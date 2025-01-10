@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"ebpfExecutor/blazesym"
+	"ebpfExecutor/pprof"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/google/pprof/profile"
 	"github.com/iovisor/gobpf/pkg/cpuonline"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 	"log"
@@ -16,7 +19,19 @@ import (
 	"time"
 )
 
-const pid int = 95172
+type stackBuilder struct {
+	stack []string
+}
+
+func (s *stackBuilder) reset() {
+	s.stack = s.stack[:0]
+}
+
+func (s *stackBuilder) append(sym string) {
+	s.stack = append(s.stack, sym)
+}
+
+const pid int = 197936
 
 func main() {
 	// Grant CAP_SYS_ADMIN for perf event access
@@ -127,16 +142,51 @@ func main() {
 			fullStack = append(fullStack, instructionPointer)
 		}
 
-		var results []string
+		//var results []string
 		symbols, err := symbolizer.Symbolize(uint32(pid), fullStack)
 		if err != nil {
 			log.Println("Failed to symbolize: %v", err)
 		}
+
+		sb := new(stackBuilder)
+		begin := len(sb.stack)
+
 		for _, symbol := range symbols {
-			results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
+			//results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
+			sb.append(symbol.Name)
+		}
+		end := len(sb.stack)
+		Reverse(sb.stack[begin:end])
+
+		builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+			SampleRate:    int64(97),
+			PerPIDProfile: false,
+		})
+
+		caca := pprof.ProfileSample{
+			Pid:         uint32(pid),
+			Aggregation: pprof.SampleAggregated,
+			SampleType:  pprof.SampleTypeCpu,
+			Stack:       sb.stack,
+			Value:       uint64(k.UserStack),
 		}
 
-		log.Println(results)
+		builders.AddSample(&caca)
+
+		builder := builders.BuilderForSample(&caca)
+
+		buf := bytes.NewBuffer(nil)
+		_, err = builder.Write(buf)
+		if err != nil {
+			log.Fatalf("Failed to write profile: %v", err)
+		}
+		rawProfile := buf.Bytes()
+
+		parsed, err := profile.Parse(bytes.NewBuffer(rawProfile))
+		if err != nil {
+			log.Fatalf("Failed to write profile: %v", err)
+		}
+		log.Println(parsed)
 
 		//err = objs.Stackmap.Lookup(uint32(k.KernStack), kernelStack)
 		//if err != nil {
@@ -178,4 +228,10 @@ func main() {
 	// Perform cleanup here if necessary.
 
 	fmt.Println("Exiting program.")
+}
+
+func Reverse[S ~[]E, E any](s S) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
 }

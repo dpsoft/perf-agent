@@ -37,6 +37,7 @@ func newPerfEvent(cpu int, sampleRate int) (*perfEvent, error) {
 }
 
 func (pe *perfEvent) Close() error {
+	//pe.p.Close()
 	_ = syscall.Close(pe.fd)
 	if pe.link != nil {
 		_ = pe.link.Close()

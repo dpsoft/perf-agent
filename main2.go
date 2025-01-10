@@ -1,6 +1,8 @@
 package main
 
 import (
+	"ebpfExecutor/blazesym"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
@@ -14,7 +16,7 @@ import (
 	"time"
 )
 
-const pid int = 12714
+const pid int = 95172
 
 func main() {
 	// Grant CAP_SYS_ADMIN for perf event access
@@ -28,31 +30,6 @@ func main() {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatalf("Failed to remove memlock: %v", err)
 	}
-
-	// Load the eBPF program from an ELF file.
-
-	//spec, err := ebpf.LoadCollectionSpec("/home/diego/github/otrotest/perf.bpf.o")
-	//if err != nil {
-	//	log.Fatalf("Failed to load eBPF program: %v", err)
-	//}
-	//
-	//// Load the eBPF program from an ELF file.
-	//coll, err := ebpf.NewCollection(spec)
-	//if err != nil {
-	//	log.Fatalf("Failed to load eBPF program: %v", err)
-	//}
-	//defer coll.Close()
-
-	//prog := coll.Programs["profile"]
-	//log.Println(prog.Type())
-	//if prog == nil {
-	//	log.Fatalf("Program 'kprobe_execve' not found")
-	//}
-
-	//symbolizer, err := blazesym.NewSymbolizer();
-	//if err != nil {
-	//	log.Fatalf("Failed to create symbolizer: %v", err)
-	//}
 
 	objs := PerfObjects{}
 	if err := LoadPerfObjects(&objs, nil); err != nil {
@@ -77,7 +54,7 @@ func main() {
 	}
 
 	for _, id := range onlineCPUIDs {
-		pe, err := newPerfEvent(int(id), 100)
+		pe, err := newPerfEvent(int(id), 10000)
 		if err != nil {
 			log.Fatalf("failed to create perf event on CPU %d: %v", id, err)
 		}
@@ -88,66 +65,30 @@ func main() {
 		}
 	}
 
-	// read the events from the ring buffer
-	//rd, err := ringbuf.NewReader(coll.Maps["counts"])
-	////rd, err := perf.NewReader(coll.Maps["counts"], os.Getpagesize())
-	//if err != nil {
-	//	log.Fatalf("Creating event reader: %s", err)
-	//}
-	//defer rd.Close()
-	//
-	////symbolizer
-	//symbolizer, err := blazesym.NewSymbolizer()
-	//defer symbolizer.Close()
-	//
-	//if err != nil {
-	//	log.Fatalf("Failed to create symbolizer: %v", err)
-	//}
-	//
-	//results := []string{}
-	//
+	//symbolizer
+	symbolizer, err := blazesym.NewSymbolizer()
+	defer symbolizer.Close()
+
+	if err != nil {
+		log.Fatalf("Failed to create symbolizer: %v", err)
+	}
 
 	//go func() {
 	//	for {
 	fmt.Println("Waiting...")
 	time.Sleep(10 * time.Second)
-	//var event interface{}
-	//currPid := uint32(pid)
-	//log.Printf("current pid: %d", currPid)
-	//kp := unsafe.Pointer(&currPid)
-	////for objs.Counts.Iterate()
-
-	//if err := objs.Counts.Lookup(kp, &event); err != nil {
-	//	log.Printf("get event failed: %s", err)
-	//}
-
-	//counts := coll.Maps["counts"]
-	//if counts == nil {
-	//	log.Fatalf("Map 'counts' not found")
-	//}
 
 	var (
 		m       = objs.PerfMaps.Counts
 		mapSize = m.MaxEntries()
 	)
-	//
+
 	keys := make([]PerfSampleKey, mapSize)
 	values := make([]uint32, mapSize)
-	//
+
 	opts := &ebpf.BatchOptions{}
 	cursor := new(ebpf.MapBatchCursor)
 
-	//it := m.Iterate()
-	//for {
-	//	ok := it.Next(&keys, &values)
-	//	k := PerfSampleKey{}
-	//	v := uint32(0)
-	//	if err := i.MapRead(&k, &v); err != nil {
-	//		log.Printf("MapRead failed: %s", err)
-	//	}
-	//	keys = append(keys, k)
-	//	values = append(values, v)
-	//}
 	n, err := m.BatchLookupAndDelete(cursor, keys, values, opts)
 	if n > 0 {
 		log.Printf("BatchLookupAndDelete: %d", n)
@@ -158,34 +99,57 @@ func main() {
 		log.Printf("BatchLookupAndDelete: %s", err)
 	}
 
-	//resultKeys := keys[:0]
-	//resultValues := values[:0]
-	//it := counts.Iterate()
-	//
-	//var k PerfSampleKey
-	//var v uint32
-	//for it.Next(&k, &v) {
-	//	resultKeys = append(resultKeys, k)
-	//	resultValues = append(resultValues, v)
-	//}
-	//if err := it.Err(); err != nil {
-	//	log.Fatalf("iteration error: %v", err)
-	//}
 	log.Println(
 		"msg", "getCountsMapValues iter",
 		"count", len(keys),
 	)
-	//record, err := rd.Read()
-	//if err != nil {
-	//	if errors.Is(err, perf.ErrClosed) {
-	//		log.Println("Received signal, exiting..")
-	//		return
-	//	}
-	//	log.Printf("Reading from reader: %s", err)
-	//	continue
-	//}
 
-	//symbols, err := symbolizer.Symbolize(pid, []uint64{})
+	for _, k := range keys {
+		//if config.CollectUser > 0 {
+		//var userStack uint8
+		//var kernelStack uint64
+		stack, err := objs.Stackmap.LookupBytes(uint32(k.UserStack))
+		if err != nil {
+			log.Printf("Failed to lookup user stack: %v", err)
+		}
+
+		if len(stack) == 0 {
+			return
+		}
+
+		var fullStack []uint64
+		for i := 0; i < 127; i++ {
+			instructionPointerBytes := stack[i*8 : i*8+8]
+			instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
+			if instructionPointer == 0 {
+				break
+			}
+			fullStack = append(fullStack, instructionPointer)
+		}
+
+		var results []string
+		symbols, err := symbolizer.Symbolize(uint32(pid), fullStack)
+		if err != nil {
+			log.Println("Failed to symbolize: %v", err)
+		}
+		for _, symbol := range symbols {
+			results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
+		}
+
+		log.Println(results)
+
+		//err = objs.Stackmap.Lookup(uint32(k.KernStack), kernelStack)
+		//if err != nil {
+		//	log.Printf("Failed to lookup kernel stack: %v", err)
+		//}
+		//log.Println(symbolizer.Symbolize(uint32(pid), userStack))
+		//log.Println(symbolizer.Symbolize(uint32(pid), kernelStack))
+		//}
+	}
+
+	//results := []string{}
+	//
+	//symbols, err := symbolizer.Symbolize(uint32(pid), []uint64{})
 	//if err != nil {
 	//	log.Println("Failed to symbolize: %v", err)
 	//}
@@ -195,7 +159,7 @@ func main() {
 	//}
 
 	log.Println("keys:", keys)
-	log.Println("values:", keys)
+	log.Println("values:", values)
 
 	log.Println("eBPF program successfully loaded and attached")
 

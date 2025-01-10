@@ -90,7 +90,7 @@ func (s *Symbolizer) Symbolize(pid uint32, stack []uint64) ([]Symbol, error) {
 	symSrcProcess := C.struct_blaze_symbolize_src_process{}
 	symSrcProcess.type_size = C.ulong(unsafe.Sizeof(symSrcProcess))
 	symSrcProcess.pid = C.uint32_t(pid)
-	symSrcProcess.debug_syms = C.bool(true)
+	symSrcProcess.debug_syms = C.bool(false) // for golang not use debug syms?
 	symSrcProcess.map_files = C.bool(true)
 	syms := C.blaze_symbolize_process_abs_addrs(s.s, &symSrcProcess, caddr, clen)
 	lastErr := BlazeErr(C.blaze_err_last())

@@ -31,7 +31,7 @@ func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)
 }
 
-const pid int = 197936
+const pid int = 10036
 
 func main() {
 	// Grant CAP_SYS_ADMIN for perf event access
@@ -99,7 +99,7 @@ func main() {
 	)
 
 	keys := make([]PerfSampleKey, mapSize)
-	values := make([]uint32, mapSize)
+	values := make([]uint64, mapSize)
 
 	opts := &ebpf.BatchOptions{}
 	cursor := new(ebpf.MapBatchCursor)
@@ -119,11 +119,20 @@ func main() {
 		"count", len(keys),
 	)
 
-	for _, k := range keys {
+	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		SampleRate:    int64(97),
+		PerPIDProfile: false,
+	})
+
+	for i := 0; i < len(keys); i++ {
+
+		//for _, k := range keys {
 		//if config.CollectUser > 0 {
 		//var userStack uint8
-		//var kernelStack uint64
-		stack, err := objs.Stackmap.LookupBytes(uint32(k.UserStack))
+		//var kernelStack
+		key := keys[i]
+		value := values[i]
+		stack, err := objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
 		}
@@ -132,44 +141,42 @@ func main() {
 			return
 		}
 
-		var fullStack []uint64
+		//var fullStack []uint64
+
+		sb := new(stackBuilder)
+		begin := len(sb.stack)
+
 		for i := 0; i < 127; i++ {
 			instructionPointerBytes := stack[i*8 : i*8+8]
 			instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
 			if instructionPointer == 0 {
 				break
 			}
-			fullStack = append(fullStack, instructionPointer)
+
+			symbol, err := symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
+			if err != nil {
+				log.Println("Failed to symbolize: %v", err)
+				break
+			}
+
+			sb.append(symbol[0].Name)
+			//fullStack = append(fullStack, instructionPointer)
 		}
 
 		//var results []string
-		symbols, err := symbolizer.Symbolize(uint32(pid), fullStack)
-		if err != nil {
-			log.Println("Failed to symbolize: %v", err)
-		}
+		//symbols, err := symbolizer.Symbolize(uint32(pid), fullStack)
+		//if err != nil {
+		//	log.Println("Failed to symbolize: %v", err)
+		//}
 
-		sb := new(stackBuilder)
-		begin := len(sb.stack)
-
-		for _, symbol := range symbols {
-			//results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
-			sb.append(symbol.Name)
-		}
+		//for _, symbol := range symbols {
+		//	//results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
+		//	sb.append(symbol.Name)
+		//}
 		end := len(sb.stack)
 		Reverse(sb.stack[begin:end])
 
-		builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
-			SampleRate:    int64(97),
-			PerPIDProfile: false,
-		})
-
-		caca := pprof.ProfileSample{
-			Pid:         uint32(pid),
-			Aggregation: pprof.SampleAggregated,
-			SampleType:  pprof.SampleTypeCpu,
-			Stack:       sb.stack,
-			Value:       uint64(k.UserStack),
-		}
+		caca := sample(sb, value)
 
 		builders.AddSample(&caca)
 
@@ -186,9 +193,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to write profile: %v", err)
 		}
-		log.Println(parsed)
+		//log.Println(parsed)
 
-		//err = objs.Stackmap.Lookup(uint32(k.KernStack), kernelStack)
+		file, err := os.Create("profile.pb.gz")
+		if err != nil {
+			log.Fatalf("Failed to create profile file: %v", err)
+		}
+		defer file.Close()
+
+		if err := parsed.Write(file); err != nil {
+			log.Fatalf("Failed to write profile to file: %v", err)
+		} //err = objs.Stackmap.Lookup(uint32(k.KernStack), kernelStack)
 		//if err != nil {
 		//	log.Printf("Failed to lookup kernel stack: %v", err)
 		//}
@@ -228,6 +243,17 @@ func main() {
 	// Perform cleanup here if necessary.
 
 	fmt.Println("Exiting program.")
+}
+
+func sample(sb *stackBuilder, value uint64) pprof.ProfileSample {
+	caca := pprof.ProfileSample{
+		Pid:         uint32(pid),
+		Aggregation: pprof.SampleAggregated,
+		SampleType:  pprof.SampleTypeCpu,
+		Stack:       sb.stack,
+		Value:       value,
+	}
+	return caca
 }
 
 func Reverse[S ~[]E, E any](s S) {

@@ -90,6 +90,7 @@ func (b *ProfileBuilders) AddSample(sample *ProfileSample) {
 	}
 }
 
+// func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilder {
 func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilder {
 	//labelsHash, labels := sample.Target.Labels()
 

@@ -1,4 +1,4 @@
-module ebpfExecutor
+module perf-agent
 
 go 1.23
 

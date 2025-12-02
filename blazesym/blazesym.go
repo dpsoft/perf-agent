@@ -50,7 +50,7 @@ const (
 )
 
 func (e BlazeErr) Error() error {
-	return errors.New(C.GoString(C.blaze_err_str(C.enum_blaze_err(e))))
+	return errors.New(C.GoString(C.blaze_err_str(C.blaze_err(e))))
 }
 
 // NewSymbolizer returns a new Blazesym symbolizer.
@@ -90,9 +90,10 @@ func (s *Symbolizer) Symbolize(pid uint32, stack []uint64) ([]Symbol, error) {
 	symSrcProcess := C.struct_blaze_symbolize_src_process{}
 	symSrcProcess.type_size = C.ulong(unsafe.Sizeof(symSrcProcess))
 	symSrcProcess.pid = C.uint32_t(pid)
-	symSrcProcess.debug_syms = C.bool(false) // for golang not use debug syms?
-	symSrcProcess.map_files = C.bool(true)
-	symSrcProcess.perf_map = C.bool(true)
+	symSrcProcess.debug_syms = C.bool(true) // for golang not use debug syms?
+	symSrcProcess.no_map_files = C.bool(false)
+	//symSrcProcess.map_files = C.bool(true)
+	symSrcProcess.perf_map = C.bool(false)
 	syms := C.blaze_symbolize_process_abs_addrs(s.s, &symSrcProcess, caddr, clen)
 	lastErr := BlazeErr(C.blaze_err_last())
 	if lastErr != blazeErrOk {

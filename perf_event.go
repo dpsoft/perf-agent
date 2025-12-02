@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
+	"syscall"
+
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/elastic/go-perf"
 	"golang.org/x/sys/unix"
-	"syscall"
 )
 
 type perfEvent struct {

@@ -7,16 +7,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/rlimit"
-	"github.com/google/pprof/profile"
-	"github.com/iovisor/gobpf/pkg/cpuonline"
-	"kernel.org/pub/linux/libs/security/libcap/cap"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
+	"github.com/google/pprof/profile"
+	"github.com/iovisor/gobpf/pkg/cpuonline"
+	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
 type stackBuilder struct {
@@ -31,7 +32,9 @@ func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)
 }
 
-const pid int = 10036
+const pid int = 561187
+
+//const pid int = 528425
 
 func main() {
 	// Grant CAP_SYS_ADMIN for perf event access

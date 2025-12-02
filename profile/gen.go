@@ -5,4 +5,4 @@ package profile
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -cc clang -cflags "-O2 -Wall -Werror -fpie -Wno-unused-variable -Wno-unused-function" Profile ./home/diego/github/otrotest/perf.bpf.c
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -go-package=main Perf /home/diego/github/otrotest/perf.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -go-package=main Perf /home/diego/github/bpf-runner/perf.bpf.c

@@ -8,11 +8,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-
+	"perf-agent/cpu"
 	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/iovisor/gobpf/pkg/cpuonline"
 
@@ -37,7 +38,7 @@ func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)
 }
 
-const pid int = 682922
+const pid int = 1271369
 
 //const pid int = 528425
 
@@ -95,6 +96,111 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create symbolizer: %v", err)
 	}
+
+	// Load CPU usage eBPF objects
+	cpuObjs := cpu.CPUObjects{}
+
+	if err := cpu.LoadCPUObjects(&cpuObjs, nil); err != nil {
+		log.Fatalf("Failed to load CPU usage objects: %v", err)
+	}
+	defer cpuObjs.Close()
+
+	// Clear ALL CPU-related maps on startup
+	//log.Println("Clearing all CPU usage maps on startup...")
+	//zero := uint64(0)
+	//
+	//// 1. Clear cpu_usage map (per-CPU accumulated deltas)
+	//numCPUs := runtime.NumCPU()
+	//if numCPUs > 1024 {
+	//	numCPUs = 1024
+	//}
+	//for cpu := 0; cpu < numCPUs; cpu++ {
+	//	for offset := 0; offset < 8; offset++ { // CPU_USAGE_GROUP_WIDTH = 8
+	//		idx := uint32(cpu*8 + offset)
+	//		cpuObjs.CpuUsage.Update(idx, &zero, 0)
+	//	}
+	//}
+	//
+	//// 2. Clear per-PID maps by iterating through all entries
+	//log.Println("Clearing PID maps (this may take a moment)...")
+	//var pid uint32
+	//var value uint64
+	//
+	//// Clear pid_cpu_user_time
+	//c := cpuObjs.PidCpuUserTime.Iterate()
+	//pidsToClear := []uint32{}
+	//for c.Next(&pid, &value) {
+	//	pidsToClear = append(pidsToClear, pid)
+	//}
+	//for _, pid := range pidsToClear {
+	//	cpuObjs.PidCpuUserTime.Update(pid, &zero, 0)
+	//}
+	//
+	//// Clear pid_cpu_system_time
+	//c = cpuObjs.PidCpuSystemTime.Iterate()
+	//pidsToClear = []uint32{}
+	//for c.Next(&pid, &value) {
+	//	pidsToClear = append(pidsToClear, pid)
+	//}
+	//for _, pid := range pidsToClear {
+	//	cpuObjs.PidCpuSystemTime.Update(pid, &zero, 0)
+	//}
+	//
+	//log.Println("All maps cleared successfully")
+
+	tp, err := link.Tracepoint("sched", "sched_switch", cpuObjs.CPUPrograms.HandleSwitch, nil)
+	if err != nil {
+		log.Fatalf("attach tracepoint sched_switch: %v", err)
+	}
+	defer tp.Close()
+
+	fexit, err := link.AttachTracing(link.TracingOptions{
+		Program: cpuObjs.CPUPrograms.OnKcpustatFetch,
+	})
+	if err != nil {
+		log.Fatalf("attach fexit kcpustat_fetch: %v", err)
+	}
+	defer fexit.Close()
+
+	//kprobe, err := link.Kprobe("cpuacct_account_field", cpuObjs.CPUPrograms.CpuacctAccountFieldKprobe, nil)
+	//if err != nil {
+	//	log.Fatalf("attach kprobe cpuacct_account_field: %v", err)
+	//}
+	//defer kprobe.Close()
+
+	//tpEnter, err := link.Tracepoint("irq", "softirq_entry", cpuObjs.CPUPrograms.SoftirqEnter, nil)
+	//if err != nil {
+	//	log.Fatalf("attach tracepoint softirq_entry: %v", err)
+	//}
+	//defer tpEnter.Close()
+	//
+	//tpExit, err := link.Tracepoint("irq", "softirq_exit", cpuObjs.CPUPrograms.SoftirqExit, nil)
+	//if err != nil {
+	//	log.Fatalf("attach tracepoint softirq_exit: %v", err)
+	//}
+	//defer tpExit.Close()
+
+	// Create collector
+	collector, _ := cpu.NewCPUUsageCollector(&cpuObjs)
+
+	// Configure which PIDs to track
+	trackValue := uint8(1)
+	err = cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny)
+	if err != nil {
+		log.Fatalf("Failed to configure tracked PIDs: %v", err)
+	}
+
+	// Poll periodically
+	ticker := time.NewTicker(1 * time.Second) // Poll every second
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			if err := collector.ReadCPUUsage(); err != nil {
+				log.Printf("Error reading CPU usage: %v", err)
+			}
+		}
+	}()
 
 	//go func() {
 	//	for {
@@ -220,17 +326,6 @@ func main() {
 		//}
 	}
 
-	//results := []string{}
-	//
-	//symbols, err := symbolizer.Symbolize(uint32(pid), []uint64{})
-	//if err != nil {
-	//	log.Println("Failed to symbolize: %v", err)
-	//}
-	////
-	//for _, symbol := range symbols {
-	//	results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
-	//}
-
 	log.Println("keys:", keys)
 	log.Println("values:", values)
 
@@ -249,6 +344,27 @@ func main() {
 	fmt.Printf("Received signal: %s\n", sig)
 
 	// Perform cleanup here if necessary.
+
+	// Print histogram statistics
+	for pid, hist := range collector.GetAllHistograms() {
+		fmt.Printf("\n=== PID %d CPU Usage Histogram ===\n", pid)
+		fmt.Printf("Count: %d\n", hist.TotalCount())
+		fmt.Printf("Min: %.2f%%\n", float64(hist.Min())/10000.0)
+		fmt.Printf("Max: %.2f%%\n", float64(hist.Max())/10000.0)
+		fmt.Printf("Mean: %.2f%%\n", hist.Mean()/10000.0)
+		fmt.Printf("StdDev: %.2f%%\n", hist.StdDev()/10000.0)
+		fmt.Printf("P50: %.2f%%\n", float64(hist.ValueAtQuantile(50.0))/10000.0)
+		fmt.Printf("P95: %.2f%%\n", float64(hist.ValueAtQuantile(95.0))/10000.0)
+		fmt.Printf("P99: %.2f%%\n", float64(hist.ValueAtQuantile(99.0))/10000.0)
+		fmt.Printf("P99.9: %.2f%%\n", float64(hist.ValueAtQuantile(99.9))/10000.0)
+
+		// Export histogram to file (HDR format)
+		//histFile, err := os.Create(fmt.Sprintf("cpu_usage_pid_%d.hdr", pid))
+		//if err == nil {
+		//	hist.Export(histFile)
+		//	histFile.Close()
+		//}
+	}
 
 	fmt.Println("Exiting program.")
 }

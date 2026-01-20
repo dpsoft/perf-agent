@@ -3,13 +3,13 @@ package pprof
 import (
 	"fmt"
 	"io"
-	"reflect"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/pprof/profile"
+
 	//"github.com/grafana/pyroscope/ebpf/sd"
 	"github.com/klauspost/compress/gzip"
 	//"github.com/prometheus/prometheus/model/labels"
@@ -62,7 +62,7 @@ type BuildersOptions struct {
 }
 
 type builderHashKey struct {
-	labelsHash uint64
+	// labelsHash uint64  // unused for now
 	pid        uint32
 	sampleType SampleType
 }
@@ -244,12 +244,8 @@ func uint64Bytes(s []uint64) []byte {
 	if len(s) == 0 {
 		return nil
 	}
-	var bs []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
-	hdr.Len = len(s) * 8
-	hdr.Cap = hdr.Len
-	hdr.Data = uintptr(unsafe.Pointer(&s[0]))
-	return bs
+	// Use unsafe.SliceData instead of deprecated reflect.SliceHeader
+	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*8)
 }
 func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 	sample := new(profile.Sample)

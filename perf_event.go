@@ -11,10 +11,10 @@ import (
 )
 
 type perfEvent struct {
-	fd    int
-	ioctl bool
-	link  *link.RawLink
-	p     *perf.Event
+	fd   int
+	// ioctl bool  // unused
+	link *link.RawLink
+	p    *perf.Event
 }
 
 func newPerfEvent(cpu int, sampleRate int) (*perfEvent, error) {
@@ -55,31 +55,31 @@ func (pe *perfEvent) attachPerfEvent(prog *ebpf.Program) error {
 	//return pe.attachPerfEventIoctl(prog)
 }
 
-func (pe *perfEvent) attachPerfEventIoctl(prog *ebpf.Program) error {
-	var err error
-	err = unix.IoctlSetInt(pe.fd, unix.PERF_EVENT_IOC_SET_BPF, prog.FD())
-	if err != nil {
-		return fmt.Errorf("setting perf event bpf program: %w", err)
-	}
-	if err = unix.IoctlSetInt(pe.fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		return fmt.Errorf("enable perf event: %w", err)
-	}
-	pe.ioctl = true
-	return nil
-}
+// Commented out unused functions - keeping for future use
+// func (pe *perfEvent) attachPerfEventIoctl(prog *ebpf.Program) error {
+// 	var err error
+// 	err = unix.IoctlSetInt(pe.fd, unix.PERF_EVENT_IOC_SET_BPF, prog.FD())
+// 	if err != nil {
+// 		return fmt.Errorf("setting perf event bpf program: %w", err)
+// 	}
+// 	if err = unix.IoctlSetInt(pe.fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
+// 		return fmt.Errorf("enable perf event: %w", err)
+// 	}
+// 	return nil
+// }
 
-func (pe *perfEvent) attachPerfEventLink(prog *ebpf.Program) error {
-	var err error
-	opts := link.RawLinkOptions{
-		Target:  pe.fd,
-		Program: prog,
-		Attach:  ebpf.AttachPerfEvent,
-	}
-
-	pe.link, err = link.AttachRawLink(opts)
-	if err != nil {
-		return fmt.Errorf("attach raw link: %w", err)
-	}
-
-	return nil
-}
+// func (pe *perfEvent) attachPerfEventLink(prog *ebpf.Program) error {
+// 	var err error
+// 	opts := link.RawLinkOptions{
+// 		Target:  pe.fd,
+// 		Program: prog,
+// 		Attach:  ebpf.AttachPerfEvent,
+// 	}
+//
+// 	pe.link, err = link.AttachRawLink(opts)
+// 	if err != nil {
+// 		return fmt.Errorf("attach raw link: %w", err)
+// 	}
+//
+// 	return nil
+// }

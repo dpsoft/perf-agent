@@ -40,9 +40,10 @@ type stackBuilder struct {
 	stack []string
 }
 
-func (s *stackBuilder) reset() {
-	s.stack = s.stack[:0]
-}
+// Commented out unused function
+// func (s *stackBuilder) reset() {
+// 	s.stack = s.stack[:0]
+// }
 
 func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)

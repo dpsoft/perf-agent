@@ -39,22 +39,24 @@ jobs:
       run: |
         git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
         cd /tmp/blazesym
-        echo "Building blazesym with C header support..."
-        cargo build --release --features=cheader
+        echo "Building blazesym C bindings package..."
+        cargo build --release --package blazesym-c
         echo "Built files:"
-        ls -lh target/release/libblazesym* || true
-        ls -lh target/release/*.a || true
-        echo "Checking if libblazesym_c.a exists..."
-        if [ ! -f target/release/libblazesym_c.a ]; then
-          echo "libblazesym_c.a not found, checking for alternatives..."
-          # Create symlink if needed
-          if [ -f target/release/libblazesym.a ]; then
-            echo "Found libblazesym.a, creating symlink..."
-            ln -s libblazesym.a target/release/libblazesym_c.a
-          fi
+        ls -lh target/release/libblazesym* || echo "No libblazesym files"
+        ls -lh target/release/*.a || echo "No .a files"
+        ls -lh target/release/*.so || echo "No .so files"
+        echo ""
+        echo "Verifying library exists:"
+        if [ -f target/release/libblazesym_c.a ]; then
+          echo "✓ libblazesym_c.a found"
+          file target/release/libblazesym_c.a
+        elif [ -f target/release/libblazesym.a ]; then
+          echo "Found libblazesym.a, creating symlink..."
+          ln -s libblazesym.a target/release/libblazesym_c.a
+        else
+          echo "ERROR: No blazesym library found!"
+          exit 1
         fi
-        echo "Final library files:"
-        ls -lh target/release/libblazesym*.a
     
     - name: Update blazesym path for CI
       run: |

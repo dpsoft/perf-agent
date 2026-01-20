@@ -41,15 +41,16 @@ jobs:
             sudo ldconfig
           fi
 
-      - name: Build blazesym
+      - name: Build and install blazesym
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
-
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
+          # Install headers and library for official Go bindings
+          sudo mkdir -p /usr/local/include /usr/local/lib
+          sudo cp capi/include/blazesym.h /usr/local/include/
+          sudo cp target/release/libblazesym_c.a /usr/local/lib/
+          sudo ldconfig
 
       - name: Generate eBPF code
         run: go generate ./...
@@ -159,15 +160,16 @@ jobs:
             sudo ldconfig
           fi
 
-      - name: Build blazesym
+      - name: Build and install blazesym
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
-
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
+          # Install headers and library for official Go bindings
+          sudo mkdir -p /usr/local/include /usr/local/lib
+          sudo cp capi/include/blazesym.h /usr/local/include/
+          sudo cp target/release/libblazesym_c.a /usr/local/lib/
+          sudo ldconfig
 
       - name: Generate eBPF code
         run: go generate ./...
@@ -215,15 +217,16 @@ jobs:
             sudo ldconfig
           fi
 
-      - name: Build blazesym
+      - name: Build and install blazesym
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
-
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
+          # Install headers and library for official Go bindings
+          sudo mkdir -p /usr/local/include /usr/local/lib
+          sudo cp capi/include/blazesym.h /usr/local/include/
+          sudo cp target/release/libblazesym_c.a /usr/local/lib/
+          sudo ldconfig
 
       - name: Generate eBPF code
         run: go generate ./...

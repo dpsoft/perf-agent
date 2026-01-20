@@ -45,7 +45,7 @@ jobs:
           sudo ldconfig
         fi
     
-    - name: Clone and build blazesym
+    - name: Build and install blazesym
       run: |
         git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
         cd /tmp/blazesym
@@ -53,28 +53,18 @@ jobs:
         cargo build --release --package blazesym-c
         echo "Built files:"
         ls -lh target/release/libblazesym* || echo "No libblazesym files"
-        ls -lh target/release/*.a || echo "No .a files"
-        ls -lh target/release/*.so || echo "No .so files"
         echo ""
-        echo "Verifying library exists:"
-        if [ -f target/release/libblazesym_c.a ]; then
-          echo "✓ libblazesym_c.a found"
-          file target/release/libblazesym_c.a
-        elif [ -f target/release/libblazesym.a ]; then
-          echo "Found libblazesym.a, creating symlink..."
-          ln -s libblazesym.a target/release/libblazesym_c.a
-        else
-          echo "ERROR: No blazesym library found!"
-          exit 1
-        fi
-
+        echo "Installing to /usr/local..."
+        sudo mkdir -p /usr/local/include /usr/local/lib
+        sudo cp capi/include/blazesym.h /usr/local/include/
+        sudo cp target/release/libblazesym_c.a /usr/local/lib/
+        sudo ldconfig
+        echo "✓ blazesym installed"
+    
     - name: Run go generate
       run: go generate ./...
-
+    
     - name: Build perf-agent
-      env:
-        CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
-        CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
       run: go build -v .
     
     - name: Run unit tests

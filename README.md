@@ -69,3 +69,20 @@ Prints to stdout:
 go generate ./...
 go build
 ```
+
+## Testing
+
+perf-agent includes a comprehensive test suite with unit tests, integration tests, and multi-language test workloads (Go, Rust, Python).
+
+```bash
+# Run all tests (unit + integration)
+make test
+
+# Run only unit tests (no root required)
+make test-unit
+
+# Run only integration tests (requires root)
+sudo make test-integration
+```
+
+For detailed testing documentation, see [TESTING.md](TESTING.md).

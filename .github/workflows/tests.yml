@@ -25,7 +25,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev libelf-dev
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-headers-$(uname -r) \
+            libbpf-dev
+          
+          # Ensure bpf headers are available
+          if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+            echo "Installing libbpf from source..."
+            git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+            cd /tmp/libbpf/src
+            sudo make install install_headers
+            sudo ldconfig
+          fi
 
       - name: Build blazesym
         run: |
@@ -72,7 +86,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev libelf-dev
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-headers-$(uname -r) \
+            libbpf-dev
+          
+          # Ensure bpf headers are available
+          if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+            echo "Installing libbpf from source..."
+            git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+            cd /tmp/libbpf/src
+            sudo make install install_headers
+            sudo ldconfig
+          fi
 
       - name: Build blazesym
         run: |
@@ -115,7 +143,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev libelf-dev
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-headers-$(uname -r) \
+            libbpf-dev
+          
+          # Ensure bpf headers are available
+          if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+            echo "Installing libbpf from source..."
+            git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+            cd /tmp/libbpf/src
+            sudo make install install_headers
+            sudo ldconfig
+          fi
 
       - name: Build blazesym
         run: |
@@ -157,7 +199,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev libelf-dev
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-headers-$(uname -r) \
+            libbpf-dev
+          
+          # Ensure bpf headers are available
+          if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+            echo "Installing libbpf from source..."
+            git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+            cd /tmp/libbpf/src
+            sudo make install install_headers
+            sudo ldconfig
+          fi
 
       - name: Build blazesym
         run: |

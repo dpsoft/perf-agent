@@ -33,7 +33,17 @@ jobs:
           libelf-dev \
           linux-headers-$(uname -r) \
           build-essential \
-          pkg-config
+          pkg-config \
+          libbpf-dev
+        
+        # Ensure bpf headers are available
+        if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+          echo "Installing libbpf from source..."
+          git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+          cd /tmp/libbpf/src
+          sudo make install install_headers
+          sudo ldconfig
+        fi
     
     - name: Clone and build blazesym
       run: |

@@ -2,7 +2,7 @@ package blazesym
 
 /*
 
-#cgo LDFLAGS: -L /usr/lib -L /home/diego/github/blazesym/target/release -lblazesym_c -static
+#cgo LDFLAGS: -L /usr/lib -L /usr/local/lib -L /home/diego/github/blazesym/target/release -lblazesym_c -static
 
 #include "blazesym.h"
 // HACK

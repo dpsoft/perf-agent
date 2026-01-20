@@ -57,3 +57,6 @@ offcpu.pb.gz
 
 # Test temporary files
 /tmp/perf-agent-test-*
+
+### Project binaries ###
+perf-agent

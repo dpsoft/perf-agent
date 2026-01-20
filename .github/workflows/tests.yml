@@ -139,10 +139,9 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        goos: [linux]
-        goarch: [amd64, arm64]
+    # Note: ARM64 builds excluded because blazesym requires CGO,
+    # and cross-compiling CGO code is complex. Native ARM64 builds
+    # require ARM64 runners which may not be available.
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -175,12 +174,12 @@ jobs:
 
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: go build -v -o perf-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -v -o perf-agent-linux-amd64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: perf-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: perf-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: perf-agent-linux-amd64
+          path: perf-agent-linux-amd64

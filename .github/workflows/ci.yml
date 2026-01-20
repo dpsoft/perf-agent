@@ -39,16 +39,31 @@ jobs:
       run: |
         git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
         cd /tmp/blazesym
+        echo "Building blazesym with C header support..."
         cargo build --release --features=cheader
-        sudo mkdir -p /usr/local/lib
-        sudo cp target/release/libblazesym_c.a /usr/local/lib/
-        sudo cp target/release/libblazesym_c.so /usr/local/lib/
-        sudo ldconfig
+        echo "Built files:"
+        ls -lh target/release/libblazesym* || true
+        ls -lh target/release/*.a || true
+        echo "Checking if libblazesym_c.a exists..."
+        if [ ! -f target/release/libblazesym_c.a ]; then
+          echo "libblazesym_c.a not found, checking for alternatives..."
+          # Create symlink if needed
+          if [ -f target/release/libblazesym.a ]; then
+            echo "Found libblazesym.a, creating symlink..."
+            ln -s libblazesym.a target/release/libblazesym_c.a
+          fi
+        fi
+        echo "Final library files:"
+        ls -lh target/release/libblazesym*.a
     
     - name: Update blazesym path for CI
       run: |
-        # Update the CGO LDFLAGS to use /usr/local/lib instead of local path
-        sed -i 's|/home/diego/github/blazesym/target/release|/usr/local/lib|g' blazesym/blazesym.go
+        echo "Original blazesym.go CGO flags:"
+        grep "cgo LDFLAGS" blazesym/blazesym.go
+        # Update to use /tmp/blazesym path
+        sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
+        echo "Updated blazesym.go CGO flags:"
+        grep "cgo LDFLAGS" blazesym/blazesym.go
     
     - name: Run go generate
       run: go generate ./...

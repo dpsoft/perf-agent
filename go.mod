@@ -10,13 +10,11 @@ require (
 	github.com/google/pprof v0.0.0-20240727154555-813a5fbdbec8
 	github.com/iovisor/gobpf v0.2.0
 	github.com/klauspost/compress v1.17.10
-	github.com/tklauser/go-sysconf v0.3.16
 	golang.org/x/sys v0.38.0
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.73
 )
 
 require (
-	github.com/tklauser/numcpus v0.11.0 // indirect
 	golang.org/x/exp v0.0.0-20230224173230-c95f2b4c22f2 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.73 // indirect
 )

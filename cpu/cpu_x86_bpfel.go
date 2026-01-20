@@ -53,17 +53,23 @@ type CPUSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type CPUProgramSpecs struct {
-	HandleSwitch    *ebpf.ProgramSpec `ebpf:"handle_switch"`
-	OnKcpustatFetch *ebpf.ProgramSpec `ebpf:"on_kcpustat_fetch"`
+	HandleSwitch *ebpf.ProgramSpec `ebpf:"handle_switch"`
 }
 
 // CPUMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type CPUMapSpecs struct {
-	LastSeen  *ebpf.MapSpec `ebpf:"last_seen"`
-	PidFilter *ebpf.MapSpec `ebpf:"pid_filter"`
-	Rb        *ebpf.MapSpec `ebpf:"rb"`
+	CacheMissesReader     *ebpf.MapSpec `ebpf:"cache_misses_reader"`
+	CpuCyclesReader       *ebpf.MapSpec `ebpf:"cpu_cycles_reader"`
+	CpuInstructionsReader *ebpf.MapSpec `ebpf:"cpu_instructions_reader"`
+	HwCountersEnabled     *ebpf.MapSpec `ebpf:"hw_counters_enabled"`
+	LastSeen              *ebpf.MapSpec `ebpf:"last_seen"`
+	PidFilter             *ebpf.MapSpec `ebpf:"pid_filter"`
+	PrevCacheMisses       *ebpf.MapSpec `ebpf:"prev_cache_misses"`
+	PrevCycles            *ebpf.MapSpec `ebpf:"prev_cycles"`
+	PrevInstructions      *ebpf.MapSpec `ebpf:"prev_instructions"`
+	Rb                    *ebpf.MapSpec `ebpf:"rb"`
 }
 
 // CPUObjects contains all objects after they have been loaded into the kernel.
@@ -85,15 +91,29 @@ func (o *CPUObjects) Close() error {
 //
 // It can be passed to LoadCPUObjects or ebpf.CollectionSpec.LoadAndAssign.
 type CPUMaps struct {
-	LastSeen  *ebpf.Map `ebpf:"last_seen"`
-	PidFilter *ebpf.Map `ebpf:"pid_filter"`
-	Rb        *ebpf.Map `ebpf:"rb"`
+	CacheMissesReader     *ebpf.Map `ebpf:"cache_misses_reader"`
+	CpuCyclesReader       *ebpf.Map `ebpf:"cpu_cycles_reader"`
+	CpuInstructionsReader *ebpf.Map `ebpf:"cpu_instructions_reader"`
+	HwCountersEnabled     *ebpf.Map `ebpf:"hw_counters_enabled"`
+	LastSeen              *ebpf.Map `ebpf:"last_seen"`
+	PidFilter             *ebpf.Map `ebpf:"pid_filter"`
+	PrevCacheMisses       *ebpf.Map `ebpf:"prev_cache_misses"`
+	PrevCycles            *ebpf.Map `ebpf:"prev_cycles"`
+	PrevInstructions      *ebpf.Map `ebpf:"prev_instructions"`
+	Rb                    *ebpf.Map `ebpf:"rb"`
 }
 
 func (m *CPUMaps) Close() error {
 	return _CPUClose(
+		m.CacheMissesReader,
+		m.CpuCyclesReader,
+		m.CpuInstructionsReader,
+		m.HwCountersEnabled,
 		m.LastSeen,
 		m.PidFilter,
+		m.PrevCacheMisses,
+		m.PrevCycles,
+		m.PrevInstructions,
 		m.Rb,
 	)
 }
@@ -102,14 +122,12 @@ func (m *CPUMaps) Close() error {
 //
 // It can be passed to LoadCPUObjects or ebpf.CollectionSpec.LoadAndAssign.
 type CPUPrograms struct {
-	HandleSwitch    *ebpf.Program `ebpf:"handle_switch"`
-	OnKcpustatFetch *ebpf.Program `ebpf:"on_kcpustat_fetch"`
+	HandleSwitch *ebpf.Program `ebpf:"handle_switch"`
 }
 
 func (p *CPUPrograms) Close() error {
 	return _CPUClose(
 		p.HandleSwitch,
-		p.OnKcpustatFetch,
 	)
 }
 

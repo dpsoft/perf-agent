@@ -13,11 +13,11 @@ import (
 type CPUUsageCollector struct {
 	objs         *CPUObjects
 	reader       *ringbuf.Reader
-	histograms   map[uint32]*hdrhistogram.Histogram
+	histograms   map[uint32]*hdrhistogram.Histogram // deprecated, use metrics
+	metrics      map[uint32]*PidMetrics
 	lastPollTime time.Time
 }
 
-// Matches cpu_stat_s in BPF (must match exact layout)
 type CpuStat struct {
 	CPU       uint32
 	Busy      uint64
@@ -25,11 +25,22 @@ type CpuStat struct {
 	Timestamp uint64
 }
 
-// Matches pid_stat_s in BPF (must match exact layout)
 type PidStat struct {
-	TGID      uint32
-	DeltaNs   uint64
-	Timestamp uint64
+	TGID        uint32
+	DeltaNs     uint64
+	Cycles      uint64
+	Instructions uint64
+	CacheMisses uint64
+	Timestamp   uint64
+}
+
+// PidMetrics holds accumulated metrics for a PID
+type PidMetrics struct {
+	TimeHist        *hdrhistogram.Histogram
+	TotalCycles     uint64
+	TotalInstructions uint64
+	TotalCacheMisses  uint64
+	SampleCount     uint64
 }
 
 func NewCPUUsageCollector(objs *CPUObjects) (*CPUUsageCollector, error) {
@@ -42,6 +53,7 @@ func NewCPUUsageCollector(objs *CPUObjects) (*CPUUsageCollector, error) {
 		objs:         objs,
 		reader:       reader,
 		histograms:   make(map[uint32]*hdrhistogram.Histogram),
+		metrics:      make(map[uint32]*PidMetrics),
 		lastPollTime: time.Now(),
 	}, nil
 }
@@ -65,21 +77,27 @@ func (c *CPUUsageCollector) ReadCPUUsage() error {
 		case int(unsafe.Sizeof(PidStat{})):
 			ps := (*PidStat)(unsafe.Pointer(&rec.RawSample[0]))
 
-			// Get or create histogram for this PID
-			hist, exists := c.histograms[ps.TGID]
+			// Get or create metrics for this PID
+			m, exists := c.metrics[ps.TGID]
 			if !exists {
-				hist = hdrhistogram.New(0, 1000000000, 3) // 0-1sec in nanoseconds
-				c.histograms[ps.TGID] = hist
+				m = &PidMetrics{
+					TimeHist: hdrhistogram.New(0, 1000000000000000, 3), // 0-1 hour in ns
+				}
+				c.metrics[ps.TGID] = m
+				// Keep histograms map in sync for backward compatibility
+				c.histograms[ps.TGID] = m.TimeHist
 			}
 
-			// Record the delta_ns
-			if err := hist.RecordValue(int64(ps.DeltaNs)); err != nil {
-				log.Printf("[PID %d] Error recording: %v", ps.TGID, err)
-			} else {
-				log.Printf("[PID %d] used %.2f ms at %s",
-					ps.TGID, float64(ps.DeltaNs)/1e6,
-					time.Unix(0, int64(ps.Timestamp)).Format(time.RFC3339Nano))
+			if err := m.TimeHist.RecordValue(int64(ps.DeltaNs)); err != nil {
+				log.Printf("[PID %d] Error recording: %v (value=%d ns = %.0f sec)",
+					ps.TGID, err, ps.DeltaNs, float64(ps.DeltaNs)/1e9)
 			}
+
+			// Accumulate hardware counter values
+			m.TotalCycles += ps.Cycles
+			m.TotalInstructions += ps.Instructions
+			m.TotalCacheMisses += ps.CacheMisses
+			m.SampleCount++
 
 		case int(unsafe.Sizeof(CpuStat{})):
 			cs := (*CpuStat)(unsafe.Pointer(&rec.RawSample[0]))
@@ -104,6 +122,16 @@ func (c *CPUUsageCollector) GetHistogram(pid uint32) *hdrhistogram.Histogram {
 
 func (c *CPUUsageCollector) GetAllHistograms() map[uint32]*hdrhistogram.Histogram {
 	return c.histograms
+}
+
+// GetMetrics returns the metrics for a specific PID
+func (c *CPUUsageCollector) GetMetrics(pid uint32) *PidMetrics {
+	return c.metrics[pid]
+}
+
+// GetAllMetrics returns all PID metrics
+func (c *CPUUsageCollector) GetAllMetrics() map[uint32]*PidMetrics {
+	return c.metrics
 }
 
 func (c *CPUUsageCollector) Close() error {

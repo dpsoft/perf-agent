@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -26,6 +27,13 @@ import (
 	p "github.com/google/pprof/profile"
 )
 
+var (
+	flagProfile  = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagPMU      = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
+	flagPID      = flag.Int("pid", 0, "Target process ID to monitor (required)")
+	flagDuration = flag.Duration("duration", 10*time.Second, "Collection duration")
+)
+
 type stackBuilder struct {
 	stack []string
 }
@@ -38,12 +46,27 @@ func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)
 }
 
-const pid int = 1271369
-
-//const pid int = 528425
+// Profiler state for cleanup and profile collection
+type profilerState struct {
+	objs       *profile.PerfObjects
+	symbolizer *blazesym.Symbolizer
+	perfEvents []*perfEvent
+}
 
 func main() {
-	// Grant CAP_SYS_ADMIN for perf event access
+	flag.Parse()
+
+	// Validate flags
+	if !*flagProfile && !*flagPMU {
+		log.Fatal("At least one of --profile or --pmu must be specified")
+	}
+	if *flagPID == 0 {
+		log.Fatal("--pid is required")
+	}
+
+	pid := *flagPID
+
+	// Common setup: Set capabilities
 	caps := cap.GetProc()
 	err := caps.SetFlag(cap.Effective, true, cap.SYS_ADMIN, cap.PERFMON)
 	if err != nil {
@@ -55,11 +78,69 @@ func main() {
 		log.Fatalf("Failed to remove memlock: %v", err)
 	}
 
-	objs := profile.PerfObjects{}
-	if err := profile.LoadPerfObjects(&objs, nil); err != nil {
-		log.Fatal(err)
+	// Get online CPUs
+	onlineCPUIDs, err := cpuonline.Get()
+	if err != nil {
+		log.Fatalf("failed to get online CPUs: %v", err)
 	}
-	defer objs.Close()
+
+	var profilerCleanup func()
+	var profiler *profilerState
+
+	var pmuCleanup func()
+	var collector *cpu.CPUUsageCollector
+
+	// Setup profiler if enabled
+	if *flagProfile {
+		profiler, profilerCleanup, err = setupProfiler(pid, onlineCPUIDs)
+		if err != nil {
+			log.Fatalf("Failed to setup profiler: %v", err)
+		}
+		defer profilerCleanup()
+		log.Println("Profiler enabled")
+	}
+
+	// Setup PMU monitor if enabled
+	if *flagPMU {
+		collector, pmuCleanup, err = setupPMUMonitor(pid, onlineCPUIDs)
+		if err != nil {
+			log.Fatalf("Failed to setup PMU monitor: %v", err)
+		}
+		defer pmuCleanup()
+		log.Println("PMU monitor enabled")
+	}
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for duration or signal
+	fmt.Printf("Collecting data for %v (Ctrl+C to stop early)...\n", *flagDuration)
+
+	select {
+	case <-time.After(*flagDuration):
+		fmt.Println("Collection duration completed")
+	case sig := <-sigChan:
+		fmt.Printf("\nReceived signal: %s\n", sig)
+	}
+
+	// Collect and print results
+	if *flagPMU && collector != nil {
+		printPMUMetrics(collector)
+	}
+
+	if *flagProfile && profiler != nil {
+		collectAndWriteProfile(profiler, pid)
+	}
+
+	fmt.Println("Exiting program.")
+}
+
+func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
+	objs := &profile.PerfObjects{}
+	if err := profile.LoadPerfObjects(objs, nil); err != nil {
+		return nil, nil, fmt.Errorf("load profile objects: %w", err)
+	}
 
 	config := profile.PerfPidConfig{
 		Type:          0,
@@ -67,150 +148,198 @@ func main() {
 		CollectKernel: 0,
 	}
 
-	err = objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny)
-	if err != nil {
-		log.Fatalf("failed to update pid map: %v", err)
+	if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {
+		objs.Close()
+		return nil, nil, fmt.Errorf("update pid map: %w", err)
 	}
 
-	onlineCPUIDs, err := cpuonline.Get()
-	if err != nil {
-		log.Fatalf("failed to get online CPUs: %v", err)
-	}
-
-	for _, id := range onlineCPUIDs {
+	var perfEvents []*perfEvent
+	for _, id := range cpus {
 		pe, err := newPerfEvent(int(id), 10000)
 		if err != nil {
-			log.Fatalf("failed to create perf event on CPU %d: %v", id, err)
+			// Cleanup already created perf events
+			for _, pe := range perfEvents {
+				pe.Close()
+			}
+			objs.Close()
+			return nil, nil, fmt.Errorf("create perf event on CPU %d: %w", id, err)
 		}
 
-		err = pe.attachPerfEvent(objs.Profile)
-		if err != nil {
-			log.Fatalf("failed to attach eBPF program to perf event on CPU %d: %v", id, err)
+		if err := pe.attachPerfEvent(objs.Profile); err != nil {
+			pe.Close()
+			for _, pe := range perfEvents {
+				pe.Close()
+			}
+			objs.Close()
+			return nil, nil, fmt.Errorf("attach eBPF to perf event on CPU %d: %w", id, err)
 		}
+
+		perfEvents = append(perfEvents, pe)
 	}
 
-	//symbolizer
 	symbolizer, err := blazesym.NewSymbolizer()
-	defer symbolizer.Close()
-
 	if err != nil {
-		log.Fatalf("Failed to create symbolizer: %v", err)
+		for _, pe := range perfEvents {
+			pe.Close()
+		}
+		objs.Close()
+		return nil, nil, fmt.Errorf("create symbolizer: %w", err)
 	}
 
-	// Load CPU usage eBPF objects
-	cpuObjs := cpu.CPUObjects{}
-
-	if err := cpu.LoadCPUObjects(&cpuObjs, nil); err != nil {
-		log.Fatalf("Failed to load CPU usage objects: %v", err)
+	state := &profilerState{
+		objs:       objs,
+		symbolizer: symbolizer,
+		perfEvents: perfEvents,
 	}
-	defer cpuObjs.Close()
 
-	// Clear ALL CPU-related maps on startup
-	//log.Println("Clearing all CPU usage maps on startup...")
-	//zero := uint64(0)
-	//
-	//// 1. Clear cpu_usage map (per-CPU accumulated deltas)
-	//numCPUs := runtime.NumCPU()
-	//if numCPUs > 1024 {
-	//	numCPUs = 1024
-	//}
-	//for cpu := 0; cpu < numCPUs; cpu++ {
-	//	for offset := 0; offset < 8; offset++ { // CPU_USAGE_GROUP_WIDTH = 8
-	//		idx := uint32(cpu*8 + offset)
-	//		cpuObjs.CpuUsage.Update(idx, &zero, 0)
-	//	}
-	//}
-	//
-	//// 2. Clear per-PID maps by iterating through all entries
-	//log.Println("Clearing PID maps (this may take a moment)...")
-	//var pid uint32
-	//var value uint64
-	//
-	//// Clear pid_cpu_user_time
-	//c := cpuObjs.PidCpuUserTime.Iterate()
-	//pidsToClear := []uint32{}
-	//for c.Next(&pid, &value) {
-	//	pidsToClear = append(pidsToClear, pid)
-	//}
-	//for _, pid := range pidsToClear {
-	//	cpuObjs.PidCpuUserTime.Update(pid, &zero, 0)
-	//}
-	//
-	//// Clear pid_cpu_system_time
-	//c = cpuObjs.PidCpuSystemTime.Iterate()
-	//pidsToClear = []uint32{}
-	//for c.Next(&pid, &value) {
-	//	pidsToClear = append(pidsToClear, pid)
-	//}
-	//for _, pid := range pidsToClear {
-	//	cpuObjs.PidCpuSystemTime.Update(pid, &zero, 0)
-	//}
-	//
-	//log.Println("All maps cleared successfully")
+	cleanup := func() {
+		symbolizer.Close()
+		for _, pe := range perfEvents {
+			pe.Close()
+		}
+		objs.Close()
+	}
 
-	tp, err := link.Tracepoint("sched", "sched_switch", cpuObjs.CPUPrograms.HandleSwitch, nil)
+	return state, cleanup, nil
+}
+
+func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), error) {
+	cpuObjs := &cpu.CPUObjects{}
+	if err := cpu.LoadCPUObjects(cpuObjs, nil); err != nil {
+		return nil, nil, fmt.Errorf("load CPU objects: %w", err)
+	}
+
+	// Initialize hardware perf counters
+	cpuList := make([]int, len(cpus))
+	for i, id := range cpus {
+		cpuList[i] = int(id)
+	}
+
+	var hwPerf *cpu.HardwarePerfEvents
+	hwPerf, err := cpu.NewHardwarePerfEvents(cpuList)
 	if err != nil {
-		log.Fatalf("attach tracepoint sched_switch: %v", err)
+		log.Printf("Hardware perf counters unavailable (running in VM?): %v", err)
+	} else {
+		err = hwPerf.AttachToMaps(
+			cpuObjs.CpuCyclesReader,
+			cpuObjs.CpuInstructionsReader,
+			cpuObjs.CacheMissesReader,
+		)
+		if err != nil {
+			log.Printf("Failed to attach HW counters to maps: %v", err)
+			hwPerf.Close()
+			hwPerf = nil
+		} else {
+			if err := hwPerf.EnableInBPF(cpuObjs.HwCountersEnabled); err != nil {
+				log.Printf("Failed to enable HW counters in eBPF: %v", err)
+			} else {
+				log.Println("Hardware perf counters enabled (cycles, instructions, cache misses)")
+			}
+		}
 	}
-	defer tp.Close()
 
-	fexit, err := link.AttachTracing(link.TracingOptions{
-		Program: cpuObjs.CPUPrograms.OnKcpustatFetch,
+	tp, err := link.AttachTracing(link.TracingOptions{
+		Program: cpuObjs.CPUPrograms.HandleSwitch,
 	})
 	if err != nil {
-		log.Fatalf("attach fexit kcpustat_fetch: %v", err)
+		if hwPerf != nil {
+			hwPerf.Close()
+		}
+		cpuObjs.Close()
+		return nil, nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
-	defer fexit.Close()
 
-	//kprobe, err := link.Kprobe("cpuacct_account_field", cpuObjs.CPUPrograms.CpuacctAccountFieldKprobe, nil)
-	//if err != nil {
-	//	log.Fatalf("attach kprobe cpuacct_account_field: %v", err)
-	//}
-	//defer kprobe.Close()
-
-	//tpEnter, err := link.Tracepoint("irq", "softirq_entry", cpuObjs.CPUPrograms.SoftirqEnter, nil)
-	//if err != nil {
-	//	log.Fatalf("attach tracepoint softirq_entry: %v", err)
-	//}
-	//defer tpEnter.Close()
-	//
-	//tpExit, err := link.Tracepoint("irq", "softirq_exit", cpuObjs.CPUPrograms.SoftirqExit, nil)
-	//if err != nil {
-	//	log.Fatalf("attach tracepoint softirq_exit: %v", err)
-	//}
-	//defer tpExit.Close()
-
-	// Create collector
-	collector, _ := cpu.NewCPUUsageCollector(&cpuObjs)
-
-	// Configure which PIDs to track
-	trackValue := uint8(1)
-	err = cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny)
+	collector, err := cpu.NewCPUUsageCollector(cpuObjs)
 	if err != nil {
-		log.Fatalf("Failed to configure tracked PIDs: %v", err)
+		tp.Close()
+		if hwPerf != nil {
+			hwPerf.Close()
+		}
+		cpuObjs.Close()
+		return nil, nil, fmt.Errorf("create CPU usage collector: %w", err)
 	}
 
-	// Poll periodically
-	ticker := time.NewTicker(1 * time.Second) // Poll every second
-	defer ticker.Stop()
+	// Configure PID filter
+	trackValue := uint8(1)
+	if err := cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
+		tp.Close()
+		if hwPerf != nil {
+			hwPerf.Close()
+		}
+		cpuObjs.Close()
+		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
+	}
+
+	// Start polling goroutine
+	ticker := time.NewTicker(1 * time.Second)
+	stopPolling := make(chan struct{})
 
 	go func() {
-		for range ticker.C {
-			if err := collector.ReadCPUUsage(); err != nil {
-				log.Printf("Error reading CPU usage: %v", err)
+		for {
+			select {
+			case <-ticker.C:
+				if err := collector.ReadCPUUsage(); err != nil {
+					log.Printf("Error reading CPU usage: %v", err)
+				}
+			case <-stopPolling:
+				return
 			}
 		}
 	}()
 
-	//go func() {
-	//	for {
-	fmt.Println("Waiting...")
-	time.Sleep(10 * time.Second)
+	cleanup := func() {
+		close(stopPolling)
+		ticker.Stop()
+		tp.Close()
+		if hwPerf != nil {
+			hwPerf.Close()
+		}
+		cpuObjs.Close()
+	}
 
-	var (
-		m       = objs.PerfMaps.Counts
-		mapSize = m.MaxEntries()
-	)
+	return collector, cleanup, nil
+}
+
+func printPMUMetrics(collector *cpu.CPUUsageCollector) {
+	for pid, m := range collector.GetAllMetrics() {
+		fmt.Printf("\n=== PID %d Metrics ===\n", pid)
+		fmt.Printf("Samples: %d\n", m.SampleCount)
+
+		// Time histogram stats
+		hist := m.TimeHist
+		fmt.Printf("\nScheduling Latency (time on CPU per switch):\n")
+		fmt.Printf("  Min:    %.3f ms\n", float64(hist.Min())/1e6)
+		fmt.Printf("  Max:    %.3f ms\n", float64(hist.Max())/1e6)
+		fmt.Printf("  Mean:   %.3f ms\n", hist.Mean()/1e6)
+		fmt.Printf("  P50:    %.3f ms\n", float64(hist.ValueAtQuantile(50.0))/1e6)
+		fmt.Printf("  P95:    %.3f ms\n", float64(hist.ValueAtQuantile(95.0))/1e6)
+		fmt.Printf("  P99:    %.3f ms\n", float64(hist.ValueAtQuantile(99.0))/1e6)
+		fmt.Printf("  P99.9:  %.3f ms\n", float64(hist.ValueAtQuantile(99.9))/1e6)
+
+		// Hardware counters
+		if m.TotalCycles > 0 || m.TotalInstructions > 0 {
+			fmt.Printf("\nHardware Counters:\n")
+			fmt.Printf("  Total Cycles:       %d\n", m.TotalCycles)
+			fmt.Printf("  Total Instructions: %d\n", m.TotalInstructions)
+			fmt.Printf("  Total Cache Misses: %d\n", m.TotalCacheMisses)
+
+			if m.TotalCycles > 0 {
+				ipc := float64(m.TotalInstructions) / float64(m.TotalCycles)
+				fmt.Printf("  IPC (Instr/Cycle):  %.3f\n", ipc)
+			}
+			if m.TotalInstructions > 0 {
+				missRate := float64(m.TotalCacheMisses) / float64(m.TotalInstructions) * 1000
+				fmt.Printf("  Cache Misses/1K Instr: %.3f\n", missRate)
+			}
+		} else {
+			fmt.Printf("\nHardware Counters: not available\n")
+		}
+	}
+}
+
+func collectAndWriteProfile(profiler *profilerState, pid int) {
+	m := profiler.objs.PerfMaps.Counts
+	mapSize := m.MaxEntries()
 
 	keys := make([]profile.PerfSampleKey, mapSize)
 	values := make([]uint64, mapSize)
@@ -220,164 +349,110 @@ func main() {
 
 	n, err := m.BatchLookupAndDelete(cursor, keys, values, opts)
 	if n > 0 {
-		log.Printf("BatchLookupAndDelete: %d", n)
-
+		log.Printf("BatchLookupAndDelete: %d samples", n)
 	}
 
 	if errors.Is(err, ebpf.ErrKeyNotExist) {
-		log.Printf("BatchLookupAndDelete: %s", err)
+		// Expected when map is empty or all entries processed
+	} else if err != nil {
+		log.Printf("BatchLookupAndDelete error: %v", err)
 	}
 
-	log.Println(
-		"msg", "getCountsMapValues iter",
-		"count", len(keys),
-	)
+	if n == 0 {
+		log.Println("No profile samples collected")
+		return
+	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
 		SampleRate:    int64(97),
 		PerPIDProfile: false,
 	})
 
-	for i := 0; i < len(keys); i++ {
-
-		//for _, k := range keys {
-		//if config.CollectUser > 0 {
-		//var userStack uint8
-		//var kernelStack
+	for i := 0; i < n; i++ {
 		key := keys[i]
 		value := values[i]
-		stack, err := objs.Stackmap.LookupBytes(uint32(key.UserStack))
+
+		stack, err := profiler.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
+			continue
 		}
 
 		if len(stack) == 0 {
-			return
+			continue
 		}
-
-		//var fullStack []uint64
 
 		sb := new(stackBuilder)
 		begin := len(sb.stack)
 
-		for i := 0; i < 127; i++ {
-			instructionPointerBytes := stack[i*8 : i*8+8]
+		for j := 0; j < 127; j++ {
+			instructionPointerBytes := stack[j*8 : j*8+8]
 			instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
 			if instructionPointer == 0 {
 				break
 			}
 
-			symbol, err := symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
+			symbol, err := profiler.symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
 			if err != nil {
-				log.Println("Failed to symbolize: %v", err)
+				log.Printf("Failed to symbolize: %v", err)
 				break
 			}
 
 			sb.append(symbol[0].Name)
-			//fullStack = append(fullStack, instructionPointer)
 		}
 
-		//var results []string
-		//symbols, err := symbolizer.Symbolize(uint32(pid), fullStack)
-		//if err != nil {
-		//	log.Println("Failed to symbolize: %v", err)
-		//}
-
-		//for _, symbol := range symbols {
-		//	//results = append(results, fmt.Sprintf("%s:%d", symbol.Name, symbol.Line))
-		//	sb.append(symbol.Name)
-		//}
 		end := len(sb.stack)
 		Reverse(sb.stack[begin:end])
 
-		caca := sample(sb, value)
-
-		builders.AddSample(&caca)
-
-		builder := builders.BuilderForSample(&caca)
-
-		buf := bytes.NewBuffer(nil)
-		_, err = builder.Write(buf)
-		if err != nil {
-			log.Fatalf("Failed to write profile: %v", err)
-		}
-		rawProfile := buf.Bytes()
-
-		parsed, err := p.Parse(bytes.NewBuffer(rawProfile))
-		if err != nil {
-			log.Fatalf("Failed to write profile: %v", err)
-		}
-		//log.Println(parsed)
-
-		file, err := os.Create("profile.pb.gz")
-		if err != nil {
-			log.Fatalf("Failed to create profile file: %v", err)
-		}
-		defer file.Close()
-
-		if err := parsed.Write(file); err != nil {
-			log.Fatalf("Failed to write profile to file: %v", err)
-		} //err = objs.Stackmap.Lookup(uint32(k.KernStack), kernelStack)
-		//if err != nil {
-		//	log.Printf("Failed to lookup kernel stack: %v", err)
-		//}
-		//log.Println(symbolizer.Symbolize(uint32(pid), userStack))
-		//log.Println(symbolizer.Symbolize(uint32(pid), kernelStack))
-		//}
+		sample := createSample(sb, value, pid)
+		builders.AddSample(&sample)
 	}
 
-	log.Println("keys:", keys)
-	log.Println("values:", values)
-
-	log.Println("eBPF program successfully loaded and attached")
-
-	//log.Println("Results:", results)
-	// Create a channel to receive OS signals.
-	sigChan := make(chan os.Signal, 1)
-
-	// Notify the channel on interrupt and terminate signals.
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Block until a signal is received.
-	sig := <-sigChan
-
-	fmt.Printf("Received signal: %s\n", sig)
-
-	// Perform cleanup here if necessary.
-
-	// Print histogram statistics
-	for pid, hist := range collector.GetAllHistograms() {
-		fmt.Printf("\n=== PID %d CPU Usage Histogram ===\n", pid)
-		fmt.Printf("Count: %d\n", hist.TotalCount())
-		fmt.Printf("Min: %.2f%%\n", float64(hist.Min())/10000.0)
-		fmt.Printf("Max: %.2f%%\n", float64(hist.Max())/10000.0)
-		fmt.Printf("Mean: %.2f%%\n", hist.Mean()/10000.0)
-		fmt.Printf("StdDev: %.2f%%\n", hist.StdDev()/10000.0)
-		fmt.Printf("P50: %.2f%%\n", float64(hist.ValueAtQuantile(50.0))/10000.0)
-		fmt.Printf("P95: %.2f%%\n", float64(hist.ValueAtQuantile(95.0))/10000.0)
-		fmt.Printf("P99: %.2f%%\n", float64(hist.ValueAtQuantile(99.0))/10000.0)
-		fmt.Printf("P99.9: %.2f%%\n", float64(hist.ValueAtQuantile(99.9))/10000.0)
-
-		// Export histogram to file (HDR format)
-		//histFile, err := os.Create(fmt.Sprintf("cpu_usage_pid_%d.hdr", pid))
-		//if err == nil {
-		//	hist.Export(histFile)
-		//	histFile.Close()
-		//}
+	// Get builder and write profile
+	var buf bytes.Buffer
+	for _, builder := range builders.Builders {
+		_, err = builder.Write(&buf)
+		if err != nil {
+			log.Printf("Failed to write profile: %v", err)
+			return
+		}
+		break // Only need first builder for non-per-PID profile
 	}
 
-	fmt.Println("Exiting program.")
+	if buf.Len() == 0 {
+		log.Println("No profile data to write")
+		return
+	}
+
+	parsed, err := p.Parse(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		log.Printf("Failed to parse profile: %v", err)
+		return
+	}
+
+	file, err := os.Create("profile.pb.gz")
+	if err != nil {
+		log.Printf("Failed to create profile file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	if err := parsed.Write(file); err != nil {
+		log.Printf("Failed to write profile to file: %v", err)
+		return
+	}
+
+	log.Println("Profile written to profile.pb.gz")
 }
 
-func sample(sb *stackBuilder, value uint64) pprof.ProfileSample {
-	caca := pprof.ProfileSample{
+func createSample(sb *stackBuilder, value uint64, pid int) pprof.ProfileSample {
+	return pprof.ProfileSample{
 		Pid:         uint32(pid),
 		Aggregation: pprof.SampleAggregated,
 		SampleType:  pprof.SampleTypeCpu,
 		Stack:       sb.stack,
 		Value:       value,
 	}
-	return caca
 }
 
 func Reverse[S ~[]E, E any](s S) {

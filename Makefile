@@ -34,7 +34,7 @@ test-unit: generate
 
 .PHONY: test-integration
 test-integration: build test-workloads
-	cd test && bash run_tests.sh
+	cd test && CGO_CFLAGS="-I$(LIBBLAZESYM_INC)" CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release)" bash run_tests.sh
 
 .PHONY: test
 test: test-unit test-integration

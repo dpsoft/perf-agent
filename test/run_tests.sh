@@ -3,6 +3,33 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Set CGO flags for blazesym if not already set
+# Users can override these by setting them before running this script
+if [ -z "$CGO_CFLAGS" ]; then
+    # Check common locations for blazesym
+    if [ -f "/usr/local/include/blazesym.h" ]; then
+        export CGO_CFLAGS="-I/usr/local/include"
+    elif [ -d "$HOME/github/blazesym/capi/include" ]; then
+        export CGO_CFLAGS="-I$HOME/github/blazesym/capi/include"
+    fi
+fi
+
+if [ -z "$CGO_LDFLAGS" ]; then
+    if [ -f "/usr/local/lib/libblazesym_c.a" ]; then
+        export CGO_LDFLAGS="-L/usr/local/lib"
+    elif [ -d "$HOME/github/blazesym/target/release" ]; then
+        export CGO_LDFLAGS="-L$HOME/github/blazesym/target/release"
+    fi
+fi
+
+# Export for child processes
+export CGO_CFLAGS
+export CGO_LDFLAGS
+
+echo "Using CGO_CFLAGS: $CGO_CFLAGS"
+echo "Using CGO_LDFLAGS: $CGO_LDFLAGS"
+echo ""
+
 echo "=== Building test workloads ==="
 
 # Build Go workloads
@@ -29,8 +56,12 @@ chmod +x workloads/python/*.py
 echo ""
 echo "=== Building perf-agent ==="
 cd ..
-go generate ./...
-go build -o perf-agent
+if [ -f "perf-agent" ] && [ "perf-agent" -nt "main.go" ]; then
+    echo "perf-agent already built and up to date, skipping..."
+else
+    go generate ./...
+    go build -o perf-agent
+fi
 cd test
 
 echo ""
@@ -43,7 +74,7 @@ echo ""
 echo "=== Running integration tests ==="
 if [ "$(id -u)" -ne 0 ]; then
     echo "Integration tests require root. Running with sudo..."
-    sudo -E go test -v -timeout 5m ./...
+    sudo CGO_CFLAGS="$CGO_CFLAGS" CGO_LDFLAGS="$CGO_LDFLAGS" $(which go) test -v -timeout 5m ./...
 else
     go test -v -timeout 5m ./...
 fi

@@ -67,20 +67,14 @@ jobs:
           echo "ERROR: No blazesym library found!"
           exit 1
         fi
-    
-    - name: Update blazesym path for CI
-      run: |
-        echo "Original blazesym.go CGO flags:"
-        grep "cgo LDFLAGS" blazesym/blazesym.go
-        # Update to use /tmp/blazesym path
-        sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
-        echo "Updated blazesym.go CGO flags:"
-        grep "cgo LDFLAGS" blazesym/blazesym.go
-    
+
     - name: Run go generate
       run: go generate ./...
-    
+
     - name: Build perf-agent
+      env:
+        CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+        CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
       run: go build -v .
     
     - name: Run unit tests

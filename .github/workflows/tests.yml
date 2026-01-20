@@ -47,14 +47,13 @@ jobs:
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
 
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
-
       - name: Generate eBPF code
         run: go generate ./...
 
       - name: Run unit tests
+        env:
+          CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+          CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/...
 
       - name: Upload coverage
@@ -108,19 +107,21 @@ jobs:
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
 
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
-
       - name: Build test workloads
         run: make test-workloads
 
       - name: Generate and build perf-agent
+        env:
+          CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+          CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
         run: |
           go generate ./...
           go build -o perf-agent
 
       - name: Run integration tests
+        env:
+          CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+          CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
         run: |
           cd test
           sudo -E $(which go) test -v -timeout 15m ./...
@@ -165,11 +166,10 @@ jobs:
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
 
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
-
       - name: Generate eBPF code
+        env:
+          CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+          CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
         run: go generate ./...
 
       - name: golangci-lint
@@ -221,10 +221,6 @@ jobs:
           cd /tmp/blazesym
           cargo build --release --package blazesym-c
 
-      - name: Update blazesym path
-        run: |
-          sed -i 's|/home/diego/github/blazesym|/tmp/blazesym|g' blazesym/blazesym.go
-
       - name: Generate eBPF code
         run: go generate ./...
 
@@ -232,6 +228,8 @@ jobs:
         env:
           GOOS: linux
           GOARCH: amd64
+          CGO_CFLAGS: "-I/tmp/blazesym/capi/include"
+          CGO_LDFLAGS: "-L/tmp/blazesym/target/release"
         run: go build -v -o perf-agent-linux-amd64
 
       - name: Upload artifact

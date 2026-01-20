@@ -22,7 +22,7 @@ sudo apt-get install -y clang llvm libelf-dev linux-headers-$(uname -r)
 
 ## Building Blazesym
 
-perf-agent requires the blazesym library for symbol resolution. You need to build it before building perf-agent.
+perf-agent uses the official Go bindings from `github.com/libbpf/blazesym/go`. You need to build the blazesym C library before building perf-agent.
 
 ### Option 1: Local Development Setup
 
@@ -33,14 +33,16 @@ git clone https://github.com/libbpf/blazesym.git
 cd blazesym
 
 # Build the C library
-cargo build --release --features=cheader
+cargo build --release --package blazesym-c
 
 # The library will be at: target/release/libblazesym_c.a
 ```
 
-Update `blazesym/blazesym.go` if you cloned to a different location:
-```go
-#cgo LDFLAGS: -L /usr/lib -L /usr/local/lib -L /path/to/your/blazesym/target/release -lblazesym_c -static
+Then build perf-agent using `CGO_CFLAGS` and `CGO_LDFLAGS`:
+```bash
+CGO_CFLAGS="-I$HOME/github/blazesym/capi/include" \
+CGO_LDFLAGS="-L$HOME/github/blazesym/target/release" \
+go build .
 ```
 
 ### Option 2: System-Wide Installation
@@ -49,16 +51,16 @@ Update `blazesym/blazesym.go` if you cloned to a different location:
 # Clone and build
 git clone https://github.com/libbpf/blazesym.git
 cd blazesym
-cargo build --release --features=cheader
+cargo build --release --package blazesym-c
 
 # Install system-wide
-sudo mkdir -p /usr/local/lib
+sudo mkdir -p /usr/local/lib /usr/local/include
 sudo cp target/release/libblazesym_c.a /usr/local/lib/
-sudo cp target/release/libblazesym_c.so /usr/local/lib/
+sudo cp capi/include/blazesym.h /usr/local/include/
 sudo ldconfig
 ```
 
-With this option, you don't need to modify any paths - the linker will find it in `/usr/local/lib`.
+With this option, you don't need to set `CGO_CFLAGS` or `CGO_LDFLAGS` - the compiler will find them in the default system paths.
 
 ## Building perf-agent
 
@@ -68,7 +70,12 @@ Once blazesym is set up:
 # Generate BPF code
 go generate ./...
 
-# Build the agent
+# Build the agent (use CGO_CFLAGS/CGO_LDFLAGS if blazesym is not installed system-wide)
+CGO_CFLAGS="-I/path/to/blazesym/capi/include" \
+CGO_LDFLAGS="-L/path/to/blazesym/target/release" \
+go build -o perf-agent
+
+# Or if blazesym is installed system-wide:
 go build -o perf-agent
 
 # Run tests
@@ -109,9 +116,9 @@ sudo -E go test -v ./...
 
 The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
 1. Installs all dependencies
-2. Builds blazesym and installs to `/usr/local/lib`
+2. Builds blazesym
 3. Generates BPF code
-4. Builds perf-agent
+4. Builds perf-agent using `CGO_CFLAGS` and `CGO_LDFLAGS`
 5. Runs unit tests
 6. Builds test workloads
 
@@ -119,23 +126,39 @@ The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
 
 ### Error: "cannot find -lblazesym_c"
 
-This means the linker can't find the blazesym library. Check:
+This means the linker can't find the blazesym library. Solutions:
 
-1. **Blazesym is built:**
+1. **Set CGO_CFLAGS and CGO_LDFLAGS:**
    ```bash
-   ls ~/github/blazesym/target/release/libblazesym_c.a
+   CGO_CFLAGS="-I/path/to/blazesym/capi/include" \
+   CGO_LDFLAGS="-L/path/to/blazesym/target/release" \
+   go build .
    ```
 
-2. **Path is correct in `blazesym/blazesym.go`:**
-   ```go
-   #cgo LDFLAGS: -L /usr/lib -L /usr/local/lib -L /path/to/blazesym/target/release -lblazesym_c -static
+2. **Verify blazesym is built:**
+   ```bash
+   ls ~/github/blazesym/target/release/libblazesym_c.a
+   ls ~/github/blazesym/capi/include/blazesym.h
    ```
 
 3. **Or install system-wide:**
    ```bash
    sudo cp ~/github/blazesym/target/release/libblazesym_c.a /usr/local/lib/
+   sudo cp ~/github/blazesym/capi/include/blazesym.h /usr/local/include/
    sudo ldconfig
    ```
+
+### Error: "blazesym.h: No such file or directory"
+
+This means the compiler can't find the blazesym header file. Set `CGO_CFLAGS`:
+```bash
+CGO_CFLAGS="-I/path/to/blazesym/capi/include" go build .
+```
+
+Or install the header system-wide:
+```bash
+sudo cp ~/github/blazesym/capi/include/blazesym.h /usr/local/include/
+```
 
 ### Error: "kernel.org/pub/linux/libs/security/libcap" issues
 
@@ -174,17 +197,26 @@ cd perf-agent
 # 2. Build blazesym (one-time setup)
 git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
 cd /tmp/blazesym
-cargo build --release --features=cheader
-sudo cp target/release/libblazesym_c.a /usr/local/lib/
-sudo ldconfig
+cargo build --release --package blazesym-c
 cd -
 
 # 3. Build perf-agent
 go generate ./...
+CGO_CFLAGS="-I/tmp/blazesym/capi/include" \
+CGO_LDFLAGS="-L/tmp/blazesym/target/release" \
 go build -o perf-agent
 
 # 4. Run it!
 sudo ./perf-agent --profile --pid <PID> --duration 30s
+```
+
+Or install blazesym system-wide for simpler builds:
+```bash
+sudo mkdir -p /usr/local/lib /usr/local/include
+sudo cp /tmp/blazesym/target/release/libblazesym_c.a /usr/local/lib/
+sudo cp /tmp/blazesym/capi/include/blazesym.h /usr/local/include/
+sudo ldconfig
+go build -o perf-agent
 ```
 
 ## Platform Support

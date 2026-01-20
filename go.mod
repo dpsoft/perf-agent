@@ -1,6 +1,6 @@
 module perf-agent
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
@@ -10,6 +10,7 @@ require (
 	github.com/google/pprof v0.0.0-20240727154555-813a5fbdbec8
 	github.com/iovisor/gobpf v0.2.0
 	github.com/klauspost/compress v1.17.10
+	github.com/libbpf/blazesym/go v0.0.0-20260119160357-eda2b90327e5
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sys v0.38.0
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.73

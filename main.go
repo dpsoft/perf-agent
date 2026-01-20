@@ -21,7 +21,7 @@ import (
 
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
-	"perf-agent/blazesym"
+	blazesym "github.com/libbpf/blazesym/go"
 	"perf-agent/pprof"
 	"perf-agent/profile"
 
@@ -204,7 +204,7 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 		perfEvents = append(perfEvents, pe)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer()
+	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
 	if err != nil {
 		for _, pe := range perfEvents {
 			pe.Close()
@@ -419,7 +419,12 @@ func collectAndWriteProfile(profiler *profilerState, pid int) {
 				break
 			}
 
-			symbol, err := profiler.symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
+			symbol, err := profiler.symbolizer.SymbolizeProcessAbsAddrs(
+				[]uint64{instructionPointer},
+				uint32(pid),
+				blazesym.ProcessSourceWithPerfMap(true),
+				blazesym.ProcessSourceWithDebugSyms(true),
+			)
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
 				break
@@ -510,7 +515,7 @@ func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
 		return nil, nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer()
+	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
 	if err != nil {
 		tp.Close()
 		objs.Close()
@@ -587,7 +592,12 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
 				break
 			}
 
-			symbol, err := profiler.symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
+			symbol, err := profiler.symbolizer.SymbolizeProcessAbsAddrs(
+				[]uint64{instructionPointer},
+				uint32(pid),
+				blazesym.ProcessSourceWithPerfMap(true),
+				blazesym.ProcessSourceWithDebugSyms(true),
+			)
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
 				break

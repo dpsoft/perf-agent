@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"perf-agent/cpu"
+	"perf-agent/offcpu"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 
 var (
 	flagProfile  = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagOffCpu   = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
 	flagPMU      = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
 	flagPID      = flag.Int("pid", 0, "Target process ID to monitor (required)")
 	flagDuration = flag.Duration("duration", 10*time.Second, "Collection duration")
@@ -53,12 +55,19 @@ type profilerState struct {
 	perfEvents []*perfEvent
 }
 
+// Off-CPU profiler state for cleanup and profile collection
+type offcpuState struct {
+	objs       *offcpu.OffcpuObjects
+	symbolizer *blazesym.Symbolizer
+	link       link.Link
+}
+
 func main() {
 	flag.Parse()
 
 	// Validate flags
-	if !*flagProfile && !*flagPMU {
-		log.Fatal("At least one of --profile or --pmu must be specified")
+	if !*flagProfile && !*flagPMU && !*flagOffCpu {
+		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 	if *flagPID == 0 {
 		log.Fatal("--pid is required")
@@ -87,6 +96,9 @@ func main() {
 	var profilerCleanup func()
 	var profiler *profilerState
 
+	var offcpuCleanup func()
+	var offcpuProfiler *offcpuState
+
 	var pmuCleanup func()
 	var collector *cpu.CPUUsageCollector
 
@@ -98,6 +110,16 @@ func main() {
 		}
 		defer profilerCleanup()
 		log.Println("Profiler enabled")
+	}
+
+	// Setup off-CPU profiler if enabled
+	if *flagOffCpu {
+		offcpuProfiler, offcpuCleanup, err = setupOffcpuProfiler(pid)
+		if err != nil {
+			log.Fatalf("Failed to setup off-CPU profiler: %v", err)
+		}
+		defer offcpuCleanup()
+		log.Println("Off-CPU profiler enabled")
 	}
 
 	// Setup PMU monitor if enabled
@@ -131,6 +153,10 @@ func main() {
 
 	if *flagProfile && profiler != nil {
 		collectAndWriteProfile(profiler, pid)
+	}
+
+	if *flagOffCpu && offcpuProfiler != nil {
+		collectAndWriteOffcpuProfile(offcpuProfiler, pid)
 	}
 
 	fmt.Println("Exiting program.")
@@ -459,4 +485,162 @@ func Reverse[S ~[]E, E any](s S) {
 	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
 		s[i], s[j] = s[j], s[i]
 	}
+}
+
+func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
+	objs := &offcpu.OffcpuObjects{}
+	if err := offcpu.LoadOffcpuObjects(objs, nil); err != nil {
+		return nil, nil, fmt.Errorf("load offcpu objects: %w", err)
+	}
+
+	// Configure PID filter
+	trackValue := uint8(1)
+	if err := objs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
+		objs.Close()
+		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
+	}
+
+	// Attach to sched_switch tracepoint
+	tp, err := link.AttachTracing(link.TracingOptions{
+		Program: objs.OffcpuSchedSwitch,
+	})
+	if err != nil {
+		objs.Close()
+		return nil, nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
+	}
+
+	symbolizer, err := blazesym.NewSymbolizer()
+	if err != nil {
+		tp.Close()
+		objs.Close()
+		return nil, nil, fmt.Errorf("create symbolizer: %w", err)
+	}
+
+	state := &offcpuState{
+		objs:       objs,
+		symbolizer: symbolizer,
+		link:       tp,
+	}
+
+	cleanup := func() {
+		symbolizer.Close()
+		tp.Close()
+		objs.Close()
+	}
+
+	return state, cleanup, nil
+}
+
+func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
+	m := profiler.objs.OffcpuCounts
+	mapSize := m.MaxEntries()
+
+	keys := make([]offcpu.OffcpuOffcpuKey, mapSize)
+	values := make([]uint64, mapSize)
+
+	opts := &ebpf.BatchOptions{}
+	cursor := new(ebpf.MapBatchCursor)
+
+	n, err := m.BatchLookupAndDelete(cursor, keys, values, opts)
+	if n > 0 {
+		log.Printf("Off-CPU BatchLookupAndDelete: %d samples", n)
+	}
+
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		// Expected when map is empty or all entries processed
+	} else if err != nil {
+		log.Printf("Off-CPU BatchLookupAndDelete error: %v", err)
+	}
+
+	if n == 0 {
+		log.Println("No off-CPU samples collected")
+		return
+	}
+
+	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		SampleRate:    1, // Not used for off-CPU, but needed for builder
+		PerPIDProfile: false,
+	})
+
+	for i := 0; i < n; i++ {
+		key := keys[i]
+		value := values[i]
+
+		stack, err := profiler.objs.Stackmap.LookupBytes(uint32(key.UserStack))
+		if err != nil {
+			log.Printf("Failed to lookup user stack: %v", err)
+			continue
+		}
+
+		if len(stack) == 0 {
+			continue
+		}
+
+		sb := new(stackBuilder)
+		begin := len(sb.stack)
+
+		for j := 0; j < 127; j++ {
+			instructionPointerBytes := stack[j*8 : j*8+8]
+			instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
+			if instructionPointer == 0 {
+				break
+			}
+
+			symbol, err := profiler.symbolizer.Symbolize(uint32(pid), []uint64{instructionPointer})
+			if err != nil {
+				log.Printf("Failed to symbolize: %v", err)
+				break
+			}
+
+			sb.append(symbol[0].Name)
+		}
+
+		end := len(sb.stack)
+		Reverse(sb.stack[begin:end])
+
+		sample := pprof.ProfileSample{
+			Pid:         uint32(pid),
+			Aggregation: pprof.SampleAggregated,
+			SampleType:  pprof.SampleTypeOffCpu,
+			Stack:       sb.stack,
+			Value:       value,
+		}
+		builders.AddSample(&sample)
+	}
+
+	// Get builder and write profile
+	var buf bytes.Buffer
+	for _, builder := range builders.Builders {
+		_, err = builder.Write(&buf)
+		if err != nil {
+			log.Printf("Failed to write off-CPU profile: %v", err)
+			return
+		}
+		break // Only need first builder for non-per-PID profile
+	}
+
+	if buf.Len() == 0 {
+		log.Println("No off-CPU profile data to write")
+		return
+	}
+
+	parsed, err := p.Parse(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		log.Printf("Failed to parse off-CPU profile: %v", err)
+		return
+	}
+
+	file, err := os.Create("offcpu.pb.gz")
+	if err != nil {
+		log.Printf("Failed to create off-CPU profile file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	if err := parsed.Write(file); err != nil {
+		log.Printf("Failed to write off-CPU profile to file: %v", err)
+		return
+	}
+
+	log.Println("Off-CPU profile written to offcpu.pb.gz")
 }

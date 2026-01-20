@@ -31,6 +31,7 @@ type SampleType uint32
 
 var SampleTypeCpu = SampleType(0)
 var SampleTypeMem = SampleType(1)
+var SampleTypeOffCpu = SampleType(2)
 
 type SampleAggregation bool
 
@@ -110,6 +111,10 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		sampleType = []*profile.ValueType{{Type: "cpu", Unit: "nanoseconds"}}
 		periodType = &profile.ValueType{Type: "cpu", Unit: "nanoseconds"}
 		period = time.Second.Nanoseconds() / b.opt.SampleRate
+	} else if sample.SampleType == SampleTypeOffCpu {
+		sampleType = []*profile.ValueType{{Type: "offcpu", Unit: "nanoseconds"}}
+		periodType = &profile.ValueType{Type: "offcpu", Unit: "nanoseconds"}
+		period = 1 // Direct nanosecond values, not sampled
 	} else {
 		sampleType = []*profile.ValueType{{Type: "alloc_objects", Unit: "count"}, {Type: "alloc_space", Unit: "bytes"}}
 		periodType = &profile.ValueType{Type: "space", Unit: "bytes"}
@@ -248,7 +253,7 @@ func uint64Bytes(s []uint64) []byte {
 }
 func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 	sample := new(profile.Sample)
-	if inputSample.SampleType == SampleTypeCpu {
+	if inputSample.SampleType == SampleTypeCpu || inputSample.SampleType == SampleTypeOffCpu {
 		sample.Value = []int64{0}
 	} else {
 		sample.Value = []int64{0, 0}
@@ -260,6 +265,9 @@ func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 func (p *ProfileBuilder) addValue(inputSample *ProfileSample, sample *profile.Sample) {
 	if inputSample.SampleType == SampleTypeCpu {
 		sample.Value[0] += int64(inputSample.Value) * p.Profile.Period
+	} else if inputSample.SampleType == SampleTypeOffCpu {
+		// Off-CPU values are already in nanoseconds, no scaling needed
+		sample.Value[0] += int64(inputSample.Value)
 	} else {
 		sample.Value[0] += int64(inputSample.Value)
 		sample.Value[1] += int64(inputSample.Value2)

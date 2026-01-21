@@ -12,28 +12,28 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// LoadCPU returns the embedded CollectionSpec for CPU.
-func LoadCPU() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_CPUBytes)
+// loadCpu returns the embedded CollectionSpec for cpu.
+func loadCpu() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_CpuBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load CPU: %w", err)
+		return nil, fmt.Errorf("can't load cpu: %w", err)
 	}
 
 	return spec, err
 }
 
-// LoadCPUObjects loads CPU and converts it into a struct.
+// loadCpuObjects loads cpu and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*CPUObjects
-//	*CPUPrograms
-//	*CPUMaps
+//	*cpuObjects
+//	*cpuPrograms
+//	*cpuMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadCPUObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := LoadCPU()
+func loadCpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadCpu()
 	if err != nil {
 		return err
 	}
@@ -41,25 +41,25 @@ func LoadCPUObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// CPUSpecs contains maps and programs before they are loaded into the kernel.
+// cpuSpecs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type CPUSpecs struct {
-	CPUProgramSpecs
-	CPUMapSpecs
+type cpuSpecs struct {
+	cpuProgramSpecs
+	cpuMapSpecs
 }
 
-// CPUSpecs contains programs before they are loaded into the kernel.
+// cpuSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type CPUProgramSpecs struct {
+type cpuProgramSpecs struct {
 	HandleSwitch *ebpf.ProgramSpec `ebpf:"handle_switch"`
 }
 
-// CPUMapSpecs contains maps before they are loaded into the kernel.
+// cpuMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type CPUMapSpecs struct {
+type cpuMapSpecs struct {
 	CacheMissesReader     *ebpf.MapSpec `ebpf:"cache_misses_reader"`
 	CpuCyclesReader       *ebpf.MapSpec `ebpf:"cpu_cycles_reader"`
 	CpuInstructionsReader *ebpf.MapSpec `ebpf:"cpu_instructions_reader"`
@@ -72,25 +72,25 @@ type CPUMapSpecs struct {
 	Rb                    *ebpf.MapSpec `ebpf:"rb"`
 }
 
-// CPUObjects contains all objects after they have been loaded into the kernel.
+// cpuObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to LoadCPUObjects or ebpf.CollectionSpec.LoadAndAssign.
-type CPUObjects struct {
-	CPUPrograms
-	CPUMaps
+// It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type cpuObjects struct {
+	cpuPrograms
+	cpuMaps
 }
 
-func (o *CPUObjects) Close() error {
-	return _CPUClose(
-		&o.CPUPrograms,
-		&o.CPUMaps,
+func (o *cpuObjects) Close() error {
+	return _CpuClose(
+		&o.cpuPrograms,
+		&o.cpuMaps,
 	)
 }
 
-// CPUMaps contains all maps after they have been loaded into the kernel.
+// cpuMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to LoadCPUObjects or ebpf.CollectionSpec.LoadAndAssign.
-type CPUMaps struct {
+// It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type cpuMaps struct {
 	CacheMissesReader     *ebpf.Map `ebpf:"cache_misses_reader"`
 	CpuCyclesReader       *ebpf.Map `ebpf:"cpu_cycles_reader"`
 	CpuInstructionsReader *ebpf.Map `ebpf:"cpu_instructions_reader"`
@@ -103,8 +103,8 @@ type CPUMaps struct {
 	Rb                    *ebpf.Map `ebpf:"rb"`
 }
 
-func (m *CPUMaps) Close() error {
-	return _CPUClose(
+func (m *cpuMaps) Close() error {
+	return _CpuClose(
 		m.CacheMissesReader,
 		m.CpuCyclesReader,
 		m.CpuInstructionsReader,
@@ -118,20 +118,20 @@ func (m *CPUMaps) Close() error {
 	)
 }
 
-// CPUPrograms contains all programs after they have been loaded into the kernel.
+// cpuPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to LoadCPUObjects or ebpf.CollectionSpec.LoadAndAssign.
-type CPUPrograms struct {
+// It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type cpuPrograms struct {
 	HandleSwitch *ebpf.Program `ebpf:"handle_switch"`
 }
 
-func (p *CPUPrograms) Close() error {
-	return _CPUClose(
+func (p *cpuPrograms) Close() error {
+	return _CpuClose(
 		p.HandleSwitch,
 	)
 }
 
-func _CPUClose(closers ...io.Closer) error {
+func _CpuClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -143,4 +143,4 @@ func _CPUClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed cpu_x86_bpfel.o
-var _CPUBytes []byte
+var _CpuBytes []byte

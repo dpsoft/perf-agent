@@ -12,46 +12,46 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type OffcpuOffcpuKey struct {
+type offcpuOffcpuKey struct {
 	Pid       uint32
 	_         [4]byte
 	KernStack int64
 	UserStack int64
 }
 
-type OffcpuStartKey struct {
+type offcpuStartKey struct {
 	Pid  uint32
 	Tgid uint32
 }
 
-type OffcpuStartVal struct {
+type offcpuStartVal struct {
 	Timestamp uint64
 	KernStack int64
 	UserStack int64
 }
 
-// LoadOffcpu returns the embedded CollectionSpec for Offcpu.
-func LoadOffcpu() (*ebpf.CollectionSpec, error) {
+// loadOffcpu returns the embedded CollectionSpec for offcpu.
+func loadOffcpu() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_OffcpuBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load Offcpu: %w", err)
+		return nil, fmt.Errorf("can't load offcpu: %w", err)
 	}
 
 	return spec, err
 }
 
-// LoadOffcpuObjects loads Offcpu and converts it into a struct.
+// loadOffcpuObjects loads offcpu and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*OffcpuObjects
-//	*OffcpuPrograms
-//	*OffcpuMaps
+//	*offcpuObjects
+//	*offcpuPrograms
+//	*offcpuMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadOffcpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := LoadOffcpu()
+func loadOffcpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadOffcpu()
 	if err != nil {
 		return err
 	}
@@ -59,57 +59,57 @@ func LoadOffcpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// OffcpuSpecs contains maps and programs before they are loaded into the kernel.
+// offcpuSpecs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type OffcpuSpecs struct {
-	OffcpuProgramSpecs
-	OffcpuMapSpecs
+type offcpuSpecs struct {
+	offcpuProgramSpecs
+	offcpuMapSpecs
 }
 
-// OffcpuSpecs contains programs before they are loaded into the kernel.
+// offcpuSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type OffcpuProgramSpecs struct {
+type offcpuProgramSpecs struct {
 	OffcpuSchedSwitch *ebpf.ProgramSpec `ebpf:"offcpu_sched_switch"`
 }
 
-// OffcpuMapSpecs contains maps before they are loaded into the kernel.
+// offcpuMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type OffcpuMapSpecs struct {
+type offcpuMapSpecs struct {
 	OffcpuCounts *ebpf.MapSpec `ebpf:"offcpu_counts"`
 	PidFilter    *ebpf.MapSpec `ebpf:"pid_filter"`
 	Stackmap     *ebpf.MapSpec `ebpf:"stackmap"`
 	Start        *ebpf.MapSpec `ebpf:"start"`
 }
 
-// OffcpuObjects contains all objects after they have been loaded into the kernel.
+// offcpuObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to LoadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
-type OffcpuObjects struct {
-	OffcpuPrograms
-	OffcpuMaps
+// It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type offcpuObjects struct {
+	offcpuPrograms
+	offcpuMaps
 }
 
-func (o *OffcpuObjects) Close() error {
+func (o *offcpuObjects) Close() error {
 	return _OffcpuClose(
-		&o.OffcpuPrograms,
-		&o.OffcpuMaps,
+		&o.offcpuPrograms,
+		&o.offcpuMaps,
 	)
 }
 
-// OffcpuMaps contains all maps after they have been loaded into the kernel.
+// offcpuMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to LoadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
-type OffcpuMaps struct {
+// It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type offcpuMaps struct {
 	OffcpuCounts *ebpf.Map `ebpf:"offcpu_counts"`
 	PidFilter    *ebpf.Map `ebpf:"pid_filter"`
 	Stackmap     *ebpf.Map `ebpf:"stackmap"`
 	Start        *ebpf.Map `ebpf:"start"`
 }
 
-func (m *OffcpuMaps) Close() error {
+func (m *offcpuMaps) Close() error {
 	return _OffcpuClose(
 		m.OffcpuCounts,
 		m.PidFilter,
@@ -118,14 +118,14 @@ func (m *OffcpuMaps) Close() error {
 	)
 }
 
-// OffcpuPrograms contains all programs after they have been loaded into the kernel.
+// offcpuPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to LoadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
-type OffcpuPrograms struct {
+// It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type offcpuPrograms struct {
 	OffcpuSchedSwitch *ebpf.Program `ebpf:"offcpu_sched_switch"`
 }
 
-func (p *OffcpuPrograms) Close() error {
+func (p *offcpuPrograms) Close() error {
 	return _OffcpuClose(
 		p.OffcpuSchedSwitch,
 	)

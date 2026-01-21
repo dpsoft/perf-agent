@@ -11,7 +11,7 @@ import (
 
 // PMUMonitor handles PMU hardware counter monitoring
 type PMUMonitor struct {
-	objs        *CPUObjects
+	objs        *cpuObjects
 	hwPerf      *HardwarePerfEvents
 	tp          link.Link
 	collector   *CPUUsageCollector
@@ -21,7 +21,7 @@ type PMUMonitor struct {
 
 // NewPMUMonitor creates a new PMU monitor
 func NewPMUMonitor(pid int, systemWide bool, cpus []uint) (*PMUMonitor, error) {
-	spec, err := LoadCPU()
+	spec, err := loadCpu()
 	if err != nil {
 		return nil, fmt.Errorf("load CPU spec: %w", err)
 	}
@@ -33,7 +33,7 @@ func NewPMUMonitor(pid int, systemWide bool, cpus []uint) (*PMUMonitor, error) {
 		return nil, fmt.Errorf("rewrite constants: %w", err)
 	}
 
-	cpuObjs := &CPUObjects{}
+	cpuObjs := &cpuObjects{}
 	if err := spec.LoadAndAssign(cpuObjs, nil); err != nil {
 		return nil, fmt.Errorf("load CPU objects: %w", err)
 	}

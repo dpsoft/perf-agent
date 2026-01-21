@@ -12,41 +12,41 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type PerfPidConfig struct {
+type perfPidConfig struct {
 	Type          uint8
 	CollectUser   uint8
 	CollectKernel uint8
 }
 
-type PerfSampleKey struct {
+type perfSampleKey struct {
 	Pid       uint32
 	Flags     uint32
 	KernStack int64
 	UserStack int64
 }
 
-// LoadPerf returns the embedded CollectionSpec for Perf.
-func LoadPerf() (*ebpf.CollectionSpec, error) {
+// loadPerf returns the embedded CollectionSpec for perf.
+func loadPerf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_PerfBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load Perf: %w", err)
+		return nil, fmt.Errorf("can't load perf: %w", err)
 	}
 
 	return spec, err
 }
 
-// LoadPerfObjects loads Perf and converts it into a struct.
+// loadPerfObjects loads perf and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*PerfObjects
-//	*PerfPrograms
-//	*PerfMaps
+//	*perfObjects
+//	*perfPrograms
+//	*perfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadPerfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := LoadPerf()
+func loadPerfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadPerf()
 	if err != nil {
 		return err
 	}
@@ -54,55 +54,55 @@ func LoadPerfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// PerfSpecs contains maps and programs before they are loaded into the kernel.
+// perfSpecs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type PerfSpecs struct {
-	PerfProgramSpecs
-	PerfMapSpecs
+type perfSpecs struct {
+	perfProgramSpecs
+	perfMapSpecs
 }
 
-// PerfSpecs contains programs before they are loaded into the kernel.
+// perfSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type PerfProgramSpecs struct {
+type perfProgramSpecs struct {
 	Profile *ebpf.ProgramSpec `ebpf:"profile"`
 }
 
-// PerfMapSpecs contains maps before they are loaded into the kernel.
+// perfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type PerfMapSpecs struct {
+type perfMapSpecs struct {
 	Counts   *ebpf.MapSpec `ebpf:"counts"`
 	Pids     *ebpf.MapSpec `ebpf:"pids"`
 	Stackmap *ebpf.MapSpec `ebpf:"stackmap"`
 }
 
-// PerfObjects contains all objects after they have been loaded into the kernel.
+// perfObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to LoadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
-type PerfObjects struct {
-	PerfPrograms
-	PerfMaps
+// It can be passed to loadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type perfObjects struct {
+	perfPrograms
+	perfMaps
 }
 
-func (o *PerfObjects) Close() error {
+func (o *perfObjects) Close() error {
 	return _PerfClose(
-		&o.PerfPrograms,
-		&o.PerfMaps,
+		&o.perfPrograms,
+		&o.perfMaps,
 	)
 }
 
-// PerfMaps contains all maps after they have been loaded into the kernel.
+// perfMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to LoadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
-type PerfMaps struct {
+// It can be passed to loadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type perfMaps struct {
 	Counts   *ebpf.Map `ebpf:"counts"`
 	Pids     *ebpf.Map `ebpf:"pids"`
 	Stackmap *ebpf.Map `ebpf:"stackmap"`
 }
 
-func (m *PerfMaps) Close() error {
+func (m *perfMaps) Close() error {
 	return _PerfClose(
 		m.Counts,
 		m.Pids,
@@ -110,14 +110,14 @@ func (m *PerfMaps) Close() error {
 	)
 }
 
-// PerfPrograms contains all programs after they have been loaded into the kernel.
+// perfPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to LoadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
-type PerfPrograms struct {
+// It can be passed to loadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type perfPrograms struct {
 	Profile *ebpf.Program `ebpf:"profile"`
 }
 
-func (p *PerfPrograms) Close() error {
+func (p *perfPrograms) Close() error {
 	return _PerfClose(
 		p.Profile,
 	)

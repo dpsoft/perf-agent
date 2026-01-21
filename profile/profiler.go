@@ -22,7 +22,7 @@ import (
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
-	objs       *PerfObjects
+	objs       *perfObjects
 	symbolizer *blazesym.Symbolizer
 	perfEvents []*perfEvent
 	tags       []string
@@ -47,7 +47,7 @@ func (s *stackBuilder) append(sym string) {
 
 // NewProfiler creates a new CPU profiler with the specified sample rate in Hz
 func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
-	spec, err := LoadPerf()
+	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
 	}
@@ -59,14 +59,14 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		return nil, fmt.Errorf("rewrite constants: %w", err)
 	}
 
-	objs := &PerfObjects{}
+	objs := &perfObjects{}
 	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("load profile objects: %w", err)
 	}
 
 	// Only configure PID filter for targeted mode
 	if !systemWide {
-		config := PerfPidConfig{
+		config := perfPidConfig{
 			Type:          0,
 			CollectUser:   1,
 			CollectKernel: 0,
@@ -134,7 +134,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	m := pr.objs.Counts
 	mapSize := m.MaxEntries()
 
-	keys := make([]PerfSampleKey, mapSize)
+	keys := make([]perfSampleKey, mapSize)
 	values := make([]uint64, mapSize)
 
 	opts := &ebpf.BatchOptions{}

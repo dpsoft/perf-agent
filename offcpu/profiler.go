@@ -19,7 +19,7 @@ import (
 
 // Profiler handles off-CPU profiling with stack traces
 type Profiler struct {
-	objs       *OffcpuObjects
+	objs       *offcpuObjects
 	symbolizer *blazesym.Symbolizer
 	link       link.Link
 	tags       []string
@@ -36,7 +36,7 @@ func (s *stackBuilder) append(sym string) {
 
 // NewProfiler creates a new off-CPU profiler
 func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
-	spec, err := LoadOffcpu()
+	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
 	}
@@ -48,7 +48,7 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 		return nil, fmt.Errorf("rewrite constants: %w", err)
 	}
 
-	objs := &OffcpuObjects{}
+	objs := &offcpuObjects{}
 	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, fmt.Errorf("load offcpu objects: %w", err)
 	}
@@ -98,7 +98,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	m := pr.objs.OffcpuCounts
 	mapSize := m.MaxEntries()
 
-	keys := make([]OffcpuOffcpuKey, mapSize)
+	keys := make([]offcpuOffcpuKey, mapSize)
 	values := make([]uint64, mapSize)
 
 	opts := &ebpf.BatchOptions{}

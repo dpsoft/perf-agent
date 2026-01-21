@@ -12,7 +12,7 @@ import (
 )
 
 type CPUUsageCollector struct {
-	objs         *CPUObjects
+	objs         *cpuObjects
 	reader       *ringbuf.Reader
 	metrics      map[uint32]*PidMetrics
 	lastPollTime time.Time
@@ -43,7 +43,7 @@ type PidMetrics struct {
 	SampleCount       uint64
 }
 
-func NewCPUUsageCollector(objs *CPUObjects) (*CPUUsageCollector, error) {
+func NewCPUUsageCollector(objs *cpuObjects) (*CPUUsageCollector, error) {
 	reader, err := ringbuf.NewReader(objs.Rb)
 	if err != nil {
 		return nil, fmt.Errorf("opening ring buffer reader: %w", err)

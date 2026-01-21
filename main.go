@@ -20,14 +20,15 @@ import (
 )
 
 var (
-	flagProfile  = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
-	flagOffCpu   = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
-	flagPMU      = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
-	flagPID      = flag.Int("pid", 0, "Target process ID to monitor")
-	flagAll      = flag.Bool("a", false, "System-wide profiling (all processes)")
-	flagPerPID   = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
-	flagDuration = flag.Duration("duration", 10*time.Second, "Collection duration")
-	flagTags     tagFlags
+	flagProfile    = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagOffCpu     = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
+	flagPMU        = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
+	flagPID        = flag.Int("pid", 0, "Target process ID to monitor")
+	flagAll        = flag.Bool("a", false, "System-wide profiling (all processes)")
+	flagPerPID     = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
+	flagDuration   = flag.Duration("duration", 10*time.Second, "Collection duration")
+	flagSampleRate = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
+	flagTags       tagFlags
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -104,15 +105,15 @@ func main() {
 
 	// Setup profiler if enabled
 	if *flagProfile {
-		cpuProfiler, err = profile.NewProfiler(pid, systemWide, onlineCPUIDs, flagTags)
+		cpuProfiler, err = profile.NewProfiler(pid, systemWide, onlineCPUIDs, flagTags, *flagSampleRate)
 		if err != nil {
 			log.Fatalf("Failed to setup profiler: %v", err)
 		}
 		defer cpuProfiler.Close()
 		if systemWide {
-			log.Println("Profiler enabled (system-wide)")
+			log.Printf("Profiler enabled (system-wide, %d Hz)", *flagSampleRate)
 		} else {
-			log.Printf("Profiler enabled (PID: %d)", pid)
+			log.Printf("Profiler enabled (PID: %d, %d Hz)", pid, *flagSampleRate)
 		}
 	}
 

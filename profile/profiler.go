@@ -25,6 +25,7 @@ type Profiler struct {
 	symbolizer *blazesym.Symbolizer
 	perfEvents []*perfEvent
 	tags       []string
+	sampleRate int
 }
 
 // perfEvent wraps a Linux perf event for CPU sampling
@@ -43,8 +44,8 @@ func (s *stackBuilder) append(sym string) {
 	s.stack = append(s.stack, sym)
 }
 
-// NewProfiler creates a new CPU profiler
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*Profiler, error) {
+// NewProfiler creates a new CPU profiler with the specified sample rate in Hz
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
 	spec, err := LoadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -78,7 +79,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*Profile
 
 	var perfEvents []*perfEvent
 	for _, id := range cpus {
-		pe, err := newPerfEvent(int(id), 10000)
+		pe, err := newPerfEvent(int(id), sampleRate)
 		if err != nil {
 			// Cleanup already created perf events
 			for _, pe := range perfEvents {
@@ -114,6 +115,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*Profile
 		symbolizer: symbolizer,
 		perfEvents: perfEvents,
 		tags:       tags,
+		sampleRate: sampleRate,
 	}, nil
 }
 
@@ -154,7 +156,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
-		SampleRate:    int64(97),
+		SampleRate:    int64(pr.sampleRate),
 		PerPIDProfile: false,
 		Comments:      pr.tags,
 	})

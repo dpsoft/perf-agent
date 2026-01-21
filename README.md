@@ -43,6 +43,7 @@ sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
 | `-a, --all` | System-wide profiling (all processes) | `false` |
 | `--per-pid` | Show per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
+| `--sample-rate` | CPU profiling sample rate in Hz | `99` |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
 
 Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.

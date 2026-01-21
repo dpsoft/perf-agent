@@ -15,8 +15,9 @@ import (
 	blazesym "github.com/libbpf/blazesym/go"
 	"golang.org/x/sys/unix"
 
-	p "github.com/google/pprof/profile"
 	"perf-agent/pprof"
+
+	p "github.com/google/pprof/profile"
 )
 
 // Profiler handles CPU profiling with stack traces
@@ -81,7 +82,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	for _, id := range cpus {
 		pe, err := newPerfEvent(int(id), sampleRate)
 		if err != nil {
-			// Cleanup already created perf events
+			// Clean up already created perf events
 			for _, pe := range perfEvents {
 				_ = pe.Close()
 			}

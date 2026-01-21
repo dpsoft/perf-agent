@@ -10,9 +10,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/pprof/profile"
 
-	//"github.com/grafana/pyroscope/ebpf/sd"
 	"github.com/klauspost/compress/gzip"
-	//"github.com/prometheus/prometheus/model/labels"
 )
 
 var (
@@ -47,7 +45,6 @@ type SamplesCollector interface {
 }
 
 type ProfileSample struct {
-	//Target      *sd.Target
 	Pid         uint32
 	SampleType  SampleType
 	Aggregation SampleAggregation
@@ -63,7 +60,6 @@ type BuildersOptions struct {
 }
 
 type builderHashKey struct {
-	// labelsHash uint64  // unused for now
 	pid        uint32
 	sampleType SampleType
 }
@@ -92,10 +88,7 @@ func (b *ProfileBuilders) AddSample(sample *ProfileSample) {
 	}
 }
 
-// func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilder {
 func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilder {
-	//labelsHash, labels := sample.Target.Labels()
-
 	k := builderHashKey{sampleType: sample.SampleType}
 	if b.opt.PerPIDProfile {
 		k.pid = sample.Pid
@@ -152,10 +145,8 @@ type ProfileBuilder struct {
 	functions          map[string]*profile.Function
 	sampleHashToSample map[uint64]*profile.Sample
 	Profile            *profile.Profile
-	//Labels             labels.Labels
-
-	tmpLocations   []*profile.Location
-	tmpLocationIDs []uint64
+	tmpLocations       []*profile.Location
+	tmpLocationIDs     []uint64
 }
 
 func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {

@@ -10,10 +10,11 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	blazesym "github.com/libbpf/blazesym/go"
+
+	"perf-agent/pprof"
 
 	p "github.com/google/pprof/profile"
-	"perf-agent/pprof"
+	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Profiler handles off-CPU profiling with stack traces
@@ -52,7 +53,7 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 		return nil, fmt.Errorf("load offcpu objects: %w", err)
 	}
 
-	// Configure PID filter only for targeted mode
+	// Configure PID filter only for the targeted mode
 	if !systemWide {
 		trackValue := uint8(1)
 		if err := objs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
@@ -109,7 +110,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	}
 
 	if errors.Is(err, ebpf.ErrKeyNotExist) {
-		// Expected when map is empty or all entries processed
+		// Expected when a map is empty or all entries processed
 	} else if err != nil {
 		log.Printf("Off-CPU BatchLookupAndDelete error: %v", err)
 	}
@@ -120,7 +121,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
-		SampleRate:    1, // Not used for off-CPU, but needed for builder
+		SampleRate:    1, // Not used for off-CPU but needed for builder
 		PerPIDProfile: false,
 		Comments:      pr.tags,
 	})
@@ -129,7 +130,7 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 		key := keys[i]
 		value := values[i]
 
-		// Use PID from sample key for symbolization
+		// Use PID from a sample key for symbolization
 		samplePid := key.Pid
 
 		stack, err := pr.objs.Stackmap.LookupBytes(uint32(key.UserStack))

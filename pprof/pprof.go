@@ -107,15 +107,16 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 	var sampleType []*profile.ValueType
 	var periodType *profile.ValueType
 	var period int64
-	if sample.SampleType == SampleTypeCpu {
+	switch sample.SampleType {
+	case SampleTypeCpu:
 		sampleType = []*profile.ValueType{{Type: "cpu", Unit: "nanoseconds"}}
 		periodType = &profile.ValueType{Type: "cpu", Unit: "nanoseconds"}
 		period = time.Second.Nanoseconds() / b.opt.SampleRate
-	} else if sample.SampleType == SampleTypeOffCpu {
+	case SampleTypeOffCpu:
 		sampleType = []*profile.ValueType{{Type: "offcpu", Unit: "nanoseconds"}}
 		periodType = &profile.ValueType{Type: "offcpu", Unit: "nanoseconds"}
 		period = 1 // Direct nanosecond values, not sampled
-	} else {
+	default:
 		sampleType = []*profile.ValueType{{Type: "alloc_objects", Unit: "count"}, {Type: "alloc_space", Unit: "bytes"}}
 		periodType = &profile.ValueType{Type: "space", Unit: "bytes"}
 		period = 512 * 1024 // todo
@@ -259,12 +260,13 @@ func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 }
 
 func (p *ProfileBuilder) addValue(inputSample *ProfileSample, sample *profile.Sample) {
-	if inputSample.SampleType == SampleTypeCpu {
+	switch inputSample.SampleType {
+	case SampleTypeCpu:
 		sample.Value[0] += int64(inputSample.Value) * p.Profile.Period
-	} else if inputSample.SampleType == SampleTypeOffCpu {
+	case SampleTypeOffCpu:
 		// Off-CPU values are already in nanoseconds, no scaling needed
 		sample.Value[0] += int64(inputSample.Value)
-	} else {
+	default:
 		sample.Value[0] += int64(inputSample.Value)
 		sample.Value[1] += int64(inputSample.Value2)
 	}

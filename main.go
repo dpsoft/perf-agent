@@ -176,7 +176,7 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 	}
 
 	if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, nil, fmt.Errorf("update pid map: %w", err)
 	}
 
@@ -186,18 +186,18 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 		if err != nil {
 			// Cleanup already created perf events
 			for _, pe := range perfEvents {
-				pe.Close()
+				_ = pe.Close()
 			}
-			objs.Close()
+			_ = objs.Close()
 			return nil, nil, fmt.Errorf("create perf event on CPU %d: %w", id, err)
 		}
 
 		if err := pe.attachPerfEvent(objs.Profile); err != nil {
-			pe.Close()
+			_ = pe.Close()
 			for _, pe := range perfEvents {
-				pe.Close()
+				_ = pe.Close()
 			}
-			objs.Close()
+			_ = objs.Close()
 			return nil, nil, fmt.Errorf("attach eBPF to perf event on CPU %d: %w", id, err)
 		}
 
@@ -207,9 +207,9 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
 	if err != nil {
 		for _, pe := range perfEvents {
-			pe.Close()
+			_ = pe.Close()
 		}
-		objs.Close()
+		_ = objs.Close()
 		return nil, nil, fmt.Errorf("create symbolizer: %w", err)
 	}
 
@@ -254,7 +254,7 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 		)
 		if err != nil {
 			log.Printf("Failed to attach HW counters to maps: %v", err)
-			hwPerf.Close()
+			_ = hwPerf.Close()
 			hwPerf = nil
 		} else {
 			if err := hwPerf.EnableInBPF(cpuObjs.HwCountersEnabled); err != nil {
@@ -266,34 +266,34 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 	}
 
 	tp, err := link.AttachTracing(link.TracingOptions{
-		Program: cpuObjs.CPUPrograms.HandleSwitch,
+		Program: cpuObjs.HandleSwitch,
 	})
 	if err != nil {
 		if hwPerf != nil {
-			hwPerf.Close()
+			_ = hwPerf.Close()
 		}
-		cpuObjs.Close()
+		_ = cpuObjs.Close()
 		return nil, nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
 	collector, err := cpu.NewCPUUsageCollector(cpuObjs)
 	if err != nil {
-		tp.Close()
+		_ = tp.Close()
 		if hwPerf != nil {
-			hwPerf.Close()
+			_ = hwPerf.Close()
 		}
-		cpuObjs.Close()
+		_ = cpuObjs.Close()
 		return nil, nil, fmt.Errorf("create CPU usage collector: %w", err)
 	}
 
 	// Configure PID filter
 	trackValue := uint8(1)
 	if err := cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
-		tp.Close()
+		_ = tp.Close()
 		if hwPerf != nil {
-			hwPerf.Close()
+			_ = hwPerf.Close()
 		}
-		cpuObjs.Close()
+		_ = cpuObjs.Close()
 		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
 	}
 
@@ -317,11 +317,11 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 	cleanup := func() {
 		close(stopPolling)
 		ticker.Stop()
-		tp.Close()
+		_ = tp.Close()
 		if hwPerf != nil {
-			hwPerf.Close()
+			_ = hwPerf.Close()
 		}
-		cpuObjs.Close()
+		_ = cpuObjs.Close()
 	}
 
 	return collector, cleanup, nil
@@ -365,7 +365,7 @@ func printPMUMetrics(collector *cpu.CPUUsageCollector) {
 }
 
 func collectAndWriteProfile(profiler *profilerState, pid int) {
-	m := profiler.objs.PerfMaps.Counts
+	m := profiler.objs.Counts
 	mapSize := m.MaxEntries()
 
 	keys := make([]profile.PerfSampleKey, mapSize)
@@ -467,7 +467,7 @@ func collectAndWriteProfile(profiler *profilerState, pid int) {
 		log.Printf("Failed to create profile file: %v", err)
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	if err := parsed.Write(file); err != nil {
 		log.Printf("Failed to write profile to file: %v", err)
@@ -646,7 +646,7 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
 		log.Printf("Failed to create off-CPU profile file: %v", err)
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	if err := parsed.Write(file); err != nil {
 		log.Printf("Failed to write off-CPU profile to file: %v", err)

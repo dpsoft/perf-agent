@@ -35,14 +35,14 @@ func NewHardwarePerfEvents(cpus []int) (*HardwarePerfEvents, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hardware counters unavailable: %w", err)
 	}
-	testEvent.Close()
+	_ = testEvent.Close()
 
 	// Open events for each CPU
 	for _, cpu := range cpus {
 		// CPU Cycles
 		cyclesEvent, err := openHWCounter(cpu, unix.PERF_COUNT_HW_CPU_CYCLES)
 		if err != nil {
-			h.Close()
+			_ = h.Close()
 			return nil, fmt.Errorf("open cycles counter on CPU %d: %w", cpu, err)
 		}
 		h.cyclesEvents = append(h.cyclesEvents, cyclesEvent)
@@ -50,7 +50,7 @@ func NewHardwarePerfEvents(cpus []int) (*HardwarePerfEvents, error) {
 		// Instructions
 		instrEvent, err := openHWCounter(cpu, unix.PERF_COUNT_HW_INSTRUCTIONS)
 		if err != nil {
-			h.Close()
+			_ = h.Close()
 			return nil, fmt.Errorf("open instructions counter on CPU %d: %w", cpu, err)
 		}
 		h.instructionsEvents = append(h.instructionsEvents, instrEvent)
@@ -58,7 +58,7 @@ func NewHardwarePerfEvents(cpus []int) (*HardwarePerfEvents, error) {
 		// Cache Misses
 		cacheEvent, err := openHWCounter(cpu, unix.PERF_COUNT_HW_CACHE_MISSES)
 		if err != nil {
-			h.Close()
+			_ = h.Close()
 			return nil, fmt.Errorf("open cache misses counter on CPU %d: %w", cpu, err)
 		}
 		h.cacheMissesEvents = append(h.cacheMissesEvents, cacheEvent)

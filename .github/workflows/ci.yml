@@ -8,8 +8,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -88,9 +97,18 @@ jobs:
   # Integration tests require root and are harder to run in CI
   # They can be run manually or in a different environment
   integration-tests:
-    runs-on: ubuntu-latest
+    name: Integration Tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     if: false  # Disabled by default, enable when you have a way to run with root
-    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4

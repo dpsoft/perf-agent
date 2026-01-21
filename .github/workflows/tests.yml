@@ -8,8 +8,16 @@ on:
 
 jobs:
   unit-tests:
-    name: Unit Tests
-    runs-on: ubuntu-22.04
+    name: Unit Tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -65,8 +73,16 @@ jobs:
           flags: unittests
 
   integration-tests:
-    name: Integration Tests
-    runs-on: ubuntu-22.04
+    name: Integration Tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -181,11 +197,18 @@ jobs:
           args: --timeout=5m
 
   build:
-    name: Build
-    runs-on: ubuntu-22.04
-    # Note: ARM64 builds excluded because blazesym requires CGO,
-    # and cross-compiling CGO code is complex. Native ARM64 builds
-    # require ARM64 runners which may not be available.
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            goarch: amd64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            goarch: arm64
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -234,11 +257,11 @@ jobs:
       - name: Build
         env:
           GOOS: linux
-          GOARCH: amd64
-        run: go build -v -o perf-agent-linux-amd64
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: perf-agent-linux-amd64
-          path: perf-agent-linux-amd64
+          name: perf-agent-linux-${{ matrix.goarch }}
+          path: perf-agent-linux-${{ matrix.goarch }}

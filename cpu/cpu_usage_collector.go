@@ -1,6 +1,7 @@
 package cpu
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -13,7 +14,6 @@ import (
 type CPUUsageCollector struct {
 	objs         *CPUObjects
 	reader       *ringbuf.Reader
-	histograms   map[uint32]*hdrhistogram.Histogram // deprecated, use metrics
 	metrics      map[uint32]*PidMetrics
 	lastPollTime time.Time
 }
@@ -52,19 +52,18 @@ func NewCPUUsageCollector(objs *CPUObjects) (*CPUUsageCollector, error) {
 	return &CPUUsageCollector{
 		objs:         objs,
 		reader:       reader,
-		histograms:   make(map[uint32]*hdrhistogram.Histogram),
 		metrics:      make(map[uint32]*PidMetrics),
 		lastPollTime: time.Now(),
 	}, nil
 }
 
 func (c *CPUUsageCollector) ReadCPUUsage() error {
-	// Read all available events from ring buffer
+	// Read all available events from the ring buffer
 	for {
 		rec, err := c.reader.Read()
 		if err != nil {
 			// No more events available (EAGAIN) or context cancelled
-			if err == ringbuf.ErrClosed {
+			if errors.Is(err, ringbuf.ErrClosed) {
 				return err
 			}
 			// No events available, return without error
@@ -84,8 +83,6 @@ func (c *CPUUsageCollector) ReadCPUUsage() error {
 					TimeHist: hdrhistogram.New(0, 1000000000000000, 3), // 0-1 hour in ns
 				}
 				c.metrics[ps.TGID] = m
-				// Keep histograms map in sync for backward compatibility
-				c.histograms[ps.TGID] = m.TimeHist
 			}
 
 			if err := m.TimeHist.RecordValue(int64(ps.DeltaNs)); err != nil {
@@ -114,14 +111,6 @@ func (c *CPUUsageCollector) ReadCPUUsage() error {
 				size, unsafe.Sizeof(PidStat{}), unsafe.Sizeof(CpuStat{}))
 		}
 	}
-}
-
-func (c *CPUUsageCollector) GetHistogram(pid uint32) *hdrhistogram.Histogram {
-	return c.histograms[pid]
-}
-
-func (c *CPUUsageCollector) GetAllHistograms() map[uint32]*hdrhistogram.Histogram {
-	return c.histograms
 }
 
 // GetMetrics returns the metrics for a specific PID

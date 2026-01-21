@@ -273,3 +273,10 @@ func (p *ProfileBuilder) addValue(inputSample *ProfileSample, sample *profile.Sa
 		sample.Value[1] += int64(inputSample.Value2)
 	}
 }
+
+// Reverse reverses a slice in place
+func Reverse[S ~[]E, E any](s S) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}

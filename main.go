@@ -222,9 +222,9 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 	cleanup := func() {
 		symbolizer.Close()
 		for _, pe := range perfEvents {
-			pe.Close()
+			_ = pe.Close()
 		}
-		objs.Close()
+		_ = objs.Close()
 	}
 
 	return state, cleanup, nil
@@ -502,7 +502,7 @@ func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
 	// Configure PID filter
 	trackValue := uint8(1)
 	if err := objs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
 	}
 
@@ -511,14 +511,14 @@ func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
 		Program: objs.OffcpuSchedSwitch,
 	})
 	if err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
 	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
 	if err != nil {
-		tp.Close()
-		objs.Close()
+		_ = tp.Close()
+		_ = objs.Close()
 		return nil, nil, fmt.Errorf("create symbolizer: %w", err)
 	}
 
@@ -530,8 +530,8 @@ func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
 
 	cleanup := func() {
 		symbolizer.Close()
-		tp.Close()
-		objs.Close()
+		_ = tp.Close()
+		_ = objs.Close()
 	}
 
 	return state, cleanup, nil

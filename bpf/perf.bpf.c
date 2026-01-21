@@ -48,6 +48,10 @@ struct {
 
 
 ////////// PERF CONFIG //////////
+
+// System-wide mode: when true, profile all processes; when false, use PID filter
+const volatile bool system_wide = false;
+
 struct pid_config {
     uint8_t type;
     uint8_t collect_user;
@@ -85,12 +89,16 @@ int profile(struct bpf_perf_event_data *ctx) {
         return 0;
     }
 
-    // check if config exists for this pid
-    struct pid_config *config = bpf_map_lookup_elem(&pids, &tgid);
-    if (config == NULL) {
-        char kernel_fmt[] = "config is null for pid %d\n";
-        bpf_trace_printk(kernel_fmt, sizeof(kernel_fmt), tgid);
-        return 0;
+    // In system-wide mode, collect from all processes
+    // In targeted mode, check if config exists for this pid
+    struct pid_config *config = NULL;
+    if (!system_wide) {
+        config = bpf_map_lookup_elem(&pids, &tgid);
+        if (config == NULL) {
+            char kernel_fmt[] = "config is null for pid %d\n";
+            bpf_trace_printk(kernel_fmt, sizeof(kernel_fmt), tgid);
+            return 0;
+        }
     }
 
     // struct bpf_perf_event_value value_buf;
@@ -100,11 +108,16 @@ int profile(struct bpf_perf_event_data *ctx) {
     key.kern_stack = -1;
     key.user_stack = -1;
 
-    if (config->collect_kernel) {
+    // In system-wide mode, always collect user stacks (default behavior)
+    // In targeted mode, use config settings
+    bool collect_kernel = system_wide ? false : (config && config->collect_kernel);
+    bool collect_user = system_wide ? true : (config && config->collect_user);
+
+    if (collect_kernel) {
         key.kern_stack = bpf_get_stackid(ctx, &stackmap, KERN_STACKID_FLAGS);
     }
 
-    if (config->collect_user) {
+    if (collect_user) {
         key.user_stack = bpf_get_stackid(ctx, &stackmap, USER_STACKID_FLAGS);
     }
 

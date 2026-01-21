@@ -33,9 +33,16 @@ var (
 	flagProfile  = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
 	flagOffCpu   = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
 	flagPMU      = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
-	flagPID      = flag.Int("pid", 0, "Target process ID to monitor (required)")
+	flagPID      = flag.Int("pid", 0, "Target process ID to monitor")
+	flagAll      = flag.Bool("a", false, "System-wide profiling (all processes)")
+	flagPerPID   = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
 	flagDuration = flag.Duration("duration", 10*time.Second, "Collection duration")
 )
+
+func init() {
+	// Register long form for -a flag
+	flag.BoolVar(flagAll, "all", false, "System-wide profiling (all processes)")
+}
 
 type stackBuilder struct {
 	stack []string
@@ -71,11 +78,27 @@ func main() {
 	if !*flagProfile && !*flagPMU && !*flagOffCpu {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
-	if *flagPID == 0 {
-		log.Fatal("--pid is required")
+
+	// Validate PID / system-wide flags
+	if *flagPID != 0 && *flagAll {
+		log.Fatal("--pid and -a/--all are mutually exclusive")
+	}
+	if *flagPID == 0 && !*flagAll {
+		log.Fatal("Either --pid or -a/--all is required")
+	}
+
+	// Validate --per-pid flag
+	if *flagPerPID {
+		if !*flagAll {
+			log.Fatal("--per-pid requires -a/--all")
+		}
+		if !*flagPMU {
+			log.Fatal("--per-pid is only valid with --pmu")
+		}
 	}
 
 	pid := *flagPID
+	systemWide := *flagAll
 
 	// Common setup: Set capabilities
 	caps := cap.GetProc()
@@ -106,32 +129,44 @@ func main() {
 
 	// Setup profiler if enabled
 	if *flagProfile {
-		profiler, profilerCleanup, err = setupProfiler(pid, onlineCPUIDs)
+		profiler, profilerCleanup, err = setupProfiler(pid, systemWide, onlineCPUIDs)
 		if err != nil {
 			log.Fatalf("Failed to setup profiler: %v", err)
 		}
 		defer profilerCleanup()
-		log.Println("Profiler enabled")
+		if systemWide {
+			log.Println("Profiler enabled (system-wide)")
+		} else {
+			log.Printf("Profiler enabled (PID: %d)", pid)
+		}
 	}
 
 	// Setup off-CPU profiler if enabled
 	if *flagOffCpu {
-		offcpuProfiler, offcpuCleanup, err = setupOffcpuProfiler(pid)
+		offcpuProfiler, offcpuCleanup, err = setupOffcpuProfiler(pid, systemWide)
 		if err != nil {
 			log.Fatalf("Failed to setup off-CPU profiler: %v", err)
 		}
 		defer offcpuCleanup()
-		log.Println("Off-CPU profiler enabled")
+		if systemWide {
+			log.Println("Off-CPU profiler enabled (system-wide)")
+		} else {
+			log.Printf("Off-CPU profiler enabled (PID: %d)", pid)
+		}
 	}
 
 	// Setup PMU monitor if enabled
 	if *flagPMU {
-		collector, pmuCleanup, err = setupPMUMonitor(pid, onlineCPUIDs)
+		collector, pmuCleanup, err = setupPMUMonitor(pid, systemWide, onlineCPUIDs)
 		if err != nil {
 			log.Fatalf("Failed to setup PMU monitor: %v", err)
 		}
 		defer pmuCleanup()
-		log.Println("PMU monitor enabled")
+		if systemWide {
+			log.Println("PMU monitor enabled (system-wide)")
+		} else {
+			log.Printf("PMU monitor enabled (PID: %d)", pid)
+		}
 	}
 
 	// Setup signal handling
@@ -150,35 +185,50 @@ func main() {
 
 	// Collect and print results
 	if *flagPMU && collector != nil {
-		collector.PrintMetrics()
+		collector.PrintMetrics(systemWide, *flagPerPID)
 	}
 
 	if *flagProfile && profiler != nil {
-		collectAndWriteProfile(profiler, pid)
+		collectAndWriteProfile(profiler, systemWide)
 	}
 
 	if *flagOffCpu && offcpuProfiler != nil {
-		collectAndWriteOffcpuProfile(offcpuProfiler, pid)
+		collectAndWriteOffcpuProfile(offcpuProfiler, systemWide)
 	}
 
 	fmt.Println("Exiting program.")
 }
 
-func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
+func setupProfiler(pid int, systemWide bool, cpus []uint) (*profilerState, func(), error) {
+	spec, err := profile.LoadPerf()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load profile spec: %w", err)
+	}
+
+	// Set system_wide variable in eBPF program
+	if err := spec.RewriteConstants(map[string]interface{}{
+		"system_wide": systemWide,
+	}); err != nil {
+		return nil, nil, fmt.Errorf("rewrite constants: %w", err)
+	}
+
 	objs := &profile.PerfObjects{}
-	if err := profile.LoadPerfObjects(objs, nil); err != nil {
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, nil, fmt.Errorf("load profile objects: %w", err)
 	}
 
-	config := profile.PerfPidConfig{
-		Type:          0,
-		CollectUser:   1,
-		CollectKernel: 0,
-	}
+	// Only configure PID filter for targeted mode
+	if !systemWide {
+		config := profile.PerfPidConfig{
+			Type:          0,
+			CollectUser:   1,
+			CollectKernel: 0,
+		}
 
-	if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {
-		_ = objs.Close()
-		return nil, nil, fmt.Errorf("update pid map: %w", err)
+		if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {
+			_ = objs.Close()
+			return nil, nil, fmt.Errorf("update pid map: %w", err)
+		}
 	}
 
 	var perfEvents []*perfEvent
@@ -231,9 +281,21 @@ func setupProfiler(pid int, cpus []uint) (*profilerState, func(), error) {
 	return state, cleanup, nil
 }
 
-func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), error) {
+func setupPMUMonitor(pid int, systemWide bool, cpus []uint) (*cpu.CPUUsageCollector, func(), error) {
+	spec, err := cpu.LoadCPU()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load CPU spec: %w", err)
+	}
+
+	// Set system_wide variable in eBPF program
+	if err := spec.RewriteConstants(map[string]interface{}{
+		"system_wide": systemWide,
+	}); err != nil {
+		return nil, nil, fmt.Errorf("rewrite constants: %w", err)
+	}
+
 	cpuObjs := &cpu.CPUObjects{}
-	if err := cpu.LoadCPUObjects(cpuObjs, nil); err != nil {
+	if err := spec.LoadAndAssign(cpuObjs, nil); err != nil {
 		return nil, nil, fmt.Errorf("load CPU objects: %w", err)
 	}
 
@@ -244,7 +306,7 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 	}
 
 	var hwPerf *cpu.HardwarePerfEvents
-	hwPerf, err := cpu.NewHardwarePerfEvents(cpuList)
+	hwPerf, err = cpu.NewHardwarePerfEvents(cpuList)
 	if err != nil {
 		log.Printf("Hardware perf counters unavailable (running in VM?): %v", err)
 	} else {
@@ -287,15 +349,17 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 		return nil, nil, fmt.Errorf("create CPU usage collector: %w", err)
 	}
 
-	// Configure PID filter
-	trackValue := uint8(1)
-	if err := cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
-		_ = tp.Close()
-		if hwPerf != nil {
-			_ = hwPerf.Close()
+	// Configure PID filter only for targeted mode
+	if !systemWide {
+		trackValue := uint8(1)
+		if err := cpuObjs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
+			_ = tp.Close()
+			if hwPerf != nil {
+				_ = hwPerf.Close()
+			}
+			_ = cpuObjs.Close()
+			return nil, nil, fmt.Errorf("configure PID filter: %w", err)
 		}
-		_ = cpuObjs.Close()
-		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
 	}
 
 	// Start polling goroutine
@@ -328,7 +392,7 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 	return collector, cleanup, nil
 }
 
-func collectAndWriteProfile(profiler *profilerState, pid int) {
+func collectAndWriteProfile(profiler *profilerState, systemWide bool) {
 	m := profiler.objs.Counts
 	mapSize := m.MaxEntries()
 
@@ -363,6 +427,9 @@ func collectAndWriteProfile(profiler *profilerState, pid int) {
 		key := keys[i]
 		value := values[i]
 
+		// Use PID from sample key for symbolization
+		samplePid := key.Pid
+
 		stack, err := profiler.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
@@ -385,7 +452,7 @@ func collectAndWriteProfile(profiler *profilerState, pid int) {
 
 			symbol, err := profiler.symbolizer.SymbolizeProcessAbsAddrs(
 				[]uint64{instructionPointer},
-				uint32(pid),
+				samplePid,
 				blazesym.ProcessSourceWithPerfMap(true),
 				blazesym.ProcessSourceWithDebugSyms(true),
 			)
@@ -400,7 +467,7 @@ func collectAndWriteProfile(profiler *profilerState, pid int) {
 		end := len(sb.stack)
 		Reverse(sb.stack[begin:end])
 
-		sample := createSample(sb, value, pid)
+		sample := createSample(sb, value, int(samplePid))
 		builders.AddSample(&sample)
 	}
 
@@ -457,17 +524,31 @@ func Reverse[S ~[]E, E any](s S) {
 	}
 }
 
-func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
+func setupOffcpuProfiler(pid int, systemWide bool) (*offcpuState, func(), error) {
+	spec, err := offcpu.LoadOffcpu()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load offcpu spec: %w", err)
+	}
+
+	// Set system_wide variable in eBPF program
+	if err := spec.RewriteConstants(map[string]interface{}{
+		"system_wide": systemWide,
+	}); err != nil {
+		return nil, nil, fmt.Errorf("rewrite constants: %w", err)
+	}
+
 	objs := &offcpu.OffcpuObjects{}
-	if err := offcpu.LoadOffcpuObjects(objs, nil); err != nil {
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
 		return nil, nil, fmt.Errorf("load offcpu objects: %w", err)
 	}
 
-	// Configure PID filter
-	trackValue := uint8(1)
-	if err := objs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
-		_ = objs.Close()
-		return nil, nil, fmt.Errorf("configure PID filter: %w", err)
+	// Configure PID filter only for targeted mode
+	if !systemWide {
+		trackValue := uint8(1)
+		if err := objs.PidFilter.Update(uint32(pid), &trackValue, ebpf.UpdateAny); err != nil {
+			_ = objs.Close()
+			return nil, nil, fmt.Errorf("configure PID filter: %w", err)
+		}
 	}
 
 	// Attach to sched_switch tracepoint
@@ -501,7 +582,7 @@ func setupOffcpuProfiler(pid int) (*offcpuState, func(), error) {
 	return state, cleanup, nil
 }
 
-func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
+func collectAndWriteOffcpuProfile(profiler *offcpuState, systemWide bool) {
 	m := profiler.objs.OffcpuCounts
 	mapSize := m.MaxEntries()
 
@@ -536,6 +617,9 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
 		key := keys[i]
 		value := values[i]
 
+		// Use PID from sample key for symbolization
+		samplePid := key.Pid
+
 		stack, err := profiler.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
@@ -558,7 +642,7 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
 
 			symbol, err := profiler.symbolizer.SymbolizeProcessAbsAddrs(
 				[]uint64{instructionPointer},
-				uint32(pid),
+				samplePid,
 				blazesym.ProcessSourceWithPerfMap(true),
 				blazesym.ProcessSourceWithDebugSyms(true),
 			)
@@ -574,7 +658,7 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, pid int) {
 		Reverse(sb.stack[begin:end])
 
 		sample := pprof.ProfileSample{
-			Pid:         uint32(pid),
+			Pid:         samplePid,
 			Aggregation: pprof.SampleAggregated,
 			SampleType:  pprof.SampleTypeOffCpu,
 			Stack:       sb.stack,

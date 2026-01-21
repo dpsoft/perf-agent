@@ -52,7 +52,10 @@ struct {
     __uint(max_entries, OFFCPU_MAPS_SIZE);
 } stackmap SEC(".maps");
 
-// PID filter: only track specified PIDs
+// System-wide mode: when true, profile all processes; when false, use PID filter
+const volatile bool system_wide = false;
+
+// PID filter: only track specified PIDs (used when system_wide=false)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
@@ -77,9 +80,9 @@ static int handle_sched_switch(void *ctx, bool preempt,
 
     // Handle prev task going off-CPU
     if (prev_pid != 0) {
-        // Check if we're tracking this PID
-        u8 *track = bpf_map_lookup_elem(&pid_filter, &prev_tgid);
-        if (track) {
+        // In system-wide mode, track all processes; otherwise check PID filter
+        bool should_track = system_wide || bpf_map_lookup_elem(&pid_filter, &prev_tgid);
+        if (should_track) {
             // Skip kernel threads
             u32 flags = BPF_CORE_READ(prev, flags);
             if (!(flags & PF_KTHREAD)) {
@@ -106,8 +109,9 @@ static int handle_sched_switch(void *ctx, bool preempt,
 
     // Handle next task returning to CPU
     if (next_pid != 0) {
-        u8 *track = bpf_map_lookup_elem(&pid_filter, &next_tgid);
-        if (track) {
+        // In system-wide mode, track all processes; otherwise check PID filter
+        bool should_track = system_wide || bpf_map_lookup_elem(&pid_filter, &next_tgid);
+        if (should_track) {
             struct start_key sk = {
                 .pid = next_pid,
                 .tgid = next_tgid,

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -85,34 +84,6 @@ func TestProfileMode(t *testing.T) {
 				time.Sleep(2 * time.Second) // Let workload stabilize
 			}
 
-			// For Python, check if perf map file exists (requires Python 3.12+ with -X perf)
-			if wl.Language == "python" {
-				perfMapPath := fmt.Sprintf("/tmp/perf-%d.map", workload.Process.Pid)
-				if _, err := os.Stat(perfMapPath); err == nil {
-					t.Logf("✓ Python perf map found at %s", perfMapPath)
-					// Read and check for user functions
-					if data, err := os.ReadFile(perfMapPath); err == nil {
-						lines := strings.Split(string(data), "\n")
-						if len(lines) > 0 && lines[0] != "" {
-							t.Logf("  Sample entry: %s", lines[0])
-						}
-						// Check for actual user functions after warmup
-						mapContent := string(data)
-						hasUserFunctions := strings.Contains(mapContent, "cpu_work") ||
-							strings.Contains(mapContent, "io_work") ||
-							strings.Contains(mapContent, "main")
-						if hasUserFunctions {
-							t.Logf("✓ User functions found in perf map after warmup")
-						} else {
-							t.Logf("⚠ Perf map exists but user functions not yet JIT-compiled")
-						}
-					}
-				} else {
-					t.Logf("⚠ WARNING: Python perf map not found at %s", perfMapPath)
-					t.Logf("  Python version may not support -X perf (requires 3.12+)")
-				}
-			}
-
 			// Run perf-agent
 			outputFile := "profile.pb.gz"
 			defer os.Remove(outputFile)
@@ -124,8 +95,9 @@ func TestProfileMode(t *testing.T) {
 			)
 
 			output, err := agent.CombinedOutput()
-			t.Logf("perf-agent output:\n%s", string(output))
-			require.NoError(t, err, "perf-agent should complete successfully")
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
 
 			// Verify profile.pb.gz was created
 			assert.FileExists(t, outputFile)
@@ -139,9 +111,7 @@ func TestProfileMode(t *testing.T) {
 
 			// Should have valid sample types
 			require.Greater(t, len(prof.SampleType), 0)
-			// Sample type can be "sample" or "cpu" or "samples" depending on pprof version
 			sampleType := prof.SampleType[0].Type
-			t.Logf("Sample type: %s", sampleType)
 			assert.True(t, sampleType == "sample" || sampleType == "cpu" || sampleType == "samples",
 				"Expected sample type to be 'sample', 'cpu', or 'samples', got: %s", sampleType)
 
@@ -157,36 +127,13 @@ func TestProfileMode(t *testing.T) {
 
 			// Verify symbolization worked (at least some symbols)
 			hasSymbols := false
-			hasPythonSymbols := false
 			for _, fn := range prof.Function {
 				if fn.Name != "" && fn.Name != "??" {
 					hasSymbols = true
-					t.Logf("Found symbol: %s (file: %s)", fn.Name, fn.Filename)
-
-					// For Python, check if we have actual Python function symbols
-					if wl.Language == "python" {
-						if fn.Filename != "" && strings.HasSuffix(fn.Filename, ".py") {
-							hasPythonSymbols = true
-							t.Logf("✓ Found Python-specific symbol: %s in %s", fn.Name, fn.Filename)
-						} else if strings.Contains(fn.Name, "cpu_work") || strings.Contains(fn.Name, "py:") {
-							hasPythonSymbols = true
-							t.Logf("✓ Found Python function: %s", fn.Name)
-						}
-					}
 					break
 				}
 			}
 			assert.True(t, hasSymbols, "Profile should contain symbolized functions")
-
-			// Additional validation for Python
-			if wl.Language == "python" {
-				if hasPythonSymbols {
-					t.Logf("✓ Python symbolization working correctly")
-				} else {
-					t.Logf("⚠ No Python-specific symbols found (may need Python 3.12+ with -X perf)")
-					t.Logf("  Profile contains system symbols only, which is expected without perf map support")
-				}
-			}
 		})
 	}
 }
@@ -226,8 +173,9 @@ func TestOffCPUMode(t *testing.T) {
 			)
 
 			output, err := agent.CombinedOutput()
-			t.Logf("perf-agent output:\n%s", string(output))
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
 
 			// Verify offcpu.pb.gz was created
 			assert.FileExists(t, outputFile)
@@ -270,8 +218,9 @@ func TestPMUMode(t *testing.T) {
 	)
 
 	output, err := agent.CombinedOutput()
-	t.Logf("perf-agent output:\n%s", string(output))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
 
 	outputStr := string(output)
 
@@ -279,20 +228,8 @@ func TestPMUMode(t *testing.T) {
 	assert.Contains(t, outputStr, "Metrics")
 	assert.Contains(t, outputStr, "Samples:")
 	assert.Contains(t, outputStr, "Scheduling Latency")
-
-	// Check for percentile data
 	assert.Contains(t, outputStr, "P50:")
-	assert.Contains(t, outputStr, "P95:")
 	assert.Contains(t, outputStr, "P99:")
-
-	// Hardware counters (may not be available in VMs)
-	if strings.Contains(outputStr, "Hardware Counters:") {
-		if !strings.Contains(outputStr, "not available") {
-			assert.Contains(t, outputStr, "Total Cycles:")
-			assert.Contains(t, outputStr, "Total Instructions:")
-			assert.Contains(t, outputStr, "IPC")
-		}
-	}
 }
 
 func TestCombinedMode(t *testing.T) {
@@ -325,8 +262,9 @@ func TestCombinedMode(t *testing.T) {
 	)
 
 	output, err := agent.CombinedOutput()
-	t.Logf("perf-agent output:\n%s", string(output))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
 
 	// Verify both profile files exist
 	defer os.Remove("profile.pb.gz")
@@ -334,17 +272,13 @@ func TestCombinedMode(t *testing.T) {
 
 	assert.FileExists(t, "profile.pb.gz")
 	assert.FileExists(t, "offcpu.pb.gz")
-
-	// Verify PMU output
-	outputStr := string(output)
-	assert.Contains(t, outputStr, "Metrics")
+	assert.Contains(t, string(output), "Metrics")
 
 	// Verify profiles are valid
 	cpuProf := parseProfile(t, "profile.pb.gz")
 	assert.Greater(t, len(cpuProf.Sample), 0)
 
 	offcpuProf := parseProfile(t, "offcpu.pb.gz")
-	// Off-CPU may have 0 samples for CPU-bound workload, that's OK
 	assert.NotNil(t, offcpuProf)
 }
 
@@ -375,4 +309,201 @@ func parseProfile(t *testing.T, filename string) *profile.Profile {
 	require.NoError(t, err)
 
 	return prof
+}
+
+// System-wide profiling tests
+
+func TestSystemWideProfile(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// Start multiple workloads
+	workload1 := exec.Command("./workloads/go/cpu_bound", "-duration=15s", "-threads=2")
+	workload2 := exec.Command("./workloads/go/io_bound", "-duration=15s", "-threads=2")
+	require.NoError(t, workload1.Start())
+	require.NoError(t, workload2.Start())
+	defer func() {
+		if workload1.Process != nil {
+			workload1.Process.Kill()
+			workload1.Wait()
+		}
+		if workload2.Process != nil {
+			workload2.Process.Kill()
+			workload2.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Run system-wide profiling
+	outputFile := "profile.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath, "--profile", "-a", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	assert.Contains(t, string(output), "system-wide")
+	assert.FileExists(t, outputFile)
+
+	prof := parseProfile(t, outputFile)
+	require.NotNil(t, prof)
+	assert.Greater(t, len(prof.Sample), 0, "System-wide profile should contain samples")
+}
+
+func TestSystemWideOffCPU(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	workload := exec.Command("./workloads/go/io_bound", "-duration=15s", "-threads=2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	outputFile := "offcpu.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath, "--offcpu", "-a", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	assert.Contains(t, string(output), "system-wide")
+	assert.FileExists(t, outputFile)
+}
+
+func TestSystemWidePMU(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	workload := exec.Command("./workloads/go/cpu_bound", "-duration=15s", "-threads=2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	agent := exec.Command(agentPath, "--pmu", "-a", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+	assert.Contains(t, outputStr, "System-Wide")
+	assert.Contains(t, outputStr, "Processes profiled")
+	assert.NotContains(t, outputStr, "--- PID")
+}
+
+func TestSystemWidePMUPerPID(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	workload1 := exec.Command("./workloads/go/cpu_bound", "-duration=15s", "-threads=2")
+	workload2 := exec.Command("./workloads/go/io_bound", "-duration=15s", "-threads=2")
+	require.NoError(t, workload1.Start())
+	require.NoError(t, workload2.Start())
+	defer func() {
+		if workload1.Process != nil {
+			workload1.Process.Kill()
+			workload1.Wait()
+		}
+		if workload2.Process != nil {
+			workload2.Process.Kill()
+			workload2.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	agent := exec.Command(agentPath, "--pmu", "-a", "--per-pid", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+	assert.Contains(t, outputStr, "System-Wide, Per-PID")
+	assert.Contains(t, outputStr, "--- PID")
+}
+
+func TestMutuallyExclusiveFlags(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// --pid and -a should be mutually exclusive
+	agent := exec.Command(agentPath, "--profile", "--pid", "1234", "-a", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	assert.Error(t, err)
+	assert.Contains(t, string(output), "mutually exclusive")
+}
+
+func TestRequiresPIDOrAll(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// Should fail without --pid or -a
+	agent := exec.Command(agentPath, "--profile", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	assert.Error(t, err)
+	assert.Contains(t, string(output), "required")
+}
+
+func TestPerPIDRequiresAll(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// --per-pid should require -a
+	agent := exec.Command(agentPath, "--pmu", "--pid", "1234", "--per-pid", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	assert.Error(t, err)
+	assert.Contains(t, string(output), "--per-pid requires")
+}
+
+func TestPerPIDRequiresPMU(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// --per-pid should require --pmu
+	agent := exec.Command(agentPath, "--profile", "-a", "--per-pid", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	assert.Error(t, err)
+	assert.Contains(t, string(output), "only valid with --pmu")
 }

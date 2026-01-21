@@ -93,13 +93,16 @@ static __always_inline u64 read_counter_delta(void *reader_map, void *prev_map, 
     return delta;
 }
 
+// System-wide mode: when true, profile all processes; when false, use PID filter
+const volatile bool system_wide = false;
+
 // Ring buffer for host-wide CPU stats
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
 
-// Filter: tracked TGIDs
+// Filter: tracked TGIDs (used when system_wide=false)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
@@ -114,6 +117,8 @@ struct {
     __type(key, u32);
     __type(value, u64);
 } last_seen SEC(".maps");
+
+#define PF_KTHREAD 0x00200000 /* I am a kernel thread */
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_struct *next) {
@@ -137,8 +142,17 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
     u32 prev_pid = BPF_CORE_READ(prev, pid);
     if (prev_pid != 0) {
         u32 tgid = BPF_CORE_READ(prev, tgid);
-        u8 *track = bpf_map_lookup_elem(&pid_filter, &tgid);
-        if (track) {
+
+        // Skip kernel threads in system-wide mode
+        if (system_wide) {
+            u32 flags = BPF_CORE_READ(prev, flags);
+            if (flags & PF_KTHREAD)
+                goto update_timestamp;
+        }
+
+        // In system-wide mode, track all processes; otherwise check PID filter
+        bool should_track = system_wide || bpf_map_lookup_elem(&pid_filter, &tgid);
+        if (should_track) {
             struct pid_stat_s *ps = bpf_ringbuf_reserve(&rb, sizeof(*ps), 0);
             if (ps) {
                 ps->tgid = tgid;
@@ -152,6 +166,7 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
         }
     }
 
+update_timestamp:
     bpf_map_update_elem(&last_seen, &cpu, &now, BPF_ANY);
     return 0;
 }

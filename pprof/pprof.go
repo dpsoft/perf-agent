@@ -59,6 +59,7 @@ type ProfileSample struct {
 type BuildersOptions struct {
 	SampleRate    int64
 	PerPIDProfile bool
+	Comments      []string // Profile-level comments/tags
 }
 
 type builderHashKey struct {
@@ -136,6 +137,7 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 			Period:     period,
 			PeriodType: periodType,
 			TimeNanos:  time.Now().UnixNano(),
+			Comments:   b.opt.Comments,
 		},
 		tmpLocationIDs: make([]uint64, 0, 128),
 		tmpLocations:   make([]*profile.Location, 0, 128),

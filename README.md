@@ -22,8 +22,14 @@ sudo ./perf-agent --profile --offcpu --pid <PID>
 # PMU only (hardware counters: cycles, instructions, cache misses)
 sudo ./perf-agent --pmu --pid <PID>
 
-# All features
-sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s
+# System-wide profiling (all processes)
+sudo ./perf-agent --profile -a --duration 30s
+
+# All features with tags for metadata
+sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
+    --tag env=production \
+    --tag version=1.2.3 \
+    --tag service=api
 ```
 
 ## Flags
@@ -33,10 +39,13 @@ sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s
 | `--profile` | Enable CPU profiling with stack traces | `false` |
 | `--offcpu` | Enable off-CPU profiling with stack traces | `false` |
 | `--pmu` | Enable PMU hardware counters | `false` |
-| `--pid` | Target process ID to monitor (required) | - |
+| `--pid <PID>` | Target process ID to monitor | - |
+| `-a, --all` | System-wide profiling (all processes) | `false` |
+| `--per-pid` | Show per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
+| `--tag key=value` | Add tag to profile (repeatable) | - |
 
-At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
+Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
 
 ## Output
 
@@ -46,6 +55,18 @@ Writes `profile.pb.gz` in pprof format. Shows where CPU time is spent.
 
 ```bash
 go tool pprof profile.pb.gz
+```
+
+### Profile Tags (`--tag`)
+
+Tags are stored as comments in the pprof file. View them with:
+
+```bash
+go tool pprof profile.pb.gz
+(pprof) comments
+env=production
+version=1.2.3
+service=api
 ```
 
 ### Off-CPU Mode (`--offcpu`)

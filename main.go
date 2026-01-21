@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"perf-agent/cpu"
 	"perf-agent/offcpu"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,11 +38,29 @@ var (
 	flagAll      = flag.Bool("a", false, "System-wide profiling (all processes)")
 	flagPerPID   = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
 	flagDuration = flag.Duration("duration", 10*time.Second, "Collection duration")
+	flagTags     tagFlags
 )
+
+// tagFlags is a custom flag type for collecting multiple --tag key=value arguments
+type tagFlags []string
+
+func (t *tagFlags) String() string {
+	return strings.Join(*t, ",")
+}
+
+func (t *tagFlags) Set(value string) error {
+	if !strings.Contains(value, "=") {
+		return fmt.Errorf("tag must be in key=value format")
+	}
+	*t = append(*t, value)
+	return nil
+}
 
 func init() {
 	// Register long form for -a flag
 	flag.BoolVar(flagAll, "all", false, "System-wide profiling (all processes)")
+	// Register --tag flag for profile metadata
+	flag.Var(&flagTags, "tag", "Add tag to profile (repeatable, format: key=value)")
 }
 
 type stackBuilder struct {
@@ -421,6 +440,7 @@ func collectAndWriteProfile(profiler *profilerState, systemWide bool) {
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
 		SampleRate:    int64(97),
 		PerPIDProfile: false,
+		Comments:      flagTags,
 	})
 
 	for i := 0; i < n; i++ {
@@ -611,6 +631,7 @@ func collectAndWriteOffcpuProfile(profiler *offcpuState, systemWide bool) {
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
 		SampleRate:    1, // Not used for off-CPU, but needed for builder
 		PerPIDProfile: false,
+		Comments:      flagTags,
 	})
 
 	for i := 0; i < n; i++ {

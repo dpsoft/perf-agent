@@ -26,21 +26,21 @@ type CpuStat struct {
 }
 
 type PidStat struct {
-	TGID        uint32
-	DeltaNs     uint64
-	Cycles      uint64
+	TGID         uint32
+	DeltaNs      uint64
+	Cycles       uint64
 	Instructions uint64
-	CacheMisses uint64
-	Timestamp   uint64
+	CacheMisses  uint64
+	Timestamp    uint64
 }
 
 // PidMetrics holds accumulated metrics for a PID
 type PidMetrics struct {
-	TimeHist        *hdrhistogram.Histogram
-	TotalCycles     uint64
+	TimeHist          *hdrhistogram.Histogram
+	TotalCycles       uint64
 	TotalInstructions uint64
 	TotalCacheMisses  uint64
-	SampleCount     uint64
+	SampleCount       uint64
 }
 
 func NewCPUUsageCollector(objs *CPUObjects) (*CPUUsageCollector, error) {
@@ -139,4 +139,42 @@ func (c *CPUUsageCollector) Close() error {
 		return c.reader.Close()
 	}
 	return nil
+}
+
+// PrintMetrics prints PMU metrics for all tracked PIDs
+func (c *CPUUsageCollector) PrintMetrics() {
+	for pid, m := range c.GetAllMetrics() {
+		fmt.Printf("\n=== PID %d Metrics ===\n", pid)
+		fmt.Printf("Samples: %d\n", m.SampleCount)
+
+		// Time histogram stats
+		hist := m.TimeHist
+		fmt.Printf("\nScheduling Latency (time on CPU per switch):\n")
+		fmt.Printf("  Min:    %.3f ms\n", float64(hist.Min())/1e6)
+		fmt.Printf("  Max:    %.3f ms\n", float64(hist.Max())/1e6)
+		fmt.Printf("  Mean:   %.3f ms\n", hist.Mean()/1e6)
+		fmt.Printf("  P50:    %.3f ms\n", float64(hist.ValueAtQuantile(50.0))/1e6)
+		fmt.Printf("  P95:    %.3f ms\n", float64(hist.ValueAtQuantile(95.0))/1e6)
+		fmt.Printf("  P99:    %.3f ms\n", float64(hist.ValueAtQuantile(99.0))/1e6)
+		fmt.Printf("  P99.9:  %.3f ms\n", float64(hist.ValueAtQuantile(99.9))/1e6)
+
+		// Hardware counters
+		if m.TotalCycles > 0 || m.TotalInstructions > 0 {
+			fmt.Printf("\nHardware Counters:\n")
+			fmt.Printf("  Total Cycles:       %d\n", m.TotalCycles)
+			fmt.Printf("  Total Instructions: %d\n", m.TotalInstructions)
+			fmt.Printf("  Total Cache Misses: %d\n", m.TotalCacheMisses)
+
+			if m.TotalCycles > 0 {
+				ipc := float64(m.TotalInstructions) / float64(m.TotalCycles)
+				fmt.Printf("  IPC (Instr/Cycle):  %.3f\n", ipc)
+			}
+			if m.TotalInstructions > 0 {
+				missRate := float64(m.TotalCacheMisses) / float64(m.TotalInstructions) * 1000
+				fmt.Printf("  Cache Misses/1K Instr: %.3f\n", missRate)
+			}
+		} else {
+			fmt.Printf("\nHardware Counters: not available\n")
+		}
+	}
 }

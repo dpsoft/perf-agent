@@ -21,9 +21,10 @@ import (
 
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
-	blazesym "github.com/libbpf/blazesym/go"
 	"perf-agent/pprof"
 	"perf-agent/profile"
+
+	blazesym "github.com/libbpf/blazesym/go"
 
 	p "github.com/google/pprof/profile"
 )
@@ -149,7 +150,7 @@ func main() {
 
 	// Collect and print results
 	if *flagPMU && collector != nil {
-		printPMUMetrics(collector)
+		collector.PrintMetrics()
 	}
 
 	if *flagProfile && profiler != nil {
@@ -325,43 +326,6 @@ func setupPMUMonitor(pid int, cpus []uint) (*cpu.CPUUsageCollector, func(), erro
 	}
 
 	return collector, cleanup, nil
-}
-
-func printPMUMetrics(collector *cpu.CPUUsageCollector) {
-	for pid, m := range collector.GetAllMetrics() {
-		fmt.Printf("\n=== PID %d Metrics ===\n", pid)
-		fmt.Printf("Samples: %d\n", m.SampleCount)
-
-		// Time histogram stats
-		hist := m.TimeHist
-		fmt.Printf("\nScheduling Latency (time on CPU per switch):\n")
-		fmt.Printf("  Min:    %.3f ms\n", float64(hist.Min())/1e6)
-		fmt.Printf("  Max:    %.3f ms\n", float64(hist.Max())/1e6)
-		fmt.Printf("  Mean:   %.3f ms\n", hist.Mean()/1e6)
-		fmt.Printf("  P50:    %.3f ms\n", float64(hist.ValueAtQuantile(50.0))/1e6)
-		fmt.Printf("  P95:    %.3f ms\n", float64(hist.ValueAtQuantile(95.0))/1e6)
-		fmt.Printf("  P99:    %.3f ms\n", float64(hist.ValueAtQuantile(99.0))/1e6)
-		fmt.Printf("  P99.9:  %.3f ms\n", float64(hist.ValueAtQuantile(99.9))/1e6)
-
-		// Hardware counters
-		if m.TotalCycles > 0 || m.TotalInstructions > 0 {
-			fmt.Printf("\nHardware Counters:\n")
-			fmt.Printf("  Total Cycles:       %d\n", m.TotalCycles)
-			fmt.Printf("  Total Instructions: %d\n", m.TotalInstructions)
-			fmt.Printf("  Total Cache Misses: %d\n", m.TotalCacheMisses)
-
-			if m.TotalCycles > 0 {
-				ipc := float64(m.TotalInstructions) / float64(m.TotalCycles)
-				fmt.Printf("  IPC (Instr/Cycle):  %.3f\n", ipc)
-			}
-			if m.TotalInstructions > 0 {
-				missRate := float64(m.TotalCacheMisses) / float64(m.TotalInstructions) * 1000
-				fmt.Printf("  Cache Misses/1K Instr: %.3f\n", missRate)
-			}
-		} else {
-			fmt.Printf("\nHardware Counters: not available\n")
-		}
-	}
 }
 
 func collectAndWriteProfile(profiler *profilerState, pid int) {

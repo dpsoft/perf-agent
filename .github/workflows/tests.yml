@@ -175,7 +175,7 @@ jobs:
         run: go generate ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.8.0
           args: --timeout=5m

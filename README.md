@@ -2,6 +2,66 @@
 
 eBPF-based performance monitoring agent for Linux. Supports CPU profiling with stack traces, off-CPU profiling, and PMU hardware counter collection.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            USER SPACE (Go)                                  │
+│                                                                             │
+│                            ┌──────────┐                                     │
+│                            │ main.go  │                                     │
+│                            └────┬─────┘                                     │
+│                    ┌────────────┼────────────┐                              │
+│                    ▼            ▼            ▼                              │
+│  ┌──────────────────┐  ┌──────────────┐  ┌─────────────────┐               │
+│  │   CPU Profiler   │  │ PMU Monitor  │  │ Off-CPU Profiler│               │
+│  │                  │  │              │  │                 │               │
+│  │  profile/        │  │  cpu/        │  │  offcpu/        │               │
+│  │  perf_event.go   │  │  ring buffer │  │  sched_switch   │               │
+│  │  blazesym        │  │  histograms  │  │  blazesym       │               │
+│  └────────┬─────────┘  └──────┬───────┘  └────────┬────────┘               │
+│           │                   │                   │                         │
+│           ▼                   ▼                   ▼                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        pprof/ (Profile Builder)                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└───────────┬───────────────────┬───────────────────┬─────────────────────────┘
+            │                   │                   │
+════════════╪═══════════════════╪═══════════════════╪═════════════════════════
+            │    eBPF Load      │                   │
+            ▼                   ▼                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          KERNEL SPACE (eBPF)                                │
+│                                                                             │
+│  ┌──────────────────┐  ┌──────────────┐  ┌─────────────────┐               │
+│  │   perf.bpf.c     │  │  cpu.bpf.c   │  │  offcpu.bpf.c   │               │
+│  │                  │  │              │  │                 │               │
+│  │  perf_event hook │  │ sched_switch │  │  sched_switch   │               │
+│  │  stack capture   │  │ sched_wakeup │  │  off-CPU time   │               │
+│  │                  │  │ HW counters  │  │  stack capture  │               │
+│  └────────┬─────────┘  └──────┬───────┘  └────────┬────────┘               │
+│           │                   │                   │                         │
+│           └───────────────────┼───────────────────┘                         │
+│                               ▼                                             │
+│                    ┌─────────────────────┐                                  │
+│                    │     eBPF Maps       │                                  │
+│                    │                     │                                  │
+│                    │  • stackmap         │                                  │
+│                    │  • ring buffer      │                                  │
+│                    │  • pid_filter       │                                  │
+│                    │  • hw_counters      │                                  │
+│                    └─────────────────────┘                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                    ┌───────────────────────────────────────┐
+                    │              OUTPUT                   │
+                    │                                       │
+                    │  profile.pb.gz   Console    offcpu.pb.gz
+                    │  (CPU stacks)    Metrics    (blocking) │
+                    └───────────────────────────────────────┘
+```
+
 ## Requirements
 
 - Linux kernel 5.8+ (for BTF and CO-RE support)

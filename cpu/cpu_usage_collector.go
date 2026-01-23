@@ -171,7 +171,7 @@ func printSinglePIDMetrics(m *PidMetrics) {
 
 	// Time histogram stats
 	hist := m.TimeHist
-	fmt.Printf("\nScheduling Latency (time on CPU per switch):\n")
+	fmt.Printf("\nOn-CPU Time (time slice per context switch):\n")
 	fmt.Printf("  Min:    %.3f ms\n", float64(hist.Min())/1e6)
 	fmt.Printf("  Max:    %.3f ms\n", float64(hist.Max())/1e6)
 	fmt.Printf("  Mean:   %.3f ms\n", hist.Mean()/1e6)

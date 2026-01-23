@@ -253,15 +253,18 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
         unsigned int prev_state = BPF_CORE_READ(prev, __state);
         u8 prev_state_classified = classify_task_state(prev_state);
 
-        // Skip kernel threads in system-wide mode
+        // Single condition: track if not kernel thread AND (system-wide OR in filter)
+        bool should_track = true;
+        
         if (system_wide) {
             u32 flags = BPF_CORE_READ(prev, flags);
-            if (flags & PF_KTHREAD)
-                goto update_timestamp;
+            if (flags & PF_KTHREAD) {
+                should_track = false;
+            }
+        } else {
+            should_track = bpf_map_lookup_elem(&pid_filter, &tgid) != NULL;
         }
 
-        // In system-wide mode, track all processes; otherwise check PID filter
-        bool should_track = system_wide || bpf_map_lookup_elem(&pid_filter, &tgid);
         if (should_track) {
             struct pid_stat_s *ps = bpf_ringbuf_reserve(&rb, sizeof(*ps), 0);
             if (ps) {
@@ -296,7 +299,7 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
         }
     }
 
-update_timestamp:
+    // Always update timestamp (no goto needed)
     bpf_map_update_elem(&last_seen, &cpu, &now, BPF_ANY);
     return 0;
 }

@@ -60,3 +60,7 @@ offcpu.pb.gz
 
 ### Project binaries ###
 perf-agent
+
+### Anthropic Claude ###
+.claude
+.memory-bank

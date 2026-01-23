@@ -81,9 +81,11 @@ go tool pprof offcpu.pb.gz
 ### PMU Mode (`--pmu`)
 
 Prints to stdout:
-- Scheduling latency histogram (min, max, mean, percentiles)
-- Hardware counters (cycles, instructions, cache misses)
-- Derived metrics (IPC, cache miss rate)
+- **On-CPU time**: Time slice per context switch (min, max, mean, percentiles)
+- **Runqueue latency**: Time waiting for CPU after becoming runnable (min, max, mean, percentiles)
+- **Context switch reasons**: Breakdown of preempted (running), voluntary (sleep/mutex), and I/O wait (D state)
+- **Hardware counters**: Cycles, instructions, cache misses
+- **Derived metrics**: IPC (instructions per cycle), cache miss rate
 
 ## Building
 

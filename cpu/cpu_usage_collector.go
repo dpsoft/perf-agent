@@ -268,6 +268,10 @@ func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
 	var totalCycles, totalInstructions, totalCacheMisses uint64
 	var totalPreempted, totalVoluntary, totalIOWait uint64
 
+	// Aggregate histograms for latency metrics
+	aggOnCPUHist := hdrhistogram.New(0, 1000000000000000, 3)
+	aggRunqHist := hdrhistogram.New(0, 1000000000000, 3)
+
 	for _, m := range metrics {
 		totalSamples += m.SampleCount
 		totalCycles += m.TotalCycles
@@ -276,11 +280,39 @@ func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
 		totalPreempted += m.PreemptedCount
 		totalVoluntary += m.VoluntaryCount
 		totalIOWait += m.IOWaitCount
+
+		// Merge histograms
+		aggOnCPUHist.Merge(m.OnCPUHist)
+		aggRunqHist.Merge(m.RunqLatencyHist)
 	}
 
 	fmt.Printf("\nPerformance counter stats for 'system wide':\n\n")
 	fmt.Printf("  Processes profiled:     %d\n", len(metrics))
 	fmt.Printf("  Total samples:          %d\n", totalSamples)
+
+	// On-CPU time histogram stats
+	if aggOnCPUHist.TotalCount() > 0 {
+		fmt.Printf("\nOn-CPU Time (time slice per context switch):\n")
+		fmt.Printf("  Min:    %.3f ms\n", float64(aggOnCPUHist.Min())/1e6)
+		fmt.Printf("  Max:    %.3f ms\n", float64(aggOnCPUHist.Max())/1e6)
+		fmt.Printf("  Mean:   %.3f ms\n", aggOnCPUHist.Mean()/1e6)
+		fmt.Printf("  P50:    %.3f ms\n", float64(aggOnCPUHist.ValueAtQuantile(50.0))/1e6)
+		fmt.Printf("  P95:    %.3f ms\n", float64(aggOnCPUHist.ValueAtQuantile(95.0))/1e6)
+		fmt.Printf("  P99:    %.3f ms\n", float64(aggOnCPUHist.ValueAtQuantile(99.0))/1e6)
+		fmt.Printf("  P99.9:  %.3f ms\n", float64(aggOnCPUHist.ValueAtQuantile(99.9))/1e6)
+	}
+
+	// Runqueue latency histogram stats
+	if aggRunqHist.TotalCount() > 0 {
+		fmt.Printf("\nRunqueue Latency (time waiting for CPU):\n")
+		fmt.Printf("  Min:    %.3f ms\n", float64(aggRunqHist.Min())/1e6)
+		fmt.Printf("  Max:    %.3f ms\n", float64(aggRunqHist.Max())/1e6)
+		fmt.Printf("  Mean:   %.3f ms\n", aggRunqHist.Mean()/1e6)
+		fmt.Printf("  P50:    %.3f ms\n", float64(aggRunqHist.ValueAtQuantile(50.0))/1e6)
+		fmt.Printf("  P95:    %.3f ms\n", float64(aggRunqHist.ValueAtQuantile(95.0))/1e6)
+		fmt.Printf("  P99:    %.3f ms\n", float64(aggRunqHist.ValueAtQuantile(99.0))/1e6)
+		fmt.Printf("  P99.9:  %.3f ms\n", float64(aggRunqHist.ValueAtQuantile(99.9))/1e6)
+	}
 
 	// Context switch reasons
 	totalSwitches := totalPreempted + totalVoluntary + totalIOWait

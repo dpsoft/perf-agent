@@ -5,9 +5,6 @@
 
 //#include "perf.h"
 
-
-////////// PERF EVENT //////////
-
 #define PERF_MAX_STACK_DEPTH    127
 #define PROFILE_MAPS_SIZE       16384
 
@@ -36,16 +33,6 @@ struct {
 
 #define KERN_STACKID_FLAGS (0 | BPF_F_FAST_STACK_CMP)
 #define USER_STACKID_FLAGS (0 | BPF_F_FAST_STACK_CMP | BPF_F_USER_STACK)
-
-////////// PERF EVENT //////////
-
-// #define LOG(fmt, ...)                       \
-//     ({                                      \
-//         if (verbose) {                      \
-//             bpf_printk(fmt, ##__VA_ARGS__); \
-//         }                                   \
-//     })
-
 
 ////////// PERF CONFIG //////////
 

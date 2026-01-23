@@ -53,7 +53,9 @@ type cpuSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cpuProgramSpecs struct {
-	HandleSwitch *ebpf.ProgramSpec `ebpf:"handle_switch"`
+	HandleSwitch    *ebpf.ProgramSpec `ebpf:"handle_switch"`
+	HandleWakeup    *ebpf.ProgramSpec `ebpf:"handle_wakeup"`
+	HandleWakeupNew *ebpf.ProgramSpec `ebpf:"handle_wakeup_new"`
 }
 
 // cpuMapSpecs contains maps before they are loaded into the kernel.
@@ -66,10 +68,12 @@ type cpuMapSpecs struct {
 	HwCountersEnabled     *ebpf.MapSpec `ebpf:"hw_counters_enabled"`
 	LastSeen              *ebpf.MapSpec `ebpf:"last_seen"`
 	PidFilter             *ebpf.MapSpec `ebpf:"pid_filter"`
+	PidRunqLatency        *ebpf.MapSpec `ebpf:"pid_runq_latency"`
 	PrevCacheMisses       *ebpf.MapSpec `ebpf:"prev_cache_misses"`
 	PrevCycles            *ebpf.MapSpec `ebpf:"prev_cycles"`
 	PrevInstructions      *ebpf.MapSpec `ebpf:"prev_instructions"`
 	Rb                    *ebpf.MapSpec `ebpf:"rb"`
+	WakeupTs              *ebpf.MapSpec `ebpf:"wakeup_ts"`
 }
 
 // cpuObjects contains all objects after they have been loaded into the kernel.
@@ -97,10 +101,12 @@ type cpuMaps struct {
 	HwCountersEnabled     *ebpf.Map `ebpf:"hw_counters_enabled"`
 	LastSeen              *ebpf.Map `ebpf:"last_seen"`
 	PidFilter             *ebpf.Map `ebpf:"pid_filter"`
+	PidRunqLatency        *ebpf.Map `ebpf:"pid_runq_latency"`
 	PrevCacheMisses       *ebpf.Map `ebpf:"prev_cache_misses"`
 	PrevCycles            *ebpf.Map `ebpf:"prev_cycles"`
 	PrevInstructions      *ebpf.Map `ebpf:"prev_instructions"`
 	Rb                    *ebpf.Map `ebpf:"rb"`
+	WakeupTs              *ebpf.Map `ebpf:"wakeup_ts"`
 }
 
 func (m *cpuMaps) Close() error {
@@ -111,10 +117,12 @@ func (m *cpuMaps) Close() error {
 		m.HwCountersEnabled,
 		m.LastSeen,
 		m.PidFilter,
+		m.PidRunqLatency,
 		m.PrevCacheMisses,
 		m.PrevCycles,
 		m.PrevInstructions,
 		m.Rb,
+		m.WakeupTs,
 	)
 }
 
@@ -122,12 +130,16 @@ func (m *cpuMaps) Close() error {
 //
 // It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cpuPrograms struct {
-	HandleSwitch *ebpf.Program `ebpf:"handle_switch"`
+	HandleSwitch    *ebpf.Program `ebpf:"handle_switch"`
+	HandleWakeup    *ebpf.Program `ebpf:"handle_wakeup"`
+	HandleWakeupNew *ebpf.Program `ebpf:"handle_wakeup_new"`
 }
 
 func (p *cpuPrograms) Close() error {
 	return _CpuClose(
 		p.HandleSwitch,
+		p.HandleWakeup,
+		p.HandleWakeupNew,
 	)
 }
 

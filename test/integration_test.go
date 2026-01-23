@@ -227,9 +227,17 @@ func TestPMUMode(t *testing.T) {
 	// Verify PMU metrics are present
 	assert.Contains(t, outputStr, "Metrics")
 	assert.Contains(t, outputStr, "Samples:")
-	assert.Contains(t, outputStr, "Scheduling Latency")
+	assert.Contains(t, outputStr, "On-CPU Time")
 	assert.Contains(t, outputStr, "P50:")
 	assert.Contains(t, outputStr, "P99:")
+
+	// Verify new runqueue latency metrics
+	assert.Contains(t, outputStr, "Runqueue Latency")
+
+	// Verify context switch reasons
+	assert.Contains(t, outputStr, "Context Switch Reasons")
+	assert.Contains(t, outputStr, "Preempted")
+	assert.Contains(t, outputStr, "Voluntary")
 }
 
 func TestCombinedMode(t *testing.T) {
@@ -506,4 +514,218 @@ func TestPerPIDRequiresPMU(t *testing.T) {
 	output, err := agent.CombinedOutput()
 	assert.Error(t, err)
 	assert.Contains(t, string(output), "only valid with --pmu")
+}
+
+// Tests for new runqueue latency and task state features
+
+func TestPMURunqueueLatency(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+	wl := workloads[0] // Go CPU workload
+
+	// Start workload
+	workload := exec.Command(wl.Binary, wl.Args...)
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Run perf-agent with PMU
+	agent := exec.Command(agentPath,
+		"--pmu",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+
+	// Verify runqueue latency histogram is present
+	assert.Contains(t, outputStr, "Runqueue Latency (time waiting for CPU)")
+
+	// Verify percentile values are present for runqueue latency
+	// The output should have two sets of percentiles: On-CPU and Runqueue
+	assert.Contains(t, outputStr, "Min:")
+	assert.Contains(t, outputStr, "Max:")
+	assert.Contains(t, outputStr, "Mean:")
+	assert.Contains(t, outputStr, "P50:")
+	assert.Contains(t, outputStr, "P95:")
+	assert.Contains(t, outputStr, "P99:")
+	assert.Contains(t, outputStr, "P99.9:")
+}
+
+func TestPMUTaskStateClassification(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	// Use I/O workload to ensure we see different task states
+	wl := workloads[1] // Go I/O workload
+
+	// Start workload
+	workload := exec.Command(wl.Binary, wl.Args...)
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Run perf-agent with PMU
+	agent := exec.Command(agentPath,
+		"--pmu",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+
+	// Verify context switch reasons are classified
+	assert.Contains(t, outputStr, "Context Switch Reasons:")
+	assert.Contains(t, outputStr, "Preempted (running):")
+	assert.Contains(t, outputStr, "Voluntary (sleep/mutex):")
+	assert.Contains(t, outputStr, "I/O Wait (D state):")
+
+	// Verify percentages are shown
+	assert.Contains(t, outputStr, "%")
+	assert.Contains(t, outputStr, "times)")
+}
+
+func TestPMUIOWorkloadHasIOWait(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+	wl := workloads[1] // Go I/O workload
+
+	// Start I/O-bound workload
+	workload := exec.Command(wl.Binary, wl.Args...)
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Run perf-agent with PMU
+	agent := exec.Command(agentPath,
+		"--pmu",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+
+	// I/O workload should show some I/O wait or voluntary sleep
+	// (file operations cause both)
+	hasIOActivity := false
+	if assert.Contains(t, outputStr, "I/O Wait (D state):") ||
+		assert.Contains(t, outputStr, "Voluntary (sleep/mutex):") {
+		hasIOActivity = true
+	}
+	assert.True(t, hasIOActivity, "I/O workload should show I/O or voluntary sleep activity")
+}
+
+func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+	wl := workloads[0] // Go CPU workload
+
+	// Start CPU-bound workload
+	workload := exec.Command(wl.Binary, wl.Args...)
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Run perf-agent with PMU
+	agent := exec.Command(agentPath,
+		"--pmu",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+	t.Logf("Output:\n%s", outputStr)
+
+	// CPU-bound workload should show preempted switches
+	// (it gets preempted because it never voluntarily yields)
+	assert.Contains(t, outputStr, "Preempted (running):")
+}
+
+func TestSystemWidePMUWithNewMetrics(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	agentPath := getAgentPath(t)
+
+	workload := exec.Command("./workloads/go/cpu_bound", "-duration=15s", "-threads=2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	agent := exec.Command(agentPath, "--pmu", "-a", "--duration", "5s")
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	outputStr := string(output)
+
+	// System-wide aggregate should include context switch reasons
+	assert.Contains(t, outputStr, "Context Switch Reasons (aggregate):")
+	assert.Contains(t, outputStr, "Preempted (running):")
+	assert.Contains(t, outputStr, "Voluntary (sleep/mutex):")
+	assert.Contains(t, outputStr, "I/O Wait (D state):")
 }

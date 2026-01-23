@@ -299,7 +299,7 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
         }
     }
 
-    // Always update timestamp (no goto needed)
+    // Always update timestamp
     bpf_map_update_elem(&last_seen, &cpu, &now, BPF_ANY);
     return 0;
 }

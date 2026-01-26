@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            goarch: amd64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            goarch: arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for tag messages
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            linux-headers-$(uname -r) \
+            libbpf-dev
+          
+          # Ensure bpf headers are available
+          if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+            echo "Installing libbpf from source..."
+            git clone https://github.com/libbpf/libbpf.git /tmp/libbpf
+            cd /tmp/libbpf/src
+            sudo make install install_headers
+            sudo ldconfig
+          fi
+
+      - name: Build and install blazesym
+        run: |
+          git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+          cd /tmp/blazesym
+          cargo build --release --package blazesym-c
+          # Install headers and library
+          sudo mkdir -p /usr/local/include /usr/local/lib
+          sudo cp capi/include/blazesym.h /usr/local/include/
+          sudo cp target/release/libblazesym_c.a /usr/local/lib/
+          sudo ldconfig
+
+      - name: Generate eBPF code
+        run: go generate ./...
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CGO_CFLAGS: -I/usr/local/include
+          CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
+        run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-agent-linux-${{ matrix.goarch }}
+          path: perf-agent-linux-${{ matrix.goarch }}
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get tag message
+        id: tag_message
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG_NAME" 2>/dev/null | head -n -1 || echo "")
+          if [ -z "$TAG_MESSAGE" ] || [ "$TAG_MESSAGE" = "$TAG_NAME" ]; then
+            TAG_MESSAGE="Release $TAG_NAME"
+          fi
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_message.outputs.tag }}
+          name: ${{ steps.tag_message.outputs.tag }}
+          body: ${{ steps.tag_message.outputs.message }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/perf-agent-linux-amd64/perf-agent-linux-amd64
+            artifacts/perf-agent-linux-arm64/perf-agent-linux-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

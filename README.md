@@ -141,11 +141,95 @@ go tool pprof offcpu.pb.gz
 ### PMU Mode (`--pmu`)
 
 Prints to stdout:
-- **On-CPU time**: Time slice per context switch (min, max, mean, percentiles)
-- **Runqueue latency**: Time waiting for CPU after becoming runnable (min, max, mean, percentiles)
-- **Context switch reasons**: Breakdown of preempted (running), voluntary (sleep/mutex), and I/O wait (D state)
-- **Hardware counters**: Cycles, instructions, cache misses
-- **Derived metrics**: IPC (instructions per cycle), cache miss rate
+
+- **On-CPU Time**: Time slice per context switch (min, max, mean, percentiles)
+  - Measures how long a process runs on CPU before being switched out
+- **Runqueue Latency**: Time waiting for CPU after becoming runnable (min, max, mean, percentiles)
+  - Measures scheduling delay: time from `sched_wakeup` to actually running
+- **Context Switch Reasons**: Breakdown of why tasks were switched out
+  - **Preempted (running)**: Task was running and got preempted by scheduler
+  - **Voluntary (sleep/mutex)**: Task voluntarily yielded (sleep, mutex wait)
+  - **I/O Wait (D state)**: Task blocked on I/O (uninterruptible sleep)
+- **Hardware Counters**: Cycles, instructions, cache misses
+- **Derived Metrics**: IPC (instructions per cycle), cache miss rate
+
+Example output:
+```
+=== PMU Metrics (PID: 84228) ===
+Samples: 26358
+
+On-CPU Time (time slice per context switch):
+  Min:    0.003 ms
+  P50:    0.071 ms
+  P99:    9.183 ms
+
+Runqueue Latency (time waiting for CPU):
+  Min:    0.001 ms
+  P50:    0.012 ms
+  P99:    0.850 ms
+
+Context Switch Reasons:
+  Preempted (running):     45.2%  (11912 times)
+  Voluntary (sleep/mutex): 42.1%  (11095 times)
+  I/O Wait (D state):      12.7%  (3351 times)
+
+Hardware Counters:
+  IPC (Instr/Cycle):  2.342
+  Cache Misses/1K:    0.022
+```
+
+## Library Usage
+
+`perf-agent` can be used as a Go library via the `perfagent` package:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+    "perf-agent/perfagent"
+)
+
+func main() {
+    agent, err := perfagent.New(
+        perfagent.WithPID(12345),
+        perfagent.WithCPUProfile("profile.pb.gz"),
+        perfagent.WithPMU(),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer agent.Close()
+
+    ctx := context.Background()
+    agent.Start(ctx)
+    time.Sleep(10 * time.Second)
+    agent.Stop(ctx)
+}
+```
+
+### In-Memory Collection
+
+```go
+var buf bytes.Buffer
+agent, _ := perfagent.New(
+    perfagent.WithCPUProfileWriter(&buf), // gzip-compressed pprof
+)
+// After Stop(), buf contains ready-to-use .pb.gz data
+```
+
+### Custom Metrics Export
+
+```go
+agent, _ := perfagent.New(
+    perfagent.WithPMU(),
+    perfagent.WithMetricsExporter(&MyExporter{}),
+)
+```
+
+See [perfagent package documentation](perfagent/) for all available options.
 
 ## Building
 

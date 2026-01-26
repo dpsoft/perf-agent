@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -10,13 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cilium/ebpf/rlimit"
-	"github.com/iovisor/gobpf/pkg/cpuonline"
-	"kernel.org/pub/linux/libs/security/libcap/cap"
-
-	"perf-agent/cpu"
-	"perf-agent/offcpu"
-	"perf-agent/profile"
+	"perf-agent/metrics"
+	"perf-agent/perfagent"
 )
 
 var (
@@ -56,93 +52,27 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// Validate flags
-	if !*flagProfile && !*flagPMU && !*flagOffCpu {
-		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
-	}
+	// Build options from flags
+	opts := buildOptions()
 
-	// Validate PID / system-wide flags
-	if *flagPID != 0 && *flagAll {
-		log.Fatal("--pid and -a/--all are mutually exclusive")
-	}
-	if *flagPID == 0 && !*flagAll {
-		log.Fatal("Either --pid or -a/--all is required")
-	}
-
-	// Validate --per-pid flag
-	if *flagPerPID {
-		if !*flagAll {
-			log.Fatal("--per-pid requires -a/--all")
-		}
-		if !*flagPMU {
-			log.Fatal("--per-pid is only valid with --pmu")
-		}
-	}
-
-	pid := *flagPID
-	systemWide := *flagAll
-
-	// Common setup: Set capabilities
-	caps := cap.GetProc()
-	if err := caps.SetFlag(cap.Effective, true, cap.SYS_ADMIN, cap.PERFMON); err != nil {
-		log.Fatalf("Failed to apply capabilities: %v", err)
-	}
-
-	// Allow the current process to lock memory for eBPF resources.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("Failed to remove memlock: %v", err)
-	}
-
-	// Get online CPUs
-	onlineCPUIDs, err := cpuonline.Get()
+	// Create agent
+	agent, err := perfagent.New(opts...)
 	if err != nil {
-		log.Fatalf("failed to get online CPUs: %v", err)
+		log.Fatalf("Failed to create agent: %v", err)
 	}
+	defer func() {
+		if err := agent.Close(); err != nil {
+			log.Printf("Error closing agent: %v", err)
+		}
+	}()
 
-	var cpuProfiler *profile.Profiler
-	var offcpuProfiler *offcpu.Profiler
-	var pmuMonitor *cpu.PMUMonitor
+	// Setup context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Setup profiler if enabled
-	if *flagProfile {
-		cpuProfiler, err = profile.NewProfiler(pid, systemWide, onlineCPUIDs, flagTags, *flagSampleRate)
-		if err != nil {
-			log.Fatalf("Failed to setup profiler: %v", err)
-		}
-		defer cpuProfiler.Close()
-		if systemWide {
-			log.Printf("Profiler enabled (system-wide, %d Hz)", *flagSampleRate)
-		} else {
-			log.Printf("Profiler enabled (PID: %d, %d Hz)", pid, *flagSampleRate)
-		}
-	}
-
-	// Setup off-CPU profiler if enabled
-	if *flagOffCpu {
-		offcpuProfiler, err = offcpu.NewProfiler(pid, systemWide, flagTags)
-		if err != nil {
-			log.Fatalf("Failed to setup off-CPU profiler: %v", err)
-		}
-		defer offcpuProfiler.Close()
-		if systemWide {
-			log.Println("Off-CPU profiler enabled (system-wide)")
-		} else {
-			log.Printf("Off-CPU profiler enabled (PID: %d)", pid)
-		}
-	}
-
-	// Setup PMU monitor if enabled
-	if *flagPMU {
-		pmuMonitor, err = cpu.NewPMUMonitor(pid, systemWide, onlineCPUIDs)
-		if err != nil {
-			log.Fatalf("Failed to setup PMU monitor: %v", err)
-		}
-		defer pmuMonitor.Close()
-		if systemWide {
-			log.Println("PMU monitor enabled (system-wide)")
-		} else {
-			log.Printf("PMU monitor enabled (PID: %d)", pid)
-		}
+	// Start the agent
+	if err := agent.Start(ctx); err != nil {
+		log.Fatalf("Failed to start agent: %v", err)
 	}
 
 	// Setup signal handling
@@ -159,22 +89,68 @@ func main() {
 		fmt.Printf("\nReceived signal: %s\n", sig)
 	}
 
-	// Collect and print results
-	if *flagPMU && pmuMonitor != nil {
-		pmuMonitor.PrintMetrics(systemWide, *flagPerPID)
-	}
-
-	if *flagProfile && cpuProfiler != nil {
-		if err := cpuProfiler.CollectAndWrite("profile.pb.gz"); err != nil {
-			log.Printf("Failed to write profile: %v", err)
-		}
-	}
-
-	if *flagOffCpu && offcpuProfiler != nil {
-		if err := offcpuProfiler.CollectAndWrite("offcpu.pb.gz"); err != nil {
-			log.Printf("Failed to write off-CPU profile: %v", err)
-		}
+	// Stop and collect results
+	if err := agent.Stop(ctx); err != nil {
+		log.Printf("Error stopping agent: %v", err)
 	}
 
 	fmt.Println("Exiting program.")
+}
+
+func buildOptions() []perfagent.Option {
+	var opts []perfagent.Option
+
+	// Target selection
+	if *flagAll {
+		opts = append(opts, perfagent.WithSystemWide())
+	} else if *flagPID != 0 {
+		opts = append(opts, perfagent.WithPID(*flagPID))
+	} else {
+		log.Fatal("Either --pid or -a/--all is required")
+	}
+
+	// Validate mutually exclusive
+	if *flagPID != 0 && *flagAll {
+		log.Fatal("--pid and -a/--all are mutually exclusive")
+	}
+
+	// Profiling modes
+	if !*flagProfile && !*flagPMU && !*flagOffCpu {
+		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
+	}
+
+	if *flagProfile {
+		opts = append(opts, perfagent.WithCPUProfile("profile.pb.gz"))
+	}
+
+	if *flagOffCpu {
+		opts = append(opts, perfagent.WithOffCPUProfile("offcpu.pb.gz"))
+	}
+
+	if *flagPMU {
+		opts = append(opts, perfagent.WithPMU())
+		// Use console exporter for backward compatibility
+		opts = append(opts, perfagent.WithMetricsExporter(metrics.NewConsoleExporter(*flagPerPID)))
+	}
+
+	// Per-PID validation
+	if *flagPerPID {
+		if !*flagAll {
+			log.Fatal("--per-pid requires -a/--all")
+		}
+		if !*flagPMU {
+			log.Fatal("--per-pid is only valid with --pmu")
+		}
+		opts = append(opts, perfagent.WithPerPID())
+	}
+
+	// Sample rate
+	opts = append(opts, perfagent.WithSampleRate(*flagSampleRate))
+
+	// Tags
+	if len(flagTags) > 0 {
+		opts = append(opts, perfagent.WithTags(flagTags...))
+	}
+
+	return opts
 }

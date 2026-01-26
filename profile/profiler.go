@@ -1,23 +1,21 @@
 package profile
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"syscall"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/elastic/go-perf"
-	blazesym "github.com/libbpf/blazesym/go"
 	"golang.org/x/sys/unix"
 
-	"perf-agent/pprof"
+	"perf-agent/internal/blazesym"
 
-	p "github.com/google/pprof/profile"
+	"perf-agent/pprof"
 )
 
 // Profiler handles CPU profiling with stack traces
@@ -33,7 +31,6 @@ type Profiler struct {
 type perfEvent struct {
 	fd   int
 	link *link.RawLink
-	p    *perf.Event
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -129,8 +126,9 @@ func (pr *Profiler) Close() {
 	_ = pr.objs.Close()
 }
 
-// CollectAndWrite collects samples and writes the profile to the specified path
-func (pr *Profiler) CollectAndWrite(outputPath string) error {
+// Collect writes the profile to the provided writer (supports streaming).
+// The output is gzip-compressed pprof data.
+func (pr *Profiler) Collect(w io.Writer) error {
 	m := pr.objs.Counts
 	mapSize := m.MaxEntries()
 
@@ -210,34 +208,29 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 		builders.AddSample(&sample)
 	}
 
-	// Get builder and write profile
-	var buf bytes.Buffer
+	// Write profile directly to the provided writer
 	for _, builder := range builders.Builders {
-		_, err = builder.Write(&buf)
+		_, err = builder.Write(w)
 		if err != nil {
 			return fmt.Errorf("write profile: %w", err)
 		}
 		break // Only need first builder for non-per-PID profile
 	}
 
-	if buf.Len() == 0 {
-		log.Println("No profile data to write")
-		return nil
-	}
+	return nil
+}
 
-	parsed, err := p.Parse(bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return fmt.Errorf("parse profile: %w", err)
-	}
-
+// CollectAndWrite collects samples and writes the profile to the specified path.
+// This is a convenience wrapper around Collect for file-based output.
+func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	file, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create profile file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
-	if err := parsed.Write(file); err != nil {
-		return fmt.Errorf("write profile to file: %w", err)
+	if err := pr.Collect(file); err != nil {
+		return err
 	}
 
 	log.Printf("Profile written to %s", outputPath)
@@ -257,32 +250,41 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 // perfEvent helpers
 
 func newPerfEvent(cpu int, sampleRate int) (*perfEvent, error) {
-	perfAttribute := new(perf.Attr)
-	perfAttribute.SetSampleFreq(uint64(sampleRate))
-	perfAttribute.Type = unix.PERF_TYPE_SOFTWARE
-	perfAttribute.Config = unix.PERF_COUNT_SW_CPU_CLOCK
-
-	p, err := perf.Open(perfAttribute, -1, cpu, nil)
-	if err != nil {
-		return nil, fmt.Errorf("open perf event: %w", err)
+	attr := unix.PerfEventAttr{
+		Type:   unix.PERF_TYPE_SOFTWARE,
+		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+		Config: unix.PERF_COUNT_SW_CPU_CLOCK,
+		Sample: uint64(sampleRate),
+		Bits:   unix.PerfBitFreq, // Enable frequency mode
 	}
 
-	fd, err := p.FD()
+	fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
-		return nil, fmt.Errorf("get perf event fd: %w", err)
+		return nil, os.NewSyscallError("perf_event_open", err)
 	}
 
-	return &perfEvent{fd: fd, p: p}, nil
+	return &perfEvent{fd: fd}, nil
 }
 
 func (pe *perfEvent) Close() error {
-	_ = syscall.Close(pe.fd)
 	if pe.link != nil {
 		_ = pe.link.Close()
+	}
+	if pe.fd >= 0 {
+		return unix.Close(pe.fd)
 	}
 	return nil
 }
 
 func (pe *perfEvent) attachPerfEvent(prog *ebpf.Program) error {
-	return pe.p.SetBPF(uint32(prog.FD()))
+	rawLink, err := link.AttachRawLink(link.RawLinkOptions{
+		Target:  pe.fd,
+		Program: prog,
+		Attach:  ebpf.AttachPerfEvent,
+	})
+	if err != nil {
+		return fmt.Errorf("attach raw link: %w", err)
+	}
+	pe.link = rawLink
+	return nil
 }

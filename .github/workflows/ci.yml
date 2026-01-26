@@ -121,4 +121,5 @@ jobs:
     - name: Run integration tests
       run: |
         cd test
-        sudo -E go test -v -timeout 5m ./...
+        sudo env LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+          go test -v -timeout 5m ./...

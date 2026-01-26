@@ -140,7 +140,8 @@ jobs:
       - name: Run integration tests
         run: |
           cd test
-          sudo -E $(which go) test -v -timeout 15m ./...
+          sudo env LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+            $(which go) test -v -timeout 15m ./...
 
   lint:
     name: Lint

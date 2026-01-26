@@ -1,20 +1,18 @@
 package offcpu
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
+	"perf-agent/internal/blazesym"
 	"perf-agent/pprof"
-
-	p "github.com/google/pprof/profile"
-	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Profiler handles off-CPU profiling with stack traces
@@ -93,8 +91,9 @@ func (pr *Profiler) Close() {
 	_ = pr.objs.Close()
 }
 
-// CollectAndWrite collects samples and writes the profile to the specified path
-func (pr *Profiler) CollectAndWrite(outputPath string) error {
+// Collect writes the profile to the provided writer (supports streaming).
+// The output is gzip-compressed pprof data.
+func (pr *Profiler) Collect(w io.Writer) error {
 	m := pr.objs.OffcpuCounts
 	mapSize := m.MaxEntries()
 
@@ -180,34 +179,29 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 		builders.AddSample(&sample)
 	}
 
-	// Get builder and write profile
-	var buf bytes.Buffer
+	// Write profile directly to the provided writer
 	for _, builder := range builders.Builders {
-		_, err = builder.Write(&buf)
+		_, err = builder.Write(w)
 		if err != nil {
 			return fmt.Errorf("write off-CPU profile: %w", err)
 		}
 		break // Only need first builder for non-per-PID profile
 	}
 
-	if buf.Len() == 0 {
-		log.Println("No off-CPU profile data to write")
-		return nil
-	}
+	return nil
+}
 
-	parsed, err := p.Parse(bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return fmt.Errorf("parse off-CPU profile: %w", err)
-	}
-
+// CollectAndWrite collects samples and writes the profile to the specified path.
+// This is a convenience wrapper around Collect for file-based output.
+func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	file, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create off-CPU profile file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
-	if err := parsed.Write(file); err != nil {
-		return fmt.Errorf("write off-CPU profile to file: %w", err)
+	if err := pr.Collect(file); err != nil {
+		return err
 	}
 
 	log.Printf("Off-CPU profile written to %s", outputPath)

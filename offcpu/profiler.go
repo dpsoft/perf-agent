@@ -11,8 +11,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
-	"perf-agent/internal/blazesym"
-	"perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/internal/blazesym"
+	"github.com/dpsoft/perf-agent/pprof"
 )
 
 // Profiler handles off-CPU profiling with stack traces

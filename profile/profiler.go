@@ -13,9 +13,9 @@ import (
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 
-	"perf-agent/internal/blazesym"
+	"github.com/dpsoft/perf-agent/internal/blazesym"
 
-	"perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/pprof"
 )
 
 // Profiler handles CPU profiling with stack traces

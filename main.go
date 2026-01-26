@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"perf-agent/metrics"
-	"perf-agent/perfagent"
+	"github.com/dpsoft/perf-agent/metrics"
+	"github.com/dpsoft/perf-agent/perfagent"
 )
 
 var (

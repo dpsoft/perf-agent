@@ -11,10 +11,10 @@ import (
 	"github.com/iovisor/gobpf/pkg/cpuonline"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
-	"perf-agent/cpu"
-	"perf-agent/metrics"
-	"perf-agent/offcpu"
-	"perf-agent/profile"
+	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/metrics"
+	"github.com/dpsoft/perf-agent/offcpu"
+	"github.com/dpsoft/perf-agent/profile"
 )
 
 // Agent is the main performance monitoring agent.

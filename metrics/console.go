@@ -29,14 +29,14 @@ func (e *ConsoleExporter) Name() string {
 // Export outputs the metrics snapshot to the console.
 func (e *ConsoleExporter) Export(ctx context.Context, snapshot *MetricsSnapshot) error {
 	if len(snapshot.Processes) == 0 {
-		fmt.Fprintln(e.Writer, "\nNo PMU metrics collected")
+		_, _ = fmt.Fprintln(e.Writer, "\nNo PMU metrics collected")
 		return nil
 	}
 
 	if !snapshot.SystemWide {
 		// Targeted mode (single PID)
 		for pid, m := range snapshot.Processes {
-			fmt.Fprintf(e.Writer, "\n=== PMU Metrics (PID: %d) ===\n", pid)
+			_, _ = fmt.Fprintf(e.Writer, "\n=== PMU Metrics (PID: %d) ===\n", pid)
 			e.printSinglePIDMetrics(m)
 		}
 		return nil
@@ -44,8 +44,8 @@ func (e *ConsoleExporter) Export(ctx context.Context, snapshot *MetricsSnapshot)
 
 	if e.PerPID {
 		// System-wide with per-PID breakdown
-		fmt.Fprintf(e.Writer, "\n=== PMU Metrics (System-Wide, Per-PID) ===\n")
-		fmt.Fprintf(e.Writer, "Profiled %d processes\n", len(snapshot.Processes))
+		_, _ = fmt.Fprintf(e.Writer, "\n=== PMU Metrics (System-Wide, Per-PID) ===\n")
+		_, _ = fmt.Fprintf(e.Writer, "Profiled %d processes\n", len(snapshot.Processes))
 		for pid, m := range snapshot.Processes {
 			fmt.Fprintf(e.Writer, "\n--- PID %d ---\n", pid)
 			e.printSinglePIDMetrics(m)

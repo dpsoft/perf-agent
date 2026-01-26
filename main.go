@@ -60,7 +60,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create agent: %v", err)
 	}
-	defer agent.Close()
+	defer func() {
+		if err := agent.Close(); err != nil {
+			log.Printf("Error closing agent: %v", err)
+		}
+	}()
 
 	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())

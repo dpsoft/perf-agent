@@ -1,4 +1,4 @@
-module perf-agent
+module github.com/dpsoft/perf-agent
 
 go 1.24.0
 

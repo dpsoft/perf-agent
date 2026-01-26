@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"perf-agent/perfagent"
+	"github.com/dpsoft/perf-agent/perfagent"
 
 	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/require"

@@ -9,7 +9,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
-	"perf-agent/metrics"
+	"github.com/dpsoft/perf-agent/metrics"
 )
 
 // PMUMonitor handles PMU hardware counter monitoring

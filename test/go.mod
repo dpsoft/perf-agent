@@ -1,11 +1,11 @@
-module perf-agent/test
+module github.com/dpsoft/perf-agent/test
 
 go 1.24.0
 
 require (
 	github.com/google/pprof v0.0.0-20241210010833-40e02aabc2ad
 	github.com/stretchr/testify v1.11.1
-	perf-agent v0.0.0
+	github.com/dpsoft/perf-agent v0.0.0
 )
 
 require (
@@ -23,4 +23,4 @@ require (
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.73 // indirect
 )
 
-replace perf-agent => ../
+replace github.com/dpsoft/perf-agent => ../

@@ -11,7 +11,7 @@ import (
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cilium/ebpf/ringbuf"
 
-	"perf-agent/metrics"
+	"github.com/dpsoft/perf-agent/metrics"
 )
 
 type CPUUsageCollector struct {

@@ -4,7 +4,7 @@ package perfagent
 import (
 	"io"
 
-	"perf-agent/metrics"
+	"github.com/dpsoft/perf-agent/metrics"
 )
 
 // Config holds the configuration for the performance agent.

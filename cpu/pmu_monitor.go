@@ -1,12 +1,15 @@
 package cpu
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+
+	"perf-agent/metrics"
 )
 
 // PMUMonitor handles PMU hardware counter monitoring
@@ -135,6 +138,16 @@ func (m *PMUMonitor) pollLoop() {
 // PrintMetrics prints collected metrics
 func (m *PMUMonitor) PrintMetrics(systemWide, perPID bool) {
 	m.collector.PrintMetrics(systemWide, perPID)
+}
+
+// GetMetricsSnapshot returns a snapshot of the current metrics.
+func (m *PMUMonitor) GetMetricsSnapshot(systemWide bool) *metrics.MetricsSnapshot {
+	return m.collector.GetSnapshot(systemWide)
+}
+
+// ExportMetrics exports metrics using the provided exporters.
+func (m *PMUMonitor) ExportMetrics(ctx context.Context, systemWide bool, exporters ...metrics.Exporter) error {
+	return m.collector.ExportMetrics(ctx, systemWide, exporters...)
 }
 
 // Close releases all resources associated with the monitor

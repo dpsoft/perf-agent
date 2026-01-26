@@ -31,7 +31,10 @@ test-unit: generate
 
 .PHONY: test-integration
 test-integration: build test-workloads
-	cd test && CGO_CFLAGS="-I$(LIBBLAZESYM_INC)" CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release)" bash run_tests.sh
+	cd test && LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
+		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I$(LIBBLAZESYM_INC)" \
+		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+		bash run_tests.sh
 
 .PHONY: test
 test: test-unit test-integration

@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"perf-agent/perfagent"
 
 	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
@@ -728,4 +731,204 @@ func TestSystemWidePMUWithNewMetrics(t *testing.T) {
 	assert.Contains(t, outputStr, "Preempted (running):")
 	assert.Contains(t, outputStr, "Voluntary (sleep/mutex):")
 	assert.Contains(t, outputStr, "I/O Wait (D state):")
+}
+
+// Library streaming tests
+
+func TestStreamingProfileOutput(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	// Start a CPU workload
+	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second) // warmup
+
+	var buf bytes.Buffer
+
+	agent, err := perfagent.New(
+		perfagent.WithPID(workload.Process.Pid),
+		perfagent.WithCPUProfileWriter(&buf),
+		perfagent.WithSampleRate(99),
+	)
+	require.NoError(t, err)
+	defer agent.Close()
+
+	ctx := context.Background()
+	require.NoError(t, agent.Start(ctx))
+
+	time.Sleep(3 * time.Second)
+
+	require.NoError(t, agent.Stop(ctx))
+
+	// Verify profile
+	require.Greater(t, buf.Len(), 0, "profile buffer should have data")
+
+	prof, err := profile.Parse(&buf)
+	require.NoError(t, err)
+	require.Greater(t, len(prof.Sample), 0, "profile should contain samples")
+
+	// Verify we got symbolized functions
+	hasSymbols := false
+	for _, fn := range prof.Function {
+		if fn.Name != "" && fn.Name != "??" {
+			hasSymbols = true
+			break
+		}
+	}
+	assert.True(t, hasSymbols, "Profile should contain symbolized functions")
+}
+
+func TestStreamingOffCPUProfileOutput(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	// Start an I/O workload
+	workload := exec.Command("./workloads/go/io_bound", "-duration=20s", "-threads=2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second) // warmup
+
+	var buf bytes.Buffer
+
+	agent, err := perfagent.New(
+		perfagent.WithPID(workload.Process.Pid),
+		perfagent.WithOffCPUProfileWriter(&buf),
+	)
+	require.NoError(t, err)
+	defer agent.Close()
+
+	ctx := context.Background()
+	require.NoError(t, agent.Start(ctx))
+
+	time.Sleep(3 * time.Second)
+
+	require.NoError(t, agent.Stop(ctx))
+
+	// Off-CPU profile should have data for I/O workload
+	if buf.Len() > 0 {
+		prof, err := profile.Parse(&buf)
+		require.NoError(t, err)
+		require.Greater(t, len(prof.Sample), 0, "off-CPU profile should contain samples")
+	}
+}
+
+func TestStreamingCombinedProfileOutput(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	// Start workload
+	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	var cpuBuf, offcpuBuf bytes.Buffer
+
+	agent, err := perfagent.New(
+		perfagent.WithPID(workload.Process.Pid),
+		perfagent.WithCPUProfileWriter(&cpuBuf),
+		perfagent.WithOffCPUProfileWriter(&offcpuBuf),
+		perfagent.WithSampleRate(99),
+	)
+	require.NoError(t, err)
+	defer agent.Close()
+
+	ctx := context.Background()
+	require.NoError(t, agent.Start(ctx))
+
+	time.Sleep(3 * time.Second)
+
+	require.NoError(t, agent.Stop(ctx))
+
+	// Verify CPU profile
+	require.Greater(t, cpuBuf.Len(), 0, "CPU profile buffer should have data")
+	cpuProf, err := profile.Parse(&cpuBuf)
+	require.NoError(t, err)
+	require.NotNil(t, cpuProf)
+
+	// Off-CPU may or may not have data for CPU-bound workload
+	if offcpuBuf.Len() > 0 {
+		offcpuProf, err := profile.Parse(&offcpuBuf)
+		require.NoError(t, err)
+		require.NotNil(t, offcpuProf)
+	}
+}
+
+func TestLibraryPMUMetrics(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	// Start a CPU workload
+	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			workload.Process.Kill()
+			workload.Wait()
+		}
+	}()
+
+	time.Sleep(2 * time.Second) // warmup
+
+	// Test library usage with PMU
+	agent, err := perfagent.New(
+		perfagent.WithPID(workload.Process.Pid),
+		perfagent.WithPMU(),
+	)
+	require.NoError(t, err)
+	defer agent.Close()
+
+	ctx := context.Background()
+	require.NoError(t, agent.Start(ctx))
+
+	// Collect for a few seconds
+	time.Sleep(3 * time.Second)
+
+	// Test GetMetrics() API
+	snapshot, err := agent.GetMetrics()
+	require.NoError(t, err)
+	require.NotNil(t, snapshot)
+
+	// Verify snapshot contains data
+	if snapshot != nil {
+		// Should have at least one process with metrics
+		if len(snapshot.Processes) > 0 {
+			for pid, pm := range snapshot.Processes {
+				t.Logf("PID %d: Samples=%d, Preempted=%d, Voluntary=%d, IOWait=%d",
+					pid, pm.SampleCount, pm.ContextSwitches.PreemptedCount,
+					pm.ContextSwitches.VoluntaryCount, pm.ContextSwitches.IOWaitCount)
+				assert.Greater(t, pm.SampleCount, uint64(0))
+
+				// Verify new metrics are present
+				assert.Greater(t, pm.RunqueueStats.Count, int64(0), "should have runqueue latency data")
+				assert.Greater(t, pm.OnCPUStats.Count, int64(0), "should have on-CPU time data")
+			}
+		}
+	}
+
+	require.NoError(t, agent.Stop(ctx))
 }

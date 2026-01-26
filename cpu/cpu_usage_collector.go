@@ -1,6 +1,7 @@
 package cpu
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cilium/ebpf/ringbuf"
+
+	"perf-agent/metrics"
 )
 
 type CPUUsageCollector struct {
@@ -263,7 +266,7 @@ func printSinglePIDMetrics(m *PidMetrics) {
 }
 
 // printAggregateMetrics prints aggregated metrics for system-wide mode
-func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
+func printAggregateMetrics(metricsMap map[uint32]*PidMetrics) {
 	var totalSamples uint64
 	var totalCycles, totalInstructions, totalCacheMisses uint64
 	var totalPreempted, totalVoluntary, totalIOWait uint64
@@ -272,7 +275,7 @@ func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
 	aggOnCPUHist := hdrhistogram.New(0, 1000000000000000, 3)
 	aggRunqHist := hdrhistogram.New(0, 1000000000000, 3)
 
-	for _, m := range metrics {
+	for _, m := range metricsMap {
 		totalSamples += m.SampleCount
 		totalCycles += m.TotalCycles
 		totalInstructions += m.TotalInstructions
@@ -287,7 +290,7 @@ func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
 	}
 
 	fmt.Printf("\nPerformance counter stats for 'system wide':\n\n")
-	fmt.Printf("  Processes profiled:     %d\n", len(metrics))
+	fmt.Printf("  Processes profiled:     %d\n", len(metricsMap))
 	fmt.Printf("  Total samples:          %d\n", totalSamples)
 
 	// On-CPU time histogram stats
@@ -339,4 +342,75 @@ func printAggregateMetrics(metrics map[uint32]*PidMetrics) {
 		missRate := float64(totalCacheMisses) / float64(totalInstructions) * 1000
 		fmt.Printf("  Cache Misses/1K Instr:  %.2f\n", missRate)
 	}
+}
+
+// GetSnapshot returns a metrics snapshot for export.
+func (c *CPUUsageCollector) GetSnapshot(systemWide bool) *metrics.MetricsSnapshot {
+	snapshot := metrics.NewMetricsSnapshot(systemWide)
+
+	for pid, m := range c.metrics {
+		pm := &metrics.ProcessMetrics{
+			PID:         pid,
+			SampleCount: m.SampleCount,
+			OnCPUStats: metrics.LatencyStats{
+				Min:   m.OnCPUHist.Min(),
+				Max:   m.OnCPUHist.Max(),
+				P50:   m.OnCPUHist.ValueAtQuantile(50.0),
+				P95:   m.OnCPUHist.ValueAtQuantile(95.0),
+				P99:   m.OnCPUHist.ValueAtQuantile(99.0),
+				P999:  m.OnCPUHist.ValueAtQuantile(99.9),
+				Mean:  m.OnCPUHist.Mean(),
+				Count: m.OnCPUHist.TotalCount(),
+			},
+			RunqueueStats: metrics.LatencyStats{
+				Min:   m.RunqLatencyHist.Min(),
+				Max:   m.RunqLatencyHist.Max(),
+				P50:   m.RunqLatencyHist.ValueAtQuantile(50.0),
+				P95:   m.RunqLatencyHist.ValueAtQuantile(95.0),
+				P99:   m.RunqLatencyHist.ValueAtQuantile(99.0),
+				P999:  m.RunqLatencyHist.ValueAtQuantile(99.9),
+				Mean:  m.RunqLatencyHist.Mean(),
+				Count: m.RunqLatencyHist.TotalCount(),
+			},
+			ContextSwitches: metrics.ContextSwitchStats{
+				PreemptedCount: m.PreemptedCount,
+				VoluntaryCount: m.VoluntaryCount,
+				IOWaitCount:    m.IOWaitCount,
+			},
+		}
+
+		// Hardware counters
+		if m.TotalCycles > 0 || m.TotalInstructions > 0 {
+			pm.HardwareCounters = metrics.HardwareCounterStats{
+				Available:    true,
+				Cycles:       m.TotalCycles,
+				Instructions: m.TotalInstructions,
+				CacheMisses:  m.TotalCacheMisses,
+			}
+			if m.TotalCycles > 0 {
+				pm.HardwareCounters.IPC = float64(m.TotalInstructions) / float64(m.TotalCycles)
+			}
+			if m.TotalInstructions > 0 {
+				pm.HardwareCounters.MissRate = float64(m.TotalCacheMisses) / float64(m.TotalInstructions) * 1000
+			}
+		}
+
+		snapshot.AddProcess(pid, pm)
+	}
+
+	return snapshot
+}
+
+// ExportMetrics exports metrics using the provided exporters.
+func (c *CPUUsageCollector) ExportMetrics(ctx context.Context, systemWide bool, exporters ...metrics.Exporter) error {
+	snapshot := c.GetSnapshot(systemWide)
+
+	var lastErr error
+	for _, exp := range exporters {
+		if err := exp.Export(ctx, snapshot); err != nil {
+			lastErr = fmt.Errorf("exporter %s: %w", exp.Name(), err)
+		}
+	}
+
+	return lastErr
 }

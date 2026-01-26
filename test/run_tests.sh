@@ -17,9 +17,16 @@ fi
 if [ -z "$CGO_LDFLAGS" ]; then
     if [ -f "/usr/local/lib/libblazesym_c.a" ]; then
         export CGO_LDFLAGS="-L/usr/local/lib"
+        BLAZESYM_LIB_PATH="/usr/local/lib"
     elif [ -d "$HOME/github/blazesym/target/release" ]; then
         export CGO_LDFLAGS="-L$HOME/github/blazesym/target/release"
+        BLAZESYM_LIB_PATH="$HOME/github/blazesym/target/release"
     fi
+fi
+
+# Set LD_LIBRARY_PATH for runtime library loading
+if [ -n "$BLAZESYM_LIB_PATH" ]; then
+    export LD_LIBRARY_PATH="${BLAZESYM_LIB_PATH}:${LD_LIBRARY_PATH}"
 fi
 
 # Export for child processes
@@ -28,6 +35,7 @@ export CGO_LDFLAGS
 
 echo "Using CGO_CFLAGS: $CGO_CFLAGS"
 echo "Using CGO_LDFLAGS: $CGO_LDFLAGS"
+echo "Using LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo ""
 
 echo "=== Building test workloads ==="
@@ -72,11 +80,15 @@ cd test
 
 echo ""
 echo "=== Running integration tests ==="
+# Force rebuild to ensure correct CGO flags are used
 if [ "$(id -u)" -ne 0 ]; then
     echo "Integration tests require root. Running with sudo..."
-    sudo CGO_CFLAGS="$CGO_CFLAGS" CGO_LDFLAGS="$CGO_LDFLAGS" $(which go) test -v -timeout 5m ./...
+    # Use env to preserve LD_LIBRARY_PATH with sudo
+    sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" CGO_CFLAGS="$CGO_CFLAGS" CGO_LDFLAGS="$CGO_LDFLAGS" $(which go) clean -testcache
+    sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" CGO_CFLAGS="$CGO_CFLAGS" CGO_LDFLAGS="$CGO_LDFLAGS" $(which go) test -v -a -timeout 5m ./...
 else
-    go test -v -timeout 5m ./...
+    go clean -testcache
+    go test -v -a -timeout 5m ./...
 fi
 
 echo ""

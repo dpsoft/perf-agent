@@ -39,6 +39,12 @@ struct {
 // System-wide mode: when true, profile all processes; when false, use PID filter
 const volatile bool system_wide = false;
 
+// PID namespace device and inode for namespace-aware PID resolution.
+// When both are non-zero, bpf_get_ns_current_pid_tgid() is used instead of
+// bpf_get_current_pid_tgid(), allowing correct PID matching inside containers.
+const volatile u64 pidns_dev = 0;
+const volatile u64 pidns_ino = 0;
+
 struct pid_config {
     uint8_t type;
     uint8_t collect_user;
@@ -61,7 +67,21 @@ int profile(struct bpf_perf_event_data *ctx) {
     char kv_fmt[] = "key %llx, value %lle\n";
     char counter_fmt[] = "increment counter %llx\n";
 
-    int tgid = bpf_get_current_pid_tgid() >> 32;
+    int tgid;
+
+    // Use namespace-aware PID resolution when pidns info is available.
+    // This is needed when running inside containers (e.g. K8s sidecars)
+    // where the PID namespace differs from the host namespace.
+    if (pidns_dev != 0 && pidns_ino != 0) {
+        struct bpf_pidns_info nsdata = {};
+        if (bpf_get_ns_current_pid_tgid(pidns_dev, pidns_ino, &nsdata, sizeof(nsdata)) == 0) {
+            tgid = nsdata.tgid;
+        } else {
+            tgid = bpf_get_current_pid_tgid() >> 32;
+        }
+    } else {
+        tgid = bpf_get_current_pid_tgid() >> 32;
+    }
 
     u64 *val, one = 1;
 

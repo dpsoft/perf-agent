@@ -49,10 +49,26 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		return nil, fmt.Errorf("load profile spec: %w", err)
 	}
 
-	// Set system_wide variable in eBPF program
-	if err := spec.RewriteConstants(map[string]interface{}{
+	// Build eBPF constants
+	constants := map[string]interface{}{
 		"system_wide": systemWide,
-	}); err != nil {
+	}
+
+	// Add PID namespace info for namespace-aware PID resolution in containers.
+	// When running inside a container (e.g. K8s sidecar), the PID seen in /proc
+	// differs from the host PID that bpf_get_current_pid_tgid() returns.
+	// By passing the pidns dev/ino, the eBPF program can use
+	// bpf_get_ns_current_pid_tgid() to resolve PIDs in the caller's namespace.
+	if !systemWide {
+		if dev, ino, err := getPIDNamespaceInfo(); err != nil {
+			log.Printf("WARNING: failed to get PID namespace info, eBPF will use host PIDs: %v", err)
+		} else {
+			constants["pidns_dev"] = dev
+			constants["pidns_ino"] = ino
+		}
+	}
+
+	if err := spec.RewriteConstants(constants); err != nil {
 		return nil, fmt.Errorf("rewrite constants: %w", err)
 	}
 
@@ -245,6 +261,28 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 		Stack:       sb.stack,
 		Value:       value,
 	}
+}
+
+// getPIDNamespaceInfo returns the device and inode of the current process's
+// PID namespace. These values are passed to the eBPF program so it can use
+// bpf_get_ns_current_pid_tgid() for namespace-aware PID resolution.
+// We need the stat of the namespace file itself (following the symlink),
+// not the symlink entry in procfs.
+func getPIDNamespaceInfo() (uint64, uint64, error) {
+	// Open the ns file to get a real fd, then fstat it.
+	// This gives us the nsfs device and inode that the kernel expects.
+	fd, err := unix.Open("/proc/self/ns/pid", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open pidns: %w", err)
+	}
+	defer unix.Close(fd)
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return 0, 0, fmt.Errorf("fstat pidns: %w", err)
+	}
+	log.Printf("PID namespace info: dev=%d, ino=%d", stat.Dev, stat.Ino)
+	return stat.Dev, stat.Ino, nil
 }
 
 // perfEvent helpers

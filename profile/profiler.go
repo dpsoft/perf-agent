@@ -61,7 +61,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	// bpf_get_ns_current_pid_tgid() to resolve PIDs in the caller's namespace.
 	if !systemWide {
 		if dev, ino, err := getPIDNamespaceInfo(); err != nil {
-			log.Printf("WARNING: failed to get PID namespace info, eBPF will use host PIDs: %v", err)
+			log.Printf("PID namespace info unavailable, eBPF will use host PIDs: %v", err)
 		} else {
 			constants["pidns_dev"] = dev
 			constants["pidns_ino"] = ino

@@ -90,9 +90,9 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("set capabilities: %w", err)
 	}
 
-	// Remove memlock limit
+	// Remove memlock limit (best-effort; on kernels 5.11+ BPF uses cgroup memory accounting)
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return fmt.Errorf("remove memlock: %w", err)
+		log.Printf("Warning: failed to remove memlock rlimit (may be ignored on kernels 5.11+): %v", err)
 	}
 
 	// Get CPUs to monitor

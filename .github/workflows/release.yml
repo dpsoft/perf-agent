@@ -63,6 +63,11 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
+      - name: Configure blazesym Go module
+        run: |
+          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+
       - name: Generate eBPF code
         run: go generate ./...
 

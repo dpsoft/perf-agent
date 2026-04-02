@@ -33,7 +33,10 @@ func main() {
 
 	if len(os.Args) > 1 {
 		var targetPid uint32
-		fmt.Sscanf(os.Args[1], "%d", &targetPid)
+		if _, err := fmt.Sscanf(os.Args[1], "%d", &targetPid); err != nil {
+			fmt.Printf("Invalid PID: %v\n", err)
+			return
+		}
 		fmt.Printf("\nTarget PID: %d\n", targetPid)
 
 		maps, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", targetPid))
@@ -46,7 +49,7 @@ func main() {
 		for _, b := range splitLines(maps) {
 			line := string(b)
 			if len(line) > 0 {
-				fmt.Sscanf(line, "%x-", &addr)
+				_, _ = fmt.Sscanf(line, "%x-", &addr)
 				if addr > 0 {
 					break
 				}

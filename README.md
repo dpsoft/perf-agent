@@ -57,15 +57,15 @@ eBPF-based performance monitoring agent for Linux. Supports CPU profiling with s
                     ┌───────────────────────────────────────┐
                     │              OUTPUT                   │
                     │                                       │
-                    │  profile.pb.gz   Console    offcpu.pb.gz
-                    │  (CPU stacks)    Metrics    (blocking) │
+                    │  *-on-cpu.pb.gz  Console/   *-off-cpu.pb.gz
+                    │  (CPU stacks)    File       (blocking)  │
                     └───────────────────────────────────────┘
 ```
 
 ## Requirements
 
 - Linux kernel 5.8+ (for BTF and CO-RE support)
-- Root privileges or `CAP_SYS_ADMIN` + `CAP_PERFMON` capabilities
+- Root privileges or capabilities: `CAP_SYS_ADMIN` + `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE` + `CAP_CHECKPOINT_RESTORE`
 
 ## Usage
 
@@ -104,43 +104,48 @@ sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
 | `--per-pid` | Show per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
 | `--sample-rate` | CPU profiling sample rate in Hz | `99` |
+| `--profile-output` | Output path for CPU profile | auto-generated |
+| `--offcpu-output` | Output path for off-CPU profile | auto-generated |
+| `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
 
 Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
 
 ## Output
 
+### Output File Naming
+
+Output files are auto-named based on process name, timestamp, and profile type:
+
+| Mode | Per-PID example | System-wide example |
+|------|----------------|---------------------|
+| `--profile` | `myapp-202604021430-on-cpu.pb.gz` | `202604021430-on-cpu.pb.gz` |
+| `--offcpu` | `myapp-202604021430-off-cpu.pb.gz` | `202604021430-off-cpu.pb.gz` |
+| `--pmu-output auto` | `myapp-202604021430-pmu.txt` | `202604021430-pmu.txt` |
+
+Process name is read from `/proc/<pid>/comm`. Override with `--profile-output` or `--offcpu-output`.
+
 ### Profile Mode (`--profile`)
 
-Writes `profile.pb.gz` in pprof format. Shows where CPU time is spent.
+Writes pprof format. Shows where CPU time is spent.
 
 ```bash
-go tool pprof profile.pb.gz
+go tool pprof myapp-202604021430-on-cpu.pb.gz
 ```
 
-### Profile Tags (`--tag`)
-
-Tags are stored as comments in the pprof file. View them with:
-
-```bash
-go tool pprof profile.pb.gz
-(pprof) comments
-env=production
-version=1.2.3
-service=api
-```
+Tags (`--tag key=value`) are stored as comments in the pprof file.
 
 ### Off-CPU Mode (`--offcpu`)
 
-Writes `offcpu.pb.gz` in pprof format. Shows where time is spent blocked/sleeping (I/O, locks, sleep calls, etc.). Values are in nanoseconds.
+Writes pprof format. Shows where time is spent blocked/sleeping (I/O, locks, sleep calls). Values are in nanoseconds.
 
 ```bash
-go tool pprof offcpu.pb.gz
+go tool pprof myapp-202604021430-off-cpu.pb.gz
 ```
 
 ### PMU Mode (`--pmu`)
 
-Prints to stdout:
+Prints to stdout (or to file with `--pmu-output <path>`):
 
 - **On-CPU Time**: Time slice per context switch (min, max, mean, percentiles)
   - Measures how long a process runs on CPU before being switched out
@@ -189,7 +194,7 @@ import (
     "context"
     "log"
     "time"
-    "perf-agent/perfagent"
+    "github.com/dpsoft/perf-agent/perfagent"
 )
 
 func main() {
@@ -233,10 +238,13 @@ See [perfagent package documentation](perfagent/) for all available options.
 
 ## Building
 
+Requires Go 1.25+, Clang/LLVM, Linux headers, and [blazesym](https://github.com/libbpf/blazesym) (Rust C library for symbolization).
+
 ```bash
-go generate ./...
-go build
+make build
 ```
+
+See [BUILDING.md](BUILDING.md) for detailed setup instructions.
 
 ## Testing
 

@@ -34,7 +34,8 @@ fi
 
 echo ""
 echo "=== Running perf-agent --offcpu for 10s ==="
-sudo ./perf-agent --offcpu --pid $PYTHON_PID --duration 10s \
+PROFILE_OUTPUT="$PROFILE_OUTPUT"
+sudo ./perf-agent --offcpu --offcpu-output "$PROFILE_OUTPUT" --pid $PYTHON_PID --duration 10s \
     --tag test=offcpu_synthetic
 
 # Wait for Python to finish
@@ -43,17 +44,17 @@ PYTHON_PID=""
 
 echo ""
 echo "=== Validating off-CPU profile output ==="
-if [ -f "offcpu.pb.gz" ]; then
-    echo "✓ Off-CPU profile created: offcpu.pb.gz"
+if [ -f "$PROFILE_OUTPUT" ]; then
+    echo "✓ Off-CPU profile created: $PROFILE_OUTPUT"
     
     # Check profile with pprof
     echo ""
     echo "Top functions (off-CPU time in nanoseconds):"
-    go tool pprof -top -nodecount=15 offcpu.pb.gz 2>/dev/null | head -20
+    go tool pprof -top -nodecount=15 $PROFILE_OUTPUT 2>/dev/null | head -20
     
     echo ""
     echo "Looking for blocking symbols..."
-    if go tool pprof -top offcpu.pb.gz 2>/dev/null | grep -qiE "sleep|wait|read|write|fsync|io_work"; then
+    if go tool pprof -top $PROFILE_OUTPUT 2>/dev/null | grep -qiE "sleep|wait|read|write|fsync|io_work"; then
         echo "✓ Blocking/I/O symbols found!"
     else
         echo "⚠ No obvious blocking symbols found"
@@ -61,11 +62,11 @@ if [ -f "offcpu.pb.gz" ]; then
     
     echo ""
     echo "Profile comments (tags):"
-    go tool pprof -comments offcpu.pb.gz 2>/dev/null || echo "(no comments)"
+    go tool pprof -comments $PROFILE_OUTPUT 2>/dev/null || echo "(no comments)"
     
     echo ""
     echo "Profile sample type:"
-    go tool pprof -sample_index offcpu.pb.gz 2>/dev/null | head -5 || true
+    go tool pprof -sample_index $PROFILE_OUTPUT 2>/dev/null | head -5 || true
 else
     echo "✗ Off-CPU profile not created!"
     exit 1
@@ -75,7 +76,7 @@ echo ""
 echo "=== Test complete ==="
 echo ""
 echo "To explore the off-CPU profile interactively:"
-echo "  go tool pprof offcpu.pb.gz"
+echo "  go tool pprof $PROFILE_OUTPUT"
 echo ""
 echo "To see flame graph:"
-echo "  go tool pprof -http=:8080 offcpu.pb.gz"
+echo "  go tool pprof -http=:8080 $PROFILE_OUTPUT"

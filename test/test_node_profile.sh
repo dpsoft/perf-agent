@@ -36,7 +36,8 @@ fi
 
 echo ""
 echo "=== Running perf-agent for 10s ==="
-sudo ./perf-agent --profile --pid "$NODE_PID" --duration 10s --sample-rate 99 \
+PROFILE_OUTPUT="profile.pb.gz"
+sudo ./perf-agent --profile --profile-output "$PROFILE_OUTPUT" --pid "$NODE_PID" --duration 10s --sample-rate 99 \
     --tag test=node_synthetic
 
 # Wait for Node to finish (or ignore errors if it already exited)
@@ -45,17 +46,17 @@ NODE_PID=""
 
 echo ""
 echo "=== Validating profile output ==="
-if [ -f "profile.pb.gz" ]; then
-    echo "✓ Profile created: profile.pb.gz"
+if [ -f "$PROFILE_OUTPUT" ]; then
+    echo "✓ Profile created: $PROFILE_OUTPUT"
 
     echo ""
     echo "Top functions:"
-    go tool pprof -top -nodecount=20 profile.pb.gz 2>/dev/null | head -25
+    go tool pprof -top -nodecount=20 "$PROFILE_OUTPUT" 2>/dev/null | head -25
 
     echo ""
     echo "Looking for Node.js symbols..."
     # Adjust the patterns depending on your workload; look for JS function names or module paths
-    if go tool pprof -top profile.pb.gz 2>/dev/null | grep -qiE "cpuWork|Node\\.js|node|v8::"; then
+    if go tool pprof -top "$PROFILE_OUTPUT" 2>/dev/null | grep -qiE "cpuWork|Node\\.js|node|v8::"; then
         echo "✓ Node.js / V8 symbols found!"
     else
         echo "⚠ No clear Node.js symbols found (may still be only native frames)"
@@ -64,7 +65,7 @@ if [ -f "profile.pb.gz" ]; then
 
     echo ""
     echo "Profile comments (tags):"
-    go tool pprof -comments profile.pb.gz 2>/dev/null || echo "(no comments)"
+    go tool pprof -comments "$PROFILE_OUTPUT" 2>/dev/null || echo "(no comments)"
 else
     echo "✗ Profile not created!"
     exit 1

@@ -11,8 +11,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
-	"github.com/dpsoft/perf-agent/internal/blazesym"
 	"github.com/dpsoft/perf-agent/pprof"
+	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Profiler handles off-CPU profiling with stack traces
@@ -40,10 +40,8 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 	}
 
 	// Set system_wide variable in eBPF program
-	if err := spec.RewriteConstants(map[string]interface{}{
-		"system_wide": systemWide,
-	}); err != nil {
-		return nil, fmt.Errorf("rewrite constants: %w", err)
+	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
+		return nil, fmt.Errorf("set system_wide variable: %w", err)
 	}
 
 	objs := &offcpuObjects{}

@@ -30,10 +30,8 @@ func NewPMUMonitor(pid int, systemWide bool, cpus []uint) (*PMUMonitor, error) {
 	}
 
 	// Set system_wide variable in eBPF program
-	if err := spec.RewriteConstants(map[string]interface{}{
-		"system_wide": systemWide,
-	}); err != nil {
-		return nil, fmt.Errorf("rewrite constants: %w", err)
+	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
+		return nil, fmt.Errorf("set system_wide variable: %w", err)
 	}
 
 	cpuObjs := &cpuObjects{}

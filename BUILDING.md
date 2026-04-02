@@ -3,7 +3,7 @@
 ## Prerequisites
 
 ### Required Tools
-- Go 1.24+
+- Go 1.25+
 - Clang/LLVM
 - Linux headers
 - Rust toolchain (for blazesym)

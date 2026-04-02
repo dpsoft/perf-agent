@@ -80,9 +80,13 @@ func (a *Agent) Start(ctx context.Context) error {
 		return errors.New("agent already started")
 	}
 
-	// Set capabilities
+	// Set capabilities:
+	//   CAP_BPF                - load eBPF programs and create maps
+	//   CAP_PERFMON            - perf_event_open, stack traces, tracing attachment
+	//   CAP_SYS_PTRACE         - read /proc/<pid>/maps and /proc/<pid>/mem of other processes
+	//   CAP_CHECKPOINT_RESTORE - follow /proc/<pid>/map_files/ symlinks (blazesym symbolization)
 	caps := cap.GetProc()
-	if err := caps.SetFlag(cap.Effective, true, cap.SYS_ADMIN, cap.PERFMON); err != nil {
+	if err := caps.SetFlag(cap.Effective, true, cap.BPF, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE); err != nil {
 		return fmt.Errorf("set capabilities: %w", err)
 	}
 

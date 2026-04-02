@@ -70,6 +70,11 @@ jobs:
         sudo ldconfig
         echo "✓ blazesym installed"
     
+    - name: Configure blazesym Go module
+      run: |
+        go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+        cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+
     - name: Run go generate
       run: go generate ./...
     

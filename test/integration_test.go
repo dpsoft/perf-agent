@@ -93,6 +93,7 @@ func TestProfileMode(t *testing.T) {
 
 			agent := exec.Command(agentPath,
 				"--profile",
+				"--profile-output", outputFile,
 				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
 				"--duration", "10s",
 			)
@@ -171,6 +172,7 @@ func TestOffCPUMode(t *testing.T) {
 
 			agent := exec.Command(agentPath,
 				"--offcpu",
+				"--offcpu-output", outputFile,
 				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
 				"--duration", "10s",
 			)
@@ -266,7 +268,9 @@ func TestCombinedMode(t *testing.T) {
 	// Run perf-agent with all features
 	agent := exec.Command(agentPath,
 		"--profile",
+		"--profile-output", "profile.pb.gz",
 		"--offcpu",
+		"--offcpu-output", "offcpu.pb.gz",
 		"--pmu",
 		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
 		"--duration", "10s",
@@ -353,7 +357,7 @@ func TestSystemWideProfile(t *testing.T) {
 	outputFile := "profile.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath, "--profile", "-a", "--duration", "5s")
+	agent := exec.Command(agentPath, "--profile", "--profile-output", outputFile, "-a", "--duration", "5s")
 	output, err := agent.CombinedOutput()
 	if err != nil {
 		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
@@ -388,7 +392,7 @@ func TestSystemWideOffCPU(t *testing.T) {
 	outputFile := "offcpu.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath, "--offcpu", "-a", "--duration", "5s")
+	agent := exec.Command(agentPath, "--offcpu", "--offcpu-output", outputFile, "-a", "--duration", "5s")
 	output, err := agent.CombinedOutput()
 	if err != nil {
 		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))

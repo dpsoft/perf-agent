@@ -8,11 +8,13 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type offcpuOffcpuKey struct {
+	_         structs.HostLayout
 	Pid       uint32
 	_         [4]byte
 	KernStack int64
@@ -20,11 +22,13 @@ type offcpuOffcpuKey struct {
 }
 
 type offcpuStartKey struct {
+	_    structs.HostLayout
 	Pid  uint32
 	Tgid uint32
 }
 
 type offcpuStartVal struct {
+	_         structs.HostLayout
 	Timestamp uint64
 	KernStack int64
 	UserStack int64
@@ -65,9 +69,10 @@ func loadOffcpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type offcpuSpecs struct {
 	offcpuProgramSpecs
 	offcpuMapSpecs
+	offcpuVariableSpecs
 }
 
-// offcpuSpecs contains programs before they are loaded into the kernel.
+// offcpuProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type offcpuProgramSpecs struct {
@@ -84,12 +89,20 @@ type offcpuMapSpecs struct {
 	Start        *ebpf.MapSpec `ebpf:"start"`
 }
 
+// offcpuVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type offcpuVariableSpecs struct {
+	SystemWide *ebpf.VariableSpec `ebpf:"system_wide"`
+}
+
 // offcpuObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
 type offcpuObjects struct {
 	offcpuPrograms
 	offcpuMaps
+	offcpuVariables
 }
 
 func (o *offcpuObjects) Close() error {
@@ -116,6 +129,13 @@ func (m *offcpuMaps) Close() error {
 		m.Stackmap,
 		m.Start,
 	)
+}
+
+// offcpuVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type offcpuVariables struct {
+	SystemWide *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // offcpuPrograms contains all programs after they have been loaded into the kernel.

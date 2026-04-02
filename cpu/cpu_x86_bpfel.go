@@ -47,9 +47,10 @@ func loadCpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type cpuSpecs struct {
 	cpuProgramSpecs
 	cpuMapSpecs
+	cpuVariableSpecs
 }
 
-// cpuSpecs contains programs before they are loaded into the kernel.
+// cpuProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type cpuProgramSpecs struct {
@@ -76,12 +77,20 @@ type cpuMapSpecs struct {
 	WakeupTs              *ebpf.MapSpec `ebpf:"wakeup_ts"`
 }
 
+// cpuVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type cpuVariableSpecs struct {
+	SystemWide *ebpf.VariableSpec `ebpf:"system_wide"`
+}
+
 // cpuObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
 type cpuObjects struct {
 	cpuPrograms
 	cpuMaps
+	cpuVariables
 }
 
 func (o *cpuObjects) Close() error {
@@ -124,6 +133,13 @@ func (m *cpuMaps) Close() error {
 		m.Rb,
 		m.WakeupTs,
 	)
+}
+
+// cpuVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadCpuObjects or ebpf.CollectionSpec.LoadAndAssign.
+type cpuVariables struct {
+	SystemWide *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // cpuPrograms contains all programs after they have been loaded into the kernel.

@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 
-	"github.com/dpsoft/perf-agent/internal/blazesym"
+	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/pprof"
 )
@@ -50,10 +50,8 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	}
 
 	// Set system_wide variable in eBPF program
-	if err := spec.RewriteConstants(map[string]interface{}{
-		"system_wide": systemWide,
-	}); err != nil {
-		return nil, fmt.Errorf("rewrite constants: %w", err)
+	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
+		return nil, fmt.Errorf("set system_wide variable: %w", err)
 	}
 
 	objs := &perfObjects{}
@@ -75,6 +73,11 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
+	// Always use pid=-1 (system-wide) for perf_event_open.
+	// Per-PID filtering is done in the eBPF program by TGID, which correctly
+	// captures all threads of the target process. Passing a specific PID to
+	// perf_event_open would only monitor that single thread (TID), missing
+	// worker threads in multi-threaded processes.
 	var perfEvents []*perfEvent
 	for _, id := range cpus {
 		pe, err := newPerfEvent(int(id), sampleRate)

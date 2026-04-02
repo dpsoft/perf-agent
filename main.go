@@ -16,15 +16,18 @@ import (
 )
 
 var (
-	flagProfile    = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
-	flagOffCpu     = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
-	flagPMU        = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
-	flagPID        = flag.Int("pid", 0, "Target process ID to monitor")
-	flagAll        = flag.Bool("a", false, "System-wide profiling (all processes)")
-	flagPerPID     = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
-	flagDuration   = flag.Duration("duration", 10*time.Second, "Collection duration")
-	flagSampleRate = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
-	flagTags       tagFlags
+	flagProfile       = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagOffCpu        = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
+	flagPMU           = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
+	flagPID           = flag.Int("pid", 0, "Target process ID to monitor")
+	flagAll           = flag.Bool("a", false, "System-wide profiling (all processes)")
+	flagPerPID        = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
+	flagDuration      = flag.Duration("duration", 10*time.Second, "Collection duration")
+	flagSampleRate    = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
+	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
+	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
+	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagTags          tagFlags
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -48,6 +51,8 @@ func init() {
 	// Register --tag flag for profile metadata
 	flag.Var(&flagTags, "tag", "Add tag to profile (repeatable, format: key=value)")
 }
+
+var pmuFile *os.File
 
 func main() {
 	flag.Parse()
@@ -94,6 +99,10 @@ func main() {
 		log.Printf("Error stopping agent: %v", err)
 	}
 
+	if pmuFile != nil {
+		_ = pmuFile.Close()
+	}
+
 	fmt.Println("Exiting program.")
 }
 
@@ -120,17 +129,38 @@ func buildOptions() []perfagent.Option {
 	}
 
 	if *flagProfile {
-		opts = append(opts, perfagent.WithCPUProfile("profile.pb.gz"))
+		outputPath := *flagProfileOutput
+		if outputPath == "" {
+			outputPath = generateOutputName(*flagPID, *flagAll, "on-cpu", "pb.gz")
+		}
+		opts = append(opts, perfagent.WithCPUProfile(outputPath))
 	}
 
 	if *flagOffCpu {
-		opts = append(opts, perfagent.WithOffCPUProfile("offcpu.pb.gz"))
+		outputPath := *flagOffcpuOutput
+		if outputPath == "" {
+			outputPath = generateOutputName(*flagPID, *flagAll, "off-cpu", "pb.gz")
+		}
+		opts = append(opts, perfagent.WithOffCPUProfile(outputPath))
 	}
 
 	if *flagPMU {
 		opts = append(opts, perfagent.WithPMU())
-		// Use console exporter for backward compatibility
-		opts = append(opts, perfagent.WithMetricsExporter(metrics.NewConsoleExporter(*flagPerPID)))
+		exporter := metrics.NewConsoleExporter(*flagPerPID)
+		if *flagPMUOutput != "" {
+			pmuPath := *flagPMUOutput
+			if pmuPath == "auto" {
+				pmuPath = generateOutputName(*flagPID, *flagAll, "pmu", "txt")
+			}
+			f, err := os.Create(pmuPath)
+			if err != nil {
+				log.Fatalf("Failed to create PMU output file: %v", err)
+			}
+			pmuFile = f
+			exporter.Writer = f
+			fmt.Printf("PMU metrics will be written to %s\n", pmuPath)
+		}
+		opts = append(opts, perfagent.WithMetricsExporter(exporter))
 	}
 
 	// Per-PID validation
@@ -153,4 +183,21 @@ func buildOptions() []perfagent.Option {
 	}
 
 	return opts
+}
+
+func generateOutputName(pid int, systemWide bool, suffix, ext string) string {
+	timestamp := time.Now().Format("200601021504")
+	if systemWide {
+		return fmt.Sprintf("%s-%s.%s", timestamp, suffix, ext)
+	}
+	procName := readProcessName(pid)
+	return fmt.Sprintf("%s-%s-%s.%s", procName, timestamp, suffix, ext)
+}
+
+func readProcessName(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return fmt.Sprintf("pid%d", pid)
+	}
+	return strings.TrimSpace(string(data))
 }

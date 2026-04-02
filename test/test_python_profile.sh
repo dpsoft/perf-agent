@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 # Cleanup on exit
 cleanup() {
     [ -n "$PYTHON_PID" ] && kill $PYTHON_PID 2>/dev/null || true
-    rm -f /tmp/test_profile.pb.gz
+    rm -f profile.pb.gz
 }
 trap cleanup EXIT
 
@@ -35,7 +35,8 @@ fi
 
 echo ""
 echo "=== Running perf-agent for 10s ==="
-sudo ./perf-agent --profile --pid $PYTHON_PID --duration 10s --sample-rate 99 \
+PROFILE_OUTPUT="profile.pb.gz"
+sudo ./perf-agent --profile --profile-output "$PROFILE_OUTPUT" --pid $PYTHON_PID --duration 10s --sample-rate 99 \
     --tag test=python_synthetic
 
 # Wait for Python to finish
@@ -44,17 +45,17 @@ PYTHON_PID=""
 
 echo ""
 echo "=== Validating profile output ==="
-if [ -f "profile.pb.gz" ]; then
-    echo "✓ Profile created: profile.pb.gz"
+if [ -f "$PROFILE_OUTPUT" ]; then
+    echo "✓ Profile created: $PROFILE_OUTPUT"
     
     # Check profile with pprof
     echo ""
     echo "Top functions:"
-    go tool pprof -top -nodecount=15 profile.pb.gz 2>/dev/null | head -20
+    go tool pprof -top -nodecount=15 "$PROFILE_OUTPUT" 2>/dev/null | head -20
     
     echo ""
     echo "Looking for Python symbols..."
-    if go tool pprof -top profile.pb.gz 2>/dev/null | grep -qE "cpu_work|main|warmup"; then
+    if go tool pprof -top "$PROFILE_OUTPUT" 2>/dev/null | grep -qE "cpu_work|main|warmup"; then
         echo "✓ Python user symbols found!"
     else
         echo "⚠ No Python user symbols found (only native symbols)"
@@ -63,7 +64,7 @@ if [ -f "profile.pb.gz" ]; then
     
     echo ""
     echo "Profile comments (tags):"
-    go tool pprof -comments profile.pb.gz 2>/dev/null || echo "(no comments)"
+    go tool pprof -comments "$PROFILE_OUTPUT" 2>/dev/null || echo "(no comments)"
 else
     echo "✗ Profile not created!"
     exit 1

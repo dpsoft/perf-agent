@@ -8,17 +8,20 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type perfPidConfig struct {
+	_             structs.HostLayout
 	Type          uint8
 	CollectUser   uint8
 	CollectKernel uint8
 }
 
 type perfSampleKey struct {
+	_         structs.HostLayout
 	Pid       uint32
 	Flags     uint32
 	KernStack int64
@@ -60,9 +63,10 @@ func loadPerfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type perfSpecs struct {
 	perfProgramSpecs
 	perfMapSpecs
+	perfVariableSpecs
 }
 
-// perfSpecs contains programs before they are loaded into the kernel.
+// perfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type perfProgramSpecs struct {
@@ -78,12 +82,20 @@ type perfMapSpecs struct {
 	Stackmap *ebpf.MapSpec `ebpf:"stackmap"`
 }
 
+// perfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type perfVariableSpecs struct {
+	SystemWide *ebpf.VariableSpec `ebpf:"system_wide"`
+}
+
 // perfObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type perfObjects struct {
 	perfPrograms
 	perfMaps
+	perfVariables
 }
 
 func (o *perfObjects) Close() error {
@@ -108,6 +120,13 @@ func (m *perfMaps) Close() error {
 		m.Pids,
 		m.Stackmap,
 	)
+}
+
+// perfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadPerfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type perfVariables struct {
+	SystemWide *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // perfPrograms contains all programs after they have been loaded into the kernel.

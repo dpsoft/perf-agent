@@ -27,6 +27,8 @@ test-workloads:
 
 .PHONY: test-unit
 test-unit: generate
+	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
+	CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
 	go test -v ./cpu/... ./profile/... ./offcpu/...
 
 .PHONY: test-integration

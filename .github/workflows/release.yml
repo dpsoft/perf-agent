@@ -77,8 +77,8 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 1
           CGO_CFLAGS: -I/usr/local/include
-          CGO_LDFLAGS: -L/usr/local/lib -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic -static
-        run: go build -v -ldflags '-extldflags "-static"' -o perf-agent-linux-${{ matrix.goarch }}
+          CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
+        run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

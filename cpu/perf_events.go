@@ -19,7 +19,7 @@ type HardwarePerfEvents struct {
 
 // NewHardwarePerfEvents opens hardware perf events on all specified CPUs.
 // Returns nil (not error) if hardware counters are unavailable.
-func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
+func NewHardwarePerfEvents(cpus []int) (*HardwarePerfEvents, error) {
 	h := &HardwarePerfEvents{
 		cpus:            cpus,
 		cyclesFDs:       make([]int, 0, len(cpus)),
@@ -28,7 +28,7 @@ func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
 	}
 
 	// Try to open cycles counter first to check if HW counters are available
-	testFD, err := openHWCounter(pid, cpus[0], unix.PERF_COUNT_HW_CPU_CYCLES)
+	testFD, err := openHWCounter(cpus[0], unix.PERF_COUNT_HW_CPU_CYCLES)
 	if err != nil {
 		return nil, fmt.Errorf("hardware counters unavailable: %w", err)
 	}
@@ -37,7 +37,7 @@ func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
 	// Open events for each CPU
 	for _, cpu := range cpus {
 		// CPU Cycles
-		cyclesFD, err := openHWCounter(pid, cpu, unix.PERF_COUNT_HW_CPU_CYCLES)
+		cyclesFD, err := openHWCounter(cpu, unix.PERF_COUNT_HW_CPU_CYCLES)
 		if err != nil {
 			_ = h.Close()
 			return nil, fmt.Errorf("open cycles counter on CPU %d: %w", cpu, err)
@@ -45,7 +45,7 @@ func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
 		h.cyclesFDs = append(h.cyclesFDs, cyclesFD)
 
 		// Instructions
-		instrFD, err := openHWCounter(pid, cpu, unix.PERF_COUNT_HW_INSTRUCTIONS)
+		instrFD, err := openHWCounter(cpu, unix.PERF_COUNT_HW_INSTRUCTIONS)
 		if err != nil {
 			_ = h.Close()
 			return nil, fmt.Errorf("open instructions counter on CPU %d: %w", cpu, err)
@@ -53,7 +53,7 @@ func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
 		h.instructionsFDs = append(h.instructionsFDs, instrFD)
 
 		// Cache Misses
-		cacheFD, err := openHWCounter(pid, cpu, unix.PERF_COUNT_HW_CACHE_MISSES)
+		cacheFD, err := openHWCounter(cpu, unix.PERF_COUNT_HW_CACHE_MISSES)
 		if err != nil {
 			_ = h.Close()
 			return nil, fmt.Errorf("open cache misses counter on CPU %d: %w", cpu, err)
@@ -65,13 +65,13 @@ func NewHardwarePerfEvents(pid int, cpus []int) (*HardwarePerfEvents, error) {
 }
 
 // openHWCounter opens a hardware perf counter for a specific CPU using unix.PerfEventOpen directly
-func openHWCounter(pid int, cpu int, config uint64) (int, error) {
+func openHWCounter(cpu int, config uint64) (int, error) {
 	attr := unix.PerfEventAttr{
 		Type:   unix.PERF_TYPE_HARDWARE,
 		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
 		Config: config,
 	}
-	fd, err := unix.PerfEventOpen(&attr, pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
 		return -1, os.NewSyscallError("perf_event_open", err)
 	}

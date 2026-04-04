@@ -67,12 +67,7 @@ eBPF-based performance monitoring agent for Linux. Supports CPU profiling with s
 ## Requirements
 
 - Linux kernel 5.8+ (for BTF and CO-RE support)
-- Root privileges or the following capabilities:
-
-| Mode | Required Capabilities |
-|------|----------------------|
-| Per-PID (`--pid`) | `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE` + `CAP_CHECKPOINT_RESTORE` |
-| System-wide (`-a`) | All of the above + `CAP_SYS_ADMIN` |
+- Root privileges or the following capabilities: `CAP_SYS_ADMIN` + `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE` + `CAP_CHECKPOINT_RESTORE`
 
 ## Usage
 

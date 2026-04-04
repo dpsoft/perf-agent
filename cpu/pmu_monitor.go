@@ -46,11 +46,7 @@ func NewPMUMonitor(pid int, systemWide bool, cpus []uint) (*PMUMonitor, error) {
 	}
 
 	var hwPerf *HardwarePerfEvents
-	targetPID := pid
-	if systemWide {
-		targetPID = -1
-	}
-	hwPerf, err = NewHardwarePerfEvents(targetPID, cpuList)
+	hwPerf, err = NewHardwarePerfEvents(cpuList)
 	if err != nil {
 		log.Printf("Hardware perf counters unavailable (running in VM?): %v", err)
 	} else {

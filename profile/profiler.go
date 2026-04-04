@@ -7,8 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
-	"strconv"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -75,44 +73,27 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	// Build list of PIDs to monitor:
-	//   System-wide: pid=-1 (requires CAP_SYS_ADMIN)
-	//   Per-PID: all TIDs from /proc/<pid>/task/ (requires CAP_PERFMON only)
-	var targetPIDs []int
-	if systemWide {
-		targetPIDs = []int{-1}
-	} else {
-		tids, err := getThreadIDs(pid)
-		if err != nil {
-			_ = objs.Close()
-			return nil, fmt.Errorf("get thread IDs for PID %d: %w", pid, err)
-		}
-		targetPIDs = tids
-	}
-
 	var perfEvents []*perfEvent
-	for _, tid := range targetPIDs {
-		for _, id := range cpus {
-			pe, err := newPerfEvent(tid, int(id), sampleRate)
-			if err != nil {
-				for _, pe := range perfEvents {
-					_ = pe.Close()
-				}
-				_ = objs.Close()
-				return nil, fmt.Errorf("create perf event for TID %d on CPU %d: %w", tid, id, err)
-			}
-
-			if err := pe.attachPerfEvent(objs.Profile); err != nil {
+	for _, id := range cpus {
+		pe, err := newPerfEvent(int(id), sampleRate)
+		if err != nil {
+			for _, pe := range perfEvents {
 				_ = pe.Close()
-				for _, pe := range perfEvents {
-					_ = pe.Close()
-				}
-				_ = objs.Close()
-				return nil, fmt.Errorf("attach eBPF to perf event for TID %d on CPU %d: %w", tid, id, err)
 			}
-
-			perfEvents = append(perfEvents, pe)
+			_ = objs.Close()
+			return nil, fmt.Errorf("create perf event on CPU %d: %w", id, err)
 		}
+
+		if err := pe.attachPerfEvent(objs.Profile); err != nil {
+			_ = pe.Close()
+			for _, pe := range perfEvents {
+				_ = pe.Close()
+			}
+			_ = objs.Close()
+			return nil, fmt.Errorf("attach eBPF to perf event on CPU %d: %w", id, err)
+		}
+
+		perfEvents = append(perfEvents, pe)
 	}
 
 	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
@@ -265,7 +246,7 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 
 // perfEvent helpers
 
-func newPerfEvent(pid int, cpu int, sampleRate int) (*perfEvent, error) {
+func newPerfEvent(cpu int, sampleRate int) (*perfEvent, error) {
 	attr := unix.PerfEventAttr{
 		Type:   unix.PERF_TYPE_SOFTWARE,
 		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
@@ -274,7 +255,7 @@ func newPerfEvent(pid int, cpu int, sampleRate int) (*perfEvent, error) {
 		Bits:   unix.PerfBitFreq, // Enable frequency mode
 	}
 
-	fd, err := unix.PerfEventOpen(&attr, pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
 		return nil, os.NewSyscallError("perf_event_open", err)
 	}
@@ -305,23 +286,3 @@ func (pe *perfEvent) attachPerfEvent(prog *ebpf.Program) error {
 	return nil
 }
 
-// getThreadIDs returns all thread IDs (TIDs) for a given process.
-func getThreadIDs(pid int) ([]int, error) {
-	taskDir := filepath.Join("/proc", strconv.Itoa(pid), "task")
-	entries, err := os.ReadDir(taskDir)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", taskDir, err)
-	}
-	tids := make([]int, 0, len(entries))
-	for _, e := range entries {
-		tid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		tids = append(tids, tid)
-	}
-	if len(tids) == 0 {
-		return nil, fmt.Errorf("no threads found for PID %d", pid)
-	}
-	return tids, nil
-}

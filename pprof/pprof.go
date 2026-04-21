@@ -3,6 +3,8 @@ package pprof
 import (
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -44,11 +46,35 @@ type SamplesCollector interface {
 	CollectProfiles(callback CollectProfilesCallback) error
 }
 
+// Frame is a single symbolized stack frame. Only Name is required; the other
+// fields are populated when the symbolizer can provide them (DWARF for native
+// binaries, perf-map decoding for Python/Node runtimes).
+type Frame struct {
+	Name   string
+	File   string
+	Line   uint32
+	Module string
+}
+
+// FrameFromName is a convenience constructor for callers that only know the
+// function name (synthetic "[unknown]" frames, tests).
+func FrameFromName(name string) Frame { return Frame{Name: name} }
+
+// FramesFromNames converts a []string of symbol names into []Frame. Intended
+// for tests and for callers migrating incrementally.
+func FramesFromNames(names []string) []Frame {
+	out := make([]Frame, len(names))
+	for i, n := range names {
+		out[i] = Frame{Name: n}
+	}
+	return out
+}
+
 type ProfileSample struct {
 	Pid         uint32
 	SampleType  SampleType
 	Aggregation SampleAggregation
-	Stack       []string
+	Stack       []Frame
 	Value       uint64
 	Value2      uint64
 }
@@ -116,10 +142,9 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		period = 512 * 1024 // todo
 	}
 	builder := &ProfileBuilder{
-		locations:          make(map[string]*profile.Location),
-		functions:          make(map[string]*profile.Function),
+		locations:          make(map[frameKey]*profile.Location),
+		functions:          make(map[frameKey]*profile.Function),
 		sampleHashToSample: make(map[uint64]*profile.Sample),
-		//Labels:             labels
 		Profile: &profile.Profile{
 			Mapping: []*profile.Mapping{
 				{
@@ -140,9 +165,35 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 	return res
 }
 
+// frameKey dedupes locations and functions. Line is included so two PCs at
+// different source lines within the same function produce distinct locations
+// (otherwise the first-seen line would silently win for all samples).
+type frameKey struct {
+	Name   string
+	File   string
+	Module string
+	Line   uint32
+}
+
+// functionKey is the subset of frameKey that identifies a pprof Function
+// (Line is per-location, not per-function).
+type functionKey struct {
+	Name   string
+	File   string
+	Module string
+}
+
+func (f Frame) locationKey() frameKey {
+	return frameKey{Name: f.Name, File: f.File, Module: f.Module, Line: f.Line}
+}
+
+func (f Frame) functionKey() frameKey {
+	return frameKey{Name: f.Name, File: f.File, Module: f.Module}
+}
+
 type ProfileBuilder struct {
-	locations          map[string]*profile.Location
-	functions          map[string]*profile.Function
+	locations          map[frameKey]*profile.Location
+	functions          map[frameKey]*profile.Function
 	sampleHashToSample map[uint64]*profile.Sample
 	Profile            *profile.Profile
 	tmpLocations       []*profile.Location
@@ -152,8 +203,8 @@ type ProfileBuilder struct {
 func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {
 	sample := p.newSample(inputSample)
 	p.addValue(inputSample, sample)
-	for i, s := range inputSample.Stack {
-		sample.Location[i] = p.addLocation(s)
+	for i, f := range inputSample.Stack {
+		sample.Location[i] = p.addLocation(f)
 	}
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
@@ -161,8 +212,8 @@ func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {
 func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.tmpLocations = p.tmpLocations[:0]
 	p.tmpLocationIDs = p.tmpLocationIDs[:0]
-	for _, s := range inputSample.Stack {
-		loc := p.addLocation(s)
+	for _, f := range inputSample.Stack {
+		loc := p.addLocation(f)
 		p.tmpLocations = append(p.tmpLocations, loc)
 		p.tmpLocationIDs = append(p.tmpLocationIDs, loc.ID)
 	}
@@ -179,40 +230,47 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
 
-func (p *ProfileBuilder) addLocation(function string) *profile.Location {
-	loc, ok := p.locations[function]
-	if ok {
+func (p *ProfileBuilder) addLocation(frame Frame) *profile.Location {
+	// Runtimes that symbolize via perf-maps pack name+file into a single
+	// string in Frame.Name. Decode here so pprof's Function.Filename and
+	// Line fields populate for any known runtime.
+	frame = decodePerfMapFrame(frame)
+
+	key := frame.locationKey()
+	if loc, ok := p.locations[key]; ok {
 		return loc
 	}
 
 	id := uint64(len(p.Profile.Location) + 1)
-	loc = &profile.Location{
+	loc := &profile.Location{
 		ID:      id,
 		Mapping: p.Profile.Mapping[0],
 		Line: []profile.Line{
 			{
-				Function: p.addFunction(function),
+				Function: p.addFunction(frame),
+				Line:     int64(frame.Line),
 			},
 		},
 	}
 	p.Profile.Location = append(p.Profile.Location, loc)
-	p.locations[function] = loc
+	p.locations[key] = loc
 	return loc
 }
 
-func (p *ProfileBuilder) addFunction(function string) *profile.Function {
-	f, ok := p.functions[function]
-	if ok {
+func (p *ProfileBuilder) addFunction(frame Frame) *profile.Function {
+	key := frame.functionKey()
+	if f, ok := p.functions[key]; ok {
 		return f
 	}
 
 	id := uint64(len(p.Profile.Function) + 1)
-	f = &profile.Function{
-		ID:   id,
-		Name: function,
+	f := &profile.Function{
+		ID:       id,
+		Name:     frame.Name,
+		Filename: frame.File,
 	}
 	p.Profile.Function = append(p.Profile.Function, f)
-	p.functions[function] = f
+	p.functions[key] = f
 	return f
 }
 
@@ -269,5 +327,133 @@ func (p *ProfileBuilder) addValue(inputSample *ProfileSample, sample *profile.Sa
 func Reverse[S ~[]E, E any](s S) {
 	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
 		s[i], s[j] = s[j], s[i]
+	}
+}
+
+// decodePerfMapFrame expands a Frame whose Name was produced by a runtime
+// perf-map (where the symbolizer returns the raw map line as a single
+// string) into a richer Frame with File/Line populated.
+//
+// Applied only when File is still empty (DWARF-symbolized frames already
+// have File/Line set). Runtimes without a matching case fall through
+// unchanged — strictly more information than before, never less.
+//
+// TODO(blazesym): once the Go binding exposes structured perf-map symbol
+// info, remove this and pull fields directly from blazesym.
+//
+// Recognized formats:
+//
+//	Python 3.12+ (PYTHONPERFSUPPORT):
+//	    py::<qualname>:<absolute_file.py>
+//
+//	Node.js (--perf-basic-prof):
+//	    LazyCompile:~<name> <file.js>:<line>:<col>
+//	    Function:<name>     <file.js>:<line>:<col>
+//	    Builtin:<name>                (no file/line)
+func decodePerfMapFrame(f Frame) Frame {
+	if f.File != "" || f.Name == "" {
+		return f
+	}
+	if dec, ok := decodePython(f.Name); ok {
+		return mergeFrame(f, dec)
+	}
+	if dec, ok := decodeNode(f.Name); ok {
+		return mergeFrame(f, dec)
+	}
+	return f
+}
+
+func mergeFrame(base, dec Frame) Frame {
+	if dec.Name != "" {
+		base.Name = dec.Name
+	}
+	if dec.File != "" {
+		base.File = dec.File
+	}
+	if dec.Line != 0 {
+		base.Line = dec.Line
+	}
+	return base
+}
+
+// decodePython parses "py::<qual>:<file.py>" emitted by CPython's
+// PYTHONPERFSUPPORT. The qualname itself can contain "::" (e.g.
+// "py::Class.method"), so we anchor on ":/" — Linux absolute paths always
+// start with "/".
+func decodePython(raw string) (Frame, bool) {
+	if !strings.HasPrefix(raw, "py::") {
+		return Frame{}, false
+	}
+	if idx := strings.LastIndex(raw, ":/"); idx != -1 {
+		return Frame{Name: raw[:idx], File: raw[idx+1:]}, true
+	}
+	// Prefix matched but no path — keep name as-is.
+	return Frame{Name: raw}, true
+}
+
+// decodeNode parses Node.js --perf-basic-prof lines. Returns ok=true when the
+// shape is recognized, even if file/line are absent (Builtin:, Code:, Script:).
+//
+// Modern Node (v16+) emits "JS:<tier><name> <file>:<line>:<col>" where <tier>
+// is a single marker character (~ lazy, ^ sparkplug, + baseline/other,
+// * optimized). Older versions emit "LazyCompile:~<name>" or "Function:<name>".
+// Builtin:/Code:/Script: carry no file info.
+func decodeNode(raw string) (Frame, bool) {
+	var prefix string
+	switch {
+	case strings.HasPrefix(raw, "JS:"):
+		prefix = "JS:"
+	case strings.HasPrefix(raw, "LazyCompile:"):
+		prefix = "LazyCompile:"
+	case strings.HasPrefix(raw, "Function:"):
+		prefix = "Function:"
+	case strings.HasPrefix(raw, "Builtin:"), strings.HasPrefix(raw, "Code:"), strings.HasPrefix(raw, "Script:"):
+		return Frame{Name: raw}, true
+	default:
+		return Frame{}, false
+	}
+	tail := raw[len(prefix):]
+	// Format: "<name> <file>:<line>:<col>" or "<name> <file>:<line>".
+	sp := strings.IndexByte(tail, ' ')
+	if sp == -1 {
+		return Frame{Name: raw}, true
+	}
+	name := prefix + tail[:sp]
+	loc := tail[sp+1:]
+
+	// Rightmost ":<num>" is either line (no col) or col (with line preceding).
+	// Parse both numeric suffixes; the leftmost of the two is the line.
+	file, line := parseTrailingFileLine(loc)
+	return Frame{Name: name, File: file, Line: line}, true
+}
+
+// parseTrailingFileLine splits "<file>:<line>" or "<file>:<line>:<col>" into
+// file and line. Returns line=0 if no numeric suffix is found.
+func parseTrailingFileLine(s string) (file string, line uint32) {
+	file = s
+	var nums [2]uint32
+	var found int
+	for found < 2 {
+		colon := strings.LastIndexByte(file, ':')
+		if colon == -1 || colon == len(file)-1 {
+			break
+		}
+		n, err := strconv.ParseUint(file[colon+1:], 10, 32)
+		if err != nil {
+			break
+		}
+		nums[found] = uint32(n)
+		found++
+		file = file[:colon]
+	}
+	switch found {
+	case 0:
+		return s, 0
+	case 1:
+		// "<file>:<line>" — the single parsed number is the line.
+		return file, nums[0]
+	default:
+		// "<file>:<line>:<col>" — nums[1] was parsed second (leftmost), so it's the line.
+		return file, nums[1]
 	}
 }

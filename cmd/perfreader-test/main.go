@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -22,6 +23,7 @@ func main() {
 	freq := flag.Uint64("freq", 99, "sample frequency (Hz)")
 	stackBytes := flag.Uint("stack-bytes", 8192, "user-stack bytes to capture per sample")
 	limit := flag.Int("limit", 20, "stop after printing this many samples")
+	duration := flag.Int("duration", 10, "stop after this many seconds regardless of sample count")
 	flag.Parse()
 
 	if *pid == 0 {
@@ -58,14 +60,19 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Printf("perfreader-test: pid=%d freq=%dHz stack=%dB\n", *pid, *freq, *stackBytes)
-	fmt.Printf("sampling… (Ctrl+C to stop, or auto-stops after %d samples)\n\n", *limit)
+	fmt.Printf("perfreader-test: pid=%d freq=%dHz stack=%dB limit=%d duration=%ds\n",
+		*pid, *freq, *stackBytes, *limit, *duration)
+	fmt.Printf("sampling… (Ctrl+C to stop early)\n\n")
 
 	count := 0
+	wakeups := 0
+	totalRecords := 0
 	events := make([]unix.EpollEvent, 4)
+	deadline := time.Now().Add(time.Duration(*duration) * time.Second)
+	lastProgress := time.Now()
 
 loop:
-	for count < *limit {
+	for count < *limit && time.Now().Before(deadline) {
 		select {
 		case <-sig:
 			break loop
@@ -79,21 +86,33 @@ loop:
 			}
 			log.Fatalf("epoll_wait: %v", err)
 		}
-		if n == 0 {
-			continue
+		if n > 0 {
+			wakeups++
 		}
 
-		_, err = r.ReadNext(func(s perfreader.Sample) {
+		records, err := r.ReadNext(func(s perfreader.Sample) {
 			count++
-			printSample(count, s)
+			if count <= *limit {
+				printSample(count, s)
+			}
 		})
 		if err != nil {
 			log.Printf("ReadNext: %v", err)
 			break
 		}
+		totalRecords += records
+
+		// Print a progress line every 2 seconds so silent hangs are visible.
+		if time.Since(lastProgress) > 2*time.Second {
+			fmt.Fprintf(os.Stderr, "[%.0fs] wakeups=%d records=%d samples=%d\n",
+				time.Since(deadline.Add(-time.Duration(*duration)*time.Second)).Seconds(),
+				wakeups, totalRecords, count)
+			lastProgress = time.Now()
+		}
 	}
 
-	fmt.Printf("\n[done: %d samples printed]\n", count)
+	fmt.Printf("\n[done: %d samples printed, %d records total, %d wakeups]\n",
+		count, totalRecords, wakeups)
 }
 
 func printSample(n int, s perfreader.Sample) {
@@ -104,11 +123,13 @@ func printSample(n int, s perfreader.Sample) {
 	fmt.Printf("  callchain (%d frames):\n", len(s.Callchain))
 	for i, pc := range s.Callchain {
 		tag := ""
-		// PERF_CONTEXT_* sentinels are high-bit-set markers.
+		// PERF_CONTEXT_* sentinels from include/uapi/linux/perf_event.h
 		switch pc {
-		case 0xffffffffffffff80: // PERF_CONTEXT_KERNEL
+		case 0xffffffffffffffe0: // PERF_CONTEXT_HV = -32
+			tag = " [hv]"
+		case 0xffffffffffffff80: // PERF_CONTEXT_KERNEL = -128
 			tag = " [kernel]"
-		case 0xffffffffffffff00: // PERF_CONTEXT_USER
+		case 0xfffffffffffffe00: // PERF_CONTEXT_USER = -512
 			tag = " [user]"
 		}
 		fmt.Printf("    [%02d] 0x%016x%s\n", i, pc, tag)

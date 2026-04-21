@@ -40,12 +40,13 @@ func DefaultConfig() Config {
 // creates one Reader per CPU (or one per PID+CPU combination) and pumps
 // events from Events() until Close().
 type Reader struct {
-	cfg    Config
-	fd     int
-	mmap   []byte          // full mapping: metadata page + data pages
-	meta   *perfMmapPage   // first page
-	data   []byte          // the ring portion of mmap
-	pageSz int
+	cfg      Config
+	fd       int
+	mmap     []byte // full mapping: metadata page + data pages
+	data     []byte // the ring portion of mmap
+	pageSz   int
+	dataHead *uint64 // aliases mmap[dataHeadOffset] — atomic load only
+	dataTail *uint64 // aliases mmap[dataTailOffset] — atomic store only
 }
 
 // NewReader opens a perf_event sampling CPU_CLOCK at cfg.SampleFreq Hz,
@@ -90,13 +91,19 @@ func NewReader(cfg Config) (*Reader, error) {
 		return nil, fmt.Errorf("mmap perf ring: %w", err)
 	}
 
+	// data_head / data_tail live at kernel-guaranteed offsets 1024 / 1032
+	// inside struct perf_event_mmap_page (see include/uapi/linux/perf_event.h).
+	// We access them via raw pointer rather than mirroring the whole 1KB+ page
+	// struct in Go — its layout has evolved across kernels and mirroring it
+	// is a portability trap.
 	r := &Reader{
-		cfg:    cfg,
-		fd:     fd,
-		mmap:   mmap,
-		meta:   (*perfMmapPage)(unsafe.Pointer(&mmap[0])),
-		data:   mmap[pageSz:],
-		pageSz: pageSz,
+		cfg:      cfg,
+		fd:       fd,
+		mmap:     mmap,
+		data:     mmap[pageSz:],
+		pageSz:   pageSz,
+		dataHead: (*uint64)(unsafe.Pointer(&mmap[dataHeadOffset])),
+		dataTail: (*uint64)(unsafe.Pointer(&mmap[dataTailOffset])),
 	}
 
 	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_RESET, 0); err != nil {
@@ -145,8 +152,8 @@ func (r *Reader) FD() int { return r.fd }
 // Returns the number of records consumed (all types, including ignored).
 // Returns 0, nil if the ring is empty — caller should poll the FD and retry.
 func (r *Reader) ReadNext(cb func(Sample)) (int, error) {
-	head := atomic.LoadUint64(&r.meta.DataHead)
-	tail := r.meta.DataTail
+	head := atomic.LoadUint64(r.dataHead)
+	tail := atomic.LoadUint64(r.dataTail)
 	if head == tail {
 		return 0, nil
 	}
@@ -183,7 +190,7 @@ func (r *Reader) ReadNext(cb func(Sample)) (int, error) {
 		consumed++
 	}
 
-	atomic.StoreUint64(&r.meta.DataTail, head)
+	atomic.StoreUint64(r.dataTail, head)
 	return consumed, nil
 }
 
@@ -360,35 +367,14 @@ func (c *byteCursor) bytes(n int) []byte {
 	return out
 }
 
-// perfMmapPage mirrors `struct perf_event_mmap_page` up to the fields we
-// use (data_head, data_tail). Kernel definition in include/uapi/linux/perf_event.h.
-//
-// Only the head/tail cursors are needed — the ring buffer is [page_sz, mmap_end)
-// and we compute positions modulo (page_sz * RingPages).
-type perfMmapPage struct {
-	Version        uint32
-	CompatVersion  uint32
-	Lock           uint32
-	Index          uint32
-	Offset         int64
-	TimeEnabled    uint64
-	TimeRunning    uint64
-	CapabilitiesEtc uint64
-	PmcWidth       uint16
-	TimeShift      uint16
-	TimeMult       uint32
-	TimeOffset     uint64
-	TimeZero       uint64
-	Size           uint32
-	_              uint32
-	_              [948]byte
-	DataHead       uint64
-	DataTail       uint64
-	DataOffset     uint64
-	DataSize       uint64
-}
+// Kernel-ABI offsets inside struct perf_event_mmap_page. Stable across
+// kernels; see include/uapi/linux/perf_event.h.
+const (
+	dataHeadOffset = 1024
+	dataTailOffset = 1032
 
-const perfEventHeaderSize = 8 // u32 type + u16 misc + u16 size
+	perfEventHeaderSize = 8 // u32 type + u16 misc + u16 size
+)
 
 // ensure we actually compile for linux only
 var _ = runtime.GOOS

@@ -85,9 +85,21 @@ Not really a separate option — the kernel doesn't do DWARF unwinding on its ow
 
 3. **Keep the eBPF path** for off-CPU mode — `sched_switch` tracepoint samples don't have the perf-event stack-sample ergonomics. Off-CPU keeps FP walking + inline expansion.
 
-4. **Feature flag / fallback**:
-   - CLI option `--unwind {fp,dwarf}` defaulting to `fp` during rollout, then flipping after validation.
-   - If the DWARF unwinder returns an empty or impossibly-short chain for a sample, fall back to whatever the kernel's `PERF_SAMPLE_CALLCHAIN` produced for that sample.
+4. **CLI flag `--unwind {fp,dwarf,auto}`** — default **`auto`**:
+   - `fp` — kernel callchain (existing path). Cheapest; breaks on FP-less frames.
+   - `dwarf` — always DWARF-unwind from captured regs+stack. Most accurate; highest per-sample cost.
+   - `auto` **(default)** — hybrid:
+     1. Consult pre-scanned `.eh_frame` classification for the innermost PC's binary/range.
+     2. If PC is in an FP-safe range, use the kernel's `PERF_SAMPLE_CALLCHAIN` directly.
+     3. If PC is in an FP-less range (libstd, glibc, C++ release builds), DWARF-unwind.
+     4. If callchain was short for no obvious reason (≤ 2 frames when stack looks deep), DWARF-unwind as a fallback even for nominally FP-safe PCs.
+   - The heuristic is per-sample and cheap — a range lookup + length check.
+
+5. **Per-binary `.eh_frame` classification** in the `unwind/` package:
+   - At `/proc/<pid>/maps` attach (and on mmap-change events), parse each ELF's `.eh_frame`.
+   - For each FDE, inspect the CFA rule. CFA = `rbp+N` → FP-safe. Anything else (SP-relative, register-indirect, DWARF expression) → FP-less.
+   - Cache by `(build-id, function range)` — blazesym's `blaze_read_elf_build_id` can keyfield this — so repeated mmaps of the same `.so` don't re-parse.
+   - Result: `map[PID]rangeSet[uint64]` that the sample-time decision consults in O(log n).
 
 ### Architecture diagram (text)
 

@@ -35,28 +35,37 @@ It does **not** recover real, non-inlined frames hidden behind FP-less code. A R
 - **Wins:** fast at sample time (no per-sample userspace cost), scales to system-wide mode at high sample rate.
 - **When to pick:** only if perf-agent becomes a product where high-volume always-on system-wide profiling matters.
 
-### Option B: raw stack capture + userspace unwinding (recommended next step)
+### Option B: raw stack capture + userspace unwinding
 
-- **Where:** kernel copies the top-of-stack bytes + register set into a ring buffer per sample. Userspace does the DWARF unwinding using blazesym (which already implements it).
-- **How:** swap current `perf_event_open(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK)` sampling for `perf_event_open` with `sample_type = PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER`. `sample_regs_user` = the x86_64 GPR mask blazesym needs. `sample_stack_user` = ~8KB. Read from perf ring buffer via `perf_event_open` mmap + `BPF_RINGBUF_OUTPUT` or userspace `perf_event` consumer.
-- **Scope:** medium. A week of focused work:
-  - New userspace perf-event reader (replace/augment the eBPF-only collector for CPU mode).
-  - Pass `(regs, stack_bytes)` to blazesym's unwinder API.
-  - Integrate results into the existing `Frame` pipeline.
-  - Off-CPU mode keeps `bpf_get_stackid` + inline expansion, since off-CPU samples from `sched_switch` don't have the same perf-event ergonomics.
-- **Wins:** correct stacks on everything blazesym can unwind (FP-less Rust, stripped C++, most of glibc). Bounded implementation. No kernel-side DWARF parsing.
+- **Where:** kernel copies the top-of-stack bytes + register set into a ring buffer per sample. Userspace does the DWARF unwinding with a separate library, then feeds the resulting PCs through blazesym for symbolization.
+- **How:** swap current `perf_event_open(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK)` sampling for `perf_event_open` with `sample_type = PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER`. `sample_regs_user` = the target arch's GPR mask the unwinder needs (RIP, RBP, RSP at minimum on x86_64). `sample_stack_user` = ~8KB. Read from perf ring buffer via mmap + `perf_event_poll`.
+- **Wins:** correct stacks on everything the unwinder handles (FP-less Rust, stripped C++, most of glibc). No kernel-side DWARF parsing.
 - **Costs:**
   - ~8KB per sample through the ring buffer. At 99 Hz × N CPUs that's ~100–800 KB/s. Manageable.
-  - Userspace CPU spent unwinding competes with the workload. Measure against the existing FP path.
-  - Doesn't work in `BPF_F_USER_STACK` style for arbitrary eBPF hook points — only the perf-event sample path gets `PERF_SAMPLE_STACK_USER`. So this improves CPU profiling but not, say, off-CPU via `sched_switch` tracepoint (that path keeps FP walking).
+  - Userspace CPU spent unwinding competes with the workload. Must be measured against the current FP path.
+  - `PERF_SAMPLE_STACK_USER` is a perf-event feature only — off-CPU via `sched_switch` tracepoint cannot use it. Off-CPU stays on FP + inline expansion.
+
+**Important correction:** earlier drafts of this spec assumed blazesym could unwind from `(regs, stack_bytes)`. **It cannot.** blazesym is a symbolizer, not an unwinder. The full C API surface (`blazesym.h`) offers only `blaze_symbolize_*`, `blaze_normalize_user_addrs`, `blaze_symbolize_kernel_abs_addrs`, `blaze_read_elf_build_id`, and `blaze_inspect_*`. The Rust crate's modules are `symbolize`, `normalize`, `inspect`, `kernel` — there is no `unwind` module and no plans to add one (confirmed via upstream activity through PR #1328). So Option B needs a *separate* unwinder library.
+
+#### Unwinder library choice (decide when picked up)
+
+Three realistic paths, in order of pragmatism:
+
+1. **libunwind via CGO.** The traditional C library. Mature, handles amd64 + arm64, well-documented. Adds a C build dependency, but we already link blazesym's C library, so the build chain is set up for it. Ballpark: 1–2 weeks of integration work. API shape: `unw_init_remote` + a memory-access callback that reads from our captured stack bytes + an address-space (PID-aware) to read `.eh_frame` from the target process's ELFs.
+
+2. **`github.com/go-delve/delve/pkg/dwarf/frame`.** Pure-Go DWARF CFI evaluator. No new C dep, but we own more code — we'd write the walker loop ourselves on top of delve's CFI rule evaluator, plus handle ELF loading and PC-range lookup. Ballpark: 2–3 weeks. Attractive because everything stays in Go; unattractive because delve's DWARF package is internal API and could change.
+
+3. **Shell out to `perf record --call-graph dwarf` + `perf script`.** Zero unwinder code — let perf do it. Subprocess orchestration, output parsing, different deploy requirement (`perf` must be on the host). Not production-grade long-term but useful as a reference / validation harness while building #1 or #2.
+
+Additional option if perf-agent ever gets serious about this: consider upstreaming an `unwind` module to blazesym. The blazesym authors have declined to build it so far (scope), but a well-written Rust unwinder on top of their existing DWARF infra would likely be accepted. Not a short-term play.
 
 ### Option C: `--call-graph dwarf` style with kernel help only
 
-Not really a separate option — the kernel doesn't do DWARF unwinding on its own. `perf record --call-graph dwarf` is actually Option B under the hood (kernel captures stack bytes, `perf report` unwinds them).
+Not really a separate option — the kernel doesn't do DWARF unwinding on its own. `perf record --call-graph dwarf` is actually Option B under the hood (kernel captures stack bytes, `perf report` unwinds them via libunwind).
 
 ## Recommendation
 
-**Option B.** Medium scope, uses infrastructure (blazesym) we already depend on, solves the concrete limitation for CPU profiling. If a future use case demands always-on system-wide at scale, Option A becomes worth revisiting.
+**Option B with libunwind** is the most pragmatic first implementation. The kernel-side work is unchanged; the userspace-side picks up a proven C library via CGO. Delve-frame becomes attractive only if the CGO build-chain overhead is a real problem, which it isn't today. Option A stays reserved for a potential future where always-on system-wide profiling at high sample rates matters.
 
 ## Scope for Option B (when picked up)
 
@@ -64,20 +73,21 @@ Not really a separate option — the kernel doesn't do DWARF unwinding on its ow
 
 1. **New CPU sampling path** in `profile/`:
    - Replace `newPerfEvent` (profile/profiler.go:249) with a `perf_event_open` that requests `PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER`.
-   - `sample_regs_user` mask: the x86_64 GPRs blazesym needs (RIP, RBP, RSP, plus general-purpose for register restoration during unwinding — check blazesym's expected format).
+   - `sample_regs_user` mask: minimum RIP, RBP, RSP on x86_64. Validate against libunwind's expected register encoding.
    - `sample_stack_user` size: start with 8192. Make configurable.
    - Consume perf ring buffer via mmap + `perf_event_poll`.
 
 2. **Userspace unwinder** in a new `unwind/` package:
+   - Wrap libunwind (`libunwind-ptrace` / `libunwind-x86_64`) via CGO.
    - Accept `(pid, regs, stack_bytes)` per sample.
-   - Call blazesym's unwinding API. Check current blazesym Go binding — may need extension if raw-stack unwind isn't exposed yet (as of this writing the Go binding covers `SymbolizeProcessAbsAddrs` but has incomplete coverage of normalize/unwind APIs).
-   - Produce `[]uint64` instruction pointers, then feed into the existing `symbolize` path.
+   - Provide libunwind with a custom address-space that reads registers from our captured regs, stack memory from our captured bytes, and `.eh_frame` / process memory from the target PID's maps (via `process_vm_readv` or `/proc/<pid>/mem`).
+   - Produce `[]uint64` instruction pointers, then feed into the existing `SymbolizeProcessAbsAddrs` → `blazeSymToFrames` pipeline — no change to the `Frame` type.
 
 3. **Keep the eBPF path** for off-CPU mode — `sched_switch` tracepoint samples don't have the perf-event stack-sample ergonomics. Off-CPU keeps FP walking + inline expansion.
 
 4. **Feature flag / fallback**:
    - CLI option `--unwind {fp,dwarf}` defaulting to `fp` during rollout, then flipping after validation.
-   - If DWARF unwinder fails on a sample (exotic CFI, missing debug info), fall back to whatever the kernel's `PERF_SAMPLE_CALLCHAIN` produced for that sample.
+   - If the DWARF unwinder returns an empty or impossibly-short chain for a sample, fall back to whatever the kernel's `PERF_SAMPLE_CALLCHAIN` produced for that sample.
 
 ### Architecture diagram (text)
 
@@ -87,7 +97,7 @@ Before:
 
 After (Option B):
   perf_event (SAMPLE_REGS_USER|SAMPLE_STACK_USER) → perf ring buffer
-      → userspace unwinder (regs, stack, blazesym DWARF) → []PC
+      → userspace libunwind (regs, stack, .eh_frame from PID) → []PC
       → blazesym symbolize → Frame
 ```
 

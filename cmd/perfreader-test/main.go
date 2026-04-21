@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/dpsoft/perf-agent/unwind/fpwalker"
 	"github.com/dpsoft/perf-agent/unwind/perfreader"
 )
 
@@ -147,14 +148,56 @@ func printSample(n int, s perfreader.Sample) {
 	}
 	if len(s.Stack) > 0 {
 		fmt.Printf("  stack   : addr=0x%016x len=%d bytes\n", s.StackAddr, len(s.Stack))
-		// Print the first 4 u64 words of the stack so we can eyeball that
-		// the return-address area is populated.
 		fmt.Printf("            [% 4x % 4x % 4x % 4x ...]\n",
 			le64(s.Stack, 0), le64(s.Stack, 8), le64(s.Stack, 16), le64(s.Stack, 24))
 	} else {
 		fmt.Printf("  stack   : (empty)\n")
 	}
+
+	// Run our pure-Go FP walker and compare to the kernel's callchain.
+	if len(s.Regs) > 0 && len(s.Stack) > 0 {
+		bp := perfreader.RegBP(s.Regs)
+		fp := fpwalker.Walk(s.IP, bp, s.StackAddr, s.Stack)
+		fmt.Printf("  fp-walk : %d frames\n", len(fp))
+		for i, pc := range fp {
+			fmt.Printf("    [%02d] 0x%016x\n", i, pc)
+		}
+		// Compare to kernel's user-space portion of CALLCHAIN.
+		kernel := filterKernelCallchain(s.Callchain)
+		if equalChains(fp, kernel) {
+			fmt.Printf("  match   : yes (fp-walk == kernel CALLCHAIN)\n")
+		} else {
+			fmt.Printf("  match   : NO — fp-walk and kernel CALLCHAIN differ\n")
+		}
+	}
+
 	fmt.Println()
+}
+
+// filterKernelCallchain strips PERF_CONTEXT_* sentinels so we can compare
+// the actual PC list against our FP walker's output.
+func filterKernelCallchain(chain []uint64) []uint64 {
+	out := make([]uint64, 0, len(chain))
+	for _, pc := range chain {
+		// Context sentinels are all in the 0xffffffff_ffff____ region.
+		if pc >= 0xfffffffffffff000 {
+			continue
+		}
+		out = append(out, pc)
+	}
+	return out
+}
+
+func equalChains(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func le64(b []byte, off int) uint64 {

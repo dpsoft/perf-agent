@@ -1,141 +1,310 @@
-# DWARF-based stack unwinding — design spec
+# DWARF-based stack unwinding — design spec (Option A, BPF-side)
 
-**Status:** deferred / not scheduled
-**Author:** design context captured 2026-04-21
-**Related:** branch `feat/pprof-frame-refactor` (inline-frame expansion landed; this is the next step beyond that)
+**Status:** scheduled — this is the direction `feat/dwarf-unwinding` is taking.
+**Supersedes:** the earlier Option B draft (userspace libunwind CGO wrapper), preserved in git history on this branch.
+**Goal:** when a sampled PC lives in code compiled without frame pointers (libstd, glibc, stripped C++), perf-agent should still produce a correct, deep stack — without ptrace, without external tools, at eBPF speed.
 
-## Problem
+## Context
 
-perf-agent's eBPF collector uses frame-pointer (FP) walking via `bpf_get_stackid(ctx, &stackmap, BPF_F_USER_STACK)` in `bpf/perf.bpf.c` and `bpf/offcpu.bpf.c`. This walks the `rbp` chain: at each frame, `[rbp]` holds the caller's `rbp`, `[rbp+8]` holds the return address.
+Phase 1 and Phase 2a on this branch established that perf-agent can:
 
-The chain breaks whenever any function in the call path was compiled without a `push rbp; mov rbp, rsp` prologue. Everything deeper than the first FP-less frame is invisible.
+- Capture `(regs, stack_bytes, callchain)` via `perf_event_open(REGS_USER | STACK_USER | CALLCHAIN)` — `unwind/perfreader/`.
+- Reproduce the kernel's frame-pointer callchain byte-for-byte in pure Go — `unwind/fpwalker/`.
 
-**Where this bites in practice:**
+Phase 2b began as a userspace libunwind CGO wrapper (Option B). That path works in principle but has three drawbacks we don't want to carry:
 
-- Pre-built Rust `libstd` / `liballoc` / `libcore` (shipped via rustup) has FPs elided. Any user code whose hot path sits beneath a libstd call is invisible.
-- Much of glibc (distro-dependent) is built without FPs.
-- C++ release builds almost always use `-fomit-frame-pointer`.
-- Workloads that call through any shared library the user didn't compile themselves.
+- Per-sample CGO cost + userspace DWARF parse cost competes with the workload.
+- Off-CPU profiling couldn't use it (no `PERF_SAMPLE_STACK_USER` path from `sched_switch`).
+- Parking complex code in userspace that could live in BPF keeps the sample-time overhead higher than it needs to be.
 
-**What it looks like:** shallow stacks (1–5 frames) on deep call graphs, hot functions orphaned from thread entry points, narrow-tall flamegraphs.
+This spec chooses **Option A**: perform DWARF unwinding inside the BPF program, using CFI tables pre-compiled in userspace. Symbolization stays where it is — blazesym takes PCs and produces `Frame` objects exactly as today.
 
-**What inline-frame expansion solves (and doesn't):**
+## Constraints and non-goals
 
-The branch `feat/pprof-frame-refactor` added inline-frame expansion via `blazesym.Sym.Inlined`. This recovers user code that was *inlined* into a visible frame (our Rust test case: `cpu_intensive_work` was inlined into `FnOnce::call_once{{vtable.shim}}`).
+**We explicitly do *not* need to match parca-agent's scope.** We deliberately drop:
 
-It does **not** recover real, non-inlined frames hidden behind FP-less code. A Rust workload with `#[inline(never)] cpu_intensive_work` sitting below a libstd call would still be invisible.
+- **Full DWARF expression evaluation.** We handle simple `CFA = register + offset` rules only. PCs with complex expression rules (DW_CFA_expression) fall back to FP walking for that sample. Measured ratio on this system's glibc: 2 out of 3,919 FDEs use expressions (0.05%). The long tail is dominated by signal trampolines which are rarely sampled.
+- **JIT / dynamic code.** No tracking of Python perf-maps, Node JIT regions, or similar — those already work via the perf-map decoder landed on `feat/pprof-frame-refactor`.
+- **Always-on / high-sample-rate system-wide profiling.** We ship `--pid` first (sequencing A), then `-a` as a follow-up.
 
-## Approach options
+**We do keep all current features.** Every mode that works on `main` today (`--profile`, `--offcpu`, `--pmu`, `--pid`, `-a`) continues to work. DWARF is additive; it activates via `--unwind dwarf` or the default `--unwind auto`. The existing `--unwind fp` path stays byte-for-byte identical.
 
-### Option A: DWARF unwinding inside eBPF (parca-agent / pyroscope-ebpf model)
-
-- **Where:** userspace parses every loaded ELF's `.eh_frame` into compact lookup tables, ships those into BPF maps keyed by `(binary, PC range)`. The eBPF program does the unwinding at sample time using the maps.
-- **Scope:** large. `/proc/<pid>/maps` watcher, ELF `.eh_frame` parser, table compiler, BPF-side walker implementing a subset of DWARF CFI (PLT stubs, common cases; bail to raw-stack on exotic CFI expressions), map eviction on exec/mmap.
-- **Reference:** parca-agent has ~5k lines of Go + eBPF dedicated to this. Not a weekend project.
-- **Wins:** fast at sample time (no per-sample userspace cost), scales to system-wide mode at high sample rate.
-- **When to pick:** only if perf-agent becomes a product where high-volume always-on system-wide profiling matters.
-
-### Option B: raw stack capture + userspace unwinding
-
-- **Where:** kernel copies the top-of-stack bytes + register set into a ring buffer per sample. Userspace does the DWARF unwinding with a separate library, then feeds the resulting PCs through blazesym for symbolization.
-- **How:** swap current `perf_event_open(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK)` sampling for `perf_event_open` with `sample_type = PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER`. `sample_regs_user` = the target arch's GPR mask the unwinder needs (RIP, RBP, RSP at minimum on x86_64). `sample_stack_user` = ~8KB. Read from perf ring buffer via mmap + `perf_event_poll`.
-- **Wins:** correct stacks on everything the unwinder handles (FP-less Rust, stripped C++, most of glibc). No kernel-side DWARF parsing.
-- **Costs:**
-  - ~8KB per sample through the ring buffer. At 99 Hz × N CPUs that's ~100–800 KB/s. Manageable.
-  - Userspace CPU spent unwinding competes with the workload. Must be measured against the current FP path.
-  - `PERF_SAMPLE_STACK_USER` is a perf-event feature only — off-CPU via `sched_switch` tracepoint cannot use it. Off-CPU stays on FP + inline expansion.
-
-**Important correction:** earlier drafts of this spec assumed blazesym could unwind from `(regs, stack_bytes)`. **It cannot.** blazesym is a symbolizer, not an unwinder. The full C API surface (`blazesym.h`) offers only `blaze_symbolize_*`, `blaze_normalize_user_addrs`, `blaze_symbolize_kernel_abs_addrs`, `blaze_read_elf_build_id`, and `blaze_inspect_*`. The Rust crate's modules are `symbolize`, `normalize`, `inspect`, `kernel` — there is no `unwind` module and no plans to add one (confirmed via upstream activity through PR #1328). So Option B needs a *separate* unwinder library.
-
-#### Unwinder library choice (decide when picked up)
-
-Three realistic paths, in order of pragmatism:
-
-1. **libunwind via CGO.** The traditional C library. Mature, handles amd64 + arm64, well-documented. Adds a C build dependency, but we already link blazesym's C library, so the build chain is set up for it. Ballpark: 1–2 weeks of integration work. API shape: `unw_init_remote` + a memory-access callback that reads from our captured stack bytes + an address-space (PID-aware) to read `.eh_frame` from the target process's ELFs.
-
-2. **`github.com/go-delve/delve/pkg/dwarf/frame`.** Pure-Go DWARF CFI evaluator. No new C dep, but we own more code — we'd write the walker loop ourselves on top of delve's CFI rule evaluator, plus handle ELF loading and PC-range lookup. Ballpark: 2–3 weeks. Attractive because everything stays in Go; unattractive because delve's DWARF package is internal API and could change.
-
-3. **Shell out to `perf record --call-graph dwarf` + `perf script`.** Zero unwinder code — let perf do it. Subprocess orchestration, output parsing, different deploy requirement (`perf` must be on the host). Not production-grade long-term but useful as a reference / validation harness while building #1 or #2.
-
-Additional option if perf-agent ever gets serious about this: consider upstreaming an `unwind` module to blazesym. The blazesym authors have declined to build it so far (scope), but a well-written Rust unwinder on top of their existing DWARF infra would likely be accepted. Not a short-term play.
-
-### Option C: `--call-graph dwarf` style with kernel help only
-
-Not really a separate option — the kernel doesn't do DWARF unwinding on its own. `perf record --call-graph dwarf` is actually Option B under the hood (kernel captures stack bytes, `perf report` unwinds them via libunwind).
-
-## Recommendation
-
-**Option B with libunwind** is the most pragmatic first implementation. The kernel-side work is unchanged; the userspace-side picks up a proven C library via CGO. Delve-frame becomes attractive only if the CGO build-chain overhead is a real problem, which it isn't today. Option A stays reserved for a potential future where always-on system-wide profiling at high sample rates matters.
-
-## Scope for Option B (when picked up)
-
-### Changes
-
-1. **New CPU sampling path** in `profile/`:
-   - Replace `newPerfEvent` (profile/profiler.go:249) with a `perf_event_open` that requests `PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER`.
-   - `sample_regs_user` mask: minimum RIP, RBP, RSP on x86_64. Validate against libunwind's expected register encoding.
-   - `sample_stack_user` size: start with 8192. Make configurable.
-   - Consume perf ring buffer via mmap + `perf_event_poll`.
-
-2. **Userspace unwinder** in a new `unwind/` package:
-   - Wrap libunwind (`libunwind-ptrace` / `libunwind-x86_64`) via CGO.
-   - Accept `(pid, regs, stack_bytes)` per sample.
-   - Provide libunwind with a custom address-space that reads registers from our captured regs, stack memory from our captured bytes, and `.eh_frame` / process memory from the target PID's maps (via `process_vm_readv` or `/proc/<pid>/mem`).
-   - Produce `[]uint64` instruction pointers, then feed into the existing `SymbolizeProcessAbsAddrs` → `blazeSymToFrames` pipeline — no change to the `Frame` type.
-
-3. **Keep the eBPF path** for off-CPU mode — `sched_switch` tracepoint samples don't have the perf-event stack-sample ergonomics. Off-CPU keeps FP walking + inline expansion.
-
-4. **CLI flag `--unwind {fp,dwarf,auto}`** — default **`auto`**:
-   - `fp` — kernel callchain (existing path). Cheapest; breaks on FP-less frames.
-   - `dwarf` — always DWARF-unwind from captured regs+stack. Most accurate; highest per-sample cost.
-   - `auto` **(default)** — hybrid:
-     1. Consult pre-scanned `.eh_frame` classification for the innermost PC's binary/range.
-     2. If PC is in an FP-safe range, use the kernel's `PERF_SAMPLE_CALLCHAIN` directly.
-     3. If PC is in an FP-less range (libstd, glibc, C++ release builds), DWARF-unwind.
-     4. If callchain was short for no obvious reason (≤ 2 frames when stack looks deep), DWARF-unwind as a fallback even for nominally FP-safe PCs.
-   - The heuristic is per-sample and cheap — a range lookup + length check.
-
-5. **Per-binary `.eh_frame` classification** in the `unwind/` package:
-   - At `/proc/<pid>/maps` attach (and on mmap-change events), parse each ELF's `.eh_frame`.
-   - For each FDE, inspect the CFA rule. CFA = `rbp+N` → FP-safe. Anything else (SP-relative, register-indirect, DWARF expression) → FP-less.
-   - Cache by `(build-id, function range)` — blazesym's `blaze_read_elf_build_id` can keyfield this — so repeated mmaps of the same `.so` don't re-parse.
-   - Result: `map[PID]rangeSet[uint64]` that the sample-time decision consults in O(log n).
-
-### Architecture diagram (text)
+## Architecture
 
 ```
-Before:
-  perf_event → eBPF (bpf_get_stackid, FP walk) → stackmap → userspace → blazesym → Frame
-
-After (Option B):
-  perf_event (SAMPLE_REGS_USER|SAMPLE_STACK_USER) → perf ring buffer
-      → userspace libunwind (regs, stack, .eh_frame from PID) → []PC
-      → blazesym symbolize → Frame
+                        ┌──────────────────────────────────────────┐
+  perf_event (CPU)      │                                          │
+  sched_switch (off-CPU)│   BPF (kernel-side)                      │
+          │             │                                          │
+          ▼             │   ┌────────────────────────────────┐     │
+    ┌──────────┐        │   │  perf_dwarf.bpf.c  /           │     │
+    │ capture  │◄───────┤   │  offcpu_dwarf.bpf.c            │     │
+    │  regs    │        │   │  (share unwind_common.h)       │     │
+    │ + stack  │        │   │                                 │     │
+    └──────────┘        │   │  1. classify(IP) → FP|DWARF    │     │
+                        │   │  2. if FP: walk rbp chain      │     │
+                        │   │     — re-classify every PC     │     │
+                        │   │  3. if DWARF: CFI lookup,      │     │
+                        │   │     apply, step                │     │
+                        │   │  4. emit PC chain via ringbuf  │     │
+                        │   └────────────────────────────────┘     │
+                        └──────────────────────────────────────────┘
+                                       │
+                         BPF ringbuf   │ BPF maps (CFI tables,
+                                       │   classification, per-PID
+                                       │   mappings, counts)
+                                       ▼
+                        ┌──────────────────────────────────────────┐
+                        │   userspace (Go)                         │
+                        │                                          │
+                        │  ┌─────────────┐   ┌────────────────┐   │
+                        │  │ MMAP2       │   │ CFI compiler   │   │
+                        │  │ watcher     ├──▶│ .eh_frame →    │   │
+                        │  │(perf_event  │   │ flat rule tbl  │   │
+                        │  │ mmap_data=1)│   └──────┬─────────┘   │
+                        │  └─────────────┘          │ load         │
+                        │                           ▼              │
+                        │        BPF maps: CFI + classification   │
+                        │                           ▲              │
+                        │  ┌─────────────┐          │              │
+                        │  │ ringbuf     │          │              │
+                        │  │ reader      │──▶ PC ──▶ blazesym     │
+                        │  │             │  chain                  │
+                        │  └─────────────┘                         │
+                        │                                          │
+                        │       ───▶ existing pprof.Frame pipeline│
+                        └──────────────────────────────────────────┘
 ```
+
+**Boundaries:**
+
+- **BPF** does sampling, FP walking, CFI rule application, hybrid decisions, and emits a flat PC chain.
+- **Userspace** parses `.eh_frame`, compiles CFI tables, watches MMAP2 events, orchestrates BPF maps, consumes PC chains, and symbolizes via blazesym (unchanged).
+
+## File layout
+
+### BPF side
+
+```
+bpf/
+  perf.bpf.c              # unchanged — existing FP-only CPU profiler
+  offcpu.bpf.c            # unchanged — existing FP-only off-CPU
+  unwind_common.h         # new — shared types, maps, inline helpers
+  perf_dwarf.bpf.c        # new — DWARF-capable CPU profiler
+  offcpu_dwarf.bpf.c      # new — DWARF-capable off-CPU
+```
+
+Userspace picks which program to load based on `--unwind`:
+
+| `--unwind` value | CPU program loaded        | Off-CPU program loaded      |
+|------------------|---------------------------|-----------------------------|
+| `fp`             | `perf.bpf.c`              | `offcpu.bpf.c`              |
+| `dwarf` / `auto` | `perf_dwarf.bpf.c`        | `offcpu_dwarf.bpf.c`        |
+
+Same-file diffs in `perf.bpf.c` / `offcpu.bpf.c` are off the table — the default path must remain byte-identical.
+
+### Userspace side (Go)
+
+```
+unwind/
+  perfreader/        # (exists, from Phase 1) — perf_event ring-buffer reader
+  fpwalker/          # (exists, from Phase 2a) — pure-Go FP walker (kept as reference / fallback)
+  ehcompile/         # new — .eh_frame → flat CFI table; classification emitter
+  ehmaps/            # new — BPF-map orchestration: load/evict tables, mmap2 tracking
+  dwarfagent/        # new — lifecycle glue: open perf_events, load BPF, consume ringbuf, wire blazesym
+```
+
+The existing `profile/`, `offcpu/`, and `pprof/` packages **do not change**. They consume `[]pprof.Frame`, and we keep producing `[]pprof.Frame`. The new code sits below that interface.
+
+## BPF map schemas
+
+All maps are created from userspace at start-up; entries added/removed lazily as processes mmap binaries.
+
+### `cfi_rules` — per build-id CFI tables
+
+- **Type:** `BPF_MAP_TYPE_HASH` of outer-handle → `BPF_MAP_TYPE_ARRAY` of entries.
+  - Outer key: `u32 table_id` (build-id hashed to 32 bits, dense-packed).
+  - Inner value per entry: 24 bytes.
+
+```c
+struct cfi_entry {
+    u64 pc_start;       // PC in binary's VA (not target VA) — lookup uses relative PC
+    u32 pc_end_delta;   // pc_end - pc_start
+    u8  cfa_reg;        // enum: RSP=0, RBP=1, ... (small set)
+    u8  flags;          // bit 0: simple rule; bit 1: has_rbp_save
+    s16 cfa_offset;     // signed 16-bit offset in bytes
+    s16 ra_offset;      // return-addr @ [CFA + ra_offset], typically -8
+    s16 rbp_offset;     // saved-rbp @ [CFA + rbp_offset], typically -16 or unused
+    u8  _pad[4];
+};
+```
+
+Sorted by `pc_start` so BPF can binary-search.
+
+### `pc_classification` — per build-id FP-safe vs FP-less ranges
+
+- **Type:** `BPF_MAP_TYPE_ARRAY` inside the same outer hash, parallel to `cfi_rules`.
+- **Entry:** `{u64 pc_start; u32 pc_end_delta; u8 mode;}` where `mode ∈ {FP_SAFE, FP_LESS, FALLBACK}`.
+
+Classification comes from the same CFI parse — if all FDEs in a range use the identity CFA rule and have frame pointers reliably, the range is FP_SAFE; otherwise FP_LESS; ranges with complex rules get FALLBACK (BPF treats as FP_SAFE with truncate-on-failure).
+
+### `pid_mappings` — PID → list of (vma_range, build_id, base)
+
+- **Type:** `BPF_MAP_TYPE_HASH` key `u32 pid` → `BPF_MAP_TYPE_ARRAY` of mapping entries.
+- **Entry:** `{u64 vma_start; u64 vma_end; u64 load_bias; u32 table_id;}`.
+
+Populated and updated on `PERF_RECORD_MMAP2` events from userspace. BPF uses this to: given a sampled PC, find `(table_id, relative_pc = PC - load_bias)` for lookup in `cfi_rules` and `pc_classification`.
+
+### `stack_events` — BPF ringbuf for PC chains
+
+- **Type:** `BPF_MAP_TYPE_RINGBUF`, 256KB default.
+- **Record:** `{u32 pid; u32 tid; u64 time_ns; u64 value; u8 mode; u8 n_pcs; u64 pcs[128];}`.
+  - `mode` indicates which walker produced the chain (for telemetry).
+  - `value` is sample count (CPU) or blocking-ns (off-CPU).
+
+Userspace consumes with `ringbuf.Reader.Read()`.
+
+## Hybrid walking algorithm (pseudocode, runs in BPF)
+
+```
+walk_stack(regs, stack_base, max_depth):
+  pcs = [regs.IP]                         # leaf first
+  pc  = regs.IP
+  bp  = regs.BP
+  sp  = regs.SP
+
+  for step in 1..max_depth:
+    cls = classify(pc)                    # FP_SAFE | FP_LESS | FALLBACK
+    if cls == FP_SAFE or cls == FALLBACK:
+      # Advance one frame using rbp chain
+      if not (stack_base <= bp and bp + 16 <= stack_base + STACK_BYTES):
+        break
+      saved_bp  = probe_read(bp)          # captured stack or bpf_probe_read_user
+      ret_addr  = probe_read(bp + 8)
+      pcs.push(ret_addr)
+      if saved_bp == 0 or saved_bp <= bp:
+        break
+      pc = ret_addr
+      bp = saved_bp
+      sp = bp + 16
+    else:                                 # FP_LESS → DWARF
+      rule = cfi_lookup(pc)               # binary search in cfi_rules table for pc's binary
+      if rule == NULL:
+        break                             # no CFI info — stop, don't extrapolate
+      cfa  = (rule.cfa_reg == RSP ? sp : bp) + rule.cfa_offset
+      ra   = probe_read(cfa + rule.ra_offset)
+      pcs.push(ra)
+      # Restore regs for next iteration
+      sp = cfa
+      if rule.flags & HAS_RBP_SAVE:
+        bp = probe_read(cfa + rule.rbp_offset)
+      pc = ra
+
+  return pcs
+```
+
+Two subtleties:
+
+- **Per-frame reclassification** — we check `classify(pc)` at the top of every iteration, not just the initial PC. This handles "user code calls libstd which calls back into user code" — when FP-safe user code's chain leads into libstd, we notice at the next step and switch to DWARF for the libstd portion.
+- **`bpf_loop()` helper** — the unwind loop is bounded via `bpf_loop()` (Linux 5.17+) rather than unrolled, so the verifier has an easier time. Kernel floor lands at 5.17 anyway because we want per-CPU maps with `BPF_MAP_TYPE_RINGBUF`.
+
+## Userspace components
+
+### `unwind/ehcompile/` — .eh_frame → CFI table
+
+Given an open ELF file:
+
+1. Parse the `.eh_frame_hdr` (small, fast — we already know how from the Option B work).
+2. Walk `.eh_frame` CIE + FDE entries. For each FDE:
+   - Simulate the DWARF CFI program to produce a sequence of `(pc, CFA rule, RA rule, RBP rule)` tuples at each CFI state transition.
+   - If the CFA rule is `reg + offset`, emit a `cfi_entry`.
+   - If the CFA rule uses `DW_CFA_expression` or `DW_CFA_val_expression`, emit a `FALLBACK` classification entry for that PC range and no `cfi_entry`.
+3. Merge adjacent entries with identical rules to minimize table size.
+4. Emit both the sorted CFI array and the classification array.
+
+Pure Go, ~800 LOC estimate. Unit-testable in isolation against known ELFs.
+
+### `unwind/ehmaps/` — BPF-map orchestration
+
+- Maintains a `build_id → table_id` map and ref-counts per PID.
+- On a new mapping in a tracked PID:
+  - If this build-id already has a table loaded, increment refcount.
+  - Otherwise, compile via `ehcompile`, allocate a `table_id`, populate the inner arrays.
+  - Add to `pid_mappings`.
+- On munmap or PID exit: decrement, free tables at zero refs.
+
+### `unwind/dwarfagent/` — lifecycle glue
+
+- Opens the `perf_event_open` FDs for sampling and for MMAP2 tracking (two separate events — samples on one, MMAP2 on a metadata event with `mmap_data=1, sample_period=0`).
+- Loads the correct BPF program per `--unwind`.
+- Spawns goroutines: one to consume the MMAP2 ring-buffer and feed `ehmaps`, one to consume the `stack_events` ring-buffer and produce `pprof.ProfileSample` values via blazesym symbolization.
+- Presents the same `SamplesCollector` interface the existing profiler uses.
+
+## Integration with the existing pipeline
+
+Zero change to `pprof/pprof.go`, `profile/profiler.go`, `offcpu/profiler.go` beyond the profiler constructor, which gets a new branch:
+
+```go
+switch cfg.UnwindMode {
+case UnwindFP, UnwindDefault:
+    return fpProfiler{...}  // existing path, unchanged
+case UnwindDWARF, UnwindAuto:
+    return dwarfProfiler{...}  // new path, implements the same interface
+}
+```
+
+Both produce `[]pprof.Frame` samples through the same collector callback. Symbolization, Frame de-duplication, inline-frame expansion (already landed), and pprof emission are unchanged.
+
+## Kernel / feature requirements
+
+- Linux **5.17+** for `bpf_loop()`, `BPF_MAP_TYPE_RINGBUF`, mature `bpf_probe_read_user()`, CO-RE.
+- `CAP_BPF + CAP_PERFMON + CAP_SYS_PTRACE` — same as today.
+- `PERF_SAMPLE_REGS_USER + PERF_SAMPLE_STACK_USER` (Linux 3.7+ — non-issue).
+- `PERF_RECORD_MMAP2` with `prot/flags` fields (Linux 4.9+ — non-issue).
+
+## Staging
+
+| Stage | Scope                                        | Rough effort |
+|-------|----------------------------------------------|--------------|
+| S1    | `unwind/ehcompile/` with unit tests          | 3-4 days     |
+| S2    | BPF: FP walker in `perf_dwarf.bpf.c` with per-frame classification | 3-4 days     |
+| S3    | BPF: DWARF walker with simple-CFA rules      | 3-4 days     |
+| S4    | `unwind/ehmaps/` + MMAP2 ingestion           | 2-3 days     |
+| S5    | `unwind/dwarfagent/` + profile/ integration  | 2-3 days     |
+| S6    | Port same pattern to `offcpu_dwarf.bpf.c`    | 2 days       |
+| S7    | System-wide (`-a`) — multi-PID map tables    | 3-4 days     |
+
+**Total: ~3-4 focused weeks.** Each stage is independently mergeable — the branch keeps working through the progression because `--unwind fp` (the default) never regresses.
+
+## Testing
+
+- **Unit tests** for `ehcompile/` — canned ELFs with known CFI, assert table contents.
+- **Unit tests** for the hybrid algorithm — synthetic (regs, stack, CFI table) inputs, known expected chain.
+- **Integration tests** against real workloads in `test/workloads/`:
+  - Go `cpu_bound` — FP-only path, both `fp` and `auto` modes must produce identical chains (Go has FPs).
+  - Rust release with `#[inline(never)] cpu_intensive_work` — FP mode truncates at libstd; `auto` mode must unwind to `cpu_intensive_work`.
+  - C++ `-O2 -fomit-frame-pointer` synthetic — new workload in `test/workloads/cpp/`.
+  - Python and Node under PYTHONPERFSUPPORT / --perf-basic-prof — no regression in perf-map decoder.
+- **Overhead budget:** DWARF profiler at 99 Hz `--pid`, per-PID-mode CPU cost ≤ 2× the FP path, measured on a CPU-bound Go workload.
+
+## Open questions (to resolve during implementation, not blocking)
+
+1. **Classification granularity.** Per-function (one entry per FDE) vs per-instruction (one entry per CFI state transition). Per-function is smaller and simpler; per-instruction is more precise for function prologues/epilogues. Start per-function; refine if we see false-negative truncations.
+2. **Table eviction policy.** Exact ref-counting works but adds complexity. For the first cut: free all of a PID's tables on PID exit; rely on build-id sharing to keep steady-state memory bounded.
+3. **BPF program size.** Close to verifier limits once both walkers are present. Mitigation: factor shared helpers into `static __always_inline` functions in `unwind_common.h` so the inlined copies dedupe cleanly.
+4. **`--unwind auto` default flip.** Ship with `auto = fp` default initially, flip to `auto = hybrid` once S5 is validated on real workloads. Keeps anyone who upgrades from regressing unintentionally.
 
 ## Success criteria
 
-1. **Rust workload with `#[inline(never)] cpu_intensive_work`**: `cpu_intensive_work` visible in the profile even when it sits below a libstd call.
-2. **C++ release build** (any reasonable sample, e.g. a `-O2 -fomit-frame-pointer` benchmark): user functions visible through at least one shared-library frame.
-3. **No regression** on Go, Python (PYTHONPERFSUPPORT), Node (--perf-basic-prof) — stacks remain at least as deep as the FP+inline path.
-4. **Overhead budget:** DWARF-unwind CPU profiler at 99 Hz, per-PID mode, adds ≤ 2× the CPU cost of the current FP path. Measure with a dedicated benchmark.
+1. Rust release build with `#[inline(never)] cpu_intensive_work` — hot function visible in the profile.
+2. Go, Python, Node regressions: none. Chains in `auto` mode at least as deep as `fp` mode.
+3. Off-CPU samples with DWARF unwind through libpthread / glibc-futex paths.
+4. Overhead: within the 2× budget.
+5. Binary size: no new runtime dependencies; libunwind removed from the build.
 
 ## Out of scope
 
-- Kernel-side DWARF (Option A). Revisit only if sample-rate scaling becomes a product requirement.
-- Off-CPU DWARF unwinding. Off-CPU stays on FP + inline expansion.
-- PMU mode. Already doesn't use stacks.
-- Windows/macOS. Not relevant.
-
-## Open questions (decide when picked up)
-
-1. **blazesym binding coverage** — Does `github.com/libbpf/blazesym/go` expose a raw-stack unwind API today? If not, either extend the Go binding upstream or call the C API via CGO. Check `libblazesym_c.a` surface — `blaze_symbolizer_*` vs. the normalize/unwind entry points.
-2. **Kernel version floor** — `PERF_SAMPLE_STACK_USER` has been available since Linux 3.7, so no concern there. But confirm the `sample_regs_user` register encoding blazesym expects matches what the kernel supplies on the target arches (amd64 first, arm64 later).
-3. **Ring-buffer backpressure** — if userspace unwinding can't keep up, do we drop samples, queue them to disk, or reduce sample rate? Prototype under synthetic load and decide.
-4. **Integration with the `Frame` type** — inline expansion already handled by `blazeSymToFrames`. The unwinder returns `[]uint64` PCs; each PC goes through `SymbolizeProcessAbsAddrs` and then `blazeSymToFrames`. No change to `Frame` needed.
-
-## Pre-work before picking this up
-
-- Benchmark the current FP-only path: samples per second per CPU, ring-buffer bytes/sec.
-- Write a synthetic workload with deliberate FP-less frames (e.g. C library built with `-fomit-frame-pointer` wrapping user code) — this becomes the regression test.
-- Verify blazesym's raw-stack unwind API is mature enough, or file an upstream issue.
+- Option A full parity with parca-agent (full DWARF expressions, VLA support).
+- Kernel-stack DWARF (kernel still uses its own callchain via `bpf_get_stackid` kernel-mode path).
+- Windows/macOS — not a Linux feature concern.
+- JIT code unwinding — covered by the perf-map decoder for Python/Node; other JITs stay out.

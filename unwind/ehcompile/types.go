@@ -1,9 +1,44 @@
 // Package ehcompile parses an ELF file's .eh_frame section and produces
 // flat tables of unwind rules suitable for loading into BPF maps.
 //
-// Arch-neutral output: the same struct shape describes unwind rules for
-// x86_64 and arm64. CFAType uses SP / FP abstractions that the interpreter
-// maps from the concrete DWARF register numbers per-arch. See arch.go.
+// Output:
+//
+//   - entries []CFIEntry: "for PC in [PCStart, PCStart+PCEndDelta),
+//     CFA = <CFAType> + CFAOffset; FP saved per FPType/FPOffset;
+//     RA saved per RAType/RAOffset."
+//   - classifications []Classification: parallel rows tagging each PC
+//     range as FP_SAFE (FP-based CFA), FP_LESS (SP-based CFA), or
+//     FALLBACK (complex expression rule — BPF falls back to FP walking).
+//
+// Architectures (auto-detected from ELF machine type):
+//
+//   - x86_64 (EM_X86_64): SP=RSP, FP=RBP, RA column=16.
+//   - arm64  (EM_AARCH64): SP=SP, FP=x29, RA column=30 (LR).
+//   - Others rejected with ErrUnsupportedArch.
+//
+// CFI dialect supported:
+//
+//   - Simple CFA rules: def_cfa / def_cfa_register / def_cfa_offset /
+//     def_cfa_offset_sf / def_cfa_sf. Only SP and FP (per-arch) produce
+//     CFIEntry rows; other registers → FALLBACK classification.
+//   - Register saves: offset / offset_extended / offset_extended_sf /
+//     restore / restore_extended / same_value / undefined / register.
+//     Only FP and RA are tracked; other register saves are ignored.
+//   - State stack: remember_state / restore_state (16 deep).
+//   - Expressions: def_cfa_expression / expression / val_expression
+//     → FALLBACK for the covered PC range, no CFIEntry.
+//   - PC advance: advance_loc (compressed), advance_loc1/2/4, set_loc.
+//   - GNU extensions: GNU_args_size (consumed, no effect).
+//   - arm64: DW_CFA_AArch64_negate_ra_state (no operand, no effect).
+//
+// Out of scope:
+//
+//   - DW_EH_PE_indirect pointer encoding.
+//   - DW_CFA_val_offset register saving.
+//   - .debug_frame (different layout from .eh_frame).
+//
+// See docs/dwarf-unwinding-design.md for the broader BPF-side architecture
+// this package feeds.
 package ehcompile
 
 // CFAType names the base register of a CFA rule.

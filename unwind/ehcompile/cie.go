@@ -102,6 +102,58 @@ func parseCIE(raw []byte, filePos uint64) (*cie, error) {
 	return c, nil
 }
 
+type fde struct {
+	cie             *cie
+	initialLocation uint64
+	addressRange    uint64
+	instructions    []byte
+}
+
+// parseFDE reads an FDE starting at raw[0]. filePos is raw[0]'s absolute
+// file offset. Caller is responsible for locating the matching CIE.
+func parseFDE(raw []byte, filePos uint64, c *cie) (*fde, error) {
+	if len(raw) < 8 {
+		return nil, errTruncated
+	}
+	length := binary.LittleEndian.Uint32(raw[:4])
+	if length == 0xFFFFFFFF || length == 0 {
+		return nil, errors.New("ehcompile: unsupported FDE length")
+	}
+	body := raw[4 : 4+length]
+	pos := 4 // skip CIE pointer (caller already resolved it)
+
+	encPos := filePos + 8 // position of initial_location in absolute terms
+	initLoc, n, err := decodeEHPointer(body[pos:], c.fdePointerEnc, encPos, 0)
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	// address_range uses the same data format as initial_location but no
+	// relativity.
+	rangeEnc := c.fdePointerEnc & 0x0f
+	addrRange, n, err := decodeEHPointer(body[pos:], rangeEnc, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	if len(c.augmentation) > 0 && c.augmentation[0] == 'z' {
+		augLen, n, err := decodeULEB128(body[pos:])
+		if err != nil {
+			return nil, err
+		}
+		pos += n + int(augLen)
+	}
+
+	return &fde{
+		cie:             c,
+		initialLocation: initLoc,
+		addressRange:    addrRange,
+		instructions:    body[pos:],
+	}, nil
+}
+
 func (c *cie) parseAugmentationData(augChars string, data []byte) error {
 	pos := 0
 	for _, ch := range augChars {

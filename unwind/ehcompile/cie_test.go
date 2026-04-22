@@ -57,3 +57,37 @@ func TestParseCIE_UnknownAugmentation(t *testing.T) {
 	_, err := parseCIE(b, 0)
 	require.Error(t, err)
 }
+
+// FDE for the sample CIE:
+//
+//	length = 0x10 (16 bytes body follow)
+//	CIE_pointer = 0x1C (backward offset from this field to CIE start)
+//	initial_location = 0x100 (sdata4 pcrel)
+//	address_range = 0x20
+//	augmentation length = 0
+//	instructions = DW_CFA_nop * 3
+func sampleFDE(ciePos uint64, fdePos uint64) []byte {
+	return []byte{
+		0x10, 0x00, 0x00, 0x00,
+		0x1c, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00,
+		0x20, 0x00, 0x00, 0x00,
+		0x00,
+		0x00, 0x00, 0x00,
+	}
+}
+
+func TestParseFDE_Basic(t *testing.T) {
+	cieRaw := sampleCIEx86()
+	c, err := parseCIE(cieRaw, 0)
+	require.NoError(t, err)
+
+	fdeRaw := sampleFDE(0, uint64(len(cieRaw)))
+	f, err := parseFDE(fdeRaw, uint64(len(cieRaw)), c)
+	require.NoError(t, err)
+
+	wantPC := uint64(len(cieRaw)) + 8 + 0x100
+	assert.Equal(t, wantPC, f.initialLocation)
+	assert.Equal(t, uint64(0x20), f.addressRange)
+	assert.NotEmpty(t, f.instructions)
+}

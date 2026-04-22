@@ -1,0 +1,171 @@
+{
+  "entries": [
+    {
+      "PCStart": 4195168,
+      "PCEndDelta": 4,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 8,
+      "FPOffset": 0,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195172,
+      "PCEndDelta": 34,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 8,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    },
+    {
+      "PCStart": 4195216,
+      "PCEndDelta": 5,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 8,
+      "FPOffset": 0,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195398,
+      "PCEndDelta": 1,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 8,
+      "FPOffset": 0,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195399,
+      "PCEndDelta": 3,
+      "CFAType": 1,
+      "FPType": 1,
+      "CFAOffset": 16,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195402,
+      "PCEndDelta": 12,
+      "CFAType": 2,
+      "FPType": 1,
+      "CFAOffset": 16,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195414,
+      "PCEndDelta": 1,
+      "CFAType": 1,
+      "FPType": 1,
+      "CFAOffset": 8,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195415,
+      "PCEndDelta": 1,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 8,
+      "FPOffset": 0,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195416,
+      "PCEndDelta": 3,
+      "CFAType": 1,
+      "FPType": 1,
+      "CFAOffset": 16,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195419,
+      "PCEndDelta": 22,
+      "CFAType": 2,
+      "FPType": 1,
+      "CFAOffset": 16,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    },
+    {
+      "PCStart": 4195441,
+      "PCEndDelta": 1,
+      "CFAType": 1,
+      "FPType": 1,
+      "CFAOffset": 8,
+      "FPOffset": -16,
+      "RAOffset": -8,
+      "RAType": 1
+    }
+  ],
+  "classifications": [
+    {
+      "PCStart": 4195168,
+      "PCEndDelta": 4,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195172,
+      "PCEndDelta": 34,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195216,
+      "PCEndDelta": 5,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195398,
+      "PCEndDelta": 1,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195399,
+      "PCEndDelta": 3,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195402,
+      "PCEndDelta": 12,
+      "Mode": 0
+    },
+    {
+      "PCStart": 4195414,
+      "PCEndDelta": 1,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195415,
+      "PCEndDelta": 1,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195416,
+      "PCEndDelta": 3,
+      "Mode": 1
+    },
+    {
+      "PCStart": 4195419,
+      "PCEndDelta": 22,
+      "Mode": 0
+    },
+    {
+      "PCStart": 4195441,
+      "PCEndDelta": 1,
+      "Mode": 1
+    }
+  ]
+}

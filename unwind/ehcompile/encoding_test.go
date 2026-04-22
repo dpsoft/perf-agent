@@ -60,3 +60,34 @@ func TestDecodeSLEB128(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeEHPointer_udata4(t *testing.T) {
+	b := []byte{0x34, 0x12, 0x00, 0x00}
+	v, n, err := decodeEHPointer(b, 0x03, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x1234), v)
+	assert.Equal(t, 4, n)
+}
+
+func TestDecodeEHPointer_sdata4_pcrel(t *testing.T) {
+	b := []byte{0xf0, 0xff, 0xff, 0xff}
+	v, n, err := decodeEHPointer(b, 0x1B, 0x1000, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x0FF0), v)
+	assert.Equal(t, 4, n)
+}
+
+func TestDecodeEHPointer_sdata4_datarel(t *testing.T) {
+	b := []byte{0x10, 0x00, 0x00, 0x00}
+	v, n, err := decodeEHPointer(b, 0x3B, 0, 0x2000)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x2010), v)
+	assert.Equal(t, 4, n)
+}
+
+func TestDecodeEHPointer_omit(t *testing.T) {
+	v, n, err := decodeEHPointer(nil, 0xff, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), v)
+	assert.Equal(t, 0, n)
+}

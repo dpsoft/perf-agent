@@ -120,3 +120,121 @@ func TestWalkEHFrame_CIEAndFDE(t *testing.T) {
 	assert.Equal(t, 1, cies)
 	assert.Equal(t, 1, fdes)
 }
+
+// --- Additional CIE / FDE / walker edge cases -----------------------------
+
+func TestParseCIE_TooShort(t *testing.T) {
+	_, err := parseCIE([]byte{0x01, 0x02}, 0)
+	require.Error(t, err)
+}
+
+func TestParseCIE_ZeroLength(t *testing.T) {
+	// length=0 is the EOF sentinel, not a valid CIE.
+	_, err := parseCIE([]byte{0x00, 0x00, 0x00, 0x00}, 0)
+	require.Error(t, err)
+}
+
+func TestParseCIE_NonZeroCIE_id(t *testing.T) {
+	// CIE_id must be 0 for .eh_frame. Corrupt byte 4 to trigger error.
+	b := sampleCIEx86()
+	b[4] = 0x01
+	_, err := parseCIE(b, 0)
+	require.Error(t, err)
+}
+
+func TestParseCIE_UnsupportedVersion(t *testing.T) {
+	b := sampleCIEx86()
+	b[8] = 0x05 // not 1 or 3
+	_, err := parseCIE(b, 0)
+	require.Error(t, err)
+}
+
+func TestParseCIE_LegacyEHAugmentation(t *testing.T) {
+	// Build a CIE with augmentation string "eh" (legacy gcc) — we reject.
+	// Start from sampleCIEx86 and rewrite the augmentation field bytes.
+	// sampleCIEx86 has "zR\0" at offset 9..11; replace with "eh\0".
+	b := sampleCIEx86()
+	b[9] = 'e'
+	b[10] = 'h'
+	// b[11] stays as 0 (null terminator)
+	_, err := parseCIE(b, 0)
+	require.Error(t, err)
+}
+
+func TestParseCIE_EmptyAugmentation(t *testing.T) {
+	// Build a minimal CIE with no augmentation. Single-byte augmentation
+	// string "" (just a null terminator), followed by code/data align
+	// and RA column, no augmentation data, just nops for initial insts.
+	//   length body = 4 (CIE_id) + 1 (version) + 1 (null aug) + 1 (codeAlign=1)
+	//                 + 1 (dataAlign=-8 sleb128 = 0x78) + 1 (raCol=16) + 3 nops
+	//                 = 12 bytes
+	b := []byte{
+		0x0c, 0x00, 0x00, 0x00, // length = 12
+		0x00, 0x00, 0x00, 0x00, // CIE_id
+		0x01,             // version
+		0x00,             // augmentation = ""
+		0x01,             // codeAlign
+		0x78,             // dataAlign = -8
+		0x10,             // raColumn = 16
+		0x00, 0x00, 0x00, // nops
+	}
+	c, err := parseCIE(b, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "", c.augmentation)
+	assert.Len(t, c.initialInstructions, 3)
+}
+
+func TestWalkEHFrame_EmptyBuffer(t *testing.T) {
+	// Zero-byte section is trivially valid (immediate EOF).
+	err := walkEHFrame(nil, 0, func(off uint64, c *cie, f *fde) error {
+		t.Errorf("callback invoked on empty buffer")
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func TestWalkEHFrame_ZeroSentinel(t *testing.T) {
+	// Length=0 record terminates the section. Nothing parsed.
+	section := []byte{0x00, 0x00, 0x00, 0x00}
+	var called bool
+	err := walkEHFrame(section, 0, func(off uint64, c *cie, f *fde) error {
+		called = true
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, called)
+}
+
+func TestWalkEHFrame_Truncated(t *testing.T) {
+	// Record claims 0x10 bytes but buffer is only 8.
+	section := []byte{0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	err := walkEHFrame(section, 0, func(off uint64, c *cie, f *fde) error { return nil })
+	require.Error(t, err)
+}
+
+// --- CIE/FDE parse benchmarks ---------------------------------------------
+
+func BenchmarkParseCIE(b *testing.B) {
+	raw := sampleCIEx86()
+	for b.Loop() {
+		_, _ = parseCIE(raw, 0)
+	}
+}
+
+func BenchmarkParseFDE(b *testing.B) {
+	cieRaw := sampleCIEx86()
+	c, _ := parseCIE(cieRaw, 0)
+	fdeRaw := sampleFDE(0, uint64(len(cieRaw)))
+	for b.Loop() {
+		_, _ = parseFDE(fdeRaw, uint64(len(cieRaw)), c)
+	}
+}
+
+func BenchmarkWalkEHFrame(b *testing.B) {
+	cieRaw := sampleCIEx86()
+	fdeRaw := sampleFDE(0, uint64(len(cieRaw)))
+	section := append(append([]byte{}, cieRaw...), fdeRaw...)
+	for b.Loop() {
+		_ = walkEHFrame(section, 0, func(off uint64, c *cie, f *fde) error { return nil })
+	}
+}

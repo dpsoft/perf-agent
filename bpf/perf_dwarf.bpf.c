@@ -27,8 +27,7 @@
 // (user_pt_regs) that isn't in our x86-dumped vmlinux.h. Arm64 BPF support
 // lands in a later stage with its own vmlinux and a separate source file.
 
-// System-wide mode toggle set by userspace at load time (const volatile so
-// the verifier dead-code-eliminates the wrong branch).
+// System-wide mode toggle set by userspace at load time.
 const volatile bool system_wide = false;
 
 SEC("perf_event")

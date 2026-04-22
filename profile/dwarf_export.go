@@ -5,6 +5,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
 // PerfDwarfForTest is a thin wrapper around the generated perf_dwarf
@@ -20,17 +21,26 @@ type PerfDwarfForTest struct {
 // must Close(). The program isn't attached to any perf event yet — the
 // caller opens perf_event_open fds and attaches separately.
 func LoadPerfDwarfForTest() (*PerfDwarfForTest, error) {
-	_ = rlimit.RemoveMemlock() // best-effort; modern kernels don't require it
+	// Match perfagent/agent.go's Start() ordering: promote caps to the
+	// effective set, then raise RLIMIT_MEMLOCK via CAP_SYS_ADMIN, then
+	// load the BPF program. Without RemoveMemlock the BPF_MAP_CREATE
+	// syscall hits EPERM under lockdown-integrity + an 8 MB default
+	// memlock limit (the library's error message mis-attributes this
+	// as "operation not permitted" since the syscall returns EPERM
+	// rather than ENOMEM).
+	caps := cap.GetProc()
+	if err := caps.SetFlag(cap.Effective, true,
+		cap.SYS_ADMIN, cap.BPF, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE); err != nil {
+		return nil, fmt.Errorf("set capabilities: %w", err)
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("remove memlock: %w", err)
+	}
 
 	spec, err := loadPerf_dwarf()
 	if err != nil {
 		return nil, fmt.Errorf("load perf_dwarf spec: %w", err)
 	}
-	// system_wide must be set on the spec before LoadAndAssign so the
-	// verifier sees the final const-volatile value. We pick targeted mode
-	// (false) by default; the caller can still override via SetSystemWide
-	// before calling this helper… actually, we force-set here because
-	// the object isn't loaded yet at call time.
 	if err := spec.Variables["system_wide"].Set(false); err != nil {
 		return nil, fmt.Errorf("set system_wide: %w", err)
 	}

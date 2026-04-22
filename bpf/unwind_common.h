@@ -22,8 +22,9 @@
 // BPF_MAP_TYPE_STACK_TRACE convention; deeper stacks truncate.
 #define MAX_FRAMES 127
 
-// RINGBUF_BYTES: size of the stack_events ringbuf. 256 KB absorbs typical
-// bursts at 99 Hz × 16 CPUs without loss.
+// RINGBUF_BYTES: size of the stack_events ringbuf. Must be a power of two
+// and >= PAGE_SIZE. 256 KB absorbs bursts at 99 Hz × 16 CPUs; higher
+// sample rates want bigger.
 #define RINGBUF_BYTES (256 * 1024)
 
 #define PF_KTHREAD 0x00200000

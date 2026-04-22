@@ -17,15 +17,20 @@
 //
 // See docs/dwarf-unwinding-design.md.
 
+#if defined(__TARGET_ARCH_arm64)
+#include "vmlinux_arm64.h"
+#else
 #include "vmlinux.h"
+#endif
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 #include "unwind_common.h"
 
-// x86_64-only for S2. We access pt_regs fields directly (ip/bp/sp); arm64
-// uses different field names (pc/regs[29]/sp) and a different struct type
-// (user_pt_regs) that isn't in our x86-dumped vmlinux.h. Arm64 BPF support
-// lands in a later stage with its own vmlinux and a separate source file.
+// Register access uses the PT_REGS_* macros from bpf_tracing.h, which expand
+// to the right fields per arch: ip/bp/sp on x86_64, pc/regs[29]/sp on arm64.
+// The vmlinux header include above is gated on bpf2go's __TARGET_ARCH_* define
+// so each build sees the correct bpf_user_pt_regs_t typedef.
 
 // System-wide mode toggle set by userspace at load time.
 const volatile bool system_wide = false;
@@ -52,10 +57,11 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     struct sample_record *rec = bpf_map_lookup_elem(&walker_scratch, &zero);
     if (!rec) return 0;
 
-    // User registers. x86_64-only; see comment atop this file.
-    __u64 ip = ctx->regs.ip;
-    __u64 fp = ctx->regs.bp;
-    __u64 sp = ctx->regs.sp;
+    // User registers. PT_REGS_* macros handle the arch-specific field names;
+    // &ctx->regs points at bpf_user_pt_regs_t, which the macros cast and read.
+    __u64 ip = (__u64)PT_REGS_IP(&ctx->regs);
+    __u64 fp = (__u64)PT_REGS_FP(&ctx->regs);
+    __u64 sp = (__u64)PT_REGS_SP(&ctx->regs);
 
     struct walk_ctx walker = {
         .pc    = ip,

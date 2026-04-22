@@ -15,7 +15,12 @@
 #ifndef PERF_AGENT_UNWIND_COMMON_H
 #define PERF_AGENT_UNWIND_COMMON_H
 
+// Callers should include the arch-specific vmlinux header (vmlinux.h on x86,
+// vmlinux_arm64.h on arm64) BEFORE including this file. We guard on
+// __VMLINUX_H__ so the two headers don't both get pulled in accidentally.
+#ifndef __VMLINUX_H__
 #include "vmlinux.h"
+#endif
 #include <bpf/bpf_helpers.h>
 
 // MAX_FRAMES: the unwind walker's per-sample loop bound. Matches the

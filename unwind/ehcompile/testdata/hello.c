@@ -1,7 +1,7 @@
 // Fixture for ehcompile snapshot tests. Deliberately simple — one main
 // that calls a leaf function — so the resulting .eh_frame is small and
-// the golden file stays readable.
-#include <stdio.h>
+// the golden file stays readable. No stdio so arm64 cross-compile works
+// without libc-headers.
 
 __attribute__((noinline))
 int leaf(int x) {

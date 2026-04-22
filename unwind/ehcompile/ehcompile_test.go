@@ -66,3 +66,11 @@ func TestCompile_SystemBinary(t *testing.T) {
 func TestCompile_GoldenFile_x86(t *testing.T) {
 	runGolden(t, "testdata/hello", "testdata/hello.golden")
 }
+
+func TestCompile_GoldenFile_arm64(t *testing.T) {
+	// hello_arm64.o is a relocatable object file (not a linked binary) —
+	// we can build it without arm64 libc headers. PCs are placeholders
+	// until link time, so the snapshot captures the CFI structure, not
+	// absolute addresses.
+	runGolden(t, "testdata/hello_arm64.o", "testdata/hello_arm64.golden")
+}

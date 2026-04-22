@@ -31,6 +31,11 @@ const (
 	cfaValOffsetSF      = 0x15
 	cfaValExpression    = 0x16
 
+	// 0x2d = DW_CFA_AArch64_negate_ra_state (aka DW_CFA_GNU_window_save
+	// on SPARC). Takes no operand. On arm64 it toggles a PAC-signed-RA
+	// state bit; we don't track that, so the opcode is a no-op for our
+	// purposes. Real arm64 binaries emit it in most FDEs.
+	cfaAArch64NegateRAState      = 0x2d
 	cfaGnuArgsSize               = 0x2e
 	cfaGnuNegativeOffsetExtended = 0x2f
 

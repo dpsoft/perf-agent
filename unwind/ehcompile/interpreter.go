@@ -294,6 +294,9 @@ func (s *interpreter) run(startPC, endPC uint64, program []byte) error {
 				return errors.New("ehcompile: set_loc moves backward")
 			}
 			s.snapshotAndAdvance(newPC - s.pc)
+		case cfaAArch64NegateRAState:
+			// No operand. Toggles PAC-signed-RA state on arm64; we don't
+			// track that. No-op for CFA/FP/RA tracking.
 		case cfaGnuArgsSize:
 			_, n, err := decodeULEB128(program[pos:])
 			if err != nil {

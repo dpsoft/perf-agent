@@ -1,6 +1,7 @@
 package ehcompile
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,20 +62,28 @@ func TestParseCIE_UnknownAugmentation(t *testing.T) {
 // FDE for the sample CIE:
 //
 //	length = 0x10 (16 bytes body follow)
-//	CIE_pointer = 0x1C (backward offset from this field to CIE start)
+//	CIE_pointer = backward offset from CIE_pointer field to CIE record start
 //	initial_location = 0x100 (sdata4 pcrel)
 //	address_range = 0x20
 //	augmentation length = 0
 //	instructions = DW_CFA_nop * 3
 func sampleFDE(ciePos uint64, fdePos uint64) []byte {
-	return []byte{
-		0x10, 0x00, 0x00, 0x00,
-		0x1c, 0x00, 0x00, 0x00,
-		0x00, 0x01, 0x00, 0x00,
-		0x20, 0x00, 0x00, 0x00,
-		0x00,
-		0x00, 0x00, 0x00,
-	}
+	// CIE_pointer field is at fdePos+4; value = distance back to CIE record start.
+	ciePtrFieldPos := fdePos + 4
+	ciePtr := uint32(ciePtrFieldPos - ciePos)
+	b := make([]byte, 20)
+	binary.LittleEndian.PutUint32(b[0:], 0x10)
+	binary.LittleEndian.PutUint32(b[4:], ciePtr)
+	// initial_location: 0x100 (sdata4 pcrel, little-endian)
+	binary.LittleEndian.PutUint32(b[8:], 0x100)
+	// address_range: 0x20
+	binary.LittleEndian.PutUint32(b[12:], 0x20)
+	// augmentation length = 0, three DW_CFA_nop bytes
+	b[16] = 0x00
+	b[17] = 0x00
+	b[18] = 0x00
+	b[19] = 0x00
+	return b
 }
 
 func TestParseFDE_Basic(t *testing.T) {
@@ -90,4 +99,24 @@ func TestParseFDE_Basic(t *testing.T) {
 	assert.Equal(t, wantPC, f.initialLocation)
 	assert.Equal(t, uint64(0x20), f.addressRange)
 	assert.NotEmpty(t, f.instructions)
+}
+
+func TestWalkEHFrame_CIEAndFDE(t *testing.T) {
+	cieRaw := sampleCIEx86()
+	fdeRaw := sampleFDE(0, uint64(len(cieRaw)))
+	section := append(append([]byte{}, cieRaw...), fdeRaw...)
+
+	var cies, fdes int
+	err := walkEHFrame(section, 0, func(off uint64, c *cie, f *fde) error {
+		if c != nil {
+			cies++
+		}
+		if f != nil {
+			fdes++
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, cies)
+	assert.Equal(t, 1, fdes)
 }

@@ -154,6 +154,56 @@ func parseFDE(raw []byte, filePos uint64, c *cie) (*fde, error) {
 	}, nil
 }
 
+// walkEHFrame iterates CIE/FDE records in an .eh_frame section.
+// sectionPos is section[0]'s absolute file offset. The callback receives
+// exactly one of (c, f) non-nil per invocation; c is passed BEFORE any
+// of its FDEs.
+func walkEHFrame(section []byte, sectionPos uint64, cb func(off uint64, c *cie, f *fde) error) error {
+	cies := make(map[uint64]*cie)
+
+	var pos uint64
+	for int(pos)+4 <= len(section) {
+		length := binary.LittleEndian.Uint32(section[pos : pos+4])
+		if length == 0 {
+			return nil // EOF sentinel
+		}
+		if length == 0xFFFFFFFF {
+			return errors.New("ehcompile: 64-bit .eh_frame not supported")
+		}
+		recordEnd := pos + 4 + uint64(length)
+		if recordEnd > uint64(len(section)) {
+			return errTruncated
+		}
+		secondWord := binary.LittleEndian.Uint32(section[pos+4 : pos+8])
+
+		if secondWord == 0 {
+			c, err := parseCIE(section[pos:recordEnd], sectionPos+pos)
+			if err != nil {
+				return fmt.Errorf("CIE at +%#x: %w", pos, err)
+			}
+			cies[pos] = c
+			if err := cb(pos, c, nil); err != nil {
+				return err
+			}
+		} else {
+			cieOff := pos + 4 - uint64(secondWord)
+			c, ok := cies[cieOff]
+			if !ok {
+				return fmt.Errorf("FDE at +%#x references unknown CIE at +%#x", pos, cieOff)
+			}
+			f, err := parseFDE(section[pos:recordEnd], sectionPos+pos, c)
+			if err != nil {
+				return fmt.Errorf("FDE at +%#x: %w", pos, err)
+			}
+			if err := cb(pos, nil, f); err != nil {
+				return err
+			}
+		}
+		pos = recordEnd
+	}
+	return nil
+}
+
 func (c *cie) parseAugmentationData(augChars string, data []byte) error {
 	pos := 0
 	for _, ch := range augChars {

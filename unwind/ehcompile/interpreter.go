@@ -125,6 +125,57 @@ func (s *interpreter) run(startPC, endPC uint64, program []byte) error {
 			delta := uint64(binary.LittleEndian.Uint32(program[pos:])) * s.cie.codeAlign
 			pos += 4
 			s.snapshotAndAdvance(delta)
+		case cfaDefCFA:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			off, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setCFA(uint8(reg), int64(off))
+		case cfaDefCFASF:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			off, n, err := decodeSLEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setCFA(uint8(reg), off*s.cie.dataAlign)
+		case cfaDefCFARegister:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setCFAReg(uint8(reg))
+		case cfaDefCFAOffset:
+			off, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.cfaOffset = int64(off)
+			if s.cfaType != CFATypeUndefined {
+				s.cfaRule = ruleSameValue
+			}
+		case cfaDefCFAOffsetSF:
+			off, n, err := decodeSLEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.cfaOffset = off * s.cie.dataAlign
+			if s.cfaType != CFATypeUndefined {
+				s.cfaRule = ruleSameValue
+			}
 		default:
 			return fmt.Errorf("ehcompile: unhandled opcode 0x%02x at pos %d", op, pos-1)
 		}
@@ -138,7 +189,8 @@ func (s *interpreter) snapshotAndAdvance(delta uint64) {
 	s.pc += delta
 }
 
-// snapshot is filled in by later tasks; skeleton just tracks lastEmittedPC.
+// snapshot emits a row covering [lastEmittedPC, newPC) with the current
+// state. Adjacent rows with identical rules are coalesced.
 func (s *interpreter) snapshot(newPC uint64) {
 	if newPC <= s.lastEmittedPC {
 		return
@@ -147,5 +199,96 @@ func (s *interpreter) snapshot(newPC uint64) {
 		s.lastEmittedPC = newPC
 		return
 	}
+
+	cur := emittedState{
+		cfaType:   s.cfaType,
+		cfaOffset: s.cfaOffset,
+		cfaRule:   s.cfaRule,
+		fpRule:    s.fpRule,
+		raRule:    s.raRule,
+	}
+	delta := uint32(newPC - s.lastEmittedPC)
+
+	// Coalesce: if the last emitted row matches current state, extend it.
+	if s.cfaRule != ruleExpression && len(s.entries) > 0 && cur == s.lastState {
+		s.entries[len(s.entries)-1].PCEndDelta += delta
+		s.classifications[len(s.classifications)-1].PCEndDelta += delta
+		s.lastEmittedPC = newPC
+		return
+	}
+	if s.cfaRule == ruleExpression && len(s.classifications) > 0 && cur == s.lastState {
+		s.classifications[len(s.classifications)-1].PCEndDelta += delta
+		s.lastEmittedPC = newPC
+		return
+	}
+
+	if s.cfaRule == ruleExpression {
+		s.classifications = append(s.classifications, Classification{
+			PCStart:    s.lastEmittedPC,
+			PCEndDelta: delta,
+			Mode:       ModeFallback,
+		})
+	} else {
+		s.entries = append(s.entries, CFIEntry{
+			PCStart:    s.lastEmittedPC,
+			PCEndDelta: delta,
+			CFAType:    s.cfaType,
+			FPType:     fpRuleToType(s.fpRule),
+			CFAOffset:  int16(s.cfaOffset),
+			FPOffset:   int16(s.fpRule.offset),
+			RAType:     raRuleToType(s.raRule),
+			RAOffset:   int16(s.raRule.offset),
+		})
+		mode := ModeFPLess
+		if s.cfaType == CFATypeFP {
+			mode = ModeFPSafe
+		}
+		s.classifications = append(s.classifications, Classification{
+			PCStart:    s.lastEmittedPC,
+			PCEndDelta: delta,
+			Mode:       mode,
+		})
+	}
+	s.lastState = cur
 	s.lastEmittedPC = newPC
+}
+
+func (s *interpreter) setCFA(reg uint8, off int64) {
+	s.setCFAReg(reg)
+	s.cfaOffset = off
+}
+
+func (s *interpreter) setCFAReg(reg uint8) {
+	s.cfaType = s.arch.cfaTypeFor(reg)
+	if s.cfaType == CFATypeUndefined {
+		s.cfaRule = ruleExpression // arch register we can't express
+	} else {
+		s.cfaRule = ruleSameValue
+	}
+}
+
+func fpRuleToType(r regRule) FPType {
+	switch r.kind {
+	case ruleOffset:
+		return FPTypeOffsetCFA
+	case ruleSameValue:
+		return FPTypeSameValue
+	case ruleRegister:
+		return FPTypeRegister
+	default:
+		return FPTypeUndefined
+	}
+}
+
+func raRuleToType(r regRule) RAType {
+	switch r.kind {
+	case ruleOffset:
+		return RATypeOffsetCFA
+	case ruleSameValue:
+		return RATypeSameValue
+	case ruleRegister:
+		return RATypeRegister
+	default:
+		return RATypeUndefined
+	}
 }

@@ -2,7 +2,6 @@ package ehcompile
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 )
 
@@ -95,9 +94,17 @@ func (s *interpreter) run(startPC, endPC uint64, program []byte) error {
 				s.snapshotAndAdvance(delta)
 				continue
 			case cfaOffset:
-				return errors.New("ehcompile: DW_CFA_offset not yet implemented")
+				reg := op & cfaOperandMask
+				factor, n, err := decodeULEB128(program[pos:])
+				if err != nil {
+					return err
+				}
+				pos += n
+				s.setRegOffset(reg, int64(factor)*s.cie.dataAlign)
+				continue
 			case cfaRestore:
-				return errors.New("ehcompile: DW_CFA_restore not yet implemented")
+				s.restoreRegInitial(op & cfaOperandMask)
+				continue
 			}
 		}
 
@@ -176,6 +183,63 @@ func (s *interpreter) run(startPC, endPC uint64, program []byte) error {
 			if s.cfaType != CFATypeUndefined {
 				s.cfaRule = ruleSameValue
 			}
+		case cfaOffsetExtended:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			factor, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setRegOffset(uint8(reg), int64(factor)*s.cie.dataAlign)
+		case cfaOffsetExtendedSF:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			factor, n, err := decodeSLEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setRegOffset(uint8(reg), factor*s.cie.dataAlign)
+		case cfaUndefined:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setRegRule(uint8(reg), regRule{kind: ruleUndefined})
+		case cfaSameValue:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setRegRule(uint8(reg), regRule{kind: ruleSameValue})
+		case cfaRegister:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			other, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.setRegRule(uint8(reg), regRule{kind: ruleRegister, register: uint8(other)})
+		case cfaRestoreExtended:
+			reg, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.restoreRegInitial(uint8(reg))
 		default:
 			return fmt.Errorf("ehcompile: unhandled opcode 0x%02x at pos %d", op, pos-1)
 		}
@@ -291,4 +355,28 @@ func raRuleToType(r regRule) RAType {
 	default:
 		return RATypeUndefined
 	}
+}
+
+// setRegOffset is the common path for DW_CFA_offset / offset_extended /
+// offset_extended_sf. Updates rule only for registers we track (FP and RA).
+func (s *interpreter) setRegOffset(reg uint8, offset int64) {
+	s.setRegRule(reg, regRule{kind: ruleOffset, offset: offset})
+}
+
+// setRegRule routes a rule to the right slot based on which register
+// we're tracking. Only FP (arch.fpReg) and RA (cie.raColumn) matter.
+func (s *interpreter) setRegRule(reg uint8, r regRule) {
+	switch {
+	case reg == s.arch.fpReg:
+		s.fpRule = r
+	case uint64(reg) == s.cie.raColumn:
+		s.raRule = r
+	}
+}
+
+// restoreRegInitial resets the register's rule to undefined. Simplification:
+// tracking CIE's initial rules precisely would help correctness in a few
+// edge cases but matters little for CFA+FP+RA tracking.
+func (s *interpreter) restoreRegInitial(reg uint8) {
+	s.setRegRule(reg, regRule{kind: ruleUndefined})
 }

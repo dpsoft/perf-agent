@@ -27,7 +27,7 @@ This spec chooses **Option A**: perform DWARF unwinding inside the BPF program, 
 - **JIT / dynamic code.** No tracking of Python perf-maps, Node JIT regions, or similar — those already work via the perf-map decoder landed on `feat/pprof-frame-refactor`.
 - **Always-on / high-sample-rate system-wide profiling.** We ship `--pid` first (sequencing A), then `-a` as a follow-up.
 
-**We do keep all current features.** Every mode that works on `main` today (`--profile`, `--offcpu`, `--pmu`, `--pid`, `-a`) continues to work. DWARF is additive; it activates via `--unwind dwarf` or the default `--unwind auto`. The existing `--unwind fp` path stays byte-for-byte identical.
+**We do keep all current features.** Every mode that works on `main` today (`--profile`, `--offcpu`, `--pmu`, `--pid`, `-a`) continues to work. DWARF is additive; it activates via `--unwind dwarf`. The existing `--unwind fp` path stays byte-for-byte identical at the BPF layer; the Go call path gains one new switch arm in the profiler constructor. `--unwind auto`'s default routing is a staging decision covered in the Staging section below.
 
 ## Architecture
 
@@ -52,7 +52,7 @@ This spec chooses **Option A**: perform DWARF unwinding inside the BPF program, 
                                        │
                          BPF ringbuf   │ BPF maps (CFI tables,
                                        │   classification, per-PID
-                                       │   mappings, counts)
+                                       │   mappings)
                                        ▼
                         ┌──────────────────────────────────────────┐
                         │   userspace (Go)                         │
@@ -94,14 +94,26 @@ bpf/
   offcpu_dwarf.bpf.c      # new — DWARF-capable off-CPU
 ```
 
-Userspace picks which program to load based on `--unwind`:
+Each BPF program has one job:
 
-| `--unwind` value | CPU program loaded        | Off-CPU program loaded      |
-|------------------|---------------------------|-----------------------------|
-| `fp`             | `perf.bpf.c`              | `offcpu.bpf.c`              |
-| `dwarf` / `auto` | `perf_dwarf.bpf.c`        | `offcpu_dwarf.bpf.c`        |
+| Program              | Behavior                                      |
+|----------------------|-----------------------------------------------|
+| `perf.bpf.c`         | FP-only CPU sampling (unchanged from today)   |
+| `offcpu.bpf.c`       | FP-only off-CPU (unchanged from today)        |
+| `perf_dwarf.bpf.c`   | Hybrid FP+DWARF CPU sampling                  |
+| `offcpu_dwarf.bpf.c` | Hybrid FP+DWARF off-CPU                       |
 
-Same-file diffs in `perf.bpf.c` / `offcpu.bpf.c` are off the table — the default path must remain byte-identical.
+Userspace routes each `--unwind` value to one of these at load time. The `auto` default routing changes across stages:
+
+| `--unwind` value | Stages S1–S5 (initial) | After S5 validation |
+|------------------|------------------------|---------------------|
+| `fp`             | `perf.bpf.c` / `offcpu.bpf.c`       | same                           |
+| `dwarf`          | `perf_dwarf.bpf.c` / `offcpu_dwarf.bpf.c` | same                |
+| `auto`           | routes to `fp` programs             | routes to `dwarf` programs     |
+
+This means anyone who upgrades during S1–S5 sees no behavior change until they opt in via `--unwind dwarf`. After the flip, `auto` becomes the sensible default.
+
+Same-file diffs in `perf.bpf.c` / `offcpu.bpf.c` are off the table — the default path must remain byte-identical at the BPF layer.
 
 ### Userspace side (Go)
 
@@ -123,7 +135,7 @@ All maps are created from userspace at start-up; entries added/removed lazily as
 ### `cfi_rules` — per build-id CFI tables
 
 - **Type:** `BPF_MAP_TYPE_HASH` of outer-handle → `BPF_MAP_TYPE_ARRAY` of entries.
-  - Outer key: `u32 table_id` (build-id hashed to 32 bits, dense-packed).
+  - Outer key: `u64 table_id` (FNV-1a of the 20-byte build-id). 64-bit hash to push the birthday-collision threshold well out of practical range.
   - Inner value per entry: 24 bytes.
 
 ```c
@@ -146,23 +158,29 @@ Sorted by `pc_start` so BPF can binary-search.
 - **Type:** `BPF_MAP_TYPE_ARRAY` inside the same outer hash, parallel to `cfi_rules`.
 - **Entry:** `{u64 pc_start; u32 pc_end_delta; u8 mode;}` where `mode ∈ {FP_SAFE, FP_LESS, FALLBACK}`.
 
-Classification comes from the same CFI parse — if all FDEs in a range use the identity CFA rule and have frame pointers reliably, the range is FP_SAFE; otherwise FP_LESS; ranges with complex rules get FALLBACK (BPF treats as FP_SAFE with truncate-on-failure).
+Classification comes from the same CFI parse — if all FDEs in a range use the identity CFA rule and have frame pointers reliably, the range is FP_SAFE; otherwise FP_LESS; ranges with complex rules (DW_CFA_expression etc.) get FALLBACK.
+
+At runtime, **FALLBACK behaves exactly like FP_SAFE** — BPF tries the FP walk and accepts whatever it produces (truncating naturally if FP fails). The distinction is telemetry-only: we count FALLBACK hits separately so we can quantify the "long tail" of code the DWARF walker deliberately skipped.
 
 ### `pid_mappings` — PID → list of (vma_range, build_id, base)
 
 - **Type:** `BPF_MAP_TYPE_HASH` key `u32 pid` → `BPF_MAP_TYPE_ARRAY` of mapping entries.
-- **Entry:** `{u64 vma_start; u64 vma_end; u64 load_bias; u32 table_id;}`.
+- **Entry:** `{u64 vma_start; u64 vma_end; u64 load_bias; u64 table_id;}`.
 
 Populated and updated on `PERF_RECORD_MMAP2` events from userspace. BPF uses this to: given a sampled PC, find `(table_id, relative_pc = PC - load_bias)` for lookup in `cfi_rules` and `pc_classification`.
 
 ### `stack_events` — BPF ringbuf for PC chains
 
 - **Type:** `BPF_MAP_TYPE_RINGBUF`, 256KB default.
-- **Record:** `{u32 pid; u32 tid; u64 time_ns; u64 value; u8 mode; u8 n_pcs; u64 pcs[128];}`.
-  - `mode` indicates which walker produced the chain (for telemetry).
+- **Record — variable length:** fixed 32-byte header `{u32 pid; u32 tid; u64 time_ns; u64 value; u8 mode; u8 n_pcs; u8 walker_flags; u8 _pad;}` followed by `n_pcs × u64` PC entries. Typical stack is <30 frames → ~270 bytes vs 1056 bytes for a fixed-128-slot layout.
+  - `mode` indicates which walker produced each PC (FP vs DWARF, optionally per-frame if worth tracking).
   - `value` is sample count (CPU) or blocking-ns (off-CPU).
 
+The existing `counts` map and `stackmap` (STACK_TRACE) used by `perf.bpf.c` are **not** shared with the DWARF programs. Their lifecycles stay independent — the FP-only programs keep aggregating in `counts` as today, the DWARF programs emit per-sample via ringbuf.
+
 Userspace consumes with `ringbuf.Reader.Read()`.
+
+**No `counts` map in the DWARF programs.** Unlike the existing `perf.bpf.c` (which aggregates same-stack samples in a BPF hash map and batch-reads from userspace), the DWARF programs emit every sample's PC chain individually through the ringbuf. Userspace aggregates after symbolization. This costs more ringbuf bandwidth but keeps the BPF program smaller and simpler, and the per-sample bandwidth (few hundred bytes — see variable-length record below) is well within budget at 99 Hz.
 
 ## Hybrid walking algorithm (pseudocode, runs in BPF)
 
@@ -257,34 +275,35 @@ Both produce `[]pprof.Frame` samples through the same collector callback. Symbol
 
 ## Kernel / feature requirements
 
-- Linux **5.17+** for `bpf_loop()`, `BPF_MAP_TYPE_RINGBUF`, mature `bpf_probe_read_user()`, CO-RE.
+- **Linux 6.0+.** All BPF features we use (`bpf_loop()`, `BPF_MAP_TYPE_RINGBUF`, `bpf_probe_read_user()`, CO-RE, `PERF_SAMPLE_REGS_USER`/`STACK_USER`, `PERF_RECORD_MMAP2`) are mature well before 6.0. Picking 6.x as the floor keeps the compatibility matrix simple and matches the kernels on realistic production targets.
 - `CAP_BPF + CAP_PERFMON + CAP_SYS_PTRACE` — same as today.
-- `PERF_SAMPLE_REGS_USER + PERF_SAMPLE_STACK_USER` (Linux 3.7+ — non-issue).
-- `PERF_RECORD_MMAP2` with `prot/flags` fields (Linux 4.9+ — non-issue).
 
 ## Staging
 
-| Stage | Scope                                        | Rough effort |
-|-------|----------------------------------------------|--------------|
-| S1    | `unwind/ehcompile/` with unit tests          | 3-4 days     |
-| S2    | BPF: FP walker in `perf_dwarf.bpf.c` with per-frame classification | 3-4 days     |
-| S3    | BPF: DWARF walker with simple-CFA rules      | 3-4 days     |
-| S4    | `unwind/ehmaps/` + MMAP2 ingestion           | 2-3 days     |
-| S5    | `unwind/dwarfagent/` + profile/ integration  | 2-3 days     |
-| S6    | Port same pattern to `offcpu_dwarf.bpf.c`    | 2 days       |
-| S7    | System-wide (`-a`) — multi-PID map tables    | 3-4 days     |
+Each stage is independently mergeable. `--unwind fp` (default during S1–S5) never regresses, so the branch stays usable throughout.
 
-**Total: ~3-4 focused weeks.** Each stage is independently mergeable — the branch keeps working through the progression because `--unwind fp` (the default) never regresses.
+| Stage | Scope                                                      | Effort  | Exit criteria                                                                                  |
+|-------|------------------------------------------------------------|---------|------------------------------------------------------------------------------------------------|
+| S1    | `unwind/ehcompile/` with unit tests                        | 3-4d    | Given a test ELF, compiler emits CFI + classification tables matching a hand-verified fixture. Pure Go; no BPF yet. |
+| S2    | BPF: FP walker in `perf_dwarf.bpf.c` with per-frame classification lookup | 3-4d    | Loaded program runs on Go `cpu_bound` workload, emits PC chains to ringbuf identical to `fpwalker` output. DWARF path not yet active — classification always returns FP_SAFE. |
+| S3    | BPF: DWARF walker with simple-CFA rules                    | 3-4d    | On Rust workload with `#[inline(never)] cpu_intensive_work`, FP-less frames now resolve. Chain depth strictly ≥ FP path on same workload. |
+| S4    | `unwind/ehmaps/` + MMAP2 ingestion                         | 2-3d    | New `.so` loaded at runtime (via `dlopen`-style test) produces correct unwinds without restart. PID exit cleans up maps. |
+| S5    | `unwind/dwarfagent/` + `profile/` integration              | 2-3d    | End user runs `perf-agent --pid N --unwind dwarf` and gets a pprof profile. `--unwind auto` still routes to FP programs at this stage. |
+| S6    | `offcpu_dwarf.bpf.c` — off-CPU variant                     | 2-3d    | Entry path differs: tracepoint on `sched_switch` rather than perf_event; regs via `bpf_task_pt_regs(task)`, stack via explicit `bpf_probe_read_user()` from `task->thread.sp`. Walker and classification logic reused from common.h unchanged. End state: `--unwind dwarf --offcpu` produces deep stacks through libpthread/glibc-futex. |
+| S7    | System-wide (`-a`) — multi-PID map management              | 3-4d    | `perf-agent -a --unwind dwarf` correctly tracks mmaps across all processes. Build-id sharing keeps memory bounded. |
+| S8    | Flip `--unwind auto` default to DWARF-routed programs      | <1d     | CLI default change + release notes. Gated on real-workload validation from S5–S7. |
+
+**Total: ~3-4 focused weeks.**
 
 ## Testing
 
-- **Unit tests** for `ehcompile/` — canned ELFs with known CFI, assert table contents.
-- **Unit tests** for the hybrid algorithm — synthetic (regs, stack, CFI table) inputs, known expected chain.
+- **Unit tests** for `ehcompile/` — canned ELFs with known CFI, assert table contents byte-for-byte against a fixture.
+- **Unit tests for the hybrid algorithm — via a Go mirror.** The walker runs in BPF, which is hard to unit-test directly. Strategy: port the walker to Go (as a sibling of `fpwalker`), unit-test the Go version against synthetic `(regs, stack, CFI table)` inputs, and fuzz-compare BPF vs Go outputs on captured real samples. The Go mirror also serves as executable documentation of the algorithm.
 - **Integration tests** against real workloads in `test/workloads/`:
-  - Go `cpu_bound` — FP-only path, both `fp` and `auto` modes must produce identical chains (Go has FPs).
-  - Rust release with `#[inline(never)] cpu_intensive_work` — FP mode truncates at libstd; `auto` mode must unwind to `cpu_intensive_work`.
+  - Go `cpu_bound` — FP-only path; `fp`, `dwarf`, and (post-S8) `auto` modes must produce identical chains since Go has frame pointers.
+  - Rust release with `#[inline(never)] cpu_intensive_work` — FP mode truncates at libstd; `dwarf` mode must unwind to `cpu_intensive_work`.
   - C++ `-O2 -fomit-frame-pointer` synthetic — new workload in `test/workloads/cpp/`.
-  - Python and Node under PYTHONPERFSUPPORT / --perf-basic-prof — no regression in perf-map decoder.
+  - Python and Node under `PYTHONPERFSUPPORT` / `--perf-basic-prof` — no regression in perf-map decoder.
 - **Overhead budget:** DWARF profiler at 99 Hz `--pid`, per-PID-mode CPU cost ≤ 2× the FP path, measured on a CPU-bound Go workload.
 
 ## Open questions (to resolve during implementation, not blocking)
@@ -292,7 +311,6 @@ Both produce `[]pprof.Frame` samples through the same collector callback. Symbol
 1. **Classification granularity.** Per-function (one entry per FDE) vs per-instruction (one entry per CFI state transition). Per-function is smaller and simpler; per-instruction is more precise for function prologues/epilogues. Start per-function; refine if we see false-negative truncations.
 2. **Table eviction policy.** Exact ref-counting works but adds complexity. For the first cut: free all of a PID's tables on PID exit; rely on build-id sharing to keep steady-state memory bounded.
 3. **BPF program size.** Close to verifier limits once both walkers are present. Mitigation: factor shared helpers into `static __always_inline` functions in `unwind_common.h` so the inlined copies dedupe cleanly.
-4. **`--unwind auto` default flip.** Ship with `auto = fp` default initially, flip to `auto = hybrid` once S5 is validated on real workloads. Keeps anyone who upgrades from regressing unintentionally.
 
 ## Success criteria
 

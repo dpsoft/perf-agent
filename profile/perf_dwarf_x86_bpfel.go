@@ -13,11 +13,41 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type perf_dwarfCfiEntry struct {
+	_          structs.HostLayout
+	PcStart    uint64
+	PcEndDelta uint32
+	CfaType    uint8
+	FpType     uint8
+	CfaOffset  int16
+	FpOffset   int16
+	RaOffset   int16
+	RaType     uint8
+	Pad        [5]uint8
+	_          [6]byte
+}
+
+type perf_dwarfClassification struct {
+	_          structs.HostLayout
+	PcStart    uint64
+	PcEndDelta uint32
+	Mode       uint8
+	Pad        [3]uint8
+}
+
 type perf_dwarfPidConfig struct {
 	_             structs.HostLayout
 	Type          uint8
 	CollectUser   uint8
 	CollectKernel uint8
+}
+
+type perf_dwarfPidMapping struct {
+	_        structs.HostLayout
+	VmaStart uint64
+	VmaEnd   uint64
+	LoadBias uint64
+	TableId  uint64
 }
 
 type perf_dwarfSampleRecord struct {
@@ -86,16 +116,25 @@ type perf_dwarfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type perf_dwarfMapSpecs struct {
-	Pids          *ebpf.MapSpec `ebpf:"pids"`
-	StackEvents   *ebpf.MapSpec `ebpf:"stack_events"`
-	WalkerScratch *ebpf.MapSpec `ebpf:"walker_scratch"`
+	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
+	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
+	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
+	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
+	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
+	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
+	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
 // perf_dwarfVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type perf_dwarfVariableSpecs struct {
-	SystemWide *ebpf.VariableSpec `ebpf:"system_wide"`
+	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
+	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
 // perf_dwarfObjects contains all objects after they have been loaded into the kernel.
@@ -118,13 +157,25 @@ func (o *perf_dwarfObjects) Close() error {
 //
 // It can be passed to loadPerf_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type perf_dwarfMaps struct {
-	Pids          *ebpf.Map `ebpf:"pids"`
-	StackEvents   *ebpf.Map `ebpf:"stack_events"`
-	WalkerScratch *ebpf.Map `ebpf:"walker_scratch"`
+	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
+	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
+	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
+	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
+	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
+	Pids                     *ebpf.Map `ebpf:"pids"`
+	StackEvents              *ebpf.Map `ebpf:"stack_events"`
+	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
 
 func (m *perf_dwarfMaps) Close() error {
 	return _Perf_dwarfClose(
+		m.CfiClassification,
+		m.CfiClassificationLengths,
+		m.CfiLengths,
+		m.CfiRules,
+		m.PidMappingLengths,
+		m.PidMappings,
 		m.Pids,
 		m.StackEvents,
 		m.WalkerScratch,
@@ -135,7 +186,10 @@ func (m *perf_dwarfMaps) Close() error {
 //
 // It can be passed to loadPerf_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type perf_dwarfVariables struct {
-	SystemWide *ebpf.Variable `ebpf:"system_wide"`
+	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
+	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // perf_dwarfPrograms contains all programs after they have been loaded into the kernel.

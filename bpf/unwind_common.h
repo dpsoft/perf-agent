@@ -5,11 +5,11 @@
 // users opt into DWARF unwinding via --unwind dwarf / auto, which causes
 // userspace to load these new programs instead.
 //
-// S2 scope: this header defines the sample-record shape, the per-CPU
-// walker scratch, and the ringbuf for emitted samples. The CFI + pc-
-// classification + pid_mappings maps land in S3/S4 — for S2 the struct
-// types are defined here so layouts are locked in, but the maps
-// themselves aren't declared yet (no point; they'd just be dead code).
+// Scope: the sample-record shape, per-CPU walker scratch, ringbuf for
+// emitted samples, PID filter, and (as of S3) the CFI + classification
+// + pid_mappings HASH_OF_MAPS tables that the hybrid walker consults
+// per frame. The walker itself lives in perf_dwarf.bpf.c (CPU) /
+// offcpu_dwarf.bpf.c (off-CPU).
 //
 // See docs/dwarf-unwinding-design.md for architecture.
 #ifndef PERF_AGENT_UNWIND_COMMON_H
@@ -37,9 +37,8 @@
 // ----- Type layouts mirrored from unwind/ehcompile/types.go.
 //
 // Kept in lockstep with the Go side — any change here requires updating
-// CFIEntry / Classification in types.go and vice versa. S2 declares the
-// types so future stages' maps can reference them; the maps themselves
-// are added in S3/S4.
+// CFIEntry / Classification in types.go and vice versa. Types declared
+// in S2; maps declared in S3.
 
 enum cfa_type {
     CFA_TYPE_UNDEFINED = 0,
@@ -181,5 +180,97 @@ static long walk_step(__u32 idx, void *arg) {
     ctx->fp = saved_fp;
     return 0;
 }
+
+// ----- CFI maps (S3).
+//
+// cfi_rules is a HASH_OF_MAPS: outer key is table_id (FNV-1a of build-id),
+// inner is a variable-size ARRAY of cfi_entry sorted by pc_start.
+// cfi_lengths holds the valid length of each inner array (BPF can't read
+// inner max_entries at runtime).
+//
+// cfi_classification mirrors the structure for classification rows.
+//
+// pid_mappings: outer key is pid, inner is a fixed-size ARRAY of pid_mapping
+// entries (most processes need < 256 mappings). pid_mapping_lengths holds
+// the valid length per pid.
+
+#define MAX_PID_MAPPINGS 256
+
+// Clang emits only a BTF forward declaration for a struct referenced solely
+// inside a HASH_OF_MAPS' __type(value, ...) annotation — the outer map's
+// BTF records the inner value type as BTF_KIND_FWD rather than the full
+// layout. cilium/ebpf's loader needs the full layout to generate Go structs
+// and validate types, so we anchor each struct with an (otherwise unused)
+// global so clang emits BTF_KIND_STRUCT with complete field info.
+#define BTF_MATERIALIZE(T) struct T _btf_anchor_##T __attribute__((unused));
+BTF_MATERIALIZE(cfi_entry)
+BTF_MATERIALIZE(classification)
+BTF_MATERIALIZE(pid_mapping)
+
+// Named inner-map types for HASH_OF_MAPS.
+struct cfi_inner {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1); // template only; actual inner maps are sized per binary at populate time
+    __type(key, __u32);
+    __type(value, struct cfi_entry);
+};
+
+struct classification_inner {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1); // template only; actual inner maps are sized per binary at populate time
+    __type(key, __u32);
+    __type(value, struct classification);
+};
+
+struct pid_mapping_inner {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_PID_MAPPINGS);
+    __type(key, __u32);
+    __type(value, struct pid_mapping);
+};
+
+// Outer maps.
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __array(values, struct cfi_inner);
+} cfi_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __type(value, __u32);
+} cfi_lengths SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __array(values, struct classification_inner);
+} cfi_classification SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __type(value, __u32);
+} cfi_classification_lengths SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+    __uint(max_entries, 2048);
+    __type(key, __u32);
+    __array(values, struct pid_mapping_inner);
+} pid_mappings SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 2048);
+    __type(key, __u32);
+    __type(value, __u32);
+} pid_mapping_lengths SEC(".maps");
 
 #endif // PERF_AGENT_UNWIND_COMMON_H

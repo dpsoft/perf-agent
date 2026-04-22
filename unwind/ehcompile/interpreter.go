@@ -2,6 +2,7 @@ package ehcompile
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -240,6 +241,81 @@ func (s *interpreter) run(startPC, endPC uint64, program []byte) error {
 			}
 			pos += n
 			s.restoreRegInitial(uint8(reg))
+		case cfaRememberState:
+			if s.sp >= len(s.stack) {
+				return errors.New("ehcompile: remember_state stack overflow")
+			}
+			s.stack[s.sp] = savedState{
+				cfaType:   s.cfaType,
+				cfaOffset: s.cfaOffset,
+				cfaRule:   s.cfaRule,
+				fpRule:    s.fpRule,
+				raRule:    s.raRule,
+			}
+			s.sp++
+		case cfaRestoreState:
+			if s.sp == 0 {
+				return errors.New("ehcompile: restore_state on empty stack")
+			}
+			s.sp--
+			ss := s.stack[s.sp]
+			s.cfaType = ss.cfaType
+			s.cfaOffset = ss.cfaOffset
+			s.cfaRule = ss.cfaRule
+			s.fpRule = ss.fpRule
+			s.raRule = ss.raRule
+		case cfaDefCFAExpression:
+			length, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n + int(length)
+			s.cfaRule = ruleExpression
+			s.cfaType = CFATypeUndefined
+		case cfaExpression, cfaValExpression:
+			_, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			length, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n + int(length)
+			s.cfaRule = ruleExpression
+		case cfaSetLoc:
+			newPC, n, err := decodeEHPointer(program[pos:], s.cie.fdePointerEnc, 0, 0)
+			if err != nil {
+				return err
+			}
+			pos += n
+			if newPC < s.pc {
+				return errors.New("ehcompile: set_loc moves backward")
+			}
+			s.snapshotAndAdvance(newPC - s.pc)
+		case cfaGnuArgsSize:
+			_, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+		case cfaValOffset, cfaValOffsetSF:
+			_, n, err := decodeULEB128(program[pos:])
+			if err != nil {
+				return err
+			}
+			pos += n
+			if op == cfaValOffset {
+				_, n, err = decodeULEB128(program[pos:])
+			} else {
+				_, n, err = decodeSLEB128(program[pos:])
+			}
+			if err != nil {
+				return err
+			}
+			pos += n
+			s.cfaRule = ruleExpression
 		default:
 			return fmt.Errorf("ehcompile: unhandled opcode 0x%02x at pos %d", op, pos-1)
 		}

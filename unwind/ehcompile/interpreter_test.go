@@ -111,3 +111,50 @@ func TestInterpret_OffsetFPAndRA_arm64(t *testing.T) {
 	assert.Equal(t, int16(-16), e.FPOffset)
 	assert.Equal(t, int16(-8), e.RAOffset)
 }
+
+func TestInterpret_RememberRestoreState(t *testing.T) {
+	c := newTestCIE()
+	program := []byte{
+		cfaDefCFA, x86RSP, 8,
+		0x40 | 2,
+		cfaRememberState,
+		cfaDefCFAOffset, 64,
+		0x40 | 3,
+		cfaRestoreState,
+		0x40 | 5,
+	}
+	s := newInterpreter(c, archX86_64())
+	err := s.run(0x5000, 0x500A, program)
+	require.NoError(t, err)
+	require.Len(t, s.entries, 3)
+	assert.Equal(t, int16(8), s.entries[0].CFAOffset)
+	assert.Equal(t, int16(64), s.entries[1].CFAOffset)
+	assert.Equal(t, int16(8), s.entries[2].CFAOffset)
+}
+
+func TestInterpret_ExpressionProducesFallback(t *testing.T) {
+	c := newTestCIE()
+	program := []byte{
+		cfaDefCFAExpression, 1, 0x90,
+		0x40 | 16,
+	}
+	s := newInterpreter(c, archX86_64())
+	err := s.run(0x6000, 0x6010, program)
+	require.NoError(t, err)
+	assert.Empty(t, s.entries)
+	require.Len(t, s.classifications, 1)
+	assert.Equal(t, ModeFallback, s.classifications[0].Mode)
+}
+
+func TestInterpret_GnuArgsSizeIsNoop(t *testing.T) {
+	c := newTestCIE()
+	program := []byte{
+		cfaDefCFA, x86RSP, 8,
+		cfaGnuArgsSize, 0x10,
+		0x40 | 4,
+	}
+	s := newInterpreter(c, archX86_64())
+	err := s.run(0x7000, 0x7004, program)
+	require.NoError(t, err)
+	require.Len(t, s.entries, 1)
+}

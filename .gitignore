@@ -20,6 +20,8 @@
 # Note: eBPF bytecode files (*_bpfel.o, *_bpfeb.o) are committed for library usage
 !*_bpfel.o
 !*_bpfeb.o
+# Committed test fixtures (cross-compiled arm64 object file for CFI tests)
+!unwind/ehcompile/testdata/*.o
 *.a
 
 # Go generated folders

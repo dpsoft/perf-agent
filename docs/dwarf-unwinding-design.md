@@ -142,14 +142,18 @@ All maps are created from userspace at start-up; entries added/removed lazily as
 struct cfi_entry {
     u64 pc_start;       // PC in binary's VA (not target VA) — lookup uses relative PC
     u32 pc_end_delta;   // pc_end - pc_start
-    u8  cfa_reg;        // enum: RSP=0, RBP=1, ... (small set)
-    u8  flags;          // bit 0: simple rule; bit 1: has_rbp_save
+    u8  cfa_type;       // enum: SP=1, FP=2 (arch-neutral — on x86_64 these map to RSP/RBP; on arm64 to SP/x29)
+    u8  fp_type;        // enum: Undefined=0, OffsetCFA=1, SameValue=2, Register=3
     s16 cfa_offset;     // signed 16-bit offset in bytes
-    s16 ra_offset;      // return-addr @ [CFA + ra_offset], typically -8
-    s16 rbp_offset;     // saved-rbp @ [CFA + rbp_offset], typically -16 or unused
-    u8  _pad[4];
+    s16 fp_offset;      // saved FP @ [CFA + fp_offset], valid when fp_type == OffsetCFA
+    s16 ra_offset;      // saved return addr @ [CFA + ra_offset]; typically -8 on x86_64, varies on arm64
+    u8  _pad[6];
 };
 ```
+
+**Arch-neutral naming.** `FP` is "frame pointer" abstractly — RBP (DWARF reg 6) on x86_64, x29 (DWARF reg 29) on arm64. Similarly `SP` maps to RSP (reg 7) on x86_64, SP (reg 31) on arm64. The CFI compiler's `archInfo` translates DWARF register numbers to these neutral slots at compile time; BPF doesn't need to know the arch.
+
+**RA is not hardcoded.** On x86_64 the return address is conventionally always at `[CFA-8]`, but arm64 uses the LR register (x30) whose save location is set explicitly per FDE. We emit `ra_offset` for every row to handle both.
 
 Sorted by `pc_start` so BPF can binary-search.
 
@@ -188,34 +192,34 @@ Userspace consumes with `ringbuf.Reader.Read()`.
 walk_stack(regs, stack_base, max_depth):
   pcs = [regs.IP]                         # leaf first
   pc  = regs.IP
-  bp  = regs.BP
+  fp  = regs.FP                           # rbp on x86_64, x29 on arm64
   sp  = regs.SP
 
   for step in 1..max_depth:
     cls = classify(pc)                    # FP_SAFE | FP_LESS | FALLBACK
     if cls == FP_SAFE or cls == FALLBACK:
       # Advance one frame using rbp chain
-      if not (stack_base <= bp and bp + 16 <= stack_base + STACK_BYTES):
+      if not (stack_base <= fp and fp + 16 <= stack_base + STACK_BYTES):
         break
-      saved_bp  = probe_read(bp)          # captured stack or bpf_probe_read_user
-      ret_addr  = probe_read(bp + 8)
+      saved_fp  = probe_read(fp)          # captured stack or bpf_probe_read_user
+      ret_addr  = probe_read(fp + 8)      # arch-specific offset — 8 on x86_64 and arm64 AAPCS
       pcs.push(ret_addr)
-      if saved_bp == 0 or saved_bp <= bp:
+      if saved_fp == 0 or saved_fp <= fp:
         break
       pc = ret_addr
-      bp = saved_bp
-      sp = bp + 16
+      fp = saved_fp
+      sp = fp + 16
     else:                                 # FP_LESS → DWARF
       rule = cfi_lookup(pc)               # binary search in cfi_rules table for pc's binary
       if rule == NULL:
         break                             # no CFI info — stop, don't extrapolate
-      cfa  = (rule.cfa_reg == RSP ? sp : bp) + rule.cfa_offset
+      cfa  = (rule.cfa_type == SP ? sp : fp) + rule.cfa_offset
       ra   = probe_read(cfa + rule.ra_offset)
       pcs.push(ra)
       # Restore regs for next iteration
       sp = cfa
-      if rule.flags & HAS_RBP_SAVE:
-        bp = probe_read(cfa + rule.rbp_offset)
+      if rule.fp_type == OffsetCFA:
+        fp = probe_read(cfa + rule.fp_offset)
       pc = ra
 
   return pcs

@@ -86,3 +86,33 @@ func (p *PerfDwarfForTest) AddPID(pid uint32) error {
 func (p *PerfDwarfForTest) Close() error {
 	return p.objs.Close()
 }
+
+// CFIRulesMap returns the cfi_rules HASH_OF_MAPS outer map.
+func (p *PerfDwarfForTest) CFIRulesMap() *ebpf.Map {
+	return p.objs.CfiRules
+}
+
+// CFILengthsMap returns the cfi_lengths HASH keyed by table_id → u32 length.
+func (p *PerfDwarfForTest) CFILengthsMap() *ebpf.Map {
+	return p.objs.CfiLengths
+}
+
+// CFIClassificationMap returns the cfi_classification HASH_OF_MAPS outer map.
+func (p *PerfDwarfForTest) CFIClassificationMap() *ebpf.Map {
+	return p.objs.CfiClassification
+}
+
+// CFIClassificationLengthsMap returns the cfi_classification_lengths HASH.
+func (p *PerfDwarfForTest) CFIClassificationLengthsMap() *ebpf.Map {
+	return p.objs.CfiClassificationLengths
+}
+
+// PIDMappingsMap returns the pid_mappings HASH_OF_MAPS outer map.
+func (p *PerfDwarfForTest) PIDMappingsMap() *ebpf.Map {
+	return p.objs.PidMappings
+}
+
+// PIDMappingLengthsMap returns the pid_mapping_lengths HASH keyed by pid → u32 length.
+func (p *PerfDwarfForTest) PIDMappingLengthsMap() *ebpf.Map {
+	return p.objs.PidMappingLengths
+}

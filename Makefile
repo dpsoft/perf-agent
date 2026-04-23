@@ -41,7 +41,7 @@ test-unit: generate
 	LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
 	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
 	CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
-	go test -v ./cpu/... ./profile/... ./offcpu/...
+	go test -v ./cpu/... ./profile/... ./offcpu/... ./unwind/...
 
 .PHONY: test-integration
 test-integration: build test-workloads

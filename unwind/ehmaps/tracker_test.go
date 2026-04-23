@@ -141,3 +141,39 @@ func TestTrackerAutoAttachOnMmap(t *testing.T) {
 		}
 	}
 }
+
+// TestAttachAllMappings attaches to the test process itself (which is
+// multi-binary — the Go test harness + blazesym.so + libc + ld.so +
+// libpthread + etc.) and verifies that more than one cfi_lengths entry
+// gets installed (i.e. AttachAllMappings found several unique binaries
+// in /proc/self/maps and Attach'd each).
+func TestAttachAllMappings(t *testing.T) {
+	requireBPFCaps(t)
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit: %v", err)
+	}
+	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+
+	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
+
+	n, err := AttachAllMappings(tracker, uint32(os.Getpid()))
+	if err != nil {
+		t.Fatalf("AttachAllMappings: %v", err)
+	}
+	if n < 2 {
+		t.Fatalf("AttachAllMappings installed %d tables, want >= 2 (main + at least one .so)", n)
+	}
+
+	installed := 0
+	it := cfiLen.Iterate()
+	var tid uint64
+	var cnt uint32
+	for it.Next(&tid, &cnt) {
+		installed++
+	}
+	if installed != n {
+		t.Fatalf("cfi_lengths has %d entries, AttachAllMappings claimed %d", installed, n)
+	}
+}

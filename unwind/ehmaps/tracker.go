@@ -150,6 +150,65 @@ func (t *PIDTracker) Run(ctx context.Context, w *MmapWatcher) {
 	}
 }
 
+// AttachAllMappings walks /proc/<pid>/maps, finds every file-backed
+// executable mapping, and calls tracker.Attach once per unique binary
+// path. Returns the count of distinct binaries attached.
+//
+// Call this once at agent startup to cover the main binary plus every
+// shared library present at that moment. Subsequent mmaps (dlopen,
+// runtime-loaded plugins) are handled by MmapWatcher driving
+// PIDTracker.Run.
+//
+// Attach failures for individual binaries are logged at Debug and
+// skipped rather than fatal — a process may have exotic mappings
+// (ehcompile-rejectable formats, ELFs without .eh_frame) that we
+// shouldn't fail the whole attach on. The first failure is returned
+// only if NO binary was successfully attached; otherwise we report
+// whatever we managed.
+func AttachAllMappings(t *PIDTracker, pid uint32) (int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
+	if err != nil {
+		return 0, fmt.Errorf("read /proc/%d/maps: %w", pid, err)
+	}
+	seen := map[string]struct{}{}
+	var firstErr error
+	n := 0
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		if !strings.Contains(fields[1], "x") {
+			continue
+		}
+		path := fields[5]
+		if path == "" || strings.HasPrefix(path, "[") || strings.HasPrefix(path, "//anon") {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if err := t.Attach(pid, path); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("attach %s: %w", path, err)
+			} else {
+				slog.Debug("ehmaps: AttachAllMappings: skip", "path", path, "err", err)
+			}
+			continue
+		}
+		n++
+	}
+	if n == 0 && firstErr != nil {
+		return 0, firstErr
+	}
+	return n, nil
+}
+
 // looksExecutable filters MMAP2 events down to those worth attaching to.
 // Must be an executable mapping (PROT_EXEC), have a real filename
 // (non-empty, not an anonymous or special kernel path), and the file

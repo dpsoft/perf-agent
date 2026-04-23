@@ -107,7 +107,7 @@ struct sample_header {
     __u64 value;       // sample weight: 1 for CPU, blocking-ns for off-CPU
     __u8  mode;        // dominant classification for the sample (telemetry)
     __u8  n_pcs;       // number of valid PCs in the pcs[] array
-    __u8  walker_flags; // bit 0: FP walk reached terminator; 0 = truncated mid-read
+    __u8  walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
     __u8  _pad;
     __u32 _pad2;
 };
@@ -161,25 +161,6 @@ struct walk_ctx {
     __u32 n_pcs;
     struct sample_record *rec;
 };
-
-// walk_step is the per-frame callback invoked by bpf_loop(). Returns 0 to
-// continue walking, 1 to stop. Reads saved-FP and return-address off the
-// user stack; any read failure terminates the walk.
-static long walk_step(__u32 idx, void *arg) {
-    struct walk_ctx *ctx = (struct walk_ctx *)arg;
-    if (ctx->n_pcs >= MAX_FRAMES) return 1;
-
-    ctx->rec->pcs[ctx->n_pcs++] = ctx->pc;
-
-    __u64 saved_fp = 0, ret_addr = 0;
-    if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) return 1;
-    if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) return 1;
-    if (saved_fp == 0 || saved_fp <= ctx->fp) return 1;
-
-    ctx->pc = ret_addr;
-    ctx->fp = saved_fp;
-    return 0;
-}
 
 // ----- CFI maps (S3).
 //
@@ -382,6 +363,97 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
         }
     }
     return NULL;
+}
+
+// walker_flags bits, exposed via sample_header.walker_flags:
+//
+//   bit 0 — FP walk reached a natural terminator (saved_fp == 0). Clear
+//           means the walk was cut short by a read failure or MAX_FRAMES.
+//   bit 1 — at least one frame used the DWARF path.
+//   bit 2 — at least one frame's CFI lookup missed while classified FP_LESS
+//           (walk truncated at that frame).
+#define WALKER_FLAG_FP_TERMINATED  0x01
+#define WALKER_FLAG_DWARF_USED     0x02
+#define WALKER_FLAG_CFI_MISS       0x04
+
+// walk_step is the per-frame bpf_loop callback for the hybrid walker.
+// Classifies ctx->pc, picks FP or DWARF path, and advances the walk
+// state. Returns 0 to continue, 1 to stop.
+static long walk_step(__u32 idx, void *arg) {
+    struct walk_ctx *ctx = (struct walk_ctx *)arg;
+    if (ctx->n_pcs >= MAX_FRAMES) return 1;
+
+    ctx->rec->pcs[ctx->n_pcs++] = ctx->pc;
+
+    // Per-frame classification. Miss = treat as FP_SAFE (spec: FALLBACK
+    // behaves the same as FP_SAFE at runtime).
+    struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
+    __u8 mode = MODE_FP_SAFE;
+    if (m.found) {
+        mode = classify_rel_pc(m.table_id, m.rel_pc);
+    }
+
+    if (mode == MODE_FP_LESS) {
+        struct cfi_entry *ep = cfi_lookup(m.table_id, m.rel_pc);
+        if (!ep) {
+            ctx->rec->hdr.walker_flags |= WALKER_FLAG_CFI_MISS;
+            return 1;
+        }
+        // Copy out of the inner map immediately — the pointer's lifetime
+        // is bounded by the next BPF helper call. Defensive-copying keeps
+        // reasoning simple and avoids any verifier fuss.
+        struct cfi_entry e = *ep;
+
+        __u64 base = (e.cfa_type == CFA_TYPE_FP) ? ctx->fp : ctx->sp;
+        __u64 cfa = base + (__s64)e.cfa_offset;
+
+        __u64 ret_addr = 0;
+        if (e.ra_type == RA_TYPE_OFFSET_CFA) {
+            if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
+                                    (void *)(cfa + (__s64)e.ra_offset)) != 0) return 1;
+        } else {
+            // SAME_VALUE (leaf on arm64) or REGISTER — S3 doesn't track
+            // non-FP registers, so stop. S6+ can extend.
+            return 1;
+        }
+
+        __u64 new_fp = ctx->fp;
+        if (e.fp_type == FP_TYPE_OFFSET_CFA) {
+            if (bpf_probe_read_user(&new_fp, sizeof(new_fp),
+                                    (void *)(cfa + (__s64)e.fp_offset)) != 0) return 1;
+        } else if (e.fp_type == FP_TYPE_SAME_VALUE) {
+            // new_fp unchanged
+        } else {
+            // UNDEFINED / REGISTER — FP is lost; continuing via DWARF
+            // further is fine but FP-based frames further up will fail.
+            new_fp = 0;
+        }
+
+        ctx->pc = ret_addr;
+        ctx->fp = new_fp;
+        ctx->sp = cfa;
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_DWARF_USED;
+        return 0;
+    }
+
+    // FP_SAFE or FALLBACK — same path: FP walk.
+    __u64 saved_fp = 0, ret_addr = 0;
+    if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) return 1;
+    if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) return 1;
+    if (saved_fp == 0) {
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_TERMINATED;
+        return 1;
+    }
+    if (saved_fp <= ctx->fp) return 1;
+
+    // Caller's resume SP: after a standard prologue (push FP; move FP=SP
+    // on x86_64; equivalent stp x29, x30 on arm64), the caller's SP at
+    // the return instruction is current FP + 16 (saved FP + saved RA).
+    // Matters when the next frame up is FP_LESS with CFA rooted at SP.
+    ctx->sp = ctx->fp + 16;
+    ctx->pc = ret_addr;
+    ctx->fp = saved_fp;
+    return 0;
 }
 
 #endif // PERF_AGENT_UNWIND_COMMON_H

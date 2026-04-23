@@ -1,19 +1,18 @@
 //go:build ignore
 //
-// perf_dwarf.bpf.c — DWARF-capable CPU sampler (S2).
+// perf_dwarf.bpf.c — DWARF-capable CPU sampler.
 //
 // Loaded only when --unwind dwarf is selected. Mirrors perf.bpf.c's PID-
 // filter + kernel-thread skip, but:
 //
-//   1. Uses a custom FP walker (bpf_loop + bpf_probe_read_user) instead of
-//      bpf_get_stackid, so we can control per-frame classification.
+//   1. Uses a custom hybrid walker (bpf_loop + bpf_probe_read_user) that
+//      classifies each frame's PC and picks FP-walk or DWARF-based unwind
+//      per frame. Classification and CFI rules come from unwind/ehcompile.
 //   2. Emits per-sample PC chains via BPF_MAP_TYPE_RINGBUF instead of
 //      aggregating in a counts map — userspace aggregates post-symbolize.
 //
-// S2 stubs the classification lookup: every sample is tagged MODE_FP_SAFE
-// and FP walking is the only path. S3 adds DWARF unwinding for FP-less
-// ranges; S4 wires the per-PID mappings that make the classification
-// lookup meaningful.
+// S3 wires the hybrid walker; S4 adds MMAP2-driven mapping ingestion so
+// the userspace side can track new binaries at runtime without a restart.
 //
 // See docs/dwarf-unwinding-design.md.
 
@@ -72,6 +71,10 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
         .rec   = rec,
     };
 
+    // Zero walker_flags BEFORE bpf_loop so walk_step can OR bits in as it
+    // classifies / switches modes / hits terminators.
+    rec->hdr.walker_flags = 0;
+
     // Walk at most MAX_FRAMES frames. walk_step breaks early on read
     // failure or natural terminator (saved_fp == 0, saved_fp <= fp).
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
@@ -81,9 +84,12 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     rec->hdr.tid          = tid;
     rec->hdr.time_ns      = bpf_ktime_get_ns();
     rec->hdr.value        = 1; // CPU sample count; weight is applied at sampling rate
-    rec->hdr.mode         = MODE_FP_SAFE; // S2 stub — S3 varies this per-range
     rec->hdr.n_pcs        = (__u8)(walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs);
-    rec->hdr.walker_flags = 0; // unused in S2; S3+ marks DWARF transitions
+    // Dominant mode for telemetry: FP_LESS if DWARF fired at least once,
+    // else FP_SAFE. walker_flags carries the per-bit breakdown.
+    rec->hdr.mode = (rec->hdr.walker_flags & WALKER_FLAG_DWARF_USED)
+        ? MODE_FP_LESS : MODE_FP_SAFE;
+    // walker_flags already populated by walk_step during the walk — do not reset here.
 
     // Copy the full fixed-size record into the ringbuf. The wasted bytes
     // past n_pcs are acceptable; see unwind_common.h for the design note.

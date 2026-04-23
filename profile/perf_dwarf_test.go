@@ -18,7 +18,7 @@ import (
 func TestPerfDwarfLoads(t *testing.T) {
 	requireBPFCaps(t)
 
-	objs, err := LoadPerfDwarfForTest()
+	objs, err := LoadPerfDwarf()
 	if err != nil {
 		t.Fatalf("load perf_dwarf: %v", err)
 	}
@@ -48,7 +48,7 @@ func requireBPFCaps(t *testing.T) {
 	if !have {
 		t.Skip("CAP_BPF not in permitted set; run as root or setcap the test binary")
 	}
-	// Having CAP_BPF alone isn't enough — LoadPerfDwarfForTest also raises
+	// Having CAP_BPF alone isn't enough — LoadPerfDwarf also raises
 	// CAP_PERFMON/SYS_PTRACE/etc. Check those too to avoid confusing
 	// "set capabilities" failures inside the loader.
 	for _, c := range []cap.Value{cap.SYS_ADMIN, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE} {

@@ -39,10 +39,10 @@ const (
 // we need through a thin local wrapper so main doesn't need to know the
 // generator's specific spelling.
 func loadObjects() (*loadedObjects, error) {
-	return profile.LoadPerfDwarfForTest()
+	return profile.LoadPerfDwarf()
 }
 
-type loadedObjects = profile.PerfDwarfForTest
+type loadedObjects = profile.PerfDwarf
 
 func main() {
 	pid := flag.Int("pid", 0, "target PID (required)")
@@ -209,7 +209,7 @@ func printRecord(n int, raw []byte) {
 
 // populateDwarfMaps runs ehcompile on binPath and installs CFI,
 // classification, and pid_mappings into the BPF maps for the given PID.
-func populateDwarfMaps(objs *profile.PerfDwarfForTest, pid uint32, binPath string) error {
+func populateDwarfMaps(objs *profile.PerfDwarf, pid uint32, binPath string) error {
 	entries, classifications, err := ehcompile.Compile(binPath)
 	if err != nil {
 		return fmt.Errorf("ehcompile: %w", err)

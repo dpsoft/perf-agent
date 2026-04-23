@@ -25,6 +25,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 
+	"kernel.org/pub/linux/libs/security/libcap/cap"
+
 	"github.com/dpsoft/perf-agent/perfagent"
 	perfprofile "github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/unwind/ehcompile"
@@ -958,8 +960,16 @@ func TestLibraryPMUMetrics(t *testing.T) {
 // maps, attach per-CPU perf events, and verify the ringbuf receives samples
 // with DWARF-unwound chains.
 func TestPerfDwarfWalker(t *testing.T) {
+	// Unlike the other integration tests (which spawn perf-agent as a
+	// subprocess and thus need the caller to be root), this test loads
+	// BPF in-process, so setcap on the test binary is sufficient. Accept
+	// either root or a process with CAP_BPF in its permitted set.
 	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
+		caps := cap.GetProc()
+		have, err := caps.GetFlag(cap.Permitted, cap.BPF)
+		if err != nil || !have {
+			t.Skip("requires root or CAP_BPF in permitted set")
+		}
 	}
 
 	binPath := "./workloads/rust/target/release/rust-workload"
@@ -1031,11 +1041,15 @@ func TestPerfDwarfWalker(t *testing.T) {
 			_ = unix.Close(fd)
 		}
 	}()
+	// pid=-1, cpu=N samples all threads running on that CPU — the BPF-side
+	// `pids` map (populated via objs.AddPID above) restricts emission to the
+	// workload's TGID. Using pid=workloadPID here would sample ONLY that
+	// specific TID, missing the worker threads where the actual CPU load runs.
 	for cpu := range ncpu {
-		fd, err := unix.PerfEventOpen(attr, workload.Process.Pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+		fd, err := unix.PerfEventOpen(attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 		if err != nil {
 			if errors.Is(err, syscall.ESRCH) {
-				continue // target not schedulable on this CPU, skip
+				continue
 			}
 			t.Fatalf("perf_event_open cpu=%d: %v", cpu, err)
 		}
@@ -1058,6 +1072,8 @@ func TestPerfDwarfWalker(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	var samples, dwarfSamples, maxFrames int
+	flagCounts := map[byte]int{}
+	var samplePrinted bool
 	for samples < 40 && time.Now().Before(deadline) {
 		rd.SetDeadline(time.Now().Add(500 * time.Millisecond))
 		rec, err := rd.Read()
@@ -1073,6 +1089,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 		}
 		nPCs := int(rec.RawSample[25])
 		walkerFlags := rec.RawSample[26]
+		flagCounts[walkerFlags]++
 		if nPCs > maxFrames {
 			maxFrames = nPCs
 		}
@@ -1080,9 +1097,22 @@ func TestPerfDwarfWalker(t *testing.T) {
 		if walkerFlags&0x02 != 0 {
 			dwarfSamples++
 		}
+		// Dump one sample's PC chain for diagnostics.
+		if !samplePrinted && nPCs >= 1 {
+			samplePrinted = true
+			t.Logf("first sample: nPCs=%d walker_flags=%#x", nPCs, walkerFlags)
+			for i := range nPCs {
+				off := 32 + i*8
+				if off+8 > len(rec.RawSample) {
+					break
+				}
+				pc := binary.LittleEndian.Uint64(rec.RawSample[off : off+8])
+				t.Logf("  [%d] %#016x", i, pc)
+			}
+		}
 	}
 
-	t.Logf("samples=%d dwarf_samples=%d max_frames=%d", samples, dwarfSamples, maxFrames)
+	t.Logf("samples=%d dwarf_samples=%d max_frames=%d flag_counts=%v", samples, dwarfSamples, maxFrames, flagCounts)
 	require.Greater(t, samples, 5, "no samples consumed — perf events may not have fired")
 	require.Greater(t, maxFrames, 2, "chains too shallow — walker producing tiny stacks")
 	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release")
@@ -1138,13 +1168,42 @@ func extractGNUBuildID(notes []byte) []byte {
 }
 
 // loadProcessMappings reads /proc/<pid>/maps and returns one PIDMapping per
-// executable-mapped range of binPath. load_bias = vma_start - file_offset.
+// executable-mapped range of binPath. The load bias (B in ELF-speak) is the
+// actual runtime base at which the binary was loaded. For a PIE/ET_DYN:
+//   vma_start = B + PT_LOAD.vaddr_page_aligned
+//   file_offset = PT_LOAD.offset_page_aligned
+// Which does NOT reduce to `vma_start - file_offset` in general — the ELF
+// can have holes between vaddr and file_offset. Compute B by reading the
+// ELF's executable PT_LOAD and inverting from the /proc/maps entry that
+// maps it.
 func loadProcessMappings(pid int, binPath string, tableID uint64) ([]ehmaps.PIDMapping, error) {
+	ef, err := elf.Open(binPath)
+	if err != nil {
+		return nil, err
+	}
+	defer ef.Close()
+	var execProg *elf.Prog
+	for _, p := range ef.Progs {
+		if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 {
+			execProg = p
+			break
+		}
+	}
+	if execProg == nil {
+		return nil, errors.New("no executable PT_LOAD in ELF")
+	}
+	const pageMask uint64 = ^uint64(0xfff)
+	execVaddrAligned := execProg.Vaddr & pageMask
+	execOffsetAligned := execProg.Off & pageMask
+
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return nil, err
 	}
 	base := binPath[strings.LastIndex(binPath, "/")+1:]
+
+	var loadBias uint64
+	var haveBias bool
 	var out []ehmaps.PIDMapping
 	for line := range strings.SplitSeq(string(data), "\n") {
 		fields := strings.Fields(line)
@@ -1173,12 +1232,22 @@ func loadProcessMappings(pid int, binPath string, tableID uint64) ([]ehmaps.PIDM
 		if err != nil {
 			continue
 		}
+		if !haveBias && offset == execOffsetAligned {
+			loadBias = start - execVaddrAligned
+			haveBias = true
+		}
 		out = append(out, ehmaps.PIDMapping{
 			VMAStart: start,
 			VMAEnd:   end,
-			LoadBias: start - offset,
 			TableID:  tableID,
+			// LoadBias filled in below once we've located the exec PT_LOAD.
 		})
+	}
+	if !haveBias {
+		return nil, errors.New("executable PT_LOAD has no matching /proc/<pid>/maps entry")
+	}
+	for i := range out {
+		out[i].LoadBias = loadBias
 	}
 	return out, nil
 }

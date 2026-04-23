@@ -8,6 +8,7 @@ require (
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sys v0.42.0
+	kernel.org/pub/linux/libs/security/libcap/cap v1.2.77
 )
 
 require (
@@ -19,7 +20,6 @@ require (
 	github.com/libbpf/blazesym/go v0.0.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	kernel.org/pub/linux/libs/security/libcap/cap v1.2.77 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )
 

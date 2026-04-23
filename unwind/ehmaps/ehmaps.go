@@ -34,8 +34,10 @@ func TableIDForBuildID(buildID []byte) uint64 {
 	return h
 }
 
-// CFIEntryByteSize matches bpf/unwind_common.h `struct cfi_entry` (24 bytes).
-const CFIEntryByteSize = 24
+// CFIEntryByteSize matches bpf/unwind_common.h `struct cfi_entry` (32 bytes
+// after u64 alignment padding; the active data fills offsets 0..25 and the
+// remaining 6 bytes are tail padding the BPF struct expects).
+const CFIEntryByteSize = 32
 
 // ClassificationByteSize matches bpf/unwind_common.h `struct classification`
 // (16 bytes).

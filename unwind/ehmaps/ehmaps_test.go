@@ -49,7 +49,7 @@ func TestMarshalCFIEntryMatchesBPFLayout(t *testing.T) {
 		RAType:     ehcompile.RATypeOffsetCFA,
 	}
 	got := MarshalCFIEntry(e)
-	want := make([]byte, 24)
+	want := make([]byte, 32)
 	binary.LittleEndian.PutUint64(want[0:8], 0x1234_5678_9abc_def0)
 	binary.LittleEndian.PutUint32(want[8:12], 0x0102_0304)
 	want[12] = 1 // cfa_type = SP
@@ -61,6 +61,7 @@ func TestMarshalCFIEntryMatchesBPFLayout(t *testing.T) {
 	ra := int16(-8)
 	binary.LittleEndian.PutUint16(want[18:20], uint16(ra))
 	want[20] = 1 // ra_type = OffsetCFA
+	// want[21:32] is tail padding (already zeroed by make)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("MarshalCFIEntry:\n got %x\nwant %x", got, want)
 	}

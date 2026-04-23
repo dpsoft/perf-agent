@@ -30,7 +30,8 @@ test-workloads:
 	cd test/workloads/go && go build -o cpu_bound cpu_bound.go
 	cd test/workloads/go && go build -o io_bound io_bound.go
 	@if command -v cargo >/dev/null 2>&1; then \
-		cd test/workloads/rust && cargo build --release; \
+		(cd test/workloads/rust && cargo build --release); \
+		(cd test/workloads/rust/probe && cargo build --release); \
 	else \
 		echo "Rust/Cargo not found, skipping Rust workload"; \
 	fi

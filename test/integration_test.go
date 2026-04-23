@@ -12,8 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -1117,6 +1115,100 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release")
 }
 
-// readBuildID reads the GNU build-id from an ELF's .note.gnu.build-id.
+// TestPerfDwarfMmap2Tracking validates the S4 flow: after starting the
+// rust workload with --dlopen-delay, MmapWatcher + PIDTracker should
+// pick up the probe.so mapping AUTOMATICALLY and install a second
+// cfi_lengths entry (main binary + probe.so).
+func TestPerfDwarfMmap2Tracking(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+	binPath := "./workloads/rust/target/release/rust-workload"
+	probePath := "./workloads/rust/probe/target/release/libprobe.so"
+	for _, p := range []string{binPath, probePath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Skipf("workload %s not built: %v", p, err)
+		}
+	}
 
+	// Start the workload with a 4s dlopen delay — gives us a wide window
+	// to bring up the BPF maps, tracker, and watcher before the dlopen
+	// MMAP2 fires.
+	workload := exec.Command(binPath, "20", "2", "--dlopen", probePath, "--dlopen-delay", "4")
+	require.NoError(t, workload.Start())
+	defer func() {
+		_ = workload.Process.Kill()
+		_ = workload.Wait()
+	}()
+	time.Sleep(500 * time.Millisecond) // let workload print its PID banner
 
+	objs, err := perfprofile.LoadPerfDwarfForTest()
+	require.NoError(t, err)
+	defer objs.Close()
+	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
+
+	store := ehmaps.NewTableStore(
+		objs.CFIRulesMap(), objs.CFILengthsMap(),
+		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap())
+	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
+	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath))
+
+	// Start the watcher BEFORE the dlopen fires. The 4s delay in the
+	// workload above gives us time to get here.
+	w, err := ehmaps.NewMmapWatcher(uint32(workload.Process.Pid))
+	require.NoError(t, err)
+	defer w.Close()
+
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	runDone := make(chan struct{})
+	go func() {
+		tracker.Run(runCtx, w)
+		close(runDone)
+	}()
+
+	// Wait for the dlopen + Attach to land. 6s covers the 4s pre-dlopen
+	// delay plus a generous margin.
+	deadline := time.After(6 * time.Second)
+	var installed int
+wait:
+	for {
+		installed = countMapEntries(t, objs.CFILengthsMap())
+		if installed >= 2 {
+			break wait
+		}
+		select {
+		case <-deadline:
+			break wait
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	cancelRun()
+	<-runDone
+
+	if installed < 2 {
+		t.Fatalf("expected >= 2 tables installed (main + probe.so), got %d", installed)
+	}
+}
+
+// countMapEntries iterates a u64→u32 HASH map and returns the number of
+// populated keys. Safe to call while other goroutines write (cilium/ebpf
+// Iterate may skip or re-report keys under concurrent mutation — for
+// this test we only need monotonic "at least 2").
+func countMapEntries(t *testing.T, m *ebpf.Map) int {
+	t.Helper()
+	it := m.Iterate()
+	var key uint64
+	var val uint32
+	n := 0
+	for it.Next(&key, &val) {
+		n++
+	}
+	if err := it.Err(); err != nil {
+		t.Logf("iterate: %v (continuing)", err)
+	}
+	return n
+}

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+#[inline(never)]
 fn cpu_intensive_work(stop: Arc<AtomicBool>) {
     let mut sum = 0u64;
     while !stop.load(Ordering::Relaxed) {

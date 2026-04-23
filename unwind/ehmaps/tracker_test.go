@@ -1,8 +1,11 @@
 package ehmaps
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -81,6 +84,60 @@ func closeAll(ms ...*ebpf.Map) {
 	for _, m := range ms {
 		if m != nil {
 			_ = m.Close()
+		}
+	}
+}
+
+// TestTrackerAutoAttachOnMmap exercises the full S4 flow: launch a
+// child process that, after a small delay, execs a different program
+// (the inner `exec` fires MMAP2 events AFTER our watcher is attached —
+// avoiding the child-startup race where libc's initial load happens
+// before we can start the watcher). Run() should see those events and
+// Attach the child automatically, populating pid_mappings.
+func TestTrackerAutoAttachOnMmap(t *testing.T) {
+	requireBPFCaps(t)
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit: %v", err)
+	}
+	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+
+	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
+
+	// The inner `exec` runs inside the already-tracked PID after a
+	// 300ms sleep. That re-exec fires fresh MMAP2 events for cat's
+	// dynamic libraries — events the watcher, set up below, can see.
+	child := exec.Command("/bin/sh", "-c", "sleep 0.3 && exec /bin/cat /dev/null")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	defer func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	}()
+
+	w, err := NewMmapWatcher(uint32(child.Process.Pid))
+	if err != nil {
+		t.Fatalf("NewMmapWatcher: %v", err)
+	}
+	defer w.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	go tracker.Run(ctx, w)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		var gotLen uint32
+		err := pidMapLen.Lookup(uint32(child.Process.Pid), &gotLen)
+		if err == nil && gotLen > 0 {
+			return // success
+		}
+		select {
+		case <-deadline:
+			t.Fatal("pid_mapping_lengths never got a non-zero entry for child PID")
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

@@ -1,7 +1,12 @@
 package ehmaps
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -95,4 +100,75 @@ func (t *PIDTracker) Detach(pid uint32) error {
 		}
 	}
 	return firstErr
+}
+
+// Run blocks consuming events from the watcher until ctx is canceled or
+// the watcher's event channel closes. Call from a goroutine. On MmapEvent
+// with an executable filename, auto-attaches the PID if we haven't seen
+// that (pid, path) already. On ExitEvent (group-leader only), detaches.
+func (t *PIDTracker) Run(ctx context.Context, w *MmapWatcher) {
+	seen := map[uint32]map[string]struct{}{} // pid → set of paths already attached
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-w.Events():
+			if !ok {
+				return
+			}
+			switch ev.Kind {
+			case MmapEvent:
+				if !looksExecutable(ev) {
+					continue
+				}
+				bucket, present := seen[ev.PID]
+				if !present {
+					bucket = map[string]struct{}{}
+					seen[ev.PID] = bucket
+				}
+				if _, already := bucket[ev.Filename]; already {
+					continue
+				}
+				bucket[ev.Filename] = struct{}{}
+				if err := t.Attach(ev.PID, ev.Filename); err != nil {
+					slog.Debug("ehmaps: Attach failed", "pid", ev.PID, "path", ev.Filename, "err", err)
+				}
+			case ExitEvent:
+				// Only act on group-leader exit (whole process gone).
+				// Per-thread exits still fire PERF_RECORD_EXIT but leave
+				// the process alive; detaching on those would break
+				// tracking mid-process.
+				if ev.TID != ev.PID {
+					continue
+				}
+				delete(seen, ev.PID)
+				if err := t.Detach(ev.PID); err != nil {
+					slog.Debug("ehmaps: Detach failed", "pid", ev.PID, "err", err)
+				}
+			}
+		}
+	}
+}
+
+// looksExecutable filters MMAP2 events down to those worth attaching to.
+// Must be an executable mapping (PROT_EXEC), have a real filename
+// (non-empty, not an anonymous or special kernel path), and the file
+// must exist and be a regular file.
+func looksExecutable(ev MmapEventRecord) bool {
+	const protExec = 0x4
+	if ev.Prot&protExec == 0 {
+		return false
+	}
+	if ev.Filename == "" {
+		return false
+	}
+	if strings.HasPrefix(ev.Filename, "[") || strings.HasPrefix(ev.Filename, "//anon") {
+		return false
+	}
+	clean := filepath.Clean(ev.Filename)
+	info, err := os.Stat(clean)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return true
 }

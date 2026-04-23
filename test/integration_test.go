@@ -4,15 +4,31 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"debug/elf"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/perfagent"
+	perfprofile "github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/unwind/ehcompile"
+	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 
 	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
@@ -935,4 +951,234 @@ func TestLibraryPMUMetrics(t *testing.T) {
 	}
 
 	require.NoError(t, agent.Stop(ctx))
+}
+
+// TestPerfDwarfWalker drives the S3 DWARF-walker pipeline end-to-end: start
+// the Rust cpu_bound workload, ehcompile its CFI, install it into the BPF
+// maps, attach per-CPU perf events, and verify the ringbuf receives samples
+// with DWARF-unwound chains.
+func TestPerfDwarfWalker(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test requires root privileges")
+	}
+
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			_ = workload.Process.Kill()
+			_ = workload.Wait()
+		}
+	}()
+	time.Sleep(2 * time.Second) // let workload start
+
+	objs, err := perfprofile.LoadPerfDwarfForTest()
+	require.NoError(t, err)
+	defer objs.Close()
+
+	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
+
+	// Compile CFI from the Rust binary.
+	entries, classifications, err := ehcompile.Compile(binPath)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "ehcompile produced no CFI entries")
+
+	buildID, err := readBuildID(binPath)
+	require.NoError(t, err)
+	tableID := ehmaps.TableIDForBuildID(buildID)
+
+	// Install maps.
+	require.NoError(t, ehmaps.PopulateCFI(ehmaps.PopulateCFIArgs{
+		TableID: tableID, Entries: entries,
+		OuterMap: objs.CFIRulesMap(), LengthMap: objs.CFILengthsMap(),
+	}))
+	require.NoError(t, ehmaps.PopulateClassification(ehmaps.PopulateClassificationArgs{
+		TableID: tableID, Entries: classifications,
+		OuterMap: objs.CFIClassificationMap(), LengthMap: objs.CFIClassificationLengthsMap(),
+	}))
+
+	mappings, err := loadProcessMappings(workload.Process.Pid, binPath, tableID)
+	require.NoError(t, err)
+	require.NotEmpty(t, mappings, "no matching mappings in /proc/<pid>/maps")
+	require.NoError(t, ehmaps.PopulatePIDMappings(ehmaps.PopulatePIDMappingsArgs{
+		PID: uint32(workload.Process.Pid), Mappings: mappings,
+		OuterMap: objs.PIDMappingsMap(), LengthMap: objs.PIDMappingLengthsMap(),
+	}))
+
+	// Per-CPU perf events at 99 Hz.
+	ncpu := runtime.NumCPU()
+	attr := &unix.PerfEventAttr{
+		Type:   unix.PERF_TYPE_SOFTWARE,
+		Config: unix.PERF_COUNT_SW_CPU_CLOCK,
+		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+		Sample: 99,
+		Bits:   unix.PerfBitFreq | unix.PerfBitDisabled,
+	}
+	var links []link.Link
+	defer func() {
+		for _, l := range links {
+			_ = l.Close()
+		}
+	}()
+	var fds []int
+	defer func() {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+	}()
+	for cpu := range ncpu {
+		fd, err := unix.PerfEventOpen(attr, workload.Process.Pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+		if err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				continue // target not schedulable on this CPU, skip
+			}
+			t.Fatalf("perf_event_open cpu=%d: %v", cpu, err)
+		}
+		fds = append(fds, fd)
+		rl, err := link.AttachRawLink(link.RawLinkOptions{
+			Target:  fd,
+			Program: objs.Program(),
+			Attach:  ebpf.AttachPerfEvent,
+		})
+		require.NoError(t, err)
+		links = append(links, rl)
+		require.NoError(t, unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0))
+	}
+	require.NotEmpty(t, fds, "no perf events attached — workload PID may have exited")
+
+	// Consume ringbuf.
+	rd, err := ringbuf.NewReader(objs.RingbufMap())
+	require.NoError(t, err)
+	defer rd.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var samples, dwarfSamples, maxFrames int
+	for samples < 40 && time.Now().Before(deadline) {
+		rd.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		rec, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			break
+		}
+		samples++
+		if len(rec.RawSample) < 32 {
+			continue
+		}
+		nPCs := int(rec.RawSample[25])
+		walkerFlags := rec.RawSample[26]
+		if nPCs > maxFrames {
+			maxFrames = nPCs
+		}
+		// bit 1 = WALKER_FLAG_DWARF_USED
+		if walkerFlags&0x02 != 0 {
+			dwarfSamples++
+		}
+	}
+
+	t.Logf("samples=%d dwarf_samples=%d max_frames=%d", samples, dwarfSamples, maxFrames)
+	require.Greater(t, samples, 5, "no samples consumed — perf events may not have fired")
+	require.Greater(t, maxFrames, 2, "chains too shallow — walker producing tiny stacks")
+	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release")
+}
+
+// readBuildID reads the GNU build-id from an ELF's .note.gnu.build-id.
+func readBuildID(path string) ([]byte, error) {
+	ef, err := elf.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer ef.Close()
+	for _, sec := range ef.Sections {
+		if sec.Type != elf.SHT_NOTE {
+			continue
+		}
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		if id := extractGNUBuildID(data); id != nil {
+			return id, nil
+		}
+	}
+	return nil, errors.New("no .note.gnu.build-id section")
+}
+
+// extractGNUBuildID walks an ELF .note section's payload looking for the
+// type-3 "GNU"-named note (the build-id). Note format per ELF spec:
+// u32 name_size, u32 desc_size, u32 type, name (padded to 4), desc (padded).
+func extractGNUBuildID(notes []byte) []byte {
+	for len(notes) >= 12 {
+		nameSize := binary.LittleEndian.Uint32(notes[0:4])
+		descSize := binary.LittleEndian.Uint32(notes[4:8])
+		noteType := binary.LittleEndian.Uint32(notes[8:12])
+		p := 12
+		nameEnd := p + int(nameSize)
+		namePadded := (nameEnd + 3) &^ 3
+		if namePadded > len(notes) {
+			return nil
+		}
+		descEnd := namePadded + int(descSize)
+		descPadded := (descEnd + 3) &^ 3
+		if descPadded > len(notes) {
+			return nil
+		}
+		if noteType == 3 && nameSize == 4 && string(notes[p:p+3]) == "GNU" {
+			return notes[namePadded:descEnd]
+		}
+		notes = notes[descPadded:]
+	}
+	return nil
+}
+
+// loadProcessMappings reads /proc/<pid>/maps and returns one PIDMapping per
+// executable-mapped range of binPath. load_bias = vma_start - file_offset.
+func loadProcessMappings(pid int, binPath string, tableID uint64) ([]ehmaps.PIDMapping, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
+	if err != nil {
+		return nil, err
+	}
+	base := binPath[strings.LastIndex(binPath, "/")+1:]
+	var out []ehmaps.PIDMapping
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		if !strings.Contains(fields[1], "x") {
+			continue
+		}
+		if !strings.HasSuffix(fields[5], base) {
+			continue
+		}
+		addrs := strings.SplitN(fields[0], "-", 2)
+		if len(addrs) != 2 {
+			continue
+		}
+		start, err := strconv.ParseUint(addrs[0], 16, 64)
+		if err != nil {
+			continue
+		}
+		end, err := strconv.ParseUint(addrs[1], 16, 64)
+		if err != nil {
+			continue
+		}
+		offset, err := strconv.ParseUint(fields[2], 16, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, ehmaps.PIDMapping{
+			VMAStart: start,
+			VMAEnd:   end,
+			LoadBias: start - offset,
+			TableID:  tableID,
+		})
+	}
+	return out, nil
 }

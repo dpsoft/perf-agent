@@ -6,7 +6,6 @@
 package main
 
 import (
-	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -15,8 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -217,7 +214,7 @@ func populateDwarfMaps(objs *profile.PerfDwarfForTest, pid uint32, binPath strin
 	if err != nil {
 		return fmt.Errorf("ehcompile: %w", err)
 	}
-	buildID, err := readBuildID(binPath)
+	buildID, err := ehmaps.ReadBuildID(binPath)
 	if err != nil {
 		return fmt.Errorf("build-id: %w", err)
 	}
@@ -235,7 +232,7 @@ func populateDwarfMaps(objs *profile.PerfDwarfForTest, pid uint32, binPath strin
 	}); err != nil {
 		return err
 	}
-	mappings, err := loadProcessMappings(int(pid), binPath, tableID)
+	mappings, err := ehmaps.LoadProcessMappings(int(pid), binPath, tableID)
 	if err != nil {
 		return err
 	}
@@ -245,129 +242,5 @@ func populateDwarfMaps(objs *profile.PerfDwarfForTest, pid uint32, binPath strin
 	})
 }
 
-// readBuildID reads the GNU build-id from an ELF's .note.gnu.build-id.
-func readBuildID(path string) ([]byte, error) {
-	ef, err := elf.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer ef.Close()
-	for _, sec := range ef.Sections {
-		if sec.Type != elf.SHT_NOTE {
-			continue
-		}
-		data, err := sec.Data()
-		if err != nil {
-			continue
-		}
-		if id := extractGNUBuildID(data); id != nil {
-			return id, nil
-		}
-	}
-	return nil, errors.New("no .note.gnu.build-id section")
-}
 
-// extractGNUBuildID walks an ELF .note section payload looking for the
-// type-3 "GNU"-named note. ELF note format: u32 name_size, u32 desc_size,
-// u32 type, name (padded to 4), desc (padded to 4).
-func extractGNUBuildID(notes []byte) []byte {
-	for len(notes) >= 12 {
-		nameSize := binary.LittleEndian.Uint32(notes[0:4])
-		descSize := binary.LittleEndian.Uint32(notes[4:8])
-		noteType := binary.LittleEndian.Uint32(notes[8:12])
-		p := 12
-		nameEnd := p + int(nameSize)
-		namePadded := (nameEnd + 3) &^ 3
-		if namePadded > len(notes) {
-			return nil
-		}
-		descEnd := namePadded + int(descSize)
-		descPadded := (descEnd + 3) &^ 3
-		if descPadded > len(notes) {
-			return nil
-		}
-		if noteType == 3 && nameSize == 4 && string(notes[p:p+3]) == "GNU" {
-			return notes[namePadded:descEnd]
-		}
-		notes = notes[descPadded:]
-	}
-	return nil
-}
 
-// loadProcessMappings reads /proc/<pid>/maps and returns one PIDMapping
-// per executable-mapped range of binPath. The load bias is computed via
-// the ELF's executable PT_LOAD — the simple "vma_start - file_offset"
-// formula is wrong for PIE binaries whose PT_LOAD vaddr differs from
-// file_offset (e.g. Rust's release output has a 0x1000 hole).
-func loadProcessMappings(pid int, binPath string, tableID uint64) ([]ehmaps.PIDMapping, error) {
-	ef, err := elf.Open(binPath)
-	if err != nil {
-		return nil, err
-	}
-	defer ef.Close()
-	var execProg *elf.Prog
-	for _, p := range ef.Progs {
-		if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 {
-			execProg = p
-			break
-		}
-	}
-	if execProg == nil {
-		return nil, errors.New("no executable PT_LOAD in ELF")
-	}
-	const pageMask uint64 = ^uint64(0xfff)
-	execVaddrAligned := execProg.Vaddr & pageMask
-	execOffsetAligned := execProg.Off & pageMask
-
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
-	if err != nil {
-		return nil, err
-	}
-	base := binPath[strings.LastIndex(binPath, "/")+1:]
-
-	var loadBias uint64
-	var haveBias bool
-	var out []ehmaps.PIDMapping
-	for line := range strings.SplitSeq(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 6 {
-			continue
-		}
-		if !strings.Contains(fields[1], "x") {
-			continue
-		}
-		if !strings.HasSuffix(fields[5], base) {
-			continue
-		}
-		addrs := strings.SplitN(fields[0], "-", 2)
-		if len(addrs) != 2 {
-			continue
-		}
-		start, err := strconv.ParseUint(addrs[0], 16, 64)
-		if err != nil {
-			continue
-		}
-		end, err := strconv.ParseUint(addrs[1], 16, 64)
-		if err != nil {
-			continue
-		}
-		offset, err := strconv.ParseUint(fields[2], 16, 64)
-		if err != nil {
-			continue
-		}
-		if !haveBias && offset == execOffsetAligned {
-			loadBias = start - execVaddrAligned
-			haveBias = true
-		}
-		out = append(out, ehmaps.PIDMapping{
-			VMAStart: start, VMAEnd: end, TableID: tableID,
-		})
-	}
-	if !haveBias {
-		return nil, errors.New("executable PT_LOAD has no matching /proc/<pid>/maps entry")
-	}
-	for i := range out {
-		out[i].LoadBias = loadBias
-	}
-	return out, nil
-}

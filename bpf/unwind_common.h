@@ -273,4 +273,115 @@ struct {
     __type(value, __u32);
 } pid_mapping_lengths SEC(".maps");
 
+// ----- Lookup helpers (S3).
+//
+// These helpers are called per-frame by the hybrid walker (Task 5). They
+// encapsulate the map-of-maps dance so the walker stays readable.
+
+// mapping_lookup_result carries what mapping_for_pc returns.
+struct mapping_lookup_result {
+    __u64 table_id;
+    __u64 rel_pc;     // pc - load_bias
+    __u8  found;      // 1 if pc falls inside some mapping of this pid
+    __u8  _pad[7];
+};
+
+// mapping_scan_ctx is the bpf_loop callback's state; it also serves as
+// the return channel via ctx->out.
+struct mapping_scan_ctx {
+    __u32 pid;
+    __u64 pc;
+    struct mapping_lookup_result out;
+    void *inner;
+    __u32 len;
+};
+
+// mapping_scan_step checks one mapping slot; stops the loop when we find
+// a hit or when we pass the end of valid entries.
+static long mapping_scan_step(__u32 idx, void *arg) {
+    struct mapping_scan_ctx *ctx = (struct mapping_scan_ctx *)arg;
+    if (idx >= ctx->len) return 1;
+    struct pid_mapping *m = bpf_map_lookup_elem(ctx->inner, &idx);
+    if (!m) return 1;
+    if (ctx->pc >= m->vma_start && ctx->pc < m->vma_end) {
+        ctx->out.table_id = m->table_id;
+        ctx->out.rel_pc = ctx->pc - m->load_bias;
+        ctx->out.found = 1;
+        return 1;
+    }
+    return 0;
+}
+
+// mapping_for_pc finds the first mapping in this pid's list whose vma range
+// contains `pc`. Linear scan over MAX_PID_MAPPINGS; terminates early at the
+// valid length. Returns .found == 0 if nothing matched (e.g. the PC is in a
+// binary we never compiled CFI for, like the kernel's vsyscall or an anon
+// JIT page).
+static __always_inline struct mapping_lookup_result mapping_for_pc(__u32 pid, __u64 pc) {
+    struct mapping_scan_ctx ctx = { .pid = pid, .pc = pc, };
+    ctx.inner = bpf_map_lookup_elem(&pid_mappings, &pid);
+    if (!ctx.inner) return ctx.out;
+    __u32 *lenp = bpf_map_lookup_elem(&pid_mapping_lengths, &pid);
+    if (!lenp || *lenp == 0) return ctx.out;
+    ctx.len = *lenp > MAX_PID_MAPPINGS ? MAX_PID_MAPPINGS : *lenp;
+    bpf_loop(MAX_PID_MAPPINGS, mapping_scan_step, &ctx, 0);
+    return ctx.out;
+}
+
+// BINARY_SEARCH_MAX_ITERS bounds binary search over CFI / classification
+// tables. log2(1_000_000) ≈ 20, so 20 iters suffices for any realistically
+// sized binary.
+#define BINARY_SEARCH_MAX_ITERS 20
+
+// classify_rel_pc returns MODE_FP_SAFE / MODE_FP_LESS / MODE_FALLBACK for the
+// given (table_id, rel_pc). If the table is absent or no row covers rel_pc,
+// returns MODE_FP_SAFE — the walker treats FP-safe and "unknown" identically
+// (spec: "FALLBACK behaves exactly like FP_SAFE").
+static __always_inline __u8 classify_rel_pc(__u64 table_id, __u64 rel_pc) {
+    void *inner = bpf_map_lookup_elem(&cfi_classification, &table_id);
+    if (!inner) return MODE_FP_SAFE;
+    __u32 *lenp = bpf_map_lookup_elem(&cfi_classification_lengths, &table_id);
+    if (!lenp || *lenp == 0) return MODE_FP_SAFE;
+    __u32 lo = 0, hi = *lenp;
+    for (int i = 0; i < BINARY_SEARCH_MAX_ITERS; i++) {
+        if (lo >= hi) break;
+        __u32 mid = lo + (hi - lo) / 2;
+        struct classification *c = bpf_map_lookup_elem(inner, &mid);
+        if (!c) break;
+        if (rel_pc < c->pc_start) {
+            hi = mid;
+        } else if (rel_pc >= c->pc_start + (__u64)c->pc_end_delta) {
+            lo = mid + 1;
+        } else {
+            return c->mode;
+        }
+    }
+    return MODE_FP_SAFE;
+}
+
+// cfi_lookup returns a pointer to the cfi_entry whose PC range contains
+// rel_pc, or NULL if not found. Pointer is into the inner map — safe to
+// read but not to retain across helper calls.
+static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc) {
+    void *inner = bpf_map_lookup_elem(&cfi_rules, &table_id);
+    if (!inner) return NULL;
+    __u32 *lenp = bpf_map_lookup_elem(&cfi_lengths, &table_id);
+    if (!lenp || *lenp == 0) return NULL;
+    __u32 lo = 0, hi = *lenp;
+    for (int i = 0; i < BINARY_SEARCH_MAX_ITERS; i++) {
+        if (lo >= hi) break;
+        __u32 mid = lo + (hi - lo) / 2;
+        struct cfi_entry *e = bpf_map_lookup_elem(inner, &mid);
+        if (!e) return NULL;
+        if (rel_pc < e->pc_start) {
+            hi = mid;
+        } else if (rel_pc >= e->pc_start + (__u64)e->pc_end_delta) {
+            lo = mid + 1;
+        } else {
+            return e;
+        }
+    }
+    return NULL;
+}
+
 #endif // PERF_AGENT_UNWIND_COMMON_H

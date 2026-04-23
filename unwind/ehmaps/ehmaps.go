@@ -10,6 +10,9 @@ package ehmaps
 
 import (
 	"encoding/binary"
+	"fmt"
+
+	"github.com/cilium/ebpf"
 
 	"github.com/dpsoft/perf-agent/unwind/ehcompile"
 )
@@ -83,4 +86,156 @@ func MarshalPIDMapping(m PIDMapping) []byte {
 	binary.LittleEndian.PutUint64(out[16:24], m.LoadBias)
 	binary.LittleEndian.PutUint64(out[24:32], m.TableID)
 	return out
+}
+
+// BPF_F_INNER_MAP enables dynamic sizing of HASH_OF_MAPS inner maps.
+// Defined in linux/bpf.h; redeclared here since cilium/ebpf doesn't
+// re-export it at the package level. Requires kernel 5.10+; our 6.0+
+// floor covers this trivially.
+const BPF_F_INNER_MAP = 0x1000
+
+// MaxPIDMappings mirrors bpf/unwind_common.h's MAX_PID_MAPPINGS. Keep in
+// lockstep. The BPF inner map must be created with this max_entries value
+// for the walker's bpf_loop bound to hold.
+const MaxPIDMappings = 256
+
+// PopulateCFIArgs bundles what the caller already has in memory — an already-
+// compiled set of rules plus the outer and length maps from the loaded BPF
+// program.
+type PopulateCFIArgs struct {
+	TableID   uint64
+	Entries   []ehcompile.CFIEntry
+	OuterMap  *ebpf.Map // cfi_rules (HASH_OF_MAPS)
+	LengthMap *ebpf.Map // cfi_lengths (HASH)
+}
+
+// PopulateCFI creates a right-sized inner ARRAY, fills it with Entries, and
+// installs it into OuterMap keyed by TableID. Also writes the valid length
+// into LengthMap. On success the inner map stays owned by the kernel (the
+// outer map holds a reference); our userspace handle is closed immediately.
+func PopulateCFI(args PopulateCFIArgs) error {
+	if len(args.Entries) == 0 {
+		return fmt.Errorf("ehmaps: PopulateCFI: no entries")
+	}
+	spec := &ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  CFIEntryByteSize,
+		MaxEntries: uint32(len(args.Entries)),
+		Flags:      BPF_F_INNER_MAP,
+	}
+	inner, err := ebpf.NewMap(spec)
+	if err != nil {
+		return fmt.Errorf("ehmaps: create inner cfi map: %w", err)
+	}
+	for i, e := range args.Entries {
+		key := uint32(i)
+		if err := inner.Update(key, MarshalCFIEntry(e), ebpf.UpdateAny); err != nil {
+			inner.Close()
+			return fmt.Errorf("ehmaps: write cfi[%d]: %w", i, err)
+		}
+	}
+	if err := args.OuterMap.Update(args.TableID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
+		inner.Close()
+		return fmt.Errorf("ehmaps: install inner cfi map: %w", err)
+	}
+	inner.Close()
+
+	length := uint32(len(args.Entries))
+	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("ehmaps: write cfi length: %w", err)
+	}
+	return nil
+}
+
+// PopulateClassificationArgs mirrors PopulateCFIArgs but for classification.
+type PopulateClassificationArgs struct {
+	TableID   uint64
+	Entries   []ehcompile.Classification
+	OuterMap  *ebpf.Map // cfi_classification
+	LengthMap *ebpf.Map // cfi_classification_lengths
+}
+
+func PopulateClassification(args PopulateClassificationArgs) error {
+	if len(args.Entries) == 0 {
+		return fmt.Errorf("ehmaps: PopulateClassification: no entries")
+	}
+	spec := &ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  ClassificationByteSize,
+		MaxEntries: uint32(len(args.Entries)),
+		Flags:      BPF_F_INNER_MAP,
+	}
+	inner, err := ebpf.NewMap(spec)
+	if err != nil {
+		return fmt.Errorf("ehmaps: create inner classification map: %w", err)
+	}
+	for i, c := range args.Entries {
+		key := uint32(i)
+		if err := inner.Update(key, MarshalClassification(c), ebpf.UpdateAny); err != nil {
+			inner.Close()
+			return fmt.Errorf("ehmaps: write classification[%d]: %w", i, err)
+		}
+	}
+	if err := args.OuterMap.Update(args.TableID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
+		inner.Close()
+		return fmt.Errorf("ehmaps: install inner classification map: %w", err)
+	}
+	inner.Close()
+
+	length := uint32(len(args.Entries))
+	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("ehmaps: write classification length: %w", err)
+	}
+	return nil
+}
+
+// PopulatePIDMappingsArgs installs a list of mappings for one PID. The
+// inner map is always sized at MaxPIDMappings so the BPF walker's bpf_loop
+// bound is a compile-time constant.
+type PopulatePIDMappingsArgs struct {
+	PID       uint32
+	Mappings  []PIDMapping
+	OuterMap  *ebpf.Map // pid_mappings
+	LengthMap *ebpf.Map // pid_mapping_lengths
+}
+
+func PopulatePIDMappings(args PopulatePIDMappingsArgs) error {
+	if len(args.Mappings) == 0 {
+		return fmt.Errorf("ehmaps: PopulatePIDMappings: no mappings")
+	}
+	if len(args.Mappings) > MaxPIDMappings {
+		return fmt.Errorf("ehmaps: PopulatePIDMappings: %d > MaxPIDMappings=%d",
+			len(args.Mappings), MaxPIDMappings)
+	}
+	spec := &ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  PIDMappingByteSize,
+		MaxEntries: MaxPIDMappings,
+		Flags:      BPF_F_INNER_MAP,
+	}
+	inner, err := ebpf.NewMap(spec)
+	if err != nil {
+		return fmt.Errorf("ehmaps: create inner pid_mappings map: %w", err)
+	}
+	for i, m := range args.Mappings {
+		key := uint32(i)
+		if err := inner.Update(key, MarshalPIDMapping(m), ebpf.UpdateAny); err != nil {
+			inner.Close()
+			return fmt.Errorf("ehmaps: write pid_mapping[%d]: %w", i, err)
+		}
+	}
+	if err := args.OuterMap.Update(args.PID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
+		inner.Close()
+		return fmt.Errorf("ehmaps: install inner pid_mappings map: %w", err)
+	}
+	inner.Close()
+
+	length := uint32(len(args.Mappings))
+	if err := args.LengthMap.Update(args.PID, length, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("ehmaps: write pid mapping length: %w", err)
+	}
+	return nil
 }

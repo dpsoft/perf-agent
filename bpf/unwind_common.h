@@ -192,6 +192,7 @@ BTF_MATERIALIZE(pid_mapping)
 struct cfi_inner {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1); // template only; actual inner maps are sized per binary at populate time
+    __uint(map_flags, BPF_F_INNER_MAP);
     __type(key, __u32);
     __type(value, struct cfi_entry);
 };
@@ -199,6 +200,7 @@ struct cfi_inner {
 struct classification_inner {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1); // template only; actual inner maps are sized per binary at populate time
+    __uint(map_flags, BPF_F_INNER_MAP);
     __type(key, __u32);
     __type(value, struct classification);
 };
@@ -206,6 +208,7 @@ struct classification_inner {
 struct pid_mapping_inner {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, MAX_PID_MAPPINGS);
+    __uint(map_flags, BPF_F_INNER_MAP);
     __type(key, __u32);
     __type(value, struct pid_mapping);
 };

@@ -160,7 +160,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
 			}
 			a.cpuProfiler = dwarfProfilerAdapter{p}
-			log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+			}
 		default:
 			profiler, err := profile.NewProfiler(
 				a.config.PID,
@@ -196,7 +200,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				return fmt.Errorf("create DWARF off-CPU profiler: %w", err)
 			}
 			a.offcpuProfiler = dwarfOffCPUProfilerAdapter{p}
-			log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+			if a.config.SystemWide {
+				log.Println("Off-CPU profiler enabled (system-wide, DWARF)")
+			} else {
+				log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+			}
 		default:
 			profiler, err := offcpu.NewProfiler(
 				a.config.PID,

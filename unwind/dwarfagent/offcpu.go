@@ -1,56 +1,32 @@
 package dwarfagent
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"sync"
-	"time"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
-	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
-	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 )
 
 // OffCPUProfiler is the DWARF-capable off-CPU profiler. Same public
-// shape as offcpu.Profiler — Collect / CollectAndWrite / Close — so
-// perfagent.Agent can swap between the two on --unwind.
+// shape as offcpu.Profiler (Collect / CollectAndWrite / Close). Most
+// lifecycle lives in the embedded *session; OffCPUProfiler only adds
+// the single tp_btf link.
 type OffCPUProfiler struct {
-	pid  int
-	tags []string
-
-	objs       *profile.OffCPUDwarf
-	store      *ehmaps.TableStore
-	tracker    *ehmaps.PIDTracker
-	watcher    mmapEventSourceCloser
-	link       link.Link
-	ringReader *ringbuf.Reader
-
-	symbolizer *blazesym.Symbolizer
-
-	stop      chan struct{}
-	trackerWG sync.WaitGroup
-	readerWG  sync.WaitGroup
-
-	mu      sync.Mutex
-	samples map[sampleKey]uint64 // value = accumulated blocking-ns
-	stacks  map[sampleKey][]uint64
+	*session
+	link link.Link
 }
 
-// NewOffCPUProfiler loads the offcpu_dwarf BPF program, primes the
-// ehmaps lifecycle (CFI/pid_mappings), attaches the tp_btf program,
+// NewOffCPUProfiler loads the offcpu_dwarf BPF program, wires ehmaps
+// via newSession, attaches the tp_btf program via link.AttachTracing,
 // and starts the ringbuf reader + tracker goroutines.
 //
-// On error, every resource created up to the failure point is closed
-// before returning. Callers should NOT call Close on a Profiler they
-// received as (nil, err).
+// On error, every resource created is closed before returning.
+// Callers should NOT call Close on an OffCPUProfiler they received
+// as (nil, err).
 func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
@@ -66,199 +42,47 @@ func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*O
 		}
 	}
 
-	store := ehmaps.NewTableStore(
-		objs.CFIRulesMap(), objs.CFILengthsMap(),
-		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
-	)
-	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
-
-	if systemWide {
-		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
-		if err != nil {
-			objs.Close()
-			return nil, fmt.Errorf("attach all processes: %w", err)
-		}
-		log.Printf("dwarfagent (offcpu): attached %d distinct binaries across %d PIDs", nTables, nPIDs)
-	} else {
-		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
-		if err != nil {
-			objs.Close()
-			return nil, fmt.Errorf("attach initial mappings: %w", err)
-		}
-		log.Printf("dwarfagent (offcpu): attached %d binaries from /proc/%d/maps", n, pid)
-	}
-
-	var watcher mmapEventSourceCloser
-	if systemWide {
-		cpuInts := make([]int, 0, len(cpus))
-		for _, c := range cpus {
-			cpuInts = append(cpuInts, int(c))
-		}
-		mw, err := ehmaps.NewMultiCPUMmapWatcher(cpuInts)
-		if err != nil {
-			objs.Close()
-			return nil, fmt.Errorf("multi-cpu mmap watcher: %w", err)
-		}
-		watcher = mw
-	} else {
-		w, err := ehmaps.NewMmapWatcher(uint32(pid))
-		if err != nil {
-			objs.Close()
-			return nil, fmt.Errorf("mmap watcher: %w", err)
-		}
-		watcher = w
-	}
-
-	tpLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.Program(),
-	})
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)")
 	if err != nil {
-		watcher.Close()
 		objs.Close()
+		return nil, err
+	}
+
+	tpLink, err := link.AttachTracing(link.TracingOptions{Program: objs.Program()})
+	if err != nil {
+		_ = sess.close()
 		return nil, fmt.Errorf("attach tp_btf: %w", err)
 	}
 
-	rd, err := ringbuf.NewReader(objs.RingbufMap())
-	if err != nil {
-		tpLink.Close()
-		watcher.Close()
-		objs.Close()
-		return nil, fmt.Errorf("ringbuf reader: %w", err)
-	}
-
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		rd.Close()
-		tpLink.Close()
-		watcher.Close()
-		objs.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
-	p := &OffCPUProfiler{
-		pid:        pid,
-		tags:       tags,
-		objs:       objs,
-		store:      store,
-		tracker:    tracker,
-		watcher:    watcher,
-		link:       tpLink,
-		ringReader: rd,
-		symbolizer: symbolizer,
-		stop:       make(chan struct{}),
-		samples:    map[sampleKey]uint64{},
-	}
-
-	p.trackerWG.Add(1)
-	go func() {
-		defer p.trackerWG.Done()
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() {
-			<-p.stop
-			cancel()
-		}()
-		p.tracker.Run(ctx, p.watcher)
-	}()
-
-	p.readerWG.Add(1)
-	go p.consume()
+	p := &OffCPUProfiler{session: sess, link: tpLink}
+	sess.runTracker()
+	sess.readerWG.Add(1)
+	go sess.consumeRingbuf(aggregateOffCPUSample)
 
 	return p, nil
 }
 
-// consume is the ringbuf reader goroutine. Adds Sample.Value (blocking-ns)
-// into the aggregated total for each (pid, stack) key.
-func (p *OffCPUProfiler) consume() {
-	defer p.readerWG.Done()
-	for {
-		select {
-		case <-p.stop:
-			return
-		default:
-		}
-		p.ringReader.SetDeadline(time.Now().Add(200 * time.Millisecond))
-		rec, err := p.ringReader.Read()
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
-			}
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
-			log.Printf("dwarfagent (offcpu): ringbuf read: %v", err)
-			return
-		}
-		s, err := parseSample(rec.RawSample)
-		if err != nil {
-			log.Printf("dwarfagent (offcpu): parseSample: %v", err)
-			continue
-		}
-		if len(s.PCs) == 0 || s.Value == 0 {
-			continue
-		}
-		key := sampleKey{pid: s.PID, hash: hashPCs(s.PCs)}
-		p.mu.Lock()
-		p.samples[key] += s.Value
-		if p.stacks == nil {
-			p.stacks = map[sampleKey][]uint64{}
-		}
-		if _, have := p.stacks[key]; !have {
-			p.stacks[key] = append([]uint64(nil), s.PCs...)
-		}
-		p.mu.Unlock()
+// aggregateOffCPUSample is the off-CPU-specific ringbuf aggregator:
+// samples that never saw a switch-IN (Value == 0) are skipped; valid
+// samples add their blocking-ns into the accumulator.
+func aggregateOffCPUSample(s *session, sample Sample) {
+	if sample.Value == 0 {
+		return
 	}
+	key := sampleKey{pid: sample.PID, hash: hashPCs(sample.PCs)}
+	s.mu.Lock()
+	s.samples[key] += sample.Value
+	s.stashStack(key, sample.PCs)
+	s.mu.Unlock()
 }
 
-// Collect symbolizes accumulated off-CPU samples and writes a gzipped
-// pprof to w. SampleType is off-CPU; Value is accumulated blocking-ns.
+// Collect writes a gzipped pprof to w. SampleType is off-CPU; sample
+// values are accumulated blocking-ns.
 func (p *OffCPUProfiler) Collect(w io.Writer) error {
-	p.mu.Lock()
-	samples := make(map[sampleKey]uint64, len(p.samples))
-	stacks := make(map[sampleKey][]uint64, len(p.stacks))
-	for k, v := range p.samples {
-		samples[k] = v
-	}
-	for k, v := range p.stacks {
-		stacks[k] = v
-	}
-	p.mu.Unlock()
-
-	if len(samples) == 0 {
-		log.Println("dwarfagent (offcpu): no samples collected")
-		return nil
-	}
-
-	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
-		PerPIDProfile: false,
-		Comments:      p.tags,
-	})
-
-	for key, totalNs := range samples {
-		frames := symbolizePID(p.symbolizer, key.pid, stacks[key])
-		sample := pprof.ProfileSample{
-			Pid:         key.pid,
-			SampleType:  pprof.SampleTypeOffCpu,
-			Aggregation: pprof.SampleAggregated,
-			Stack:       frames,
-			Value:       totalNs,
-		}
-		builders.AddSample(&sample)
-	}
-
-	for _, b := range builders.Builders {
-		if _, err := b.Write(w); err != nil {
-			return fmt.Errorf("write profile: %w", err)
-		}
-		break
-	}
-	return nil
+	return p.session.collect(w, pprof.SampleTypeOffCpu, 0)
 }
 
-// CollectAndWrite is a convenience wrapper for file output.
+// CollectAndWrite is a file-path convenience wrapper.
 func (p *OffCPUProfiler) CollectAndWrite(outputPath string) error {
 	f, err := os.Create(outputPath)
 	if err != nil {
@@ -268,24 +92,12 @@ func (p *OffCPUProfiler) CollectAndWrite(outputPath string) error {
 	return p.Collect(f)
 }
 
-// Close stops goroutines and releases all resources. Idempotent at the
-// stop-channel level. Waits for goroutines to exit before unmapping
-// so an in-flight drain can't fault on freed memory.
+// Close closes the tp_btf link, then delegates the rest to
+// session.close. Idempotent.
 func (p *OffCPUProfiler) Close() error {
-	select {
-	case <-p.stop:
-	default:
-		close(p.stop)
-	}
-	p.readerWG.Wait()
-	p.ringReader.Close()
-	p.watcher.Close()
-	p.trackerWG.Wait()
 	if p.link != nil {
 		_ = p.link.Close()
+		p.link = nil
 	}
-	if p.symbolizer != nil {
-		p.symbolizer.Close()
-	}
-	return p.objs.Close()
+	return p.session.close()
 }

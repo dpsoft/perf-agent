@@ -14,3 +14,17 @@ type Mapping struct {
 	BuildID string // hex; empty if no .note.gnu.build-id
 	IsExec  bool
 }
+
+// Option configures a Resolver.
+type Option func(*resolverConfig)
+
+type resolverConfig struct {
+	procRoot string
+}
+
+// WithProcRoot overrides the filesystem root used to resolve /proc
+// paths. Defaults to "/proc". Intended for unit tests with fake
+// per-PID fixtures.
+func WithProcRoot(path string) Option {
+	return func(c *resolverConfig) { c.procRoot = path }
+}

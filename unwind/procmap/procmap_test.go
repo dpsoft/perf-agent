@@ -1,6 +1,7 @@
 package procmap
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -49,5 +50,79 @@ func TestReadBuildIDMissing(t *testing.T) {
 	id, err := readBuildID("/nonexistent/path/to/nothing")
 	if err == nil {
 		t.Fatalf("expected error, got id=%q", id)
+	}
+}
+
+func TestResolverLookupHitMiss(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	m, ok := r.Lookup(4242, 0x00401234)
+	if !ok {
+		t.Fatal("expected lookup hit in /usr/bin/target range")
+	}
+	if m.Path != "/usr/bin/target" {
+		t.Errorf("got Path=%q, want /usr/bin/target", m.Path)
+	}
+
+	_, ok = r.Lookup(4242, 0xdeadbeef)
+	if ok {
+		t.Fatal("expected lookup miss outside any mapping")
+	}
+}
+
+func TestResolverMissingPID(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	_, ok := r.Lookup(9999999, 0x00401234)
+	if ok {
+		t.Fatal("expected miss for non-existent PID")
+	}
+	// Second call should hit the cached empty entry, not re-read /proc.
+	_, ok = r.Lookup(9999999, 0x00401234)
+	if ok {
+		t.Fatal("second lookup should also miss")
+	}
+}
+
+func TestResolverInvalidate(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	_, ok := r.Lookup(4242, 0x00401234)
+	if !ok {
+		t.Fatal("first lookup should hit")
+	}
+	r.Invalidate(4242)
+	// Still hits because the fixture file is unchanged, but the path
+	// re-populated. Just ensures Invalidate doesn't panic and Lookup
+	// keeps working afterward.
+	_, ok = r.Lookup(4242, 0x00401234)
+	if !ok {
+		t.Fatal("lookup after Invalidate should still hit")
+	}
+}
+
+func TestResolverConcurrentLookup(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	const N = 32
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		go func() {
+			_, ok := r.Lookup(4242, 0x00401234)
+			if !ok {
+				errs <- fmt.Errorf("lookup miss")
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for i := 0; i < N; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

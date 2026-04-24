@@ -1278,3 +1278,63 @@ func TestPerfAgentDwarfUnwind(t *testing.T) {
 		t.Fatalf("no function named *cpu_intensive_work* in pprof; first few: %v", names)
 	}
 }
+
+// TestPerfAgentOffCPUDwarfUnwind runs the full perf-agent binary with
+// --offcpu --unwind dwarf against the rust-workload and verifies the
+// resulting off-CPU pprof has samples with non-zero blocking-ns.
+//
+// rust-workload (not go io_bound) because Go binaries have no .eh_frame
+// — ehcompile needs .eh_frame to produce CFI. rust-workload is
+// CPU-bound but its threads context-switch routinely, firing enough
+// off-CPU samples to validate the pipeline end-to-end.
+func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+	agentPath := getAgentPath(t)
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		_ = workload.Process.Kill()
+		_ = workload.Wait()
+	}()
+	time.Sleep(2 * time.Second)
+
+	outputFile := "offcpu-dwarf.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath,
+		"--offcpu",
+		"--offcpu-output", outputFile,
+		"--unwind", "dwarf",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+	assert.FileExists(t, outputFile)
+
+	prof := parseProfile(t, outputFile)
+	require.NotNil(t, prof)
+	require.Greater(t, len(prof.Sample), 0, "off-CPU profile should have samples")
+
+	var totalNs int64
+	for _, s := range prof.Sample {
+		for _, v := range s.Value {
+			totalNs += v
+		}
+	}
+	require.Greater(t, totalNs, int64(0), "off-CPU profile should have non-zero blocking-ns values")
+	t.Logf("off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
+}

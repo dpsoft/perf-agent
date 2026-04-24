@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -133,6 +134,17 @@ func (t *PIDTracker) Run(ctx context.Context, w *MmapWatcher) {
 				if err := t.Attach(ev.PID, ev.Filename); err != nil {
 					slog.Debug("ehmaps: Attach failed", "pid", ev.PID, "path", ev.Filename, "err", err)
 				}
+			case ForkEvent:
+				// Only act on group-leader fork (whole new process).
+				// Per-thread FORKs fire for every clone inside an
+				// existing tracked TGID — no-op those.
+				if ev.TID != ev.PID {
+					continue
+				}
+				n, err := AttachAllMappings(t, ev.PID)
+				if err != nil || n == 0 {
+					slog.Debug("ehmaps: fork Attach failed", "pid", ev.PID, "err", err)
+				}
 			case ExitEvent:
 				// Only act on group-leader exit (whole process gone).
 				// Per-thread exits still fire PERF_RECORD_EXIT but leave
@@ -207,6 +219,64 @@ func AttachAllMappings(t *PIDTracker, pid uint32) (int, error) {
 		return 0, firstErr
 	}
 	return n, nil
+}
+
+// AttachAllProcesses walks /proc/* and calls AttachAllMappings for every
+// numeric PID directory that still has a live /proc/<pid>/maps.
+// Returns (pidCount, distinctBinaryCount, err). The distinct-binary
+// count comes from observing the TableStore's CFIRules outer map before
+// and after the scan; the walker tolerates individual PID failures
+// (process vanished between listdir and open).
+//
+// Intended for system-wide startup. After this returns, follow-up
+// tracking relies on per-CPU MmapWatchers + FORK events.
+func AttachAllProcesses(t *PIDTracker) (pids, tables int, err error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, 0, fmt.Errorf("read /proc: %w", err)
+	}
+	beforeCFI := countCFIRules(t.store)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.ParseUint(e.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+		if pid == 0 {
+			continue
+		}
+		// Skip self so the agent doesn't track itself — it has no
+		// actionable samples from its own code in practice.
+		if int(pid) == os.Getpid() {
+			continue
+		}
+		n, err := AttachAllMappings(t, uint32(pid))
+		if err != nil || n == 0 {
+			slog.Debug("ehmaps: AttachAllProcesses: skip", "pid", pid, "err", err)
+			continue
+		}
+		pids++
+	}
+	afterCFI := countCFIRules(t.store)
+	return pids, afterCFI - beforeCFI, nil
+}
+
+// countCFIRules returns the number of distinct table_ids currently
+// present in the TableStore's CFIRules outer map.
+func countCFIRules(s *TableStore) int {
+	if s == nil || s.CFIRules == nil {
+		return 0
+	}
+	it := s.CFIRules.Iterate()
+	var k uint64
+	var v uint32
+	n := 0
+	for it.Next(&k, &v) {
+		n++
+	}
+	return n
 }
 
 // looksExecutable filters MMAP2 events down to those worth attaching to.

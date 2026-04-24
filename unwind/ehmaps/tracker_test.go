@@ -177,3 +177,31 @@ func TestAttachAllMappings(t *testing.T) {
 		t.Fatalf("cfi_lengths has %d entries, AttachAllMappings claimed %d", installed, n)
 	}
 }
+
+// TestAttachAllProcesses scans /proc/* and Attaches every eligible PID
+// it finds. On a typical Linux host we should see at least one process
+// attached with at least one distinct binary (the caller's libc / ld
+// are typical hits even if we skip ourselves).
+func TestAttachAllProcesses(t *testing.T) {
+	requireBPFCaps(t)
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit: %v", err)
+	}
+	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+
+	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
+
+	nPIDs, nTables, err := AttachAllProcesses(tracker)
+	if err != nil {
+		t.Fatalf("AttachAllProcesses: %v", err)
+	}
+	if nPIDs < 1 {
+		t.Fatalf("AttachAllProcesses attached %d PIDs, want >= 1", nPIDs)
+	}
+	if nTables < 1 {
+		t.Fatalf("AttachAllProcesses installed %d CFI tables, want >= 1", nTables)
+	}
+	t.Logf("attached %d PIDs across %d distinct binaries", nPIDs, nTables)
+}

@@ -37,12 +37,31 @@ func (a dwarfProfilerAdapter) Close() {
 	}
 }
 
+// offcpuProfiler is the narrow shape both offcpu.Profiler and
+// dwarfagent.OffCPUProfiler satisfy, letting Agent dispatch on --unwind
+// for the off-CPU path.
+type offcpuProfiler interface {
+	Collect(w io.Writer) error
+	CollectAndWrite(path string) error
+	Close()
+}
+
+// dwarfOffCPUProfilerAdapter wraps dwarfagent.OffCPUProfiler so its
+// Close() matches the void Close() the FP offcpu profiler exposes.
+type dwarfOffCPUProfilerAdapter struct{ *dwarfagent.OffCPUProfiler }
+
+func (a dwarfOffCPUProfilerAdapter) Close() {
+	if err := a.OffCPUProfiler.Close(); err != nil {
+		log.Printf("dwarfagent.OffCPUProfiler.Close: %v", err)
+	}
+}
+
 // Agent is the main performance monitoring agent.
 type Agent struct {
 	config *Config
 
 	cpuProfiler    cpuProfiler
-	offcpuProfiler *offcpu.Profiler
+	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
 
 	mu      sync.Mutex
@@ -166,20 +185,34 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Start off-CPU profiler if enabled
 	if a.config.EnableOffCPUProfile {
-		profiler, err := offcpu.NewProfiler(
-			a.config.PID,
-			a.config.SystemWide,
-			a.config.Tags,
-		)
-		if err != nil {
-			a.cleanup()
-			return fmt.Errorf("create off-CPU profiler: %w", err)
-		}
-		a.offcpuProfiler = profiler
-		if a.config.SystemWide {
-			log.Println("Off-CPU profiler enabled (system-wide)")
-		} else {
-			log.Printf("Off-CPU profiler enabled (PID: %d)", a.config.PID)
+		switch a.config.Unwind {
+		case "dwarf":
+			if a.config.SystemWide {
+				return fmt.Errorf("--unwind dwarf does not support system-wide mode yet (S7)")
+			}
+			p, err := dwarfagent.NewOffCPUProfiler(a.config.PID, a.config.Tags)
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create DWARF off-CPU profiler: %w", err)
+			}
+			a.offcpuProfiler = dwarfOffCPUProfilerAdapter{p}
+			log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+		default:
+			profiler, err := offcpu.NewProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				a.config.Tags,
+			)
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create off-CPU profiler: %w", err)
+			}
+			a.offcpuProfiler = profiler
+			if a.config.SystemWide {
+				log.Println("Off-CPU profiler enabled (system-wide)")
+			} else {
+				log.Printf("Off-CPU profiler enabled (PID: %d)", a.config.PID)
+			}
 		}
 	}
 

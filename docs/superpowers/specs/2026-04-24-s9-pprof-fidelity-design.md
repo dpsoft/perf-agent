@@ -224,8 +224,19 @@ Exactly one `pprof.Mapping` per sentinel per builder. Kernel VA space is shared 
 
 - `NewProfiler` creates `procmap.Resolver`, stores on `Profiler`.
 - `Collect` threads the resolver into `BuildersOptions`.
-- No invalidation logic — symbolize happens in one Collect pass per run; PID reuse within a window is not a realistic concern.
 - `Close` calls `resolver.Close`.
+
+**On live invalidation — why there is none.** The FP capture path uses `BPF_MAP_TYPE_STACK_TRACE` + `bpf_get_stackid` and aggregates samples into a BPF HASH keyed by `(pid, user_stack_id, kern_stack_id, comm)` with a count value (`bpf/perf.bpf.c:19-27,104-108`). Samples carry **no timestamp**. Even if we wired an MMAP2 ringbuf watcher parallel to the DWARF path, we could not know which mapping snapshot was active when a particular sample was captured — the best we could do is still a single Resolver snapshot at Collect time.
+
+**Consequence — mis-attribution window.** For the duration of a profile run, the resolver lazily caches `/proc/<pid>/maps` at first Lookup and holds it. Mapping churn during the run produces mis-attribution:
+
+| Churn during run | Outcome at Collect |
+|------------------|--------------------|
+| `dlopen` of a new SO | Post-churn maps include it → samples land correctly |
+| `dlclose` of an SO | Post-churn maps lack it → fallback frame (`ok=false`) |
+| `exec` (same PID, new image) | Post-churn maps show new image → pre-exec samples mis-attribute |
+
+For typical perf-agent windows (10–30s) on stable workloads, none of these trigger. Acceptable for S9-narrow; a future MmapWatcher for the FP path would narrow the `dlclose` case but cannot fix the fundamental timestamp gap.
 
 ### 8.2 DWARF profiler (`unwind/dwarfagent/`)
 

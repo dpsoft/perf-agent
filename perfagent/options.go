@@ -50,6 +50,12 @@ type Config struct {
 	// MetricsExporters are the exporters to use for metrics output.
 	MetricsExporters []metrics.Exporter
 
+	// Unwind selects the stack-unwinding strategy for --profile and
+	// --offcpu modes. Valid values: "fp" (frame pointer — default),
+	// "dwarf" (DWARF CFI), "auto" (currently routes to fp; see S8 in
+	// the design doc). Empty string defaults to "fp".
+	Unwind string
+
 	// CPUs is the list of CPUs to monitor. If nil, all online CPUs are used.
 	CPUs []uint
 }
@@ -141,6 +147,13 @@ func WithMetricsExporter(exp metrics.Exporter) Option {
 func WithCPUs(cpus []uint) Option {
 	return func(c *Config) {
 		c.CPUs = cpus
+	}
+}
+
+// WithUnwind selects the stack-unwinding strategy. See Config.Unwind.
+func WithUnwind(mode string) Option {
+	return func(c *Config) {
+		c.Unwind = mode
 	}
 }
 

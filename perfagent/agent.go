@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 
@@ -15,13 +16,32 @@ import (
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
+
+// cpuProfiler is the narrow shape both profile.Profiler and
+// dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
+type cpuProfiler interface {
+	Collect(w io.Writer) error
+	CollectAndWrite(path string) error
+	Close()
+}
+
+// dwarfProfilerAdapter wraps dwarfagent.Profiler so its Close() matches
+// the void Close() the FP profiler exposes (see cpuProfiler interface).
+type dwarfProfilerAdapter struct{ *dwarfagent.Profiler }
+
+func (a dwarfProfilerAdapter) Close() {
+	if err := a.Profiler.Close(); err != nil {
+		log.Printf("dwarfagent.Close: %v", err)
+	}
+}
 
 // Agent is the main performance monitoring agent.
 type Agent struct {
 	config *Config
 
-	cpuProfiler    *profile.Profiler
+	cpuProfiler    cpuProfiler
 	offcpuProfiler *offcpu.Profiler
 	pmuMonitor     *cpu.PMUMonitor
 
@@ -108,21 +128,39 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
-		profiler, err := profile.NewProfiler(
-			a.config.PID,
-			a.config.SystemWide,
-			cpus,
-			a.config.Tags,
-			a.config.SampleRate,
-		)
-		if err != nil {
-			return fmt.Errorf("create CPU profiler: %w", err)
-		}
-		a.cpuProfiler = profiler
-		if a.config.SystemWide {
-			log.Printf("CPU profiler enabled (system-wide, %d Hz)", a.config.SampleRate)
-		} else {
-			log.Printf("CPU profiler enabled (PID: %d, %d Hz)", a.config.PID, a.config.SampleRate)
+		switch a.config.Unwind {
+		case "dwarf":
+			if a.config.SystemWide {
+				return fmt.Errorf("--unwind dwarf does not support system-wide mode yet (S7)")
+			}
+			p, err := dwarfagent.NewProfiler(
+				a.config.PID,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+			)
+			if err != nil {
+				return fmt.Errorf("create DWARF CPU profiler: %w", err)
+			}
+			a.cpuProfiler = dwarfProfilerAdapter{p}
+			log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+		default:
+			profiler, err := profile.NewProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+			)
+			if err != nil {
+				return fmt.Errorf("create CPU profiler: %w", err)
+			}
+			a.cpuProfiler = profiler
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz)", a.config.PID, a.config.SampleRate)
+			}
 		}
 	}
 

@@ -149,11 +149,9 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
 		case "dwarf":
-			if a.config.SystemWide {
-				return fmt.Errorf("--unwind dwarf does not support system-wide mode yet (S7)")
-			}
 			p, err := dwarfagent.NewProfiler(
 				a.config.PID,
+				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,

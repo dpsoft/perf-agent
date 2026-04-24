@@ -45,7 +45,7 @@ func TestProfilerEndToEnd(t *testing.T) {
 		cpus = append(cpus, uint(i))
 	}
 
-	p, err := dwarfagent.NewProfiler(workload.Process.Pid, cpus, nil, 99)
+	p, err := dwarfagent.NewProfiler(workload.Process.Pid, false, cpus, nil, 99)
 	if err != nil {
 		t.Fatalf("NewProfiler: %v", err)
 	}

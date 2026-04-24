@@ -23,6 +23,15 @@ import (
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 )
 
+// mmapEventSourceCloser is the local-to-dwarfagent interface that both
+// *ehmaps.MmapWatcher and *ehmaps.MultiCPUMmapWatcher satisfy, letting
+// us store either concrete type in the Profiler struct and close it
+// uniformly.
+type mmapEventSourceCloser interface {
+	Events() <-chan ehmaps.MmapEventRecord
+	Close() error
+}
+
 // Profiler is the DWARF-capable CPU profiler. It has the same public
 // shape as profile.Profiler — Collect / CollectAndWrite / Close —
 // so perfagent.Agent can swap between the two on --unwind.
@@ -34,7 +43,7 @@ type Profiler struct {
 	objs       *profile.PerfDwarf
 	store      *ehmaps.TableStore
 	tracker    *ehmaps.PIDTracker
-	watcher    *ehmaps.MmapWatcher
+	watcher    mmapEventSourceCloser
 	perfFDs    []int
 	perfLinks  []link.Link
 	ringReader *ringbuf.Reader
@@ -66,17 +75,19 @@ type sampleKey struct {
 // On error, every resource created up to the failure point is closed
 // before returning. Callers should NOT call Close on a Profiler they
 // received as (nil, err).
-func NewProfiler(pid int, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
-	if pid <= 0 {
-		return nil, fmt.Errorf("dwarfagent: pid must be > 0 (system-wide is S7 scope)")
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
+	if !systemWide && pid <= 0 {
+		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
-	objs, err := profile.LoadPerfDwarf(false)
+	objs, err := profile.LoadPerfDwarf(systemWide)
 	if err != nil {
 		return nil, fmt.Errorf("load perf_dwarf: %w", err)
 	}
-	if err := objs.AddPID(uint32(pid)); err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("add pid to filter: %w", err)
+	if !systemWide {
+		if err := objs.AddPID(uint32(pid)); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("add pid to filter: %w", err)
+		}
 	}
 
 	store := ehmaps.NewTableStore(
@@ -85,17 +96,41 @@ func NewProfiler(pid int, cpus []uint, tags []string, sampleRate int) (*Profiler
 	)
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 
-	nAttached, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("attach initial mappings: %w", err)
+	if systemWide {
+		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("attach all processes: %w", err)
+		}
+		log.Printf("dwarfagent: attached %d distinct binaries across %d PIDs", nTables, nPIDs)
+	} else {
+		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("attach initial mappings: %w", err)
+		}
+		log.Printf("dwarfagent: attached %d binaries from /proc/%d/maps", n, pid)
 	}
-	log.Printf("dwarfagent: attached %d binaries from /proc/%d/maps", nAttached, pid)
 
-	watcher, err := ehmaps.NewMmapWatcher(uint32(pid))
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("mmap watcher: %w", err)
+	var watcher mmapEventSourceCloser
+	if systemWide {
+		cpuInts := make([]int, 0, len(cpus))
+		for _, c := range cpus {
+			cpuInts = append(cpuInts, int(c))
+		}
+		mw, err := ehmaps.NewMultiCPUMmapWatcher(cpuInts)
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("multi-cpu mmap watcher: %w", err)
+		}
+		watcher = mw
+	} else {
+		w, err := ehmaps.NewMmapWatcher(uint32(pid))
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("mmap watcher: %w", err)
+		}
+		watcher = w
 	}
 
 	// Per-CPU perf events. pid=-1 + BPF-side pids filter = same pattern

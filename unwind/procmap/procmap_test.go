@@ -126,3 +126,34 @@ func TestResolverConcurrentLookup(t *testing.T) {
 		}
 	}
 }
+
+func TestResolverInvalidateAddrNoOpInRange(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	_, _ = r.Lookup(7777, 0x00701000) // populate
+	before := r.populateCountForTest(7777)
+
+	r.InvalidateAddr(7777, 0x00701000) // in-range -> no-op
+	after := r.populateCountForTest(7777)
+
+	if after != before {
+		t.Fatalf("populate count changed %d -> %d after in-range InvalidateAddr", before, after)
+	}
+}
+
+func TestResolverInvalidateAddrOutOfRangeForcesReparse(t *testing.T) {
+	r := NewResolver(WithProcRoot("testdata/proc"))
+	defer r.Close()
+
+	_, _ = r.Lookup(7777, 0x00701000) // populate
+	before := r.populateCountForTest(7777)
+
+	r.InvalidateAddr(7777, 0xdeadbeef) // out-of-range -> evict
+	_, _ = r.Lookup(7777, 0x00701000)  // re-populate
+	after := r.populateCountForTest(7777)
+
+	if after != before+1 {
+		t.Fatalf("expected 1 re-populate, got %d -> %d", before, after)
+	}
+}

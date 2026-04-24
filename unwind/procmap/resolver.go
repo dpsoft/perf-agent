@@ -18,7 +18,8 @@ type Resolver struct {
 	mu    sync.RWMutex
 	cache map[uint32]*pidEntry
 
-	buildIDs sync.Map // path string -> build-id hex string
+	buildIDs       sync.Map // path string -> build-id hex string
+	populateCounts sync.Map // uint32 (pid) -> *int64 (populate count)
 }
 
 type pidEntry struct {
@@ -116,6 +117,7 @@ func (r *Resolver) entryFor(pid uint32) *pidEntry {
 // build-ids. Missing PIDs are cached as empty (entry.err==nil,
 // entry.mappings==nil) so subsequent Lookups fast-fail.
 func (r *Resolver) populate(entry *pidEntry, pid uint32) {
+	defer r.bumpPopulateCount(pid)
 	path := filepath.Join(r.procRoot, fmt.Sprint(pid), "maps")
 	mappings, err := parseMapsFile(path)
 	if err != nil {
@@ -143,4 +145,23 @@ func (r *Resolver) buildIDFor(path string) string {
 	id, _ := readBuildID(path)
 	actual, _ := r.buildIDs.LoadOrStore(path, id)
 	return actual.(string)
+}
+
+// bumpPopulateCount increments the per-PID populate counter. Test-only
+// observability: lets tests assert whether a cache miss forced a
+// re-parse.
+func (r *Resolver) bumpPopulateCount(pid uint32) {
+	v, _ := r.populateCounts.LoadOrStore(pid, new(int64))
+	*v.(*int64)++
+}
+
+// populateCountForTest returns the number of times populate ran for
+// pid. Exported name ends with "ForTest" to mark it as a test hook;
+// no external callers should rely on it.
+func (r *Resolver) populateCountForTest(pid uint32) int64 {
+	v, ok := r.populateCounts.Load(pid)
+	if !ok {
+		return 0
+	}
+	return *v.(*int64)
 }

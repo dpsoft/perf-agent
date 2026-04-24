@@ -59,15 +59,6 @@ type Profiler struct {
 	stacks  map[sampleKey][]uint64 // stashed PC chain per key — lazy-init in stash()
 }
 
-// sampleKey is "(pid, stack hash)" — we dedupe identical stacks
-// userspace-side to avoid re-symbolizing the same N-PC chain N times.
-// The hash collides at the theoretical FNV rate (not cryptographic);
-// collisions conflate counts but don't miss samples.
-type sampleKey struct {
-	pid  uint32
-	hash uint64
-}
-
 // NewProfiler loads the BPF program, walks /proc/<pid>/maps to prime
 // the ehmaps lifecycle, opens per-CPU perf events at sampleRate Hz,
 // and starts the ringbuf reader + tracker goroutines.
@@ -292,22 +283,6 @@ func (p *Profiler) stash(key sampleKey, pcs []uint64) {
 	if _, have := p.stacks[key]; !have {
 		p.stacks[key] = append([]uint64(nil), pcs...)
 	}
-}
-
-// hashPCs: FNV-1a over the PC chain bytes. Stable, fast, collision-rare.
-func hashPCs(pcs []uint64) uint64 {
-	const (
-		offset uint64 = 0xcbf29ce484222325
-		prime  uint64 = 0x100000001b3
-	)
-	h := offset
-	for _, pc := range pcs {
-		for shift := uint(0); shift < 64; shift += 8 {
-			h ^= (pc >> shift) & 0xff
-			h *= prime
-		}
-	}
-	return h
 }
 
 // Collect drains accumulated samples, symbolizes them, and writes a

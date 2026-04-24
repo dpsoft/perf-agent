@@ -82,9 +82,10 @@ func (r *Resolver) InvalidateAddr(pid uint32, addr uint64) {
 	r.Invalidate(pid)
 }
 
-// Close releases internal state. Currently a no-op — Resolver holds
-// no OS handles — but exposed for symmetry with other lifecycle-bearing
-// types and future extension.
+// Close releases cached state. After Close, the Resolver remains
+// usable but behaves as freshly constructed; in-flight Lookups that
+// captured a *pidEntry before the call complete normally against
+// their captured snapshot.
 func (r *Resolver) Close() {
 	r.mu.Lock()
 	r.cache = map[uint32]*pidEntry{}

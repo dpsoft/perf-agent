@@ -1116,6 +1116,109 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release")
 }
 
+// TestPerfAgentSystemWideDwarfProfile runs perf-agent with
+// --profile --unwind dwarf -a (no --pid) against a running
+// rust-workload. System-wide mode means samples can come from any
+// process; we only assert non-empty samples + at least one symbolized
+// function (the specific function depends on what was CPU-active
+// during the 5s sampling window).
+func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+	agentPath := getAgentPath(t)
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		_ = workload.Process.Kill()
+		_ = workload.Wait()
+	}()
+	time.Sleep(2 * time.Second)
+
+	outputFile := "profile-dwarf-sys.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath,
+		"--profile",
+		"--profile-output", outputFile,
+		"--unwind", "dwarf",
+		"-a",
+		"--duration", "5s",
+	)
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+	assert.FileExists(t, outputFile)
+	prof := parseProfile(t, outputFile)
+	require.NotNil(t, prof)
+	require.Greater(t, len(prof.Sample), 0, "system-wide profile should have samples")
+	require.Greater(t, len(prof.Function), 0, "system-wide profile should have at least one symbolized function")
+}
+
+// TestPerfAgentSystemWideDwarfOffCPU runs perf-agent with --offcpu
+// --unwind dwarf -a. System-wide means any blocking activity anywhere
+// contributes samples — we just need non-zero blocking-ns total.
+func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+	agentPath := getAgentPath(t)
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		_ = workload.Process.Kill()
+		_ = workload.Wait()
+	}()
+	time.Sleep(2 * time.Second)
+
+	outputFile := "offcpu-dwarf-sys.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath,
+		"--offcpu",
+		"--offcpu-output", outputFile,
+		"--unwind", "dwarf",
+		"-a",
+		"--duration", "5s",
+	)
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+	assert.FileExists(t, outputFile)
+	prof := parseProfile(t, outputFile)
+	require.NotNil(t, prof)
+	require.Greater(t, len(prof.Sample), 0, "system-wide off-CPU profile should have samples")
+
+	var totalNs int64
+	for _, s := range prof.Sample {
+		for _, v := range s.Value {
+			totalNs += v
+		}
+	}
+	require.Greater(t, totalNs, int64(0), "system-wide off-CPU profile should have non-zero blocking-ns")
+	t.Logf("system-wide off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
+}
+
 // TestPerfDwarfMmap2Tracking validates the S4 flow: after starting the
 // rust workload with --dlopen-delay, MmapWatcher + PIDTracker should
 // pick up the probe.so mapping AUTOMATICALLY and install a second

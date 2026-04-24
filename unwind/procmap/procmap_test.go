@@ -26,3 +26,28 @@ func TestParseMapsFile(t *testing.T) {
 		}
 	}
 }
+
+func TestReadBuildID(t *testing.T) {
+	// /bin/ls on any modern distro has a GNU build-id. We don't assert
+	// the exact value (it varies) — only that it parses to a non-empty
+	// lowercase hex string.
+	id, err := readBuildID("/bin/ls")
+	if err != nil {
+		t.Fatalf("readBuildID(/bin/ls): %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected non-empty build-id, got empty")
+	}
+	for _, r := range id {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			t.Fatalf("build-id %q contains non-hex char %q", id, r)
+		}
+	}
+}
+
+func TestReadBuildIDMissing(t *testing.T) {
+	id, err := readBuildID("/nonexistent/path/to/nothing")
+	if err == nil {
+		t.Fatalf("expected error, got id=%q", id)
+	}
+}

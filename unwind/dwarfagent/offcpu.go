@@ -29,7 +29,7 @@ type OffCPUProfiler struct {
 	objs       *profile.OffCPUDwarf
 	store      *ehmaps.TableStore
 	tracker    *ehmaps.PIDTracker
-	watcher    *ehmaps.MmapWatcher
+	watcher    mmapEventSourceCloser
 	link       link.Link
 	ringReader *ringbuf.Reader
 
@@ -51,17 +51,19 @@ type OffCPUProfiler struct {
 // On error, every resource created up to the failure point is closed
 // before returning. Callers should NOT call Close on a Profiler they
 // received as (nil, err).
-func NewOffCPUProfiler(pid int, tags []string) (*OffCPUProfiler, error) {
-	if pid <= 0 {
-		return nil, fmt.Errorf("dwarfagent: pid must be > 0 (system-wide is S7 scope)")
+func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*OffCPUProfiler, error) {
+	if !systemWide && pid <= 0 {
+		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
-	objs, err := profile.LoadOffCPUDwarf(false)
+	objs, err := profile.LoadOffCPUDwarf(systemWide)
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu_dwarf: %w", err)
 	}
-	if err := objs.AddPID(uint32(pid)); err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("add pid to filter: %w", err)
+	if !systemWide {
+		if err := objs.AddPID(uint32(pid)); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("add pid to filter: %w", err)
+		}
 	}
 
 	store := ehmaps.NewTableStore(
@@ -70,17 +72,41 @@ func NewOffCPUProfiler(pid int, tags []string) (*OffCPUProfiler, error) {
 	)
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 
-	nAttached, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("attach initial mappings: %w", err)
+	if systemWide {
+		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("attach all processes: %w", err)
+		}
+		log.Printf("dwarfagent (offcpu): attached %d distinct binaries across %d PIDs", nTables, nPIDs)
+	} else {
+		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("attach initial mappings: %w", err)
+		}
+		log.Printf("dwarfagent (offcpu): attached %d binaries from /proc/%d/maps", n, pid)
 	}
-	log.Printf("dwarfagent (offcpu): attached %d binaries from /proc/%d/maps", nAttached, pid)
 
-	watcher, err := ehmaps.NewMmapWatcher(uint32(pid))
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("mmap watcher: %w", err)
+	var watcher mmapEventSourceCloser
+	if systemWide {
+		cpuInts := make([]int, 0, len(cpus))
+		for _, c := range cpus {
+			cpuInts = append(cpuInts, int(c))
+		}
+		mw, err := ehmaps.NewMultiCPUMmapWatcher(cpuInts)
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("multi-cpu mmap watcher: %w", err)
+		}
+		watcher = mw
+	} else {
+		w, err := ehmaps.NewMmapWatcher(uint32(pid))
+		if err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("mmap watcher: %w", err)
+		}
+		watcher = w
 	}
 
 	tpLink, err := link.AttachTracing(link.TracingOptions{

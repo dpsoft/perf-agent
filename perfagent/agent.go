@@ -185,10 +185,12 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.EnableOffCPUProfile {
 		switch a.config.Unwind {
 		case "dwarf":
-			if a.config.SystemWide {
-				return fmt.Errorf("--unwind dwarf does not support system-wide mode yet (S7)")
-			}
-			p, err := dwarfagent.NewOffCPUProfiler(a.config.PID, a.config.Tags)
+			p, err := dwarfagent.NewOffCPUProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+			)
 			if err != nil {
 				a.cleanup()
 				return fmt.Errorf("create DWARF off-CPU profiler: %w", err)

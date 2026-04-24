@@ -43,7 +43,7 @@ func TestOffCPUProfilerEndToEnd(t *testing.T) {
 	}()
 	time.Sleep(1 * time.Second)
 
-	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, nil)
+	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, false, nil, nil)
 	if err != nil {
 		t.Fatalf("NewOffCPUProfiler: %v", err)
 	}

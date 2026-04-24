@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -1211,4 +1212,69 @@ func countMapEntries(t *testing.T, m *ebpf.Map) int {
 		t.Logf("iterate: %v (continuing)", err)
 	}
 	return n
+}
+
+// TestPerfAgentDwarfUnwind runs the full perf-agent binary end-to-end
+// with --unwind dwarf against the rust workload, then parses the
+// resulting pprof.pb.gz and asserts cpu_intensive_work shows up as
+// a symbolized function name.
+func TestPerfAgentDwarfUnwind(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+	agentPath := getAgentPath(t)
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		_ = workload.Process.Kill()
+		_ = workload.Wait()
+	}()
+	time.Sleep(2 * time.Second)
+
+	outputFile := "profile-dwarf.pb.gz"
+	defer os.Remove(outputFile)
+
+	agent := exec.Command(agentPath,
+		"--profile",
+		"--profile-output", outputFile,
+		"--unwind", "dwarf",
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+	assert.FileExists(t, outputFile)
+
+	prof := parseProfile(t, outputFile)
+	require.NotNil(t, prof)
+	require.Greater(t, len(prof.Sample), 0, "profile should have samples")
+
+	hit := false
+	for _, fn := range prof.Function {
+		if strings.Contains(fn.Name, "cpu_intensive_work") {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		names := make([]string, 0, min(10, len(prof.Function)))
+		for i, fn := range prof.Function {
+			if i >= 10 {
+				break
+			}
+			names = append(names, fn.Name)
+		}
+		t.Fatalf("no function named *cpu_intensive_work* in pprof; first few: %v", names)
+	}
 }

@@ -16,6 +16,7 @@ type MmapEventKind int
 const (
 	MmapEvent MmapEventKind = iota + 1
 	ExitEvent
+	ForkEvent
 )
 
 // MmapEventRecord is a parsed PERF_RECORD_MMAP2 or PERF_RECORD_EXIT.
@@ -36,6 +37,7 @@ const (
 	// Record types per include/uapi/linux/perf_event.h.
 	perfRecordMmap2 = 10
 	perfRecordExit  = 4
+	perfRecordFork  = 7
 
 	// Offsets into the perf_event_mmap_page; guaranteed by the kernel ABI.
 	mwDataHeadOffset = 1024
@@ -61,33 +63,28 @@ type MmapWatcher struct {
 	exited   chan struct{} // closed by loop() when it has returned
 }
 
-// NewMmapWatcher attaches a metadata-only perf_event to `pid` across all
-// CPUs. Requires CAP_PERFMON (or CAP_BPF / root). The watcher delivers
-// PERF_RECORD_MMAP2 and PERF_RECORD_EXIT records to Events(); other
-// record types (FORK, COMM) are silently discarded.
-func NewMmapWatcher(pid uint32) (*MmapWatcher, error) {
+// newMmapWatcher opens the perf_event fd, mmaps the ring, and starts
+// the reader goroutine. Shared by NewMmapWatcher (per-PID, cpu=-1) and
+// NewSystemWideMmapWatcher (pid=-1, per-CPU).
+//
+// Mmap+Mmap2 together → kernel emits PERF_RECORD_MMAP2 (the richer variant
+// with inode metadata). Setting Mmap2 alone works on many kernels but is
+// inconsistent in practice — libbpf and perf(1) both set both, which we
+// mirror. Task enables FORK/EXIT/COMM as a bundle; we consume EXIT and FORK.
+// NOTE: we deliberately do NOT set attr.inherit. The kernel rejects mmap()
+// on a perf_event fd when inherit=1 is combined with a non-CPU-wide target
+// (EINVAL from perf_mmap). Per-CPU watchers (pid=-1) avoid this restriction
+// and capture mmaps from any task that runs on that CPU.
+func newMmapWatcher(pid, cpu int) (*MmapWatcher, error) {
 	attr := &unix.PerfEventAttr{
 		Type:   unix.PERF_TYPE_SOFTWARE,
 		Config: unix.PERF_COUNT_SW_DUMMY,
 		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		// Mmap+Mmap2 together → kernel emits PERF_RECORD_MMAP2 (the
-		// richer variant with inode metadata). Setting Mmap2 alone
-		// works on many kernels but is inconsistent in practice —
-		// libbpf and perf(1) both set both, which we mirror.
-		// Task enables FORK/EXIT/COMM as a bundle; we only consume EXIT.
-		// NOTE: we deliberately do NOT set attr.inherit. The kernel
-		// rejects mmap() on a perf_event fd when inherit=1 is combined
-		// with a non-CPU-wide target (EINVAL from perf_mmap). That
-		// means this watcher only sees mmaps issued by the exact TID
-		// we opened against. S5/S7 can upgrade to per-CPU watchers
-		// (pid=-1, one fd per CPU) with userspace TGID filtering to
-		// capture mmaps from any thread of the tracked process.
-		// Start disabled; enable after the ring mmap succeeds.
-		Bits: unix.PerfBitMmap | unix.PerfBitMmap2 | unix.PerfBitTask | unix.PerfBitDisabled,
+		Bits:   unix.PerfBitMmap | unix.PerfBitMmap2 | unix.PerfBitTask | unix.PerfBitDisabled,
 	}
-	fd, err := unix.PerfEventOpen(attr, int(pid), -1, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	fd, err := unix.PerfEventOpen(attr, pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
-		return nil, fmt.Errorf("perf_event_open (mmap2, pid=%d): %w", pid, err)
+		return nil, fmt.Errorf("perf_event_open (mmap2, pid=%d, cpu=%d): %w", pid, cpu, err)
 	}
 	pageSz := os.Getpagesize()
 	mmapSz := pageSz * (1 + mwRingPages)
@@ -113,6 +110,23 @@ func NewMmapWatcher(pid uint32) (*MmapWatcher, error) {
 	}
 	go w.loop()
 	return w, nil
+}
+
+// NewMmapWatcher attaches a per-TID watcher to pid. Requires CAP_PERFMON
+// (or CAP_BPF / root). The watcher delivers PERF_RECORD_MMAP2,
+// PERF_RECORD_EXIT, and PERF_RECORD_FORK records to Events(). Note that
+// only mmaps issued by the exact TID we opened against generate records —
+// see newMmapWatcher for background on the inherit restriction.
+func NewMmapWatcher(pid uint32) (*MmapWatcher, error) {
+	return newMmapWatcher(int(pid), -1)
+}
+
+// NewSystemWideMmapWatcher attaches to CPU `cpu` with pid=-1 — sees
+// MMAP2/EXIT/FORK from any task that runs on that CPU. Combine N
+// instances (one per online CPU) via MultiCPUMmapWatcher for
+// whole-system coverage.
+func NewSystemWideMmapWatcher(cpu int) (*MmapWatcher, error) {
+	return newMmapWatcher(-1, cpu)
 }
 
 // Events returns the channel of parsed records. Closed when the watcher
@@ -199,6 +213,9 @@ func (w *MmapWatcher) drain() bool {
 		case perfRecordExit:
 			body := w.readBytes((base+8)%size, recSize-8)
 			ev, ok = parseExit(body)
+		case perfRecordFork:
+			body := w.readBytes((base+8)%size, recSize-8)
+			ev, ok = parseFork(body)
 		}
 		if ok {
 			select {
@@ -272,6 +289,24 @@ func parseExit(body []byte) (MmapEventRecord, bool) {
 	}
 	return MmapEventRecord{
 		Kind: ExitEvent,
+		PID:  binary.LittleEndian.Uint32(body[0:4]),
+		TID:  binary.LittleEndian.Uint32(body[8:12]),
+	}, true
+}
+
+// parseFork decodes PERF_RECORD_FORK body. Shares the first 16 bytes
+// of its layout with PERF_RECORD_EXIT:
+//
+//	u32 pid, u32 ppid, u32 tid, u32 ptid, u64 time
+//
+// Callers only act on group-leader forks (pid == tid) — per-thread
+// forks within a tracked process are no-ops.
+func parseFork(body []byte) (MmapEventRecord, bool) {
+	if len(body) < 16 {
+		return MmapEventRecord{}, false
+	}
+	return MmapEventRecord{
+		Kind: ForkEvent,
 		PID:  binary.LittleEndian.Uint32(body[0:4]),
 		TID:  binary.LittleEndian.Uint32(body[8:12]),
 	}, true

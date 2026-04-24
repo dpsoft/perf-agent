@@ -64,3 +64,53 @@ func TestMmapWatcherSeesMmap(t *testing.T) {
 		}
 	}
 }
+
+// TestSystemWideMmapWatcherSeesMmap pins the test goroutine to CPU 0,
+// opens a system-wide watcher on that CPU, and deliberately mmaps
+// /bin/ls — validates the pid=-1, cpu=N capture path.
+func TestSystemWideMmapWatcherSeesMmap(t *testing.T) {
+	requireBPFCaps(t)
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var set unix.CPUSet
+	set.Set(0)
+	if err := unix.SchedSetaffinity(0, &set); err != nil {
+		t.Skipf("sched_setaffinity: %v", err)
+	}
+
+	w, err := NewSystemWideMmapWatcher(0)
+	if err != nil {
+		t.Fatalf("NewSystemWideMmapWatcher: %v", err)
+	}
+	defer w.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	const target = "/bin/ls"
+	f, err := os.Open(target)
+	if err != nil {
+		t.Skipf("%s not available: %v", target, err)
+	}
+	defer f.Close()
+	data, err := unix.Mmap(int(f.Fd()), 0, 4096, unix.PROT_READ|unix.PROT_EXEC, unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("mmap: %v", err)
+	}
+	defer unix.Munmap(data)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-w.Events():
+			if !ok {
+				t.Fatal("event channel closed before /bin/ls MMAP2 observed")
+			}
+			if ev.Kind == MmapEvent && strings.HasSuffix(ev.Filename, "/ls") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no MMAP2 event for /bin/ls within 2s")
+		}
+	}
+}

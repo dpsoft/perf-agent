@@ -103,11 +103,18 @@ func (t *PIDTracker) Detach(pid uint32) error {
 	return firstErr
 }
 
+// mmapEventSource is the shape both *MmapWatcher and
+// *MultiCPUMmapWatcher satisfy — Events() returns a read-only channel
+// of event records.
+type mmapEventSource interface {
+	Events() <-chan MmapEventRecord
+}
+
 // Run blocks consuming events from the watcher until ctx is canceled or
 // the watcher's event channel closes. Call from a goroutine. On MmapEvent
 // with an executable filename, auto-attaches the PID if we haven't seen
 // that (pid, path) already. On ExitEvent (group-leader only), detaches.
-func (t *PIDTracker) Run(ctx context.Context, w *MmapWatcher) {
+func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource) {
 	seen := map[uint32]map[string]struct{}{} // pid → set of paths already attached
 	for {
 		select {

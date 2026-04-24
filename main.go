@@ -27,6 +27,7 @@ var (
 	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagUnwind        = flag.String("unwind", "fp", "Stack unwinding strategy: fp | dwarf | auto")
 	flagTags          tagFlags
 )
 
@@ -180,6 +181,11 @@ func buildOptions() []perfagent.Option {
 	// Tags
 	if len(flagTags) > 0 {
 		opts = append(opts, perfagent.WithTags(flagTags...))
+	}
+
+	// Unwinding strategy
+	if *flagUnwind != "" {
+		opts = append(opts, perfagent.WithUnwind(*flagUnwind))
 	}
 
 	return opts

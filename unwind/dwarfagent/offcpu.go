@@ -55,7 +55,7 @@ func NewOffCPUProfiler(pid int, tags []string) (*OffCPUProfiler, error) {
 	if pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 (system-wide is S7 scope)")
 	}
-	objs, err := profile.LoadOffCPUDwarf()
+	objs, err := profile.LoadOffCPUDwarf(false)
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu_dwarf: %w", err)
 	}

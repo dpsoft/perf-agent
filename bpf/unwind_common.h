@@ -245,14 +245,14 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 2048);
+    __uint(max_entries, 4096);
     __type(key, __u32);
     __array(values, struct pid_mapping_inner);
 } pid_mappings SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 2048);
+    __uint(max_entries, 4096);
     __type(key, __u32);
     __type(value, __u32);
 } pid_mapping_lengths SEC(".maps");

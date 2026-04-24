@@ -24,6 +24,11 @@
 #include <bpf/bpf_tracing.h>
 #include "unwind_common.h"
 
+// System-wide mode toggle set by userspace at load time. When true, the
+// PID filter below is skipped — the walker emits a sample for every
+// non-kernel task's off-CPU interval.
+const volatile bool system_wide = false;
+
 // offcpu_start keys the stashed sample by (pid, tgid). Value is the
 // sample_record captured on switch-OUT. To avoid blowing the 512-byte
 // BPF stack, we do NOT wrap it in a struct with a timestamp — instead
@@ -52,8 +57,10 @@ static __always_inline void handle_switch_out(struct task_struct *prev) {
     if (pid == 0 || tgid == 0) return;
     if (BPF_CORE_READ(prev, flags) & PF_KTHREAD) return;
 
-    // PID filter (same shape as perf_dwarf).
-    if (!bpf_map_lookup_elem(&pids, &tgid)) return;
+    // PID filter (skipped in system-wide mode).
+    if (!system_wide) {
+        if (!bpf_map_lookup_elem(&pids, &tgid)) return;
+    }
 
     // Grab per-CPU scratch to build the sample_record.
     __u32 zero = 0;

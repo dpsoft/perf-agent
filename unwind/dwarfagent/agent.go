@@ -70,7 +70,7 @@ func NewProfiler(pid int, cpus []uint, tags []string, sampleRate int) (*Profiler
 	if pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 (system-wide is S7 scope)")
 	}
-	objs, err := profile.LoadPerfDwarf()
+	objs, err := profile.LoadPerfDwarf(false)
 	if err != nil {
 		return nil, fmt.Errorf("load perf_dwarf: %w", err)
 	}

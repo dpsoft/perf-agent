@@ -18,7 +18,7 @@ type PerfDwarf struct {
 // Close(). The program isn't attached to any perf event yet — the caller
 // opens perf_event_open fds and attaches separately (see
 // unwind/dwarfagent for the full wiring).
-func LoadPerfDwarf() (*PerfDwarf, error) {
+func LoadPerfDwarf(systemWide bool) (*PerfDwarf, error) {
 	// Match perfagent/agent.go's Start() ordering: promote caps to the
 	// effective set, then raise RLIMIT_MEMLOCK via CAP_SYS_ADMIN, then
 	// load the BPF program. Without RemoveMemlock the BPF_MAP_CREATE
@@ -39,7 +39,7 @@ func LoadPerfDwarf() (*PerfDwarf, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load perf_dwarf spec: %w", err)
 	}
-	if err := spec.Variables["system_wide"].Set(false); err != nil {
+	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide: %w", err)
 	}
 	p := &PerfDwarf{}
@@ -59,13 +59,9 @@ func (p *PerfDwarf) RingbufMap() *ebpf.Map {
 	return p.objs.StackEvents
 }
 
-// SetSystemWide is a no-op; the setting is baked in at load time. Kept as
-// a stable API for the test CLI so the future profile.Profiler wiring can
-// honor --unwind dwarf + -a without changing callers.
+// SetSystemWide is a no-op; the setting is baked in at load time via the
+// systemWide argument to LoadPerfDwarf. Kept as a stable API placeholder.
 func (p *PerfDwarf) SetSystemWide(v bool) error {
-	if v {
-		return fmt.Errorf("system_wide must be configured before LoadPerfDwarf; currently defaults to false")
-	}
 	return nil
 }
 

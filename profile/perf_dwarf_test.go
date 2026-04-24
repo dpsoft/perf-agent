@@ -18,7 +18,7 @@ import (
 func TestPerfDwarfLoads(t *testing.T) {
 	requireBPFCaps(t)
 
-	objs, err := LoadPerfDwarf()
+	objs, err := LoadPerfDwarf(false)
 	if err != nil {
 		t.Fatalf("load perf_dwarf: %v", err)
 	}

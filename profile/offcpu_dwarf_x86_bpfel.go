@@ -142,6 +142,7 @@ type offcpu_dwarfVariableSpecs struct {
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.VariableSpec `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
 // offcpu_dwarfObjects contains all objects after they have been loaded into the kernel.
@@ -199,6 +200,7 @@ type offcpu_dwarfVariables struct {
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.Variable `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // offcpu_dwarfPrograms contains all programs after they have been loaded into the kernel.

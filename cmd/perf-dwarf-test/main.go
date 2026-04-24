@@ -39,7 +39,7 @@ const (
 // we need through a thin local wrapper so main doesn't need to know the
 // generator's specific spelling.
 func loadObjects() (*loadedObjects, error) {
-	return profile.LoadPerfDwarf()
+	return profile.LoadPerfDwarf(false)
 }
 
 type loadedObjects = profile.PerfDwarf

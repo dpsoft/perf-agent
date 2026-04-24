@@ -148,7 +148,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
-		case "dwarf":
+		case "dwarf", "auto":
 			p, err := dwarfagent.NewProfiler(
 				a.config.PID,
 				a.config.SystemWide,
@@ -188,7 +188,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start off-CPU profiler if enabled
 	if a.config.EnableOffCPUProfile {
 		switch a.config.Unwind {
-		case "dwarf":
+		case "dwarf", "auto":
 			p, err := dwarfagent.NewOffCPUProfiler(
 				a.config.PID,
 				a.config.SystemWide,

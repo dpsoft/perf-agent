@@ -27,7 +27,7 @@ var (
 	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
-	flagUnwind        = flag.String("unwind", "fp", "Stack unwinding strategy: fp | dwarf | auto")
+	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagTags          tagFlags
 )
 

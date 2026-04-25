@@ -73,3 +73,6 @@ perf-agent
 .claude/scheduled_tasks.lock
 .claude/*.log
 .memory-bank
+
+### Git worktrees ###
+.worktrees/

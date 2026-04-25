@@ -61,7 +61,7 @@ Two layers plus shared instrumentation.
 
 One new exported type, one new ctor variant per profiler. Existing callers untouched.
 
-**New type** in `dwarfagent/hooks.go`:
+**New type** in `unwind/dwarfagent/hooks.go`:
 
 ```go
 type Hooks struct {
@@ -78,7 +78,7 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 
 **Threading path:**
 
-- `dwarfagent.newSession` (`dwarfagent/common.go:83`) accepts `hooks *Hooks`, passes to `ehmaps.NewTableStore`.
+- `dwarfagent.newSession` (`unwind/dwarfagent/common.go:83`) accepts `hooks *Hooks`, passes to `ehmaps.NewTableStore`.
 - `TableStore` stores `hooks`. In `AcquireBinary` (`unwind/ehmaps/store.go:101`), the call to `ehcompile.Compile` is wrapped: `t0 := time.Now()` before, `hooks.OnCompile(path, buildID, ehFrameBytes, time.Since(t0))` after. All hook calls are nil-guarded.
 - `ehcompile.Compile` itself is **not** modified — it stays a pure compile primitive with no observability concerns. Timing wrap lives in the caller (`store.go`).
 - `ehFrameBytes` is the size of the `.eh_frame` section as parsed by `ehcompile.Compile`. Either it returns this alongside the existing entries/classifications, or `store.go` reads it from the ELF before compile. The smaller change wins; pick during implementation.
@@ -235,7 +235,7 @@ bench/
 │       └── schema.go             # shared JSON types
 └── README.md                     # how to run, what numbers mean, caveats
 
-dwarfagent/
+unwind/dwarfagent/
 ├── hooks.go                      # NEW: Hooks struct
 ├── agent.go                      # NewProfilerWithHooks added; existing ctor delegates with nil
 ├── offcpu.go                     # NewOffCPUProfilerWithHooks added; same

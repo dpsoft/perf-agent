@@ -1,5 +1,7 @@
 package gpu
 
+import pp "github.com/dpsoft/perf-agent/pprof"
+
 type GPUBackendID string
 
 type GPUCapability string
@@ -42,7 +44,7 @@ type LaunchContext struct {
 	PID      uint32            `json:"pid"`
 	TID      uint32            `json:"tid"`
 	TimeNs   uint64            `json:"time_ns"`
-	CPUStack []any             `json:"cpu_stack"`
+	CPUStack []pp.Frame        `json:"cpu_stack"`
 	Tags     map[string]string `json:"tags"`
 }
 

@@ -470,3 +470,22 @@ func TestInternKeyTypesDeclared(t *testing.T) {
 	var _ = locationFallbackKey{Name: "n", File: "f", Module: "m", Line: 10}
 	var _ = functionKey{MappingID: 1, Name: "n"}
 }
+
+func TestBuildersOptionsResolverNilFallback(t *testing.T) {
+	// With Resolver==nil, two Frames differing only in Address still
+	// dedup to one Location (fallback path key has no Address).
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99})
+	s1 := &ProfileSample{Pid: 42, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x1000},
+	}}
+	s2 := &ProfileSample{Pid: 42, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x2000},
+	}}
+	bs.AddSample(s1)
+	bs.AddSample(s2)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 1 {
+		t.Fatalf("Resolver=nil: expected 1 Location (fallback dedup), got %d", got)
+	}
+}

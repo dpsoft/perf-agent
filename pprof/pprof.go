@@ -13,6 +13,8 @@ import (
 	"github.com/google/pprof/profile"
 
 	"github.com/klauspost/compress/gzip"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 var (
@@ -93,6 +95,7 @@ type BuildersOptions struct {
 	SampleRate    int64
 	PerPIDProfile bool
 	Comments      []string // Profile-level comments/tags
+	Resolver      *procmap.Resolver // nil → fallback to name-based Location dedup
 }
 
 type builderHashKey struct {
@@ -152,6 +155,7 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		period = 512 * 1024 // todo
 	}
 	builder := &ProfileBuilder{
+		resolver:           b.opt.Resolver,
 		locations:          make(map[any]*profile.Location),
 		functions:          make(map[any]*profile.Function),
 		sampleHashToSample: make(map[uint64]*profile.Sample),
@@ -213,6 +217,7 @@ type functionKey struct {
 }
 
 type ProfileBuilder struct {
+	resolver           *procmap.Resolver
 	locations          map[any]*profile.Location
 	functions          map[any]*profile.Function
 	sampleHashToSample map[uint64]*profile.Sample
@@ -225,7 +230,7 @@ func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {
 	sample := p.newSample(inputSample)
 	p.addValue(inputSample, sample)
 	for i, f := range inputSample.Stack {
-		sample.Location[i] = p.addLocation(f)
+		sample.Location[i] = p.addLocation(f, inputSample.Pid)
 	}
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
@@ -234,7 +239,7 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.tmpLocations = p.tmpLocations[:0]
 	p.tmpLocationIDs = p.tmpLocationIDs[:0]
 	for _, f := range inputSample.Stack {
-		loc := p.addLocation(f)
+		loc := p.addLocation(f, inputSample.Pid)
 		p.tmpLocations = append(p.tmpLocations, loc)
 		p.tmpLocationIDs = append(p.tmpLocationIDs, loc.ID)
 	}
@@ -251,8 +256,13 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
 
-func (p *ProfileBuilder) addLocation(frame Frame) *profile.Location {
+func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location {
 	frame = decodePerfMapFrame(frame)
+
+	// Task 6: pid is plumbed in for the resolver path Task 7 will add.
+	// Fallback path (current shim) doesn't read it.
+	_ = pid
+
 	key := locationFallbackKey{
 		Name: frame.Name, File: frame.File, Module: frame.Module, Line: frame.Line,
 	}

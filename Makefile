@@ -2,6 +2,11 @@ SHELL := /bin/bash
 all: build
 .PHONY: all
 
+# Allow Go to fetch the toolchain pinned in go.mod (1.26+) instead of failing
+# when the system Go is older. Override with `GOTOOLCHAIN=local make build`
+# to enforce the locally-installed toolchain.
+export GOTOOLCHAIN ?= auto
+
 LIBBLAZESYM_SRC := $(abspath /home/diego/github/blazesym/)
 LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a)

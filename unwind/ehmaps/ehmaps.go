@@ -1,7 +1,6 @@
 // Package ehmaps populates the BPF-side CFI / classification / pid-mappings
-// maps from unwind/ehcompile output. S3 scope: pure population — no MMAP2
-// ingestion, no refcounting, no munmap cleanup. S4 adds the lifecycle layer
-// on top of this package's primitives.
+// maps from unwind/ehcompile output. Handles population plus lifecycle
+// management via the refcounting layer in this package.
 //
 // Build-IDs map to 64-bit table_ids via FNV-1a (non-cryptographic; collision
 // resistance is "practically nonexistent" at the scale we care about — a

@@ -1,4 +1,4 @@
-// Package dwarfagent wires the S3 perf_dwarf BPF program, the S4
+// Package dwarfagent wires the perf_dwarf BPF program, the
 // ehmaps lifecycle (TableStore / PIDTracker / MmapWatcher), and pprof
 // output into a single Profiler with the same Collect/CollectAndWrite
 // shape as profile.Profiler. The user-visible entry point is
@@ -36,7 +36,7 @@ type Sample struct {
 // parseSample decodes one stack_events record. nPCs is clamped to
 // MaxFrames. Returns an error if buf is smaller than the 32-byte
 // header; a short PC array (buf truncated) is silently clamped rather
-// than errored, matching the resilience posture of the S3 ringbuf
+// than errored, matching the resilience posture of the ringbuf
 // consumer pattern.
 func parseSample(buf []byte) (Sample, error) {
 	if len(buf) < SampleHeaderBytes {

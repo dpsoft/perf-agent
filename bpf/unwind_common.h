@@ -6,7 +6,7 @@
 // userspace to load these new programs instead.
 //
 // Scope: the sample-record shape, per-CPU walker scratch, ringbuf for
-// emitted samples, PID filter, and (as of S3) the CFI + classification
+// emitted samples, PID filter, CFI tables, and per-instruction classification
 // + pid_mappings HASH_OF_MAPS tables that the hybrid walker consults
 // per frame. The walker itself lives in perf_dwarf.bpf.c (CPU) /
 // offcpu_dwarf.bpf.c (off-CPU).
@@ -37,8 +37,7 @@
 // ----- Type layouts mirrored from unwind/ehcompile/types.go.
 //
 // Kept in lockstep with the Go side — any change here requires updating
-// CFIEntry / Classification in types.go and vice versa. Types declared
-// in S2; maps declared in S3.
+// CFIEntry / Classification in types.go and vice versa.
 
 enum cfa_type {
     CFA_TYPE_UNDEFINED = 0,
@@ -162,7 +161,7 @@ struct walk_ctx {
     struct sample_record *rec;
 };
 
-// ----- CFI maps (S3).
+// ----- CFI maps.
 //
 // cfi_rules is a HASH_OF_MAPS: outer key is table_id (FNV-1a of build-id),
 // inner is a variable-size ARRAY of cfi_entry sorted by pc_start.
@@ -257,7 +256,7 @@ struct {
     __type(value, __u32);
 } pid_mapping_lengths SEC(".maps");
 
-// ----- Lookup helpers (S3).
+// ----- Lookup helpers.
 //
 // These helpers are called per-frame by the hybrid walker (Task 5). They
 // encapsulate the map-of-maps dance so the walker stays readable.
@@ -415,8 +414,8 @@ static long walk_step(__u32 idx, void *arg) {
             if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
                                     (void *)(cfa + (__s64)e.ra_offset)) != 0) return 1;
         } else {
-            // SAME_VALUE (leaf on arm64) or REGISTER — S3 doesn't track
-            // non-FP registers, so stop. S6+ can extend.
+            // SAME_VALUE (leaf on arm64) or REGISTER — we don't track
+            // non-FP registers, so stop.
             return 1;
         }
 

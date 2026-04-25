@@ -78,8 +78,8 @@ const (
 // CFIEntry is one row of the flat unwind table. The range
 // [PCStart, PCStart + PCEndDelta) shares the same CFA / FP / RA rules.
 //
-// Layout mirrors bpf/unwind_common.h's `struct cfi_entry` (to be written
-// in S2) — keep in sync. Arch-neutral: the same struct serves x86_64
+// Layout mirrors bpf/unwind_common.h's `struct cfi_entry`
+// — keep in sync with the BPF header. Arch-neutral: the same struct serves x86_64
 // and arm64 unwinders.
 type CFIEntry struct {
 	PCStart    uint64  // relative to the binary's load base

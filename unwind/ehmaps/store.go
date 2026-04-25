@@ -60,8 +60,8 @@ func (r *RefcountTable) Release(tableID uint64, pid uint32) int {
 }
 
 // TableStore owns the BPF-side cfi_* outer maps and composes refcount
-// tracking with actual map population. It is the S4 replacement for the
-// hand-wired calls to PopulateCFI/PopulateClassification in S3's tests.
+// tracking with actual map population. Wraps Populate{CFI,Classification} with refcounting so callers don't
+// hand-manage table lifetimes.
 type TableStore struct {
 	CFIRules          *ebpf.Map
 	CFILengths        *ebpf.Map

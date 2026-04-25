@@ -11,7 +11,7 @@ import (
 // verifier accepts it. Run via `sudo make test-unit` or on a capped binary;
 // skipped otherwise.
 //
-// This is the S2 smoke test: it exercises nothing user-visible, but catches
+// Smoke test for the perf_dwarf BPF program: exercises nothing user-visible but catches
 // arch-specific verifier regressions (e.g. an arm64 port that passes
 // `go generate` but emits verifier-invalid BPF). Per-arch coverage comes
 // from running this test under the matching arch's CI runner.

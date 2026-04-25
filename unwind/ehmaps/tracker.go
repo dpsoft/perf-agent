@@ -18,9 +18,9 @@ import (
 // for every unique binary in the process's address space. Detach
 // reverses both.
 //
-// S4 scope: Attach is called once per binary in the target's address
-// space. Subsequent calls for the same PID with a different binPath
-// append to the pid_mappings array. The S4 integration test exercises
+// Attach is called once per binary in the target's address space.
+// Subsequent calls for the same PID with a different binPath append
+// to the pid_mappings array. The integration test exercises
 // the full flow via MmapWatcher events driving Attach automatically.
 type PIDTracker struct {
 	store       *TableStore

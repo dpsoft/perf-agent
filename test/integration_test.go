@@ -1007,7 +1007,7 @@ func TestLibraryPMUMetrics(t *testing.T) {
 	require.NoError(t, agent.Stop(ctx))
 }
 
-// TestPerfDwarfWalker drives the S3 DWARF-walker pipeline end-to-end: start
+// TestPerfDwarfWalker drives the DWARF-walker pipeline end-to-end: start
 // the Rust cpu_bound workload, ehcompile its CFI, install it into the BPF
 // maps, attach per-CPU perf events, and verify the ringbuf receives samples
 // with DWARF-unwound chains.
@@ -1276,7 +1276,7 @@ func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
 	t.Logf("system-wide off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
 }
 
-// TestPerfDwarfMmap2Tracking validates the S4 flow: after starting the
+// TestPerfDwarfMmap2Tracking validates the MMAP2 flow: after starting the
 // rust workload with --dlopen-delay, MmapWatcher + PIDTracker should
 // pick up the probe.so mapping AUTOMATICALLY and install a second
 // cfi_lengths entry (main binary + probe.so).

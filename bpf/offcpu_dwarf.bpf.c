@@ -1,9 +1,9 @@
 //go:build ignore
 //
-// offcpu_dwarf.bpf.c — DWARF-capable off-CPU sampler (S6).
+// offcpu_dwarf.bpf.c — DWARF-capable off-CPU sampler.
 //
 // Loaded only when --offcpu --unwind dwarf is selected. Walks the user
-// stack of tasks going off-CPU using the S3 hybrid walker (walk_step in
+// stack of tasks going off-CPU using the hybrid walker (walk_step in
 // unwind_common.h). Emits one ringbuf record per off-CPU interval with
 // value = blocking-ns.
 //

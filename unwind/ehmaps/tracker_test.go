@@ -52,7 +52,7 @@ func TestTrackerAttachSelf(t *testing.T) {
 	}
 }
 
-// newTestMaps creates S3-shape BPF maps that mirror bpf2go's output.
+// newTestMaps creates BPF maps shaped like bpf2go's output.
 func newTestMaps(t *testing.T) (cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen *ebpf.Map) {
 	t.Helper()
 	const innerFlag = 0x1000 // BPF_F_INNER_MAP
@@ -89,7 +89,7 @@ func closeAll(ms ...*ebpf.Map) {
 	}
 }
 
-// TestTrackerAutoAttachOnMmap exercises the full S4 flow: launch a
+// TestTrackerAutoAttachOnMmap exercises the full MMAP2 flow: launch a
 // child process that, after a small delay, execs a different program
 // (the inner `exec` fires MMAP2 events AFTER our watcher is attached —
 // avoiding the child-startup race where libc's initial load happens

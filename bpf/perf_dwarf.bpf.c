@@ -11,7 +11,7 @@
 //   2. Emits per-sample PC chains via BPF_MAP_TYPE_RINGBUF instead of
 //      aggregating in a counts map — userspace aggregates post-symbolize.
 //
-// S3 wires the hybrid walker; S4 adds MMAP2-driven mapping ingestion so
+// Hybrid walker + MMAP2-driven mapping ingestion so
 // the userspace side can track new binaries at runtime without a restart.
 //
 // See docs/dwarf-unwinding-design.md.

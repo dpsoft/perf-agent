@@ -1,0 +1,35 @@
+[
+  {
+    "kind": "launch",
+    "correlation": { "backend": "replay", "value": "corr-1" },
+    "queue": { "backend": "replay", "queue_id": "q7" },
+    "kernel_name": "flash_attn_fwd",
+    "time_ns": 100,
+    "launch": {
+      "pid": 101,
+      "tid": 202,
+      "time_ns": 100,
+      "cpu_stack": [
+        { "Name": "train_step" },
+        { "Name": "cudaLaunchKernel" }
+      ]
+    }
+  },
+  {
+    "kind": "exec",
+    "correlation": { "backend": "replay", "value": "corr-1" },
+    "queue": { "backend": "replay", "queue_id": "q7" },
+    "kernel_name": "flash_attn_fwd",
+    "start_ns": 120,
+    "end_ns": 200
+  },
+  {
+    "kind": "sample",
+    "correlation": { "backend": "replay", "value": "corr-1" },
+    "device": { "backend": "replay", "device_id": "0", "name": "replay-gpu" },
+    "time_ns": 140,
+    "kernel_name": "flash_attn_fwd",
+    "stall_reason": "memory_throttle",
+    "weight": 7
+  }
+]

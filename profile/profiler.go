@@ -16,12 +16,14 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
 	objs       *perfObjects
 	symbolizer *blazesym.Symbolizer
+	resolver   *procmap.Resolver
 	perfEvents []*perfEvent
 	tags       []string
 	sampleRate int
@@ -139,6 +141,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	return &Profiler{
 		objs:       objs,
 		symbolizer: symbolizer,
+		resolver:   procmap.NewResolver(),
 		perfEvents: perfEvents,
 		tags:       tags,
 		sampleRate: sampleRate,
@@ -148,6 +151,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 // Close releases all resources associated with the profiler
 func (pr *Profiler) Close() {
 	pr.symbolizer.Close()
+	pr.resolver.Close()
 	for _, pe := range pr.perfEvents {
 		_ = pe.Close()
 	}
@@ -186,6 +190,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		SampleRate:    int64(pr.sampleRate),
 		PerPIDProfile: false,
 		Comments:      pr.tags,
+		Resolver:      pr.resolver,
 	})
 
 	for i := 0; i < n; i++ {

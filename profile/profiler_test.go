@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	blazesym "github.com/libbpf/blazesym/go"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 func TestBlazeSymToFramesAddress(t *testing.T) {
@@ -40,4 +42,12 @@ func TestBlazeSymToFramesInlineSharesAddress(t *testing.T) {
 			t.Errorf("frame %d Address=%#x, want 0x4000", i, f.Address)
 		}
 	}
+}
+
+func TestProfilerHasResolver(t *testing.T) {
+	// Compile-time check: Profiler has a resolver field with the
+	// expected procmap.Resolver type. Behavioral tests live in the
+	// integration suite.
+	var p Profiler
+	var _ *procmap.Resolver = p.resolver
 }

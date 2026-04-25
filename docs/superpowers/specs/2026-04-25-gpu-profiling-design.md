@@ -766,7 +766,7 @@ This gives us a serious path to Option 2 without claiming a false vendor-neutral
 
 ## 17. Open Questions / Decision Prompts
 
-These are the main review decisions the draft still needs.
+These are the main review decisions the draft still needs. The current branch now has a working default for each so planning can proceed.
 
 ### 17.1 First backend
 
@@ -775,7 +775,10 @@ Question:
 
 Current recommendation:
 - prefer the backend that matches the first real deployment environment
-- absent a strong internal constraint, NVIDIA looks like the most generally deployable first path
+
+Working default:
+- keep the public contract vendor-agnostic
+- defer naming a single first vendor implementation in the spec until the first real target environment is chosen
 
 ### 17.2 First host correlation mechanism
 
@@ -786,6 +789,10 @@ Current recommendation:
 - start with whichever source gives the strongest correlation IDs for the chosen backend
 - add `uprobes` early if callbacks alone are not enough for attach-late workflows
 
+Working default:
+- start with the strongest correlation source available for the chosen backend
+- add `uprobes` when callback-only collection is insufficient for attach-late workflows
+
 ### 17.3 Raw timeline export format
 
 Question:
@@ -794,6 +801,9 @@ Question:
 Current recommendation:
 - start with JSON if early inspection and debugging matter more than schema rigidity
 - move to protobuf only if volume, compatibility, or external ingestion pressure justifies it
+
+Working default:
+- JSON first
 
 ### 17.4 Mixed stack representation
 
@@ -804,6 +814,10 @@ Current recommendation:
 - keep the normalized event stream as the source of truth
 - defer a new profile model unless the pprof projection becomes too lossy
 
+Working default:
+- keep the normalized event stream as the source of truth
+- use the existing `pprof.Frame`-based projection first
+
 ### 17.5 Initial scope width
 
 Question:
@@ -812,6 +826,9 @@ Question:
 Current recommendation:
 - optimize Phase 1 for one active workload first
 - treat broader system-wide fairness and attribution as follow-on work
+
+Working default:
+- single active workload first
 
 ### 17.6 Subsampling contract
 
@@ -822,6 +839,10 @@ Current recommendation:
 - define subsampling as an optional but standardizable backend capability
 - avoid requiring every backend to implement it on day one
 
+Working default:
+- subsampling is part of the backend capability contract
+- individual backends may omit it initially
+
 ### 17.7 Canonical flame-graph artifact
 
 Question:
@@ -830,6 +851,10 @@ Question:
 Current recommendation:
 - lean toward `pprof` with synthetic GPU frames as the first-class artifact
 - keep folded-stack export available as a compatibility or debugging output if implementation cost stays low
+
+Working default:
+- `pprof` with synthetic GPU frames is the primary flame-graph artifact
+- folded-stack export remains optional
 
 ## 18. Test Plan
 

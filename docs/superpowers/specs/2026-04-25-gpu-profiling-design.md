@@ -91,6 +91,24 @@ Use a **layered architecture**:
 
 This is the only architecture that is honest about current Linux GPU observability while still preserving a clean, mostly vendor-neutral product surface.
 
+### 4.1 Meaning of “vendor-agnostic”
+
+In this spec, “vendor-agnostic” applies to:
+
+- the public backend contract
+- the normalized event model
+- the capability model
+- the manager and projection pipeline
+
+It does **not** require the collector internals to be identical across vendors.
+
+So the design rule is:
+
+- backend **contracts** must be vendor-agnostic
+- backend **implementations** may be vendor-specific behind that contract
+
+Reviewers should evaluate portability at the contract boundary, not by forcing NVIDIA, Intel, and AMD collection internals into one fake-uniform implementation strategy.
+
 ## 5. Why Not eBPF First Alone?
 
 `eBPF` should be first in the architecture, but not first as the only data source.

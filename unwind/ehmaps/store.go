@@ -98,7 +98,7 @@ func (s *TableStore) AcquireBinary(binPath string, pid uint32) (tableID uint64, 
 		return tableID, false, nil // already installed
 	}
 	// First reference for this tableID — compile + install.
-	entries, classifications, err := ehcompile.Compile(binPath)
+	entries, classifications, _, err := ehcompile.Compile(binPath)
 	if err != nil {
 		s.rc.Release(tableID, pid)
 		return 0, false, fmt.Errorf("ehcompile %s: %w", binPath, err)

@@ -1043,7 +1043,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
 
 	// Compile CFI from the Rust binary.
-	entries, classifications, err := ehcompile.Compile(binPath)
+	entries, classifications, _, err := ehcompile.Compile(binPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, entries, "ehcompile produced no CFI entries")
 

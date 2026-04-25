@@ -12,7 +12,7 @@ func BenchmarkCompile_Glibc(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, err := Compile(path)
+		_, _, _, err := Compile(path)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -25,7 +25,7 @@ func BenchmarkCompile_HelloX86(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, err := Compile("testdata/hello")
+		_, _, _, err := Compile("testdata/hello")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -38,7 +38,7 @@ func BenchmarkCompile_HelloArm64(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, err := Compile("testdata/hello_arm64.o")
+		_, _, _, err := Compile("testdata/hello_arm64.o")
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -68,6 +68,8 @@ perf-agent
 
 ### Anthropic Claude ###
 # Track project-shared Claude config (.claude/settings.json) but keep
-# per-user / per-machine state (settings.local.json) out of the repo.
+# per-user / per-machine state out of the repo.
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/*.log
 .memory-bank

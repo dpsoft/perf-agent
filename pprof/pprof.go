@@ -491,10 +491,14 @@ func decodePerfMapFrame(f Frame) Frame {
 		return f
 	}
 	if dec, ok := decodePython(f.Name); ok {
-		return mergeFrame(f, dec)
+		f = mergeFrame(f, dec)
+		f.Address = 0 // JIT code — file-offset is meaningless
+		return f
 	}
 	if dec, ok := decodeNode(f.Name); ok {
-		return mergeFrame(f, dec)
+		f = mergeFrame(f, dec)
+		f.Address = 0
+		return f
 	}
 	return f
 }

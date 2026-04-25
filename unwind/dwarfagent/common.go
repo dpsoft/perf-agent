@@ -16,6 +16,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // sampleKey is "(pid, stack hash)" — we dedupe identical stacks
@@ -60,6 +61,7 @@ type session struct {
 	watcher    mmapEventSourceCloser
 	ringReader *ringbuf.Reader
 	symbolizer *blazesym.Symbolizer
+	resolver   *procmap.Resolver
 
 	stop      chan struct{}
 	trackerWG sync.WaitGroup
@@ -143,6 +145,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		watcher:    watcher,
 		ringReader: rd,
 		symbolizer: symbolizer,
+		resolver:   procmap.NewResolver(),
 		stop:       make(chan struct{}),
 		samples:    map[sampleKey]uint64{},
 	}, nil
@@ -161,7 +164,18 @@ func (s *session) runTracker() {
 			<-s.stop
 			cancel()
 		}()
-		s.tracker.Run(ctx, s.watcher)
+
+		observer := func(ev ehmaps.MmapEventRecord) {
+			switch ev.Kind {
+			case ehmaps.MmapEvent:
+				s.resolver.InvalidateAddr(ev.PID, ev.Addr)
+			case ehmaps.ExitEvent:
+				if ev.TID == ev.PID {
+					s.resolver.Invalidate(ev.PID)
+				}
+			}
+		}
+		s.tracker.Run(ctx, s.watcher, observer)
 	}()
 }
 
@@ -242,6 +256,7 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 		SampleRate:    int64(sampleRate),
 		PerPIDProfile: false,
 		Comments:      s.tags,
+		Resolver:      s.resolver,
 	})
 	for key, val := range samples {
 		frames := symbolizePID(s.symbolizer, key.pid, stacks[key])
@@ -281,6 +296,9 @@ func (s *session) close() error {
 	_ = s.ringReader.Close()
 	_ = s.watcher.Close()
 	s.trackerWG.Wait()
+	if s.resolver != nil {
+		s.resolver.Close()
+	}
 	if s.symbolizer != nil {
 		s.symbolizer.Close()
 	}

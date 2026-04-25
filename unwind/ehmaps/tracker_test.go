@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -205,3 +206,42 @@ func TestAttachAllProcesses(t *testing.T) {
 	}
 	t.Logf("attached %d PIDs across %d distinct binaries", nPIDs, nTables)
 }
+
+func TestPIDTrackerRunObserver(t *testing.T) {
+	w := &fakeMmapWatcher{ch: make(chan MmapEventRecord, 8)}
+	tracker := NewPIDTracker(nil, nil, nil)
+
+	var got []MmapEventRecord
+	var mu sync.Mutex
+	observer := func(ev MmapEventRecord) {
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		tracker.Run(ctx, w, observer)
+		close(done)
+	}()
+
+	w.ch <- MmapEventRecord{Kind: ExitEvent, PID: 42, TID: 42}
+	// Drain wait — observer is invoked synchronously inside Run's loop,
+	// but we need the goroutine to consume the event first.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0].Kind != ExitEvent || got[0].PID != 42 {
+		t.Fatalf("observer didn't see event, got=%+v", got)
+	}
+}
+
+type fakeMmapWatcher struct {
+	ch chan MmapEventRecord
+}
+
+func (w *fakeMmapWatcher) Events() <-chan MmapEventRecord { return w.ch }

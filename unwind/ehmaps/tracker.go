@@ -89,15 +89,21 @@ func (t *PIDTracker) Detach(pid uint32) error {
 	t.mu.Unlock()
 
 	var firstErr error
-	if err := t.pidMappings.Delete(pid); err != nil {
-		firstErr = fmt.Errorf("delete pid_mappings[%d]: %w", pid, err)
+	if t.pidMappings != nil {
+		if err := t.pidMappings.Delete(pid); err != nil {
+			firstErr = fmt.Errorf("delete pid_mappings[%d]: %w", pid, err)
+		}
 	}
-	if err := t.pidMapLens.Delete(pid); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("delete pid_mapping_lengths[%d]: %w", pid, err)
+	if t.pidMapLens != nil {
+		if err := t.pidMapLens.Delete(pid); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete pid_mapping_lengths[%d]: %w", pid, err)
+		}
 	}
-	for tid := range st.tableIDs {
-		if err := t.store.ReleaseBinary(tid, pid); err != nil && firstErr == nil {
-			firstErr = err
+	if t.store != nil {
+		for tid := range st.tableIDs {
+			if err := t.store.ReleaseBinary(tid, pid); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -114,7 +120,12 @@ type mmapEventSource interface {
 // the watcher's event channel closes. Call from a goroutine. On MmapEvent
 // with an executable filename, auto-attaches the PID if we haven't seen
 // that (pid, path) already. On ExitEvent (group-leader only), detaches.
-func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource) {
+//
+// Observers (if any) run BEFORE the tracker's own dispatch for each
+// event — they see every event including those the tracker itself
+// would filter out. Used by dwarfagent.session to keep a procmap
+// Resolver's cache in sync with MMAP2/EXIT events.
+func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource, observers ...func(MmapEventRecord)) {
 	seen := map[uint32]map[string]struct{}{} // pid → set of paths already attached
 	for {
 		select {
@@ -123,6 +134,9 @@ func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource) {
 		case ev, ok := <-w.Events():
 			if !ok {
 				return
+			}
+			for _, obs := range observers {
+				obs(ev)
 			}
 			switch ev.Kind {
 			case MmapEvent:

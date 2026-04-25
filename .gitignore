@@ -20,6 +20,8 @@
 # Note: eBPF bytecode files (*_bpfel.o, *_bpfeb.o) are committed for library usage
 !*_bpfel.o
 !*_bpfeb.o
+# Committed test fixtures (cross-compiled arm64 object file for CFI tests)
+!unwind/ehcompile/testdata/*.o
 *.a
 
 # Go generated folders
@@ -65,5 +67,9 @@ offcpu.pb.gz
 perf-agent
 
 ### Anthropic Claude ###
-.claude
+# Track project-shared Claude config (.claude/settings.json) but keep
+# per-user / per-machine state out of the repo.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/*.log
 .memory-bank

@@ -1,94 +1,133 @@
 # perf-agent
 
-eBPF-based performance monitoring agent for Linux. Supports CPU profiling with stack traces, off-CPU profiling, and PMU hardware counter collection.
+eBPF-based performance monitoring agent for Linux. CPU profiling, off-CPU profiling, and PMU hardware counters in a single binary, with a hybrid FP+DWARF stack walker that handles release-built C++/Rust binaries that omit frame pointers.
+
+## What you get
+
+- **On-CPU profiles** with full stack traces → pprof.
+- **Off-CPU profiles** (blocking/sleep time, with stacks) → pprof.
+- **PMU metrics** — hardware counters, scheduling latency, context-switch breakdown.
+- **High-fidelity pprof output**: real per-binary `Mapping` entries with build-id and file offsets, address-keyed `Location` entries — feeds tools like `go tool pprof`, differential profiling, and downstream LLVM sample-PGO converters.
+- **Multi-runtime symbolization**: native (DWARF + ELF), Python (`-X perf` perf-maps), Node.js (`--perf-basic-prof`), Go.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           USER SPACE (Go)                               │
-│                                                                         │
-│                           ┌──────────┐                                  │
-│                           │ main.go  │                                  │
-│                           └────┬─────┘                                  │
-│                   ┌────────────┼────────────┐                           │
-│                   ▼            ▼            ▼                           │
-│  ┌──────────────────┐  ┌──────────────┐  ┌──────────────────┐           │
-│  │   CPU Profiler   │  │ PMU Monitor  │  │ Off-CPU Profiler │           │
-│  │                  │  │              │  │                  │           │
-│  │  profile/        │  │  cpu/        │  │  offcpu/         │           │
-│  │  perf_event.go   │  │  ring buffer │  │  sched_switch    │           │
-│  │  blazesym        │  │  histograms  │  │  blazesym        │           │
-│  └────────┬─────────┘  └──────┬───────┘  └────────┬─────────┘           │
-│           │                   │                   │                     │
-│           ▼                   ▼                   ▼                     │
-│  ┌────────────────────────────────────────────────────────────────┐     │
-│  │                    pprof/ (Profile Builder)                    │     │
-│  └────────────────────────────────────────────────────────────────┘     │
-└───────────┬───────────────────┬───────────────────┬─────────────────────┘
-            │                   │                   │
-════════════╪═══════════════════╪═══════════════════╪══════════════════════
-            │    eBPF Load      │                   │
-            ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         KERNEL SPACE (eBPF)                             │
-│                                                                         │
-│  ┌──────────────────┐  ┌──────────────┐  ┌──────────────────┐           │
-│  │   perf.bpf.c     │  │  cpu.bpf.c   │  │  offcpu.bpf.c    │           │
-│  │                  │  │              │  │                  │           │
-│  │  perf_event hook │  │ sched_switch │  │  sched_switch    │           │
-│  │  stack capture   │  │ sched_wakeup │  │  off-CPU time    │           │
-│  │                  │  │ HW counters  │  │  stack capture   │           │
-│  └────────┬─────────┘  └──────┬───────┘  └────────┬─────────┘           │
-│           │                   │                   │                     │
-│           └───────────────────┼───────────────────┘                     │
-│                               ▼                                         │
-│                    ┌─────────────────────┐                              │
-│                    │     eBPF Maps       │                              │
-│                    │                     │                              │
-│                    │  • stackmap         │                              │
-│                    │  • ring buffer      │                              │
-│                    │  • pid_filter       │                              │
-│                    │  • hw_counters      │                              │
-│                    └─────────────────────┘                              │
-└─────────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-                  ┌─────────────────────────────────────────┐
-                  │               OUTPUT                    │
-                  │                                         │
-                  │  *-on-cpu.pb.gz    *-off-cpu.pb.gz      │
-                  │  (CPU stacks)      (blocking time)      │
-                  │                                         │
-                  │  Console / File    (PMU metrics)        │
-                  └─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            USER SPACE (Go)                               │
+│                                                                          │
+│                            ┌──────────┐                                  │
+│                            │ main.go  │                                  │
+│                            └────┬─────┘                                  │
+│                                 ▼                                        │
+│                       ┌──────────────────┐                               │
+│                       │ perfagent.Agent  │  lifecycle + --unwind dispatch│
+│                       └─────┬────────────┘                               │
+│       ┌─────────────────────┼─────────────────────────┐                  │
+│       ▼                     ▼                         ▼                  │
+│ ┌───────────────┐  ┌──────────────────────┐  ┌──────────────┐            │
+│ │  CPU Profiler │  │  DWARF CPU/Off-CPU   │  │ PMU Monitor  │            │
+│ │   (FP path)   │  │      Profiler        │  │              │            │
+│ │   profile/    │  │  unwind/dwarfagent/  │  │   cpu/       │            │
+│ │   offcpu/     │  │   (hybrid walker)    │  │              │            │
+│ └───────┬───────┘  └──────────┬───────────┘  └──────┬───────┘            │
+│         │                     │                     │                    │
+│         │     ┌───────────────┴───────────────┐     │                    │
+│         │     ▼                               ▼     │                    │
+│         │   ┌─────────────────┐    ┌──────────────────────┐              │
+│         │   │ unwind/ehcompile│    │  unwind/ehmaps       │              │
+│         │   │ .eh_frame → CFI │    │  per-PID map lifecyle│              │
+│         │   └─────────────────┘    │  + MMAP2 watcher     │              │
+│         │                          └──────────┬───────────┘              │
+│         │                                     │                          │
+│         ▼                                     ▼                          │
+│   ┌──────────────────────────────────────────────────────────────┐       │
+│   │              unwind/procmap (Resolver)                       │       │
+│   │   /proc/<pid>/maps + .note.gnu.build-id, lazy per-PID cache  │       │
+│   └────────────────────┬─────────────────────────────────────────┘       │
+│                        ▼                                                 │
+│   ┌──────────────────────────────────────────────────────────────┐       │
+│   │            pprof/ ProfileBuilder                             │       │
+│   │  address-keyed Locations + per-binary Mapping (build-id,     │       │
+│   │  file offsets) + kernel/[jit] sentinels + name-based         │       │
+│   │  fallback when resolver misses                               │       │
+│   └──────────────────────────────────────────────────────────────┘       │
+│                                                                          │
+│   Symbolization: blazesym (DWARF + ELF + perf-maps for JIT runtimes)     │
+└─────────────┬──────────────────┬──────────────────┬──────────────────────┘
+              │                  │                  │
+══════════════╪══════════════════╪══════════════════╪═══════════════════════
+              │  eBPF load       │                  │
+              ▼                  ▼                  ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          KERNEL SPACE (eBPF)                             │
+│                                                                          │
+│  ┌──────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────┐  │
+│  │ perf.bpf.c   │  │ perf_dwarf.bpf │  │ offcpu.bpf.c   │  │ cpu.bpf.c│  │
+│  │ (FP only)    │  │ (hybrid: FP    │  │ + offcpu_dwarf │  │ HW ctrs  │  │
+│  │ stackmap     │  │  fast path,    │  │ sched_switch   │  │ rq lat   │  │
+│  │ aggregated   │  │  DWARF for     │  │ blocking-ns    │  │ ctx swch │  │
+│  │ counts       │  │  FP-less PCs)  │  │                │  │          │  │
+│  └──────┬───────┘  └────────┬───────┘  └────────┬───────┘  └────┬─────┘  │
+│         │                   │                   │               │        │
+│         │             CFI tables, classification, pid_mappings  │        │
+│         │             via HASH_OF_MAPS keyed by build-id        │        │
+│         │                   │                                   │        │
+│         └────────┬──────────┴──────────────┬────────────────────┘        │
+│                  ▼                         ▼                             │
+│           ┌─────────────┐          ┌─────────────────┐                   │
+│           │ stack ringbuf│         │ aggregated maps │                   │
+│           │ (DWARF path) │         │ (FP path)       │                   │
+│           └─────────────┘          └─────────────────┘                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────────────────┐
+                    │              OUTPUT                  │
+                    │                                      │
+                    │  *-on-cpu.pb.gz   *-off-cpu.pb.gz    │
+                    │  PMU: console / file                 │
+                    └──────────────────────────────────────┘
 ```
+
+Two stack-walker paths share a single user-space pipeline:
+
+- **FP path** (`--unwind fp`): cheap, kernel-side stackmap aggregation. Truncates on FP-less code (release C++/Rust without `-fno-omit-frame-pointer`).
+- **DWARF/hybrid path** (`--unwind dwarf` or `auto`, the default): pure-FP for FP-safe code, falls through to `.eh_frame`-derived CFI rules for FP-less PCs. Userspace pre-compiles per-binary CFI from `.eh_frame` (`unwind/ehcompile`) and installs it into BPF maps (`unwind/ehmaps`); the BPF walker reads CFI per-frame. MMAP2 events keep CFI fresh as processes `dlopen`/`exec`. Eager-compile failures (Go binaries lack `.eh_frame`) are tolerated — the walker's FP path covers those.
+
+The `procmap.Resolver` sits between the walkers and pprof. It lazily reads `/proc/<pid>/maps` and ELF `.note.gnu.build-id`, caches per-PID, and gives the pprof builder real `Mapping` identity (path, start/limit, file offset, build-id). Each `Location` is keyed by `(mapping_id, file_offset)` rather than by symbol name, so two PCs that symbolize to the same `(file, line, func)` stay distinguishable — the data downstream tools need for sample-based PGO and cross-run diffing.
 
 ## Requirements
 
-- Linux kernel 5.8+ (for BTF and CO-RE support)
-- Root privileges or the following capabilities: `CAP_SYS_ADMIN` + `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE` + `CAP_CHECKPOINT_RESTORE`
+- Linux kernel 5.8+ (BTF + CO-RE).
+- Root, OR `setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent`.
 
 ## Usage
 
 ```bash
-# CPU profiling (stack traces + pprof output)
-sudo ./perf-agent --profile --pid <PID>
+# CPU profiling — DWARF/hybrid walker is the default
+./perf-agent --profile --pid <PID>
 
-# Off-CPU profiling (blocking/sleep time with stack traces)
-sudo ./perf-agent --offcpu --pid <PID>
+# Force frame-pointer-only walker (cheaper startup, may truncate on FP-less binaries)
+./perf-agent --profile --unwind fp --pid <PID>
 
-# Combined on-CPU + off-CPU profiling
-sudo ./perf-agent --profile --offcpu --pid <PID>
+# Force DWARF walker (eager CFI compile + per-frame hybrid)
+./perf-agent --profile --unwind dwarf --pid <PID>
 
-# PMU only (hardware counters: cycles, instructions, cache misses)
-sudo ./perf-agent --pmu --pid <PID>
+# Off-CPU profiling
+./perf-agent --offcpu --pid <PID>
 
-# System-wide profiling (all processes)
-sudo ./perf-agent --profile -a --duration 30s
+# Combined on-CPU + off-CPU
+./perf-agent --profile --offcpu --pid <PID>
 
-# All features with tags for metadata
-sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
+# PMU only (hardware counters)
+./perf-agent --pmu --pid <PID>
+
+# System-wide
+./perf-agent --profile -a --duration 30s
+
+# All features with metadata tags
+./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
     --tag env=production \
     --tag version=1.2.3 \
     --tag service=api
@@ -101,13 +140,14 @@ sudo ./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
 | `--profile` | Enable CPU profiling with stack traces | `false` |
 | `--offcpu` | Enable off-CPU profiling with stack traces | `false` |
 | `--pmu` | Enable PMU hardware counters | `false` |
-| `--pid <PID>` | Target process ID to monitor | - |
-| `-a, --all` | System-wide profiling (all processes) | `false` |
-| `--per-pid` | Show per-PID breakdown (only with `-a --pmu`) | `false` |
+| `--pid <PID>` | Target process ID | - |
+| `-a, --all` | System-wide (all processes) | `false` |
+| `--per-pid` | Per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
-| `--sample-rate` | CPU profiling sample rate in Hz | `99` |
-| `--profile-output` | Output path for CPU profile | auto-generated |
-| `--offcpu-output` | Output path for off-CPU profile | auto-generated |
+| `--sample-rate` | CPU profile sample rate (Hz) | `99` |
+| `--unwind` | Stack unwinding strategy: `fp` \| `dwarf` \| `auto` (auto routes to dwarf; the hybrid walker covers FP-safe code via the FP path) | `auto` |
+| `--profile-output` | Output path for CPU profile | auto-named |
+| `--offcpu-output` | Output path for off-CPU profile | auto-named |
 | `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
 
@@ -117,7 +157,7 @@ Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu
 
 ### Output File Naming
 
-Output files are auto-named based on process name, timestamp, and profile type:
+Output files are auto-named by process name + timestamp + profile type:
 
 | Mode | Per-PID example | System-wide example |
 |------|----------------|---------------------|
@@ -125,42 +165,35 @@ Output files are auto-named based on process name, timestamp, and profile type:
 | `--offcpu` | `myapp-202604021430-off-cpu.pb.gz` | `202604021430-off-cpu.pb.gz` |
 | `--pmu-output auto` | `myapp-202604021430-pmu.txt` | `202604021430-pmu.txt` |
 
-Process name is read from `/proc/<pid>/comm`. Override with `--profile-output` or `--offcpu-output`.
+Process name comes from `/proc/<pid>/comm`. Override with `--profile-output` / `--offcpu-output`.
 
-### Profile Mode (`--profile`)
+### pprof fidelity
 
-Writes pprof format. Shows where CPU time is spent.
+CPU and off-CPU profiles are pprof. Each `Mapping` carries:
+
+- `File` — absolute binary path (`/usr/bin/myapp`, `/lib/x86_64-linux-gnu/libc.so.6`).
+- `BuildID` — ELF GNU build-id (hex).
+- `Start`, `Limit`, `Offset` — VA range and file offset for the mapping.
+- `HasFunctions` / `HasFilenames` / `HasLineNumbers` — flags indicating what symbolization could resolve.
+
+Each `Location` carries:
+
+- `Address` — file-relative offset (`Address - MapStart + MapOff`), portable across runs.
+- One `Line` per inlined frame (blazesym expands inline chains).
+
+Sentinel mappings handle the special cases: `[kernel]` for kernel frames (one shared mapping across all PIDs in a profile) and `[jit]` for Python/Node JIT frames where address has no file-offset meaning.
+
+Tags (`--tag key=value`) are stored as profile-level comments.
 
 ```bash
 go tool pprof myapp-202604021430-on-cpu.pb.gz
 ```
 
-Tags (`--tag key=value`) are stored as comments in the pprof file.
+### PMU output
 
-### Off-CPU Mode (`--offcpu`)
+On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).
 
-Writes pprof format. Shows where time is spent blocked/sleeping (I/O, locks, sleep calls). Values are in nanoseconds.
-
-```bash
-go tool pprof myapp-202604021430-off-cpu.pb.gz
-```
-
-### PMU Mode (`--pmu`)
-
-Prints to stdout (or to file with `--pmu-output <path>`):
-
-- **On-CPU Time**: Time slice per context switch (min, max, mean, percentiles)
-  - Measures how long a process runs on CPU before being switched out
-- **Runqueue Latency**: Time waiting for CPU after becoming runnable (min, max, mean, percentiles)
-  - Measures scheduling delay: time from `sched_wakeup` to actually running
-- **Context Switch Reasons**: Breakdown of why tasks were switched out
-  - **Preempted (running)**: Task was running and got preempted by scheduler
-  - **Voluntary (sleep/mutex)**: Task voluntarily yielded (sleep, mutex wait)
-  - **I/O Wait (D state)**: Task blocked on I/O (uninterruptible sleep)
-- **Hardware Counters**: Cycles, instructions, cache misses
-- **Derived Metrics**: IPC (instructions per cycle), cache miss rate
-
-Example output:
+Example:
 ```
 === PMU Metrics (PID: 84228) ===
 Samples: 26358
@@ -187,7 +220,7 @@ Hardware Counters:
 
 ## Library Usage
 
-`perf-agent` can be used as a Go library via the `perfagent` package:
+`perf-agent` is also a Go library via the `perfagent` package:
 
 ```go
 package main
@@ -240,27 +273,32 @@ See [perfagent package documentation](perfagent/) for all available options.
 
 ## Building
 
-Requires Go 1.25+, Clang/LLVM, Linux headers, and [blazesym](https://github.com/libbpf/blazesym) (Rust C library for symbolization).
+Requires Go 1.26+, Clang/LLVM, Linux headers, and [blazesym](https://github.com/libbpf/blazesym) (Rust C library for symbolization).
 
 ```bash
 make build
 ```
 
+The Makefile defaults to `GOTOOLCHAIN=auto`, so Go fetches the pinned toolchain automatically if your system Go is older. Override with `GOTOOLCHAIN=local make build` to enforce the locally-installed toolchain.
+
 See [BUILDING.md](BUILDING.md) for detailed setup instructions.
 
 ## Testing
 
-perf-agent includes a comprehensive test suite with unit tests, integration tests, and multi-language test workloads (Go, Rust, Python).
+Unit tests run without root; integration tests require root or a setcap'd binary.
 
 ```bash
-# Run all tests (unit + integration)
-make test
+# Build + cap the binary once, then run tests as a normal user
+make build
+sudo setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent
 
-# Run only unit tests (no root required)
+# Unit tests (no root)
 make test-unit
 
-# Run only integration tests (requires root)
-sudo make test-integration
+# Integration tests — auto-skip when neither root nor caps are available
+make test-integration
 ```
+
+Test gates honor file capabilities on the `perf-agent` binary: a setcap'd `perf-agent` lets the test runner exec it without sudo. For tests that load BPF in-process (library tests), the test binary itself needs caps — `setcap` it after `go test -c`.
 
 For detailed testing documentation, see [TESTING.md](TESTING.md).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 
@@ -15,14 +16,52 @@ import (
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
+
+// cpuProfiler is the narrow shape both profile.Profiler and
+// dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
+type cpuProfiler interface {
+	Collect(w io.Writer) error
+	CollectAndWrite(path string) error
+	Close()
+}
+
+// dwarfProfilerAdapter wraps dwarfagent.Profiler so its Close() matches
+// the void Close() the FP profiler exposes (see cpuProfiler interface).
+type dwarfProfilerAdapter struct{ *dwarfagent.Profiler }
+
+func (a dwarfProfilerAdapter) Close() {
+	if err := a.Profiler.Close(); err != nil {
+		log.Printf("dwarfagent.Close: %v", err)
+	}
+}
+
+// offcpuProfiler is the narrow shape both offcpu.Profiler and
+// dwarfagent.OffCPUProfiler satisfy, letting Agent dispatch on --unwind
+// for the off-CPU path.
+type offcpuProfiler interface {
+	Collect(w io.Writer) error
+	CollectAndWrite(path string) error
+	Close()
+}
+
+// dwarfOffCPUProfilerAdapter wraps dwarfagent.OffCPUProfiler so its
+// Close() matches the void Close() the FP offcpu profiler exposes.
+type dwarfOffCPUProfilerAdapter struct{ *dwarfagent.OffCPUProfiler }
+
+func (a dwarfOffCPUProfilerAdapter) Close() {
+	if err := a.OffCPUProfiler.Close(); err != nil {
+		log.Printf("dwarfagent.OffCPUProfiler.Close: %v", err)
+	}
+}
 
 // Agent is the main performance monitoring agent.
 type Agent struct {
 	config *Config
 
-	cpuProfiler    *profile.Profiler
-	offcpuProfiler *offcpu.Profiler
+	cpuProfiler    cpuProfiler
+	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
 
 	mu      sync.Mutex
@@ -108,40 +147,80 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
-		profiler, err := profile.NewProfiler(
-			a.config.PID,
-			a.config.SystemWide,
-			cpus,
-			a.config.Tags,
-			a.config.SampleRate,
-		)
-		if err != nil {
-			return fmt.Errorf("create CPU profiler: %w", err)
-		}
-		a.cpuProfiler = profiler
-		if a.config.SystemWide {
-			log.Printf("CPU profiler enabled (system-wide, %d Hz)", a.config.SampleRate)
-		} else {
-			log.Printf("CPU profiler enabled (PID: %d, %d Hz)", a.config.PID, a.config.SampleRate)
+		switch a.config.Unwind {
+		case "dwarf", "auto":
+			p, err := dwarfagent.NewProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+			)
+			if err != nil {
+				return fmt.Errorf("create DWARF CPU profiler: %w", err)
+			}
+			a.cpuProfiler = dwarfProfilerAdapter{p}
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+			}
+		default:
+			profiler, err := profile.NewProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+			)
+			if err != nil {
+				return fmt.Errorf("create CPU profiler: %w", err)
+			}
+			a.cpuProfiler = profiler
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz)", a.config.PID, a.config.SampleRate)
+			}
 		}
 	}
 
 	// Start off-CPU profiler if enabled
 	if a.config.EnableOffCPUProfile {
-		profiler, err := offcpu.NewProfiler(
-			a.config.PID,
-			a.config.SystemWide,
-			a.config.Tags,
-		)
-		if err != nil {
-			a.cleanup()
-			return fmt.Errorf("create off-CPU profiler: %w", err)
-		}
-		a.offcpuProfiler = profiler
-		if a.config.SystemWide {
-			log.Println("Off-CPU profiler enabled (system-wide)")
-		} else {
-			log.Printf("Off-CPU profiler enabled (PID: %d)", a.config.PID)
+		switch a.config.Unwind {
+		case "dwarf", "auto":
+			p, err := dwarfagent.NewOffCPUProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+			)
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create DWARF off-CPU profiler: %w", err)
+			}
+			a.offcpuProfiler = dwarfOffCPUProfilerAdapter{p}
+			if a.config.SystemWide {
+				log.Println("Off-CPU profiler enabled (system-wide, DWARF)")
+			} else {
+				log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+			}
+		default:
+			profiler, err := offcpu.NewProfiler(
+				a.config.PID,
+				a.config.SystemWide,
+				a.config.Tags,
+			)
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create off-CPU profiler: %w", err)
+			}
+			a.offcpuProfiler = profiler
+			if a.config.SystemWide {
+				log.Println("Off-CPU profiler enabled (system-wide)")
+			} else {
+				log.Printf("Off-CPU profiler enabled (PID: %d)", a.config.PID)
+			}
 		}
 	}
 

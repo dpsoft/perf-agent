@@ -1,0 +1,96 @@
+{
+  "entries": [
+    {
+      "PCStart": 28,
+      "PCEndDelta": 8,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 0,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    },
+    {
+      "PCStart": 36,
+      "PCEndDelta": 20,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 16,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    },
+    {
+      "PCStart": 52,
+      "PCEndDelta": 8,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 0,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    },
+    {
+      "PCStart": 56,
+      "PCEndDelta": 4,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 0,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    },
+    {
+      "PCStart": 60,
+      "PCEndDelta": 24,
+      "CFAType": 1,
+      "FPType": 1,
+      "CFAOffset": 32,
+      "FPOffset": -32,
+      "RAOffset": -24,
+      "RAType": 1
+    },
+    {
+      "PCStart": 84,
+      "PCEndDelta": 8,
+      "CFAType": 1,
+      "FPType": 0,
+      "CFAOffset": 0,
+      "FPOffset": 0,
+      "RAOffset": 0,
+      "RAType": 0
+    }
+  ],
+  "classifications": [
+    {
+      "PCStart": 28,
+      "PCEndDelta": 8,
+      "Mode": 1
+    },
+    {
+      "PCStart": 36,
+      "PCEndDelta": 20,
+      "Mode": 1
+    },
+    {
+      "PCStart": 52,
+      "PCEndDelta": 8,
+      "Mode": 1
+    },
+    {
+      "PCStart": 56,
+      "PCEndDelta": 4,
+      "Mode": 1
+    },
+    {
+      "PCStart": 60,
+      "PCEndDelta": 24,
+      "Mode": 1
+    },
+    {
+      "PCStart": 84,
+      "PCEndDelta": 8,
+      "Mode": 1
+    }
+  ]
+}

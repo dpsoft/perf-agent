@@ -28,5 +28,6 @@ dependencies = [
 name = "rust-workload"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "num_cpus",
 ]

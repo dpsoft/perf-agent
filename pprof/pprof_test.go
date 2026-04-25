@@ -2,11 +2,14 @@ package pprof
 
 import (
 	"bytes"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // === EXISTING FUNCTIONALITY TESTS ===
@@ -417,8 +420,12 @@ func TestAddSameFunctionDifferentLinesMakesDistinctLocations(t *testing.T) {
 	}
 }
 
-// Same function name from different modules must not collapse.
-func TestAddSameNameDifferentModulesMakesDistinctFunctions(t *testing.T) {
+// TestAddSameNameDifferentModulesDedupsWithoutResolver verifies that
+// when no Resolver is supplied (BuildersOptions.Resolver==nil), all
+// frames land on the placeholder Mapping[0] and the per-binary
+// functionKey collapses same-name samples regardless of Module.
+// Resolver-equipped tests verify the per-binary distinction elsewhere.
+func TestAddSameNameDifferentModulesDedupsWithoutResolver(t *testing.T) {
 	builders := NewProfileBuilders(BuildersOptions{SampleRate: 99})
 	builders.AddSample(&ProfileSample{
 		SampleType:  SampleTypeCpu,
@@ -433,6 +440,158 @@ func TestAddSameNameDifferentModulesMakesDistinctFunctions(t *testing.T) {
 		Value:       100,
 	})
 	for _, b := range builders.Builders {
-		assert.Len(t, b.Profile.Function, 2, "same name in different modules must not collapse")
+		// functionKey is {MappingID, Name} — does not include Module. Per-binary
+		// distinction comes from MappingID, populated when a Resolver is wired
+		// (see resolver-equipped tests).
+		assert.Len(t, b.Profile.Function, 1, "without resolver: same name dedupes to one function")
+	}
+}
+
+func TestFrameHasAddressFields(t *testing.T) {
+	f := Frame{
+		Name:     "foo",
+		Address:  0xdeadbeef,
+		BuildID:  "abc123",
+		MapStart: 0x400000,
+		MapLimit: 0x500000,
+		MapOff:   0x1000,
+		IsKernel: false,
+	}
+	if f.Address != 0xdeadbeef {
+		t.Fatalf("Address round-trip failed: %x", f.Address)
+	}
+	if f.BuildID != "abc123" {
+		t.Fatalf("BuildID round-trip failed: %q", f.BuildID)
+	}
+}
+
+func TestInternKeyTypesDeclared(t *testing.T) {
+	// Compile-time checks: these types must exist with the documented shape.
+	var _ = mappingKey{Path: "p", Start: 1, Limit: 2, Off: 3, BuildID: "b"}
+	var _ = locationKey{MappingID: 1, Address: 0x400}
+	var _ = locationFallbackKey{Name: "n", File: "f", Module: "m", Line: 10}
+	var _ = functionKey{MappingID: 1, Name: "n"}
+}
+
+func TestBuildersOptionsResolverNilFallback(t *testing.T) {
+	// With Resolver==nil, two Frames differing only in Address still
+	// dedup to one Location (fallback path key has no Address).
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99})
+	s1 := &ProfileSample{Pid: 42, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x1000},
+	}}
+	s2 := &ProfileSample{Pid: 42, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x2000},
+	}}
+	bs.AddSample(s1)
+	bs.AddSample(s2)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 1 {
+		t.Fatalf("Resolver=nil: expected 1 Location (fallback dedup), got %d", got)
+	}
+}
+
+func TestAddLocationAddressKeyed(t *testing.T) {
+	// Use the procmap testdata fixture: PID 4242, /usr/bin/target at 0x00400000-0x00420000.
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{
+		SampleRate: 99,
+		Resolver:   resolver,
+	})
+
+	// Two samples with same (func, file, line) but different Address.
+	s1 := &ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00401000},
+	}}
+	s2 := &ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00402000},
+	}}
+	bs.AddSample(s1)
+	bs.AddSample(s2)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 2 {
+		t.Fatalf("Resolver set + distinct Addresses: expected 2 Locations, got %d", got)
+	}
+	for _, loc := range b.Profile.Location {
+		if loc.Mapping == nil || loc.Mapping.File != "/usr/bin/target" {
+			t.Errorf("Location.Mapping wrong: %+v", loc.Mapping)
+		}
+	}
+}
+
+func TestAddLocationResolverMissFallback(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	// PID 9999 has no fixture → resolver Lookup misses.
+	s := &ProfileSample{Pid: 9999, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "orphan", File: "o.go", Line: 5, Address: 0xdeadbeef},
+	}}
+	bs.AddSample(s)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 1 {
+		t.Fatalf("miss → fallback: expected 1 Location, got %d", got)
+	}
+	if b.Profile.Location[0].Mapping == nil {
+		t.Fatal("Location.Mapping nil on fallback path")
+	}
+}
+
+func TestKernelFrameUsesSentinel(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	bs.AddSample(&ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "schedule", IsKernel: true, Address: 0xffffffff80000000},
+	}})
+	bs.AddSample(&ProfileSample{Pid: 5555, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "schedule", IsKernel: true, Address: 0xffffffff80000100},
+	}})
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	var kernelCount int
+	for _, m := range b.Profile.Mapping {
+		if m.File == "[kernel]" {
+			kernelCount++
+		}
+	}
+	if kernelCount != 1 {
+		t.Fatalf("expected 1 [kernel] mapping, got %d", kernelCount)
+	}
+}
+
+func TestMappingFlags(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	bs.AddSample(&ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00401000},
+	}})
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	var target *profile.Mapping
+	for _, m := range b.Profile.Mapping {
+		if m.File == "/usr/bin/target" {
+			target = m
+		}
+	}
+	if target == nil {
+		t.Fatal("target mapping not interned")
+	}
+	if !target.HasFunctions || !target.HasFilenames || !target.HasLineNumbers {
+		t.Errorf("expected all Has* flags true, got funcs=%v files=%v lines=%v",
+			target.HasFunctions, target.HasFilenames, target.HasLineNumbers)
 	}
 }

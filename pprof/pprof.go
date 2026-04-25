@@ -13,6 +13,8 @@ import (
 	"github.com/google/pprof/profile"
 
 	"github.com/klauspost/compress/gzip"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 var (
@@ -46,14 +48,24 @@ type SamplesCollector interface {
 	CollectProfiles(callback CollectProfilesCallback) error
 }
 
-// Frame is a single symbolized stack frame. Only Name is required; the other
-// fields are populated when the symbolizer can provide them (DWARF for native
-// binaries, perf-map decoding for Python/Node runtimes).
+// Frame is a single symbolized stack frame. Name is always populated;
+// other fields are filled when the symbolizer (DWARF for native
+// binaries, perf-map decoding for Python/Node runtimes) or the
+// Resolver can provide them. Address carries the absolute PC from
+// the BPF stack so Locations stay distinguishable across samples
+// that symbolize to the same (file,line,func).
 type Frame struct {
 	Name   string
 	File   string
 	Line   uint32
 	Module string
+
+	Address  uint64
+	BuildID  string
+	MapStart uint64
+	MapLimit uint64
+	MapOff   uint64
+	IsKernel bool
 }
 
 // FrameFromName is a convenience constructor for callers that only know the
@@ -83,6 +95,7 @@ type BuildersOptions struct {
 	SampleRate    int64
 	PerPIDProfile bool
 	Comments      []string // Profile-level comments/tags
+	Resolver      *procmap.Resolver // nil → fallback to name-based Location dedup
 }
 
 type builderHashKey struct {
@@ -142,8 +155,10 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		period = 512 * 1024 // todo
 	}
 	builder := &ProfileBuilder{
-		locations:          make(map[frameKey]*profile.Location),
-		functions:          make(map[frameKey]*profile.Function),
+		resolver:           b.opt.Resolver,
+		mappings:           make(map[mappingKey]*profile.Mapping),
+		locations:          make(map[any]*profile.Location),
+		functions:          make(map[any]*profile.Function),
 		sampleHashToSample: make(map[uint64]*profile.Sample),
 		Profile: &profile.Profile{
 			Mapping: []*profile.Mapping{
@@ -165,29 +180,68 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 	return res
 }
 
-// frameKey dedupes locations and functions. Line is included so two PCs at
-// different source lines within the same function produce distinct locations
-// (otherwise the first-seen line would silently win for all samples).
-type frameKey struct {
-	Name   string
-	File   string
-	Module string
-	Line   uint32
+// mappingKey interns per-binary pprof.Mapping entries. Two mappings
+// with the same backing file but different load addresses (e.g., the
+// same libc mapped into two PIDs with different ASLR slides) intern
+// separately — pprof.Mapping's Start/Limit are absolute VAs.
+type mappingKey struct {
+	Path    string
+	Start   uint64
+	Limit   uint64
+	Off     uint64
+	BuildID string
 }
 
-func (f Frame) locationKey() frameKey {
-	return frameKey{Name: f.Name, File: f.File, Module: f.Module, Line: f.Line}
+// locationKey is the primary Location intern key. MappingID scopes
+// Address to one binary so the same offset in two loaded copies
+// dedups independently.
+type locationKey struct {
+	MappingID uint64
+	Address   uint64 // binary-relative file offset (Address - MapStart + MapOff)
 }
 
-// functionKey returns the (Name, File, Module) subset of frameKey that
-// identifies a pprof Function — Line is per-location, not per-function.
-func (f Frame) functionKey() frameKey {
-	return frameKey{Name: f.Name, File: f.File, Module: f.Module}
+// locationFallbackKey is used when Address==0 (JIT runtime frames) or
+// when the Resolver can't attribute the PC to any mapping. Falls back
+// to the name/file/line dedup scheme used when no Resolver is wired.
+type locationFallbackKey struct {
+	Name, File, Module string
+	Line               uint32
+}
+
+// functionKey interns pprof.Function entries per (binary, name).
+// Adding MappingID means the same symbol name in two binaries (e.g.,
+// main.main in a tool binary and a subprocess) produces two separate
+// Functions — pprof-correct, but changes existing output fidelity.
+type functionKey struct {
+	MappingID uint64
+	Name      string
+}
+
+var (
+	kernelSentinel = procmap.Mapping{Path: "[kernel]"}
+	jitSentinel    = procmap.Mapping{Path: "[jit]"}
+)
+
+// looksJIT returns true when frame.Name matches one of the perf-map
+// runtime prefixes (Python, Node). decodePerfMapFrame zeros Address
+// for these formats, so JIT frames reach the [jit] sentinel mapping
+// rather than the resolver-driven primary path — anonymous JIT
+// mappings have no file-offset identity that would round-trip.
+func looksJIT(f Frame) bool {
+	return strings.HasPrefix(f.Name, "py::") ||
+		strings.HasPrefix(f.Name, "JS:") ||
+		strings.HasPrefix(f.Name, "LazyCompile:") ||
+		strings.HasPrefix(f.Name, "Function:") ||
+		strings.HasPrefix(f.Name, "Builtin:") ||
+		strings.HasPrefix(f.Name, "Code:") ||
+		strings.HasPrefix(f.Name, "Script:")
 }
 
 type ProfileBuilder struct {
-	locations          map[frameKey]*profile.Location
-	functions          map[frameKey]*profile.Function
+	resolver           *procmap.Resolver
+	mappings           map[mappingKey]*profile.Mapping
+	locations          map[any]*profile.Location
+	functions          map[any]*profile.Function
 	sampleHashToSample map[uint64]*profile.Sample
 	Profile            *profile.Profile
 	tmpLocations       []*profile.Location
@@ -198,7 +252,7 @@ func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {
 	sample := p.newSample(inputSample)
 	p.addValue(inputSample, sample)
 	for i, f := range inputSample.Stack {
-		sample.Location[i] = p.addLocation(f)
+		sample.Location[i] = p.addLocation(f, inputSample.Pid)
 	}
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
@@ -207,7 +261,7 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.tmpLocations = p.tmpLocations[:0]
 	p.tmpLocationIDs = p.tmpLocationIDs[:0]
 	for _, f := range inputSample.Stack {
-		loc := p.addLocation(f)
+		loc := p.addLocation(f, inputSample.Pid)
 		p.tmpLocations = append(p.tmpLocations, loc)
 		p.tmpLocationIDs = append(p.tmpLocationIDs, loc.ID)
 	}
@@ -224,39 +278,127 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
 
-func (p *ProfileBuilder) addLocation(frame Frame) *profile.Location {
-	// Runtimes that symbolize via perf-maps pack name+file into a single
-	// string in Frame.Name. Decode here so pprof's Function.Filename and
-	// Line fields populate for any known runtime.
+func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location {
 	frame = decodePerfMapFrame(frame)
 
-	key := frame.locationKey()
+	// 1. Kernel frames use a shared sentinel mapping regardless of PID.
+	if frame.IsKernel {
+		mapping := p.addMapping(kernelSentinel, frame)
+		return p.addLocationByAddr(mapping, frame)
+	}
+
+	// 2. Perf-map runtime frames (Python/Node JIT) live in anonymous
+	// mappings with meaningless file offsets. decodePerfMapFrame zeros
+	// Address for these formats, so this branch routes them to the [jit]
+	// sentinel via the fallback key.
+	if frame.Address == 0 && looksJIT(frame) {
+		mapping := p.addMapping(jitSentinel, frame)
+		return p.addLocationByFallback(mapping, frame)
+	}
+
+	// 3. Resolver-driven primary path.
+	if frame.Address != 0 && p.resolver != nil {
+		if m, ok := p.resolver.Lookup(pid, frame.Address); ok {
+			frame.MapStart = m.Start
+			frame.MapLimit = m.Limit
+			frame.MapOff = m.Offset
+			frame.BuildID = m.BuildID
+			mapping := p.addMapping(m, frame)
+			return p.addLocationByAddr(mapping, frame)
+		}
+	}
+
+	// 4. Fallback: name-based dedup on the default single mapping.
+	return p.addLocationByFallback(p.Profile.Mapping[0], frame)
+}
+
+func (p *ProfileBuilder) addMapping(m procmap.Mapping, frame Frame) *profile.Mapping {
+	key := mappingKey{
+		Path: m.Path, Start: m.Start, Limit: m.Limit, Off: m.Offset, BuildID: m.BuildID,
+	}
+	if existing, ok := p.mappings[key]; ok {
+		p.updateMappingFlags(existing, frame)
+		return existing
+	}
+	id := uint64(len(p.Profile.Mapping) + 1)
+	mapping := &profile.Mapping{
+		ID:      id,
+		Start:   m.Start,
+		Limit:   m.Limit,
+		Offset:  m.Offset,
+		File:    m.Path,
+		BuildID: m.BuildID,
+	}
+	p.updateMappingFlags(mapping, frame)
+	p.Profile.Mapping = append(p.Profile.Mapping, mapping)
+	p.mappings[key] = mapping
+	return mapping
+}
+
+func (p *ProfileBuilder) updateMappingFlags(m *profile.Mapping, f Frame) {
+	if f.Name != "" {
+		m.HasFunctions = true
+	}
+	if f.File != "" {
+		m.HasFilenames = true
+	}
+	if f.Line > 0 {
+		m.HasLineNumbers = true
+	}
+}
+
+func (p *ProfileBuilder) addLocationByAddr(mapping *profile.Mapping, frame Frame) *profile.Location {
+	var offset uint64
+	if frame.MapStart != 0 {
+		offset = frame.Address - frame.MapStart + frame.MapOff
+	} else {
+		offset = frame.Address
+	}
+	key := locationKey{MappingID: mapping.ID, Address: offset}
 	if loc, ok := p.locations[key]; ok {
 		return loc
 	}
-
 	id := uint64(len(p.Profile.Location) + 1)
 	loc := &profile.Location{
 		ID:      id,
-		Mapping: p.Profile.Mapping[0],
-		Line: []profile.Line{
-			{
-				Function: p.addFunction(frame),
-				Line:     int64(frame.Line),
-			},
-		},
+		Mapping: mapping,
+		Address: offset,
+		Line: []profile.Line{{
+			Function: p.addFunction(frame, mapping.ID),
+			Line:     int64(frame.Line),
+		}},
 	}
 	p.Profile.Location = append(p.Profile.Location, loc)
 	p.locations[key] = loc
 	return loc
 }
 
-func (p *ProfileBuilder) addFunction(frame Frame) *profile.Function {
-	key := frame.functionKey()
+func (p *ProfileBuilder) addLocationByFallback(mapping *profile.Mapping, frame Frame) *profile.Location {
+	key := locationFallbackKey{
+		Name: frame.Name, File: frame.File, Module: frame.Module, Line: frame.Line,
+	}
+	if loc, ok := p.locations[key]; ok {
+		return loc
+	}
+	id := uint64(len(p.Profile.Location) + 1)
+	loc := &profile.Location{
+		ID:      id,
+		Mapping: mapping,
+		Line: []profile.Line{{
+			Function: p.addFunction(frame, mapping.ID),
+			Line:     int64(frame.Line),
+		}},
+	}
+	p.Profile.Location = append(p.Profile.Location, loc)
+	p.locations[key] = loc
+	return loc
+}
+
+func (p *ProfileBuilder) addFunction(frame Frame, mappingID uint64) *profile.Function {
+	key := functionKey{MappingID: mappingID, Name: frame.Name}
 	if f, ok := p.functions[key]; ok {
 		return f
 	}
-
 	id := uint64(len(p.Profile.Function) + 1)
 	f := &profile.Function{
 		ID:       id,
@@ -349,10 +491,14 @@ func decodePerfMapFrame(f Frame) Frame {
 		return f
 	}
 	if dec, ok := decodePython(f.Name); ok {
-		return mergeFrame(f, dec)
+		f = mergeFrame(f, dec)
+		f.Address = 0 // JIT code — file-offset is meaningless
+		return f
 	}
 	if dec, ok := decodeNode(f.Name); ok {
-		return mergeFrame(f, dec)
+		f = mergeFrame(f, dec)
+		f.Address = 0
+		return f
 	}
 	return f
 }

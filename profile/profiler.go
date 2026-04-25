@@ -1,7 +1,6 @@
 package profile
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,13 +14,16 @@ import (
 
 	blazesym "github.com/libbpf/blazesym/go"
 
+	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
 	objs       *perfObjects
 	symbolizer *blazesym.Symbolizer
+	resolver   *procmap.Resolver
 	perfEvents []*perfEvent
 	tags       []string
 	sampleRate int
@@ -43,25 +45,25 @@ func (s *stackBuilder) append(f pprof.Frame) {
 }
 
 // blazeSymToFrames converts a blazesym.Sym into one or more pprof.Frames.
-// When the PC is inside a chain of inlined function calls, the chain is
-// expanded into separate Frames in leaf-first order (innermost inline first,
-// outer real function last), matching the append order of a leaf-first stack.
+// addr is the absolute PC from the BPF stack — it is copied onto every
+// frame (inlined chain + outer real function) so pprof Locations stay
+// distinguishable when two PCs symbolize to the same (file, line, func).
 //
 // blazesym reports Inlined in outer→inner order (see
 // blazesym/src/symbolize/mod.rs:408), so we walk it in reverse to get
 // leaf-first output.
-func blazeSymToFrames(s blazesym.Sym) []pprof.Frame {
+func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
 	for i := len(s.Inlined) - 1; i >= 0; i-- {
 		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module}
+		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
 		if in.CodeInfo != nil {
 			f.File = in.CodeInfo.File
 			f.Line = in.CodeInfo.Line
 		}
 		out = append(out, f)
 	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module}
+	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
 	if s.CodeInfo != nil {
 		outer.File = s.CodeInfo.File
 		outer.Line = s.CodeInfo.Line
@@ -139,6 +141,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	return &Profiler{
 		objs:       objs,
 		symbolizer: symbolizer,
+		resolver:   procmap.NewResolver(),
 		perfEvents: perfEvents,
 		tags:       tags,
 		sampleRate: sampleRate,
@@ -148,6 +151,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 // Close releases all resources associated with the profiler
 func (pr *Profiler) Close() {
 	pr.symbolizer.Close()
+	pr.resolver.Close()
 	for _, pe := range pr.perfEvents {
 		_ = pe.Close()
 	}
@@ -186,6 +190,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		SampleRate:    int64(pr.sampleRate),
 		PerPIDProfile: false,
 		Comments:      pr.tags,
+		Resolver:      pr.resolver,
 	})
 
 	for i := 0; i < n; i++ {
@@ -208,26 +213,30 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		sb := new(stackBuilder)
 		begin := len(sb.stack)
 
-		for j := 0; j < 127; j++ {
-			instructionPointerBytes := stack[j*8 : j*8+8]
-			instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
-			if instructionPointer == 0 {
-				break
-			}
-
-			symbol, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
-				[]uint64{instructionPointer},
+		// Extract all non-zero IPs first, then batch-symbolize in a
+		// single blazesym call. Per-call overhead (CGO boundary +
+		// perf-map / debug-syms bookkeeping) dominates for short stacks;
+		// one batched call is dramatically cheaper than one call per IP.
+		ips := bpfstack.ExtractIPs(stack)
+		if len(ips) > 0 {
+			symbols, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
+				ips,
 				samplePid,
 				blazesym.ProcessSourceWithPerfMap(true),
 				blazesym.ProcessSourceWithDebugSyms(true),
 			)
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
-				break
-			}
-
-			for _, f := range blazeSymToFrames(symbol[0]) {
-				sb.append(f)
+			} else {
+				// symbols and ips are parallel — one Sym per IP.
+				for i, s := range symbols {
+					if i >= len(ips) {
+						break
+					}
+					for _, f := range blazeSymToFrames(s, ips[i]) {
+						sb.append(f)
+					}
+				}
 			}
 		}
 
@@ -318,4 +327,3 @@ func (pe *perfEvent) attachPerfEvent(prog *ebpf.Program) error {
 	pe.link = rawLink
 	return nil
 }
-

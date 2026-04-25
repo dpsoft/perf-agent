@@ -258,7 +258,7 @@ struct {
 
 // ----- Lookup helpers.
 //
-// These helpers are called per-frame by the hybrid walker (Task 5). They
+// These helpers are called per-frame by the hybrid walker. They
 // encapsulate the map-of-maps dance so the walker stays readable.
 
 // mapping_lookup_result carries what mapping_for_pc returns.

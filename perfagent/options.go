@@ -50,10 +50,12 @@ type Config struct {
 	// MetricsExporters are the exporters to use for metrics output.
 	MetricsExporters []metrics.Exporter
 
-	// Unwind selects the stack-unwinding strategy for --profile and
-	// --offcpu modes. Valid values: "fp" (frame pointer — default),
-	// "dwarf" (DWARF CFI), "auto" (aliases to "dwarf"; the DWARF walker already takes the FP path for FP-safe frames).
-	// Empty string defaults to "fp".
+	// Unwind selects the stack unwinding strategy for --profile and
+	// --offcpu modes. Valid values: "fp" (frame pointer),
+	// "dwarf" (DWARF CFI), "auto" (default; aliases to "dwarf",
+	// and the DWARF walker already takes the FP path for FP-safe
+	// frames). After options parsing, an empty string is treated
+	// as "auto".
 	Unwind string
 
 	// CPUs is the list of CPUs to monitor. If nil, all online CPUs are used.

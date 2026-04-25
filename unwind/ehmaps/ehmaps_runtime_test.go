@@ -17,7 +17,7 @@ import (
 //
 // Note: we can't directly read the inner map via the outer map's userspace
 // handle (cilium/ebpf returns the inner map's ID rather than a readable
-// handle when looking up). The integration test in Task 9 validates the
+// handle when looking up). The integration tests validate the
 // round-trip through the BPF walker end-to-end.
 func TestPopulateCFIRoundtrip(t *testing.T) {
 	requireBPFCaps(t)

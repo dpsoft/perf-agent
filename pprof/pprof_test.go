@@ -420,13 +420,12 @@ func TestAddSameFunctionDifferentLinesMakesDistinctLocations(t *testing.T) {
 	}
 }
 
-// Same function name from different modules: with the fallback intern key
-// (locationFallbackKey for locations, functionKey{MappingID,Name} for
-// functions), two frames with the same name but different Module fields
-// still share a single pprof.Function because the shim-stage functionKey
-// does not include Module. Module-aware dedup is wired in Task 6 via
-// MappingID. This test documents the shim behaviour.
-func TestAddSameNameDifferentModulesMakesDistinctFunctions(t *testing.T) {
+// TestAddSameNameDifferentModulesDedupsWithoutResolver verifies that
+// when no Resolver is supplied (BuildersOptions.Resolver==nil), all
+// frames land on the placeholder Mapping[0] and the per-binary
+// functionKey collapses same-name samples regardless of Module.
+// Resolver-equipped tests verify the per-binary distinction elsewhere.
+func TestAddSameNameDifferentModulesDedupsWithoutResolver(t *testing.T) {
 	builders := NewProfileBuilders(BuildersOptions{SampleRate: 99})
 	builders.AddSample(&ProfileSample{
 		SampleType:  SampleTypeCpu,
@@ -441,10 +440,10 @@ func TestAddSameNameDifferentModulesMakesDistinctFunctions(t *testing.T) {
 		Value:       100,
 	})
 	for _, b := range builders.Builders {
-		// Shim stage: functionKey is {MappingID, Name} — Module is not yet
-		// in the key, so both frames share one pprof.Function. Task 6 will
-		// wire MappingID properly and restore per-binary dedup.
-		assert.Len(t, b.Profile.Function, 1, "shim: same name dedupes to one function (Module not yet in key)")
+		// functionKey is {MappingID, Name} — does not include Module. Per-binary
+		// distinction comes from MappingID, populated when a Resolver is wired
+		// (see resolver-equipped tests).
+		assert.Len(t, b.Profile.Function, 1, "without resolver: same name dedupes to one function")
 	}
 }
 
@@ -494,7 +493,7 @@ func TestBuildersOptionsResolverNilFallback(t *testing.T) {
 }
 
 func TestAddLocationAddressKeyed(t *testing.T) {
-	// Use the Task 1 fixture: PID 4242, /usr/bin/target at 0x00400000-0x00420000.
+	// Use the procmap testdata fixture: PID 4242, /usr/bin/target at 0x00400000-0x00420000.
 	resolver := procmap.NewResolver(procmap.WithProcRoot(
 		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
 	defer resolver.Close()

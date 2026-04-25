@@ -153,7 +153,7 @@ func TestProfileMode(t *testing.T) {
 			}
 			assert.True(t, hasSymbols, "Profile should contain symbolized functions")
 
-			// S9: verify pprof fidelity guarantees
+			// verify pprof fidelity guarantees
 			assertPprofFidelity(t, outputFile)
 		})
 	}
@@ -206,6 +206,9 @@ func TestOffCPUMode(t *testing.T) {
 
 			// Should have samples (I/O workloads block on I/O)
 			assert.Greater(t, len(prof.Sample), 0, "Off-CPU profile should contain samples")
+
+			// verify pprof fidelity guarantees
+			assertPprofFidelity(t, outputFile)
 		})
 	}
 }
@@ -350,8 +353,8 @@ func requireBPFRunnable(t *testing.T, agentPath string) {
 	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
 }
 
-// assertPprofFidelity verifies the S9 pprof fidelity guarantees on a
-// captured profile: >=2 real (non-sentinel) mappings, at least one
+// assertPprofFidelity verifies pprof fidelity guarantees on a
+// captured profile: >=1 real (non-sentinel) mapping, at least one
 // mapping with a non-empty BuildID, every user-space Location has a
 // non-zero Address. Skips kernel and JIT sentinel mappings.
 func assertPprofFidelity(t *testing.T, path string) {
@@ -493,6 +496,9 @@ func TestSystemWideOffCPU(t *testing.T) {
 
 	assert.Contains(t, string(output), "system-wide")
 	assert.FileExists(t, outputFile)
+
+	// verify pprof fidelity guarantees
+	assertPprofFidelity(t, outputFile)
 }
 
 func TestSystemWidePMU(t *testing.T) {
@@ -1200,7 +1206,7 @@ func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
 	require.Greater(t, len(prof.Sample), 0, "system-wide profile should have samples")
 	require.Greater(t, len(prof.Function), 0, "system-wide profile should have at least one symbolized function")
 
-	// S9: verify pprof fidelity guarantees
+	// verify pprof fidelity guarantees
 	assertPprofFidelity(t, outputFile)
 }
 
@@ -1251,6 +1257,9 @@ func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
 	}
 	require.Greater(t, totalNs, int64(0), "system-wide off-CPU profile should have non-zero blocking-ns")
 	t.Logf("system-wide off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
+
+	// verify pprof fidelity guarantees
+	assertPprofFidelity(t, outputFile)
 }
 
 // TestPerfDwarfMmap2Tracking validates the MMAP2 flow: after starting the

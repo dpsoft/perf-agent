@@ -11,7 +11,7 @@ type ProbeSpinFn = unsafe extern "C" fn(u64) -> u64;
 fn cpu_intensive_work(stop: Arc<AtomicBool>, probe: Arc<AtomicPtr<c_void>>) {
     let mut sum = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        let p = probe.load(Ordering::Relaxed);
+        let p = probe.load(Ordering::Acquire);
         if !p.is_null() {
             let f: ProbeSpinFn = unsafe { std::mem::transmute(p) };
             unsafe { sum = sum.wrapping_add(f(100_000)); }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 	blazesym "github.com/libbpf/blazesym/go"
 )
 
@@ -19,6 +20,7 @@ import (
 type Profiler struct {
 	objs       *offcpuObjects
 	symbolizer *blazesym.Symbolizer
+	resolver   *procmap.Resolver
 	link       link.Link
 	tags       []string
 }
@@ -33,19 +35,21 @@ func (s *stackBuilder) append(f pprof.Frame) {
 }
 
 // blazeSymToFrames mirrors the converter in profile/profiler.go: expands
-// inlined call chains into separate leaf-first Frames.
-func blazeSymToFrames(s blazesym.Sym) []pprof.Frame {
+// inlined call chains into separate leaf-first Frames. addr is the
+// absolute PC from the BPF stack, copied onto every frame so pprof
+// Locations stay distinguishable.
+func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
 	for i := len(s.Inlined) - 1; i >= 0; i-- {
 		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module}
+		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
 		if in.CodeInfo != nil {
 			f.File = in.CodeInfo.File
 			f.Line = in.CodeInfo.Line
 		}
 		out = append(out, f)
 	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module}
+	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
 	if s.CodeInfo != nil {
 		outer.File = s.CodeInfo.File
 		outer.Line = s.CodeInfo.Line
@@ -102,6 +106,7 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 	return &Profiler{
 		objs:       objs,
 		symbolizer: symbolizer,
+		resolver:   procmap.NewResolver(),
 		link:       tp,
 		tags:       tags,
 	}, nil
@@ -110,6 +115,7 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 // Close releases all resources associated with the profiler
 func (pr *Profiler) Close() {
 	pr.symbolizer.Close()
+	pr.resolver.Close()
 	_ = pr.link.Close()
 	_ = pr.objs.Close()
 }
@@ -146,6 +152,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		SampleRate:    1, // Not used for off-CPU but needed for builder
 		PerPIDProfile: false,
 		Comments:      pr.tags,
+		Resolver:      pr.resolver,
 	})
 
 	for i := 0; i < n; i++ {
@@ -182,8 +189,11 @@ func (pr *Profiler) Collect(w io.Writer) error {
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
 			} else {
-				for _, s := range symbols {
-					for _, f := range blazeSymToFrames(s) {
+				for i, s := range symbols {
+					if i >= len(ips) {
+						break
+					}
+					for _, f := range blazeSymToFrames(s, ips[i]) {
 						sb.append(f)
 					}
 				}

@@ -202,7 +202,7 @@ type locationKey struct {
 
 // locationFallbackKey is used when Address==0 (JIT runtime frames) or
 // when the Resolver can't attribute the PC to any mapping. Falls back
-// to the pre-S9 name/file/line dedup scheme.
+// to the name/file/line dedup scheme used when no Resolver is wired.
 type locationFallbackKey struct {
 	Name, File, Module string
 	Line               uint32
@@ -224,9 +224,9 @@ var (
 
 // looksJIT returns true when frame.Name matches one of the perf-map
 // runtime prefixes (Python, Node). decodePerfMapFrame zeros Address
-// for these in Task 8; before then, the Address field may still be
-// nonzero but we keep these on the [jit] sentinel because anonymous
-// JIT mappings have no file-offset identity.
+// for these formats, so JIT frames reach the [jit] sentinel mapping
+// rather than the resolver-driven primary path — anonymous JIT
+// mappings have no file-offset identity that would round-trip.
 func looksJIT(f Frame) bool {
 	return strings.HasPrefix(f.Name, "py::") ||
 		strings.HasPrefix(f.Name, "JS:") ||
@@ -288,9 +288,9 @@ func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location 
 	}
 
 	// 2. Perf-map runtime frames (Python/Node JIT) live in anonymous
-	// mappings with meaningless file offsets. After Task 8,
-	// decodePerfMapFrame zeros Address for these; until then, the
-	// Address may be nonzero but we still group them under [jit].
+	// mappings with meaningless file offsets. decodePerfMapFrame zeros
+	// Address for these formats, so this branch routes them to the [jit]
+	// sentinel via the fallback key.
 	if frame.Address == 0 && looksJIT(frame) {
 		mapping := p.addMapping(jitSentinel, frame)
 		return p.addLocationByFallback(mapping, frame)

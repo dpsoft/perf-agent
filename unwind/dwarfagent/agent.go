@@ -125,7 +125,7 @@ func (p *Profiler) attachPerfEvents(prog *ebpf.Program, cpus []uint, sampleRate 
 		}
 	}
 	if len(p.perfFDs) == 0 {
-		return fmt.Errorf("no perf events attached — pid %d may have exited", p.pid)
+		return fmt.Errorf("no perf events attached (pid=%d, cpus=%d)", p.pid, len(cpus))
 	}
 	return nil
 }

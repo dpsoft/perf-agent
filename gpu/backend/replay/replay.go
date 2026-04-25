@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/dpsoft/perf-agent/gpu"
-	"github.com/dpsoft/perf-agent/gpu/backend"
 )
 
 type Backend struct {
@@ -21,19 +20,19 @@ func New(path string) (*Backend, error) {
 	return &Backend{path: path}, nil
 }
 
-func (b *Backend) ID() backend.GPUBackendID {
+func (b *Backend) ID() gpu.GPUBackendID {
 	return "replay"
 }
 
-func (b *Backend) Capabilities() []backend.GPUCapability {
-	return []backend.GPUCapability{
+func (b *Backend) Capabilities() []gpu.GPUCapability {
+	return []gpu.GPUCapability{
 		gpu.CapabilityLaunchTrace,
 		gpu.CapabilityExecTimeline,
 		gpu.CapabilityStallReasons,
 	}
 }
 
-func (b *Backend) Start(_ context.Context, sink backend.EventSink) error {
+func (b *Backend) Start(_ context.Context, sink gpu.EventSink) error {
 	data, err := os.ReadFile(b.path)
 	if err != nil {
 		return fmt.Errorf("read replay fixture: %w", err)
@@ -68,7 +67,7 @@ type rawEvent struct {
 	Weight      uint64            `json:"weight"`
 }
 
-func emitEvent(event rawEvent, sink backend.EventSink) error {
+func emitEvent(event rawEvent, sink gpu.EventSink) error {
 	switch event.Kind {
 	case "launch":
 		sink.EmitLaunch(gpu.GPUKernelLaunch{

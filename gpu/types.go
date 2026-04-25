@@ -1,6 +1,10 @@
 package gpu
 
-import pp "github.com/dpsoft/perf-agent/pprof"
+import (
+	"context"
+
+	pp "github.com/dpsoft/perf-agent/pprof"
+)
 
 type GPUBackendID string
 
@@ -84,4 +88,19 @@ type GPUSample struct {
 	Line        uint32        `json:"line"`
 	StallReason string        `json:"stall_reason"`
 	Weight      uint64        `json:"weight"`
+}
+
+type EventSink interface {
+	EmitLaunch(GPUKernelLaunch)
+	EmitExec(GPUKernelExec)
+	EmitCounter(GPUCounterSample)
+	EmitSample(GPUSample)
+}
+
+type Backend interface {
+	ID() GPUBackendID
+	Capabilities() []GPUCapability
+	Start(ctx context.Context, sink EventSink) error
+	Stop(ctx context.Context) error
+	Close() error
 }

@@ -175,18 +175,12 @@ type frameKey struct {
 	Line   uint32
 }
 
-// functionKey is the subset of frameKey that identifies a pprof Function
-// (Line is per-location, not per-function).
-type functionKey struct {
-	Name   string
-	File   string
-	Module string
-}
-
 func (f Frame) locationKey() frameKey {
 	return frameKey{Name: f.Name, File: f.File, Module: f.Module, Line: f.Line}
 }
 
+// functionKey returns the (Name, File, Module) subset of frameKey that
+// identifies a pprof Function — Line is per-location, not per-function.
 func (f Frame) functionKey() frameKey {
 	return frameKey{Name: f.Name, File: f.File, Module: f.Module}
 }

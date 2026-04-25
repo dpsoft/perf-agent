@@ -389,6 +389,65 @@ type EventSink interface {
 }
 ```
 
+### 10.4 Go API design principles
+
+The GPU packages should follow the same broad design discipline as the rest of this repo:
+
+- keep interfaces narrow and behavioral
+- keep ownership of concurrency at the manager/session boundary
+- keep normalized event types in one package so backends do not redefine the contract
+- prefer explicit capability checks over type assertions against concrete backends
+- keep the raw event stream append-only until projection time
+
+Concretely:
+
+- `gpu/types.go` should own the canonical exported event structs
+- `gpu/backend` should own the narrow backend interface only
+- backend packages should translate vendor-native records into core types as early as possible
+- `gpu/manager` should own lifecycle, fan-in, and projection wiring
+
+Candidate manager shape:
+
+```go
+type Manager struct {
+    backends []backend.Backend
+    sink     EventSink
+}
+
+func NewManager(backends []backend.Backend, sink EventSink) *Manager
+func (m *Manager) Start(ctx context.Context) error
+func (m *Manager) Stop(ctx context.Context) error
+func (m *Manager) Close() error
+```
+
+This keeps the public surface simple while allowing the implementation to evolve internally.
+
+### 10.5 Modern Go implementation notes
+
+When implementation starts, the GPU packages should prefer modern Go 1.26-era standard library patterns over custom helpers or legacy idioms.
+
+Use these defaults unless repo-local constraints argue otherwise:
+
+- `slices`, `maps`, and `cmp` for common collection operations instead of bespoke loops where readability improves
+- `errors.Is` and `errors.Join` for error inspection and aggregation
+- `context.WithCancelCause`, `context.WithTimeoutCause`, and `context.Cause` when manager or backend shutdown needs to preserve failure reason
+- `sync.OnceFunc` or `sync.OnceValue` for lazy backend/global initialization instead of open-coded `sync.Once` wrappers
+- `atomic.Bool`, `atomic.Int64`, and `atomic.Pointer[T]` for shared backend state rather than untyped atomic patterns
+- `clear`, `min`, and `max` where they simplify intent
+- `slices.Clone` and `maps.Clone` when raw event snapshots need defensive copies
+
+Avoid:
+
+- custom slice or map utility helpers when stdlib packages already cover the operation
+- lossy cancellation where the cause of shutdown matters for backend diagnosis
+- broad interfaces that exist only to make testing easier
+
+For tests:
+
+- use `t.Context()` when test code needs a context
+- prefer table-driven tests around normalized event joins and projection rules
+- keep backend-specific fixtures at the package boundary so core tests do not depend on vendor SDKs
+
 ## 11. Host Correlation Plane
 
 The host plane should be independent of any single vendor backend.
@@ -469,6 +528,58 @@ That output may be implemented as:
 3. both
 
 But the requirement is the same: one visual stack that answers “which CPU code caused which GPU work, and why was that GPU work expensive?”
+
+### 12.2.2 Candidate: `pprof` with synthetic GPU frames
+
+One likely projection is to reuse the existing pprof pipeline and encode GPU-side context as synthetic frames appended after the real CPU launch stack.
+
+Example shape:
+
+```text
+app::train_step
+model::forward
+cudaLaunchKernel
+[gpu:launch]
+[gpu:device:0]
+[gpu:queue:7]
+[gpu:kernel:flash_attn_fwd]
+[gpu:stall:memory_throttle]
+[gpu:pc:0x1a40]
+```
+
+Why this is attractive:
+
+- it reuses the existing pprof builder and profile-writing path
+- it preserves the real CPU stack at the top of the flame graph
+- it can produce a mixed CPU+GPU visual without requiring a custom profile format first
+
+Why it is still an open question:
+
+- synthetic GPU frames are a convention, not a native pprof concept
+- naming stability matters because it directly affects aggregation behavior
+- some projections may still need folded-stack export for compatibility with existing flame graph tooling
+
+If this route is chosen, the ordering rule should be:
+
+1. real CPU user frames
+2. optional CPU runtime or kernel frames
+3. one or more GPU boundary markers
+4. GPU execution identity
+5. optional GPU function/source/stall/PC detail
+
+And the naming rule should be explicit and machine-stable, for example:
+
+```text
+[gpu:launch]
+[gpu:device:<id>]
+[gpu:queue:<id>]
+[gpu:kernel:<name>]
+[gpu:function:<name>]
+[gpu:stall:<reason>]
+[gpu:pc:<hex>]
+```
+
+This section is intentionally a candidate design, not a final commitment.
 
 ### 12.3 Symbolization contract
 
@@ -635,14 +746,72 @@ Implement the architecture as:
 
 This gives us a serious path to Option 2 without claiming a false vendor-neutral device sampler.
 
-## 17. Open Questions
+## 17. Open Questions / Decision Prompts
 
-1. Which backend should be first: NVIDIA, Intel, or a narrower internal target?
-2. Should the first host correlation path rely on runtime callbacks only, or also add `uprobes` immediately?
-3. Should raw timeline export be JSON first, protobuf first, or internal-only at the start?
-4. Should mixed CPU+GPU stacks live in the existing `pprof.Frame` model, or in a new GPU-aware profile model with a pprof exporter on top?
-5. Do we want Phase 1 to target a single process, or system-wide multi-process GPU attribution from the start?
-6. Should subsampling be a universal backend capability in the core API, or an optional backend-specific control surfaced only when needed?
+These are the main review decisions the draft still needs.
+
+### 17.1 First backend
+
+Question:
+- Which backend should be first: NVIDIA, Intel, or a narrower internal target?
+
+Current recommendation:
+- prefer the backend that matches the first real deployment environment
+- absent a strong internal constraint, NVIDIA looks like the most generally deployable first path
+
+### 17.2 First host correlation mechanism
+
+Question:
+- Should the first host correlation path rely on runtime callbacks only, or also add `uprobes` immediately?
+
+Current recommendation:
+- start with whichever source gives the strongest correlation IDs for the chosen backend
+- add `uprobes` early if callbacks alone are not enough for attach-late workflows
+
+### 17.3 Raw timeline export format
+
+Question:
+- Should raw timeline export be JSON first, protobuf first, or internal-only at the start?
+
+Current recommendation:
+- start with JSON if early inspection and debugging matter more than schema rigidity
+- move to protobuf only if volume, compatibility, or external ingestion pressure justifies it
+
+### 17.4 Mixed stack representation
+
+Question:
+- Should mixed CPU+GPU stacks live in the existing `pprof.Frame` model, or in a new GPU-aware profile model with a pprof exporter on top?
+
+Current recommendation:
+- keep the normalized event stream as the source of truth
+- defer a new profile model unless the pprof projection becomes too lossy
+
+### 17.5 Initial scope width
+
+Question:
+- Do we want Phase 1 to target a single process, or system-wide multi-process GPU attribution from the start?
+
+Current recommendation:
+- optimize Phase 1 for one active workload first
+- treat broader system-wide fairness and attribution as follow-on work
+
+### 17.6 Subsampling contract
+
+Question:
+- Should subsampling be a universal backend capability in the core API, or an optional backend-specific control surfaced only when needed?
+
+Current recommendation:
+- define subsampling as an optional but standardizable backend capability
+- avoid requiring every backend to implement it on day one
+
+### 17.7 Canonical flame-graph artifact
+
+Question:
+- Should the canonical flame-graph artifact be `pprof` with synthetic GPU frames, or should folded-stack export be first-class from the start as well?
+
+Current recommendation:
+- lean toward `pprof` with synthetic GPU frames as the first-class artifact
+- keep folded-stack export available as a compatibility or debugging output if implementation cost stays low
 
 ## 18. Test Plan
 
@@ -652,6 +821,8 @@ This gives us a serious path to Option 2 without claiming a false vendor-neutral
 - correlation join logic
 - timestamp conversion helpers
 - backend capability negotiation
+- synthetic GPU frame naming and ordering rules
+- event snapshot copy semantics and zero-value behavior
 
 ### 18.2 Integration
 
@@ -659,6 +830,7 @@ This gives us a serious path to Option 2 without claiming a false vendor-neutral
 - exported timeline links launch X to execution A
 - optional counters appear on the same device/time axis
 - ambiguous or heuristic joins are surfaced distinctly from hard joins
+- pprof projection preserves CPU launch frames and appends synthetic GPU frames in the expected order
 
 ### 18.3 End-to-end
 

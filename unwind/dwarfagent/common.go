@@ -87,18 +87,25 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	)
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 
+	// Eager-compile is best-effort. Binaries without .eh_frame (Go,
+	// stripped musl statics) intentionally fail here; the hybrid walker
+	// still handles FP-safe code at runtime, and MmapWatcher will retry
+	// per-binary on dlopen. Log the error and continue rather than refusing
+	// to start.
 	if systemWide {
 		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
 		if err != nil {
-			return nil, fmt.Errorf("attach all processes: %w", err)
+			log.Printf("%s: AttachAllProcesses: %v (continuing; walker uses FP path for unattached binaries)", logPrefix, err)
+		} else {
+			log.Printf("%s: attached %d distinct binaries across %d PIDs", logPrefix, nTables, nPIDs)
 		}
-		log.Printf("%s: attached %d distinct binaries across %d PIDs", logPrefix, nTables, nPIDs)
 	} else {
 		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
 		if err != nil {
-			return nil, fmt.Errorf("attach initial mappings: %w", err)
+			log.Printf("%s: AttachAllMappings(pid=%d): %v (continuing; walker uses FP path for unattached binaries)", logPrefix, pid, err)
+		} else {
+			log.Printf("%s: attached %d binaries from /proc/%d/maps", logPrefix, n, pid)
 		}
-		log.Printf("%s: attached %d binaries from /proc/%d/maps", logPrefix, n, pid)
 	}
 
 	var watcher mmapEventSourceCloser

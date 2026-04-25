@@ -2,11 +2,14 @@ package pprof
 
 import (
 	"bytes"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // === EXISTING FUNCTIONALITY TESTS ===
@@ -487,5 +490,109 @@ func TestBuildersOptionsResolverNilFallback(t *testing.T) {
 	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
 	if got := len(b.Profile.Location); got != 1 {
 		t.Fatalf("Resolver=nil: expected 1 Location (fallback dedup), got %d", got)
+	}
+}
+
+func TestAddLocationAddressKeyed(t *testing.T) {
+	// Use the Task 1 fixture: PID 4242, /usr/bin/target at 0x00400000-0x00420000.
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{
+		SampleRate: 99,
+		Resolver:   resolver,
+	})
+
+	// Two samples with same (func, file, line) but different Address.
+	s1 := &ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00401000},
+	}}
+	s2 := &ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00402000},
+	}}
+	bs.AddSample(s1)
+	bs.AddSample(s2)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 2 {
+		t.Fatalf("Resolver set + distinct Addresses: expected 2 Locations, got %d", got)
+	}
+	for _, loc := range b.Profile.Location {
+		if loc.Mapping == nil || loc.Mapping.File != "/usr/bin/target" {
+			t.Errorf("Location.Mapping wrong: %+v", loc.Mapping)
+		}
+	}
+}
+
+func TestAddLocationResolverMissFallback(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	// PID 9999 has no fixture → resolver Lookup misses.
+	s := &ProfileSample{Pid: 9999, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "orphan", File: "o.go", Line: 5, Address: 0xdeadbeef},
+	}}
+	bs.AddSample(s)
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	if got := len(b.Profile.Location); got != 1 {
+		t.Fatalf("miss → fallback: expected 1 Location, got %d", got)
+	}
+	if b.Profile.Location[0].Mapping == nil {
+		t.Fatal("Location.Mapping nil on fallback path")
+	}
+}
+
+func TestKernelFrameUsesSentinel(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	bs.AddSample(&ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "schedule", IsKernel: true, Address: 0xffffffff80000000},
+	}})
+	bs.AddSample(&ProfileSample{Pid: 5555, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "schedule", IsKernel: true, Address: 0xffffffff80000100},
+	}})
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	var kernelCount int
+	for _, m := range b.Profile.Mapping {
+		if m.File == "[kernel]" {
+			kernelCount++
+		}
+	}
+	if kernelCount != 1 {
+		t.Fatalf("expected 1 [kernel] mapping, got %d", kernelCount)
+	}
+}
+
+func TestMappingFlags(t *testing.T) {
+	resolver := procmap.NewResolver(procmap.WithProcRoot(
+		filepath.Join("..", "unwind", "procmap", "testdata", "proc")))
+	defer resolver.Close()
+
+	bs := NewProfileBuilders(BuildersOptions{SampleRate: 99, Resolver: resolver})
+	bs.AddSample(&ProfileSample{Pid: 4242, SampleType: SampleTypeCpu, Value: 1, Stack: []Frame{
+		{Name: "foo", File: "f.go", Line: 10, Address: 0x00401000},
+	}})
+
+	b := bs.Builders[builderHashKey{sampleType: SampleTypeCpu}]
+	var target *profile.Mapping
+	for _, m := range b.Profile.Mapping {
+		if m.File == "/usr/bin/target" {
+			target = m
+		}
+	}
+	if target == nil {
+		t.Fatal("target mapping not interned")
+	}
+	if !target.HasFunctions || !target.HasFilenames || !target.HasLineNumbers {
+		t.Errorf("expected all Has* flags true, got funcs=%v files=%v lines=%v",
+			target.HasFunctions, target.HasFilenames, target.HasLineNumbers)
 	}
 }

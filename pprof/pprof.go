@@ -156,6 +156,7 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 	}
 	builder := &ProfileBuilder{
 		resolver:           b.opt.Resolver,
+		mappings:           make(map[mappingKey]*profile.Mapping),
 		locations:          make(map[any]*profile.Location),
 		functions:          make(map[any]*profile.Function),
 		sampleHashToSample: make(map[uint64]*profile.Sample),
@@ -216,8 +217,29 @@ type functionKey struct {
 	Name      string
 }
 
+var (
+	kernelSentinel = procmap.Mapping{Path: "[kernel]"}
+	jitSentinel    = procmap.Mapping{Path: "[jit]"}
+)
+
+// looksJIT returns true when frame.Name matches one of the perf-map
+// runtime prefixes (Python, Node). decodePerfMapFrame zeros Address
+// for these in Task 8; before then, the Address field may still be
+// nonzero but we keep these on the [jit] sentinel because anonymous
+// JIT mappings have no file-offset identity.
+func looksJIT(f Frame) bool {
+	return strings.HasPrefix(f.Name, "py::") ||
+		strings.HasPrefix(f.Name, "JS:") ||
+		strings.HasPrefix(f.Name, "LazyCompile:") ||
+		strings.HasPrefix(f.Name, "Function:") ||
+		strings.HasPrefix(f.Name, "Builtin:") ||
+		strings.HasPrefix(f.Name, "Code:") ||
+		strings.HasPrefix(f.Name, "Script:")
+}
+
 type ProfileBuilder struct {
 	resolver           *procmap.Resolver
+	mappings           map[mappingKey]*profile.Mapping
 	locations          map[any]*profile.Location
 	functions          map[any]*profile.Function
 	sampleHashToSample map[uint64]*profile.Sample
@@ -259,10 +281,99 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location {
 	frame = decodePerfMapFrame(frame)
 
-	// Task 6: pid is plumbed in for the resolver path Task 7 will add.
-	// Fallback path (current shim) doesn't read it.
-	_ = pid
+	// 1. Kernel frames use a shared sentinel mapping regardless of PID.
+	if frame.IsKernel {
+		mapping := p.addMapping(kernelSentinel, frame)
+		return p.addLocationByAddr(mapping, frame)
+	}
 
+	// 2. Perf-map runtime frames (Python/Node JIT) live in anonymous
+	// mappings with meaningless file offsets. After Task 8,
+	// decodePerfMapFrame zeros Address for these; until then, the
+	// Address may be nonzero but we still group them under [jit].
+	if frame.Address == 0 && looksJIT(frame) {
+		mapping := p.addMapping(jitSentinel, frame)
+		return p.addLocationByFallback(mapping, frame)
+	}
+
+	// 3. Resolver-driven primary path.
+	if frame.Address != 0 && p.resolver != nil {
+		if m, ok := p.resolver.Lookup(pid, frame.Address); ok {
+			frame.MapStart = m.Start
+			frame.MapLimit = m.Limit
+			frame.MapOff = m.Offset
+			frame.BuildID = m.BuildID
+			mapping := p.addMapping(m, frame)
+			return p.addLocationByAddr(mapping, frame)
+		}
+	}
+
+	// 4. Fallback: name-based dedup on the default single mapping.
+	return p.addLocationByFallback(p.Profile.Mapping[0], frame)
+}
+
+func (p *ProfileBuilder) addMapping(m procmap.Mapping, frame Frame) *profile.Mapping {
+	key := mappingKey{
+		Path: m.Path, Start: m.Start, Limit: m.Limit, Off: m.Offset, BuildID: m.BuildID,
+	}
+	if existing, ok := p.mappings[key]; ok {
+		p.updateMappingFlags(existing, frame)
+		return existing
+	}
+	id := uint64(len(p.Profile.Mapping) + 1)
+	mapping := &profile.Mapping{
+		ID:      id,
+		Start:   m.Start,
+		Limit:   m.Limit,
+		Offset:  m.Offset,
+		File:    m.Path,
+		BuildID: m.BuildID,
+	}
+	p.updateMappingFlags(mapping, frame)
+	p.Profile.Mapping = append(p.Profile.Mapping, mapping)
+	p.mappings[key] = mapping
+	return mapping
+}
+
+func (p *ProfileBuilder) updateMappingFlags(m *profile.Mapping, f Frame) {
+	if f.Name != "" {
+		m.HasFunctions = true
+	}
+	if f.File != "" {
+		m.HasFilenames = true
+	}
+	if f.Line > 0 {
+		m.HasLineNumbers = true
+	}
+}
+
+func (p *ProfileBuilder) addLocationByAddr(mapping *profile.Mapping, frame Frame) *profile.Location {
+	var offset uint64
+	if frame.MapStart != 0 {
+		offset = frame.Address - frame.MapStart + frame.MapOff
+	} else {
+		offset = frame.Address
+	}
+	key := locationKey{MappingID: mapping.ID, Address: offset}
+	if loc, ok := p.locations[key]; ok {
+		return loc
+	}
+	id := uint64(len(p.Profile.Location) + 1)
+	loc := &profile.Location{
+		ID:      id,
+		Mapping: mapping,
+		Address: offset,
+		Line: []profile.Line{{
+			Function: p.addFunction(frame, mapping.ID),
+			Line:     int64(frame.Line),
+		}},
+	}
+	p.Profile.Location = append(p.Profile.Location, loc)
+	p.locations[key] = loc
+	return loc
+}
+
+func (p *ProfileBuilder) addLocationByFallback(mapping *profile.Mapping, frame Frame) *profile.Location {
 	key := locationFallbackKey{
 		Name: frame.Name, File: frame.File, Module: frame.Module, Line: frame.Line,
 	}
@@ -272,9 +383,9 @@ func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location 
 	id := uint64(len(p.Profile.Location) + 1)
 	loc := &profile.Location{
 		ID:      id,
-		Mapping: p.Profile.Mapping[0],
+		Mapping: mapping,
 		Line: []profile.Line{{
-			Function: p.addFunction(frame, p.Profile.Mapping[0].ID),
+			Function: p.addFunction(frame, mapping.ID),
 			Line:     int64(frame.Line),
 		}},
 	}

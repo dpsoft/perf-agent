@@ -6,6 +6,8 @@
 
 **Architecture:** This plan intentionally implements the contract-first portion of the GPU profiling spec without choosing a real vendor SDK yet. A new `gpu/` package owns normalized event types, timeline correlation, lifecycle management, export, and pprof projection. A `gpu/backend/replay/` backend replays fixture events into the core so the end-to-end path is testable now; real vendor backends plug into the same contract later.
 
+**Implementation note:** The actual branch keeps `Backend` and `EventSink` in `gpu/types.go` instead of a separate `gpu/backend/backend.go` file. That avoids an import cycle once `gpu.Manager` depends on the backend contract and implementation packages like `gpu/backend/replay` depend on canonical `gpu` event types.
+
 **Tech Stack:** Go 1.26, `encoding/json`, `context`, `errors`, `slices`, `maps`, `cmp`, `github.com/google/pprof/profile`, existing `pprof/` package, existing `perfagent` CLI and lifecycle wiring.
 
 **Reference spec:** `docs/superpowers/specs/2026-04-25-gpu-profiling-design.md`
@@ -25,7 +27,6 @@
 - `gpu/pprof_projection_test.go` — mixed-stack projection tests.
 - `gpu/manager.go` — backend lifecycle, fan-in, cancellation, and output orchestration.
 - `gpu/manager_test.go` — manager lifecycle and error-propagation tests.
-- `gpu/backend/backend.go` — narrow backend contract and event sink interface.
 - `gpu/backend/replay/replay.go` — deterministic fixture-backed backend for Phase 1.
 - `gpu/backend/replay/replay_test.go` — replay backend tests.
 - `gpu/testdata/replay/flash_attn.json` — normalized event fixture representing one active workload.
@@ -74,7 +75,6 @@ Expected: PASS, with any existing CAP_BPF-dependent tests still skipped as they 
 **Files:**
 - Create: `gpu/types.go`
 - Create: `gpu/types_test.go`
-- Create: `gpu/backend/backend.go`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -147,7 +147,7 @@ Expected: FAIL with undefined GPU types and capabilities.
 
 - [ ] **Step 3: Implement minimal types and backend contract**
 
-Create `gpu/types.go` and `gpu/backend/backend.go` with the canonical exported structs from the spec, including:
+Create `gpu/types.go` with the canonical exported structs from the spec, including:
 - `GPUBackendID`
 - `GPUCapability`
 - `GPUDeviceRef`
@@ -176,7 +176,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add gpu/types.go gpu/types_test.go gpu/backend/backend.go
+git add gpu/types.go gpu/types_test.go
 git commit -m "gpu: add canonical event types and backend contract"
 ```
 

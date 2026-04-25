@@ -374,10 +374,6 @@ gpu/
 gpu/hostebpf/
   collector.go        # CPU-side launch attribution via eBPF/uprobes/tracepoints
   events.go           # host correlation events
-
-gpu/backend/
-  backend.go          # backend interface
-
 gpu/backend/nvidia/
   cupti.go            # CUPTI-based tracing / sampling backend
 
@@ -420,7 +416,7 @@ The GPU packages should follow the same broad design discipline as the rest of t
 Concretely:
 
 - `gpu/types.go` should own the canonical exported event structs
-- `gpu/backend` should own the narrow backend interface only
+- `gpu/types.go` should also own the narrow backend and event-sink contracts, so implementation packages can depend on `gpu` without creating an import cycle through a separate contract package
 - backend packages should translate vendor-native records into core types as early as possible
 - `gpu/manager` should own lifecycle, fan-in, and projection wiring
 

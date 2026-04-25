@@ -67,5 +67,7 @@ offcpu.pb.gz
 perf-agent
 
 ### Anthropic Claude ###
-.claude
+# Track project-shared Claude config (.claude/settings.json) but keep
+# per-user / per-machine state (settings.local.json) out of the repo.
+.claude/settings.local.json
 .memory-bank

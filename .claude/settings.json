@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "modern-go-guidelines@goland-claude-marketplace": true
+  }
+}

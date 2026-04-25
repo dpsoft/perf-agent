@@ -380,8 +380,12 @@ func assertPprofFidelity(t *testing.T, path string) {
 			hasBuildID = true
 		}
 	}
-	if real < 2 {
-		t.Errorf("expected >=2 real mappings, got %d: %+v", real, p.Mapping)
+	// At least one real mapping — proves we're not falling back to the
+	// hardcoded single-mapping default. Static binaries (Go) legitimately
+	// produce exactly 1; dynamically-linked binaries produce N+ (target +
+	// shared libs).
+	if real < 1 {
+		t.Errorf("expected >=1 real mapping, got %d: %+v", real, p.Mapping)
 	}
 	if !hasBuildID {
 		t.Errorf("expected at least one mapping with non-empty BuildID")

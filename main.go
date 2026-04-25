@@ -28,6 +28,9 @@ var (
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
+	flagGPUReplayInput  = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
+	flagGPURawOutput    = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
+	flagGPUProfileOutput = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
 	flagTags          tagFlags
 )
 
@@ -109,13 +112,14 @@ func main() {
 
 func buildOptions() []perfagent.Option {
 	var opts []perfagent.Option
+	gpuReplayMode := *flagGPUReplayInput != ""
 
 	// Target selection
 	if *flagAll {
 		opts = append(opts, perfagent.WithSystemWide())
 	} else if *flagPID != 0 {
 		opts = append(opts, perfagent.WithPID(*flagPID))
-	} else {
+	} else if !gpuReplayMode {
 		log.Fatal("Either --pid or -a/--all is required")
 	}
 
@@ -125,7 +129,7 @@ func buildOptions() []perfagent.Option {
 	}
 
 	// Profiling modes
-	if !*flagProfile && !*flagPMU && !*flagOffCpu {
+	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 
@@ -162,6 +166,16 @@ func buildOptions() []perfagent.Option {
 			fmt.Printf("PMU metrics will be written to %s\n", pmuPath)
 		}
 		opts = append(opts, perfagent.WithMetricsExporter(exporter))
+	}
+
+	if gpuReplayMode {
+		opts = append(opts, perfagent.WithGPUReplayInput(*flagGPUReplayInput))
+		if *flagGPURawOutput != "" {
+			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
+		}
+		if *flagGPUProfileOutput != "" {
+			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
+		}
 	}
 
 	// Per-PID validation

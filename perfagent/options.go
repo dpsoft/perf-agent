@@ -4,6 +4,7 @@ package perfagent
 import (
 	"io"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/metrics"
 )
 
@@ -60,6 +61,21 @@ type Config struct {
 
 	// CPUs is the list of CPUs to monitor. If nil, all online CPUs are used.
 	CPUs []uint
+
+	// GPUReplayInput is a fixture path for the experimental replay backend.
+	GPUReplayInput string
+
+	// GPURawOutputPath writes the normalized GPU snapshot as JSON when set.
+	GPURawOutputPath string
+
+	// GPURawOutputWriter receives JSON GPU snapshot output when set.
+	GPURawOutputWriter io.Writer
+
+	// GPUProfileOutputPath writes synthetic-frame GPU pprof output when set.
+	GPUProfileOutputPath string
+
+	// GPUProfileOutputWriter receives synthetic-frame GPU pprof output when set.
+	GPUProfileOutputWriter io.Writer
 }
 
 // Option is a functional option for configuring the Agent.
@@ -177,4 +193,38 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 		c.EnableOffCPUProfile = true
 		c.OffCPUProfileWriter = w
 	}
+}
+
+func WithGPUReplayInput(path string) Option {
+	return func(c *Config) {
+		c.GPUReplayInput = path
+	}
+}
+
+func WithGPURawOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPURawOutputWriter = w
+	}
+}
+
+func WithGPUProfileOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUProfileOutputWriter = w
+	}
+}
+
+func WithGPURawOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPURawOutputPath = path
+	}
+}
+
+func WithGPUProfileOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUProfileOutputPath = path
+	}
+}
+
+func newGPUManager(backends []gpu.Backend) *gpu.Manager {
+	return gpu.NewManager(backends, nil)
 }

@@ -2,6 +2,8 @@ package perfagent
 
 import (
 	"bytes"
+	"io"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -191,4 +193,17 @@ func TestAgentConfigCopy(t *testing.T) {
 	cfg.SampleRate = 100
 	originalCfg := agent.Config()
 	assert.Equal(t, 49, originalCfg.SampleRate)
+}
+
+func TestAgentGPUReplayMode(t *testing.T) {
+	agent, err := New(
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "flash_attn.json")),
+		WithGPURawOutput(io.Discard),
+		WithGPUProfileOutput(io.Discard),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
 }

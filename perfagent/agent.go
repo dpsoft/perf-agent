@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -13,8 +14,11 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/gpu/backend/replay"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
+	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
@@ -63,6 +67,7 @@ type Agent struct {
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
+	gpuManager     *gpu.Manager
 
 	mu      sync.Mutex
 	started bool
@@ -87,16 +92,20 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 func (c *Config) validate() error {
-	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU {
+	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.GPUReplayInput == "" {
 		return errors.New("at least one of CPU profile, off-CPU profile, or PMU must be enabled")
+	}
+
+	if c.GPUReplayInput == "" {
+		if c.PID == 0 && !c.SystemWide {
+			return errors.New("either PID or system-wide is required")
+		}
+	} else if c.PID == 0 && !c.SystemWide && !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU {
+		return nil
 	}
 
 	if c.PID != 0 && c.SystemWide {
 		return errors.New("PID and system-wide are mutually exclusive")
-	}
-
-	if c.PID == 0 && !c.SystemWide {
-		return errors.New("either PID or system-wide is required")
 	}
 
 	if c.PerPID && !c.SystemWide {
@@ -117,6 +126,21 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	if a.started {
 		return errors.New("agent already started")
+	}
+
+	gpuOnly := a.config.GPUReplayInput != "" && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
+	if gpuOnly {
+		replayBackend, err := replay.New(a.config.GPUReplayInput)
+		if err != nil {
+			return fmt.Errorf("create GPU replay backend: %w", err)
+		}
+		a.gpuManager = gpu.NewManager([]gpu.Backend{replayBackend}, nil)
+		if err := a.gpuManager.Start(ctx); err != nil {
+			a.cleanup()
+			return fmt.Errorf("start GPU manager: %w", err)
+		}
+		a.started = true
+		return nil
 	}
 
 	// Set capabilities:
@@ -301,6 +325,18 @@ func (a *Agent) Stop(ctx context.Context) error {
 		}
 	}
 
+	if a.gpuManager != nil {
+		snapshot := a.gpuManager.Snapshot()
+		if err := a.writeGPURaw(snapshot); err != nil {
+			log.Printf("Failed to write GPU raw output: %v", err)
+			lastErr = err
+		}
+		if err := a.writeGPUProfile(snapshot); err != nil {
+			log.Printf("Failed to write GPU profile output: %v", err)
+			lastErr = err
+		}
+	}
+
 	return lastErr
 }
 
@@ -344,9 +380,65 @@ func (a *Agent) cleanup() {
 		a.pmuMonitor.Close()
 		a.pmuMonitor = nil
 	}
+	if a.gpuManager != nil {
+		_ = a.gpuManager.Close()
+		a.gpuManager = nil
+	}
 }
 
 // Config returns a copy of the agent's configuration.
 func (a *Agent) Config() Config {
 	return *a.config
+}
+
+func (a *Agent) writeGPURaw(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPURawOutputWriter != nil:
+		return gpu.WriteJSONSnapshot(a.config.GPURawOutputWriter, snapshot)
+	case a.config.GPURawOutputPath != "":
+		f, err := os.Create(a.config.GPURawOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteJSONSnapshot(f, snapshot)
+	default:
+		return nil
+	}
+}
+
+func (a *Agent) writeGPUProfile(snapshot gpu.Snapshot) error {
+	samples := gpu.ProjectExecutionSamples(snapshot)
+	if len(samples) == 0 {
+		return nil
+	}
+
+	var w io.Writer
+	switch {
+	case a.config.GPUProfileOutputWriter != nil:
+		w = a.config.GPUProfileOutputWriter
+	case a.config.GPUProfileOutputPath != "":
+		f, err := os.Create(a.config.GPUProfileOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	default:
+		return nil
+	}
+
+	builders := pp.NewProfileBuilders(pp.BuildersOptions{
+		SampleRate:    int64(max(1, a.config.SampleRate)),
+		PerPIDProfile: false,
+		Comments:      a.config.Tags,
+	})
+	for i := range samples {
+		builders.AddSample(&samples[i])
+	}
+	for _, builder := range builders.Builders {
+		_, err := builder.Write(w)
+		return err
+	}
+	return nil
 }

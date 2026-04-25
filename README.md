@@ -189,6 +189,28 @@ Tags (`--tag key=value`) are stored as profile-level comments.
 go tool pprof myapp-202604021430-on-cpu.pb.gz
 ```
 
+### Experimental GPU replay pipeline
+
+There is an experimental contract-validation path for the planned GPU profiling architecture. It does **not** talk to a real vendor runtime yet. Instead, it replays normalized GPU events from a JSON fixture, exports the normalized snapshot as JSON, and projects a mixed CPU+GPU profile using synthetic GPU frames.
+
+```bash
+go run . \
+  --gpu-replay-input gpu/testdata/replay/flash_attn.json \
+  --gpu-raw-output /tmp/gpu-raw.json \
+  --gpu-profile-output /tmp/gpu.pb.gz \
+  --duration 1ms
+
+go tool pprof /tmp/gpu.pb.gz
+```
+
+This path is intended to validate:
+
+- the vendor-agnostic GPU event contract
+- timeline correlation and raw JSON export
+- `pprof` projection with synthetic GPU frames
+
+It is not yet a real NVIDIA / Intel / AMD backend.
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

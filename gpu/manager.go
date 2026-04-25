@@ -62,3 +62,7 @@ func (m *Manager) EmitCounter(counter GPUCounterSample) {
 func (m *Manager) EmitSample(sample GPUSample) {
 	m.timeline.RecordSample(sample)
 }
+
+func (m *Manager) Snapshot() Snapshot {
+	return m.timeline.Snapshot()
+}

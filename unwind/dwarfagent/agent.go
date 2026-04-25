@@ -153,7 +153,7 @@ func (p *Profiler) CollectAndWrite(outputPath string) error {
 	if err != nil {
 		return fmt.Errorf("create profile file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return p.Collect(f)
 }
 

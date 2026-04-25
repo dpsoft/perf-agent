@@ -44,7 +44,7 @@ func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*O
 
 	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)")
 	if err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, err
 	}
 
@@ -79,7 +79,7 @@ func aggregateOffCPUSample(s *session, sample Sample) {
 // Collect writes a gzipped pprof to w. SampleType is off-CPU; sample
 // values are accumulated blocking-ns.
 func (p *OffCPUProfiler) Collect(w io.Writer) error {
-	return p.session.collect(w, pprof.SampleTypeOffCpu, 0)
+	return p.collect(w, pprof.SampleTypeOffCpu, 0)
 }
 
 // CollectAndWrite is a file-path convenience wrapper.
@@ -88,7 +88,7 @@ func (p *OffCPUProfiler) CollectAndWrite(outputPath string) error {
 	if err != nil {
 		return fmt.Errorf("create profile file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return p.Collect(f)
 }
 
@@ -99,5 +99,5 @@ func (p *OffCPUProfiler) Close() error {
 		_ = p.link.Close()
 		p.link = nil
 	}
-	return p.session.close()
+	return p.close()
 }

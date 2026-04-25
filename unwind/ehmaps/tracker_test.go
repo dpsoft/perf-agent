@@ -122,7 +122,7 @@ func TestTrackerAutoAttachOnMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMmapWatcher: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()

@@ -175,15 +175,15 @@ func PopulateClassification(args PopulateClassificationArgs) error {
 	for i, c := range args.Entries {
 		key := uint32(i)
 		if err := inner.Update(key, MarshalClassification(c), ebpf.UpdateAny); err != nil {
-			inner.Close()
+			_ = inner.Close()
 			return fmt.Errorf("ehmaps: write classification[%d]: %w", i, err)
 		}
 	}
 	if err := args.OuterMap.Update(args.TableID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
-		inner.Close()
+		_ = inner.Close()
 		return fmt.Errorf("ehmaps: install inner classification map: %w", err)
 	}
-	inner.Close()
+	_ = inner.Close()
 
 	length := uint32(len(args.Entries))
 	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {
@@ -224,15 +224,15 @@ func PopulatePIDMappings(args PopulatePIDMappingsArgs) error {
 	for i, m := range args.Mappings {
 		key := uint32(i)
 		if err := inner.Update(key, MarshalPIDMapping(m), ebpf.UpdateAny); err != nil {
-			inner.Close()
+			_ = inner.Close()
 			return fmt.Errorf("ehmaps: write pid_mapping[%d]: %w", i, err)
 		}
 	}
 	if err := args.OuterMap.Update(args.PID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
-		inner.Close()
+		_ = inner.Close()
 		return fmt.Errorf("ehmaps: install inner pid_mappings map: %w", err)
 	}
-	inner.Close()
+	_ = inner.Close()
 
 	length := uint32(len(args.Mappings))
 	if err := args.LengthMap.Update(args.PID, length, ebpf.UpdateAny); err != nil {

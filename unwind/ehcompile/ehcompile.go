@@ -27,7 +27,7 @@ func Compile(elfPath string) (entries []CFIEntry, classifications []Classificati
 	if err != nil {
 		return nil, nil, fmt.Errorf("open elf: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	arch, err := archFromELFMachine(f.Machine)
 	if err != nil {

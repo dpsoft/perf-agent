@@ -29,7 +29,7 @@ func runGolden(t *testing.T, elfPath, goldenPath string) {
 	if *updateGolden {
 		f, err := os.Create(goldenPath)
 		require.NoError(t, err)
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		enc := json.NewEncoder(f)
 		enc.SetIndent("", "  ")
 		require.NoError(t, enc.Encode(got))

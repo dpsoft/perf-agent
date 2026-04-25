@@ -40,7 +40,7 @@ func TestReadBuildID(t *testing.T) {
 		t.Fatal("expected non-empty build-id, got empty")
 	}
 	for _, r := range id {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			t.Fatalf("build-id %q contains non-hex char %q", id, r)
 		}
 	}

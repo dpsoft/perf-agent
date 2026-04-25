@@ -154,6 +154,9 @@ func TestProfileMode(t *testing.T) {
 				}
 			}
 			assert.True(t, hasSymbols, "Profile should contain symbolized functions")
+
+			// S9: verify pprof fidelity guarantees
+			assertPprofFidelity(t, outputFile)
 		})
 	}
 }
@@ -322,6 +325,57 @@ func getAgentPath(t *testing.T) string {
 	abs, err := filepath.Abs(agentPath)
 	require.NoError(t, err)
 	return abs
+}
+
+// assertPprofFidelity verifies the S9 pprof fidelity guarantees on a
+// captured profile: >=2 real (non-sentinel) mappings, at least one
+// mapping with a non-empty BuildID, every user-space Location has a
+// non-zero Address. Skips kernel and JIT sentinel mappings.
+func assertPprofFidelity(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open profile: %v", err)
+	}
+	defer f.Close()
+
+	p, err := profile.Parse(f)
+	if err != nil {
+		t.Fatalf("parse profile: %v", err)
+	}
+	if err := p.CheckValid(); err != nil {
+		t.Fatalf("pprof invalid: %v", err)
+	}
+
+	var real int
+	var hasBuildID bool
+	for _, m := range p.Mapping {
+		if m.File != "" && m.File != "[kernel]" && m.File != "[jit]" {
+			real++
+		}
+		if m.BuildID != "" {
+			hasBuildID = true
+		}
+	}
+	if real < 2 {
+		t.Errorf("expected >=2 real mappings, got %d: %+v", real, p.Mapping)
+	}
+	if !hasBuildID {
+		t.Errorf("expected at least one mapping with non-empty BuildID")
+	}
+
+	for _, loc := range p.Location {
+		if loc.Mapping == nil {
+			continue
+		}
+		m := loc.Mapping
+		if m.File == "" || m.File == "[kernel]" || m.File == "[jit]" {
+			continue
+		}
+		if loc.Address == 0 {
+			t.Errorf("Location %d in %s has Address=0", loc.ID, m.File)
+		}
+	}
 }
 
 func parseProfile(t *testing.T, filename string) *profile.Profile {
@@ -1163,6 +1217,9 @@ func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
 	require.NotNil(t, prof)
 	require.Greater(t, len(prof.Sample), 0, "system-wide profile should have samples")
 	require.Greater(t, len(prof.Function), 0, "system-wide profile should have at least one symbolized function")
+
+	// S9: verify pprof fidelity guarantees
+	assertPprofFidelity(t, outputFile)
 }
 
 // TestPerfAgentSystemWideDwarfOffCPU runs perf-agent with --offcpu

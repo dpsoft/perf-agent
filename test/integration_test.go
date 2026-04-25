@@ -77,9 +77,7 @@ var workloads = []TestWorkload{
 }
 
 func TestProfileMode(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -162,9 +160,7 @@ func TestProfileMode(t *testing.T) {
 }
 
 func TestOffCPUMode(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -215,9 +211,7 @@ func TestOffCPUMode(t *testing.T) {
 }
 
 func TestPMUMode(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 	wl := workloads[0] // Go CPU workload
@@ -265,9 +259,7 @@ func TestPMUMode(t *testing.T) {
 }
 
 func TestCombinedMode(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 	wl := workloads[0] // Go CPU workload
@@ -325,6 +317,37 @@ func getAgentPath(t *testing.T) string {
 	abs, err := filepath.Abs(agentPath)
 	require.NoError(t, err)
 	return abs
+}
+
+// requireBPFRunnable skips the test unless BPF programs can be loaded by
+// either (a) running as root, (b) the test process holding CAP_BPF in its
+// permitted set (test binary itself capped), or (c) when agentPath is
+// non-empty, the file at agentPath holding CAP_BPF in its file-permitted
+// set (perf-agent binary capped via `setcap cap_*+ep`, which is enough
+// for tests that exec it as a subprocess).
+//
+// Pass agentPath = getAgentPath(t) for tests that exec the agent as a
+// subprocess. Pass agentPath = "" for tests that load BPF in-process via
+// the perfagent / perfprofile / ehmaps libraries — those need caps on
+// the test process itself, not on the agent binary.
+func requireBPFRunnable(t *testing.T, agentPath string) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		return
+	}
+	if procCaps := cap.GetProc(); procCaps != nil {
+		if have, err := procCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
+			return
+		}
+	}
+	if agentPath != "" {
+		if fileCaps, err := cap.GetFile(agentPath); err == nil && fileCaps != nil {
+			if have, err := fileCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
+				return
+			}
+		}
+	}
+	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
 }
 
 // assertPprofFidelity verifies the S9 pprof fidelity guarantees on a
@@ -399,9 +422,7 @@ func parseProfile(t *testing.T, filename string) *profile.Profile {
 // System-wide profiling tests
 
 func TestSystemWideProfile(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -442,9 +463,7 @@ func TestSystemWideProfile(t *testing.T) {
 }
 
 func TestSystemWideOffCPU(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -473,9 +492,7 @@ func TestSystemWideOffCPU(t *testing.T) {
 }
 
 func TestSystemWidePMU(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -503,9 +520,7 @@ func TestSystemWidePMU(t *testing.T) {
 }
 
 func TestSystemWidePMUPerPID(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -538,9 +553,7 @@ func TestSystemWidePMUPerPID(t *testing.T) {
 }
 
 func TestMutuallyExclusiveFlags(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -552,9 +565,7 @@ func TestMutuallyExclusiveFlags(t *testing.T) {
 }
 
 func TestRequiresPIDOrAll(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -566,9 +577,7 @@ func TestRequiresPIDOrAll(t *testing.T) {
 }
 
 func TestPerPIDRequiresAll(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -580,9 +589,7 @@ func TestPerPIDRequiresAll(t *testing.T) {
 }
 
 func TestPerPIDRequiresPMU(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -596,9 +603,7 @@ func TestPerPIDRequiresPMU(t *testing.T) {
 // Tests for new runqueue latency and task state features
 
 func TestPMURunqueueLatency(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 	wl := workloads[0] // Go CPU workload
@@ -644,9 +649,7 @@ func TestPMURunqueueLatency(t *testing.T) {
 }
 
 func TestPMUTaskStateClassification(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -691,9 +694,7 @@ func TestPMUTaskStateClassification(t *testing.T) {
 }
 
 func TestPMUIOWorkloadHasIOWait(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 	wl := workloads[1] // Go I/O workload
@@ -735,9 +736,7 @@ func TestPMUIOWorkloadHasIOWait(t *testing.T) {
 }
 
 func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 	wl := workloads[0] // Go CPU workload
@@ -775,9 +774,7 @@ func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {
 }
 
 func TestSystemWidePMUWithNewMetrics(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
 
@@ -810,9 +807,7 @@ func TestSystemWidePMUWithNewMetrics(t *testing.T) {
 // Library streaming tests
 
 func TestStreamingProfileOutput(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, "")
 
 	// Start a CPU workload
 	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
@@ -862,9 +857,7 @@ func TestStreamingProfileOutput(t *testing.T) {
 }
 
 func TestStreamingOffCPUProfileOutput(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, "")
 
 	// Start an I/O workload
 	workload := exec.Command("./workloads/go/io_bound", "-duration=20s", "-threads=2")
@@ -903,9 +896,7 @@ func TestStreamingOffCPUProfileOutput(t *testing.T) {
 }
 
 func TestStreamingCombinedProfileOutput(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, "")
 
 	// Start workload
 	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
@@ -952,9 +943,7 @@ func TestStreamingCombinedProfileOutput(t *testing.T) {
 }
 
 func TestLibraryPMUMetrics(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test requires root privileges")
-	}
+	requireBPFRunnable(t, "")
 
 	// Start a CPU workload
 	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
@@ -1016,13 +1005,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	// subprocess and thus need the caller to be root), this test loads
 	// BPF in-process, so setcap on the test binary is sufficient. Accept
 	// either root or a process with CAP_BPF in its permitted set.
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, err := caps.GetFlag(cap.Permitted, cap.BPF)
-		if err != nil || !have {
-			t.Skip("requires root or CAP_BPF in permitted set")
-		}
-	}
+	requireBPFRunnable(t, "")
 
 	binPath := "./workloads/rust/target/release/rust-workload"
 	if _, err := os.Stat(binPath); err != nil {
@@ -1177,13 +1160,8 @@ func TestPerfDwarfWalker(t *testing.T) {
 // function (the specific function depends on what was CPU-active
 // during the 5s sampling window).
 func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
-		if !have {
-			t.Skip("requires root or CAP_BPF")
-		}
-	}
+	requireBPFRunnable(t, getAgentPath(t))
+
 	agentPath := getAgentPath(t)
 	binPath := "./workloads/rust/target/release/rust-workload"
 	if _, err := os.Stat(binPath); err != nil {
@@ -1226,13 +1204,8 @@ func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
 // --unwind dwarf -a. System-wide means any blocking activity anywhere
 // contributes samples — we just need non-zero blocking-ns total.
 func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
-		if !have {
-			t.Skip("requires root or CAP_BPF")
-		}
-	}
+	requireBPFRunnable(t, getAgentPath(t))
+
 	agentPath := getAgentPath(t)
 	binPath := "./workloads/rust/target/release/rust-workload"
 	if _, err := os.Stat(binPath); err != nil {
@@ -1281,13 +1254,8 @@ func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
 // pick up the probe.so mapping AUTOMATICALLY and install a second
 // cfi_lengths entry (main binary + probe.so).
 func TestPerfDwarfMmap2Tracking(t *testing.T) {
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
-		if !have {
-			t.Skip("requires root or CAP_BPF")
-		}
-	}
+	requireBPFRunnable(t, "")
+
 	binPath := "./workloads/rust/target/release/rust-workload"
 	probePath := "./workloads/rust/probe/target/release/libprobe.so"
 	for _, p := range []string{binPath, probePath} {
@@ -1379,13 +1347,8 @@ func countMapEntries(t *testing.T, m *ebpf.Map) int {
 // resulting pprof.pb.gz and asserts cpu_intensive_work shows up as
 // a symbolized function name.
 func TestPerfAgentDwarfUnwind(t *testing.T) {
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
-		if !have {
-			t.Skip("requires root or CAP_BPF")
-		}
-	}
+	requireBPFRunnable(t, getAgentPath(t))
+
 	agentPath := getAgentPath(t)
 	binPath := "./workloads/rust/target/release/rust-workload"
 	if _, err := os.Stat(binPath); err != nil {
@@ -1448,13 +1411,8 @@ func TestPerfAgentDwarfUnwind(t *testing.T) {
 // CPU-bound but its threads context-switch routinely, firing enough
 // off-CPU samples to validate the pipeline end-to-end.
 func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
-	if os.Getuid() != 0 {
-		caps := cap.GetProc()
-		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
-		if !have {
-			t.Skip("requires root or CAP_BPF")
-		}
-	}
+	requireBPFRunnable(t, getAgentPath(t))
+
 	agentPath := getAgentPath(t)
 	binPath := "./workloads/rust/target/release/rust-workload"
 	if _, err := os.Stat(binPath); err != nil {

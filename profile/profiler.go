@@ -35,11 +35,39 @@ type perfEvent struct {
 
 // stackBuilder accumulates symbolized stack frames
 type stackBuilder struct {
-	stack []string
+	stack []pprof.Frame
 }
 
-func (s *stackBuilder) append(sym string) {
-	s.stack = append(s.stack, sym)
+func (s *stackBuilder) append(f pprof.Frame) {
+	s.stack = append(s.stack, f)
+}
+
+// blazeSymToFrames converts a blazesym.Sym into one or more pprof.Frames.
+// When the PC is inside a chain of inlined function calls, the chain is
+// expanded into separate Frames in leaf-first order (innermost inline first,
+// outer real function last), matching the append order of a leaf-first stack.
+//
+// blazesym reports Inlined in outer→inner order (see
+// blazesym/src/symbolize/mod.rs:408), so we walk it in reverse to get
+// leaf-first output.
+func blazeSymToFrames(s blazesym.Sym) []pprof.Frame {
+	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
+	for i := len(s.Inlined) - 1; i >= 0; i-- {
+		in := s.Inlined[i]
+		f := pprof.Frame{Name: in.Name, Module: s.Module}
+		if in.CodeInfo != nil {
+			f.File = in.CodeInfo.File
+			f.Line = in.CodeInfo.Line
+		}
+		out = append(out, f)
+	}
+	outer := pprof.Frame{Name: s.Name, Module: s.Module}
+	if s.CodeInfo != nil {
+		outer.File = s.CodeInfo.File
+		outer.Line = s.CodeInfo.Line
+	}
+	out = append(out, outer)
+	return out
 }
 
 // NewProfiler creates a new CPU profiler with the specified sample rate in Hz
@@ -96,7 +124,10 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		perfEvents = append(perfEvents, pe)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
+	symbolizer, err := blazesym.NewSymbolizer(
+		blazesym.SymbolizerWithCodeInfo(true),
+		blazesym.SymbolizerWithInlinedFns(true),
+	)
 	if err != nil {
 		for _, pe := range perfEvents {
 			_ = pe.Close()
@@ -195,7 +226,9 @@ func (pr *Profiler) Collect(w io.Writer) error {
 				break
 			}
 
-			sb.append(symbol[0].Name)
+			for _, f := range blazeSymToFrames(symbol[0]) {
+				sb.append(f)
+			}
 		}
 
 		end := len(sb.stack)

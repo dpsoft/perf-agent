@@ -25,11 +25,33 @@ type Profiler struct {
 
 // stackBuilder accumulates symbolized stack frames
 type stackBuilder struct {
-	stack []string
+	stack []pprof.Frame
 }
 
-func (s *stackBuilder) append(sym string) {
-	s.stack = append(s.stack, sym)
+func (s *stackBuilder) append(f pprof.Frame) {
+	s.stack = append(s.stack, f)
+}
+
+// blazeSymToFrames mirrors the converter in profile/profiler.go: expands
+// inlined call chains into separate leaf-first Frames.
+func blazeSymToFrames(s blazesym.Sym) []pprof.Frame {
+	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
+	for i := len(s.Inlined) - 1; i >= 0; i-- {
+		in := s.Inlined[i]
+		f := pprof.Frame{Name: in.Name, Module: s.Module}
+		if in.CodeInfo != nil {
+			f.File = in.CodeInfo.File
+			f.Line = in.CodeInfo.Line
+		}
+		out = append(out, f)
+	}
+	outer := pprof.Frame{Name: s.Name, Module: s.Module}
+	if s.CodeInfo != nil {
+		outer.File = s.CodeInfo.File
+		outer.Line = s.CodeInfo.Line
+	}
+	out = append(out, outer)
+	return out
 }
 
 // NewProfiler creates a new off-CPU profiler
@@ -67,7 +89,10 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 		return nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(blazesym.SymbolizerWithCodeInfo(true))
+	symbolizer, err := blazesym.NewSymbolizer(
+		blazesym.SymbolizerWithCodeInfo(true),
+		blazesym.SymbolizerWithInlinedFns(true),
+	)
 	if err != nil {
 		_ = tp.Close()
 		_ = objs.Close()
@@ -161,7 +186,9 @@ func (pr *Profiler) Collect(w io.Writer) error {
 				break
 			}
 
-			sb.append(symbol[0].Name)
+			for _, f := range blazeSymToFrames(symbol[0]) {
+				sb.append(f)
+			}
 		}
 
 		end := len(sb.stack)

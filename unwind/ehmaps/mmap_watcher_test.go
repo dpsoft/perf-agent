@@ -32,7 +32,7 @@ func TestMmapWatcherSeesMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMmapWatcher: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	// Let the reader goroutine start draining.
 	time.Sleep(100 * time.Millisecond)
@@ -42,12 +42,12 @@ func TestMmapWatcherSeesMmap(t *testing.T) {
 	if err != nil {
 		t.Skipf("%s not available: %v", target, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := unix.Mmap(int(f.Fd()), 0, 4096, unix.PROT_READ|unix.PROT_EXEC, unix.MAP_PRIVATE)
 	if err != nil {
 		t.Fatalf("mmap(%s, PROT_EXEC): %v", target, err)
 	}
-	defer unix.Munmap(data)
+	defer func() { _ = unix.Munmap(data) }()
 
 	deadline := time.After(2 * time.Second)
 	for {
@@ -83,7 +83,7 @@ func TestSystemWideMmapWatcherSeesMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSystemWideMmapWatcher: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -92,12 +92,12 @@ func TestSystemWideMmapWatcherSeesMmap(t *testing.T) {
 	if err != nil {
 		t.Skipf("%s not available: %v", target, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := unix.Mmap(int(f.Fd()), 0, 4096, unix.PROT_READ|unix.PROT_EXEC, unix.MAP_PRIVATE)
 	if err != nil {
 		t.Fatalf("mmap: %v", err)
 	}
-	defer unix.Munmap(data)
+	defer func() { _ = unix.Munmap(data) }()
 
 	deadline := time.After(2 * time.Second)
 	for {

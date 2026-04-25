@@ -17,7 +17,7 @@ func ReadBuildID(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer ef.Close()
+	defer func() { _ = ef.Close() }()
 	for _, sec := range ef.Sections {
 		if sec.Type != elf.SHT_NOTE {
 			continue
@@ -70,7 +70,7 @@ func LoadProcessMappings(pid int, binPath string, tableID uint64) ([]PIDMapping,
 	if err != nil {
 		return nil, err
 	}
-	defer ef.Close()
+	defer func() { _ = ef.Close() }()
 	var execProg *elf.Prog
 	for _, p := range ef.Progs {
 		if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 {

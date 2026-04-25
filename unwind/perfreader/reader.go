@@ -107,11 +107,11 @@ func NewReader(cfg Config) (*Reader, error) {
 	}
 
 	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_RESET, 0); err != nil {
-		r.Close()
+		_ = r.Close()
 		return nil, fmt.Errorf("perf_event reset: %w", err)
 	}
 	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		r.Close()
+		_ = r.Close()
 		return nil, fmt.Errorf("perf_event enable: %w", err)
 	}
 

@@ -57,7 +57,6 @@ func parseSample(buf []byte) (Sample, error) {
 	pcEnd := SampleHeaderBytes + nPCs*8
 	if pcEnd > len(buf) {
 		nPCs = (len(buf) - SampleHeaderBytes) / 8
-		pcEnd = SampleHeaderBytes + nPCs*8
 	}
 	s.PCs = make([]uint64, nPCs)
 	for i := range nPCs {

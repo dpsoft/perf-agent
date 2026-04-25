@@ -37,7 +37,7 @@ func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*O
 	}
 	if !systemWide {
 		if err := objs.AddPID(uint32(pid)); err != nil {
-			objs.Close()
+			_ = objs.Close()
 			return nil, fmt.Errorf("add pid to filter: %w", err)
 		}
 	}

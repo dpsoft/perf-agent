@@ -132,15 +132,15 @@ func PopulateCFI(args PopulateCFIArgs) error {
 	for i, e := range args.Entries {
 		key := uint32(i)
 		if err := inner.Update(key, MarshalCFIEntry(e), ebpf.UpdateAny); err != nil {
-			inner.Close()
+			_ = inner.Close()
 			return fmt.Errorf("ehmaps: write cfi[%d]: %w", i, err)
 		}
 	}
 	if err := args.OuterMap.Update(args.TableID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
-		inner.Close()
+		_ = inner.Close()
 		return fmt.Errorf("ehmaps: install inner cfi map: %w", err)
 	}
-	inner.Close()
+	_ = inner.Close()
 
 	length := uint32(len(args.Entries))
 	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {

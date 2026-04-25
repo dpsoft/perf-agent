@@ -49,5 +49,5 @@ func TestProfilerHasResolver(t *testing.T) {
 	// expected procmap.Resolver type. Behavioral tests live in the
 	// integration suite.
 	var p Profiler
-	var _ *procmap.Resolver = p.resolver
+	_ = (*procmap.Resolver)(p.resolver)
 }

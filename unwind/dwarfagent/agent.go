@@ -54,20 +54,20 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	}
 	if !systemWide {
 		if err := objs.AddPID(uint32(pid)); err != nil {
-			objs.Close()
+			_ = objs.Close()
 			return nil, fmt.Errorf("add pid to filter: %w", err)
 		}
 	}
 
 	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent")
 	if err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, err
 	}
 
 	p := &Profiler{session: sess, sampleRate: sampleRate}
 	if err := p.attachPerfEvents(objs.Program(), cpus, sampleRate); err != nil {
-		_ = p.session.close()
+		_ = p.close()
 		return nil, err
 	}
 
@@ -144,7 +144,7 @@ func aggregateCPUSample(s *session, sample Sample) {
 // Collect writes a gzipped pprof to w. Output is SampleTypeCpu with
 // count-weighted samples.
 func (p *Profiler) Collect(w io.Writer) error {
-	return p.session.collect(w, pprof.SampleTypeCpu, p.sampleRate)
+	return p.collect(w, pprof.SampleTypeCpu, p.sampleRate)
 }
 
 // CollectAndWrite is a file-path convenience wrapper.
@@ -169,5 +169,5 @@ func (p *Profiler) Close() error {
 	}
 	p.perfLinks = nil
 	p.perfFDs = nil
-	return p.session.close()
+	return p.close()
 }

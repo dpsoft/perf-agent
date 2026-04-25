@@ -22,7 +22,7 @@ func readBuildID(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	sec := f.Section(".note.gnu.build-id")
 	if sec == nil {

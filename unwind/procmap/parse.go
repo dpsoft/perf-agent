@@ -19,7 +19,7 @@ func parseMapsFile(path string) ([]Mapping, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var out []Mapping
 	scanner := bufio.NewScanner(f)

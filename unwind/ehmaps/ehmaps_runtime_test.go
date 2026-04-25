@@ -41,7 +41,7 @@ func TestPopulateCFIRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outer: %v", err)
 	}
-	defer outer.Close()
+	defer func() { _ = outer.Close() }()
 
 	lengths, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
@@ -52,7 +52,7 @@ func TestPopulateCFIRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lengths: %v", err)
 	}
-	defer lengths.Close()
+	defer func() { _ = lengths.Close() }()
 
 	entries := []ehcompile.CFIEntry{
 		{PCStart: 0x100, PCEndDelta: 0x40, CFAType: ehcompile.CFATypeSP, FPType: ehcompile.FPTypeOffsetCFA, CFAOffset: 16, FPOffset: -16, RAOffset: -8, RAType: ehcompile.RATypeOffsetCFA},

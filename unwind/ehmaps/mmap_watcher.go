@@ -105,7 +105,7 @@ func newMmapWatcher(pid, cpu int) (*MmapWatcher, error) {
 		exited:   make(chan struct{}),
 	}
 	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		w.Close()
+		_ = w.Close()
 		return nil, fmt.Errorf("perf_event enable: %w", err)
 	}
 	go w.loop()

@@ -6,14 +6,7 @@ import (
 )
 
 func TestCapabilityConstantsStable(t *testing.T) {
-	got := []GPUCapability{
-		CapabilityLaunchTrace,
-		CapabilityExecTimeline,
-		CapabilityDeviceCounters,
-		CapabilityPCSampling,
-		CapabilityStallReasons,
-		CapabilitySourceMap,
-	}
+	got := CapabilityNames()
 	want := []GPUCapability{
 		"launch-trace",
 		"exec-timeline",
@@ -21,6 +14,7 @@ func TestCapabilityConstantsStable(t *testing.T) {
 		"gpu-pc-sampling",
 		"stall-reasons",
 		"gpu-source-correlation",
+		"lifecycle-timeline",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len(got)=%d len(want)=%d", len(got), len(want))
@@ -36,7 +30,7 @@ func TestLaunchRoundTripJSON(t *testing.T) {
 	in := GPUKernelLaunch{
 		Correlation: CorrelationID{Backend: "replay", Value: "corr-1"},
 		KernelName:  "flash_attn_fwd",
-		Launch: LaunchContext{PID: 42, TID: 43},
+		Launch:      LaunchContext{PID: 42, TID: 43},
 	}
 	buf, err := json.Marshal(in)
 	if err != nil {

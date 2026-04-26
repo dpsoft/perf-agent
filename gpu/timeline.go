@@ -13,7 +13,8 @@ type ExecutionView struct {
 }
 
 type Snapshot struct {
-	Executions []ExecutionView   `json:"executions"`
+	Executions []ExecutionView    `json:"executions"`
+	Events     []GPUTimelineEvent `json:"events,omitempty"`
 	Counters   []GPUCounterSample `json:"counters,omitempty"`
 }
 
@@ -22,6 +23,7 @@ type Timeline struct {
 	execs    []GPUKernelExec
 	counters []GPUCounterSample
 	samples  []GPUSample
+	events   []GPUTimelineEvent
 }
 
 func NewTimeline() *Timeline {
@@ -44,6 +46,10 @@ func (t *Timeline) RecordSample(sample GPUSample) {
 	t.samples = append(t.samples, sample)
 }
 
+func (t *Timeline) RecordEvent(event GPUTimelineEvent) {
+	t.events = append(t.events, cloneTimelineEvent(event))
+}
+
 func (t *Timeline) Snapshot() Snapshot {
 	views := make([]ExecutionView, 0, len(t.execs))
 	for _, exec := range t.execs {
@@ -61,6 +67,7 @@ func (t *Timeline) Snapshot() Snapshot {
 	}
 	return Snapshot{
 		Executions: views,
+		Events:     cloneTimelineEvents(t.events),
 		Counters:   slices.Clone(t.counters),
 	}
 }
@@ -109,5 +116,27 @@ func cloneLaunch(in GPUKernelLaunch) GPUKernelLaunch {
 	out := in
 	out.Launch.Tags = maps.Clone(in.Launch.Tags)
 	out.Launch.CPUStack = slices.Clone(in.Launch.CPUStack)
+	return out
+}
+
+func cloneTimelineEvents(in []GPUTimelineEvent) []GPUTimelineEvent {
+	out := make([]GPUTimelineEvent, 0, len(in))
+	for _, event := range in {
+		out = append(out, cloneTimelineEvent(event))
+	}
+	return out
+}
+
+func cloneTimelineEvent(in GPUTimelineEvent) GPUTimelineEvent {
+	out := in
+	out.Attributes = maps.Clone(in.Attributes)
+	if in.Device != nil {
+		device := *in.Device
+		out.Device = &device
+	}
+	if in.Queue != nil {
+		queue := *in.Queue
+		out.Queue = &queue
+	}
 	return out
 }

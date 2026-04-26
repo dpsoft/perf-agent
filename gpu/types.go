@@ -2,6 +2,7 @@ package gpu
 
 import (
 	"context"
+	"slices"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
@@ -11,13 +12,28 @@ type GPUBackendID string
 type GPUCapability string
 
 const (
-	CapabilityLaunchTrace    GPUCapability = "launch-trace"
-	CapabilityExecTimeline   GPUCapability = "exec-timeline"
-	CapabilityDeviceCounters GPUCapability = "device-counters"
-	CapabilityPCSampling     GPUCapability = "gpu-pc-sampling"
-	CapabilityStallReasons   GPUCapability = "stall-reasons"
-	CapabilitySourceMap      GPUCapability = "gpu-source-correlation"
+	CapabilityLaunchTrace       GPUCapability = "launch-trace"
+	CapabilityExecTimeline      GPUCapability = "exec-timeline"
+	CapabilityDeviceCounters    GPUCapability = "device-counters"
+	CapabilityPCSampling        GPUCapability = "gpu-pc-sampling"
+	CapabilityStallReasons      GPUCapability = "stall-reasons"
+	CapabilitySourceMap         GPUCapability = "gpu-source-correlation"
+	CapabilityLifecycleTimeline GPUCapability = "lifecycle-timeline"
 )
+
+var capabilityNames = []GPUCapability{
+	CapabilityLaunchTrace,
+	CapabilityExecTimeline,
+	CapabilityDeviceCounters,
+	CapabilityPCSampling,
+	CapabilityStallReasons,
+	CapabilitySourceMap,
+	CapabilityLifecycleTimeline,
+}
+
+func CapabilityNames() []GPUCapability {
+	return slices.Clone(capabilityNames)
+}
 
 type GPUDeviceRef struct {
 	Backend  GPUBackendID `json:"backend"`
@@ -90,11 +106,45 @@ type GPUSample struct {
 	Weight      uint64        `json:"weight"`
 }
 
+type TimelineEventKind string
+
+const (
+	TimelineEventRuntime TimelineEventKind = "runtime"
+	TimelineEventSyscall TimelineEventKind = "syscall"
+	TimelineEventIOCtl   TimelineEventKind = "ioctl"
+	TimelineEventSubmit  TimelineEventKind = "submit"
+	TimelineEventWait    TimelineEventKind = "wait"
+	TimelineEventContext TimelineEventKind = "context"
+	TimelineEventQueue   TimelineEventKind = "queue"
+	TimelineEventMemory  TimelineEventKind = "memory"
+	TimelineEventDevice  TimelineEventKind = "device"
+)
+
+type GPUTimelineEvent struct {
+	Backend    GPUBackendID      `json:"backend"`
+	Kind       TimelineEventKind `json:"kind"`
+	Name       string            `json:"name,omitempty"`
+	TimeNs     uint64            `json:"time_ns"`
+	DurationNs uint64            `json:"duration_ns,omitempty"`
+	PID        uint32            `json:"pid,omitempty"`
+	TID        uint32            `json:"tid,omitempty"`
+	Device     *GPUDeviceRef     `json:"device,omitempty"`
+	Queue      *GPUQueueRef      `json:"queue,omitempty"`
+	ContextID  string            `json:"context_id,omitempty"`
+	FD         int32             `json:"fd,omitempty"`
+	ResultCode int64             `json:"result_code,omitempty"`
+	Driver     string            `json:"driver,omitempty"`
+	Source     string            `json:"source,omitempty"`
+	Confidence string            `json:"confidence,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+}
+
 type EventSink interface {
 	EmitLaunch(GPUKernelLaunch)
 	EmitExec(GPUKernelExec)
 	EmitCounter(GPUCounterSample)
 	EmitSample(GPUSample)
+	EmitEvent(GPUTimelineEvent)
 }
 
 type Backend interface {

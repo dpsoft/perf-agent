@@ -18,6 +18,7 @@ func (s *sink) EmitLaunch(gpu.GPUKernelLaunch)   { s.launches++ }
 func (s *sink) EmitExec(gpu.GPUKernelExec)       { s.execs++ }
 func (s *sink) EmitCounter(gpu.GPUCounterSample) {}
 func (s *sink) EmitSample(gpu.GPUSample)         { s.samples++ }
+func (s *sink) EmitEvent(gpu.GPUTimelineEvent)   {}
 
 func TestReplayBackendEmitsFixture(t *testing.T) {
 	path := filepath.Join("..", "..", "testdata", "replay", "flash_attn.json")

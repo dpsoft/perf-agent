@@ -65,6 +65,8 @@ func (s *captureEventSink) EmitCounter(gpu.GPUCounterSample) {}
 
 func (s *captureEventSink) EmitSample(gpu.GPUSample) {}
 
+func (s *captureEventSink) EmitEvent(gpu.GPUTimelineEvent) {}
+
 func TestLaunchSinkEmitsCanonicalLaunch(t *testing.T) {
 	var sink captureEventSink
 	hostSink := NewLaunchSink(&sink)

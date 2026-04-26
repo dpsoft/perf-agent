@@ -59,6 +59,10 @@ func (m *Manager) EmitSample(sample GPUSample) {
 	m.timeline.RecordSample(sample)
 }
 
+func (m *Manager) EmitEvent(event GPUTimelineEvent) {
+	m.timeline.RecordEvent(event)
+}
+
 func (m *Manager) Snapshot() Snapshot {
 	return m.timeline.Snapshot()
 }

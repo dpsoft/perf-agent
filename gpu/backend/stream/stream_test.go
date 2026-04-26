@@ -19,6 +19,7 @@ func (s *sink) EmitLaunch(event gpu.GPUKernelLaunch)   { s.launches = append(s.l
 func (s *sink) EmitExec(event gpu.GPUKernelExec)       { s.execs = append(s.execs, event) }
 func (s *sink) EmitCounter(event gpu.GPUCounterSample) { s.counters = append(s.counters, event) }
 func (s *sink) EmitSample(event gpu.GPUSample)         { s.samples = append(s.samples, event) }
+func (s *sink) EmitEvent(gpu.GPUTimelineEvent)         {}
 
 func TestStreamBackendEmitsEventsFromReader(t *testing.T) {
 	src := strings.NewReader(

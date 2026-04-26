@@ -16,6 +16,18 @@ func (s *sink) EmitCounter(gpu.GPUCounterSample) {}
 func (s *sink) EmitSample(gpu.GPUSample)         {}
 func (s *sink) EmitEvent(gpu.GPUTimelineEvent)   {}
 
+type eventSink struct {
+	events []gpu.GPUTimelineEvent
+}
+
+func (s *eventSink) EmitLaunch(gpu.GPUKernelLaunch)   {}
+func (s *eventSink) EmitExec(gpu.GPUKernelExec)       {}
+func (s *eventSink) EmitCounter(gpu.GPUCounterSample) {}
+func (s *eventSink) EmitSample(gpu.GPUSample)         {}
+func (s *eventSink) EmitEvent(event gpu.GPUTimelineEvent) {
+	s.events = append(s.events, event)
+}
+
 func TestNewRejectsMissingPID(t *testing.T) {
 	_, err := New(Config{})
 	if err == nil {
@@ -79,5 +91,40 @@ func TestStopPropagatesRunError(t *testing.T) {
 	}
 	if err := b.Stop(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("Stop error=%v want %v", err, want)
+	}
+}
+
+func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
+	b, err := New(Config{
+		PID: 123,
+		testRecords: []rawRecord{{
+			Kind:       recordKindIOCtl,
+			PID:        123,
+			TID:        124,
+			FD:         9,
+			Command:    0xc04064,
+			ResultCode: 0,
+			StartNs:    1000,
+			EndNs:      1200,
+			DeviceID:   77,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var sink eventSink
+	if err := b.Start(context.Background(), &sink); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := b.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if len(sink.events) != 1 {
+		t.Fatalf("events=%d", len(sink.events))
+	}
+	if sink.events[0].Kind != gpu.TimelineEventIOCtl {
+		t.Fatalf("kind=%q", sink.events[0].Kind)
 	}
 }

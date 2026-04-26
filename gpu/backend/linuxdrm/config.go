@@ -12,7 +12,8 @@ var errPIDRequired = errors.New("pid is required")
 type Config struct {
 	PID int
 
-	testRun func(context.Context, gpu.EventSink) error
+	testRun     func(context.Context, gpu.EventSink) error
+	testRecords []rawRecord
 }
 
 func (c Config) validate() error {

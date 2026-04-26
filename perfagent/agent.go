@@ -15,6 +15,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/gpu"
+	linuxdrm "github.com/dpsoft/perf-agent/gpu/backend/linuxdrm"
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
 	"github.com/dpsoft/perf-agent/gpu/backend/stream"
 	hostsource "github.com/dpsoft/perf-agent/gpu/host"
@@ -110,6 +111,15 @@ func (c *Config) validate() error {
 		return errors.New("gpu host source requires a gpu source")
 	}
 
+	if c.GPULinuxDRM {
+		if c.SystemWide {
+			return errors.New("linuxdrm backend does not support system-wide mode")
+		}
+		if c.PID == 0 {
+			return errors.New("linuxdrm backend requires pid")
+		}
+	}
+
 	if c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
 		if c.PID == 0 && !c.SystemWide {
 			return errors.New("either PID or system-wide is required")
@@ -139,6 +149,9 @@ func (c *Config) gpuSourceCount() int {
 		count++
 	}
 	if c.GPUStreamInput != nil {
+		count++
+	}
+	if c.GPULinuxDRM {
 		count++
 	}
 	return count
@@ -322,6 +335,8 @@ func (a *Agent) newGPUBackend() (gpu.Backend, error) {
 		return replay.New(a.config.GPUReplayInput)
 	case a.config.GPUStreamInput != nil:
 		return stream.New(a.config.GPUStreamInput), nil
+	case a.config.GPULinuxDRM:
+		return linuxdrm.New(linuxdrm.Config{PID: a.config.PID})
 	default:
 		return nil, errors.New("no gpu source configured")
 	}

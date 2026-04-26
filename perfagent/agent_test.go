@@ -53,6 +53,10 @@ func TestConfigValidation(t *testing.T) {
 			opts: []Option{WithGPUStreamInput(strings.NewReader(""))},
 		},
 		{
+			name: "valid linuxdrm gpu mode",
+			opts: []Option{WithPID(123), WithGPULinuxDRM()},
+		},
+		{
 			name: "valid GPU host replay plus stream mode",
 			opts: []Option{
 				WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
@@ -76,6 +80,16 @@ func TestConfigValidation(t *testing.T) {
 				WithGPUStreamInput(strings.NewReader("")),
 			},
 			wantErr: "gpu source",
+		},
+		{
+			name:    "linuxdrm requires pid",
+			opts:    []Option{WithGPULinuxDRM()},
+			wantErr: "linuxdrm backend requires pid",
+		},
+		{
+			name:    "linuxdrm rejects system-wide",
+			opts:    []Option{WithSystemWide(), WithGPULinuxDRM()},
+			wantErr: "linuxdrm backend does not support system-wide mode",
 		},
 	}
 
@@ -234,8 +248,8 @@ func TestAgentGPUStreamMode(t *testing.T) {
 
 	agent, err := New(
 		WithGPUStreamInput(strings.NewReader(
-			"{\"kind\":\"launch\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":100}\n" +
-				"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n" +
+			"{\"kind\":\"launch\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":100}\n"+
+				"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n"+
 				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
 		)),
 		WithGPURawOutput(&raw),
@@ -257,7 +271,7 @@ func TestAgentHostReplayPlusGPUStreamMode(t *testing.T) {
 	agent, err := New(
 		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
 		WithGPUStreamInput(strings.NewReader(
-			"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n" +
+			"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n"+
 				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
 		)),
 		WithGPURawOutput(&raw),

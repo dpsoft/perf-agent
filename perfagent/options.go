@@ -71,6 +71,9 @@ type Config struct {
 	// GPUStreamInput is a live normalized GPU NDJSON stream.
 	GPUStreamInput io.Reader
 
+	// GPULinuxDRM enables the experimental Linux DRM lifecycle backend.
+	GPULinuxDRM bool
+
 	// GPURawOutputPath writes the normalized GPU snapshot as JSON when set.
 	GPURawOutputPath string
 
@@ -216,6 +219,12 @@ func WithGPUHostReplayInput(path string) Option {
 func WithGPUStreamInput(r io.Reader) Option {
 	return func(c *Config) {
 		c.GPUStreamInput = r
+	}
+}
+
+func WithGPULinuxDRM() Option {
+	return func(c *Config) {
+		c.GPULinuxDRM = true
 	}
 }
 

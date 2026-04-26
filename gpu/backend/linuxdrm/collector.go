@@ -3,9 +3,13 @@ package linuxdrm
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"sync"
+	"time"
 
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/dpsoft/perf-agent/gpu"
 )
 
@@ -25,6 +29,10 @@ type Backend struct {
 	done    chan struct{}
 	cancel  context.CancelCauseFunc
 	runErr  error
+	objs    *Objects
+	reader  *ringbuf.Reader
+	enterTP link.Link
+	exitTP  link.Link
 }
 
 func New(cfg Config) (*Backend, error) {
@@ -54,6 +62,12 @@ func (b *Backend) Start(ctx context.Context, sink gpu.EventSink) error {
 	}
 
 	runCtx, cancel := context.WithCancelCause(ctx)
+	if b.cfg.testRun == nil && len(b.cfg.testRecords) == 0 {
+		if err := b.openLive(); err != nil {
+			cancel(err)
+			return err
+		}
+	}
 	b.cancel = cancel
 	b.done = make(chan struct{})
 	b.runErr = nil
@@ -72,8 +86,21 @@ func (b *Backend) run(ctx context.Context, sink gpu.EventSink) {
 		}
 		return
 	}
+	if err := b.emitTestRecords(sink); err != nil {
+		b.setRunErr(err)
+		return
+	}
+	if len(b.cfg.testRecords) > 0 {
+		<-ctx.Done()
+		return
+	}
 
-	<-ctx.Done()
+	if err := b.runLive(ctx, sink); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, ringbuf.ErrClosed) {
+			return
+		}
+		b.setRunErr(err)
+	}
 }
 
 func (b *Backend) Stop(ctx context.Context) error {
@@ -88,6 +115,7 @@ func (b *Backend) Stop(ctx context.Context) error {
 	if cancel != nil {
 		cancel(context.Canceled)
 	}
+	b.closeReader()
 
 	select {
 	case <-done:
@@ -98,7 +126,12 @@ func (b *Backend) Stop(ctx context.Context) error {
 }
 
 func (b *Backend) Close() error {
-	return nil
+	b.closeReader()
+	return errors.Join(
+		closeLink(b.enterTP),
+		closeLink(b.exitTP),
+		closeObjects(b.objs),
+	)
 }
 
 func (b *Backend) setRunErr(err error) {
@@ -111,4 +144,109 @@ func (b *Backend) err() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.runErr
+}
+
+func (b *Backend) emitTestRecords(sink gpu.EventSink) error {
+	for _, record := range b.cfg.testRecords {
+		if err := emitRecord(record, sink); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Backend) openLive() error {
+	objs, err := Load(uint32(b.cfg.PID))
+	if err != nil {
+		return err
+	}
+
+	enterTP, err := link.Tracepoint("syscalls", "sys_enter_ioctl", objs.EnterProgram(), nil)
+	if err != nil {
+		_ = objs.Close()
+		return err
+	}
+	exitTP, err := link.Tracepoint("syscalls", "sys_exit_ioctl", objs.ExitProgram(), nil)
+	if err != nil {
+		_ = enterTP.Close()
+		_ = objs.Close()
+		return err
+	}
+	reader, err := ringbuf.NewReader(objs.EventsMap())
+	if err != nil {
+		_ = exitTP.Close()
+		_ = enterTP.Close()
+		_ = objs.Close()
+		return err
+	}
+
+	b.objs = objs
+	b.enterTP = enterTP
+	b.exitTP = exitTP
+	b.reader = reader
+	return nil
+}
+
+func (b *Backend) runLive(ctx context.Context, sink gpu.EventSink) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
+
+		b.mu.Lock()
+		reader := b.reader
+		b.mu.Unlock()
+		if reader == nil {
+			return nil
+		}
+		reader.SetDeadline(time.Now().Add(200 * time.Millisecond))
+
+		record, err := reader.Read()
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			return err
+		}
+
+		decoded, err := decodeRecord(record.RawSample)
+		if err != nil {
+			return err
+		}
+		if err := emitRecord(decoded, sink); err != nil {
+			return err
+		}
+	}
+}
+
+func emitRecord(record rawRecord, sink gpu.EventSink) error {
+	event, err := normalizeRecord(record)
+	if err != nil {
+		return err
+	}
+	sink.EmitEvent(event)
+	return nil
+}
+
+func (b *Backend) closeReader() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reader != nil {
+		_ = b.reader.Close()
+		b.reader = nil
+	}
+}
+
+func closeLink(tp link.Link) error {
+	if tp == nil {
+		return nil
+	}
+	return tp.Close()
+}
+
+func closeObjects(objs *Objects) error {
+	if objs == nil {
+		return nil
+	}
+	return objs.Close()
 }

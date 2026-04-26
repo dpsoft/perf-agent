@@ -16,24 +16,25 @@ import (
 )
 
 var (
-	flagProfile       = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
-	flagOffCpu        = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
-	flagPMU           = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
-	flagPID           = flag.Int("pid", 0, "Target process ID to monitor")
-	flagAll           = flag.Bool("a", false, "System-wide profiling (all processes)")
-	flagPerPID        = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
-	flagDuration      = flag.Duration("duration", 10*time.Second, "Collection duration")
-	flagSampleRate    = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
-	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
-	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
-	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
-	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
+	flagProfile            = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagOffCpu             = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
+	flagPMU                = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
+	flagPID                = flag.Int("pid", 0, "Target process ID to monitor")
+	flagAll                = flag.Bool("a", false, "System-wide profiling (all processes)")
+	flagPerPID             = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
+	flagDuration           = flag.Duration("duration", 10*time.Second, "Collection duration")
+	flagSampleRate         = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
+	flagProfileOutput      = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
+	flagOffcpuOutput       = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
+	flagPMUOutput          = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagUnwind             = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagGPUHostReplayInput = flag.String("gpu-host-replay-input", "", "Experimental: replay host launch attribution from a JSON fixture")
-	flagGPUReplayInput  = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
-	flagGPUStreamStdin = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
-	flagGPURawOutput    = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
-	flagGPUProfileOutput = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
-	flagTags          tagFlags
+	flagGPUReplayInput     = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
+	flagGPUStreamStdin     = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
+	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
+	flagGPURawOutput       = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
+	flagGPUProfileOutput   = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
+	flagTags               tagFlags
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -117,9 +118,13 @@ func buildOptions() []perfagent.Option {
 	gpuHostReplayMode := *flagGPUHostReplayInput != ""
 	gpuReplayMode := *flagGPUReplayInput != ""
 	gpuStreamMode := *flagGPUStreamStdin
+	gpuLinuxDRMMode := *flagGPULinuxDRM
 
 	if gpuReplayMode && gpuStreamMode {
 		log.Fatal("--gpu-replay-input and --gpu-stream-stdin are mutually exclusive")
+	}
+	if gpuLinuxDRMMode && *flagAll {
+		log.Fatal("--gpu-linux-drm does not support -a/--all")
 	}
 
 	// Target selection
@@ -137,7 +142,7 @@ func buildOptions() []perfagent.Option {
 	}
 
 	// Profiling modes
-	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode && !gpuStreamMode {
+	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode && !gpuStreamMode && !gpuLinuxDRMMode {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 
@@ -195,6 +200,12 @@ func buildOptions() []perfagent.Option {
 		}
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
+		}
+	}
+	if gpuLinuxDRMMode {
+		opts = append(opts, perfagent.WithGPULinuxDRM())
+		if *flagGPURawOutput != "" {
+			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}
 	}
 

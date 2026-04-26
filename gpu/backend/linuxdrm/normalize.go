@@ -21,6 +21,12 @@ func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 		case "card":
 			name = "drm-card-ioctl"
 		}
+		if classification, ok := classifyIOCtl(record.Command); ok {
+			name = classification.Name
+			for key, value := range classification.Attributes {
+				attrs[key] = value
+			}
+		}
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventIOCtl,

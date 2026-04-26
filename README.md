@@ -275,6 +275,7 @@ What this currently provides:
 
 - PID-scoped Linux DRM boundary telemetry
 - normalized DRM `ioctl` lifecycle events in the GPU JSON snapshot
+- conservative semantic naming for recognizable DRM core calls such as sync waits, PRIME imports/exports, and generic driver-command buckets
 - scheduler wakeup and runqueue-latency events for the same target PID
 - a real eBPF + ringbuf collector path behind the existing `gpu` manager
 

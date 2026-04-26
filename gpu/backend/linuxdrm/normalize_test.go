@@ -118,3 +118,97 @@ func TestNormalizeSchedWakeupRecord(t *testing.T) {
 		t.Fatalf("cpu=%q", got)
 	}
 }
+
+func TestNormalizeRecordClassifiesDRMSyncobjWait(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 32, 'd', 0xc3),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Name != "drm-syncobj-wait" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["command_family"]; got != "drm-core" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["command_name"]; got != "syncobj_wait" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "sync-wait" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesDRMPrimeImport(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 32, 'd', 0x2e),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Name != "drm-prime-fd-to-handle" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["semantic"]; got != "prime-import" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordBucketsDRMDriverCommands(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 64, 'd', 0x40),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Name != "drm-driver-ioctl" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["command_family"]; got != "drm-driver" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "driver-command" {
+		t.Fatalf("semantic=%q", got)
+	}
+	if got := event.Attributes["drm_command_index"]; got != "0" {
+		t.Fatalf("drm_command_index=%q", got)
+	}
+}
+
+func encodeTestIOCtl(dir, size, typ, nr uint64) uint64 {
+	return (dir << iocDirShift) | (size << iocSizeShift) | (typ << iocTypeShift) | (nr << iocNRShift)
+}

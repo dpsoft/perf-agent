@@ -17,13 +17,9 @@ func NewManager(backends []Backend, _ any) *Manager {
 }
 
 func (m *Manager) Start(ctx context.Context) error {
-	runCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-
 	for _, b := range m.backends {
-		if err := b.Start(runCtx, m); err != nil {
-			cancel(err)
-			return context.Cause(runCtx)
+		if err := b.Start(ctx, m); err != nil {
+			return err
 		}
 	}
 	return nil

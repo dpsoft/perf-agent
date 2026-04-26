@@ -211,6 +211,30 @@ This path is intended to validate:
 
 It is not yet a real NVIDIA / Intel / AMD backend.
 
+### Experimental live GPU stream pipeline
+
+There is also an experimental live ingestion path for normalized GPU NDJSON events. It keeps the same vendor-agnostic event contract as replay mode, but reads one event per line from stdin and drives the existing JSON snapshot plus synthetic-frame `pprof` projection.
+
+```bash
+cat <<'EOF' | go run . \
+  --gpu-stream-stdin \
+  --gpu-raw-output /tmp/gpu-live.json \
+  --gpu-profile-output /tmp/gpu-live.pb.gz \
+  --duration 1ms
+{"kind":"launch","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":100}
+{"kind":"exec","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","start_ns":120,"end_ns":200}
+{"kind":"sample","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":150,"stall_reason":"memory_throttle","weight":7}
+EOF
+
+go tool pprof /tmp/gpu-live.pb.gz
+```
+
+This is still a bridge layer, not a vendor runtime integration. It is meant to validate:
+
+- live event ingestion
+- NDJSON decode and validation
+- reuse of the existing GPU manager, JSON export, and `pprof` projection
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

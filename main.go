@@ -29,6 +29,7 @@ var (
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagGPUReplayInput  = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
+	flagGPUStreamStdin = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
 	flagGPURawOutput    = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
 	flagGPUProfileOutput = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
 	flagTags          tagFlags
@@ -113,13 +114,18 @@ func main() {
 func buildOptions() []perfagent.Option {
 	var opts []perfagent.Option
 	gpuReplayMode := *flagGPUReplayInput != ""
+	gpuStreamMode := *flagGPUStreamStdin
+
+	if gpuReplayMode && gpuStreamMode {
+		log.Fatal("--gpu-replay-input and --gpu-stream-stdin are mutually exclusive")
+	}
 
 	// Target selection
 	if *flagAll {
 		opts = append(opts, perfagent.WithSystemWide())
 	} else if *flagPID != 0 {
 		opts = append(opts, perfagent.WithPID(*flagPID))
-	} else if !gpuReplayMode {
+	} else if !gpuReplayMode && !gpuStreamMode {
 		log.Fatal("Either --pid or -a/--all is required")
 	}
 
@@ -129,7 +135,7 @@ func buildOptions() []perfagent.Option {
 	}
 
 	// Profiling modes
-	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode {
+	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode && !gpuStreamMode {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 
@@ -170,6 +176,15 @@ func buildOptions() []perfagent.Option {
 
 	if gpuReplayMode {
 		opts = append(opts, perfagent.WithGPUReplayInput(*flagGPUReplayInput))
+		if *flagGPURawOutput != "" {
+			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
+		}
+		if *flagGPUProfileOutput != "" {
+			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
+		}
+	}
+	if gpuStreamMode {
+		opts = append(opts, perfagent.WithGPUStreamInput(os.Stdin))
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}

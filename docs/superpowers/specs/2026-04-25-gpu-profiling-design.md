@@ -1,11 +1,73 @@
 # GPU Profiling — Draft Design Spec
 
 **Status:** draft for review and extension.
-**Branch context:** `feat/dwarf-unwinding`
+**Branch context:** `gpu-profiling-spec`
 **Predecessor work:** S3-S9 DWARF unwinding and pprof fidelity improvements.
 **Goal of this draft:** define a first architecture for full-stack GPU profiling that fits the current perf-agent collector model without pretending that GPU hardware profiling can be implemented with eBPF alone.
 
-## 1. Problem
+## 1. Overview
+
+This document defines the design for integrating GPU profiling into `perf-agent`.
+
+The goal is to extend `perf-agent` into a unified CPU + GPU continuous profiling system that preserves the branch's existing CPU-side strengths while adding timeline-oriented GPU observability.
+
+## 2. Design Principles
+
+### 2.1 Timeline-first
+
+GPU workloads are asynchronous and queue-based.
+
+Profiling must therefore be timeline-oriented first, not stack-oriented first.
+
+### 2.2 Correlation-first
+
+The primary value is understanding how CPU behavior drives GPU execution.
+
+That means launch attribution, queueing delays, runtime behavior, and device execution must join into one correlated model instead of being emitted as unrelated metric streams.
+
+### 2.3 Continuous-first
+
+The design should favor:
+
+- low overhead
+- production safety
+- always-on viability
+
+### 2.4 Vendor-backed instrumentation
+
+Real full-stack GPU profiling requires vendor-backed device signals.
+
+Representative backend families are:
+
+- NVIDIA via CUPTI
+- AMD via ROCprofiler-SDK
+- Intel via Level Zero and related runtime/driver hooks
+
+### 2.5 Canonical representation
+
+The canonical internal representation is a normalized event stream.
+
+All downstream outputs, including `pprof`, flame graphs, summaries, and timeline views, are derived projections.
+
+## 3. Goals
+
+At a product level, the design should support:
+
+- GPU timelines covering kernels, memory copies, queues, and related execution intervals
+- CPU to GPU correlation
+- continuous profiling
+- a unified output model
+
+## 4. Non-goals
+
+This design does not promise:
+
+- an `eBPF-only` GPU profiler
+- immediate vendor parity
+- UI design in this spec
+- forced `pprof` as the only output artifact
+
+## 5. Problem
 
 The current branch has strong CPU-side collection and profile emission:
 
@@ -28,7 +90,7 @@ The design tension is that GPU profiling has two layers:
 
 An `eBPF-only` design cannot deliver serious GPU profiling on its own. It can provide host attribution and some driver-level observation, but not the vendor-only device signals needed for full-stack GPU flame graphs.
 
-## 2. Goal
+## 6. Goal
 
 Build a GPU profiling architecture for `perf-agent` with these properties:
 
@@ -41,7 +103,7 @@ Build a GPU profiling architecture for `perf-agent` with these properties:
 5. Existing CPU/off-CPU/pprof work on this branch remains reusable rather than bypassed.
 6. The system must be able to generate a flame graph shaped like the public AI Profiler examples: CPU launch stack, runtime/driver path, and GPU execution/sample context in one visual when backend capability allows it.
 
-### 2.1 Non-functional requirements
+### 6.1 Non-functional requirements
 
 The first design should explicitly optimize for the same properties that made CPU profiling broadly usable:
 
@@ -65,7 +127,7 @@ The first design should explicitly optimize for the same properties that made CP
 - **Single-active-workload-first viability**
   - the first serious implementation may target one active GPU workload per device/session before attempting broad multi-tenant attribution
 
-## 3. Non-goals
+## 7. Detailed Non-goals
 
 - No promise of a universal `eBPF-only` GPU profiler.
 - No requirement that all vendors expose the same fidelity on day one.
@@ -76,7 +138,7 @@ The first design should explicitly optimize for the same properties that made CP
   - pprof plus a sidecar event stream
 - No kernel-driver reverse engineering as a baseline dependency.
 
-## 4. Recommendation
+## 8. Recommendation
 
 Use a **layered architecture**:
 
@@ -91,7 +153,7 @@ Use a **layered architecture**:
 
 This is the only architecture that is honest about current Linux GPU observability while still preserving a clean, mostly vendor-neutral product surface.
 
-### 4.1 Meaning of “vendor-agnostic”
+### 8.1 Meaning of “vendor-agnostic”
 
 In this spec, “vendor-agnostic” applies to:
 
@@ -109,11 +171,11 @@ So the design rule is:
 
 Reviewers should evaluate portability at the contract boundary, not by forcing NVIDIA, Intel, and AMD collection internals into one fake-uniform implementation strategy.
 
-## 5. Why Not eBPF First Alone?
+## 9. Why Not eBPF First Alone?
 
 `eBPF` should be first in the architecture, but not first as the only data source.
 
-### 5.1 What eBPF does well
+### 9.1 What eBPF does well
 
 - capture CPU stacks at GPU API call sites or queue submission sites
 - track PID/TID/cgroup/container/process identity
@@ -121,7 +183,7 @@ Reviewers should evaluate portability at the contract boundary, not by forcing N
 - ingest generic kernel events and some driver tracepoints
 - provide a single always-on control plane across vendors
 
-### 5.2 What eBPF does not solve
+### 9.2 What eBPF does not solve
 
 - GPU PC sampling
 - stall reasons
@@ -129,13 +191,13 @@ Reviewers should evaluate portability at the contract boundary, not by forcing N
 - runtime correlation objects that only vendor libraries expose
 - per-kernel metrics that live behind CUPTI / Level Zero / ROCprofiler
 
-### 5.3 Design implication
+### 9.3 Design implication
 
 The architecture should treat eBPF as the **common attribution spine**, not as the complete GPU profiler.
 
-## 6. Proposed Scope Split
+## 10. Proposed Scope Split
 
-### 6.1 Vendor-agnostic core
+### 10.1 Vendor-agnostic core
 
 The core owns:
 
@@ -147,7 +209,7 @@ The core owns:
 - cross-source correlation
 - profile and timeline assembly
 
-### 6.2 Vendor-specific backends
+### 10.2 Vendor-specific backends
 
 Backends own:
 
@@ -158,7 +220,7 @@ Backends own:
 - device/stream/queue metadata
 - vendor-specific correlation IDs
 
-## 7. Capability Model
+## 11. Capability Model
 
 Backends should declare capabilities rather than pretending every backend is equivalent.
 
@@ -182,11 +244,11 @@ Examples:
 
 This lets the product be vendor-agnostic at the contract level while remaining honest about backend-specific depth.
 
-## 8. Normalized Data Model
+## 12. Normalized Data Model
 
 The core event model should be explicit and append-only.
 
-### 8.1 Session-level types
+### 12.1 Session-level types
 
 ```go
 type GPUBackendID string
@@ -204,7 +266,7 @@ type GPUQueueRef struct {
 }
 ```
 
-### 8.2 Correlation types
+### 12.2 Correlation types
 
 ```go
 type CorrelationID struct {
@@ -221,7 +283,7 @@ type LaunchContext struct {
 }
 ```
 
-### 8.3 Normalized events
+### 12.3 Normalized events
 
 ```go
 type GPUEventKind uint8
@@ -273,7 +335,7 @@ type GPUSample struct {
 }
 ```
 
-### 8.4 Execution identity and context requirements
+### 12.4 Execution identity and context requirements
 
 The core model needs a stronger notion of GPU execution identity than just `(device, queue, kernel_name, time)`.
 
@@ -304,13 +366,13 @@ type GPUKernelExec struct {
 
 This requirement exists because some GPU sampling surfaces are not globally unique by virtual address alone. If a backend cannot reliably distinguish execution contexts, the core must treat that as a reduced-fidelity mode rather than silently over-joining unrelated samples.
 
-## 9. Correlation Model
+## 13. Correlation Model
 
 The main semantic unit is:
 
 `CPU launch stack -> backend correlation ID -> GPU kernel execution -> optional GPU samples/counters`
 
-### 9.1 Cross-layer correlation stack
+### 13.1 Cross-layer correlation stack
 
 Conceptually the profiler is joining evidence across layers:
 
@@ -336,7 +398,7 @@ This gives three useful output levels:
 
 If a backend cannot provide GPU samples, the first two levels still work.
 
-### 9.2 Join policy
+### 13.2 Join policy
 
 Correlation should be performed from strongest to weakest evidence:
 
@@ -347,11 +409,11 @@ Correlation should be performed from strongest to weakest evidence:
 
 Heuristic joins must be marked as such in the normalized stream or debug output. The core should not present a guessed join as equivalent to a hard runtime-provided correlation.
 
-## 10. Architecture in This Repo
+## 14. Architecture in This Repo
 
 The current code already suggests useful boundaries.
 
-### 10.1 Reusable parts
+### 14.1 Reusable parts
 
 - [perfagent/agent.go](/home/diego/github/perf-agent/perfagent/agent.go:1)
   - central lifecycle and feature dispatch
@@ -362,29 +424,58 @@ The current code already suggests useful boundaries.
 - [metrics/types.go](/home/diego/github/perf-agent/metrics/types.go:1)
   - precedent for non-pprof snapshots and exporters
 
-### 10.2 Proposed new packages
+### 14.2 Recommended repo organization
 
 ```text
+cpu/
+  ...                 # existing CPU profiling and PMU paths
+
 gpu/
-  manager.go          # backend selection, lifecycle, capability registry
-  types.go            # normalized GPU event model and capabilities
+  types.go            # canonical GPU event model and capabilities
+  manager.go          # backend lifecycle and fan-in
   timeline.go         # event assembly and correlation
-  exporter.go         # raw/timeline export interfaces
+  exporter.go         # JSON/raw snapshot export
+  pprof_projection.go # synthetic-frame pprof projection
 
-gpu/hostebpf/
-  collector.go        # CPU-side launch attribution via eBPF/uprobes/tracepoints
-  events.go           # host correlation events
-gpu/backend/nvidia/
-  cupti.go            # CUPTI-based tracing / sampling backend
+  backend/
+    replay/
+      replay.go
+    stream/
+      stream.go
+    nvidia/
+      cupti_collector.go
+    amd/
+      rocprofiler_collector.go
+    intel/
+      levelzero_collector.go
 
-gpu/backend/intel/
-  levelzero.go        # Level Zero or iaprof-style backend
+  correlation/
+    pid_tid.go
+    stream_context.go
+    clock_sync.go
 
-gpu/backend/amd/
-  rocprofiler.go      # ROCprofiler-SDK backend
+  codec/
+    ndjson.go
+
+pprof/
+  ...                 # existing shared pprof builder/projection support
+
+export/
+  perfetto/
+  otlp/
 ```
 
-### 10.3 Backend interface
+This layout keeps ownership clear:
+
+- canonical GPU model and projections stay in `gpu/`
+- vendor implementations live under `gpu/backend/`
+- stream/file codecs stay under `gpu/codec/`
+- correlation helpers only split out once they justify dedicated packages
+- `pprof` remains a shared repo-level concern rather than a GPU-only exporter package
+
+The design should avoid generic top-level packages such as `model/` when the ownership is really GPU-specific. Putting the canonical event schema in `gpu/types.go` keeps the contract close to the subsystem that owns it and reduces the chance of vague cross-package dependencies.
+
+### 14.3 Backend interface
 
 ```go
 type Backend interface {
@@ -403,7 +494,7 @@ type EventSink interface {
 }
 ```
 
-### 10.4 Go API design principles
+### 14.4 Go API design principles
 
 The GPU packages should follow the same broad design discipline as the rest of this repo:
 
@@ -424,11 +515,11 @@ Candidate manager shape:
 
 ```go
 type Manager struct {
-    backends []backend.Backend
+    backends []Backend
     sink     EventSink
 }
 
-func NewManager(backends []backend.Backend, sink EventSink) *Manager
+func NewManager(backends []Backend, sink EventSink) *Manager
 func (m *Manager) Start(ctx context.Context) error
 func (m *Manager) Stop(ctx context.Context) error
 func (m *Manager) Close() error
@@ -436,7 +527,7 @@ func (m *Manager) Close() error
 
 This keeps the public surface simple while allowing the implementation to evolve internally.
 
-### 10.5 Modern Go implementation notes
+### 14.5 Modern Go implementation notes
 
 When implementation starts, the GPU packages should prefer modern Go 1.26-era standard library patterns over custom helpers or legacy idioms.
 
@@ -462,11 +553,11 @@ For tests:
 - prefer table-driven tests around normalized event joins and projection rules
 - keep backend-specific fixtures at the package boundary so core tests do not depend on vendor SDKs
 
-## 11. Host Correlation Plane
+## 15. Host Correlation Plane
 
 The host plane should be independent of any single vendor backend.
 
-### 11.1 Responsibilities
+### 15.1 Responsibilities
 
 - observe target processes and threads
 - capture CPU launch stacks
@@ -474,7 +565,7 @@ The host plane should be independent of any single vendor backend.
 - attach process metadata and existing tags
 - feed correlation records into the GPU manager
 
-### 11.2 Collection options
+### 15.2 Collection options
 
 Ordered by realism:
 
@@ -484,11 +575,11 @@ Ordered by realism:
 
 For the first version, the host plane may need backend assistance to know which runtime functions to probe. That is acceptable. “Vendor-agnostic core” does not mean “zero vendor knowledge at the probe list.”
 
-## 12. Output Model
+## 16. Output Model
 
 We should explicitly separate **profile output** from **timeline output**.
 
-### 12.1 Timeline output
+### 16.1 Timeline output
 
 The first output should be a normalized event stream that can drive:
 
@@ -499,7 +590,7 @@ The first output should be a normalized event stream that can drive:
 
 This is safer than forcing everything into pprof immediately.
 
-### 12.2 pprof output
+### 16.2 pprof output
 
 pprof remains useful for mixed-stack aggregation, but it should be treated as a derived view.
 
@@ -522,7 +613,7 @@ my_kernel
 
 This is intentionally provisional. The normalized event stream is the primary truth; pprof is a downstream projection.
 
-### 12.2.1 Flame graph requirement
+### 16.2.1 Flame graph requirement
 
 The architecture is not complete unless it can project the normalized stream into a flame graph resembling the public AI Profiler examples:
 
@@ -543,7 +634,7 @@ That output may be implemented as:
 
 But the requirement is the same: one visual stack that answers “which CPU code caused which GPU work, and why was that GPU work expensive?”
 
-### 12.2.2 Candidate: `pprof` with synthetic GPU frames
+### 16.2.2 Candidate: `pprof` with synthetic GPU frames
 
 One likely projection is to reuse the existing pprof pipeline and encode GPU-side context as synthetic frames appended after the real CPU launch stack.
 
@@ -595,7 +686,7 @@ And the naming rule should be explicit and machine-stable, for example:
 
 This section is intentionally a candidate design, not a final commitment.
 
-### 12.3 Symbolization contract
+### 16.3 Symbolization contract
 
 Full-stack flame graphs eventually depend on more than collection:
 
@@ -615,9 +706,9 @@ So the core architecture should assume three symbolization tiers:
 
 The first implementation should be successful even if the first backend initially only reaches Tier 1 or Tier 2.
 
-## 13. Backend Strategy
+## 17. Backend Strategy
 
-### 13.0 `iaprof` lessons
+### 17.1 `iaprof` lessons
 
 `iaprof` is interesting here less as a reusable implementation and more as a proof of shape:
 
@@ -632,7 +723,7 @@ The first implementation should be successful even if the first backend initiall
 
 This spec adopts the architectural lessons without inheriting Intel-specific assumptions as universal design constraints.
 
-### 13.1 NVIDIA
+### 17.2 NVIDIA
 
 Expected source surfaces:
 
@@ -645,7 +736,7 @@ Likely maturity:
 - strongest short-term path for launch + execution correlation
 - deeper GPU flame graphs possible, but backend complexity is high
 
-### 13.2 Intel
+### 17.3 Intel
 
 Expected source surfaces:
 
@@ -657,7 +748,7 @@ Likely maturity:
 - attractive because some of the public full-stack design is visible
 - likely less broadly deployable than NVIDIA in many environments
 
-### 13.3 AMD
+### 17.4 AMD
 
 Expected source surfaces:
 
@@ -668,7 +759,7 @@ Likely maturity:
 - viable long-term backend
 - not the recommended first implementation unless AMD is the target environment
 
-## 14. Phasing
+## 18. Phasing
 
 ### Phase 0: draft and architecture validation
 
@@ -707,29 +798,29 @@ Success criteria:
 - produce at least one folded or pprof-derived flame graph artifact comparable in shape to the PDF examples
 - expose an explicit backend or session-level subsampling control when raw sample volume is too high for practical continuous collection
 
-## 15. Risks
+## 19. Risks
 
-### 15.1 Timebase alignment
+### 19.1 Timebase alignment
 
 Different sources report time differently. CPU `ktime`, runtime timestamps, and device timestamps may need calibration and drift handling.
 
-### 15.2 Runtime interception fragility
+### 19.2 Runtime interception fragility
 
 Hooking launch APIs may vary by runtime version, loader behavior, and static vs dynamic linking.
 
-### 15.3 Incomplete backend parity
+### 19.3 Incomplete backend parity
 
 The capability model helps, but users may still expect identical behavior across vendors.
 
-### 15.4 pprof mismatch
+### 19.4 pprof mismatch
 
 pprof is CPU-centric. Mixed CPU+GPU representations may need conventions that are useful but not “standard.”
 
-### 15.5 Over-aggregation
+### 19.5 Over-aggregation
 
 If we aggregate too early, we can lose the exact correlation chain needed for debugging. Raw normalized events should be retained until projection time.
 
-### 15.6 GPU context ambiguity
+### 19.6 GPU context ambiguity
 
 Some backends may expose GPU PCs or virtual addresses without a sufficiently strong execution or context identifier. In those cases, the same address may be reused across processes or contexts, making naive joins incorrect.
 
@@ -739,7 +830,7 @@ The architecture must support:
 - backend-specific software workarounds where available
 - clear degradation to launch/execution correlation when sample-to-context joins are not trustworthy
 
-### 15.7 Proof-of-concept brittleness
+### 19.7 Proof-of-concept brittleness
 
 The public Intel AI profiler material is useful because it proves the model is possible, but it also shows that early full-stack GPU profiling is brittle. Driver/runtime/compiler cooperation may be required for robustness, symbolization, and context identity.
 
@@ -749,7 +840,7 @@ This means:
 - the first shipped backend should be narrow and honest
 - the design should avoid hard-coding one vendor's assumptions into the vendor-agnostic event model
 
-## 16. Initial Recommendation
+## 20. Initial Recommendation
 
 Implement the architecture as:
 
@@ -760,11 +851,11 @@ Implement the architecture as:
 
 This gives us a serious path to Option 2 without claiming a false vendor-neutral device sampler.
 
-## 17. Open Questions / Decision Prompts
+## 21. Open Questions / Decision Prompts
 
 These are the main review decisions the draft still needs. The current branch now has a working default for each so planning can proceed.
 
-### 17.1 First backend
+### 21.1 First backend
 
 Question:
 - Which backend should be first: NVIDIA, Intel, or a narrower internal target?
@@ -776,7 +867,7 @@ Working default:
 - keep the public contract vendor-agnostic
 - defer naming a single first vendor implementation in the spec until the first real target environment is chosen
 
-### 17.2 First host correlation mechanism
+### 21.2 First host correlation mechanism
 
 Question:
 - Should the first host correlation path rely on runtime callbacks only, or also add `uprobes` immediately?
@@ -789,7 +880,7 @@ Working default:
 - start with the strongest correlation source available for the chosen backend
 - add `uprobes` when callback-only collection is insufficient for attach-late workflows
 
-### 17.3 Raw timeline export format
+### 21.3 Raw timeline export format
 
 Question:
 - Should raw timeline export be JSON first, protobuf first, or internal-only at the start?
@@ -801,7 +892,7 @@ Current recommendation:
 Working default:
 - JSON first
 
-### 17.4 Mixed stack representation
+### 21.4 Mixed stack representation
 
 Question:
 - Should mixed CPU+GPU stacks live in the existing `pprof.Frame` model, or in a new GPU-aware profile model with a pprof exporter on top?
@@ -814,7 +905,7 @@ Working default:
 - keep the normalized event stream as the source of truth
 - use the existing `pprof.Frame`-based projection first
 
-### 17.5 Initial scope width
+### 21.5 Initial scope width
 
 Question:
 - Do we want Phase 1 to target a single process, or system-wide multi-process GPU attribution from the start?
@@ -826,7 +917,7 @@ Current recommendation:
 Working default:
 - single active workload first
 
-### 17.6 Subsampling contract
+### 21.6 Subsampling contract
 
 Question:
 - Should subsampling be a universal backend capability in the core API, or an optional backend-specific control surfaced only when needed?
@@ -839,7 +930,7 @@ Working default:
 - subsampling is part of the backend capability contract
 - individual backends may omit it initially
 
-### 17.7 Canonical flame-graph artifact
+### 21.7 Canonical flame-graph artifact
 
 Question:
 - Should the canonical flame-graph artifact be `pprof` with synthetic GPU frames, or should folded-stack export be first-class from the start as well?
@@ -852,9 +943,9 @@ Working default:
 - `pprof` with synthetic GPU frames is the primary flame-graph artifact
 - folded-stack export remains optional
 
-## 18. Test Plan
+## 22. Test Plan
 
-### 18.1 Unit
+### 22.1 Unit
 
 - normalized event schema validation
 - correlation join logic
@@ -863,7 +954,7 @@ Working default:
 - synthetic GPU frame naming and ordering rules
 - event snapshot copy semantics and zero-value behavior
 
-### 18.2 Integration
+### 22.2 Integration
 
 - known GPU workload launches kernel A from CPU stack X
 - exported timeline links launch X to execution A
@@ -871,7 +962,7 @@ Working default:
 - ambiguous or heuristic joins are surfaced distinctly from hard joins
 - pprof projection preserves CPU launch frames and appends synthetic GPU frames in the expected order
 
-### 18.3 End-to-end
+### 22.3 End-to-end
 
 - run workload under `perf-agent`
 - collect CPU profile, GPU timeline, and any backend counters
@@ -881,7 +972,7 @@ Working default:
   - whether the GPU was idle, saturated, or stalled
   - whether the reported correlations are hard IDs or heuristic joins
 
-## 19. Review Focus
+## 23. Review Focus
 
 This draft should be reviewed for:
 

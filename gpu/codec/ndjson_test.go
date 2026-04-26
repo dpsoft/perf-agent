@@ -1,0 +1,102 @@
+package codec
+
+import (
+	"testing"
+
+	"github.com/dpsoft/perf-agent/gpu"
+)
+
+func TestDecodeLaunchLine(t *testing.T) {
+	line := []byte(`{"kind":"launch","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":100}`)
+
+	ev, err := DecodeLine(line)
+	if err != nil {
+		t.Fatalf("DecodeLine: %v", err)
+	}
+	if ev.Kind != KindLaunch {
+		t.Fatalf("kind=%q want %q", ev.Kind, KindLaunch)
+	}
+	if ev.Launch.KernelName != "flash_attn_fwd" {
+		t.Fatalf("kernel=%q", ev.Launch.KernelName)
+	}
+	if ev.Launch.TimeNs != 100 {
+		t.Fatalf("time_ns=%d", ev.Launch.TimeNs)
+	}
+	if ev.Launch.Correlation != (gpu.CorrelationID{Backend: "stream", Value: "c1"}) {
+		t.Fatalf("correlation=%+v", ev.Launch.Correlation)
+	}
+}
+
+func TestDecodeExecLine(t *testing.T) {
+	line := []byte(`{"kind":"exec","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","start_ns":120,"end_ns":200}`)
+
+	ev, err := DecodeLine(line)
+	if err != nil {
+		t.Fatalf("DecodeLine: %v", err)
+	}
+	if ev.Kind != KindExec {
+		t.Fatalf("kind=%q want %q", ev.Kind, KindExec)
+	}
+	if ev.Exec.KernelName != "flash_attn_fwd" {
+		t.Fatalf("kernel=%q", ev.Exec.KernelName)
+	}
+	if ev.Exec.StartNs != 120 || ev.Exec.EndNs != 200 {
+		t.Fatalf("exec=%+v", ev.Exec)
+	}
+}
+
+func TestDecodeSampleLine(t *testing.T) {
+	line := []byte(`{"kind":"sample","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":150,"stall_reason":"memory_throttle","weight":7}`)
+
+	ev, err := DecodeLine(line)
+	if err != nil {
+		t.Fatalf("DecodeLine: %v", err)
+	}
+	if ev.Kind != KindSample {
+		t.Fatalf("kind=%q want %q", ev.Kind, KindSample)
+	}
+	if ev.Sample.KernelName != "flash_attn_fwd" {
+		t.Fatalf("kernel=%q", ev.Sample.KernelName)
+	}
+	if ev.Sample.StallReason != "memory_throttle" {
+		t.Fatalf("stall=%q", ev.Sample.StallReason)
+	}
+	if ev.Sample.Weight != 7 {
+		t.Fatalf("weight=%d", ev.Sample.Weight)
+	}
+}
+
+func TestDecodeRejectsMalformedJSON(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kind":"launch"`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeRejectsUnknownKind(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kind":"mystery","time_ns":100}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeRejectsMissingKind(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kernel_name":"flash_attn_fwd","time_ns":100}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeRejectsMissingKindPayload(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kind":"launch","time_ns":100}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeRejectsBadTimestampType(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kind":"launch","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":"100"}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}

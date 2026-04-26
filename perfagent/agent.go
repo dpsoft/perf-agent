@@ -16,6 +16,7 @@ import (
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
+	"github.com/dpsoft/perf-agent/gpu/backend/stream"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -92,11 +93,15 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 func (c *Config) validate() error {
-	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.GPUReplayInput == "" {
-		return errors.New("at least one of CPU profile, off-CPU profile, or PMU must be enabled")
+	if c.gpuSourceCount() > 1 {
+		return errors.New("gpu source options are mutually exclusive")
 	}
 
-	if c.GPUReplayInput == "" {
+	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.gpuSourceCount() == 0 {
+		return errors.New("at least one of CPU profile, off-CPU profile, PMU, or a GPU source must be enabled")
+	}
+
+	if c.gpuSourceCount() == 0 {
 		if c.PID == 0 && !c.SystemWide {
 			return errors.New("either PID or system-wide is required")
 		}
@@ -119,6 +124,17 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func (c *Config) gpuSourceCount() int {
+	count := 0
+	if c.GPUReplayInput != "" {
+		count++
+	}
+	if c.GPUStreamInput != nil {
+		count++
+	}
+	return count
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -128,13 +144,13 @@ func (a *Agent) Start(ctx context.Context) error {
 		return errors.New("agent already started")
 	}
 
-	gpuOnly := a.config.GPUReplayInput != "" && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
+	gpuOnly := a.config.gpuSourceCount() == 1 && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
 	if gpuOnly {
-		replayBackend, err := replay.New(a.config.GPUReplayInput)
+		gpuBackend, err := a.newGPUBackend()
 		if err != nil {
-			return fmt.Errorf("create GPU replay backend: %w", err)
+			return fmt.Errorf("create GPU backend: %w", err)
 		}
-		a.gpuManager = gpu.NewManager([]gpu.Backend{replayBackend}, nil)
+		a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, nil)
 		if err := a.gpuManager.Start(ctx); err != nil {
 			a.cleanup()
 			return fmt.Errorf("start GPU manager: %w", err)
@@ -271,6 +287,17 @@ func (a *Agent) Start(ctx context.Context) error {
 	return nil
 }
 
+func (a *Agent) newGPUBackend() (gpu.Backend, error) {
+	switch {
+	case a.config.GPUReplayInput != "":
+		return replay.New(a.config.GPUReplayInput)
+	case a.config.GPUStreamInput != nil:
+		return stream.New(a.config.GPUStreamInput), nil
+	default:
+		return nil, errors.New("no gpu source configured")
+	}
+}
+
 // Stop stops data collection and writes profiles.
 func (a *Agent) Stop(ctx context.Context) error {
 	a.mu.Lock()
@@ -326,6 +353,10 @@ func (a *Agent) Stop(ctx context.Context) error {
 	}
 
 	if a.gpuManager != nil {
+		if err := a.gpuManager.Stop(ctx); err != nil {
+			log.Printf("Failed to stop GPU manager: %v", err)
+			lastErr = err
+		}
 		snapshot := a.gpuManager.Snapshot()
 		if err := a.writeGPURaw(snapshot); err != nil {
 			log.Printf("Failed to write GPU raw output: %v", err)

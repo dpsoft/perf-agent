@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,6 +49,10 @@ func TestConfigValidation(t *testing.T) {
 			opts: []Option{WithSystemWide(), WithOffCPUProfile("")},
 		},
 		{
+			name: "valid GPU stream mode",
+			opts: []Option{WithGPUStreamInput(strings.NewReader(""))},
+		},
+		{
 			name:    "per-pid requires system-wide",
 			opts:    []Option{WithPID(1), WithPMU(), WithPerPID()},
 			wantErr: "per-PID requires system-wide",
@@ -56,6 +61,14 @@ func TestConfigValidation(t *testing.T) {
 			name:    "per-pid requires PMU",
 			opts:    []Option{WithSystemWide(), WithCPUProfile(""), WithPerPID()},
 			wantErr: "per-PID is only valid with PMU",
+		},
+		{
+			name: "rejects multiple GPU sources",
+			opts: []Option{
+				WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "flash_attn.json")),
+				WithGPUStreamInput(strings.NewReader("")),
+			},
+			wantErr: "gpu source",
 		},
 	}
 
@@ -206,4 +219,26 @@ func TestAgentGPUReplayMode(t *testing.T) {
 	ctx := t.Context()
 	require.NoError(t, agent.Start(ctx))
 	require.NoError(t, agent.Stop(ctx))
+}
+
+func TestAgentGPUStreamMode(t *testing.T) {
+	var raw bytes.Buffer
+	var profile bytes.Buffer
+
+	agent, err := New(
+		WithGPUStreamInput(strings.NewReader(
+			"{\"kind\":\"launch\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":100}\n" +
+				"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n" +
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
+		)),
+		WithGPURawOutput(&raw),
+		WithGPUProfileOutput(&profile),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	assert.Contains(t, raw.String(), "flash_attn_fwd")
+	assert.NotZero(t, profile.Len())
 }

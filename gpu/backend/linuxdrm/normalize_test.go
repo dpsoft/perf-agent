@@ -1,6 +1,10 @@
 package linuxdrm
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/dpsoft/perf-agent/gpu"
+)
 
 func TestNormalizeRecord(t *testing.T) {
 	event, err := normalizeRecord(rawRecord{
@@ -58,5 +62,59 @@ func TestNormalizeRecord(t *testing.T) {
 func TestNormalizeRecordRejectsUnknownKind(t *testing.T) {
 	if _, err := normalizeRecord(rawRecord{}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestNormalizeSchedRunqRecord(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:    recordKindSchedRunq,
+		PID:     123,
+		TID:     124,
+		StartNs: 1000,
+		EndNs:   1150,
+		CPU:     7,
+		AuxNs:   150,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Kind != gpu.TimelineEventWait {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if event.Name != "sched-runq-latency" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.TimeNs != 1000 || event.DurationNs != 150 {
+		t.Fatalf("timing=%#v", event)
+	}
+	if got := event.Attributes["cpu"]; got != "7" {
+		t.Fatalf("cpu=%q", got)
+	}
+}
+
+func TestNormalizeSchedWakeupRecord(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:    recordKindSchedWakeup,
+		PID:     123,
+		TID:     124,
+		StartNs: 1000,
+		CPU:     5,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Kind != gpu.TimelineEventWait {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if event.Name != "sched-wakeup" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.DurationNs != 0 {
+		t.Fatalf("duration=%d", event.DurationNs)
+	}
+	if got := event.Attributes["cpu"]; got != "5" {
+		t.Fatalf("cpu=%q", got)
 	}
 }

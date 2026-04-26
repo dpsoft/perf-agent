@@ -33,6 +33,9 @@ type Backend struct {
 	reader  *ringbuf.Reader
 	enterTP link.Link
 	exitTP  link.Link
+	wakeup  link.Link
+	wakeupN link.Link
+	switchT link.Link
 }
 
 func New(cfg Config) (*Backend, error) {
@@ -130,6 +133,9 @@ func (b *Backend) Close() error {
 	return errors.Join(
 		closeLink(b.enterTP),
 		closeLink(b.exitTP),
+		closeLink(b.wakeup),
+		closeLink(b.wakeupN),
+		closeLink(b.switchT),
 		closeObjects(b.objs),
 	)
 }
@@ -172,8 +178,35 @@ func (b *Backend) openLive() error {
 		_ = objs.Close()
 		return err
 	}
+	wakeup, err := link.AttachTracing(link.TracingOptions{Program: objs.WakeupProgram()})
+	if err != nil {
+		_ = exitTP.Close()
+		_ = enterTP.Close()
+		_ = objs.Close()
+		return err
+	}
+	wakeupN, err := link.AttachTracing(link.TracingOptions{Program: objs.WakeupNewProgram()})
+	if err != nil {
+		_ = wakeup.Close()
+		_ = exitTP.Close()
+		_ = enterTP.Close()
+		_ = objs.Close()
+		return err
+	}
+	switchT, err := link.AttachTracing(link.TracingOptions{Program: objs.SwitchProgram()})
+	if err != nil {
+		_ = wakeupN.Close()
+		_ = wakeup.Close()
+		_ = exitTP.Close()
+		_ = enterTP.Close()
+		_ = objs.Close()
+		return err
+	}
 	reader, err := ringbuf.NewReader(objs.EventsMap())
 	if err != nil {
+		_ = switchT.Close()
+		_ = wakeupN.Close()
+		_ = wakeup.Close()
 		_ = exitTP.Close()
 		_ = enterTP.Close()
 		_ = objs.Close()
@@ -183,6 +216,9 @@ func (b *Backend) openLive() error {
 	b.objs = objs
 	b.enterTP = enterTP
 	b.exitTP = exitTP
+	b.wakeup = wakeup
+	b.wakeupN = wakeupN
+	b.switchT = switchT
 	b.reader = reader
 	return nil
 }

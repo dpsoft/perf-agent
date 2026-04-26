@@ -34,6 +34,18 @@ func (o *Objects) ExitProgram() *ebpf.Program {
 	return o.objs.HandleExitIoctl
 }
 
+func (o *Objects) WakeupProgram() *ebpf.Program {
+	return o.objs.HandleSchedWakeup
+}
+
+func (o *Objects) WakeupNewProgram() *ebpf.Program {
+	return o.objs.HandleSchedWakeupNew
+}
+
+func (o *Objects) SwitchProgram() *ebpf.Program {
+	return o.objs.HandleSchedSwitch
+}
+
 func (o *Objects) EventsMap() *ebpf.Map {
 	return o.objs.Events
 }

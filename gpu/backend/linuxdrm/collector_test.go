@@ -97,19 +97,37 @@ func TestStopPropagatesRunError(t *testing.T) {
 func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 	b, err := New(Config{
 		PID: 123,
-		testRecords: []rawRecord{{
-			Kind:        recordKindIOCtl,
-			PID:         123,
-			TID:         124,
-			FD:          9,
-			Command:     0xc04064,
-			ResultCode:  0,
-			StartNs:     1000,
-			EndNs:       1200,
-			DeviceMajor: 226,
-			DeviceMinor: 128,
-			Inode:       77,
-		}},
+		testRecords: []rawRecord{
+			{
+				Kind:        recordKindIOCtl,
+				PID:         123,
+				TID:         124,
+				FD:          9,
+				Command:     0xc04064,
+				ResultCode:  0,
+				StartNs:     1000,
+				EndNs:       1200,
+				DeviceMajor: 226,
+				DeviceMinor: 128,
+				Inode:       77,
+			},
+			{
+				Kind:    recordKindSchedWakeup,
+				PID:     123,
+				TID:     124,
+				StartNs: 2000,
+				CPU:     5,
+			},
+			{
+				Kind:    recordKindSchedRunq,
+				PID:     123,
+				TID:     124,
+				StartNs: 2000,
+				EndNs:   2200,
+				CPU:     5,
+				AuxNs:   200,
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -123,10 +141,16 @@ func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	if len(sink.events) != 1 {
+	if len(sink.events) != 3 {
 		t.Fatalf("events=%d", len(sink.events))
 	}
 	if sink.events[0].Kind != gpu.TimelineEventIOCtl {
 		t.Fatalf("kind=%q", sink.events[0].Kind)
+	}
+	if sink.events[1].Name != "sched-wakeup" {
+		t.Fatalf("event[1].name=%q", sink.events[1].Name)
+	}
+	if sink.events[2].Name != "sched-runq-latency" {
+		t.Fatalf("event[2].name=%q", sink.events[2].Name)
 	}
 }

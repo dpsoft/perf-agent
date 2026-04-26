@@ -3,15 +3,19 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 const volatile __u32 target_pid = 0;
 
 #define MINORBITS 20
 #define MINORMASK ((1U << MINORBITS) - 1)
+#define PF_KTHREAD 0x00200000
 
 enum record_kind {
     RECORD_KIND_UNKNOWN = 0,
     RECORD_KIND_IOCTL = 1,
+    RECORD_KIND_SCHED_WAKEUP = 2,
+    RECORD_KIND_SCHED_RUNQ = 3,
 };
 
 struct inflight_ioctl {
@@ -33,8 +37,11 @@ struct raw_record {
     __u64 start_ns;
     __u64 end_ns;
     __u32 device_minor;
-    __u32 _pad1;
+    __u32 cpu;
     __u64 inode;
+    __u64 aux_ns;
+    __u32 flags;
+    __u32 _pad2;
 };
 
 struct {
@@ -43,6 +50,13 @@ struct {
     __type(key, __u32);
     __type(value, struct inflight_ioctl);
 } inflight SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, __u64);
+} wakeup_ts SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -55,6 +69,19 @@ static __always_inline bool should_trace(__u32 pid)
         return false;
     }
     return pid == target_pid;
+}
+
+static __always_inline bool should_trace_task(struct task_struct *task)
+{
+    __u32 tgid = BPF_CORE_READ(task, tgid);
+    if (!should_trace(tgid)) {
+        return false;
+    }
+    __u32 flags = BPF_CORE_READ(task, flags);
+    if (flags & PF_KTHREAD) {
+        return false;
+    }
+    return true;
 }
 
 static __always_inline __u32 dev_major(__u32 dev)
@@ -105,6 +132,24 @@ static __always_inline void capture_file_identity(__s32 fd, __u32 *major, __u32 
     *major = dev_major(rdev);
     *minor = dev_minor(rdev);
     *inode_num = BPF_CORE_READ(inode, i_ino);
+}
+
+static __always_inline void emit_sched_record(__u8 kind, __u32 pid, __u32 tid, __u64 start_ns, __u64 end_ns, __u32 cpu, __u64 aux_ns)
+{
+    struct raw_record *record = bpf_ringbuf_reserve(&events, sizeof(*record), 0);
+    if (!record) {
+        return;
+    }
+
+    record->kind = kind;
+    record->pid = pid;
+    record->tid = tid;
+    record->start_ns = start_ns;
+    record->end_ns = end_ns;
+    record->cpu = cpu;
+    record->aux_ns = aux_ns;
+
+    bpf_ringbuf_submit(record, 0);
 }
 
 SEC("tracepoint/syscalls/sys_enter_ioctl")
@@ -161,6 +206,68 @@ int handle_exit_ioctl(struct trace_event_raw_sys_exit *ctx)
 
     bpf_ringbuf_submit(record, 0);
     bpf_map_delete_elem(&inflight, &tid);
+    return 0;
+}
+
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(handle_sched_wakeup, struct task_struct *p)
+{
+    if (!should_trace_task(p)) {
+        return 0;
+    }
+
+    __u32 pid = BPF_CORE_READ(p, pid);
+    __u32 tgid = BPF_CORE_READ(p, tgid);
+    __u64 now = bpf_ktime_get_ns();
+    __u32 cpu = bpf_get_smp_processor_id();
+
+    bpf_map_update_elem(&wakeup_ts, &pid, &now, BPF_ANY);
+    emit_sched_record(RECORD_KIND_SCHED_WAKEUP, tgid, pid, now, now, cpu, 0);
+    return 0;
+}
+
+SEC("tp_btf/sched_wakeup_new")
+int BPF_PROG(handle_sched_wakeup_new, struct task_struct *p)
+{
+    if (!should_trace_task(p)) {
+        return 0;
+    }
+
+    __u32 pid = BPF_CORE_READ(p, pid);
+    __u32 tgid = BPF_CORE_READ(p, tgid);
+    __u64 now = bpf_ktime_get_ns();
+    __u32 cpu = bpf_get_smp_processor_id();
+
+    bpf_map_update_elem(&wakeup_ts, &pid, &now, BPF_ANY);
+    emit_sched_record(RECORD_KIND_SCHED_WAKEUP, tgid, pid, now, now, cpu, 0);
+    return 0;
+}
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
+{
+    __u64 now = bpf_ktime_get_ns();
+    __u32 cpu = bpf_get_smp_processor_id();
+
+    if (should_trace_task(next)) {
+        __u32 next_pid = BPF_CORE_READ(next, pid);
+        __u32 next_tgid = BPF_CORE_READ(next, tgid);
+        __u64 *wake_ts = bpf_map_lookup_elem(&wakeup_ts, &next_pid);
+        if (wake_ts) {
+            __u64 lat = now - *wake_ts;
+            emit_sched_record(RECORD_KIND_SCHED_RUNQ, next_tgid, next_pid, *wake_ts, now, cpu, lat);
+            bpf_map_delete_elem(&wakeup_ts, &next_pid);
+        }
+    }
+
+    if (should_trace_task(prev)) {
+        __u32 prev_pid = BPF_CORE_READ(prev, pid);
+        unsigned int prev_state = BPF_CORE_READ(prev, __state);
+        if (preempt || prev_state == 0) {
+            bpf_map_update_elem(&wakeup_ts, &prev_pid, &now, BPF_ANY);
+        }
+    }
+
     return 0;
 }
 

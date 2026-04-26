@@ -18,7 +18,10 @@ func TestDecodeRecord(t *testing.T) {
 		EndNs:       1200,
 		DeviceMajor: 226,
 		DeviceMinor: 128,
+		CPU:         3,
 		Inode:       77,
+		AuxNs:       42,
+		Flags:       7,
 	}
 
 	var buf bytes.Buffer

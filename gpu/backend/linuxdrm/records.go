@@ -11,6 +11,8 @@ type recordKind uint8
 const (
 	recordKindUnknown recordKind = iota
 	recordKindIOCtl
+	recordKindSchedWakeup
+	recordKindSchedRunq
 )
 
 type rawRecord struct {
@@ -25,8 +27,11 @@ type rawRecord struct {
 	StartNs     uint64
 	EndNs       uint64
 	DeviceMinor uint32
-	_           uint32
+	CPU         uint32
 	Inode       uint64
+	AuxNs       uint64
+	Flags       uint32
+	_           uint32
 }
 
 func decodeRecord(data []byte) (rawRecord, error) {

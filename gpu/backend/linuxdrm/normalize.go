@@ -2,6 +2,7 @@ package linuxdrm
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/dpsoft/perf-agent/gpu"
 )
@@ -36,6 +37,35 @@ func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 			Attributes: attrs,
 		}
 		return event, nil
+	case recordKindSchedWakeup:
+		return gpu.GPUTimelineEvent{
+			Backend:    "linuxdrm",
+			Kind:       gpu.TimelineEventWait,
+			Name:       "sched-wakeup",
+			TimeNs:     record.StartNs,
+			PID:        record.PID,
+			TID:        record.TID,
+			Source:     "ebpf",
+			Confidence: "exact",
+			Attributes: map[string]string{
+				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
+			},
+		}, nil
+	case recordKindSchedRunq:
+		return gpu.GPUTimelineEvent{
+			Backend:    "linuxdrm",
+			Kind:       gpu.TimelineEventWait,
+			Name:       "sched-runq-latency",
+			TimeNs:     record.StartNs,
+			DurationNs: record.AuxNs,
+			PID:        record.PID,
+			TID:        record.TID,
+			Source:     "ebpf",
+			Confidence: "exact",
+			Attributes: map[string]string{
+				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
+			},
+		}, nil
 	default:
 		return gpu.GPUTimelineEvent{}, fmt.Errorf("unsupported record kind %d", record.Kind)
 	}

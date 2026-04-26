@@ -63,8 +63,11 @@ type linuxdrmSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type linuxdrmProgramSpecs struct {
-	HandleEnterIoctl *ebpf.ProgramSpec `ebpf:"handle_enter_ioctl"`
-	HandleExitIoctl  *ebpf.ProgramSpec `ebpf:"handle_exit_ioctl"`
+	HandleEnterIoctl     *ebpf.ProgramSpec `ebpf:"handle_enter_ioctl"`
+	HandleExitIoctl      *ebpf.ProgramSpec `ebpf:"handle_exit_ioctl"`
+	HandleSchedSwitch    *ebpf.ProgramSpec `ebpf:"handle_sched_switch"`
+	HandleSchedWakeup    *ebpf.ProgramSpec `ebpf:"handle_sched_wakeup"`
+	HandleSchedWakeupNew *ebpf.ProgramSpec `ebpf:"handle_sched_wakeup_new"`
 }
 
 // linuxdrmMapSpecs contains maps before they are loaded into the kernel.
@@ -73,6 +76,7 @@ type linuxdrmProgramSpecs struct {
 type linuxdrmMapSpecs struct {
 	Events   *ebpf.MapSpec `ebpf:"events"`
 	Inflight *ebpf.MapSpec `ebpf:"inflight"`
+	WakeupTs *ebpf.MapSpec `ebpf:"wakeup_ts"`
 }
 
 // linuxdrmVariableSpecs contains global variables before they are loaded into the kernel.
@@ -104,12 +108,14 @@ func (o *linuxdrmObjects) Close() error {
 type linuxdrmMaps struct {
 	Events   *ebpf.Map `ebpf:"events"`
 	Inflight *ebpf.Map `ebpf:"inflight"`
+	WakeupTs *ebpf.Map `ebpf:"wakeup_ts"`
 }
 
 func (m *linuxdrmMaps) Close() error {
 	return _LinuxdrmClose(
 		m.Events,
 		m.Inflight,
+		m.WakeupTs,
 	)
 }
 
@@ -124,14 +130,20 @@ type linuxdrmVariables struct {
 //
 // It can be passed to loadLinuxdrmObjects or ebpf.CollectionSpec.LoadAndAssign.
 type linuxdrmPrograms struct {
-	HandleEnterIoctl *ebpf.Program `ebpf:"handle_enter_ioctl"`
-	HandleExitIoctl  *ebpf.Program `ebpf:"handle_exit_ioctl"`
+	HandleEnterIoctl     *ebpf.Program `ebpf:"handle_enter_ioctl"`
+	HandleExitIoctl      *ebpf.Program `ebpf:"handle_exit_ioctl"`
+	HandleSchedSwitch    *ebpf.Program `ebpf:"handle_sched_switch"`
+	HandleSchedWakeup    *ebpf.Program `ebpf:"handle_sched_wakeup"`
+	HandleSchedWakeupNew *ebpf.Program `ebpf:"handle_sched_wakeup_new"`
 }
 
 func (p *linuxdrmPrograms) Close() error {
 	return _LinuxdrmClose(
 		p.HandleEnterIoctl,
 		p.HandleExitIoctl,
+		p.HandleSchedSwitch,
+		p.HandleSchedWakeup,
+		p.HandleSchedWakeupNew,
 	)
 }
 

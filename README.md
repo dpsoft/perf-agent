@@ -274,7 +274,8 @@ go run . \
 What this currently provides:
 
 - PID-scoped Linux DRM boundary telemetry
-- normalized `ioctl` lifecycle events in the GPU JSON snapshot
+- normalized DRM `ioctl` lifecycle events in the GPU JSON snapshot
+- scheduler wakeup and runqueue-latency events for the same target PID
 - a real eBPF + ringbuf collector path behind the existing `gpu` manager
 
 Current limits:
@@ -283,7 +284,7 @@ Current limits:
 - `-a/--all` is not supported for this backend
 - raw JSON is the primary output artifact for this mode
 - it needs a Linux host with BPF attach capability and a real `/dev/dri/renderD*` workload to observe
-- it does not yet provide queue/context decoding, device counters, or vendor runtime correlation
+- it does not yet decode vendor-specific submit/wait semantics, queue/context identities, device counters, or vendor runtime correlation
 
 ### PMU output
 

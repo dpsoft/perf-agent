@@ -62,7 +62,7 @@ func runSummary(w io.Writer, paths []string, format string) {
 			os.Exit(3)
 		}
 		writeSummary(w, doc, format)
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 	}
 }
 
@@ -72,11 +72,11 @@ func writeSummary(w io.Writer, d *schema.Document, format string) {
 		os.Exit(4)
 	}
 
-	fmt.Fprintf(w, "# Scenario: `%s`\n\n", d.Scenario)
-	fmt.Fprintf(w, "- **Started:** %s\n", d.StartedAt.UTC().Format("2006-01-02 15:04:05 UTC"))
-	fmt.Fprintf(w, "- **Kernel:** %s · **CPU:** %s · **NCPU:** %d · **Go:** %s · **Commit:** %s\n",
+	_, _ = fmt.Fprintf(w, "# Scenario: `%s`\n\n", d.Scenario)
+	_, _ = fmt.Fprintf(w, "- **Started:** %s\n", d.StartedAt.UTC().Format("2006-01-02 15:04:05 UTC"))
+	_, _ = fmt.Fprintf(w, "- **Kernel:** %s · **CPU:** %s · **NCPU:** %d · **Go:** %s · **Commit:** %s\n",
 		d.System.Kernel, d.System.CPUModel, d.System.NCPU, d.System.GoVersion, d.System.PerfAgentCommit)
-	fmt.Fprintf(w, "- **Config:** processes=%d runs=%d drop_cache=%v\n\n",
+	_, _ = fmt.Fprintf(w, "- **Config:** processes=%d runs=%d drop_cache=%v\n\n",
 		d.Config.Processes, d.Config.Runs, d.Config.DropCache)
 
 	// Wall-time stats.
@@ -85,14 +85,14 @@ func writeSummary(w io.Writer, d *schema.Document, format string) {
 		totals = append(totals, r.TotalMs)
 	}
 	p50, p95, max := stats(totals)
-	fmt.Fprintln(w, "## Wall time (newSession startup)")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| metric | value (ms) |")
-	fmt.Fprintln(w, "|--------|-----------|")
-	fmt.Fprintf(w, "| p50 | %.1f |\n", p50)
-	fmt.Fprintf(w, "| p95 | %.1f |\n", p95)
-	fmt.Fprintf(w, "| max | %.1f |\n", max)
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "## Wall time (newSession startup)")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "| metric | value (ms) |")
+	_, _ = fmt.Fprintln(w, "|--------|-----------|")
+	_, _ = fmt.Fprintf(w, "| p50 | %.1f |\n", p50)
+	_, _ = fmt.Fprintf(w, "| p95 | %.1f |\n", p95)
+	_, _ = fmt.Fprintf(w, "| max | %.1f |\n", max)
+	_, _ = fmt.Fprintln(w)
 
 	// Top binaries by median compile_ms.
 	type agg struct {
@@ -124,12 +124,12 @@ func writeSummary(w io.Writer, d *schema.Document, format string) {
 		rows = rows[:n]
 	}
 
-	fmt.Fprintln(w, "## Top binaries by median compile_ms")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| binary | build_id | eh_frame_bytes | median compile_ms |")
-	fmt.Fprintln(w, "|--------|----------|----------------|-------------------|")
+	_, _ = fmt.Fprintln(w, "## Top binaries by median compile_ms")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "| binary | build_id | eh_frame_bytes | median compile_ms |")
+	_, _ = fmt.Fprintln(w, "|--------|----------|----------------|-------------------|")
 	for _, a := range rows {
-		fmt.Fprintf(w, "| `%s` | `%s` | %d | %.2f |\n", a.path, shortID(a.buildID), a.bytes, median(a.samples))
+		_, _ = fmt.Fprintf(w, "| `%s` | `%s` | %d | %.2f |\n", a.path, shortID(a.buildID), a.bytes, median(a.samples))
 	}
 }
 
@@ -193,16 +193,16 @@ func runDiff(w io.Writer, beforePath, afterPath, format string) {
 	bStd := stddev(bTotals)
 	aStd := stddev(aTotals)
 
-	fmt.Fprintf(w, "# Diff: `%s` → `%s`\n\n", beforePath, afterPath)
-	fmt.Fprintln(w, "## Wall time")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| metric | before (ms) | after (ms) | Δ% | noise (±ms, max stddev) |")
-	fmt.Fprintln(w, "|--------|-------------|-----------|----|-------------------------|")
-	fmt.Fprintf(w, "| p50 | %.1f | %.1f | %s | %.1f |\n",
+	_, _ = fmt.Fprintf(w, "# Diff: `%s` → `%s`\n\n", beforePath, afterPath)
+	_, _ = fmt.Fprintln(w, "## Wall time")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "| metric | before (ms) | after (ms) | Δ% | noise (±ms, max stddev) |")
+	_, _ = fmt.Fprintln(w, "|--------|-------------|-----------|----|-------------------------|")
+	_, _ = fmt.Fprintf(w, "| p50 | %.1f | %.1f | %s | %.1f |\n",
 		bP50, aP50, deltaPct(bP50, aP50), maxF(bStd, aStd))
-	fmt.Fprintf(w, "| p95 | %.1f | %.1f | %s | %.1f |\n",
+	_, _ = fmt.Fprintf(w, "| p95 | %.1f | %.1f | %s | %.1f |\n",
 		bP95, aP95, deltaPct(bP95, aP95), maxF(bStd, aStd))
-	fmt.Fprintf(w, "| max | %.1f | %.1f | %s | %.1f |\n",
+	_, _ = fmt.Fprintf(w, "| max | %.1f | %.1f | %s | %.1f |\n",
 		bMax, aMax, deltaPct(bMax, aMax), maxF(bStd, aStd))
 }
 
@@ -211,7 +211,7 @@ func readDoc(path string) (*schema.Document, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return schema.Read(f)
 }
 

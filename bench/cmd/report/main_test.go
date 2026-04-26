@@ -106,7 +106,7 @@ func writeTempJSON(t *testing.T, d *schema.Document) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := schema.Write(f, d); err != nil {
 		t.Fatal(err)
 	}

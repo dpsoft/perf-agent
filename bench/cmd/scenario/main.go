@@ -82,11 +82,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("create %s: %v", out, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := schema.Write(f, doc); err != nil {
 		log.Fatalf("write %s: %v", out, err)
 	}
-	fmt.Fprintf(os.Stdout, "wrote %s\n", out)
+	_, _ = fmt.Fprintf(os.Stdout, "wrote %s\n", out)
 }
 
 // runPIDLarge spawns one Rust workload, attaches dwarfagent --pid,
@@ -101,7 +101,7 @@ func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache b
 	if err != nil {
 		log.Fatalf("spawn fleet: %v", err)
 	}
-	defer flt.Stop()
+	defer func() { _ = flt.Stop() }()
 
 	if err := flt.Wait(10 * time.Second); err != nil {
 		log.Fatalf("fleet wait: %v", err)
@@ -173,7 +173,7 @@ func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, run
 	if err != nil {
 		log.Fatalf("spawn fleet: %v", err)
 	}
-	defer flt.Stop()
+	defer func() { _ = flt.Stop() }()
 
 	if err := flt.Wait(10 * time.Second); err != nil {
 		log.Fatalf("fleet wait: %v", err)

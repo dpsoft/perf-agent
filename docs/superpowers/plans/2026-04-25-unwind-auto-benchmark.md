@@ -1007,14 +1007,14 @@ import (
 - [ ] **Step 3: Build the test binary and setcap it**
 
 ```bash
-GOTOOLCHAIN=auto CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" go test -c -o /tmp/dwarfagent.test ./unwind/dwarfagent/
-sudo setcap cap_perfmon,cap_bpf,cap_sys_admin,cap_sys_ptrace,cap_checkpoint_restore+ep /tmp/dwarfagent.test
+GOTOOLCHAIN=auto CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" go test -c -o ./unwind/dwarfagent/dwarfagent.test ./unwind/dwarfagent/
+sudo setcap cap_perfmon,cap_bpf,cap_sys_admin,cap_sys_ptrace,cap_checkpoint_restore+ep ./unwind/dwarfagent/dwarfagent.test
 ```
 
 - [ ] **Step 4: Run the new test**
 
 ```bash
-/tmp/dwarfagent.test -test.v -test.run TestNewProfilerWithHooks_FiresOnCompile
+./unwind/dwarfagent/dwarfagent.test -test.v -test.run TestNewProfilerWithHooks_FiresOnCompile
 ```
 
 Expected: PASS. Output includes the `t.Logf` line showing fires > 0.

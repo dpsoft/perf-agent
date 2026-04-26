@@ -259,6 +259,32 @@ This path is still not a real `uprobes` collector or vendor callback backend. It
 - host launch to GPU execution correlation
 - reuse of the existing mixed CPU+GPU `pprof` projection
 
+### Experimental Linux DRM lifecycle backend
+
+There is also an experimental Linux-first GPU lifecycle backend. It traces `ioctl` activity for a single target PID, emits normalized lifecycle events into the GPU timeline, and writes the raw JSON snapshot through the existing GPU export path.
+
+```bash
+go run . \
+  --pid 12345 \
+  --gpu-linux-drm \
+  --gpu-raw-output /tmp/gpu-linuxdrm.json \
+  --duration 5s
+```
+
+What this currently provides:
+
+- PID-scoped Linux DRM boundary telemetry
+- normalized `ioctl` lifecycle events in the GPU JSON snapshot
+- a real eBPF + ringbuf collector path behind the existing `gpu` manager
+
+Current limits:
+
+- `--pid` is required
+- `-a/--all` is not supported for this backend
+- raw JSON is the primary output artifact for this mode
+- it needs a Linux host with BPF attach capability and a real `/dev/dri/renderD*` workload to observe
+- it does not yet provide queue/context decoding, device counters, or vendor runtime correlation
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

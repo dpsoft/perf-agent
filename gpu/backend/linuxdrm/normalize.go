@@ -2,7 +2,6 @@ package linuxdrm
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/dpsoft/perf-agent/gpu"
 )
@@ -11,11 +10,20 @@ func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 	switch record.Kind {
 	case recordKindIOCtl:
 		device, attrs := classifyFileIdentity(record)
-		attrs["command"] = strconv.FormatUint(record.Command, 10)
+		for key, value := range ioctlAttributes(record.Command) {
+			attrs[key] = value
+		}
+		name := "ioctl"
+		switch attrs["node_class"] {
+		case "render":
+			name = "drm-render-ioctl"
+		case "card":
+			name = "drm-card-ioctl"
+		}
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventIOCtl,
-			Name:       "ioctl",
+			Name:       name,
 			TimeNs:     record.StartNs,
 			DurationNs: duration(record.StartNs, record.EndNs),
 			PID:        record.PID,

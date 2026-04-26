@@ -28,6 +28,7 @@ var (
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
+	flagGPUHostReplayInput = flag.String("gpu-host-replay-input", "", "Experimental: replay host launch attribution from a JSON fixture")
 	flagGPUReplayInput  = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
 	flagGPUStreamStdin = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
 	flagGPURawOutput    = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
@@ -113,6 +114,7 @@ func main() {
 
 func buildOptions() []perfagent.Option {
 	var opts []perfagent.Option
+	gpuHostReplayMode := *flagGPUHostReplayInput != ""
 	gpuReplayMode := *flagGPUReplayInput != ""
 	gpuStreamMode := *flagGPUStreamStdin
 
@@ -182,6 +184,9 @@ func buildOptions() []perfagent.Option {
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
 		}
+	}
+	if gpuHostReplayMode {
+		opts = append(opts, perfagent.WithGPUHostReplayInput(*flagGPUHostReplayInput))
 	}
 	if gpuStreamMode {
 		opts = append(opts, perfagent.WithGPUStreamInput(os.Stdin))

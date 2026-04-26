@@ -17,6 +17,8 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
 	"github.com/dpsoft/perf-agent/gpu/backend/stream"
+	hostsource "github.com/dpsoft/perf-agent/gpu/host"
+	hostreplay "github.com/dpsoft/perf-agent/gpu/host/replay"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -69,6 +71,7 @@ type Agent struct {
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
 	gpuManager     *gpu.Manager
+	hostSource     hostsource.HostSource
 
 	mu      sync.Mutex
 	started bool
@@ -96,12 +99,18 @@ func (c *Config) validate() error {
 	if c.gpuSourceCount() > 1 {
 		return errors.New("gpu source options are mutually exclusive")
 	}
-
-	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.gpuSourceCount() == 0 {
-		return errors.New("at least one of CPU profile, off-CPU profile, PMU, or a GPU source must be enabled")
+	if c.hostSourceCount() > 1 {
+		return errors.New("gpu host source options are mutually exclusive")
 	}
 
-	if c.gpuSourceCount() == 0 {
+	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
+		return errors.New("at least one of CPU profile, off-CPU profile, PMU, a GPU source, or a GPU host source must be enabled")
+	}
+	if c.hostSourceCount() > 0 && c.gpuSourceCount() == 0 {
+		return errors.New("gpu host source requires a gpu source")
+	}
+
+	if c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
 		if c.PID == 0 && !c.SystemWide {
 			return errors.New("either PID or system-wide is required")
 		}
@@ -135,6 +144,14 @@ func (c *Config) gpuSourceCount() int {
 	return count
 }
 
+func (c *Config) hostSourceCount() int {
+	count := 0
+	if c.GPUHostReplayInput != "" {
+		count++
+	}
+	return count
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -144,8 +161,8 @@ func (a *Agent) Start(ctx context.Context) error {
 		return errors.New("agent already started")
 	}
 
-	gpuOnly := a.config.gpuSourceCount() == 1 && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
-	if gpuOnly {
+	gpuMode := a.config.gpuSourceCount() == 1 && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
+	if gpuMode {
 		gpuBackend, err := a.newGPUBackend()
 		if err != nil {
 			return fmt.Errorf("create GPU backend: %w", err)
@@ -154,6 +171,18 @@ func (a *Agent) Start(ctx context.Context) error {
 		if err := a.gpuManager.Start(ctx); err != nil {
 			a.cleanup()
 			return fmt.Errorf("start GPU manager: %w", err)
+		}
+		if a.config.hostSourceCount() == 1 {
+			hostSource, err := a.newHostSource()
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create host source: %w", err)
+			}
+			a.hostSource = hostSource
+			if err := a.hostSource.Start(ctx, hostsource.NewLaunchSink(a.gpuManager)); err != nil {
+				a.cleanup()
+				return fmt.Errorf("start host source: %w", err)
+			}
 		}
 		a.started = true
 		return nil
@@ -298,6 +327,15 @@ func (a *Agent) newGPUBackend() (gpu.Backend, error) {
 	}
 }
 
+func (a *Agent) newHostSource() (hostsource.HostSource, error) {
+	switch {
+	case a.config.GPUHostReplayInput != "":
+		return hostreplay.New(a.config.GPUHostReplayInput)
+	default:
+		return nil, errors.New("no gpu host source configured")
+	}
+}
+
 // Stop stops data collection and writes profiles.
 func (a *Agent) Stop(ctx context.Context) error {
 	a.mu.Lock()
@@ -353,6 +391,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 	}
 
 	if a.gpuManager != nil {
+		if a.hostSource != nil {
+			if err := a.hostSource.Stop(ctx); err != nil {
+				log.Printf("Failed to stop GPU host source: %v", err)
+				lastErr = err
+			}
+		}
 		if err := a.gpuManager.Stop(ctx); err != nil {
 			log.Printf("Failed to stop GPU manager: %v", err)
 			lastErr = err
@@ -410,6 +454,10 @@ func (a *Agent) cleanup() {
 	if a.pmuMonitor != nil {
 		a.pmuMonitor.Close()
 		a.pmuMonitor = nil
+	}
+	if a.hostSource != nil {
+		_ = a.hostSource.Close()
+		a.hostSource = nil
 	}
 	if a.gpuManager != nil {
 		_ = a.gpuManager.Close()

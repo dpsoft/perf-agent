@@ -65,6 +65,9 @@ type Config struct {
 	// GPUReplayInput is a fixture path for the experimental replay backend.
 	GPUReplayInput string
 
+	// GPUHostReplayInput is a fixture path for the experimental host replay source.
+	GPUHostReplayInput string
+
 	// GPUStreamInput is a live normalized GPU NDJSON stream.
 	GPUStreamInput io.Reader
 
@@ -201,6 +204,12 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 func WithGPUReplayInput(path string) Option {
 	return func(c *Config) {
 		c.GPUReplayInput = path
+	}
+}
+
+func WithGPUHostReplayInput(path string) Option {
+	return func(c *Config) {
+		c.GPUHostReplayInput = path
 	}
 }
 

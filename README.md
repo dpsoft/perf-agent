@@ -235,6 +235,30 @@ This is still a bridge layer, not a vendor runtime integration. It is meant to v
 - NDJSON decode and validation
 - reuse of the existing GPU manager, JSON export, and `pprof` projection
 
+### Experimental host replay plus GPU stream pipeline
+
+There is also an experimental host-correlation validation path. It replays CPU-side launch attribution from a fixture, combines that with a live GPU NDJSON execution stream, and validates that the final JSON snapshot and synthetic-frame `pprof` output include CPU launch frames joined to GPU execution.
+
+```bash
+cat <<'EOF' | go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
+  --gpu-stream-stdin \
+  --gpu-raw-output /tmp/gpu-host-raw.json \
+  --gpu-profile-output /tmp/gpu-host.pb.gz \
+  --duration 1ms
+{"kind":"exec","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","start_ns":120,"end_ns":200}
+{"kind":"sample","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":150,"stall_reason":"memory_throttle","weight":7}
+EOF
+
+go tool pprof /tmp/gpu-host.pb.gz
+```
+
+This path is still not a real `uprobes` collector or vendor callback backend. It is intended to validate:
+
+- canonical host launch normalization
+- host launch to GPU execution correlation
+- reuse of the existing mixed CPU+GPU `pprof` projection
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

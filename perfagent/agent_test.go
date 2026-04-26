@@ -53,6 +53,13 @@ func TestConfigValidation(t *testing.T) {
 			opts: []Option{WithGPUStreamInput(strings.NewReader(""))},
 		},
 		{
+			name: "valid GPU host replay plus stream mode",
+			opts: []Option{
+				WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+				WithGPUStreamInput(strings.NewReader("")),
+			},
+		},
+		{
 			name:    "per-pid requires system-wide",
 			opts:    []Option{WithPID(1), WithPMU(), WithPerPID()},
 			wantErr: "per-PID requires system-wide",
@@ -240,5 +247,28 @@ func TestAgentGPUStreamMode(t *testing.T) {
 	require.NoError(t, agent.Start(ctx))
 	require.NoError(t, agent.Stop(ctx))
 	assert.Contains(t, raw.String(), "flash_attn_fwd")
+	assert.NotZero(t, profile.Len())
+}
+
+func TestAgentHostReplayPlusGPUStreamMode(t *testing.T) {
+	var raw bytes.Buffer
+	var profile bytes.Buffer
+
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+		WithGPUStreamInput(strings.NewReader(
+			"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n" +
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
+		)),
+		WithGPURawOutput(&raw),
+		WithGPUProfileOutput(&profile),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	assert.Contains(t, raw.String(), "flash_attn_fwd")
+	assert.Contains(t, raw.String(), "train_step")
 	assert.NotZero(t, profile.Len())
 }

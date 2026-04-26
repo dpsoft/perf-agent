@@ -1,0 +1,24 @@
+[
+  {
+    "backend": "stream",
+    "pid": 4242,
+    "tid": 4243,
+    "time_ns": 100,
+    "cpu_stack": [
+      {
+        "Name": "train_step"
+      },
+      {
+        "Name": "cudaLaunchKernel"
+      }
+    ],
+    "kernel_name": "flash_attn_fwd",
+    "queue_id": "q7",
+    "context_id": "ctx0",
+    "correlation_id": "c1",
+    "tags": {
+      "env": "test"
+    },
+    "source": "host-replay"
+  }
+]

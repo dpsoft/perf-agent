@@ -10,6 +10,10 @@ import (
 const drmMajor = 226
 
 func classifyFileIdentity(record rawRecord) (*gpu.GPUDeviceRef, map[string]string) {
+	return classifyFileIdentityWithLookup(record, lookupDRMDeviceInfo)
+}
+
+func classifyFileIdentityWithLookup(record rawRecord, lookup func(uint32, uint32) (drmDeviceInfo, bool)) (*gpu.GPUDeviceRef, map[string]string) {
 	attrs := map[string]string{
 		"device_major": strconv.FormatUint(uint64(record.DeviceMajor), 10),
 		"device_minor": strconv.FormatUint(uint64(record.DeviceMinor), 10),
@@ -31,6 +35,16 @@ func classifyFileIdentity(record rawRecord) (*gpu.GPUDeviceRef, map[string]strin
 	deviceID := fmt.Sprintf("%d:%d:%d", record.DeviceMajor, record.DeviceMinor, record.Inode)
 	attrs["device_id"] = deviceID
 	attrs["node_class"] = nodeClass
+	if lookup != nil {
+		if info, ok := lookup(record.DeviceMajor, record.DeviceMinor); ok {
+			if info.Driver != "" {
+				attrs["driver"] = info.Driver
+			}
+			if info.Node != "" {
+				attrs["drm_node"] = info.Node
+			}
+		}
+	}
 
 	return &gpu.GPUDeviceRef{
 		Backend:  "linuxdrm",

@@ -277,6 +277,7 @@ What this currently provides:
 - normalized DRM `ioctl` lifecycle events in the GPU JSON snapshot
 - conservative semantic naming for recognizable DRM core calls such as sync waits, PRIME imports/exports, and generic driver-command buckets
 - scheduler wakeup and runqueue-latency events for the same target PID
+- stable device attrs, with open-driver enrichment when `/sys/dev/char` exposes a DRM node and bound kernel driver
 - a real eBPF + ringbuf collector path behind the existing `gpu` manager
 
 Current limits:

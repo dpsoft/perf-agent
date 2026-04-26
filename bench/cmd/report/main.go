@@ -165,8 +165,96 @@ func shortID(s string) string {
 	return s
 }
 
-// runDiff is implemented in Task 10.
 func runDiff(w io.Writer, beforePath, afterPath, format string) {
-	fmt.Fprintln(os.Stderr, "diff mode not yet implemented (see Task 10)")
-	os.Exit(5)
+	if format != "markdown" {
+		fmt.Fprintln(os.Stderr, "csv diff is not implemented in v1")
+		os.Exit(4)
+	}
+	before, err := readDoc(beforePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(3)
+	}
+	after, err := readDoc(afterPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(3)
+	}
+
+	if before.Scenario != after.Scenario {
+		fmt.Fprintf(os.Stderr, "warning: scenario differs (%q vs %q); diff may be misleading\n",
+			before.Scenario, after.Scenario)
+	}
+
+	bTotals := totalsOf(before)
+	aTotals := totalsOf(after)
+	bP50, bP95, bMax := stats(append([]float64{}, bTotals...))
+	aP50, aP95, aMax := stats(append([]float64{}, aTotals...))
+	bStd := stddev(bTotals)
+	aStd := stddev(aTotals)
+
+	fmt.Fprintf(w, "# Diff: `%s` → `%s`\n\n", beforePath, afterPath)
+	fmt.Fprintln(w, "## Wall time")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "| metric | before (ms) | after (ms) | Δ% | noise (±ms, max stddev) |")
+	fmt.Fprintln(w, "|--------|-------------|-----------|----|-------------------------|")
+	fmt.Fprintf(w, "| p50 | %.1f | %.1f | %s | %.1f |\n",
+		bP50, aP50, deltaPct(bP50, aP50), maxF(bStd, aStd))
+	fmt.Fprintf(w, "| p95 | %.1f | %.1f | %s | %.1f |\n",
+		bP95, aP95, deltaPct(bP95, aP95), maxF(bStd, aStd))
+	fmt.Fprintf(w, "| max | %.1f | %.1f | %s | %.1f |\n",
+		bMax, aMax, deltaPct(bMax, aMax), maxF(bStd, aStd))
+}
+
+func readDoc(path string) (*schema.Document, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	return schema.Read(f)
+}
+
+func totalsOf(d *schema.Document) []float64 {
+	out := make([]float64, len(d.Runs))
+	for i, r := range d.Runs {
+		out[i] = r.TotalMs
+	}
+	return out
+}
+
+func stddev(xs []float64) float64 {
+	if len(xs) <= 1 {
+		return 0
+	}
+	var sum float64
+	for _, x := range xs {
+		sum += x
+	}
+	mean := sum / float64(len(xs))
+	var ss float64
+	for _, x := range xs {
+		d := x - mean
+		ss += d * d
+	}
+	return math.Sqrt(ss / float64(len(xs)-1))
+}
+
+func deltaPct(before, after float64) string {
+	if before == 0 {
+		return "n/a"
+	}
+	pct := (after - before) / before * 100
+	sign := "+"
+	if pct < 0 {
+		sign = ""
+	}
+	return fmt.Sprintf("%s%.1f%%", sign, pct)
+}
+
+func maxF(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

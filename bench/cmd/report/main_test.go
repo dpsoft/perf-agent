@@ -64,3 +64,51 @@ func TestWriteSummary_Markdown(t *testing.T) {
 		t.Errorf("missing /bin/foo row")
 	}
 }
+
+func TestRunDiff_Markdown(t *testing.T) {
+	mkDoc := func(scenario string, runs []float64) *schema.Document {
+		d := &schema.Document{
+			SchemaVersion: schema.SchemaVersion,
+			Scenario:      scenario,
+			Config:        schema.Config{Runs: len(runs)},
+			System:        schema.System{Kernel: "x"},
+			StartedAt:     time.Now(),
+		}
+		for i, ms := range runs {
+			d.Runs = append(d.Runs, schema.Run{RunN: i + 1, TotalMs: ms})
+		}
+		return d
+	}
+
+	beforeF := writeTempJSON(t, mkDoc("system-wide-mixed", []float64{1000, 1100, 950}))
+	afterF := writeTempJSON(t, mkDoc("system-wide-mixed", []float64{800, 850, 870}))
+
+	var got bytes.Buffer
+	runDiff(&got, beforeF, afterF, "markdown")
+
+	out := got.String()
+	for _, want := range []string{"# Diff:", "## Wall time", "| p50 |", "Δ%"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q\n%s", want, out)
+		}
+	}
+	// p50: before=1000, after=850, Δ = -15%.
+	if !strings.Contains(out, "-15.0%") {
+		t.Errorf("expected -15.0%% somewhere in p50 row; got:\n%s", out)
+	}
+}
+
+func writeTempJSON(t *testing.T, d *schema.Document) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "doc.json")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := schema.Write(f, d); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

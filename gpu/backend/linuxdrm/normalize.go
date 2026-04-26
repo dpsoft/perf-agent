@@ -10,6 +10,8 @@ import (
 func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 	switch record.Kind {
 	case recordKindIOCtl:
+		device, attrs := classifyFileIdentity(record)
+		attrs["command"] = strconv.FormatUint(record.Command, 10)
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventIOCtl,
@@ -20,12 +22,10 @@ func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 			TID:        record.TID,
 			FD:         record.FD,
 			ResultCode: record.ResultCode,
+			Device:     device,
 			Source:     "ebpf",
 			Confidence: "exact",
-			Attributes: map[string]string{
-				"command":   strconv.FormatUint(record.Command, 10),
-				"device_id": strconv.FormatUint(record.DeviceID, 10),
-			},
+			Attributes: attrs,
 		}
 		return event, nil
 	default:

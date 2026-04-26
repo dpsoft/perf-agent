@@ -98,15 +98,17 @@ func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 	b, err := New(Config{
 		PID: 123,
 		testRecords: []rawRecord{{
-			Kind:       recordKindIOCtl,
-			PID:        123,
-			TID:        124,
-			FD:         9,
-			Command:    0xc04064,
-			ResultCode: 0,
-			StartNs:    1000,
-			EndNs:      1200,
-			DeviceID:   77,
+			Kind:        recordKindIOCtl,
+			PID:         123,
+			TID:         124,
+			FD:          9,
+			Command:     0xc04064,
+			ResultCode:  0,
+			StartNs:     1000,
+			EndNs:       1200,
+			DeviceMajor: 226,
+			DeviceMinor: 128,
+			Inode:       77,
 		}},
 	})
 	if err != nil {

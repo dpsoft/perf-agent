@@ -8,15 +8,17 @@ import (
 
 func TestDecodeRecord(t *testing.T) {
 	in := rawRecord{
-		Kind:       recordKindIOCtl,
-		PID:        123,
-		TID:        124,
-		FD:         9,
-		Command:    0xc04064,
-		ResultCode: -11,
-		StartNs:    1000,
-		EndNs:      1200,
-		DeviceID:   77,
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     0xc04064,
+		ResultCode:  -11,
+		StartNs:     1000,
+		EndNs:       1200,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
 	}
 
 	var buf bytes.Buffer

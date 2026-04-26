@@ -14,17 +14,19 @@ const (
 )
 
 type rawRecord struct {
-	Kind       recordKind
-	_          [3]byte
-	PID        uint32
-	TID        uint32
-	FD         int32
-	_          uint32
-	Command    uint64
-	ResultCode int64
-	StartNs    uint64
-	EndNs      uint64
-	DeviceID   uint64
+	Kind        recordKind
+	_           [3]byte
+	PID         uint32
+	TID         uint32
+	FD          int32
+	DeviceMajor uint32
+	Command     uint64
+	ResultCode  int64
+	StartNs     uint64
+	EndNs       uint64
+	DeviceMinor uint32
+	_           uint32
+	Inode       uint64
 }
 
 func decodeRecord(data []byte) (rawRecord, error) {

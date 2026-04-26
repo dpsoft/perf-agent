@@ -2,9 +2,11 @@ package dwarfagent_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +90,81 @@ func TestProfilerEndToEnd(t *testing.T) {
 		}
 		t.Fatalf("no function named *cpu_intensive_work* in pprof; first few: %v", names)
 	}
+}
+
+// TestNewProfilerWithHooks_FiresOnCompile spawns a victim PID and
+// verifies that NewProfilerWithHooks routes per-binary compile events
+// through to the user-supplied OnCompile callback. This is the only
+// end-to-end test of the hook plumbing across NewProfilerWithHooks →
+// newSession → TableStore.AcquireBinary → ehcompile.Compile → OnCompile.
+func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
+	if os.Getuid() != 0 {
+		caps := cap.GetProc()
+		have, _ := caps.GetFlag(cap.Permitted, cap.BPF)
+		if !have {
+			t.Skip("requires root or CAP_BPF")
+		}
+	}
+
+	// Spawn a tiny workload we can attach to. /usr/bin/sleep is universal
+	// enough; on systems without it, fall back to /bin/sleep.
+	sleepPath := "/usr/bin/sleep"
+	if _, err := os.Stat(sleepPath); err != nil {
+		sleepPath = "/bin/sleep"
+	}
+	cmd := exec.Command(sleepPath, "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn sleep: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	// Wait for the process to be visible in /proc.
+	pid := cmd.Process.Pid
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d/maps", pid)); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var (
+		mu     sync.Mutex
+		fires  int
+		paths  []string
+		bytes  int
+		anyDur bool
+	)
+	hooks := &dwarfagent.Hooks{
+		OnCompile: func(path, buildID string, ehFrameBytes int, dur time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			fires++
+			paths = append(paths, path)
+			bytes += ehFrameBytes
+			if dur > 0 {
+				anyDur = true
+			}
+		},
+	}
+
+	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks)
+	if err != nil {
+		t.Fatalf("NewProfilerWithHooks: %v", err)
+	}
+	t.Cleanup(func() { _ = prof.Close() })
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fires == 0 {
+		t.Fatalf("OnCompile never fired (expected ≥1 for sleep + its shared libs)")
+	}
+	if !anyDur {
+		t.Errorf("all OnCompile durations were zero — timing wrap may not be in effect")
+	}
+	if bytes == 0 {
+		t.Errorf("OnCompile total ehFrameBytes was 0 — section size not propagating")
+	}
+	t.Logf("OnCompile fired %d times across %d binaries, total .eh_frame bytes %d", fires, len(paths), bytes)
 }
 
 // numOnlineCPUs reads /sys/devices/system/cpu/online and returns the

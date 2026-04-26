@@ -30,6 +30,8 @@ type Opts struct {
 type Fleet struct {
 	procs []*exec.Cmd
 
+	startupTimeout time.Duration
+
 	mu      sync.Mutex
 	stopped bool
 }
@@ -53,7 +55,7 @@ func Spawn(opts Opts) (*Fleet, error) {
 		return nil, errors.New("fleet: WorkloadDir must be set")
 	}
 
-	f := &Fleet{}
+	f := &Fleet{startupTimeout: opts.StartupTimeout}
 	for lang, count := range opts.Mix {
 		argv, err := commandFor(opts.WorkloadDir, lang)
 		if err != nil {
@@ -128,14 +130,22 @@ func isFile(p string) bool {
 // Wait blocks until every spawned process is visible in /proc/<pid>/stat
 // (i.e. the kernel has it as a task), or timeout elapses, or any process
 // has exited (which is treated as a fatal startup failure).
+//
+// If timeout is 0, falls back to opts.StartupTimeout from Spawn.
 func (f *Fleet) Wait(timeout time.Duration) error {
+	if timeout == 0 {
+		timeout = f.startupTimeout
+	}
 	deadline := time.Now().Add(timeout)
 	for _, cmd := range f.procs {
 		pid := cmd.Process.Pid
 		for {
-			// Check exit first — if the process died on us, that's fatal.
-			if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-				return fmt.Errorf("fleet: pid=%d exited before reaching ready state", pid)
+			// Check liveness: signal 0 returns ESRCH if process is gone.
+			if err := syscall.Kill(pid, 0); err != nil {
+				if errors.Is(err, syscall.ESRCH) {
+					return fmt.Errorf("fleet: pid=%d exited before reaching ready state", pid)
+				}
+				// EPERM or other — process exists but we can't signal it; fall through to /proc check.
 			}
 			if _, err := os.Stat(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
 				break
@@ -159,8 +169,10 @@ func (f *Fleet) PIDs() []int {
 }
 
 // Stop sends SIGTERM to every process group, waits 1s, then SIGKILLs
-// any still alive. Idempotent. Returns the first error encountered;
-// always attempts every process.
+// any still alive. Idempotent — second call returns nil. Returns nil
+// even if individual signal/wait operations error; this is a
+// best-effort teardown for a benchmark fixture, not a strict
+// supervisor.
 func (f *Fleet) Stop() error {
 	f.mu.Lock()
 	if f.stopped {
@@ -178,7 +190,7 @@ func (f *Fleet) Stop() error {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 
-	// Wait up to 1s for graceful exit.
+	// Wait up to graceful timeout for them to exit; SIGKILL stragglers.
 	done := make(chan struct{})
 	go func() {
 		for _, cmd := range f.procs {
@@ -192,13 +204,18 @@ func (f *Fleet) Stop() error {
 	case <-time.After(1 * time.Second):
 	}
 
-	// SIGKILL anyone still alive.
+	// Grace expired — escalate. SIGKILL the groups; the goroutine
+	// above will unblock as each Wait returns. We do NOT call Wait
+	// again here (would race with the goroutine and return "Wait
+	// was already called" without doing anything useful).
 	for _, cmd := range f.procs {
 		if cmd.Process == nil {
 			continue
 		}
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_ = cmd.Wait()
 	}
+	// Block until the goroutine drains. SIGKILL is uninterruptible,
+	// so this returns within milliseconds.
+	<-done
 	return nil
 }

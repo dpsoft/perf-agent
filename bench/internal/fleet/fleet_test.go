@@ -65,6 +65,35 @@ func TestSpawnFailsOnMissingWorkload(t *testing.T) {
 	}
 }
 
+func TestSpawnPartialFleetFailureCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	// Set up "go" workload only — rust will fail.
+	goSub := filepath.Join(dir, "go")
+	if err := os.MkdirAll(goSub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(goSub, "cpu_bound")
+	body := "#!/bin/sh\nexec sleep 30\n"
+	if err := os.WriteFile(bin, []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Map iteration order is random — we don't know if go or rust resolves
+	// first. If go resolves first, 2 go workers are spawned, then rust fails
+	// and Spawn must clean them up. If rust resolves first, commandFor fails
+	// immediately with no workers started. Either way we expect an error.
+	//
+	// The real verification is that the cleanup code path runs without
+	// leaking goroutines or panicking, which -race detects. We cannot
+	// enumerate the spawned PIDs post-failure because Spawn returns
+	// (nil, err) on failure; a stronger assertion would require API changes
+	// to expose the partial fleet.
+	_, err := Spawn(Opts{Mix: map[string]int{"go": 2, "rust": 1}, WorkloadDir: dir})
+	if err == nil {
+		t.Fatal("expected error for missing rust workload, got nil")
+	}
+}
+
 // intStr is strconv.Itoa-equivalent without importing strconv into the
 // test (keeps the test file imports minimal).
 func intStr(i int) string {

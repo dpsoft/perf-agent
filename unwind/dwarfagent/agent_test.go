@@ -128,11 +128,11 @@ func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
 	}
 
 	var (
-		mu     sync.Mutex
-		fires  int
-		paths  []string
-		bytes  int
-		anyDur bool
+		mu      sync.Mutex
+		fires   int
+		paths   []string
+		ehBytes int
+		anyDur  bool
 	)
 	hooks := &dwarfagent.Hooks{
 		OnCompile: func(path, buildID string, ehFrameBytes int, dur time.Duration) {
@@ -140,7 +140,7 @@ func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
 			defer mu.Unlock()
 			fires++
 			paths = append(paths, path)
-			bytes += ehFrameBytes
+			ehBytes += ehFrameBytes
 			if dur > 0 {
 				anyDur = true
 			}
@@ -151,20 +151,27 @@ func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProfilerWithHooks: %v", err)
 	}
-	t.Cleanup(func() { _ = prof.Close() })
+	// Close before reading recorded state — drains the tracker goroutine
+	// so OnCompile cannot fire concurrently with our assertions.
+	if err := prof.Close(); err != nil {
+		t.Logf("prof.Close (non-fatal): %v", err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if fires == 0 {
 		t.Fatalf("OnCompile never fired (expected ≥1 for sleep + its shared libs)")
 	}
+	if len(paths) != fires {
+		t.Errorf("len(paths)=%d != fires=%d — TableStore dedupe invariant violated", len(paths), fires)
+	}
 	if !anyDur {
 		t.Errorf("all OnCompile durations were zero — timing wrap may not be in effect")
 	}
-	if bytes == 0 {
+	if ehBytes == 0 {
 		t.Errorf("OnCompile total ehFrameBytes was 0 — section size not propagating")
 	}
-	t.Logf("OnCompile fired %d times across %d binaries, total .eh_frame bytes %d", fires, len(paths), bytes)
+	t.Logf("OnCompile fired %d times across %d binaries, total .eh_frame bytes %d", fires, len(paths), ehBytes)
 }
 
 // numOnlineCPUs reads /sys/devices/system/cpu/online and returns the

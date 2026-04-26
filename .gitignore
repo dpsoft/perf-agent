@@ -65,6 +65,12 @@ offcpu.pb.gz
 
 ### Project binaries ###
 perf-agent
+bench/cmd/scenario/scenario
+bench/cmd/report/report
+
+### Benchmark artifacts ###
+bench-*.json
+bench-report.md
 
 ### Anthropic Claude ###
 # Track project-shared Claude config (.claude/settings.json) but keep

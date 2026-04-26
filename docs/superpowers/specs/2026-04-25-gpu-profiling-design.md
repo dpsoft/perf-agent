@@ -49,10 +49,31 @@ The canonical internal representation is a normalized event stream.
 
 All downstream outputs, including `pprof`, flame graphs, summaries, and timeline views, are derived projections.
 
+### 2.6 Linux-first base layer
+
+The first serious implementation should be Linux-first and DRM-aware.
+
+That means the base product should prioritize:
+
+- syscall and `ioctl` timing
+- scheduler interaction
+- context and queue lifecycle where exposed
+- process and thread ownership
+- runtime and driver boundary correlation
+
+before promising universal access to vendor PMUs or deep device internals.
+
+### 2.7 Honest nullability
+
+“Vendor-agnostic” should mean stable semantics and graceful degradation.
+
+If a device or stack cannot expose queue identity, power, context IDs, or per-kernel counters, the collector should emit those fields as unavailable with clear provenance rather than inventing approximate values.
+
 ## 3. Goals
 
 At a product level, the design should support:
 
+- a portable event-timeline profiler first
 - GPU timelines covering kernels, memory copies, queues, and related execution intervals
 - CPU to GPU correlation
 - continuous profiling
@@ -144,8 +165,8 @@ Use a **layered architecture**:
 
 - **Layer A: Core GPU profiling model**
   - vendor-agnostic event types, correlation IDs, capability negotiation, and output contract
-- **Layer B: eBPF host correlation plane**
-  - CPU stacks, process/container metadata, scheduler context, optional driver/runtime tracepoints, and launch-site attribution
+- **Layer B: Linux-first observability core**
+  - `eBPF` collection, DRM-aware syscall and `ioctl` timing, scheduler context, process/container metadata, optional driver tracepoints, and runtime-boundary correlation
 - **Layer C: On-demand vendor backends**
   - NVIDIA via CUPTI
   - Intel via Level Zero and/or `iaprof`-style runtime/driver integration
@@ -171,7 +192,7 @@ So the design rule is:
 
 Reviewers should evaluate portability at the contract boundary, not by forcing NVIDIA, Intel, and AMD collection internals into one fake-uniform implementation strategy.
 
-## 9. Why Not eBPF First Alone?
+## 9. Why eBPF First, but Not eBPF Only?
 
 `eBPF` should be first in the architecture, but not first as the only data source.
 
@@ -194,6 +215,33 @@ Reviewers should evaluate portability at the contract boundary, not by forcing N
 ### 9.3 Design implication
 
 The architecture should treat eBPF as the **common attribution spine**, not as the complete GPU profiler.
+
+### 9.4 Portable base scope
+
+The base layer should normalize the parts of GPU observability that can be captured honestly across Linux stacks:
+
+- device identity
+  - PCI BDF, DRM node, driver name, and process ownership when available
+- process and thread correlation
+  - PID, TID, cgroup, `fd`, syscall path, runtime callsite, scheduler state
+- context and queue lifecycle where exposed
+  - create, destroy, submit, wait, signal, timeout, reset
+- latency intervals
+  - API-call latency, `ioctl` latency, submission-to-completion when timestamps exist
+- memory boundary events
+  - alloc, map, unmap, migrate, fault, and address-space association when exposed
+- coarse operational samples
+  - utilization, power, clocks, VRAM, or engine state only when a stack exposes them cleanly
+
+The base layer should not promise portable access to:
+
+- GPU PMU counters
+- occupancy or issue-slot metrics
+- warp, wavefront, or EU internals
+- precise queue residency on proprietary stacks
+- replay-based per-kernel profiling modes
+
+Those belong to on-demand vendor adapters.
 
 ## 10. Proposed Scope Split
 
@@ -334,6 +382,31 @@ type GPUSample struct {
     Weight      uint64
 }
 ```
+
+### 12.3.1 Base observability event families
+
+The current branch already has useful canonical types for launch, execution, counters, and samples.
+
+That is enough for replay, projection, and early backend work, but it is too narrow for the Linux-first observability core. The base layer also needs lifecycle and boundary telemetry such as:
+
+- runtime/API enter and exit
+- syscall and `ioctl` enter and exit
+- submit and wait intervals
+- context and queue create and destroy
+- memory map, unmap, migrate, and fault
+- reset, timeout, and lost-device signals
+
+So the event model should evolve to support two layers:
+
+1. high-level execution records such as `GPUKernelLaunch`, `GPUKernelExec`, `GPUCounterSample`, and `GPUSample`
+2. lower-level timeline events for lifecycle and boundary observation
+
+That lower-level layer may be represented as:
+
+- additional typed structs, or
+- a generic normalized timeline event envelope
+
+The key requirement is that the Linux-first base can emit truthful lifecycle telemetry without pretending every event is already a kernel launch or execution interval.
 
 ### 12.4 Execution identity and context requirements
 
@@ -553,7 +626,7 @@ For tests:
 - prefer table-driven tests around normalized event joins and projection rules
 - keep backend-specific fixtures at the package boundary so core tests do not depend on vendor SDKs
 
-## 15. Host Correlation Plane
+## 15. Linux Observability and Host Correlation Plane
 
 The host plane should be independent of any single vendor backend.
 
@@ -569,11 +642,12 @@ The host plane should be independent of any single vendor backend.
 
 Ordered by realism:
 
-1. `uprobes` on vendor runtime entry points
-2. runtime-specific callbacks if the backend already exposes them
-3. kernel tracepoints / driver events where useful
+1. syscall and `ioctl` tracepoints plus scheduler correlation
+2. open-driver tracepoints or BTF-backed hooks where available
+3. `uprobes` on runtime entry points when kernel-boundary telemetry is not enough
+4. runtime-specific callbacks if a backend already exposes stronger correlation IDs
 
-For the first version, the host plane may need backend assistance to know which runtime functions to probe. That is acceptable. “Vendor-agnostic core” does not mean “zero vendor knowledge at the probe list.”
+For the first version, the host plane should prefer the Linux/DRM boundary first and add runtime-specific probes only when they materially improve correlation. “Vendor-agnostic core” does not mean “zero vendor knowledge,” but it also does not mean the first milestone should start at proprietary userspace entry points.
 
 ## 16. Output Model
 
@@ -723,6 +797,19 @@ The first implementation should be successful even if the first backend initiall
 
 This spec adopts the architectural lessons without inheriting Intel-specific assumptions as universal design constraints.
 
+### 17.1.1 Linux-first base before vendor depth
+
+Before the first vendor-deep backend, the product should have a credible Linux-first observability core:
+
+- `eBPF` and ringbuf-based event collection
+- DRM-aware syscall and `ioctl` timing
+- scheduler and wait-path correlation
+- open-driver validation on the most transparent stacks available
+
+That base is the default operating mode.
+
+Vendor SDKs, PMUs, and replay-style metrics are follow-on capability layers, not the starting point of the product.
+
 ### 17.2 NVIDIA
 
 Expected source surfaces:
@@ -769,26 +856,36 @@ Likely maturity:
 - decide timeline export format
 - decide whether the first target is explicitly “single active workload” rather than general system-wide GPU attribution
 
-### Phase 1: vendor-agnostic core + one backend with launch/execution correlation
+### Phase 1: vendor-agnostic core + Linux-first observability core
 
 Success criteria:
 
-- capture CPU launch stack
-- capture corresponding GPU kernel execution interval
+- capture DRM-aware syscall and `ioctl` lifecycle events
+- capture scheduler and wait-path correlation around GPU activity
+- capture process, thread, and device identity with explicit provenance
 - export normalized timeline
-- provide one CPU-launch-weighted pprof projection
+- validate the normalized base on at least one open-driver stack
 - work reliably for a single active GPU workload even if broader multi-process fairness and attribution are deferred
 
-This phase does **not** require GPU PC sampling yet.
+This phase does **not** require GPU PC sampling, vendor PMUs, or proprietary runtime callbacks yet.
 
-### Phase 2: device counters
+### Phase 2: host launch attribution and coarse metrics
 
 Success criteria:
 
+- attach CPU launch stacks or runtime-boundary attribution to the same timeline when available
 - attach device utilization / memory / power / engine metrics to the same timeline
 - correlate starvation vs saturation
 
-### Phase 3: full-stack GPU sample attribution
+### Phase 3: backend execution correlation
+
+Success criteria:
+
+- ingest vendor or open-driver execution intervals
+- join them to the base timeline and host launch attribution
+- provide one CPU-launch-weighted `pprof` projection with synthetic GPU frames where the data is strong enough
+
+### Phase 4: full-stack GPU sample attribution
 
 Success criteria:
 
@@ -845,9 +942,10 @@ This means:
 Implement the architecture as:
 
 1. vendor-agnostic normalized core
-2. eBPF-centered host correlation plane
-3. one vendor backend that provides launch and execution correlation first
-4. pprof as a derived output, not the canonical raw format
+2. Linux-first `eBPF` observability core
+3. host launch attribution after the base timeline is trustworthy
+4. one vendor or open-driver execution backend that provides launch and execution correlation
+5. pprof as a derived output, not the canonical raw format
 
 This gives us a serious path to Option 2 without claiming a false vendor-neutral device sampler.
 
@@ -870,15 +968,15 @@ Working default:
 ### 21.2 First host correlation mechanism
 
 Question:
-- Should the first host correlation path rely on runtime callbacks only, or also add `uprobes` immediately?
+- Should the first real host-side source start at the Linux/DRM boundary, or start directly with runtime `uprobes`/callbacks?
 
 Current recommendation:
-- start with whichever source gives the strongest correlation IDs for the chosen backend
-- add `uprobes` early if callbacks alone are not enough for attach-late workflows
+- start with syscall, `ioctl`, scheduler, and open-driver telemetry
+- add runtime probes only when the Linux-first base is insufficient for useful correlation
 
 Working default:
-- start with the strongest correlation source available for the chosen backend
-- add `uprobes` when callback-only collection is insufficient for attach-late workflows
+- start with the Linux-first observability core
+- treat `uprobes` and callbacks as follow-on correlation sources, not the first milestone
 
 ### 21.3 Raw timeline export format
 

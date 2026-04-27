@@ -145,7 +145,8 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, workload, args...)
+	cmdArgs := append([]string{"-lc", `sleep 1; exec "$0" "$@"`, workload}, args...)
+	cmd := exec.CommandContext(ctx, "/bin/sh", cmdArgs...)
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("open devnull: %v", err)
@@ -201,6 +202,7 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("amdgpu workload failed: %v", err)
 			}
+			t.Fatal("amdgpu workload exited before any amdgpu ioctl event was observed")
 		case <-b.done:
 			t.Fatalf("linuxdrm backend exited early: %v", b.err())
 		case <-ctx.Done():

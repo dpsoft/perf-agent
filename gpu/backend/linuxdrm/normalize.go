@@ -19,6 +19,7 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 			attrs[key] = value
 		}
 		name := "ioctl"
+		kind := gpu.TimelineEventIOCtl
 		switch attrs["node_class"] {
 		case "render":
 			name = "drm-render-ioctl"
@@ -28,13 +29,16 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 		driver := attrs["driver"]
 		if classification, ok := classifyIOCtlForDriver(record.Command, driver); ok {
 			name = classification.Name
+			if classification.Kind != "" {
+				kind = classification.Kind
+			}
 			for key, value := range classification.Attributes {
 				attrs[key] = value
 			}
 		}
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
-			Kind:       gpu.TimelineEventIOCtl,
+			Kind:       kind,
 			Name:       name,
 			TimeNs:     record.StartNs,
 			DurationNs: duration(record.StartNs, record.EndNs),

@@ -232,6 +232,9 @@ func TestNormalizeRecordClassifiesAMDGPUCommandSubmission(t *testing.T) {
 	if event.Name != "amdgpu-cs" {
 		t.Fatalf("name=%q", event.Name)
 	}
+	if event.Kind != gpu.TimelineEventSubmit {
+		t.Fatalf("kind=%q", event.Kind)
+	}
 	if got := event.Attributes["command_family"]; got != "amdgpu" {
 		t.Fatalf("command_family=%q", got)
 	}
@@ -266,10 +269,47 @@ func TestNormalizeRecordClassifiesAMDGPUWaitFences(t *testing.T) {
 	if event.Name != "amdgpu-wait-fences" {
 		t.Fatalf("name=%q", event.Name)
 	}
+	if event.Kind != gpu.TimelineEventWait {
+		t.Fatalf("kind=%q", event.Kind)
+	}
 	if got := event.Attributes["command_name"]; got != "wait_fences" {
 		t.Fatalf("command_name=%q", got)
 	}
 	if got := event.Attributes["semantic"]; got != "sync-wait" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesAMDGPUBufferCreationAsMemory(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 64, 'd', 0x40),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	}, func(uint32, uint32) (drmDeviceInfo, bool) {
+		return drmDeviceInfo{Driver: "amdgpu", Node: "renderD128"}, true
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "amdgpu-gem-create" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventMemory {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["command_name"]; got != "gem_create" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "memory-create" {
 		t.Fatalf("semantic=%q", got)
 	}
 }

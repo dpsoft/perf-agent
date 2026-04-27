@@ -3,6 +3,8 @@ package linuxdrm
 import (
 	"fmt"
 	"strconv"
+
+	"github.com/dpsoft/perf-agent/gpu"
 )
 
 const (
@@ -41,6 +43,7 @@ type ioctlMetadata struct {
 
 type ioctlClassification struct {
 	Name       string
+	Kind       gpu.TimelineEventKind
 	Attributes map[string]string
 }
 
@@ -170,29 +173,34 @@ func classifyIOCtlForDriver(command uint64, driver string) (ioctlClassification,
 func classifyAMDGPUDriverIOCtl(number uint64) (ioctlClassification, bool) {
 	switch number - drmCommandBase {
 	case 0x00:
-		return classifiedIOCtl("amdgpu-gem-create", "amdgpu", "gem_create", "memory-create"), true
+		return classifiedIOCtlWithKind("amdgpu-gem-create", gpu.TimelineEventMemory, "amdgpu", "gem_create", "memory-create"), true
 	case 0x01:
-		return classifiedIOCtl("amdgpu-gem-mmap", "amdgpu", "gem_mmap", "memory-map"), true
+		return classifiedIOCtlWithKind("amdgpu-gem-mmap", gpu.TimelineEventMemory, "amdgpu", "gem_mmap", "memory-map"), true
 	case 0x03:
 		return classifiedIOCtl("amdgpu-bo-list", "amdgpu", "bo_list", "resource-list"), true
 	case 0x04:
-		return classifiedIOCtl("amdgpu-cs", "amdgpu", "cs", "command-submit"), true
+		return classifiedIOCtlWithKind("amdgpu-cs", gpu.TimelineEventSubmit, "amdgpu", "cs", "command-submit"), true
 	case 0x05:
 		return classifiedIOCtl("amdgpu-info", "amdgpu", "info", "query"), true
 	case 0x07:
-		return classifiedIOCtl("amdgpu-gem-wait-idle", "amdgpu", "gem_wait_idle", "sync-wait"), true
+		return classifiedIOCtlWithKind("amdgpu-gem-wait-idle", gpu.TimelineEventWait, "amdgpu", "gem_wait_idle", "sync-wait"), true
 	case 0x09:
-		return classifiedIOCtl("amdgpu-wait-cs", "amdgpu", "wait_cs", "sync-wait"), true
+		return classifiedIOCtlWithKind("amdgpu-wait-cs", gpu.TimelineEventWait, "amdgpu", "wait_cs", "sync-wait"), true
 	case 0x12:
-		return classifiedIOCtl("amdgpu-wait-fences", "amdgpu", "wait_fences", "sync-wait"), true
+		return classifiedIOCtlWithKind("amdgpu-wait-fences", gpu.TimelineEventWait, "amdgpu", "wait_fences", "sync-wait"), true
 	default:
 		return ioctlClassification{}, false
 	}
 }
 
 func classifiedIOCtl(name, family, commandName, semantic string) ioctlClassification {
+	return classifiedIOCtlWithKind(name, "", family, commandName, semantic)
+}
+
+func classifiedIOCtlWithKind(name string, kind gpu.TimelineEventKind, family, commandName, semantic string) ioctlClassification {
 	return ioctlClassification{
 		Name: name,
+		Kind: kind,
 		Attributes: map[string]string{
 			"command_family": family,
 			"command_name":   commandName,

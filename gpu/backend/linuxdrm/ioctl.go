@@ -107,19 +107,19 @@ func classifyIOCtlForDriver(command uint64, driver string) (ioctlClassification,
 	case 0x0d:
 		return classifiedIOCtl("drm-set-client-cap", "drm-core", "set_client_cap", "capability-set"), true
 	case 0x09:
-		return classifiedIOCtl("drm-gem-close", "drm-core", "gem_close", "memory-release"), true
+		return classifiedIOCtlWithKind("drm-gem-close", gpu.TimelineEventMemory, "drm-core", "gem_close", "memory-release"), true
 	case 0x2d:
-		return classifiedIOCtl("drm-prime-handle-to-fd", "drm-core", "prime_handle_to_fd", "prime-export"), true
+		return classifiedIOCtlWithKind("drm-prime-handle-to-fd", gpu.TimelineEventMemory, "drm-core", "prime_handle_to_fd", "prime-export"), true
 	case 0x2e:
-		return classifiedIOCtl("drm-prime-fd-to-handle", "drm-core", "prime_fd_to_handle", "prime-import"), true
+		return classifiedIOCtlWithKind("drm-prime-fd-to-handle", gpu.TimelineEventMemory, "drm-core", "prime_fd_to_handle", "prime-import"), true
 	case 0x3a:
-		return classifiedIOCtl("drm-wait-vblank", "drm-core", "wait_vblank", "display-wait"), true
+		return classifiedIOCtlWithKind("drm-wait-vblank", gpu.TimelineEventWait, "drm-core", "wait_vblank", "display-wait"), true
 	case 0xbc:
 		return classifiedIOCtl("drm-mode-atomic", "drm-mode", "mode_atomic", "display-commit"), true
 	case 0xc3:
-		return classifiedIOCtl("drm-syncobj-wait", "drm-core", "syncobj_wait", "sync-wait"), true
+		return classifiedIOCtlWithKind("drm-syncobj-wait", gpu.TimelineEventWait, "drm-core", "syncobj_wait", "sync-wait"), true
 	case 0xca:
-		return classifiedIOCtl("drm-syncobj-timeline-wait", "drm-core", "syncobj_timeline_wait", "sync-wait"), true
+		return classifiedIOCtlWithKind("drm-syncobj-timeline-wait", gpu.TimelineEventWait, "drm-core", "syncobj_timeline_wait", "sync-wait"), true
 	case 0xc5:
 		return classifiedIOCtl("drm-syncobj-signal", "drm-core", "syncobj_signal", "sync-signal"), true
 	case 0xcd:

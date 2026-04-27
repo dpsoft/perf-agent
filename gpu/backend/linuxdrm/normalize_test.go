@@ -140,6 +140,9 @@ func TestNormalizeRecordClassifiesDRMSyncobjWait(t *testing.T) {
 	if event.Name != "drm-syncobj-wait" {
 		t.Fatalf("name=%q", event.Name)
 	}
+	if event.Kind != gpu.TimelineEventWait {
+		t.Fatalf("kind=%q", event.Kind)
+	}
 	if got := event.Attributes["command_family"]; got != "drm-core" {
 		t.Fatalf("command_family=%q", got)
 	}
@@ -172,7 +175,39 @@ func TestNormalizeRecordClassifiesDRMPrimeImport(t *testing.T) {
 	if event.Name != "drm-prime-fd-to-handle" {
 		t.Fatalf("name=%q", event.Name)
 	}
+	if event.Kind != gpu.TimelineEventMemory {
+		t.Fatalf("kind=%q", event.Kind)
+	}
 	if got := event.Attributes["semantic"]; got != "prime-import" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesDRMGEMCloseAsMemory(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 32, 'd', 0x09),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+
+	if event.Name != "drm-gem-close" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventMemory {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["semantic"]; got != "memory-release" {
 		t.Fatalf("semantic=%q", got)
 	}
 }

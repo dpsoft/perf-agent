@@ -3,8 +3,12 @@ package linuxdrm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +125,93 @@ func TestLinuxDRMLiveSmoke(t *testing.T) {
 	}
 }
 
+func TestLinuxDRMAMDGPUObservation(t *testing.T) {
+	requireBPFCaps(t)
+
+	renderNode, err := firstRenderNode()
+	if err != nil {
+		t.Skipf("no DRM render node: %v", err)
+	}
+	info, ok := lookupDRMDeviceInfo(drmMajor, renderNodeMinor(renderNode))
+	if !ok || info.Driver != "amdgpu" {
+		t.Skip("render node is not backed by amdgpu")
+	}
+
+	workload, args, err := firstAMDGPUWorkload()
+	if err != nil {
+		t.Skipf("no amdgpu workload tool: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, workload, args...)
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", workload, err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	}()
+
+	b, err := New(Config{PID: cmd.Process.Pid})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	sink := &liveEventSink{events: make(chan gpu.GPUTimelineEvent, 64)}
+	if err := b.Start(ctx, sink); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := b.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	}()
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	for {
+		select {
+		case event := <-sink.events:
+			if event.PID != uint32(cmd.Process.Pid) {
+				continue
+			}
+			if !strings.HasPrefix(event.Name, "amdgpu-") {
+				continue
+			}
+			if got := event.Attributes["command_family"]; got != "amdgpu" {
+				t.Fatalf("command_family=%q", got)
+			}
+			return
+		case err := <-waitErr:
+			if err != nil {
+				t.Fatalf("amdgpu workload failed: %v", err)
+			}
+		case <-b.done:
+			t.Fatalf("linuxdrm backend exited early: %v", b.err())
+		case <-ctx.Done():
+			if err := b.Stop(context.Background()); err != nil {
+				t.Fatalf("timed out waiting for amdgpu ioctl event: backend error: %v", err)
+			}
+			t.Fatal("timed out waiting for amdgpu ioctl event")
+		}
+	}
+}
+
 func requireBPFCaps(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 {
@@ -161,4 +252,30 @@ func firstRenderNode() (string, error) {
 		return match, nil
 	}
 	return "", errors.New("no render nodes found")
+}
+
+func renderNodeMinor(path string) uint32 {
+	base := filepath.Base(path)
+	value := strings.TrimPrefix(base, "renderD")
+	minor, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(minor)
+}
+
+func firstAMDGPUWorkload() (string, []string, error) {
+	for _, candidate := range []struct {
+		bin  string
+		args []string
+	}{
+		{bin: "rocminfo"},
+		{bin: "amdgpu-arch"},
+	} {
+		path, err := exec.LookPath(candidate.bin)
+		if err == nil {
+			return path, candidate.args, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no supported amdgpu workload tool found")
 }

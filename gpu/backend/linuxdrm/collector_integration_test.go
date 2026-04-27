@@ -22,9 +22,33 @@ func (s *liveEventSink) EmitExec(gpu.GPUKernelExec)       {}
 func (s *liveEventSink) EmitCounter(gpu.GPUCounterSample) {}
 func (s *liveEventSink) EmitSample(gpu.GPUSample)         {}
 func (s *liveEventSink) EmitEvent(event gpu.GPUTimelineEvent) {
+	if event.Kind != gpu.TimelineEventIOCtl {
+		return
+	}
 	select {
 	case s.events <- event:
 	default:
+	}
+}
+
+func TestLiveEventSinkQueuesOnlyIOCtlEvents(t *testing.T) {
+	sink := &liveEventSink{events: make(chan gpu.GPUTimelineEvent, 1)}
+	sink.EmitEvent(gpu.GPUTimelineEvent{Kind: gpu.TimelineEventWait})
+	select {
+	case event := <-sink.events:
+		t.Fatalf("unexpected event queued: %#v", event)
+	default:
+	}
+
+	want := gpu.GPUTimelineEvent{Kind: gpu.TimelineEventIOCtl, Name: "drm-syncobj-wait"}
+	sink.EmitEvent(want)
+	select {
+	case got := <-sink.events:
+		if got.Kind != want.Kind || got.Name != want.Name {
+			t.Fatalf("event=%#v want kind=%q name=%q", got, want.Kind, want.Name)
+		}
+	default:
+		t.Fatal("expected ioctl event")
 	}
 }
 
@@ -55,7 +79,11 @@ func TestLinuxDRMLiveSmoke(t *testing.T) {
 	if err := b.Start(ctx, sink); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = b.Stop(context.Background()) }()
+	defer func() {
+		if err := b.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	}()
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), uintptr(0), uintptr(0))
 	if errno != 0 && errno != unix.ENOTTY && errno != unix.EINVAL {
@@ -82,7 +110,12 @@ func TestLinuxDRMLiveSmoke(t *testing.T) {
 				t.Fatalf("command=%q", got)
 			}
 			return
+		case <-b.done:
+			t.Fatalf("linuxdrm backend exited early: %v", b.err())
 		case <-ctx.Done():
+			if err := b.Stop(context.Background()); err != nil {
+				t.Fatalf("timed out waiting for linuxdrm ioctl event: backend error: %v", err)
+			}
 			t.Fatal("timed out waiting for linuxdrm ioctl event")
 		}
 	}

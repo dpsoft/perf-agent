@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+func TestRawRecordBinarySizeMatchesBPFLayout(t *testing.T) {
+	if got, want := binary.Size(rawRecord{}), 88; got != want {
+		t.Fatalf("binary.Size(rawRecord{})=%d want %d", got, want)
+	}
+}
+
 func TestDecodeRecord(t *testing.T) {
 	in := rawRecord{
 		Kind:        recordKindIOCtl,

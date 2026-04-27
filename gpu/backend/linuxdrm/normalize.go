@@ -8,9 +8,13 @@ import (
 )
 
 func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
+	return normalizeRecordWithLookup(record, lookupDRMDeviceInfo)
+}
+
+func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (drmDeviceInfo, bool)) (gpu.GPUTimelineEvent, error) {
 	switch record.Kind {
 	case recordKindIOCtl:
-		device, attrs := classifyFileIdentity(record)
+		device, attrs := classifyFileIdentityWithLookup(record, lookup)
 		for key, value := range ioctlAttributes(record.Command) {
 			attrs[key] = value
 		}
@@ -21,7 +25,8 @@ func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
 		case "card":
 			name = "drm-card-ioctl"
 		}
-		if classification, ok := classifyIOCtl(record.Command); ok {
+		driver := attrs["driver"]
+		if classification, ok := classifyIOCtlForDriver(record.Command, driver); ok {
 			name = classification.Name
 			for key, value := range classification.Attributes {
 				attrs[key] = value

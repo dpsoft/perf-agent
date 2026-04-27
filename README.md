@@ -288,6 +288,30 @@ Current limits:
 - it needs a Linux host with BPF attach capability and a real `/dev/dri/renderD*` workload to observe
 - it does not yet decode vendor-specific submit/wait semantics, queue/context identities, device counters, or vendor runtime correlation
 
+On an AMDGPU host, the backend now adds a small amount of optional driver-specific naming when `/sys/dev/char` resolves the render node to `amdgpu`. The first mapped commands are focused on high-signal operations such as:
+
+- `amdgpu-cs`
+- `amdgpu-wait-cs`
+- `amdgpu-wait-fences`
+- `amdgpu-gem-create`
+- `amdgpu-gem-mmap`
+- `amdgpu-info`
+
+One practical local validation loop is:
+
+```bash
+rocminfo >/tmp/rocminfo.out 2>/tmp/rocminfo.err &
+pid=$!
+sudo timeout 5s go run . \
+  --pid "$pid" \
+  --gpu-linux-drm \
+  --gpu-raw-output /tmp/amdgpu.json \
+  --duration 3s
+wait "$pid" || true
+```
+
+Then inspect `/tmp/amdgpu.json` for `amdgpu-*` event names and `command_family=amdgpu`.
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

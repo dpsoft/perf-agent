@@ -87,6 +87,10 @@ func ioctlAttributes(command uint64) map[string]string {
 }
 
 func classifyIOCtl(command uint64) (ioctlClassification, bool) {
+	return classifyIOCtlForDriver(command, "")
+}
+
+func classifyIOCtlForDriver(command uint64, driver string) (ioctlClassification, bool) {
 	meta := decodeIOCtl(command)
 	if meta.Type != drmIOCtlType {
 		return ioctlClassification{}, false
@@ -117,6 +121,12 @@ func classifyIOCtl(command uint64) (ioctlClassification, bool) {
 		return classifiedIOCtl("drm-syncobj-signal", "drm-core", "syncobj_signal", "sync-signal"), true
 	case 0xcd:
 		return classifiedIOCtl("drm-syncobj-timeline-signal", "drm-core", "syncobj_timeline_signal", "sync-signal"), true
+	}
+
+	if driver == "amdgpu" && meta.Number >= drmCommandBase && meta.Number < drmCommandEnd {
+		if classification, ok := classifyAMDGPUDriverIOCtl(meta.Number); ok {
+			return classification, true
+		}
 	}
 
 	if meta.Number >= drmCommandBase && meta.Number < drmCommandEnd {
@@ -155,6 +165,29 @@ func classifyIOCtl(command uint64) (ioctlClassification, bool) {
 			"semantic":       "core-ioctl",
 		},
 	}, true
+}
+
+func classifyAMDGPUDriverIOCtl(number uint64) (ioctlClassification, bool) {
+	switch number - drmCommandBase {
+	case 0x00:
+		return classifiedIOCtl("amdgpu-gem-create", "amdgpu", "gem_create", "memory-create"), true
+	case 0x01:
+		return classifiedIOCtl("amdgpu-gem-mmap", "amdgpu", "gem_mmap", "memory-map"), true
+	case 0x03:
+		return classifiedIOCtl("amdgpu-bo-list", "amdgpu", "bo_list", "resource-list"), true
+	case 0x04:
+		return classifiedIOCtl("amdgpu-cs", "amdgpu", "cs", "command-submit"), true
+	case 0x05:
+		return classifiedIOCtl("amdgpu-info", "amdgpu", "info", "query"), true
+	case 0x07:
+		return classifiedIOCtl("amdgpu-gem-wait-idle", "amdgpu", "gem_wait_idle", "sync-wait"), true
+	case 0x09:
+		return classifiedIOCtl("amdgpu-wait-cs", "amdgpu", "wait_cs", "sync-wait"), true
+	case 0x12:
+		return classifiedIOCtl("amdgpu-wait-fences", "amdgpu", "wait_fences", "sync-wait"), true
+	default:
+		return ioctlClassification{}, false
+	}
 }
 
 func classifiedIOCtl(name, family, commandName, semantic string) ioctlClassification {

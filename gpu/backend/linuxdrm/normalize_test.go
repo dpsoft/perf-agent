@@ -178,7 +178,7 @@ func TestNormalizeRecordClassifiesDRMPrimeImport(t *testing.T) {
 }
 
 func TestNormalizeRecordBucketsDRMDriverCommands(t *testing.T) {
-	event, err := normalizeRecord(rawRecord{
+	event, err := normalizeRecordWithLookup(rawRecord{
 		Kind:        recordKindIOCtl,
 		PID:         123,
 		TID:         124,
@@ -190,7 +190,7 @@ func TestNormalizeRecordBucketsDRMDriverCommands(t *testing.T) {
 		DeviceMajor: 226,
 		DeviceMinor: 128,
 		Inode:       77,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
 	}
@@ -206,6 +206,99 @@ func TestNormalizeRecordBucketsDRMDriverCommands(t *testing.T) {
 	}
 	if got := event.Attributes["drm_command_index"]; got != "0" {
 		t.Fatalf("drm_command_index=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesAMDGPUCommandSubmission(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 64, 'd', 0x44),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	}, func(uint32, uint32) (drmDeviceInfo, bool) {
+		return drmDeviceInfo{Driver: "amdgpu", Node: "renderD128"}, true
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "amdgpu-cs" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["command_family"]; got != "amdgpu" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["command_name"]; got != "cs" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "command-submit" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesAMDGPUWaitFences(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 64, 'd', 0x52),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	}, func(uint32, uint32) (drmDeviceInfo, bool) {
+		return drmDeviceInfo{Driver: "amdgpu", Node: "renderD128"}, true
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "amdgpu-wait-fences" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["command_name"]; got != "wait_fences" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "sync-wait" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordLeavesUnknownAMDGPUDriverCommandBucketed(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     encodeTestIOCtl(3, 64, 'd', 0x59),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+	}, func(uint32, uint32) (drmDeviceInfo, bool) {
+		return drmDeviceInfo{Driver: "amdgpu", Node: "renderD128"}, true
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "drm-driver-ioctl" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if got := event.Attributes["command_family"]; got != "drm-driver" {
+		t.Fatalf("command_family=%q", got)
 	}
 }
 

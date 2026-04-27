@@ -312,6 +312,21 @@ wait "$pid" || true
 
 Then inspect `/tmp/amdgpu.json` for `amdgpu-*` event names and `command_family=amdgpu`.
 
+There is also a capability-gated integration test for real AMDGPU observation:
+
+```bash
+sudo -E go test ./gpu/backend/linuxdrm -run '^TestLinuxDRMAMDGPUObservation$' -v
+```
+
+If you want to save the observed normalized snapshot as a fixture for offline iteration, set:
+
+```bash
+export PERF_AGENT_WRITE_AMDGPU_FIXTURE=/tmp/amdgpu-observation.json
+sudo -E go test ./gpu/backend/linuxdrm -run '^TestLinuxDRMAMDGPUObservation$' -v
+```
+
+The test will write the normalized GPU snapshot JSON to the requested path after it sees a real `amdgpu-*` event.
+
 ### PMU output
 
 On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).

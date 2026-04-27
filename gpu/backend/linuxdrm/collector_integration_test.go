@@ -18,41 +18,62 @@ import (
 )
 
 type liveEventSink struct {
-	events chan gpu.GPUTimelineEvent
+	timeline *gpu.Timeline
+	ioctls   chan gpu.GPUTimelineEvent
 }
 
-func (s *liveEventSink) EmitLaunch(gpu.GPUKernelLaunch)   {}
-func (s *liveEventSink) EmitExec(gpu.GPUKernelExec)       {}
-func (s *liveEventSink) EmitCounter(gpu.GPUCounterSample) {}
-func (s *liveEventSink) EmitSample(gpu.GPUSample)         {}
+func newLiveEventSink(size int) *liveEventSink {
+	return &liveEventSink{
+		timeline: gpu.NewTimeline(),
+		ioctls:   make(chan gpu.GPUTimelineEvent, size),
+	}
+}
+
+func (s *liveEventSink) EmitLaunch(launch gpu.GPUKernelLaunch) { s.timeline.RecordLaunch(launch) }
+func (s *liveEventSink) EmitExec(exec gpu.GPUKernelExec)       { s.timeline.RecordExec(exec) }
+func (s *liveEventSink) EmitCounter(counter gpu.GPUCounterSample) {
+	s.timeline.RecordCounter(counter)
+}
+func (s *liveEventSink) EmitSample(sample gpu.GPUSample) { s.timeline.RecordSample(sample) }
 func (s *liveEventSink) EmitEvent(event gpu.GPUTimelineEvent) {
+	s.timeline.RecordEvent(event)
 	if event.Kind != gpu.TimelineEventIOCtl {
 		return
 	}
 	select {
-	case s.events <- event:
+	case s.ioctls <- event:
 	default:
 	}
 }
 
-func TestLiveEventSinkQueuesOnlyIOCtlEvents(t *testing.T) {
-	sink := &liveEventSink{events: make(chan gpu.GPUTimelineEvent, 1)}
+func (s *liveEventSink) Snapshot() gpu.Snapshot {
+	return s.timeline.Snapshot()
+}
+
+func TestLiveEventSinkRecordsEventsAndQueuesOnlyIOCtl(t *testing.T) {
+	sink := newLiveEventSink(1)
 	sink.EmitEvent(gpu.GPUTimelineEvent{Kind: gpu.TimelineEventWait})
 	select {
-	case event := <-sink.events:
+	case event := <-sink.ioctls:
 		t.Fatalf("unexpected event queued: %#v", event)
 	default:
+	}
+	if got := len(sink.Snapshot().Events); got != 1 {
+		t.Fatalf("events=%d", got)
 	}
 
 	want := gpu.GPUTimelineEvent{Kind: gpu.TimelineEventIOCtl, Name: "drm-syncobj-wait"}
 	sink.EmitEvent(want)
 	select {
-	case got := <-sink.events:
+	case got := <-sink.ioctls:
 		if got.Kind != want.Kind || got.Name != want.Name {
 			t.Fatalf("event=%#v want kind=%q name=%q", got, want.Kind, want.Name)
 		}
 	default:
 		t.Fatal("expected ioctl event")
+	}
+	if got := len(sink.Snapshot().Events); got != 2 {
+		t.Fatalf("events=%d", got)
 	}
 }
 
@@ -76,7 +97,7 @@ func TestLinuxDRMLiveSmoke(t *testing.T) {
 	}
 	defer func() { _ = b.Close() }()
 
-	sink := &liveEventSink{events: make(chan gpu.GPUTimelineEvent, 16)}
+	sink := newLiveEventSink(16)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -97,7 +118,7 @@ func TestLinuxDRMLiveSmoke(t *testing.T) {
 	fd := int32(f.Fd())
 	for {
 		select {
-		case event := <-sink.events:
+		case event := <-sink.ioctls:
 			if event.Kind != gpu.TimelineEventIOCtl {
 				continue
 			}
@@ -170,7 +191,7 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 	}
 	defer func() { _ = b.Close() }()
 
-	sink := &liveEventSink{events: make(chan gpu.GPUTimelineEvent, 64)}
+	sink := newLiveEventSink(64)
 	if err := b.Start(ctx, sink); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -187,7 +208,7 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 
 	for {
 		select {
-		case event := <-sink.events:
+		case event := <-sink.ioctls:
 			if event.PID != uint32(cmd.Process.Pid) {
 				continue
 			}
@@ -197,6 +218,7 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 			if got := event.Attributes["command_family"]; got != "amdgpu" {
 				t.Fatalf("command_family=%q", got)
 			}
+			maybeWriteSnapshotFixture(t, sink.Snapshot())
 			return
 		case err := <-waitErr:
 			if err != nil {
@@ -211,6 +233,22 @@ func TestLinuxDRMAMDGPUObservation(t *testing.T) {
 			}
 			t.Fatal("timed out waiting for amdgpu ioctl event")
 		}
+	}
+}
+
+func maybeWriteSnapshotFixture(t *testing.T, snap gpu.Snapshot) {
+	t.Helper()
+	path := os.Getenv("PERF_AGENT_WRITE_AMDGPU_FIXTURE")
+	if path == "" {
+		return
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create fixture: %v", err)
+	}
+	defer f.Close()
+	if err := gpu.WriteJSONSnapshot(f, snap); err != nil {
+		t.Fatalf("write fixture: %v", err)
 	}
 }
 

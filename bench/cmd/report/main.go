@@ -24,7 +24,7 @@ func main() {
 	flag.Parse()
 
 	if *formatFlag != "markdown" && *formatFlag != "csv" {
-		fmt.Fprintln(os.Stderr, "format must be markdown or csv")
+		_, _ = fmt.Fprintln(os.Stderr, "format must be markdown or csv")
 		os.Exit(2)
 	}
 
@@ -32,12 +32,12 @@ func main() {
 	case len(diffArgs) == 2:
 		runDiff(os.Stdout, string(diffArgs[0]), string(diffArgs[1]), *formatFlag)
 	case len(diffArgs) != 0:
-		fmt.Fprintln(os.Stderr, "--diff requires exactly two arguments")
+		_, _ = fmt.Fprintln(os.Stderr, "--diff requires exactly two arguments")
 		os.Exit(2)
 	case len(inFlag) > 0:
 		runSummary(os.Stdout, inFlag, *formatFlag)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: report --in PATH... | --diff A.json --diff B.json")
+		_, _ = fmt.Fprintln(os.Stderr, "usage: report --in PATH... | --diff A.json --diff B.json")
 		os.Exit(2)
 	}
 }
@@ -52,13 +52,13 @@ func runSummary(w io.Writer, paths []string, format string) {
 	for _, p := range paths {
 		f, err := os.Open(p)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "open %s: %v\n", p, err)
+			_, _ = fmt.Fprintf(os.Stderr, "open %s: %v\n", p, err)
 			os.Exit(3)
 		}
 		doc, err := schema.Read(f)
 		_ = f.Close()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read %s: %v\n", p, err)
+			_, _ = fmt.Fprintf(os.Stderr, "read %s: %v\n", p, err)
 			os.Exit(3)
 		}
 		writeSummary(w, doc, format)
@@ -68,7 +68,7 @@ func runSummary(w io.Writer, paths []string, format string) {
 
 func writeSummary(w io.Writer, d *schema.Document, format string) {
 	if format != "markdown" {
-		fmt.Fprintf(os.Stderr, "csv output is not implemented in v1\n")
+		_, _ = fmt.Fprintf(os.Stderr, "csv output is not implemented in v1\n")
 		os.Exit(4)
 	}
 
@@ -167,22 +167,22 @@ func shortID(s string) string {
 
 func runDiff(w io.Writer, beforePath, afterPath, format string) {
 	if format != "markdown" {
-		fmt.Fprintln(os.Stderr, "csv diff is not implemented in v1")
+		_, _ = fmt.Fprintln(os.Stderr, "csv diff is not implemented in v1")
 		os.Exit(4)
 	}
 	before, err := readDoc(beforePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(3)
 	}
 	after, err := readDoc(afterPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(3)
 	}
 
 	if before.Scenario != after.Scenario {
-		fmt.Fprintf(os.Stderr, "warning: scenario differs (%q vs %q); diff may be misleading\n",
+		_, _ = fmt.Fprintf(os.Stderr, "warning: scenario differs (%q vs %q); diff may be misleading\n",
 			before.Scenario, after.Scenario)
 	}
 

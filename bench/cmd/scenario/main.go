@@ -34,12 +34,12 @@ func main() {
 	flag.Parse()
 
 	if *scenario == "" {
-		fmt.Fprintln(os.Stderr, "--scenario is required")
+		_, _ = fmt.Fprintln(os.Stderr, "--scenario is required")
 		os.Exit(2)
 	}
 
 	if !checkCaps() {
-		fmt.Fprintln(os.Stdout, "BENCH_SKIPPED: missing required capabilities (CAP_PERFMON, CAP_BPF, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_CHECKPOINT_RESTORE)")
+		_, _ = fmt.Fprintln(os.Stdout, "BENCH_SKIPPED: missing required capabilities (CAP_PERFMON, CAP_BPF, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_CHECKPOINT_RESTORE)")
 		os.Exit(0)
 	}
 
@@ -48,7 +48,7 @@ func main() {
 		var err error
 		dir, err = autodetectWorkloadDir()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "auto-detect workloads: %v\n", err)
+			_, _ = fmt.Fprintf(os.Stderr, "auto-detect workloads: %v\n", err)
 			os.Exit(2)
 		}
 	}
@@ -70,7 +70,7 @@ func main() {
 	case "system-wide-mixed":
 		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
+		_, _ = fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
 	}
 

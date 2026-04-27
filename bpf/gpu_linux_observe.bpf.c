@@ -40,6 +40,7 @@ struct raw_record {
     __u32 cpu;
     __u64 inode;
     __u64 aux_ns;
+    __u64 cgroup_id;
     __u32 flags;
     __u32 _pad2;
 };
@@ -148,6 +149,7 @@ static __always_inline void emit_sched_record(__u8 kind, __u32 pid, __u32 tid, _
     record->end_ns = end_ns;
     record->cpu = cpu;
     record->aux_ns = aux_ns;
+    record->cgroup_id = bpf_get_current_cgroup_id();
 
     bpf_ringbuf_submit(record, 0);
 }
@@ -202,6 +204,7 @@ int handle_exit_ioctl(struct trace_event_raw_sys_exit *ctx)
     record->result_code = ctx->ret;
     record->start_ns = start->start_ns;
     record->end_ns = bpf_ktime_get_ns();
+    record->cgroup_id = bpf_get_current_cgroup_id();
     capture_file_identity(start->fd, &record->device_major, &record->device_minor, &record->inode);
 
     bpf_ringbuf_submit(record, 0);

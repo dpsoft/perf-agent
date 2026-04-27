@@ -19,6 +19,7 @@ func TestNormalizeRecord(t *testing.T) {
 		DeviceMajor: 226,
 		DeviceMinor: 128,
 		Inode:       77,
+		CgroupID:    4242,
 	})
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
@@ -57,6 +58,9 @@ func TestNormalizeRecord(t *testing.T) {
 	if got := event.Attributes["ioctl_type_char"]; got != "@" {
 		t.Fatalf("ioctl_type_char=%q", got)
 	}
+	if got := event.Attributes["cgroup_id"]; got != "4242" {
+		t.Fatalf("cgroup_id=%q", got)
+	}
 }
 
 func TestNormalizeRecordRejectsUnknownKind(t *testing.T) {
@@ -74,6 +78,7 @@ func TestNormalizeSchedRunqRecord(t *testing.T) {
 		EndNs:   1150,
 		CPU:     7,
 		AuxNs:   150,
+		CgroupID: 99,
 	})
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
@@ -91,6 +96,9 @@ func TestNormalizeSchedRunqRecord(t *testing.T) {
 	if got := event.Attributes["cpu"]; got != "7" {
 		t.Fatalf("cpu=%q", got)
 	}
+	if got := event.Attributes["cgroup_id"]; got != "99" {
+		t.Fatalf("cgroup_id=%q", got)
+	}
 }
 
 func TestNormalizeSchedWakeupRecord(t *testing.T) {
@@ -100,6 +108,7 @@ func TestNormalizeSchedWakeupRecord(t *testing.T) {
 		TID:     124,
 		StartNs: 1000,
 		CPU:     5,
+		CgroupID: 7,
 	})
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
@@ -116,6 +125,9 @@ func TestNormalizeSchedWakeupRecord(t *testing.T) {
 	}
 	if got := event.Attributes["cpu"]; got != "5" {
 		t.Fatalf("cpu=%q", got)
+	}
+	if got := event.Attributes["cgroup_id"]; got != "7" {
+		t.Fatalf("cgroup_id=%q", got)
 	}
 }
 

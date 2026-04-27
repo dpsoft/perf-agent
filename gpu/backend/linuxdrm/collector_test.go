@@ -110,6 +110,7 @@ func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 				DeviceMajor: 226,
 				DeviceMinor: 128,
 				Inode:       77,
+				CgroupID:    12345,
 			},
 			{
 				Kind:    recordKindSchedWakeup,
@@ -146,6 +147,9 @@ func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 	}
 	if sink.events[0].Kind != gpu.TimelineEventIOCtl {
 		t.Fatalf("kind=%q", sink.events[0].Kind)
+	}
+	if got := sink.events[0].Attributes["cgroup_id"]; got != "12345" {
+		t.Fatalf("event[0].cgroup_id=%q", got)
 	}
 	if sink.events[1].Name != "sched-wakeup" {
 		t.Fatalf("event[1].name=%q", sink.events[1].Name)

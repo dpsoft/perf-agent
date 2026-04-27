@@ -31,6 +31,7 @@ type rawRecord struct {
 	CPU         uint32
 	Inode       uint64
 	AuxNs       uint64
+	CgroupID    uint64
 	Flags       uint32
 	Pad2        uint32
 }

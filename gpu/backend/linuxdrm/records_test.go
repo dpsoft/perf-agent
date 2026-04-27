@@ -7,7 +7,7 @@ import (
 )
 
 func TestRawRecordBinarySizeMatchesBPFLayout(t *testing.T) {
-	if got, want := binary.Size(rawRecord{}), 88; got != want {
+	if got, want := binary.Size(rawRecord{}), 96; got != want {
 		t.Fatalf("binary.Size(rawRecord{})=%d want %d", got, want)
 	}
 }
@@ -27,6 +27,7 @@ func TestDecodeRecord(t *testing.T) {
 		CPU:         3,
 		Inode:       77,
 		AuxNs:       42,
+		CgroupID:    99,
 		Flags:       7,
 	}
 

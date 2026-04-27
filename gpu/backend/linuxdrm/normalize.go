@@ -15,6 +15,7 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 	switch record.Kind {
 	case recordKindIOCtl:
 		device, attrs := classifyFileIdentityWithLookup(record, lookup)
+		addAttributionAttrs(attrs, record)
 		for key, value := range ioctlAttributes(record.Command) {
 			attrs[key] = value
 		}
@@ -53,7 +54,7 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 		}
 		return event, nil
 	case recordKindSchedWakeup:
-		return gpu.GPUTimelineEvent{
+		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventWait,
 			Name:       "sched-wakeup",
@@ -65,9 +66,11 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 			Attributes: map[string]string{
 				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
 			},
-		}, nil
+		}
+		addAttributionAttrs(event.Attributes, record)
+		return event, nil
 	case recordKindSchedRunq:
-		return gpu.GPUTimelineEvent{
+		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventWait,
 			Name:       "sched-runq-latency",
@@ -80,9 +83,17 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 			Attributes: map[string]string{
 				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
 			},
-		}, nil
+		}
+		addAttributionAttrs(event.Attributes, record)
+		return event, nil
 	default:
 		return gpu.GPUTimelineEvent{}, fmt.Errorf("unsupported record kind %d", record.Kind)
+	}
+}
+
+func addAttributionAttrs(attrs map[string]string, record rawRecord) {
+	if record.CgroupID != 0 {
+		attrs["cgroup_id"] = strconv.FormatUint(record.CgroupID, 10)
 	}
 }
 

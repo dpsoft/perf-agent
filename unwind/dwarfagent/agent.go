@@ -37,14 +37,10 @@ type Profiler struct {
 	perfLinks  []link.Link
 }
 
-// NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
-// newSession, opens per-CPU perf events at sampleRate Hz, attaches
-// the BPF program to each, and starts the ringbuf reader + tracker
-// goroutines.
-//
-// On error, every resource created is closed before returning.
-// Callers should NOT call Close on a Profiler they received as (nil, err).
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
+// NewProfilerWithHooks is the variant of NewProfiler that accepts an
+// optional observation surface. Pass nil hooks for the same behavior
+// as NewProfiler. Hooks are non-load-bearing — see Hooks docs.
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -59,7 +55,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent")
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -76,6 +72,17 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	go sess.consumeRingbuf(aggregateCPUSample)
 
 	return p, nil
+}
+
+// NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
+// newSession, opens per-CPU perf events at sampleRate Hz, attaches
+// the BPF program to each, and starts the ringbuf reader + tracker
+// goroutines.
+//
+// On error, every resource created is closed before returning.
+// Callers should NOT call Close on a Profiler they received as (nil, err).
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
+	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil)
 }
 
 // attachPerfEvents opens one perf_event_open per CPU (pid=-1, cpu=N,
@@ -170,4 +177,16 @@ func (p *Profiler) Close() error {
 	p.perfLinks = nil
 	p.perfFDs = nil
 	return p.close()
+}
+
+// AttachStats returns the (pidCount, binaryCount) recorded by newSession's
+// initial AttachAllProcesses/AttachAllMappings call. For per-PID profilers,
+// pidCount is always 1. For system-wide, pidCount is the number of distinct
+// PIDs successfully scanned. binaryCount is the number of distinct binaries
+// (by build-id) compiled into the BPF maps.
+//
+// Returns (0, 0) if the initial attach failed (the agent still ran in
+// FP-only mode for unattached binaries).
+func (p *Profiler) AttachStats() (pidCount, binaryCount int) {
+	return p.attachStats.pidCount, p.attachStats.binaryCount
 }

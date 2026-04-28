@@ -1,8 +1,10 @@
 package ehmaps
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
 
@@ -69,6 +71,11 @@ type TableStore struct {
 	CFIClassLengths   *ebpf.Map
 
 	rc *RefcountTable
+
+	// onCompile, if non-nil, is invoked after each successful first-time
+	// compile in AcquireBinary. Nil means no observation. Set via
+	// SetOnCompile after construction.
+	onCompile func(path, buildID string, ehFrameBytes int, dur time.Duration)
 }
 
 // NewTableStore wires up a TableStore around already-loaded BPF maps
@@ -82,6 +89,14 @@ func NewTableStore(cfi, cfiLen, cls, clsLen *ebpf.Map) *TableStore {
 		CFIClassLengths:   clsLen,
 		rc:                NewRefcountTable(),
 	}
+}
+
+// SetOnCompile installs an observer callback that fires after each
+// successful CFI compile in AcquireBinary. Pass nil to disable.
+// Not safe to call concurrently with AcquireBinary; set once at
+// construction time.
+func (s *TableStore) SetOnCompile(fn func(path, buildID string, ehFrameBytes int, dur time.Duration)) {
+	s.onCompile = fn
 }
 
 // AcquireBinary ensures CFI for `binPath` is installed and references
@@ -98,10 +113,15 @@ func (s *TableStore) AcquireBinary(binPath string, pid uint32) (tableID uint64, 
 		return tableID, false, nil // already installed
 	}
 	// First reference for this tableID — compile + install.
-	entries, classifications, err := ehcompile.Compile(binPath)
+	t0 := time.Now()
+	entries, classifications, ehFrameBytes, err := ehcompile.Compile(binPath)
+	compileDur := time.Since(t0)
 	if err != nil {
 		s.rc.Release(tableID, pid)
 		return 0, false, fmt.Errorf("ehcompile %s: %w", binPath, err)
+	}
+	if s.onCompile != nil {
+		s.onCompile(binPath, hex.EncodeToString(buildID), ehFrameBytes, compileDur)
 	}
 	if err := PopulateCFI(PopulateCFIArgs{
 		TableID: tableID, Entries: entries,

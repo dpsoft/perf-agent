@@ -234,3 +234,86 @@ func TestTimelineBuildsLaunchOnlyWorkloadAttribution(t *testing.T) {
 		t.Fatalf("backends=%v", got.Backends)
 	}
 }
+
+func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "b"},
+		TimeNs:      40,
+		Launch: LaunchContext{
+			PID: 2,
+			TID: 2,
+			Tags: map[string]string{
+				"cgroup_id": "2000",
+				"pod_uid":   "pod-b",
+			},
+		},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventSubmit,
+		Name:       "submit-b",
+		TimeNs:     50,
+		DurationNs: 5,
+		PID:        2,
+		TID:        2,
+	})
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "a"},
+		TimeNs:      10,
+		Launch: LaunchContext{
+			PID: 1,
+			TID: 1,
+			Tags: map[string]string{
+				"cgroup_id": "1000",
+				"pod_uid":   "pod-a",
+			},
+		},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventSubmit,
+		Name:       "submit-a1",
+		TimeNs:     20,
+		DurationNs: 3,
+		PID:        1,
+		TID:        1,
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventWait,
+		Name:       "wait-a2",
+		TimeNs:     25,
+		DurationNs: 4,
+		PID:        1,
+		TID:        1,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Attributions) != 2 {
+		t.Fatalf("got %d attributions", len(snapshot.Attributions))
+	}
+
+	first := snapshot.Attributions[0]
+	second := snapshot.Attributions[1]
+
+	if first.CgroupID != "1000" || first.PodUID != "pod-a" {
+		t.Fatalf("first attribution=%+v", first)
+	}
+	if first.LaunchCount != 1 || first.EventCount != 2 || first.EventDurationNs != 7 {
+		t.Fatalf("first totals=%+v", first)
+	}
+	if first.FirstSeenNs != 10 || first.LastSeenNs != 29 {
+		t.Fatalf("first window=%+v", first)
+	}
+
+	if second.CgroupID != "2000" || second.PodUID != "pod-b" {
+		t.Fatalf("second attribution=%+v", second)
+	}
+	if second.LaunchCount != 1 || second.EventCount != 1 || second.EventDurationNs != 5 {
+		t.Fatalf("second totals=%+v", second)
+	}
+	if second.FirstSeenNs != 40 || second.LastSeenNs != 55 {
+		t.Fatalf("second window=%+v", second)
+	}
+}

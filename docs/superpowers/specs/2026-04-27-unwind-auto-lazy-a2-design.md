@@ -169,6 +169,30 @@ static __always_inline void emit_cfi_miss(__u32 pid, __u64 table_id, __u64 rel_p
 }
 ```
 
+### Additional emit site for lazy mode
+
+The FP_LESS+miss emit covers the case where classification IS compiled but specific PCs have no CFI rule. Lazy mode (Option A2) needs an earlier emit point: when the walker enters an enrolled-but-uncompiled binary, classify_rel_pc returns the default MODE_FP_SAFE because cfi_classification has no entry for table_id, and the FP_LESS branch is never taken.
+
+The fix is a single map probe before classify_rel_pc:
+
+```c
+struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
+__u8 mode = MODE_FP_SAFE;
+if (m.found) {
+    __u32 *cls_len = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id);
+    if (!cls_len) {
+        emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
+        // Fall through to FP path for this sample.
+    } else {
+        mode = classify_rel_pc(m.table_id, m.rel_pc);
+    }
+}
+```
+
+Eager mode is unchanged: every binary's cfi_classification is compiled, so the length lookup always succeeds, and classify_rel_pc runs as before. In lazy mode, the first sample on an enrolled-but-uncompiled binary triggers the miss emit; userspace compiles; subsequent samples find the length entry and classify normally.
+
+The FP_LESS+`cfi_lookup` miss emit (the original Task 1 emit point) stays as a fallback for the rare case where classification is present but a specific PC lacks a CFI rule.
+
 ### Verifier considerations
 
 - `walk_step` is already non-trivial. `emit_cfi_miss` adds ~10 instructions inline. Confirm with `bpftool prog dump` after build that we stay under the kernel's instruction-count cap on the project's target kernels (4.x EOL, 5.x supported). If we hit the cap, fallback is to move `emit_cfi_miss` into a tail-called helper (one extra map jump).

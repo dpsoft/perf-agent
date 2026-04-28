@@ -452,7 +452,20 @@ static long walk_step(__u32 idx, void *arg) {
     struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
     __u8 mode = MODE_FP_SAFE;
     if (m.found) {
-        mode = classify_rel_pc(m.table_id, m.rel_pc);
+        // Lazy mode (Option A2): pid_mappings is populated but
+        // cfi_classification may not be. Detect by probing
+        // cfi_classification_lengths[table_id]. If missing, the binary
+        // was enrolled but not yet compiled — emit a miss event so the
+        // userspace drainer compiles on demand. Fall through to FP path
+        // for this sample; the next sample after compile completes will
+        // classify and unwind normally.
+        __u32 *cls_len = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id);
+        if (!cls_len) {
+            emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
+            // mode stays MODE_FP_SAFE (default); continue via FP path.
+        } else {
+            mode = classify_rel_pc(m.table_id, m.rel_pc);
+        }
     }
 
     if (mode == MODE_FP_LESS) {

@@ -192,6 +192,9 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	if got.LaunchCount != 1 {
 		t.Fatalf("launch count=%d", got.LaunchCount)
 	}
+	if got.ExactJoinCount != 1 || got.HeuristicJoinCount != 1 {
+		t.Fatalf("join counts=%+v", got)
+	}
 	if got.ExecutionCount != 1 || got.ExecutionDurationNs != 80 {
 		t.Fatalf("execution aggregation=%+v", got)
 	}
@@ -235,6 +238,9 @@ func TestTimelineBuildsLaunchOnlyWorkloadAttribution(t *testing.T) {
 	}
 	if got.LaunchCount != 1 {
 		t.Fatalf("launch count=%d", got.LaunchCount)
+	}
+	if got.ExactJoinCount != 0 || got.HeuristicJoinCount != 0 {
+		t.Fatalf("join counts=%+v", got)
 	}
 	if got.FirstSeenNs != 55 || got.LastSeenNs != 55 {
 		t.Fatalf("seen window=%+v", got)
@@ -312,6 +318,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 	if first.LaunchCount != 1 || first.EventCount != 2 || first.EventDurationNs != 7 {
 		t.Fatalf("first totals=%+v", first)
 	}
+	if first.ExactJoinCount != 0 || first.HeuristicJoinCount != 2 {
+		t.Fatalf("first joins=%+v", first)
+	}
 	if first.FirstSeenNs != 10 || first.LastSeenNs != 29 {
 		t.Fatalf("first window=%+v", first)
 	}
@@ -321,6 +330,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 	}
 	if second.LaunchCount != 1 || second.EventCount != 1 || second.EventDurationNs != 5 {
 		t.Fatalf("second totals=%+v", second)
+	}
+	if second.ExactJoinCount != 0 || second.HeuristicJoinCount != 1 {
+		t.Fatalf("second joins=%+v", second)
 	}
 	if second.FirstSeenNs != 40 || second.LastSeenNs != 55 {
 		t.Fatalf("second window=%+v", second)

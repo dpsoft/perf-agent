@@ -148,6 +148,8 @@ type WorkloadAttribution struct {
 	LastSeenNs          uint64         `json:"last_seen_ns,omitempty"`
 	Backends            []GPUBackendID `json:"backends,omitempty"`
 	LaunchCount         uint64         `json:"launch_count,omitempty"`
+	ExactJoinCount      uint64         `json:"exact_join_count,omitempty"`
+	HeuristicJoinCount  uint64         `json:"heuristic_join_count,omitempty"`
 	ExecutionCount      uint64         `json:"execution_count,omitempty"`
 	ExecutionDurationNs uint64         `json:"execution_duration_ns,omitempty"`
 	SampleWeight        uint64         `json:"sample_weight,omitempty"`

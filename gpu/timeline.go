@@ -134,6 +134,7 @@ func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, e
 		entry := ensureAttribution(byKey, key)
 		entry.observe(exec.Exec.StartNs, exec.Exec.EndNs)
 		entry.addBackend(exec.Exec.Execution.Backend)
+		entry.observeJoin(exec.Join)
 		entry.ExecutionCount++
 		entry.ExecutionDurationNs += max(1, exec.Exec.EndNs-exec.Exec.StartNs)
 		if len(exec.Samples) == 0 {
@@ -154,6 +155,7 @@ func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, e
 		entry := ensureAttribution(byKey, key)
 		entry.observe(event.Event.TimeNs, event.Event.TimeNs+max(1, event.Event.DurationNs))
 		entry.addBackend(event.Event.Backend)
+		entry.observeJoin(event.Join)
 		entry.EventCount++
 		entry.EventDurationNs += max(1, event.Event.DurationNs)
 	}
@@ -224,6 +226,15 @@ func (w *WorkloadAttribution) addBackend(backend GPUBackendID) {
 	}
 	w.Backends = append(w.Backends, backend)
 	slices.Sort(w.Backends)
+}
+
+func (w *WorkloadAttribution) observeJoin(join JoinKind) {
+	switch join {
+	case JoinExact:
+		w.ExactJoinCount++
+	case JoinHeuristic:
+		w.HeuristicJoinCount++
+	}
 }
 
 func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch {

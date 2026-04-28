@@ -7,7 +7,7 @@ import (
 )
 
 func TestNormalizeRecord(t *testing.T) {
-	event, err := normalizeRecord(rawRecord{
+	event, err := normalizeRecordWithResolvers(rawRecord{
 		Kind:        recordKindIOCtl,
 		PID:         123,
 		TID:         124,
@@ -20,6 +20,8 @@ func TestNormalizeRecord(t *testing.T) {
 		DeviceMinor: 128,
 		Inode:       77,
 		CgroupID:    4242,
+	}, lookupDRMDeviceInfo, func(uint32) (string, bool) {
+		return "/kubepods.slice/pod-abc/container-def", true
 	})
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
@@ -60,6 +62,9 @@ func TestNormalizeRecord(t *testing.T) {
 	}
 	if got := event.Attributes["cgroup_id"]; got != "4242" {
 		t.Fatalf("cgroup_id=%q", got)
+	}
+	if got := event.Attributes["cgroup_path"]; got != "/kubepods.slice/pod-abc/container-def" {
+		t.Fatalf("cgroup_path=%q", got)
 	}
 }
 

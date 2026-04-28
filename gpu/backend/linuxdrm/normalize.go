@@ -8,14 +8,22 @@ import (
 )
 
 func normalizeRecord(record rawRecord) (gpu.GPUTimelineEvent, error) {
-	return normalizeRecordWithLookup(record, lookupDRMDeviceInfo)
+	return normalizeRecordWithResolvers(record, lookupDRMDeviceInfo, lookupCgroupPath)
 }
 
 func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (drmDeviceInfo, bool)) (gpu.GPUTimelineEvent, error) {
+	return normalizeRecordWithResolvers(record, lookup, lookupCgroupPath)
+}
+
+func normalizeRecordWithResolvers(
+	record rawRecord,
+	lookupDevice func(uint32, uint32) (drmDeviceInfo, bool),
+	lookupCgroup func(uint32) (string, bool),
+) (gpu.GPUTimelineEvent, error) {
 	switch record.Kind {
 	case recordKindIOCtl:
-		device, attrs := classifyFileIdentityWithLookup(record, lookup)
-		addAttributionAttrs(attrs, record)
+		device, attrs := classifyFileIdentityWithLookup(record, lookupDevice)
+		addAttributionAttrs(attrs, record, lookupCgroup)
 		for key, value := range ioctlAttributes(record.Command) {
 			attrs[key] = value
 		}
@@ -67,7 +75,7 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
 			},
 		}
-		addAttributionAttrs(event.Attributes, record)
+		addAttributionAttrs(event.Attributes, record, lookupCgroup)
 		return event, nil
 	case recordKindSchedRunq:
 		event := gpu.GPUTimelineEvent{
@@ -84,16 +92,21 @@ func normalizeRecordWithLookup(record rawRecord, lookup func(uint32, uint32) (dr
 				"cpu": strconv.FormatUint(uint64(record.CPU), 10),
 			},
 		}
-		addAttributionAttrs(event.Attributes, record)
+		addAttributionAttrs(event.Attributes, record, lookupCgroup)
 		return event, nil
 	default:
 		return gpu.GPUTimelineEvent{}, fmt.Errorf("unsupported record kind %d", record.Kind)
 	}
 }
 
-func addAttributionAttrs(attrs map[string]string, record rawRecord) {
+func addAttributionAttrs(attrs map[string]string, record rawRecord, lookupCgroup func(uint32) (string, bool)) {
 	if record.CgroupID != 0 {
 		attrs["cgroup_id"] = strconv.FormatUint(record.CgroupID, 10)
+	}
+	if lookupCgroup != nil {
+		if path, ok := lookupCgroup(record.PID); ok {
+			attrs["cgroup_path"] = path
+		}
 	}
 }
 

@@ -1,0 +1,32 @@
+[
+  {
+    "kind": "exec",
+    "correlation": { "backend": "stream", "value": "corr-a" },
+    "kernel_name": "alpha_kernel",
+    "start_ns": 20,
+    "end_ns": 80
+  },
+  {
+    "kind": "sample",
+    "correlation": { "backend": "stream", "value": "corr-a" },
+    "time_ns": 50,
+    "kernel_name": "alpha_kernel",
+    "stall_reason": "memory_throttle",
+    "weight": 11
+  },
+  {
+    "kind": "exec",
+    "correlation": { "backend": "stream", "value": "corr-b" },
+    "kernel_name": "beta_kernel",
+    "start_ns": 60,
+    "end_ns": 100
+  },
+  {
+    "kind": "sample",
+    "correlation": { "backend": "stream", "value": "corr-b" },
+    "time_ns": 90,
+    "kernel_name": "beta_kernel",
+    "stall_reason": "wait",
+    "weight": 13
+  }
+]

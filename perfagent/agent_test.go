@@ -477,6 +477,23 @@ func TestAgentHostReplayPlusCheckedInGPUExecutionReplayRawJSONGolden(t *testing.
 	assert.Equal(t, string(want), raw.String())
 }
 
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUExecutionReplayRawJSONGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.json")),
+		WithGPURawOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.raw.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}
+
 func TestAgentHostReplayPlusGPUStreamFoldedGolden(t *testing.T) {
 	var folded bytes.Buffer
 	agent, err := New(
@@ -510,6 +527,23 @@ func TestAgentHostReplayPlusCheckedInGPUExecutionReplayFoldedGolden(t *testing.T
 	require.NoError(t, agent.Start(ctx))
 	require.NoError(t, agent.Stop(ctx))
 	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_exec_sample.folded"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), folded.String())
+}
+
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUExecutionReplayFoldedGolden(t *testing.T) {
+	var folded bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.json")),
+		WithGPUFoldedOutput(&folded),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.folded"))
 	require.NoError(t, err)
 	assert.Equal(t, string(want), folded.String())
 }
@@ -601,6 +635,28 @@ func TestAgentHostReplayPlusCheckedInGPUExecutionReplayProfileGolden(t *testing.
 	got := flattenedSampleStacks(prof)
 
 	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_exec_sample.pprof.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), got)
+}
+
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUExecutionReplayProfileGolden(t *testing.T) {
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.json")),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_exec.pprof.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, string(want), got)
 }

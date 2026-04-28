@@ -1,0 +1,2 @@
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:kernel:alpha_kernel];[gpu:stall:memory_throttle] 111111110
+train_step_b;cudaLaunchKernel;[gpu:cgroup:2000];[gpu:pod:pod-b];[gpu:launch];[gpu:kernel:beta_kernel];[gpu:stall:wait] 131313130

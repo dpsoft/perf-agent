@@ -260,6 +260,7 @@ func TestAgentGPUReplayMode(t *testing.T) {
 
 func TestAgentGPUStreamMode(t *testing.T) {
 	var raw bytes.Buffer
+	var folded bytes.Buffer
 	var profile bytes.Buffer
 
 	agent, err := New(
@@ -269,6 +270,7 @@ func TestAgentGPUStreamMode(t *testing.T) {
 				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
 		)),
 		WithGPURawOutput(&raw),
+		WithGPUFoldedOutput(&folded),
 		WithGPUProfileOutput(&profile),
 	)
 	require.NoError(t, err)
@@ -277,6 +279,7 @@ func TestAgentGPUStreamMode(t *testing.T) {
 	require.NoError(t, agent.Start(ctx))
 	require.NoError(t, agent.Stop(ctx))
 	assert.Contains(t, raw.String(), "flash_attn_fwd")
+	assert.Contains(t, folded.String(), "[gpu:kernel:flash_attn_fwd]")
 	assert.NotZero(t, profile.Len())
 }
 

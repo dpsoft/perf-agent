@@ -438,6 +438,10 @@ func (a *Agent) Stop(ctx context.Context) error {
 			log.Printf("Failed to write GPU profile output: %v", err)
 			lastErr = err
 		}
+		if err := a.writeGPUFolded(snapshot); err != nil {
+			log.Printf("Failed to write GPU folded output: %v", err)
+			lastErr = err
+		}
 	}
 
 	return lastErr
@@ -548,4 +552,20 @@ func (a *Agent) writeGPUProfile(snapshot gpu.Snapshot) error {
 		return err
 	}
 	return nil
+}
+
+func (a *Agent) writeGPUFolded(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPUFoldedOutputWriter != nil:
+		return gpu.WriteFoldedStacks(a.config.GPUFoldedOutputWriter, snapshot)
+	case a.config.GPUFoldedOutputPath != "":
+		f, err := os.Create(a.config.GPUFoldedOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteFoldedStacks(f, snapshot)
+	default:
+		return nil
+	}
 }

@@ -123,6 +123,7 @@ func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
 	prevReplay := *flagGPUReplayInput
 	prevHostHIPLibrary := *flagGPUHostHIPLibrary
 	prevHostHIPSymbol := *flagGPUHostHIPSymbol
+	prevGPUFoldedOutput := *flagGPUFoldedOutput
 	prevLinuxDRM := *flagGPULinuxDRM
 	prevProfile := *flagProfile
 	prevOffCPU := *flagOffCpu
@@ -136,6 +137,7 @@ func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
 		*flagGPUReplayInput = prevReplay
 		*flagGPUHostHIPLibrary = prevHostHIPLibrary
 		*flagGPUHostHIPSymbol = prevHostHIPSymbol
+		*flagGPUFoldedOutput = prevGPUFoldedOutput
 		*flagGPULinuxDRM = prevLinuxDRM
 		*flagProfile = prevProfile
 		*flagOffCpu = prevOffCPU
@@ -149,6 +151,7 @@ func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
 	*flagGPUReplayInput = ""
 	*flagGPUHostHIPLibrary = "/opt/rocm/lib/libamdhip64.so"
 	*flagGPUHostHIPSymbol = "hipLaunchKernel"
+	*flagGPUFoldedOutput = ""
 	*flagGPULinuxDRM = false
 	*flagProfile = false
 	*flagOffCpu = false

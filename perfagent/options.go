@@ -91,6 +91,12 @@ type Config struct {
 
 	// GPUProfileOutputWriter receives synthetic-frame GPU pprof output when set.
 	GPUProfileOutputWriter io.Writer
+
+	// GPUFoldedOutputPath writes folded-stack GPU flamegraph input when set.
+	GPUFoldedOutputPath string
+
+	// GPUFoldedOutputWriter receives folded-stack GPU flamegraph input when set.
+	GPUFoldedOutputWriter io.Writer
 }
 
 // Option is a functional option for configuring the Agent.
@@ -256,6 +262,12 @@ func WithGPUProfileOutput(w io.Writer) Option {
 	}
 }
 
+func WithGPUFoldedOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUFoldedOutputWriter = w
+	}
+}
+
 func WithGPURawOutputPath(path string) Option {
 	return func(c *Config) {
 		c.GPURawOutputPath = path
@@ -265,6 +277,12 @@ func WithGPURawOutputPath(path string) Option {
 func WithGPUProfileOutputPath(path string) Option {
 	return func(c *Config) {
 		c.GPUProfileOutputPath = path
+	}
+}
+
+func WithGPUFoldedOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUFoldedOutputPath = path
 	}
 }
 

@@ -36,6 +36,7 @@ var (
 	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
 	flagGPURawOutput       = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
 	flagGPUProfileOutput   = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
+	flagGPUFoldedOutput    = flag.String("gpu-folded-output", "", "Experimental: write folded GPU flamegraph input to this path")
 	flagTags               tagFlags
 )
 
@@ -195,6 +196,9 @@ func buildOptions() []perfagent.Option {
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
 		}
+		if *flagGPUFoldedOutput != "" {
+			opts = append(opts, perfagent.WithGPUFoldedOutputPath(*flagGPUFoldedOutput))
+		}
 	}
 	if gpuHostReplayMode {
 		opts = append(opts, perfagent.WithGPUHostReplayInput(*flagGPUHostReplayInput))
@@ -210,11 +214,17 @@ func buildOptions() []perfagent.Option {
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
 		}
+		if *flagGPUFoldedOutput != "" {
+			opts = append(opts, perfagent.WithGPUFoldedOutputPath(*flagGPUFoldedOutput))
+		}
 	}
 	if gpuLinuxDRMMode {
 		opts = append(opts, perfagent.WithGPULinuxDRM())
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
+		}
+		if *flagGPUFoldedOutput != "" {
+			opts = append(opts, perfagent.WithGPUFoldedOutputPath(*flagGPUFoldedOutput))
 		}
 	}
 

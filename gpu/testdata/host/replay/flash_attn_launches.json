@@ -19,7 +19,9 @@
     "tags": {
       "env": "test",
       "cgroup_id": "9876",
-      "pod_uid": "pod-abc"
+      "pod_uid": "pod-abc",
+      "container_id": "ctr-123",
+      "container_runtime": "containerd"
     },
     "source": "host-replay"
   }

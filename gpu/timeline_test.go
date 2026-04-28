@@ -143,8 +143,10 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 			PID: 10,
 			TID: 11,
 			Tags: map[string]string{
-				"cgroup_id": "9876",
-				"pod_uid":   "pod-abc",
+				"cgroup_id":         "9876",
+				"pod_uid":           "pod-abc",
+				"container_id":      "ctr-123",
+				"container_runtime": "containerd",
 			},
 		},
 	})
@@ -175,7 +177,7 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 		t.Fatalf("got %d attributions", len(snapshot.Attributions))
 	}
 	got := snapshot.Attributions[0]
-	if got.CgroupID != "9876" || got.PodUID != "pod-abc" {
+	if got.CgroupID != "9876" || got.PodUID != "pod-abc" || got.ContainerID != "ctr-123" || got.ContainerRuntime != "containerd" {
 		t.Fatalf("attribution=%+v", got)
 	}
 	if got.ExecutionCount != 1 || got.ExecutionDurationNs != 80 {

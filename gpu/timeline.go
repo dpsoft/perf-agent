@@ -96,6 +96,7 @@ type workloadKey struct {
 	cgroupID    string
 	podUID      string
 	containerID string
+	runtime     string
 }
 
 func buildAttributions(executions []ExecutionView, events []EventView) []WorkloadAttribution {
@@ -145,7 +146,10 @@ func buildAttributions(executions []ExecutionView, events []EventView) []Workloa
 		if diff := cmp.Compare(a.PodUID, b.PodUID); diff != 0 {
 			return diff
 		}
-		return cmp.Compare(a.ContainerID, b.ContainerID)
+		if diff := cmp.Compare(a.ContainerID, b.ContainerID); diff != 0 {
+			return diff
+		}
+		return cmp.Compare(a.ContainerRuntime, b.ContainerRuntime)
 	})
 	return out
 }
@@ -155,6 +159,7 @@ func attributionKey(tags map[string]string) (workloadKey, bool) {
 		cgroupID:    tags["cgroup_id"],
 		podUID:      tags["pod_uid"],
 		containerID: tags["container_id"],
+		runtime:     tags["container_runtime"],
 	}
 	if key == (workloadKey{}) {
 		return workloadKey{}, false
@@ -167,9 +172,10 @@ func ensureAttribution(byKey map[workloadKey]*WorkloadAttribution, key workloadK
 		return entry
 	}
 	entry := &WorkloadAttribution{
-		CgroupID:    key.cgroupID,
-		PodUID:      key.podUID,
-		ContainerID: key.containerID,
+		CgroupID:         key.cgroupID,
+		PodUID:           key.podUID,
+		ContainerID:      key.containerID,
+		ContainerRuntime: key.runtime,
 	}
 	byKey[key] = entry
 	return entry

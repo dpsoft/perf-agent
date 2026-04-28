@@ -143,6 +143,7 @@ type WorkloadAttribution struct {
 	CgroupID            string         `json:"cgroup_id,omitempty"`
 	PodUID              string         `json:"pod_uid,omitempty"`
 	ContainerID         string         `json:"container_id,omitempty"`
+	ContainerRuntime    string         `json:"container_runtime,omitempty"`
 	FirstSeenNs         uint64         `json:"first_seen_ns,omitempty"`
 	LastSeenNs          uint64         `json:"last_seen_ns,omitempty"`
 	Backends            []GPUBackendID `json:"backends,omitempty"`

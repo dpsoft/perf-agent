@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
+
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 )
 
@@ -135,7 +137,16 @@ func (s *session) consumeCFIMisses() {
 			continue
 		}
 		s.missCounters.received.Add(1)
-		s.missCounters.lastLatencyNs.Store(uint64(time.Now().UnixNano()) - ev.KtimeNs)
+		// ev.KtimeNs is bpf_ktime_get_ns() — CLOCK_MONOTONIC since boot.
+		// Compare against the same clock on the userspace side; using
+		// time.Now() (wallclock) would underflow into nonsense.
+		var ts unix.Timespec
+		if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err == nil {
+			nowNs := uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
+			if nowNs >= ev.KtimeNs {
+				s.missCounters.lastLatencyNs.Store(nowNs - ev.KtimeNs)
+			}
+		}
 
 		key := cfiMissKey{pid: ev.PID, tableID: ev.TableID}
 		mu.Lock()

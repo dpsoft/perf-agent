@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/dpsoft/perf-agent/gpu/cgroupmeta"
 	"github.com/dpsoft/perf-agent/gpu"
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
@@ -24,7 +25,8 @@ type LaunchRecord struct {
 }
 
 type launchSink struct {
-	sink gpu.EventSink
+	sink    gpu.EventSink
+	cgroups *cgroupmeta.PathCache
 }
 
 func NormalizeLaunch(record LaunchRecord) (gpu.GPUKernelLaunch, error) {
@@ -60,14 +62,50 @@ func NormalizeLaunch(record LaunchRecord) (gpu.GPUKernelLaunch, error) {
 }
 
 func NewLaunchSink(sink gpu.EventSink) HostSink {
-	return launchSink{sink: sink}
+	return newLaunchSinkWithLookup(sink, cgroupmeta.LookupPath)
 }
 
 func (s launchSink) EmitLaunchRecord(record LaunchRecord) error {
+	record.Tags = s.enrichTags(record.PID, record.Tags)
 	launch, err := NormalizeLaunch(record)
 	if err != nil {
 		return err
 	}
 	s.sink.EmitLaunch(launch)
 	return nil
+}
+
+func newLaunchSinkWithLookup(sink gpu.EventSink, lookup cgroupmeta.PathLookup) HostSink {
+	return launchSink{
+		sink:    sink,
+		cgroups: cgroupmeta.NewPathCache(lookup),
+	}
+}
+
+func (s launchSink) enrichTags(pid uint32, tags map[string]string) map[string]string {
+	if s.cgroups == nil || pid == 0 {
+		return maps.Clone(tags)
+	}
+	path, ok := s.cgroups.Lookup(pid)
+	if !ok || path == "" {
+		return maps.Clone(tags)
+	}
+	out := maps.Clone(tags)
+	if out == nil {
+		out = make(map[string]string)
+	}
+	if out["cgroup_path"] == "" {
+		out["cgroup_path"] = path
+	}
+	meta := cgroupmeta.MetadataFromPath(path)
+	if out["pod_uid"] == "" && meta.PodUID != "" {
+		out["pod_uid"] = meta.PodUID
+	}
+	if out["container_id"] == "" && meta.ContainerID != "" {
+		out["container_id"] = meta.ContainerID
+	}
+	if out["container_runtime"] == "" && meta.ContainerRuntime != "" {
+		out["container_runtime"] = meta.ContainerRuntime
+	}
+	return out
 }

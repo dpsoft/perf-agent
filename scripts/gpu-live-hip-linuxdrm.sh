@@ -46,6 +46,18 @@ quote_cmd() {
     printf '%s\n' "${parts[*]}"
 }
 
+pid_exists() {
+    [[ -d "/proc/$1" ]]
+}
+
+pid_maps_hip() {
+    local pid="$1"
+    if grep -q 'libamdhip64' "/proc/${pid}/maps" 2>/dev/null; then
+        return 0
+    fi
+    sudo grep -q 'libamdhip64' "/proc/${pid}/maps" 2>/dev/null
+}
+
 DRY_RUN=0
 OUTDIR="/tmp/gpu-live"
 PID=""
@@ -135,6 +147,20 @@ declare -a SUDO_CMD=(
 )
 
 if [[ -n "${PID}" ]]; then
+    if [[ ! "${PID}" =~ ^[0-9]+$ ]]; then
+        echo "pid must be numeric: ${PID}" >&2
+        exit 1
+    fi
+    if [[ "${DRY_RUN}" != "1" ]]; then
+        if ! pid_exists "${PID}"; then
+            echo "pid does not exist: ${PID}" >&2
+            exit 1
+        fi
+        if ! pid_maps_hip "${PID}"; then
+            echo "pid does not map libamdhip64: ${PID}" >&2
+            exit 1
+        fi
+    fi
     SUDO_CMD[13]="${PID}"
 elif [[ "${DRY_RUN}" == "1" ]]; then
     echo "dry-run placeholder: pass --pid <live-hip-process-pid> for a real run"

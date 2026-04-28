@@ -490,6 +490,76 @@ func TestGPULiveHIPLinuxDRMWrapperDryRunAutoTarget(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPLinuxDRMWrapperRejectsMissingPID(t *testing.T) {
+	fakeDir := t.TempDir()
+	fakeHipLib := filepath.Join(fakeDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeHipLib, []byte(""), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+	fakeSudo := filepath.Join(fakeDir, "sudo")
+	if err := os.WriteFile(fakeSudo, []byte("#!/bin/sh\necho unexpected sudo >&2\nexit 42\n"), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"999999",
+		"--hip-library",
+		fakeHipLib,
+	)
+	cmd.Env = append(os.Environ(), "PATH="+fakeDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing pid failure, got success:\n%s", out)
+	}
+	got := string(out)
+	if strings.Contains(got, "unexpected sudo") {
+		t.Fatalf("wrapper reached sudo before missing pid preflight:\n%s", got)
+	}
+	if !strings.Contains(got, "does not exist") {
+		t.Fatalf("missing pid preflight message not found:\n%s", got)
+	}
+}
+
+func TestGPULiveHIPLinuxDRMWrapperRejectsNonHIPPID(t *testing.T) {
+	fakeDir := t.TempDir()
+	fakeHipLib := filepath.Join(fakeDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeHipLib, []byte(""), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+	fakeSudo := filepath.Join(fakeDir, "sudo")
+	if err := os.WriteFile(fakeSudo, []byte("#!/bin/sh\necho unexpected sudo >&2\nexit 42\n"), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		strconv.Itoa(os.Getpid()),
+		"--hip-library",
+		fakeHipLib,
+	)
+	cmd.Env = append(os.Environ(), "PATH="+fakeDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-hip pid failure, got success:\n%s", out)
+	}
+	got := string(out)
+	if strings.Contains(got, "unexpected sudo") {
+		t.Fatalf("wrapper reached sudo before hip maps preflight:\n%s", got)
+	}
+	if !strings.Contains(got, "does not map libamdhip64") {
+		t.Fatalf("non-hip pid preflight message not found:\n%s", got)
+	}
+}
+
 func requireBPFCapsForRootTest(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 {

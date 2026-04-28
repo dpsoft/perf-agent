@@ -20,7 +20,7 @@ func WriteFoldedStacks(w io.Writer, snap Snapshot) error {
 
 func foldedLines(snap Snapshot) []string {
 	var out []string
-	for _, sample := range ProjectExecutionSamples(snap) {
+	for _, sample := range projectExecutionOnlySamples(snap.Executions) {
 		if len(sample.Stack) == 0 {
 			continue
 		}

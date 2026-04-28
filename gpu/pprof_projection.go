@@ -7,8 +7,25 @@ import (
 )
 
 func ProjectExecutionSamples(snap Snapshot) []pp.ProfileSample {
+	out := projectExecutionOnlySamples(snap.Executions)
+	for _, eventView := range snap.EventViews {
+		if eventView.Launch == nil {
+			continue
+		}
+		out = append(out, pp.ProfileSample{
+			Pid:         eventView.Launch.Launch.PID,
+			SampleType:  pp.SampleTypeCpu,
+			Aggregation: pp.SampleAggregated,
+			Stack:       buildEventSyntheticStack(eventView),
+			Value:       max(1, eventView.Event.DurationNs),
+		})
+	}
+	return out
+}
+
+func projectExecutionOnlySamples(views []ExecutionView) []pp.ProfileSample {
 	var out []pp.ProfileSample
-	for _, execView := range snap.Executions {
+	for _, execView := range views {
 		switch {
 		case len(execView.Samples) > 0:
 			for _, gpuSample := range execView.Samples {
@@ -70,6 +87,17 @@ func buildLaunchTagFrames(tags map[string]string) []pp.Frame {
 		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:container:%s]", value)))
 	}
 	return frames
+}
+
+func buildEventSyntheticStack(eventView EventView) []pp.Frame {
+	var stack []pp.Frame
+	if eventView.Launch != nil {
+		stack = append(stack, eventView.Launch.Launch.CPUStack...)
+		stack = append(stack, buildLaunchTagFrames(eventView.Launch.Launch.Tags)...)
+	}
+	stack = append(stack, pp.FrameFromName("[gpu:launch]"))
+	stack = append(stack, pp.FrameFromName(fmt.Sprintf("[gpu:event:%s:%s]", eventView.Event.Kind, eventView.Event.Name)))
+	return stack
 }
 
 func (e ExecutionView) launchPID() uint32 {

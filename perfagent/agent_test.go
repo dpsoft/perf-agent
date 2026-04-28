@@ -5,9 +5,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	goprofile "github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -402,4 +404,48 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayRawJSONGolden(t *testing.T) {
 	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.raw.json"))
 	require.NoError(t, err)
 	assert.Equal(t, string(want), raw.String())
+}
+
+func TestAgentHostReplayPlusCheckedInGPUEventReplayProfileGolden(t *testing.T) {
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.json")),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.pprof.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), got)
+}
+
+func flattenedSampleStacks(prof *goprofile.Profile) string {
+	var b strings.Builder
+	for _, sample := range prof.Sample {
+		var frames []string
+		for _, loc := range sample.Location {
+			if len(loc.Line) == 0 || loc.Line[0].Function == nil {
+				continue
+			}
+			frames = append(frames, loc.Line[0].Function.Name)
+		}
+		b.WriteString(strings.Join(frames, ";"))
+		b.WriteByte(' ')
+		if len(sample.Value) > 0 {
+			b.WriteString(strconv.FormatInt(sample.Value[0], 10))
+		} else {
+			b.WriteByte('0')
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

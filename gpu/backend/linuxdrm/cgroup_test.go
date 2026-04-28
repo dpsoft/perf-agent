@@ -83,3 +83,30 @@ func TestParseCgroupPathMetadataFromCgroupfsKubePath(t *testing.T) {
 		t.Fatalf("runtime=%q want empty", meta.ContainerRuntime)
 	}
 }
+
+func TestCgroupPathCacheCachesHitsAndMisses(t *testing.T) {
+	calls := 0
+	cache := newCgroupPathCache(func(pid uint32) (string, bool) {
+		calls++
+		if pid == 42 {
+			return "/kubepods/pod-abc/container-def", true
+		}
+		return "", false
+	})
+
+	if got, ok := cache.Lookup(42); !ok || got != "/kubepods/pod-abc/container-def" {
+		t.Fatalf("Lookup(42)=(%q,%v)", got, ok)
+	}
+	if got, ok := cache.Lookup(42); !ok || got != "/kubepods/pod-abc/container-def" {
+		t.Fatalf("Lookup(42) cached=(%q,%v)", got, ok)
+	}
+	if _, ok := cache.Lookup(77); ok {
+		t.Fatal("expected miss for pid 77")
+	}
+	if _, ok := cache.Lookup(77); ok {
+		t.Fatal("expected cached miss for pid 77")
+	}
+	if calls != 2 {
+		t.Fatalf("lookup calls=%d want 2", calls)
+	}
+}

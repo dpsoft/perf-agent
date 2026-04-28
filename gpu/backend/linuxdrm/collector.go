@@ -24,6 +24,8 @@ var (
 type Backend struct {
 	cfg Config
 
+	cgroups *cgroupPathCache
+
 	mu      sync.Mutex
 	started bool
 	done    chan struct{}
@@ -42,7 +44,10 @@ func New(cfg Config) (*Backend, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Backend{cfg: cfg}, nil
+	return &Backend{
+		cfg:     cfg,
+		cgroups: newCgroupPathCache(lookupCgroupPath),
+	}, nil
 }
 
 func (b *Backend) ID() gpu.GPUBackendID {
@@ -154,7 +159,7 @@ func (b *Backend) err() error {
 
 func (b *Backend) emitTestRecords(sink gpu.EventSink) error {
 	for _, record := range b.cfg.testRecords {
-		if err := emitRecord(record, sink); err != nil {
+		if err := b.emitRecord(record, sink); err != nil {
 			return err
 		}
 	}
@@ -249,14 +254,14 @@ func (b *Backend) runLive(ctx context.Context, sink gpu.EventSink) error {
 		if err != nil {
 			return err
 		}
-		if err := emitRecord(decoded, sink); err != nil {
+		if err := b.emitRecord(decoded, sink); err != nil {
 			return err
 		}
 	}
 }
 
-func emitRecord(record rawRecord, sink gpu.EventSink) error {
-	event, err := normalizeRecord(record)
+func (b *Backend) emitRecord(record rawRecord, sink gpu.EventSink) error {
+	event, err := normalizeRecordWithResolvers(record, lookupDRMDeviceInfo, b.cgroups.Lookup)
 	if err != nil {
 		return err
 	}

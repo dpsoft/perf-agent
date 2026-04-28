@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const procRoot = "/proc"
@@ -24,8 +25,44 @@ type cgroupPathMetadata struct {
 	ContainerRuntime string
 }
 
+type cgroupPathLookup func(pid uint32) (string, bool)
+
+type cgroupPathCache struct {
+	mu      sync.Mutex
+	lookup  cgroupPathLookup
+	entries map[uint32]cgroupPathResult
+}
+
+type cgroupPathResult struct {
+	path string
+	ok   bool
+}
+
 func lookupCgroupPath(pid uint32) (string, bool) {
 	return lookupCgroupPathFrom(procRoot, pid)
+}
+
+func newCgroupPathCache(lookup cgroupPathLookup) *cgroupPathCache {
+	return &cgroupPathCache{
+		lookup:  lookup,
+		entries: make(map[uint32]cgroupPathResult),
+	}
+}
+
+func (c *cgroupPathCache) Lookup(pid uint32) (string, bool) {
+	c.mu.Lock()
+	if result, ok := c.entries[pid]; ok {
+		c.mu.Unlock()
+		return result.path, result.ok
+	}
+	c.mu.Unlock()
+
+	path, ok := c.lookup(pid)
+
+	c.mu.Lock()
+	c.entries[pid] = cgroupPathResult{path: path, ok: ok}
+	c.mu.Unlock()
+	return path, ok
 }
 
 func lookupCgroupPathFrom(root string, pid uint32) (string, bool) {

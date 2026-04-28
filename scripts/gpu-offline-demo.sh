@@ -211,6 +211,18 @@ Wrote:
   ${FOLDED_PATH}
   ${PROFILE_PATH}
 
+Inspect join diagnostics with:
+  jq '.join_stats' ${RAW_PATH}
+
+Inspect workload attribution with:
+  jq '.' ${ATTR_PATH}
+
 Render folded output with:
   flamegraph.pl ${FOLDED_PATH} > ${OUTDIR}/${NAME}.svg
 EOF
+
+if command -v jq >/dev/null 2>&1; then
+    echo
+    echo "join_stats:"
+    jq '.join_stats' "${RAW_PATH}"
+fi

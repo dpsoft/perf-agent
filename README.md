@@ -289,6 +289,11 @@ bash scripts/gpu-offline-demo.sh --dry-run live-hip-linuxdrm /tmp/gpu-live \
   --hip-library /opt/rocm/lib/libamdhip64.so
 ```
 
+The live path also accepts:
+
+- `--join-window <dur>` to tune HIP launch -> `linuxdrm` fallback joins
+- `PERF_AGENT_HIP_LIBRARY=/path/to/libamdhip64.so` instead of repeating `--hip-library`
+
 That prints the exact `go run . ...` command it would execute, including:
 
 - raw snapshot output
@@ -297,6 +302,15 @@ That prints the exact `go run . ...` command it would execute, including:
 - synthetic-frame `pprof`
 
 If `--hip-library` is omitted, the helper will first honor `PERF_AGENT_HIP_LIBRARY`, then try a small set of common local ROCm library paths.
+
+After a real run, the helper also prints the fastest inspection steps for the current MVP:
+
+```bash
+jq '.join_stats' /tmp/gpu-live/live_hip_linuxdrm.raw.json
+jq '.' /tmp/gpu-live/live_hip_linuxdrm.attributions.json
+```
+
+If `jq` is installed, it also prints the `join_stats` block directly.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 
@@ -431,6 +445,22 @@ This is still a host-to-driver correlation flame, not a true GPU-internal flame 
 - lifecycle event replay through the canonical event model
 - heuristic launch-to-submit attribution
 - tenancy-aware folded output suitable for later `flamegraph.pl` rendering
+
+For the live AMD path, `join_stats` in the raw snapshot is the quickest tuning signal:
+
+- `launch_count`: total host launches observed
+- `matched_launch_count`: launches used by at least one join
+- `unmatched_launch_count`: launches that never matched
+- `exact_execution_join_count`: execution joins by correlation ID
+- `heuristic_event_join_count`: submit/wait joins by PID/TID plus time window
+- `unmatched_candidate_event_count`: submit/wait events that did not match any launch
+
+That gives a practical tuning loop for `--join-window`:
+
+1. Run `live-hip-linuxdrm` against a real PID.
+2. Inspect `jq '.join_stats' ...raw.json`.
+3. If `unmatched_candidate_event_count` is high, widen the window.
+4. If almost every launch matches but the associations look suspicious, narrow the window.
 
 There is also a checked-in multi-workload lifecycle path that proves heuristic host-to-driver attribution stays workload-scoped:
 

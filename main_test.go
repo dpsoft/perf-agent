@@ -385,6 +385,39 @@ func TestGPUOfflineDemoScriptLiveHIPLinuxDRMSmoke(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"host-exec",
+		outDir,
+	)
+	cmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"CGO_CFLAGS=-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include",
+		"CGO_LDFLAGS=-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("host-exec helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"Inspect join diagnostics with:",
+		"jq '.join_stats' " + filepath.Join(outDir, "host_exec_sample.raw.json"),
+		"Inspect workload attribution with:",
+		"jq '.' " + filepath.Join(outDir, "host_exec_sample.attributions.json"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func requireBPFCapsForRootTest(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 {

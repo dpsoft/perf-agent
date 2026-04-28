@@ -13,19 +13,21 @@ type sink struct {
 	execs    []gpu.GPUKernelExec
 	counters []gpu.GPUCounterSample
 	samples  []gpu.GPUSample
+	events   []gpu.GPUTimelineEvent
 }
 
 func (s *sink) EmitLaunch(event gpu.GPUKernelLaunch)   { s.launches = append(s.launches, event) }
 func (s *sink) EmitExec(event gpu.GPUKernelExec)       { s.execs = append(s.execs, event) }
 func (s *sink) EmitCounter(event gpu.GPUCounterSample) { s.counters = append(s.counters, event) }
 func (s *sink) EmitSample(event gpu.GPUSample)         { s.samples = append(s.samples, event) }
-func (s *sink) EmitEvent(gpu.GPUTimelineEvent)         {}
+func (s *sink) EmitEvent(event gpu.GPUTimelineEvent)   { s.events = append(s.events, event) }
 
 func TestStreamBackendEmitsEventsFromReader(t *testing.T) {
 	src := strings.NewReader(
 		"{\"kind\":\"launch\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":100}\n" +
 			"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n" +
-			"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
+			"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n" +
+			"{\"kind\":\"event\",\"event\":{\"backend\":\"linuxdrm\",\"kind\":\"submit\",\"name\":\"amdgpu-cs\",\"time_ns\":130,\"duration_ns\":13,\"pid\":4242,\"tid\":4243,\"source\":\"replay\"}}\n",
 	)
 	b := New(src)
 	var s sink
@@ -45,6 +47,9 @@ func TestStreamBackendEmitsEventsFromReader(t *testing.T) {
 	}
 	if got := len(s.samples); got != 1 {
 		t.Fatalf("samples=%d", got)
+	}
+	if got := len(s.events); got != 1 {
+		t.Fatalf("events=%d", got)
 	}
 }
 

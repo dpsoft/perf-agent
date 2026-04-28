@@ -54,17 +54,18 @@ func (b *Backend) Stop(context.Context) error { return nil }
 func (b *Backend) Close() error { return nil }
 
 type rawEvent struct {
-	Kind        string            `json:"kind"`
-	Correlation gpu.CorrelationID `json:"correlation"`
-	Queue       gpu.GPUQueueRef   `json:"queue"`
-	Launch      gpu.LaunchContext `json:"launch"`
-	Device      gpu.GPUDeviceRef  `json:"device"`
-	KernelName  string            `json:"kernel_name"`
-	TimeNs      uint64            `json:"time_ns"`
-	StartNs     uint64            `json:"start_ns"`
-	EndNs       uint64            `json:"end_ns"`
-	StallReason string            `json:"stall_reason"`
-	Weight      uint64            `json:"weight"`
+	Kind        string               `json:"kind"`
+	Event       gpu.GPUTimelineEvent `json:"event"`
+	Correlation gpu.CorrelationID    `json:"correlation"`
+	Queue       gpu.GPUQueueRef      `json:"queue"`
+	Launch      gpu.LaunchContext    `json:"launch"`
+	Device      gpu.GPUDeviceRef     `json:"device"`
+	KernelName  string               `json:"kernel_name"`
+	TimeNs      uint64               `json:"time_ns"`
+	StartNs     uint64               `json:"start_ns"`
+	EndNs       uint64               `json:"end_ns"`
+	StallReason string               `json:"stall_reason"`
+	Weight      uint64               `json:"weight"`
 }
 
 func emitEvent(event rawEvent, sink gpu.EventSink) error {
@@ -94,6 +95,8 @@ func emitEvent(event rawEvent, sink gpu.EventSink) error {
 			StallReason: event.StallReason,
 			Weight:      max(1, event.Weight),
 		})
+	case "event":
+		sink.EmitEvent(event.Event)
 	default:
 		return fmt.Errorf("unsupported replay event kind %q", event.Kind)
 	}

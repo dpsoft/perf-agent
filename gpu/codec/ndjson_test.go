@@ -66,6 +66,27 @@ func TestDecodeSampleLine(t *testing.T) {
 	}
 }
 
+func TestDecodeTimelineEventLine(t *testing.T) {
+	line := []byte(`{"kind":"event","event":{"backend":"linuxdrm","kind":"submit","name":"amdgpu-cs","time_ns":130,"duration_ns":13,"pid":4242,"tid":4243,"source":"replay"}}`)
+
+	ev, err := DecodeLine(line)
+	if err != nil {
+		t.Fatalf("DecodeLine: %v", err)
+	}
+	if ev.Kind != KindEvent {
+		t.Fatalf("kind=%q want %q", ev.Kind, KindEvent)
+	}
+	if ev.Event.Kind != gpu.TimelineEventSubmit {
+		t.Fatalf("event kind=%q", ev.Event.Kind)
+	}
+	if ev.Event.Name != "amdgpu-cs" {
+		t.Fatalf("name=%q", ev.Event.Name)
+	}
+	if ev.Event.DurationNs != 13 {
+		t.Fatalf("duration=%d", ev.Event.DurationNs)
+	}
+}
+
 func TestDecodeRejectsMalformedJSON(t *testing.T) {
 	_, err := DecodeLine([]byte(`{"kind":"launch"`))
 	if err == nil {

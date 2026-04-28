@@ -3,6 +3,7 @@ package perfagent
 import (
 	"bytes"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -304,4 +305,67 @@ func TestAgentHostReplayPlusGPUStreamMode(t *testing.T) {
 	assert.Contains(t, raw.String(), "flash_attn_fwd")
 	assert.Contains(t, raw.String(), "train_step")
 	assert.NotZero(t, profile.Len())
+}
+
+func TestAgentHostReplayPlusGPUEventReplayMode(t *testing.T) {
+	dir := t.TempDir()
+	hostPath := filepath.Join(dir, "host.json")
+	gpuPath := filepath.Join(dir, "gpu.json")
+
+	hostFixture := `[
+  {
+    "backend": "stream",
+    "pid": 4242,
+    "tid": 4243,
+    "time_ns": 100,
+    "cpu_stack": [
+      { "Name": "train_step" },
+      { "Name": "cudaLaunchKernel" }
+    ],
+    "kernel_name": "flash_attn_fwd",
+    "queue_id": "q7",
+    "context_id": "ctx0",
+    "correlation_id": "c1",
+    "tags": {
+      "cgroup_id": "9876",
+      "pod_uid": "pod-abc"
+    },
+    "source": "host-replay"
+  }
+]`
+	if err := os.WriteFile(hostPath, []byte(hostFixture), 0o644); err != nil {
+		t.Fatalf("WriteFile host: %v", err)
+	}
+
+	gpuFixture := `[
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "submit",
+      "name": "amdgpu-cs",
+      "time_ns": 130,
+      "duration_ns": 13,
+      "pid": 4242,
+      "tid": 4243,
+      "source": "replay"
+    }
+  }
+]`
+	if err := os.WriteFile(gpuPath, []byte(gpuFixture), 0o644); err != nil {
+		t.Fatalf("WriteFile gpu: %v", err)
+	}
+
+	var folded bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(hostPath),
+		WithGPUReplayInput(gpuPath),
+		WithGPUFoldedOutput(&folded),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	assert.Contains(t, folded.String(), "train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13")
 }

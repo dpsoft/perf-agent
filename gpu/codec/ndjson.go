@@ -14,6 +14,7 @@ const (
 	KindExec    EventKind = "exec"
 	KindCounter EventKind = "counter"
 	KindSample  EventKind = "sample"
+	KindEvent   EventKind = "event"
 )
 
 type DecodedEvent struct {
@@ -22,10 +23,16 @@ type DecodedEvent struct {
 	Exec    gpu.GPUKernelExec
 	Counter gpu.GPUCounterSample
 	Sample  gpu.GPUSample
+	Event   gpu.GPUTimelineEvent
 }
 
 type envelope struct {
 	Kind EventKind `json:"kind"`
+}
+
+type timelineEventEnvelope struct {
+	Kind  EventKind            `json:"kind"`
+	Event gpu.GPUTimelineEvent `json:"event"`
 }
 
 func DecodeLine(line []byte) (DecodedEvent, error) {
@@ -65,6 +72,15 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 			return DecodedEvent{}, fmt.Errorf("decode sample event: %w", err)
 		}
 		if err := validateSample(out.Sample); err != nil {
+			return DecodedEvent{}, err
+		}
+	case KindEvent:
+		var eventLine timelineEventEnvelope
+		if err := json.Unmarshal(line, &eventLine); err != nil {
+			return DecodedEvent{}, fmt.Errorf("decode timeline event: %w", err)
+		}
+		out.Event = eventLine.Event
+		if err := validateEvent(out.Event); err != nil {
 			return DecodedEvent{}, err
 		}
 	default:
@@ -110,6 +126,16 @@ func validateSample(event gpu.GPUSample) error {
 	}
 	if event.KernelName == "" {
 		return fmt.Errorf("sample event missing kernel_name")
+	}
+	return nil
+}
+
+func validateEvent(event gpu.GPUTimelineEvent) error {
+	if event.Kind == "" {
+		return fmt.Errorf("timeline event missing kind")
+	}
+	if event.Name == "" {
+		return fmt.Errorf("timeline event missing name")
 	}
 	return nil
 }

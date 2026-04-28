@@ -142,6 +142,8 @@ func emitDecodedLine(line []byte, sink gpu.EventSink) error {
 		sink.EmitCounter(event.Counter)
 	case codec.KindSample:
 		sink.EmitSample(event.Sample)
+	case codec.KindEvent:
+		sink.EmitEvent(event.Event)
 	default:
 		return fmt.Errorf("unsupported decoded event kind %q", event.Kind)
 	}

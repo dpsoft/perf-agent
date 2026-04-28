@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	goprofile "github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
@@ -172,6 +173,14 @@ func TestWithOffCPUProfileWriter(t *testing.T) {
 	assert.Equal(t, &buf, cfg.OffCPUProfileWriter)
 }
 
+func TestWithGPUHIPLinuxDRMJoinWindow(t *testing.T) {
+	cfg := DefaultConfig()
+
+	WithGPUHIPLinuxDRMJoinWindow(25 * time.Millisecond)(cfg)
+
+	assert.Equal(t, 25*time.Millisecond, cfg.GPUHIPLinuxDRMJoinWindow)
+}
+
 func TestWithPIDDisablesSystemWide(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.SystemWide = true
@@ -218,6 +227,33 @@ func TestWithOffCPUProfileSetsPath(t *testing.T) {
 
 	assert.True(t, cfg.EnableOffCPUProfile)
 	assert.Equal(t, "/custom/offcpu.pb.gz", cfg.OffCPUProfilePath)
+}
+
+func TestGPUManagerConfigForHIPLinuxDRMDefaultsWindow(t *testing.T) {
+	agent, err := New(
+		WithPID(123),
+		WithGPULinuxDRM(),
+		WithGPUHostHIP("/opt/rocm/lib/libamdhip64.so", "hipLaunchKernel"),
+	)
+	require.NoError(t, err)
+
+	cfg := agent.gpuManagerConfig()
+	require.NotNil(t, cfg)
+	assert.Equal(t, uint64(defaultGPUHIPLinuxDRMJoinWindow), cfg.LaunchEventJoinWindowNs)
+}
+
+func TestGPUManagerConfigForHIPLinuxDRMUsesOverride(t *testing.T) {
+	agent, err := New(
+		WithPID(123),
+		WithGPULinuxDRM(),
+		WithGPUHostHIP("/opt/rocm/lib/libamdhip64.so", "hipLaunchKernel"),
+		WithGPUHIPLinuxDRMJoinWindow(2*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	cfg := agent.gpuManagerConfig()
+	require.NotNil(t, cfg)
+	assert.Equal(t, uint64(2*time.Millisecond), cfg.LaunchEventJoinWindowNs)
 }
 
 func TestWithCPUs(t *testing.T) {

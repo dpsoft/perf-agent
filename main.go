@@ -31,6 +31,7 @@ var (
 	flagGPUHostReplayInput = flag.String("gpu-host-replay-input", "", "Experimental: replay host launch attribution from a JSON fixture")
 	flagGPUHostHIPLibrary  = flag.String("gpu-host-hip-library", "", "Experimental: attach HIP host launch attribution to this shared library path")
 	flagGPUHostHIPSymbol   = flag.String("gpu-host-hip-symbol", "hipLaunchKernel", "Experimental: HIP launch symbol name for --gpu-host-hip-library")
+	flagGPUHIPLinuxDRMJoin = flag.Duration("gpu-hip-linuxdrm-join-window", 5*time.Millisecond, "Experimental: fallback join window for HIP host launches to linuxdrm lifecycle events")
 	flagGPUReplayInput     = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
 	flagGPUStreamStdin     = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
 	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
@@ -227,6 +228,9 @@ func buildOptions() []perfagent.Option {
 	}
 	if gpuLinuxDRMMode {
 		opts = append(opts, perfagent.WithGPULinuxDRM())
+		if gpuHostHIPMode {
+			opts = append(opts, perfagent.WithGPUHIPLinuxDRMJoinWindow(*flagGPUHIPLinuxDRMJoin))
+		}
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}

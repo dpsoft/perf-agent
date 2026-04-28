@@ -37,7 +37,12 @@ type Snapshot struct {
 	Attributions []WorkloadAttribution `json:"attributions,omitempty"`
 }
 
+type TimelineConfig struct {
+	LaunchEventJoinWindowNs uint64
+}
+
 type Timeline struct {
+	cfg      TimelineConfig
 	launches []GPUKernelLaunch
 	execs    []GPUKernelExec
 	counters []GPUCounterSample
@@ -45,8 +50,11 @@ type Timeline struct {
 	events   []GPUTimelineEvent
 }
 
-func NewTimeline() *Timeline {
-	return &Timeline{}
+func NewTimeline(cfg ...TimelineConfig) *Timeline {
+	if len(cfg) == 0 {
+		return &Timeline{}
+	}
+	return &Timeline{cfg: cfg[0]}
 }
 
 func (t *Timeline) RecordLaunch(launch GPUKernelLaunch) {
@@ -297,6 +305,9 @@ func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
 			continue
 		}
 		if launch.TimeNs > event.TimeNs {
+			continue
+		}
+		if t.cfg.LaunchEventJoinWindowNs > 0 && event.TimeNs-launch.TimeNs > t.cfg.LaunchEventJoinWindowNs {
 			continue
 		}
 		if best == nil || launch.TimeNs > best.TimeNs {

@@ -3,6 +3,7 @@ package perfagent
 
 import (
 	"io"
+	"time"
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/metrics"
@@ -79,6 +80,9 @@ type Config struct {
 
 	// GPULinuxDRM enables the experimental Linux DRM lifecycle backend.
 	GPULinuxDRM bool
+
+	// GPUHIPLinuxDRMJoinWindow bounds heuristic HIP launch -> linuxdrm event joins.
+	GPUHIPLinuxDRMJoinWindow time.Duration
 
 	// GPURawOutputPath writes the normalized GPU snapshot as JSON when set.
 	GPURawOutputPath string
@@ -253,6 +257,12 @@ func WithGPUStreamInput(r io.Reader) Option {
 func WithGPULinuxDRM() Option {
 	return func(c *Config) {
 		c.GPULinuxDRM = true
+	}
+}
+
+func WithGPUHIPLinuxDRMJoinWindow(window time.Duration) Option {
+	return func(c *Config) {
+		c.GPUHIPLinuxDRMJoinWindow = window
 	}
 }
 

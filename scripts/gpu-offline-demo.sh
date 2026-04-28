@@ -12,7 +12,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
-  scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxdrm <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--duration <dur>]
+  scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxdrm <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
 
 Modes:
   host-exec         checked-in host->execution replay
@@ -89,6 +89,7 @@ PID=""
 HIP_LIBRARY=""
 HIP_SYMBOL="hipLaunchKernel"
 DURATION="1ms"
+JOIN_WINDOW="5ms"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -106,6 +107,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --duration)
             DURATION="${2:-}"
+            shift 2
+            ;;
+        --join-window)
+            JOIN_WINDOW="${2:-}"
             shift 2
             ;;
         *)
@@ -162,6 +167,7 @@ case "${MODE}" in
             "--gpu-linux-drm"
             "--gpu-host-hip-library" "${HIP_LIBRARY}"
             "--gpu-host-hip-symbol" "${HIP_SYMBOL}"
+            "--gpu-hip-linuxdrm-join-window" "${JOIN_WINDOW}"
         )
         ;;
     *)

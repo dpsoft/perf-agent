@@ -145,6 +145,59 @@ func TestTimelineAttachesLaunchHeuristicallyToSubmitEvent(t *testing.T) {
 	}
 }
 
+func TestTimelineAttachesLaunchToEventWithinConfiguredWindow(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 50})
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch:     LaunchContext{PID: 10, TID: 11},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend: "linuxdrm",
+		Kind:    TimelineEventSubmit,
+		Name:    "amdgpu-cs",
+		TimeNs:  140,
+		PID:     10,
+		TID:     11,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch == nil {
+		t.Fatal("expected attached launch")
+	}
+}
+
+func TestTimelineSkipsEventOutsideConfiguredWindow(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 20})
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch:     LaunchContext{PID: 10, TID: 11},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend: "linuxdrm",
+		Kind:    TimelineEventSubmit,
+		Name:    "amdgpu-cs",
+		TimeNs:  140,
+		PID:     10,
+		TID:     11,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch != nil {
+		t.Fatalf("expected no attached launch: %#v", snapshot.EventViews[0])
+	}
+	if snapshot.EventViews[0].Join != "" {
+		t.Fatalf("expected empty join, got %q", snapshot.EventViews[0].Join)
+	}
+}
+
 func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	tl := NewTimeline()
 	tl.RecordLaunch(GPUKernelLaunch{

@@ -9,10 +9,18 @@ type Manager struct {
 	timeline *Timeline
 }
 
-func NewManager(backends []Backend, _ any) *Manager {
+type ManagerConfig struct {
+	LaunchEventJoinWindowNs uint64
+}
+
+func NewManager(backends []Backend, cfg *ManagerConfig) *Manager {
+	timelineCfg := TimelineConfig{}
+	if cfg != nil {
+		timelineCfg.LaunchEventJoinWindowNs = cfg.LaunchEventJoinWindowNs
+	}
 	return &Manager{
 		backends: backends,
-		timeline: NewTimeline(),
+		timeline: NewTimeline(timelineCfg),
 	}
 }
 

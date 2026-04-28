@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/iovisor/gobpf/pkg/cpuonline"
@@ -27,6 +28,8 @@ import (
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
+
+const defaultGPUHIPLinuxDRMJoinWindow = 5 * time.Millisecond
 
 // cpuProfiler is the narrow shape both profile.Profiler and
 // dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
@@ -187,7 +190,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("create GPU backend: %w", err)
 		}
-		a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, nil)
+		a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, a.gpuManagerConfig())
 		if err := a.gpuManager.Start(ctx); err != nil {
 			a.cleanup()
 			return fmt.Errorf("start GPU manager: %w", err)
@@ -334,6 +337,20 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	a.started = true
 	return nil
+}
+
+func (a *Agent) gpuManagerConfig() *gpu.ManagerConfig {
+	if !a.config.GPULinuxDRM || a.config.GPUHostHIPLibrary == "" {
+		return nil
+	}
+
+	window := a.config.GPUHIPLinuxDRMJoinWindow
+	if window <= 0 {
+		window = defaultGPUHIPLinuxDRMJoinWindow
+	}
+	return &gpu.ManagerConfig{
+		LaunchEventJoinWindowNs: uint64(window),
+	}
 }
 
 func (a *Agent) newGPUBackend() (gpu.Backend, error) {

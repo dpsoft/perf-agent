@@ -174,6 +174,54 @@ func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
 	}
 }
 
+func TestBuildOptionsGPUHostHIPPlusLinuxDRMMode(t *testing.T) {
+	prevStream := *flagGPUStreamStdin
+	prevHostReplay := *flagGPUHostReplayInput
+	prevReplay := *flagGPUReplayInput
+	prevHostHIPLibrary := *flagGPUHostHIPLibrary
+	prevHostHIPSymbol := *flagGPUHostHIPSymbol
+	prevHIPLinuxDRMJoin := *flagGPUHIPLinuxDRMJoin
+	prevLinuxDRM := *flagGPULinuxDRM
+	prevProfile := *flagProfile
+	prevOffCPU := *flagOffCpu
+	prevPMU := *flagPMU
+	prevPID := *flagPID
+	prevAll := *flagAll
+
+	t.Cleanup(func() {
+		*flagGPUStreamStdin = prevStream
+		*flagGPUHostReplayInput = prevHostReplay
+		*flagGPUReplayInput = prevReplay
+		*flagGPUHostHIPLibrary = prevHostHIPLibrary
+		*flagGPUHostHIPSymbol = prevHostHIPSymbol
+		*flagGPUHIPLinuxDRMJoin = prevHIPLinuxDRMJoin
+		*flagGPULinuxDRM = prevLinuxDRM
+		*flagProfile = prevProfile
+		*flagOffCpu = prevOffCPU
+		*flagPMU = prevPMU
+		*flagPID = prevPID
+		*flagAll = prevAll
+	})
+
+	*flagGPUStreamStdin = false
+	*flagGPUHostReplayInput = ""
+	*flagGPUReplayInput = ""
+	*flagGPUHostHIPLibrary = "/opt/rocm/lib/libamdhip64.so"
+	*flagGPUHostHIPSymbol = "hipLaunchKernel"
+	*flagGPUHIPLinuxDRMJoin = 3 * time.Millisecond
+	*flagGPULinuxDRM = true
+	*flagProfile = false
+	*flagOffCpu = false
+	*flagPMU = false
+	*flagPID = 123
+	*flagAll = false
+
+	opts := buildOptions()
+	if _, err := perfagent.New(opts...); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHostExec(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -210,6 +258,8 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 		"4242",
 		"--hip-library",
 		"/opt/rocm/lib/libamdhip64.so",
+		"--join-window",
+		"7ms",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -220,6 +270,7 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 		"--pid 4242",
 		"--gpu-linux-drm",
 		"--gpu-host-hip-library /opt/rocm/lib/libamdhip64.so",
+		"--gpu-hip-linuxdrm-join-window 7ms",
 		"--gpu-attribution-output /tmp/gpu-live-demo/live_hip_linuxdrm.attributions.json",
 		"--gpu-folded-output /tmp/gpu-live-demo/live_hip_linuxdrm.folded",
 	} {

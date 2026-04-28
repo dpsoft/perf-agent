@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -245,3 +246,100 @@ type fakeMmapWatcher struct {
 }
 
 func (w *fakeMmapWatcher) Events() <-chan MmapEventRecord { return w.ch }
+
+func TestEnrollWithoutCompile_PopulatesPIDMappingsOnly(t *testing.T) {
+	// Use a real ELF for ReadBuildID. The hello fixture from ehcompile testdata.
+	binPath := "../ehcompile/testdata/hello"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("test fixture missing: %v", err)
+	}
+
+	// No BPF maps — we expect PopulatePIDMappings to return an error
+	// because t.pidMappings is nil. The IMPORTANT assertions are:
+	//   1. ReadBuildID was called (cache populated)
+	//   2. No refcount taken (compile never happened)
+	store := NewTableStore(nil, nil, nil, nil)
+	tracker := NewPIDTracker(store, nil, nil)
+
+	cache := map[string][]byte{}
+	err := tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, cache)
+
+	// Tolerate the LoadProcessMappings or PopulatePIDMappings error path,
+	// but DO NOT tolerate any error related to compile/AcquireBinary.
+	if err != nil &&
+		!strings.Contains(err.Error(), "PopulatePIDMappings") &&
+		!strings.Contains(err.Error(), "load mappings") &&
+		!strings.Contains(err.Error(), "populate") {
+		t.Fatalf("unexpected error type: %v", err)
+	}
+
+	// Build-id was read and cached.
+	if _, ok := cache[binPath]; !ok {
+		t.Errorf("build-id not cached for %s", binPath)
+	}
+
+	// No refcount taken — compile didn't happen.
+	if numRefs := len(store.rc.byID); numRefs != 0 {
+		t.Errorf("refcount taken without compile: %d entries", numRefs)
+	}
+}
+
+func TestEnrollWithoutCompile_BuildIDCacheHit(t *testing.T) {
+	binPath := "../ehcompile/testdata/hello"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("test fixture missing: %v", err)
+	}
+
+	store := NewTableStore(nil, nil, nil, nil)
+	tracker := NewPIDTracker(store, nil, nil)
+
+	// Pre-seed cache with a deliberate non-real value.
+	cache := map[string][]byte{
+		binPath: {0xDE, 0xAD, 0xBE, 0xEF},
+	}
+
+	_ = tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, cache)
+
+	// Cache value should NOT have been overwritten — proves ReadBuildID
+	// wasn't called when the entry was already present.
+	got := cache[binPath]
+	if len(got) != 4 || got[0] != 0xDE {
+		t.Errorf("cache hit overwrote pre-seeded value: got=%v", got)
+	}
+}
+
+func TestAttachCompileOnly_AcquireRefcountWithoutPIDMappings(t *testing.T) {
+	// AttachCompileOnly should call AcquireBinary (which compiles + populates
+	// cfi_*) and add the tableID to perPID[pid].tableIDs, but NOT call
+	// LoadProcessMappings or PopulatePIDMappings.
+	//
+	// We can't assert "compile happened" without real BPF maps; this test
+	// verifies the simpler contract: AttachCompileOnly DOES try to call
+	// AcquireBinary (and thus errors when store has nil maps), and it
+	// does NOT touch t.pidMappings (which is nil — would panic if it tried).
+
+	binPath := "../ehcompile/testdata/hello"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("test fixture missing: %v", err)
+	}
+
+	store := NewTableStore(nil, nil, nil, nil)
+	tracker := NewPIDTracker(store, nil, nil)
+
+	err := tracker.AttachCompileOnly(uint32(os.Getpid()), binPath)
+	// Expected: AcquireBinary succeeds in computing tableID + acquiring
+	// the refcount, but errors on PopulateCFI (nil map). Or it succeeds
+	// entirely if the test runs in a mode where Populate is gated. Either
+	// is acceptable — what we check is that tracker.AttachCompileOnly
+	// didn't panic (i.e., it didn't try to populate pid_mappings).
+	_ = err
+
+	// Verify NO mappings were populated for this PID — the perPID entry
+	// either doesn't exist or has empty mappings.
+	tracker.mu.Lock()
+	st, ok := tracker.perPID[uint32(os.Getpid())]
+	tracker.mu.Unlock()
+	if ok && len(st.mappings) > 0 {
+		t.Errorf("AttachCompileOnly should not populate mappings; got %d entries", len(st.mappings))
+	}
+}

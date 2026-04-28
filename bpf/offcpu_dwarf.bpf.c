@@ -24,6 +24,17 @@
 #include <bpf/bpf_tracing.h>
 #include "unwind_common.h"
 
+// Note: unwind_common.h declares cfi_miss_events ringbuf and cfi_miss_ratelimit
+// LRU map for Option A2 (lazy CFI compile, --unwind auto). Off-CPU is always
+// eager in v1 per the A2 spec's non-goals — userspace's off-CPU dispatch
+// hardcodes ModeEager, so the lazy-mode emit path in walk_step (probing
+// cfi_classification_lengths) finds the length entry present and skips the
+// ringbuf write. The fallback FP_LESS+miss emit can still fire on rare
+// edge cases (samples inside code without a CFI rule), but no userspace
+// drainer reads the ringbuf in off-CPU mode. Bounded ~96 KB of pinned BPF
+// memory per off-CPU profiler instance is the cost; A2 v2 may extend the
+// drainer to off-CPU if data justifies it.
+
 // System-wide mode toggle set by userspace at load time. When true, the
 // PID filter below is skipped — the walker emits a sample for every
 // non-kernel task's off-CPU interval.

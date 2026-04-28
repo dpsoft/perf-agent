@@ -72,6 +72,13 @@ type session struct {
 	stacks  map[sampleKey][]uint64
 
 	attachStats attachStats
+
+	// Lazy CFI (mode == ModeLazy) state. Zero-valued in eager modes.
+	// missReader is nil when not in lazy mode; the consumeCFIMisses
+	// goroutine is only spawned when missReader != nil.
+	missReader   *ringbuf.Reader
+	drainerWG    sync.WaitGroup
+	missCounters missCounters
 }
 
 // attachStats records the (pidCount, binaryCount) returned by the
@@ -92,7 +99,7 @@ type attachStats struct {
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
@@ -102,13 +109,28 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	}
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 
-	// Eager-compile is best-effort. Binaries without .eh_frame (Go,
-	// stripped musl statics) intentionally fail here; the hybrid walker
-	// still handles FP-safe code at runtime, and MmapWatcher will retry
-	// per-binary on dlopen. Log the error and continue rather than refusing
-	// to start.
+	// Attach strategy depends on mode:
+	//   ModeLazy + systemWide: ScanAndEnroll (pid_mappings only, no CFI compile).
+	//   ModeEager + systemWide: AttachAllProcesses (compile CFI eagerly).
+	//   per-PID (always eager): AttachAllMappings.
+	// All paths are best-effort; failures fall through to FP-only mode.
 	var stats attachStats
-	if systemWide {
+	switch {
+	case mode == ModeLazy && systemWide:
+		nPIDs, nTables, err := ehmaps.ScanAndEnroll(tracker)
+		if err != nil {
+			log.Printf("%s: ScanAndEnroll: %v (falling back to eager)", logPrefix, err)
+			// Fallback: today's eager path
+			nPIDs, nTables, err = ehmaps.AttachAllProcesses(tracker)
+			if err != nil {
+				log.Printf("%s: AttachAllProcesses fallback: %v (continuing FP-only)", logPrefix, err)
+			}
+		}
+		log.Printf("%s: enrolled %d binaries across %d PIDs (lazy)", logPrefix, nTables, nPIDs)
+		stats.pidCount = nPIDs
+		stats.binaryCount = nTables
+
+	case systemWide:
 		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
 		if err != nil {
 			log.Printf("%s: AttachAllProcesses: %v (continuing; walker uses FP path for unattached binaries)", logPrefix, err)
@@ -117,7 +139,8 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 			stats.pidCount = nPIDs
 			stats.binaryCount = nTables
 		}
-	} else {
+
+	default:
 		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
 		if err != nil {
 			log.Printf("%s: AttachAllMappings(pid=%d): %v (continuing; walker uses FP path for unattached binaries)", logPrefix, pid, err)
@@ -163,6 +186,24 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		return nil, fmt.Errorf("create symbolizer: %w", err)
 	}
 
+	var missReader *ringbuf.Reader
+	if mode == ModeLazy {
+		// Type-assert sessionObjs to access the CFIMissRingbuf accessor
+		// added in Task 2. Only PerfDwarf implements it; OffCPUDwarf does not.
+		type missMapAccessor interface {
+			CFIMissRingbuf() *ebpf.Map
+		}
+		if a, ok := objs.(missMapAccessor); ok && a.CFIMissRingbuf() != nil {
+			mr, err := ringbuf.NewReader(a.CFIMissRingbuf())
+			if err != nil {
+				_ = rd.Close()
+				_ = watcher.Close()
+				return nil, fmt.Errorf("cfi miss ringbuf reader: %w", err)
+			}
+			missReader = mr
+		}
+	}
+
 	return &session{
 		pid:         pid,
 		tags:        tags,
@@ -171,6 +212,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		tracker:     tracker,
 		watcher:     watcher,
 		ringReader:  rd,
+		missReader:  missReader,
 		symbolizer:  symbolizer,
 		resolver:    procmap.NewResolver(),
 		stop:        make(chan struct{}),
@@ -321,7 +363,11 @@ func (s *session) close() error {
 		close(s.stop)
 	}
 	s.readerWG.Wait()
+	s.drainerWG.Wait()
 	_ = s.ringReader.Close()
+	if s.missReader != nil {
+		_ = s.missReader.Close()
+	}
 	_ = s.watcher.Close()
 	s.trackerWG.Wait()
 	if s.resolver != nil {

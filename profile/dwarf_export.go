@@ -110,3 +110,16 @@ func (p *PerfDwarf) PIDMappingsMap() *ebpf.Map {
 func (p *PerfDwarf) PIDMappingLengthsMap() *ebpf.Map {
 	return p.objs.PidMappingLengths
 }
+
+// CFIMissRingbuf returns the ringbuf the BPF walker writes lazy-CFI miss
+// notifications to. Userspace drains this in lazy mode (--unwind auto).
+func (p *PerfDwarf) CFIMissRingbuf() *ebpf.Map {
+	return p.objs.CfiMissEvents
+}
+
+// CFIMissRatelimitMap returns the per-(pid, table_id) rate-limit map.
+// Exposed for tests that want to introspect the rate-limit state; not
+// needed by the production path.
+func (p *PerfDwarf) CFIMissRatelimitMap() *ebpf.Map {
+	return p.objs.CfiMissRatelimit
+}

@@ -148,13 +148,34 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
-		case "dwarf", "auto":
-			p, err := dwarfagent.NewProfiler(
+		case "dwarf":
+			p, err := dwarfagent.NewProfilerWithMode(
 				a.config.PID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
+				nil,
+				dwarfagent.ModeEager,
+			)
+			if err != nil {
+				return fmt.Errorf("create DWARF CPU profiler: %w", err)
+			}
+			a.cpuProfiler = dwarfProfilerAdapter{p}
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+			}
+		case "auto":
+			p, err := dwarfagent.NewProfilerWithMode(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+				nil,
+				dwarfagent.ModeLazy,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)

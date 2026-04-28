@@ -38,7 +38,7 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err

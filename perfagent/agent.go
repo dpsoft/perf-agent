@@ -434,6 +434,10 @@ func (a *Agent) Stop(ctx context.Context) error {
 			log.Printf("Failed to write GPU raw output: %v", err)
 			lastErr = err
 		}
+		if err := a.writeGPUAttributions(snapshot); err != nil {
+			log.Printf("Failed to write GPU attribution output: %v", err)
+			lastErr = err
+		}
 		if err := a.writeGPUProfile(snapshot); err != nil {
 			log.Printf("Failed to write GPU profile output: %v", err)
 			lastErr = err
@@ -513,6 +517,22 @@ func (a *Agent) writeGPURaw(snapshot gpu.Snapshot) error {
 		}
 		defer f.Close()
 		return gpu.WriteJSONSnapshot(f, snapshot)
+	default:
+		return nil
+	}
+}
+
+func (a *Agent) writeGPUAttributions(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPUAttributionOutputWriter != nil:
+		return gpu.WriteJSONAttributions(a.config.GPUAttributionOutputWriter, snapshot)
+	case a.config.GPUAttributionOutputPath != "":
+		f, err := os.Create(a.config.GPUAttributionOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteJSONAttributions(f, snapshot)
 	default:
 		return nil
 	}

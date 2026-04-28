@@ -86,6 +86,12 @@ type Config struct {
 	// GPURawOutputWriter receives JSON GPU snapshot output when set.
 	GPURawOutputWriter io.Writer
 
+	// GPUAttributionOutputPath writes workload attribution rollups as JSON when set.
+	GPUAttributionOutputPath string
+
+	// GPUAttributionOutputWriter receives workload attribution rollups as JSON when set.
+	GPUAttributionOutputWriter io.Writer
+
 	// GPUProfileOutputPath writes synthetic-frame GPU pprof output when set.
 	GPUProfileOutputPath string
 
@@ -262,6 +268,12 @@ func WithGPUProfileOutput(w io.Writer) Option {
 	}
 }
 
+func WithGPUAttributionOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUAttributionOutputWriter = w
+	}
+}
+
 func WithGPUFoldedOutput(w io.Writer) Option {
 	return func(c *Config) {
 		c.GPUFoldedOutputWriter = w
@@ -277,6 +289,12 @@ func WithGPURawOutputPath(path string) Option {
 func WithGPUProfileOutputPath(path string) Option {
 	return func(c *Config) {
 		c.GPUProfileOutputPath = path
+	}
+}
+
+func WithGPUAttributionOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUAttributionOutputPath = path
 	}
 }
 

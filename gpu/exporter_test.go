@@ -36,3 +36,33 @@ func TestWriteJSONSnapshot(t *testing.T) {
 		t.Fatalf("missing timeline event in %q", buf.String())
 	}
 }
+
+func TestWriteJSONAttributions(t *testing.T) {
+	var buf bytes.Buffer
+	snap := Snapshot{
+		Attributions: []WorkloadAttribution{
+			{
+				CgroupID:           "1000",
+				PodUID:             "pod-a",
+				KernelNames:        []string{"alpha_kernel"},
+				LaunchCount:        1,
+				ExactJoinCount:     1,
+				ExecutionCount:     1,
+				ExecutionDurationNs: 60,
+				SampleWeight:       11,
+			},
+		},
+	}
+	if err := WriteJSONAttributions(&buf, snap); err != nil {
+		t.Fatalf("WriteJSONAttributions: %v", err)
+	}
+	if strings.Contains(buf.String(), "\"executions\"") {
+		t.Fatalf("unexpected snapshot fields in %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"pod_uid\":\"pod-a\"") {
+		t.Fatalf("missing pod uid in %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"kernel_names\":[\"alpha_kernel\"]") {
+		t.Fatalf("missing kernel names in %q", buf.String())
+	}
+}

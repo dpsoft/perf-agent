@@ -35,6 +35,7 @@ var (
 	flagGPUStreamStdin     = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
 	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
 	flagGPURawOutput       = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
+	flagGPUAttributionOut  = flag.String("gpu-attribution-output", "", "Experimental: write workload attribution rollups as JSON to this path")
 	flagGPUProfileOutput   = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
 	flagGPUFoldedOutput    = flag.String("gpu-folded-output", "", "Experimental: write folded GPU flamegraph input to this path")
 	flagTags               tagFlags
@@ -193,6 +194,9 @@ func buildOptions() []perfagent.Option {
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}
+		if *flagGPUAttributionOut != "" {
+			opts = append(opts, perfagent.WithGPUAttributionOutputPath(*flagGPUAttributionOut))
+		}
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
 		}
@@ -211,6 +215,9 @@ func buildOptions() []perfagent.Option {
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}
+		if *flagGPUAttributionOut != "" {
+			opts = append(opts, perfagent.WithGPUAttributionOutputPath(*flagGPUAttributionOut))
+		}
 		if *flagGPUProfileOutput != "" {
 			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
 		}
@@ -222,6 +229,9 @@ func buildOptions() []perfagent.Option {
 		opts = append(opts, perfagent.WithGPULinuxDRM())
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
+		}
+		if *flagGPUAttributionOut != "" {
+			opts = append(opts, perfagent.WithGPUAttributionOutputPath(*flagGPUAttributionOut))
 		}
 		if *flagGPUFoldedOutput != "" {
 			opts = append(opts, perfagent.WithGPUFoldedOutputPath(*flagGPUFoldedOutput))

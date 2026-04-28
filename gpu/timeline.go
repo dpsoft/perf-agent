@@ -12,8 +12,15 @@ type ExecutionView struct {
 	Heuristic bool             `json:"heuristic"`
 }
 
+type EventView struct {
+	Launch    *GPUKernelLaunch `json:"launch,omitempty"`
+	Event     GPUTimelineEvent `json:"event"`
+	Heuristic bool             `json:"heuristic"`
+}
+
 type Snapshot struct {
 	Executions []ExecutionView    `json:"executions"`
+	EventViews []EventView        `json:"event_views,omitempty"`
 	Events     []GPUTimelineEvent `json:"events,omitempty"`
 	Counters   []GPUCounterSample `json:"counters,omitempty"`
 }
@@ -65,8 +72,18 @@ func (t *Timeline) Snapshot() Snapshot {
 		}
 		views = append(views, view)
 	}
+	eventViews := make([]EventView, 0, len(t.events))
+	for _, event := range t.events {
+		view := EventView{Event: cloneTimelineEvent(event)}
+		if launch := t.findLaunchForEvent(event); launch != nil {
+			view.Launch = launch
+			view.Heuristic = true
+		}
+		eventViews = append(eventViews, view)
+	}
 	return Snapshot{
 		Executions: views,
+		EventViews: eventViews,
 		Events:     cloneTimelineEvents(t.events),
 		Counters:   slices.Clone(t.counters),
 	}
@@ -100,6 +117,31 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		return &copy
 	}
 	return nil
+}
+
+func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
+	switch event.Kind {
+	case TimelineEventSubmit, TimelineEventWait:
+	default:
+		return nil
+	}
+	var best *GPUKernelLaunch
+	for _, launch := range t.launches {
+		if launch.Launch.PID == 0 || launch.Launch.TID == 0 {
+			continue
+		}
+		if launch.Launch.PID != event.PID || launch.Launch.TID != event.TID {
+			continue
+		}
+		if launch.TimeNs > event.TimeNs {
+			continue
+		}
+		if best == nil || launch.TimeNs > best.TimeNs {
+			copy := cloneLaunch(launch)
+			best = &copy
+		}
+	}
+	return best
 }
 
 func samplesForExec(all []GPUSample, exec GPUKernelExec) []GPUSample {

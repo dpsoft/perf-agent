@@ -1,6 +1,10 @@
 package gpu
 
-import "testing"
+import (
+	"testing"
+
+	pp "github.com/dpsoft/perf-agent/pprof"
+)
 
 func TestTimelineCorrelatesByCorrelationID(t *testing.T) {
 	tl := NewTimeline()
@@ -90,5 +94,41 @@ func TestTimelineSnapshotClonesLifecycleEventAttributes(t *testing.T) {
 	again := tl.Snapshot()
 	if got := again.Events[0].Attributes["cmd"]; got != "0xc04064" {
 		t.Fatalf("attributes mutated through snapshot copy: %q", got)
+	}
+}
+
+func TestTimelineAttachesLaunchHeuristicallyToSubmitEvent(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch: LaunchContext{
+			PID: 10,
+			TID: 11,
+			CPUStack: []pp.Frame{
+				pp.FrameFromName("train_step"),
+				pp.FrameFromName("hipLaunchKernel"),
+			},
+		},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventSubmit,
+		Name:       "amdgpu-cs",
+		TimeNs:     120,
+		DurationNs: 15,
+		PID:        10,
+		TID:        11,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch == nil {
+		t.Fatal("expected attached launch")
+	}
+	if !snapshot.EventViews[0].Heuristic {
+		t.Fatal("expected heuristic attribution")
 	}
 }

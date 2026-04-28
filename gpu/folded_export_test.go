@@ -53,3 +53,39 @@ func TestWriteFoldedStacksSkipsEmptySnapshot(t *testing.T) {
 		t.Fatalf("buf len=%d", buf.Len())
 	}
 }
+
+func TestWriteFoldedStacksIncludesAttributedSubmitEvent(t *testing.T) {
+	snap := Snapshot{
+		EventViews: []EventView{
+			{
+				Launch: &GPUKernelLaunch{
+					Launch: LaunchContext{
+						PID: 1,
+						CPUStack: []pp.Frame{
+							pp.FrameFromName("train_step"),
+							pp.FrameFromName("hipLaunchKernel"),
+						},
+					},
+				},
+				Event: GPUTimelineEvent{
+					Backend:    "linuxdrm",
+					Kind:       TimelineEventSubmit,
+					Name:       "amdgpu-cs",
+					TimeNs:     100,
+					DurationNs: 13,
+				},
+				Heuristic: true,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteFoldedStacks(&buf, snap); err != nil {
+		t.Fatalf("WriteFoldedStacks: %v", err)
+	}
+	got := strings.TrimSpace(buf.String())
+	want := "train_step;hipLaunchKernel;[gpu:launch];[gpu:event:submit:amdgpu-cs] 13"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}

@@ -20,12 +20,16 @@ type OffCPUProfiler struct {
 	link link.Link
 }
 
-// NewOffCPUProfilerWithHooks is the variant of NewOffCPUProfiler that
-// accepts an optional observation surface. Pass nil hooks for the same
-// behavior as NewOffCPUProfiler.
-func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks) (*OffCPUProfiler, error) {
+// NewOffCPUProfilerWithMode is the variant of NewOffCPUProfiler that accepts both
+// an optional Hooks struct and a Mode. Pass ModeEager + nil hooks for
+// the same behavior as NewOffCPUProfiler.
+func NewOffCPUProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, mode Mode) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
+	}
+	// Per-PID always eager regardless of caller-passed mode (per spec).
+	if !systemWide {
+		mode = ModeEager
 	}
 	objs, err := profile.LoadOffCPUDwarf(systemWide)
 	if err != nil {
@@ -38,7 +42,7 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, mode)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -55,7 +59,18 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 	sess.readerWG.Add(1)
 	go sess.consumeRingbuf(aggregateOffCPUSample)
 
+	if mode == ModeLazy {
+		sess.drainerWG.Go(sess.consumeCFIMisses)
+	}
+
 	return p, nil
+}
+
+// NewOffCPUProfilerWithHooks is the variant of NewOffCPUProfiler that
+// accepts an optional observation surface. Pass nil hooks for the same
+// behavior as NewOffCPUProfiler.
+func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks) (*OffCPUProfiler, error) {
+	return NewOffCPUProfilerWithMode(pid, systemWide, cpus, tags, hooks, ModeEager)
 }
 
 // NewOffCPUProfiler loads the offcpu_dwarf BPF program, wires ehmaps

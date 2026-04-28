@@ -148,13 +148,34 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
-		case "dwarf", "auto":
-			p, err := dwarfagent.NewProfiler(
+		case "dwarf":
+			p, err := dwarfagent.NewProfilerWithMode(
 				a.config.PID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
+				nil,
+				dwarfagent.ModeEager,
+			)
+			if err != nil {
+				return fmt.Errorf("create DWARF CPU profiler: %w", err)
+			}
+			a.cpuProfiler = dwarfProfilerAdapter{p}
+			if a.config.SystemWide {
+				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
+			} else {
+				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+			}
+		case "auto":
+			p, err := dwarfagent.NewProfilerWithMode(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				a.config.SampleRate,
+				nil,
+				dwarfagent.ModeLazy,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -188,12 +209,33 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start off-CPU profiler if enabled
 	if a.config.EnableOffCPUProfile {
 		switch a.config.Unwind {
-		case "dwarf", "auto":
-			p, err := dwarfagent.NewOffCPUProfiler(
+		case "dwarf":
+			p, err := dwarfagent.NewOffCPUProfilerWithMode(
 				a.config.PID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
+				nil,
+				dwarfagent.ModeEager,
+			)
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create DWARF off-CPU profiler: %w", err)
+			}
+			a.offcpuProfiler = dwarfOffCPUProfilerAdapter{p}
+			if a.config.SystemWide {
+				log.Println("Off-CPU profiler enabled (system-wide, DWARF)")
+			} else {
+				log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+			}
+		case "auto":
+			p, err := dwarfagent.NewOffCPUProfilerWithMode(
+				a.config.PID,
+				a.config.SystemWide,
+				cpus,
+				a.config.Tags,
+				nil,
+				dwarfagent.ModeLazy,
 			)
 			if err != nil {
 				a.cleanup()

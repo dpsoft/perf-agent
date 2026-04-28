@@ -264,7 +264,7 @@ There is also a fully offline host-to-execution path backed by checked-in fixtur
 ```bash
 go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
-  --gpu-replay-input gpu/testdata/replay/flash_attn.json \
+  --gpu-replay-input gpu/testdata/replay/host_exec_sample.json \
   --gpu-raw-output /tmp/gpu-host-exec.raw.json \
   --gpu-folded-output /tmp/gpu-host-exec.folded \
   --duration 1ms

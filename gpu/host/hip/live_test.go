@@ -22,6 +22,8 @@ func (o *fakeLiveObjects) LaunchProgram() any { return struct{}{} }
 
 func (o *fakeLiveObjects) EventsHandle() any { return struct{}{} }
 
+func (o *fakeLiveObjects) StacksHandle() stackBytesLookup { return nil }
+
 func (o *fakeLiveObjects) Close() error {
 	o.closed = true
 	return nil
@@ -131,7 +133,7 @@ func TestRunLiveAttachesConfiguredSymbolAndEmitsLaunchRecord(t *testing.T) {
 			return exec, nil
 		},
 		newReader: func(got liveObjects) (liveReader, error) {
-			if got != objs {
+			if gotObjs, ok := got.(*fakeLiveObjects); !ok || gotObjs != objs {
 				t.Fatal("unexpected objects passed to reader")
 			}
 			return reader, nil

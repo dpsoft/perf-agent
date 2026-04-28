@@ -6,7 +6,7 @@ import (
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
 
-func blazeSymToFrames(sym blazesym.Sym, addr uint64) []pp.Frame {
+func BlazeSymToFrames(sym blazesym.Sym, addr uint64) []pp.Frame {
 	out := make([]pp.Frame, 0, 1+len(sym.Inlined))
 	for i := len(sym.Inlined) - 1; i >= 0; i-- {
 		in := sym.Inlined[i]

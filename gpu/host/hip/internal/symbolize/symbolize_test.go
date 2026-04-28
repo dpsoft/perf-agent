@@ -7,7 +7,7 @@ import (
 )
 
 func TestBlazeSymToFramesLeafFirst(t *testing.T) {
-	frames := blazeSymToFrames(blazesym.Sym{
+	frames := BlazeSymToFrames(blazesym.Sym{
 		Name:   "outer",
 		Module: "/opt/libhip.so",
 		Inlined: []blazesym.InlinedFn{

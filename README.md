@@ -265,16 +265,18 @@ There is also an offline host-to-driver flame path for the current MVP. It uses 
 go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
   --gpu-replay-input gpu/testdata/replay/host_driver_submit.json \
+  --gpu-raw-output /tmp/gpu-host-driver.raw.json \
   --gpu-folded-output /tmp/gpu-host-driver.folded \
   --duration 1ms
 
 flamegraph.pl /tmp/gpu-host-driver.folded > /tmp/gpu-host-driver.svg
+jq '.attributions' /tmp/gpu-host-driver.raw.json
 ```
 
 The resulting folded line is expected to look like:
 
 ```text
-train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13
+train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13
 ```
 
 This is still a host-to-driver correlation flame, not a true GPU-internal flame graph. It proves:
@@ -283,6 +285,32 @@ This is still a host-to-driver correlation flame, not a true GPU-internal flame 
 - lifecycle event replay through the canonical event model
 - heuristic launch-to-submit attribution
 - tenancy-aware folded output suitable for later `flamegraph.pl` rendering
+
+The same run now also emits a workload-level rollup in the raw snapshot:
+
+```json
+[
+  {
+    "cgroup_id": "9876",
+    "pod_uid": "pod-abc",
+    "container_id": "ctr-123",
+    "container_runtime": "containerd",
+    "first_seen_ns": 100,
+    "last_seen_ns": 143,
+    "backends": ["linuxdrm", "stream"],
+    "launch_count": 1,
+    "event_count": 1,
+    "event_duration_ns": 13
+  }
+]
+```
+
+Those attribution summaries are meant to be the bridge from profiling artifacts to workload-oriented reporting:
+
+- `cgroup_id`, `pod_uid`, `container_id`, `container_runtime` identify the workload
+- `first_seen_ns` and `last_seen_ns` bound the observed activity window
+- `backends` shows which collection paths contributed data
+- `launch_count`, `event_count`, and the duration counters provide a first rollup surface for per-workload GPU usage
 
 ### Experimental Linux DRM lifecycle backend
 

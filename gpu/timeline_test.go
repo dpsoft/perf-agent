@@ -26,6 +26,9 @@ func TestTimelineCorrelatesByCorrelationID(t *testing.T) {
 	if snapshot.Executions[0].Launch == nil {
 		t.Fatalf("expected correlated launch")
 	}
+	if snapshot.Executions[0].Join != JoinExact {
+		t.Fatalf("join=%q", snapshot.Executions[0].Join)
+	}
 }
 
 func TestTimelineMarksHeuristicJoin(t *testing.T) {
@@ -44,6 +47,9 @@ func TestTimelineMarksHeuristicJoin(t *testing.T) {
 	snapshot := tl.Snapshot()
 	if len(snapshot.Executions) != 1 || !snapshot.Executions[0].Heuristic {
 		t.Fatalf("expected heuristic join: %#v", snapshot.Executions)
+	}
+	if snapshot.Executions[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.Executions[0].Join)
 	}
 }
 
@@ -130,6 +136,9 @@ func TestTimelineAttachesLaunchHeuristicallyToSubmitEvent(t *testing.T) {
 	}
 	if !snapshot.EventViews[0].Heuristic {
 		t.Fatal("expected heuristic attribution")
+	}
+	if snapshot.EventViews[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.EventViews[0].Join)
 	}
 }
 

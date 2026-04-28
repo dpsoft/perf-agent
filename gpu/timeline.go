@@ -10,14 +10,23 @@ type ExecutionView struct {
 	Launch    *GPUKernelLaunch `json:"launch,omitempty"`
 	Exec      GPUKernelExec    `json:"exec"`
 	Samples   []GPUSample      `json:"samples,omitempty"`
+	Join      JoinKind         `json:"join,omitempty"`
 	Heuristic bool             `json:"heuristic"`
 }
 
 type EventView struct {
 	Launch    *GPUKernelLaunch `json:"launch,omitempty"`
 	Event     GPUTimelineEvent `json:"event"`
+	Join      JoinKind         `json:"join,omitempty"`
 	Heuristic bool             `json:"heuristic"`
 }
+
+type JoinKind string
+
+const (
+	JoinExact     JoinKind = "exact"
+	JoinHeuristic JoinKind = "heuristic"
+)
 
 type Snapshot struct {
 	Executions   []ExecutionView       `json:"executions"`
@@ -68,8 +77,10 @@ func (t *Timeline) Snapshot() Snapshot {
 		}
 		if launch := t.findLaunchByCorrelation(exec); launch != nil {
 			view.Launch = launch
+			view.Join = JoinExact
 		} else if launch := t.findLaunchHeuristic(exec); launch != nil {
 			view.Launch = launch
+			view.Join = JoinHeuristic
 			view.Heuristic = true
 		}
 		views = append(views, view)
@@ -79,6 +90,7 @@ func (t *Timeline) Snapshot() Snapshot {
 		view := EventView{Event: cloneTimelineEvent(event)}
 		if launch := t.findLaunchForEvent(event); launch != nil {
 			view.Launch = launch
+			view.Join = JoinHeuristic
 			view.Heuristic = true
 		}
 		eventViews = append(eventViews, view)

@@ -259,6 +259,53 @@ This path is still not a real `uprobes` collector or vendor callback backend. It
 - host launch to GPU execution correlation
 - reuse of the existing mixed CPU+GPU `pprof` projection
 
+There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
+
+```bash
+go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
+  --gpu-replay-input gpu/testdata/replay/flash_attn.json \
+  --gpu-raw-output /tmp/gpu-host-exec.raw.json \
+  --gpu-folded-output /tmp/gpu-host-exec.folded \
+  --duration 1ms
+
+flamegraph.pl /tmp/gpu-host-exec.folded > /tmp/gpu-host-exec.svg
+jq '.attributions' /tmp/gpu-host-exec.raw.json
+```
+
+The resulting folded line is expected to look like:
+
+```text
+train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:kernel:flash_attn_fwd];[gpu:stall:memory_throttle] 7
+```
+
+This is still not a true device-internal flame graph, but it is the current branch’s clearest CPU-to-GPU execution artifact. It proves:
+
+- host launch replay through the canonical launch model
+- execution/sample replay through the canonical execution model
+- synthetic flame output for a correlated kernel sample path
+- workload-level attribution for execution time and sample weight
+
+The same run emits a workload rollup like:
+
+```json
+[
+  {
+    "cgroup_id": "9876",
+    "pod_uid": "pod-abc",
+    "container_id": "ctr-123",
+    "container_runtime": "containerd",
+    "first_seen_ns": 100,
+    "last_seen_ns": 200,
+    "backends": ["stream"],
+    "launch_count": 1,
+    "execution_count": 1,
+    "execution_duration_ns": 80,
+    "sample_weight": 7
+  }
+]
+```
+
 There is also an offline host-to-driver flame path for the current MVP. It uses checked-in fixtures for a canonical host launch plus a normalized Linux DRM submit event, then writes folded stacks that you can render with Brendan Gregg’s FlameGraph tools:
 
 ```bash

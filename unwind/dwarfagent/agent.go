@@ -93,8 +93,7 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 	go sess.consumeRingbuf(aggregateCPUSample)
 
 	if mode == ModeLazy {
-		sess.drainerWG.Add(1)
-		go sess.consumeCFIMisses()
+		sess.drainerWG.Go(sess.consumeCFIMisses)
 	}
 
 	return p, nil

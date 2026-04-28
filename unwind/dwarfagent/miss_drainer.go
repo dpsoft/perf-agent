@@ -107,7 +107,6 @@ type cfiMissKey struct {
 //
 // Terminates when s.stop closes OR s.missReader.Close() is called.
 func (s *session) consumeCFIMisses() {
-	defer s.drainerWG.Done()
 	inflight := map[cfiMissKey]struct{}{}
 	failures := map[cfiMissKey]int{}
 	var mu sync.Mutex

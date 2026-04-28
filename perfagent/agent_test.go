@@ -423,6 +423,23 @@ func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUEventReplayRawJSONGolden(t 
 	assert.Equal(t, string(want), raw.String())
 }
 
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUEventReplayFoldedGolden(t *testing.T) {
+	var folded bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.json")),
+		WithGPUFoldedOutput(&folded),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.folded"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), folded.String())
+}
+
 func TestAgentHostReplayPlusGPUStreamRawJSONGolden(t *testing.T) {
 	var raw bytes.Buffer
 	agent, err := New(
@@ -515,6 +532,28 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayProfileGolden(t *testing.T) {
 	got := flattenedSampleStacks(prof)
 
 	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.pprof.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), got)
+}
+
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUEventReplayProfileGolden(t *testing.T) {
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.json")),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.pprof.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, string(want), got)
 }

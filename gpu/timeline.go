@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"maps"
 	"slices"
+	"strconv"
 )
 
 type ExecutionView struct {
@@ -34,6 +35,7 @@ type Snapshot struct {
 	EventViews   []EventView           `json:"event_views,omitempty"`
 	Events       []GPUTimelineEvent    `json:"events,omitempty"`
 	Counters     []GPUCounterSample    `json:"counters,omitempty"`
+	JoinStats    JoinStats             `json:"join_stats,omitempty"`
 	Attributions []WorkloadAttribution `json:"attributions,omitempty"`
 }
 
@@ -110,8 +112,45 @@ func (t *Timeline) Snapshot() Snapshot {
 		EventViews:   eventViews,
 		Events:       cloneTimelineEvents(t.events),
 		Counters:     slices.Clone(t.counters),
+		JoinStats:    buildJoinStats(t.launches, views, eventViews),
 		Attributions: buildAttributions(t.launches, views, eventViews),
 	}
+}
+
+func buildJoinStats(launches []GPUKernelLaunch, executions []ExecutionView, events []EventView) JoinStats {
+	stats := JoinStats{
+		LaunchCount: uint64(len(launches)),
+	}
+	matched := make(map[string]struct{})
+	for _, exec := range executions {
+		switch exec.Join {
+		case JoinExact:
+			stats.ExactExecutionJoinCount++
+		case JoinHeuristic:
+			stats.HeuristicExecutionJoinCount++
+		default:
+			stats.UnmatchedExecutionCount++
+		}
+		if exec.Launch != nil {
+			matched[launchJoinKey(*exec.Launch)] = struct{}{}
+		}
+	}
+	for _, event := range events {
+		if !isJoinCandidateEvent(event.Event) {
+			continue
+		}
+		if event.Join == JoinHeuristic && event.Launch != nil {
+			stats.HeuristicEventJoinCount++
+			matched[launchJoinKey(*event.Launch)] = struct{}{}
+			continue
+		}
+		stats.UnmatchedCandidateEventCount++
+	}
+	stats.MatchedLaunchCount = uint64(len(matched))
+	if stats.LaunchCount >= stats.MatchedLaunchCount {
+		stats.UnmatchedLaunchCount = stats.LaunchCount - stats.MatchedLaunchCount
+	}
+	return stats
 }
 
 type workloadKey struct {
@@ -316,6 +355,25 @@ func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
 		}
 	}
 	return best
+}
+
+func isJoinCandidateEvent(event GPUTimelineEvent) bool {
+	switch event.Kind {
+	case TimelineEventSubmit, TimelineEventWait:
+		return true
+	default:
+		return false
+	}
+}
+
+func launchJoinKey(launch GPUKernelLaunch) string {
+	return string(launch.Correlation.Backend) + "\x00" +
+		launch.Correlation.Value + "\x00" +
+		launch.KernelName + "\x00" +
+		launch.Queue.QueueID + "\x00" +
+		strconv.FormatUint(uint64(launch.Launch.PID), 10) + "\x00" +
+		strconv.FormatUint(uint64(launch.Launch.TID), 10) + "\x00" +
+		strconv.FormatUint(launch.TimeNs, 10)
 }
 
 func samplesForExec(all []GPUSample, exec GPUKernelExec) []GPUSample {

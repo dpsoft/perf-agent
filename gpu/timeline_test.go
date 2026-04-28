@@ -269,6 +269,9 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	if len(got.Backends) != 2 || got.Backends[0] != "linuxdrm" || got.Backends[1] != "stream" {
 		t.Fatalf("backends=%v", got.Backends)
 	}
+	if stats := snapshot.JoinStats; stats.LaunchCount != 1 || stats.MatchedLaunchCount != 1 || stats.UnmatchedLaunchCount != 0 || stats.ExactExecutionJoinCount != 1 || stats.HeuristicEventJoinCount != 1 || stats.UnmatchedExecutionCount != 0 || stats.UnmatchedCandidateEventCount != 0 {
+		t.Fatalf("join stats=%+v", stats)
+	}
 }
 
 func TestTimelineBuildsLaunchOnlyWorkloadAttribution(t *testing.T) {
@@ -404,5 +407,44 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 	}
 	if second.FirstSeenNs != 40 || second.LastSeenNs != 55 {
 		t.Fatalf("second window=%+v", second)
+	}
+	if stats := snapshot.JoinStats; stats.LaunchCount != 2 || stats.MatchedLaunchCount != 2 || stats.UnmatchedLaunchCount != 0 || stats.HeuristicEventJoinCount != 3 || stats.UnmatchedCandidateEventCount != 0 {
+		t.Fatalf("join stats=%+v", stats)
+	}
+}
+
+func TestTimelineBuildsJoinStatsForUnmatchedRecords(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 5})
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "l1"},
+		KernelName:  "alpha_kernel",
+		TimeNs:      10,
+		Launch:      LaunchContext{PID: 1, TID: 1},
+	})
+	tl.RecordExec(GPUKernelExec{
+		Correlation: CorrelationID{Backend: "stream", Value: "missing"},
+		KernelName:  "beta_kernel",
+		StartNs:     30,
+		EndNs:       60,
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend: "linuxdrm",
+		Kind:    TimelineEventSubmit,
+		Name:    "submit-late",
+		TimeNs:  40,
+		PID:     1,
+		TID:     1,
+	})
+
+	snapshot := tl.Snapshot()
+	stats := snapshot.JoinStats
+	if stats.LaunchCount != 1 || stats.MatchedLaunchCount != 0 || stats.UnmatchedLaunchCount != 1 {
+		t.Fatalf("launch stats=%+v", stats)
+	}
+	if stats.UnmatchedExecutionCount != 1 || stats.ExactExecutionJoinCount != 0 || stats.HeuristicExecutionJoinCount != 0 {
+		t.Fatalf("execution stats=%+v", stats)
+	}
+	if stats.HeuristicEventJoinCount != 0 || stats.UnmatchedCandidateEventCount != 1 {
+		t.Fatalf("event stats=%+v", stats)
 	}
 }

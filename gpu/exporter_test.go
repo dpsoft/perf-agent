@@ -25,6 +25,10 @@ func TestWriteJSONSnapshot(t *testing.T) {
 				TID:     12,
 			},
 		},
+		JoinStats: JoinStats{
+			LaunchCount:                  1,
+			UnmatchedCandidateEventCount: 1,
+		},
 	}
 	if err := WriteJSONSnapshot(&buf, snap); err != nil {
 		t.Fatalf("WriteJSONSnapshot: %v", err)
@@ -38,6 +42,9 @@ func TestWriteJSONSnapshot(t *testing.T) {
 	if !strings.Contains(buf.String(), "\"events\"") {
 		t.Fatalf("missing events field in %q", buf.String())
 	}
+	if !strings.Contains(buf.String(), "\"join_stats\"") {
+		t.Fatalf("missing join_stats field in %q", buf.String())
+	}
 	if !strings.Contains(buf.String(), "\"submit\"") {
 		t.Fatalf("missing timeline event in %q", buf.String())
 	}
@@ -48,14 +55,14 @@ func TestWriteJSONAttributions(t *testing.T) {
 	snap := Snapshot{
 		Attributions: []WorkloadAttribution{
 			{
-				CgroupID:           "1000",
-				PodUID:             "pod-a",
-				KernelNames:        []string{"alpha_kernel"},
-				LaunchCount:        1,
-				ExactJoinCount:     1,
-				ExecutionCount:     1,
+				CgroupID:            "1000",
+				PodUID:              "pod-a",
+				KernelNames:         []string{"alpha_kernel"},
+				LaunchCount:         1,
+				ExactJoinCount:      1,
+				ExecutionCount:      1,
 				ExecutionDurationNs: 60,
-				SampleWeight:       11,
+				SampleWeight:        11,
 			},
 		},
 	}

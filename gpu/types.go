@@ -158,6 +158,17 @@ type WorkloadAttribution struct {
 	EventDurationNs     uint64         `json:"event_duration_ns,omitempty"`
 }
 
+type JoinStats struct {
+	LaunchCount                  uint64 `json:"launch_count,omitempty"`
+	MatchedLaunchCount           uint64 `json:"matched_launch_count,omitempty"`
+	UnmatchedLaunchCount         uint64 `json:"unmatched_launch_count,omitempty"`
+	ExactExecutionJoinCount      uint64 `json:"exact_execution_join_count,omitempty"`
+	HeuristicExecutionJoinCount  uint64 `json:"heuristic_execution_join_count,omitempty"`
+	UnmatchedExecutionCount      uint64 `json:"unmatched_execution_count,omitempty"`
+	HeuristicEventJoinCount      uint64 `json:"heuristic_event_join_count,omitempty"`
+	UnmatchedCandidateEventCount uint64 `json:"unmatched_candidate_event_count,omitempty"`
+}
+
 type EventSink interface {
 	EmitLaunch(GPUKernelLaunch)
 	EmitExec(GPUKernelExec)

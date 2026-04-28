@@ -286,6 +286,61 @@ This is still not a true device-internal flame graph, but it is the current bran
 - synthetic flame output for a correlated kernel sample path
 - workload-level attribution for execution time and sample weight
 
+There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:
+
+```bash
+go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/multi_workload_launches.json \
+  --gpu-replay-input gpu/testdata/replay/multi_workload_exec.json \
+  --gpu-raw-output /tmp/gpu-multi-exec.raw.json \
+  --gpu-folded-output /tmp/gpu-multi-exec.folded \
+  --gpu-profile-output /tmp/gpu-multi-exec.pb.gz \
+  --duration 1ms
+
+flamegraph.pl /tmp/gpu-multi-exec.folded > /tmp/gpu-multi-exec.svg
+jq '.attributions' /tmp/gpu-multi-exec.raw.json
+```
+
+The checked-in folded output currently looks like:
+
+```text
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:kernel:alpha_kernel];[gpu:stall:memory_throttle] 11
+train_step_b;cudaLaunchKernel;[gpu:cgroup:2000];[gpu:pod:pod-b];[gpu:launch];[gpu:kernel:beta_kernel];[gpu:stall:wait] 13
+```
+
+And the attribution rollup is expected to stay split cleanly across the two workloads:
+
+```json
+[
+  {
+    "cgroup_id": "1000",
+    "pod_uid": "pod-a",
+    "first_seen_ns": 10,
+    "last_seen_ns": 80,
+    "backends": ["stream"],
+    "kernel_names": ["alpha_kernel"],
+    "launch_count": 1,
+    "exact_join_count": 1,
+    "execution_count": 1,
+    "execution_duration_ns": 60,
+    "sample_weight": 11
+  },
+  {
+    "cgroup_id": "2000",
+    "pod_uid": "pod-b",
+    "first_seen_ns": 40,
+    "last_seen_ns": 100,
+    "backends": ["stream"],
+    "kernel_names": ["beta_kernel"],
+    "launch_count": 1,
+    "exact_join_count": 1,
+    "execution_count": 1,
+    "execution_duration_ns": 40,
+    "sample_weight": 13
+  }
+]
+```
+
 The same run emits a workload rollup like:
 
 ```json
@@ -334,6 +389,60 @@ This is still a host-to-driver correlation flame, not a true GPU-internal flame 
 - lifecycle event replay through the canonical event model
 - heuristic launch-to-submit attribution
 - tenancy-aware folded output suitable for later `flamegraph.pl` rendering
+
+There is also a checked-in multi-workload lifecycle path that proves heuristic host-to-driver attribution stays workload-scoped:
+
+```bash
+go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/multi_workload_launches.json \
+  --gpu-replay-input gpu/testdata/replay/multi_workload_submit.json \
+  --gpu-raw-output /tmp/gpu-multi-driver.raw.json \
+  --gpu-folded-output /tmp/gpu-multi-driver.folded \
+  --gpu-profile-output /tmp/gpu-multi-driver.pb.gz \
+  --duration 1ms
+
+flamegraph.pl /tmp/gpu-multi-driver.folded > /tmp/gpu-multi-driver.svg
+jq '.attributions' /tmp/gpu-multi-driver.raw.json
+```
+
+The checked-in folded output currently looks like:
+
+```text
+train_step_b;cudaLaunchKernel;[gpu:cgroup:2000];[gpu:pod:pod-b];[gpu:launch];[gpu:event:submit:submit-b] 5
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:event:submit:submit-a1] 3
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:event:wait:wait-a2] 4
+```
+
+And the attribution rollup is expected to show the heuristic join counts per workload:
+
+```json
+[
+  {
+    "cgroup_id": "1000",
+    "pod_uid": "pod-a",
+    "first_seen_ns": 10,
+    "last_seen_ns": 29,
+    "backends": ["linuxdrm", "stream"],
+    "kernel_names": ["alpha_kernel"],
+    "launch_count": 1,
+    "heuristic_join_count": 2,
+    "event_count": 2,
+    "event_duration_ns": 7
+  },
+  {
+    "cgroup_id": "2000",
+    "pod_uid": "pod-b",
+    "first_seen_ns": 40,
+    "last_seen_ns": 55,
+    "backends": ["linuxdrm", "stream"],
+    "kernel_names": ["beta_kernel"],
+    "launch_count": 1,
+    "heuristic_join_count": 1,
+    "event_count": 1,
+    "event_duration_ns": 5
+  }
+]
+```
 
 The same run now also emits a workload-level rollup in the raw snapshot:
 

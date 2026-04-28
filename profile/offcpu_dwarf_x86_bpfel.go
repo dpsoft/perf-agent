@@ -27,6 +27,12 @@ type offcpu_dwarfCfiEntry struct {
 	_          [6]byte
 }
 
+type offcpu_dwarfCfiMissRatelimitKey struct {
+	_       structs.HostLayout
+	Pid     uint32
+	TableId uint64
+}
+
 type offcpu_dwarfClassification struct {
 	_          structs.HostLayout
 	PcStart    uint64
@@ -125,6 +131,8 @@ type offcpu_dwarfMapSpecs struct {
 	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
 	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
 	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
 	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
@@ -168,6 +176,8 @@ type offcpu_dwarfMaps struct {
 	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
 	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
 	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
 	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
@@ -182,6 +192,8 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.CfiClassification,
 		m.CfiClassificationLengths,
 		m.CfiLengths,
+		m.CfiMissEvents,
+		m.CfiMissRatelimit,
 		m.CfiRules,
 		m.OffcpuStart,
 		m.PidMappingLengths,

@@ -59,8 +59,8 @@ func buildSyntheticProcTree(t testing.TB, numPIDs, numDistinctBinaries int) (pro
 		for i, p := range binPaths {
 			// Format mimics /proc/<pid>/maps: addr-addr perms offset dev inode path
 			offset := i * 0x1000
-			b.WriteString(fmt.Sprintf("%016x-%016x r-xp %08x 00:00 1234 %s\n",
-				0x400000+offset, 0x401000+offset, 0, p))
+			fmt.Fprintf(&b, "%016x-%016x r-xp %08x 00:00 1234 %s\n",
+				0x400000+offset, 0x401000+offset, 0, p)
 		}
 		if err := os.WriteFile(filepath.Join(pidDir, "maps"), []byte(b.String()), 0o644); err != nil {
 			t.Fatal(err)

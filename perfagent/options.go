@@ -68,6 +68,12 @@ type Config struct {
 	// GPUHostReplayInput is a fixture path for the experimental host replay source.
 	GPUHostReplayInput string
 
+	// GPUHostHIPLibrary is the shared object path for the experimental HIP host source.
+	GPUHostHIPLibrary string
+
+	// GPUHostHIPSymbol is the HIP launch symbol name to trace.
+	GPUHostHIPSymbol string
+
 	// GPUStreamInput is a live normalized GPU NDJSON stream.
 	GPUStreamInput io.Reader
 
@@ -213,6 +219,16 @@ func WithGPUReplayInput(path string) Option {
 func WithGPUHostReplayInput(path string) Option {
 	return func(c *Config) {
 		c.GPUHostReplayInput = path
+	}
+}
+
+func WithGPUHostHIP(libraryPath, symbol string) Option {
+	return func(c *Config) {
+		if symbol == "" {
+			symbol = "hipLaunchKernel"
+		}
+		c.GPUHostHIPLibrary = libraryPath
+		c.GPUHostHIPSymbol = symbol
 	}
 }
 

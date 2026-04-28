@@ -19,6 +19,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
 	"github.com/dpsoft/perf-agent/gpu/backend/stream"
 	hostsource "github.com/dpsoft/perf-agent/gpu/host"
+	hiphost "github.com/dpsoft/perf-agent/gpu/host/hip"
 	hostreplay "github.com/dpsoft/perf-agent/gpu/host/replay"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
@@ -119,6 +120,9 @@ func (c *Config) validate() error {
 			return errors.New("linuxdrm backend requires pid")
 		}
 	}
+	if c.GPUHostHIPLibrary != "" && c.PID == 0 {
+		return errors.New("hip host source requires pid")
+	}
 
 	if c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
 		if c.PID == 0 && !c.SystemWide {
@@ -160,6 +164,9 @@ func (c *Config) gpuSourceCount() int {
 func (c *Config) hostSourceCount() int {
 	count := 0
 	if c.GPUHostReplayInput != "" {
+		count++
+	}
+	if c.GPUHostHIPLibrary != "" {
 		count++
 	}
 	return count
@@ -346,6 +353,12 @@ func (a *Agent) newHostSource() (hostsource.HostSource, error) {
 	switch {
 	case a.config.GPUHostReplayInput != "":
 		return hostreplay.New(a.config.GPUHostReplayInput)
+	case a.config.GPUHostHIPLibrary != "":
+		return hiphost.New(hiphost.Config{
+			PID:         a.config.PID,
+			LibraryPath: a.config.GPUHostHIPLibrary,
+			Symbol:      a.config.GPUHostHIPSymbol,
+		})
 	default:
 		return nil, errors.New("no gpu host source configured")
 	}

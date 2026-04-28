@@ -29,6 +29,8 @@ var (
 	flagPMUOutput          = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagUnwind             = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagGPUHostReplayInput = flag.String("gpu-host-replay-input", "", "Experimental: replay host launch attribution from a JSON fixture")
+	flagGPUHostHIPLibrary  = flag.String("gpu-host-hip-library", "", "Experimental: attach HIP host launch attribution to this shared library path")
+	flagGPUHostHIPSymbol   = flag.String("gpu-host-hip-symbol", "hipLaunchKernel", "Experimental: HIP launch symbol name for --gpu-host-hip-library")
 	flagGPUReplayInput     = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
 	flagGPUStreamStdin     = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
 	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
@@ -116,12 +118,16 @@ func main() {
 func buildOptions() []perfagent.Option {
 	var opts []perfagent.Option
 	gpuHostReplayMode := *flagGPUHostReplayInput != ""
+	gpuHostHIPMode := *flagGPUHostHIPLibrary != ""
 	gpuReplayMode := *flagGPUReplayInput != ""
 	gpuStreamMode := *flagGPUStreamStdin
 	gpuLinuxDRMMode := *flagGPULinuxDRM
 
 	if gpuReplayMode && gpuStreamMode {
 		log.Fatal("--gpu-replay-input and --gpu-stream-stdin are mutually exclusive")
+	}
+	if gpuHostReplayMode && gpuHostHIPMode {
+		log.Fatal("--gpu-host-replay-input and --gpu-host-hip-library are mutually exclusive")
 	}
 	if gpuLinuxDRMMode && *flagAll {
 		log.Fatal("--gpu-linux-drm does not support -a/--all")
@@ -192,6 +198,9 @@ func buildOptions() []perfagent.Option {
 	}
 	if gpuHostReplayMode {
 		opts = append(opts, perfagent.WithGPUHostReplayInput(*flagGPUHostReplayInput))
+	}
+	if gpuHostHIPMode {
+		opts = append(opts, perfagent.WithGPUHostHIP(*flagGPUHostHIPLibrary, *flagGPUHostHIPSymbol))
 	}
 	if gpuStreamMode {
 		opts = append(opts, perfagent.WithGPUStreamInput(os.Stdin))

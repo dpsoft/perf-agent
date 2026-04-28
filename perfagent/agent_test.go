@@ -64,6 +64,14 @@ func TestConfigValidation(t *testing.T) {
 			},
 		},
 		{
+			name: "valid GPU HIP host plus stream mode",
+			opts: []Option{
+				WithPID(123),
+				WithGPUHostHIP("/opt/rocm/lib/libamdhip64.so", "hipLaunchKernel"),
+				WithGPUStreamInput(strings.NewReader("")),
+			},
+		},
+		{
 			name:    "per-pid requires system-wide",
 			opts:    []Option{WithPID(1), WithPMU(), WithPerPID()},
 			wantErr: "per-PID requires system-wide",
@@ -90,6 +98,14 @@ func TestConfigValidation(t *testing.T) {
 			name:    "linuxdrm rejects system-wide",
 			opts:    []Option{WithSystemWide(), WithGPULinuxDRM()},
 			wantErr: "linuxdrm backend does not support system-wide mode",
+		},
+		{
+			name: "hip host requires pid",
+			opts: []Option{
+				WithGPUHostHIP("/opt/rocm/lib/libamdhip64.so", "hipLaunchKernel"),
+				WithGPUStreamInput(strings.NewReader("")),
+			},
+			wantErr: "hip host source requires pid",
 		},
 	}
 

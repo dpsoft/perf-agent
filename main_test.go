@@ -116,3 +116,48 @@ func TestBuildOptionsGPULinuxDRMMode(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 }
+
+func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
+	prevStream := *flagGPUStreamStdin
+	prevHostReplay := *flagGPUHostReplayInput
+	prevReplay := *flagGPUReplayInput
+	prevHostHIPLibrary := *flagGPUHostHIPLibrary
+	prevHostHIPSymbol := *flagGPUHostHIPSymbol
+	prevLinuxDRM := *flagGPULinuxDRM
+	prevProfile := *flagProfile
+	prevOffCPU := *flagOffCpu
+	prevPMU := *flagPMU
+	prevPID := *flagPID
+	prevAll := *flagAll
+
+	t.Cleanup(func() {
+		*flagGPUStreamStdin = prevStream
+		*flagGPUHostReplayInput = prevHostReplay
+		*flagGPUReplayInput = prevReplay
+		*flagGPUHostHIPLibrary = prevHostHIPLibrary
+		*flagGPUHostHIPSymbol = prevHostHIPSymbol
+		*flagGPULinuxDRM = prevLinuxDRM
+		*flagProfile = prevProfile
+		*flagOffCpu = prevOffCPU
+		*flagPMU = prevPMU
+		*flagPID = prevPID
+		*flagAll = prevAll
+	})
+
+	*flagGPUStreamStdin = true
+	*flagGPUHostReplayInput = ""
+	*flagGPUReplayInput = ""
+	*flagGPUHostHIPLibrary = "/opt/rocm/lib/libamdhip64.so"
+	*flagGPUHostHIPSymbol = "hipLaunchKernel"
+	*flagGPULinuxDRM = false
+	*flagProfile = false
+	*flagOffCpu = false
+	*flagPMU = false
+	*flagPID = 123
+	*flagAll = false
+
+	opts := buildOptions()
+	if _, err := perfagent.New(opts...); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+}

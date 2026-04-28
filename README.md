@@ -266,11 +266,12 @@ go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
   --gpu-replay-input gpu/testdata/replay/host_exec_sample.json \
   --gpu-raw-output /tmp/gpu-host-exec.raw.json \
+  --gpu-attribution-output /tmp/gpu-host-exec.attributions.json \
   --gpu-folded-output /tmp/gpu-host-exec.folded \
   --duration 1ms
 
 flamegraph.pl /tmp/gpu-host-exec.folded > /tmp/gpu-host-exec.svg
-jq '.attributions' /tmp/gpu-host-exec.raw.json
+cat /tmp/gpu-host-exec.attributions.json
 ```
 
 The resulting folded line is expected to look like:
@@ -293,12 +294,13 @@ go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/multi_workload_launches.json \
   --gpu-replay-input gpu/testdata/replay/multi_workload_exec.json \
   --gpu-raw-output /tmp/gpu-multi-exec.raw.json \
+  --gpu-attribution-output /tmp/gpu-multi-exec.attributions.json \
   --gpu-folded-output /tmp/gpu-multi-exec.folded \
   --gpu-profile-output /tmp/gpu-multi-exec.pb.gz \
   --duration 1ms
 
 flamegraph.pl /tmp/gpu-multi-exec.folded > /tmp/gpu-multi-exec.svg
-jq '.attributions' /tmp/gpu-multi-exec.raw.json
+cat /tmp/gpu-multi-exec.attributions.json
 ```
 
 The checked-in folded output currently looks like:
@@ -370,11 +372,12 @@ go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
   --gpu-replay-input gpu/testdata/replay/host_driver_submit.json \
   --gpu-raw-output /tmp/gpu-host-driver.raw.json \
+  --gpu-attribution-output /tmp/gpu-host-driver.attributions.json \
   --gpu-folded-output /tmp/gpu-host-driver.folded \
   --duration 1ms
 
 flamegraph.pl /tmp/gpu-host-driver.folded > /tmp/gpu-host-driver.svg
-jq '.attributions' /tmp/gpu-host-driver.raw.json
+cat /tmp/gpu-host-driver.attributions.json
 ```
 
 The resulting folded line is expected to look like:
@@ -397,12 +400,13 @@ go run . \
   --gpu-host-replay-input gpu/testdata/host/replay/multi_workload_launches.json \
   --gpu-replay-input gpu/testdata/replay/multi_workload_submit.json \
   --gpu-raw-output /tmp/gpu-multi-driver.raw.json \
+  --gpu-attribution-output /tmp/gpu-multi-driver.attributions.json \
   --gpu-folded-output /tmp/gpu-multi-driver.folded \
   --gpu-profile-output /tmp/gpu-multi-driver.pb.gz \
   --duration 1ms
 
 flamegraph.pl /tmp/gpu-multi-driver.folded > /tmp/gpu-multi-driver.svg
-jq '.attributions' /tmp/gpu-multi-driver.raw.json
+cat /tmp/gpu-multi-driver.attributions.json
 ```
 
 The checked-in folded output currently looks like:
@@ -473,6 +477,8 @@ Those attribution summaries are meant to be the bridge from profiling artifacts 
 - `kernel_names` lists the unique kernels currently associated with that workload in the snapshot
 - `exact_join_count` and `heuristic_join_count` show how much of the rollup came from exact correlation versus fallback matching
 - `launch_count`, `event_count`, and the duration counters provide a first rollup surface for per-workload GPU usage
+
+If you want just the workload rollup without the full snapshot, use `--gpu-attribution-output <path>`. It writes the same `attributions` array as standalone JSON.
 
 ### Experimental Linux DRM lifecycle backend
 

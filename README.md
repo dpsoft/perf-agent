@@ -303,6 +303,25 @@ That prints the exact `go run . ...` command it would execute, including:
 
 If `--hip-library` is omitted, the helper will first honor `PERF_AGENT_HIP_LIBRARY`, then try a small set of common local ROCm library paths.
 
+There is also a dedicated wrapper for the live AMD path that avoids long `sudo /usr/bin/env ...` commands entirely:
+
+```bash
+bash scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live --pid 4242
+```
+
+Or let it start a short delayed local target automatically:
+
+```bash
+bash scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live
+```
+
+The wrapper:
+
+- sets the required Go / CGO / blazesym environment internally
+- runs the existing `live-hip-linuxdrm` helper under `sudo`
+- accepts the same live knobs such as `--join-window`, `--duration`, and `--hip-library`
+- prints `join_stats` again after the helper completes
+
 After a real run, the helper also prints the fastest inspection steps for the current MVP:
 
 ```bash

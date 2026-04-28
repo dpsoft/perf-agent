@@ -426,6 +426,78 @@ func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPLinuxDRMWrapperDryRunWithPID(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--join-window",
+		"7ms",
+		"--duration",
+		"3s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with pid: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"sudo /usr/bin/env",
+		"scripts/gpu-offline-demo.sh",
+		"live-hip-linuxdrm",
+		"/tmp/gpu-live-wrapper",
+		"--pid 4242",
+		"--hip-library /opt/rocm/lib/libamdhip64.so",
+		"--join-window 7ms",
+		"--duration 3s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPLinuxDRMWrapperDryRunAutoTarget(t *testing.T) {
+	fakeBinDir := t.TempDir()
+	fakeROCmInfo := filepath.Join(fakeBinDir, "rocminfo")
+	if err := os.WriteFile(fakeROCmInfo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake rocminfo: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+	)
+	cmd.Env = append(os.Environ(), "PATH="+fakeBinDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run auto target: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"would start local workload tool: rocminfo",
+		"--pid",
+		"auto-pid",
+		"scripts/gpu-offline-demo.sh",
+		"live-hip-linuxdrm",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func requireBPFCapsForRootTest(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 {

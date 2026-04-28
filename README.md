@@ -259,6 +259,43 @@ This path is still not a real `uprobes` collector or vendor callback backend. It
 - host launch to GPU execution correlation
 - reuse of the existing mixed CPU+GPU `pprof` projection
 
+### Offline and live helper script
+
+The current branch also includes a small checked-in helper for the MVP workflows:
+
+```bash
+scripts/gpu-offline-demo.sh [--dry-run] <mode> <outdir>
+```
+
+Current modes are:
+
+- `host-exec`
+- `host-driver`
+- `multi-exec`
+- `multi-driver`
+- `live-hip-linuxdrm`
+
+For example, the checked-in host-to-execution path can now be run as:
+
+```bash
+bash scripts/gpu-offline-demo.sh host-exec /tmp/gpu-demo
+```
+
+And the current live entrypoint can be previewed safely with:
+
+```bash
+bash scripts/gpu-offline-demo.sh --dry-run live-hip-linuxdrm /tmp/gpu-live \
+  --pid 4242 \
+  --hip-library /opt/rocm/lib/libamdhip64.so
+```
+
+That prints the exact `go run . ...` command it would execute, including:
+
+- raw snapshot output
+- standalone attribution JSON
+- folded flamegraph input
+- synthetic-frame `pprof`
+
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 
 ```bash

@@ -382,5 +382,7 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayMode(t *testing.T) {
 	ctx := t.Context()
 	require.NoError(t, agent.Start(ctx))
 	require.NoError(t, agent.Stop(ctx))
-	assert.Contains(t, folded.String(), "train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13")
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.folded"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), folded.String())
 }

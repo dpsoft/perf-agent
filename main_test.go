@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dpsoft/perf-agent/perfagent"
+	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
 func TestBuildOptionsGPUStreamMode(t *testing.T) {
@@ -221,4 +227,123 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 			t.Fatalf("missing %q in output:\n%s", want, got)
 		}
 	}
+}
+
+func TestGPUOfflineDemoScriptLiveHIPLinuxDRMSmoke(t *testing.T) {
+	requireBPFCapsForRootTest(t)
+
+	hipLib, err := firstHIPLibraryPath()
+	if err != nil {
+		t.Skipf("no HIP library path: %v", err)
+	}
+
+	workload, args, err := firstAMDGPUWorkloadTool()
+	if err != nil {
+		t.Skipf("no amdgpu workload tool: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	workloadArgs := append([]string{"-lc", `sleep 1; exec "$0" "$@"`, workload}, args...)
+	workloadCmd := exec.CommandContext(ctx, "/bin/sh", workloadArgs...)
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+	workloadCmd.Stdout = devNull
+	workloadCmd.Stderr = devNull
+	if err := workloadCmd.Start(); err != nil {
+		t.Fatalf("start workload: %v", err)
+	}
+	defer func() {
+		if workloadCmd.ProcessState == nil || !workloadCmd.ProcessState.Exited() {
+			_ = workloadCmd.Process.Kill()
+			_, _ = workloadCmd.Process.Wait()
+		}
+	}()
+
+	outDir := t.TempDir()
+	scriptCmd := exec.CommandContext(
+		ctx,
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"live-hip-linuxdrm",
+		outDir,
+		"--pid",
+		strconv.Itoa(workloadCmd.Process.Pid),
+		"--hip-library",
+		hipLib,
+		"--duration",
+		"2s",
+	)
+	scriptCmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"CGO_CFLAGS=-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include",
+		"CGO_LDFLAGS=-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic",
+	)
+	out, err := scriptCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("live helper smoke: %v\n%s", err, out)
+	}
+
+	for _, name := range []string{
+		"live_hip_linuxdrm.raw.json",
+		"live_hip_linuxdrm.attributions.json",
+		"live_hip_linuxdrm.folded",
+		"live_hip_linuxdrm.pb.gz",
+	} {
+		path := filepath.Join(outDir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v\n%s", path, err, out)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("%s is empty\n%s", path, out)
+		}
+	}
+}
+
+func requireBPFCapsForRootTest(t *testing.T) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		return
+	}
+	caps := cap.GetProc()
+	hasBPF, err := caps.GetFlag(cap.Permitted, cap.BPF)
+	if err != nil || !hasBPF {
+		t.Skip("CAP_BPF not in permitted set")
+	}
+	hasPerfmon, err := caps.GetFlag(cap.Permitted, cap.PERFMON)
+	if err != nil || !hasPerfmon {
+		t.Skip("CAP_PERFMON not in permitted set")
+	}
+}
+
+func firstHIPLibraryPath() (string, error) {
+	candidates := []string{
+		"/usr/local/lib/ollama/rocm/libamdhip64.so.6.3.60303",
+		"/usr/local/lib/ollama/rocm/libamdhip64.so.6",
+		"/opt/rocm/lib/libamdhip64.so",
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", errors.New("no hip library found")
+}
+
+func firstAMDGPUWorkloadTool() (string, []string, error) {
+	for _, bin := range []string{"rocminfo", "amdgpu-arch"} {
+		path, err := exec.LookPath(bin)
+		if err == nil {
+			return path, nil, nil
+		}
+	}
+	return "", nil, errors.New("no amdgpu workload tool")
 }

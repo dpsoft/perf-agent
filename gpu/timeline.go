@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"cmp"
 	"maps"
 	"slices"
 )
@@ -19,10 +20,11 @@ type EventView struct {
 }
 
 type Snapshot struct {
-	Executions []ExecutionView    `json:"executions"`
-	EventViews []EventView        `json:"event_views,omitempty"`
-	Events     []GPUTimelineEvent `json:"events,omitempty"`
-	Counters   []GPUCounterSample `json:"counters,omitempty"`
+	Executions   []ExecutionView       `json:"executions"`
+	EventViews   []EventView           `json:"event_views,omitempty"`
+	Events       []GPUTimelineEvent    `json:"events,omitempty"`
+	Counters     []GPUCounterSample    `json:"counters,omitempty"`
+	Attributions []WorkloadAttribution `json:"attributions,omitempty"`
 }
 
 type Timeline struct {
@@ -82,11 +84,91 @@ func (t *Timeline) Snapshot() Snapshot {
 		eventViews = append(eventViews, view)
 	}
 	return Snapshot{
-		Executions: views,
-		EventViews: eventViews,
-		Events:     cloneTimelineEvents(t.events),
-		Counters:   slices.Clone(t.counters),
+		Executions:   views,
+		EventViews:   eventViews,
+		Events:       cloneTimelineEvents(t.events),
+		Counters:     slices.Clone(t.counters),
+		Attributions: buildAttributions(views, eventViews),
 	}
+}
+
+type workloadKey struct {
+	cgroupID    string
+	podUID      string
+	containerID string
+}
+
+func buildAttributions(executions []ExecutionView, events []EventView) []WorkloadAttribution {
+	byKey := make(map[workloadKey]*WorkloadAttribution)
+	for _, exec := range executions {
+		if exec.Launch == nil {
+			continue
+		}
+		key, ok := attributionKey(exec.Launch.Launch.Tags)
+		if !ok {
+			continue
+		}
+		entry := ensureAttribution(byKey, key)
+		entry.ExecutionCount++
+		entry.ExecutionDurationNs += max(1, exec.Exec.EndNs-exec.Exec.StartNs)
+		if len(exec.Samples) == 0 {
+			continue
+		}
+		for _, sample := range exec.Samples {
+			entry.SampleWeight += max(1, sample.Weight)
+		}
+	}
+	for _, event := range events {
+		if event.Launch == nil {
+			continue
+		}
+		key, ok := attributionKey(event.Launch.Launch.Tags)
+		if !ok {
+			continue
+		}
+		entry := ensureAttribution(byKey, key)
+		entry.EventCount++
+		entry.EventDurationNs += max(1, event.Event.DurationNs)
+	}
+	out := make([]WorkloadAttribution, 0, len(byKey))
+	for _, entry := range byKey {
+		out = append(out, *entry)
+	}
+	slices.SortFunc(out, func(a, b WorkloadAttribution) int {
+		if diff := cmp.Compare(a.CgroupID, b.CgroupID); diff != 0 {
+			return diff
+		}
+		if diff := cmp.Compare(a.PodUID, b.PodUID); diff != 0 {
+			return diff
+		}
+		return cmp.Compare(a.ContainerID, b.ContainerID)
+	})
+	return out
+}
+
+func attributionKey(tags map[string]string) (workloadKey, bool) {
+	key := workloadKey{
+		cgroupID:    tags["cgroup_id"],
+		podUID:      tags["pod_uid"],
+		containerID: tags["container_id"],
+	}
+	if key == (workloadKey{}) {
+		return workloadKey{}, false
+	}
+	return key, true
+}
+
+func ensureAttribution(byKey map[workloadKey]*WorkloadAttribution, key workloadKey) *WorkloadAttribution {
+	if entry, ok := byKey[key]; ok {
+		return entry
+	}
+	entry := &WorkloadAttribution{
+		CgroupID:    key.cgroupID,
+		PodUID:      key.podUID,
+		ContainerID: key.containerID,
+	}
+	byKey[key] = entry
+	return entry
 }
 
 func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch {

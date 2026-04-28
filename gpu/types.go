@@ -139,6 +139,17 @@ type GPUTimelineEvent struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
+type WorkloadAttribution struct {
+	CgroupID            string `json:"cgroup_id,omitempty"`
+	PodUID              string `json:"pod_uid,omitempty"`
+	ContainerID         string `json:"container_id,omitempty"`
+	ExecutionCount      uint64 `json:"execution_count,omitempty"`
+	ExecutionDurationNs uint64 `json:"execution_duration_ns,omitempty"`
+	SampleWeight        uint64 `json:"sample_weight,omitempty"`
+	EventCount          uint64 `json:"event_count,omitempty"`
+	EventDurationNs     uint64 `json:"event_duration_ns,omitempty"`
+}
+
 type EventSink interface {
 	EmitLaunch(GPUKernelLaunch)
 	EmitExec(GPUKernelExec)

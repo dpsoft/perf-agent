@@ -132,3 +132,58 @@ func TestTimelineAttachesLaunchHeuristicallyToSubmitEvent(t *testing.T) {
 		t.Fatal("expected heuristic attribution")
 	}
 }
+
+func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "c1"},
+		KernelName:  "hip_kernel",
+		TimeNs:      100,
+		Launch: LaunchContext{
+			PID: 10,
+			TID: 11,
+			Tags: map[string]string{
+				"cgroup_id": "9876",
+				"pod_uid":   "pod-abc",
+			},
+		},
+	})
+	tl.RecordExec(GPUKernelExec{
+		Correlation: CorrelationID{Backend: "stream", Value: "c1"},
+		KernelName:  "hip_kernel",
+		StartNs:     120,
+		EndNs:       200,
+	})
+	tl.RecordSample(GPUSample{
+		Correlation: CorrelationID{Backend: "stream", Value: "c1"},
+		KernelName:  "hip_kernel",
+		Weight:      7,
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventSubmit,
+		Name:       "amdgpu-cs",
+		TimeNs:     130,
+		DurationNs: 13,
+		PID:        10,
+		TID:        11,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Attributions) != 1 {
+		t.Fatalf("got %d attributions", len(snapshot.Attributions))
+	}
+	got := snapshot.Attributions[0]
+	if got.CgroupID != "9876" || got.PodUID != "pod-abc" {
+		t.Fatalf("attribution=%+v", got)
+	}
+	if got.ExecutionCount != 1 || got.ExecutionDurationNs != 80 {
+		t.Fatalf("execution aggregation=%+v", got)
+	}
+	if got.SampleWeight != 7 {
+		t.Fatalf("sample weight=%d", got.SampleWeight)
+	}
+	if got.EventCount != 1 || got.EventDurationNs != 13 {
+		t.Fatalf("event aggregation=%+v", got)
+	}
+}

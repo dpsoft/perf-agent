@@ -600,6 +600,74 @@ func TestGPULiveHIPShimDemoDryRun(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoRecordsWrapperFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeHipLib, []byte("not-a-real-library"), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+
+	fakeWrapper := filepath.Join(tmpDir, "fake-wrapper.sh")
+	if err := os.WriteFile(fakeWrapper, []byte("#!/bin/sh\necho fake wrapper ran >&2\nexit 17\n"), 0o755); err != nil {
+		t.Fatalf("write fake wrapper: %v", err)
+	}
+
+	fakeSudo := filepath.Join(tmpDir, "sudo")
+	if err := os.WriteFile(fakeSudo, []byte("#!/bin/sh\nif [ \"$1\" = \"-v\" ]; then exit 0; fi\necho unexpected sudo >&2\nexit 42\n"), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	outDir := filepath.Join(tmpDir, "out")
+	binaryPath := filepath.Join(tmpDir, "gpu-hip-launch-shim")
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--outdir",
+		outDir,
+		"--binary",
+		binaryPath,
+		"--hip-library",
+		fakeHipLib,
+		"--duration",
+		"1ms",
+		"--sleep-before-ms",
+		"1",
+		"--sleep-after-ms",
+		"1",
+	)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tmpDir+":"+os.Getenv("PATH"),
+		"PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT="+fakeWrapper,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected wrapper failure, got success:\n%s", out)
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %T: %v", err, err)
+	}
+	if exitErr.ExitCode() != 17 {
+		t.Fatalf("exit code = %d, want 17\n%s", exitErr.ExitCode(), out)
+	}
+
+	logData, err := os.ReadFile(filepath.Join(outDir, "gpu_live_wrapper.log"))
+	if err != nil {
+		t.Fatalf("read wrapper log: %v", err)
+	}
+	got := string(logData)
+	for _, want := range []string{
+		"wrapper command:",
+		"fake wrapper ran",
+		"wrapper exit status: 17",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in wrapper log:\n%s", want, got)
+		}
+	}
+}
+
 func TestHIPLaunchShimBinaryRuns(t *testing.T) {
 	hipLib, err := firstHIPLibraryPath()
 	if err != nil {

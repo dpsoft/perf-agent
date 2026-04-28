@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-scripts/gpu-live-hip-linuxdrm.sh}"
 
 usage() {
     cat <<'EOF'
@@ -52,8 +53,8 @@ BINARY_PATH="/tmp/gpu-hip-launch-shim"
 HIP_LIBRARY=""
 JOIN_WINDOW="5ms"
 DURATION="2s"
-SLEEP_BEFORE_MS="2000"
-SLEEP_AFTER_MS="4000"
+SLEEP_BEFORE_MS="5000"
+SLEEP_AFTER_MS="10000"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -111,6 +112,7 @@ fi
 
 SOURCE_PATH="${SCRIPT_DIR}/hip-launch-shim.c"
 LOG_PATH="${OUTDIR}/hip_launch_shim.log"
+WRAPPER_LOG_PATH="${OUTDIR}/gpu_live_wrapper.log"
 
 declare -a BUILD_CMD=(
     cc
@@ -126,7 +128,7 @@ declare -a BUILD_CMD=(
 
 declare -a WRAPPER_CMD=(
     bash
-    scripts/gpu-live-hip-linuxdrm.sh
+    "${WRAPPER_SCRIPT}"
     --outdir
     "${OUTDIR}"
     --pid
@@ -157,6 +159,10 @@ mkdir -p "${OUTDIR}"
     "${BUILD_CMD[@]}"
 )
 
+# Acquire sudo credentials before starting the short-lived shim process so the
+# password prompt cannot consume the attach window.
+sudo -v
+
 HIP_LAUNCH_SHIM_LIBRARY="${HIP_LIBRARY}" \
 HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS="${SLEEP_BEFORE_MS}" \
 HIP_LAUNCH_SHIM_SLEEP_AFTER_MS="${SLEEP_AFTER_MS}" \
@@ -169,18 +175,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+set +e
 (
     cd "${REPO_ROOT}"
-    bash scripts/gpu-live-hip-linuxdrm.sh \
-        --outdir "${OUTDIR}" \
-        --pid "${shim_pid}" \
-        --hip-library "${HIP_LIBRARY}" \
-        --join-window "${JOIN_WINDOW}" \
-        --duration "${DURATION}"
+    : >"${WRAPPER_LOG_PATH}"
+    printf 'wrapper command: ' >>"${WRAPPER_LOG_PATH}"
+    quote_cmd "${WRAPPER_CMD[@]/<shim-pid>/${shim_pid}}" >>"${WRAPPER_LOG_PATH}"
+    "${WRAPPER_CMD[@]/<shim-pid>/${shim_pid}}" >>"${WRAPPER_LOG_PATH}" 2>&1
 )
+wrapper_status=$?
+set -e
+printf 'wrapper exit status: %d\n' "${wrapper_status}" >>"${WRAPPER_LOG_PATH}"
+if [[ "${wrapper_status}" -ne 0 ]]; then
+    exit "${wrapper_status}"
+fi
 
 wait "${shim_pid}" || true
 trap - EXIT
 
 echo
 echo "hip shim log: ${LOG_PATH}"
+echo "wrapper log: ${WRAPPER_LOG_PATH}"

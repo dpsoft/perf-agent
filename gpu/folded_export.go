@@ -41,6 +41,7 @@ func buildEventStack(view EventView) []string {
 		return nil
 	}
 	names := ppFrameNames(view.Launch.Launch.CPUStack)
+	names = append(names, ppFrameNames(buildLaunchTagFrames(view.Launch.Launch.Tags))...)
 	names = append(names, "[gpu:launch]")
 	names = append(names, fmt.Sprintf("[gpu:event:%s:%s]", view.Event.Kind, view.Event.Name))
 	return names

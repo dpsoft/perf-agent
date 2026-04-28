@@ -37,6 +37,7 @@ func buildSyntheticStack(execView ExecutionView, gpuSample GPUSample) []pp.Frame
 	var stack []pp.Frame
 	if execView.Launch != nil {
 		stack = append(stack, execView.Launch.Launch.CPUStack...)
+		stack = append(stack, buildLaunchTagFrames(execView.Launch.Launch.Tags)...)
 	}
 	stack = append(stack, pp.FrameFromName("[gpu:launch]"))
 	if queueID := execView.Exec.Queue.QueueID; queueID != "" {
@@ -52,6 +53,23 @@ func buildSyntheticStack(execView ExecutionView, gpuSample GPUSample) []pp.Frame
 		stack = append(stack, pp.FrameFromName(fmt.Sprintf("[gpu:pc:%#x]", gpuSample.PC)))
 	}
 	return stack
+}
+
+func buildLaunchTagFrames(tags map[string]string) []pp.Frame {
+	if len(tags) == 0 {
+		return nil
+	}
+	var frames []pp.Frame
+	if value := tags["cgroup_id"]; value != "" {
+		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:cgroup:%s]", value)))
+	}
+	if value := tags["pod_uid"]; value != "" {
+		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:pod:%s]", value)))
+	}
+	if value := tags["container_id"]; value != "" {
+		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:container:%s]", value)))
+	}
+	return frames
 }
 
 func (e ExecutionView) launchPID() uint32 {

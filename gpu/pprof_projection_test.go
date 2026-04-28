@@ -19,6 +19,10 @@ func TestProjectionAppendsSyntheticGPUFrames(t *testing.T) {
 							pp.FrameFromName("train_step"),
 							pp.FrameFromName("cudaLaunchKernel"),
 						},
+						Tags: map[string]string{
+							"cgroup_id": "9876",
+							"pod_uid":   "pod-abc",
+						},
 					},
 				},
 				Exec: GPUKernelExec{
@@ -39,6 +43,8 @@ func TestProjectionAppendsSyntheticGPUFrames(t *testing.T) {
 	wantNames := []string{
 		"train_step",
 		"cudaLaunchKernel",
+		"[gpu:cgroup:9876]",
+		"[gpu:pod:pod-abc]",
 		"[gpu:launch]",
 		"[gpu:queue:q7]",
 		"[gpu:kernel:flash_attn_fwd]",

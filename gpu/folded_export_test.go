@@ -19,6 +19,10 @@ func TestWriteFoldedStacks(t *testing.T) {
 							pp.FrameFromName("train_step"),
 							pp.FrameFromName("hipLaunchKernel"),
 						},
+						Tags: map[string]string{
+							"cgroup_id": "9876",
+							"pod_uid":   "pod-abc",
+						},
 					},
 				},
 				Exec: GPUKernelExec{
@@ -38,7 +42,7 @@ func TestWriteFoldedStacks(t *testing.T) {
 	}
 
 	got := strings.TrimSpace(buf.String())
-	want := "train_step;hipLaunchKernel;[gpu:launch];[gpu:queue:q7];[gpu:kernel:hip_kernel];[gpu:stall:memory_throttle] 7"
+	want := "train_step;hipLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:queue:q7];[gpu:kernel:hip_kernel];[gpu:stall:memory_throttle] 7"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
@@ -65,6 +69,10 @@ func TestWriteFoldedStacksIncludesAttributedSubmitEvent(t *testing.T) {
 							pp.FrameFromName("train_step"),
 							pp.FrameFromName("hipLaunchKernel"),
 						},
+						Tags: map[string]string{
+							"cgroup_id": "9876",
+							"pod_uid":   "pod-abc",
+						},
 					},
 				},
 				Event: GPUTimelineEvent{
@@ -84,7 +92,7 @@ func TestWriteFoldedStacksIncludesAttributedSubmitEvent(t *testing.T) {
 		t.Fatalf("WriteFoldedStacks: %v", err)
 	}
 	got := strings.TrimSpace(buf.String())
-	want := "train_step;hipLaunchKernel;[gpu:launch];[gpu:event:submit:amdgpu-cs] 13"
+	want := "train_step;hipLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}

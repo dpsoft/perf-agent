@@ -386,3 +386,20 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayMode(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(want), folded.String())
 }
+
+func TestAgentHostReplayPlusCheckedInGPUEventReplayRawJSONGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.json")),
+		WithGPURawOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.raw.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}

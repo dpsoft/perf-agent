@@ -406,6 +406,26 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayRawJSONGolden(t *testing.T) {
 	assert.Equal(t, string(want), raw.String())
 }
 
+func TestAgentHostReplayPlusGPUStreamRawJSONGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+		WithGPUStreamInput(strings.NewReader(
+			"{\"kind\":\"exec\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"start_ns\":120,\"end_ns\":200}\n"+
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"stream\",\"value\":\"c1\"},\"kernel_name\":\"flash_attn_fwd\",\"time_ns\":150,\"stall_reason\":\"memory_throttle\",\"weight\":7}\n",
+		)),
+		WithGPURawOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_exec_sample.raw.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}
+
 func TestAgentHostReplayPlusCheckedInGPUEventReplayProfileGolden(t *testing.T) {
 	var profileBuf bytes.Buffer
 	agent, err := New(

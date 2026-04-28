@@ -10,8 +10,8 @@ usage() {
 Usage:
   scripts/gpu-live-hip-linuxdrm.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
 
-If --pid is omitted, the script starts a short delayed local workload
-(rocminfo first, then amdgpu-arch) and targets that PID automatically.
+Real runs require --pid to point at an existing HIP process. Dry-run mode
+may omit --pid to preview the wrapped command with a placeholder PID.
 EOF
 }
 
@@ -34,17 +34,6 @@ discover_hip_library() {
         fi
     done
 
-    return 1
-}
-
-discover_workload_tool() {
-    local tool
-    for tool in rocminfo amdgpu-arch; do
-        if command -v "${tool}" >/dev/null 2>&1; then
-            printf '%s\n' "${tool}"
-            return 0
-        fi
-    done
     return 1
 }
 
@@ -115,16 +104,6 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
     exit 1
 fi
 
-WORKLOAD_PID=""
-WORKLOAD_TOOL=""
-if [[ -z "${PID}" ]]; then
-    WORKLOAD_TOOL="$(discover_workload_tool || true)"
-    if [[ -z "${WORKLOAD_TOOL}" ]]; then
-        echo "could not discover local AMDGPU workload tool; pass --pid explicitly" >&2
-        exit 1
-    fi
-fi
-
 RAW_PATH="${OUTDIR}/live_hip_linuxdrm.raw.json"
 ATTR_PATH="${OUTDIR}/live_hip_linuxdrm.attributions.json"
 FOLDED_PATH="${OUTDIR}/live_hip_linuxdrm.folded"
@@ -157,29 +136,15 @@ declare -a SUDO_CMD=(
 
 if [[ -n "${PID}" ]]; then
     SUDO_CMD[13]="${PID}"
+elif [[ "${DRY_RUN}" == "1" ]]; then
+    echo "dry-run placeholder: pass --pid <live-hip-process-pid> for a real run"
+    SUDO_CMD[13]="<pid>"
+    quote_cmd "${SUDO_CMD[@]}"
+    exit 0
 else
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "would start local workload tool: ${WORKLOAD_TOOL}"
-        SUDO_CMD[13]="<auto-pid>"
-        quote_cmd "${SUDO_CMD[@]}"
-        exit 0
-    fi
-
-    (
-        sleep 1
-        exec "${WORKLOAD_TOOL}" >/tmp/${WORKLOAD_TOOL}.out 2>/tmp/${WORKLOAD_TOOL}.err
-    ) &
-    WORKLOAD_PID=$!
-    SUDO_CMD[13]="${WORKLOAD_PID}"
+    echo "live runs require --pid for an existing HIP process; auto-target is not supported yet" >&2
+    exit 1
 fi
-
-cleanup() {
-    if [[ -n "${WORKLOAD_PID}" ]]; then
-        kill "${WORKLOAD_PID}" >/dev/null 2>&1 || true
-        wait "${WORKLOAD_PID}" >/dev/null 2>&1 || true
-    fi
-}
-trap cleanup EXIT
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     quote_cmd "${SUDO_CMD[@]}"

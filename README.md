@@ -309,10 +309,10 @@ There is also a dedicated wrapper for the live AMD path that avoids long `sudo /
 bash scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live --pid 4242
 ```
 
-Or let it start a short delayed local target automatically:
+Or preview the wrapped command shape without a real PID yet:
 
 ```bash
-bash scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live
+bash scripts/gpu-live-hip-linuxdrm.sh --dry-run --outdir /tmp/gpu-live
 ```
 
 The wrapper:
@@ -320,6 +320,7 @@ The wrapper:
 - sets the required Go / CGO / blazesym environment internally
 - runs the existing `live-hip-linuxdrm` helper under `sudo`
 - accepts the same live knobs such as `--join-window`, `--duration`, and `--hip-library`
+- requires `--pid` for a real run, because the target must already be a HIP process
 - prints `join_stats` again after the helper completes
 
 After a real run, the helper also prints the fastest inspection steps for the current MVP:

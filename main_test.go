@@ -464,12 +464,6 @@ func TestGPULiveHIPLinuxDRMWrapperDryRunWithPID(t *testing.T) {
 }
 
 func TestGPULiveHIPLinuxDRMWrapperDryRunAutoTarget(t *testing.T) {
-	fakeBinDir := t.TempDir()
-	fakeROCmInfo := filepath.Join(fakeBinDir, "rocminfo")
-	if err := os.WriteFile(fakeROCmInfo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fake rocminfo: %v", err)
-	}
-
 	cmd := exec.Command(
 		"bash",
 		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
@@ -479,16 +473,14 @@ func TestGPULiveHIPLinuxDRMWrapperDryRunAutoTarget(t *testing.T) {
 		"--hip-library",
 		"/opt/rocm/lib/libamdhip64.so",
 	)
-	cmd.Env = append(os.Environ(), "PATH="+fakeBinDir+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("wrapper dry-run auto target: %v\n%s", err, out)
 	}
 	got := string(out)
 	for _, want := range []string{
-		"would start local workload tool: rocminfo",
+		"dry-run placeholder: pass --pid <live-hip-process-pid> for a real run",
 		"--pid",
-		"auto-pid",
 		"scripts/gpu-offline-demo.sh",
 		"live-hip-linuxdrm",
 	} {

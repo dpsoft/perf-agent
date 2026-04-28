@@ -1,0 +1,15 @@
+[
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "submit",
+      "name": "amdgpu-cs",
+      "time_ns": 130,
+      "duration_ns": 13,
+      "pid": 4242,
+      "tid": 4243,
+      "source": "replay"
+    }
+  }
+]

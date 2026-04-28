@@ -369,3 +369,18 @@ func TestAgentHostReplayPlusGPUEventReplayMode(t *testing.T) {
 	require.NoError(t, agent.Stop(ctx))
 	assert.Contains(t, folded.String(), "train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13")
 }
+
+func TestAgentHostReplayPlusCheckedInGPUEventReplayMode(t *testing.T) {
+	var folded bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "host_driver_submit.json")),
+		WithGPUFoldedOutput(&folded),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	assert.Contains(t, folded.String(), "train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13")
+}

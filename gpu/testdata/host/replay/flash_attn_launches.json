@@ -17,7 +17,9 @@
     "context_id": "ctx0",
     "correlation_id": "c1",
     "tags": {
-      "env": "test"
+      "env": "test",
+      "cgroup_id": "9876",
+      "pod_uid": "pod-abc"
     },
     "source": "host-replay"
   }

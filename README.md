@@ -259,6 +259,31 @@ This path is still not a real `uprobes` collector or vendor callback backend. It
 - host launch to GPU execution correlation
 - reuse of the existing mixed CPU+GPU `pprof` projection
 
+There is also an offline host-to-driver flame path for the current MVP. It uses checked-in fixtures for a canonical host launch plus a normalized Linux DRM submit event, then writes folded stacks that you can render with Brendan Gregg’s FlameGraph tools:
+
+```bash
+go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
+  --gpu-replay-input gpu/testdata/replay/host_driver_submit.json \
+  --gpu-folded-output /tmp/gpu-host-driver.folded \
+  --duration 1ms
+
+flamegraph.pl /tmp/gpu-host-driver.folded > /tmp/gpu-host-driver.svg
+```
+
+The resulting folded line is expected to look like:
+
+```text
+train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:launch];[gpu:event:submit:amdgpu-cs] 13
+```
+
+This is still a host-to-driver correlation flame, not a true GPU-internal flame graph. It proves:
+
+- host launch replay through the canonical launch model
+- lifecycle event replay through the canonical event model
+- heuristic launch-to-submit attribution
+- tenancy-aware folded output suitable for later `flamegraph.pl` rendering
+
 ### Experimental Linux DRM lifecycle backend
 
 There is also an experimental Linux-first GPU lifecycle backend. It traces `ioctl` activity for a single target PID, emits normalized lifecycle events into the GPU timeline, and writes the raw JSON snapshot through the existing GPU export path.

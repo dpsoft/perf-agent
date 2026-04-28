@@ -121,6 +121,7 @@ func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, e
 		entry := ensureAttribution(byKey, key)
 		entry.observe(launch.TimeNs, launch.TimeNs)
 		entry.addBackend(launch.Correlation.Backend)
+		entry.addKernelName(launch.KernelName)
 		entry.LaunchCount++
 	}
 	for _, exec := range executions {
@@ -134,6 +135,7 @@ func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, e
 		entry := ensureAttribution(byKey, key)
 		entry.observe(exec.Exec.StartNs, exec.Exec.EndNs)
 		entry.addBackend(exec.Exec.Execution.Backend)
+		entry.addKernelName(exec.Exec.KernelName)
 		entry.observeJoin(exec.Join)
 		entry.ExecutionCount++
 		entry.ExecutionDurationNs += max(1, exec.Exec.EndNs-exec.Exec.StartNs)
@@ -226,6 +228,17 @@ func (w *WorkloadAttribution) addBackend(backend GPUBackendID) {
 	}
 	w.Backends = append(w.Backends, backend)
 	slices.Sort(w.Backends)
+}
+
+func (w *WorkloadAttribution) addKernelName(name string) {
+	if name == "" {
+		return
+	}
+	if slices.Contains(w.KernelNames, name) {
+		return
+	}
+	w.KernelNames = append(w.KernelNames, name)
+	slices.Sort(w.KernelNames)
 }
 
 func (w *WorkloadAttribution) observeJoin(join JoinKind) {

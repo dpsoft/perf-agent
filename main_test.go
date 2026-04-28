@@ -229,6 +229,32 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRMUsesEnvLibrary(t *testing.T) {
+	fakeDir := t.TempDir()
+	fakeLib := filepath.Join(fakeDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeLib, []byte(""), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"live-hip-linuxdrm",
+		"/tmp/gpu-live-demo",
+		"--pid",
+		"4242",
+	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_HIP_LIBRARY="+fakeLib)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run live-hip-linuxdrm env lib: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "--gpu-host-hip-library "+fakeLib) {
+		t.Fatalf("missing env-discovered hip library in output:\n%s", out)
+	}
+}
+
 func TestGPUOfflineDemoScriptLiveHIPLinuxDRMSmoke(t *testing.T) {
 	requireBPFCapsForRootTest(t)
 

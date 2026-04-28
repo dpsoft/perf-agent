@@ -29,6 +29,28 @@ Outputs:
 EOF
 }
 
+discover_hip_library() {
+    local env_path="${PERF_AGENT_HIP_LIBRARY:-}"
+    if [[ -n "${env_path}" && -e "${env_path}" ]]; then
+        printf '%s\n' "${env_path}"
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "/usr/local/lib/ollama/rocm/libamdhip64.so.6.3.60303" \
+        "/usr/local/lib/ollama/rocm/libamdhip64.so.6" \
+        "/opt/rocm/lib/libamdhip64.so"
+    do
+        if [[ -e "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 quote_cmd() {
     local parts=()
     local arg
@@ -123,8 +145,15 @@ case "${MODE}" in
         NAME="multi_workload_submit"
         ;;
     live-hip-linuxdrm)
-        if [[ -z "${PID}" || -z "${HIP_LIBRARY}" ]]; then
-            echo "live-hip-linuxdrm requires --pid and --hip-library" >&2
+        if [[ -z "${PID}" ]]; then
+            echo "live-hip-linuxdrm requires --pid" >&2
+            exit 1
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            HIP_LIBRARY="$(discover_hip_library || true)"
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            echo "live-hip-linuxdrm requires --hip-library or PERF_AGENT_HIP_LIBRARY" >&2
             exit 1
         fi
         NAME="live_hip_linuxdrm"

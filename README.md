@@ -296,6 +296,8 @@ That prints the exact `go run . ...` command it would execute, including:
 - folded flamegraph input
 - synthetic-frame `pprof`
 
+If `--hip-library` is omitted, the helper will first honor `PERF_AGENT_HIP_LIBRARY`, then try a small set of common local ROCm library paths.
+
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 
 ```bash

@@ -70,6 +70,18 @@ type session struct {
 	mu      sync.Mutex
 	samples map[sampleKey]uint64
 	stacks  map[sampleKey][]uint64
+
+	attachStats attachStats
+}
+
+// attachStats records the (pidCount, binaryCount) returned by the
+// initial AttachAll{Processes,Mappings} call in newSession. Exposed
+// via Profiler.AttachStats / OffCPUProfiler.AttachStats. Zero on
+// attach failure (the agent still ran in FP-only mode for unattached
+// binaries).
+type attachStats struct {
+	pidCount    int
+	binaryCount int
 }
 
 // newSession wires up everything shared after BPF is loaded: ehmaps,
@@ -80,11 +92,14 @@ type session struct {
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
 	)
+	if hooks != nil && hooks.OnCompile != nil {
+		store.SetOnCompile(hooks.onCompileFunc())
+	}
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 
 	// Eager-compile is best-effort. Binaries without .eh_frame (Go,
@@ -92,12 +107,15 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	// still handles FP-safe code at runtime, and MmapWatcher will retry
 	// per-binary on dlopen. Log the error and continue rather than refusing
 	// to start.
+	var stats attachStats
 	if systemWide {
 		nPIDs, nTables, err := ehmaps.AttachAllProcesses(tracker)
 		if err != nil {
 			log.Printf("%s: AttachAllProcesses: %v (continuing; walker uses FP path for unattached binaries)", logPrefix, err)
 		} else {
 			log.Printf("%s: attached %d distinct binaries across %d PIDs", logPrefix, nTables, nPIDs)
+			stats.pidCount = nPIDs
+			stats.binaryCount = nTables
 		}
 	} else {
 		n, err := ehmaps.AttachAllMappings(tracker, uint32(pid))
@@ -105,6 +123,8 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 			log.Printf("%s: AttachAllMappings(pid=%d): %v (continuing; walker uses FP path for unattached binaries)", logPrefix, pid, err)
 		} else {
 			log.Printf("%s: attached %d binaries from /proc/%d/maps", logPrefix, n, pid)
+			stats.pidCount = 1
+			stats.binaryCount = n
 		}
 	}
 
@@ -144,17 +164,18 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	}
 
 	return &session{
-		pid:        pid,
-		tags:       tags,
-		objs:       objs,
-		store:      store,
-		tracker:    tracker,
-		watcher:    watcher,
-		ringReader: rd,
-		symbolizer: symbolizer,
-		resolver:   procmap.NewResolver(),
-		stop:       make(chan struct{}),
-		samples:    map[sampleKey]uint64{},
+		pid:         pid,
+		tags:        tags,
+		objs:        objs,
+		store:       store,
+		tracker:     tracker,
+		watcher:     watcher,
+		ringReader:  rd,
+		symbolizer:  symbolizer,
+		resolver:    procmap.NewResolver(),
+		stop:        make(chan struct{}),
+		samples:     map[sampleKey]uint64{},
+		attachStats: stats,
 	}, nil
 }
 

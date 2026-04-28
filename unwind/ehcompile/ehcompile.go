@@ -15,33 +15,40 @@ var ErrNoEHFrame = errors.New("ehcompile: no .eh_frame section")
 var ErrUnsupportedArch = errors.New("ehcompile: unsupported ELF machine type")
 
 // Compile reads the ELF at elfPath and produces flat CFI + Classification
-// tables. Both slices are sorted by PCStart. Adjacent rows with identical
-// rules are coalesced at emission time.
+// tables, plus the size in bytes of the ELF's .eh_frame section. Both
+// slices are sorted by PCStart. Adjacent rows with identical rules are
+// coalesced at emission time.
+//
+// ehFrameBytes is the raw .eh_frame section size before parsing — useful
+// for cost analysis (per-byte compile rate) and observability hooks. It
+// is reported even on parse errors after the section has been read; if
+// the section is missing entirely (ErrNoEHFrame), ehFrameBytes is 0.
 //
 // The ELF's machine type (x86_64 vs aarch64) is auto-detected and the
 // appropriate archInfo is used for register-number translation.
 //
 // Not safe for concurrent calls per instance; callers should serialize.
-func Compile(elfPath string) (entries []CFIEntry, classifications []Classification, err error) {
+func Compile(elfPath string) (entries []CFIEntry, classifications []Classification, ehFrameBytes int, err error) {
 	f, err := elf.Open(elfPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open elf: %w", err)
+		return nil, nil, 0, fmt.Errorf("open elf: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	arch, err := archFromELFMachine(f.Machine)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	sec := f.Section(".eh_frame")
 	if sec == nil {
-		return nil, nil, ErrNoEHFrame
+		return nil, nil, 0, ErrNoEHFrame
 	}
 	data, err := sec.Data()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read .eh_frame: %w", err)
+		return nil, nil, 0, fmt.Errorf("read .eh_frame: %w", err)
 	}
+	ehFrameBytes = len(data)
 	sectionPos := sec.Addr
 
 	var allEntries []CFIEntry
@@ -67,11 +74,11 @@ func Compile(elfPath string) (entries []CFIEntry, classifications []Classificati
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, ehFrameBytes, err
 	}
 
 	sort.Slice(allEntries, func(i, j int) bool { return allEntries[i].PCStart < allEntries[j].PCStart })
 	sort.Slice(allClasses, func(i, j int) bool { return allClasses[i].PCStart < allClasses[j].PCStart })
 
-	return allEntries, allClasses, nil
+	return allEntries, allClasses, ehFrameBytes, nil
 }

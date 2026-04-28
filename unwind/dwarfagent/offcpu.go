@@ -20,14 +20,10 @@ type OffCPUProfiler struct {
 	link link.Link
 }
 
-// NewOffCPUProfiler loads the offcpu_dwarf BPF program, wires ehmaps
-// via newSession, attaches the tp_btf program via link.AttachTracing,
-// and starts the ringbuf reader + tracker goroutines.
-//
-// On error, every resource created is closed before returning.
-// Callers should NOT call Close on an OffCPUProfiler they received
-// as (nil, err).
-func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*OffCPUProfiler, error) {
+// NewOffCPUProfilerWithHooks is the variant of NewOffCPUProfiler that
+// accepts an optional observation surface. Pass nil hooks for the same
+// behavior as NewOffCPUProfiler.
+func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -42,7 +38,7 @@ func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*O
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)")
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -60,6 +56,17 @@ func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*O
 	go sess.consumeRingbuf(aggregateOffCPUSample)
 
 	return p, nil
+}
+
+// NewOffCPUProfiler loads the offcpu_dwarf BPF program, wires ehmaps
+// via newSession, attaches the tp_btf program via link.AttachTracing,
+// and starts the ringbuf reader + tracker goroutines.
+//
+// On error, every resource created is closed before returning.
+// Callers should NOT call Close on an OffCPUProfiler they received
+// as (nil, err).
+func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*OffCPUProfiler, error) {
+	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil)
 }
 
 // aggregateOffCPUSample is the off-CPU-specific ringbuf aggregator:
@@ -100,4 +107,11 @@ func (p *OffCPUProfiler) Close() error {
 		p.link = nil
 	}
 	return p.close()
+}
+
+// AttachStats returns the (pidCount, binaryCount) recorded by newSession's
+// initial AttachAllProcesses/AttachAllMappings call. See
+// (*Profiler).AttachStats for full semantics.
+func (p *OffCPUProfiler) AttachStats() (pidCount, binaryCount int) {
+	return p.attachStats.pidCount, p.attachStats.binaryCount
 }

@@ -55,3 +55,24 @@ clean:
 	rm -f test/workloads/go/cpu_bound test/workloads/go/io_bound
 	rm -rf test/workloads/rust/target
 	rm -f /tmp/perf-agent-test-*.dat
+
+.PHONY: bench-corpus bench-build bench-scenarios
+
+bench-corpus:
+	GOTOOLCHAIN=auto go test -bench=. -benchmem -run=^$$ ./unwind/ehcompile/...
+
+bench-build:
+	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
+		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-rpath,$(abspath $(LIBBLAZESYM_SRC)/target/release) -lblazesym_c" \
+		GOTOOLCHAIN=auto go build -o bench/cmd/scenario/scenario ./bench/cmd/scenario
+	GOTOOLCHAIN=auto go build -o bench/cmd/report/report ./bench/cmd/report
+
+bench-scenarios: bench-build test-workloads
+	@if ! getcap ./bench/cmd/scenario/scenario | grep -q cap_perfmon; then \
+		echo "*** scenario binary missing caps; run: sudo setcap cap_perfmon,cap_bpf,cap_sys_admin,cap_sys_ptrace,cap_checkpoint_restore+ep ./bench/cmd/scenario/scenario"; \
+		exit 1; \
+	fi
+	./bench/cmd/scenario/scenario --scenario pid-large --runs 5 --out bench-pid-large.json
+	./bench/cmd/scenario/scenario --scenario system-wide-mixed --processes 30 --runs 5 --out bench-system-wide-mixed.json
+	./bench/cmd/report/report --in bench-pid-large.json bench-system-wide-mixed.json > bench-report.md
+	@echo "report written to bench-report.md"

@@ -22,7 +22,7 @@ func runGolden(t *testing.T, elfPath, goldenPath string) {
 	if _, err := os.Stat(elfPath); err != nil {
 		t.Skipf("fixture missing: %s", elfPath)
 	}
-	entries, classes, err := Compile(elfPath)
+	entries, classes, _, err := Compile(elfPath)
 	require.NoError(t, err)
 	got := goldenFile{Entries: entries, Classifications: classes}
 
@@ -45,7 +45,7 @@ func runGolden(t *testing.T, elfPath, goldenPath string) {
 }
 
 func TestCompile_NotImplemented(t *testing.T) {
-	_, _, err := Compile("/dev/null")
+	_, _, _, err := Compile("/dev/null")
 	require.Error(t, err)
 }
 
@@ -53,7 +53,7 @@ func TestCompile_SystemBinary(t *testing.T) {
 	if _, err := os.Stat("/bin/true"); err != nil {
 		t.Skip("/bin/true not found")
 	}
-	entries, classes, err := Compile("/bin/true")
+	entries, classes, _, err := Compile("/bin/true")
 	require.NoError(t, err)
 	assert.NotEmpty(t, entries)
 	assert.NotEmpty(t, classes)
@@ -91,7 +91,7 @@ func TestCompile_SystemGlibc(t *testing.T) {
 	if path == "" {
 		t.Skip("no system libc found")
 	}
-	entries, classes, err := Compile(path)
+	entries, classes, _, err := Compile(path)
 	require.NoError(t, err)
 	assert.Greater(t, len(entries), 1000)
 
@@ -114,7 +114,7 @@ func TestCompile_GoBinary(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Skip("/usr/bin/go not found")
 	}
-	entries, _, err := Compile(path)
+	entries, _, _, err := Compile(path)
 	if err == ErrNoEHFrame {
 		t.Logf("go binary: pure-Go, no .eh_frame (expected for non-cgo builds)")
 		return

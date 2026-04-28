@@ -1,0 +1,41 @@
+[
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "submit",
+      "name": "submit-b",
+      "time_ns": 50,
+      "duration_ns": 5,
+      "pid": 2002,
+      "tid": 2002,
+      "source": "replay"
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "submit",
+      "name": "submit-a1",
+      "time_ns": 20,
+      "duration_ns": 3,
+      "pid": 1001,
+      "tid": 1001,
+      "source": "replay"
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "wait",
+      "name": "wait-a2",
+      "time_ns": 25,
+      "duration_ns": 4,
+      "pid": 1001,
+      "tid": 1001,
+      "source": "replay"
+    }
+  }
+]

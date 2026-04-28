@@ -406,6 +406,23 @@ func TestAgentHostReplayPlusCheckedInGPUEventReplayRawJSONGolden(t *testing.T) {
 	assert.Equal(t, string(want), raw.String())
 }
 
+func TestAgentHostReplayPlusCheckedInMultiWorkloadGPUEventReplayRawJSONGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "multi_workload_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.json")),
+		WithGPURawOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "multi_workload_submit.raw.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}
+
 func TestAgentHostReplayPlusGPUStreamRawJSONGolden(t *testing.T) {
 	var raw bytes.Buffer
 	agent, err := New(

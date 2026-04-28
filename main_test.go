@@ -411,6 +411,14 @@ func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 		"jq '.join_stats' " + filepath.Join(outDir, "host_exec_sample.raw.json"),
 		"Inspect workload attribution with:",
 		"jq '.' " + filepath.Join(outDir, "host_exec_sample.attributions.json"),
+		"join summary:",
+		"launches matched: 1/1",
+		"exact execution joins: 1",
+		"heuristic event joins: 0",
+		"unmatched launches: 0",
+		"unmatched candidate events: 0",
+		"tuning hint:",
+		"join activity looks healthy; only widen --join-window if you still see missing lifecycle matches",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

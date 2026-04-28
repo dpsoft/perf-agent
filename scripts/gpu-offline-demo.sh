@@ -225,4 +225,31 @@ if command -v jq >/dev/null 2>&1; then
     echo
     echo "join_stats:"
     jq '.join_stats' "${RAW_PATH}"
+
+    launch_count="$(jq -r '.join_stats.launch_count // 0' "${RAW_PATH}")"
+    matched_launch_count="$(jq -r '.join_stats.matched_launch_count // 0' "${RAW_PATH}")"
+    unmatched_launch_count="$(jq -r '.join_stats.unmatched_launch_count // 0' "${RAW_PATH}")"
+    exact_execution_join_count="$(jq -r '.join_stats.exact_execution_join_count // 0' "${RAW_PATH}")"
+    heuristic_event_join_count="$(jq -r '.join_stats.heuristic_event_join_count // 0' "${RAW_PATH}")"
+    unmatched_candidate_event_count="$(jq -r '.join_stats.unmatched_candidate_event_count // 0' "${RAW_PATH}")"
+
+    echo
+    echo "join summary:"
+    echo "  launches matched: ${matched_launch_count}/${launch_count}"
+    echo "  exact execution joins: ${exact_execution_join_count}"
+    echo "  heuristic event joins: ${heuristic_event_join_count}"
+    echo "  unmatched launches: ${unmatched_launch_count}"
+    echo "  unmatched candidate events: ${unmatched_candidate_event_count}"
+
+    echo
+    echo "tuning hint:"
+    if (( unmatched_candidate_event_count > heuristic_event_join_count )); then
+        echo "  many submit/wait events are unmatched; try a wider --join-window"
+    elif (( unmatched_launch_count > matched_launch_count )); then
+        echo "  many launches are unmatched; verify the target PID and HIP library path first"
+    elif (( exact_execution_join_count > 0 || heuristic_event_join_count > 0 )); then
+        echo "  join activity looks healthy; only widen --join-window if you still see missing lifecycle matches"
+    else
+        echo "  no joins were produced; verify the workload, PID, and data sources before tuning the window"
+    fi
 fi

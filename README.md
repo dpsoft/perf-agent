@@ -310,7 +310,11 @@ jq '.join_stats' /tmp/gpu-live/live_hip_linuxdrm.raw.json
 jq '.' /tmp/gpu-live/live_hip_linuxdrm.attributions.json
 ```
 
-If `jq` is installed, it also prints the `join_stats` block directly.
+If `jq` is installed, it also prints:
+
+- the `join_stats` block directly
+- a short `join summary`
+- a first-pass `tuning hint`
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

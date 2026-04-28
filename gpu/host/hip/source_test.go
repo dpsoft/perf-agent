@@ -23,6 +23,12 @@ func TestNewRejectsMissingPID(t *testing.T) {
 	}
 }
 
+func TestNewRejectsMissingLibraryInLiveMode(t *testing.T) {
+	if _, err := New(Config{PID: 123}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestStartEmitsNormalizedLaunchRecordFromTestRecord(t *testing.T) {
 	src, err := New(Config{
 		PID: 123,
@@ -67,5 +73,55 @@ func TestStartEmitsNormalizedLaunchRecordFromTestRecord(t *testing.T) {
 	}
 	if got := len(sink.records[0].CPUStack); got != 2 {
 		t.Fatalf("cpu stack len=%d", got)
+	}
+}
+
+func TestNewAcceptsLiveConfig(t *testing.T) {
+	src, err := New(Config{
+		PID:         123,
+		LibraryPath: "/lib64/libamdhip64.so",
+		Symbol:      "hipExtLaunchKernel",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if src == nil {
+		t.Fatal("expected source")
+	}
+}
+
+func TestStartLiveModeDelegatesToLiveRunner(t *testing.T) {
+	src, err := New(Config{
+		PID:         123,
+		LibraryPath: "/lib64/libamdhip64.so",
+		Symbol:      "hipLaunchKernel",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	called := false
+	src.startLive = func(_ context.Context, sink host.HostSink) error {
+		called = true
+		return sink.EmitLaunchRecord(host.LaunchRecord{
+			Backend:       "hip",
+			PID:           123,
+			TID:           456,
+			TimeNs:        789,
+			KernelName:    "hip_kernel",
+			QueueID:       "stream:beef",
+			CorrelationID: "hip:123:456:789",
+		})
+	}
+
+	var sink captureSink
+	if err := src.Start(context.Background(), &sink); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !called {
+		t.Fatal("expected live runner")
+	}
+	if got := len(sink.records); got != 1 {
+		t.Fatalf("records=%d", got)
 	}
 }

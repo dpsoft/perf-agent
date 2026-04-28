@@ -2,26 +2,37 @@ package hip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/dpsoft/perf-agent/gpu/host"
 )
 
+var errLiveNotImplemented = errors.New("hip live uprobes are not implemented yet")
+
 type Source struct {
-	cfg     Config
-	decoder recordDecoder
+	cfg       Config
+	decoder   recordDecoder
+	startLive func(context.Context, host.HostSink) error
+	live      liveDeps
 }
 
 func New(cfg Config) (*Source, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Source{cfg: cfg}, nil
+	src := &Source{cfg: cfg}
+	src.startLive = src.runLive
+	src.live = defaultLiveDeps()
+	return src, nil
 }
 
 func (s *Source) ID() string { return "hip-uprobes" }
 
-func (s *Source) Start(_ context.Context, sink host.HostSink) error {
+func (s *Source) Start(ctx context.Context, sink host.HostSink) error {
+	if len(s.cfg.testRecords) == 0 {
+		return s.startLive(ctx, sink)
+	}
 	for _, record := range s.cfg.testRecords {
 		launch, err := s.decode(record)
 		if err != nil {

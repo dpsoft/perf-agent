@@ -1,7 +1,10 @@
 package hip
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 
 	"github.com/dpsoft/perf-agent/gpu/host"
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -13,7 +16,9 @@ type rawRecord struct {
 	TimeNs       uint64
 	FunctionAddr uint64
 	UserStackID  int32
+	Pad0         uint32
 	Stream       uint64
+	CgroupID     uint64
 }
 
 type recordDecoder struct {
@@ -30,6 +35,7 @@ type launchRecord struct {
 	KernelName    string
 	QueueID       string
 	CorrelationID string
+	Tags          map[string]string
 	Source        string
 }
 
@@ -43,6 +49,7 @@ func (r launchRecord) toHostRecord() host.LaunchRecord {
 		KernelName:    r.KernelName,
 		QueueID:       r.QueueID,
 		CorrelationID: r.CorrelationID,
+		Tags:          r.Tags,
 		Source:        r.Source,
 	}
 }
@@ -60,6 +67,12 @@ func (d recordDecoder) decode(record rawRecord) (launchRecord, error) {
 	if d.resolveStack != nil && record.UserStackID >= 0 {
 		stack = d.resolveStack(record.PID, record.UserStackID)
 	}
+	var tags map[string]string
+	if record.CgroupID != 0 {
+		tags = map[string]string{
+			"cgroup_id": strconv.FormatUint(record.CgroupID, 10),
+		}
+	}
 
 	return launchRecord{
 		Backend:       "hip",
@@ -70,6 +83,15 @@ func (d recordDecoder) decode(record rawRecord) (launchRecord, error) {
 		KernelName:    kernelName,
 		QueueID:       fmt.Sprintf("stream:%x", record.Stream),
 		CorrelationID: fmt.Sprintf("hip:%d:%d:%d", record.PID, record.TID, record.TimeNs),
+		Tags:          tags,
 		Source:        "ebpf",
 	}, nil
+}
+
+func decodeRecord(raw []byte) (rawRecord, error) {
+	var record rawRecord
+	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &record); err != nil {
+		return rawRecord{}, fmt.Errorf("decode hip raw record: %w", err)
+	}
+	return record, nil
 }

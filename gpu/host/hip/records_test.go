@@ -1,6 +1,8 @@
 package hip
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -14,6 +16,7 @@ func TestDecodeLaunchRecord(t *testing.T) {
 		FunctionAddr: 0x1234,
 		UserStackID:  9,
 		Stream:       0xbeef,
+		CgroupID:     9876,
 	}
 
 	decoder := recordDecoder{
@@ -53,6 +56,9 @@ func TestDecodeLaunchRecord(t *testing.T) {
 	if got := len(launch.CPUStack); got != 2 {
 		t.Fatalf("cpu stack len=%d", got)
 	}
+	if got := launch.Tags["cgroup_id"]; got != "9876" {
+		t.Fatalf("cgroup_id=%q", got)
+	}
 }
 
 func TestDecodeLaunchRecordRejectsUnknownKernel(t *testing.T) {
@@ -62,5 +68,36 @@ func TestDecodeLaunchRecordRejectsUnknownKernel(t *testing.T) {
 	}
 	if _, err := decoder.decode(rawRecord{PID: 123, TID: 456, TimeNs: 789, FunctionAddr: 0x1234}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestRawRecordBinarySizeMatchesBPFLayout(t *testing.T) {
+	if got, want := binary.Size(rawRecord{}), 48; got != want {
+		t.Fatalf("size=%d want=%d", got, want)
+	}
+}
+
+func TestDecodeRawRecord(t *testing.T) {
+	record := rawRecord{
+		PID:          123,
+		TID:          456,
+		TimeNs:       789,
+		FunctionAddr: 0x1234,
+		UserStackID:  9,
+		Stream:       0xbeef,
+		CgroupID:     9876,
+	}
+
+	var payload bytes.Buffer
+	if err := binary.Write(&payload, binary.LittleEndian, record); err != nil {
+		t.Fatalf("write raw record: %v", err)
+	}
+
+	got, err := decodeRecord(payload.Bytes())
+	if err != nil {
+		t.Fatalf("decodeRecord: %v", err)
+	}
+	if got != record {
+		t.Fatalf("record=%+v", got)
 	}
 }

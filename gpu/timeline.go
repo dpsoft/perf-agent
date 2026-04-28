@@ -88,7 +88,7 @@ func (t *Timeline) Snapshot() Snapshot {
 		EventViews:   eventViews,
 		Events:       cloneTimelineEvents(t.events),
 		Counters:     slices.Clone(t.counters),
-		Attributions: buildAttributions(views, eventViews),
+		Attributions: buildAttributions(t.launches, views, eventViews),
 	}
 }
 
@@ -99,8 +99,18 @@ type workloadKey struct {
 	runtime     string
 }
 
-func buildAttributions(executions []ExecutionView, events []EventView) []WorkloadAttribution {
+func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, events []EventView) []WorkloadAttribution {
 	byKey := make(map[workloadKey]*WorkloadAttribution)
+	for _, launch := range launches {
+		key, ok := attributionKey(launch.Launch.Tags)
+		if !ok {
+			continue
+		}
+		entry := ensureAttribution(byKey, key)
+		entry.observe(launch.TimeNs, launch.TimeNs)
+		entry.addBackend(launch.Correlation.Backend)
+		entry.LaunchCount++
+	}
 	for _, exec := range executions {
 		if exec.Launch == nil {
 			continue

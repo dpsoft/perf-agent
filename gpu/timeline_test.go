@@ -180,6 +180,9 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	if got.CgroupID != "9876" || got.PodUID != "pod-abc" || got.ContainerID != "ctr-123" || got.ContainerRuntime != "containerd" {
 		t.Fatalf("attribution=%+v", got)
 	}
+	if got.LaunchCount != 1 {
+		t.Fatalf("launch count=%d", got.LaunchCount)
+	}
 	if got.ExecutionCount != 1 || got.ExecutionDurationNs != 80 {
 		t.Fatalf("execution aggregation=%+v", got)
 	}
@@ -189,10 +192,45 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	if got.EventCount != 1 || got.EventDurationNs != 13 {
 		t.Fatalf("event aggregation=%+v", got)
 	}
-	if got.FirstSeenNs != 120 || got.LastSeenNs != 200 {
+	if got.FirstSeenNs != 100 || got.LastSeenNs != 200 {
 		t.Fatalf("seen window=%+v", got)
 	}
 	if len(got.Backends) != 2 || got.Backends[0] != "linuxdrm" || got.Backends[1] != "stream" {
+		t.Fatalf("backends=%v", got.Backends)
+	}
+}
+
+func TestTimelineBuildsLaunchOnlyWorkloadAttribution(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "host-replay", Value: "launch-only"},
+		KernelName:  "hip_kernel",
+		TimeNs:      55,
+		Launch: LaunchContext{
+			PID: 10,
+			TID: 11,
+			Tags: map[string]string{
+				"cgroup_id": "1234",
+				"pod_uid":   "pod-only",
+			},
+		},
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Attributions) != 1 {
+		t.Fatalf("got %d attributions", len(snapshot.Attributions))
+	}
+	got := snapshot.Attributions[0]
+	if got.CgroupID != "1234" || got.PodUID != "pod-only" {
+		t.Fatalf("attribution=%+v", got)
+	}
+	if got.LaunchCount != 1 {
+		t.Fatalf("launch count=%d", got.LaunchCount)
+	}
+	if got.FirstSeenNs != 55 || got.LastSeenNs != 55 {
+		t.Fatalf("seen window=%+v", got)
+	}
+	if len(got.Backends) != 1 || got.Backends[0] != "host-replay" {
 		t.Fatalf("backends=%v", got.Backends)
 	}
 }

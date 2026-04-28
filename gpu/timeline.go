@@ -109,6 +109,8 @@ func buildAttributions(executions []ExecutionView, events []EventView) []Workloa
 			continue
 		}
 		entry := ensureAttribution(byKey, key)
+		entry.observe(exec.Exec.StartNs, exec.Exec.EndNs)
+		entry.addBackend(exec.Exec.Execution.Backend)
 		entry.ExecutionCount++
 		entry.ExecutionDurationNs += max(1, exec.Exec.EndNs-exec.Exec.StartNs)
 		if len(exec.Samples) == 0 {
@@ -127,6 +129,8 @@ func buildAttributions(executions []ExecutionView, events []EventView) []Workloa
 			continue
 		}
 		entry := ensureAttribution(byKey, key)
+		entry.observe(event.Event.TimeNs, event.Event.TimeNs+max(1, event.Event.DurationNs))
+		entry.addBackend(event.Event.Backend)
 		entry.EventCount++
 		entry.EventDurationNs += max(1, event.Event.DurationNs)
 	}
@@ -169,6 +173,29 @@ func ensureAttribution(byKey map[workloadKey]*WorkloadAttribution, key workloadK
 	}
 	byKey[key] = entry
 	return entry
+}
+
+func (w *WorkloadAttribution) observe(startNs, endNs uint64) {
+	if startNs == 0 && endNs == 0 {
+		return
+	}
+	if w.FirstSeenNs == 0 || startNs < w.FirstSeenNs {
+		w.FirstSeenNs = startNs
+	}
+	if endNs > w.LastSeenNs {
+		w.LastSeenNs = endNs
+	}
+}
+
+func (w *WorkloadAttribution) addBackend(backend GPUBackendID) {
+	if backend == "" {
+		return
+	}
+	if slices.Contains(w.Backends, backend) {
+		return
+	}
+	w.Backends = append(w.Backends, backend)
+	slices.Sort(w.Backends)
 }
 
 func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch {

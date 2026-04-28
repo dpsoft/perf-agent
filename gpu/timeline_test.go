@@ -149,6 +149,7 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 		},
 	})
 	tl.RecordExec(GPUKernelExec{
+		Execution:   GPUExecutionRef{Backend: "stream"},
 		Correlation: CorrelationID{Backend: "stream", Value: "c1"},
 		KernelName:  "hip_kernel",
 		StartNs:     120,
@@ -185,5 +186,11 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	}
 	if got.EventCount != 1 || got.EventDurationNs != 13 {
 		t.Fatalf("event aggregation=%+v", got)
+	}
+	if got.FirstSeenNs != 120 || got.LastSeenNs != 200 {
+		t.Fatalf("seen window=%+v", got)
+	}
+	if len(got.Backends) != 2 || got.Backends[0] != "linuxdrm" || got.Backends[1] != "stream" {
+		t.Fatalf("backends=%v", got.Backends)
 	}
 }

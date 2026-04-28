@@ -23,6 +23,9 @@ func TestTimelineCorrelatesByCorrelationID(t *testing.T) {
 	if len(snapshot.Executions) != 1 {
 		t.Fatalf("got %d executions", len(snapshot.Executions))
 	}
+	if len(snapshot.Launches) != 1 {
+		t.Fatalf("got %d launches", len(snapshot.Launches))
+	}
 	if snapshot.Executions[0].Launch == nil {
 		t.Fatalf("expected correlated launch")
 	}

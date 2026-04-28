@@ -29,6 +29,7 @@ const (
 )
 
 type Snapshot struct {
+	Launches     []GPUKernelLaunch     `json:"launches,omitempty"`
 	Executions   []ExecutionView       `json:"executions"`
 	EventViews   []EventView           `json:"event_views,omitempty"`
 	Events       []GPUTimelineEvent    `json:"events,omitempty"`
@@ -96,6 +97,7 @@ func (t *Timeline) Snapshot() Snapshot {
 		eventViews = append(eventViews, view)
 	}
 	return Snapshot{
+		Launches:     cloneLaunches(t.launches),
 		Executions:   views,
 		EventViews:   eventViews,
 		Events:       cloneTimelineEvents(t.events),
@@ -319,6 +321,14 @@ func cloneLaunch(in GPUKernelLaunch) GPUKernelLaunch {
 	out := in
 	out.Launch.Tags = maps.Clone(in.Launch.Tags)
 	out.Launch.CPUStack = slices.Clone(in.Launch.CPUStack)
+	return out
+}
+
+func cloneLaunches(in []GPUKernelLaunch) []GPUKernelLaunch {
+	out := make([]GPUKernelLaunch, 0, len(in))
+	for _, launch := range in {
+		out = append(out, cloneLaunch(launch))
+	}
 	return out
 }
 

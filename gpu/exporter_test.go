@@ -9,6 +9,9 @@ import (
 func TestWriteJSONSnapshot(t *testing.T) {
 	var buf bytes.Buffer
 	snap := Snapshot{
+		Launches: []GPUKernelLaunch{
+			{Correlation: CorrelationID{Backend: "stream", Value: "c1"}, KernelName: "flash_attn_fwd"},
+		},
 		Executions: []ExecutionView{
 			{Exec: GPUKernelExec{KernelName: "flash_attn_fwd", StartNs: 1, EndNs: 2}},
 		},
@@ -28,6 +31,9 @@ func TestWriteJSONSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "flash_attn_fwd") {
 		t.Fatalf("missing kernel name in %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"launches\"") {
+		t.Fatalf("missing launches field in %q", buf.String())
 	}
 	if !strings.Contains(buf.String(), "\"events\"") {
 		t.Fatalf("missing events field in %q", buf.String())

@@ -298,6 +298,7 @@ The same run emits a workload rollup like:
     "first_seen_ns": 100,
     "last_seen_ns": 200,
     "backends": ["stream"],
+    "kernel_names": ["flash_attn_fwd"],
     "launch_count": 1,
     "exact_join_count": 1,
     "execution_count": 1,
@@ -346,6 +347,7 @@ The same run now also emits a workload-level rollup in the raw snapshot:
     "first_seen_ns": 100,
     "last_seen_ns": 143,
     "backends": ["linuxdrm", "stream"],
+    "kernel_names": ["flash_attn_fwd"],
     "launch_count": 1,
     "heuristic_join_count": 1,
     "event_count": 1,
@@ -359,6 +361,7 @@ Those attribution summaries are meant to be the bridge from profiling artifacts 
 - `cgroup_id`, `pod_uid`, `container_id`, `container_runtime` identify the workload
 - `first_seen_ns` and `last_seen_ns` bound the observed activity window
 - `backends` shows which collection paths contributed data
+- `kernel_names` lists the unique kernels currently associated with that workload in the snapshot
 - `exact_join_count` and `heuristic_join_count` show how much of the rollup came from exact correlation versus fallback matching
 - `launch_count`, `event_count`, and the duration counters provide a first rollup surface for per-workload GPU usage
 

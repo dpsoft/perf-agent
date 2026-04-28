@@ -68,6 +68,38 @@ func TestNormalizeRecord(t *testing.T) {
 	}
 }
 
+func TestNormalizeRecordAddsDerivedKubernetesCgroupAttrs(t *testing.T) {
+	event, err := normalizeRecordWithResolvers(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          9,
+		Command:     0xc04064,
+		ResultCode:  -11,
+		StartNs:     1000,
+		EndNs:       1200,
+		DeviceMajor: 226,
+		DeviceMinor: 128,
+		Inode:       77,
+		CgroupID:    4242,
+	}, lookupDRMDeviceInfo, func(uint32) (string, bool) {
+		return "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod2af2f6f1_1111_2222_3333_444444444444.slice/cri-containerd-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope", true
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecordWithResolvers: %v", err)
+	}
+
+	if got := event.Attributes["pod_uid"]; got != "2af2f6f1-1111-2222-3333-444444444444" {
+		t.Fatalf("pod_uid=%q", got)
+	}
+	if got := event.Attributes["container_runtime"]; got != "containerd" {
+		t.Fatalf("container_runtime=%q", got)
+	}
+	if got := event.Attributes["container_id"]; got != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("container_id=%q", got)
+	}
+}
+
 func TestNormalizeRecordRejectsUnknownKind(t *testing.T) {
 	if _, err := normalizeRecord(rawRecord{}); err == nil {
 		t.Fatal("expected error")

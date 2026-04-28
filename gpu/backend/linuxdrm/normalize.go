@@ -106,6 +106,16 @@ func addAttributionAttrs(attrs map[string]string, record rawRecord, lookupCgroup
 	if lookupCgroup != nil {
 		if path, ok := lookupCgroup(record.PID); ok {
 			attrs["cgroup_path"] = path
+			meta := parseCgroupPathMetadata(path)
+			if meta.PodUID != "" {
+				attrs["pod_uid"] = meta.PodUID
+			}
+			if meta.ContainerRuntime != "" {
+				attrs["container_runtime"] = meta.ContainerRuntime
+			}
+			if meta.ContainerID != "" {
+				attrs["container_id"] = meta.ContainerID
+			}
 		}
 	}
 }

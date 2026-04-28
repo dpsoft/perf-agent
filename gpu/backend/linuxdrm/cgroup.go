@@ -3,11 +3,26 @@ package linuxdrm
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
 const procRoot = "/proc"
+
+var (
+	podUIDRe         = regexp.MustCompile(`(?:^|-)pod([0-9a-fA-F][0-9a-fA-F_-]{7,})$`)
+	containerdScope  = regexp.MustCompile(`^cri-containerd-([0-9a-fA-F]{16,})\.scope$`)
+	crioScope        = regexp.MustCompile(`^crio-([0-9a-fA-F]{16,})\.scope$`)
+	dockerScope      = regexp.MustCompile(`^docker-([0-9a-fA-F]{16,})\.scope$`)
+	hexContainerIDRe = regexp.MustCompile(`^[0-9a-fA-F]{16,}$`)
+)
+
+type cgroupPathMetadata struct {
+	PodUID           string
+	ContainerID      string
+	ContainerRuntime string
+}
 
 func lookupCgroupPath(pid uint32) (string, bool) {
 	return lookupCgroupPathFrom(procRoot, pid)
@@ -47,4 +62,44 @@ func parseCgroupPath(raw string) (string, bool) {
 		return "", false
 	}
 	return fallback, true
+}
+
+func parseCgroupPathMetadata(path string) cgroupPathMetadata {
+	var meta cgroupPathMetadata
+	for _, segment := range strings.Split(path, "/") {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+
+		trimmed := strings.TrimSuffix(segment, ".slice")
+		if meta.PodUID == "" {
+			if match := podUIDRe.FindStringSubmatch(trimmed); match != nil {
+				meta.PodUID = strings.ReplaceAll(match[1], "_", "-")
+				continue
+			}
+		}
+		if meta.ContainerID != "" {
+			continue
+		}
+		if match := containerdScope.FindStringSubmatch(segment); match != nil {
+			meta.ContainerRuntime = "containerd"
+			meta.ContainerID = strings.ToLower(match[1])
+			continue
+		}
+		if match := crioScope.FindStringSubmatch(segment); match != nil {
+			meta.ContainerRuntime = "crio"
+			meta.ContainerID = strings.ToLower(match[1])
+			continue
+		}
+		if match := dockerScope.FindStringSubmatch(segment); match != nil {
+			meta.ContainerRuntime = "docker"
+			meta.ContainerID = strings.ToLower(match[1])
+			continue
+		}
+		if hexContainerIDRe.MatchString(segment) {
+			meta.ContainerID = strings.ToLower(segment)
+		}
+	}
+	return meta
 }

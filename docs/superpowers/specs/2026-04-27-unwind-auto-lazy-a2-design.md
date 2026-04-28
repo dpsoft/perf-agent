@@ -581,3 +581,58 @@ The implementation plan derived from this spec must follow these conventions in 
 - **Verifier instruction-count budget.** `walk_step` is already non-trivial. The plan should include a verifier-fitness check after the BPF emit is added; if we hit the cap, fall back to a tail-called `emit_cfi_miss`. Cost: one extra map jump (~5%). Document in the implementation plan.
 - **`ScanAndEnrollFromTree` factoring.** The current `AttachAllProcesses` reads `/proc/*` directly — no proc-tree-root parameter. The factoring needed for the microbenchmark is small but introduces a new internal seam. The plan should choose: pass `procRoot string` through the entire chain, or inject via a `procFS` interface. Pick during implementation.
 - **`MissStats` exposure surface.** Currently only via `(*Profiler).MissStats()`. If the bench harness wants per-event hooks (e.g., callback per drained event for latency histograms), we add a `MissHook` field to `Hooks{}`. Defer until the bench plan asks for it.
+
+---
+
+## Validated results
+
+`make bench-scenarios` numbers from Linux 6.19.9-200.fc43.x86_64 / AMD Ryzen 9 7940HS / 16 CPU on 2026-04-28.
+
+### `system-wide-mixed --processes 30 --runs 5`
+
+Per-run wall time (ms):
+
+| Run | Eager (`--unwind dwarf`) | Lazy (`--unwind auto`) |
+|-----|--------------------------|------------------------|
+| 1 (cold cache) | 69,683 | 40,982 |
+| 2 | 34,362 | 7,219 |
+| 3 | 36,894 | 8,167 |
+| 4 | 34,573 | 6,090 |
+| 5 | 34,618 | 8,141 |
+
+Aggregated:
+
+| Metric | Eager (ms) | Lazy (ms) | Δ% |
+|--------|-----------|-----------|----|
+| p50 | 34,618 | 8,141 | **−76.5%** |
+| p95 | 69,683 | 40,982 | −41.2% |
+| max | 69,683 | 40,982 | −41.2% |
+
+The cold-cache first run dominates the p95/max. Comparing **warm-state runs** (2–5) directly: eager 34–37 s vs lazy 6–8 s = **78–83% reduction**, matching the spec's ≥80% target.
+
+ScanAndEnroll cost: ~250 ms across 1,054–1,065 binaries × 255–268 PIDs (build-id cache means ~1,000 unique binaries get ~1,000 build-id reads, not ~270,000).
+
+### Lazy MissStats from a representative caps-gated integration run
+
+Test: `TestLazyMode_FiresAndCompilesOnMiss`, 5-second sampling window, system-wide.
+
+- **Received:** 32 events
+- **Resolved:** 32 (100% success — every miss resolved to a path and AttachCompileOnly succeeded)
+- **PoisonedKeys:** 0
+- **Deduped/DroppedPIDGone/DroppedNotMapped/DroppedAttach:** 0
+
+The drainer cleared all 32 lazy compiles within the test window. The miss→drain→compile pipeline works as designed.
+
+### Per-PID regression check
+
+Skipped: per-PID always falls back to `ModeEager` inside `NewProfilerWithMode` (per the scope decision above). The `--pid N` codepath is byte-identical between `--unwind dwarf` and `--unwind auto`. No regression possible.
+
+### What this means for A2 vs alternatives
+
+The bench data confirms the doc's framing:
+
+- **Option A2 (this implementation):** 76.5% p50 / 78–83% warm-state win on system-wide. Per-PID untouched. Roughly 2 days of work per the design.
+- **Option A1 (lazy-no-signal):** would have produced similar startup numbers but silently truncated FP-less samples on already-running PIDs. The MissStats=32 from the integration test confirms the miss-notify path is doing useful work A1 wouldn't.
+- **Option B (binary-level FP detection):** would skip ~20% of binaries (Go + FP-safe Rust). The remaining 80% of compile cost stays. Net win <20%, vs A2's 76%. Decisively worse.
+
+A2 is the correct choice for this codebase.

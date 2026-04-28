@@ -4,11 +4,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 )
 
@@ -89,6 +93,106 @@ func (c *missCounters) snapshot() MissStats {
 		PoisonedKeys:     c.poisonedKeys.Load(),
 		LastLatencyNs:    c.lastLatencyNs.Load(),
 	}
+}
+
+// cfiMissKey is the userspace dedup key — same shape as the BPF rate-limit key.
+type cfiMissKey struct {
+	pid     uint32
+	tableID uint64
+}
+
+// consumeCFIMisses reads cfi_miss_events ringbuf records, dedupes
+// per-(pid, table_id), and drives tracker.AttachCompileOnly to compile
+// CFI on demand. Spawned via s.drainerWG.Add(1) + go s.consumeCFIMisses().
+//
+// Terminates when s.stop closes OR s.missReader.Close() is called.
+func (s *session) consumeCFIMisses() {
+	defer s.drainerWG.Done()
+	inflight := map[cfiMissKey]struct{}{}
+	failures := map[cfiMissKey]int{}
+	var mu sync.Mutex
+
+	for {
+		select {
+		case <-s.stop:
+			return
+		default:
+		}
+		s.missReader.SetDeadline(time.Now().Add(200 * time.Millisecond))
+		rec, err := s.missReader.Read()
+		if err != nil {
+			switch {
+			case errors.Is(err, os.ErrDeadlineExceeded):
+				continue
+			case errors.Is(err, ringbuf.ErrClosed):
+				return
+			default:
+				log.Printf("dwarfagent: miss ringbuf read: %v", err)
+				return
+			}
+		}
+		ev, err := parseMissEvent(rec.RawSample)
+		if err != nil {
+			continue
+		}
+		s.missCounters.received.Add(1)
+		s.missCounters.lastLatencyNs.Store(uint64(time.Now().UnixNano()) - ev.KtimeNs)
+
+		key := cfiMissKey{pid: ev.PID, tableID: ev.TableID}
+		mu.Lock()
+		if _, alreadyInflight := inflight[key]; alreadyInflight {
+			mu.Unlock()
+			s.missCounters.deduped.Add(1)
+			continue
+		}
+		if failures[key] >= 3 {
+			mu.Unlock()
+			// poisoned — skip
+			continue
+		}
+		inflight[key] = struct{}{}
+		mu.Unlock()
+
+		ok := s.compileForMiss(ev)
+
+		mu.Lock()
+		delete(inflight, key)
+		if !ok {
+			failures[key]++
+			if failures[key] >= 3 {
+				s.missCounters.poisonedKeys.Add(1)
+			}
+		} else {
+			delete(failures, key)
+		}
+		mu.Unlock()
+	}
+}
+
+// compileForMiss is the per-event work: resolve the binary path and
+// call AttachCompileOnly. Returns true on success (so the drainer can
+// reset the failure counter), false on any drop.
+func (s *session) compileForMiss(ev *cfiMissEvent) bool {
+	binPath, err := resolveBinaryByTableID(ev.PID, ev.TableID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrPIDGone):
+			s.missCounters.droppedPIDGone.Add(1)
+		case errors.Is(err, ErrTableNotMapped):
+			s.missCounters.droppedNotMapped.Add(1)
+		default:
+			log.Printf("dwarfagent: lazy resolve pid=%d table=%#x: %v", ev.PID, ev.TableID, err)
+			s.missCounters.droppedAttach.Add(1)
+		}
+		return false
+	}
+	if err := s.tracker.AttachCompileOnly(ev.PID, binPath); err != nil {
+		s.missCounters.droppedAttach.Add(1)
+		log.Printf("dwarfagent: lazy attach pid=%d %s: %v", ev.PID, binPath, err)
+		return false
+	}
+	s.missCounters.resolved.Add(1)
+	return true
 }
 
 // resolveBinaryByTableID reads /proc/<pid>/maps and returns the

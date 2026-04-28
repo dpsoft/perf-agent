@@ -72,6 +72,13 @@ type session struct {
 	stacks  map[sampleKey][]uint64
 
 	attachStats attachStats
+
+	// Lazy CFI (mode == ModeLazy) state. Zero-valued in eager modes.
+	// missReader is nil when not in lazy mode; the consumeCFIMisses
+	// goroutine is only spawned when missReader != nil.
+	missReader   *ringbuf.Reader
+	drainerWG    sync.WaitGroup
+	missCounters missCounters
 }
 
 // attachStats records the (pidCount, binaryCount) returned by the

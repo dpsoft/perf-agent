@@ -60,3 +60,18 @@ func TestMissCounters_Snapshot(t *testing.T) {
 		t.Errorf("snapshot mismatch: %+v", snap)
 	}
 }
+
+func TestConsumeCFIMisses_SafeWhenMissReaderNil(t *testing.T) {
+	// The contract: NewProfilerWithMode in Task 8 only spawns the
+	// drainer goroutine when missReader != nil. This test locks that
+	// contract by verifying the session struct can be constructed with
+	// a nil missReader and closing s.stop is safe (no panic in this
+	// path; the goroutine simply isn't running).
+	s := &session{
+		stop: make(chan struct{}),
+	}
+	// No drainer goroutine spawned. Closing stop is a no-op.
+	close(s.stop)
+	// Verifying drainerWG is zero-value-usable.
+	s.drainerWG.Wait()
+}

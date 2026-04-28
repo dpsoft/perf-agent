@@ -560,6 +560,91 @@ func TestGPULiveHIPLinuxDRMWrapperRejectsNonHIPPID(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRun(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-shim-demo",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--join-window",
+		"7ms",
+		"--duration",
+		"3s",
+		"--sleep-before-ms",
+		"1500",
+		"--sleep-after-ms",
+		"2500",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"cc -O2 -g -Wall -Wextra",
+		"scripts/hip-launch-shim.c",
+		"HIP_LAUNCH_SHIM_LIBRARY=/opt/rocm/lib/libamdhip64.so",
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=1500",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=2500",
+		"scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live-shim-demo",
+		"--pid",
+		"--join-window 7ms",
+		"--duration 3s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestHIPLaunchShimBinaryRuns(t *testing.T) {
+	hipLib, err := firstHIPLibraryPath()
+	if err != nil {
+		t.Skipf("no hip library path: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	binaryPath := filepath.Join(tmpDir, "gpu-hip-launch-shim")
+	buildCmd := exec.Command(
+		"cc",
+		"-O2",
+		"-g",
+		"-Wall",
+		"-Wextra",
+		filepath.Join("scripts", "hip-launch-shim.c"),
+		"-ldl",
+		"-o",
+		binaryPath,
+	)
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build hip shim: %v\n%s", err, buildOut)
+	}
+
+	runCmd := exec.Command(binaryPath)
+	runCmd.Env = append(os.Environ(),
+		"HIP_LAUNCH_SHIM_LIBRARY="+hipLib,
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=10",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=10",
+	)
+	runOut, err := runCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run hip shim: %v\n%s", err, runOut)
+	}
+	got := string(runOut)
+	for _, want := range []string{
+		"hipGetDeviceCount ->",
+		"hipLaunchKernel ->",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func requireBPFCapsForRootTest(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 {

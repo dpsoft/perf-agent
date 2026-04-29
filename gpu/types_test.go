@@ -30,6 +30,7 @@ func TestBackendIDConstantsStable(t *testing.T) {
 	got := []GPUBackendID{
 		BackendLinuxDRM,
 		BackendLinuxKFD,
+		BackendAMDSample,
 		BackendStream,
 		BackendReplay,
 		BackendHIP,
@@ -38,6 +39,7 @@ func TestBackendIDConstantsStable(t *testing.T) {
 	want := []GPUBackendID{
 		"linuxdrm",
 		"linuxkfd",
+		"amdsample",
 		"stream",
 		"replay",
 		"hip",

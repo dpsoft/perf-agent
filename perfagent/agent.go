@@ -16,6 +16,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/gpu"
+	amdsample "github.com/dpsoft/perf-agent/gpu/backend/amdsample"
 	linuxdrm "github.com/dpsoft/perf-agent/gpu/backend/linuxdrm"
 	linuxkfd "github.com/dpsoft/perf-agent/gpu/backend/linuxkfd"
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
@@ -172,6 +173,9 @@ func (c *Config) gpuSourceCount() int {
 		count++
 	}
 	if c.GPUStreamInput != nil {
+		count++
+	}
+	if c.GPUAMDSampleInput != nil {
 		count++
 	}
 	if c.GPULinuxDRM {
@@ -378,6 +382,8 @@ func (a *Agent) newGPUBackend() (gpu.Backend, error) {
 		return replay.New(a.config.GPUReplayInput)
 	case a.config.GPUStreamInput != nil:
 		return stream.New(a.config.GPUStreamInput), nil
+	case a.config.GPUAMDSampleInput != nil:
+		return amdsample.New(amdsample.Config{Reader: a.config.GPUAMDSampleInput})
 	case a.config.GPULinuxDRM:
 		return linuxdrm.New(linuxdrm.Config{PID: a.config.PID})
 	case a.config.GPULinuxKFD:

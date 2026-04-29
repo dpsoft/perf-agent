@@ -58,6 +58,10 @@ func TestConfigValidation(t *testing.T) {
 			opts: []Option{WithGPUStreamInput(strings.NewReader(""))},
 		},
 		{
+			name: "valid AMD sample gpu mode",
+			opts: []Option{WithGPUAMDSampleInput(strings.NewReader(""))},
+		},
+		{
 			name: "valid linuxdrm gpu mode",
 			opts: []Option{WithPID(123), WithGPULinuxDRM()},
 		},
@@ -94,6 +98,14 @@ func TestConfigValidation(t *testing.T) {
 			name: "rejects multiple GPU sources",
 			opts: []Option{
 				WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "flash_attn.json")),
+				WithGPUStreamInput(strings.NewReader("")),
+			},
+			wantErr: "gpu source",
+		},
+		{
+			name: "rejects AMD sample plus stream mode",
+			opts: []Option{
+				WithGPUAMDSampleInput(strings.NewReader("")),
 				WithGPUStreamInput(strings.NewReader("")),
 			},
 			wantErr: "gpu source",
@@ -769,6 +781,36 @@ func TestAgentHostReplayPlusGPUStreamProfileGolden(t *testing.T) {
 	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "host_exec_sample.pprof.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, string(want), got)
+}
+
+func TestAgentHostReplayPlusGPUAMDSampleOutputsExecutionFrames(t *testing.T) {
+	var foldedBuf bytes.Buffer
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUAMDSampleInput(strings.NewReader(
+			"{\"kind\":\"exec\",\"execution\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"queue_id\":\"compute:0\",\"context_id\":\"ctx0\",\"exec_id\":\"dispatch-1\"},\"correlation\":{\"backend\":\"hip\",\"value\":\"hip:555:555:100\"},\"queue\":{\"backend\":\"amdsample\",\"device\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"name\":\"AMD Radeon 780M Graphics\"},\"queue_id\":\"compute:0\"},\"kernel_name\":\"hip_launch_shim_kernel\",\"start_ns\":120,\"end_ns\":260}\n"+
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"hip\",\"value\":\"hip:555:555:100\"},\"device\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"name\":\"AMD Radeon 780M Graphics\"},\"time_ns\":150,\"kernel_name\":\"hip_launch_shim_kernel\",\"stall_reason\":\"memory_wait\",\"weight\":11}\n"+
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"hip\",\"value\":\"hip:555:555:100\"},\"device\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"name\":\"AMD Radeon 780M Graphics\"},\"time_ns\":210,\"kernel_name\":\"hip_launch_shim_kernel\",\"stall_reason\":\"wave_barrier\",\"weight\":5}\n",
+		)),
+		WithGPUFoldedOutput(&foldedBuf),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	folded := foldedBuf.String()
+	assert.Contains(t, folded, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait] 11")
+	assert.Contains(t, folded, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier] 5")
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+	assert.Contains(t, got, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait]")
+	assert.Contains(t, got, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier]")
 }
 
 func TestAgentHostReplayPlusCheckedInGPUExecutionReplayProfileGolden(t *testing.T) {

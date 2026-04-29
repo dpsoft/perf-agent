@@ -12,6 +12,7 @@ type GPUBackendID string
 const (
 	BackendLinuxDRM   GPUBackendID = "linuxdrm"
 	BackendLinuxKFD   GPUBackendID = "linuxkfd"
+	BackendAMDSample  GPUBackendID = "amdsample"
 	BackendStream     GPUBackendID = "stream"
 	BackendReplay     GPUBackendID = "replay"
 	BackendHIP        GPUBackendID = "hip"

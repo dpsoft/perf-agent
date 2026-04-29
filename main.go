@@ -34,6 +34,7 @@ var (
 	flagGPUHIPLinuxDRMJoin = flag.Duration("gpu-hip-linuxdrm-join-window", 5*time.Millisecond, "Experimental: fallback join window for HIP host launches to linuxdrm lifecycle events")
 	flagGPUReplayInput     = flag.String("gpu-replay-input", "", "Experimental: replay normalized GPU events from a JSON fixture")
 	flagGPUStreamStdin     = flag.Bool("gpu-stream-stdin", false, "Experimental: read normalized GPU NDJSON events from stdin")
+	flagGPUAMDSampleStdin  = flag.Bool("gpu-amd-sample-stdin", false, "Experimental: read AMD execution/sample NDJSON events from stdin")
 	flagGPULinuxDRM        = flag.Bool("gpu-linux-drm", false, "Experimental: collect Linux DRM GPU lifecycle telemetry for the target PID")
 	flagGPULinuxKFD        = flag.Bool("gpu-linux-kfd", false, "Experimental: collect Linux KFD GPU compute lifecycle telemetry for the target PID")
 	flagGPURawOutput       = flag.String("gpu-raw-output", "", "Experimental: write normalized GPU snapshot JSON to this path")
@@ -160,11 +161,18 @@ func buildOptions() []perfagent.Option {
 	gpuHostHIPMode := *flagGPUHostHIPLibrary != ""
 	gpuReplayMode := *flagGPUReplayInput != ""
 	gpuStreamMode := *flagGPUStreamStdin
+	gpuAMDsampleMode := *flagGPUAMDSampleStdin
 	gpuLinuxDRMMode := *flagGPULinuxDRM
 	gpuLinuxKFDMode := *flagGPULinuxKFD
 
-	if gpuReplayMode && gpuStreamMode {
-		log.Fatal("--gpu-replay-input and --gpu-stream-stdin are mutually exclusive")
+	gpuSourceCount := 0
+	for _, enabled := range []bool{gpuReplayMode, gpuStreamMode, gpuAMDsampleMode, gpuLinuxDRMMode, gpuLinuxKFDMode} {
+		if enabled {
+			gpuSourceCount++
+		}
+	}
+	if gpuSourceCount > 1 {
+		log.Fatal("--gpu-replay-input, --gpu-stream-stdin, --gpu-amd-sample-stdin, --gpu-linux-drm, and --gpu-linux-kfd are mutually exclusive")
 	}
 	if gpuLinuxDRMMode && gpuLinuxKFDMode {
 		log.Fatal("--gpu-linux-drm and --gpu-linux-kfd are mutually exclusive")
@@ -184,7 +192,7 @@ func buildOptions() []perfagent.Option {
 		opts = append(opts, perfagent.WithSystemWide())
 	} else if *flagPID != 0 {
 		opts = append(opts, perfagent.WithPID(*flagPID))
-	} else if !gpuReplayMode && !gpuStreamMode {
+	} else if !gpuReplayMode && !gpuStreamMode && !gpuAMDsampleMode {
 		log.Fatal("Either --pid or -a/--all is required")
 	}
 
@@ -194,7 +202,7 @@ func buildOptions() []perfagent.Option {
 	}
 
 	// Profiling modes
-	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode && !gpuStreamMode && !gpuLinuxDRMMode && !gpuLinuxKFDMode {
+	if !*flagProfile && !*flagPMU && !*flagOffCpu && !gpuReplayMode && !gpuStreamMode && !gpuAMDsampleMode && !gpuLinuxDRMMode && !gpuLinuxKFDMode {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 
@@ -256,6 +264,21 @@ func buildOptions() []perfagent.Option {
 	}
 	if gpuStreamMode {
 		opts = append(opts, perfagent.WithGPUStreamInput(os.Stdin))
+		if *flagGPURawOutput != "" {
+			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
+		}
+		if *flagGPUAttributionOut != "" {
+			opts = append(opts, perfagent.WithGPUAttributionOutputPath(*flagGPUAttributionOut))
+		}
+		if *flagGPUProfileOutput != "" {
+			opts = append(opts, perfagent.WithGPUProfileOutputPath(*flagGPUProfileOutput))
+		}
+		if *flagGPUFoldedOutput != "" {
+			opts = append(opts, perfagent.WithGPUFoldedOutputPath(*flagGPUFoldedOutput))
+		}
+	}
+	if gpuAMDsampleMode {
+		opts = append(opts, perfagent.WithGPUAMDSampleInput(os.Stdin))
 		if *flagGPURawOutput != "" {
 			opts = append(opts, perfagent.WithGPURawOutputPath(*flagGPURawOutput))
 		}

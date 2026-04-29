@@ -1128,6 +1128,31 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithCollectorPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperRejectsCollectorPathWithSampleCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-command",
+		"printf explicit-command",
+		"--sample-collector-path",
+		"/opt/rocm/bin/amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected conflict failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "cannot combine --sample-command with --sample-collector-path") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1421,6 +1446,27 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorPath(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
 		}
+	}
+}
+
+func TestGPULiveHIPShimDemoRejectsCollectorPathWithSampleCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-command",
+		"printf explicit-command",
+		"--sample-collector-path",
+		"/opt/rocm/bin/amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected conflict failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "cannot combine --sample-command with --sample-collector-path") {
+		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
 

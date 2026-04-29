@@ -142,6 +142,10 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
     echo "could not discover HIP library; pass --hip-library or set PERF_AGENT_HIP_LIBRARY" >&2
     exit 1
 fi
+if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
+    echo "cannot combine --sample-command with --sample-collector-path" >&2
+    exit 1
+fi
 if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" ]]; then
     SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi

@@ -48,3 +48,20 @@ func TestManagerEventBackendsDeduplicatesAndSorts(t *testing.T) {
 		}
 	}
 }
+
+func TestManagerSnapshotCarriesEventBackends(t *testing.T) {
+	m := gpu.NewManager([]gpu.Backend{
+		fakeBackend{eventBackends: []gpu.GPUBackendID{gpu.BackendLinuxKFD, gpu.BackendLinuxDRM}},
+	}, nil)
+
+	snapshot := m.Snapshot()
+	want := []gpu.GPUBackendID{gpu.BackendLinuxDRM, gpu.BackendLinuxKFD}
+	if len(snapshot.EventBackends) != len(want) {
+		t.Fatalf("len(snapshot.EventBackends)=%d len(want)=%d", len(snapshot.EventBackends), len(want))
+	}
+	for i := range want {
+		if snapshot.EventBackends[i] != want[i] {
+			t.Fatalf("snapshot.EventBackends[%d]=%q want %q", i, snapshot.EventBackends[i], want[i])
+		}
+	}
+}

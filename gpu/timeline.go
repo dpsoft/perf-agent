@@ -30,6 +30,7 @@ const (
 )
 
 type Snapshot struct {
+	EventBackends []GPUBackendID       `json:"event_backends,omitempty"`
 	Launches     []GPUKernelLaunch     `json:"launches,omitempty"`
 	Executions   []ExecutionView       `json:"executions"`
 	EventViews   []EventView           `json:"event_views,omitempty"`

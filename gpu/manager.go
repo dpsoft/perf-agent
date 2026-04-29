@@ -85,7 +85,9 @@ func (m *Manager) EmitEvent(event GPUTimelineEvent) {
 }
 
 func (m *Manager) Snapshot() Snapshot {
-	return m.timeline.Snapshot()
+	snapshot := m.timeline.Snapshot()
+	snapshot.EventBackends = m.EventBackends()
+	return snapshot
 }
 
 func (m *Manager) EventBackends() []GPUBackendID {

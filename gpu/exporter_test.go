@@ -9,6 +9,7 @@ import (
 func TestWriteJSONSnapshot(t *testing.T) {
 	var buf bytes.Buffer
 	snap := Snapshot{
+		EventBackends: []GPUBackendID{BackendLinuxDRM, BackendLinuxKFD},
 		Launches: []GPUKernelLaunch{
 			{Correlation: CorrelationID{Backend: "stream", Value: "c1"}, KernelName: "flash_attn_fwd"},
 		},
@@ -41,6 +42,9 @@ func TestWriteJSONSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "\"events\"") {
 		t.Fatalf("missing events field in %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"event_backends\":[\"linuxdrm\",\"linuxkfd\"]") {
+		t.Fatalf("missing event_backends field in %q", buf.String())
 	}
 	if !strings.Contains(buf.String(), "\"join_stats\"") {
 		t.Fatalf("missing join_stats field in %q", buf.String())

@@ -336,6 +336,7 @@ func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch 
 }
 
 func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
+	var best *GPUKernelLaunch
 	for _, launch := range t.launches {
 		if launch.Queue.Backend != exec.Queue.Backend || launch.Queue.QueueID != exec.Queue.QueueID {
 			continue
@@ -346,10 +347,33 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		if launch.TimeNs > exec.StartNs {
 			continue
 		}
-		copy := cloneLaunch(launch)
-		return &copy
+		if best == nil || launch.TimeNs > best.TimeNs {
+			copy := cloneLaunch(launch)
+			best = &copy
+		}
 	}
-	return nil
+	if best != nil {
+		return best
+	}
+	if exec.Execution.Backend != BackendAMDSample {
+		return nil
+	}
+	for _, launch := range t.launches {
+		if launch.Correlation.Backend != BackendHIP {
+			continue
+		}
+		if launch.KernelName != exec.KernelName {
+			continue
+		}
+		if launch.TimeNs > exec.StartNs {
+			continue
+		}
+		if best == nil || launch.TimeNs > best.TimeNs {
+			copy := cloneLaunch(launch)
+			best = &copy
+		}
+	}
+	return best
 }
 
 func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {

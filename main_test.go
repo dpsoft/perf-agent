@@ -875,7 +875,7 @@ func TestGPULiveHIPAMDSampleWrapperSmoke(t *testing.T) {
 	if len(snap.Executions) != 1 {
 		t.Fatalf("executions=%d want 1", len(snap.Executions))
 	}
-	if snap.JoinStats.ExactExecutionJoinCount != 1 {
+	if snap.JoinStats.HeuristicExecutionJoinCount != 1 || snap.JoinStats.ExactExecutionJoinCount != 0 {
 		t.Fatalf("join_stats=%+v", snap.JoinStats)
 	}
 	if got := snap.Attributions; len(got) != 1 || got[0].SampleWeight != 16 {
@@ -952,7 +952,8 @@ func TestGPUOfflineDemoScriptHIPAMDSampleReportsJoinInspection(t *testing.T) {
 		"jq '.' " + filepath.Join(outDir, "amd_sample_exec.attributions.json"),
 		"join summary:",
 		"launches matched: 1/1",
-		"exact execution joins: 1",
+		"exact execution joins: 0",
+		"heuristic execution joins: 1",
 		"heuristic event joins: 0",
 		"unmatched launches: 0",
 		"unmatched candidate events: 0",

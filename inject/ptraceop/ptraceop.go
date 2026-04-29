@@ -6,11 +6,13 @@
 package ptraceop
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -59,6 +61,15 @@ func (i *Injector) RemoteDeactivate(pid uint32, addrs SymbolAddrs, payload []byt
 // runSequence implements the full attach → 3 calls → detach sequence from
 // design §6.2.
 func (i *Injector) runSequence(pid uint32, addrs SymbolAddrs, payload []byte) error {
+	// Pin to the current OS thread for the lifetime of this call. On Linux,
+	// only the thread that issued PTRACE_ATTACH may issue subsequent ptrace
+	// ops on the tracee — Go's scheduler can migrate goroutines between OS
+	// threads at preemption points (including syscall returns), which would
+	// cause subsequent ptrace ops to fail with EPERM/ESRCH or, worse, target
+	// a different tracee. Pinning eliminates the migration window.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if pid == 0 {
 		return errors.New("ptraceop: pid is zero")
 	}
@@ -210,9 +221,13 @@ func stackLowAddr(pid uint32) (uint64, bool) {
 		return 0, false
 	}
 	defer f.Close()
-	buf := make([]byte, 64*1024)
-	n, _ := f.Read(buf)
-	for _, line := range strings.Split(string(buf[:n]), "\n") {
+	sc := bufio.NewScanner(f)
+	// Expand the scanner's max buffer so very long /proc/<pid>/maps files
+	// (e.g., a Python process with hundreds of extension modules) don't
+	// silently truncate before the [stack] line.
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
 		if !strings.Contains(line, "[stack]") {
 			continue
 		}

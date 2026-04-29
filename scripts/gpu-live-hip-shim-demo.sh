@@ -4,15 +4,15 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-scripts/gpu-live-hip-linuxdrm.sh}"
+WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
-live HIP + linuxdrm wrapper to that PID.
+live HIP + linux wrapper to that PID.
 EOF
 }
 
@@ -51,6 +51,7 @@ DRY_RUN=0
 OUTDIR="/tmp/gpu-live"
 BINARY_PATH="/tmp/gpu-hip-launch-shim"
 HIP_LIBRARY=""
+LINUX_SURFACE="drm"
 JOIN_WINDOW="5ms"
 DURATION="2s"
 SLEEP_BEFORE_MS="5000"
@@ -72,6 +73,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --hip-library)
             HIP_LIBRARY="${2:-}"
+            shift 2
+            ;;
+        --linux-surface)
+            LINUX_SURFACE="${2:-}"
             shift 2
             ;;
         --join-window)
@@ -101,6 +106,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -z "${WRAPPER_SCRIPT}" ]]; then
+    case "${LINUX_SURFACE}" in
+        drm)
+            WRAPPER_SCRIPT="scripts/gpu-live-hip-linuxdrm.sh"
+            ;;
+        kfd)
+            WRAPPER_SCRIPT="scripts/gpu-live-hip-linuxkfd.sh"
+            ;;
+        *)
+            echo "unsupported --linux-surface: ${LINUX_SURFACE}" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 if [[ -z "${HIP_LIBRARY}" ]]; then
     HIP_LIBRARY="$(discover_hip_library || true)"

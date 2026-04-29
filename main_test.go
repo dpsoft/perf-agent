@@ -878,6 +878,48 @@ func TestGPULiveHIPShimDemoDryRun(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForLinuxKFD(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-shim-demo",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--linux-surface",
+		"kfd",
+		"--join-window",
+		"7ms",
+		"--duration",
+		"3s",
+		"--sleep-before-ms",
+		"1500",
+		"--sleep-after-ms",
+		"2500",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run kfd: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"cc -O2 -g -Wall -Wextra",
+		"scripts/hip-launch-shim.c",
+		"HIP_LAUNCH_SHIM_LIBRARY=/opt/rocm/lib/libamdhip64.so",
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=1500",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=2500",
+		"scripts/gpu-live-hip-linuxkfd.sh --outdir /tmp/gpu-live-shim-demo",
+		"--pid",
+		"--join-window 7ms",
+		"--duration 3s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoRecordsWrapperFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")

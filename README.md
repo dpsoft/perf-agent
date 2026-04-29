@@ -353,6 +353,15 @@ If `jq` is installed, it also prints:
 - a short `join summary`
 - a first-pass `tuning hint`
 
+For the local HIP shim harness, the same script can now target either Linux surface:
+
+```bash
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
+```
+
+`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path.
+
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 
 ```bash

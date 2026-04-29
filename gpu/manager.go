@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"slices"
 )
 
 type Manager struct {
@@ -85,4 +86,21 @@ func (m *Manager) EmitEvent(event GPUTimelineEvent) {
 
 func (m *Manager) Snapshot() Snapshot {
 	return m.timeline.Snapshot()
+}
+
+func (m *Manager) EventBackends() []GPUBackendID {
+	if len(m.backends) == 0 {
+		return nil
+	}
+	var out []GPUBackendID
+	for _, backend := range m.backends {
+		for _, eventBackend := range backend.EventBackends() {
+			if slices.Contains(out, eventBackend) {
+				continue
+			}
+			out = append(out, eventBackend)
+		}
+	}
+	slices.Sort(out)
+	return out
 }

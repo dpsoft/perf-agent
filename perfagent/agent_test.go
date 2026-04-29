@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	goprofile "github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -254,6 +255,29 @@ func TestGPUManagerConfigForHIPLinuxDRMUsesOverride(t *testing.T) {
 	cfg := agent.gpuManagerConfig()
 	require.NotNil(t, cfg)
 	assert.Equal(t, uint64(2*time.Millisecond), cfg.LaunchEventJoinWindowNs)
+}
+
+func TestAgentGPUEventBackendsForLinuxDRMMode(t *testing.T) {
+	agent, err := New(
+		WithPID(123),
+		WithGPULinuxDRM(),
+	)
+	require.NoError(t, err)
+
+	got, err := agent.GPUEventBackends()
+	require.NoError(t, err)
+	assert.Equal(t, []gpu.GPUBackendID{gpu.BackendLinuxDRM, gpu.BackendLinuxKFD}, got)
+}
+
+func TestAgentGPUEventBackendsForStreamModeIsDynamic(t *testing.T) {
+	agent, err := New(
+		WithGPUStreamInput(strings.NewReader("")),
+	)
+	require.NoError(t, err)
+
+	got, err := agent.GPUEventBackends()
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }
 
 func TestWithCPUs(t *testing.T) {

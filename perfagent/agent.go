@@ -544,6 +544,24 @@ func (a *Agent) Config() Config {
 	return *a.config
 }
 
+func (a *Agent) GPUEventBackends() ([]gpu.GPUBackendID, error) {
+	if a.gpuManager != nil {
+		return a.gpuManager.EventBackends(), nil
+	}
+	if a.config.gpuSourceCount() == 0 {
+		return nil, nil
+	}
+
+	backend, err := a.newGPUBackend()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = backend.Close()
+	}()
+	return backend.EventBackends(), nil
+}
+
 func (a *Agent) writeGPURaw(snapshot gpu.Snapshot) error {
 	switch {
 	case a.config.GPURawOutputWriter != nil:

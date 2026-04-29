@@ -564,6 +564,86 @@ func TestGPUOfflineDemoScriptLiveHIPLinuxDRMSmoke(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptLiveHIPLinuxKFDSmoke(t *testing.T) {
+	requireBPFCapsForRootTest(t)
+
+	hipLib, err := firstHIPLibraryPath()
+	if err != nil {
+		t.Skipf("no HIP library path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	binaryPath := buildHIPLaunchShim(t, t.TempDir())
+	shimLogPath := filepath.Join(t.TempDir(), "hip-shim.log")
+	shimCmd := exec.CommandContext(ctx, binaryPath)
+	shimLog, err := os.Create(shimLogPath)
+	if err != nil {
+		t.Fatalf("create shim log: %v", err)
+	}
+	defer shimLog.Close()
+	shimCmd.Stdout = shimLog
+	shimCmd.Stderr = shimLog
+	shimCmd.Env = append(os.Environ(),
+		"HIP_LAUNCH_SHIM_LIBRARY="+hipLib,
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=10000",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=60000",
+	)
+	if err := shimCmd.Start(); err != nil {
+		t.Fatalf("start hip shim: %v", err)
+	}
+	defer func() {
+		if shimCmd.ProcessState == nil || !shimCmd.ProcessState.Exited() {
+			_ = shimCmd.Process.Kill()
+			_, _ = shimCmd.Process.Wait()
+		}
+	}()
+
+	outDir := t.TempDir()
+	scriptCmd := exec.CommandContext(
+		ctx,
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"live-hip-linuxkfd",
+		outDir,
+		"--pid",
+		strconv.Itoa(shimCmd.Process.Pid),
+		"--hip-library",
+		hipLib,
+		"--duration",
+		"2s",
+	)
+	scriptCmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"CGO_CFLAGS=-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include",
+		"CGO_LDFLAGS=-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic",
+	)
+	out, err := scriptCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("live kfd helper smoke: %v\n%s", err, out)
+	}
+
+	for _, name := range []string{
+		"live_hip_linuxkfd.raw.json",
+		"live_hip_linuxkfd.attributions.json",
+		"live_hip_linuxkfd.folded",
+		"live_hip_linuxkfd.pb.gz",
+	} {
+		path := filepath.Join(outDir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v\n%s", path, err, out)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("%s is empty\n%s", path, out)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 	outDir := t.TempDir()
 	cmd := exec.Command(
@@ -995,22 +1075,7 @@ func TestHIPLaunchShimBinaryRuns(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	binaryPath := filepath.Join(tmpDir, "gpu-hip-launch-shim")
-	buildCmd := exec.Command(
-		"cc",
-		"-O2",
-		"-g",
-		"-Wall",
-		"-Wextra",
-		filepath.Join("scripts", "hip-launch-shim.c"),
-		"-ldl",
-		"-o",
-		binaryPath,
-	)
-	buildOut, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build hip shim: %v\n%s", err, buildOut)
-	}
+	binaryPath := buildHIPLaunchShim(t, tmpDir)
 
 	runCmd := exec.Command(binaryPath)
 	runCmd.Env = append(os.Environ(),
@@ -1031,6 +1096,28 @@ func TestHIPLaunchShimBinaryRuns(t *testing.T) {
 			t.Fatalf("missing %q in output:\n%s", want, got)
 		}
 	}
+}
+
+func buildHIPLaunchShim(t *testing.T, dir string) string {
+	t.Helper()
+
+	binaryPath := filepath.Join(dir, "gpu-hip-launch-shim")
+	buildCmd := exec.Command(
+		"cc",
+		"-O2",
+		"-g",
+		"-Wall",
+		"-Wextra",
+		filepath.Join("scripts", "hip-launch-shim.c"),
+		"-ldl",
+		"-o",
+		binaryPath,
+	)
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build hip shim: %v\n%s", err, buildOut)
+	}
+	return binaryPath
 }
 
 func requireBPFCapsForRootTest(t *testing.T) {

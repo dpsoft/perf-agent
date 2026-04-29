@@ -312,6 +312,9 @@ func (w *WorkloadAttribution) observeJoin(join JoinKind) {
 }
 
 func eventFamily(event GPUTimelineEvent) string {
+	if event.Family != "" {
+		return event.Family
+	}
 	if family := event.Attributes["command_family"]; family != "" {
 		return family
 	}

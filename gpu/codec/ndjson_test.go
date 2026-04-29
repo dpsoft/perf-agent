@@ -67,7 +67,7 @@ func TestDecodeSampleLine(t *testing.T) {
 }
 
 func TestDecodeTimelineEventLine(t *testing.T) {
-	line := []byte(`{"kind":"event","event":{"backend":"linuxdrm","kind":"submit","name":"amdgpu-cs","time_ns":130,"duration_ns":13,"pid":4242,"tid":4243,"source":"replay"}}`)
+	line := []byte(`{"kind":"event","event":{"backend":"linuxdrm","kind":"submit","family":"amdgpu","name":"amdgpu-cs","time_ns":130,"duration_ns":13,"pid":4242,"tid":4243,"source":"replay"}}`)
 
 	ev, err := DecodeLine(line)
 	if err != nil {
@@ -78,6 +78,9 @@ func TestDecodeTimelineEventLine(t *testing.T) {
 	}
 	if ev.Event.Kind != gpu.TimelineEventSubmit {
 		t.Fatalf("event kind=%q", ev.Event.Kind)
+	}
+	if ev.Event.Family != "amdgpu" {
+		t.Fatalf("family=%q", ev.Event.Family)
 	}
 	if ev.Event.Name != "amdgpu-cs" {
 		t.Fatalf("name=%q", ev.Event.Name)

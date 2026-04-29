@@ -494,6 +494,9 @@ func TestNormalizeRecordClassifiesKFDUnmapMemoryAsMemory(t *testing.T) {
 	if got := event.Attributes["semantic"]; got != "memory-unmap" {
 		t.Fatalf("semantic=%q", got)
 	}
+	if event.Family != "kfd" {
+		t.Fatalf("family=%q", event.Family)
+	}
 }
 
 func TestNormalizeRecordClassifiesKFDWaitEventsAsWait(t *testing.T) {
@@ -528,6 +531,25 @@ func TestNormalizeRecordClassifiesKFDWaitEventsAsWait(t *testing.T) {
 	}
 	if got := event.Attributes["semantic"]; got != "sync-wait" {
 		t.Fatalf("semantic=%q", got)
+	}
+	if event.Family != "kfd" {
+		t.Fatalf("family=%q", event.Family)
+	}
+}
+
+func TestNormalizeSchedWakeupUsesSchedulerFamily(t *testing.T) {
+	event, err := normalizeRecord(rawRecord{
+		Kind:    recordKindSchedWakeup,
+		StartNs: 123,
+		PID:     7,
+		TID:     8,
+		CPU:     4,
+	})
+	if err != nil {
+		t.Fatalf("normalizeRecord: %v", err)
+	}
+	if event.Family != "scheduler" {
+		t.Fatalf("family=%q", event.Family)
 	}
 }
 

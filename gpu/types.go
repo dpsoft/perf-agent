@@ -123,6 +123,7 @@ const (
 type GPUTimelineEvent struct {
 	Backend    GPUBackendID      `json:"backend"`
 	Kind       TimelineEventKind `json:"kind"`
+	Family     string            `json:"family,omitempty"`
 	Name       string            `json:"name,omitempty"`
 	TimeNs     uint64            `json:"time_ns"`
 	DurationNs uint64            `json:"duration_ns,omitempty"`

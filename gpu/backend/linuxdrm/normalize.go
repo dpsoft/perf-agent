@@ -48,6 +48,7 @@ func normalizeRecordWithResolvers(
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       kind,
+			Family:     eventFamilyFromAttrs(attrs),
 			Name:       name,
 			TimeNs:     record.StartNs,
 			DurationNs: duration(record.StartNs, record.EndNs),
@@ -65,6 +66,7 @@ func normalizeRecordWithResolvers(
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventWait,
+			Family:     "scheduler",
 			Name:       "sched-wakeup",
 			TimeNs:     record.StartNs,
 			PID:        record.PID,
@@ -81,6 +83,7 @@ func normalizeRecordWithResolvers(
 		event := gpu.GPUTimelineEvent{
 			Backend:    "linuxdrm",
 			Kind:       gpu.TimelineEventWait,
+			Family:     "scheduler",
 			Name:       "sched-runq-latency",
 			TimeNs:     record.StartNs,
 			DurationNs: record.AuxNs,
@@ -96,6 +99,18 @@ func normalizeRecordWithResolvers(
 		return event, nil
 	default:
 		return gpu.GPUTimelineEvent{}, fmt.Errorf("unsupported record kind %d", record.Kind)
+	}
+}
+
+func eventFamilyFromAttrs(attrs map[string]string) string {
+	if family := attrs["command_family"]; family != "" {
+		return family
+	}
+	switch attrs["node_class"] {
+	case "render", "card":
+		return "drm"
+	default:
+		return ""
 	}
 }
 

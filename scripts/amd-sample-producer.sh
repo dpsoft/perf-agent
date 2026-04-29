@@ -12,6 +12,26 @@ IDs and boot-relative timestamps suitable for the live HIP + amdsample wrapper.
 EOF
 }
 
+duration_to_ns() {
+    local raw="$1"
+    local value unit
+    if [[ "${raw}" =~ ^([0-9]+)(ms|s)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+    else
+        echo "Unsupported PERF_AGENT_GPU_DURATION: ${raw}" >&2
+        exit 1
+    fi
+    case "${unit}" in
+        ms)
+            echo "$((value * 1000000))"
+            ;;
+        s)
+            echo "$((value * 1000000000))"
+            ;;
+    esac
+}
+
 boot_time_ns() {
     awk '{ printf "%.0f\n", $1 * 1000000000 }' /proc/uptime
 }
@@ -30,6 +50,7 @@ DEVICE_NAME="AMD Radeon 780M Graphics"
 QUEUE_ID="compute:0"
 SLEEP_BEFORE_MS="250"
 HIP_PID="${PERF_AGENT_HIP_PID:-}"
+GPU_DURATION="${PERF_AGENT_GPU_DURATION:-140ms}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,9 +89,26 @@ done
 sleep_ms "${SLEEP_BEFORE_MS}"
 
 start_ns="$(boot_time_ns)"
-sample1_ns="$((start_ns + 30000000))"
-sample2_ns="$((start_ns + 90000000))"
-end_ns="$((start_ns + 140000000))"
+duration_ns="$(duration_to_ns "${GPU_DURATION}")"
+sample1_offset_ns="$((duration_ns / 4))"
+sample2_offset_ns="$(((duration_ns * 3) / 4))"
+if (( sample1_offset_ns <= 0 )); then
+    sample1_offset_ns=1
+fi
+if (( sample2_offset_ns <= sample1_offset_ns )); then
+    sample2_offset_ns=$((sample1_offset_ns + 1))
+fi
+if (( sample2_offset_ns >= duration_ns )); then
+    sample2_offset_ns=$((duration_ns - 1))
+fi
+if (( sample2_offset_ns <= sample1_offset_ns )); then
+    sample1_offset_ns=1
+    sample2_offset_ns=2
+    duration_ns=3
+fi
+sample1_ns="$((start_ns + sample1_offset_ns))"
+sample2_ns="$((start_ns + sample2_offset_ns))"
+end_ns="$((start_ns + duration_ns))"
 
 context_id="ctx0"
 exec_corr="dispatch:${start_ns}"

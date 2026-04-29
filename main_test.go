@@ -1453,6 +1453,42 @@ func TestAMDSampleProducerScriptUsesHIPPIDContext(t *testing.T) {
 	}
 }
 
+func TestAMDSampleProducerScriptUsesDurationContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-producer.sh"),
+		"--sleep-before-ms",
+		"0",
+	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_GPU_DURATION=2s")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample producer with duration env: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if got := execEv.Exec.EndNs - execEv.Exec.StartNs; got != 2_000_000_000 {
+		t.Fatalf("duration_ns=%d", got)
+	}
+	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
+		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+}
+
 func TestGPULiveHIPShimDemoRecordsWrapperFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")

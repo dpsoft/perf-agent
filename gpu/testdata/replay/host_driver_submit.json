@@ -4,6 +4,7 @@
     "event": {
       "backend": "linuxdrm",
       "kind": "submit",
+      "family": "amdgpu",
       "name": "amdgpu-cs",
       "time_ns": 130,
       "duration_ns": 13,

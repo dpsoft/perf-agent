@@ -146,7 +146,7 @@
         }
       },
       "event": {
-        "backend": "linuxdrm",
+        "backend": "linuxkfd",
         "kind": "memory",
         "name": "kfd-unmap-memory-from-gpu",
         "time_ns": 231314936417933,
@@ -233,7 +233,7 @@
         }
       },
       "event": {
-        "backend": "linuxdrm",
+        "backend": "linuxkfd",
         "kind": "memory",
         "name": "kfd-free-memory-of-gpu",
         "time_ns": 231314936602279,
@@ -269,7 +269,7 @@
   ],
   "events": [
     {
-      "backend": "linuxdrm",
+      "backend": "linuxkfd",
       "kind": "wait",
       "name": "sched-wakeup",
       "time_ns": 231314936291576,
@@ -284,7 +284,7 @@
       }
     },
     {
-      "backend": "linuxdrm",
+      "backend": "linuxkfd",
       "kind": "wait",
       "name": "sched-runq-latency",
       "time_ns": 231314936291576,
@@ -300,7 +300,7 @@
       }
     },
     {
-      "backend": "linuxdrm",
+      "backend": "linuxkfd",
       "kind": "memory",
       "name": "kfd-unmap-memory-from-gpu",
       "time_ns": 231314936417933,
@@ -331,7 +331,7 @@
       }
     },
     {
-      "backend": "linuxdrm",
+      "backend": "linuxkfd",
       "kind": "memory",
       "name": "kfd-free-memory-of-gpu",
       "time_ns": 231314936602279,
@@ -376,7 +376,7 @@
       "last_seen_ns": 231314936629049,
       "backends": [
         "hip",
-        "linuxdrm"
+        "linuxkfd"
       ],
       "kernel_names": [
         "hip_launch_shim_kernel"

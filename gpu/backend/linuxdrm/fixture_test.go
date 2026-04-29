@@ -93,6 +93,9 @@ func TestHIPKFDObservationFixtureContainsDecodedMemoryEvents(t *testing.T) {
 			if view.Launch == nil || !view.Heuristic || view.Join != gpu.JoinHeuristic {
 				t.Fatalf("unmap view=%+v", view)
 			}
+			if event.Backend != "linuxkfd" {
+				t.Fatalf("unmap backend=%q", event.Backend)
+			}
 			if event.Kind != gpu.TimelineEventMemory {
 				t.Fatalf("unmap kind=%q", event.Kind)
 			}
@@ -109,6 +112,9 @@ func TestHIPKFDObservationFixtureContainsDecodedMemoryEvents(t *testing.T) {
 			foundFree = true
 			if view.Launch == nil || !view.Heuristic || view.Join != gpu.JoinHeuristic {
 				t.Fatalf("free view=%+v", view)
+			}
+			if event.Backend != "linuxkfd" {
+				t.Fatalf("free backend=%q", event.Backend)
 			}
 			if event.Kind != gpu.TimelineEventMemory {
 				t.Fatalf("free kind=%q", event.Kind)

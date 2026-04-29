@@ -4,6 +4,7 @@
     "event": {
       "backend": "linuxdrm",
       "kind": "submit",
+      "family": "amdgpu",
       "name": "submit-b",
       "time_ns": 50,
       "duration_ns": 5,
@@ -17,6 +18,7 @@
     "event": {
       "backend": "linuxdrm",
       "kind": "submit",
+      "family": "amdgpu",
       "name": "submit-a1",
       "time_ns": 20,
       "duration_ns": 3,
@@ -30,6 +32,7 @@
     "event": {
       "backend": "linuxdrm",
       "kind": "wait",
+      "family": "drm-core",
       "name": "wait-a2",
       "time_ns": 25,
       "duration_ns": 4,

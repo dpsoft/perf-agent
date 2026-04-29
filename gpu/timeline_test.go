@@ -434,7 +434,7 @@ func TestTimelineBuildsWorkloadAttributionsForKFDMemoryEvent(t *testing.T) {
 		},
 	})
 	tl.RecordEvent(GPUTimelineEvent{
-		Backend:    "linuxdrm",
+		Backend:    "linuxkfd",
 		Kind:       TimelineEventMemory,
 		Name:       "kfd-unmap-memory-from-gpu",
 		TimeNs:     130,
@@ -458,7 +458,7 @@ func TestTimelineBuildsWorkloadAttributionsForKFDMemoryEvent(t *testing.T) {
 	if got.HeuristicJoinCount != 1 || got.ExactJoinCount != 0 {
 		t.Fatalf("join counts=%+v", got)
 	}
-	if len(got.Backends) != 2 || got.Backends[0] != "hip" || got.Backends[1] != "linuxdrm" {
+	if len(got.Backends) != 2 || got.Backends[0] != "hip" || got.Backends[1] != "linuxkfd" {
 		t.Fatalf("backends=%v", got.Backends)
 	}
 	if len(got.EventFamilies) != 1 || got.EventFamilies[0] != "kfd" {

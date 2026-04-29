@@ -447,6 +447,9 @@ func TestNormalizeRecordClassifiesKFDFreeMemoryAsMemory(t *testing.T) {
 	if event.Name != "kfd-free-memory-of-gpu" {
 		t.Fatalf("name=%q", event.Name)
 	}
+	if event.Backend != "linuxkfd" {
+		t.Fatalf("backend=%q", event.Backend)
+	}
 	if event.Kind != gpu.TimelineEventMemory {
 		t.Fatalf("kind=%q", event.Kind)
 	}
@@ -481,6 +484,9 @@ func TestNormalizeRecordClassifiesKFDUnmapMemoryAsMemory(t *testing.T) {
 
 	if event.Name != "kfd-unmap-memory-from-gpu" {
 		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Backend != "linuxkfd" {
+		t.Fatalf("backend=%q", event.Backend)
 	}
 	if event.Kind != gpu.TimelineEventMemory {
 		t.Fatalf("kind=%q", event.Kind)
@@ -519,6 +525,9 @@ func TestNormalizeRecordClassifiesKFDWaitEventsAsWait(t *testing.T) {
 
 	if event.Name != "kfd-wait-events" {
 		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Backend != "linuxkfd" {
+		t.Fatalf("backend=%q", event.Backend)
 	}
 	if event.Kind != gpu.TimelineEventWait {
 		t.Fatalf("kind=%q", event.Kind)

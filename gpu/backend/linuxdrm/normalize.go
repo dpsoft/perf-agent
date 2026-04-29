@@ -46,7 +46,7 @@ func normalizeRecordWithResolvers(
 			}
 		}
 		event := gpu.GPUTimelineEvent{
-			Backend:    "linuxdrm",
+			Backend:    eventBackendFromAttrs(attrs),
 			Kind:       kind,
 			Family:     eventFamilyFromAttrs(attrs),
 			Name:       name,
@@ -112,6 +112,13 @@ func eventFamilyFromAttrs(attrs map[string]string) string {
 	default:
 		return ""
 	}
+}
+
+func eventBackendFromAttrs(attrs map[string]string) gpu.GPUBackendID {
+	if eventFamilyFromAttrs(attrs) == "kfd" {
+		return gpu.GPUBackendID("linuxkfd")
+	}
+	return gpu.GPUBackendID("linuxdrm")
 }
 
 func addAttributionAttrs(attrs map[string]string, record rawRecord, lookupCgroup func(uint32) (string, bool)) {

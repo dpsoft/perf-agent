@@ -36,13 +36,14 @@ func modeFromFlag(s string) dwarfagent.Mode {
 
 func main() {
 	var (
-		scenario    = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
-		processes   = flag.Int("processes", 30, "fleet size for system-wide-mixed")
-		runs        = flag.Int("runs", 5, "iterations per scenario")
-		dropCache   = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
-		outPath     = flag.String("out", "", "output JSON path (default ./bench-{scenario}-{ts}.json)")
-		workloadDir = flag.String("workloads-dir", "", "test/workloads dir (default auto-detect)")
-		unwind      = flag.String("unwind", "auto", "unwind mode passed to dwarfagent: auto (lazy) | dwarf (eager)")
+		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
+		processes    = flag.Int("processes", 30, "fleet size for system-wide-mixed")
+		runs         = flag.Int("runs", 5, "iterations per scenario")
+		dropCache    = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
+		outPath      = flag.String("out", "", "output JSON path (default ./bench-{scenario}-{ts}.json)")
+		workloadDir  = flag.String("workloads-dir", "", "test/workloads dir (default auto-detect)")
+		unwind       = flag.String("unwind", "auto", "unwind mode passed to dwarfagent: auto (lazy) | dwarf (eager)")
+		injectPython = flag.Bool("inject-python", false, "Enable Python trampoline injection for the profiled fleet (requires CAP_SYS_PTRACE)")
 	)
 	flag.Parse()
 
@@ -67,8 +68,9 @@ func main() {
 	}
 
 	doc := &schema.Document{
-		Scenario:  *scenario,
-		StartedAt: time.Now().UTC(),
+		Scenario:     *scenario,
+		StartedAt:    time.Now().UTC(),
+		InjectPython: *injectPython,
 		Config: schema.Config{
 			Processes:  *processes,
 			Runs:       *runs,
@@ -80,9 +82,9 @@ func main() {
 
 	switch *scenario {
 	case "pid-large":
-		runPIDLarge(doc, dir, *runs, *dropCache, *unwind)
+		runPIDLarge(doc, dir, *runs, *dropCache, *unwind, *injectPython)
 	case "system-wide-mixed":
-		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache, *unwind)
+		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache, *unwind, *injectPython)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
@@ -105,7 +107,7 @@ func main() {
 
 // runPIDLarge spawns one Rust workload, attaches dwarfagent --pid,
 // and records per-binary timings across N runs.
-func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache bool, unwind string) {
+func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache bool, unwind string, injectPython bool) {
 	doc.Config.WorkloadMix = map[string]int{"rust": 1}
 
 	flt, err := fleet.Spawn(fleet.Opts{
@@ -132,14 +134,14 @@ func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache b
 				log.Printf("drop_caches: %v (continuing — measurement is warm-cache for this run)", err)
 			}
 		}
-		run := measureOnePID(pid, i, unwind)
+		run := measureOnePID(pid, i, unwind, injectPython)
 		doc.Runs = append(doc.Runs, run)
 	}
 }
 
 // measureOnePID times one NewProfilerWithMode(pid=...) call and the
 // per-binary breakdown collected via OnCompile.
-func measureOnePID(pid, runN int, unwind string) schema.Run {
+func measureOnePID(pid, runN int, unwind string, injectPython bool) schema.Run {
 	var (
 		mu      sync.Mutex
 		entries []schema.Binary
@@ -179,7 +181,7 @@ func measureOnePID(pid, runN int, unwind string) schema.Run {
 
 // runSystemWideMixed spawns a fleet matching the proportional mix and
 // times newSession in system-wide mode for each run.
-func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, runs int, dropCache bool, unwind string) {
+func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, runs int, dropCache bool, unwind string, injectPython bool) {
 	mix := computeMix(processes)
 	doc.Config.WorkloadMix = mix
 
@@ -199,7 +201,7 @@ func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, run
 				log.Printf("drop_caches: %v", err)
 			}
 		}
-		run := measureSystemWide(i, unwind)
+		run := measureSystemWide(i, unwind, injectPython)
 		doc.Runs = append(doc.Runs, run)
 	}
 }
@@ -216,7 +218,7 @@ func computeMix(n int) map[string]int {
 }
 
 // measureSystemWide times one NewProfilerWithMode in systemWide=true mode.
-func measureSystemWide(runN int, unwind string) schema.Run {
+func measureSystemWide(runN int, unwind string, injectPython bool) schema.Run {
 	var (
 		mu      sync.Mutex
 		entries []schema.Binary

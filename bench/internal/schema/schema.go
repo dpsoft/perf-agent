@@ -19,14 +19,15 @@ type Document struct {
 	Config        Config    `json:"config"`
 	System        System    `json:"system"`
 	StartedAt     time.Time `json:"started_at"`
+	InjectPython  bool      `json:"inject_python,omitempty"`
 	Runs          []Run     `json:"runs"`
 }
 
 type Config struct {
-	Processes  int            `json:"processes"`
-	Runs       int            `json:"runs"`
-	DropCache  bool           `json:"drop_cache"`
-	UnwindMode string         `json:"unwind_mode,omitzero"`
+	Processes   int            `json:"processes"`
+	Runs        int            `json:"runs"`
+	DropCache   bool           `json:"drop_cache"`
+	UnwindMode  string         `json:"unwind_mode,omitzero"`
 	WorkloadMix map[string]int `json:"workload_mix,omitempty"`
 }
 

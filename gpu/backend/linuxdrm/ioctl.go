@@ -24,6 +24,7 @@ const (
 	iocDirShift  = iocSizeShift + iocSizeBits
 
 	drmIOCtlType   = 'd'
+	kfdIOCtlType   = 'K'
 	drmCommandBase = 0x40
 	drmCommandEnd  = 0xa0
 	drmModeBase    = 0xa0
@@ -95,6 +96,9 @@ func classifyIOCtl(command uint64) (ioctlClassification, bool) {
 
 func classifyIOCtlForDriver(command uint64, driver string) (ioctlClassification, bool) {
 	meta := decodeIOCtl(command)
+	if meta.Type == kfdIOCtlType {
+		return classifyKFDIOCtl(meta.Number)
+	}
 	if meta.Type != drmIOCtlType {
 		return ioctlClassification{}, false
 	}
@@ -190,6 +194,33 @@ func classifyAMDGPUDriverIOCtl(number uint64) (ioctlClassification, bool) {
 		return classifiedIOCtlWithKind("amdgpu-wait-fences", gpu.TimelineEventWait, "amdgpu", "wait_fences", "sync-wait"), true
 	default:
 		return ioctlClassification{}, false
+	}
+}
+
+func classifyKFDIOCtl(number uint64) (ioctlClassification, bool) {
+	switch number {
+	case 0x01:
+		return classifiedIOCtl("kfd-get-version", "kfd", "get_version", "query"), true
+	case 0x0c:
+		return classifiedIOCtlWithKind("kfd-wait-events", gpu.TimelineEventWait, "kfd", "wait_events", "sync-wait"), true
+	case 0x16:
+		return classifiedIOCtlWithKind("kfd-alloc-memory-of-gpu", gpu.TimelineEventMemory, "kfd", "alloc_memory_of_gpu", "memory-create"), true
+	case 0x17:
+		return classifiedIOCtlWithKind("kfd-free-memory-of-gpu", gpu.TimelineEventMemory, "kfd", "free_memory_of_gpu", "memory-release"), true
+	case 0x18:
+		return classifiedIOCtlWithKind("kfd-map-memory-to-gpu", gpu.TimelineEventMemory, "kfd", "map_memory_to_gpu", "memory-map"), true
+	case 0x19:
+		return classifiedIOCtlWithKind("kfd-unmap-memory-from-gpu", gpu.TimelineEventMemory, "kfd", "unmap_memory_from_gpu", "memory-unmap"), true
+	case 0x25:
+		return classifiedIOCtl("kfd-runtime-enable", "kfd", "runtime_enable", "runtime-enable"), true
+	default:
+		return ioctlClassification{
+			Name: "kfd-ioctl",
+			Attributes: map[string]string{
+				"command_family": "kfd",
+				"semantic":       "compute-ioctl",
+			},
+		}, true
 	}
 }
 

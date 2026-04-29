@@ -108,13 +108,13 @@ func TestNormalizeRecordRejectsUnknownKind(t *testing.T) {
 
 func TestNormalizeSchedRunqRecord(t *testing.T) {
 	event, err := normalizeRecord(rawRecord{
-		Kind:    recordKindSchedRunq,
-		PID:     123,
-		TID:     124,
-		StartNs: 1000,
-		EndNs:   1150,
-		CPU:     7,
-		AuxNs:   150,
+		Kind:     recordKindSchedRunq,
+		PID:      123,
+		TID:      124,
+		StartNs:  1000,
+		EndNs:    1150,
+		CPU:      7,
+		AuxNs:    150,
 		CgroupID: 99,
 	})
 	if err != nil {
@@ -140,11 +140,11 @@ func TestNormalizeSchedRunqRecord(t *testing.T) {
 
 func TestNormalizeSchedWakeupRecord(t *testing.T) {
 	event, err := normalizeRecord(rawRecord{
-		Kind:    recordKindSchedWakeup,
-		PID:     123,
-		TID:     124,
-		StartNs: 1000,
-		CPU:     5,
+		Kind:     recordKindSchedWakeup,
+		PID:      123,
+		TID:      124,
+		StartNs:  1000,
+		CPU:      5,
 		CgroupID: 7,
 	})
 	if err != nil {
@@ -423,6 +423,143 @@ func TestNormalizeRecordLeavesUnknownAMDGPUDriverCommandBucketed(t *testing.T) {
 	}
 	if got := event.Attributes["command_family"]; got != "drm-driver" {
 		t.Fatalf("command_family=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesKFDFreeMemoryAsMemory(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          3,
+		Command:     encodeTestIOCtl(1, 8, 'K', 0x17),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 235,
+		DeviceMinor: 0,
+		Inode:       527,
+	}, nil)
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "kfd-free-memory-of-gpu" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventMemory {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["command_family"]; got != "kfd" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["command_name"]; got != "free_memory_of_gpu" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "memory-release" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesKFDUnmapMemoryAsMemory(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          3,
+		Command:     encodeTestIOCtl(3, 24, 'K', 0x19),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 235,
+		DeviceMinor: 0,
+		Inode:       527,
+	}, nil)
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "kfd-unmap-memory-from-gpu" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventMemory {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["command_family"]; got != "kfd" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["command_name"]; got != "unmap_memory_from_gpu" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "memory-unmap" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordClassifiesKFDWaitEventsAsWait(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          3,
+		Command:     encodeTestIOCtl(3, 16, 'K', 0x0c),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 235,
+		DeviceMinor: 0,
+		Inode:       527,
+	}, nil)
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "kfd-wait-events" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventWait {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["command_family"]; got != "kfd" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["command_name"]; got != "wait_events" {
+		t.Fatalf("command_name=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "sync-wait" {
+		t.Fatalf("semantic=%q", got)
+	}
+}
+
+func TestNormalizeRecordBucketsUnknownKFDCommand(t *testing.T) {
+	event, err := normalizeRecordWithLookup(rawRecord{
+		Kind:        recordKindIOCtl,
+		PID:         123,
+		TID:         124,
+		FD:          3,
+		Command:     encodeTestIOCtl(3, 8, 'K', 0x26),
+		ResultCode:  0,
+		StartNs:     1000,
+		EndNs:       1300,
+		DeviceMajor: 235,
+		DeviceMinor: 0,
+		Inode:       527,
+	}, nil)
+	if err != nil {
+		t.Fatalf("normalizeRecordWithLookup: %v", err)
+	}
+
+	if event.Name != "kfd-ioctl" {
+		t.Fatalf("name=%q", event.Name)
+	}
+	if event.Kind != gpu.TimelineEventIOCtl {
+		t.Fatalf("kind=%q", event.Kind)
+	}
+	if got := event.Attributes["command_family"]; got != "kfd" {
+		t.Fatalf("command_family=%q", got)
+	}
+	if got := event.Attributes["semantic"]; got != "compute-ioctl" {
+		t.Fatalf("semantic=%q", got)
 	}
 }
 

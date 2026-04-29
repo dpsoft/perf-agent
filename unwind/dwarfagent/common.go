@@ -108,6 +108,9 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		store.SetOnCompile(hooks.onCompileFunc())
 	}
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
+	if hooks != nil && hooks.OnNewExec != nil {
+		tracker.SetOnNewExec(hooks.OnNewExec)
+	}
 
 	// Attach strategy depends on mode:
 	//   ModeLazy + systemWide: ScanAndEnroll (pid_mappings only, no CFI compile).

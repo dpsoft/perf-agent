@@ -196,13 +196,14 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
 		case "dwarf":
+			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
 				a.config.PID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
-				nil,
+				hooks,
 				dwarfagent.ModeEager,
 			)
 			if err != nil {
@@ -215,13 +216,14 @@ func (a *Agent) Start(ctx context.Context) error {
 				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
 			}
 		case "auto":
+			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
 				a.config.PID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
-				nil,
+				hooks,
 				dwarfagent.ModeLazy,
 			)
 			if err != nil {
@@ -480,4 +482,21 @@ func (b *ptraceopBridge) RemoteDeactivate(pid uint32, addrs python.SymbolAddrsFo
 		PyGILRelease: addrs.PyGILRelease,
 		PyRunString:  addrs.PyRunString,
 	}, python.DeactivatePayload())
+}
+
+// dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When
+// --inject-python is enabled and the target is system-wide, OnNewExec is
+// wired to pyInjector.ActivateLate so late-arriving Python processes are
+// injected without a polling loop. When --inject-python is off (default),
+// hooks is nil — the PIDTracker performs a single nil check per fork event
+// and does zero additional work.
+func dwarfHooksForAgent(a *Agent) *dwarfagent.Hooks {
+	if a.pyInjector == nil || a.config.PID != 0 {
+		// No injector, or per-PID mode: late subscription is a no-op
+		// (single-PID already handled at startup).
+		return nil
+	}
+	return &dwarfagent.Hooks{
+		OnNewExec: a.pyInjector.ActivateLate,
+	}
 }

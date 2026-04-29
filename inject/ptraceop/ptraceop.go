@@ -77,8 +77,8 @@ func (i *Injector) runSequence(pid uint32, addrs SymbolAddrs, payload []byte) er
 		return fmt.Errorf("ptrace attach pid=%d: %w", pid, err)
 	}
 	defer func() {
-		// Best-effort detach. If we error before reaching the explicit detach
-		// below, this ensures the target is resumed.
+		// Best-effort detach. Always runs; errors swallowed because the success
+		// path's explicit detach is the diagnostic surface.
 		_ = unix.PtraceDetach(int(pid))
 	}()
 
@@ -95,6 +95,16 @@ func (i *Injector) runSequence(pid uint32, addrs SymbolAddrs, payload []byte) er
 	if err := unix.PtraceGetRegs(int(pid), &orig); err != nil {
 		return fmt.Errorf("ptrace getregs pid=%d: %w", pid, err)
 	}
+	// Best-effort register restore on every post-GetRegs exit path. Without this,
+	// an error after a remote call would leave the target with PC=0 (SIGSEGV
+	// sentinel) and the deferred detach would resume the target straight into
+	// a segfault, killing the user's process. Defers run LIFO, so this restore
+	// runs before the detach defer above. Errors are swallowed here for the
+	// same reason as the detach defer; the success path's explicit SetRegs
+	// below remains the diagnostic surface.
+	defer func() {
+		_ = unix.PtraceSetRegs(int(pid), &orig)
+	}()
 
 	// Step 4: find stack mapping and verify headroom.
 	stackLow, ok := stackLowAddr(pid)
@@ -134,7 +144,9 @@ func (i *Injector) runSequence(pid uint32, addrs SymbolAddrs, payload []byte) er
 		return fmt.Errorf("PyRun_SimpleString returned non-zero: %d (likely activation refused at runtime)", runResult)
 	}
 
-	// Step 10-11: restore registers, detach (defer above handles detach).
+	// Step 10-11: restore registers + explicit detach for diagnostic visibility
+	// on the success path. (Both operations are also covered by deferred
+	// best-effort versions above for error paths.)
 	if err := unix.PtraceSetRegs(int(pid), &orig); err != nil {
 		return fmt.Errorf("ptrace setregs restore pid=%d: %w", pid, err)
 	}

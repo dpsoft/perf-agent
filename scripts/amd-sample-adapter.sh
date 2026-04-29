@@ -10,10 +10,13 @@ Usage:
 Adapts the live HIP + amdsample wrapper contract into an NDJSON producer.
 
 Behavior:
+  - if PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH is set, execs that program directly
   - if PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND is set, runs that command
   - otherwise falls back to the checked-in amd-sample-producer.sh
 
 Relevant env:
+  - PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH
+  - PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND
   - PERF_AGENT_HIP_PID
   - PERF_AGENT_HIP_LIBRARY
   - PERF_AGENT_HIP_SYMBOL
@@ -34,6 +37,10 @@ if [[ $# -gt 0 ]]; then
             exit 1
             ;;
     esac
+fi
+
+if [[ -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}" ]]; then
+    exec "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH}"
 fi
 
 if [[ -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}" ]]; then

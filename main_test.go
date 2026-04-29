@@ -1535,6 +1535,31 @@ func TestAMDSampleAdapterScriptRunsCollectorCommand(t *testing.T) {
 	}
 }
 
+func TestAMDSampleAdapterScriptPrefersCollectorPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	collector := filepath.Join(tmpDir, "collector.sh")
+	if err := os.WriteFile(collector, []byte("#!/bin/sh\nprintf path-wins\n"), 0o755); err != nil {
+		t.Fatalf("write collector: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH="+collector,
+		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=printf command-loses",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter collector path: %v\n%s", err, out)
+	}
+	if got := string(out); got != "path-wins" {
+		t.Fatalf("output=%q", got)
+	}
+}
+
 func TestGPULiveHIPShimDemoRecordsWrapperFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")

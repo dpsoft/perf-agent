@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -13,6 +16,8 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/inject/ptraceop"
+	"github.com/dpsoft/perf-agent/inject/python"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
@@ -63,6 +68,7 @@ type Agent struct {
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
+	pyInjector     *python.Manager // nil unless --inject-python is set
 
 	mu      sync.Mutex
 	started bool
@@ -80,9 +86,19 @@ func New(opts ...Option) (*Agent, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	return &Agent{
-		config: config,
-	}, nil
+	a := &Agent{config: config}
+
+	if config.InjectPython {
+		low := &ptraceopBridge{inj: ptraceop.New(slog.Default())}
+		a.pyInjector = python.NewManager(python.Options{
+			StrictPerPID: config.PID != 0, // single-PID is strict; -a is lenient
+			Logger:       slog.Default(),
+			Detector:     python.NewDetector("/proc", slog.Default()),
+			Injector:     low,
+		})
+	}
+
+	return a, nil
 }
 
 // validate checks the configuration for errors.
@@ -107,7 +123,29 @@ func (c *Config) validate() error {
 		return errors.New("per-PID is only valid with PMU enabled")
 	}
 
+	if c.InjectPython && !c.EnableCPUProfile {
+		return errors.New("--inject-python requires --profile (off-cpu and pmu are not supported)")
+	}
+
+	if c.InjectPython && !hasCapSysPtrace() {
+		return errors.New("--inject-python requires CAP_SYS_PTRACE; use sudo or setcap")
+	}
+
 	return nil
+}
+
+// hasCapSysPtrace returns true if the current process holds CAP_SYS_PTRACE
+// in its effective set. Uses the libcap package already imported by the agent.
+func hasCapSysPtrace() bool {
+	if os.Geteuid() == 0 {
+		return true
+	}
+	caps := cap.GetProc()
+	have, err := caps.GetFlag(cap.Effective, cap.SYS_PTRACE)
+	if err != nil {
+		return false
+	}
+	return have
 }
 
 // Start initializes and starts all enabled profilers.
@@ -142,6 +180,15 @@ func (a *Agent) Start(ctx context.Context) error {
 		cpus, err = cpuonline.Get()
 		if err != nil {
 			return fmt.Errorf("get online CPUs: %w", err)
+		}
+	}
+
+	// Inject Python perf-trampoline before BPF attach so early samples have
+	// JIT symbol names. Runs only when --inject-python is set.
+	if a.pyInjector != nil {
+		pids := a.scanPythonTargets()
+		if err := a.pyInjector.ActivateAll(pids); err != nil {
+			return fmt.Errorf("python injection: %w", err)
 		}
 	}
 
@@ -322,6 +369,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 		}
 	}
 
+	// Deactivate Python trampolines after profile finalization but before BPF
+	// teardown. Tolerates ESRCH (process gone) and respects the 5s deadline.
+	if a.pyInjector != nil {
+		a.pyInjector.DeactivateAll(ctx)
+	}
+
 	return lastErr
 }
 
@@ -370,4 +423,61 @@ func (a *Agent) cleanup() {
 // Config returns a copy of the agent's configuration.
 func (a *Agent) Config() Config {
 	return *a.config
+}
+
+// PythonInjectStats returns counters for the Python injector. Returns a
+// zero-value Stats if --inject-python was not enabled.
+func (a *Agent) PythonInjectStats() *python.Stats {
+	if a.pyInjector == nil {
+		return &python.Stats{}
+	}
+	return a.pyInjector.Stats()
+}
+
+// scanPythonTargets returns the PIDs to consider for injection. For --pid
+// mode, just [cfg.PID]. For -a mode, walks /proc and returns all numeric PID
+// directories (the Manager's Detect call filters down to actual Python
+// processes).
+func (a *Agent) scanPythonTargets() []uint32 {
+	if a.config.PID != 0 {
+		return []uint32{uint32(a.config.PID)}
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	pids := make([]uint32, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		v, err := strconv.ParseUint(e.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+		pids = append(pids, uint32(v))
+	}
+	return pids
+}
+
+// ptraceopBridge adapts ptraceop.Injector to python.LowLevelInjector,
+// supplying the activate/deactivate payloads from inject/python.
+type ptraceopBridge struct {
+	inj *ptraceop.Injector
+}
+
+func (b *ptraceopBridge) RemoteActivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
+	return b.inj.RemoteActivate(pid, ptraceop.SymbolAddrs{
+		PyGILEnsure:  addrs.PyGILEnsure,
+		PyGILRelease: addrs.PyGILRelease,
+		PyRunString:  addrs.PyRunString,
+	}, python.ActivatePayload())
+}
+
+func (b *ptraceopBridge) RemoteDeactivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
+	return b.inj.RemoteDeactivate(pid, ptraceop.SymbolAddrs{
+		PyGILEnsure:  addrs.PyGILEnsure,
+		PyGILRelease: addrs.PyGILRelease,
+		PyRunString:  addrs.PyRunString,
+	}, python.DeactivatePayload())
 }

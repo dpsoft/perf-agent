@@ -158,13 +158,25 @@ func TestInjectPython_StrictFailsOnNonPython(t *testing.T) {
 	}
 }
 
-// requirePython312Plus skips if python3 < 3.12.
+// requirePython312Plus skips if python3 < 3.12 OR the interpreter was built
+// without --enable-perf-trampoline. Both gate the activate path, so both
+// must skip cleanly.
 func requirePython312Plus(t *testing.T) {
 	t.Helper()
 	out, err := exec.Command("python3", "-c",
 		"import sys; print(sys.version_info >= (3, 12))").CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "True") {
 		t.Skipf("requires python3 >= 3.12; got: %s (err=%v)", strings.TrimSpace(string(out)), err)
+	}
+	// Even on 3.12+, the interpreter may have been compiled without
+	// --enable-perf-trampoline (Fedora's stock build does this). Probe by
+	// attempting activation+deactivation; ImportError or AttributeError on
+	// the trampoline functions means the build doesn't support it.
+	out, err = exec.Command("python3", "-c",
+		"import sys; sys.activate_stack_trampoline('perf'); sys.deactivate_stack_trampoline(); print('OK')").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "OK") {
+		t.Skipf("python3 lacks --enable-perf-trampoline; got: %s (err=%v)",
+			strings.TrimSpace(string(out)), err)
 	}
 }
 

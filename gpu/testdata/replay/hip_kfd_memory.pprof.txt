@@ -1,0 +1,2 @@
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:event:memory:kfd-unmap-memory-from-gpu] 131313130
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:event:memory:kfd-free-memory-of-gpu] 50505050

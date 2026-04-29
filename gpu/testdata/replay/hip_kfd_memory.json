@@ -1,0 +1,73 @@
+[
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "wait",
+      "name": "sched-wakeup",
+      "time_ns": 80,
+      "pid": 555,
+      "tid": 555,
+      "source": "replay",
+      "attributes": {
+        "cpu": "4",
+        "cgroup_id": "1"
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "wait",
+      "name": "sched-runq-latency",
+      "time_ns": 80,
+      "duration_ns": 10,
+      "pid": 555,
+      "tid": 555,
+      "source": "replay",
+      "attributes": {
+        "cpu": "4",
+        "cgroup_id": "1"
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "memory",
+      "name": "kfd-unmap-memory-from-gpu",
+      "time_ns": 130,
+      "duration_ns": 13,
+      "pid": 555,
+      "tid": 555,
+      "source": "replay",
+      "attributes": {
+        "command_family": "kfd",
+        "command_name": "unmap_memory_from_gpu",
+        "semantic": "memory-unmap",
+        "cgroup_id": "138970"
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "event": {
+      "backend": "linuxdrm",
+      "kind": "memory",
+      "name": "kfd-free-memory-of-gpu",
+      "time_ns": 150,
+      "duration_ns": 5,
+      "pid": 555,
+      "tid": 555,
+      "source": "replay",
+      "attributes": {
+        "command_family": "kfd",
+        "command_name": "free_memory_of_gpu",
+        "semantic": "memory-release",
+        "cgroup_id": "138970"
+      }
+    }
+  }
+]

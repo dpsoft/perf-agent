@@ -1,0 +1,23 @@
+[
+  {
+    "backend": "hip",
+    "pid": 555,
+    "tid": 555,
+    "time_ns": 100,
+    "cpu_stack": [
+      {
+        "Name": "train_step"
+      },
+      {
+        "Name": "hipLaunchKernel"
+      }
+    ],
+    "kernel_name": "hip_launch_shim_kernel",
+    "queue_id": "stream:0",
+    "correlation_id": "hip:555:555:100",
+    "tags": {
+      "cgroup_id": "138970"
+    },
+    "source": "host-replay"
+  }
+]

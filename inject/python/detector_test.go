@@ -72,11 +72,6 @@ func TestDetect_DynamicLinkedPython312(t *testing.T) {
 	d := NewDetector(root, nil)
 	got, err := d.Detect(pid)
 	if err != nil {
-		// libpython might not have been built with --enable-perf-trampoline on
-		// this host. Accept ErrNoPerfTrampoline as a valid skip.
-		if errors.Is(err, ErrNoPerfTrampoline) {
-			t.Skipf("host libpython lacks --enable-perf-trampoline: %v", err)
-		}
 		t.Fatalf("Detect: %v", err)
 	}
 	if got.PID != pid {
@@ -104,8 +99,8 @@ func TestDetect_NonPython(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for non-python; got nil")
 	}
-	if !errors.Is(err, ErrNotPython) && !errors.Is(err, ErrNoPerfTrampoline) {
-		t.Fatalf("expected ErrNotPython or ErrNoPerfTrampoline; got %v", err)
+	if !errors.Is(err, ErrNotPython) {
+		t.Fatalf("expected ErrNotPython; got %v", err)
 	}
 }
 

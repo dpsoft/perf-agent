@@ -39,9 +39,14 @@ var requiredSymbols = []string{
 	"PyRun_SimpleString",
 }
 
-// markerSymbol is a presence-only check; if absent in the symbol table, the
-// target was compiled without --enable-perf-trampoline.
-const markerSymbol = "_PyPerf_Callbacks"
+// We previously used `_PyPerf_Callbacks` as a presence-only "is the trampoline
+// compiled in?" pre-flight check. That was wrong: distributors (Fedora,
+// Ubuntu, etc.) strip internal symbols from production libpython builds, so
+// the symbol is absent from the binary's symbol table even when
+// `--enable-perf-trampoline` was set at compile time. We therefore rely on
+// the runtime return value of `PyRun_SimpleString` to tell us whether the
+// activation actually succeeded — at the cost of one extra ptrace round trip
+// for genuinely-unsupported targets.
 
 // NewDetector builds a /proc-based Detector. procRoot is configurable for
 // testing; production callers pass "/proc". log may be nil (uses
@@ -59,9 +64,10 @@ type procDetector struct {
 }
 
 // Detect implements Detector. Errors are sentinel-wrapped (errors.Is friendly):
-// ErrNotPython, ErrPythonTooOld, ErrNoPerfTrampoline, ErrStaticallyLinkedNoSymbols.
-// Any other error (e.g. EACCES on /proc) is returned as a hard error for the
-// caller to decide whether to abort.
+// ErrNotPython, ErrPythonTooOld, ErrStaticallyLinkedNoSymbols. Any other
+// error (e.g. EACCES on /proc) is returned as a hard error for the caller to
+// decide whether to abort. ErrNoPerfTrampoline is now surfaced at activation
+// time only (when PyRun_SimpleString returns non-zero), not at detection.
 func (d *procDetector) Detect(pid uint32) (*Target, error) {
 	mapsPath := filepath.Join(d.procRoot, strconv.FormatUint(uint64(pid), 10), "maps")
 	f, err := os.Open(mapsPath)
@@ -125,16 +131,13 @@ func (d *procDetector) resolveDynamic(pid uint32, libpath string, loadBase uint6
 	if !elfsym.IsPython312Plus(major, minor) {
 		return nil, fmt.Errorf("%w: detected %d.%d", ErrPythonTooOld, major, minor)
 	}
-	resolved, err := elfsym.ResolveSymbols(libpath, append([]string{markerSymbol}, requiredSymbols...))
+	resolved, err := elfsym.ResolveSymbols(libpath, requiredSymbols)
 	if err != nil {
 		return nil, fmt.Errorf("resolve symbols in %s: %w", libpath, err)
 	}
 	d.log.Debug("python detector: dynamic match",
 		"pid", pid, "libpython", libpath, "loadbase", loadBase,
 		"version", fmt.Sprintf("%d.%d", major, minor))
-	if _, ok := resolved[markerSymbol]; !ok {
-		return nil, fmt.Errorf("%w: %s missing in %s", ErrNoPerfTrampoline, markerSymbol, libpath)
-	}
 	for _, sym := range requiredSymbols {
 		if _, ok := resolved[sym]; !ok {
 			return nil, fmt.Errorf("%w: %s missing in %s", ErrStaticallyLinkedNoSymbols, sym, libpath)
@@ -160,7 +163,7 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: readlink %s: %v", ErrNotPython, exePath, err)
 	}
-	resolved, err := elfsym.ResolveSymbols(realExe, append([]string{markerSymbol}, requiredSymbols...))
+	resolved, err := elfsym.ResolveSymbols(realExe, requiredSymbols)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotPython, err)
 	}
@@ -170,9 +173,6 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 		if _, ok := resolved[sym]; !ok {
 			return nil, fmt.Errorf("%w: %s missing in %s", ErrNotPython, sym, realExe)
 		}
-	}
-	if _, ok := resolved[markerSymbol]; !ok {
-		return nil, fmt.Errorf("%w: %s missing in %s", ErrNoPerfTrampoline, markerSymbol, realExe)
 	}
 	mapsPath := filepath.Join(d.procRoot, strconv.FormatUint(uint64(pid), 10), "maps")
 	f, err := os.Open(mapsPath)

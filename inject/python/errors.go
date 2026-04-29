@@ -26,10 +26,12 @@ var (
 	// sys.activate_stack_trampoline primitive does not exist on older versions.
 	ErrPythonTooOld = errors.New("python version too old (need 3.12+)")
 
-	// ErrNoPerfTrampoline is returned when libpython is 3.12+ but was compiled
-	// without --enable-perf-trampoline, detected by absence of the
-	// _PyPerf_Callbacks symbol in .dynsym/.symtab.
-	ErrNoPerfTrampoline = errors.New("python built without --enable-perf-trampoline")
+	// ErrNoPerfTrampoline is returned at activation time (not detection) when
+	// PyRun_SimpleString returns non-zero — typically because the interpreter
+	// was compiled without --enable-perf-trampoline. Distributors strip
+	// internal symbols from production libpython, so we cannot detect this
+	// from the symbol table; we rely on the runtime return value.
+	ErrNoPerfTrampoline = errors.New("python activation refused (likely built without --enable-perf-trampoline)")
 
 	// ErrStaticallyLinkedNoSymbols is returned when neither libpython nor
 	// /proc/<pid>/exe exposes the libpython internal symbols needed for

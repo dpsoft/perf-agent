@@ -57,6 +57,7 @@ func TestWriteJSONAttributions(t *testing.T) {
 			{
 				CgroupID:            "1000",
 				PodUID:              "pod-a",
+				EventFamilies:       []string{"kfd"},
 				KernelNames:         []string{"alpha_kernel"},
 				LaunchCount:         1,
 				ExactJoinCount:      1,
@@ -77,5 +78,8 @@ func TestWriteJSONAttributions(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "\"kernel_names\":[\"alpha_kernel\"]") {
 		t.Fatalf("missing kernel names in %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"event_families\":[\"kfd\"]") {
+		t.Fatalf("missing event families in %q", buf.String())
 	}
 }

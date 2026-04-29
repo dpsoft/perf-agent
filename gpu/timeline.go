@@ -206,6 +206,7 @@ func buildAttributions(launches []GPUKernelLaunch, executions []ExecutionView, e
 		entry := ensureAttribution(byKey, key)
 		entry.observe(event.Event.TimeNs, event.Event.TimeNs+max(1, event.Event.DurationNs))
 		entry.addBackend(event.Event.Backend)
+		entry.addEventFamily(eventFamily(event.Event))
 		entry.observeJoin(event.Join)
 		entry.EventCount++
 		entry.EventDurationNs += max(1, event.Event.DurationNs)
@@ -279,6 +280,17 @@ func (w *WorkloadAttribution) addBackend(backend GPUBackendID) {
 	slices.Sort(w.Backends)
 }
 
+func (w *WorkloadAttribution) addEventFamily(family string) {
+	if family == "" {
+		return
+	}
+	if slices.Contains(w.EventFamilies, family) {
+		return
+	}
+	w.EventFamilies = append(w.EventFamilies, family)
+	slices.Sort(w.EventFamilies)
+}
+
 func (w *WorkloadAttribution) addKernelName(name string) {
 	if name == "" {
 		return
@@ -297,6 +309,13 @@ func (w *WorkloadAttribution) observeJoin(join JoinKind) {
 	case JoinHeuristic:
 		w.HeuristicJoinCount++
 	}
+}
+
+func eventFamily(event GPUTimelineEvent) string {
+	if family := event.Attributes["command_family"]; family != "" {
+		return family
+	}
+	return "unknown"
 }
 
 func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch {

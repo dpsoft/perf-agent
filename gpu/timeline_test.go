@@ -401,6 +401,9 @@ func TestTimelineBuildsWorkloadAttributionsForKFDMemoryEvent(t *testing.T) {
 	if len(got.Backends) != 2 || got.Backends[0] != "hip" || got.Backends[1] != "linuxdrm" {
 		t.Fatalf("backends=%v", got.Backends)
 	}
+	if len(got.EventFamilies) != 1 || got.EventFamilies[0] != "kfd" {
+		t.Fatalf("event families=%v", got.EventFamilies)
+	}
 	if got.FirstSeenNs != 100 || got.LastSeenNs != 143 {
 		t.Fatalf("seen window=%+v", got)
 	}
@@ -490,6 +493,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 		DurationNs: 3,
 		PID:        1,
 		TID:        1,
+		Attributes: map[string]string{
+			"command_family": "amdgpu",
+		},
 	})
 	tl.RecordEvent(GPUTimelineEvent{
 		Backend:    "linuxdrm",
@@ -499,6 +505,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 		DurationNs: 4,
 		PID:        1,
 		TID:        1,
+		Attributes: map[string]string{
+			"command_family": "drm-core",
+		},
 	})
 
 	snapshot := tl.Snapshot()
@@ -521,6 +530,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 	if first.ExactJoinCount != 0 || first.HeuristicJoinCount != 2 {
 		t.Fatalf("first joins=%+v", first)
 	}
+	if len(first.EventFamilies) != 2 || first.EventFamilies[0] != "amdgpu" || first.EventFamilies[1] != "drm-core" {
+		t.Fatalf("first event families=%v", first.EventFamilies)
+	}
 	if first.FirstSeenNs != 10 || first.LastSeenNs != 29 {
 		t.Fatalf("first window=%+v", first)
 	}
@@ -536,6 +548,9 @@ func TestTimelineBuildsSortedMergedWorkloadAttributions(t *testing.T) {
 	}
 	if second.ExactJoinCount != 0 || second.HeuristicJoinCount != 1 {
 		t.Fatalf("second joins=%+v", second)
+	}
+	if len(second.EventFamilies) != 1 || second.EventFamilies[0] != "unknown" {
+		t.Fatalf("second event families=%v", second.EventFamilies)
 	}
 	if second.FirstSeenNs != 40 || second.LastSeenNs != 55 {
 		t.Fatalf("second window=%+v", second)

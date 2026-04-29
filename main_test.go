@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/gpu/codec"
 	"github.com/dpsoft/perf-agent/perfagent"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
@@ -1327,11 +1328,69 @@ func TestGPULiveHIPShimDemoDryRunForAMDSample(t *testing.T) {
 	got := string(out)
 	for _, want := range []string{
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
-		"--sample-command cat\\ gpu/testdata/replay/amd_sample_exec.ndjson",
+		"--sample-command bash\\ scripts/amd-sample-producer.sh\\ --kernel-name\\ hip_launch_shim_kernel",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
 		}
+	}
+}
+
+func TestAMDSampleProducerScriptEmitsProducerNativeNDJSON(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-producer.sh"),
+		"--kernel-name",
+		"hip_launch_shim_kernel",
+		"--sleep-before-ms",
+		"0",
+		"--device-id",
+		"gfx1103:0",
+		"--queue-id",
+		"compute:0",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample producer: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Kind != codec.KindExec {
+		t.Fatalf("kind=%q want exec", execEv.Kind)
+	}
+	if execEv.Exec.Correlation.Backend != gpu.BackendAMDSample || execEv.Exec.Correlation.Value == "" {
+		t.Fatalf("exec correlation=%+v", execEv.Exec.Correlation)
+	}
+	if execEv.Exec.Correlation.Value == "hip:555:555:100" {
+		t.Fatalf("exec correlation should be producer-native, got %+v", execEv.Exec.Correlation)
+	}
+	if execEv.Exec.Queue.Backend != gpu.BackendAMDSample || execEv.Exec.Queue.QueueID != "compute:0" {
+		t.Fatalf("exec queue=%+v", execEv.Exec.Queue)
+	}
+
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if sample1.Kind != codec.KindSample || sample2.Kind != codec.KindSample {
+		t.Fatalf("kinds=%q,%q", sample1.Kind, sample2.Kind)
+	}
+	if sample1.Sample.Correlation.Backend != gpu.BackendAMDSample || sample2.Sample.Correlation.Backend != gpu.BackendAMDSample {
+		t.Fatalf("sample correlations=%+v %+v", sample1.Sample.Correlation, sample2.Sample.Correlation)
+	}
+	if !(execEv.Exec.StartNs <= sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs <= execEv.Exec.EndNs) {
+		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
 	}
 }
 

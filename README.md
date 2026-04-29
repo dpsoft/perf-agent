@@ -388,7 +388,17 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 ```
 
-`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `cat gpu/testdata/replay/amd_sample_exec.ndjson`.
+`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel`.
+
+There is also a small checked-in AMD sample producer for live-shaped demos:
+
+```bash
+bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
+```
+
+It emits producer-native `amdsample` execution/sample NDJSON with boot-relative
+timestamps, which is a closer stand-in for a real live producer than replaying a
+static checked-in file.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

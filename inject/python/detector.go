@@ -85,7 +85,9 @@ func (d *procDetector) Detect(pid uint32) (*Target, error) {
 
 // scanForLibpython walks the maps file looking for an executable mapping whose
 // path matches a libpython SONAME. Returns the on-disk path and the load
-// (start) address, or ("", 0, false).
+// (start) address, or ("", 0, false). Returns the first match — multiple
+// libpython mappings can exist when extension modules embed a second
+// interpreter (rare); see spec §5 edge cases.
 func scanForLibpython(maps *os.File) (string, uint64, bool) {
 	sc := bufio.NewScanner(maps)
 	for sc.Scan() {
@@ -127,6 +129,9 @@ func (d *procDetector) resolveDynamic(pid uint32, libpath string, loadBase uint6
 	if err != nil {
 		return nil, fmt.Errorf("resolve symbols in %s: %w", libpath, err)
 	}
+	d.log.Debug("python detector: dynamic match",
+		"pid", pid, "libpython", libpath, "loadbase", loadBase,
+		"version", fmt.Sprintf("%d.%d", major, minor))
 	if _, ok := resolved[markerSymbol]; !ok {
 		return nil, fmt.Errorf("%w: %s missing in %s", ErrNoPerfTrampoline, markerSymbol, libpath)
 	}
@@ -159,6 +164,8 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotPython, err)
 	}
+	d.log.Debug("python detector: static match",
+		"pid", pid, "exe", realExe)
 	for _, sym := range requiredSymbols {
 		if _, ok := resolved[sym]; !ok {
 			return nil, fmt.Errorf("%w: %s missing in %s", ErrNotPython, sym, realExe)

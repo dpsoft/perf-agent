@@ -385,9 +385,10 @@ For the local HIP shim harness, the same script can now target either Linux surf
 ```bash
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 ```
 
-`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path.
+`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `cat gpu/testdata/replay/amd_sample_exec.ndjson`.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

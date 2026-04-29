@@ -1219,6 +1219,29 @@ func TestGPULiveHIPShimDemoDryRunForLinuxKFD(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSample(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-command cat\\ gpu/testdata/replay/amd_sample_exec.ndjson",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoRecordsWrapperFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")

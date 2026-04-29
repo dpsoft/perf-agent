@@ -120,6 +120,7 @@ RAW_PATH="${OUTDIR}/live_hip_linuxdrm.raw.json"
 ATTR_PATH="${OUTDIR}/live_hip_linuxdrm.attributions.json"
 FOLDED_PATH="${OUTDIR}/live_hip_linuxdrm.folded"
 PROFILE_PATH="${OUTDIR}/live_hip_linuxdrm.pb.gz"
+WRAPPER_LOG_PATH="${OUTDIR}/live_hip_linuxdrm_wrapper.log"
 
 declare -a SUDO_CMD=(
     sudo
@@ -177,10 +178,22 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     exit 0
 fi
 
+mkdir -p "${OUTDIR}"
+
+set +e
 (
     cd "${REPO_ROOT}"
-    "${SUDO_CMD[@]}"
+    : >"${WRAPPER_LOG_PATH}"
+    printf 'wrapper command: ' >>"${WRAPPER_LOG_PATH}"
+    quote_cmd "${SUDO_CMD[@]}" >>"${WRAPPER_LOG_PATH}"
+    "${SUDO_CMD[@]}" >>"${WRAPPER_LOG_PATH}" 2>&1
 )
+wrapper_status=$?
+set -e
+printf 'wrapper exit status: %d\n' "${wrapper_status}" >>"${WRAPPER_LOG_PATH}"
+if [[ "${wrapper_status}" -ne 0 ]]; then
+    exit "${wrapper_status}"
+fi
 
 echo
 echo "wrapper summary:"
@@ -188,6 +201,7 @@ echo "  raw snapshot: ${RAW_PATH}"
 echo "  attribution output: ${ATTR_PATH}"
 echo "  folded output: ${FOLDED_PATH}"
 echo "  profile output: ${PROFILE_PATH}"
+echo "  wrapper log: ${WRAPPER_LOG_PATH}"
 
 if command -v jq >/dev/null 2>&1 && [[ -f "${RAW_PATH}" ]]; then
     echo

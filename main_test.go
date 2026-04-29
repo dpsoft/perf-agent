@@ -560,6 +560,68 @@ func TestGPULiveHIPLinuxDRMWrapperRejectsNonHIPPID(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPLinuxDRMWrapperRecordsWrappedFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeHipLib := filepath.Join(tmpDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeHipLib, []byte(""), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+
+	fakeSudo := filepath.Join(tmpDir, "sudo")
+	fakeSudoScript := `#!/bin/sh
+if [ "$1" = "grep" ]; then
+  exit 0
+fi
+echo fake sudo wrapper ran >&2
+exit 23
+`
+	if err := os.WriteFile(fakeSudo, []byte(fakeSudoScript), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	outDir := filepath.Join(tmpDir, "out")
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxdrm.sh"),
+		"--outdir",
+		outDir,
+		"--pid",
+		strconv.Itoa(os.Getpid()),
+		"--hip-library",
+		fakeHipLib,
+		"--duration",
+		"1ms",
+	)
+	cmd.Env = append(os.Environ(), "PATH="+tmpDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected wrapped sudo failure, got success:\n%s", out)
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %T: %v", err, err)
+	}
+	if exitErr.ExitCode() != 23 {
+		t.Fatalf("exit code = %d, want 23\n%s", exitErr.ExitCode(), out)
+	}
+
+	logData, err := os.ReadFile(filepath.Join(outDir, "live_hip_linuxdrm_wrapper.log"))
+	if err != nil {
+		t.Fatalf("read wrapper log: %v", err)
+	}
+	got := string(logData)
+	for _, want := range []string{
+		"wrapper command:",
+		"fake sudo wrapper ran",
+		"wrapper exit status: 23",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in wrapper log:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRun(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

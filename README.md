@@ -274,6 +274,7 @@ Current modes are:
 - `multi-exec`
 - `multi-driver`
 - `live-hip-linuxdrm`
+- `live-hip-linuxkfd`
 
 For example, the checked-in host-to-execution path can now be run as:
 
@@ -285,6 +286,14 @@ And the current live entrypoint can be previewed safely with:
 
 ```bash
 bash scripts/gpu-offline-demo.sh --dry-run live-hip-linuxdrm /tmp/gpu-live \
+  --pid 4242 \
+  --hip-library /opt/rocm/lib/libamdhip64.so
+```
+
+For the AMD compute-side KFD path instead of the DRM path:
+
+```bash
+bash scripts/gpu-offline-demo.sh --dry-run live-hip-linuxkfd /tmp/gpu-live \
   --pid 4242 \
   --hip-library /opt/rocm/lib/libamdhip64.so
 ```
@@ -309,6 +318,12 @@ There is also a dedicated wrapper for the live AMD path that avoids long `sudo /
 bash scripts/gpu-live-hip-linuxdrm.sh --outdir /tmp/gpu-live --pid 4242
 ```
 
+For the KFD-only AMD compute path:
+
+```bash
+bash scripts/gpu-live-hip-linuxkfd.sh --outdir /tmp/gpu-live --pid 4242
+```
+
 Or preview the wrapped command shape without a real PID yet:
 
 ```bash
@@ -329,6 +344,8 @@ After a real run, the helper also prints the fastest inspection steps for the cu
 jq '.join_stats' /tmp/gpu-live/live_hip_linuxdrm.raw.json
 jq '.' /tmp/gpu-live/live_hip_linuxdrm.attributions.json
 ```
+
+And the KFD-only path writes the parallel `live_hip_linuxkfd.*` outputs.
 
 If `jq` is installed, it also prints:
 

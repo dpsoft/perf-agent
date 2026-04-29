@@ -404,6 +404,39 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRMUsesEnvLibrary(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxKFD(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"live-hip-linuxkfd",
+		"/tmp/gpu-live-demo",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--join-window",
+		"7ms",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run live-hip-linuxkfd: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--pid 4242",
+		"--gpu-linux-kfd",
+		"--gpu-host-hip-library /opt/rocm/lib/libamdhip64.so",
+		"--gpu-hip-linuxdrm-join-window 7ms",
+		"--gpu-attribution-output /tmp/gpu-live-demo/live_hip_linuxkfd.attributions.json",
+		"--gpu-folded-output /tmp/gpu-live-demo/live_hip_linuxkfd.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptRecordsRunnerFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	fakeGo := filepath.Join(tmpDir, "go")
@@ -629,6 +662,43 @@ func TestGPULiveHIPLinuxDRMWrapperDryRunAutoTarget(t *testing.T) {
 		"--pid",
 		"scripts/gpu-offline-demo.sh",
 		"live-hip-linuxdrm",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPLinuxKFDWrapperDryRunWithPID(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-linuxkfd.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--join-window",
+		"7ms",
+		"--duration",
+		"3s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with pid: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"sudo /usr/bin/env",
+		"scripts/gpu-offline-demo.sh",
+		"live-hip-linuxkfd",
+		"/tmp/gpu-live-wrapper",
+		"--pid 4242",
+		"--hip-library /opt/rocm/lib/libamdhip64.so",
+		"--join-window 7ms",
+		"--duration 3s",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

@@ -13,6 +13,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxdrm <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
+  scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxkfd <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
 
 Modes:
   host-exec         checked-in host->execution replay
@@ -20,6 +21,7 @@ Modes:
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
   live-hip-linuxdrm experimental live host HIP + linuxdrm path
+  live-hip-linuxkfd experimental live host HIP + linuxkfd path
 
 Outputs:
   <outdir>/<name>.raw.json
@@ -171,6 +173,28 @@ case "${MODE}" in
         EXTRA_ARGS=(
             "--pid" "${PID}"
             "--gpu-linux-drm"
+            "--gpu-host-hip-library" "${HIP_LIBRARY}"
+            "--gpu-host-hip-symbol" "${HIP_SYMBOL}"
+            "--gpu-hip-linuxdrm-join-window" "${JOIN_WINDOW}"
+        )
+        ;;
+    live-hip-linuxkfd)
+        if [[ -z "${PID}" ]]; then
+            echo "live-hip-linuxkfd requires --pid" >&2
+            exit 1
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            HIP_LIBRARY="$(discover_hip_library || true)"
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            echo "live-hip-linuxkfd requires --hip-library or PERF_AGENT_HIP_LIBRARY" >&2
+            exit 1
+        fi
+        NAME="live_hip_linuxkfd"
+        DEBUG_GPU_LIVE=1
+        EXTRA_ARGS=(
+            "--pid" "${PID}"
+            "--gpu-linux-kfd"
             "--gpu-host-hip-library" "${HIP_LIBRARY}"
             "--gpu-host-hip-symbol" "${HIP_SYMBOL}"
             "--gpu-hip-linuxdrm-join-window" "${JOIN_WINDOW}"

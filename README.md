@@ -350,7 +350,7 @@ bash scripts/gpu-live-hip-amdsample.sh \
 
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:
-- exec `PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH` directly
+- exec `--sample-collector-path` / `PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH` directly
 - run `PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND`
 - or fall back to the checked-in synthetic producer
 

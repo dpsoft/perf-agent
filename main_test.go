@@ -1097,6 +1097,37 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithPID(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithCollectorPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-collector-path",
+		"/opt/rocm/bin/amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with collector path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=/opt/rocm/bin/amd-sample-collector",
+		"bash -lc bash\\ scripts/amd-sample-adapter.sh |",
+		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
+		"--pid 4242",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

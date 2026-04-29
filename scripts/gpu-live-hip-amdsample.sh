@@ -8,14 +8,16 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--sample-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--sample-command <cmd>] [--sample-collector-path <path>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
   - AMD sample NDJSON on stdout, either from:
+      - --sample-collector-path
       - --sample-command
+      - PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH
       - PERF_AGENT_AMD_SAMPLE_COMMAND
-      - the default checked-in producer script
+      - the default checked-in adapter / producer path
 EOF
 }
 
@@ -68,6 +70,7 @@ PID=""
 HIP_LIBRARY=""
 HIP_SYMBOL="hipLaunchKernel"
 SAMPLE_COMMAND="${PERF_AGENT_AMD_SAMPLE_COMMAND:-}"
+SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
 DURATION="2s"
 
 while [[ $# -gt 0 ]]; do
@@ -94,6 +97,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sample-command)
             SAMPLE_COMMAND="${2:-}"
+            shift 2
+            ;;
+        --sample-collector-path)
+            SAMPLE_COLLECTOR_PATH="${2:-}"
             shift 2
             ;;
         --duration)
@@ -185,6 +192,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_HIP_SYMBOL=${HIP_SYMBOL}"
     "PERF_AGENT_GPU_DURATION=${DURATION}"
     "PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel"
+    "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     bash
     -lc
     "${SAMPLE_COMMAND}"

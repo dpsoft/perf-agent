@@ -3,8 +3,6 @@ package python
 import (
 	"errors"
 	"fmt"
-	"os"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -20,16 +18,6 @@ func (m *Manager) activateOne(pid uint32) error {
 		if m.opts.StrictPerPID {
 			return fmt.Errorf("inject pid=%d: %w", pid, err)
 		}
-		return nil
-	}
-
-	if m.opts.PreexistingMarkerCheck(pid) {
-		m.mu.Lock()
-		m.tracked[pid] = &trackedTarget{target: target, preexisting: true, activatedAt: time.Now()}
-		m.mu.Unlock()
-		m.stats.SkippedPreexisting.Add(1)
-		m.log.Warn("python inject skipped",
-			"pid", pid, "reason", "preexisting_perf_map")
 		return nil
 	}
 
@@ -103,21 +91,9 @@ func (m *Manager) logSummary() {
 		m.stats.SkippedNotPython.Load()+
 			m.stats.SkippedTooOld.Load()+
 			m.stats.SkippedNoTramp.Load()+
-			m.stats.SkippedNoSymbols.Load()+
-			m.stats.SkippedPreexisting.Load(),
+			m.stats.SkippedNoSymbols.Load(),
 		"failed", m.stats.ActivateFailed.Load(),
 	)
-}
-
-// defaultPreexistingMarkerCheck returns true iff /tmp/perf-<pid>.map exists
-// and is non-empty. This is the conservative idempotency check from spec §7.2.
-func defaultPreexistingMarkerCheck(pid uint32) bool {
-	path := "/tmp/perf-" + strconv.FormatUint(uint64(pid), 10) + ".map"
-	st, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return st.Size() > 0
 }
 
 // isProcessGone returns true if the error is a "no such process" (ESRCH),

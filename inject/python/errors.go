@@ -2,6 +2,13 @@
 // (sys.activate_stack_trampoline) into running processes via ptrace, so that
 // perf-agent can resolve Python JIT frames to qualnames without requiring the
 // target to be launched with `python -X perf`.
+//
+// Lifecycle: each profiling run activates the trampoline at start and
+// deactivates at end. Activation is idempotent — re-running on the same
+// process is safe and is the supported pattern for continuous profiling. If
+// the target was launched with `python -X perf`, the deactivate-at-end will
+// turn the trampoline off; users who want to keep `-X perf` always-on should
+// not pass --inject-python.
 package python
 
 import "errors"
@@ -28,10 +35,4 @@ var (
 	// /proc/<pid>/exe exposes the libpython internal symbols needed for
 	// remote calls (PyRun_SimpleString, PyGILState_Ensure, PyGILState_Release).
 	ErrStaticallyLinkedNoSymbols = errors.New("python interpreter symbols not resolvable")
-
-	// ErrPreexisting is recorded (not returned to callers) when /tmp/perf-<pid>.map
-	// already exists at activation time, indicating the trampoline was activated
-	// by a prior perf-agent run or by user code. We skip both activation and
-	// deactivation in this case to avoid stomping on prior state.
-	ErrPreexisting = errors.New("perf trampoline already active (preexisting marker)")
 )

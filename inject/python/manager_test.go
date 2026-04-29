@@ -66,11 +66,10 @@ func newTestManager(t *testing.T, det Detector, inj LowLevelInjector, strict boo
 	t.Helper()
 	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewManager(Options{
-		StrictPerPID:           strict,
-		Logger:                 silent,
-		Detector:               det,
-		Injector:               inj,
-		PreexistingMarkerCheck: func(uint32) bool { return false },
+		StrictPerPID: strict,
+		Logger:       silent,
+		Detector:     det,
+		Injector:     inj,
 	})
 }
 
@@ -133,35 +132,6 @@ func TestActivateAll_LenientContinuesOnError(t *testing.T) {
 	}
 }
 
-func TestActivateAll_PreexistingMarkerSkips(t *testing.T) {
-	det := &stubDetector{results: map[uint32]stubResult{
-		100: {target: makeTarget(100)},
-	}}
-	inj := &stubInjector{}
-	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := NewManager(Options{
-		Logger:                 silent,
-		Detector:               det,
-		Injector:               inj,
-		PreexistingMarkerCheck: func(pid uint32) bool { return pid == 100 },
-	})
-	if err := m.ActivateAll([]uint32{100}); err != nil {
-		t.Fatalf("ActivateAll: %v", err)
-	}
-	if got := m.stats.SkippedPreexisting.Load(); got != 1 {
-		t.Errorf("SkippedPreexisting = %d, want 1", got)
-	}
-	if got := m.stats.Activated.Load(); got != 0 {
-		t.Errorf("Activated = %d, want 0", got)
-	}
-	// Now Deactivate — preexisting must be skipped (it IS in tracked but
-	// with preexisting=true, and deactivation skips it).
-	m.DeactivateAll(t.Context())
-	if got := m.stats.Deactivated.Load(); got != 0 {
-		t.Errorf("Deactivated = %d, want 0 (preexisting must be skipped)", got)
-	}
-}
-
 func TestDeactivateAll_HonorsDeadline(t *testing.T) {
 	det := &stubDetector{results: map[uint32]stubResult{
 		100: {target: makeTarget(100)},
@@ -172,11 +142,10 @@ func TestDeactivateAll_HonorsDeadline(t *testing.T) {
 	inj := &stubInjector{deactivateDelay: 100 * time.Millisecond}
 	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := NewManager(Options{
-		Logger:                 silent,
-		Detector:               det,
-		Injector:               inj,
-		PreexistingMarkerCheck: func(uint32) bool { return false },
-		DeactivateDeadline:     50 * time.Millisecond,
+		Logger:             silent,
+		Detector:           det,
+		Injector:           inj,
+		DeactivateDeadline: 50 * time.Millisecond,
 	})
 	if err := m.ActivateAll([]uint32{100, 200, 300}); err != nil {
 		t.Fatalf("ActivateAll: %v", err)

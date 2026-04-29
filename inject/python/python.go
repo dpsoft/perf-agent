@@ -18,11 +18,6 @@ type Options struct {
 	// event. nil → slog.Default().
 	Logger *slog.Logger
 
-	// PreexistingMarkerCheck overrides the default check for "is this PID's
-	// trampoline already active?" — set in tests to a stub. Production passes
-	// nil and gets the default /tmp/perf-<pid>.map check.
-	PreexistingMarkerCheck func(pid uint32) bool
-
 	// Injector overrides the default ptraceop-based injector. Tests inject
 	// stubs; production passes nil and gets the real ptraceop.Injector.
 	// In production this is wired by perfagent.Agent (Task 8) since this
@@ -57,15 +52,14 @@ type SymbolAddrsForTarget struct {
 // Stats holds counters that operators inspect after a run. All counters are
 // safe for concurrent use.
 type Stats struct {
-	Activated          atomic.Uint64
-	Deactivated        atomic.Uint64
-	SkippedNotPython   atomic.Uint64
-	SkippedTooOld      atomic.Uint64
-	SkippedNoTramp     atomic.Uint64
-	SkippedNoSymbols   atomic.Uint64
-	SkippedPreexisting atomic.Uint64
-	ActivateFailed     atomic.Uint64
-	DeactivateFailed   atomic.Uint64
+	Activated        atomic.Uint64
+	Deactivated      atomic.Uint64
+	SkippedNotPython atomic.Uint64
+	SkippedTooOld    atomic.Uint64
+	SkippedNoTramp   atomic.Uint64
+	SkippedNoSymbols atomic.Uint64
+	ActivateFailed   atomic.Uint64
+	DeactivateFailed atomic.Uint64
 }
 
 // Manager orchestrates Python perf-trampoline injection across a profile run:
@@ -85,7 +79,6 @@ type Manager struct {
 type trackedTarget struct {
 	target      *Target
 	activatedAt time.Time
-	preexisting bool
 }
 
 // NewManager constructs a Manager. opts.Logger may be nil. opts.Detector and
@@ -96,9 +89,6 @@ func NewManager(opts Options) *Manager {
 	}
 	if opts.DeactivateDeadline == 0 {
 		opts.DeactivateDeadline = 5 * time.Second
-	}
-	if opts.PreexistingMarkerCheck == nil {
-		opts.PreexistingMarkerCheck = defaultPreexistingMarkerCheck
 	}
 	return &Manager{
 		opts:    opts,
@@ -146,9 +136,9 @@ func (m *Manager) ActivateLate(pid uint32) {
 	_ = m.activateOne(pid) // lenient: errors logged inside
 }
 
-// DeactivateAll runs the bounded shutdown deactivation pass. Skips entries
-// marked preexisting; tolerates ESRCH (process gone). Honors ctx cancellation
-// AND the configured deactivation deadline (5s default).
+// DeactivateAll runs the bounded shutdown deactivation pass. Tolerates ESRCH
+// (process gone). Honors ctx cancellation AND the configured deactivation
+// deadline (5s default).
 func (m *Manager) DeactivateAll(ctx context.Context) {
 	deadline, cancel := context.WithTimeout(ctx, m.opts.DeactivateDeadline)
 	defer cancel()
@@ -161,9 +151,6 @@ func (m *Manager) DeactivateAll(ctx context.Context) {
 				"abandoned", len(snapshot)-int(m.stats.Deactivated.Load()))
 			return
 		default:
-		}
-		if tt.preexisting {
-			continue
 		}
 		addrs := SymbolAddrsForTarget{
 			PyGILEnsure:  tt.target.PyGILEnsureAddr,

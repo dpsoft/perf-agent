@@ -346,8 +346,11 @@ For an external AMD execution/sample producer that writes NDJSON on stdout:
 bash scripts/gpu-live-hip-amdsample.sh \
   --outdir /tmp/gpu-live \
   --pid 4242 \
-  --sample-command 'cat gpu/testdata/replay/amd_sample_exec.ndjson'
+  --sample-command 'bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel'
 ```
+
+If `--sample-command` is omitted, the wrapper now defaults to that checked-in
+producer script automatically.
 
 Or preview the wrapped command shape without a real PID yet:
 

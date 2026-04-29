@@ -1099,6 +1099,35 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithPID(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run default producer: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"bash -lc bash\\ scripts/amd-sample-producer.sh\\ --kernel-name\\ hip_launch_shim_kernel |",
+		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
+		"--pid 4242",
+		"--hip-library /opt/rocm/lib/libamdhip64.so",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPLinuxDRMWrapperRejectsMissingPID(t *testing.T) {
 	fakeDir := t.TempDir()
 	fakeHipLib := filepath.Join(fakeDir, "libamdhip64.so")

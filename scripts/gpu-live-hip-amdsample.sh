@@ -12,7 +12,10 @@ Usage:
 
 Real runs require:
   - --pid to point at an existing HIP process
-  - --sample-command (or PERF_AGENT_AMD_SAMPLE_COMMAND) to produce AMD sample NDJSON on stdout
+  - AMD sample NDJSON on stdout, either from:
+      - --sample-command
+      - PERF_AGENT_AMD_SAMPLE_COMMAND
+      - the default checked-in producer script
 EOF
 }
 
@@ -117,8 +120,7 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
-    echo "live AMD sample runs require --sample-command or PERF_AGENT_AMD_SAMPLE_COMMAND" >&2
-    exit 1
+    SAMPLE_COMMAND="bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel"
 fi
 
 RAW_PATH="${OUTDIR}/live_hip_amdsample.raw.json"

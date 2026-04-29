@@ -391,6 +391,7 @@ For the local HIP shim harness, the same script can now target either Linux surf
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-collector-path /opt/rocm/bin/amd-sample-collector
 ```
 
 `drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `bash scripts/amd-sample-adapter.sh`.

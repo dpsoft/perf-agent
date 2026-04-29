@@ -1399,6 +1399,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSample(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-collector-path",
+		"/opt/rocm/bin/amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample collector path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-collector-path /opt/rocm/bin/amd-sample-collector",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
 func TestAMDSampleProducerScriptEmitsProducerNativeNDJSON(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

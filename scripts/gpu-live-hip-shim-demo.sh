@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--sample-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--sample-command <cmd>] [--sample-collector-path <path>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -53,6 +53,7 @@ BINARY_PATH="/tmp/gpu-hip-launch-shim"
 HIP_LIBRARY=""
 LINUX_SURFACE="drm"
 SAMPLE_COMMAND=""
+SAMPLE_COLLECTOR_PATH=""
 JOIN_WINDOW="5ms"
 DURATION="2s"
 SLEEP_BEFORE_MS="5000"
@@ -82,6 +83,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sample-command)
             SAMPLE_COMMAND="${2:-}"
+            shift 2
+            ;;
+        --sample-collector-path)
+            SAMPLE_COLLECTOR_PATH="${2:-}"
             shift 2
             ;;
         --join-window)
@@ -172,6 +177,12 @@ declare -a WRAPPER_CMD=(
     "${DURATION}"
 )
 if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
+    if [[ -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
+        WRAPPER_CMD+=(
+            --sample-collector-path
+            "${SAMPLE_COLLECTOR_PATH}"
+        )
+    fi
     WRAPPER_CMD+=(
         --sample-command
         "${SAMPLE_COMMAND}"

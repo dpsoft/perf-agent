@@ -1,0 +1,171 @@
+{
+  "launches": [
+    {
+      "correlation": {
+        "backend": "hip",
+        "value": "hip:1768709:1768709:231314936335008"
+      },
+      "queue": {
+        "backend": "hip",
+        "device": {
+          "backend": "",
+          "device_id": "",
+          "name": ""
+        },
+        "queue_id": "stream:0"
+      },
+      "kernel_name": "hip_launch_shim_kernel",
+      "time_ns": 231314936335008,
+      "launch": {
+        "pid": 1768709,
+        "tid": 1768709,
+        "time_ns": 231314936335008,
+        "cpu_stack": [
+          {
+            "Name": "hipLaunchKernel",
+            "File": "",
+            "Line": 0,
+            "Module": "/usr/local/lib/ollama/rocm/libamdhip64.so.6.3.60303",
+            "Address": 140578057093520,
+            "BuildID": "",
+            "MapStart": 0,
+            "MapLimit": 0,
+            "MapOff": 0,
+            "IsKernel": false
+          },
+          {
+            "Name": "",
+            "File": "",
+            "Line": 0,
+            "Module": "",
+            "Address": 8011730467041537121,
+            "BuildID": "",
+            "MapStart": 0,
+            "MapLimit": 0,
+            "MapOff": 0,
+            "IsKernel": false
+          }
+        ],
+        "tags": {
+          "cgroup_id": "138970",
+          "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-516ffeea-7fc4-4134-84bd-70d1b32fa87f.scope"
+        }
+      }
+    }
+  ],
+  "executions": [],
+  "events": [
+    {
+      "backend": "linuxdrm",
+      "kind": "wait",
+      "name": "sched-wakeup",
+      "time_ns": 231314936291576,
+      "pid": 1768709,
+      "tid": 1768709,
+      "source": "ebpf",
+      "confidence": "exact",
+      "attributes": {
+        "cgroup_id": "1",
+        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-516ffeea-7fc4-4134-84bd-70d1b32fa87f.scope",
+        "cpu": "4"
+      }
+    },
+    {
+      "backend": "linuxdrm",
+      "kind": "wait",
+      "name": "sched-runq-latency",
+      "time_ns": 231314936291576,
+      "duration_ns": 18876,
+      "pid": 1768709,
+      "tid": 1768709,
+      "source": "ebpf",
+      "confidence": "exact",
+      "attributes": {
+        "cgroup_id": "1",
+        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-516ffeea-7fc4-4134-84bd-70d1b32fa87f.scope",
+        "cpu": "4"
+      }
+    },
+    {
+      "backend": "linuxdrm",
+      "kind": "memory",
+      "name": "kfd-unmap-memory-from-gpu",
+      "time_ns": 231314936417933,
+      "duration_ns": 179787,
+      "pid": 1768709,
+      "tid": 1768709,
+      "fd": 3,
+      "source": "ebpf",
+      "confidence": "exact",
+      "attributes": {
+        "cgroup_id": "138970",
+        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-516ffeea-7fc4-4134-84bd-70d1b32fa87f.scope",
+        "command": "3222817561",
+        "command_family": "kfd",
+        "command_hex": "0xc0184b19",
+        "command_name": "unmap_memory_from_gpu",
+        "device_major": "235",
+        "device_minor": "0",
+        "inode": "527",
+        "ioctl_dir": "readwrite",
+        "ioctl_dir_id": "3",
+        "ioctl_nr": "25",
+        "ioctl_size": "24",
+        "ioctl_type": "75",
+        "ioctl_type_char": "K",
+        "node_class": "unknown",
+        "semantic": "memory-unmap"
+      }
+    },
+    {
+      "backend": "linuxdrm",
+      "kind": "memory",
+      "name": "kfd-free-memory-of-gpu",
+      "time_ns": 231314936602279,
+      "duration_ns": 26770,
+      "pid": 1768709,
+      "tid": 1768709,
+      "fd": 3,
+      "source": "ebpf",
+      "confidence": "exact",
+      "attributes": {
+        "cgroup_id": "138970",
+        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-516ffeea-7fc4-4134-84bd-70d1b32fa87f.scope",
+        "command": "1074285335",
+        "command_family": "kfd",
+        "command_hex": "0x40084b17",
+        "command_name": "free_memory_of_gpu",
+        "device_major": "235",
+        "device_minor": "0",
+        "inode": "527",
+        "ioctl_dir": "write",
+        "ioctl_dir_id": "1",
+        "ioctl_nr": "23",
+        "ioctl_size": "8",
+        "ioctl_type": "75",
+        "ioctl_type_char": "K",
+        "node_class": "unknown",
+        "semantic": "memory-release"
+      }
+    }
+  ],
+  "join_stats": {
+    "launch_count": 1,
+    "unmatched_launch_count": 1,
+    "unmatched_candidate_event_count": 2
+  },
+  "attributions": [
+    {
+      "cgroup_id": "138970",
+      "first_seen_ns": 231314936335008,
+      "last_seen_ns": 231314936335008,
+      "backends": [
+        "hip"
+      ],
+      "kernel_names": [
+        "hip_launch_shim_kernel"
+      ],
+      "launch_count": 1
+    }
+  ]
+}

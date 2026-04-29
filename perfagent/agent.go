@@ -17,6 +17,7 @@ import (
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/gpu"
 	linuxdrm "github.com/dpsoft/perf-agent/gpu/backend/linuxdrm"
+	linuxkfd "github.com/dpsoft/perf-agent/gpu/backend/linuxkfd"
 	"github.com/dpsoft/perf-agent/gpu/backend/replay"
 	"github.com/dpsoft/perf-agent/gpu/backend/stream"
 	hostsource "github.com/dpsoft/perf-agent/gpu/host"
@@ -380,10 +381,7 @@ func (a *Agent) newGPUBackend() (gpu.Backend, error) {
 	case a.config.GPULinuxDRM:
 		return linuxdrm.New(linuxdrm.Config{PID: a.config.PID})
 	case a.config.GPULinuxKFD:
-		return linuxdrm.New(linuxdrm.Config{
-			PID:           a.config.PID,
-			EventBackends: []gpu.GPUBackendID{gpu.BackendLinuxKFD},
-		})
+		return linuxkfd.New(linuxkfd.Config{PID: a.config.PID})
 	default:
 		return nil, errors.New("no gpu source configured")
 	}

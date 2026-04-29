@@ -130,6 +130,14 @@ func (c *Config) validate() error {
 			return errors.New("linuxdrm backend requires pid")
 		}
 	}
+	if c.GPULinuxKFD {
+		if c.SystemWide {
+			return errors.New("linuxkfd backend does not support system-wide mode")
+		}
+		if c.PID == 0 {
+			return errors.New("linuxkfd backend requires pid")
+		}
+	}
 	if c.GPUHostHIPLibrary != "" && c.PID == 0 {
 		return errors.New("hip host source requires pid")
 	}
@@ -166,6 +174,9 @@ func (c *Config) gpuSourceCount() int {
 		count++
 	}
 	if c.GPULinuxDRM {
+		count++
+	}
+	if c.GPULinuxKFD {
 		count++
 	}
 	return count
@@ -347,7 +358,7 @@ func (a *Agent) Start(ctx context.Context) error {
 }
 
 func (a *Agent) gpuManagerConfig() *gpu.ManagerConfig {
-	if !a.config.GPULinuxDRM || a.config.GPUHostHIPLibrary == "" {
+	if (!a.config.GPULinuxDRM && !a.config.GPULinuxKFD) || a.config.GPUHostHIPLibrary == "" {
 		return nil
 	}
 
@@ -368,6 +379,11 @@ func (a *Agent) newGPUBackend() (gpu.Backend, error) {
 		return stream.New(a.config.GPUStreamInput), nil
 	case a.config.GPULinuxDRM:
 		return linuxdrm.New(linuxdrm.Config{PID: a.config.PID})
+	case a.config.GPULinuxKFD:
+		return linuxdrm.New(linuxdrm.Config{
+			PID:           a.config.PID,
+			EventBackends: []gpu.GPUBackendID{gpu.BackendLinuxKFD},
+		})
 	default:
 		return nil, errors.New("no gpu source configured")
 	}

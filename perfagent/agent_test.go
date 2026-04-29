@@ -62,6 +62,10 @@ func TestConfigValidation(t *testing.T) {
 			opts: []Option{WithPID(123), WithGPULinuxDRM()},
 		},
 		{
+			name: "valid linuxkfd gpu mode",
+			opts: []Option{WithPID(123), WithGPULinuxKFD()},
+		},
+		{
 			name: "valid GPU host replay plus stream mode",
 			opts: []Option{
 				WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "flash_attn_launches.json")),
@@ -100,9 +104,19 @@ func TestConfigValidation(t *testing.T) {
 			wantErr: "linuxdrm backend requires pid",
 		},
 		{
+			name:    "linuxkfd requires pid",
+			opts:    []Option{WithGPULinuxKFD()},
+			wantErr: "linuxkfd backend requires pid",
+		},
+		{
 			name:    "linuxdrm rejects system-wide",
 			opts:    []Option{WithSystemWide(), WithGPULinuxDRM()},
 			wantErr: "linuxdrm backend does not support system-wide mode",
+		},
+		{
+			name:    "linuxkfd rejects system-wide",
+			opts:    []Option{WithSystemWide(), WithGPULinuxKFD()},
+			wantErr: "linuxkfd backend does not support system-wide mode",
 		},
 		{
 			name: "hip host requires pid",
@@ -267,6 +281,18 @@ func TestAgentGPUEventBackendsForLinuxDRMMode(t *testing.T) {
 	got, err := agent.GPUEventBackends()
 	require.NoError(t, err)
 	assert.Equal(t, []gpu.GPUBackendID{gpu.BackendLinuxDRM, gpu.BackendLinuxKFD}, got)
+}
+
+func TestAgentGPUEventBackendsForLinuxKFDMode(t *testing.T) {
+	agent, err := New(
+		WithPID(123),
+		WithGPULinuxKFD(),
+	)
+	require.NoError(t, err)
+
+	got, err := agent.GPUEventBackends()
+	require.NoError(t, err)
+	assert.Equal(t, []gpu.GPUBackendID{gpu.BackendLinuxKFD}, got)
 }
 
 func TestAgentGPUEventBackendsForStreamModeIsDynamic(t *testing.T) {

@@ -68,6 +68,19 @@ func TestBackendIDAndCapabilities(t *testing.T) {
 	}
 }
 
+func TestBackendEventBackendsCanBeScopedToLinuxKFD(t *testing.T) {
+	b, err := New(Config{
+		PID:           123,
+		EventBackends: []gpu.GPUBackendID{gpu.BackendLinuxKFD},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := b.EventBackends(); len(got) != 1 || got[0] != gpu.BackendLinuxKFD {
+		t.Fatalf("EventBackends()=%v", got)
+	}
+}
+
 func TestStartRejectsNilSink(t *testing.T) {
 	b, err := New(Config{PID: 123})
 	if err != nil {
@@ -159,5 +172,61 @@ func TestStartEmitsNormalizedEventsFromTestRecords(t *testing.T) {
 	}
 	if sink.events[2].Name != "sched-runq-latency" {
 		t.Fatalf("event[2].name=%q", sink.events[2].Name)
+	}
+}
+
+func TestStartFiltersEventsToConfiguredEventBackends(t *testing.T) {
+	b, err := New(Config{
+		PID:           123,
+		EventBackends: []gpu.GPUBackendID{gpu.BackendLinuxKFD},
+		testRecords: []rawRecord{
+			{
+				Kind:        recordKindIOCtl,
+				PID:         123,
+				TID:         124,
+				FD:          9,
+				Command:     0xc04064,
+				ResultCode:  0,
+				StartNs:     1000,
+				EndNs:       1200,
+				DeviceMajor: 226,
+				DeviceMinor: 128,
+				Inode:       77,
+			},
+			{
+				Kind:        recordKindIOCtl,
+				PID:         123,
+				TID:         124,
+				FD:          3,
+				Command:     encodeTestIOCtl(1, 8, 'K', 0x17),
+				ResultCode:  0,
+				StartNs:     1300,
+				EndNs:       1500,
+				DeviceMajor: 235,
+				DeviceMinor: 0,
+				Inode:       527,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var sink eventSink
+	if err := b.Start(context.Background(), &sink); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := b.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if len(sink.events) != 1 {
+		t.Fatalf("events=%d want 1", len(sink.events))
+	}
+	if got := sink.events[0].Backend; got != gpu.BackendLinuxKFD {
+		t.Fatalf("event backend=%q want %q", got, gpu.BackendLinuxKFD)
+	}
+	if got := sink.events[0].Name; got != "kfd-free-memory-of-gpu" {
+		t.Fatalf("event name=%q", got)
 	}
 }

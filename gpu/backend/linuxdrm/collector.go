@@ -63,7 +63,7 @@ func (b *Backend) ID() gpu.GPUBackendID {
 }
 
 func (b *Backend) EventBackends() []gpu.GPUBackendID {
-	return []gpu.GPUBackendID{gpu.BackendLinuxDRM, gpu.BackendLinuxKFD}
+	return b.cfg.configuredEventBackends()
 }
 
 func (b *Backend) Capabilities() []gpu.GPUCapability {
@@ -281,6 +281,9 @@ func (b *Backend) emitRecord(record rawRecord, sink gpu.EventSink) error {
 	event, err := normalizeRecordWithResolvers(record, lookupDRMDeviceInfo, b.cgroups.Lookup)
 	if err != nil {
 		return err
+	}
+	if !slices.Contains(b.cfg.configuredEventBackends(), event.Backend) {
+		return nil
 	}
 	sink.EmitEvent(event)
 	return nil

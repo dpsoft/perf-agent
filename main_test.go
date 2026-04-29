@@ -126,6 +126,48 @@ func TestBuildOptionsGPULinuxDRMMode(t *testing.T) {
 	}
 }
 
+func TestBuildOptionsGPULinuxKFDMode(t *testing.T) {
+	prevLinuxKFD := *flagGPULinuxKFD
+	prevLinuxDRM := *flagGPULinuxDRM
+	prevStream := *flagGPUStreamStdin
+	prevHostReplay := *flagGPUHostReplayInput
+	prevReplay := *flagGPUReplayInput
+	prevProfile := *flagProfile
+	prevOffCPU := *flagOffCpu
+	prevPMU := *flagPMU
+	prevPID := *flagPID
+	prevAll := *flagAll
+
+	t.Cleanup(func() {
+		*flagGPULinuxKFD = prevLinuxKFD
+		*flagGPULinuxDRM = prevLinuxDRM
+		*flagGPUStreamStdin = prevStream
+		*flagGPUHostReplayInput = prevHostReplay
+		*flagGPUReplayInput = prevReplay
+		*flagProfile = prevProfile
+		*flagOffCpu = prevOffCPU
+		*flagPMU = prevPMU
+		*flagPID = prevPID
+		*flagAll = prevAll
+	})
+
+	*flagGPULinuxKFD = true
+	*flagGPULinuxDRM = false
+	*flagGPUStreamStdin = false
+	*flagGPUHostReplayInput = ""
+	*flagGPUReplayInput = ""
+	*flagProfile = false
+	*flagOffCpu = false
+	*flagPMU = false
+	*flagPID = 123
+	*flagAll = false
+
+	opts := buildOptions()
+	if _, err := perfagent.New(opts...); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+}
+
 func TestBuildOptionsGPUHostHIPPlusStreamMode(t *testing.T) {
 	prevStream := *flagGPUStreamStdin
 	prevHostReplay := *flagGPUHostReplayInput
@@ -237,6 +279,26 @@ func TestGPUEventBackendLineForLinuxDRMMode(t *testing.T) {
 		t.Fatalf("gpuEventBackendLine: %v", err)
 	}
 	const want = "GPU event backends: linuxdrm, linuxkfd"
+	if got != want {
+		t.Fatalf("gpuEventBackendLine()=%q want %q", got, want)
+	}
+}
+
+func TestGPUEventBackendLineForLinuxKFDMode(t *testing.T) {
+	agent, err := perfagent.New(
+		perfagent.WithPID(123),
+		perfagent.WithGPULinuxKFD(),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer agent.Close()
+
+	got, err := gpuEventBackendLine(agent)
+	if err != nil {
+		t.Fatalf("gpuEventBackendLine: %v", err)
+	}
+	const want = "GPU event backends: linuxkfd"
 	if got != want {
 		t.Fatalf("gpuEventBackendLine()=%q want %q", got, want)
 	}

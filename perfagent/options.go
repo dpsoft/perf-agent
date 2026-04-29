@@ -81,6 +81,9 @@ type Config struct {
 	// GPULinuxDRM enables the experimental Linux DRM lifecycle backend.
 	GPULinuxDRM bool
 
+	// GPULinuxKFD enables the experimental Linux KFD compute lifecycle backend.
+	GPULinuxKFD bool
+
 	// GPUHIPLinuxDRMJoinWindow bounds heuristic HIP launch -> linuxdrm event joins.
 	GPUHIPLinuxDRMJoinWindow time.Duration
 
@@ -257,6 +260,12 @@ func WithGPUStreamInput(r io.Reader) Option {
 func WithGPULinuxDRM() Option {
 	return func(c *Config) {
 		c.GPULinuxDRM = true
+	}
+}
+
+func WithGPULinuxKFD() Option {
+	return func(c *Config) {
+		c.GPULinuxKFD = true
 	}
 }
 

@@ -382,7 +382,7 @@ func isJoinCandidateEvent(event GPUTimelineEvent) bool {
 	case TimelineEventSubmit, TimelineEventWait:
 		return true
 	case TimelineEventMemory:
-		return event.Attributes["command_family"] == "kfd"
+		return eventFamily(event) == "kfd"
 	default:
 		return false
 	}

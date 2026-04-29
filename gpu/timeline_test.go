@@ -280,6 +280,66 @@ func TestTimelineDoesNotAttachLaunchToNonKFDMemoryEvent(t *testing.T) {
 	}
 }
 
+func TestTimelineAttachesLaunchToKFDMemoryEventByExplicitFamily(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch:     LaunchContext{PID: 10, TID: 11},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventMemory,
+		Family:     "kfd",
+		Name:       "kfd-map-memory-to-gpu",
+		TimeNs:     120,
+		DurationNs: 15,
+		PID:        10,
+		TID:        11,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch == nil {
+		t.Fatal("expected attached launch")
+	}
+	if snapshot.EventViews[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.EventViews[0].Join)
+	}
+}
+
+func TestTimelineExplicitFamilyOverridesConflictingAttributes(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch:     LaunchContext{PID: 10, TID: 11},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventMemory,
+		Family:     "drm-core",
+		Name:       "drm-gem-close",
+		TimeNs:     120,
+		DurationNs: 15,
+		PID:        10,
+		TID:        11,
+		Attributes: map[string]string{
+			"command_family": "kfd",
+		},
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch != nil {
+		t.Fatalf("expected no attached launch: %#v", snapshot.EventViews[0])
+	}
+}
+
 func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	tl := NewTimeline()
 	tl.RecordLaunch(GPUKernelLaunch{

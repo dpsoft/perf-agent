@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--sample-command <cmd>] [--sample-collector-path <path>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -54,6 +54,7 @@ HIP_LIBRARY=""
 LINUX_SURFACE="drm"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH=""
+SAMPLE_COLLECTOR_COMMAND=""
 JOIN_WINDOW="5ms"
 DURATION="2s"
 SLEEP_BEFORE_MS="5000"
@@ -87,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sample-collector-path)
             SAMPLE_COLLECTOR_PATH="${2:-}"
+            shift 2
+            ;;
+        --sample-collector-command)
+            SAMPLE_COLLECTOR_COMMAND="${2:-}"
             shift 2
             ;;
         --join-window)
@@ -146,6 +151,14 @@ if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
     exit 1
 fi
+if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+    echo "cannot combine --sample-command with --sample-collector-command" >&2
+    exit 1
+fi
+if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+    echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
+    exit 1
+fi
 if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" ]]; then
     SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi
@@ -185,6 +198,12 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
         WRAPPER_CMD+=(
             --sample-collector-path
             "${SAMPLE_COLLECTOR_PATH}"
+        )
+    fi
+    if [[ -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+        WRAPPER_CMD+=(
+            --sample-collector-command
+            "${SAMPLE_COLLECTOR_COMMAND}"
         )
     fi
     WRAPPER_CMD+=(

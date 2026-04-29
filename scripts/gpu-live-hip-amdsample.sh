@@ -8,12 +8,13 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--sample-command <cmd>] [--sample-collector-path <path>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
   - AMD sample NDJSON on stdout, either from:
       - --sample-collector-path
+      - --sample-collector-command
       - --sample-command
       - PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH
       - PERF_AGENT_AMD_SAMPLE_COMMAND
@@ -71,6 +72,7 @@ HIP_LIBRARY=""
 HIP_SYMBOL="hipLaunchKernel"
 SAMPLE_COMMAND="${PERF_AGENT_AMD_SAMPLE_COMMAND:-}"
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
+SAMPLE_COLLECTOR_COMMAND="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}"
 DURATION="2s"
 
 while [[ $# -gt 0 ]]; do
@@ -103,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             SAMPLE_COLLECTOR_PATH="${2:-}"
             shift 2
             ;;
+        --sample-collector-command)
+            SAMPLE_COLLECTOR_COMMAND="${2:-}"
+            shift 2
+            ;;
         --duration)
             DURATION="${2:-}"
             shift 2
@@ -128,6 +134,14 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
 fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
+    exit 1
+fi
+if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+    echo "cannot combine --sample-command with --sample-collector-command" >&2
+    exit 1
+fi
+if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+    echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
@@ -197,6 +211,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_GPU_DURATION=${DURATION}"
     "PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
+    "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"
     bash
     -lc
     "${SAMPLE_COMMAND}"

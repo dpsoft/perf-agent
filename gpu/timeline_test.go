@@ -198,6 +198,88 @@ func TestTimelineSkipsEventOutsideConfiguredWindow(t *testing.T) {
 	}
 }
 
+func TestTimelineAttachesLaunchHeuristicallyToKFDMemoryEvent(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch: LaunchContext{
+			PID: 10,
+			TID: 11,
+			CPUStack: []pp.Frame{
+				pp.FrameFromName("train_step"),
+				pp.FrameFromName("hipLaunchKernel"),
+			},
+		},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventMemory,
+		Name:       "kfd-free-memory-of-gpu",
+		TimeNs:     120,
+		DurationNs: 15,
+		PID:        10,
+		TID:        11,
+		Attributes: map[string]string{
+			"command_family": "kfd",
+			"command_name":   "free_memory_of_gpu",
+		},
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch == nil {
+		t.Fatal("expected attached launch")
+	}
+	if !snapshot.EventViews[0].Heuristic {
+		t.Fatal("expected heuristic attribution")
+	}
+	if snapshot.EventViews[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.EventViews[0].Join)
+	}
+	if stats := snapshot.JoinStats; stats.LaunchCount != 1 || stats.MatchedLaunchCount != 1 || stats.UnmatchedLaunchCount != 0 || stats.HeuristicEventJoinCount != 1 || stats.UnmatchedCandidateEventCount != 0 {
+		t.Fatalf("join stats=%+v", stats)
+	}
+}
+
+func TestTimelineDoesNotAttachLaunchToNonKFDMemoryEvent(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		KernelName: "hip_kernel",
+		TimeNs:     100,
+		Launch:     LaunchContext{PID: 10, TID: 11},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventMemory,
+		Name:       "drm-gem-close",
+		TimeNs:     120,
+		DurationNs: 15,
+		PID:        10,
+		TID:        11,
+		Attributes: map[string]string{
+			"command_family": "drm-core",
+			"command_name":   "gem_close",
+		},
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.EventViews) != 1 {
+		t.Fatalf("got %d event views", len(snapshot.EventViews))
+	}
+	if snapshot.EventViews[0].Launch != nil {
+		t.Fatalf("expected no attached launch: %#v", snapshot.EventViews[0])
+	}
+	if snapshot.EventViews[0].Join != "" {
+		t.Fatalf("expected empty join, got %q", snapshot.EventViews[0].Join)
+	}
+	if stats := snapshot.JoinStats; stats.LaunchCount != 1 || stats.MatchedLaunchCount != 0 || stats.UnmatchedLaunchCount != 1 || stats.HeuristicEventJoinCount != 0 || stats.UnmatchedCandidateEventCount != 0 {
+		t.Fatalf("join stats=%+v", stats)
+	}
+}
+
 func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	tl := NewTimeline()
 	tl.RecordLaunch(GPUKernelLaunch{
@@ -271,6 +353,56 @@ func TestTimelineBuildsWorkloadAttributions(t *testing.T) {
 	}
 	if stats := snapshot.JoinStats; stats.LaunchCount != 1 || stats.MatchedLaunchCount != 1 || stats.UnmatchedLaunchCount != 0 || stats.ExactExecutionJoinCount != 1 || stats.HeuristicEventJoinCount != 1 || stats.UnmatchedExecutionCount != 0 || stats.UnmatchedCandidateEventCount != 0 {
 		t.Fatalf("join stats=%+v", stats)
+	}
+}
+
+func TestTimelineBuildsWorkloadAttributionsForKFDMemoryEvent(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "hip", Value: "c1"},
+		KernelName:  "hip_kernel",
+		TimeNs:      100,
+		Launch: LaunchContext{
+			PID: 10,
+			TID: 11,
+			Tags: map[string]string{
+				"cgroup_id":         "9876",
+				"pod_uid":           "pod-abc",
+				"container_id":      "ctr-123",
+				"container_runtime": "containerd",
+			},
+		},
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend:    "linuxdrm",
+		Kind:       TimelineEventMemory,
+		Name:       "kfd-unmap-memory-from-gpu",
+		TimeNs:     130,
+		DurationNs: 13,
+		PID:        10,
+		TID:        11,
+		Attributes: map[string]string{
+			"command_family": "kfd",
+			"command_name":   "unmap_memory_from_gpu",
+		},
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Attributions) != 1 {
+		t.Fatalf("got %d attributions", len(snapshot.Attributions))
+	}
+	got := snapshot.Attributions[0]
+	if got.LaunchCount != 1 || got.EventCount != 1 || got.EventDurationNs != 13 {
+		t.Fatalf("event aggregation=%+v", got)
+	}
+	if got.HeuristicJoinCount != 1 || got.ExactJoinCount != 0 {
+		t.Fatalf("join counts=%+v", got)
+	}
+	if len(got.Backends) != 2 || got.Backends[0] != "hip" || got.Backends[1] != "linuxdrm" {
+		t.Fatalf("backends=%v", got.Backends)
+	}
+	if got.FirstSeenNs != 100 || got.LastSeenNs != 143 {
+		t.Fatalf("seen window=%+v", got)
 	}
 }
 

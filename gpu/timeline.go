@@ -330,9 +330,7 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 }
 
 func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
-	switch event.Kind {
-	case TimelineEventSubmit, TimelineEventWait:
-	default:
+	if !isJoinCandidateEvent(event) {
 		return nil
 	}
 	var best *GPUKernelLaunch
@@ -361,6 +359,8 @@ func isJoinCandidateEvent(event GPUTimelineEvent) bool {
 	switch event.Kind {
 	case TimelineEventSubmit, TimelineEventWait:
 		return true
+	case TimelineEventMemory:
+		return event.Attributes["command_family"] == "kfd"
 	default:
 		return false
 	}

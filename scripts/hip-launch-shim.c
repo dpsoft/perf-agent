@@ -14,6 +14,12 @@ typedef struct {
 } dim3;
 
 typedef hipError_t (*hip_get_device_count_fn)(int *count);
+typedef hipError_t (*hip_init_fn)(unsigned int flags);
+typedef hipError_t (*hip_set_device_fn)(int device);
+typedef hipError_t (*hip_stream_create_fn)(hipStream_t *stream);
+typedef hipError_t (*hip_stream_destroy_fn)(hipStream_t stream);
+typedef hipError_t (*hip_malloc_fn)(void **ptr, size_t size);
+typedef hipError_t (*hip_free_fn)(void *ptr);
 typedef hipError_t (*hip_launch_kernel_fn)(
     const void *function_address,
     dim3 num_blocks,
@@ -66,6 +72,14 @@ int main(void)
 
     hip_get_device_count_fn hip_get_device_count =
         (hip_get_device_count_fn)dlsym(handle, "hipGetDeviceCount");
+    hip_init_fn hip_init = (hip_init_fn)dlsym(handle, "hipInit");
+    hip_set_device_fn hip_set_device = (hip_set_device_fn)dlsym(handle, "hipSetDevice");
+    hip_stream_create_fn hip_stream_create =
+        (hip_stream_create_fn)dlsym(handle, "hipStreamCreate");
+    hip_stream_destroy_fn hip_stream_destroy =
+        (hip_stream_destroy_fn)dlsym(handle, "hipStreamDestroy");
+    hip_malloc_fn hip_malloc = (hip_malloc_fn)dlsym(handle, "hipMalloc");
+    hip_free_fn hip_free = (hip_free_fn)dlsym(handle, "hipFree");
     hip_launch_kernel_fn hip_launch_kernel =
         (hip_launch_kernel_fn)dlsym(handle, "hipLaunchKernel");
     if (hip_get_device_count == NULL || hip_launch_kernel == NULL) {
@@ -79,6 +93,31 @@ int main(void)
     printf("hipGetDeviceCount -> err=%d count=%d\n", count_err, device_count);
     fflush(stdout);
 
+    if (hip_init != NULL) {
+        hipError_t init_err = hip_init(0);
+        printf("hipInit -> err=%d\n", init_err);
+        fflush(stdout);
+    }
+    if (hip_set_device != NULL) {
+        hipError_t set_device_err = hip_set_device(0);
+        printf("hipSetDevice -> err=%d\n", set_device_err);
+        fflush(stdout);
+    }
+
+    hipStream_t stream = NULL;
+    if (hip_stream_create != NULL) {
+        hipError_t stream_create_err = hip_stream_create(&stream);
+        printf("hipStreamCreate -> err=%d stream=%p\n", stream_create_err, stream);
+        fflush(stdout);
+    }
+
+    void *device_ptr = NULL;
+    if (hip_malloc != NULL) {
+        hipError_t malloc_err = hip_malloc(&device_ptr, 4096);
+        printf("hipMalloc -> err=%d ptr=%p\n", malloc_err, device_ptr);
+        fflush(stdout);
+    }
+
     usleep((useconds_t)sleep_before_ms * 1000);
 
     dim3 blocks = {1, 1, 1};
@@ -89,9 +128,20 @@ int main(void)
         threads,
         NULL,
         0,
-        NULL);
+        stream);
     printf("hipLaunchKernel -> err=%d\n", launch_err);
     fflush(stdout);
+
+    if (device_ptr != NULL && hip_free != NULL) {
+        hipError_t free_err = hip_free(device_ptr);
+        printf("hipFree -> err=%d\n", free_err);
+        fflush(stdout);
+    }
+    if (stream != NULL && hip_stream_destroy != NULL) {
+        hipError_t stream_destroy_err = hip_stream_destroy(stream);
+        printf("hipStreamDestroy -> err=%d\n", stream_destroy_err);
+        fflush(stdout);
+    }
 
     usleep((useconds_t)sleep_after_ms * 1000);
 

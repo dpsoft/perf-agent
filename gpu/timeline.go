@@ -382,10 +382,17 @@ func isJoinCandidateEvent(event GPUTimelineEvent) bool {
 	case TimelineEventSubmit, TimelineEventWait:
 		return true
 	case TimelineEventMemory:
-		return eventFamily(event) == "kfd"
+		return isKFDMemoryEvent(event)
 	default:
 		return false
 	}
+}
+
+func isKFDMemoryEvent(event GPUTimelineEvent) bool {
+	if event.Backend == BackendLinuxKFD {
+		return true
+	}
+	return eventFamily(event) == "kfd"
 }
 
 func launchJoinKey(launch GPUKernelLaunch) string {

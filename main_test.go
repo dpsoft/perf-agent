@@ -306,6 +306,54 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRMUsesEnvLibrary(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptRecordsRunnerFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeGo := filepath.Join(tmpDir, "go")
+	fakeGoScript := `#!/bin/sh
+echo fake go runner failed >&2
+exit 19
+`
+	if err := os.WriteFile(fakeGo, []byte(fakeGoScript), 0o755); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+
+	outDir := filepath.Join(tmpDir, "out")
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"host-exec",
+		outDir,
+	)
+	cmd.Env = append(os.Environ(), "PATH="+tmpDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected runner failure, got success:\n%s", out)
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %T: %v", err, err)
+	}
+	if exitErr.ExitCode() != 19 {
+		t.Fatalf("exit code = %d, want 19\n%s", exitErr.ExitCode(), out)
+	}
+
+	logData, err := os.ReadFile(filepath.Join(outDir, "host_exec_sample.runner.log"))
+	if err != nil {
+		t.Fatalf("read runner log: %v", err)
+	}
+	got := string(logData)
+	for _, want := range []string{
+		"runner command: go run .",
+		"fake go runner failed",
+		"runner exit status: 19",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in runner log:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptLiveHIPLinuxDRMSmoke(t *testing.T) {
 	requireBPFCapsForRootTest(t)
 

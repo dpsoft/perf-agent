@@ -65,10 +65,14 @@ run_cmd() {
         quote_cmd "$@"
         return 0
     fi
+    set +e
     (
         cd "${REPO_ROOT}"
         "$@"
     )
+    local status=$?
+    set -e
+    return "${status}"
 }
 
 DRY_RUN=0
@@ -181,6 +185,7 @@ RAW_PATH="${OUTDIR}/${NAME}.raw.json"
 ATTR_PATH="${OUTDIR}/${NAME}.attributions.json"
 FOLDED_PATH="${OUTDIR}/${NAME}.folded"
 PROFILE_PATH="${OUTDIR}/${NAME}.pb.gz"
+RUNNER_LOG_PATH="${OUTDIR}/${NAME}.runner.log"
 
 declare -a CMD=("go" "run" ".")
 if [[ -n "${HOST_REPLAY}" ]]; then
@@ -198,10 +203,24 @@ CMD+=(
     "--duration" "${DURATION}"
 )
 
-run_cmd "${CMD[@]}"
-
 if [[ "${DRY_RUN}" == "1" ]]; then
+    run_cmd "${CMD[@]}"
     exit 0
+fi
+
+set +e
+(
+    cd "${REPO_ROOT}"
+    : >"${RUNNER_LOG_PATH}"
+    printf 'runner command: ' >>"${RUNNER_LOG_PATH}"
+    quote_cmd "${CMD[@]}" >>"${RUNNER_LOG_PATH}"
+    "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+)
+runner_status=$?
+set -e
+printf 'runner exit status: %d\n' "${runner_status}" >>"${RUNNER_LOG_PATH}"
+if [[ "${runner_status}" -ne 0 ]]; then
+    exit "${runner_status}"
 fi
 
 cat <<EOF
@@ -210,6 +229,7 @@ Wrote:
   ${ATTR_PATH}
   ${FOLDED_PATH}
   ${PROFILE_PATH}
+  ${RUNNER_LOG_PATH}
 
 Inspect join diagnostics with:
   jq '.join_stats' ${RAW_PATH}

@@ -1,0 +1,2 @@
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait] 111111110
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier] 50505050

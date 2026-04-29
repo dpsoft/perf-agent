@@ -59,6 +59,7 @@ type rawEvent struct {
 	Kind        string               `json:"kind"`
 	Event       gpu.GPUTimelineEvent `json:"event"`
 	Correlation gpu.CorrelationID    `json:"correlation"`
+	Execution   gpu.GPUExecutionRef  `json:"execution"`
 	Queue       gpu.GPUQueueRef      `json:"queue"`
 	Launch      gpu.LaunchContext    `json:"launch"`
 	Device      gpu.GPUDeviceRef     `json:"device"`
@@ -82,6 +83,7 @@ func emitEvent(event rawEvent, sink gpu.EventSink) error {
 		})
 	case "exec":
 		sink.EmitExec(gpu.GPUKernelExec{
+			Execution:   event.Execution,
 			Correlation: event.Correlation,
 			Queue:       event.Queue,
 			KernelName:  event.KernelName,

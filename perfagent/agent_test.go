@@ -813,6 +813,79 @@ func TestAgentHostReplayPlusGPUAMDSampleOutputsExecutionFrames(t *testing.T) {
 	assert.Contains(t, got, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier]")
 }
 
+func TestAgentHostReplayPlusCheckedInAMDSampleReplayRawJSONGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.json")),
+		WithGPURawOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.raw.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}
+
+func TestAgentHostReplayPlusCheckedInAMDSampleReplayAttributionGolden(t *testing.T) {
+	var raw bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.json")),
+		WithGPUAttributionOutput(&raw),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.attributions.json"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), raw.String())
+}
+
+func TestAgentHostReplayPlusCheckedInAMDSampleReplayFoldedGolden(t *testing.T) {
+	var folded bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.json")),
+		WithGPUFoldedOutput(&folded),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.folded"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), folded.String())
+}
+
+func TestAgentHostReplayPlusCheckedInAMDSampleReplayProfileGolden(t *testing.T) {
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUReplayInput(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.json")),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+
+	want, err := os.ReadFile(filepath.Join("..", "gpu", "testdata", "replay", "amd_sample_exec.pprof.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, string(want), got)
+}
+
 func TestAgentHostReplayPlusCheckedInGPUExecutionReplayProfileGolden(t *testing.T) {
 	var profileBuf bytes.Buffer
 	agent, err := New(

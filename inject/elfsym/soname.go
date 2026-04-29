@@ -10,9 +10,11 @@ import (
 )
 
 // libpythonRE matches typical CPython library SONAMEs, e.g.:
-//   libpython3.12.so
-//   libpython3.12.so.1.0
-//   libpython2.7.so
+//
+//	libpython3.12.so
+//	libpython3.12.so.1.0
+//	libpython2.7.so
+//
 // It is deliberately liberal — caller decides whether the version is
 // acceptable via IsPython312Plus.
 var libpythonRE = regexp.MustCompile(`^libpython(\d+)\.(\d+)\.so(?:\..*)?$`)

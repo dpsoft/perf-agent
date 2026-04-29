@@ -4,11 +4,11 @@ import "testing"
 
 func TestParseLibpythonSONAME(t *testing.T) {
 	tests := []struct {
-		name        string
-		path        string
-		wantMajor   int
-		wantMinor   int
-		wantIsPy    bool
+		name      string
+		path      string
+		wantMajor int
+		wantMinor int
+		wantIsPy  bool
 	}{
 		{"py312_typical", "/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0", 3, 12, true},
 		{"py312_no_minor_suffix", "/usr/lib/libpython3.12.so", 3, 12, true},

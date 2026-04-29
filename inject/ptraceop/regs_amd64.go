@@ -16,12 +16,20 @@ import (
 //   - *(RSP) gets a 0 written to it by the caller, serving as the return
 //     address; when the function returns, target jumps to 0 → SIGSEGV →
 //     ptrace catches it.
+//   - Orig_rax = ^uint64(0) (i.e. -1) to disable kernel syscall-restart logic:
+//     when ptrace attaches to a target mid-syscall (e.g. nanosleep), the kernel
+//     records the syscall number in orig_rax; on PtraceCont the kernel runs
+//     syscall-return processing which clobbers RAX based on that number. The
+//     pyrasite/py-spy/manhole convention is to set orig_rax = -1 to mark "not
+//     in a syscall", which prevents that clobbering and lets our remote call
+//     return its actual value.
 //
 // All other registers are inherited from orig — we only edit what we must.
 func setupCallFrame(orig unix.PtraceRegs, fnAddr, arg1, payloadAddr uint64) (unix.PtraceRegs, error) {
 	frame := orig
 	frame.Rip = fnAddr
 	frame.Rdi = arg1
+	frame.Orig_rax = ^uint64(0) // -1: suppress kernel syscall-restart on PtraceCont
 	// SP layout: ... [return-addr sentinel = 0] [payload string]
 	// We choose RSP = payloadAddr - 8 so *(RSP) holds the sentinel.
 	// Then ensure 16-byte alignment after the simulated CALL push: in System V,

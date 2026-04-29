@@ -839,8 +839,6 @@ func TestGPULiveHIPAMDSampleWrapperSmoke(t *testing.T) {
 		strconv.Itoa(shimCmd.Process.Pid),
 		"--hip-library",
 		hipLib,
-		"--sample-command",
-		"cat gpu/testdata/replay/amd_sample_exec.ndjson",
 		"--duration",
 		"2s",
 	)

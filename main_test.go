@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/perfagent"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
@@ -641,6 +644,55 @@ func TestGPUOfflineDemoScriptLiveHIPLinuxKFDSmoke(t *testing.T) {
 		if info.Size() == 0 {
 			t.Fatalf("%s is empty\n%s", path, out)
 		}
+	}
+
+	rawBytes, err := os.ReadFile(filepath.Join(outDir, "live_hip_linuxkfd.raw.json"))
+	if err != nil {
+		t.Fatalf("read raw snapshot: %v", err)
+	}
+	var snap gpu.Snapshot
+	if err := json.Unmarshal(rawBytes, &snap); err != nil {
+		t.Fatalf("unmarshal raw snapshot: %v\n%s", err, rawBytes)
+	}
+	if len(snap.EventBackends) != 1 || snap.EventBackends[0] != gpu.BackendLinuxKFD {
+		t.Fatalf("event_backends=%v want [%q]", snap.EventBackends, gpu.BackendLinuxKFD)
+	}
+	if snap.JoinStats.LaunchCount == 0 {
+		t.Fatalf("expected at least one captured HIP launch, join_stats=%+v", snap.JoinStats)
+	}
+	if snap.JoinStats.UnmatchedCandidateEventCount == 0 {
+		t.Fatalf("expected linuxkfd candidate events, join_stats=%+v", snap.JoinStats)
+	}
+	var foundKFD bool
+	for _, event := range snap.Events {
+		if event.Backend == gpu.BackendLinuxKFD {
+			foundKFD = true
+			break
+		}
+	}
+	if !foundKFD {
+		t.Fatalf("expected at least one linuxkfd event in snapshot: %+v", snap.Events)
+	}
+
+	attrBytes, err := os.ReadFile(filepath.Join(outDir, "live_hip_linuxkfd.attributions.json"))
+	if err != nil {
+		t.Fatalf("read attribution snapshot: %v", err)
+	}
+	var attributions []gpu.WorkloadAttribution
+	if err := json.Unmarshal(attrBytes, &attributions); err != nil {
+		t.Fatalf("unmarshal attributions: %v\n%s", err, attrBytes)
+	}
+	if len(attributions) == 0 {
+		t.Fatal("expected at least one workload attribution")
+	}
+	if attributions[0].LaunchCount == 0 {
+		t.Fatalf("expected launch attribution in first workload: %+v", attributions[0])
+	}
+	if !slices.Contains(attributions[0].Backends, gpu.BackendHIP) {
+		t.Fatalf("expected hip backend in attribution backends: %+v", attributions[0].Backends)
+	}
+	if !slices.Contains(attributions[0].Backends, gpu.BackendLinuxKFD) {
+		t.Fatalf("expected linuxkfd backend in attribution backends: %+v", attributions[0].Backends)
 	}
 }
 

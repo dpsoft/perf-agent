@@ -791,6 +791,98 @@ func TestGPUOfflineDemoScriptLiveHIPLinuxKFDSmoke(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperSmoke(t *testing.T) {
+	requireBPFCapsForRootTest(t)
+
+	hipLib, err := firstHIPLibraryPath()
+	if err != nil {
+		t.Skipf("no HIP library path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	binaryPath := buildHIPLaunchShim(t, t.TempDir())
+	shimLogPath := filepath.Join(t.TempDir(), "hip-shim.log")
+	shimCmd := exec.CommandContext(ctx, binaryPath)
+	shimLog, err := os.Create(shimLogPath)
+	if err != nil {
+		t.Fatalf("create shim log: %v", err)
+	}
+	defer shimLog.Close()
+	shimCmd.Stdout = shimLog
+	shimCmd.Stderr = shimLog
+	shimCmd.Env = append(os.Environ(),
+		"HIP_LAUNCH_SHIM_LIBRARY="+hipLib,
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=10000",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=60000",
+	)
+	if err := shimCmd.Start(); err != nil {
+		t.Fatalf("start hip shim: %v", err)
+	}
+	defer func() {
+		if shimCmd.ProcessState == nil || !shimCmd.ProcessState.Exited() {
+			_ = shimCmd.Process.Kill()
+			_, _ = shimCmd.Process.Wait()
+		}
+	}()
+
+	outDir := t.TempDir()
+	cmd := exec.CommandContext(
+		ctx,
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--outdir",
+		outDir,
+		"--pid",
+		strconv.Itoa(shimCmd.Process.Pid),
+		"--hip-library",
+		hipLib,
+		"--sample-command",
+		"cat gpu/testdata/replay/amd_sample_exec.ndjson",
+		"--duration",
+		"2s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("live amd sample wrapper smoke: %v\n%s", err, out)
+	}
+
+	for _, name := range []string{
+		"live_hip_amdsample.raw.json",
+		"live_hip_amdsample.attributions.json",
+		"live_hip_amdsample.folded",
+		"live_hip_amdsample.pb.gz",
+	} {
+		path := filepath.Join(outDir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v\n%s", path, err, out)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("%s is empty\n%s", path, out)
+		}
+	}
+
+	rawBytes, err := os.ReadFile(filepath.Join(outDir, "live_hip_amdsample.raw.json"))
+	if err != nil {
+		t.Fatalf("read raw snapshot: %v", err)
+	}
+	var snap gpu.Snapshot
+	if err := json.Unmarshal(rawBytes, &snap); err != nil {
+		t.Fatalf("unmarshal raw snapshot: %v\n%s", err, rawBytes)
+	}
+	if len(snap.Executions) != 1 {
+		t.Fatalf("executions=%d want 1", len(snap.Executions))
+	}
+	if snap.JoinStats.ExactExecutionJoinCount != 1 {
+		t.Fatalf("join_stats=%+v", snap.JoinStats)
+	}
+	if got := snap.Attributions; len(got) != 1 || got[0].SampleWeight != 16 {
+		t.Fatalf("attributions=%+v", got)
+	}
+}
+
 func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 	outDir := t.TempDir()
 	cmd := exec.Command(

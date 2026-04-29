@@ -28,6 +28,12 @@ func TestReplayBackendEmitsFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	if got := b.ID(); got != gpu.BackendReplay {
+		t.Fatalf("ID=%q", got)
+	}
+	if got := b.EventBackends(); len(got) != 0 {
+		t.Fatalf("EventBackends()=%v", got)
+	}
 	var s sink
 	if err := b.Start(context.Background(), &s); err != nil {
 		t.Fatalf("Start: %v", err)

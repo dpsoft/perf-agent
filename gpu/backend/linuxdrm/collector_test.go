@@ -50,8 +50,11 @@ func TestBackendIDAndCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := b.ID(); got != "linuxdrm" {
+	if got := b.ID(); got != gpu.BackendLinuxDRM {
 		t.Fatalf("ID=%q", got)
+	}
+	if got := b.EventBackends(); len(got) != 2 || got[0] != gpu.BackendLinuxDRM || got[1] != gpu.BackendLinuxKFD {
+		t.Fatalf("EventBackends()=%v", got)
 	}
 	got := b.Capabilities()
 	want := []gpu.GPUCapability{gpu.CapabilityLifecycleTimeline}

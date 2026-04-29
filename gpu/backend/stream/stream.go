@@ -30,6 +30,8 @@ func (b *Backend) ID() gpu.GPUBackendID {
 	return gpu.BackendStream
 }
 
+func (b *Backend) EventBackends() []gpu.GPUBackendID { return nil }
+
 func (b *Backend) Capabilities() []gpu.GPUCapability {
 	return []gpu.GPUCapability{
 		gpu.CapabilityLaunchTrace,

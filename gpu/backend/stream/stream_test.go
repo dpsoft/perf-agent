@@ -30,6 +30,12 @@ func TestStreamBackendEmitsEventsFromReader(t *testing.T) {
 			"{\"kind\":\"event\",\"event\":{\"backend\":\"linuxdrm\",\"kind\":\"submit\",\"name\":\"amdgpu-cs\",\"time_ns\":130,\"duration_ns\":13,\"pid\":4242,\"tid\":4243,\"source\":\"replay\"}}\n",
 	)
 	b := New(src)
+	if got := b.ID(); got != gpu.BackendStream {
+		t.Fatalf("ID=%q", got)
+	}
+	if got := b.EventBackends(); len(got) != 0 {
+		t.Fatalf("EventBackends()=%v", got)
+	}
 	var s sink
 
 	if err := b.Start(t.Context(), &s); err != nil {

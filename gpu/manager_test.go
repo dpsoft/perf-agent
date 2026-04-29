@@ -11,7 +11,8 @@ import (
 type fakeBackend struct{ startErr error }
 
 func (f fakeBackend) ID() gpu.GPUBackendID                     { return "fake" }
-func (f fakeBackend) Capabilities() []gpu.GPUCapability { return nil }
+func (f fakeBackend) EventBackends() []gpu.GPUBackendID       { return nil }
+func (f fakeBackend) Capabilities() []gpu.GPUCapability       { return nil }
 func (f fakeBackend) Start(context.Context, gpu.EventSink) error {
 	return f.startErr
 }

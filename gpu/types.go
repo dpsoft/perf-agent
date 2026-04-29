@@ -190,6 +190,7 @@ type EventSink interface {
 
 type Backend interface {
 	ID() GPUBackendID
+	EventBackends() []GPUBackendID
 	Capabilities() []GPUCapability
 	Start(ctx context.Context, sink EventSink) error
 	Stop(ctx context.Context) error

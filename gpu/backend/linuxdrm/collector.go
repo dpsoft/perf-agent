@@ -62,6 +62,10 @@ func (b *Backend) ID() gpu.GPUBackendID {
 	return gpu.BackendLinuxDRM
 }
 
+func (b *Backend) EventBackends() []gpu.GPUBackendID {
+	return []gpu.GPUBackendID{gpu.BackendLinuxDRM, gpu.BackendLinuxKFD}
+}
+
 func (b *Backend) Capabilities() []gpu.GPUCapability {
 	return slices.Clone(baseCapabilities)
 }

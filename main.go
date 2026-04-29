@@ -73,6 +73,21 @@ func debugGPULivef(format string, args ...any) {
 	log.Printf("gpu-live-debug: "+format, args...)
 }
 
+func gpuEventBackendLine(agent *perfagent.Agent) (string, error) {
+	backends, err := agent.GPUEventBackends()
+	if err != nil {
+		return "", err
+	}
+	if len(backends) == 0 {
+		return "", nil
+	}
+	parts := make([]string, 0, len(backends))
+	for _, backend := range backends {
+		parts = append(parts, string(backend))
+	}
+	return fmt.Sprintf("GPU event backends: %s", strings.Join(parts, ", ")), nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -99,6 +114,11 @@ func main() {
 		log.Fatalf("Failed to start agent: %v", err)
 	}
 	debugGPULivef("agent started")
+	if line, err := gpuEventBackendLine(agent); err != nil {
+		log.Printf("Failed to report GPU event backends: %v", err)
+	} else if line != "" {
+		fmt.Println(line)
+	}
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)

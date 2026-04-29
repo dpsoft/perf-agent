@@ -222,6 +222,42 @@ func TestBuildOptionsGPUHostHIPPlusLinuxDRMMode(t *testing.T) {
 	}
 }
 
+func TestGPUEventBackendLineForLinuxDRMMode(t *testing.T) {
+	agent, err := perfagent.New(
+		perfagent.WithPID(123),
+		perfagent.WithGPULinuxDRM(),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer agent.Close()
+
+	got, err := gpuEventBackendLine(agent)
+	if err != nil {
+		t.Fatalf("gpuEventBackendLine: %v", err)
+	}
+	const want = "GPU event backends: linuxdrm, linuxkfd"
+	if got != want {
+		t.Fatalf("gpuEventBackendLine()=%q want %q", got, want)
+	}
+}
+
+func TestGPUEventBackendLineForDynamicGPUStreamMode(t *testing.T) {
+	agent, err := perfagent.New(perfagent.WithGPUStreamInput(strings.NewReader("")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer agent.Close()
+
+	got, err := gpuEventBackendLine(agent)
+	if err != nil {
+		t.Fatalf("gpuEventBackendLine: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("gpuEventBackendLine()=%q want empty string", got)
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHostExec(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

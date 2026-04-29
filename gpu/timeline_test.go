@@ -56,6 +56,58 @@ func TestTimelineMarksHeuristicJoin(t *testing.T) {
 	}
 }
 
+func TestTimelineHeuristicallyAttachesInWindowSamples(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Queue:      GPUQueueRef{Backend: BackendAMDSample, QueueID: "compute:0"},
+		KernelName: "hip_launch_shim_kernel",
+		TimeNs:     100,
+	})
+	tl.RecordExec(GPUKernelExec{
+		Execution:   GPUExecutionRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", QueueID: "compute:0", ExecID: "dispatch-1"},
+		Correlation: CorrelationID{Backend: BackendAMDSample, Value: "dispatch-1"},
+		Queue: GPUQueueRef{
+			Backend: BackendAMDSample,
+			Device:  GPUDeviceRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", Name: "AMD Radeon 780M Graphics"},
+			QueueID: "compute:0",
+		},
+		KernelName: "hip_launch_shim_kernel",
+		StartNs:    120,
+		EndNs:      260,
+	})
+	tl.RecordSample(GPUSample{
+		Correlation: CorrelationID{Backend: BackendAMDSample, Value: "sample-stream-1"},
+		Device:      GPUDeviceRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", Name: "AMD Radeon 780M Graphics"},
+		TimeNs:      150,
+		KernelName:  "hip_launch_shim_kernel",
+		StallReason: "memory_wait",
+		Weight:      11,
+	})
+	tl.RecordSample(GPUSample{
+		Correlation: CorrelationID{Backend: BackendAMDSample, Value: "sample-stream-2"},
+		Device:      GPUDeviceRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", Name: "AMD Radeon 780M Graphics"},
+		TimeNs:      300,
+		KernelName:  "hip_launch_shim_kernel",
+		StallReason: "wave_barrier",
+		Weight:      5,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Executions) != 1 {
+		t.Fatalf("got %d executions", len(snapshot.Executions))
+	}
+	if snapshot.Executions[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.Executions[0].Join)
+	}
+	if len(snapshot.Executions[0].Samples) != 1 {
+		t.Fatalf("got %d samples", len(snapshot.Executions[0].Samples))
+	}
+	got := snapshot.Executions[0].Samples[0]
+	if got.StallReason != "memory_wait" || got.Weight != 11 {
+		t.Fatalf("sample=%+v", got)
+	}
+}
+
 func TestTimelinePreservesLifecycleEventOrder(t *testing.T) {
 	tl := NewTimeline()
 	tl.RecordEvent(GPUTimelineEvent{

@@ -407,13 +407,42 @@ func launchJoinKey(launch GPUKernelLaunch) string {
 }
 
 func samplesForExec(all []GPUSample, exec GPUKernelExec) []GPUSample {
-	var out []GPUSample
+	var exact []GPUSample
 	for _, sample := range all {
 		if sample.Correlation != (CorrelationID{}) && sample.Correlation == exec.Correlation {
-			out = append(out, sample)
+			exact = append(exact, sample)
 		}
 	}
-	return out
+	if len(exact) > 0 {
+		return exact
+	}
+	var heuristic []GPUSample
+	for _, sample := range all {
+		if sample.KernelName != "" && exec.KernelName != "" && sample.KernelName != exec.KernelName {
+			continue
+		}
+		if sample.TimeNs < exec.StartNs || sample.TimeNs > exec.EndNs {
+			continue
+		}
+		if !sampleDeviceMatchesExec(sample, exec) {
+			continue
+		}
+		heuristic = append(heuristic, sample)
+	}
+	return heuristic
+}
+
+func sampleDeviceMatchesExec(sample GPUSample, exec GPUKernelExec) bool {
+	if sample.Device.Backend != "" && exec.Execution.Backend != "" && sample.Device.Backend != exec.Execution.Backend {
+		return false
+	}
+	if sample.Device.DeviceID == "" {
+		return true
+	}
+	if exec.Execution.DeviceID != "" && sample.Device.DeviceID == exec.Execution.DeviceID {
+		return true
+	}
+	return exec.Queue.Device.DeviceID != "" && sample.Device.DeviceID == exec.Queue.Device.DeviceID
 }
 
 func cloneLaunch(in GPUKernelLaunch) GPUKernelLaunch {

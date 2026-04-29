@@ -9,6 +9,7 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/gpu-offline-demo.sh [--dry-run] host-exec <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
@@ -17,6 +18,7 @@ Usage:
 
 Modes:
   host-exec         checked-in host->execution replay
+  hip-amd-sample    checked-in host->AMD execution/sample stdin path
   host-driver       checked-in host->driver replay
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
@@ -131,6 +133,7 @@ mkdir -p "${OUTDIR}"
 
 HOST_REPLAY=""
 GPU_REPLAY=""
+STDIN_PATH=""
 NAME=""
 DEBUG_GPU_LIVE=0
 declare -a EXTRA_ARGS=()
@@ -140,6 +143,12 @@ case "${MODE}" in
         HOST_REPLAY="gpu/testdata/host/replay/flash_attn_launches.json"
         GPU_REPLAY="gpu/testdata/replay/host_exec_sample.json"
         NAME="host_exec_sample"
+        ;;
+    hip-amd-sample)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        STDIN_PATH="gpu/testdata/replay/amd_sample_exec.ndjson"
+        NAME="amd_sample_exec"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
     host-driver)
         HOST_REPLAY="gpu/testdata/host/replay/flash_attn_launches.json"
@@ -230,7 +239,11 @@ CMD+=(
 )
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-    run_cmd "${CMD[@]}"
+    if [[ -n "${STDIN_PATH}" ]]; then
+        printf '%s < %s\n' "$(quote_cmd "${CMD[@]}")" "${STDIN_PATH}"
+    else
+        run_cmd "${CMD[@]}"
+    fi
     exit 0
 fi
 
@@ -239,11 +252,23 @@ set +e
     cd "${REPO_ROOT}"
     : >"${RUNNER_LOG_PATH}"
     printf 'runner command: ' >>"${RUNNER_LOG_PATH}"
-    quote_cmd "${CMD[@]}" >>"${RUNNER_LOG_PATH}"
-    if [[ "${DEBUG_GPU_LIVE}" == "1" ]]; then
-        PERF_AGENT_DEBUG_GPU_LIVE=1 "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+    if [[ -n "${STDIN_PATH}" ]]; then
+        printf '%s < %s\n' "$(quote_cmd "${CMD[@]}")" "${STDIN_PATH}" >>"${RUNNER_LOG_PATH}"
     else
-        "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+        quote_cmd "${CMD[@]}" >>"${RUNNER_LOG_PATH}"
+    fi
+    if [[ "${DEBUG_GPU_LIVE}" == "1" ]]; then
+        if [[ -n "${STDIN_PATH}" ]]; then
+            PERF_AGENT_DEBUG_GPU_LIVE=1 "${CMD[@]}" <"${STDIN_PATH}" >>"${RUNNER_LOG_PATH}" 2>&1
+        else
+            PERF_AGENT_DEBUG_GPU_LIVE=1 "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+        fi
+    else
+        if [[ -n "${STDIN_PATH}" ]]; then
+            "${CMD[@]}" <"${STDIN_PATH}" >>"${RUNNER_LOG_PATH}" 2>&1
+        else
+            "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+        fi
     fi
 )
 runner_status=$?

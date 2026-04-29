@@ -387,6 +387,32 @@ func TestGPUOfflineDemoScriptDryRunHostExec(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-amd-sample",
+		"/tmp/gpu-amd-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-amd-sample: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-amd-demo/amd_sample_exec.attributions.json",
+		"--gpu-folded-output /tmp/gpu-amd-demo/amd_sample_exec.folded",
+		"< gpu/testdata/replay/amd_sample_exec.ndjson",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -761,6 +787,47 @@ func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 		"jq '.join_stats' " + filepath.Join(outDir, "host_exec_sample.raw.json"),
 		"Inspect workload attribution with:",
 		"jq '.' " + filepath.Join(outDir, "host_exec_sample.attributions.json"),
+		"join summary:",
+		"launches matched: 1/1",
+		"exact execution joins: 1",
+		"heuristic event joins: 0",
+		"unmatched launches: 0",
+		"unmatched candidate events: 0",
+		"tuning hint:",
+		"join activity looks healthy; only widen --join-window if you still see missing lifecycle matches",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptHIPAMDSampleReportsJoinInspection(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-amd-sample",
+		outDir,
+	)
+	cmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"CGO_CFLAGS=-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include",
+		"CGO_LDFLAGS=-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-amd-sample helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"Inspect join diagnostics with:",
+		"jq '.join_stats' " + filepath.Join(outDir, "amd_sample_exec.raw.json"),
+		"Inspect workload attribution with:",
+		"jq '.' " + filepath.Join(outDir, "amd_sample_exec.attributions.json"),
 		"join summary:",
 		"launches matched: 1/1",
 		"exact execution joins: 1",

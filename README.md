@@ -270,6 +270,7 @@ scripts/gpu-offline-demo.sh [--dry-run] <mode> <outdir>
 Current modes are:
 
 - `host-exec`
+- `hip-amd-sample`
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
@@ -280,6 +281,12 @@ For example, the checked-in host-to-execution path can now be run as:
 
 ```bash
 bash scripts/gpu-offline-demo.sh host-exec /tmp/gpu-demo
+```
+
+And the checked-in HIP host + AMD execution/sample path can be run as:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-amd-sample /tmp/gpu-amd-demo
 ```
 
 And the current live entrypoint can be previewed safely with:
@@ -381,6 +388,29 @@ The resulting folded line is expected to look like:
 
 ```text
 train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:kernel:flash_attn_fwd];[gpu:stall:memory_throttle] 7
+```
+
+There is also a checked-in HIP host + AMD execution/sample stdin path using the new `amdsample` source mode:
+
+```bash
+go run . \
+  --gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json \
+  --gpu-amd-sample-stdin \
+  --gpu-raw-output /tmp/gpu-amd-exec.raw.json \
+  --gpu-attribution-output /tmp/gpu-amd-exec.attributions.json \
+  --gpu-folded-output /tmp/gpu-amd-exec.folded \
+  --gpu-profile-output /tmp/gpu-amd-exec.pb.gz \
+  --duration 1ms < gpu/testdata/replay/amd_sample_exec.ndjson
+
+flamegraph.pl /tmp/gpu-amd-exec.folded > /tmp/gpu-amd-exec.svg
+cat /tmp/gpu-amd-exec.attributions.json
+```
+
+The resulting folded lines are expected to look like:
+
+```text
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait] 11
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier] 5
 ```
 
 This is still not a true device-internal flame graph, but it is the current branch’s clearest CPU-to-GPU execution artifact. It proves:

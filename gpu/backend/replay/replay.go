@@ -21,7 +21,7 @@ func New(path string) (*Backend, error) {
 }
 
 func (b *Backend) ID() gpu.GPUBackendID {
-	return "replay"
+	return gpu.BackendReplay
 }
 
 func (b *Backend) Capabilities() []gpu.GPUCapability {

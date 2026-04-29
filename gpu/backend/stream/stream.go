@@ -27,7 +27,7 @@ func New(r io.Reader) *Backend {
 }
 
 func (b *Backend) ID() gpu.GPUBackendID {
-	return "stream"
+	return gpu.BackendStream
 }
 
 func (b *Backend) Capabilities() []gpu.GPUCapability {

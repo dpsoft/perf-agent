@@ -64,7 +64,7 @@ func normalizeRecordWithResolvers(
 		return event, nil
 	case recordKindSchedWakeup:
 		event := gpu.GPUTimelineEvent{
-			Backend:    "linuxdrm",
+			Backend:    gpu.BackendLinuxDRM,
 			Kind:       gpu.TimelineEventWait,
 			Family:     "scheduler",
 			Name:       "sched-wakeup",
@@ -81,7 +81,7 @@ func normalizeRecordWithResolvers(
 		return event, nil
 	case recordKindSchedRunq:
 		event := gpu.GPUTimelineEvent{
-			Backend:    "linuxdrm",
+			Backend:    gpu.BackendLinuxDRM,
 			Kind:       gpu.TimelineEventWait,
 			Family:     "scheduler",
 			Name:       "sched-runq-latency",
@@ -116,9 +116,9 @@ func eventFamilyFromAttrs(attrs map[string]string) string {
 
 func eventBackendFromAttrs(attrs map[string]string) gpu.GPUBackendID {
 	if eventFamilyFromAttrs(attrs) == "kfd" {
-		return gpu.GPUBackendID("linuxkfd")
+		return gpu.BackendLinuxKFD
 	}
-	return gpu.GPUBackendID("linuxdrm")
+	return gpu.BackendLinuxDRM
 }
 
 func addAttributionAttrs(attrs map[string]string, record rawRecord, lookupCgroup func(uint32) (string, bool)) {

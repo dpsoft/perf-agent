@@ -26,6 +26,33 @@ func TestCapabilityConstantsStable(t *testing.T) {
 	}
 }
 
+func TestBackendIDConstantsStable(t *testing.T) {
+	got := []GPUBackendID{
+		BackendLinuxDRM,
+		BackendLinuxKFD,
+		BackendStream,
+		BackendReplay,
+		BackendHIP,
+		BackendHostReplay,
+	}
+	want := []GPUBackendID{
+		"linuxdrm",
+		"linuxkfd",
+		"stream",
+		"replay",
+		"hip",
+		"host-replay",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len(got)=%d len(want)=%d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backend[%d]=%q want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestLaunchRoundTripJSON(t *testing.T) {
 	in := GPUKernelLaunch{
 		Correlation: CorrelationID{Backend: "replay", Value: "corr-1"},

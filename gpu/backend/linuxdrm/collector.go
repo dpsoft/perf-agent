@@ -59,7 +59,7 @@ func New(cfg Config) (*Backend, error) {
 }
 
 func (b *Backend) ID() gpu.GPUBackendID {
-	return "linuxdrm"
+	return gpu.BackendLinuxDRM
 }
 
 func (b *Backend) Capabilities() []gpu.GPUCapability {

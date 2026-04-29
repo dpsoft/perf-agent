@@ -9,6 +9,15 @@ import (
 
 type GPUBackendID string
 
+const (
+	BackendLinuxDRM   GPUBackendID = "linuxdrm"
+	BackendLinuxKFD   GPUBackendID = "linuxkfd"
+	BackendStream     GPUBackendID = "stream"
+	BackendReplay     GPUBackendID = "replay"
+	BackendHIP        GPUBackendID = "hip"
+	BackendHostReplay GPUBackendID = "host-replay"
+)
+
 type GPUCapability string
 
 const (

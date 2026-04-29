@@ -21,7 +21,7 @@ This spec proposes a v1 injector that uses `ptrace` to remotely call `sys.activa
 - Integrate cleanly into both `--pid N` and `-a` system-wide profiling modes.
 - Cover both amd64 and arm64 architectures in v1.
 - Provide structured stats (`Activated`, `Deactivated`, `Skipped[reason]`, `Failed`) for operator audit.
-- Keep the injector self-contained — `inject/` package has no dependencies on `profile/`, `offcpu/`, or `cpu/`.
+- Keep the injector tree self-contained — `inject/` and its subpackages (`inject/elfsym/`, `inject/ptraceop/`, `inject/python/`) have no dependencies on `profile/`, `offcpu/`, or `cpu/`. Language-agnostic primitives (`elfsym`, `ptraceop`) sit at the inject root so future runtimes (Node.js, JVM) can share them.
 
 ### Non-goals (v1)
 
@@ -51,34 +51,40 @@ This spec proposes a v1 injector that uses `ptrace` to remotely call `sys.activa
 
 ### 4.1 Package layout
 
-A new top-level package, sibling to `unwind/`, `cpu/`, `offcpu/`:
+A new top-level package tree, sibling to `unwind/`, `cpu/`, `offcpu/`. The layout splits **language-agnostic primitives** (`elfsym`, `ptraceop`) from **language-specific logic** (`python`) so future runtimes (Node.js, JVM, Ruby) can plug in as siblings of `python/` without touching the shared layer:
 
 ```
 inject/
-  inject.go              # public types: Manager, Options, Stats, Target
-  manager.go             # Manager struct, ActivateAll, DeactivateAll, dedupe
-  detector.go            # Detector interface + concrete /proc-based impl
-  errors.go              # ErrNotPython, ErrPythonTooOld, ErrNoPerfTrampoline,
+  elfsym/                # SHARED across runtimes
+    soname.go            # SONAME parsing + version filter (regex-based)
+    elfsym.go            # ResolveSymbols (.dynsym → .symtab fallback)
+    *_test.go
+  ptraceop/              # SHARED across runtimes
+    ptraceop.go          # RemoteCall: attach → save → write → call → restore → detach
+                         # Generic 3-call sequencing primitive
+    regs_amd64.go        # //go:build amd64 — System V AMD64 call-frame setup
+    regs_arm64.go        # //go:build arm64 — AAPCS64 call-frame setup
+    *_test.go
+  python/                # Python-specific
+    python.go            # Public types: Manager, Options, Stats, Target
+    manager.go           # Manager struct, ActivateAll, DeactivateAll,
+                         # ActivateLate (mmap-watcher hook), dedupe
+    detector.go          # Detection ladder: /proc/<pid>/maps → SONAME match →
+                         # /proc/<pid>/exe fallback → ELF symbol resolution
+    payload.go           # Activate/deactivate C-string payload encoding
+    errors.go            # ErrNotPython, ErrPythonTooOld, ErrNoPerfTrampoline,
                          # ErrStaticallyLinkedNoSymbols, ErrPreexisting
-  payload.go             # Activate/deactivate C-string payload encoding
-  elfsym/
-    elfsym.go            # Public ResolveSymbols entrypoint
-    soname.go            # SONAME parsing + version filter
-  ptraceop/
-    ptraceop.go          # Arch-generic coordination: attach → save → write →
-                         # remote-call → restore → detach
-    regs_amd64.go        # //go:build amd64 — call-frame setup,
-                         # syscall trap encoding
-    regs_arm64.go        # //go:build arm64 — call-frame setup,
-                         # syscall trap encoding
+    *_test.go
 ```
 
-Tests sit alongside (`*_test.go`).
+**Future expansion (illustrative — not part of v1):** When Node.js injection ships, it lands as `inject/nodejs/` parallel to `inject/python/`, reusing `inject/elfsym/` and (where applicable) `inject/ptraceop/`. Some runtimes may not use ptrace at all — for example, a Node.js injector via the V8 inspector protocol would import `inject/inspectorproto/` (a hypothetical future sibling of `ptraceop/`) instead. The layout supports both patterns.
+
+Tests sit alongside source files (`*_test.go`).
 
 ### 4.2 Public surface
 
 ```go
-package inject
+package python  // import path: github.com/.../inject/python
 
 type Options struct {
     StrictPerPID bool        // true for --pid N; false for -a
@@ -119,19 +125,43 @@ type Stats struct {
 }
 ```
 
+Internally, `python.Manager` calls into `inject/ptraceop` for the low-level remote-call sequence. `ptraceop` does NOT import `inject/python` — to avoid an import cycle, `ptraceop.RemoteCall` takes primitive `SymbolAddrs` arguments rather than `*Target`. `python.manager` constructs `SymbolAddrs` from `Target` and passes them through.
+
+```go
+package ptraceop  // import path: github.com/.../inject/ptraceop
+
+type SymbolAddrs struct {
+    PyGILEnsure  uint64
+    PyGILRelease uint64
+    PyRunString  uint64
+}
+
+type Injector struct { ... }
+
+func New(log *slog.Logger) *Injector
+// RemoteActivate runs the three-call sequence (Ensure → Run → Release) inside
+// a single ptrace session. Generic over the symbol set; today only Python uses
+// it, but the same primitive works for any C-ABI runtime that needs a brief
+// remote-function-call to enable instrumentation.
+func (i *Injector) RemoteActivate(pid uint32, addrs SymbolAddrs, payload []byte) error
+func (i *Injector) RemoteDeactivate(pid uint32, addrs SymbolAddrs, payload []byte) error
+```
+
 ### 4.3 Integration with `perfagent.Agent`
 
 ```go
 // perfagent/agent.go (additions only shown)
+import "github.com/.../inject/python"
+
 type Agent struct {
     // ...existing fields...
-    injectMgr *inject.Manager  // nil unless --inject-python is set
+    pyInjector *python.Manager  // nil unless --inject-python is set
 }
 
 func (a *Agent) Start(ctx context.Context) error {
-    if a.injectMgr != nil {
+    if a.pyInjector != nil {
         targets := a.scanForPythonTargets()  // detector ladder, see §5
-        if err := a.injectMgr.ActivateAll(targets); err != nil {
+        if err := a.pyInjector.ActivateAll(targets); err != nil {
             return fmt.Errorf("python injection: %w", err)
         }
     }
@@ -140,16 +170,18 @@ func (a *Agent) Start(ctx context.Context) error {
 
 func (a *Agent) Stop(ctx context.Context) error {
     // ...profile finalization...
-    if a.injectMgr != nil {
-        a.injectMgr.DeactivateAll(ctx)
+    if a.pyInjector != nil {
+        a.pyInjector.DeactivateAll(ctx)
     }
     // ...close BPF, flush, exit...
 }
 
-func (a *Agent) InjectStats() inject.Stats  // nil-safe; zero value if off
+func (a *Agent) PythonInjectStats() python.Stats  // nil-safe; zero value if off
 ```
 
-For `-a` mode, the existing mmap watcher (`unwind/ehmaps/tracker.go`) gains a hook that calls `injectMgr.ActivateLate(pid)` when a new exec is detected.
+For `-a` mode, the existing mmap watcher (`unwind/ehmaps/tracker.go`) gains a hook that calls `pyInjector.ActivateLate(pid)` when a new exec is detected.
+
+When future runtimes ship, `Agent` gains parallel fields (`nodeInjector *nodejs.Manager`, etc.) and parallel scan loops. The mmap watcher's new-exec channel is multiplexed across all configured injectors — each runtime's `Detector.Detect()` runs in parallel and the first non-nil result wins (a process is one runtime; if any future detector ambiguity arises, we'd add explicit precedence then).
 
 ## 5. Detection ladder
 
@@ -432,18 +464,13 @@ The summary line at end-of-scan gives operators a one-glance audit without grepp
 
 ```
 inject/elfsym/
-  symtab_test.go
+  soname_test.go
     TestParseSONAME_PythonVariants
     TestParseSONAME_NotPython
+  elfsym_test.go
     TestResolveSymbols_DynsymHit
     TestResolveSymbols_FallsBackToSymtab
-    TestResolveSymbols_MissingPyRunSimpleString  → ErrStaticallyLinkedNoSymbols
-    TestResolveSymbols_MissingPerfCallbacks      → ErrNoPerfTrampoline
-    TestResolveStaticBinary
-
-inject/payload_test.go
-  TestEncodeActivatePayload     (exact bytes, null-terminated)
-  TestEncodeDeactivatePayload   (exact bytes, null-terminated)
+    TestResolveSymbols_MissingByName
 
 inject/ptraceop/
   regs_amd64_test.go            (//go:build amd64)
@@ -454,15 +481,26 @@ inject/ptraceop/
     TestSetupCallFrame_arm64    (X0/SP/PC/LR set; sentinel)
     TestRegsRoundTrip_arm64
 
-inject/manager_test.go
-  TestActivateAll_StrictExitsOnFirstError
-  TestActivateAll_LenientContinuesOnError
-  TestActivateAll_PreexistingMarkerSkips
-  TestDeactivateAll_HonorsDeadline
-  TestDeactivateAll_SkipsPreexisting
-  TestDeactivateAll_ToleratesESRCH
-  TestNewExec_DedupesViaTracked
-  TestNewExec_DedupesViaPending
+inject/python/
+  payload_test.go
+    TestEncodeActivatePayload     (exact bytes, null-terminated)
+    TestEncodeDeactivatePayload   (exact bytes, null-terminated)
+  detector_test.go
+    TestDetect_DynamicLinkedPython312       (libpython3.12.so in maps → Target)
+    TestDetect_StaticLinkedPython           (no libpython; exe has symbols)
+    TestDetect_NonPython                    (Go binary → ErrNotPython)
+    TestDetect_PythonTooOld                 (libpython3.11.so → ErrPythonTooOld)
+    TestDetect_NoPerfTrampoline             (libpython3.12.so without
+                                              _PyPerf_Callbacks → ErrNoPerfTrampoline)
+  manager_test.go
+    TestActivateAll_StrictExitsOnFirstError
+    TestActivateAll_LenientContinuesOnError
+    TestActivateAll_PreexistingMarkerSkips
+    TestDeactivateAll_HonorsDeadline
+    TestDeactivateAll_SkipsPreexisting
+    TestDeactivateAll_ToleratesESRCH
+    TestNewExec_DedupesViaTracked
+    TestNewExec_DedupesViaPending
 ```
 
 Synthetic-procfs pattern reused from PR #11's `scan_enroll_test.go::buildSyntheticProcTree`. Synthetic ELF files for symbol-resolution tests use `debug/elf.NewFile` over an in-memory byte buffer with a minimal `.dynsym`. Register tests in `ptraceop_*_test.go` exercise frame setup logic over hand-crafted `unix.PtraceRegs` values (real `ptrace` is exercised in integration).
@@ -470,14 +508,14 @@ Synthetic-procfs pattern reused from PR #11's `scan_enroll_test.go::buildSynthet
 ### 9.2 Integration tests (caps-gated)
 
 ```
-test/integration_inject_test.go
+test/integration_inject_python_test.go
   TestInjectPython_ActivatesTrampoline
     1. Launch python3.12 test/workloads/python/cpu_bound.py 10 2 (no -X perf)
     2. Wait 1s for warmup
     3. Run perf-agent --profile --inject-python --pid <PID> --duration 5s
     4. Assert /tmp/perf-<PID>.map exists, contains py:: lines
     5. Assert profile.pb.gz has Python frame names
-    6. Assert agent.InjectStats(): Activated=1, Deactivated=1
+    6. Assert agent.PythonInjectStats(): Activated=1, Deactivated=1
     7. After perf-agent exit: re-stat perf-map twice with 1s gap; size unchanged
        (proves deactivation ran)
 
@@ -492,7 +530,7 @@ test/integration_inject_test.go
        1× Go binary
     2. Run perf-agent --profile -a --inject-python --duration 5s
     3. Assert exit 0
-    4. Assert agent.InjectStats(): Activated=2, SkippedTooOld=1,
+    4. Assert agent.PythonInjectStats(): Activated=2, SkippedTooOld=1,
        SkippedNotPython=1, Failed=0
     5. Assert profile contains Python frames from the two 3.12 processes
 ```

@@ -138,7 +138,7 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
     exit 1
 fi
 if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" ]]; then
-    SAMPLE_COMMAND="bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel"
+    SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi
 
 SOURCE_PATH="${SCRIPT_DIR}/hip-launch-shim.c"

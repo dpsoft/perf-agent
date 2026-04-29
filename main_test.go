@@ -1119,7 +1119,8 @@ func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 		"PERF_AGENT_HIP_LIBRARY=/opt/rocm/lib/libamdhip64.so",
 		"PERF_AGENT_HIP_SYMBOL=hipLaunchKernel",
 		"PERF_AGENT_GPU_DURATION=2s",
-		"bash -lc bash\\ scripts/amd-sample-producer.sh\\ --kernel-name\\ hip_launch_shim_kernel |",
+		"PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel",
+		"bash -lc bash\\ scripts/amd-sample-adapter.sh |",
 		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
 		"--pid 4242",
 		"--hip-library /opt/rocm/lib/libamdhip64.so",
@@ -1359,7 +1360,7 @@ func TestGPULiveHIPShimDemoDryRunForAMDSample(t *testing.T) {
 	got := string(out)
 	for _, want := range []string{
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
-		"--sample-command bash\\ scripts/amd-sample-producer.sh\\ --kernel-name\\ hip_launch_shim_kernel",
+		"--sample-command bash\\ scripts/amd-sample-adapter.sh",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
@@ -1486,6 +1487,51 @@ func TestAMDSampleProducerScriptUsesDurationContext(t *testing.T) {
 	}
 	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
 		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+}
+
+func TestAMDSampleAdapterScriptFallsBackToProducerWithKernelContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_GPU_KERNEL_NAME=adapter_kernel",
+		"PERF_AGENT_GPU_DURATION=2s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter fallback: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.KernelName != "adapter_kernel" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	if got := execEv.Exec.EndNs - execEv.Exec.StartNs; got != 2_000_000_000 {
+		t.Fatalf("duration_ns=%d", got)
+	}
+}
+
+func TestAMDSampleAdapterScriptRunsCollectorCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=printf adapter-external")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter collector command: %v\n%s", err, out)
+	}
+	if got := string(out); got != "adapter-external" {
+		t.Fatalf("output=%q", got)
 	}
 }
 

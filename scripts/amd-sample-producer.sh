@@ -44,7 +44,7 @@ sleep_ms() {
     sleep "$(awk -v ms="${ms}" 'BEGIN { printf "%.3f", ms / 1000 }')"
 }
 
-KERNEL_NAME="hip_launch_shim_kernel"
+KERNEL_NAME="${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}"
 DEVICE_ID="gfx1103:0"
 DEVICE_NAME="AMD Radeon 780M Graphics"
 QUEUE_ID="compute:0"

@@ -349,7 +349,7 @@ bash scripts/gpu-live-hip-amdsample.sh \
 ```
 
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
-producer script automatically.
+adapter script automatically.
 
 Or preview the wrapped command shape without a real PID yet:
 
@@ -390,7 +390,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 ```
 
-`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel`.
+`drm` remains the default. `kfd` switches the shim demo to the KFD-only live wrapper path. `amdsample` switches it to the execution/sample wrapper and defaults the sample producer to `bash scripts/amd-sample-adapter.sh`.
 
 There is also a small checked-in AMD sample producer for live-shaped demos:
 
@@ -398,7 +398,7 @@ There is also a small checked-in AMD sample producer for live-shaped demos:
 bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
 ```
 
-It emits producer-native `amdsample` execution/sample NDJSON with boot-relative
+The checked-in adapter defaults to the synthetic producer and emits producer-native `amdsample` execution/sample NDJSON with boot-relative
 timestamps, which is a closer stand-in for a real live producer than replaying a
 static checked-in file.
 

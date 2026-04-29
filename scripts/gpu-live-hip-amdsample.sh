@@ -120,7 +120,7 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
-    SAMPLE_COMMAND="bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel"
+    SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi
 
 RAW_PATH="${OUTDIR}/live_hip_amdsample.raw.json"
@@ -184,6 +184,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_HIP_LIBRARY=${HIP_LIBRARY}"
     "PERF_AGENT_HIP_SYMBOL=${HIP_SYMBOL}"
     "PERF_AGENT_GPU_DURATION=${DURATION}"
+    "PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel"
     bash
     -lc
     "${SAMPLE_COMMAND}"

@@ -2372,36 +2372,141 @@ For `-a --inject-python`, processes that exec during the run also need injection
 grep -rn "OnNewExec\|NewMmapWatcher\|MmapWatcher" unwind/ perfagent/
 ```
 
-- [ ] **Step 2: Add the hook**
+- [ ] **Step 2: Add the hook with LAZY subscription**
 
-If the watcher already exposes a `OnNewExec(func(pid uint32))` callback, wire `Agent` to register `a.pyInjector.ActivateLate` if `pyInjector != nil`. If it does not, extend it minimally.
+**Hard requirement: zero overhead when `--inject-python` is off.** The watcher must not produce, buffer, or dispatch new-exec events when nobody is subscribed. This rules out:
 
-If the watcher uses a channel (e.g., `Watcher.NewExecChan() <-chan uint32`), spawn a small drainer goroutine in `Agent.Start()`:
+- Always-on channels (even if no goroutine drains them, populating the channel costs CPU and may eventually block whatever produces the events).
+- Slice-of-callbacks where an empty slice is iterated on every event.
+
+Pick exactly one of these two patterns based on what the watcher already does:
+
+**Pattern A — callback registration (preferred if the watcher has a constructor or hook-registration phase):**
 
 ```go
-if a.pyInjector != nil && a.cfg.PID == 0 {  // -a mode only
-	a.lateExecWG.Go(func() {
-		ch := a.watcher.NewExecChan()
-		for {
-			select {
-			case <-a.ctx.Done():
-				return
-			case pid, ok := <-ch:
-				if !ok {
-					return
-				}
-				a.pyInjector.ActivateLate(pid)
-			}
-		}
-	})
+// In the watcher's package:
+type Watcher struct {
+    // ... existing fields ...
+    onNewExec func(pid uint32)  // nil → no hook; producer skips dispatch entirely
+}
+
+// SetOnNewExec registers a hook. Pass nil to clear. Must be called before
+// Start() (or while holding the watcher's lock) to avoid races.
+func (w *Watcher) SetOnNewExec(fn func(pid uint32)) {
+    w.onNewExec = fn
+}
+
+// Inside the watcher's event loop:
+func (w *Watcher) handleExec(pid uint32) {
+    // ... existing CFI-related work ...
+    if w.onNewExec != nil {
+        w.onNewExec(pid)  // single nil check; if no subscriber, fully skipped
+    }
 }
 ```
 
-The exact shape depends on the existing watcher API; the goal is "every new exec invokes ActivateLate" and "the goroutine ends cleanly on ctx cancel."
+In `perfagent/agent.go`, register only when injection is enabled:
 
-- [ ] **Step 3: Add a unit test for the dedupe path**
+```go
+if a.pyInjector != nil && a.cfg.PID == 0 {  // -a mode only
+    a.watcher.SetOnNewExec(a.pyInjector.ActivateLate)
+}
+```
 
-If the watcher exposes a way to inject a synthetic new-exec event in tests, write `TestLateExecHook_InvokesActivateLate` in `inject/python/manager_test.go`. Otherwise, the integration test in Task 11 covers this end-to-end.
+No goroutine, no channel, no producer-side cost when `pyInjector == nil`.
+
+**Pattern B — Subscribe()-on-demand channel (use only if the watcher already serves multiple consumers via channels):**
+
+```go
+// In the watcher's package:
+type Watcher struct {
+    mu          sync.Mutex
+    subscribers []chan<- uint32  // nil/empty → producer skips dispatch
+}
+
+// Subscribe returns a buffered channel (size 64) that receives new-exec PIDs.
+// The channel is closed when the watcher shuts down. Returns a cancel func
+// the caller should invoke to drop the subscription before its context ends.
+func (w *Watcher) Subscribe() (<-chan uint32, func()) {
+    ch := make(chan uint32, 64)
+    w.mu.Lock()
+    w.subscribers = append(w.subscribers, ch)
+    w.mu.Unlock()
+    cancel := func() {
+        w.mu.Lock()
+        defer w.mu.Unlock()
+        for i, s := range w.subscribers {
+            if s == ch {
+                w.subscribers = append(w.subscribers[:i], w.subscribers[i+1:]...)
+                close(ch)
+                return
+            }
+        }
+    }
+    return ch, cancel
+}
+
+// Inside the watcher's event loop:
+func (w *Watcher) handleExec(pid uint32) {
+    w.mu.Lock()
+    if len(w.subscribers) == 0 {
+        w.mu.Unlock()
+        return  // zero subscribers → zero work
+    }
+    subs := append([]chan<- uint32(nil), w.subscribers...)
+    w.mu.Unlock()
+    for _, ch := range subs {
+        select {
+        case ch <- pid:
+        default:
+            // subscriber's buffer full; drop. Slow consumers must not stall
+            // the watcher.
+        }
+    }
+}
+```
+
+In `perfagent/agent.go`:
+
+```go
+if a.pyInjector != nil && a.cfg.PID == 0 {
+    ch, cancelSub := a.watcher.Subscribe()
+    a.lateExecWG.Go(func() {
+        defer cancelSub()
+        for {
+            select {
+            case <-a.ctx.Done():
+                return
+            case pid, ok := <-ch:
+                if !ok {
+                    return
+                }
+                a.pyInjector.ActivateLate(pid)
+            }
+        }
+    })
+}
+```
+
+When no one calls `Subscribe()`, `len(w.subscribers) == 0` and `handleExec` returns after one mutex acquire — no allocation, no channel send.
+
+**Choosing between A and B:**
+- Pattern A is simpler and cheaper. Use it unless the existing watcher already has a multi-consumer channel API.
+- Pattern B is appropriate if the codebase already uses Subscribe()-style channels elsewhere.
+
+In either case: **the producer (the watcher's event loop) must do zero work when no subscriber is registered.** That's the invariant; the test below verifies it.
+
+- [ ] **Step 3: Add unit tests — including a no-subscriber zero-overhead test**
+
+Two tests required:
+
+**Test 1: `TestNewExec_NoSubscribersZeroDispatch`** (in the watcher's test file). Construct a Watcher without registering any hook (Pattern A: don't call `SetOnNewExec`; Pattern B: don't call `Subscribe`). Drive a synthetic exec event into the watcher's `handleExec`. Assert that no observable side-effect occurs and (Pattern A) the `onNewExec` field is still nil.
+
+The literal assertion is "the test passes" — what we're verifying is that the no-subscriber path doesn't panic, doesn't allocate (for B), and exits early. This guards the lazy-subscription invariant against future refactors.
+
+**Test 2: `TestNewExec_HookFires`** (same file). Register a hook (Pattern A) or subscribe (Pattern B). Drive a synthetic exec event for `pid=12345`. Assert the hook saw `pid=12345`.
+
+If the watcher is internally hard to test (e.g., spawns goroutines that read from a real perf event ring), introduce an internal `func handleExec(pid uint32)` method that the test can call directly while the production event loop calls the same method.
 
 - [ ] **Step 4: Build + test**
 

@@ -13,6 +13,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] live-hip-amdsample <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--duration <dur>]
   scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxdrm <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
   scripts/gpu-offline-demo.sh [--dry-run] live-hip-linuxkfd <outdir> --pid <pid> --hip-library <path> [--hip-symbol <symbol>] [--join-window <dur>] [--duration <dur>]
 
@@ -22,6 +23,7 @@ Modes:
   host-driver       checked-in host->driver replay
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
+  live-hip-amdsample experimental live host HIP + AMD execution/sample stdin path
   live-hip-linuxdrm experimental live host HIP + linuxdrm path
   live-hip-linuxkfd experimental live host HIP + linuxkfd path
 
@@ -164,6 +166,26 @@ case "${MODE}" in
         HOST_REPLAY="gpu/testdata/host/replay/multi_workload_launches.json"
         GPU_REPLAY="gpu/testdata/replay/multi_workload_submit.json"
         NAME="multi_workload_submit"
+        ;;
+    live-hip-amdsample)
+        if [[ -z "${PID}" ]]; then
+            echo "live-hip-amdsample requires --pid" >&2
+            exit 1
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            HIP_LIBRARY="$(discover_hip_library || true)"
+        fi
+        if [[ -z "${HIP_LIBRARY}" ]]; then
+            echo "live-hip-amdsample requires --hip-library or PERF_AGENT_HIP_LIBRARY" >&2
+            exit 1
+        fi
+        NAME="live_hip_amdsample"
+        EXTRA_ARGS=(
+            "--pid" "${PID}"
+            "--gpu-amd-sample-stdin"
+            "--gpu-host-hip-library" "${HIP_LIBRARY}"
+            "--gpu-host-hip-symbol" "${HIP_SYMBOL}"
+        )
         ;;
     live-hip-linuxdrm)
         if [[ -z "${PID}" ]]; then

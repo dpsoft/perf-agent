@@ -274,6 +274,7 @@ Current modes are:
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
+- `live-hip-amdsample`
 - `live-hip-linuxdrm`
 - `live-hip-linuxkfd`
 
@@ -305,6 +306,14 @@ bash scripts/gpu-offline-demo.sh --dry-run live-hip-linuxkfd /tmp/gpu-live \
   --hip-library /opt/rocm/lib/libamdhip64.so
 ```
 
+For a future real AMD execution/sample producer instead of lifecycle-only DRM/KFD events:
+
+```bash
+bash scripts/gpu-offline-demo.sh --dry-run live-hip-amdsample /tmp/gpu-live \
+  --pid 4242 \
+  --hip-library /opt/rocm/lib/libamdhip64.so
+```
+
 The live path also accepts:
 
 - `--join-window <dur>` to tune HIP launch -> `linuxdrm` fallback joins
@@ -331,6 +340,15 @@ For the KFD-only AMD compute path:
 bash scripts/gpu-live-hip-linuxkfd.sh --outdir /tmp/gpu-live --pid 4242
 ```
 
+For an external AMD execution/sample producer that writes NDJSON on stdout:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-command 'cat gpu/testdata/replay/amd_sample_exec.ndjson'
+```
+
 Or preview the wrapped command shape without a real PID yet:
 
 ```bash
@@ -353,6 +371,8 @@ jq '.' /tmp/gpu-live/live_hip_linuxdrm.attributions.json
 ```
 
 And the KFD-only path writes the parallel `live_hip_linuxkfd.*` outputs.
+
+The AMD execution/sample wrapper writes the parallel `live_hip_amdsample.*` outputs.
 
 If `jq` is installed, it also prints:
 

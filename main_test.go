@@ -413,6 +413,36 @@ func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunLiveHIPAMDSample(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"live-hip-amdsample",
+		"/tmp/gpu-live-amd-demo",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run live-hip-amdsample: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--pid 4242",
+		"--gpu-amd-sample-stdin",
+		"--gpu-host-hip-library /opt/rocm/lib/libamdhip64.so",
+		"--gpu-attribution-output /tmp/gpu-live-amd-demo/live_hip_amdsample.attributions.json",
+		"--gpu-folded-output /tmp/gpu-live-amd-demo/live_hip_amdsample.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunLiveHIPLinuxDRM(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -937,6 +967,37 @@ func TestGPULiveHIPLinuxKFDWrapperDryRunWithPID(t *testing.T) {
 		"--hip-library /opt/rocm/lib/libamdhip64.so",
 		"--join-window 7ms",
 		"--duration 3s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperDryRunWithPID(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-command",
+		"cat gpu/testdata/replay/amd_sample_exec.ndjson",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with pid: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"bash -lc cat\\ gpu/testdata/replay/amd_sample_exec.ndjson |",
+		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
+		"--pid 4242",
+		"--hip-library /opt/rocm/lib/libamdhip64.so",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

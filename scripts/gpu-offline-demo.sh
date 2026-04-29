@@ -130,6 +130,7 @@ mkdir -p "${OUTDIR}"
 HOST_REPLAY=""
 GPU_REPLAY=""
 NAME=""
+DEBUG_GPU_LIVE=0
 declare -a EXTRA_ARGS=()
 
 case "${MODE}" in
@@ -166,6 +167,7 @@ case "${MODE}" in
             exit 1
         fi
         NAME="live_hip_linuxdrm"
+        DEBUG_GPU_LIVE=1
         EXTRA_ARGS=(
             "--pid" "${PID}"
             "--gpu-linux-drm"
@@ -214,7 +216,11 @@ set +e
     : >"${RUNNER_LOG_PATH}"
     printf 'runner command: ' >>"${RUNNER_LOG_PATH}"
     quote_cmd "${CMD[@]}" >>"${RUNNER_LOG_PATH}"
-    "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+    if [[ "${DEBUG_GPU_LIVE}" == "1" ]]; then
+        PERF_AGENT_DEBUG_GPU_LIVE=1 "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+    else
+        "${CMD[@]}" >>"${RUNNER_LOG_PATH}" 2>&1
+    fi
 )
 runner_status=$?
 set -e

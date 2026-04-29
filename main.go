@@ -66,6 +66,13 @@ func init() {
 
 var pmuFile *os.File
 
+func debugGPULivef(format string, args ...any) {
+	if os.Getenv("PERF_AGENT_DEBUG_GPU_LIVE") == "" {
+		return
+	}
+	log.Printf("gpu-live-debug: "+format, args...)
+}
+
 func main() {
 	flag.Parse()
 
@@ -91,6 +98,7 @@ func main() {
 	if err := agent.Start(ctx); err != nil {
 		log.Fatalf("Failed to start agent: %v", err)
 	}
+	debugGPULivef("agent started")
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
@@ -101,14 +109,20 @@ func main() {
 
 	select {
 	case <-time.After(*flagDuration):
+		debugGPULivef("duration completed after %v", *flagDuration)
 		fmt.Println("Collection duration completed")
 	case sig := <-sigChan:
+		debugGPULivef("received signal %s", sig)
 		fmt.Printf("\nReceived signal: %s\n", sig)
 	}
 
 	// Stop and collect results
+	debugGPULivef("calling agent.Stop")
 	if err := agent.Stop(ctx); err != nil {
+		debugGPULivef("agent.Stop returned error: %v", err)
 		log.Printf("Error stopping agent: %v", err)
+	} else {
+		debugGPULivef("agent.Stop completed successfully")
 	}
 
 	if pmuFile != nil {
@@ -116,6 +130,7 @@ func main() {
 	}
 
 	fmt.Println("Exiting program.")
+	debugGPULivef("program exit")
 }
 
 func buildOptions() []perfagent.Option {

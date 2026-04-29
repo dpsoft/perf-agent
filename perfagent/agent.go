@@ -31,6 +31,13 @@ import (
 
 const defaultGPUHIPLinuxDRMJoinWindow = 5 * time.Millisecond
 
+func debugGPULivef(format string, args ...any) {
+	if os.Getenv("PERF_AGENT_DEBUG_GPU_LIVE") == "" {
+		return
+	}
+	log.Printf("gpu-live-debug: "+format, args...)
+}
+
 // cpuProfiler is the narrow shape both profile.Profiler and
 // dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
 type cpuProfiler interface {
@@ -437,32 +444,46 @@ func (a *Agent) Stop(ctx context.Context) error {
 
 	if a.gpuManager != nil {
 		if a.hostSource != nil {
+			debugGPULivef("stopping host source")
 			if err := a.hostSource.Stop(ctx); err != nil {
+				debugGPULivef("host source stop error: %v", err)
 				log.Printf("Failed to stop GPU host source: %v", err)
 				lastErr = err
+			} else {
+				debugGPULivef("host source stopped")
 			}
 		}
+		debugGPULivef("stopping gpu manager")
 		if err := a.gpuManager.Stop(ctx); err != nil {
+			debugGPULivef("gpu manager stop error: %v", err)
 			log.Printf("Failed to stop GPU manager: %v", err)
 			lastErr = err
+		} else {
+			debugGPULivef("gpu manager stopped")
 		}
+		debugGPULivef("building gpu snapshot")
 		snapshot := a.gpuManager.Snapshot()
 		if err := a.writeGPURaw(snapshot); err != nil {
+			debugGPULivef("gpu raw write error: %v", err)
 			log.Printf("Failed to write GPU raw output: %v", err)
 			lastErr = err
 		}
 		if err := a.writeGPUAttributions(snapshot); err != nil {
+			debugGPULivef("gpu attribution write error: %v", err)
 			log.Printf("Failed to write GPU attribution output: %v", err)
 			lastErr = err
 		}
 		if err := a.writeGPUProfile(snapshot); err != nil {
+			debugGPULivef("gpu profile write error: %v", err)
 			log.Printf("Failed to write GPU profile output: %v", err)
 			lastErr = err
 		}
 		if err := a.writeGPUFolded(snapshot); err != nil {
+			debugGPULivef("gpu folded write error: %v", err)
 			log.Printf("Failed to write GPU folded output: %v", err)
 			lastErr = err
 		}
+		debugGPULivef("gpu outputs written")
 	}
 
 	return lastErr

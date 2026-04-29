@@ -3,6 +3,7 @@ package linuxdrm
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 	"slices"
 	"sync"
@@ -20,6 +21,13 @@ var (
 		gpu.CapabilityLifecycleTimeline,
 	}
 )
+
+func debugGPULivef(format string, args ...any) {
+	if os.Getenv("PERF_AGENT_DEBUG_GPU_LIVE") == "" {
+		return
+	}
+	log.Printf("gpu-live-debug: "+format, args...)
+}
 
 type Backend struct {
 	cfg Config
@@ -118,17 +126,22 @@ func (b *Backend) Stop(ctx context.Context) error {
 	b.mu.Unlock()
 
 	if done == nil {
+		debugGPULivef("linuxdrm stop: backend not started")
 		return nil
 	}
 	if cancel != nil {
+		debugGPULivef("linuxdrm stop: canceling run context")
 		cancel(context.Canceled)
 	}
+	debugGPULivef("linuxdrm stop: closing ringbuf reader")
 	b.closeReader()
 
 	select {
 	case <-done:
+		debugGPULivef("linuxdrm stop: run goroutine finished")
 		return b.err()
 	case <-ctx.Done():
+		debugGPULivef("linuxdrm stop: stop context done: %v", context.Cause(ctx))
 		return context.Cause(ctx)
 	}
 }

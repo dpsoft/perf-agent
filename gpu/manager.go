@@ -2,6 +2,8 @@ package gpu
 
 import (
 	"context"
+	"log"
+	"os"
 )
 
 type Manager struct {
@@ -11,6 +13,13 @@ type Manager struct {
 
 type ManagerConfig struct {
 	LaunchEventJoinWindowNs uint64
+}
+
+func debugGPULivef(format string, args ...any) {
+	if os.Getenv("PERF_AGENT_DEBUG_GPU_LIVE") == "" {
+		return
+	}
+	log.Printf("gpu-live-debug: "+format, args...)
 }
 
 func NewManager(backends []Backend, cfg *ManagerConfig) *Manager {
@@ -35,9 +44,12 @@ func (m *Manager) Start(ctx context.Context) error {
 
 func (m *Manager) Stop(ctx context.Context) error {
 	for i := len(m.backends) - 1; i >= 0; i-- {
+		debugGPULivef("stopping gpu backend %d (%s)", i, m.backends[i].ID())
 		if err := m.backends[i].Stop(ctx); err != nil {
+			debugGPULivef("gpu backend %d (%s) stop error: %v", i, m.backends[i].ID(), err)
 			return err
 		}
+		debugGPULivef("gpu backend %d (%s) stopped", i, m.backends[i].ID())
 	}
 	return nil
 }

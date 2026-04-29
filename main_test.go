@@ -1115,6 +1115,10 @@ func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 	}
 	got := string(out)
 	for _, want := range []string{
+		"PERF_AGENT_HIP_PID=4242",
+		"PERF_AGENT_HIP_LIBRARY=/opt/rocm/lib/libamdhip64.so",
+		"PERF_AGENT_HIP_SYMBOL=hipLaunchKernel",
+		"PERF_AGENT_GPU_DURATION=2s",
 		"bash -lc bash\\ scripts/amd-sample-producer.sh\\ --kernel-name\\ hip_launch_shim_kernel |",
 		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
 		"--pid 4242",
@@ -1418,6 +1422,34 @@ func TestAMDSampleProducerScriptEmitsProducerNativeNDJSON(t *testing.T) {
 	}
 	if !(execEv.Exec.StartNs <= sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs <= execEv.Exec.EndNs) {
 		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+}
+
+func TestAMDSampleProducerScriptUsesHIPPIDContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-producer.sh"),
+		"--sleep-before-ms",
+		"0",
+	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_HIP_PID=4242")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample producer with pid env: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		t.Fatalf("expected producer output, got none")
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ContextID != "pid-4242" {
+		t.Fatalf("context_id=%q", execEv.Exec.Execution.ContextID)
+	}
+	if !strings.Contains(execEv.Exec.Execution.ExecID, "4242") {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
 }
 

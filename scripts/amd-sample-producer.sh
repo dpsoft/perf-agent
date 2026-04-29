@@ -29,6 +29,7 @@ DEVICE_ID="gfx1103:0"
 DEVICE_NAME="AMD Radeon 780M Graphics"
 QUEUE_ID="compute:0"
 SLEEP_BEFORE_MS="250"
+HIP_PID="${PERF_AGENT_HIP_PID:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,10 +72,15 @@ sample1_ns="$((start_ns + 30000000))"
 sample2_ns="$((start_ns + 90000000))"
 end_ns="$((start_ns + 140000000))"
 
+context_id="ctx0"
 exec_corr="dispatch:${start_ns}"
+if [[ -n "${HIP_PID}" ]]; then
+    context_id="pid-${HIP_PID}"
+    exec_corr="dispatch:${HIP_PID}:${start_ns}"
+fi
 sample1_corr="sample:${sample1_ns}"
 sample2_corr="sample:${sample2_ns}"
 
-printf '%s\n' "{\"kind\":\"exec\",\"execution\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"queue_id\":\"${QUEUE_ID}\",\"context_id\":\"ctx0\",\"exec_id\":\"${exec_corr}\"},\"correlation\":{\"backend\":\"amdsample\",\"value\":\"${exec_corr}\"},\"queue\":{\"backend\":\"amdsample\",\"device\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"name\":\"${DEVICE_NAME}\"},\"queue_id\":\"${QUEUE_ID}\"},\"kernel_name\":\"${KERNEL_NAME}\",\"start_ns\":${start_ns},\"end_ns\":${end_ns}}"
+printf '%s\n' "{\"kind\":\"exec\",\"execution\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"queue_id\":\"${QUEUE_ID}\",\"context_id\":\"${context_id}\",\"exec_id\":\"${exec_corr}\"},\"correlation\":{\"backend\":\"amdsample\",\"value\":\"${exec_corr}\"},\"queue\":{\"backend\":\"amdsample\",\"device\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"name\":\"${DEVICE_NAME}\"},\"queue_id\":\"${QUEUE_ID}\"},\"kernel_name\":\"${KERNEL_NAME}\",\"start_ns\":${start_ns},\"end_ns\":${end_ns}}"
 printf '%s\n' "{\"kind\":\"sample\",\"correlation\":{\"backend\":\"amdsample\",\"value\":\"${sample1_corr}\"},\"device\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"name\":\"${DEVICE_NAME}\"},\"time_ns\":${sample1_ns},\"kernel_name\":\"${KERNEL_NAME}\",\"stall_reason\":\"memory_wait\",\"weight\":11}"
 printf '%s\n' "{\"kind\":\"sample\",\"correlation\":{\"backend\":\"amdsample\",\"value\":\"${sample2_corr}\"},\"device\":{\"backend\":\"amdsample\",\"device_id\":\"${DEVICE_ID}\",\"name\":\"${DEVICE_NAME}\"},\"time_ns\":${sample2_ns},\"kernel_name\":\"${KERNEL_NAME}\",\"stall_reason\":\"wave_barrier\",\"weight\":5}"

@@ -178,8 +178,19 @@ else
     exit 1
 fi
 
+declare -a PRODUCER_CMD=(
+    env
+    "PERF_AGENT_HIP_PID=${SUDO_CMD[13]}"
+    "PERF_AGENT_HIP_LIBRARY=${HIP_LIBRARY}"
+    "PERF_AGENT_HIP_SYMBOL=${HIP_SYMBOL}"
+    "PERF_AGENT_GPU_DURATION=${DURATION}"
+    bash
+    -lc
+    "${SAMPLE_COMMAND}"
+)
+
 if [[ "${DRY_RUN}" == "1" ]]; then
-    printf '%s | %s\n' "$(quote_cmd bash -lc "${SAMPLE_COMMAND}")" "$(quote_cmd "${SUDO_CMD[@]}")"
+    printf '%s | %s\n' "$(quote_cmd "${PRODUCER_CMD[@]}")" "$(quote_cmd "${SUDO_CMD[@]}")"
     exit 0
 fi
 
@@ -192,8 +203,8 @@ set +e
     cd "${REPO_ROOT}"
     : >"${WRAPPER_LOG_PATH}"
     printf 'wrapper command: ' >>"${WRAPPER_LOG_PATH}"
-    printf '%s | %s\n' "$(quote_cmd bash -lc "${SAMPLE_COMMAND}")" "$(quote_cmd "${SUDO_CMD[@]}")" >>"${WRAPPER_LOG_PATH}"
-    bash -lc "${SAMPLE_COMMAND}" 2>>"${WRAPPER_LOG_PATH}" | "${SUDO_CMD[@]}" >>"${WRAPPER_LOG_PATH}" 2>&1
+    printf '%s | %s\n' "$(quote_cmd "${PRODUCER_CMD[@]}")" "$(quote_cmd "${SUDO_CMD[@]}")" >>"${WRAPPER_LOG_PATH}"
+    "${PRODUCER_CMD[@]}" 2>>"${WRAPPER_LOG_PATH}" | "${SUDO_CMD[@]}" >>"${WRAPPER_LOG_PATH}" 2>&1
 )
 wrapper_status=$?
 set -e

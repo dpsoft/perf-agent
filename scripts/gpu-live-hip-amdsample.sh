@@ -196,8 +196,6 @@ if [[ -n "${PID}" ]]; then
 elif [[ "${DRY_RUN}" == "1" ]]; then
     echo "dry-run placeholder: pass --pid <live-hip-process-pid> for a real run"
     SUDO_CMD[13]="<pid>"
-    printf '%s | %s\n' "$(quote_cmd bash -lc "${SAMPLE_COMMAND}")" "$(quote_cmd "${SUDO_CMD[@]}")"
-    exit 0
 else
     echo "live runs require --pid for an existing HIP process" >&2
     exit 1

@@ -1268,6 +1268,67 @@ func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithoutPIDShowsProducerContract(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run without pid: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"dry-run placeholder: pass --pid <live-hip-process-pid> for a real run",
+		"PERF_AGENT_HIP_PID=<pid>",
+		"PERF_AGENT_HIP_LIBRARY=/opt/rocm/lib/libamdhip64.so",
+		"PERF_AGENT_HIP_SYMBOL=hipLaunchKernel",
+		"PERF_AGENT_GPU_DURATION=2s",
+		"PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel",
+		"bash -lc bash\\ scripts/amd-sample-adapter.sh |",
+		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
+		"--pid \\<pid\\>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperDryRunWithoutPIDShowsCollectorPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-collector-path",
+		"/opt/rocm/bin/amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run without pid collector path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"PERF_AGENT_HIP_PID=<pid>",
+		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=/opt/rocm/bin/amd-sample-collector",
+		"bash -lc bash\\ scripts/amd-sample-adapter.sh |",
+		"--pid \\<pid\\>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPLinuxDRMWrapperRejectsMissingPID(t *testing.T) {
 	fakeDir := t.TempDir()
 	fakeHipLib := filepath.Join(fakeDir, "libamdhip64.so")

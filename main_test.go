@@ -2434,12 +2434,26 @@ func TestAMDSampleCollectorBinaryRejectsUnsupportedRealSource(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
 
-	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "madeup-source")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected unsupported real source failure, got success:\n%s", out)
 	}
 	if !strings.Contains(string(out), "unsupported amd sample real source") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsUnimplementedRocprofv2RealSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected unimplemented rocprofv2 failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "amd sample real source rocprofv2 is not implemented") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }

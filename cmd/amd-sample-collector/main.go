@@ -316,6 +316,8 @@ func runReal(cfg collectorConfig) error {
 	switch cfg.realSource {
 	case "", defaultRealSource:
 		// supported below
+	case "rocprofv2":
+		return fmt.Errorf("amd sample real source rocprofv2 is not implemented")
 	default:
 		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
 	}

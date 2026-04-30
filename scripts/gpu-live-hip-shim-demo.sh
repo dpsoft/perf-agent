@@ -179,10 +179,6 @@ if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
     exit 1
 fi
-if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" && -z "${SAMPLE_COLLECTOR_PATH}" && -z "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
-    SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
-fi
-
 SOURCE_PATH="${SCRIPT_DIR}/hip-launch-shim.c"
 LOG_PATH="${OUTDIR}/hip_launch_shim.log"
 WRAPPER_LOG_PATH="${OUTDIR}/gpu_live_wrapper.log"

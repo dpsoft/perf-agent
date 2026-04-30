@@ -1663,11 +1663,13 @@ func TestGPULiveHIPShimDemoDryRunForAMDSample(t *testing.T) {
 	got := string(out)
 	for _, want := range []string{
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
-		"--sample-command bash\\ scripts/amd-sample-adapter.sh",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "--sample-command") {
+		t.Fatalf("default amdsample dry-run should rely on wrapper default producer:\n%s", got)
 	}
 }
 

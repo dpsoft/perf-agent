@@ -937,7 +937,7 @@ func runRocprofilerSDKReal(cfg collectorConfig) error {
 			os.Getenv("PERF_AGENT_ROCPROFILER_SDK_OUTPUT_DIR") != "" {
 			return fmt.Errorf("rocprofiler-sdk native mode cannot use external command/path/output options")
 		}
-		return fmt.Errorf("rocprofiler-sdk native mode is not implemented")
+		return runRocprofilerSDKNative(cfg)
 	default:
 		return fmt.Errorf("unsupported rocprofiler-sdk mode: %s", cfg.rocprofilerSDKMode)
 	}

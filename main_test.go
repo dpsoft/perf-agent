@@ -4348,19 +4348,20 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
 func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	libraryPath := buildDummySharedLibrary(t, tmpDir)
 
 	cmd := exec.Command(
 		binaryPath,
 		"--mode", "real",
 		"--real-source", "rocprofiler-sdk",
 		"--rocprofiler-sdk-mode", "native",
-		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
+		"--rocprofiler-sdk-library", libraryPath,
 	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected native mode failure, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "rocprofiler-sdk native mode is not implemented") {
+	if !strings.Contains(string(out), "rocprofiler-sdk native collector loaded library but capture is not implemented") {
 		t.Fatalf("unexpected native mode error:\n%s", out)
 	}
 }
@@ -4384,16 +4385,38 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithoutLibrary(t
 	}
 }
 
-func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithExternalCommand(t *testing.T) {
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithMissingLibraryFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	missingLibrary := filepath.Join(tmpDir, "librocprofiler-sdk.so")
 
 	cmd := exec.Command(
 		binaryPath,
 		"--mode", "real",
 		"--real-source", "rocprofiler-sdk",
 		"--rocprofiler-sdk-mode", "native",
-		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
+		"--rocprofiler-sdk-library", missingLibrary,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing native library file failure:\n%s", out)
+	}
+	if !strings.Contains(string(out), "load rocprofiler-sdk native library") {
+		t.Fatalf("unexpected missing native library file error:\n%s", out)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithExternalCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	libraryPath := buildDummySharedLibrary(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", libraryPath,
 	)
 	cmd.Env = append(
 		os.Environ(),
@@ -5293,6 +5316,29 @@ func buildAMDSampleCollector(t *testing.T, dir string) string {
 		t.Fatalf("build amd sample collector: %v\n%s", err, buildOut)
 	}
 	return binaryPath
+}
+
+func buildDummySharedLibrary(t *testing.T, dir string) string {
+	t.Helper()
+
+	sourcePath := filepath.Join(dir, "dummy.c")
+	if err := os.WriteFile(sourcePath, []byte("int perf_agent_dummy_symbol(void) { return 7; }\n"), 0o644); err != nil {
+		t.Fatalf("write dummy shared library source: %v", err)
+	}
+	libraryPath := filepath.Join(dir, "libdummy.so")
+	buildCmd := exec.Command(
+		"cc",
+		"-shared",
+		"-fPIC",
+		sourcePath,
+		"-o",
+		libraryPath,
+	)
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build dummy shared library: %v\n%s", err, buildOut)
+	}
+	return libraryPath
 }
 
 func requireBPFCapsForRootTest(t *testing.T) {

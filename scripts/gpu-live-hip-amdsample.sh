@@ -168,6 +168,10 @@ if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
     exit 1
 fi
+if [[ "${DRY_RUN}" != "1" && -n "${SAMPLE_COLLECTOR_PATH}" && ! -x "${SAMPLE_COLLECTOR_PATH}" ]]; then
+    echo "sample collector path is not executable: ${SAMPLE_COLLECTOR_PATH}" >&2
+    exit 1
+fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
     SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi

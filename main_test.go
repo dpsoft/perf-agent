@@ -1339,6 +1339,50 @@ func TestGPULiveHIPAMDSampleWrapperRejectsCollectorPathWithCollectorCommand(t *t
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperRejectsMissingCollectorPathBeforeSudo(t *testing.T) {
+	fakeDir := t.TempDir()
+	fakeHipLib := filepath.Join(fakeDir, "libamdhip64.so")
+	if err := os.WriteFile(fakeHipLib, []byte(""), 0o644); err != nil {
+		t.Fatalf("write fake hip library: %v", err)
+	}
+	fakeSudo := filepath.Join(fakeDir, "sudo")
+	fakeSudoScript := `#!/bin/sh
+if [ "$1" = "grep" ]; then
+  exit 0
+fi
+echo unexpected sudo >&2
+exit 42
+`
+	if err := os.WriteFile(fakeSudo, []byte(fakeSudoScript), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		strconv.Itoa(os.Getpid()),
+		"--hip-library",
+		fakeHipLib,
+		"--sample-collector-path",
+		filepath.Join(fakeDir, "missing-collector"),
+	)
+	cmd.Env = append(os.Environ(), "PATH="+fakeDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing collector path failure, got success:\n%s", out)
+	}
+	got := string(out)
+	if strings.Contains(got, "unexpected sudo") {
+		t.Fatalf("wrapper reached sudo before collector path preflight:\n%s", got)
+	}
+	if !strings.Contains(got, "sample collector path is not executable") {
+		t.Fatalf("unexpected output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunDefaultsProducer(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1827,6 +1871,24 @@ func TestGPULiveHIPShimDemoRejectsCollectorCommandWithSampleCommand(t *testing.T
 	}
 }
 
+func TestGPULiveHIPShimDemoRejectsMissingCollectorPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--linux-surface",
+		"amdsample",
+		"--sample-collector-path",
+		"/tmp/definitely-missing-amd-sample-collector",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing collector path failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "sample collector path is not executable") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestAMDSampleProducerScriptEmitsProducerNativeNDJSON(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1985,6 +2047,52 @@ func TestAMDSampleProducerScriptUsesQueueAndDeviceContext(t *testing.T) {
 	}
 }
 
+func TestAMDSampleCollectorBinaryUsesContext(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(binaryPath)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_HIP_PID=4242",
+		"PERF_AGENT_GPU_DURATION=2s",
+		"PERF_AGENT_GPU_KERNEL_NAME=collector_kernel",
+		"PERF_AGENT_GPU_DEVICE_ID=gfx942:0",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI300X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector binary: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.KernelName != "collector_kernel" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	if execEv.Exec.Execution.ContextID != "pid-4242" {
+		t.Fatalf("context_id=%q", execEv.Exec.Execution.ContextID)
+	}
+	if execEv.Exec.Execution.DeviceID != "gfx942:0" {
+		t.Fatalf("device_id=%q", execEv.Exec.Execution.DeviceID)
+	}
+	if execEv.Exec.Queue.Device.Name != "MI300X" {
+		t.Fatalf("device_name=%q", execEv.Exec.Queue.Device.Name)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
+	}
+	if got := execEv.Exec.EndNs - execEv.Exec.StartNs; got != 2_000_000_000 {
+		t.Fatalf("duration_ns=%d", got)
+	}
+}
+
 func TestAMDSampleAdapterScriptFallsBackToProducerWithKernelContext(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -2012,6 +2120,49 @@ func TestAMDSampleAdapterScriptFallsBackToProducerWithKernelContext(t *testing.T
 	}
 	if got := execEv.Exec.EndNs - execEv.Exec.StartNs; got != 2_000_000_000 {
 		t.Fatalf("duration_ns=%d", got)
+	}
+}
+
+func TestAMDSampleAdapterScriptExecsCollectorPathBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	collector := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH="+collector,
+		"PERF_AGENT_HIP_PID=4242",
+		"PERF_AGENT_GPU_KERNEL_NAME=collector_kernel",
+		"PERF_AGENT_GPU_DEVICE_ID=gfx942:0",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI300X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter collector path binary: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.KernelName != "collector_kernel" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	if execEv.Exec.Execution.DeviceID != "gfx942:0" {
+		t.Fatalf("device_id=%q", execEv.Exec.Execution.DeviceID)
+	}
+	if execEv.Exec.Queue.Device.Name != "MI300X" {
+		t.Fatalf("device_name=%q", execEv.Exec.Queue.Device.Name)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
 	}
 }
 
@@ -2171,6 +2322,24 @@ func buildHIPLaunchShim(t *testing.T, dir string) string {
 	buildOut, err := buildCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build hip shim: %v\n%s", err, buildOut)
+	}
+	return binaryPath
+}
+
+func buildAMDSampleCollector(t *testing.T, dir string) string {
+	t.Helper()
+
+	binaryPath := filepath.Join(dir, "amd-sample-collector")
+	buildCmd := exec.Command(
+		"go",
+		"build",
+		"-o",
+		binaryPath,
+		"./cmd/amd-sample-collector",
+	)
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build amd sample collector: %v\n%s", err, buildOut)
 	}
 	return binaryPath
 }

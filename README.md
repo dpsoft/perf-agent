@@ -354,6 +354,18 @@ adapter script automatically. The adapter can then:
 - run `PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND`
 - or fall back to the checked-in synthetic producer
 
+There is now a checked-in collector executable you can build and pass through
+`--sample-collector-path`:
+
+```bash
+go build -o /tmp/amd-sample-collector ./cmd/amd-sample-collector
+
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-collector-path /tmp/amd-sample-collector
+```
+
 If the live target kernel name is known, pass it explicitly so the producer /
 collector contract does not stay tied to the local shim default:
 
@@ -429,6 +441,10 @@ bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
 The checked-in adapter defaults to the synthetic producer and emits producer-native `amdsample` execution/sample NDJSON with boot-relative
 timestamps, which is a closer stand-in for a real live producer than replaying a
 static checked-in file.
+
+The checked-in Go collector binary emits the same live-shaped NDJSON contract as
+the shell producer, but through the real `--sample-collector-path` executable
+hook rather than a shell command string.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

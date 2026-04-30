@@ -179,6 +179,10 @@ if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
     exit 1
 fi
+if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && -n "${SAMPLE_COLLECTOR_PATH}" && ! -x "${SAMPLE_COLLECTOR_PATH}" ]]; then
+    echo "sample collector path is not executable: ${SAMPLE_COLLECTOR_PATH}" >&2
+    exit 1
+fi
 SOURCE_PATH="${SCRIPT_DIR}/hip-launch-shim.c"
 LOG_PATH="${OUTDIR}/hip_launch_shim.log"
 WRAPPER_LOG_PATH="${OUTDIR}/gpu_live_wrapper.log"

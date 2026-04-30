@@ -956,6 +956,88 @@ func TestGPULiveHIPAMDSampleWrapperSmoke(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperSmokeWithRocprofv2RealSource(t *testing.T) {
+	requireBPFCapsForRootTest(t)
+
+	hipLib, err := firstHIPLibraryPath()
+	if err != nil {
+		t.Skipf("no HIP library path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	binaryPath := buildHIPLaunchShim(t, t.TempDir())
+	shimLogPath := filepath.Join(t.TempDir(), "hip-shim.log")
+	shimCmd := exec.CommandContext(ctx, binaryPath)
+	shimLog, err := os.Create(shimLogPath)
+	if err != nil {
+		t.Fatalf("create shim log: %v", err)
+	}
+	defer shimLog.Close()
+	shimCmd.Stdout = shimLog
+	shimCmd.Stderr = shimLog
+	shimCmd.Env = append(os.Environ(),
+		"HIP_LAUNCH_SHIM_LIBRARY="+hipLib,
+		"HIP_LAUNCH_SHIM_SLEEP_BEFORE_MS=10000",
+		"HIP_LAUNCH_SHIM_SLEEP_AFTER_MS=60000",
+	)
+	if err := shimCmd.Start(); err != nil {
+		t.Fatalf("start hip shim: %v", err)
+	}
+	defer func() {
+		if shimCmd.ProcessState == nil || !shimCmd.ProcessState.Exited() {
+			_ = shimCmd.Process.Kill()
+			_, _ = shimCmd.Process.Wait()
+		}
+	}()
+
+	outDir := t.TempDir()
+	cmd := exec.CommandContext(
+		ctx,
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--outdir",
+		outDir,
+		"--pid",
+		strconv.Itoa(shimCmd.Process.Pid),
+		"--hip-library",
+		hipLib,
+		"--sample-mode",
+		"real",
+		"--real-source",
+		"rocprofv2",
+		"--rocprofv2-path",
+		filepath.Join(".", "scripts", "emit-rocprofv2-rich-fixture.sh"),
+		"--duration",
+		"2s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("live amd sample wrapper rocprofv2 smoke: %v\n%s", err, out)
+	}
+
+	foldedPath := filepath.Join(outDir, "live_hip_amdsample.folded")
+	folded, err := os.ReadFile(foldedPath)
+	if err != nil {
+		t.Fatalf("read folded: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"train_step",
+		"hipLaunchKernel",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+		"[gpu:function:flash_attn_epilogue]",
+		"[gpu:source:flash_attn_epilogue.hip:91]",
+		"[gpu:pc:0xdef]",
+	} {
+		if !strings.Contains(string(folded), want) {
+			t.Fatalf("missing %q in folded output:\n%s", want, folded)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptHostExecReportsJoinInspection(t *testing.T) {
 	outDir := t.TempDir()
 	cmd := exec.Command(

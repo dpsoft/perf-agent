@@ -37,7 +37,7 @@ func translateAt(procRoot string, pid int) (int, error) {
 		}
 		fields := strings.Fields(strings.TrimPrefix(line, "NSpid:"))
 		if len(fields) == 0 {
-			break
+			return 0, errors.New("nspid: NSpid: line has no fields (malformed /proc status)")
 		}
 		host, perr := strconv.Atoi(fields[0])
 		if perr != nil {

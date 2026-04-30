@@ -4366,6 +4366,34 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
 	}
 }
 
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithRealLibrary(t *testing.T) {
+	libraryPath := os.Getenv("PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY")
+	if libraryPath == "" {
+		t.Skip("set PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY to exercise the native seam with a real rocprofiler-sdk build")
+	}
+	if _, err := os.Stat(libraryPath); err != nil {
+		t.Skipf("real rocprofiler-sdk library unavailable: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", libraryPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected native mode failure with real library, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk native collector loaded library but capture is not implemented") {
+		t.Fatalf("unexpected native mode error with real library:\n%s", out)
+	}
+}
+
 func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithoutLibrary(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)

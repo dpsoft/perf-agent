@@ -169,6 +169,11 @@ type rocprofilerSDKRecord struct {
 	} `json:"stall"`
 }
 
+type rocprofilerSDKEnvelope struct {
+	Records []rocprofilerSDKRecord `json:"records"`
+	Events  []rocprofilerSDKRecord `json:"events"`
+}
+
 func (r rocprofV2Record) dispatchCorrelation() string {
 	if r.DispatchID != "" {
 		return r.DispatchID
@@ -930,17 +935,12 @@ func runRocprofilerSDKReal() error {
 	defaultDeviceName := envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName)
 	defaultQueue := envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID)
 
-	scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var record rocprofilerSDKRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			return fmt.Errorf("decode rocprofiler-sdk source line: %w", err)
-		}
+	records, err := decodeRocprofilerSDKRecords(sourceBytes)
+	if err != nil {
+		return err
+	}
 
+	for _, record := range records {
 		deviceID := record.resolvedDeviceID(defaultDeviceID)
 		deviceName := record.resolvedDeviceName(defaultDeviceName)
 		queueID := record.resolvedQueueID(defaultQueue)
@@ -1011,10 +1011,55 @@ func runRocprofilerSDKReal() error {
 			return fmt.Errorf("unsupported rocprofiler-sdk record kind: %s", record.Kind)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan rocprofiler-sdk source output: %w", err)
-	}
 	return nil
+}
+
+func decodeRocprofilerSDKRecords(sourceBytes []byte) ([]rocprofilerSDKRecord, error) {
+	trimmed := bytes.TrimSpace(sourceBytes)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+
+	switch trimmed[0] {
+	case '[':
+		var records []rocprofilerSDKRecord
+		if err := json.Unmarshal(trimmed, &records); err != nil {
+			return nil, fmt.Errorf("decode rocprofiler-sdk source array: %w", err)
+		}
+		return records, nil
+	case '{':
+		var envelope rocprofilerSDKEnvelope
+		if err := json.Unmarshal(trimmed, &envelope); err == nil {
+			if len(envelope.Records) > 0 {
+				return envelope.Records, nil
+			}
+			if len(envelope.Events) > 0 {
+				return envelope.Events, nil
+			}
+		}
+		var record rocprofilerSDKRecord
+		if err := json.Unmarshal(trimmed, &record); err == nil && record.Kind != "" {
+			return []rocprofilerSDKRecord{record}, nil
+		}
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
+	records := make([]rocprofilerSDKRecord, 0)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record rocprofilerSDKRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			return nil, fmt.Errorf("decode rocprofiler-sdk source line: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan rocprofiler-sdk source output: %w", err)
+	}
+	return records, nil
 }
 
 func main() {

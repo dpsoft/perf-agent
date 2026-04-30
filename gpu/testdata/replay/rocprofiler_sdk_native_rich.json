@@ -1,0 +1,36 @@
+{
+  "events": [
+    {
+      "kind": "dispatch",
+      "dispatch_id": "sdk-dispatch-1",
+      "start_ns": 120,
+      "end_ns": 260,
+      "kernel_name": "hip_launch_shim_kernel",
+      "device_id": "gfx1103:0",
+      "device_name": "AMD Radeon 780M Graphics",
+      "queue_id": "compute:0"
+    },
+    {
+      "kind": "sample",
+      "dispatch_id": "sdk-dispatch-1",
+      "timestamp_ns": 150,
+      "stall_reason": "memory_wait",
+      "weight": 11,
+      "pc": "0xabc",
+      "function": "flash_attn_fwd",
+      "file": "flash_attn.hip",
+      "line": 77
+    },
+    {
+      "kind": "sample",
+      "dispatch_id": "sdk-dispatch-1",
+      "timestamp_ns": 210,
+      "stall_reason": "wave_barrier",
+      "weight": 5,
+      "pc": "0xdef",
+      "function": "flash_attn_epilogue",
+      "file": "flash_attn_epilogue.hip",
+      "line": 91
+    }
+  ]
+}

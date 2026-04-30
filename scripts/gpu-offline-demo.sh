@@ -18,6 +18,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv3-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-rich <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-recorder-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-output-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
@@ -35,6 +36,7 @@ Modes:
   hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv3-command-rich checked-in host->rocprofv3-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-rich checked-in preferred host->rocprofiler-sdk->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofiler-sdk-recorder-rich checked-in host->rocprofiler-sdk-recorder->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-command-rich checked-in host->rocprofiler-sdk-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-output-rich checked-in host->rocprofiler-sdk-output-file->collector->AMD sample path with richer function/source/pc frames
   host-driver       checked-in host->driver replay
@@ -220,6 +222,16 @@ case "${MODE}" in
         AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH"
         AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofiler_sdk_native_rich.ndjson"
         NAME="rocprofiler_sdk_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
+    hip-rocprofiler-sdk-recorder-rich)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        AMD_SAMPLE_SOURCE_COMMAND='cat gpu/testdata/replay/rocprofiler_sdk_native_rich.json > "$PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH"'
+        AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofiler-sdk"
+        AMD_SAMPLE_SOURCE_COMMAND_ENV="PERF_AGENT_ROCPROFILER_SDK_COMMAND"
+        AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH"
+        AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofiler_sdk_native_rich.json"
+        NAME="rocprofiler_sdk_recorder_sample_exec_rich"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
     hip-rocprofiler-sdk-command-rich)

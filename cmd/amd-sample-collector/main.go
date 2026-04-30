@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +19,7 @@ const (
 	defaultDeviceName = "AMD Radeon 780M Graphics"
 	defaultQueueID    = "compute:0"
 	defaultMode       = "synthetic"
+	defaultROCMSMI    = "rocm-smi"
 )
 
 type correlation struct {
@@ -63,6 +67,22 @@ type sampleRecord struct {
 	SampleWeight int         `json:"weight"`
 }
 
+type collectorConfig struct {
+	mode          string
+	kernelName    string
+	deviceID      string
+	deviceName    string
+	queueID       string
+	sleepBeforeMS int
+}
+
+type rocmSMIMetrics struct {
+	deviceID   string
+	deviceName string
+	gpuUse     int
+	powerWatts int
+}
+
 func envOrDefault(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -104,37 +124,15 @@ func writeJSONLine(value any) error {
 	return nil
 }
 
-func main() {
-	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
-	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
-	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
-	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
-	queueID := flag.String("queue-id", envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID), "queue id to emit")
-	sleepBeforeMS := flag.Int("sleep-before-ms", 250, "sleep before emitting samples, in milliseconds")
-	flag.Parse()
-
-	switch *mode {
-	case "synthetic":
-	case "real":
-		fmt.Fprintln(os.Stderr, "real amd sample collection is not implemented")
-		os.Exit(1)
-	default:
-		fmt.Fprintf(os.Stderr, "unsupported amd sample mode: %s\n", *mode)
-		os.Exit(1)
-	}
-
-	sleepBefore(*sleepBeforeMS)
-
+func collectionWindow() (int64, int64, int64, int64, error) {
 	startNS, err := bootTimeNS()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "boot time: %v\n", err)
-		os.Exit(1)
+		return 0, 0, 0, 0, err
 	}
 
 	duration, err := time.ParseDuration(envOrDefault("PERF_AGENT_GPU_DURATION", "140ms"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unsupported PERF_AGENT_GPU_DURATION: %v\n", err)
-		os.Exit(1)
+		return 0, 0, 0, 0, err
 	}
 	durationNS := duration.Nanoseconds()
 	sample1OffsetNS := durationNS / 4
@@ -154,9 +152,74 @@ func main() {
 		durationNS = 3
 	}
 
-	sample1NS := startNS + sample1OffsetNS
-	sample2NS := startNS + sample2OffsetNS
-	endNS := startNS + durationNS
+	return startNS, startNS + sample1OffsetNS, startNS + sample2OffsetNS, startNS + durationNS, nil
+}
+
+func queryROCMSMI(path string) (rocmSMIMetrics, error) {
+	cmd := exec.Command(path, "--showuse", "--showpower", "--showid", "--showproductname", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return rocmSMIMetrics{}, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return rocmSMIMetrics{}, err
+	}
+
+	var cards map[string]map[string]string
+	if err := json.Unmarshal(out, &cards); err != nil {
+		return rocmSMIMetrics{}, err
+	}
+	if len(cards) == 0 {
+		return rocmSMIMetrics{}, fmt.Errorf("no devices in rocm-smi output")
+	}
+
+	cardKeys := make([]string, 0, len(cards))
+	for key := range cards {
+		cardKeys = append(cardKeys, key)
+	}
+	sort.Strings(cardKeys)
+	cardKey := cardKeys[0]
+	card := cards[cardKey]
+
+	metrics := rocmSMIMetrics{
+		deviceName: strings.TrimSpace(card["Device Name"]),
+	}
+	if metrics.deviceName == "" || strings.EqualFold(metrics.deviceName, "N/A") {
+		metrics.deviceName = ""
+	}
+
+	if gfxVersion := strings.TrimSpace(card["GFX Version"]); gfxVersion != "" {
+		cardIndex := strings.TrimPrefix(cardKey, "card")
+		if cardIndex == cardKey {
+			cardIndex = "0"
+		}
+		metrics.deviceID = fmt.Sprintf("%s:%s", gfxVersion, cardIndex)
+	}
+
+	if gpuUse := strings.TrimSpace(card["GPU use (%)"]); gpuUse != "" {
+		value, err := strconv.Atoi(gpuUse)
+		if err != nil {
+			return rocmSMIMetrics{}, fmt.Errorf("parse GPU use (%%): %w", err)
+		}
+		metrics.gpuUse = value
+	}
+
+	if power := strings.TrimSpace(card["Current Socket Graphics Package Power (W)"]); power != "" {
+		value, err := strconv.ParseFloat(power, 64)
+		if err != nil {
+			return rocmSMIMetrics{}, fmt.Errorf("parse power: %w", err)
+		}
+		metrics.powerWatts = int(math.Round(value))
+	}
+
+	return metrics, nil
+}
+
+func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, sample2Reason string, sample2Weight int) error {
+	startNS, sample1NS, sample2NS, endNS, err := collectionWindow()
+	if err != nil {
+		return err
+	}
 
 	contextID := "ctx0"
 	execID := fmt.Sprintf("dispatch:%d", startNS)
@@ -169,32 +232,31 @@ func main() {
 
 	dev := device{
 		Backend:  "amdsample",
-		DeviceID: *deviceID,
-		Name:     *deviceName,
+		DeviceID: cfg.deviceID,
+		Name:     cfg.deviceName,
 	}
 	q := queue{
 		Backend: "amdsample",
 		Device:  dev,
-		QueueID: *queueID,
+		QueueID: cfg.queueID,
 	}
 
 	if err := writeJSONLine(execRecord{
 		Kind: "exec",
 		Execution: execution{
 			Backend:   "amdsample",
-			DeviceID:  *deviceID,
-			QueueID:   *queueID,
+			DeviceID:  cfg.deviceID,
+			QueueID:   cfg.queueID,
 			ContextID: contextID,
 			ExecID:    execID,
 		},
 		Correlation: correlation{Backend: "amdsample", Value: execID},
 		Queue:       q,
-		KernelName:  *kernelName,
+		KernelName:  cfg.kernelName,
 		StartNS:     startNS,
 		EndNS:       endNS,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "write exec record: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("write exec record: %w", err)
 	}
 
 	if err := writeJSONLine(sampleRecord{
@@ -202,12 +264,11 @@ func main() {
 		Correlation:  correlation{Backend: "amdsample", Value: sample1ID},
 		Device:       dev,
 		TimeNS:       sample1NS,
-		KernelName:   *kernelName,
-		StallReason:  "memory_wait",
-		SampleWeight: 11,
+		KernelName:   cfg.kernelName,
+		StallReason:  sample1Reason,
+		SampleWeight: sample1Weight,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "write sample record: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("write sample record: %w", err)
 	}
 
 	if err := writeJSONLine(sampleRecord{
@@ -215,11 +276,69 @@ func main() {
 		Correlation:  correlation{Backend: "amdsample", Value: sample2ID},
 		Device:       dev,
 		TimeNS:       sample2NS,
-		KernelName:   *kernelName,
-		StallReason:  "wave_barrier",
-		SampleWeight: 5,
+		KernelName:   cfg.kernelName,
+		StallReason:  sample2Reason,
+		SampleWeight: sample2Weight,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "write sample record: %v\n", err)
+		return fmt.Errorf("write sample record: %w", err)
+	}
+
+	return nil
+}
+
+func runSynthetic(cfg collectorConfig) error {
+	return emitRecords(cfg, "memory_wait", 11, "wave_barrier", 5)
+}
+
+func runReal(cfg collectorConfig) error {
+	metrics, err := queryROCMSMI(envOrDefault("PERF_AGENT_ROCM_SMI_PATH", defaultROCMSMI))
+	if err != nil {
+		return fmt.Errorf("rocm-smi query failed: %w", err)
+	}
+
+	if cfg.deviceID == defaultDeviceID && metrics.deviceID != "" {
+		cfg.deviceID = metrics.deviceID
+	}
+	if cfg.deviceName == defaultDeviceName && metrics.deviceName != "" {
+		cfg.deviceName = metrics.deviceName
+	}
+
+	return emitRecords(cfg, "hardware_gpu_use", metrics.gpuUse, "hardware_socket_power_watts", metrics.powerWatts)
+}
+
+func main() {
+	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
+	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
+	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
+	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
+	queueID := flag.String("queue-id", envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID), "queue id to emit")
+	sleepBeforeMS := flag.Int("sleep-before-ms", 250, "sleep before emitting samples, in milliseconds")
+	flag.Parse()
+
+	cfg := collectorConfig{
+		mode:          *mode,
+		kernelName:    *kernelName,
+		deviceID:      *deviceID,
+		deviceName:    *deviceName,
+		queueID:       *queueID,
+		sleepBeforeMS: *sleepBeforeMS,
+	}
+
+	sleepBefore(cfg.sleepBeforeMS)
+
+	var err error
+	switch cfg.mode {
+	case "synthetic":
+		err = runSynthetic(cfg)
+	case "real":
+		err = runReal(cfg)
+	default:
+		fmt.Fprintf(os.Stderr, "unsupported amd sample mode: %s\n", cfg.mode)
+		os.Exit(1)
+	}
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

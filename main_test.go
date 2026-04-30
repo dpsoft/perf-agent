@@ -1491,7 +1491,7 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithoutPIDShowsCollectorPath(t *testing
 	}
 	got := string(out)
 	for _, want := range []string{
-		"PERF_AGENT_HIP_PID=<pid>",
+		"PERF_AGENT_HIP_PID=\\<pid\\>",
 		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=/opt/rocm/bin/amd-sample-collector",
 		"bash -lc bash\\ scripts/amd-sample-adapter.sh |",
 		"--pid \\<pid\\>",
@@ -2142,16 +2142,92 @@ func TestAMDSampleCollectorBinaryUsesContext(t *testing.T) {
 	}
 }
 
-func TestAMDSampleCollectorBinaryRejectsRealMode(t *testing.T) {
+func TestAMDSampleCollectorBinaryRealModeUsesROCMSMI(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocmSMIPath := filepath.Join(tmpDir, "rocm-smi")
+	rocmSMIScript := `#!/bin/sh
+printf '%s\n' 'libdrm warning' >&2
+printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","GFX Version":"gfx942"}}'
+`
+	if err := os.WriteFile(rocmSMIPath, []byte(rocmSMIScript), 0o755); err != nil {
+		t.Fatalf("write fake rocm-smi: %v", err)
+	}
 
 	cmd := exec.Command(binaryPath, "--mode", "real")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_HIP_PID=4242",
+		"PERF_AGENT_GPU_DURATION=2s",
+		"PERF_AGENT_GPU_KERNEL_NAME=collector_kernel",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+		"PERF_AGENT_ROCM_SMI_PATH="+rocmSMIPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector real mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if execEv.Exec.KernelName != "collector_kernel" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	if execEv.Exec.Execution.ContextID != "pid-4242" {
+		t.Fatalf("context_id=%q", execEv.Exec.Execution.ContextID)
+	}
+	if execEv.Exec.Execution.DeviceID != "gfx942:1" {
+		t.Fatalf("device_id=%q", execEv.Exec.Execution.DeviceID)
+	}
+	if execEv.Exec.Queue.Device.Name != "MI300X" {
+		t.Fatalf("device_name=%q", execEv.Exec.Queue.Device.Name)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
+	}
+	if sample1.Sample.StallReason != "hardware_gpu_use" || sample1.Sample.Weight != 73 {
+		t.Fatalf("sample1=%+v", sample1.Sample)
+	}
+	if sample2.Sample.StallReason != "hardware_socket_power_watts" || sample2.Sample.Weight != 276 {
+		t.Fatalf("sample2=%+v", sample2.Sample)
+	}
+	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
+		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsROCMSMIFailureInRealMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocmSMIPath := filepath.Join(tmpDir, "rocm-smi")
+	rocmSMIScript := `#!/bin/sh
+echo 'boom' >&2
+exit 7
+`
+	if err := os.WriteFile(rocmSMIPath, []byte(rocmSMIScript), 0o755); err != nil {
+		t.Fatalf("write fake rocm-smi: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real")
+	cmd.Env = append(os.Environ(), "PERF_AGENT_ROCM_SMI_PATH="+rocmSMIPath)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected real mode failure, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "real amd sample collection is not implemented") {
+	if !strings.Contains(string(out), "rocm-smi query failed") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }

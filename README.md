@@ -377,8 +377,10 @@ bash scripts/gpu-live-hip-amdsample.sh \
 ```
 
 `synthetic` is still the default. `real` is now an explicit opt-in that fails
-cleanly until hardware-backed AMD sampling lands, instead of silently acting as
-if real sampling already exists.
+through a first hardware-backed path using `rocm-smi`, while keeping the same
+collector contract and output shape. It is still not true GPU PC sampling yet,
+but it no longer silently pretends that `real` mode exists without any live
+signal behind it.
 
 If the live target kernel name is known, pass it explicitly so the producer /
 collector contract does not stay tied to the local shim default:

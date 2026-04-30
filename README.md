@@ -364,6 +364,18 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --kernel-name flash_attn_fwd
 ```
 
+For synthetic or adapted producers that also need explicit queue / device
+identity, the wrapper now exposes those too:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --device-id gfx942:0 \
+  --device-name MI300X \
+  --queue-id compute:7
+```
+
 Or preview the wrapped command shape without a real PID yet:
 
 ```bash
@@ -402,6 +414,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-collector-path /opt/rocm/bin/amd-sample-collector
 ```
 

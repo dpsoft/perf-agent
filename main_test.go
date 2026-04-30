@@ -1189,6 +1189,40 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithKernelName(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithQueueAndDeviceContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--device-id",
+		"gfx942:0",
+		"--device-name",
+		"MI300X",
+		"--queue-id",
+		"compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with queue/device context: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"PERF_AGENT_GPU_DEVICE_ID=gfx942:0",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI300X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperRejectsLegacySampleCommandEnv(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1718,6 +1752,37 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleKernelName(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleQueueAndDeviceContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--device-id",
+		"gfx942:0",
+		"--device-name",
+		"MI300X",
+		"--queue-id",
+		"compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample queue/device context: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--device-id gfx942:0",
+		"--device-name MI300X",
+		"--queue-id compute:7",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoRejectsCollectorPathWithSampleCommand(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1879,6 +1944,42 @@ func TestAMDSampleProducerScriptUsesDurationContext(t *testing.T) {
 	}
 	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
 		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+}
+
+func TestAMDSampleProducerScriptUsesQueueAndDeviceContext(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-producer.sh"),
+		"--sleep-before-ms",
+		"0",
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_GPU_DEVICE_ID=gfx942:0",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI300X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample producer with queue/device env: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.DeviceID != "gfx942:0" {
+		t.Fatalf("device_id=%q", execEv.Exec.Execution.DeviceID)
+	}
+	if execEv.Exec.Queue.Device.Name != "MI300X" {
+		t.Fatalf("device_name=%q", execEv.Exec.Queue.Device.Name)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
 	}
 }
 

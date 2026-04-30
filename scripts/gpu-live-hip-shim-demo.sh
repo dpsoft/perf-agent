@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -53,6 +53,9 @@ BINARY_PATH="/tmp/gpu-hip-launch-shim"
 HIP_LIBRARY=""
 LINUX_SURFACE="drm"
 KERNEL_NAME="hip_launch_shim_kernel"
+DEVICE_ID="gfx1103:0"
+DEVICE_NAME="AMD Radeon 780M Graphics"
+QUEUE_ID="compute:0"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH=""
 SAMPLE_COLLECTOR_COMMAND=""
@@ -85,6 +88,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --kernel-name)
             KERNEL_NAME="${2:-}"
+            shift 2
+            ;;
+        --device-id)
+            DEVICE_ID="${2:-}"
+            shift 2
+            ;;
+        --device-name)
+            DEVICE_NAME="${2:-}"
+            shift 2
+            ;;
+        --queue-id)
+            QUEUE_ID="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -203,6 +218,24 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
         WRAPPER_CMD+=(
             --kernel-name
             "${KERNEL_NAME}"
+        )
+    fi
+    if [[ -n "${DEVICE_ID}" ]]; then
+        WRAPPER_CMD+=(
+            --device-id
+            "${DEVICE_ID}"
+        )
+    fi
+    if [[ -n "${DEVICE_NAME}" ]]; then
+        WRAPPER_CMD+=(
+            --device-name
+            "${DEVICE_NAME}"
+        )
+    fi
+    if [[ -n "${QUEUE_ID}" ]]; then
+        WRAPPER_CMD+=(
+            --queue-id
+            "${QUEUE_ID}"
         )
     fi
     if [[ -n "${SAMPLE_COLLECTOR_PATH}" ]]; then

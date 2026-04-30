@@ -395,6 +395,19 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
+There is now also an explicit `rocprofv2` real-source hook. Today it expects a
+collector-style executable behind that path and forwards its NDJSON output
+through the same `amdsample` contract:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofv2 \
+  --rocprofv2-path /opt/rocm/bin/rocprofv2
+```
+
 The real collector poll interval is also tunable when you want denser or
 sparser coarse hardware samples:
 
@@ -467,6 +480,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocm-smi --rocm-smi-path /opt/rocm/bin/rocm-smi
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofv2 --rocprofv2-path /opt/rocm/bin/rocprofv2
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-poll-interval 25ms
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7

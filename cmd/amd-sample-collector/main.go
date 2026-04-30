@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ const (
 	defaultMode       = "synthetic"
 	defaultRealSource = "rocm-smi"
 	defaultROCMSMI    = "rocm-smi"
+	defaultRocprofV2  = "rocprofv2"
 	maxRealSpacing    = 100 * time.Millisecond
 	maxRealPolls      = 32
 )
@@ -315,13 +317,15 @@ func runSynthetic(cfg collectorConfig) error {
 func runReal(cfg collectorConfig) error {
 	switch cfg.realSource {
 	case "", defaultRealSource:
-		// supported below
+		return runROCMSMIReal(cfg)
 	case "rocprofv2":
-		return fmt.Errorf("amd sample real source rocprofv2 is not implemented")
+		return runRocprofV2Real()
 	default:
 		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
 	}
+}
 
+func runROCMSMIReal(cfg collectorConfig) error {
 	startNS, _, _, endNS, duration, err := collectionWindow()
 	if err != nil {
 		return err
@@ -480,6 +484,26 @@ func runReal(cfg collectorConfig) error {
 		}
 	}
 
+	return nil
+}
+
+func runRocprofV2Real() error {
+	path := envOrDefault("PERF_AGENT_ROCPROFV2_PATH", defaultRocprofV2)
+	cmd := exec.Command(path)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		errText := strings.TrimSpace(stderr.String())
+		if errText != "" {
+			return fmt.Errorf("rocprofv2 source failed: %w: %s", err, errText)
+		}
+		return fmt.Errorf("rocprofv2 source failed: %w", err)
+	}
+	if _, err := os.Stdout.Write(stdout.Bytes()); err != nil {
+		return fmt.Errorf("write rocprofv2 source output: %w", err)
+	}
 	return nil
 }
 

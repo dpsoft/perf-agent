@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi>] [--rocm-smi-path <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -77,6 +77,7 @@ QUEUE_ID="${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"
 SAMPLE_MODE="${PERF_AGENT_AMD_SAMPLE_MODE:-synthetic}"
 REAL_SOURCE="${PERF_AGENT_AMD_SAMPLE_REAL_SOURCE:-rocm-smi}"
 ROCM_SMI_PATH="${PERF_AGENT_ROCM_SMI_PATH:-}"
+ROCPROFV2_PATH="${PERF_AGENT_ROCPROFV2_PATH:-}"
 REAL_POLL_INTERVAL="${PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL:-}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
@@ -131,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocm-smi-path)
             ROCM_SMI_PATH="${2:-}"
+            shift 2
+            ;;
+        --rocprofv2-path)
+            ROCPROFV2_PATH="${2:-}"
             shift 2
             ;;
         --real-poll-interval)
@@ -194,6 +199,10 @@ if [[ "${DRY_RUN}" != "1" && -n "${SAMPLE_COLLECTOR_PATH}" && ! -x "${SAMPLE_COL
 fi
 if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocm-smi" && -n "${ROCM_SMI_PATH}" && ! -x "${ROCM_SMI_PATH}" ]]; then
     echo "rocm-smi path is not executable: ${ROCM_SMI_PATH}" >&2
+    exit 1
+fi
+if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofv2" && -n "${ROCPROFV2_PATH}" && ! -x "${ROCPROFV2_PATH}" ]]; then
+    echo "rocprofv2 path is not executable: ${ROCPROFV2_PATH}" >&2
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
@@ -266,6 +275,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_AMD_SAMPLE_MODE=${SAMPLE_MODE}"
     "PERF_AGENT_AMD_SAMPLE_REAL_SOURCE=${REAL_SOURCE}"
     "PERF_AGENT_ROCM_SMI_PATH=${ROCM_SMI_PATH}"
+    "PERF_AGENT_ROCPROFV2_PATH=${ROCPROFV2_PATH}"
     "PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=${REAL_POLL_INTERVAL}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"

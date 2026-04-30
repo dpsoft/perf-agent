@@ -1235,6 +1235,34 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithROCMSMIPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2Path(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode",
+		"real",
+		"--real-source",
+		"rocprofv2",
+		"--rocprofv2-path",
+		"/opt/rocm/bin/rocprofv2",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofv2 path: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFV2_PATH=/opt/rocm/bin/rocprofv2") {
+		t.Fatalf("missing rocprofv2 path env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1956,6 +1984,37 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleROCMSMIPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2Path(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-mode",
+		"real",
+		"--real-source",
+		"rocprofv2",
+		"--rocprofv2-path",
+		"/opt/rocm/bin/rocprofv2",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofv2 path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-mode real",
+		"--real-source rocprofv2",
+		"--rocprofv2-path /opt/rocm/bin/rocprofv2",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -2444,16 +2503,93 @@ func TestAMDSampleCollectorBinaryRejectsUnsupportedRealSource(t *testing.T) {
 	}
 }
 
-func TestAMDSampleCollectorBinaryRejectsUnimplementedRocprofv2RealSource(t *testing.T) {
+func TestAMDSampleCollectorBinaryRejectsMissingRocprofv2Executable(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
 
 	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatalf("expected unimplemented rocprofv2 failure, got success:\n%s", out)
+		t.Fatalf("expected missing rocprofv2 executable failure, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "amd sample real source rocprofv2 is not implemented") {
+	if !strings.Contains(string(out), "rocprofv2 source failed") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesRocprofv2SourcePath(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
+	rocprofv2Script := `#!/bin/sh
+cat <<EOF
+{"kind":"exec","execution":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","queue_id":"${PERF_AGENT_GPU_QUEUE_ID:-compute:0}","context_id":"pid-${PERF_AGENT_HIP_PID:-0}","exec_id":"rocprofv2:dispatch:1"},"correlation":{"backend":"amdsample","value":"rocprofv2:dispatch:1"},"queue":{"backend":"amdsample","device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"queue_id":"${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"},"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","start_ns":100,"end_ns":200}
+{"kind":"sample","correlation":{"backend":"amdsample","value":"rocprofv2:sample:1"},"device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"time_ns":125,"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","stall_reason":"memory_wait","weight":11}
+{"kind":"sample","correlation":{"backend":"amdsample","value":"rocprofv2:sample:2"},"device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"time_ns":175,"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","stall_reason":"wave_barrier","weight":5}
+EOF
+`
+	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
+		t.Fatalf("write fake rocprofv2: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFV2_PATH="+rocprofv2Path,
+		"PERF_AGENT_HIP_PID=4242",
+		"PERF_AGENT_GPU_KERNEL_NAME=collector_kernel",
+		"PERF_AGENT_GPU_DEVICE_ID=gfx942:0",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI300X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector rocprofv2 mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.KernelName != "collector_kernel" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	if execEv.Exec.Execution.ContextID != "pid-4242" {
+		t.Fatalf("context_id=%q", execEv.Exec.Execution.ContextID)
+	}
+	if execEv.Exec.Execution.DeviceID != "gfx942:0" {
+		t.Fatalf("device_id=%q", execEv.Exec.Execution.DeviceID)
+	}
+	if execEv.Exec.Queue.Device.Name != "MI300X" {
+		t.Fatalf("device_name=%q", execEv.Exec.Queue.Device.Name)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRocprofv2Failure(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
+	rocprofv2Script := `#!/bin/sh
+echo 'boom' >&2
+exit 9
+`
+	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
+		t.Fatalf("write fake rocprofv2: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(os.Environ(), "PERF_AGENT_ROCPROFV2_PATH="+rocprofv2Path)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected rocprofv2 failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofv2 source failed") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }

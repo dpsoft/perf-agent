@@ -113,6 +113,10 @@ type Config struct {
 
 	// GPUFoldedOutputWriter receives folded-stack GPU flamegraph input when set.
 	GPUFoldedOutputWriter io.Writer
+
+	// InjectPython enables Python perf-trampoline injection during profiling.
+	// Only valid with EnableCPUProfile. Requires CAP_SYS_PTRACE.
+	InjectPython bool
 }
 
 // Option is a functional option for configuring the Agent.
@@ -210,6 +214,14 @@ func WithUnwind(mode string) Option {
 	return func(c *Config) {
 		c.Unwind = mode
 	}
+}
+
+// WithInjectPython enables Python perf-trampoline injection during profiling.
+// Caller must hold CAP_SYS_PTRACE. With --pid N, any per-target failure exits
+// non-zero (strict). With -a, failures are logged and the profile continues
+// (lenient). Only valid when CPU profiling is enabled.
+func WithInjectPython(enabled bool) Option {
+	return func(c *Config) { c.InjectPython = enabled }
 }
 
 // WithCPUProfileWriter enables CPU profiling and sets a writer for output.

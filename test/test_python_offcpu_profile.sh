@@ -34,7 +34,7 @@ fi
 
 echo ""
 echo "=== Running perf-agent --offcpu for 10s ==="
-PROFILE_OUTPUT="$PROFILE_OUTPUT"
+PROFILE_OUTPUT="${PROFILE_OUTPUT:-offcpu-python-test.pb.gz}"
 sudo ./perf-agent --offcpu --offcpu-output "$PROFILE_OUTPUT" --pid $PYTHON_PID --duration 10s \
     --tag test=offcpu_synthetic
 

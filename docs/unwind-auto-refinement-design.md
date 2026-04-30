@@ -1,6 +1,14 @@
 # `--unwind auto`: Runtime Cost Refinement — Design Spec
 
-> **Status:** brainstorm / not yet planned. This doc captures two refinement paths for the `--unwind auto` flag beyond the S8 MVP (which aliases `auto → dwarf`). Neither is implemented. Pick one (or neither) after benchmarking S8's eager-compile cost on real workloads.
+> **Status (2026-04-28):** Option A2 implemented and shipped.
+>
+> - `--unwind auto` now invokes lazy CFI compile (Option A2) for system-wide mode.
+> - `--unwind dwarf` retains eager-compile behavior as an explicit escape hatch.
+> - `--pid N` always uses eager mode regardless of `--unwind` value (compile cost is already negligible per bench data).
+> - Validated bench results: 76.5% p50 reduction on system-wide-mixed (78–83% on warm-cache runs).
+> - See `docs/superpowers/specs/2026-04-27-unwind-auto-lazy-a2-design.md` for the implementation spec, plan, and validation numbers.
+>
+> The original brainstorm below is preserved for context; Option A1 and Option B were considered and rejected per the data captured in the implementation spec.
 
 ## Context
 

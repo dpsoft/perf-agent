@@ -153,6 +153,33 @@ The `procmap.Resolver` sits between the walkers and pprof. It lazily reads `/pro
 
 Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
 
+### Profiling running Python processes
+
+For Python 3.12+ processes, perf-agent can activate the perf trampoline at
+profile start without restarting the target — no need for `python -X perf`:
+
+```bash
+sudo perf-agent --profile --pid $(pgrep -f myapp.py) \
+                --duration 30s --inject-python
+```
+
+The trampoline emits Python qualnames to `/tmp/perf-<PID>.map`, which
+perf-agent reads via blazesym to attach human-readable names to JIT'd
+frames. perf-agent automatically deactivates the trampoline at end of
+profile, so the per-call overhead does not persist past the profiling
+window.
+
+For system-wide injection (`-a`), perf-agent activates every detected
+Python 3.12+ process and tolerates per-process failures (e.g., processes
+built without `--enable-perf-trampoline`):
+
+```bash
+sudo perf-agent --profile -a --duration 30s --inject-python
+```
+
+Requires `CAP_SYS_PTRACE` (already in the standard cap set).
+See [docs/python-profiling.md](docs/python-profiling.md) for details.
+
 ## Output
 
 ### Output File Naming

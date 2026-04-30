@@ -26,6 +26,7 @@ type Config struct {
 	Processes   int            `json:"processes"`
 	Runs        int            `json:"runs"`
 	DropCache   bool           `json:"drop_cache"`
+	UnwindMode  string         `json:"unwind_mode,omitzero"`
 	WorkloadMix map[string]int `json:"workload_mix,omitempty"`
 }
 

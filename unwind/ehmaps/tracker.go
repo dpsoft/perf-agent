@@ -27,8 +27,9 @@ type PIDTracker struct {
 	pidMappings *ebpf.Map
 	pidMapLens  *ebpf.Map
 
-	mu     sync.Mutex
-	perPID map[uint32]*pidState
+	mu        sync.Mutex
+	perPID    map[uint32]*pidState
+	onNewExec func(pid uint32) // nil → no hook; producer skips dispatch entirely
 }
 
 type pidState struct {
@@ -45,6 +46,18 @@ func NewPIDTracker(store *TableStore, pidMappings, pidMapLengths *ebpf.Map) *PID
 		pidMapLens:  pidMapLengths,
 		perPID:      map[uint32]*pidState{},
 	}
+}
+
+// SetOnNewExec registers a hook that Run calls when it observes a new
+// group-leader fork (PERF_RECORD_FORK with pid == tid), which the kernel
+// emits for every new process created via fork/exec. Pass nil to clear the
+// hook. Must be called before Run to avoid races.
+//
+// The hook runs synchronously on Run's goroutine. When no hook is registered
+// (the default), Run performs a single nil check and skips dispatch entirely —
+// zero producer overhead when --inject-python is off.
+func (t *PIDTracker) SetOnNewExec(fn func(pid uint32)) {
+	t.onNewExec = fn
 }
 
 // Attach walks /proc/<pid>/maps for binPath, acquires CFI via the store,
@@ -74,6 +87,74 @@ func (t *PIDTracker) Attach(pid uint32, binPath string) error {
 		PID: pid, Mappings: st.mappings,
 		OuterMap: t.pidMappings, LengthMap: t.pidMapLens,
 	})
+}
+
+// EnrollWithoutCompile populates pid_mappings for binPath under pid
+// WITHOUT compiling CFI. Used by the lazy mode (Option A2) to give the
+// walker enough mapping info to classify per-frame, deferring the
+// expensive ehcompile.Compile call to the first sample miss.
+//
+// buildIDCache is shared across calls so each unique binary's build-id
+// is read exactly once across all PIDs. Caller owns the cache.
+//
+// Does NOT increment the TableStore refcount — compile-time refcounting
+// is handled by AttachCompileOnly when the drainer compiles on demand.
+func (t *PIDTracker) EnrollWithoutCompile(pid uint32, binPath string, buildIDCache map[string][]byte) error {
+	buildID, ok := buildIDCache[binPath]
+	if !ok {
+		var err error
+		buildID, err = ReadBuildID(binPath)
+		if err != nil {
+			return fmt.Errorf("build-id %s: %w", binPath, err)
+		}
+		buildIDCache[binPath] = buildID
+	}
+	tableID := TableIDForBuildID(buildID)
+
+	newMappings, err := LoadProcessMappings(int(pid), binPath, tableID)
+	if err != nil {
+		return fmt.Errorf("load mappings pid=%d: %w", pid, err)
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, exists := t.perPID[pid]
+	if !exists {
+		st = &pidState{tableIDs: map[uint64]struct{}{}}
+		t.perPID[pid] = st
+	}
+	st.mappings = append(st.mappings, newMappings...)
+	// NOTE: do NOT add tableID to st.tableIDs — no refcount taken.
+	// AttachCompileOnly will record it when the drainer compiles on demand.
+	return PopulatePIDMappings(PopulatePIDMappingsArgs{
+		PID: pid, Mappings: st.mappings,
+		OuterMap: t.pidMappings, LengthMap: t.pidMapLens,
+	})
+}
+
+// AttachCompileOnly compiles CFI for binPath and registers the tableID
+// for refcount-tracked release. Assumes pid_mappings already has an
+// entry for this binary (set by a prior EnrollWithoutCompile). Used by
+// the lazy CFI miss drainer.
+//
+// Skips LoadProcessMappings + PopulatePIDMappings — the enrolled state
+// already covers them. Calling this for a binary that was NOT enrolled
+// would leave pid_mappings empty for it; the walker would still hit
+// MAPPING_NOT_FOUND and fall through to FP-only.
+func (t *PIDTracker) AttachCompileOnly(pid uint32, binPath string) error {
+	tableID, _, err := t.store.AcquireBinary(binPath, pid)
+	if err != nil {
+		return fmt.Errorf("acquire %s: %w", binPath, err)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, ok := t.perPID[pid]
+	if !ok {
+		st = &pidState{tableIDs: map[uint64]struct{}{}}
+		t.perPID[pid] = st
+	}
+	st.tableIDs[tableID] = struct{}{}
+	return nil
 }
 
 // Detach removes the PID from the pid_mappings map and releases all
@@ -165,6 +246,12 @@ func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource, observers ...fu
 				n, err := AttachAllMappings(t, ev.PID)
 				if err != nil || n == 0 {
 					slog.Debug("ehmaps: fork Attach failed", "pid", ev.PID, "err", err)
+				}
+				// Notify the late-activation hook (e.g. Python injector)
+				// that a new process was born. Single nil check — no work
+				// when no subscriber is registered.
+				if t.onNewExec != nil {
+					t.onNewExec(ev.PID)
 				}
 			case ExitEvent:
 				// Only act on group-leader exit (whole process gone).

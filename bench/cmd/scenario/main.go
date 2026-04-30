@@ -22,15 +22,33 @@ import (
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
 
+func modeFromFlag(s string) dwarfagent.Mode {
+	switch s {
+	case "dwarf":
+		return dwarfagent.ModeEager
+	case "auto":
+		return dwarfagent.ModeLazy
+	default:
+		log.Fatalf("invalid --unwind %q (want auto or dwarf)", s)
+		return dwarfagent.ModeEager // unreachable
+	}
+}
+
 func main() {
 	var (
-		scenario    = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
+		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
 		processes   = flag.Int("processes", 30, "fleet size for system-wide-mixed")
 		runs        = flag.Int("runs", 5, "iterations per scenario")
 		dropCache   = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
 		outPath     = flag.String("out", "", "output JSON path (default ./bench-{scenario}-{ts}.json)")
 		workloadDir = flag.String("workloads-dir", "", "test/workloads dir (default auto-detect)")
+		unwind      = flag.String("unwind", "auto", "unwind mode passed to dwarfagent: auto (lazy) | dwarf (eager)")
 	)
+	// NOTE: --inject-python was previously plumbed here, but the bench
+	// constructs dwarfagent.NewProfilerWithMode directly rather than going
+	// through perfagent.Agent, so the flag had no behavioural effect — it
+	// only landed in the JSON. Re-add when the bench is reworked around
+	// perfagent.Agent (which owns the python.Manager wiring).
 	flag.Parse()
 
 	if *scenario == "" {
@@ -57,18 +75,19 @@ func main() {
 		Scenario:  *scenario,
 		StartedAt: time.Now().UTC(),
 		Config: schema.Config{
-			Processes: *processes,
-			Runs:      *runs,
-			DropCache: *dropCache,
+			Processes:  *processes,
+			Runs:       *runs,
+			DropCache:  *dropCache,
+			UnwindMode: *unwind,
 		},
 		System: gatherSystemInfo(),
 	}
 
 	switch *scenario {
 	case "pid-large":
-		runPIDLarge(doc, dir, *runs, *dropCache)
+		runPIDLarge(doc, dir, *runs, *dropCache, *unwind)
 	case "system-wide-mixed":
-		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache)
+		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache, *unwind)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
@@ -91,7 +110,7 @@ func main() {
 
 // runPIDLarge spawns one Rust workload, attaches dwarfagent --pid,
 // and records per-binary timings across N runs.
-func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache bool) {
+func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache bool, unwind string) {
 	doc.Config.WorkloadMix = map[string]int{"rust": 1}
 
 	flt, err := fleet.Spawn(fleet.Opts{
@@ -118,14 +137,14 @@ func runPIDLarge(doc *schema.Document, workloadDir string, runs int, dropCache b
 				log.Printf("drop_caches: %v (continuing — measurement is warm-cache for this run)", err)
 			}
 		}
-		run := measureOnePID(pid, i)
+		run := measureOnePID(pid, i, unwind)
 		doc.Runs = append(doc.Runs, run)
 	}
 }
 
-// measureOnePID times one NewProfilerWithHooks(pid=...) call and the
+// measureOnePID times one NewProfilerWithMode(pid=...) call and the
 // per-binary breakdown collected via OnCompile.
-func measureOnePID(pid, runN int) schema.Run {
+func measureOnePID(pid, runN int, unwind string) schema.Run {
 	var (
 		mu      sync.Mutex
 		entries []schema.Binary
@@ -143,10 +162,10 @@ func measureOnePID(pid, runN int) schema.Run {
 		},
 	}
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks)
+	prof, err := dwarfagent.NewProfilerWithMode(pid, false, []uint{0}, nil, 99, hooks, modeFromFlag(unwind))
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
-		log.Fatalf("NewProfilerWithHooks (run %d): %v", runN, err)
+		log.Fatalf("NewProfilerWithMode (run %d): %v", runN, err)
 	}
 	pidCount, binCount := prof.AttachStats()
 	_ = prof.Close()
@@ -165,7 +184,7 @@ func measureOnePID(pid, runN int) schema.Run {
 
 // runSystemWideMixed spawns a fleet matching the proportional mix and
 // times newSession in system-wide mode for each run.
-func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, runs int, dropCache bool) {
+func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, runs int, dropCache bool, unwind string) {
 	mix := computeMix(processes)
 	doc.Config.WorkloadMix = mix
 
@@ -185,7 +204,7 @@ func runSystemWideMixed(doc *schema.Document, workloadDir string, processes, run
 				log.Printf("drop_caches: %v", err)
 			}
 		}
-		run := measureSystemWide(i)
+		run := measureSystemWide(i, unwind)
 		doc.Runs = append(doc.Runs, run)
 	}
 }
@@ -201,8 +220,8 @@ func computeMix(n int) map[string]int {
 	return map[string]int{"go": gp, "python": pp, "rust": rp, "node": np}
 }
 
-// measureSystemWide times one NewProfilerWithHooks in systemWide=true mode.
-func measureSystemWide(runN int) schema.Run {
+// measureSystemWide times one NewProfilerWithMode in systemWide=true mode.
+func measureSystemWide(runN int, unwind string) schema.Run {
 	var (
 		mu      sync.Mutex
 		entries []schema.Binary
@@ -221,10 +240,10 @@ func measureSystemWide(runN int) schema.Run {
 	}
 	cpus := allCPUs()
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithHooks(0, true, cpus, nil, 99, hooks)
+	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, hooks, modeFromFlag(unwind))
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
-		log.Fatalf("NewProfilerWithHooks (run %d, system-wide): %v", runN, err)
+		log.Fatalf("NewProfilerWithMode (run %d, system-wide): %v", runN, err)
 	}
 	pidCount, binCount := prof.AttachStats()
 	_ = prof.Close()

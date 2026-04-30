@@ -25,6 +25,23 @@ type mmapEventSourceCloser interface {
 	Close() error
 }
 
+// Mode controls the CFI install policy for dwarfagent.Profiler.
+type Mode int
+
+const (
+	// ModeEager compiles CFI for every binary visible at startup
+	// (systemWide: AttachAllProcesses; per-PID: AttachAllMappings).
+	// Selected by --unwind dwarf. Today's behavior.
+	ModeEager Mode = iota
+
+	// ModeLazy populates pid_mappings only at startup; CFI compile
+	// is deferred to the first BPF→userspace miss notification.
+	// Selected by --unwind auto with -a (system-wide). For --pid N
+	// ModeLazy falls back to ModeEager (compile cost is already
+	// negligible per bench data).
+	ModeLazy
+)
+
 // Profiler is the DWARF-capable CPU profiler. Same public shape as
 // profile.Profiler (Collect / CollectAndWrite / Close) so
 // perfagent.Agent can swap on --unwind. Most heavy lifting lives in
@@ -37,12 +54,16 @@ type Profiler struct {
 	perfLinks  []link.Link
 }
 
-// NewProfilerWithHooks is the variant of NewProfiler that accepts an
-// optional observation surface. Pass nil hooks for the same behavior
-// as NewProfiler. Hooks are non-load-bearing — see Hooks docs.
-func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks) (*Profiler, error) {
+// NewProfilerWithMode is the variant of NewProfiler that accepts both
+// an optional Hooks struct and a Mode. Pass ModeEager + nil hooks for
+// the same behavior as NewProfiler.
+func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
+	}
+	// Per-PID always eager regardless of caller-passed mode (per spec).
+	if !systemWide {
+		mode = ModeEager
 	}
 	objs, err := profile.LoadPerfDwarf(systemWide)
 	if err != nil {
@@ -55,7 +76,7 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -71,7 +92,17 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 	sess.readerWG.Add(1)
 	go sess.consumeRingbuf(aggregateCPUSample)
 
+	if mode == ModeLazy {
+		sess.drainerWG.Go(sess.consumeCFIMisses)
+	}
+
 	return p, nil
+}
+
+// NewProfilerWithHooks is the legacy variant that defaults to ModeEager.
+// Existing callers (perfagent.Agent's --unwind dwarf path) work unchanged.
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks) (*Profiler, error) {
+	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager)
 }
 
 // NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
@@ -189,4 +220,10 @@ func (p *Profiler) Close() error {
 // FP-only mode for unattached binaries).
 func (p *Profiler) AttachStats() (pidCount, binaryCount int) {
 	return p.attachStats.pidCount, p.attachStats.binaryCount
+}
+
+// MissStats returns a snapshot of the lazy-CFI drainer's lifetime
+// counters. Returns the zero value in eager mode (drainer never spawned).
+func (p *Profiler) MissStats() MissStats {
+	return p.missCounters.snapshot()
 }

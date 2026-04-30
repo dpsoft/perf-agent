@@ -41,6 +41,8 @@ var (
 	flagGPUAttributionOut  = flag.String("gpu-attribution-output", "", "Experimental: write workload attribution rollups as JSON to this path")
 	flagGPUProfileOutput   = flag.String("gpu-profile-output", "", "Experimental: write synthetic-frame GPU pprof output to this path")
 	flagGPUFoldedOutput    = flag.String("gpu-folded-output", "", "Experimental: write folded GPU flamegraph input to this path")
+	flagInjectPython       = flag.Bool("inject-python", false,
+		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
 	flagTags               tagFlags
 )
 
@@ -345,6 +347,11 @@ func buildOptions() []perfagent.Option {
 	// Unwinding strategy
 	if *flagUnwind != "" {
 		opts = append(opts, perfagent.WithUnwind(*flagUnwind))
+	}
+
+	// Python perf-trampoline injection
+	if *flagInjectPython {
+		opts = append(opts, perfagent.WithInjectPython(true))
 	}
 
 	return opts

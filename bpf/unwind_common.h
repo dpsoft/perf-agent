@@ -134,6 +134,43 @@ struct {
     __uint(max_entries, RINGBUF_BYTES);
 } stack_events SEC(".maps");
 
+// ----- Lazy CFI: miss-notify ringbuf (Option A2).
+//
+// Walker writes a cfi_miss_event here when cfi_lookup misses on a frame
+// classified MODE_FP_LESS. Userspace drains and compiles the missed
+// binary on demand. Rate-limited per (pid, table_id) pair via
+// cfi_miss_ratelimit below — without it, a single FP-less binary would
+// flood ~99 events/sec/CPU until the userspace compile completes.
+//
+// 64 KB sized to hold ~2000 in-flight events while the drainer processes
+// them; larger than realistic miss rates × compile latency.
+
+struct cfi_miss_event {
+    __u32 pid;
+    __u64 table_id;
+    __u64 rel_pc;        // diagnostic; userspace compiles whole binary
+    __u64 ktime_ns;       // BPF emit time (for userspace latency telemetry)
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64 * 1024);
+} cfi_miss_events SEC(".maps");
+
+// Per-(pid, table_id) rate-limit. LRU caps memory at ~96 KB regardless
+// of fork-storms or long uptime.
+struct cfi_miss_ratelimit_key {
+    __u32 pid;
+    __u64 table_id;
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct cfi_miss_ratelimit_key);
+    __type(value, __u64);  // last-emit ktime_get_ns()
+} cfi_miss_ratelimit SEC(".maps");
+
 // ----- PID filter (same shape as perf.bpf.c).
 struct pid_config {
     __u8 type;
@@ -160,6 +197,29 @@ struct walk_ctx {
     __u32 n_pcs;
     struct sample_record *rec;
 };
+
+// ----- Lazy CFI: miss emit helper.
+//
+// Called from walk_step when MODE_FP_LESS + cfi_lookup miss occur.
+// Rate-limits to 1 event per (pid, table_id) per second; drops on
+// ringbuf full (next sample after the rate-limit window will retry).
+static __always_inline void emit_cfi_miss(__u32 pid, __u64 table_id, __u64 rel_pc) {
+    struct cfi_miss_ratelimit_key key = {.pid = pid, .table_id = table_id};
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&cfi_miss_ratelimit, &key);
+    if (last && now - *last < 1000000000ULL /* 1 sec */) {
+        return;
+    }
+    bpf_map_update_elem(&cfi_miss_ratelimit, &key, &now, BPF_ANY);
+
+    struct cfi_miss_event *ev = bpf_ringbuf_reserve(&cfi_miss_events, sizeof(*ev), 0);
+    if (!ev) return;
+    ev->pid = pid;
+    ev->table_id = table_id;
+    ev->rel_pc = rel_pc;
+    ev->ktime_ns = now;
+    bpf_ringbuf_submit(ev, 0);
+}
 
 // ----- CFI maps.
 //
@@ -392,13 +452,27 @@ static long walk_step(__u32 idx, void *arg) {
     struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
     __u8 mode = MODE_FP_SAFE;
     if (m.found) {
-        mode = classify_rel_pc(m.table_id, m.rel_pc);
+        // Lazy mode (Option A2): pid_mappings is populated but
+        // cfi_classification may not be. Detect by probing
+        // cfi_classification_lengths[table_id]. If missing, the binary
+        // was enrolled but not yet compiled — emit a miss event so the
+        // userspace drainer compiles on demand. Fall through to FP path
+        // for this sample; the next sample after compile completes will
+        // classify and unwind normally.
+        __u32 *cls_len = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id);
+        if (!cls_len) {
+            emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
+            // mode stays MODE_FP_SAFE (default); continue via FP path.
+        } else {
+            mode = classify_rel_pc(m.table_id, m.rel_pc);
+        }
     }
 
     if (mode == MODE_FP_LESS) {
         struct cfi_entry *ep = cfi_lookup(m.table_id, m.rel_pc);
         if (!ep) {
             ctx->rec->hdr.walker_flags |= WALKER_FLAG_CFI_MISS;
+            emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
             return 1;
         }
         // Copy out of the inner map immediately — the pointer's lifetime

@@ -377,6 +377,10 @@ func TestGPUOfflineDemoScriptDryRunHostExec(t *testing.T) {
 	}
 	got := string(out)
 	for _, want := range []string{
+		"env LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release GOCACHE=/tmp/perf-agent-gocache GOMODCACHE=/tmp/perf-agent-gomodcache GOTOOLCHAIN=auto",
+		"CGO_CFLAGS=",
+		"CGO_LDFLAGS=",
+		"go run .",
 		"--gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json",
 		"--gpu-replay-input gpu/testdata/replay/host_exec_sample.json",
 		"--gpu-attribution-output /tmp/gpu-demo/host_exec_sample.attributions.json",
@@ -402,11 +406,45 @@ func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	}
 	got := string(out)
 	for _, want := range []string{
+		"env LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release GOCACHE=/tmp/perf-agent-gocache GOMODCACHE=/tmp/perf-agent-gomodcache GOTOOLCHAIN=auto",
+		"CGO_CFLAGS=",
+		"CGO_LDFLAGS=",
+		"go run .",
 		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
 		"--gpu-amd-sample-stdin",
 		"--gpu-attribution-output /tmp/gpu-amd-demo/amd_sample_exec.attributions.json",
 		"--gpu-folded-output /tmp/gpu-amd-demo/amd_sample_exec.folded",
 		"< gpu/testdata/replay/amd_sample_exec.ndjson",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptDryRunHIPAMDSampleRich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-amd-sample-rich",
+		"/tmp/gpu-amd-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-amd-sample-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"env LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release GOCACHE=/tmp/perf-agent-gocache GOMODCACHE=/tmp/perf-agent-gomodcache GOTOOLCHAIN=auto",
+		"CGO_CFLAGS=",
+		"CGO_LDFLAGS=",
+		"go run .",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-amd-rich-demo/amd_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-amd-rich-demo/amd_sample_exec_rich.folded",
+		"< gpu/testdata/replay/amd_sample_exec_rich.ndjson",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)
@@ -432,6 +470,10 @@ func TestGPUOfflineDemoScriptDryRunLiveHIPAMDSample(t *testing.T) {
 	}
 	got := string(out)
 	for _, want := range []string{
+		"env LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release GOCACHE=/tmp/perf-agent-gocache GOMODCACHE=/tmp/perf-agent-gomodcache GOTOOLCHAIN=auto",
+		"CGO_CFLAGS=",
+		"CGO_LDFLAGS=",
+		"go run .",
 		"--pid 4242",
 		"--gpu-amd-sample-stdin",
 		"--gpu-host-hip-library /opt/rocm/lib/libamdhip64.so",
@@ -574,7 +616,8 @@ exit 19
 	}
 	got := string(logData)
 	for _, want := range []string{
-		"runner command: go run .",
+		"runner command: env LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"go run .",
 		"fake go runner failed",
 		"runner exit status: 19",
 	} {
@@ -1025,6 +1068,68 @@ func TestGPUOfflineDemoScriptHIPAMDSampleWritesCPUAndGPUFlamegraphArtifacts(t *t
 		"<svg",
 		"train_step",
 		"[gpu:kernel:hip_launch_shim_kernel]",
+	} {
+		if !strings.Contains(string(htmlData), want) {
+			t.Fatalf("missing %q in html:\n%s", want, htmlData)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptHIPAMDSampleRichWritesBrendanStyleFrames(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-amd-sample-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-amd-sample-rich helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "amd_sample_exec_rich.svg"),
+		filepath.Join(outDir, "amd_sample_exec_rich.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+
+	svgPath := filepath.Join(outDir, "amd_sample_exec_rich.svg")
+	svg, err := os.ReadFile(svgPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", svgPath, err)
+	}
+	for _, want := range []string{
+		"<svg",
+		"train_step",
+		"hipLaunchKernel",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+		"[gpu:function:flash_attn_epilogue]",
+		"[gpu:source:flash_attn_epilogue.hip:91]",
+		"[gpu:pc:0xdef]",
+	} {
+		if !strings.Contains(string(svg), want) {
+			t.Fatalf("missing %q in svg:\n%s", want, svg)
+		}
+	}
+
+	htmlPath := filepath.Join(outDir, "amd_sample_exec_rich.html")
+	htmlData, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", htmlPath, err)
+	}
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"<html",
+		"<svg",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
 	} {
 		if !strings.Contains(string(htmlData), want) {
 			t.Fatalf("missing %q in html:\n%s", want, htmlData)

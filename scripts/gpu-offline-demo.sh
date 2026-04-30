@@ -4,12 +4,16 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+BLAZESYM_ROOT="/home/diego/github/blazesym"
+BLAZESYM_LIB_DIR="${BLAZESYM_ROOT}/target/release"
+BLAZESYM_INCLUDE_DIR="${BLAZESYM_ROOT}/capi/include"
 
 usage() {
     cat <<'EOF'
 Usage:
   scripts/gpu-offline-demo.sh [--dry-run] host-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
@@ -20,6 +24,7 @@ Usage:
 Modes:
   host-exec         checked-in host->execution replay
   hip-amd-sample    checked-in host->AMD execution/sample stdin path
+  hip-amd-sample-rich checked-in host->AMD execution/sample stdin path with richer function/source/pc frames
   host-driver       checked-in host->driver replay
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
@@ -154,6 +159,12 @@ case "${MODE}" in
         NAME="amd_sample_exec"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
+    hip-amd-sample-rich)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        STDIN_PATH="gpu/testdata/replay/amd_sample_exec_rich.ndjson"
+        NAME="amd_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
     host-driver)
         HOST_REPLAY="gpu/testdata/host/replay/flash_attn_launches.json"
         GPU_REPLAY="gpu/testdata/replay/host_driver_submit.json"
@@ -248,7 +259,22 @@ HTML_PATH="${OUTDIR}/${NAME}.html"
 PROFILE_PATH="${OUTDIR}/${NAME}.pb.gz"
 RUNNER_LOG_PATH="${OUTDIR}/${NAME}.runner.log"
 
-declare -a CMD=("go" "run" ".")
+DEFAULT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-${BLAZESYM_LIB_DIR}}"
+DEFAULT_CGO_CFLAGS="${CGO_CFLAGS:-"-I /usr/include/bpf -I /usr/include/pcap -I ${BLAZESYM_INCLUDE_DIR}"}"
+DEFAULT_CGO_LDFLAGS="${CGO_LDFLAGS:-"-L${BLAZESYM_LIB_DIR} -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic"}"
+
+declare -a CMD=(
+    "env"
+    "LD_LIBRARY_PATH=${DEFAULT_LD_LIBRARY_PATH}"
+    "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
+    "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
+    "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
+    "CGO_CFLAGS=${DEFAULT_CGO_CFLAGS}"
+    "CGO_LDFLAGS=${DEFAULT_CGO_LDFLAGS}"
+    "go"
+    "run"
+    "."
+)
 if [[ -n "${HOST_REPLAY}" ]]; then
     CMD+=("--gpu-host-replay-input" "${HOST_REPLAY}")
 fi
@@ -307,7 +333,14 @@ fi
 if [[ -s "${FOLDED_PATH}" ]]; then
     (
         cd "${REPO_ROOT}"
-        go run ./cmd/flamegraph-svg \
+        env \
+            "LD_LIBRARY_PATH=${DEFAULT_LD_LIBRARY_PATH}" \
+            "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}" \
+            "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}" \
+            "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}" \
+            "CGO_CFLAGS=${DEFAULT_CGO_CFLAGS}" \
+            "CGO_LDFLAGS=${DEFAULT_CGO_LDFLAGS}" \
+            go run ./cmd/flamegraph-svg \
             --title "GPU Flame Graph: ${NAME}" \
             --input "${FOLDED_PATH}" \
             --output "${SVG_PATH}" \

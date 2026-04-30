@@ -298,6 +298,7 @@ Current modes are:
 
 - `host-exec`
 - `hip-amd-sample`
+- `hip-amd-sample-rich`
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
@@ -569,6 +570,21 @@ This is still not a true device-internal flame graph, but it is the current bran
 - execution/sample replay through the canonical execution model
 - synthetic flame output for a correlated kernel sample path
 - workload-level attribution for execution time and sample weight
+
+There is also a richer checked-in variant that makes the rendered flamegraph more Brendan-like by projecting function, source, and PC frames into the GPU leaves:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-amd-sample-rich /tmp/gpu-amd-rich
+xdg-open /tmp/gpu-amd-rich/amd_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-amd-rich/amd_sample_exec_rich.html
+```
+
+That view still starts with the CPU launch stack, but the GPU side now includes frames like:
+
+```text
+[gpu:function:flash_attn_fwd]
+[gpu:source:flash_attn.hip:77]
+[gpu:pc:0xabc]
+```
 
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:
 

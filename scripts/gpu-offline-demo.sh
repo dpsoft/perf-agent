@@ -17,6 +17,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv3-command-rich <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
@@ -31,6 +32,7 @@ Modes:
   hip-rocprofv2-rich checked-in host->rocprofv2->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv3-command-rich checked-in host->rocprofv3-command->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofiler-sdk-command-rich checked-in host->rocprofiler-sdk-command->collector->AMD sample path with richer function/source/pc frames
   host-driver       checked-in host->driver replay
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
@@ -206,6 +208,14 @@ case "${MODE}" in
         NAME="rocprofv3_command_sample_exec_rich"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
+    hip-rocprofiler-sdk-command-rich)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        AMD_SAMPLE_SOURCE_COMMAND='cat gpu/testdata/replay/rocprofiler_sdk_native_rich.ndjson'
+        AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofiler-sdk"
+        AMD_SAMPLE_SOURCE_COMMAND_ENV="PERF_AGENT_ROCPROFILER_SDK_COMMAND"
+        NAME="rocprofiler_sdk_command_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
     host-driver)
         HOST_REPLAY="gpu/testdata/host/replay/flash_attn_launches.json"
         GPU_REPLAY="gpu/testdata/replay/host_driver_submit.json"
@@ -341,7 +351,6 @@ elif [[ -n "${AMD_SAMPLE_SOURCE_COMMAND}" ]]; then
         "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
         "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
         "${AMD_SAMPLE_SOURCE_COMMAND_ENV}=${AMD_SAMPLE_SOURCE_COMMAND}"
-        "${AMD_SAMPLE_SOURCE_OUTPUT_ENV}=${AMD_SAMPLE_SOURCE_OUTPUT_FILE}"
         "go"
         "run"
         "./cmd/amd-sample-collector"
@@ -350,6 +359,14 @@ elif [[ -n "${AMD_SAMPLE_SOURCE_COMMAND}" ]]; then
         "--real-source"
         "${AMD_SAMPLE_SOURCE_REAL_SOURCE}"
     )
+    if [[ -n "${AMD_SAMPLE_SOURCE_OUTPUT_ENV}" ]]; then
+        AMD_SAMPLE_COLLECTOR_CMD=(
+            "${AMD_SAMPLE_COLLECTOR_CMD[@]:0:4}"
+            "${AMD_SAMPLE_COLLECTOR_CMD[4]}"
+            "${AMD_SAMPLE_SOURCE_OUTPUT_ENV}=${AMD_SAMPLE_SOURCE_OUTPUT_FILE}"
+            "${AMD_SAMPLE_COLLECTOR_CMD[@]:5}"
+        )
+    fi
 fi
 
 if [[ -n "${HOST_REPLAY}" ]]; then

@@ -26,6 +26,7 @@ const (
 	defaultROCMSMI    = "rocm-smi"
 	defaultRocprofV2  = "rocprofv2"
 	defaultRocprofV3  = "rocprofv3"
+	defaultRocprofilerSDK = "rocprofiler-sdk"
 	maxRealSpacing    = 100 * time.Millisecond
 	maxRealPolls      = 32
 )
@@ -123,6 +124,26 @@ type rocprofV2Record struct {
 	Weight      int    `json:"weight"`
 }
 
+type rocprofilerSDKRecord struct {
+	Kind       string `json:"kind"`
+	DispatchID string `json:"dispatch_id"`
+	SampleID   string `json:"sample_id"`
+	StartNS    int64  `json:"start_ns"`
+	EndNS      int64  `json:"end_ns"`
+	TimeNS     int64  `json:"time_ns"`
+	TimestampNS int64 `json:"timestamp_ns"`
+	KernelName string `json:"kernel_name"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	QueueID    string `json:"queue_id"`
+	PC         string `json:"pc"`
+	Function   string `json:"function"`
+	File       string `json:"file"`
+	Line       uint32 `json:"line"`
+	StallReason string `json:"stall_reason"`
+	Weight     int    `json:"weight"`
+}
+
 func (r rocprofV2Record) dispatchCorrelation() string {
 	if r.DispatchID != "" {
 		return r.DispatchID
@@ -177,6 +198,13 @@ func (r rocprofV2Record) sampleLine() uint32 {
 		return r.Line
 	}
 	return r.Location.Line
+}
+
+func (r rocprofilerSDKRecord) sampleTimeNS() int64 {
+	if r.TimeNS != 0 {
+		return r.TimeNS
+	}
+	return r.TimestampNS
 }
 
 func envOrDefault(key, fallback string) string {
@@ -445,6 +473,8 @@ func runReal(cfg collectorConfig) error {
 		return runRocprofReal("PERF_AGENT_ROCPROFV2", defaultRocprofV2, "rocprofv2")
 	case "rocprofv3":
 		return runRocprofReal("PERF_AGENT_ROCPROFV3", defaultRocprofV3, "rocprofv3")
+	case "rocprofiler-sdk":
+		return runRocprofilerSDKReal()
 	default:
 		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
 	}
@@ -612,13 +642,13 @@ func runROCMSMIReal(cfg collectorConfig) error {
 	return nil
 }
 
-func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
+func readRealSourceBytes(envPrefix, defaultPath, sourceName string) ([]byte, error) {
 	path := envOrDefault(envPrefix+"_PATH", defaultPath)
 	commandText := os.Getenv(envPrefix + "_COMMAND")
 	outputPath := os.Getenv(envPrefix + "_OUTPUT_PATH")
 	outputDir := os.Getenv(envPrefix + "_OUTPUT_DIR")
 	if commandText != "" && path != defaultPath {
-		return fmt.Errorf("cannot combine %s_COMMAND with %s_PATH", envPrefix, envPrefix)
+		return nil, fmt.Errorf("cannot combine %s_COMMAND with %s_PATH", envPrefix, envPrefix)
 	}
 	var cmd *exec.Cmd
 	if commandText != "" {
@@ -633,28 +663,36 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 	if err := cmd.Run(); err != nil {
 		errText := strings.TrimSpace(stderr.String())
 		if errText != "" {
-			return fmt.Errorf("%s source failed: %w: %s", sourceName, err, errText)
+			return nil, fmt.Errorf("%s source failed: %w: %s", sourceName, err, errText)
 		}
-		return fmt.Errorf("%s source failed: %w", sourceName, err)
+		return nil, fmt.Errorf("%s source failed: %w", sourceName, err)
 	}
 
 	sourceBytes := stdout.Bytes()
 	if outputPath != "" && outputDir != "" {
-		return fmt.Errorf("cannot combine %s_OUTPUT_PATH with %s_OUTPUT_DIR", envPrefix, envPrefix)
+		return nil, fmt.Errorf("cannot combine %s_OUTPUT_PATH with %s_OUTPUT_DIR", envPrefix, envPrefix)
 	}
 	if outputDir != "" {
 		resolvedPath, err := newestFileInDir(outputDir)
 		if err != nil {
-			return fmt.Errorf("resolve %s output dir: %w", sourceName, err)
+			return nil, fmt.Errorf("resolve %s output dir: %w", sourceName, err)
 		}
 		outputPath = resolvedPath
 	}
 	if outputPath != "" {
 		data, err := os.ReadFile(outputPath)
 		if err != nil {
-			return fmt.Errorf("read %s output path: %w", sourceName, err)
+			return nil, fmt.Errorf("read %s output path: %w", sourceName, err)
 		}
 		sourceBytes = data
+	}
+	return sourceBytes, nil
+}
+
+func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
+	sourceBytes, err := readRealSourceBytes(envPrefix, defaultPath, sourceName)
+	if err != nil {
+		return err
 	}
 
 	contextID := "ctx0"
@@ -742,6 +780,118 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan %s source output: %w", sourceName, err)
+	}
+	return nil
+}
+
+func runRocprofilerSDKReal() error {
+	sourceBytes, err := readRealSourceBytes("PERF_AGENT_ROCPROFILER_SDK", defaultRocprofilerSDK, "rocprofiler-sdk")
+	if err != nil {
+		return err
+	}
+
+	contextID := "ctx0"
+	if hipPID := os.Getenv("PERF_AGENT_HIP_PID"); hipPID != "" {
+		contextID = fmt.Sprintf("pid-%s", hipPID)
+	}
+	defaultKernel := envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName)
+	defaultDeviceID := envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID)
+	defaultDeviceName := envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName)
+	defaultQueue := envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID)
+
+	scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record rocprofilerSDKRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			return fmt.Errorf("decode rocprofiler-sdk source line: %w", err)
+		}
+
+		deviceID := defaultDeviceID
+		if record.DeviceID != "" {
+			deviceID = record.DeviceID
+		}
+		deviceName := defaultDeviceName
+		if record.DeviceName != "" {
+			deviceName = record.DeviceName
+		}
+		queueID := defaultQueue
+		if record.QueueID != "" {
+			queueID = record.QueueID
+		}
+		kernelName := defaultKernel
+		if record.KernelName != "" {
+			kernelName = record.KernelName
+		}
+
+		dev := device{
+			Backend:  "amdsample",
+			DeviceID: deviceID,
+			Name:     deviceName,
+		}
+		q := queue{
+			Backend: "amdsample",
+			Device:  dev,
+			QueueID: queueID,
+		}
+
+		switch record.Kind {
+		case "dispatch":
+			if err := writeJSONLine(execRecord{
+				Kind: "exec",
+				Execution: execution{
+					Backend:   "amdsample",
+					DeviceID:  deviceID,
+					QueueID:   queueID,
+					ContextID: contextID,
+					ExecID:    record.DispatchID,
+				},
+				Correlation: correlation{Backend: "amdsample", Value: record.DispatchID},
+				Queue:       q,
+				KernelName:  kernelName,
+				StartNS:     record.StartNS,
+				EndNS:       record.EndNS,
+			}); err != nil {
+				return fmt.Errorf("write rocprofiler-sdk exec record: %w", err)
+			}
+		case "sample":
+			sampleID := record.SampleID
+			sampleTimeNS := record.sampleTimeNS()
+			if sampleID == "" {
+				sampleID = fmt.Sprintf("%s:%d", record.DispatchID, sampleTimeNS)
+			}
+			var pc uint64
+			if record.PC != "" {
+				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(record.PC, "0x"), 16, 64)
+				if err != nil {
+					return fmt.Errorf("parse rocprofiler-sdk sample pc: %w", err)
+				}
+				pc = parsedPC
+			}
+			if err := writeJSONLine(sampleRecord{
+				Kind:         "sample",
+				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
+				Device:       dev,
+				TimeNS:       sampleTimeNS,
+				KernelName:   kernelName,
+				PC:           pc,
+				Function:     record.Function,
+				File:         record.File,
+				Line:         record.Line,
+				StallReason:  record.StallReason,
+				SampleWeight: record.Weight,
+			}); err != nil {
+				return fmt.Errorf("write rocprofiler-sdk sample record: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported rocprofiler-sdk record kind: %s", record.Kind)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan rocprofiler-sdk source output: %w", err)
 	}
 	return nil
 }

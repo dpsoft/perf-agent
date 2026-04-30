@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -85,6 +85,8 @@ ROCPROFV3_PATH="${PERF_AGENT_ROCPROFV3_PATH:-}"
 ROCPROFV3_COMMAND="${PERF_AGENT_ROCPROFV3_COMMAND:-}"
 ROCPROFV3_OUTPUT_PATH="${PERF_AGENT_ROCPROFV3_OUTPUT_PATH:-}"
 ROCPROFV3_OUTPUT_DIR="${PERF_AGENT_ROCPROFV3_OUTPUT_DIR:-}"
+ROCPROFILER_SDK_PATH="${PERF_AGENT_ROCPROFILER_SDK_PATH:-}"
+ROCPROFILER_SDK_COMMAND="${PERF_AGENT_ROCPROFILER_SDK_COMMAND:-}"
 REAL_POLL_INTERVAL="${PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL:-}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
@@ -173,6 +175,14 @@ while [[ $# -gt 0 ]]; do
             ROCPROFV3_OUTPUT_DIR="${2:-}"
             shift 2
             ;;
+        --rocprofiler-sdk-path)
+            ROCPROFILER_SDK_PATH="${2:-}"
+            shift 2
+            ;;
+        --rocprofiler-sdk-command)
+            ROCPROFILER_SDK_COMMAND="${2:-}"
+            shift 2
+            ;;
         --real-poll-interval)
             REAL_POLL_INTERVAL="${2:-}"
             shift 2
@@ -232,6 +242,10 @@ if [[ -n "${ROCPROFV3_PATH}" && -n "${ROCPROFV3_COMMAND}" ]]; then
     echo "cannot combine --rocprofv3-path with --rocprofv3-command" >&2
     exit 1
 fi
+if [[ -n "${ROCPROFILER_SDK_PATH}" && -n "${ROCPROFILER_SDK_COMMAND}" ]]; then
+    echo "cannot combine --rocprofiler-sdk-path with --rocprofiler-sdk-command" >&2
+    exit 1
+fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
     exit 1
@@ -258,6 +272,10 @@ if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofv2" && -n "${ROCPROFV2_
 fi
 if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofv3" && -n "${ROCPROFV3_PATH}" && ! -x "${ROCPROFV3_PATH}" ]]; then
     echo "rocprofv3 path is not executable: ${ROCPROFV3_PATH}" >&2
+    exit 1
+fi
+if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofiler-sdk" && -n "${ROCPROFILER_SDK_PATH}" && ! -x "${ROCPROFILER_SDK_PATH}" ]]; then
+    echo "rocprofiler-sdk path is not executable: ${ROCPROFILER_SDK_PATH}" >&2
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
@@ -338,6 +356,8 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_ROCPROFV3_COMMAND=${ROCPROFV3_COMMAND}"
     "PERF_AGENT_ROCPROFV3_OUTPUT_PATH=${ROCPROFV3_OUTPUT_PATH}"
     "PERF_AGENT_ROCPROFV3_OUTPUT_DIR=${ROCPROFV3_OUTPUT_DIR}"
+    "PERF_AGENT_ROCPROFILER_SDK_PATH=${ROCPROFILER_SDK_PATH}"
+    "PERF_AGENT_ROCPROFILER_SDK_COMMAND=${ROCPROFILER_SDK_COMMAND}"
     "PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=${REAL_POLL_INTERVAL}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"

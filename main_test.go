@@ -551,6 +551,37 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv3CommandRich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKCommandRich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofiler-sdk-command-rich",
+		"/tmp/gpu-rocprofiler-sdk-command-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofiler-sdk-command-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat\\ gpu/testdata/replay/rocprofiler_sdk_native_rich.ndjson",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofiler-sdk",
+		"|",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-rocprofiler-sdk-command-rich-demo/rocprofiler_sdk_command_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprofiler-sdk-command-rich-demo/rocprofiler_sdk_command_sample_exec_rich.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunLiveHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1465,6 +1496,29 @@ func TestGPUOfflineDemoScriptHIPRocprofv3CommandRichWritesBrendanStyleFrames(t *
 	}
 }
 
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichWritesBrendanStyleFrames(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-command-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-command-rich helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.svg"),
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPLinuxDRMWrapperDryRunWithPID(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1802,6 +1856,27 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv3Command(t *testing.T) {
 	got := string(out)
 	if !strings.Contains(got, "PERF_AGENT_ROCPROFV3_COMMAND=rocprofv3\\ --hip-trace") {
 		t.Fatalf("missing rocprofv3 command env in output:\n%s", got)
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-command", "collector --emit-json",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofiler-sdk command: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFILER_SDK_COMMAND=collector\\ --emit-json") {
+		t.Fatalf("missing rocprofiler-sdk command env in output:\n%s", got)
 	}
 }
 
@@ -2669,6 +2744,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv3Command(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofilerSDKCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface", "amdsample",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-command", "collector --emit-json",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofiler-sdk command: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--real-source rocprofiler-sdk",
+		"--rocprofiler-sdk-command collector\\ --emit-json",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputPath(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -3296,6 +3396,36 @@ func TestAMDSampleCollectorBinaryUsesRocprofv3Command(t *testing.T) {
 		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
 	}
 	if execEv.Exec.Execution.ExecID != "dispatch-v3-1" {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	inputPath := filepath.Join(tmpDir, "rocprofiler-sdk-input.ndjson")
+	if err := os.WriteFile(inputPath, []byte("{\"kind\":\"dispatch\",\"dispatch_id\":\"sdk-dispatch-1\",\"start_ns\":300,\"end_ns\":360,\"kernel_name\":\"sdk_kernel\"}\n"), 0o644); err != nil {
+		t.Fatalf("write rocprofiler-sdk input: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofiler-sdk")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat "+inputPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector rocprofiler-sdk command mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ExecID != "sdk-dispatch-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
 }

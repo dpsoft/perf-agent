@@ -29,6 +29,24 @@ type SymbolAddrs struct {
 	PyRunString  uint64
 }
 
+// ErrRemoteCallNonZero is returned by RemoteActivate / RemoteDeactivate when
+// the ptrace handshake completed (target hit the SIGSEGV sentinel cleanly)
+// but the remote function returned a non-zero value. The Result field carries
+// the raw register value at sentinel time. ptraceop is language-agnostic —
+// callers (e.g. the perfagent ↔ inject/python bridge) interpret the value
+// against their runtime's calling convention. For CPython, Result that
+// sign-extends to int32(-1) means PyRun_SimpleString reported a Python-level
+// error (most commonly a build without --enable-perf-trampoline, an
+// already-activated trampoline, or an unknown backend).
+type ErrRemoteCallNonZero struct {
+	Op     string
+	Result uint64
+}
+
+func (e *ErrRemoteCallNonZero) Error() string {
+	return fmt.Sprintf("%s returned non-zero: %d", e.Op, e.Result)
+}
+
 // Injector performs ptrace-based remote function calls.
 type Injector struct {
 	log *slog.Logger
@@ -152,7 +170,7 @@ func (i *Injector) runSequence(pid uint32, addrs SymbolAddrs, payload []byte) er
 		return fmt.Errorf("PyRun_SimpleString: %w", runErr)
 	}
 	if runResult != 0 {
-		return fmt.Errorf("PyRun_SimpleString returned non-zero: %d (likely activation refused at runtime)", runResult)
+		return &ErrRemoteCallNonZero{Op: "PyRun_SimpleString", Result: runResult}
 	}
 
 	// Step 10-11: restore registers + explicit detach for diagnostic visibility

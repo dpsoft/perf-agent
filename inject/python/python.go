@@ -81,8 +81,16 @@ type trackedTarget struct {
 	activatedAt time.Time
 }
 
-// NewManager constructs a Manager. opts.Logger may be nil. opts.Detector and
-// opts.Injector default to /proc + ptraceop in production; tests inject stubs.
+// NewManager constructs a Manager.
+//
+// opts.Logger may be nil and falls back to slog.Default(); opts.DeactivateDeadline
+// of 0 falls back to 5s. opts.Detector and opts.Injector are required and must
+// be supplied by the caller — perfagent.Agent wires the production /proc-based
+// detector and the ptraceop bridge; tests inject stubs. inject/python
+// deliberately does not import inject/ptraceop, which is why no automatic
+// default is constructed here. Calling ActivateAll/DeactivateAll with either
+// nil panics at first use; that's intentional — a silent default would mask
+// wiring mistakes.
 func NewManager(opts Options) *Manager {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()

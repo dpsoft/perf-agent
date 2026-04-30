@@ -3,6 +3,7 @@ package python
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -83,6 +84,53 @@ func makeTarget(pid uint32) *Target {
 		PyRunStringAddr:  0x403000,
 		Major:            3,
 		Minor:            12,
+	}
+}
+
+// TestActivateAll_NoPerfTrampolineCountsAsSkip exercises the path where
+// the bridge translates ptraceop.ErrRemoteCallNonZero(Result=-1) into
+// ErrNoPerfTrampoline. The manager must classify it as SkippedNoTramp,
+// not ActivateFailed — that's the whole point of the typed-error wiring.
+func TestActivateAll_NoPerfTrampolineCountsAsSkip(t *testing.T) {
+	det := &stubDetector{results: map[uint32]stubResult{
+		100: {target: makeTarget(100)},
+	}}
+	inj := &stubInjector{
+		activateErr: fmt.Errorf("activation refused: %w", ErrNoPerfTrampoline),
+	}
+	m := newTestManager(t, det, inj, false)
+
+	if err := m.ActivateAll([]uint32{100}); err != nil {
+		t.Fatalf("lenient ActivateAll returned error: %v", err)
+	}
+	if got := m.stats.Activated.Load(); got != 0 {
+		t.Errorf("Activated = %d, want 0", got)
+	}
+	if got := m.stats.SkippedNoTramp.Load(); got != 1 {
+		t.Errorf("SkippedNoTramp = %d, want 1", got)
+	}
+	if got := m.stats.ActivateFailed.Load(); got != 0 {
+		t.Errorf("ActivateFailed = %d, want 0 (must not double-count)", got)
+	}
+}
+
+// TestActivateAll_StrictWrapsNoTrampSentinel verifies strict mode returns
+// an error wrapping ErrNoPerfTrampoline so callers can errors.Is on it.
+func TestActivateAll_StrictWrapsNoTrampSentinel(t *testing.T) {
+	det := &stubDetector{results: map[uint32]stubResult{
+		100: {target: makeTarget(100)},
+	}}
+	inj := &stubInjector{
+		activateErr: fmt.Errorf("activation refused: %w", ErrNoPerfTrampoline),
+	}
+	m := newTestManager(t, det, inj, true)
+
+	err := m.ActivateAll([]uint32{100})
+	if err == nil {
+		t.Fatal("expected strict error; got nil")
+	}
+	if !errors.Is(err, ErrNoPerfTrampoline) {
+		t.Fatalf("expected ErrNoPerfTrampoline; got %v", err)
 	}
 }
 

@@ -463,25 +463,50 @@ func (a *Agent) scanPythonTargets() []uint32 {
 }
 
 // ptraceopBridge adapts ptraceop.Injector to python.LowLevelInjector,
-// supplying the activate/deactivate payloads from inject/python.
+// supplying the activate/deactivate payloads from inject/python and
+// translating ptraceop's language-agnostic typed errors into Python-specific
+// sentinels the manager can classify (e.g. PyRun_SimpleString returning -1
+// → python.ErrNoPerfTrampoline so the manager records SkippedNoTramp instead
+// of an opaque ActivateFailed).
 type ptraceopBridge struct {
 	inj *ptraceop.Injector
 }
 
 func (b *ptraceopBridge) RemoteActivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
-	return b.inj.RemoteActivate(pid, ptraceop.SymbolAddrs{
+	err := b.inj.RemoteActivate(pid, ptraceop.SymbolAddrs{
 		PyGILEnsure:  addrs.PyGILEnsure,
 		PyGILRelease: addrs.PyGILRelease,
 		PyRunString:  addrs.PyRunString,
 	}, python.ActivatePayload())
+	return mapPtraceopErrToPython(err)
 }
 
 func (b *ptraceopBridge) RemoteDeactivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
-	return b.inj.RemoteDeactivate(pid, ptraceop.SymbolAddrs{
+	err := b.inj.RemoteDeactivate(pid, ptraceop.SymbolAddrs{
 		PyGILEnsure:  addrs.PyGILEnsure,
 		PyGILRelease: addrs.PyGILRelease,
 		PyRunString:  addrs.PyRunString,
 	}, python.DeactivatePayload())
+	return mapPtraceopErrToPython(err)
+}
+
+// mapPtraceopErrToPython translates a ptraceop typed error into a
+// python-domain sentinel-wrapped error when the result code corresponds to
+// a Python-level failure. PyRun_SimpleString returns -1 on any Python error;
+// in the activate/deactivate payload context this is overwhelmingly the
+// "perf trampoline not supported" path (the test gate already runs the
+// payload from a normal interpreter, so structurally-different errors at
+// inject time are rare and worth surfacing as ActivateFailed).
+func mapPtraceopErrToPython(err error) error {
+	if err == nil {
+		return nil
+	}
+	var nonZero *ptraceop.ErrRemoteCallNonZero
+	if errors.As(err, &nonZero) && int32(nonZero.Result) == -1 {
+		return fmt.Errorf("activation refused (PyRun_SimpleString returned -1): %w",
+			python.ErrNoPerfTrampoline)
+	}
+	return err
 }
 
 // dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When

@@ -27,6 +27,22 @@ func (m *Manager) activateOne(pid uint32) error {
 		PyRunString:  target.PyRunStringAddr,
 	}
 	if err := m.opts.Injector.RemoteActivate(pid, addrs); err != nil {
+		// "Trampoline not supported" surfaces here (not at detect time) because
+		// the symbol-table pre-flight check is unreliable: distros strip the
+		// internal _PyPerf_Callbacks marker even when --enable-perf-trampoline
+		// was set. We rely on the bridge to translate PyRun_SimpleString == -1
+		// into ErrNoPerfTrampoline so this path classifies it as a structured
+		// skip rather than an opaque ActivateFailed.
+		if errors.Is(err, ErrNoPerfTrampoline) {
+			m.recordSkipReason(err)
+			m.log.Warn("python inject skipped",
+				"pid", pid, "reason", reasonString(err),
+				"libpython", target.LibPythonPath)
+			if m.opts.StrictPerPID {
+				return fmt.Errorf("inject pid=%d: %w", pid, err)
+			}
+			return nil
+		}
 		m.stats.ActivateFailed.Add(1)
 		m.log.Warn("python inject failed", "pid", pid, "err", err,
 			"libpython", target.LibPythonPath,

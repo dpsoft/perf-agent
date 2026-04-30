@@ -27,10 +27,16 @@ func TestEncodeDeactivatePayload(t *testing.T) {
 	}
 }
 
-func TestPayloadsAreImmutable(t *testing.T) {
+// TestActivatePayloadIsConsistent guards against accidental in-place mutation
+// of the package-level slice across calls. ActivatePayload returns the
+// underlying slice (no copy), so a caller mutating it would also affect
+// later calls — that contract is documented; this test merely confirms the
+// returned bytes haven't drifted from the canonical payload between two
+// consecutive reads.
+func TestActivatePayloadIsConsistent(t *testing.T) {
 	a := ActivatePayload()
 	b := ActivatePayload()
 	if !bytes.Equal(a, b) {
-		t.Fatalf("ActivatePayload returned different slices on consecutive calls")
+		t.Fatalf("ActivatePayload returned different bytes on consecutive calls")
 	}
 }

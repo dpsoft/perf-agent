@@ -611,9 +611,18 @@ func runROCMSMIReal(cfg collectorConfig) error {
 
 func runRocprofV2Real() error {
 	path := envOrDefault("PERF_AGENT_ROCPROFV2_PATH", defaultRocprofV2)
+	commandText := os.Getenv("PERF_AGENT_ROCPROFV2_COMMAND")
 	outputPath := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_PATH")
 	outputDir := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_DIR")
-	cmd := exec.Command(path)
+	if commandText != "" && path != defaultRocprofV2 {
+		return fmt.Errorf("cannot combine PERF_AGENT_ROCPROFV2_COMMAND with PERF_AGENT_ROCPROFV2_PATH")
+	}
+	var cmd *exec.Cmd
+	if commandText != "" {
+		cmd = exec.Command("bash", "-lc", commandText)
+	} else {
+		cmd = exec.Command(path)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -438,6 +438,17 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocprofv2-path /opt/rocm/bin/rocprofv2
 ```
 
+If the profiler needs a full command line instead of a bare executable path, pass that directly:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofv2 \
+  --rocprofv2-command 'rocprofv2 --hip-trace --output /tmp/rocprofv2-out'
+```
+
 If that source writes native records to a file instead of stdout, pass the output path too:
 
 ```bash

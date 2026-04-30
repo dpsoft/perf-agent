@@ -1183,6 +1183,32 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithSampleMode(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithROCMSMIPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode",
+		"real",
+		"--rocm-smi-path",
+		"/opt/rocm/bin/rocm-smi",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocm-smi path: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCM_SMI_PATH=/opt/rocm/bin/rocm-smi") {
+		t.Fatalf("missing rocm-smi path env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithKernelName(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1815,6 +1841,34 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleSampleMode(t *testing.T) {
 	for _, want := range []string{
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
 		"--sample-mode real",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPShimDemoDryRunForAMDSampleROCMSMIPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-mode",
+		"real",
+		"--rocm-smi-path",
+		"/opt/rocm/bin/rocm-smi",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocm-smi path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-mode real",
+		"--rocm-smi-path /opt/rocm/bin/rocm-smi",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)

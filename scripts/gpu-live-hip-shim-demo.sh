@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -57,6 +57,7 @@ DEVICE_ID="gfx1103:0"
 DEVICE_NAME="AMD Radeon 780M Graphics"
 QUEUE_ID="compute:0"
 SAMPLE_MODE="synthetic"
+ROCM_SMI_PATH=""
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH=""
 SAMPLE_COLLECTOR_COMMAND=""
@@ -105,6 +106,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sample-mode)
             SAMPLE_MODE="${2:-}"
+            shift 2
+            ;;
+        --rocm-smi-path)
+            ROCM_SMI_PATH="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -188,6 +193,10 @@ if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && -n "${SAMPLE_C
     echo "sample collector path is not executable: ${SAMPLE_COLLECTOR_PATH}" >&2
     exit 1
 fi
+if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && -n "${ROCM_SMI_PATH}" && ! -x "${ROCM_SMI_PATH}" ]]; then
+    echo "rocm-smi path is not executable: ${ROCM_SMI_PATH}" >&2
+    exit 1
+fi
 SOURCE_PATH="${SCRIPT_DIR}/hip-launch-shim.c"
 LOG_PATH="${OUTDIR}/hip_launch_shim.log"
 WRAPPER_LOG_PATH="${OUTDIR}/gpu_live_wrapper.log"
@@ -253,6 +262,12 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
         WRAPPER_CMD+=(
             --sample-collector-path
             "${SAMPLE_COLLECTOR_PATH}"
+        )
+    fi
+    if [[ -n "${ROCM_SMI_PATH}" ]]; then
+        WRAPPER_CMD+=(
+            --rocm-smi-path
+            "${ROCM_SMI_PATH}"
         )
     fi
     if [[ -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then

@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -75,6 +75,7 @@ DEVICE_ID="${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}"
 DEVICE_NAME="${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"
 QUEUE_ID="${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"
 SAMPLE_MODE="${PERF_AGENT_AMD_SAMPLE_MODE:-synthetic}"
+ROCM_SMI_PATH="${PERF_AGENT_ROCM_SMI_PATH:-}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
 SAMPLE_COLLECTOR_COMMAND="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}"
@@ -120,6 +121,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sample-mode)
             SAMPLE_MODE="${2:-}"
+            shift 2
+            ;;
+        --rocm-smi-path)
+            ROCM_SMI_PATH="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -175,6 +180,10 @@ if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
 fi
 if [[ "${DRY_RUN}" != "1" && -n "${SAMPLE_COLLECTOR_PATH}" && ! -x "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "sample collector path is not executable: ${SAMPLE_COLLECTOR_PATH}" >&2
+    exit 1
+fi
+if [[ "${DRY_RUN}" != "1" && -n "${ROCM_SMI_PATH}" && ! -x "${ROCM_SMI_PATH}" ]]; then
+    echo "rocm-smi path is not executable: ${ROCM_SMI_PATH}" >&2
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
@@ -245,6 +254,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_GPU_DEVICE_NAME=${DEVICE_NAME}"
     "PERF_AGENT_GPU_QUEUE_ID=${QUEUE_ID}"
     "PERF_AGENT_AMD_SAMPLE_MODE=${SAMPLE_MODE}"
+    "PERF_AGENT_ROCM_SMI_PATH=${ROCM_SMI_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"
     bash

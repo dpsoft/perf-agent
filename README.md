@@ -531,19 +531,11 @@ emit the same live-shaped `amdsample` execution/sample NDJSON with boot-relative
 timestamps, so the path-based collector hook and the default adapter fallback
 stay aligned.
 
-There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
+There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input, raw snapshot, and a rendered SVG/HTML flamegraph:
 
 ```bash
-go run . \
-  --gpu-host-replay-input gpu/testdata/host/replay/flash_attn_launches.json \
-  --gpu-replay-input gpu/testdata/replay/host_exec_sample.json \
-  --gpu-raw-output /tmp/gpu-host-exec.raw.json \
-  --gpu-attribution-output /tmp/gpu-host-exec.attributions.json \
-  --gpu-folded-output /tmp/gpu-host-exec.folded \
-  --duration 1ms
-
-flamegraph.pl /tmp/gpu-host-exec.folded > /tmp/gpu-host-exec.svg
-cat /tmp/gpu-host-exec.attributions.json
+bash scripts/gpu-offline-demo.sh host-exec /tmp/gpu-host-exec
+xdg-open /tmp/gpu-host-exec/host_exec_sample.html 2>/dev/null || open /tmp/gpu-host-exec/host_exec_sample.html
 ```
 
 The resulting folded line is expected to look like:
@@ -552,28 +544,24 @@ The resulting folded line is expected to look like:
 train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:kernel:flash_attn_fwd];[gpu:stall:memory_throttle] 7
 ```
 
-There is also a checked-in HIP host + AMD execution/sample stdin path using the new `amdsample` source mode:
+There is also a checked-in HIP host + AMD execution/sample stdin path using the new `amdsample` source mode. This is the branch’s clearest CPU+GPU end-to-end flamegraph example right now:
 
 ```bash
-go run . \
-  --gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json \
-  --gpu-amd-sample-stdin \
-  --gpu-raw-output /tmp/gpu-amd-exec.raw.json \
-  --gpu-attribution-output /tmp/gpu-amd-exec.attributions.json \
-  --gpu-folded-output /tmp/gpu-amd-exec.folded \
-  --gpu-profile-output /tmp/gpu-amd-exec.pb.gz \
-  --duration 1ms < gpu/testdata/replay/amd_sample_exec.ndjson
-
-flamegraph.pl /tmp/gpu-amd-exec.folded > /tmp/gpu-amd-exec.svg
-cat /tmp/gpu-amd-exec.attributions.json
+bash scripts/gpu-offline-demo.sh hip-amd-sample /tmp/gpu-amd-exec
+xdg-open /tmp/gpu-amd-exec/amd_sample_exec.html 2>/dev/null || open /tmp/gpu-amd-exec/amd_sample_exec.html
 ```
 
-The resulting folded lines are expected to look like:
+The generated folded lines are expected to look like:
 
 ```text
 train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait] 11
 train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier] 5
 ```
+
+The rendered HTML/SVG flamegraph now includes both:
+
+- the CPU launch side: `train_step -> hipLaunchKernel`
+- the GPU sample side: queue, kernel, stall, and richer sample frames such as function/source/PC when present
 
 This is still not a true device-internal flame graph, but it is the current branch’s clearest CPU-to-GPU execution artifact. It proves:
 
@@ -585,17 +573,8 @@ This is still not a true device-internal flame graph, but it is the current bran
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:
 
 ```bash
-go run . \
-  --gpu-host-replay-input gpu/testdata/host/replay/multi_workload_launches.json \
-  --gpu-replay-input gpu/testdata/replay/multi_workload_exec.json \
-  --gpu-raw-output /tmp/gpu-multi-exec.raw.json \
-  --gpu-attribution-output /tmp/gpu-multi-exec.attributions.json \
-  --gpu-folded-output /tmp/gpu-multi-exec.folded \
-  --gpu-profile-output /tmp/gpu-multi-exec.pb.gz \
-  --duration 1ms
-
-flamegraph.pl /tmp/gpu-multi-exec.folded > /tmp/gpu-multi-exec.svg
-cat /tmp/gpu-multi-exec.attributions.json
+bash scripts/gpu-offline-demo.sh multi-exec /tmp/gpu-multi-exec
+xdg-open /tmp/gpu-multi-exec/multi_workload_exec.html 2>/dev/null || open /tmp/gpu-multi-exec/multi_workload_exec.html
 ```
 
 The checked-in folded output currently looks like:

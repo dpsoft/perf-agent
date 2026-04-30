@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -12,7 +15,8 @@ Adapts the live HIP + amdsample wrapper contract into an NDJSON producer.
 Behavior:
   - if PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH is set, execs that program directly
   - if PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND is set, runs that command
-  - otherwise falls back to the checked-in amd-sample-producer.sh
+  - otherwise prefers the checked-in Go collector executable via `go run`
+  - and only falls back to the shell amd-sample-producer.sh as a last resort
 
 Relevant env:
   - PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH
@@ -53,6 +57,11 @@ fi
 
 if [[ -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}" ]]; then
     exec bash -lc "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND}"
+fi
+
+if command -v go >/dev/null 2>&1 && [[ -d "${REPO_ROOT}/cmd/amd-sample-collector" ]]; then
+    cd "${REPO_ROOT}"
+    exec go run ./cmd/amd-sample-collector
 fi
 
 exec bash scripts/amd-sample-producer.sh

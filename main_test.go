@@ -2123,6 +2123,30 @@ func TestAMDSampleAdapterScriptFallsBackToProducerWithKernelContext(t *testing.T
 	}
 }
 
+func TestAMDSampleAdapterScriptPrefersGoCollectorFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeGo := filepath.Join(tmpDir, "go")
+	fakeGoScript := `#!/bin/sh
+printf 'fake-go:%s\n' "$*"
+`
+	if err := os.WriteFile(fakeGo, []byte(fakeGoScript), 0o755); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(os.Environ(), "PATH="+tmpDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter go collector fallback: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "fake-go:run ./cmd/amd-sample-collector" {
+		t.Fatalf("output=%q", got)
+	}
+}
+
 func TestAMDSampleAdapterScriptExecsCollectorPathBinary(t *testing.T) {
 	tmpDir := t.TempDir()
 	collector := buildAMDSampleCollector(t, tmpDir)

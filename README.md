@@ -352,7 +352,8 @@ If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:
 - exec `--sample-collector-path` / `PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH` directly
 - run `PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND`
-- or fall back to the checked-in synthetic producer
+- otherwise prefer the checked-in Go collector binary via `go run ./cmd/amd-sample-collector`
+- and only fall back to the shell synthetic producer as a last resort
 
 There is now a checked-in collector executable you can build and pass through
 `--sample-collector-path`:
@@ -438,13 +439,11 @@ There is also a small checked-in AMD sample producer for live-shaped demos:
 bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
 ```
 
-The checked-in adapter defaults to the synthetic producer and emits producer-native `amdsample` execution/sample NDJSON with boot-relative
-timestamps, which is a closer stand-in for a real live producer than replaying a
-static checked-in file.
-
-The checked-in Go collector binary emits the same live-shaped NDJSON contract as
-the shell producer, but through the real `--sample-collector-path` executable
-hook rather than a shell command string.
+The checked-in adapter now prefers the Go collector binary and only falls back
+to the shell producer if `go` or the collector package path is unavailable.
+Both emit the same live-shaped `amdsample` execution/sample NDJSON contract with
+boot-relative timestamps, so the path-based collector hook and the default
+adapter fallback stay aligned.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

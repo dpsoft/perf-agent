@@ -684,6 +684,32 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKRich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKLLMRich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofiler-sdk-llm-rich",
+		"/tmp/gpu-rocprofiler-sdk-llm-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofiler-sdk-llm-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--gpu-host-replay-input gpu/testdata/host/replay/llm_flash_attn_launches.json",
+		"--gpu-attribution-output /tmp/gpu-rocprofiler-sdk-llm-rich-demo/rocprofiler_sdk_llm_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprofiler-sdk-llm-rich-demo/rocprofiler_sdk_llm_sample_exec_rich.folded",
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat\\ gpu/testdata/replay/rocprofiler_sdk_native_llm_rich.ndjson",
+		"PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH=/tmp/gpu-rocprofiler-sdk-llm-rich-demo/rocprofiler_sdk_native_llm_rich.ndjson",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKNativeProbe(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1974,6 +2000,122 @@ func TestGPUOfflineDemoScriptHIPRocprofilerSDKRichWritesCPUAndGPUFlamegraph(t *t
 			t.Fatalf("missing %q in html:\n%s", want, htmlData)
 		}
 	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKLLMRichWritesCPUAndGPUFlamegraph(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-llm-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-llm-rich helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.svg"),
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+
+	svgPath := filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.svg")
+	svg, err := os.ReadFile(svgPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", svgPath, err)
+	}
+	for _, want := range []string{
+		"<svg",
+		"CPU + GPU Flame Graph: rocprofiler_sdk_llm_sample_exec_rich",
+		"serve_request",
+		"generate_token",
+		"model_forward",
+		"transformer_block_17",
+		"flash_attention",
+		"hipLaunchKernel",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+		"[gpu:function:paged_kv_gather]",
+		"[gpu:source:paged_kv_cache.hip:132]",
+		"[gpu:pc:0xbcd]",
+		"[gpu:function:flash_attn_epilogue]",
+		"[gpu:source:flash_attn_epilogue.hip:91]",
+		"[gpu:pc:0xdef]",
+	} {
+		if !strings.Contains(string(svg), want) {
+			t.Fatalf("missing %q in svg:\n%s", want, svg)
+		}
+	}
+
+	htmlPath := filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.html")
+	htmlData, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", htmlPath, err)
+	}
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"<html",
+		"<svg",
+		"CPU + GPU Flame Graph: rocprofiler_sdk_llm_sample_exec_rich",
+		"serve_request",
+		"generate_token",
+		"model_forward",
+		"transformer_block_17",
+		"flash_attention",
+		"hipLaunchKernel",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+		"[gpu:function:paged_kv_gather]",
+		"[gpu:source:paged_kv_cache.hip:132]",
+		"[gpu:pc:0xbcd]",
+	} {
+		if !strings.Contains(string(htmlData), want) {
+			t.Fatalf("missing %q in html:\n%s", want, htmlData)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKLLMRichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-llm-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-llm-rich helper: %v\n%s", err, out)
+	}
+
+	assertJSONContentEqualsIgnoringKeys(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.raw.json"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_llm_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.attributions.json"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_llm_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.folded"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_llm_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_llm_sample_exec_rich.pb.gz"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_llm_sample_exec_rich.pprof.txt"),
+	)
 }
 
 func TestGPUOfflineDemoScriptHIPRocprofilerSDKRichMatchesArtifactGoldens(t *testing.T) {

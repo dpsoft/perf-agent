@@ -177,6 +177,13 @@ type rocprofilerSDKEnvelope struct {
 	Events  []rocprofilerSDKRecord `json:"events"`
 }
 
+type externalDispatchMeta struct {
+	deviceID   string
+	deviceName string
+	queueID    string
+	kernelName string
+}
+
 func (r rocprofV2Record) dispatchCorrelation() string {
 	if r.DispatchID != "" {
 		return r.DispatchID
@@ -852,6 +859,7 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 		Device:  dev,
 		QueueID: queueID,
 	}
+	dispatchMeta := map[string]externalDispatchMeta{}
 
 	scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
 	for scanner.Scan() {
@@ -866,6 +874,12 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 		switch record.Type {
 		case "dispatch":
 			dispatchID := record.dispatchCorrelation()
+			dispatchMeta[dispatchID] = externalDispatchMeta{
+				deviceID:   deviceID,
+				deviceName: deviceName,
+				queueID:    queueID,
+				kernelName: kernelName,
+			}
 			if err := writeJSONLine(execRecord{
 				Kind: "exec",
 				Execution: execution{
@@ -890,6 +904,16 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 			if sampleID == "" {
 				sampleID = fmt.Sprintf("%s:%d", dispatchID, sampleTimeNS)
 			}
+			sampleDevice := dev
+			sampleKernelName := kernelName
+			if meta, ok := dispatchMeta[dispatchID]; ok {
+				sampleDevice = device{
+					Backend:  "amdsample",
+					DeviceID: meta.deviceID,
+					Name:     meta.deviceName,
+				}
+				sampleKernelName = meta.kernelName
+			}
 			var pc uint64
 			if rawPC := record.samplePC(); rawPC != "" {
 				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(rawPC, "0x"), 16, 64)
@@ -901,9 +925,9 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 			if err := writeJSONLine(sampleRecord{
 				Kind:         "sample",
 				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
-				Device:       dev,
+				Device:       sampleDevice,
 				TimeNS:       sampleTimeNS,
-				KernelName:   kernelName,
+				KernelName:   sampleKernelName,
 				PC:           pc,
 				Function:     record.sampleFunction(),
 				File:         record.sampleFile(),
@@ -963,6 +987,7 @@ func runRocprofilerSDKExternal() error {
 		return err
 	}
 
+	dispatchMeta := map[string]externalDispatchMeta{}
 	for _, record := range records {
 		deviceID := record.resolvedDeviceID(defaultDeviceID)
 		deviceName := record.resolvedDeviceName(defaultDeviceName)
@@ -983,6 +1008,12 @@ func runRocprofilerSDKExternal() error {
 		switch record.Kind {
 		case "dispatch":
 			dispatchID := record.dispatchCorrelation()
+			dispatchMeta[dispatchID] = externalDispatchMeta{
+				deviceID:   deviceID,
+				deviceName: deviceName,
+				queueID:    queueID,
+				kernelName: kernelName,
+			}
 			if err := writeJSONLine(execRecord{
 				Kind: "exec",
 				Execution: execution{
@@ -1007,6 +1038,16 @@ func runRocprofilerSDKExternal() error {
 			if sampleID == "" {
 				sampleID = fmt.Sprintf("%s:%d", dispatchID, sampleTimeNS)
 			}
+			sampleDevice := dev
+			sampleKernelName := kernelName
+			if meta, ok := dispatchMeta[dispatchID]; ok {
+				sampleDevice = device{
+					Backend:  "amdsample",
+					DeviceID: meta.deviceID,
+					Name:     meta.deviceName,
+				}
+				sampleKernelName = meta.kernelName
+			}
 			var pc uint64
 			if rawPC := record.samplePC(); rawPC != "" {
 				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(rawPC, "0x"), 16, 64)
@@ -1018,9 +1059,9 @@ func runRocprofilerSDKExternal() error {
 			if err := writeJSONLine(sampleRecord{
 				Kind:         "sample",
 				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
-				Device:       dev,
+				Device:       sampleDevice,
 				TimeNS:       sampleTimeNS,
-				KernelName:   kernelName,
+				KernelName:   sampleKernelName,
 				PC:           pc,
 				Function:     record.sampleFunction(),
 				File:         record.sampleFile(),

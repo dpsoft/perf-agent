@@ -695,6 +695,27 @@ xdg-open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html 2>/
 
 This renders a mixed `CPU + GPU Flame Graph: rocprofiler_sdk_sample_exec_rich` artifact, keeping the CPU launch side (`train_step -> hipLaunchKernel`) visible above the richer GPU `function/source/pc` frames.
 
+For a more realistic inference-style example with a deeper CPU stack, use:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofiler-sdk-llm-rich /tmp/gpu-rocprofiler-sdk-llm-rich
+xdg-open /tmp/gpu-rocprofiler-sdk-llm-rich/rocprofiler_sdk_llm_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofiler-sdk-llm-rich/rocprofiler_sdk_llm_sample_exec_rich.html
+```
+
+This renders a mixed `CPU + GPU Flame Graph: rocprofiler_sdk_llm_sample_exec_rich` artifact with a model-like CPU path:
+
+```text
+serve_request -> generate_token -> model_forward -> transformer_block_17 -> flash_attention -> hipLaunchKernel
+```
+
+and richer algorithm GPU leaves such as:
+
+```text
+[gpu:function:flash_attn_fwd]
+[gpu:function:paged_kv_gather]
+[gpu:function:flash_attn_epilogue]
+```
+
 This canonical SDK demo currently exercises the `rocprofiler-sdk` `external` mode rather than an in-process native SDK collector.
 
 If you have a real `librocprofiler-sdk.so` available, there is also a native probe variant that uses the in-process loader path instead of the external adapter:

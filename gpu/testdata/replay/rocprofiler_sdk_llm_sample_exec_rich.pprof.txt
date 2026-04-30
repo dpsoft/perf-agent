@@ -1,0 +1,28 @@
+Type: cpu
+Time: 2026-04-30 20:33:30 -03
+Showing nodes accounting for 232.32ms, 100% of 232.32ms total
+      flat  flat%   sum%        cum   cum%
+  232.32ms   100%   100%   232.32ms   100%  serve_request
+         0     0%   100%   232.32ms   100%  [gpu:cgroup:138970]
+         0     0%   100%   232.32ms   100%  [gpu:container:decoder-ctr]
+         0     0%   100%    50.51ms 21.74%  [gpu:function:flash_attn_epilogue]
+         0     0%   100%   111.11ms 47.83%  [gpu:function:flash_attn_fwd]
+         0     0%   100%    70.71ms 30.43%  [gpu:function:paged_kv_gather]
+         0     0%   100%   232.32ms   100%  [gpu:kernel:flash_attn_decode_bf16_gfx11]
+         0     0%   100%   232.32ms   100%  [gpu:launch]
+         0     0%   100%   111.11ms 47.83%  [gpu:pc:0xabc]
+         0     0%   100%    70.71ms 30.43%  [gpu:pc:0xbcd]
+         0     0%   100%    50.51ms 21.74%  [gpu:pc:0xdef]
+         0     0%   100%   232.32ms   100%  [gpu:pod:llm-pod-7f]
+         0     0%   100%   232.32ms   100%  [gpu:queue:compute:0]
+         0     0%   100%   111.11ms 47.83%  [gpu:source:flash_attn.hip:77]
+         0     0%   100%    50.51ms 21.74%  [gpu:source:flash_attn_epilogue.hip:91]
+         0     0%   100%    70.71ms 30.43%  [gpu:source:paged_kv_cache.hip:132]
+         0     0%   100%    70.71ms 30.43%  [gpu:stall:lds_bank_conflict]
+         0     0%   100%   111.11ms 47.83%  [gpu:stall:memory_wait]
+         0     0%   100%    50.51ms 21.74%  [gpu:stall:wave_barrier]
+         0     0%   100%   232.32ms   100%  flash_attention
+         0     0%   100%   232.32ms   100%  generate_token
+         0     0%   100%   232.32ms   100%  hipLaunchKernel
+         0     0%   100%   232.32ms   100%  model_forward
+         0     0%   100%   232.32ms   100%  transformer_block_17

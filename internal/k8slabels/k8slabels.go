@@ -9,6 +9,7 @@ package k8slabels
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,15 +36,13 @@ func FromPID(procRoot string, hostPID int) (map[string]string, error) {
 		// proceed
 	case errors.Is(err, os.ErrNotExist):
 		// process gone or non-Linux fixture; merge env-only labels and return.
-		for k, v := range downwardAPIEnv() {
-			out[k] = v
-		}
+		maps.Copy(out, downwardAPIEnv())
 		return out, nil
 	default:
 		return nil, fmt.Errorf("k8slabels: read %s: %w", cgroupPath, err)
 	}
 
-	if v2Path, ok := parseV2CgroupPath(body); ok {
+	if v2Path, ok := parseV2CgroupPath(body); ok && v2Path != "" {
 		out["cgroup_path"] = v2Path
 		if uid := extractPodUID(v2Path); uid != "" {
 			out["pod_uid"] = uid
@@ -53,8 +52,6 @@ func FromPID(procRoot string, hostPID int) (map[string]string, error) {
 		}
 	}
 
-	for k, v := range downwardAPIEnv() {
-		out[k] = v
-	}
+	maps.Copy(out, downwardAPIEnv())
 	return out, nil
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -114,5 +115,28 @@ func TestFromPID_ProcessGone(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("missing cgroup file should produce no labels, got %v", got)
+	}
+}
+
+func TestFromPID_UnreadableCgroup(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod 000 has no effect for root")
+	}
+	t.Setenv("POD_NAME", "")
+	t.Setenv("POD_NAMESPACE", "")
+	t.Setenv("CONTAINER_NAME", "")
+	root := t.TempDir()
+	writeCgroup(t, root, 1, "0::/user.slice\n")
+	cgroupFile := filepath.Join(root, "1", "cgroup")
+	if err := os.Chmod(cgroupFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cgroupFile, 0o644) }) // let TempDir cleanup succeed
+	_, err := FromPID(root, 1)
+	if err == nil {
+		t.Fatal("expected error for unreadable cgroup file")
+	}
+	if !strings.Contains(err.Error(), "k8slabels: read") {
+		t.Errorf("error message not prefixed correctly: %v", err)
 	}
 }

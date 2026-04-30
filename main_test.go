@@ -2523,9 +2523,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofv2SourcePath(t *testing.T) {
 	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
 	rocprofv2Script := `#!/bin/sh
 cat <<EOF
-{"kind":"exec","execution":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","queue_id":"${PERF_AGENT_GPU_QUEUE_ID:-compute:0}","context_id":"pid-${PERF_AGENT_HIP_PID:-0}","exec_id":"rocprofv2:dispatch:1"},"correlation":{"backend":"amdsample","value":"rocprofv2:dispatch:1"},"queue":{"backend":"amdsample","device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"queue_id":"${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"},"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","start_ns":100,"end_ns":200}
-{"kind":"sample","correlation":{"backend":"amdsample","value":"rocprofv2:sample:1"},"device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"time_ns":125,"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","stall_reason":"memory_wait","weight":11}
-{"kind":"sample","correlation":{"backend":"amdsample","value":"rocprofv2:sample:2"},"device":{"backend":"amdsample","device_id":"${PERF_AGENT_GPU_DEVICE_ID:-gfx1103:0}","name":"${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"},"time_ns":175,"kernel_name":"${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}","stall_reason":"wave_barrier","weight":5}
+{"type":"dispatch","dispatch_id":"dispatch-1","start_ns":100,"end_ns":200}
+{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-1","time_ns":125,"stall_reason":"memory_wait","weight":11}
+{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-2","time_ns":175,"stall_reason":"wave_barrier","weight":5}
 EOF
 `
 	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {

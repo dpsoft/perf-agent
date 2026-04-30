@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -89,6 +90,17 @@ type rocmSMIMetrics struct {
 	powerWatts   int
 	temperatureC int
 	vramUsedPct  int
+}
+
+type rocprofV2Record struct {
+	Type        string `json:"type"`
+	DispatchID  string `json:"dispatch_id"`
+	SampleID    string `json:"sample_id"`
+	StartNS     int64  `json:"start_ns"`
+	EndNS       int64  `json:"end_ns"`
+	TimeNS      int64  `json:"time_ns"`
+	StallReason string `json:"stall_reason"`
+	Weight      int    `json:"weight"`
 }
 
 func envOrDefault(key, fallback string) string {
@@ -501,8 +513,77 @@ func runRocprofV2Real() error {
 		}
 		return fmt.Errorf("rocprofv2 source failed: %w", err)
 	}
-	if _, err := os.Stdout.Write(stdout.Bytes()); err != nil {
-		return fmt.Errorf("write rocprofv2 source output: %w", err)
+
+	contextID := "ctx0"
+	if hipPID := os.Getenv("PERF_AGENT_HIP_PID"); hipPID != "" {
+		contextID = fmt.Sprintf("pid-%s", hipPID)
+	}
+	kernelName := envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName)
+	deviceID := envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID)
+	deviceName := envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName)
+	queueID := envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID)
+	dev := device{
+		Backend:  "amdsample",
+		DeviceID: deviceID,
+		Name:     deviceName,
+	}
+	q := queue{
+		Backend: "amdsample",
+		Device:  dev,
+		QueueID: queueID,
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record rocprofV2Record
+		if err := json.Unmarshal(line, &record); err != nil {
+			return fmt.Errorf("decode rocprofv2 source line: %w", err)
+		}
+		switch record.Type {
+		case "dispatch":
+			if err := writeJSONLine(execRecord{
+				Kind: "exec",
+				Execution: execution{
+					Backend:   "amdsample",
+					DeviceID:  deviceID,
+					QueueID:   queueID,
+					ContextID: contextID,
+					ExecID:    record.DispatchID,
+				},
+				Correlation: correlation{Backend: "amdsample", Value: record.DispatchID},
+				Queue:       q,
+				KernelName:  kernelName,
+				StartNS:     record.StartNS,
+				EndNS:       record.EndNS,
+			}); err != nil {
+				return fmt.Errorf("write rocprofv2 exec record: %w", err)
+			}
+		case "sample":
+			sampleID := record.SampleID
+			if sampleID == "" {
+				sampleID = fmt.Sprintf("%s:%d", record.DispatchID, record.TimeNS)
+			}
+			if err := writeJSONLine(sampleRecord{
+				Kind:         "sample",
+				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
+				Device:       dev,
+				TimeNS:       record.TimeNS,
+				KernelName:   kernelName,
+				StallReason:  record.StallReason,
+				SampleWeight: record.Weight,
+			}); err != nil {
+				return fmt.Errorf("write rocprofv2 sample record: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported rocprofv2 record type: %s", record.Type)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan rocprofv2 source output: %w", err)
 	}
 	return nil
 }

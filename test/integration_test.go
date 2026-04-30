@@ -394,20 +394,27 @@ func isJitOnlyProfile(p *profile.Profile) bool {
 	return hasJit && !hasReal
 }
 
-// isDegenerateProfile reports whether the profile has no usable mapping
-// information at all — neither file-backed mappings nor the [jit]
-// sentinel. This happens on slow CI runners (and has been observed on
-// GitHub Actions ubuntu-24.04 / ubuntu-24.04-arm) where the workload
-// finishes or sleeps through the sampling window and only one or two
-// PCs land in the profile, none of which match any binary mapping that
-// blazesym recognises. The captured pprof is structurally valid but
-// has no signal worth asserting against.
+// isDegenerateProfile reports whether the profile is the "captured
+// almost nothing" shape we keep hitting on slow CI runners: zero or
+// one or two samples, with no usable mapping information at all
+// (neither file-backed mappings nor the [jit] sentinel).
+//
+// We deliberately gate on **sample count** as well as mapping
+// emptiness. A healthy run for a 5-second workload at 99 Hz produces
+// hundreds of samples; a real mapping-resolution regression that
+// wiped binaries from the symbolizer would still leave samples
+// behind. ≤2 samples means the runner timed out the workload before
+// anything meaningful was captured — that's blazesym/scheduler
+// timing, not a perf-agent bug.
 //
 // Treat the same way as isJitOnlyProfile: log a loud warning, do not
-// fail the test. A real regression that wiped mappings across the
-// board would also surface as broken unit tests, broken builds, or
-// repeated failures on the same run — not as a one-shot empty profile.
+// fail the test. With the sample-count gate, a regression that wipes
+// mappings while still capturing samples will surface loudly as a
+// genuine assertion failure, not as a silent pass.
 func isDegenerateProfile(p *profile.Profile) bool {
+	if len(p.Sample) > 2 {
+		return false
+	}
 	for _, m := range p.Mapping {
 		switch m.File {
 		case "", "[kernel]", "[jit]":

@@ -92,8 +92,8 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 	return p, nil
 }
 
-// NewProfilerWithHooks is the legacy variant that defaults to ModeEager.
-// Existing callers (perfagent.Agent's --unwind dwarf path) work unchanged.
+// NewProfilerWithHooks is the ModeEager variant of NewProfilerWithMode.
+// Pass nil for labels when no per-sample static labels are needed.
 func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string) (*Profiler, error) {
 	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels)
 }

@@ -124,9 +124,9 @@ Two layers of labels, both opt-in via the library hook system:
 Read once at startup from `/proc/<hostPID>/cgroup`. The file may have one
 line (pure v2) or multiple (legacy hybrid mode). The parser scans for the
 **v2 line specifically** — the one starting `0::` — and ignores all
-others. If no `0::` line is found, the system is cgroup-v1-only; no k8s
-labels are added (this is one of the documented non-goal cases). From the
-v2 path:
+others. If no `0::` line is found, the system is cgroup-v1-only; **no
+cgroup-derived labels are added**. (Layer 2 env labels remain
+independent — see below.) From the v2 path:
 
 | Label         | Source                                             | Always set?              |
 |---------------|----------------------------------------------------|--------------------------|
@@ -156,6 +156,14 @@ names, attach them:
 These cost three `os.Getenv` calls and zero error paths. If absent (host CLI
 use, library calls without those vars set), they're silently skipped — no
 warning, no error.
+
+**Independent of cgroup version.** The downward-API env vars come from the
+deployment manifest, not the host's cgroup hierarchy. If a v1-cgroup host
+runs perf-agent as a sidecar with the downward API wired up (rare but
+possible — some long-tail nodes still default to v1), pod_name / namespace /
+container_name still attach. The cgroup version only gates the *cgroup-
+derived* labels (Layer 1: cgroup_path / pod_uid / container_id); env labels
+are sourced separately and remain whatever the operator put in the env.
 
 **No k8s API call**, **no kubelet read**, **no container runtime socket**.
 Pod_name/namespace come from the env or they don't come at all. Consumers
@@ -245,9 +253,9 @@ CLI flag --pid 5         OR        Library: perfagent.New(WithPID(5))
 |---------------------------------------|------------------------------------------------------------|
 | `/proc/<N>/status` missing            | Hard error at startup: "pid not visible".                 |
 | `NSpid:` line missing in status       | Hard error: "kernel doesn't expose PID namespaces".        |
-| `/proc/<hostPID>/cgroup` unreadable   | Warn at info level; continue with no k8s labels.           |
-| No `0::` line in cgroup file (v1-only host) | Warn at info level; no k8s labels added.            |
-| Cgroup path is not a kubepods layout  | Silently skip k8s labels; `cgroup_path` still set.         |
+| `/proc/<hostPID>/cgroup` unreadable   | Warn at info level; continue with no cgroup-derived labels (env labels still apply). |
+| No `0::` line in cgroup file (v1-only host) | Warn at info level; no cgroup-derived labels (env labels still apply). |
+| Cgroup path is not a kubepods layout  | Silently skip pod/container labels; `cgroup_path` still set; env labels still apply. |
 | Env vars empty / unset                | Silently skip; no labels for those keys.                   |
 | `WithLabelEnricher` returns nil/error | Treat as "no labels"; only `WithLabels` static set applied. |
 

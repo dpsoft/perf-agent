@@ -2030,7 +2030,7 @@ func TestAMDSampleAdapterScriptRunsCollectorCommand(t *testing.T) {
 	}
 }
 
-func TestAMDSampleAdapterScriptPrefersCollectorPath(t *testing.T) {
+func TestAMDSampleAdapterScriptRejectsCollectorPathWithCommand(t *testing.T) {
 	tmpDir := t.TempDir()
 	collector := filepath.Join(tmpDir, "collector.sh")
 	if err := os.WriteFile(collector, []byte("#!/bin/sh\nprintf path-wins\n"), 0o755); err != nil {
@@ -2047,11 +2047,11 @@ func TestAMDSampleAdapterScriptPrefersCollectorPath(t *testing.T) {
 		"PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=printf command-loses",
 	)
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("amd sample adapter collector path: %v\n%s", err, out)
+	if err == nil {
+		t.Fatalf("expected collector conflict failure, got success:\n%s", out)
 	}
-	if got := string(out); got != "path-wins" {
-		t.Fatalf("output=%q", got)
+	if !strings.Contains(string(out), "cannot combine PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH with PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND") {
+		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
 

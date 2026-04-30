@@ -42,6 +42,11 @@ if [[ $# -gt 0 ]]; then
     esac
 fi
 
+if [[ -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}" && -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}" ]]; then
+    echo "cannot combine PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH with PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND" >&2
+    exit 1
+fi
+
 if [[ -n "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}" ]]; then
     exec "${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH}"
 fi

@@ -66,6 +66,16 @@ func buildSyntheticStack(execView ExecutionView, gpuSample GPUSample) []pp.Frame
 	if gpuSample.StallReason != "" {
 		stack = append(stack, pp.FrameFromName(fmt.Sprintf("[gpu:stall:%s]", gpuSample.StallReason)))
 	}
+	if gpuSample.Function != "" {
+		stack = append(stack, pp.FrameFromName(fmt.Sprintf("[gpu:function:%s]", gpuSample.Function)))
+	}
+	if gpuSample.File != "" {
+		sourceFrame := fmt.Sprintf("[gpu:source:%s]", gpuSample.File)
+		if gpuSample.Line != 0 {
+			sourceFrame = fmt.Sprintf("[gpu:source:%s:%d]", gpuSample.File, gpuSample.Line)
+		}
+		stack = append(stack, pp.FrameFromName(sourceFrame))
+	}
 	if gpuSample.PC != 0 {
 		stack = append(stack, pp.FrameFromName(fmt.Sprintf("[gpu:pc:%#x]", gpuSample.PC)))
 	}

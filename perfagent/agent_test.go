@@ -813,6 +813,37 @@ func TestAgentHostReplayPlusGPUAMDSampleOutputsExecutionFrames(t *testing.T) {
 	assert.Contains(t, got, "train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier]")
 }
 
+func TestAgentHostReplayPlusGPUAMDSampleOutputsRichSampleFrames(t *testing.T) {
+	var foldedBuf bytes.Buffer
+	var profileBuf bytes.Buffer
+	agent, err := New(
+		WithGPUHostReplayInput(filepath.Join("..", "gpu", "testdata", "host", "replay", "hip_kfd_launches.json")),
+		WithGPUAMDSampleInput(strings.NewReader(
+			"{\"kind\":\"exec\",\"execution\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"queue_id\":\"compute:0\",\"context_id\":\"ctx0\",\"exec_id\":\"dispatch-1\"},\"correlation\":{\"backend\":\"amdsample\",\"value\":\"dispatch-1\"},\"queue\":{\"backend\":\"amdsample\",\"device\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"name\":\"AMD Radeon 780M Graphics\"},\"queue_id\":\"compute:0\"},\"kernel_name\":\"hip_launch_shim_kernel\",\"start_ns\":120,\"end_ns\":260}\n"+
+				"{\"kind\":\"sample\",\"correlation\":{\"backend\":\"amdsample\",\"value\":\"sample-stream-1\"},\"device\":{\"backend\":\"amdsample\",\"device_id\":\"gfx1103:0\",\"name\":\"AMD Radeon 780M Graphics\"},\"time_ns\":150,\"kernel_name\":\"hip_launch_shim_kernel\",\"pc\":2748,\"function\":\"flash_attn_fwd\",\"file\":\"flash_attn.hip\",\"line\":77,\"stall_reason\":\"memory_wait\",\"weight\":11}\n",
+		)),
+		WithGPUFoldedOutput(&foldedBuf),
+		WithGPUProfileOutput(&profileBuf),
+	)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, agent.Start(ctx))
+	require.NoError(t, agent.Stop(ctx))
+
+	folded := foldedBuf.String()
+	assert.Contains(t, folded, "[gpu:function:flash_attn_fwd]")
+	assert.Contains(t, folded, "[gpu:source:flash_attn.hip:77]")
+	assert.Contains(t, folded, "[gpu:pc:0xabc]")
+
+	prof, err := goprofile.Parse(&profileBuf)
+	require.NoError(t, err)
+	got := flattenedSampleStacks(prof)
+	assert.Contains(t, got, "[gpu:function:flash_attn_fwd]")
+	assert.Contains(t, got, "[gpu:source:flash_attn.hip:77]")
+	assert.Contains(t, got, "[gpu:pc:0xabc]")
+}
+
 func TestAgentHostReplayPlusCheckedInAMDSampleReplayRawJSONGolden(t *testing.T) {
 	var raw bytes.Buffer
 	agent, err := New(

@@ -127,3 +127,49 @@ func TestWriteFoldedStacksIncludesAttributedKFDMemoryEvents(t *testing.T) {
 		t.Fatalf("missing free line in %q", lines[1])
 	}
 }
+
+func TestWriteFoldedStacksIncludesRichAMDSampleFrames(t *testing.T) {
+	snap := Snapshot{
+		Executions: []ExecutionView{
+			{
+				Launch: &GPUKernelLaunch{
+					Launch: LaunchContext{
+						PID: 1,
+						CPUStack: []pp.Frame{
+							pp.FrameFromName("train_step"),
+							pp.FrameFromName("hipLaunchKernel"),
+						},
+						Tags: map[string]string{
+							"cgroup_id": "9876",
+						},
+					},
+				},
+				Exec: GPUKernelExec{
+					Queue:      GPUQueueRef{Backend: "amdsample", QueueID: "compute:3"},
+					KernelName: "attention_kernel",
+					StartNs:    10,
+					EndNs:      50,
+				},
+				Samples: []GPUSample{{
+					StallReason: "memory_wait",
+					Function:    "attention_epilogue",
+					File:        "attention.hip",
+					Line:        44,
+					PC:          0x1234,
+					Weight:      7,
+				}},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteFoldedStacks(&buf, snap); err != nil {
+		t.Fatalf("WriteFoldedStacks: %v", err)
+	}
+
+	got := strings.TrimSpace(buf.String())
+	want := "train_step;hipLaunchKernel;[gpu:cgroup:9876];[gpu:launch];[gpu:queue:compute:3];[gpu:kernel:attention_kernel];[gpu:stall:memory_wait];[gpu:function:attention_epilogue];[gpu:source:attention.hip:44];[gpu:pc:0x1234] 7"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}

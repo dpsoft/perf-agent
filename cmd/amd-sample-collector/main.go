@@ -125,23 +125,48 @@ type rocprofV2Record struct {
 }
 
 type rocprofilerSDKRecord struct {
-	Kind       string `json:"kind"`
-	DispatchID string `json:"dispatch_id"`
-	SampleID   string `json:"sample_id"`
-	StartNS    int64  `json:"start_ns"`
-	EndNS      int64  `json:"end_ns"`
-	TimeNS     int64  `json:"time_ns"`
-	TimestampNS int64 `json:"timestamp_ns"`
-	KernelName string `json:"kernel_name"`
-	DeviceID   string `json:"device_id"`
-	DeviceName string `json:"device_name"`
-	QueueID    string `json:"queue_id"`
-	PC         string `json:"pc"`
-	Function   string `json:"function"`
-	File       string `json:"file"`
-	Line       uint32 `json:"line"`
-	StallReason string `json:"stall_reason"`
-	Weight     int    `json:"weight"`
+	Kind         string `json:"kind"`
+	ID           string `json:"id"`
+	DispatchID   string `json:"dispatch_id"`
+	SampleID     string `json:"sample_id"`
+	StartNS      int64  `json:"start_ns"`
+	BeginNS      int64  `json:"begin_ns"`
+	EndNS        int64  `json:"end_ns"`
+	CompleteNS   int64  `json:"complete_ns"`
+	TimeNS       int64  `json:"time_ns"`
+	TimestampNS  int64  `json:"timestamp_ns"`
+	KernelName   string `json:"kernel_name"`
+	DeviceID     string `json:"device_id"`
+	DeviceName   string `json:"device_name"`
+	QueueID      string `json:"queue_id"`
+	PC           string `json:"pc"`
+	Function     string `json:"function"`
+	File         string `json:"file"`
+	Line         uint32 `json:"line"`
+	StallReason  string `json:"stall_reason"`
+	Weight       int    `json:"weight"`
+	Kernel       struct {
+		Name string `json:"name"`
+	} `json:"kernel"`
+	Device struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"device"`
+	Queue struct {
+		ID string `json:"id"`
+	} `json:"queue"`
+	Dispatch struct {
+		ID string `json:"id"`
+	} `json:"dispatch"`
+	Location struct {
+		PC       string `json:"pc"`
+		Function string `json:"function"`
+		File     string `json:"file"`
+		Line     uint32 `json:"line"`
+	} `json:"location"`
+	Stall struct {
+		Reason string `json:"reason"`
+	} `json:"stall"`
 }
 
 func (r rocprofV2Record) dispatchCorrelation() string {
@@ -205,6 +230,112 @@ func (r rocprofilerSDKRecord) sampleTimeNS() int64 {
 		return r.TimeNS
 	}
 	return r.TimestampNS
+}
+
+func (r rocprofilerSDKRecord) dispatchCorrelation() string {
+	if r.DispatchID != "" {
+		return r.DispatchID
+	}
+	if r.Dispatch.ID != "" {
+		return r.Dispatch.ID
+	}
+	return r.ID
+}
+
+func (r rocprofilerSDKRecord) sampleCorrelation() string {
+	if r.SampleID != "" {
+		return r.SampleID
+	}
+	return r.ID
+}
+
+func (r rocprofilerSDKRecord) startTimeNS() int64 {
+	if r.StartNS != 0 {
+		return r.StartNS
+	}
+	return r.BeginNS
+}
+
+func (r rocprofilerSDKRecord) endTimeNS() int64 {
+	if r.EndNS != 0 {
+		return r.EndNS
+	}
+	return r.CompleteNS
+}
+
+func (r rocprofilerSDKRecord) resolvedKernelName(fallback string) string {
+	if r.KernelName != "" {
+		return r.KernelName
+	}
+	if r.Kernel.Name != "" {
+		return r.Kernel.Name
+	}
+	return fallback
+}
+
+func (r rocprofilerSDKRecord) resolvedDeviceID(fallback string) string {
+	if r.DeviceID != "" {
+		return r.DeviceID
+	}
+	if r.Device.ID != "" {
+		return r.Device.ID
+	}
+	return fallback
+}
+
+func (r rocprofilerSDKRecord) resolvedDeviceName(fallback string) string {
+	if r.DeviceName != "" {
+		return r.DeviceName
+	}
+	if r.Device.Name != "" {
+		return r.Device.Name
+	}
+	return fallback
+}
+
+func (r rocprofilerSDKRecord) resolvedQueueID(fallback string) string {
+	if r.QueueID != "" {
+		return r.QueueID
+	}
+	if r.Queue.ID != "" {
+		return r.Queue.ID
+	}
+	return fallback
+}
+
+func (r rocprofilerSDKRecord) samplePC() string {
+	if r.PC != "" {
+		return r.PC
+	}
+	return r.Location.PC
+}
+
+func (r rocprofilerSDKRecord) sampleFunction() string {
+	if r.Function != "" {
+		return r.Function
+	}
+	return r.Location.Function
+}
+
+func (r rocprofilerSDKRecord) sampleFile() string {
+	if r.File != "" {
+		return r.File
+	}
+	return r.Location.File
+}
+
+func (r rocprofilerSDKRecord) sampleLine() uint32 {
+	if r.Line != 0 {
+		return r.Line
+	}
+	return r.Location.Line
+}
+
+func (r rocprofilerSDKRecord) sampleStallReason() string {
+	if r.StallReason != "" {
+		return r.StallReason
+	}
+	return r.Stall.Reason
 }
 
 func envOrDefault(key, fallback string) string {
@@ -810,22 +941,10 @@ func runRocprofilerSDKReal() error {
 			return fmt.Errorf("decode rocprofiler-sdk source line: %w", err)
 		}
 
-		deviceID := defaultDeviceID
-		if record.DeviceID != "" {
-			deviceID = record.DeviceID
-		}
-		deviceName := defaultDeviceName
-		if record.DeviceName != "" {
-			deviceName = record.DeviceName
-		}
-		queueID := defaultQueue
-		if record.QueueID != "" {
-			queueID = record.QueueID
-		}
-		kernelName := defaultKernel
-		if record.KernelName != "" {
-			kernelName = record.KernelName
-		}
+		deviceID := record.resolvedDeviceID(defaultDeviceID)
+		deviceName := record.resolvedDeviceName(defaultDeviceName)
+		queueID := record.resolvedQueueID(defaultQueue)
+		kernelName := record.resolvedKernelName(defaultKernel)
 
 		dev := device{
 			Backend:  "amdsample",
@@ -840,6 +959,7 @@ func runRocprofilerSDKReal() error {
 
 		switch record.Kind {
 		case "dispatch":
+			dispatchID := record.dispatchCorrelation()
 			if err := writeJSONLine(execRecord{
 				Kind: "exec",
 				Execution: execution{
@@ -847,25 +967,26 @@ func runRocprofilerSDKReal() error {
 					DeviceID:  deviceID,
 					QueueID:   queueID,
 					ContextID: contextID,
-					ExecID:    record.DispatchID,
+					ExecID:    dispatchID,
 				},
-				Correlation: correlation{Backend: "amdsample", Value: record.DispatchID},
+				Correlation: correlation{Backend: "amdsample", Value: dispatchID},
 				Queue:       q,
 				KernelName:  kernelName,
-				StartNS:     record.StartNS,
-				EndNS:       record.EndNS,
+				StartNS:     record.startTimeNS(),
+				EndNS:       record.endTimeNS(),
 			}); err != nil {
 				return fmt.Errorf("write rocprofiler-sdk exec record: %w", err)
 			}
 		case "sample":
-			sampleID := record.SampleID
+			dispatchID := record.dispatchCorrelation()
+			sampleID := record.sampleCorrelation()
 			sampleTimeNS := record.sampleTimeNS()
 			if sampleID == "" {
-				sampleID = fmt.Sprintf("%s:%d", record.DispatchID, sampleTimeNS)
+				sampleID = fmt.Sprintf("%s:%d", dispatchID, sampleTimeNS)
 			}
 			var pc uint64
-			if record.PC != "" {
-				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(record.PC, "0x"), 16, 64)
+			if rawPC := record.samplePC(); rawPC != "" {
+				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(rawPC, "0x"), 16, 64)
 				if err != nil {
 					return fmt.Errorf("parse rocprofiler-sdk sample pc: %w", err)
 				}
@@ -878,10 +999,10 @@ func runRocprofilerSDKReal() error {
 				TimeNS:       sampleTimeNS,
 				KernelName:   kernelName,
 				PC:           pc,
-				Function:     record.Function,
-				File:         record.File,
-				Line:         record.Line,
-				StallReason:  record.StallReason,
+				Function:     record.sampleFunction(),
+				File:         record.sampleFile(),
+				Line:         record.sampleLine(),
+				StallReason:  record.sampleStallReason(),
 				SampleWeight: record.Weight,
 			}); err != nil {
 				return fmt.Errorf("write rocprofiler-sdk sample record: %w", err)

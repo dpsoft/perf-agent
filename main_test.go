@@ -3577,6 +3577,59 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
 	}
 }
 
+func TestAMDSampleCollectorBinaryUsesAlternateRocprofilerSDKNativeShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	inputPath := filepath.Join(tmpDir, "rocprofiler-sdk-alt.ndjson")
+	input := strings.Join([]string{
+		`{"kind":"dispatch","id":"sdk-dispatch-alt-1","begin_ns":300,"complete_ns":360,"kernel":{"name":"flash_attn_fwd"},"device":{"id":"gfx1103:1","name":"AMD Test GPU"},"queue":{"id":"compute:7"}}`,
+		`{"kind":"sample","id":"sdk-sample-alt-1","dispatch":{"id":"sdk-dispatch-alt-1"},"timestamp_ns":320,"location":{"pc":"0xabc","function":"flash_attn_fwd","file":"flash_attn.hip","line":77},"stall":{"reason":"memory_wait"},"weight":11}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(inputPath, []byte(input), 0o644); err != nil {
+		t.Fatalf("write rocprofiler-sdk alt input: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofiler-sdk")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat "+inputPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector alternate rocprofiler-sdk mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ExecID != "sdk-dispatch-alt-1" {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+	if execEv.Exec.Queue.QueueID != "compute:7" {
+		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
+	}
+	if execEv.Exec.Queue.Device.DeviceID != "gfx1103:1" {
+		t.Fatalf("device_id=%q", execEv.Exec.Queue.Device.DeviceID)
+	}
+	sampleEv, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample line: %v\n%s", err, lines[1])
+	}
+	if sampleEv.Sample.Function != "flash_attn_fwd" {
+		t.Fatalf("function=%q", sampleEv.Sample.Function)
+	}
+	if sampleEv.Sample.File != "flash_attn.hip" || sampleEv.Sample.Line != 77 {
+		t.Fatalf("location=%s:%d", sampleEv.Sample.File, sampleEv.Sample.Line)
+	}
+	if sampleEv.Sample.StallReason != "memory_wait" {
+		t.Fatalf("stall_reason=%q", sampleEv.Sample.StallReason)
+	}
+}
+
 func TestAMDSampleCollectorBinaryUsesRocprofilerSDKOutputPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)

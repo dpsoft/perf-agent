@@ -300,6 +300,7 @@ Current modes are:
 - `hip-amd-sample`
 - `hip-amd-sample-rich`
 - `hip-rocprofv2-rich`
+- `hip-rocprofv2-command-rich`
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
@@ -636,6 +637,13 @@ rocprofv2 native records -> cmd/amd-sample-collector --mode real --real-source r
 ```
 
 The checked-in demo currently exercises the file-output flavor of that contract.
+
+There is also a command-shaped variant that exercises the same adapter through the new `rocprofv2` full-command hook and file-output discovery:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofv2-command-rich /tmp/gpu-rocprof-command-rich
+xdg-open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html
+```
 
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:
 

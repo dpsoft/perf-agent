@@ -485,6 +485,39 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv2Rich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofv2CommandRich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofv2-command-rich",
+		"/tmp/gpu-rocprof-command-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofv2-command-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"PERF_AGENT_ROCPROFV2_COMMAND=scripts/emit-rocprofv2-rich-fixture.sh",
+		"\\$PERF_AGENT_ROCPROFV2_OUTPUT_PATH",
+		"PERF_AGENT_ROCPROFV2_OUTPUT_PATH=/tmp/gpu-rocprof-command-rich-demo/rocprofv2_native_rich.ndjson",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofv2",
+		"|",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-rocprof-command-rich-demo/rocprofv2_command_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprof-command-rich-demo/rocprofv2_command_sample_exec_rich.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunLiveHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1296,6 +1329,68 @@ func TestGPUOfflineDemoScriptHIPRocprofv2RichWritesBrendanStyleFrames(t *testing
 	}
 
 	htmlPath := filepath.Join(outDir, "rocprofv2_sample_exec_rich.html")
+	htmlData, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", htmlPath, err)
+	}
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"<html",
+		"<svg",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+	} {
+		if !strings.Contains(string(htmlData), want) {
+			t.Fatalf("missing %q in html:\n%s", want, htmlData)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofv2CommandRichWritesBrendanStyleFrames(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofv2-command-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofv2-command-rich helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "rocprofv2_command_sample_exec_rich.svg"),
+		filepath.Join(outDir, "rocprofv2_command_sample_exec_rich.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+
+	svgPath := filepath.Join(outDir, "rocprofv2_command_sample_exec_rich.svg")
+	svg, err := os.ReadFile(svgPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", svgPath, err)
+	}
+	for _, want := range []string{
+		"<svg",
+		"train_step",
+		"hipLaunchKernel",
+		"[gpu:function:flash_attn_fwd]",
+		"[gpu:source:flash_attn.hip:77]",
+		"[gpu:pc:0xabc]",
+		"[gpu:function:flash_attn_epilogue]",
+		"[gpu:source:flash_attn_epilogue.hip:91]",
+		"[gpu:pc:0xdef]",
+	} {
+		if !strings.Contains(string(svg), want) {
+			t.Fatalf("missing %q in svg:\n%s", want, svg)
+		}
+	}
+
+	htmlPath := filepath.Join(outDir, "rocprofv2_command_sample_exec_rich.html")
 	htmlData, err := os.ReadFile(htmlPath)
 	if err != nil {
 		t.Fatalf("ReadFile(%s): %v", htmlPath, err)

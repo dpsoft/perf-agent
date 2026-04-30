@@ -15,6 +15,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-rich <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] host-driver <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-exec <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] multi-driver <outdir>
@@ -27,6 +28,7 @@ Modes:
   hip-amd-sample    checked-in host->AMD execution/sample stdin path
   hip-amd-sample-rich checked-in host->AMD execution/sample stdin path with richer function/source/pc frames
   hip-rocprofv2-rich checked-in host->rocprofv2->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
   host-driver       checked-in host->driver replay
   multi-exec        checked-in multi-workload execution replay
   multi-driver      checked-in multi-workload lifecycle replay
@@ -146,6 +148,7 @@ HOST_REPLAY=""
 GPU_REPLAY=""
 STDIN_PATH=""
 AMD_SAMPLE_SOURCE_PATH=""
+AMD_SAMPLE_SOURCE_COMMAND=""
 NAME=""
 DEBUG_GPU_LIVE=0
 declare -a EXTRA_ARGS=()
@@ -172,6 +175,12 @@ case "${MODE}" in
         HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
         AMD_SAMPLE_SOURCE_PATH="scripts/emit-rocprofv2-rich-fixture.sh"
         NAME="rocprofv2_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
+    hip-rocprofv2-command-rich)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        AMD_SAMPLE_SOURCE_COMMAND='scripts/emit-rocprofv2-rich-fixture.sh > "$PERF_AGENT_ROCPROFV2_OUTPUT_PATH"'
+        NAME="rocprofv2_command_sample_exec_rich"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
     host-driver)
@@ -293,6 +302,22 @@ if [[ -n "${AMD_SAMPLE_SOURCE_PATH}" ]]; then
         "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
         "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
         "PERF_AGENT_ROCPROFV2_PATH=${REPO_ROOT}/${AMD_SAMPLE_SOURCE_PATH}"
+        "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=${OUTDIR}/rocprofv2_native_rich.ndjson"
+        "go"
+        "run"
+        "./cmd/amd-sample-collector"
+        "--mode"
+        "real"
+        "--real-source"
+        "rocprofv2"
+    )
+elif [[ -n "${AMD_SAMPLE_SOURCE_COMMAND}" ]]; then
+    AMD_SAMPLE_COLLECTOR_CMD=(
+        "env"
+        "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
+        "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
+        "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
+        "PERF_AGENT_ROCPROFV2_COMMAND=${AMD_SAMPLE_SOURCE_COMMAND}"
         "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=${OUTDIR}/rocprofv2_native_rich.ndjson"
         "go"
         "run"

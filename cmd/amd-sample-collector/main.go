@@ -20,6 +20,7 @@ const (
 	defaultQueueID    = "compute:0"
 	defaultMode       = "synthetic"
 	defaultROCMSMI    = "rocm-smi"
+	maxRealSpacing    = 100 * time.Millisecond
 )
 
 type correlation struct {
@@ -124,15 +125,15 @@ func writeJSONLine(value any) error {
 	return nil
 }
 
-func collectionWindow() (int64, int64, int64, int64, error) {
+func collectionWindow() (int64, int64, int64, int64, time.Duration, error) {
 	startNS, err := bootTimeNS()
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 
 	duration, err := time.ParseDuration(envOrDefault("PERF_AGENT_GPU_DURATION", "140ms"))
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	durationNS := duration.Nanoseconds()
 	sample1OffsetNS := durationNS / 4
@@ -152,7 +153,7 @@ func collectionWindow() (int64, int64, int64, int64, error) {
 		durationNS = 3
 	}
 
-	return startNS, startNS + sample1OffsetNS, startNS + sample2OffsetNS, startNS + durationNS, nil
+	return startNS, startNS + sample1OffsetNS, startNS + sample2OffsetNS, startNS + durationNS, duration, nil
 }
 
 func queryROCMSMI(path string) (rocmSMIMetrics, error) {
@@ -216,7 +217,7 @@ func queryROCMSMI(path string) (rocmSMIMetrics, error) {
 }
 
 func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, sample2Reason string, sample2Weight int) error {
-	startNS, sample1NS, sample2NS, endNS, err := collectionWindow()
+	startNS, sample1NS, sample2NS, endNS, _, err := collectionWindow()
 	if err != nil {
 		return err
 	}
@@ -291,19 +292,109 @@ func runSynthetic(cfg collectorConfig) error {
 }
 
 func runReal(cfg collectorConfig) error {
-	metrics, err := queryROCMSMI(envOrDefault("PERF_AGENT_ROCM_SMI_PATH", defaultROCMSMI))
+	startNS, sample1NS, sample2NS, endNS, duration, err := collectionWindow()
+	if err != nil {
+		return err
+	}
+
+	path := envOrDefault("PERF_AGENT_ROCM_SMI_PATH", defaultROCMSMI)
+	firstMetrics, err := queryROCMSMI(path)
 	if err != nil {
 		return fmt.Errorf("rocm-smi query failed: %w", err)
 	}
 
-	if cfg.deviceID == defaultDeviceID && metrics.deviceID != "" {
-		cfg.deviceID = metrics.deviceID
+	realSpacing := duration / 2
+	if realSpacing <= 0 {
+		realSpacing = time.Millisecond
 	}
-	if cfg.deviceName == defaultDeviceName && metrics.deviceName != "" {
-		cfg.deviceName = metrics.deviceName
+	if realSpacing > maxRealSpacing {
+		realSpacing = maxRealSpacing
+	}
+	time.Sleep(realSpacing)
+
+	secondMetrics, err := queryROCMSMI(path)
+	if err != nil {
+		return fmt.Errorf("rocm-smi query failed: %w", err)
 	}
 
-	return emitRecords(cfg, "hardware_gpu_use", metrics.gpuUse, "hardware_socket_power_watts", metrics.powerWatts)
+	if cfg.deviceID == defaultDeviceID {
+		if firstMetrics.deviceID != "" {
+			cfg.deviceID = firstMetrics.deviceID
+		} else if secondMetrics.deviceID != "" {
+			cfg.deviceID = secondMetrics.deviceID
+		}
+	}
+	if cfg.deviceName == defaultDeviceName {
+		if firstMetrics.deviceName != "" {
+			cfg.deviceName = firstMetrics.deviceName
+		} else if secondMetrics.deviceName != "" {
+			cfg.deviceName = secondMetrics.deviceName
+		}
+	}
+
+	contextID := "ctx0"
+	execID := fmt.Sprintf("dispatch:%d", startNS)
+	if hipPID := os.Getenv("PERF_AGENT_HIP_PID"); hipPID != "" {
+		contextID = fmt.Sprintf("pid-%s", hipPID)
+		execID = fmt.Sprintf("dispatch:%s:%d", hipPID, startNS)
+	}
+	sample1ID := fmt.Sprintf("sample:%d", sample1NS)
+	sample2ID := fmt.Sprintf("sample:%d", sample2NS)
+
+	dev := device{
+		Backend:  "amdsample",
+		DeviceID: cfg.deviceID,
+		Name:     cfg.deviceName,
+	}
+	q := queue{
+		Backend: "amdsample",
+		Device:  dev,
+		QueueID: cfg.queueID,
+	}
+
+	if err := writeJSONLine(execRecord{
+		Kind: "exec",
+		Execution: execution{
+			Backend:   "amdsample",
+			DeviceID:  cfg.deviceID,
+			QueueID:   cfg.queueID,
+			ContextID: contextID,
+			ExecID:    execID,
+		},
+		Correlation: correlation{Backend: "amdsample", Value: execID},
+		Queue:       q,
+		KernelName:  cfg.kernelName,
+		StartNS:     startNS,
+		EndNS:       endNS,
+	}); err != nil {
+		return fmt.Errorf("write exec record: %w", err)
+	}
+
+	if err := writeJSONLine(sampleRecord{
+		Kind:         "sample",
+		Correlation:  correlation{Backend: "amdsample", Value: sample1ID},
+		Device:       dev,
+		TimeNS:       sample1NS,
+		KernelName:   cfg.kernelName,
+		StallReason:  "hardware_gpu_use",
+		SampleWeight: firstMetrics.gpuUse,
+	}); err != nil {
+		return fmt.Errorf("write sample record: %w", err)
+	}
+
+	if err := writeJSONLine(sampleRecord{
+		Kind:         "sample",
+		Correlation:  correlation{Backend: "amdsample", Value: sample2ID},
+		Device:       dev,
+		TimeNS:       sample2NS,
+		KernelName:   cfg.kernelName,
+		StallReason:  "hardware_socket_power_watts",
+		SampleWeight: secondMetrics.powerWatts,
+	}); err != nil {
+		return fmt.Errorf("write sample record: %w", err)
+	}
+
+	return nil
 }
 
 func main() {

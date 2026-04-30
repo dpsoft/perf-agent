@@ -2201,8 +2201,19 @@ func TestAMDSampleCollectorBinaryRealModeUsesROCMSMI(t *testing.T) {
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
 	rocmSMIPath := filepath.Join(tmpDir, "rocm-smi")
 	rocmSMIScript := `#!/bin/sh
+counter_file="$(dirname "$0")/rocm-smi.count"
+count=0
+if [ -f "${counter_file}" ]; then
+  count="$(cat "${counter_file}")"
+fi
+count=$((count + 1))
+printf '%s' "${count}" > "${counter_file}"
 printf '%s\n' 'libdrm warning' >&2
-printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","GFX Version":"gfx942"}}'
+if [ "${count}" -eq 1 ]; then
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","GFX Version":"gfx942"}}'
+else
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"301.100","GPU use (%)":"41","GFX Version":"gfx942"}}'
+fi
 `
 	if err := os.WriteFile(rocmSMIPath, []byte(rocmSMIScript), 0o755); err != nil {
 		t.Fatalf("write fake rocm-smi: %v", err)
@@ -2255,11 +2266,18 @@ printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current So
 	if sample1.Sample.StallReason != "hardware_gpu_use" || sample1.Sample.Weight != 73 {
 		t.Fatalf("sample1=%+v", sample1.Sample)
 	}
-	if sample2.Sample.StallReason != "hardware_socket_power_watts" || sample2.Sample.Weight != 276 {
+	if sample2.Sample.StallReason != "hardware_socket_power_watts" || sample2.Sample.Weight != 301 {
 		t.Fatalf("sample2=%+v", sample2.Sample)
 	}
 	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
 		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	}
+	countBytes, err := os.ReadFile(filepath.Join(tmpDir, "rocm-smi.count"))
+	if err != nil {
+		t.Fatalf("read rocm-smi count: %v", err)
+	}
+	if strings.TrimSpace(string(countBytes)) != "2" {
+		t.Fatalf("rocm-smi invocation count=%q", strings.TrimSpace(string(countBytes)))
 	}
 }
 

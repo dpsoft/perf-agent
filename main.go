@@ -28,7 +28,9 @@ var (
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
-	flagTags          tagFlags
+	flagInjectPython  = flag.Bool("inject-python", false,
+		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
+	flagTags tagFlags
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -186,6 +188,11 @@ func buildOptions() []perfagent.Option {
 	// Unwinding strategy
 	if *flagUnwind != "" {
 		opts = append(opts, perfagent.WithUnwind(*flagUnwind))
+	}
+
+	// Python perf-trampoline injection
+	if *flagInjectPython {
+		opts = append(opts, perfagent.WithInjectPython(true))
 	}
 
 	return opts

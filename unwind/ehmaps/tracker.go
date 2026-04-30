@@ -27,8 +27,9 @@ type PIDTracker struct {
 	pidMappings *ebpf.Map
 	pidMapLens  *ebpf.Map
 
-	mu     sync.Mutex
-	perPID map[uint32]*pidState
+	mu        sync.Mutex
+	perPID    map[uint32]*pidState
+	onNewExec func(pid uint32) // nil → no hook; producer skips dispatch entirely
 }
 
 type pidState struct {
@@ -45,6 +46,18 @@ func NewPIDTracker(store *TableStore, pidMappings, pidMapLengths *ebpf.Map) *PID
 		pidMapLens:  pidMapLengths,
 		perPID:      map[uint32]*pidState{},
 	}
+}
+
+// SetOnNewExec registers a hook that Run calls when it observes a new
+// group-leader fork (PERF_RECORD_FORK with pid == tid), which the kernel
+// emits for every new process created via fork/exec. Pass nil to clear the
+// hook. Must be called before Run to avoid races.
+//
+// The hook runs synchronously on Run's goroutine. When no hook is registered
+// (the default), Run performs a single nil check and skips dispatch entirely —
+// zero producer overhead when --inject-python is off.
+func (t *PIDTracker) SetOnNewExec(fn func(pid uint32)) {
+	t.onNewExec = fn
 }
 
 // Attach walks /proc/<pid>/maps for binPath, acquires CFI via the store,
@@ -233,6 +246,12 @@ func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource, observers ...fu
 				n, err := AttachAllMappings(t, ev.PID)
 				if err != nil || n == 0 {
 					slog.Debug("ehmaps: fork Attach failed", "pid", ev.PID, "err", err)
+				}
+				// Notify the late-activation hook (e.g. Python injector)
+				// that a new process was born. Single nil check — no work
+				// when no subscriber is registered.
+				if t.onNewExec != nil {
+					t.onNewExec(ev.PID)
 				}
 			case ExitEvent:
 				// Only act on group-leader exit (whole process gone).

@@ -17,6 +17,16 @@ type Hooks struct {
 	// note. ehFrameBytes is the raw .eh_frame section size in bytes.
 	// dur is the wall-clock duration of the ehcompile.Compile call.
 	OnCompile func(path, buildID string, ehFrameBytes int, dur time.Duration)
+
+	// OnNewExec is the mmap-watcher hook for new-process events. When
+	// non-nil, it is registered on the PIDTracker before the tracker
+	// goroutine starts, so there is no data race. The hook fires
+	// synchronously on the tracker goroutine whenever a group-leader
+	// PERF_RECORD_FORK arrives — i.e. a new process was born via fork/exec.
+	// The hook must not block for more than a few milliseconds.
+	// When nil (the default), the PIDTracker performs a single nil check
+	// per fork event and skips dispatch entirely — zero overhead.
+	OnNewExec func(pid uint32)
 }
 
 // onCompileFunc returns a non-nil callback safe to invoke from anywhere.

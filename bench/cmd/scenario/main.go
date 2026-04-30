@@ -36,7 +36,7 @@ func modeFromFlag(s string) dwarfagent.Mode {
 
 func main() {
 	var (
-		scenario    = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
+		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
 		processes   = flag.Int("processes", 30, "fleet size for system-wide-mixed")
 		runs        = flag.Int("runs", 5, "iterations per scenario")
 		dropCache   = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
@@ -44,6 +44,11 @@ func main() {
 		workloadDir = flag.String("workloads-dir", "", "test/workloads dir (default auto-detect)")
 		unwind      = flag.String("unwind", "auto", "unwind mode passed to dwarfagent: auto (lazy) | dwarf (eager)")
 	)
+	// NOTE: --inject-python was previously plumbed here, but the bench
+	// constructs dwarfagent.NewProfilerWithMode directly rather than going
+	// through perfagent.Agent, so the flag had no behavioural effect — it
+	// only landed in the JSON. Re-add when the bench is reworked around
+	// perfagent.Agent (which owns the python.Manager wiring).
 	flag.Parse()
 
 	if *scenario == "" {

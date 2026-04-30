@@ -381,7 +381,7 @@ bash scripts/gpu-live-hip-amdsample.sh \
 
 The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning the collector consumes an external producer through command/path/output-file contracts. The `native` mode is now a real in-process seam: it validates the library path, rejects external producer knobs, and probes the shared library before stopping at the not-yet-implemented capture path.
 
-When exercising that native seam today, use `--rocprofiler-sdk-mode native --rocprofiler-sdk-library /path/to/librocprofiler-sdk.so`. The branch validates the native contract, rejects mixing it with the external command/path/output knobs, and fails clearly if the shared library cannot be loaded.
+When exercising that native seam today, use `--rocprofiler-sdk-mode native --rocprofiler-sdk-library /path/to/librocprofiler-sdk.so`. The branch validates the native contract, rejects mixing it with the external command/path/output knobs, and fails clearly if the shared library cannot be loaded. On this host shape, `rocm-runtime` alone does not provide `librocprofiler-sdk.so`; the native seam needs an actual ROCprofiler-SDK install.
 
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:

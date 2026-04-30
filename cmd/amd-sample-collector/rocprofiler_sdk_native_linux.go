@@ -16,7 +16,7 @@ import (
 
 func runRocprofilerSDKNative(cfg collectorConfig) error {
 	if err := probeSharedLibrary(cfg.rocprofilerSDKLibrary); err != nil {
-		return fmt.Errorf("load rocprofiler-sdk native library: %w", err)
+		return fmt.Errorf("load rocprofiler-sdk native library: %w; install ROCprofiler-SDK (rocm-runtime alone is not enough)", err)
 	}
 	return fmt.Errorf("rocprofiler-sdk native collector loaded library but capture is not implemented")
 }

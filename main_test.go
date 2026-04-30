@@ -4401,7 +4401,8 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithMissingLibra
 	if err == nil {
 		t.Fatalf("expected missing native library file failure:\n%s", out)
 	}
-	if !strings.Contains(string(out), "load rocprofiler-sdk native library") {
+	if !strings.Contains(string(out), "load rocprofiler-sdk native library") ||
+		!strings.Contains(string(out), "install ROCprofiler-SDK") {
 		t.Fatalf("unexpected missing native library file error:\n%s", out)
 	}
 }

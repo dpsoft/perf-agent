@@ -575,6 +575,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 
 func runRocprofV2Real() error {
 	path := envOrDefault("PERF_AGENT_ROCPROFV2_PATH", defaultRocprofV2)
+	outputPath := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_PATH")
 	cmd := exec.Command(path)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -586,6 +587,15 @@ func runRocprofV2Real() error {
 			return fmt.Errorf("rocprofv2 source failed: %w: %s", err, errText)
 		}
 		return fmt.Errorf("rocprofv2 source failed: %w", err)
+	}
+
+	sourceBytes := stdout.Bytes()
+	if outputPath != "" {
+		data, err := os.ReadFile(outputPath)
+		if err != nil {
+			return fmt.Errorf("read rocprofv2 output path: %w", err)
+		}
+		sourceBytes = data
 	}
 
 	contextID := "ctx0"
@@ -607,7 +617,7 @@ func runRocprofV2Real() error {
 		QueueID: queueID,
 	}
 
-	scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
+	scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {

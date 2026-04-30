@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -470,6 +471,7 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv2Rich(t *testing.T) {
 		"GOMODCACHE=/tmp/perf-agent-gomodcache",
 		"GOTOOLCHAIN=auto",
 		"PERF_AGENT_ROCPROFV2_PATH=/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/scripts/emit-rocprofv2-rich-fixture.sh",
+		"PERF_AGENT_ROCPROFV2_OUTPUT_PATH=/tmp/gpu-rocprof-rich-demo/rocprofv2_native_rich.ndjson",
 		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofv2",
 		"|",
 		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
@@ -1610,6 +1612,27 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2Path(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2OutputPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofv2",
+		"--rocprofv2-output-path", "/tmp/rocprofv2.jsonl",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofv2 output path: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=/tmp/rocprofv2.jsonl") {
+		t.Fatalf("missing rocprofv2 output path env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -2362,6 +2385,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2Path(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputPath(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface", "amdsample",
+		"--sample-mode", "real",
+		"--real-source", "rocprofv2",
+		"--rocprofv2-output-path", "/tmp/rocprofv2.jsonl",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofv2 output path: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--real-source rocprofv2",
+		"--rocprofv2-output-path /tmp/rocprofv2.jsonl",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -3024,6 +3072,55 @@ EOF
 	}
 	if sample2.Sample.Function != "attention_epilogue" || sample2.Sample.File != "attention_epilogue.hip" || sample2.Sample.Line != 58 {
 		t.Fatalf("sample2 location=%q %q %d", sample2.Sample.Function, sample2.Sample.File, sample2.Sample.Line)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesRocprofv2OutputPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
+	outputPath := filepath.Join(tmpDir, "rocprofv2.jsonl")
+	rocprofv2Script := fmt.Sprintf(`#!/bin/sh
+cat <<EOF >%q
+{"type":"dispatch","correlation_id":"dispatch-file-1","begin_ns":200,"complete_ns":260}
+{"type":"sample","correlation_id":"dispatch-file-1","timestamp_ns":220,"stall_reason":"memory_wait","weight":4,"location":{"pc":"0x111","function":"file_kernel","file":"file_kernel.hip","line":12}}
+EOF
+`, outputPath)
+	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
+		t.Fatalf("write fake rocprofv2: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFV2_PATH="+rocprofv2Path,
+		"PERF_AGENT_ROCPROFV2_OUTPUT_PATH="+outputPath,
+		"PERF_AGENT_GPU_KERNEL_NAME=file_kernel_name",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector rocprofv2 output-path mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ExecID != "dispatch-file-1" {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+	if execEv.Exec.KernelName != "file_kernel_name" {
+		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
+	}
+	sampleEv, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample line: %v\n%s", err, lines[1])
+	}
+	if sampleEv.Sample.PC != 0x111 || sampleEv.Sample.Function != "file_kernel" || sampleEv.Sample.File != "file_kernel.hip" || sampleEv.Sample.Line != 12 {
+		t.Fatalf("sample=%+v", sampleEv.Sample)
 	}
 }
 

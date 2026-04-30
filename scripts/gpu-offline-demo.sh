@@ -293,6 +293,7 @@ if [[ -n "${AMD_SAMPLE_SOURCE_PATH}" ]]; then
         "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
         "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
         "PERF_AGENT_ROCPROFV2_PATH=${REPO_ROOT}/${AMD_SAMPLE_SOURCE_PATH}"
+        "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=${OUTDIR}/rocprofv2_native_rich.ndjson"
         "go"
         "run"
         "./cmd/amd-sample-collector"

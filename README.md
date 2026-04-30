@@ -438,6 +438,18 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocprofv2-path /opt/rocm/bin/rocprofv2
 ```
 
+If that source writes native records to a file instead of stdout, pass the output path too:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofv2 \
+  --rocprofv2-path /opt/rocm/bin/rocprofv2 \
+  --rocprofv2-output-path /tmp/rocprofv2.jsonl
+```
+
 The real collector poll interval is also tunable when you want denser or
 sparser coarse hardware samples:
 
@@ -599,6 +611,8 @@ That path runs:
 ```text
 rocprofv2 native records -> cmd/amd-sample-collector --mode real --real-source rocprofv2 -> perf-agent -> folded/svg/html
 ```
+
+The checked-in demo currently exercises the file-output flavor of that contract.
 
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:
 

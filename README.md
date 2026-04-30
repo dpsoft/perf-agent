@@ -299,6 +299,7 @@ Current modes are:
 - `host-exec`
 - `hip-amd-sample`
 - `hip-amd-sample-rich`
+- `hip-rocprofv2-rich`
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
@@ -584,6 +585,19 @@ That view still starts with the CPU launch stack, but the GPU side now includes 
 [gpu:function:flash_attn_fwd]
 [gpu:source:flash_attn.hip:77]
 [gpu:pc:0xabc]
+```
+
+There is also a collector-shaped variant that exercises the `rocprofv2` adapter before rendering the same richer CPU+GPU HTML/SVG output:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofv2-rich /tmp/gpu-rocprof-rich
+xdg-open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html
+```
+
+That path runs:
+
+```text
+rocprofv2 native records -> cmd/amd-sample-collector --mode real --real-source rocprofv2 -> perf-agent -> folded/svg/html
 ```
 
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:

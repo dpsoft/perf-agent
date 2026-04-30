@@ -1,0 +1,3 @@
+{"type":"dispatch","correlation_id":"rocprof-dispatch-7","begin_ns":120,"complete_ns":260}
+{"type":"sample","correlation_id":"rocprof-dispatch-7","timestamp_ns":160,"stall_reason":"memory_wait","weight":11,"location":{"pc":"0xabc","function":"flash_attn_fwd","file":"flash_attn.hip","line":77}}
+{"type":"sample","correlation_id":"rocprof-dispatch-7","timestamp_ns":220,"stall_reason":"wave_barrier","weight":5,"location":{"pc":"0xdef","function":"flash_attn_epilogue","file":"flash_attn_epilogue.hip","line":91}}

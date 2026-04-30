@@ -137,17 +137,27 @@ func scanForLibpython(maps *os.File) (string, uint64, bool) {
 }
 
 // resolveDynamic handles the case where libpython is mapped as a shared lib.
-func (d *procDetector) resolveDynamic(pid uint32, libpath string, loadBase uint64) (*Target, error) {
+// mappingStart is the address of the libpython mapping that backs file
+// offset 0 (returned by scanForLibpython).
+func (d *procDetector) resolveDynamic(pid uint32, libpath string, mappingStart uint64) (*Target, error) {
 	major, minor, _ := elfsym.ParseLibpythonSONAME(libpath)
 	if !elfsym.IsPython312Plus(major, minor) {
 		return nil, fmt.Errorf("%w: detected %d.%d", ErrPythonTooOld, major, minor)
 	}
+	firstLoadVaddr, err := elfsym.FirstLoadVaddr(libpath)
+	if err != nil {
+		return nil, fmt.Errorf("compute load_bias for %s: %w", libpath, err)
+	}
+	loadBias := mappingStart - firstLoadVaddr
 	resolved, err := elfsym.ResolveSymbols(libpath, requiredSymbols)
 	if err != nil {
 		return nil, fmt.Errorf("resolve symbols in %s: %w", libpath, err)
 	}
 	d.log.Debug("python detector: dynamic match",
-		"pid", pid, "libpython", libpath, "loadbase", loadBase,
+		"pid", pid, "libpython", libpath,
+		"mapping_start", fmt.Sprintf("0x%x", mappingStart),
+		"first_load_vaddr", fmt.Sprintf("0x%x", firstLoadVaddr),
+		"load_bias", fmt.Sprintf("0x%x", loadBias),
 		"version", fmt.Sprintf("%d.%d", major, minor))
 	for _, sym := range requiredSymbols {
 		if _, ok := resolved[sym]; !ok {
@@ -157,10 +167,10 @@ func (d *procDetector) resolveDynamic(pid uint32, libpath string, loadBase uint6
 	return &Target{
 		PID:              pid,
 		LibPythonPath:    libpath,
-		LoadBase:         loadBase,
-		PyGILEnsureAddr:  loadBase + resolved["PyGILState_Ensure"],
-		PyGILReleaseAddr: loadBase + resolved["PyGILState_Release"],
-		PyRunStringAddr:  loadBase + resolved["PyRun_SimpleString"],
+		LoadBase:         loadBias,
+		PyGILEnsureAddr:  loadBias + resolved["PyGILState_Ensure"],
+		PyGILReleaseAddr: loadBias + resolved["PyGILState_Release"],
+		PyRunStringAddr:  loadBias + resolved["PyRun_SimpleString"],
 		Major:            major,
 		Minor:            minor,
 	}, nil
@@ -178,8 +188,6 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotPython, err)
 	}
-	d.log.Debug("python detector: static match",
-		"pid", pid, "exe", realExe)
 	for _, sym := range requiredSymbols {
 		if _, ok := resolved[sym]; !ok {
 			return nil, fmt.Errorf("%w: %s missing in %s", ErrNotPython, sym, realExe)
@@ -191,17 +199,27 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 		return nil, fmt.Errorf("open %s: %w", mapsPath, err)
 	}
 	defer func() { _ = f.Close() }()
-	loadBase := scanForExeBase(f, realExe)
-	if loadBase == 0 {
-		return nil, fmt.Errorf("%w: cannot find exe load base in %s", ErrNotPython, mapsPath)
+	mappingStart := scanForExeBase(f, realExe)
+	if mappingStart == 0 {
+		return nil, fmt.Errorf("%w: cannot find exe mapping in %s", ErrNotPython, mapsPath)
 	}
+	firstLoadVaddr, err := elfsym.FirstLoadVaddr(realExe)
+	if err != nil {
+		return nil, fmt.Errorf("%w: compute load_bias for %s: %v", ErrNotPython, realExe, err)
+	}
+	loadBias := mappingStart - firstLoadVaddr
+	d.log.Debug("python detector: static match",
+		"pid", pid, "exe", realExe,
+		"mapping_start", fmt.Sprintf("0x%x", mappingStart),
+		"first_load_vaddr", fmt.Sprintf("0x%x", firstLoadVaddr),
+		"load_bias", fmt.Sprintf("0x%x", loadBias))
 	return &Target{
 		PID:              pid,
 		LibPythonPath:    realExe,
-		LoadBase:         loadBase,
-		PyGILEnsureAddr:  loadBase + resolved["PyGILState_Ensure"],
-		PyGILReleaseAddr: loadBase + resolved["PyGILState_Release"],
-		PyRunStringAddr:  loadBase + resolved["PyRun_SimpleString"],
+		LoadBase:         loadBias,
+		PyGILEnsureAddr:  loadBias + resolved["PyGILState_Ensure"],
+		PyGILReleaseAddr: loadBias + resolved["PyGILState_Release"],
+		PyRunStringAddr:  loadBias + resolved["PyRun_SimpleString"],
 		Major:            0, // static path; SONAME version unknown
 		Minor:            0,
 	}, nil

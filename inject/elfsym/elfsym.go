@@ -2,8 +2,41 @@ package elfsym
 
 import (
 	"debug/elf"
+	"errors"
 	"fmt"
 )
+
+// FirstLoadVaddr returns the p_vaddr of the PT_LOAD segment that covers file
+// offset 0 (the segment with the ELF header). Combined with the start address
+// of the matching /proc/<pid>/maps entry, this gives the load bias:
+//
+//	load_bias = mapping_start - FirstLoadVaddr(path)
+//	abs_addr  = load_bias + sym.Value
+//
+// For typical PIE shared libraries / PIE executables (p_vaddr == 0),
+// load_bias collapses to mapping_start and the formula matches the
+// long-standing convention. For non-PIE ET_EXEC binaries — Ubuntu
+// /usr/bin/python3.12 has p_vaddr = 0x400000 and ships absolute symbol
+// values — load_bias correctly resolves to 0, leaving sym.Value untouched.
+// Without this correction, doubling mapping_start onto an already-absolute
+// symbol drops RIP into garbage on remote call.
+func FirstLoadVaddr(path string) (uint64, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open ELF %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD {
+			continue
+		}
+		if p.Off != 0 {
+			continue
+		}
+		return p.Vaddr, nil
+	}
+	return 0, errors.New("no PT_LOAD segment with file offset 0")
+}
 
 // ResolveSymbols opens the ELF file at path and resolves each symbol name in
 // names to its file-offset value (the symbol's st_value). Returned map only

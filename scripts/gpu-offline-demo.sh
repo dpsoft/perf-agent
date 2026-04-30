@@ -31,6 +31,8 @@ Outputs:
   <outdir>/<name>.raw.json
   <outdir>/<name>.attributions.json
   <outdir>/<name>.folded
+  <outdir>/<name>.svg
+  <outdir>/<name>.html
   <outdir>/<name>.pb.gz
 EOF
 }
@@ -241,6 +243,8 @@ esac
 RAW_PATH="${OUTDIR}/${NAME}.raw.json"
 ATTR_PATH="${OUTDIR}/${NAME}.attributions.json"
 FOLDED_PATH="${OUTDIR}/${NAME}.folded"
+SVG_PATH="${OUTDIR}/${NAME}.svg"
+HTML_PATH="${OUTDIR}/${NAME}.html"
 PROFILE_PATH="${OUTDIR}/${NAME}.pb.gz"
 RUNNER_LOG_PATH="${OUTDIR}/${NAME}.runner.log"
 
@@ -300,11 +304,28 @@ if [[ "${runner_status}" -ne 0 ]]; then
     exit "${runner_status}"
 fi
 
+if [[ -s "${FOLDED_PATH}" ]]; then
+    (
+        cd "${REPO_ROOT}"
+        go run ./cmd/flamegraph-svg \
+            --title "GPU Flame Graph: ${NAME}" \
+            --input "${FOLDED_PATH}" \
+            --output "${SVG_PATH}" \
+            --html-output "${HTML_PATH}" \
+            >>"${RUNNER_LOG_PATH}" 2>&1
+    )
+else
+    : >"${SVG_PATH}"
+    : >"${HTML_PATH}"
+fi
+
 cat <<EOF
 Wrote:
   ${RAW_PATH}
   ${ATTR_PATH}
   ${FOLDED_PATH}
+  ${SVG_PATH}
+  ${HTML_PATH}
   ${PROFILE_PATH}
   ${RUNNER_LOG_PATH}
 
@@ -314,8 +335,9 @@ Inspect join diagnostics with:
 Inspect workload attribution with:
   jq '.' ${ATTR_PATH}
 
-Render folded output with:
-  flamegraph.pl ${FOLDED_PATH} > ${OUTDIR}/${NAME}.svg
+Open flamegraph artifacts:
+  ${SVG_PATH}
+  ${HTML_PATH}
 EOF
 
 if command -v jq >/dev/null 2>&1; then

@@ -965,6 +965,73 @@ func TestGPUOfflineDemoScriptHIPAMDSampleReportsJoinInspection(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptHIPAMDSampleWritesCPUAndGPUFlamegraphArtifacts(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-amd-sample",
+		outDir,
+	)
+	cmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release",
+		"CGO_CFLAGS=-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include",
+		"CGO_LDFLAGS=-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-amd-sample helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "amd_sample_exec.svg"),
+		filepath.Join(outDir, "amd_sample_exec.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+
+	svgPath := filepath.Join(outDir, "amd_sample_exec.svg")
+	svg, err := os.ReadFile(svgPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", svgPath, err)
+	}
+	for _, want := range []string{
+		"<svg",
+		"train_step",
+		"hipLaunchKernel",
+		"[gpu:launch]",
+		"[gpu:queue:compute:0]",
+		"[gpu:kernel:hip_launch_shim_kernel]",
+		"[gpu:stall:memory_wait]",
+	} {
+		if !strings.Contains(string(svg), want) {
+			t.Fatalf("missing %q in svg:\n%s", want, svg)
+		}
+	}
+
+	htmlPath := filepath.Join(outDir, "amd_sample_exec.html")
+	htmlData, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", htmlPath, err)
+	}
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"<html",
+		"<svg",
+		"train_step",
+		"[gpu:kernel:hip_launch_shim_kernel]",
+	} {
+		if !strings.Contains(string(htmlData), want) {
+			t.Fatalf("missing %q in html:\n%s", want, htmlData)
+		}
+	}
+}
+
 func TestGPULiveHIPLinuxDRMWrapperDryRunWithPID(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

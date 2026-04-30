@@ -65,7 +65,10 @@ func TestInjectPython_ActivatesTrampoline(t *testing.T) {
 	if st.Size() == 0 {
 		t.Fatalf("perf map %s is empty", perfMap)
 	}
-	pmContent, _ := os.ReadFile(perfMap)
+	pmContent, err := os.ReadFile(perfMap)
+	if err != nil {
+		t.Fatalf("read perf map %s: %v", perfMap, err)
+	}
 	if !strings.Contains(string(pmContent), "py::") {
 		t.Errorf("perf map missing py:: entries:\nfirst 500 bytes:\n%s",
 			truncateForLog(string(pmContent), 500))
@@ -146,14 +149,17 @@ func TestInjectPython_StrictFailsOnNonPython(t *testing.T) {
 	}
 	combined := string(out)
 	t.Logf("perf-agent stderr/stdout:\n%s", combined)
-	// The error message should mention not_python OR "not a python" OR a
-	// related structured reason. Be permissive: the exact wording may vary
-	// based on log format.
-	if !strings.Contains(combined, "not_python") &&
-		!strings.Contains(combined, "not a python") &&
-		!strings.Contains(combined, "ErrNotPython") &&
-		!strings.Contains(combined, "python") {
-		t.Errorf("output does not mention 'python' anywhere; expected a structured reason\n%s",
+	// Assert specifically the "non-Python target" failure mode by matching
+	// structured reason tokens or the wrapped error type. Avoid a bare
+	// "python" substring fallback — that would pass for unrelated failures
+	// (missing CAP_SYS_PTRACE, --inject-python flag rejection at validate
+	// time, etc.) and defeat the test's intent. Match case-insensitive
+	// because slog and fmt.Errorf chains differ in casing across paths.
+	combinedLower := strings.ToLower(combined)
+	if !strings.Contains(combinedLower, "not_python") &&
+		!strings.Contains(combinedLower, "not a python") &&
+		!strings.Contains(combinedLower, "errnotpython") {
+		t.Errorf("output does not contain a structured 'not python' reason; got:\n%s",
 			combined)
 	}
 }

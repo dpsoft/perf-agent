@@ -19,7 +19,6 @@ type Document struct {
 	Config        Config    `json:"config"`
 	System        System    `json:"system"`
 	StartedAt     time.Time `json:"started_at"`
-	InjectPython  bool      `json:"inject_python,omitempty"`
 	Runs          []Run     `json:"runs"`
 }
 

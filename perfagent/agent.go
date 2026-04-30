@@ -134,18 +134,27 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// hasCapSysPtrace returns true if the current process holds CAP_SYS_PTRACE
-// in its effective set. Uses the libcap package already imported by the agent.
+// hasCapSysPtrace reports whether the current process holds CAP_SYS_PTRACE
+// in either the Permitted or Effective set. validate() runs before Start()
+// promotes Permitted → Effective via SetFlag, so checking Effective alone
+// would falsely reject runs where the cap was granted via setcap or
+// inherited but not yet promoted. Mirrors test/integration_test.go's
+// nil-safe probing against libcap.
 func hasCapSysPtrace() bool {
 	if os.Geteuid() == 0 {
 		return true
 	}
 	caps := cap.GetProc()
-	have, err := caps.GetFlag(cap.Effective, cap.SYS_PTRACE)
-	if err != nil {
+	if caps == nil {
 		return false
 	}
-	return have
+	for _, flag := range []cap.Flag{cap.Permitted, cap.Effective} {
+		have, err := caps.GetFlag(flag, cap.SYS_PTRACE)
+		if err == nil && have {
+			return true
+		}
+	}
+	return false
 }
 
 // Start initializes and starts all enabled profilers.

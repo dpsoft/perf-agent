@@ -83,20 +83,29 @@ type trackedTarget struct {
 
 // NewManager constructs a Manager.
 //
-// opts.Logger may be nil and falls back to slog.Default(); opts.DeactivateDeadline
-// of 0 falls back to 5s. opts.Detector and opts.Injector are required and must
-// be supplied by the caller — perfagent.Agent wires the production /proc-based
-// detector and the ptraceop bridge; tests inject stubs. inject/python
-// deliberately does not import inject/ptraceop, which is why no automatic
-// default is constructed here. Calling ActivateAll/DeactivateAll with either
-// nil panics at first use; that's intentional — a silent default would mask
-// wiring mistakes.
+// Defaults:
+//   - opts.Logger             → slog.Default() if nil
+//   - opts.DeactivateDeadline → 5 * time.Second if zero
+//   - opts.Detector           → NewDetector("/proc", logger) if nil
+//
+// opts.Injector has no in-package default — inject/python deliberately does
+// not import inject/ptraceop, so the low-level injector must be supplied by
+// the caller. perfagent.Agent wires it via the ptraceopBridge; tests inject
+// stubs. NewManager panics with a clear message if Injector is nil; surfacing
+// that wiring mistake at construction is friendlier than the deep NPE the
+// first ActivateAll call would otherwise raise.
 func NewManager(opts Options) *Manager {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 	if opts.DeactivateDeadline == 0 {
 		opts.DeactivateDeadline = 5 * time.Second
+	}
+	if opts.Detector == nil {
+		opts.Detector = NewDetector("/proc", opts.Logger)
+	}
+	if opts.Injector == nil {
+		panic("python.NewManager: opts.Injector is required (perfagent.Agent wires this; tests inject stubs)")
 	}
 	return &Manager{
 		opts:    opts,

@@ -19,6 +19,7 @@ const (
 	defaultDeviceName = "AMD Radeon 780M Graphics"
 	defaultQueueID    = "compute:0"
 	defaultMode       = "synthetic"
+	defaultRealSource = "rocm-smi"
 	defaultROCMSMI    = "rocm-smi"
 	maxRealSpacing    = 100 * time.Millisecond
 	maxRealPolls      = 32
@@ -71,6 +72,7 @@ type sampleRecord struct {
 
 type collectorConfig struct {
 	mode          string
+	realSource    string
 	kernelName    string
 	deviceID      string
 	deviceName    string
@@ -311,6 +313,13 @@ func runSynthetic(cfg collectorConfig) error {
 }
 
 func runReal(cfg collectorConfig) error {
+	switch cfg.realSource {
+	case "", defaultRealSource:
+		// supported below
+	default:
+		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
+	}
+
 	startNS, _, _, endNS, duration, err := collectionWindow()
 	if err != nil {
 		return err
@@ -474,6 +483,7 @@ func runReal(cfg collectorConfig) error {
 
 func main() {
 	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
+	realSource := flag.String("real-source", envOrDefault("PERF_AGENT_AMD_SAMPLE_REAL_SOURCE", defaultRealSource), "real collector source")
 	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
 	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
 	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
@@ -483,6 +493,7 @@ func main() {
 
 	cfg := collectorConfig{
 		mode:          *mode,
+		realSource:    *realSource,
 		kernelName:    *kernelName,
 		deviceID:      *deviceID,
 		deviceName:    *deviceName,

@@ -383,13 +383,15 @@ but it no longer silently pretends that `real` mode exists without any live
 signal behind it.
 
 If the real collector needs an explicit `rocm-smi` location, the wrapper now
-passes that through too:
+passes that through too. The real source is explicit now, even though
+`rocm-smi` remains the default:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
   --outdir /tmp/gpu-live \
   --pid 4242 \
   --sample-mode real \
+  --real-source rocm-smi \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
@@ -464,7 +466,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
-bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --rocm-smi-path /opt/rocm/bin/rocm-smi
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocm-smi --rocm-smi-path /opt/rocm/bin/rocm-smi
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-poll-interval 25ms
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7
@@ -482,9 +484,10 @@ bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
 The checked-in adapter now prefers the Go collector binary and only falls back
 to the shell producer if `go` or the collector package path is unavailable.
 Both honor the same `PERF_AGENT_AMD_SAMPLE_MODE` / kernel / device / queue
-contract and emit the same live-shaped `amdsample` execution/sample NDJSON with
-boot-relative timestamps, so the path-based collector hook and the default
-adapter fallback stay aligned.
+contract, along with `PERF_AGENT_AMD_SAMPLE_REAL_SOURCE` for real mode, and
+emit the same live-shaped `amdsample` execution/sample NDJSON with boot-relative
+timestamps, so the path-based collector hook and the default adapter fallback
+stay aligned.
 
 There is also a fully offline host-to-execution path backed by checked-in fixtures. It replays the same canonical host launch plus a correlated execution/sample stream, then writes the folded flame input and raw snapshot:
 

@@ -22,7 +22,7 @@ const (
 	defaultDeviceName = "AMD Radeon 780M Graphics"
 	defaultQueueID    = "compute:0"
 	defaultMode       = "synthetic"
-	defaultRealSource = "rocm-smi"
+	defaultRealSource = "rocprofiler-sdk"
 	defaultROCMSMI    = "rocm-smi"
 	defaultRocprofV2  = "rocprofv2"
 	defaultRocprofV3  = "rocprofv3"
@@ -599,13 +599,13 @@ func runSynthetic(cfg collectorConfig) error {
 func runReal(cfg collectorConfig) error {
 	switch cfg.realSource {
 	case "", defaultRealSource:
+		return runRocprofilerSDKReal()
+	case "rocm-smi":
 		return runROCMSMIReal(cfg)
 	case "rocprofv2":
 		return runRocprofReal("PERF_AGENT_ROCPROFV2", defaultRocprofV2, "rocprofv2")
 	case "rocprofv3":
 		return runRocprofReal("PERF_AGENT_ROCPROFV3", defaultRocprofV3, "rocprofv3")
-	case "rocprofiler-sdk":
-		return runRocprofilerSDKReal()
 	default:
 		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
 	}

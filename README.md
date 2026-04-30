@@ -407,15 +407,14 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --sample-mode synthetic
 ```
 
-`synthetic` is still the default. `real` is now an explicit opt-in that fails
-through a first hardware-backed path using `rocm-smi`, while keeping the same
-collector contract and output shape. It is still not true GPU PC sampling yet,
-but it no longer silently pretends that `real` mode exists without any live
-signal behind it.
+`synthetic` is still the default. `real` is now an explicit opt-in whose
+preferred source is `rocprofiler-sdk`, while `rocm-smi` remains available as a
+coarse hardware-backed fallback using the same collector contract and output
+shape. It is still not true GPU PC sampling yet, but it no longer silently
+pretends that `real` mode exists without any live signal behind it.
 
 If the real collector needs an explicit `rocm-smi` location, the wrapper now
-passes that through too. The real source is explicit now, even though
-`rocm-smi` remains the default:
+passes that through too. `rocm-smi` is now explicit fallback behavior:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -426,12 +425,23 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
-There is now also an explicit ROCm profiler real-source hook. The preferred
-modern path is `rocprofv3`; `rocprofv2` remains available as a compatibility
-source. These hooks expect a collector-style executable behind the selected
-path and adapt simple native JSON records such as `dispatch` and `sample` into
-the same `amdsample` contract, including alternate timing aliases and nested
-source-location metadata:
+The preferred modern path is now `rocprofiler-sdk`, with `rocprofv3` kept as a
+CLI-shaped compatibility surface and `rocprofv2` retained only as an older
+compatibility source. These hooks expect a collector-style executable behind
+the selected path and adapt simple native JSON records such as `dispatch` and
+`sample` into the same `amdsample` contract, including alternate timing
+aliases and nested source-location metadata:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofiler-sdk \
+  --rocprofiler-sdk-command 'rocprofiler-sdk --hip-trace --output /tmp/rocprofiler-sdk-out'
+```
+
+CLI-shaped compatibility path with `rocprofv3`:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -560,6 +570,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocm-smi --rocm-smi-path /opt/rocm/bin/rocm-smi
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofiler-sdk --rocprofiler-sdk-command 'rocprofiler-sdk --hip-trace --output /tmp/rocprofiler-sdk-out'
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofv2 --rocprofv2-path /opt/rocm/bin/rocprofv2
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-poll-interval 25ms
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd

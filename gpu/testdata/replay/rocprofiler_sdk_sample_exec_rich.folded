@@ -1,0 +1,2 @@
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:memory_wait];[gpu:function:flash_attn_fwd];[gpu:source:flash_attn.hip:77];[gpu:pc:0xabc] 11
+train_step;hipLaunchKernel;[gpu:cgroup:138970];[gpu:launch];[gpu:queue:compute:0];[gpu:kernel:hip_launch_shim_kernel];[gpu:stall:wave_barrier];[gpu:function:flash_attn_epilogue];[gpu:source:flash_attn_epilogue.hip:91];[gpu:pc:0xdef] 5

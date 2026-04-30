@@ -1,0 +1,18 @@
+Type: cpu
+Time: 2026-04-30 14:45:49 -03
+Showing nodes accounting for 161.62ms, 100% of 161.62ms total
+      flat  flat%   sum%        cum   cum%
+  161.62ms   100%   100%   161.62ms   100%  train_step
+         0     0%   100%   161.62ms   100%  [gpu:cgroup:138970]
+         0     0%   100%    50.51ms 31.25%  [gpu:function:flash_attn_epilogue]
+         0     0%   100%   111.11ms 68.75%  [gpu:function:flash_attn_fwd]
+         0     0%   100%   161.62ms   100%  [gpu:kernel:hip_launch_shim_kernel]
+         0     0%   100%   161.62ms   100%  [gpu:launch]
+         0     0%   100%   111.11ms 68.75%  [gpu:pc:0xabc]
+         0     0%   100%    50.51ms 31.25%  [gpu:pc:0xdef]
+         0     0%   100%   161.62ms   100%  [gpu:queue:compute:0]
+         0     0%   100%   111.11ms 68.75%  [gpu:source:flash_attn.hip:77]
+         0     0%   100%    50.51ms 31.25%  [gpu:source:flash_attn_epilogue.hip:91]
+         0     0%   100%   111.11ms 68.75%  [gpu:stall:memory_wait]
+         0     0%   100%    50.51ms 31.25%  [gpu:stall:wave_barrier]
+         0     0%   100%   161.62ms   100%  hipLaunchKernel

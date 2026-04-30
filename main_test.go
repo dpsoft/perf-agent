@@ -20,6 +20,107 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
+func assertFileContentEquals(t *testing.T, gotPath, wantPath string) {
+	t.Helper()
+	got, err := os.ReadFile(gotPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", gotPath, err)
+	}
+	want, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", wantPath, err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("content mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", gotPath, got, want)
+	}
+}
+
+func stripJSONKeys(value any, keys map[string]struct{}) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(typed))
+		for k, v := range typed {
+			if _, skip := keys[k]; skip {
+				continue
+			}
+			cleaned[k] = stripJSONKeys(v, keys)
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, len(typed))
+		for i, v := range typed {
+			cleaned[i] = stripJSONKeys(v, keys)
+		}
+		return cleaned
+	default:
+		return value
+	}
+}
+
+func assertJSONContentEqualsIgnoringKeys(t *testing.T, gotPath, wantPath string, ignoredKeys ...string) {
+	t.Helper()
+	got, err := os.ReadFile(gotPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", gotPath, err)
+	}
+	want, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", wantPath, err)
+	}
+	ignored := make(map[string]struct{}, len(ignoredKeys))
+	for _, key := range ignoredKeys {
+		ignored[key] = struct{}{}
+	}
+	var gotValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("unmarshal %s: %v", gotPath, err)
+	}
+	var wantValue any
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("unmarshal %s: %v", wantPath, err)
+	}
+	gotNorm, err := json.Marshal(stripJSONKeys(gotValue, ignored))
+	if err != nil {
+		t.Fatalf("marshal normalized %s: %v", gotPath, err)
+	}
+	wantNorm, err := json.Marshal(stripJSONKeys(wantValue, ignored))
+	if err != nil {
+		t.Fatalf("marshal normalized %s: %v", wantPath, err)
+	}
+	if string(gotNorm) != string(wantNorm) {
+		t.Fatalf("json content mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", gotPath, gotNorm, wantNorm)
+	}
+}
+
+func assertPprofTopEquals(t *testing.T, pbPath, wantPath string) {
+	t.Helper()
+	cmd := exec.Command("go", "tool", "pprof", "-top", pbPath)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("pprof top %s: %v", pbPath, err)
+	}
+	want, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", wantPath, err)
+	}
+	normalize := func(s string) string {
+		lines := strings.Split(s, "\n")
+		filtered := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if strings.HasPrefix(line, "Time: ") {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		return strings.Join(filtered, "\n")
+	}
+	gotText := normalize(string(out))
+	wantText := normalize(string(want))
+	if gotText != wantText {
+		t.Fatalf("pprof top mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", pbPath, gotText, wantText)
+	}
+}
+
 func TestBuildOptionsGPUStreamMode(t *testing.T) {
 	prevStream := *flagGPUStreamStdin
 	prevHostReplay := *flagGPUHostReplayInput
@@ -1551,6 +1652,39 @@ func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichWritesBrendanStyleFrame
 	}
 }
 
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-command-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-command-rich helper: %v\n%s", err, out)
+	}
+
+	goldenDir := filepath.Join("gpu", "testdata", "replay")
+	assertJSONContentEqualsIgnoringKeys(t,
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.raw.json"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.attributions.json"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.folded"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_command_sample_exec_rich.pb.gz"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.pprof.txt"),
+	)
+}
+
 func TestGPUOfflineDemoScriptHIPRocprofilerSDKOutputRichWritesBrendanStyleFrames(t *testing.T) {
 	outDir := t.TempDir()
 	cmd := exec.Command(
@@ -1572,6 +1706,39 @@ func TestGPUOfflineDemoScriptHIPRocprofilerSDKOutputRichWritesBrendanStyleFrames
 			t.Fatalf("missing %q in output:\n%s", want, got)
 		}
 	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKOutputRichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-output-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-output-rich helper: %v\n%s", err, out)
+	}
+
+	goldenDir := filepath.Join("gpu", "testdata", "replay")
+	assertJSONContentEqualsIgnoringKeys(t,
+		filepath.Join(outDir, "rocprofiler_sdk_output_sample_exec_rich.raw.json"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_output_sample_exec_rich.attributions.json"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_output_sample_exec_rich.folded"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(t,
+		filepath.Join(outDir, "rocprofiler_sdk_output_sample_exec_rich.pb.gz"),
+		filepath.Join(goldenDir, "rocprofiler_sdk_sample_exec_rich.pprof.txt"),
+	)
 }
 
 func TestGPULiveHIPLinuxDRMWrapperDryRunWithPID(t *testing.T) {
@@ -1787,8 +1954,13 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithSampleMode(t *testing.T) {
 		t.Fatalf("wrapper dry-run with sample mode: %v\n%s", err, out)
 	}
 	got := string(out)
-	if !strings.Contains(got, "PERF_AGENT_AMD_SAMPLE_MODE=real") {
-		t.Fatalf("missing collector mode env in output:\n%s", got)
+	for _, want := range []string{
+		"PERF_AGENT_AMD_SAMPLE_MODE=real",
+		"PERF_AGENT_AMD_SAMPLE_REAL_SOURCE=rocprofiler-sdk",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
 	}
 }
 
@@ -2697,6 +2869,7 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleSampleMode(t *testing.T) {
 	for _, want := range []string{
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
 		"--sample-mode real",
+		"--real-source rocprofiler-sdk",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
@@ -3358,7 +3531,7 @@ fi
 		t.Fatalf("write fake rocm-smi: %v", err)
 	}
 
-	cmd := exec.Command(binaryPath, "--mode", "real")
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocm-smi")
 	cmd.Env = append(
 		os.Environ(),
 		"PERF_AGENT_HIP_PID=4242",
@@ -3448,7 +3621,7 @@ exit 7
 		t.Fatalf("write fake rocm-smi: %v", err)
 	}
 
-	cmd := exec.Command(binaryPath, "--mode", "real")
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocm-smi")
 	cmd.Env = append(os.Environ(), "PERF_AGENT_ROCM_SMI_PATH="+rocmSMIPath)
 	out, err := cmd.CombinedOutput()
 	if err == nil {

@@ -69,6 +69,10 @@ type sampleRecord struct {
 	Device       device      `json:"device"`
 	TimeNS       int64       `json:"time_ns"`
 	KernelName   string      `json:"kernel_name"`
+	PC           uint64      `json:"pc,omitempty"`
+	Function     string      `json:"function,omitempty"`
+	File         string      `json:"file,omitempty"`
+	Line         uint32      `json:"line,omitempty"`
 	StallReason  string      `json:"stall_reason"`
 	SampleWeight int         `json:"weight"`
 }
@@ -93,14 +97,84 @@ type rocmSMIMetrics struct {
 }
 
 type rocprofV2Record struct {
-	Type        string `json:"type"`
-	DispatchID  string `json:"dispatch_id"`
-	SampleID    string `json:"sample_id"`
-	StartNS     int64  `json:"start_ns"`
-	EndNS       int64  `json:"end_ns"`
-	TimeNS      int64  `json:"time_ns"`
+	Type          string `json:"type"`
+	DispatchID    string `json:"dispatch_id"`
+	CorrelationID string `json:"correlation_id"`
+	SampleID      string `json:"sample_id"`
+	StartNS       int64  `json:"start_ns"`
+	BeginNS       int64  `json:"begin_ns"`
+	EndNS         int64  `json:"end_ns"`
+	CompleteNS    int64  `json:"complete_ns"`
+	TimeNS        int64  `json:"time_ns"`
+	TimestampNS   int64  `json:"timestamp_ns"`
+	PC            string `json:"pc"`
+	Function      string `json:"function"`
+	File          string `json:"file"`
+	Line          uint32 `json:"line"`
+	Location      struct {
+		PC       string `json:"pc"`
+		Function string `json:"function"`
+		File     string `json:"file"`
+		Line     uint32 `json:"line"`
+	} `json:"location"`
 	StallReason string `json:"stall_reason"`
 	Weight      int    `json:"weight"`
+}
+
+func (r rocprofV2Record) dispatchCorrelation() string {
+	if r.DispatchID != "" {
+		return r.DispatchID
+	}
+	return r.CorrelationID
+}
+
+func (r rocprofV2Record) startTimeNS() int64 {
+	if r.StartNS != 0 {
+		return r.StartNS
+	}
+	return r.BeginNS
+}
+
+func (r rocprofV2Record) endTimeNS() int64 {
+	if r.EndNS != 0 {
+		return r.EndNS
+	}
+	return r.CompleteNS
+}
+
+func (r rocprofV2Record) sampleTimeNS() int64 {
+	if r.TimeNS != 0 {
+		return r.TimeNS
+	}
+	return r.TimestampNS
+}
+
+func (r rocprofV2Record) samplePC() string {
+	if r.PC != "" {
+		return r.PC
+	}
+	return r.Location.PC
+}
+
+func (r rocprofV2Record) sampleFunction() string {
+	if r.Function != "" {
+		return r.Function
+	}
+	return r.Location.Function
+}
+
+func (r rocprofV2Record) sampleFile() string {
+	if r.File != "" {
+		return r.File
+	}
+	return r.Location.File
+}
+
+func (r rocprofV2Record) sampleLine() uint32 {
+	if r.Line != 0 {
+		return r.Line
+	}
+	return r.Location.Line
 }
 
 func envOrDefault(key, fallback string) string {
@@ -545,6 +619,7 @@ func runRocprofV2Real() error {
 		}
 		switch record.Type {
 		case "dispatch":
+			dispatchID := record.dispatchCorrelation()
 			if err := writeJSONLine(execRecord{
 				Kind: "exec",
 				Execution: execution{
@@ -552,27 +627,41 @@ func runRocprofV2Real() error {
 					DeviceID:  deviceID,
 					QueueID:   queueID,
 					ContextID: contextID,
-					ExecID:    record.DispatchID,
+					ExecID:    dispatchID,
 				},
-				Correlation: correlation{Backend: "amdsample", Value: record.DispatchID},
+				Correlation: correlation{Backend: "amdsample", Value: dispatchID},
 				Queue:       q,
 				KernelName:  kernelName,
-				StartNS:     record.StartNS,
-				EndNS:       record.EndNS,
+				StartNS:     record.startTimeNS(),
+				EndNS:       record.endTimeNS(),
 			}); err != nil {
 				return fmt.Errorf("write rocprofv2 exec record: %w", err)
 			}
 		case "sample":
 			sampleID := record.SampleID
+			dispatchID := record.dispatchCorrelation()
+			sampleTimeNS := record.sampleTimeNS()
 			if sampleID == "" {
-				sampleID = fmt.Sprintf("%s:%d", record.DispatchID, record.TimeNS)
+				sampleID = fmt.Sprintf("%s:%d", dispatchID, sampleTimeNS)
+			}
+			var pc uint64
+			if rawPC := record.samplePC(); rawPC != "" {
+				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(rawPC, "0x"), 16, 64)
+				if err != nil {
+					return fmt.Errorf("parse rocprofv2 sample pc: %w", err)
+				}
+				pc = parsedPC
 			}
 			if err := writeJSONLine(sampleRecord{
 				Kind:         "sample",
 				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
 				Device:       dev,
-				TimeNS:       record.TimeNS,
+				TimeNS:       sampleTimeNS,
 				KernelName:   kernelName,
+				PC:           pc,
+				Function:     record.sampleFunction(),
+				File:         record.sampleFile(),
+				Line:         record.sampleLine(),
 				StallReason:  record.StallReason,
 				SampleWeight: record.Weight,
 			}); err != nil {

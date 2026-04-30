@@ -396,8 +396,9 @@ bash scripts/gpu-live-hip-amdsample.sh \
 ```
 
 There is now also an explicit `rocprofv2` real-source hook. Today it expects a
-collector-style executable behind that path and forwards its NDJSON output
-through the same `amdsample` contract:
+collector-style executable behind that path and adapts simple native JSON
+records such as `dispatch` and `sample` into the same `amdsample` contract,
+including alternate timing aliases and nested source-location metadata:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \

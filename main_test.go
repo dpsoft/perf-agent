@@ -2524,8 +2524,8 @@ func TestAMDSampleCollectorBinaryUsesRocprofv2SourcePath(t *testing.T) {
 	rocprofv2Script := `#!/bin/sh
 cat <<EOF
 {"type":"dispatch","dispatch_id":"dispatch-1","start_ns":100,"end_ns":200}
-{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-1","time_ns":125,"stall_reason":"memory_wait","weight":11}
-{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-2","time_ns":175,"stall_reason":"wave_barrier","weight":5}
+{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-1","time_ns":125,"stall_reason":"memory_wait","weight":11,"pc":"0xabc","function":"flash_attn_fwd","file":"flash_attn.cu","line":77}
+{"type":"sample","dispatch_id":"dispatch-1","sample_id":"sample-2","time_ns":175,"stall_reason":"wave_barrier","weight":5,"pc":"0xdef","function":"flash_attn_epilogue","file":"flash_attn_epilogue.cu","line":91}
 EOF
 `
 	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
@@ -2568,6 +2568,115 @@ EOF
 	}
 	if execEv.Exec.Queue.QueueID != "compute:7" {
 		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
+	}
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	if sample1.Sample.PC != 0xabc {
+		t.Fatalf("sample1 pc=%#x", sample1.Sample.PC)
+	}
+	if sample1.Sample.Function != "flash_attn_fwd" {
+		t.Fatalf("sample1 function=%q", sample1.Sample.Function)
+	}
+	if sample1.Sample.File != "flash_attn.cu" {
+		t.Fatalf("sample1 file=%q", sample1.Sample.File)
+	}
+	if sample1.Sample.Line != 77 {
+		t.Fatalf("sample1 line=%d", sample1.Sample.Line)
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if sample2.Sample.PC != 0xdef {
+		t.Fatalf("sample2 pc=%#x", sample2.Sample.PC)
+	}
+	if sample2.Sample.Function != "flash_attn_epilogue" {
+		t.Fatalf("sample2 function=%q", sample2.Sample.Function)
+	}
+	if sample2.Sample.File != "flash_attn_epilogue.cu" {
+		t.Fatalf("sample2 file=%q", sample2.Sample.File)
+	}
+	if sample2.Sample.Line != 91 {
+		t.Fatalf("sample2 line=%d", sample2.Sample.Line)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesAlternateRocprofv2NativeShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
+	rocprofv2Script := `#!/bin/sh
+cat <<EOF
+{"type":"dispatch","correlation_id":"dispatch-9","begin_ns":1000,"complete_ns":1400}
+{"type":"sample","correlation_id":"dispatch-9","timestamp_ns":1100,"stall_reason":"inst_fetch","weight":3,"location":{"pc":"0x1234","function":"attention_kernel","file":"attention.hip","line":44}}
+{"type":"sample","correlation_id":"dispatch-9","sample_id":"sample-9b","timestamp_ns":1300,"stall_reason":"memory_wait","weight":7,"location":{"pc":"0x5678","function":"attention_epilogue","file":"attention_epilogue.hip","line":58}}
+EOF
+`
+	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
+		t.Fatalf("write fake rocprofv2: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFV2_PATH="+rocprofv2Path,
+		"PERF_AGENT_HIP_PID=9898",
+		"PERF_AGENT_GPU_KERNEL_NAME=alternate_kernel",
+		"PERF_AGENT_GPU_DEVICE_ID=gfx950:1",
+		"PERF_AGENT_GPU_DEVICE_NAME=MI325X",
+		"PERF_AGENT_GPU_QUEUE_ID=compute:11",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector alternate rocprofv2 mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ExecID != "dispatch-9" {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+	if execEv.Exec.StartNs != 1000 || execEv.Exec.EndNs != 1400 {
+		t.Fatalf("exec window=%d..%d", execEv.Exec.StartNs, execEv.Exec.EndNs)
+	}
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	if sample1.Sample.Correlation.Value != "dispatch-9:1100" {
+		t.Fatalf("sample1 correlation=%q", sample1.Sample.Correlation.Value)
+	}
+	if sample1.Sample.TimeNs != 1100 {
+		t.Fatalf("sample1 time_ns=%d", sample1.Sample.TimeNs)
+	}
+	if sample1.Sample.PC != 0x1234 {
+		t.Fatalf("sample1 pc=%#x", sample1.Sample.PC)
+	}
+	if sample1.Sample.Function != "attention_kernel" || sample1.Sample.File != "attention.hip" || sample1.Sample.Line != 44 {
+		t.Fatalf("sample1 location=%q %q %d", sample1.Sample.Function, sample1.Sample.File, sample1.Sample.Line)
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if sample2.Sample.Correlation.Value != "sample-9b" {
+		t.Fatalf("sample2 correlation=%q", sample2.Sample.Correlation.Value)
+	}
+	if sample2.Sample.TimeNs != 1300 {
+		t.Fatalf("sample2 time_ns=%d", sample2.Sample.TimeNs)
+	}
+	if sample2.Sample.PC != 0x5678 {
+		t.Fatalf("sample2 pc=%#x", sample2.Sample.PC)
+	}
+	if sample2.Sample.Function != "attention_epilogue" || sample2.Sample.File != "attention_epilogue.hip" || sample2.Sample.Line != 58 {
+		t.Fatalf("sample2 location=%q %q %d", sample2.Sample.Function, sample2.Sample.File, sample2.Sample.Line)
 	}
 }
 

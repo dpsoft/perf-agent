@@ -677,6 +677,15 @@ bash scripts/gpu-offline-demo.sh hip-rocprofiler-sdk-rich /tmp/gpu-rocprofiler-s
 xdg-open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html
 ```
 
+This renders a mixed `CPU + GPU Flame Graph: rocprofiler_sdk_sample_exec_rich` artifact, keeping the CPU launch side (`train_step -> hipLaunchKernel`) visible above the richer GPU `function/source/pc` frames.
+
+Recorder-envelope variant of the same modern SDK path:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofiler-sdk-recorder-rich /tmp/gpu-rocprofiler-sdk-recorder-rich
+xdg-open /tmp/gpu-rocprofiler-sdk-recorder-rich/rocprofiler_sdk_recorder_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofiler-sdk-recorder-rich/rocprofiler_sdk_recorder_sample_exec_rich.html
+```
+
 And the `rocprofv3` command-shaped compatibility variant:
 
 ```bash

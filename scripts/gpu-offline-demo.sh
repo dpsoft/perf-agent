@@ -477,7 +477,7 @@ if [[ -s "${FOLDED_PATH}" ]]; then
             "CGO_CFLAGS=${DEFAULT_CGO_CFLAGS}" \
             "CGO_LDFLAGS=${DEFAULT_CGO_LDFLAGS}" \
             go run ./cmd/flamegraph-svg \
-            --title "GPU Flame Graph: ${NAME}" \
+            --title "CPU + GPU Flame Graph: ${NAME}" \
             --input "${FOLDED_PATH}" \
             --output "${SVG_PATH}" \
             --html-output "${HTML_PATH}" \

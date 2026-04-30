@@ -1159,6 +1159,28 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithCollectorCommand(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperRejectsLegacySampleCommandEnv(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_AMD_SAMPLE_COMMAND=printf legacy-command")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected legacy env failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "PERF_AGENT_AMD_SAMPLE_COMMAND is no longer supported") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperRejectsCollectorPathWithSampleCommand(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1181,6 +1203,25 @@ func TestGPULiveHIPAMDSampleWrapperRejectsCollectorPathWithSampleCommand(t *test
 	}
 	if !strings.Contains(string(out), "cannot combine --sample-command with --sample-collector-path") {
 		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperHelpOmitsLegacySampleCommandEnv(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--help",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper help: %v\n%s", err, out)
+	}
+	got := string(out)
+	if strings.Contains(got, "PERF_AGENT_AMD_SAMPLE_COMMAND") {
+		t.Fatalf("legacy env leaked into help output:\n%s", got)
+	}
+	if !strings.Contains(got, "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND") {
+		t.Fatalf("missing collector command env in help output:\n%s", got)
 	}
 }
 
@@ -1285,7 +1326,7 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithoutPIDShowsProducerContract(t *test
 	got := string(out)
 	for _, want := range []string{
 		"dry-run placeholder: pass --pid <live-hip-process-pid> for a real run",
-		"PERF_AGENT_HIP_PID=<pid>",
+		"PERF_AGENT_HIP_PID=\\<pid\\>",
 		"PERF_AGENT_HIP_LIBRARY=/opt/rocm/lib/libamdhip64.so",
 		"PERF_AGENT_HIP_SYMBOL=hipLaunchKernel",
 		"PERF_AGENT_GPU_DURATION=2s",

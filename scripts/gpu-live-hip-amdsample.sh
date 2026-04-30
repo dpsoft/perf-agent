@@ -17,7 +17,7 @@ Real runs require:
       - --sample-collector-command
       - --sample-command
       - PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH
-      - PERF_AGENT_AMD_SAMPLE_COMMAND
+      - PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND
       - the default checked-in adapter / producer path
 EOF
 }
@@ -70,7 +70,7 @@ OUTDIR="/tmp/gpu-live"
 PID=""
 HIP_LIBRARY=""
 HIP_SYMBOL="hipLaunchKernel"
-SAMPLE_COMMAND="${PERF_AGENT_AMD_SAMPLE_COMMAND:-}"
+SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
 SAMPLE_COLLECTOR_COMMAND="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}"
 DURATION="2s"
@@ -130,6 +130,10 @@ if [[ -z "${HIP_LIBRARY}" ]]; then
 fi
 if [[ -z "${HIP_LIBRARY}" ]]; then
     echo "could not discover HIP library; pass --hip-library or set PERF_AGENT_HIP_LIBRARY" >&2
+    exit 1
+fi
+if [[ -n "${PERF_AGENT_AMD_SAMPLE_COMMAND:-}" ]]; then
+    echo "PERF_AGENT_AMD_SAMPLE_COMMAND is no longer supported; use --sample-command or PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND" >&2
     exit 1
 fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then

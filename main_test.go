@@ -1159,6 +1159,36 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithCollectorCommand(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithKernelName(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--kernel-name",
+		"flash_attn_fwd",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with kernel name: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"PERF_AGENT_GPU_KERNEL_NAME=flash_attn_fwd",
+		"scripts/gpu-offline-demo.sh live-hip-amdsample /tmp/gpu-live-wrapper",
+		"--pid 4242",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperRejectsLegacySampleCommandEnv(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1660,6 +1690,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorCommand(t *testing.T) {
 	}
 	if strings.Contains(got, "--sample-command") {
 		t.Fatalf("collector-command dry-run should not force --sample-command:\n%s", got)
+	}
+}
+
+func TestGPULiveHIPShimDemoDryRunForAMDSampleKernelName(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--kernel-name",
+		"flash_attn_fwd",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample kernel name: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--kernel-name flash_attn_fwd",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
 	}
 }
 

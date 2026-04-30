@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -70,6 +70,7 @@ OUTDIR="/tmp/gpu-live"
 PID=""
 HIP_LIBRARY=""
 HIP_SYMBOL="hipLaunchKernel"
+KERNEL_NAME="${PERF_AGENT_GPU_KERNEL_NAME:-hip_launch_shim_kernel}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
 SAMPLE_COLLECTOR_COMMAND="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}"
@@ -95,6 +96,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --hip-symbol)
             HIP_SYMBOL="${2:-}"
+            shift 2
+            ;;
+        --kernel-name)
+            KERNEL_NAME="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -211,7 +216,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_HIP_LIBRARY=${HIP_LIBRARY}"
     "PERF_AGENT_HIP_SYMBOL=${HIP_SYMBOL}"
     "PERF_AGENT_GPU_DURATION=${DURATION}"
-    "PERF_AGENT_GPU_KERNEL_NAME=hip_launch_shim_kernel"
+    "PERF_AGENT_GPU_KERNEL_NAME=${KERNEL_NAME}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"
     bash

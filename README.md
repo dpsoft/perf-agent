@@ -354,6 +354,16 @@ adapter script automatically. The adapter can then:
 - run `PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND`
 - or fall back to the checked-in synthetic producer
 
+If the live target kernel name is known, pass it explicitly so the producer /
+collector contract does not stay tied to the local shim default:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --kernel-name flash_attn_fwd
+```
+
 Or preview the wrapped command shape without a real PID yet:
 
 ```bash
@@ -391,6 +401,7 @@ For the local HIP shim harness, the same script can now target either Linux surf
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-collector-path /opt/rocm/bin/amd-sample-collector
 ```
 

@@ -34,6 +34,12 @@ func TestParseV2CgroupPath(t *testing.T) {
 			want:   "",
 			wantOK: false,
 		},
+		{
+			name:   "v2 line with CRLF terminator",
+			input:  "0::/kubepods.slice/foo\r\n",
+			want:   "/kubepods.slice/foo",
+			wantOK: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -70,6 +76,11 @@ func TestExtractPodUID(t *testing.T) {
 			path: "/kubepods.slice/kubepods-besteffort.slice",
 			want: "",
 		},
+		{
+			// mixed - and _ separators: not produced by any kubelet, tightened regex rejects it
+			path: "/kubepods.slice/.../pod12345678-1234_1234-1234-123456789abc.slice/foo",
+			want: "",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
@@ -104,6 +115,10 @@ func TestExtractContainerID(t *testing.T) {
 		},
 		{
 			path: "/kubepods.slice/kubepods-burstable.slice", // no leaf yet
+			want: "",
+		},
+		{
+			path: "/kubepods/burstable/pod-abc/abcdef01234", // 11-char hex leaf, below 12-char threshold
 			want: "",
 		},
 	}

@@ -10,24 +10,33 @@ import (
 // cgroup v2 path (the line beginning with "0::"). Hybrid hosts (cgroup v1
 // + v2 mounted) include both formats; pure v1 hosts have no 0:: line.
 func parseV2CgroupPath(body []byte) (string, bool) {
-	for line := range strings.SplitSeq(string(body), "\n") {
+	for line := range strings.Lines(string(body)) {
+		line = strings.TrimRight(line, "\r\n")
 		if rest, ok := strings.CutPrefix(line, "0::"); ok {
-			return strings.TrimRight(rest, "\r"), true
+			return rest, true
 		}
 	}
 	return "", false
 }
 
 // podUIDRE matches the pod-UID segment in a kubepods cgroup path. Two
-// flavors are produced by kubelet drivers:
+// driver styles are produced by kubelet:
 //
-//   - cgroupfs driver: pod<UID> with dashes (e.g. pod12345678-1234-...)
-//   - systemd driver: kubepods-burstable-pod<UID>.slice with underscores
-//     in place of dashes (e.g. ...pod12345678_1234_1234_1234_...slice)
+//   - cgroupfs driver: pod<UID> with all-dashes separators
+//     (e.g. pod12345678-1234-1234-1234-123456789abc)
+//   - systemd driver: ...pod<UID>.slice with all-underscores separators
+//     (e.g. ...pod12345678_1234_1234_1234_123456789abc.slice)
 //
-// The regex captures both variants; canonicalisation (underscores → dashes)
-// happens after extraction.
-var podUIDRE = regexp.MustCompile(`pod([0-9a-fA-F]{8}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{12})`)
+// Each alternative requires homogeneous separators within a single UID;
+// mixed separators are not produced by any kubelet and would indicate a
+// malformed path. Canonicalisation to dashes happens after extraction.
+var podUIDRE = regexp.MustCompile(
+	`pod(` +
+		`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` +
+		`|` +
+		`[0-9a-fA-F]{8}_[0-9a-fA-F]{4}_[0-9a-fA-F]{4}_[0-9a-fA-F]{4}_[0-9a-fA-F]{12}` +
+		`)`,
+)
 
 func extractPodUID(cgroupPath string) string {
 	if !strings.Contains(cgroupPath, "kubepods") {
@@ -51,7 +60,7 @@ var containerIDRuntimePrefixes = []string{
 
 func extractContainerID(cgroupPath string) string {
 	leaf := filepath.Base(cgroupPath)
-	if leaf == "" || leaf == "/" {
+	if leaf == "." || leaf == ".." || leaf == "/" {
 		return ""
 	}
 	// Strip the .scope suffix (systemd driver) before checking prefixes.
@@ -70,6 +79,9 @@ func extractContainerID(cgroupPath string) string {
 }
 
 func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
 	for _, r := range s {
 		switch {
 		case r >= '0' && r <= '9':

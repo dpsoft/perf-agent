@@ -82,14 +82,15 @@ type sampleRecord struct {
 }
 
 type collectorConfig struct {
-	mode               string
-	realSource         string
-	rocprofilerSDKMode string
-	kernelName         string
-	deviceID           string
-	deviceName         string
-	queueID            string
-	sleepBeforeMS      int
+	mode                  string
+	realSource            string
+	rocprofilerSDKMode    string
+	rocprofilerSDKLibrary string
+	kernelName            string
+	deviceID              string
+	deviceName            string
+	queueID               string
+	sleepBeforeMS         int
 }
 
 type rocmSMIMetrics struct {
@@ -927,6 +928,15 @@ func runRocprofilerSDKReal(cfg collectorConfig) error {
 	case "", defaultRocprofilerSDKMode:
 		return runRocprofilerSDKExternal()
 	case "native":
+		if cfg.rocprofilerSDKLibrary == "" {
+			return fmt.Errorf("rocprofiler-sdk native mode requires PERF_AGENT_ROCPROFILER_SDK_LIBRARY or --rocprofiler-sdk-library")
+		}
+		if os.Getenv("PERF_AGENT_ROCPROFILER_SDK_PATH") != "" ||
+			os.Getenv("PERF_AGENT_ROCPROFILER_SDK_COMMAND") != "" ||
+			os.Getenv("PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH") != "" ||
+			os.Getenv("PERF_AGENT_ROCPROFILER_SDK_OUTPUT_DIR") != "" {
+			return fmt.Errorf("rocprofiler-sdk native mode cannot use external command/path/output options")
+		}
 		return fmt.Errorf("rocprofiler-sdk native mode is not implemented")
 	default:
 		return fmt.Errorf("unsupported rocprofiler-sdk mode: %s", cfg.rocprofilerSDKMode)
@@ -1079,6 +1089,7 @@ func main() {
 	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
 	realSource := flag.String("real-source", envOrDefault("PERF_AGENT_AMD_SAMPLE_REAL_SOURCE", defaultRealSource), "real collector source")
 	rocprofilerSDKMode := flag.String("rocprofiler-sdk-mode", envOrDefault("PERF_AGENT_ROCPROFILER_SDK_MODE", defaultRocprofilerSDKMode), "rocprofiler-sdk mode (external|native)")
+	rocprofilerSDKLibrary := flag.String("rocprofiler-sdk-library", envOrDefault("PERF_AGENT_ROCPROFILER_SDK_LIBRARY", ""), "rocprofiler-sdk native library path")
 	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
 	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
 	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
@@ -1087,14 +1098,15 @@ func main() {
 	flag.Parse()
 
 	cfg := collectorConfig{
-		mode:               *mode,
-		realSource:         *realSource,
-		rocprofilerSDKMode: *rocprofilerSDKMode,
-		kernelName:         *kernelName,
-		deviceID:           *deviceID,
-		deviceName:         *deviceName,
-		queueID:            *queueID,
-		sleepBeforeMS:      *sleepBeforeMS,
+		mode:                  *mode,
+		realSource:            *realSource,
+		rocprofilerSDKMode:    *rocprofilerSDKMode,
+		rocprofilerSDKLibrary: *rocprofilerSDKLibrary,
+		kernelName:            *kernelName,
+		deviceID:              *deviceID,
+		deviceName:            *deviceName,
+		queueID:               *queueID,
+		sleepBeforeMS:         *sleepBeforeMS,
 	}
 
 	sleepBefore(cfg.sleepBeforeMS)

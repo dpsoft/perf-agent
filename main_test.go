@@ -2612,6 +2612,7 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKMode(t *testing.T) {
 		"--sample-mode", "real",
 		"--real-source", "rocprofiler-sdk",
 		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -2620,6 +2621,49 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKMode(t *testing.T) {
 	got := string(out)
 	if !strings.Contains(got, "PERF_AGENT_ROCPROFILER_SDK_MODE=native") {
 		t.Fatalf("missing rocprofiler-sdk mode env in output:\n%s", got)
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKNativeLibrary(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofiler-sdk native library: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFILER_SDK_LIBRARY=/opt/rocm/lib/librocprofiler-sdk.so") {
+		t.Fatalf("missing rocprofiler-sdk native library env in output:\n%s", got)
+	}
+}
+
+func TestGPULiveHIPAMDSampleWrapperRejectsRocprofilerSDKNativeModeWithCommand(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-command", "collector --emit-json",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected native mode conflict failure:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk native mode cannot use external command/path/output options") {
+		t.Fatalf("unexpected native mode conflict output:\n%s", out)
 	}
 }
 
@@ -3613,6 +3657,33 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofilerSDKMode(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofilerSDKNativeLibrary(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface", "amdsample",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofiler-sdk native library: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--real-source rocprofiler-sdk",
+		"--rocprofiler-sdk-mode native",
+		"--rocprofiler-sdk-library /opt/rocm/lib/librocprofiler-sdk.so",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputPath(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -4283,6 +4354,7 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
 		"--mode", "real",
 		"--real-source", "rocprofiler-sdk",
 		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
 	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
@@ -4290,6 +4362,49 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "rocprofiler-sdk native mode is not implemented") {
 		t.Fatalf("unexpected native mode error:\n%s", out)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithoutLibrary(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing native library failure:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk native mode requires PERF_AGENT_ROCPROFILER_SDK_LIBRARY or --rocprofiler-sdk-library") {
+		t.Fatalf("unexpected missing native library error:\n%s", out)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithExternalCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", "/opt/rocm/lib/librocprofiler-sdk.so",
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=collector --emit-json",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected native mode external command failure:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk native mode cannot use external command/path/output options") {
+		t.Fatalf("unexpected native mode external command error:\n%s", out)
 	}
 }
 

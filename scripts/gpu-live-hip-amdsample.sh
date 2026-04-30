@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocprofiler-sdk-mode <external|native>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocprofiler-sdk-mode <external|native>] [--rocprofiler-sdk-library <path>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -77,6 +77,7 @@ QUEUE_ID="${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"
 SAMPLE_MODE="${PERF_AGENT_AMD_SAMPLE_MODE:-synthetic}"
 REAL_SOURCE="${PERF_AGENT_AMD_SAMPLE_REAL_SOURCE:-rocprofiler-sdk}"
 ROCPROFILER_SDK_MODE="${PERF_AGENT_ROCPROFILER_SDK_MODE:-external}"
+ROCPROFILER_SDK_LIBRARY="${PERF_AGENT_ROCPROFILER_SDK_LIBRARY:-}"
 ROCM_SMI_PATH="${PERF_AGENT_ROCM_SMI_PATH:-}"
 ROCPROFV2_PATH="${PERF_AGENT_ROCPROFV2_PATH:-}"
 ROCPROFV2_COMMAND="${PERF_AGENT_ROCPROFV2_COMMAND:-}"
@@ -186,6 +187,10 @@ while [[ $# -gt 0 ]]; do
             ROCPROFILER_SDK_MODE="${2:-}"
             shift 2
             ;;
+        --rocprofiler-sdk-library)
+            ROCPROFILER_SDK_LIBRARY="${2:-}"
+            shift 2
+            ;;
         --rocprofiler-sdk-command)
             ROCPROFILER_SDK_COMMAND="${2:-}"
             shift 2
@@ -265,6 +270,20 @@ if [[ -n "${ROCPROFILER_SDK_OUTPUT_PATH}" && -n "${ROCPROFILER_SDK_OUTPUT_DIR}" 
     echo "cannot combine --rocprofiler-sdk-output-path with --rocprofiler-sdk-output-dir" >&2
     exit 1
 fi
+if [[ "${REAL_SOURCE}" == "rocprofiler-sdk" && "${ROCPROFILER_SDK_MODE}" == "native" ]]; then
+    if [[ -n "${ROCPROFILER_SDK_PATH}" || -n "${ROCPROFILER_SDK_COMMAND}" || -n "${ROCPROFILER_SDK_OUTPUT_PATH}" || -n "${ROCPROFILER_SDK_OUTPUT_DIR}" ]]; then
+        echo "rocprofiler-sdk native mode cannot use external command/path/output options" >&2
+        exit 1
+    fi
+    if [[ -n "${SAMPLE_COMMAND}" || -n "${SAMPLE_COLLECTOR_PATH}" || -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
+        echo "rocprofiler-sdk native mode cannot use sample-command or sample-collector overrides" >&2
+        exit 1
+    fi
+    if [[ -z "${ROCPROFILER_SDK_LIBRARY}" ]]; then
+        echo "rocprofiler-sdk native mode requires --rocprofiler-sdk-library or PERF_AGENT_ROCPROFILER_SDK_LIBRARY" >&2
+        exit 1
+    fi
+fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
     exit 1
@@ -297,8 +316,10 @@ if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofiler-sdk" && -n "${ROCP
     echo "rocprofiler-sdk path is not executable: ${ROCPROFILER_SDK_PATH}" >&2
     exit 1
 fi
+if [[ "${REAL_SOURCE}" != "rocprofiler-sdk" || "${ROCPROFILER_SDK_MODE}" != "native" ]]; then
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
     SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
+fi
 fi
 
 RAW_PATH="${OUTDIR}/live_hip_amdsample.raw.json"
@@ -377,6 +398,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_ROCPROFV3_OUTPUT_DIR=${ROCPROFV3_OUTPUT_DIR}"
     "PERF_AGENT_ROCPROFILER_SDK_PATH=${ROCPROFILER_SDK_PATH}"
     "PERF_AGENT_ROCPROFILER_SDK_MODE=${ROCPROFILER_SDK_MODE}"
+    "PERF_AGENT_ROCPROFILER_SDK_LIBRARY=${ROCPROFILER_SDK_LIBRARY}"
     "PERF_AGENT_ROCPROFILER_SDK_COMMAND=${ROCPROFILER_SDK_COMMAND}"
     "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH=${ROCPROFILER_SDK_OUTPUT_PATH}"
     "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_DIR=${ROCPROFILER_SDK_OUTPUT_DIR}"
@@ -387,6 +409,38 @@ declare -a PRODUCER_CMD=(
     -lc
     "${SAMPLE_COMMAND}"
 )
+
+if [[ "${REAL_SOURCE}" == "rocprofiler-sdk" && "${ROCPROFILER_SDK_MODE}" == "native" ]]; then
+    PRODUCER_CMD=(
+        env
+        "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
+        "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
+        "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
+        "PERF_AGENT_HIP_PID=${SUDO_CMD[13]}"
+        "PERF_AGENT_HIP_LIBRARY=${HIP_LIBRARY}"
+        "PERF_AGENT_HIP_SYMBOL=${HIP_SYMBOL}"
+        "PERF_AGENT_GPU_DURATION=${DURATION}"
+        "PERF_AGENT_GPU_KERNEL_NAME=${KERNEL_NAME}"
+        "PERF_AGENT_GPU_DEVICE_ID=${DEVICE_ID}"
+        "PERF_AGENT_GPU_DEVICE_NAME=${DEVICE_NAME}"
+        "PERF_AGENT_GPU_QUEUE_ID=${QUEUE_ID}"
+        "PERF_AGENT_AMD_SAMPLE_MODE=${SAMPLE_MODE}"
+        "PERF_AGENT_AMD_SAMPLE_REAL_SOURCE=${REAL_SOURCE}"
+        "PERF_AGENT_ROCPROFILER_SDK_MODE=${ROCPROFILER_SDK_MODE}"
+        "PERF_AGENT_ROCPROFILER_SDK_LIBRARY=${ROCPROFILER_SDK_LIBRARY}"
+        go
+        run
+        ./cmd/amd-sample-collector
+        --mode
+        real
+        --real-source
+        rocprofiler-sdk
+        --rocprofiler-sdk-mode
+        native
+        --rocprofiler-sdk-library
+        "${ROCPROFILER_SDK_LIBRARY}"
+    )
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     printf '%s | %s\n' "$(quote_cmd "${PRODUCER_CMD[@]}")" "$(quote_cmd "${SUDO_CMD[@]}")"

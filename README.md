@@ -381,6 +381,8 @@ bash scripts/gpu-live-hip-amdsample.sh \
 
 The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning the collector consumes an external producer through command/path/output-file contracts. A future `native` mode is reserved for the in-process SDK-backed producer.
 
+When exercising that future seam today, use `--rocprofiler-sdk-mode native --rocprofiler-sdk-library /path/to/librocprofiler-sdk.so`. The branch validates the native contract and rejects mixing it with the external command/path/output knobs.
+
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:
 - exec `--sample-collector-path` / `PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH` directly

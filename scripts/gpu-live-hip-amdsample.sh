@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocprofiler-sdk-mode <external|native>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -76,6 +76,7 @@ DEVICE_NAME="${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"
 QUEUE_ID="${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"
 SAMPLE_MODE="${PERF_AGENT_AMD_SAMPLE_MODE:-synthetic}"
 REAL_SOURCE="${PERF_AGENT_AMD_SAMPLE_REAL_SOURCE:-rocprofiler-sdk}"
+ROCPROFILER_SDK_MODE="${PERF_AGENT_ROCPROFILER_SDK_MODE:-external}"
 ROCM_SMI_PATH="${PERF_AGENT_ROCM_SMI_PATH:-}"
 ROCPROFV2_PATH="${PERF_AGENT_ROCPROFV2_PATH:-}"
 ROCPROFV2_COMMAND="${PERF_AGENT_ROCPROFV2_COMMAND:-}"
@@ -179,6 +180,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocprofiler-sdk-path)
             ROCPROFILER_SDK_PATH="${2:-}"
+            shift 2
+            ;;
+        --rocprofiler-sdk-mode)
+            ROCPROFILER_SDK_MODE="${2:-}"
             shift 2
             ;;
         --rocprofiler-sdk-command)
@@ -371,6 +376,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_ROCPROFV3_OUTPUT_PATH=${ROCPROFV3_OUTPUT_PATH}"
     "PERF_AGENT_ROCPROFV3_OUTPUT_DIR=${ROCPROFV3_OUTPUT_DIR}"
     "PERF_AGENT_ROCPROFILER_SDK_PATH=${ROCPROFILER_SDK_PATH}"
+    "PERF_AGENT_ROCPROFILER_SDK_MODE=${ROCPROFILER_SDK_MODE}"
     "PERF_AGENT_ROCPROFILER_SDK_COMMAND=${ROCPROFILER_SDK_COMMAND}"
     "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH=${ROCPROFILER_SDK_OUTPUT_PATH}"
     "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_DIR=${ROCPROFILER_SDK_OUTPUT_DIR}"

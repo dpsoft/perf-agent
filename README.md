@@ -379,6 +379,8 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --pid 4242
 ```
 
+The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning the collector consumes an external producer through command/path/output-file contracts. A future `native` mode is reserved for the in-process SDK-backed producer.
+
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:
 - exec `--sample-collector-path` / `PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH` directly
@@ -678,6 +680,8 @@ xdg-open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html 2>/
 ```
 
 This renders a mixed `CPU + GPU Flame Graph: rocprofiler_sdk_sample_exec_rich` artifact, keeping the CPU launch side (`train_step -> hipLaunchKernel`) visible above the richer GPU `function/source/pc` frames.
+
+This canonical SDK demo currently exercises the `rocprofiler-sdk` `external` mode rather than an in-process native SDK collector.
 
 Recorder-envelope variant of the same modern SDK path:
 

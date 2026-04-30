@@ -2602,6 +2602,27 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKOutputDir(t *testing.
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofilerSDKMode(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofiler-sdk mode: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFILER_SDK_MODE=native") {
+		t.Fatalf("missing rocprofiler-sdk mode env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2OutputPath(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -3567,6 +3588,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofilerSDKOutputDir(t *testing.
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofilerSDKMode(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface", "amdsample",
+		"--sample-mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofiler-sdk mode: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--real-source rocprofiler-sdk",
+		"--rocprofiler-sdk-mode native",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputPath(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -4225,6 +4271,25 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
 	}
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected native mode failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk native mode is not implemented") {
+		t.Fatalf("unexpected native mode error:\n%s", out)
 	}
 }
 

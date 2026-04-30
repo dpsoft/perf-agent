@@ -17,18 +17,19 @@ import (
 )
 
 const (
-	defaultKernelName = "hip_launch_shim_kernel"
-	defaultDeviceID   = "gfx1103:0"
-	defaultDeviceName = "AMD Radeon 780M Graphics"
-	defaultQueueID    = "compute:0"
-	defaultMode       = "synthetic"
-	defaultRealSource = "rocprofiler-sdk"
-	defaultROCMSMI    = "rocm-smi"
-	defaultRocprofV2  = "rocprofv2"
-	defaultRocprofV3  = "rocprofv3"
-	defaultRocprofilerSDK = "rocprofiler-sdk"
-	maxRealSpacing    = 100 * time.Millisecond
-	maxRealPolls      = 32
+	defaultKernelName         = "hip_launch_shim_kernel"
+	defaultDeviceID           = "gfx1103:0"
+	defaultDeviceName         = "AMD Radeon 780M Graphics"
+	defaultQueueID            = "compute:0"
+	defaultMode               = "synthetic"
+	defaultRealSource         = "rocprofiler-sdk"
+	defaultROCMSMI            = "rocm-smi"
+	defaultRocprofV2          = "rocprofv2"
+	defaultRocprofV3          = "rocprofv3"
+	defaultRocprofilerSDK     = "rocprofiler-sdk"
+	defaultRocprofilerSDKMode = "external"
+	maxRealSpacing            = 100 * time.Millisecond
+	maxRealPolls              = 32
 )
 
 type correlation struct {
@@ -81,13 +82,14 @@ type sampleRecord struct {
 }
 
 type collectorConfig struct {
-	mode          string
-	realSource    string
-	kernelName    string
-	deviceID      string
-	deviceName    string
-	queueID       string
-	sleepBeforeMS int
+	mode               string
+	realSource         string
+	rocprofilerSDKMode string
+	kernelName         string
+	deviceID           string
+	deviceName         string
+	queueID            string
+	sleepBeforeMS      int
 }
 
 type rocmSMIMetrics struct {
@@ -125,27 +127,27 @@ type rocprofV2Record struct {
 }
 
 type rocprofilerSDKRecord struct {
-	Kind         string `json:"kind"`
-	ID           string `json:"id"`
-	DispatchID   string `json:"dispatch_id"`
-	SampleID     string `json:"sample_id"`
-	StartNS      int64  `json:"start_ns"`
-	BeginNS      int64  `json:"begin_ns"`
-	EndNS        int64  `json:"end_ns"`
-	CompleteNS   int64  `json:"complete_ns"`
-	TimeNS       int64  `json:"time_ns"`
-	TimestampNS  int64  `json:"timestamp_ns"`
-	KernelName   string `json:"kernel_name"`
-	DeviceID     string `json:"device_id"`
-	DeviceName   string `json:"device_name"`
-	QueueID      string `json:"queue_id"`
-	PC           string `json:"pc"`
-	Function     string `json:"function"`
-	File         string `json:"file"`
-	Line         uint32 `json:"line"`
-	StallReason  string `json:"stall_reason"`
-	Weight       int    `json:"weight"`
-	Kernel       struct {
+	Kind        string `json:"kind"`
+	ID          string `json:"id"`
+	DispatchID  string `json:"dispatch_id"`
+	SampleID    string `json:"sample_id"`
+	StartNS     int64  `json:"start_ns"`
+	BeginNS     int64  `json:"begin_ns"`
+	EndNS       int64  `json:"end_ns"`
+	CompleteNS  int64  `json:"complete_ns"`
+	TimeNS      int64  `json:"time_ns"`
+	TimestampNS int64  `json:"timestamp_ns"`
+	KernelName  string `json:"kernel_name"`
+	DeviceID    string `json:"device_id"`
+	DeviceName  string `json:"device_name"`
+	QueueID     string `json:"queue_id"`
+	PC          string `json:"pc"`
+	Function    string `json:"function"`
+	File        string `json:"file"`
+	Line        uint32 `json:"line"`
+	StallReason string `json:"stall_reason"`
+	Weight      int    `json:"weight"`
+	Kernel      struct {
 		Name string `json:"name"`
 	} `json:"kernel"`
 	Device struct {
@@ -604,7 +606,7 @@ func runSynthetic(cfg collectorConfig) error {
 func runReal(cfg collectorConfig) error {
 	switch cfg.realSource {
 	case "", defaultRealSource:
-		return runRocprofilerSDKReal()
+		return runRocprofilerSDKReal(cfg)
 	case "rocm-smi":
 		return runROCMSMIReal(cfg)
 	case "rocprofv2":
@@ -920,7 +922,18 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 	return nil
 }
 
-func runRocprofilerSDKReal() error {
+func runRocprofilerSDKReal(cfg collectorConfig) error {
+	switch cfg.rocprofilerSDKMode {
+	case "", defaultRocprofilerSDKMode:
+		return runRocprofilerSDKExternal()
+	case "native":
+		return fmt.Errorf("rocprofiler-sdk native mode is not implemented")
+	default:
+		return fmt.Errorf("unsupported rocprofiler-sdk mode: %s", cfg.rocprofilerSDKMode)
+	}
+}
+
+func runRocprofilerSDKExternal() error {
 	sourceBytes, err := readRealSourceBytes("PERF_AGENT_ROCPROFILER_SDK", defaultRocprofilerSDK, "rocprofiler-sdk")
 	if err != nil {
 		return err
@@ -1065,6 +1078,7 @@ func decodeRocprofilerSDKRecords(sourceBytes []byte) ([]rocprofilerSDKRecord, er
 func main() {
 	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
 	realSource := flag.String("real-source", envOrDefault("PERF_AGENT_AMD_SAMPLE_REAL_SOURCE", defaultRealSource), "real collector source")
+	rocprofilerSDKMode := flag.String("rocprofiler-sdk-mode", envOrDefault("PERF_AGENT_ROCPROFILER_SDK_MODE", defaultRocprofilerSDKMode), "rocprofiler-sdk mode (external|native)")
 	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
 	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
 	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
@@ -1073,13 +1087,14 @@ func main() {
 	flag.Parse()
 
 	cfg := collectorConfig{
-		mode:          *mode,
-		realSource:    *realSource,
-		kernelName:    *kernelName,
-		deviceID:      *deviceID,
-		deviceName:    *deviceName,
-		queueID:       *queueID,
-		sleepBeforeMS: *sleepBeforeMS,
+		mode:               *mode,
+		realSource:         *realSource,
+		rocprofilerSDKMode: *rocprofilerSDKMode,
+		kernelName:         *kernelName,
+		deviceID:           *deviceID,
+		deviceName:         *deviceName,
+		queueID:            *queueID,
+		sleepBeforeMS:      *sleepBeforeMS,
 	}
 
 	sleepBefore(cfg.sleepBeforeMS)

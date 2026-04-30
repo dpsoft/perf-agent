@@ -367,6 +367,19 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --sample-collector-path /tmp/amd-sample-collector
 ```
 
+The collector path now has an explicit mode boundary too:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode synthetic
+```
+
+`synthetic` is still the default. `real` is now an explicit opt-in that fails
+cleanly until hardware-backed AMD sampling lands, instead of silently acting as
+if real sampling already exists.
+
 If the live target kernel name is known, pass it explicitly so the producer /
 collector contract does not stay tied to the local shim default:
 
@@ -426,6 +439,7 @@ For the local HIP shim harness, the same script can now target either Linux surf
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface drm
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-collector-path /opt/rocm/bin/amd-sample-collector
@@ -441,7 +455,8 @@ bash scripts/amd-sample-producer.sh --kernel-name hip_launch_shim_kernel
 
 The checked-in adapter now prefers the Go collector binary and only falls back
 to the shell producer if `go` or the collector package path is unavailable.
-Both emit the same live-shaped `amdsample` execution/sample NDJSON contract with
+Both honor the same `PERF_AGENT_AMD_SAMPLE_MODE` / kernel / device / queue
+contract and emit the same live-shaped `amdsample` execution/sample NDJSON with
 boot-relative timestamps, so the path-based collector hook and the default
 adapter fallback stay aligned.
 

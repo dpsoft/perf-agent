@@ -15,6 +15,7 @@ const (
 	defaultDeviceID   = "gfx1103:0"
 	defaultDeviceName = "AMD Radeon 780M Graphics"
 	defaultQueueID    = "compute:0"
+	defaultMode       = "synthetic"
 )
 
 type correlation struct {
@@ -104,12 +105,23 @@ func writeJSONLine(value any) error {
 }
 
 func main() {
+	mode := flag.String("mode", envOrDefault("PERF_AGENT_AMD_SAMPLE_MODE", defaultMode), "collector mode (synthetic|real)")
 	kernelName := flag.String("kernel-name", envOrDefault("PERF_AGENT_GPU_KERNEL_NAME", defaultKernelName), "kernel name to emit")
 	deviceID := flag.String("device-id", envOrDefault("PERF_AGENT_GPU_DEVICE_ID", defaultDeviceID), "device id to emit")
 	deviceName := flag.String("device-name", envOrDefault("PERF_AGENT_GPU_DEVICE_NAME", defaultDeviceName), "device name to emit")
 	queueID := flag.String("queue-id", envOrDefault("PERF_AGENT_GPU_QUEUE_ID", defaultQueueID), "queue id to emit")
 	sleepBeforeMS := flag.Int("sleep-before-ms", 250, "sleep before emitting samples, in milliseconds")
 	flag.Parse()
+
+	switch *mode {
+	case "synthetic":
+	case "real":
+		fmt.Fprintln(os.Stderr, "real amd sample collection is not implemented")
+		os.Exit(1)
+	default:
+		fmt.Fprintf(os.Stderr, "unsupported amd sample mode: %s\n", *mode)
+		os.Exit(1)
+	}
 
 	sleepBefore(*sleepBeforeMS)
 

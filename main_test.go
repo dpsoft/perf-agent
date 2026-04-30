@@ -1159,6 +1159,30 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithCollectorCommand(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithSampleMode(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode",
+		"real",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with sample mode: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_AMD_SAMPLE_MODE=real") {
+		t.Fatalf("missing collector mode env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithKernelName(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1773,6 +1797,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorCommand(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleSampleMode(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-mode",
+		"real",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample sample mode: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-mode real",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleKernelName(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -2090,6 +2139,48 @@ func TestAMDSampleCollectorBinaryUsesContext(t *testing.T) {
 	}
 	if got := execEv.Exec.EndNs - execEv.Exec.StartNs; got != 2_000_000_000 {
 		t.Fatalf("duration_ns=%d", got)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsRealMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+
+	cmd := exec.Command(binaryPath, "--mode", "real")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected real mode failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "real amd sample collection is not implemented") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
+func TestAMDSampleAdapterScriptPassesCollectorModeToGoFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeGo := filepath.Join(tmpDir, "go")
+	fakeGoScript := `#!/bin/sh
+printf '%s %s\n' "${PERF_AGENT_AMD_SAMPLE_MODE:-}" "$*"
+`
+	if err := os.WriteFile(fakeGo, []byte(fakeGoScript), 0o755); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-sample-adapter.sh"),
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+tmpDir+":"+os.Getenv("PATH"),
+		"PERF_AGENT_AMD_SAMPLE_MODE=real",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample adapter go fallback with mode: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "real run ./cmd/amd-sample-collector" {
+		t.Fatalf("output=%q", got)
 	}
 }
 

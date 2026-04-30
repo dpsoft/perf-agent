@@ -301,6 +301,7 @@ Current modes are:
 - `hip-amd-sample-rich`
 - `hip-rocprofv2-rich`
 - `hip-rocprofv2-command-rich`
+- `hip-rocprofv3-command-rich`
 - `host-driver`
 - `multi-exec`
 - `multi-driver`
@@ -425,10 +426,23 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
-There is now also an explicit `rocprofv2` real-source hook. Today it expects a
-collector-style executable behind that path and adapts simple native JSON
-records such as `dispatch` and `sample` into the same `amdsample` contract,
-including alternate timing aliases and nested source-location metadata:
+There is now also an explicit ROCm profiler real-source hook. The preferred
+modern path is `rocprofv3`; `rocprofv2` remains available as a compatibility
+source. These hooks expect a collector-style executable behind the selected
+path and adapt simple native JSON records such as `dispatch` and `sample` into
+the same `amdsample` contract, including alternate timing aliases and nested
+source-location metadata:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofv3 \
+  --rocprofv3-command 'rocprofv3 --hip-trace --output /tmp/rocprofv3-out'
+```
+
+Compatibility path with `rocprofv2`:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -643,6 +657,13 @@ There is also a command-shaped variant that exercises the same adapter through t
 ```bash
 bash scripts/gpu-offline-demo.sh hip-rocprofv2-command-rich /tmp/gpu-rocprof-command-rich
 xdg-open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html
+```
+
+And the preferred `rocprofv3` command-shaped variant:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofv3-command-rich /tmp/gpu-rocprofv3-command-rich
+xdg-open /tmp/gpu-rocprofv3-command-rich/rocprofv3_command_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofv3-command-rich/rocprofv3_command_sample_exec_rich.html
 ```
 
 There is also a checked-in multi-workload execution path that proves exact correlation stays separated by workload:

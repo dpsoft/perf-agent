@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -81,6 +81,10 @@ ROCPROFV2_PATH="${PERF_AGENT_ROCPROFV2_PATH:-}"
 ROCPROFV2_COMMAND="${PERF_AGENT_ROCPROFV2_COMMAND:-}"
 ROCPROFV2_OUTPUT_PATH="${PERF_AGENT_ROCPROFV2_OUTPUT_PATH:-}"
 ROCPROFV2_OUTPUT_DIR="${PERF_AGENT_ROCPROFV2_OUTPUT_DIR:-}"
+ROCPROFV3_PATH="${PERF_AGENT_ROCPROFV3_PATH:-}"
+ROCPROFV3_COMMAND="${PERF_AGENT_ROCPROFV3_COMMAND:-}"
+ROCPROFV3_OUTPUT_PATH="${PERF_AGENT_ROCPROFV3_OUTPUT_PATH:-}"
+ROCPROFV3_OUTPUT_DIR="${PERF_AGENT_ROCPROFV3_OUTPUT_DIR:-}"
 REAL_POLL_INTERVAL="${PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL:-}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
@@ -153,6 +157,22 @@ while [[ $# -gt 0 ]]; do
             ROCPROFV2_OUTPUT_DIR="${2:-}"
             shift 2
             ;;
+        --rocprofv3-path)
+            ROCPROFV3_PATH="${2:-}"
+            shift 2
+            ;;
+        --rocprofv3-command)
+            ROCPROFV3_COMMAND="${2:-}"
+            shift 2
+            ;;
+        --rocprofv3-output-path)
+            ROCPROFV3_OUTPUT_PATH="${2:-}"
+            shift 2
+            ;;
+        --rocprofv3-output-dir)
+            ROCPROFV3_OUTPUT_DIR="${2:-}"
+            shift 2
+            ;;
         --real-poll-interval)
             REAL_POLL_INTERVAL="${2:-}"
             shift 2
@@ -204,6 +224,14 @@ if [[ -n "${ROCPROFV2_PATH}" && -n "${ROCPROFV2_COMMAND}" ]]; then
     echo "cannot combine --rocprofv2-path with --rocprofv2-command" >&2
     exit 1
 fi
+if [[ -n "${ROCPROFV3_OUTPUT_PATH}" && -n "${ROCPROFV3_OUTPUT_DIR}" ]]; then
+    echo "cannot combine --rocprofv3-output-path with --rocprofv3-output-dir" >&2
+    exit 1
+fi
+if [[ -n "${ROCPROFV3_PATH}" && -n "${ROCPROFV3_COMMAND}" ]]; then
+    echo "cannot combine --rocprofv3-path with --rocprofv3-command" >&2
+    exit 1
+fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
     exit 1
@@ -226,6 +254,10 @@ if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocm-smi" && -n "${ROCM_SMI_PA
 fi
 if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofv2" && -n "${ROCPROFV2_PATH}" && ! -x "${ROCPROFV2_PATH}" ]]; then
     echo "rocprofv2 path is not executable: ${ROCPROFV2_PATH}" >&2
+    exit 1
+fi
+if [[ "${DRY_RUN}" != "1" && "${REAL_SOURCE}" == "rocprofv3" && -n "${ROCPROFV3_PATH}" && ! -x "${ROCPROFV3_PATH}" ]]; then
+    echo "rocprofv3 path is not executable: ${ROCPROFV3_PATH}" >&2
     exit 1
 fi
 if [[ -z "${SAMPLE_COMMAND}" ]]; then
@@ -302,6 +334,10 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_ROCPROFV2_COMMAND=${ROCPROFV2_COMMAND}"
     "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=${ROCPROFV2_OUTPUT_PATH}"
     "PERF_AGENT_ROCPROFV2_OUTPUT_DIR=${ROCPROFV2_OUTPUT_DIR}"
+    "PERF_AGENT_ROCPROFV3_PATH=${ROCPROFV3_PATH}"
+    "PERF_AGENT_ROCPROFV3_COMMAND=${ROCPROFV3_COMMAND}"
+    "PERF_AGENT_ROCPROFV3_OUTPUT_PATH=${ROCPROFV3_OUTPUT_PATH}"
+    "PERF_AGENT_ROCPROFV3_OUTPUT_DIR=${ROCPROFV3_OUTPUT_DIR}"
     "PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=${REAL_POLL_INTERVAL}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"

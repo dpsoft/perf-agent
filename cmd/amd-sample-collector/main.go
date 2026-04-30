@@ -25,6 +25,7 @@ const (
 	defaultRealSource = "rocm-smi"
 	defaultROCMSMI    = "rocm-smi"
 	defaultRocprofV2  = "rocprofv2"
+	defaultRocprofV3  = "rocprofv3"
 	maxRealSpacing    = 100 * time.Millisecond
 	maxRealPolls      = 32
 )
@@ -441,7 +442,9 @@ func runReal(cfg collectorConfig) error {
 	case "", defaultRealSource:
 		return runROCMSMIReal(cfg)
 	case "rocprofv2":
-		return runRocprofV2Real()
+		return runRocprofReal("PERF_AGENT_ROCPROFV2", defaultRocprofV2, "rocprofv2")
+	case "rocprofv3":
+		return runRocprofReal("PERF_AGENT_ROCPROFV3", defaultRocprofV3, "rocprofv3")
 	default:
 		return fmt.Errorf("unsupported amd sample real source: %s", cfg.realSource)
 	}
@@ -609,13 +612,13 @@ func runROCMSMIReal(cfg collectorConfig) error {
 	return nil
 }
 
-func runRocprofV2Real() error {
-	path := envOrDefault("PERF_AGENT_ROCPROFV2_PATH", defaultRocprofV2)
-	commandText := os.Getenv("PERF_AGENT_ROCPROFV2_COMMAND")
-	outputPath := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_PATH")
-	outputDir := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_DIR")
-	if commandText != "" && path != defaultRocprofV2 {
-		return fmt.Errorf("cannot combine PERF_AGENT_ROCPROFV2_COMMAND with PERF_AGENT_ROCPROFV2_PATH")
+func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
+	path := envOrDefault(envPrefix+"_PATH", defaultPath)
+	commandText := os.Getenv(envPrefix + "_COMMAND")
+	outputPath := os.Getenv(envPrefix + "_OUTPUT_PATH")
+	outputDir := os.Getenv(envPrefix + "_OUTPUT_DIR")
+	if commandText != "" && path != defaultPath {
+		return fmt.Errorf("cannot combine %s_COMMAND with %s_PATH", envPrefix, envPrefix)
 	}
 	var cmd *exec.Cmd
 	if commandText != "" {
@@ -630,26 +633,26 @@ func runRocprofV2Real() error {
 	if err := cmd.Run(); err != nil {
 		errText := strings.TrimSpace(stderr.String())
 		if errText != "" {
-			return fmt.Errorf("rocprofv2 source failed: %w: %s", err, errText)
+			return fmt.Errorf("%s source failed: %w: %s", sourceName, err, errText)
 		}
-		return fmt.Errorf("rocprofv2 source failed: %w", err)
+		return fmt.Errorf("%s source failed: %w", sourceName, err)
 	}
 
 	sourceBytes := stdout.Bytes()
 	if outputPath != "" && outputDir != "" {
-		return fmt.Errorf("cannot combine PERF_AGENT_ROCPROFV2_OUTPUT_PATH with PERF_AGENT_ROCPROFV2_OUTPUT_DIR")
+		return fmt.Errorf("cannot combine %s_OUTPUT_PATH with %s_OUTPUT_DIR", envPrefix, envPrefix)
 	}
 	if outputDir != "" {
 		resolvedPath, err := newestFileInDir(outputDir)
 		if err != nil {
-			return fmt.Errorf("resolve rocprofv2 output dir: %w", err)
+			return fmt.Errorf("resolve %s output dir: %w", sourceName, err)
 		}
 		outputPath = resolvedPath
 	}
 	if outputPath != "" {
 		data, err := os.ReadFile(outputPath)
 		if err != nil {
-			return fmt.Errorf("read rocprofv2 output path: %w", err)
+			return fmt.Errorf("read %s output path: %w", sourceName, err)
 		}
 		sourceBytes = data
 	}
@@ -681,7 +684,7 @@ func runRocprofV2Real() error {
 		}
 		var record rocprofV2Record
 		if err := json.Unmarshal(line, &record); err != nil {
-			return fmt.Errorf("decode rocprofv2 source line: %w", err)
+			return fmt.Errorf("decode %s source line: %w", sourceName, err)
 		}
 		switch record.Type {
 		case "dispatch":
@@ -701,7 +704,7 @@ func runRocprofV2Real() error {
 				StartNS:     record.startTimeNS(),
 				EndNS:       record.endTimeNS(),
 			}); err != nil {
-				return fmt.Errorf("write rocprofv2 exec record: %w", err)
+				return fmt.Errorf("write %s exec record: %w", sourceName, err)
 			}
 		case "sample":
 			sampleID := record.SampleID
@@ -714,7 +717,7 @@ func runRocprofV2Real() error {
 			if rawPC := record.samplePC(); rawPC != "" {
 				parsedPC, err := strconv.ParseUint(strings.TrimPrefix(rawPC, "0x"), 16, 64)
 				if err != nil {
-					return fmt.Errorf("parse rocprofv2 sample pc: %w", err)
+					return fmt.Errorf("parse %s sample pc: %w", sourceName, err)
 				}
 				pc = parsedPC
 			}
@@ -731,14 +734,14 @@ func runRocprofV2Real() error {
 				StallReason:  record.StallReason,
 				SampleWeight: record.Weight,
 			}); err != nil {
-				return fmt.Errorf("write rocprofv2 sample record: %w", err)
+				return fmt.Errorf("write %s sample record: %w", sourceName, err)
 			}
 		default:
-			return fmt.Errorf("unsupported rocprofv2 record type: %s", record.Type)
+			return fmt.Errorf("unsupported %s record type: %s", sourceName, record.Type)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan rocprofv2 source output: %w", err)
+		return fmt.Errorf("scan %s source output: %w", sourceName, err)
 	}
 	return nil
 }

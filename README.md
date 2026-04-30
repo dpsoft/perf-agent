@@ -450,6 +450,18 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocprofv2-output-path /tmp/rocprofv2.jsonl
 ```
 
+If it writes multiple traces into a directory, pass the directory and the collector will pick the newest file after the profiler exits:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-source rocprofv2 \
+  --rocprofv2-path /opt/rocm/bin/rocprofv2 \
+  --rocprofv2-output-dir /tmp/rocprofv2-out
+```
+
 The real collector poll interval is also tunable when you want denser or
 sparser coarse hardware samples:
 

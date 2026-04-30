@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -396,6 +397,41 @@ func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, s
 	return nil
 }
 
+func newestFileInDir(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	var candidates []candidate
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return "", err
+		}
+		candidates = append(candidates, candidate{
+			path:    filepath.Join(dir, entry.Name()),
+			modTime: info.ModTime(),
+		})
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no files found in %s", dir)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].modTime.Equal(candidates[j].modTime) {
+			return candidates[i].path < candidates[j].path
+		}
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+	return candidates[0].path, nil
+}
+
 func runSynthetic(cfg collectorConfig) error {
 	return emitRecords(cfg, "memory_wait", 11, "wave_barrier", 5)
 }
@@ -576,6 +612,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 func runRocprofV2Real() error {
 	path := envOrDefault("PERF_AGENT_ROCPROFV2_PATH", defaultRocprofV2)
 	outputPath := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_PATH")
+	outputDir := os.Getenv("PERF_AGENT_ROCPROFV2_OUTPUT_DIR")
 	cmd := exec.Command(path)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -590,6 +627,16 @@ func runRocprofV2Real() error {
 	}
 
 	sourceBytes := stdout.Bytes()
+	if outputPath != "" && outputDir != "" {
+		return fmt.Errorf("cannot combine PERF_AGENT_ROCPROFV2_OUTPUT_PATH with PERF_AGENT_ROCPROFV2_OUTPUT_DIR")
+	}
+	if outputDir != "" {
+		resolvedPath, err := newestFileInDir(outputDir)
+		if err != nil {
+			return fmt.Errorf("resolve rocprofv2 output dir: %w", err)
+		}
+		outputPath = resolvedPath
+	}
 	if outputPath != "" {
 		data, err := os.ReadFile(outputPath)
 		if err != nil {

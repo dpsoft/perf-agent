@@ -1633,6 +1633,27 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2OutputPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRocprofv2OutputDir(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--pid", "4242",
+		"--hip-library", "/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode", "real",
+		"--real-source", "rocprofv2",
+		"--rocprofv2-output-dir", "/tmp/rocprofv2-out",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with rocprofv2 output dir: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_ROCPROFV2_OUTPUT_DIR=/tmp/rocprofv2-out") {
+		t.Fatalf("missing rocprofv2 output dir env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -2410,6 +2431,31 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRocprofv2OutputDir(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface", "amdsample",
+		"--sample-mode", "real",
+		"--real-source", "rocprofv2",
+		"--rocprofv2-output-dir", "/tmp/rocprofv2-out",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample rocprofv2 output dir: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"--real-source rocprofv2",
+		"--rocprofv2-output-dir /tmp/rocprofv2-out",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPULiveHIPShimDemoDryRunForAMDSampleRealPollInterval(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -3120,6 +3166,60 @@ EOF
 		t.Fatalf("decode sample line: %v\n%s", err, lines[1])
 	}
 	if sampleEv.Sample.PC != 0x111 || sampleEv.Sample.Function != "file_kernel" || sampleEv.Sample.File != "file_kernel.hip" || sampleEv.Sample.Line != 12 {
+		t.Fatalf("sample=%+v", sampleEv.Sample)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesNewestRocprofv2OutputDirFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	rocprofv2Path := filepath.Join(tmpDir, "rocprofv2")
+	outputDir := filepath.Join(tmpDir, "rocprofv2-out")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatalf("mkdir output dir: %v", err)
+	}
+	oldPath := filepath.Join(outputDir, "old.jsonl")
+	newPath := filepath.Join(outputDir, "new.jsonl")
+	rocprofv2Script := fmt.Sprintf(`#!/bin/sh
+cat <<EOF >%q
+{"type":"dispatch","correlation_id":"dispatch-old","begin_ns":100,"complete_ns":150}
+EOF
+sleep 0.1
+cat <<EOF >%q
+{"type":"dispatch","correlation_id":"dispatch-new","begin_ns":200,"complete_ns":260}
+{"type":"sample","correlation_id":"dispatch-new","timestamp_ns":220,"stall_reason":"memory_wait","weight":6,"location":{"pc":"0x222","function":"dir_kernel","file":"dir_kernel.hip","line":21}}
+EOF
+`, oldPath, newPath)
+	if err := os.WriteFile(rocprofv2Path, []byte(rocprofv2Script), 0o755); err != nil {
+		t.Fatalf("write fake rocprofv2: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFV2_PATH="+rocprofv2Path,
+		"PERF_AGENT_ROCPROFV2_OUTPUT_DIR="+outputDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amd sample collector rocprofv2 output-dir mode: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.ExecID != "dispatch-new" {
+		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+	sampleEv, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample line: %v\n%s", err, lines[1])
+	}
+	if sampleEv.Sample.PC != 0x222 || sampleEv.Sample.Function != "dir_kernel" || sampleEv.Sample.File != "dir_kernel.hip" || sampleEv.Sample.Line != 21 {
 		t.Fatalf("sample=%+v", sampleEv.Sample)
 	}
 }

@@ -159,7 +159,7 @@ if [[ -n "${SAMPLE_COLLECTOR_PATH}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     echo "cannot combine --sample-collector-path with --sample-collector-command" >&2
     exit 1
 fi
-if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" ]]; then
+if [[ "${LINUX_SURFACE}" == "amdsample" && -z "${SAMPLE_COMMAND}" && -z "${SAMPLE_COLLECTOR_PATH}" && -z "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     SAMPLE_COMMAND="bash scripts/amd-sample-adapter.sh"
 fi
 
@@ -206,10 +206,12 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
             "${SAMPLE_COLLECTOR_COMMAND}"
         )
     fi
-    WRAPPER_CMD+=(
-        --sample-command
-        "${SAMPLE_COMMAND}"
-    )
+    if [[ -n "${SAMPLE_COMMAND}" ]]; then
+        WRAPPER_CMD+=(
+            --sample-command
+            "${SAMPLE_COMMAND}"
+        )
+    fi
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then

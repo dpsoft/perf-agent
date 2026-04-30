@@ -1528,6 +1528,9 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorPath(t *testing.T) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "--sample-command") {
+		t.Fatalf("collector-path dry-run should not force --sample-command:\n%s", got)
+	}
 }
 
 func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorCommand(t *testing.T) {
@@ -1552,6 +1555,9 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleCollectorCommand(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "--sample-command") {
+		t.Fatalf("collector-command dry-run should not force --sample-command:\n%s", got)
 	}
 }
 

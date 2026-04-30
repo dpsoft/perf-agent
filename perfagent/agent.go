@@ -18,6 +18,8 @@ import (
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/inject/ptraceop"
 	"github.com/dpsoft/perf-agent/inject/python"
+	"github.com/dpsoft/perf-agent/internal/k8slabels"
+	"github.com/dpsoft/perf-agent/internal/nspid"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
@@ -157,6 +159,51 @@ func hasCapSysPtrace() bool {
 	return false
 }
 
+// resolveTarget translates the configured PID to its host-namespace
+// counterpart and computes the final per-sample label set by running the
+// configured enricher (default: internal/k8slabels.FromPID) and merging
+// the static labels from WithLabels on top.
+//
+// If config.PID is 0 (system-wide -a mode), no translation runs and
+// labels come solely from WithLabels and from any user-supplied enricher
+// invoked with hostPID=0.
+func (a *Agent) resolveTarget() (hostPID int, labels map[string]string, err error) {
+	hostPID = a.config.PID
+	if hostPID > 0 {
+		hostPID, err = nspid.Translate(a.config.PID)
+		if err != nil {
+			return 0, nil, fmt.Errorf("resolve target pid: %w", err)
+		}
+	}
+
+	labels = make(map[string]string, 8)
+
+	// Default enricher unless the caller explicitly disabled or replaced.
+	enricher := a.config.LabelEnricher
+	if !a.config.LabelEnricherSet {
+		enricher = func(pid int) map[string]string {
+			if pid <= 0 {
+				return nil
+			}
+			out, err := k8slabels.FromPID("/proc", pid)
+			if err != nil {
+				log.Printf("k8slabels.FromPID(%d): %v (continuing without k8s labels)", pid, err)
+				return nil
+			}
+			return out
+		}
+	}
+	if enricher != nil {
+		for k, v := range enricher(hostPID) {
+			labels[k] = v
+		}
+	}
+	for k, v := range a.config.Labels {
+		labels[k] = v // WithLabels wins on key collision
+	}
+	return hostPID, labels, nil
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -181,6 +228,14 @@ func (a *Agent) Start(ctx context.Context) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
+
+	// Translate PID to host namespace and collect labels.
+	hostPID, labels, err := a.resolveTarget()
+	if err != nil {
+		return err
+	}
+	// hostPID replaces config.PID for downstream BPF setup;
+	// labels are passed to every profiler constructor.
 
 	// Get CPUs to monitor
 	cpus := a.config.CPUs
@@ -207,14 +262,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		case "dwarf":
 			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeEager,
-				nil,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -228,14 +283,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		case "auto":
 			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeLazy,
-				nil,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -248,12 +303,12 @@ func (a *Agent) Start(ctx context.Context) error {
 			}
 		default:
 			profiler, err := profile.NewProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
-				nil,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -272,11 +327,11 @@ func (a *Agent) Start(ctx context.Context) error {
 		switch a.config.Unwind {
 		case "dwarf", "auto":
 			p, err := dwarfagent.NewOffCPUProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
-				nil,
+				labels,
 			)
 			if err != nil {
 				a.cleanup()
@@ -290,10 +345,10 @@ func (a *Agent) Start(ctx context.Context) error {
 			}
 		default:
 			profiler, err := offcpu.NewProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				a.config.Tags,
-				nil,
+				labels,
 			)
 			if err != nil {
 				a.cleanup()
@@ -311,7 +366,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start PMU monitor if enabled
 	if a.config.EnablePMU {
 		monitor, err := cpu.NewPMUMonitor(
-			a.config.PID,
+			hostPID,
 			a.config.SystemWide,
 			cpus,
 		)

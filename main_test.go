@@ -652,6 +652,38 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv3CommandRich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKRich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofiler-sdk-rich",
+		"/tmp/gpu-rocprofiler-sdk-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofiler-sdk-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat\\ gpu/testdata/replay/rocprofiler_sdk_native_rich.ndjson\\ \\>\\ \\\"\\$PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH\\\"",
+		"PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH=/tmp/gpu-rocprofiler-sdk-rich-demo/rocprofiler_sdk_native_rich.ndjson",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofiler-sdk",
+		"|",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-rocprofiler-sdk-rich-demo/rocprofiler_sdk_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprofiler-sdk-rich-demo/rocprofiler_sdk_sample_exec_rich.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKCommandRich(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1650,6 +1682,42 @@ func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichWritesBrendanStyleFrame
 			t.Fatalf("missing %q in output:\n%s", want, got)
 		}
 	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofilerSDKRichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofiler-sdk-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofiler-sdk-rich helper: %v\n%s", err, out)
+	}
+
+	assertJSONContentEqualsIgnoringKeys(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_sample_exec_rich.raw.json"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_sample_exec_rich.attributions.json"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_sample_exec_rich.folded"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(
+		t,
+		filepath.Join(outDir, "rocprofiler_sdk_sample_exec_rich.pb.gz"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_sample_exec_rich.pprof.txt"),
+	)
 }
 
 func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichMatchesArtifactGoldens(t *testing.T) {

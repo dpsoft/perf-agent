@@ -670,7 +670,14 @@ bash scripts/gpu-offline-demo.sh hip-rocprofv2-command-rich /tmp/gpu-rocprof-com
 xdg-open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html
 ```
 
-And the preferred `rocprofv3` command-shaped variant:
+Preferred modern SDK-shaped variant:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofiler-sdk-rich /tmp/gpu-rocprofiler-sdk-rich
+xdg-open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofiler-sdk-rich/rocprofiler_sdk_sample_exec_rich.html
+```
+
+And the `rocprofv3` command-shaped compatibility variant:
 
 ```bash
 bash scripts/gpu-offline-demo.sh hip-rocprofv3-command-rich /tmp/gpu-rocprofv3-command-rich

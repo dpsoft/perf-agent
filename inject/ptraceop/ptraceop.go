@@ -209,6 +209,15 @@ func (i *Injector) remoteCall(pid uint32, orig unix.PtraceRegs, fnAddr, payloadA
 	if err := unix.PtraceGetRegs(int(pid), &post); err != nil {
 		return 0, fmt.Errorf("getregs post-call: %w", err)
 	}
+	// SIGSEGV must come from the return-to-zero sentinel. If it fired at any
+	// other address, the function crashed mid-execution — most often because
+	// fnAddr was wrong (bad load_base, missing symbol, etc.). Report the
+	// crash address so the caller can debug rather than silently treating the
+	// pre-SEGV register state as a "return value".
+	if rip := instructionPointer(post); rip != 0 {
+		return 0, fmt.Errorf("SIGSEGV at unexpected address 0x%x (expected sentinel 0); fnAddr=0x%x — likely wrong load_base or symbol address",
+			rip, fnAddr)
+	}
 	return extractReturn(post), nil
 }
 

@@ -28,7 +28,10 @@ func (m *Manager) activateOne(pid uint32) error {
 	}
 	if err := m.opts.Injector.RemoteActivate(pid, addrs); err != nil {
 		m.stats.ActivateFailed.Add(1)
-		m.log.Warn("python inject failed", "pid", pid, "err", err)
+		m.log.Warn("python inject failed", "pid", pid, "err", err,
+			"libpython", target.LibPythonPath,
+			"loadbase", fmt.Sprintf("0x%x", target.LoadBase),
+			"py_run_string", fmt.Sprintf("0x%x", target.PyRunStringAddr))
 		if m.opts.StrictPerPID {
 			return fmt.Errorf("activate pid=%d: %w", pid, err)
 		}

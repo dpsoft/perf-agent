@@ -88,6 +88,40 @@ func TestDetect_DynamicLinkedPython312(t *testing.T) {
 	}
 }
 
+// TestDetect_DynamicLinkedPython_SeparateCodeLayout covers the modern
+// -Wl,-z,separate-code layout (default in Ubuntu 24.04 + glibc 2.39, used by
+// actions/setup-python's CPython 3.12 builds): the first PT_LOAD segment is
+// r-- (header + RELRO data) at file offset 0, and a separate r-x segment
+// holds .text at a non-zero file offset. Picking the first executable mapping
+// in this layout would return load_base + first_segment_size — wrong by that
+// delta. Detection must use file offset 0 as the load-base anchor.
+func TestDetect_DynamicLinkedPython_SeparateCodeLayout(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-only test")
+	}
+	libpath := findRealLibpython(t)
+	pid := uint32(54321)
+	root := buildSyntheticProc(t, pid, []string{
+		// Leading r-- segment at offset 0 — this is the proper load base.
+		fmt.Sprintf("7f0000400000-7f0000401000 r--p 00000000 00:00 0 %s", libpath),
+		// Executable .text segment at non-zero offset — old code would
+		// have picked this start address as load base, off by 0x1000.
+		fmt.Sprintf("7f0000401000-7f0000800000 r-xp 00001000 00:00 0 %s", libpath),
+		fmt.Sprintf("7f0000800000-7f0000900000 r--p 00400000 00:00 0 %s", libpath),
+		fmt.Sprintf("7f0000900000-7f0000a00000 rw-p 00500000 00:00 0 %s", libpath),
+	}, "")
+
+	d := NewDetector(root, nil)
+	got, err := d.Detect(pid)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if got.LoadBase != 0x7f0000400000 {
+		t.Errorf("LoadBase = 0x%x, want 0x7f0000400000 (the offset-0 mapping, not the executable one)",
+			got.LoadBase)
+	}
+}
+
 func TestDetect_NonPython(t *testing.T) {
 	pid := uint32(22222)
 	root := buildSyntheticProc(t, pid, []string{

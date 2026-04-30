@@ -55,3 +55,8 @@ func extractReturn(post unix.PtraceRegs) uint64 {
 func stackPointer(r unix.PtraceRegs) uint64 {
 	return r.Rsp
 }
+
+// instructionPointer returns the IP register value for arch-generic code.
+func instructionPointer(r unix.PtraceRegs) uint64 {
+	return r.Rip
+}

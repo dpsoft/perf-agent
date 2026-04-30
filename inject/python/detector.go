@@ -89,11 +89,22 @@ func (d *procDetector) Detect(pid uint32) (*Target, error) {
 	return d.resolveStatic(pid)
 }
 
-// scanForLibpython walks the maps file looking for an executable mapping whose
-// path matches a libpython SONAME. Returns the on-disk path and the load
-// (start) address, or ("", 0, false). Returns the first match — multiple
-// libpython mappings can exist when extension modules embed a second
-// interpreter (rare); see spec §5 edge cases.
+// scanForLibpython walks the maps file looking for the libpython load base —
+// the mapping that backs the file at offset 0 (the first PT_LOAD segment).
+// Returns the on-disk path and the load address, or ("", 0, false).
+//
+// We filter on offset==0 rather than executable perms because modern toolchains
+// (glibc with -Wl,-z,separate-code, default on Ubuntu 24.04+) produce an ELF
+// with a leading r-- LOAD segment for the header + RELRO data and a separate
+// r-x segment for .text at a non-zero file offset. Picking the first
+// executable mapping in that layout returns load_base + first_segment_size,
+// which is wrong: every absolute symbol address derived from it is off by
+// that delta, RIP jumps to garbage on remote call, and the target SEGVs with
+// RAX still holding whatever value the kernel left in it (e.g.
+// -ERESTARTNOHAND if attached mid-syscall).
+//
+// Returns the first match — multiple libpython mappings can exist when
+// extension modules embed a second interpreter (rare); see spec §5 edge cases.
 func scanForLibpython(maps *os.File) (string, uint64, bool) {
 	sc := bufio.NewScanner(maps)
 	for sc.Scan() {
@@ -103,8 +114,8 @@ func scanForLibpython(maps *os.File) (string, uint64, bool) {
 		if len(fields) < 6 {
 			continue
 		}
-		perms := fields[1]
-		if !strings.Contains(perms, "x") {
+		offset, err := strconv.ParseUint(fields[2], 16, 64)
+		if err != nil || offset != 0 {
 			continue
 		}
 		path := fields[5]
@@ -196,9 +207,10 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 	}, nil
 }
 
-// scanForExeBase finds the lowest start address of an executable mapping whose
-// path matches realExe. Used for statically-linked CPython where load base
-// must be derived from the exe's own mapping.
+// scanForExeBase finds the load base of the statically-linked CPython exe.
+// Same rationale as scanForLibpython: we filter on offset==0 to pick the
+// first PT_LOAD segment's mapping, which gives the correct load_base even
+// when modern -Wl,-z,separate-code lays out a leading r-- segment.
 func scanForExeBase(maps *os.File, realExe string) uint64 {
 	var lowest uint64
 	sc := bufio.NewScanner(maps)
@@ -207,10 +219,11 @@ func scanForExeBase(maps *os.File, realExe string) uint64 {
 		if len(fields) < 6 {
 			continue
 		}
-		if !strings.Contains(fields[1], "x") {
+		if fields[5] != realExe {
 			continue
 		}
-		if fields[5] != realExe {
+		offset, err := strconv.ParseUint(fields[2], 16, 64)
+		if err != nil || offset != 0 {
 			continue
 		}
 		dash := strings.IndexByte(fields[0], '-')

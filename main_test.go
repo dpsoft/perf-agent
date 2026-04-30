@@ -2264,11 +2264,11 @@ count=$((count + 1))
 printf '%s' "${count}" > "${counter_file}"
 printf '%s\n' 'libdrm warning' >&2
 if [ "${count}" -eq 1 ]; then
-  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","GFX Version":"gfx942"}}'
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","Temperature (Sensor edge) (C)":"65.0","GPU Memory Allocated (VRAM%)":"44","GFX Version":"gfx942"}}'
 elif [ "${count}" -eq 2 ]; then
-  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"301.100","GPU use (%)":"41","GFX Version":"gfx942"}}'
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"301.100","GPU use (%)":"41","Temperature (Sensor edge) (C)":"67.0","GPU Memory Allocated (VRAM%)":"46","GFX Version":"gfx942"}}'
 else
-  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"199.400","GPU use (%)":"18","GFX Version":"gfx942"}}'
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"199.400","GPU use (%)":"18","Temperature (Sensor edge) (C)":"63.0","GPU Memory Allocated (VRAM%)":"39","GFX Version":"gfx942"}}'
 fi
 `
 	if err := os.WriteFile(rocmSMIPath, []byte(rocmSMIScript), 0o755); err != nil {
@@ -2290,7 +2290,7 @@ fi
 		t.Fatalf("amd sample collector real mode: %v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 7 {
+	if len(lines) != 13 {
 		t.Fatalf("got %d lines:\n%s", len(lines), out)
 	}
 	execEv, err := codec.DecodeLine([]byte(lines[0]))
@@ -2315,12 +2315,18 @@ fi
 	wantReasons := []string{
 		"hardware_gpu_use",
 		"hardware_socket_power_watts",
+		"hardware_temperature_c",
+		"hardware_vram_used_pct",
 		"hardware_gpu_use",
 		"hardware_socket_power_watts",
+		"hardware_temperature_c",
+		"hardware_vram_used_pct",
 		"hardware_gpu_use",
 		"hardware_socket_power_watts",
+		"hardware_temperature_c",
+		"hardware_vram_used_pct",
 	}
-	wantWeights := []uint64{73, 276, 41, 301, 18, 199}
+	wantWeights := []uint64{73, 276, 65, 44, 41, 301, 67, 46, 18, 199, 63, 39}
 	prevTime := execEv.Exec.StartNs
 	for i := 1; i < len(lines); i++ {
 		ev, err := codec.DecodeLine([]byte(lines[i]))

@@ -79,10 +79,12 @@ type collectorConfig struct {
 }
 
 type rocmSMIMetrics struct {
-	deviceID   string
-	deviceName string
-	gpuUse     int
-	powerWatts int
+	deviceID     string
+	deviceName   string
+	gpuUse       int
+	powerWatts   int
+	temperatureC int
+	vramUsedPct  int
 }
 
 func envOrDefault(key, fallback string) string {
@@ -158,7 +160,7 @@ func collectionWindow() (int64, int64, int64, int64, time.Duration, error) {
 }
 
 func queryROCMSMI(path string) (rocmSMIMetrics, error) {
-	cmd := exec.Command(path, "--showuse", "--showpower", "--showid", "--showproductname", "--json")
+	cmd := exec.Command(path, "--showuse", "--showpower", "--showtemp", "--showmemuse", "--showid", "--showproductname", "--json")
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -212,6 +214,22 @@ func queryROCMSMI(path string) (rocmSMIMetrics, error) {
 			return rocmSMIMetrics{}, fmt.Errorf("parse power: %w", err)
 		}
 		metrics.powerWatts = int(math.Round(value))
+	}
+
+	if temperature := strings.TrimSpace(card["Temperature (Sensor edge) (C)"]); temperature != "" {
+		value, err := strconv.ParseFloat(temperature, 64)
+		if err != nil {
+			return rocmSMIMetrics{}, fmt.Errorf("parse temperature: %w", err)
+		}
+		metrics.temperatureC = int(math.Round(value))
+	}
+
+	if vramUsedPct := strings.TrimSpace(card["GPU Memory Allocated (VRAM%)"]); vramUsedPct != "" {
+		value, err := strconv.Atoi(vramUsedPct)
+		if err != nil {
+			return rocmSMIMetrics{}, fmt.Errorf("parse VRAM used (%%): %w", err)
+		}
+		metrics.vramUsedPct = value
 	}
 
 	return metrics, nil
@@ -420,6 +438,32 @@ func runReal(cfg collectorConfig) error {
 			KernelName:   cfg.kernelName,
 			StallReason:  "hardware_socket_power_watts",
 			SampleWeight: metrics.powerWatts,
+		}); err != nil {
+			return fmt.Errorf("write sample record: %w", err)
+		}
+
+		tempSampleID := fmt.Sprintf("sample:temp:%d:%d", i, sampleTimeNS)
+		if err := writeJSONLine(sampleRecord{
+			Kind:         "sample",
+			Correlation:  correlation{Backend: "amdsample", Value: tempSampleID},
+			Device:       dev,
+			TimeNS:       sampleTimeNS,
+			KernelName:   cfg.kernelName,
+			StallReason:  "hardware_temperature_c",
+			SampleWeight: metrics.temperatureC,
+		}); err != nil {
+			return fmt.Errorf("write sample record: %w", err)
+		}
+
+		vramSampleID := fmt.Sprintf("sample:vram:%d:%d", i, sampleTimeNS)
+		if err := writeJSONLine(sampleRecord{
+			Kind:         "sample",
+			Correlation:  correlation{Backend: "amdsample", Value: vramSampleID},
+			Device:       dev,
+			TimeNS:       sampleTimeNS,
+			KernelName:   cfg.kernelName,
+			StallReason:  "hardware_vram_used_pct",
+			SampleWeight: metrics.vramUsedPct,
 		}); err != nil {
 			return fmt.Errorf("write sample record: %w", err)
 		}

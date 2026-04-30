@@ -25,6 +25,7 @@ type Profiler struct {
 	perfSet    *perfevent.Set
 	tags       []string
 	sampleRate int
+	labels     map[string]string
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -65,7 +66,7 @@ func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 }
 
 // NewProfiler creates a new CPU profiler with the specified sample rate in Hz
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -118,6 +119,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		perfSet:    perfSet,
 		tags:       tags,
 		sampleRate: sampleRate,
+		labels:     labels,
 	}, nil
 }
 
@@ -162,6 +164,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		PerPIDProfile: false,
 		Comments:      pr.tags,
 		Resolver:      pr.resolver,
+		Labels:        pr.labels,
 	})
 
 	for i := 0; i < n; i++ {

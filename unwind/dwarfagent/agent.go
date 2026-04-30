@@ -49,7 +49,7 @@ type Profiler struct {
 // NewProfilerWithMode is the variant of NewProfiler that accepts both
 // an optional Hooks struct and a Mode. Pass ModeEager + nil hooks for
 // the same behavior as NewProfiler.
-func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode) (*Profiler, error) {
+func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -68,7 +68,7 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode, labels)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -94,8 +94,8 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 
 // NewProfilerWithHooks is the legacy variant that defaults to ModeEager.
 // Existing callers (perfagent.Agent's --unwind dwarf path) work unchanged.
-func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks) (*Profiler, error) {
-	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager)
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string) (*Profiler, error) {
+	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels)
 }
 
 // NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
@@ -105,8 +105,8 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 //
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on a Profiler they received as (nil, err).
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int) (*Profiler, error) {
-	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil)
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
+	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels)
 }
 
 // aggregateCPUSample is the CPU-specific ringbuf aggregator: each

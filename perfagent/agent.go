@@ -214,6 +214,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeEager,
+				nil,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -234,6 +235,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeLazy,
+				nil,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -251,6 +253,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
+				nil,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -273,6 +276,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
+				nil,
 			)
 			if err != nil {
 				a.cleanup()
@@ -289,6 +293,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.PID,
 				a.config.SystemWide,
 				a.config.Tags,
+				nil,
 			)
 			if err != nil {
 				a.cleanup()

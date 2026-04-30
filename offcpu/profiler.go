@@ -23,6 +23,7 @@ type Profiler struct {
 	resolver   *procmap.Resolver
 	link       link.Link
 	tags       []string
+	labels     map[string]string
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -59,7 +60,7 @@ func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 }
 
 // NewProfiler creates a new off-CPU profiler
-func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string) (*Profiler, error) {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
@@ -109,6 +110,7 @@ func NewProfiler(pid int, systemWide bool, tags []string) (*Profiler, error) {
 		resolver:   procmap.NewResolver(),
 		link:       tp,
 		tags:       tags,
+		labels:     labels,
 	}, nil
 }
 
@@ -153,6 +155,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		PerPIDProfile: false,
 		Comments:      pr.tags,
 		Resolver:      pr.resolver,
+		Labels:        pr.labels,
 	})
 
 	for i := 0; i < n; i++ {

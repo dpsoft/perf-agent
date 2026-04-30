@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
+  scripts/gpu-live-hip-amdsample.sh [--dry-run] [--outdir <dir>] [--pid <pid>] [--hip-library <path>] [--hip-symbol <symbol>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--duration <dur>]
 
 Real runs require:
   - --pid to point at an existing HIP process
@@ -76,6 +76,7 @@ DEVICE_NAME="${PERF_AGENT_GPU_DEVICE_NAME:-AMD Radeon 780M Graphics}"
 QUEUE_ID="${PERF_AGENT_GPU_QUEUE_ID:-compute:0}"
 SAMPLE_MODE="${PERF_AGENT_AMD_SAMPLE_MODE:-synthetic}"
 ROCM_SMI_PATH="${PERF_AGENT_ROCM_SMI_PATH:-}"
+REAL_POLL_INTERVAL="${PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL:-}"
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH:-}"
 SAMPLE_COLLECTOR_COMMAND="${PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND:-}"
@@ -125,6 +126,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocm-smi-path)
             ROCM_SMI_PATH="${2:-}"
+            shift 2
+            ;;
+        --real-poll-interval)
+            REAL_POLL_INTERVAL="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -255,6 +260,7 @@ declare -a PRODUCER_CMD=(
     "PERF_AGENT_GPU_QUEUE_ID=${QUEUE_ID}"
     "PERF_AGENT_AMD_SAMPLE_MODE=${SAMPLE_MODE}"
     "PERF_AGENT_ROCM_SMI_PATH=${ROCM_SMI_PATH}"
+    "PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=${REAL_POLL_INTERVAL}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_PATH=${SAMPLE_COLLECTOR_PATH}"
     "PERF_AGENT_AMD_SAMPLE_COLLECTOR_COMMAND=${SAMPLE_COLLECTOR_COMMAND}"
     bash

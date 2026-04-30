@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--rocm-smi-path <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -58,6 +58,7 @@ DEVICE_NAME="AMD Radeon 780M Graphics"
 QUEUE_ID="compute:0"
 SAMPLE_MODE="synthetic"
 ROCM_SMI_PATH=""
+REAL_POLL_INTERVAL=""
 SAMPLE_COMMAND=""
 SAMPLE_COLLECTOR_PATH=""
 SAMPLE_COLLECTOR_COMMAND=""
@@ -110,6 +111,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocm-smi-path)
             ROCM_SMI_PATH="${2:-}"
+            shift 2
+            ;;
+        --real-poll-interval)
+            REAL_POLL_INTERVAL="${2:-}"
             shift 2
             ;;
         --sample-command)
@@ -268,6 +273,12 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
         WRAPPER_CMD+=(
             --rocm-smi-path
             "${ROCM_SMI_PATH}"
+        )
+    fi
+    if [[ -n "${REAL_POLL_INTERVAL}" ]]; then
+        WRAPPER_CMD+=(
+            --real-poll-interval
+            "${REAL_POLL_INTERVAL}"
         )
     fi
     if [[ -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then

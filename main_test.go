@@ -1209,6 +1209,32 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithROCMSMIPath(t *testing.T) {
 	}
 }
 
+func TestGPULiveHIPAMDSampleWrapperDryRunWithRealPollInterval(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
+		"--dry-run",
+		"--outdir",
+		"/tmp/gpu-live-wrapper",
+		"--pid",
+		"4242",
+		"--hip-library",
+		"/opt/rocm/lib/libamdhip64.so",
+		"--sample-mode",
+		"real",
+		"--real-poll-interval",
+		"25ms",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper dry-run with real poll interval: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=25ms") {
+		t.Fatalf("missing poll interval env in output:\n%s", got)
+	}
+}
+
 func TestGPULiveHIPAMDSampleWrapperDryRunWithKernelName(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -1869,6 +1895,34 @@ func TestGPULiveHIPShimDemoDryRunForAMDSampleROCMSMIPath(t *testing.T) {
 		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
 		"--sample-mode real",
 		"--rocm-smi-path /opt/rocm/bin/rocm-smi",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in shim demo output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPULiveHIPShimDemoDryRunForAMDSampleRealPollInterval(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
+		"--dry-run",
+		"--linux-surface",
+		"amdsample",
+		"--sample-mode",
+		"real",
+		"--real-poll-interval",
+		"25ms",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shim demo dry-run amdsample real poll interval: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"scripts/gpu-live-hip-amdsample.sh --outdir /tmp/gpu-live",
+		"--sample-mode real",
+		"--real-poll-interval 25ms",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in shim demo output:\n%s", want, got)

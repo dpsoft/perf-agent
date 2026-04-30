@@ -393,6 +393,17 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
+The real collector poll interval is also tunable when you want denser or
+sparser coarse hardware samples:
+
+```bash
+bash scripts/gpu-live-hip-amdsample.sh \
+  --outdir /tmp/gpu-live \
+  --pid 4242 \
+  --sample-mode real \
+  --real-poll-interval 25ms
+```
+
 If the live target kernel name is known, pass it explicitly so the producer /
 collector contract does not stay tied to the local shim default:
 
@@ -454,6 +465,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface kfd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --rocm-smi-path /opt/rocm/bin/rocm-smi
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-poll-interval 25ms
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-collector-path /opt/rocm/bin/amd-sample-collector

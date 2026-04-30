@@ -684,6 +684,36 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKRich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKNativeProbe(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofiler-sdk-native-probe",
+		"/tmp/gpu-rocprofiler-sdk-native-probe-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofiler-sdk-native-probe: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofiler-sdk --rocprofiler-sdk-mode native --rocprofiler-sdk-library /home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so",
+		"|",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-rocprofiler-sdk-native-probe-demo/rocprofiler_sdk_native_probe.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprofiler-sdk-native-probe-demo/rocprofiler_sdk_native_probe.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKRecorderRich(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -4361,12 +4391,57 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected native mode failure, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "rocprofiler-sdk native collector loaded library but capture is not implemented") {
+	if !strings.Contains(string(out), "resolve rocprofiler-sdk native symbol") {
 		t.Fatalf("unexpected native mode error:\n%s", out)
 	}
 }
 
-func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithRealLibrary(t *testing.T) {
+func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	libraryPath := buildFakeRocprofilerSDKSharedLibrary(t, tmpDir)
+
+	cmd := exec.Command(
+		binaryPath,
+		"--mode", "real",
+		"--real-source", "rocprofiler-sdk",
+		"--rocprofiler-sdk-mode", "native",
+		"--rocprofiler-sdk-library", libraryPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native mode with fake rocprofiler-sdk library: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	execEv, err := codec.DecodeLine([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	if execEv.Exec.Execution.Backend != "amdsample" {
+		t.Fatalf("backend=%q", execEv.Exec.Execution.Backend)
+	}
+
+	sample1, err := codec.DecodeLine([]byte(lines[1]))
+	if err != nil {
+		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
+	}
+	if sample1.Sample.StallReason != "native_sdk_version" || sample1.Sample.Weight != 70201 {
+		t.Fatalf("unexpected sample1: %+v", sample1.Sample)
+	}
+
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if sample2.Sample.StallReason != "native_sdk_available_agents" || sample2.Sample.Weight != 2 {
+		t.Fatalf("unexpected sample2: %+v", sample2.Sample)
+	}
+}
+
+func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeModeWithRealLibrary(t *testing.T) {
 	libraryPath := os.Getenv("PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY")
 	if libraryPath == "" {
 		t.Skip("set PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY to exercise the native seam with a real rocprofiler-sdk build")
@@ -4386,11 +4461,22 @@ func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeModeWithRealLibrary(
 		"--rocprofiler-sdk-library", libraryPath,
 	)
 	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected native mode failure with real library, got success:\n%s", out)
+	if err != nil {
+		t.Fatalf("native mode with real library: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "rocprofiler-sdk native collector loaded library but capture is not implemented") {
-		t.Fatalf("unexpected native mode error with real library:\n%s", out)
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines:\n%s", len(lines), out)
+	}
+	if _, err := codec.DecodeLine([]byte(lines[0])); err != nil {
+		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
+	}
+	sample2, err := codec.DecodeLine([]byte(lines[2]))
+	if err != nil {
+		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
+	}
+	if sample2.Sample.StallReason != "native_sdk_available_agents" {
+		t.Fatalf("unexpected sample2: %+v", sample2.Sample)
 	}
 }
 
@@ -5366,6 +5452,64 @@ func buildDummySharedLibrary(t *testing.T, dir string) string {
 	buildOut, err := buildCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build dummy shared library: %v\n%s", err, buildOut)
+	}
+	return libraryPath
+}
+
+func buildFakeRocprofilerSDKSharedLibrary(t *testing.T, dir string) string {
+	t.Helper()
+
+	sourcePath := filepath.Join(dir, "fake_rocprofiler_sdk.c")
+	source := `
+#include <stddef.h>
+#include <stdint.h>
+
+typedef int rocprofiler_status_t;
+typedef unsigned int rocprofiler_agent_version_t;
+
+typedef struct rocprofiler_version_triplet_t {
+    uint32_t major;
+    uint32_t minor;
+    uint32_t patch;
+} rocprofiler_version_triplet_t;
+
+typedef rocprofiler_status_t (*rocprofiler_query_available_agents_cb_t)(
+    rocprofiler_agent_version_t version,
+    const void** agents,
+    size_t num_agents,
+    void* user_data);
+
+rocprofiler_status_t rocprofiler_get_version_triplet(rocprofiler_version_triplet_t* info) {
+    info->major = 7;
+    info->minor = 2;
+    info->patch = 1;
+    return 0;
+}
+
+rocprofiler_status_t rocprofiler_query_available_agents(
+    rocprofiler_agent_version_t version,
+    rocprofiler_query_available_agents_cb_t callback,
+    size_t agent_size,
+    void* user_data) {
+    (void) agent_size;
+    return callback(version, NULL, 2, user_data);
+}
+`
+	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
+		t.Fatalf("write fake rocprofiler-sdk source: %v", err)
+	}
+	libraryPath := filepath.Join(dir, "librocprofiler-sdk.so")
+	buildCmd := exec.Command(
+		"cc",
+		"-shared",
+		"-fPIC",
+		sourcePath,
+		"-o",
+		libraryPath,
+	)
+	buildOut, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build fake rocprofiler-sdk shared library: %v\n%s", err, buildOut)
 	}
 	return libraryPath
 }

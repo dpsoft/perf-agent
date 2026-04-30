@@ -697,6 +697,17 @@ This renders a mixed `CPU + GPU Flame Graph: rocprofiler_sdk_sample_exec_rich` a
 
 This canonical SDK demo currently exercises the `rocprofiler-sdk` `external` mode rather than an in-process native SDK collector.
 
+If you have a real `librocprofiler-sdk.so` available, there is also a native probe variant that uses the in-process loader path instead of the external adapter:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofiler-sdk-native-probe /tmp/gpu-rocprofiler-sdk-native-probe
+xdg-open /tmp/gpu-rocprofiler-sdk-native-probe/rocprofiler_sdk_native_probe.html 2>/dev/null || open /tmp/gpu-rocprofiler-sdk-native-probe/rocprofiler_sdk_native_probe.html
+```
+
+That path currently emits a mixed CPU+GPU artifact from live SDK metadata probes:
+- CPU side still comes from the checked-in HIP launch replay
+- GPU side carries native SDK probe leaves such as `native_sdk_version` and `native_sdk_available_agents`
+
 Recorder-envelope variant of the same modern SDK path:
 
 ```bash

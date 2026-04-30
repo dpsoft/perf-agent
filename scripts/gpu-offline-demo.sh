@@ -18,6 +18,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv3-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-rich <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-native-probe <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-recorder-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-output-rich <outdir>
@@ -36,6 +37,7 @@ Modes:
   hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv3-command-rich checked-in host->rocprofv3-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-rich checked-in preferred host->rocprofiler-sdk->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofiler-sdk-native-probe host->rocprofiler-sdk-native->collector probe path using a real librocprofiler-sdk.so
   hip-rocprofiler-sdk-recorder-rich checked-in host->rocprofiler-sdk-recorder->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-command-rich checked-in host->rocprofiler-sdk-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-output-rich checked-in host->rocprofiler-sdk-output-file->collector->AMD sample path with richer function/source/pc frames
@@ -163,9 +165,11 @@ AMD_SAMPLE_SOURCE_REAL_SOURCE=""
 AMD_SAMPLE_SOURCE_COMMAND_ENV=""
 AMD_SAMPLE_SOURCE_OUTPUT_ENV=""
 AMD_SAMPLE_SOURCE_OUTPUT_FILE=""
+ROCPROFILER_SDK_NATIVE_LIBRARY="${PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY:-/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so}"
 NAME=""
 DEBUG_GPU_LIVE=0
 declare -a EXTRA_ARGS=()
+declare -a AMD_SAMPLE_COLLECTOR_CMD=()
 
 case "${MODE}" in
     host-exec)
@@ -222,6 +226,32 @@ case "${MODE}" in
         AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFILER_SDK_OUTPUT_PATH"
         AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofiler_sdk_native_rich.ndjson"
         NAME="rocprofiler_sdk_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
+    hip-rocprofiler-sdk-native-probe)
+        if [[ "${DRY_RUN}" != "1" && ! -e "${ROCPROFILER_SDK_NATIVE_LIBRARY}" ]]; then
+            echo "hip-rocprofiler-sdk-native-probe requires librocprofiler-sdk.so at ${ROCPROFILER_SDK_NATIVE_LIBRARY} or PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY" >&2
+            exit 1
+        fi
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        AMD_SAMPLE_COLLECTOR_CMD=(
+            "env"
+            "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
+            "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
+            "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
+            "go"
+            "run"
+            "./cmd/amd-sample-collector"
+            "--mode"
+            "real"
+            "--real-source"
+            "rocprofiler-sdk"
+            "--rocprofiler-sdk-mode"
+            "native"
+            "--rocprofiler-sdk-library"
+            "${ROCPROFILER_SDK_NATIVE_LIBRARY}"
+        )
+        NAME="rocprofiler_sdk_native_probe"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
     hip-rocprofiler-sdk-recorder-rich)
@@ -363,8 +393,7 @@ declare -a CMD=(
     "."
 )
 
-declare -a AMD_SAMPLE_COLLECTOR_CMD=()
-if [[ -n "${AMD_SAMPLE_SOURCE_PATH}" ]]; then
+if [[ ${#AMD_SAMPLE_COLLECTOR_CMD[@]} -eq 0 && -n "${AMD_SAMPLE_SOURCE_PATH}" ]]; then
     AMD_SAMPLE_COLLECTOR_CMD=(
         "env"
         "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
@@ -380,7 +409,7 @@ if [[ -n "${AMD_SAMPLE_SOURCE_PATH}" ]]; then
         "--real-source"
         "${AMD_SAMPLE_SOURCE_REAL_SOURCE}"
     )
-elif [[ -n "${AMD_SAMPLE_SOURCE_COMMAND}" ]]; then
+elif [[ ${#AMD_SAMPLE_COLLECTOR_CMD[@]} -eq 0 && -n "${AMD_SAMPLE_SOURCE_COMMAND}" ]]; then
     AMD_SAMPLE_COLLECTOR_CMD=(
         "env"
         "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"

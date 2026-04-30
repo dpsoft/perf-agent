@@ -220,7 +220,7 @@ func stackLowAddr(pid uint32) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	// Expand the scanner's max buffer so very long /proc/<pid>/maps files
 	// (e.g., a Python process with hundreds of extension modules) don't

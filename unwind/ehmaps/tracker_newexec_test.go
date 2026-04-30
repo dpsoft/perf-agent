@@ -67,10 +67,7 @@ func TestNewExec_HookFires(t *testing.T) {
 
 	// Wait for the hook to fire (Run dispatches synchronously; 200ms is generous).
 	deadline := time.After(200 * time.Millisecond)
-	for {
-		if got.Load() == wantPID {
-			break
-		}
+	for got.Load() != wantPID {
 		select {
 		case <-deadline:
 			t.Fatalf("OnNewExec hook did not fire within deadline; got pid=%d, want %d",

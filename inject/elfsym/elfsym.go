@@ -24,7 +24,7 @@ func ResolveSymbols(path string, names []string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open ELF %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := make(map[string]uint64, len(names))
 	want := make(map[string]struct{}, len(names))

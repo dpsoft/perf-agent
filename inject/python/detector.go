@@ -78,7 +78,7 @@ func (d *procDetector) Detect(pid uint32) (*Target, error) {
 		}
 		return nil, fmt.Errorf("open %s: %w", mapsPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	libpythonPath, libpythonBase, ok := scanForLibpython(f)
 	if ok {
@@ -179,7 +179,7 @@ func (d *procDetector) resolveStatic(pid uint32) (*Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", mapsPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	loadBase := scanForExeBase(f, realExe)
 	if loadBase == 0 {
 		return nil, fmt.Errorf("%w: cannot find exe load base in %s", ErrNotPython, mapsPath)

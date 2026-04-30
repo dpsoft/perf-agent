@@ -2211,8 +2211,10 @@ printf '%s' "${count}" > "${counter_file}"
 printf '%s\n' 'libdrm warning' >&2
 if [ "${count}" -eq 1 ]; then
   printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"275.500","GPU use (%)":"73","GFX Version":"gfx942"}}'
-else
+elif [ "${count}" -eq 2 ]; then
   printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"301.100","GPU use (%)":"41","GFX Version":"gfx942"}}'
+else
+  printf '%s\n' '{"card1":{"Device Name":"MI300X","Device ID":"0x74a1","Current Socket Graphics Package Power (W)":"199.400","GPU use (%)":"18","GFX Version":"gfx942"}}'
 fi
 `
 	if err := os.WriteFile(rocmSMIPath, []byte(rocmSMIScript), 0o755); err != nil {
@@ -2223,30 +2225,23 @@ fi
 	cmd.Env = append(
 		os.Environ(),
 		"PERF_AGENT_HIP_PID=4242",
-		"PERF_AGENT_GPU_DURATION=2s",
+		"PERF_AGENT_GPU_DURATION=12ms",
 		"PERF_AGENT_GPU_KERNEL_NAME=collector_kernel",
 		"PERF_AGENT_GPU_QUEUE_ID=compute:7",
 		"PERF_AGENT_ROCM_SMI_PATH="+rocmSMIPath,
+		"PERF_AGENT_AMD_SAMPLE_REAL_POLL_INTERVAL=5ms",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("amd sample collector real mode: %v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 3 {
+	if len(lines) != 7 {
 		t.Fatalf("got %d lines:\n%s", len(lines), out)
 	}
 	execEv, err := codec.DecodeLine([]byte(lines[0]))
 	if err != nil {
 		t.Fatalf("decode exec line: %v\n%s", err, lines[0])
-	}
-	sample1, err := codec.DecodeLine([]byte(lines[1]))
-	if err != nil {
-		t.Fatalf("decode sample1 line: %v\n%s", err, lines[1])
-	}
-	sample2, err := codec.DecodeLine([]byte(lines[2]))
-	if err != nil {
-		t.Fatalf("decode sample2 line: %v\n%s", err, lines[2])
 	}
 	if execEv.Exec.KernelName != "collector_kernel" {
 		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
@@ -2263,20 +2258,37 @@ fi
 	if execEv.Exec.Queue.QueueID != "compute:7" {
 		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
 	}
-	if sample1.Sample.StallReason != "hardware_gpu_use" || sample1.Sample.Weight != 73 {
-		t.Fatalf("sample1=%+v", sample1.Sample)
+	wantReasons := []string{
+		"hardware_gpu_use",
+		"hardware_socket_power_watts",
+		"hardware_gpu_use",
+		"hardware_socket_power_watts",
+		"hardware_gpu_use",
+		"hardware_socket_power_watts",
 	}
-	if sample2.Sample.StallReason != "hardware_socket_power_watts" || sample2.Sample.Weight != 301 {
-		t.Fatalf("sample2=%+v", sample2.Sample)
-	}
-	if !(execEv.Exec.StartNs < sample1.Sample.TimeNs && sample1.Sample.TimeNs < sample2.Sample.TimeNs && sample2.Sample.TimeNs < execEv.Exec.EndNs) {
-		t.Fatalf("unexpected time ordering: exec=%+v sample1=%+v sample2=%+v", execEv.Exec, sample1.Sample, sample2.Sample)
+	wantWeights := []uint64{73, 276, 41, 301, 18, 199}
+	prevTime := execEv.Exec.StartNs
+	for i := 1; i < len(lines); i++ {
+		ev, err := codec.DecodeLine([]byte(lines[i]))
+		if err != nil {
+			t.Fatalf("decode sample line %d: %v\n%s", i, err, lines[i])
+		}
+		if ev.Sample.StallReason != wantReasons[i-1] || ev.Sample.Weight != wantWeights[i-1] {
+			t.Fatalf("sample%d=%+v", i, ev.Sample)
+		}
+		if !(execEv.Exec.StartNs < ev.Sample.TimeNs && ev.Sample.TimeNs < execEv.Exec.EndNs) {
+			t.Fatalf("sample%d time outside exec window: exec=%+v sample=%+v", i, execEv.Exec, ev.Sample)
+		}
+		if ev.Sample.TimeNs < prevTime {
+			t.Fatalf("sample%d time regressed: prev=%d sample=%d", i, prevTime, ev.Sample.TimeNs)
+		}
+		prevTime = ev.Sample.TimeNs
 	}
 	countBytes, err := os.ReadFile(filepath.Join(tmpDir, "rocm-smi.count"))
 	if err != nil {
 		t.Fatalf("read rocm-smi count: %v", err)
 	}
-	if strings.TrimSpace(string(countBytes)) != "2" {
+	if strings.TrimSpace(string(countBytes)) != "3" {
 		t.Fatalf("rocm-smi invocation count=%q", strings.TrimSpace(string(countBytes)))
 	}
 }

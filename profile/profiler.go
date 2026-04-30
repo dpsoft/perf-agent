@@ -6,15 +6,13 @@ import (
 	"io"
 	"log"
 	"os"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
-	"golang.org/x/sys/unix"
 
 	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
+	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
@@ -24,15 +22,9 @@ type Profiler struct {
 	objs       *perfObjects
 	symbolizer *blazesym.Symbolizer
 	resolver   *procmap.Resolver
-	perfEvents []*perfEvent
+	perfSet    *perfevent.Set
 	tags       []string
 	sampleRate int
-}
-
-// perfEvent wraps a Linux perf event for CPU sampling
-type perfEvent struct {
-	fd   int
-	link *link.RawLink
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -103,27 +95,10 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	var perfEvents []*perfEvent
-	for _, id := range cpus {
-		pe, err := newPerfEvent(int(id), sampleRate)
-		if err != nil {
-			for _, pe := range perfEvents {
-				_ = pe.Close()
-			}
-			_ = objs.Close()
-			return nil, fmt.Errorf("create perf event on CPU %d: %w", id, err)
-		}
-
-		if err := pe.attachPerfEvent(objs.Profile); err != nil {
-			_ = pe.Close()
-			for _, pe := range perfEvents {
-				_ = pe.Close()
-			}
-			_ = objs.Close()
-			return nil, fmt.Errorf("attach eBPF to perf event on CPU %d: %w", id, err)
-		}
-
-		perfEvents = append(perfEvents, pe)
+	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, sampleRate)
+	if err != nil {
+		_ = objs.Close()
+		return nil, err
 	}
 
 	symbolizer, err := blazesym.NewSymbolizer(
@@ -131,9 +106,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		blazesym.SymbolizerWithInlinedFns(true),
 	)
 	if err != nil {
-		for _, pe := range perfEvents {
-			_ = pe.Close()
-		}
+		_ = perfSet.Close()
 		_ = objs.Close()
 		return nil, fmt.Errorf("create symbolizer: %w", err)
 	}
@@ -142,7 +115,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		objs:       objs,
 		symbolizer: symbolizer,
 		resolver:   procmap.NewResolver(),
-		perfEvents: perfEvents,
+		perfSet:    perfSet,
 		tags:       tags,
 		sampleRate: sampleRate,
 	}, nil
@@ -152,9 +125,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 func (pr *Profiler) Close() {
 	pr.symbolizer.Close()
 	pr.resolver.Close()
-	for _, pe := range pr.perfEvents {
-		_ = pe.Close()
-	}
+	_ = pr.perfSet.Close()
 	_ = pr.objs.Close()
 }
 
@@ -286,44 +257,3 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 	}
 }
 
-// perfEvent helpers
-
-func newPerfEvent(cpu int, sampleRate int) (*perfEvent, error) {
-	attr := unix.PerfEventAttr{
-		Type:   unix.PERF_TYPE_SOFTWARE,
-		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Config: unix.PERF_COUNT_SW_CPU_CLOCK,
-		Sample: uint64(sampleRate),
-		Bits:   unix.PerfBitFreq, // Enable frequency mode
-	}
-
-	fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
-	if err != nil {
-		return nil, os.NewSyscallError("perf_event_open", err)
-	}
-
-	return &perfEvent{fd: fd}, nil
-}
-
-func (pe *perfEvent) Close() error {
-	if pe.link != nil {
-		_ = pe.link.Close()
-	}
-	if pe.fd >= 0 {
-		return unix.Close(pe.fd)
-	}
-	return nil
-}
-
-func (pe *perfEvent) attachPerfEvent(prog *ebpf.Program) error {
-	rawLink, err := link.AttachRawLink(link.RawLinkOptions{
-		Target:  pe.fd,
-		Program: prog,
-		Attach:  ebpf.AttachPerfEvent,
-	})
-	if err != nil {
-		return fmt.Errorf("attach raw link: %w", err)
-	}
-	pe.link = rawLink
-	return nil
-}

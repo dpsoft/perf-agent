@@ -1,17 +1,11 @@
 package dwarfagent
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"syscall"
-	"unsafe"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
-	"golang.org/x/sys/unix"
-
+	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
@@ -45,13 +39,11 @@ const (
 // Profiler is the DWARF-capable CPU profiler. Same public shape as
 // profile.Profiler (Collect / CollectAndWrite / Close) so
 // perfagent.Agent can swap on --unwind. Most heavy lifting lives in
-// the embedded *session — Profiler only adds per-CPU perf_event +
-// RawLink slices.
+// the embedded *session — Profiler only adds the per-CPU perf-event Set.
 type Profiler struct {
 	*session
 	sampleRate int
-	perfFDs    []int
-	perfLinks  []link.Link
+	perfSet    *perfevent.Set
 }
 
 // NewProfilerWithMode is the variant of NewProfiler that accepts both
@@ -82,11 +74,12 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 		return nil, err
 	}
 
-	p := &Profiler{session: sess, sampleRate: sampleRate}
-	if err := p.attachPerfEvents(objs.Program(), cpus, sampleRate); err != nil {
-		_ = p.close()
+	perfSet, err := perfevent.OpenAll(objs.Program(), cpus, sampleRate, perfevent.WithDeferredEnable())
+	if err != nil {
+		_ = sess.close()
 		return nil, err
 	}
+	p := &Profiler{session: sess, sampleRate: sampleRate, perfSet: perfSet}
 
 	sess.runTracker()
 	sess.readerWG.Add(1)
@@ -116,58 +109,6 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil)
 }
 
-// attachPerfEvents opens one perf_event_open per CPU (pid=-1, cpu=N,
-// BPF pids-map filter) and link.AttachRawLinks the BPF program to each.
-// Populates p.perfFDs + p.perfLinks for Close to tear down.
-func (p *Profiler) attachPerfEvents(prog *ebpf.Program, cpus []uint, sampleRate int) error {
-	attr := &unix.PerfEventAttr{
-		Type:   unix.PERF_TYPE_SOFTWARE,
-		Config: unix.PERF_COUNT_SW_CPU_CLOCK,
-		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Sample: uint64(sampleRate),
-		Bits:   unix.PerfBitFreq | unix.PerfBitDisabled,
-	}
-	cleanup := func() {
-		for _, l := range p.perfLinks {
-			_ = l.Close()
-		}
-		for _, fd := range p.perfFDs {
-			_ = unix.Close(fd)
-		}
-		p.perfLinks = nil
-		p.perfFDs = nil
-	}
-	for _, cpu := range cpus {
-		fd, err := unix.PerfEventOpen(attr, -1, int(cpu), -1, unix.PERF_FLAG_FD_CLOEXEC)
-		if err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				continue
-			}
-			cleanup()
-			return fmt.Errorf("perf_event_open cpu=%d: %w", cpu, err)
-		}
-		p.perfFDs = append(p.perfFDs, fd)
-		rl, err := link.AttachRawLink(link.RawLinkOptions{
-			Target:  fd,
-			Program: prog,
-			Attach:  ebpf.AttachPerfEvent,
-		})
-		if err != nil {
-			cleanup()
-			return fmt.Errorf("attach perf event cpu=%d: %w", cpu, err)
-		}
-		p.perfLinks = append(p.perfLinks, rl)
-		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-			cleanup()
-			return fmt.Errorf("enable perf event cpu=%d: %w", cpu, err)
-		}
-	}
-	if len(p.perfFDs) == 0 {
-		return fmt.Errorf("no perf events attached (pid=%d, cpus=%d)", p.pid, len(cpus))
-	}
-	return nil
-}
-
 // aggregateCPUSample is the CPU-specific ringbuf aggregator: each
 // sample counts once; blocking-ns isn't meaningful here. Wrapped as a
 // free function so consumeRingbuf can pass it generically.
@@ -195,18 +136,11 @@ func (p *Profiler) CollectAndWrite(outputPath string) error {
 	return p.Collect(f)
 }
 
-// Close closes perf-event links + fds, then delegates the rest to
+// Close closes the per-CPU perf-event Set, then delegates the rest to
 // session.close (ringbuf reader, watcher, symbolizer, BPF handle).
 // Idempotent at the stop-channel level.
 func (p *Profiler) Close() error {
-	for _, l := range p.perfLinks {
-		_ = l.Close()
-	}
-	for _, fd := range p.perfFDs {
-		_ = unix.Close(fd)
-	}
-	p.perfLinks = nil
-	p.perfFDs = nil
+	_ = p.perfSet.Close()
 	return p.close()
 }
 

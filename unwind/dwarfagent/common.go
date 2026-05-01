@@ -52,8 +52,9 @@ type sessionObjs interface {
 // off-CPU) plus a consume-callback that controls how Sample.Value
 // aggregates (count++ vs sum+=).
 type session struct {
-	pid  int
-	tags []string
+	pid    int
+	tags   []string
+	labels map[string]string
 
 	objs       sessionObjs
 	store      *ehmaps.TableStore
@@ -99,7 +100,7 @@ type attachStats struct {
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
@@ -210,6 +211,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	return &session{
 		pid:         pid,
 		tags:        tags,
+		labels:      labels,
 		objs:        objs,
 		store:       store,
 		tracker:     tracker,
@@ -330,6 +332,7 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 		PerPIDProfile: false,
 		Comments:      s.tags,
 		Resolver:      s.resolver,
+		Labels:        s.labels,
 	})
 	for key, val := range samples {
 		frames := symbolizePID(s.symbolizer, key.pid, stacks[key])

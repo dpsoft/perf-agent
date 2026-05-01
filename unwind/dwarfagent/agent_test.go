@@ -47,7 +47,7 @@ func TestProfilerEndToEnd(t *testing.T) {
 		cpus = append(cpus, uint(i))
 	}
 
-	p, err := dwarfagent.NewProfiler(workload.Process.Pid, false, cpus, nil, 99)
+	p, err := dwarfagent.NewProfiler(workload.Process.Pid, false, cpus, nil, 99, nil)
 	if err != nil {
 		t.Fatalf("NewProfiler: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
 		},
 	}
 
-	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks)
+	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks, nil)
 	if err != nil {
 		t.Fatalf("NewProfilerWithHooks: %v", err)
 	}

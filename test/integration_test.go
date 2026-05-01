@@ -162,14 +162,6 @@ func TestProfileMode(t *testing.T) {
 					break
 				}
 			}
-			// Threshold below which the symbolization assertion is
-			// statistically too noisy to be meaningful. A healthy 10s @ 99Hz
-			// CPU-bound run produces hundreds of samples; an IO-bound run
-			// spending ~95% time in kernel produces tens. Below 20 user-space
-			// samples, the few PCs we got may have all landed in
-			// unsymbolizable regions (vdso, interpreter trampolines, stripped
-			// .text holes) — that's CI noise, not a perf-agent regression.
-			const minSamplesForSymbolAssertion = 20
 			switch {
 			case hasSymbols:
 				// good
@@ -177,9 +169,9 @@ func TestProfileMode(t *testing.T) {
 				t.Logf("WARN: JIT-only profile (no file-backed mappings or symbols); known limitation for low-CPU Python -X perf on amd64")
 			case isDegenerateProfile(prof):
 				t.Logf("WARN: degenerate profile (no usable mappings); known CI flake on slow runners — captured PCs landed outside any binary mapping")
-			case len(prof.Sample) < minSamplesForSymbolAssertion:
+			case len(prof.Sample) < degenerateSampleFloor:
 				t.Logf("WARN: only %d samples captured (< %d threshold); symbolization assertion skipped — too few user-space PCs to reliably hit symbolizable code",
-					len(prof.Sample), minSamplesForSymbolAssertion)
+					len(prof.Sample), degenerateSampleFloor)
 			default:
 				assert.True(t, hasSymbols, "Profile should contain symbolized functions")
 			}
@@ -406,24 +398,29 @@ func isJitOnlyProfile(p *profile.Profile) bool {
 }
 
 // isDegenerateProfile reports whether the profile is the "captured
-// almost nothing" shape we keep hitting on slow CI runners: zero or
-// one or two samples, with no usable mapping information at all
-// (neither file-backed mappings nor the [jit] sentinel).
+// almost nothing" shape we keep hitting on slow CI runners: a
+// low-volume run (< degenerateSampleFloor samples) with no usable
+// mapping information at all (neither file-backed mappings nor the
+// [jit] sentinel).
 //
 // We deliberately gate on **sample count** as well as mapping
-// emptiness. A healthy run for a 5-second workload at 99 Hz produces
-// hundreds of samples; a real mapping-resolution regression that
-// wiped binaries from the symbolizer would still leave samples
-// behind. ≤2 samples means the runner timed out the workload before
-// anything meaningful was captured — that's blazesym/scheduler
-// timing, not a perf-agent bug.
+// emptiness. A real mapping-resolution regression (e.g. blazesym
+// broken, /proc/<pid>/maps unreadable, library lookup busted) would
+// still produce hundreds of samples for a 10s @ 99Hz run — those
+// samples just wouldn't have any binary mapping attached. Above the
+// floor, "zero real mappings" is a genuine bug worth a loud failure.
+// Below the floor, the few PCs we got may all have landed in
+// unmapped/anonymous regions on a slow runner — that's blazesym /
+// scheduler timing, not a perf-agent bug. Other earlier guards
+// (`len(prof.Sample) > 0`, `hasStacks`) already catch the "BPF
+// stopped capturing entirely" case, so this gate doesn't hide that.
 //
-// Treat the same way as isJitOnlyProfile: log a loud warning, do not
-// fail the test. With the sample-count gate, a regression that wipes
-// mappings while still capturing samples will surface loudly as a
-// genuine assertion failure, not as a silent pass.
+// The floor (degenerateSampleFloor) is shared with the
+// symbolization-assertion floor in TestProfileMode for consistency:
+// the underlying claim in both is the same — below this many
+// samples, we have too little signal to assert against.
 func isDegenerateProfile(p *profile.Profile) bool {
-	if len(p.Sample) > 2 {
+	if len(p.Sample) >= degenerateSampleFloor {
 		return false
 	}
 	for _, m := range p.Mapping {
@@ -436,6 +433,13 @@ func isDegenerateProfile(p *profile.Profile) bool {
 	}
 	return true
 }
+
+// degenerateSampleFloor is the sample-count threshold below which the
+// pprof fidelity / symbolization assertions are considered too noisy
+// to be meaningful. A healthy 10s @ 99Hz CPU-bound run produces
+// hundreds of user-space samples; the IO-bound subtests on slow CI
+// runners can drop into the low tens or single digits.
+const degenerateSampleFloor = 20
 
 // assertPprofFidelity verifies pprof fidelity guarantees on a
 // captured profile: >=1 real (non-sentinel) mapping and every

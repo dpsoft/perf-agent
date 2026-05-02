@@ -494,6 +494,36 @@ func TestGPUOfflineDemoScriptDryRunHostExec(t *testing.T) {
 	}
 }
 
+func TestRunRealRustHIPFlamegraphScriptDryRun(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-hip-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-flame",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip flamegraph: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"rustc examples/real_hip_attention_workload.rs",
+		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/perf-agent .",
+		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/flamegraph-svg ./cmd/flamegraph-svg",
+		"REAL_HIP_ATTENTION_ITERATIONS=12",
+		"--profile --pid \\<pid\\> --duration 8480ms",
+		"--unwind fp",
+		"--gpu-linux-kfd",
+		"--gpu-host-hip-library",
+		"--gpu-folded-output /tmp/real-rust-hip-flame/real_rust_hip_attention.folded",
+		"/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/flamegraph-svg --title CPU\\ +\\ GPU\\ Flame\\ Graph:\\ real_rust_hip_attention",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

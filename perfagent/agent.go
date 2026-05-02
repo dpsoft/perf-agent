@@ -255,26 +255,9 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	gpuMode := a.config.gpuSourceCount() == 1 && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
 	if gpuMode {
-		gpuBackend, err := a.newGPUBackend()
-		if err != nil {
-			return fmt.Errorf("create GPU backend: %w", err)
-		}
-		a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, a.gpuManagerConfig())
-		if err := a.gpuManager.Start(ctx); err != nil {
+		if err := a.startGPUPipeline(ctx); err != nil {
 			a.cleanup()
-			return fmt.Errorf("start GPU manager: %w", err)
-		}
-		if a.config.hostSourceCount() == 1 {
-			hostSource, err := a.newHostSource()
-			if err != nil {
-				a.cleanup()
-				return fmt.Errorf("create host source: %w", err)
-			}
-			a.hostSource = hostSource
-			if err := a.hostSource.Start(ctx, hostsource.NewLaunchSink(a.gpuManager)); err != nil {
-				a.cleanup()
-				return fmt.Errorf("start host source: %w", err)
-			}
+			return err
 		}
 		a.started = true
 		return nil
@@ -436,7 +419,36 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	if a.config.gpuSourceCount() == 1 {
+		if err := a.startGPUPipeline(ctx); err != nil {
+			a.cleanup()
+			return err
+		}
+	}
+
 	a.started = true
+	return nil
+}
+
+func (a *Agent) startGPUPipeline(ctx context.Context) error {
+	gpuBackend, err := a.newGPUBackend()
+	if err != nil {
+		return fmt.Errorf("create GPU backend: %w", err)
+	}
+	a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, a.gpuManagerConfig())
+	if err := a.gpuManager.Start(ctx); err != nil {
+		return fmt.Errorf("start GPU manager: %w", err)
+	}
+	if a.config.hostSourceCount() == 1 {
+		hostSource, err := a.newHostSource()
+		if err != nil {
+			return fmt.Errorf("create host source: %w", err)
+		}
+		a.hostSource = hostSource
+		if err := a.hostSource.Start(ctx, hostsource.NewLaunchSink(a.gpuManager)); err != nil {
+			return fmt.Errorf("start host source: %w", err)
+		}
+	}
 	return nil
 }
 

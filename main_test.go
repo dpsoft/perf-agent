@@ -524,6 +524,50 @@ func TestRunRealRustHIPFlamegraphScriptDryRun(t *testing.T) {
 	}
 }
 
+func TestRunRealRustHIPFlamegraphScriptDryRunAutoSizesDuration(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-hip-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-flame",
+		"--iterations", "3",
+		"--sleep-before-ms", "1000",
+		"--sleep-between-ms", "50",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip flamegraph auto duration: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "--profile --pid \\<pid\\> --duration 4150ms") {
+		t.Fatalf("missing auto-sized duration in output:\n%s", got)
+	}
+}
+
+func TestRunRealRustHIPFlamegraphScriptDryRunPreservesExplicitDuration(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-hip-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-flame",
+		"--duration", "9s",
+		"--iterations", "3",
+		"--sleep-before-ms", "1000",
+		"--sleep-between-ms", "50",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip flamegraph explicit duration: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "--profile --pid \\<pid\\> --duration 9s") {
+		t.Fatalf("missing explicit duration in output:\n%s", got)
+	}
+	if strings.Contains(got, "--profile --pid \\<pid\\> --duration 4150ms") {
+		t.Fatalf("explicit duration was replaced by auto duration:\n%s", got)
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

@@ -82,7 +82,9 @@ func TestRenderHTMLWrapsSVGDocument(t *testing.T) {
 		"leaf",
 		`id="search"`,
 		`id="reset-zoom"`,
-		`Click a frame to zoom`,
+		`id="match-count"`,
+		`id="breadcrumbs"`,
+		`Click to zoom`,
 		`querySelectorAll('.frame')`,
 	} {
 		if !strings.Contains(got, want) {
@@ -103,10 +105,13 @@ func TestRenderHTMLAnnotatesFramesForNavigation(t *testing.T) {
 	for _, want := range []string{
 		`class="frame"`,
 		`data-name="leaf"`,
+		`data-path="root;branch;leaf"`,
 		`data-orig-x="`,
 		`data-orig-width="`,
 		`function zoom(target)`,
 		`function applySearch(query)`,
+		`function renderBreadcrumbs(parts)`,
+		`evt.key==='/'`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

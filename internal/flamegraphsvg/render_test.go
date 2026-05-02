@@ -80,6 +80,33 @@ func TestRenderHTMLWrapsSVGDocument(t *testing.T) {
 		"<svg",
 		"GPU HTML Flame",
 		"leaf",
+		`id="search"`,
+		`id="reset-zoom"`,
+		`Click a frame to zoom`,
+		`querySelectorAll('.frame')`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderHTMLAnnotatesFramesForNavigation(t *testing.T) {
+	input := strings.NewReader("root;branch;leaf 7\n")
+
+	var out strings.Builder
+	if err := RenderHTML(&out, input, Options{Title: "GPU HTML Flame"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		`class="frame"`,
+		`data-name="leaf"`,
+		`data-orig-x="`,
+		`data-orig-width="`,
+		`function zoom(target)`,
+		`function applySearch(query)`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

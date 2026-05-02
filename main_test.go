@@ -568,6 +568,36 @@ func TestRunRealRustHIPFlamegraphScriptDryRunPreservesExplicitDuration(t *testin
 	}
 }
 
+func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-rocprofiler-sdk-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-rocprofiler-sdk-flame",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip rocprofiler-sdk flamegraph: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"rustc examples/real_hip_attention_workload.rs",
+		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/amd-sample-collector ./cmd/amd-sample-collector",
+		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/flamegraph-svg ./cmd/flamegraph-svg",
+		"REAL_HIP_ATTENTION_ITERATIONS=12",
+		"PERF_AGENT_ROCPROFILER_SDK_MODE=native",
+		"PERF_AGENT_ROCPROFILER_SDK_LIBRARY=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so",
+		"--gpu-amd-sample-stdin",
+		"--gpu-host-hip-library",
+		"--gpu-folded-output /tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.folded",
+		"|",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

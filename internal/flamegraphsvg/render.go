@@ -75,14 +75,26 @@ func Render(w io.Writer, folded io.Reader, opts Options) error {
 
 func RenderHTML(w io.Writer, folded io.Reader, opts Options) error {
 	var svg strings.Builder
+	if opts.Width <= 0 {
+		opts.Width = defaultWidth
+	}
+	if opts.Title == "" {
+		opts.Title = "Flame Graph"
+	}
 	if err := Render(&svg, folded, opts); err != nil {
 		return err
 	}
 	title := opts.Title
-	if title == "" {
-		title = "Flame Graph"
-	}
-	_, err := fmt.Fprintf(w, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>%s</title>\n<style>body{margin:0;background:%s;font-family:Verdana,sans-serif}main{padding:12px}svg{max-width:100%%;height:auto;display:block}</style>\n</head>\n<body>\n<main>\n%s</main>\n</body>\n</html>\n", html.EscapeString(title), defaultBackground, svg.String())
+	_, err := fmt.Fprintf(w, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>%s</title>\n<style>body{margin:0;background:%s;font-family:Verdana,sans-serif;color:#222}main{padding:12px}header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}h1{font-size:18px;margin:0 12px 0 0}label{font-size:13px}input{font:inherit;padding:4px 6px}button{font:inherit;padding:4px 8px;cursor:pointer}svg{max-width:100%%;height:auto;display:block;border:1px solid #ddd;background:%s}#details{font-size:12px;color:#444;min-height:1.2em}.frame{cursor:pointer}.frame.highlight rect{stroke:#111;stroke-width:1.5}.frame.dim{opacity:.18}</style>\n</head>\n<body>\n<main>\n<header><h1>%s</h1><label>Search <input id=\"search\" type=\"search\" placeholder=\"frame name\" /></label><button id=\"clear-search\" type=\"button\">Clear Search</button><button id=\"reset-zoom\" type=\"button\">Reset Zoom</button><div id=\"details\">Click a frame to zoom. Hover to inspect.</div></header>\n%s\n<script>(function(){const svg=document.querySelector('svg');if(!svg)return;const frames=[...svg.querySelectorAll('.frame')];const sidePad=%d;const svgWidth=%d;const plotWidth=svgWidth-(sidePad*2);const originalViewBox=svg.getAttribute('viewBox');const details=document.getElementById('details');const search=document.getElementById('search');const clearSearch=document.getElementById('clear-search');const resetZoom=document.getElementById('reset-zoom');function num(el,key){return Number(el.dataset[key]||'0');}function setFrame(el,x,width,visible,highlight){el.style.display=visible?'':'none';el.classList.toggle('highlight',!!highlight);el.classList.toggle('dim',false);if(!visible)return;const rect=el.querySelector('rect');const text=el.querySelector('text');rect.setAttribute('x',x.toFixed(2));rect.setAttribute('width',Math.max(0,width).toFixed(2));if(text){const textX=x+%d;text.setAttribute('x',textX.toFixed(2));text.style.display=width>=%d?'':'none';}}function reset(){svg.setAttribute('viewBox',originalViewBox);frames.forEach(el=>{setFrame(el,num(el,'origX'),num(el,'origWidth'),true,false);});details.textContent='Click a frame to zoom. Hover to inspect.';applySearch(search.value);}function zoom(target){const tx=num(target,'origX');const tw=num(target,'origWidth');const tEnd=tx+tw;const ratio=plotWidth/tw;frames.forEach(el=>{const x=num(el,'origX');const w=num(el,'origWidth');const end=x+w;const isAncestor=x<=tx&&end>=tEnd;const isDescendant=x>=tx&&end<=tEnd;const visible=isAncestor||isDescendant;if(!visible){setFrame(el,x,w,false,false);return;}if(isAncestor){setFrame(el,sidePad,plotWidth,true,false);return;}const newX=sidePad+((x-tx)*ratio);const newW=w*ratio;setFrame(el,newX,newW,true,false);});details.textContent=target.dataset.name+' ('+target.dataset.value+')';applySearch(search.value);}function applySearch(query){const q=(query||'').trim().toLowerCase();frames.forEach(el=>{const match=q!==''&&el.dataset.name.toLowerCase().includes(q);el.classList.toggle('highlight',match);el.classList.toggle('dim',q!==''&&!match&&el.style.display!=='none');});if(q===''){frames.forEach(el=>el.classList.remove('dim'));}}frames.forEach(el=>{el.addEventListener('click',()=>zoom(el));el.addEventListener('mouseenter',()=>{details.textContent=el.dataset.name+' ('+el.dataset.value+')';});});search.addEventListener('input',e=>applySearch(e.target.value));clearSearch.addEventListener('click',()=>{search.value='';applySearch('');});resetZoom.addEventListener('click',reset);reset();})();</script>\n</main>\n</body>\n</html>\n",
+		html.EscapeString(title),
+		defaultBackground,
+		defaultBackground,
+		html.EscapeString(title),
+		svg.String(),
+		defaultSidePad,
+		opts.Width,
+		defaultTextPad,
+		defaultMinTextW)
 	return err
 }
 
@@ -148,7 +160,7 @@ func renderNode(w io.Writer, n *node, x float64, depth, maxDepth int, scale floa
 	title := html.EscapeString(fmt.Sprintf("%s (%d)", n.name, n.value))
 	fill := colorFor(n.name)
 
-	fmt.Fprintf(w, `<g>`+"\n")
+	fmt.Fprintf(w, `<g class="frame" data-name="%s" data-value="%d" data-orig-x="%.2f" data-orig-width="%.2f" data-depth="%d">`+"\n", html.EscapeString(n.name), n.value, x, width, depth)
 	fmt.Fprintf(w, `<title>%s</title>`+"\n", title)
 	fmt.Fprintf(w, `<rect x="%.2f" y="%.2f" width="%.2f" height="%d" fill="%s" stroke="#e8e8e8" stroke-width="0.5" rx="2" ry="2" />`+"\n", x, y, width, defaultFrameH-1, fill)
 	if width >= defaultMinTextW {

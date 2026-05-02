@@ -130,6 +130,8 @@ GPU_SVG="${OUTDIR}/real_rust_hip_attention.svg"
 GPU_HTML="${OUTDIR}/real_rust_hip_attention.html"
 APP_LOG="${OUTDIR}/real_rust_hip_attention.app.log"
 RUNNER_LOG="${OUTDIR}/real_rust_hip_attention.runner.log"
+OWNER_UID=$(id -u)
+OWNER_GID=$(id -g)
 
 declare -a BUILD_CMD=(
     rustc
@@ -301,6 +303,15 @@ set -e
 if [[ "${STATUS}" -ne 0 ]]; then
     exit "${STATUS}"
 fi
+
+sudo chown "${OWNER_UID}:${OWNER_GID}" \
+    "${CPU_PROFILE}" \
+    "${GPU_RAW}" \
+    "${GPU_ATTR}" \
+    "${GPU_FOLDED}" \
+    "${GPU_PPROF}" \
+    "${GPU_SVG}" \
+    "${GPU_HTML}" 2>/dev/null || true
 
 (
     cd "${REPO_ROOT}"

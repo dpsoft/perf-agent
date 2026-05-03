@@ -63,6 +63,20 @@ offcpu.pb.gz
 # Test temporary files
 /tmp/perf-agent-test-*
 
+# Built test workload binaries (sources are tracked; binaries aren't)
+test/workloads/go/cpu_bound
+test/workloads/go/io_bound
+
+### Local dev runtime debris ###
+# Node.js V8 isolate logs from JS workload runs
+isolate-*-v8.log
+
+# Stray PMU capture files some users redirect from the CLI
+pmu.txt
+
+# Codex / Anthropic CLI cache
+.codex
+
 ### Project binaries ###
 perf-agent
 bench/cmd/scenario/scenario

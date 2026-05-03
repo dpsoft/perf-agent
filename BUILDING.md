@@ -3,7 +3,7 @@
 ## Prerequisites
 
 ### Required Tools
-- Go 1.25+
+- Go 1.26+ (the Makefile uses `GOTOOLCHAIN=auto`, so older system Go works — Go fetches the pinned toolchain on demand)
 - Clang/LLVM
 - Linux headers
 - Rust toolchain (for blazesym)

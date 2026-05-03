@@ -171,18 +171,43 @@ fn flash_attention(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String>
 }
 
 #[inline(never)]
-fn transformer_block_17(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn fused_attention_residual(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
     flash_attention(api, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn model_forward(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn transformer_block_17(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    fused_attention_residual(api, sleep_ms, spin)
+}
+
+#[inline(never)]
+fn decoder_layer_norm(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
     transformer_block_17(api, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn generate_token(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn paged_kv_cache_lookup(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    decoder_layer_norm(api, sleep_ms, spin)
+}
+
+#[inline(never)]
+fn attention_window_update(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    paged_kv_cache_lookup(api, sleep_ms, spin)
+}
+
+#[inline(never)]
+fn model_forward(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    attention_window_update(api, sleep_ms, spin)
+}
+
+#[inline(never)]
+fn decode_token_step(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
     model_forward(api, sleep_ms, spin)
+}
+
+#[inline(never)]
+fn generate_token(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    decode_token_step(api, sleep_ms, spin)
 }
 
 #[inline(never)]

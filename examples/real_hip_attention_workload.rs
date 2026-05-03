@@ -176,12 +176,20 @@ fn load_hip_api(path: &str) -> Result<HipApi, String> {
 }
 
 struct HipKernel {
-    module: HipModule,
+    name: &'static str,
     function: HipFunction,
-    unload: HipModuleUnload,
 }
 
-impl Drop for HipKernel {
+struct HipKernels {
+    module: HipModule,
+    unload: HipModuleUnload,
+    paged_kv_gather: HipKernel,
+    decoder_layer_norm: HipKernel,
+    flash_attn_decode: HipKernel,
+    flash_attn_epilogue: HipKernel,
+}
+
+impl Drop for HipKernels {
     fn drop(&mut self) {
         unsafe {
             let _ = (self.unload)(self.module);
@@ -193,13 +201,54 @@ fn env_offload_arch() -> String {
     env::var("REAL_HIP_ATTENTION_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1103".to_string())
 }
 
-fn compile_attention_kernel(api: &HipApi) -> Result<HipKernel, String> {
+unsafe fn resolve_kernel_function(
+    api: &HipApi,
+    module: HipModule,
+    symbol_name: &'static str,
+) -> Result<HipKernel, String> {
+    let symbol = CString::new(symbol_name).map_err(|e| e.to_string())?;
+    let mut function: HipFunction = ptr::null_mut();
+    let function_err = (api.module_get_function)(&mut function, module, symbol.as_ptr());
+    if function_err != 0 {
+        return Err(format!(
+            "hipModuleGetFunction({symbol_name}) failed: {} ({function_err})",
+            cstr_lossy_from_ptr((api.get_error_string)(function_err))
+        ));
+    }
+    Ok(HipKernel {
+        name: symbol_name,
+        function,
+    })
+}
+
+fn compile_attention_kernel(api: &HipApi) -> Result<HipKernels, String> {
     let source = CString::new(
         r#"
 extern "C" __global__
-void flash_attn_decode_bf16_gfx11(int* out) {
+void paged_kv_gather_gfx11(int* out) {
     if(threadIdx.x == 0 && out != nullptr) {
         out[0] = out[0] + 1;
+    }
+}
+
+extern "C" __global__
+void decoder_layer_norm_gfx11(int* out) {
+    if(threadIdx.x == 0 && out != nullptr) {
+        out[0] = out[0] + 2;
+    }
+}
+
+extern "C" __global__
+void flash_attn_decode_bf16_gfx11(int* out) {
+    if(threadIdx.x == 0 && out != nullptr) {
+        out[0] = out[0] + 3;
+    }
+}
+
+extern "C" __global__
+void flash_attn_epilogue_gfx11(int* out) {
+    if(threadIdx.x == 0 && out != nullptr) {
+        out[0] = out[0] + 4;
     }
 }
 "#,
@@ -278,21 +327,45 @@ void flash_attn_decode_bf16_gfx11(int* out) {
             ));
         }
 
-        let symbol = CString::new("flash_attn_decode_bf16_gfx11").map_err(|e| e.to_string())?;
-        let mut function: HipFunction = ptr::null_mut();
-        let function_err = (api.module_get_function)(&mut function, module, symbol.as_ptr());
-        if function_err != 0 {
-            let _ = (api.module_unload)(module);
-            return Err(format!(
-                "hipModuleGetFunction failed: {} ({function_err})",
-                cstr_lossy_from_ptr((api.get_error_string)(function_err))
-            ));
-        }
+        let paged_kv_gather = match resolve_kernel_function(api, module, "paged_kv_gather_gfx11") {
+            Ok(fnptr) => fnptr,
+            Err(err) => {
+                let _ = (api.module_unload)(module);
+                return Err(err);
+            }
+        };
+        let decoder_layer_norm =
+            match resolve_kernel_function(api, module, "decoder_layer_norm_gfx11") {
+                Ok(fnptr) => fnptr,
+                Err(err) => {
+                    let _ = (api.module_unload)(module);
+                    return Err(err);
+                }
+            };
+        let flash_attn_decode =
+            match resolve_kernel_function(api, module, "flash_attn_decode_bf16_gfx11") {
+                Ok(fnptr) => fnptr,
+                Err(err) => {
+                    let _ = (api.module_unload)(module);
+                    return Err(err);
+                }
+            };
+        let flash_attn_epilogue =
+            match resolve_kernel_function(api, module, "flash_attn_epilogue_gfx11") {
+                Ok(fnptr) => fnptr,
+                Err(err) => {
+                    let _ = (api.module_unload)(module);
+                    return Err(err);
+                }
+            };
 
-        Ok(HipKernel {
+        Ok(HipKernels {
             module,
-            function,
             unload: api.module_unload,
+            paged_kv_gather,
+            decoder_layer_norm,
+            flash_attn_decode,
+            flash_attn_epilogue,
         })
     }
 }
@@ -307,7 +380,12 @@ fn cpu_spin(spin: u64) -> u64 {
 }
 
 #[inline(never)]
-fn launch_attention_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn launch_attention_step(
+    api: &HipApi,
+    kernel: &HipKernel,
+    sleep_ms: u64,
+    spin: u64,
+) -> Result<(), String> {
     let _ = cpu_spin(spin);
     let mut stream: HipStream = ptr::null_mut();
     let mut device_ptr: *mut c_void = ptr::null_mut();
@@ -335,7 +413,8 @@ fn launch_attention_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: 
             ptr::null_mut(),
         );
         println!(
-            "hipModuleLaunchKernel -> err={launch_err} ({})",
+            "hipModuleLaunchKernel[{}] -> err={launch_err} ({})",
+            kernel.name,
             cstr_lossy_from_ptr((api.get_error_string)(launch_err))
         );
 
@@ -354,54 +433,57 @@ fn launch_attention_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: 
 }
 
 #[inline(never)]
-fn flash_attention(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    launch_attention_step(api, kernel, sleep_ms, spin)
+fn flash_attention(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    launch_attention_step(api, &kernels.flash_attn_decode, sleep_ms, spin)?;
+    fused_attention_residual(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn fused_attention_residual(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    flash_attention(api, kernel, sleep_ms, spin)
+fn fused_attention_residual(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    launch_attention_step(api, &kernels.flash_attn_epilogue, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn transformer_block_17(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    fused_attention_residual(api, kernel, sleep_ms, spin)
+fn transformer_block_17(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    flash_attention(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn decoder_layer_norm(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    transformer_block_17(api, kernel, sleep_ms, spin)
+fn decoder_layer_norm(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    launch_attention_step(api, &kernels.decoder_layer_norm, sleep_ms, spin)?;
+    transformer_block_17(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn paged_kv_cache_lookup(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    decoder_layer_norm(api, kernel, sleep_ms, spin)
+fn paged_kv_cache_lookup(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    launch_attention_step(api, &kernels.paged_kv_gather, sleep_ms, spin)?;
+    decoder_layer_norm(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn attention_window_update(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    paged_kv_cache_lookup(api, kernel, sleep_ms, spin)
+fn attention_window_update(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    paged_kv_cache_lookup(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn model_forward(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    attention_window_update(api, kernel, sleep_ms, spin)
+fn model_forward(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    attention_window_update(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn decode_token_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    model_forward(api, kernel, sleep_ms, spin)
+fn decode_token_step(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    model_forward(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn generate_token(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    decode_token_step(api, kernel, sleep_ms, spin)
+fn generate_token(api: &HipApi, kernels: &HipKernels, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    decode_token_step(api, kernels, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn serve_request(api: &HipApi, kernel: &HipKernel, iterations: u64, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn serve_request(api: &HipApi, kernels: &HipKernels, iterations: u64, sleep_ms: u64, spin: u64) -> Result<(), String> {
     for _ in 0..iterations {
-        generate_token(api, kernel, sleep_ms, spin)?;
+        generate_token(api, kernels, sleep_ms, spin)?;
     }
     Ok(())
 }
@@ -414,6 +496,7 @@ fn main() -> Result<(), String> {
     let iterations = env_u64("REAL_HIP_ATTENTION_ITERATIONS", 12);
     let sleep_before_ms = env_u64("REAL_HIP_ATTENTION_SLEEP_BEFORE_MS", 3000);
     let sleep_between_ms = env_u64("REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS", 20);
+    let sleep_after_ms = env_u64("REAL_HIP_ATTENTION_SLEEP_AFTER_MS", 250);
     let cpu_spin_iters = env_u64("REAL_HIP_ATTENTION_CPU_SPIN", 1_500_000);
 
     let api = load_hip_api(&hip_library)?;
@@ -426,12 +509,14 @@ fn main() -> Result<(), String> {
         let device_err = (api.set_device)(0);
         println!("hipSetDevice -> err={device_err}");
     }
-    let kernel = compile_attention_kernel(&api)?;
+    let kernels = compile_attention_kernel(&api)?;
 
     println!("warming up before launches for {sleep_before_ms}ms");
     thread::sleep(Duration::from_millis(sleep_before_ms));
-    serve_request(&api, &kernel, iterations, sleep_between_ms, cpu_spin_iters)?;
+    serve_request(&api, &kernels, iterations, sleep_between_ms, cpu_spin_iters)?;
     println!("completed {iterations} iterations");
+    println!("draining profiler callbacks for {sleep_after_ms}ms");
+    thread::sleep(Duration::from_millis(sleep_after_ms));
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     unsafe { _exit(0) }

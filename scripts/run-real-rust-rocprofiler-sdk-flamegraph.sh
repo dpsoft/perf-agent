@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh [--dry-run] [--outdir <dir>] [--hip-library <path>] [--rocprofiler-sdk-library <path>] [--duration <dur>] [--iterations <n>] [--sleep-before-ms <ms>] [--sleep-between-ms <ms>] [--cpu-spin <n>]
+  scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh [--dry-run] [--outdir <dir>] [--hip-library <path>] [--rocprofiler-sdk-library <path>] [--duration <dur>] [--iterations <n>] [--sleep-before-ms <ms>] [--sleep-between-ms <ms>] [--sleep-after-ms <ms>] [--cpu-spin <n>]
 
 Builds a real Rust HIP workload, runs it, profiles CPU stacks plus HIP host
 launches, and feeds a real rocprofiler-sdk native producer into
@@ -65,7 +65,9 @@ DURATION=""
 ITERATIONS="12"
 SLEEP_BEFORE_MS="5000"
 SLEEP_BETWEEN_MS="40"
+SLEEP_AFTER_MS="250"
 CPU_SPIN="1500000"
+LAUNCHES_PER_ITERATION="4"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -101,6 +103,10 @@ while [[ $# -gt 0 ]]; do
             SLEEP_BETWEEN_MS="${2:-}"
             shift 2
             ;;
+        --sleep-after-ms)
+            SLEEP_AFTER_MS="${2:-}"
+            shift 2
+            ;;
         --cpu-spin)
             CPU_SPIN="${2:-}"
             shift 2
@@ -134,8 +140,8 @@ if [[ -z "${ROCPROFILER_SDK_LIBRARY}" ]]; then
 fi
 
 if [[ -z "${DURATION}" ]]; then
-    LOOP_BUDGET_MS=$((ITERATIONS * SLEEP_BETWEEN_MS))
-    PROFILE_DURATION_MS=$((SLEEP_BEFORE_MS + LOOP_BUDGET_MS + 3000))
+    LOOP_BUDGET_MS=$((ITERATIONS * LAUNCHES_PER_ITERATION * SLEEP_BETWEEN_MS))
+    PROFILE_DURATION_MS=$((SLEEP_BEFORE_MS + LOOP_BUDGET_MS + SLEEP_AFTER_MS + 3000))
     DURATION="${PROFILE_DURATION_MS}ms"
 fi
 
@@ -329,7 +335,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     quote_cmd "${BUILD_RENDER_CMD[@]}"
     echo
     echo "run app:"
-    printf '%s 3>%q\n' "$(quote_cmd env "LD_PRELOAD=${BRIDGE_SO}" "LD_LIBRARY_PATH=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib" "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3" "PERF_AGENT_ROCPROFILER_SDK_DEBUG=${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}")" "${NATIVE_JSON}"
+    printf '%s 3>%q\n' "$(quote_cmd env "LD_PRELOAD=${BRIDGE_SO}" "LD_LIBRARY_PATH=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib" "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3" "PERF_AGENT_ROCPROFILER_SDK_DEBUG=${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_SLEEP_AFTER_MS=${SLEEP_AFTER_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}")" "${NATIVE_JSON}"
     echo
     echo "producer:"
     quote_cmd "${PRODUCER_CMD[@]}"
@@ -377,6 +383,7 @@ set +e
     REAL_HIP_ATTENTION_ITERATIONS="${ITERATIONS}" \
     REAL_HIP_ATTENTION_SLEEP_BEFORE_MS="${SLEEP_BEFORE_MS}" \
     REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS="${SLEEP_BETWEEN_MS}" \
+    REAL_HIP_ATTENTION_SLEEP_AFTER_MS="${SLEEP_AFTER_MS}" \
     REAL_HIP_ATTENTION_CPU_SPIN="${CPU_SPIN}" \
     "${APP_BIN}" 3>"${NATIVE_JSON}" >"${APP_LOG}" 2>&1 &
     APP_PID=$!

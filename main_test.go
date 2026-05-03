@@ -511,7 +511,8 @@ func TestRunRealRustHIPFlamegraphScriptDryRun(t *testing.T) {
 		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/perf-agent .",
 		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/flamegraph-svg ./cmd/flamegraph-svg",
 		"REAL_HIP_ATTENTION_ITERATIONS=12",
-		"--profile --pid \\<pid\\> --duration 8480ms",
+		"REAL_HIP_ATTENTION_SLEEP_AFTER_MS=250",
+		"--profile --pid \\<pid\\> --duration 10170ms",
 		"--unwind fp",
 		"--gpu-linux-kfd",
 		"--gpu-host-hip-library",
@@ -540,7 +541,7 @@ func TestRunRealRustHIPFlamegraphScriptDryRunAutoSizesDuration(t *testing.T) {
 		t.Fatalf("dry-run real rust hip flamegraph auto duration: %v\n%s", err, out)
 	}
 	got := string(out)
-	if !strings.Contains(got, "--profile --pid \\<pid\\> --duration 4150ms") {
+	if !strings.Contains(got, "--profile --pid \\<pid\\> --duration 4850ms") {
 		t.Fatalf("missing auto-sized duration in output:\n%s", got)
 	}
 }
@@ -564,7 +565,7 @@ func TestRunRealRustHIPFlamegraphScriptDryRunPreservesExplicitDuration(t *testin
 	if !strings.Contains(got, "--profile --pid \\<pid\\> --duration 9s") {
 		t.Fatalf("missing explicit duration in output:\n%s", got)
 	}
-	if strings.Contains(got, "--profile --pid \\<pid\\> --duration 4150ms") {
+	if strings.Contains(got, "--profile --pid \\<pid\\> --duration 4850ms") {
 		t.Fatalf("explicit duration was replaced by auto duration:\n%s", got)
 	}
 }
@@ -589,6 +590,7 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 		"LD_PRELOAD=/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/libperf-agent-rocprofiler-sdk-preload.so",
 		"PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3",
 		"REAL_HIP_ATTENTION_ITERATIONS=12",
+		"REAL_HIP_ATTENTION_SLEEP_AFTER_MS=250",
 		"3>/tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.native.ndjson",
 		"producer:",
 		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=",
@@ -596,6 +598,7 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 		"--gpu-amd-sample-stdin",
 		"--gpu-host-hip-library",
 		"--gpu-host-hip-symbol hipModuleLaunchKernel",
+		"--profile --pid \\<pid\\> --duration 10170ms",
 		"--gpu-folded-output /tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.folded",
 	} {
 		if !strings.Contains(got, want) {

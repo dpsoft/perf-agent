@@ -12,13 +12,14 @@ A single binary that samples on-CPU stack traces, off-CPU blocking time, and har
 
 Runs entirely local. No backend, no telemetry, no scrape config.
 
+> 🚧 **GPU profiling support is in active development** as an experimental track ([design spec](docs/superpowers/specs/2026-04-25-gpu-profiling-design.md)). CPU, off-CPU, and PMU profiling are stable today.
+
 ---
 
 ## Contents
 
 - [Quickstart](#quickstart)
-- [What it does](#what-it-does)
-- [vs the alternatives](#vs-the-alternatives)
+- [What you can do with perf-agent](#what-you-can-do-with-perf-agent)
 - [Requirements](#requirements)
 - [Usage](#usage)
 - [Flags](#flags)
@@ -51,33 +52,33 @@ go tool pprof <output>.pb.gz
 
 ---
 
-## What it does
+## What you can do with perf-agent
 
-| Mode | Flag | Output | Notes |
-|---|---|---|---|
-| **On-CPU profile** | `--profile` | gzipped pprof | hybrid FP+DWARF stack walker |
-| **Off-CPU profile** | `--offcpu` | gzipped pprof | sched-switch hooks, blocking-time stacks |
-| **PMU metrics** | `--pmu` | text or file | hardware counters, runqueue latency, context-switch reasons |
-| **Library mode** | (Go API) | in-memory or to file | `perfagent.New(opts...)` — see [Library usage](#library-usage) |
+Real workflows perf-agent is built for. Each maps to one or more of the modes documented under [Flags](#flags).
 
-All three modes can run together (`--profile --offcpu --pmu`) and target either a single PID or system-wide (`-a`).
+### 🔥 On-demand production profiling
 
----
+Hot-attach to a running pod or process — no restart. For Python 3.12+, `--inject-python` activates the perf trampoline at profile start and deactivates it at exit, so the per-call overhead does not persist past the profiling window. Drop in as a sidecar (`shareProcessNamespace: true`), capture for 30s, exit. Output is pprof; ship it home with `kubectl cp` or pipe it into your store.
 
-## vs the alternatives
+### 💤 Off-CPU stalls and blocking analysis
 
-| | perf-agent | `perf record` | parca-agent | pyroscope-ebpf | py-spy |
-|---|---|---|---|---|---|
-| Runs locally without a backend | ✓ | ✓ | needs a Parca server | needs a Pyroscope/Grafana endpoint | ✓ |
-| Hybrid FP+DWARF unwind | ✓ | DWARF only (heavy) | ✓ | ✓ | ✗ |
-| Python `-X perf` activation without restart | ✓ | ✗ | ✗ | ✗ | n/a |
-| Off-CPU profiling | ✓ | external scripts | ✓ | ✗ | ✗ |
-| PMU hardware counters | ✓ | ✓ | ✗ | ✗ | ✗ |
-| pprof output | ✓ | needs `perf script` + converter | proprietary + pprof | proprietary | proprietary |
-| Pod-level k8s identity labels in pprof | ✓ (no kubelet/API) | ✗ | ✓ (kubelet API) | ✓ (kubelet API) | ✗ |
-| Single-shot CLI | ✓ | ✓ | ✗ (daemon) | ✗ (daemon) | ✓ |
+Find why a service is "slow but not CPU-busy." `--offcpu` hooks `sched_switch` and accumulates blocking time per call site — lock waits, syscall blocks, channel reads, mutex contention. Output is pprof, viewable in `go tool pprof` or any flame-graph tool that consumes it.
 
-**Reach for `perf-agent`** when you want a local, single-shot profiler that produces pprof and handles release-built binaries and JIT runtimes without per-target setup. **Reach for parca-agent or pyroscope** when you want fleet-wide always-on profiling with a server-side query layer. **Reach for `perf record`** when you need raw events outside the pprof model.
+### 🐍 Cross-language flame graphs
+
+One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python (`-X perf` perf-maps, optionally activated on demand), Node.js (`--perf-basic-prof`), and Go — all inlined frames expanded by blazesym. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
+
+### 📊 Hardware-counter performance investigations
+
+`--pmu` summarizes IPC, cache miss rate, runqueue latency (P50/P99), and context-switch reasons (preempted vs voluntary vs I/O wait) without the `perf stat` parsing tax. Combine with `--per-pid` in system-wide mode to see which processes dominate the node's wait time.
+
+### 🧪 Differential profiling and sample-based PGO
+
+High-fidelity pprof is the foundation. Each `Mapping` carries the absolute file path, GNU build-id, and file offsets; each `Location` is keyed by `(mapping_id, file_offset)` rather than symbol name, so two PCs that symbolize to the same `(file, line, func)` stay distinguishable. Feeds `go tool pprof -diff_base`, LLVM SamplePGO converters, and any cross-run analysis that depends on stable address-level identity.
+
+### 🐳 Sidecar profiling inside Kubernetes pods
+
+`--pid <N>` is namespace-aware: a PID visible from inside a pod (with `shareProcessNamespace: true`) is translated to the host kernel PID via `/proc/<N>/status`'s `NSpid` line. Output samples carry k8s identity labels (`pod_uid`, `container_id`, `cgroup_path`) parsed from the cgroup, plus best-effort `pod_name` / `namespace` / `container_name` from the downward API. **No kubelet API calls, no client-go dependency.**
 
 ---
 

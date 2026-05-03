@@ -95,6 +95,17 @@ fallback_kernel_name_value()
     return std::string{g_state.fallback_kernel_name};
 }
 
+std::string
+display_kernel_name(const std::string& kernel_name)
+{
+    if(kernel_name.size() > 3 &&
+       kernel_name.compare(kernel_name.size() - 3, 3, ".kd") == 0)
+    {
+        return kernel_name.substr(0, kernel_name.size() - 3);
+    }
+    return kernel_name;
+}
+
 void
 log_error(const std::string& msg)
 {
@@ -293,6 +304,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
     const auto weight = std::max<int64_t>(1, std::max<int64_t>(1, end_ns - start_ns) / 1000);
     const auto corr_id = static_cast<uint64_t>(record->correlation_id.internal);
     const auto op_name = operation_name(kind, record->operation);
+    const auto function_name = display_kernel_name(fallback_kernel_name_value());
 
     debug_header(kind, record->operation, corr_id, start_ns, end_ns);
     if(op_name.find("hipLaunchKernel") == std::string::npos) return;
@@ -314,7 +326,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
                 << ",\"dispatch_id\":\"hip-launch:" << corr_id << "\""
                 << ",\"sample_id\":\"hip-launch-sample:" << corr_id << "\""
                 << ",\"time_ns\":" << sample_ns
-                << ",\"function\":\"" << json_escape(fallback_kernel_name_value()) << "\""
+                << ",\"function\":\"" << json_escape(function_name) << "\""
                 << ",\"stall\":{\"reason\":\"hip_launch_runtime\"}"
                 << ",\"stall_reason\":\"hip_launch_runtime\""
                 << ",\"weight\":" << weight
@@ -414,6 +426,8 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
             }
         }
 
+        const auto display_name = display_kernel_name(kernel_name);
+
         std::ostringstream dispatch_json{};
         dispatch_json << "{\"kind\":\"dispatch\""
                       << ",\"id\":\"dispatch:" << dispatch_handle << "\""
@@ -429,7 +443,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                     << ",\"dispatch_id\":\"dispatch:" << dispatch_handle << "\""
                     << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << "\""
                     << ",\"time_ns\":" << sample_ns
-                    << ",\"function\":\"" << json_escape(kernel_name) << "\""
+                    << ",\"function\":\"" << json_escape(display_name) << "\""
                     << ",\"stall\":{\"reason\":\"dispatch_complete\"}"
                     << ",\"stall_reason\":\"dispatch_complete\""
                     << ",\"weight\":" << weight;
@@ -439,7 +453,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
             pc_stream << "0x" << std::hex << kernel_pc;
             sample_json << ",\"pc\":\"" << pc_stream.str() << "\""
                         << ",\"location\":{\"pc\":\"" << pc_stream.str() << "\",\"function\":\""
-                        << json_escape(kernel_name) << "\"}";
+                        << json_escape(display_name) << "\"}";
         }
         sample_json << "}";
         g_dispatch_emits.fetch_add(1);

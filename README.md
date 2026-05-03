@@ -8,9 +8,7 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/dpsoft/perf-agent)](go.mod)
 [![License](https://img.shields.io/github/license/dpsoft/perf-agent)](LICENSE)
 
-A single binary that samples on-CPU stack traces, off-CPU blocking time, and hardware PMU counters — and emits production-ready pprof. Hybrid FP+DWARF unwinder handles release-built C++/Rust binaries that omit frame pointers; built-in symbolization for native code (DWARF + ELF), Python (`-X perf` perf-maps), Node.js (`--perf-basic-prof`), and Go.
-
-Runs entirely local. No backend, no telemetry, no scrape config.
+Capture on-CPU, off-CPU, and PMU profiles — system-wide or per-PID — and emit pprof. One binary, runs locally, no backend or telemetry.
 
 > 🚧 **GPU profiling support is in active development** as an experimental track ([design spec](docs/superpowers/specs/2026-04-25-gpu-profiling-design.md)). CPU, off-CPU, and PMU profiling are stable today.
 
@@ -58,7 +56,7 @@ Real workflows perf-agent is built for. Each maps to one or more of the modes do
 
 ### 🔥 On-demand production profiling
 
-Hot-attach to a running pod or process — no restart. For Python 3.12+, `--inject-python` activates the perf trampoline at profile start and deactivates it at exit, so the per-call overhead does not persist past the profiling window. Drop in as a sidecar (`shareProcessNamespace: true`), capture for 30s, exit. Output is pprof; ship it home with `kubectl cp` or pipe it into your store.
+Hot-attach to a running process — no restart, no preinstalled agent. For Python 3.12+, `--inject-python` enables the perf trampoline only for the capture window, so there's no persistent overhead.
 
 ### 💤 Off-CPU stalls and blocking analysis
 
@@ -377,12 +375,9 @@ See the [`perfagent` package documentation](perfagent/) for all available option
                     └──────────────────────────────────────┘
 ```
 
-Two stack-walker paths share a single user-space pipeline:
+Two stack-walker paths: **`--unwind fp`** (cheap, kernel-side aggregation; truncates on FP-less code) and **`--unwind dwarf`** / **`auto`** (default — FP fast path with `.eh_frame`-derived CFI fallback for release C++/Rust without frame pointers).
 
-- **FP path** (`--unwind fp`): cheap, kernel-side stackmap aggregation. Truncates on FP-less code (release C++/Rust without `-fno-omit-frame-pointer`).
-- **DWARF/hybrid path** (`--unwind dwarf` or `auto`, the default): pure-FP for FP-safe code, falls through to `.eh_frame`-derived CFI rules for FP-less PCs. Userspace pre-compiles per-binary CFI from `.eh_frame` (`unwind/ehcompile`) and installs it into BPF maps (`unwind/ehmaps`); the BPF walker reads CFI per-frame. MMAP2 events keep CFI fresh as processes `dlopen`/`exec`. Eager-compile failures (Go binaries lack `.eh_frame`) are tolerated — the walker's FP path covers those.
-
-The `procmap.Resolver` sits between the walkers and pprof. It lazily reads `/proc/<pid>/maps` and ELF `.note.gnu.build-id`, caches per-PID, and gives the pprof builder real `Mapping` identity (path, start/limit, file offset, build-id). Each `Location` is keyed by `(mapping_id, file_offset)` rather than by symbol name, so two PCs that symbolize to the same `(file, line, func)` stay distinguishable — the data downstream tools need for sample-based PGO and cross-run diffing.
+Sample addresses resolve through `procmap.Resolver` (lazy `/proc/<pid>/maps` + build-id), so each pprof `Mapping` carries real per-binary identity and each `Location` is keyed by `(mapping_id, file_offset)` — what `go tool pprof -diff_base` and sample-based PGO converters need to round-trip.
 
 ---
 

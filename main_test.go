@@ -587,10 +587,10 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 		"REAL_HIP_ATTENTION_ITERATIONS=12",
 		"PERF_AGENT_ROCPROFILER_SDK_MODE=native",
 		"PERF_AGENT_ROCPROFILER_SDK_LIBRARY=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so",
+		"producer:",
 		"--gpu-amd-sample-stdin",
 		"--gpu-host-hip-library",
 		"--gpu-folded-output /tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.folded",
-		"|",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

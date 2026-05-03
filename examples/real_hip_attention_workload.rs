@@ -1,20 +1,17 @@
 use std::env;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::hint::black_box;
+use std::io::Write;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
 
 type HipError = c_int;
 type HipStream = *mut c_void;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Dim3 {
-    x: c_uint,
-    y: c_uint,
-    z: c_uint,
-}
+type HipModule = *mut c_void;
+type HipFunction = *mut c_void;
+type HiprtcProgram = *mut c_void;
+type HiprtcResult = c_int;
 
 type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipInit = unsafe extern "C" fn(c_uint) -> HipError;
@@ -23,14 +20,40 @@ type HipStreamCreate = unsafe extern "C" fn(*mut HipStream) -> HipError;
 type HipStreamDestroy = unsafe extern "C" fn(HipStream) -> HipError;
 type HipMalloc = unsafe extern "C" fn(*mut *mut c_void, usize) -> HipError;
 type HipFree = unsafe extern "C" fn(*mut c_void) -> HipError;
-type HipLaunchKernel = unsafe extern "C" fn(
-    *const c_void,
-    Dim3,
-    Dim3,
-    *mut *mut c_void,
-    usize,
+type HipModuleLoadData = unsafe extern "C" fn(*mut HipModule, *const c_void) -> HipError;
+type HipModuleGetFunction =
+    unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> HipError;
+type HipModuleLaunchKernel = unsafe extern "C" fn(
+    HipFunction,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
     HipStream,
+    *mut *mut c_void,
+    *mut *mut c_void,
 ) -> HipError;
+type HipModuleUnload = unsafe extern "C" fn(HipModule) -> HipError;
+type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
+type HiprtcCreateProgram = unsafe extern "C" fn(
+    *mut HiprtcProgram,
+    *const c_char,
+    *const c_char,
+    c_int,
+    *const *const c_char,
+    *const *const c_char,
+) -> HiprtcResult;
+type HiprtcCompileProgram =
+    unsafe extern "C" fn(HiprtcProgram, c_int, *const *const c_char) -> HiprtcResult;
+type HiprtcGetCodeSize = unsafe extern "C" fn(HiprtcProgram, *mut usize) -> HiprtcResult;
+type HiprtcGetCode = unsafe extern "C" fn(HiprtcProgram, *mut c_void) -> HiprtcResult;
+type HiprtcDestroyProgram = unsafe extern "C" fn(*mut HiprtcProgram) -> HiprtcResult;
+type HiprtcGetProgramLogSize = unsafe extern "C" fn(HiprtcProgram, *mut usize) -> HiprtcResult;
+type HiprtcGetProgramLog = unsafe extern "C" fn(HiprtcProgram, *mut c_char) -> HiprtcResult;
+type HiprtcGetErrorString = unsafe extern "C" fn(HiprtcResult) -> *const c_char;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -38,15 +61,11 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn dlerror() -> *const c_char;
+    fn _exit(status: c_int) -> !;
 }
 
 const RTLD_NOW: c_int = 2;
 const RTLD_LOCAL: c_int = 0;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn flash_attn_decode_bf16_gfx11() {
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-}
 
 struct HipApi {
     handle: *mut c_void,
@@ -57,7 +76,19 @@ struct HipApi {
     stream_destroy: HipStreamDestroy,
     malloc: HipMalloc,
     free: HipFree,
-    launch_kernel: HipLaunchKernel,
+    module_load_data: HipModuleLoadData,
+    module_get_function: HipModuleGetFunction,
+    module_launch_kernel: HipModuleLaunchKernel,
+    module_unload: HipModuleUnload,
+    get_error_string: HipGetErrorString,
+    hiprtc_create_program: HiprtcCreateProgram,
+    hiprtc_compile_program: HiprtcCompileProgram,
+    hiprtc_get_code_size: HiprtcGetCodeSize,
+    hiprtc_get_code: HiprtcGetCode,
+    hiprtc_destroy_program: HiprtcDestroyProgram,
+    hiprtc_get_program_log_size: HiprtcGetProgramLogSize,
+    hiprtc_get_program_log: HiprtcGetProgramLog,
+    hiprtc_get_error_string: HiprtcGetErrorString,
 }
 
 impl Drop for HipApi {
@@ -94,6 +125,15 @@ unsafe fn load_symbol<T: Copy>(handle: *mut c_void, symbol: &str) -> Result<T, S
     Ok(std::mem::transmute_copy(&addr))
 }
 
+fn cstr_lossy_from_ptr(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return "<null>".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn load_hip_api(path: &str) -> Result<HipApi, String> {
     let c_path = CString::new(path).map_err(|e| e.to_string())?;
     let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
@@ -118,7 +158,141 @@ fn load_hip_api(path: &str) -> Result<HipApi, String> {
             stream_destroy: load_symbol(handle, "hipStreamDestroy")?,
             malloc: load_symbol(handle, "hipMalloc")?,
             free: load_symbol(handle, "hipFree")?,
-            launch_kernel: load_symbol(handle, "hipLaunchKernel")?,
+            module_load_data: load_symbol(handle, "hipModuleLoadData")?,
+            module_get_function: load_symbol(handle, "hipModuleGetFunction")?,
+            module_launch_kernel: load_symbol(handle, "hipModuleLaunchKernel")?,
+            module_unload: load_symbol(handle, "hipModuleUnload")?,
+            get_error_string: load_symbol(handle, "hipGetErrorString")?,
+            hiprtc_create_program: load_symbol(handle, "hiprtcCreateProgram")?,
+            hiprtc_compile_program: load_symbol(handle, "hiprtcCompileProgram")?,
+            hiprtc_get_code_size: load_symbol(handle, "hiprtcGetCodeSize")?,
+            hiprtc_get_code: load_symbol(handle, "hiprtcGetCode")?,
+            hiprtc_destroy_program: load_symbol(handle, "hiprtcDestroyProgram")?,
+            hiprtc_get_program_log_size: load_symbol(handle, "hiprtcGetProgramLogSize")?,
+            hiprtc_get_program_log: load_symbol(handle, "hiprtcGetProgramLog")?,
+            hiprtc_get_error_string: load_symbol(handle, "hiprtcGetErrorString")?,
+        })
+    }
+}
+
+struct HipKernel {
+    module: HipModule,
+    function: HipFunction,
+    unload: HipModuleUnload,
+}
+
+impl Drop for HipKernel {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.unload)(self.module);
+        }
+    }
+}
+
+fn env_offload_arch() -> String {
+    env::var("REAL_HIP_ATTENTION_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1103".to_string())
+}
+
+fn compile_attention_kernel(api: &HipApi) -> Result<HipKernel, String> {
+    let source = CString::new(
+        r#"
+extern "C" __global__
+void flash_attn_decode_bf16_gfx11(int* out) {
+    if(threadIdx.x == 0 && out != nullptr) {
+        out[0] = out[0] + 1;
+    }
+}
+"#,
+    )
+    .map_err(|e| e.to_string())?;
+    let prog_name = CString::new("flash_attn_decode_bf16_gfx11.cu").map_err(|e| e.to_string())?;
+    let arch = CString::new(format!("--offload-arch={}", env_offload_arch())).map_err(|e| e.to_string())?;
+    let stdopt = CString::new("--std=c++17").map_err(|e| e.to_string())?;
+    let opts = [arch.as_ptr(), stdopt.as_ptr()];
+    let mut program: HiprtcProgram = ptr::null_mut();
+
+    unsafe {
+        let create_err = (api.hiprtc_create_program)(
+            &mut program,
+            source.as_ptr(),
+            prog_name.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        );
+        if create_err != 0 {
+            return Err(format!(
+                "hiprtcCreateProgram failed: {} ({create_err})",
+                cstr_lossy_from_ptr((api.hiprtc_get_error_string)(create_err))
+            ));
+        }
+
+        let compile_err = (api.hiprtc_compile_program)(program, opts.len() as c_int, opts.as_ptr());
+        if compile_err != 0 {
+            let mut log_size: usize = 0;
+            let _ = (api.hiprtc_get_program_log_size)(program, &mut log_size);
+            let mut log = vec![0u8; log_size.max(1)];
+            let _ = (api.hiprtc_get_program_log)(program, log.as_mut_ptr().cast::<c_char>());
+            let log = String::from_utf8_lossy(&log)
+                .trim_end_matches('\0')
+                .to_string();
+            let _ = (api.hiprtc_destroy_program)(&mut program);
+            return Err(format!(
+                "hiprtcCompileProgram failed: {} ({compile_err}): {log}",
+                cstr_lossy_from_ptr((api.hiprtc_get_error_string)(compile_err))
+            ));
+        }
+
+        let mut code_size: usize = 0;
+        let code_size_err = (api.hiprtc_get_code_size)(program, &mut code_size);
+        if code_size_err != 0 {
+            let _ = (api.hiprtc_destroy_program)(&mut program);
+            return Err(format!(
+                "hiprtcGetCodeSize failed: {} ({code_size_err})",
+                cstr_lossy_from_ptr((api.hiprtc_get_error_string)(code_size_err))
+            ));
+        }
+
+        let mut code = vec![0u8; code_size];
+        let code_err = (api.hiprtc_get_code)(program, code.as_mut_ptr().cast::<c_void>());
+        let destroy_err = (api.hiprtc_destroy_program)(&mut program);
+        if code_err != 0 {
+            return Err(format!(
+                "hiprtcGetCode failed: {} ({code_err})",
+                cstr_lossy_from_ptr((api.hiprtc_get_error_string)(code_err))
+            ));
+        }
+        if destroy_err != 0 {
+            return Err(format!(
+                "hiprtcDestroyProgram failed: {} ({destroy_err})",
+                cstr_lossy_from_ptr((api.hiprtc_get_error_string)(destroy_err))
+            ));
+        }
+
+        let mut module: HipModule = ptr::null_mut();
+        let module_err = (api.module_load_data)(&mut module, code.as_ptr().cast::<c_void>());
+        if module_err != 0 {
+            return Err(format!(
+                "hipModuleLoadData failed: {} ({module_err})",
+                cstr_lossy_from_ptr((api.get_error_string)(module_err))
+            ));
+        }
+
+        let symbol = CString::new("flash_attn_decode_bf16_gfx11").map_err(|e| e.to_string())?;
+        let mut function: HipFunction = ptr::null_mut();
+        let function_err = (api.module_get_function)(&mut function, module, symbol.as_ptr());
+        if function_err != 0 {
+            let _ = (api.module_unload)(module);
+            return Err(format!(
+                "hipModuleGetFunction failed: {} ({function_err})",
+                cstr_lossy_from_ptr((api.get_error_string)(function_err))
+            ));
+        }
+
+        Ok(HipKernel {
+            module,
+            function,
+            unload: api.module_unload,
         })
     }
 }
@@ -133,7 +307,7 @@ fn cpu_spin(spin: u64) -> u64 {
 }
 
 #[inline(never)]
-fn launch_attention_step(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn launch_attention_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
     let _ = cpu_spin(spin);
     let mut stream: HipStream = ptr::null_mut();
     let mut device_ptr: *mut c_void = ptr::null_mut();
@@ -145,11 +319,25 @@ fn launch_attention_step(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), S
         let malloc_err = (api.malloc)(&mut device_ptr, 4096);
         println!("hipMalloc -> err={malloc_err} ptr={device_ptr:p}");
 
-        let blocks = Dim3 { x: 1, y: 1, z: 1 };
-        let threads = Dim3 { x: 1, y: 1, z: 1 };
-        let kernel = flash_attn_decode_bf16_gfx11 as *const c_void;
-        let launch_err = (api.launch_kernel)(kernel, blocks, threads, ptr::null_mut(), 0, stream);
-        println!("hipLaunchKernel -> err={launch_err}");
+        let mut arg0 = device_ptr;
+        let mut kernel_params = [(&mut arg0 as *mut *mut c_void).cast::<c_void>()];
+        let launch_err = (api.module_launch_kernel)(
+            kernel.function,
+            1,
+            1,
+            1,
+            64,
+            1,
+            1,
+            0,
+            stream,
+            kernel_params.as_mut_ptr(),
+            ptr::null_mut(),
+        );
+        println!(
+            "hipModuleLaunchKernel -> err={launch_err} ({})",
+            cstr_lossy_from_ptr((api.get_error_string)(launch_err))
+        );
 
         if !device_ptr.is_null() {
             let free_err = (api.free)(device_ptr);
@@ -166,54 +354,54 @@ fn launch_attention_step(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), S
 }
 
 #[inline(never)]
-fn flash_attention(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    launch_attention_step(api, sleep_ms, spin)
+fn flash_attention(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    launch_attention_step(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn fused_attention_residual(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    flash_attention(api, sleep_ms, spin)
+fn fused_attention_residual(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    flash_attention(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn transformer_block_17(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    fused_attention_residual(api, sleep_ms, spin)
+fn transformer_block_17(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    fused_attention_residual(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn decoder_layer_norm(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    transformer_block_17(api, sleep_ms, spin)
+fn decoder_layer_norm(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    transformer_block_17(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn paged_kv_cache_lookup(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    decoder_layer_norm(api, sleep_ms, spin)
+fn paged_kv_cache_lookup(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    decoder_layer_norm(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn attention_window_update(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    paged_kv_cache_lookup(api, sleep_ms, spin)
+fn attention_window_update(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    paged_kv_cache_lookup(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn model_forward(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    attention_window_update(api, sleep_ms, spin)
+fn model_forward(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    attention_window_update(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn decode_token_step(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    model_forward(api, sleep_ms, spin)
+fn decode_token_step(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    model_forward(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn generate_token(api: &HipApi, sleep_ms: u64, spin: u64) -> Result<(), String> {
-    decode_token_step(api, sleep_ms, spin)
+fn generate_token(api: &HipApi, kernel: &HipKernel, sleep_ms: u64, spin: u64) -> Result<(), String> {
+    decode_token_step(api, kernel, sleep_ms, spin)
 }
 
 #[inline(never)]
-fn serve_request(api: &HipApi, iterations: u64, sleep_ms: u64, spin: u64) -> Result<(), String> {
+fn serve_request(api: &HipApi, kernel: &HipKernel, iterations: u64, sleep_ms: u64, spin: u64) -> Result<(), String> {
     for _ in 0..iterations {
-        generate_token(api, sleep_ms, spin)?;
+        generate_token(api, kernel, sleep_ms, spin)?;
     }
     Ok(())
 }
@@ -238,10 +426,13 @@ fn main() -> Result<(), String> {
         let device_err = (api.set_device)(0);
         println!("hipSetDevice -> err={device_err}");
     }
+    let kernel = compile_attention_kernel(&api)?;
 
     println!("warming up before launches for {sleep_before_ms}ms");
     thread::sleep(Duration::from_millis(sleep_before_ms));
-    serve_request(&api, iterations, sleep_between_ms, cpu_spin_iters)?;
+    serve_request(&api, &kernel, iterations, sleep_between_ms, cpu_spin_iters)?;
     println!("completed {iterations} iterations");
-    Ok(())
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { _exit(0) }
 }

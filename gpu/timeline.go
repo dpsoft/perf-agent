@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 )
 
 type ExecutionView struct {
@@ -341,7 +342,7 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		if launch.Queue.Backend != exec.Queue.Backend || launch.Queue.QueueID != exec.Queue.QueueID {
 			continue
 		}
-		if launch.KernelName != exec.KernelName {
+		if !launchKernelNamesCompatible(launch, exec) {
 			continue
 		}
 		if launch.TimeNs > exec.StartNs {
@@ -362,7 +363,7 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		if launch.Correlation.Backend != BackendHIP {
 			continue
 		}
-		if launch.KernelName != exec.KernelName {
+		if !launchKernelNamesCompatible(launch, exec) {
 			continue
 		}
 		if launch.TimeNs > exec.StartNs {
@@ -374,6 +375,27 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		}
 	}
 	return best
+}
+
+func launchKernelNamesCompatible(launch GPUKernelLaunch, exec GPUKernelExec) bool {
+	if launch.KernelName == exec.KernelName {
+		return true
+	}
+	if exec.Execution.Backend != BackendAMDSample {
+		return false
+	}
+	if !strings.HasPrefix(launch.KernelName, "hip_kernel@") {
+		return false
+	}
+	if len(launch.Launch.CPUStack) == 0 {
+		return false
+	}
+	for _, frame := range launch.Launch.CPUStack {
+		if frame.Name == "hipModuleLaunchKernel" || frame.Name == "hipLaunchKernel" {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {

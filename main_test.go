@@ -515,6 +515,7 @@ func TestRunRealRustHIPFlamegraphScriptDryRun(t *testing.T) {
 		"--unwind fp",
 		"--gpu-linux-kfd",
 		"--gpu-host-hip-library",
+		"--gpu-host-hip-symbol hipModuleLaunchKernel",
 		"--gpu-folded-output /tmp/real-rust-hip-flame/real_rust_hip_attention.folded",
 		"/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip/flamegraph-svg --title CPU\\ +\\ GPU\\ Flame\\ Graph:\\ real_rust_hip_attention",
 	} {
@@ -583,13 +584,18 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 	for _, want := range []string{
 		"rustc examples/real_hip_attention_workload.rs",
 		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/amd-sample-collector ./cmd/amd-sample-collector",
+		"c++ -shared -fPIC -std=c++17 -D__HIP_PLATFORM_AMD__ examples/rocprofiler_sdk_preload_bridge.cpp",
 		"go build -o /home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/flamegraph-svg ./cmd/flamegraph-svg",
+		"LD_PRELOAD=/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/.tmp/real-rust-hip-sdk/libperf-agent-rocprofiler-sdk-preload.so",
+		"PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3",
 		"REAL_HIP_ATTENTION_ITERATIONS=12",
-		"PERF_AGENT_ROCPROFILER_SDK_MODE=native",
-		"PERF_AGENT_ROCPROFILER_SDK_LIBRARY=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so",
+		"3>/tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.native.ndjson",
 		"producer:",
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=",
+		"real_rust_hip_attention_rocprofiler_sdk.native.ndjson",
 		"--gpu-amd-sample-stdin",
 		"--gpu-host-hip-library",
+		"--gpu-host-hip-symbol hipModuleLaunchKernel",
 		"--gpu-folded-output /tmp/real-rust-hip-rocprofiler-sdk-flame/real_rust_hip_attention_rocprofiler_sdk.folded",
 	} {
 		if !strings.Contains(got, want) {

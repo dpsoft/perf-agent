@@ -200,7 +200,7 @@ declare -a PROFILE_CMD=(
     --gpu-host-hip-library
     "${HIP_LIBRARY}"
     --gpu-host-hip-symbol
-    hipLaunchKernel
+    hipModuleLaunchKernel
     --gpu-hip-linuxdrm-join-window
     "${JOIN_WINDOW}"
     --gpu-raw-output

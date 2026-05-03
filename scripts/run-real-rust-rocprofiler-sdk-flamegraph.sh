@@ -149,6 +149,7 @@ APP_BIN="${APP_DIR}/real-hip-attention-workload"
 AGENT_BIN="${APP_DIR}/perf-agent"
 COLLECTOR_BIN="${APP_DIR}/amd-sample-collector"
 FLAMEGRAPH_BIN="${APP_DIR}/flamegraph-svg"
+BRIDGE_SO="${APP_DIR}/libperf-agent-rocprofiler-sdk-preload.so"
 CPU_PROFILE="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.oncpu.pb.gz"
 GPU_RAW="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.raw.json"
 GPU_ATTR="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.attributions.json"
@@ -156,6 +157,7 @@ GPU_FOLDED="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.folded"
 GPU_PPROF="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.pb.gz"
 GPU_SVG="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.svg"
 GPU_HTML="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.html"
+NATIVE_JSON="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.native.ndjson"
 APP_LOG="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.app.log"
 RUNNER_LOG="${OUTDIR}/real_rust_hip_attention_rocprofiler_sdk.runner.log"
 OWNER_UID=$(id -u)
@@ -204,6 +206,25 @@ declare -a BUILD_COLLECTOR_CMD=(
     ./cmd/amd-sample-collector
 )
 
+declare -a BUILD_BRIDGE_CMD=(
+    c++
+    -shared
+    -fPIC
+    -std=c++17
+    -D__HIP_PLATFORM_AMD__
+    examples/rocprofiler_sdk_preload_bridge.cpp
+    -I
+    /home/diego/github/rocm-systems/projects/rocprofiler-sdk/source/include
+    -I
+    /home/diego/github/rocm-systems/rocprofiler-sdk-build/source/include
+    -L
+    /home/diego/github/rocm-systems/rocprofiler-sdk-build/lib
+    -lrocprofiler-sdk
+    -Wl,-rpath,/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib
+    -o
+    "${BRIDGE_SO}"
+)
+
 declare -a BUILD_RENDER_CMD=(
     env
     "LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release"
@@ -243,7 +264,7 @@ declare -a PROFILE_CMD=(
     --gpu-host-hip-library
     "${HIP_LIBRARY}"
     --gpu-host-hip-symbol
-    hipLaunchKernel
+    hipModuleLaunchKernel
     --gpu-raw-output
     "${GPU_RAW}"
     --gpu-attribution-output
@@ -259,22 +280,17 @@ declare -a PRODUCER_CMD=(
     "GOCACHE=/tmp/perf-agent-gocache"
     "GOMODCACHE=/tmp/perf-agent-gomodcache"
     "GOTOOLCHAIN=auto"
+    "PERF_AGENT_ROCPROFILER_SDK_COMMAND=bash -lc 'while kill -0 <pid> 2>/dev/null; do sleep 0.1; done; cat ${NATIVE_JSON}'"
     "PERF_AGENT_HIP_PID=<pid>"
     "PERF_AGENT_GPU_DURATION=${DURATION}"
     "PERF_AGENT_GPU_KERNEL_NAME=flash_attn_decode_bf16_gfx11"
-    "PERF_AGENT_ROCPROFILER_SDK_MODE=native"
-    "PERF_AGENT_ROCPROFILER_SDK_LIBRARY=${ROCPROFILER_SDK_LIBRARY}"
     "${COLLECTOR_BIN}"
     --mode
     real
     --real-source
     rocprofiler-sdk
-    --rocprofiler-sdk-mode
-    native
-    --rocprofiler-sdk-library
-    "${ROCPROFILER_SDK_LIBRARY}"
     --sleep-before-ms
-    "${PRODUCER_SLEEP_BEFORE_MS}"
+    0
 )
 
 declare -a RENDER_CMD=(
@@ -306,11 +322,14 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "build amd sample collector:"
     quote_cmd "${BUILD_COLLECTOR_CMD[@]}"
     echo
+    echo "build rocprofiler-sdk preload bridge:"
+    quote_cmd "${BUILD_BRIDGE_CMD[@]}"
+    echo
     echo "build flamegraph renderer:"
     quote_cmd "${BUILD_RENDER_CMD[@]}"
     echo
     echo "run app:"
-    quote_cmd env "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}"
+    printf '%s 3>%q\n' "$(quote_cmd env "LD_PRELOAD=${BRIDGE_SO}" "LD_LIBRARY_PATH=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib" "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3" "PERF_AGENT_ROCPROFILER_SDK_DEBUG=${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}")" "${NATIVE_JSON}"
     echo
     echo "producer:"
     quote_cmd "${PRODUCER_CMD[@]}"
@@ -324,24 +343,42 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 mkdir -p "${APP_DIR}" "${OUTDIR}"
+rm -f \
+    "${CPU_PROFILE}" \
+    "${GPU_RAW}" \
+    "${GPU_ATTR}" \
+    "${GPU_FOLDED}" \
+    "${GPU_PPROF}" \
+    "${GPU_SVG}" \
+    "${GPU_HTML}" \
+    "${NATIVE_JSON}" \
+    "${APP_LOG}" \
+    "${RUNNER_LOG}"
 
 (
     cd "${REPO_ROOT}"
     "${BUILD_APP_CMD[@]}"
     "${BUILD_AGENT_CMD[@]}"
     "${BUILD_COLLECTOR_CMD[@]}"
+    "${BUILD_BRIDGE_CMD[@]}"
     "${BUILD_RENDER_CMD[@]}"
 )
 
 set +e
 (
     cd "${REPO_ROOT}"
+    rm -f "${NATIVE_JSON}"
+    env \
+    LD_PRELOAD="${BRIDGE_SO}" \
+    LD_LIBRARY_PATH="/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3 \
+    PERF_AGENT_ROCPROFILER_SDK_DEBUG="${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" \
     REAL_HIP_ATTENTION_LIBRARY="${HIP_LIBRARY}" \
     REAL_HIP_ATTENTION_ITERATIONS="${ITERATIONS}" \
     REAL_HIP_ATTENTION_SLEEP_BEFORE_MS="${SLEEP_BEFORE_MS}" \
     REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS="${SLEEP_BETWEEN_MS}" \
     REAL_HIP_ATTENTION_CPU_SPIN="${CPU_SPIN}" \
-    "${APP_BIN}" >"${APP_LOG}" 2>&1 &
+    "${APP_BIN}" 3>"${NATIVE_JSON}" >"${APP_LOG}" 2>&1 &
     APP_PID=$!
     trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
 
@@ -355,7 +392,8 @@ set +e
     for i in "${!PRODUCER_CMD[@]}"; do
         if [[ "${PRODUCER_CMD[$i]}" == "PERF_AGENT_HIP_PID=<pid>" ]]; then
             PRODUCER_CMD[$i]="PERF_AGENT_HIP_PID=${APP_PID}"
-            break
+        elif [[ "${PRODUCER_CMD[$i]}" == *"<pid>"* ]]; then
+            PRODUCER_CMD[$i]="${PRODUCER_CMD[$i]//<pid>/${APP_PID}}"
         fi
     done
 
@@ -391,7 +429,8 @@ sudo chown "${OWNER_UID}:${OWNER_GID}" \
     "${GPU_FOLDED}" \
     "${GPU_PPROF}" \
     "${GPU_SVG}" \
-    "${GPU_HTML}" 2>/dev/null || true
+    "${GPU_HTML}" \
+    "${NATIVE_JSON}" 2>/dev/null || true
 
 (
     cd "${REPO_ROOT}"
@@ -406,5 +445,6 @@ echo "  ${GPU_FOLDED}"
 echo "  ${GPU_PPROF}"
 echo "  ${GPU_SVG}"
 echo "  ${GPU_HTML}"
+echo "  ${NATIVE_JSON}"
 echo "  ${APP_LOG}"
 echo "  ${RUNNER_LOG}"

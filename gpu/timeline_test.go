@@ -145,6 +145,56 @@ func TestTimelineHeuristicallyJoinsAMDSampleExecAcrossQueueBoundary(t *testing.T
 	}
 }
 
+func TestTimelineHeuristicallyJoinsAMDSampleExecFromHIPModuleLaunchFallbackName(t *testing.T) {
+	tl := NewTimeline()
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendHIP, Value: "hip:999:999:100"},
+		Queue:       GPUQueueRef{Backend: BackendHIP, QueueID: "stream:1"},
+		KernelName:  "hip_kernel@0x1234",
+		TimeNs:      100,
+		Launch: LaunchContext{
+			PID: 999,
+			TID: 999,
+			CPUStack: []pp.Frame{
+				pp.FrameFromName("real_hip_attention_workload::flash_attention"),
+				pp.FrameFromName("hipModuleLaunchKernel"),
+			},
+		},
+	})
+	tl.RecordExec(GPUKernelExec{
+		Execution:   GPUExecutionRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", QueueID: "compute:0", ExecID: "dispatch:1"},
+		Correlation: CorrelationID{Backend: BackendAMDSample, Value: "dispatch:1"},
+		Queue: GPUQueueRef{
+			Backend: BackendAMDSample,
+			Device:  GPUDeviceRef{Backend: BackendAMDSample, DeviceID: "gfx1103:0", Name: "AMD Radeon 780M Graphics"},
+			QueueID: "compute:0",
+		},
+		KernelName: "flash_attn_decode_bf16_gfx11.kd",
+		StartNs:    120,
+		EndNs:      260,
+	})
+
+	snapshot := tl.Snapshot()
+	if len(snapshot.Executions) != 1 {
+		t.Fatalf("got %d executions", len(snapshot.Executions))
+	}
+	if snapshot.Executions[0].Launch == nil {
+		t.Fatal("expected attached launch")
+	}
+	if snapshot.Executions[0].Join != JoinHeuristic {
+		t.Fatalf("join=%q", snapshot.Executions[0].Join)
+	}
+	if !snapshot.Executions[0].Heuristic {
+		t.Fatalf("expected heuristic execution join: %+v", snapshot.Executions[0])
+	}
+	if got := snapshot.JoinStats.HeuristicExecutionJoinCount; got != 1 {
+		t.Fatalf("heuristic_execution_join_count=%d", got)
+	}
+	if got := snapshot.JoinStats.UnmatchedLaunchCount; got != 0 {
+		t.Fatalf("unmatched_launch_count=%d", got)
+	}
+}
+
 func TestTimelinePreservesLifecycleEventOrder(t *testing.T) {
 	tl := NewTimeline()
 	tl.RecordEvent(GPUTimelineEvent{

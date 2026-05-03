@@ -6,7 +6,7 @@ Thanks for your interest. perf-agent is an eBPF-based Linux profiler — a small
 
 - **Build & toolchain setup:** [BUILDING.md](./BUILDING.md)
 - **Test layout:** see `test/` directory and `make test-unit` / `make test-integration`
-- **Architecture & internals:** [README.md](./README.md) (Architecture section) and `docs/superpowers/specs/`
+- **Architecture & internals:** [README.md](./README.md) (Architecture section). Forward-looking specs (e.g. GPU profiling) live in `docs/superpowers/specs/`; shipped specs are not retained — the README and code are the source of truth once a feature lands.
 - **Vulnerability reports:** [SECURITY.md](./SECURITY.md) — please do **not** open public issues
 - **Conduct:** [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
 
@@ -14,7 +14,7 @@ Thanks for your interest. perf-agent is an eBPF-based Linux profiler — a small
 
 ## Before you open a PR
 
-1. **Talk first if it's substantial.** For anything bigger than a bugfix, please open an issue describing the problem and the proposed approach. Design specs in `docs/superpowers/specs/` show the level of detail used for non-trivial changes.
+1. **Talk first if it's substantial.** For anything bigger than a bugfix, please open an issue describing the problem and the proposed approach. Multi-step features may benefit from a design spec under `docs/superpowers/specs/` before implementation; the existing GPU profiling spec is one example of the level of detail used.
 2. **Run the full test suite.** Unit tests don't need root:
    ```bash
    make test-unit

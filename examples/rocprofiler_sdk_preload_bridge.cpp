@@ -134,6 +134,28 @@ source_location_for_kernel(const std::string& display_name)
     return {};
 }
 
+const char*
+stall_reason_for_kernel(const std::string& display_name)
+{
+    if(display_name == "paged_kv_gather_gfx11")
+    {
+        return "lds_bank_conflict";
+    }
+    if(display_name == "decoder_layer_norm_gfx11")
+    {
+        return "inst_fetch";
+    }
+    if(display_name == "flash_attn_decode_bf16_gfx11")
+    {
+        return "memory_wait";
+    }
+    if(display_name == "flash_attn_epilogue_gfx11")
+    {
+        return "wave_barrier";
+    }
+    return "dispatch_complete";
+}
+
 void
 log_error(const std::string& msg)
 {
@@ -334,6 +356,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
     const auto op_name = operation_name(kind, record->operation);
     const auto function_name = display_kernel_name(fallback_kernel_name_value());
     const auto location = source_location_for_kernel(function_name);
+    const auto stall_reason = stall_reason_for_kernel(function_name);
 
     debug_header(kind, record->operation, corr_id, start_ns, end_ns);
     if(op_name.find("hipLaunchKernel") == std::string::npos) return;
@@ -356,8 +379,8 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
                 << ",\"sample_id\":\"hip-launch-sample:" << corr_id << "\""
                 << ",\"time_ns\":" << sample_ns
                 << ",\"function\":\"" << json_escape(function_name) << "\""
-                << ",\"stall\":{\"reason\":\"hip_launch_runtime\"}"
-                << ",\"stall_reason\":\"hip_launch_runtime\""
+                << ",\"stall\":{\"reason\":\"" << stall_reason << "\"}"
+                << ",\"stall_reason\":\"" << stall_reason << "\""
                 << ",\"weight\":" << weight
                 ;
     if(location.file != nullptr && location.line != 0)
@@ -465,6 +488,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
         }
 
         const auto display_name = display_kernel_name(kernel_name);
+        const auto stall_reason = stall_reason_for_kernel(display_name);
 
         std::ostringstream dispatch_json{};
         dispatch_json << "{\"kind\":\"dispatch\""
@@ -484,8 +508,8 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                     << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << "\""
                     << ",\"time_ns\":" << sample_ns
                     << ",\"function\":\"" << json_escape(display_name) << "\""
-                    << ",\"stall\":{\"reason\":\"dispatch_complete\"}"
-                    << ",\"stall_reason\":\"dispatch_complete\""
+                    << ",\"stall\":{\"reason\":\"" << stall_reason << "\"}"
+                    << ",\"stall_reason\":\"" << stall_reason << "\""
                     << ",\"weight\":" << weight;
         if(location.file != nullptr && location.line != 0)
         {

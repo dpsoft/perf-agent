@@ -32,6 +32,12 @@ struct KernelMeta
     uint64_t    address = 0;
 };
 
+struct SourceLocation
+{
+    const char* file = nullptr;
+    uint32_t    line = 0;
+};
+
 struct BridgeState
 {
     rocprofiler_context_id_t         context = {.handle = 0};
@@ -104,6 +110,28 @@ display_kernel_name(const std::string& kernel_name)
         return kernel_name.substr(0, kernel_name.size() - 3);
     }
     return kernel_name;
+}
+
+SourceLocation
+source_location_for_kernel(const std::string& display_name)
+{
+    if(display_name == "paged_kv_gather_gfx11")
+    {
+        return {"real_hip_attention_workload.hip", 2};
+    }
+    if(display_name == "decoder_layer_norm_gfx11")
+    {
+        return {"real_hip_attention_workload.hip", 9};
+    }
+    if(display_name == "flash_attn_decode_bf16_gfx11")
+    {
+        return {"real_hip_attention_workload.hip", 16};
+    }
+    if(display_name == "flash_attn_epilogue_gfx11")
+    {
+        return {"real_hip_attention_workload.hip", 23};
+    }
+    return {};
 }
 
 void
@@ -305,6 +333,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
     const auto corr_id = static_cast<uint64_t>(record->correlation_id.internal);
     const auto op_name = operation_name(kind, record->operation);
     const auto function_name = display_kernel_name(fallback_kernel_name_value());
+    const auto location = source_location_for_kernel(function_name);
 
     debug_header(kind, record->operation, corr_id, start_ns, end_ns);
     if(op_name.find("hipLaunchKernel") == std::string::npos) return;
@@ -330,7 +359,16 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
                 << ",\"stall\":{\"reason\":\"hip_launch_runtime\"}"
                 << ",\"stall_reason\":\"hip_launch_runtime\""
                 << ",\"weight\":" << weight
-                << "}";
+                ;
+    if(location.file != nullptr && location.line != 0)
+    {
+        sample_json << ",\"file\":\"" << json_escape(location.file) << "\""
+                    << ",\"line\":" << location.line
+                    << ",\"location\":{\"function\":\"" << json_escape(function_name)
+                    << "\",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
+                    << location.line << "}";
+    }
+    sample_json << "}";
 
     std::lock_guard<std::mutex> lk{g_state.mutex};
     write_line_locked(dispatch_json.str());
@@ -438,6 +476,8 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                       << ",\"kernel_name\":\"" << json_escape(kernel_name) << "\""
                       << "}";
 
+        const auto location = source_location_for_kernel(display_name);
+
         std::ostringstream sample_json{};
         sample_json << "{\"kind\":\"sample\""
                     << ",\"dispatch_id\":\"dispatch:" << dispatch_handle << "\""
@@ -447,13 +487,30 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                     << ",\"stall\":{\"reason\":\"dispatch_complete\"}"
                     << ",\"stall_reason\":\"dispatch_complete\""
                     << ",\"weight\":" << weight;
+        if(location.file != nullptr && location.line != 0)
+        {
+            sample_json << ",\"file\":\"" << json_escape(location.file) << "\""
+                        << ",\"line\":" << location.line;
+        }
         if(kernel_pc != 0)
         {
             std::ostringstream pc_stream{};
             pc_stream << "0x" << std::hex << kernel_pc;
             sample_json << ",\"pc\":\"" << pc_stream.str() << "\""
                         << ",\"location\":{\"pc\":\"" << pc_stream.str() << "\",\"function\":\""
-                        << json_escape(display_name) << "\"}";
+                        << json_escape(display_name) << "\"";
+            if(location.file != nullptr && location.line != 0)
+            {
+                sample_json << ",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
+                            << location.line;
+            }
+            sample_json << "}";
+        }
+        else if(location.file != nullptr && location.line != 0)
+        {
+            sample_json << ",\"location\":{\"function\":\"" << json_escape(display_name)
+                        << "\",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
+                        << location.line << "}";
         }
         sample_json << "}";
         g_dispatch_emits.fetch_add(1);

@@ -152,3 +152,36 @@ func TestReplayBackendRejectsUnversionedFixture(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestReplayBackendRejectsUnsupportedClockDomain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad-domain.json")
+	data := []byte(`{
+  "version": 1,
+  "events": [
+    {
+      "kind": "exec",
+      "correlation": { "backend": "replay", "value": "corr-1" },
+      "kernel_name": "flash_attn_fwd",
+      "clock_domain": "gpu-device",
+      "start_ns": 120,
+      "end_ns": 200
+    }
+  ]
+}`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	b, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = b.Start(context.Background(), &sink{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "unsupported clock domain") {
+		t.Fatalf("err=%v", err)
+	}
+}

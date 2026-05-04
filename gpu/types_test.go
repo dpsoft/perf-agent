@@ -132,3 +132,49 @@ func TestCapabilityRejectsUnknownJSONValue(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestClockDomainRoundTripJSONUsesStableNames(t *testing.T) {
+	in := []ClockDomain{
+		ClockDomainCPUMonotonic,
+		ClockDomainSynced,
+		ClockDomainGPUDevice,
+	}
+	buf, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	got := string(buf)
+	for _, want := range []string{
+		"cpu-monotonic",
+		"synced",
+		"gpu-device",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %s", want, got)
+		}
+	}
+
+	var out []ClockDomain
+	if err := json.Unmarshal(buf, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("len(out)=%d len(in)=%d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i] != in[i] {
+			t.Fatalf("domain[%d]=%v want %v", i, out[i], in[i])
+		}
+	}
+}
+
+func TestClockDomainRejectsUnknownJSONValue(t *testing.T) {
+	var out ClockDomain
+	err := json.Unmarshal([]byte(`"not-a-clock-domain"`), &out)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "unknown clock domain") {
+		t.Fatalf("err=%v", err)
+	}
+}

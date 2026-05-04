@@ -121,6 +121,73 @@ type CorrelationID struct {
 	Value   string       `json:"value"`
 }
 
+type ClockDomain uint8
+
+const (
+	ClockDomainInvalid ClockDomain = iota
+	ClockDomainCPUMonotonic
+	ClockDomainSynced
+	ClockDomainGPUDevice
+)
+
+var clockDomainToName = map[ClockDomain]string{
+	ClockDomainCPUMonotonic: "cpu-monotonic",
+	ClockDomainSynced:       "synced",
+	ClockDomainGPUDevice:    "gpu-device",
+}
+
+var nameToClockDomain = map[string]ClockDomain{
+	"cpu-monotonic": ClockDomainCPUMonotonic,
+	"synced":        ClockDomainSynced,
+	"gpu-device":    ClockDomainGPUDevice,
+}
+
+func (d ClockDomain) String() string {
+	if name, ok := clockDomainToName[d]; ok {
+		return name
+	}
+	return fmt.Sprintf("unknown-clock-domain-%d", uint8(d))
+}
+
+func (d ClockDomain) MarshalJSON() ([]byte, error) {
+	name, ok := clockDomainToName[d]
+	if !ok {
+		return nil, fmt.Errorf("unknown clock domain %d", d)
+	}
+	return json.Marshal(name)
+}
+
+func (d *ClockDomain) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("decode clock domain: %w", err)
+	}
+	value, ok := nameToClockDomain[name]
+	if !ok {
+		return fmt.Errorf("unknown clock domain %q", name)
+	}
+	*d = value
+	return nil
+}
+
+func NormalizeClockDomain(domain ClockDomain) ClockDomain {
+	if domain == ClockDomainInvalid {
+		return ClockDomainCPUMonotonic
+	}
+	return domain
+}
+
+func ValidateSupportedClockDomain(domain ClockDomain) error {
+	switch NormalizeClockDomain(domain) {
+	case ClockDomainCPUMonotonic:
+		return nil
+	case ClockDomainSynced, ClockDomainGPUDevice:
+		return fmt.Errorf("unsupported clock domain %q", NormalizeClockDomain(domain))
+	default:
+		return fmt.Errorf("unknown clock domain %d", domain)
+	}
+}
+
 // Timestamp contract:
 //   - all *_ns fields emitted into the normalized GPU event model are in the
 //     CPU monotonic clock domain
@@ -139,6 +206,7 @@ type GPUKernelLaunch struct {
 	Correlation CorrelationID `json:"correlation"`
 	Queue       GPUQueueRef   `json:"queue"`
 	KernelName  string        `json:"kernel_name"`
+	ClockDomain ClockDomain   `json:"clock_domain,omitempty"`
 	TimeNs      uint64        `json:"time_ns"`
 	Launch      LaunchContext `json:"launch"`
 }
@@ -148,12 +216,14 @@ type GPUKernelExec struct {
 	Correlation CorrelationID   `json:"correlation"`
 	Queue       GPUQueueRef     `json:"queue"`
 	KernelName  string          `json:"kernel_name"`
+	ClockDomain ClockDomain     `json:"clock_domain,omitempty"`
 	StartNs     uint64          `json:"start_ns"`
 	EndNs       uint64          `json:"end_ns"`
 }
 
 type GPUCounterSample struct {
 	Device GPUDeviceRef `json:"device"`
+	ClockDomain ClockDomain `json:"clock_domain,omitempty"`
 	TimeNs uint64       `json:"time_ns"`
 	Name   string       `json:"name"`
 	Value  float64      `json:"value"`
@@ -163,6 +233,7 @@ type GPUCounterSample struct {
 type GPUSample struct {
 	Correlation CorrelationID `json:"correlation"`
 	Device      GPUDeviceRef  `json:"device"`
+	ClockDomain ClockDomain   `json:"clock_domain,omitempty"`
 	TimeNs      uint64        `json:"time_ns"`
 	KernelName  string        `json:"kernel_name"`
 	PC          uint64        `json:"pc"`
@@ -192,6 +263,7 @@ type GPUTimelineEvent struct {
 	Kind       TimelineEventKind `json:"kind"`
 	Family     string            `json:"family,omitempty"`
 	Name       string            `json:"name,omitempty"`
+	ClockDomain ClockDomain      `json:"clock_domain,omitempty"`
 	TimeNs     uint64            `json:"time_ns"`
 	DurationNs uint64            `json:"duration_ns,omitempty"`
 	PID        uint32            `json:"pid,omitempty"`

@@ -50,6 +50,7 @@ func NormalizeLaunch(record LaunchRecord) (gpu.GPUKernelLaunch, error) {
 			QueueID: record.QueueID,
 		},
 		KernelName: record.KernelName,
+		ClockDomain: gpu.ClockDomainCPUMonotonic,
 		TimeNs:     record.TimeNs,
 		Launch: gpu.LaunchContext{
 			PID:      record.PID,

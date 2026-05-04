@@ -33,6 +33,9 @@ func TestNormalizeRecord(t *testing.T) {
 	if event.Kind != "ioctl" {
 		t.Fatalf("kind=%q", event.Kind)
 	}
+	if event.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%v", event.ClockDomain)
+	}
 	if event.Name != "drm-render-ioctl" {
 		t.Fatalf("name=%q", event.Name)
 	}

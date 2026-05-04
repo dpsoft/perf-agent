@@ -518,7 +518,12 @@ Replay fixtures are versioned envelopes:
 }
 ```
 
-All timestamp fields in replay fixtures are in the CPU monotonic clock domain.
+Replay clock-domain contract:
+
+- `clock_domain` is an optional field on normalized replay events
+- omitted `clock_domain` defaults to `cpu-monotonic`
+- replay currently accepts only `cpu-monotonic`; non-CPU domains are rejected early
+- all timestamp fields in replay fixtures are therefore comparable directly to CPU launch timestamps today
 
 ```bash
 go run . \
@@ -546,7 +551,9 @@ Stream contract:
 
 - one UTF-8 JSON object per line
 - `kind` must be one of `launch`, `exec`, `counter`, `sample`, `event`
+- `clock_domain` is optional and defaults to `cpu-monotonic`
 - timestamps (`time_ns`, `start_ns`, `end_ns`, `duration_ns`) are in the CPU monotonic clock domain
+- stream ingestion currently accepts only `cpu-monotonic`
 - external collectors must convert device-local/GPU clocks before emitting into this pipe
 
 ```bash

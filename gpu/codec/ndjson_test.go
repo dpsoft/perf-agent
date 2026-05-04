@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dpsoft/perf-agent/gpu"
@@ -24,6 +25,9 @@ func TestDecodeLaunchLine(t *testing.T) {
 	}
 	if ev.Launch.Correlation != (gpu.CorrelationID{Backend: "stream", Value: "c1"}) {
 		t.Fatalf("correlation=%+v", ev.Launch.Correlation)
+	}
+	if ev.Launch.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%v", ev.Launch.ClockDomain)
 	}
 }
 
@@ -88,6 +92,9 @@ func TestDecodeTimelineEventLine(t *testing.T) {
 	if ev.Event.DurationNs != 13 {
 		t.Fatalf("duration=%d", ev.Event.DurationNs)
 	}
+	if ev.Event.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%v", ev.Event.ClockDomain)
+	}
 }
 
 func TestDecodeRejectsMalformedJSON(t *testing.T) {
@@ -122,5 +129,15 @@ func TestDecodeRejectsBadTimestampType(t *testing.T) {
 	_, err := DecodeLine([]byte(`{"kind":"launch","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","time_ns":"100"}`))
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeRejectsUnsupportedClockDomain(t *testing.T) {
+	_, err := DecodeLine([]byte(`{"kind":"exec","correlation":{"backend":"stream","value":"c1"},"kernel_name":"flash_attn_fwd","clock_domain":"gpu-device","start_ns":120,"end_ns":200}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if got := err.Error(); got == "" || !strings.Contains(got, "unsupported clock domain") {
+		t.Fatalf("err=%v", err)
 	}
 }

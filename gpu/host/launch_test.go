@@ -33,6 +33,9 @@ func TestNormalizeLaunchRecord(t *testing.T) {
 	if launch.Queue.QueueID != "q7" {
 		t.Fatalf("queue=%q", launch.Queue.QueueID)
 	}
+	if launch.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%v", launch.ClockDomain)
+	}
 	if got := len(launch.Launch.CPUStack); got != 2 {
 		t.Fatalf("cpu stack len=%d", got)
 	}
@@ -84,6 +87,9 @@ func TestLaunchSinkEmitsCanonicalLaunch(t *testing.T) {
 	}
 	if sink.launches[0].Correlation.Value != "c1" {
 		t.Fatalf("correlation=%+v", sink.launches[0].Correlation)
+	}
+	if sink.launches[0].ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%v", sink.launches[0].ClockDomain)
 	}
 }
 

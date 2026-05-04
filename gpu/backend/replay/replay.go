@@ -80,37 +80,57 @@ type rawEvent struct {
 	EndNs       uint64               `json:"end_ns"`
 	StallReason string               `json:"stall_reason"`
 	Weight      uint64               `json:"weight"`
+	ClockDomain gpu.ClockDomain      `json:"clock_domain,omitempty"`
 }
 
 func emitEvent(event rawEvent, sink gpu.EventSink) error {
 	switch event.Kind {
 	case "launch":
+		domain := gpu.NormalizeClockDomain(event.ClockDomain)
+		if err := gpu.ValidateSupportedClockDomain(domain); err != nil {
+			return fmt.Errorf("replay launch event %w", err)
+		}
 		sink.EmitLaunch(gpu.GPUKernelLaunch{
 			Correlation: event.Correlation,
 			Queue:       event.Queue,
 			KernelName:  event.KernelName,
+			ClockDomain: domain,
 			TimeNs:      event.TimeNs,
 			Launch:      event.Launch,
 		})
 	case "exec":
+		domain := gpu.NormalizeClockDomain(event.ClockDomain)
+		if err := gpu.ValidateSupportedClockDomain(domain); err != nil {
+			return fmt.Errorf("replay exec event %w", err)
+		}
 		sink.EmitExec(gpu.GPUKernelExec{
 			Execution:   event.Execution,
 			Correlation: event.Correlation,
 			Queue:       event.Queue,
 			KernelName:  event.KernelName,
+			ClockDomain: domain,
 			StartNs:     event.StartNs,
 			EndNs:       event.EndNs,
 		})
 	case "sample":
+		domain := gpu.NormalizeClockDomain(event.ClockDomain)
+		if err := gpu.ValidateSupportedClockDomain(domain); err != nil {
+			return fmt.Errorf("replay sample event %w", err)
+		}
 		sink.EmitSample(gpu.GPUSample{
 			Correlation: event.Correlation,
 			Device:      event.Device,
+			ClockDomain: domain,
 			TimeNs:      event.TimeNs,
 			KernelName:  event.KernelName,
 			StallReason: event.StallReason,
 			Weight:      max(1, event.Weight),
 		})
 	case "event":
+		event.Event.ClockDomain = gpu.NormalizeClockDomain(event.Event.ClockDomain)
+		if err := gpu.ValidateSupportedClockDomain(event.Event.ClockDomain); err != nil {
+			return fmt.Errorf("replay timeline event %w", err)
+		}
 		sink.EmitEvent(event.Event)
 	default:
 		return fmt.Errorf("unsupported replay event kind %q", event.Kind)

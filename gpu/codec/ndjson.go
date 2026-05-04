@@ -50,6 +50,7 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 		if err := json.Unmarshal(line, &out.Launch); err != nil {
 			return DecodedEvent{}, fmt.Errorf("decode launch event: %w", err)
 		}
+		out.Launch.ClockDomain = gpu.NormalizeClockDomain(out.Launch.ClockDomain)
 		if err := validateLaunch(out.Launch); err != nil {
 			return DecodedEvent{}, err
 		}
@@ -57,6 +58,7 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 		if err := json.Unmarshal(line, &out.Exec); err != nil {
 			return DecodedEvent{}, fmt.Errorf("decode exec event: %w", err)
 		}
+		out.Exec.ClockDomain = gpu.NormalizeClockDomain(out.Exec.ClockDomain)
 		if err := validateExec(out.Exec); err != nil {
 			return DecodedEvent{}, err
 		}
@@ -64,6 +66,7 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 		if err := json.Unmarshal(line, &out.Counter); err != nil {
 			return DecodedEvent{}, fmt.Errorf("decode counter event: %w", err)
 		}
+		out.Counter.ClockDomain = gpu.NormalizeClockDomain(out.Counter.ClockDomain)
 		if err := validateCounter(out.Counter); err != nil {
 			return DecodedEvent{}, err
 		}
@@ -71,6 +74,7 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 		if err := json.Unmarshal(line, &out.Sample); err != nil {
 			return DecodedEvent{}, fmt.Errorf("decode sample event: %w", err)
 		}
+		out.Sample.ClockDomain = gpu.NormalizeClockDomain(out.Sample.ClockDomain)
 		if err := validateSample(out.Sample); err != nil {
 			return DecodedEvent{}, err
 		}
@@ -80,6 +84,7 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 			return DecodedEvent{}, fmt.Errorf("decode timeline event: %w", err)
 		}
 		out.Event = eventLine.Event
+		out.Event.ClockDomain = gpu.NormalizeClockDomain(out.Event.ClockDomain)
 		if err := validateEvent(out.Event); err != nil {
 			return DecodedEvent{}, err
 		}
@@ -91,6 +96,9 @@ func DecodeLine(line []byte) (DecodedEvent, error) {
 }
 
 func validateLaunch(event gpu.GPUKernelLaunch) error {
+	if err := gpu.ValidateSupportedClockDomain(event.ClockDomain); err != nil {
+		return fmt.Errorf("launch event %w", err)
+	}
 	if event.Correlation.Backend == "" || event.Correlation.Value == "" {
 		return fmt.Errorf("launch event missing correlation")
 	}
@@ -101,6 +109,9 @@ func validateLaunch(event gpu.GPUKernelLaunch) error {
 }
 
 func validateExec(event gpu.GPUKernelExec) error {
+	if err := gpu.ValidateSupportedClockDomain(event.ClockDomain); err != nil {
+		return fmt.Errorf("exec event %w", err)
+	}
 	if event.Correlation.Backend == "" || event.Correlation.Value == "" {
 		return fmt.Errorf("exec event missing correlation")
 	}
@@ -111,6 +122,9 @@ func validateExec(event gpu.GPUKernelExec) error {
 }
 
 func validateCounter(event gpu.GPUCounterSample) error {
+	if err := gpu.ValidateSupportedClockDomain(event.ClockDomain); err != nil {
+		return fmt.Errorf("counter event %w", err)
+	}
 	if event.Device.Backend == "" || event.Device.DeviceID == "" {
 		return fmt.Errorf("counter event missing device")
 	}
@@ -121,6 +135,9 @@ func validateCounter(event gpu.GPUCounterSample) error {
 }
 
 func validateSample(event gpu.GPUSample) error {
+	if err := gpu.ValidateSupportedClockDomain(event.ClockDomain); err != nil {
+		return fmt.Errorf("sample event %w", err)
+	}
 	if event.Correlation.Backend == "" || event.Correlation.Value == "" {
 		return fmt.Errorf("sample event missing correlation")
 	}
@@ -131,6 +148,9 @@ func validateSample(event gpu.GPUSample) error {
 }
 
 func validateEvent(event gpu.GPUTimelineEvent) error {
+	if err := gpu.ValidateSupportedClockDomain(event.ClockDomain); err != nil {
+		return fmt.Errorf("timeline event %w", err)
+	}
 	if event.Kind == "" {
 		return fmt.Errorf("timeline event missing kind")
 	}

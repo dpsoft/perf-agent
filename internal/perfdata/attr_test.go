@@ -53,7 +53,7 @@ func TestEncodeEventAttr_Hardware(t *testing.T) {
 	}
 	// type at offset 0 = perfTypeHardware = 0
 	got := buf.Bytes()
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if got[i] != 0 {
 			t.Errorf("type byte %d = %02x, want 00 (PERF_TYPE_HARDWARE)", i, got[i])
 		}

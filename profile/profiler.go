@@ -176,7 +176,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		Labels:        pr.labels,
 	})
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		key := keys[i]
 		value := values[i]
 

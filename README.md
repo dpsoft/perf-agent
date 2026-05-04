@@ -614,8 +614,6 @@ Current modes are:
 - `hip-amd-sample`
 - `hip-amd-sample-rich`
 - `hip-rocprofv3-rich`
-- `hip-rocprofv2-rich` (legacy compatibility)
-- `hip-rocprofv2-command-rich` (legacy compatibility)
 - `hip-rocprofv3-command-rich`
 - `host-driver`
 - `multi-exec`
@@ -757,11 +755,11 @@ bash scripts/gpu-live-hip-amdsample.sh \
 ```
 
 The preferred modern path is now `rocprofiler-sdk`, with `rocprofv3` kept as
-the richer CLI-shaped compatibility surface and `rocprofv2` retained only as
-an older compatibility source. These hooks expect a collector-style executable
-behind the selected path and adapt simple native JSON records such as
-`dispatch` and `sample` into the same `amdsample` contract, including
-alternate timing aliases and nested source-location metadata:
+the richer CLI-shaped compatibility surface. These hooks expect a
+collector-style executable behind the selected path and adapt simple native
+JSON records such as `dispatch` and `sample` into the same `amdsample`
+contract, including alternate timing aliases and nested source-location
+metadata:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -782,10 +780,6 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --real-source rocprofv3 \
   --rocprofv3-command 'rocprofv3 --hip-trace --output /tmp/rocprofv3-out'
 ```
-
-Legacy `rocprofv2` live compatibility remains available through the same
-path/command/output-file/output-dir knobs, but richer live-path examples and
-narrative are intentionally centered on `rocprofv3` and `rocprofiler-sdk`.
 
 The real collector poll interval is also tunable when you want denser or
 sparser coarse hardware samples:
@@ -951,10 +945,6 @@ rocprofv3 native records -> cmd/amd-sample-collector --mode real --real-source r
 ```
 
 The checked-in demo currently exercises the file-output flavor of that contract.
-
-Legacy `rocprofv2` compatibility modes remain available in the helper scripts,
-but the richer offline demo and golden coverage now live on `rocprofv3` and
-`rocprofiler-sdk`.
 
 Preferred modern SDK-shaped variant:
 

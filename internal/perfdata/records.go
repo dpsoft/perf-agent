@@ -121,3 +121,48 @@ func encodeMmap2(w io.Writer, r mmap2Record) {
 	writeUint32LE(w, r.flags)
 	writeCStringPadded8(w, r.filename)
 }
+
+// sampleRecord is the in-memory image of a PERF_RECORD_SAMPLE payload, for
+// the fixed sample_type we emit:
+//
+//	IP | TID | TIME | CPU | PERIOD | CALLCHAIN
+//
+// (No ADDR, ID, STREAM_ID, READ, RAW, BRANCH_STACK, REGS_USER, STACK_USER,
+// WEIGHT, DATA_SRC, TRANSACTION.)
+type sampleRecord struct {
+	ip        uint64   // PERF_SAMPLE_IP
+	pid, tid  uint32   // PERF_SAMPLE_TID
+	time      uint64   // PERF_SAMPLE_TIME (ns since clock origin)
+	cpu       uint32   // PERF_SAMPLE_CPU (low 32 bits)
+	period    uint64   // PERF_SAMPLE_PERIOD
+	callchain []uint64 // PERF_SAMPLE_CALLCHAIN (leaf first, ips array)
+}
+
+// encodeSample writes a PERF_RECORD_SAMPLE record (type 9). Field order
+// follows the sample_type bit order in uapi/linux/perf_event.h:
+//
+//	{ u64 ip; }                            // PERF_SAMPLE_IP
+//	{ u32 pid, tid; }                      // PERF_SAMPLE_TID
+//	{ u64 time; }                          // PERF_SAMPLE_TIME
+//	{ u32 cpu, res; }                      // PERF_SAMPLE_CPU
+//	{ u64 period; }                        // PERF_SAMPLE_PERIOD
+//	{ u64 nr; u64 ips[nr]; }               // PERF_SAMPLE_CALLCHAIN
+func encodeSample(w io.Writer, r sampleRecord) {
+	bodySize := 8 + 8 + 8 + 8 + 8 + 8 + 8*len(r.callchain)
+	size := recordHeaderSize + bodySize
+	writeUint32LE(w, recordSample)
+	writeUint16LE(w, 0) // misc — could carry CPUMODE_USER etc. but blazesym handles that downstream
+	writeUint16LE(w, uint16(size))
+
+	writeUint64LE(w, r.ip)
+	writeUint32LE(w, r.pid)
+	writeUint32LE(w, r.tid)
+	writeUint64LE(w, r.time)
+	writeUint32LE(w, r.cpu)
+	writeUint32LE(w, 0) // res
+	writeUint64LE(w, r.period)
+	writeUint64LE(w, uint64(len(r.callchain)))
+	for _, ip := range r.callchain {
+		writeUint64LE(w, ip)
+	}
+}

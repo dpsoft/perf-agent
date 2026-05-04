@@ -98,3 +98,42 @@ func TestEncodeMmap2_WithBuildID(t *testing.T) {
 		t.Errorf("build_id[0..2] = % x, want de ad", got[44:46])
 	}
 }
+
+func TestEncodeSample(t *testing.T) {
+	var buf bytes.Buffer
+	encodeSample(&buf, sampleRecord{
+		ip:        0x401000,
+		pid:       1234,
+		tid:       1234,
+		time:      1000000000, // 1 second in ns
+		cpu:       3,
+		period:    1,
+		callchain: []uint64{0x401000, 0x402000, 0x403000},
+	})
+
+	got := buf.Bytes()
+	// sample_type = IP | TID | TIME | CPU | PERIOD | CALLCHAIN
+	// Layout:
+	//   header(8) + ip(8) + pid+tid(8) + time(8) + cpu+res(8) + period(8) +
+	//   nr(8) + ips(3*8) = 80
+	if len(got) != 80 {
+		t.Fatalf("SAMPLE size = %d, want 80; bytes: % x", len(got), got)
+	}
+	// header.type at offset 0 = PERF_RECORD_SAMPLE = 9
+	if got[0] != 9 {
+		t.Errorf("type = %d, want 9", got[0])
+	}
+	// header.size at offset 6 (u16 LE) = 80
+	if got[6] != 80 || got[7] != 0 {
+		t.Errorf("size = % x, want 50 00", got[6:8])
+	}
+	// ip at offset 8 (u64 LE) = 0x401000
+	wantIP := []byte{0x00, 0x10, 0x40, 0, 0, 0, 0, 0}
+	if !bytes.Equal(got[8:16], wantIP) {
+		t.Errorf("ip bytes = % x, want % x", got[8:16], wantIP)
+	}
+	// nr at offset 48 (u64 LE) = 3
+	if got[48] != 3 || got[49] != 0 {
+		t.Errorf("nr = % x, want 03 00", got[48:50])
+	}
+}

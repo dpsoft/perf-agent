@@ -44,6 +44,7 @@ struct SamplePoint
     uint32_t line = 0;
     uint64_t pc_offset = 0;
     uint32_t weight_pct = 0;
+    const char* function = nullptr;
 };
 
 struct BridgeState
@@ -148,39 +149,39 @@ sample_points_for_kernel(const std::string& display_name)
     if(display_name == "paged_kv_gather_gfx11")
     {
         return {{
-            {.line = 2, .pc_offset = 0x10, .weight_pct = 45},
-            {.line = 4, .pc_offset = 0x48, .weight_pct = 35},
-            {.line = 6, .pc_offset = 0x80, .weight_pct = 20},
+            {.line = 2, .pc_offset = 0x10, .weight_pct = 45, .function = "paged_kv_gather_tiles"},
+            {.line = 4, .pc_offset = 0x48, .weight_pct = 35, .function = "paged_kv_accumulate_heads"},
+            {.line = 6, .pc_offset = 0x80, .weight_pct = 20, .function = "paged_kv_writeback"},
         }};
     }
     if(display_name == "decoder_layer_norm_gfx11")
     {
         return {{
-            {.line = 9, .pc_offset = 0x14, .weight_pct = 30},
-            {.line = 11, .pc_offset = 0x50, .weight_pct = 45},
-            {.line = 13, .pc_offset = 0x88, .weight_pct = 25},
+            {.line = 9, .pc_offset = 0x14, .weight_pct = 30, .function = "decoder_layer_norm_reduce"},
+            {.line = 11, .pc_offset = 0x50, .weight_pct = 45, .function = "decoder_layer_norm_scale"},
+            {.line = 13, .pc_offset = 0x88, .weight_pct = 25, .function = "decoder_layer_norm_store"},
         }};
     }
     if(display_name == "flash_attn_decode_bf16_gfx11")
     {
         return {{
-            {.line = 16, .pc_offset = 0x18, .weight_pct = 28},
-            {.line = 18, .pc_offset = 0x58, .weight_pct = 44},
-            {.line = 20, .pc_offset = 0x98, .weight_pct = 28},
+            {.line = 16, .pc_offset = 0x18, .weight_pct = 28, .function = "flash_attn_qk_tiles"},
+            {.line = 18, .pc_offset = 0x58, .weight_pct = 44, .function = "flash_attn_softmax_step"},
+            {.line = 20, .pc_offset = 0x98, .weight_pct = 28, .function = "flash_attn_value_mix"},
         }};
     }
     if(display_name == "flash_attn_epilogue_gfx11")
     {
         return {{
-            {.line = 23, .pc_offset = 0x1c, .weight_pct = 24},
-            {.line = 25, .pc_offset = 0x5c, .weight_pct = 36},
-            {.line = 27, .pc_offset = 0xa0, .weight_pct = 40},
+            {.line = 23, .pc_offset = 0x1c, .weight_pct = 24, .function = "flash_attn_epilogue_residual"},
+            {.line = 25, .pc_offset = 0x5c, .weight_pct = 36, .function = "flash_attn_epilogue_norm"},
+            {.line = 27, .pc_offset = 0xa0, .weight_pct = 40, .function = "flash_attn_epilogue_store"},
         }};
     }
     return {{
-        {.line = 0, .pc_offset = 0x10, .weight_pct = 34},
-        {.line = 0, .pc_offset = 0x40, .weight_pct = 33},
-        {.line = 0, .pc_offset = 0x70, .weight_pct = 33},
+        {.line = 0, .pc_offset = 0x10, .weight_pct = 34, .function = "kernel_phase_a"},
+        {.line = 0, .pc_offset = 0x40, .weight_pct = 33, .function = "kernel_phase_b"},
+        {.line = 0, .pc_offset = 0x70, .weight_pct = 33, .function = "kernel_phase_c"},
     }};
 }
 
@@ -572,6 +573,9 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
             {
                 sample_weight = std::max<int64_t>(1, sample_weight + (weight - written_weight));
             }
+            const auto sample_function =
+                (sample.function != nullptr && sample.function[0] != '\0') ? std::string{sample.function}
+                                                                           : display_name;
 
             std::ostringstream sample_json{};
             sample_json << "{\"kind\":\"sample\""
@@ -579,7 +583,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                         << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << ":"
                         << sample_idx << "\""
                         << ",\"time_ns\":" << sample_ns
-                        << ",\"function\":\"" << json_escape(display_name) << "\""
+                        << ",\"function\":\"" << json_escape(sample_function) << "\""
                         << ",\"stall\":{\"reason\":\"" << stall_reason << "\"}"
                         << ",\"stall_reason\":\"" << stall_reason << "\""
                         << ",\"weight\":" << sample_weight;
@@ -594,7 +598,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                 pc_stream << "0x" << std::hex << (kernel_pc + sample.pc_offset);
                 sample_json << ",\"pc\":\"" << pc_stream.str() << "\""
                             << ",\"location\":{\"pc\":\"" << pc_stream.str()
-                            << "\",\"function\":\"" << json_escape(display_name) << "\"";
+                            << "\",\"function\":\"" << json_escape(sample_function) << "\"";
                 if(location.file != nullptr && sample.line != 0)
                 {
                     sample_json << ",\"file\":\"" << json_escape(location.file)
@@ -604,7 +608,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
             }
             else if(location.file != nullptr && sample.line != 0)
             {
-                sample_json << ",\"location\":{\"function\":\"" << json_escape(display_name)
+                sample_json << ",\"location\":{\"function\":\"" << json_escape(sample_function)
                             << "\",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
                             << sample.line << "}";
             }

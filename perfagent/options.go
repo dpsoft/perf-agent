@@ -35,6 +35,11 @@ type Config struct {
 	// If set, profile data is written here instead of to OffCPUProfilePath.
 	OffCPUProfileWriter io.Writer
 
+	// PerfDataOutput is the path for a kernel-format perf.data file. Empty
+	// disables emission. Set via WithPerfDataOutput. Only on-CPU samples
+	// are written; off-CPU and PMU modes ignore this option.
+	PerfDataOutput string
+
 	// EnablePMU enables PMU hardware counter monitoring.
 	EnablePMU bool
 
@@ -227,4 +232,12 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 		c.EnableOffCPUProfile = true
 		c.OffCPUProfileWriter = w
 	}
+}
+
+// WithPerfDataOutput enables writing a Linux perf.data file alongside the
+// pprof output. Only on-CPU samples are emitted (off-CPU and PMU modes
+// ignore this). The output is consumable by perf script, perf report,
+// create_llvm_prof (AutoFDO PGO), FlameGraph, hotspot, etc.
+func WithPerfDataOutput(path string) Option {
+	return func(c *Config) { c.PerfDataOutput = path }
 }

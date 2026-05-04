@@ -16,6 +16,87 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// --- resolveTarget tests ---
+// All use config.PID = 0 (system-wide path) to avoid nspid.Translate
+// touching /proc; hostPID stays 0, and the default enricher short-circuits
+// on pid <= 0.
+
+func TestResolveTarget_EnricherOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PID = 0 // system-wide → no nspid translation
+	WithLabelEnricher(func(int) map[string]string {
+		return map[string]string{"pod_uid": "from-enricher", "extra": "set"}
+	})(cfg)
+	a := &Agent{config: cfg}
+
+	hostPID, labels, err := a.resolveTarget()
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if hostPID != 0 {
+		t.Errorf("hostPID = %d, want 0", hostPID)
+	}
+	if labels["pod_uid"] != "from-enricher" {
+		t.Errorf("pod_uid = %q", labels["pod_uid"])
+	}
+	if labels["extra"] != "set" {
+		t.Errorf("extra = %q", labels["extra"])
+	}
+}
+
+func TestResolveTarget_StaticLabelsWinOnCollision(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PID = 0
+	WithLabelEnricher(func(int) map[string]string {
+		return map[string]string{"pod_uid": "from-enricher"}
+	})(cfg)
+	WithLabels(map[string]string{"pod_uid": "static-override"})(cfg)
+	a := &Agent{config: cfg}
+
+	_, labels, err := a.resolveTarget()
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if labels["pod_uid"] != "static-override" {
+		t.Errorf("pod_uid = %q, want static-override (WithLabels must win on collision)", labels["pod_uid"])
+	}
+}
+
+func TestResolveTarget_NilEnricherDisablesDefault(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PID = 0
+	WithLabelEnricher(nil)(cfg) // explicit nil disables k8slabels.FromPID default
+	WithLabels(map[string]string{"only": "static"})(cfg)
+	a := &Agent{config: cfg}
+
+	_, labels, err := a.resolveTarget()
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if labels["only"] != "static" {
+		t.Errorf("only = %q", labels["only"])
+	}
+	// Default enricher would have run k8slabels.FromPID; with WithLabelEnricher(nil),
+	// it must NOT run. Confirm no cgroup_path label appears.
+	if _, has := labels["cgroup_path"]; has {
+		t.Errorf("cgroup_path was set despite WithLabelEnricher(nil): %q", labels["cgroup_path"])
+	}
+}
+
+func TestResolveTarget_DefaultEnricherWhenNotSet(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PID = 0 // hostPID = 0; default enricher returns nil for pid <= 0
+	a := &Agent{config: cfg}
+
+	_, labels, err := a.resolveTarget()
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if len(labels) != 0 {
+		t.Errorf("default enricher should produce no labels for pid=0; got %v", labels)
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string

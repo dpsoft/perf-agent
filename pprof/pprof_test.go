@@ -595,3 +595,32 @@ func TestMappingFlags(t *testing.T) {
 			target.HasFunctions, target.HasFilenames, target.HasLineNumbers)
 	}
 }
+
+func TestNewProfileBuilders_StaticLabelsOnSample(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{
+		SampleRate: 99,
+		Labels: map[string]string{
+			"pod_uid":      "12345678-1234-1234-1234-123456789abc",
+			"container_id": "abc123def456",
+		},
+	})
+	builders.AddSample(&ProfileSample{
+		Pid:         42,
+		Aggregation: SampleAggregated,
+		SampleType:  SampleTypeCpu,
+		Stack:       []Frame{FrameFromName("main.foo")},
+		Value:       1,
+	})
+	for _, b := range builders.Builders {
+		if len(b.Profile.Sample) == 0 {
+			t.Fatal("no samples emitted")
+		}
+		got := b.Profile.Sample[0].Label
+		if got["pod_uid"] == nil || got["pod_uid"][0] != "12345678-1234-1234-1234-123456789abc" {
+			t.Errorf("pod_uid label missing or wrong: %v", got)
+		}
+		if got["container_id"] == nil || got["container_id"][0] != "abc123def456" {
+			t.Errorf("container_id label missing or wrong: %v", got)
+		}
+	}
+}

@@ -117,6 +117,19 @@ type Config struct {
 	// InjectPython enables Python perf-trampoline injection during profiling.
 	// Only valid with EnableCPUProfile. Requires CAP_SYS_PTRACE.
 	InjectPython bool
+
+	// Labels are static per-sample pprof labels. Merged on top of the enricher
+	// output (Labels wins on key collision). Set via WithLabels.
+	Labels map[string]string
+
+	// LabelEnricher computes additional per-sample labels at agent startup
+	// from the resolved host PID. Default is internal/k8slabels.FromPID.
+	// Override via WithLabelEnricher; pass nil to disable defaults entirely.
+	// LabelEnricherSet records whether the user explicitly called
+	// WithLabelEnricher (so passing nil to disable is distinguishable from
+	// not calling it at all).
+	LabelEnricher    func(hostPID int) map[string]string
+	LabelEnricherSet bool
 }
 
 // Option is a functional option for configuring the Agent.
@@ -222,6 +235,31 @@ func WithUnwind(mode string) Option {
 // (lenient). Only valid when CPU profiling is enabled.
 func WithInjectPython(enabled bool) Option {
 	return func(c *Config) { c.InjectPython = enabled }
+}
+
+// WithLabels attaches static per-sample labels to every emitted pprof
+// sample. Merged with WithLabelEnricher output; static labels win on key
+// collision.
+func WithLabels(labels map[string]string) Option {
+	return func(c *Config) {
+		if c.Labels == nil {
+			c.Labels = make(map[string]string, len(labels))
+		}
+		for k, v := range labels {
+			c.Labels[k] = v
+		}
+	}
+}
+
+// WithLabelEnricher overrides the default label enricher (which derives
+// k8s identity labels from /proc/<hostPID>/cgroup and downward-API env
+// vars). Pass nil to disable all enricher-sourced labels — only labels
+// from WithLabels will be attached.
+func WithLabelEnricher(fn func(hostPID int) map[string]string) Option {
+	return func(c *Config) {
+		c.LabelEnricher = fn
+		c.LabelEnricherSet = true
+	}
 }
 
 // WithCPUProfileWriter enables CPU profiling and sets a writer for output.

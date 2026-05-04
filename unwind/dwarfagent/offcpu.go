@@ -23,7 +23,7 @@ type OffCPUProfiler struct {
 // NewOffCPUProfilerWithHooks is the variant of NewOffCPUProfiler that
 // accepts an optional observation surface. Pass nil hooks for the same
 // behavior as NewOffCPUProfiler.
-func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks) (*OffCPUProfiler, error) {
+func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, labels map[string]string) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -38,7 +38,7 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager, labels)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -65,8 +65,8 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on an OffCPUProfiler they received
 // as (nil, err).
-func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string) (*OffCPUProfiler, error) {
-	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil)
+func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string, labels map[string]string) (*OffCPUProfiler, error) {
+	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil, labels)
 }
 
 // aggregateOffCPUSample is the off-CPU-specific ringbuf aggregator:

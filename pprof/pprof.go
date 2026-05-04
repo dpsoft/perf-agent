@@ -94,7 +94,8 @@ type ProfileSample struct {
 type BuildersOptions struct {
 	SampleRate    int64
 	PerPIDProfile bool
-	Comments      []string // Profile-level comments/tags
+	Comments      []string          // Profile-level comments/tags
+	Labels        map[string]string // Per-sample static labels (e.g. pod_uid, container_id)
 	Resolver      *procmap.Resolver // nil → fallback to name-based Location dedup
 }
 
@@ -155,6 +156,7 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		period = 512 * 1024 // todo
 	}
 	builder := &ProfileBuilder{
+		opt:                b.opt,
 		resolver:           b.opt.Resolver,
 		mappings:           make(map[mappingKey]*profile.Mapping),
 		locations:          make(map[any]*profile.Location),
@@ -238,6 +240,7 @@ func looksJIT(f Frame) bool {
 }
 
 type ProfileBuilder struct {
+	opt                BuildersOptions
 	resolver           *procmap.Resolver
 	mappings           map[mappingKey]*profile.Mapping
 	locations          map[any]*profile.Location
@@ -443,6 +446,12 @@ func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 		sample.Value = []int64{0, 0}
 	}
 	sample.Location = make([]*profile.Location, len(inputSample.Stack))
+	if len(p.opt.Labels) > 0 {
+		sample.Label = make(map[string][]string, len(p.opt.Labels))
+		for k, v := range p.opt.Labels {
+			sample.Label[k] = []string{v}
+		}
+	}
 	return sample
 }
 

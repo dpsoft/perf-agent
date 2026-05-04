@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"log/slog"
+	"maps"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -28,6 +29,8 @@ import (
 	hostreplay "github.com/dpsoft/perf-agent/gpu/host/replay"
 	"github.com/dpsoft/perf-agent/inject/ptraceop"
 	"github.com/dpsoft/perf-agent/inject/python"
+	"github.com/dpsoft/perf-agent/internal/k8slabels"
+	"github.com/dpsoft/perf-agent/internal/nspid"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -244,6 +247,56 @@ func hasCapSysPtrace() bool {
 	return false
 }
 
+// resolveTarget translates the configured PID to its host-namespace
+// counterpart and computes the final per-sample label set by running the
+// configured enricher (default: internal/k8slabels.FromPID) and merging
+// the static labels from WithLabels on top.
+//
+// If config.PID is 0 (system-wide -a mode), no translation runs and
+// labels come solely from WithLabels and from any user-supplied enricher
+// invoked with hostPID=0.
+func (a *Agent) resolveTarget() (hostPID int, labels map[string]string, err error) {
+	hostPID = a.config.PID
+	if hostPID > 0 {
+		hostPID, err = nspid.Translate(a.config.PID)
+		if err != nil {
+			return 0, nil, fmt.Errorf("resolve target pid: %w", err)
+		}
+	}
+
+	labels = make(map[string]string, 8)
+
+	// Default enricher unless the caller explicitly disabled or replaced.
+	enricher := a.config.LabelEnricher
+	if !a.config.LabelEnricherSet {
+		enricher = func(pid int) map[string]string {
+			if pid <= 0 {
+				return nil
+			}
+			out, err := k8slabels.FromPID("/proc", pid)
+			if err != nil {
+				log.Printf("k8slabels.FromPID(%d): %v (continuing without k8s labels)", pid, err)
+				return nil
+			}
+			return out
+		}
+	}
+	if enricher != nil {
+		maps.Copy(labels, enricher(hostPID))
+	}
+	maps.Copy(labels, a.config.Labels) // WithLabels wins on key collision
+	return hostPID, labels, nil
+}
+
+// pidLogStr returns "N" when hostPID equals the user-visible PID,
+// otherwise "N (host: M)" so sidecar deployments see both.
+func (a *Agent) pidLogStr(hostPID int) string {
+	if hostPID == a.config.PID {
+		return fmt.Sprintf("%d", hostPID)
+	}
+	return fmt.Sprintf("%d (host: %d)", a.config.PID, hostPID)
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -279,6 +332,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
 
+	// Translate PID to host namespace and collect labels.
+	hostPID, labels, err := a.resolveTarget()
+	if err != nil {
+		return err
+	}
+	// hostPID replaces config.PID for downstream BPF setup;
+	// labels are passed to every profiler constructor.
+
 	// Get CPUs to monitor
 	cpus := a.config.CPUs
 	if len(cpus) == 0 {
@@ -292,7 +353,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Inject Python perf-trampoline before BPF attach so early samples have
 	// JIT symbol names. Runs only when --inject-python is set.
 	if a.pyInjector != nil {
-		pids := a.scanPythonTargets()
+		pids := a.scanPythonTargets(hostPID)
 		if err := a.pyInjector.ActivateAll(pids); err != nil {
 			return fmt.Errorf("python injection: %w", err)
 		}
@@ -304,13 +365,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		case "dwarf":
 			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeEager,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -319,18 +381,19 @@ func (a *Agent) Start(ctx context.Context) error {
 			if a.config.SystemWide {
 				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
 			} else {
-				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+				log.Printf("CPU profiler enabled (PID: %s, %d Hz, DWARF)", a.pidLogStr(hostPID), a.config.SampleRate)
 			}
 		case "auto":
 			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
 				hooks,
 				dwarfagent.ModeLazy,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -339,15 +402,16 @@ func (a *Agent) Start(ctx context.Context) error {
 			if a.config.SystemWide {
 				log.Printf("CPU profiler enabled (system-wide, %d Hz, DWARF)", a.config.SampleRate)
 			} else {
-				log.Printf("CPU profiler enabled (PID: %d, %d Hz, DWARF)", a.config.PID, a.config.SampleRate)
+				log.Printf("CPU profiler enabled (PID: %s, %d Hz, DWARF)", a.pidLogStr(hostPID), a.config.SampleRate)
 			}
 		default:
 			profiler, err := profile.NewProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
+				labels,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -356,7 +420,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			if a.config.SystemWide {
 				log.Printf("CPU profiler enabled (system-wide, %d Hz)", a.config.SampleRate)
 			} else {
-				log.Printf("CPU profiler enabled (PID: %d, %d Hz)", a.config.PID, a.config.SampleRate)
+				log.Printf("CPU profiler enabled (PID: %s, %d Hz)", a.pidLogStr(hostPID), a.config.SampleRate)
 			}
 		}
 	}
@@ -366,10 +430,11 @@ func (a *Agent) Start(ctx context.Context) error {
 		switch a.config.Unwind {
 		case "dwarf", "auto":
 			p, err := dwarfagent.NewOffCPUProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
+				labels,
 			)
 			if err != nil {
 				a.cleanup()
@@ -379,13 +444,14 @@ func (a *Agent) Start(ctx context.Context) error {
 			if a.config.SystemWide {
 				log.Println("Off-CPU profiler enabled (system-wide, DWARF)")
 			} else {
-				log.Printf("Off-CPU profiler enabled (PID: %d, DWARF)", a.config.PID)
+				log.Printf("Off-CPU profiler enabled (PID: %s, DWARF)", a.pidLogStr(hostPID))
 			}
 		default:
 			profiler, err := offcpu.NewProfiler(
-				a.config.PID,
+				hostPID,
 				a.config.SystemWide,
 				a.config.Tags,
+				labels,
 			)
 			if err != nil {
 				a.cleanup()
@@ -395,7 +461,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			if a.config.SystemWide {
 				log.Println("Off-CPU profiler enabled (system-wide)")
 			} else {
-				log.Printf("Off-CPU profiler enabled (PID: %d)", a.config.PID)
+				log.Printf("Off-CPU profiler enabled (PID: %s)", a.pidLogStr(hostPID))
 			}
 		}
 	}
@@ -403,7 +469,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start PMU monitor if enabled
 	if a.config.EnablePMU {
 		monitor, err := cpu.NewPMUMonitor(
-			a.config.PID,
+			hostPID,
 			a.config.SystemWide,
 			cpus,
 		)
@@ -415,7 +481,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		if a.config.SystemWide {
 			log.Println("PMU monitor enabled (system-wide)")
 		} else {
-			log.Printf("PMU monitor enabled (PID: %d)", a.config.PID)
+			log.Printf("PMU monitor enabled (PID: %s)", a.pidLogStr(hostPID))
 		}
 	}
 
@@ -775,12 +841,12 @@ func (a *Agent) PythonInjectStats() *python.Stats {
 }
 
 // scanPythonTargets returns the PIDs to consider for injection. For --pid
-// mode, just [cfg.PID]. For -a mode, walks /proc and returns all numeric PID
-// directories (the Manager's Detect call filters down to actual Python
-// processes).
-func (a *Agent) scanPythonTargets() []uint32 {
+// mode, just [hostPID] (the host-namespace PID that ptrace(2) requires).
+// For -a mode, walks /proc and returns all numeric PID directories (the
+// Manager's Detect call filters down to actual Python processes).
+func (a *Agent) scanPythonTargets(hostPID int) []uint32 {
 	if a.config.PID != 0 {
-		return []uint32{uint32(a.config.PID)}
+		return []uint32{uint32(hostPID)}
 	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {

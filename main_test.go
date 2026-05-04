@@ -2583,7 +2583,7 @@ func TestGPULiveHIPAMDSampleWrapperDryRunWithROCMSMIPath(t *testing.T) {
 	}
 }
 
-func TestGPULiveHIPAMDSampleWrapperRejectsRocprofv2RealSource(t *testing.T) {
+func TestGPULiveHIPAMDSampleWrapperRejectsUnsupportedRealSource(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
 		filepath.Join("scripts", "gpu-live-hip-amdsample.sh"),
@@ -2597,31 +2597,31 @@ func TestGPULiveHIPAMDSampleWrapperRejectsRocprofv2RealSource(t *testing.T) {
 		"--sample-mode",
 		"real",
 		"--real-source",
-		"rocprofv2",
+		"madeup-source",
 	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatalf("expected rocprofv2 source rejection, got success:\n%s", out)
+		t.Fatalf("expected unsupported real source rejection, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "unsupported real source: rocprofv2") {
+	if !strings.Contains(string(out), "unsupported real source: madeup-source") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
 
-func TestGPULiveHIPShimDemoRejectsRocprofv2RealSource(t *testing.T) {
+func TestGPULiveHIPShimDemoRejectsUnsupportedRealSource(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
 		filepath.Join("scripts", "gpu-live-hip-shim-demo.sh"),
 		"--dry-run",
 		"--linux-surface", "amdsample",
 		"--sample-mode", "real",
-		"--real-source", "rocprofv2",
+		"--real-source", "madeup-source",
 	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatalf("expected rocprofv2 source rejection, got success:\n%s", out)
+		t.Fatalf("expected unsupported real source rejection, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "unsupported real source: rocprofv2") {
+	if !strings.Contains(string(out), "unsupported real source: madeup-source") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
@@ -4183,33 +4183,19 @@ func TestAMDSampleCollectorBinaryRejectsUnsupportedRealSource(t *testing.T) {
 	}
 }
 
-func TestAMDSampleCollectorBinaryRejectsRocprofv2RealSource(t *testing.T) {
-	tmpDir := t.TempDir()
-	binaryPath := buildAMDSampleCollector(t, tmpDir)
-
-	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected rocprofv2 source rejection, got success:\n%s", out)
-	}
-	if !strings.Contains(string(out), "unsupported amd sample real source") {
-		t.Fatalf("unexpected output:\n%s", out)
-	}
-}
-
-func TestGPUOfflineDemoScriptRejectsLegacyRocprofv2RichMode(t *testing.T) {
+func TestGPUOfflineDemoScriptRejectsUnknownMode(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
 		filepath.Join("scripts", "gpu-offline-demo.sh"),
 		"--dry-run",
-		"hip-rocprofv2-rich",
-		"/tmp/gpu-rocprofv2-rich-demo",
+		"hip-madeup-rich",
+		"/tmp/gpu-madeup-rich-demo",
 	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected unsupported mode failure, got success:\n%s", out)
 	}
-	if !strings.Contains(string(out), "Unknown mode: hip-rocprofv2-rich") {
+	if !strings.Contains(string(out), "Unknown mode: hip-madeup-rich") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }

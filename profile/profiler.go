@@ -96,7 +96,13 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, sampleRate)
+	evSpec := perfevent.EventSpec{
+		Type:         perfevent.PerfTypeSoftware,
+		Config:       perfevent.PerfCountSWCPUClock,
+		SamplePeriod: uint64(sampleRate),
+		Frequency:    true,
+	}
+	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, evSpec)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err

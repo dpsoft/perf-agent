@@ -74,7 +74,13 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 		return nil, err
 	}
 
-	perfSet, err := perfevent.OpenAll(objs.Program(), cpus, sampleRate, perfevent.WithDeferredEnable())
+	spec := perfevent.EventSpec{
+		Type:         perfevent.PerfTypeSoftware,
+		Config:       perfevent.PerfCountSWCPUClock,
+		SamplePeriod: uint64(sampleRate),
+		Frequency:    true,
+	}
+	perfSet, err := perfevent.OpenAll(objs.Program(), cpus, spec, perfevent.WithDeferredEnable())
 	if err != nil {
 		_ = sess.close()
 		return nil, err

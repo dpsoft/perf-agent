@@ -77,7 +77,7 @@ func WithDeferredEnable() Option { return func(c *config) { c.deferEnable = true
 //
 // On any failure mid-loop, every fd and link opened so far is released
 // before returning. Caller never has to clean up after a non-nil error.
-func OpenAll(prog *ebpf.Program, cpus []uint, sampleRate int, opts ...Option) (*Set, error) {
+func OpenAll(prog *ebpf.Program, cpus []uint, spec EventSpec, opts ...Option) (*Set, error) {
 	cfg := config{}
 	for _, o := range opts {
 		o(&cfg)
@@ -88,10 +88,10 @@ func OpenAll(prog *ebpf.Program, cpus []uint, sampleRate int, opts ...Option) (*
 		bits |= unix.PerfBitDisabled
 	}
 	attr := &unix.PerfEventAttr{
-		Type:   unix.PERF_TYPE_SOFTWARE,
-		Config: unix.PERF_COUNT_SW_CPU_CLOCK,
+		Type:   spec.Type,
+		Config: spec.Config,
 		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Sample: uint64(sampleRate),
+		Sample: spec.SamplePeriod,
 		Bits:   bits,
 	}
 

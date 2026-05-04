@@ -518,21 +518,24 @@ func TestAgentHostReplayPlusGPUEventReplayMode(t *testing.T) {
 		t.Fatalf("WriteFile host: %v", err)
 	}
 
-	gpuFixture := `[
-  {
-    "kind": "event",
-    "event": {
-      "backend": "linuxdrm",
-      "kind": "submit",
-      "name": "amdgpu-cs",
-      "time_ns": 130,
-      "duration_ns": 13,
-      "pid": 4242,
-      "tid": 4243,
-      "source": "replay"
+	gpuFixture := `{
+  "version": 1,
+  "events": [
+    {
+      "kind": "event",
+      "event": {
+        "backend": "linuxdrm",
+        "kind": "submit",
+        "name": "amdgpu-cs",
+        "time_ns": 130,
+        "duration_ns": 13,
+        "pid": 4242,
+        "tid": 4243,
+        "source": "replay"
+      }
     }
-  }
-]`
+  ]
+}`
 	if err := os.WriteFile(gpuPath, []byte(gpuFixture), 0o644); err != nil {
 		t.Fatalf("WriteFile gpu: %v", err)
 	}

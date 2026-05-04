@@ -8,7 +8,7 @@ import (
 func TestEncodeComm(t *testing.T) {
 	var buf bytes.Buffer
 	// pid=42, tid=42, comm="ls", no sample_id_all suffix
-	encodeComm(&buf, commRecord{pid: 42, tid: 42, comm: "ls"})
+	encodeComm(&buf, CommRecord{Pid: 42, Tid: 42, Comm: "ls"})
 
 	got := buf.Bytes()
 	// Header: type=PERF_RECORD_COMM=3 (u32), misc=0 (u16), size = 8 + 4 + 4 + 8 = 24 (u16)
@@ -41,13 +41,13 @@ func TestEncodeFinishedRound(t *testing.T) {
 
 func TestEncodeMmap2_NoBuildID(t *testing.T) {
 	var buf bytes.Buffer
-	encodeMmap2(&buf, mmap2Record{
-		pid:      1234,
-		tid:      1234,
-		addr:     0x400000,
-		len:      0x1000,
-		pgoff:    0,
-		filename: "/usr/bin/ls",
+	encodeMmap2(&buf, Mmap2Record{
+		Pid:      1234,
+		Tid:      1234,
+		Addr:     0x400000,
+		Len:      0x1000,
+		Pgoff:    0,
+		Filename: "/usr/bin/ls",
 		// no build-id → use the maj/min/ino union
 	})
 
@@ -72,16 +72,16 @@ func TestEncodeMmap2_NoBuildID(t *testing.T) {
 func TestEncodeMmap2_WithBuildID(t *testing.T) {
 	bid := [20]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
 	var buf bytes.Buffer
-	encodeMmap2(&buf, mmap2Record{
-		pid:         1234,
-		tid:         1234,
-		addr:        0x7f0000400000,
-		len:         0x1000,
-		pgoff:       0,
-		hasBuildID:  true,
-		buildIDSize: 20,
-		buildID:     bid,
-		filename:    "/lib/x86_64-linux-gnu/libc.so.6",
+	encodeMmap2(&buf, Mmap2Record{
+		Pid:         1234,
+		Tid:         1234,
+		Addr:        0x7f0000400000,
+		Len:         0x1000,
+		Pgoff:       0,
+		HasBuildID:  true,
+		BuildIDSize: 20,
+		BuildID:     bid,
+		Filename:    "/lib/x86_64-linux-gnu/libc.so.6",
 	})
 
 	got := buf.Bytes()
@@ -101,14 +101,14 @@ func TestEncodeMmap2_WithBuildID(t *testing.T) {
 
 func TestEncodeSample(t *testing.T) {
 	var buf bytes.Buffer
-	encodeSample(&buf, sampleRecord{
-		ip:        0x401000,
-		pid:       1234,
-		tid:       1234,
-		time:      1000000000, // 1 second in ns
-		cpu:       3,
-		period:    1,
-		callchain: []uint64{0x401000, 0x402000, 0x403000},
+	encodeSample(&buf, SampleRecord{
+		IP:        0x401000,
+		Pid:       1234,
+		Tid:       1234,
+		Time:      1000000000, // 1 second in ns
+		Cpu:       3,
+		Period:    1,
+		Callchain: []uint64{0x401000, 0x402000, 0x403000},
 	})
 
 	got := buf.Bytes()

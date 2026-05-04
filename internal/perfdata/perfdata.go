@@ -37,7 +37,7 @@ type Writer struct {
 	meta    MetaInfo
 
 	// data accumulated for feature-section emission at Close
-	buildIDs []buildIDEntry
+	buildIDs []BuildIDEntry
 }
 
 // Open creates a new perf.data file at path and writes the file header,
@@ -85,7 +85,7 @@ func Open(path string, spec EventSpec, meta MetaInfo) (*Writer, error) {
 }
 
 // AddComm appends a PERF_RECORD_COMM record.
-func (w *Writer) AddComm(r commRecord) {
+func (w *Writer) AddComm(r CommRecord) {
 	var buf bytes.Buffer
 	encodeComm(&buf, r)
 	n, _ := w.bw.Write(buf.Bytes())
@@ -93,7 +93,7 @@ func (w *Writer) AddComm(r commRecord) {
 }
 
 // AddMmap2 appends a PERF_RECORD_MMAP2 record.
-func (w *Writer) AddMmap2(r mmap2Record) {
+func (w *Writer) AddMmap2(r Mmap2Record) {
 	var buf bytes.Buffer
 	encodeMmap2(&buf, r)
 	n, _ := w.bw.Write(buf.Bytes())
@@ -101,7 +101,7 @@ func (w *Writer) AddMmap2(r mmap2Record) {
 }
 
 // AddSample appends a PERF_RECORD_SAMPLE record.
-func (w *Writer) AddSample(r sampleRecord) {
+func (w *Writer) AddSample(r SampleRecord) {
 	var buf bytes.Buffer
 	encodeSample(&buf, r)
 	n, _ := w.bw.Write(buf.Bytes())
@@ -118,7 +118,7 @@ func (w *Writer) AddFinishedRound() {
 
 // AddBuildID records a binary's build-id for emission in the
 // HEADER_BUILD_ID feature section at Close.
-func (w *Writer) AddBuildID(e buildIDEntry) {
+func (w *Writer) AddBuildID(e BuildIDEntry) {
 	w.buildIDs = append(w.buildIDs, e)
 }
 

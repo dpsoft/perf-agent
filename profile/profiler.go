@@ -12,6 +12,7 @@ import (
 	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
+	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
@@ -26,6 +27,7 @@ type Profiler struct {
 	tags       []string
 	sampleRate int
 	labels     map[string]string
+	perfData   *perfdata.Writer // optional, nil when --perf-data-output not set
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -66,7 +68,7 @@ func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 }
 
 // NewProfiler creates a new CPU profiler with the specified sample rate in Hz
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -126,6 +128,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		tags:       tags,
 		sampleRate: sampleRate,
 		labels:     labels,
+		perfData:   perfData,
 	}, nil
 }
 
@@ -225,6 +228,16 @@ func (pr *Profiler) Collect(w io.Writer) error {
 
 		sample := pr.createSample(sb, value, int(samplePid))
 		builders.AddSample(&sample)
+
+		if pr.perfData != nil && len(ips) > 0 {
+			pr.perfData.AddSample(perfdata.SampleRecord{
+				IP:        ips[0],
+				Pid:       samplePid,
+				Tid:       samplePid,
+				Period:    value,
+				Callchain: ips,
+			})
+		}
 	}
 
 	// Write profile directly to the provided writer

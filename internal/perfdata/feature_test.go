@@ -7,11 +7,11 @@ import (
 
 func TestEncodeBuildIDFeature(t *testing.T) {
 	var buf bytes.Buffer
-	encodeBuildIDFeature(&buf, []buildIDEntry{
+	encodeBuildIDFeature(&buf, []BuildIDEntry{
 		{
-			pid:      -1,
-			buildID:  [20]byte{0xab, 0xcd, 0xef},
-			filename: "/usr/bin/ls",
+			Pid:      -1,
+			BuildID:  [20]byte{0xab, 0xcd, 0xef},
+			Filename: "/usr/bin/ls",
 		},
 	})
 	got := buf.Bytes()

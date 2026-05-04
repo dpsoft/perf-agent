@@ -29,21 +29,21 @@ func TestWriter_RoundTrip(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	w.AddComm(commRecord{pid: 1234, tid: 1234, comm: "myapp"})
-	w.AddMmap2(mmap2Record{
-		pid: 1234, tid: 1234,
-		addr: 0x400000, len: 0x1000, pgoff: 0,
-		filename: "/usr/bin/myapp",
+	w.AddComm(CommRecord{Pid: 1234, Tid: 1234, Comm: "myapp"})
+	w.AddMmap2(Mmap2Record{
+		Pid: 1234, Tid: 1234,
+		Addr: 0x400000, Len: 0x1000, Pgoff: 0,
+		Filename: "/usr/bin/myapp",
 	})
-	w.AddSample(sampleRecord{
-		ip: 0x400500, pid: 1234, tid: 1234,
-		time: 1000, cpu: 0, period: 1,
-		callchain: []uint64{0x400500},
+	w.AddSample(SampleRecord{
+		IP: 0x400500, Pid: 1234, Tid: 1234,
+		Time: 1000, Cpu: 0, Period: 1,
+		Callchain: []uint64{0x400500},
 	})
-	w.AddBuildID(buildIDEntry{
-		pid:      -1,
-		buildID:  [20]byte{0xde, 0xad, 0xbe, 0xef},
-		filename: "/usr/bin/myapp",
+	w.AddBuildID(BuildIDEntry{
+		Pid:      -1,
+		BuildID:  [20]byte{0xde, 0xad, 0xbe, 0xef},
+		Filename: "/usr/bin/myapp",
 	})
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

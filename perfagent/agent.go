@@ -315,6 +315,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				a.config.SampleRate,
 				labels,
+				nil, // perfData wired in Task 12
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)

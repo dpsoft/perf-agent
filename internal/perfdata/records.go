@@ -16,11 +16,11 @@ const (
 // 8 = u32 type + u16 misc + u16 size.
 const recordHeaderSize = 8
 
-// commRecord is the in-memory image of a PERF_RECORD_COMM payload.
-type commRecord struct {
-	pid  uint32
-	tid  uint32
-	comm string
+// CommRecord is the in-memory image of a PERF_RECORD_COMM payload.
+type CommRecord struct {
+	Pid  uint32
+	Tid  uint32
+	Comm string
 }
 
 // encodeComm writes a PERF_RECORD_COMM record (type 3). Layout:
@@ -29,15 +29,15 @@ type commRecord struct {
 //	u32 pid;
 //	u32 tid;
 //	char comm[];                       // NUL-terminated, 8-byte padded
-func encodeComm(w io.Writer, r commRecord) {
-	commBytes := align8(len(r.comm) + 1) // NUL + padding
+func encodeComm(w io.Writer, r CommRecord) {
+	commBytes := align8(len(r.Comm) + 1) // NUL + padding
 	size := recordHeaderSize + 4 + 4 + commBytes
 	writeUint32LE(w, recordComm)
 	writeUint16LE(w, 0) // misc
 	writeUint16LE(w, uint16(size))
-	writeUint32LE(w, r.pid)
-	writeUint32LE(w, r.tid)
-	writeCStringPadded8(w, r.comm)
+	writeUint32LE(w, r.Pid)
+	writeUint32LE(w, r.Tid)
+	writeCStringPadded8(w, r.Comm)
 }
 
 // encodeFinishedRound writes a PERF_RECORD_FINISHED_ROUND record (type 12).
@@ -52,26 +52,26 @@ func encodeFinishedRound(w io.Writer) {
 // uses the build-id flavour of its union (post-5.12 kernels).
 const miscMmapBuildID = 1 << 14
 
-// mmap2Record is the in-memory image of a PERF_RECORD_MMAP2 payload.
-// Set hasBuildID when emitting the build-id flavour of the union;
+// Mmap2Record is the in-memory image of a PERF_RECORD_MMAP2 payload.
+// Set HasBuildID when emitting the build-id flavour of the union;
 // otherwise the maj/min/ino path is used (and all four fields stay zero).
-type mmap2Record struct {
-	pid, tid uint32
-	addr     uint64
-	len      uint64
-	pgoff    uint64
+type Mmap2Record struct {
+	Pid, Tid uint32
+	Addr     uint64
+	Len      uint64
+	Pgoff    uint64
 
 	// union: build-id flavour
-	hasBuildID  bool
-	buildIDSize uint8
-	buildID     [20]byte // padded to 20 bytes; SHA-1 build-ids are exactly that
+	HasBuildID  bool
+	BuildIDSize uint8
+	BuildID     [20]byte // padded to 20 bytes; SHA-1 build-ids are exactly that
 
 	// (maj, min, ino, inoGen would go here for the file-id flavour;
 	// we always emit zeros — consumers fall back to filename matching.)
 
-	prot     uint32
-	flags    uint32
-	filename string
+	Prot     uint32
+	Flags    uint32
+	Filename string
 }
 
 // encodeMmap2 writes a PERF_RECORD_MMAP2 record (type 10). The record carries
@@ -89,12 +89,12 @@ type mmap2Record struct {
 //	union { ino flavour | build-id flavour } // 24
 //	u32 prot, u32 flags;              // 8
 //	char filename[];                  // NUL-terminated, 8-byte padded
-func encodeMmap2(w io.Writer, r mmap2Record) {
-	filenameBytes := align8(len(r.filename) + 1)
+func encodeMmap2(w io.Writer, r Mmap2Record) {
+	filenameBytes := align8(len(r.Filename) + 1)
 	bodySize := 4 + 4 + 8 + 8 + 8 + 24 + 4 + 4 + filenameBytes
 	size := recordHeaderSize + bodySize
 	misc := uint16(0)
-	if r.hasBuildID {
+	if r.HasBuildID {
 		misc |= miscMmapBuildID
 	}
 
@@ -102,40 +102,40 @@ func encodeMmap2(w io.Writer, r mmap2Record) {
 	writeUint16LE(w, misc)
 	writeUint16LE(w, uint16(size))
 
-	writeUint32LE(w, r.pid)
-	writeUint32LE(w, r.tid)
-	writeUint64LE(w, r.addr)
-	writeUint64LE(w, r.len)
-	writeUint64LE(w, r.pgoff)
+	writeUint32LE(w, r.Pid)
+	writeUint32LE(w, r.Tid)
+	writeUint64LE(w, r.Addr)
+	writeUint64LE(w, r.Len)
+	writeUint64LE(w, r.Pgoff)
 
 	// union (24 bytes)
-	if r.hasBuildID {
-		_, _ = w.Write([]byte{r.buildIDSize, 0, 0, 0}) // u8 + 3 reserved
-		_, _ = w.Write(r.buildID[:])                   // 20 bytes
+	if r.HasBuildID {
+		_, _ = w.Write([]byte{r.BuildIDSize, 0, 0, 0}) // u8 + 3 reserved
+		_, _ = w.Write(r.BuildID[:])                   // 20 bytes
 	} else {
 		// maj=0, min=0, ino=0, ino_generation=0 — 24 bytes of zeros
 		_, _ = w.Write(make([]byte, 24))
 	}
 
-	writeUint32LE(w, r.prot)
-	writeUint32LE(w, r.flags)
-	writeCStringPadded8(w, r.filename)
+	writeUint32LE(w, r.Prot)
+	writeUint32LE(w, r.Flags)
+	writeCStringPadded8(w, r.Filename)
 }
 
-// sampleRecord is the in-memory image of a PERF_RECORD_SAMPLE payload, for
+// SampleRecord is the in-memory image of a PERF_RECORD_SAMPLE payload, for
 // the fixed sample_type we emit:
 //
 //	IP | TID | TIME | CPU | PERIOD | CALLCHAIN
 //
 // (No ADDR, ID, STREAM_ID, READ, RAW, BRANCH_STACK, REGS_USER, STACK_USER,
 // WEIGHT, DATA_SRC, TRANSACTION.)
-type sampleRecord struct {
-	ip        uint64   // PERF_SAMPLE_IP
-	pid, tid  uint32   // PERF_SAMPLE_TID
-	time      uint64   // PERF_SAMPLE_TIME (ns since clock origin)
-	cpu       uint32   // PERF_SAMPLE_CPU (low 32 bits)
-	period    uint64   // PERF_SAMPLE_PERIOD
-	callchain []uint64 // PERF_SAMPLE_CALLCHAIN (leaf first, ips array)
+type SampleRecord struct {
+	IP        uint64   // PERF_SAMPLE_IP
+	Pid, Tid  uint32   // PERF_SAMPLE_TID
+	Time      uint64   // PERF_SAMPLE_TIME (ns since clock origin)
+	Cpu       uint32   // PERF_SAMPLE_CPU (low 32 bits)
+	Period    uint64   // PERF_SAMPLE_PERIOD
+	Callchain []uint64 // PERF_SAMPLE_CALLCHAIN (leaf first, ips array)
 }
 
 // encodeSample writes a PERF_RECORD_SAMPLE record (type 9). Field order
@@ -147,22 +147,22 @@ type sampleRecord struct {
 //	{ u32 cpu, res; }                      // PERF_SAMPLE_CPU
 //	{ u64 period; }                        // PERF_SAMPLE_PERIOD
 //	{ u64 nr; u64 ips[nr]; }               // PERF_SAMPLE_CALLCHAIN
-func encodeSample(w io.Writer, r sampleRecord) {
-	bodySize := 8 + 8 + 8 + 8 + 8 + 8 + 8*len(r.callchain)
+func encodeSample(w io.Writer, r SampleRecord) {
+	bodySize := 8 + 8 + 8 + 8 + 8 + 8 + 8*len(r.Callchain)
 	size := recordHeaderSize + bodySize
 	writeUint32LE(w, recordSample)
 	writeUint16LE(w, 0) // misc — could carry CPUMODE_USER etc. but blazesym handles that downstream
 	writeUint16LE(w, uint16(size))
 
-	writeUint64LE(w, r.ip)
-	writeUint32LE(w, r.pid)
-	writeUint32LE(w, r.tid)
-	writeUint64LE(w, r.time)
-	writeUint32LE(w, r.cpu)
+	writeUint64LE(w, r.IP)
+	writeUint32LE(w, r.Pid)
+	writeUint32LE(w, r.Tid)
+	writeUint64LE(w, r.Time)
+	writeUint32LE(w, r.Cpu)
 	writeUint32LE(w, 0) // res
-	writeUint64LE(w, r.period)
-	writeUint64LE(w, uint64(len(r.callchain)))
-	for _, ip := range r.callchain {
+	writeUint64LE(w, r.Period)
+	writeUint64LE(w, uint64(len(r.Callchain)))
+	for _, ip := range r.Callchain {
 		writeUint64LE(w, ip)
 	}
 }

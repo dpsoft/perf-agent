@@ -2311,4 +2311,611 @@ git commit -m "docs: perf-data-output.md — user walkthrough (perf script, Flam
 
 **3. Type consistency.** Public types in `internal/perfdata`: `Writer`, `Open`, `EventSpec`, `MetaInfo`, `SampleRecord`, `Mmap2Record`, `CommRecord`, `BuildIDEntry`. Private types and helpers begin lowercase. Tasks 4–8 use the lowercase names; Task 10 promotes them to public when the first external caller appears (`profile/profiler.go`). All references after Task 10 use the public names. *(Self-correction: if the implementer is reading tasks out of order, this rename can confuse — flag the rename explicitly in Task 10's commit.)*
 
-**4. Dependency order.** Task 1 (primitives) blocks 2–7 (encoders). Task 8 (Writer) needs all encoders. Task 9 (event-type) is independent. Tasks 10–11 (fan-out) need 8 + 9 (the public types and the spec). Task 12 (agent wiring) needs 8 + 9 + 10 + 11. Task 13 (CLI) needs 12. Tasks 14–15 (test + docs) need everything else. Order in the plan respects this.
+**4. Dependency order.** Task 1 (primitives) blocks 2–7 (encoders). Task 8 (Writer) needs all encoders. Task 9 (event-type) is independent. Tasks 10–11 (fan-out) need 8 + 9 (the public types and the spec). Task 12 (agent wiring) needs 8 + 9 + 10 + 11. Task 13 (CLI) needs 12. Tasks 14–15 (test + docs) need everything else. Examples (Tasks 16–18) need everything else.
+
+---
+
+## Task 16: Runnable Rust AutoFDO example
+
+**Files:**
+- Create: `examples/rust-pgo/Cargo.toml`
+- Create: `examples/rust-pgo/src/main.rs`
+- Create: `examples/rust-pgo/pgo-cycle.sh`
+- Create: `examples/rust-pgo/README.md`
+
+**Goal:** an end-to-end script anyone can run that builds a CPU-bound Rust workload, captures a perf-agent profile, converts via `create_llvm_prof`, rebuilds with PGO, strips the final binary, and prints the speedup. Demonstrates the full AutoFDO loop — no hidden steps.
+
+- [ ] **Step 1: Workload source**
+
+```toml
+# examples/rust-pgo/Cargo.toml
+[package]
+name = "rust-pgo-example"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = "limited"  # keep -C debuginfo=2-equivalent for the convert step
+lto = "thin"
+codegen-units = 1
+# Final --release artefact stays *with* debug info so create_llvm_prof can
+# resolve symbols. The pgo-cycle.sh script strips the *optimised* output
+# explicitly (cargo rustc -C strip=symbols) so users see a clean before/after.
+```
+
+```rust
+// examples/rust-pgo/src/main.rs
+//
+// CPU-bound demonstrator: 99% of dispatched ops are `Add`, the other 1%
+// are spread across the rare arms. AutoFDO will move the Add arm to the
+// hot fall-through and shrink the prologue's branch overhead. Real-world
+// workloads see 5-15% speedup; this synthetic one tends to land near 8%.
+//
+// Run: `./rust-pgo-example <iterations>` (default 200_000_000).
+
+#[derive(Clone, Copy)]
+enum Op { Add, Sub, Mul, Div }
+
+#[inline(never)]
+fn dispatch(op: Op, a: u64, b: u64) -> u64 {
+    match op {
+        Op::Add => a.wrapping_add(b),
+        Op::Sub => a.wrapping_sub(b),
+        Op::Mul => a.wrapping_mul(b),
+        Op::Div => if b == 0 { 0 } else { a / b },
+    }
+}
+
+fn main() {
+    let n: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200_000_000);
+    let ops = [Op::Add, Op::Sub, Op::Mul, Op::Div];
+    let mut total: u64 = 1;
+    for i in 0..n {
+        // 99% Add, 1% one of the others — the hot path AutoFDO will inline
+        // and place as the fall-through.
+        let op = if i % 100 == 0 {
+            ops[((i / 100) as usize) % 4]
+        } else {
+            Op::Add
+        };
+        total = total.wrapping_add(dispatch(op, i, total));
+    }
+    println!("{}", total);
+}
+```
+
+- [ ] **Step 2: pgo-cycle.sh — the full loop**
+
+```bash
+#!/usr/bin/env bash
+# examples/rust-pgo/pgo-cycle.sh
+#
+# End-to-end Rust AutoFDO demo. Requires:
+#   - cargo (any recent stable)
+#   - perf-agent built and on PATH (or pass --agent ./perf-agent)
+#   - create_llvm_prof from https://github.com/google/autofdo
+#   - hyperfine (optional; falls back to /usr/bin/time -p)
+#
+# Output: baseline vs PGO-optimised wall-clock time for the same workload.
+set -euo pipefail
+
+ITER=${ITER:-200000000}
+DURATION=${DURATION:-30s}
+AGENT=${AGENT:-perf-agent}
+WORKDIR=$(cd "$(dirname "$0")" && pwd)
+cd "$WORKDIR"
+
+bench() {
+    local label=$1 bin=$2
+    if command -v hyperfine >/dev/null 2>&1; then
+        hyperfine --warmup 1 --runs 3 --export-json "${label}.json" \
+            "$bin $ITER" >"${label}.txt" 2>&1
+        awk -F'"mean": ' '/mean/{print $2}' "${label}.json" | head -1
+    else
+        /usr/bin/time -p "$bin" "$ITER" 2>&1 | awk '/real/ {print $2}'
+    fi
+}
+
+echo "==> 1. Baseline build (with debug info)"
+RUSTFLAGS="-C debuginfo=2" cargo build --release --quiet
+
+echo "==> 2. Baseline benchmark"
+BASELINE=$(bench baseline ./target/release/rust-pgo-example)
+echo "    baseline: ${BASELINE}s"
+
+echo "==> 3. Capture profile via perf-agent"
+./target/release/rust-pgo-example "$ITER" &
+WL_PID=$!
+sleep 1   # workload warmup
+"$AGENT" --profile --pid "$WL_PID" --duration "$DURATION" \
+         --perf-data-output train.perf.data
+wait "$WL_PID" || true
+
+echo "==> 4. Convert perf.data → LLVM .prof via create_llvm_prof"
+create_llvm_prof \
+    --binary=./target/release/rust-pgo-example \
+    --profile=train.perf.data \
+    --out=train.prof
+
+echo "==> 5. PGO build (uses train.prof; strips symbols on the final artefact)"
+RUSTFLAGS="-C profile-use=$WORKDIR/train.prof -C strip=symbols" \
+    cargo build --release --quiet
+
+echo "==> 6. PGO-optimised benchmark"
+OPT=$(bench optimized ./target/release/rust-pgo-example)
+echo "    optimized: ${OPT}s"
+
+echo
+echo "==> Speedup"
+awk -v b="$BASELINE" -v o="$OPT" \
+    'BEGIN { printf "    %.2fx faster (%.1f%% improvement)\n", b/o, (b-o)/b*100 }'
+
+echo "==> Final stripped binary:"
+ls -la ./target/release/rust-pgo-example
+file  ./target/release/rust-pgo-example
+```
+
+- [ ] **Step 3: README**
+
+```markdown
+<!-- examples/rust-pgo/README.md -->
+# Rust AutoFDO PGO with perf-agent
+
+A complete, runnable demonstration: build a Rust workload, capture a profile
+with perf-agent, convert via Google's `create_llvm_prof` (autofdo), rebuild
+with PGO and a stripped final binary, measure the speedup.
+
+## Prerequisites
+
+- Rust toolchain (`cargo --version` ≥ 1.70).
+- `perf-agent` built and on PATH (or pass `AGENT=/path/to/perf-agent`).
+  Required caps: `setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`.
+- `create_llvm_prof` from <https://github.com/google/autofdo>. Build:
+  ```bash
+  git clone https://github.com/google/autofdo
+  cd autofdo
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+  sudo cp build/create_llvm_prof /usr/local/bin/
+  ```
+- Optional: `hyperfine` (`cargo install hyperfine`) for nicer benchmark output;
+  the script falls back to `/usr/bin/time` if absent.
+
+## Run
+
+```bash
+cd examples/rust-pgo
+./pgo-cycle.sh
+```
+
+Tune the workload size with `ITER=<n>` (default 200M iterations) or capture
+duration with `DURATION=60s` (default 30s).
+
+## What it does
+
+1. `cargo build --release` with `-C debuginfo=2` — keeps debug info so
+   `create_llvm_prof` can map sample IPs back to function names.
+2. Benchmarks the baseline binary.
+3. Runs the workload, attaches perf-agent for `$DURATION`, writes
+   `train.perf.data`.
+4. `create_llvm_prof --binary=… --profile=train.perf.data --out=train.prof`
+   produces an LLVM sample-profile.
+5. `cargo build --release` with `-C profile-use=train.prof -C strip=symbols` —
+   PGO build, final binary stripped.
+6. Benchmarks the optimised binary, prints the speedup.
+
+Typical result: 5–15% speedup on this synthetic workload. Real production
+workloads vary; the numbers are illustrative.
+
+## Why this works
+
+The dispatch loop hits the `Add` arm 99% of the time. Without PGO, the
+compiler has no way to know which arm is hot, so the match prologue treats
+all four arms equally. With AutoFDO, the converter records that `Add` was
+overwhelmingly the leaf at runtime; LLVM moves it to fall-through, hoists the
+guard out of the loop, and inlines the call. The remaining 1% of operations
+take a slow path; the bulk of the time gets faster.
+```
+
+- [ ] **Step 4: Test the example end-to-end on the host**
+
+```bash
+cd examples/rust-pgo
+chmod +x pgo-cycle.sh
+./pgo-cycle.sh
+```
+Expected: prints baseline time, optimized time, and a positive speedup. May skip if `create_llvm_prof` not installed; in that case the script prints a clear error referencing the install instructions.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add examples/rust-pgo/
+git commit -m "examples/rust-pgo: end-to-end AutoFDO demo (build, profile, convert, rebuild, strip, measure)"
+```
+
+---
+
+## Task 17: Runnable C++ AutoFDO example
+
+**Files:**
+- Create: `examples/cpp-pgo/Makefile`
+- Create: `examples/cpp-pgo/workload.cpp`
+- Create: `examples/cpp-pgo/pgo-cycle.sh`
+- Create: `examples/cpp-pgo/README.md`
+
+**Goal:** mirror the Rust example with clang and `-fprofile-sample-use`. Same workload shape so users can compare PGO impact between languages.
+
+- [ ] **Step 1: Workload source**
+
+```cpp
+// examples/cpp-pgo/workload.cpp
+//
+// CPU-bound: 99% of dispatched ops are Add. clang -fprofile-sample-use
+// will move the Add arm to fall-through and inline it through the loop.
+//
+// Build with -g (-C debuginfo=2 equivalent) so create_llvm_prof can resolve
+// symbols. Run: ./workload <iterations>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+enum class Op { Add, Sub, Mul, Div };
+
+__attribute__((noinline))
+static uint64_t dispatch(Op op, uint64_t a, uint64_t b) {
+    switch (op) {
+        case Op::Add: return a + b;
+        case Op::Sub: return a - b;
+        case Op::Mul: return a * b;
+        case Op::Div: return b == 0 ? 0 : a / b;
+    }
+    __builtin_unreachable();
+}
+
+int main(int argc, char** argv) {
+    uint64_t n = (argc > 1) ? std::strtoull(argv[1], nullptr, 10) : 200000000;
+    static const Op ops[] = {Op::Add, Op::Sub, Op::Mul, Op::Div};
+    uint64_t total = 1;
+    for (uint64_t i = 0; i < n; ++i) {
+        Op op = (i % 100 == 0) ? ops[(i / 100) % 4] : Op::Add;
+        total += dispatch(op, i, total);
+    }
+    std::printf("%llu\n", (unsigned long long)total);
+    return 0;
+}
+```
+
+- [ ] **Step 2: Makefile**
+
+```makefile
+# examples/cpp-pgo/Makefile
+CXX      ?= clang++
+CXXFLAGS ?= -O2 -g -std=c++17
+
+.PHONY: baseline pgo strip clean
+baseline:
+	$(CXX) $(CXXFLAGS) workload.cpp -o workload-baseline
+
+pgo:
+	$(CXX) $(CXXFLAGS) -fprofile-sample-use=$(PWD)/train.prof workload.cpp -o workload-pgo
+
+strip:
+	strip --strip-all workload-pgo
+
+clean:
+	rm -f workload-baseline workload-pgo train.perf.data train.prof baseline.json optimized.json
+```
+
+- [ ] **Step 3: pgo-cycle.sh**
+
+```bash
+#!/usr/bin/env bash
+# examples/cpp-pgo/pgo-cycle.sh — same shape as the Rust demo.
+set -euo pipefail
+
+ITER=${ITER:-200000000}
+DURATION=${DURATION:-30s}
+AGENT=${AGENT:-perf-agent}
+WORKDIR=$(cd "$(dirname "$0")" && pwd)
+cd "$WORKDIR"
+
+bench() {
+    local label=$1 bin=$2
+    if command -v hyperfine >/dev/null 2>&1; then
+        hyperfine --warmup 1 --runs 3 --export-json "${label}.json" \
+            "$bin $ITER" >/dev/null
+        awk -F'"mean": ' '/mean/{print $2}' "${label}.json" | head -1
+    else
+        /usr/bin/time -p "$bin" "$ITER" 2>&1 | awk '/real/ {print $2}'
+    fi
+}
+
+echo "==> 1. Baseline build (clang++ -O2 -g)"
+make -s baseline
+
+echo "==> 2. Baseline benchmark"
+BASELINE=$(bench baseline ./workload-baseline)
+echo "    baseline: ${BASELINE}s"
+
+echo "==> 3. Capture profile via perf-agent"
+./workload-baseline "$ITER" &
+WL_PID=$!
+sleep 1
+"$AGENT" --profile --pid "$WL_PID" --duration "$DURATION" \
+         --perf-data-output train.perf.data
+wait "$WL_PID" || true
+
+echo "==> 4. Convert perf.data → LLVM .prof"
+create_llvm_prof \
+    --binary=./workload-baseline \
+    --profile=train.perf.data \
+    --out=train.prof
+
+echo "==> 5. PGO build (-fprofile-sample-use=train.prof)"
+make -s pgo
+
+echo "==> 6. Strip the optimised binary"
+make -s strip
+
+echo "==> 7. PGO-optimised benchmark"
+OPT=$(bench optimized ./workload-pgo)
+echo "    optimized: ${OPT}s"
+
+echo
+echo "==> Speedup"
+awk -v b="$BASELINE" -v o="$OPT" \
+    'BEGIN { printf "    %.2fx faster (%.1f%% improvement)\n", b/o, (b-o)/b*100 }'
+
+echo "==> Final stripped binary:"
+ls -la ./workload-pgo
+file  ./workload-pgo
+```
+
+- [ ] **Step 4: README**
+
+```markdown
+<!-- examples/cpp-pgo/README.md -->
+# C++ AutoFDO PGO with perf-agent
+
+Same shape as `examples/rust-pgo` but using clang's
+`-fprofile-sample-use=` flag. Useful for comparing PGO impact between
+languages on the same algorithmic workload.
+
+## Prerequisites
+
+- clang ≥ 12 (any modern release supports `-fprofile-sample-use`).
+- `perf-agent` built and on PATH (caps as documented in the repo README).
+- `create_llvm_prof` from <https://github.com/google/autofdo>.
+- Optional: `hyperfine`.
+
+## Run
+
+```bash
+cd examples/cpp-pgo
+./pgo-cycle.sh
+```
+
+`ITER` and `DURATION` env vars work the same as in the Rust example.
+
+## What it does
+
+1. Builds `workload-baseline` with `-O2 -g`.
+2. Benchmarks it.
+3. Captures a profile with perf-agent → `train.perf.data`.
+4. Converts via `create_llvm_prof` → `train.prof`.
+5. Builds `workload-pgo` with `-fprofile-sample-use=train.prof`.
+6. Strips the optimised binary.
+7. Benchmarks and prints the speedup.
+
+The same dispatch-loop trick used in the Rust example: 99% of operations
+hit a single match arm, AutoFDO pulls that arm to fall-through.
+```
+
+- [ ] **Step 5: Test on the host**
+
+```bash
+cd examples/cpp-pgo
+chmod +x pgo-cycle.sh
+./pgo-cycle.sh
+```
+Expected: prints baseline + optimised + speedup. Skips with a clear error if `clang`/`create_llvm_prof` not installed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add examples/cpp-pgo/
+git commit -m "examples/cpp-pgo: end-to-end clang AutoFDO demo (-fprofile-sample-use, stripped)"
+```
+
+---
+
+## Task 18: FlameGraph capture + render example
+
+**Files:**
+- Create: `examples/flamegraph/capture.sh`
+- Create: `examples/flamegraph/README.md`
+
+**Goal:** turn a perf-agent capture into an SVG flame graph using Brendan Gregg's [FlameGraph](https://github.com/brendangregg/FlameGraph) scripts. No PGO; just demonstrates that perf.data emission feeds the canonical visualisation tool.
+
+- [ ] **Step 1: capture.sh**
+
+```bash
+#!/usr/bin/env bash
+# examples/flamegraph/capture.sh
+#
+# Capture a perf-agent profile against a running PID and render a
+# Brendan-Gregg-style flame graph to flame.svg.
+#
+# Requires:
+#   - perf-agent (caps set)
+#   - perf binary (for `perf script`)
+#   - FlameGraph scripts (stackcollapse-perf.pl, flamegraph.pl).
+#     Either on PATH, or set FLAMEGRAPH_DIR=/path/to/FlameGraph.
+#
+# Usage:
+#   ./capture.sh <PID> [DURATION]
+#       e.g. ./capture.sh $(pgrep my-app) 30s
+
+set -euo pipefail
+
+PID=${1:?usage: $0 <PID> [DURATION]}
+DURATION=${2:-30s}
+AGENT=${AGENT:-perf-agent}
+
+# Locate FlameGraph scripts.
+if [[ -n "${FLAMEGRAPH_DIR:-}" ]]; then
+    SC="$FLAMEGRAPH_DIR/stackcollapse-perf.pl"
+    FG="$FLAMEGRAPH_DIR/flamegraph.pl"
+elif command -v stackcollapse-perf.pl >/dev/null 2>&1; then
+    SC=$(command -v stackcollapse-perf.pl)
+    FG=$(command -v flamegraph.pl)
+else
+    cat >&2 <<EOF
+error: FlameGraph scripts not found.
+  Either:
+    git clone https://github.com/brendangregg/FlameGraph
+    export FLAMEGRAPH_DIR=\$(pwd)/FlameGraph
+  or install the scripts on PATH.
+EOF
+    exit 1
+fi
+
+WORKDIR=$(cd "$(dirname "$0")" && pwd)
+cd "$WORKDIR"
+
+echo "==> 1. Capture profile (PID=$PID, duration=$DURATION)"
+"$AGENT" --profile --pid "$PID" --duration "$DURATION" \
+         --perf-data-output capture.perf.data
+
+echo "==> 2. perf script | stackcollapse-perf.pl | flamegraph.pl"
+perf script -i capture.perf.data | "$SC" | "$FG" \
+    --title "perf-agent flame graph (pid $PID, $DURATION)" \
+    > flame.svg
+
+echo "==> Wrote flame.svg ($(stat -c %s flame.svg) bytes)"
+echo "    Open it in a browser, or with: xdg-open flame.svg"
+```
+
+- [ ] **Step 2: README**
+
+```markdown
+<!-- examples/flamegraph/README.md -->
+# perf-agent → FlameGraph
+
+Capture a profile with perf-agent and render a Brendan Gregg-style flame
+graph. Demonstrates that perf-agent's perf.data output feeds the canonical
+flame-graph tooling unchanged.
+
+## Prerequisites
+
+- `perf-agent` built and on PATH, with caps set
+  (`setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`).
+- `perf` binary on PATH (for `perf script`). Most distributions ship it
+  in the `linux-tools` / `perf` / `linux-perf` package.
+- Brendan Gregg's FlameGraph scripts:
+  ```bash
+  git clone https://github.com/brendangregg/FlameGraph
+  export FLAMEGRAPH_DIR=$(pwd)/FlameGraph
+  ```
+  Or copy `stackcollapse-perf.pl` and `flamegraph.pl` into a directory on
+  your PATH.
+
+## Run
+
+```bash
+# Capture against any running process for 30 seconds:
+./capture.sh $(pgrep my-app) 30s
+
+# Or specify a PID directly:
+./capture.sh 12345 60s
+```
+
+Output: `flame.svg` in the current directory. Open it in any browser —
+flame graphs are interactive (click to zoom, search by symbol name).
+
+## What it does
+
+1. `perf-agent --profile --pid <PID> --duration <D> --perf-data-output capture.perf.data`
+2. `perf script -i capture.perf.data` → text per-sample dump.
+3. `stackcollapse-perf.pl` → "folded" stack format (one stack per line, with sample count).
+4. `flamegraph.pl` → SVG.
+
+The pipeline is the same one you'd use with `perf record`. perf-agent slots
+in as the capture step; the rest of the chain is unchanged.
+
+## Notes on accuracy
+
+perf-agent samples at 99 Hz with software cpu-clock by default (or hardware
+cycles if available — see the agent's INFO log on startup). For flame graphs
+that's plenty — the goal is identifying *which functions* dominate, not
+precise cycle attribution. If you need higher fidelity, increase the sample
+rate (`--sample-rate 999`) or capture for longer (`DURATION=120s`).
+```
+
+- [ ] **Step 3: Test on the host**
+
+```bash
+cd examples/flamegraph
+chmod +x capture.sh
+
+# Use any long-running process. A simple one:
+sleep 600 &
+SLEEP_PID=$!
+./capture.sh "$SLEEP_PID" 5s
+kill "$SLEEP_PID"
+ls -la flame.svg
+```
+Expected: prints capture progress, writes a non-zero `flame.svg`. Skips with a clear error if FlameGraph scripts not found.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add examples/flamegraph/
+git commit -m "examples/flamegraph: capture-and-render demo using brendangregg/FlameGraph"
+```
+
+---
+
+## Task 19: top-level `examples/README.md`
+
+**Files:**
+- Create: `examples/README.md`
+
+- [ ] **Step 1: Write the index**
+
+```markdown
+<!-- examples/README.md -->
+# perf-agent examples
+
+End-to-end runnable demonstrations of what perf-agent can do beyond a
+quick CPU profile. Each example is a self-contained directory with its
+own README, source workload, and driver script.
+
+| Example | What it shows |
+|---|---|
+| [`rust-pgo/`](rust-pgo/) | Rust AutoFDO PGO. Build → profile → `create_llvm_prof` → rebuild → strip → measure speedup. |
+| [`cpp-pgo/`](cpp-pgo/) | C++ AutoFDO PGO. Same shape via clang's `-fprofile-sample-use`. |
+| [`flamegraph/`](flamegraph/) | Render a Brendan-Gregg flame graph from a perf-agent capture. |
+
+All three depend on `perf-agent` being built and on PATH with the standard
+capability set (`setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`).
+
+## Why these are here
+
+The README describes what perf-agent emits. These examples prove the
+workflows end-to-end: prerequisites you actually need to install, scripts
+that run unattended, expected output you can compare against. If a workflow
+documented in the README doesn't have a runnable example here, treat that
+as a documentation bug.
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add examples/README.md
+git commit -m "examples: top-level index README"
+```

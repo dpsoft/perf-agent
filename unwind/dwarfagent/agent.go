@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
@@ -49,7 +50,7 @@ type Profiler struct {
 // NewProfilerWithMode is the variant of NewProfiler that accepts both
 // an optional Hooks struct and a Mode. Pass ModeEager + nil hooks for
 // the same behavior as NewProfiler.
-func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string) (*Profiler, error) {
+func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -68,7 +69,7 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode, labels)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode, labels, perfData)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -100,8 +101,8 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 
 // NewProfilerWithHooks is the ModeEager variant of NewProfilerWithMode.
 // Pass nil for labels when no per-sample static labels are needed.
-func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string) (*Profiler, error) {
-	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels)
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string, perfData *perfdata.Writer) (*Profiler, error) {
+	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels, perfData)
 }
 
 // NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
@@ -111,8 +112,8 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 //
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on a Profiler they received as (nil, err).
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
-	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels)
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer) (*Profiler, error) {
+	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels, perfData)
 }
 
 // aggregateCPUSample is the CPU-specific ringbuf aggregator: each
@@ -124,6 +125,16 @@ func aggregateCPUSample(s *session, sample Sample) {
 	s.samples[key]++
 	s.stashStack(key, sample.PCs)
 	s.mu.Unlock()
+	if s.perfData != nil && len(sample.PCs) > 0 {
+		s.perfData.AddSample(perfdata.SampleRecord{
+			IP:        sample.PCs[0],
+			Pid:       sample.PID,
+			Tid:       sample.TID,
+			Time:      sample.TimeNs,
+			Period:    1,
+			Callchain: sample.PCs,
+		})
+	}
 }
 
 // Collect writes a gzipped pprof to w. Output is SampleTypeCpu with

@@ -276,6 +276,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeEager,
 				labels,
+				nil,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -297,6 +298,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeLazy,
 				labels,
+				nil,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)

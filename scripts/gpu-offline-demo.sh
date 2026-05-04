@@ -16,6 +16,7 @@ Usage:
   scripts/gpu-offline-demo.sh [--dry-run] hip-amd-sample-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv2-command-rich <outdir>
+  scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv3-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofv3-command-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-rich <outdir>
   scripts/gpu-offline-demo.sh [--dry-run] hip-rocprofiler-sdk-llm-rich <outdir>
@@ -36,6 +37,7 @@ Modes:
   hip-amd-sample-rich checked-in host->AMD execution/sample stdin path with richer function/source/pc frames
   hip-rocprofv2-rich checked-in host->rocprofv2->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofv3-rich checked-in host->rocprofv3->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv3-command-rich checked-in host->rocprofv3-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-rich checked-in preferred host->rocprofiler-sdk->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-llm-rich checked-in model-style host->rocprofiler-sdk->collector->AMD sample path with deeper CPU frames and richer algorithm GPU frames
@@ -162,6 +164,7 @@ HOST_REPLAY=""
 GPU_REPLAY=""
 STDIN_PATH=""
 AMD_SAMPLE_SOURCE_PATH=""
+AMD_SAMPLE_SOURCE_PATH_ENV=""
 AMD_SAMPLE_SOURCE_COMMAND=""
 AMD_SAMPLE_SOURCE_REAL_SOURCE=""
 AMD_SAMPLE_SOURCE_COMMAND_ENV=""
@@ -194,6 +197,7 @@ case "${MODE}" in
     hip-rocprofv2-rich)
         HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
         AMD_SAMPLE_SOURCE_PATH="scripts/emit-rocprofv2-rich-fixture.sh"
+        AMD_SAMPLE_SOURCE_PATH_ENV="PERF_AGENT_ROCPROFV2_PATH"
         AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofv2"
         AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFV2_OUTPUT_PATH"
         AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofv2_native_rich.ndjson"
@@ -210,9 +214,19 @@ case "${MODE}" in
         NAME="rocprofv2_command_sample_exec_rich"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
+    hip-rocprofv3-rich)
+        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
+        AMD_SAMPLE_SOURCE_PATH="scripts/emit-rocprofv3-rich-fixture.sh"
+        AMD_SAMPLE_SOURCE_PATH_ENV="PERF_AGENT_ROCPROFV3_PATH"
+        AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofv3"
+        AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFV3_OUTPUT_PATH"
+        AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofv3_native_rich.ndjson"
+        NAME="rocprofv3_sample_exec_rich"
+        EXTRA_ARGS=("--gpu-amd-sample-stdin")
+        ;;
     hip-rocprofv3-command-rich)
         HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
-        AMD_SAMPLE_SOURCE_COMMAND='scripts/emit-rocprofv2-rich-fixture.sh > "$PERF_AGENT_ROCPROFV3_OUTPUT_PATH"'
+        AMD_SAMPLE_SOURCE_COMMAND='scripts/emit-rocprofv3-rich-fixture.sh > "$PERF_AGENT_ROCPROFV3_OUTPUT_PATH"'
         AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofv3"
         AMD_SAMPLE_SOURCE_COMMAND_ENV="PERF_AGENT_ROCPROFV3_COMMAND"
         AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFV3_OUTPUT_PATH"
@@ -411,8 +425,8 @@ if [[ ${#AMD_SAMPLE_COLLECTOR_CMD[@]} -eq 0 && -n "${AMD_SAMPLE_SOURCE_PATH}" ]]
         "GOCACHE=${GOCACHE:-/tmp/perf-agent-gocache}"
         "GOMODCACHE=${GOMODCACHE:-/tmp/perf-agent-gomodcache}"
         "GOTOOLCHAIN=${GOTOOLCHAIN:-auto}"
-        "PERF_AGENT_ROCPROFV2_PATH=${REPO_ROOT}/${AMD_SAMPLE_SOURCE_PATH}"
-        "PERF_AGENT_ROCPROFV2_OUTPUT_PATH=${AMD_SAMPLE_SOURCE_OUTPUT_FILE}"
+        "${AMD_SAMPLE_SOURCE_PATH_ENV}=${REPO_ROOT}/${AMD_SAMPLE_SOURCE_PATH}"
+        "${AMD_SAMPLE_SOURCE_OUTPUT_ENV}=${AMD_SAMPLE_SOURCE_OUTPUT_FILE}"
         "go"
         "run"
         "./cmd/amd-sample-collector"

@@ -755,12 +755,12 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocm-smi-path /opt/rocm/bin/rocm-smi
 ```
 
-The preferred modern path is now `rocprofiler-sdk`, with `rocprofv3` kept as a
-CLI-shaped compatibility surface and `rocprofv2` retained only as an older
-compatibility source. These hooks expect a collector-style executable behind
-the selected path and adapt simple native JSON records such as `dispatch` and
-`sample` into the same `amdsample` contract, including alternate timing
-aliases and nested source-location metadata:
+The preferred modern path is now `rocprofiler-sdk`, with `rocprofv3` kept as
+the richer CLI-shaped compatibility surface and `rocprofv2` retained only as
+an older compatibility source. These hooks expect a collector-style executable
+behind the selected path and adapt simple native JSON records such as
+`dispatch` and `sample` into the same `amdsample` contract, including
+alternate timing aliases and nested source-location metadata:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -978,22 +978,29 @@ That view still starts with the CPU launch stack, but the GPU side now includes 
 [gpu:pc:0xabc]
 ```
 
-There is also a collector-shaped variant that exercises the `rocprofv2` adapter before rendering the same richer CPU+GPU HTML/SVG output:
+Preferred CLI-shaped compatibility variant with `rocprofv3`:
+
+```bash
+bash scripts/gpu-offline-demo.sh hip-rocprofv3-rich /tmp/gpu-rocprofv3-rich
+xdg-open /tmp/gpu-rocprofv3-rich/rocprofv3_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprofv3-rich/rocprofv3_sample_exec_rich.html
+```
+
+That path runs:
+
+```text
+rocprofv3 native records -> cmd/amd-sample-collector --mode real --real-source rocprofv3 -> perf-agent -> folded/svg/html
+```
+
+The checked-in demo currently exercises the file-output flavor of that contract.
+
+Legacy compatibility variant with `rocprofv2`:
 
 ```bash
 bash scripts/gpu-offline-demo.sh hip-rocprofv2-rich /tmp/gpu-rocprof-rich
 xdg-open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html
 ```
 
-That path runs:
-
-```text
-rocprofv2 native records -> cmd/amd-sample-collector --mode real --real-source rocprofv2 -> perf-agent -> folded/svg/html
-```
-
-The checked-in demo currently exercises the file-output flavor of that contract.
-
-There is also a command-shaped variant that exercises the same adapter through the new `rocprofv2` full-command hook and file-output discovery:
+There is also a legacy command-shaped variant that exercises the same adapter through the `rocprofv2` full-command hook and file-output discovery:
 
 ```bash
 bash scripts/gpu-offline-demo.sh hip-rocprofv2-command-rich /tmp/gpu-rocprof-command-rich

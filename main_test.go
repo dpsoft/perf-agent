@@ -732,6 +732,38 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv2CommandRich(t *testing.T) {
 	}
 }
 
+func TestGPUOfflineDemoScriptDryRunHIPRocprofv3Rich(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"--dry-run",
+		"hip-rocprofv3-rich",
+		"/tmp/gpu-rocprofv3-rich-demo",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run hip-rocprofv3-rich: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"GOCACHE=/tmp/perf-agent-gocache",
+		"GOMODCACHE=/tmp/perf-agent-gomodcache",
+		"GOTOOLCHAIN=auto",
+		"PERF_AGENT_ROCPROFV3_PATH=/home/diego/github/perf-agent/.worktrees/gpu-profiling-spec/scripts/emit-rocprofv3-rich-fixture.sh",
+		"PERF_AGENT_ROCPROFV3_OUTPUT_PATH=/tmp/gpu-rocprofv3-rich-demo/rocprofv3_native_rich.ndjson",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofv3",
+		"|",
+		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
+		"--gpu-amd-sample-stdin",
+		"--gpu-attribution-output /tmp/gpu-rocprofv3-rich-demo/rocprofv3_sample_exec_rich.attributions.json",
+		"--gpu-folded-output /tmp/gpu-rocprofv3-rich-demo/rocprofv3_sample_exec_rich.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPRocprofv3CommandRich(t *testing.T) {
 	cmd := exec.Command(
 		"bash",
@@ -749,7 +781,7 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofv3CommandRich(t *testing.T) {
 		"GOCACHE=/tmp/perf-agent-gocache",
 		"GOMODCACHE=/tmp/perf-agent-gomodcache",
 		"GOTOOLCHAIN=auto",
-		"PERF_AGENT_ROCPROFV3_COMMAND=scripts/emit-rocprofv2-rich-fixture.sh",
+		"PERF_AGENT_ROCPROFV3_COMMAND=scripts/emit-rocprofv3-rich-fixture.sh",
 		"\\$PERF_AGENT_ROCPROFV3_OUTPUT_PATH",
 		"PERF_AGENT_ROCPROFV3_OUTPUT_PATH=/tmp/gpu-rocprofv3-command-rich-demo/rocprofv3_native_rich.ndjson",
 		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofv3",
@@ -2019,6 +2051,29 @@ func TestGPUOfflineDemoScriptHIPRocprofv3CommandRichWritesBrendanStyleFrames(t *
 	for _, want := range []string{
 		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.svg"),
 		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.html"),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofv3RichWritesBrendanStyleFrames(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofv3-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofv3-rich helper: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.svg"),
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.html"),
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

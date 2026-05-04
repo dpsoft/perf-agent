@@ -54,8 +54,8 @@ func TestEncodeFileHeader_FeatureBitsSet(t *testing.T) {
 		attrs:      section{offset: 104, size: 136},
 		data:       section{offset: 240, size: 1024},
 		eventTypes: section{offset: 0, size: 0},
-		// HEADER_BUILD_ID = 2, HEADER_HOSTNAME = 4 → mask = (1<<2) | (1<<4) = 0x14
-		addsFeatures: (1 << featBuildID) | (1 << featHostname),
+		// HEADER_BUILD_ID = 2, HEADER_OSRELEASE = 4 → mask = (1<<2) | (1<<4) = 0x14
+		addsFeatures: (1 << featBuildID) | (1 << featOSRelease),
 	}
 	encodeFileHeader(&buf, hdr)
 

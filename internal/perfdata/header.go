@@ -27,19 +27,19 @@ type section struct {
 const (
 	featTracingData  = 1
 	featBuildID      = 2
-	featHostname     = 4
-	featOSRelease    = 5
-	featVersion      = 6
-	featArch         = 7
-	featNRCPUS       = 8
-	featCPUDesc      = 9
-	featCPUID        = 10
-	featTotalMem     = 11
-	featCmdLine      = 12
-	featEventDesc    = 13
-	featCPUTopology  = 14
-	featNUMATopology = 15
-	featBranchStack  = 16
+	featHostname     = 3
+	featOSRelease    = 4
+	featVersion      = 5
+	featArch         = 6
+	featNRCPUS       = 7
+	featCPUDesc      = 8
+	featCPUID        = 9
+	featTotalMem     = 10
+	featCmdLine      = 11
+	featEventDesc    = 12
+	featCPUTopology  = 13
+	featNUMATopology = 14
+	featBranchStack  = 15
 	// ... up to HEADER_LAST_FEATURE around 31; we only emit a small subset.
 )
 

@@ -190,26 +190,6 @@ case "${MODE}" in
         NAME="amd_sample_exec_rich"
         EXTRA_ARGS=("--gpu-amd-sample-stdin")
         ;;
-    hip-rocprofv2-rich)
-        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
-        AMD_SAMPLE_SOURCE_PATH="scripts/emit-rocprofv2-rich-fixture.sh"
-        AMD_SAMPLE_SOURCE_PATH_ENV="PERF_AGENT_ROCPROFV2_PATH"
-        AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofv2"
-        AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFV2_OUTPUT_PATH"
-        AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofv2_native_rich.ndjson"
-        NAME="rocprofv2_sample_exec_rich"
-        EXTRA_ARGS=("--gpu-amd-sample-stdin")
-        ;;
-    hip-rocprofv2-command-rich)
-        HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
-        AMD_SAMPLE_SOURCE_COMMAND='scripts/emit-rocprofv2-rich-fixture.sh > "$PERF_AGENT_ROCPROFV2_OUTPUT_PATH"'
-        AMD_SAMPLE_SOURCE_REAL_SOURCE="rocprofv2"
-        AMD_SAMPLE_SOURCE_COMMAND_ENV="PERF_AGENT_ROCPROFV2_COMMAND"
-        AMD_SAMPLE_SOURCE_OUTPUT_ENV="PERF_AGENT_ROCPROFV2_OUTPUT_PATH"
-        AMD_SAMPLE_SOURCE_OUTPUT_FILE="${OUTDIR}/rocprofv2_native_rich.ndjson"
-        NAME="rocprofv2_command_sample_exec_rich"
-        EXTRA_ARGS=("--gpu-amd-sample-stdin")
-        ;;
     hip-rocprofv3-rich)
         HOST_REPLAY="gpu/testdata/host/replay/hip_kfd_launches.json"
         AMD_SAMPLE_SOURCE_PATH="scripts/emit-rocprofv3-rich-fixture.sh"

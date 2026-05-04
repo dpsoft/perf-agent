@@ -9,7 +9,7 @@ WRAPPER_SCRIPT="${PERF_AGENT_GPU_LIVE_WRAPPER_SCRIPT:-}"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv2|rocprofv3|rocprofiler-sdk>] [--rocprofiler-sdk-mode <external|native>] [--rocprofiler-sdk-library <path>] [--rocm-smi-path <path>] [--rocprofv2-path <path>] [--rocprofv2-command <cmd>] [--rocprofv2-output-path <path>] [--rocprofv2-output-dir <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
+  scripts/gpu-live-hip-shim-demo.sh [--dry-run] [--outdir <dir>] [--binary <path>] [--hip-library <path>] [--linux-surface <drm|kfd|amdsample>] [--kernel-name <name>] [--device-id <id>] [--device-name <name>] [--queue-id <id>] [--sample-mode <synthetic|real>] [--real-source <rocm-smi|rocprofv3|rocprofiler-sdk>] [--rocprofiler-sdk-mode <external|native>] [--rocprofiler-sdk-library <path>] [--rocm-smi-path <path>] [--rocprofv3-path <path>] [--rocprofv3-command <cmd>] [--rocprofv3-output-path <path>] [--rocprofv3-output-dir <path>] [--rocprofiler-sdk-path <path>] [--rocprofiler-sdk-command <cmd>] [--rocprofiler-sdk-output-path <path>] [--rocprofiler-sdk-output-dir <path>] [--real-poll-interval <dur>] [--sample-command <cmd>] [--sample-collector-path <path>] [--sample-collector-command <cmd>] [--join-window <dur>] [--duration <dur>] [--sleep-before-ms <ms>] [--sleep-after-ms <ms>]
 
 Builds a tiny local HIP host process, launches it, then attaches the existing
 live HIP + linux wrapper to that PID.
@@ -61,10 +61,6 @@ REAL_SOURCE="rocprofiler-sdk"
 ROCPROFILER_SDK_MODE="external"
 ROCPROFILER_SDK_LIBRARY=""
 ROCM_SMI_PATH=""
-ROCPROFV2_PATH=""
-ROCPROFV2_COMMAND=""
-ROCPROFV2_OUTPUT_PATH=""
-ROCPROFV2_OUTPUT_DIR=""
 ROCPROFV3_PATH=""
 ROCPROFV3_COMMAND=""
 ROCPROFV3_OUTPUT_PATH=""
@@ -130,22 +126,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocm-smi-path)
             ROCM_SMI_PATH="${2:-}"
-            shift 2
-            ;;
-        --rocprofv2-path)
-            ROCPROFV2_PATH="${2:-}"
-            shift 2
-            ;;
-        --rocprofv2-command)
-            ROCPROFV2_COMMAND="${2:-}"
-            shift 2
-            ;;
-        --rocprofv2-output-path)
-            ROCPROFV2_OUTPUT_PATH="${2:-}"
-            shift 2
-            ;;
-        --rocprofv2-output-dir)
-            ROCPROFV2_OUTPUT_DIR="${2:-}"
             shift 2
             ;;
         --rocprofv3-path)
@@ -261,14 +241,6 @@ if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_PATH}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-path" >&2
     exit 1
 fi
-if [[ -n "${ROCPROFV2_OUTPUT_PATH}" && -n "${ROCPROFV2_OUTPUT_DIR}" ]]; then
-    echo "cannot combine --rocprofv2-output-path with --rocprofv2-output-dir" >&2
-    exit 1
-fi
-if [[ -n "${ROCPROFV2_PATH}" && -n "${ROCPROFV2_COMMAND}" ]]; then
-    echo "cannot combine --rocprofv2-path with --rocprofv2-command" >&2
-    exit 1
-fi
 if [[ -n "${ROCPROFV3_OUTPUT_PATH}" && -n "${ROCPROFV3_OUTPUT_DIR}" ]]; then
     echo "cannot combine --rocprofv3-output-path with --rocprofv3-output-dir" >&2
     exit 1
@@ -285,6 +257,10 @@ if [[ -n "${ROCPROFILER_SDK_OUTPUT_PATH}" && -n "${ROCPROFILER_SDK_OUTPUT_DIR}" 
     echo "cannot combine --rocprofiler-sdk-output-path with --rocprofiler-sdk-output-dir" >&2
     exit 1
 fi
+if [[ "${REAL_SOURCE}" != "rocm-smi" && "${REAL_SOURCE}" != "rocprofv3" && "${REAL_SOURCE}" != "rocprofiler-sdk" ]]; then
+    echo "unsupported real source: ${REAL_SOURCE}" >&2
+    exit 1
+fi
 if [[ -n "${SAMPLE_COMMAND}" && -n "${SAMPLE_COLLECTOR_COMMAND}" ]]; then
     echo "cannot combine --sample-command with --sample-collector-command" >&2
     exit 1
@@ -299,10 +275,6 @@ if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && -n "${SAMPLE_C
 fi
 if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && "${REAL_SOURCE}" == "rocm-smi" && -n "${ROCM_SMI_PATH}" && ! -x "${ROCM_SMI_PATH}" ]]; then
     echo "rocm-smi path is not executable: ${ROCM_SMI_PATH}" >&2
-    exit 1
-fi
-if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && "${REAL_SOURCE}" == "rocprofv2" && -n "${ROCPROFV2_PATH}" && ! -x "${ROCPROFV2_PATH}" ]]; then
-    echo "rocprofv2 path is not executable: ${ROCPROFV2_PATH}" >&2
     exit 1
 fi
 if [[ "${DRY_RUN}" != "1" && "${LINUX_SURFACE}" == "amdsample" && "${REAL_SOURCE}" == "rocprofv3" && -n "${ROCPROFV3_PATH}" && ! -x "${ROCPROFV3_PATH}" ]]; then
@@ -386,30 +358,6 @@ if [[ "${LINUX_SURFACE}" == "amdsample" ]]; then
         WRAPPER_CMD+=(
             --rocm-smi-path
             "${ROCM_SMI_PATH}"
-        )
-    fi
-    if [[ -n "${ROCPROFV2_PATH}" ]]; then
-        WRAPPER_CMD+=(
-            --rocprofv2-path
-            "${ROCPROFV2_PATH}"
-        )
-    fi
-    if [[ -n "${ROCPROFV2_COMMAND}" ]]; then
-        WRAPPER_CMD+=(
-            --rocprofv2-command
-            "${ROCPROFV2_COMMAND}"
-        )
-    fi
-    if [[ -n "${ROCPROFV2_OUTPUT_PATH}" ]]; then
-        WRAPPER_CMD+=(
-            --rocprofv2-output-path
-            "${ROCPROFV2_OUTPUT_PATH}"
-        )
-    fi
-    if [[ -n "${ROCPROFV2_OUTPUT_DIR}" ]]; then
-        WRAPPER_CMD+=(
-            --rocprofv2-output-dir
-            "${ROCPROFV2_OUTPUT_DIR}"
         )
     fi
     if [[ -n "${ROCPROFV3_PATH}" ]]; then

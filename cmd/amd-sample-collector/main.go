@@ -27,7 +27,6 @@ const (
 	defaultMode               = "synthetic"
 	defaultRealSource         = "rocprofiler-sdk"
 	defaultROCMSMI            = "rocm-smi"
-	defaultRocprofV2          = "rocprofv2"
 	defaultRocprofV3          = "rocprofv3"
 	defaultRocprofilerSDK     = "rocprofiler-sdk"
 	defaultRocprofilerSDKMode = "external"
@@ -107,7 +106,7 @@ type rocmSMIMetrics struct {
 	vramUsedPct  int
 }
 
-type rocprofV2Record struct {
+type rocprofRecord struct {
 	Type          string          `json:"type"`
 	ClockDomain   gpu.ClockDomain `json:"clock_domain,omitempty"`
 	DispatchID    string          `json:"dispatch_id"`
@@ -191,56 +190,56 @@ type externalDispatchMeta struct {
 	kernelName string
 }
 
-func (r rocprofV2Record) dispatchCorrelation() string {
+func (r rocprofRecord) dispatchCorrelation() string {
 	if r.DispatchID != "" {
 		return r.DispatchID
 	}
 	return r.CorrelationID
 }
 
-func (r rocprofV2Record) startTimeNS() int64 {
+func (r rocprofRecord) startTimeNS() int64 {
 	if r.StartNS != 0 {
 		return r.StartNS
 	}
 	return r.BeginNS
 }
 
-func (r rocprofV2Record) endTimeNS() int64 {
+func (r rocprofRecord) endTimeNS() int64 {
 	if r.EndNS != 0 {
 		return r.EndNS
 	}
 	return r.CompleteNS
 }
 
-func (r rocprofV2Record) sampleTimeNS() int64 {
+func (r rocprofRecord) sampleTimeNS() int64 {
 	if r.TimeNS != 0 {
 		return r.TimeNS
 	}
 	return r.TimestampNS
 }
 
-func (r rocprofV2Record) samplePC() string {
+func (r rocprofRecord) samplePC() string {
 	if r.PC != "" {
 		return r.PC
 	}
 	return r.Location.PC
 }
 
-func (r rocprofV2Record) sampleFunction() string {
+func (r rocprofRecord) sampleFunction() string {
 	if r.Function != "" {
 		return r.Function
 	}
 	return r.Location.Function
 }
 
-func (r rocprofV2Record) sampleFile() string {
+func (r rocprofRecord) sampleFile() string {
 	if r.File != "" {
 		return r.File
 	}
 	return r.Location.File
 }
 
-func (r rocprofV2Record) sampleLine() uint32 {
+func (r rocprofRecord) sampleLine() uint32 {
 	if r.Line != 0 {
 		return r.Line
 	}
@@ -368,7 +367,7 @@ func normalizeAndValidateExternalClockDomain(domain gpu.ClockDomain, sourceName 
 	return normalized, nil
 }
 
-func validateRocprofV2Record(record *rocprofV2Record, sourceName string) error {
+func validateRocprofRecord(record *rocprofRecord, sourceName string) error {
 	normalized, err := normalizeAndValidateExternalClockDomain(record.ClockDomain, sourceName)
 	if err != nil {
 		return err
@@ -653,8 +652,6 @@ func runReal(cfg collectorConfig) error {
 		return runRocprofilerSDKReal(cfg)
 	case "rocm-smi":
 		return runROCMSMIReal(cfg)
-	case "rocprofv2":
-		return runRocprofReal("PERF_AGENT_ROCPROFV2", defaultRocprofV2, "rocprofv2")
 	case "rocprofv3":
 		return runRocprofReal("PERF_AGENT_ROCPROFV3", defaultRocprofV3, "rocprofv3")
 	default:
@@ -908,11 +905,11 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 		if len(line) == 0 {
 			continue
 		}
-		var record rocprofV2Record
+		var record rocprofRecord
 		if err := json.Unmarshal(line, &record); err != nil {
 			return fmt.Errorf("decode %s source line: %w", sourceName, err)
 		}
-		if err := validateRocprofV2Record(&record, sourceName); err != nil {
+		if err := validateRocprofRecord(&record, sourceName); err != nil {
 			return err
 		}
 		switch record.Type {

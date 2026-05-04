@@ -60,3 +60,12 @@ func TestWriteUint32LE(t *testing.T) {
 		t.Errorf("writeUint32LE = % x, want % x", buf.Bytes(), want)
 	}
 }
+
+func TestWriteUint16LE(t *testing.T) {
+	var buf bytes.Buffer
+	writeUint16LE(&buf, 0x0102)
+	want := []byte{0x02, 0x01}
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Errorf("writeUint16LE = % x, want % x", buf.Bytes(), want)
+	}
+}

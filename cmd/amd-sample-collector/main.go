@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dpsoft/perf-agent/gpu"
 )
 
 const (
@@ -106,20 +108,21 @@ type rocmSMIMetrics struct {
 }
 
 type rocprofV2Record struct {
-	Type          string `json:"type"`
-	DispatchID    string `json:"dispatch_id"`
-	CorrelationID string `json:"correlation_id"`
-	SampleID      string `json:"sample_id"`
-	StartNS       int64  `json:"start_ns"`
-	BeginNS       int64  `json:"begin_ns"`
-	EndNS         int64  `json:"end_ns"`
-	CompleteNS    int64  `json:"complete_ns"`
-	TimeNS        int64  `json:"time_ns"`
-	TimestampNS   int64  `json:"timestamp_ns"`
-	PC            string `json:"pc"`
-	Function      string `json:"function"`
-	File          string `json:"file"`
-	Line          uint32 `json:"line"`
+	Type          string          `json:"type"`
+	ClockDomain   gpu.ClockDomain `json:"clock_domain,omitempty"`
+	DispatchID    string          `json:"dispatch_id"`
+	CorrelationID string          `json:"correlation_id"`
+	SampleID      string          `json:"sample_id"`
+	StartNS       int64           `json:"start_ns"`
+	BeginNS       int64           `json:"begin_ns"`
+	EndNS         int64           `json:"end_ns"`
+	CompleteNS    int64           `json:"complete_ns"`
+	TimeNS        int64           `json:"time_ns"`
+	TimestampNS   int64           `json:"timestamp_ns"`
+	PC            string          `json:"pc"`
+	Function      string          `json:"function"`
+	File          string          `json:"file"`
+	Line          uint32          `json:"line"`
 	Location      struct {
 		PC       string `json:"pc"`
 		Function string `json:"function"`
@@ -131,26 +134,27 @@ type rocprofV2Record struct {
 }
 
 type rocprofilerSDKRecord struct {
-	Kind        string `json:"kind"`
-	ID          string `json:"id"`
-	DispatchID  string `json:"dispatch_id"`
-	SampleID    string `json:"sample_id"`
-	StartNS     int64  `json:"start_ns"`
-	BeginNS     int64  `json:"begin_ns"`
-	EndNS       int64  `json:"end_ns"`
-	CompleteNS  int64  `json:"complete_ns"`
-	TimeNS      int64  `json:"time_ns"`
-	TimestampNS int64  `json:"timestamp_ns"`
-	KernelName  string `json:"kernel_name"`
-	DeviceID    string `json:"device_id"`
-	DeviceName  string `json:"device_name"`
-	QueueID     string `json:"queue_id"`
-	PC          string `json:"pc"`
-	Function    string `json:"function"`
-	File        string `json:"file"`
-	Line        uint32 `json:"line"`
-	StallReason string `json:"stall_reason"`
-	Weight      int    `json:"weight"`
+	Kind        string          `json:"kind"`
+	ClockDomain gpu.ClockDomain `json:"clock_domain,omitempty"`
+	ID          string          `json:"id"`
+	DispatchID  string          `json:"dispatch_id"`
+	SampleID    string          `json:"sample_id"`
+	StartNS     int64           `json:"start_ns"`
+	BeginNS     int64           `json:"begin_ns"`
+	EndNS       int64           `json:"end_ns"`
+	CompleteNS  int64           `json:"complete_ns"`
+	TimeNS      int64           `json:"time_ns"`
+	TimestampNS int64           `json:"timestamp_ns"`
+	KernelName  string          `json:"kernel_name"`
+	DeviceID    string          `json:"device_id"`
+	DeviceName  string          `json:"device_name"`
+	QueueID     string          `json:"queue_id"`
+	PC          string          `json:"pc"`
+	Function    string          `json:"function"`
+	File        string          `json:"file"`
+	Line        uint32          `json:"line"`
+	StallReason string          `json:"stall_reason"`
+	Weight      int             `json:"weight"`
 	Kernel      struct {
 		Name string `json:"name"`
 	} `json:"kernel"`
@@ -354,6 +358,32 @@ func (r rocprofilerSDKRecord) sampleStallReason() string {
 		return r.StallReason
 	}
 	return r.Stall.Reason
+}
+
+func normalizeAndValidateExternalClockDomain(domain gpu.ClockDomain, sourceName string) (gpu.ClockDomain, error) {
+	normalized := gpu.NormalizeClockDomain(domain)
+	if err := gpu.ValidateSupportedClockDomain(normalized); err != nil {
+		return gpu.ClockDomainInvalid, fmt.Errorf("%s record clock_domain: %w", sourceName, err)
+	}
+	return normalized, nil
+}
+
+func validateRocprofV2Record(record *rocprofV2Record, sourceName string) error {
+	normalized, err := normalizeAndValidateExternalClockDomain(record.ClockDomain, sourceName)
+	if err != nil {
+		return err
+	}
+	record.ClockDomain = normalized
+	return nil
+}
+
+func validateRocprofilerSDKRecord(record *rocprofilerSDKRecord, sourceName string) error {
+	normalized, err := normalizeAndValidateExternalClockDomain(record.ClockDomain, sourceName)
+	if err != nil {
+		return err
+	}
+	record.ClockDomain = normalized
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -882,6 +912,9 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 		if err := json.Unmarshal(line, &record); err != nil {
 			return fmt.Errorf("decode %s source line: %w", sourceName, err)
 		}
+		if err := validateRocprofV2Record(&record, sourceName); err != nil {
+			return err
+		}
 		switch record.Type {
 		case "dispatch":
 			dispatchID := record.dispatchCorrelation()
@@ -1105,10 +1138,25 @@ func decodeRocprofilerSDKRecords(sourceBytes []byte) ([]rocprofilerSDKRecord, er
 		if err := json.Unmarshal(trimmed, &records); err != nil {
 			return nil, fmt.Errorf("decode rocprofiler-sdk source array: %w", err)
 		}
+		for i := range records {
+			if err := validateRocprofilerSDKRecord(&records[i], "rocprofiler-sdk"); err != nil {
+				return nil, err
+			}
+		}
 		return records, nil
 	case '{':
 		var envelope rocprofilerSDKEnvelope
 		if err := json.Unmarshal(trimmed, &envelope); err == nil {
+			for i := range envelope.Records {
+				if err := validateRocprofilerSDKRecord(&envelope.Records[i], "rocprofiler-sdk"); err != nil {
+					return nil, err
+				}
+			}
+			for i := range envelope.Events {
+				if err := validateRocprofilerSDKRecord(&envelope.Events[i], "rocprofiler-sdk"); err != nil {
+					return nil, err
+				}
+			}
 			if len(envelope.Records) > 0 {
 				return envelope.Records, nil
 			}
@@ -1118,6 +1166,9 @@ func decodeRocprofilerSDKRecords(sourceBytes []byte) ([]rocprofilerSDKRecord, er
 		}
 		var record rocprofilerSDKRecord
 		if err := json.Unmarshal(trimmed, &record); err == nil && record.Kind != "" {
+			if err := validateRocprofilerSDKRecord(&record, "rocprofiler-sdk"); err != nil {
+				return nil, err
+			}
 			return []rocprofilerSDKRecord{record}, nil
 		}
 	}
@@ -1132,6 +1183,9 @@ func decodeRocprofilerSDKRecords(sourceBytes []byte) ([]rocprofilerSDKRecord, er
 		var record rocprofilerSDKRecord
 		if err := json.Unmarshal(line, &record); err != nil {
 			return nil, fmt.Errorf("decode rocprofiler-sdk source line: %w", err)
+		}
+		if err := validateRocprofilerSDKRecord(&record, "rocprofiler-sdk"); err != nil {
+			return nil, err
 		}
 		records = append(records, record)
 	}

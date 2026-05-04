@@ -4570,6 +4570,29 @@ func TestAMDSampleCollectorBinaryUsesRocprofv2Command(t *testing.T) {
 	}
 }
 
+func TestAMDSampleCollectorBinaryRejectsUnsupportedRocprofv2ClockDomain(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	inputPath := filepath.Join(tmpDir, "rocprofv2-input.ndjson")
+	if err := os.WriteFile(inputPath, []byte("{\"type\":\"dispatch\",\"clock_domain\":\"gpu-device\",\"correlation_id\":\"dispatch-cmd-1\",\"begin_ns\":300,\"complete_ns\":360}\n"), 0o644); err != nil {
+		t.Fatalf("write rocprofv2 input: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofv2")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFV2_COMMAND=cat "+inputPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected unsupported rocprofv2 clock domain failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofv2 record clock_domain") ||
+		!strings.Contains(string(out), "unsupported clock domain") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestAMDSampleCollectorBinaryUsesRocprofv3Command(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := buildAMDSampleCollector(t, tmpDir)
@@ -4630,6 +4653,29 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
 	}
 	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
 		t.Fatalf("clock_domain=%q", execEv.Exec.ClockDomain)
+	}
+}
+
+func TestAMDSampleCollectorBinaryRejectsUnsupportedRocprofilerSDKClockDomain(t *testing.T) {
+	tmpDir := t.TempDir()
+	binaryPath := buildAMDSampleCollector(t, tmpDir)
+	inputPath := filepath.Join(tmpDir, "rocprofiler-sdk-input.ndjson")
+	if err := os.WriteFile(inputPath, []byte("{\"kind\":\"dispatch\",\"clock_domain\":\"gpu-device\",\"dispatch_id\":\"sdk-dispatch-1\",\"start_ns\":300,\"end_ns\":360,\"kernel_name\":\"sdk_kernel\"}\n"), 0o644); err != nil {
+		t.Fatalf("write rocprofiler-sdk input: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "--mode", "real", "--real-source", "rocprofiler-sdk")
+	cmd.Env = append(
+		os.Environ(),
+		"PERF_AGENT_ROCPROFILER_SDK_COMMAND=cat "+inputPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected unsupported rocprofiler-sdk clock domain failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rocprofiler-sdk record clock_domain") ||
+		!strings.Contains(string(out), "unsupported clock domain") {
+		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
 

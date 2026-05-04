@@ -21,6 +21,7 @@ const (
 	defaultDeviceID           = "gfx1103:0"
 	defaultDeviceName         = "AMD Radeon 780M Graphics"
 	defaultQueueID            = "compute:0"
+	defaultClockDomain        = "cpu-monotonic"
 	defaultMode               = "synthetic"
 	defaultRealSource         = "rocprofiler-sdk"
 	defaultROCMSMI            = "rocm-smi"
@@ -59,6 +60,7 @@ type execution struct {
 
 type execRecord struct {
 	Kind        string      `json:"kind"`
+	ClockDomain string      `json:"clock_domain,omitempty"`
 	Execution   execution   `json:"execution"`
 	Correlation correlation `json:"correlation"`
 	Queue       queue       `json:"queue"`
@@ -69,6 +71,7 @@ type execRecord struct {
 
 type sampleRecord struct {
 	Kind         string      `json:"kind"`
+	ClockDomain  string      `json:"clock_domain,omitempty"`
 	Correlation  correlation `json:"correlation"`
 	Device       device      `json:"device"`
 	TimeNS       int64       `json:"time_ns"`
@@ -528,7 +531,8 @@ func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, s
 	}
 
 	if err := writeJSONLine(execRecord{
-		Kind: "exec",
+		Kind:        "exec",
+		ClockDomain: defaultClockDomain,
 		Execution: execution{
 			Backend:   "amdsample",
 			DeviceID:  cfg.deviceID,
@@ -547,6 +551,7 @@ func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, s
 
 	if err := writeJSONLine(sampleRecord{
 		Kind:         "sample",
+		ClockDomain:  defaultClockDomain,
 		Correlation:  correlation{Backend: "amdsample", Value: sample1ID},
 		Device:       dev,
 		TimeNS:       sample1NS,
@@ -559,6 +564,7 @@ func emitRecords(cfg collectorConfig, sample1Reason string, sample1Weight int, s
 
 	if err := writeJSONLine(sampleRecord{
 		Kind:         "sample",
+		ClockDomain:  defaultClockDomain,
 		Correlation:  correlation{Backend: "amdsample", Value: sample2ID},
 		Device:       dev,
 		TimeNS:       sample2NS,
@@ -708,7 +714,8 @@ func runROCMSMIReal(cfg collectorConfig) error {
 	}
 
 	if err := writeJSONLine(execRecord{
-		Kind: "exec",
+		Kind:        "exec",
+		ClockDomain: defaultClockDomain,
 		Execution: execution{
 			Backend:   "amdsample",
 			DeviceID:  cfg.deviceID,
@@ -735,6 +742,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 		gpuSampleID := fmt.Sprintf("sample:gpu:%d:%d", i, sampleTimeNS)
 		if err := writeJSONLine(sampleRecord{
 			Kind:         "sample",
+			ClockDomain:  defaultClockDomain,
 			Correlation:  correlation{Backend: "amdsample", Value: gpuSampleID},
 			Device:       dev,
 			TimeNS:       sampleTimeNS,
@@ -748,6 +756,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 		powerSampleID := fmt.Sprintf("sample:power:%d:%d", i, sampleTimeNS)
 		if err := writeJSONLine(sampleRecord{
 			Kind:         "sample",
+			ClockDomain:  defaultClockDomain,
 			Correlation:  correlation{Backend: "amdsample", Value: powerSampleID},
 			Device:       dev,
 			TimeNS:       sampleTimeNS,
@@ -761,6 +770,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 		tempSampleID := fmt.Sprintf("sample:temp:%d:%d", i, sampleTimeNS)
 		if err := writeJSONLine(sampleRecord{
 			Kind:         "sample",
+			ClockDomain:  defaultClockDomain,
 			Correlation:  correlation{Backend: "amdsample", Value: tempSampleID},
 			Device:       dev,
 			TimeNS:       sampleTimeNS,
@@ -774,6 +784,7 @@ func runROCMSMIReal(cfg collectorConfig) error {
 		vramSampleID := fmt.Sprintf("sample:vram:%d:%d", i, sampleTimeNS)
 		if err := writeJSONLine(sampleRecord{
 			Kind:         "sample",
+			ClockDomain:  defaultClockDomain,
 			Correlation:  correlation{Backend: "amdsample", Value: vramSampleID},
 			Device:       dev,
 			TimeNS:       sampleTimeNS,
@@ -881,7 +892,8 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 				kernelName: kernelName,
 			}
 			if err := writeJSONLine(execRecord{
-				Kind: "exec",
+				Kind:        "exec",
+				ClockDomain: defaultClockDomain,
 				Execution: execution{
 					Backend:   "amdsample",
 					DeviceID:  deviceID,
@@ -924,6 +936,7 @@ func runRocprofReal(envPrefix, defaultPath, sourceName string) error {
 			}
 			if err := writeJSONLine(sampleRecord{
 				Kind:         "sample",
+				ClockDomain:  defaultClockDomain,
 				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
 				Device:       sampleDevice,
 				TimeNS:       sampleTimeNS,
@@ -1015,7 +1028,8 @@ func runRocprofilerSDKExternal() error {
 				kernelName: kernelName,
 			}
 			if err := writeJSONLine(execRecord{
-				Kind: "exec",
+				Kind:        "exec",
+				ClockDomain: defaultClockDomain,
 				Execution: execution{
 					Backend:   "amdsample",
 					DeviceID:  deviceID,
@@ -1058,6 +1072,7 @@ func runRocprofilerSDKExternal() error {
 			}
 			if err := writeJSONLine(sampleRecord{
 				Kind:         "sample",
+				ClockDomain:  defaultClockDomain,
 				Correlation:  correlation{Backend: "amdsample", Value: sampleID},
 				Device:       sampleDevice,
 				TimeNS:       sampleTimeNS,

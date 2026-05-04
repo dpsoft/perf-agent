@@ -257,7 +257,8 @@ func emitRocprofilerSDKNativeProbe(cfg collectorConfig, probe rocprofilerSDKNati
 	}
 
 	if err := writeJSONLine(execRecord{
-		Kind: "exec",
+		Kind:        "exec",
+		ClockDomain: defaultClockDomain,
 		Execution: execution{
 			Backend:   "amdsample",
 			DeviceID:  cfg.deviceID,
@@ -277,6 +278,7 @@ func emitRocprofilerSDKNativeProbe(cfg collectorConfig, probe rocprofilerSDKNati
 	versionValue := int(probe.Major)*10000 + int(probe.Minor)*100 + int(probe.Patch)
 	if err := writeJSONLine(sampleRecord{
 		Kind:         "sample",
+		ClockDomain:  defaultClockDomain,
 		Correlation:  correlation{Backend: "amdsample", Value: fmt.Sprintf("native-sdk-version:%d", sample1NS)},
 		Device:       dev,
 		TimeNS:       sample1NS,
@@ -289,6 +291,7 @@ func emitRocprofilerSDKNativeProbe(cfg collectorConfig, probe rocprofilerSDKNati
 
 	if err := writeJSONLine(sampleRecord{
 		Kind:         "sample",
+		ClockDomain:  defaultClockDomain,
 		Correlation:  correlation{Backend: "amdsample", Value: fmt.Sprintf("native-sdk-agents:%d", sample2NS)},
 		Device:       dev,
 		TimeNS:       sample2NS,

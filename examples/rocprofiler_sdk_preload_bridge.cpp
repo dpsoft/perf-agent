@@ -416,6 +416,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
 
     std::ostringstream dispatch_json{};
     dispatch_json << "{\"kind\":\"dispatch\""
+                  << ",\"clock_domain\":\"cpu-monotonic\""
                   << ",\"id\":\"hip-launch:" << corr_id << "\""
                   << ",\"dispatch\":{\"id\":\"hip-launch:" << corr_id << "\"}"
                   << ",\"start_ns\":" << start_ns
@@ -426,6 +427,7 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
 
     std::ostringstream sample_json{};
     sample_json << "{\"kind\":\"sample\""
+                << ",\"clock_domain\":\"cpu-monotonic\""
                 << ",\"dispatch_id\":\"hip-launch:" << corr_id << "\""
                 << ",\"sample_id\":\"hip-launch-sample:" << corr_id << "\""
                 << ",\"time_ns\":" << sample_ns
@@ -542,6 +544,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
 
         std::ostringstream dispatch_json{};
         dispatch_json << "{\"kind\":\"dispatch\""
+                      << ",\"clock_domain\":\"cpu-monotonic\""
                       << ",\"id\":\"dispatch:" << dispatch_handle << "\""
                       << ",\"dispatch\":{\"id\":\"dispatch:" << dispatch_handle << "\"}"
                       << ",\"start_ns\":" << start_ns
@@ -579,6 +582,7 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
 
             std::ostringstream sample_json{};
             sample_json << "{\"kind\":\"sample\""
+                        << ",\"clock_domain\":\"cpu-monotonic\""
                         << ",\"dispatch_id\":\"dispatch:" << dispatch_handle << "\""
                         << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << ":"
                         << sample_idx << "\""

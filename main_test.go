@@ -4628,6 +4628,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKCommand(t *testing.T) {
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%q", execEv.Exec.ClockDomain)
+	}
 }
 
 func TestAMDSampleCollectorBinaryRejectsRocprofilerSDKNativeMode(t *testing.T) {
@@ -4678,6 +4681,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeMode(t *testing.T) {
 	if execEv.Exec.Execution.Backend != "amdsample" {
 		t.Fatalf("backend=%q", execEv.Exec.Execution.Backend)
 	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("exec clock_domain=%q", execEv.Exec.ClockDomain)
+	}
 
 	sample1, err := codec.DecodeLine([]byte(lines[1]))
 	if err != nil {
@@ -4686,6 +4692,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeMode(t *testing.T) {
 	if sample1.Sample.StallReason != "native_sdk_version" || sample1.Sample.Weight != 70201 {
 		t.Fatalf("unexpected sample1: %+v", sample1.Sample)
 	}
+	if sample1.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample1 clock_domain=%q", sample1.Sample.ClockDomain)
+	}
 
 	sample2, err := codec.DecodeLine([]byte(lines[2]))
 	if err != nil {
@@ -4693,6 +4702,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeMode(t *testing.T) {
 	}
 	if sample2.Sample.StallReason != "native_sdk_available_agents" || sample2.Sample.Weight != 2 {
 		t.Fatalf("unexpected sample2: %+v", sample2.Sample)
+	}
+	if sample2.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample2 clock_domain=%q", sample2.Sample.ClockDomain)
 	}
 }
 
@@ -4732,6 +4744,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKNativeModeWithRealLibrary(t *
 	}
 	if sample2.Sample.StallReason != "native_sdk_available_agents" {
 		t.Fatalf("unexpected sample2: %+v", sample2.Sample)
+	}
+	if sample2.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample2 clock_domain=%q", sample2.Sample.ClockDomain)
 	}
 }
 
@@ -4833,6 +4848,9 @@ func TestAMDSampleCollectorBinaryUsesAlternateRocprofilerSDKNativeShape(t *testi
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-alt-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("exec clock_domain=%q", execEv.Exec.ClockDomain)
+	}
 	if execEv.Exec.Queue.QueueID != "compute:7" {
 		t.Fatalf("queue_id=%q", execEv.Exec.Queue.QueueID)
 	}
@@ -4851,6 +4869,9 @@ func TestAMDSampleCollectorBinaryUsesAlternateRocprofilerSDKNativeShape(t *testi
 	}
 	if sampleEv.Sample.StallReason != "memory_wait" {
 		t.Fatalf("stall_reason=%q", sampleEv.Sample.StallReason)
+	}
+	if sampleEv.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample clock_domain=%q", sampleEv.Sample.ClockDomain)
 	}
 }
 
@@ -4888,6 +4909,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKRecorderEnvelope(t *testing.T
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-env-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("exec clock_domain=%q", execEv.Exec.ClockDomain)
+	}
 	sampleEv, err := codec.DecodeLine([]byte(lines[1]))
 	if err != nil {
 		t.Fatalf("decode sample line: %v\n%s", err, lines[1])
@@ -4897,6 +4921,9 @@ func TestAMDSampleCollectorBinaryUsesRocprofilerSDKRecorderEnvelope(t *testing.T
 	}
 	if sampleEv.Sample.File != "flash_attn.hip" || sampleEv.Sample.Line != 77 {
 		t.Fatalf("location=%s:%d", sampleEv.Sample.File, sampleEv.Sample.Line)
+	}
+	if sampleEv.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample clock_domain=%q", sampleEv.Sample.ClockDomain)
 	}
 }
 
@@ -4940,6 +4967,9 @@ EOF
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
 	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("exec clock_domain=%q", execEv.Exec.ClockDomain)
+	}
 	if execEv.Exec.KernelName != "flash_attn_fwd" {
 		t.Fatalf("kernel_name=%q", execEv.Exec.KernelName)
 	}
@@ -4958,6 +4988,9 @@ EOF
 	}
 	if sampleEv.Sample.StallReason != "memory_wait" {
 		t.Fatalf("stall_reason=%q", sampleEv.Sample.StallReason)
+	}
+	if sampleEv.Sample.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("sample clock_domain=%q", sampleEv.Sample.ClockDomain)
 	}
 }
 
@@ -4996,6 +5029,9 @@ EOF
 	}
 	if execEv.Exec.Execution.ExecID != "sdk-dispatch-file-1" {
 		t.Fatalf("exec_id=%q", execEv.Exec.Execution.ExecID)
+	}
+	if execEv.Exec.ClockDomain != gpu.ClockDomainCPUMonotonic {
+		t.Fatalf("clock_domain=%q", execEv.Exec.ClockDomain)
 	}
 }
 

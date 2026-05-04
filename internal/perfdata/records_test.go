@@ -38,3 +38,63 @@ func TestEncodeFinishedRound(t *testing.T) {
 		t.Errorf("FINISHED_ROUND bytes mismatch:\n got: % x\nwant: % x", buf.Bytes(), want)
 	}
 }
+
+func TestEncodeMmap2_NoBuildID(t *testing.T) {
+	var buf bytes.Buffer
+	encodeMmap2(&buf, mmap2Record{
+		pid:      1234,
+		tid:      1234,
+		addr:     0x400000,
+		len:      0x1000,
+		pgoff:    0,
+		filename: "/usr/bin/ls",
+		// no build-id → use the maj/min/ino union
+	})
+
+	got := buf.Bytes()
+	// Expected total size:
+	//   header(8) + pid(4) + tid(4) + addr(8) + len(8) + pgoff(8) +
+	//   union(24: maj+min+ino+ino_gen) + prot(4) + flags(4) +
+	//   filename "/usr/bin/ls" (12 chars+NUL=13, padded to 16) = 88 bytes
+	if len(got) != 88 {
+		t.Fatalf("MMAP2 size = %d, want 88; bytes: % x", len(got), got)
+	}
+	// header.type at offset 0 = PERF_RECORD_MMAP2 = 10
+	if got[0] != 10 || got[1] != 0 {
+		t.Errorf("type = % x, want 0a 00", got[0:2])
+	}
+	// header.size at offset 6 = 88 (u16 LE)
+	if got[6] != 88 || got[7] != 0 {
+		t.Errorf("size = % x, want 58 00", got[6:8])
+	}
+}
+
+func TestEncodeMmap2_WithBuildID(t *testing.T) {
+	bid := [20]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	var buf bytes.Buffer
+	encodeMmap2(&buf, mmap2Record{
+		pid:         1234,
+		tid:         1234,
+		addr:        0x7f0000400000,
+		len:         0x1000,
+		pgoff:       0,
+		hasBuildID:  true,
+		buildIDSize: 20,
+		buildID:     bid,
+		filename:    "/lib/x86_64-linux-gnu/libc.so.6",
+	})
+
+	got := buf.Bytes()
+	// header.misc must have PERF_RECORD_MISC_MMAP_BUILD_ID = 1<<14 = 0x4000
+	if got[4] != 0x00 || got[5] != 0x40 {
+		t.Errorf("misc = % x, want 00 40 (MISC_MMAP_BUILD_ID)", got[4:6])
+	}
+	// build-id starts at offset 8(hdr) + 4(pid) + 4(tid) + 8(addr) + 8(len) + 8(pgoff) = 40
+	// At offset 40: u8 build_id_size, u8[3] reserved, u8[20] build_id
+	if got[40] != 20 {
+		t.Errorf("build_id_size = %d, want 20", got[40])
+	}
+	if got[44] != 0xde || got[45] != 0xad {
+		t.Errorf("build_id[0..2] = % x, want de ad", got[44:46])
+	}
+}

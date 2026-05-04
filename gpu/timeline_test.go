@@ -856,3 +856,56 @@ func TestTimelineBuildsJoinStatsForUnmatchedRecords(t *testing.T) {
 		t.Fatalf("event stats=%+v", stats)
 	}
 }
+
+func TestTimelineJoinStatsTrackAmbiguousAndOutOfWindowHeuristics(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 5})
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "l1"},
+		Queue:       GPUQueueRef{Backend: BackendStream, QueueID: "q1"},
+		KernelName:  "flash_attn_fwd",
+		TimeNs:      10,
+		Launch: LaunchContext{
+			PID:  42,
+			TID:  42,
+			Tags: map[string]string{"cgroup_id": "1000"},
+		},
+	})
+	tl.RecordLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: "stream", Value: "l2"},
+		Queue:       GPUQueueRef{Backend: BackendStream, QueueID: "q1"},
+		KernelName:  "flash_attn_fwd",
+		TimeNs:      12,
+		Launch: LaunchContext{
+			PID:  42,
+			TID:  42,
+			Tags: map[string]string{"cgroup_id": "1000"},
+		},
+	})
+	tl.RecordExec(GPUKernelExec{
+		Correlation: CorrelationID{Backend: "stream", Value: "missing"},
+		Queue:       GPUQueueRef{Backend: BackendStream, QueueID: "q1"},
+		KernelName:  "flash_attn_fwd",
+		StartNs:     30,
+		EndNs:       60,
+	})
+	tl.RecordEvent(GPUTimelineEvent{
+		Backend: "linuxdrm",
+		Kind:    TimelineEventSubmit,
+		Name:    "submit-late",
+		TimeNs:  40,
+		PID:     42,
+		TID:     42,
+	})
+
+	snapshot := tl.Snapshot()
+	stats := snapshot.JoinStats
+	if stats.HeuristicExecutionJoinCount != 1 {
+		t.Fatalf("heuristic execution joins=%+v", stats)
+	}
+	if stats.AmbiguousHeuristicMatchCount != 1 {
+		t.Fatalf("ambiguous heuristic matches=%+v", stats)
+	}
+	if stats.OutOfWindowDropCount != 1 {
+		t.Fatalf("out of window drops=%+v", stats)
+	}
+}

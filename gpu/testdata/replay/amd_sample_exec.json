@@ -1,4 +1,6 @@
-[
+{
+  "version": 1,
+  "events": [
   {
     "kind": "exec",
     "correlation": { "backend": "hip", "value": "hip:555:555:100" },
@@ -48,4 +50,5 @@
     "stall_reason": "wave_barrier",
     "weight": 5
   }
-]
+  ]
+}

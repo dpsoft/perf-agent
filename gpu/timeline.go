@@ -14,6 +14,7 @@ type ExecutionView struct {
 	Samples   []GPUSample      `json:"samples,omitempty"`
 	Join      JoinKind         `json:"join,omitempty"`
 	Heuristic bool             `json:"heuristic"`
+	Ambiguous bool             `json:"ambiguous,omitempty"`
 }
 
 type EventView struct {
@@ -21,6 +22,8 @@ type EventView struct {
 	Event     GPUTimelineEvent `json:"event"`
 	Join      JoinKind         `json:"join,omitempty"`
 	Heuristic bool             `json:"heuristic"`
+	Ambiguous bool             `json:"ambiguous,omitempty"`
+	OutOfWindow bool           `json:"out_of_window,omitempty"`
 }
 
 type JoinKind string
@@ -91,20 +94,24 @@ func (t *Timeline) Snapshot() Snapshot {
 		if launch := t.findLaunchByCorrelation(exec); launch != nil {
 			view.Launch = launch
 			view.Join = JoinExact
-		} else if launch := t.findLaunchHeuristic(exec); launch != nil {
-			view.Launch = launch
+		} else if match := t.findLaunchHeuristic(exec); match.launch != nil {
+			view.Launch = match.launch
 			view.Join = JoinHeuristic
 			view.Heuristic = true
+			view.Ambiguous = match.ambiguous
 		}
 		views = append(views, view)
 	}
 	eventViews := make([]EventView, 0, len(t.events))
 	for _, event := range t.events {
 		view := EventView{Event: cloneTimelineEvent(event)}
-		if launch := t.findLaunchForEvent(event); launch != nil {
-			view.Launch = launch
+		if match := t.findLaunchForEvent(event); match.launch != nil {
+			view.Launch = match.launch
 			view.Join = JoinHeuristic
 			view.Heuristic = true
+			view.Ambiguous = match.ambiguous
+		} else if match.outOfWindow {
+			view.OutOfWindow = true
 		}
 		eventViews = append(eventViews, view)
 	}
@@ -135,6 +142,9 @@ func buildJoinStats(launches []GPUKernelLaunch, executions []ExecutionView, even
 		}
 		if exec.Launch != nil {
 			matched[launchJoinKey(*exec.Launch)] = struct{}{}
+			if exec.Ambiguous {
+				stats.AmbiguousHeuristicMatchCount++
+			}
 		}
 	}
 	for _, event := range events {
@@ -144,7 +154,13 @@ func buildJoinStats(launches []GPUKernelLaunch, executions []ExecutionView, even
 		if event.Join == JoinHeuristic && event.Launch != nil {
 			stats.HeuristicEventJoinCount++
 			matched[launchJoinKey(*event.Launch)] = struct{}{}
+			if event.Ambiguous {
+				stats.AmbiguousHeuristicMatchCount++
+			}
 			continue
+		}
+		if event.OutOfWindow {
+			stats.OutOfWindowDropCount++
 		}
 		stats.UnmatchedCandidateEventCount++
 	}
@@ -336,8 +352,15 @@ func (t *Timeline) findLaunchByCorrelation(exec GPUKernelExec) *GPUKernelLaunch 
 	return nil
 }
 
-func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
+type launchMatch struct {
+	launch       *GPUKernelLaunch
+	ambiguous    bool
+	outOfWindow  bool
+}
+
+func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) launchMatch {
 	var best *GPUKernelLaunch
+	var candidateCount int
 	for _, launch := range t.launches {
 		if launch.Queue.Backend != exec.Queue.Backend || launch.Queue.QueueID != exec.Queue.QueueID {
 			continue
@@ -348,17 +371,19 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		if launch.TimeNs > exec.StartNs {
 			continue
 		}
+		candidateCount++
 		if best == nil || launch.TimeNs > best.TimeNs {
 			copy := cloneLaunch(launch)
 			best = &copy
 		}
 	}
 	if best != nil {
-		return best
+		return launchMatch{launch: best, ambiguous: candidateCount > 1}
 	}
 	if exec.Execution.Backend != BackendAMDSample {
-		return nil
+		return launchMatch{}
 	}
+	candidateCount = 0
 	for _, launch := range t.launches {
 		if launch.Correlation.Backend != BackendHIP {
 			continue
@@ -369,12 +394,13 @@ func (t *Timeline) findLaunchHeuristic(exec GPUKernelExec) *GPUKernelLaunch {
 		if launch.TimeNs > exec.StartNs {
 			continue
 		}
+		candidateCount++
 		if best == nil || launch.TimeNs > best.TimeNs {
 			copy := cloneLaunch(launch)
 			best = &copy
 		}
 	}
-	return best
+	return launchMatch{launch: best, ambiguous: candidateCount > 1}
 }
 
 func launchKernelNamesCompatible(launch GPUKernelLaunch, exec GPUKernelExec) bool {
@@ -398,11 +424,13 @@ func launchKernelNamesCompatible(launch GPUKernelLaunch, exec GPUKernelExec) boo
 	return false
 }
 
-func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
+func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) launchMatch {
 	if !isJoinCandidateEvent(event) {
-		return nil
+		return launchMatch{}
 	}
 	var best *GPUKernelLaunch
+	var candidateCount int
+	var outOfWindow bool
 	for _, launch := range t.launches {
 		if launch.Launch.PID == 0 || launch.Launch.TID == 0 {
 			continue
@@ -414,14 +442,20 @@ func (t *Timeline) findLaunchForEvent(event GPUTimelineEvent) *GPUKernelLaunch {
 			continue
 		}
 		if t.cfg.LaunchEventJoinWindowNs > 0 && event.TimeNs-launch.TimeNs > t.cfg.LaunchEventJoinWindowNs {
+			outOfWindow = true
 			continue
 		}
+		candidateCount++
 		if best == nil || launch.TimeNs > best.TimeNs {
 			copy := cloneLaunch(launch)
 			best = &copy
 		}
 	}
-	return best
+	return launchMatch{
+		launch:      best,
+		ambiguous:   candidateCount > 1,
+		outOfWindow: best == nil && outOfWindow,
+	}
 }
 
 func isJoinCandidateEvent(event GPUTimelineEvent) bool {

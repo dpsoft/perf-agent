@@ -13,6 +13,11 @@ type Backend struct {
 	path string
 }
 
+type fixture struct {
+	Version int        `json:"version"`
+	Events  []rawEvent `json:"events"`
+}
+
 func New(path string) (*Backend, error) {
 	if path == "" {
 		return nil, fmt.Errorf("replay path is required")
@@ -39,11 +44,17 @@ func (b *Backend) Start(_ context.Context, sink gpu.EventSink) error {
 	if err != nil {
 		return fmt.Errorf("read replay fixture: %w", err)
 	}
-	var events []rawEvent
-	if err := json.Unmarshal(data, &events); err != nil {
-		return fmt.Errorf("decode replay fixture: %w", err)
+	var f fixture
+	if err := json.Unmarshal(data, &f); err != nil {
+		return fmt.Errorf("decode versioned replay fixture: %w", err)
 	}
-	for _, event := range events {
+	if f.Version == 0 {
+		return fmt.Errorf("decode versioned replay fixture: missing versioned replay fixture envelope")
+	}
+	if f.Version != 1 {
+		return fmt.Errorf("decode versioned replay fixture: unsupported replay fixture version %d", f.Version)
+	}
+	for _, event := range f.Events {
 		if err := emitEvent(event, sink); err != nil {
 			return err
 		}

@@ -1,4 +1,6 @@
-[
+{
+  "version": 1,
+  "events": [
   {
     "kind": "exec",
     "correlation": { "backend": "stream", "value": "c1" },
@@ -14,4 +16,5 @@
     "stall_reason": "memory_throttle",
     "weight": 7
   }
-]
+  ]
+}

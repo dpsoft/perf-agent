@@ -1,4 +1,6 @@
-[
+{
+  "version": 1,
+  "events": [
   {
     "kind": "exec",
     "correlation": { "backend": "stream", "value": "corr-a" },
@@ -29,4 +31,5 @@
     "stall_reason": "wait",
     "weight": 13
   }
-]
+  ]
+}

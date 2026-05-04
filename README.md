@@ -507,6 +507,19 @@ go tool pprof myapp-202604021430-on-cpu.pb.gz
 
 There is an experimental contract-validation path for the planned GPU profiling architecture. It does **not** talk to a real vendor runtime yet. Instead, it replays normalized GPU events from a JSON fixture, exports the normalized snapshot as JSON, and projects a mixed CPU+GPU profile using synthetic GPU frames.
 
+Replay fixtures are versioned envelopes:
+
+```json
+{
+  "version": 1,
+  "events": [
+    { "kind": "launch", "...": "..." }
+  ]
+}
+```
+
+All timestamp fields in replay fixtures are in the CPU monotonic clock domain.
+
 ```bash
 go run . \
   --gpu-replay-input gpu/testdata/replay/flash_attn.json \
@@ -528,6 +541,13 @@ It is not yet a real NVIDIA / Intel / AMD backend.
 ### Experimental live GPU stream pipeline
 
 There is also an experimental live ingestion path for normalized GPU NDJSON events. It keeps the same vendor-agnostic event contract as replay mode, but reads one event per line from stdin and drives the existing JSON snapshot plus synthetic-frame `pprof` projection.
+
+Stream contract:
+
+- one UTF-8 JSON object per line
+- `kind` must be one of `launch`, `exec`, `counter`, `sample`, `event`
+- timestamps (`time_ns`, `start_ns`, `end_ns`, `duration_ns`) are in the CPU monotonic clock domain
+- external collectors must convert device-local/GPU clocks before emitting into this pipe
 
 ```bash
 cat <<'EOF' | go run . \

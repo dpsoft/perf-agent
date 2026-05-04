@@ -70,6 +70,12 @@ type CorrelationID struct {
 	Value   string       `json:"value"`
 }
 
+// Timestamp contract:
+//   - all *_ns fields emitted into the normalized GPU event model are in the
+//     CPU monotonic clock domain
+//   - backends that observe GPU/device-local clocks must convert them before
+//     emitting launches, executions, samples, counters, or timeline events
+//   - replay fixtures and stream NDJSON follow the same contract
 type LaunchContext struct {
 	PID      uint32            `json:"pid"`
 	TID      uint32            `json:"tid"`
@@ -176,8 +182,10 @@ type JoinStats struct {
 	UnmatchedLaunchCount         uint64 `json:"unmatched_launch_count,omitempty"`
 	ExactExecutionJoinCount      uint64 `json:"exact_execution_join_count,omitempty"`
 	HeuristicExecutionJoinCount  uint64 `json:"heuristic_execution_join_count,omitempty"`
+	AmbiguousHeuristicMatchCount uint64 `json:"ambiguous_heuristic_match_count,omitempty"`
 	UnmatchedExecutionCount      uint64 `json:"unmatched_execution_count,omitempty"`
 	HeuristicEventJoinCount      uint64 `json:"heuristic_event_join_count,omitempty"`
+	OutOfWindowDropCount         uint64 `json:"out_of_window_drop_count,omitempty"`
 	UnmatchedCandidateEventCount uint64 `json:"unmatched_candidate_event_count,omitempty"`
 }
 

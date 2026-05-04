@@ -1,4 +1,6 @@
-[
+{
+  "version": 1,
+  "events": [
   {
     "kind": "event",
     "event": {
@@ -13,4 +15,5 @@
       "source": "replay"
     }
   }
-]
+  ]
+}

@@ -607,6 +607,26 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 	}
 }
 
+func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
+	fixtures := []string{
+		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_native_rich.ndjson"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_native_rich.json"),
+		filepath.Join("gpu", "testdata", "replay", "rocprofiler_sdk_native_llm_rich.ndjson"),
+	}
+
+	for _, fixture := range fixtures {
+		data, err := os.ReadFile(fixture)
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", fixture, err)
+		}
+		if !strings.Contains(string(data), "\"clock_domain\":\"cpu-monotonic\"") &&
+			!strings.Contains(string(data), "\"clock_domain\": \"cpu-monotonic\"") {
+			t.Fatalf("fixture %s does not declare cpu-monotonic clock domain", fixture)
+		}
+	}
+}
+
 func TestGPUOfflineDemoScriptDryRunHIPAMDSample(t *testing.T) {
 	cmd := exec.Command(
 		"bash",

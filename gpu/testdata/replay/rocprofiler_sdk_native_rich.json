@@ -3,6 +3,7 @@
     {
       "kind": "dispatch",
       "dispatch_id": "sdk-dispatch-1",
+      "clock_domain": "cpu-monotonic",
       "start_ns": 120,
       "end_ns": 260,
       "kernel_name": "hip_launch_shim_kernel",
@@ -13,6 +14,7 @@
     {
       "kind": "sample",
       "dispatch_id": "sdk-dispatch-1",
+      "clock_domain": "cpu-monotonic",
       "timestamp_ns": 150,
       "stall_reason": "memory_wait",
       "weight": 11,
@@ -24,6 +26,7 @@
     {
       "kind": "sample",
       "dispatch_id": "sdk-dispatch-1",
+      "clock_domain": "cpu-monotonic",
       "timestamp_ns": 210,
       "stall_reason": "wave_barrier",
       "weight": 5,

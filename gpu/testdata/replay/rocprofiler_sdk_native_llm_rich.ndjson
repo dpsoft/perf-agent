@@ -1,4 +1,4 @@
-{"kind":"dispatch","dispatch_id":"sdk-dispatch-llm-1","start_ns":120,"end_ns":310,"kernel_name":"flash_attn_decode_bf16_gfx11","device_id":"gfx1103:0","device_name":"AMD Radeon 780M Graphics","queue_id":"compute:0"}
-{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","timestamp_ns":150,"pc":"0xabc","function":"flash_attn_fwd","file":"flash_attn.hip","line":77,"stall_reason":"memory_wait","weight":11}
-{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","timestamp_ns":205,"pc":"0xbcd","function":"paged_kv_gather","file":"paged_kv_cache.hip","line":132,"stall_reason":"lds_bank_conflict","weight":7}
-{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","timestamp_ns":265,"pc":"0xdef","function":"flash_attn_epilogue","file":"flash_attn_epilogue.hip","line":91,"stall_reason":"wave_barrier","weight":5}
+{"kind":"dispatch","dispatch_id":"sdk-dispatch-llm-1","clock_domain":"cpu-monotonic","start_ns":120,"end_ns":310,"kernel_name":"flash_attn_decode_bf16_gfx11","device_id":"gfx1103:0","device_name":"AMD Radeon 780M Graphics","queue_id":"compute:0"}
+{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","clock_domain":"cpu-monotonic","timestamp_ns":150,"pc":"0xabc","function":"flash_attn_fwd","file":"flash_attn.hip","line":77,"stall_reason":"memory_wait","weight":11}
+{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","clock_domain":"cpu-monotonic","timestamp_ns":205,"pc":"0xbcd","function":"paged_kv_gather","file":"paged_kv_cache.hip","line":132,"stall_reason":"lds_bank_conflict","weight":7}
+{"kind":"sample","dispatch_id":"sdk-dispatch-llm-1","clock_domain":"cpu-monotonic","timestamp_ns":265,"pc":"0xdef","function":"flash_attn_epilogue","file":"flash_attn_epilogue.hip","line":91,"stall_reason":"wave_barrier","weight":5}

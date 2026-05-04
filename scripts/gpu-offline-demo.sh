@@ -35,8 +35,8 @@ Modes:
   host-exec         checked-in host->execution replay
   hip-amd-sample    checked-in host->AMD execution/sample stdin path
   hip-amd-sample-rich checked-in host->AMD execution/sample stdin path with richer function/source/pc frames
-  hip-rocprofv2-rich checked-in host->rocprofv2->collector->AMD sample path with richer function/source/pc frames
-  hip-rocprofv2-command-rich checked-in host->rocprofv2-command->collector->AMD sample path with richer function/source/pc frames
+  hip-rocprofv2-rich legacy compatibility-only host->rocprofv2->collector path
+  hip-rocprofv2-command-rich legacy compatibility-only host->rocprofv2-command->collector path
   hip-rocprofv3-rich checked-in host->rocprofv3->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofv3-command-rich checked-in host->rocprofv3-command->collector->AMD sample path with richer function/source/pc frames
   hip-rocprofiler-sdk-rich checked-in preferred host->rocprofiler-sdk->collector->AMD sample path with richer function/source/pc frames

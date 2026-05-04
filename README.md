@@ -613,8 +613,8 @@ Current modes are:
 - `host-exec`
 - `hip-amd-sample`
 - `hip-amd-sample-rich`
-- `hip-rocprofv2-rich`
-- `hip-rocprofv2-command-rich`
+- `hip-rocprofv2-rich` (legacy compatibility)
+- `hip-rocprofv2-command-rich` (legacy compatibility)
 - `hip-rocprofv3-command-rich`
 - `host-driver`
 - `multi-exec`
@@ -993,19 +993,9 @@ rocprofv3 native records -> cmd/amd-sample-collector --mode real --real-source r
 
 The checked-in demo currently exercises the file-output flavor of that contract.
 
-Legacy compatibility variant with `rocprofv2`:
-
-```bash
-bash scripts/gpu-offline-demo.sh hip-rocprofv2-rich /tmp/gpu-rocprof-rich
-xdg-open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-rich/rocprofv2_sample_exec_rich.html
-```
-
-There is also a legacy command-shaped variant that exercises the same adapter through the `rocprofv2` full-command hook and file-output discovery:
-
-```bash
-bash scripts/gpu-offline-demo.sh hip-rocprofv2-command-rich /tmp/gpu-rocprof-command-rich
-xdg-open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html 2>/dev/null || open /tmp/gpu-rocprof-command-rich/rocprofv2_command_sample_exec_rich.html
-```
+Legacy `rocprofv2` compatibility modes remain available in the helper scripts,
+but the richer offline demo and golden coverage now live on `rocprofv3` and
+`rocprofiler-sdk`.
 
 Preferred modern SDK-shaped variant:
 

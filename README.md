@@ -613,6 +613,7 @@ Current modes are:
 - `host-exec`
 - `hip-amd-sample`
 - `hip-amd-sample-rich`
+- `hip-rocprofv3-rich`
 - `hip-rocprofv2-rich` (legacy compatibility)
 - `hip-rocprofv2-command-rich` (legacy compatibility)
 - `hip-rocprofv3-command-rich`
@@ -782,51 +783,9 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocprofv3-command 'rocprofv3 --hip-trace --output /tmp/rocprofv3-out'
 ```
 
-Compatibility path with `rocprofv2`:
-
-```bash
-bash scripts/gpu-live-hip-amdsample.sh \
-  --outdir /tmp/gpu-live \
-  --pid 4242 \
-  --sample-mode real \
-  --real-source rocprofv2 \
-  --rocprofv2-path /opt/rocm/bin/rocprofv2
-```
-
-If the profiler needs a full command line instead of a bare executable path, pass that directly:
-
-```bash
-bash scripts/gpu-live-hip-amdsample.sh \
-  --outdir /tmp/gpu-live \
-  --pid 4242 \
-  --sample-mode real \
-  --real-source rocprofv2 \
-  --rocprofv2-command 'rocprofv2 --hip-trace --output /tmp/rocprofv2-out'
-```
-
-If that source writes native records to a file instead of stdout, pass the output path too:
-
-```bash
-bash scripts/gpu-live-hip-amdsample.sh \
-  --outdir /tmp/gpu-live \
-  --pid 4242 \
-  --sample-mode real \
-  --real-source rocprofv2 \
-  --rocprofv2-path /opt/rocm/bin/rocprofv2 \
-  --rocprofv2-output-path /tmp/rocprofv2.jsonl
-```
-
-If it writes multiple traces into a directory, pass the directory and the collector will pick the newest file after the profiler exits:
-
-```bash
-bash scripts/gpu-live-hip-amdsample.sh \
-  --outdir /tmp/gpu-live \
-  --pid 4242 \
-  --sample-mode real \
-  --real-source rocprofv2 \
-  --rocprofv2-path /opt/rocm/bin/rocprofv2 \
-  --rocprofv2-output-dir /tmp/rocprofv2-out
-```
+Legacy `rocprofv2` live compatibility remains available through the same
+path/command/output-file/output-dir knobs, but richer live-path examples and
+narrative are intentionally centered on `rocprofv3` and `rocprofiler-sdk`.
 
 The real collector poll interval is also tunable when you want denser or
 sparser coarse hardware samples:
@@ -901,7 +860,7 @@ bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocm-smi --rocm-smi-path /opt/rocm/bin/rocm-smi
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofiler-sdk --rocprofiler-sdk-command 'rocprofiler-sdk --hip-trace --output /tmp/rocprofiler-sdk-out'
-bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofv2 --rocprofv2-path /opt/rocm/bin/rocprofv2
+bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-source rocprofv3 --rocprofv3-command 'rocprofv3 --hip-trace --output /tmp/rocprofv3-out'
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --sample-mode real --real-poll-interval 25ms
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --kernel-name flash_attn_fwd
 bash scripts/gpu-live-hip-shim-demo.sh --dry-run --linux-surface amdsample --device-id gfx942:0 --device-name MI300X --queue-id compute:7

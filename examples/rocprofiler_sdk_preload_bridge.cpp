@@ -369,8 +369,8 @@ emit_runtime_record(rocprofiler_buffer_tracing_kind_t kind, RecordT* record)
                   << ",\"dispatch\":{\"id\":\"hip-launch:" << corr_id << "\"}"
                   << ",\"start_ns\":" << start_ns
                   << ",\"end_ns\":" << end_ns
-                  << ",\"kernel\":{\"name\":\"" << json_escape(fallback_kernel_name_value()) << "\"}"
-                  << ",\"kernel_name\":\"" << json_escape(fallback_kernel_name_value()) << "\""
+                  << ",\"kernel\":{\"name\":\"" << json_escape(function_name) << "\"}"
+                  << ",\"kernel_name\":\"" << json_escape(function_name) << "\""
                   << "}";
 
     std::ostringstream sample_json{};
@@ -496,8 +496,8 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                       << ",\"dispatch\":{\"id\":\"dispatch:" << dispatch_handle << "\"}"
                       << ",\"start_ns\":" << start_ns
                       << ",\"end_ns\":" << end_ns
-                      << ",\"kernel\":{\"name\":\"" << json_escape(kernel_name) << "\"}"
-                      << ",\"kernel_name\":\"" << json_escape(kernel_name) << "\""
+                      << ",\"kernel\":{\"name\":\"" << json_escape(display_name) << "\"}"
+                      << ",\"kernel_name\":\"" << json_escape(display_name) << "\""
                       << "}";
 
         const auto location = source_location_for_kernel(display_name);

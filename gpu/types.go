@@ -2,6 +2,8 @@ package gpu
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"slices"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -19,16 +21,17 @@ const (
 	BackendHostReplay GPUBackendID = "host-replay"
 )
 
-type GPUCapability string
+type GPUCapability uint8
 
 const (
-	CapabilityLaunchTrace       GPUCapability = "launch-trace"
-	CapabilityExecTimeline      GPUCapability = "exec-timeline"
-	CapabilityDeviceCounters    GPUCapability = "device-counters"
-	CapabilityPCSampling        GPUCapability = "gpu-pc-sampling"
-	CapabilityStallReasons      GPUCapability = "stall-reasons"
-	CapabilitySourceMap         GPUCapability = "gpu-source-correlation"
-	CapabilityLifecycleTimeline GPUCapability = "lifecycle-timeline"
+	CapabilityInvalid GPUCapability = iota
+	CapabilityLaunchTrace
+	CapabilityExecTimeline
+	CapabilityDeviceCounters
+	CapabilityPCSampling
+	CapabilityStallReasons
+	CapabilitySourceMap
+	CapabilityLifecycleTimeline
 )
 
 var capabilityNames = []GPUCapability{
@@ -41,8 +44,56 @@ var capabilityNames = []GPUCapability{
 	CapabilityLifecycleTimeline,
 }
 
+var capabilityToName = map[GPUCapability]string{
+	CapabilityLaunchTrace:       "launch-trace",
+	CapabilityExecTimeline:      "exec-timeline",
+	CapabilityDeviceCounters:    "device-counters",
+	CapabilityPCSampling:        "gpu-pc-sampling",
+	CapabilityStallReasons:      "stall-reasons",
+	CapabilitySourceMap:         "gpu-source-correlation",
+	CapabilityLifecycleTimeline: "lifecycle-timeline",
+}
+
+var nameToCapability = map[string]GPUCapability{
+	"launch-trace":            CapabilityLaunchTrace,
+	"exec-timeline":           CapabilityExecTimeline,
+	"device-counters":         CapabilityDeviceCounters,
+	"gpu-pc-sampling":         CapabilityPCSampling,
+	"stall-reasons":           CapabilityStallReasons,
+	"gpu-source-correlation":  CapabilitySourceMap,
+	"lifecycle-timeline":      CapabilityLifecycleTimeline,
+}
+
 func CapabilityNames() []GPUCapability {
 	return slices.Clone(capabilityNames)
+}
+
+func (c GPUCapability) String() string {
+	if name, ok := capabilityToName[c]; ok {
+		return name
+	}
+	return fmt.Sprintf("unknown-gpu-capability-%d", uint8(c))
+}
+
+func (c GPUCapability) MarshalJSON() ([]byte, error) {
+	name, ok := capabilityToName[c]
+	if !ok {
+		return nil, fmt.Errorf("unknown gpu capability %d", c)
+	}
+	return json.Marshal(name)
+}
+
+func (c *GPUCapability) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("decode gpu capability: %w", err)
+	}
+	value, ok := nameToCapability[name]
+	if !ok {
+		return fmt.Errorf("unknown gpu capability %q", name)
+	}
+	*c = value
+	return nil
 }
 
 type GPUDeviceRef struct {

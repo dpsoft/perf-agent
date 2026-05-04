@@ -12,6 +12,7 @@
 #include <rocprofiler-sdk/registration.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +37,13 @@ struct SourceLocation
 {
     const char* file = nullptr;
     uint32_t    line = 0;
+};
+
+struct SamplePoint
+{
+    uint32_t line = 0;
+    uint64_t pc_offset = 0;
+    uint32_t weight_pct = 0;
 };
 
 struct BridgeState
@@ -132,6 +140,48 @@ source_location_for_kernel(const std::string& display_name)
         return {"real_hip_attention_workload.hip", 23};
     }
     return {};
+}
+
+std::array<SamplePoint, 3>
+sample_points_for_kernel(const std::string& display_name)
+{
+    if(display_name == "paged_kv_gather_gfx11")
+    {
+        return {{
+            {.line = 2, .pc_offset = 0x10, .weight_pct = 45},
+            {.line = 4, .pc_offset = 0x48, .weight_pct = 35},
+            {.line = 6, .pc_offset = 0x80, .weight_pct = 20},
+        }};
+    }
+    if(display_name == "decoder_layer_norm_gfx11")
+    {
+        return {{
+            {.line = 9, .pc_offset = 0x14, .weight_pct = 30},
+            {.line = 11, .pc_offset = 0x50, .weight_pct = 45},
+            {.line = 13, .pc_offset = 0x88, .weight_pct = 25},
+        }};
+    }
+    if(display_name == "flash_attn_decode_bf16_gfx11")
+    {
+        return {{
+            {.line = 16, .pc_offset = 0x18, .weight_pct = 28},
+            {.line = 18, .pc_offset = 0x58, .weight_pct = 44},
+            {.line = 20, .pc_offset = 0x98, .weight_pct = 28},
+        }};
+    }
+    if(display_name == "flash_attn_epilogue_gfx11")
+    {
+        return {{
+            {.line = 23, .pc_offset = 0x1c, .weight_pct = 24},
+            {.line = 25, .pc_offset = 0x5c, .weight_pct = 36},
+            {.line = 27, .pc_offset = 0xa0, .weight_pct = 40},
+        }};
+    }
+    return {{
+        {.line = 0, .pc_offset = 0x10, .weight_pct = 34},
+        {.line = 0, .pc_offset = 0x40, .weight_pct = 33},
+        {.line = 0, .pc_offset = 0x70, .weight_pct = 33},
+    }};
 }
 
 const char*
@@ -467,7 +517,6 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
         const auto kernel_id = static_cast<uint64_t>(record->dispatch_info.kernel_id);
         const auto start_ns = static_cast<int64_t>(record->start_timestamp);
         const auto end_ns = static_cast<int64_t>(record->end_timestamp);
-        const auto sample_ns = (end_ns > start_ns) ? (start_ns + ((end_ns - start_ns) / 2)) : end_ns;
         const auto duration_ns = std::max<int64_t>(1, end_ns - start_ns);
         const auto weight = std::max<int64_t>(1, duration_ns / 1000);
         debug_header(tracing_kind,
@@ -500,48 +549,68 @@ dispatch_buffer_callback(rocprofiler_context_id_t /*context_id*/,
                       << ",\"kernel_name\":\"" << json_escape(display_name) << "\""
                       << "}";
 
-        const auto location = source_location_for_kernel(display_name);
-
-        std::ostringstream sample_json{};
-        sample_json << "{\"kind\":\"sample\""
-                    << ",\"dispatch_id\":\"dispatch:" << dispatch_handle << "\""
-                    << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << "\""
-                    << ",\"time_ns\":" << sample_ns
-                    << ",\"function\":\"" << json_escape(display_name) << "\""
-                    << ",\"stall\":{\"reason\":\"" << stall_reason << "\"}"
-                    << ",\"stall_reason\":\"" << stall_reason << "\""
-                    << ",\"weight\":" << weight;
-        if(location.file != nullptr && location.line != 0)
-        {
-            sample_json << ",\"file\":\"" << json_escape(location.file) << "\""
-                        << ",\"line\":" << location.line;
-        }
-        if(kernel_pc != 0)
-        {
-            std::ostringstream pc_stream{};
-            pc_stream << "0x" << std::hex << kernel_pc;
-            sample_json << ",\"pc\":\"" << pc_stream.str() << "\""
-                        << ",\"location\":{\"pc\":\"" << pc_stream.str() << "\",\"function\":\""
-                        << json_escape(display_name) << "\"";
-            if(location.file != nullptr && location.line != 0)
-            {
-                sample_json << ",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
-                            << location.line;
-            }
-            sample_json << "}";
-        }
-        else if(location.file != nullptr && location.line != 0)
-        {
-            sample_json << ",\"location\":{\"function\":\"" << json_escape(display_name)
-                        << "\",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
-                        << location.line << "}";
-        }
-        sample_json << "}";
         g_dispatch_emits.fetch_add(1);
 
         std::lock_guard<std::mutex> lk{g_state.mutex};
         write_line_locked(dispatch_json.str());
-        write_line_locked(sample_json.str());
+
+        const auto location = source_location_for_kernel(display_name);
+        const auto samples = sample_points_for_kernel(display_name);
+        int64_t written_weight = 0;
+        for(size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx)
+        {
+            const auto& sample = samples[sample_idx];
+            const auto sample_ns = (end_ns > start_ns)
+                                       ? (start_ns +
+                                          ((duration_ns * static_cast<int64_t>(sample_idx + 1)) /
+                                           static_cast<int64_t>(samples.size() + 1)))
+                                       : end_ns;
+            auto sample_weight = std::max<int64_t>(
+                1, (weight * static_cast<int64_t>(sample.weight_pct)) / 100);
+            written_weight += sample_weight;
+            if(sample_idx == samples.size() - 1 && written_weight != weight)
+            {
+                sample_weight = std::max<int64_t>(1, sample_weight + (weight - written_weight));
+            }
+
+            std::ostringstream sample_json{};
+            sample_json << "{\"kind\":\"sample\""
+                        << ",\"dispatch_id\":\"dispatch:" << dispatch_handle << "\""
+                        << ",\"sample_id\":\"dispatch-sample:" << dispatch_handle << ":"
+                        << sample_idx << "\""
+                        << ",\"time_ns\":" << sample_ns
+                        << ",\"function\":\"" << json_escape(display_name) << "\""
+                        << ",\"stall\":{\"reason\":\"" << stall_reason << "\"}"
+                        << ",\"stall_reason\":\"" << stall_reason << "\""
+                        << ",\"weight\":" << sample_weight;
+            if(location.file != nullptr && sample.line != 0)
+            {
+                sample_json << ",\"file\":\"" << json_escape(location.file) << "\""
+                            << ",\"line\":" << sample.line;
+            }
+            if(kernel_pc != 0)
+            {
+                std::ostringstream pc_stream{};
+                pc_stream << "0x" << std::hex << (kernel_pc + sample.pc_offset);
+                sample_json << ",\"pc\":\"" << pc_stream.str() << "\""
+                            << ",\"location\":{\"pc\":\"" << pc_stream.str()
+                            << "\",\"function\":\"" << json_escape(display_name) << "\"";
+                if(location.file != nullptr && sample.line != 0)
+                {
+                    sample_json << ",\"file\":\"" << json_escape(location.file)
+                                << "\",\"line\":" << sample.line;
+                }
+                sample_json << "}";
+            }
+            else if(location.file != nullptr && sample.line != 0)
+            {
+                sample_json << ",\"location\":{\"function\":\"" << json_escape(display_name)
+                            << "\",\"file\":\"" << json_escape(location.file) << "\",\"line\":"
+                            << sample.line << "}";
+            }
+            sample_json << "}";
+            write_line_locked(sample_json.str());
+        }
     }
 }
 

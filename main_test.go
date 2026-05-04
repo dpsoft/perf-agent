@@ -2081,6 +2081,72 @@ func TestGPUOfflineDemoScriptHIPRocprofv3RichWritesBrendanStyleFrames(t *testing
 	}
 }
 
+func TestGPUOfflineDemoScriptHIPRocprofv3RichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofv3-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofv3-rich helper: %v\n%s", err, out)
+	}
+
+	goldenDir := filepath.Join("gpu", "testdata", "replay")
+	assertJSONContentEqualsIgnoringKeys(t,
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.raw.json"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.attributions.json"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.folded"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(t,
+		filepath.Join(outDir, "rocprofv3_sample_exec_rich.pb.gz"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.pprof.txt"),
+	)
+}
+
+func TestGPUOfflineDemoScriptHIPRocprofv3CommandRichMatchesArtifactGoldens(t *testing.T) {
+	outDir := t.TempDir()
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "gpu-offline-demo.sh"),
+		"hip-rocprofv3-command-rich",
+		outDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hip-rocprofv3-command-rich helper: %v\n%s", err, out)
+	}
+
+	goldenDir := filepath.Join("gpu", "testdata", "replay")
+	assertJSONContentEqualsIgnoringKeys(t,
+		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.raw.json"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.raw.json"),
+		"cgroup_path",
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.attributions.json"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.attributions.json"),
+	)
+	assertFileContentEquals(t,
+		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.folded"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.folded"),
+	)
+	assertPprofTopEquals(t,
+		filepath.Join(outDir, "rocprofv3_command_sample_exec_rich.pb.gz"),
+		filepath.Join(goldenDir, "rocprofv3_sample_exec_rich.pprof.txt"),
+	)
+}
+
 func TestGPUOfflineDemoScriptHIPRocprofilerSDKCommandRichWritesBrendanStyleFrames(t *testing.T) {
 	outDir := t.TempDir()
 	cmd := exec.Command(

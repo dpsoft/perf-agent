@@ -1,0 +1,1 @@
+train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:event:submit:amdgpu-cs] 131313130

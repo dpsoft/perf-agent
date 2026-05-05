@@ -1,0 +1,1 @@
+[{"cgroup_id":"9876","pod_uid":"pod-abc","container_id":"ctr-123","container_runtime":"containerd","first_seen_ns":100,"last_seen_ns":200,"backends":["stream"],"kernel_names":["flash_attn_fwd"],"launch_count":1,"exact_join_count":1,"execution_count":1,"execution_duration_ns":80,"sample_weight":7}]

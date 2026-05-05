@@ -3,7 +3,9 @@ package perfagent
 
 import (
 	"io"
+	"time"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/metrics"
 )
 
@@ -60,6 +62,57 @@ type Config struct {
 
 	// CPUs is the list of CPUs to monitor. If nil, all online CPUs are used.
 	CPUs []uint
+
+	// GPUReplayInput is a fixture path for the experimental replay backend.
+	GPUReplayInput string
+
+	// GPUHostReplayInput is a fixture path for the experimental host replay source.
+	GPUHostReplayInput string
+
+	// GPUHostHIPLibrary is the shared object path for the experimental HIP host source.
+	GPUHostHIPLibrary string
+
+	// GPUHostHIPSymbol is the HIP launch symbol name to trace.
+	GPUHostHIPSymbol string
+
+	// GPUStreamInput is a live normalized GPU NDJSON stream.
+	GPUStreamInput io.Reader
+
+	// GPUAMDSampleInput is a live AMD execution/sample NDJSON stream.
+	GPUAMDSampleInput io.Reader
+
+	// GPULinuxDRM enables the experimental Linux DRM lifecycle backend.
+	GPULinuxDRM bool
+
+	// GPULinuxKFD enables the experimental Linux KFD compute lifecycle backend.
+	GPULinuxKFD bool
+
+	// GPUHIPLinuxDRMJoinWindow bounds heuristic HIP launch -> linuxdrm event joins.
+	GPUHIPLinuxDRMJoinWindow time.Duration
+
+	// GPURawOutputPath writes the normalized GPU snapshot as JSON when set.
+	GPURawOutputPath string
+
+	// GPURawOutputWriter receives JSON GPU snapshot output when set.
+	GPURawOutputWriter io.Writer
+
+	// GPUAttributionOutputPath writes workload attribution rollups as JSON when set.
+	GPUAttributionOutputPath string
+
+	// GPUAttributionOutputWriter receives workload attribution rollups as JSON when set.
+	GPUAttributionOutputWriter io.Writer
+
+	// GPUProfileOutputPath writes synthetic-frame GPU pprof output when set.
+	GPUProfileOutputPath string
+
+	// GPUProfileOutputWriter receives synthetic-frame GPU pprof output when set.
+	GPUProfileOutputWriter io.Writer
+
+	// GPUFoldedOutputPath writes folded-stack GPU flamegraph input when set.
+	GPUFoldedOutputPath string
+
+	// GPUFoldedOutputWriter receives folded-stack GPU flamegraph input when set.
+	GPUFoldedOutputWriter io.Writer
 
 	// InjectPython enables Python perf-trampoline injection during profiling.
 	// Only valid with EnableCPUProfile. Requires CAP_SYS_PTRACE.
@@ -227,4 +280,108 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 		c.EnableOffCPUProfile = true
 		c.OffCPUProfileWriter = w
 	}
+}
+
+func WithGPUReplayInput(path string) Option {
+	return func(c *Config) {
+		c.GPUReplayInput = path
+	}
+}
+
+func WithGPUHostReplayInput(path string) Option {
+	return func(c *Config) {
+		c.GPUHostReplayInput = path
+	}
+}
+
+func WithGPUHostHIP(libraryPath, symbol string) Option {
+	return func(c *Config) {
+		if symbol == "" {
+			symbol = "hipLaunchKernel"
+		}
+		c.GPUHostHIPLibrary = libraryPath
+		c.GPUHostHIPSymbol = symbol
+	}
+}
+
+func WithGPUStreamInput(r io.Reader) Option {
+	return func(c *Config) {
+		c.GPUStreamInput = r
+	}
+}
+
+func WithGPUAMDSampleInput(r io.Reader) Option {
+	return func(c *Config) {
+		c.GPUAMDSampleInput = r
+	}
+}
+
+func WithGPULinuxDRM() Option {
+	return func(c *Config) {
+		c.GPULinuxDRM = true
+	}
+}
+
+func WithGPULinuxKFD() Option {
+	return func(c *Config) {
+		c.GPULinuxKFD = true
+	}
+}
+
+func WithGPUHIPLinuxDRMJoinWindow(window time.Duration) Option {
+	return func(c *Config) {
+		c.GPUHIPLinuxDRMJoinWindow = window
+	}
+}
+
+func WithGPURawOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPURawOutputWriter = w
+	}
+}
+
+func WithGPUProfileOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUProfileOutputWriter = w
+	}
+}
+
+func WithGPUAttributionOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUAttributionOutputWriter = w
+	}
+}
+
+func WithGPUFoldedOutput(w io.Writer) Option {
+	return func(c *Config) {
+		c.GPUFoldedOutputWriter = w
+	}
+}
+
+func WithGPURawOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPURawOutputPath = path
+	}
+}
+
+func WithGPUProfileOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUProfileOutputPath = path
+	}
+}
+
+func WithGPUAttributionOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUAttributionOutputPath = path
+	}
+}
+
+func WithGPUFoldedOutputPath(path string) Option {
+	return func(c *Config) {
+		c.GPUFoldedOutputPath = path
+	}
+}
+
+func newGPUManager(backends []gpu.Backend) *gpu.Manager {
+	return gpu.NewManager(backends, nil)
 }

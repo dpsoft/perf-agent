@@ -1,0 +1,1 @@
+[{"cgroup_id":"138970","first_seen_ns":100,"last_seen_ns":155,"backends":["hip","linuxkfd"],"event_families":["kfd"],"kernel_names":["hip_launch_shim_kernel"],"launch_count":1,"heuristic_join_count":2,"event_count":2,"event_duration_ns":18}]

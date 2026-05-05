@@ -1,0 +1,48 @@
+[
+  {
+    "backend": "stream",
+    "pid": 1001,
+    "tid": 1001,
+    "time_ns": 10,
+    "cpu_stack": [
+      {
+        "Name": "train_step_a"
+      },
+      {
+        "Name": "cudaLaunchKernel"
+      }
+    ],
+    "kernel_name": "alpha_kernel",
+    "queue_id": "qa",
+    "context_id": "ctx-a",
+    "correlation_id": "corr-a",
+    "tags": {
+      "cgroup_id": "1000",
+      "pod_uid": "pod-a"
+    },
+    "source": "host-replay"
+  },
+  {
+    "backend": "stream",
+    "pid": 2002,
+    "tid": 2002,
+    "time_ns": 40,
+    "cpu_stack": [
+      {
+        "Name": "train_step_b"
+      },
+      {
+        "Name": "cudaLaunchKernel"
+      }
+    ],
+    "kernel_name": "beta_kernel",
+    "queue_id": "qb",
+    "context_id": "ctx-b",
+    "correlation_id": "corr-b",
+    "tags": {
+      "cgroup_id": "2000",
+      "pod_uid": "pod-b"
+    },
+    "source": "host-replay"
+  }
+]

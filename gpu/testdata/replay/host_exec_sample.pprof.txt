@@ -1,0 +1,1 @@
+train_step;cudaLaunchKernel;[gpu:cgroup:9876];[gpu:pod:pod-abc];[gpu:container:ctr-123];[gpu:launch];[gpu:kernel:flash_attn_fwd];[gpu:stall:memory_throttle] 70707070

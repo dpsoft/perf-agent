@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "events": [
+  {
+    "kind": "exec",
+    "correlation": { "backend": "stream", "value": "c1" },
+    "kernel_name": "flash_attn_fwd",
+    "start_ns": 120,
+    "end_ns": 200
+  },
+  {
+    "kind": "sample",
+    "correlation": { "backend": "stream", "value": "c1" },
+    "time_ns": 150,
+    "kernel_name": "flash_attn_fwd",
+    "stall_reason": "memory_throttle",
+    "weight": 7
+  }
+  ]
+}

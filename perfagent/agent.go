@@ -11,21 +11,41 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/iovisor/gobpf/pkg/cpuonline"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/gpu"
+	amdsample "github.com/dpsoft/perf-agent/gpu/backend/amdsample"
+	linuxdrm "github.com/dpsoft/perf-agent/gpu/backend/linuxdrm"
+	linuxkfd "github.com/dpsoft/perf-agent/gpu/backend/linuxkfd"
+	"github.com/dpsoft/perf-agent/gpu/backend/replay"
+	"github.com/dpsoft/perf-agent/gpu/backend/stream"
+	hostsource "github.com/dpsoft/perf-agent/gpu/host"
+	hiphost "github.com/dpsoft/perf-agent/gpu/host/hip"
+	hostreplay "github.com/dpsoft/perf-agent/gpu/host/replay"
 	"github.com/dpsoft/perf-agent/inject/ptraceop"
 	"github.com/dpsoft/perf-agent/inject/python"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
+	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
+
+const defaultGPUHIPLinuxDRMJoinWindow = 5 * time.Millisecond
+
+func debugGPULivef(format string, args ...any) {
+	if os.Getenv("PERF_AGENT_DEBUG_GPU_LIVE") == "" {
+		return
+	}
+	log.Printf("gpu-live-debug: "+format, args...)
+}
 
 // cpuProfiler is the narrow shape both profile.Profiler and
 // dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
@@ -71,6 +91,8 @@ type Agent struct {
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
+	gpuManager     *gpu.Manager
+	hostSource     hostsource.HostSource
 	pyInjector     *python.Manager // nil unless --inject-python is set
 
 	mu      sync.Mutex
@@ -106,16 +128,50 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 func (c *Config) validate() error {
-	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU {
-		return errors.New("at least one of CPU profile, off-CPU profile, or PMU must be enabled")
+	if c.gpuSourceCount() > 1 {
+		return errors.New("gpu source options are mutually exclusive")
+	}
+	if c.hostSourceCount() > 1 {
+		return errors.New("gpu host source options are mutually exclusive")
+	}
+
+	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU && c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
+		return errors.New("at least one of CPU profile, off-CPU profile, PMU, a GPU source, or a GPU host source must be enabled")
+	}
+	if c.hostSourceCount() > 0 && c.gpuSourceCount() == 0 {
+		return errors.New("gpu host source requires a gpu source")
+	}
+
+	if c.GPULinuxDRM {
+		if c.SystemWide {
+			return errors.New("linuxdrm backend does not support system-wide mode")
+		}
+		if c.PID == 0 {
+			return errors.New("linuxdrm backend requires pid")
+		}
+	}
+	if c.GPULinuxKFD {
+		if c.SystemWide {
+			return errors.New("linuxkfd backend does not support system-wide mode")
+		}
+		if c.PID == 0 {
+			return errors.New("linuxkfd backend requires pid")
+		}
+	}
+	if c.GPUHostHIPLibrary != "" && c.PID == 0 {
+		return errors.New("hip host source requires pid")
+	}
+
+	if c.gpuSourceCount() == 0 && c.hostSourceCount() == 0 {
+		if c.PID == 0 && !c.SystemWide {
+			return errors.New("either PID or system-wide is required")
+		}
+	} else if c.PID == 0 && !c.SystemWide && !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU {
+		return nil
 	}
 
 	if c.PID != 0 && c.SystemWide {
 		return errors.New("PID and system-wide are mutually exclusive")
-	}
-
-	if c.PID == 0 && !c.SystemWide {
-		return errors.New("either PID or system-wide is required")
 	}
 
 	if c.PerPID && !c.SystemWide {
@@ -135,6 +191,37 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+func (c *Config) gpuSourceCount() int {
+	count := 0
+	if c.GPUReplayInput != "" {
+		count++
+	}
+	if c.GPUStreamInput != nil {
+		count++
+	}
+	if c.GPUAMDSampleInput != nil {
+		count++
+	}
+	if c.GPULinuxDRM {
+		count++
+	}
+	if c.GPULinuxKFD {
+		count++
+	}
+	return count
+}
+
+func (c *Config) hostSourceCount() int {
+	count := 0
+	if c.GPUHostReplayInput != "" {
+		count++
+	}
+	if c.GPUHostHIPLibrary != "" {
+		count++
+	}
+	return count
 }
 
 // hasCapSysPtrace reports whether the current process holds CAP_SYS_PTRACE
@@ -217,6 +304,16 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	if a.started {
 		return errors.New("agent already started")
+	}
+
+	gpuMode := a.config.gpuSourceCount() == 1 && !a.config.EnableCPUProfile && !a.config.EnableOffCPUProfile && !a.config.EnablePMU
+	if gpuMode {
+		if err := a.startGPUPipeline(ctx); err != nil {
+			a.cleanup()
+			return err
+		}
+		a.started = true
+		return nil
 	}
 
 	// Set capabilities:
@@ -388,8 +485,83 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	if a.config.gpuSourceCount() == 1 {
+		if err := a.startGPUPipeline(ctx); err != nil {
+			a.cleanup()
+			return err
+		}
+	}
+
 	a.started = true
 	return nil
+}
+
+func (a *Agent) startGPUPipeline(ctx context.Context) error {
+	gpuBackend, err := a.newGPUBackend()
+	if err != nil {
+		return fmt.Errorf("create GPU backend: %w", err)
+	}
+	a.gpuManager = gpu.NewManager([]gpu.Backend{gpuBackend}, a.gpuManagerConfig())
+	if err := a.gpuManager.Start(ctx); err != nil {
+		return fmt.Errorf("start GPU manager: %w", err)
+	}
+	if a.config.hostSourceCount() == 1 {
+		hostSource, err := a.newHostSource()
+		if err != nil {
+			return fmt.Errorf("create host source: %w", err)
+		}
+		a.hostSource = hostSource
+		if err := a.hostSource.Start(ctx, hostsource.NewLaunchSink(a.gpuManager)); err != nil {
+			return fmt.Errorf("start host source: %w", err)
+		}
+	}
+	return nil
+}
+
+func (a *Agent) gpuManagerConfig() *gpu.ManagerConfig {
+	if (!a.config.GPULinuxDRM && !a.config.GPULinuxKFD) || a.config.GPUHostHIPLibrary == "" {
+		return nil
+	}
+
+	window := a.config.GPUHIPLinuxDRMJoinWindow
+	if window <= 0 {
+		window = defaultGPUHIPLinuxDRMJoinWindow
+	}
+	return &gpu.ManagerConfig{
+		LaunchEventJoinWindowNs: uint64(window),
+	}
+}
+
+func (a *Agent) newGPUBackend() (gpu.Backend, error) {
+	switch {
+	case a.config.GPUReplayInput != "":
+		return replay.New(a.config.GPUReplayInput)
+	case a.config.GPUStreamInput != nil:
+		return stream.New(a.config.GPUStreamInput), nil
+	case a.config.GPUAMDSampleInput != nil:
+		return amdsample.New(amdsample.Config{Reader: a.config.GPUAMDSampleInput})
+	case a.config.GPULinuxDRM:
+		return linuxdrm.New(linuxdrm.Config{PID: a.config.PID})
+	case a.config.GPULinuxKFD:
+		return linuxkfd.New(linuxkfd.Config{PID: a.config.PID})
+	default:
+		return nil, errors.New("no gpu source configured")
+	}
+}
+
+func (a *Agent) newHostSource() (hostsource.HostSource, error) {
+	switch {
+	case a.config.GPUHostReplayInput != "":
+		return hostreplay.New(a.config.GPUHostReplayInput)
+	case a.config.GPUHostHIPLibrary != "":
+		return hiphost.New(hiphost.Config{
+			PID:         a.config.PID,
+			LibraryPath: a.config.GPUHostHIPLibrary,
+			Symbol:      a.config.GPUHostHIPSymbol,
+		})
+	default:
+		return nil, errors.New("no gpu host source configured")
+	}
 }
 
 // Stop stops data collection and writes profiles.
@@ -446,9 +618,56 @@ func (a *Agent) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Deactivate Python trampolines after profile finalization but before BPF
-	// teardown. Tolerates ESRCH (process gone) and respects the 5s deadline.
-	if a.pyInjector != nil {
+	if a.gpuManager != nil {
+		// Deactivate Python trampolines after profile finalization but before BPF
+		// teardown.
+		if a.pyInjector != nil {
+			a.pyInjector.DeactivateAll(ctx)
+		}
+		if a.hostSource != nil {
+			debugGPULivef("stopping host source")
+			if err := a.hostSource.Stop(ctx); err != nil {
+				debugGPULivef("host source stop error: %v", err)
+				log.Printf("Failed to stop GPU host source: %v", err)
+				lastErr = err
+			} else {
+				debugGPULivef("host source stopped")
+			}
+		}
+		debugGPULivef("stopping gpu manager")
+		if err := a.gpuManager.Stop(ctx); err != nil {
+			debugGPULivef("gpu manager stop error: %v", err)
+			log.Printf("Failed to stop GPU manager: %v", err)
+			lastErr = err
+		} else {
+			debugGPULivef("gpu manager stopped")
+		}
+		debugGPULivef("building gpu snapshot")
+		snapshot := a.gpuManager.Snapshot()
+		if err := a.writeGPURaw(snapshot); err != nil {
+			debugGPULivef("gpu raw write error: %v", err)
+			log.Printf("Failed to write GPU raw output: %v", err)
+			lastErr = err
+		}
+		if err := a.writeGPUAttributions(snapshot); err != nil {
+			debugGPULivef("gpu attribution write error: %v", err)
+			log.Printf("Failed to write GPU attribution output: %v", err)
+			lastErr = err
+		}
+		if err := a.writeGPUProfile(snapshot); err != nil {
+			debugGPULivef("gpu profile write error: %v", err)
+			log.Printf("Failed to write GPU profile output: %v", err)
+			lastErr = err
+		}
+		if err := a.writeGPUFolded(snapshot); err != nil {
+			debugGPULivef("gpu folded write error: %v", err)
+			log.Printf("Failed to write GPU folded output: %v", err)
+			lastErr = err
+		}
+		debugGPULivef("gpu outputs written")
+	}
+
+	if a.gpuManager == nil && a.pyInjector != nil {
 		a.pyInjector.DeactivateAll(ctx)
 	}
 
@@ -495,11 +714,121 @@ func (a *Agent) cleanup() {
 		a.pmuMonitor.Close()
 		a.pmuMonitor = nil
 	}
+	if a.hostSource != nil {
+		_ = a.hostSource.Close()
+		a.hostSource = nil
+	}
+	if a.gpuManager != nil {
+		_ = a.gpuManager.Close()
+		a.gpuManager = nil
+	}
 }
 
 // Config returns a copy of the agent's configuration.
 func (a *Agent) Config() Config {
 	return *a.config
+}
+
+func (a *Agent) GPUEventBackends() ([]gpu.GPUBackendID, error) {
+	if a.gpuManager != nil {
+		return a.gpuManager.EventBackends(), nil
+	}
+	if a.config.gpuSourceCount() == 0 {
+		return nil, nil
+	}
+
+	backend, err := a.newGPUBackend()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = backend.Close()
+	}()
+	return backend.EventBackends(), nil
+}
+
+func (a *Agent) writeGPURaw(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPURawOutputWriter != nil:
+		return gpu.WriteJSONSnapshot(a.config.GPURawOutputWriter, snapshot)
+	case a.config.GPURawOutputPath != "":
+		f, err := os.Create(a.config.GPURawOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteJSONSnapshot(f, snapshot)
+	default:
+		return nil
+	}
+}
+
+func (a *Agent) writeGPUAttributions(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPUAttributionOutputWriter != nil:
+		return gpu.WriteJSONAttributions(a.config.GPUAttributionOutputWriter, snapshot)
+	case a.config.GPUAttributionOutputPath != "":
+		f, err := os.Create(a.config.GPUAttributionOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteJSONAttributions(f, snapshot)
+	default:
+		return nil
+	}
+}
+
+func (a *Agent) writeGPUProfile(snapshot gpu.Snapshot) error {
+	samples := gpu.ProjectExecutionSamples(snapshot)
+	if len(samples) == 0 {
+		return nil
+	}
+
+	var w io.Writer
+	switch {
+	case a.config.GPUProfileOutputWriter != nil:
+		w = a.config.GPUProfileOutputWriter
+	case a.config.GPUProfileOutputPath != "":
+		f, err := os.Create(a.config.GPUProfileOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	default:
+		return nil
+	}
+
+	builders := pp.NewProfileBuilders(pp.BuildersOptions{
+		SampleRate:    int64(max(1, a.config.SampleRate)),
+		PerPIDProfile: false,
+		Comments:      a.config.Tags,
+	})
+	for i := range samples {
+		builders.AddSample(&samples[i])
+	}
+	for _, builder := range builders.Builders {
+		_, err := builder.Write(w)
+		return err
+	}
+	return nil
+}
+
+func (a *Agent) writeGPUFolded(snapshot gpu.Snapshot) error {
+	switch {
+	case a.config.GPUFoldedOutputWriter != nil:
+		return gpu.WriteFoldedStacks(a.config.GPUFoldedOutputWriter, snapshot)
+	case a.config.GPUFoldedOutputPath != "":
+		f, err := os.Create(a.config.GPUFoldedOutputPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return gpu.WriteFoldedStacks(f, snapshot)
+	default:
+		return nil
+	}
 }
 
 // PythonInjectStats returns counters for the Python injector. Returns a

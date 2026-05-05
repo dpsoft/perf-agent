@@ -1,0 +1,3 @@
+train_step_b;cudaLaunchKernel;[gpu:cgroup:2000];[gpu:pod:pod-b];[gpu:launch];[gpu:event:submit:submit-b] 5
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:event:submit:submit-a1] 3
+train_step_a;cudaLaunchKernel;[gpu:cgroup:1000];[gpu:pod:pod-a];[gpu:launch];[gpu:event:wait:wait-a2] 4

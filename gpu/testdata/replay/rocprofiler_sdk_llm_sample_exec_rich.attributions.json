@@ -1,0 +1,1 @@
+[{"cgroup_id":"138970","pod_uid":"llm-pod-7f","container_id":"decoder-ctr","container_runtime":"containerd","first_seen_ns":100,"last_seen_ns":310,"backends":["amdsample","hip"],"kernel_names":["flash_attn_decode_bf16_gfx11"],"launch_count":1,"heuristic_join_count":1,"execution_count":1,"execution_duration_ns":190,"sample_weight":23}]

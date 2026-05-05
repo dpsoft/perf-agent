@@ -162,7 +162,7 @@ func measureOnePID(pid, runN int, unwind string) schema.Run {
 		},
 	}
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithMode(pid, false, []uint{0}, nil, 99, hooks, modeFromFlag(unwind), nil)
+	prof, err := dwarfagent.NewProfilerWithMode(pid, false, []uint{0}, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil)
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
 		log.Fatalf("NewProfilerWithMode (run %d): %v", runN, err)
@@ -240,7 +240,7 @@ func measureSystemWide(runN int, unwind string) schema.Run {
 	}
 	cpus := allCPUs()
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, hooks, modeFromFlag(unwind), nil)
+	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil)
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
 		log.Fatalf("NewProfilerWithMode (run %d, system-wide): %v", runN, err)

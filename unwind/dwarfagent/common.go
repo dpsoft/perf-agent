@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	blazesym "github.com/libbpf/blazesym/go"
 
+	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
@@ -80,6 +81,8 @@ type session struct {
 	missReader   *ringbuf.Reader
 	drainerWG    sync.WaitGroup
 	missCounters missCounters
+
+	perfData *perfdata.Writer // optional, nil when --perf-data-output not set
 }
 
 // attachStats records the (pidCount, binaryCount) returned by the
@@ -100,7 +103,7 @@ type attachStats struct {
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
@@ -223,6 +226,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		stop:        make(chan struct{}),
 		samples:     map[sampleKey]uint64{},
 		attachStats: stats,
+		perfData:    perfData,
 	}, nil
 }
 

@@ -1577,3 +1577,65 @@ func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
 	require.Greater(t, totalNs, int64(0), "off-CPU profile should have non-zero blocking-ns values")
 	t.Logf("off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
 }
+
+// TestPerfDataOutput captures a perf.data file from a CPU-bound workload,
+// runs `perf script` against it, and asserts the kernel decodes our output
+// without errors and produces at least one sample line.
+func TestPerfDataOutput(t *testing.T) {
+	requireBPFRunnable(t, getAgentPath(t))
+	// Probe the perf binary functionally. On Ubuntu, /usr/bin/perf is a
+	// shim that re-execs the kernel-version-specific tool from
+	// linux-tools-<kver>; if that package isn't installed the shim exits
+	// non-zero with "perf not found for kernel". LookPath alone isn't
+	// enough — confirm `perf --version` actually works.
+	if _, err := exec.LookPath("perf"); err != nil {
+		t.Skipf("perf binary not on PATH; skipping: %v", err)
+	}
+	if out, err := exec.Command("perf", "--version").CombinedOutput(); err != nil {
+		t.Skipf("perf binary not functional (likely missing linux-tools for this kernel); skipping: %v\n%s",
+			err, string(out))
+	}
+
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+
+	workload := exec.Command(binPath, "20", "2")
+	require.NoError(t, workload.Start())
+	defer func() {
+		if workload.Process != nil {
+			_ = workload.Process.Kill()
+			_ = workload.Wait()
+		}
+	}()
+	time.Sleep(2 * time.Second)
+
+	outDir := t.TempDir()
+	pprofOut := filepath.Join(outDir, "profile.pb.gz")
+	perfDataOut := filepath.Join(outDir, "test.perf.data")
+
+	agent := exec.Command(getAgentPath(t),
+		"--profile",
+		"--profile-output", pprofOut,
+		"--perf-data-output", perfDataOut,
+		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+		"--duration", "5s",
+	)
+	output, err := agent.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	}
+
+	st, err := os.Stat(perfDataOut)
+	require.NoError(t, err, "perf.data not created")
+	require.Greater(t, st.Size(), int64(200), "perf.data suspiciously small: %d bytes", st.Size())
+
+	cmd := exec.Command("perf", "script", "-i", perfDataOut)
+	scriptOut, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("perf script failed on our output: %v\n%s", err, string(scriptOut))
+	}
+	require.NotEmpty(t, scriptOut, "perf script produced no output (no samples in perf.data?)")
+	t.Logf("perf script captured %d bytes of output", len(scriptOut))
+}

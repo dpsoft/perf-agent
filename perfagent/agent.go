@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -21,6 +22,8 @@ import (
 	"github.com/dpsoft/perf-agent/inject/python"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
+	"github.com/dpsoft/perf-agent/internal/perfdata"
+	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
@@ -72,6 +75,7 @@ type Agent struct {
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
 	pyInjector     *python.Manager // nil unless --inject-python is set
+	perfDataWriter *perfdata.Writer // nil when --perf-data-output not set
 
 	mu      sync.Mutex
 	started bool
@@ -253,6 +257,38 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	// Open perf.data writer if --perf-data-output set. Probe HW cycles up
+	// front so the writer's attr matches the perf events we'll actually
+	// open in the profiler — and pass the same spec into the profiler's
+	// constructor below so perf_event_open and the perf.data attr stay
+	// in sync. Otherwise consumers see HW/cycles in the header but real
+	// SW/cpu-clock samples, and weight attribution silently drifts.
+	var profilerEventSpec *perfevent.EventSpec
+	if a.config.PerfDataOutput != "" {
+		spec, err := perfevent.ProbeHardwareCycles(uint64(a.config.SampleRate))
+		if err != nil {
+			return fmt.Errorf("probe perf event for perf.data: %w", err)
+		}
+		log.Printf("perf-agent: perf.data event = %s", spec)
+		profilerEventSpec = &spec
+
+		hostname, _ := os.Hostname()
+		w, err := perfdata.Open(a.config.PerfDataOutput, perfdata.EventSpec{
+			Type:         spec.Type,
+			Config:       spec.Config,
+			SamplePeriod: spec.SamplePeriod,
+			Frequency:    spec.Frequency,
+		}, perfdata.MetaInfo{
+			Hostname:  hostname,
+			OSRelease: readOSRelease(),
+			NumCPUs:   uint32(len(cpus)),
+		})
+		if err != nil {
+			return fmt.Errorf("open perf.data: %w", err)
+		}
+		a.perfDataWriter = w
+	}
+
 	// Inject Python perf-trampoline before BPF attach so early samples have
 	// JIT symbol names. Runs only when --inject-python is set.
 	if a.pyInjector != nil {
@@ -276,6 +312,8 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeEager,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -297,6 +335,8 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeLazy,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -315,6 +355,8 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				a.config.SampleRate,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -487,6 +529,14 @@ func (a *Agent) cleanup() {
 		a.cpuProfiler.Close()
 		a.cpuProfiler = nil
 	}
+	// Close perf.data after the CPU profiler so any in-flight ringbuf
+	// samples (dwarfagent fan-out) land before we patch the file header.
+	if a.perfDataWriter != nil {
+		if err := a.perfDataWriter.Close(); err != nil {
+			log.Printf("perf-agent: close perf.data: %v", err)
+		}
+		a.perfDataWriter = nil
+	}
 	if a.offcpuProfiler != nil {
 		a.offcpuProfiler.Close()
 		a.offcpuProfiler = nil
@@ -495,6 +545,18 @@ func (a *Agent) cleanup() {
 		a.pmuMonitor.Close()
 		a.pmuMonitor = nil
 	}
+}
+
+// readOSRelease reads the running kernel release from
+// /proc/sys/kernel/osrelease (a single-line file). Used to populate the
+// HEADER_OSRELEASE feature section in the perf.data header. Returns
+// "unknown" if the file can't be read.
+func readOSRelease() string {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // Config returns a copy of the agent's configuration.

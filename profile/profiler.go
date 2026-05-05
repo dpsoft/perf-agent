@@ -12,6 +12,7 @@ import (
 	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
+	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
@@ -26,6 +27,7 @@ type Profiler struct {
 	tags       []string
 	sampleRate int
 	labels     map[string]string
+	perfData   *perfdata.Writer // optional, nil when --perf-data-output not set
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -65,8 +67,14 @@ func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 	return out
 }
 
-// NewProfiler creates a new CPU profiler with the specified sample rate in Hz
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
+// NewProfiler creates a new CPU profiler.
+//
+// eventSpec selects the perf-event source. Pass nil to default to software
+// cpu-clock at sampleRate Hz. When non-nil, sampleRate is ignored (the
+// caller is responsible for putting the desired rate in eventSpec). Used
+// by the agent to keep the in-kernel event and the perf.data attr in sync
+// when the output writer is enabled — a divergence would mislead consumers.
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -96,7 +104,16 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, sampleRate)
+	evSpec := perfevent.EventSpec{
+		Type:         perfevent.PerfTypeSoftware,
+		Config:       perfevent.PerfCountSWCPUClock,
+		SamplePeriod: uint64(sampleRate),
+		Frequency:    true,
+	}
+	if eventSpec != nil {
+		evSpec = *eventSpec
+	}
+	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, evSpec)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -120,6 +137,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		tags:       tags,
 		sampleRate: sampleRate,
 		labels:     labels,
+		perfData:   perfData,
 	}, nil
 }
 
@@ -167,7 +185,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		Labels:        pr.labels,
 	})
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		key := keys[i]
 		value := values[i]
 
@@ -219,6 +237,16 @@ func (pr *Profiler) Collect(w io.Writer) error {
 
 		sample := pr.createSample(sb, value, int(samplePid))
 		builders.AddSample(&sample)
+
+		if pr.perfData != nil && len(ips) > 0 {
+			pr.perfData.AddSample(perfdata.SampleRecord{
+				IP:        ips[0],
+				Pid:       samplePid,
+				Tid:       samplePid,
+				Period:    value,
+				Callchain: ips,
+			})
+		}
 	}
 
 	// Write profile directly to the provided writer

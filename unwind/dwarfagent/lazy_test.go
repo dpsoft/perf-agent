@@ -57,7 +57,7 @@ func TestLazyMode_FiresAndCompilesOnMiss(t *testing.T) {
 	for i := range cpus {
 		cpus[i] = uint(i)
 	}
-	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, nil, dwarfagent.ModeLazy, nil)
+	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, nil, dwarfagent.ModeLazy, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewProfilerWithMode: %v", err)
 	}

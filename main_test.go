@@ -631,6 +631,28 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRunUsesProvidedLib
 	}
 }
 
+func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRunUsesProvidedIncludeDir(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-rocprofiler-sdk-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-rocprofiler-sdk-flame",
+		"--rocprofiler-sdk-library", "/custom/rocm/lib/librocprofiler-sdk.so",
+		"--rocprofiler-sdk-include-dir", "/custom/rocm/include",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip rocprofiler-sdk flamegraph with explicit include: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "-I /custom/rocm/include") {
+		t.Fatalf("missing explicit include dir in output:\n%s", got)
+	}
+	if strings.Contains(got, "/home/diego/github/rocm-systems/projects/rocprofiler-sdk/source/include") {
+		t.Fatalf("dry-run should not hardcode local rocm-systems include path when explicit include dir is provided:\n%s", got)
+	}
+}
+
 func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
 	fixtures := []string{
 		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),

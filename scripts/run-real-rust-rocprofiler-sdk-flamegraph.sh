@@ -8,7 +8,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh [--dry-run] [--outdir <dir>] [--hip-library <path>] [--rocprofiler-sdk-library <path>] [--duration <dur>] [--iterations <n>] [--sleep-before-ms <ms>] [--sleep-between-ms <ms>] [--sleep-after-ms <ms>] [--cpu-spin <n>]
+  scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh [--dry-run] [--outdir <dir>] [--hip-library <path>] [--rocprofiler-sdk-library <path>] [--rocprofiler-sdk-include-dir <path>] [--duration <dur>] [--iterations <n>] [--sleep-before-ms <ms>] [--sleep-between-ms <ms>] [--sleep-after-ms <ms>] [--cpu-spin <n>]
 
 Builds a real Rust HIP workload, runs it, profiles CPU stacks plus HIP host
 launches, and feeds a real rocprofiler-sdk native producer into
@@ -61,6 +61,7 @@ DRY_RUN=0
 OUTDIR="/tmp/perf-agent-real-rust-hip-sdk"
 HIP_LIBRARY=""
 ROCPROFILER_SDK_LIBRARY=""
+ROCPROFILER_SDK_INCLUDE_DIR=""
 DURATION=""
 ITERATIONS="12"
 SLEEP_BEFORE_MS="5000"
@@ -85,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rocprofiler-sdk-library)
             ROCPROFILER_SDK_LIBRARY="${2:-}"
+            shift 2
+            ;;
+        --rocprofiler-sdk-include-dir)
+            ROCPROFILER_SDK_INCLUDE_DIR="${2:-}"
             shift 2
             ;;
         --duration)
@@ -139,6 +144,20 @@ if [[ -z "${ROCPROFILER_SDK_LIBRARY}" ]]; then
     exit 1
 fi
 ROCPROFILER_SDK_LIB_DIR=$(dirname "${ROCPROFILER_SDK_LIBRARY}")
+ROCPROFILER_SDK_ROOT_DIR=$(dirname "${ROCPROFILER_SDK_LIB_DIR}")
+if [[ -z "${ROCPROFILER_SDK_INCLUDE_DIR}" ]]; then
+    if [[ -n "${PERF_AGENT_ROCPROFILER_SDK_INCLUDE_DIR:-}" ]]; then
+        ROCPROFILER_SDK_INCLUDE_DIR="${PERF_AGENT_ROCPROFILER_SDK_INCLUDE_DIR}"
+    elif [[ -d "${ROCPROFILER_SDK_ROOT_DIR}/include" ]]; then
+        ROCPROFILER_SDK_INCLUDE_DIR="${ROCPROFILER_SDK_ROOT_DIR}/include"
+    else
+        ROCPROFILER_SDK_INCLUDE_DIR="${ROCPROFILER_SDK_ROOT_DIR}/source/include"
+    fi
+fi
+ROCPROFILER_SDK_EXTRA_INCLUDE_DIR=""
+if [[ -d "${ROCPROFILER_SDK_ROOT_DIR}/source/include" && "${ROCPROFILER_SDK_ROOT_DIR}/source/include" != "${ROCPROFILER_SDK_INCLUDE_DIR}" ]]; then
+    ROCPROFILER_SDK_EXTRA_INCLUDE_DIR="${ROCPROFILER_SDK_ROOT_DIR}/source/include"
+fi
 
 if [[ -z "${DURATION}" ]]; then
     LOOP_BUDGET_MS=$((ITERATIONS * LAUNCHES_PER_ITERATION * SLEEP_BETWEEN_MS))
@@ -221,9 +240,7 @@ declare -a BUILD_BRIDGE_CMD=(
     -D__HIP_PLATFORM_AMD__
     examples/rocprofiler_sdk_preload_bridge.cpp
     -I
-    /home/diego/github/rocm-systems/projects/rocprofiler-sdk/source/include
-    -I
-    /home/diego/github/rocm-systems/rocprofiler-sdk-build/source/include
+    "${ROCPROFILER_SDK_INCLUDE_DIR}"
     -L
     "${ROCPROFILER_SDK_LIB_DIR}"
     -lrocprofiler-sdk
@@ -231,6 +248,14 @@ declare -a BUILD_BRIDGE_CMD=(
     -o
     "${BRIDGE_SO}"
 )
+if [[ -n "${ROCPROFILER_SDK_EXTRA_INCLUDE_DIR}" ]]; then
+    BUILD_BRIDGE_CMD=(
+        "${BUILD_BRIDGE_CMD[@]:0:8}"
+        -I
+        "${ROCPROFILER_SDK_EXTRA_INCLUDE_DIR}"
+        "${BUILD_BRIDGE_CMD[@]:8}"
+    )
+fi
 
 declare -a BUILD_RENDER_CMD=(
     env

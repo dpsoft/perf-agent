@@ -7,9 +7,13 @@ import "io"
 //       16 (data section) + 16 (event_types section) + 32 (adds_features bitmap).
 const fileHeaderSize = 104
 
-// magicPERFILE2 is the little-endian on-disk representation of "PERFILE2".
-// Constructed manually so reading the file with cat shows "PERFILE2".
-const magicPERFILE2 uint64 = 0x50455246494c4532
+// magicPERFILE2 is the uint64 value that, when serialized little-endian via
+// writeUint64LE, lands the ASCII bytes 'P','E','R','F','I','L','E','2' on
+// disk in that order. Decoded high-to-low: 0x32 ('2'), 0x45 ('E'), 0x4c
+// ('L'), 0x49 ('I'), 0x46 ('F'), 0x52 ('R'), 0x45 ('E'), 0x50 ('P') — i.e.
+// "PERFILE2" reversed. The kernel matches the on-disk literal, not the
+// big-endian value.
+const magicPERFILE2 uint64 = 0x32454c4946524550
 
 // attrV8Size is the on-disk size of struct perf_event_attr at version 8 of
 // the format (the canonical modern size).

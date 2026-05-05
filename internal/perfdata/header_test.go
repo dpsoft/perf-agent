@@ -16,8 +16,8 @@ func TestEncodeFileHeader_Empty(t *testing.T) {
 	encodeFileHeader(&buf, hdr)
 
 	want := []byte{
-		// magic = "PERFILE2" little-endian
-		0x32, 0x45, 0x4c, 0x49, 0x46, 0x52, 0x45, 0x50,
+		// magic = ASCII "PERFILE2" on disk (P E R F I L E 2)
+		0x50, 0x45, 0x52, 0x46, 0x49, 0x4c, 0x45, 0x32,
 		// size = 104
 		0x68, 0, 0, 0, 0, 0, 0, 0,
 		// attr_size = 136
@@ -45,6 +45,12 @@ func TestEncodeFileHeader_Empty(t *testing.T) {
 	}
 	if buf.Len() != fileHeaderSize {
 		t.Errorf("file header size = %d, want %d", buf.Len(), fileHeaderSize)
+	}
+	// Cross-check: the first 8 bytes on disk MUST be ASCII "PERFILE2".
+	// `perf script` and friends match the literal string, not the numeric
+	// magic. Easy to break by flipping the magic constant's endianness.
+	if got := string(buf.Bytes()[:8]); got != "PERFILE2" {
+		t.Errorf("on-disk magic = %q, want %q", got, "PERFILE2")
 	}
 }
 

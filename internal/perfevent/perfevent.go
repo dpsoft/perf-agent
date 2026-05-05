@@ -67,9 +67,10 @@ type config struct {
 // BPF program is attached. Recommended for new call sites.
 func WithDeferredEnable() Option { return func(c *config) { c.deferEnable = true } }
 
-// OpenAll opens one PERF_TYPE_SOFTWARE / PERF_COUNT_SW_CPU_CLOCK event per
-// CPU at the given sample rate (treated as Hz via PerfBitFreq), attaches
-// prog to each via link.AttachRawLink, and returns the resulting Set.
+// OpenAll opens one perf event per CPU configured per spec (Type/Config
+// determine the event source; SamplePeriod is interpreted as a frequency
+// in Hz when spec.Frequency is true, otherwise as a fixed sample period),
+// attaches prog to each via link.AttachRawLink, and returns the resulting Set.
 //
 // Offline CPUs (ESRCH from perf_event_open) are skipped silently — they
 // come back online or stay offline, neither is an error here. If every CPU
@@ -83,7 +84,10 @@ func OpenAll(prog *ebpf.Program, cpus []uint, spec EventSpec, opts ...Option) (*
 		o(&cfg)
 	}
 
-	bits := uint64(unix.PerfBitFreq)
+	var bits uint64
+	if spec.Frequency {
+		bits |= unix.PerfBitFreq
+	}
 	if cfg.deferEnable {
 		bits |= unix.PerfBitDisabled
 	}

@@ -259,13 +259,19 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Open perf.data writer if --perf-data-output set. Probe HW cycles up
 	// front so the writer's attr matches the perf events we'll actually
-	// open in the profiler.
+	// open in the profiler — and pass the same spec into the profiler's
+	// constructor below so perf_event_open and the perf.data attr stay
+	// in sync. Otherwise consumers see HW/cycles in the header but real
+	// SW/cpu-clock samples, and weight attribution silently drifts.
+	var profilerEventSpec *perfevent.EventSpec
 	if a.config.PerfDataOutput != "" {
 		spec, err := perfevent.ProbeHardwareCycles(uint64(a.config.SampleRate))
 		if err != nil {
 			return fmt.Errorf("probe perf event for perf.data: %w", err)
 		}
 		log.Printf("perf-agent: perf.data event = %s", spec)
+		profilerEventSpec = &spec
+
 		hostname, _ := os.Hostname()
 		w, err := perfdata.Open(a.config.PerfDataOutput, perfdata.EventSpec{
 			Type:         spec.Type,
@@ -307,6 +313,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				dwarfagent.ModeEager,
 				labels,
 				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -329,6 +336,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				dwarfagent.ModeLazy,
 				labels,
 				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -348,6 +356,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SampleRate,
 				labels,
 				a.perfDataWriter,
+				profilerEventSpec,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)

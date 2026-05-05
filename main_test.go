@@ -864,6 +864,7 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKNativeProbe(t *testing.T) {
 		"hip-rocprofiler-sdk-native-probe",
 		"/tmp/gpu-rocprofiler-sdk-native-probe-demo",
 	)
+	cmd.Env = append(os.Environ(), "PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY=/custom/rocm/lib/librocprofiler-sdk.so")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("dry-run hip-rocprofiler-sdk-native-probe: %v\n%s", err, out)
@@ -873,7 +874,7 @@ func TestGPUOfflineDemoScriptDryRunHIPRocprofilerSDKNativeProbe(t *testing.T) {
 		"GOCACHE=/tmp/perf-agent-gocache",
 		"GOMODCACHE=/tmp/perf-agent-gomodcache",
 		"GOTOOLCHAIN=auto",
-		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofiler-sdk --rocprofiler-sdk-mode native --rocprofiler-sdk-library /home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so",
+		"go run ./cmd/amd-sample-collector --mode real --real-source rocprofiler-sdk --rocprofiler-sdk-mode native --rocprofiler-sdk-library /custom/rocm/lib/librocprofiler-sdk.so",
 		"|",
 		"--gpu-host-replay-input gpu/testdata/host/replay/hip_kfd_launches.json",
 		"--gpu-amd-sample-stdin",

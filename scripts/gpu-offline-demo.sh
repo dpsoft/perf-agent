@@ -58,6 +58,22 @@ Outputs:
 EOF
 }
 
+discover_rocprofiler_sdk_native_library() {
+    local candidate
+    for candidate in \
+        "${PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY:-}" \
+        "/usr/local/lib/librocprofiler-sdk.so" \
+        "/opt/rocm/lib/librocprofiler-sdk.so" \
+        "/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so"
+    do
+        if [[ -n "${candidate}" && -e "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 discover_hip_library() {
     local env_path="${PERF_AGENT_HIP_LIBRARY:-}"
     if [[ -n "${env_path}" && -e "${env_path}" ]]; then
@@ -166,7 +182,13 @@ AMD_SAMPLE_SOURCE_REAL_SOURCE=""
 AMD_SAMPLE_SOURCE_COMMAND_ENV=""
 AMD_SAMPLE_SOURCE_OUTPUT_ENV=""
 AMD_SAMPLE_SOURCE_OUTPUT_FILE=""
-ROCPROFILER_SDK_NATIVE_LIBRARY="${PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY:-/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so}"
+ROCPROFILER_SDK_NATIVE_LIBRARY="${PERF_AGENT_REAL_ROCPROFILER_SDK_LIBRARY:-}"
+if [[ -z "${ROCPROFILER_SDK_NATIVE_LIBRARY}" ]]; then
+    ROCPROFILER_SDK_NATIVE_LIBRARY="$(discover_rocprofiler_sdk_native_library || true)"
+fi
+if [[ -z "${ROCPROFILER_SDK_NATIVE_LIBRARY}" ]]; then
+    ROCPROFILER_SDK_NATIVE_LIBRARY="/opt/rocm/lib/librocprofiler-sdk.so"
+fi
 NAME=""
 DEBUG_GPU_LIVE=0
 declare -a EXTRA_ARGS=()

@@ -68,23 +68,20 @@ One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python
 
 `--pmu` summarizes IPC, cache miss rate, runqueue latency (P50/P99), and context-switch reasons (preempted vs voluntary vs I/O wait). Combine with `--per-pid` in system-wide mode to see which processes dominate the node's wait time.
 
-### 🧪 Differential profiling, PGO, and ecosystem-tool round-trip
-
-High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof -diff_base` and Go's native `-pgo=...` flag.
-
-For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` file alongside the pprof output. Same capture, two formats. Pick whichever consumer fits:
-
-- **AutoFDO PGO** for Rust (`-C profile-use=...`) and C++ (`clang -fprofile-sample-use=...`) via Google's [`create_llvm_prof`](https://github.com/google/autofdo). End-to-end demo: [`examples/rust-pgo`](examples/rust-pgo/), [`examples/cpp-pgo`](examples/cpp-pgo/).
-- **`perf script` / `perf report`** — text dump or terminal TUI, no extra tooling.
-- **[FlameGraph](https://github.com/brendangregg/FlameGraph)** — `perf script | stackcollapse-perf.pl | flamegraph.pl` produces an SVG. Demo: [`examples/flamegraph`](examples/flamegraph/).
-- **[hotspot](https://github.com/KDAB/hotspot)** — Qt GUI with interactive flame graphs, call trees, and source annotation.
-- **[Pyroscope](https://pyroscope.io/) / Grafana** — ingest perf.data via their converters when you'd rather store profiles centrally.
-
-See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walkthrough.
-
 ### 🐳 Sidecar profiling inside Kubernetes pods
 
 `--pid <N>` is namespace-aware (with `shareProcessNamespace: true` on the pod), so the in-pod PID just works. Output samples carry k8s identity labels (`pod_uid`, `container_id`, `cgroup_path`) parsed from the cgroup, plus best-effort `pod_name` / `namespace` / `container_name` from the downward API. **No kubelet API calls, no client-go dependency.**
+
+### 🧪 PGO and flame graphs
+
+High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof -diff_base` and Go's native `-pgo=...` flag.
+
+For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` alongside the pprof output. Same capture, two formats:
+
+- **AutoFDO PGO** for Rust (`-C profile-use=...`) and C++ (`clang -fprofile-sample-use=...`) via Google's [`create_llvm_prof`](https://github.com/google/autofdo). End-to-end demo: [`examples/rust-pgo`](examples/rust-pgo/), [`examples/cpp-pgo`](examples/cpp-pgo/).
+- **[FlameGraph](https://github.com/brendangregg/FlameGraph)** — `perf script | stackcollapse-perf.pl | flamegraph.pl` produces an SVG. Demo: [`examples/flamegraph`](examples/flamegraph/).
+
+See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walkthrough.
 
 ---
 

@@ -1583,8 +1583,17 @@ func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
 // without errors and produces at least one sample line.
 func TestPerfDataOutput(t *testing.T) {
 	requireBPFRunnable(t, getAgentPath(t))
+	// Probe the perf binary functionally. On Ubuntu, /usr/bin/perf is a
+	// shim that re-execs the kernel-version-specific tool from
+	// linux-tools-<kver>; if that package isn't installed the shim exits
+	// non-zero with "perf not found for kernel". LookPath alone isn't
+	// enough — confirm `perf --version` actually works.
 	if _, err := exec.LookPath("perf"); err != nil {
-		t.Skipf("perf binary not installed; skipping: %v", err)
+		t.Skipf("perf binary not on PATH; skipping: %v", err)
+	}
+	if out, err := exec.Command("perf", "--version").CombinedOutput(); err != nil {
+		t.Skipf("perf binary not functional (likely missing linux-tools for this kernel); skipping: %v\n%s",
+			err, string(out))
 	}
 
 	binPath := "./workloads/rust/target/release/rust-workload"

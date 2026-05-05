@@ -1008,6 +1008,19 @@ xdg-open /tmp/perf-agent-real-rust-hip-sdk/real_rust_hip_attention_rocprofiler_s
 
 That path builds and runs the real Rust HIP workload, feeds the live `rocprofiler-sdk` native bridge into `perf-agent --gpu-amd-sample-stdin`, and renders a mixed CPU+GPU HTML/SVG flamegraph. The current live GPU leaves come from dispatch-derived native records rather than full hardware PC sampling, but the app, CPU stack, HIP launches, and SDK producer path are all real.
 
+For the canonical AMD-first `v1` acceptance path, use the smoke wrapper:
+
+```bash
+bash scripts/amd-v1-smoke.sh \
+  --outdir /tmp/perf-agent-amd-v1
+```
+
+That wrapper runs the same real Rust + `rocprofiler-sdk` path and then verifies:
+- the expected artifact files exist and are non-empty
+- the raw JSON contains `join_stats`
+- the HTML is a `CPU + GPU Flame Graph`
+- the folded output contains both CPU-side and GPU-side frames
+
 Recorder-envelope variant of the same modern SDK path:
 
 ```bash

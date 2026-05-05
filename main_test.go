@@ -653,6 +653,36 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRunUsesProvidedInc
 	}
 }
 
+func TestAMDV1SmokeScriptDryRun(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-v1-smoke.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/perf-agent-amd-v1-test",
+		"--rocprofiler-sdk-library", "/custom/rocm/lib/librocprofiler-sdk.so",
+		"--rocprofiler-sdk-include-dir", "/custom/rocm/include",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run amd v1 smoke: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"runner:",
+		"bash scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh --outdir /tmp/perf-agent-amd-v1-test --rocprofiler-sdk-library /custom/rocm/lib/librocprofiler-sdk.so --rocprofiler-sdk-include-dir /custom/rocm/include --dry-run",
+		"checks:",
+		"test -s /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json",
+		"grep -q '\"join_stats\"' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json",
+		"grep -q 'CPU + GPU Flame Graph:' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.html",
+		"grep -q '\\[gpu:function:' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded",
+		"grep -Eq 'hipModuleLaunchKernel|real_hip_attention_workload::' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
 	fixtures := []string{
 		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),

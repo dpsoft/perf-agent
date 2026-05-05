@@ -712,6 +712,38 @@ func TestAMDV1SmokeScriptRequiresCachedSudo(t *testing.T) {
 	}
 }
 
+func TestAMDV1SmokeScriptRejectsMissingExplicitSDKLibrary(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-v1-smoke.sh"),
+		"--outdir", filepath.Join(t.TempDir(), "out"),
+		"--rocprofiler-sdk-library", "/definitely/missing/librocprofiler-sdk.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing sdk library failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "amd-v1-smoke explicit rocprofiler-sdk library does not exist: /definitely/missing/librocprofiler-sdk.so") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
+func TestAMDV1SmokeScriptRejectsMissingExplicitIncludeDir(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-v1-smoke.sh"),
+		"--outdir", filepath.Join(t.TempDir(), "out"),
+		"--rocprofiler-sdk-include-dir", "/definitely/missing/include",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing include dir failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "amd-v1-smoke explicit rocprofiler-sdk include dir does not exist: /definitely/missing/include") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
 	fixtures := []string{
 		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),

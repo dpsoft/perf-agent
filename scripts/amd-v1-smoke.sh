@@ -27,6 +27,14 @@ quote_cmd() {
     printf '%s\n' "${parts[*]}"
 }
 
+require_cmd() {
+    local name="${1:?command name required}"
+    if ! command -v "${name}" >/dev/null 2>&1; then
+        echo "amd-v1-smoke requires '${name}' on PATH." >&2
+        exit 1
+    fi
+}
+
 print_failure_summary() {
     local runner_status="${1:-1}"
     echo "AMD v1 smoke failed (runner exit ${runner_status})." >&2
@@ -55,6 +63,9 @@ print_failure_summary() {
 
 DRY_RUN=0
 OUTDIR="/tmp/perf-agent-amd-v1"
+HIP_LIBRARY=""
+ROCPROFILER_SDK_LIBRARY=""
+ROCPROFILER_SDK_INCLUDE_DIR=""
 declare -a RUNNER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +79,17 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --hip-library|--rocprofiler-sdk-library|--rocprofiler-sdk-include-dir|--duration|--iterations|--sleep-before-ms|--sleep-between-ms|--sleep-after-ms|--cpu-spin)
+            case "$1" in
+                --hip-library)
+                    HIP_LIBRARY="${2:-}"
+                    ;;
+                --rocprofiler-sdk-library)
+                    ROCPROFILER_SDK_LIBRARY="${2:-}"
+                    ;;
+                --rocprofiler-sdk-include-dir)
+                    ROCPROFILER_SDK_INCLUDE_DIR="${2:-}"
+                    ;;
+            esac
             RUNNER_ARGS+=("$1" "${2:-}")
             shift 2
             ;;
@@ -138,6 +160,31 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 mkdir -p "${OUTDIR}"
+
+require_cmd jq
+require_cmd go
+require_cmd rustc
+require_cmd c++
+require_cmd sudo
+
+if [[ -n "${HIP_LIBRARY}" && ! -e "${HIP_LIBRARY}" ]]; then
+    echo "amd-v1-smoke explicit HIP library does not exist: ${HIP_LIBRARY}" >&2
+    exit 1
+fi
+if [[ -n "${ROCPROFILER_SDK_LIBRARY}" && ! -e "${ROCPROFILER_SDK_LIBRARY}" ]]; then
+    echo "amd-v1-smoke explicit rocprofiler-sdk library does not exist: ${ROCPROFILER_SDK_LIBRARY}" >&2
+    exit 1
+fi
+if [[ -n "${ROCPROFILER_SDK_INCLUDE_DIR}" && ! -d "${ROCPROFILER_SDK_INCLUDE_DIR}" ]]; then
+    echo "amd-v1-smoke explicit rocprofiler-sdk include dir does not exist: ${ROCPROFILER_SDK_INCLUDE_DIR}" >&2
+    exit 1
+fi
+
+if ! PREVIEW_OUT=$(cd "${REPO_ROOT}" && "${RUNNER_CMD[@]}" --dry-run 2>&1); then
+    echo "amd-v1-smoke preflight failed:" >&2
+    printf '%s\n' "${PREVIEW_OUT}" >&2
+    exit 1
+fi
 
 if ! sudo -n true >/dev/null 2>&1; then
     echo "amd-v1-smoke requires cached sudo credentials. Run 'sudo -v' first, then rerun this script." >&2

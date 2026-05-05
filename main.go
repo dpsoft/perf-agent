@@ -24,9 +24,13 @@ var (
 	flagPerPID        = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
 	flagDuration      = flag.Duration("duration", 10*time.Second, "Collection duration")
 	flagSampleRate    = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
-	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
-	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
-	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagProfileOutput  = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
+	flagOffcpuOutput   = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
+	flagPMUOutput      = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagPerfDataOutput = flag.String("perf-data-output", "",
+		"Write a kernel-format perf.data file alongside the pprof output. "+
+			"Consumable by perf script, perf report, create_llvm_prof (AutoFDO PGO), "+
+			"FlameGraph, hotspot, etc.")
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagInjectPython  = flag.Bool("inject-python", false,
 		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
@@ -137,6 +141,10 @@ func buildOptions() []perfagent.Option {
 			outputPath = generateOutputName(*flagPID, *flagAll, "on-cpu", "pb.gz")
 		}
 		opts = append(opts, perfagent.WithCPUProfile(outputPath))
+
+		if *flagPerfDataOutput != "" {
+			opts = append(opts, perfagent.WithPerfDataOutput(*flagPerfDataOutput))
+		}
 	}
 
 	if *flagOffCpu {

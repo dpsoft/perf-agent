@@ -692,7 +692,7 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --pid 4242
 ```
 
-The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning the collector consumes an external producer through command/path/output-file contracts. The `native` mode is now a real in-process seam: it validates the library path, rejects external producer knobs, and probes the shared library before stopping at the not-yet-implemented capture path.
+The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning the collector consumes an external producer through command/path/output-file contracts. The `native` mode is now a real in-process seam: it validates the library path, rejects external producer knobs, and supports the current in-process probe/native bridge paths. It is still not full hardware PC sampling yet, but it no longer stops at a placeholder as soon as the library loads.
 
 When exercising that native seam today, use `--rocprofiler-sdk-mode native --rocprofiler-sdk-library /path/to/librocprofiler-sdk.so`. The branch validates the native contract, rejects mixing it with the external command/path/output knobs, and fails clearly if the shared library cannot be loaded. On this host shape, `rocm-runtime` alone does not provide `librocprofiler-sdk.so`; the native seam needs an actual ROCprofiler-SDK install.
 
@@ -997,6 +997,16 @@ xdg-open /tmp/gpu-rocprofiler-sdk-native-probe/rocprofiler_sdk_native_probe.html
 That path currently emits a mixed CPU+GPU artifact from live SDK metadata probes:
 - CPU side still comes from the checked-in HIP launch replay
 - GPU side carries native SDK probe leaves such as `native_sdk_version` and `native_sdk_available_agents`
+
+For the real app path on this branch, run:
+
+```bash
+bash scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh \
+  --outdir /tmp/perf-agent-real-rust-hip-sdk
+xdg-open /tmp/perf-agent-real-rust-hip-sdk/real_rust_hip_attention_rocprofiler_sdk.html 2>/dev/null || open /tmp/perf-agent-real-rust-hip-sdk/real_rust_hip_attention_rocprofiler_sdk.html
+```
+
+That path builds and runs the real Rust HIP workload, feeds the live `rocprofiler-sdk` native bridge into `perf-agent --gpu-amd-sample-stdin`, and renders a mixed CPU+GPU HTML/SVG flamegraph. The current live GPU leaves come from dispatch-derived native records rather than full hardware PC sampling, but the app, CPU stack, HIP launches, and SDK producer path are all real.
 
 Recorder-envelope variant of the same modern SDK path:
 

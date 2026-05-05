@@ -114,10 +114,16 @@ declare -a CHECKS=(
     "test -s ${APP_LOG}"
     "test -s ${RUNNER_LOG}"
     "grep -q '\"join_stats\"' ${GPU_RAW}"
+    "jq -e '.join_stats.launch_count > 0' ${GPU_RAW} >/dev/null"
+    "jq -e '.join_stats.matched_launch_count > 0' ${GPU_RAW} >/dev/null"
+    "jq -e '.executions | length > 0' ${GPU_RAW} >/dev/null"
     "grep -q 'CPU + GPU Flame Graph:' ${GPU_HTML}"
+    "grep -q 'Reset Zoom' ${GPU_HTML}"
     "grep -q '\\[gpu:kernel:' ${GPU_FOLDED}"
     "grep -q '\\[gpu:function:' ${GPU_FOLDED}"
     "grep -Eq 'hipModuleLaunchKernel|real_hip_attention_workload::' ${GPU_FOLDED}"
+    "[[ \$(grep -o '\\[gpu:kernel:[^]]*' ${GPU_FOLDED} | sort -u | wc -l) -ge 2 ]]"
+    "[[ \$(grep -o '\\[gpu:function:[^]]*' ${GPU_FOLDED} | sort -u | wc -l) -ge 3 ]]"
 )
 
 if [[ "${DRY_RUN}" == "1" ]]; then

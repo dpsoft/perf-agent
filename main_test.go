@@ -673,9 +673,15 @@ func TestAMDV1SmokeScriptDryRun(t *testing.T) {
 		"checks:",
 		"test -s /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json",
 		"grep -q '\"join_stats\"' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json",
+		"jq -e '.join_stats.launch_count > 0' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json >/dev/null",
+		"jq -e '.join_stats.matched_launch_count > 0' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json >/dev/null",
+		"jq -e '.executions | length > 0' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.raw.json >/dev/null",
 		"grep -q 'CPU + GPU Flame Graph:' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.html",
+		"grep -q 'Reset Zoom' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.html",
 		"grep -q '\\[gpu:function:' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded",
 		"grep -Eq 'hipModuleLaunchKernel|real_hip_attention_workload::' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded",
+		"[[ $(grep -o '\\[gpu:kernel:[^]]*' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded | sort -u | wc -l) -ge 2 ]]",
+		"[[ $(grep -o '\\[gpu:function:[^]]*' /tmp/perf-agent-amd-v1-test/real_rust_hip_attention_rocprofiler_sdk.folded | sort -u | wc -l) -ge 3 ]]",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in output:\n%s", want, got)

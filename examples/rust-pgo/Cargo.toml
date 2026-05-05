@@ -1,0 +1,12 @@
+[package]
+name = "rust-pgo-example"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = "limited"
+lto = "thin"
+codegen-units = 1
+# Final --release artefact stays *with* debug info so create_llvm_prof can
+# resolve symbols. The pgo-cycle.sh script strips the *optimised* output
+# explicitly (-C strip=symbols) so users see a clean before/after.

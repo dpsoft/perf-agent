@@ -28,6 +28,12 @@ type MetaInfo struct {
 // and not concurrency-safe — callers (perf-agent's CPU profiler) call them
 // from a single goroutine. Close finalizes the file (writes feature sections,
 // patches header offsets/sizes).
+//
+// If any append fails (e.g. ENOSPC), the first error is latched and
+// subsequent Add* calls become no-ops; Close returns the latched error.
+// This keeps pos in sync with bytes actually written and prevents the
+// finalizer from patching the header with offsets that point past the
+// real end of the data section.
 type Writer struct {
 	f       *os.File
 	bw      *bufio.Writer
@@ -35,6 +41,7 @@ type Writer struct {
 	dataBeg int64 // offset where data section begins
 	spec    EventSpec
 	meta    MetaInfo
+	err     error // first append/flush error; sticky
 
 	// data accumulated for feature-section emission at Close
 	buildIDs []BuildIDEntry
@@ -84,36 +91,41 @@ func Open(path string, spec EventSpec, meta MetaInfo) (*Writer, error) {
 	}, nil
 }
 
+// writeRecord encodes the record into a temporary buffer, writes it to bw,
+// advances pos by the actual bytes written, and latches any error so all
+// subsequent appends become no-ops. Caller passes the encoder; we centralize
+// the error-handling and pos-tracking here.
+func (w *Writer) writeRecord(encode func(*bytes.Buffer)) {
+	if w.err != nil {
+		return
+	}
+	var buf bytes.Buffer
+	encode(&buf)
+	n, err := w.bw.Write(buf.Bytes())
+	w.pos += int64(n)
+	if err != nil {
+		w.err = err
+	}
+}
+
 // AddComm appends a PERF_RECORD_COMM record.
 func (w *Writer) AddComm(r CommRecord) {
-	var buf bytes.Buffer
-	encodeComm(&buf, r)
-	n, _ := w.bw.Write(buf.Bytes())
-	w.pos += int64(n)
+	w.writeRecord(func(b *bytes.Buffer) { encodeComm(b, r) })
 }
 
 // AddMmap2 appends a PERF_RECORD_MMAP2 record.
 func (w *Writer) AddMmap2(r Mmap2Record) {
-	var buf bytes.Buffer
-	encodeMmap2(&buf, r)
-	n, _ := w.bw.Write(buf.Bytes())
-	w.pos += int64(n)
+	w.writeRecord(func(b *bytes.Buffer) { encodeMmap2(b, r) })
 }
 
 // AddSample appends a PERF_RECORD_SAMPLE record.
 func (w *Writer) AddSample(r SampleRecord) {
-	var buf bytes.Buffer
-	encodeSample(&buf, r)
-	n, _ := w.bw.Write(buf.Bytes())
-	w.pos += int64(n)
+	w.writeRecord(func(b *bytes.Buffer) { encodeSample(b, r) })
 }
 
 // AddFinishedRound appends a PERF_RECORD_FINISHED_ROUND marker.
 func (w *Writer) AddFinishedRound() {
-	var buf bytes.Buffer
-	encodeFinishedRound(&buf)
-	n, _ := w.bw.Write(buf.Bytes())
-	w.pos += int64(n)
+	w.writeRecord(func(b *bytes.Buffer) { encodeFinishedRound(b) })
 }
 
 // AddBuildID records a binary's build-id for emission in the
@@ -124,8 +136,15 @@ func (w *Writer) AddBuildID(e BuildIDEntry) {
 
 // Close finalizes the file: emits feature sections, builds the feature
 // index table, patches the file header's offsets/sizes/feature bitmap,
-// and closes the underlying file.
+// and closes the underlying file. If any earlier Add* call hit a write
+// error, Close returns that latched error after attempting to close the
+// file; the on-disk output is then not a valid perf.data and the caller
+// should delete it.
 func (w *Writer) Close() error {
+	if w.err != nil {
+		_ = w.f.Close()
+		return fmt.Errorf("perfdata: append failed: %w", w.err)
+	}
 	dataEnd := w.pos
 	dataSize := uint64(dataEnd - w.dataBeg)
 

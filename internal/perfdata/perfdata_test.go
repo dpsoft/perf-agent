@@ -78,3 +78,36 @@ func TestWriter_RoundTrip(t *testing.T) {
 		t.Errorf("filename not found in output")
 	}
 }
+
+// TestWriter_LatchedErrorMakesAddsNoOp verifies that once a write error is
+// latched on the Writer, subsequent Add* calls advance neither pos nor the
+// underlying buffer, and Close surfaces the error rather than patching the
+// header with stale offsets. We inject the error manually because driving
+// a real ENOSPC is impractical in unit tests.
+func TestWriter_LatchedErrorMakesAddsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.perf.data")
+
+	w, err := Open(path, EventSpec{
+		Type: perfTypeSoftware, Config: perfCountSWCPUClock,
+		SamplePeriod: 99, Frequency: true,
+	}, MetaInfo{Hostname: "h", OSRelease: "r", NumCPUs: 1})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	posBefore := w.pos
+	w.err = errSentinel{}
+	w.AddSample(SampleRecord{IP: 0x1, Pid: 1, Tid: 1, Period: 1, Callchain: []uint64{0x1}})
+	if w.pos != posBefore {
+		t.Errorf("pos advanced after latched error: %d → %d", posBefore, w.pos)
+	}
+
+	if err := w.Close(); err == nil {
+		t.Fatal("Close: expected latched error, got nil")
+	}
+}
+
+type errSentinel struct{}
+
+func (errSentinel) Error() string { return "sentinel" }

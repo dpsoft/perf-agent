@@ -607,6 +607,30 @@ func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRun(t *testing.T) 
 	}
 }
 
+func TestRunRealRustHIPRocprofilerSDKNativeFlamegraphScriptDryRunUsesProvidedLibraryDir(t *testing.T) {
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "run-real-rust-rocprofiler-sdk-flamegraph.sh"),
+		"--dry-run",
+		"--outdir", "/tmp/real-rust-hip-rocprofiler-sdk-flame",
+		"--rocprofiler-sdk-library", "/custom/rocm/lib/librocprofiler-sdk.so",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry-run real rust hip rocprofiler-sdk flamegraph with explicit library: %v\n%s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"-L /custom/rocm/lib",
+		"-Wl\\,-rpath\\,/custom/rocm/lib",
+		"LD_LIBRARY_PATH=/custom/rocm/lib",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
 func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
 	fixtures := []string{
 		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),

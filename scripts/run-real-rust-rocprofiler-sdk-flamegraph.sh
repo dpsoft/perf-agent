@@ -138,6 +138,7 @@ if [[ -z "${ROCPROFILER_SDK_LIBRARY}" ]]; then
     echo "could not discover rocprofiler-sdk library; pass --rocprofiler-sdk-library or set PERF_AGENT_ROCPROFILER_SDK_LIBRARY" >&2
     exit 1
 fi
+ROCPROFILER_SDK_LIB_DIR=$(dirname "${ROCPROFILER_SDK_LIBRARY}")
 
 if [[ -z "${DURATION}" ]]; then
     LOOP_BUDGET_MS=$((ITERATIONS * LAUNCHES_PER_ITERATION * SLEEP_BETWEEN_MS))
@@ -224,9 +225,9 @@ declare -a BUILD_BRIDGE_CMD=(
     -I
     /home/diego/github/rocm-systems/rocprofiler-sdk-build/source/include
     -L
-    /home/diego/github/rocm-systems/rocprofiler-sdk-build/lib
+    "${ROCPROFILER_SDK_LIB_DIR}"
     -lrocprofiler-sdk
-    -Wl,-rpath,/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib
+    "-Wl,-rpath,${ROCPROFILER_SDK_LIB_DIR}"
     -o
     "${BRIDGE_SO}"
 )
@@ -335,7 +336,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     quote_cmd "${BUILD_RENDER_CMD[@]}"
     echo
     echo "run app:"
-    printf '%s 3>%q\n' "$(quote_cmd env "LD_PRELOAD=${BRIDGE_SO}" "LD_LIBRARY_PATH=/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib" "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3" "PERF_AGENT_ROCPROFILER_SDK_DEBUG=${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_SLEEP_AFTER_MS=${SLEEP_AFTER_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}")" "${NATIVE_JSON}"
+    printf '%s 3>%q\n' "$(quote_cmd env "LD_PRELOAD=${BRIDGE_SO}" "LD_LIBRARY_PATH=${ROCPROFILER_SDK_LIB_DIR}" "PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3" "PERF_AGENT_ROCPROFILER_SDK_DEBUG=${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" "REAL_HIP_ATTENTION_LIBRARY=${HIP_LIBRARY}" "REAL_HIP_ATTENTION_ITERATIONS=${ITERATIONS}" "REAL_HIP_ATTENTION_SLEEP_BEFORE_MS=${SLEEP_BEFORE_MS}" "REAL_HIP_ATTENTION_SLEEP_BETWEEN_MS=${SLEEP_BETWEEN_MS}" "REAL_HIP_ATTENTION_SLEEP_AFTER_MS=${SLEEP_AFTER_MS}" "REAL_HIP_ATTENTION_CPU_SPIN=${CPU_SPIN}" "${APP_BIN}")" "${NATIVE_JSON}"
     echo
     echo "producer:"
     quote_cmd "${PRODUCER_CMD[@]}"
@@ -376,7 +377,7 @@ set +e
     rm -f "${NATIVE_JSON}"
     env \
     LD_PRELOAD="${BRIDGE_SO}" \
-    LD_LIBRARY_PATH="/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    LD_LIBRARY_PATH="${ROCPROFILER_SDK_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
     PERF_AGENT_ROCPROFILER_SDK_OUTPUT_FD=3 \
     PERF_AGENT_ROCPROFILER_SDK_DEBUG="${PERF_AGENT_ROCPROFILER_SDK_DEBUG:-}" \
     REAL_HIP_ATTENTION_LIBRARY="${HIP_LIBRARY}" \

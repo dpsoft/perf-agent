@@ -61,13 +61,19 @@ perf-agent --profile --pid $(pgrep my-app) --duration 60s \
            --perf-data-output train.perf.data
 
 # 3. Convert to LLVM .profdata via autofdo's create_llvm_prof
-#    (https://github.com/google/autofdo#install)
+#    (https://github.com/google/autofdo#install). --use_lbr=false is
+#    required: perf-agent samples cycles without branch records, and
+#    create_llvm_prof's default LBR mode produces an empty profile.
 create_llvm_prof --binary=./target/release/my-app \
                  --profile=train.perf.data \
-                 --out=train.prof
+                 --out=train.prof \
+                 --use_lbr=false
 
-# 4. Recompile with PGO
-RUSTFLAGS="-C profile-use=$(pwd)/train.prof" cargo build --release
+# 4. Recompile with PGO. Stable rustc has no high-level AutoFDO flag
+#    (`-C profile-use` is for instrumented PGO and rejects sample
+#    profiles), so plumb the profile through to LLVM directly.
+RUSTFLAGS="-Cllvm-args=-sample-profile-file=$(pwd)/train.prof" \
+    cargo build --release
 ```
 
 ### C++ AutoFDO PGO

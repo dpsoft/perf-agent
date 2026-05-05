@@ -38,14 +38,25 @@ duration with `DURATION=60s` (default 30s).
 2. Benchmarks the baseline binary.
 3. Runs the workload, attaches perf-agent for `$DURATION`, writes
    `train.perf.data`.
-4. `create_llvm_prof --binary=… --profile=train.perf.data --out=train.prof`
-   produces an LLVM sample-profile.
-5. `cargo build --release` with `-C profile-use=train.prof -C strip=symbols` —
-   PGO build, final binary stripped.
+4. `create_llvm_prof --binary=… --profile=train.perf.data --out=train.prof
+   --use_lbr=false` produces an LLVM sample-profile. `--use_lbr=false` is
+   required because perf-agent samples cycles without branch records;
+   without the flag, AutoFDO produces an empty profile.
+5. `cargo build --release` with
+   `-Cllvm-args=-sample-profile-file=train.prof -C strip=symbols` —
+   PGO build, final binary stripped. Stable rustc has no high-level
+   AutoFDO flag (`-C profile-use` is for *instrumented* PGO and rejects
+   sample profiles with "bad magic"), so we drop to the underlying LLVM
+   option directly.
 6. Benchmarks the optimised binary, prints the speedup.
 
-Typical result: 5–15% speedup on this synthetic workload. Real production
-workloads vary; the numbers are illustrative.
+Typical result on this synthetic via the rustc LLVM-args path: 1–3%
+improvement. The companion [C++ demo](../cpp-pgo/) on the same shape of
+workload reaches ~30% — clang's `-fprofile-sample-use` integrates the
+profile into the full optimisation pipeline (inlining, branch layout,
+register allocation), whereas rustc only feeds it to LLVM at the
+codegen pass. Real production workloads vary; the numbers are
+illustrative.
 
 ## Why this works
 

@@ -44,10 +44,17 @@ echo "==> 4. Convert perf.data → LLVM .prof via create_llvm_prof"
 create_llvm_prof \
     --binary=./target/release/rust-pgo-example \
     --profile=train.perf.data \
-    --out=train.prof
+    --out=train.prof \
+    --use_lbr=false
 
 echo "==> 5. PGO build (uses train.prof; strips symbols on the final artefact)"
-RUSTFLAGS="-C profile-use=$WORKDIR/train.prof -C strip=symbols" \
+# Stable rustc doesn't expose a high-level AutoFDO flag — `-C profile-use`
+# is for instrumented PGO and rejects sample profiles with "bad magic".
+# Drop to the underlying LLVM option via -Cllvm-args=-sample-profile-file.
+# -pgo-warn-missing-function surfaces functions present in the profile
+# but not in the binary (a sign the binary was rebuilt between training
+# and use, breaking the build-id join).
+RUSTFLAGS="-Cllvm-args=-sample-profile-file=$WORKDIR/train.prof -Cllvm-args=-pgo-warn-missing-function -C strip=symbols" \
     cargo build --release --quiet
 
 echo "==> 6. PGO-optimised benchmark"

@@ -78,7 +78,7 @@ High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, an
 
 For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` alongside the pprof output. Same capture, two formats:
 
-- **AutoFDO PGO** for Rust (`-C profile-use=...`) and C++ (`clang -fprofile-sample-use=...`) via Google's [`create_llvm_prof`](https://github.com/google/autofdo). End-to-end demo: [`examples/rust-pgo`](examples/rust-pgo/), [`examples/cpp-pgo`](examples/cpp-pgo/).
+- **AutoFDO PGO** for Rust (`rustc -Cllvm-args=-sample-profile-file=...`) and C++ (`clang -fprofile-sample-use=...`) via Google's [`create_llvm_prof`](https://github.com/google/autofdo). End-to-end demo: [`examples/rust-pgo`](examples/rust-pgo/), [`examples/cpp-pgo`](examples/cpp-pgo/).
 - **[FlameGraph](https://github.com/brendangregg/FlameGraph)** — `perf script | stackcollapse-perf.pl | flamegraph.pl` produces an SVG. Demo: [`examples/flamegraph`](examples/flamegraph/).
 
 See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walkthrough.

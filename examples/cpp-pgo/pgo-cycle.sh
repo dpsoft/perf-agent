@@ -38,7 +38,8 @@ echo "==> 4. Convert perf.data → LLVM .prof"
 create_llvm_prof \
     --binary=./workload-baseline \
     --profile=train.perf.data \
-    --out=train.prof
+    --out=train.prof \
+    --use_lbr=false
 
 echo "==> 5. PGO build (-fprofile-sample-use=train.prof)"
 make -s pgo

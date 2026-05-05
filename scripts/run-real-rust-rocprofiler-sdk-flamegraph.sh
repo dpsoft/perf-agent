@@ -45,9 +45,9 @@ discover_rocprofiler_sdk_library() {
     local candidate
     for candidate in \
         "${PERF_AGENT_ROCPROFILER_SDK_LIBRARY:-}" \
-        "/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so" \
         "/usr/local/lib/librocprofiler-sdk.so" \
-        "/opt/rocm/lib/librocprofiler-sdk.so"
+        "/opt/rocm/lib/librocprofiler-sdk.so" \
+        "/home/diego/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so"
     do
         if [[ -n "${candidate}" && -e "${candidate}" ]]; then
             printf '%s\n' "${candidate}"

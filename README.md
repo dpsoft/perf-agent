@@ -696,7 +696,7 @@ The `rocprofiler-sdk` real source currently defaults to `external` mode, meaning
 
 When exercising that native seam today, use `--rocprofiler-sdk-mode native --rocprofiler-sdk-library /path/to/librocprofiler-sdk.so`. The branch validates the native contract, rejects mixing it with the external command/path/output knobs, and fails clearly if the shared library cannot be loaded. On this host shape, `rocm-runtime` alone does not provide `librocprofiler-sdk.so`; the native seam needs an actual ROCprofiler-SDK install.
 
-If you are building ROCprofiler-SDK from source instead of installing it under `/opt/rocm`, point the native seam at the build artifact directly:
+If you are building ROCprofiler-SDK from source instead of installing it under `/opt/rocm`, point the native seam at the build artifact directly. The real Rust runner can also take an explicit include directory when the headers are not installed under the same prefix as the shared library:
 
 ```bash
 bash scripts/gpu-live-hip-amdsample.sh \
@@ -707,6 +707,15 @@ bash scripts/gpu-live-hip-amdsample.sh \
   --rocprofiler-sdk-mode native \
   --rocprofiler-sdk-library ~/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so
 ```
+
+```bash
+bash scripts/run-real-rust-rocprofiler-sdk-flamegraph.sh \
+  --outdir /tmp/perf-agent-real-rust-hip-sdk \
+  --rocprofiler-sdk-library ~/github/rocm-systems/rocprofiler-sdk-build/lib/librocprofiler-sdk.so \
+  --rocprofiler-sdk-include-dir ~/github/rocm-systems/projects/rocprofiler-sdk/source/include
+```
+
+If `--rocprofiler-sdk-include-dir` is omitted, the real runner derives its bridge include path from the selected library root and only needs the override when your headers live somewhere else.
 
 If `--sample-command` is omitted, the wrapper now defaults to that checked-in
 adapter script automatically. The adapter can then:

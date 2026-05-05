@@ -27,6 +27,32 @@ quote_cmd() {
     printf '%s\n' "${parts[*]}"
 }
 
+print_failure_summary() {
+    local runner_status="${1:-1}"
+    echo "AMD v1 smoke failed (runner exit ${runner_status})." >&2
+    if [[ -s "${RUNNER_LOG}" ]]; then
+        echo >&2
+        echo "runner log:" >&2
+        sed -n '1,200p' "${RUNNER_LOG}" >&2
+    fi
+    if [[ -s "${APP_LOG}" ]]; then
+        echo >&2
+        echo "app log:" >&2
+        sed -n '1,120p' "${APP_LOG}" >&2
+    fi
+    if [[ -f "${RUNNER_LOG}" ]] && grep -q 'no new privileges' "${RUNNER_LOG}"; then
+        echo >&2
+        echo "hint: this environment blocks sudo escalation with no_new_privileges; run the smoke on the target AMD host or adjust the container/sandbox policy." >&2
+    elif [[ -f "${RUNNER_LOG}" ]] && grep -q 'a terminal is required\|password is required\|sudo:' "${RUNNER_LOG}"; then
+        echo >&2
+        echo "hint: run 'sudo -v' in your terminal first, then rerun scripts/amd-v1-smoke.sh." >&2
+    fi
+    if [[ -f "${APP_LOG}" ]] && grep -q 'no ROCm-capable device is detected\|hipGetDeviceCount -> err=100 count=0\|hipInit -> err=100' "${APP_LOG}"; then
+        echo >&2
+        echo "hint: no ROCm-capable AMD GPU was visible to the workload. Check the target host/device assignment and HIP library path." >&2
+    fi
+}
+
 DRY_RUN=0
 OUTDIR="/tmp/perf-agent-amd-v1"
 declare -a RUNNER_ARGS=()
@@ -107,13 +133,30 @@ fi
 
 mkdir -p "${OUTDIR}"
 
+if ! sudo -n true >/dev/null 2>&1; then
+    echo "amd-v1-smoke requires cached sudo credentials. Run 'sudo -v' first, then rerun this script." >&2
+    exit 1
+fi
+
+set +e
 (
     cd "${REPO_ROOT}"
     "${RUNNER_CMD[@]}"
 )
+RUNNER_STATUS=$?
+set -e
+
+if [[ "${RUNNER_STATUS}" -ne 0 ]]; then
+    print_failure_summary "${RUNNER_STATUS}"
+    exit "${RUNNER_STATUS}"
+fi
 
 for check_cmd in "${CHECKS[@]}"; do
-    bash -lc "${check_cmd}"
+    if ! bash -lc "${check_cmd}"; then
+        echo "artifact check failed: ${check_cmd}" >&2
+        print_failure_summary 1
+        exit 1
+    fi
 done
 
 echo "AMD v1 smoke passed:"

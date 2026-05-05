@@ -683,6 +683,29 @@ func TestAMDV1SmokeScriptDryRun(t *testing.T) {
 	}
 }
 
+func TestAMDV1SmokeScriptRequiresCachedSudo(t *testing.T) {
+	tmpDir := t.TempDir()
+	sudoPath := filepath.Join(tmpDir, "sudo")
+	sudoScript := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(sudoPath, []byte(sudoScript), 0o755); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+
+	cmd := exec.Command(
+		"bash",
+		filepath.Join("scripts", "amd-v1-smoke.sh"),
+		"--outdir", filepath.Join(tmpDir, "out"),
+	)
+	cmd.Env = append(os.Environ(), "PATH="+tmpDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected cached sudo failure, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "amd-v1-smoke requires cached sudo credentials. Run 'sudo -v' first") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+}
+
 func TestModernNativeReplayFixturesDeclareClockDomain(t *testing.T) {
 	fixtures := []string{
 		filepath.Join("gpu", "testdata", "replay", "rocprofv3_native_rich.ndjson"),

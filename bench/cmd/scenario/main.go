@@ -19,6 +19,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/bench/internal/fleet"
 	"github.com/dpsoft/perf-agent/bench/internal/schema"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
 
@@ -161,8 +162,12 @@ func measureOnePID(pid, runN int, unwind string) schema.Run {
 			})
 		},
 	}
+	sym, err := symbolize.NewLocalSymbolizer()
+	if err != nil {
+		log.Fatalf("NewLocalSymbolizer (run %d): %v", runN, err)
+	}
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithMode(pid, false, []uint{0}, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil)
+	prof, err := dwarfagent.NewProfilerWithMode(pid, false, []uint{0}, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil, sym)
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
 		log.Fatalf("NewProfilerWithMode (run %d): %v", runN, err)
@@ -239,8 +244,12 @@ func measureSystemWide(runN int, unwind string) schema.Run {
 		},
 	}
 	cpus := allCPUs()
+	sym, err := symbolize.NewLocalSymbolizer()
+	if err != nil {
+		log.Fatalf("NewLocalSymbolizer (run %d, system-wide): %v", runN, err)
+	}
 	t0 := time.Now()
-	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil)
+	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, hooks, modeFromFlag(unwind), nil, nil, nil, sym)
 	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	if err != nil {
 		log.Fatalf("NewProfilerWithMode (run %d, system-wide): %v", runN, err)

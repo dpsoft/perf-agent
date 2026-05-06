@@ -304,6 +304,10 @@ func (a *Agent) Start(ctx context.Context) error {
 		switch a.config.Unwind {
 		case "dwarf":
 			hooks := dwarfHooksForAgent(a)
+			sym, err := symbolize.NewLocalSymbolizer()
+			if err != nil {
+				return fmt.Errorf("create symbolizer: %w", err)
+			}
 			p, err := dwarfagent.NewProfilerWithMode(
 				hostPID,
 				a.config.SystemWide,
@@ -315,6 +319,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				sym,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -327,6 +332,10 @@ func (a *Agent) Start(ctx context.Context) error {
 			}
 		case "auto":
 			hooks := dwarfHooksForAgent(a)
+			sym, err := symbolize.NewLocalSymbolizer()
+			if err != nil {
+				return fmt.Errorf("create symbolizer: %w", err)
+			}
 			p, err := dwarfagent.NewProfilerWithMode(
 				hostPID,
 				a.config.SystemWide,
@@ -338,6 +347,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				sym,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -380,12 +390,18 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.EnableOffCPUProfile {
 		switch a.config.Unwind {
 		case "dwarf", "auto":
+			sym, err := symbolize.NewLocalSymbolizer()
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create symbolizer: %w", err)
+			}
 			p, err := dwarfagent.NewOffCPUProfiler(
 				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				labels,
+				sym,
 			)
 			if err != nil {
 				a.cleanup()

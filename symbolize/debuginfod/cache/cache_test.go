@@ -36,7 +36,7 @@ func TestWriteAtomicCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	c := &Cache{Dir: dir}
 	body := strings.NewReader("hello world")
-	abs, err := c.WriteAtomic(KindDebuginfo, "deadbeef0011223344", body)
+	abs, err := c.WriteAtomic("deadbeef0011223344", KindDebuginfo, body)
 	if err != nil {
 		t.Fatalf("WriteAtomic: %v", err)
 	}
@@ -55,7 +55,9 @@ func TestWriteAtomicCreatesFile(t *testing.T) {
 func TestWriteAtomicNoPartialOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	c := &Cache{Dir: dir}
-	// Create an unreadable parent so rename fails late
+	// Make the destination dir non-writable so CreateTemp fails before rename
+	// is reached. Verifies the no-leftover-tmp-file invariant on the early
+	// (CreateTemp) failure path.
 	bad := filepath.Join(dir, ".build-id", "de")
 	if err := os.MkdirAll(bad, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -64,7 +66,7 @@ func TestWriteAtomicNoPartialOnFailure(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	defer os.Chmod(bad, 0o755) //nolint:errcheck
-	_, err := c.WriteAtomic(KindDebuginfo, "deadbeef0011223344", strings.NewReader("x"))
+	_, err := c.WriteAtomic("deadbeef0011223344", KindDebuginfo, strings.NewReader("x"))
 	if err == nil {
 		t.Skip("rename succeeded despite chmod (likely root)")
 	}
@@ -88,7 +90,7 @@ func TestWriteAtomicLargeBody(t *testing.T) {
 	c := &Cache{Dir: dir}
 	const N = 1 << 20
 	want := bytes.Repeat([]byte("A"), N)
-	abs, err := c.WriteAtomic(KindExecutable, "abcdef0123456789aa", bytes.NewReader(want))
+	abs, err := c.WriteAtomic("abcdef0123456789aa", KindExecutable, bytes.NewReader(want))
 	if err != nil {
 		t.Fatalf("WriteAtomic: %v", err)
 	}

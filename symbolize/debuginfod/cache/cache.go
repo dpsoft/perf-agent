@@ -4,7 +4,6 @@
 package cache
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -65,7 +64,7 @@ func (c *Cache) Has(buildID string, kind Kind) bool {
 // WriteAtomic streams body to a tmp file in the same directory as the
 // final destination, then renames into place. Returns the absolute final
 // path on success. On any error the tmp file is removed before returning.
-func (c *Cache) WriteAtomic(kind Kind, buildID string, body io.Reader) (_ string, err error) {
+func (c *Cache) WriteAtomic(buildID string, kind Kind, body io.Reader) (_ string, err error) {
 	rel := pathFor(buildID, kind)
 	if rel == "" {
 		return "", fmt.Errorf("invalid build-id %q", buildID)
@@ -98,5 +97,3 @@ func (c *Cache) WriteAtomic(kind Kind, buildID string, body io.Reader) (_ string
 	return abs, nil
 }
 
-// ErrNoIndex is returned when an operation requires a configured Index.
-var ErrNoIndex = errors.New("cache: no index configured")

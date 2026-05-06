@@ -398,11 +398,17 @@ func (a *Agent) Start(ctx context.Context) error {
 				log.Printf("Off-CPU profiler enabled (PID: %s, DWARF)", a.pidLogStr(hostPID))
 			}
 		default:
+			sym, err := symbolize.NewLocalSymbolizer()
+			if err != nil {
+				a.cleanup()
+				return fmt.Errorf("create symbolizer: %w", err)
+			}
 			profiler, err := offcpu.NewProfiler(
 				hostPID,
 				a.config.SystemWide,
 				a.config.Tags,
 				labels,
+				sym,
 			)
 			if err != nil {
 				a.cleanup()

@@ -1,11 +1,16 @@
 package debuginfod
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
 )
 
 func newServer(t *testing.T, handler http.HandlerFunc) string {
@@ -94,4 +99,46 @@ func TestFetchTrimsTrailingSlash(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 	body.Close()
+}
+
+// cacheBackend is a tiny test stub: it adapts a freshly-created cache.Cache
+// (no Index) to the singleflightFetcher's storer interface.
+type cacheBackend struct {
+	baseDir string
+}
+
+func (c *cacheBackend) WriteAtomic(buildID string, kind cache.Kind, body io.Reader) (string, error) {
+	cc := &cache.Cache{Dir: c.baseDir}
+	return cc.WriteAtomic(buildID, kind, body)
+}
+
+func TestSingleflightCollapsesConcurrentFetches(t *testing.T) {
+	var calls atomic.Int32
+	url := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	dir := t.TempDir()
+	c := &cacheBackend{baseDir: dir}
+	sf := newSingleflightFetcher(newFetcher([]string{url}, http.DefaultClient), c)
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			path, err := sf.fetchAndStore(t.Context(), "debuginfo", "aabbccddeeff")
+			if err != nil {
+				t.Errorf("fetch: %v", err)
+			}
+			if path == "" {
+				t.Errorf("empty path")
+			}
+		})
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("HTTP call count = %d, want 1 (singleflight failure)", got)
+	}
 }

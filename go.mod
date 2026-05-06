@@ -11,6 +11,7 @@ require (
 	github.com/klauspost/compress v1.18.5
 	github.com/libbpf/blazesym/go v0.0.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.42.0
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.77
 	modernc.org/sqlite v1.50.0

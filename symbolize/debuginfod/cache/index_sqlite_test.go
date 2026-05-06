@@ -40,12 +40,16 @@ func TestSQLiteIndexTouchUpdatesAccess(t *testing.T) {
 		t.Fatalf("first Touch: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond)
+	before := time.Now()
+	time.Sleep(2 * time.Millisecond) // ensure wall clock advances strictly past `before`
 	if err := idx.Touch("aabb", KindDebuginfo, 100); err != nil {
 		t.Fatalf("second Touch: %v", err)
 	}
 	var seen int
+	var lastAccess time.Time
 	if err := idx.Iter(func(e Entry) bool {
 		seen++
+		lastAccess = e.LastAccess
 		if e.BuildID != "aabb" {
 			t.Fatalf("BuildID = %q", e.BuildID)
 		}
@@ -55,6 +59,9 @@ func TestSQLiteIndexTouchUpdatesAccess(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Fatalf("Iter visited %d entries, want 1 (Touch must upsert)", seen)
+	}
+	if !lastAccess.After(before) {
+		t.Fatalf("LastAccess = %v, want strictly after %v (Touch must update last_access)", lastAccess, before)
 	}
 }
 

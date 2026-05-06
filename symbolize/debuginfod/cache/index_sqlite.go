@@ -18,6 +18,12 @@ func NewSQLiteIndex(dbPath string) (Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// modernc.org/sqlite serializes writes via the per-file journal lock; if
+	// the connection pool opens multiple connections, concurrent Touch +
+	// EvictTo callers will get SQLITE_BUSY. The Index contract promises
+	// concurrent safety, so cap to a single connection and let database/sql
+	// queue callers.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS entries (
 			build_id    TEXT NOT NULL,
@@ -47,11 +53,11 @@ func (s *sqliteIndex) Touch(buildID string, kind Kind, size int64) error {
 }
 
 func (s *sqliteIndex) TotalBytes() (int64, error) {
-	var total sql.NullInt64
+	var total int64
 	if err := s.db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM entries`).Scan(&total); err != nil {
 		return 0, err
 	}
-	return total.Int64, nil
+	return total, nil
 }
 
 func (s *sqliteIndex) EvictTo(maxBytes int64) ([]Entry, error) {

@@ -135,14 +135,18 @@ func (r *Resolver) populate(entry *pidEntry, pid uint32) {
 	entry.mappings = mappings
 }
 
-// buildIDFor returns a cached hex build-id for path, reading the ELF
-// on first call. Read failures produce an empty string (cached) —
-// a missing build-id is not a Lookup failure.
+// BuildID returns a cached hex build-id for path, reading the ELF on
+// first call. Read failures produce an empty string (cached) —
+// a missing build-id is not a Lookup failure. Safe for concurrent use.
+func (r *Resolver) BuildID(path string) string { return r.buildIDFor(path) }
+
+// buildIDFor is the internal implementation. The exported BuildID method
+// delegates here.
 func (r *Resolver) buildIDFor(path string) string {
 	if v, ok := r.buildIDs.Load(path); ok {
 		return v.(string)
 	}
-	id, _ := readBuildID(path)
+	id, _ := ReadBuildID(path)
 	actual, _ := r.buildIDs.LoadOrStore(path, id)
 	return actual.(string)
 }

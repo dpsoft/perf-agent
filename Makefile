@@ -12,7 +12,15 @@ LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a)
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
-build: $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
+.PHONY: blazesym-check
+blazesym-check:
+	@if ! grep -q 'process_dispatch' $(LIBBLAZESYM_INC)/blazesym.h; then \
+		echo "*** blazesym header at $(LIBBLAZESYM_INC)/blazesym.h is too old"; \
+		echo "*** missing process_dispatch — pull blazesym to a commit ≥ 8891e70"; \
+		exit 1; \
+	fi
+
+build: blazesym-check $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
 	CGO_LDFLAGS=" -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release) -lblazesym_c -static " CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release)" go build .
 
 .PHONY: generate

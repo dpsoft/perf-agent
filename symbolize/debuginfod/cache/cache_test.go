@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -156,8 +157,8 @@ func TestCacheEvictionDeletesFiles(t *testing.T) {
 	}
 
 	var remainingFiles int
-	_ = filepath.Walk(c.Dir, func(p string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".debug") {
+	_ = filepath.WalkDir(c.Dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".debug") {
 			remainingFiles++
 		}
 		return nil
@@ -169,14 +170,20 @@ func TestCacheEvictionDeletesFiles(t *testing.T) {
 
 func TestCachePrewarmRebuildsIndex(t *testing.T) {
 	dir := t.TempDir()
-	idx, _ := NewSQLiteIndex(filepath.Join(dir, "index.db"))
+	idx, err := NewSQLiteIndex(filepath.Join(dir, "index.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteIndex: %v", err)
+	}
 	c := &Cache{Dir: dir, Index: idx, MaxBytes: 1024}
 	if _, err := c.WriteAtomic("ddee0011223344", KindDebuginfo, strings.NewReader("hello")); err != nil {
 		t.Fatalf("WriteAtomic: %v", err)
 	}
 	_ = c.Close()
 
-	idx2, _ := NewSQLiteIndex(filepath.Join(dir, "index2.db"))
+	idx2, err := NewSQLiteIndex(filepath.Join(dir, "index2.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteIndex (rebuild): %v", err)
+	}
 	c2 := &Cache{Dir: dir, Index: idx2, MaxBytes: 1024}
 	defer c2.Close()
 	if err := c2.Prewarm(); err != nil {

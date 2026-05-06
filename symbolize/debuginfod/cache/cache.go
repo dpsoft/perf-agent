@@ -90,7 +90,8 @@ func (c *Cache) WriteAtomic(buildID string, kind Kind, body io.Reader) (_ string
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if _, err = io.Copy(tmp, body); err != nil {
+	n, err := io.Copy(tmp, body)
+	if err != nil {
 		_ = tmp.Close()
 		return "", fmt.Errorf("copy: %w", err)
 	}
@@ -102,20 +103,10 @@ func (c *Cache) WriteAtomic(buildID string, kind Kind, body io.Reader) (_ string
 	}
 	// Record in the index (best-effort: a stale index can be rebuilt by
 	// Prewarm; failing here would mean throwing away a successful fetch).
-	size, _ := fileSize(abs)
 	if c.Index != nil {
-		_ = c.Index.Touch(buildID, kind, size)
+		_ = c.Index.Touch(buildID, kind, n)
 	}
 	return abs, nil
-}
-
-// fileSize returns the size in bytes of the file at path p.
-func fileSize(p string) (int64, error) {
-	st, err := os.Stat(p)
-	if err != nil {
-		return 0, err
-	}
-	return st.Size(), nil
 }
 
 // Evict deletes LRU entries until total cache size ≤ MaxBytes. Safe to
@@ -128,17 +119,17 @@ func (c *Cache) Evict() error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range evicted {
 		abs := c.AbsPath(e.BuildID, e.Kind)
 		if abs == "" {
 			continue
 		}
 		if err := os.Remove(abs); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			// Continue evicting; index/file drift can be reconciled by
-			// Prewarm on next start.
+			errs = append(errs, fmt.Errorf("evict %s: %w", abs, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Prewarm walks Dir and records each existing artifact in the Index.
@@ -163,11 +154,11 @@ func (c *Cache) Prewarm() error {
 		if !ok {
 			return nil
 		}
-		st, err := os.Stat(path)
+		info, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		return c.Index.Touch(buildID, kind, st.Size())
+		return c.Index.Touch(buildID, kind, info.Size())
 	})
 }
 

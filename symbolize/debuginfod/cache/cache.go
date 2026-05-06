@@ -4,11 +4,17 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// ErrNoIndex is returned when an operation requires a configured Index.
+var ErrNoIndex = errors.New("cache: no index configured")
 
 // Kind selects the artifact flavor. KindDebuginfo files are placed where
 // blazesym's debug-link / build-id resolver finds them automatically.
@@ -21,10 +27,10 @@ const (
 )
 
 // Cache wraps a directory containing the .build-id index.
-// The Index field is added in Task 9.
 type Cache struct {
-	Dir string
-	// Index will be added in Task 9.
+	Dir      string
+	Index    Index
+	MaxBytes int64 // 0 means unbounded
 }
 
 // pathFor returns the path within Dir for (buildID, kind), or "" if buildID
@@ -94,6 +100,103 @@ func (c *Cache) WriteAtomic(buildID string, kind Kind, body io.Reader) (_ string
 	if err = os.Rename(tmpName, abs); err != nil {
 		return "", fmt.Errorf("rename: %w", err)
 	}
+	// Record in the index (best-effort: a stale index can be rebuilt by
+	// Prewarm; failing here would mean throwing away a successful fetch).
+	size, _ := fileSize(abs)
+	if c.Index != nil {
+		_ = c.Index.Touch(buildID, kind, size)
+	}
 	return abs, nil
 }
 
+// fileSize returns the size in bytes of the file at path p.
+func fileSize(p string) (int64, error) {
+	st, err := os.Stat(p)
+	if err != nil {
+		return 0, err
+	}
+	return st.Size(), nil
+}
+
+// Evict deletes LRU entries until total cache size ≤ MaxBytes. Safe to
+// call at any time. No-op when Index is nil or MaxBytes ≤ 0.
+func (c *Cache) Evict() error {
+	if c.Index == nil || c.MaxBytes <= 0 {
+		return nil
+	}
+	evicted, err := c.Index.EvictTo(c.MaxBytes)
+	if err != nil {
+		return err
+	}
+	for _, e := range evicted {
+		abs := c.AbsPath(e.BuildID, e.Kind)
+		if abs == "" {
+			continue
+		}
+		if err := os.Remove(abs); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			// Continue evicting; index/file drift can be reconciled by
+			// Prewarm on next start.
+		}
+	}
+	return nil
+}
+
+// Prewarm walks Dir and records each existing artifact in the Index.
+// Recovers from index loss (e.g., crash) and lets a fresh process inherit
+// a populated cache from a previous run.
+func (c *Cache) Prewarm() error {
+	if c.Index == nil {
+		return ErrNoIndex
+	}
+	root := filepath.Join(c.Dir, ".build-id")
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		buildID, kind, ok := parsePath(c.Dir, path)
+		if !ok {
+			return nil
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			return nil
+		}
+		return c.Index.Touch(buildID, kind, st.Size())
+	})
+}
+
+// parsePath inverts pathFor for files under <dir>/.build-id/<NN>/<rest>{.debug,}.
+// Returns ok=false for paths outside that layout.
+func parsePath(dir, path string) (buildID string, kind Kind, ok bool) {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if len(parts) != 3 || parts[0] != ".build-id" {
+		return
+	}
+	prefix := parts[1]
+	rest := parts[2]
+	if strings.HasSuffix(rest, ".debug") {
+		kind = KindDebuginfo
+		rest = strings.TrimSuffix(rest, ".debug")
+	} else {
+		kind = KindExecutable
+	}
+	return prefix + rest, kind, true
+}
+
+// Close closes the index. No-op when Index is nil.
+func (c *Cache) Close() error {
+	if c.Index == nil {
+		return nil
+	}
+	return c.Index.Close()
+}

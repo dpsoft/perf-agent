@@ -4,7 +4,7 @@
 
 **Goal:** Land M1 of the debuginfod-symbolization design — a `symbolize.Symbolizer` interface with two impls (`LocalSymbolizer` preserves today's behavior; `DebuginfodSymbolizer` adds debuginfod-backed off-box DWARF fetch via blazesym's `process_dispatch` hook). Migrate the three existing symbolize call sites to the interface and wire the chosen impl through `perfagent.Agent`. Behavior is unchanged unless `--debuginfod-url` is configured.
 
-**Architecture:** Two new packages. `symbolize/` defines the interface, `Frame` value type, and `LocalSymbolizer` (wraps the upstream `github.com/libbpf/blazesym/go` binding — today's behavior). `symbolize/debuginfod/` holds the cgo-backed `Symbolizer` that drives blazesym's `process_dispatch` callback through a 4-case routing table (cached executable / local-resolution-possible / fetch `/debuginfo` / fetch `/executable`), plus a build-id-indexed on-disk cache with SQLite or JSON index (build-tag selectable).
+**Architecture:** Two new packages. `symbolize/` defines the interface, `Frame` value type, and `LocalSymbolizer` (wraps the upstream `github.com/libbpf/blazesym/go` binding — today's behavior). `symbolize/debuginfod/` holds the cgo-backed `Symbolizer` that drives blazesym's `process_dispatch` callback through a 4-case routing table (cached executable / local-resolution-possible / fetch `/debuginfo` / fetch `/executable`), plus a build-id-indexed on-disk cache with a SQLite index (`modernc.org/sqlite`, pure Go).
 
 **Tech Stack:** Go 1.26, cgo (blazesym capi), `golang.org/x/sync/singleflight`, `modernc.org/sqlite` (pure-Go), `httptest` for fetch tests, docker-compose-based integration test from the PoC archive.
 
@@ -46,12 +46,10 @@ symbolize/debuginfod/
 
 symbolize/debuginfod/cache/
   cache.go                Cache struct (path layout, atomic write, LRU eviction trigger)
-  index.go                index interface + entry type (always compiled)
-  index_sqlite.go         //go:build !noindex_sqlite — default
-  index_json.go           //go:build noindex_sqlite — restrictive builds
+  index.go                Index interface + Entry type
+  index_sqlite.go         sole Index implementation (modernc.org/sqlite)
   cache_test.go
-  index_sqlite_test.go    //go:build !noindex_sqlite
-  index_json_test.go      //go:build noindex_sqlite
+  index_sqlite_test.go
 
 test/debuginfod/
   docker-compose.yml      (lifted/adapted from PoC archive)
@@ -1024,7 +1022,7 @@ git commit -m "procmap: export ReadBuildID and Resolver.BuildID for debuginfod r
 
 ---
 
-## Phase 4 — Cache + index (default SQLite, build-tag JSON)
+## Phase 4 — Cache + index (SQLite-only)
 
 ### Task 8: Cache file-layout helpers
 
@@ -1342,11 +1340,11 @@ git commit -m "cache: define Index interface and Entry type"
 
 ---
 
-### Task 10: SQLite index implementation (default)
+### Task 10: SQLite index implementation
 
 **Files:**
-- Create: `symbolize/debuginfod/cache/index_sqlite.go` (build tag: `!noindex_sqlite`)
-- Test: `symbolize/debuginfod/cache/index_sqlite_test.go` (same build tag)
+- Create: `symbolize/debuginfod/cache/index_sqlite.go`
+- Test: `symbolize/debuginfod/cache/index_sqlite_test.go`
 - Modify: `go.mod` (add `modernc.org/sqlite`)
 
 - [ ] **Step 1: Add the dep**
@@ -1360,8 +1358,6 @@ go get modernc.org/sqlite
 `symbolize/debuginfod/cache/index_sqlite_test.go`:
 
 ```go
-//go:build !noindex_sqlite
-
 package cache
 
 import (
@@ -1476,8 +1472,6 @@ Expected: FAIL — `NewSQLiteIndex` undefined.
 - [ ] **Step 4: Implement `index_sqlite.go`**
 
 ```go
-//go:build !noindex_sqlite
-
 package cache
 
 import (
@@ -1623,304 +1617,16 @@ git commit -m "cache: add SQLite-backed Index implementation (default build)"
 
 ---
 
-### Task 11: JSON index implementation (build-tag opt-out)
+### Task 11: REMOVED — JSON index dropped
 
-**Files:**
-- Create: `symbolize/debuginfod/cache/index_json.go` (build tag: `noindex_sqlite`)
-- Test: `symbolize/debuginfod/cache/index_json_test.go` (same build tag)
+The plan originally shipped a JSON `Index` implementation behind the
+`-tags noindex_sqlite` build tag, so restrictive deployments could opt out
+of `modernc.org/sqlite`. After review, the JSON impl was dropped: SQLite is
+pure-Go (no cgo) and tiny in binary size; the `Index` interface stays so
+cache-layout tests can substitute a fake; nothing in the agent's deployment
+story actually requires a SQLite-free build today.
 
-- [ ] **Step 1: Write the failing test**
-
-`symbolize/debuginfod/cache/index_json_test.go`:
-
-```go
-//go:build noindex_sqlite
-
-package cache
-
-import (
-	"path/filepath"
-	"testing"
-	"time"
-)
-
-func newJSONIdx(t *testing.T) Index {
-	t.Helper()
-	dir := t.TempDir()
-	idx, err := NewJSONIndex(filepath.Join(dir, "index.json"))
-	if err != nil {
-		t.Fatalf("NewJSONIndex: %v", err)
-	}
-	t.Cleanup(func() { _ = idx.Close() })
-	return idx
-}
-
-// Same suite as SQLite — same expected behaviors.
-func TestJSONIndexTouchAndTotal(t *testing.T) {
-	idx := newJSONIdx(t)
-	if err := idx.Touch("aabb", KindDebuginfo, 100); err != nil {
-		t.Fatalf("Touch: %v", err)
-	}
-	if err := idx.Touch("ccdd", KindExecutable, 250); err != nil {
-		t.Fatalf("Touch: %v", err)
-	}
-	total, err := idx.TotalBytes()
-	if err != nil {
-		t.Fatalf("TotalBytes: %v", err)
-	}
-	if total != 350 {
-		t.Fatalf("TotalBytes = %d, want 350", total)
-	}
-}
-
-func TestJSONIndexEvictToOldestFirst(t *testing.T) {
-	idx := newJSONIdx(t)
-	if err := idx.Touch("first", KindDebuginfo, 100); err != nil {
-		t.Fatalf("Touch first: %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	if err := idx.Touch("second", KindDebuginfo, 100); err != nil {
-		t.Fatalf("Touch second: %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	if err := idx.Touch("third", KindDebuginfo, 100); err != nil {
-		t.Fatalf("Touch third: %v", err)
-	}
-
-	evicted, err := idx.EvictTo(150)
-	if err != nil {
-		t.Fatalf("EvictTo: %v", err)
-	}
-	if len(evicted) != 2 {
-		t.Fatalf("evicted %d entries, want 2", len(evicted))
-	}
-	if evicted[0].BuildID != "first" || evicted[1].BuildID != "second" {
-		t.Fatalf("eviction order: %+v", evicted)
-	}
-}
-
-func TestJSONIndexPersistsAcrossOpen(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "index.json")
-	idx, err := NewJSONIndex(path)
-	if err != nil {
-		t.Fatalf("first open: %v", err)
-	}
-	if err := idx.Touch("aabb", KindDebuginfo, 42); err != nil {
-		t.Fatalf("Touch: %v", err)
-	}
-	_ = idx.Close()
-
-	idx2, err := NewJSONIndex(path)
-	if err != nil {
-		t.Fatalf("re-open: %v", err)
-	}
-	defer idx2.Close()
-	total, err := idx2.TotalBytes()
-	if err != nil {
-		t.Fatalf("TotalBytes: %v", err)
-	}
-	if total != 42 {
-		t.Fatalf("TotalBytes after reopen = %d, want 42", total)
-	}
-}
-```
-
-- [ ] **Step 2: Run with the build tag, confirm it fails**
-
-```bash
-go test -tags noindex_sqlite ./symbolize/debuginfod/cache/...
-```
-Expected: FAIL — `NewJSONIndex` undefined.
-
-- [ ] **Step 3: Implement `index_json.go`**
-
-```go
-//go:build noindex_sqlite
-
-package cache
-
-import (
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"sort"
-	"sync"
-	"time"
-)
-
-type jsonEntry struct {
-	BuildID    string `json:"build_id"`
-	Kind       int    `json:"kind"`
-	Size       int64  `json:"size"`
-	LastAccess int64  `json:"last_access"` // unix-nanos
-}
-
-type jsonIndex struct {
-	path    string
-	mu      sync.Mutex
-	entries map[string]jsonEntry // key: buildID + ":" + kind
-}
-
-// NewJSONIndex opens (or creates) a JSON-backed index at the given path.
-// All operations rewrite the entire file under a mutex; suitable for the
-// 2 GiB cache cap (low-thousands of entries).
-func NewJSONIndex(path string) (Index, error) {
-	idx := &jsonIndex{path: path, entries: map[string]jsonEntry{}}
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return idx, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("open: %w", err)
-	}
-	defer f.Close()
-	body, err := io.ReadAll(f)
-	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
-	}
-	if len(body) == 0 {
-		return idx, nil
-	}
-	var rows []jsonEntry
-	if err := json.Unmarshal(body, &rows); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	for _, r := range rows {
-		idx.entries[idx.key(r.BuildID, Kind(r.Kind))] = r
-	}
-	return idx, nil
-}
-
-func (s *jsonIndex) key(buildID string, kind Kind) string {
-	return fmt.Sprintf("%s:%d", buildID, kind)
-}
-
-func (s *jsonIndex) flushLocked() error {
-	tmp := s.path + ".tmp"
-	rows := make([]jsonEntry, 0, len(s.entries))
-	for _, r := range s.entries {
-		rows = append(rows, r)
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].LastAccess < rows[j].LastAccess })
-	buf, err := json.MarshalIndent(rows, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
-}
-
-func (s *jsonIndex) Touch(buildID string, kind Kind, size int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries[s.key(buildID, kind)] = jsonEntry{
-		BuildID:    buildID,
-		Kind:       int(kind),
-		Size:       size,
-		LastAccess: time.Now().UnixNano(),
-	}
-	return s.flushLocked()
-}
-
-func (s *jsonIndex) TotalBytes() (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var total int64
-	for _, r := range s.entries {
-		total += r.Size
-	}
-	return total, nil
-}
-
-func (s *jsonIndex) EvictTo(maxBytes int64) ([]Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var total int64
-	for _, r := range s.entries {
-		total += r.Size
-	}
-	if total <= maxBytes {
-		return nil, nil
-	}
-	rows := make([]jsonEntry, 0, len(s.entries))
-	for _, r := range s.entries {
-		rows = append(rows, r)
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].LastAccess < rows[j].LastAccess })
-
-	excess := total - maxBytes
-	var evicted []Entry
-	var freed int64
-	for _, r := range rows {
-		if freed >= excess {
-			break
-		}
-		evicted = append(evicted, Entry{
-			BuildID:    r.BuildID,
-			Kind:       Kind(r.Kind),
-			Size:       r.Size,
-			LastAccess: time.Unix(0, r.LastAccess),
-		})
-		delete(s.entries, s.key(r.BuildID, Kind(r.Kind)))
-		freed += r.Size
-	}
-	if err := s.flushLocked(); err != nil {
-		return evicted, err
-	}
-	return evicted, nil
-}
-
-func (s *jsonIndex) Iter(yield func(Entry) bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, r := range s.entries {
-		if !yield(Entry{
-			BuildID:    r.BuildID,
-			Kind:       Kind(r.Kind),
-			Size:       r.Size,
-			LastAccess: time.Unix(0, r.LastAccess),
-		}) {
-			return nil
-		}
-	}
-	return nil
-}
-
-func (s *jsonIndex) Forget(buildID string, kind Kind) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.entries, s.key(buildID, kind))
-	return s.flushLocked()
-}
-
-func (s *jsonIndex) Close() error { return nil }
-```
-
-- [ ] **Step 4: Run with build tag, confirm pass**
-
-```bash
-go test -tags noindex_sqlite ./symbolize/debuginfod/cache/...
-```
-Expected: PASS.
-
-- [ ] **Step 5: Verify default build still works (the SQLite path)**
-
-```bash
-go test ./symbolize/debuginfod/cache/...
-```
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add symbolize/debuginfod/cache/index_json.go symbolize/debuginfod/cache/index_json_test.go
-git commit -m "cache: add JSON Index for -tags noindex_sqlite restrictive builds"
-```
+**No code changes.** Downstream task numbers (12, 13, ...) are preserved.
 
 ---
 
@@ -3083,37 +2789,17 @@ func (s *Symbolizer) Close() error {
 func (s *Symbolizer) Stats() Stats { return s.stats.snapshot() }
 ```
 
-- [ ] **Step 4: Implement `openIndex` (build-tag selection lives in cache/, not here)**
+- [ ] **Step 4: Implement `openIndex` helper**
 
 Append to `symbolizer.go`:
 
 ```go
 const indexFilename = "index.db"
 
-// openIndex chooses between SQLite and JSON index based on build-tags.
-// The cache package's index files are tag-gated; both register a New*Index
-// constructor. We can't both call them unconditionally — instead, expose a
-// single helper from cache and call that.
+// openIndex constructs the cache index. SQLite-only; the indirection is
+// kept so future tests can inject a fake Index without changing this site.
 func openIndex(path string) (cache.Index, error) {
-	return cache.OpenDefaultIndex(path)
-}
-```
-
-Add `OpenDefaultIndex` to `symbolize/debuginfod/cache/index_sqlite.go`:
-
-```go
-// OpenDefaultIndex opens the build-tag-selected default index implementation.
-func OpenDefaultIndex(path string) (Index, error) {
-	return NewSQLiteIndex(path)
-}
-```
-
-And to `symbolize/debuginfod/cache/index_json.go`:
-
-```go
-// OpenDefaultIndex opens the build-tag-selected default index implementation.
-func OpenDefaultIndex(path string) (Index, error) {
-	return NewJSONIndex(path)
+	return cache.NewSQLiteIndex(path)
 }
 ```
 
@@ -3166,7 +2852,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add symbolize/debuginfod/options.go symbolize/debuginfod/symbolizer.go symbolize/debuginfod/errors.go symbolize/debuginfod/symbolizer_test.go symbolize/debuginfod/cache/index_sqlite.go symbolize/debuginfod/cache/index_json.go
+git add symbolize/debuginfod/options.go symbolize/debuginfod/symbolizer.go symbolize/debuginfod/errors.go symbolize/debuginfod/symbolizer_test.go
 git commit -m "debuginfod: add Options, Symbolizer skeleton, lifecycle (no dispatcher yet)"
 ```
 
@@ -4295,31 +3981,14 @@ LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
 ```
 Expected: PASS.
 
-- [ ] **Step 2: Restrictive-build unit tests (no SQLite)**
-
-```bash
-LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
-  CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" \
-  CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
-  go test -tags noindex_sqlite ./symbolize/debuginfod/cache/...
-```
-Expected: PASS.
-
-- [ ] **Step 3: Verify SQLite isn't linked under the build-tag**
-
-```bash
-go list -tags noindex_sqlite -deps ./symbolize/debuginfod/... | grep -i sqlite || echo "no sqlite — ok"
-```
-Expected: `no sqlite — ok`.
-
-- [ ] **Step 4: Lint**
+- [ ] **Step 2: Lint**
 
 ```bash
 golangci-lint run --timeout=5m ./symbolize/...
 ```
 Expected: clean.
 
-- [ ] **Step 5: Integration test**
+- [ ] **Step 3: Integration test**
 
 ```bash
 cd /home/diego/github/perf-agent
@@ -4332,7 +4001,7 @@ PERF_AGENT_BIN="$PWD/perf-agent" \
 ```
 Expected: PASS.
 
-- [ ] **Step 6: Confirm zero behavior change for non-debuginfod users**
+- [ ] **Step 4: Confirm zero behavior change for non-debuginfod users**
 
 ```bash
 # Existing integration tests, no debuginfod URL configured — agent uses LocalSymbolizer.
@@ -4340,7 +4009,7 @@ sudo make test-integration
 ```
 Expected: PASS (same as before this work).
 
-- [ ] **Step 7: Commit any final touch-ups (lint, test-runner integration)**
+- [ ] **Step 5: Commit any final touch-ups (lint, test-runner integration)**
 
 If the lint/test runner needed adjustments:
 
@@ -4357,7 +4026,7 @@ After this plan completes:
 
 - `symbolize.Symbolizer` is the abstraction every profiler depends on.
 - `LocalSymbolizer` preserves today's behavior bit-for-bit.
-- `DebuginfodSymbolizer` is opt-in via `--debuginfod-url`, hybrid-routes per mapping, caches under `.build-id/...` with SQLite (default) or JSON (`-tags noindex_sqlite`).
+- `DebuginfodSymbolizer` is opt-in via `--debuginfod-url`, hybrid-routes per mapping, caches under `.build-id/...` with a SQLite index (`modernc.org/sqlite`).
 - All three call sites use the interface; the Agent owns the symbolizer.
 - An integration test boots the PoC's docker-compose and asserts end-to-end symbolization.
 

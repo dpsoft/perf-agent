@@ -495,7 +495,7 @@ build-id collapse to one HTTP call.
       aa/
          bbccddeeff...debug      ← from /debuginfo (works as debug_dirs source)
          bbccddeeff...           ← from /executable (returned to dispatcher directly)
-   index.db                       ← SQLite (or index.json with -tags noindex_sqlite)
+   index.db                       ← SQLite (modernc.org/sqlite, pure Go)
 ```
 
 The `.build-id/<NN>/<rest>` layout is what gdb, eu-readelf, and blazesym's
@@ -511,29 +511,23 @@ fetches never collide.
 `(build_id, kind, size, last_access_ns)`. A goroutine wakes on cache write,
 sums sizes, and evicts LRU entries until total ≤ `CacheMaxBytes`.
 
-**Index backend selection.** Build-tag opt-out:
-
-```
-go build                     → SQLite via modernc.org/sqlite (default)
-go build -tags noindex_sqlite → JSON-only (no SQLite linked in)
-```
+**Index backend.** Single SQLite implementation via `modernc.org/sqlite`
+(pure Go, no cgo). The `Index` interface stays so cache-layout tests can
+substitute a fake without dragging SQLite into every test, but production
+builds always use SQLite.
 
 ```go
-// symbolize/debuginfod/cache/index.go (always compiled)
-type index interface {
-    Touch(buildID, kind string, size int64)
-    Evict(maxBytes int64) []entry
-    Iter(yield func(entry) bool)
+// symbolize/debuginfod/cache/index.go
+type Index interface {
+    Touch(buildID string, kind Kind, size int64) error
+    TotalBytes() (int64, error)
+    EvictTo(maxBytes int64) ([]Entry, error)
+    Iter(yield func(Entry) bool) error
+    Forget(buildID string, kind Kind) error
     Close() error
 }
-
-// symbolize/debuginfod/cache/index_sqlite.go  //go:build !noindex_sqlite
-// symbolize/debuginfod/cache/index_json.go    //go:build noindex_sqlite
+// symbolize/debuginfod/cache/index_sqlite.go — sole impl
 ```
-
-Both impls covered by the cache test suite via build-tag matrix in CI. JSON
-impl is a single `index.json` rewritten on cache write, mutex-guarded; fine
-at the 2 GiB cap (low-thousands of entries).
 
 **Pre-warm on startup.** `New(...)` scans the cache directory and
 re-populates the index from disk (recovers from index loss; lets a fresh
@@ -743,10 +737,7 @@ Assert resolved frames match the unstripped baseline.
   `capi/include/blazesym.h` lacks `process_dispatch`.
 - **Go modules added:**
   - `golang.org/x/sync/singleflight`
-  - `modernc.org/sqlite` (default builds only; pure Go, no cgo)
-- **Build tags:**
-  - `noindex_sqlite` — drops SQLite, falls back to JSON index. Used in
-    restrictive-environment builds.
+  - `modernc.org/sqlite` (pure Go, no cgo)
 - **No new system packages.**
 
 ## Phasing
@@ -757,8 +748,7 @@ Assert resolved frames match the unstripped baseline.
 - Migrate the three call sites to the interface (no functional change).
 - `symbolize/debuginfod`: cgo dispatcher, `readBuildID`, fetcher with
   singleflight, four-case dispatcher logic.
-- Cache with SQLite index (default) + JSON index (build-tag opt-out), LRU
-  eviction.
+- Cache with SQLite index (`modernc.org/sqlite`, pure Go), LRU eviction.
 - CLI flags + env-var fallback.
 - Unit tests + the docker-compose integration test from the PoC.
 
@@ -768,7 +758,7 @@ Assert resolved frames match the unstripped baseline.
 - Multi-URL ordered fallback tests.
 - Metrics exporter wiring.
 - Race tests, FD-leak tests, multi-instance test.
-- BUILDING.md update (blazesym pin + build-tag matrix).
+- BUILDING.md update (blazesym pin).
 - End-to-end stripped-binary test in `test/integration_test.go`.
 
 ### M3 — operational polish (3-5 days)
@@ -821,10 +811,7 @@ Assert resolved frames match the unstripped baseline.
 - No measurable latency regression vs. local-disk symbolization on cache
   hit (within 5% of baseline).
 - `go test -race` passes with 1000-iteration concurrency tests.
-- A build with `-tags noindex_sqlite` produces a binary that does not link
-  `modernc.org/sqlite` (verifiable via `go list -deps`).
-- BUILDING.md documents the blazesym pin, the build-tag, and the cache
-  semantics.
+- BUILDING.md documents the blazesym pin and the cache semantics.
 
 ## Resolved open questions
 

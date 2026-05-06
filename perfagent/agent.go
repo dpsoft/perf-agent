@@ -27,6 +27,7 @@ import (
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
 
@@ -348,6 +349,10 @@ func (a *Agent) Start(ctx context.Context) error {
 				log.Printf("CPU profiler enabled (PID: %s, %d Hz, DWARF)", a.pidLogStr(hostPID), a.config.SampleRate)
 			}
 		default:
+			sym, err := symbolize.NewLocalSymbolizer()
+			if err != nil {
+				return fmt.Errorf("create symbolizer: %w", err)
+			}
 			profiler, err := profile.NewProfiler(
 				hostPID,
 				a.config.SystemWide,
@@ -357,6 +362,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				sym,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)

@@ -15,7 +15,7 @@ func hasDwarf(path string) bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sec := f.Section(".debug_info")
 	return sec != nil && sec.Size > 0
 }
@@ -39,7 +39,7 @@ func hasResolvableDebuglink(path string, extraDirs []string) bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sec := f.Section(".gnu_debuglink")
 	if sec == nil {
 		return false

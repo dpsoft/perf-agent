@@ -100,7 +100,7 @@ func TestWriteAtomicLargeBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	got, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -185,7 +185,7 @@ func TestCachePrewarmRebuildsIndex(t *testing.T) {
 		t.Fatalf("NewSQLiteIndex (rebuild): %v", err)
 	}
 	c2 := &Cache{Dir: dir, Index: idx2, MaxBytes: 1024}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	if err := c2.Prewarm(); err != nil {
 		t.Fatalf("Prewarm: %v", err)
 	}

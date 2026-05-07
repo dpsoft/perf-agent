@@ -74,7 +74,7 @@ func (s *sqliteIndex) EvictTo(maxBytes int64) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var evicted []Entry
 	var freed int64
@@ -93,7 +93,7 @@ func (s *sqliteIndex) EvictTo(maxBytes int64) ([]Entry, error) {
 	if err := rows.Err(); err != nil {
 		return evicted, err
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for _, e := range evicted {
 		if _, err := s.db.Exec(`DELETE FROM entries WHERE build_id=? AND kind=?`, e.BuildID, int(e.Kind)); err != nil {
@@ -108,7 +108,7 @@ func (s *sqliteIndex) Iter(yield func(Entry) bool) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var e Entry
 		var k int

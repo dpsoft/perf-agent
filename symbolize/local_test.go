@@ -36,7 +36,7 @@ func TestLocalSymbolizerSymbolizeSelf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalSymbolizer: %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	// main is a symbol in our own binary — its address is the runtime PC of any
 	// stack frame inside it. We don't need to find it precisely; we just need an

@@ -33,7 +33,7 @@ func TestFetchOnce200(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchURL: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	buf := make([]byte, 16)
 	n, _ := body.Read(buf)
 	if string(buf[:n]) != "hello" {
@@ -54,7 +54,7 @@ func TestFetchOnceFallback404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	buf := make([]byte, 16)
 	n, _ := body.Read(buf)
 	if string(buf[:n]) != "ok" {
@@ -98,7 +98,7 @@ func TestFetchTrimsTrailingSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	body.Close()
+	_ = body.Close()
 }
 
 // cacheBackend is a tiny test stub: it adapts a freshly-created cache.Cache

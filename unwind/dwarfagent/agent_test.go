@@ -13,8 +13,21 @@ import (
 	"github.com/google/pprof/profile"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
+
+// newTestSymbolizer constructs a LocalSymbolizer for tests; fails the
+// test on construction error.
+func newTestSymbolizer(t *testing.T) symbolize.Symbolizer {
+	t.Helper()
+	sym, err := symbolize.NewLocalSymbolizer()
+	if err != nil {
+		t.Fatalf("NewLocalSymbolizer: %v", err)
+	}
+	t.Cleanup(func() { _ = sym.Close() })
+	return sym
+}
 
 // TestProfilerEndToEnd runs the full dwarfagent stack against the
 // rust-workload and asserts that the resulting pprof contains at
@@ -47,7 +60,7 @@ func TestProfilerEndToEnd(t *testing.T) {
 		cpus = append(cpus, uint(i))
 	}
 
-	p, err := dwarfagent.NewProfiler(workload.Process.Pid, false, cpus, nil, 99, nil, nil, nil)
+	p, err := dwarfagent.NewProfiler(workload.Process.Pid, false, cpus, nil, 99, nil, nil, nil, newTestSymbolizer(t))
 	if err != nil {
 		t.Fatalf("NewProfiler: %v", err)
 	}
@@ -147,7 +160,7 @@ func TestNewProfilerWithHooks_FiresOnCompile(t *testing.T) {
 		},
 	}
 
-	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks, nil, nil, nil)
+	prof, err := dwarfagent.NewProfilerWithHooks(pid, false, []uint{0}, nil, 99, hooks, nil, nil, nil, newTestSymbolizer(t))
 	if err != nil {
 		t.Fatalf("NewProfilerWithHooks: %v", err)
 	}

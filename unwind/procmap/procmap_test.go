@@ -32,9 +32,9 @@ func TestReadBuildID(t *testing.T) {
 	// /bin/ls on any modern distro has a GNU build-id. We don't assert
 	// the exact value (it varies) — only that it parses to a non-empty
 	// lowercase hex string.
-	id, err := readBuildID("/bin/ls")
+	id, err := ReadBuildID("/bin/ls")
 	if err != nil {
-		t.Fatalf("readBuildID(/bin/ls): %v", err)
+		t.Fatalf("ReadBuildID(/bin/ls): %v", err)
 	}
 	if id == "" {
 		t.Fatal("expected non-empty build-id, got empty")
@@ -47,7 +47,7 @@ func TestReadBuildID(t *testing.T) {
 }
 
 func TestReadBuildIDMissing(t *testing.T) {
-	id, err := readBuildID("/nonexistent/path/to/nothing")
+	id, err := ReadBuildID("/nonexistent/path/to/nothing")
 	if err == nil {
 		t.Fatalf("expected error, got id=%q", id)
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/google/pprof/profile"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
 
@@ -43,7 +44,12 @@ func TestOffCPUProfilerEndToEnd(t *testing.T) {
 	}()
 	time.Sleep(1 * time.Second)
 
-	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, false, nil, nil, nil)
+	sym, err := symbolize.NewLocalSymbolizer()
+	if err != nil {
+		t.Fatalf("NewLocalSymbolizer: %v", err)
+	}
+	defer sym.Close()
+	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, false, nil, nil, nil, sym)
 	if err != nil {
 		t.Fatalf("NewOffCPUProfiler: %v", err)
 	}

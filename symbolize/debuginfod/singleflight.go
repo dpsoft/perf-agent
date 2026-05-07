@@ -34,7 +34,7 @@ func (s *singleflightFetcher) fetchAndStore(ctx context.Context, kindStr, buildI
 		if err != nil {
 			return "", err
 		}
-		defer body.Close()
+		defer func() { _ = body.Close() }()
 		var k cache.Kind
 		switch kindStr {
 		case "debuginfo":

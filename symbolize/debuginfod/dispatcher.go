@@ -138,18 +138,35 @@ func (s *Symbolizer) cgoDispatch(mapsFile, symbolicPath string) *C.char {
 	return C.CString(path)
 }
 
-// dispatchDecision is the pure-Go four-case routing logic. Returns the
-// override path string for blazesym, or "" meaning "use the default".
+// dispatchDecision is the production entry: reads the build-id from the ELF,
+// then delegates to dispatchWithBuildID for the four-case routing logic.
+// Returns the override path string for blazesym, or "" meaning "use the default".
 //
 // See spec §"Dispatcher decision tree".
 func (s *Symbolizer) dispatchDecision(ctx context.Context, mapsFile, symbolicPath string) string {
 	s.stats.dispatcherCalls.Add(1)
-
 	buildID := readBuildID(mapsFile, symbolicPath)
 	if buildID == "" {
 		return ""
 	}
+	return s.dispatchWithBuildID(ctx, symbolicPath, buildID)
+}
 
+// dispatchDecisionForTest is a test-only entry that lets tests bypass
+// readBuildID (which depends on the ELF having .note.gnu.build-id) by
+// supplying an explicit buildID. Delegates to the same dispatchWithBuildID
+// helper as the production path so both share identical routing logic.
+func (s *Symbolizer) dispatchDecisionForTest(ctx context.Context, _, symbolicPath, buildID string) string {
+	s.stats.dispatcherCalls.Add(1)
+	return s.dispatchWithBuildID(ctx, symbolicPath, buildID)
+}
+
+// dispatchWithBuildID is the shared four-case routing logic. Both the
+// production entry (dispatchDecision) and the test entry
+// (dispatchDecisionForTest) delegate here so the routing logic lives in
+// exactly one place. dispatcherCalls must be incremented by the caller, not
+// here, to avoid double-counting.
+func (s *Symbolizer) dispatchWithBuildID(ctx context.Context, symbolicPath, buildID string) string {
 	// Case 1: cached executable from prior fetch.
 	if s.cache.Has(buildID, cache.KindExecutable) {
 		s.stats.cacheHits.Add(1)
@@ -183,29 +200,6 @@ func (s *Symbolizer) dispatchDecision(ctx context.Context, mapsFile, symbolicPat
 		return ""
 	}
 	s.stats.fetchSuccessExecutable.Add(1)
-	return abs
-}
-
-// dispatchDecisionForTest is a test-only entry that lets tests bypass
-// readBuildID (which depends on the ELF having .note.gnu.build-id).
-func (s *Symbolizer) dispatchDecisionForTest(ctx context.Context, mapsFile, symbolicPath, buildID string) string {
-	_ = mapsFile
-	s.stats.dispatcherCalls.Add(1)
-
-	if s.cache.Has(buildID, cache.KindExecutable) {
-		return s.cache.AbsPath(buildID, cache.KindExecutable)
-	}
-	if s.localResolutionPossible(symbolicPath, buildID) {
-		return ""
-	}
-	if binaryReadable(symbolicPath) {
-		_, _ = s.sf.fetchAndStore(ctx, "debuginfo", buildID)
-		return ""
-	}
-	abs, err := s.sf.fetchAndStore(ctx, "executable", buildID)
-	if err != nil {
-		return ""
-	}
 	return abs
 }
 
@@ -272,6 +266,9 @@ func newCgoState(s *Symbolizer) (*cgoState, error) {
 // holding the cb/ctx pair) → free the dispatch struct → delete the cgo
 // handle. Reversing any pair would risk a use-after-free if a callback
 // were still running, hence the inflight.Wait() precondition.
+//
+// close is idempotent: each field is checked and zeroed before freeing,
+// so a second call is a safe no-op.
 func (st *cgoState) close() {
 	if st.csym != nil {
 		C.blaze_symbolizer_free(st.csym)
@@ -281,7 +278,10 @@ func (st *cgoState) close() {
 		C.free_dispatch(st.dispatch)
 		st.dispatch = nil
 	}
-	st.handle.Delete()
+	if st.handle != 0 {
+		st.handle.Delete()
+		st.handle = 0
+	}
 }
 
 // symbolizeProcess is the C-side symbolize call. Returns one Frame per IP.

@@ -10,7 +10,7 @@
 
 One binary, runs locally, no backend or telemetry.
 
-> 🚧 **GPU profiling support is in active development** as an experimental track ([design spec](docs/superpowers/specs/2026-04-25-gpu-profiling-design.md)). CPU, off-CPU, and PMU profiling are stable today.
+> 🚧 **GPU profiling support is in active development** as an experimental track. CPU, off-CPU, and PMU profiling are stable today.
 
 ---
 
@@ -71,6 +71,18 @@ One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python
 ### 🐳 Sidecar profiling inside Kubernetes pods
 
 `--pid <N>` is namespace-aware (with `shareProcessNamespace: true` on the pod), so the in-pod PID just works. Output samples carry k8s identity labels (`pod_uid`, `container_id`, `cgroup_path`) parsed from the cgroup, plus best-effort `pod_name` / `namespace` / `container_name` from the downward API. **No kubelet API calls, no client-go dependency.**
+
+### 🔍 Stripped production binaries via off-box symbols
+
+Production builds usually strip debug info to keep images small. Point
+perf-agent at a `debuginfod`-protocol server with `--debuginfod-url=URL`
+and the agent fetches DWARF on demand, keyed by GNU build-id, and caches
+it on disk. Symbol resolution uses blazesym's `process_dispatch` hook —
+binaries already on disk get DWARF via the cache (no override), sidecar/missing
+binaries get the full ELF from the server.
+
+See [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md)
+for the dispatcher routing table, cache layout, and operating notes.
 
 ### 🧪 PGO and flame graphs
 
@@ -146,6 +158,11 @@ Two specific deployment shapes — Python via `--inject-python`, and sidecar ins
 | `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
 | `--inject-python` | Activate Python 3.12+ perf trampoline on the target before profiling | `false` |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
+| `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable). Falls back to `DEBUGINFOD_URLS` env. Unset → off. | - |
+| `--symbol-cache-dir=DIR` | Local directory for fetched artifacts. | `/tmp/perf-agent-debuginfod` |
+| `--symbol-cache-max=BYTES` | LRU cap for the symbol cache. | `2147483648` (2 GiB) |
+| `--symbol-fetch-timeout=DUR` | Per-artifact HTTP fetch timeout. | `30s` |
+| `--symbol-fail-closed` | (M2 stub) Refuse to symbolize a mapping whose fetch failed. | `false` |
 
 Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
 
@@ -172,6 +189,10 @@ CPU and off-CPU profiles are full-fidelity pprof: every `Mapping` carries the ab
 ```bash
 go tool pprof myapp-202604021430-on-cpu.pb.gz
 ```
+
+With `--debuginfod-url` configured, pprof comes back fully symbolized —
+function names + source `:line` — even when debug info isn't present
+locally. See [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
 
 ### PMU output
 

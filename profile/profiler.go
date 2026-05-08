@@ -9,19 +9,18 @@ import (
 
 	"github.com/cilium/ebpf"
 
-	blazesym "github.com/libbpf/blazesym/go"
-
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
 	objs       *perfObjects
-	symbolizer *blazesym.Symbolizer
+	symbolizer symbolize.Symbolizer
 	resolver   *procmap.Resolver
 	perfSet    *perfevent.Set
 	tags       []string
@@ -39,34 +38,6 @@ func (s *stackBuilder) append(f pprof.Frame) {
 	s.stack = append(s.stack, f)
 }
 
-// blazeSymToFrames converts a blazesym.Sym into one or more pprof.Frames.
-// addr is the absolute PC from the BPF stack — it is copied onto every
-// frame (inlined chain + outer real function) so pprof Locations stay
-// distinguishable when two PCs symbolize to the same (file, line, func).
-//
-// blazesym reports Inlined in outer→inner order (see
-// blazesym/src/symbolize/mod.rs:408), so we walk it in reverse to get
-// leaf-first output.
-func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
-	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
-	for i := len(s.Inlined) - 1; i >= 0; i-- {
-		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
-		if in.CodeInfo != nil {
-			f.File = in.CodeInfo.File
-			f.Line = in.CodeInfo.Line
-		}
-		out = append(out, f)
-	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
-	if s.CodeInfo != nil {
-		outer.File = s.CodeInfo.File
-		outer.Line = s.CodeInfo.Line
-	}
-	out = append(out, outer)
-	return out
-}
-
 // NewProfiler creates a new CPU profiler.
 //
 // eventSpec selects the perf-event source. Pass nil to default to software
@@ -74,7 +45,7 @@ func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
 // caller is responsible for putting the desired rate in eventSpec). Used
 // by the agent to keep the in-kernel event and the perf.data attr in sync
 // when the output writer is enabled — a divergence would mislead consumers.
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -119,19 +90,9 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		return nil, err
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		_ = perfSet.Close()
-		_ = objs.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
 	return &Profiler{
 		objs:       objs,
-		symbolizer: symbolizer,
+		symbolizer: sym,
 		resolver:   procmap.NewResolver(),
 		perfSet:    perfSet,
 		tags:       tags,
@@ -141,9 +102,9 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	}, nil
 }
 
-// Close releases all resources associated with the profiler
+// Close releases all resources associated with the profiler.
+// The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
-	pr.symbolizer.Close()
 	pr.resolver.Close()
 	_ = pr.perfSet.Close()
 	_ = pr.objs.Close()
@@ -206,28 +167,18 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		begin := len(sb.stack)
 
 		// Extract all non-zero IPs first, then batch-symbolize in a
-		// single blazesym call. Per-call overhead (CGO boundary +
-		// perf-map / debug-syms bookkeeping) dominates for short stacks;
-		// one batched call is dramatically cheaper than one call per IP.
+		// single call through the symbolize.Symbolizer interface. Per-call
+		// overhead (CGO boundary + perf-map / debug-syms bookkeeping)
+		// dominates for short stacks; one batched call is dramatically
+		// cheaper than one call per IP.
 		ips := bpfstack.ExtractIPs(stack)
 		if len(ips) > 0 {
-			symbols, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
-				ips,
-				samplePid,
-				blazesym.ProcessSourceWithPerfMap(true),
-				blazesym.ProcessSourceWithDebugSyms(true),
-			)
+			frames, err := pr.symbolizer.SymbolizeProcess(samplePid, ips)
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
 			} else {
-				// symbols and ips are parallel — one Sym per IP.
-				for i, s := range symbols {
-					if i >= len(ips) {
-						break
-					}
-					for _, f := range blazeSymToFrames(s, ips[i]) {
-						sb.append(f)
-					}
+				for _, f := range symbolize.ToProfFrames(frames) {
+					sb.append(f)
 				}
 			}
 		}

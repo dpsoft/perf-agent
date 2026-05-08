@@ -3,6 +3,7 @@ package perfagent
 
 import (
 	"io"
+	"time"
 
 	"github.com/dpsoft/perf-agent/metrics"
 )
@@ -82,6 +83,26 @@ type Config struct {
 	// not calling it at all).
 	LabelEnricher    func(hostPID int) map[string]string
 	LabelEnricherSet bool
+
+	// DebuginfodURLs is the ordered list of debuginfod servers to consult for
+	// off-box DWARF/executable fetching. If empty (and DEBUGINFOD_URLS env is
+	// also empty), the agent uses the local symbolizer.
+	DebuginfodURLs []string
+
+	// SymbolCacheDir overrides the debuginfod cache directory.
+	// Default: /tmp/perf-agent-debuginfod.
+	SymbolCacheDir string
+
+	// SymbolCacheMaxBytes overrides the debuginfod cache size cap. Default: 2 GiB.
+	SymbolCacheMaxBytes int64
+
+	// SymbolFetchTimeout overrides per-artifact fetch timeout. Default: 30s.
+	SymbolFetchTimeout time.Duration
+
+	// SymbolFailClosed makes the agent refuse to symbolize a mapping whose
+	// debuginfod fetch failed (vs. fall back to local). Default: false.
+	// Note: M1 ships the option but FailClosed semantics are M2.
+	SymbolFailClosed bool
 }
 
 // Option is a functional option for configuring the Agent.
@@ -240,4 +261,31 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 // create_llvm_prof (AutoFDO PGO), FlameGraph, hotspot, etc.
 func WithPerfDataOutput(path string) Option {
 	return func(c *Config) { c.PerfDataOutput = path }
+}
+
+// WithDebuginfodURL appends a debuginfod server URL. Repeatable.
+func WithDebuginfodURL(url string) Option {
+	return func(c *Config) {
+		c.DebuginfodURLs = append(c.DebuginfodURLs, url)
+	}
+}
+
+// WithSymbolCacheDir overrides the debuginfod cache directory.
+func WithSymbolCacheDir(dir string) Option {
+	return func(c *Config) { c.SymbolCacheDir = dir }
+}
+
+// WithSymbolCacheMaxBytes overrides the debuginfod cache cap.
+func WithSymbolCacheMaxBytes(n int64) Option {
+	return func(c *Config) { c.SymbolCacheMaxBytes = n }
+}
+
+// WithSymbolFetchTimeout overrides per-artifact fetch timeout.
+func WithSymbolFetchTimeout(d time.Duration) Option {
+	return func(c *Config) { c.SymbolFetchTimeout = d }
+}
+
+// WithSymbolFailClosed enables fail-closed behavior on debuginfod errors.
+func WithSymbolFailClosed() Option {
+	return func(c *Config) { c.SymbolFailClosed = true }
 }

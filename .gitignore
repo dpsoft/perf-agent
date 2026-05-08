@@ -96,3 +96,10 @@ bench-report.md
 
 ### Git worktrees ###
 .worktrees/
+
+# debuginfod local cache (created by upload.sh during tests)
+test/debuginfod/debuginfo-store/
+# Compiled sample binaries (sources are tracked; binaries are not)
+test/debuginfod/sample/hello
+test/debuginfod/sample/hello.full
+test/debuginfod/sample/hello.debug

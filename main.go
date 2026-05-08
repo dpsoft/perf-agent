@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -34,7 +35,16 @@ var (
 	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagInjectPython  = flag.Bool("inject-python", false,
 		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
-	flagTags tagFlags
+	flagTags               tagFlags
+	flagDebuginfodURLs     urlFlags
+	flagSymbolCacheDir     = flag.String("symbol-cache-dir", "",
+		"Directory for debuginfod-fetched artifacts. Default: /tmp/perf-agent-debuginfod.")
+	flagSymbolCacheMax = flag.Int64("symbol-cache-max", 0,
+		"Maximum size of the debuginfod cache in bytes. Default: 2 GiB.")
+	flagSymbolFetchTimeout = flag.Duration("symbol-fetch-timeout", 0,
+		"Per-artifact debuginfod fetch timeout. Default: 30s.")
+	flagSymbolFailClosed = flag.Bool("symbol-fail-closed", false,
+		"Refuse to symbolize a mapping whose debuginfod fetch failed (no fallback to local).")
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -52,11 +62,26 @@ func (t *tagFlags) Set(value string) error {
 	return nil
 }
 
+// urlFlags collects multiple --debuginfod-url arguments.
+type urlFlags []string
+
+func (u *urlFlags) String() string { return strings.Join(*u, ",") }
+func (u *urlFlags) Set(v string) error {
+	if v == "" {
+		return errors.New("debuginfod URL must not be empty")
+	}
+	*u = append(*u, v)
+	return nil
+}
+
 func init() {
 	// Register long form for -a flag
 	flag.BoolVar(flagAll, "all", false, "System-wide profiling (all processes)")
 	// Register --tag flag for profile metadata
 	flag.Var(&flagTags, "tag", "Add tag to profile (repeatable, format: key=value)")
+	// Register --debuginfod-url flag for debuginfod server URLs
+	flag.Var(&flagDebuginfodURLs, "debuginfod-url",
+		"Add a debuginfod server URL (repeatable). Falls back to DEBUGINFOD_URLS env var.")
 }
 
 var pmuFile *os.File
@@ -191,6 +216,23 @@ func buildOptions() []perfagent.Option {
 	// Tags
 	if len(flagTags) > 0 {
 		opts = append(opts, perfagent.WithTags(flagTags...))
+	}
+
+	// Debuginfod / symbol-cache options
+	for _, u := range flagDebuginfodURLs {
+		opts = append(opts, perfagent.WithDebuginfodURL(u))
+	}
+	if *flagSymbolCacheDir != "" {
+		opts = append(opts, perfagent.WithSymbolCacheDir(*flagSymbolCacheDir))
+	}
+	if *flagSymbolCacheMax > 0 {
+		opts = append(opts, perfagent.WithSymbolCacheMaxBytes(*flagSymbolCacheMax))
+	}
+	if *flagSymbolFetchTimeout > 0 {
+		opts = append(opts, perfagent.WithSymbolFetchTimeout(*flagSymbolFetchTimeout))
+	}
+	if *flagSymbolFailClosed {
+		opts = append(opts, perfagent.WithSymbolFailClosed())
 	}
 
 	// Unwinding strategy

@@ -1,6 +1,7 @@
 package perfagent
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/iovisor/gobpf/pkg/cpuonline"
@@ -27,7 +29,10 @@ import (
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	"github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // cpuProfiler is the narrow shape both profile.Profiler and
@@ -76,6 +81,10 @@ type Agent struct {
 	pmuMonitor     *cpu.PMUMonitor
 	pyInjector     *python.Manager // nil unless --inject-python is set
 	perfDataWriter *perfdata.Writer // nil when --perf-data-output not set
+
+	// symbolizer is the agent-owned shared symbol resolver. Selected at
+	// Start() time based on whether DebuginfodURLs is non-empty.
+	symbolizer symbolize.Symbolizer
 
 	mu      sync.Mutex
 	started bool
@@ -214,6 +223,36 @@ func (a *Agent) pidLogStr(hostPID int) string {
 	return fmt.Sprintf("%d (host: %d)", a.config.PID, hostPID)
 }
 
+// chooseSymbolizer constructs the agent-owned symbolizer. If DebuginfodURLs
+// is non-empty (or the DEBUGINFOD_URLS env var is set), a Debuginfod
+// symbolizer is returned; otherwise the local blazesym symbolizer is used.
+func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (symbolize.Symbolizer, error) {
+	urls := cfg.DebuginfodURLs
+	if len(urls) == 0 {
+		for u := range strings.FieldsSeq(os.Getenv("DEBUGINFOD_URLS")) {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return symbolize.NewLocalSymbolizer()
+	}
+	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
+	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))
+	timeout := cmp.Or(cfg.SymbolFetchTimeout, 30*time.Second)
+	return debuginfod.New(debuginfod.Options{
+		URLs:          urls,
+		CacheDir:      cacheDir,
+		CacheMaxBytes: cacheMax,
+		FetchTimeout:  timeout,
+		FailClosed:    cfg.SymbolFailClosed,
+		Resolver:      res,
+		Logger:        logger,
+		Demangle:      true,
+		InlinedFns:    true,
+		CodeInfo:      true,
+	})
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -298,6 +337,15 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	// Construct the shared symbolizer once. All profilers below share the
+	// same instance. chooseSymbolizer picks LocalSymbolizer when no
+	// debuginfod URLs are configured, or DebuginfodSymbolizer otherwise.
+	sym, err := chooseSymbolizer(a.config, procmap.NewResolver(), slog.Default())
+	if err != nil {
+		return fmt.Errorf("symbolizer: %w", err)
+	}
+	a.symbolizer = sym
+
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
@@ -314,6 +362,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				a.symbolizer,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -337,6 +386,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				a.symbolizer,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -357,6 +407,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				labels,
 				a.perfDataWriter,
 				profilerEventSpec,
+				a.symbolizer,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -380,6 +431,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				cpus,
 				a.config.Tags,
 				labels,
+				a.symbolizer,
 			)
 			if err != nil {
 				a.cleanup()
@@ -397,6 +449,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SystemWide,
 				a.config.Tags,
 				labels,
+				a.symbolizer,
 			)
 			if err != nil {
 				a.cleanup()
@@ -544,6 +597,12 @@ func (a *Agent) cleanup() {
 	if a.pmuMonitor != nil {
 		a.pmuMonitor.Close()
 		a.pmuMonitor = nil
+	}
+	// Close the symbolizer last — profilers above may have been using it
+	// up until their own Close() calls completed.
+	if a.symbolizer != nil {
+		_ = a.symbolizer.Close()
+		a.symbolizer = nil
 	}
 }
 

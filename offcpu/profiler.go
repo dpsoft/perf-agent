@@ -12,14 +12,14 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
-	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Profiler handles off-CPU profiling with stack traces
 type Profiler struct {
 	objs       *offcpuObjects
-	symbolizer *blazesym.Symbolizer
+	symbolizer symbolize.Symbolizer
 	resolver   *procmap.Resolver
 	link       link.Link
 	tags       []string
@@ -35,32 +35,8 @@ func (s *stackBuilder) append(f pprof.Frame) {
 	s.stack = append(s.stack, f)
 }
 
-// blazeSymToFrames mirrors the converter in profile/profiler.go: expands
-// inlined call chains into separate leaf-first Frames. addr is the
-// absolute PC from the BPF stack, copied onto every frame so pprof
-// Locations stay distinguishable.
-func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
-	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
-	for i := len(s.Inlined) - 1; i >= 0; i-- {
-		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
-		if in.CodeInfo != nil {
-			f.File = in.CodeInfo.File
-			f.Line = in.CodeInfo.Line
-		}
-		out = append(out, f)
-	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
-	if s.CodeInfo != nil {
-		outer.File = s.CodeInfo.File
-		outer.Line = s.CodeInfo.Line
-	}
-	out = append(out, outer)
-	return out
-}
-
 // NewProfiler creates a new off-CPU profiler
-func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer) (*Profiler, error) {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
@@ -94,19 +70,9 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 		return nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		_ = tp.Close()
-		_ = objs.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
 	return &Profiler{
 		objs:       objs,
-		symbolizer: symbolizer,
+		symbolizer: sym,
 		resolver:   procmap.NewResolver(),
 		link:       tp,
 		tags:       tags,
@@ -114,9 +80,9 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 	}, nil
 }
 
-// Close releases all resources associated with the profiler
+// Close releases all resources associated with the profiler.
+// The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
-	pr.symbolizer.Close()
 	pr.resolver.Close()
 	_ = pr.link.Close()
 	_ = pr.objs.Close()
@@ -179,26 +145,17 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		begin := len(sb.stack)
 
 		// Extract all non-zero IPs first, then batch-symbolize in a
-		// single blazesym call. Per-call overhead dominates for short
-		// stacks; one batched call is dramatically cheaper than one per IP.
+		// single call through the symbolize.Symbolizer interface. Per-call
+		// overhead dominates for short stacks; one batched call is
+		// dramatically cheaper than one per IP.
 		ips := bpfstack.ExtractIPs(stack)
 		if len(ips) > 0 {
-			symbols, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
-				ips,
-				samplePid,
-				blazesym.ProcessSourceWithPerfMap(true),
-				blazesym.ProcessSourceWithDebugSyms(true),
-			)
+			frames, err := pr.symbolizer.SymbolizeProcess(samplePid, ips)
 			if err != nil {
 				log.Printf("Failed to symbolize: %v", err)
 			} else {
-				for i, s := range symbols {
-					if i >= len(ips) {
-						break
-					}
-					for _, f := range blazeSymToFrames(s, ips[i]) {
-						sb.append(f)
-					}
+				for _, f := range symbolize.ToProfFrames(frames) {
+					sb.append(f)
 				}
 			}
 		}

@@ -12,10 +12,10 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
-	blazesym "github.com/libbpf/blazesym/go"
 
 	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
@@ -62,7 +62,7 @@ type session struct {
 	tracker    *ehmaps.PIDTracker
 	watcher    mmapEventSourceCloser
 	ringReader *ringbuf.Reader
-	symbolizer *blazesym.Symbolizer
+	symbolizer symbolize.Symbolizer
 	resolver   *procmap.Resolver
 
 	stop      chan struct{}
@@ -103,7 +103,7 @@ type attachStats struct {
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, sym symbolize.Symbolizer) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
@@ -183,16 +183,6 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		return nil, fmt.Errorf("ringbuf reader: %w", err)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		_ = rd.Close()
-		_ = watcher.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
 	var missReader *ringbuf.Reader
 	if mode == ModeLazy {
 		// Type-assert sessionObjs to access the CFIMissRingbuf accessor
@@ -221,7 +211,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		watcher:     watcher,
 		ringReader:  rd,
 		missReader:  missReader,
-		symbolizer:  symbolizer,
+		symbolizer:  sym,
 		resolver:    procmap.NewResolver(),
 		stop:        make(chan struct{}),
 		samples:     map[sampleKey]uint64{},
@@ -383,9 +373,7 @@ func (s *session) close() error {
 	if s.resolver != nil {
 		s.resolver.Close()
 	}
-	if s.symbolizer != nil {
-		s.symbolizer.Close()
-	}
+	// Symbolizer is owned by the Agent; do not close it here.
 	return s.objs.Close()
 }
 

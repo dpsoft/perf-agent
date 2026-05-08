@@ -1,0 +1,9 @@
+# The `frame-pointers = "force-on"` key in Cargo.toml's [profile.release]
+# is nightly-only. On stable cargo (≤1.93 at time of writing), the key
+# silently warns + is ignored. To make this fixture reproducible on stable,
+# we force frame pointers here via RUSTFLAGS — same effect, different knob.
+#
+# Once `frame-pointers` ships in stable Cargo, this file can be removed
+# (the Cargo.toml key takes over).
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]

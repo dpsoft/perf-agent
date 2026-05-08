@@ -8,17 +8,19 @@
 
 ## Summary
 
-Make perf-agent's pprof + `--perf-data-output` resolve kernel-mode stack
-frames natively. Today's BPF programs have a kernel-stack capture path
-that's gated off (system-wide hard-disables it; targeted mode reads a
-`CollectKernel` config bit that's wired to `0`). This spec flips those
-gates, walks the kernel stack chain in userspace, symbolizes it via
-blazesym's kernel source over cgo, merges with user frames, and emits
-both pprof + a kernel-aware `perf.data` callchain (with
-`PERF_CONTEXT_KERNEL` / `PERF_CONTEXT_USER` markers + a catch-all
-`[kernel.kallsyms]_text` MMAP2). Result: KVM-bound, syscall-bound, and
-IRQ-bound workloads symbolize correctly without any `/proc/kallsyms`
-post-processing hack.
+Add opt-in kernel-mode stack capture and symbolization to perf-agent's
+pprof + `--perf-data-output` output. Today's BPF programs have a
+kernel-stack capture path that's gated off (system-wide hard-disables it;
+targeted mode reads a `CollectKernel` config bit that's wired to `0`).
+This spec adds an explicit `--kernel-stacks` CLI flag (library:
+`perfagent.WithKernelStacks()`) that, when set, enables those gates, walks
+the kernel stack chain in userspace, symbolizes it via blazesym's kernel
+source over cgo, merges with user frames, and emits both pprof + a
+kernel-aware `perf.data` callchain (with `PERF_CONTEXT_KERNEL` /
+`PERF_CONTEXT_USER` markers + a catch-all `[kernel.kallsyms]_text` MMAP2).
+Result: KVM-bound, syscall-bound, and IRQ-bound workloads symbolize
+correctly without any `/proc/kallsyms` post-processing hack. Default
+behavior (no flag) is unchanged from v1.1.0.
 
 ## Motivation
 
@@ -53,8 +55,9 @@ Operators currently work around this by capturing perf-agent's
   function-name symbols for every loaded module already (when
   `kptr_restrict=0`); fetching `.ko.debug` for source `:line` resolution
   is M2. Mirrors the user-mode debuginfod pattern from v1.1.0.
-- **`--kernel-symbols` CLI flag.** Auto-detect (fail-quiet on
-  `kptr_restrict`) covers M1; an explicit flag is M3 if needed.
+- **`--kernel-symbols={auto,require,disable}` flag.** The explicit opt-in
+  `--kernel-stacks` flag covers M1; a multi-mode enum flag is a future
+  operator-grade switch for hardened deployments.
 - **Inline kernel function expansion.** blazesym's kernel source doesn't
   expose `inline` info today; revisit if upstream adds it.
 - **Per-syscall classification labels** (e.g., `syscall:openat`).
@@ -78,20 +81,32 @@ Operators currently work around this by capturing perf-agent's
   name + source `:line`. When not installed, we fall back to
   kallsyms-only (function name, no source line) — same posture as M1's
   user-mode debuginfod path.
-- **One-line BPF source flip + two userspace `pid_config` lines.**
-  `bpf/perf.bpf.c:101-102` (and `bpf/perf_dwarf.bpf.c`,
-  `bpf/offcpu.bpf.c`, `bpf/offcpu_dwarf.bpf.c` mirrors) hard-disable
-  kernel-stack capture in system-wide mode
-  (`bool collect_kernel = system_wide ? false : ...`); change to
-  `system_wide ? true : ...`. `profile/profiler.go:66` and
+- **BPF gate via `kernel_stacks_enabled` volatile global.** Each BPF
+  source (`bpf/perf.bpf.c`, `bpf/perf_dwarf.bpf.c`, `bpf/offcpu.bpf.c`,
+  `bpf/offcpu_dwarf.bpf.c`) gains a `const volatile bool
+  kernel_stacks_enabled = false;` global. Userspace flips it at load
+  time (via `spec.Variables["kernel_stacks_enabled"].Set(true)`) when
+  `--kernel-stacks` is passed. `profile/profiler.go:66` and
   `profile/dwarf_export.go:71` set `CollectKernel: 0` in `pid_config`;
-  flip to `1`. `bpf2go` regenerates the embedded bytecode + accessor
-  structs from these changes — same workflow as any other BPF edit. No
-  new BPF maps, no new BPF helpers, no semantic shift.
-- **Behavior-preserving for non-affected users.** A profile of a
-  kallsyms-readable host gets kernel frames automatically; a host with
-  `kptr_restrict=2` still profiles cleanly with raw kernel addresses.
-  No new flag gates the behavior.
+  they are flipped to `1` only when the flag is on. `bpf2go` regenerates
+  the embedded bytecode + accessor structs — same workflow as any other
+  BPF edit. No new BPF maps, no new BPF helpers, no semantic shift.
+- **Opt-in via explicit CLI flag.** Kernel-stack capture and symbolization
+  are OFF by default. Users opt in with `--kernel-stacks` (CLI) or
+  `perfagent.WithKernelStacks()` (library). Matches the v1.1.0 posture
+  for `--debuginfod-url` and `--inject-python` — explicit feature flag,
+  no auto-detect, no side channels. When the flag is set:
+  - BPF kernel-stack capture is enabled (a `volatile bool` global flipped
+    at load time, no per-sample cost when disabled).
+  - The Agent constructs a `LocalKernelSymbolizer`; on
+    `ErrKernelSymbolsUnavailable` it falls back to `NoopKernelSymbolizer`
+    + a one-time warning (kernel frames render as raw `0xffff…`).
+  - `AddKernelMmap` is invoked at writer init.
+  - `SampleRecord.KernelIPs` is populated; the encoded callchain carries
+    `PERF_CONTEXT_KERNEL` / `PERF_CONTEXT_USER` markers.
+
+  When the flag is NOT set, none of the above happens — zero behavioral
+  delta from v1.1.0 for users who don't opt in.
 
 ## Architecture
 
@@ -146,7 +161,8 @@ Operators currently work around this by capturing perf-agent's
 
 `procmap.Resolver`, `pprof.ProfileBuilder`'s public surface, and the
 existing user-mode `Symbolizer` are unchanged. The BPF programs get a
-one-line gate flip.
+new `kernel_stacks_enabled` volatile global (off by default); userspace
+flips it at load time when `--kernel-stacks` is set.
 
 **Module symbols (e.g. `svm_vcpu_run` in kvm_amd):** `/proc/kallsyms` already
 lists module symbols at their full kernel-virtual addresses, so blazesym's
@@ -210,21 +226,6 @@ func MergeKernelFirst(kernel, user []Frame) []Frame
 func ToProfFramesKernel(frames []Frame) []pprof.Frame
 ```
 
-### `pprof/` (one helper)
-
-```go
-// SyntheticKernelMapping returns a Mapping the builder attaches to
-// kernel-side Locations. Filename is "[kernel.kallsyms]"; build-id is
-// read from /sys/kernel/notes when available; address range comes from
-// /proc/kallsyms _text/_etext. Process-independent — shared across all
-// PIDs in a system-wide profile.
-func SyntheticKernelMapping() *Mapping
-```
-
-The `pprof.ProfileBuilder`'s existing per-build Mapping cache (keyed by
-`Filename + BuildID`) gets one new branch: when a `Frame.Module` starts
-with `"[kernel."`, attach to the synthetic kernel Mapping.
-
 ### `internal/perfdata/` (one method)
 
 ```go
@@ -241,22 +242,52 @@ func (w *Writer) AddKernelMmap() error
 ### `perfagent/` (Agent + factory)
 
 ```go
-// Agent gains a sibling field; no new Option setters in M1.
+// Agent gains a sibling field.
 type Agent struct {
     // ... existing ...
     symbolizer       symbolize.Symbolizer       // user-mode (existing)
     kernelSymbolizer symbolize.KernelSymbolizer // NEW
 }
 
-// chooseKernelSymbolizer mirrors chooseSymbolizer: tries the local
-// blazesym kernel source; on ErrKernelSymbolsUnavailable returns a
-// NoopKernelSymbolizer + logs one warning. Never returns an error.
-func chooseKernelSymbolizer(logger *slog.Logger) symbolize.KernelSymbolizer
+// chooseKernelSymbolizer returns LocalKernelSymbolizer when
+// cfg.KernelStacks is true and /proc/kallsyms is readable; otherwise
+// NoopKernelSymbolizer (and a one-time warning if the user opted in but
+// kallsyms is locked down). When cfg.KernelStacks is false, returns
+// NoopKernelSymbolizer silently — the user did not opt in.
+func chooseKernelSymbolizer(cfg *Config, logger *slog.Logger) symbolize.KernelSymbolizer
 ```
 
-No new CLI flag in M1. No `WithKernel*` setters. The agent constructs
-the kernel symbolizer unconditionally; the impl chooses real-vs-noop
-based on what kallsyms gives back.
+## Configuration
+
+### CLI
+
+```
+--kernel-stacks            Enable kernel-mode stack capture and
+                           symbolization. Default: false.
+```
+
+No additional flags — the kernel symbolizer doesn't have a separate cache
+or URL. When `--kernel-stacks` is set and `/proc/kallsyms` is locked down
+(`kptr_restrict=2`), the agent logs a one-time warning and emits raw
+addresses for kernel frames; user-side resolution is unaffected.
+
+Distro kernel debug-info packages (`linux-image-{ver}-dbgsym` on Ubuntu,
+`kernel-debuginfo` on Fedora) are picked up automatically by the bumped
+blazesym pin — no flag, no path config. When installed, kernel and
+module functions resolve to function name + source `:line`.
+
+### Library (perfagent package)
+
+```go
+// WithKernelStacks enables kernel-mode stack capture + symbolization.
+// Default: off.
+func WithKernelStacks() Option {
+    return func(c *Config) { c.KernelStacks = true }
+}
+```
+
+`Config.KernelStacks bool` is a new field. Zero-value (false) preserves
+v1.1.0 behavior.
 
 ## Stack-walk changes per call site
 
@@ -315,20 +346,23 @@ func symbolizeStack(userSym symbolize.Symbolizer,
 
 ## pprof emission
 
-The synthetic kernel Mapping is created on first kernel-side Frame
-encountered by the builder, then deduped across the rest of the profile.
-Filename `[kernel.kallsyms]`, build-id read once from `/sys/kernel/notes`.
+Kernel frames are produced by the new `symbolize.ToProfFramesKernel`
+helper, which flips `pprof.Frame.IsKernel = true` on every output. The
+existing `pprof.ProfileBuilder` branch at `pprof/pprof.go:288` already
+routes `IsKernel` frames through the `kernelSentinel` mapping
+(`procmap.Mapping{Path: "[kernel]"}`). **No pprof builder code changes
+needed**; we reuse the existing machinery.
 
-Frame ordering at the pprof level: kernel frames are leaf-side (deepest
-first), then user frames (`main` is root). After `pprof.Reverse` the
-on-disk pprof has root → leaf as pprof prefers, with the kernel block as
-the leaf-most segment of every kernel-impacted sample. This matches what
-`perf script` produces for `[k]` frames and what FlameGraph expects.
+Stack ordering at the pprof level: kernel frames are leaf-side (deepest
+first), then user frames. After `pprof.Reverse` the on-disk pprof has
+root → leaf as pprof prefers. Locations attached to the kernel mapping
+carry `Address` (the kernel IP) for `pprof -diff_base` stability.
 
-Locations attached to the kernel Mapping carry `Address` (the kernel IP
-itself) for `pprof -diff_base` stability. Source `:line` is empty in M1
-(blazesym kernel source returns symbol name + offset; module-level DWARF
-fetch is M2).
+Source `:line` for kernel and module functions is populated when blazesym's
+kernel source has DWARF available (the bumped pin auto-discovers
+`/lib/modules/<release>/...` and reads distro kernel-modules-debuginfo when
+installed). Without local debug info, the resolver returns function name
+only; `:line` is empty.
 
 ## perf.data emission
 
@@ -394,8 +428,15 @@ ambiguity); `encodeSample` writes the marker + kernel chain when
 
 `internal/perfdata.SampleRecord` is unexported as a public-API surface
 (it's part of `internal/`), so renaming is unobserved outside the
-project. The single call site (`profile.Profiler.Collect`) is updated
-to pass both slices.
+project. **Two existing call sites are updated**:
+
+- `profile/profiler.go:193` — FP CPU profiler.
+- `unwind/dwarfagent/agent.go:137` — DWARF CPU profiler.
+
+Both are updated together so that `--unwind dwarf` and the default
+`--unwind auto` emit kernel+user callchains, not just the FP path.
+Off-CPU profilers (FP and DWARF) don't currently write `perf.data`
+samples; if that changes in the future, the same shape applies.
 
 ## Error handling
 
@@ -407,8 +448,8 @@ posture):
 | 1 | `NewLocalKernelSymbolizer()` returns `ErrKernelSymbolsUnavailable` at agent start | Log one warning at `slog.Warn`, fall back to `NoopKernelSymbolizer`. Agent does NOT fail to start. |
 | 2 | `LocalKernelSymbolizer.SymbolizeKernel` errors mid-run | Log once + return `[]Frame` of raw-address frames. User-side resolution is unaffected. |
 | 3 | `Stackmap.LookupBytes(KernStack)` returns nothing or `KernStack < 0` | Skip kernel branch silently; user-only chain is emitted. |
-| 4 | pprof builder dedups `[kernel.kallsyms]` Mapping | Builder cache extended to recognize kernel mapping by Filename prefix. Single Mapping instance per output. |
-| 5 | `Writer.AddKernelMmap` fails (kallsyms unreadable, `_text` missing) | Emit `MMAP2` with `start=0, len=0`; log once. `--perf-data-output` user path is unaffected. |
+| 4 | pprof builder dedup of kernel Mapping | The existing `kernelSentinel` (`procmap.Mapping{Path: "[kernel]"}`) is a singleton inside `pprof.ProfileBuilder`; all `IsKernel` frames share it. No new code needed. |
+| 5 | `Writer.AddKernelMmap` cannot read `/proc/kallsyms` `_text`/`_etext` | Emit a catch-all `MMAP2` covering the conventional kernel address range (`Addr=0xffffffff80000000, Len=0x80000000` on x86_64) so `perf report` still routes kernel addresses through the kernel mapping; resolution falls back to its own `/proc/kallsyms` snapshot. Log once. |
 
 Posture matches the v1.1.0 debuginfod work: "if it works, you get nicer
 profiles; if it doesn't, the profile still produces and tells you why
@@ -424,8 +465,6 @@ Five rings:
   single-side inputs.
 - `symbolize.NoopKernelSymbolizer` — IPs come back as `0x…`-named frames
   with `FailureMissingSymbols`.
-- `pprof.SyntheticKernelMapping` — golden tests with a fixture
-  `/sys/kernel/notes` and a fixture kallsyms.
 - `internal/perfdata` records test extension: golden bytes for the
   kernel MMAP2 record.
 
@@ -476,16 +515,17 @@ Single milestone. Sub-tasks (each landing in one commit, single PR):
 
 | # | Task | Files | Day-est |
 |---|---|---|---|
-| 0 | Bump blazesym pin past `29a609f` (module DWARF) + flip BPF kernel-stack gate + flip userspace `CollectKernel: 1` | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, regenerated bpf2go output | 0.5 |
+| 0 | Bump blazesym pin past `29a609f` (module DWARF) + add `kernel_stacks_enabled` volatile global + BPF gate logic + flip userspace `CollectKernel: 1` | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, regenerated bpf2go output | 0.5 |
 | 1 | `KernelSymbolizer` interface + `NoopKernelSymbolizer` + `MergeKernelFirst` + `ToProfFramesKernel` | `symbolize/kernel.go`, test | 0.5 |
 | 2 | `LocalKernelSymbolizer` cgo wrap (uses `debug_syms=true` so module DWARF lights up automatically) | `symbolize/local_kernel.go`, test | 1.0 |
 | 3 | Stack-walk changes in `profile/`, `offcpu/`, `dwarfagent/` | three call sites | 1.0 |
 | 4 | `Writer.AddKernelMmap` (catch-all kernel address range) | `internal/perfdata/perfdata.go`, test | 0.5 |
 | 5 | `SampleRecord.KernelIPs` + `encodeSample` PERF_CONTEXT_{KERNEL,USER} markers | `internal/perfdata/records.go`, test, profile/offcpu callers | 1.0 |
-| 6 | Agent owns + threads `KernelSymbolizer`; invokes `AddKernelMmap` at writer init | `perfagent/agent.go`, profiler constructor signatures | 0.5 |
+| 6a | `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter + `Config.KernelStacks bool` + BPF `kernel_stacks_enabled` volatile global plumbing | `main.go`, `perfagent/options.go`, `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go` (LoadCollectionSpec setter), `offcpu/profiler.go`, regenerated bpf2go | 0.5 |
+| 6b | Agent owns + threads `KernelSymbolizer`; invokes `AddKernelMmap` at writer init (both gated on `cfg.KernelStacks`) | `perfagent/agent.go`, profiler constructor signatures | 0.5 |
 | 7 | Integration tests: kernel-stack pprof + perf.data callchain | `test/integration_test.go` | 0.5 |
 
-Total: ~6 days. Single feature branch `feat/kernel-stacks-m1`, single PR.
+Total: ~6.5 days. Single feature branch `feat/kernel-stacks-m1`, single PR.
 
 ## Risks
 
@@ -523,12 +563,10 @@ Total: ~6 days. Single feature branch `feat/kernel-stacks-m1`, single PR.
   resolution itself is unaffected — already correct via the M1 catch-all.
 - **Module debuginfod fetch.** Per-module `.ko.debug` artifact fetch via
   distro debuginfod (Fedora kernel-modules-debuginfo, Ubuntu
-  linux-image-{ver}-dbgsym, etc.). Slot into `symbolize/debuginfod` as a
-  `KernelSymbolizer` impl; the existing build-id-keyed cache handles it.
-  Unlocks source `:line` for module functions.
-- **`--kernel-symbols={auto,require,disable}` flag.** Auto-detect is M1;
-  the flag is a future operator-grade switch (e.g., for hardened
-  deployments that explicitly forbid kernel-symbol resolution).
+  linux-image-{ver}-dbgsym, etc.) — fetching debuginfo when it's NOT
+  locally installed. M1 uses only locally-installed debuginfo. Slot into
+  `symbolize/debuginfod` as a `KernelSymbolizer` impl; the existing
+  build-id-keyed cache handles it.
 - **Inline kernel function expansion.** When blazesym's kernel source
   exposes inline info, mirror what `frameFromBlazesymSym` does for user
   code.

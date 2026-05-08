@@ -1,6 +1,8 @@
 package debuginfod
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -27,6 +29,10 @@ type Symbolizer struct {
 func New(opts Options) (*Symbolizer, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
+	}
+
+	if err := os.MkdirAll(opts.CacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 
 	idx, err := openIndex(filepath.Join(opts.CacheDir, indexFilename))

@@ -48,7 +48,7 @@ func TestSymbolizeViaDebuginfod(t *testing.T) {
 	// Populate the store BEFORE compose up — the container mounts it :ro and
 	// rescans every 10s, so pre-population is fastest.
 	// upload.sh uses STORE env var; set it to the absolute path.
-	if err := runScriptEnv(fixtureDir+"/upload.sh", []string{"STORE=" + storeDir}, fixtureDir+"/sample/hello"); err != nil {
+	if err := runScriptEnv(fixtureDir+"/upload.sh", []string{"STORE=" + storeDir}, fixtureDir+"/sample/hello.full"); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 

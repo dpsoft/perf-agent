@@ -63,8 +63,16 @@ func (c *Cache) Has(buildID string, kind Kind) bool {
 	if abs == "" {
 		return false
 	}
-	_, err := os.Stat(abs)
-	return err == nil
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return false
+	}
+	// Refresh index access metadata on cache hits so LRU eviction treats
+	// frequently-used artifacts as hot. Best-effort, matching WriteAtomic.
+	if c.Index != nil {
+		_ = c.Index.Touch(buildID, kind, fi.Size())
+	}
+	return true
 }
 
 // WriteAtomic streams body to a tmp file in the same directory as the

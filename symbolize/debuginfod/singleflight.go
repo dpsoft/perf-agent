@@ -12,6 +12,7 @@ import (
 // The interface lets tests substitute a stub.
 type storer interface {
 	WriteAtomic(buildID string, kind cache.Kind, body io.Reader) (string, error)
+	Evict() error
 }
 
 type singleflightFetcher struct {
@@ -42,7 +43,15 @@ func (s *singleflightFetcher) fetchAndStore(ctx context.Context, kindStr, buildI
 		case "executable":
 			k = cache.KindExecutable
 		}
-		return s.cache.WriteAtomic(buildID, k, body)
+		abs, werr := s.cache.WriteAtomic(buildID, k, body)
+		if werr != nil {
+			return "", werr
+		}
+		// Best-effort eviction. Errors are surfaced via the cache's own counters
+		// in M2; for now we just suppress so a fetch that succeeded isn't
+		// retroactively marked as a failure.
+		_ = s.cache.Evict()
+		return abs, nil
 	})
 	if err != nil {
 		return "", err

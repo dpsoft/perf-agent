@@ -112,6 +112,8 @@ func (c *cacheBackend) WriteAtomic(buildID string, kind cache.Kind, body io.Read
 	return cc.WriteAtomic(buildID, kind, body)
 }
 
+func (c *cacheBackend) Evict() error { return nil }
+
 func TestSingleflightCollapsesConcurrentFetches(t *testing.T) {
 	var calls atomic.Int32
 	url := newServer(t, func(w http.ResponseWriter, r *http.Request) {

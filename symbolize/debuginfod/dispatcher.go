@@ -87,11 +87,16 @@ import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
 )
+
+// orphanDispatcherPanics tracks panics that fired before we could resolve
+// the cgo handle to a *Symbolizer (corrupt/deleted/zero ctx).
+var orphanDispatcherPanics atomic.Uint64
 
 // goDispatchCb is the C-callable callback installed in
 // blaze_symbolizer_dispatch. blazesym invokes it for every process member
@@ -104,6 +109,20 @@ import (
 //
 //export goDispatchCb
 func goDispatchCb(mapsFile, symbolicPath *C.char, ctx unsafe.Pointer) (ret *C.char) {
+	// Recover BEFORE cgo.Handle.Value(): Value() panics on an invalid handle,
+	// and a Go panic crossing the cgo boundary is UB. We don't have access to
+	// the Symbolizer's stats here yet (the recovery target is the package-level
+	// counter for orphan panics — invalid/zero handles).
+	defer func() {
+		if r := recover(); r != nil {
+			orphanDispatcherPanics.Add(1)
+			ret = nil
+		}
+	}()
+
+	if uintptr(ctx) == 0 {
+		return nil
+	}
 	h := cgo.Handle(uintptr(ctx))
 	s, ok := h.Value().(*Symbolizer)
 	if !ok {

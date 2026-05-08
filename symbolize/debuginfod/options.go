@@ -19,9 +19,15 @@ type Options struct {
 	Resolver      *procmap.Resolver
 	HTTPClient    *http.Client
 	Logger        *slog.Logger
-	Demangle      bool
-	InlinedFns    bool
-	CodeInfo      bool
+	// Demangle is always true in v1. The field exists so we can switch to a
+	// *bool tristate later without API breakage.
+	Demangle bool
+	// InlinedFns is always true in v1. The field exists so we can switch to a
+	// *bool tristate later without API breakage.
+	InlinedFns bool
+	// CodeInfo is always true in v1. The field exists so we can switch to a
+	// *bool tristate later without API breakage.
+	CodeInfo bool
 }
 
 // validate fills in defaults and returns ErrNoURLs / ErrInvalidOpts when
@@ -45,6 +51,13 @@ func (o *Options) validate() error {
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.NewTextHandler(devNull{}, nil))
 	}
+	// Defaults: matches LocalSymbolizer + the spec's documented behavior. We
+	// don't honor user-provided false here because Go bool defaults to false;
+	// distinguishing unset from explicit-false would require *bool, and the
+	// fields don't have a good reason to be turned off in v1.
+	o.Demangle = true
+	o.InlinedFns = true
+	o.CodeInfo = true
 	return nil
 }
 

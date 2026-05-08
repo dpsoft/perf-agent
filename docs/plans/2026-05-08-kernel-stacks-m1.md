@@ -607,6 +607,9 @@ static blaze_symbolize_src_kernel make_kernel_src(void) {
     return src;
 }
 
+// sym_at_kernel mirrors the user-mode sym_at helper in
+// symbolize/debuginfod/dispatcher.go: lets Go index the trailing
+// flexible array without performing pointer arithmetic on the Go side.
 static const blaze_sym* sym_at_kernel(const blaze_syms* syms, size_t i) {
     return &syms->syms[i];
 }
@@ -701,9 +704,11 @@ func (s *LocalKernelSymbolizer) Close() error {
 	return nil
 }
 
-// frameFromKernelCSym translates one C blaze_sym to a Frame. When the
-// resolver couldn't name the address, we still emit a Frame so the caller
-// gets a 1:1 input/output mapping; Name is the hex form, Reason is set.
+// frameFromKernelCSym mirrors the user-mode frameFromCSym helper from
+// symbolize/debuginfod/dispatcher.go: copies name + offset + code_info
+// (file/line/column) when blazesym resolved them, and walks the inlined
+// chain so kernel module functions get full source attribution when
+// blazesym has DWARF for the loaded modules.
 func frameFromKernelCSym(c *C.blaze_sym, addr uint64) Frame {
 	f := Frame{Address: addr, Module: "[kernel.kallsyms]"}
 	if c.name == nil {
@@ -713,8 +718,31 @@ func frameFromKernelCSym(c *C.blaze_sym, addr uint64) Frame {
 	}
 	f.Name = C.GoString(c.name)
 	f.Offset = uint64(c.offset)
+	if c.code_info.file != nil {
+		f.File = C.GoString(c.code_info.file)
+		f.Line = int(c.code_info.line)
+		f.Column = int(c.code_info.column)
+	}
+	for j := C.size_t(0); j < c.inlined_cnt; j++ {
+		in := (*C.blaze_symbolize_inlined_fn)(unsafe.Pointer(uintptr(unsafe.Pointer(c.inlined)) + uintptr(j)*unsafe.Sizeof(*c.inlined)))
+		inFrame := Frame{Address: addr, Module: f.Module}
+		if in.name != nil {
+			inFrame.Name = C.GoString(in.name)
+		}
+		if in.code_info.file != nil {
+			inFrame.File = C.GoString(in.code_info.file)
+			inFrame.Line = int(in.code_info.line)
+			inFrame.Column = int(in.code_info.column)
+		}
+		f.Inlined = append(f.Inlined, inFrame)
+	}
 	return f
 }
+
+// The inlined-array indexing pattern is the same one used by the user-mode
+// `frameFromCSym` in `symbolize/debuginfod/dispatcher.go`. blazesym lays
+// out `c.inlined` as a flexible array; we walk it via pointer arithmetic
+// rather than a C indexing helper to match the existing M1 idiom.
 
 // kallsymsReadableInternal mirrors the test helper but lives here so the
 // constructor can short-circuit before allocating any cgo state.
@@ -1182,16 +1210,24 @@ import (
 )
 
 // TestAddKernelMmap writes a Writer with one kernel MMAP2 record and
-// asserts the on-disk shape: pid=-1, tid=0, filename=[kernel.kallsyms]_text,
-// and a non-zero Len (the catch-all range must cover at least the fallback
-// 0x80000000 even when /proc/kallsyms is unreadable).
+// asserts the on-disk shape: pid=-1, tid=0, filename=[kernel.kallsyms]_text.
+// We don't validate the address range against the running kernel; the
+// helper falls back to the catch-all kernel range when /proc/kallsyms is
+// unreadable, so Len is always non-zero in the on-disk output.
 func TestAddKernelMmap(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.perf.data")
 
-	w, err := NewWriter(path, Meta{})
+	// Use the same EventSpec/MetaInfo args as the existing perfdata tests
+	// — a software cpu-clock event at 99 Hz is the conventional default.
+	w, err := Open(path, EventSpec{
+		Type:         1,    // PERF_TYPE_SOFTWARE
+		Config:       0,    // PERF_COUNT_SW_CPU_CLOCK
+		SamplePeriod: 99,
+		Frequency:    true,
+	}, MetaInfo{})
 	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	if err := w.AddKernelMmap(); err != nil {
 		t.Fatalf("AddKernelMmap: %v", err)
@@ -1212,15 +1248,6 @@ func TestAddKernelMmap(t *testing.T) {
 	// (depends on header), but the bytes must appear in the file.
 	if !bytes.Contains(body, []byte{0xff, 0xff, 0xff, 0xff}) {
 		t.Fatalf("perf.data missing pid=-1 marker")
-	}
-	// The catch-all Len must be non-zero: even on an unreadable kallsyms
-	// we fall back to (0xffffffff80000000, 0x80000000) so perf report
-	// has a range to work with. Parse the MMAP2 record to verify Len > 0.
-	// (We check indirectly: the 8-byte value 0x80000000 must appear as
-	// the LE encoding 0x00000080 00000000 somewhere in the body.)
-	if !bytes.Contains(body, []byte{0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00}) {
-		t.Logf("warning: catch-all Len 0x80000000 not found in perf.data body — " +
-			"may indicate /proc/kallsyms was readable and a different range was used")
 	}
 }
 ```
@@ -1456,22 +1483,34 @@ func TestEncodeSample_UserOnly_NoKernelMarker(t *testing.T) {
 grep -rn "perfdata.SampleRecord{" --include="*.go"
 ```
 
-Each call site renames `Callchain:` → `UserIPs:`. The single existing
-caller in `profile/profiler.go:192-200` also gains `KernelIPs:`:
+Two existing call sites — both must be updated:
 
-```go
-pr.perfData.AddSample(perfdata.SampleRecord{
-    IP:        userIPs[0],
-    Pid:       samplePid,
-    Tid:       samplePid,
-    Period:    value,
-    UserIPs:   userIPs,
-    KernelIPs: kernelIPs,
-})
-```
+- **`profile/profiler.go:193`** (FP CPU profiler):
 
-(Replace the existing `ips` variable with `userIPs` to match the new
-naming; `kernelIPs` was already added in Task 3.)
+  ```go
+  pr.perfData.AddSample(perfdata.SampleRecord{
+      IP:        userIPs[0],
+      Pid:       samplePid,
+      Tid:       samplePid,
+      Period:    value,
+      UserIPs:   userIPs,   // renamed from Callchain
+      KernelIPs: kernelIPs, // NEW
+  })
+  ```
+
+  (Replace the existing `ips` variable with `userIPs` to match the new
+  naming; `kernelIPs` was already added in Task 3.)
+
+- **`unwind/dwarfagent/agent.go:137`** (DWARF CPU profiler — `s.perfData.AddSample(...)`):
+
+  Mirror the same shape. The dwarfagent's per-sample loop has its own
+  user/kernel IP extraction (added in Task 5); `kernelIPs` is the same
+  slice produced there. Apply the rename + add `KernelIPs:` at this
+  site too. Without this update, `--unwind dwarf` and the default
+  `--unwind auto` continue emitting user-only perf.data callchains.
+
+If a future grep finds additional `perfdata.SampleRecord{...}` sites
+(e.g., off-CPU adds one in M2), apply the same shape there.
 
 - [ ] **Step 5: Run tests**
 
@@ -1561,7 +1600,7 @@ Replace each occurrence with `a.kernelSymbolizer`. This affects the five profile
 
 - [ ] **Step 5: Invoke `AddKernelMmap` at writer init**
 
-In `Agent.Start` (or wherever `a.perfDataWriter` is constructed via `perfdata.NewWriter(...)`), immediately after the writer is created and before any profilers are spun up, call:
+In `Agent.Start`, find the existing `perfdata.Open(a.config.PerfDataOutput, perfdata.EventSpec{...}, perfdata.MetaInfo{...})` call (around `perfagent/agent.go:315`). Immediately after the `Open` returns success, before any profilers are spun up, call:
 
 ```go
 if a.perfDataWriter != nil {

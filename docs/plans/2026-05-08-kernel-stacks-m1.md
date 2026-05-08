@@ -4,13 +4,13 @@
 
 **Goal:** Make perf-agent's pprof + `--perf-data-output` resolve kernel-mode stack frames natively. The BPF programs have a kernel-stack capture path that is currently gated off; this plan flips those gates and wires the kernel chain through userspace stack lookup, symbolization (via blazesym's kernel source over cgo), pprof emission (using the existing `Frame.IsKernel` + `kernelSentinel` machinery), and the kernel `MMAP2` record in `--perf-data-output`.
 
-**Architecture:** Flip the BPF kernel-stack capture gate (one .c line + two userspace `CollectKernel: 1` flags). New `symbolize.KernelSymbolizer` interface (separate type from user-mode `Symbolizer` — kernel resolution has no PID and a different blazesym source). One implementation in M1 — `LocalKernelSymbolizer` — wrapping `blaze_symbolize_kernel_abs_addrs` via cgo with `debug_syms=true` so blazesym's transparent module-DWARF support resolves source `:line` for module functions when distro debug-info is installed; `NoopKernelSymbolizer` fallback when `/proc/kallsyms` is locked down. Each profiler reads `key.KernStack`, looks it up in the same `Stackmap`, calls the kernel symbolizer, and merges the result with user frames; kernel frames carry `IsKernel=true` (via `ToProfFramesKernel`) so the existing pprof builder routes them through `kernelSentinel`. `internal/perfdata.Writer` gains `AddKernelMmap()` (catch-all kernel address range) invoked at writer init, plus `SampleRecord.KernelIPs` + `PERF_CONTEXT_{KERNEL,USER}` markers in the encoded callchain.
+**Architecture:** Flip the BPF kernel-stack capture gate (one .c line + two userspace `CollectKernel: 1` flags). New `symbolize.KernelSymbolizer` interface (separate type from user-mode `Symbolizer` — kernel resolution has no PID and a different blazesym source). One implementation in M1 — `LocalKernelSymbolizer` — wrapping `blaze_symbolize_kernel_abs_addrs` via cgo with `debug_syms=true` so blazesym's transparent module-DWARF support resolves source `:line` for module functions when distro debug-info is installed; `NoopKernelSymbolizer` fallback when `/proc/kallsyms` is locked down. Each profiler reads `key.KernStack`, looks it up in the same `Stackmap`, calls the kernel symbolizer, and merges the result with user frames; kernel frames carry `IsKernel=true` (via `ToProfFramesKernel`) so the existing pprof builder routes them through `kernelSentinel`. `internal/perfdata.Writer` gains `AddKernelMmap()` (catch-all kernel address range) invoked at writer init, plus `SampleRecord.KernelIPs` + `PERF_CONTEXT_{KERNEL,USER}` markers in the encoded callchain. Kernel-stack capture is opt-in via the new `--kernel-stacks` CLI flag (`perfagent.WithKernelStacks()` library setter, `Config.KernelStacks bool` field). When the flag is OFF (default), the BPF program's new `kernel_stacks_enabled` volatile global stays `false` and no kernel work runs in either kernel-side or userspace.
 
 **Tech Stack:** Go 1.26, cgo against `libblazesym_c` (already in the build env), `/proc/kallsyms`, `/sys/kernel/notes`. No new external Go modules. BPF program changes are minimal: one-line gate flip per .bpf.c file + bpf2go regen.
 
 **Authoritative spec:** `docs/specs/2026-05-08-kernel-stacks-design.md`. Read it before starting.
 
-**Out of scope (deferred to M2+):** module debuginfod fetch (`.ko.debug` artifacts), `--kernel-symbols` CLI flag, inline kernel function expansion, per-syscall classification labels, PMU-mode kernel stacks.
+**Out of scope (deferred to M2+):** module debuginfod fetch (`.ko.debug` artifacts), `--kernel-symbols={auto,require,disable}` enum flag, inline kernel function expansion, per-syscall classification labels, PMU-mode kernel stacks.
 
 ---
 
@@ -132,18 +132,36 @@ grep -nE "system_wide \? false" bpf/*.bpf.c
 
 Expected: matches in `bpf/perf.bpf.c` and at least one of `bpf/perf_dwarf.bpf.c`, `bpf/offcpu.bpf.c`, `bpf/offcpu_dwarf.bpf.c`. Each match needs the same flip.
 
-- [ ] **Step 2: Flip every match**
+- [ ] **Step 2: Add `kernel_stacks_enabled` volatile global + gate the kernel-stack capture**
 
-In each BPF file:
+In each affected BPF source (`bpf/perf.bpf.c`, `bpf/perf_dwarf.bpf.c`,
+`bpf/offcpu.bpf.c`, `bpf/offcpu_dwarf.bpf.c`), add a new volatile global
+near the existing `system_wide` global:
 
 ```c
-// before:
-bool collect_kernel = system_wide ? false : (config && config->collect_kernel);
-// after:
-bool collect_kernel = system_wide ? true : (config && config->collect_kernel);
+const volatile bool kernel_stacks_enabled = false;
 ```
 
-If a particular BPF program doesn't have a `system_wide ? false` ternary at all (e.g., `bpf/offcpu.bpf.c` may use a different gate), inspect and adapt. Read each file before editing.
+Then change the kernel-stack ternary from:
+
+```c
+bool collect_kernel = system_wide ? false : (config && config->collect_kernel);
+```
+
+to:
+
+```c
+bool collect_kernel = false;
+if (kernel_stacks_enabled) {
+    collect_kernel = system_wide ? true : (config && config->collect_kernel);
+}
+```
+
+This gives zero per-sample cost when the flag is off (the entire kernel-stack
+branch is gated by `kernel_stacks_enabled`).
+
+If a particular BPF program lacks a `system_wide ? false` ternary, inspect
+and adapt — read each file before editing.
 
 - [ ] **Step 3: Flip `CollectKernel: 1` in the userspace `pid_config` setters**
 
@@ -172,16 +190,31 @@ config := perfPidConfig{
 grep -rn "CollectKernel" --include="*.go"
 ```
 
-- [ ] **Step 4: Regenerate bpf2go output**
+The BPF gate (`kernel_stacks_enabled && collect_kernel`) means the
+config bit only takes effect when the flag is on.
 
-```bash
-cd /home/diego/github/perf-agent/.worktrees/kernel-stacks-m1
-make generate
+- [ ] **Step 4: Userspace setter for the volatile global**
+
+The existing v1.1.0 setter pattern lives in `profile/profiler.go` —
+`spec.Variables["system_wide"].Set(systemWide)`. Add a sibling setter in
+the same loader path (and in `offcpu/profiler.go` + dwarf variants):
+
+```go
+// Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
+// gate evaluates correctly on first sample.
+if err := spec.Variables["kernel_stacks_enabled"].Set(cfg.KernelStacks); err != nil {
+    return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
+}
 ```
+
+Wire `cfg.KernelStacks` through the constructor signature.
+
+(This step's code lands here; Task 6a below adds the `Config.KernelStacks`
+field and CLI flag that `cfg.KernelStacks` refers to.)
 
 Expected: `bpf2go` regenerates `*_bpfel.go` files (and their `.o` counterparts in `profile/`, `offcpu/`). Verify via `git status` that the regenerated files have small diffs (struct fields unchanged; only embedded bytecode bytes change).
 
-- [ ] **Step 5: Run unit tests, confirm no regressions**
+- [ ] **Step 6: Run unit tests, confirm no regressions**
 
 ```bash
 GOTOOLCHAIN=auto LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
@@ -192,11 +225,11 @@ GOTOOLCHAIN=auto LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add bpf/ profile/ offcpu/
-git commit -m "bpf: enable kernel-stack capture in system-wide + targeted modes"
+git commit -m "bpf: add kernel_stacks_enabled volatile global; gate kernel-stack capture"
 ```
 
 ---
@@ -1532,6 +1565,91 @@ git commit -m "perfdata: encode mixed kernel+user callchains with PERF_CONTEXT m
 
 ---
 
+### Task 6c: `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter
+
+**Files:**
+- Modify: `perfagent/options.go` (add `Config.KernelStacks bool` + `WithKernelStacks()`)
+- Modify: `main.go` (add `--kernel-stacks` flag + wire it into `buildOptions()`)
+
+- [ ] **Step 1: Add the Config field + Option setter**
+
+`perfagent/options.go`:
+
+```go
+// In Config struct:
+type Config struct {
+    // ... existing ...
+
+    // KernelStacks enables kernel-mode stack capture and symbolization.
+    // Default: false. Opt in via --kernel-stacks (CLI) or
+    // WithKernelStacks() (library).
+    //
+    // When set:
+    //   - BPF programs enable the kernel-stack capture path (a volatile
+    //     bool global flipped at load time; no per-sample cost when off).
+    //   - The Agent constructs a LocalKernelSymbolizer; on
+    //     ErrKernelSymbolsUnavailable, falls back to NoopKernelSymbolizer
+    //     + a one-time warning.
+    //   - --perf-data-output emits a kernel MMAP2 record at writer init,
+    //     and SampleRecord callchains carry PERF_CONTEXT_{KERNEL,USER}
+    //     markers around the merged kernel+user IPs.
+    KernelStacks bool
+}
+
+// WithKernelStacks enables kernel-mode stack capture + symbolization.
+// Default: off.
+func WithKernelStacks() Option {
+    return func(c *Config) { c.KernelStacks = true }
+}
+```
+
+- [ ] **Step 2: Add the CLI flag**
+
+`main.go`:
+
+```go
+// Alongside the other flag declarations:
+flagKernelStacks = flag.Bool("kernel-stacks", false,
+    "Enable kernel-mode stack capture and symbolization (default: off).")
+```
+
+In `buildOptions()`, append:
+
+```go
+if *flagKernelStacks {
+    opts = append(opts, perfagent.WithKernelStacks())
+}
+```
+
+- [ ] **Step 3: Run build + help check**
+
+```bash
+make build
+./perf-agent -h 2>&1 | grep "kernel-stacks"
+```
+
+Expected: clean build, `--kernel-stacks` shown in `--help`.
+
+- [ ] **Step 4: Run tests**
+
+```bash
+GOTOOLCHAIN=auto LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
+  CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" \
+  CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+  go test -count=1 ./perfagent/... ./symbolize/...
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add perfagent/options.go main.go
+git commit -m "perfagent: add --kernel-stacks CLI flag + WithKernelStacks() option"
+```
+
+---
+
 ## Phase 4 — Agent wiring
 
 ### Task 7: `chooseKernelSymbolizer` + thread to all profilers + invoke `AddKernelMmap`
@@ -1558,10 +1676,15 @@ type Agent struct {
 Append to `perfagent/agent.go` near `chooseSymbolizer`:
 
 ```go
-// chooseKernelSymbolizer returns LocalKernelSymbolizer when /proc/kallsyms
-// is readable; otherwise NoopKernelSymbolizer + a one-time warning log.
-// Never returns an error — kernel-symbol resolution is best-effort.
-func chooseKernelSymbolizer(logger *slog.Logger) symbolize.KernelSymbolizer {
+// chooseKernelSymbolizer returns LocalKernelSymbolizer when
+// cfg.KernelStacks is true and /proc/kallsyms is readable; otherwise
+// NoopKernelSymbolizer (and a one-time warning if the user opted in but
+// kallsyms is locked down). When cfg.KernelStacks is false, returns
+// NoopKernelSymbolizer silently — the user did not opt in.
+func chooseKernelSymbolizer(cfg *Config, logger *slog.Logger) symbolize.KernelSymbolizer {
+	if !cfg.KernelStacks {
+		return symbolize.NoopKernelSymbolizer{}
+	}
 	s, err := symbolize.NewLocalKernelSymbolizer()
 	if err != nil {
 		if logger != nil {
@@ -1575,6 +1698,8 @@ func chooseKernelSymbolizer(logger *slog.Logger) symbolize.KernelSymbolizer {
 }
 ```
 
+(Update the call site in the Start path to pass `a.config` to the factory.)
+
 - [ ] **Step 3: Construct the kernel symbolizer in `Agent.Start`**
 
 Find the existing `chooseSymbolizer(...)` call. Add a sibling call:
@@ -1585,7 +1710,7 @@ if err != nil {
 	return fmt.Errorf("symbolizer: %w", err)
 }
 a.symbolizer = sym
-a.kernelSymbolizer = chooseKernelSymbolizer(slog.Default())
+a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
 ```
 
 - [ ] **Step 4: Replace every stopgap `NoopKernelSymbolizer{}` with `a.kernelSymbolizer`**
@@ -1598,14 +1723,14 @@ grep -n "NoopKernelSymbolizer{}" perfagent/agent.go
 
 Replace each occurrence with `a.kernelSymbolizer`. This affects the five profiler-construction sites added in Tasks 3-5 (FP CPU, FP off-CPU, DWARF CPU, DWARF auto, DWARF off-CPU).
 
-- [ ] **Step 5: Invoke `AddKernelMmap` at writer init**
+- [ ] **Step 5: Invoke `AddKernelMmap` at writer init (gated on the flag)**
 
 In `Agent.Start`, find the existing `perfdata.Open(a.config.PerfDataOutput, perfdata.EventSpec{...}, perfdata.MetaInfo{...})` call (around `perfagent/agent.go:315`). Immediately after the `Open` returns success, before any profilers are spun up, call:
 
 ```go
-if a.perfDataWriter != nil {
+if a.perfDataWriter != nil && a.config.KernelStacks {
 	if err := a.perfDataWriter.AddKernelMmap(); err != nil {
-		log.Printf("perfdata: AddKernelMmap: %v (continuing; kernel symbol resolution may be limited)", err)
+		log.Printf("perfdata: AddKernelMmap: %v", err)
 	}
 }
 ```
@@ -1934,15 +2059,16 @@ git commit -m "test: housekeeping for kernel-stacks M1" || true
 
 After this plan completes:
 
-- BPF programs have a one-line gate flip per .bpf.c (kernel-stack capture enabled); bpf2go bytecode regenerated.
+- BPF programs have a new `kernel_stacks_enabled` volatile global (default `false`); userspace flips it at load time when `--kernel-stacks` is set. bpf2go bytecode regenerated.
 - `symbolize.KernelSymbolizer` is the new abstraction; `LocalKernelSymbolizer` (cgo) and `NoopKernelSymbolizer` (fallback) are the two impls.
 - All three profilers (`profile`, `offcpu`, `dwarfagent`) walk both stack chains, symbolize each, and merge with kernel frames at the leaf side.
 - pprof emission uses the existing `Frame.IsKernel` + `kernelSentinel` machinery — no new pprof builder code.
 - `--perf-data-output` emits a catch-all `PERF_RECORD_MMAP2` for `[kernel.kallsyms]_text` at writer init; per-sample callchains carry `PERF_CONTEXT_KERNEL` / `PERF_CONTEXT_USER` markers.
 - The agent fail-quiet's on `kptr_restrict=2` — startup is unaffected, kernel frames degrade to raw addresses.
+- Behavior is **opt-in**: users get kernel symbols by passing `--kernel-stacks` (CLI) or `perfagent.WithKernelStacks()` (library). Without the flag, perf-agent runs identically to v1.1.0 — no BPF per-sample cost, no kallsyms read, no kernel MMAP2.
 
 **Deferred to M2+** (separate plans):
 - Module debuginfod fetch (`.ko.debug` from distro debuginfod).
-- `--kernel-symbols={auto,require,disable}` CLI flag.
+- `--kernel-symbols={auto,require,disable}` enum flag.
 - Inline kernel function expansion.
 - Per-syscall classification labels.

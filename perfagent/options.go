@@ -103,6 +103,21 @@ type Config struct {
 	// debuginfod fetch failed (vs. fall back to local). Default: false.
 	// Note: M1 ships the option but FailClosed semantics are M2.
 	SymbolFailClosed bool
+
+	// KernelStacks enables kernel-mode stack capture and symbolization.
+	// Default: false. Opt in via --kernel-stacks (CLI) or
+	// WithKernelStacks() (library).
+	//
+	// When set:
+	//   - BPF programs enable the kernel-stack capture path (a volatile
+	//     bool global flipped at load time; no per-sample cost when off).
+	//   - The Agent constructs a LocalKernelSymbolizer; on
+	//     ErrKernelSymbolsUnavailable, falls back to NoopKernelSymbolizer
+	//     + a one-time warning.
+	//   - --perf-data-output emits a kernel MMAP2 record at writer init,
+	//     and SampleRecord callchains carry PERF_CONTEXT_{KERNEL,USER}
+	//     markers around the merged kernel+user IPs.
+	KernelStacks bool
 }
 
 // Option is a functional option for configuring the Agent.
@@ -288,4 +303,10 @@ func WithSymbolFetchTimeout(d time.Duration) Option {
 // WithSymbolFailClosed enables fail-closed behavior on debuginfod errors.
 func WithSymbolFailClosed() Option {
 	return func(c *Config) { c.SymbolFailClosed = true }
+}
+
+// WithKernelStacks enables kernel-mode stack capture + symbolization.
+// Default: off.
+func WithKernelStacks() Option {
+	return func(c *Config) { c.KernelStacks = true }
 }

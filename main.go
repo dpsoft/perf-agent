@@ -45,6 +45,8 @@ var (
 		"Per-artifact debuginfod fetch timeout. Default: 30s.")
 	flagSymbolFailClosed = flag.Bool("symbol-fail-closed", false,
 		"Refuse to symbolize a mapping whose debuginfod fetch failed (no fallback to local).")
+	flagKernelStacks = flag.Bool("kernel-stacks", false,
+		"Enable kernel-mode stack capture and symbolization (default: off).")
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -233,6 +235,9 @@ func buildOptions() []perfagent.Option {
 	}
 	if *flagSymbolFailClosed {
 		opts = append(opts, perfagent.WithSymbolFailClosed())
+	}
+	if *flagKernelStacks {
+		opts = append(opts, perfagent.WithKernelStacks())
 	}
 
 	// Unwinding strategy

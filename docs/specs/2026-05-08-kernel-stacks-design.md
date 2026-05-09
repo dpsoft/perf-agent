@@ -523,17 +523,18 @@ Single milestone. Sub-tasks (each landing in one commit, single PR):
 
 | # | Task | Files | Day-est |
 |---|---|---|---|
-| 0 | Bump blazesym pin past `29a609f` (module DWARF) + add `kernel_stacks_enabled` volatile global to all four BPF programs + wire the userspace `spec.Variables["kernel_stacks_enabled"].Set(cfg.KernelStacks)` call in every BPF loader (FP CPU, DWARF CPU, FP off-CPU, DWARF off-CPU) + flip `CollectKernel: 1` in all three `pid_config` setters | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, `offcpu/profiler.go`, `profile/offcpu_dwarf_export.go`, regenerated bpf2go output | 0.5 |
+| 0a | Bump blazesym pin past `29a609f` (module DWARF) + extend the Makefile's `blazesym-check` to require `blaze_symbolize_kernel_abs_addrs` | `Makefile`, local blazesym checkout | 0.1 |
+| 0b | `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter + `Config.KernelStacks bool` | `main.go`, `perfagent/options.go` | 0.2 |
+| 0c | Add `kernel_stacks_enabled` volatile global to all four BPF programs + wire the userspace `spec.Variables["kernel_stacks_enabled"].Set(cfg.KernelStacks)` call in every BPF loader (FP CPU, DWARF CPU, FP off-CPU, DWARF off-CPU) + flip `CollectKernel: 1` in all three `pid_config` setters | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, `offcpu/profiler.go`, `profile/offcpu_dwarf_export.go`, regenerated bpf2go output | 0.5 |
 | 1 | `KernelSymbolizer` interface + `NoopKernelSymbolizer` + `MergeKernelFirst` + `ToProfFramesKernel` | `symbolize/kernel.go`, test | 0.5 |
 | 2 | `LocalKernelSymbolizer` cgo wrap (uses `debug_syms=true` so module DWARF lights up automatically) | `symbolize/local_kernel.go`, test | 1.0 |
 | 3 | Stack-walk changes in `profile/`, `offcpu/`, `dwarfagent/` | three call sites | 1.0 |
 | 4 | `Writer.AddKernelMmap` (catch-all kernel address range) | `internal/perfdata/perfdata.go`, test | 0.5 |
 | 5 | `SampleRecord.KernelIPs` + `encodeSample` PERF_CONTEXT_{KERNEL,USER} markers | `internal/perfdata/records.go`, test, `profile/profiler.go` + `unwind/dwarfagent/agent.go` callers | 1.0 |
-| 6a | `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter + `Config.KernelStacks bool` + BPF `kernel_stacks_enabled` volatile global plumbing | `main.go`, `perfagent/options.go`, `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go` (LoadCollectionSpec setter), `offcpu/profiler.go`, regenerated bpf2go | 0.5 |
-| 6b | Agent owns + threads `KernelSymbolizer`; invokes `AddKernelMmap` at writer init (both gated on `cfg.KernelStacks`) | `perfagent/agent.go`, profiler constructor signatures | 0.5 |
+| 6 | Agent owns + threads `KernelSymbolizer`; invokes `AddKernelMmap` at writer init (both gated on `cfg.KernelStacks`) | `perfagent/agent.go`, profiler constructor signatures | 0.5 |
 | 7 | Integration tests: kernel-stack pprof + perf.data callchain | `test/integration_test.go` | 0.5 |
 
-Total: ~6.5 days. Single feature branch `feat/kernel-stacks-m1`, single PR.
+Total: ~6.3 days. Single feature branch `feat/kernel-stacks-m1`, single PR.
 
 ## Risks
 

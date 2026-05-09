@@ -29,6 +29,8 @@ symbolize/
 **Modified files:**
 
 ```
+main.go                          --kernel-stacks flag + wire into buildOptions()
+perfagent/options.go             Config.KernelStacks bool + WithKernelStacks() option setter
 profile/profiler.go              read KernStack, symbolize, merge; constructor gains kernelSym param; kernel_stacks_enabled setter
 profile/dwarf_export.go          kernel_stacks_enabled setter (LoadPerfDwarf); CollectKernel flip
 offcpu/profiler.go               read KernStack, symbolize, merge; same shape as profile/profiler.go; kernel_stacks_enabled setter
@@ -114,7 +116,95 @@ git add Makefile
 git commit -m "build: extend blazesym header guard to require kernel-module DWARF API"
 ```
 
-### Task 0b: Flip BPF kernel-stack capture gate
+### Task 0b: `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter
+
+**Files:**
+- Modify: `perfagent/options.go` (add `Config.KernelStacks bool` + `WithKernelStacks()`)
+- Modify: `main.go` (add `--kernel-stacks` flag + wire it into `buildOptions()`)
+
+This task lands BEFORE the BPF gate work (next task) so that
+`cfg.KernelStacks` exists by the time loaders reference it.
+
+- [ ] **Step 1: Add the Config field + Option setter**
+
+`perfagent/options.go`:
+
+```go
+// In Config struct:
+type Config struct {
+    // ... existing ...
+
+    // KernelStacks enables kernel-mode stack capture and symbolization.
+    // Default: false. Opt in via --kernel-stacks (CLI) or
+    // WithKernelStacks() (library).
+    //
+    // When set:
+    //   - BPF programs enable the kernel-stack capture path (a volatile
+    //     bool global flipped at load time; no per-sample cost when off).
+    //   - The Agent constructs a LocalKernelSymbolizer; on
+    //     ErrKernelSymbolsUnavailable, falls back to NoopKernelSymbolizer
+    //     + a one-time warning.
+    //   - --perf-data-output emits a kernel MMAP2 record at writer init,
+    //     and SampleRecord callchains carry PERF_CONTEXT_{KERNEL,USER}
+    //     markers around the merged kernel+user IPs.
+    KernelStacks bool
+}
+
+// WithKernelStacks enables kernel-mode stack capture + symbolization.
+// Default: off.
+func WithKernelStacks() Option {
+    return func(c *Config) { c.KernelStacks = true }
+}
+```
+
+- [ ] **Step 2: Add the CLI flag**
+
+`main.go`:
+
+```go
+// Alongside the other flag declarations:
+flagKernelStacks = flag.Bool("kernel-stacks", false,
+    "Enable kernel-mode stack capture and symbolization (default: off).")
+```
+
+In `buildOptions()`, append:
+
+```go
+if *flagKernelStacks {
+    opts = append(opts, perfagent.WithKernelStacks())
+}
+```
+
+- [ ] **Step 3: Run build + help check**
+
+```bash
+make build
+./perf-agent -h 2>&1 | grep "kernel-stacks"
+```
+
+Expected: clean build, `--kernel-stacks` shown in `--help`.
+
+- [ ] **Step 4: Run tests**
+
+```bash
+GOTOOLCHAIN=auto LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
+  CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" \
+  CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+  go test -count=1 ./perfagent/... ./symbolize/...
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add perfagent/options.go main.go
+git commit -m "perfagent: add --kernel-stacks CLI flag + WithKernelStacks() option"
+```
+
+---
+
+### Task 0c: Flip BPF kernel-stack capture gate
 
 **Files:**
 - Modify: `bpf/perf.bpf.c`
@@ -227,7 +317,7 @@ targeted-mode `pid_config`. Flip all three to `1`. The BPF gate
 (`kernel_stacks_enabled && collect_kernel`) means the config bit only
 takes effect when the flag is on.
 
-(This step's code lands here; Task 6a below adds the `Config.KernelStacks`
+(This step's code lands here; Task 0b above adds the `Config.KernelStacks`
 field and CLI flag that `cfg.KernelStacks` refers to.)
 
 Expected: `bpf2go` regenerates `*_bpfel.go` files (and their `.o` counterparts in `profile/`, `offcpu/`). Verify via `git status` that the regenerated files have small diffs (struct fields unchanged; only embedded bytecode bytes change).
@@ -1579,91 +1669,6 @@ Expected: PASS.
 ```bash
 git add internal/perfdata/records.go internal/perfdata/records_test.go profile/profiler.go offcpu/profiler.go
 git commit -m "perfdata: encode mixed kernel+user callchains with PERF_CONTEXT markers"
-```
-
----
-
-### Task 6c: `--kernel-stacks` CLI flag + `WithKernelStacks()` Option setter
-
-**Files:**
-- Modify: `perfagent/options.go` (add `Config.KernelStacks bool` + `WithKernelStacks()`)
-- Modify: `main.go` (add `--kernel-stacks` flag + wire it into `buildOptions()`)
-
-- [ ] **Step 1: Add the Config field + Option setter**
-
-`perfagent/options.go`:
-
-```go
-// In Config struct:
-type Config struct {
-    // ... existing ...
-
-    // KernelStacks enables kernel-mode stack capture and symbolization.
-    // Default: false. Opt in via --kernel-stacks (CLI) or
-    // WithKernelStacks() (library).
-    //
-    // When set:
-    //   - BPF programs enable the kernel-stack capture path (a volatile
-    //     bool global flipped at load time; no per-sample cost when off).
-    //   - The Agent constructs a LocalKernelSymbolizer; on
-    //     ErrKernelSymbolsUnavailable, falls back to NoopKernelSymbolizer
-    //     + a one-time warning.
-    //   - --perf-data-output emits a kernel MMAP2 record at writer init,
-    //     and SampleRecord callchains carry PERF_CONTEXT_{KERNEL,USER}
-    //     markers around the merged kernel+user IPs.
-    KernelStacks bool
-}
-
-// WithKernelStacks enables kernel-mode stack capture + symbolization.
-// Default: off.
-func WithKernelStacks() Option {
-    return func(c *Config) { c.KernelStacks = true }
-}
-```
-
-- [ ] **Step 2: Add the CLI flag**
-
-`main.go`:
-
-```go
-// Alongside the other flag declarations:
-flagKernelStacks = flag.Bool("kernel-stacks", false,
-    "Enable kernel-mode stack capture and symbolization (default: off).")
-```
-
-In `buildOptions()`, append:
-
-```go
-if *flagKernelStacks {
-    opts = append(opts, perfagent.WithKernelStacks())
-}
-```
-
-- [ ] **Step 3: Run build + help check**
-
-```bash
-make build
-./perf-agent -h 2>&1 | grep "kernel-stacks"
-```
-
-Expected: clean build, `--kernel-stacks` shown in `--help`.
-
-- [ ] **Step 4: Run tests**
-
-```bash
-GOTOOLCHAIN=auto LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
-  CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" \
-  CGO_LDFLAGS="-L /home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
-  go test -count=1 ./perfagent/... ./symbolize/...
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add perfagent/options.go main.go
-git commit -m "perfagent: add --kernel-stacks CLI flag + WithKernelStacks() option"
 ```
 
 ---

@@ -86,11 +86,17 @@ Operators currently work around this by capturing perf-agent's
   `bpf/offcpu_dwarf.bpf.c`) gains a `const volatile bool
   kernel_stacks_enabled = false;` global. Userspace flips it at load
   time (via `spec.Variables["kernel_stacks_enabled"].Set(true)`) when
-  `--kernel-stacks` is passed. `profile/profiler.go:66` and
-  `profile/dwarf_export.go:71` set `CollectKernel: 0` in `pid_config`;
-  they are flipped to `1` only when the flag is on. `bpf2go` regenerates
-  the embedded bytecode + accessor structs — same workflow as any other
-  BPF edit. No new BPF maps, no new BPF helpers, no semantic shift.
+  `--kernel-stacks` is passed. Three userspace `pid_config` setters
+  currently hardcode `CollectKernel: 0` and must flip to `1` (gated by
+  the BPF `kernel_stacks_enabled` global so the bit only takes effect
+  when the flag is on): `profile/profiler.go:66` (FP CPU),
+  `profile/dwarf_export.go:71` (DWARF CPU), and
+  `profile/offcpu_dwarf_export.go:62` (DWARF off-CPU). The off-CPU FP
+  profiler does not have its own `pid_config` setter — its targeted-mode
+  kernel-stack capture is gated entirely by the BPF program's
+  `kernel_stacks_enabled` global. `bpf2go` regenerates the embedded
+  bytecode + accessor structs — same workflow as any other BPF edit. No
+  new BPF maps, no new BPF helpers, no semantic shift.
 - **Opt-in via explicit CLI flag.** Kernel-stack capture and symbolization
   are OFF by default. Users opt in with `--kernel-stacks` (CLI) or
   `perfagent.WithKernelStacks()` (library). Matches the v1.1.0 posture
@@ -368,7 +374,9 @@ only; `:line` is empty.
 
 `perfagent.Agent`, when `--perf-data-output` is set:
 
-1. `perfdata.NewWriter(...)` opens the file (existing).
+1. `perfdata.Open(path, EventSpec, MetaInfo)` opens the file (existing —
+   see `internal/perfdata/perfdata.go:54`; the agent already constructs
+   the writer this way at `perfagent/agent.go:315`).
 2. **NEW:** immediately after, call `w.AddKernelMmap()` — emits one
    `PERF_RECORD_MMAP2` covering all kernel addresses:
    ```
@@ -515,7 +523,7 @@ Single milestone. Sub-tasks (each landing in one commit, single PR):
 
 | # | Task | Files | Day-est |
 |---|---|---|---|
-| 0 | Bump blazesym pin past `29a609f` (module DWARF) + add `kernel_stacks_enabled` volatile global + BPF gate logic + flip userspace `CollectKernel: 1` | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, regenerated bpf2go output | 0.5 |
+| 0 | Bump blazesym pin past `29a609f` (module DWARF) + add `kernel_stacks_enabled` volatile global + BPF gate logic + flip userspace `CollectKernel: 1` in all three `pid_config` setters | `bpf/{perf,offcpu,perf_dwarf,offcpu_dwarf}.bpf.c`, `profile/profiler.go`, `profile/dwarf_export.go`, `profile/offcpu_dwarf_export.go`, regenerated bpf2go output | 0.5 |
 | 1 | `KernelSymbolizer` interface + `NoopKernelSymbolizer` + `MergeKernelFirst` + `ToProfFramesKernel` | `symbolize/kernel.go`, test | 0.5 |
 | 2 | `LocalKernelSymbolizer` cgo wrap (uses `debug_syms=true` so module DWARF lights up automatically) | `symbolize/local_kernel.go`, test | 1.0 |
 | 3 | Stack-walk changes in `profile/`, `offcpu/`, `dwarfagent/` | three call sites | 1.0 |

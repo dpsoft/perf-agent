@@ -29,8 +29,10 @@ symbolize/
 **Modified files:**
 
 ```
-profile/profiler.go              read KernStack, symbolize, merge; constructor gains kernelSym param
-offcpu/profiler.go               same
+profile/profiler.go              read KernStack, symbolize, merge; constructor gains kernelSym param; kernel_stacks_enabled setter
+profile/dwarf_export.go          kernel_stacks_enabled setter (LoadPerfDwarf); CollectKernel flip
+offcpu/profiler.go               read KernStack, symbolize, merge; same shape as profile/profiler.go; kernel_stacks_enabled setter
+profile/offcpu_dwarf_export.go   kernel_stacks_enabled setter (LoadOffCPUDwarf); CollectKernel flip
 unwind/dwarfagent/symbolize.go   symbolizePID gains kernelSym param + kernelIPs
 unwind/dwarfagent/common.go      session struct + newSession signature gain kernelSym
 unwind/dwarfagent/agent.go       NewProfiler/NewProfilerWithMode/NewProfilerWithHooks signatures
@@ -195,9 +197,16 @@ config bit only takes effect when the flag is on.
 
 - [ ] **Step 4: Userspace setter for the volatile global**
 
-The existing v1.1.0 setter pattern lives in `profile/profiler.go` —
+The existing v1.1.0 setter pattern lives in each BPF loader path —
 `spec.Variables["system_wide"].Set(systemWide)`. Add a sibling setter in
-the same loader path (and in `offcpu/profiler.go` + dwarf variants):
+**all four** loaders:
+
+- `profile/profiler.go` (FP CPU)
+- `profile/dwarf_export.go` (DWARF CPU; `LoadPerfDwarf`)
+- `offcpu/profiler.go` (FP off-CPU)
+- `profile/offcpu_dwarf_export.go` (DWARF off-CPU; `LoadOffCPUDwarf`)
+
+In each, after the existing `system_wide` setter:
 
 ```go
 // Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
@@ -207,7 +216,16 @@ if err := spec.Variables["kernel_stacks_enabled"].Set(cfg.KernelStacks); err != 
 }
 ```
 
-Wire `cfg.KernelStacks` through the constructor signature.
+The constructor signatures must thread `cfg.KernelStacks` (or the equivalent
+single bool) through. Where loaders are called from `dwarfagent` constructors,
+add the bool parameter to those constructors too — same pattern as the
+v1.1.0 `symbolize.Symbolizer` plumbing in PR #19's commit `3b754842`.
+
+`profile/profiler.go:66`, `profile/dwarf_export.go:71`, and
+`profile/offcpu_dwarf_export.go:62` already set `CollectKernel: 0` in the
+targeted-mode `pid_config`. Flip all three to `1`. The BPF gate
+(`kernel_stacks_enabled && collect_kernel`) means the config bit only
+takes effect when the flag is on.
 
 (This step's code lands here; Task 6a below adds the `Config.KernelStacks`
 field and CLI flag that `cfg.KernelStacks` refers to.)

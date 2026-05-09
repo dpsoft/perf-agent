@@ -68,9 +68,27 @@ One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python
 
 `--pmu` summarizes IPC, cache miss rate, runqueue latency (P50/P99), and context-switch reasons (preempted vs voluntary vs I/O wait). Combine with `--per-pid` in system-wide mode to see which processes dominate the node's wait time.
 
-### 🐳 Sidecar profiling inside Kubernetes pods
+### 🐳 Kubernetes-aware profile labels
 
-`--pid <N>` is namespace-aware (with `shareProcessNamespace: true` on the pod), so the in-pod PID just works. Output samples carry k8s identity labels (`pod_uid`, `container_id`, `cgroup_path`) parsed from the cgroup, plus best-effort `pod_name` / `namespace` / `container_name` from the downward API. **No kubelet API calls, no client-go dependency.**
+perf-agent runs in two Kubernetes shapes:
+
+- **DaemonSet on the host PID namespace (recommended for fleet
+  profiling).** Sees every process on the node; identifies the target
+  pod via the **target's** cgroup. Each sample carries `pod_uid`,
+  `container_id`, and `cgroup_path` parsed directly from
+  `/proc/<targetPID>/cgroup` — no kubelet API calls, no client-go
+  dependency.
+- **Sidecar inside a single-tenant pod.** Requires
+  `shareProcessNamespace: true` on the pod, which lets every container
+  in the pod see every other container's processes — a security
+  regression in multi-tenant pods, fine in single-tenant pods where the
+  agent and target are co-deployed by the same operator. In this shape,
+  additional `pod_name` / `namespace` / `container_name` labels (read
+  from the agent's downward-API env vars) correctly identify the
+  target because they share a pod.
+
+`--pid <N>` accepts in-pod PIDs and translates them to host PIDs
+automatically (PID-namespace aware).
 
 ### 🔍 Stripped production binaries via off-box symbols
 

@@ -40,6 +40,14 @@
 // non-kernel task's off-CPU interval.
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// existing per-mode gate (system_wide hard-true OR pid_config.collect_kernel)
+// decides which samples capture kernel stacks. Task 3 wires the kernel
+// stack ID capture path; this declaration lets userspace flip the gate
+// at load time without another bpf2go regeneration.
+const volatile bool kernel_stacks_enabled = false;
+
 // offcpu_start keys the stashed sample by (pid, tgid). Value is the
 // sample_record captured on switch-OUT. To avoid blowing the 512-byte
 // BPF stack, we do NOT wrap it in a struct with a timestamp — instead

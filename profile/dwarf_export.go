@@ -18,7 +18,12 @@ type PerfDwarf struct {
 // Close(). The program isn't attached to any perf event yet — the caller
 // opens perf_event_open fds and attaches separately (see
 // unwind/dwarfagent for the full wiring).
-func LoadPerfDwarf(systemWide bool) (*PerfDwarf, error) {
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time; the CollectKernel bit on each pid_config entry is a
+// no-op. When true, kernel stacks are captured for matched samples.
+func LoadPerfDwarf(systemWide, kernelStacks bool) (*PerfDwarf, error) {
 	// Match perfagent/agent.go's Start() ordering: promote caps to the
 	// effective set, then raise RLIMIT_MEMLOCK via CAP_SYS_ADMIN, then
 	// load the BPF program. Without RemoveMemlock the BPF_MAP_CREATE
@@ -41,6 +46,9 @@ func LoadPerfDwarf(systemWide bool) (*PerfDwarf, error) {
 	}
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide: %w", err)
+	}
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 	p := &PerfDwarf{}
 	if err := spec.LoadAndAssign(&p.objs, nil); err != nil {
@@ -71,7 +79,7 @@ func (p *PerfDwarf) AddPID(pid uint32) error {
 	cfg := perf_dwarfPidConfig{
 		Type:          0,
 		CollectUser:   1,
-		CollectKernel: 0,
+		CollectKernel: 1, // gated by BPF kernel_stacks_enabled global
 	}
 	return p.objs.Pids.Update(pid, &cfg, ebpf.UpdateAny)
 }

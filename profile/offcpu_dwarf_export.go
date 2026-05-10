@@ -18,7 +18,12 @@ type OffCPUDwarf struct {
 // must Close(). The tp_btf/sched_switch program isn't attached yet —
 // see unwind/dwarfagent.OffCPUProfiler for the attach wiring via
 // link.AttachTracing.
-func LoadOffCPUDwarf(systemWide bool) (*OffCPUDwarf, error) {
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time; the CollectKernel bit on each pid_config entry is a
+// no-op. When true, kernel stacks are captured for matched samples.
+func LoadOffCPUDwarf(systemWide, kernelStacks bool) (*OffCPUDwarf, error) {
 	caps := cap.GetProc()
 	if err := caps.SetFlag(cap.Effective, true,
 		cap.SYS_ADMIN, cap.BPF, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE); err != nil {
@@ -34,6 +39,9 @@ func LoadOffCPUDwarf(systemWide bool) (*OffCPUDwarf, error) {
 	}
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide: %w", err)
+	}
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 	p := &OffCPUDwarf{}
 	if err := spec.LoadAndAssign(&p.objs, nil); err != nil {
@@ -59,7 +67,7 @@ func (p *OffCPUDwarf) AddPID(pid uint32) error {
 	cfg := offcpu_dwarfPidConfig{
 		Type:          0,
 		CollectUser:   1,
-		CollectKernel: 0,
+		CollectKernel: 1, // gated by BPF kernel_stacks_enabled global
 	}
 	return p.objs.Pids.Update(pid, &cfg, ebpf.UpdateAny)
 }

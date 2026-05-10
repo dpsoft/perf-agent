@@ -49,7 +49,7 @@ func TestOffCPUProfilerEndToEnd(t *testing.T) {
 		t.Fatalf("NewLocalSymbolizer: %v", err)
 	}
 	defer func() { _ = sym.Close() }()
-	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, false, nil, nil, nil, sym)
+	p, err := dwarfagent.NewOffCPUProfiler(workload.Process.Pid, false, nil, nil, nil, sym, false)
 	if err != nil {
 		t.Fatalf("NewOffCPUProfiler: %v", err)
 	}

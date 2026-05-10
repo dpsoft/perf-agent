@@ -1140,7 +1140,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	}()
 	time.Sleep(2 * time.Second) // let workload start
 
-	objs, err := perfprofile.LoadPerfDwarf(false)
+	objs, err := perfprofile.LoadPerfDwarf(false, false)
 	require.NoError(t, err)
 	defer objs.Close()
 
@@ -1396,7 +1396,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 	}()
 	time.Sleep(500 * time.Millisecond) // let workload print its PID banner
 
-	objs, err := perfprofile.LoadPerfDwarf(false)
+	objs, err := perfprofile.LoadPerfDwarf(false, false)
 	require.NoError(t, err)
 	defer objs.Close()
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))

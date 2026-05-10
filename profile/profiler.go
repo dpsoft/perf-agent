@@ -45,7 +45,12 @@ func (s *stackBuilder) append(f pprof.Frame) {
 // caller is responsible for putting the desired rate in eventSpec). Used
 // by the agent to keep the in-kernel event and the perf.data attr in sync
 // when the output writer is enabled — a divergence would mislead consumers.
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer) (*Profiler, error) {
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time; the CollectKernel bit on each pid_config entry is a
+// no-op. When true, kernel stacks are captured for matched samples.
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -54,6 +59,12 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	// Set system_wide variable in eBPF program
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide variable: %w", err)
+	}
+
+	// Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
+	// gate evaluates correctly on first sample.
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 
 	objs := &perfObjects{}
@@ -66,7 +77,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		config := perfPidConfig{
 			Type:          0,
 			CollectUser:   1,
-			CollectKernel: 0,
+			CollectKernel: 1, // gated by BPF kernel_stacks_enabled global
 		}
 
 		if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {

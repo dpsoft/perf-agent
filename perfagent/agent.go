@@ -363,6 +363,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -387,6 +388,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -408,6 +410,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -432,6 +435,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				labels,
 				a.symbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				a.cleanup()
@@ -450,6 +454,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				labels,
 				a.symbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				a.cleanup()

@@ -142,6 +142,7 @@ type perf_dwarfVariableSpecs struct {
 	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
 	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
@@ -201,6 +202,7 @@ type perf_dwarfVariables struct {
 	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
 	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 

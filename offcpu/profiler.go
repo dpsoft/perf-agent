@@ -35,8 +35,13 @@ func (s *stackBuilder) append(f pprof.Frame) {
 	s.stack = append(s.stack, f)
 }
 
-// NewProfiler creates a new off-CPU profiler
-func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer) (*Profiler, error) {
+// NewProfiler creates a new off-CPU profiler.
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time. The off-CPU FP profiler has no per-PID pid_config
+// setter, so the gate lives entirely in the BPF program.
+func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
@@ -45,6 +50,12 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 	// Set system_wide variable in eBPF program
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide variable: %w", err)
+	}
+
+	// Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
+	// gate evaluates correctly on first sample.
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 
 	objs := &offcpuObjects{}

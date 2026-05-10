@@ -34,6 +34,14 @@
 // System-wide mode toggle set by userspace at load time.
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// existing per-mode gate (system_wide hard-true OR pid_config.collect_kernel)
+// decides which samples capture kernel stacks. Task 3 wires the kernel
+// stack ID capture path; this declaration lets userspace flip the gate
+// at load time without another bpf2go regeneration.
+const volatile bool kernel_stacks_enabled = false;
+
 SEC("perf_event")
 int perf_dwarf(struct bpf_perf_event_data *ctx) {
     __u64 tgid_tid = bpf_get_current_pid_tgid();

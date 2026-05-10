@@ -55,7 +55,11 @@ type Profiler struct {
 // eventSpec selects the perf-event source. Pass nil to default to software
 // cpu-clock at sampleRate Hz; when non-nil, sampleRate is ignored. Used by
 // the agent to keep perf_event_open and perf.data attr in sync.
-func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer) (*Profiler, error) {
+//
+// kernelStacks is forwarded to profile.LoadPerfDwarf so the BPF program's
+// kernel_stacks_enabled global is set before LoadAndAssign. When false,
+// kernel-stack capture is fully bypassed at sample time.
+func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -63,7 +67,7 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 	if !systemWide {
 		mode = ModeEager
 	}
-	objs, err := profile.LoadPerfDwarf(systemWide)
+	objs, err := profile.LoadPerfDwarf(systemWide, kernelStacks)
 	if err != nil {
 		return nil, fmt.Errorf("load perf_dwarf: %w", err)
 	}
@@ -109,8 +113,8 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 
 // NewProfilerWithHooks is the ModeEager variant of NewProfilerWithMode.
 // Pass nil for labels when no per-sample static labels are needed.
-func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer) (*Profiler, error) {
-	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels, perfData, eventSpec, sym)
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
+	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels, perfData, eventSpec, sym, kernelStacks)
 }
 
 // NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
@@ -120,8 +124,8 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 //
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on a Profiler they received as (nil, err).
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer) (*Profiler, error) {
-	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels, perfData, eventSpec, sym)
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
+	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels, perfData, eventSpec, sym, kernelStacks)
 }
 
 // aggregateCPUSample is the CPU-specific ringbuf aggregator: each

@@ -24,11 +24,15 @@ type OffCPUProfiler struct {
 // NewOffCPUProfilerWithHooks is the variant of NewOffCPUProfiler that
 // accepts an optional observation surface. Pass nil hooks for the same
 // behavior as NewOffCPUProfiler.
-func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, labels map[string]string, sym symbolize.Symbolizer) (*OffCPUProfiler, error) {
+//
+// kernelStacks is forwarded to profile.LoadOffCPUDwarf so the BPF
+// program's kernel_stacks_enabled global is set before LoadAndAssign.
+// When false, kernel-stack capture is fully bypassed at sample time.
+func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
-	objs, err := profile.LoadOffCPUDwarf(systemWide)
+	objs, err := profile.LoadOffCPUDwarf(systemWide, kernelStacks)
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu_dwarf: %w", err)
 	}
@@ -66,8 +70,8 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on an OffCPUProfiler they received
 // as (nil, err).
-func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string, labels map[string]string, sym symbolize.Symbolizer) (*OffCPUProfiler, error) {
-	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil, labels, sym)
+func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
+	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil, labels, sym, kernelStacks)
 }
 
 // aggregateOffCPUSample is the off-CPU-specific ringbuf aggregator:

@@ -67,6 +67,14 @@ func (p *PerfDwarf) RingbufMap() *ebpf.Map {
 	return p.objs.StackEvents
 }
 
+// KernStackmap returns the BPF_MAP_TYPE_STACK_TRACE used for kernel
+// stack-ID lookup. Populated only when kernel_stacks_enabled is true at
+// BPF load; otherwise samples carry KernStack == -1 and userspace skips
+// the lookup. Mirror of FP profiler's Stackmap accessor.
+func (p *PerfDwarf) KernStackmap() *ebpf.Map {
+	return p.objs.KernStackmap
+}
+
 // SetSystemWide is a no-op; the setting is baked in at load time via the
 // systemWide argument to LoadPerfDwarf. Kept as a stable API placeholder.
 func (p *PerfDwarf) SetSystemWide(v bool) error {

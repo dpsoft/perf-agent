@@ -75,6 +75,7 @@ type offcpu_dwarfSampleRecord struct {
 		WalkerFlags uint8
 		Pad         uint8
 		Pad2        uint32
+		KernStack   int64
 	}
 	Pcs [127]uint64
 }
@@ -134,6 +135,7 @@ type offcpu_dwarfMapSpecs struct {
 	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
+	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
@@ -180,6 +182,7 @@ type offcpu_dwarfMaps struct {
 	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
+	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
@@ -196,6 +199,7 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
 		m.CfiRules,
+		m.KernStackmap,
 		m.OffcpuStart,
 		m.PidMappingLengths,
 		m.PidMappings,

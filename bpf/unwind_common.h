@@ -97,8 +97,12 @@ struct pid_mapping {
 // telling consumers how many slots are valid. A variable-length layout
 // would save bandwidth but fights the verifier; we pay the constant-size
 // cost and optimize later if needed.
-// sample_header is 32 bytes; explicit tail padding makes the `pcs` array
-// that follows it naturally 8-byte aligned on both archs.
+// sample_header is 40 bytes; explicit tail padding makes the `pcs` array
+// that follows it naturally 8-byte aligned on both archs. kern_stack carries
+// the BPF stack-ID produced by bpf_get_stackid on kern_stackmap (or -1 when
+// kernel-stack capture is disabled). Userspace reads it to look the kernel
+// IPs back out of kern_stackmap, symbolizes via the kernel symbolizer, and
+// merges leaf-first with user frames.
 struct sample_header {
     __u32 pid;
     __u32 tid;
@@ -109,6 +113,7 @@ struct sample_header {
     __u8  walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
     __u8  _pad;
     __u32 _pad2;
+    __s64 kern_stack;  // bpf_get_stackid(&kern_stackmap,…) result, or -1 if disabled
 };
 
 struct sample_record {
@@ -133,6 +138,29 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, RINGBUF_BYTES);
 } stack_events SEC(".maps");
+
+// ----- Kernel-stack capture (gated by kernel_stacks_enabled).
+//
+// Mirrors the FP-side stackmap in perf.bpf.c: BPF_MAP_TYPE_STACK_TRACE
+// indexed by stack ID, each slot holding up to PERF_MAX_STACK_DEPTH u64
+// kernel IPs. Populated per-sample via
+// bpf_get_stackid(&kern_stackmap, KERN_STACKID_FLAGS) when the gate is on;
+// userspace later does kern_stackmap.LookupBytes(stack_id) to retrieve the
+// raw IPs and symbolizes them through the kernel symbolizer. When the gate
+// is off, sample_header.kern_stack stays -1 and userspace skips the lookup.
+//
+// Named distinctly from the FP-side "stackmap" so both BPF programs can
+// coexist in the same address space without symbol collision.
+#define PERF_MAX_STACK_DEPTH 127
+#define PROFILE_MAPS_SIZE    16384
+#define KERN_STACKID_FLAGS   (0 | BPF_F_FAST_STACK_CMP)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, PERF_MAX_STACK_DEPTH * sizeof(__u64));
+    __uint(max_entries, PROFILE_MAPS_SIZE);
+} kern_stackmap SEC(".maps");
 
 // ----- Lazy CFI: miss-notify ringbuf (Option A2).
 //

@@ -58,8 +58,11 @@ type Profiler struct {
 //
 // kernelStacks is forwarded to profile.LoadPerfDwarf so the BPF program's
 // kernel_stacks_enabled global is set before LoadAndAssign. When false,
-// kernel-stack capture is fully bypassed at sample time.
-func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
+// kernel-stack capture is fully bypassed at sample time. kernelSym
+// symbolizes the per-sample kernel IPs; pass symbolize.NoopKernelSymbolizer{}
+// when kernelStacks is false (or callers don't have a kernel symbolizer
+// yet — Task 6 wires the real one through the Agent).
+func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -78,7 +81,7 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode, labels, perfData, sym)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent", hooks, mode, labels, perfData, sym, kernelSym)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -113,8 +116,8 @@ func NewProfilerWithMode(pid int, systemWide bool, cpus []uint, tags []string, s
 
 // NewProfilerWithHooks is the ModeEager variant of NewProfilerWithMode.
 // Pass nil for labels when no per-sample static labels are needed.
-func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
-	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels, perfData, eventSpec, sym, kernelStacks)
+func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, hooks *Hooks, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
+	return NewProfilerWithMode(pid, systemWide, cpus, tags, sampleRate, hooks, ModeEager, labels, perfData, eventSpec, sym, kernelSym, kernelStacks)
 }
 
 // NewProfiler loads the perf_dwarf BPF program, wires ehmaps via
@@ -124,18 +127,24 @@ func NewProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, 
 //
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on a Profiler they received as (nil, err).
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
-	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels, perfData, eventSpec, sym, kernelStacks)
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
+	return NewProfilerWithHooks(pid, systemWide, cpus, tags, sampleRate, nil, labels, perfData, eventSpec, sym, kernelSym, kernelStacks)
 }
 
 // aggregateCPUSample is the CPU-specific ringbuf aggregator: each
 // sample counts once; blocking-ns isn't meaningful here. Wrapped as a
 // free function so consumeRingbuf can pass it generically.
-func aggregateCPUSample(s *session, sample Sample) {
+//
+// kernelIPs is the resolved kernel stack from consumeRingbuf's kernel
+// stackmap lookup (empty when --kernel-stacks is off). We stash it under
+// the same sampleKey so collect() can symbolize it leaf-side with the
+// user frames.
+func aggregateCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	key := sampleKey{pid: sample.PID, hash: hashPCs(sample.PCs)}
 	s.mu.Lock()
 	s.samples[key]++
 	s.stashStack(key, sample.PCs)
+	s.stashKernelStack(key, kernelIPs)
 	s.mu.Unlock()
 	if s.perfData != nil && len(sample.PCs) > 0 {
 		s.perfData.AddSample(perfdata.SampleRecord{

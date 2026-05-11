@@ -61,6 +61,14 @@ func (p *OffCPUDwarf) RingbufMap() *ebpf.Map {
 	return p.objs.StackEvents
 }
 
+// KernStackmap returns the BPF_MAP_TYPE_STACK_TRACE used for kernel
+// stack-ID lookup. Populated only when kernel_stacks_enabled is true at
+// BPF load; otherwise samples carry KernStack == -1 and userspace skips
+// the lookup. Mirror of FP off-CPU profiler's Stackmap accessor.
+func (p *OffCPUDwarf) KernStackmap() *ebpf.Map {
+	return p.objs.KernStackmap
+}
+
 // AddPID registers a target PID for sampling. Semantics match
 // profile.PerfDwarf.AddPID — inserts into the `pids` filter.
 func (p *OffCPUDwarf) AddPID(pid uint32) error {

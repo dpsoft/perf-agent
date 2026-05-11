@@ -28,7 +28,9 @@ type OffCPUProfiler struct {
 // kernelStacks is forwarded to profile.LoadOffCPUDwarf so the BPF
 // program's kernel_stacks_enabled global is set before LoadAndAssign.
 // When false, kernel-stack capture is fully bypassed at sample time.
-func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
+// kernelSym symbolizes the per-sample kernel IPs; pass
+// symbolize.NoopKernelSymbolizer{} when kernelStacks is false.
+func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []string, hooks *Hooks, labels map[string]string, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
 	if !systemWide && pid <= 0 {
 		return nil, fmt.Errorf("dwarfagent: pid must be > 0 when systemWide=false")
 	}
@@ -43,7 +45,7 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 		}
 	}
 
-	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager, labels, nil, sym)
+	sess, err := newSession(objs, pid, systemWide, cpus, tags, "dwarfagent (offcpu)", hooks, ModeEager, labels, nil, sym, kernelSym)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
@@ -70,14 +72,16 @@ func NewOffCPUProfilerWithHooks(pid int, systemWide bool, cpus []uint, tags []st
 // On error, every resource created is closed before returning.
 // Callers should NOT call Close on an OffCPUProfiler they received
 // as (nil, err).
-func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
-	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil, labels, sym, kernelStacks)
+func NewOffCPUProfiler(pid int, systemWide bool, cpus []uint, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*OffCPUProfiler, error) {
+	return NewOffCPUProfilerWithHooks(pid, systemWide, cpus, tags, nil, labels, sym, kernelSym, kernelStacks)
 }
 
 // aggregateOffCPUSample is the off-CPU-specific ringbuf aggregator:
 // samples that never saw a switch-IN (Value == 0) are skipped; valid
-// samples add their blocking-ns into the accumulator.
-func aggregateOffCPUSample(s *session, sample Sample) {
+// samples add their blocking-ns into the accumulator. kernelIPs (when
+// --kernel-stacks is on) is stashed alongside the user PCs so collect()
+// can symbolize it leaf-side.
+func aggregateOffCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	if sample.Value == 0 {
 		return
 	}
@@ -85,6 +89,7 @@ func aggregateOffCPUSample(s *session, sample Sample) {
 	s.mu.Lock()
 	s.samples[key] += sample.Value
 	s.stashStack(key, sample.PCs)
+	s.stashKernelStack(key, kernelIPs)
 	s.mu.Unlock()
 }
 

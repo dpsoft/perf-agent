@@ -87,6 +87,15 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     // failure or natural terminator (saved_fp == 0, saved_fp <= fp).
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
 
+    // Kernel-stack capture. Default to -1 so userspace can cheaply detect
+    // "no kernel stack" without branching on the gate. bpf_get_stackid is
+    // the kernel-side counterpart of the FP-walk path's stackmap insert in
+    // perf.bpf.c — see internal/bpfstack.ExtractIPs for the userspace decode.
+    rec->hdr.kern_stack = -1;
+    if (kernel_stacks_enabled) {
+        rec->hdr.kern_stack = bpf_get_stackid(ctx, &kern_stackmap, KERN_STACKID_FLAGS);
+    }
+
     // Fill the header AFTER the walk so we know n_pcs.
     rec->hdr.pid          = tgid;
     rec->hdr.tid          = tid;

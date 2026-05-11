@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseSampleHeader(t *testing.T) {
-	const sampleSize = 32 + 127*8
+	const sampleSize = 40 + 127*8
 	buf := make([]byte, sampleSize)
 	binary.LittleEndian.PutUint32(buf[0:4], 0x1234)       // pid
 	binary.LittleEndian.PutUint32(buf[4:8], 0x5678)       // tid
@@ -15,9 +15,10 @@ func TestParseSampleHeader(t *testing.T) {
 	buf[24] = 1                                           // mode = MODE_FP_LESS
 	buf[25] = 3                                           // n_pcs = 3
 	buf[26] = 0x2                                         // walker_flags = DWARF_USED
-	binary.LittleEndian.PutUint64(buf[32:40], 0xaaaa)
-	binary.LittleEndian.PutUint64(buf[40:48], 0xbbbb)
-	binary.LittleEndian.PutUint64(buf[48:56], 0xcccc)
+	binary.LittleEndian.PutUint64(buf[32:40], 7)          // kern_stack = 7
+	binary.LittleEndian.PutUint64(buf[40:48], 0xaaaa)
+	binary.LittleEndian.PutUint64(buf[48:56], 0xbbbb)
+	binary.LittleEndian.PutUint64(buf[56:64], 0xcccc)
 
 	s, err := parseSample(buf)
 	if err != nil {
@@ -32,6 +33,9 @@ func TestParseSampleHeader(t *testing.T) {
 	if s.Mode != 1 {
 		t.Errorf("Mode = %d, want 1", s.Mode)
 	}
+	if s.KernStack != 7 {
+		t.Errorf("KernStack = %d, want 7", s.KernStack)
+	}
 	if len(s.PCs) != 3 {
 		t.Fatalf("len(PCs) = %d, want 3", len(s.PCs))
 	}
@@ -43,15 +47,32 @@ func TestParseSampleHeader(t *testing.T) {
 	}
 }
 
+// TestParseSampleHeaderKernStackDisabled covers the gate-off case where
+// BPF wrote -1 into kern_stack — userspace must read it back as -1 so
+// the consumeRingbuf loop knows to skip the kern_stackmap lookup.
+func TestParseSampleHeaderKernStackDisabled(t *testing.T) {
+	const sampleSize = 40 + 127*8
+	buf := make([]byte, sampleSize)
+	// -1 in two's complement int64
+	binary.LittleEndian.PutUint64(buf[32:40], ^uint64(0))
+	s, err := parseSample(buf)
+	if err != nil {
+		t.Fatalf("parseSample: %v", err)
+	}
+	if s.KernStack != -1 {
+		t.Errorf("KernStack = %d, want -1", s.KernStack)
+	}
+}
+
 func TestParseSampleTruncatedHeader(t *testing.T) {
-	buf := make([]byte, 16) // smaller than 32-byte header
+	buf := make([]byte, 16) // smaller than 40-byte header
 	if _, err := parseSample(buf); err == nil {
 		t.Fatal("expected error on truncated header")
 	}
 }
 
 func TestParseSampleNPCsClamped(t *testing.T) {
-	const sampleSize = 32 + 127*8
+	const sampleSize = 40 + 127*8
 	buf := make([]byte, sampleSize)
 	binary.LittleEndian.PutUint32(buf[0:4], 42)
 	buf[25] = 200 // n_pcs > 127, should clamp

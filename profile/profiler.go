@@ -19,14 +19,15 @@ import (
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
-	objs       *perfObjects
-	symbolizer symbolize.Symbolizer
-	resolver   *procmap.Resolver
-	perfSet    *perfevent.Set
-	tags       []string
-	sampleRate int
-	labels     map[string]string
-	perfData   *perfdata.Writer // optional, nil when --perf-data-output not set
+	objs             *perfObjects
+	symbolizer       symbolize.Symbolizer
+	kernelSymbolizer symbolize.KernelSymbolizer
+	resolver         *procmap.Resolver
+	perfSet          *perfevent.Set
+	tags             []string
+	sampleRate       int
+	labels           map[string]string
+	perfData         *perfdata.Writer // optional, nil when --perf-data-output not set
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -50,7 +51,7 @@ func (s *stackBuilder) append(f pprof.Frame) {
 // cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
 // at sample time; the CollectKernel bit on each pid_config entry is a
 // no-op. When true, kernel stacks are captured for matched samples.
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -102,14 +103,15 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	}
 
 	return &Profiler{
-		objs:       objs,
-		symbolizer: sym,
-		resolver:   procmap.NewResolver(),
-		perfSet:    perfSet,
-		tags:       tags,
-		sampleRate: sampleRate,
-		labels:     labels,
-		perfData:   perfData,
+		objs:             objs,
+		symbolizer:       sym,
+		kernelSymbolizer: kernelSym,
+		resolver:         procmap.NewResolver(),
+		perfSet:          perfSet,
+		tags:             tags,
+		sampleRate:       sampleRate,
+		labels:           labels,
+		perfData:         perfData,
 	}, nil
 }
 
@@ -164,6 +166,14 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// Use PID from sample key for symbolization
 		samplePid := key.Pid
 
+		// Kernel stack lookup — only when BPF gated a valid stack ID.
+		var kernelIPs []uint64
+		if key.KernStack >= 0 {
+			if kernBytes, err := pr.objs.Stackmap.LookupBytes(uint32(key.KernStack)); err == nil {
+				kernelIPs = bpfstack.ExtractIPs(kernBytes)
+			}
+		}
+
 		stack, err := pr.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
@@ -183,14 +193,28 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// dominates for short stacks; one batched call is dramatically
 		// cheaper than one call per IP.
 		ips := bpfstack.ExtractIPs(stack)
-		if len(ips) > 0 {
-			frames, err := pr.symbolizer.SymbolizeProcess(samplePid, ips)
-			if err != nil {
-				log.Printf("Failed to symbolize: %v", err)
-			} else {
-				for _, f := range symbolize.ToProfFrames(frames) {
-					sb.append(f)
+		if len(ips) > 0 || len(kernelIPs) > 0 {
+			var userFrames, kernelFrames []symbolize.Frame
+			if len(ips) > 0 {
+				userFrames, err = pr.symbolizer.SymbolizeProcess(samplePid, ips)
+				if err != nil {
+					log.Printf("Failed to symbolize user: %v", err)
 				}
+			}
+			if len(kernelIPs) > 0 {
+				kernelFrames, err = pr.kernelSymbolizer.SymbolizeKernel(kernelIPs)
+				if err != nil {
+					log.Printf("Failed to symbolize kernel: %v", err)
+				}
+			}
+			// Kernel frames are leaf-side: they go first so that after
+			// Reverse() the call chain reads root→kernel→user (outermost
+			// first), which matches pprof convention.
+			for _, f := range symbolize.ToProfFramesKernel(kernelFrames) {
+				sb.append(f)
+			}
+			for _, f := range symbolize.ToProfFrames(userFrames) {
+				sb.append(f)
 			}
 		}
 

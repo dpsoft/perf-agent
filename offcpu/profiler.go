@@ -18,12 +18,13 @@ import (
 
 // Profiler handles off-CPU profiling with stack traces
 type Profiler struct {
-	objs       *offcpuObjects
-	symbolizer symbolize.Symbolizer
-	resolver   *procmap.Resolver
-	link       link.Link
-	tags       []string
-	labels     map[string]string
+	objs             *offcpuObjects
+	symbolizer       symbolize.Symbolizer
+	kernelSymbolizer symbolize.KernelSymbolizer
+	resolver         *procmap.Resolver
+	link             link.Link
+	tags             []string
+	labels           map[string]string
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -41,7 +42,7 @@ func (s *stackBuilder) append(f pprof.Frame) {
 // cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
 // at sample time. The off-CPU FP profiler has no per-PID pid_config
 // setter, so the gate lives entirely in the BPF program.
-func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelStacks bool) (*Profiler, error) {
+func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
@@ -82,12 +83,13 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 	}
 
 	return &Profiler{
-		objs:       objs,
-		symbolizer: sym,
-		resolver:   procmap.NewResolver(),
-		link:       tp,
-		tags:       tags,
-		labels:     labels,
+		objs:             objs,
+		symbolizer:       sym,
+		kernelSymbolizer: kernelSym,
+		resolver:         procmap.NewResolver(),
+		link:             tp,
+		tags:             tags,
+		labels:           labels,
 	}, nil
 }
 
@@ -142,6 +144,14 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// Use PID from a sample key for symbolization
 		samplePid := key.Pid
 
+		// Kernel stack lookup — only when BPF gated a valid stack ID.
+		var kernelIPs []uint64
+		if key.KernStack >= 0 {
+			if kernBytes, err := pr.objs.Stackmap.LookupBytes(uint32(key.KernStack)); err == nil {
+				kernelIPs = bpfstack.ExtractIPs(kernBytes)
+			}
+		}
+
 		stack, err := pr.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
@@ -160,14 +170,28 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// overhead dominates for short stacks; one batched call is
 		// dramatically cheaper than one per IP.
 		ips := bpfstack.ExtractIPs(stack)
-		if len(ips) > 0 {
-			frames, err := pr.symbolizer.SymbolizeProcess(samplePid, ips)
-			if err != nil {
-				log.Printf("Failed to symbolize: %v", err)
-			} else {
-				for _, f := range symbolize.ToProfFrames(frames) {
-					sb.append(f)
+		if len(ips) > 0 || len(kernelIPs) > 0 {
+			var userFrames, kernelFrames []symbolize.Frame
+			if len(ips) > 0 {
+				userFrames, err = pr.symbolizer.SymbolizeProcess(samplePid, ips)
+				if err != nil {
+					log.Printf("Failed to symbolize user: %v", err)
 				}
+			}
+			if len(kernelIPs) > 0 {
+				kernelFrames, err = pr.kernelSymbolizer.SymbolizeKernel(kernelIPs)
+				if err != nil {
+					log.Printf("Failed to symbolize kernel: %v", err)
+				}
+			}
+			// Kernel frames are leaf-side: they go first so that after
+			// Reverse() the call chain reads root→kernel→user (outermost
+			// first), which matches pprof convention.
+			for _, f := range symbolize.ToProfFramesKernel(kernelFrames) {
+				sb.append(f)
+			}
+			for _, f := range symbolize.ToProfFrames(userFrames) {
+				sb.append(f)
 			}
 		}
 

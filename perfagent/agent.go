@@ -410,6 +410,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
+				symbolize.NoopKernelSymbolizer{},
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -454,6 +455,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				labels,
 				a.symbolizer,
+				symbolize.NoopKernelSymbolizer{},
 				a.config.KernelStacks,
 			)
 			if err != nil {

@@ -86,6 +86,10 @@ type Agent struct {
 	// Start() time based on whether DebuginfodURLs is non-empty.
 	symbolizer symbolize.Symbolizer
 
+	// kernelSymbolizer resolves kernel-space addresses. Initialized in
+	// Start() when cfg.KernelStacks is true; otherwise NoopKernelSymbolizer.
+	kernelSymbolizer symbolize.KernelSymbolizer
+
 	mu      sync.Mutex
 	started bool
 }
@@ -253,6 +257,27 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 	})
 }
 
+// chooseKernelSymbolizer returns LocalKernelSymbolizer when cfg.KernelStacks
+// is true and /proc/kallsyms is readable; otherwise NoopKernelSymbolizer (and
+// a one-time warning if the user opted in but kallsyms is locked down). When
+// cfg.KernelStacks is false, returns NoopKernelSymbolizer silently — the user
+// did not opt in.
+func chooseKernelSymbolizer(cfg *Config, logger *slog.Logger) symbolize.KernelSymbolizer {
+	if !cfg.KernelStacks {
+		return symbolize.NoopKernelSymbolizer{}
+	}
+	s, err := symbolize.NewLocalKernelSymbolizer()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("kernel symbols unavailable; kernel frames will be raw addresses",
+				"error", err,
+				"hint", "sysctl kernel.kptr_restrict=0 (and ensure perf_event_paranoid <= 2)")
+		}
+		return symbolize.NoopKernelSymbolizer{}
+	}
+	return s
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -328,6 +353,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.perfDataWriter = w
 	}
 
+	if a.perfDataWriter != nil && a.config.KernelStacks {
+		if err := a.perfDataWriter.AddKernelMmap(); err != nil {
+			log.Printf("perfdata: AddKernelMmap: %v (continuing; kernel symbol resolution may be limited)", err)
+		}
+	}
+
 	// Inject Python perf-trampoline before BPF attach so early samples have
 	// JIT symbol names. Runs only when --inject-python is set.
 	if a.pyInjector != nil {
@@ -345,6 +376,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("symbolizer: %w", err)
 	}
 	a.symbolizer = sym
+	a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
 
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
@@ -363,7 +395,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
-				symbolize.NoopKernelSymbolizer{},
+				a.kernelSymbolizer,
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -389,7 +421,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
-				symbolize.NoopKernelSymbolizer{},
+				a.kernelSymbolizer,
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -412,7 +444,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.perfDataWriter,
 				profilerEventSpec,
 				a.symbolizer,
-				symbolize.NoopKernelSymbolizer{},
+				a.kernelSymbolizer,
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -438,7 +470,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				labels,
 				a.symbolizer,
-				symbolize.NoopKernelSymbolizer{},
+				a.kernelSymbolizer,
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -458,7 +490,7 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				labels,
 				a.symbolizer,
-				symbolize.NoopKernelSymbolizer{},
+				a.kernelSymbolizer,
 				a.config.KernelStacks,
 			)
 			if err != nil {
@@ -613,6 +645,10 @@ func (a *Agent) cleanup() {
 	if a.symbolizer != nil {
 		_ = a.symbolizer.Close()
 		a.symbolizer = nil
+	}
+	if a.kernelSymbolizer != nil {
+		_ = a.kernelSymbolizer.Close()
+		a.kernelSymbolizer = nil
 	}
 }
 

@@ -11,9 +11,12 @@ import (
 
 // kcoreReadable reports whether the current process can open /proc/kcore.
 // blazesym's kernel source tries /proc/kcore as a vmlinux candidate; it
-// is mode 0400 root:root, so a non-root unit-test process gets EACCES and
-// the whole symbolize call fails. Production paths run with the elevated
-// caps perf-agent already requires (CAP_SYS_RAWIO comes via root).
+// is mode 0400 root:root AND the read path has an internal capable(CAP_SYS_RAWIO)
+// check. A normally-setcap'd test binary lacks both CAP_DAC_READ_SEARCH
+// (to bypass the 0400 mode) and CAP_SYS_RAWIO (to read kcore contents),
+// so this gate skips in that case. To run the test without sudo, add
+// `cap_sys_rawio,cap_dac_read_search+ep` to the test binary's setcap
+// line on top of the existing perf-agent caps.
 func kcoreReadable() bool {
 	f, err := os.Open("/proc/kcore")
 	if err != nil {
@@ -96,7 +99,7 @@ func TestLocalKernelSymbolizerRoundTrip(t *testing.T) {
 		t.Skip("requires kptr_restrict=0 (or root + CAP_SYSLOG)")
 	}
 	if !kcoreReadable() {
-		t.Skip("blazesym kernel source needs /proc/kcore readable; requires root")
+		t.Skip("blazesym kernel source needs /proc/kcore readable (CAP_SYS_RAWIO + CAP_DAC_READ_SEARCH via setcap, or root)")
 	}
 	s, err := NewLocalKernelSymbolizer()
 	if err != nil {

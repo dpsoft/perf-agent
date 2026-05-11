@@ -38,7 +38,7 @@ func TestWriter_RoundTrip(t *testing.T) {
 	w.AddSample(SampleRecord{
 		IP: 0x400500, Pid: 1234, Tid: 1234,
 		Time: 1000, Cpu: 0, Period: 1,
-		Callchain: []uint64{0x400500},
+		UserIPs: []uint64{0x400500},
 	})
 	w.AddBuildID(BuildIDEntry{
 		Pid:      -1,
@@ -98,7 +98,7 @@ func TestWriter_LatchedErrorMakesAddsNoOp(t *testing.T) {
 
 	posBefore := w.pos
 	w.err = errSentinel{}
-	w.AddSample(SampleRecord{IP: 0x1, Pid: 1, Tid: 1, Period: 1, Callchain: []uint64{0x1}})
+	w.AddSample(SampleRecord{IP: 0x1, Pid: 1, Tid: 1, Period: 1, UserIPs: []uint64{0x1}})
 	if w.pos != posBefore {
 		t.Errorf("pos advanced after latched error: %d → %d", posBefore, w.pos)
 	}

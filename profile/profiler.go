@@ -230,7 +230,8 @@ func (pr *Profiler) Collect(w io.Writer) error {
 				Pid:       samplePid,
 				Tid:       samplePid,
 				Period:    value,
-				Callchain: ips,
+				UserIPs:   ips,
+				KernelIPs: kernelIPs,
 			})
 		}
 	}

@@ -153,7 +153,8 @@ func aggregateCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 			Tid:       sample.TID,
 			Time:      sample.TimeNs,
 			Period:    1,
-			Callchain: sample.PCs,
+			UserIPs:   sample.PCs,
+			KernelIPs: kernelIPs,
 		})
 	}
 }

@@ -102,38 +102,76 @@ func TestEncodeMmap2_WithBuildID(t *testing.T) {
 func TestEncodeSample(t *testing.T) {
 	var buf bytes.Buffer
 	encodeSample(&buf, SampleRecord{
-		IP:        0x401000,
-		Pid:       1234,
-		Tid:       1234,
-		Time:      1000000000, // 1 second in ns
-		Cpu:       3,
-		Period:    1,
-		Callchain: []uint64{0x401000, 0x402000, 0x403000},
+		IP:      0x401000,
+		Pid:     1234,
+		Tid:     1234,
+		Time:    1000000000, // 1 second in ns
+		Cpu:     3,
+		Period:  1,
+		UserIPs: []uint64{0x401000, 0x402000, 0x403000},
 	})
 
 	got := buf.Bytes()
 	// sample_type = IP | TID | TIME | CPU | PERIOD | CALLCHAIN
 	// Layout:
 	//   header(8) + ip(8) + pid+tid(8) + time(8) + cpu+res(8) + period(8) +
-	//   nr(8) + ips(3*8) = 80
-	if len(got) != 80 {
-		t.Fatalf("SAMPLE size = %d, want 80; bytes: % x", len(got), got)
+	//   nr(8) + ips(4*8) = 88
+	//   (4 = PERF_CONTEXT_USER marker + 3 user IPs)
+	if len(got) != 88 {
+		t.Fatalf("SAMPLE size = %d, want 88; bytes: % x", len(got), got)
 	}
 	// header.type at offset 0 = PERF_RECORD_SAMPLE = 9
 	if got[0] != 9 {
 		t.Errorf("type = %d, want 9", got[0])
 	}
-	// header.size at offset 6 (u16 LE) = 80
-	if got[6] != 80 || got[7] != 0 {
-		t.Errorf("size = % x, want 50 00", got[6:8])
+	// header.size at offset 6 (u16 LE) = 88
+	if got[6] != 88 || got[7] != 0 {
+		t.Errorf("size = % x, want 58 00", got[6:8])
 	}
 	// ip at offset 8 (u64 LE) = 0x401000
 	wantIP := []byte{0x00, 0x10, 0x40, 0, 0, 0, 0, 0}
 	if !bytes.Equal(got[8:16], wantIP) {
 		t.Errorf("ip bytes = % x, want % x", got[8:16], wantIP)
 	}
-	// nr at offset 48 (u64 LE) = 3
-	if got[48] != 3 || got[49] != 0 {
-		t.Errorf("nr = % x, want 03 00", got[48:50])
+	// nr at offset 48 (u64 LE) = 4 (PERF_CONTEXT_USER + 3 IPs)
+	if got[48] != 4 || got[49] != 0 {
+		t.Errorf("nr = % x, want 04 00", got[48:50])
+	}
+}
+
+func TestEncodeSample_KernelAndUserChains(t *testing.T) {
+	var buf bytes.Buffer
+	encodeSample(&buf, SampleRecord{
+		IP:        0xffffffff80100000,
+		Pid:       42,
+		Tid:       42,
+		Period:    1,
+		KernelIPs: []uint64{0xffffffff80100000, 0xffffffff80200000},
+		UserIPs:   []uint64{0x401000, 0x402000},
+	})
+	body := buf.Bytes()
+
+	kernelMarker := []byte{0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff} // -128 LE
+	userMarker := []byte{0x00, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}   // -512 LE
+	if !bytes.Contains(body, kernelMarker) {
+		t.Fatalf("missing PERF_CONTEXT_KERNEL marker; body: % x", body)
+	}
+	if !bytes.Contains(body, userMarker) {
+		t.Fatalf("missing PERF_CONTEXT_USER marker; body: % x", body)
+	}
+	if bytes.Index(body, kernelMarker) >= bytes.Index(body, userMarker) {
+		t.Fatalf("kernel marker must precede user marker")
+	}
+}
+
+func TestEncodeSample_UserOnly_NoKernelMarker(t *testing.T) {
+	var buf bytes.Buffer
+	encodeSample(&buf, SampleRecord{
+		Pid: 42, Tid: 42, Period: 1,
+		UserIPs: []uint64{0x401000},
+	})
+	kernelMarker := []byte{0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	if bytes.Contains(buf.Bytes(), kernelMarker) {
+		t.Fatalf("user-only sample should not emit PERF_CONTEXT_KERNEL")
 	}
 }

@@ -49,18 +49,22 @@ We adopt this pattern (Option B from brainstorming) as the primary fix.
 ```
 DebuginfodSymbolizer.Symbolize(pid, ips) → frames
 │
-├─ procmapClassifier.classify(pid)            ← read /proc/<pid>/maps once per PID
-│   └─ for each mapping: inspect binary →
+├─ procmapClassifier.classify(pid)            ← re-snapshot /proc/<pid>/maps every call
+│   │                                           (live mmap/dlopen/exec change mappings;
+│   │                                            fresh snapshot is the correct invariant)
+│   └─ for each mapping: inspect binary using map_files-derived path first,
+│      fall back to symbolic path —
 │       ├─ has local DWARF or resolvable .gnu_debuglink → ROUTE: process-mode
 │       └─ build-id only, no local DWARF                → ROUTE: file-mode
-│           └─ ensure cached .debug (fetch if miss)
+│           └─ ensure cached .debug (fetch if miss); on fetch fail → process-mode
 │
 ├─ split ips by mapping route
 │
 ├─ Batch 1 — process-mode addresses:
 │       blaze_symbolize_process_abs_addrs(csym, pid, ips_batch1)
-│       (blazesym walks /proc/<pid>/maps + opens binaries.
-│        Dispatcher provides Cases 1/2/4 only — Case 3 is removed.)
+│       (blazesym walks /proc/<pid>/maps + opens binaries. Dispatcher
+│        provides Cases 1/2/4; Case 3 becomes a no-fetch fail-open
+│        returning "" — see Dispatcher section.)
 │
 ├─ Batch 2 — file-mode addresses (one call per cached .debug):
 │       for each mapping in batch2:
@@ -75,41 +79,73 @@ DebuginfodSymbolizer.Symbolize(pid, ips) → frames
 
 ### Classification
 
-`procmapClassifier` runs **per-`Symbolize` call**, against a fresh `/proc/<pid>/maps` snapshot. It walks each executable mapping (`r-xp` or `r--p` with executable bit) and inspects the backing ELF:
+`procmapClassifier` runs **per-`Symbolize` call**, against a fresh `/proc/<pid>/maps` snapshot. It walks each executable mapping (`r-xp` or `r--p` with executable bit) and inspects the backing ELF.
+
+**Path resolution (sidecar / mount-namespace safe)** — every ELF read goes through a two-step path resolution that mirrors the existing `symbolize/debuginfod/buildid.go::readBuildID` policy:
+
+```
+resolveELFPath(pid, mapping) → path:
+  mapFilesPath := /proc/<pid>/map_files/<start>-<limit>
+  if open(mapFilesPath) succeeds:        return mapFilesPath
+  if open(mapping.SymbolicPath) succeeds: return mapping.SymbolicPath
+  return ""   // unreachable from agent namespace
+```
+
+`/proc/<pid>/map_files/<va>-<va>` is a kernel-resolved symlink that points at the open file descriptor — it works even when the target's filesystem isn't reachable from the agent's mount namespace (sidecar case). The symbolic path is the fallback for older kernels or PIDs where map_files is restricted.
+
+To make this available without threading `pid` everywhere, **`procmap.Mapping` gains a `MapFiles string` field** populated at parse time. Callers that need the dual-lookup ask for `mapping.OpenablePath()` (helper that returns the first openable of MapFiles / Path).
+
+**Classification logic**:
 
 ```
 classify(mapping) → route:
-  if mapping.path is empty or [vdso] or [stack] or [vsyscall]:
-                                                          skip (no symbolization possible)
-  if hasDwarf(mapping.path):                              process-mode
-  if hasResolvableDebuglink(mapping.path, []):            process-mode
-                                                          (covers distro libs: blazesym walks
-                                                           /usr/lib/debug/.build-id/NN/REST.debug
-                                                           via its built-in BuildId DebugFileIter
-                                                           state, which is reached because a
-                                                           debug-link exists. Local distro debuginfo
-                                                           resolves with no fetch.)
-  buildID := readBuildID(mapping.path)
-  if buildID == "":                                       process-mode
-                                                          (no off-box option; .symtab may
-                                                           still resolve via blazesym defaults)
-  if exists(/usr/lib/debug/.build-id/NN/REST.debug):      file-mode (local path; no fetch)
-  if cache.Has(buildID, KindDebuginfo):                   file-mode (cached path)
-  if negFetch.Has(buildID) && !negFetch.Expired(buildID): process-mode
-                                                          (recent fetch failure;
-                                                           let blazesym try with what's local)
-                                                          file-mode (path = fetch result)
+  if mapping.Path is empty or [vdso] or [stack] or [vsyscall] or [heap]:
+      return skip
+  path := mapping.OpenablePath()    // map_files → symbolic → ""
+  if path == "":
+      return skip  (unreachable from agent — can't even read PHDRs)
+
+  if hasDwarf(path):                            return process-mode
+  if hasResolvableDebuglink(path, []):          return process-mode
+      // covers distro libs: blazesym walks /usr/lib/debug/.build-id/NN/REST.debug
+      // via its built-in BuildId DebugFileIter state, reached because a debug-link
+      // exists. Local distro debuginfo resolves with no fetch.
+
+  buildID := readBuildID(mapping.MapFiles, mapping.Path)
+  if buildID == "":
+      return process-mode
+      // no off-box option; .symtab may still resolve via blazesym defaults
+
+  // 1. Distro debuginfo at standard path, even without debug-link in the binary
+  systemPath := "/usr/lib/debug/.build-id/" + buildID[0:2] + "/" + buildID[2:] + ".debug"
+  if exists(systemPath):
+      return file-mode(path = systemPath)
+
+  // 2. Our cache already has it
+  if cache.Has(buildID, KindDebuginfo):
+      return file-mode(path = cache.AbsPath(buildID, KindDebuginfo))
+
+  // 3. Recent fetch failure — don't retry every batch
+  if negFetch.IsActive(buildID):
+      return process-mode
+
+  // 4. Fetch via debuginfod
+  abs, err := singleflightFetcher.fetchAndStore(ctx, "debuginfo", buildID)
+  if err != nil:
+      negFetch.Set(buildID, 5*Minute)
+      return process-mode
+  return file-mode(path = abs)
 ```
 
 The local `/usr/lib/debug/.build-id/NN/REST.debug` check addresses **G2**: distro-installed split-debug (e.g., `glibc-debugsource`) that happens to lack `.gnu_debuglink` is reused without remote fetch. The path is the elfutils-standard hardcoded location.
 
-Helpers reuse existing `symbolize/debuginfod/resolution.go::hasDwarf` and `hasResolvableDebuglink`. The check order matches blazesym's resolution preference.
+Helpers reuse existing `symbolize/debuginfod/resolution.go::hasDwarf`, `hasResolvableDebuglink`, and `symbolize/debuginfod/buildid.go::readBuildID`. The check order matches blazesym's resolution preference.
 
 **No persistent PID classification cache.** Mappings change across `Symbolize` calls (mmap, dlopen, exec, mprotect — `dwarfagent` already invalidates its session resolver on these events at `unwind/dwarfagent/common.go:249`, but that doesn't reach into the symbolizer). Re-classifying each batch from a fresh `/proc/<pid>/maps` is the simplest correct invariant: classification is cheap (one ELF open per new mapping; PHDRs only, a few KB read), and stale routes are impossible by construction.
 
 Two **content-addressed** caches survive across calls and are immutable for the lifetime of the file at that path:
 
-- `mappers map[mapperKey]*AddressMapper` — keyed by `mapperKey{path: string, ino: uint64}`. `AddressMapper` depends only on ELF program headers, which don't change for a given inode.
+- `mappers map[mapperKey]*AddressMapper` — keyed by `mapperKey{dev: uint64, ino: uint64}` from `Stat(openablePath)`. `AddressMapper` depends only on ELF program headers, which don't change for a given inode. Keying by `(dev, ino)` (not path) means two PIDs mapping the same shared library via different namespaces share one mapper; also avoids collisions if a deleted-and-recreated file reuses the same path with different content.
 - `negFetch map[string]time.Time` — keyed by build-id, 5-min TTL. Avoids re-trying failed fetches every batch.
 
 Both maps are bounded LRU (size from existing `--symbol-cache-max` budget; entries cheap, default 4096). Mutex on the symbolizer protects both.
@@ -133,6 +169,9 @@ type AddressMapper struct {
     loads    []ptLoad  // executable PT_LOADs, sorted by Off
 }
 
+// NewAddressMapper reads PHDRs from the ELF at path. Caller is responsible
+// for picking a path that's readable from the agent's namespace — typically
+// mapping.OpenablePath() which prefers /proc/<pid>/map_files/...
 func NewAddressMapper(path string) (*AddressMapper, error)
 func (m *AddressMapper) FileOffsetToVirtualAddress(off uint64) (uint64, bool)
 ```
@@ -223,7 +262,7 @@ Stats reframed: `cacheMisses` for Case 3 is removed (no fetch here anymore). `fe
 | Classification: build-id present but stripped, no debug-link, fetch fails (404 / timeout / all URLs exhausted) | Demote mapping to process-mode for this `Symbolize` batch. Record negative-fetch entry (build-id, 5-min TTL) so subsequent batches skip the fetch and go straight to process-mode. Dispatcher Case 3 returns "" (no panic). One log line per (PID, build-id). |
 | `AddressMapper` can't find PT_LOAD for an offset | Skip that address — frame name = `[binary]:offset` (current behavior) |
 | Cached `.debug` is corrupt / `blaze_symbolize_elf_virt_offsets` returns NULL | Demote that build-id to process-mode for the remainder of the session (no per-PID scope — file content is identical for all consumers). **Don't** poison the cache file itself — a future blazesym version may parse it correctly. Set negative-fetch with a longer TTL (1 hour) to avoid re-parsing every batch. |
-| `--symbol-fail-closed` is set | Refuse to emit any frame for any mapping that file-mode would have served. pprof gets `[unresolved]` instead of `[binary]:offset`. Existing flag, semantics extended naturally. |
+| `--symbol-fail-closed` is set | **No change in this PR.** The flag's semantics remain as-of v1.1.0 (still M2-pending per `perfagent/options.go:102`). Wiring it into the new classifier + file-mode demote logic is a separate concern; deferred to a follow-up PR so this work stays scoped. |
 
 ### Observability
 
@@ -258,7 +297,9 @@ Logged at agent shutdown alongside existing dispatcher counters. No new env vars
 | `unwind/procmap/addressmapper_test.go` (NEW) | ~120 | Unit tests for normalization |
 | `symbolize/debuginfod/classifier.go` (NEW) | ~150 | `procmapClassifier`, route decisions, content-addressed mapper + negFetch caches |
 | `symbolize/debuginfod/classifier_test.go` (NEW) | ~200 | Table-driven classification tests |
-| `symbolize/debuginfod/dispatcher.go` (MODIFY) | -30 / +80 | Remove Case 3, add `symbolize_elf_virt` cgo wrapper, add `symbolizeElfVirt` Go wrapper |
+| `symbolize/debuginfod/dispatcher.go` (MODIFY) | -20 / +80 | Reframe Case 3 as no-fetch fallback (return ""), add `symbolize_elf_virt` cgo wrapper, add `symbolizeElfVirt` Go wrapper |
+| `unwind/procmap/procmap.go` (MODIFY) | +15 | Add `Mapping.MapFiles string` + `Mapping.OpenablePath()` helper |
+| `unwind/procmap/procmap_test.go` (MODIFY) | +30 | Tests for OpenablePath: map_files preferred, falls back to symbolic, returns "" when neither works |
 | `symbolize/debuginfod/symbolizer.go` (MODIFY) | +60 | Per-mapping routing in `Symbolize()`, batch splitting, result merging |
 | `symbolize/debuginfod/stats.go` (MODIFY) | +20 | New counters |
 | `test/integration_test.go` (MODIFY) | +180 | `TestStrippedRustOffBoxSymbolization`, `TestStrippedGoOffBoxSymbolization`, `TestStrippedCachedHitNoFetch`, `TestOffBoxLibcResolution` |
@@ -325,6 +366,8 @@ Test cases:
 
 - **`TestFileModeParseFailDemotes`**: Corrupt a cached `.debug` (truncate to 100 bytes). Run perf-agent. Assert the mapping demotes cleanly to process-mode and pprof still emits frames (just unsymbolized).
 
+- **`TestStrippedSidecarUnreachableSymbolicPath`**: Simulate the sidecar / mount-namespace case. Build a workload, get its symbolic path, then **delete the binary from its symbolic location while it's still running** (the process keeps it alive via the open file descriptor). The agent now sees the symbolic path as missing but `/proc/<pid>/map_files/...` still works. Assert symbols still resolve. (This is the simplest portable repro of the sidecar shareProcessNamespace + separate-mount-ns case.)
+
 ### Workload prep
 
 New `test/integration_strip_helpers.go` (build-tag `integration`):
@@ -350,6 +393,7 @@ func uploadDebug(t *testing.T, srcWithDwarf string) (buildID, debugPath string)
 
 ## Open follow-ups (out of scope here)
 
+- **Wire `--symbol-fail-closed` end-to-end**: today the flag is parsed but inert (M2-pending). Extend it through classifier + file-mode demotion so users running profiling pipelines that must not silently lose frames can opt into hard failures. Separate PR.
 - Per-mapping debuginfod-fetch latency: today the first symbolize-batch for a new PID blocks on fetch (synchronous). Could move to "fetch ahead of time on attach" or "spawn background fetch + emit unresolved frames for the first batch".
 - Object-store cache backend (Parca / Pyroscope use S3-compatible). Filesystem cache is fine for single-host; multi-replica K8s scenarios would benefit from shared storage.
 - Lidia-style indexed DWARF (Pyroscope) — symbolize cost is currently `O(DWARF parse)` per first-use. Caching parsed DWARF (via blazesym's `blaze_symbolize_cache_elf`) would help; consider in M3.

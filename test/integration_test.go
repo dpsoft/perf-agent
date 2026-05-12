@@ -1652,7 +1652,7 @@ func TestKernelStackResolution(t *testing.T) {
 	t.Helper()
 	requireBPFRunnable(t, getAgentPath(t))
 
-	bin := agentBinary(t)
+	bin := getAgentPath(t)
 	kptrZero := readKptrRestrictZero()
 
 	cmd, cleanup := spawnIoBoundWorkload(t)
@@ -1718,7 +1718,7 @@ func TestPerfDataKernelMmap2(t *testing.T) {
 	t.Helper()
 	requireBPFRunnable(t, getAgentPath(t))
 
-	bin := agentBinary(t)
+	bin := getAgentPath(t)
 
 	cmd, cleanup := spawnIoBoundWorkload(t)
 	defer cleanup()

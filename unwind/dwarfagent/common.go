@@ -13,6 +13,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 
+	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
@@ -35,6 +36,7 @@ type sampleKey struct {
 type sessionObjs interface {
 	Close() error
 	RingbufMap() *ebpf.Map
+	KernStackmap() *ebpf.Map
 	CFIRulesMap() *ebpf.Map
 	CFILengthsMap() *ebpf.Map
 	CFIClassificationMap() *ebpf.Map
@@ -57,21 +59,23 @@ type session struct {
 	tags   []string
 	labels map[string]string
 
-	objs       sessionObjs
-	store      *ehmaps.TableStore
-	tracker    *ehmaps.PIDTracker
-	watcher    mmapEventSourceCloser
-	ringReader *ringbuf.Reader
-	symbolizer symbolize.Symbolizer
-	resolver   *procmap.Resolver
+	objs             sessionObjs
+	store            *ehmaps.TableStore
+	tracker          *ehmaps.PIDTracker
+	watcher          mmapEventSourceCloser
+	ringReader       *ringbuf.Reader
+	symbolizer       symbolize.Symbolizer
+	kernelSymbolizer symbolize.KernelSymbolizer
+	resolver         *procmap.Resolver
 
 	stop      chan struct{}
 	trackerWG sync.WaitGroup
 	readerWG  sync.WaitGroup
 
-	mu      sync.Mutex
-	samples map[sampleKey]uint64
-	stacks  map[sampleKey][]uint64
+	mu         sync.Mutex
+	samples    map[sampleKey]uint64
+	stacks     map[sampleKey][]uint64
+	kernStacks map[sampleKey][]uint64 // kernel IPs per sample key; nil when kernel-stacks disabled
 
 	attachStats attachStats
 
@@ -100,10 +104,17 @@ type attachStats struct {
 // Does NOT start any goroutines, attach the BPF program, or call
 // AddPID — those are caller-specific (CPU vs off-CPU differ).
 //
+// kernelSym resolves kernel-mode addresses for samples that carry a
+// valid BPF kernel stack-ID. Callers pass symbolize.NoopKernelSymbolizer{}
+// to disable kernel symbolization (the BPF gate
+// kernel_stacks_enabled=false makes the userspace lookup a dead branch
+// anyway). The session does NOT close the kernel symbolizer — its
+// lifecycle is owned by the Agent, same as the user-mode Symbolizer.
+//
 // On error, every resource newSession allocated is closed. Caller's
 // BPF-handle `objs` is NOT closed on error — caller remains responsible
 // for it, so its defer-close pattern still works.
-func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, sym symbolize.Symbolizer) (*session, error) {
+func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
@@ -202,21 +213,22 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	}
 
 	return &session{
-		pid:         pid,
-		tags:        tags,
-		labels:      labels,
-		objs:        objs,
-		store:       store,
-		tracker:     tracker,
-		watcher:     watcher,
-		ringReader:  rd,
-		missReader:  missReader,
-		symbolizer:  sym,
-		resolver:    procmap.NewResolver(),
-		stop:        make(chan struct{}),
-		samples:     map[sampleKey]uint64{},
-		attachStats: stats,
-		perfData:    perfData,
+		pid:              pid,
+		tags:             tags,
+		labels:           labels,
+		objs:             objs,
+		store:            store,
+		tracker:          tracker,
+		watcher:          watcher,
+		ringReader:       rd,
+		missReader:       missReader,
+		symbolizer:       sym,
+		kernelSymbolizer: kernelSym,
+		resolver:         procmap.NewResolver(),
+		stop:             make(chan struct{}),
+		samples:          map[sampleKey]uint64{},
+		attachStats:      stats,
+		perfData:         perfData,
 	}, nil
 }
 
@@ -250,13 +262,23 @@ func (s *session) runTracker() {
 
 // aggregator is the per-sample callback used by consumeRingbuf.
 // CPU passes a function that does `s.samples[key]++`; off-CPU passes a
-// function that does `s.samples[key] += sample.Value`.
-type aggregator func(s *session, sample Sample)
+// function that does `s.samples[key] += sample.Value`. kernelIPs holds
+// the resolved kernel-mode IPs (may be empty if --kernel-stacks is off
+// or the stack-ID went stale); the aggregator stashes them via
+// stashKernelStack so collect() can symbolize them later.
+type aggregator func(s *session, sample Sample, kernelIPs []uint64)
 
 // consumeRingbuf runs the ringbuf reader loop until s.stop fires or
 // the reader returns ErrClosed. Must be called exactly once in a
 // goroutine after newSession + runTracker. Caller is responsible for
 // s.readerWG.Add(1) BEFORE spawning the goroutine.
+//
+// For each sample with a valid BPF kernel stack-ID (sample.KernStack >= 0),
+// the loop reads the IPs out of the per-program kern_stackmap and stashes
+// them in s.kernStacks keyed by the same sampleKey as the user PCs. The
+// stash happens BEFORE the per-mode aggregator (CPU vs off-CPU) runs so
+// it sees the kernel IPs alongside the user PC chain. When the BPF gate
+// is off the field is -1 and we skip the lookup entirely.
 func (s *session) consumeRingbuf(agg aggregator) {
 	defer s.readerWG.Done()
 	for {
@@ -285,7 +307,18 @@ func (s *session) consumeRingbuf(agg aggregator) {
 		if len(sample.PCs) == 0 {
 			continue
 		}
-		agg(s, sample)
+		// Kernel-stack lookup gated on the BPF-set stack-ID. The
+		// kern_stackmap is shared across all CPUs / samples; the
+		// stack-ID identifies a unique IP chain inside the kernel
+		// FNV-hashed buffer. Lookup failures (stale ID, map evict)
+		// are logged at debug level and fall through to no-kernel.
+		var kernelIPs []uint64
+		if sample.KernStack >= 0 {
+			if kernBytes, err := s.objs.KernStackmap().LookupBytes(uint32(sample.KernStack)); err == nil {
+				kernelIPs = bpfstack.ExtractIPs(kernBytes)
+			}
+		}
+		agg(s, sample, kernelIPs)
 	}
 }
 
@@ -300,19 +333,44 @@ func (s *session) stashStack(key sampleKey, pcs []uint64) {
 	}
 }
 
+// stashKernelStack stores the kernel IP chain for key if not already
+// stashed. No-op when kernelIPs is empty (the common case when kernel
+// stacks are disabled or the BPF gate didn't fire). Must be called
+// under s.mu.
+func (s *session) stashKernelStack(key sampleKey, kernelIPs []uint64) {
+	if len(kernelIPs) == 0 {
+		return
+	}
+	if s.kernStacks == nil {
+		s.kernStacks = map[sampleKey][]uint64{}
+	}
+	if _, have := s.kernStacks[key]; !have {
+		s.kernStacks[key] = append([]uint64(nil), kernelIPs...)
+	}
+}
+
 // collect drains accumulated samples, symbolizes them, and writes a
 // gzipped pprof to w. sampleType distinguishes CPU vs off-CPU in the
 // output. sampleRate is passed through to pprof builders (off-CPU can
 // pass 0).
+//
+// Kernel frames (if --kernel-stacks is on and the stack-ID was valid
+// when consumeRingbuf ran) are symbolized via s.kernelSymbolizer and
+// merged leaf-first with the user frames — matching the FP profiler's
+// shape so pprof Reverse() yields root→kernel→user.
 func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate int) error {
 	s.mu.Lock()
 	samples := make(map[sampleKey]uint64, len(s.samples))
 	stacks := make(map[sampleKey][]uint64, len(s.stacks))
+	kernStacks := make(map[sampleKey][]uint64, len(s.kernStacks))
 	for k, v := range s.samples {
 		samples[k] = v
 	}
 	for k, v := range s.stacks {
 		stacks[k] = v
+	}
+	for k, v := range s.kernStacks {
+		kernStacks[k] = v
 	}
 	s.mu.Unlock()
 
@@ -329,7 +387,7 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 		Labels:        s.labels,
 	})
 	for key, val := range samples {
-		frames := symbolizePID(s.symbolizer, key.pid, stacks[key])
+		frames := symbolizePIDWithKernel(s.symbolizer, s.kernelSymbolizer, key.pid, stacks[key], kernStacks[key])
 		sample := pprof.ProfileSample{
 			Pid:         key.pid,
 			SampleType:  sampleType,

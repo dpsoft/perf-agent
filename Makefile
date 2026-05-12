@@ -19,6 +19,12 @@ blazesym-check:
 		echo "*** missing process_dispatch — pull blazesym to a commit ≥ 8891e70"; \
 		exit 1; \
 	fi
+	@if ! grep -q 'blaze_symbolize_kernel_abs_addrs' $(LIBBLAZESYM_INC)/blazesym.h; then \
+		echo "*** blazesym header at $(LIBBLAZESYM_INC)/blazesym.h is too old"; \
+		echo "*** missing blaze_symbolize_kernel_abs_addrs (kernel-mode + module DWARF symbolization)"; \
+		echo "*** pull blazesym to a commit ≥ 29a609f"; \
+		exit 1; \
+	fi
 
 build: blazesym-check $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
 	CGO_LDFLAGS=" -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release) -lblazesym_c -static " CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release)" go build .

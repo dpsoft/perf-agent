@@ -12,6 +12,13 @@ const (
 	recordFinishedRound = 12
 )
 
+// PERF_CONTEXT_* sentinel IPs used to separate kernel and user portions of a
+// callchain in PERF_RECORD_SAMPLE. Values match uapi/linux/perf_event.h.
+const (
+	perfContextKernel uint64 = 0xffffffffffffff80 // (uint64)-128
+	perfContextUser   uint64 = 0xfffffffffffffe00 // (uint64)-512
+)
+
 // recordHeaderSize is the size of struct perf_event_header in bytes.
 // 8 = u32 type + u16 misc + u16 size.
 const recordHeaderSize = 8
@@ -135,7 +142,8 @@ type SampleRecord struct {
 	Time      uint64   // PERF_SAMPLE_TIME (ns since clock origin)
 	Cpu       uint32   // PERF_SAMPLE_CPU (low 32 bits)
 	Period    uint64   // PERF_SAMPLE_PERIOD
-	Callchain []uint64 // PERF_SAMPLE_CALLCHAIN (leaf first, ips array)
+	UserIPs   []uint64 // PERF_SAMPLE_CALLCHAIN — user-space IPs (leaf first)
+	KernelIPs []uint64 // kernel-space IPs (leaf first); emitted before UserIPs with PERF_CONTEXT markers
 }
 
 // encodeSample writes a PERF_RECORD_SAMPLE record (type 9). Field order
@@ -147,8 +155,23 @@ type SampleRecord struct {
 //	{ u32 cpu, res; }                      // PERF_SAMPLE_CPU
 //	{ u64 period; }                        // PERF_SAMPLE_PERIOD
 //	{ u64 nr; u64 ips[nr]; }               // PERF_SAMPLE_CALLCHAIN
+//
+// The callchain is built from KernelIPs and UserIPs, separated by
+// PERF_CONTEXT_KERNEL / PERF_CONTEXT_USER sentinel IPs as required by
+// `perf report`. Kernel frames are leaf-side (emitted first).
 func encodeSample(w io.Writer, r SampleRecord) {
-	bodySize := 8 + 8 + 8 + 8 + 8 + 8 + 8*len(r.Callchain)
+	// Build merged callchain: kernel first (leaf-side), then user (root-side).
+	chain := make([]uint64, 0, 2+len(r.KernelIPs)+len(r.UserIPs))
+	if len(r.KernelIPs) > 0 {
+		chain = append(chain, perfContextKernel)
+		chain = append(chain, r.KernelIPs...)
+	}
+	if len(r.UserIPs) > 0 {
+		chain = append(chain, perfContextUser)
+		chain = append(chain, r.UserIPs...)
+	}
+
+	bodySize := 8 + 8 + 8 + 8 + 8 + 8 + 8*len(chain)
 	size := recordHeaderSize + bodySize
 	writeUint32LE(w, recordSample)
 	writeUint16LE(w, 0) // misc — could carry CPUMODE_USER etc. but blazesym handles that downstream
@@ -161,8 +184,8 @@ func encodeSample(w io.Writer, r SampleRecord) {
 	writeUint32LE(w, r.Cpu)
 	writeUint32LE(w, 0) // res
 	writeUint64LE(w, r.Period)
-	writeUint64LE(w, uint64(len(r.Callchain)))
-	for _, ip := range r.Callchain {
+	writeUint64LE(w, uint64(len(chain)))
+	for _, ip := range chain {
 		writeUint64LE(w, ip)
 	}
 }

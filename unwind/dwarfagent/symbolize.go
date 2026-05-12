@@ -27,3 +27,31 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, ips []uint64) []pprof.Fr
 	}
 	return symbolize.ToProfFrames(frames)
 }
+
+// symbolizePIDWithKernel resolves both user-mode and kernel-mode IPs for a
+// single sample. Kernel frames are leaf-side and are prepended to the user
+// frames so the resulting chain is leaf-first (kernel → user-leaf → … →
+// user-root). pprof.Reverse() later flips this to outermost-first.
+//
+// When kernelIPs is empty (the typical case with --kernel-stacks off or
+// stale BPF stack-IDs), behaves identically to symbolizePID. When user-mode
+// symbolization fails we still emit synthetic "[unknown]" placeholders so
+// the kernel frames don't appear hanging off an unrelated stack.
+func symbolizePIDWithKernel(sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, pid uint32, userIPs, kernelIPs []uint64) []pprof.Frame {
+	userFrames := symbolizePID(sym, pid, userIPs)
+	if len(kernelIPs) == 0 {
+		return userFrames
+	}
+	kernelFrames, err := kernelSym.SymbolizeKernel(kernelIPs)
+	if err != nil {
+		log.Printf("dwarfagent: symbolize kernel: %v", err)
+	}
+	kf := symbolize.ToProfFramesKernel(kernelFrames)
+	if len(kf) == 0 {
+		return userFrames
+	}
+	out := make([]pprof.Frame, 0, len(kf)+len(userFrames))
+	out = append(out, kf...)
+	out = append(out, userFrames...)
+	return out
+}

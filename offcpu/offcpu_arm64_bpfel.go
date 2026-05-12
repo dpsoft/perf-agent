@@ -93,7 +93,8 @@ type offcpuMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type offcpuVariableSpecs struct {
-	SystemWide *ebpf.VariableSpec `ebpf:"system_wide"`
+	KernelStacksEnabled *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
+	SystemWide          *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
 // offcpuObjects contains all objects after they have been loaded into the kernel.
@@ -135,7 +136,8 @@ func (m *offcpuMaps) Close() error {
 //
 // It can be passed to loadOffcpuObjects or ebpf.CollectionSpec.LoadAndAssign.
 type offcpuVariables struct {
-	SystemWide *ebpf.Variable `ebpf:"system_wide"`
+	KernelStacksEnabled *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
+	SystemWide          *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // offcpuPrograms contains all programs after they have been loaded into the kernel.

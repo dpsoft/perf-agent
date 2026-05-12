@@ -11,7 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -1140,7 +1143,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	}()
 	time.Sleep(2 * time.Second) // let workload start
 
-	objs, err := perfprofile.LoadPerfDwarf(false)
+	objs, err := perfprofile.LoadPerfDwarf(false, false)
 	require.NoError(t, err)
 	defer objs.Close()
 
@@ -1396,7 +1399,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 	}()
 	time.Sleep(500 * time.Millisecond) // let workload print its PID banner
 
-	objs, err := perfprofile.LoadPerfDwarf(false)
+	objs, err := perfprofile.LoadPerfDwarf(false, false)
 	require.NoError(t, err)
 	defer objs.Close()
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
@@ -1638,4 +1641,159 @@ func TestPerfDataOutput(t *testing.T) {
 	}
 	require.NotEmpty(t, scriptOut, "perf script produced no output (no samples in perf.data?)")
 	t.Logf("perf script captured %d bytes of output", len(scriptOut))
+}
+
+// TestKernelStackResolution verifies the pprof path for kernel-stack capture.
+// It spawns the Go io_bound workload (heavy I/O → many kernel frames), runs
+// perf-agent with --profile --kernel-stacks, and asserts:
+//   - at least one user-side function (main.* or runtime.*) appears in the pprof
+//   - when kptr_restrict=0, at least one resolved kernel symbol also appears
+func TestKernelStackResolution(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+
+	bin := getAgentPath(t)
+	kptrZero := readKptrRestrictZero()
+
+	cmd, cleanup := spawnIoBoundWorkload(t)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	agent := exec.Command(bin,
+		"--profile",
+		"--kernel-stacks",
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+
+	// Always assert at least one user-side function from io_bound appears.
+	hasUser := false
+	for name := range got {
+		if strings.Contains(name, "main.") || strings.Contains(name, "runtime.") {
+			hasUser = true
+			break
+		}
+	}
+	if !hasUser {
+		t.Fatalf("no user-side function in profile; got: %v", sortedKeys(got))
+	}
+
+	if kptrZero {
+		// Expect at least one resolved kernel symbol.
+		kernelRe := regexp.MustCompile(`^(do_sys_|ksys_|__x64_sys_|vfs_|__schedule|read_|sock_|tcp_)`)
+		matched := false
+		for name := range got {
+			if kernelRe.MatchString(name) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("no resolved kernel symbol matched expected regex; got: %v", sortedKeys(got))
+		}
+	} else {
+		// kptr_restrict != 0 → kernel frames may appear as raw 0xffff… names
+		// or may be absent entirely. Either is acceptable.
+		t.Logf("kptr_restrict != 0; not asserting kernel symbol resolution")
+	}
+}
+
+// TestPerfDataKernelMmap2 verifies the --perf-data-output path for kernel
+// stacks. It asserts the produced perf.data file contains the
+// [kernel.kallsyms]_text MMAP2 record and the pid=-1 (0xffffffff LE) marker
+// that perf tooling relies on to anchor kernel symbol lookups.
+func TestPerfDataKernelMmap2(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+
+	bin := getAgentPath(t)
+
+	cmd, cleanup := spawnIoBoundWorkload(t)
+	defer cleanup()
+
+	outDir := t.TempDir()
+	pb := filepath.Join(outDir, "profile.pb.gz")
+	pd := filepath.Join(outDir, "perf.data")
+	agent := exec.Command(bin,
+		"--profile",
+		"--kernel-stacks",
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", pb,
+		"--perf-data-output", pd,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	body, err := os.ReadFile(pd)
+	if err != nil {
+		t.Fatalf("read perf.data: %v", err)
+	}
+	if !bytes.Contains(body, []byte("[kernel.kallsyms]_text")) {
+		t.Fatalf("perf.data missing [kernel.kallsyms]_text MMAP2 filename")
+	}
+	// pid=-1 (0xffffffff in little-endian) is written into every kernel MMAP2
+	// record to signal kernel address space to perf tooling.
+	if !bytes.Contains(body, []byte{0xff, 0xff, 0xff, 0xff}) {
+		t.Fatalf("perf.data missing pid=-1 marker (0xffffffff LE)")
+	}
+}
+
+// spawnIoBoundWorkload starts the Go io_bound workload (heavy /dev/zero reads
+// → frequent syscall/kernel frames) and returns the running command plus a
+// cleanup func that kills it.
+func spawnIoBoundWorkload(t *testing.T) (*exec.Cmd, func()) {
+	t.Helper()
+	bin := "./workloads/go/io_bound"
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("io_bound workload not built: %v", err)
+	}
+	cmd := exec.Command(bin, "-duration=30s", "-threads=2")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start io_bound: %v", err)
+	}
+	// Brief pause so the workload is fully running before we attach.
+	time.Sleep(500 * time.Millisecond)
+	cleanup := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	}
+	return cmd, cleanup
+}
+
+// readKptrRestrictZero returns true when /proc/sys/kernel/kptr_restrict reads
+// "0". Best-effort; returns false on any read error.
+func readKptrRestrictZero() bool {
+	body, err := os.ReadFile("/proc/sys/kernel/kptr_restrict")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(body)) == "0"
+}
+
+// sortedKeys returns the keys of a map[string]bool in sorted order.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -39,6 +39,12 @@ struct {
 // System-wide mode: when true, profile all processes; when false, use PID filter
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// existing per-mode gate (system_wide hard-true OR pid_config.collect_kernel)
+// decides which samples capture kernel stacks.
+const volatile bool kernel_stacks_enabled = false;
+
 struct pid_config {
     uint8_t type;
     uint8_t collect_user;
@@ -97,7 +103,10 @@ int profile(struct bpf_perf_event_data *ctx) {
 
     // In system-wide mode, always collect user stacks (default behavior)
     // In targeted mode, use config settings
-    bool collect_kernel = system_wide ? false : (config && config->collect_kernel);
+    bool collect_kernel = false;
+    if (kernel_stacks_enabled) {
+        collect_kernel = system_wide ? true : (config && config->collect_kernel);
+    }
     bool collect_user = system_wide ? true : (config && config->collect_user);
 
     if (collect_kernel) {

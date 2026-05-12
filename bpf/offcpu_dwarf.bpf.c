@@ -40,6 +40,14 @@
 // non-kernel task's off-CPU interval.
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// existing per-mode gate (system_wide hard-true OR pid_config.collect_kernel)
+// decides which samples capture kernel stacks. Task 3 wires the kernel
+// stack ID capture path; this declaration lets userspace flip the gate
+// at load time without another bpf2go regeneration.
+const volatile bool kernel_stacks_enabled = false;
+
 // offcpu_start keys the stashed sample by (pid, tgid). Value is the
 // sample_record captured on switch-OUT. To avoid blowing the 512-byte
 // BPF stack, we do NOT wrap it in a struct with a timestamp — instead
@@ -62,7 +70,7 @@ struct {
 
 BTF_MATERIALIZE(offcpu_start_key)
 
-static __always_inline void handle_switch_out(struct task_struct *prev) {
+static __always_inline void handle_switch_out(void *ctx, struct task_struct *prev) {
     __u32 pid = BPF_CORE_READ(prev, pid);
     __u32 tgid = BPF_CORE_READ(prev, tgid);
     if (pid == 0 || tgid == 0) return;
@@ -95,6 +103,15 @@ static __always_inline void handle_switch_out(struct task_struct *prev) {
     };
     rec->hdr.walker_flags = 0;
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
+
+    // Kernel-stack capture for prev. At sched_switch, prev is still
+    // "current" so bpf_get_stackid(ctx, …) records prev's kernel stack.
+    // Default -1 so userspace can skip the lookup without branching on
+    // the gate. Mirror of the FP off-CPU's behavior in offcpu.bpf.c.
+    rec->hdr.kern_stack = -1;
+    if (kernel_stacks_enabled) {
+        rec->hdr.kern_stack = bpf_get_stackid(ctx, &kern_stackmap, KERN_STACKID_FLAGS);
+    }
 
     __u64 now = bpf_ktime_get_ns();
     rec->hdr.pid     = tgid;
@@ -131,7 +148,7 @@ static __always_inline void handle_switch_in(struct task_struct *next) {
 SEC("tp_btf/sched_switch")
 int BPF_PROG(offcpu_dwarf_sched_switch, bool preempt,
              struct task_struct *prev, struct task_struct *next) {
-    handle_switch_out(prev);
+    handle_switch_out(ctx, prev);
     handle_switch_in(next);
     return 0;
 }

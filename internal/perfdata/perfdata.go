@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 )
 
 // EventSpec describes the perf event the captured samples come from. Filled
@@ -224,4 +226,83 @@ func (w *Writer) Close() error {
 		return fmt.Errorf("perfdata: header patch flush: %w", err)
 	}
 	return w.f.Close()
+}
+
+// AddKernelMmap emits PERF_RECORD_MMAP2 for [kernel.kallsyms]_text so
+// `perf report` resolves kernel symbols against /proc/kallsyms (or its
+// own kallsyms snapshot). Should be called once at writer init, before
+// any sample records. pid=-1 (kernel-or-any), tid=0.
+//
+// Address range: when /proc/kallsyms is readable, uses the real
+// (_text, _etext-_text) extent. When unreadable / kptr-restricted, uses
+// the conventional x86_64/arm64 kernel base + a catch-all length so
+// module text outside _text..(_etext) is still attributed to this MMAP2.
+// `perf report` falls back to its own /proc/kallsyms snapshot for
+// symbol resolution in either case.
+func (w *Writer) AddKernelMmap() error {
+	addr, length := readKernelTextRange()
+	w.AddMmap2(Mmap2Record{
+		Pid:      uint32(0xffffffff), // -1
+		Tid:      0,
+		Addr:     addr,
+		Len:      length,
+		Pgoff:    0,
+		Prot:     0x5, // PROT_READ | PROT_EXEC
+		Flags:    0x2, // MAP_PRIVATE
+		Filename: "[kernel.kallsyms]_text",
+	})
+	return nil
+}
+
+// readKernelTextRange returns (start, len) for kernel text. When
+// /proc/kallsyms is readable AND exposes _text + _etext, returns the
+// real range. Otherwise returns the conventional kernel base +
+// catch-all length so PMU samples in module text are still attributed
+// to [kernel.kallsyms]_text.
+func readKernelTextRange() (uint64, uint64) {
+	const path = "/proc/kallsyms"
+	f, err := os.Open(path)
+	if err != nil {
+		return kernelCatchallRange()
+	}
+	defer func() { _ = f.Close() }()
+
+	var textStart, etext uint64
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		addr, err := strconv.ParseUint(fields[0], 16, 64)
+		if err != nil || addr == 0 {
+			continue
+		}
+		switch fields[2] {
+		case "_text":
+			textStart = addr
+		case "_etext":
+			etext = addr
+		}
+		if textStart != 0 && etext != 0 {
+			break
+		}
+	}
+	if textStart == 0 {
+		return kernelCatchallRange()
+	}
+	if etext <= textStart {
+		// _text readable but _etext missing/zero — extend to catch-all
+		// so module text is still attributed.
+		return textStart, 0x80000000
+	}
+	return textStart, etext - textStart
+}
+
+// kernelCatchallRange returns a fallback (start, len) when /proc/kallsyms
+// is unreadable/kptr-restricted. 0xffffffff80000000 is the conventional
+// x86_64 kernel base; arm64's range overlaps. Length 0x80000000 (~2 GiB)
+// covers the full kernel-text upper half and all loaded modules.
+func kernelCatchallRange() (uint64, uint64) {
+	return 0xffffffff80000000, 0x80000000
 }

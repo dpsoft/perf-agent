@@ -10,6 +10,7 @@ import (
 
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
 )
 
@@ -57,7 +58,7 @@ func TestLazyMode_FiresAndCompilesOnMiss(t *testing.T) {
 	for i := range cpus {
 		cpus[i] = uint(i)
 	}
-	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, nil, dwarfagent.ModeLazy, nil, nil, nil, newTestSymbolizer(t))
+	prof, err := dwarfagent.NewProfilerWithMode(0, true, cpus, nil, 99, nil, dwarfagent.ModeLazy, nil, nil, nil, newTestSymbolizer(t), symbolize.NoopKernelSymbolizer{}, false)
 	if err != nil {
 		t.Fatalf("NewProfilerWithMode: %v", err)
 	}

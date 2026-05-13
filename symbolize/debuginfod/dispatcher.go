@@ -69,6 +69,23 @@ static blaze_symbolize_src_process make_process_src(uint32_t pid) {
     return src;
 }
 
+// symbolize_elf_virt symbolizes file-VA addresses against the ELF at path.
+// Mirrors make_process_src / blaze_symbolize_process_abs_addrs but for the
+// elf-virt API: the caller already owns the file-VAs (from AddressMapper),
+// so we just stage a stack-local src struct and forward the call.
+static const blaze_syms* symbolize_elf_virt(
+    blaze_symbolizer* sym,
+    const char* path,
+    const uint64_t* virt_offsets,
+    size_t cnt) {
+    blaze_symbolize_src_elf src;
+    memset(&src, 0, sizeof(src));
+    src.type_size = sizeof(src);
+    src.path = path;
+    src.debug_syms = 1;
+    return blaze_symbolize_elf_virt_offsets(sym, &src, virt_offsets, cnt);
+}
+
 // sym_at lets Go index into the trailing flexible array member without
 // performing pointer arithmetic on the Go side.
 static const blaze_sym* sym_at(const blaze_syms* syms, size_t i) {
@@ -323,6 +340,52 @@ func (st *cgoState) symbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fram
 		var addr uint64
 		if i < len(ips) {
 			addr = ips[i]
+		}
+		out = append(out, frameFromCSym(csym, addr))
+	}
+	return out, nil
+}
+
+// symbolizeElfVirt symbolizes file-VA addresses against the ELF at path.
+//
+// originalIPs and virtOffsets MUST be the same length. virtOffsets[i] is the
+// file-VA used for the blazesym lookup (output of AddressMapper);
+// originalIPs[i] is the process PC the resulting Frame.Address must carry so
+// pprof's mapping resolver can route the location to its /proc/<pid>/maps
+// range. The rewrite propagates to every inlined entry in the leaf's chain
+// (frameFromCSym carries `addr` into every inlined Frame it builds).
+//
+// Without this rewrite, file-mode locations would land on synthetic mapping 0
+// with no BuildID, which breaks downstream symbol routing.
+func (st *cgoState) symbolizeElfVirt(path string, originalIPs, virtOffsets []uint64) ([]symbolize.Frame, error) {
+	if len(originalIPs) != len(virtOffsets) {
+		return nil, fmt.Errorf("debuginfod: symbolizeElfVirt: len mismatch %d vs %d",
+			len(originalIPs), len(virtOffsets))
+	}
+	if len(virtOffsets) == 0 {
+		return nil, nil
+	}
+
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	caddr := (*C.uint64_t)(unsafe.Pointer(&virtOffsets[0]))
+	syms := C.symbolize_elf_virt(st.csym, cpath, caddr, C.size_t(len(virtOffsets)))
+	if syms == nil {
+		return nil, fmt.Errorf("debuginfod: blaze_symbolize_elf_virt_offsets returned NULL")
+	}
+	defer C.blaze_syms_free(syms)
+
+	cnt := int(syms.cnt)
+	out := make([]symbolize.Frame, 0, cnt)
+	for i := range cnt {
+		csym := C.sym_at(syms, C.size_t(i))
+		// Pass originalIPs[i] as the Frame.Address — frameFromCSym writes
+		// it onto both the leaf frame AND every inlined chain entry, so
+		// pprof's mapping resolver sees the process PC, not the file-VA.
+		var addr uint64
+		if i < len(originalIPs) {
+			addr = originalIPs[i]
 		}
 		out = append(out, frameFromCSym(csym, addr))
 	}

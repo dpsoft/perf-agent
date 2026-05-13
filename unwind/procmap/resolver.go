@@ -129,10 +129,29 @@ func (r *Resolver) populate(entry *pidEntry, pid uint32) {
 		return
 	}
 
+	r.attachBuildIDs(mappings)
+	entry.mappings = mappings
+}
+
+// attachBuildIDs sets BuildID on each mapping that doesn't already have one.
+// It tries MapFiles first (kernel-resolved symlink, works across mount
+// namespaces and survives unlinked-but-mapped binaries), then falls back to
+// the symbolic Path.
+func (r *Resolver) attachBuildIDs(mappings []Mapping) {
 	for i := range mappings {
+		if mappings[i].BuildID != "" {
+			continue // already attached
+		}
+		// Try MapFiles first (works across mount namespaces, survives
+		// unlinked binaries). Fall back to symbolic Path.
+		if p := mappings[i].MapFiles; p != "" {
+			if id := r.buildIDFor(p); id != "" {
+				mappings[i].BuildID = id
+				continue
+			}
+		}
 		mappings[i].BuildID = r.buildIDFor(mappings[i].Path)
 	}
-	entry.mappings = mappings
 }
 
 // BuildID returns a cached hex build-id for path, reading the ELF on

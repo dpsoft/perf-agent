@@ -1988,3 +1988,88 @@ func elfHasSection(t *testing.T, path, name string) bool {
 	sec := f.Section(name)
 	return sec != nil && sec.Size > 0
 }
+
+// TestFileModeFrameAddressPreservesMapping is the regression guard for the
+// originalIPs address-rewrite invariant. Without it, file-mode locations
+// carry the ELF virt-offset instead of the process PC, and pprof's
+// resolver routes them to the synthetic mapping 0 with no BuildID.
+func TestFileModeFrameAddressPreservesMapping(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+
+	// For each Location whose function name looks like a Rust symbol
+	// (rust_workload::*), assert it has a real Mapping with a BuildID.
+	rustRe := regexp.MustCompile(`^rust_workload::`)
+	checked := 0
+	for _, loc := range p.Location {
+		hasRust := false
+		for _, ln := range loc.Line {
+			if ln.Function != nil && rustRe.MatchString(ln.Function.Name) {
+				hasRust = true
+				break
+			}
+		}
+		if !hasRust {
+			continue
+		}
+		checked++
+
+		// Location.Address must be inside Location.Mapping.Start..Mapping.Limit.
+		if loc.Mapping == nil {
+			t.Errorf("rust frame at addr %#x has no Mapping (file-mode address rewrite broken)", loc.Address)
+			continue
+		}
+		if loc.Address < loc.Mapping.Start || loc.Address >= loc.Mapping.Limit {
+			t.Errorf("rust frame addr %#x outside Mapping[%#x, %#x) — file-mode address rewrite broken",
+				loc.Address, loc.Mapping.Start, loc.Mapping.Limit)
+		}
+		// Mapping.BuildID must equal the workload's build-id.
+		if !strings.EqualFold(loc.Mapping.BuildID, buildID) {
+			t.Errorf("rust frame Mapping.BuildID = %q, want %q",
+				loc.Mapping.BuildID, buildID)
+		}
+		// Mapping.File must point at the workload (not [unknown] or [jit]).
+		if !strings.Contains(loc.Mapping.File, "rust-workload") {
+			t.Errorf("rust frame Mapping.File = %q, want a path containing rust-workload",
+				loc.Mapping.File)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no rust frames in pprof — symbolization didn't fire at all")
+	}
+}

@@ -165,6 +165,10 @@ func TestMappingOpenablePath(t *testing.T) {
 	if err := os.WriteFile(binPath, []byte("dummy"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	binPath2 := filepath.Join(tmp, "exe2")
+	if err := os.WriteFile(binPath2, []byte("dummy2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name     string
@@ -172,7 +176,9 @@ func TestMappingOpenablePath(t *testing.T) {
 		path     string
 		want     string
 	}{
-		{"map_files preferred when both readable", binPath, binPath, binPath},
+		// binPath is in MapFiles; binPath2 is the symbolic Path.
+		// The result must be binPath, proving MapFiles is checked first.
+		{"map_files preferred when both readable", binPath, binPath2, binPath},
 		{"falls back to symbolic when map_files empty", "", binPath, binPath},
 		{"falls back to symbolic when map_files missing", "/nope/missing", binPath, binPath},
 		{"map_files wins when symbolic deleted", binPath, "/deleted/path", binPath},

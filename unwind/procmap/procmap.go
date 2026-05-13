@@ -25,6 +25,11 @@ type Mapping struct {
 // OpenablePath returns the first openable path: MapFiles (preferred — works
 // across mount namespaces and survives unlinked-but-mapped binaries) then
 // the symbolic Path. Returns "" when neither is readable.
+//
+// Note: the probe (open + close) and the caller's subsequent use of the
+// returned path are not atomic. The file may be unlinked or become
+// unreadable between the two. Callers must still handle errors from
+// os.Open (or equivalent) on the returned path themselves.
 func (m Mapping) OpenablePath() string {
 	for _, p := range [2]string{m.MapFiles, m.Path} {
 		if p == "" {

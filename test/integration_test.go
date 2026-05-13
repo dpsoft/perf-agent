@@ -2073,3 +2073,85 @@ func TestFileModeFrameAddressPreservesMapping(t *testing.T) {
 		t.Fatal("no rust frames in pprof — symbolization didn't fire at all")
 	}
 }
+
+// TestStrippedCachedHitNoFetch verifies that a second profiling run for the
+// same stripped binary doesn't re-fetch from debuginfod when the cache
+// already has the .debug. Confirms the cache.Has → file-mode short-circuit.
+func TestStrippedCachedHitNoFetch(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+
+	// First run: should fetch.
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	// Snapshot the debuginfod container access log line count.
+	prevHits := countDebuginfodHits(t, buildID)
+
+	// Second run: should NOT fetch (cache hit).
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	newHits := countDebuginfodHits(t, buildID)
+	delta := newHits - prevHits
+	if delta > 0 {
+		t.Errorf("expected 0 new debuginfod fetches on second run; saw %d new GET /buildid/%s/debuginfo entries",
+			delta, buildID)
+	}
+}
+
+// runStripped is a small helper that runs the agent for one short profile.
+func runStripped(t *testing.T, agentBin, target, cacheDir, outDir string) {
+	t.Helper()
+	cmd, cleanup := spawnBinaryAsWorkload(t, target)
+	defer cleanup()
+	out := filepath.Join(outDir, "profile.pb.gz")
+	agent := exec.Command(agentBin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+}
+
+// countDebuginfodHits returns the number of `GET /buildid/<buildID>/debuginfo`
+// log lines emitted by the debuginfod container so far. Best-effort —
+// returns 0 if `docker logs` fails (we surface that as 0 delta upstream).
+func countDebuginfodHits(t *testing.T, buildID string) int {
+	t.Helper()
+	cmd := exec.Command("docker", "logs", "debuginfod")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("docker logs debuginfod: %v (proceeding with 0 hits)", err)
+		return 0
+	}
+	needle := "GET /buildid/" + buildID + "/debuginfo"
+	count := 0
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if strings.Contains(line, needle) {
+			count++
+		}
+	}
+	return count
+}

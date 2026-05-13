@@ -2,6 +2,7 @@ package procmap
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -155,5 +156,34 @@ func TestResolverInvalidateAddrOutOfRangeForcesReparse(t *testing.T) {
 
 	if after != before+1 {
 		t.Fatalf("expected 1 re-populate, got %d -> %d", before, after)
+	}
+}
+
+func TestMappingOpenablePath(t *testing.T) {
+	tmp := t.TempDir()
+	binPath := filepath.Join(tmp, "exe")
+	if err := os.WriteFile(binPath, []byte("dummy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		mapFiles string
+		path     string
+		want     string
+	}{
+		{"map_files preferred when both readable", binPath, binPath, binPath},
+		{"falls back to symbolic when map_files empty", "", binPath, binPath},
+		{"falls back to symbolic when map_files missing", "/nope/missing", binPath, binPath},
+		{"map_files wins when symbolic deleted", binPath, "/deleted/path", binPath},
+		{"empty when neither works", "/nope/a", "/nope/b", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := Mapping{MapFiles: tc.mapFiles, Path: tc.path}
+			if got := m.OpenablePath(); got != tc.want {
+				t.Errorf("OpenablePath() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

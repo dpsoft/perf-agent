@@ -112,6 +112,15 @@ func (s *Symbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fra
 		s.stats.classifyProcessMode.Add(uint64(len(ips)))
 		return s.cgo.symbolizeProcess(pid, ips)
 	}
+
+	// Spec invariant: each Symbolize call must re-snapshot /proc/<pid>/maps
+	// (docs/specs/2026-05-12-debuginfod-cache-layout-design.md — "No
+	// persistent per-PID state"). Without this Invalidate, Mappings is
+	// sync.Once-cached: a dlopen/mmap/exec that extends the address space
+	// after the first call would leave new mappings invisible, causing IPs
+	// in those regions to fall through findMapping with no hit and be
+	// silently misrouted to process-mode against the wrong (or no) mapping.
+	s.resolver.Invalidate(pid)
 	mappings, err := s.resolver.Mappings(pid)
 	if err != nil || len(mappings) == 0 {
 		s.stats.classifyProcessMode.Add(uint64(len(ips)))

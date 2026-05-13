@@ -183,6 +183,75 @@ func TestResolverPopulateBuildIDViaMapFiles(t *testing.T) {
 	}
 }
 
+// TestResolverMappingsReSnapshotAfterInvalidate verifies the spec invariant
+// ("No persistent per-PID state — each Symbolize call re-snapshots
+// /proc/<pid>/maps"). It checks that Mappings repopulates after Invalidate by
+// confirming the populate counter increments; it also mutates the fixture
+// between calls and asserts the second snapshot sees the added mapping.
+func TestResolverMappingsReSnapshotAfterInvalidate(t *testing.T) {
+	// Set up a private /proc root with a single mapping for PID 9001.
+	tmp := t.TempDir()
+	pidDir := filepath.Join(tmp, "9001")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mapsPath := filepath.Join(pidDir, "maps")
+
+	// First snapshot: one executable mapping.
+	const firstMaps = "00400000-00401000 r-xp 00000000 fd:01 111 /usr/bin/first\n"
+	if err := os.WriteFile(mapsPath, []byte(firstMaps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver(WithProcRoot(tmp))
+	defer r.Close()
+
+	// First call — populates the cache.
+	m1, err := r.Mappings(9001)
+	if err != nil {
+		t.Fatalf("first Mappings: %v", err)
+	}
+	if len(m1) != 1 || m1[0].Path != "/usr/bin/first" {
+		t.Fatalf("first snapshot: got %v, want 1 mapping /usr/bin/first", m1)
+	}
+	countAfterFirst := r.populateCountForTest(9001)
+	if countAfterFirst != 1 {
+		t.Fatalf("populate count after first call: got %d, want 1", countAfterFirst)
+	}
+
+	// Mutate the fixture: add a second mapping (simulates dlopen / mmap).
+	const secondMaps = "00400000-00401000 r-xp 00000000 fd:01 111 /usr/bin/first\n" +
+		"7f0000001000-7f0000002000 r-xp 00000000 fd:01 222 /lib/libnew.so\n"
+	if err := os.WriteFile(mapsPath, []byte(secondMaps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without Invalidate, Mappings returns the stale snapshot.
+	stale, _ := r.Mappings(9001)
+	if len(stale) != 1 {
+		t.Fatalf("expected stale snapshot (1 mapping), got %d", len(stale))
+	}
+	if r.populateCountForTest(9001) != 1 {
+		t.Fatal("populate count must not change without Invalidate")
+	}
+
+	// Invalidate forces re-snapshot on the next Mappings call.
+	r.Invalidate(9001)
+	m2, err := r.Mappings(9001)
+	if err != nil {
+		t.Fatalf("second Mappings: %v", err)
+	}
+	if len(m2) != 2 {
+		t.Fatalf("second snapshot: got %d mappings, want 2", len(m2))
+	}
+	if m2[1].Path != "/lib/libnew.so" {
+		t.Errorf("second snapshot mapping[1]: got %q, want /lib/libnew.so", m2[1].Path)
+	}
+	if r.populateCountForTest(9001) != 2 {
+		t.Fatalf("populate count after Invalidate+Mappings: got %d, want 2", r.populateCountForTest(9001))
+	}
+}
+
 func TestMappingOpenablePath(t *testing.T) {
 	tmp := t.TempDir()
 	binPath := filepath.Join(tmp, "exe")

@@ -2,6 +2,7 @@ package debuginfod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -169,6 +170,54 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		return classifyResult{route: routeProcessMode}
 	}
 	return classifyResult{route: routeFileMode, debugPath: abs}
+}
+
+// mapperFor returns an AddressMapper for the mapping, content-addressed
+// by (dev, ino) of mapping.OpenablePath(). Mappers are cached across
+// classify() calls: two mappings backed by the same inode (e.g. a
+// shared library mapped into multiple processes) reuse a single parse.
+//
+// The lock is held only around map access; the (potentially slow)
+// NewAddressMapper call happens unlocked. A benign race may cause two
+// goroutines to parse the same file concurrently; the loser's mapper
+// is discarded.
+func (c *classifier) mapperFor(m procmap.Mapping) (*procmap.AddressMapper, error) {
+	openPath := m.OpenablePath()
+	if openPath == "" {
+		return nil, errors.New("classifier: mapping not openable")
+	}
+	fi, err := os.Stat(openPath)
+	if err != nil {
+		return nil, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("classifier: stat %s: not a *syscall.Stat_t", openPath)
+	}
+	key := mapperKey{dev: uint64(st.Dev), ino: st.Ino}
+
+	c.mu.Lock()
+	if existing, ok := c.mappers[key]; ok {
+		c.mu.Unlock()
+		return existing, nil
+	}
+	c.mu.Unlock()
+
+	mapper, err := procmap.NewAddressMapper(openPath)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	if existing, ok := c.mappers[key]; ok {
+		// A concurrent caller won the race; prefer the cached entry
+		// to keep identity stable for downstream consumers.
+		mapper = existing
+	} else {
+		c.mappers[key] = mapper
+	}
+	c.mu.Unlock()
+	return mapper, nil
 }
 
 // systemDebugPath returns the elfutils-standard split-debug path for

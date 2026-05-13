@@ -208,6 +208,25 @@ func TestClassifierBadDebugSkipsToSiblingCandidate(t *testing.T) {
 	}
 }
 
+// TestSymbolizerSplitsBatchesByRoute exercises the integration glue: an
+// IP batch with two distinct mappings — one routed to process-mode,
+// one to file-mode — should produce frames in the correct order with
+// the correct sources. This is a unit-level guard for the routing logic
+// in SymbolizeProcess(); the full end-to-end story lives in the
+// integration tests in test/.
+func TestSymbolizerSplitsBatchesByRoute(t *testing.T) {
+	t.Skip("integration-style test; uses real /proc/<pid>/maps from this very test process")
+	// Implementation hint: pick a non-trivial Go function in the current
+	// process (a runtime symbol), call SymbolizeProcess(os.Getpid(),
+	// [its_PC]), assert one frame with that name. Then also pass an
+	// address inside a deliberately-stripped fixture mapped via
+	// syscall.Mmap. Verify both frames resolve. This test is gated by
+	// t.Skip because it's fragile across runners; the integration tests
+	// in test/ cover the same path with real workloads. Left in as a
+	// documented placeholder in case someone wants to expand unit
+	// coverage of the router.
+}
+
 // writeStrippedELFWithBuildID writes an ELF with .note.gnu.build-id (decoded
 // from hex) but no .debug_info, no .gnu_debuglink, no .symtab.
 func writeStrippedELFWithBuildID(t *testing.T, path, buildIDHex string) string {

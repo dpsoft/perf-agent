@@ -64,6 +64,19 @@ func (r *Resolver) Lookup(pid uint32, addr uint64) (Mapping, bool) {
 	return m, true
 }
 
+// Mappings returns a snapshot of pid's executable mappings, populating
+// the per-PID cache on first call. The returned slice aliases the cached
+// state — callers MUST NOT mutate it. Returns nil when the PID has no
+// mappings (gone, restricted) or when /proc parse failed.
+func (r *Resolver) Mappings(pid uint32) ([]Mapping, error) {
+	entry := r.entryFor(pid)
+	entry.once.Do(func() { r.populate(entry, pid) })
+	if entry.err != nil {
+		return nil, entry.err
+	}
+	return entry.mappings, nil
+}
+
 // Invalidate drops any cached state for pid. The next Lookup
 // re-parses /proc/<pid>/maps. Call on process exit or when the
 // agent learns of whole-process churn (e.g., exec).

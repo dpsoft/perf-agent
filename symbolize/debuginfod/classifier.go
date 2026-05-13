@@ -89,6 +89,24 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		return classifyResult{route: routeSkip}
 	}
 
-	// Subsequent tiers come in later tasks.
+	// Tier 2: try to read the ELF; on any failure fall through to
+	// process-mode so blazesym's defaults can attempt resolution.
+	openPath := m.OpenablePath()
+	if openPath == "" {
+		// Unreachable from agent namespace. Process-mode is defensive —
+		// blazesym will emit [binary]:offset which still preserves
+		// stack shape vs skipping (which would drop frames).
+		return classifyResult{route: routeProcessMode}
+	}
+	if hasDwarf(openPath) {
+		return classifyResult{route: routeProcessMode}
+	}
+	// Debug-link search is filesystem-relative; only meaningful with the
+	// symbolic path. Skip if it isn't readable.
+	if m.Path != "" && hasResolvableDebuglink(m.Path, nil) {
+		return classifyResult{route: routeProcessMode}
+	}
+
+	// Tier 3 (file-mode) lands in the next task.
 	return classifyResult{route: routeProcessMode}
 }

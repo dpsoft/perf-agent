@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1899,4 +1900,91 @@ func spawnBinaryAsWorkload(t *testing.T, bin string) (*exec.Cmd, func()) {
 		_ = cmd.Wait()
 	}
 	return cmd, cleanup
+}
+
+// TestStrippedGoOffBoxSymbolization verifies off-box symbolization for a
+// stripped Go release binary. Plain `go build` emits DWARF + symtab; we
+// strip both via objcopy --strip-all leaving only .note.gnu.build-id.
+// The .debug file uploaded to debuginfod must carry the DWARF blazesym
+// reads.
+func TestStrippedGoOffBoxSymbolization(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	goSrc := "./workloads/go/cpu_bound"
+	if _, err := os.Stat(goSrc); err != nil {
+		t.Skipf("go workload not built (run make test-workloads): %v", err)
+	}
+	// Sanity: confirm the source binary has DWARF — otherwise the test
+	// would silently pass for the wrong reason.
+	if !elfHasSection(t, goSrc, ".debug_info") {
+		t.Skipf("go workload at %s has no .debug_info; rebuild without -ldflags='-w'", goSrc)
+	}
+
+	buildID, _ := uploadDebug(t, goSrc)
+	stripped := filepath.Join(worktreeTmp, "go-cpu-bound-stripped")
+	stripWorkload(t, goSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+	// main.main is always present in a Go binary; cpu_bound's worker
+	// loop is typically in main.cpuWork or main.run — accept either.
+	wantAny := []string{"main.main", "main.cpuWork", "main.run", "main.worker"}
+	found := false
+	for _, w := range wantAny {
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no Go user-side function found in stripped pprof; got: %v", sortedKeys(got))
+	}
+}
+
+// elfHasSection reports whether the ELF at path has a non-empty section
+// with the given name. Used as a guard before tests that depend on DWARF
+// being present in a fixture binary.
+func elfHasSection(t *testing.T, path, name string) bool {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	sec := f.Section(name)
+	return sec != nil && sec.Size > 0
 }

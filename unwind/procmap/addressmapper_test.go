@@ -112,3 +112,36 @@ func TestAddressMapperPageAlignment(t *testing.T) {
 	}
 }
 
+func TestAddressMapperZeroOffset(t *testing.T) {
+	tmp := t.TempDir()
+	// p_offset=0 is the common case for single-segment static binaries and PIE
+	// text segments. The page-align math (0 &^ 0xfff == 0) handles it correctly;
+	// this test makes that coverage explicit.
+	path := writeMinimalELF(t, tmp, 0x0, 0x400000, 0x1000)
+
+	m, err := NewAddressMapper(path)
+	if err != nil {
+		t.Fatalf("NewAddressMapper: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		off  uint64
+		want uint64
+		ok   bool
+	}{
+		{"start of segment", 0x0, 0x400000, true},
+		{"middle of segment", 0x500, 0x400500, true},
+		{"past end of segment", 0x1000, 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := m.FileOffsetToVirtualAddress(tc.off)
+			if ok != tc.ok || got != tc.want {
+				t.Errorf("FileOffsetToVirtualAddress(%#x) = (%#x, %v), want (%#x, %v)",
+					tc.off, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+

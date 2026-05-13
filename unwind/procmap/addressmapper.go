@@ -1,6 +1,7 @@
 package procmap
 
 import (
+	"cmp"
 	"debug/elf"
 	"fmt"
 	"os"
@@ -59,13 +60,7 @@ func NewAddressMapper(path string) (*AddressMapper, error) {
 		})
 	}
 	slices.SortFunc(loads, func(a, b ptLoad) int {
-		if a.Off < b.Off {
-			return -1
-		}
-		if a.Off > b.Off {
-			return 1
-		}
-		return 0
+		return cmp.Compare(a.Off, b.Off)
 	})
 	return &AddressMapper{pageSize: pageSize, loads: loads}, nil
 }

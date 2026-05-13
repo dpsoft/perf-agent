@@ -1,10 +1,12 @@
 package debuginfod
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
@@ -64,4 +66,95 @@ func TestClassifierTier2ProcessMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassifierTier3FileModeCacheHit(t *testing.T) {
+	tmp := t.TempDir()
+	buildIDHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	binPath := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "exe"), buildIDHex)
+
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+	cc := &cache.Cache{Dir: cacheDir, Index: idx}
+
+	// Stage a fake .debug at the cache's .build-id layout.
+	debugDir := filepath.Join(cacheDir, ".build-id", buildIDHex[:2])
+	if err := os.MkdirAll(debugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	debugPath := filepath.Join(debugDir, buildIDHex[2:]+".debug")
+	if err := os.WriteFile(debugPath, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Touch(buildIDHex, cache.KindDebuginfo, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClassifier(cc, nil) // no fetcher needed — cache hit
+	got := c.classify(t.Context(), procmap.Mapping{Path: binPath})
+	if got.route != routeFileMode {
+		t.Errorf("route = %v, want routeFileMode", got.route)
+	}
+	if got.debugPath != debugPath {
+		t.Errorf("debugPath = %q, want %q", got.debugPath, debugPath)
+	}
+}
+
+func TestClassifierBadDebugFiltersCacheCopy(t *testing.T) {
+	tmp := t.TempDir()
+	buildIDHex := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	binPath := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "exe"), buildIDHex)
+
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+	cc := &cache.Cache{Dir: cacheDir, Index: idx}
+
+	debugDir := filepath.Join(cacheDir, ".build-id", buildIDHex[:2])
+	if err := os.MkdirAll(debugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	debugPath := filepath.Join(debugDir, buildIDHex[2:]+".debug")
+	if err := os.WriteFile(debugPath, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Touch(buildIDHex, cache.KindDebuginfo, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClassifier(cc, nil)
+	// Mark the cached file as bad via its signature.
+	sig, err := statSig(debugPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.markBadDebug(sig)
+
+	got := c.classify(t.Context(), procmap.Mapping{Path: binPath})
+	if got.route != routeProcessMode {
+		t.Errorf("route with badDebug-blocked cache and no other candidate = %v, want routeProcessMode", got.route)
+	}
+}
+
+// writeStrippedELFWithBuildID writes an ELF with .note.gnu.build-id (decoded
+// from hex) but no .debug_info, no .gnu_debuglink, no .symtab.
+func writeStrippedELFWithBuildID(t *testing.T, path, buildIDHex string) string {
+	t.Helper()
+	buildID, err := hex.DecodeString(buildIDHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeELFWithNoteGnuBuildID(path, buildID); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

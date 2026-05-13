@@ -50,6 +50,7 @@ type classifyResult struct {
 type classifier struct {
 	cache   *cache.Cache
 	fetcher *singleflightFetcher
+	stats   *atomicStats
 
 	// systemDebugRoot is the directory blazesym would walk for build-id-
 	// keyed debug files. Defaults to "/usr/lib/debug/.build-id" (the
@@ -85,10 +86,11 @@ const (
 // backing ELF; we drop them at Tier 1.
 var nonSymbolizablePaths = []string{"", "[vdso]", "[stack]", "[vsyscall]", "[heap]"}
 
-func newClassifier(c *cache.Cache, f *singleflightFetcher) *classifier {
+func newClassifier(c *cache.Cache, f *singleflightFetcher, st *atomicStats) *classifier {
 	return &classifier{
 		cache:           c,
 		fetcher:         f,
+		stats:           st,
 		systemDebugRoot: "/usr/lib/debug/.build-id",
 		mappers:         make(map[mapperKey]*procmap.AddressMapper),
 		negFetch:        make(map[string]time.Time),
@@ -148,6 +150,9 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		if c.isBadDebug(sig) {
 			continue
 		}
+		if c.stats != nil {
+			c.stats.fileModeLocalHits.Add(1)
+		}
 		return classifyResult{route: routeFileMode, debugPath: p}
 	}
 
@@ -160,6 +165,9 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 	abs, err := c.fetcher.fetchAndStore(ctx, "debuginfo", buildID)
 	if err != nil {
 		c.markNegFetch(buildID)
+		if c.stats != nil {
+			c.stats.fileModeFetchFails.Add(1)
+		}
 		return classifyResult{route: routeProcessMode}
 	}
 

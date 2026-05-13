@@ -15,6 +15,7 @@ type Stats struct {
 	ClassifyProcessMode, ClassifyFileMode, ClassifySkipped uint64
 	// File-mode outcomes.
 	FileModeCalls, FileModeParseFails uint64
+	FileModeFetchFails, FileModeLocalHits uint64
 	// AddressMapper miss for an individual IP.
 	NormalizationFails uint64
 }
@@ -31,6 +32,7 @@ type atomicStats struct {
 	classifyProcessMode, classifyFileMode, classifySkipped atomic.Uint64
 	// File-mode outcomes.
 	fileModeCalls, fileModeParseFails atomic.Uint64
+	fileModeFetchFails, fileModeLocalHits atomic.Uint64
 	// AddressMapper miss for an individual IP.
 	normalizationFails atomic.Uint64
 }
@@ -54,6 +56,8 @@ func (a *atomicStats) snapshot() Stats {
 		ClassifySkipped:        a.classifySkipped.Load(),
 		FileModeCalls:          a.fileModeCalls.Load(),
 		FileModeParseFails:     a.fileModeParseFails.Load(),
+		FileModeFetchFails:     a.fileModeFetchFails.Load(),
+		FileModeLocalHits:      a.fileModeLocalHits.Load(),
 		NormalizationFails:     a.normalizationFails.Load(),
 	}
 }

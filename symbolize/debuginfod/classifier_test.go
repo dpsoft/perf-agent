@@ -11,7 +11,7 @@ import (
 )
 
 func TestClassifierSkipPaths(t *testing.T) {
-	c := newClassifier(nil /* cache unused for skip-path tests */, nil /* fetcher unused */)
+	c := newClassifier(nil /* cache unused for skip-path tests */, nil /* fetcher unused */, &atomicStats{})
 	skipPaths := []string{"", "[vdso]", "[stack]", "[vsyscall]", "[heap]"}
 	for _, p := range skipPaths {
 		t.Run(p, func(t *testing.T) {
@@ -48,7 +48,7 @@ func TestClassifierTier2ProcessMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := newClassifier(nil, nil)
+	c := newClassifier(nil, nil, &atomicStats{})
 	cases := []struct {
 		name string
 		m    procmap.Mapping
@@ -95,7 +95,7 @@ func TestClassifierTier3FileModeCacheHit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := newClassifier(cc, nil) // no fetcher needed — cache hit
+	c := newClassifier(cc, nil, &atomicStats{}) // no fetcher needed — cache hit
 	got := c.classify(t.Context(), procmap.Mapping{Path: binPath})
 	if got.route != routeFileMode {
 		t.Errorf("route = %v, want routeFileMode", got.route)
@@ -131,7 +131,7 @@ func TestClassifierBadDebugFiltersCacheCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := newClassifier(cc, nil)
+	c := newClassifier(cc, nil, &atomicStats{})
 	// Mark the cached file as bad via its signature.
 	sig, err := statSig(debugPath)
 	if err != nil {
@@ -188,7 +188,7 @@ func TestClassifierBadDebugSkipsToSiblingCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := newClassifier(cc, nil)
+	c := newClassifier(cc, nil, &atomicStats{})
 	c.systemDebugRoot = sysRoot // override the hardcoded path
 
 	// Mark the FIRST candidate (sysDebug) as bad. Loop must skip it and

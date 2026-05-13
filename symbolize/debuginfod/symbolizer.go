@@ -56,13 +56,13 @@ func New(opts Options) (*Symbolizer, error) {
 	sfConcrete := newSingleflightFetcher(f, c)
 
 	s := &Symbolizer{
-		opts:       opts,
-		cache:      c,
-		fetcher:    f,
-		sf:         sfConcrete,
-		resolver:   opts.Resolver,
-		classifier: newClassifier(c, sfConcrete),
+		opts:     opts,
+		cache:    c,
+		fetcher:  f,
+		sf:       sfConcrete,
+		resolver: opts.Resolver,
 	}
+	s.classifier = newClassifier(c, sfConcrete, &s.stats)
 	st, err := newCgoState(s)
 	if err != nil {
 		_ = c.Close()

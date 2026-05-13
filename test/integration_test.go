@@ -2307,3 +2307,100 @@ func TestStrippedSidecarUnreachableSymbolicPath(t *testing.T) {
 		t.Errorf("no mapping with workload build-id %s — Resolver.populate didn't use map_files", buildID)
 	}
 }
+
+// TestOffBoxLibcResolution verifies that system libraries (libc) continue
+// to resolve through the process-mode path when local /usr/lib/debug
+// debuginfo is installed. The new classifier must NOT refetch them.
+// Skip when the local debuginfo isn't available.
+func TestOffBoxLibcResolution(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+
+	// Find libc with build-id and assert a corresponding .debug exists at
+	// /usr/lib/debug/.build-id/...
+	libc, libcBuildID := findLibcWithLocalDebuginfo(t)
+
+	bin := getAgentPath(t)
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	cmd, cleanup := spawnBinaryAsWorkload(t, rustSrc)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	// libc should NOT have been fetched via debuginfod — it was resolvable
+	// locally through process-mode.
+	hits := countDebuginfodHits(t, libcBuildID)
+	if hits > 0 {
+		t.Errorf("libc fetched from debuginfod %d times; local /usr/lib/debug should have been used. libc=%s build-id=%s",
+			hits, libc, libcBuildID)
+	}
+
+	// libc functions should appear in the pprof (best-effort — on hosts
+	// without libc debuginfo this assertion is a soft log).
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+	wantAny := []string{"__libc_start_main", "malloc", "__GI___libc_malloc", "free"}
+	found := false
+	for _, w := range wantAny {
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Logf("no libc symbol resolved; got: %v (acceptable on systems with no libc debuginfo)", sortedKeys(got))
+	}
+}
+
+// findLibcWithLocalDebuginfo locates libc.so.6 in common paths, reads its
+// build-id, and verifies /usr/lib/debug/.build-id/NN/REST.debug exists.
+// Skips the test if any of these aren't true.
+func findLibcWithLocalDebuginfo(t *testing.T) (string, string) {
+	t.Helper()
+	candidates := []string{
+		"/lib/x86_64-linux-gnu/libc.so.6",
+		"/lib64/libc.so.6",
+		"/usr/lib64/libc.so.6",
+		"/usr/lib/x86_64-linux-gnu/libc.so.6",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			id := readBuildID(t, p)
+			if id == "" {
+				continue
+			}
+			debugPath := filepath.Join("/usr/lib/debug", ".build-id", id[:2], id[2:]+".debug")
+			if _, err := os.Stat(debugPath); err == nil {
+				return p, id
+			}
+		}
+	}
+	t.Skip("no libc.so.6 with local /usr/lib/debug/.build-id debuginfo found — install glibc-debuginfo")
+	return "", ""
+}

@@ -23,10 +23,15 @@ type AddressMapper struct {
 	loads    []ptLoad
 }
 
+// ptLoad mirrors OTel's addressMapperPHDR: stores the raw PHDR fields
+// (p_offset, p_vaddr, p_filesz) exactly as the ELF declares them. Page
+// alignment is applied lazily inside FileOffsetToVirtualAddress so the
+// lookup math works for both the un-aligned p_offset itself and any
+// offset down to its page-aligned floor.
 type ptLoad struct {
-	Off    uint64 // p_offset (page-aligned by NewAddressMapper)
-	Vaddr  uint64 // p_vaddr
-	Filesz uint64 // p_filesz
+	Off    uint64 // p_offset (raw)
+	Vaddr  uint64 // p_vaddr  (raw)
+	Filesz uint64 // p_filesz (raw)
 }
 
 // NewAddressMapper reads PHDRs from the ELF at path and returns a mapper
@@ -49,14 +54,11 @@ func NewAddressMapper(path string) (*AddressMapper, error) {
 		if p.Flags&elf.PF_X == 0 {
 			continue // only executable segments matter for symbolization
 		}
-		// OTel's correctness fix: page-align p_offset DOWN to mirror
-		// kernel mmap alignment. Without this, offsets near segment
-		// starts get misattributed.
-		aligned := p.Off &^ (pageSize - 1)
+		// Store raw PHDR fields — alignment is handled at lookup time.
 		loads = append(loads, ptLoad{
-			Off:    aligned,
+			Off:    p.Off,
 			Vaddr:  p.Vaddr,
-			Filesz: p.Filesz + (p.Off - aligned),
+			Filesz: p.Filesz,
 		})
 	}
 	slices.SortFunc(loads, func(a, b ptLoad) int {
@@ -67,10 +69,30 @@ func NewAddressMapper(path string) (*AddressMapper, error) {
 
 // FileOffsetToVirtualAddress maps a file offset to its ELF virtual address.
 // Returns (0, false) if the offset is outside every executable PT_LOAD.
+//
+// The accepted range is [alignedOffset, p.offset+p.filesz) where
+// alignedOffset = p.offset &^ (pageSize-1). The asymmetric bounds mirror
+// what the kernel does at mmap time: it rounds p_offset DOWN to a page
+// boundary when creating the mapping, so file offsets in the pre-segment
+// padding [alignedOffset, p.offset) are part of the live mapping even
+// though they precede the declared start. The upper bound stays at the
+// declared end so we don't claim bytes past p_filesz.
+//
+// The math vaddr + (off - p.offset) (equivalent to vaddr - (p.offset - off))
+// reproduces the correct virtual address for every offset in that range:
+//   - off == p.offset           → vaddr (un-aligned start maps to un-aligned VA)
+//   - off == alignedOffset      → vaddr - (p.offset - alignedOffset)
+//   - off in (p.offset, end)    → vaddr + positive delta
+//
+// Note: for off < p.Off the subexpression (off - p.Off) wraps under
+// uint64 arithmetic; the wrap cancels when added to p.Vaddr, leaving
+// the correct VA modulo 2^64 (which is what an address is).
 func (m *AddressMapper) FileOffsetToVirtualAddress(off uint64) (uint64, bool) {
-	for _, l := range m.loads {
-		if off >= l.Off && off < l.Off+l.Filesz {
-			return l.Vaddr + (off - l.Off), true
+	pageMask := m.pageSize - 1
+	for _, p := range m.loads {
+		alignedOffset := p.Off &^ pageMask
+		if off >= alignedOffset && off < p.Off+p.Filesz {
+			return p.Vaddr + (off - p.Off), true
 		}
 	}
 	return 0, false

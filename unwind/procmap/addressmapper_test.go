@@ -100,16 +100,69 @@ func TestAddressMapperPageAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAddressMapper: %v", err)
 	}
-	// page-aligned start of the segment is 0x1000 (0x1234 &^ 0xfff)
-	got, ok := m.FileOffsetToVirtualAddress(0x1000)
-	if !ok {
-		t.Fatalf("FileOffsetToVirtualAddress(0x1000) ok=false, want true (page-align should include this offset)")
+
+	t.Run("page-aligned start maps to vaddr - delta", func(t *testing.T) {
+		// page-aligned start of the segment is 0x1000 (0x1234 &^ 0xfff).
+		// The correct math is vaddr + (off - p.Off) = vaddr - (p.Off - off)
+		// = 0x400000 - 0x234 = 0x3FFDCC. The previous (buggy) port returned
+		// 0x400000 here, which mis-resolved samples by `delta` bytes.
+		got, ok := m.FileOffsetToVirtualAddress(0x1000)
+		if !ok {
+			t.Fatalf("FileOffsetToVirtualAddress(0x1000) ok=false, want true (page-align should include this offset)")
+		}
+		if got != 0x3FFDCC {
+			t.Errorf("FileOffsetToVirtualAddress(0x1000) = %#x, want %#x", got, 0x3FFDCC)
+		}
+	})
+
+	t.Run("un-aligned p_offset maps to un-aligned p_vaddr", func(t *testing.T) {
+		// off == p.Off, so the delta is zero and VA equals p.Vaddr unchanged.
+		got, ok := m.FileOffsetToVirtualAddress(0x1234)
+		if !ok {
+			t.Fatalf("FileOffsetToVirtualAddress(0x1234) ok=false, want true")
+		}
+		if got != 0x400000 {
+			t.Errorf("FileOffsetToVirtualAddress(0x1234) = %#x, want %#x", got, 0x400000)
+		}
+	})
+}
+
+// TestAddressMapperPIEWithNonPageAlignedOffset reproduces the actual layout
+// of a Rust release-build PIE binary: p_offset=0x16ec0 (not page-aligned),
+// p_vaddr=0x17ec0, p_filesz=0x47460. This is the exact case that broke the
+// integration tests — the kernel mmap()'s the segment starting at the
+// page-aligned floor 0x16000 (file) → 0x17000 (VA), so a sampled file
+// offset of 0x16000 must resolve to VA 0x17000 (= p_vaddr - delta), and
+// an offset of 0x16ec0 must resolve to VA 0x17ec0 (= p_vaddr).
+func TestAddressMapperPIEWithNonPageAlignedOffset(t *testing.T) {
+	tmp := t.TempDir()
+	path := writeMinimalELFType(t, tmp, elf.ET_DYN, 0x16ec0, 0x17ec0, 0x47460)
+
+	m, err := NewAddressMapper(path)
+	if err != nil {
+		t.Fatalf("NewAddressMapper: %v", err)
 	}
-	// The mapping from off=0x1000 (page-aligned start) follows the same
-	// arithmetic OTel uses: vaddr + (off - off_aligned). When the requested
-	// offset equals off_aligned, the returned VA equals vaddr.
-	if got != 0x400000 {
-		t.Errorf("FileOffsetToVirtualAddress(0x1000) = %#x, want %#x", got, 0x400000)
+
+	tests := []struct {
+		name string
+		off  uint64
+		want uint64
+		ok   bool
+	}{
+		{"un-aligned start (off == p.Off)", 0x16ec0, 0x17ec0, true},
+		{"page-aligned start (off == aligned)", 0x16000, 0x17000, true},
+		{"interior page-aligned offset", 0x18000, 0x19000, true},
+		{"last byte of segment", 0x16ec0 + 0x47460 - 1, 0x5F31F, true},
+		{"past end of segment", 0x16ec0 + 0x47460, 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := m.FileOffsetToVirtualAddress(tc.off)
+			if ok != tc.ok || got != tc.want {
+				t.Errorf("FileOffsetToVirtualAddress(%#x) = (%#x, %v), want (%#x, %v)",
+					tc.off, got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }
 

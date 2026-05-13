@@ -1797,3 +1797,106 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestStrippedRustOffBoxSymbolization verifies off-box symbolization for a
+// stripped Rust release binary with build-id only (no .gnu_debuglink).
+// Without the debuginfod cache layout fix, the user-side function names
+// would be missing from the resulting pprof.
+func TestStrippedRustOffBoxSymbolization(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	agentBin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built (run make test-workloads): %v", err)
+	}
+
+	// Upload .debug from the unstripped binary, then strip a copy.
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(agentBin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+
+	want := []string{
+		"rust_workload::cpu_intensive_work",
+		"core::num::<impl u64>::wrapping_add",
+	}
+	for _, w := range want {
+		found := false
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing expected symbol %q in stripped pprof; got: %v", w, sortedKeys(got))
+		}
+	}
+}
+
+// requireDebuginfodContainer skips the test unless the local debuginfod
+// docker container is running on localhost:8002.
+func requireDebuginfodContainer(t *testing.T) {
+	t.Helper()
+	cmd := exec.Command("curl", "-fsS", "-o", "/dev/null", "http://localhost:8002/metrics")
+	if err := cmd.Run(); err != nil {
+		t.Skip("debuginfod container not running on localhost:8002 (run: cd test/debuginfod && docker compose up -d)")
+	}
+}
+
+// requireTool skips the test when the named CLI tool is not on PATH.
+func requireTool(t *testing.T, tool string) {
+	t.Helper()
+	if _, err := exec.LookPath(tool); err != nil {
+		t.Skipf("%s not on PATH", tool)
+	}
+}
+
+// spawnBinaryAsWorkload starts the binary and returns the running command.
+// Caller MUST call cleanup() to kill+wait the process. The binary is
+// expected to be CPU-bound for at least 15s.
+func spawnBinaryAsWorkload(t *testing.T, bin string) (*exec.Cmd, func()) {
+	t.Helper()
+	cmd := exec.Command(bin)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", bin, err)
+	}
+	// Give it 0.5s to set up worker threads.
+	time.Sleep(500 * time.Millisecond)
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	return cmd, cleanup
+}

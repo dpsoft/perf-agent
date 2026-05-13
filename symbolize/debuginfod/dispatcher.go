@@ -216,15 +216,25 @@ func (s *Symbolizer) dispatchWithBuildID(ctx context.Context, symbolicPath, buil
 		return ""
 	}
 
-	// Case 3: binary on disk, no DWARF locally → fetch /debuginfo into
-	// the build-id cache; blazesym will find it via debug_dirs.
+	// Case 3: binary on disk, no DWARF locally, no resolvable debug-link.
+	// In the v1.1.0 design this branch fetched the .debug file and let
+	// blazesym find it via debug_dirs. That never worked — blazesym's
+	// split-debug lookup is gated on .gnu_debuglink, which most stripped
+	// Rust/Go release builds lack. File-mode routing in the classifier
+	// owns this case now.
+	//
+	// If we reach this branch, one of two things happened:
+	//   (a) The mapping was demoted from file-mode after a fetch or parse
+	//       failure. Process-mode is the correct fail-open: blazesym
+	//       emits [binary]:offset, identical to v1.1.0 behavior.
+	//   (b) Process-mode found a build-id-only mapping that the classifier
+	//       didn't pre-route (rare, transient race during a /proc/maps
+	//       snapshot change). Same outcome.
+	//
+	// Either way: no fetch, no panic. Return "" so blazesym uses its
+	// defaults.
 	if binaryReadable(symbolicPath) {
-		s.stats.cacheMisses.Add(1)
-		if _, err := s.sf.fetchAndStore(ctx, "debuginfo", buildID); err != nil {
-			s.recordFetchErr(err)
-		} else {
-			s.stats.fetchSuccessDebuginfo.Add(1)
-		}
+		s.stats.dispatcherSkippedLocal.Add(1)
 		return ""
 	}
 

@@ -1,6 +1,7 @@
 package debuginfod
 
 import (
+	"context"
 	"debug/elf"
 	"net/http"
 	"net/http/httptest"
@@ -8,7 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
 )
 
 func newTestSymbolizer(t *testing.T, urls []string) *Symbolizer {
@@ -154,4 +158,52 @@ func pickResolvableSymbol(t *testing.T, debugPath string) (uint64, string) {
 	}
 	t.Skip("no usable symbol in fixture")
 	return 0, ""
+}
+
+// fakesfFetcher implements sfFetcher for tests, counting fetchAndStore calls.
+type fakesfFetcher struct {
+	fetch func(ctx context.Context, kindStr, buildID string) (string, error)
+}
+
+func (f *fakesfFetcher) fetchAndStore(ctx context.Context, kindStr, buildID string) (string, error) {
+	return f.fetch(ctx, kindStr, buildID)
+}
+
+func TestDispatcherCase3ReturnsEmptyNoFetch(t *testing.T) {
+	// After the Case 3 reframe, the dispatcher must NOT invoke the fetcher
+	// for a stripped binary (build-id present, no DWARF, no debug-link).
+	// File-mode routing in the classifier owns the fetch decision now.
+	tmp := t.TempDir()
+	buildIDHex := strings.Repeat("c", 40) // 40 hex chars — exactly one build-id
+	binPath := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "exe"), buildIDHex)
+
+	var fetchCount atomic.Int64
+	fakeFetcher := &fakesfFetcher{
+		fetch: func(_ context.Context, kind, buildID string) (string, error) {
+			fetchCount.Add(1)
+			return "", nil
+		},
+	}
+
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+
+	s := &Symbolizer{
+		opts:  Options{CacheDir: cacheDir},
+		cache: &cache.Cache{Dir: cacheDir, Index: idx},
+		sf:    fakeFetcher,
+	}
+
+	got := s.dispatchWithBuildID(t.Context(), binPath, buildIDHex)
+	if got != "" {
+		t.Errorf("Case 3 dispatch returned %q, want \"\" (no-fetch fallback)", got)
+	}
+	if n := fetchCount.Load(); n != 0 {
+		t.Errorf("Case 3 dispatch made %d fetch call(s), want 0", n)
+	}
 }

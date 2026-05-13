@@ -15,6 +15,13 @@ type storer interface {
 	Evict() error
 }
 
+// sfFetcher is the minimal contract needed by the dispatcher to fetch a
+// build-id-keyed artifact. Tests provide an implementation that counts
+// calls; production uses *singleflightFetcher.
+type sfFetcher interface {
+	fetchAndStore(ctx context.Context, kindStr, buildID string) (string, error)
+}
+
 type singleflightFetcher struct {
 	upstream *fetcher
 	cache    storer

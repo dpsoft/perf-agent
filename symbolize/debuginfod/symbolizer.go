@@ -18,7 +18,7 @@ type Symbolizer struct {
 	opts     Options
 	cache    *cache.Cache
 	fetcher  *fetcher
-	sf       *singleflightFetcher
+	sf       sfFetcher
 	cgo      *cgoState
 	stats    atomicStats
 	closed   atomic.Bool

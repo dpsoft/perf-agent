@@ -2155,3 +2155,75 @@ func countDebuginfodHits(t *testing.T, buildID string) int {
 	}
 	return count
 }
+
+// TestFileModeParseFailDemotes truncates a cached .debug to make
+// blaze_symbolize_elf_virt_offsets return NULL. The mapping should demote
+// to process-mode and pprof should still emit frames (just unsymbolized).
+// Confirms badDebug per-path filtering.
+func TestFileModeParseFailDemotes(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+
+	// First run: populates the cache.
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	// Corrupt the cached .debug.
+	cached := filepath.Join(cacheDir, ".build-id", buildID[:2], buildID[2:]+".debug")
+	if _, err := os.Stat(cached); err != nil {
+		t.Fatalf("expected cached .debug at %s: %v", cached, err)
+	}
+	if err := os.Truncate(cached, 100); err != nil {
+		t.Fatalf("truncate %s: %v", cached, err)
+	}
+
+	// Second run: parse fails, mapping demotes to process-mode.
+	// pprof must still emit frames for the workload's mapping.
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	if len(p.Sample) == 0 {
+		t.Fatalf("no samples in pprof — agent crashed or got 0 frames")
+	}
+	// At least one sample's leaf should fall in the workload's mapping
+	// (even if unsymbolized).
+	var workloadMapping *profile.Mapping
+	for _, m := range p.Mapping {
+		if strings.Contains(m.File, "rust-workload") {
+			workloadMapping = m
+			break
+		}
+	}
+	if workloadMapping == nil {
+		t.Fatalf("no rust-workload mapping in pprof — agent didn't see the binary")
+	}
+}

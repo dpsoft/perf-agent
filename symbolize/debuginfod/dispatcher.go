@@ -377,17 +377,18 @@ func (st *cgoState) symbolizeElfVirt(path string, originalIPs, virtOffsets []uin
 	defer C.blaze_syms_free(syms)
 
 	cnt := int(syms.cnt)
+	if cnt != len(virtOffsets) {
+		return nil, fmt.Errorf("debuginfod: blazesym returned %d frames for %d virt-offsets",
+			cnt, len(virtOffsets))
+	}
 	out := make([]symbolize.Frame, 0, cnt)
 	for i := range cnt {
 		csym := C.sym_at(syms, C.size_t(i))
 		// Pass originalIPs[i] as the Frame.Address — frameFromCSym writes
 		// it onto both the leaf frame AND every inlined chain entry, so
 		// pprof's mapping resolver sees the process PC, not the file-VA.
-		var addr uint64
-		if i < len(originalIPs) {
-			addr = originalIPs[i]
-		}
-		out = append(out, frameFromCSym(csym, addr))
+		f := frameFromCSym(csym, originalIPs[i])
+		out = append(out, f)
 	}
 	return out, nil
 }

@@ -145,6 +145,69 @@ func TestClassifierBadDebugFiltersCacheCopy(t *testing.T) {
 	}
 }
 
+// TestClassifierBadDebugSkipsToSiblingCandidate proves the core Tier 3
+// invariant: badDebug is keyed by per-path signature, so a corrupt
+// candidate does NOT block a valid sibling for the same build-id.
+// Without the loop continuing past the bad entry, this test fails.
+func TestClassifierBadDebugSkipsToSiblingCandidate(t *testing.T) {
+	tmp := t.TempDir()
+	buildIDHex := "cccccccccccccccccccccccccccccccccccccccc"
+	binPath := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "exe"), buildIDHex)
+
+	// Set up a fake "system" debug root in a temp dir and place a valid
+	// .debug there. This is candidate #1 (preferred).
+	sysRoot := t.TempDir()
+	sysDir := filepath.Join(sysRoot, buildIDHex[:2])
+	if err := os.MkdirAll(sysDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sysDebug := filepath.Join(sysDir, buildIDHex[2:]+".debug")
+	if err := os.WriteFile(sysDebug, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up the cache with a SECOND .debug. This is candidate #2.
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+	cc := &cache.Cache{Dir: cacheDir, Index: idx}
+
+	debugDir := filepath.Join(cacheDir, ".build-id", buildIDHex[:2])
+	if err := os.MkdirAll(debugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cacheDebug := filepath.Join(debugDir, buildIDHex[2:]+".debug")
+	if err := os.WriteFile(cacheDebug, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Touch(buildIDHex, cache.KindDebuginfo, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClassifier(cc, nil)
+	c.systemDebugRoot = sysRoot // override the hardcoded path
+
+	// Mark the FIRST candidate (sysDebug) as bad. Loop must skip it and
+	// return the SECOND candidate (cacheDebug).
+	sig, err := statSig(sysDebug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.markBadDebug(sig)
+
+	got := c.classify(t.Context(), procmap.Mapping{Path: binPath})
+	if got.route != routeFileMode {
+		t.Fatalf("route = %v, want routeFileMode", got.route)
+	}
+	if got.debugPath != cacheDebug {
+		t.Errorf("debugPath = %q, want %q (the cache sibling — first candidate was badDebug)", got.debugPath, cacheDebug)
+	}
+}
+
 // writeStrippedELFWithBuildID writes an ELF with .note.gnu.build-id (decoded
 // from hex) but no .debug_info, no .gnu_debuglink, no .symtab.
 func writeStrippedELFWithBuildID(t *testing.T, path, buildIDHex string) string {

@@ -2,7 +2,7 @@ package debuginfod
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -50,6 +50,11 @@ type classifier struct {
 	cache   *cache.Cache
 	fetcher *singleflightFetcher
 
+	// systemDebugRoot is the directory blazesym would walk for build-id-
+	// keyed debug files. Defaults to "/usr/lib/debug/.build-id" (the
+	// elfutils standard). Tests override it via newClassifierForTest.
+	systemDebugRoot string
+
 	mu       sync.Mutex
 	mappers  map[mapperKey]*procmap.AddressMapper
 	negFetch map[string]time.Time  // build-id → deadline (don't re-fetch)
@@ -81,11 +86,12 @@ var nonSymbolizablePaths = []string{"", "[vdso]", "[stack]", "[vsyscall]", "[hea
 
 func newClassifier(c *cache.Cache, f *singleflightFetcher) *classifier {
 	return &classifier{
-		cache:    c,
-		fetcher:  f,
-		mappers:  make(map[mapperKey]*procmap.AddressMapper),
-		negFetch: make(map[string]time.Time),
-		badDebug: make(map[pathSig]time.Time),
+		cache:           c,
+		fetcher:         f,
+		systemDebugRoot: "/usr/lib/debug/.build-id",
+		mappers:         make(map[mapperKey]*procmap.AddressMapper),
+		negFetch:        make(map[string]time.Time),
+		badDebug:        make(map[pathSig]time.Time),
 	}
 }
 
@@ -123,7 +129,7 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 
 	// 3a: collect local candidate paths (no network).
 	candidates := make([]string, 0, 2)
-	if sys := systemDebugPath(buildID); sys != "" {
+	if sys := c.systemDebugPath(buildID); sys != "" {
 		candidates = append(candidates, sys)
 	}
 	if c.cache != nil && c.cache.Has(buildID, cache.KindDebuginfo) {
@@ -165,14 +171,13 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 	return classifyResult{route: routeFileMode, debugPath: abs}
 }
 
-// systemDebugPath returns the elfutils-standard /usr/lib/debug location for
-// a given build-id. Returns "" if buildID is too short to split or the
-// path doesn't exist.
-func systemDebugPath(buildID string) string {
+// systemDebugPath returns the elfutils-standard split-debug path for
+// buildID under c.systemDebugRoot, or "" if absent.
+func (c *classifier) systemDebugPath(buildID string) string {
 	if len(buildID) < 4 {
 		return ""
 	}
-	candidate := filepath.Join("/usr/lib/debug", ".build-id", buildID[:2], buildID[2:]+".debug")
+	candidate := filepath.Join(c.systemDebugRoot, buildID[:2], buildID[2:]+".debug")
 	if _, err := os.Stat(candidate); err != nil {
 		return ""
 	}
@@ -187,7 +192,7 @@ func statSig(path string) (pathSig, error) {
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return pathSig{}, errors.New("classifier: stat: not a *syscall.Stat_t")
+		return pathSig{}, fmt.Errorf("classifier: stat %s: not a *syscall.Stat_t", path)
 	}
 	return pathSig{
 		dev:   uint64(st.Dev),

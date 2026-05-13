@@ -142,8 +142,6 @@ func (r *Resolver) attachBuildIDs(mappings []Mapping) {
 		if mappings[i].BuildID != "" {
 			continue // already attached
 		}
-		// Try MapFiles first (works across mount namespaces, survives
-		// unlinked binaries). Fall back to symbolic Path.
 		if p := mappings[i].MapFiles; p != "" {
 			if id := r.buildIDFor(p); id != "" {
 				mappings[i].BuildID = id

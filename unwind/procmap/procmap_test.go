@@ -14,9 +14,18 @@ func TestParseMapsFile(t *testing.T) {
 		t.Fatalf("parseMapsFile: %v", err)
 	}
 
+	mapFilesDir := filepath.Join("testdata", "proc", "4242", "map_files")
 	want := []Mapping{
-		{Path: "/usr/bin/target", Start: 0x00400000, Limit: 0x00420000, Offset: 0x1000, IsExec: true},
-		{Path: "/lib/x86_64-linux-gnu/libc.so.6", Start: 0x7f0000001000, Limit: 0x7f0000100000, Offset: 0x2000, IsExec: true},
+		{
+			Path:     "/usr/bin/target",
+			MapFiles: filepath.Join(mapFilesDir, "400000-420000"),
+			Start:    0x00400000, Limit: 0x00420000, Offset: 0x1000, IsExec: true,
+		},
+		{
+			Path:     "/lib/x86_64-linux-gnu/libc.so.6",
+			MapFiles: filepath.Join(mapFilesDir, "7f0000001000-7f0000100000"),
+			Start:    0x7f0000001000, Limit: 0x7f0000100000, Offset: 0x2000, IsExec: true,
+		},
 	}
 
 	if len(got) != len(want) {
@@ -25,6 +34,52 @@ func TestParseMapsFile(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("mapping %d: got %#v, want %#v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseMapsFileMapFilesPopulated verifies that after parseMapsFile, each
+// returned Mapping.MapFiles is non-empty and resolves to the expected
+// /proc/<pid>/map_files/<startHex>-<limitHex> path.
+func TestParseMapsFileMapFilesPopulated(t *testing.T) {
+	// Build a fake /proc/<pid>/maps under a temp dir so we can verify the
+	// MapFiles path is constructed relative to that directory.
+	tmp := t.TempDir()
+	pidDir := filepath.Join(tmp, "1234")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const mapsContent = "00400000-00401000 r-xp 00000000 fd:01 111 /usr/bin/prog\n" +
+		"7f0000001000-7f0000002000 r-xp 00001000 fd:01 222 /lib/libfoo.so\n"
+	mapsPath := filepath.Join(pidDir, "maps")
+	if err := os.WriteFile(mapsPath, []byte(mapsContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parseMapsFile(mapsPath)
+	if err != nil {
+		t.Fatalf("parseMapsFile: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d mappings, want 2", len(got))
+	}
+
+	mapFilesDir := filepath.Join(pidDir, "map_files")
+	cases := []struct {
+		idx      int
+		wantPath string
+	}{
+		{0, filepath.Join(mapFilesDir, "400000-401000")},
+		{1, filepath.Join(mapFilesDir, "7f0000001000-7f0000002000")},
+	}
+	for _, tc := range cases {
+		m := got[tc.idx]
+		if m.MapFiles == "" {
+			t.Errorf("mapping[%d] MapFiles is empty, want %q", tc.idx, tc.wantPath)
+			continue
+		}
+		if m.MapFiles != tc.wantPath {
+			t.Errorf("mapping[%d] MapFiles = %q, want %q", tc.idx, m.MapFiles, tc.wantPath)
 		}
 	}
 }

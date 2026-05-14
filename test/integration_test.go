@@ -1169,7 +1169,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 		OuterMap: objs.CFIClassificationMap(), LengthMap: objs.CFIClassificationLengthsMap(),
 	}))
 
-	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, tableID)
+	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, "", tableID)
 	require.NoError(t, err)
 	require.NotEmpty(t, mappings, "no matching mappings in /proc/<pid>/maps")
 	require.NoError(t, ehmaps.PopulatePIDMappings(ehmaps.PopulatePIDMappingsArgs{
@@ -1409,7 +1409,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap())
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
-	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath))
+	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath, ""))
 
 	// Start the watcher BEFORE the dlopen fires. The 4s delay in the
 	// workload above gives us time to get here.

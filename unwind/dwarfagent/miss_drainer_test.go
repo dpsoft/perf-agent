@@ -35,7 +35,7 @@ func TestParseMissEvent_TooShort(t *testing.T) {
 
 func TestResolveBinaryByTableID_PIDGone(t *testing.T) {
 	// PID 99999999 is unlikely to exist.
-	_, err := resolveBinaryByTableID(99999999, 0xDEADBEEF)
+	_, _, err := resolveBinaryByTableID(99999999, 0xDEADBEEF)
 	if !errors.Is(err, ErrPIDGone) {
 		t.Errorf("err = %v, want ErrPIDGone", err)
 	}
@@ -44,7 +44,7 @@ func TestResolveBinaryByTableID_PIDGone(t *testing.T) {
 func TestResolveBinaryByTableID_TableNotMapped(t *testing.T) {
 	// The current process has /proc/self/maps; we ask for a tableID
 	// that no binary in our address space matches.
-	_, err := resolveBinaryByTableID(uint32(os.Getpid()), 0xFFFFFFFFFFFFFFFF)
+	_, _, err := resolveBinaryByTableID(uint32(os.Getpid()), 0xFFFFFFFFFFFFFFFF)
 	if !errors.Is(err, ErrTableNotMapped) {
 		t.Errorf("err = %v, want ErrTableNotMapped", err)
 	}

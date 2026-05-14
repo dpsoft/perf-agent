@@ -227,6 +227,65 @@ func TestSymbolizerSplitsBatchesByRoute(t *testing.T) {
 	// coverage of the router.
 }
 
+// TestClassifierUsesMapFilesWhenSymbolicPathDeleted verifies that the
+// classifier routes correctly when a mapping's symbolic path is unreachable
+// (deleted binary, sidecar / mount-namespace case) but MapFiles still points
+// at the live inode via /proc/<pid>/map_files/<va>-<va>.
+//
+// The DWARF unwinder in unwind/dwarfagent opens the binary by symbolic path at
+// attach time; that path may also be absent. Fixing that is a separate PR.
+// This test verifies the classifier's own concern: it reads the build-id via
+// MapFiles and routes the mapping to file-mode when a cached .debug exists.
+func TestClassifierUsesMapFilesWhenSymbolicPathDeleted(t *testing.T) {
+	tmp := t.TempDir()
+	buildIDHex := "dddddddddddddddddddddddddddddddddddddddd"
+
+	// Write a stripped ELF with a build-id to act as the "live binary" that
+	// would be reachable via /proc/<pid>/map_files/<range>.
+	mapFilesTarget := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "live-binary"), buildIDHex)
+
+	// Set up a cache with a .debug staged for the build-id.
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+	cc := &cache.Cache{Dir: cacheDir, Index: idx}
+
+	debugDir := filepath.Join(cacheDir, ".build-id", buildIDHex[:2])
+	if err := os.MkdirAll(debugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	debugPath := filepath.Join(debugDir, buildIDHex[2:]+".debug")
+	if err := os.WriteFile(debugPath, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Touch(buildIDHex, cache.KindDebuginfo, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClassifier(cc, nil, &atomicStats{})
+
+	// Construct a Mapping whose symbolic Path is unreachable (deleted binary)
+	// but whose MapFiles field points at the live inode — exactly what
+	// procmap.Parse produces when it sees " (deleted)" in /proc/<pid>/maps
+	// and resolves the map_files link successfully.
+	m := procmap.Mapping{
+		Path:     "/deleted/path/rust-workload",
+		MapFiles: mapFilesTarget, // the live file the kernel still has open
+	}
+
+	got := c.classify(t.Context(), m)
+	if got.route != routeFileMode {
+		t.Errorf("classify() route = %v, want routeFileMode (MapFiles provides build-id even though Path is deleted)", got.route)
+	}
+	if got.debugPath != debugPath {
+		t.Errorf("classify() debugPath = %q, want %q", got.debugPath, debugPath)
+	}
+}
+
 // writeStrippedELFWithBuildID writes an ELF with .note.gnu.build-id (decoded
 // from hex) but no .debug_info, no .gnu_debuglink, no .symtab.
 func writeStrippedELFWithBuildID(t *testing.T, path, buildIDHex string) string {

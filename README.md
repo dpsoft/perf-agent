@@ -85,15 +85,19 @@ env vars then add `pod_name` / `namespace` / `container_name` labels.
 
 ### 🔍 Stripped production binaries via off-box symbols
 
-Production builds usually strip debug info to keep images small. Point
-perf-agent at a `debuginfod`-protocol server with `--debuginfod-url=URL`
-and the agent fetches DWARF on demand, keyed by GNU build-id, and caches
-it on disk. Symbol resolution uses blazesym's `process_dispatch` hook —
-binaries already on disk get DWARF via the cache (no override), sidecar/missing
-binaries get the full ELF from the server.
+Production builds usually strip debug info. Point perf-agent at a
+`debuginfod`-protocol server with `--debuginfod-url=URL`. A per-mapping
+classifier routes each binary in the target:
 
-See [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md)
-for the dispatcher routing table, cache layout, and operating notes.
+- Has local DWARF or resolvable `.gnu_debuglink` → blazesym's process-mode
+  (system libs from distro debuginfo land here for free).
+- Stripped, build-id only (Rust/Go release builds) → file-mode against the
+  cached `.debug`, fetched on demand and content-addressed by build-id.
+- Deleted-but-still-mapped binary (sidecar / mount-namespace case) →
+  same flow, opened via `/proc/<pid>/map_files`.
+
+Cache layout, dispatcher details, and the address-normalization math:
+see [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
 
 ### 🧪 PGO and flame graphs
 

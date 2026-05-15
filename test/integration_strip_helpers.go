@@ -12,11 +12,9 @@ import (
 )
 
 // stripWorkload copies src to dst, runs `objcopy --strip-all dst`, and
-// returns dst's GNU build-id (lowercase hex).
-//
-// dst MUST be under the worktree, NOT /tmp — /tmp is mounted nosuid on
-// many distros and file caps don't survive exec from nosuid mounts.
-// (See memory feedback_setcap_no_tmp.)
+// returns dst's GNU build-id (lowercase hex). dst is the new path of
+// the stripped binary; the original src is left untouched so other
+// tests can reuse it.
 func stripWorkload(t *testing.T, src, dst string) string {
 	t.Helper()
 	if err := copyFile(src, dst); err != nil {

@@ -1,12 +1,18 @@
 package debuginfod
 
 import (
+	"context"
+	"debug/elf"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
 )
 
 func newTestSymbolizer(t *testing.T, urls []string) *Symbolizer {
@@ -55,5 +61,149 @@ func TestDispatchDecisionFetchOnSidecar(t *testing.T) {
 	}
 	if string(data) != body {
 		t.Fatalf("file body = %q, want %q", data, body)
+	}
+}
+
+func TestSymbolizeElfVirtRewritesAddressToOriginalIP(t *testing.T) {
+	// Build a tiny Go program with DWARF and use its .debug file as the
+	// symbolization source. Pick any resolvable function symbol and verify:
+	//   1. The function name matches what blazesym would resolve.
+	//   2. Frame.Address equals originalIPs[i] (NOT virtOffsets[i]).
+	debugPath := buildGoFixtureWithDWARF(t, t.TempDir())
+	resolvableVA, resolvableName := pickResolvableSymbol(t, debugPath)
+
+	sym, err := New(Options{
+		URLs:     []string{"http://example.invalid"},
+		CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = sym.Close() }()
+
+	originalIPs := []uint64{0xdeadbeef00000000} // a deliberately-not-VA value
+	virtOffsets := []uint64{resolvableVA}
+
+	frames, err := sym.cgo.symbolizeElfVirt(debugPath, originalIPs, virtOffsets)
+	if err != nil {
+		t.Fatalf("symbolizeElfVirt: %v", err)
+	}
+	if len(frames) == 0 {
+		t.Fatalf("got 0 frames")
+	}
+	if frames[0].Name != resolvableName {
+		t.Errorf("frames[0].Name = %q, want %q", frames[0].Name, resolvableName)
+	}
+	// Critical: the frame's Address MUST be originalIPs[0], not virtOffsets[0].
+	// Without this rewrite, pprof.Profile.Resolve cannot route this location
+	// to its containing mapping.
+	if frames[0].Address != originalIPs[0] {
+		t.Errorf("frames[0].Address = %#x, want %#x (originalIPs[0]) — file-mode address rewrite is broken",
+			frames[0].Address, originalIPs[0])
+	}
+	// Address rewrite must also propagate to every inlined chain entry.
+	for j, in := range frames[0].Inlined {
+		if in.Address != originalIPs[0] {
+			t.Errorf("frames[0].Inlined[%d].Address = %#x, want %#x (originalIPs[0])",
+				j, in.Address, originalIPs[0])
+		}
+	}
+}
+
+// buildGoFixtureWithDWARF compiles a tiny Go program with DWARF and extracts
+// only the .debug sections via objcopy --only-keep-debug. Returns the .debug path.
+func buildGoFixtureWithDWARF(t *testing.T, dir string) string {
+	t.Helper()
+	src := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(src, []byte(`package main
+
+func helloWorld() string { return "hi" }
+func main() { _ = helloWorld() }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "bin")
+	cmd := exec.Command("go", "build", "-o", bin, src)
+	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=auto")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Skipf("go build failed (toolchain unavailable?): %v\n%s", err, out)
+	}
+	debug := filepath.Join(dir, "bin.debug")
+	cmd = exec.Command("objcopy", "--only-keep-debug", bin, debug)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("objcopy failed: %v\n%s", err, out)
+	}
+	return debug
+}
+
+// pickResolvableSymbol returns (file-VA, name) of a function we'll round-trip.
+func pickResolvableSymbol(t *testing.T, debugPath string) (uint64, string) {
+	t.Helper()
+	f, err := elf.Open(debugPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	syms, err := f.Symbols()
+	if err != nil {
+		t.Skipf("no symtab in fixture: %v", err)
+	}
+	for _, want := range []string{"main.helloWorld", "main.main"} {
+		for _, s := range syms {
+			if s.Name == want && s.Value != 0 {
+				return s.Value, s.Name
+			}
+		}
+	}
+	t.Skip("no usable symbol in fixture")
+	return 0, ""
+}
+
+// fakesfFetcher implements sfFetcher for tests, counting fetchAndStore calls.
+type fakesfFetcher struct {
+	fetch func(ctx context.Context, kindStr, buildID string) (string, error)
+}
+
+func (f *fakesfFetcher) fetchAndStore(ctx context.Context, kindStr, buildID string) (string, error) {
+	return f.fetch(ctx, kindStr, buildID)
+}
+
+func TestDispatcherCase3ReturnsEmptyNoFetch(t *testing.T) {
+	// After the Case 3 reframe, the dispatcher must NOT invoke the fetcher
+	// for a stripped binary (build-id present, no DWARF, no debug-link).
+	// File-mode routing in the classifier owns the fetch decision now.
+	tmp := t.TempDir()
+	buildIDHex := strings.Repeat("c", 40) // 40 hex chars — exactly one build-id
+	binPath := writeStrippedELFWithBuildID(t, filepath.Join(tmp, "exe"), buildIDHex)
+
+	var fetchCount atomic.Int64
+	fakeFetcher := &fakesfFetcher{
+		fetch: func(_ context.Context, kind, buildID string) (string, error) {
+			fetchCount.Add(1)
+			return "", nil
+		},
+	}
+
+	cacheDir := t.TempDir()
+	cacheDB := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.NewSQLiteIndex(cacheDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+
+	s := &Symbolizer{
+		opts:  Options{CacheDir: cacheDir},
+		cache: &cache.Cache{Dir: cacheDir, Index: idx},
+		sf:    fakeFetcher,
+	}
+
+	got := s.dispatchWithBuildID(t.Context(), binPath, buildIDHex)
+	if got != "" {
+		t.Errorf("Case 3 dispatch returned %q, want \"\" (no-fetch fallback)", got)
+	}
+	if n := fetchCount.Load(); n != 0 {
+		t.Errorf("Case 3 dispatch made %d fetch call(s), want 0", n)
 	}
 }

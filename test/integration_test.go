@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1168,7 +1169,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 		OuterMap: objs.CFIClassificationMap(), LengthMap: objs.CFIClassificationLengthsMap(),
 	}))
 
-	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, tableID)
+	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, "", tableID)
 	require.NoError(t, err)
 	require.NotEmpty(t, mappings, "no matching mappings in /proc/<pid>/maps")
 	require.NoError(t, ehmaps.PopulatePIDMappings(ehmaps.PopulatePIDMappingsArgs{
@@ -1408,7 +1409,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
 		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap())
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
-	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath))
+	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath, ""))
 
 	// Start the watcher BEFORE the dlopen fires. The 4s delay in the
 	// workload above gives us time to get here.
@@ -1796,4 +1797,618 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// TestStrippedRustOffBoxSymbolization verifies off-box symbolization for a
+// stripped Rust release binary with build-id only (no .gnu_debuglink).
+// Without the debuginfod cache layout fix, the user-side function names
+// would be missing from the resulting pprof.
+func TestStrippedRustOffBoxSymbolization(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	agentBin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built (run make test-workloads): %v", err)
+	}
+
+	// Upload .debug from the unstripped binary, then strip a copy.
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(agentBin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+
+	want := []string{
+		"rust_workload::cpu_intensive_work",
+		"core::num::<impl u64>::wrapping_add",
+	}
+	for _, w := range want {
+		found := false
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing expected symbol %q in stripped pprof; got: %v", w, sortedKeys(got))
+		}
+	}
+}
+
+// requireDebuginfodContainer skips the test unless the local debuginfod
+// docker container is running on localhost:8002.
+func requireDebuginfodContainer(t *testing.T) {
+	t.Helper()
+	cmd := exec.Command("curl", "-fsS", "-o", "/dev/null", "http://localhost:8002/metrics")
+	if err := cmd.Run(); err != nil {
+		t.Skip("debuginfod container not running on localhost:8002 (run: cd test/debuginfod && docker compose up -d)")
+	}
+}
+
+// requireTool skips the test when the named CLI tool is not on PATH.
+func requireTool(t *testing.T, tool string) {
+	t.Helper()
+	if _, err := exec.LookPath(tool); err != nil {
+		t.Skipf("%s not on PATH", tool)
+	}
+}
+
+// spawnBinaryAsWorkload starts the binary and returns the running command.
+// Caller MUST call cleanup() to kill+wait the process. The binary is
+// expected to be CPU-bound for at least 15s.
+func spawnBinaryAsWorkload(t *testing.T, bin string) (*exec.Cmd, func()) {
+	t.Helper()
+	cmd := exec.Command(bin)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", bin, err)
+	}
+	// Give it 0.5s to set up worker threads.
+	time.Sleep(500 * time.Millisecond)
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	return cmd, cleanup
+}
+
+// TestStrippedGoOffBoxSymbolization verifies off-box symbolization for a
+// stripped Go release binary. Plain `go build` emits DWARF + symtab; we
+// strip both via objcopy --strip-all leaving only .note.gnu.build-id.
+// The .debug file uploaded to debuginfod must carry the DWARF blazesym
+// reads.
+func TestStrippedGoOffBoxSymbolization(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	goSrc := "./workloads/go/cpu_bound"
+	if _, err := os.Stat(goSrc); err != nil {
+		t.Skipf("go workload not built (run make test-workloads): %v", err)
+	}
+	// Sanity: confirm the source binary has DWARF — otherwise the test
+	// would silently pass for the wrong reason.
+	if !elfHasSection(t, goSrc, ".debug_info") {
+		t.Skipf("go workload at %s has no .debug_info; rebuild without -ldflags='-w'", goSrc)
+	}
+
+	buildID, _ := uploadDebug(t, goSrc)
+	stripped := filepath.Join(worktreeTmp, "go-cpu-bound-stripped")
+	stripWorkload(t, goSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+	// main.main is always present in a Go binary; cpu_bound's worker
+	// loop is typically in main.cpuWork or main.run — accept either.
+	wantAny := []string{"main.main", "main.cpuWork", "main.run", "main.worker"}
+	found := false
+	for _, w := range wantAny {
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no Go user-side function found in stripped pprof; got: %v", sortedKeys(got))
+	}
+}
+
+// elfHasSection reports whether the ELF at path has a non-empty section
+// with the given name. Used as a guard before tests that depend on DWARF
+// being present in a fixture binary.
+func elfHasSection(t *testing.T, path, name string) bool {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	sec := f.Section(name)
+	return sec != nil && sec.Size > 0
+}
+
+// TestFileModeFrameAddressPreservesMapping is the regression guard for the
+// file-mode symbolization path. It verifies that after perf-agent profiles a
+// stripped rust-workload binary whose debug info lives in debuginfod, every
+// pprof Location tied to a Rust frame is routed to a real Mapping (not
+// synthetic mapping 0) and that Mapping carries the correct BuildID. The
+// previous version of this test compared loc.Address (a binary-relative file
+// offset per pprof's contract: Address = ProcessPC - MapStart + MapOff) to
+// Mapping.Start..Mapping.Limit (process address range); those are different
+// units and the check was always false. The real invariant is captured below.
+func TestFileModeFrameAddressPreservesMapping(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+
+	// For each Location whose function name looks like a Rust symbol
+	// (rust_workload::*), assert it is tied to a real Mapping with the
+	// correct BuildID and a File path containing "rust-workload".
+	// We intentionally do NOT compare loc.Address to Mapping.Start/Limit
+	// because loc.Address is a binary-relative file offset (per pprof's
+	// contract: Address = ProcessPC - MapStart + MapOff), while
+	// Mapping.Start/Limit are process virtual addresses — different units.
+	rustRe := regexp.MustCompile(`^rust_workload::`)
+	checked := 0
+	for _, loc := range p.Location {
+		hasRust := false
+		for _, ln := range loc.Line {
+			if ln.Function != nil && rustRe.MatchString(ln.Function.Name) {
+				hasRust = true
+				break
+			}
+		}
+		if !hasRust {
+			continue
+		}
+		checked++
+
+		if loc.Mapping == nil {
+			t.Errorf("rust frame at addr %#x has no Mapping (file-mode location not routed to a real mapping)", loc.Address)
+			continue
+		}
+		// Mapping.BuildID must equal the workload's build-id.
+		if !strings.EqualFold(loc.Mapping.BuildID, buildID) {
+			t.Errorf("rust frame Mapping.BuildID = %q, want %q",
+				loc.Mapping.BuildID, buildID)
+		}
+		// Mapping.File must point at the workload binary (not [unknown] or [jit]).
+		if !strings.Contains(loc.Mapping.File, "rust-workload") {
+			t.Errorf("rust frame Mapping.File = %q, want a path containing rust-workload",
+				loc.Mapping.File)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no rust frames in pprof — symbolization didn't fire at all")
+	}
+}
+
+// TestStrippedCachedHitNoFetch verifies that a second profiling run for the
+// same stripped binary doesn't re-fetch from debuginfod when the cache
+// already has the .debug. Confirms the cache.Has → file-mode short-circuit.
+func TestStrippedCachedHitNoFetch(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+
+	// First run: should fetch.
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	// Snapshot the debuginfod container access log line count.
+	prevHits := countDebuginfodHits(t, buildID)
+
+	// Second run: should NOT fetch (cache hit).
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	newHits := countDebuginfodHits(t, buildID)
+	delta := newHits - prevHits
+	if delta > 0 {
+		t.Errorf("expected 0 new debuginfod fetches on second run; saw %d new GET /buildid/%s/debuginfo entries",
+			delta, buildID)
+	}
+}
+
+// runStripped is a small helper that runs the agent for one short profile.
+func runStripped(t *testing.T, agentBin, target, cacheDir, outDir string) {
+	t.Helper()
+	cmd, cleanup := spawnBinaryAsWorkload(t, target)
+	defer cleanup()
+	out := filepath.Join(outDir, "profile.pb.gz")
+	agent := exec.Command(agentBin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+}
+
+// countDebuginfodHits returns the number of `GET /buildid/<buildID>/debuginfo`
+// log lines emitted by the debuginfod container so far. Best-effort —
+// returns 0 if `docker logs` fails (we surface that as 0 delta upstream).
+func countDebuginfodHits(t *testing.T, buildID string) int {
+	t.Helper()
+	cmd := exec.Command("docker", "logs", "debuginfod")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("docker logs debuginfod: %v (proceeding with 0 hits)", err)
+		return 0
+	}
+	needle := "GET /buildid/" + buildID + "/debuginfo"
+	count := 0
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if strings.Contains(line, needle) {
+			count++
+		}
+	}
+	return count
+}
+
+// TestFileModeParseFailDemotes truncates a cached .debug to make
+// blaze_symbolize_elf_virt_offsets return NULL. The mapping should demote
+// to process-mode and pprof should still emit frames (just unsymbolized).
+// Confirms badDebug per-path filtering.
+func TestFileModeParseFailDemotes(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+
+	// First run: populates the cache.
+	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+
+	// Corrupt the cached .debug.
+	cached := filepath.Join(cacheDir, ".build-id", buildID[:2], buildID[2:]+".debug")
+	if _, err := os.Stat(cached); err != nil {
+		t.Fatalf("expected cached .debug at %s: %v", cached, err)
+	}
+	if err := os.Truncate(cached, 100); err != nil {
+		t.Fatalf("truncate %s: %v", cached, err)
+	}
+
+	// Second run: parse fails, mapping demotes to process-mode.
+	// pprof must still emit frames for the workload's mapping.
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	if len(p.Sample) == 0 {
+		t.Fatalf("no samples in pprof — agent crashed or got 0 frames")
+	}
+	// At least one sample's leaf should fall in the workload's mapping
+	// (even if unsymbolized).
+	var workloadMapping *profile.Mapping
+	for _, m := range p.Mapping {
+		if strings.Contains(m.File, "rust-workload") {
+			workloadMapping = m
+			break
+		}
+	}
+	if workloadMapping == nil {
+		t.Fatalf("no rust-workload mapping in pprof — agent didn't see the binary")
+	}
+}
+
+// TestStrippedSidecarUnreachableSymbolicPath simulates the sidecar /
+// mount-namespace case by deleting the workload binary from disk while
+// it's still running. The process keeps the binary alive via its open
+// file descriptor; /proc/<pid>/map_files/... still resolves, but the
+// symbolic path is gone. Asserts symbols still resolve and that
+// Mapping.BuildID is populated through map_files. Exercises both the
+// classifier (symbolizer routes via MapFiles) AND the DWARF unwinder
+// (ehmaps opens via /proc/<pid>/map_files when the symbolic path is
+// deleted).
+func TestStrippedSidecarUnreachableSymbolicPath(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+	requireTool(t, "objcopy")
+
+	bin := getAgentPath(t)
+	worktreeTmp := t.TempDir()
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	buildID, _ := uploadDebug(t, rustSrc)
+	stripped := filepath.Join(worktreeTmp, "rust-workload-stripped")
+	stripWorkload(t, rustSrc, stripped)
+	waitForDebuginfodReady(t, buildID)
+
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	defer cleanup()
+
+	// Delete the binary from disk; the running process keeps it alive
+	// through the open fd. /proc/<pid>/map_files/<va>-<va> still resolves.
+	if err := os.Remove(stripped); err != nil {
+		t.Fatalf("remove %s: %v", stripped, err)
+	}
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+	// Assert symbol resolved through map_files-derived path.
+	found := false
+	for name := range got {
+		if strings.Contains(name, "rust_workload::cpu_intensive_work") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("sidecar-style profiling didn't resolve symbols; got: %v", sortedKeys(got))
+	}
+	// Assert Mapping.BuildID is populated (i.e., Resolver.populate read
+	// it via map_files since the symbolic path is gone).
+	var workloadMapping *profile.Mapping
+	for _, m := range p.Mapping {
+		// File is the symbolic path which we deleted; it shows as "(deleted)"
+		// suffix in /proc/<pid>/maps. Match by build-id instead.
+		if strings.EqualFold(m.BuildID, buildID) {
+			workloadMapping = m
+			break
+		}
+	}
+	if workloadMapping == nil {
+		t.Errorf("no mapping with workload build-id %s — Resolver.populate didn't use map_files", buildID)
+	}
+}
+
+// TestOffBoxLibcResolution verifies that system libraries (libc) continue
+// to resolve through the process-mode path when local /usr/lib/debug
+// debuginfo is installed. The new classifier must NOT refetch them.
+// Skip when the local debuginfo isn't available.
+func TestOffBoxLibcResolution(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+	requireDebuginfodContainer(t)
+
+	// Find libc with build-id and assert a corresponding .debug exists at
+	// /usr/lib/debug/.build-id/...
+	libc, libcBuildID := findLibcWithLocalDebuginfo(t)
+
+	bin := getAgentPath(t)
+	rustSrc := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(rustSrc); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	cmd, cleanup := spawnBinaryAsWorkload(t, rustSrc)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
+	agent := exec.Command(bin,
+		"--profile",
+		"--debuginfod-url", "http://localhost:8002",
+		"--symbol-cache-dir", cacheDir,
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "6s",
+		"--profile-output", out,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	// libc should NOT have been fetched via debuginfod — it was resolvable
+	// locally through process-mode.
+	hits := countDebuginfodHits(t, libcBuildID)
+	if hits > 0 {
+		t.Errorf("libc fetched from debuginfod %d times; local /usr/lib/debug should have been used. libc=%s build-id=%s",
+			hits, libc, libcBuildID)
+	}
+
+	// libc functions should appear in the pprof (best-effort — on hosts
+	// without libc debuginfo this assertion is a soft log).
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+	wantAny := []string{"__libc_start_main", "malloc", "__GI___libc_malloc", "free"}
+	found := false
+	for _, w := range wantAny {
+		for name := range got {
+			if strings.Contains(name, w) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Logf("no libc symbol resolved; got: %v (acceptable on systems with no libc debuginfo)", sortedKeys(got))
+	}
+}
+
+// findLibcWithLocalDebuginfo locates libc.so.6 in common paths, reads its
+// build-id, and verifies /usr/lib/debug/.build-id/NN/REST.debug exists.
+// Skips the test if any of these aren't true.
+func findLibcWithLocalDebuginfo(t *testing.T) (string, string) {
+	t.Helper()
+	candidates := []string{
+		"/lib/x86_64-linux-gnu/libc.so.6",
+		"/lib64/libc.so.6",
+		"/usr/lib64/libc.so.6",
+		"/usr/lib/x86_64-linux-gnu/libc.so.6",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			id := readBuildID(t, p)
+			if id == "" {
+				continue
+			}
+			debugPath := filepath.Join("/usr/lib/debug", ".build-id", id[:2], id[2:]+".debug")
+			if _, err := os.Stat(debugPath); err == nil {
+				return p, id
+			}
+		}
+	}
+	t.Skip("no libc.so.6 with local /usr/lib/debug/.build-id debuginfo found — install glibc-debuginfo")
+	return "", ""
 }

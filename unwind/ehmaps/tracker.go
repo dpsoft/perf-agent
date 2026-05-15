@@ -63,12 +63,23 @@ func (t *PIDTracker) SetOnNewExec(fn func(pid uint32)) {
 // Attach walks /proc/<pid>/maps for binPath, acquires CFI via the store,
 // and installs a pid_mappings row. Safe to call multiple times with
 // different binPaths for the same PID — mappings accumulate.
-func (t *PIDTracker) Attach(pid uint32, binPath string) error {
-	tableID, _, err := t.store.AcquireBinary(binPath, pid)
+//
+// binPath is the cache key (the symbolic path; stable across PIDs).
+// openPath is the file actually opened to read the build-id and compile
+// CFI; pass "" to use binPath. openPath differs only when the symbolic
+// path is unreachable from the agent's namespace (deleted-but-mapped
+// binary, sidecar / mount-namespace cases) and the caller routed I/O
+// through /proc/<pid>/map_files. The pid_mappings table itself does
+// not need either path — it only stores va ranges keyed by tableID.
+func (t *PIDTracker) Attach(pid uint32, binPath, openPath string) error {
+	if openPath == "" {
+		openPath = binPath
+	}
+	tableID, _, err := t.store.AcquireBinary(binPath, openPath, pid)
 	if err != nil {
 		return fmt.Errorf("acquire %s: %w", binPath, err)
 	}
-	newMappings, err := LoadProcessMappings(int(pid), binPath, tableID)
+	newMappings, err := LoadProcessMappings(int(pid), binPath, openPath, tableID)
 	if err != nil {
 		_ = t.store.ReleaseBinary(tableID, pid)
 		return fmt.Errorf("load mappings pid=%d: %w", pid, err)
@@ -94,16 +105,25 @@ func (t *PIDTracker) Attach(pid uint32, binPath string) error {
 // walker enough mapping info to classify per-frame, deferring the
 // expensive ehcompile.Compile call to the first sample miss.
 //
+// binPath is the cache key (symbolic path; also the key used in
+// buildIDCache so two PIDs mapping the same binary share one build-id
+// read). openPath is the file actually opened to read the build-id and
+// match against /proc/<pid>/maps; pass "" to use binPath. They differ
+// only when the symbolic path is unreachable from the agent's namespace.
+//
 // buildIDCache is shared across calls so each unique binary's build-id
 // is read exactly once across all PIDs. Caller owns the cache.
 //
 // Does NOT increment the TableStore refcount — compile-time refcounting
 // is handled by AttachCompileOnly when the drainer compiles on demand.
-func (t *PIDTracker) EnrollWithoutCompile(pid uint32, binPath string, buildIDCache map[string][]byte) error {
+func (t *PIDTracker) EnrollWithoutCompile(pid uint32, binPath, openPath string, buildIDCache map[string][]byte) error {
+	if openPath == "" {
+		openPath = binPath
+	}
 	buildID, ok := buildIDCache[binPath]
 	if !ok {
 		var err error
-		buildID, err = ReadBuildID(binPath)
+		buildID, err = ReadBuildID(openPath)
 		if err != nil {
 			return fmt.Errorf("build-id %s: %w", binPath, err)
 		}
@@ -111,7 +131,7 @@ func (t *PIDTracker) EnrollWithoutCompile(pid uint32, binPath string, buildIDCac
 	}
 	tableID := TableIDForBuildID(buildID)
 
-	newMappings, err := LoadProcessMappings(int(pid), binPath, tableID)
+	newMappings, err := LoadProcessMappings(int(pid), binPath, openPath, tableID)
 	if err != nil {
 		return fmt.Errorf("load mappings pid=%d: %w", pid, err)
 	}
@@ -137,12 +157,19 @@ func (t *PIDTracker) EnrollWithoutCompile(pid uint32, binPath string, buildIDCac
 // entry for this binary (set by a prior EnrollWithoutCompile). Used by
 // the lazy CFI miss drainer.
 //
+// binPath is the cache key (symbolic path). openPath is the file actually
+// opened for ehcompile; pass "" to use binPath. See Attach for the
+// rationale.
+//
 // Skips LoadProcessMappings + PopulatePIDMappings — the enrolled state
 // already covers them. Calling this for a binary that was NOT enrolled
 // would leave pid_mappings empty for it; the walker would still hit
 // MAPPING_NOT_FOUND and fall through to FP-only.
-func (t *PIDTracker) AttachCompileOnly(pid uint32, binPath string) error {
-	tableID, _, err := t.store.AcquireBinary(binPath, pid)
+func (t *PIDTracker) AttachCompileOnly(pid uint32, binPath, openPath string) error {
+	if openPath == "" {
+		openPath = binPath
+	}
+	tableID, _, err := t.store.AcquireBinary(binPath, openPath, pid)
 	if err != nil {
 		return fmt.Errorf("acquire %s: %w", binPath, err)
 	}
@@ -233,7 +260,15 @@ func (t *PIDTracker) Run(ctx context.Context, w mmapEventSource, observers ...fu
 					continue
 				}
 				bucket[ev.Filename] = struct{}{}
-				if err := t.Attach(ev.PID, ev.Filename); err != nil {
+				// Resolve an openable path: prefer /proc/<pid>/map_files/<va>-<va>
+				// (works for deleted-but-mapped binaries) then the symbolic
+				// filename. Cache key stays the symbolic Filename.
+				openPath := openableBinary(ev.PID, ev.Addr, ev.Addr+ev.Len, ev.Filename)
+				if openPath == "" {
+					slog.Debug("ehmaps: Attach skipped (no openable path)", "pid", ev.PID, "path", ev.Filename)
+					continue
+				}
+				if err := t.Attach(ev.PID, ev.Filename, openPath); err != nil {
 					slog.Debug("ehmaps: Attach failed", "pid", ev.PID, "path", ev.Filename, "err", err)
 				}
 			case ForkEvent:
@@ -305,15 +340,36 @@ func AttachAllMappings(t *PIDTracker, pid uint32) (int, error) {
 		if path == "" || strings.HasPrefix(path, "[") || strings.HasPrefix(path, "//anon") {
 			continue
 		}
+		// Parse the va range so we can fall back to /proc/<pid>/map_files
+		// when the symbolic path is unreachable (deleted-but-mapped binary,
+		// sidecar / mount-namespace case).
+		dash := strings.IndexByte(fields[0], '-')
+		if dash < 0 {
+			continue
+		}
+		start, perr := strconv.ParseUint(fields[0][:dash], 16, 64)
+		if perr != nil {
+			continue
+		}
+		limit, perr := strconv.ParseUint(fields[0][dash+1:], 16, 64)
+		if perr != nil {
+			continue
+		}
+		// Cache-key dedup uses the symbolic path so multiple executable
+		// segments of the same binary don't get attached twice.
 		if _, dup := seen[path]; dup {
 			continue
 		}
 		seen[path] = struct{}{}
-		info, err := os.Stat(path)
+		openPath := openableBinary(pid, start, limit, path)
+		if openPath == "" {
+			continue
+		}
+		info, err := os.Stat(openPath)
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		if err := t.Attach(pid, path); err != nil {
+		if err := t.Attach(pid, path, openPath); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("attach %s: %w", path, err)
 			} else {
@@ -389,8 +445,10 @@ func countCFIRules(s *TableStore) int {
 
 // looksExecutable filters MMAP2 events down to those worth attaching to.
 // Must be an executable mapping (PROT_EXEC), have a real filename
-// (non-empty, not an anonymous or special kernel path), and the file
-// must exist and be a regular file.
+// (non-empty, not an anonymous or special kernel path), and the binary
+// must be reachable through either the symbolic path or
+// /proc/<pid>/map_files (the latter covers deleted-but-mapped binaries
+// and sidecar / mount-namespace cases).
 func looksExecutable(ev MmapEventRecord) bool {
 	const protExec = 0x4
 	if ev.Prot&protExec == 0 {
@@ -402,9 +460,9 @@ func looksExecutable(ev MmapEventRecord) bool {
 	if strings.HasPrefix(ev.Filename, "[") || strings.HasPrefix(ev.Filename, "//anon") {
 		return false
 	}
-	clean := filepath.Clean(ev.Filename)
-	info, err := os.Stat(clean)
-	if err != nil || !info.Mode().IsRegular() {
+	// Accept the mapping when either the symbolic path is a regular file
+	// or /proc/<pid>/map_files resolves. openableBinary handles both probes.
+	if openableBinary(ev.PID, ev.Addr, ev.Addr+ev.Len, filepath.Clean(ev.Filename)) == "" {
 		return false
 	}
 	return true

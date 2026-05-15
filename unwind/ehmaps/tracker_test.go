@@ -33,7 +33,7 @@ func TestTrackerAttachSelf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	if err := tracker.Attach(uint32(os.Getpid()), self); err != nil {
+	if err := tracker.Attach(uint32(os.Getpid()), self, ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
@@ -262,7 +262,7 @@ func TestEnrollWithoutCompile_PopulatesPIDMappingsOnly(t *testing.T) {
 	tracker := NewPIDTracker(store, nil, nil)
 
 	cache := map[string][]byte{}
-	err := tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, cache)
+	err := tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, "", cache)
 
 	// Tolerate the LoadProcessMappings or PopulatePIDMappings error path,
 	// but DO NOT tolerate any error related to compile/AcquireBinary.
@@ -298,7 +298,7 @@ func TestEnrollWithoutCompile_BuildIDCacheHit(t *testing.T) {
 		binPath: {0xDE, 0xAD, 0xBE, 0xEF},
 	}
 
-	_ = tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, cache)
+	_ = tracker.EnrollWithoutCompile(uint32(os.Getpid()), binPath, "", cache)
 
 	// Cache value should NOT have been overwritten — proves ReadBuildID
 	// wasn't called when the entry was already present.
@@ -326,7 +326,7 @@ func TestAttachCompileOnly_AcquireRefcountWithoutPIDMappings(t *testing.T) {
 	store := NewTableStore(nil, nil, nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
-	err := tracker.AttachCompileOnly(uint32(os.Getpid()), binPath)
+	err := tracker.AttachCompileOnly(uint32(os.Getpid()), binPath, "")
 	// Expected: AcquireBinary succeeds in computing tableID + acquiring
 	// the refcount, but errors on PopulateCFI (nil map). Or it succeeds
 	// entirely if the test runs in a mode where Populate is gated. Either

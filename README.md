@@ -70,37 +70,34 @@ One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python
 
 ### 🐳 Kubernetes-aware profile labels
 
-perf-agent runs in two Kubernetes shapes:
+Run as a **DaemonSet on the host PID namespace** (recommended): perf-agent
+sees every node process and tags each sample with `pod_uid`,
+`container_id`, and `cgroup_path` parsed from `/proc/<pid>/cgroup` — no
+kubelet API, no client-go.
 
-- **DaemonSet on the host PID namespace (recommended for fleet
-  profiling).** Sees every process on the node; identifies the target
-  pod via the **target's** cgroup. Each sample carries `pod_uid`,
-  `container_id`, and `cgroup_path` parsed directly from
-  `/proc/<targetPID>/cgroup` — no kubelet API calls, no client-go
-  dependency.
-- **Sidecar inside a single-tenant pod.** Requires
-  `shareProcessNamespace: true` on the pod, which lets every container
-  in the pod see every other container's processes — a security
-  regression in multi-tenant pods, fine in single-tenant pods where the
-  agent and target are co-deployed by the same operator. In this shape,
-  additional `pod_name` / `namespace` / `container_name` labels (read
-  from the agent's downward-API env vars) correctly identify the
-  target because they share a pod.
+For single-tenant pods, sidecar mode also works with
+`shareProcessNamespace: true` (which exposes every container's processes
+to every other container — fine when the agent and target are co-deployed
+by the same operator, a security regression otherwise). Downward-API
+env vars then add `pod_name` / `namespace` / `container_name` labels.
 
-`--pid <N>` accepts in-pod PIDs and translates them to host PIDs
-automatically (PID-namespace aware).
+`--pid <N>` accepts in-pod PIDs and translates them to host PIDs automatically.
 
 ### 🔍 Stripped production binaries via off-box symbols
 
-Production builds usually strip debug info to keep images small. Point
-perf-agent at a `debuginfod`-protocol server with `--debuginfod-url=URL`
-and the agent fetches DWARF on demand, keyed by GNU build-id, and caches
-it on disk. Symbol resolution uses blazesym's `process_dispatch` hook —
-binaries already on disk get DWARF via the cache (no override), sidecar/missing
-binaries get the full ELF from the server.
+Production builds usually strip debug info. Point perf-agent at a
+`debuginfod`-protocol server with `--debuginfod-url=URL`. A per-mapping
+classifier routes each binary in the target:
 
-See [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md)
-for the dispatcher routing table, cache layout, and operating notes.
+- Has local DWARF or resolvable `.gnu_debuglink` → blazesym's process-mode
+  (system libs from distro debuginfo land here for free).
+- Stripped, build-id only (Rust/Go release builds) → file-mode against the
+  cached `.debug`, fetched on demand and content-addressed by build-id.
+- Deleted-but-still-mapped binary (sidecar / mount-namespace case) →
+  same flow, opened via `/proc/<pid>/map_files`.
+
+Cache layout, dispatcher details, and the address-normalization math:
+see [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
 
 ### 🧪 PGO and flame graphs
 
@@ -153,7 +150,7 @@ See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walk
     --tag service=api
 ```
 
-Two specific deployment shapes — Python via `--inject-python`, and sidecar inside a Kubernetes pod — work as documented in the use cases above. Python details: [docs/python-profiling.md](docs/python-profiling.md).
+For Python workloads, see [docs/python-profiling.md](docs/python-profiling.md).
 
 ---
 

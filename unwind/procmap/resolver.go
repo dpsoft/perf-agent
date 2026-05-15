@@ -64,6 +64,25 @@ func (r *Resolver) Lookup(pid uint32, addr uint64) (Mapping, bool) {
 	return m, true
 }
 
+// Mappings returns a snapshot of pid's executable mappings, populating
+// the per-PID cache on first call. The returned slice aliases the cached
+// state — callers MUST NOT mutate it.
+//
+// Return contract:
+//   - (nil, nil)  — PID has no mappings: process gone, access restricted,
+//     or the maps file contained no executable regions.
+//   - (nil, err)  — /proc parse failed (I/O error, unexpected format, etc.)
+//   - (mappings, nil) — success; slice may be empty if no executable regions
+//     were found (same observable result as the nil-nil case above).
+func (r *Resolver) Mappings(pid uint32) ([]Mapping, error) {
+	entry := r.entryFor(pid)
+	entry.once.Do(func() { r.populate(entry, pid) })
+	if entry.err != nil {
+		return nil, entry.err
+	}
+	return entry.mappings, nil
+}
+
 // Invalidate drops any cached state for pid. The next Lookup
 // re-parses /proc/<pid>/maps. Call on process exit or when the
 // agent learns of whole-process churn (e.g., exec).
@@ -129,10 +148,42 @@ func (r *Resolver) populate(entry *pidEntry, pid uint32) {
 		return
 	}
 
+	r.attachBuildIDs(mappings)
+	entry.mappings = mappings
+}
+
+// attachBuildIDs sets BuildID on each mapping that doesn't already have one.
+// It tries MapFiles first (kernel-resolved symlink, works across mount
+// namespaces and survives unlinked-but-mapped binaries), then falls back to
+// the symbolic Path.
+//
+// When the build-id is read via MapFiles, the result is cached under the
+// symbolic Path — not under the MapFiles key — so that two PIDs mapping the
+// same binary share a single cache entry. Keying by MapFiles
+// (/proc/<pid>/map_files/<range>) would create a unique entry per PID+VA,
+// causing unbounded growth of r.buildIDs in long-running agents.
+func (r *Resolver) attachBuildIDs(mappings []Mapping) {
 	for i := range mappings {
+		if mappings[i].BuildID != "" {
+			continue // already attached
+		}
+		if mp := mappings[i].MapFiles; mp != "" {
+			// Read directly via MapFiles; bypass buildIDFor's cache because
+			// the MapFiles key is /proc/<pid>/map_files/<range> — unique per
+			// PID + VA range — so caching by it defeats cross-PID sharing.
+			if id, _ := ReadBuildID(mp); id != "" {
+				mappings[i].BuildID = id
+				// Backfill the cache under the stable symbolic path so future
+				// lookups for the same binary (possibly a different PID) get a
+				// cache hit without re-reading the ELF.
+				if p := mappings[i].Path; p != "" {
+					r.buildIDs.LoadOrStore(p, id)
+				}
+				continue
+			}
+		}
 		mappings[i].BuildID = r.buildIDFor(mappings[i].Path)
 	}
-	entry.mappings = mappings
 }
 
 // BuildID returns a cached hex build-id for path, reading the ELF on

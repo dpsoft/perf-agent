@@ -66,8 +66,14 @@ func (r *Resolver) Lookup(pid uint32, addr uint64) (Mapping, bool) {
 
 // Mappings returns a snapshot of pid's executable mappings, populating
 // the per-PID cache on first call. The returned slice aliases the cached
-// state — callers MUST NOT mutate it. Returns nil when the PID has no
-// mappings (gone, restricted) or when /proc parse failed.
+// state — callers MUST NOT mutate it.
+//
+// Return contract:
+//   - (nil, nil)  — PID has no mappings: process gone, access restricted,
+//     or the maps file contained no executable regions.
+//   - (nil, err)  — /proc parse failed (I/O error, unexpected format, etc.)
+//   - (mappings, nil) — success; slice may be empty if no executable regions
+//     were found (same observable result as the nil-nil case above).
 func (r *Resolver) Mappings(pid uint32) ([]Mapping, error) {
 	entry := r.entryFor(pid)
 	entry.once.Do(func() { r.populate(entry, pid) })

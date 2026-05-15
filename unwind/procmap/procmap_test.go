@@ -238,6 +238,54 @@ func TestResolverPopulateBuildIDViaMapFiles(t *testing.T) {
 	}
 }
 
+// TestAttachBuildIDsCachesUnderSymbolicPath proves that after attachBuildIDs
+// reads a build-id via MapFiles, the result is cached under the symbolic
+// Path — not under the MapFiles key. The test verifies this by:
+//  1. Calling attachBuildIDs with a mapping whose MapFiles resolves but whose
+//     symbolic Path does not exist on disk.
+//  2. Deleting the MapFiles file so no future ELF read can succeed.
+//  3. Calling buildIDFor(symbolicPath) and asserting it returns the cached
+//     value without re-reading the ELF.
+//
+// If the cache were keyed by MapFiles instead of by Path, step 3 would miss
+// (buildIDFor would try to open the symbolic path, fail, and return "").
+func TestAttachBuildIDsCachesUnderSymbolicPath(t *testing.T) {
+	tmp := t.TempDir()
+	buildID := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04}
+	binPath := writeELFWithBuildID(t, tmp, buildID)
+
+	const symbolicPath = "/symbolic/path/to/libfoo.so"
+
+	m := Mapping{
+		Path:     symbolicPath, // unreachable on this host
+		MapFiles: binPath,      // readable — contains the build-id
+		Start:    0x400000,
+		Limit:    0x401000,
+		IsExec:   true,
+	}
+
+	r := &Resolver{}
+	mappings := []Mapping{m}
+	r.attachBuildIDs(mappings)
+
+	want := "112233445566778899aabbccddeeff0001020304"
+	if mappings[0].BuildID != want {
+		t.Fatalf("attachBuildIDs: BuildID = %q, want %q", mappings[0].BuildID, want)
+	}
+
+	// Remove the MapFiles ELF so any future ELF read via that path fails.
+	if err := os.Remove(binPath); err != nil {
+		t.Fatalf("os.Remove(%s): %v", binPath, err)
+	}
+
+	// buildIDFor(symbolicPath) must return the cached value — it was
+	// backfilled under the symbolic path, not under MapFiles.
+	got := r.buildIDFor(symbolicPath)
+	if got != want {
+		t.Errorf("buildIDFor(symbolicPath) = %q, want %q (cache miss — build-id was not stored under symbolic path)", got, want)
+	}
+}
+
 // TestResolverMappingsReSnapshotAfterInvalidate verifies the spec invariant
 // ("No persistent per-PID state — each Symbolize call re-snapshots
 // /proc/<pid>/maps"). It checks that Mappings repopulates after Invalidate by

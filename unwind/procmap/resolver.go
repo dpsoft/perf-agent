@@ -150,14 +150,29 @@ func (r *Resolver) populate(entry *pidEntry, pid uint32) {
 // It tries MapFiles first (kernel-resolved symlink, works across mount
 // namespaces and survives unlinked-but-mapped binaries), then falls back to
 // the symbolic Path.
+//
+// When the build-id is read via MapFiles, the result is cached under the
+// symbolic Path — not under the MapFiles key — so that two PIDs mapping the
+// same binary share a single cache entry. Keying by MapFiles
+// (/proc/<pid>/map_files/<range>) would create a unique entry per PID+VA,
+// causing unbounded growth of r.buildIDs in long-running agents.
 func (r *Resolver) attachBuildIDs(mappings []Mapping) {
 	for i := range mappings {
 		if mappings[i].BuildID != "" {
 			continue // already attached
 		}
-		if p := mappings[i].MapFiles; p != "" {
-			if id := r.buildIDFor(p); id != "" {
+		if mp := mappings[i].MapFiles; mp != "" {
+			// Read directly via MapFiles; bypass buildIDFor's cache because
+			// the MapFiles key is /proc/<pid>/map_files/<range> — unique per
+			// PID + VA range — so caching by it defeats cross-PID sharing.
+			if id, _ := ReadBuildID(mp); id != "" {
 				mappings[i].BuildID = id
+				// Backfill the cache under the stable symbolic path so future
+				// lookups for the same binary (possibly a different PID) get a
+				// cache hit without re-reading the ELF.
+				if p := mappings[i].Path; p != "" {
+					r.buildIDs.LoadOrStore(p, id)
+				}
 				continue
 			}
 		}

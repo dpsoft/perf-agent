@@ -75,13 +75,22 @@ func New(opts Options) (*Symbolizer, error) {
 // SymbolizeProcess resolves abs IPs into Frames. Each address is routed
 // per-mapping:
 //
-//   - skip (vdso/[stack]/anonymous) → empty Frame with the original
+//   - skip (only triggered when classify() returns routeSkip — currently
+//     rare in practice because procmap.Resolver's parser already filters
+//     out pseudo-files ([vdso], [stack], [vsyscall], [heap]) and anonymous
+//     ranges upstream; IPs in those regions hit "no mapping found" and fall
+//     through to process-mode instead) → empty Frame with the original
 //     address so the pprof location's mapping fallback can name it
 //   - process-mode → blazesym's default abs-addr API, with the dispatcher
 //     hook handling on-demand fetches of missing executables
 //   - file-mode → AddressMapper translates each IP into a file-VA against
 //     the cached .debug, then blazesym's elf-virt API resolves the file-VA
 //     and the result's Address is rewritten back to the original IP
+//
+// Mappings come from procmap.Resolver, whose snapshot excludes pseudo-files
+// such as [vdso]/[stack] and anonymous ranges. IPs in those regions
+// therefore do not hit a separate skip route here; when no mapping is
+// found, they fall back to process-mode.
 //
 // Failure modes are graceful: a missing AddressMapper translation demotes
 // the individual IP to process-mode; a parse failure of the whole .debug

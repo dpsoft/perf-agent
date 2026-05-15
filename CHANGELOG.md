@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-15
+
+### Added
+
+- Opt-in kernel-mode stack capture and symbolization (`--kernel-stacks`). Interleaves kernel and user frames in the same pprof stack; off by default ([#21](https://github.com/dpsoft/perf-agent/pull/21)).
+
+### Fixed
+
+- Off-box symbolization for stripped binaries that lack `.gnu_debuglink` (the common Rust/Go release-build case). The v1.1.0 dispatcher relied on blazesym's split-debug lookup, which silently no-op'd without a debug-link. v1.2.0 adds a per-mapping classifier that normalizes addresses to file-VAs and symbolizes against the fetched `.debug` directly via blazesym's elf-virt API ([#22](https://github.com/dpsoft/perf-agent/pull/22)).
+
 ## [1.1.0] - 2026-05-08
 
 ### Added
@@ -30,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/dpsoft/perf-agent/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dpsoft/perf-agent/compare/v1.0.5...v1.1.0
 [1.0.5]: https://github.com/dpsoft/perf-agent/releases/tag/v1.0.5

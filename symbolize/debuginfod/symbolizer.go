@@ -313,7 +313,7 @@ func (s *Symbolizer) symbolizeFileBucket(
 		} else {
 			// symbolizeElfVirt asserts cnt == virtOffsets, so we can
 			// rely on len(frames) == len(validIdx) here.
-			s.stats.fileModeCalls.Add(uint64(len(virt)))
+			s.stats.fileModeAddrs.Add(uint64(len(virt)))
 			for j, idx := range validIdx {
 				out[idx] = frames[j]
 			}

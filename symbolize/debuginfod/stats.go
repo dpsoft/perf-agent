@@ -14,7 +14,9 @@ type Stats struct {
 	// Per-mapping routing (Symbolize-time).
 	ClassifyProcessMode, ClassifyFileMode, ClassifySkipped uint64
 	// File-mode outcomes.
-	FileModeCalls, FileModeParseFails uint64
+	// FileModeAddrs is the total number of addresses (IPs) resolved through
+	// the file-mode path (one per IP, not one per symbolizeFileBucket call).
+	FileModeAddrs, FileModeParseFails uint64
 	FileModeFetchFails, FileModeLocalHits uint64
 	// AddressMapper miss for an individual IP.
 	NormalizationFails uint64
@@ -31,7 +33,9 @@ type atomicStats struct {
 	// Classifier routing (Symbolize-time).
 	classifyProcessMode, classifyFileMode, classifySkipped atomic.Uint64
 	// File-mode outcomes.
-	fileModeCalls, fileModeParseFails atomic.Uint64
+	// fileModeAddrs counts the total number of addresses (IPs) resolved
+	// through the file-mode path; incremented by len(virt) per bucket call.
+	fileModeAddrs, fileModeParseFails atomic.Uint64
 	fileModeFetchFails, fileModeLocalHits atomic.Uint64
 	// AddressMapper miss for an individual IP.
 	normalizationFails atomic.Uint64
@@ -54,7 +58,7 @@ func (a *atomicStats) snapshot() Stats {
 		ClassifyProcessMode:    a.classifyProcessMode.Load(),
 		ClassifyFileMode:       a.classifyFileMode.Load(),
 		ClassifySkipped:        a.classifySkipped.Load(),
-		FileModeCalls:          a.fileModeCalls.Load(),
+		FileModeAddrs:          a.fileModeAddrs.Load(),
 		FileModeParseFails:     a.fileModeParseFails.Load(),
 		FileModeFetchFails:     a.fileModeFetchFails.Load(),
 		FileModeLocalHits:      a.fileModeLocalHits.Load(),

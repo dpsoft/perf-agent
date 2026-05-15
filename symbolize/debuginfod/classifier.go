@@ -57,7 +57,7 @@ const classifierCacheMax = 4096
 // eviction on insert when full.
 type classifier struct {
 	cache   *cache.Cache
-	fetcher *singleflightFetcher
+	fetcher sfFetcher
 	stats   *atomicStats
 
 	// systemDebugRoot is the directory blazesym would walk for build-id-
@@ -94,7 +94,7 @@ const (
 // backing ELF; we drop them at Tier 1.
 var nonSymbolizablePaths = []string{"", "[vdso]", "[stack]", "[vsyscall]", "[heap]"}
 
-func newClassifier(c *cache.Cache, f *singleflightFetcher, st *atomicStats) *classifier {
+func newClassifier(c *cache.Cache, f sfFetcher, st *atomicStats) *classifier {
 	return &classifier{
 		cache:           c,
 		fetcher:         f,

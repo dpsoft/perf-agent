@@ -45,8 +45,16 @@ type classifyResult struct {
 	debugPath string
 }
 
+// classifierCacheMax is the maximum number of entries kept in each of the
+// classifier's in-memory maps (negFetch, badDebug, mappers). When a new
+// entry would exceed the cap, the entry with the earliest deadline is
+// evicted first (oldest-deadline policy). For mappers, which have no
+// deadline, an arbitrary entry is dropped.
+const classifierCacheMax = 4096
+
 // classifier picks a route per mapping. It owns the negFetch and badDebug
-// state — both content-addressed, both bounded LRU.
+// state — both content-addressed, bounded by size + TTL; oldest-deadline
+// eviction on insert when full.
 type classifier struct {
 	cache   *cache.Cache
 	fetcher *singleflightFetcher
@@ -222,6 +230,15 @@ func (c *classifier) mapperFor(m procmap.Mapping) (*procmap.AddressMapper, error
 		// to keep identity stable for downstream consumers.
 		mapper = existing
 	} else {
+		// Evict an arbitrary entry when the map is at capacity (mappers
+		// have no deadline, so a random-iteration drop is the simplest
+		// correct policy for a bounded cache).
+		if len(c.mappers) >= classifierCacheMax {
+			for k := range c.mappers {
+				delete(c.mappers, k)
+				break
+			}
+		}
 		c.mappers[key] = mapper
 	}
 	c.mu.Unlock()
@@ -258,9 +275,29 @@ func statSig(path string) (pathSig, error) {
 	}, nil
 }
 
+// evictOldestTime removes the entry with the earliest deadline from m when
+// len(m) >= classifierCacheMax. Caller must hold c.mu.
+func evictOldestTime[K comparable](m map[K]time.Time) {
+	if len(m) < classifierCacheMax {
+		return
+	}
+	var oldestKey K
+	var oldestTime time.Time
+	first := true
+	for k, t := range m {
+		if first || t.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = t
+			first = false
+		}
+	}
+	delete(m, oldestKey)
+}
+
 func (c *classifier) markBadDebug(sig pathSig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	evictOldestTime(c.badDebug)
 	c.badDebug[sig] = time.Now().Add(badDebugTTL)
 }
 
@@ -281,6 +318,7 @@ func (c *classifier) isBadDebug(sig pathSig) bool {
 func (c *classifier) markNegFetch(buildID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	evictOldestTime(c.negFetch)
 	c.negFetch[buildID] = time.Now().Add(negFetchTTL)
 }
 

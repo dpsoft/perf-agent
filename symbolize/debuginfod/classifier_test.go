@@ -2,6 +2,7 @@ package debuginfod
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -283,6 +284,37 @@ func TestClassifierUsesMapFilesWhenSymbolicPathDeleted(t *testing.T) {
 	}
 	if got.debugPath != debugPath {
 		t.Errorf("classify() debugPath = %q, want %q", got.debugPath, debugPath)
+	}
+}
+
+// TestClassifierBadDebugBounded proves that badDebug never grows beyond
+// classifierCacheMax entries: inserting classifierCacheMax+100 distinct
+// entries must leave len(badDebug) <= classifierCacheMax.
+func TestClassifierBadDebugBounded(t *testing.T) {
+	c := newClassifier(nil, nil, &atomicStats{})
+	for i := 0; i < classifierCacheMax+100; i++ {
+		c.markBadDebug(pathSig{dev: 1, ino: uint64(i), mtime: int64(i)})
+	}
+	c.mu.Lock()
+	n := len(c.badDebug)
+	c.mu.Unlock()
+	if n > classifierCacheMax {
+		t.Errorf("badDebug grew to %d; expected <= %d", n, classifierCacheMax)
+	}
+}
+
+// TestClassifierNegFetchBounded proves that negFetch never grows beyond
+// classifierCacheMax entries.
+func TestClassifierNegFetchBounded(t *testing.T) {
+	c := newClassifier(nil, nil, &atomicStats{})
+	for i := 0; i < classifierCacheMax+100; i++ {
+		c.markNegFetch(fmt.Sprintf("buildid%08x", i))
+	}
+	c.mu.Lock()
+	n := len(c.negFetch)
+	c.mu.Unlock()
+	if n > classifierCacheMax {
+		t.Errorf("negFetch grew to %d; expected <= %d", n, classifierCacheMax)
 	}
 }
 

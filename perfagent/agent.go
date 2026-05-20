@@ -91,6 +91,10 @@ type Agent struct {
 	// Start() when cfg.KernelStacks is true; otherwise NoopKernelSymbolizer.
 	kernelSymbolizer symbolize.KernelSymbolizer
 
+	// metricsSrv is the optional HTTP server hosting /metrics and
+	// /debug/pprof. nil when WithMetricsListen wasn't used.
+	metricsSrv *metricsServer
+
 	mu      sync.Mutex
 	started bool
 }
@@ -405,6 +409,24 @@ func (a *Agent) Start(ctx context.Context) error {
 	a.symbolizer = sym
 	a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
 
+	// Optional /metrics + /debug/pprof endpoint. Started after the
+	// kernelSymbolizer is constructed so the handler closure can
+	// snapshot live counters; stopped in cleanup() after the
+	// symbolizer is closed so a late scrape can't race.
+	if a.config.MetricsListen != "" {
+		srv, err := startMetricsListener(a.config.MetricsListen, func() symbolize.CountersSnapshot {
+			if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+				return lks.Stats()
+			}
+			return symbolize.CountersSnapshot{}
+		})
+		if err != nil {
+			return fmt.Errorf("start metrics listener: %w", err)
+		}
+		a.metricsSrv = srv
+		log.Printf("perf-agent: metrics endpoint listening on http://%s/metrics (and /debug/pprof)", srv.addr)
+	}
+
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
@@ -683,6 +705,11 @@ func (a *Agent) cleanup() {
 		_ = a.kernelSymbolizer.Close()
 		a.kernelSymbolizer = nil
 	}
+	// Stop the metrics endpoint after the symbolizer is gone — a
+	// late scrape during shutdown would otherwise see post-Close
+	// counter state, which is harmless but adds confusion.
+	stopMetricsListener(a.metricsSrv)
+	a.metricsSrv = nil
 }
 
 // readOSRelease reads the running kernel release from

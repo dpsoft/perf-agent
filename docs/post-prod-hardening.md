@@ -53,8 +53,21 @@ Still to do:
 
 ### 3. `--metrics-listen` HTTP endpoint
 
-`/metrics` (Prometheus-style) + `/debug/pprof` (Go runtime
-self-pprof). Trivial to ship and zero overhead when not scraped.
+**Shipped in this PR.** `--metrics-listen <addr>` (e.g.
+`127.0.0.1:7777`) starts an HTTP server hosting:
+
+- `/metrics` — Prometheus text format with all
+  `symbolize.Counters` fields, including the reason buckets
+  added in #4 (`KernelLockdownEPERM`, `KernelOtherErr`)
+- `/debug/pprof/` — full Go runtime self-pprof, so
+  `go tool pprof http://host:7777/debug/pprof/profile` works
+  live (vs the offline bench-self path)
+
+Default off — no port opened when the flag isn't set. Lifecycle
+is wired into `Agent.Start` / `Agent.cleanup` with a 2-second
+graceful shutdown on Close. Tests cover Prometheus format, live
+scrape against a `:0` listener, post-Stop liveness, and the
+pprof mount.
 
 ### 4. Symbolizer error counter by reason
 
@@ -163,7 +176,7 @@ alongside the MMAP2 record for the workload pid.
 |----|--------|----------|--------|
 | 1  | 1d     | High     | **Shipped** in this PR — `make bench-self` |
 | 2  | 0.5d   | High     | **Partial** — counters shipped, histograms pending |
-| 3  | 0.5d   | Med      | Pending — easy wins once #2 fully ships |
+| 3  | 0.5d   | Med      | **Shipped** in this PR — `--metrics-listen` flag |
 | 4  | 0.5d   | Med      | **Shipped** in this PR — `KernelLockdownEPERM` + `KernelOtherErr` |
 | 5  | 5min   | High     | **Shipped** in this PR |
 | 6  | 0.5d   | Med      | **Shipped** in this PR — `make bench-symbolize` |

@@ -47,6 +47,9 @@ var (
 		"Refuse to symbolize a mapping whose debuginfod fetch failed (no fallback to local).")
 	flagKernelStacks = flag.Bool("kernel-stacks", false,
 		"Enable kernel-mode stack capture and symbolization (default: off).")
+	flagMetricsListen = flag.String("metrics-listen", "",
+		"If non-empty, expose /metrics (Prometheus text format) and "+
+			"/debug/pprof on this address (e.g. 127.0.0.1:7777). Default: off.")
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -238,6 +241,12 @@ func buildOptions() []perfagent.Option {
 	}
 	if *flagKernelStacks {
 		opts = append(opts, perfagent.WithKernelStacks())
+	}
+
+	// Metrics endpoint (Prometheus + /debug/pprof) for live
+	// observability — roadmap #3.
+	if *flagMetricsListen != "" {
+		opts = append(opts, perfagent.WithMetricsListen(*flagMetricsListen))
 	}
 
 	// Unwinding strategy

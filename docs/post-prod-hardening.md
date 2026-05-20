@@ -108,10 +108,28 @@ walk. Roadmap #9 below.
 
 ### 9. Lazy MMAP2 on first new-PID sample
 
-For `-a`, instead of pre-walking thousands of PIDs (expensive on
-busy hosts), emit MMAP2 lazily when a sample carries a PID we
-haven't seen. Tracks `exec()` correctly too — pre-walking misses
-processes that fork after capture starts. Complements #8.
+**Shipped in this PR.** `perfdata.Writer.OnNewPID` fires the
+first time a unique pid arrives in `AddSample`. Wired in
+`agent.go` system-wide mode to emit COMM + MMAP2 just-in-time
+for each sampled PID; the eager `/proc/*/maps` walk at writer
+init is gone. Sentinel filter (pid != 0 && pid != 0xffffffff)
+keeps kernel-only samples from triggering.
+
+Discovered via bench-self iter 9: on a busy host (9000+ PIDs),
+the eager walk burned ~30% of perf-agent CPU on kernel
+`/proc/<pid>/maps` rendering (`show_map_vma`, `mangle_path`,
+`lock_next_vma`). iter 11 (lazy) emitted records for only the
+~200 actually-sampled PIDs; perf.data dropped to ~3 MB (vs
+40-50 MB the eager walk would have written), and the per-PID
+walk cost is now bounded by activity rather than host PID
+count. Bonus: lazy mode also covers PIDs that exec AFTER capture
+starts — the eager walk could never see those.
+
+Remaining kernel `/proc/maps` cost in iter 11 (~15% cum) comes
+from procmap.Resolver's per-batch re-snapshot (spec invariant —
+see docs/specs/2026-05-12-debuginfod-cache-layout-design.md)
+and dwarfagent's lazy attach (also bounded by sampled-PID
+count). Both reduce when the workload has fewer active PIDs.
 
 ### 10. kthread MMAP / COMM attribution
 
@@ -136,7 +154,7 @@ alongside the MMAP2 record for the workload pid.
 | 6  | 0.5d   | Med      | Pending — bench infrastructure already exists |
 | 7  | 1d     | Low      | Pending — needs #2 first |
 | 8  | 1d     | Med      | **Shipped** in this PR |
-| 9  | 1d     | Med      | Pending — natural follow-up to #8 |
+| 9  | 1d     | Med      | **Shipped** in this PR — `Writer.OnNewPID` |
 | 10 | 0.5d   | Low      | **Shipped** in this PR (AddComm was entirely unwired, not just for kthreads) |
 
 Recommended next: **9 → 4 → 3 → 6 → 7**. With #1 in place,

@@ -47,6 +47,20 @@ type Writer struct {
 
 	// data accumulated for feature-section emission at Close
 	buildIDs []BuildIDEntry
+
+	// OnNewPID, when non-nil, fires the FIRST time AddSample sees
+	// each unique pid (skipping 0 and 0xffffffff sentinels). Used
+	// in system-wide capture to emit PERF_RECORD_COMM and per-PID
+	// PERF_RECORD_MMAP2 lazily — versus the original "walk every
+	// /proc PID at writer init" which ate ~30% of perf-agent CPU
+	// in kernel /proc/<pid>/maps rendering (dogfood iter 9).
+	//
+	// Callback runs synchronously on the AddSample hot path; the
+	// records it emits land in the perf.data BEFORE the sample
+	// they triggered, which matches `perf record`'s ordering
+	// invariant.
+	OnNewPID func(pid uint32)
+	seenPIDs map[uint32]struct{}
 }
 
 // Open creates a new perf.data file at path and writes the file header,
@@ -84,12 +98,13 @@ func Open(path string, spec EventSpec, meta MetaInfo) (*Writer, error) {
 
 	dataBeg := int64(fileHeaderSize + attrV8Size + 16)
 	return &Writer{
-		f:       f,
-		bw:      bw,
-		pos:     dataBeg,
-		dataBeg: dataBeg,
-		spec:    spec,
-		meta:    meta,
+		f:        f,
+		bw:       bw,
+		pos:      dataBeg,
+		dataBeg:  dataBeg,
+		spec:     spec,
+		meta:     meta,
+		seenPIDs: make(map[uint32]struct{}, 64),
 	}, nil
 }
 
@@ -120,8 +135,16 @@ func (w *Writer) AddMmap2(r Mmap2Record) {
 	w.writeRecord(func(b *bytes.Buffer) { encodeMmap2(b, r) })
 }
 
-// AddSample appends a PERF_RECORD_SAMPLE record.
+// AddSample appends a PERF_RECORD_SAMPLE record. When OnNewPID is
+// set, fires it (synchronously, before encoding the sample) the
+// first time each non-sentinel pid is observed.
 func (w *Writer) AddSample(r SampleRecord) {
+	if w.OnNewPID != nil && r.Pid != 0 && r.Pid != 0xffffffff {
+		if _, seen := w.seenPIDs[r.Pid]; !seen {
+			w.seenPIDs[r.Pid] = struct{}{}
+			w.OnNewPID(r.Pid)
+		}
+	}
 	w.writeRecord(func(b *bytes.Buffer) { encodeSample(b, r) })
 }
 

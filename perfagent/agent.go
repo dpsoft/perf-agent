@@ -370,13 +370,19 @@ func (a *Agent) Start(ctx context.Context) error {
 			emitCommForPID(a.perfDataWriter, hostPID)
 			emitUserspaceMmapsForPID(a.perfDataWriter, r, hostPID)
 		} else {
-			// System-wide: walk /proc and emit per-PID COMM +
-			// MMAP2s for every process visible to us at writer
-			// init. Misses PIDs that fork after capture starts;
-			// roadmap #9 (lazy on-first-sample emitter) would
-			// close that gap — for now the snapshot matches
-			// `perf record -a`'s synthetic pass.
-			emitCommAndMmapsForAllPIDs(a.perfDataWriter, r)
+			// System-wide: emit COMM + MMAP2 lazily, on the first
+			// sample observed per PID. The previous "walk every
+			// /proc PID at writer init" pass cost ~30% of
+			// perf-agent CPU on a busy host (dogfood iter 9 found
+			// kernel /proc/<pid>/maps rendering — show_map_vma,
+			// mangle_path, lock_next_vma — dominating the
+			// profile). Lazy emission also automatically covers
+			// PIDs that exec after capture starts; the eager
+			// walk could never see those.
+			a.perfDataWriter.OnNewPID = func(pid uint32) {
+				emitCommForPID(a.perfDataWriter, int(pid))
+				emitUserspaceMmapsForPID(a.perfDataWriter, r, int(pid))
+			}
 		}
 	}
 

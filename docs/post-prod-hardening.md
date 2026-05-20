@@ -221,6 +221,44 @@ In rough priority order based on hot-path share and ease:
    PIDs at writer init. Lazy emission would cut that to the
    PIDs we actually sample (likely 10s, not 1000s).
 
+### Dogfood iteration log
+
+The self scenario was actually run against this branch four times,
+each iteration finding a new bottleneck and the next iteration
+confirming the fix and revealing what was hidden underneath:
+
+| # | Visible bottleneck | Fix landed | Hidden underneath |
+|---|---|---|---|
+| 1 | 100% `<unknown>` in user pprof | (this PR's earlier symbolize fallback chain) | per-IP empty-name failures rendered as `<unknown>` |
+| 2 | `<unknown>` still 76% of samples | `frameFromCSym` / `fromBlazesymSym` fill empty Name with hex (symmetric to kernel side) | 40% of "user" CPU was kernel addresses leaked from BPF user-stack walker |
+| 3 | `module_get_kallsym` + `seq_read_iter` 40% (kernel-side) | `bpfstack.SplitUserKernelIPs` routes the leak to the kernel symbolizer; 256 KiB read buffer on `/proc/kallsyms` | the kallsyms read of ~3M lines was forcing the kernel through `vsnprintf` per small read() |
+| 4 | `do_syscall_64` 42%, `finish_task_switch` 21%, `ep_poll` 10%, ring-buffer read 1% | (none — intrinsic) | diminishing returns: clock / futex / ring-buffer driven by sample rate |
+
+After iteration 4 the top user-side functions resolve to:
+`Syscall6`, `nanotime1`, `time.now`, `futex`, `ringbuf.readRecord`,
+`dwarfagent.aggregateCPUSample`. Genuine steady-state cost of an
+eBPF-based profiler.
+
+Bugs surfaced and fixed along the way (in addition to the lockdown
+fix that motivated the PR):
+
+- **A**. `DebuginfodSymbolizer` swallowed NULL returns. Fix:
+  `LocalSymbolizer` fallback inside the dispatcher.
+- **B**. Userspace symbolize EPERM when target has caps (e.g.,
+  a setcap'd perf-agent profiling another setcap'd perf-agent).
+  Fix: `rawUserAddrFrames` synthesis preserves stack shape and
+  addresses (matches the kernel-side raw-hex behavior in this PR).
+- **B'**. Per-IP empty Name in successful blazesym calls (the
+  blazesym successfully ran but couldn't resolve some IPs)
+  rendered as `<unknown>`. Fix: hex-name fallback in
+  `frameFromCSym` + `fromBlazesymSym`.
+- **C**. BPF user-stack walker leaks kernel IPs into the user
+  buffer when the sampled task is in syscall/irq/fault context.
+  Fix: `bpfstack.SplitUserKernelIPs` partitions and routes.
+- **D**. `/proc/kallsyms` parser used the default 4 KiB read
+  buffer, forcing the kernel through `vsnprintf` on each small
+  read. Fix: 256 KiB `bufio.NewReaderSize` wrap.
+
 ### Limitations of the analysis
 
 - Single 25s capture, no statistical replication. Use the JSON

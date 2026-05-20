@@ -433,9 +433,17 @@ func (st *cgoState) symbolizeElfVirt(path string, originalIPs, virtOffsets []uin
 // frameFromCSym translates one C blaze_sym to a Go Frame. The Inlined
 // chain is left in caller-most-to-callee order (no reversal here; the
 // reversal lives in symbolize.ToProfFrames).
+//
+// On per-IP miss (c.name == NULL — blazesym opened the binary but
+// couldn't map this address to a symbol), Name is filled with the
+// hex IP so the pprof Location renders as "0x<addr>" instead of
+// "<unknown>". Symmetric to the kernel-side rawKernelAddrFrames /
+// frameFromKernelCSym behavior. Operators can decode hex names
+// with addr2line; <unknown> is dead weight.
 func frameFromCSym(c *C.blaze_sym, addr uint64) symbolize.Frame {
 	f := symbolize.Frame{Address: addr}
 	if c.name == nil {
+		f.Name = fmt.Sprintf("0x%x", addr)
 		f.Reason = symbolize.FailureUnknownAddress
 		return f
 	}

@@ -170,6 +170,13 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// overhead dominates for short stacks; one batched call is
 		// dramatically cheaper than one per IP.
 		ips := bpfstack.ExtractIPs(stack)
+		// Same kernel-leak split as profile/profiler.go: route
+		// kernel-range IPs that surfaced in the user stack walker
+		// to the kernel symbolizer where they belong.
+		ips, strayKernelIPs := bpfstack.SplitUserKernelIPs(ips)
+		if len(strayKernelIPs) > 0 {
+			kernelIPs = append(strayKernelIPs, kernelIPs...)
+		}
 		if len(ips) > 0 || len(kernelIPs) > 0 {
 			var userFrames, kernelFrames []symbolize.Frame
 			if len(ips) > 0 {

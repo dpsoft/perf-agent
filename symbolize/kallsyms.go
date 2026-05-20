@@ -28,6 +28,14 @@ type kallsymsSymbolizer struct {
 // newKallsymsSymbolizer parses /proc/kallsyms into a sorted index.
 // Returns ErrKernelSymbolsUnavailable when the file is unreadable or
 // returns zero addresses (kptr-restricted).
+//
+// Read path is tuned for the bench-self iteration-3 finding:
+// /proc/kallsyms is a synthesized file (the kernel formats each
+// line via vsnprintf on demand), and small read() syscalls force
+// the kernel through that path repeatedly. Wrap the file in a
+// 256 KiB bufio.Reader so each read() pulls many lines at once
+// and the kallsyms parse stops dominating perf-agent startup CPU
+// on lockdown hosts (where this path runs every invocation).
 func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
 	f, err := os.Open("/proc/kallsyms")
 	if err != nil {
@@ -41,9 +49,10 @@ func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
 		modules []string
 		sawNZ   bool
 	)
-	sc := bufio.NewScanner(f)
-	// /proc/kallsyms lines are short, but allocate generously so the
-	// scanner never errors on long module-symbol names.
+	br := bufio.NewReaderSize(f, 256*1024)
+	sc := bufio.NewScanner(br)
+	// Token buffer: 4 KiB initial (typical line), 1 MiB max for
+	// pathologically long module-symbol names.
 	sc.Buffer(make([]byte, 0, 4096), 1<<20)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())

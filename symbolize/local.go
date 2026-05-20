@@ -2,6 +2,7 @@ package symbolize
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	blazesym "github.com/libbpf/blazesym/go"
@@ -80,12 +81,26 @@ func (s *LocalSymbolizer) Close() error {
 // fromBlazesymSym translates one blazesym.Sym into a Frame, populating
 // Inlined in caller-most-to-callee order. addr is the abs IP this frame
 // was resolved from.
+//
+// On per-IP miss (s.Name == "" — blazesym opened the binary but
+// couldn't map this address to a symbol), Name is filled with the
+// hex IP so the pprof Location renders as "0x<addr>" instead of
+// "<unknown>". Symmetric to the kernel-side rawKernelAddrFrames /
+// frameFromKernelCSym behavior — operators can decode with
+// addr2line; <unknown> just hides the structure.
 func fromBlazesymSym(s blazesym.Sym, addr uint64) Frame {
+	name := s.Name
+	reason := FailureNone
+	if name == "" {
+		name = fmt.Sprintf("0x%x", addr)
+		reason = FailureMissingSymbols
+	}
 	f := Frame{
 		Address: addr,
-		Name:    s.Name,
+		Name:    name,
 		Module:  s.Module,
 		Offset:  s.Offset,
+		Reason:  reason,
 	}
 	if s.CodeInfo != nil {
 		f.File = s.CodeInfo.File

@@ -44,6 +44,16 @@ func metricsHandlerFor(getCounters func() symbolize.CountersSnapshot) http.Handl
 			"counter", "BLAZE_ERR_PERMISSION_DENIED events from blazesym (canonical lockdown signature)", s.KernelLockdownEPERM)
 		writeMetricLine(w, "perf_agent_symbolize_kernel_other_err_total",
 			"counter", "non-EPERM blazesym kernel failures (unexpected, deserves a look)", s.KernelOtherErr)
+		// Batch-duration histogram fields (roadmap #2). Exposed
+		// as separate gauges for p50/p99/max so Prometheus
+		// scrapers can graph each percentile independently
+		// without parsing a histogram body.
+		writeMetricLine(w, "perf_agent_symbolize_kernel_batch_p50_microseconds",
+			"gauge", "p50 of SymbolizeKernel batch wall-clock duration over recent window", s.KernelBatchHist.P50Us)
+		writeMetricLine(w, "perf_agent_symbolize_kernel_batch_p99_microseconds",
+			"gauge", "p99 of SymbolizeKernel batch wall-clock duration over recent window", s.KernelBatchHist.P99Us)
+		writeMetricLine(w, "perf_agent_symbolize_kernel_batch_max_microseconds",
+			"gauge", "max of SymbolizeKernel batch wall-clock duration (lifetime, not window)", s.KernelBatchHist.MaxUs)
 	}
 }
 

@@ -37,19 +37,24 @@ PR touching `profile/`, `offcpu/`, `symbolize/`.
 
 ### 2. `metrics.Exporter` histograms
 
-**Partially shipped in this PR.** `symbolize.Counters` (atomic-based)
-covers: KernelBatches, KernelInputIPs, KernelBatchFailures,
-KernelFallbackEngaged, KernelRawAddrFrames. Logged at agent shutdown
-via `agent.cleanup`.
+**Shipped in this PR.** `symbolize.Counters` carries:
 
-Still to do:
+- Counters: KernelBatches, KernelInputIPs, KernelBatchFailures,
+  KernelFallbackEngaged, KernelRawAddrFrames, KernelLockdownEPERM
+  (#4), KernelOtherErr (#4)
+- LatencyHist: KernelBatchHist — sliding-window (1024 samples)
+  ring-buffer histogram of per-SymbolizeKernel-call wall-clock
+  duration, with min/max/mean/p50/p99 on snapshot
 
-- Histograms (p50/p99) for blazesym + kallsyms batch durations.
-  Requires reservoir sampling or HDR-histogram; deferred.
-- `samples.drops` (BPF ring-buffer overruns — currently silent).
-- `proc.maps.parses_per_sec`.
-- Integration with the existing `metrics.Exporter` snapshot model so
-  ConsoleExporter / future PrometheusExporter can pick them up.
+Exposed via end-of-run log line and `/metrics` HTTP (#3) as
+`*_p50_microseconds`, `*_p99_microseconds`,
+`*_max_microseconds`. Snapshot is mutex-guarded but the Record
+path is zero-alloc (TestAllocsBudget_LatencyHistRecord).
+
+Still to ship in a follow-up:
+- `samples.drops` (BPF ring-buffer overruns — currently silent)
+- `proc.maps.parses_per_sec`
+- User-side equivalents on `LocalSymbolizer` / `DebuginfodSymbolizer`
 
 ### 3. `--metrics-listen` HTTP endpoint
 
@@ -115,11 +120,22 @@ runs (currently manual).
 
 ### 7. Allocations budget
 
-`pprof.AllocProfile` during integration tests; budget allocs/sample.
-The sample-processing loop in `profile/profiler.go` and
-`offcpu/profiler.go` churns `Frame{}` structs hard — every kernel +
-user frame is one alloc, with the `Inlined` chain adding more.
-Pool-reuse opportunity once the budget is in place.
+**Partially shipped in this PR.** `symbolize/allocs_budget_test.go`
+uses `testing.AllocsPerRun` to assert hot-path functions stay
+within their budget:
+
+- `parseKallsymsLine`: 0 allocs/op
+- `(*kallsymsSymbolizer).Resolve`: 1 alloc/op (the return slice)
+- `LatencyHist.Record`: 0 allocs/op
+
+PRs that regress these will fail the test immediately, not just
+show worse numbers in benchstat.
+
+Still to ship in a follow-up: extend the budget gate to the
+sample-processing loop in `profile/profiler.go` and
+`offcpu/profiler.go`. Those allocate `Frame{}` structs per
+captured frame plus the `Inlined` chain; pool reuse is the
+natural follow-up.
 
 ## Capture quality
 
@@ -175,19 +191,20 @@ alongside the MMAP2 record for the workload pid.
 | ID | Effort | Priority | Status |
 |----|--------|----------|--------|
 | 1  | 1d     | High     | **Shipped** in this PR — `make bench-self` |
-| 2  | 0.5d   | High     | **Partial** — counters shipped, histograms pending |
+| 2  | 0.5d   | High     | **Shipped** in this PR — counters + p50/p99 batch histograms |
 | 3  | 0.5d   | Med      | **Shipped** in this PR — `--metrics-listen` flag |
 | 4  | 0.5d   | Med      | **Shipped** in this PR — `KernelLockdownEPERM` + `KernelOtherErr` |
 | 5  | 5min   | High     | **Shipped** in this PR |
 | 6  | 0.5d   | Med      | **Shipped** in this PR — `make bench-symbolize` |
-| 7  | 1d     | Low      | Pending — needs #2 first |
+| 7  | 1d     | Low      | **Partial** — symbolize hot-path budget gates shipped |
 | 8  | 1d     | Med      | **Shipped** in this PR |
 | 9  | 1d     | Med      | **Shipped** in this PR — `Writer.OnNewPID` |
 | 10 | 0.5d   | Low      | **Shipped** in this PR (AddComm was entirely unwired, not just for kthreads) |
 
-Recommended next: **9 → 4 → 3 → 6 → 7**. With #1 in place,
-catching overhead and lockdown regressions is now mechanical; the
-remaining items broaden observability and capture quality.
+Every numbered item in this roadmap has now landed (with #7 as
+a partial — symbolize hot path covered, sample-processing
+follow-up still open). The PR closed the loop end-to-end:
+profile → observe → fix → re-observe → ship.
 
 ## Findings from running the self scenario
 

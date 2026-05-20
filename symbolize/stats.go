@@ -56,6 +56,13 @@ type Counters struct {
 	// Should normally be ~0; non-zero in production deserves a
 	// look at the log lines surrounding the failure.
 	KernelOtherErr atomic.Uint64
+
+	// KernelBatchHist records per-SymbolizeKernel-call wall-clock
+	// duration (microseconds) for the recent window. Snapshots
+	// expose p50/p99 so operators can alert on tail latency without
+	// trace-level logging. Sized for sliding-window semantics
+	// (latencyHistSize=1024).
+	KernelBatchHist LatencyHist
 }
 
 // CountersSnapshot is a value-type point-in-time view of Counters.
@@ -71,6 +78,7 @@ type CountersSnapshot struct {
 	KernelRawAddrFrames   uint64
 	KernelLockdownEPERM   uint64
 	KernelOtherErr        uint64
+	KernelBatchHist       LatencyHistSnapshot
 }
 
 // Snapshot returns the current counter values as a plain struct.
@@ -83,6 +91,7 @@ func (c *Counters) Snapshot() CountersSnapshot {
 		KernelRawAddrFrames:   c.KernelRawAddrFrames.Load(),
 		KernelLockdownEPERM:   c.KernelLockdownEPERM.Load(),
 		KernelOtherErr:        c.KernelOtherErr.Load(),
+		KernelBatchHist:       c.KernelBatchHist.Snapshot(),
 	}
 }
 
@@ -91,8 +100,9 @@ func (c *Counters) Snapshot() CountersSnapshot {
 // drops without having to add a metrics scrape.
 func (s CountersSnapshot) String() string {
 	return fmt.Sprintf(
-		"symbolize: batches=%d input_ips=%d batch_failures=%d fallback_engaged=%d raw_addr_frames=%d eperm=%d other_err=%d",
+		"symbolize: batches=%d input_ips=%d batch_failures=%d fallback_engaged=%d raw_addr_frames=%d eperm=%d other_err=%d batch_p50_us=%d batch_p99_us=%d batch_max_us=%d",
 		s.KernelBatches, s.KernelInputIPs, s.KernelBatchFailures, s.KernelFallbackEngaged, s.KernelRawAddrFrames,
 		s.KernelLockdownEPERM, s.KernelOtherErr,
+		s.KernelBatchHist.P50Us, s.KernelBatchHist.P99Us, s.KernelBatchHist.MaxUs,
 	)
 }

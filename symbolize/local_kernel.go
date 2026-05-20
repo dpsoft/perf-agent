@@ -51,6 +51,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -188,6 +189,14 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 
 	s.stats.KernelBatches.Add(1)
 	s.stats.KernelInputIPs.Add(uint64(len(ips)))
+	// Record per-batch wall-clock duration so p50/p99 land in the
+	// /metrics scrape and end-of-run log. Microseconds keep the
+	// numbers human-readable across both warm-cache (sub-ms) and
+	// cold-CGO (millisecond+) paths.
+	t0 := time.Now()
+	defer func() {
+		s.stats.KernelBatchHist.Record(uint64(time.Since(t0).Microseconds()))
+	}()
 
 	// Sticky fallback: once we've seen permission-denied on the CGO
 	// path, this host won't recover within the symbolizer's lifetime.

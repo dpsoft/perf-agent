@@ -280,6 +280,11 @@ type cgoState struct {
 	csym     *C.blaze_symbolizer
 	dispatch *C.blaze_symbolizer_dispatch
 	handle   cgo.Handle
+
+	// localFallback is consulted when the upstream blazesym
+	// process-mode call returns NULL. Optional: nil means no
+	// fallback, error propagates as before. See symbolizeProcess.
+	localFallback symbolize.Symbolizer
 }
 
 func newCgoState(s *Symbolizer) (*cgoState, error) {
@@ -328,9 +333,25 @@ func (st *cgoState) close() {
 		st.handle.Delete()
 		st.handle = 0
 	}
+	if st.localFallback != nil {
+		_ = st.localFallback.Close()
+		st.localFallback = nil
+	}
 }
 
 // symbolizeProcess is the C-side symbolize call. Returns one Frame per IP.
+//
+// On NULL return (which surfaces for two known causes: upstream
+// debuginfod has no debug-info for the build-id of a locally-built
+// binary; or the target is setcap'd and /proc/<pid>/exe is
+// restricted by ptrace_scope), falls back to local-only
+// symbolization via the parent Symbolizer's LocalSymbolizer fallback.
+// If the local path also fails, the caller's LocalSymbolizer returns
+// raw-hex-named frames (symbolize/local.go), preserving stack shape.
+//
+// Discovered via the self-profile scenario (roadmap #1) when
+// DEBUGINFOD_URLS pointed at a server that didn't have perf-agent's
+// own locally-generated build-id.
 func (st *cgoState) symbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Frame, error) {
 	if len(ips) == 0 {
 		return nil, nil
@@ -339,6 +360,12 @@ func (st *cgoState) symbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fram
 	caddr := (*C.uint64_t)(unsafe.Pointer(&ips[0]))
 	syms := C.blaze_symbolize_process_abs_addrs(st.csym, &src, caddr, C.size_t(len(ips)))
 	if syms == nil {
+		if st.localFallback != nil {
+			frames, err := st.localFallback.SymbolizeProcess(pid, ips)
+			if err == nil {
+				return frames, nil
+			}
+		}
 		return nil, fmt.Errorf("debuginfod: blaze_symbolize_process_abs_addrs returned NULL")
 	}
 	defer C.blaze_syms_free(syms)

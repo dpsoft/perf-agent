@@ -33,6 +33,14 @@ func NewLocalSymbolizer() (*LocalSymbolizer, error) {
 
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
 // expanded into the Frame.Inlined slice in caller-most-to-callee order.
+//
+// On blazesym error (e.g. "permission denied" when the target is
+// setcap'd and ptrace_scope restricts /proc/<pid>/exe), returns raw
+// hex-named Frames instead of dropping the batch — preserves stack
+// shape and addresses so operators can decode with addr2line and
+// the pprof's user mapping still has somewhere to attach. A future
+// per-mapping ELF resolver (roadmap follow-up to bench-self bug B)
+// can recover full symbols using procmap-supplied paths.
 func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -47,7 +55,7 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 		blazesym.ProcessSourceWithDebugSyms(true),
 	)
 	if err != nil {
-		return nil, err
+		return rawUserAddrFrames(ips), nil
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {

@@ -142,3 +142,96 @@ alongside the MMAP2 record for the workload pid.
 Recommended next: **9 → 4 → 3 → 6 → 7**. With #1 in place,
 catching overhead and lockdown regressions is now mechanical; the
 remaining items broaden observability and capture quality.
+
+## Findings from running the self scenario
+
+Running `make bench-self` on this codebase, then `addr2line`-ing
+the raw stacks from perf-agent #2's profile of perf-agent #1
+(workload: `cpu_bound -threads=2`, capture 25s @ 99Hz), surfaced
+the following hot categories. Frequencies are from a single 25s
+capture — illustrative, not statistically rigorous.
+
+| Category | Samples | What it is |
+|---|---|---|
+| `net.*` (DNS / sockets) | 5 | DEBUGINFOD_URLS resolution + socket setup on critical path |
+| `cilium/ebpf/btf.*` | 5 | BTF parse + CO-RE relocation at BPF load |
+| `cilium/ebpf/asm.*` | 4 | BPF instruction encoding |
+| `cilium/ebpf.*` | 2 | `newProgramWithOptions` (BPF program load) |
+| `modernc.org/sqlite` | 2 | debuginfod cache SQLite init |
+| `pprof.(*Line).encode` | 1 | pprof output building |
+| `perfdata.encodeMmap2` | 1 | system-wide MMAP2 emission (item #8) |
+
+85 of 119 unique addresses were unresolved by `addr2line` — those
+are the statically-linked Rust blazesym + some Go addresses
+addr2line can't follow. Symbol fidelity matches what an operator
+running the bench would actually see.
+
+### Bugs found while running the bench (worth their own follow-ups)
+
+**A. `DebuginfodSymbolizer` doesn't fall back to local on NULL.**
+With `DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/` set,
+profiling a locally-built binary (build-id not present upstream)
+makes blazesym's process-symbolize return NULL, and perf-agent
+gives up — every userspace frame appears as `<unknown>`. Should
+fall back to `LocalSymbolizer.SymbolizeProcess` and cache the
+per-build-id decision so we don't keep retrying upstream.
+
+**B. Userspace symbolize EPERM when the target has file caps.**
+Profiling a setcap'd binary (e.g., a second perf-agent) hits
+`permission denied` from blazesym when it tries `/proc/<pid>/exe`.
+The kernel restricts the symlink for privileged targets unless
+`PTRACE_MODE_READ_REALCREDS` is granted. perf-agent already parses
+`/proc/<pid>/maps` (via `procmap.Resolver`) — should pass those
+paths to blazesym instead of letting it follow `/proc/<pid>/exe`.
+
+### Proposed improvements (data-driven, not yet shipped)
+
+In rough priority order based on hot-path share and ease:
+
+1. **Lazy `modernc.org/sqlite` init (roadmap addition).** debuginfod
+   cache opens its SQLite DB unconditionally at agent startup, even
+   when DEBUGINFOD_URLS isn't set or upstream is unreachable. The
+   `_btreeInitPage` / `_removeFromSharingList` samples come from
+   that init. Make it lazy — first symbolize miss that would
+   benefit from upstream fetch triggers the open. ~0.5d.
+
+2. **Async DEBUGINFOD_URLS resolution.** DNS + connect for
+   debuginfod runs on the critical path of agent startup. Move
+   behind a `sync.Once` triggered on first off-box need. ~0.5d.
+
+3. **Fix bug A** (debuginfod NULL → local fallback). Concrete fix:
+   in `symbolize/debuginfod/dispatcher.go`, on
+   `blaze_symbolize_process_abs_addrs == NULL`, retry through
+   `LocalSymbolizer`. Add a "fell-back-to-local" counter
+   (extending #2's `symbolize.Counters`). ~3h.
+
+4. **Fix bug B** (target-has-caps EPERM). Concrete fix: pass
+   per-mapping `Mapping.Path` (from `procmap.Resolver`) into
+   blazesym instead of relying on `/proc/<pid>/exe`. ~half-day.
+
+5. **Cache cilium/ebpf BTF parse across in-process invocations.**
+   The BTF samples are dominated by `parseBTFHeader` /
+   `LoadSplitSpecFromReader`. cilium/ebpf has package-level state
+   for some of this; verify whether we re-parse vmlinux BTF more
+   often than needed. ~half-day investigation, then varies.
+
+6. **Roadmap #9 (lazy MMAP2 on first new-PID sample) gets sharper
+   motivation from this profile**: `encodeMmap2` shows up in
+   the hot list because system-wide mode emits MMAP2 for ~9000
+   PIDs at writer init. Lazy emission would cut that to the
+   PIDs we actually sample (likely 10s, not 1000s).
+
+### Limitations of the analysis
+
+- Single 25s capture, no statistical replication. Use the JSON
+  output from #1 (`make bench-self`) across N runs for trend.
+- The workload (`cpu_bound`) is mild; perf-agent is dominated by
+  startup. A noisier workload (multi-PID system-wide) would shift
+  the distribution toward sample-processing hot paths
+  (`profile/profiler.go`, `pprof.AddSample`, blazesym
+  `process_abs_addrs` per-batch overhead).
+- 71% of addresses were unresolved (Rust blazesym statically
+  linked without debug info linkage). Address that to read the
+  full perf-agent profile cleanly: build blazesym with
+  `RUSTFLAGS="-C debuginfo=2"` and ensure `addr2line` picks up
+  the static archive's debug info.

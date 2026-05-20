@@ -84,9 +84,42 @@ type kallsymsSymbolizer struct {
 	modules []string // "" for vmlinux, "[xfs]" etc. for modules
 }
 
-// newKallsymsSymbolizer parses /proc/kallsyms into a sorted index.
-// Returns ErrKernelSymbolsUnavailable when the file is unreadable or
-// returns zero addresses (kptr-restricted).
+// newKallsymsSymbolizer materializes the /proc/kallsyms index,
+// preferring the on-disk cache (keyed by kernel boot_id) over a
+// fresh parse. The fresh-parse path is unchanged from iter 5
+// (allocation-free byte-level scan + module intern); the cache
+// path skips it entirely when valid.
+//
+// Decision order:
+//  1. Try loadCachedKallsyms. Hit → return; cache key (boot_id)
+//     guarantees correctness.
+//  2. Miss / stale / corrupt → fall through to parseKallsymsFresh
+//     and best-effort write the cache for next time.
+//  3. Fresh parse fails → return the parse error.
+//
+// On lockdown hosts where blazesym hits EPERM on /proc/kcore and
+// every agent invocation otherwise pays the ~0.8s kallsyms parse,
+// the cache drops first-symbol latency to single-digit
+// milliseconds. On non-lockdown hosts the kallsymsSymbolizer
+// path isn't engaged at all, so this code has zero cost there.
+func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
+	if s, err := loadCachedKallsyms(); err == nil {
+		return s, nil
+	}
+	s, err := parseKallsymsFresh()
+	if err != nil {
+		return nil, err
+	}
+	// Best-effort: cache-write failures don't affect this call.
+	_ = writeKallsymsCache(s)
+	return s, nil
+}
+
+// parseKallsymsFresh is the slow path: read and parse
+// /proc/kallsyms from scratch. Tuning history kept here because
+// this is also the path that PRODUCES the cache contents — the
+// disk cache speeds up subsequent invocations, but the first
+// invocation on every boot still pays this cost.
 //
 // Tuned across two bench-self iterations:
 //   - iter 3: wrap the file in a 256 KiB bufio.Reader so each
@@ -104,7 +137,7 @@ type kallsymsSymbolizer struct {
 // the read buffer so the buffer can be reused). Modules deduped
 // via an intern map: a typical kernel has tens of modules but
 // millions of module symbols.
-func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
+func parseKallsymsFresh() (*kallsymsSymbolizer, error) {
 	f, err := os.Open("/proc/kallsyms")
 	if err != nil {
 		return nil, fmt.Errorf("kallsyms: open: %w", err)

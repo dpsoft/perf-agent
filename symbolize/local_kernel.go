@@ -152,6 +152,14 @@ func NewLocalKernelSymbolizer() (*LocalKernelSymbolizer, error) {
 		// operators couldn't tell the kallsyms path was used.
 		s.fallback.Store(true)
 		s.stats.KernelFallbackEngaged.Add(1)
+	} else if blazesymEPERMMarkerExists() {
+		// We've seen blazesym EPERM on this boot already. Skip the
+		// failing attempt — it would just re-read /proc/kallsyms,
+		// hit EPERM on /proc/kcore (lockdown), and waste ~110ms of
+		// CPU per agent invocation. Marker is boot_id-scoped, so a
+		// reboot reverts to attempting blazesym fresh.
+		s.fallback.Store(true)
+		s.stats.KernelFallbackEngaged.Add(1)
 	}
 	return s, nil
 }
@@ -201,6 +209,12 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 	if errors.Is(err, errBlazePermissionDenied) {
 		if s.fallback.CompareAndSwap(false, true) {
 			s.stats.KernelFallbackEngaged.Add(1)
+			// Persist the fact that blazesym EPERM'd on this
+			// boot so the next perf-agent invocation can skip
+			// the failing attempt at construction time. Best
+			// effort — the in-process sticky bit handles the
+			// rest of this invocation regardless.
+			_ = writeBlazesymEPERMMarker()
 		}
 		frames, err = s.callBlazesym(ips, true)
 		if err == nil {

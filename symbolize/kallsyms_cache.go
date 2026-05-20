@@ -60,6 +60,12 @@ var (
 // ~/.cache; final fallback is /tmp so the cache works even for
 // daemons with no $HOME set.
 func kallsymsDefaultCachePath() string {
+	return filepath.Join(kallsymsCacheDir(), "kallsyms.cache")
+}
+
+// kallsymsCacheDir returns the directory holding all per-boot
+// cache artifacts (kallsyms parse + blazesym-EPERM marker).
+func kallsymsCacheDir() string {
 	base := os.Getenv("XDG_CACHE_HOME")
 	if base == "" {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -68,7 +74,47 @@ func kallsymsDefaultCachePath() string {
 			base = "/tmp"
 		}
 	}
-	return filepath.Join(base, "perf-agent", "kallsyms.cache")
+	return filepath.Join(base, "perf-agent")
+}
+
+// blazesymEPERMMarkerPath returns the path of the
+// "blazesym EPERM'd on this boot" marker. The boot_id is encoded
+// in the filename so a reboot invalidates the signal — same
+// rationale as the kallsyms cache key.
+func blazesymEPERMMarkerPath(bootID [16]byte) string {
+	return filepath.Join(kallsymsCacheDir(), fmt.Sprintf("blazesym-eperm-%x", bootID))
+}
+
+// blazesymEPERMMarkerExists reports whether blazesym was observed
+// to EPERM on this boot. Best-effort: any error is treated as
+// "no marker", so a stat failure can't cause false fast-path
+// engagement.
+func blazesymEPERMMarkerExists() bool {
+	bootID, err := readBootIDFn()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(blazesymEPERMMarkerPath(bootID))
+	return err == nil
+}
+
+// writeBlazesymEPERMMarker creates the marker file. Best-effort:
+// failure is logged but never affects the current symbolize call.
+func writeBlazesymEPERMMarker() error {
+	bootID, err := readBootIDFn()
+	if err != nil {
+		return err
+	}
+	path := blazesymEPERMMarkerPath(bootID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	// Touch the file; content doesn't matter, only existence.
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // readBootID parses /proc/sys/kernel/random/boot_id (a UUID like

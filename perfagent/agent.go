@@ -360,40 +360,23 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
-	if a.perfDataWriter != nil && hostPID != 0 {
-		// Single-PID mode: synthesize userspace MMAP2 records from
-		// /proc/<pid>/maps so `perf script` / `perf report` can
-		// resolve user-space IPs against on-disk binaries. Without
-		// these every userspace frame in the resulting perf.data
-		// shows up as [unknown]. System-wide capture (hostPID==0)
-		// would need a walk across every observed PID — out of
-		// scope for this writer-init hook; samples carry their
-		// own pid so a future pass can synthesize lazily.
+	if a.perfDataWriter != nil {
+		// Synthesize userspace MMAP2 records from /proc/<pid>/maps so
+		// `perf script` / `perf report` can resolve user-space IPs
+		// against on-disk binaries. Without these, every userspace
+		// frame in the resulting perf.data shows up as [unknown].
 		r := procmap.NewResolver()
-		mappings, err := r.Mappings(uint32(hostPID))
-		if err != nil {
-			log.Printf("perfdata: enumerate userspace mappings for pid %d: %v (continuing; perf.data userspace symbols may be [unknown])", hostPID, err)
+		if hostPID != 0 {
+			emitCommForPID(a.perfDataWriter, hostPID)
+			emitUserspaceMmapsForPID(a.perfDataWriter, r, hostPID)
 		} else {
-			user := make([]perfdata.UserspaceMapping, 0, len(mappings))
-			for _, m := range mappings {
-				if !m.IsExec {
-					continue
-				}
-				var bid []byte
-				if m.BuildID != "" {
-					if b, err := hex.DecodeString(m.BuildID); err == nil {
-						bid = b
-					}
-				}
-				user = append(user, perfdata.UserspaceMapping{
-					Start:   m.Start,
-					Len:     m.Limit - m.Start,
-					Pgoff:   m.Offset,
-					Path:    m.Path,
-					BuildID: bid,
-				})
-			}
-			a.perfDataWriter.AddUserspaceMmaps(hostPID, user)
+			// System-wide: walk /proc and emit per-PID COMM +
+			// MMAP2s for every process visible to us at writer
+			// init. Misses PIDs that fork after capture starts;
+			// roadmap #9 (lazy on-first-sample emitter) would
+			// close that gap — for now the snapshot matches
+			// `perf record -a`'s synthetic pass.
+			emitCommAndMmapsForAllPIDs(a.perfDataWriter, r)
 		}
 	}
 
@@ -685,6 +668,12 @@ func (a *Agent) cleanup() {
 		a.symbolizer = nil
 	}
 	if a.kernelSymbolizer != nil {
+		// Surface kernel-symbolizer counters so operators see
+		// fallback engagement and frame drops at end-of-run
+		// without having to scrape a /metrics endpoint.
+		if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+			log.Printf("%s", lks.Stats())
+		}
 		_ = a.kernelSymbolizer.Close()
 		a.kernelSymbolizer = nil
 	}
@@ -787,6 +776,116 @@ func mapPtraceopErrToPython(err error) error {
 			python.ErrNoPerfTrampoline)
 	}
 	return err
+}
+
+// emitCommForPID reads /proc/<pid>/comm and writes a PERF_RECORD_COMM.
+// Best-effort: returns silently if /proc/<pid>/comm is unreadable
+// (process exited, restricted) — without COMM `perf script` shows
+// the bare numeric pid in place of the process name, but the
+// kernel-side samples are still attributed by pid.
+//
+// Emitted for every PID we walk, including kernel threads — the
+// load-bearing reason for #10 in docs/post-prod-hardening.md.
+// kthreads (kvm-pit, vhost-*, kworker/*) have empty cmdline but a
+// valid comm; without this record, kernel-stacks samples drawn from
+// them appear with no name in `perf script` output.
+func emitCommForPID(w *perfdata.Writer, pid int) {
+	body, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return
+	}
+	comm := strings.TrimSpace(string(body))
+	if comm == "" {
+		return
+	}
+	w.AddComm(perfdata.CommRecord{
+		Pid:  uint32(pid),
+		Tid:  uint32(pid),
+		Comm: comm,
+	})
+}
+
+// emitUserspaceMmapsForPID writes PERF_RECORD_MMAP2 entries to w for
+// every executable mapping in /proc/<pid>/maps, sourced via the given
+// procmap.Resolver (which also attaches build-ids from
+// .note.gnu.build-id sections). Best-effort: errors are logged and
+// the perf.data writer continues; symbol resolution will be partial
+// for any pid we couldn't enumerate.
+//
+// Does NOT emit COMM — callers that want both should call
+// emitCommForPID first (perf convention: COMM before MMAP2 for the
+// same pid).
+func emitUserspaceMmapsForPID(w *perfdata.Writer, r *procmap.Resolver, pid int) {
+	mappings, err := r.Mappings(uint32(pid))
+	if err != nil {
+		log.Printf("perfdata: enumerate userspace mappings for pid %d: %v (continuing; perf.data userspace symbols may be [unknown])", pid, err)
+		return
+	}
+	user := make([]perfdata.UserspaceMapping, 0, len(mappings))
+	for _, m := range mappings {
+		if !m.IsExec {
+			continue
+		}
+		var bid []byte
+		if m.BuildID != "" {
+			if b, err := hex.DecodeString(m.BuildID); err == nil {
+				bid = b
+			}
+		}
+		user = append(user, perfdata.UserspaceMapping{
+			Start:   m.Start,
+			Len:     m.Limit - m.Start,
+			Pgoff:   m.Offset,
+			Path:    m.Path,
+			BuildID: bid,
+		})
+	}
+	w.AddUserspaceMmaps(pid, user)
+}
+
+// emitCommAndMmapsForAllPIDs implements the system-wide synthetic
+// COMM + MMAP2 pass: walks /proc, emits COMM for every visible PID
+// (so `perf script` prints readable process names for kernel-side
+// samples), and MMAP2 for every non-kthread PID (so userspace IPs
+// resolve to on-disk binaries). Skips PIDs whose files become
+// unreadable mid-walk (process exited) without failing.
+//
+// kthreads: detected by empty /proc/<pid>/cmdline. They get COMM
+// but no MMAP2 — they have no userspace mappings anyway, and the
+// open+parse is wasteful across thousands of pids.
+//
+// Trade-off vs. `perf record -a`: this is a snapshot at writer init.
+// Processes that exec after the snapshot are invisible. Roadmap
+// item #9 (lazy on-first-sample emission) closes that gap; the
+// snapshot is enough for steady-state workloads, which is the
+// common voidbox/benchmark case the original bug report cited.
+func emitCommAndMmapsForAllPIDs(w *perfdata.Writer, r *procmap.Resolver) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		log.Printf("perfdata: read /proc for system-wide comm+mmap walk: %v (continuing; perf.data userspace symbols may be [unknown])", err)
+		return
+	}
+	comm, mmap := 0, 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		// COMM for every pid we see — including kthreads.
+		emitCommForPID(w, pid)
+		comm++
+		// MMAP2 only for userspace processes. Cheap kthread
+		// detection: kthreads have empty /proc/<pid>/cmdline.
+		if body, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && len(body) == 0 {
+			continue
+		}
+		emitUserspaceMmapsForPID(w, r, pid)
+		mmap++
+	}
+	log.Printf("perfdata: emitted system-wide records: %d COMM, %d userspace MMAP2 sets", comm, mmap)
 }
 
 // dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When

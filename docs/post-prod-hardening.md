@@ -2,8 +2,10 @@
 
 Captures follow-up work surfaced while fixing the v1.2.0 kernel-stacks
 production gaps (lockdown=integrity symbolization + perf.data
-userspace MMAP2 records). None of these are blocking the current PR;
-each can land as its own focused change.
+userspace MMAP2 records).
+
+**Status:** Items #2, #5, #8, #10 shipped in the same PR as the bug
+fixes. Items #1, #3, #4, #6, #7, #9 remain as follow-ups.
 
 ## Observability of perf-agent itself
 
@@ -28,17 +30,19 @@ Suggested location: `bench/self/`. Wires into the existing
 
 ### 2. `metrics.Exporter` histograms
 
-Today: nothing. Add:
+**Partially shipped in this PR.** `symbolize.Counters` (atomic-based)
+covers: KernelBatches, KernelInputIPs, KernelBatchFailures,
+KernelFallbackEngaged, KernelRawAddrFrames. Logged at agent shutdown
+via `agent.cleanup`.
 
-- `symbolize.kernel.batch_duration_us` (p50, p99)
-- `symbolize.user.batch_duration_us` (p50, p99)
-- `symbolize.kernel.fallback_engaged` (counter; bumped once when
-  blazesym → kallsymsSymbolizer switch fires)
-- `samples.drops` (BPF ring-buffer overruns — currently silent)
-- `proc.maps.parses_per_sec`
+Still to do:
 
-Existing `metrics.Exporter` interface (`metrics/exporter.go`) already
-accepts arbitrary counters; just need wire-up at the call sites.
+- Histograms (p50/p99) for blazesym + kallsyms batch durations.
+  Requires reservoir sampling or HDR-histogram; deferred.
+- `samples.drops` (BPF ring-buffer overruns — currently silent).
+- `proc.maps.parses_per_sec`.
+- Integration with the existing `metrics.Exporter` snapshot model so
+  ConsoleExporter / future PrometheusExporter can pick them up.
 
 ### 3. `--metrics-listen` HTTP endpoint
 
@@ -62,10 +66,11 @@ Exposed via #2 above so dashboards can alert on the ratio.
 
 ### 5. CI lockdown lane
 
-Run the existing kernel-stacks integration test with
-`PERFAGENT_FORCE_KERNEL_FALLBACK=1`. The env-var faker added in this
-PR makes this a one-line CI matrix entry: every kernel-stacks PR
-exercises the pure-Go fallback path on whatever host runs CI.
+**Shipped in this PR.** `make test-integration-lockdown` runs the
+kernel-stacks integration tests with
+`PERFAGENT_FORCE_KERNEL_FALLBACK=1`. Wired into the default `make
+test` target so every CI run exercises the kallsyms fallback path
+regardless of the host's lockdown state.
 
 ### 6. `go test -bench` for the symbolize hot path
 
@@ -85,12 +90,14 @@ Pool-reuse opportunity once the budget is in place.
 
 ### 8. System-wide userspace MMAP2
 
-The Bug 3 fix is single-PID only. For `-a` (system-wide), `perf
-record` does a `/proc/*/maps` walk at start. Needs
-`perfdata.Writer.AddAllUserspaceMmaps` that scoops every executable
-mapping on the host, gated by a `--snapshot-all-mmaps` flag so the
-perf.data overhead is opt-in. Out of scope for the prod-hardening PR
-but the natural follow-up.
+**Shipped in this PR.** `perfagent.emitCommAndMmapsForAllPIDs` walks
+/proc at writer init and emits PERF_RECORD_MMAP2 (plus COMM, see
+#10) for every visible PID. Integration test
+`TestPerfDataUserspaceMmap2_SystemWide` verifies the walk covers
+multiple distinct PIDs.
+
+Remaining gap: snapshot semantics miss processes that exec after the
+walk. Roadmap #9 below.
 
 ### 9. Lazy MMAP2 on first new-PID sample
 
@@ -101,27 +108,30 @@ processes that fork after capture starts. Complements #8.
 
 ### 10. kthread MMAP / COMM attribution
 
-In the blog flames that motivated this work, KVM kthreads
-(`kvm-pit/*`, `vhost-*`) showed real CPU but with truncated kernel
-stacks. Their kernel stacks go through the `[kernel.kallsyms]_text`
-MMAP fine, but `comm` records may not be emitted for kthreads —
-worth checking that `AddComm` runs for kernel-only PIDs.
+**Shipped in this PR.** Audit found that `perfdata.Writer.AddComm`
+was defined but never called from anywhere in perf-agent — every
+perf.data emitted had zero COMM records, not just for kthreads.
+`perfagent.emitCommForPID` now reads `/proc/<pid>/comm` and emits
+PERF_RECORD_COMM for every PID enumerated (kthreads included, since
+they have a valid comm even when their userspace maps are empty).
+`TestPerfDataUserspaceMmap2` asserts the COMM record appears
+alongside the MMAP2 record for the workload pid.
 
 ## Triage / ordering
 
-| ID | Effort | Priority | Notes |
-|----|--------|----------|-------|
-| 1  | 1d     | High     | Catches future lockdown-class bugs at PR time |
-| 2  | 0.5d   | High     | Foundation for everything else |
-| 3  | 0.5d   | Med      | Easy wins once #2 ships |
-| 4  | 0.5d   | Med      | Depends on #2 |
-| 5  | 5min   | High     | One-line CI matrix entry |
-| 6  | 0.5d   | Med      | Bench infrastructure already exists |
-| 7  | 1d     | Low      | Needs #2 first |
-| 8  | 1d     | Med      | The `-a` user pain point |
-| 9  | 1d     | Med      | Combines with #8 |
-| 10 | 0.5d   | Low      | Probably already works; verify with #5 |
+| ID | Effort | Priority | Status |
+|----|--------|----------|--------|
+| 1  | 1d     | High     | Pending — catches future lockdown-class bugs at PR time |
+| 2  | 0.5d   | High     | **Partial** — counters shipped, histograms pending |
+| 3  | 0.5d   | Med      | Pending — easy wins once #2 fully ships |
+| 4  | 0.5d   | Med      | Pending — depends on #2 |
+| 5  | 5min   | High     | **Shipped** in this PR |
+| 6  | 0.5d   | Med      | Pending — bench infrastructure already exists |
+| 7  | 1d     | Low      | Pending — needs #2 first |
+| 8  | 1d     | Med      | **Shipped** in this PR |
+| 9  | 1d     | Med      | Pending — natural follow-up to #8 |
+| 10 | 0.5d   | Low      | **Shipped** in this PR (AddComm was entirely unwired, not just for kthreads) |
 
-Recommended order: **5 → 2 → 1 → 4 → 3 → 6 → 8 → 9 → 7 → 10**. The
-first three together would have prevented the v1.2.0 ship-and-pray
-incident this PR cleaned up.
+Recommended next: **1 → 9 → 4 → 3 → 6 → 7**. #1 (self-profile lane)
+remains the highest-leverage item left — it's what would have caught
+the original v1.2.0 lockdown bug at PR time.

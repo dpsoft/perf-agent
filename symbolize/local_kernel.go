@@ -112,6 +112,17 @@ type LocalKernelSymbolizer struct {
 	kallsymsOnce  sync.Once
 	kallsymsCache *kallsymsSymbolizer
 	kallsymsErr   error
+
+	// stats counts observability events (batch counts, fallback
+	// engagement, raw-address synthesis). Exposed via Stats() for
+	// end-of-run logging and future /metrics scrape.
+	stats Counters
+}
+
+// Stats returns a snapshot of the symbolizer's observability
+// counters. Safe to call concurrently with SymbolizeKernel.
+func (s *LocalKernelSymbolizer) Stats() CountersSnapshot {
+	return s.stats.Snapshot()
 }
 
 // NewLocalKernelSymbolizer returns a kernel symbolizer or
@@ -134,7 +145,13 @@ func NewLocalKernelSymbolizer() (*LocalKernelSymbolizer, error) {
 	s := &LocalKernelSymbolizer{csym: csym}
 	s.callBlazesym = s.invoke
 	if os.Getenv(forceFallbackEnv) == "1" {
+		// Bump the counter so the end-of-run log reflects that we
+		// ran in fallback mode, matching the semantic when the
+		// switch happens naturally via EPERM. Without this, the
+		// forced-fallback case would log fallback_engaged=0 and
+		// operators couldn't tell the kallsyms path was used.
 		s.fallback.Store(true)
+		s.stats.KernelFallbackEngaged.Add(1)
 	}
 	return s, nil
 }
@@ -161,12 +178,17 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 		return nil, ErrClosed
 	}
 
+	s.stats.KernelBatches.Add(1)
+	s.stats.KernelInputIPs.Add(uint64(len(ips)))
+
 	// Sticky fallback: once we've seen permission-denied on the CGO
 	// path, this host won't recover within the symbolizer's lifetime.
 	// Skip blazesym on every subsequent batch.
 	if s.fallback.Load() {
 		frames, err := s.callBlazesym(ips, true)
 		if err != nil {
+			s.stats.KernelBatchFailures.Add(1)
+			s.stats.KernelRawAddrFrames.Add(uint64(len(ips)))
 			return rawKernelAddrFrames(ips), nil
 		}
 		return frames, nil
@@ -177,7 +199,9 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 		return frames, nil
 	}
 	if errors.Is(err, errBlazePermissionDenied) {
-		s.fallback.Store(true)
+		if s.fallback.CompareAndSwap(false, true) {
+			s.stats.KernelFallbackEngaged.Add(1)
+		}
 		frames, err = s.callBlazesym(ips, true)
 		if err == nil {
 			return frames, nil
@@ -185,6 +209,8 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 	}
 	// Both paths failed — preserve raw kernel addresses so the
 	// kernel side of the stack survives into the pprof.
+	s.stats.KernelBatchFailures.Add(1)
+	s.stats.KernelRawAddrFrames.Add(uint64(len(ips)))
 	return rawKernelAddrFrames(ips), nil
 }
 
@@ -232,7 +258,7 @@ func (s *LocalKernelSymbolizer) cgoSymbolize(ips []uint64) ([]Frame, error) {
 	defer C.blaze_syms_free(syms)
 
 	out := make([]Frame, 0, int(syms.cnt))
-	for i := 0; i < int(syms.cnt); i++ {
+	for i := range int(syms.cnt) {
 		csym := C.sym_at_kernel(syms, C.size_t(i))
 		out = append(out, frameFromKernelCSym(csym, ips[i]))
 	}

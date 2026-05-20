@@ -68,7 +68,7 @@ func TestSymbolizeKernel_StickyFallback(t *testing.T) {
 		return []Frame{{Address: ips[0], Name: "ok"}}, nil
 	})
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, err := s.SymbolizeKernel([]uint64{uint64(0xffffffff80001000) + uint64(i)}); err != nil {
 			t.Fatalf("batch %d: %v", i, err)
 		}

@@ -239,6 +239,30 @@ After iteration 4 the top user-side functions resolve to:
 `dwarfagent.aggregateCPUSample`. Genuine steady-state cost of an
 eBPF-based profiler.
 
+| 5 | A/B split run: A = profile with --kernel-stacks (full); B = profile without --kernel-stacks (user-only). B revealed `strings.Fields` + `strconv.ParseUint` in the kallsyms parser were dominating user-side allocation (mallocgc, sweepone in top 10). | byte-level `parseKallsymsLine` (16.5 ns/op, 0 allocs) + module-name intern map | kallsyms parse user-side cost gone; kernel-side `module_get_kallsym` + `vsnprintf` remain — those are the kernel synthesizing the file, can't be optimized from userspace |
+| 6 | A/B split rerun. user-side allocation pressure gone (no more sweepone / mallocgc in top). kernel-side kallsyms cost is the remaining floor on lockdown hosts: every perf-agent invocation re-parses /proc/kallsyms because blazesym hits EPERM on /proc/kcore. | (none in this PR — next step) | the floor: ~0.8s CPU per agent invocation on this host's ~3M-line kallsyms. Negligible for long captures, noticeable for ≤30s. |
+
+### Remaining bottleneck after iter 6 (proposed follow-up #D-cache)
+
+On hosts where blazesym's kernel source fails (lockdown=integrity,
+Secure Boot, missing CAP_SYS_RAWIO), every perf-agent invocation
+parses /proc/kallsyms from scratch. The user-side cost is gone
+(allocation-free parser), but the kernel still formats the
+synthesized file via vsnprintf on each read syscall — no userspace
+optimization helps.
+
+**Proposed fix**: disk-cached kallsyms index.
+
+- Cache path: `${XDG_CACHE_HOME:-~/.cache}/perf-agent/kallsyms-${BOOT_ID}.cache`
+- Format: addrs (uint64 array) + names (length-prefixed) + modules (intern table + indices)
+- Invalidation: `/proc/sys/kernel/random/boot_id` (changes only on reboot)
+- Read path: mmap or single read into prealloc'd slices — should drop kallsyms parse to milliseconds
+- Write path: best-effort; failure is non-fatal (falls back to fresh parse)
+
+Estimated win: ~0.8s CPU saved per agent invocation on lockdown
+hosts. Significant for the short-capture / CI-bench / sidecar
+patterns. ~150 LOC + tests. Out of scope for this PR.
+
 Bugs surfaced and fixed along the way (in addition to the lockdown
 fix that motivated the PR):
 

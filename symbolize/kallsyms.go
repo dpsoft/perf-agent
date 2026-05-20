@@ -5,9 +5,68 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
 )
+
+// parseKallsymsLine extracts (addr, type, name, module) from one
+// /proc/kallsyms line without allocating. Returns ok=false on
+// malformed lines.
+//
+// Format:  "<16-hex-addr> <type-byte> <name>[ \t]+[module]"
+// Example: "ffffffff80c6a050 T __x64_sys_open"
+// Example: "ffffffff8e2b0010 T kvm_init  [kvm]"
+//
+// Name and module are slices into the input buffer; the caller is
+// responsible for copying them out before the buffer is reused.
+func parseKallsymsLine(line []byte) (addr uint64, typ byte, name, module []byte, ok bool) {
+	i := 0
+	// hex addr — accept any run of hex digits, stop at first non-hex
+	for i < len(line) {
+		c := line[i]
+		v := uint64(0)
+		switch {
+		case c >= '0' && c <= '9':
+			v = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v = uint64(c-'A') + 10
+		default:
+			goto endAddr
+		}
+		addr = addr<<4 | v
+		i++
+	}
+endAddr:
+	if i == 0 {
+		return 0, 0, nil, nil, false
+	}
+	if i >= len(line) || line[i] != ' ' {
+		return 0, 0, nil, nil, false
+	}
+	i++
+	if i >= len(line) {
+		return 0, 0, nil, nil, false
+	}
+	typ = line[i]
+	i++
+	if i >= len(line) || line[i] != ' ' {
+		return 0, 0, nil, nil, false
+	}
+	i++
+	nameStart := i
+	for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+		i++
+	}
+	name = line[nameStart:i]
+	// optional module: whitespace then "[modname]"
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	if i < len(line) {
+		module = line[i:]
+	}
+	return addr, typ, name, module, true
+}
 
 // kallsymsSymbolizer resolves kernel addresses by binary search
 // against a snapshot of /proc/kallsyms. Used as the lockdown-safe
@@ -29,13 +88,22 @@ type kallsymsSymbolizer struct {
 // Returns ErrKernelSymbolsUnavailable when the file is unreadable or
 // returns zero addresses (kptr-restricted).
 //
-// Read path is tuned for the bench-self iteration-3 finding:
-// /proc/kallsyms is a synthesized file (the kernel formats each
-// line via vsnprintf on demand), and small read() syscalls force
-// the kernel through that path repeatedly. Wrap the file in a
-// 256 KiB bufio.Reader so each read() pulls many lines at once
-// and the kallsyms parse stops dominating perf-agent startup CPU
-// on lockdown hosts (where this path runs every invocation).
+// Tuned across two bench-self iterations:
+//   - iter 3: wrap the file in a 256 KiB bufio.Reader so each
+//     read() pulls many lines at once (the kernel synthesizes
+//     kallsyms via vsnprintf per read; small reads forced
+//     repeated trips through that path).
+//   - iter 5: byte-level allocation-free line parser, replacing
+//     strings.Fields + strconv.ParseUint. The previous version
+//     was the top allocation source in perf-agent's user-side
+//     pprof: 3M kallsyms lines × strings.Fields × ParseUint =
+//     ~9M+ allocations, triggering noticeable GC pressure
+//     (sweepone, tryDeferToSpanScan, mallocgc).
+//
+// One string allocation per KEPT symbol (the name; copies out of
+// the read buffer so the buffer can be reused). Modules deduped
+// via an intern map: a typical kernel has tens of modules but
+// millions of module symbols.
 func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
 	f, err := os.Open("/proc/kallsyms")
 	if err != nil {
@@ -49,37 +117,41 @@ func newKallsymsSymbolizer() (*kallsymsSymbolizer, error) {
 		modules []string
 		sawNZ   bool
 	)
+	moduleIntern := make(map[string]string, 64)
 	br := bufio.NewReaderSize(f, 256*1024)
 	sc := bufio.NewScanner(br)
 	// Token buffer: 4 KiB initial (typical line), 1 MiB max for
 	// pathologically long module-symbol names.
 	sc.Buffer(make([]byte, 0, 4096), 1<<20)
 	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 3 {
+		line := sc.Bytes()
+		addr, typ, nameBytes, modBytes, ok := parseKallsymsLine(line)
+		if !ok {
 			continue
 		}
 		// Type filter: only addressable code symbols. Matches the
 		// kinds the awk hack in resolve_user_addrs.py keeps for
 		// userspace; same logic applies to kernel symbols.
-		switch fields[1] {
-		case "T", "t", "W", "w", "i":
+		switch typ {
+		case 'T', 't', 'W', 'w', 'i':
 		default:
-			continue
-		}
-		addr, err := strconv.ParseUint(fields[0], 16, 64)
-		if err != nil {
 			continue
 		}
 		if addr != 0 {
 			sawNZ = true
 		}
 		module := ""
-		if len(fields) >= 4 {
-			module = fields[3] // "[modname]"
+		if len(modBytes) > 0 {
+			s := string(modBytes)
+			if interned, ok := moduleIntern[s]; ok {
+				module = interned
+			} else {
+				moduleIntern[s] = s
+				module = s
+			}
 		}
 		addrs = append(addrs, addr)
-		names = append(names, fields[2])
+		names = append(names, string(nameBytes)) // one alloc per kept name
 		modules = append(modules, module)
 	}
 	if err := sc.Err(); err != nil {

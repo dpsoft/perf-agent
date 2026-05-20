@@ -58,16 +58,20 @@ self-pprof). Trivial to ship and zero overhead when not scraped.
 
 ### 4. Symbolizer error counter by reason
 
-Today: `log.Printf("Failed to symbolize kernel: %v", err)` into the
-void. Bucket the errors:
+**Shipped in this PR.** `symbolize.Counters` gained
+`KernelLockdownEPERM` and `KernelOtherErr` (atomic, bumped at
+the cgoSymbolize error classification site). `CountersSnapshot`
++ String() now include `eperm=` and `other_err=` fields so the
+end-of-run log line distinguishes:
 
-- `lockdown_eperm`
-- `kallsyms_unreadable`
-- `kallsyms_unknown_address` (raw-hex fallback engaged)
-- `blazesym_misc`
-- `no_buildid` (user-side)
+  - `eperm=N` matching `fallback_engaged=1` → canonical
+    lockdown signature
+  - `other_err > 0` → unexpected blazesym failure, deserves a
+    look at log lines around the failure
 
-Exposed via #2 above so dashboards can alert on the ratio.
+Remaining (user-side reason buckets — debuginfod NoBuildID etc.):
+left for a follow-up PR that adds a sibling Counters struct on
+the user symbolizer types.
 
 ## Regression gates (cheap to add)
 
@@ -81,9 +85,20 @@ regardless of the host's lockdown state.
 
 ### 6. `go test -bench` for the symbolize hot path
 
-Today: no benchmarks for symbolize. Budget per-batch CGO cost. Catches
-blazesym pin regressions and pure-Go kallsyms-walker regressions.
-Suggested file: `symbolize/bench_test.go`.
+**Shipped in this PR.** `symbolize/kallsyms_bench_test.go`
+covers: full fresh parse, cache load, per-IP resolve, per-line
+parser. `make bench-symbolize` is the canonical entry point.
+Reference numbers on a Ryzen 9 7940HS + Fedora 44 (~225k
+filtered kallsyms symbols):
+
+  BenchmarkParseKallsymsFresh   204 ms/op  365k allocs   81 MB
+  BenchmarkLoadCachedKallsyms    10 ms/op  365k allocs   32 MB  (20x)
+  BenchmarkResolveKernelIPs     ~35 ns/IP   1 alloc/call
+  BenchmarkParseKallsymsLine   17.5 ns/op   0 allocs
+
+The 20x cache speedup is the headline metric — PRs that
+regress it will surface in CI when the bench-symbolize lane
+runs (currently manual).
 
 ### 7. Allocations budget
 
@@ -149,9 +164,9 @@ alongside the MMAP2 record for the workload pid.
 | 1  | 1d     | High     | **Shipped** in this PR — `make bench-self` |
 | 2  | 0.5d   | High     | **Partial** — counters shipped, histograms pending |
 | 3  | 0.5d   | Med      | Pending — easy wins once #2 fully ships |
-| 4  | 0.5d   | Med      | Pending — depends on #2 |
+| 4  | 0.5d   | Med      | **Shipped** in this PR — `KernelLockdownEPERM` + `KernelOtherErr` |
 | 5  | 5min   | High     | **Shipped** in this PR |
-| 6  | 0.5d   | Med      | Pending — bench infrastructure already exists |
+| 6  | 0.5d   | Med      | **Shipped** in this PR — `make bench-symbolize` |
 | 7  | 1d     | Low      | Pending — needs #2 first |
 | 8  | 1d     | Med      | **Shipped** in this PR |
 | 9  | 1d     | Med      | **Shipped** in this PR — `Writer.OnNewPID` |

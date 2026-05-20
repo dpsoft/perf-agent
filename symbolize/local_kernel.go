@@ -257,6 +257,11 @@ func (s *LocalKernelSymbolizer) getKallsymsFallback() (*kallsymsSymbolizer, erro
 // errBlazePermissionDenied on BLAZE_ERR_PERMISSION_DENIED so the
 // fallback ladder can switch to the pure-Go path; other blazesym
 // errors propagate as wrapped errors.
+//
+// Bumps reason-bucketed counters at the error site (roadmap #4)
+// so end-of-run logs / future /metrics scrapes can distinguish a
+// lockdown host (high KernelLockdownEPERM) from a buggy blazesym
+// (any KernelOtherErr at all).
 func (s *LocalKernelSymbolizer) cgoSymbolize(ips []uint64) ([]Frame, error) {
 	src := C.make_kernel_src()
 	caddr := (*C.uint64_t)(unsafe.Pointer(&ips[0]))
@@ -264,8 +269,10 @@ func (s *LocalKernelSymbolizer) cgoSymbolize(ips []uint64) ([]Frame, error) {
 	if syms == nil {
 		errc := C.blaze_err_last()
 		if errc == C.BLAZE_ERR_PERMISSION_DENIED {
+			s.stats.KernelLockdownEPERM.Add(1)
 			return nil, errBlazePermissionDenied
 		}
+		s.stats.KernelOtherErr.Add(1)
 		errStr := C.GoString(C.blaze_err_str(errc))
 		return nil, fmt.Errorf("blaze_symbolize_kernel_abs_addrs: %s (code %d)", errStr, int(errc))
 	}

@@ -40,6 +40,22 @@ type Counters struct {
 	// "0x<hex>"). High values mean blazesym + kallsyms both failed
 	// — likely a configuration problem on the host.
 	KernelRawAddrFrames atomic.Uint64
+
+	// Reason-bucketed counters for batch-level blazesym failures.
+	// Roadmap #4: lets operators distinguish "lockdown-class host
+	// (every batch EPERMs once before fallback)" from "blazesym is
+	// throwing some other error" without re-instrumenting.
+	//
+	// KernelLockdownEPERM bumps each time blazesym returns
+	// BLAZE_ERR_PERMISSION_DENIED — high values + matching
+	// KernelFallbackEngaged=1 is the canonical lockdown signature.
+	KernelLockdownEPERM atomic.Uint64
+
+	// KernelOtherErr bumps when blazesym returns a non-EPERM
+	// failure (some other CGO-side error from the Rust library).
+	// Should normally be ~0; non-zero in production deserves a
+	// look at the log lines surrounding the failure.
+	KernelOtherErr atomic.Uint64
 }
 
 // CountersSnapshot is a value-type point-in-time view of Counters.
@@ -53,6 +69,8 @@ type CountersSnapshot struct {
 	KernelBatchFailures   uint64
 	KernelFallbackEngaged uint64
 	KernelRawAddrFrames   uint64
+	KernelLockdownEPERM   uint64
+	KernelOtherErr        uint64
 }
 
 // Snapshot returns the current counter values as a plain struct.
@@ -63,6 +81,8 @@ func (c *Counters) Snapshot() CountersSnapshot {
 		KernelBatchFailures:   c.KernelBatchFailures.Load(),
 		KernelFallbackEngaged: c.KernelFallbackEngaged.Load(),
 		KernelRawAddrFrames:   c.KernelRawAddrFrames.Load(),
+		KernelLockdownEPERM:   c.KernelLockdownEPERM.Load(),
+		KernelOtherErr:        c.KernelOtherErr.Load(),
 	}
 }
 
@@ -71,7 +91,8 @@ func (c *Counters) Snapshot() CountersSnapshot {
 // drops without having to add a metrics scrape.
 func (s CountersSnapshot) String() string {
 	return fmt.Sprintf(
-		"symbolize: batches=%d input_ips=%d batch_failures=%d fallback_engaged=%d raw_addr_frames=%d",
+		"symbolize: batches=%d input_ips=%d batch_failures=%d fallback_engaged=%d raw_addr_frames=%d eperm=%d other_err=%d",
 		s.KernelBatches, s.KernelInputIPs, s.KernelBatchFailures, s.KernelFallbackEngaged, s.KernelRawAddrFrames,
+		s.KernelLockdownEPERM, s.KernelOtherErr,
 	)
 }

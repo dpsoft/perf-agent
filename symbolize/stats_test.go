@@ -27,9 +27,14 @@ func TestCounters_StringContainsBumpedFields(t *testing.T) {
 	c.KernelBatches.Add(5)
 	c.KernelFallbackEngaged.Add(1)
 	c.KernelRawAddrFrames.Add(42)
+	c.KernelLockdownEPERM.Add(7)
+	c.KernelOtherErr.Add(2)
 
 	out := c.Snapshot().String()
-	for _, want := range []string{"batches=5", "fallback_engaged=1", "raw_addr_frames=42"} {
+	for _, want := range []string{
+		"batches=5", "fallback_engaged=1", "raw_addr_frames=42",
+		"eperm=7", "other_err=2",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("snapshot string missing %q: %s", want, out)
 		}

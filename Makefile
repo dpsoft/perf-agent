@@ -88,6 +88,16 @@ clean:
 bench-corpus:
 	GOTOOLCHAIN=auto go test -bench=. -benchmem -run=^$$ ./unwind/ehcompile/...
 
+# Roadmap #6: bench the symbolize hot path so PRs touching it have
+# numerical evidence (or numerical regressions). Covers the
+# /proc/kallsyms parser, cache load, and per-IP resolve.
+.PHONY: bench-symbolize
+bench-symbolize:
+	LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
+		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
+		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+		go test -bench=. -benchmem -run=^$$ ./symbolize/...
+
 bench-build:
 	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
 		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-rpath,$(abspath $(LIBBLAZESYM_SRC)/target/release) -lblazesym_c" \

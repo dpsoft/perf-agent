@@ -4,8 +4,8 @@ Captures follow-up work surfaced while fixing the v1.2.0 kernel-stacks
 production gaps (lockdown=integrity symbolization + perf.data
 userspace MMAP2 records).
 
-**Status:** Items #2, #5, #8, #10 shipped in the same PR as the bug
-fixes. Items #1, #3, #4, #6, #7, #9 remain as follow-ups.
+**Status:** Items #1, #2, #5, #8, #10 shipped in the same PR as the
+bug fixes. Items #3, #4, #6, #7, #9 remain as follow-ups.
 
 ## Observability of perf-agent itself
 
@@ -16,17 +16,24 @@ improvements below close that gap.
 
 ### 1. Self-profile lane
 
-A second perf-agent profiling the first perf-agent during a fixed
-workload. Asserts:
+**Shipped in this PR.** New `self` scenario in
+`bench/cmd/scenario/`: perf-agent #1 profiles a CPU workload while
+perf-agent #2 profiles perf-agent #1. Outputs JSON with:
 
-- perf-agent's CPU ≤ N% of sampled CPU (overhead regression gate)
-- perf-agent's kernel-symbol resolution rate ≥ M (would have caught
-  the lockdown bug — the first agent's flames would show kernel side
-  empty, the second agent's pprof would carry the evidence)
+- `cpu_overhead_ratio` — agent samples / workload samples (a
+  straight comparison at the same sample rate over the same window)
+- `kernel_resolution_rate` — fraction of kernel-side Locations
+  whose Function.Name is non-hex (i.e., resolved by blazesym or
+  the kallsyms fallback rather than dropped to "0x<addr>")
 
-Suggested location: `bench/self/`. Wires into the existing
-`bench/cmd/scenario/` harness — runs in CI on every PR touching
-`profile/`, `offcpu/`, `symbolize/`.
+Budget gates: `--cpu-budget` (max overhead) and
+`--resolution-budget` (min resolution rate) on the scenario binary
+fail the run with a non-zero exit when breached. `make bench-self`
+runs the canonical 3×10s configuration with 10% CPU / 50% kernel
+resolution gates.
+
+Future: wire `make bench-self` into a CI lane that runs on every
+PR touching `profile/`, `offcpu/`, `symbolize/`.
 
 ### 2. `metrics.Exporter` histograms
 
@@ -121,7 +128,7 @@ alongside the MMAP2 record for the workload pid.
 
 | ID | Effort | Priority | Status |
 |----|--------|----------|--------|
-| 1  | 1d     | High     | Pending — catches future lockdown-class bugs at PR time |
+| 1  | 1d     | High     | **Shipped** in this PR — `make bench-self` |
 | 2  | 0.5d   | High     | **Partial** — counters shipped, histograms pending |
 | 3  | 0.5d   | Med      | Pending — easy wins once #2 fully ships |
 | 4  | 0.5d   | Med      | Pending — depends on #2 |
@@ -132,6 +139,6 @@ alongside the MMAP2 record for the workload pid.
 | 9  | 1d     | Med      | Pending — natural follow-up to #8 |
 | 10 | 0.5d   | Low      | **Shipped** in this PR (AddComm was entirely unwired, not just for kthreads) |
 
-Recommended next: **1 → 9 → 4 → 3 → 6 → 7**. #1 (self-profile lane)
-remains the highest-leverage item left — it's what would have caught
-the original v1.2.0 lockdown bug at PR time.
+Recommended next: **9 → 4 → 3 → 6 → 7**. With #1 in place,
+catching overhead and lockdown regressions is now mechanical; the
+remaining items broaden observability and capture quality.

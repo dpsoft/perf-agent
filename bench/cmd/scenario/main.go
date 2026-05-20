@@ -37,13 +37,18 @@ func modeFromFlag(s string) dwarfagent.Mode {
 
 func main() {
 	var (
-		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed (required)")
+		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed | self (required)")
 		processes   = flag.Int("processes", 30, "fleet size for system-wide-mixed")
 		runs        = flag.Int("runs", 5, "iterations per scenario")
 		dropCache   = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
 		outPath     = flag.String("out", "", "output JSON path (default ./bench-{scenario}-{ts}.json)")
 		workloadDir = flag.String("workloads-dir", "", "test/workloads dir (default auto-detect)")
 		unwind      = flag.String("unwind", "auto", "unwind mode passed to dwarfagent: auto (lazy) | dwarf (eager)")
+		// self-scenario specific flags
+		agentPath        = flag.String("agent", "", "path to perf-agent binary for the self scenario (default ./perf-agent)")
+		selfDuration     = flag.Duration("self-duration", 10*time.Second, "capture window for each perf-agent in the self scenario")
+		cpuBudget        = flag.Float64("cpu-budget", 0, "self scenario: max allowed CPU overhead ratio (agent samples / workload samples); 0 disables the gate")
+		resolutionBudget = flag.Float64("resolution-budget", 0, "self scenario: min allowed kernel-symbol resolution rate; 0 disables the gate")
 	)
 	// NOTE: --inject-python was previously plumbed here, but the bench
 	// constructs dwarfagent.NewProfilerWithMode directly rather than going
@@ -57,7 +62,11 @@ func main() {
 		os.Exit(2)
 	}
 
-	if !checkCaps() {
+	// The "self" scenario is pure orchestration — it spawns
+	// perf-agent subprocesses which carry their own file caps.
+	// Other scenarios use dwarfagent.NewProfilerWithMode in-process
+	// and need caps on this binary itself.
+	if *scenario != "self" && !checkCaps() {
 		_, _ = fmt.Fprintln(os.Stdout, "BENCH_SKIPPED: missing required capabilities (CAP_PERFMON, CAP_BPF, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_CHECKPOINT_RESTORE)")
 		os.Exit(0)
 	}
@@ -89,6 +98,19 @@ func main() {
 		runPIDLarge(doc, dir, *runs, *dropCache, *unwind)
 	case "system-wide-mixed":
 		runSystemWideMixed(doc, dir, *processes, *runs, *dropCache, *unwind)
+	case "self":
+		ap := *agentPath
+		if ap == "" {
+			ap = "./perf-agent"
+		}
+		abs, err := filepath.Abs(ap)
+		if err != nil {
+			log.Fatalf("resolve agent path: %v", err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			log.Fatalf("perf-agent binary not found at %s (set --agent or run `make build`): %v", abs, err)
+		}
+		selfBudgetsMet = runSelf(doc, dir, abs, *runs, *dropCache, *selfDuration, *cpuBudget, *resolutionBudget)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
@@ -107,7 +129,20 @@ func main() {
 		log.Fatalf("write %s: %v", out, err)
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "wrote %s\n", out)
+
+	// Non-zero exit on budget breach so CI can gate on the result.
+	// Only the "self" scenario currently has budgets — others have
+	// no concept of pass/fail (they're measurement-only).
+	if *scenario == "self" && !selfBudgetsMet {
+		_, _ = fmt.Fprintln(os.Stderr, "self scenario: one or more budget gates breached (see `cpu_overhead_budget_met` / `resolution_rate_budget_met` in the output JSON)")
+		os.Exit(3)
+	}
 }
+
+// selfBudgetsMet is set by the "self" scenario; only consulted when
+// --scenario=self is in effect. Package-level so the budget-exit
+// check at the end of main() can read it without threading.
+var selfBudgetsMet = true
 
 // runPIDLarge spawns one Rust workload, attaches dwarfagent --pid,
 // and records per-binary timings across N runs.

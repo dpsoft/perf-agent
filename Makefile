@@ -103,3 +103,34 @@ bench-scenarios: bench-build test-workloads
 	./bench/cmd/scenario/scenario --scenario system-wide-mixed --processes 30 --runs 5 --out bench-system-wide-mixed.json
 	./bench/cmd/report/report --in bench-pid-large.json bench-system-wide-mixed.json > bench-report.md
 	@echo "report written to bench-report.md"
+
+# Self-profile scenario: a second perf-agent profiles the first while
+# it captures a CPU workload. Catches perf-agent overhead regressions
+# AND the v1.2.0-class lockdown bug at PR time (the kernel-resolution
+# canary would have surfaced empty kernel-side flames in CI).
+# Defaults:
+#   --self-duration 10s  --runs 3
+#   --cpu-budget 0.10        (perf-agent ≤ 10% of workload CPU)
+#   --resolution-budget 0.50 (≥ 50% of kernel locations named)
+# Override on the command line if needed.
+.PHONY: bench-self
+# Note: depends only on bench-build + test-workloads. The perf-agent
+# binary is expected to be built AND setcap'd manually beforehand —
+# adding `build` as a dep would wipe the file caps every invocation.
+bench-self: bench-build test-workloads
+	@# The scenario binary doesn't need caps for "self" — it's pure
+	@# orchestration. perf-agent subprocesses each carry their own
+	@# file caps and need to be capped explicitly.
+	@if ! getcap ./perf-agent | grep -q cap_perfmon; then \
+		echo "*** perf-agent binary missing caps; run: sudo setcap cap_perfmon,cap_bpf,cap_sys_admin,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent"; \
+		exit 1; \
+	fi
+	@# Budget gates calibrated to catch regressions, not enforce a
+	@# specific overhead target on this codebase as-of-today:
+	@#   --cpu-budget 1.5 means agent CPU <= 150% of workload CPU.
+	@#   --resolution-budget 0.5 means >=50% of kernel locations named.
+	@# Tighten as perf-agent gets leaner; loosen on slow CI runners.
+	./bench/cmd/scenario/scenario --scenario self --runs 3 --self-duration 10s \
+		--cpu-budget 1.5 --resolution-budget 0.5 \
+		--out bench-self.json
+	@echo "self-profile bench written to bench-self.json"

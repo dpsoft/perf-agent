@@ -1755,6 +1755,121 @@ func TestPerfDataKernelMmap2(t *testing.T) {
 	}
 }
 
+// TestPerfDataUserspaceMmap2 covers Bug 3: a perf.data produced by
+// perf-agent in --pid mode must contain at least one PERF_RECORD_MMAP2
+// for a userspace mapping of the target PID. Without these records
+// `perf script` and `perf report` cannot resolve user-space IPs and
+// every user-side frame in the output shows up as [unknown] — which
+// previously forced operators to post-process perf.data with the awk
+// /proc/kallsyms hack the kernel-stacks spec calls out.
+func TestPerfDataUserspaceMmap2(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+
+	bin := getAgentPath(t)
+
+	cmd, cleanup := spawnIoBoundWorkload(t)
+	defer cleanup()
+
+	outDir := t.TempDir()
+	pb := filepath.Join(outDir, "profile.pb.gz")
+	pd := filepath.Join(outDir, "perf.data")
+	agent := exec.Command(bin,
+		"--profile",
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", pb,
+		"--perf-data-output", pd,
+	)
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	body, err := os.ReadFile(pd)
+	if err != nil {
+		t.Fatalf("read perf.data: %v", err)
+	}
+
+	// The target io_bound binary is the most reliable userspace
+	// filename to expect — agent walks /proc/<pid>/maps which always
+	// contains the executable itself.
+	if !bytes.Contains(body, []byte("io_bound")) {
+		t.Fatalf("perf.data missing io_bound userspace MMAP2 filename (kernel-only mmap was emitted, userspace mmaps are missing)")
+	}
+
+	// Target PID must appear in the MMAP2 record's pid field. Probe
+	// the LE byte pattern: pid != 0 and pid != 0xffffffff means we
+	// have a per-process MMAP2 (not the kernel sentinel).
+	pid := uint32(cmd.Process.Pid)
+	pidLE := []byte{byte(pid), byte(pid >> 8), byte(pid >> 16), byte(pid >> 24)}
+	if !bytes.Contains(body, pidLE) {
+		t.Fatalf("perf.data missing pid=%d marker (%x) — userspace MMAP2 PID field not set", pid, pidLE)
+	}
+}
+
+// TestKernelStackResolution_ForcedFallback covers the kernel-lockdown
+// path: on hosts with lockdown=integrity, blazesym's default kernel
+// source fails with BLAZE_ERR_PERMISSION_DENIED and SymbolizeKernel
+// retries against the kallsyms-only source (vmlinux=""). This test
+// pins the fallback path on every host by setting
+// PERFAGENT_FORCE_KERNEL_FALLBACK=1, so a regression in the fallback
+// implementation surfaces in normal CI without needing an actual
+// locked-down kernel.
+//
+// Also explicitly verifies that --pid mode (not --all) resolves
+// kernel symbols — kernel-mode resolution is a per-symbolizer property
+// and should not depend on system-wide capture scope.
+func TestKernelStackResolution_ForcedFallback(t *testing.T) {
+	t.Helper()
+	requireBPFRunnable(t, getAgentPath(t))
+
+	if !readKptrRestrictZero() {
+		t.Skip("requires kptr_restrict=0 (the fallback path resolves via /proc/kallsyms)")
+	}
+
+	bin := getAgentPath(t)
+
+	cmd, cleanup := spawnIoBoundWorkload(t)
+	defer cleanup()
+
+	out := filepath.Join(t.TempDir(), "profile.pb.gz")
+	agent := exec.Command(bin,
+		"--profile",
+		"--kernel-stacks",
+		"--pid", strconv.Itoa(cmd.Process.Pid),
+		"--duration", "3s",
+		"--profile-output", out,
+	)
+	// Force the kallsyms-only path so this test always exercises the
+	// fallback branch, regardless of whether the running kernel has
+	// lockdown=integrity.
+	agent.Env = append(os.Environ(), "PERFAGENT_FORCE_KERNEL_FALLBACK=1")
+	agent.Stdout = os.Stdout
+	agent.Stderr = os.Stderr
+	if err := agent.Run(); err != nil {
+		t.Fatalf("perf-agent run: %v", err)
+	}
+
+	p := parseProfile(t, out)
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
+	}
+
+	// The fallback path must still surface kernel symbols. Use the
+	// same regex as TestKernelStackResolution: common syscall / VFS /
+	// scheduler / TCP entry points produced by the io_bound workload.
+	kernelRe := regexp.MustCompile(`^(do_sys_|ksys_|__x64_sys_|vfs_|__schedule|read_|sock_|tcp_)`)
+	for name := range got {
+		if kernelRe.MatchString(name) {
+			return
+		}
+	}
+	t.Fatalf("forced-fallback path produced no kernel symbol; got: %v", sortedKeys(got))
+}
+
 // spawnIoBoundWorkload starts the Go io_bound workload (heavy /dev/zero reads
 // → frequent syscall/kernel frames) and returns the running command plus a
 // cleanup func that kills it.

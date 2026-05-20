@@ -254,6 +254,53 @@ func (w *Writer) AddKernelMmap() error {
 	return nil
 }
 
+// UserspaceMapping is the minimal projection of /proc/<pid>/maps
+// needed to emit a PERF_RECORD_MMAP2 for a single executable mapping.
+// Callers (perfagent.Agent) build these from procmap.Resolver and
+// hand them to AddUserspaceMmaps; perfdata stays decoupled from
+// procmap and the resolver.
+type UserspaceMapping struct {
+	Start   uint64 // virtual address of the mapping start
+	Len     uint64 // mapping length in bytes
+	Pgoff   uint64 // file offset (p_offset of backing PT_LOAD)
+	Path    string // on-disk path, e.g. /usr/bin/foo or /usr/lib/libc.so.6
+	BuildID []byte // optional, up to 20 bytes; emits the build-id flavour
+}
+
+// AddUserspaceMmaps emits PERF_RECORD_MMAP2 records for each given
+// mapping under the supplied PID. Without these records `perf script`
+// / `perf report` cannot resolve user-space IPs against on-disk
+// binaries and shows [unknown] for every userspace frame. Should be
+// called once per target PID, after AddKernelMmap, before any sample
+// records.
+//
+// When BuildID is non-empty, emits the build-id flavour of the MMAP2
+// record so consumers can match the mapping to a debuginfo file by
+// build-id rather than path (survives renames, sidecar paths, etc.).
+func (w *Writer) AddUserspaceMmaps(pid int, mappings []UserspaceMapping) {
+	for _, m := range mappings {
+		rec := Mmap2Record{
+			Pid:      uint32(pid),
+			Tid:      uint32(pid),
+			Addr:     m.Start,
+			Len:      m.Len,
+			Pgoff:    m.Pgoff,
+			Prot:     0x5, // PROT_READ | PROT_EXEC
+			Flags:    0x2, // MAP_PRIVATE
+			Filename: m.Path,
+		}
+		if n := len(m.BuildID); n > 0 {
+			if n > len(rec.BuildID) {
+				n = len(rec.BuildID)
+			}
+			rec.HasBuildID = true
+			rec.BuildIDSize = uint8(n)
+			copy(rec.BuildID[:], m.BuildID[:n])
+		}
+		w.AddMmap2(rec)
+	}
+}
+
 // readKernelTextRange returns (start, len) for kernel text. When
 // /proc/kallsyms is readable AND exposes _text + _etext, returns the
 // real range. Otherwise returns the conventional kernel base +

@@ -3,6 +3,7 @@ package perfagent
 import (
 	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -356,6 +357,43 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.perfDataWriter != nil && a.config.KernelStacks {
 		if err := a.perfDataWriter.AddKernelMmap(); err != nil {
 			log.Printf("perfdata: AddKernelMmap: %v (continuing; kernel symbol resolution may be limited)", err)
+		}
+	}
+
+	if a.perfDataWriter != nil && hostPID != 0 {
+		// Single-PID mode: synthesize userspace MMAP2 records from
+		// /proc/<pid>/maps so `perf script` / `perf report` can
+		// resolve user-space IPs against on-disk binaries. Without
+		// these every userspace frame in the resulting perf.data
+		// shows up as [unknown]. System-wide capture (hostPID==0)
+		// would need a walk across every observed PID — out of
+		// scope for this writer-init hook; samples carry their
+		// own pid so a future pass can synthesize lazily.
+		r := procmap.NewResolver()
+		mappings, err := r.Mappings(uint32(hostPID))
+		if err != nil {
+			log.Printf("perfdata: enumerate userspace mappings for pid %d: %v (continuing; perf.data userspace symbols may be [unknown])", hostPID, err)
+		} else {
+			user := make([]perfdata.UserspaceMapping, 0, len(mappings))
+			for _, m := range mappings {
+				if !m.IsExec {
+					continue
+				}
+				var bid []byte
+				if m.BuildID != "" {
+					if b, err := hex.DecodeString(m.BuildID); err == nil {
+						bid = b
+					}
+				}
+				user = append(user, perfdata.UserspaceMapping{
+					Start:   m.Start,
+					Len:     m.Limit - m.Start,
+					Pgoff:   m.Offset,
+					Path:    m.Path,
+					BuildID: bid,
+				})
+			}
+			a.perfDataWriter.AddUserspaceMmaps(hostPID, user)
 		}
 	}
 

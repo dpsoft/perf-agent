@@ -876,51 +876,6 @@ func emitUserspaceMmapsForPID(w *perfdata.Writer, r *procmap.Resolver, pid int) 
 	w.AddUserspaceMmaps(pid, user)
 }
 
-// emitCommAndMmapsForAllPIDs implements the system-wide synthetic
-// COMM + MMAP2 pass: walks /proc, emits COMM for every visible PID
-// (so `perf script` prints readable process names for kernel-side
-// samples), and MMAP2 for every non-kthread PID (so userspace IPs
-// resolve to on-disk binaries). Skips PIDs whose files become
-// unreadable mid-walk (process exited) without failing.
-//
-// kthreads: detected by empty /proc/<pid>/cmdline. They get COMM
-// but no MMAP2 — they have no userspace mappings anyway, and the
-// open+parse is wasteful across thousands of pids.
-//
-// Trade-off vs. `perf record -a`: this is a snapshot at writer init.
-// Processes that exec after the snapshot are invisible. Roadmap
-// item #9 (lazy on-first-sample emission) closes that gap; the
-// snapshot is enough for steady-state workloads, which is the
-// common voidbox/benchmark case the original bug report cited.
-func emitCommAndMmapsForAllPIDs(w *perfdata.Writer, r *procmap.Resolver) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		log.Printf("perfdata: read /proc for system-wide comm+mmap walk: %v (continuing; perf.data userspace symbols may be [unknown])", err)
-		return
-	}
-	comm, mmap := 0, 0
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 0 {
-			continue
-		}
-		// COMM for every pid we see — including kthreads.
-		emitCommForPID(w, pid)
-		comm++
-		// MMAP2 only for userspace processes. Cheap kthread
-		// detection: kthreads have empty /proc/<pid>/cmdline.
-		if body, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && len(body) == 0 {
-			continue
-		}
-		emitUserspaceMmapsForPID(w, r, pid)
-		mmap++
-	}
-	log.Printf("perfdata: emitted system-wide records: %d COMM, %d userspace MMAP2 sets", comm, mmap)
-}
-
 // dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When
 // --inject-python is enabled and the target is system-wide, OnNewExec is
 // wired to pyInjector.ActivateLate so late-arriving Python processes are

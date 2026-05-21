@@ -2,6 +2,7 @@ package symbolize
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	blazesym "github.com/libbpf/blazesym/go"
@@ -33,6 +34,14 @@ func NewLocalSymbolizer() (*LocalSymbolizer, error) {
 
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
 // expanded into the Frame.Inlined slice in caller-most-to-callee order.
+//
+// On blazesym error (e.g. "permission denied" when the target is
+// setcap'd and ptrace_scope restricts /proc/<pid>/exe), returns raw
+// hex-named Frames instead of dropping the batch — preserves stack
+// shape and addresses so operators can decode with addr2line and
+// the pprof's user mapping still has somewhere to attach. A future
+// per-mapping ELF resolver (roadmap follow-up to bench-self bug B)
+// can recover full symbols using procmap-supplied paths.
 func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -47,7 +56,7 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 		blazesym.ProcessSourceWithDebugSyms(true),
 	)
 	if err != nil {
-		return nil, err
+		return rawUserAddrFrames(ips), nil
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {
@@ -72,12 +81,26 @@ func (s *LocalSymbolizer) Close() error {
 // fromBlazesymSym translates one blazesym.Sym into a Frame, populating
 // Inlined in caller-most-to-callee order. addr is the abs IP this frame
 // was resolved from.
+//
+// On per-IP miss (s.Name == "" — blazesym opened the binary but
+// couldn't map this address to a symbol), Name is filled with the
+// hex IP so the pprof Location renders as "0x<addr>" instead of
+// "<unknown>". Symmetric to the kernel-side rawKernelAddrFrames /
+// frameFromKernelCSym behavior — operators can decode with
+// addr2line; <unknown> just hides the structure.
 func fromBlazesymSym(s blazesym.Sym, addr uint64) Frame {
+	name := s.Name
+	reason := FailureNone
+	if name == "" {
+		name = fmt.Sprintf("0x%x", addr)
+		reason = FailureMissingSymbols
+	}
 	f := Frame{
 		Address: addr,
-		Name:    s.Name,
+		Name:    name,
 		Module:  s.Module,
 		Offset:  s.Offset,
+		Reason:  reason,
 	}
 	if s.CodeInfo != nil {
 		f.File = s.CodeInfo.File

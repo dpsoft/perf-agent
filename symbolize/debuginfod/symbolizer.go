@@ -68,6 +68,14 @@ func New(opts Options) (*Symbolizer, error) {
 		_ = c.Close()
 		return nil, err
 	}
+	// LocalSymbolizer fallback for the NULL-return case (locally-built
+	// binaries with build-ids absent upstream, or targets whose
+	// /proc/<pid>/exe is restricted). Construct lazily-tolerant:
+	// failure to build the fallback is non-fatal — the dispatcher
+	// just runs without it.
+	if lf, lfErr := symbolize.NewLocalSymbolizer(); lfErr == nil {
+		st.localFallback = lf
+	}
 	s.cgo = st
 	return s, nil
 }

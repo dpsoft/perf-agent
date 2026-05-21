@@ -280,6 +280,11 @@ type cgoState struct {
 	csym     *C.blaze_symbolizer
 	dispatch *C.blaze_symbolizer_dispatch
 	handle   cgo.Handle
+
+	// localFallback is consulted when the upstream blazesym
+	// process-mode call returns NULL. Optional: nil means no
+	// fallback, error propagates as before. See symbolizeProcess.
+	localFallback symbolize.Symbolizer
 }
 
 func newCgoState(s *Symbolizer) (*cgoState, error) {
@@ -328,9 +333,25 @@ func (st *cgoState) close() {
 		st.handle.Delete()
 		st.handle = 0
 	}
+	if st.localFallback != nil {
+		_ = st.localFallback.Close()
+		st.localFallback = nil
+	}
 }
 
 // symbolizeProcess is the C-side symbolize call. Returns one Frame per IP.
+//
+// On NULL return (which surfaces for two known causes: upstream
+// debuginfod has no debug-info for the build-id of a locally-built
+// binary; or the target is setcap'd and /proc/<pid>/exe is
+// restricted by ptrace_scope), falls back to local-only
+// symbolization via the parent Symbolizer's LocalSymbolizer fallback.
+// If the local path also fails, the caller's LocalSymbolizer returns
+// raw-hex-named frames (symbolize/local.go), preserving stack shape.
+//
+// Discovered via the self-profile scenario (roadmap #1) when
+// DEBUGINFOD_URLS pointed at a server that didn't have perf-agent's
+// own locally-generated build-id.
 func (st *cgoState) symbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Frame, error) {
 	if len(ips) == 0 {
 		return nil, nil
@@ -339,6 +360,12 @@ func (st *cgoState) symbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fram
 	caddr := (*C.uint64_t)(unsafe.Pointer(&ips[0]))
 	syms := C.blaze_symbolize_process_abs_addrs(st.csym, &src, caddr, C.size_t(len(ips)))
 	if syms == nil {
+		if st.localFallback != nil {
+			frames, err := st.localFallback.SymbolizeProcess(pid, ips)
+			if err == nil {
+				return frames, nil
+			}
+		}
 		return nil, fmt.Errorf("debuginfod: blaze_symbolize_process_abs_addrs returned NULL")
 	}
 	defer C.blaze_syms_free(syms)
@@ -406,9 +433,17 @@ func (st *cgoState) symbolizeElfVirt(path string, originalIPs, virtOffsets []uin
 // frameFromCSym translates one C blaze_sym to a Go Frame. The Inlined
 // chain is left in caller-most-to-callee order (no reversal here; the
 // reversal lives in symbolize.ToProfFrames).
+//
+// On per-IP miss (c.name == NULL — blazesym opened the binary but
+// couldn't map this address to a symbol), Name is filled with the
+// hex IP so the pprof Location renders as "0x<addr>" instead of
+// "<unknown>". Symmetric to the kernel-side rawKernelAddrFrames /
+// frameFromKernelCSym behavior. Operators can decode hex names
+// with addr2line; <unknown> is dead weight.
 func frameFromCSym(c *C.blaze_sym, addr uint64) symbolize.Frame {
 	f := symbolize.Frame{Address: addr}
 	if c.name == nil {
+		f.Name = fmt.Sprintf("0x%x", addr)
 		f.Reason = symbolize.FailureUnknownAddress
 		return f
 	}

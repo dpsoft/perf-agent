@@ -16,14 +16,19 @@ static blaze_symbolizer_opts make_kernel_opts(_Bool code_info, _Bool inlined_fns
     return opts;
 }
 
+// make_kernel_src returns the kernel source blazesym uses by default:
+// kallsyms=NULL → /proc/kallsyms, vmlinux=NULL → blazesym auto-scans
+// /sys/kernel/btf/vmlinux, /boot/vmlinux-*, /proc/kcore, and friends
+// for DWARF. On hosts with kernel lockdown=integrity (Secure Boot) one
+// of those open() calls returns EACCES — most commonly /proc/kcore,
+// which has CAP_SYS_RAWIO + CAP_DAC_READ_SEARCH requirements — and
+// blazesym surfaces it as BLAZE_ERR_PERMISSION_DENIED for the whole
+// batch. SymbolizeKernel handles this by falling back to a pure-Go
+// /proc/kallsyms symbolizer (kallsyms.go).
 static blaze_symbolize_src_kernel make_kernel_src(void) {
     blaze_symbolize_src_kernel src;
     memset(&src, 0, sizeof(src));
     src.type_size = sizeof(src);
-    // kallsyms = NULL, vmlinux = NULL → blazesym uses /proc/kallsyms +
-    // discovers vmlinux on disk if it can. debug_syms = true so the
-    // bumped blazesym pin walks /proc/modules + /lib/modules/<release>/
-    // for module .ko.debug DWARF.
     src.debug_syms = 1;
     return src;
 }
@@ -39,24 +44,86 @@ import "C"
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
-// LocalKernelSymbolizer wraps blazesym's kernel source: /proc/kallsyms
-// for vmlinux + every loaded module's symbols. With debug_syms=true and
-// the v1.1.0+ blazesym pin (≥ commit 29a609f), module functions resolve
-// to function name + source :line when distro kernel-modules-debuginfo
-// is installed locally.
+// errBlazePermissionDenied signals that blazesym returned
+// BLAZE_ERR_PERMISSION_DENIED for the kernel source. The
+// SymbolizeKernel fallback ladder converts this into a switch to the
+// pure-Go /proc/kallsyms symbolizer for the symbolizer's lifetime.
+var errBlazePermissionDenied = errors.New("symbolize: blazesym permission denied (kernel lockdown?)")
+
+// forceFallbackEnv lets operators (and integration tests) force the
+// pure-Go /proc/kallsyms fallback without waiting for blazesym to
+// fail first. Set PERFAGENT_FORCE_KERNEL_FALLBACK=1 to skip the CGO
+// blazesym path on hosts known to be locked down — avoids one wasted
+// CGO call per sample batch — and to exercise the fallback in CI on
+// hosts that don't naturally hit EPERM.
+const forceFallbackEnv = "PERFAGENT_FORCE_KERNEL_FALLBACK"
+
+// LocalKernelSymbolizer resolves kernel-mode addresses via blazesym,
+// with a transparent pure-Go /proc/kallsyms fallback for hosts where
+// blazesym can't read its required kernel images (lockdown=integrity,
+// Secure Boot, missing CAP_SYS_RAWIO/CAP_DAC_READ_SEARCH).
+//
+// blazesym path: gives function name + offset + inline expansion +
+// source file:line when the host kernel exposes vmlinux DWARF and
+// /proc/kcore. Used by default on permissive hosts.
+//
+// Pure-Go kallsyms path (see kallsyms.go): gives function name +
+// offset + module marker only. No DWARF, no inline frames. Sufficient
+// for flame graphs and operator decoding — and works under
+// lockdown=integrity, which is the common production case.
+//
+// The fallback decision is sticky: once we've seen
+// BLAZE_ERR_PERMISSION_DENIED on this host, every subsequent batch
+// goes straight to the pure-Go path. Re-probing blazesym on every
+// batch would waste a CGO call per sample.
 type LocalKernelSymbolizer struct {
 	csym   *C.blaze_symbolizer
 	closed atomic.Bool
 	mu     sync.Mutex
+
+	// callBlazesym is the seam under SymbolizeKernel. In production
+	// it points to invoke (which routes to cgoSymbolize or to the
+	// pure-Go kallsymsSymbolizer based on useFallback). Tests swap
+	// it for a stub so the Go-level fallback ladder can be exercised
+	// without a real blazesym handle and without a real
+	// /proc/kallsyms read.
+	callBlazesym func(ips []uint64, useFallback bool) ([]Frame, error)
+
+	// fallback is set once blazesym reports permission-denied on the
+	// CGO path, or at construction time when forceFallbackEnv is set.
+	// Subsequent batches skip the failing CGO path and go straight to
+	// the pure-Go /proc/kallsyms symbolizer.
+	fallback atomic.Bool
+
+	// kallsymsOnce + kallsymsCache + kallsymsErr lazily build the
+	// pure-Go /proc/kallsyms index on the first fallback batch and
+	// reuse it for the symbolizer's lifetime. Parsing is ~3M lines
+	// of /proc/kallsyms on a typical x86_64 — one-time cost.
+	kallsymsOnce  sync.Once
+	kallsymsCache *kallsymsSymbolizer
+	kallsymsErr   error
+
+	// stats counts observability events (batch counts, fallback
+	// engagement, raw-address synthesis). Exposed via Stats() for
+	// end-of-run logging and future /metrics scrape.
+	stats Counters
+}
+
+// Stats returns a snapshot of the symbolizer's observability
+// counters. Safe to call concurrently with SymbolizeKernel.
+func (s *LocalKernelSymbolizer) Stats() CountersSnapshot {
+	return s.stats.Snapshot()
 }
 
 // NewLocalKernelSymbolizer returns a kernel symbolizer or
@@ -76,12 +143,34 @@ func NewLocalKernelSymbolizer() (*LocalKernelSymbolizer, error) {
 	if csym == nil {
 		return nil, fmt.Errorf("blaze_symbolizer_new_opts returned NULL")
 	}
-	return &LocalKernelSymbolizer{csym: csym}, nil
+	s := &LocalKernelSymbolizer{csym: csym}
+	s.callBlazesym = s.invoke
+	if os.Getenv(forceFallbackEnv) == "1" {
+		// Bump the counter so the end-of-run log reflects that we
+		// ran in fallback mode, matching the semantic when the
+		// switch happens naturally via EPERM. Without this, the
+		// forced-fallback case would log fallback_engaged=0 and
+		// operators couldn't tell the kallsyms path was used.
+		s.fallback.Store(true)
+		s.stats.KernelFallbackEngaged.Add(1)
+	} else if blazesymEPERMMarkerExists() {
+		// We've seen blazesym EPERM on this boot already. Skip the
+		// failing attempt — it would just re-read /proc/kallsyms,
+		// hit EPERM on /proc/kcore (lockdown), and waste ~110ms of
+		// CPU per agent invocation. Marker is boot_id-scoped, so a
+		// reboot reverts to attempting blazesym fresh.
+		s.fallback.Store(true)
+		s.stats.KernelFallbackEngaged.Add(1)
+	}
+	return s, nil
 }
 
-// SymbolizeKernel resolves kernel addresses via blazesym's kernel source.
-// Returns one Frame per IP. Frames whose name couldn't be resolved get
-// Name = "0x<hex>" + Reason = FailureMissingSymbols (matches Noop posture).
+// SymbolizeKernel resolves kernel addresses to frames. On
+// BLAZE_ERR_PERMISSION_DENIED from the CGO path, transparently
+// switches to the pure-Go /proc/kallsyms symbolizer for the
+// symbolizer's remaining lifetime. If even that fails, returns
+// raw-address frames (Name="0x<hex>", Reason=FailureMissingSymbols)
+// so kernel context survives into the pprof.
 func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -98,22 +187,130 @@ func (s *LocalKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]Frame, error) {
 		return nil, ErrClosed
 	}
 
+	s.stats.KernelBatches.Add(1)
+	s.stats.KernelInputIPs.Add(uint64(len(ips)))
+	// Record per-batch wall-clock duration so p50/p99 land in the
+	// /metrics scrape and end-of-run log. Microseconds keep the
+	// numbers human-readable across both warm-cache (sub-ms) and
+	// cold-CGO (millisecond+) paths.
+	t0 := time.Now()
+	defer func() {
+		s.stats.KernelBatchHist.Record(uint64(time.Since(t0).Microseconds()))
+	}()
+
+	// Sticky fallback: once we've seen permission-denied on the CGO
+	// path, this host won't recover within the symbolizer's lifetime.
+	// Skip blazesym on every subsequent batch.
+	if s.fallback.Load() {
+		frames, err := s.callBlazesym(ips, true)
+		if err != nil {
+			s.stats.KernelBatchFailures.Add(1)
+			s.stats.KernelRawAddrFrames.Add(uint64(len(ips)))
+			return rawKernelAddrFrames(ips), nil
+		}
+		return frames, nil
+	}
+
+	frames, err := s.callBlazesym(ips, false)
+	if err == nil {
+		return frames, nil
+	}
+	if errors.Is(err, errBlazePermissionDenied) {
+		if s.fallback.CompareAndSwap(false, true) {
+			s.stats.KernelFallbackEngaged.Add(1)
+			// Persist the fact that blazesym EPERM'd on this
+			// boot so the next perf-agent invocation can skip
+			// the failing attempt at construction time. Best
+			// effort — the in-process sticky bit handles the
+			// rest of this invocation regardless.
+			_ = writeBlazesymEPERMMarker()
+		}
+		frames, err = s.callBlazesym(ips, true)
+		if err == nil {
+			return frames, nil
+		}
+	}
+	// Both paths failed — preserve raw kernel addresses so the
+	// kernel side of the stack survives into the pprof.
+	s.stats.KernelBatchFailures.Add(1)
+	s.stats.KernelRawAddrFrames.Add(uint64(len(ips)))
+	return rawKernelAddrFrames(ips), nil
+}
+
+// invoke is the production callBlazesym. useFallback=false routes to
+// the CGO blazesym path (full inline + DWARF); useFallback=true
+// routes to the pure-Go /proc/kallsyms symbolizer (name+offset only,
+// but lockdown-safe).
+func (s *LocalKernelSymbolizer) invoke(ips []uint64, useFallback bool) ([]Frame, error) {
+	if useFallback {
+		ks, err := s.getKallsymsFallback()
+		if err != nil {
+			return nil, err
+		}
+		return ks.Resolve(ips), nil
+	}
+	return s.cgoSymbolize(ips)
+}
+
+// getKallsymsFallback returns the lazily-built pure-Go /proc/kallsyms
+// symbolizer. Built exactly once per LocalKernelSymbolizer lifetime;
+// subsequent calls return the cached instance.
+func (s *LocalKernelSymbolizer) getKallsymsFallback() (*kallsymsSymbolizer, error) {
+	s.kallsymsOnce.Do(func() {
+		s.kallsymsCache, s.kallsymsErr = newKallsymsSymbolizer()
+	})
+	return s.kallsymsCache, s.kallsymsErr
+}
+
+// cgoSymbolize invokes blazesym's kernel source. Returns
+// errBlazePermissionDenied on BLAZE_ERR_PERMISSION_DENIED so the
+// fallback ladder can switch to the pure-Go path; other blazesym
+// errors propagate as wrapped errors.
+//
+// Bumps reason-bucketed counters at the error site (roadmap #4)
+// so end-of-run logs / future /metrics scrapes can distinguish a
+// lockdown host (high KernelLockdownEPERM) from a buggy blazesym
+// (any KernelOtherErr at all).
+func (s *LocalKernelSymbolizer) cgoSymbolize(ips []uint64) ([]Frame, error) {
 	src := C.make_kernel_src()
 	caddr := (*C.uint64_t)(unsafe.Pointer(&ips[0]))
 	syms := C.blaze_symbolize_kernel_abs_addrs(s.csym, &src, caddr, C.size_t(len(ips)))
 	if syms == nil {
 		errc := C.blaze_err_last()
+		if errc == C.BLAZE_ERR_PERMISSION_DENIED {
+			s.stats.KernelLockdownEPERM.Add(1)
+			return nil, errBlazePermissionDenied
+		}
+		s.stats.KernelOtherErr.Add(1)
 		errStr := C.GoString(C.blaze_err_str(errc))
 		return nil, fmt.Errorf("blaze_symbolize_kernel_abs_addrs: %s (code %d)", errStr, int(errc))
 	}
 	defer C.blaze_syms_free(syms)
 
 	out := make([]Frame, 0, int(syms.cnt))
-	for i := 0; i < int(syms.cnt); i++ {
+	for i := range int(syms.cnt) {
 		csym := C.sym_at_kernel(syms, C.size_t(i))
 		out = append(out, frameFromKernelCSym(csym, ips[i]))
 	}
 	return out, nil
+}
+
+// rawKernelAddrFrames synthesizes Frames carrying just the raw IPs
+// when no symbolizer could resolve them. Module is set so pprof's
+// kernelSentinel mapping picks these up; Reason=FailureMissingSymbols
+// matches the NoopKernelSymbolizer posture. Address is preserved so
+// distinct pprof Locations stay distinct.
+func rawKernelAddrFrames(ips []uint64) []Frame {
+	out := make([]Frame, len(ips))
+	for i, ip := range ips {
+		out[i] = Frame{
+			Address: ip,
+			Name:    fmt.Sprintf("0x%x", ip),
+			Module:  "[kernel.kallsyms]",
+			Reason:  FailureMissingSymbols,
+		}
+	}
+	return out
 }
 
 // Close releases the underlying blazesym symbolizer. Idempotent.

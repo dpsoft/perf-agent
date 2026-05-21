@@ -193,6 +193,20 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// dominates for short stacks; one batched call is dramatically
 		// cheaper than one call per IP.
 		ips := bpfstack.ExtractIPs(stack)
+		// Split kernel-range IPs out of the user-stack walk. When the
+		// sampled task is in kernel context (syscall, irq, fault),
+		// bpf_get_stackid with BPF_F_USER_STACK can leak kernel
+		// addresses into the user-stack buffer — they appear in
+		// the high half (≥ 0xffff_8000_0000_0000 on x86_64). Without
+		// this split the user symbolizer sees kernel IPs (which it
+		// can't resolve) and the kernel symbolizer never sees them.
+		// Bug discovered via bench-self iteration 2: top 5 hot
+		// "user" addresses in perf-agent's self-profile were all
+		// kernel-range.
+		ips, strayKernelIPs := bpfstack.SplitUserKernelIPs(ips)
+		if len(strayKernelIPs) > 0 {
+			kernelIPs = append(strayKernelIPs, kernelIPs...)
+		}
 		if len(ips) > 0 || len(kernelIPs) > 0 {
 			var userFrames, kernelFrames []symbolize.Frame
 			if len(ips) > 0 {
@@ -274,4 +288,5 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 		Value:       value,
 	}
 }
+
 

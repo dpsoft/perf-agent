@@ -59,8 +59,21 @@ test-integration: build test-workloads
 		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
 		bash run_tests.sh
 
+# Forces the pure-Go /proc/kallsyms kernel symbolizer on every batch
+# (via PERFAGENT_FORCE_KERNEL_FALLBACK=1). Runs only the kernel-stacks
+# tests — they're the ones whose fallback semantics matter — so the
+# lane is cheap enough to add to every CI run as a regression gate
+# against lockdown=integrity hosts.
+.PHONY: test-integration-lockdown
+test-integration-lockdown: build test-workloads
+	cd test && LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
+		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I$(LIBBLAZESYM_INC)" \
+		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+		PERFAGENT_FORCE_KERNEL_FALLBACK=1 \
+		go test -v -timeout 120s -run 'TestKernelStackResolution|TestPerfDataKernelMmap2' ./...
+
 .PHONY: test
-test: test-unit test-integration
+test: test-unit test-integration test-integration-lockdown
 
 .PHONY: clean
 clean:
@@ -74,6 +87,16 @@ clean:
 
 bench-corpus:
 	GOTOOLCHAIN=auto go test -bench=. -benchmem -run=^$$ ./unwind/ehcompile/...
+
+# Roadmap #6: bench the symbolize hot path so PRs touching it have
+# numerical evidence (or numerical regressions). Covers the
+# /proc/kallsyms parser, cache load, and per-IP resolve.
+.PHONY: bench-symbolize
+bench-symbolize:
+	LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
+		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
+		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
+		go test -bench=. -benchmem -run=^$$ ./symbolize/...
 
 bench-build:
 	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
@@ -90,3 +113,34 @@ bench-scenarios: bench-build test-workloads
 	./bench/cmd/scenario/scenario --scenario system-wide-mixed --processes 30 --runs 5 --out bench-system-wide-mixed.json
 	./bench/cmd/report/report --in bench-pid-large.json bench-system-wide-mixed.json > bench-report.md
 	@echo "report written to bench-report.md"
+
+# Self-profile scenario: a second perf-agent profiles the first while
+# it captures a CPU workload. Catches perf-agent overhead regressions
+# AND the v1.2.0-class lockdown bug at PR time (the kernel-resolution
+# canary would have surfaced empty kernel-side flames in CI).
+# Defaults:
+#   --self-duration 10s  --runs 3
+#   --cpu-budget 0.10        (perf-agent ≤ 10% of workload CPU)
+#   --resolution-budget 0.50 (≥ 50% of kernel locations named)
+# Override on the command line if needed.
+.PHONY: bench-self
+# Note: depends only on bench-build + test-workloads. The perf-agent
+# binary is expected to be built AND setcap'd manually beforehand —
+# adding `build` as a dep would wipe the file caps every invocation.
+bench-self: bench-build test-workloads
+	@# The scenario binary doesn't need caps for "self" — it's pure
+	@# orchestration. perf-agent subprocesses each carry their own
+	@# file caps and need to be capped explicitly.
+	@if ! getcap ./perf-agent | grep -q cap_perfmon; then \
+		echo "*** perf-agent binary missing caps; run: sudo setcap cap_perfmon,cap_bpf,cap_sys_admin,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent"; \
+		exit 1; \
+	fi
+	@# Budget gates calibrated to catch regressions, not enforce a
+	@# specific overhead target on this codebase as-of-today:
+	@#   --cpu-budget 1.5 means agent CPU <= 150% of workload CPU.
+	@#   --resolution-budget 0.5 means >=50% of kernel locations named.
+	@# Tighten as perf-agent gets leaner; loosen on slow CI runners.
+	./bench/cmd/scenario/scenario --scenario self --runs 3 --self-duration 10s \
+		--cpu-budget 1.5 --resolution-budget 0.5 \
+		--out bench-self.json
+	@echo "self-profile bench written to bench-self.json"

@@ -56,6 +56,20 @@ type Config struct {
 	// MetricsExporters are the exporters to use for metrics output.
 	MetricsExporters []metrics.Exporter
 
+	// MetricsListen, when non-empty, starts a small HTTP server on
+	// the given address (e.g. ":7777" or "127.0.0.1:7777") exposing:
+	//   /metrics       — Prometheus text format counters from
+	//                    symbolize.Counters (kernel symbolize
+	//                    batches, EPERMs, fallback engagement, etc.)
+	//   /debug/pprof/  — Go runtime self-pprof handlers, so an
+	//                    operator can attach `go tool pprof
+	//                    http://host:port/debug/pprof/profile`
+	//                    to a running perf-agent and see ITS hot
+	//                    paths in real time (vs the bench-self
+	//                    offline path).
+	// Empty = no server, no port opened.
+	MetricsListen string
+
 	// Unwind selects the stack unwinding strategy for --profile and
 	// --offcpu modes. Valid values: "fp" (frame pointer),
 	// "dwarf" (DWARF CFI), "auto" (default; aliases to "dwarf",
@@ -200,6 +214,15 @@ func WithTags(tags ...string) Option {
 func WithMetricsExporter(exp metrics.Exporter) Option {
 	return func(c *Config) {
 		c.MetricsExporters = append(c.MetricsExporters, exp)
+	}
+}
+
+// WithMetricsListen enables the in-process HTTP server hosting
+// /metrics (Prometheus text format) and /debug/pprof on the
+// given address. See Config.MetricsListen.
+func WithMetricsListen(addr string) Option {
+	return func(c *Config) {
+		c.MetricsListen = addr
 	}
 }
 

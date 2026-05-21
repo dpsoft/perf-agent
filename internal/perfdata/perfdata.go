@@ -47,6 +47,20 @@ type Writer struct {
 
 	// data accumulated for feature-section emission at Close
 	buildIDs []BuildIDEntry
+
+	// OnNewPID, when non-nil, fires the FIRST time AddSample sees
+	// each unique pid (skipping 0 and 0xffffffff sentinels). Used
+	// in system-wide capture to emit PERF_RECORD_COMM and per-PID
+	// PERF_RECORD_MMAP2 lazily — versus the original "walk every
+	// /proc PID at writer init" which ate ~30% of perf-agent CPU
+	// in kernel /proc/<pid>/maps rendering (dogfood iter 9).
+	//
+	// Callback runs synchronously on the AddSample hot path; the
+	// records it emits land in the perf.data BEFORE the sample
+	// they triggered, which matches `perf record`'s ordering
+	// invariant.
+	OnNewPID func(pid uint32)
+	seenPIDs map[uint32]struct{}
 }
 
 // Open creates a new perf.data file at path and writes the file header,
@@ -84,12 +98,13 @@ func Open(path string, spec EventSpec, meta MetaInfo) (*Writer, error) {
 
 	dataBeg := int64(fileHeaderSize + attrV8Size + 16)
 	return &Writer{
-		f:       f,
-		bw:      bw,
-		pos:     dataBeg,
-		dataBeg: dataBeg,
-		spec:    spec,
-		meta:    meta,
+		f:        f,
+		bw:       bw,
+		pos:      dataBeg,
+		dataBeg:  dataBeg,
+		spec:     spec,
+		meta:     meta,
+		seenPIDs: make(map[uint32]struct{}, 64),
 	}, nil
 }
 
@@ -120,8 +135,16 @@ func (w *Writer) AddMmap2(r Mmap2Record) {
 	w.writeRecord(func(b *bytes.Buffer) { encodeMmap2(b, r) })
 }
 
-// AddSample appends a PERF_RECORD_SAMPLE record.
+// AddSample appends a PERF_RECORD_SAMPLE record. When OnNewPID is
+// set, fires it (synchronously, before encoding the sample) the
+// first time each non-sentinel pid is observed.
 func (w *Writer) AddSample(r SampleRecord) {
+	if w.OnNewPID != nil && r.Pid != 0 && r.Pid != 0xffffffff {
+		if _, seen := w.seenPIDs[r.Pid]; !seen {
+			w.seenPIDs[r.Pid] = struct{}{}
+			w.OnNewPID(r.Pid)
+		}
+	}
 	w.writeRecord(func(b *bytes.Buffer) { encodeSample(b, r) })
 }
 
@@ -252,6 +275,53 @@ func (w *Writer) AddKernelMmap() error {
 		Filename: "[kernel.kallsyms]_text",
 	})
 	return nil
+}
+
+// UserspaceMapping is the minimal projection of /proc/<pid>/maps
+// needed to emit a PERF_RECORD_MMAP2 for a single executable mapping.
+// Callers (perfagent.Agent) build these from procmap.Resolver and
+// hand them to AddUserspaceMmaps; perfdata stays decoupled from
+// procmap and the resolver.
+type UserspaceMapping struct {
+	Start   uint64 // virtual address of the mapping start
+	Len     uint64 // mapping length in bytes
+	Pgoff   uint64 // file offset (p_offset of backing PT_LOAD)
+	Path    string // on-disk path, e.g. /usr/bin/foo or /usr/lib/libc.so.6
+	BuildID []byte // optional, up to 20 bytes; emits the build-id flavour
+}
+
+// AddUserspaceMmaps emits PERF_RECORD_MMAP2 records for each given
+// mapping under the supplied PID. Without these records `perf script`
+// / `perf report` cannot resolve user-space IPs against on-disk
+// binaries and shows [unknown] for every userspace frame. Should be
+// called once per target PID, after AddKernelMmap, before any sample
+// records.
+//
+// When BuildID is non-empty, emits the build-id flavour of the MMAP2
+// record so consumers can match the mapping to a debuginfo file by
+// build-id rather than path (survives renames, sidecar paths, etc.).
+func (w *Writer) AddUserspaceMmaps(pid int, mappings []UserspaceMapping) {
+	for _, m := range mappings {
+		rec := Mmap2Record{
+			Pid:      uint32(pid),
+			Tid:      uint32(pid),
+			Addr:     m.Start,
+			Len:      m.Len,
+			Pgoff:    m.Pgoff,
+			Prot:     0x5, // PROT_READ | PROT_EXEC
+			Flags:    0x2, // MAP_PRIVATE
+			Filename: m.Path,
+		}
+		if n := len(m.BuildID); n > 0 {
+			if n > len(rec.BuildID) {
+				n = len(rec.BuildID)
+			}
+			rec.HasBuildID = true
+			rec.BuildIDSize = uint8(n)
+			copy(rec.BuildID[:], m.BuildID[:n])
+		}
+		w.AddMmap2(rec)
+	}
 }
 
 // readKernelTextRange returns (start, len) for kernel text. When

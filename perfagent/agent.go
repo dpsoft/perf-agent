@@ -3,6 +3,7 @@ package perfagent
 import (
 	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -89,6 +90,10 @@ type Agent struct {
 	// kernelSymbolizer resolves kernel-space addresses. Initialized in
 	// Start() when cfg.KernelStacks is true; otherwise NoopKernelSymbolizer.
 	kernelSymbolizer symbolize.KernelSymbolizer
+
+	// metricsSrv is the optional HTTP server hosting /metrics and
+	// /debug/pprof. nil when WithMetricsListen wasn't used.
+	metricsSrv *metricsServer
 
 	mu      sync.Mutex
 	started bool
@@ -359,6 +364,32 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	if a.perfDataWriter != nil {
+		// Synthesize userspace MMAP2 records from /proc/<pid>/maps so
+		// `perf script` / `perf report` can resolve user-space IPs
+		// against on-disk binaries. Without these, every userspace
+		// frame in the resulting perf.data shows up as [unknown].
+		r := procmap.NewResolver()
+		if hostPID != 0 {
+			emitCommForPID(a.perfDataWriter, hostPID)
+			emitUserspaceMmapsForPID(a.perfDataWriter, r, hostPID)
+		} else {
+			// System-wide: emit COMM + MMAP2 lazily, on the first
+			// sample observed per PID. The previous "walk every
+			// /proc PID at writer init" pass cost ~30% of
+			// perf-agent CPU on a busy host (dogfood iter 9 found
+			// kernel /proc/<pid>/maps rendering — show_map_vma,
+			// mangle_path, lock_next_vma — dominating the
+			// profile). Lazy emission also automatically covers
+			// PIDs that exec after capture starts; the eager
+			// walk could never see those.
+			a.perfDataWriter.OnNewPID = func(pid uint32) {
+				emitCommForPID(a.perfDataWriter, int(pid))
+				emitUserspaceMmapsForPID(a.perfDataWriter, r, int(pid))
+			}
+		}
+	}
+
 	// Inject Python perf-trampoline before BPF attach so early samples have
 	// JIT symbol names. Runs only when --inject-python is set.
 	if a.pyInjector != nil {
@@ -377,6 +408,24 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	a.symbolizer = sym
 	a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
+
+	// Optional /metrics + /debug/pprof endpoint. Started after the
+	// kernelSymbolizer is constructed so the handler closure can
+	// snapshot live counters; stopped in cleanup() after the
+	// symbolizer is closed so a late scrape can't race.
+	if a.config.MetricsListen != "" {
+		srv, err := startMetricsListener(a.config.MetricsListen, func() symbolize.CountersSnapshot {
+			if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+				return lks.Stats()
+			}
+			return symbolize.CountersSnapshot{}
+		})
+		if err != nil {
+			return fmt.Errorf("start metrics listener: %w", err)
+		}
+		a.metricsSrv = srv
+		log.Printf("perf-agent: metrics endpoint listening on http://%s/metrics (and /debug/pprof)", srv.addr)
+	}
 
 	// Start CPU profiler if enabled
 	if a.config.EnableCPUProfile {
@@ -647,9 +696,20 @@ func (a *Agent) cleanup() {
 		a.symbolizer = nil
 	}
 	if a.kernelSymbolizer != nil {
+		// Surface kernel-symbolizer counters so operators see
+		// fallback engagement and frame drops at end-of-run
+		// without having to scrape a /metrics endpoint.
+		if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+			log.Printf("%s", lks.Stats())
+		}
 		_ = a.kernelSymbolizer.Close()
 		a.kernelSymbolizer = nil
 	}
+	// Stop the metrics endpoint after the symbolizer is gone — a
+	// late scrape during shutdown would otherwise see post-Close
+	// counter state, which is harmless but adds confusion.
+	stopMetricsListener(a.metricsSrv)
+	a.metricsSrv = nil
 }
 
 // readOSRelease reads the running kernel release from
@@ -749,6 +809,71 @@ func mapPtraceopErrToPython(err error) error {
 			python.ErrNoPerfTrampoline)
 	}
 	return err
+}
+
+// emitCommForPID reads /proc/<pid>/comm and writes a PERF_RECORD_COMM.
+// Best-effort: returns silently if /proc/<pid>/comm is unreadable
+// (process exited, restricted) — without COMM `perf script` shows
+// the bare numeric pid in place of the process name, but the
+// kernel-side samples are still attributed by pid.
+//
+// Emitted for every PID we walk, including kernel threads — the
+// load-bearing reason for #10 in docs/post-prod-hardening.md.
+// kthreads (kvm-pit, vhost-*, kworker/*) have empty cmdline but a
+// valid comm; without this record, kernel-stacks samples drawn from
+// them appear with no name in `perf script` output.
+func emitCommForPID(w *perfdata.Writer, pid int) {
+	body, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return
+	}
+	comm := strings.TrimSpace(string(body))
+	if comm == "" {
+		return
+	}
+	w.AddComm(perfdata.CommRecord{
+		Pid:  uint32(pid),
+		Tid:  uint32(pid),
+		Comm: comm,
+	})
+}
+
+// emitUserspaceMmapsForPID writes PERF_RECORD_MMAP2 entries to w for
+// every executable mapping in /proc/<pid>/maps, sourced via the given
+// procmap.Resolver (which also attaches build-ids from
+// .note.gnu.build-id sections). Best-effort: errors are logged and
+// the perf.data writer continues; symbol resolution will be partial
+// for any pid we couldn't enumerate.
+//
+// Does NOT emit COMM — callers that want both should call
+// emitCommForPID first (perf convention: COMM before MMAP2 for the
+// same pid).
+func emitUserspaceMmapsForPID(w *perfdata.Writer, r *procmap.Resolver, pid int) {
+	mappings, err := r.Mappings(uint32(pid))
+	if err != nil {
+		log.Printf("perfdata: enumerate userspace mappings for pid %d: %v (continuing; perf.data userspace symbols may be [unknown])", pid, err)
+		return
+	}
+	user := make([]perfdata.UserspaceMapping, 0, len(mappings))
+	for _, m := range mappings {
+		if !m.IsExec {
+			continue
+		}
+		var bid []byte
+		if m.BuildID != "" {
+			if b, err := hex.DecodeString(m.BuildID); err == nil {
+				bid = b
+			}
+		}
+		user = append(user, perfdata.UserspaceMapping{
+			Start:   m.Start,
+			Len:     m.Limit - m.Start,
+			Pgoff:   m.Offset,
+			Path:    m.Path,
+			BuildID: bid,
+		})
+	}
+	w.AddUserspaceMmaps(pid, user)
 }
 
 // dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When

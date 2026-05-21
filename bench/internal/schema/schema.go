@@ -43,7 +43,36 @@ type Run struct {
 	TotalMs             float64  `json:"total_ms"`
 	PIDCount            int      `json:"pid_count"`
 	DistinctBinaryCount int      `json:"distinct_binary_count"`
-	PerBinary           []Binary `json:"per_binary"`
+	PerBinary           []Binary `json:"per_binary,omitempty"`
+
+	// Self holds the metrics emitted by the "self" scenario (a
+	// second perf-agent profiling the first). Omitted in JSON for
+	// other scenarios via omitzero.
+	Self SelfMetrics `json:"self,omitzero"`
+}
+
+// SelfMetrics captures the measurements produced by the "self"
+// scenario: perf-agent #1 profiles a workload; perf-agent #2
+// profiles perf-agent #1. The "did this PR regress anything?" gate
+// in CI looks at:
+//
+//   - CPUOverheadRatio: how much CPU perf-agent #1 burns relative
+//     to the workload it's profiling. Above the budget = regression.
+//   - KernelResolutionRate: fraction of kernel-side samples in
+//     perf-agent #1's own pprof that resolved to a named symbol
+//     instead of "0x<hex>". A drop = blazesym + kallsyms fallback
+//     broke (the original v1.2.0 lockdown class of bug).
+type SelfMetrics struct {
+	WorkloadPID            int     `json:"workload_pid"`
+	AgentPID               int     `json:"agent_pid"`
+	WorkloadCPUSamples     int     `json:"workload_cpu_samples"`
+	AgentCPUSamples        int     `json:"agent_cpu_samples"`
+	CPUOverheadRatio       float64 `json:"cpu_overhead_ratio"`
+	KernelLocationsTotal   int     `json:"kernel_locations_total"`
+	KernelLocationsNamed   int     `json:"kernel_locations_named"`
+	KernelResolutionRate   float64 `json:"kernel_resolution_rate"`
+	CPUOverheadBudgetMet   bool    `json:"cpu_overhead_budget_met"`
+	ResolutionRateBudgetMet bool   `json:"resolution_rate_budget_met"`
 }
 
 type Binary struct {

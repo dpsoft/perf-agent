@@ -10,8 +10,6 @@
 
 One binary, runs locally, no backend or telemetry.
 
-> 🚧 **GPU profiling support is in active development** as an experimental track. CPU, off-CPU, and PMU profiling are stable today.
-
 ---
 
 ## Contents

@@ -817,8 +817,7 @@ func mapPtraceopErrToPython(err error) error {
 // the bare numeric pid in place of the process name, but the
 // kernel-side samples are still attributed by pid.
 //
-// Emitted for every PID we walk, including kernel threads — the
-// load-bearing reason for #10 in docs/post-prod-hardening.md.
+// Emitted for every PID we walk, including kernel threads:
 // kthreads (kvm-pit, vhost-*, kworker/*) have empty cmdline but a
 // valid comm; without this record, kernel-stacks samples drawn from
 // them appear with no name in `perf script` output.

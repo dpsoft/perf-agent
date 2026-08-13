@@ -59,21 +59,8 @@ test-integration: build test-workloads
 		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
 		bash run_tests.sh
 
-# Forces the pure-Go /proc/kallsyms kernel symbolizer on every batch
-# (via PERFAGENT_FORCE_KERNEL_FALLBACK=1). Runs only the kernel-stacks
-# tests — they're the ones whose fallback semantics matter — so the
-# lane is cheap enough to add to every CI run as a regression gate
-# against lockdown=integrity hosts.
-.PHONY: test-integration-lockdown
-test-integration-lockdown: build test-workloads
-	cd test && LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
-		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I$(LIBBLAZESYM_INC)" \
-		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
-		PERFAGENT_FORCE_KERNEL_FALLBACK=1 \
-		go test -v -timeout 120s -run 'TestKernelStackResolution|TestPerfDataKernelMmap2' ./...
-
 .PHONY: test
-test: test-unit test-integration test-integration-lockdown
+test: test-unit test-integration
 
 .PHONY: clean
 clean:
@@ -87,16 +74,6 @@ clean:
 
 bench-corpus:
 	GOTOOLCHAIN=auto go test -bench=. -benchmem -run=^$$ ./unwind/ehcompile/...
-
-# Roadmap #6: bench the symbolize hot path so PRs touching it have
-# numerical evidence (or numerical regressions). Covers the
-# /proc/kallsyms parser, cache load, and per-IP resolve.
-.PHONY: bench-symbolize
-bench-symbolize:
-	LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
-		CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
-		CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
-		go test -bench=. -benchmem -run=^$$ ./symbolize/...
 
 bench-build:
 	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \

@@ -17,13 +17,12 @@ import (
 // dashboards downstream.
 func TestMetricsHandler_PrometheusFormat(t *testing.T) {
 	snap := symbolize.CountersSnapshot{
-		KernelBatches:         5,
-		KernelInputIPs:        42,
-		KernelBatchFailures:   1,
-		KernelFallbackEngaged: 1,
-		KernelRawAddrFrames:   3,
-		KernelLockdownEPERM:   7,
-		KernelOtherErr:        2,
+		KernelBatches:       5,
+		KernelInputIPs:      42,
+		KernelBatchFailures: 1,
+		KernelRawAddrFrames: 3,
+		KernelLockdownEPERM: 7,
+		KernelOtherErr:      2,
 	}
 	h := metricsHandlerFor(func() symbolize.CountersSnapshot { return snap })
 
@@ -44,8 +43,6 @@ func TestMetricsHandler_PrometheusFormat(t *testing.T) {
 		"# HELP perf_agent_symbolize_kernel_batches_total",
 		"# TYPE perf_agent_symbolize_kernel_batches_total counter",
 		"perf_agent_symbolize_kernel_batches_total 5",
-		"# TYPE perf_agent_symbolize_kernel_fallback_engaged gauge",
-		"perf_agent_symbolize_kernel_fallback_engaged 1",
 		"perf_agent_symbolize_kernel_lockdown_eperm_total 7",
 		"perf_agent_symbolize_kernel_other_err_total 2",
 		"perf_agent_symbolize_kernel_raw_addr_frames_total 3",

@@ -35,11 +35,9 @@ func metricsHandlerFor(getCounters func() symbolize.CountersSnapshot) http.Handl
 		writeMetricLine(w, "perf_agent_symbolize_kernel_input_ips_total",
 			"counter", "total kernel IPs handed into SymbolizeKernel", s.KernelInputIPs)
 		writeMetricLine(w, "perf_agent_symbolize_kernel_batch_failures_total",
-			"counter", "batches where every symbolizer (blazesym + kallsyms) failed", s.KernelBatchFailures)
-		writeMetricLine(w, "perf_agent_symbolize_kernel_fallback_engaged",
-			"gauge", "1 when symbolizer switched to pure-Go kallsyms (lockdown-class hosts)", s.KernelFallbackEngaged)
+			"counter", "batches where blazesym kernel symbolization failed", s.KernelBatchFailures)
 		writeMetricLine(w, "perf_agent_symbolize_kernel_raw_addr_frames_total",
-			"counter", "kernel IPs that fell to raw-hex synthesis (both symbolizers failed)", s.KernelRawAddrFrames)
+			"counter", "kernel IPs that fell to raw-hex synthesis (blazesym failed)", s.KernelRawAddrFrames)
 		writeMetricLine(w, "perf_agent_symbolize_kernel_lockdown_eperm_total",
 			"counter", "BLAZE_ERR_PERMISSION_DENIED events from blazesym (canonical lockdown signature)", s.KernelLockdownEPERM)
 		writeMetricLine(w, "perf_agent_symbolize_kernel_other_err_total",

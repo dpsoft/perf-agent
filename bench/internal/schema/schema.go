@@ -60,7 +60,7 @@ type Run struct {
 //     to the workload it's profiling. Above the budget = regression.
 //   - KernelResolutionRate: fraction of kernel-side samples in
 //     perf-agent #1's own pprof that resolved to a named symbol
-//     instead of "0x<hex>". A drop = blazesym + kallsyms fallback
+//     instead of "0x<hex>". A drop = blazesym kernel symbolization
 //     broke (the original v1.2.0 lockdown class of bug).
 type SelfMetrics struct {
 	WorkloadPID            int     `json:"workload_pid"`

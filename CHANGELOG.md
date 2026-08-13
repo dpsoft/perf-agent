@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-13
+
+### Fixed
+
+- Kernel-stack symbolization (`--kernel-stacks`) now works under kernel `lockdown=integrity` (Secure Boot). The v1.2.0 symbolizer relied on blazesym probing `/proc/kcore`, which is `CAP_SYS_RAWIO`-gated and absent from the standard `cap_perfmon`/`cap_bpf` set, so every batch returned `BLAZE_ERR_PERMISSION_DENIED` and kernel frames vanished from the pprof. Resolved by bumping blazesym to v0.2.4, which no longer reads `/proc/kcore` for the KASLR offset unless a vmlinux DWARF resolver is present ([#25](https://github.com/dpsoft/perf-agent/pull/25), [#26](https://github.com/dpsoft/perf-agent/pull/26)).
+- On symbolization failure, kernel frames are now preserved as raw addresses (`Name: "0x<hex>"`, `Module: "[kernel.kallsyms]"`) instead of being dropped, so kernel context survives into the pprof and hot frames stay decodable via `/proc/kallsyms` ([#25](https://github.com/dpsoft/perf-agent/pull/25)).
+- `--perf-data-output` now emits a `PERF_RECORD_MMAP2` per executable mapping of the target PID, so `perf script` / `perf report` resolve user-space frames instead of showing `[unknown]`. System-wide (`-a`) userspace mmaps remain a documented follow-up ([#25](https://github.com/dpsoft/perf-agent/pull/25)).
+
+### Changed
+
+- Bumped blazesym to v0.2.4 and removed the pure-Go `/proc/kallsyms` fallback introduced during hardening — the newer blazesym resolves lockdown-class hosts directly, so the fallback (and its `PERFAGENT_FORCE_KERNEL_FALLBACK` escape hatch and `KernelFallbackEngaged` counter) is no longer needed. `KernelLockdownEPERM` / `KernelOtherErr` / `KernelRawAddrFrames` counters remain for observability ([#26](https://github.com/dpsoft/perf-agent/pull/26)).
+
 ## [1.2.0] - 2026-05-15
 
 ### Added
@@ -40,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/dpsoft/perf-agent/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/dpsoft/perf-agent/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dpsoft/perf-agent/compare/v1.0.5...v1.1.0
 [1.0.5]: https://github.com/dpsoft/perf-agent/releases/tag/v1.0.5

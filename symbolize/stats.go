@@ -36,8 +36,9 @@ type Counters struct {
 
 	// Reason-bucketed counters for batch-level blazesym failures.
 	// Roadmap #4: lets operators distinguish "lockdown-class host
-	// (every batch EPERMs once before fallback)" from "blazesym is
-	// throwing some other error" without re-instrumenting.
+	// (blazesym EPERMs, dropping kernel frames to raw addresses)"
+	// from "blazesym is throwing some other error" without
+	// re-instrumenting.
 	//
 	// KernelLockdownEPERM bumps each time blazesym returns
 	// BLAZE_ERR_PERMISSION_DENIED. Post-v0.2.4 this should only fire

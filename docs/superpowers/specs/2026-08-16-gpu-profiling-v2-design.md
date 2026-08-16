@@ -331,15 +331,18 @@ Verified on the development host:
 - CUDA 13.3 with CUPTI including `cupti_pcsampling.h`, plus `nvcc` and `nsys`
 - the card is deliberately idle/unbound; `gpu-lab on|off|status` manages it
 
-Gaps:
+Setup steps, none of them obstacles:
 
-- `sys/sdt.h` is missing — `systemtap-sdt-devel` is required to author USDT probes
-  and therefore blocks Phase 3
-- NVIDIA gates GPU performance counters to admin users by default
-  (`NVreg_RestrictProfilingToAdminUsers`). Whether PC sampling is reachable
-  without a modprobe option and reboot is **unverified** and should be checked
-  before Phase 5 is scheduled.
-- Phase 5 requires workloads compiled with `nvcc -lineinfo` for source mapping;
+- `sys/sdt.h` is not installed (`systemtap-sdt-devel`). Alternatively the shim can
+  emit `.note.stapsdt` notes via inline asm and carry no systemtap build
+  dependency at all — worth deciding in Phase 3 on its merits, not because of
+  what happens to be installed.
+- `NVreg_RestrictProfilingToAdminUsers=0` is needed for non-root access to the
+  CUPTI profiling APIs. On the lab box this is a modprobe option and a reboot. In
+  production it is a **node prerequisite in the same class as installing the
+  driver**, and it matters because the shim runs as the application's user, which
+  in a container is usually not root.
+- Phase 5 source mapping requires workloads compiled with `nvcc -lineinfo`;
   without it, degrade to PC-offset frames.
 
 ## 16. Risks
@@ -356,8 +359,6 @@ Gaps:
   replay produces unsymbolizable PC samples rather than wrong ones.
 - **AMD regression window.** Between dropping the stdin paths and shipping a ROCm
   shim, AMD has no kernel-execution data. Accepted.
-- **NVIDIA profiling restriction** could block Phase 5 entirely on some hosts.
-  Unverified.
 
 ## 17. Open questions
 

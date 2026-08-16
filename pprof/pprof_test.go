@@ -624,3 +624,95 @@ func TestNewProfileBuilders_StaticLabelsOnSample(t *testing.T) {
 		}
 	}
 }
+
+func TestProfileSampleLabels(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{SampleRate: 99})
+
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames([]string{"main"}),
+		Value:      100,
+		Labels:     map[string]string{"gpu_kernel": "flash_attn_fwd"},
+	})
+
+	for _, b := range builders.Builders {
+		require.Len(t, b.Profile.Sample, 1)
+		assert.Equal(t, []string{"flash_attn_fwd"}, b.Profile.Sample[0].Label["gpu_kernel"])
+	}
+}
+
+func TestProfileSampleLabelsMergeWithBuilderLabels(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{
+		SampleRate: 99,
+		Labels:     map[string]string{"pod_uid": "pod-a", "gpu_kernel": "from_builder"},
+	})
+
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames([]string{"main"}),
+		Value:      100,
+		Labels:     map[string]string{"gpu_kernel": "from_sample"},
+	})
+
+	for _, b := range builders.Builders {
+		require.Len(t, b.Profile.Sample, 1)
+		labels := b.Profile.Sample[0].Label
+		assert.Equal(t, []string{"pod-a"}, labels["pod_uid"],
+			"builder-level labels with no per-sample override must survive")
+		assert.Equal(t, []string{"from_sample"}, labels["gpu_kernel"],
+			"per-sample labels must win over builder-level labels of the same key")
+	}
+}
+
+func TestSameStackDifferentLabelsNotMerged(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{SampleRate: 99})
+	stack := []string{"main", "compute"}
+
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames(stack),
+		Value:      10,
+		Labels:     map[string]string{"gpu_stall": "long_scoreboard"},
+	})
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames(stack),
+		Value:      20,
+		Labels:     map[string]string{"gpu_stall": "barrier"},
+	})
+
+	for _, b := range builders.Builders {
+		require.Len(t, b.Profile.Sample, 2,
+			"samples with identical stacks but different labels must not be merged")
+	}
+}
+
+func TestSameStackSameLabelsStillMerged(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{SampleRate: 99})
+	stack := []string{"main", "compute"}
+	labels := map[string]string{"gpu_stall": "barrier"}
+
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames(stack),
+		Value:      10,
+		Labels:     labels,
+	})
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames(stack),
+		Value:      20,
+		Labels:     labels,
+	})
+
+	for _, b := range builders.Builders {
+		require.Len(t, b.Profile.Sample, 1,
+			"identical stack and identical labels must still aggregate")
+	}
+}
+
+func TestLabelHashIsOrderIndependent(t *testing.T) {
+	a := hashLabels(1234, map[string]string{"x": "1", "y": "2"})
+	b := hashLabels(1234, map[string]string{"y": "2", "x": "1"})
+	assert.Equal(t, a, b, "label hash must not depend on map iteration order")
+}

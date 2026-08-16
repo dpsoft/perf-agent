@@ -1,8 +1,10 @@
 package pprof
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +91,10 @@ type ProfileSample struct {
 	Stack       []Frame
 	Value       uint64
 	Value2      uint64
+	// Labels are per-sample pprof labels, merged over BuildersOptions.Labels.
+	// Keys present in both win here. Use for context that must not fragment
+	// stack identity (GPU stall reason, PC, queue, device, correlation ID).
+	Labels map[string]string
 }
 
 type BuildersOptions struct {
@@ -269,6 +275,9 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 		p.tmpLocationIDs = append(p.tmpLocationIDs, loc.ID)
 	}
 	h := xxhash.Sum64(uint64Bytes(p.tmpLocationIDs))
+	if len(inputSample.Labels) > 0 {
+		h = hashLabels(h, inputSample.Labels)
+	}
 	sample := p.sampleHashToSample[h]
 	if sample != nil {
 		p.addValue(inputSample, sample)
@@ -279,6 +288,30 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	copy(sample.Location, p.tmpLocations)
 	p.sampleHashToSample[h] = sample
 	p.Profile.Sample = append(p.Profile.Sample, sample)
+}
+
+// hashLabels folds per-sample labels into the sample dedup hash so that two
+// samples sharing a stack but carrying different labels are kept apart rather
+// than silently merged. Keys are sorted, so the result does not depend on Go's
+// randomized map iteration order.
+func hashLabels(seed uint64, labels map[string]string) uint64 {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	d := xxhash.New()
+	var seedBuf [8]byte
+	binary.LittleEndian.PutUint64(seedBuf[:], seed)
+	_, _ = d.Write(seedBuf[:])
+	for _, k := range keys {
+		_, _ = d.WriteString(k)
+		_, _ = d.WriteString("\x00")
+		_, _ = d.WriteString(labels[k])
+		_, _ = d.WriteString("\x00")
+	}
+	return d.Sum64()
 }
 
 func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location {
@@ -446,9 +479,12 @@ func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 		sample.Value = []int64{0, 0}
 	}
 	sample.Location = make([]*profile.Location, len(inputSample.Stack))
-	if len(p.opt.Labels) > 0 {
-		sample.Label = make(map[string][]string, len(p.opt.Labels))
+	if len(p.opt.Labels) > 0 || len(inputSample.Labels) > 0 {
+		sample.Label = make(map[string][]string, len(p.opt.Labels)+len(inputSample.Labels))
 		for k, v := range p.opt.Labels {
+			sample.Label[k] = []string{v}
+		}
+		for k, v := range inputSample.Labels {
 			sample.Label[k] = []string{v}
 		}
 	}

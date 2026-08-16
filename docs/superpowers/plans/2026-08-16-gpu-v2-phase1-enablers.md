@@ -73,12 +73,35 @@ func TestProfileSampleLabels(t *testing.T) {
 		assert.Equal(t, []string{"flash_attn_fwd"}, b.Profile.Sample[0].Label["gpu_kernel"])
 	}
 }
+
+func TestProfileSampleLabelsMergeWithBuilderLabels(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{
+		SampleRate: 99,
+		Labels:     map[string]string{"pod_uid": "pod-a", "gpu_kernel": "from_builder"},
+	})
+
+	builders.AddSample(&ProfileSample{
+		SampleType: SampleTypeCpu,
+		Stack:      FramesFromNames([]string{"main"}),
+		Value:      100,
+		Labels:     map[string]string{"gpu_kernel": "from_sample"},
+	})
+
+	for _, b := range builders.Builders {
+		require.Len(t, b.Profile.Sample, 1)
+		labels := b.Profile.Sample[0].Label
+		assert.Equal(t, []string{"pod-a"}, labels["pod_uid"],
+			"builder-level labels with no per-sample override must survive")
+		assert.Equal(t, []string{"from_sample"}, labels["gpu_kernel"],
+			"per-sample labels must win over builder-level labels of the same key")
+	}
+}
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-go test ./pprof/ -run TestProfileSampleLabels -v
+go test ./pprof/ -run "TestProfileSampleLabels" -v
 ```
 
 Expected: compile failure — `unknown field Labels in struct literal of type ProfileSample`.
@@ -119,7 +142,7 @@ Replace the label block in `newSample`:
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-go test ./pprof/ -run TestProfileSampleLabels -v
+go test ./pprof/ -run "TestProfileSampleLabels" -v
 ```
 
 Expected: PASS.

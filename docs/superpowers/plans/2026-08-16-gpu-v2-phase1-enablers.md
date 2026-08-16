@@ -289,166 +289,161 @@ the result is independent of map iteration order."
 
 ---
 
-### Task 2: Drop the redundant `CAP_SYS_ADMIN` requirement
+### Task 2: Document the capability set — why each cap, and when `CAP_SYS_ADMIN` stops being needed
 
-perf-agent requests `CAP_SYS_ADMIN` and every documented `setcap` line includes it. On kernel ≥ 5.9 it is redundant: `CAP_PERFMON` (5.8) covers `perf_event_open` including `pid=-1`, and `CAP_CHECKPOINT_RESTORE` (5.9) covers `/proc/<pid>/map_files`. `CAP_SYS_ADMIN` is near-root and is what gets a per-pod agent rejected, so removing it is a prerequisite for the §11 deployment model.
+**No behaviour change.** The requested capability set stays exactly as it is. What is wrong today is the *documentation*: `unwind/ehmaps/openable.go` attributes `/proc/<pid>/map_files` access to `CAP_SYS_ADMIN` while `perfagent/agent.go` already attributes it correctly to `CAP_CHECKPOINT_RESTORE`, and nothing anywhere explains what each capability is actually for.
 
-The capability set is currently an inline call inside `Start()`, which is untestable. This task extracts it first.
+The reason to document rather than drop is precise, and worth stating in the code so nobody has to rediscover it. The two capabilities that replace `CAP_SYS_ADMIN` did **not** arrive together:
+
+- `CAP_PERFMON` — kernel **5.8** — `perf_event_open`, including `pid=-1`
+- `CAP_CHECKPOINT_RESTORE` — kernel **5.9** — `/proc/<pid>/map_files`
+
+The project currently documents a floor of **kernel 5.8+** (`README.md:115`, `test/README.md:162`, `TESTING.md:230`). On exactly 5.8, `CAP_CHECKPOINT_RESTORE` does not exist, so dropping `CAP_SYS_ADMIN` would break symbolization there. A single kernel minor version is the entire obstacle.
+
+Current deployments target 6.x, where both capabilities are long available and `CAP_SYS_ADMIN` is unambiguously redundant. So the condition for dropping it is not "wait for kernels to catch up" — it is "raise the documented floor from 5.8 to 5.9+". This task records that, so the drop later is a deliberate decision against a stated condition rather than a rediscovery. Raising the floor is a project decision and is explicitly **not** part of this task.
+
+Do not edit the `setcap` lines in `README.md`, `bench/README.md`, or the `examples/` READMEs. They stay as-is because the code still requests the full set.
 
 **Files:**
-- Modify: `perfagent/agent.go` — capability comment block (line ~296) and `SetFlag` call (line ~302)
-- Modify: `unwind/ehmaps/openable.go:15` — stale comment
-- Modify: `README.md` (lines 40, 116, 366), `bench/README.md:28`, `examples/README.md:15`, `examples/rust-pgo/README.md:12`, `examples/flamegraph/README.md:11`
-- Test: `perfagent/agent_test.go`
+- Modify: `perfagent/agent.go` — the capability comment block above the `SetFlag` call (line ~296)
+- Modify: `unwind/ehmaps/openable.go:15-16` — the stale comment
+- Modify: `README.md` — add a subsection under the existing capability guidance
 
 **Interfaces:**
 - Consumes: nothing from Task 1.
-- Produces: `requiredCapabilities() []cap.Value` — package-private in `perfagent`, returns the capability set the agent raises to Effective.
+- Produces: nothing. Documentation only; no exported or package-private identifiers are added or changed.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Correct the stale comment in `unwind/ehmaps/openable.go`**
 
-Append to `perfagent/agent_test.go`:
-
-```go
-func TestRequiredCapabilitiesExcludesSysAdmin(t *testing.T) {
-	caps := requiredCapabilities()
-
-	assert.NotContains(t, caps, cap.SYS_ADMIN,
-		"CAP_SYS_ADMIN is redundant on kernel >= 5.9: CAP_PERFMON covers "+
-			"perf_event_open including pid=-1, CAP_CHECKPOINT_RESTORE covers "+
-			"/proc/<pid>/map_files")
-
-	assert.Contains(t, caps, cap.BPF)
-	assert.Contains(t, caps, cap.PERFMON)
-	assert.Contains(t, caps, cap.SYS_PTRACE)
-	assert.Contains(t, caps, cap.CHECKPOINT_RESTORE)
-}
-```
-
-Ensure `perfagent/agent_test.go` imports `kernel.org/pub/linux/libs/security/libcap/cap` and `github.com/stretchr/testify/assert`.
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-```bash
-go test ./perfagent/ -run TestRequiredCapabilitiesExcludesSysAdmin -v
-```
-
-Expected: compile failure — `undefined: requiredCapabilities`.
-
-- [ ] **Step 3: Extract the capability set and drop `SYS_ADMIN`**
-
-In `perfagent/agent.go`, add above the function containing the `SetFlag` call:
+Replace lines 15–16, which currently read:
 
 ```go
-// requiredCapabilities is the capability set the agent raises to Effective.
-//
-//	CAP_BPF                - load eBPF programs and create maps
-//	CAP_PERFMON            - perf_event_open (including pid=-1 for system-wide),
-//	                         stack traces, tracing attachment. Since kernel 5.8
-//	                         this covers what CAP_SYS_ADMIN used to be needed for.
-//	CAP_SYS_PTRACE         - read /proc/<pid>/maps and /proc/<pid>/mem of other processes
-//	CAP_CHECKPOINT_RESTORE - follow /proc/<pid>/map_files/ symlinks for blazesym
-//	                         symbolization. Added in kernel 5.9 precisely so this
-//	                         does not require CAP_SYS_ADMIN.
-func requiredCapabilities() []cap.Value {
-	return []cap.Value{cap.BPF, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE}
-}
+// Requires CAP_SYS_ADMIN to read /proc/<pid>/map_files. perf-agent's
+// standard cap set covers this.
 ```
 
-Replace the existing comment block and `SetFlag` call with:
+with:
 
 ```go
-	caps := cap.GetProc()
-	if err := caps.SetFlag(cap.Effective, true, requiredCapabilities()...); err != nil {
-		return fmt.Errorf("set capabilities: %w", err)
-	}
+// Reading /proc/<pid>/map_files required CAP_SYS_ADMIN before kernel 5.9, and
+// CAP_CHECKPOINT_RESTORE from 5.9 onward. perf-agent's standard cap set holds
+// both, so this works either way.
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 2: Expand the capability comment block in `perfagent/agent.go`**
 
-```bash
-go test ./perfagent/ -run TestRequiredCapabilitiesExcludesSysAdmin -v
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Fix the stale comment in `unwind/ehmaps/openable.go`**
-
-Replace lines 15–16:
+Replace the existing comment block above the `caps.SetFlag(...)` call. Leave the `SetFlag` call itself untouched:
 
 ```go
-// Requires CAP_CHECKPOINT_RESTORE to read /proc/<pid>/map_files (kernel 5.9+;
-// before that it needed CAP_SYS_ADMIN). perf-agent's standard cap set covers this.
+	// Capabilities raised to Effective. The set is deliberately the historical
+	// superset so that pre-5.8 kernels keep working:
+	//
+	//   CAP_BPF                - load eBPF programs and create maps
+	//   CAP_PERFMON            - perf_event_open, stack traces, tracing attachment
+	//   CAP_SYS_PTRACE         - read /proc/<pid>/maps and /proc/<pid>/mem of other processes
+	//   CAP_CHECKPOINT_RESTORE - follow /proc/<pid>/map_files/ symlinks (blazesym symbolization)
+	//   CAP_SYS_ADMIN          - only needed on kernels older than 5.8/5.9; see below
+	//
+	// CAP_SYS_ADMIN is retained for backward compatibility, not because current
+	// kernels need it. Two capabilities were introduced to carve out its roles,
+	// but they did not arrive together:
+	//
+	//   - CAP_PERFMON (5.8) covers perf_event_open, including pid=-1 for
+	//     system-wide profiling.
+	//   - CAP_CHECKPOINT_RESTORE (5.9) covers /proc/<pid>/map_files.
+	//
+	// That one-version gap is the whole reason this is still here. The project
+	// documents a floor of kernel 5.8, and on exactly 5.8 CAP_CHECKPOINT_RESTORE
+	// does not exist, so dropping CAP_SYS_ADMIN would break symbolization there.
+	//
+	// On kernel >= 5.9 the minimal working set is:
+	//
+	//   cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep
+	//
+	// Dropping CAP_SYS_ADMIN matters for per-pod and sidecar deployments, where
+	// it is the near-root capability that gets a workload rejected. The condition
+	// is not "wait for newer kernels" - deployments already target 6.x. It is:
+	// raise the documented floor from 5.8 to 5.9+, then verify the minimal set
+	// for both --pid and -a runs (-a is the one that exercises
+	// perf_event_open(pid=-1)), then drop it here.
 ```
 
-- [ ] **Step 6: Update every documented `setcap` invocation**
-
-Remove `cap_sys_admin,` from each of these, leaving `cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`:
-
-- `README.md:40`, `README.md:116`, `README.md:366`
-- `bench/README.md:28` (note this one orders them `cap_perfmon,cap_bpf,cap_sys_admin,...`)
-- `examples/README.md:15`
-- `examples/rust-pgo/README.md:12`
-- `examples/flamegraph/README.md:11`
-
-Verify none remain:
-
-```bash
-grep -rn "cap_sys_admin" --include="*.md" . | grep -v docs/superpowers
-```
-
-Expected: no output.
-
-- [ ] **Step 7: Run the unit suites**
+- [ ] **Step 3: Verify it still builds and the existing tests pass**
 
 ```bash
 go build ./... && go test ./perfagent/ ./unwind/... -count=1
 ```
 
-Expected: builds clean. Pre-existing failures unrelated to capabilities may appear in packages that need root — note them, do not fix them here.
+Expected: builds clean, and behaviour is identical because only comments changed. Packages requiring root may fail as they did before — note them, do not fix them here.
 
-- [ ] **Step 8: Verify on hardware — this is the phase gate**
+- [ ] **Step 4: Document the capability set in `README.md`**
 
-Build and grant the reduced set. Do **not** put the binary in `/tmp`: it is mounted `nosuid` and file capabilities do not survive exec there.
+Find the existing capability guidance near `README.md:116` (`- Root, OR \`setcap ...\``). Immediately after that line, add:
+
+```markdown
+<details>
+<summary>What each capability is for, and when <code>cap_sys_admin</code> can be dropped</summary>
+
+| Capability | Why it is needed |
+|---|---|
+| `cap_bpf` | Load eBPF programs and create maps |
+| `cap_perfmon` | `perf_event_open`, stack traces, tracing attachment |
+| `cap_sys_ptrace` | Read `/proc/<pid>/maps` and `/proc/<pid>/mem` of the target |
+| `cap_checkpoint_restore` | Follow `/proc/<pid>/map_files/` symlinks during symbolization |
+| `cap_sys_admin` | Only on kernels older than 5.8/5.9 — see below |
+
+`cap_sys_admin` is kept for backward compatibility. Two capabilities were added
+to the kernel to carve out the roles perf-agent used it for — but they did not
+arrive in the same release:
+
+- **`CAP_PERFMON` (kernel 5.8)** covers `perf_event_open`, including `pid=-1`
+  for system-wide profiling.
+- **`CAP_CHECKPOINT_RESTORE` (kernel 5.9)** covers `/proc/<pid>/map_files`.
+
+perf-agent's documented floor is kernel 5.8, and on exactly 5.8
+`cap_checkpoint_restore` does not exist — so dropping `cap_sys_admin` there would
+break symbolization. That single kernel minor version is why the full set is
+still the default.
+
+On **kernel 5.9 or newer** the minimal set is:
 
 ```bash
-go build -o ./perf-agent .
 sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent
-getcap ./perf-agent
 ```
 
-Expected from `getcap`: `cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore=ep` with no `cap_sys_admin`.
+If you run 6.x — as most deployments now do — this is the set to use. It matters
+most for per-pod and sidecar deployments, where `cap_sys_admin` is the near-root
+capability that gets a workload rejected by admission policy.
 
-Then run both modes as a non-root user, with no `sudo`:
-
-```bash
-./perf-agent --pid $$ --profile --duration 5s
-./perf-agent -a --profile --duration 5s
+</details>
 ```
 
-Expected: both complete and write a `.pb.gz`. The system-wide run is the one that actually exercises `perf_event_open(pid=-1)` — the capability `CAP_SYS_ADMIN` was believed to be required for. If it fails with `EACCES` or `EPERM`, stop: check `cat /proc/sys/kernel/perf_event_paranoid` and report the value rather than restoring `CAP_SYS_ADMIN`.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 5: Confirm no `setcap` line was changed**
 
 ```bash
-git add perfagent/agent.go perfagent/agent_test.go unwind/ehmaps/openable.go \
-        README.md bench/README.md examples/README.md \
-        examples/rust-pgo/README.md examples/flamegraph/README.md
-git commit -m "feat(caps): drop redundant CAP_SYS_ADMIN
+grep -rn "cap_sys_admin" --include="*.md" . | grep -v docs/superpowers
+```
 
-CAP_PERFMON (kernel 5.8) covers perf_event_open including pid=-1 for
-system-wide profiling, and CAP_CHECKPOINT_RESTORE (kernel 5.9) was added
-specifically so /proc/<pid>/map_files could be read without CAP_SYS_ADMIN.
-The agent has been requesting a near-root capability it has not needed for
-years, and every documented setcap line propagated it.
+Expected: the pre-existing lines in `README.md` (3), `bench/README.md` (1), `examples/README.md` (1), `examples/rust-pgo/README.md` (1) and `examples/flamegraph/README.md` (1) are all still present and unmodified, plus the new occurrences inside the block added in Step 4. Nothing was removed.
 
-Extracts the set into requiredCapabilities() so it can be asserted in a test,
-and corrects the comment in unwind/ehmaps/openable.go, which still attributed
-map_files access to CAP_SYS_ADMIN while perfagent/agent.go already documented
-it correctly.
+- [ ] **Step 6: Commit**
 
-Verified on kernel 6.19: a binary with only cap_bpf, cap_perfmon,
-cap_sys_ptrace and cap_checkpoint_restore completes both --pid and -a runs."
+```bash
+git add perfagent/agent.go unwind/ehmaps/openable.go README.md
+git commit -m "docs(caps): explain the capability set and when CAP_SYS_ADMIN is redundant
+
+No behaviour change - the requested capability set is unchanged, because
+dropping CAP_SYS_ADMIN would break kernels older than 5.8/5.9.
+
+What was wrong was the documentation. unwind/ehmaps/openable.go attributed
+/proc/<pid>/map_files access to CAP_SYS_ADMIN while perfagent/agent.go already
+attributed it correctly to CAP_CHECKPOINT_RESTORE, and nothing explained what
+any of the capabilities were for.
+
+Records the two kernel versions that made CAP_SYS_ADMIN redundant - CAP_PERFMON
+in 5.8 for perf_event_open including pid=-1, CAP_CHECKPOINT_RESTORE in 5.9 for
+map_files - and the minimal set for kernel >= 5.9, so dropping it later is a
+deliberate decision against stated conditions."
 ```
 
 ---
@@ -458,9 +453,11 @@ cap_sys_ptrace and cap_checkpoint_restore completes both --pid and -a runs."
 Phase 1 is complete when:
 
 1. `go test ./pprof/ ./perfagent/ -count=1` passes.
-2. A setcap'd binary carrying no `cap_sys_admin` completes both a `--pid` and an `-a` profile run as a non-root user (Task 2, Step 8).
-3. `grep -rn "cap_sys_admin" --include="*.md" .` returns nothing outside `docs/superpowers/`.
+2. `go build ./...` succeeds.
+3. Task 2 changed no `setcap` invocation and no capability code — `git diff` for Task 2 touches comments and `README.md` only.
 
-Both tasks are independent of each other and of the `gpu/` package. They are intended to land on `main` as two separate PRs, not as part of the GPU branch — nothing in them references GPU code.
+The original spec gate for Task 2 (a setcap'd binary without `cap_sys_admin` completing `--pid` and `-a` runs) no longer applies, because the capability set is unchanged. That verification becomes the entry condition for a future task that actually drops `CAP_SYS_ADMIN`, once the minimum supported kernel is ≥ 5.9.
+
+Both tasks are independent of each other and of the `gpu/` package. Task 1 is a behaviour change and should land on `main` as its own PR; Task 2 is documentation and can land separately.
 
 Once the gate passes, write the Phase 2 plan (the continuous core: bounded ring, correlation-ID index, sink backpressure, conformance suite, and the ported canonical model).

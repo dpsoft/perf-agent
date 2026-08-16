@@ -40,7 +40,7 @@ projection, the input paths, and the test strategy are not.
   losslessly with pprof, and Collector v0.148.0+ ships a pprof receiver, so the
   ecosystem on-ramp already exists without a format change. Revisit at beta.
 - **Not** a general off-box symbolization redesign. Off-box symbolization enters
-  in Phase 5 scoped to cubin disassembly, where it has a concrete driver.
+  in Phase 6 scoped to cubin disassembly, where it has a concrete driver.
 - **Not** a replacement for vendor tracing tools. Nsight and rocprof remain the
   right tools for one-shot deep analysis.
 - **Not** multi-vendor at launch. NVIDIA first; AMD converges onto the same ABI
@@ -112,6 +112,38 @@ ABI (the consumer reads a perf-agent-defined record, not a CUPTI one).
 | `gpu_stall_reason_map_v1` | one-shot stall index → name table |
 | `gpu_config_v1` | sampling factor, SM count, clock frequency |
 | `gpu_dropped_v1` | producer-side drop counts by class |
+
+### 6.1 Shared runtime, thin adapters
+
+Every vendor needs its own shim — CUPTI, rocprofiler-sdk and Level Zero are
+different APIs and nothing below the process boundary can paper over that. The
+cost is bounded by factoring aggressively:
+
+```
+shim/
+  core/     shared: USDT ABI, batching, token bucket, sequence numbers,
+            semaphore watch + late-attach replay, clock-fit scaffolding
+  nvidia/   CUPTI adapter            → libperfagent-gpu-nvidia.so
+  amd/      rocprofiler-sdk adapter  → libperfagent-gpu-amd.so
+```
+
+Only five things are genuinely per-vendor: the injection mechanism
+(`CUDA_INJECTION64_PATH` vs `LD_PRELOAD`/`HSA_TOOLS_LIB`), SDK registration,
+event-kind mapping onto our record types, which timestamp call feeds the clock
+fit, and the PC-sampling enable/disable API. Everything else lives in `core/`.
+
+This is the one place the design deliberately diverges from ParcaGPU rather than
+following it. Their probes are CUPTI-shaped (`cuda_correlation`, `cubin_loaded`),
+so a second vendor means a second ABI and a second consumer. Vendor-neutrality
+only pays for itself if `core/` is real; otherwise it is a tax with no benefit.
+
+**NVIDIA ships first.** The risk that carries is that the ABI ossifies
+CUPTI-shaped before a second consumer exists. The mitigation is a design-time
+cross-check, not implementation work: the rocprofiler bridge on the
+`gpu-profiling-spec` branch already shows what ROCm produces — its buffer-tracing
+kinds and its `CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER` callback map onto the
+same four record types — so the ABI is reviewed against that known taxonomy
+before it is frozen.
 
 Requirements:
 
@@ -250,16 +282,34 @@ Carried from PR #10 as **contracts, revised — not ported verbatim**:
   duplicates of each other, and `internal/k8slabels/cgroup_parse.go` predates both
   and handles cgroupfs and systemd driver conventions better.
 
+Carried as the **template for the vendor adapter**, not as shipping code:
+
+- `examples/rocprofiler_sdk_preload_bridge.cpp` (837 lines) is already the shim
+  architecture this design calls for. It registers via `rocprofiler_configure`,
+  uses buffer tracing for execution records, and hooks
+  `CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER` — the AMD analogue of cubin module
+  load. The only part that does not survive is its emit path: four
+  `write_line_locked` call sites that become USDT probe fires. It informs the ABI
+  review in §6.1 and becomes the second adapter in Phase 5.
+
 Dropped:
 
-- demo scripts (14 files), `cmd/amd-sample-collector` (1,584 lines), examples
-- the stdin input paths — `--gpu-stream-stdin`, `--gpu-amd-sample-stdin` — and
-  with them the `stream` and `amdsample` backends. This removes the only ROCm
-  execution-data path; AMD degrades to lifecycle plus HIP host launches until a
-  ROCm shim emits the ABI. Accepted deliberately.
+- demo scripts (14 files), `cmd/amd-sample-collector` (1,584 lines), examples.
+  The collector exists only because there was no in-process transport; the USDT
+  ABI removes its reason to exist.
 - the 53 checked-in replay goldens (§13)
 - the experimental CLI flag surface, collapsed to a source selector and an output
   selector
+
+Dropped on a delay:
+
+- the stdin input paths — `--gpu-stream-stdin`, `--gpu-amd-sample-stdin` — and the
+  `stream` and `amdsample` backends. These are the only ROCm execution-data path,
+  and with NVIDIA shipping first their removal would leave AMD degraded to
+  lifecycle plus HIP host launches for a full cycle. They are therefore kept alive
+  but **deprecated and undocumented** through Phases 3–4, and deleted in Phase 5
+  once the ROCm adapter replaces them. Deletion is cleanup, not a prerequisite, so
+  this costs nothing and removes the regression window entirely.
 
 `gpu/backend/replay` and `gpu/host/replay` are kept but demoted from CLI flags to
 test-only, to drive the conformance suite deterministically.
@@ -307,16 +357,26 @@ backpressure and drop counters, guarded ingestion. Port types and join ladder;
 rewrite storage and projection. Conformance suite replaces goldens.
 *Gate:* a synthetic high-rate replay holds flat memory and sub-second snapshot.
 
-**Phase 3 — USDT ABI and eBPF consumer.** Frozen ABI, consumer driven by a stub
-emitter.
-*Gate:* the stub drives the full pipeline to pprof on a machine with no GPU.
+**Phase 3 — USDT ABI, shared shim core, eBPF consumer.** The `core/` runtime of
+§6.1 and the consumer, driven by a stub emitter. Before the ABI is frozen it is
+reviewed against the rocprofiler bridge's known event taxonomy (§6.1), on paper.
+*Gate:* the stub drives the full pipeline to pprof on a machine with no GPU, and
+the ABI review has been done.
 
-**Phase 4 — CUPTI shim, callback and activity only.** Launch correlation anchor,
-activity records for real GPU intervals, clock correlation, token bucket.
+**Phase 4 — CUPTI adapter: callback and activity only. NVIDIA ships.** Launch
+correlation anchor, activity records for real GPU intervals, clock correlation,
+token bucket. This is the milestone the program exists for.
 *Gate:* on the RTX 3090, a CUDA workload yields exact-join kernels carrying real
 CPU stacks.
 
-**Phase 5 — PC sampling and cubin.** Adaptive windows, bounded launch cache for
+**Phase 5 — ROCm adapter.** Port the existing bridge's emit path onto the ABI.
+Small, because the bridge is written and validated. Its real function is to prove
+`core/` is not secretly CUPTI-shaped — a split with one consumer cannot be
+trusted. Deletes the deprecated stdin paths and the `stream`/`amdsample` backends.
+*Gate:* AMD produces exact-join kernel executions through the same consumer and
+the same canonical events as NVIDIA, with no NVIDIA-specific code in `core/`.
+
+**Phase 6 — PC sampling and cubin.** Adaptive windows, bounded launch cache for
 late batches, stall-reason and config replay on late attach, cubin capture by CRC,
 and cubin disassembly to address→source. Off-box symbolization enters here. Ships
 disabled by default.
@@ -342,7 +402,7 @@ Setup steps, none of them obstacles:
   production it is a **node prerequisite in the same class as installing the
   driver**, and it matters because the shim runs as the application's user, which
   in a container is usually not root.
-- Phase 5 source mapping requires workloads compiled with `nvcc -lineinfo`;
+- Phase 6 source mapping requires workloads compiled with `nvcc -lineinfo`;
   without it, degrade to PC-offset frames.
 
 ## 16. Risks
@@ -357,15 +417,24 @@ Setup steps, none of them obstacles:
 - **Late attach.** Cubin loads, stall maps and device config occur before the
   consumer attaches. Mitigated by semaphore-count detection and replay; incomplete
   replay produces unsymbolizable PC samples rather than wrong ones.
-- **AMD regression window.** Between dropping the stdin paths and shipping a ROCm
-  shim, AMD has no kernel-execution data. Accepted.
+- **The ABI ossifies CUPTI-shaped.** NVIDIA ships first and is the only consumer
+  until Phase 5, which is exactly how ParcaGPU's probe surface ended up
+  vendor-specific. Mitigated by the paper review in §6.1 against the rocprofiler
+  bridge's known taxonomy, and by Phase 5's gate being explicitly "no
+  NVIDIA-specific code in `core/`" rather than merely "AMD works". If Phase 5
+  requires ABI changes, that is the design working as intended, not a failure —
+  which is why the version suffixes exist.
 
 ## 17. Open questions
 
 1. Does a narrow CUPTI spike precede Phase 3, to inform the ABI before it freezes?
    The trade is ABI quality against the risk that a spike on unbounded buffers
-   hides the failure mode Phase 2 exists to fix.
-2. Does the ROCm shim adopt the ABI in this cycle, or does AMD stay degraded until
-   a later one?
-3. Sidecar or same-container as the shipping default. Sidecar plus shared volume
+   hides the failure mode Phase 2 exists to fix. Partly answered by §6.1: the
+   rocprofiler bridge already supplies a second real taxonomy to design against,
+   which is most of what a spike would have bought.
+2. Sidecar or same-container as the shipping default. Sidecar plus shared volume
    is the design target; same-container is simpler but couples lifecycles.
+3. Does `core/` ship as a static archive linked into each adapter, or as a shared
+   object the adapters load? Static is simpler to inject and avoids a second
+   `.so` in the application's address space; shared allows fixing transport bugs
+   without rebuilding every adapter.

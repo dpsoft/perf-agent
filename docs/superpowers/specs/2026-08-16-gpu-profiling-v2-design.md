@@ -132,6 +132,21 @@ Only five things are genuinely per-vendor: the injection mechanism
 event-kind mapping onto our record types, which timestamp call feeds the clock
 fit, and the PC-sampling enable/disable API. Everything else lives in `core/`.
 
+**`core/` is a static archive linked into each adapter, not a shared object.**
+Each vendor therefore ships as exactly one self-contained `.so`. This matters
+most for deployment: §11 puts the shim on an `emptyDir` mounted into both
+containers, and a shared `core` would have to be findable at runtime via RPATH or
+`LD_LIBRARY_PATH` inside the application's container — fragile, and secure-execution
+mode ignores `LD_LIBRARY_PATH` outright. One file to mount, nothing to resolve.
+It also removes any versioned interface between `core` and the adapters. The cost
+is that a transport fix requires rebuilding every adapter, which is acceptable at
+two of them.
+
+Because the result is injected into someone else's address space, `core/` must be
+built with hidden symbol visibility and the adapter must export only the entry
+points its vendor SDK requires. Leaking `core` symbols into the application's
+global namespace risks collisions with whatever else the process has loaded.
+
 This is the one place the design deliberately diverges from ParcaGPU rather than
 following it. Their probes are CUPTI-shaped (`cuda_correlation`, `cubin_loaded`),
 so a second vendor means a second ABI and a second consumer. Vendor-neutrality
@@ -434,7 +449,3 @@ Setup steps, none of them obstacles:
    which is most of what a spike would have bought.
 2. Sidecar or same-container as the shipping default. Sidecar plus shared volume
    is the design target; same-container is simpler but couples lifecycles.
-3. Does `core/` ship as a static archive linked into each adapter, or as a shared
-   object the adapters load? Static is simpler to inject and avoids a second
-   `.so` in the application's address space; shared allows fixing transport bugs
-   without rebuilding every adapter.

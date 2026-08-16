@@ -12,8 +12,9 @@ import (
 // unlinked-but-mapped binaries), then falls back to the symbolic path.
 // Returns "" when neither resolves.
 //
-// Requires CAP_SYS_ADMIN to read /proc/<pid>/map_files. perf-agent's
-// standard cap set covers this.
+// Reading /proc/<pid>/map_files required CAP_SYS_ADMIN before kernel 5.9, and
+// CAP_CHECKPOINT_RESTORE from 5.9 onward. perf-agent's standard cap set holds
+// both, so this works either way.
 //
 // Note: the probe (open + close) and the caller's subsequent use of the
 // returned path are not atomic. Callers must still handle errors from

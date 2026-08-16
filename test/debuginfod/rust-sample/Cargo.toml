@@ -1,0 +1,27 @@
+[package]
+name = "rust-sample"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rust_sample"
+path = "src/main.rs"
+
+# Mirrors the realistic production profile: max optimization, LTO, single
+# codegen unit (more inlining), abort-on-panic, line-tables-only DWARF
+# (small but enough for func name + source:line via debuginfod), no strip,
+# frame pointers forced on (so the FP unwinder works without DWARF CFI).
+#
+# `frame-pointers` profile key requires a recent Cargo. If your stable
+# toolchain rejects it, the equivalent stable invocation is:
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
+# (See README.md for build instructions.)
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+strip = "none"
+frame-pointers = "force-on"

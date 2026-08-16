@@ -1,0 +1,124 @@
+package symbolize
+
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+
+	blazesym "github.com/libbpf/blazesym/go"
+)
+
+// ErrClosed is returned from operations on a closed Symbolizer.
+var ErrClosed = errors.New("symbolize: closed")
+
+// LocalSymbolizer wraps blazesym's Process source with no off-box hooks —
+// preserves perf-agent's pre-debuginfod behavior. Used when no debuginfod
+// URL is configured.
+type LocalSymbolizer struct {
+	bz     *blazesym.Symbolizer
+	closed atomic.Bool
+}
+
+// NewLocalSymbolizer constructs a LocalSymbolizer with code-info and
+// inlined-fns enabled (matches today's behavior at the three call sites).
+func NewLocalSymbolizer() (*LocalSymbolizer, error) {
+	bz, err := blazesym.NewSymbolizer(
+		blazesym.SymbolizerWithCodeInfo(true),
+		blazesym.SymbolizerWithInlinedFns(true),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalSymbolizer{bz: bz}, nil
+}
+
+// SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
+// expanded into the Frame.Inlined slice in caller-most-to-callee order.
+//
+// On blazesym error (e.g. "permission denied" when the target is
+// setcap'd and ptrace_scope restricts /proc/<pid>/exe), returns raw
+// hex-named Frames instead of dropping the batch — preserves stack
+// shape and addresses so operators can decode with addr2line and
+// the pprof's user mapping still has somewhere to attach. A future
+// per-mapping ELF resolver (roadmap follow-up to bench-self bug B)
+// can recover full symbols using procmap-supplied paths.
+func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
+	if len(ips) == 0 {
+		return nil, nil
+	}
+	syms, err := s.bz.SymbolizeProcessAbsAddrs(
+		ips,
+		pid,
+		blazesym.ProcessSourceWithPerfMap(true),
+		blazesym.ProcessSourceWithDebugSyms(true),
+	)
+	if err != nil {
+		return rawUserAddrFrames(ips), nil
+	}
+	out := make([]Frame, 0, len(syms))
+	for i, sym := range syms {
+		var addr uint64
+		if i < len(ips) {
+			addr = ips[i]
+		}
+		out = append(out, fromBlazesymSym(sym, addr))
+	}
+	return out, nil
+}
+
+// Close releases the underlying blazesym Symbolizer. Idempotent.
+func (s *LocalSymbolizer) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return ErrClosed
+	}
+	s.bz.Close()
+	return nil
+}
+
+// fromBlazesymSym translates one blazesym.Sym into a Frame, populating
+// Inlined in caller-most-to-callee order. addr is the abs IP this frame
+// was resolved from.
+//
+// On per-IP miss (s.Name == "" — blazesym opened the binary but
+// couldn't map this address to a symbol), Name is filled with the
+// hex IP so the pprof Location renders as "0x<addr>" instead of
+// "<unknown>". Symmetric to the kernel-side rawKernelAddrFrames /
+// frameFromKernelCSym behavior — operators can decode with
+// addr2line; <unknown> just hides the structure.
+func fromBlazesymSym(s blazesym.Sym, addr uint64) Frame {
+	name := s.Name
+	reason := FailureNone
+	if name == "" {
+		name = fmt.Sprintf("0x%x", addr)
+		reason = FailureMissingSymbols
+	}
+	f := Frame{
+		Address: addr,
+		Name:    name,
+		Module:  s.Module,
+		Offset:  s.Offset,
+		Reason:  reason,
+	}
+	if s.CodeInfo != nil {
+		f.File = s.CodeInfo.File
+		f.Line = int(s.CodeInfo.Line)
+		f.Column = int(s.CodeInfo.Column)
+	}
+	for _, in := range s.Inlined {
+		inFrame := Frame{
+			Address: addr,
+			Name:    in.Name,
+			Module:  s.Module,
+		}
+		if in.CodeInfo != nil {
+			inFrame.File = in.CodeInfo.File
+			inFrame.Line = int(in.CodeInfo.Line)
+			inFrame.Column = int(in.CodeInfo.Column)
+		}
+		f.Inlined = append(f.Inlined, inFrame)
+	}
+	return f
+}

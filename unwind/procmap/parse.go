@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,11 +22,15 @@ func parseMapsFile(path string) ([]Mapping, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	// /proc/<pid>/map_files/<startHex>-<limitHex> — kernel-resolved symlinks
+	// that work across mount namespaces and survive deleted binaries.
+	mapFilesDir := filepath.Join(filepath.Dir(path), "map_files")
+
 	var out []Mapping
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		m, ok, err := parseMapsLine(line)
+		m, ok, err := parseMapsLine(line, mapFilesDir)
 		if err != nil {
 			return nil, fmt.Errorf("parse %q: %w", line, err)
 		}
@@ -44,7 +49,12 @@ func parseMapsFile(path string) ([]Mapping, error) {
 // for non-executable, anonymous, or pseudo-file lines (caller should
 // skip them without emitting a Mapping). Returns an error only for
 // malformed lines.
-func parseMapsLine(line string) (Mapping, bool, error) {
+//
+// mapFilesDir is the /proc/<pid>/map_files directory; if non-empty,
+// each returned Mapping gets a MapFiles path of the form
+// mapFilesDir/<startHex>-<limitHex> (lowercase, no leading zeros).
+// Pass "" when the map_files path is not needed (e.g. in tests).
+func parseMapsLine(line, mapFilesDir string) (Mapping, bool, error) {
 	// addr_range perms offset dev inode pathname
 	fields := strings.Fields(line)
 	if len(fields) < 5 {
@@ -81,5 +91,10 @@ func parseMapsLine(line string) (Mapping, bool, error) {
 		return Mapping{}, false, fmt.Errorf("offset: %w", err)
 	}
 
-	return Mapping{Path: path, Start: start, Limit: limit, Offset: off, IsExec: true}, true, nil
+	var mapFiles string
+	if mapFilesDir != "" {
+		mapFiles = filepath.Join(mapFilesDir, fmt.Sprintf("%x-%x", start, limit))
+	}
+
+	return Mapping{Path: path, MapFiles: mapFiles, Start: start, Limit: limit, Offset: off, IsExec: true}, true, nil
 }

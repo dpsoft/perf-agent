@@ -34,6 +34,14 @@
 // System-wide mode toggle set by userspace at load time.
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// existing per-mode gate (system_wide hard-true OR pid_config.collect_kernel)
+// decides which samples capture kernel stacks. Task 3 wires the kernel
+// stack ID capture path; this declaration lets userspace flip the gate
+// at load time without another bpf2go regeneration.
+const volatile bool kernel_stacks_enabled = false;
+
 SEC("perf_event")
 int perf_dwarf(struct bpf_perf_event_data *ctx) {
     __u64 tgid_tid = bpf_get_current_pid_tgid();
@@ -78,6 +86,15 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     // Walk at most MAX_FRAMES frames. walk_step breaks early on read
     // failure or natural terminator (saved_fp == 0, saved_fp <= fp).
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
+
+    // Kernel-stack capture. Default to -1 so userspace can cheaply detect
+    // "no kernel stack" without branching on the gate. bpf_get_stackid is
+    // the kernel-side counterpart of the FP-walk path's stackmap insert in
+    // perf.bpf.c — see internal/bpfstack.ExtractIPs for the userspace decode.
+    rec->hdr.kern_stack = -1;
+    if (kernel_stacks_enabled) {
+        rec->hdr.kern_stack = bpf_get_stackid(ctx, &kern_stackmap, KERN_STACKID_FLAGS);
+    }
 
     // Fill the header AFTER the walk so we know n_pcs.
     rec->hdr.pid          = tgid;

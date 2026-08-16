@@ -37,6 +37,11 @@ type Config struct {
 	// If set, profile data is written here instead of to OffCPUProfilePath.
 	OffCPUProfileWriter io.Writer
 
+	// PerfDataOutput is the path for a kernel-format perf.data file. Empty
+	// disables emission. Set via WithPerfDataOutput. Only on-CPU samples
+	// are written; off-CPU and PMU modes ignore this option.
+	PerfDataOutput string
+
 	// EnablePMU enables PMU hardware counter monitoring.
 	EnablePMU bool
 
@@ -51,6 +56,20 @@ type Config struct {
 
 	// MetricsExporters are the exporters to use for metrics output.
 	MetricsExporters []metrics.Exporter
+
+	// MetricsListen, when non-empty, starts a small HTTP server on
+	// the given address (e.g. ":7777" or "127.0.0.1:7777") exposing:
+	//   /metrics       — Prometheus text format counters from
+	//                    symbolize.Counters (kernel symbolize
+	//                    batches, EPERMs, fallback engagement, etc.)
+	//   /debug/pprof/  — Go runtime self-pprof handlers, so an
+	//                    operator can attach `go tool pprof
+	//                    http://host:port/debug/pprof/profile`
+	//                    to a running perf-agent and see ITS hot
+	//                    paths in real time (vs the bench-self
+	//                    offline path).
+	// Empty = no server, no port opened.
+	MetricsListen string
 
 	// Unwind selects the stack unwinding strategy for --profile and
 	// --offcpu modes. Valid values: "fp" (frame pointer),
@@ -130,6 +149,41 @@ type Config struct {
 	// not calling it at all).
 	LabelEnricher    func(hostPID int) map[string]string
 	LabelEnricherSet bool
+
+	// DebuginfodURLs is the ordered list of debuginfod servers to consult for
+	// off-box DWARF/executable fetching. If empty (and DEBUGINFOD_URLS env is
+	// also empty), the agent uses the local symbolizer.
+	DebuginfodURLs []string
+
+	// SymbolCacheDir overrides the debuginfod cache directory.
+	// Default: /tmp/perf-agent-debuginfod.
+	SymbolCacheDir string
+
+	// SymbolCacheMaxBytes overrides the debuginfod cache size cap. Default: 2 GiB.
+	SymbolCacheMaxBytes int64
+
+	// SymbolFetchTimeout overrides per-artifact fetch timeout. Default: 30s.
+	SymbolFetchTimeout time.Duration
+
+	// SymbolFailClosed makes the agent refuse to symbolize a mapping whose
+	// debuginfod fetch failed (vs. fall back to local). Default: false.
+	// Note: M1 ships the option but FailClosed semantics are M2.
+	SymbolFailClosed bool
+
+	// KernelStacks enables kernel-mode stack capture and symbolization.
+	// Default: false. Opt in via --kernel-stacks (CLI) or
+	// WithKernelStacks() (library).
+	//
+	// When set:
+	//   - BPF programs enable the kernel-stack capture path (a volatile
+	//     bool global flipped at load time; no per-sample cost when off).
+	//   - The Agent constructs a LocalKernelSymbolizer; on
+	//     ErrKernelSymbolsUnavailable, falls back to NoopKernelSymbolizer
+	//     + a one-time warning.
+	//   - --perf-data-output emits a kernel MMAP2 record at writer init,
+	//     and SampleRecord callchains carry PERF_CONTEXT_{KERNEL,USER}
+	//     markers around the merged kernel+user IPs.
+	KernelStacks bool
 }
 
 // Option is a functional option for configuring the Agent.
@@ -212,6 +266,15 @@ func WithTags(tags ...string) Option {
 func WithMetricsExporter(exp metrics.Exporter) Option {
 	return func(c *Config) {
 		c.MetricsExporters = append(c.MetricsExporters, exp)
+	}
+}
+
+// WithMetricsListen enables the in-process HTTP server hosting
+// /metrics (Prometheus text format) and /debug/pprof on the
+// given address. See Config.MetricsListen.
+func WithMetricsListen(addr string) Option {
+	return func(c *Config) {
+		c.MetricsListen = addr
 	}
 }
 
@@ -384,4 +447,45 @@ func WithGPUFoldedOutputPath(path string) Option {
 
 func newGPUManager(backends []gpu.Backend) *gpu.Manager {
 	return gpu.NewManager(backends, nil)
+}
+
+// WithPerfDataOutput enables writing a Linux perf.data file alongside the
+// pprof output. Only on-CPU samples are emitted (off-CPU and PMU modes
+// ignore this). The output is consumable by perf script, perf report,
+// create_llvm_prof (AutoFDO PGO), FlameGraph, hotspot, etc.
+func WithPerfDataOutput(path string) Option {
+	return func(c *Config) { c.PerfDataOutput = path }
+}
+
+// WithDebuginfodURL appends a debuginfod server URL. Repeatable.
+func WithDebuginfodURL(url string) Option {
+	return func(c *Config) {
+		c.DebuginfodURLs = append(c.DebuginfodURLs, url)
+	}
+}
+
+// WithSymbolCacheDir overrides the debuginfod cache directory.
+func WithSymbolCacheDir(dir string) Option {
+	return func(c *Config) { c.SymbolCacheDir = dir }
+}
+
+// WithSymbolCacheMaxBytes overrides the debuginfod cache cap.
+func WithSymbolCacheMaxBytes(n int64) Option {
+	return func(c *Config) { c.SymbolCacheMaxBytes = n }
+}
+
+// WithSymbolFetchTimeout overrides per-artifact fetch timeout.
+func WithSymbolFetchTimeout(d time.Duration) Option {
+	return func(c *Config) { c.SymbolFetchTimeout = d }
+}
+
+// WithSymbolFailClosed enables fail-closed behavior on debuginfod errors.
+func WithSymbolFailClosed() Option {
+	return func(c *Config) { c.SymbolFailClosed = true }
+}
+
+// WithKernelStacks enables kernel-mode stack capture + symbolization.
+// Default: off.
+func WithKernelStacks() Option {
+	return func(c *Config) { c.KernelStacks = true }
 }

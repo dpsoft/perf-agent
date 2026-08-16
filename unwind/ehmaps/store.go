@@ -103,8 +103,19 @@ func (s *TableStore) SetOnCompile(fn func(path, buildID string, ehFrameBytes int
 // it on behalf of `pid`. Returns the tableID plus a boolean indicating
 // whether a fresh compile happened (false means the refcount was
 // simply incremented on an existing table).
-func (s *TableStore) AcquireBinary(binPath string, pid uint32) (tableID uint64, compiled bool, err error) {
-	buildID, err := ReadBuildID(binPath)
+//
+// binPath is the cache key (the symbolic path, stable across PIDs — two
+// processes mapping the same /usr/lib/libc.so.6 share one compile result).
+// openPath is the file actually opened for build-id + ehcompile; pass
+// "" to use binPath. openPath differs from binPath only when the
+// symbolic path is unreachable from the agent's namespace (deleted-but-
+// mapped binary, sidecar / mount-namespace cases) and the caller routed
+// I/O through /proc/<pid>/map_files.
+func (s *TableStore) AcquireBinary(binPath, openPath string, pid uint32) (tableID uint64, compiled bool, err error) {
+	if openPath == "" {
+		openPath = binPath
+	}
+	buildID, err := ReadBuildID(openPath)
 	if err != nil {
 		return 0, false, fmt.Errorf("build-id %s: %w", binPath, err)
 	}
@@ -114,7 +125,7 @@ func (s *TableStore) AcquireBinary(binPath string, pid uint32) (tableID uint64, 
 	}
 	// First reference for this tableID — compile + install.
 	t0 := time.Now()
-	entries, classifications, ehFrameBytes, err := ehcompile.Compile(binPath)
+	entries, classifications, ehFrameBytes, err := ehcompile.Compile(openPath)
 	compileDur := time.Since(t0)
 	if err != nil {
 		s.rc.Release(tableID, pid)

@@ -64,6 +64,13 @@ func enrollPIDFromTree(procRoot string, t *PIDTracker, pid uint32, cache map[str
 	seen := map[string]struct{}{}
 	var firstErr error
 	n := 0
+	// Detect a synthetic test tree: when procRoot != "/proc" we must NOT
+	// fall back to /proc/<pid>/map_files (it points at a different PID
+	// namespace than the fake fixture). openableBinary only consults
+	// /proc, so for synthetic trees we restrict ourselves to the
+	// symbolic path. This matches the prior behavior of unit tests that
+	// build a fake proc tree in t.TempDir() and stage real ELFs under it.
+	syntheticTree := procRoot != "/proc"
 	for line := range strings.SplitSeq(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 6 {
@@ -76,15 +83,38 @@ func enrollPIDFromTree(procRoot string, t *PIDTracker, pid uint32, cache map[str
 		if path == "" || strings.HasPrefix(path, "[") || strings.HasPrefix(path, "//anon") {
 			continue
 		}
+		dash := strings.IndexByte(fields[0], '-')
+		if dash < 0 {
+			continue
+		}
+		start, perr := strconv.ParseUint(fields[0][:dash], 16, 64)
+		if perr != nil {
+			continue
+		}
+		limit, perr := strconv.ParseUint(fields[0][dash+1:], 16, 64)
+		if perr != nil {
+			continue
+		}
 		if _, dup := seen[path]; dup {
 			continue
 		}
 		seen[path] = struct{}{}
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
+		var openPath string
+		if syntheticTree {
+			if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			openPath = path
+		} else {
+			openPath = openableBinary(pid, start, limit, path)
+			if openPath == "" {
+				continue
+			}
+			if info, err := os.Stat(openPath); err != nil || !info.Mode().IsRegular() {
+				continue
+			}
 		}
-		if err := t.EnrollWithoutCompile(pid, path, cache); err != nil {
+		if err := t.EnrollWithoutCompile(pid, path, openPath, cache); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("enroll %s: %w", path, err)
 			} else {

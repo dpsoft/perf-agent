@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,17 +17,21 @@ import (
 )
 
 var (
-	flagProfile            = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
-	flagOffCpu             = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
-	flagPMU                = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
-	flagPID                = flag.Int("pid", 0, "Target process ID to monitor")
-	flagAll                = flag.Bool("a", false, "System-wide profiling (all processes)")
-	flagPerPID             = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
-	flagDuration           = flag.Duration("duration", 10*time.Second, "Collection duration")
-	flagSampleRate         = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
-	flagProfileOutput      = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
-	flagOffcpuOutput       = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
-	flagPMUOutput          = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagProfile        = flag.Bool("profile", false, "Enable CPU profiling with stack traces")
+	flagOffCpu         = flag.Bool("offcpu", false, "Enable off-CPU profiling with stack traces")
+	flagPMU            = flag.Bool("pmu", false, "Enable PMU hardware counters (cycles, instructions, cache misses)")
+	flagPID            = flag.Int("pid", 0, "Target process ID to monitor")
+	flagAll            = flag.Bool("a", false, "System-wide profiling (all processes)")
+	flagPerPID         = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
+	flagDuration       = flag.Duration("duration", 10*time.Second, "Collection duration")
+	flagSampleRate     = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
+	flagProfileOutput  = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
+	flagOffcpuOutput   = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
+	flagPMUOutput      = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagPerfDataOutput = flag.String("perf-data-output", "",
+		"Write a kernel-format perf.data file alongside the pprof output. "+
+			"Consumable by perf script, perf report, create_llvm_prof (AutoFDO PGO), "+
+			"FlameGraph, hotspot, etc.")
 	flagUnwind             = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
 	flagGPUHostReplayInput = flag.String("gpu-host-replay-input", "", "Experimental: replay host launch attribution from a JSON fixture")
 	flagGPUHostHIPLibrary  = flag.String("gpu-host-hip-library", "", "Experimental: attach HIP host launch attribution to this shared library path")
@@ -43,7 +48,21 @@ var (
 	flagGPUFoldedOutput    = flag.String("gpu-folded-output", "", "Experimental: write folded GPU flamegraph input to this path")
 	flagInjectPython       = flag.Bool("inject-python", false,
 		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
-	flagTags               tagFlags
+	flagTags           tagFlags
+	flagDebuginfodURLs urlFlags
+	flagSymbolCacheDir = flag.String("symbol-cache-dir", "",
+		"Directory for debuginfod-fetched artifacts. Default: /tmp/perf-agent-debuginfod.")
+	flagSymbolCacheMax = flag.Int64("symbol-cache-max", 0,
+		"Maximum size of the debuginfod cache in bytes. Default: 2 GiB.")
+	flagSymbolFetchTimeout = flag.Duration("symbol-fetch-timeout", 0,
+		"Per-artifact debuginfod fetch timeout. Default: 30s.")
+	flagSymbolFailClosed = flag.Bool("symbol-fail-closed", false,
+		"Refuse to symbolize a mapping whose debuginfod fetch failed (no fallback to local).")
+	flagKernelStacks = flag.Bool("kernel-stacks", false,
+		"Enable kernel-mode stack capture and symbolization (default: off).")
+	flagMetricsListen = flag.String("metrics-listen", "",
+		"If non-empty, expose /metrics (Prometheus text format) and "+
+			"/debug/pprof on this address (e.g. 127.0.0.1:7777). Default: off.")
 )
 
 // tagFlags is a custom flag type for collecting multiple --tag key=value arguments
@@ -61,11 +80,26 @@ func (t *tagFlags) Set(value string) error {
 	return nil
 }
 
+// urlFlags collects multiple --debuginfod-url arguments.
+type urlFlags []string
+
+func (u *urlFlags) String() string { return strings.Join(*u, ",") }
+func (u *urlFlags) Set(v string) error {
+	if v == "" {
+		return errors.New("debuginfod URL must not be empty")
+	}
+	*u = append(*u, v)
+	return nil
+}
+
 func init() {
 	// Register long form for -a flag
 	flag.BoolVar(flagAll, "all", false, "System-wide profiling (all processes)")
 	// Register --tag flag for profile metadata
 	flag.Var(&flagTags, "tag", "Add tag to profile (repeatable, format: key=value)")
+	// Register --debuginfod-url flag for debuginfod server URLs
+	flag.Var(&flagDebuginfodURLs, "debuginfod-url",
+		"Add a debuginfod server URL (repeatable). Falls back to DEBUGINFOD_URLS env var.")
 }
 
 var pmuFile *os.File
@@ -214,6 +248,10 @@ func buildOptions() []perfagent.Option {
 			outputPath = generateOutputName(*flagPID, *flagAll, "on-cpu", "pb.gz")
 		}
 		opts = append(opts, perfagent.WithCPUProfile(outputPath))
+
+		if *flagPerfDataOutput != "" {
+			opts = append(opts, perfagent.WithPerfDataOutput(*flagPerfDataOutput))
+		}
 	}
 
 	if *flagOffCpu {
@@ -342,6 +380,32 @@ func buildOptions() []perfagent.Option {
 	// Tags
 	if len(flagTags) > 0 {
 		opts = append(opts, perfagent.WithTags(flagTags...))
+	}
+
+	// Debuginfod / symbol-cache options
+	for _, u := range flagDebuginfodURLs {
+		opts = append(opts, perfagent.WithDebuginfodURL(u))
+	}
+	if *flagSymbolCacheDir != "" {
+		opts = append(opts, perfagent.WithSymbolCacheDir(*flagSymbolCacheDir))
+	}
+	if *flagSymbolCacheMax > 0 {
+		opts = append(opts, perfagent.WithSymbolCacheMaxBytes(*flagSymbolCacheMax))
+	}
+	if *flagSymbolFetchTimeout > 0 {
+		opts = append(opts, perfagent.WithSymbolFetchTimeout(*flagSymbolFetchTimeout))
+	}
+	if *flagSymbolFailClosed {
+		opts = append(opts, perfagent.WithSymbolFailClosed())
+	}
+	if *flagKernelStacks {
+		opts = append(opts, perfagent.WithKernelStacks())
+	}
+
+	// Metrics endpoint (Prometheus + /debug/pprof) for live
+	// observability — roadmap #3.
+	if *flagMetricsListen != "" {
+		opts = append(opts, perfagent.WithMetricsListen(*flagMetricsListen))
 	}
 
 	// Unwinding strategy

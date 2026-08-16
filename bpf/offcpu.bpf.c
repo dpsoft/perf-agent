@@ -55,6 +55,13 @@ struct {
 // System-wide mode: when true, profile all processes; when false, use PID filter
 const volatile bool system_wide = false;
 
+// Set by userspace at load time (cfg.KernelStacks). When false, kernel
+// stack capture is fully bypassed — zero per-sample cost. When true, the
+// per-sample kernel-stack id is captured for every tracked switch-OUT.
+// This profiler has no per-PID `pid_config.collect_kernel` setter — the
+// gate lives entirely here.
+const volatile bool kernel_stacks_enabled = false;
+
 // PID filter: only track specified PIDs (used when system_wide=false)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -99,7 +106,9 @@ static int handle_sched_switch(void *ctx, bool preempt,
 
                 // Capture stack trace using ctx (BPF_PROG provides this)
                 // At sched_switch, prev is still "current" so ctx captures its stack
-                sv.kern_stack = bpf_get_stackid(ctx, &stackmap, KERN_STACKID_FLAGS);
+                if (kernel_stacks_enabled) {
+                    sv.kern_stack = bpf_get_stackid(ctx, &stackmap, KERN_STACKID_FLAGS);
+                }
                 sv.user_stack = bpf_get_stackid(ctx, &stackmap, USER_STACKID_FLAGS);
 
                 bpf_map_update_elem(&start, &sk, &sv, BPF_ANY);

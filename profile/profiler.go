@@ -9,23 +9,25 @@ import (
 
 	"github.com/cilium/ebpf"
 
-	blazesym "github.com/libbpf/blazesym/go"
-
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
+	"github.com/dpsoft/perf-agent/internal/perfdata"
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
-	objs       *perfObjects
-	symbolizer *blazesym.Symbolizer
-	resolver   *procmap.Resolver
-	perfSet    *perfevent.Set
-	tags       []string
-	sampleRate int
-	labels     map[string]string
+	objs             *perfObjects
+	symbolizer       symbolize.Symbolizer
+	kernelSymbolizer symbolize.KernelSymbolizer
+	resolver         *procmap.Resolver
+	perfSet          *perfevent.Set
+	tags             []string
+	sampleRate       int
+	labels           map[string]string
+	perfData         *perfdata.Writer // optional, nil when --perf-data-output not set
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -37,36 +39,19 @@ func (s *stackBuilder) append(f pprof.Frame) {
 	s.stack = append(s.stack, f)
 }
 
-// blazeSymToFrames converts a blazesym.Sym into one or more pprof.Frames.
-// addr is the absolute PC from the BPF stack — it is copied onto every
-// frame (inlined chain + outer real function) so pprof Locations stay
-// distinguishable when two PCs symbolize to the same (file, line, func).
+// NewProfiler creates a new CPU profiler.
 //
-// blazesym reports Inlined in outer→inner order (see
-// blazesym/src/symbolize/mod.rs:408), so we walk it in reverse to get
-// leaf-first output.
-func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
-	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
-	for i := len(s.Inlined) - 1; i >= 0; i-- {
-		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
-		if in.CodeInfo != nil {
-			f.File = in.CodeInfo.File
-			f.Line = in.CodeInfo.Line
-		}
-		out = append(out, f)
-	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
-	if s.CodeInfo != nil {
-		outer.File = s.CodeInfo.File
-		outer.Line = s.CodeInfo.Line
-	}
-	out = append(out, outer)
-	return out
-}
-
-// NewProfiler creates a new CPU profiler with the specified sample rate in Hz
-func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string) (*Profiler, error) {
+// eventSpec selects the perf-event source. Pass nil to default to software
+// cpu-clock at sampleRate Hz. When non-nil, sampleRate is ignored (the
+// caller is responsible for putting the desired rate in eventSpec). Used
+// by the agent to keep the in-kernel event and the perf.data attr in sync
+// when the output writer is enabled — a divergence would mislead consumers.
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time; the CollectKernel bit on each pid_config entry is a
+// no-op. When true, kernel stacks are captured for matched samples.
+func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRate int, labels map[string]string, perfData *perfdata.Writer, eventSpec *perfevent.EventSpec, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadPerf()
 	if err != nil {
 		return nil, fmt.Errorf("load profile spec: %w", err)
@@ -75,6 +60,12 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 	// Set system_wide variable in eBPF program
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide variable: %w", err)
+	}
+
+	// Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
+	// gate evaluates correctly on first sample.
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 
 	objs := &perfObjects{}
@@ -87,7 +78,7 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		config := perfPidConfig{
 			Type:          0,
 			CollectUser:   1,
-			CollectKernel: 0,
+			CollectKernel: 1, // gated by BPF kernel_stacks_enabled global
 		}
 
 		if err := objs.Pids.Update(uint32(pid), &config, ebpf.UpdateAny); err != nil {
@@ -96,36 +87,37 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		}
 	}
 
-	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, sampleRate)
+	evSpec := perfevent.EventSpec{
+		Type:         perfevent.PerfTypeSoftware,
+		Config:       perfevent.PerfCountSWCPUClock,
+		SamplePeriod: uint64(sampleRate),
+		Frequency:    true,
+	}
+	if eventSpec != nil {
+		evSpec = *eventSpec
+	}
+	perfSet, err := perfevent.OpenAll(objs.Profile, cpus, evSpec)
 	if err != nil {
 		_ = objs.Close()
 		return nil, err
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		_ = perfSet.Close()
-		_ = objs.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
 	return &Profiler{
-		objs:       objs,
-		symbolizer: symbolizer,
-		resolver:   procmap.NewResolver(),
-		perfSet:    perfSet,
-		tags:       tags,
-		sampleRate: sampleRate,
-		labels:     labels,
+		objs:             objs,
+		symbolizer:       sym,
+		kernelSymbolizer: kernelSym,
+		resolver:         procmap.NewResolver(),
+		perfSet:          perfSet,
+		tags:             tags,
+		sampleRate:       sampleRate,
+		labels:           labels,
+		perfData:         perfData,
 	}, nil
 }
 
-// Close releases all resources associated with the profiler
+// Close releases all resources associated with the profiler.
+// The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
-	pr.symbolizer.Close()
 	pr.resolver.Close()
 	_ = pr.perfSet.Close()
 	_ = pr.objs.Close()
@@ -167,12 +159,20 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		Labels:        pr.labels,
 	})
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		key := keys[i]
 		value := values[i]
 
 		// Use PID from sample key for symbolization
 		samplePid := key.Pid
+
+		// Kernel stack lookup — only when BPF gated a valid stack ID.
+		var kernelIPs []uint64
+		if key.KernStack >= 0 {
+			if kernBytes, err := pr.objs.Stackmap.LookupBytes(uint32(key.KernStack)); err == nil {
+				kernelIPs = bpfstack.ExtractIPs(kernBytes)
+			}
+		}
 
 		stack, err := pr.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
@@ -188,29 +188,47 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		begin := len(sb.stack)
 
 		// Extract all non-zero IPs first, then batch-symbolize in a
-		// single blazesym call. Per-call overhead (CGO boundary +
-		// perf-map / debug-syms bookkeeping) dominates for short stacks;
-		// one batched call is dramatically cheaper than one call per IP.
+		// single call through the symbolize.Symbolizer interface. Per-call
+		// overhead (CGO boundary + perf-map / debug-syms bookkeeping)
+		// dominates for short stacks; one batched call is dramatically
+		// cheaper than one call per IP.
 		ips := bpfstack.ExtractIPs(stack)
-		if len(ips) > 0 {
-			symbols, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
-				ips,
-				samplePid,
-				blazesym.ProcessSourceWithPerfMap(true),
-				blazesym.ProcessSourceWithDebugSyms(true),
-			)
-			if err != nil {
-				log.Printf("Failed to symbolize: %v", err)
-			} else {
-				// symbols and ips are parallel — one Sym per IP.
-				for i, s := range symbols {
-					if i >= len(ips) {
-						break
-					}
-					for _, f := range blazeSymToFrames(s, ips[i]) {
-						sb.append(f)
-					}
+		// Split kernel-range IPs out of the user-stack walk. When the
+		// sampled task is in kernel context (syscall, irq, fault),
+		// bpf_get_stackid with BPF_F_USER_STACK can leak kernel
+		// addresses into the user-stack buffer — they appear in
+		// the high half (≥ 0xffff_8000_0000_0000 on x86_64). Without
+		// this split the user symbolizer sees kernel IPs (which it
+		// can't resolve) and the kernel symbolizer never sees them.
+		// Bug discovered via bench-self iteration 2: top 5 hot
+		// "user" addresses in perf-agent's self-profile were all
+		// kernel-range.
+		ips, strayKernelIPs := bpfstack.SplitUserKernelIPs(ips)
+		if len(strayKernelIPs) > 0 {
+			kernelIPs = append(strayKernelIPs, kernelIPs...)
+		}
+		if len(ips) > 0 || len(kernelIPs) > 0 {
+			var userFrames, kernelFrames []symbolize.Frame
+			if len(ips) > 0 {
+				userFrames, err = pr.symbolizer.SymbolizeProcess(samplePid, ips)
+				if err != nil {
+					log.Printf("Failed to symbolize user: %v", err)
 				}
+			}
+			if len(kernelIPs) > 0 {
+				kernelFrames, err = pr.kernelSymbolizer.SymbolizeKernel(kernelIPs)
+				if err != nil {
+					log.Printf("Failed to symbolize kernel: %v", err)
+				}
+			}
+			// Kernel frames are leaf-side: they go first so that after
+			// Reverse() the call chain reads root→kernel→user (outermost
+			// first), which matches pprof convention.
+			for _, f := range symbolize.ToProfFramesKernel(kernelFrames) {
+				sb.append(f)
+			}
+			for _, f := range symbolize.ToProfFrames(userFrames) {
+				sb.append(f)
 			}
 		}
 
@@ -219,6 +237,17 @@ func (pr *Profiler) Collect(w io.Writer) error {
 
 		sample := pr.createSample(sb, value, int(samplePid))
 		builders.AddSample(&sample)
+
+		if pr.perfData != nil && len(ips) > 0 {
+			pr.perfData.AddSample(perfdata.SampleRecord{
+				IP:        ips[0],
+				Pid:       samplePid,
+				Tid:       samplePid,
+				Period:    value,
+				UserIPs:   ips,
+				KernelIPs: kernelIPs,
+			})
+		}
 	}
 
 	// Write profile directly to the provided writer
@@ -259,4 +288,5 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 		Value:       value,
 	}
 }
+
 

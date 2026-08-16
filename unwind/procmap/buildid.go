@@ -13,11 +13,11 @@ const (
 	gnu_name        = "GNU\x00"
 )
 
-// readBuildID returns the GNU build-id of the ELF at path as a
+// ReadBuildID returns the GNU build-id of the ELF at path as a
 // lowercase hex string. Returns an empty string (with nil error) when
 // the ELF is valid but has no .note.gnu.build-id note, and an error
 // when the file can't be opened or isn't ELF.
-func readBuildID(path string) (string, error) {
+func ReadBuildID(path string) (string, error) {
 	f, err := elf.Open(path)
 	if err != nil {
 		return "", err

@@ -1,7 +1,9 @@
 package perfagent
 
 import (
+	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"maps"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,11 +34,16 @@ import (
 	"github.com/dpsoft/perf-agent/inject/python"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
+	"github.com/dpsoft/perf-agent/internal/perfdata"
+	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
+	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/symbolize/debuginfod"
 	"github.com/dpsoft/perf-agent/unwind/dwarfagent"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 const defaultGPUHIPLinuxDRMJoinWindow = 5 * time.Millisecond
@@ -93,7 +101,20 @@ type Agent struct {
 	pmuMonitor     *cpu.PMUMonitor
 	gpuManager     *gpu.Manager
 	hostSource     hostsource.HostSource
-	pyInjector     *python.Manager // nil unless --inject-python is set
+	pyInjector     *python.Manager  // nil unless --inject-python is set
+	perfDataWriter *perfdata.Writer // nil when --perf-data-output not set
+
+	// symbolizer is the agent-owned shared symbol resolver. Selected at
+	// Start() time based on whether DebuginfodURLs is non-empty.
+	symbolizer symbolize.Symbolizer
+
+	// kernelSymbolizer resolves kernel-space addresses. Initialized in
+	// Start() when cfg.KernelStacks is true; otherwise NoopKernelSymbolizer.
+	kernelSymbolizer symbolize.KernelSymbolizer
+
+	// metricsSrv is the optional HTTP server hosting /metrics and
+	// /debug/pprof. nil when WithMetricsListen wasn't used.
+	metricsSrv *metricsServer
 
 	mu      sync.Mutex
 	started bool
@@ -297,6 +318,57 @@ func (a *Agent) pidLogStr(hostPID int) string {
 	return fmt.Sprintf("%d (host: %d)", a.config.PID, hostPID)
 }
 
+// chooseSymbolizer constructs the agent-owned symbolizer. If DebuginfodURLs
+// is non-empty (or the DEBUGINFOD_URLS env var is set), a Debuginfod
+// symbolizer is returned; otherwise the local blazesym symbolizer is used.
+func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (symbolize.Symbolizer, error) {
+	urls := cfg.DebuginfodURLs
+	if len(urls) == 0 {
+		for u := range strings.FieldsSeq(os.Getenv("DEBUGINFOD_URLS")) {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return symbolize.NewLocalSymbolizer()
+	}
+	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
+	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))
+	timeout := cmp.Or(cfg.SymbolFetchTimeout, 30*time.Second)
+	return debuginfod.New(debuginfod.Options{
+		URLs:          urls,
+		CacheDir:      cacheDir,
+		CacheMaxBytes: cacheMax,
+		FetchTimeout:  timeout,
+		FailClosed:    cfg.SymbolFailClosed,
+		Resolver:      res,
+		Logger:        logger,
+		Demangle:      true,
+		InlinedFns:    true,
+		CodeInfo:      true,
+	})
+}
+
+// chooseKernelSymbolizer returns LocalKernelSymbolizer when cfg.KernelStacks
+// is true and /proc/kallsyms is readable; otherwise NoopKernelSymbolizer (and
+// a one-time warning if the user opted in but kallsyms is locked down). When
+// cfg.KernelStacks is false, returns NoopKernelSymbolizer silently — the user
+// did not opt in.
+func chooseKernelSymbolizer(cfg *Config, logger *slog.Logger) symbolize.KernelSymbolizer {
+	if !cfg.KernelStacks {
+		return symbolize.NoopKernelSymbolizer{}
+	}
+	s, err := symbolize.NewLocalKernelSymbolizer()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("kernel symbols unavailable; kernel frames will be raw addresses",
+				"error", err,
+				"hint", "sysctl kernel.kptr_restrict=0 (and ensure perf_event_paranoid <= 2)")
+		}
+		return symbolize.NoopKernelSymbolizer{}
+	}
+	return s
+}
+
 // Start initializes and starts all enabled profilers.
 func (a *Agent) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -350,6 +422,70 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	// Open perf.data writer if --perf-data-output set. Probe HW cycles up
+	// front so the writer's attr matches the perf events we'll actually
+	// open in the profiler — and pass the same spec into the profiler's
+	// constructor below so perf_event_open and the perf.data attr stay
+	// in sync. Otherwise consumers see HW/cycles in the header but real
+	// SW/cpu-clock samples, and weight attribution silently drifts.
+	var profilerEventSpec *perfevent.EventSpec
+	if a.config.PerfDataOutput != "" {
+		spec, err := perfevent.ProbeHardwareCycles(uint64(a.config.SampleRate))
+		if err != nil {
+			return fmt.Errorf("probe perf event for perf.data: %w", err)
+		}
+		log.Printf("perf-agent: perf.data event = %s", spec)
+		profilerEventSpec = &spec
+
+		hostname, _ := os.Hostname()
+		w, err := perfdata.Open(a.config.PerfDataOutput, perfdata.EventSpec{
+			Type:         spec.Type,
+			Config:       spec.Config,
+			SamplePeriod: spec.SamplePeriod,
+			Frequency:    spec.Frequency,
+		}, perfdata.MetaInfo{
+			Hostname:  hostname,
+			OSRelease: readOSRelease(),
+			NumCPUs:   uint32(len(cpus)),
+		})
+		if err != nil {
+			return fmt.Errorf("open perf.data: %w", err)
+		}
+		a.perfDataWriter = w
+	}
+
+	if a.perfDataWriter != nil && a.config.KernelStacks {
+		if err := a.perfDataWriter.AddKernelMmap(); err != nil {
+			log.Printf("perfdata: AddKernelMmap: %v (continuing; kernel symbol resolution may be limited)", err)
+		}
+	}
+
+	if a.perfDataWriter != nil {
+		// Synthesize userspace MMAP2 records from /proc/<pid>/maps so
+		// `perf script` / `perf report` can resolve user-space IPs
+		// against on-disk binaries. Without these, every userspace
+		// frame in the resulting perf.data shows up as [unknown].
+		r := procmap.NewResolver()
+		if hostPID != 0 {
+			emitCommForPID(a.perfDataWriter, hostPID)
+			emitUserspaceMmapsForPID(a.perfDataWriter, r, hostPID)
+		} else {
+			// System-wide: emit COMM + MMAP2 lazily, on the first
+			// sample observed per PID. The previous "walk every
+			// /proc PID at writer init" pass cost ~30% of
+			// perf-agent CPU on a busy host (dogfood iter 9 found
+			// kernel /proc/<pid>/maps rendering — show_map_vma,
+			// mangle_path, lock_next_vma — dominating the
+			// profile). Lazy emission also automatically covers
+			// PIDs that exec after capture starts; the eager
+			// walk could never see those.
+			a.perfDataWriter.OnNewPID = func(pid uint32) {
+				emitCommForPID(a.perfDataWriter, int(pid))
+				emitUserspaceMmapsForPID(a.perfDataWriter, r, int(pid))
+			}
+		}
+	}
+
 	// Inject Python perf-trampoline before BPF attach so early samples have
 	// JIT symbol names. Runs only when --inject-python is set.
 	if a.pyInjector != nil {
@@ -357,6 +493,34 @@ func (a *Agent) Start(ctx context.Context) error {
 		if err := a.pyInjector.ActivateAll(pids); err != nil {
 			return fmt.Errorf("python injection: %w", err)
 		}
+	}
+
+	// Construct the shared symbolizer once. All profilers below share the
+	// same instance. chooseSymbolizer picks LocalSymbolizer when no
+	// debuginfod URLs are configured, or DebuginfodSymbolizer otherwise.
+	sym, err := chooseSymbolizer(a.config, procmap.NewResolver(), slog.Default())
+	if err != nil {
+		return fmt.Errorf("symbolizer: %w", err)
+	}
+	a.symbolizer = sym
+	a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
+
+	// Optional /metrics + /debug/pprof endpoint. Started after the
+	// kernelSymbolizer is constructed so the handler closure can
+	// snapshot live counters; stopped in cleanup() after the
+	// symbolizer is closed so a late scrape can't race.
+	if a.config.MetricsListen != "" {
+		srv, err := startMetricsListener(a.config.MetricsListen, func() symbolize.CountersSnapshot {
+			if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+				return lks.Stats()
+			}
+			return symbolize.CountersSnapshot{}
+		})
+		if err != nil {
+			return fmt.Errorf("start metrics listener: %w", err)
+		}
+		a.metricsSrv = srv
+		log.Printf("perf-agent: metrics endpoint listening on http://%s/metrics (and /debug/pprof)", srv.addr)
 	}
 
 	// Start CPU profiler if enabled
@@ -373,6 +537,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeEager,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
+				a.symbolizer,
+				a.kernelSymbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -394,6 +563,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				hooks,
 				dwarfagent.ModeLazy,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
+				a.symbolizer,
+				a.kernelSymbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create DWARF CPU profiler: %w", err)
@@ -412,6 +586,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.Tags,
 				a.config.SampleRate,
 				labels,
+				a.perfDataWriter,
+				profilerEventSpec,
+				a.symbolizer,
+				a.kernelSymbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				return fmt.Errorf("create CPU profiler: %w", err)
@@ -435,6 +614,9 @@ func (a *Agent) Start(ctx context.Context) error {
 				cpus,
 				a.config.Tags,
 				labels,
+				a.symbolizer,
+				a.kernelSymbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				a.cleanup()
@@ -452,6 +634,9 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.config.SystemWide,
 				a.config.Tags,
 				labels,
+				a.symbolizer,
+				a.kernelSymbolizer,
+				a.config.KernelStacks,
 			)
 			if err != nil {
 				a.cleanup()
@@ -706,6 +891,14 @@ func (a *Agent) cleanup() {
 		a.cpuProfiler.Close()
 		a.cpuProfiler = nil
 	}
+	// Close perf.data after the CPU profiler so any in-flight ringbuf
+	// samples (dwarfagent fan-out) land before we patch the file header.
+	if a.perfDataWriter != nil {
+		if err := a.perfDataWriter.Close(); err != nil {
+			log.Printf("perf-agent: close perf.data: %v", err)
+		}
+		a.perfDataWriter = nil
+	}
 	if a.offcpuProfiler != nil {
 		a.offcpuProfiler.Close()
 		a.offcpuProfiler = nil
@@ -722,6 +915,39 @@ func (a *Agent) cleanup() {
 		_ = a.gpuManager.Close()
 		a.gpuManager = nil
 	}
+	// Close the symbolizer last — profilers above may have been using it
+	// up until their own Close() calls completed.
+	if a.symbolizer != nil {
+		_ = a.symbolizer.Close()
+		a.symbolizer = nil
+	}
+	if a.kernelSymbolizer != nil {
+		// Surface kernel-symbolizer counters so operators see
+		// fallback engagement and frame drops at end-of-run
+		// without having to scrape a /metrics endpoint.
+		if lks, ok := a.kernelSymbolizer.(*symbolize.LocalKernelSymbolizer); ok {
+			log.Printf("%s", lks.Stats())
+		}
+		_ = a.kernelSymbolizer.Close()
+		a.kernelSymbolizer = nil
+	}
+	// Stop the metrics endpoint after the symbolizer is gone — a
+	// late scrape during shutdown would otherwise see post-Close
+	// counter state, which is harmless but adds confusion.
+	stopMetricsListener(a.metricsSrv)
+	a.metricsSrv = nil
+}
+
+// readOSRelease reads the running kernel release from
+// /proc/sys/kernel/osrelease (a single-line file). Used to populate the
+// HEADER_OSRELEASE feature section in the perf.data header. Returns
+// "unknown" if the file can't be read.
+func readOSRelease() string {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // Config returns a copy of the agent's configuration.
@@ -911,6 +1137,70 @@ func mapPtraceopErrToPython(err error) error {
 			python.ErrNoPerfTrampoline)
 	}
 	return err
+}
+
+// emitCommForPID reads /proc/<pid>/comm and writes a PERF_RECORD_COMM.
+// Best-effort: returns silently if /proc/<pid>/comm is unreadable
+// (process exited, restricted) — without COMM `perf script` shows
+// the bare numeric pid in place of the process name, but the
+// kernel-side samples are still attributed by pid.
+//
+// Emitted for every PID we walk, including kernel threads:
+// kthreads (kvm-pit, vhost-*, kworker/*) have empty cmdline but a
+// valid comm; without this record, kernel-stacks samples drawn from
+// them appear with no name in `perf script` output.
+func emitCommForPID(w *perfdata.Writer, pid int) {
+	body, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return
+	}
+	comm := strings.TrimSpace(string(body))
+	if comm == "" {
+		return
+	}
+	w.AddComm(perfdata.CommRecord{
+		Pid:  uint32(pid),
+		Tid:  uint32(pid),
+		Comm: comm,
+	})
+}
+
+// emitUserspaceMmapsForPID writes PERF_RECORD_MMAP2 entries to w for
+// every executable mapping in /proc/<pid>/maps, sourced via the given
+// procmap.Resolver (which also attaches build-ids from
+// .note.gnu.build-id sections). Best-effort: errors are logged and
+// the perf.data writer continues; symbol resolution will be partial
+// for any pid we couldn't enumerate.
+//
+// Does NOT emit COMM — callers that want both should call
+// emitCommForPID first (perf convention: COMM before MMAP2 for the
+// same pid).
+func emitUserspaceMmapsForPID(w *perfdata.Writer, r *procmap.Resolver, pid int) {
+	mappings, err := r.Mappings(uint32(pid))
+	if err != nil {
+		log.Printf("perfdata: enumerate userspace mappings for pid %d: %v (continuing; perf.data userspace symbols may be [unknown])", pid, err)
+		return
+	}
+	user := make([]perfdata.UserspaceMapping, 0, len(mappings))
+	for _, m := range mappings {
+		if !m.IsExec {
+			continue
+		}
+		var bid []byte
+		if m.BuildID != "" {
+			if b, err := hex.DecodeString(m.BuildID); err == nil {
+				bid = b
+			}
+		}
+		user = append(user, perfdata.UserspaceMapping{
+			Start:   m.Start,
+			Len:     m.Limit - m.Start,
+			Pgoff:   m.Offset,
+			Path:    m.Path,
+			BuildID: bid,
+		})
+	}
+	w.AddUserspaceMmaps(pid, user)
 }
 
 // dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When

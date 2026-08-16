@@ -65,8 +65,17 @@ func extractGNUBuildID(notes []byte) []byte {
 // the ELF's executable PT_LOAD — "vma_start - file_offset" is wrong for
 // PIE binaries where PT_LOAD vaddr differs from file offset (Rust's
 // release output has a 0x1000 hole).
-func LoadProcessMappings(pid int, binPath string, tableID uint64) ([]PIDMapping, error) {
-	ef, err := elf.Open(binPath)
+//
+// binPath is the symbolic path (used for matching against /proc/<pid>/maps
+// entries — only its basename is compared). openPath is the actual file
+// to elf.Open; it may equal binPath in the common case or differ when the
+// symbolic path is unreachable (deleted-but-mapped binary, sidecar / mount-
+// namespace cases) and the caller routed I/O through /proc/<pid>/map_files.
+func LoadProcessMappings(pid int, binPath, openPath string, tableID uint64) ([]PIDMapping, error) {
+	if openPath == "" {
+		openPath = binPath
+	}
+	ef, err := elf.Open(openPath)
 	if err != nil {
 		return nil, err
 	}

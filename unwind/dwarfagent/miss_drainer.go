@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,7 +184,7 @@ func (s *session) consumeCFIMisses() {
 // call AttachCompileOnly. Returns true on success (so the drainer can
 // reset the failure counter), false on any drop.
 func (s *session) compileForMiss(ev *cfiMissEvent) bool {
-	binPath, err := resolveBinaryByTableID(ev.PID, ev.TableID)
+	binPath, openPath, err := resolveBinaryByTableID(ev.PID, ev.TableID)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrPIDGone):
@@ -196,7 +197,7 @@ func (s *session) compileForMiss(ev *cfiMissEvent) bool {
 		}
 		return false
 	}
-	if err := s.tracker.AttachCompileOnly(ev.PID, binPath); err != nil {
+	if err := s.tracker.AttachCompileOnly(ev.PID, binPath, openPath); err != nil {
 		s.missCounters.droppedAttach.Add(1)
 		log.Printf("dwarfagent: lazy attach pid=%d %s: %v", ev.PID, binPath, err)
 		return false
@@ -206,17 +207,21 @@ func (s *session) compileForMiss(ev *cfiMissEvent) bool {
 }
 
 // resolveBinaryByTableID reads /proc/<pid>/maps and returns the
-// executable mapping path whose build-id-derived tableID matches the
-// requested value. Returns ErrPIDGone if /proc/<pid>/maps is missing,
-// ErrTableNotMapped if no path matches.
-func resolveBinaryByTableID(pid uint32, tableID uint64) (string, error) {
+// (symbolic path, openable path) of the executable mapping whose
+// build-id-derived tableID matches the requested value. The symbolic
+// path is the cache key; the openable path may be the same or a
+// /proc/<pid>/map_files entry when the symbolic path is unreachable
+// (deleted-but-mapped binary, sidecar / mount-namespace cases).
+// Returns ErrPIDGone if /proc/<pid>/maps is missing, ErrTableNotMapped
+// if no path matches.
+func resolveBinaryByTableID(pid uint32, tableID uint64) (binPath, openPath string, err error) {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
 	data, err := os.ReadFile(mapsPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", ErrPIDGone
+			return "", "", ErrPIDGone
 		}
-		return "", fmt.Errorf("read %s: %w", mapsPath, err)
+		return "", "", fmt.Errorf("read %s: %w", mapsPath, err)
 	}
 	seen := map[string]struct{}{}
 	for line := range strings.SplitSeq(string(data), "\n") {
@@ -231,22 +236,61 @@ func resolveBinaryByTableID(pid uint32, tableID uint64) (string, error) {
 		if path == "" || strings.HasPrefix(path, "[") || strings.HasPrefix(path, "//anon") {
 			continue
 		}
+		dash := strings.IndexByte(fields[0], '-')
+		if dash < 0 {
+			continue
+		}
+		start, perr := strconv.ParseUint(fields[0][:dash], 16, 64)
+		if perr != nil {
+			continue
+		}
+		limit, perr := strconv.ParseUint(fields[0][dash+1:], 16, 64)
+		if perr != nil {
+			continue
+		}
 		if _, dup := seen[path]; dup {
 			continue
 		}
 		seen[path] = struct{}{}
-		info, err := os.Stat(path)
+		op := openableBinaryForMiss(pid, start, limit, path)
+		if op == "" {
+			continue
+		}
+		info, err := os.Stat(op)
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		buildID, err := ehmaps.ReadBuildID(path)
+		buildID, err := ehmaps.ReadBuildID(op)
 		if err != nil {
-			slog.Debug("dwarfagent: build-id read failed", "path", path, "err", err)
+			slog.Debug("dwarfagent: build-id read failed", "path", path, "openPath", op, "err", err)
 			continue
 		}
 		if ehmaps.TableIDForBuildID(buildID) == tableID {
-			return path, nil
+			return path, op, nil
 		}
 	}
-	return "", ErrTableNotMapped
+	return "", "", ErrTableNotMapped
+}
+
+// openableBinaryForMiss mirrors ehmaps.openableBinary for the miss drainer.
+// Returns the first openable path: /proc/<pid>/map_files/<start>-<limit>
+// (works across mount namespaces, survives unlinked-but-mapped binaries)
+// then the symbolic path. Returns "" when neither resolves.
+func openableBinaryForMiss(pid uint32, start, limit uint64, symbolicPath string) string {
+	candidates := [2]string{
+		fmt.Sprintf("/proc/%d/map_files/%x-%x", pid, start, limit),
+		symbolicPath,
+	}
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		_ = f.Close()
+		return p
+	}
+	return ""
 }

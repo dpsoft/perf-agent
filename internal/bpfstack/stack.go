@@ -10,6 +10,37 @@ import "encoding/binary"
 // PERF_MAX_STACK_DEPTH macro in bpf/perf.bpf.c and bpf/offcpu.bpf.c.
 const MaxFrames = 127
 
+// kernelAddrThreshold is the low end of the x86_64 kernel half of
+// the canonical address space. Anything at or above this is a
+// kernel address. Same threshold the Linux kernel uses internally
+// (the canonical-form rule: bits [63:48] must all match bit 47).
+// arm64 uses 0xffff000000000000 by default which is also above
+// this; the threshold is conservative for both architectures.
+const kernelAddrThreshold uint64 = 0xffff800000000000
+
+// SplitUserKernelIPs partitions a BPF user-stack buffer into
+// genuine user IPs and stray kernel IPs. The leak happens when
+// the sampled task is in kernel context (syscall, irq, fault) —
+// bpf_get_stackid with BPF_F_USER_STACK can include kernel
+// addresses in the user-stack buffer. Without this split the
+// user symbolizer sees IPs it can't resolve and the kernel
+// symbolizer never sees them.
+//
+// Order is preserved within each output slice so leaf-first stack
+// semantics survive the split. Discovered via the self-profile
+// scenario (bench-self iteration 2) where 40% of perf-agent's
+// "user" CPU was actually kernel-range addresses.
+func SplitUserKernelIPs(ips []uint64) (user, kernel []uint64) {
+	for _, ip := range ips {
+		if ip >= kernelAddrThreshold {
+			kernel = append(kernel, ip)
+		} else {
+			user = append(user, ip)
+		}
+	}
+	return user, kernel
+}
+
 // ExtractIPs decodes a BPF stackmap entry into a slice of instruction
 // pointers, stopping at the first zero slot. Buffers shorter than
 // MaxFrames*8 bytes are processed up to their length; buffers longer

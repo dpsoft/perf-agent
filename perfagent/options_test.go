@@ -47,3 +47,11 @@ func TestWithLabelEnricher_NilDisables(t *testing.T) {
 		t.Errorf("LabelEnricher should be nil")
 	}
 }
+
+func TestWithPerfDataOutput_SetsConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	WithPerfDataOutput("app.perf.data")(cfg)
+	if cfg.PerfDataOutput != "app.perf.data" {
+		t.Errorf("PerfDataOutput = %q, want %q", cfg.PerfDataOutput, "app.perf.data")
+	}
+}

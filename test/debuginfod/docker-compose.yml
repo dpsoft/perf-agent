@@ -1,0 +1,42 @@
+services:
+  debuginfod:
+    image: debian:trixie-slim
+    container_name: debuginfod
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apt-get update -q
+        apt-get install -qy --no-install-recommends \
+          debuginfod elfutils curl ca-certificates
+        update-ca-certificates
+        # -F  enables file scanning of the trailing PATH arg
+        # -p  HTTP port
+        # -d  sqlite database path
+        # -c  concurrency
+        # -t  rescan period (seconds)
+        # Upstream/federation is configured via DEBUGINFOD_URLS env var.
+        exec debuginfod \
+          -p 8002 \
+          -d /var/lib/debuginfod/db.sqlite \
+          -c 4 \
+          -t 10 \
+          -F /srv/debuginfo
+    environment:
+      # Federate to public debuginfod servers; cached locally on hit.
+      - DEBUGINFOD_URLS=https://debuginfod.debian.net/ https://debuginfod.elfutils.org/
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./debuginfo-store:/srv/debuginfo:ro
+      - debuginfod-db:/var/lib/debuginfod
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+volumes:
+  debuginfod-db:

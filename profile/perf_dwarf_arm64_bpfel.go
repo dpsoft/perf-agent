@@ -69,6 +69,7 @@ type perf_dwarfSampleRecord struct {
 		WalkerFlags uint8
 		Pad         uint8
 		Pad2        uint32
+		KernStack   int64
 	}
 	Pcs [127]uint64
 }
@@ -128,6 +129,7 @@ type perf_dwarfMapSpecs struct {
 	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
+	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
@@ -142,6 +144,7 @@ type perf_dwarfVariableSpecs struct {
 	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
 	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
@@ -171,6 +174,7 @@ type perf_dwarfMaps struct {
 	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
+	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
@@ -186,6 +190,7 @@ func (m *perf_dwarfMaps) Close() error {
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
 		m.CfiRules,
+		m.KernStackmap,
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
@@ -201,6 +206,7 @@ type perf_dwarfVariables struct {
 	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
 	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 

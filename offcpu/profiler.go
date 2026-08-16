@@ -12,18 +12,19 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
-	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Profiler handles off-CPU profiling with stack traces
 type Profiler struct {
-	objs       *offcpuObjects
-	symbolizer *blazesym.Symbolizer
-	resolver   *procmap.Resolver
-	link       link.Link
-	tags       []string
-	labels     map[string]string
+	objs             *offcpuObjects
+	symbolizer       symbolize.Symbolizer
+	kernelSymbolizer symbolize.KernelSymbolizer
+	resolver         *procmap.Resolver
+	link             link.Link
+	tags             []string
+	labels           map[string]string
 }
 
 // stackBuilder accumulates symbolized stack frames
@@ -35,32 +36,13 @@ func (s *stackBuilder) append(f pprof.Frame) {
 	s.stack = append(s.stack, f)
 }
 
-// blazeSymToFrames mirrors the converter in profile/profiler.go: expands
-// inlined call chains into separate leaf-first Frames. addr is the
-// absolute PC from the BPF stack, copied onto every frame so pprof
-// Locations stay distinguishable.
-func blazeSymToFrames(s blazesym.Sym, addr uint64) []pprof.Frame {
-	out := make([]pprof.Frame, 0, 1+len(s.Inlined))
-	for i := len(s.Inlined) - 1; i >= 0; i-- {
-		in := s.Inlined[i]
-		f := pprof.Frame{Name: in.Name, Module: s.Module, Address: addr}
-		if in.CodeInfo != nil {
-			f.File = in.CodeInfo.File
-			f.Line = in.CodeInfo.Line
-		}
-		out = append(out, f)
-	}
-	outer := pprof.Frame{Name: s.Name, Module: s.Module, Address: addr}
-	if s.CodeInfo != nil {
-		outer.File = s.CodeInfo.File
-		outer.Line = s.CodeInfo.Line
-	}
-	out = append(out, outer)
-	return out
-}
-
-// NewProfiler creates a new off-CPU profiler
-func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string) (*Profiler, error) {
+// NewProfiler creates a new off-CPU profiler.
+//
+// kernelStacks gates the BPF program's kernel-stack capture (set from
+// cfg.KernelStacks). When false, kernel-stack capture is fully bypassed
+// at sample time. The off-CPU FP profiler has no per-PID pid_config
+// setter, so the gate lives entirely in the BPF program.
+func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]string, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, kernelStacks bool) (*Profiler, error) {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return nil, fmt.Errorf("load offcpu spec: %w", err)
@@ -69,6 +51,12 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 	// Set system_wide variable in eBPF program
 	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
 		return nil, fmt.Errorf("set system_wide variable: %w", err)
+	}
+
+	// Set kernel_stacks_enabled before LoadAndAssign so the BPF program's
+	// gate evaluates correctly on first sample.
+	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
 	}
 
 	objs := &offcpuObjects{}
@@ -94,29 +82,20 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 		return nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
-	symbolizer, err := blazesym.NewSymbolizer(
-		blazesym.SymbolizerWithCodeInfo(true),
-		blazesym.SymbolizerWithInlinedFns(true),
-	)
-	if err != nil {
-		_ = tp.Close()
-		_ = objs.Close()
-		return nil, fmt.Errorf("create symbolizer: %w", err)
-	}
-
 	return &Profiler{
-		objs:       objs,
-		symbolizer: symbolizer,
-		resolver:   procmap.NewResolver(),
-		link:       tp,
-		tags:       tags,
-		labels:     labels,
+		objs:             objs,
+		symbolizer:       sym,
+		kernelSymbolizer: kernelSym,
+		resolver:         procmap.NewResolver(),
+		link:             tp,
+		tags:             tags,
+		labels:           labels,
 	}, nil
 }
 
-// Close releases all resources associated with the profiler
+// Close releases all resources associated with the profiler.
+// The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
-	pr.symbolizer.Close()
 	pr.resolver.Close()
 	_ = pr.link.Close()
 	_ = pr.objs.Close()
@@ -165,6 +144,14 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		// Use PID from a sample key for symbolization
 		samplePid := key.Pid
 
+		// Kernel stack lookup — only when BPF gated a valid stack ID.
+		var kernelIPs []uint64
+		if key.KernStack >= 0 {
+			if kernBytes, err := pr.objs.Stackmap.LookupBytes(uint32(key.KernStack)); err == nil {
+				kernelIPs = bpfstack.ExtractIPs(kernBytes)
+			}
+		}
+
 		stack, err := pr.objs.Stackmap.LookupBytes(uint32(key.UserStack))
 		if err != nil {
 			log.Printf("Failed to lookup user stack: %v", err)
@@ -179,27 +166,39 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		begin := len(sb.stack)
 
 		// Extract all non-zero IPs first, then batch-symbolize in a
-		// single blazesym call. Per-call overhead dominates for short
-		// stacks; one batched call is dramatically cheaper than one per IP.
+		// single call through the symbolize.Symbolizer interface. Per-call
+		// overhead dominates for short stacks; one batched call is
+		// dramatically cheaper than one per IP.
 		ips := bpfstack.ExtractIPs(stack)
-		if len(ips) > 0 {
-			symbols, err := pr.symbolizer.SymbolizeProcessAbsAddrs(
-				ips,
-				samplePid,
-				blazesym.ProcessSourceWithPerfMap(true),
-				blazesym.ProcessSourceWithDebugSyms(true),
-			)
-			if err != nil {
-				log.Printf("Failed to symbolize: %v", err)
-			} else {
-				for i, s := range symbols {
-					if i >= len(ips) {
-						break
-					}
-					for _, f := range blazeSymToFrames(s, ips[i]) {
-						sb.append(f)
-					}
+		// Same kernel-leak split as profile/profiler.go: route
+		// kernel-range IPs that surfaced in the user stack walker
+		// to the kernel symbolizer where they belong.
+		ips, strayKernelIPs := bpfstack.SplitUserKernelIPs(ips)
+		if len(strayKernelIPs) > 0 {
+			kernelIPs = append(strayKernelIPs, kernelIPs...)
+		}
+		if len(ips) > 0 || len(kernelIPs) > 0 {
+			var userFrames, kernelFrames []symbolize.Frame
+			if len(ips) > 0 {
+				userFrames, err = pr.symbolizer.SymbolizeProcess(samplePid, ips)
+				if err != nil {
+					log.Printf("Failed to symbolize user: %v", err)
 				}
+			}
+			if len(kernelIPs) > 0 {
+				kernelFrames, err = pr.kernelSymbolizer.SymbolizeKernel(kernelIPs)
+				if err != nil {
+					log.Printf("Failed to symbolize kernel: %v", err)
+				}
+			}
+			// Kernel frames are leaf-side: they go first so that after
+			// Reverse() the call chain reads root→kernel→user (outermost
+			// first), which matches pprof convention.
+			for _, f := range symbolize.ToProfFramesKernel(kernelFrames) {
+				sb.append(f)
+			}
+			for _, f := range symbolize.ToProfFrames(userFrames) {
+				sb.append(f)
 			}
 		}
 

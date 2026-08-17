@@ -203,12 +203,36 @@ Two findings that bear on Phase 3's choice between them:
   caller and once standalone — because nothing stopped the compiler duplicating
   the call site. A hand-rolled macro must account for inlining; the header
   already does.
-- A plain `DTRACE_PROBE1` reports `Semaphore: 0x0`. §6's replay-on-late-attach
-  requirement depends on semaphore-count tracking to detect when a consumer
-  attaches, so the shim must use the semaphore-carrying variant
-  (`DTRACE_PROBE_ENABLED` guarding the fire) rather than the bare probe.
-  Getting this wrong is silent: the probe still works, and late attachment
-  simply never replays.
+- **Semaphores are not automatic, and the shim must supply them itself.** A
+  plain `DTRACE_PROBE1` reports `Semaphore: 0x0`. §6's replay-on-late-attach
+  requirement depends on the semaphore count to detect when a consumer attaches,
+  so the shim must:
+
+  ```c
+  #define _SDT_HAS_SEMAPHORES 1
+  #include <sys/sdt.h>
+
+  __extension__ unsigned short perfagent_gpu_launch_v1_semaphore
+      __attribute__((unused)) __attribute__((section(".probes")));
+
+  if (perfagent_gpu_launch_v1_semaphore) {   /* nobody listening: skip the work */
+      STAP_PROBE1(perfagent, gpu_launch_v1, ptr);
+  }
+  ```
+
+  Verified: the note then carries a real semaphore address rather than `0x0`,
+  and the variable reads 0 with nothing attached, so an unobserved shim does no
+  batching work at all.
+
+  The consumer does **not** need the symbol to be exported — it reads the
+  semaphore address out of the note and attaches with `ref_ctr_offset` pointing
+  at it, letting the kernel maintain the count. That is the same mechanism the
+  §11 sidecar deployment relies on, where the shim and agent share the file but
+  not a symbol table.
+
+  Getting this wrong is silent: the probe still fires, the shim still works, and
+  late attachment simply never replays — which surfaces much later as
+  unsymbolizable PC samples after an agent restart.
 
 On that evidence the systemtap header is the better default, and the inline-asm
 route stays a proven fallback rather than a hypothetical one — so the build

@@ -261,6 +261,66 @@ func TestTimelinePendingOrphansAreBoundedAndCounted(t *testing.T) {
 		"evicted orphan samples must be counted, not silently dropped")
 }
 
+// TestTimelinePendingEvictionSurvivesCorrelationIDReuse is the regression
+// test for round-2 review: pendingOrder previously carried no sequence
+// discriminator, and eviction treated mere presence in t.pending as
+// liveness. Sequence of events that broke it: a correlation's samples are
+// consumed by Snapshot (its map entry deleted, its old pendingOrder position
+// left behind); the same correlation ID is then reused by a fresh
+// EmitPCSample; when the stale old position reaches the eviction head, it
+// finds the *new* generation present under that key and deletes it -
+// evicting the freshest entry while genuinely older orphans survive. The
+// trigger (correlation-ID reuse within a process run) is foreseeable for
+// this phase: 32-bit vendor correlation IDs wrap around over a long-running
+// session.
+//
+// This reproduces the coordinator's exact scenario: consume "x", add two
+// genuinely older orphans "w" and "q", reuse "x", then apply eviction
+// pressure. Mutation this catches: reverting evictPendingLocked's
+// `cur.seq != e.seq` check back to a bare presence check (`!live`) -
+// without the sequence check, "x"'s stale pre-consumption position matches
+// its reused entry by presence alone and evicts it, while "w" (genuinely
+// oldest) survives - the inverse of correct behavior.
+func TestTimelinePendingEvictionSurvivesCorrelationIDReuse(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 3}})
+	xID := CorrelationID{Backend: BackendCUPTI, Value: "x"}
+	wID := CorrelationID{Backend: BackendCUPTI, Value: "w"}
+	qID := CorrelationID{Backend: BackendCUPTI, Value: "q"}
+
+	// 1. Insert "x" and consume it via a matching exec + Snapshot: its map
+	// entry is deleted, but its pendingOrder position (seq 1) remains.
+	require.NoError(t, tl.EmitLaunch(launch("x", 1)))
+	require.NoError(t, tl.EmitExec(execFor("x", 2, 3)))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: xID, TimeNs: 1}))
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions[0].PCSamples, 1, "sanity: x's sample was attached and consumed")
+
+	// 2. Two genuinely older orphans that are never consumed.
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: wID, TimeNs: 2}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: qID, TimeNs: 3}))
+
+	// 3. Reuse "x"'s correlation ID with a fresh sample - a new generation,
+	// the freshest entry in the store, and must survive eviction.
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: xID, TimeNs: 4}))
+
+	// 4. Apply eviction pressure: pendingCap is 3 (from LaunchCache.Capacity
+	// above); pending now holds w, q, x (3 distinct live correlations) plus
+	// x's stale pre-consumption order slot at the head. One more distinct
+	// correlation pushes the live count over pendingCap and triggers
+	// eviction.
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "extra"}, TimeNs: 5,
+	}))
+
+	_, xSurvived := tl.pending[xID]
+	_, wSurvived := tl.pending[wID]
+	_, qSurvived := tl.pending[qID]
+	assert.True(t, xSurvived,
+		"the freshest re-inserted entry must survive eviction, not be mistaken for its own stale pre-consumption slot")
+	assert.False(t, wSurvived, "the genuinely oldest orphan must be the one evicted")
+	assert.True(t, qSurvived, "eviction must stop once back at capacity, not over-evict")
+}
+
 // TestTimelineEventFieldsDoNotAliasCaller is the regression test for review
 // Important 5: GPUTimelineEvent carries Device/Queue/Attributes by pointer
 // or map, and Timeline used to store the struct by value, aliasing whatever

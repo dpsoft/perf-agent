@@ -103,15 +103,50 @@ type Timeline struct {
 	// orphans; pendingCap/pendingOrder/pendingHead bound how many distinct
 	// correlations' worth of orphans can accumulate, evicting the oldest
 	// and counting it in Dropped.EvictedPendingSamples.
-	pending      map[CorrelationID][]GPUPCSample
-	pendingOrder []CorrelationID
+	//
+	// Both pending's entries and pendingOrder's positions carry a sequence
+	// number, the same way LaunchCache pairs cacheEntry.seq with
+	// orderEntry.seq (see currentIfLiveLocked there). This exists to solve
+	// the identical hazard: a correlation ID consumed by Snapshot leaves its
+	// old pendingOrder position behind with no map entry; if that same ID is
+	// then reused by a later EmitPCSample, presence-only eviction cannot
+	// tell that stale position apart from the ID's new, live generation, and
+	// would delete the freshly re-inserted entry instead of the position it
+	// actually corresponds to. A new sequence is assigned only on the
+	// absent-to-present transition (a brand new correlation, or a reused one
+	// after consumption/eviction), not on every append to an already-live
+	// entry - unlike LaunchCache.Put, which always replaces the whole value,
+	// pending accumulates samples across many EmitPCSample calls for the
+	// same still-live generation, so an in-place append must not look like a
+	// new generation.
+	pending      map[CorrelationID]pendingSamples
+	pendingOrder []pendingOrderEntry
 	pendingHead  int
+	pendingSeq   uint64
 	pendingCap   int
 
 	events  *ring[GPUTimelineEvent]
 	modules *ring[GPUModule]
 
 	dropped TimelineDropStats
+}
+
+// pendingSamples is a pending correlation's accumulated samples, tagged with
+// the sequence number of its current (live) generation - see the pending
+// field's doc comment.
+type pendingSamples struct {
+	samples []GPUPCSample
+	seq     uint64
+}
+
+// pendingOrderEntry names one FIFO position: the correlation ID inserted and
+// the sequence number it was inserted with. Comparing seq against the
+// current pendingSamples.seq for the same id is how eviction tells a live
+// position from one a later re-insertion (after consumption or eviction) has
+// superseded. Mirrors LaunchCache's orderEntry.
+type pendingOrderEntry struct {
+	id  CorrelationID
+	seq uint64
 }
 
 // NewTimeline constructs a Timeline. cfg.LaunchCache is passed through to
@@ -127,7 +162,7 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		execs:      newRing[GPUKernelExec](capacity),
 		events:     newRing[GPUTimelineEvent](capacity),
 		modules:    newRing[GPUModule](capacity),
-		pending:    make(map[CorrelationID][]GPUPCSample),
+		pending:    make(map[CorrelationID]pendingSamples),
 		pendingCap: capacity,
 	}
 }
@@ -152,32 +187,43 @@ func (t *Timeline) EmitExec(e GPUKernelExec) error {
 func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, exists := t.pending[p.Correlation]; !exists {
-		t.pendingOrder = append(t.pendingOrder, p.Correlation)
+	entry, exists := t.pending[p.Correlation]
+	if !exists {
+		// Absent-to-present transition: either a brand new correlation, or
+		// this ID being reused after its previous generation was consumed
+		// or evicted. Either way it is a new generation and gets a new
+		// sequence number plus a new order position - see the pending
+		// field's doc comment for why this must not also happen on every
+		// append to an already-live entry.
+		t.pendingSeq++
+		entry.seq = t.pendingSeq
+		t.pendingOrder = append(t.pendingOrder, pendingOrderEntry{id: p.Correlation, seq: entry.seq})
 	}
-	t.pending[p.Correlation] = append(t.pending[p.Correlation], p)
+	entry.samples = append(entry.samples, p)
+	t.pending[p.Correlation] = entry
 	t.evictPendingLocked()
 	return nil
 }
 
 // evictPendingLocked drops the oldest pending correlation groups once the
-// map holds more distinct correlations than pendingCap. A correlation
-// already consumed by Snapshot (its map entry deleted there; its order
-// entry left behind) is skipped rather than double-counted as an eviction -
-// presence in t.pending is a sufficient liveness check here because, unlike
-// LaunchCache, a pending entry is never replaced in place, only appended to
-// or deleted whole, so there is no stale-versus-live ambiguity to resolve.
-// Caller holds t.mu.
+// map holds more distinct correlations than pendingCap. An order position
+// whose sequence no longer matches the map's current entry for that id -
+// because Snapshot already consumed it, or a later re-insertion superseded
+// it - is skipped rather than double-counted or, worse, mistaken for the
+// live generation and evicted in its place. This mirrors
+// LaunchCache.evictLocked/currentIfLiveLocked exactly, for the same reason:
+// presence in the map is not a sufficient liveness check when a key can be
+// deleted and then reused. Caller holds t.mu.
 func (t *Timeline) evictPendingLocked() {
 	for len(t.pending) > t.pendingCap && t.pendingHead < len(t.pendingOrder) {
-		id := t.pendingOrder[t.pendingHead]
+		e := t.pendingOrder[t.pendingHead]
 		t.pendingHead++
-		samples, ok := t.pending[id]
-		if !ok {
+		cur, live := t.pending[e.id]
+		if !live || cur.seq != e.seq {
 			continue
 		}
-		delete(t.pending, id)
-		t.dropped.EvictedPendingSamples += uint64(len(samples))
+		delete(t.pending, e.id)
+		t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
 	}
 	t.compactPendingOrderLocked()
 }
@@ -239,6 +285,15 @@ func cloneTimelineEvent(in GPUTimelineEvent) GPUTimelineEvent {
 // while holding the lock, then releases it before touching LaunchCache -
 // which guards itself - so the join work below never runs under Timeline's
 // own mutex.
+//
+// PC samples are consumed, not cached: once a sample is attached to an
+// execution's PCSamples here, it is removed from Timeline's pending store.
+// A second consecutive Snapshot call for a still-live execution therefore
+// returns no PC samples for it unless new ones arrived since the previous
+// call. A caller polling Snapshot for metrics sees each sample exactly
+// once - it belongs to whichever profile it was reported in, not to every
+// later one - so samples should be taken away from the profile that
+// received them, not expected to reappear in the next.
 func (t *Timeline) Snapshot() Snapshot {
 	t.mu.Lock()
 	execs := t.execs.items()
@@ -251,8 +306,8 @@ func (t *Timeline) Snapshot() Snapshot {
 	// later snapshot, or eventual orphan eviction).
 	execSamples := make([][]GPUPCSample, len(execs))
 	for i, exec := range execs {
-		if samples, ok := t.pending[exec.Correlation]; ok {
-			execSamples[i] = samples
+		if entry, ok := t.pending[exec.Correlation]; ok {
+			execSamples[i] = entry.samples
 			delete(t.pending, exec.Correlation)
 		}
 	}

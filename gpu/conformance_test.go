@@ -13,12 +13,21 @@ package gpu
 //     Stressed by: all-exact (30 real JoinExact views) and correlation-gaps'
 //     exact group. Mutation caught: JoinExact path setting Heuristic=true, or
 //     the Join/Heuristic fields disagreeing.
-//  2. Heuristic joins are always marked.
+//  2. Heuristic joins are always marked, and only ever attach to an exec
+//     that never supplied a correlation ID at all (review Critical 2: an
+//     exec whose correlation missed the cache has told us its launch aged
+//     out, not that no correlation was ever available, and guessing there
+//     risks mis-attributing to a different, still-live launch - spec §13
+//     requires degrading to unattributed instead).
 //     Stressed by: correlation-gaps' "gap-heur" group, which forces a real
 //     heuristic join (matching correlation deliberately absent; only kernel
-//     name + queue + causal timing can attach the launch). Mutation caught:
-//     findLaunchHeuristic's caller setting view.Launch without also setting
-//     Join/Heuristic (e.g. Heuristic=true dropped from the heuristic branch).
+//     name + queue + causal timing can attach the launch), and
+//     driveEvictedLaunchDegradesToUnattributed, the named spec §13
+//     reproduction (see TestConformanceEvictedLaunchDegradesToUnattributed).
+//     Mutation caught: findLaunchHeuristic's caller setting view.Launch
+//     without also setting Join/Heuristic (e.g. Heuristic=true dropped from
+//     the heuristic branch), or the exec.Correlation zero-value gate in
+//     Snapshot being removed (assertHeuristicOnlyForCorrelationlessExecs).
 //  3. No launch is fabricated.
 //     Stressed by: correlation-gaps' "gap-orphan" group (no launch was ever
 //     emitted for those execs) and the clock-domain test's rejected launches
@@ -204,6 +213,7 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	assertNoFabricatedLaunch(t, snap, h.attempt.launchCarried)
 	assertExactNeverHeuristic(t, snap)
 	assertHeuristicAlwaysMarked(t, snap)
+	assertHeuristicOnlyForCorrelationlessExecs(t, snap)
 	assertTimestampsMonotonic(t, snap)
 	assertBoundedMemory(t, snap, h.cacheCapacity)
 
@@ -260,6 +270,25 @@ func assertHeuristicAlwaysMarked(t *testing.T, snap Snapshot) {
 	for _, view := range snap.Executions {
 		if view.Join == JoinHeuristic {
 			assert.True(t, view.Heuristic, "a heuristic join (correlation %+v) must always be marked Heuristic", view.Exec.Correlation)
+		}
+	}
+}
+
+// assertHeuristicOnlyForCorrelationlessExecs is the general form of review
+// Critical 2's fix, checked against every scenario in this file: a
+// GPUKernelExec that carried a non-zero Correlation and still ended up
+// heuristically joined would mean an exec whose exact lookup missed (launch
+// evicted, or never arrived) got guessed-attached anyway, instead of
+// degrading to unattributed per spec §13. Only an exec with the zero-value
+// Correlation (a backend, like DRM, that never supplies one) may take the
+// heuristic path at all. See TestConformanceEvictedLaunchDegradesToUnattributed
+// below for the specific reproduction this generalizes.
+func assertHeuristicOnlyForCorrelationlessExecs(t *testing.T, snap Snapshot) {
+	t.Helper()
+	for _, view := range snap.Executions {
+		if view.Join == JoinHeuristic {
+			assert.Equal(t, CorrelationID{}, view.Exec.Correlation,
+				"a heuristic join must only ever attach to an exec that never supplied a correlation ID at all")
 		}
 	}
 }
@@ -340,6 +369,25 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+// TestConformanceCorrelationGapsActuallyExercisesHeuristic closes a gap the
+// table-driven TestConformance above cannot: nothing in that loop ever reads
+// JoinStats, so a driveCorrelationGaps edit that silently stopped exercising
+// the heuristic join (e.g. the "gap-heur" group's exec correlation being
+// left non-zero, which review Critical 2's gate would then route to
+// UnmatchedExecutionCount instead) would still pass every invariant check -
+// an unmatched exec is exactly as invariant-compliant as a heuristically
+// matched one. This pins the counts the doc comment at the top of this file
+// claims: 3 heuristic joins (the "gap-heur" group) and 2 unmatched
+// executions (the "gap-orphan" group), independent of the harness's own
+// bookkeeping being otherwise self-consistent.
+func TestConformanceCorrelationGapsActuallyExercisesHeuristic(t *testing.T) {
+	_, snap := runConformance(t, "correlation-gaps-heuristic-check", driveCorrelationGaps)
+	assert.Equal(t, uint64(3), snap.JoinStats.HeuristicExecutionJoinCount,
+		"the gap-heur group must actually take the heuristic path, not silently degrade to unmatched")
+	assert.Equal(t, uint64(2), snap.JoinStats.UnmatchedExecutionCount,
+		"the gap-orphan group must remain genuinely unmatched")
+}
+
 // driveAllExact is the happy-path scenario: every execution correlates
 // exactly to the launch that produced it, and each carries two PC samples
 // with increasing timestamps (stresses invariant 4's per-correlation
@@ -384,20 +432,21 @@ func driveCorrelationGaps(sink EventSink) error {
 	}
 
 	// Heuristic-recoverable group: launch and exec share a kernel name and
-	// queue but deliberately different correlation IDs, so the exact lookup
-	// misses and only the heuristic join (kernel name + queue + causal
-	// timing) can attach a launch.
+	// queue, and the exec's Correlation is left at its zero value - review
+	// Critical 2 restricts the heuristic path to execs that never supplied a
+	// correlation ID at all (the exact case this group models: a backend,
+	// like DRM, with no correlation concept), so only the heuristic join
+	// (kernel name + queue + causal timing) can attach a launch here.
 	for i := 0; i < 3; i++ {
 		l := launch("gap-heur-"+strconv.Itoa(i), uint64(i*100)+1) // KernelName -> "k_gap-heur-<i>"
 		if err := sink.EmitLaunch(l); err != nil {
 			return err
 		}
 		e := GPUKernelExec{
-			Correlation: CorrelationID{Backend: BackendCUPTI, Value: "gap-heur-exec-" + strconv.Itoa(i)},
-			KernelName:  l.KernelName,
-			Queue:       l.Queue,
-			StartNs:     uint64(i*100) + 10,
-			EndNs:       uint64(i*100) + 20,
+			KernelName: l.KernelName,
+			Queue:      l.Queue,
+			StartNs:    uint64(i*100) + 10,
+			EndNs:      uint64(i*100) + 20,
 		}
 		if err := sink.EmitExec(e); err != nil {
 			return err
@@ -599,9 +648,65 @@ func TestConformanceLossAccountingCoversHorizonAndInvalidDomain(t *testing.T) {
 		snap.LaunchCache.EvictedCapacity, snap.LaunchCache.EvictedHorizon, snap.LaunchCache.Replaced)
 }
 
+// driveEvictedLaunchDegradesToUnattributed is the spec §13 fixture named in
+// the final whole-branch review's Critical 2 finding: "a sample whose launch
+// has been evicted degrades to unattributed rather than mis-attributed."
+// Reproduces the reviewer's exact scenario against a capacity-1 cache: two
+// launches sharing one kernel name ("hot_kernel") so the surviving launch is
+// a plausible-looking heuristic candidate for the evicted one's exec, then
+// an exec whose Correlation names the evicted launch. Before the review
+// Critical 2 fix, this exec would have been heuristically reattached to the
+// survivor - a different launch's PID/Tags entirely. The caller (the
+// dedicated test below, not the generic table) checks the specific outcome;
+// this drive func only needs to produce the scenario.
+func driveEvictedLaunchDegradesToUnattributed(sink EventSink) error {
+	a := launch("a", 10)
+	a.KernelName = "hot_kernel"
+	if err := sink.EmitLaunch(a); err != nil {
+		return err
+	}
+	b := launch("b", 20)
+	b.KernelName = "hot_kernel" // shares a's kernel name and queue
+	if err := sink.EmitLaunch(b); err != nil {
+		return err // evicts "a" from a capacity-1 cache
+	}
+	exec := execFor("a", 30, 40) // Correlation "a": exact lookup misses because "a" was evicted
+	exec.KernelName = "hot_kernel"
+	return sink.EmitExec(exec)
+}
+
+// TestConformanceEvictedLaunchDegradesToUnattributed drives the scenario
+// above through a dedicated capacity-1 harness and asserts the specific
+// outcome spec §13 requires: the exec attached to correlation "a" must have
+// no Launch at all, not the survivor "b". The general
+// assertHeuristicOnlyForCorrelationlessExecs invariant (run for every
+// scenario, including this one, via runConformanceWithHarness) already
+// guards the mechanism; this test pins the concrete, named reproduction so
+// a future change that broke the mechanism in a way the general invariant
+// couldn't see would still be caught here.
+func TestConformanceEvictedLaunchDegradesToUnattributed(t *testing.T) {
+	h := newConformanceHarnessWithConfig(LaunchCacheConfig{Capacity: 1}, conformanceSinkBurst)
+	snap := runConformanceWithHarness(t, "evicted-launch-degrades", h, driveEvictedLaunchDegradesToUnattributed)
+
+	require.Len(t, snap.Executions, 1)
+	view := snap.Executions[0]
+	assert.Equal(t, "a", view.Exec.Correlation.Value)
+	assert.Nil(t, view.Launch,
+		"an execution whose launch was evicted must degrade to unattributed, never reattach to a different launch that merely shares its kernel name")
+	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+}
+
 // BenchmarkSnapshotAtScale is the Phase 2 gate: a million launches through a
 // bounded cache must snapshot in well under a second, with allocation
 // reflecting the bounded cache rather than a million retained launches.
+//
+// PC samples were added to this benchmark for review Critical 5: before
+// that fix, a single pending correlation's samples could accumulate without
+// bound, and this benchmark - the phase's own memory/timing gate - emitted
+// zero PC samples, so it could not see that growth at all. Each sampled
+// exec (1 in 4, same as before) now also gets 3 PC samples under its own
+// correlation, which exercises both the per-correlation cap and the
+// proportional weight distribution's cost, not just the launch-cache path.
 func BenchmarkSnapshotAtScale(b *testing.B) {
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 65536}})
 	for i := 0; i < 1_000_000; i++ {
@@ -613,6 +718,10 @@ func BenchmarkSnapshotAtScale(b *testing.B) {
 		_ = tl.EmitLaunch(launch(id, uint64(i)))
 		if i%4 == 0 {
 			_ = tl.EmitExec(execFor(id, uint64(i), uint64(i+10)))
+			corr := CorrelationID{Backend: BackendCUPTI, Value: id}
+			for j := 0; j < 3; j++ {
+				_ = tl.EmitPCSample(GPUPCSample{Correlation: corr, TimeNs: uint64(i + j), PCOffset: uint64(j), Count: 1})
+			}
 		}
 	}
 	b.ResetTimer()

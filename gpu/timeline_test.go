@@ -57,17 +57,44 @@ func TestTimelineAttachesPCSamplesByCorrelation(t *testing.T) {
 	assert.Equal(t, uint64(0x1a40), snap.Executions[0].PCSamples[0].PCOffset)
 }
 
+// TestTimelineDegradesWhenLaunchEvicted is the regression test for review
+// Critical 2. Before the fix, this test passed vacuously: launch() derives
+// KernelName from its correlation value ("k_a" vs "k_b"), so the surviving
+// launch "b" never shared a kernel name with the evicted "a", and the old
+// unconditional-heuristic code correctly found no candidate for reasons
+// that had nothing to do with the fix under test. The real hazard - proven
+// by the reviewer's reproduction - is a SHARED kernel name: cache capacity
+// 1, launch a (evicts to make room for) launch b, both named "hot_kernel";
+// an exec whose Correlation is "a" (so the exact lookup genuinely misses,
+// since "a" was evicted) would, under the old code, find "b" as a
+// plausible heuristic candidate (same kernel name, same queue, timestamp
+// precedes the exec) and mis-attribute the exec's CPU stack/PID/Tags to
+// "b" - a different process/container than the one that actually launched
+// the kernel. Spec §13 requires degrading to unattributed instead.
+//
+// Both launches deliberately share KernelName "hot_kernel" here so that a
+// reversion of the Critical 2 fix (dropping the
+// `exec.Correlation != (CorrelationID{})` gate in Snapshot, or restoring an
+// unconditional heuristic attempt) would make this test fail by reattaching
+// exec "a" to launch "b" - proving the fix is what prevents it, not an
+// accidental kernel-name mismatch.
 func TestTimelineDegradesWhenLaunchEvicted(t *testing.T) {
-	// A PC sample whose launch has aged out must become unattributed, never
-	// mis-attributed to a different launch.
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 1}})
-	require.NoError(t, tl.EmitLaunch(launch("a", 10)))
-	require.NoError(t, tl.EmitLaunch(launch("b", 20))) // evicts "a"
-	require.NoError(t, tl.EmitExec(execFor("a", 30, 40)))
+	a := launch("a", 10)
+	a.KernelName = "hot_kernel"
+	b := launch("b", 20)
+	b.KernelName = "hot_kernel" // same kernel name and queue as "a"
+	require.NoError(t, tl.EmitLaunch(a))
+	require.NoError(t, tl.EmitLaunch(b)) // evicts "a"
+
+	exec := execFor("a", 30, 40) // Correlation "a": the exact lookup misses because "a" was evicted
+	exec.KernelName = "hot_kernel"
+	require.NoError(t, tl.EmitExec(exec))
 
 	snap := tl.Snapshot()
 	require.Len(t, snap.Executions, 1)
-	assert.Nil(t, snap.Executions[0].Launch, "an evicted launch must not be replaced by another")
+	assert.Nil(t, snap.Executions[0].Launch,
+		"an evicted launch must degrade to unattributed, not be replaced by a different launch that merely shares its kernel name")
 	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
 	assert.Equal(t, uint64(1), snap.LaunchCache.EvictedCapacity,
 		"the eviction that caused the miss must be visible in the snapshot")
@@ -357,12 +384,15 @@ func TestTimelineEventFieldsDoNotAliasCaller(t *testing.T) {
 // to an actual hit, so Join, Heuristic and Ambiguous on that path were
 // entirely unverified.
 //
-// The launch's correlation deliberately differs from the exec's, so the
-// exact lookup is guaranteed to miss and only the heuristic (same queue,
-// compatible kernel name, launch precedes exec) can produce the match.
-// Mutation this catches: the heuristic path never running at all, or
-// running but not setting Join/Heuristic, or attaching no launch, or the
-// wrong launch.
+// The exec deliberately carries the zero-value Correlation (never fixed up
+// with a real one, unlike execFor) - review Critical 2 restricts the
+// heuristic path to execs that never supplied a correlation ID at all (the
+// DRM case), since an exec with a non-zero Correlation that misses the exact
+// lookup has told us its launch aged out, and guessing there risks
+// mis-attribution. A zero-value Correlation with a matching kernel name and
+// queue is exactly the situation the heuristic exists for. Mutation this
+// catches: the heuristic path never running at all, or running but not
+// setting Join/Heuristic, or attaching no launch, or the wrong launch.
 func TestTimelineHeuristicJoinsSingleCandidate(t *testing.T) {
 	tl := NewTimeline(TimelineConfig{})
 	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
@@ -372,9 +402,9 @@ func TestTimelineHeuristicJoinsSingleCandidate(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 10},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "exec-a"},
-		KernelName:  "k_x",
-		StartNs:     20, EndNs: 30,
+		// Correlation deliberately left at its zero value - see comment above.
+		KernelName: "k_x",
+		StartNs:    20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -412,9 +442,10 @@ func TestTimelineHeuristicMarksAmbiguousAndPicksMostRecent(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 15},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "exec-a"},
-		KernelName:  "k_x",
-		StartNs:     20, EndNs: 30,
+		// Correlation deliberately left at its zero value - see the
+		// single-candidate test above for why (review Critical 2 gate).
+		KernelName: "k_x",
+		StartNs:    20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -430,7 +461,12 @@ func TestTimelineHeuristicMarksAmbiguousAndPicksMostRecent(t *testing.T) {
 // TestTimelineHeuristicRejectsLaunchAfterExecStart is the third Critical-3
 // regression test. The only candidate launch starts after the exec it might
 // otherwise match, which is causally impossible - a launch cannot produce an
-// execution that started before it did. Mutation this catches:
+// execution that started before it did. The exec's Correlation is left at
+// its zero value so the heuristic actually runs at all (review Critical 2's
+// gate; see TestTimelineHeuristicJoinsSingleCandidate) - with a non-zero
+// Correlation this test would pass vacuously, asserting Nil because the
+// heuristic was never attempted rather than because findLaunchHeuristic
+// correctly rejected the future launch. Mutation this catches:
 // `l.TimeNs > exec.StartNs` (reject future launches) flipped to `<` (reject
 // past launches, accept future ones) at the ordering check in
 // findLaunchHeuristic.
@@ -443,9 +479,8 @@ func TestTimelineHeuristicRejectsLaunchAfterExecStart(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 100},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "exec-a"},
-		KernelName:  "k_x",
-		StartNs:     20, EndNs: 30,
+		KernelName: "k_x",
+		StartNs:    20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -457,10 +492,14 @@ func TestTimelineHeuristicRejectsLaunchAfterExecStart(t *testing.T) {
 
 // TestTimelineHeuristicRejectsWrongQueueAndKernelName is the fourth
 // Critical-3 regression test: two decoys, one filtered by queue, one by
-// kernel name, neither should attach. Mutation this catches: the queue
-// filter (via groupLaunchesByQueue/queueKeyOf) or the kernel-name filter
-// (launchKernelNamesCompatible) being dropped from findLaunchHeuristic -
-// either omission would let one of these two decoys match.
+// kernel name, neither should attach. The exec's Correlation is left at its
+// zero value for the same reason as the test above - otherwise review
+// Critical 2's gate would skip the heuristic entirely and this test would
+// pass without findLaunchHeuristic's filters ever running. Mutation this
+// catches: the queue filter (via groupLaunchesByQueue/queueKeyOf) or the
+// kernel-name filter (launchKernelNamesCompatible) being dropped from
+// findLaunchHeuristic - either omission would let one of these two decoys
+// match.
 func TestTimelineHeuristicRejectsWrongQueueAndKernelName(t *testing.T) {
 	tl := NewTimeline(TimelineConfig{})
 	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
@@ -477,10 +516,11 @@ func TestTimelineHeuristicRejectsWrongQueueAndKernelName(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 10},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		// Queue left zero-value: "wrong-queue"'s non-zero QueueID must not match.
-		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "exec-a"},
-		KernelName:  "k_x",
-		StartNs:     20, EndNs: 30,
+		// Queue and Correlation left zero-value: "wrong-queue"'s non-zero
+		// QueueID must not match, and a zero Correlation is required for the
+		// heuristic to run at all (review Critical 2's gate).
+		KernelName: "k_x",
+		StartNs:    20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -497,6 +537,13 @@ func TestTimelineHeuristicRejectsWrongQueueAndKernelName(t *testing.T) {
 // Measured before the fix, this exact scenario (capacity 2000, 500 missing
 // execs): ~66.8ms/op, ~192.8MB/op, 510 allocs/op. See the fix-round report
 // for the after numbers.
+//
+// Each exec's Correlation is explicitly zeroed after execFor (which always
+// sets a non-zero one): review Critical 2 gates the heuristic path on a
+// zero-value Correlation, so a non-zero one that misses the exact lookup
+// (as every "miss-*" correlation here would) now skips the heuristic
+// entirely and this benchmark would no longer exercise - or cost - what it
+// claims to.
 func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 2000}})
 	for i := 0; i < 2000; i++ {
@@ -508,13 +555,20 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 		// Correlation and kernel name never match any launch: every exec
 		// takes the full exact-miss + heuristic-scan path with zero result,
 		// the worst case for the candidate scan.
-		if err := tl.EmitExec(execFor("miss-"+strconv.Itoa(i), uint64(3000+i), uint64(3000+i+5))); err != nil {
+		e := execFor("miss-"+strconv.Itoa(i), uint64(3000+i), uint64(3000+i+5))
+		e.Correlation = CorrelationID{}
+		if err := tl.EmitExec(e); err != nil {
 			b.Fatal(err)
 		}
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		// NOTE: Snapshot consumes execs (review Critical 3), so only the
+		// first iteration of this loop actually does the O(misses) join
+		// work measured above; subsequent iterations see an empty exec
+		// ring and return quickly. Run with -benchtime=1x for a meaningful
+		// number, matching this project's convention for these benchmarks.
 		_ = tl.Snapshot()
 	}
 }
@@ -548,6 +602,13 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 // Mutation this catches: findLaunchHeuristic reverted from sort.Search back
 // to a linear scan over the candidate group (or buildHeuristicCandidateIndex
 // grouping by queue alone again, without kernel name, or without sorting).
+//
+// Each exec's Correlation is explicitly zeroed: review Critical 2 gates the
+// heuristic path on a zero-value Correlation, and execFor always sets a
+// non-zero one. Left as execFor produces it, every exec here would miss the
+// exact lookup and then skip the heuristic entirely (Critical 2's intended
+// behavior for a non-zero, non-matching correlation), making this a
+// near-instant no-op that proves nothing about the binary-search fix.
 func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	const candidates = 50_000
 	const misses = 10_000
@@ -560,7 +621,8 @@ func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	}
 	for i := 0; i < misses; i++ {
 		e := execFor("ghost-"+strconv.Itoa(i), uint64(i), uint64(i))
-		e.KernelName = "hot_kernel" // same group; correlation never matches -> guaranteed exact-match miss
+		e.KernelName = "hot_kernel" // same group
+		e.Correlation = CorrelationID{}
 		require.NoError(t, tl.EmitExec(e))
 	}
 
@@ -581,4 +643,196 @@ func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	case <-time.After(25 * time.Second):
 		t.Fatal("Snapshot did not return within 25s - the heuristic join is scanning its candidate group, not binary-searching it")
 	}
+}
+
+// TestTimelineSnapshotConsumesExecutions is the regression test for review
+// Critical 3: Snapshot used to only COPY t.execs (via items()), never
+// removing anything from the ring, while PC samples were already consumed
+// on attach - two different lifecycles in one call. For a polling caller (the
+// documented use case), every execution was re-reported in every Snapshot
+// until the ring rotated it out, so the same kernel time was counted once
+// per poll while its PC samples were counted exactly once. The fix drains
+// execs (via a ring swap) the same way PC samples are consumed: a second
+// consecutive Snapshot call returns no executions unless new ones arrived in
+// between. Mutation this catches: reverting Snapshot to copy (items()) the
+// live rings instead of swapping in fresh ones - the second Snapshot call
+// below would then re-report the same execution.
+func TestTimelineSnapshotConsumesExecutions(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(launch("a", 10)))
+	require.NoError(t, tl.EmitExec(execFor("a", 20, 30)))
+
+	first := tl.Snapshot()
+	require.Len(t, first.Executions, 1, "the first snapshot must report the execution that arrived before it")
+
+	second := tl.Snapshot()
+	assert.Empty(t, second.Executions, "a second snapshot with no new executions must not re-report the first one")
+
+	require.NoError(t, tl.EmitExec(execFor("a", 40, 50)))
+	third := tl.Snapshot()
+	require.Len(t, third.Executions, 1, "a snapshot after a new execution arrives must report exactly that new one")
+	assert.Equal(t, uint64(40), third.Executions[0].Exec.StartNs)
+}
+
+// TestTimelineSnapshotConsumesEventsAndModules extends the Critical 3 fix to
+// events and modules, as the ruling requires ("apply the same decision to
+// events and modules so all five stores agree"). Mutation this catches:
+// events/modules reverting to items() (copy, not drain).
+func TestTimelineSnapshotConsumesEventsAndModules(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitEvent(GPUTimelineEvent{TimeNs: 1}))
+	require.NoError(t, tl.EmitModule(GPUModule{Ref: ModuleRef{CRC: 1}, LoadedNs: 1}))
+
+	first := tl.Snapshot()
+	require.Len(t, first.Events, 1)
+	require.Len(t, first.Modules, 1)
+
+	second := tl.Snapshot()
+	assert.Empty(t, second.Events, "a second snapshot must not re-report the first snapshot's events")
+	assert.Empty(t, second.Modules, "a second snapshot must not re-report the first snapshot's modules")
+}
+
+// TestTimelineJoinStatsLaunchCountsArePerSnapshot is the regression test for
+// review Important 1: JoinStats.LaunchCount used to be t.launchCount, a
+// lifetime-cumulative counter, while MatchedLaunchCount/UnmatchedLaunchCount
+// (and every other JoinStats field) are inherently per-snapshot now that
+// Critical 3 makes execs consumed. Mixing a lifetime total with a
+// per-snapshot match count made UnmatchedLaunchCount meaningless after the
+// first snapshot. This also covers LaunchCount and MatchedLaunchCount, which
+// review Important 1 noted had zero test coverage at all.
+//
+// Mutation this catches: reverting launchesSinceSnapshot to a
+// never-reset cumulative counter - the second snapshot's LaunchCount would
+// read 4 (1+3, lifetime) instead of 3 (just the launches emitted since the
+// first snapshot).
+func TestTimelineJoinStatsLaunchCountsArePerSnapshot(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(launch("a", 10)))
+	require.NoError(t, tl.EmitLaunch(launch("b", 10)))
+	require.NoError(t, tl.EmitLaunch(launch("c", 10)))
+	require.NoError(t, tl.EmitExec(execFor("a", 20, 30))) // matches "a" exactly
+
+	first := tl.Snapshot()
+	assert.Equal(t, uint64(3), first.JoinStats.LaunchCount, "all three launches were emitted before the first snapshot")
+	assert.Equal(t, uint64(1), first.JoinStats.MatchedLaunchCount)
+	assert.Equal(t, uint64(2), first.JoinStats.UnmatchedLaunchCount, "b and c were never referenced by any exec")
+
+	require.NoError(t, tl.EmitLaunch(launch("d", 40)))
+	require.NoError(t, tl.EmitLaunch(launch("e", 40)))
+	require.NoError(t, tl.EmitLaunch(launch("f", 40)))
+	require.NoError(t, tl.EmitExec(execFor("d", 50, 60)))
+
+	second := tl.Snapshot()
+	assert.Equal(t, uint64(3), second.JoinStats.LaunchCount,
+		"LaunchCount must reflect only launches since the previous snapshot, not the lifetime total (6)")
+	assert.Equal(t, uint64(1), second.JoinStats.MatchedLaunchCount)
+	assert.Equal(t, uint64(2), second.JoinStats.UnmatchedLaunchCount)
+}
+
+// TestTimelineHeuristicRespectsJoinWindow is the regression test for review
+// Important 3: LaunchEventJoinWindowNs was documented as inert (Timeline
+// never read it), so the heuristic accepted any candidate preceding the
+// exec no matter how old, and Ambiguous counted every such candidate -
+// permanently true for any kernel name reused across a workload's life,
+// carrying no information. With the window wired, an out-of-window
+// candidate must neither match nor count toward Ambiguous.
+//
+// Two candidates for the same (queue, kernel name) group: "far" at TimeNs=0
+// and "near" at TimeNs=95, against an exec at StartNs=100 with a window of
+// 10ns. Only "near" (5ns before the exec) is inside [90,100]; "far" (100ns
+// before) is not. Mutation this catches: joinWindowNs never being read
+// (both would still qualify, Ambiguous would read true), or the window
+// bound computed on the wrong side (rejecting "near" instead of "far").
+func TestTimelineHeuristicRespectsJoinWindow(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 10})
+	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "far"},
+		KernelName:  "k_x",
+		TimeNs:      0,
+		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 0},
+	}))
+	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "near"},
+		KernelName:  "k_x",
+		TimeNs:      95,
+		Launch:      LaunchContext{PID: 2, TID: 2, TimeNs: 95},
+	}))
+	require.NoError(t, tl.EmitExec(GPUKernelExec{
+		KernelName: "k_x",
+		StartNs:    100, EndNs: 110,
+	}))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	view := snap.Executions[0]
+	require.NotNil(t, view.Launch, "the in-window candidate must still be attached")
+	assert.Equal(t, "near", view.Launch.Correlation.Value, "only the in-window candidate may match")
+	assert.False(t, view.Ambiguous, "the out-of-window candidate must not count toward Ambiguous")
+}
+
+// TestTimelineHeuristicWindowZeroIsUnbounded pins the documented default:
+// TimelineConfig{} (LaunchEventJoinWindowNs left at its zero value) must
+// keep today's unbounded behavior, so every existing caller/test that never
+// sets this field sees no change. Uses the same far-candidate shape as
+// TestTimelineHeuristicRespectsJoinWindow but with no window configured -
+// "far" must now match, unlike in that test.
+func TestTimelineHeuristicWindowZeroIsUnbounded(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "far"},
+		KernelName:  "k_x",
+		TimeNs:      0,
+		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 0},
+	}))
+	require.NoError(t, tl.EmitExec(GPUKernelExec{
+		KernelName: "k_x",
+		StartNs:    100, EndNs: 110,
+	}))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	require.NotNil(t, snap.Executions[0].Launch, "with no window configured, a distant preceding candidate must still match")
+}
+
+// TestTimelinePendingSamplesPerCorrelationAreCapped is the regression test
+// for review Critical 5: evictPendingLocked only ever bounded the number of
+// distinct pending correlations (pendingCap), never the samples accumulated
+// within any single one of them - entry.samples was appended to with no cap
+// and no age-out, so one orphaned (or stale-ID-reused) correlation below the
+// cardinality bound could still grow without bound. Mutation this catches:
+// removing the `len(entry.samples) >= t.pendingSampleCap` check in
+// EmitPCSample (samples would keep accumulating past the configured cap,
+// and EvictedPendingSamples would stay 0).
+func TestTimelinePendingSamplesPerCorrelationAreCapped(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{MaxPendingSamplesPerCorrelation: 5})
+	corr := CorrelationID{Backend: BackendCUPTI, Value: "orphan"}
+	for i := 0; i < 20; i++ {
+		require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: corr, TimeNs: uint64(i + 1), PCOffset: uint64(i)}))
+	}
+
+	entry := tl.pending[corr]
+	assert.Len(t, entry.samples, 5, "one correlation's samples must never exceed the configured per-correlation cap")
+	assert.Equal(t, uint64(15), tl.dropped.EvictedPendingSamples,
+		"every sample dropped by the per-correlation cap must be counted")
+}
+
+// TestTimelinePendingOrphansAgeOutByHorizon is the second Critical 5
+// regression test: pending entries must also age out by time
+// (PendingSampleHorizonNs), not only by cardinality. Three correlations,
+// each with one sample, timestamped far enough apart that by the time the
+// third arrives, the first is well outside the 10ns horizon - even though
+// the cardinality bound (pendingCap, driven by the default launch-cache
+// capacity here) is nowhere near exceeded. Mutation this catches: removing
+// or disabling the horizon-based eviction pass in evictPendingLocked (the
+// oldest correlation would survive, and EvictedPendingSamples would stay 0).
+func TestTimelinePendingOrphansAgeOutByHorizon(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{PendingSampleHorizonNs: 10})
+	oldest := CorrelationID{Backend: BackendCUPTI, Value: "oldest"}
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: oldest, TimeNs: 0}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "mid"}, TimeNs: 5}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "newest"}, TimeNs: 50}))
+
+	_, stillPending := tl.pending[oldest]
+	assert.False(t, stillPending, "a pending correlation whose latest sample has fallen behind the horizon must be evicted")
+	assert.Greater(t, tl.dropped.EvictedPendingSamples, uint64(0), "the horizon eviction must be counted")
 }

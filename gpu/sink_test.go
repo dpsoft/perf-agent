@@ -85,8 +85,8 @@ func TestCountingSinkForwardsAndCounts(t *testing.T) {
 
 	assert.Equal(t, 1, inner.launches)
 	assert.Equal(t, 1, inner.execs)
-	assert.Equal(t, uint64(1), s.Stats().Launches)
-	assert.Equal(t, uint64(1), s.Stats().Execs)
+	assert.Equal(t, uint64(1), s.Stats().Launches.Accepted)
+	assert.Equal(t, uint64(1), s.Stats().Execs.Accepted)
 }
 
 func TestCountingSinkReturnsErrSinkFullAtCapacity(t *testing.T) {
@@ -98,7 +98,7 @@ func TestCountingSinkReturnsErrSinkFullAtCapacity(t *testing.T) {
 
 	require.Error(t, err, "a sink at capacity must push back, not absorb silently")
 	assert.True(t, errors.Is(err, ErrSinkFull))
-	assert.Equal(t, uint64(1), s.Stats().DroppedFull, "the drop must be counted")
+	assert.Equal(t, uint64(1), s.Stats().Launches.DroppedFull, "the drop must be counted")
 }
 
 func TestCountingSinkRejectsUnsupportedClockDomain(t *testing.T) {
@@ -109,8 +109,8 @@ func TestCountingSinkRejectsUnsupportedClockDomain(t *testing.T) {
 	err := s.EmitLaunch(l)
 
 	require.Error(t, err, "producers must convert device clocks before emitting")
-	assert.Equal(t, uint64(1), s.Stats().DroppedInvalid)
-	assert.Equal(t, uint64(0), s.Stats().Launches, "a rejected event is not counted as accepted")
+	assert.Equal(t, uint64(1), s.Stats().Launches.DroppedInvalid)
+	assert.Equal(t, uint64(0), s.Stats().Launches.Accepted, "a rejected event is not counted as accepted")
 }
 
 func TestCountingSinkZeroCapacityIsUnbounded(t *testing.T) {
@@ -118,7 +118,7 @@ func TestCountingSinkZeroCapacityIsUnbounded(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		require.NoError(t, s.EmitLaunch(launch("x", uint64(i))))
 	}
-	assert.Equal(t, uint64(0), s.Stats().DroppedFull)
+	assert.Equal(t, uint64(0), s.Stats().Launches.DroppedFull)
 }
 
 // TestCountingSinkDownstreamFailureIsNotCountedAsAccepted pins the
@@ -136,8 +136,8 @@ func TestCountingSinkDownstreamFailureIsNotCountedAsAccepted(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, innerErr), "the downstream error must reach the caller")
-	assert.Equal(t, uint64(0), s.Stats().Launches, "a delivery inner rejects is not an accepted event")
-	assert.Equal(t, uint64(1), s.Stats().DroppedDownstream)
+	assert.Equal(t, uint64(0), s.Stats().Launches.Accepted, "a delivery inner rejects is not an accepted event")
+	assert.Equal(t, uint64(1), s.Stats().Launches.DroppedDownstream)
 
 	// The reservation must have been released: two more emissions still fit
 	// in a capacity-2 sink even though the first attempt never delivered.
@@ -177,7 +177,7 @@ func TestCountingSinkEmitPCSampleForwardsCountsAndEnforcesCapacity(t *testing.T)
 		TimeNs:      10,
 	}))
 	assert.Equal(t, 1, inner.pcSamples)
-	assert.Equal(t, uint64(1), s.Stats().PCSamples)
+	assert.Equal(t, uint64(1), s.Stats().PCSamples.Accepted)
 
 	err := s.EmitPCSample(GPUPCSample{
 		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "b"},
@@ -185,7 +185,7 @@ func TestCountingSinkEmitPCSampleForwardsCountsAndEnforcesCapacity(t *testing.T)
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSinkFull))
-	assert.Equal(t, uint64(1), s.Stats().DroppedFull)
+	assert.Equal(t, uint64(1), s.Stats().PCSamples.DroppedFull)
 }
 
 func TestCountingSinkEmitEventForwardsCountsAndEnforcesCapacity(t *testing.T) {
@@ -196,14 +196,14 @@ func TestCountingSinkEmitEventForwardsCountsAndEnforcesCapacity(t *testing.T) {
 		Backend: BackendCUPTI, Kind: TimelineEventRuntime, TimeNs: 10,
 	}))
 	assert.Equal(t, 1, inner.events)
-	assert.Equal(t, uint64(1), s.Stats().Events)
+	assert.Equal(t, uint64(1), s.Stats().Events.Accepted)
 
 	err := s.EmitEvent(GPUTimelineEvent{
 		Backend: BackendCUPTI, Kind: TimelineEventRuntime, TimeNs: 20,
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSinkFull))
-	assert.Equal(t, uint64(1), s.Stats().DroppedFull)
+	assert.Equal(t, uint64(1), s.Stats().Events.DroppedFull)
 }
 
 // TestCountingSinkEmitModuleForwardsCountsAndEnforcesCapacity pins both
@@ -221,12 +221,12 @@ func TestCountingSinkEmitModuleForwardsCountsAndEnforcesCapacity(t *testing.T) {
 		LoadedNs:  10,
 	}))
 	assert.Equal(t, 1, inner.modules)
-	assert.Equal(t, uint64(1), s.Stats().Modules)
+	assert.Equal(t, uint64(1), s.Stats().Modules.Accepted)
 
 	err := s.EmitModule(GPUModule{Ref: ModuleRef{Backend: BackendCUPTI, CRC: 2}, LoadedNs: 20})
 	require.Error(t, err, "capacity must still be enforced for modules")
 	assert.True(t, errors.Is(err, ErrSinkFull))
-	assert.Equal(t, uint64(1), s.Stats().DroppedFull)
+	assert.Equal(t, uint64(1), s.Stats().Modules.DroppedFull)
 }
 
 // TestCountingSinkConcurrentEmitAndStats exercises CountingSink from many
@@ -261,7 +261,7 @@ func TestCountingSinkConcurrentEmitAndStats(t *testing.T) {
 	wg.Wait()
 
 	assert.Equal(t, int64(n), inner.launches.Load())
-	assert.Equal(t, uint64(n), s.Stats().Launches)
+	assert.Equal(t, uint64(n), s.Stats().Launches.Accepted)
 }
 
 // TestCountingSinkAnchorClassSurvivesDataOverload is the regression test for
@@ -296,6 +296,6 @@ func TestCountingSinkAnchorClassSurvivesDataOverload(t *testing.T) {
 	require.NoError(t, s.EmitLaunch(launch("a", 10)), "a launch must not be dropped because data-class volume exhausted its own bucket")
 	require.NoError(t, s.EmitModule(GPUModule{Ref: ModuleRef{CRC: 1}, LoadedNs: 10}))
 
-	assert.Equal(t, uint64(1), s.Stats().Launches)
-	assert.Equal(t, uint64(1), s.Stats().Modules)
+	assert.Equal(t, uint64(1), s.Stats().Launches.Accepted)
+	assert.Equal(t, uint64(1), s.Stats().Modules.Accepted)
 }

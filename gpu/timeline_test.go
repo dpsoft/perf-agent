@@ -876,3 +876,54 @@ func TestTimelineEventCapacityDefaultsToLaunchCacheCapacity(t *testing.T) {
 	snap := tl.Snapshot()
 	assert.Len(t, snap.Events, 3, "with EventCapacity unset, events must default to the launch-cache capacity")
 }
+
+// TestTimelineSnapshotReconcilesPCSampleFate is the regression test for
+// review Important 2's PC-sample reconciliation gauges: before
+// AttributedPCSamples/PendingSamples/PendingCorrelations existed, the
+// PC-sample path had no accounting at all for "attributed to an execution"
+// vs "still waiting for one" - an operator could see Dropped.
+// EvictedPendingSamples but had no way to tell how many samples were
+// currently in flight versus already delivered. Three correlations: "a" has
+// a matching exec (its 2 samples must be attributed), "b" and "c" do not
+// (their 3 total samples must remain pending). Mutation this catches:
+// AttributedPCSamples not counting the samples actually handed to a view,
+// or PendingSamples/PendingCorrelations not reflecting what's left in
+// t.pending after the match.
+func TestTimelineSnapshotReconcilesPCSampleFate(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(launch("a", 10)))
+	require.NoError(t, tl.EmitExec(execFor("a", 20, 30)))
+	aCorr := CorrelationID{Backend: BackendCUPTI, Value: "a"}
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: aCorr, TimeNs: 1}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: aCorr, TimeNs: 2}))
+
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "b"}, TimeNs: 1}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "c"}, TimeNs: 1}))
+	require.NoError(t, tl.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "c"}, TimeNs: 2}))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, uint64(2), snap.AttributedPCSamples, "the 2 samples attached to exec \"a\" must be counted as attributed")
+	assert.Equal(t, 3, snap.PendingSamples, "b's 1 sample plus c's 2 samples must remain pending")
+	assert.Equal(t, 2, snap.PendingCorrelations, "\"b\" and \"c\" must remain as distinct pending correlations")
+}
+
+// TestCountingSinkSnapshotWithEmbedsSinkStats is the regression test for
+// review Important 2: gpu.Snapshot omitted SinkStats entirely, so
+// admission-side losses (a full token bucket, a rejected clock domain) were
+// unreachable from a serialized profile even though JoinStats/Dropped were
+// right there. CountingSink.SnapshotWith is the fix - it must return
+// exactly what tl.Snapshot() would, plus the sink's own Stats().
+func TestCountingSinkSnapshotWithEmbedsSinkStats(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	s := NewCountingSink(tl, 1)
+
+	require.NoError(t, s.EmitLaunch(launch("a", 10)))
+	err := s.EmitLaunch(launch("b", 20)) // exhausts the anchor bucket (capacity 1)
+	require.Error(t, err)
+
+	snap := s.SnapshotWith(tl)
+	assert.Equal(t, uint64(1), snap.SinkStats.Launches.Accepted)
+	assert.Equal(t, uint64(1), snap.SinkStats.Launches.DroppedFull,
+		"admission-side losses must be reachable from the Snapshot returned by SnapshotWith")
+	assert.Equal(t, uint64(1), snap.JoinStats.LaunchCount, "the Timeline's own accounting must still be present")
+}

@@ -217,24 +217,32 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	assertTimestampsMonotonic(t, snap)
 	assertBoundedMemory(t, snap, h.cacheCapacity)
 
-	// Invariant 5's literal formula - SinkStats.DroppedFull + DroppedInvalid
-	// plus LaunchCacheStats.EvictedCapacity + EvictedHorizon equals emitted
-	// minus retained - is only exact when the sink handled launches
-	// exclusively and no correlation ID was reused. SinkStats.DroppedFull/
-	// DroppedInvalid/DroppedDownstream are aggregate counters shared by all
-	// five event kinds, not per-type, so a scenario that also emits execs/
-	// pc-samples/modules/events would fold their drops into the same
-	// numbers and break the identity; a reused correlation ID adds a third
-	// loss category (LaunchCacheStats.Replaced) the literal formula doesn't
-	// mention at all. Both conditions are real gaps in what these
-	// components expose for a caller who wants exact reconciliation on a
-	// mixed workload - see the report. They are not a reason to weaken the
-	// assertion, only to scope it to the scenario where it is provably
-	// exact (overflow: launch-only, unique IDs).
-	if h.attempt.execAttempts == 0 && h.attempt.pcAttempts == 0 &&
-		h.attempt.moduleAttempts == 0 && h.attempt.eventAttempts == 0 {
-		assertLaunchLossesAccounted(t, snap, sinkStats, h.attempt.launchAttempts)
-	}
+	// Invariant 5's literal formula - SinkStats.Launches.DroppedFull +
+	// DroppedInvalid plus LaunchCacheStats.EvictedCapacity + EvictedHorizon
+	// equals emitted minus retained - used to be exact only when the sink
+	// handled launches exclusively, because DroppedFull/DroppedInvalid/
+	// DroppedDownstream were aggregate counters shared by all five event
+	// kinds: a scenario that also emitted execs/pc-samples/modules/events
+	// would fold their drops into the same numbers and break the identity.
+	// Review Important 2 broke SinkStats down per event kind
+	// (sinkStats.Launches is now exclusively about launches regardless of
+	// what else a scenario emits), which removes that restriction entirely -
+	// this now runs for every scenario in this file, not just the
+	// launch-only ones. The one restriction that survives is a reused
+	// correlation ID, which adds a third loss category
+	// (LaunchCacheStats.Replaced) the literal formula still doesn't mention;
+	// assertLaunchLossesAccounted itself requires Replaced == 0.
+	assertLaunchLossesAccounted(t, snap, sinkStats, h.attempt.launchAttempts)
+
+	// Extends invariant 5 to PC samples - review Important 2: the PC-sample
+	// path had no reconciliation at all (nothing counted attributed vs
+	// still-pending), so a sample could vanish between ingestion and the
+	// snapshot with nothing to notice. Holds for every scenario because
+	// Snapshot is only ever called once per harness here (see this
+	// function's own doc comment) - AttributedPCSamples/PendingSamples are
+	// this-call gauges, not cumulative, so a second Snapshot call would need
+	// its own reconciliation, not this one.
+	assertPCSampleLossesAccounted(t, snap, sinkStats, h.attempt.pcAttempts)
 
 	return snap
 }
@@ -338,20 +346,46 @@ func assertBoundedMemory(t *testing.T, snap Snapshot, capacity int) {
 
 // assertLaunchLossesAccounted is invariant 5, restricted (see
 // assertConformanceInvariants) to launch-only, non-reused-correlation-ID
-// scenarios, which is exactly where the brief's literal formula is exact.
+// scenarios, which is exactly where the brief's literal formula is exact -
+// and, since the scenario is launch-only, exactly where reading
+// sinkStats.Launches specifically (rather than some cross-kind aggregate;
+// SinkStats is now broken down per event kind - review Important 2) is
+// unambiguously correct.
 func assertLaunchLossesAccounted(t *testing.T, snap Snapshot, sinkStats SinkStats, launchAttempts uint64) {
 	t.Helper()
 	require.Equal(t, uint64(0), snap.LaunchCache.Replaced,
 		"this reconciliation assumes no correlation-ID reuse; a launch-only scenario that reuses IDs needs a different formula")
-	require.Equal(t, uint64(0), sinkStats.DroppedDownstream,
+	require.Equal(t, uint64(0), sinkStats.Launches.DroppedDownstream,
 		"the harness's inner sink is a Timeline, which never rejects a delivered event")
 
 	retained := uint64(snap.LaunchCache.Live)
 	require.GreaterOrEqual(t, launchAttempts, retained, "cannot have retained more launches than were attempted")
 	lost := launchAttempts - retained
-	accounted := sinkStats.DroppedFull + sinkStats.DroppedInvalid + snap.LaunchCache.EvictedCapacity + snap.LaunchCache.EvictedHorizon
+	accounted := sinkStats.Launches.DroppedFull + sinkStats.Launches.DroppedInvalid + snap.LaunchCache.EvictedCapacity + snap.LaunchCache.EvictedHorizon
 	assert.Equal(t, lost, accounted,
 		"every launch that isn't currently retained must be accounted for by a sink drop or a cache eviction")
+}
+
+// assertPCSampleLossesAccounted is invariant 5 extended to PC samples -
+// review Important 2. Every PC sample a producer attempted must land in
+// exactly one bucket: rejected by the sink (DroppedFull/DroppedInvalid/
+// DroppedDownstream, all per-kind since Important 2), attributed to an
+// execution in this snapshot, still pending a future one, or evicted from
+// the pending store (Timeline's own per-correlation cap, horizon or
+// cardinality bound - review Critical 5). Holds for every scenario, unlike
+// assertLaunchLossesAccounted: PC samples have no analogue of
+// LaunchCacheStats.Replaced complicating the count (a correlation's samples
+// simply accumulate in pending; there is no "replace" concept), and
+// PendingSamples/AttributedPCSamples are already scoped to a single
+// Snapshot call rather than needing a launch-only carve-out.
+func assertPCSampleLossesAccounted(t *testing.T, snap Snapshot, sinkStats SinkStats, pcAttempts uint64) {
+	t.Helper()
+	rejected := sinkStats.PCSamples.DroppedFull + sinkStats.PCSamples.DroppedInvalid + sinkStats.PCSamples.DroppedDownstream
+	accepted := sinkStats.PCSamples.Accepted
+	require.Equal(t, pcAttempts, accepted+rejected,
+		"every attempted PC sample must have been either accepted by the sink or rejected and counted")
+	assert.Equal(t, accepted, snap.AttributedPCSamples+uint64(snap.PendingSamples)+snap.Dropped.EvictedPendingSamples,
+		"every PC sample the sink accepted must be attributed, still pending, or evicted from the pending store - never unaccounted for")
 }
 
 // TestConformance runs the producer-scenario table against every invariant.
@@ -541,19 +575,25 @@ func driveMixedClockDomains(sink EventSink) error {
 // and valid zero-value (defaulted) ones. This test drives it through
 // runConformance - the same entry point a vendor backend uses - then adds
 // the two checks a generic invariant pass can't express: that the bad ones
-// were actually rejected (SinkStats.DroppedInvalid) and that none of them
-// leak into the snapshot under any correlation.
+// were actually rejected (SinkStats per-kind DroppedInvalid) and that none
+// of them leak into the snapshot under any correlation.
 //
 // Mutation this catches: CountingSink.admit's ValidateSupportedClockDomain
 // check being removed or weakened to accept a non-monotonic domain - the
 // "bad-*" correlations would then surface in the snapshot and the leak
-// assertion below would fail.
+// assertion below would fail. Checking Launches and Execs separately (not a
+// combined total) is itself a review Important 2 regression check: before
+// SinkStats was broken down per event kind, a bug that rejected every
+// launch but zero execs (or vice versa) could still sum to the same total
+// this test used to check.
 func TestConformanceRejectedClockDomainsNeverSurface(t *testing.T) {
 	h, snap := runConformance(t, "mixed-clock-domains", driveMixedClockDomains)
 	sinkStats := h.sink.Stats()
 
-	assert.Equal(t, uint64(2*2), sinkStats.DroppedInvalid,
-		"every unsupported-domain attempt (one launch, one exec, per bad domain) must be rejected and counted")
+	assert.Equal(t, uint64(2), sinkStats.Launches.DroppedInvalid,
+		"every unsupported-domain launch attempt (one per bad domain) must be rejected and counted")
+	assert.Equal(t, uint64(2), sinkStats.Execs.DroppedInvalid,
+		"every unsupported-domain exec attempt (one per bad domain) must be rejected and counted")
 
 	for _, view := range snap.Executions {
 		assert.NotContains(t, view.Exec.Correlation.Value, "bad-",
@@ -640,11 +680,11 @@ func TestConformanceLossAccountingCoversHorizonAndInvalidDomain(t *testing.T) {
 	sinkStats := h.sink.Stats()
 
 	require.Greater(t, snap.LaunchCache.EvictedHorizon, uint64(0), "the scenario must force a real horizon eviction")
-	require.Greater(t, sinkStats.DroppedInvalid, uint64(0), "the scenario must force a real clock-domain rejection")
+	require.Greater(t, sinkStats.Launches.DroppedInvalid, uint64(0), "the scenario must force a real clock-domain rejection")
 	require.Greater(t, snap.LaunchCache.EvictedCapacity, uint64(0), "the scenario must force a real capacity eviction too")
 
 	t.Logf("loss reconciliation: attempts=%d retained=%d droppedFull=%d droppedInvalid=%d evictedCapacity=%d evictedHorizon=%d replaced=%d",
-		h.attempt.launchAttempts, snap.LaunchCache.Live, sinkStats.DroppedFull, sinkStats.DroppedInvalid,
+		h.attempt.launchAttempts, snap.LaunchCache.Live, sinkStats.Launches.DroppedFull, sinkStats.Launches.DroppedInvalid,
 		snap.LaunchCache.EvictedCapacity, snap.LaunchCache.EvictedHorizon, snap.LaunchCache.Replaced)
 }
 
@@ -694,6 +734,93 @@ func TestConformanceEvictedLaunchDegradesToUnattributed(t *testing.T) {
 	assert.Nil(t, view.Launch,
 		"an execution whose launch was evicted must degrade to unattributed, never reattach to a different launch that merely shares its kernel name")
 	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+}
+
+// drivePCSampleMixedFate is the scenario that keeps
+// assertPCSampleLossesAccounted's PendingSamples/AttributedPCSamples/
+// EvictedPendingSamples terms honest. Every other PC-sample-emitting
+// scenario in this file (currently just all-exact) matches every sample to
+// an exec before the single Snapshot call, so PendingSamples and
+// Dropped.EvictedPendingSamples are structurally 0 wherever the
+// reconciliation actually runs - the same "dead term" trap invariant 5's
+// launch formula had before driveHorizonAndDomainLosses was added. This
+// scenario forces all three terms nonzero in one run: "attributed" (an
+// exec arrives for its samples), "pending" (samples with no exec at
+// Snapshot time), and "evicted" (two orphan correlations pushed out of
+// Timeline's pending store entirely by the cardinality bound - the
+// dedicated harness this scenario runs under sets the launch-cache
+// capacity, and therefore pendingCap, to 2).
+//
+// Ordering matters here: "evict-a"/"evict-b" are inserted first (oldest),
+// filling pendingCap exactly; "pending" then "attributed" each push a new
+// distinct correlation past that cap, evicting the two "evict-*"
+// correlations in FIFO order (oldest first) before either "pending" or
+// "attributed" is ever at risk. By the time Snapshot runs, "attributed" and
+// "pending" are the two live pending entries - Snapshot matches
+// "attributed" to its exec and leaves "pending" untouched.
+func drivePCSampleMixedFate(sink EventSink) error {
+	for _, id := range []string{"evict-a", "evict-b"} {
+		corr := CorrelationID{Backend: BackendCUPTI, Value: id}
+		if err := sink.EmitPCSample(GPUPCSample{Correlation: corr, TimeNs: 0}); err != nil {
+			return err
+		}
+	}
+
+	// Pending: samples with no exec at all, so they remain in Timeline's
+	// pending store when Snapshot runs. Inserted before "attributed" so
+	// eviction pressure below lands on the two "evict-*" correlations, not
+	// this one.
+	pendingCorr := CorrelationID{Backend: BackendCUPTI, Value: "pending"}
+	for i := 0; i < 3; i++ {
+		if err := sink.EmitPCSample(GPUPCSample{Correlation: pendingCorr, TimeNs: uint64(i)}); err != nil {
+			return err
+		}
+	}
+
+	// Attributed: a launch, its exec, and 2 samples that will be matched at
+	// Snapshot time.
+	if err := sink.EmitLaunch(launch("attributed", 1)); err != nil {
+		return err
+	}
+	if err := sink.EmitExec(execFor("attributed", 10, 20)); err != nil {
+		return err
+	}
+	attributedCorr := CorrelationID{Backend: BackendCUPTI, Value: "attributed"}
+	for i := 0; i < 2; i++ {
+		if err := sink.EmitPCSample(GPUPCSample{Correlation: attributedCorr, TimeNs: uint64(11 + i)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TestConformancePCSampleReconciliationCoversPendingAndEvicted drives
+// drivePCSampleMixedFate through a harness whose Timeline has a small
+// per-correlation sample cap, then - beyond the standard invariants
+// runConformanceWithHarness already checks, including
+// assertPCSampleLossesAccounted itself - asserts the three terms are
+// genuinely nonzero, the same way
+// TestConformanceLossAccountingCoversHorizonAndInvalidDomain does for the
+// launch formula's dead terms.
+//
+// Mutation this catches: deleting "+ uint64(snap.PendingSamples)" or
+// "+ snap.Dropped.EvictedPendingSamples" from assertPCSampleLossesAccounted's
+// sum - both now make the reconciliation check fail here, where deleting
+// either was invisible in every other scenario in this file.
+func TestConformancePCSampleReconciliationCoversPendingAndEvicted(t *testing.T) {
+	// LaunchCache capacity 2 -> pendingCap 2 (Timeline reuses the launch-
+	// cache capacity for pending's cardinality bound by default): exactly
+	// enough for "pending" and "attributed" to both survive, forcing
+	// "evict-a"/"evict-b" out entirely. See drivePCSampleMixedFate's doc
+	// comment for the exact ordering this depends on.
+	h := newConformanceHarnessWithConfig(LaunchCacheConfig{Capacity: 2}, conformanceSinkBurst)
+	snap := runConformanceWithHarness(t, "pc-sample-mixed-fate", h, drivePCSampleMixedFate)
+
+	assert.Equal(t, uint64(2), snap.AttributedPCSamples, "the attributed correlation's 2 samples must be attached to its exec")
+	assert.Equal(t, 3, snap.PendingSamples, "the pending correlation's 3 samples must remain, unmatched")
+	assert.Equal(t, 1, snap.PendingCorrelations)
+	assert.Equal(t, uint64(2), snap.Dropped.EvictedPendingSamples,
+		"evict-a and evict-b (1 sample each) must have been evicted from pending entirely by the cardinality bound")
 }
 
 // BenchmarkSnapshotAtScale is the Phase 2 gate: a million launches through a

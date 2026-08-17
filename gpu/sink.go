@@ -13,24 +13,66 @@ import (
 // sample, and the loss is visible in SinkStats either way.
 var ErrSinkFull = errors.New("gpu: sink full")
 
-// SinkStats is the ingestion-side loss record. JoinStats reports what could not
-// be correlated; this reports what never arrived.
-type SinkStats struct {
-	Launches  uint64 `json:"launches,omitempty"`
-	Execs     uint64 `json:"execs,omitempty"`
-	PCSamples uint64 `json:"pc_samples,omitempty"`
-	Modules   uint64 `json:"modules,omitempty"`
-	Events    uint64 `json:"events,omitempty"`
-
+// EventKindStats is the ingestion outcome breakdown for one event kind -
+// review Important 2. SinkStats used to keep DroppedFull/DroppedInvalid/
+// DroppedDownstream as three aggregate counters shared by all five event
+// kinds, so a drop could never be attributed to (say) launches vs PC
+// samples - exactly the information an operator needs to tell "we're
+// losing correlation anchors" from "we're losing sampling detail, joins are
+// still fine".
+type EventKindStats struct {
+	Accepted       uint64 `json:"accepted,omitempty"`
 	DroppedFull    uint64 `json:"dropped_full,omitempty"`
 	DroppedInvalid uint64 `json:"dropped_invalid,omitempty"`
-
-	// DroppedDownstream counts events that passed admission (clock domain
-	// and capacity) but that inner failed to accept. They are not counted in
-	// the per-type accepted counters above, and the capacity they reserved
-	// is returned to the bucket - a downstream hiccup must not permanently
-	// shrink what the sink can admit.
+	// DroppedDownstream counts events of this kind that passed admission
+	// (clock domain and capacity) but that inner failed to accept. Not
+	// counted in Accepted, and the capacity they reserved is returned to
+	// the bucket - a downstream hiccup must not permanently shrink what the
+	// sink can admit.
 	DroppedDownstream uint64 `json:"dropped_downstream,omitempty"`
+}
+
+// SinkStats is the ingestion-side loss record, broken down per event kind.
+// JoinStats reports what could not be correlated; this reports what never
+// arrived.
+type SinkStats struct {
+	Launches  EventKindStats `json:"launches,omitempty"`
+	Execs     EventKindStats `json:"execs,omitempty"`
+	PCSamples EventKindStats `json:"pc_samples,omitempty"`
+	Modules   EventKindStats `json:"modules,omitempty"`
+	Events    EventKindStats `json:"events,omitempty"`
+}
+
+// eventKind identifies which EventKindStats an admission outcome is
+// recorded against. Distinct from eventClass: eventClass groups kinds by
+// which token bucket they draw from (review Important 5), eventKind
+// identifies exactly one of the five EventSink methods for accounting
+// (review Important 2). EmitLaunch is both classAnchor and kindLaunch.
+type eventKind int
+
+const (
+	kindLaunch eventKind = iota
+	kindExec
+	kindPCSample
+	kindModule
+	kindEvent
+)
+
+// statsFor returns the EventKindStats field to record kind's outcome
+// against. Caller holds mu.
+func (s *CountingSink) statsFor(kind eventKind) *EventKindStats {
+	switch kind {
+	case kindLaunch:
+		return &s.stats.Launches
+	case kindExec:
+		return &s.stats.Execs
+	case kindPCSample:
+		return &s.stats.PCSamples
+	case kindModule:
+		return &s.stats.Modules
+	default:
+		return &s.stats.Events
+	}
 }
 
 // eventClass groups EventSink methods by admission priority - review
@@ -109,12 +151,13 @@ func NewCountingSink(inner EventSink, capacity int) *CountingSink {
 // second) and clock made explicit, for callers that need a different
 // steady-state rate or deterministic tests. now defaults to time.Now when
 // nil. capacity <= 0 means unbounded, independent of refillPerSecond.
-// NewCountingSinkWithRate gives each eventClass (see its doc comment) its
-// own independent token bucket, each sized at capacity/refillPerSecond -
-// review Important 5. This is deliberately not capacity split across the
-// two classes: launches/modules must never be crowded out by exec/sample/
-// event volume, so the anchor class needs its own full, untouched budget
-// regardless of how saturated the data class is.
+//
+// Each eventClass (see its doc comment) gets its own independent token
+// bucket, each sized at capacity/refillPerSecond - review Important 5. This
+// is deliberately not capacity split across the two classes: launches/
+// modules must never be crowded out by exec/sample/event volume, so the
+// anchor class needs its own full, untouched budget regardless of how
+// saturated the data class is.
 func NewCountingSinkWithRate(inner EventSink, capacity int, refillPerSecond float64, now func() time.Time) *CountingSink {
 	if now == nil {
 		now = time.Now
@@ -178,15 +221,16 @@ func (s *CountingSink) refill() {
 // admitCapacity applies class's own token-bucket bound - the one rule
 // EmitModule shares with every other event type. On success it has reserved
 // one token from class's bucket; call release(class) if the reservation
-// turns out not to be used. Caller holds mu.
-func (s *CountingSink) admitCapacity(class eventClass) error {
+// turns out not to be used. kind attributes a drop to the right
+// EventKindStats. Caller holds mu.
+func (s *CountingSink) admitCapacity(kind eventKind, class eventClass) error {
 	b := s.bucketFor(class)
 	if b.unbounded {
 		return nil
 	}
 	s.refill()
 	if b.tokens < 1 {
-		s.stats.DroppedFull++
+		s.statsFor(kind).DroppedFull++
 		return ErrSinkFull
 	}
 	b.tokens--
@@ -210,17 +254,17 @@ func (s *CountingSink) release(class eventClass) {
 // admit applies the clock-domain contract, then class's capacity bound.
 // Caller holds mu. EmitModule bypasses this and calls admitCapacity
 // directly: a GPUModule has no ClockDomain field to validate.
-func (s *CountingSink) admit(class eventClass, domain ClockDomain) error {
+func (s *CountingSink) admit(kind eventKind, class eventClass, domain ClockDomain) error {
 	if err := ValidateSupportedClockDomain(domain); err != nil {
-		s.stats.DroppedInvalid++
+		s.statsFor(kind).DroppedInvalid++
 		return fmt.Errorf("gpu: rejected event: %w", err)
 	}
-	return s.admitCapacity(class)
+	return s.admitCapacity(kind, class)
 }
 
 func (s *CountingSink) EmitLaunch(l GPUKernelLaunch) error {
 	s.mu.Lock()
-	if err := s.admit(classAnchor, l.ClockDomain); err != nil {
+	if err := s.admit(kindLaunch, classAnchor, l.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -232,16 +276,16 @@ func (s *CountingSink) EmitLaunch(l GPUKernelLaunch) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.release(classAnchor)
-		s.stats.DroppedDownstream++
+		s.statsFor(kindLaunch).DroppedDownstream++
 		return err
 	}
-	s.stats.Launches++
+	s.statsFor(kindLaunch).Accepted++
 	return nil
 }
 
 func (s *CountingSink) EmitExec(e GPUKernelExec) error {
 	s.mu.Lock()
-	if err := s.admit(classData, e.ClockDomain); err != nil {
+	if err := s.admit(kindExec, classData, e.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -253,16 +297,16 @@ func (s *CountingSink) EmitExec(e GPUKernelExec) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.release(classData)
-		s.stats.DroppedDownstream++
+		s.statsFor(kindExec).DroppedDownstream++
 		return err
 	}
-	s.stats.Execs++
+	s.statsFor(kindExec).Accepted++
 	return nil
 }
 
 func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 	s.mu.Lock()
-	if err := s.admit(classData, p.ClockDomain); err != nil {
+	if err := s.admit(kindPCSample, classData, p.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -274,10 +318,10 @@ func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.release(classData)
-		s.stats.DroppedDownstream++
+		s.statsFor(kindPCSample).DroppedDownstream++
 		return err
 	}
-	s.stats.PCSamples++
+	s.statsFor(kindPCSample).Accepted++
 	return nil
 }
 
@@ -289,7 +333,7 @@ func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 // type.
 func (s *CountingSink) EmitModule(m GPUModule) error {
 	s.mu.Lock()
-	if err := s.admitCapacity(classAnchor); err != nil {
+	if err := s.admitCapacity(kindModule, classAnchor); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -301,16 +345,16 @@ func (s *CountingSink) EmitModule(m GPUModule) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.release(classAnchor)
-		s.stats.DroppedDownstream++
+		s.statsFor(kindModule).DroppedDownstream++
 		return err
 	}
-	s.stats.Modules++
+	s.statsFor(kindModule).Accepted++
 	return nil
 }
 
 func (s *CountingSink) EmitEvent(e GPUTimelineEvent) error {
 	s.mu.Lock()
-	if err := s.admit(classData, e.ClockDomain); err != nil {
+	if err := s.admit(kindEvent, classData, e.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -322,9 +366,24 @@ func (s *CountingSink) EmitEvent(e GPUTimelineEvent) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.release(classData)
-		s.stats.DroppedDownstream++
+		s.statsFor(kindEvent).DroppedDownstream++
 		return err
 	}
-	s.stats.Events++
+	s.statsFor(kindEvent).Accepted++
 	return nil
+}
+
+// SnapshotWith calls tl.Snapshot() and embeds s's own SinkStats into the
+// result - review Important 2: Timeline has no reference to the
+// CountingSink wrapping it (EventSink is the only contract between them),
+// so it cannot fill Snapshot.SinkStats in on its own. A caller that wires
+// producer -> CountingSink -> Timeline the way this package's own
+// conformance harness does should call this instead of tl.Snapshot()
+// directly whenever the result will be serialized or inspected for loss
+// accounting, so admission-side losses (a full token bucket, a rejected
+// clock domain) are reachable from the same Snapshot as everything else.
+func (s *CountingSink) SnapshotWith(tl *Timeline) Snapshot {
+	snap := tl.Snapshot()
+	snap.SinkStats = s.Stats()
+	return snap
 }

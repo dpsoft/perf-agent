@@ -63,6 +63,33 @@ type Snapshot struct {
 	JoinStats   JoinStats          `json:"join_stats,omitempty"`
 	LaunchCache LaunchCacheStats   `json:"launch_cache,omitempty"`
 	Dropped     TimelineDropStats  `json:"dropped,omitempty"`
+
+	// SinkStats is the ingestion-side loss record - review Important 2. It
+	// is the zero value unless populated by the caller (see
+	// CountingSink.SnapshotWith): Timeline itself never sees a
+	// CountingSink, only whatever EventSink wraps it, so it cannot fill
+	// this in on its own. Without it, admission-side losses (a full token
+	// bucket, a rejected clock domain) were unreachable from a serialized
+	// Snapshot even though they directly affect what the profile can show.
+	SinkStats SinkStats `json:"sink_stats,omitempty"`
+
+	// AttributedPCSamples counts PC samples that were attached to an
+	// execution in THIS snapshot (i.e. included in some ExecutionView's
+	// PCSamples above) - review Important 2's PC-sample reconciliation: the
+	// exec path had no accounting at all for "attributed" vs "still
+	// pending" before this.
+	AttributedPCSamples uint64 `json:"attributed_pc_samples,omitempty"`
+
+	// PendingSamples and PendingCorrelations are gauges (not deltas) of
+	// what remains in Timeline's pending store immediately after this
+	// snapshot: PendingCorrelations counts distinct not-yet-matched
+	// correlations, PendingSamples counts the individual GPUPCSample
+	// entries they hold in total. Together with AttributedPCSamples and
+	// Dropped.EvictedPendingSamples, these let a caller reconcile every PC
+	// sample ingested into exactly one of attributed / still pending /
+	// evicted.
+	PendingSamples      int `json:"pending_samples,omitempty"`
+	PendingCorrelations int `json:"pending_correlations,omitempty"`
 }
 
 // TimelineConfig configures Timeline's storage bounds.
@@ -199,6 +226,15 @@ type Timeline struct {
 	pendingHorizonNs uint64
 	pendingNewestNs  uint64
 
+	// pendingSampleTotal is the running count of individual GPUPCSample
+	// entries currently stored across every pending correlation - review
+	// Important 2's PendingSamples gauge. Maintained incrementally (+1 on
+	// every successful append, -len(samples) at every deletion site, in
+	// EmitPCSample/evictPendingLocked/Snapshot) rather than recomputed by
+	// scanning t.pending on every Snapshot call, which would add an
+	// O(pendingCap) cost to every snapshot even when nothing changed.
+	pendingSampleTotal uint64
+
 	events  *ring[GPUTimelineEvent]
 	modules *ring[GPUModule]
 
@@ -317,6 +353,7 @@ func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 
 	entry.samples = append(entry.samples, p)
 	t.pending[p.Correlation] = entry
+	t.pendingSampleTotal++
 	t.evictPendingLocked()
 	return nil
 }
@@ -373,6 +410,7 @@ func (t *Timeline) evictPendingLocked() {
 			}
 			delete(t.pending, e.id)
 			t.pendingHead++
+			t.pendingSampleTotal -= uint64(len(cur.samples))
 			t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
 		}
 	}
@@ -384,6 +422,7 @@ func (t *Timeline) evictPendingLocked() {
 			continue
 		}
 		delete(t.pending, e.id)
+		t.pendingSampleTotal -= uint64(len(cur.samples))
 		t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
 	}
 	t.compactPendingOrderLocked()
@@ -491,14 +530,19 @@ func (t *Timeline) Snapshot() Snapshot {
 	// actually use, rather than copying the whole map: a correlation with
 	// no live exec this round is left untouched (still eligible for a
 	// later snapshot, or eventual orphan eviction).
+	var attributedPCSamples uint64
 	t.mu.Lock()
 	execSamples := make([][]GPUPCSample, len(execs))
 	for i, exec := range execs {
 		if entry, ok := t.pending[exec.Correlation]; ok {
 			execSamples[i] = entry.samples
 			delete(t.pending, exec.Correlation)
+			t.pendingSampleTotal -= uint64(len(entry.samples))
+			attributedPCSamples += uint64(len(entry.samples))
 		}
 	}
+	pendingCorrelations := len(t.pending)
+	pendingSamples := t.pendingSampleTotal
 	t.mu.Unlock()
 
 	// The heuristic's candidate set is built lazily - only once the loop
@@ -571,12 +615,15 @@ func (t *Timeline) Snapshot() Snapshot {
 	}
 
 	return Snapshot{
-		Executions:  views,
-		Events:      events,
-		Modules:     modules,
-		JoinStats:   stats,
-		LaunchCache: t.cache.Stats(),
-		Dropped:     dropped,
+		Executions:          views,
+		Events:              events,
+		Modules:             modules,
+		JoinStats:           stats,
+		LaunchCache:         t.cache.Stats(),
+		Dropped:             dropped,
+		AttributedPCSamples: attributedPCSamples,
+		PendingSamples:      int(pendingSamples),
+		PendingCorrelations: pendingCorrelations,
 	}
 }
 

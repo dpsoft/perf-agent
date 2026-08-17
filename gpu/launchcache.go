@@ -154,6 +154,23 @@ func (c *LaunchCache) Get(id CorrelationID) (GPUKernelLaunch, bool) {
 	return e.launch, true
 }
 
+// Entries returns a snapshot of the launches currently live in the cache, in
+// no particular order. It exists for the heuristic join (Timeline), which
+// must consider more than one candidate launch: Get alone can only answer
+// "what is stored for this exact correlation ID." Because the cache is
+// bounded, scanning Entries costs at most O(capacity), not O(every launch
+// ever seen) - the quadratic behaviour this cache exists to remove. See the
+// LaunchCache doc comment for the aliasing contract on the returned values.
+func (c *LaunchCache) Entries() []GPUKernelLaunch {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]GPUKernelLaunch, 0, len(c.byCorr))
+	for _, e := range c.byCorr {
+		out = append(out, e.launch)
+	}
+	return out
+}
+
 func (c *LaunchCache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

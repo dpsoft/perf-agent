@@ -166,3 +166,54 @@ func TestLaunchCacheConcurrentPutGetIsRaceFree(t *testing.T) {
 
 	assert.LessOrEqual(t, c.Len(), 256, "cache must stay bounded under concurrent load")
 }
+
+// TestLaunchCacheEntriesReturnsWhatWasPut is a direct test of Entries(),
+// added for review Important 7: Entries() (added to support Timeline's
+// heuristic join) was previously exercised only indirectly, and never
+// through a scenario with more than one live entry. Mutation this catches:
+// Entries() returning the wrong set (empty, partial, or with stale values).
+func TestLaunchCacheEntriesReturnsWhatWasPut(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 4})
+	c.Put(launch("a", 10))
+	c.Put(launch("b", 20))
+
+	entries := c.Entries()
+	require.Len(t, entries, 2)
+	byValue := make(map[string]uint64, len(entries))
+	for _, e := range entries {
+		byValue[e.Correlation.Value] = e.TimeNs
+	}
+	assert.Equal(t, map[string]uint64{"a": 10, "b": 20}, byValue)
+}
+
+// TestLaunchCacheEntriesReflectsEviction catches Entries() returning a
+// launch that capacity eviction already dropped (e.g. a cached/stale
+// snapshot taken before eviction, rather than reading current state).
+func TestLaunchCacheEntriesReflectsEviction(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1})
+	c.Put(launch("a", 10))
+	c.Put(launch("b", 20)) // evicts "a"
+
+	entries := c.Entries()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "b", entries[0].Correlation.Value, "Entries must not return an evicted launch")
+}
+
+// TestLaunchCacheEntriesIsACopyNotAView catches Entries() handing out a
+// slice or elements that alias the cache's internal storage - e.g. returning
+// a view into the cache's own order/backing array - by mutating the
+// returned slice and its first element, then confirming neither the cache's
+// stored value nor its size changed.
+func TestLaunchCacheEntriesIsACopyNotAView(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 4})
+	c.Put(launch("a", 10))
+
+	entries := c.Entries()
+	entries[0].KernelName = "tampered"
+	entries = append(entries, launch("injected", 999))
+
+	got, ok := c.Get(CorrelationID{Backend: BackendCUPTI, Value: "a"})
+	require.True(t, ok)
+	assert.Equal(t, "k_a", got.KernelName, "mutating the returned slice must not affect the cache's stored value")
+	assert.Equal(t, 1, c.Len(), "appending to the returned slice must not grow the cache")
+}

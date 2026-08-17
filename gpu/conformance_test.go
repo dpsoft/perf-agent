@@ -33,12 +33,17 @@ package gpu
 //     zero-value ones (catches CountingSink's domain check being weakened or
 //     removed).
 //  5. Losses are accounted.
-//     Stressed by: overflow, the one scenario built so real drops
-//     (SinkStats.DroppedFull) and real evictions (LaunchCacheStats.
-//     EvictedCapacity) both happen in the same run, at very different
-//     magnitudes. See assertLaunchLossesAccounted's doc comment for why this
-//     check is scoped to launch-only, non-reused-ID scenarios rather than
-//     applied universally.
+//     Stressed by: overflow, which puts real drops (SinkStats.DroppedFull)
+//     and real capacity evictions (LaunchCacheStats.EvictedCapacity) in the
+//     same run at very different magnitudes, AND
+//     horizon-and-domain-losses (see driveHorizonAndDomainLosses), which
+//     exists specifically because overflow's harness never sets HorizonNs
+//     and never attempts an unsupported clock domain - EvictedHorizon and
+//     DroppedInvalid are structurally 0 everywhere else the reconciliation
+//     formula runs, so those two of its four terms would be undetectable
+//     dead weight without it. See assertLaunchLossesAccounted's doc comment
+//     for why the check is scoped to launch-only, non-reused-ID scenarios
+//     rather than applied universally.
 //  6. Bounded memory.
 //     Stressed by: overflow (100k launches into a capacity-64 cache).
 //     Mutation caught: capacity eviction being skipped or the ring/cache
@@ -132,26 +137,60 @@ type conformanceHarness struct {
 	tl      *Timeline
 	sink    *CountingSink
 	attempt *attemptSink
+
+	// cacheCapacity is the launch-cache capacity this harness was built
+	// with, kept alongside tl so assertBoundedMemory can check a scenario's
+	// actual configured bound instead of assuming every harness shares
+	// conformanceCacheCapacity - not true once
+	// newConformanceHarnessWithConfig is used with a different capacity.
+	cacheCapacity int
+}
+
+// newConformanceHarnessWithConfig is newConformanceHarness generalized over
+// the launch-cache config, for the one scenario (horizon-and-domain-losses)
+// that needs a HorizonNs the shared default harness deliberately doesn't
+// set. The clock is always frozen, for the same reason newConformanceHarness
+// freezes it.
+func newConformanceHarnessWithConfig(cacheCfg LaunchCacheConfig, sinkBurst int) *conformanceHarness {
+	tl := NewTimeline(TimelineConfig{LaunchCache: cacheCfg})
+	clock := newFakeClock(time.Unix(0, 0))
+	sink := NewCountingSinkWithRate(tl, sinkBurst, 0, clock.Now)
+	return &conformanceHarness{tl: tl, sink: sink, attempt: newAttemptSink(sink), cacheCapacity: cacheCfg.Capacity}
 }
 
 func newConformanceHarness() *conformanceHarness {
-	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: conformanceCacheCapacity}})
-	clock := newFakeClock(time.Unix(0, 0))
-	sink := NewCountingSinkWithRate(tl, conformanceSinkBurst, 0, clock.Now)
-	return &conformanceHarness{tl: tl, sink: sink, attempt: newAttemptSink(sink)}
+	return newConformanceHarnessWithConfig(LaunchCacheConfig{Capacity: conformanceCacheCapacity}, conformanceSinkBurst)
 }
 
-// runConformance drives one producer scenario through a fresh harness and
-// checks every invariant a producer's output must satisfy. This is the
-// helper later vendor backends (replay, HIP, CUPTI) call with their own
-// drive functions.
-func runConformance(t *testing.T, name string, drive func(EventSink) error) {
+// runConformance drives one producer scenario through a fresh, default-
+// configured harness and checks every invariant a producer's output must
+// satisfy. This is the helper later vendor backends (replay, HIP, CUPTI)
+// call with their own drive functions. It returns the harness and the
+// snapshot checked against, for the rare scenario (e.g.
+// TestConformanceRejectedClockDomainsNeverSurface) that needs an additional,
+// scenario-specific assertion beyond the standard six - callers that don't
+// need that can simply ignore both.
+func runConformance(t *testing.T, name string, drive func(EventSink) error) (*conformanceHarness, Snapshot) {
 	t.Helper()
+	h := newConformanceHarness()
+	snap := runConformanceWithHarness(t, name, h, drive)
+	return h, snap
+}
+
+// runConformanceWithHarness is runConformance generalized over the harness,
+// for scenarios that need non-default configuration (a launch-cache
+// horizon, a different sink burst) to make a particular invariant term
+// reachable at all. It shares the exact same invariant checks as
+// runConformance - a scenario using this entry point still runs the
+// identical suite, just paired with a harness it built for itself.
+func runConformanceWithHarness(t *testing.T, name string, h *conformanceHarness, drive func(EventSink) error) Snapshot {
+	t.Helper()
+	var snap Snapshot
 	t.Run(name, func(t *testing.T) {
-		h := newConformanceHarness()
 		require.NoError(t, drive(h.attempt))
-		assertConformanceInvariants(t, h)
+		snap = assertConformanceInvariants(t, h)
 	})
+	return snap
 }
 
 // assertConformanceInvariants snapshots the harness exactly once (Snapshot
@@ -166,7 +205,7 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	assertExactNeverHeuristic(t, snap)
 	assertHeuristicAlwaysMarked(t, snap)
 	assertTimestampsMonotonic(t, snap)
-	assertBoundedMemory(t, snap)
+	assertBoundedMemory(t, snap, h.cacheCapacity)
 
 	// Invariant 5's literal formula - SinkStats.DroppedFull + DroppedInvalid
 	// plus LaunchCacheStats.EvictedCapacity + EvictedHorizon equals emitted
@@ -258,10 +297,13 @@ func assertTimestampsMonotonic(t *testing.T, snap Snapshot) {
 	}
 }
 
-// assertBoundedMemory is invariant 6.
-func assertBoundedMemory(t *testing.T, snap Snapshot) {
+// assertBoundedMemory is invariant 6. capacity is the launch-cache capacity
+// the scenario's own harness was configured with (conformanceHarness.
+// cacheCapacity), not necessarily conformanceCacheCapacity - the
+// horizon-and-domain-losses scenario deliberately uses a different one.
+func assertBoundedMemory(t *testing.T, snap Snapshot, capacity int) {
 	t.Helper()
-	assert.LessOrEqual(t, snap.LaunchCache.Live, conformanceCacheCapacity,
+	assert.LessOrEqual(t, snap.LaunchCache.Live, capacity,
 		"the launch cache must never hold more than its configured capacity")
 }
 
@@ -393,55 +435,75 @@ func driveOverflow(sink EventSink) error {
 	return nil
 }
 
+// driveMixedClockDomains emits launches and execs in a mix of the supported
+// domain (explicit and zero-value/defaulted) and two unsupported domains.
+// Expressed as a plain drive func like every other scenario - a vendor
+// backend wired through runConformance inherits this coverage too, not just
+// this file's own tests - it deliberately discards each unsupported-domain
+// call's error rather than asserting on it inline (the same way
+// driveOverflow discards ErrSinkFull): rejection is still verified, just
+// after driving completes, via SinkStats and the snapshot (see
+// TestConformanceRejectedClockDomainsNeverSurface) rather than a per-call
+// assertion the drive signature has no *testing.T to make.
+func driveMixedClockDomains(sink EventSink) error {
+	for i := 0; i < 3; i++ { // valid, explicit domain
+		id := "good-" + strconv.Itoa(i)
+		l := launch(id, uint64(i*10)+1)
+		l.ClockDomain = ClockDomainCPUMonotonic
+		if err := sink.EmitLaunch(l); err != nil {
+			return err
+		}
+		e := execFor(id, uint64(i*10)+2, uint64(i*10)+3)
+		e.ClockDomain = ClockDomainCPUMonotonic
+		if err := sink.EmitExec(e); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < 3; i++ { // zero-value domain must default, not reject
+		id := "zero-" + strconv.Itoa(i)
+		if err := sink.EmitLaunch(launch(id, uint64(1000+i))); err != nil {
+			return err
+		}
+		if err := sink.EmitExec(execFor(id, uint64(2000+i), uint64(2000+i+1))); err != nil {
+			return err
+		}
+	}
+	badDomains := []ClockDomain{ClockDomainGPUDevice, ClockDomainSynced}
+	for i, dom := range badDomains {
+		id := "bad-" + strconv.Itoa(i)
+		l := launch(id, uint64(5000+i))
+		l.ClockDomain = dom
+		_ = sink.EmitLaunch(l) // expected rejection; verified post-hoc below
+
+		e := execFor(id, uint64(6000+i), uint64(6000+i+1))
+		e.ClockDomain = dom
+		_ = sink.EmitExec(e)
+	}
+	return nil
+}
+
 // TestConformanceRejectedClockDomainsNeverSurface targets invariant 4's
 // second clause directly: "every accepted event has ClockDomainCPUMonotonic
-// after normalization." The three table-driven scenarios above only ever
-// use the supported domain, so that clause holds for them vacuously -
-// nothing else was ever possible. This is the scenario that can actually
-// fail: launches and execs in the unsupported ClockDomainGPUDevice/
-// ClockDomainSynced domains, alongside valid explicit and valid zero-value
-// (defaulted) ones. It checks both that the bad ones are rejected
-// (SinkStats.DroppedInvalid) and that none of them leak into the snapshot
-// under any correlation.
+// after normalization." The three table-driven scenarios in TestConformance
+// only ever use the supported domain, so that clause holds for them
+// vacuously - nothing else was ever possible. driveMixedClockDomains is the
+// scenario that can actually fail: launches and execs in the unsupported
+// ClockDomainGPUDevice/ClockDomainSynced domains, alongside valid explicit
+// and valid zero-value (defaulted) ones. This test drives it through
+// runConformance - the same entry point a vendor backend uses - then adds
+// the two checks a generic invariant pass can't express: that the bad ones
+// were actually rejected (SinkStats.DroppedInvalid) and that none of them
+// leak into the snapshot under any correlation.
 //
 // Mutation this catches: CountingSink.admit's ValidateSupportedClockDomain
 // check being removed or weakened to accept a non-monotonic domain - the
 // "bad-*" correlations would then surface in the snapshot and the leak
 // assertion below would fail.
 func TestConformanceRejectedClockDomainsNeverSurface(t *testing.T) {
-	h := newConformanceHarness()
-
-	for i := 0; i < 3; i++ { // valid, explicit domain
-		id := "good-" + strconv.Itoa(i)
-		l := launch(id, uint64(i*10)+1)
-		l.ClockDomain = ClockDomainCPUMonotonic
-		require.NoError(t, h.attempt.EmitLaunch(l))
-		e := execFor(id, uint64(i*10)+2, uint64(i*10)+3)
-		e.ClockDomain = ClockDomainCPUMonotonic
-		require.NoError(t, h.attempt.EmitExec(e))
-	}
-	for i := 0; i < 3; i++ { // zero-value domain must default, not reject
-		id := "zero-" + strconv.Itoa(i)
-		require.NoError(t, h.attempt.EmitLaunch(launch(id, uint64(1000+i))))
-		require.NoError(t, h.attempt.EmitExec(execFor(id, uint64(2000+i), uint64(2000+i+1))))
-	}
-
-	badDomains := []ClockDomain{ClockDomainGPUDevice, ClockDomainSynced}
-	for i, dom := range badDomains {
-		id := "bad-" + strconv.Itoa(i)
-		l := launch(id, uint64(5000+i))
-		l.ClockDomain = dom
-		require.Error(t, h.attempt.EmitLaunch(l), "an unsupported clock domain must be rejected, not silently accepted")
-
-		e := execFor(id, uint64(6000+i), uint64(6000+i+1))
-		e.ClockDomain = dom
-		require.Error(t, h.attempt.EmitExec(e))
-	}
-
-	snap := assertConformanceInvariants(t, h)
+	h, snap := runConformance(t, "mixed-clock-domains", driveMixedClockDomains)
 	sinkStats := h.sink.Stats()
 
-	assert.Equal(t, uint64(len(badDomains)*2), sinkStats.DroppedInvalid,
+	assert.Equal(t, uint64(2*2), sinkStats.DroppedInvalid,
 		"every unsupported-domain attempt (one launch, one exec, per bad domain) must be rejected and counted")
 
 	for _, view := range snap.Executions {
@@ -452,6 +514,89 @@ func TestConformanceRejectedClockDomainsNeverSurface(t *testing.T) {
 				"a launch rejected for an unsupported clock domain must never surface via a join")
 		}
 	}
+}
+
+// driveHorizonAndDomainLosses is the scenario that keeps invariant 5's
+// EvictedHorizon and DroppedInvalid terms honest. No other scenario in this
+// file sets LaunchCacheConfig.HorizonNs, so EvictedHorizon is structurally 0
+// everywhere else; driveMixedClockDomains does attempt unsupported clock
+// domains, but that scenario mixes in execs, so
+// assertConformanceInvariants's launch-only gate never runs the
+// reconciliation formula against it. That means DroppedInvalid was 0 in
+// every run that actually evaluated the sum, and EvictedHorizon was 0 in
+// all of them: `0 + X == X` means deleting either term from
+// assertLaunchLossesAccounted's sum would still pass the entire rest of the
+// suite. This scenario forces both nonzero - and, as a consequence of how
+// it's built, EvictedCapacity too - in one run where the reconciliation
+// formula is actually checked.
+//
+// Two phases against a cache of capacity 1000 / horizon 50ns:
+//   - Phase A: 200 launches spaced 10ns apart (TimeNs = 0, 10, 20, ...). The
+//     50ns horizon only lets entries within 50ns of the newest timestamp
+//     stay live, so as the anchor advances, older entries age out via
+//     EvictedHorizon long before the cache is anywhere near its capacity of
+//     1000.
+//   - Phase B: 1500 more launches that all carry the same TimeNs (2000,
+//     equal to Phase A's final horizon boundary), so the horizon anchor
+//     only advances once, at the very start of this phase, and horizon
+//     eviction cannot fire again after Phase A's last few survivors age
+//     out. Once no more entries can be aged out by horizon, filling the
+//     cache with 1500 more unique-correlation entries against a capacity of
+//     1000 has nowhere to go but EvictedCapacity.
+//   - 4 launches in unsupported clock domains, rejected outright
+//     (DroppedInvalid), touching neither the cache nor the token bucket.
+//
+// Every correlation ID is unique and every launch is emitted exactly once,
+// so LaunchCacheStats.Replaced stays 0 and assertLaunchLossesAccounted's
+// preconditions hold.
+func driveHorizonAndDomainLosses(sink EventSink) error {
+	for i := 0; i < 200; i++ {
+		if err := sink.EmitLaunch(launch("horizon-"+strconv.Itoa(i), uint64(i*10))); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < 1500; i++ {
+		if err := sink.EmitLaunch(launch("capacity-"+strconv.Itoa(i), 2000)); err != nil {
+			return err
+		}
+	}
+	badDomains := []ClockDomain{ClockDomainGPUDevice, ClockDomainSynced, ClockDomainGPUDevice, ClockDomainSynced}
+	for i, dom := range badDomains {
+		l := launch("horizon-bad-"+strconv.Itoa(i), 2000)
+		l.ClockDomain = dom
+		_ = sink.EmitLaunch(l) // expected rejection; verified post-hoc below
+	}
+	return nil
+}
+
+// TestConformanceLossAccountingCoversHorizonAndInvalidDomain drives
+// driveHorizonAndDomainLosses through a harness with HorizonNs actually set
+// (runConformance's shared default harness deliberately never sets it), then
+// - beyond the standard six invariants runConformanceWithHarness already
+// checks, including the reconciliation formula itself, since this scenario
+// is launch-only and unique-ID by construction - asserts that the three
+// previously-dead-or-unchecked terms are genuinely nonzero here. Without
+// that extra guard, a future edit to this scenario's numbers could silently
+// regress it back into vacuity while the reconciliation assertion kept
+// passing for the wrong reason (both sides shrinking to 0 together).
+//
+// Mutation this catches: deleting "+ sinkStats.DroppedInvalid" or
+// "+ snap.LaunchCache.EvictedHorizon" from assertLaunchLossesAccounted's sum
+// - both now make the reconciliation check inside
+// runConformanceWithHarness/assertConformanceInvariants fail here, where
+// deleting either used to be invisible everywhere else in this file.
+func TestConformanceLossAccountingCoversHorizonAndInvalidDomain(t *testing.T) {
+	h := newConformanceHarnessWithConfig(LaunchCacheConfig{Capacity: 1000, HorizonNs: 50}, conformanceSinkBurst)
+	snap := runConformanceWithHarness(t, "horizon-and-domain-losses", h, driveHorizonAndDomainLosses)
+	sinkStats := h.sink.Stats()
+
+	require.Greater(t, snap.LaunchCache.EvictedHorizon, uint64(0), "the scenario must force a real horizon eviction")
+	require.Greater(t, sinkStats.DroppedInvalid, uint64(0), "the scenario must force a real clock-domain rejection")
+	require.Greater(t, snap.LaunchCache.EvictedCapacity, uint64(0), "the scenario must force a real capacity eviction too")
+
+	t.Logf("loss reconciliation: attempts=%d retained=%d droppedFull=%d droppedInvalid=%d evictedCapacity=%d evictedHorizon=%d replaced=%d",
+		h.attempt.launchAttempts, snap.LaunchCache.Live, sinkStats.DroppedFull, sinkStats.DroppedInvalid,
+		snap.LaunchCache.EvictedCapacity, snap.LaunchCache.EvictedHorizon, snap.LaunchCache.Replaced)
 }
 
 // BenchmarkSnapshotAtScale is the Phase 2 gate: a million launches through a

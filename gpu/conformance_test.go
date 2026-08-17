@@ -834,7 +834,13 @@ func TestConformancePCSampleReconciliationCoversPendingAndEvicted(t *testing.T) 
 // exec (1 in 4, same as before) now also gets 3 PC samples under its own
 // correlation, which exercises both the per-correlation cap and the
 // proportional weight distribution's cost, not just the launch-cache path.
-func BenchmarkSnapshotAtScale(b *testing.B) {
+// newSnapshotScaleTimeline builds the fixture BenchmarkSnapshotAtScale
+// measures: 1M launches with unique correlation IDs (see the comment
+// inline), a quarter of them with a matched exec, each of those with 3 PC
+// samples. Factored out of the benchmark so it can be rebuilt once per
+// b.N iteration - see BenchmarkSnapshotAtScale's doc comment for why that
+// matters.
+func newSnapshotScaleTimeline() *Timeline {
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 65536}})
 	for i := 0; i < 1_000_000; i++ {
 		// Every launch gets its own correlation ID. Reusing one would mean the
@@ -851,8 +857,35 @@ func BenchmarkSnapshotAtScale(b *testing.B) {
 			}
 		}
 	}
-	b.ResetTimer()
+	return tl
+}
+
+// BenchmarkSnapshotAtScale is the Phase 2 exit gate: a million launches
+// through a bounded cache must snapshot in well under a second, with
+// allocation reflecting the bounded cache rather than a million retained
+// launches.
+//
+// The timeline is rebuilt inside the loop, with the timer stopped for the
+// rebuild, on every iteration - not built once outside the loop and
+// snapshotted b.N times. Review Critical 3 made Snapshot consume
+// executions/events/modules/matched-PC-samples, so a timeline built once
+// and snapshotted repeatedly is fully drained after iteration 1: every
+// iteration after the first would measure an empty structure. That is
+// exactly invisible under `-benchtime=1x` (the convention this project's
+// other GPU benchmarks rely on and what this benchmark itself used to be
+// measured with) since b.N is 1 there and the bug never gets a second
+// iteration to hide in - but it is exactly what `go test -bench .`
+// (b.N auto-tuned, almost always > 1, and what CI or a casual check
+// actually runs) would hit, reporting a few milliseconds and a few dozen
+// allocations for an empty timeline while believing it measured the real
+// one. A `b.Skip` on b.N > 1, or a doc comment demanding a flag, would
+// both still allow the benchmark to be run wrongly and lie; rebuilding the
+// fixture per iteration is correct unconditionally, at any -benchtime.
+func BenchmarkSnapshotAtScale(b *testing.B) {
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tl := newSnapshotScaleTimeline()
+		b.StartTimer()
 		_ = tl.Snapshot()
 	}
 }

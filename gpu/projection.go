@@ -37,10 +37,10 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 
 		weights := distributeExecutionWeight(executionWeight(view.Exec), view.PCSamples)
 		for i, pcs := range view.PCSamples {
+			// common is projectionLabels' return value, which always starts
+			// from `make(map[string]string)` - never nil - so maps.Clone(common)
+			// is never nil either; no separate nil-guard is needed here.
 			labels := maps.Clone(common)
-			if labels == nil {
-				labels = make(map[string]string, 2)
-			}
 			if pcs.StallReason != "" {
 				labels["gpu_stall"] = pcs.StallReason
 			}

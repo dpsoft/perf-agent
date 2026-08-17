@@ -177,15 +177,22 @@ type Timeline struct {
 	// pending holds PC samples keyed by correlation ID until an exec with a
 	// matching Correlation is joined at Snapshot time. A correlation's
 	// samples are deleted from pending the moment they are attached to an
-	// execution's view - they are consumed, not cached indefinitely. As a
-	// direct consequence, if the same still-live execution is included in a
-	// later Snapshot call, that later call sees only samples that arrived
-	// since the previous attach, not the full history: PCSamples is a
-	// once-delivered view, not an accumulating one. Samples that are never
-	// claimed (exec never arrives, or ages out of the ring first) are
-	// orphans; pendingCap/pendingOrder/pendingHead bound how many distinct
-	// correlations' worth of orphans can accumulate, evicting the oldest
-	// and counting it in Dropped.EvictedPendingSamples.
+	// execution's view - they are consumed, not cached indefinitely. Since
+	// review Critical 3 made Snapshot drain execs the same way (an exec is
+	// reported in exactly one Snapshot call, never re-reported in a later
+	// one), an exec's attach is a one-time event by construction: whatever
+	// samples had accumulated in pending for its Correlation by that moment
+	// are handed to it, once, and there is no "later Snapshot call for the
+	// same still-live execution" for more to arrive into. A PC sample that
+	// arrives under that same correlation ID afterward - the ID having been
+	// consumed already - starts a fresh, ordinary pending entry (a new
+	// generation; see the seq discussion below), exactly like any other
+	// correlation whose exec hasn't arrived yet, not a continuation of the
+	// one already delivered. Samples that are never claimed (exec never
+	// arrives, or ages out of the ring first) are orphans; pendingCap/
+	// pendingOrder/pendingHead bound how many distinct correlations' worth
+	// of orphans can accumulate, evicting the oldest and counting it in
+	// Dropped.EvictedPendingSamples.
 	//
 	// Both pending's entries and pendingOrder's positions carry a sequence
 	// number, the same way LaunchCache pairs cacheEntry.seq with

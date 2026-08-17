@@ -169,9 +169,27 @@ Requirements:
   USDT semaphore count to detect attachment.
 - Field names avoid CUDA vocabulary where a neutral term exists (`queue` not
   `stream`) so ROCm can emit the same ABI.
+- **Every launch and execution carries a correlation ID, without exception.** A
+  producer whose vendor API does not supply one must synthesise a unique value
+  per launch; emitting the zero value is not permitted.
 
-Authoring the probes requires `systemtap-sdt-devel` (`sys/sdt.h`), which is not
-currently installed on the lab box.
+  This last requirement was discovered by building Phase 2 rather than by
+  design, and it is the kind of constraint the phase existed to surface. The
+  core indexes launches by `CorrelationID`, so every correlation-less launch
+  collapses onto the single zero-value key: the cache retains one of them, the
+  rest are counted as replacements, and the heuristic join — which after Phase 2
+  serves correlation-less executions exclusively — sees at most one candidate.
+  A DRM/lifecycle backend emitting correlation-less events would therefore
+  attribute almost nothing, and `MatchedLaunchCount` would read 1 regardless of
+  volume.
+
+  A synthetic ID costs the producer a counter. Making the core key on something
+  else would cost it the O(1) exact-join path that Phase 2's gate depends on.
+
+Authoring the probes requires `systemtap-sdt-devel` (`sys/sdt.h`), or emitting
+`.note.stapsdt` notes via inline asm to avoid the build dependency entirely.
+Neither is installed on the lab box; the choice belongs in Phase 3 on its
+merits.
 
 ## 7. Canonical event model
 
@@ -447,5 +465,15 @@ Setup steps, none of them obstacles:
    hides the failure mode Phase 2 exists to fix. Partly answered by §6.1: the
    rocprofiler bridge already supplies a second real taxonomy to design against,
    which is most of what a spike would have bought.
+
+   **Phase 2 shifted this toward yes.** Twelve defects in that phase came from
+   specifying behaviour against a document rather than against something real,
+   and the ABI is the most expensive artifact in the program to get wrong —
+   version suffixes make it survivable, not free. The mitigation for the
+   original objection is that a spike's output should be *knowledge about CUPTI
+   record shapes*, with the code discarded; it does not need to run against the
+   Phase 2 core at all, so it cannot be misled by buffer behaviour.
+
+   Open, with a deadline: it must be settled before Phase 3 freezes the ABI.
 2. Sidecar or same-container as the shipping default. Sidecar plus shared volume
    is the design target; same-container is simpler but couples lifecycles.

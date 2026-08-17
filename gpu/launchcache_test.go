@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"math"
 	"strconv"
 	"sync"
 	"testing"
@@ -97,7 +98,10 @@ func TestLaunchCacheRefreshSurvivesCapacityEviction(t *testing.T) {
 }
 
 func TestLaunchCacheAnomalousTimestampDoesNotWipeCache(t *testing.T) {
-	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1000, HorizonNs: 1000, MaxAdvanceNs: 1000})
+	// MaxAdvanceNs deliberately unset: the default must protect callers who
+	// set HorizonNs without opting in explicitly, since those are exactly the
+	// callers exposed to this hazard.
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1000, HorizonNs: 1000})
 	for i := 0; i < 10; i++ {
 		c.Put(launch(strconv.Itoa(i), uint64(i)))
 	}
@@ -108,6 +112,19 @@ func TestLaunchCacheAnomalousTimestampDoesNotWipeCache(t *testing.T) {
 	assert.Equal(t, 11, c.Stats().Live, "an anomalous timestamp must not evict previously-live entries")
 	assert.Equal(t, uint64(1), c.Stats().AnomalousTimestamp)
 	assert.Equal(t, uint64(0), c.Stats().EvictedHorizon, "the anomaly must not trigger horizon eviction of untouched entries")
+}
+
+func TestLaunchCacheMaxAdvanceNsSentinelDisablesClamping(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1000, HorizonNs: 1000, MaxAdvanceNs: math.MaxUint64})
+	for i := 0; i < 10; i++ {
+		c.Put(launch(strconv.Itoa(i), uint64(i)))
+	}
+	require.Equal(t, 10, c.Stats().Live)
+
+	c.Put(launch("far-future", 1<<62))
+
+	assert.Equal(t, uint64(0), c.Stats().AnomalousTimestamp, "the sentinel must disable anomaly clamping")
+	assert.Equal(t, uint64(10), c.Stats().EvictedHorizon, "with clamping disabled, the far-future timestamp genuinely advances the anchor and evicts the older entries")
 }
 
 // TestLaunchCacheConcurrentPutGetIsRaceFree exercises the cache's actual

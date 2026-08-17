@@ -23,10 +23,12 @@ type LaunchCacheConfig struct {
 	// to survive late arrival. A Put whose TimeNs would advance the anchor by
 	// more than MaxAdvanceNs is treated as anomalous: the launch is still
 	// stored (no data is dropped), the anchor does not advance, and
-	// LaunchCacheStats.AnomalousTimestamp is incremented instead. Zero
-	// disables clamping entirely, for callers who genuinely want that. 60
-	// seconds (60_000_000_000 ns) is a reasonable default for callers that
-	// want protection.
+	// LaunchCacheStats.AnomalousTimestamp is incremented instead.
+	//
+	// Zero means "use the default" (defaultMaxAdvanceNs, 60s): the callers
+	// exposed to this hazard are exactly the ones who set HorizonNs, so the
+	// guard must be on unless a caller explicitly turns it off. A caller who
+	// genuinely wants unclamped advance sets MaxAdvanceNs to math.MaxUint64.
 	MaxAdvanceNs uint64
 }
 
@@ -42,6 +44,12 @@ type LaunchCacheStats struct {
 }
 
 const defaultLaunchCacheCapacity = 65536
+
+// defaultMaxAdvanceNs bounds how far one Put may move the horizon anchor when
+// the caller has not chosen a bound (LaunchCacheConfig.MaxAdvanceNs == 0). A
+// corrupt or out-of-range timestamp would otherwise push every live entry
+// past the horizon in a single call.
+const defaultMaxAdvanceNs = 60 * 1e9 // 60s
 
 // cacheEntry is a stored launch tagged with the Put sequence number that
 // produced it, so a stale order position (superseded by a later replace) can
@@ -85,6 +93,9 @@ func NewLaunchCache(cfg LaunchCacheConfig) *LaunchCache {
 	if cfg.Capacity <= 0 {
 		cfg.Capacity = defaultLaunchCacheCapacity
 	}
+	if cfg.MaxAdvanceNs == 0 {
+		cfg.MaxAdvanceNs = defaultMaxAdvanceNs
+	}
 	return &LaunchCache{
 		cfg:    cfg,
 		byCorr: make(map[CorrelationID]cacheEntry, cfg.Capacity),
@@ -114,13 +125,16 @@ func (c *LaunchCache) Put(l GPUKernelLaunch) {
 // observeTimestampLocked advances the horizon anchor (newestNs) to l's
 // timestamp, unless that would be an anomalous jump larger than
 // MaxAdvanceNs, in which case the anchor is left alone and the anomaly is
-// counted. The anchor is observed time, not wall-clock: wall-clock is wrong
-// for replay and out-of-order input. The caller must hold c.mu.
+// counted. NewLaunchCache guarantees MaxAdvanceNs is never zero (it defaults
+// to defaultMaxAdvanceNs), so the only way to see unclamped advance here is
+// the explicit math.MaxUint64 opt-out, against which no real jump can ever
+// compare greater. The anchor is observed time, not wall-clock: wall-clock is
+// wrong for replay and out-of-order input. The caller must hold c.mu.
 func (c *LaunchCache) observeTimestampLocked(timeNs uint64) {
 	if timeNs <= c.newestNs {
 		return
 	}
-	if c.cfg.MaxAdvanceNs > 0 && c.newestNs != 0 && timeNs-c.newestNs > c.cfg.MaxAdvanceNs {
+	if c.newestNs != 0 && timeNs-c.newestNs > c.cfg.MaxAdvanceNs {
 		c.stats.AnomalousTimestamp++
 		return
 	}

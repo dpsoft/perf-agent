@@ -770,6 +770,38 @@ func TestTimelineHeuristicRespectsJoinWindow(t *testing.T) {
 	assert.False(t, view.Ambiguous, "the out-of-window candidate must not count toward Ambiguous")
 }
 
+// TestTimelineHeuristicOutOfWindowDropIsCounted is the regression test for
+// the minors cleanup: JoinStats.OutOfWindowDropCount was declared but never
+// written anywhere - review Important 3 made it writable by wiring the
+// window into findLaunchHeuristic, but nothing actually wrote to it yet. A
+// single candidate exists (unlike TestTimelineHeuristicRespectsJoinWindow's
+// in-window survivor "near") and it precedes the exec but falls outside the
+// window, so the miss must be attributed specifically to the window, not to
+// "no candidate at all". Mutation this catches: OutOfWindowDropCount never
+// being incremented, or launchMatch.outOfWindow being set on a miss with no
+// preceding candidate too (which would make this indistinguishable from a
+// genuinely candidate-less miss).
+func TestTimelineHeuristicOutOfWindowDropIsCounted(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchEventJoinWindowNs: 10})
+	require.NoError(t, tl.EmitLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "far"},
+		KernelName:  "k_x",
+		TimeNs:      0,
+		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 0},
+	}))
+	require.NoError(t, tl.EmitExec(GPUKernelExec{
+		KernelName: "k_x",
+		StartNs:    100, EndNs: 110, // "far" (TimeNs=0) precedes this but is 100ns away, outside the 10ns window
+	}))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	assert.Nil(t, snap.Executions[0].Launch)
+	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+	assert.Equal(t, uint64(1), snap.JoinStats.OutOfWindowDropCount,
+		"a miss caused specifically by the window excluding an otherwise-preceding candidate must be counted")
+}
+
 // TestTimelineHeuristicWindowZeroIsUnbounded pins the documented default:
 // TimelineConfig{} (LaunchEventJoinWindowNs left at its zero value) must
 // keep today's unbounded behavior, so every existing caller/test that never

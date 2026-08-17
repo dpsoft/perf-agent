@@ -605,6 +605,9 @@ func (t *Timeline) Snapshot() Snapshot {
 			matched[match.launch.Correlation] = struct{}{}
 		} else {
 			stats.UnmatchedExecutionCount++
+			if match.outOfWindow {
+				stats.OutOfWindowDropCount++
+			}
 		}
 		views = append(views, view)
 	}
@@ -628,11 +631,16 @@ func (t *Timeline) Snapshot() Snapshot {
 }
 
 // launchMatch is the result of the heuristic join: the best candidate found
-// (nil on a miss - a miss must never attach a launch), and whether more than
-// one candidate matched (Ambiguous).
+// (nil on a miss - a miss must never attach a launch), whether more than one
+// candidate matched (ambiguous), and - on a miss only - whether the window
+// (windowNs) is specifically what excluded it: outOfWindow is true when at
+// least one candidate precedes the exec but none fall within the window,
+// distinct from a miss with no preceding candidate at all. Feeds
+// JoinStats.OutOfWindowDropCount (review Important 3 / minors cleanup).
 type launchMatch struct {
-	launch    *GPUKernelLaunch
-	ambiguous bool
+	launch      *GPUKernelLaunch
+	ambiguous   bool
+	outOfWindow bool
 }
 
 // queueKey is the subset of GPUQueueRef the heuristic join actually
@@ -737,7 +745,11 @@ func findLaunchHeuristic(candidates []GPUKernelLaunch, exec GPUKernelExec, windo
 
 	inWindow := insertionPoint - lowerBound
 	if inWindow == 0 {
-		return launchMatch{}
+		// insertionPoint > 0 here (checked above), so at least one candidate
+		// precedes the exec - the window is specifically what excluded all
+		// of them. Distinct from insertionPoint == 0 above (no preceding
+		// candidate existed at all), which is not an out-of-window drop.
+		return launchMatch{outOfWindow: true}
 	}
 	best := candidates[insertionPoint-1]
 	return launchMatch{launch: &best, ambiguous: inWindow > 1}

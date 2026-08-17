@@ -299,30 +299,21 @@ type GPUTimelineEvent struct {
 	Attributes  map[string]string `json:"attributes,omitempty"`
 }
 
-// WorkloadAttribution aggregates GPU activity observed for one
-// container/cgroup over a window, for cost/usage attribution.
-type WorkloadAttribution struct {
-	CgroupID            string         `json:"cgroup_id,omitempty"`
-	PodUID              string         `json:"pod_uid,omitempty"`
-	ContainerID         string         `json:"container_id,omitempty"`
-	ContainerRuntime    string         `json:"container_runtime,omitempty"`
-	FirstSeenNs         uint64         `json:"first_seen_ns,omitempty"`
-	LastSeenNs          uint64         `json:"last_seen_ns,omitempty"`
-	Backends            []GPUBackendID `json:"backends,omitempty"`
-	EventFamilies       []string       `json:"event_families,omitempty"`
-	KernelNames         []string       `json:"kernel_names,omitempty"`
-	LaunchCount         uint64         `json:"launch_count,omitempty"`
-	ExactJoinCount      uint64         `json:"exact_join_count,omitempty"`
-	HeuristicJoinCount  uint64         `json:"heuristic_join_count,omitempty"`
-	ExecutionCount      uint64         `json:"execution_count,omitempty"`
-	ExecutionDurationNs uint64         `json:"execution_duration_ns,omitempty"`
-	SampleWeight        uint64         `json:"sample_weight,omitempty"`
-	EventCount          uint64         `json:"event_count,omitempty"`
-	EventDurationNs     uint64         `json:"event_duration_ns,omitempty"`
-}
-
 // JoinStats reports how well launches, executions and events correlated
 // during a join pass, for diagnosing lossy or ambiguous joins.
+//
+// Minor cleanup (final whole-branch review): this used to also declare
+// HeuristicEventJoinCount and UnmatchedCandidateEventCount, plus a separate
+// WorkloadAttribution type with 11 more fields - all `omitempty`, none ever
+// written anywhere in this package, so a serialized Snapshot with real drops
+// elsewhere would still read as "zero event-join activity" for these,
+// indistinguishable from a producer that genuinely had none. Removed rather
+// than kept as documented-inert: they belong to the launch/event join
+// (Timeline does not join GPUTimelineEvent to launches at all yet - see
+// TimelineConfig.LaunchEventJoinWindowNs, which this phase repurposed for
+// the launch/exec heuristic instead) and to attribution aggregation, neither
+// of which exists yet. Re-add them, with a real writer in the same change,
+// when that work lands.
 type JoinStats struct {
 	LaunchCount                  uint64 `json:"launch_count,omitempty"`
 	MatchedLaunchCount           uint64 `json:"matched_launch_count,omitempty"`
@@ -331,9 +322,15 @@ type JoinStats struct {
 	HeuristicExecutionJoinCount  uint64 `json:"heuristic_execution_join_count,omitempty"`
 	AmbiguousHeuristicMatchCount uint64 `json:"ambiguous_heuristic_match_count,omitempty"`
 	UnmatchedExecutionCount      uint64 `json:"unmatched_execution_count,omitempty"`
-	HeuristicEventJoinCount      uint64 `json:"heuristic_event_join_count,omitempty"`
-	OutOfWindowDropCount         uint64 `json:"out_of_window_drop_count,omitempty"`
-	UnmatchedCandidateEventCount uint64 `json:"unmatched_candidate_event_count,omitempty"`
+	// OutOfWindowDropCount counts heuristic-join misses caused specifically
+	// by LaunchEventJoinWindowNs excluding every candidate that would
+	// otherwise have qualified (i.e. at least one candidate preceded the
+	// exec, but none within the window) - distinct from a miss with no
+	// preceding candidate at all. Became writable once review Important 3
+	// wired the window into findLaunchHeuristic; every occurrence is also
+	// counted in UnmatchedExecutionCount, the same way every heuristic hit
+	// is counted in both HeuristicExecutionJoinCount and MatchedLaunchCount.
+	OutOfWindowDropCount uint64 `json:"out_of_window_drop_count,omitempty"`
 }
 
 // EventSink receives normalized events from a backend. Every method returns an

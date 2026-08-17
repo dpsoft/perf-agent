@@ -836,3 +836,43 @@ func TestTimelinePendingOrphansAgeOutByHorizon(t *testing.T) {
 	assert.False(t, stillPending, "a pending correlation whose latest sample has fallen behind the horizon must be evicted")
 	assert.Greater(t, tl.dropped.EvictedPendingSamples, uint64(0), "the horizon eviction must be counted")
 }
+
+// TestTimelineEventCapacityIsIndependentOfLaunchCacheCapacity is the
+// regression test for review Important 6: every bounded store used to share
+// LaunchCache's capacity, which is wrong for GPUTimelineEvent - spec §7/§12
+// describes that traffic as plausibly 10-100x launch volume. A launch-cache
+// capacity of 4 alongside an explicit EventCapacity of 20 must bound events
+// at 20, not 4; the exec ring (which has no independent dial) must still
+// follow the launch-cache capacity. Mutation this catches: EventCapacity
+// being ignored (events ring built from the launch-cache capacity like
+// execs/modules), which would evict at 4 instead of 20.
+func TestTimelineEventCapacityIsIndependentOfLaunchCacheCapacity(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{
+		LaunchCache:   LaunchCacheConfig{Capacity: 4},
+		EventCapacity: 20,
+	})
+	for i := 0; i < 30; i++ {
+		require.NoError(t, tl.EmitEvent(GPUTimelineEvent{TimeNs: uint64(i)}))
+	}
+	for i := 0; i < 30; i++ {
+		require.NoError(t, tl.EmitExec(execFor(strconv.Itoa(i), uint64(i), uint64(i+1))))
+	}
+
+	snap := tl.Snapshot()
+	assert.Len(t, snap.Events, 20, "events must be bounded by EventCapacity, not the launch-cache capacity")
+	assert.Len(t, snap.Executions, 4, "execs have no independent dial and must still follow the launch-cache capacity")
+}
+
+// TestTimelineEventCapacityDefaultsToLaunchCacheCapacity pins the documented
+// zero-value default: TimelineConfig{} (EventCapacity left unset) must
+// behave exactly as before this field existed, so no existing caller sees a
+// change.
+func TestTimelineEventCapacityDefaultsToLaunchCacheCapacity(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 3}})
+	for i := 0; i < 10; i++ {
+		require.NoError(t, tl.EmitEvent(GPUTimelineEvent{TimeNs: uint64(i)}))
+	}
+
+	snap := tl.Snapshot()
+	assert.Len(t, snap.Events, 3, "with EventCapacity unset, events must default to the launch-cache capacity")
+}

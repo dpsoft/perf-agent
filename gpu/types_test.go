@@ -1,6 +1,8 @@
 package gpu
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -34,16 +36,27 @@ func TestValidateSupportedClockDomainRejectsDeviceClocks(t *testing.T) {
 	assert.Error(t, ValidateSupportedClockDomain(ClockDomainSynced))
 }
 
-func TestPCSamplesAreSeparateFromExecutions(t *testing.T) {
-	// GPUPCSample must not be reachable by widening GPUKernelExec: PC data is
-	// capability-gated and only CUPTI-class backends emit it.
-	s := GPUPCSample{
-		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "7"},
-		Module:      ModuleRef{Backend: BackendCUPTI, CRC: 0xdeadbeef},
-		PCOffset:    0x1a40,
-		StallReason: "long_scoreboard",
-		Count:       3,
+func TestPCSamplingFieldsDoNotWidenExecution(t *testing.T) {
+	// PC data is capability-gated: only backends advertising
+	// CapabilityPCSampling emit it. Keeping it off GPUKernelExec is what stops
+	// every backend paying for CUPTI's richness. Adding any of these fields to
+	// the execution type should fail here.
+	forbidden := []string{"pc", "stall", "module", "cubin", "sass"}
+
+	execType := reflect.TypeOf(GPUKernelExec{})
+	for i := range execType.NumField() {
+		name := strings.ToLower(execType.Field(i).Name)
+		for _, f := range forbidden {
+			assert.NotContains(t, name, f,
+				"GPUKernelExec must not carry PC-sampling fields; that data belongs on GPUPCSample")
+		}
 	}
-	assert.Equal(t, uint64(0x1a40), s.PCOffset)
-	assert.Equal(t, uint64(3), s.Count)
+
+	// And the fields really do live on GPUPCSample.
+	sampleType := reflect.TypeOf(GPUPCSample{})
+	_, hasPC := sampleType.FieldByName("PCOffset")
+	_, hasStall := sampleType.FieldByName("StallReason")
+	_, hasModule := sampleType.FieldByName("Module")
+	assert.True(t, hasPC && hasStall && hasModule,
+		"GPUPCSample must carry the PC, stall reason and module reference")
 }

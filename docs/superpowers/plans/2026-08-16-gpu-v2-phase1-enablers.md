@@ -6,13 +6,13 @@
 
 **Architecture:** Both changes are to existing, shipping code and carry no GPU dependency. Task 1 adds a `Labels` field to `ProfileSample` and folds it into the sample dedup hash, so GPU metadata can live in labels rather than synthetic stack frames. Task 2 extracts the capability set into a testable function and drops `CAP_SYS_ADMIN`, which `CAP_PERFMON` and `CAP_CHECKPOINT_RESTORE` have superseded since kernels 5.8 and 5.9.
 
-**Tech Stack:** Go 1.25, `github.com/google/pprof/profile`, `github.com/cespare/xxhash/v2`, `kernel.org/pub/linux/libs/security/libcap/cap`, testify (`assert` + `require`).
+**Tech Stack:** Go 1.26, `github.com/google/pprof/profile`, `github.com/cespare/xxhash/v2`, `kernel.org/pub/linux/libs/security/libcap/cap`, testify (`assert` + `require`).
 
 **Spec:** `docs/superpowers/specs/2026-08-16-gpu-profiling-v2-design.md` (§8 Output representation, §11 Deployment, §14 Phase 1)
 
 ## Global Constraints
 
-- Go 1.25.0+.
+- Go 1.26.0+ (go.mod declares `go 1.26.0`; CI pins `1.26`).
 - CGO is required to build or test this repo. Every `go test` / `go build` invocation must be prefixed with the environment block in "Build environment" below, or it fails to link blazesym.
 - Output format stays pprof. No new wire format, no OTLP emitter.
 - Capability claims assume kernel ≥ 5.9. The dev host runs 6.19.

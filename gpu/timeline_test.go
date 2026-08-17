@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -515,5 +516,69 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = tl.Snapshot()
+	}
+}
+
+// TestTimelineHeuristicScalesWithSingleQueueSingleKernelName is the
+// complexity regression test for round-3 review. Round 2's fix
+// (BenchmarkTimelineSnapshotAllMisses above) removed the per-miss
+// allocation but left the heuristic's *time* complexity at
+// O(misses x candidates-in-group): grouping candidates by queue alone meant
+// every launch on one queue landed in a single group, and each miss still
+// scanned that whole group linearly. A single queue is not a pathological
+// input - it is what a workload submitting on one stream looks like - and
+// Task 6's BenchmarkSnapshotAtScale (1M launches, capacity 65536) measured
+// this exact shape at ~30s per Snapshot before the binary-search fix in this
+// commit, against a sub-second gate.
+//
+// The four heuristic tests above only check correctness (right launch
+// attached, right Ambiguous flag) and cannot catch this: a
+// reverted-to-linear-scan findLaunchHeuristic still returns the right
+// answer, just slowly, at any scale small enough for those tests to finish
+// in milliseconds either way. This test pins the complexity directly, via a
+// generous wall-clock bound at a scale deliberately too large for a linear
+// scan to hide in: one queue, one kernel name (so every candidate lands in
+// the same group), 50,000 live launches, 10,000 exec misses that all share
+// that one group. That is 5*10^8 candidate comparisons for a linear scan -
+// which this exact setup measured in the tens of seconds against the
+// pre-fix code (see the round-3 report) - versus roughly
+// 10,000 * log2(50,000) ~= 170,000 comparisons for a binary search, which
+// completes in low milliseconds.
+//
+// Mutation this catches: findLaunchHeuristic reverted from sort.Search back
+// to a linear scan over the candidate group (or buildHeuristicCandidateIndex
+// grouping by queue alone again, without kernel name, or without sorting).
+func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
+	const candidates = 50_000
+	const misses = 10_000
+
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: candidates}})
+	for i := 0; i < candidates; i++ {
+		l := launch(strconv.Itoa(i), uint64(i))
+		l.KernelName = "hot_kernel" // every launch shares one (queue, name) group
+		require.NoError(t, tl.EmitLaunch(l))
+	}
+	for i := 0; i < misses; i++ {
+		e := execFor("ghost-"+strconv.Itoa(i), uint64(i), uint64(i))
+		e.KernelName = "hot_kernel" // same group; correlation never matches -> guaranteed exact-match miss
+		require.NoError(t, tl.EmitExec(e))
+	}
+
+	done := make(chan struct{})
+	var elapsed time.Duration
+	go func() {
+		start := time.Now()
+		_ = tl.Snapshot()
+		elapsed = time.Since(start)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.Less(t, elapsed, 5*time.Second,
+			"a single-queue, single-kernel-name workload must not make the heuristic join scan linearly - "+
+				"this exact shape measured tens of seconds before the binary-search fix")
+	case <-time.After(25 * time.Second):
+		t.Fatal("Snapshot did not return within 25s - the heuristic join is scanning its candidate group, not binary-searching it")
 	}
 }

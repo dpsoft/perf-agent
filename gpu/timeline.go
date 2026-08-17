@@ -1,7 +1,10 @@
 package gpu
 
 import (
+	"cmp"
 	"maps"
+	"slices"
+	"sort"
 	"sync"
 )
 
@@ -319,10 +322,14 @@ func (t *Timeline) Snapshot() Snapshot {
 	// The heuristic's candidate set is materialized once per Snapshot call
 	// (not once per miss): LaunchCache.Entries() allocates, and calling it
 	// inside the per-execution loop was exactly the quadratic-with-
-	// allocation behaviour this phase exists to remove. Grouping by queue
-	// also means each miss only scans the launches that could possibly
-	// match its queue, not the whole cache.
-	candidatesByQueue := groupLaunchesByQueue(t.cache.Entries())
+	// allocation behaviour this phase exists to remove. Grouping by (queue,
+	// kernel name) and sorting each group by TimeNs turns each miss into a
+	// binary search - O(log candidates) - instead of a linear scan: a
+	// single-queue, single-kernel-name workload (one submission stream) is
+	// not a pathological input, it is what most workloads look like, and a
+	// linear scan there is still O(misses x candidates) even after the
+	// per-miss allocation was removed.
+	candidateIndex := buildHeuristicCandidateIndex(t.cache.Entries())
 
 	views := make([]ExecutionView, 0, len(execs))
 	stats := JoinStats{LaunchCount: launchCount}
@@ -342,7 +349,8 @@ func (t *Timeline) Snapshot() Snapshot {
 			}
 		}
 
-		if match := findLaunchHeuristic(candidatesByQueue[queueKeyOf(exec.Queue)], exec); match.launch != nil {
+		key := candidateGroupKey{queue: queueKeyOf(exec.Queue), kernelName: exec.KernelName}
+		if match := findLaunchHeuristic(candidateIndex[key], exec); match.launch != nil {
 			view.Launch = match.launch
 			view.Join = JoinHeuristic
 			view.Heuristic = true
@@ -395,62 +403,72 @@ func queueKeyOf(q GPUQueueRef) queueKey {
 	return queueKey{backend: q.Backend, queueID: q.QueueID}
 }
 
-// groupLaunchesByQueue indexes entries by queueKey once, so Snapshot's
-// per-execution heuristic lookup is a map access plus a scan of only that
-// queue's candidates, not a scan of the entire cache per miss.
-func groupLaunchesByQueue(entries []GPUKernelLaunch) map[queueKey][]GPUKernelLaunch {
-	out := make(map[queueKey][]GPUKernelLaunch, len(entries))
+// candidateGroupKey is the exact equivalence launchKernelNamesCompatible
+// defines (queue match plus kernel-name equality) turned into a map key.
+// Grouping candidates by this key and looking a miss up by its own
+// (queue, kernel name) is equivalent to scanning every candidate and
+// filtering with launchKernelNamesCompatible - PROVIDED that function stays
+// pure string equality on KernelName, which is what it is today (see its
+// doc comment: the one case it might have needed to be looser, the AMD/HIP
+// fallback, was deliberately left unported). If a future backend reintroduces
+// that fallback, this key must change - grouping by queue alone and
+// filtering the qualifying (binary-searched) prefix by name would be the
+// fallback design, at the cost of an O(prefix) scan per miss instead of
+// O(log candidates).
+type candidateGroupKey struct {
+	queue      queueKey
+	kernelName string
+}
+
+// buildHeuristicCandidateIndex groups cache entries by candidateGroupKey and
+// sorts each group by TimeNs ascending, once per Snapshot call. This is what
+// turns each miss's lookup into a binary search (findLaunchHeuristic) rather
+// than a linear scan: grouping alone (this function's predecessor,
+// groupLaunchesByQueue) removed the per-miss allocation but left an all-miss
+// Snapshot at O(misses x candidates-in-queue) - fine for a multi-queue
+// workload, but a single submission stream puts every launch in one group,
+// and a linear scan of that group per miss is the same quadratic shape this
+// phase exists to remove, just without the allocation on top.
+func buildHeuristicCandidateIndex(entries []GPUKernelLaunch) map[candidateGroupKey][]GPUKernelLaunch {
+	byGroup := make(map[candidateGroupKey][]GPUKernelLaunch, len(entries))
 	for _, l := range entries {
-		k := queueKeyOf(l.Queue)
-		out[k] = append(out[k], l)
+		k := candidateGroupKey{queue: queueKeyOf(l.Queue), kernelName: l.KernelName}
+		byGroup[k] = append(byGroup[k], l)
 	}
-	return out
+	for _, group := range byGroup {
+		// Sorts in place: group's backing array is the same one stored in
+		// byGroup, so no re-assignment into the map is needed.
+		slices.SortFunc(group, func(a, b GPUKernelLaunch) int {
+			return cmp.Compare(a.TimeNs, b.TimeNs)
+		})
+	}
+	return byGroup
 }
 
 // findLaunchHeuristic is the fallback path when an exec's Correlation misses
-// the cache (never arrived, or aged out). Ported from the prototype's
-// findLaunchHeuristic: a kernel-name match and a launch that precedes the
-// exec's start - picking the most recent such launch as best, and flagging
-// Ambiguous when more than one candidate qualified. candidates is expected
-// to already be filtered to the exec's queue (see groupLaunchesByQueue);
-// this function no longer does that filtering itself.
+// the cache (never arrived, or aged out). Ported decision from the
+// prototype's findLaunchHeuristic: a launch that precedes the exec's start,
+// preferring the most recent such launch, and flagging Ambiguous when more
+// than one candidate qualified.
+//
+// candidates must already be filtered to the exec's exact (queue, kernel
+// name) group (see buildHeuristicCandidateIndex) and sorted by TimeNs
+// ascending. Because the group is already filtered, every entry satisfies
+// the queue/name half of the original filter; sort.Search finds the
+// insertion point of exec.StartNs - the count of entries with
+// TimeNs <= StartNs, which is simultaneously the ambiguity count (>1 means
+// more than one qualifying candidate) and locates the best candidate
+// (immediately before the insertion point, i.e. the most recent one that
+// still precedes the exec) in O(log n) instead of an O(n) scan.
 func findLaunchHeuristic(candidates []GPUKernelLaunch, exec GPUKernelExec) launchMatch {
-	var best *GPUKernelLaunch
-	var candidateCount int
-	for _, l := range candidates {
-		if !launchKernelNamesCompatible(l, exec) {
-			continue
-		}
-		if l.TimeNs > exec.StartNs {
-			continue
-		}
-		candidateCount++
-		if best == nil || l.TimeNs > best.TimeNs {
-			candidate := l
-			best = &candidate
-		}
-	}
-	if best == nil {
+	insertionPoint := sort.Search(len(candidates), func(i int) bool {
+		return candidates[i].TimeNs > exec.StartNs
+	})
+	if insertionPoint == 0 {
 		return launchMatch{}
 	}
-	return launchMatch{launch: best, ambiguous: candidateCount > 1}
-}
-
-// launchKernelNamesCompatible decides whether launch could plausibly be the
-// origin of exec, for the heuristic join's candidate filter.
-//
-// The prototype this is ported from also accepted a HIP launch's synthetic
-// "hip_kernel@..." name for any AMD exec reported under a separate
-// execution-side backend id (BackendAMDSample), gated on the launch's CPU
-// stack showing a HIP entrypoint. That launch-side/exec-side backend split
-// doesn't exist in this model (only BackendHIP, used on both sides), so
-// nothing on the exec side can distinguish "same backend, different name"
-// from "different kernel" - porting the special case as-is would accept any
-// HIP launch for any exec, looser than the original rule. Left out rather
-// than ported incorrectly; exact kernel-name match is the only rule here
-// until a future backend reintroduces that split.
-func launchKernelNamesCompatible(launch GPUKernelLaunch, exec GPUKernelExec) bool {
-	return launch.KernelName == exec.KernelName
+	best := candidates[insertionPoint-1]
+	return launchMatch{launch: &best, ambiguous: insertionPoint > 1}
 }
 
 // ring is a fixed-capacity FIFO: push is O(1) amortized (no shifting), and

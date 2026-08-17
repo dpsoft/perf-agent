@@ -188,8 +188,31 @@ Requirements:
 
 Authoring the probes requires `systemtap-sdt-devel` (`sys/sdt.h`), or emitting
 `.note.stapsdt` notes via inline asm to avoid the build dependency entirely.
-Neither is installed on the lab box; the choice belongs in Phase 3 on its
-merits.
+
+**Both routes are verified working on the lab box.** `systemtap-sdt-devel`
+(5.5-1.fc44) *is* installed — an earlier note in this spec claiming otherwise
+was wrong. A probe built with `DTRACE_PROBE1` compiles and `readelf -n` shows a
+valid `NT_STAPSDT` note carrying provider, name, location and argument
+descriptor. The inline-asm route compiles equally cleanly with no systemtap
+dependency and produces a note a consumer reads identically.
+
+Two findings that bear on Phase 3's choice between them:
+
+- The systemtap header emitted exactly one probe per call site. The hand-rolled
+  inline-asm version emitted the same probe **twice** — once inlined into the
+  caller and once standalone — because nothing stopped the compiler duplicating
+  the call site. A hand-rolled macro must account for inlining; the header
+  already does.
+- A plain `DTRACE_PROBE1` reports `Semaphore: 0x0`. §6's replay-on-late-attach
+  requirement depends on semaphore-count tracking to detect when a consumer
+  attaches, so the shim must use the semaphore-carrying variant
+  (`DTRACE_PROBE_ENABLED` guarding the fire) rather than the bare probe.
+  Getting this wrong is silent: the probe still works, and late attachment
+  simply never replays.
+
+On that evidence the systemtap header is the better default, and the inline-asm
+route stays a proven fallback rather than a hypothetical one — so the build
+dependency is not load-bearing.
 
 ## 7. Canonical event model
 

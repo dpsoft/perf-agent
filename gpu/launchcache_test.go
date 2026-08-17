@@ -2,6 +2,7 @@ package gpu
 
 import (
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -78,4 +79,73 @@ func TestLaunchCacheReplacesDuplicateCorrelation(t *testing.T) {
 	assert.Equal(t, uint64(20), got.TimeNs, "a repeated correlation ID must take the newer launch")
 	assert.Equal(t, 1, c.Stats().Live, "a replacement must not grow the cache")
 	assert.Equal(t, uint64(1), c.Stats().Replaced)
+}
+
+func TestLaunchCacheRefreshSurvivesCapacityEviction(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 2})
+	c.Put(launch("a", 10))
+	c.Put(launch("b", 20))
+	c.Put(launch("a", 30)) // refresh: 'a' is now the newest entry
+	c.Put(launch("c", 40)) // forces one capacity eviction
+
+	_, ok := c.Get(CorrelationID{Backend: BackendCUPTI, Value: "a"})
+	assert.True(t, ok, "a refreshed entry must not be evicted ahead of an older untouched one")
+	_, ok = c.Get(CorrelationID{Backend: BackendCUPTI, Value: "b"})
+	assert.False(t, ok, "the older untouched entry must be evicted first")
+	_, ok = c.Get(CorrelationID{Backend: BackendCUPTI, Value: "c"})
+	assert.True(t, ok)
+}
+
+func TestLaunchCacheAnomalousTimestampDoesNotWipeCache(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1000, HorizonNs: 1000, MaxAdvanceNs: 1000})
+	for i := 0; i < 10; i++ {
+		c.Put(launch(strconv.Itoa(i), uint64(i)))
+	}
+	require.Equal(t, 10, c.Stats().Live)
+
+	c.Put(launch("anomaly", 1<<62))
+
+	assert.Equal(t, 11, c.Stats().Live, "an anomalous timestamp must not evict previously-live entries")
+	assert.Equal(t, uint64(1), c.Stats().AnomalousTimestamp)
+	assert.Equal(t, uint64(0), c.Stats().EvictedHorizon, "the anomaly must not trigger horizon eviction of untouched entries")
+}
+
+// TestLaunchCacheConcurrentPutGetIsRaceFree exercises the cache's actual
+// concurrency contract: producer goroutines calling Put while readers call
+// Get/Stats/Len at snapshot time. Earlier race-detector runs only
+// re-executed single-goroutine tests, which proves nothing about concurrent
+// access. Run with -race; that is the assertion that matters here.
+func TestLaunchCacheConcurrentPutGetIsRaceFree(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 256, HorizonNs: 0})
+
+	const writers = 4
+	const readers = 4
+	const opsPerGoroutine = 3000
+
+	var wg sync.WaitGroup
+	wg.Add(writers + readers)
+
+	for w := 0; w < writers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				id := strconv.Itoa(w) + "-" + strconv.Itoa(i)
+				c.Put(launch(id, uint64(i+1)))
+			}
+		}(w)
+	}
+	for r := 0; r < readers; r++ {
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				id := strconv.Itoa(r%writers) + "-" + strconv.Itoa(i)
+				c.Get(CorrelationID{Backend: BackendCUPTI, Value: id})
+				_ = c.Stats()
+				_ = c.Len()
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	assert.LessOrEqual(t, c.Len(), 256, "cache must stay bounded under concurrent load")
 }

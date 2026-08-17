@@ -266,6 +266,7 @@ Create `gpu/launchcache_test.go`:
 package gpu
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -324,7 +325,9 @@ func TestLaunchCacheEvictsBeyondHorizon(t *testing.T) {
 func TestLaunchCacheMemoryIsBounded(t *testing.T) {
 	c := NewLaunchCache(LaunchCacheConfig{Capacity: 16})
 	for i := 0; i < 100000; i++ {
-		c.Put(launch(string(rune('a'+i%26))+string(rune('a'+i/26%26))+string(rune(i)), uint64(i)))
+		// Unique correlation per launch: a repeated ID would exercise
+		// replacement rather than the capacity bound this test exists for.
+		c.Put(launch(strconv.Itoa(i), uint64(i)))
 	}
 	assert.LessOrEqual(t, c.Len(), 16, "cache must stay bounded under sustained load")
 	assert.Greater(t, c.Stats().EvictedCapacity, uint64(0), "evictions must be counted, not silent")
@@ -807,6 +810,7 @@ Create `gpu/timeline_test.go`:
 package gpu
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -879,9 +883,13 @@ func TestTimelineDegradesWhenLaunchEvicted(t *testing.T) {
 func TestTimelineSnapshotIsBoundedUnderLoad(t *testing.T) {
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 64}})
 	for i := 0; i < 50000; i++ {
-		require.NoError(t, tl.EmitLaunch(launch("x", uint64(i))))
+		// Unique correlation per launch. Reusing one ID would make every Put a
+		// replacement, leaving Live at 1 and passing this assertion vacuously.
+		require.NoError(t, tl.EmitLaunch(launch(strconv.Itoa(i), uint64(i))))
 	}
-	assert.LessOrEqual(t, tl.Snapshot().LaunchCache.Live, 64)
+	snap := tl.Snapshot()
+	assert.Equal(t, 64, snap.LaunchCache.Live, "cache must fill to capacity and hold there")
+	assert.Greater(t, snap.LaunchCache.EvictedCapacity, uint64(0), "evictions must be counted")
 }
 ```
 
@@ -1142,9 +1150,14 @@ Add to `gpu/conformance_test.go`:
 func BenchmarkSnapshotAtScale(b *testing.B) {
 	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 65536}})
 	for i := 0; i < 1_000_000; i++ {
-		_ = tl.EmitLaunch(launch("x", uint64(i)))
+		// Every launch gets its own correlation ID. Reusing one would mean the
+		// cache holds a single entry for the whole run, and this benchmark
+		// would report a fast snapshot precisely because the structure under
+		// test was empty - the phase gate would pass while measuring nothing.
+		id := strconv.Itoa(i)
+		_ = tl.EmitLaunch(launch(id, uint64(i)))
 		if i%4 == 0 {
-			_ = tl.EmitExec(execFor("x", uint64(i), uint64(i+10)))
+			_ = tl.EmitExec(execFor(id, uint64(i), uint64(i+10)))
 		}
 	}
 	b.ResetTimer()

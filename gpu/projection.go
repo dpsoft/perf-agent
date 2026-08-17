@@ -26,7 +26,7 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 		if len(view.PCSamples) == 0 {
 			samples = append(samples, pp.ProfileSample{
 				Pid:         pid,
-				SampleType:  pp.SampleTypeCpu,
+				SampleType:  pp.SampleTypeGpu,
 				Aggregation: pp.SampleAggregated,
 				Stack:       frames,
 				Value:       executionWeight(view.Exec),
@@ -35,7 +35,8 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 			continue
 		}
 
-		for _, pcs := range view.PCSamples {
+		weights := distributeExecutionWeight(executionWeight(view.Exec), view.PCSamples)
+		for i, pcs := range view.PCSamples {
 			labels := maps.Clone(common)
 			if labels == nil {
 				labels = make(map[string]string, 2)
@@ -47,10 +48,10 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 
 			samples = append(samples, pp.ProfileSample{
 				Pid:         pid,
-				SampleType:  pp.SampleTypeCpu,
+				SampleType:  pp.SampleTypeGpu,
 				Aggregation: pp.SampleAggregated,
 				Stack:       frames,
-				Value:       pcSampleWeight(pcs),
+				Value:       weights[i],
 				Labels:      labels,
 			})
 		}
@@ -113,6 +114,21 @@ func projectionPID(view ExecutionView) uint32 {
 // honestly (present-if-nonzero, exactly as for an exact join) rather than
 // borrowing the launch's Correlation and presenting an inference as an
 // observation.
+//
+// gpu_join and gpu_ambiguous are the review Critical 1 fix: ExecutionView
+// already carried Join/Heuristic/Ambiguous, but nothing ever read them on
+// the way to a pprof sample, so a heuristic join (a guess) and an exact join
+// (vendor-provided truth) were indistinguishable in the output - including
+// the launch's Tags (pod_uid/container_id), which a heuristic join can
+// attach to the wrong container. gpu_join is set unconditionally (not
+// omitempty, no "only if non-default" branch) to exactly "exact",
+// "heuristic" or "unmatched": an ABSENT label must never be readable as
+// "exact" by a consumer that doesn't know to check for its absence.
+// gpu_ambiguous is set (to "true") only when view.Ambiguous, since false is
+// the overwhelmingly common case and the presence check on the exact/
+// unmatched paths is unambiguous either way. Like every other gpu_* label,
+// both are set after the Tags copy so a producer-supplied tag can never
+// forge them.
 func projectionLabels(view ExecutionView) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {
@@ -127,6 +143,17 @@ func projectionLabels(view ExecutionView) map[string]string {
 	if view.Exec.Correlation.Value != "" {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
 	}
+	switch view.Join {
+	case JoinExact:
+		labels["gpu_join"] = "exact"
+	case JoinHeuristic:
+		labels["gpu_join"] = "heuristic"
+	default:
+		labels["gpu_join"] = "unmatched"
+	}
+	if view.Ambiguous {
+		labels["gpu_ambiguous"] = "true"
+	}
 	return labels
 }
 
@@ -140,11 +167,50 @@ func executionWeight(exec GPUKernelExec) uint64 {
 	return exec.EndNs - exec.StartNs
 }
 
-// pcSampleWeight is a PC sample's own weight: its aggregated Count, floored
-// at 1 for the same reason as executionWeight.
-func pcSampleWeight(pcs GPUPCSample) uint64 {
-	if pcs.Count < 1 {
-		return 1
+// distributeExecutionWeight is the review Critical 4 fix, part 2: a PC
+// sample's weight used to be its own aggregated Count, fed into the same
+// value dimension (SampleTypeCpu, nanoseconds-by-convention-but-not-really)
+// as executionWeight's nanosecond duration. That mixed counts and
+// nanoseconds in one field, and - independent of that - meant a kernel's
+// total attributed time was its sample count, not its actual duration: a
+// kernel sampled once for a count of 1 attributed 1ns; the same kernel
+// running for 70us but never sampled attributed 70000ns via the no-PC-
+// samples branch above. Two unrelated numbers, both mislabeled as the same
+// unit.
+//
+// The fix: PC samples no longer get their own independent weight. Instead
+// execWeight - the execution's real duration in nanoseconds, exactly what
+// executionWeight returns - is split across pcs proportionally by each
+// sample's Count, so the parts sum to the whole: a kernel's total attributed
+// time equals its actual duration regardless of how many PC samples it
+// received or how their counts are distributed. Integer division leaves a
+// remainder (up to len(pcs)-1 nanoseconds); rather than let it vanish, it is
+// added to the last sample's weight so sum(weights) == execWeight exactly.
+func distributeExecutionWeight(execWeight uint64, pcs []GPUPCSample) []uint64 {
+	weights := make([]uint64, len(pcs))
+	if len(pcs) == 0 {
+		return weights
 	}
-	return pcs.Count
+
+	counts := make([]uint64, len(pcs))
+	var totalCount uint64
+	for i, s := range pcs {
+		c := s.Count
+		if c < 1 {
+			c = 1
+		}
+		counts[i] = c
+		totalCount += c
+	}
+
+	var distributed uint64
+	for i, c := range counts {
+		w := execWeight * c / totalCount
+		weights[i] = w
+		distributed += w
+	}
+	if distributed < execWeight {
+		weights[len(weights)-1] += execWeight - distributed
+	}
+	return weights
 }

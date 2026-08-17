@@ -85,11 +85,39 @@ func projectionPID(view ExecutionView) uint32 {
 }
 
 // projectionLabels builds the labels shared by every sample projected from
-// one execution: queue, device, correlation, and the launch's tags (pod/
-// container/cgroup). Per-PC-sample labels (gpu_stall, gpu_pc) are layered on
-// top of a clone of this map by the caller.
+// one execution: the launch's tags (pod/container/cgroup) plus queue, device
+// and correlation. Per-PC-sample labels (gpu_stall, gpu_pc) are layered on
+// top of a clone of this map by the caller, after this function returns -
+// see the reserved-name note below for why that ordering matters there too.
+//
+// Tags are copied in FIRST, and every gpu_* reserved label is set AFTER that
+// copy, deliberately: Tags are producer-supplied (a launch's Tags come from
+// CLI --tag flags and cgroup/k8s attribution, both attacker/operator
+// controlled) while the gpu_* names carry facts this package itself derived
+// from the joined execution and PC sample. A tag literally named "gpu_queue"
+// or "gpu_correlation" must not be able to overwrite - and thereby forge -
+// the real profiler-derived value; reserved names always win. gpu_stall and
+// gpu_pc get the same protection by virtue of being set in ProjectExecutions
+// after this function's map is cloned, i.e. also strictly after Tags.
+//
+// gpu_correlation is built from view.Exec.Correlation - the execution's own,
+// vendor-reported correlation - not from the joined launch's Correlation.
+// For an exact join the two are identical by construction (that's how the
+// join found the launch), so it makes no observable difference. For a
+// heuristic join, though, Exec.Correlation may be empty or may not equal the
+// joined launch's Correlation: the exec's own correlation, if any, simply
+// didn't match anything in the cache, which is why the heuristic path ran at
+// all. This label reports what was actually observed on the execution, not
+// what was inferred by the join; a heuristic match has no vendor-provided
+// correlation for this execution to report, so the label reflects that
+// honestly (present-if-nonzero, exactly as for an exact join) rather than
+// borrowing the launch's Correlation and presenting an inference as an
+// observation.
 func projectionLabels(view ExecutionView) map[string]string {
 	labels := make(map[string]string)
+	if view.Launch != nil {
+		maps.Copy(labels, view.Launch.Launch.Tags)
+	}
 	if view.Exec.Queue.QueueID != "" {
 		labels["gpu_queue"] = view.Exec.Queue.QueueID
 	}
@@ -98,9 +126,6 @@ func projectionLabels(view ExecutionView) map[string]string {
 	}
 	if view.Exec.Correlation.Value != "" {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
-	}
-	if view.Launch != nil {
-		maps.Copy(labels, view.Launch.Launch.Tags)
 	}
 	return labels
 }

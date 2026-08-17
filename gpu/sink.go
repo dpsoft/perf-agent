@@ -33,10 +33,41 @@ type SinkStats struct {
 	DroppedDownstream uint64 `json:"dropped_downstream,omitempty"`
 }
 
+// eventClass groups EventSink methods by admission priority - review
+// Important 5. A single, undifferentiated token bucket meant launches and
+// modules (the correlation anchors every later exec/PC-sample join depends
+// on) were dropped exactly as readily as the much higher-volume exec/
+// sample/event traffic under overload. Per review Critical 2, a dropped
+// launch turns every subsequent exec referencing it into a permanent miss -
+// so losing an anchor is structurally more expensive than losing one data
+// point, and admission must reflect that rather than treat all five event
+// kinds as fungible.
+type eventClass int
+
+const (
+	// classAnchor is EmitLaunch/EmitModule: correlation anchors that later
+	// exact and heuristic joins depend on. Given its own token bucket so
+	// exec/sample/event volume can never starve it.
+	classAnchor eventClass = iota
+	// classData is EmitExec/EmitPCSample/EmitEvent: everything joined
+	// against an anchor rather than being one itself.
+	classData
+)
+
+// tokenBucket is one admission budget: burst is the maximum admitted at
+// once, refilled continuously at the CountingSink's shared refillRate.
+// unbounded means no admission limit is ever applied (capacity <= 0).
+type tokenBucket struct {
+	unbounded bool
+	burst     float64
+	tokens    float64
+}
+
 // CountingSink wraps a sink with admission control and accounting. Admission
-// is a token bucket: burst is the maximum number of events admitted at once,
-// refilled continuously at refillRate tokens/second. capacity <= 0 means
-// unbounded - no admission limit is ever applied.
+// is a token bucket per eventClass (see its doc comment): burst is the
+// maximum number of events of that class admitted at once, refilled
+// continuously at refillRate tokens/second. capacity <= 0 means unbounded -
+// no admission limit is ever applied, for either class.
 //
 // A lifetime budget that only ever decreases would be wrong for a
 // continuously-running profiler: once spent it would reject forever. The
@@ -45,10 +76,10 @@ type CountingSink struct {
 	mu    sync.Mutex
 	inner EventSink
 
-	unbounded  bool
-	burst      float64
-	tokens     float64
-	refillRate float64 // tokens per second
+	anchor tokenBucket
+	data   tokenBucket
+
+	refillRate float64 // tokens per second, shared by both buckets
 	lastRefill time.Time
 	now        func() time.Time
 
@@ -78,6 +109,12 @@ func NewCountingSink(inner EventSink, capacity int) *CountingSink {
 // second) and clock made explicit, for callers that need a different
 // steady-state rate or deterministic tests. now defaults to time.Now when
 // nil. capacity <= 0 means unbounded, independent of refillPerSecond.
+// NewCountingSinkWithRate gives each eventClass (see its doc comment) its
+// own independent token bucket, each sized at capacity/refillPerSecond -
+// review Important 5. This is deliberately not capacity split across the
+// two classes: launches/modules must never be crowded out by exec/sample/
+// event volume, so the anchor class needs its own full, untouched budget
+// regardless of how saturated the data class is.
 func NewCountingSinkWithRate(inner EventSink, capacity int, refillPerSecond float64, now func() time.Time) *CountingSink {
 	if now == nil {
 		now = time.Now
@@ -91,10 +128,11 @@ func NewCountingSinkWithRate(inner EventSink, capacity int, refillPerSecond floa
 	if capacity <= 0 {
 		// Explicit rather than relying on a ">0" guard at every call site,
 		// so the unbounded case can't silently diverge if the guard changes.
-		s.unbounded = true
+		s.anchor.unbounded = true
+		s.data.unbounded = true
 	} else {
-		s.burst = float64(capacity)
-		s.tokens = float64(capacity)
+		s.anchor.burst, s.anchor.tokens = float64(capacity), float64(capacity)
+		s.data.burst, s.data.tokens = float64(capacity), float64(capacity)
 	}
 	return s
 }
@@ -105,67 +143,84 @@ func (s *CountingSink) Stats() SinkStats {
 	return s.stats
 }
 
-// refill adds tokens for elapsed time since the last refill, capped at
-// burst. Caller holds mu.
-func (s *CountingSink) refill() {
-	if s.unbounded {
-		return
+// bucketFor returns the token bucket for class. Caller holds mu.
+func (s *CountingSink) bucketFor(class eventClass) *tokenBucket {
+	if class == classAnchor {
+		return &s.anchor
 	}
+	return &s.data
+}
+
+// refill adds tokens for elapsed time since the last refill to both buckets,
+// each capped at its own burst. Both buckets refill from the same shared
+// refillRate and share one lastRefill clock reading (a single elapsed
+// duration applied to both), so neither class's replenishment rate depends
+// on the other's admission traffic. Caller holds mu.
+func (s *CountingSink) refill() {
 	now := s.now()
 	elapsed := now.Sub(s.lastRefill)
 	if elapsed <= 0 {
 		return
 	}
 	s.lastRefill = now
-	s.tokens += elapsed.Seconds() * s.refillRate
-	if s.tokens > s.burst {
-		s.tokens = s.burst
+	add := elapsed.Seconds() * s.refillRate
+	for _, b := range []*tokenBucket{&s.anchor, &s.data} {
+		if b.unbounded {
+			continue
+		}
+		b.tokens += add
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
 	}
 }
 
-// admitCapacity applies the token-bucket bound only - the one rule EmitModule
-// shares with every other event type. On success it has reserved one token;
-// call release if the reservation turns out not to be used. Caller holds mu.
-func (s *CountingSink) admitCapacity() error {
-	if s.unbounded {
+// admitCapacity applies class's own token-bucket bound - the one rule
+// EmitModule shares with every other event type. On success it has reserved
+// one token from class's bucket; call release(class) if the reservation
+// turns out not to be used. Caller holds mu.
+func (s *CountingSink) admitCapacity(class eventClass) error {
+	b := s.bucketFor(class)
+	if b.unbounded {
 		return nil
 	}
 	s.refill()
-	if s.tokens < 1 {
+	if b.tokens < 1 {
 		s.stats.DroppedFull++
 		return ErrSinkFull
 	}
-	s.tokens--
+	b.tokens--
 	return nil
 }
 
-// release returns a reserved token after inner fails to accept a delegated
-// event, so a downstream rejection does not permanently shrink capacity.
-// Caller holds mu.
-func (s *CountingSink) release() {
-	if s.unbounded {
+// release returns a reserved token to class's bucket after inner fails to
+// accept a delegated event, so a downstream rejection does not permanently
+// shrink that class's capacity. Caller holds mu.
+func (s *CountingSink) release(class eventClass) {
+	b := s.bucketFor(class)
+	if b.unbounded {
 		return
 	}
-	s.tokens++
-	if s.tokens > s.burst {
-		s.tokens = s.burst
+	b.tokens++
+	if b.tokens > b.burst {
+		b.tokens = b.burst
 	}
 }
 
-// admit applies the clock-domain contract, then the capacity bound. Caller
-// holds mu. EmitModule bypasses this and calls admitCapacity directly: a
-// GPUModule has no ClockDomain field to validate.
-func (s *CountingSink) admit(domain ClockDomain) error {
+// admit applies the clock-domain contract, then class's capacity bound.
+// Caller holds mu. EmitModule bypasses this and calls admitCapacity
+// directly: a GPUModule has no ClockDomain field to validate.
+func (s *CountingSink) admit(class eventClass, domain ClockDomain) error {
 	if err := ValidateSupportedClockDomain(domain); err != nil {
 		s.stats.DroppedInvalid++
 		return fmt.Errorf("gpu: rejected event: %w", err)
 	}
-	return s.admitCapacity()
+	return s.admitCapacity(class)
 }
 
 func (s *CountingSink) EmitLaunch(l GPUKernelLaunch) error {
 	s.mu.Lock()
-	if err := s.admit(l.ClockDomain); err != nil {
+	if err := s.admit(classAnchor, l.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -176,7 +231,7 @@ func (s *CountingSink) EmitLaunch(l GPUKernelLaunch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.release()
+		s.release(classAnchor)
 		s.stats.DroppedDownstream++
 		return err
 	}
@@ -186,7 +241,7 @@ func (s *CountingSink) EmitLaunch(l GPUKernelLaunch) error {
 
 func (s *CountingSink) EmitExec(e GPUKernelExec) error {
 	s.mu.Lock()
-	if err := s.admit(e.ClockDomain); err != nil {
+	if err := s.admit(classData, e.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -197,7 +252,7 @@ func (s *CountingSink) EmitExec(e GPUKernelExec) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.release()
+		s.release(classData)
 		s.stats.DroppedDownstream++
 		return err
 	}
@@ -207,7 +262,7 @@ func (s *CountingSink) EmitExec(e GPUKernelExec) error {
 
 func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 	s.mu.Lock()
-	if err := s.admit(p.ClockDomain); err != nil {
+	if err := s.admit(classData, p.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -218,7 +273,7 @@ func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.release()
+		s.release(classData)
 		s.stats.DroppedDownstream++
 		return err
 	}
@@ -228,11 +283,13 @@ func (s *CountingSink) EmitPCSample(p GPUPCSample) error {
 
 // EmitModule deliberately skips the clock-domain check: GPUModule is
 // symbolization metadata with no ClockDomain field. It still goes through
-// the same token-bucket admission (admitCapacity) and the same
-// reserve/delegate/settle sequence as every other event type.
+// the same token-bucket admission (admitCapacity, classAnchor - modules are
+// correlation anchors for symbolization the same way launches are for
+// execs) and the same reserve/delegate/settle sequence as every other event
+// type.
 func (s *CountingSink) EmitModule(m GPUModule) error {
 	s.mu.Lock()
-	if err := s.admitCapacity(); err != nil {
+	if err := s.admitCapacity(classAnchor); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -243,7 +300,7 @@ func (s *CountingSink) EmitModule(m GPUModule) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.release()
+		s.release(classAnchor)
 		s.stats.DroppedDownstream++
 		return err
 	}
@@ -253,7 +310,7 @@ func (s *CountingSink) EmitModule(m GPUModule) error {
 
 func (s *CountingSink) EmitEvent(e GPUTimelineEvent) error {
 	s.mu.Lock()
-	if err := s.admit(e.ClockDomain); err != nil {
+	if err := s.admit(classData, e.ClockDomain); err != nil {
 		s.mu.Unlock()
 		return err
 	}
@@ -264,7 +321,7 @@ func (s *CountingSink) EmitEvent(e GPUTimelineEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.release()
+		s.release(classData)
 		s.stats.DroppedDownstream++
 		return err
 	}

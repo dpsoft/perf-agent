@@ -263,3 +263,39 @@ func TestCountingSinkConcurrentEmitAndStats(t *testing.T) {
 	assert.Equal(t, int64(n), inner.launches.Load())
 	assert.Equal(t, uint64(n), s.Stats().Launches)
 }
+
+// TestCountingSinkAnchorClassSurvivesDataOverload is the regression test for
+// review Important 5: a single, undifferentiated token bucket meant a flood
+// of PC samples (high-volume, per spec §7/§12 plausibly the bulk of GPU
+// event traffic) could exhaust the sink's entire admission budget, dropping
+// launches exactly as readily as samples. Per review Critical 2, a dropped
+// launch turns every subsequent exec referencing it into a permanent
+// unattributed miss - losing an anchor is categorically worse than losing
+// one data point, so anchors (launches, modules) must have their own budget
+// that data-class volume can never touch.
+//
+// capacity 2 (2 tokens for classAnchor's bucket): exhaust the *data* class
+// with PC samples first, then confirm launches still admit normally.
+// Mutation this catches: reverting to one shared token bucket for every
+// event kind - the launch below would then fail with ErrSinkFull because
+// the PC-sample flood already spent the shared budget.
+func TestCountingSinkAnchorClassSurvivesDataOverload(t *testing.T) {
+	s := NewCountingSink(&recordingSink{}, 2)
+
+	// Flood and exhaust the data class - well past its own capacity, to be
+	// sure it is genuinely spent.
+	for i := 0; i < 10; i++ {
+		_ = s.EmitPCSample(GPUPCSample{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "x"}, TimeNs: uint64(i)})
+	}
+	dataExhausted := s.EmitExec(GPUKernelExec{Correlation: CorrelationID{Backend: BackendCUPTI, Value: "y"}})
+	require.Error(t, dataExhausted, "sanity: the data class must actually be exhausted by the flood above")
+	assert.True(t, errors.Is(dataExhausted, ErrSinkFull))
+
+	// Anchors must be completely unaffected: both of classAnchor's tokens
+	// are still available.
+	require.NoError(t, s.EmitLaunch(launch("a", 10)), "a launch must not be dropped because data-class volume exhausted its own bucket")
+	require.NoError(t, s.EmitModule(GPUModule{Ref: ModuleRef{CRC: 1}, LoadedNs: 10}))
+
+	assert.Equal(t, uint64(1), s.Stats().Launches)
+	assert.Equal(t, uint64(1), s.Stats().Modules)
+}

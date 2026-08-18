@@ -292,12 +292,37 @@ func (a *Agent) Start(ctx context.Context) error {
 		return errors.New("agent already started")
 	}
 
-	// Set capabilities:
-	//   CAP_SYS_ADMIN          - perf_event_open with pid=-1 (system-wide perf events)
+	// Capabilities raised to Effective. The set is deliberately the historical
+	// superset so that pre-5.8 kernels keep working:
+	//
 	//   CAP_BPF                - load eBPF programs and create maps
 	//   CAP_PERFMON            - perf_event_open, stack traces, tracing attachment
 	//   CAP_SYS_PTRACE         - read /proc/<pid>/maps and /proc/<pid>/mem of other processes
 	//   CAP_CHECKPOINT_RESTORE - follow /proc/<pid>/map_files/ symlinks (blazesym symbolization)
+	//   CAP_SYS_ADMIN          - only needed on kernels older than 5.8/5.9; see below
+	//
+	// CAP_SYS_ADMIN is retained for backward compatibility, not because current
+	// kernels need it. Two capabilities were introduced to carve out its roles,
+	// but they did not arrive together:
+	//
+	//   - CAP_PERFMON (5.8) covers perf_event_open, including pid=-1 for
+	//     system-wide profiling.
+	//   - CAP_CHECKPOINT_RESTORE (5.9) covers /proc/<pid>/map_files.
+	//
+	// That one-version gap is the whole reason this is still here. The project
+	// documents a floor of kernel 5.8, and on exactly 5.8 CAP_CHECKPOINT_RESTORE
+	// does not exist, so dropping CAP_SYS_ADMIN would break symbolization there.
+	//
+	// On kernel >= 5.9 the minimal working set is:
+	//
+	//   cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep
+	//
+	// Dropping CAP_SYS_ADMIN matters for per-pod and sidecar deployments, where
+	// it is the near-root capability that gets a workload rejected. The condition
+	// is not "wait for newer kernels" - deployments already target 6.x. It is:
+	// raise the documented floor from 5.8 to 5.9+, then verify the minimal set
+	// for both --pid and -a runs (-a is the one that exercises
+	// perf_event_open(pid=-1)), then drop it here.
 	caps := cap.GetProc()
 	if err := caps.SetFlag(cap.Effective, true, cap.SYS_ADMIN, cap.BPF, cap.PERFMON, cap.SYS_PTRACE, cap.CHECKPOINT_RESTORE); err != nil {
 		return fmt.Errorf("set capabilities: %w", err)

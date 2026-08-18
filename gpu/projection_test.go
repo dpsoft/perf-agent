@@ -287,3 +287,29 @@ func TestProjectionHandlesUnmatchedExecution(t *testing.T) {
 	assert.Equal(t, "unmatched", samples[0].Labels["gpu_join"],
 		"an unmatched execution's gpu_join must read 'unmatched', never absent (which could be misread as exact)")
 }
+
+// TestProjectionDistributionSurvivesOverflow pins proportionality for an
+// execution interval large enough that execWeight*Count exceeds uint64.
+// Nothing validates EndNs-StartNs against a malformed producer, and a wrapped
+// product is silently destructive rather than loud: every share computes as 0
+// and the residue guard hands the entire duration to the last sample, so the
+// weights still sum correctly while the distribution is completely wrong.
+//
+// Mutation caught: replacing bits.Mul64/Div64 with `execWeight * c / totalCount`
+// makes the two equal-count samples receive 0 and execWeight respectively.
+func TestProjectionDistributionSurvivesOverflow(t *testing.T) {
+	execWeight := uint64(1) << 62
+	pcs := []GPUPCSample{{Count: 8}, {Count: 8}}
+
+	weights := distributeExecutionWeight(execWeight, pcs)
+
+	require.Len(t, weights, 2)
+	assert.Equal(t, weights[0], weights[1],
+		"equal sample counts must receive equal shares; unequal means the product wrapped")
+
+	var sum uint64
+	for _, w := range weights {
+		sum += w
+	}
+	assert.Equal(t, execWeight, sum, "distributed weights must sum to the execution duration")
+}

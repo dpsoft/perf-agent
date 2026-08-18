@@ -153,7 +153,9 @@ func NewCountingSink(inner EventSink, capacity int) *CountingSink {
 // nil. capacity <= 0 means unbounded, independent of refillPerSecond.
 //
 // Each eventClass (see its doc comment) gets its own independent token
-// bucket, each sized at capacity/refillPerSecond - review Important 5. This
+// bucket, each with burst size == capacity and refilled at refillPerSecond
+// tokens/second, so a full refill takes capacity/refillPerSecond seconds - see
+// review Important 5. This
 // is deliberately not capacity split across the two classes: launches/
 // modules must never be crowded out by exec/sample/event volume, so the
 // anchor class needs its own full, untouched budget regardless of how

@@ -3,6 +3,7 @@ package gpu
 import (
 	"fmt"
 	"maps"
+	"math/bits"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
@@ -205,7 +206,15 @@ func distributeExecutionWeight(execWeight uint64, pcs []GPUPCSample) []uint64 {
 
 	var distributed uint64
 	for i, c := range counts {
-		w := execWeight * c / totalCount
+		// execWeight*c overflows uint64 for a large enough interval (nothing
+		// validates EndNs-StartNs against a malformed producer), and a wrapped
+		// product silently destroys proportionality: every share computes as 0
+		// and the residue below hands the whole duration to the last sample.
+		// bits.Mul64/Div64 carry the full 128-bit product, so the result is
+		// exact for every input. Div64 cannot panic here: c <= totalCount, so
+		// the quotient is at most execWeight and hi is therefore < totalCount.
+		hi, lo := bits.Mul64(execWeight, c)
+		w, _ := bits.Div64(hi, lo, totalCount)
 		weights[i] = w
 		distributed += w
 	}

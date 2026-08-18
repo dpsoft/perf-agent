@@ -102,7 +102,10 @@ func Parse(r io.ReaderAt) ([]Probe, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usdt: opening ELF: %w", err)
 	}
-	defer ef.Close()
+	// No defer ef.Close() here: elf.NewFile (unlike elf.Open) never takes
+	// ownership of r or sets a closer, so Close would be a no-op -- Parse
+	// doesn't own r's lifecycle, the caller does. ParseFile closes the
+	// *os.File it opens itself, below.
 
 	sec := ef.Section(stapsdtSection)
 	if sec == nil {

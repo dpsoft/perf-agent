@@ -270,17 +270,24 @@ func TestParse_MalformedNote_TruncatedHeader(t *testing.T) {
 	}
 }
 
-// TestParse_MalformedNote_TruncatedDescriptor covers a note whose header
-// promises a descriptor longer than the bytes actually present.
+// TestParse_MalformedNote_DescszExceedsSectionBounds covers a note whose
+// header promises a descriptor longer than the bytes actually present in
+// the section (the raw .note.stapsdt data is cut short of what descsz
+// claims). This is caught at the note-container level, by parseNotes'
+// `if uint64(len(data)) < descLen` bounds check (usdt.go) -- the same guard
+// TestParse_MalformedNote_TruncatedHeader exercises for the header itself.
+// It never reaches parseStapsdtDescriptor at all, since parseNotes returns
+// an error before slicing out a descriptor to hand it.
 //
-// Catches: descriptor-length handling that trusts descsz without bounds
-// checking against the remaining buffer (an out-of-range slice would
-// panic; a saturating/clamping read would silently fabricate a probe from
-// garbage).
-func TestParse_MalformedNote_TruncatedDescriptor(t *testing.T) {
+// Catches: parseNotes trusting descsz without checking it against the
+// remaining section buffer (an out-of-range slice would panic; a
+// saturating/clamping read would silently hand parseStapsdtDescriptor
+// garbage and fabricate a probe from it).
+func TestParse_MalformedNote_DescszExceedsSectionBounds(t *testing.T) {
 	note := encodeStapsdtNote(binary.LittleEndian, 8, 0x400010, 0, 0, "perfagent", "gpu_launch_v1", "8@%rdi")
-	// Keep the 12-byte header (which claims the full descsz) and the
-	// 4-byte-aligned name, but chop the descriptor itself short.
+	// Keep the 12-byte header (which still claims the full descsz) and the
+	// 4-byte-aligned name, but chop the descriptor bytes themselves short
+	// -- the section's raw data ends before descsz says it should.
 	headerAndName := note[:12+align4Len(len("stapsdt")+1)]
 	truncated := append(append([]byte{}, headerAndName...), note[len(headerAndName):len(headerAndName)+3]...)
 
@@ -292,7 +299,42 @@ func TestParse_MalformedNote_TruncatedDescriptor(t *testing.T) {
 
 	probes, err := Parse(bytes.NewReader(raw))
 	if err == nil {
-		t.Fatalf("Parse succeeded on a truncated note descriptor; got %#v, want error", probes)
+		t.Fatalf("Parse succeeded when the section's raw bytes end before descsz says they should; got %#v, want error", probes)
+	}
+	if probes != nil {
+		t.Fatalf("Parse returned %d probes alongside an error; want nil on failure", len(probes))
+	}
+}
+
+// TestParse_MalformedNote_DescriptorTooShortForAddresses reaches
+// parseStapsdtDescriptor's own bounds check (usdt.go: `need := addrSize*3;
+// if len(desc) < need`) -- a distinct guard from the container-level one
+// TestParse_MalformedNote_DescszExceedsSectionBounds exercises above. The
+// note here is well-formed and *complete* at the container level: descsz is
+// accurate, every declared byte is genuinely present, and parseNotes hands
+// the full descriptor over without complaint. It only fails once
+// parseStapsdtDescriptor tries to read three pointer-sized (8 bytes each,
+// on this 64-bit ELF -- 24 bytes total) addresses out of a 5-byte
+// descriptor.
+//
+// Catches: deleting or weakening parseStapsdtDescriptor's own length check.
+// Verified live: commenting out that guard turns this test's clean error
+// into a panic (slice bounds out of range) inside readAddr instead.
+func TestParse_MalformedNote_DescriptorTooShortForAddresses(t *testing.T) {
+	// A complete, accurately-declared note (descsz=5, and all 5 bytes are
+	// really there) whose descriptor is simply too small to hold
+	// location+base+semaphore.
+	note := encodeNote(binary.LittleEndian, noteOwnerStapsdt, noteTypeStapsdt, []byte{0x11, 0x22, 0x33, 0x44, 0x55})
+
+	raw := buildELF(t, elf.ELFCLASS64, binary.LittleEndian, []synSeg{
+		{off: 0, vaddr: 0x400000, filesz: 0x100, memsz: 0x1000, flags: elf.PF_R | elf.PF_X},
+	}, []synSec{
+		{name: stapsdtSection, typ: uint32(elf.SHT_NOTE), addr: 0, data: note},
+	})
+
+	probes, err := Parse(bytes.NewReader(raw))
+	if err == nil {
+		t.Fatalf("Parse succeeded on a complete 5-byte descriptor (need 24 bytes for three 8-byte addresses); got %#v, want error", probes)
 	}
 	if probes != nil {
 		t.Fatalf("Parse returned %d probes alongside an error; want nil on failure", len(probes))

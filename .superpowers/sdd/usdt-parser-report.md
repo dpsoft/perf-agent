@@ -119,10 +119,22 @@ builder in the test file, since the compiled fixtures can't exercise these):
   12-byte namesz/descsz/type header. Catches out-of-bounds reads (panic) or
   silently returning whatever was decoded before the cut as a complete,
   successful result.
-- **`TestParse_MalformedNote_TruncatedDescriptor`** — header/name intact,
-  descriptor bytes cut short of the declared `descsz`. Catches descriptor
-  parsing that trusts `descsz` without checking it against the remaining
-  buffer.
+- **`TestParse_MalformedNote_DescszExceedsSectionBounds`** (renamed from
+  `TestParse_MalformedNote_TruncatedDescriptor` in fix round 1 — see
+  "Fix round 1" below for why): header/name intact, descriptor bytes cut
+  short of the declared `descsz`. This is a **container-level** check —
+  caught by `parseNotes`' `if uint64(len(data)) < descLen` bound, the same
+  guard `TestParse_MalformedNote_TruncatedHeader` exercises for the header.
+  It never reaches `parseStapsdtDescriptor`.
+- **`TestParse_MalformedNote_DescriptorTooShortForAddresses`** (new in fix
+  round 1): a *complete, accurately-declared* note (`descsz` correct, every
+  byte present) whose descriptor is genuinely too short — 5 bytes — to hold
+  three 8-byte addresses. This is the only test that reaches
+  `parseStapsdtDescriptor`'s own `need := addrSize*3; if len(desc) < need`
+  check. Catches deleting or weakening that guard specifically, as distinct
+  from the container-level one above. Verified live: removing the guard
+  turns this test's clean error into a panic (slice bounds out of range in
+  `readAddr`) instead of a passing test — see "Fix round 1" below.
 - **`TestParse_MalformedNote_UnterminatedString`** — addresses intact, the
   `name` string never hits a NUL within the descriptor. Catches
   string-scanning that runs past the buffer end or silently accepts a
@@ -209,13 +221,75 @@ the predicted symptom, and reverting — not just asserted in this report.
   the whole tree); created it to place this report, per the task's
   instruction to write it there.
 
+## Fix round 1
+
+Review returned spec PASS / quality good, no Critical findings, and
+independently cross-checked both formulas (`offset = vaddr - Vaddr + Off`
+and `adjusted = raw + (stapsdt_base_addr - note_base)`) against
+`libbpf/tools/lib/bpf/usdt.c` and `bcc/usdt.cc`, confirming an exact match,
+sign included. It also validated the synthetic base-adjustment test as
+representative of a real prelinked binary (prelink relocates section/segment
+addresses but never rewrites the immutable, non-relocated bytes inside
+`.note.stapsdt`), so the two-segment construction wasn't shaped to fit the
+implementation.
+
+One Important finding, correctly caught: **`TestParse_MalformedNote_TruncatedDescriptor`
+tested nothing new.** It truncated the raw section bytes while leaving the
+note header's `descsz` pointing at the original length, so the failure was
+caught by `parseNotes`' container-level bound check
+(`if uint64(len(data)) < descLen`) — the exact same code path
+`TestParse_MalformedNote_TruncatedHeader` already exercised. The distinct
+check inside `parseStapsdtDescriptor` (`need := addrSize*3; if len(desc) <
+need`) had zero coverage, despite my original report describing the old
+test as catching exactly that. It didn't; I mischaracterized it.
+
+Fixed by:
+
+1. **Renaming** the old test to
+   `TestParse_MalformedNote_DescszExceedsSectionBounds` and correcting its
+   doc comment and this report's description of it to say what it actually
+   covers: the container-level `parseNotes` bound, not the descriptor-level
+   one.
+2. **Adding** `TestParse_MalformedNote_DescriptorTooShortForAddresses`: a
+   note that is complete and accurately-declared at the container level
+   (`descsz = 5`, and all 5 bytes are genuinely present — nothing truncated,
+   nothing lied about), so it passes `parseNotes` cleanly and reaches
+   `parseStapsdtDescriptor` intact, which then correctly rejects a 5-byte
+   descriptor as too small to hold three 8-byte addresses (need 24).
+
+Verified live (temporarily deleting the `len(desc) < need` guard in
+`parseStapsdtDescriptor`, then reverting):
+
+```
+--- FAIL: TestParse_MalformedNote_DescriptorTooShortForAddresses (0.00s)
+panic: runtime error: slice bounds out of range [:16] with capacity 8
+    .../usdt.go:252 usdt.parseStapsdtDescriptor(...)
+    .../usdt.go:146 usdt.Parse(...)
+```
+
+Confirming the new test genuinely depends on that guard — without it, the
+same input produces a panic instead of a clean error, not a silent pass.
+
+Also applied the `defer ef.Close()` minor: `Parse` no longer calls `Close`
+on the `*elf.File` it gets from `elf.NewFile`, since that constructor never
+sets a closer (unlike `elf.Open`) and the call was a no-op that
+misleadingly implied `Parse` owns `r`'s lifecycle. `ParseFile` already
+closes the `*os.File` it opens itself, unaffected by this change. Skipped
+the semaphore-offset-0 minor: correctness there already follows from
+`HasSemaphore` being derived from the pre-adjustment raw semaphore field
+(`usdt.go`), and the reviewer flagged it as "not a real risk" / optional.
+
 ## Status contract
 
 - **Status:** DONE
-- **Commit:** (see below — created after this report)
-- **Test summary:** `go test ./internal/usdt/...` — 16/16 passed. `go vet`
-  and `gofmt -l` clean.
-- **Concerns:** the base-adjustment behavior has no compiled-binary backing
-  (see ambiguities above) — synthetic-ELF test only, though the formula and
-  test arithmetic were hand-verified and mutation-tested.
+- **Commit:** `c26446c3` (initial), plus a fix-round-1 commit correcting the
+  above (see reply for hash)
+- **Test summary:** `go test ./internal/usdt/ -count=1` — 17/17 passed
+  (added one test in fix round 1). `go vet` and `gofmt -l` clean.
+- **Concerns:** the base-adjustment behavior still has no compiled-binary
+  backing (see "Ambiguities" above) — synthetic-ELF test only. Review
+  independently confirmed this synthetic construction matches how a real
+  prelinked binary behaves, so I consider this resolved rather than
+  outstanding, but it remains the one place in the package with no
+  real-world binary as ground truth.
 - **Report path:** `.superpowers/sdd/usdt-parser-report.md`

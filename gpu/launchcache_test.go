@@ -210,7 +210,8 @@ func TestLaunchCacheEntriesIsACopyNotAView(t *testing.T) {
 
 	entries := c.Entries()
 	entries[0].KernelName = "tampered"
-	entries = append(entries, launch("injected", 999))
+	grown := append(entries, launch("injected", 999)) //nolint:gocritic // appending to the caller's copy is the point
+	require.Len(t, grown, 2, "the caller's own slice must be growable independently of the cache")
 
 	got, ok := c.Get(CorrelationID{Backend: BackendCUPTI, Value: "a"})
 	require.True(t, ok)

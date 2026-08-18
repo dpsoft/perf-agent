@@ -37,6 +37,13 @@ var SampleTypeCpu = SampleType(0)
 var SampleTypeMem = SampleType(1)
 var SampleTypeOffCpu = SampleType(2)
 
+// SampleTypeGpu is for GPU execution/PC-sample time, already expressed in
+// nanoseconds by the caller (see gpu/projection.go). Like SampleTypeOffCpu,
+// it uses Period 1 so BuilderForSample's addValue does not rescale it by the
+// CPU sampling period - a GPU sample's Value is a duration, not a sample
+// count to be multiplied out.
+var SampleTypeGpu = SampleType(3)
+
 type SampleAggregation bool
 
 var (
@@ -156,6 +163,10 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		sampleType = []*profile.ValueType{{Type: "offcpu", Unit: "nanoseconds"}}
 		periodType = &profile.ValueType{Type: "offcpu", Unit: "nanoseconds"}
 		period = 1 // Direct nanosecond values, not sampled
+	case SampleTypeGpu:
+		sampleType = []*profile.ValueType{{Type: "gpu", Unit: "nanoseconds"}}
+		periodType = &profile.ValueType{Type: "gpu", Unit: "nanoseconds"}
+		period = 1 // Direct nanosecond values, not sampled - see SampleTypeGpu's doc comment
 	default:
 		sampleType = []*profile.ValueType{{Type: "alloc_objects", Unit: "count"}, {Type: "alloc_space", Unit: "bytes"}}
 		periodType = &profile.ValueType{Type: "space", Unit: "bytes"}
@@ -473,7 +484,7 @@ func uint64Bytes(s []uint64) []byte {
 }
 func (p *ProfileBuilder) newSample(inputSample *ProfileSample) *profile.Sample {
 	sample := new(profile.Sample)
-	if inputSample.SampleType == SampleTypeCpu || inputSample.SampleType == SampleTypeOffCpu {
+	if inputSample.SampleType == SampleTypeCpu || inputSample.SampleType == SampleTypeOffCpu || inputSample.SampleType == SampleTypeGpu {
 		sample.Value = []int64{0}
 	} else {
 		sample.Value = []int64{0, 0}
@@ -497,6 +508,11 @@ func (p *ProfileBuilder) addValue(inputSample *ProfileSample, sample *profile.Sa
 		sample.Value[0] += int64(inputSample.Value) * p.Profile.Period
 	case SampleTypeOffCpu:
 		// Off-CPU values are already in nanoseconds, no scaling needed
+		sample.Value[0] += int64(inputSample.Value)
+	case SampleTypeGpu:
+		// GPU values are already in nanoseconds, no scaling needed - see
+		// SampleTypeGpu's doc comment for why this must not go through the
+		// SampleTypeCpu path and be multiplied by the CPU sampling period.
 		sample.Value[0] += int64(inputSample.Value)
 	default:
 		sample.Value[0] += int64(inputSample.Value)

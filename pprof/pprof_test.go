@@ -33,6 +33,7 @@ func TestSampleTypes(t *testing.T) {
 	}{
 		{"CPU", SampleTypeCpu, "cpu", "nanoseconds"},
 		{"OffCPU", SampleTypeOffCpu, "offcpu", "nanoseconds"},
+		{"GPU", SampleTypeGpu, "gpu", "nanoseconds"},
 		{"Memory", SampleTypeMem, "alloc_objects", "count"},
 	}
 
@@ -155,6 +156,34 @@ func TestOffCpuValueNotScaled(t *testing.T) {
 
 	for _, b := range builders.Builders {
 		assert.Equal(t, int64(1000000), b.Profile.Sample[0].Value[0])
+	}
+}
+
+// TestGpuValueNotScaledByCpuPeriod is the regression test for review
+// Critical 4: a GPU sample's Value is already a nanosecond duration (an
+// execution's StartNs/EndNs interval, or a proportional share of it), not a
+// count of periodic samples. Before SampleTypeGpu existed, GPU samples went
+// through SampleTypeCpu and BuilderForSample.addValue multiplied every
+// value by the CPU sampling period (~10.1ms at 99Hz) - a 70us kernel
+// rendered as 707.1 seconds. SampleRate is deliberately set low (1, an
+// extreme CPU period) so a reverted addValue case (falling through to
+// SampleTypeCpu's multiplication) would produce a value wildly different
+// from 70000, not one that happens to look close by coincidence.
+func TestGpuValueNotScaledByCpuPeriod(t *testing.T) {
+	builders := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+
+	builders.AddSample(&ProfileSample{
+		SampleType:  SampleTypeGpu,
+		Aggregation: SampleAggregated,
+		Stack:       FramesFromNames([]string{"main"}),
+		Value:       70000, // a 70us kernel, expressed in nanoseconds
+	})
+
+	require.Len(t, builders.Builders, 1)
+	for _, b := range builders.Builders {
+		assert.Equal(t, int64(1), b.Profile.Period, "SampleTypeGpu must use period 1, like SampleTypeOffCpu")
+		assert.Equal(t, int64(70000), b.Profile.Sample[0].Value[0],
+			"a 70us kernel must render as ~70000ns, not be multiplied by the CPU sampling period")
 	}
 }
 

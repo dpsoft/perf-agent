@@ -53,19 +53,14 @@ const defaultMaxAdvanceNs = 60 * 1e9 // 60s
 
 // cacheEntry is a stored launch tagged with the Put sequence number that
 // produced it, so a stale order position (superseded by a later replace) can
-// be told apart from the entry currently live for that correlation ID.
+// be told apart from the entry currently live for that correlation ID. The
+// horizon anchor is the launch's own TimeNs (cacheEntry.launch.TimeNs) - a
+// single scalar, already O(1) to read - so unlike Timeline.pending (whose
+// value is a slice needing its own tracked anchor; see pendingSamples),
+// cacheEntry does not need a separate anchor field.
 type cacheEntry struct {
 	launch GPUKernelLaunch
 	seq    uint64
-}
-
-// orderEntry names one FIFO position: the correlation ID inserted and the
-// sequence number it was inserted (or replaced) with. Comparing seq against
-// the current cacheEntry.seq for the same id is how eviction tells a live
-// position from one a later Put has superseded.
-type orderEntry struct {
-	id  CorrelationID
-	seq uint64
 }
 
 // LaunchCache is a bounded FIFO of recent launches indexed by correlation ID.
@@ -82,9 +77,7 @@ type LaunchCache struct {
 	mu       sync.Mutex
 	cfg      LaunchCacheConfig
 	byCorr   map[CorrelationID]cacheEntry
-	order    []orderEntry // insertion order; entries before head are dead
-	head     int
-	seq      uint64
+	order    *orderedFIFO[CorrelationID]
 	newestNs uint64
 	stats    LaunchCacheStats
 }
@@ -99,8 +92,16 @@ func NewLaunchCache(cfg LaunchCacheConfig) *LaunchCache {
 	return &LaunchCache{
 		cfg:    cfg,
 		byCorr: make(map[CorrelationID]cacheEntry, cfg.Capacity),
-		order:  make([]orderEntry, 0, cfg.Capacity),
+		order:  newOrderedFIFO[CorrelationID](cfg.Capacity),
 	}
+}
+
+// isLiveLocked answers orderedFIFO's isLive callback: a position is live
+// only if byCorr still holds an entry for id stamped with exactly seq. The
+// caller must hold c.mu.
+func (c *LaunchCache) isLiveLocked(id CorrelationID, seq uint64) bool {
+	e, ok := c.byCorr[id]
+	return ok && e.seq == seq
 }
 
 // Put inserts or replaces the launch for its correlation ID. A repeated
@@ -112,13 +113,11 @@ func (c *LaunchCache) Put(l GPUKernelLaunch) {
 
 	c.observeTimestampLocked(l.TimeNs)
 
-	c.seq++
-	seq := c.seq
+	seq := c.order.insert(l.Correlation)
 	if _, exists := c.byCorr[l.Correlation]; exists {
 		c.stats.Replaced++
 	}
 	c.byCorr[l.Correlation] = cacheEntry{launch: l, seq: seq}
-	c.order = append(c.order, orderEntry{id: l.Correlation, seq: seq})
 	c.evictLocked()
 }
 
@@ -189,62 +188,26 @@ func (c *LaunchCache) Stats() LaunchCacheStats {
 // caller must hold c.mu.
 func (c *LaunchCache) evictLocked() {
 	if c.cfg.HorizonNs > 0 {
-		for c.head < len(c.order) {
-			e := c.order[c.head]
-			cur, superseded := c.currentIfLiveLocked(e)
-			if superseded {
-				c.head++
-				continue
-			}
-			if c.newestNs <= cur.TimeNs || c.newestNs-cur.TimeNs <= c.cfg.HorizonNs {
+		for {
+			id, ok := c.order.peekOldestLive(c.isLiveLocked)
+			if !ok {
 				break
 			}
-			delete(c.byCorr, e.id)
-			c.head++
+			cur := c.byCorr[id] // guaranteed present: peekOldestLive just confirmed liveness
+			if c.newestNs <= cur.launch.TimeNs || c.newestNs-cur.launch.TimeNs <= c.cfg.HorizonNs {
+				break
+			}
+			c.order.evictOldestLive(c.isLiveLocked)
+			delete(c.byCorr, id)
 			c.stats.EvictedHorizon++
 		}
 	}
-	for len(c.byCorr) > c.cfg.Capacity && c.head < len(c.order) {
-		e := c.order[c.head]
-		c.head++
-		if _, superseded := c.currentIfLiveLocked(e); superseded {
-			continue
+	for len(c.byCorr) > c.cfg.Capacity {
+		id, ok := c.order.evictOldestLive(c.isLiveLocked)
+		if !ok {
+			break
 		}
-		delete(c.byCorr, e.id)
+		delete(c.byCorr, id)
 		c.stats.EvictedCapacity++
 	}
-	c.compactLocked()
-}
-
-// currentIfLiveLocked resolves an order position to the launch currently
-// live for its correlation ID, and reports whether that position is
-// superseded rather than real. A position is superseded in two cases: the id
-// has since been evicted outright (superseded && zero value; this should be
-// unreachable given eviction always consumes the order position it deletes
-// through, but is kept as a defensive guard), or — the case this exists to
-// fix — a later Put replaced the entry, so e.seq no longer matches the
-// sequence number the map holds for that id. Only a non-superseded position
-// is a real, currently-live entry eligible for eviction. The caller must
-// hold c.mu.
-func (c *LaunchCache) currentIfLiveLocked(e orderEntry) (GPUKernelLaunch, bool) {
-	cur, live := c.byCorr[e.id]
-	if !live || cur.seq != e.seq {
-		return GPUKernelLaunch{}, true
-	}
-	return cur.launch, false
-}
-
-// compactLocked reclaims the dead prefix of order once it dominates the
-// slice, so a long-running agent's order slice does not grow without bound.
-// It is not tight: compaction only fires once head >= 1024 && head*2 >=
-// len(order), so in steady state under sustained load order oscillates
-// between roughly capacity and roughly 2x capacity. That is bounded, but
-// len(order) should not be read as a proxy for live count.
-func (c *LaunchCache) compactLocked() {
-	if c.head < 1024 || c.head*2 < len(c.order) {
-		return
-	}
-	rest := c.order[c.head:]
-	c.order = append(c.order[:0], rest...)
-	c.head = 0
 }

@@ -195,10 +195,10 @@ type Timeline struct {
 	// Dropped.EvictedPendingSamples.
 	//
 	// Both pending's entries and pendingOrder's positions carry a sequence
-	// number, the same way LaunchCache pairs cacheEntry.seq with
-	// orderEntry.seq (see currentIfLiveLocked there). This exists to solve
-	// the identical hazard: a correlation ID consumed by Snapshot leaves its
-	// old pendingOrder position behind with no map entry; if that same ID is
+	// number, the same way LaunchCache pairs cacheEntry.seq with orderedFIFO
+	// (see LaunchCache.isLiveLocked). This exists to solve the identical
+	// hazard: a correlation ID consumed by Snapshot leaves its old
+	// pendingOrder position behind with no map entry; if that same ID is
 	// then reused by a later EmitPCSample, presence-only eviction cannot
 	// tell that stale position apart from the ID's new, live generation, and
 	// would delete the freshly re-inserted entry instead of the position it
@@ -208,11 +208,16 @@ type Timeline struct {
 	// entry - unlike LaunchCache.Put, which always replaces the whole value,
 	// pending accumulates samples across many EmitPCSample calls for the
 	// same still-live generation, so an in-place append must not look like a
-	// new generation.
+	// new generation. This divergence in bump cadence (vs. LaunchCache's
+	// every-call bump) is deliberate; see EmitPCSample.
+	//
+	// pending itself stays a plain, owner-held map (not hidden inside a
+	// generic type) because existing tests reach into it directly
+	// (len(tl.pending), tl.pending[id], tl.pending[id].samples); only the
+	// order/sequence/compaction bookkeeping is shared, via orderedFIFO, with
+	// LaunchCache.
 	pending      map[CorrelationID]pendingSamples
-	pendingOrder []pendingOrderEntry
-	pendingHead  int
-	pendingSeq   uint64
+	pendingOrder *orderedFIFO[CorrelationID]
 	pendingCap   int
 
 	// pendingSampleCap bounds how many samples a single pending correlation's
@@ -250,20 +255,17 @@ type Timeline struct {
 
 // pendingSamples is a pending correlation's accumulated samples, tagged with
 // the sequence number of its current (live) generation - see the pending
-// field's doc comment.
+// field's doc comment. anchorNs is the largest PC-sample TimeNs appended to
+// samples so far (a running max, updated incrementally by EmitPCSample),
+// mirroring cacheEntry's use of its own launch.TimeNs as an O(1) horizon
+// anchor - before this refactor, the equivalent value was recomputed by
+// latestSampleTimeNs scanning every sample in the entry (up to
+// pendingSampleCap of them) on every evictPendingLocked call while the
+// horizon was enabled; anchorNs makes that O(1) instead.
 type pendingSamples struct {
-	samples []GPUPCSample
-	seq     uint64
-}
-
-// pendingOrderEntry names one FIFO position: the correlation ID inserted and
-// the sequence number it was inserted with. Comparing seq against the
-// current pendingSamples.seq for the same id is how eviction tells a live
-// position from one a later re-insertion (after consumption or eviction) has
-// superseded. Mirrors LaunchCache's orderEntry.
-type pendingOrderEntry struct {
-	id  CorrelationID
-	seq uint64
+	samples  []GPUPCSample
+	seq      uint64
+	anchorNs uint64
 }
 
 // defaultMaxPendingSamplesPerCorrelation bounds a single pending
@@ -302,10 +304,19 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		events:           newRing[GPUTimelineEvent](eventCapacity),
 		modules:          newRing[GPUModule](capacity),
 		pending:          make(map[CorrelationID]pendingSamples),
+		pendingOrder:     newOrderedFIFO[CorrelationID](0),
 		pendingCap:       capacity,
 		pendingSampleCap: sampleCap,
 		pendingHorizonNs: cfg.PendingSampleHorizonNs,
 	}
+}
+
+// isPendingLiveLocked answers orderedFIFO's isLive callback for pendingOrder:
+// a position is live only if t.pending still holds an entry for id stamped
+// with exactly seq. The caller must hold t.mu.
+func (t *Timeline) isPendingLiveLocked(id CorrelationID, seq uint64) bool {
+	cur, ok := t.pending[id]
+	return ok && cur.seq == seq
 }
 
 func (t *Timeline) EmitLaunch(l GPUKernelLaunch) error {
@@ -338,10 +349,12 @@ func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 		// or evicted. Either way it is a new generation and gets a new
 		// sequence number plus a new order position - see the pending
 		// field's doc comment for why this must not also happen on every
-		// append to an already-live entry.
-		t.pendingSeq++
-		entry.seq = t.pendingSeq
-		t.pendingOrder = append(t.pendingOrder, pendingOrderEntry{id: p.Correlation, seq: entry.seq})
+		// append to an already-live entry. This is the divergence from
+		// LaunchCache.Put (which bumps on every call): pending accumulates
+		// samples into one live generation across many EmitPCSample calls,
+		// so re-stamping per append would falsely orphan the entry's own
+		// live order position.
+		entry.seq = t.pendingOrder.insert(p.Correlation)
 	}
 
 	if len(entry.samples) >= t.pendingSampleCap {
@@ -350,8 +363,8 @@ func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 		// samples within any single one of them. Without this check, one
 		// orphaned (or stale-ID-reused) correlation below that bound could
 		// still accumulate samples forever. The entry (and its order
-		// position/generation) is left exactly as it was; only the new
-		// sample is dropped and counted.
+		// position/generation/anchor) is left exactly as it was; only the
+		// new sample is dropped and counted.
 		t.dropped.EvictedPendingSamples++
 		t.pending[p.Correlation] = entry
 		t.evictPendingLocked()
@@ -359,6 +372,9 @@ func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 	}
 
 	entry.samples = append(entry.samples, p)
+	if p.TimeNs > entry.anchorNs {
+		entry.anchorNs = p.TimeNs
+	}
 	t.pending[p.Correlation] = entry
 	t.pendingSampleTotal++
 	t.evictPendingLocked()
@@ -380,72 +396,43 @@ func (t *Timeline) observePendingTimestampLocked(timeNs uint64) {
 	t.pendingNewestNs = timeNs
 }
 
-// latestSampleTimeNs returns the largest TimeNs among samples, for aging a
-// pending entry against pendingNewestNs.
-func latestSampleTimeNs(samples []GPUPCSample) uint64 {
-	var latest uint64
-	for _, s := range samples {
-		if s.TimeNs > latest {
-			latest = s.TimeNs
-		}
-	}
-	return latest
-}
-
 // evictPendingLocked drops pending correlation groups past the horizon
 // first (if pendingHorizonNs > 0), then the oldest ones once the map holds
 // more distinct correlations than pendingCap. An order position whose
 // sequence no longer matches the map's current entry for that id - because
 // Snapshot already consumed it, or a later re-insertion superseded it - is
 // skipped rather than double-counted or, worse, mistaken for the live
-// generation and evicted in its place. This mirrors
-// LaunchCache.evictLocked/currentIfLiveLocked exactly, for the same reason:
-// presence in the map is not a sufficient liveness check when a key can be
-// deleted and then reused. Caller holds t.mu.
+// generation and evicted in its place. This mirrors LaunchCache.evictLocked
+// exactly, for the same reason: presence in the map is not a sufficient
+// liveness check when a key can be deleted and then reused - both now
+// delegate that walk to orderedFIFO. Caller holds t.mu.
 func (t *Timeline) evictPendingLocked() {
 	if t.pendingHorizonNs > 0 {
-		for t.pendingHead < len(t.pendingOrder) {
-			e := t.pendingOrder[t.pendingHead]
-			cur, live := t.pending[e.id]
-			if !live || cur.seq != e.seq {
-				t.pendingHead++
-				continue
-			}
-			latest := latestSampleTimeNs(cur.samples)
-			if t.pendingNewestNs <= latest || t.pendingNewestNs-latest <= t.pendingHorizonNs {
+		for {
+			id, ok := t.pendingOrder.peekOldestLive(t.isPendingLiveLocked)
+			if !ok {
 				break
 			}
-			delete(t.pending, e.id)
-			t.pendingHead++
+			cur := t.pending[id] // guaranteed present: peekOldestLive just confirmed liveness
+			if t.pendingNewestNs <= cur.anchorNs || t.pendingNewestNs-cur.anchorNs <= t.pendingHorizonNs {
+				break
+			}
+			t.pendingOrder.evictOldestLive(t.isPendingLiveLocked)
+			delete(t.pending, id)
 			t.pendingSampleTotal -= uint64(len(cur.samples))
 			t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
 		}
 	}
-	for len(t.pending) > t.pendingCap && t.pendingHead < len(t.pendingOrder) {
-		e := t.pendingOrder[t.pendingHead]
-		t.pendingHead++
-		cur, live := t.pending[e.id]
-		if !live || cur.seq != e.seq {
-			continue
+	for len(t.pending) > t.pendingCap {
+		id, ok := t.pendingOrder.evictOldestLive(t.isPendingLiveLocked)
+		if !ok {
+			break
 		}
-		delete(t.pending, e.id)
+		cur := t.pending[id]
+		delete(t.pending, id)
 		t.pendingSampleTotal -= uint64(len(cur.samples))
 		t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
 	}
-	t.compactPendingOrderLocked()
-}
-
-// compactPendingOrderLocked reclaims the dead prefix of pendingOrder once it
-// dominates the slice, the same way LaunchCache.compactLocked does, so the
-// order slice's backing array doesn't grow without bound under sustained
-// load. Caller holds t.mu.
-func (t *Timeline) compactPendingOrderLocked() {
-	if t.pendingHead < 1024 || t.pendingHead*2 < len(t.pendingOrder) {
-		return
-	}
-	rest := t.pendingOrder[t.pendingHead:]
-	t.pendingOrder = append(t.pendingOrder[:0], rest...)
-	t.pendingHead = 0
 }
 
 func (t *Timeline) EmitModule(m GPUModule) error {

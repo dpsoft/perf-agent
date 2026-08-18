@@ -261,6 +261,110 @@ GPU, no CUPTI, no privileges, no dependence on the probe payloads — so it is
 the one piece of Phase 3 that can be written and fully tested before the ABI
 is frozen, and it is required no matter what shape the ABI takes.
 
+
+### 6.3 Draft record layouts
+
+Drafted against the ROCm bridge on branch `gpu-profiling-spec`
+(`examples/rocprofiler_sdk_preload_bridge.cpp`) — real code, validated on the
+development host's AMD hardware — rather than against CUPTI documentation.
+**NVIDIA takes the identical approach**: the CUPTI adapter emits these same
+records, and anywhere the two vendors differ is called out below rather than
+papered over. That is the whole point of §6.1 — one ABI, thin adapters.
+
+Fields marked **[spike]** are the ones the CUPTI spike must confirm. Everything
+else is grounded in a working producer.
+
+#### Conventions
+
+- Every probe fires with `(ptr, count, seq)`: a pointer to an array of
+  fixed-size records, how many, and a per-probe monotonic sequence number.
+  Records are fixed-size so the eBPF consumer can stride them without parsing;
+  variable-length data is interned (see kernel names below).
+- All integers little-endian, naturally aligned, explicitly sized. No enums, no
+  bitfields, no compiler-layout dependence — the consumer is a BPF program, not
+  a C compiler.
+- `correlation` is `u64`. ROCm supplies `record->correlation_id.internal`
+  directly; CUPTI's `correlationId` is `uint32` and zero-extends. §6's
+  requirement that **every** launch and execution carry a non-zero correlation
+  applies to both.
+- All `*_ns` are CPU-monotonic. Conversion happens in the adapter, never in the
+  core (§7).
+
+#### The interning decision, and why the real code forced it
+
+Kernel names are variable-length, high-cardinality, and repeat constantly. They
+must not ride on every execution record.
+
+The ROCm bridge answered this by accident of design: it subscribes to
+`ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER`, which delivers
+`kernel_id → kernel_name` once at registration, and its dispatch records then
+carry only `dispatch_info.kernel_id`. So ROCm's natural shape is already an
+interned id plus a separate mapping.
+
+The ABI adopts that shape, and CUPTI synthesises it: hash the function name to
+a `kernel_id` and emit the mapping once on first sight. This costs the CUPTI
+adapter a small map and saves every execution record from carrying a string.
+
+#### Probes
+
+| Probe | Record fields |
+|---|---|
+| `gpu_launch_v1` | `correlation u64`, `kernel_id u64`, `queue_id u64`, `context_id u64`, `time_ns u64`, `tid u32`, `_pad u32` |
+| `gpu_exec_v1` | `correlation u64`, `kernel_id u64`, `queue_id u64`, `device_id u64`, `start_ns u64`, `end_ns u64` |
+| `gpu_kernel_name_v1` | `kernel_id u64`, `name_len u16`, `name[]` — the interning table; replayed on late attach |
+| `gpu_pc_sample_batch_v1` | `correlation u64`, `module_id u64`, `pc_offset u64`, `stall_index u32`, `count u32` |
+| `gpu_module_load_v1` | `module_id u64`, `size_bytes u64`, `load_ns u64`, `bytes_ptr u64` **[spike]** |
+| `gpu_stall_reason_map_v1` | `index u32`, `name_len u16`, `name[]` — one-shot, replayed on late attach |
+| `gpu_config_v1` | `sampling_factor u32`, `sm_count u32`, `clock_hz u64`, `vendor u8` |
+| `gpu_dropped_v1` | `class u8`, `count u64` — producer-side loss, per §9 and the §7 sink contract |
+
+#### Where the two vendors genuinely differ
+
+Three asymmetries the bridge made visible. None is fatal; all need a decision
+before freeze.
+
+1. **Module identity is not the same concept.** CUPTI's `cubin_loaded` delivers
+   raw binary bytes keyed by CRC — a real object to disassemble. ROCm's
+   `CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER` delivers a *symbol registration*,
+   `kernel_id → name`, with no bytes. So `gpu_module_load_v1` is CUPTI-shaped
+   and ROCm will not populate `bytes_ptr`.
+
+   This is fine — PC sampling is capability-gated (§7), and a backend that
+   cannot supply module bytes simply does not advertise `CapabilityPCSampling`.
+   But it means `gpu_module_load_v1` and `gpu_kernel_name_v1` are **separate
+   probes on purpose**: ROCm emits only the latter, CUPTI emits both.
+
+2. **Queue and device identity is thinner on the ROCm side than expected.** The
+   bridge reads `dispatch_info.dispatch_id` and `kernel_id` but never extracts
+   agent or queue identity. Either rocprofiler exposes it elsewhere and the
+   bridge simply did not need it, or it requires a separate subscription. Until
+   that is settled, `queue_id` and `device_id` are **optional (zero means
+   unknown)** rather than required — which the core already tolerates, since the
+   heuristic join keys on `(queue, kernel name)` and a zero queue degrades to a
+   single group.
+
+3. **CUPTI has a launch/exec split ROCm expresses differently.** ROCm's
+   `HIP_RUNTIME_API` buffer records are the launch side and `KERNEL_DISPATCH`
+   the execution side — a clean match. CUPTI's callback API supplies the launch
+   anchor and the activity API the execution, which is the same split arriving
+   through two different mechanisms. No ABI consequence; noted so the CUPTI
+   adapter is not tempted to invent a third record type. **[spike]** confirms
+   the activity record carries everything `gpu_exec_v1` needs.
+
+#### What the spike must settle
+
+Narrow, because the AMD side already answered most of it:
+
+- Does the CUPTI activity record supply queue/stream and device identity
+  directly, or must the adapter track it from callbacks?
+- What is the real shape and lifetime of the cubin payload behind `bytes_ptr` —
+  is it stable for the probe's duration, or must the adapter copy it?
+- Do CUPTI PC samples arrive with a correlation that matches the launch's, or a
+  separate sampling correlation that needs its own mapping?
+- Confirm `correlationId` is genuinely unique per launch within a process, not
+  reused after wraparound. §6 requires uniqueness; a 32-bit counter is exactly
+  the case that wraps.
+
 ## 7. Canonical event model
 
 Carried from PR #10 `gpu/types.go`, with changes:

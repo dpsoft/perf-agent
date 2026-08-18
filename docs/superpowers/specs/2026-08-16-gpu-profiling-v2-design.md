@@ -238,6 +238,29 @@ On that evidence the systemtap header is the better default, and the inline-asm
 route stays a proven fallback rather than a hypothetical one — so the build
 dependency is not load-bearing.
 
+### 6.2 What the consumer side already gets, and what it must supply
+
+Checked against the `cilium/ebpf` version this repo already depends on (v0.21.0),
+so Phase 3 does not rediscover it:
+
+**Already provided.** `link.UprobeOptions.RefCtrOffset` exists and is passed to
+the kernel as `OffsetReferenceCount`, so the **kernel maintains the semaphore
+count** — the consumer does not write to the shim's memory, and attach/detach
+bookkeeping is not ours to get right. It is feature-gated on
+`/sys/bus/event_source/devices/uprobe/format/ref_ctr_offset`, so a kernel
+without it degrades to an always-firing probe rather than failing; the shim's
+`if (semaphore)` guard simply always passes.
+
+**Not provided.** The module contains no `.note.stapsdt` parsing at all.
+Phase 3 must supply it: read the ELF note out of the shim `.so` to recover, per
+probe, the location offset and the semaphore address, then hand those to
+`Uprobe` as the offset and `RefCtrOffset`.
+
+That parser is worth building early. It is pure userspace ELF reading — no
+GPU, no CUPTI, no privileges, no dependence on the probe payloads — so it is
+the one piece of Phase 3 that can be written and fully tested before the ABI
+is frozen, and it is required no matter what shape the ABI takes.
+
 ## 7. Canonical event model
 
 Carried from PR #10 `gpu/types.go`, with changes:

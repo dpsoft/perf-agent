@@ -123,7 +123,7 @@ func TestParse_Probe4_RealSemaphore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("elf.Open: %v", err)
 	}
-	defer ef.Close()
+	defer func() { _ = ef.Close() }()
 	seg := progContaining(ef, got[0].SemaphoreOffset)
 	if seg == nil {
 		t.Fatalf("semaphore offset %#x not contained in any PT_LOAD segment's file range", got[0].SemaphoreOffset)
@@ -153,7 +153,7 @@ func assertByteAt(t *testing.T, path string, offset int64, want byte) {
 	if err != nil {
 		t.Fatalf("open %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, 1)
 	if _, err := f.ReadAt(buf, offset); err != nil {
 		t.Fatalf("read %s at %#x: %v", path, offset, err)

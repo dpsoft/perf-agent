@@ -84,7 +84,7 @@ func ParseFile(path string) ([]Probe, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usdt: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return Parse(f)
 }
 

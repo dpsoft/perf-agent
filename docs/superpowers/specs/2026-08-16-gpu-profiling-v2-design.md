@@ -122,7 +122,8 @@ cost is bounded by factoring aggressively:
 ```
 shim/
   core/     shared: USDT ABI, batching, token bucket, sequence numbers,
-            semaphore watch + late-attach replay, clock-fit scaffolding
+            semaphore watch + late-attach replay, clock pairing with step
+            detection, periodic drain timer
   nvidia/   CUPTI adapter            → libperfagent-gpu-nvidia.so
   amd/      rocprofiler-sdk adapter  → libperfagent-gpu-amd.so
 ```
@@ -171,7 +172,16 @@ Requirements:
   `stream`) so ROCm can emit the same ABI.
 - **Every launch and execution carries a correlation ID, without exception.** A
   producer whose vendor API does not supply one must synthesise a unique value
-  per launch; emitting the zero value is not permitted.
+  per launch; emitting the zero value is not permitted. A vendor id that wraps
+  counts as "does not supply one" — see §6.3 finding 4.
+- `core/` **owns a drain timer**, and its period is a first-class tunable rather
+  than a vendor default. Both vendors deliver events in buffers that are handed
+  over when full, so on an idle GPU events sit undelivered for as long as it
+  takes to fill one — measured at up to 15 s on CUPTI (§10). The vendor's own
+  periodic-flush knob is not a substitute: CUPTI's flushes only *full* buffers.
+- `core/` samples the (vendor clock, `CLOCK_MONOTONIC`) pair on that same timer
+  and watches for discontinuity, because at least one vendor clock —
+  `cuptiGetTimestamp` — is `CLOCK_REALTIME` and can be stepped (§7).
 
   This last requirement was discovered by building Phase 2 rather than by
   design, and it is the kind of constraint the phase existed to surface. The
@@ -477,11 +487,30 @@ Carried from PR #10 `gpu/types.go`, with changes:
 
 Clock domain: the existing `ClockDomain` type models cpu-monotonic, synced and
 gpu-device, but `ValidateSupportedClockDomain` rejects the latter two. That stays.
-Producers convert before emitting. The shim establishes the conversion by sampling
-`cuptiGetTimestamp` against `CLOCK_MONOTONIC` at start and periodically re-fitting
-for drift. It must not anchor each record's end to "now" — the approach currently
-prototyped in `examples/rocprofiler_sdk_preload_bridge.cpp` — which drifts under
-queueing.
+Producers convert before emitting. A producer must not anchor each record's end to
+"now" — the approach currently prototyped in
+`examples/rocprofiler_sdk_preload_bridge.cpp` — which drifts under queueing.
+
+**`cuptiGetTimestamp` is `CLOCK_REALTIME`**, measured rather than assumed: across
+2,000 trials it landed inside a `CLOCK_REALTIME` bracket 2,000 times and inside a
+`CLOCK_MONOTONIC` bracket zero times, and it sits exactly 37 s from `CLOCK_TAI` —
+the current TAI−UTC offset. Activity record `start`/`end` share that domain.
+
+perf-agent's own samples are `bpf_ktime_get_ns()`, which is `CLOCK_MONOTONIC`
+(`unwind/dwarfagent/miss_drainer.go` already documents this). So the conversion is
+not a fit against a drifting device clock, as this spec previously assumed; it is
+the realtime-to-monotonic offset sampled as a pair,
+`mono = cupti_ts - (realtime - monotonic)`.
+
+The hazard changes shape with it. `CLOCK_REALTIME` is slewed by NTP and can be
+**stepped** — by NTP, by an administrator, by a container host's clock sync. Slew
+is harmless at profiling resolution: the pair offset moved under 15 µs over 20 s
+on an NTP-disciplined box. A step is not harmless. It shifts every subsequent GPU
+timestamp relative to the CPU profile at once and can place an execution before
+its own launch. The shim therefore re-samples the pair periodically and watches
+for a *discontinuity* rather than fitting a smooth drift model; on a detected step
+it re-anchors and marks the affected window instead of silently emitting
+mis-joined records.
 
 ## 8. Output representation
 
@@ -515,6 +544,28 @@ applied is the whole change. `google/pprof`'s `Sample.Label` is already wired up
   drops at the eBPF boundary, and eviction counts from the bounded ring. All
   surfaced; none silent.
 
+### 9.1 What the injected shim actually costs
+
+Measured on the lab 3090 (2026-08-19) against a CUDA process driving a saturating
+~393k launches/s — an unrealistic ceiling, chosen so the per-launch cost is
+visible at all. Five interleaved 6-second runs per mode, medians:
+
+| shim mode | launches/s | vs baseline |
+|---|---:|---:|
+| no injection | 393,325 | — |
+| injected, CUPTI untouched | 393,492 | 0.0% |
+| callbacks (RUNTIME + RESOURCE) | 391,408 | −0.5% |
+| activity (CONCURRENT_KERNEL) | 354,158 | −10.0% |
+| both | 353,825 | −10.0% |
+
+Injection itself is free, and the callback path — the launch anchor Phase 4 is
+built on — is nearly free. The entire cost sits in the activity path: ~0.28 µs per
+launch (2.54 µs → 2.82 µs). That is a per-launch constant to budget against, not a
+percentage; at a realistic 10–50k launches/s it is well under 1%.
+
+Which inverts where the pressure lies: the token bucket protects the callback path,
+but the thing worth being adaptive about is the activity path.
+
 ## 10. Correlation and joins
 
 The join ladder from PR #10 `gpu/timeline.go` is kept: exact correlation ID first,
@@ -536,7 +587,32 @@ The storage under it is rewritten:
 - Unbounded slices become a **bounded ring with time-based eviction**. The
   eviction horizon is what determines how late a PC sample batch can arrive and
   still be attributable, so it is a first-class tunable, not an implementation
-  detail.
+  detail. It now has a measured floor — see below.
+
+**How late records actually are.** Activity records do not arrive when a kernel
+ends; they arrive when their buffer is delivered, and CUPTI delivers a buffer only
+once it is full. Measured delivery lag after kernel end:
+
+| workload | shim flush | p50 | p99 | max |
+|---|---|---:|---:|---:|
+| ~393k launches/s | none | 33 ms | 112 ms | 119 ms |
+| ~25 launches/s | none | 7.6 s | 15.0 s | 15.0 s |
+| ~25 launches/s | own `cuptiActivityFlushAll` every 100 ms | 91 ms | 101 ms | 101 ms |
+
+The idle case is the dangerous one, and it is the counterintuitive direction: a
+*quiet* GPU delivers records later, because a 4 MB buffer holding five records
+takes an age to fill. In the 25 launches/s run with no flush, nothing arrived at
+all until process exit — one buffer, 375 records, up to 15 s stale.
+
+`cuptiActivityFlushPeriod()` does not solve it. It returns success and changes
+nothing, because by its own contract it "can return only those activity buffers
+which are full". The shim must own a flush timer calling `cuptiActivityFlushAll()`;
+at 100 ms that bounded delivery to ~100 ms at both extremes and cost nothing
+measurable at the 393k launches/s ceiling.
+
+So the eviction horizon is not a guess: it is the shim's flush period plus transit,
+and the flush period is the knob that sets it. A horizon shorter than the flush
+period drops every exec record's join, silently, and only on idle workloads.
 - Linear scans become a **correlation-ID index**. Today `Snapshot()` scans all
   launches for every execution and every event, and all samples for every
   execution — quadratic, and invisible at fixture scale.
@@ -557,6 +633,12 @@ Target model: **sidecar plus a shared volume.**
   `CUDA_INJECTION64_PATH` to it; the agent opens the identical file in its own
   mount namespace. Same inode — which is what uprobe attachment actually keys on
   — with no `/proc/<pid>/root` traversal and no overlay-inode instability.
+
+  The injection half of this is confirmed on hardware (2026-08-19): a shim
+  exporting `InitializeInjection` was loaded into an ordinary CUDA process that
+  links no CUPTI and knows nothing about profiling, subscribed successfully, and
+  captured 6.67 M launches, their execution records and the module load. Injection
+  cost nothing measurable on its own (§9.1).
 - PID visibility is still required, but for perf-agent's **existing** function,
   not the GPU path: `unwind/procmap` reads `/proc/<pid>/maps`,
   `/proc/<pid>/map_files/...` and `/proc/<pid>/comm` to unwind and symbolize.

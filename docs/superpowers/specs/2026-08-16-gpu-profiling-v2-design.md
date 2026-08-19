@@ -174,6 +174,12 @@ Requirements:
   producer whose vendor API does not supply one must synthesise a unique value
   per launch; emitting the zero value is not permitted. A vendor id that wraps
   counts as "does not supply one" — see §6.3 finding 4.
+- **The semaphore gates the producer, and costs nothing when nobody listens.**
+  Measured with the real shim: with no consumer attached the semaphore reads 0,
+  and 200 launches produced 200 skipped probes and zero emitted records. The shim
+  does no formatting, no batching and no work beyond one load-and-branch per
+  launch until a consumer attaches. This is what makes it safe to ship the shim
+  in an application container that is not currently being profiled.
 - `core/` **owns a drain timer**, and its period is a first-class tunable rather
   than a vendor default. Both vendors deliver events in buffers that are handed
   over when full, so on an idle GPU events sit undelivered for as long as it
@@ -639,6 +645,13 @@ Target model: **sidecar plus a shared volume.**
   links no CUPTI and knows nothing about profiling, subscribed successfully, and
   captured 6.67 M launches, their execution records and the module load. Injection
   cost nothing measurable on its own (§9.1).
+
+  So is the inode claim this bullet rests on. In the victim's `/proc/<pid>/maps`
+  the injected shim appears as four file-backed mappings — `r-xp` among them —
+  all carrying the same inode that `stat` reports for the file on disk. That
+  inode is what uprobe attachment keys on, so the shared-volume scheme has no
+  remaining unknown on the injection side; what is untested is only the agent
+  opening the same inode from a *different mount namespace*.
 - PID visibility is still required, but for perf-agent's **existing** function,
   not the GPU path: `unwind/procmap` reads `/proc/<pid>/maps`,
   `/proc/<pid>/map_files/...` and `/proc/<pid>/comm` to unwind and symbolize.
@@ -784,10 +797,18 @@ Verified on the development host:
 
 Setup steps, none of them obstacles:
 
-- `sys/sdt.h` is not installed (`systemtap-sdt-devel`). Alternatively the shim can
-  emit `.note.stapsdt` notes via inline asm and carry no systemtap build
-  dependency at all — worth deciding in Phase 3 on its merits, not because of
-  what happens to be installed.
+- `sys/sdt.h` is not installed (`systemtap-sdt-devel`), and it turns out not to be
+  needed. **Decided on evidence 2026-08-19: the shim emits `.note.stapsdt` via
+  inline asm and carries no systemtap build dependency.** A hand-written macro
+  produced a note that `readelf -n` reads back correctly (provider, name, base,
+  semaphore, `8@%rax 8@%rdx 8@%rcx`), and `internal/usdt.ParseFile` — the parser
+  merged in PR #32 — recovered it from the real shim `.so`, resolving the
+  semaphore's link-time address to a file offset. That is the parser's first
+  exercise against a producer rather than a fixture.
+
+  The argument descriptor came back as whatever registers the compiler happened
+  to choose, which is the concrete reason `usdt.Probe.Args` is stored verbatim
+  and parsed by the consumer rather than assumed by the ABI.
 - `NVreg_RestrictProfilingToAdminUsers=0` is needed for non-root access to the
   CUPTI profiling APIs. On the lab box this is already set — `/proc/driver/nvidia/params`
   reports `RmProfilingAdminOnly: 0`, and the 2026-08-19 spike ran PC sampling as

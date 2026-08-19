@@ -107,7 +107,7 @@ ABI (the consumer reads a perf-agent-defined record, not a CUPTI one).
 |---|---|
 | `gpu_launch_v1` | batch of launches: correlation ID, kernel name ref, queue/stream, context, host timestamp |
 | `gpu_exec_v1` | batch of executions: correlation ID, device, queue, start/end in CPU-monotonic |
-| `gpu_pc_sample_batch_v1` | batch of PC samples: correlation ID, module ref, PC offset, stall index, count |
+| `gpu_pc_sample_batch_v1` | batch of PC samples: module CRC, PC offset, function index, stall index, count, and a correlation ID only where the vendor supplies one |
 | `gpu_module_load_v1` | cubin identity (CRC), size, and bytes ref |
 | `gpu_stall_reason_map_v1` | one-shot stall index → name table |
 | `gpu_config_v1` | sampling factor, SM count, clock frequency |
@@ -271,8 +271,9 @@ development host's AMD hardware — rather than against CUPTI documentation.
 records, and anywhere the two vendors differ is called out below rather than
 papered over. That is the whole point of §6.1 — one ABI, thin adapters.
 
-Fields marked **[spike]** are the ones the CUPTI spike must confirm. Everything
-else is grounded in a working producer.
+The layouts below already incorporate the CUPTI spike's findings (2026-08-19 —
+see *What the spike settled*), so the fields that once carried a **[spike]** mark
+now carry an answer. Everything else is grounded in a working producer.
 
 #### Conventions
 
@@ -284,9 +285,11 @@ else is grounded in a working producer.
   bitfields, no compiler-layout dependence — the consumer is a BPF program, not
   a C compiler.
 - `correlation` is `u64`. ROCm supplies `record->correlation_id.internal`
-  directly; CUPTI's `correlationId` is `uint32` and zero-extends. §6's
-  requirement that **every** launch and execution carry a non-zero correlation
-  applies to both.
+  directly. CUPTI's `correlationId` is a `uint32` process-wide counter that wraps
+  in hours under load, so the adapter does not merely zero-extend it: it prefixes
+  a 32-bit epoch (§6.3, finding 4). §6's requirement that **every** launch and
+  execution carry a non-zero correlation applies to both, and on the CUPTI side
+  it is the adapter, not the vendor, that makes it true.
 - All `*_ns` are CPU-monotonic. Conversion happens in the adapter, never in the
   core (§7).
 
@@ -312,8 +315,8 @@ adapter a small map and saves every execution record from carrying a string.
 | `gpu_launch_v1` | `correlation u64`, `kernel_id u64`, `queue_id u64`, `context_id u64`, `time_ns u64`, `tid u32`, `_pad u32` |
 | `gpu_exec_v1` | `correlation u64`, `kernel_id u64`, `queue_id u64`, `device_id u64`, `start_ns u64`, `end_ns u64` |
 | `gpu_kernel_name_v1` | `kernel_id u64`, `name_len u16`, `name[]` — the interning table; replayed on late attach |
-| `gpu_pc_sample_batch_v1` | `correlation u64`, `module_id u64`, `pc_offset u64`, `stall_index u32`, `count u32` |
-| `gpu_module_load_v1` | `module_id u64`, `size_bytes u64`, `load_ns u64`, `bytes_ptr u64` **[spike]** |
+| `gpu_pc_sample_batch_v1` | `cubin_crc u64`, `correlation u64` (0 = unknown), `pc_offset u64`, `function_index u32`, `stall_index u32`, `count u32`, `_pad u32` |
+| `gpu_module_load_v1` | `cubin_crc u64`, `module_id u64`, `size_bytes u64`, `load_ns u64`, `bytes_ptr u64` |
 | `gpu_stall_reason_map_v1` | `index u32`, `name_len u16`, `name[]` — one-shot, replayed on late attach |
 | `gpu_config_v1` | `sampling_factor u32`, `sm_count u32`, `clock_hz u64`, `vendor u8` |
 | `gpu_dropped_v1` | `class u8`, `count u64` — producer-side loss, per §9 and the §7 sink contract |
@@ -348,22 +351,113 @@ before freeze.
    the execution side — a clean match. CUPTI's callback API supplies the launch
    anchor and the activity API the execution, which is the same split arriving
    through two different mechanisms. No ABI consequence; noted so the CUPTI
-   adapter is not tempted to invent a third record type. **[spike]** confirms
-   the activity record carries everything `gpu_exec_v1` needs.
+   adapter is not tempted to invent a third record type. The spike confirmed that
+   the activity record carries everything `gpu_exec_v1` needs — `start`, `end`,
+   `correlationId`, `deviceId`, `streamId` and the kernel name — in a single
+   `CUpti_ActivityKernel12`.
 
-#### What the spike must settle
+#### What the spike settled
 
-Narrow, because the AMD side already answered most of it:
+Ran 2026-08-19 against the lab RTX 3090 (GA102, sm_86), driver 610.57.04, CUDA
+13.3, `RmProfilingAdminOnly: 0`. Four throwaway programs; the code is discarded,
+the findings below are the output. Two of the four answers changed the ABI.
 
-- Does the CUPTI activity record supply queue/stream and device identity
-  directly, or must the adapter track it from callbacks?
-- What is the real shape and lifetime of the cubin payload behind `bytes_ptr` —
-  is it stable for the probe's duration, or must the adapter copy it?
-- Do CUPTI PC samples arrive with a correlation that matches the launch's, or a
-  separate sampling correlation that needs its own mapping?
-- Confirm `correlationId` is genuinely unique per launch within a process, not
-  reused after wraparound. §6 requires uniqueness; a 32-bit counter is exactly
-  the case that wraps.
+**1. Device and queue identity: the execution record supplies both directly.**
+
+`CUpti_ActivityKernel12` — the current revision in CUDA 13.3 — carries
+`deviceId`, `contextId`, `streamId`, `correlationId`, `gridId`, `channelID` and
+`name`. Nothing has to be tracked from callbacks to populate `gpu_exec_v1`.
+
+The *launch* side is what cannot be trusted. A launch callback can ask
+`cuptiGetStreamIdEx(ctx, stream, perThreadDefaultStream, &id)`, but for the
+**default stream** the answer depends on that flag: in one process
+`perThreadDefaultStream=0` returned 7 and `=1` returned 13, while the execution
+records for those same default-stream launches reported 7. The flag mirrors
+whether the application was compiled `--default-stream per-thread`, which the
+adapter cannot observe from inside the process. Explicit streams agree under
+either flag.
+
+So `gpu_launch_v1.queue_id` stays **optional (zero means unknown)** and the
+adapter must not guess it; `gpu_exec_v1` is the authoritative source of queue and
+device. The optionality was already conceded for ROCm above; CUPTI needs the same
+allowance for an unrelated reason.
+
+**2. The cubin behind `bytes_ptr` must be copied inside the load callback.**
+
+`CUPTI_CBID_RESOURCE_MODULE_LOADED` delivers `{moduleId u32, cubinSize, pCubin}`
+pointing at an ELF image. Measured lifetime of that buffer:
+
+| when | result |
+|---|---|
+| while the module is loaded, including late in process life | readable, contents identical |
+| immediately after `cuModuleUnload` | readable, **contents changed** |
+| after 64 MB of heap churn | readable, contents changed |
+
+That is the dangerous shape: the buffer is not unmapped, so a late reader gets
+silently wrong bytes rather than a fault. The adapter must copy during the load
+callback; `MODULE_UNLOAD_STARTING` — which arrives with the same `moduleId` and
+the same pointer — is the deadline. CUDA's lazy module loading puts loads and
+unloads at arbitrary points in a long-running process, so "copy later" has no
+safe definition. `bytes_ptr` on the wire therefore points at an adapter-owned
+copy, never at CUPTI's buffer.
+
+`moduleId` is a small per-process sequential `u32` (22, then 23 in one run) — not
+a hash, not stable across processes, and not the identity PC samples use. Which
+leads to the next finding.
+
+**3. PC samples carry no correlation in the mode we ship; they key on `cubinCrc`.**
+
+The same workload under both collection modes:
+
+| mode | samples | PC records | `correlationId` |
+|---|---|---|---|
+| `CONTINUOUS` | 103,440 | 352 | 0 on every record |
+| `KERNEL_SERIALIZED` | 103,515 | 1,828 | non-zero on all 1,828, every one matching a launch callback's id |
+
+`cupti_pcsampling.h` states it and the hardware agrees: the field is "only valid
+for serialized mode of pc sampling collection. For continous mode of collection
+the correlationId will be set to 0." Serialized mode serializes kernel execution,
+which §2 rules out for continuous production profiling — so **the configuration
+we ship is the one where PC samples have no correlation at all.**
+
+What the records do carry: `cubinCrc u64`, `pcOffset u64`, `functionIndex u32`,
+`functionName`, and a variable-length array of (stall index, sample count) pairs
+drawn from the 38 stall reasons this device exposes. Attribution is therefore
+`cubinCrc` → module → `functionIndex`/`pcOffset` → symbol, reaching the kernel
+through the module and function rather than through a launch.
+
+`cuptiGetCubinCrc()` over the `MODULE_LOADED` bytes reproduces exactly the CRC
+the PC records carry, and that identity is the only thing joining the two. Hence
+`cubin_crc` is now the first field of `gpu_module_load_v1`, and
+`gpu_pc_sample_batch_v1` keys on `cubin_crc` rather than `module_id`, keeping
+`correlation` only as an optional (zero = unknown) field against a future
+serialized mode. The canonical model was already right here: `ModuleRef` in
+`gpu/types.go` keys on CRC, not on a module id.
+
+The stall array is the one place the fixed-size record rule costs something: the
+adapter emits one record per (PC, stall reason) pair rather than one per PC.
+
+**4. `correlationId` is a process-wide counter, and it wraps.**
+
+It starts at 1 and increments once per *outermost* traced API call — not per
+launch. Observed directly: `cudaMalloc`=1, `cudaStreamCreate`=2,3,
+`cudaLaunchKernel`=4, `cudaDeviceSynchronize`=5, and so on; 54 launches inside a
+65-call mix consumed 65 ids. Nested driver calls share the runtime call's id, but
+only while the DRIVER domain is unsubscribed: 500 launches consumed 1.004 ids
+each under RUNTIME alone and 2.242 each under RUNTIME+DRIVER. **The adapter
+subscribes RUNTIME and RESOURCE only** — adding DRIVER halves the time to wrap
+and buys nothing this ABI reads.
+
+Rate: 200,000 empty launches on one stream in 0.369 s = 542,515 launches/s, so
+2^32 ids exhaust in ~7,900 s ≈ **2.2 hours** at that synthetic ceiling. Even at a
+realistic 50k launches/s the wrap lands inside a day — well inside the lifetime
+of a profiled service.
+
+§6 requires a unique non-zero correlation on every launch and execution, and the
+wire field is already `u64`. The adapter closes the gap: hold a 32-bit epoch,
+increment it when an observed id drops below its predecessor by more than a guard
+band, and emit `epoch << 32 | correlationId`. Uniqueness is a producer
+obligation, not something CUPTI provides.
 
 ## 7. Canonical event model
 
@@ -428,6 +522,14 @@ then queue + kernel-name + bounded-time heuristic, with `Heuristic` and
 `Ambiguous` marked per view and rolled into `JoinStats`. A guessed join is never
 presented as a vendor-provided one. NVIDIA will mostly take the exact path, but
 PC sample batches arrive late and need the honesty machinery.
+
+PC samples are a special case the spike forced (§6.3, finding 3): in continuous
+mode they carry **no correlation ID**, so the exact-correlation rung is not
+merely unlikely for them, it is unavailable. They enter through the module
+instead — `cubin_crc` to a loaded module, `function_index`/`pc_offset` to a
+symbol — and are attributed to executions of that kernel within the eviction
+horizon. Where that window holds more than one execution of the same kernel, the
+attribution is `Ambiguous` and is marked, not guessed away.
 
 The storage under it is rewritten:
 
@@ -605,7 +707,10 @@ Setup steps, none of them obstacles:
   dependency at all — worth deciding in Phase 3 on its merits, not because of
   what happens to be installed.
 - `NVreg_RestrictProfilingToAdminUsers=0` is needed for non-root access to the
-  CUPTI profiling APIs. On the lab box this is a modprobe option and a reboot. In
+  CUPTI profiling APIs. On the lab box this is already set — `/proc/driver/nvidia/params`
+  reports `RmProfilingAdminOnly: 0`, and the 2026-08-19 spike ran PC sampling as
+  an unprivileged user against driver 610.57.04 to confirm it. Elsewhere it is a
+  modprobe option and a reboot. In
   production it is a **node prerequisite in the same class as installing the
   driver**, and it matters because the shim runs as the application's user, which
   in a container is usually not root.
@@ -648,6 +753,11 @@ Setup steps, none of them obstacles:
    record shapes*, with the code discarded; it does not need to run against the
    Phase 2 core at all, so it cannot be misled by buffer behaviour.
 
-   Open, with a deadline: it must be settled before Phase 3 freezes the ABI.
+   **Settled 2026-08-19: yes, and it ran.** The findings are in §6.3 *What the
+   spike settled*. It repaid itself — two of its four answers changed the ABI
+   (`gpu_pc_sample_batch_v1` cannot key on correlation; `gpu_module_load_v1`
+   needs `cubin_crc`), and a third turned a correctness assumption into a
+   producer obligation (correlation IDs wrap in hours, not never). The code was
+   discarded as planned; only the knowledge was kept.
 2. Sidecar or same-container as the shipping default. Sidecar plus shared volume
    is the design target; same-container is simpler but couples lifecycles.

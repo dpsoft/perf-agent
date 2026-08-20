@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#include <poll.h>
 #include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
@@ -128,10 +130,51 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped());
 }
 
+// linger keeps this process alive after its records are flushed, until the
+// parent closes our stdin or linger_ms elapses -- whichever comes first.
+//
+// This exists for the consumer, not for us. A sampled launch's CPU stack is
+// symbolized against /proc/<pid>/maps of the LAUNCHING process, and the
+// kernel tears that down the moment the process exits. A producer that
+// flushes and exits immediately therefore races its own consumer: any record
+// still in the ringbuf when we die symbolizes to bare addresses. Lingering
+// hands the consumer a window in which the maps it needs still exist.
+//
+// EOF on stdin, not a fixed sleep: it lets the consumer release us the
+// instant it has what it needs, so the gate does not trade a race for a
+// guessed delay. linger_ms is the backstop for a stub run by hand from a
+// terminal, where stdin never reaches EOF -- it must never hang forever.
+static void linger(unsigned linger_ms) {
+    if (!linger_ms) return;
+    struct pollfd p{};
+    p.fd = STDIN_FILENO;
+    p.events = POLLIN;
+    // Loop, because poll() returns on readable stdin as well as on EOF and a
+    // parent that writes something is not a parent that released us. Drain
+    // and keep waiting; only a zero-length read (EOF) or the deadline ends it.
+    const uint64_t deadline = mono_ns() + (uint64_t)linger_ms * 1000000ULL;
+    for (;;) {
+        const uint64_t now = mono_ns();
+        if (now >= deadline) return;
+        const int left = (int)((deadline - now) / 1000000ULL) + 1;
+        const int rc = poll(&p, 1, left);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (rc == 0) return;                      // deadline
+        char buf[256];
+        const ssize_t got = read(STDIN_FILENO, buf, sizeof(buf));
+        if (got <= 0) return;                     // EOF, or a broken stdin
+    }
+}
+
 int main(int argc, char **argv) {
     const unsigned n = argc > 1 ? (unsigned)atoi(argv[1]) : 1000;
     const unsigned us = argc > 2 ? (unsigned)atoi(argv[2]) : 100;
     const unsigned sp = argc > 3 ? (unsigned)atoi(argv[3]) : 8;
+    const unsigned lm = argc > 4 ? (unsigned)atoi(argv[4]) : 0;
     perfagent_stub_run(n, us, sp);
+    linger(lm);
     return 0;
 }

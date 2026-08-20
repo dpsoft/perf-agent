@@ -48,13 +48,45 @@ func main() {
 		}
 	}()
 
-	if out, err := exec.Command(stub, "2000", "200").CombinedOutput(); err != nil {
-		log.Fatalf("stub: %v: %s", err, out)
+	// sample_period=8 (the stub's default, stated) and a 30s linger. The
+	// linger is what makes the CPU frames in this profile readable: a
+	// sampled launch's stack is symbolized against /proc/<pid>/maps of the
+	// stub, which the kernel destroys the instant the stub exits. Waiting on
+	// the process (the previous CombinedOutput) meant every record still in
+	// the ringbuf at that moment resolved to bare hex addresses — an artifact
+	// that looks like a working profile and names nothing.
+	const wantSampled = 2000 / 8 // the sampler is deterministic at period 8
+	cmd := exec.Command(stub, "2000", "200", "8", "30000")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	release, err := cmd.StdinPipe()
+	if err != nil {
+		log.Fatalf("stub stdin: %v", err)
 	}
-	// The stub flushes both batches synchronously before it exits, and
-	// CombinedOutput above already blocked until then, so every record is
-	// in the ringbuf by this point. The sleep is for c.Run's goroutine to
-	// drain it, not for the stub.
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("stub: %v", err)
+	}
+	// Hold the stub open until the consumer has counted every sampled
+	// launch; closing its stdin is what releases it.
+	deadline := time.Now().Add(30 * time.Second)
+	for c.Stats().SampledLaunches < wantSampled {
+		if time.Now().After(deadline) {
+			log.Printf("WARNING: only %d/%d sampled launches observed before the stub was released; "+
+				"stacks that arrive after it exits cannot be symbolized",
+				c.Stats().SampledLaunches, wantSampled)
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := release.Close(); err != nil {
+		log.Fatalf("release stub: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Fatalf("stub: %v", err)
+	}
+	// The stub flushes both batches synchronously before it lingers, so every
+	// record is in the ringbuf by this point. The sleep is for c.Run's
+	// goroutine to drain the tail of batched launches and executions — none
+	// of which carries a stack, so none of it needs the stub alive.
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	// Wait for Run to actually return before flushing or snapshotting:

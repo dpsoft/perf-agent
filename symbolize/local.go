@@ -11,12 +11,21 @@ import (
 // ErrClosed is returned from operations on a closed Symbolizer.
 var ErrClosed = errors.New("symbolize: closed")
 
+// errSkippedMapFiles stands in for the first attempt's error once the
+// map_files path has been latched off. It never escapes SymbolizeProcess.
+var errSkippedMapFiles = errors.New("symbolize: map_files disabled")
+
 // LocalSymbolizer wraps blazesym's Process source with no off-box hooks —
 // preserves perf-agent's pre-debuginfod behavior. Used when no debuginfod
 // URL is configured.
 type LocalSymbolizer struct {
 	bz     *blazesym.Symbolizer
 	closed atomic.Bool
+	// noMapFiles latches once /proc/<pid>/map_files/ has been proven
+	// unusable for this process (see SymbolizeProcess). It is a
+	// performance latch, not a correctness one: while false, every
+	// symbolization pays a doomed first attempt.
+	noMapFiles atomic.Bool
 }
 
 // NewLocalSymbolizer constructs a LocalSymbolizer with code-info and
@@ -35,13 +44,32 @@ func NewLocalSymbolizer() (*LocalSymbolizer, error) {
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
 // expanded into the Frame.Inlined slice in caller-most-to-callee order.
 //
-// On blazesym error (e.g. "permission denied" when the target is
-// setcap'd and ptrace_scope restricts /proc/<pid>/exe), returns raw
-// hex-named Frames instead of dropping the batch — preserves stack
-// shape and addresses so operators can decode with addr2line and
-// the pprof's user mapping still has somewhere to attach. A future
-// per-mapping ELF resolver (roadmap follow-up to bench-self bug B)
-// can recover full symbols using procmap-supplied paths.
+// blazesym's process source resolves each mapping through
+// /proc/<pid>/map_files/<range>, which is inode-accurate: it cannot be
+// fooled by a binary that was replaced or deleted since it was mapped.
+// Following those magic symlinks is privileged — the kernel's
+// proc_map_files_get_link() rejects the open with EPERM unless the caller
+// holds CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) — so on a perf-agent that
+// was setcap'd with only cap_bpf,cap_perfmon the ENTIRE batch fails with
+// "permission denied" and every frame degrades to a bare address. Nothing
+// about that failure is visible in the returned error, because the fallback
+// below deliberately does not propagate it.
+//
+// So: on any error, retry once with no_map_files, which reads the symbolic
+// paths out of /proc/<pid>/maps instead. That is what every other profiler
+// does and needs no capability at all; it is second choice only because a
+// symbolic path can be re-pointed at different contents between the mmap and
+// the read. Once the retry has actually rescued a batch we know map_files is
+// closed to us for good, so the doomed first attempt is latched off.
+//
+// If the retry fails too — the usual reason being that the process exited and
+// /proc/<pid>/maps is gone, "entity not found" — returns raw hex-named Frames
+// instead of dropping the batch. That preserves stack shape and addresses so
+// operators can decode with addr2line and the pprof's user mapping still has
+// somewhere to attach. Those frames carry Reason == FailureMissingSymbols;
+// callers that need to know symbolization resolved nothing must inspect
+// Frame.Reason, because err is nil on this path (see
+// gpuprobe.Stats.StacksUnresolved for a consumer that does).
 func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -49,14 +77,30 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	if len(ips) == 0 {
 		return nil, nil
 	}
-	syms, err := s.bz.SymbolizeProcessAbsAddrs(
-		ips,
-		pid,
+	opts := []blazesym.ProcessSourceOption{
 		blazesym.ProcessSourceWithPerfMap(true),
 		blazesym.ProcessSourceWithDebugSyms(true),
-	)
+	}
+	var syms []blazesym.Sym
+	var err error
+	if !s.noMapFiles.Load() {
+		syms, err = s.bz.SymbolizeProcessAbsAddrs(ips, pid, opts...)
+	} else {
+		err = errSkippedMapFiles
+	}
 	if err != nil {
-		return rawUserAddrFrames(ips), nil
+		// A fresh slice, not append(opts, ...): opts must not gain the
+		// no_map_files option as a side effect if this function ever grows a
+		// second use of it.
+		retryOpts := make([]blazesym.ProcessSourceOption, 0, len(opts)+1)
+		retryOpts = append(retryOpts, opts...)
+		retryOpts = append(retryOpts, blazesym.ProcessSourceWithoutMapFiles(true))
+		var retryErr error
+		syms, retryErr = s.bz.SymbolizeProcessAbsAddrs(ips, pid, retryOpts...)
+		if retryErr != nil {
+			return rawUserAddrFrames(ips), nil
+		}
+		s.noMapFiles.Store(true)
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {

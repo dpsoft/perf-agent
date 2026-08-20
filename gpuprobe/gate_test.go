@@ -88,7 +88,12 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 30s, not 15: the gate now holds the producer open until the consumer
+	// has counted every sampled launch, and that wait has its own 10s
+	// deadline. A context that could expire underneath it would turn a clear
+	// "timed out waiting for N sampled launches" into a pile of zero-valued
+	// assertions with no cause attached.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
@@ -104,18 +109,67 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// sample_period=8 explicit (it also happens to be the stub's default):
 	// with 500 launches the sampler is deterministic and yields exactly 63
 	// sampled launches (n%8==0 for n in 0..499, i.e. ceil(500/8)).
-	cmd := exec.Command(stub, "500", "200", "8")
+	//
+	// The fourth argument is the linger: after flushing, the stub waits for
+	// EOF on stdin (up to 10s) before exiting. Start(), not Run(): the
+	// consumer symbolizes each sampled stack against /proc/<pid>/maps of the
+	// LAUNCHING process, and the kernel destroys those maps the instant the
+	// process exits. cmd.Run() blocks until exit, so under it every record
+	// still in the ringbuf at that moment symbolizes to bare addresses — the
+	// assertion below on the stub's own frame then fails for a reason that
+	// has nothing to do with the capture path. Holding the producer open
+	// until the consumer has counted every sampled launch removes the race
+	// instead of papering over it with a longer sleep.
+	cmd := exec.Command(stub, "500", "200", "8", "10000")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
-	require.NoError(t, err, "stdout: %s stderr: %s", stdout.String(), stderr.String())
+	release, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	// Closing the pipe is what lets the stub exit. Deferred as a belt-and-
+	// braces release so a t.Fatal between here and the explicit close below
+	// cannot leave the stub parked for its full backstop.
+	defer func() { _ = release.Close() }()
+
+	// Wait for the consumer to have OBSERVED every sampled launch, rather
+	// than sleeping and hoping. Stats is the right handle: SampledLaunches is
+	// incremented on the decode path, and stacks are symbolized on that same
+	// path, so once it reads 63 every symbolization has already happened —
+	// and happened while the stub was alive.
+	const wantSampled = 63
+	deadline := time.Now().Add(10 * time.Second)
+	var lastSampled uint64
+	for {
+		lastSampled = c.Stats().SampledLaunches
+		if lastSampled >= wantSampled {
+			break
+		}
+		if time.Now().After(deadline) {
+			// Fail loudly rather than hang: a stub that never emitted and a
+			// consumer that never drained look identical from a timeout, so
+			// print what the consumer did see.
+			_ = release.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			cancel()
+			<-done
+			t.Fatalf("timed out after 10s waiting for %d sampled launches; consumer saw %d. stats: %+v stderr: %s",
+				wantSampled, lastSampled, c.Stats(), stderr.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Every sampled stack is symbolized by now, so the producer may go.
+	require.NoError(t, release.Close())
+	require.NoError(t, cmd.Wait(), "stdout: %s stderr: %s", stdout.String(), stderr.String())
 	stubErr := stderr.String()
 
-	// perfagent_stub_run flushes both batches synchronously before the
-	// child process exits, and cmd.Run above already blocked until
-	// then — so every record is in the ringbuf by this point. The sleep is
-	// for our own Run() goroutine to drain it, not for the stub.
+	// perfagent_stub_run flushes both batches synchronously before it
+	// lingers, so every record is in the ringbuf by this point. This sleep is
+	// for our own Run() goroutine to drain the tail of BATCHED launches and
+	// execs — none of which needs a live process, because only sampled
+	// launches carry a stack to symbolize.
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
@@ -181,6 +235,21 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		"the stub never emits correlation 0 on a sampled launch")
 	assert.Zero(t, stats.SymbolizeFailed,
 		"a real Symbolizer is configured; every captured stack must resolve to at least one frame")
+	// The counter that would have caught this branch's symbolization failure
+	// on its own. SymbolizeFailed stayed at zero through a run in which all
+	// 63 stacks resolved to nothing but hex addresses, because blazesym
+	// returned a frame per IP and no error — see
+	// symbolize.LocalSymbolizer.SymbolizeProcess. A regression here now fails
+	// as a number rather than being noticed by a human reading the frame
+	// dump in the assertion below.
+	assert.Zero(t, stats.StacksUnresolved,
+		"every captured stack must resolve at least one real symbol; %d/%d frames came back address-only",
+		stats.StackFramesUnresolved, stats.StacksResolved)
+	// Deliberately NOT asserted zero: a vDSO frame, or a libc built without
+	// a usable symbol table, is a legitimate address-only frame in an
+	// otherwise readable stack, and that varies by distro. StacksUnresolved
+	// above is the invariant; this is the diagnostic printed alongside it.
+	t.Logf("frames that resolved to a bare address: %d", stats.StackFramesUnresolved)
 	assert.Zero(t, stats.KernelNamesUnresolved,
 		"the stub interns both kernel names before any launch or exec references them; every event must carry a name")
 

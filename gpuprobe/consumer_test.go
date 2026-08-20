@@ -947,6 +947,13 @@ type fakeSymbolizer struct {
 	err  error
 	pids []uint32
 	ips  [][]uint64
+	// unresolved, when non-nil, decides per IP whether the frame comes back
+	// address-only: a Frame with no error, a name that is just the hex
+	// address, and Reason set. That is exactly what
+	// symbolize.LocalSymbolizer produces when blazesym cannot open the
+	// target process - the shape that made the Phase 4a gate look like a
+	// success while resolving nothing.
+	unresolved func(ip uint64) bool
 }
 
 func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Frame, error) {
@@ -957,6 +964,14 @@ func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize
 	}
 	out := make([]symbolize.Frame, 0, len(ips))
 	for _, ip := range ips {
+		if s.unresolved != nil && s.unresolved(ip) {
+			out = append(out, symbolize.Frame{
+				Address: ip,
+				Name:    fmt.Sprintf("0x%x", ip),
+				Reason:  symbolize.FailureMissingSymbols,
+			})
+			continue
+		}
 		out = append(out, symbolize.Frame{Address: ip, Name: fmt.Sprintf("fn_%x", ip)})
 	}
 	return out, nil
@@ -1286,6 +1301,69 @@ func TestMissingSymbolizerIsCountedNotSilent(t *testing.T) {
 	require.Len(t, sink.launches, 1)
 	assert.Empty(t, sink.launches[0].Launch.CPUStack)
 	assert.Equal(t, uint64(1), c.Stats().SymbolizeFailed)
+}
+
+// Symbolization that returns a frame per IP and resolves not one name is
+// not a success. It is not a SymbolizeFailed either - the stack is
+// delivered - so it needs a counter of its own, or it reads as a healthy
+// run. This is the exact failure the Phase 4a gate hit: 63 stacks, 0
+// SymbolizeFailed, and every frame named after its own address.
+func TestSymbolizationThatResolvesNoNameIsCountedNotSilent(t *testing.T) {
+	sink := &recordingSink{}
+	sym := &fakeSymbolizer{unresolved: func(uint64) bool { return true }}
+	c, sm, _ := stackConsumer(t, sink, Config{Symbolizer: sym})
+	sm.put(1, 0x1000, 0x2000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksUnresolved,
+		"a capture in which no frame resolved must be counted, not reported as a clean run")
+	assert.Equal(t, uint64(2), st.StackFramesUnresolved, "both frames came back address-only")
+	assert.Zero(t, st.SymbolizeFailed,
+		"the symbolizer returned frames and no error; this is a resolution failure, not a symbolizer failure")
+	// The launch and its (unreadable) stack are still delivered: an
+	// address-only stack is worse than a named one and better than none,
+	// and operators can still decode it with addr2line.
+	assert.Equal(t, uint64(1), st.StacksResolved)
+	require.Len(t, sink.launches, 1)
+	assert.Equal(t, []string{"0x2000", "0x1000"}, frameNames(sink.launches[0].Launch.CPUStack))
+}
+
+// One unresolvable frame in an otherwise readable stack is a normal event -
+// a stripped vendor library, a vDSO frame - and must not be reported as an
+// unresolved stack, or the counter cries wolf on every real profile.
+func TestPartiallyResolvedStackIsNotAnUnresolvedStack(t *testing.T) {
+	sink := &recordingSink{}
+	sym := &fakeSymbolizer{unresolved: func(ip uint64) bool { return ip == 0x2000 }}
+	c, sm, _ := stackConsumer(t, sink, Config{Symbolizer: sym})
+	sm.put(1, 0x1000, 0x2000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	st := c.Stats()
+	assert.Zero(t, st.StacksUnresolved, "one frame resolved, so the stack is readable")
+	assert.Equal(t, uint64(1), st.StackFramesUnresolved, "the one address-only frame is still counted")
+}
+
+// A fully resolved stack must leave both counters alone, or "zero" stops
+// meaning anything.
+func TestFullyResolvedStackCountsNoUnresolvedFrames(t *testing.T) {
+	c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+	sm.put(1, 0x1000, 0x2000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	st := c.Stats()
+	assert.Zero(t, st.StacksUnresolved)
+	assert.Zero(t, st.StackFramesUnresolved)
+	assert.Equal(t, uint64(1), st.StacksResolved)
 }
 
 // An entry that reads back with no instruction pointers yields no stack,

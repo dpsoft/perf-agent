@@ -293,6 +293,35 @@ type Stats struct {
 	// this - it degrades to no stack, which projects as unattributed GPU
 	// time, and the degradation is visible here.
 	SymbolizeFailed uint64
+	// StacksUnresolved counts captures the symbolizer accepted — no error,
+	// one frame per instruction pointer — in which NOT ONE frame came back
+	// with a real symbol name. Every frame is an address rendered as
+	// "0x<addr>", which pprof will happily display and no human can read.
+	//
+	// This is deliberately NOT folded into SymbolizeFailed, and it does not
+	// take part in the SampledLaunches reconciliation above: the stack is
+	// delivered and attached, so it is a resolution failure, not a loss. It
+	// gets its own counter because the alternative is what actually happened
+	// on this branch — the Phase 4a gate symbolized 63 stacks into 252
+	// hex addresses while SymbolizeFailed sat at zero, and the failure was
+	// only noticed by a human reading the frame names. A profiler that
+	// resolves no names while reporting no failures is lying by omission.
+	//
+	// The usual causes, in the order worth checking:
+	//
+	//   - The target process exited before its stack was symbolized.
+	//     /proc/<pid>/maps is gone, so there is nothing to resolve against.
+	//   - No capability to follow /proc/<pid>/map_files/ and no usable
+	//     fallback (see symbolize.LocalSymbolizer.SymbolizeProcess).
+	//   - The binary genuinely has no symbol table.
+	StacksUnresolved uint64
+	// StackFramesUnresolved counts individual frames — one per captured
+	// instruction pointer — that came back named after their own address.
+	// Unlike StacksUnresolved this is expected to be non-zero in normal
+	// operation: a stripped vendor library or a vDSO frame in an otherwise
+	// well-resolved stack lands here. It is the ratio against
+	// StacksResolved's frame count that is diagnostic, not the raw number.
+	StackFramesUnresolved uint64
 	// StackDeleteFailed counts stackmap entries the consumer read but could
 	// not delete. See freeStackLocked: deletion is what stops the map
 	// filling, so a rising count here is the early warning for capture
@@ -1003,10 +1032,44 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	// code, so the walked stack is user context by construction, unlike a
 	// perf_event sample that can land mid-syscall. If that assumption ever
 	// breaks, the symptom is unresolved frames, not misattributed ones.
+	// The stack is symbolized against a LIVE process: blazesym resolves it
+	// through /proc/<pid>/maps, which the kernel removes the moment the
+	// process exits. If the launching process is gone by the time its record
+	// is drained from the ringbuf, every frame comes back as a bare address
+	// and lands in StacksUnresolved below.
+	//
+	// For a long-running GPU process that is a non-issue — the consumer
+	// drains continuously and the producer outlives its own records by
+	// orders of magnitude. For a SHORT-LIVED one it is not: a process that
+	// launches a few kernels and exits can beat the drain, and the real
+	// CUPTI adapter will meet exactly that workload. Fixing it properly
+	// means capturing the maps eagerly (at first sight of a pid, or at
+	// process-exit via a sched_process_exit probe) and symbolizing against
+	// that snapshot rather than against /proc — which is Phase 4b work, not
+	// this phase's. Until then the degradation is at least COUNTED, which is
+	// the part that was missing.
 	frames, err := c.cfg.Symbolizer.SymbolizeProcess(pid, ips)
 	if err != nil {
 		c.stats.SymbolizeFailed++
 		return nil, false
+	}
+	// Symbolization that returns a frame per IP and resolves not one name is
+	// not success. Counted here, before ToProfFrames flattens the inline
+	// chains, because Reason survives only on symbolize.Frame - pprof frames
+	// carry no failure field, so after the conversion an address-only name is
+	// indistinguishable from a function genuinely called "0x4017c2".
+	//
+	// Bounded and allocation-free: one pass over the frames already in hand,
+	// two integer increments, nothing retained.
+	var resolved int
+	for i := range frames {
+		if frames[i].Reason == symbolize.FailureNone {
+			resolved++
+		}
+	}
+	c.stats.StackFramesUnresolved += uint64(len(frames) - resolved)
+	if resolved == 0 && len(frames) > 0 {
+		c.stats.StacksUnresolved++
 	}
 	out := symbolize.ToProfFrames(frames)
 	if len(out) == 0 {

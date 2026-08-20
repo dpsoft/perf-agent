@@ -35,7 +35,12 @@ static uint64_t mono_ns() {
     return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
 }
 
-extern "C" void perfagent_stub_run(unsigned launches, unsigned period_us) {
+// Default visibility: this is the one symbol libperfagent-gpu-stub.so must
+// export. Everything else in core/ and this file stays hidden (the Makefile
+// builds with -fvisibility=hidden) so the shim does not leak symbols into
+// whatever process it's injected into.
+extern "C" __attribute__((visibility("default"))) void
+perfagent_stub_run(unsigned launches, unsigned period_us) {
     perfagent::Batch<gpu_launch_v1, 32> lb(emit_launch, launch_enabled);
     perfagent::Batch<gpu_exec_v1, 32> eb(emit_exec, exec_enabled);
 

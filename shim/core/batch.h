@@ -7,10 +7,10 @@
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <type_traits>
 
 namespace perfagent {
 
-using EmitFn = void (*)(const void *ptr, unsigned long count, unsigned long seq);
 using EnabledFn = bool (*)();
 
 // Threading contract: a Batch instance is safe to share between one producer
@@ -23,7 +23,24 @@ using EnabledFn = bool (*)();
 template <typename T, size_t N>
 class Batch {
 public:
-    Batch(EmitFn emit, EnabledFn enabled) : emit_(emit), enabled_(enabled) {}
+    // The emit callback is typed on T rather than on const void*, and that is
+    // load-bearing. The eBPF consumer does not learn a record size from the
+    // wire: it derives one from the attach cookie, which is keyed on the
+    // *probe* it attached (record_size() in bpf/gpu_usdt.bpf.c, cookieFor()
+    // in gpuprobe/consumer.go). Wiring a Batch to the emit thunk of a probe
+    // that carries a different record — say Batch<gpu_module_load_v1> (40
+    // bytes) through the launch probe (48) — would have the kernel copy
+    // 48 * n bytes out of a 40 * n byte buffer, a wild read of 8 * n bytes
+    // past the end. With the callback typed, that pairing does not compile.
+    using Emit = void (*)(const T *ptr, unsigned long count, unsigned long seq);
+
+    static_assert(N > 0, "a batch must be able to hold a record");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "records cross into the kernel by raw copy; T must be trivially copyable");
+    static_assert(sizeof(T) % 8 == 0,
+                  "USDT ABI records are 8-byte aligned and explicitly padded (spec §6.3)");
+
+    Batch(Emit emit, EnabledFn enabled) : emit_(emit), enabled_(enabled) {}
 
     // Returns true if the record was accepted into the batch.
     bool add(const T &rec) {
@@ -62,7 +79,7 @@ private:
         n_ = 0;
     }
 
-    EmitFn emit_;
+    Emit emit_;
     EnabledFn enabled_;
     mutable std::mutex mu_;
     T buf_[N];

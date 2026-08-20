@@ -61,4 +61,29 @@
       :: "r"(_a0), "r"(_a1), "r"(_a2));                                     \
   } while (0)
 
+// Declares the semaphore for probe `name` plus the two thunks a Batch needs,
+// and pins the record's wire size.
+//
+// Every perfagent probe is named after the record it carries: probe
+// gpu_launch_v1 carries struct gpu_launch_v1. That pairing is not decoration
+// — the eBPF consumer derives the record size from an attach cookie keyed on
+// the probe name (record_size() in bpf/gpu_usdt.bpf.c), so a probe fired over
+// a buffer of some other record makes the kernel read past the end of it.
+//
+// Generating the probe fire and the thunk's parameter type from the same
+// token, together with Batch's emit callback being typed on its record, makes
+// that mismatch a compile error: `Batch<gpu_module_load_v1, N>` will not
+// accept gpu_launch_v1_emit. `wire_size` pins the frozen size the consumer's
+// cookie assumes (spec §6.3), so a record that grows is caught here too.
+#define PERFAGENT_USDT_EMITTER(name, wire_size)                             \
+    PERFAGENT_USDT_SEMAPHORE(name);                                         \
+    static_assert(sizeof(struct name) == (wire_size),                       \
+                  #name " record size is frozen; the BPF cookie assumes it");\
+    static bool name##_enabled() { return PERFAGENT_USDT_ENABLED(name); }   \
+    static void name##_emit(const struct name *ptr, unsigned long count,    \
+                            unsigned long seq) {                            \
+        PERFAGENT_USDT_PROBE3(name, ptr, count, seq);                       \
+    }                                                                       \
+    static_assert(true, "swallow the trailing semicolon")
+
 #endif

@@ -11,7 +11,9 @@
 // are counted in the BPF-side `dropped` map and surfaced as
 // Stats.KernelDropped; gaps in a probe's sequence numbers are counted as
 // Stats.SequenceGaps; record kinds this phase carries but does not yet
-// normalize are counted as Stats.Undecoded.
+// normalize are counted as Stats.Undecoded; records whose wire correlation is
+// zero — the ABI's "no correlation", which demotes them to the timeline's
+// heuristic join — are counted as Stats.ZeroCorrelation.
 package gpuprobe
 
 import (
@@ -128,6 +130,15 @@ type Stats struct {
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
 	Malformed uint64
+	// ZeroCorrelation counts records that arrived carrying a wire correlation
+	// of zero, which the ABI defines as "no correlation" (shim/core/usdt_abi.h;
+	// spec §6.3 finding 3 makes it the normal case for PC samples in the
+	// continuous collection mode this project ships). Those records are NOT
+	// lost — they are normalized with the zero gpu.CorrelationID, which routes
+	// them to the timeline's heuristic join instead of the exact one. The
+	// counter exists because that demotion changes how confidently the join
+	// can be read, and a silent demotion is as bad as silent loss.
+	ZeroCorrelation uint64
 	// KernelDropped counts records the BPF program itself could not deliver:
 	// a batch bigger than one ringbuf reservation, a full ringbuf, or a
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
@@ -214,6 +225,11 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	}
 
 	c = &Consumer{cfg: cfg, seqByStream: map[seqKey]uint64{}}
+	// Every failure below this point must leave through a *bare* return that
+	// only assigns err. `return nil, err` would set the named result c to nil
+	// before the deferred cleanup runs, so the defer would call Close on a nil
+	// receiver — a panic in the caller instead of an error, and a leak of the
+	// programs, maps and links Close never got to release.
 	defer func() {
 		if err != nil {
 			// Cleanup path: the caller sees the original failure, not
@@ -224,27 +240,29 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	}()
 
 	if err = spec.LoadAndAssign(&c.objs, nil); err != nil {
-		return nil, fmt.Errorf("load gpu usdt objects: %w", err)
+		err = fmt.Errorf("load gpu usdt objects: %w", err)
+		return
 	}
 
-	ex, err := link.OpenExecutable(cfg.ShimPath)
-	if err != nil {
-		return nil, err
+	var ex *link.Executable
+	if ex, err = link.OpenExecutable(cfg.ShimPath); err != nil {
+		return
 	}
-	l, err := ex.UprobeMulti(nil, c.objs.GpuUsdtBatch, &link.UprobeMultiOptions{
+	var l link.Link
+	l, err = ex.UprobeMulti(nil, c.objs.GpuUsdtBatch, &link.UprobeMultiOptions{
 		Addresses:     addrs,
 		RefCtrOffsets: refCtrs,
 		Cookies:       cookies,
 		PID:           uint32(cfg.PID),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("uprobe_multi attach (needs Linux 6.6+): %w", err)
+		err = fmt.Errorf("uprobe_multi attach (needs Linux 6.6+): %w", err)
+		return
 	}
 	c.links = append(c.links, l)
 
-	c.reader, err = ringbuf.NewReader(c.objs.Events)
-	if err != nil {
-		return nil, err
+	if c.reader, err = ringbuf.NewReader(c.objs.Events); err != nil {
+		return
 	}
 	return c, nil
 }
@@ -322,8 +340,24 @@ func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) {
 	c.seqByStream[key] = seq
 }
 
-func correlationOf(backend gpu.GPUBackendID, v uint64) gpu.CorrelationID {
-	return gpu.CorrelationID{Backend: backend, Value: strconv.FormatUint(v, 10)}
+// correlationOf converts a wire correlation into the core's CorrelationID.
+//
+// A wire value of zero means "this record carries no correlation" — the ABI
+// says so explicitly for PC samples in continuous collection, the mode this
+// project ships (shim/core/usdt_abi.h, spec §6.3 finding 3). It must map to
+// the *zero* gpu.CorrelationID, because that is the value gpu/timeline.go
+// tests to decide a record needs the heuristic join. Formatting it as the
+// string "0" would produce a perfectly valid-looking ID that every
+// uncorrelated record shares, collapsing them into one exact-join bucket and
+// yielding confident, wrong joins with nothing counted.
+//
+// Caller holds mu: the zero case bumps a counter so the demotion is visible.
+func (c *Consumer) correlationOf(v uint64) gpu.CorrelationID {
+	if v == 0 {
+		c.stats.ZeroCorrelation++
+		return gpu.CorrelationID{}
+	}
+	return gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(v, 10)}
 }
 
 // Run reads batches until the context is cancelled or the consumer is
@@ -365,7 +399,7 @@ func (c *Consumer) applyBatch(b batch) {
 		for _, l := range b.Launches {
 			c.stats.Records++
 			ev := gpu.GPUKernelLaunch{
-				Correlation: correlationOf(c.cfg.Backend, l.Correlation),
+				Correlation: c.correlationOf(l.Correlation),
 				// The shim stamps CLOCK_MONOTONIC, which is the only domain
 				// the core accepts; say so rather than leaning on
 				// NormalizeClockDomain's zero-value default.
@@ -387,7 +421,7 @@ func (c *Consumer) applyBatch(b batch) {
 		for _, e := range b.Execs {
 			c.stats.Records++
 			ev := gpu.GPUKernelExec{
-				Correlation: correlationOf(c.cfg.Backend, e.Correlation),
+				Correlation: c.correlationOf(e.Correlation),
 				ClockDomain: gpu.ClockDomainCPUMonotonic,
 				StartNs:     e.StartNs,
 				EndNs:       e.EndNs,
@@ -404,17 +438,21 @@ func (c *Consumer) applyBatch(b batch) {
 
 // Stats returns the loss record, including the BPF-side drop counters read
 // fresh from the `dropped` map.
+// The `dropped` map is read under mu, not outside it: Close tears c.objs down
+// under the same lock. Reading the map while another goroutine closes the map
+// fd does not crash — the lookup just fails — so the symptom would have been a
+// silent KernelDropped == 0, which is precisely the silent loss §6.1 forbids.
 func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	out := c.stats
-	c.mu.Unlock()
 	out.KernelDropped = c.kernelDropped()
 	return out
 }
 
 // kernelDropped sums the per-kind drop counters the BPF program maintains.
 // A read failure leaves the total at zero rather than panicking; the map is
-// nil in tests that construct a Consumer directly.
+// nil in tests that construct a Consumer directly. Caller holds mu.
 func (c *Consumer) kernelDropped() uint64 {
 	if c.objs.Dropped == nil {
 		return 0
@@ -431,17 +469,29 @@ func (c *Consumer) kernelDropped() uint64 {
 }
 
 // Close releases the ringbuf reader, the links and the BPF objects. It is
-// safe to call on a partially constructed Consumer.
+// safe to call on a partially constructed Consumer, on a nil one, and more
+// than once.
 func (c *Consumer) Close() error {
+	// Nil-receiver safe: Attach's cleanup defer runs on whatever the named
+	// result holds, and a caller that kept a nil *Consumer from a failed
+	// Attach must get an error path, not a panic.
+	if c == nil {
+		return nil
+	}
 	var errs []error
-	// c.reader is deliberately NOT set to nil: Run reads it without holding
-	// mu, and Close is documented to be callable from another goroutine while
-	// Run is blocked in Read. ringbuf.Reader's Close, Read and SetDeadline
-	// are safe to call concurrently and a second Close is a no-op, so leaving
-	// the pointer in place is both race-free and idempotent.
+	// c.reader is closed first and outside mu, because closing it is what
+	// wakes a Run blocked in Read, and Run takes mu to apply each batch. It is
+	// deliberately NOT set to nil: Run reads the field without holding mu.
+	// ringbuf.Reader's Close, Read and SetDeadline are safe to call
+	// concurrently and a second Close is a no-op, so leaving the pointer in
+	// place is both race-free and idempotent.
 	if c.reader != nil {
 		errs = append(errs, c.reader.Close())
 	}
+	// The links and objects come down under mu so Stats, which reads the
+	// `dropped` map, cannot be looking at c.objs while it is being closed.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, l := range c.links {
 		errs = append(errs, l.Close())
 	}

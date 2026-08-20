@@ -17,17 +17,13 @@
 
 static inline uint32_t current_tid() { return (uint32_t)syscall(SYS_gettid); }
 
-PERFAGENT_USDT_SEMAPHORE(gpu_launch_v1);
-PERFAGENT_USDT_SEMAPHORE(gpu_exec_v1);
-
-static void emit_launch(const void *p, unsigned long n, unsigned long s) {
-    PERFAGENT_USDT_PROBE3(gpu_launch_v1, p, n, s);
-}
-static bool launch_enabled() { return PERFAGENT_USDT_ENABLED(gpu_launch_v1); }
-static void emit_exec(const void *p, unsigned long n, unsigned long s) {
-    PERFAGENT_USDT_PROBE3(gpu_exec_v1, p, n, s);
-}
-static bool exec_enabled() { return PERFAGENT_USDT_ENABLED(gpu_exec_v1); }
+// One line per probe: the semaphore, the enabled/emit thunks, and the frozen
+// wire size the consumer's attach cookie assumes. Because the thunk's
+// parameter type and the probe it fires come from the same token, and
+// Batch's emit callback is typed on its record, a Batch can only be wired to
+// the probe whose records it actually holds -- see PERFAGENT_USDT_EMITTER.
+PERFAGENT_USDT_EMITTER(gpu_launch_v1, 48);
+PERFAGENT_USDT_EMITTER(gpu_exec_v1, 48);
 
 static uint64_t mono_ns() {
     struct timespec t;
@@ -41,8 +37,8 @@ static uint64_t mono_ns() {
 // whatever process it's injected into.
 extern "C" __attribute__((visibility("default"))) void
 perfagent_stub_run(unsigned launches, unsigned period_us) {
-    perfagent::Batch<gpu_launch_v1, 32> lb(emit_launch, launch_enabled);
-    perfagent::Batch<gpu_exec_v1, 32> eb(emit_exec, exec_enabled);
+    perfagent::Batch<gpu_launch_v1, 32> lb(gpu_launch_v1_emit, gpu_launch_v1_enabled);
+    perfagent::Batch<gpu_exec_v1, 32> eb(gpu_exec_v1_emit, gpu_exec_v1_enabled);
 
     perfagent::Drainer drainer;
     drainer.on_tick([&] { lb.flush(); eb.flush(); });

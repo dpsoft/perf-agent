@@ -3,16 +3,28 @@
 #include <cassert>
 #include <cstdio>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using perfagent::Batch;
 
 struct Rec { uint64_t v; };
 
+// Batch's emit callback is typed on the record (Batch<T,N>::Emit), so an emit
+// thunk written for another probe's record cannot be wired to this batch. The
+// consumer sizes records from the attach cookie, not from the wire, so that
+// mismatch would be a wild read in the kernel rather than a decode failure.
+// This is the same shape as the guard, checked here so the intent is written
+// down where the type is exercised:
+struct OtherRec { uint64_t a, b; };
+static_assert(!std::is_assignable<Batch<Rec, 4>::Emit &,
+                                  Batch<OtherRec, 4>::Emit>::value,
+              "an emit thunk for another record type must not be wirable to this batch");
+
 static std::vector<std::pair<unsigned long, unsigned long>> g_emits; // count, seq
 static bool g_enabled = true;
 
-static void fake_emit(const void *, unsigned long count, unsigned long seq) {
+static void fake_emit(const Rec *, unsigned long count, unsigned long seq) {
     g_emits.push_back({count, seq});
 }
 static bool fake_enabled() { return g_enabled; }
@@ -20,7 +32,7 @@ static bool fake_enabled() { return g_enabled; }
 // Used only by the concurrency case below: counts total records emitted
 // across (possibly interleaved) flush() calls from two threads.
 static std::atomic<unsigned long> g_concurrent_emitted{0};
-static void counting_emit(const void *, unsigned long count, unsigned long) {
+static void counting_emit(const Rec *, unsigned long count, unsigned long) {
     g_concurrent_emitted.fetch_add(count, std::memory_order_relaxed);
 }
 

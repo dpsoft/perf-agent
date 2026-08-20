@@ -1,6 +1,7 @@
 package gpuprobe_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -68,22 +69,54 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 
 	// The stub only emits once the semaphore says someone is listening, so it
 	// must start after Attach.
-	out, err := exec.Command(stub, "500", "200").CombinedOutput()
-	require.NoError(t, err, string(out))
+	//
+	// stderr is captured separately from stdout because the stub reports its
+	// own producer-side drop counters there: with a consumer attached the
+	// semaphore is non-zero for the whole run, so nothing may be dropped
+	// before it ever reaches a probe. A consumer-side counter cannot see that
+	// loss — it happens in the producer, upstream of the ringbuf.
+	cmd := exec.Command(stub, "500", "200")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	require.NoError(t, err, "stdout: %s stderr: %s", stdout.String(), stderr.String())
+	stubErr := stderr.String()
 
 	// perfagent_stub_run flushes both batches synchronously before the
-	// child process exits, and CombinedOutput above already blocked until
+	// child process exits, and cmd.Run above already blocked until
 	// then — so every record is in the ringbuf by this point. The sleep is
 	// for our own Run() goroutine to drain it, not for the stub.
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
 
+	// Producer-side loss, from the stub's own accounting. With a consumer
+	// attached the whole run, every add() and flush() saw an armed semaphore,
+	// so both counters must read zero.
+	assert.Contains(t, stubErr, "launch_dropped=0",
+		"the stub dropped launches: its semaphore read zero while a consumer was attached")
+	assert.Contains(t, stubErr, "exec_dropped=0",
+		"the stub dropped execs: its semaphore read zero while a consumer was attached")
+
 	stats := c.Stats()
 	assert.Zero(t, stats.SequenceGaps, "no batch may be lost silently")
 	// SequenceGaps == 0 means no batch was lost, so the record count is
 	// exact, not a lower bound: 500 launches + 500 execs.
 	assert.Equal(t, uint64(1000), stats.Records, "500 launches + 500 execs, none lost")
+	// Records is incremented *before* the sink call, so it alone does not
+	// prove the timeline accepted anything — every other loss counter has to
+	// be zero for the count above to mean what it looks like it means.
+	assert.Zero(t, stats.SinkRejected,
+		"Records counts before the sink call, so a rejection here means the timeline never took the event")
+	assert.Zero(t, stats.Malformed,
+		"a ringbuf sample that did not decode: a short header, or a payload shorter than the header claims")
+	assert.Zero(t, stats.Undecoded,
+		"the stub emits only launches and execs; an undecoded record means a kind arrived that this phase does not normalize")
+	assert.Zero(t, stats.KernelDropped,
+		"records the BPF program could not deliver: an oversized batch, a full ringbuf, or a faulting read of the producer's buffer")
+	assert.Zero(t, stats.ZeroCorrelation,
+		"the stub never emits correlation 0, so no record may have been demoted to the heuristic join")
 
 	snap := timeline.Snapshot()
 	samples := gpu.ProjectExecutions(snap)

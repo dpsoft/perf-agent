@@ -483,3 +483,57 @@ func TestRunCountsMalformedSamples(t *testing.T) {
 	require.NoError(t, c.Close())
 	<-done
 }
+
+// A wire correlation of zero is the ABI's "no correlation" (usdt_abi.h says
+// so for PC samples in continuous collection, the mode this project ships).
+// It must produce the *zero* gpu.CorrelationID, because that is what
+// gpu/timeline.go tests to route a record to the heuristic join. Formatting
+// it as "0" would hand every uncorrelated record the same valid-looking ID
+// and collapse them all into one exact-join bucket.
+func TestZeroWireCorrelationBecomesTheZeroCorrelationID(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	buf := make([]byte, 32+96)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], 2)
+	putU64(buf[24:], 96)
+	putU64(buf[32+0:], 0)  // no correlation
+	putU64(buf[32+48:], 9) // a real one
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	c.applyBatch(b)
+
+	require.Len(t, sink.launches, 2)
+	assert.Equal(t, gpu.CorrelationID{}, sink.launches[0].Correlation,
+		"wire zero means no correlation; the timeline's heuristic path keys off the zero value")
+	assert.Equal(t, gpu.CorrelationID{Backend: gpu.BackendCUPTI, Value: "9"}, sink.launches[1].Correlation,
+		"a non-zero correlation is unaffected")
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.ZeroCorrelation, "the demotion to the heuristic join is counted, not silent")
+	assert.Equal(t, uint64(2), st.Records, "an uncorrelated record is normalized, not dropped")
+	assert.Zero(t, st.SinkRejected)
+}
+
+// Execs take the same path: a zero correlation there also demotes to the
+// heuristic join rather than joining every uncorrelated exec to one bucket.
+func TestZeroWireCorrelationOnExecs(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	buf := make([]byte, 32+48)
+	putU32(buf[0:], kindExec)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], 48)
+	putU64(buf[32+0:], 0) // no correlation
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	c.applyBatch(b)
+
+	require.Len(t, sink.execs, 1)
+	assert.Equal(t, gpu.CorrelationID{}, sink.execs[0].Correlation)
+	assert.Equal(t, uint64(1), c.Stats().ZeroCorrelation)
+}

@@ -38,7 +38,11 @@ func main() {
 	if out, err := exec.Command(stub, "2000", "200").CombinedOutput(); err != nil {
 		log.Fatalf("stub: %v: %s", err, out)
 	}
-	time.Sleep(500 * time.Millisecond) // outwait one drain period
+	// The stub flushes both batches synchronously before it exits, and
+	// CombinedOutput above already blocked until then, so every record is
+	// in the ringbuf by this point. The sleep is for c.Run's goroutine to
+	// drain it, not for the stub.
+	time.Sleep(500 * time.Millisecond)
 	cancel()
 
 	snap := timeline.Snapshot()

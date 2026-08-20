@@ -71,18 +71,36 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	out, err := exec.Command(stub, "500", "200").CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	time.Sleep(500 * time.Millisecond) // let the drain timer flush the tail
+	// perfagent_stub_run flushes both batches synchronously before the
+	// child process exits, and CombinedOutput above already blocked until
+	// then — so every record is in the ringbuf by this point. The sleep is
+	// for our own Run() goroutine to drain it, not for the stub.
+	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
 
 	stats := c.Stats()
 	assert.Zero(t, stats.SequenceGaps, "no batch may be lost silently")
-	assert.GreaterOrEqual(t, stats.Records, uint64(900), "500 launches + 500 execs")
+	// SequenceGaps == 0 means no batch was lost, so the record count is
+	// exact, not a lower bound: 500 launches + 500 execs.
+	assert.Equal(t, uint64(1000), stats.Records, "500 launches + 500 execs, none lost")
 
 	snap := timeline.Snapshot()
 	samples := gpu.ProjectExecutions(snap)
 	require.NotEmpty(t, samples, "the gate is pprof samples, not counters")
 
+	// ProjectExecutions emits one sample per execution regardless of join
+	// status - a launch that aged out of the cache before its exec arrived
+	// still produces a sample, just with no [gpu:launch]-attributed launch
+	// underneath it. So sample count alone cannot distinguish "everything
+	// joined" from "nothing joined": that has to come from JoinStats
+	// directly.
+	assert.Zero(t, snap.JoinStats.UnmatchedExecutionCount,
+		"an unmatched execution means its launch aged out of the cache or never arrived - the stub emits both sides, so this must be zero")
+	assert.Equal(t, uint64(len(snap.Executions)), snap.JoinStats.ExactExecutionJoinCount,
+		"every execution must join its launch by exact correlation, not a weaker path")
+	assert.Positive(t, snap.JoinStats.ExactExecutionJoinCount,
+		"the exact-join and unmatched assertions above are vacuous on an empty snapshot; there must be at least one real join")
 	// Every execution joined its launch exactly, because the stub emits a
 	// correlation on both sides.
 	assert.Zero(t, snap.JoinStats.HeuristicExecutionJoinCount,

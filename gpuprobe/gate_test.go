@@ -73,7 +73,7 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		Sink:     timeline,
 	})
 	require.NoError(t, err)
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

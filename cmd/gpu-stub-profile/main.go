@@ -26,7 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("attach: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -60,12 +60,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
 	for _, b := range builders.Builders {
 		if _, err := b.Write(f); err != nil {
 			log.Fatalf("write profile: %v", err)
 		}
 		break
+	}
+	if err := f.Close(); err != nil {
+		log.Fatalf("close gpu-stub.pb.gz: %v", err)
 	}
 	log.Printf("wrote gpu-stub.pb.gz: %d samples, stats=%+v", len(samples), c.Stats())
 }

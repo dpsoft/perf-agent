@@ -64,11 +64,11 @@ func TestCancelInterruptsARealBlockedRingbufRead(t *testing.T) {
 		MaxEntries: 4096, // must be a power of two and page-multiple
 	})
 	require.NoError(t, err, "create ringbuf map")
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	rd, err := ringbuf.NewReader(m)
 	require.NoError(t, err, "open ringbuf reader")
-	defer rd.Close()
+	defer func() { _ = rd.Close() }()
 
 	c := newTestConsumer(&recordingSink{})
 	c.reader = rd

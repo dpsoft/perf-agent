@@ -672,6 +672,32 @@ line includes it. On any kernel ≥ 5.9 it is redundant:
 it is the difference between "needs a privileged pod" and "needs four narrow
 capabilities."
 
+**The GPU consumer nearly gives it back, and the escape is the attach mechanism.**
+Measured 2026-08-19 with a real USDT probe in the injected shim: attaching it
+through the **`perf_uprobe` PMU** — `perf_event_open`, which is what
+`link.Uprobe` uses — fails with `EACCES` under `CAP_BPF`+`CAP_PERFMON` and
+succeeds only once `CAP_SYS_ADMIN` is added. Attaching the same probe through the
+**`uprobe_multi` BPF link** (`BPF_LINK_CREATE`, `link.UprobeMulti`) succeeds under
+`CAP_BPF`+`CAP_PERFMON` alone, semaphore and all.
+
+So Phase 3's consumer attaches via `uprobe_multi`, and that is a correctness
+requirement of the capability story rather than a style preference: the obvious
+API is the one that reintroduces `CAP_SYS_ADMIN` and undoes Phase 1. The cost is
+a floor of **Linux 6.6**, where the multi-uprobe link landed. On anything older
+there is no known way to consume USDT without `CAP_SYS_ADMIN`, which makes the
+kernel floor a deployment prerequisite in the same class as the driver.
+
+One further trap on the same path: a file-capability binary is non-dumpable, so
+`/proc/self/*` is root-owned — and `cilium/ebpf` reads the vDSO through
+`/proc/self/mem` to discover the kernel version that `BPF_PROG_TYPE_KPROBE`
+requires, failing with a `permission denied` that names neither capabilities nor
+uprobes. perf-agent has never hit this because it loads only `tp_btf/*` and
+`perf_event` programs, which need no version; the GPU consumer is its first
+uprobe. Setting `ProgramSpec.KernelVersion` explicitly avoids the read. The
+alternative, `prctl(PR_SET_DUMPABLE, 1)`, also works — confirmed on the box — but
+it makes a privileged profiler ptrace-attachable by any process of the same user,
+which is a poor trade for a value we can supply from `uname`.
+
 ## 12. What we carry, what we drop
 
 Carried from PR #10 as **contracts, revised — not ported verbatim**:
@@ -767,6 +793,15 @@ reviewed against the rocprofiler bridge's known event taxonomy (§6.1), on paper
 *Gate:* the stub drives the full pipeline to pprof on a machine with no GPU, and
 the ABI review has been done.
 
+The transport this phase builds is no longer hypothetical. On 2026-08-19 a probe
+emitted from the injected CUPTI shim was consumed end to end on the lab box: an
+ordinary CUDA process under `CUDA_INJECTION64_PATH`, a `.note.stapsdt` probe
+gated on its semaphore, the kernel maintaining that semaphore through
+`RefCtrOffset`, and an eBPF program counting exactly 150 fires for 150 launches —
+with the semaphore reading 0 and the probe skipped 200/200 times when no consumer
+was attached. What Phase 3 owes is the real ABI, batching and replay on top of a
+mechanism already shown to work.
+
 **Phase 4 — CUPTI adapter: callback and activity only. NVIDIA ships.** Launch
 correlation anchor, activity records for real GPU intervals, clock correlation,
 token bucket. This is the milestone the program exists for.
@@ -817,6 +852,10 @@ Setup steps, none of them obstacles:
   production it is a **node prerequisite in the same class as installing the
   driver**, and it matters because the shim runs as the application's user, which
   in a container is usually not root.
+- **Linux 6.6 or newer is a node prerequisite**, because that is where the
+  `uprobe_multi` BPF link landed and it is the only attach path that consumes USDT
+  without `CAP_SYS_ADMIN` (§11). The lab box runs 6.19, so this is a deployment
+  constraint rather than a development one.
 - Phase 6 source mapping requires workloads compiled with `nvcc -lineinfo`;
   without it, degrade to PC-offset frames.
 

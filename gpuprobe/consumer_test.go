@@ -1127,6 +1127,146 @@ func TestUnsampledLaunchNeverBorrowsASampledSiblingsStack(t *testing.T) {
 		"a period with no stack would advertise attribution that does not exist")
 }
 
+// Correlation ids are per-process: CUPTI restarts them from a low value in
+// every process it is loaded into, and the probes fire in EVERY process that
+// maps the shim (uprobe_multi attaches to the file, and Config.PID == 0 is a
+// supported mode). So two profiled processes collide on correlation almost
+// immediately, and a side table keyed on correlation alone would hand
+// process A's stack - symbolized against /proc/A/maps - to process B's
+// launch. That is not a lost stack, it is a fabricated call path under
+// measured GPU time, which is the exact failure this whole phase exists to
+// prevent.
+//
+// This is the pendingStacks half: both stacks arrive first and park.
+func TestSameCorrelationInTwoProcessesKeepsItsOwnStack(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000) // the stack captured in pid 4242
+	sm.put(2, 0x2000) // the stack captured in pid 5353
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, sampledBatchWith(5353, 7, 2, 8))
+	require.Equal(t, 2, c.Stats().PendingStacks,
+		"two processes, two stacks: one must not overwrite the other")
+
+	apply(t, c, launchBatchWith(4242, 7))
+	apply(t, c, launchBatchWith(5353, 7))
+	c.Flush()
+
+	require.Len(t, sink.launches, 2)
+	byPID := map[uint32][]string{}
+	for _, l := range sink.launches {
+		byPID[l.Launch.PID] = frameNames(l.Launch.CPUStack)
+	}
+	assert.Equal(t, []string{"fn_1000"}, byPID[4242],
+		"pid 4242 must get the stack captured in pid 4242")
+	assert.Equal(t, []string{"fn_2000"}, byPID[5353],
+		"pid 5353 must get the stack captured in pid 5353")
+	assert.Equal(t, uint64(2), c.Stats().StacksAttached)
+	assert.Zero(t, c.Stats().StacksEvicted,
+		"neither capture may be treated as a replacement of the other")
+}
+
+// The deferredLaunches half of the same collision: a launch held for pid
+// 4242 must not be released by a stack captured in pid 5353 that happens to
+// carry the same correlation.
+func TestHeldLaunchDoesNotTakeAnotherProcessesStack(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000)
+	sm.put(2, 0x2000)
+
+	apply(t, c, launchBatchWith(4242, 7))
+	require.Equal(t, 1, c.Stats().PendingLaunches)
+
+	// Pre-fix this took the held pid-4242 launch and attached pid 5353's
+	// stack to it.
+	apply(t, c, sampledBatchWith(5353, 7, 2, 8))
+	assert.Equal(t, 1, c.Stats().PendingLaunches,
+		"another process's stack must not release this process's launch")
+	assert.Equal(t, 1, c.Stats().PendingStacks, "it parks for its own launch instead")
+
+	// pid 5353's launch releases the held pid-4242 one (any non-sampled
+	// batch does) and then collects its own parked stack.
+	apply(t, c, launchBatchWith(5353, 7))
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	c.Flush()
+
+	require.Len(t, sink.launches, 2)
+	byPID := map[uint32][]string{}
+	for _, l := range sink.launches {
+		byPID[l.Launch.PID] = frameNames(l.Launch.CPUStack)
+	}
+	assert.Equal(t, []string{"fn_2000"}, byPID[5353])
+	assert.Empty(t, byPID[4242],
+		"the pid-4242 launch was released before its own stack arrived: no stack is correct, a borrowed one is not")
+}
+
+// The measured cause of the unattached stacks in cmd/gpu-stub-profile's
+// 2000-launch run (PendingStacks:24 of 250 captured), reproduced here with
+// no privileges and no attach - just the batch order the stub actually
+// produces.
+//
+// The stub adds to the launch batch, then to the exec batch, then fires the
+// unbatched sampled probe. When one launch is both the record that FILLS
+// the launch batch and the one the sampler picks, all three land on the
+// ringbuf in that order: launch batch, exec batch, sampled record. The
+// launch is held for its twin; the exec batch releases it stackless (which
+// is correct - the timeline needs launches promptly); and the twin then
+// arrives with nowhere to go and parks forever.
+//
+// With 32-record batches and a period of 8 those two conditions are
+// disjoint by arithmetic - the batch fills at launch i = 0 mod 32 and the
+// sampler picks i = 1 mod 8 - which is why a short run never shows it. What
+// breaks the arithmetic is the stub's Drainer: it flushes both partial
+// batches every 100ms, which RE-PHASES the batch boundary to wherever the
+// loop happened to be. Roughly one tick in eight leaves the new boundary on
+// a sampled launch, and from then until the next tick every one of the
+// remaining fills - one per 32 launches - loses its stack this way. That is
+// the whole rate dependence: a 500-launch run has about one tick and
+// usually shows none, a 2000-launch run has several and showed 24.
+//
+// It costs attribution only. The launch ships, the execution ships, the GPU
+// time is measured and projects as unattributed, and the stack is counted
+// in PendingStacks rather than vanishing. Fixing it would mean holding
+// launches past the next batch, which trades a rare attribution gain for a
+// systematic delay in launch delivery that the timeline's join depends on -
+// a worse trade, so this is documented and counted, not "fixed".
+func TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000)
+
+	// Launch 7 is the record that filled the batch, so the batch is queued
+	// before its own sampled record.
+	apply(t, c, launchBatchWith(4242, 5, 6, 7))
+	require.Equal(t, 3, c.Stats().PendingLaunches)
+
+	// The exec batch the stub queues in the same iteration lands next.
+	execs := make([]byte, batchHdrSize+gpuabi.SizeExec)
+	putU32(execs[0:], kindExec)
+	putU32(execs[4:], 1)
+	putU32(execs[16:], 4242)
+	putU64(execs[24:], gpuabi.SizeExec)
+	putU64(execs[batchHdrSize:], 7)
+	apply(t, c, execs)
+	require.Equal(t, 3, sink.launchCount(), "the exec batch releases the held launches, as it must")
+
+	// The twin arrives to find its launch already gone.
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	c.Flush()
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksResolved)
+	assert.Zero(t, st.StacksAttached)
+	assert.Equal(t, 1, st.PendingStacks,
+		"the orphaned stack is counted, not silently dropped - this is what PendingStacks:24 was")
+	require.Len(t, sink.launches, 3)
+	assert.Empty(t, sink.launches[2].Launch.CPUStack,
+		"launch 7 still ships; it just ships without a call path")
+	assert.Zero(t, st.StacksEvicted, "nothing was pushed out; it is still parked")
+}
+
 // A held launch is waiting for a record that would be the next ringbuf
 // sample. Anything else arriving ends the wait: launches must not sit
 // behind an exec batch, because the timeline joins executions against
@@ -1224,6 +1364,20 @@ func TestStackmapEntriesAreFreedOnEveryOutcome(t *testing.T) {
 		apply(t, c, sampledBatchWith(4242, 7, 99, 8))
 		assert.Empty(t, sm.deleted)
 		assert.Equal(t, uint64(1), c.Stats().StackLookupFailed)
+	})
+	// A lookup that fails for any reason OTHER than key-not-exist leaves an
+	// entry sitting in the map that nothing else will ever remove. The
+	// program calls bpf_get_stackid without BPF_F_REUSE_STACKID, so that
+	// bucket then answers -EEXIST for every later capture hashing to it,
+	// and capture degrades into a permanent StacksMissing stream that reads
+	// like a broken probe rather than a leaked slot.
+	t.Run("lookup failed but the entry is still there", func(t *testing.T) {
+		c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+		sm.put(4, 0x1000)
+		sm.lookupErr = errors.New("bad file descriptor")
+		apply(t, c, sampledBatchWith(4242, 7, 4, 8))
+		assert.Equal(t, uint64(1), c.Stats().StackLookupFailed)
+		assert.True(t, sm.wasDeleted(4), "a slot we cannot read is still a slot we must free")
 	})
 }
 

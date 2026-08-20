@@ -286,6 +286,11 @@ type Stats struct {
 	// still ships, without a stack - and it is counted here rather than
 	// being papered over with a cached lookup, which could serve the frames
 	// of a different stack that reused the id after the delete.
+	//
+	// That is the LOSS half of the shared-id race. The aliasing half - a
+	// different stack landing in the freed bucket before a stale in-ring
+	// batch dereferences the old id - is silent and is documented at
+	// freeStackLocked, where the delete that enables it happens.
 	StackLookupFailed uint64
 	// SymbolizeFailed counts captures that were read back but produced no
 	// frames: the symbolizer returned an error, returned nothing, or no
@@ -932,7 +937,8 @@ func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
 		c.emitLaunchLocked(ev, kernelID)
 		return
 	}
-	if st, ok := c.pending.take(ev.Correlation); ok {
+	key := launchKey{pid: ev.Launch.PID, corr: ev.Correlation}
+	if st, ok := c.pending.take(key); ok {
 		c.attachLocked(&ev, st.frames, st.period)
 		c.emitLaunchLocked(ev, kernelID)
 		return
@@ -967,16 +973,22 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 	}
 	c.stats.StacksResolved++
 
-	corr := gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(sl.Correlation, 10)}
+	// Keyed on (pid, correlation), never correlation alone: see launchKey.
+	// pid is the batch header's, i.e. the process that fired the probe, which
+	// is the same field the batched twin's launch carries.
+	key := launchKey{
+		pid:  pid,
+		corr: gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(sl.Correlation, 10)},
+	}
 	// The batched twin arrived first and is still being held: attach and let
 	// it go now, since nothing more can arrive for it.
-	if held, ok := c.deferred.take(corr); ok {
+	if held, ok := c.deferred.take(key); ok {
 		c.attachLocked(&held.launch, frames, sl.SamplePeriod)
 		c.emitLaunchLocked(held.launch, held.kernelID)
 		return
 	}
 	// Otherwise the twin is still to come; park the stack for it.
-	c.stats.StacksEvicted += uint64(c.pending.park(corr, frames, sl.SamplePeriod))
+	c.stats.StacksEvicted += uint64(c.pending.park(key, frames, sl.SamplePeriod))
 }
 
 // attachLocked puts a resolved stack on a launch. SamplePeriod travels with
@@ -1013,6 +1025,16 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	raw, err := c.stacks.LookupBytes(uint32(stackID))
 	if err != nil || len(raw) == 0 {
 		c.stats.StackLookupFailed++
+		// A failed lookup still leaves the slot occupied, and nothing else
+		// ever removes it: the program calls bpf_get_stackid without
+		// BPF_F_REUSE_STACKID, so an orphaned bucket answers -EEXIST for
+		// every later capture that hashes to it, forever. Free it here, the
+		// same as on the success path - the entry is useless to us either
+		// way. ErrKeyNotExist is the one case with nothing to free, and
+		// calling Delete for it would only inflate StackDeleteFailed.
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			c.freeStackLocked(stackID)
+		}
 		return nil, false
 	}
 	ips := bpfstack.ExtractIPs(raw)
@@ -1102,6 +1124,29 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 // removed it - and is counted the same way rather than special-cased, since
 // it points at the same in-flight-duplicate situation StackLookupFailed
 // reports. Caller holds mu.
+//
+// The delete has a second consequence, and unlike the first one it is
+// silent. Stats.StackLookupFailed documents the LOSS case: a second capture
+// sharing this id finds nothing here and its launch ships without a stack,
+// counted. The ALIASING case is the same race won the other way. Freeing
+// this bucket makes it available again, and bpf_get_stackid hashes a
+// different stack into it; if a batch still sitting in the ringbuf refers to
+// the old id, the consumer reads the new occupant and attaches a call path
+// that did not produce that launch. Nothing counts it, because from here it
+// is indistinguishable from a successful resolution.
+//
+// It needs a hash collision on top of the in-flight duplicate, so it is
+// rare - and it is bounded by ringbuf drain latency, which is microseconds
+// on a consumer that is keeping up. It is documented rather than fixed
+// because every fix costs something this phase is not willing to spend: not
+// deleting refills the map and turns capture off entirely (see above);
+// BPF_F_REUSE_STACKID makes the overwrite the normal case rather than the
+// rare one; and a per-id generation stamp would need an ABI field and a
+// second map. What WOULD close it, and is the right place for it, is Phase
+// 4b's eager capture - reading the stack out at probe time rather than
+// handing the consumer an id to dereference later. Until then this comment
+// is the honest statement of it: a comment is not enough on its own, but the
+// remedy belongs to a phase that can carry it.
 func (c *Consumer) freeStackLocked(stackID int32) {
 	if c.stacks == nil {
 		return

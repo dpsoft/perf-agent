@@ -28,10 +28,56 @@ import (
 //     N's own sampled record. The launch waits in deferredLaunches, briefly,
 //     for the twin that is already on its way.
 //
+// The batched-first case has a known, counted, rate-dependent way of losing
+// the join, and it is the cause of the PendingStacks the demo run reports
+// (24 of 250 captures at 2000 launches; none at 500). The producer queues
+// the launch batch, then the EXEC batch, then the sampled probe. So when one
+// launch is both the record that fills the launch batch and the one the
+// sampler picks, the exec batch lands between the twins - and any batch that
+// is not a sampled launch releases the deferred queue (Consumer.applyBatch,
+// deliberately: the timeline needs launches promptly). The launch goes out
+// stackless and its stack, arriving next, parks with nothing to join.
+//
+// It looks arithmetically impossible in the stub, which is why it went
+// unexplained: batches hold 32 records and the sampler takes one in 8, so
+// "fills the batch" (i = 0 mod 32) and "is sampled" (i = 1 mod 8) cannot
+// both hold. What breaks that is the producer's periodic drain tick, which
+// flushes a PARTIAL batch every 100ms and so re-phases the batch boundary to
+// wherever the launch loop had got to. About one tick in eight leaves the
+// new boundary sitting on a sampled launch, and until the next tick moves it
+// again every remaining fill - one per 32 launches - loses its stack this
+// way. Hence rate-dependent: more launches, more ticks, more chances to land
+// in phase and more fills to spend there.
+//
+// The cost is attribution, never a record: the launch ships, the execution
+// ships, the GPU time is measured and projects as unattributed, and the
+// orphaned stack is visible in Stats.PendingStacks. The alternative -
+// holding launches past the next batch - trades a rare attribution gain for
+// a systematic delay in launch delivery that the timeline's join depends on.
+// Reproduced without any privilege by
+// TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins.
+//
 // Both stores are bounded, and both count what they push out. An unbounded
 // map on either side is a leak driven by a profiled application's launch
 // rate, which is exactly the class of bug the bounded stores in gpu/ exist
 // to avoid.
+
+// launchKey identifies one launch. A correlation alone does not.
+//
+// The probes are attached with uprobe_multi against the shim *file*, so
+// every process that maps it fires them, and Config.PID == 0 (system-wide)
+// is a supported mode. CUPTI hands out correlation ids per process, each
+// sequence starting from a low value, so two profiled processes collide on
+// correlation within the first handful of launches. Keying the side tables
+// on correlation alone would let process A's stack - symbolized against
+// /proc/A/maps - be attached to process B's launch, projecting B's measured
+// GPU time under a call path that provably did not produce it. A fabricated
+// flame graph is worse than no flame graph, so the pid is part of the key on
+// every insert, lookup, eviction and drain path.
+type launchKey struct {
+	pid  uint32
+	corr gpu.CorrelationID
+}
 
 // resolvedStack is a capture that has already been read out of the stackmap
 // and symbolized, waiting for the batched launch it belongs to.
@@ -47,15 +93,16 @@ type resolvedStack struct {
 	gen uint64
 }
 
-// pendingStacks is the bounded correlation -> stack side table for captures
-// that arrived before their batched twin. Eviction is FIFO: the oldest
+// pendingStacks is the bounded (pid, correlation) -> stack side table for
+// captures that arrived before their batched twin. Eviction is FIFO: the
+// oldest
 // parked capture is the one whose twin is least likely to still be coming
 // (its batch was dropped, or the producer stopped), so it is the right one
 // to give up on first.
 //
 // Not internally synchronized; Consumer calls it under its own mutex.
 type pendingStacks struct {
-	byCorr   map[gpu.CorrelationID]resolvedStack
+	byKey    map[launchKey]resolvedStack
 	order    []stackPos
 	head     int
 	gen      uint64
@@ -63,8 +110,8 @@ type pendingStacks struct {
 }
 
 type stackPos struct {
-	corr gpu.CorrelationID
-	gen  uint64
+	key launchKey
+	gen uint64
 }
 
 func newPendingStacks(capacity int) *pendingStacks {
@@ -72,7 +119,7 @@ func newPendingStacks(capacity int) *pendingStacks {
 		capacity = defaultSampledStackCapacity
 	}
 	return &pendingStacks{
-		byCorr:   make(map[gpu.CorrelationID]resolvedStack),
+		byKey:    make(map[launchKey]resolvedStack),
 		capacity: capacity,
 	}
 }
@@ -83,15 +130,15 @@ func newPendingStacks(capacity int) *pendingStacks {
 // is not itself an eviction of a *pending* stack - the caller counts the
 // replaced one as evicted all the same, because its stack will never reach
 // a launch either.
-func (p *pendingStacks) park(corr gpu.CorrelationID, frames []pp.Frame, period uint32) (evicted int) {
-	if _, replaced := p.byCorr[corr]; replaced {
+func (p *pendingStacks) park(key launchKey, frames []pp.Frame, period uint32) (evicted int) {
+	if _, replaced := p.byKey[key]; replaced {
 		evicted++
 	}
 	p.gen++
-	p.byCorr[corr] = resolvedStack{frames: frames, period: period, gen: p.gen}
-	p.order = append(p.order, stackPos{corr: corr, gen: p.gen})
+	p.byKey[key] = resolvedStack{frames: frames, period: period, gen: p.gen}
+	p.order = append(p.order, stackPos{key: key, gen: p.gen})
 	p.reclaimOrder()
-	for len(p.byCorr) > p.capacity {
+	for len(p.byKey) > p.capacity {
 		if !p.evictOldest() {
 			break
 		}
@@ -106,11 +153,11 @@ func (p *pendingStacks) evictOldest() bool {
 	for p.head < len(p.order) {
 		pos := p.order[p.head]
 		p.head++
-		cur, ok := p.byCorr[pos.corr]
+		cur, ok := p.byKey[pos.key]
 		if !ok || cur.gen != pos.gen {
 			continue // superseded or already taken: not an eviction
 		}
-		delete(p.byCorr, pos.corr)
+		delete(p.byKey, pos.key)
 		p.compact()
 		return true
 	}
@@ -144,7 +191,7 @@ func (p *pendingStacks) reclaimOrder() {
 	}
 	n := 0
 	for _, pos := range p.order[p.head:] {
-		cur, ok := p.byCorr[pos.corr]
+		cur, ok := p.byKey[pos.key]
 		if !ok || cur.gen != pos.gen {
 			continue
 		}
@@ -158,19 +205,19 @@ func (p *pendingStacks) reclaimOrder() {
 	p.head = 0
 }
 
-// take removes and returns the capture parked for corr, if any.
-func (p *pendingStacks) take(corr gpu.CorrelationID) (resolvedStack, bool) {
-	st, ok := p.byCorr[corr]
+// take removes and returns the capture parked for key, if any.
+func (p *pendingStacks) take(key launchKey) (resolvedStack, bool) {
+	st, ok := p.byKey[key]
 	if !ok {
 		return resolvedStack{}, false
 	}
-	delete(p.byCorr, corr)
+	delete(p.byKey, key)
 	// The order position is left behind deliberately: evictOldest tells it
 	// apart from a live entry by generation, so no scan is needed here.
 	return st, true
 }
 
-func (p *pendingStacks) len() int { return len(p.byCorr) }
+func (p *pendingStacks) len() int { return len(p.byKey) }
 
 // compact reclaims the consumed prefix of the order slice once it is more
 // than half stale, so a long-running consumer's slice does not grow without
@@ -245,13 +292,14 @@ func (d *deferredLaunches) pop() (deferredLaunch, bool) {
 	return l, true
 }
 
-// take removes the queued launch with this correlation, if it is still
-// held. Correlations are unique per launch, so the first match is the only
-// one; the scan runs from the newest end because the twin of a just-arrived
-// sampled record is the launch that was queued most recently.
-func (d *deferredLaunches) take(corr gpu.CorrelationID) (deferredLaunch, bool) {
+// take removes the queued launch with this (pid, correlation), if it is
+// still held. The pair is unique per launch - a correlation on its own is
+// not, see launchKey - so the first match is the only one; the scan runs
+// from the newest end because the twin of a just-arrived sampled record is
+// the launch that was queued most recently.
+func (d *deferredLaunches) take(key launchKey) (deferredLaunch, bool) {
 	for i := len(d.buf) - 1; i >= d.head; i-- {
-		if d.buf[i].launch.Correlation != corr {
+		if d.buf[i].launch.Launch.PID != key.pid || d.buf[i].launch.Correlation != key.corr {
 			continue
 		}
 		l := d.buf[i]

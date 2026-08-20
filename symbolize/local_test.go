@@ -8,7 +8,10 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+
+	blazesym "github.com/libbpf/blazesym/go"
 )
 
 // Symbolizing a live process must produce real names WITHOUT any capability.
@@ -211,4 +214,129 @@ func libcExecMapping(t *testing.T) (uint64, uint64, string) {
 	}
 	t.Skip("no executable libc mapping in this process (static binary?)")
 	return 0, 0, ""
+}
+
+// The map_files fallback used to latch on ANY first-attempt failure, and
+// then stay latched, for every process, for the life of the symbolizer -
+// with no counter and no log. That is a permanent, invisible loss of
+// inode-accurate resolution bought with one transient failure: a mapping
+// deleted between the walk and the read, a JIT region, a pid that vanished
+// mid-batch. And it is not merely a loss of precision: a symbolic path can
+// be re-pointed between the mmap and the read (overlayfs), which resolves to
+// the WRONG symbols rather than to none.
+//
+// Only a permission failure may latch, because only a permission failure
+// cannot improve on its own.
+func TestOnlyAPermissionFailureLatchesTheMapFilesFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uses /proc/self/maps")
+	}
+	addr, _ := mappedLibcFuncAddr(t)
+	self := uint32(os.Getpid())
+
+	// Both cases inject only the FIRST attempt's failure; the no_map_files
+	// retry underneath is the real one, against this live process, so the
+	// rescue being asserted is a real rescue.
+	newForcedFailure := func(t *testing.T, injected error) *LocalSymbolizer {
+		t.Helper()
+		s, err := NewLocalSymbolizer()
+		if err != nil {
+			t.Fatalf("NewLocalSymbolizer: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		// Undo whatever the startup capability probe decided: this test is
+		// about the runtime decision, and it must read the same on a root
+		// host and on a cap_bpf-only one.
+		s.noMapFiles.Store(false)
+		s.stats.disabledReason.Store("")
+		s.mapFilesAttempt = func([]uint64, uint32, []blazesym.ProcessSourceOption) ([]blazesym.Sym, error) {
+			return nil, injected
+		}
+		return s
+	}
+
+	t.Run("transient failure does not latch", func(t *testing.T) {
+		s := newForcedFailure(t, errors.New("failed to read /proc/1234/maps: entity not found"))
+		frames, err := s.SymbolizeProcess(self, []uint64{addr})
+		if err != nil {
+			t.Fatalf("SymbolizeProcess: %v", err)
+		}
+		if len(frames) != 1 || frames[0].Reason != FailureNone {
+			t.Fatalf("the retry must still rescue the batch: %+v", frames)
+		}
+		st := s.Stats()
+		if st.MapFilesDisabled {
+			t.Fatalf("a transient failure must not cost inode accuracy for the rest of the run (reason %q)",
+				st.MapFilesDisabledReason)
+		}
+		if st.MapFilesTransientFailure != 1 || st.MapFilesPermissionDenied != 0 {
+			t.Fatalf("misclassified: %+v", st)
+		}
+		if st.FallbackRescued != 1 {
+			t.Fatalf("the rescue must be counted, not silent: %+v", st)
+		}
+	})
+
+	t.Run("permission failure latches", func(t *testing.T) {
+		// Exactly what blazesym produces: BLAZE_ERR_PERMISSION_DENIED is
+		// rendered by blaze_err_str as this bare string and wrapped with
+		// errors.New, so no errno survives to match on.
+		s := newForcedFailure(t, errors.New("permission denied"))
+		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
+			t.Fatalf("SymbolizeProcess: %v", err)
+		}
+		st := s.Stats()
+		if !st.MapFilesDisabled {
+			t.Fatal("a permission failure cannot improve on its own; it must latch")
+		}
+		if st.MapFilesDisabledReason == "" {
+			t.Fatal("the transition must never be silent: it needs a reason")
+		}
+		if st.MapFilesPermissionDenied != 1 || st.MapFilesTransientFailure != 0 {
+			t.Fatalf("misclassified: %+v", st)
+		}
+		// Latched means latched: the second batch skips the first attempt
+		// outright, so neither classification counter moves again.
+		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
+			t.Fatalf("second SymbolizeProcess: %v", err)
+		}
+		if st2 := s.Stats(); st2.MapFilesPermissionDenied != 1 || st2.MapFilesTransientFailure != 0 {
+			t.Fatalf("a skipped first attempt is not a failure: %+v", st2)
+		}
+	})
+
+	t.Run("errno-typed permission errors are recognized too", func(t *testing.T) {
+		s := newForcedFailure(t, fmt.Errorf("open: %w", syscall.EACCES))
+		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
+			t.Fatalf("SymbolizeProcess: %v", err)
+		}
+		if !s.Stats().MapFilesDisabled {
+			t.Fatal("EACCES is a permission failure")
+		}
+	})
+}
+
+// The classifier is the whole difference between the fixed behavior and the
+// bug, so it is pinned directly.
+func TestIsPermissionDenied(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("permission denied"), true},
+		{errors.New("Permission denied (os error 13)"), true},
+		{fmt.Errorf("wrapped: %w", syscall.EPERM), true},
+		{fmt.Errorf("wrapped: %w", syscall.EACCES), true},
+		{os.ErrPermission, true},
+		{errors.New("entity not found"), false},
+		{errors.New("invalid data"), false},
+		{fmt.Errorf("wrapped: %w", syscall.ENOENT), false},
+		{errSkippedMapFiles, false},
+	}
+	for _, c := range cases {
+		if got := isPermissionDenied(c.err); got != c.want {
+			t.Errorf("isPermissionDenied(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
 }

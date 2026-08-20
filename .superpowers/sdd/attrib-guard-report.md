@@ -86,7 +86,8 @@ Every failure mode above errs towards rejecting a genuine attribution
 In `gpuprobe`, in `Consumer.attachSampledStackLocked`, immediately after
 `resolveStackLocked` succeeds and before the capture can be parked or attached —
 so it covers **both** arrival orders (stack-first parks nothing; batch-first
-releases the held launch without lending it the refused stack).
+does not lend the held launch the refused stack — it does not release that
+launch either, which waits for the next batch, the queue's bound, or `Flush`).
 
 `gpu/` is unchanged in behaviour, deliberately. The judgement needs two things
 `gpu/` does not have and should not acquire: which module is the profiler's, and
@@ -196,3 +197,138 @@ $ ~/go/bin/golangci-lint run --timeout=5m
   (`/home/diego/gpuprobe.test`, blazesym statically linked, `readelf -d | grep -c
   blazesym` = 0). **Rebuilding stripped its file capabilities; a human must
   `setcap` it again** before the gate can run.
+
+---
+
+# Review round 2: two false-accept fixes
+
+Both findings were in the dangerous direction (accepting a profiler-only
+stack), and both are fixed. Nothing else moved: the accounting identity, the
+over-reject-on-unknown-module behaviour, the placement in
+`attachSampledStackLocked` and `gpu/` are all untouched.
+
+## Fix 1: `PT_INTERP` is not what makes a file a program
+
+The review is right, and the counterexample is on this machine:
+
+```
+$ readelf -lh /lib64/libc.so.6 | grep -E "Type:|INTERP"
+  Type:                              DYN (Shared object file)
+  INTERP         0x00000000001bf000 ...
+$ readelf -d /lib64/libc.so.6 | grep -i soname
+ 0x000000000000000e (SONAME)             Library soname: [libc.so.6]
+```
+
+`libc.so.6` is a shared object that carries an interpreter — it is runnable,
+it prints its own version banner. Under the old test it classified as a
+program, so a shim `.so` linked the same way would have switched the guard
+**off** entirely, silently, in exactly the deployment the guard exists for.
+
+The new discriminator, in order, with "library" as the default at every exit:
+
+1. **`ET_EXEC`** → program. Nothing else is ever `ET_EXEC`. (`shim/perfagent-gpu-stub`
+   is `EXEC`, so the gate's shim is decided here, by the strongest signal.)
+2. **`DT_SONAME` present** → library, overriding everything below it. A file
+   that declares the name other objects link against is a library whatever
+   else it carries. This is the check that catches `libc.so.6`, and it is
+   deliberately consulted *before* the program signals so a mislabelled file
+   fails towards "library", which leaves the guard on.
+3. **`DF_1_PIE` in `DT_FLAGS_1`** → program. The linker sets it on
+   position-independent *executables* and on nothing else — the most direct
+   statement of intent an `ET_DYN` file can make. Verified present on this
+   machine's PIE (`readelf -d /proc/self/exe` → `Flags: NOW PIE`) and absent
+   on `libc.so.6` (`Flags: NOW`).
+4. **`PT_INTERP`** → program, as the fallback for a toolchain old enough to
+   emit no `DF_1_PIE`. Only ever reached after `DT_SONAME` has been ruled
+   out, which is what makes it safe here and unsafe on its own.
+
+Residual hole, now documented on `shimScope`: an injected shim `.so`
+deliberately linked with an explicit `--dynamic-linker` **and** with no
+soname, on a toolchain emitting no `DF_1_PIE`, would still read as a program.
+That is three unusual choices at once; the standard `-shared -Wl,-soname`
+shim is caught by rule 2 alone, and a `-shared` shim with no soname (what
+`shim/Makefile` builds) is caught by having neither 3 nor 4.
+
+### The counterexample is asserted, not skipped
+
+`mappedLibrary`'s `isELFProgram` filter is gone — it was stepping around
+precisely the file that disproved the classifier.
+`TestAnInterpreterCarryingSharedObjectIsStillALibrary` now walks every shared
+object mapped into the test process, and for each one that carries `PT_INTERP`
+asserts it classifies as a **library** and that a shim spelled that way is
+guarded. It ends with `require.Positive(t, checked, ...)`, so if no such
+object is mapped the test **fails** rather than passing vacuously. On this
+machine it checks `/usr/lib64/libc.so.6`. `TestShimShapeIsClassifiedFromTheELF`
+likewise now asserts over every mapped `.so` rather than the first acceptable
+one.
+
+Mutation-checked: deleting the `DT_SONAME` branch fails
+`TestAnInterpreterCarryingSharedObjectIsStillALibrary` with
+`/usr/lib64/libc.so.6 is a shared object that happens to carry PT_INTERP` and
+also fails `TestShimShapeIsClassifiedFromTheELF`.
+
+## Fix 2: the `(deleted)` suffix
+
+`shimScope.isShimModule` now strips a trailing `" (deleted)"` before matching,
+against both the path spellings and the basename (`deletedSuffix`). Without
+it, a shim replaced under a running profiled process reports as
+`.../libperfagent-gpu-nvidia.so (deleted)`, matches nothing, and the shim's
+own frame reads as *outside* the shim — a false accept, arriving during an
+upgrade, which is the least observable moment there is.
+
+I did check blazesym: `src/maps.rs`, `parse_path_name`, strips the suffix
+itself (`path.strip_suffix(b" (deleted)")`) when it parses a maps line, so
+with `symbolize.LocalSymbolizer` this is belt and braces. It is handled here
+anyway because `Config.Symbolizer` is an interface — nothing obliges another
+implementation to normalize the path, and the trade is one `TrimSuffix`
+against a silent false attribution.
+
+Two table cases pin it (plain and combined with the mount-namespace basename
+fallback); mutation-checked by making the strip a no-op, which fails both.
+
+## Also done (the two optional items)
+
+* `TestSampledStackAccountingReconciles` now runs with a real `ShimPath` and a
+  module-aware symbolizer, so **every** term of the second identity is
+  non-zero at once: one attached, one evicted, one refused as profiler-only,
+  one still parked (each asserted individually, then the identity). Before,
+  the `StacksProfilerOnly` term was zero by construction.
+* Report wording corrected: the batch-first refusal does **not** release the
+  held launch. The guard returns before `deferred.take`, so the launch waits
+  exactly as it would for a capture that failed to resolve — for the next
+  batch, the queue's own bound, or `Flush`. Bounded and lossless, but a wait,
+  not a release. The same correction is now in the test's own comment.
+
+## Re-verification
+
+```
+$ go build ./... && go vet ./...
+(no output: clean)
+
+$ go test ./gpu/ ./gpuprobe/ ./internal/... -count=1
+ok  	github.com/dpsoft/perf-agent/gpu	3.454s
+ok  	github.com/dpsoft/perf-agent/gpuprobe	0.062s
+ok  	github.com/dpsoft/perf-agent/internal/bpfstack	0.004s
+ok  	github.com/dpsoft/perf-agent/internal/gpuabi	0.004s
+ok  	github.com/dpsoft/perf-agent/internal/k8slabels	0.004s
+ok  	github.com/dpsoft/perf-agent/internal/nspid	0.002s
+ok  	github.com/dpsoft/perf-agent/internal/perfdata	0.187s
+ok  	github.com/dpsoft/perf-agent/internal/perfevent	0.003s
+ok  	github.com/dpsoft/perf-agent/internal/usdt	0.199s
+
+$ go test ./gpuprobe/ -race -count=1
+ok  	github.com/dpsoft/perf-agent/gpuprobe	1.172s
+
+$ gofmt -l gpu gpuprobe
+(no output: clean)
+
+$ ~/go/bin/golangci-lint run --timeout=5m
+0 issues.
+```
+
+Still not verifiable here: the phase gate itself (`CapEff: 0`). The stub is
+`ET_EXEC`, so it is classified a program by rule 1 — the strongest and least
+ambiguous of the four — and the guard cannot touch a stub stack.
+`/home/diego/gpuprobe.test` was rebuilt once at the end with the static
+blazesym recipe; **its file capabilities are stripped and a human must
+`setcap` it again**.

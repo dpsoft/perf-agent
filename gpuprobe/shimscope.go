@@ -3,6 +3,7 @@ package gpuprobe
 import (
 	"debug/elf"
 	"path/filepath"
+	"strings"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
@@ -48,9 +49,11 @@ import (
 //     application are the same binary. There is no boundary to cross.
 //
 // shimScope tells the two apart from the shim's ELF alone, once, when the
-// consumer is built: a file that carries a PT_INTERP segment (or is ET_EXEC)
-// is a program the kernel can exec, i.e. shape two; anything else is a
-// shared object, i.e. shape one. That is a static, deterministic property of
+// consumer is built: ET_EXEC, or an ET_DYN that declares no DT_SONAME and
+// marks itself DF_1_PIE (or, on an older toolchain, carries PT_INTERP), is a
+// program the kernel can exec, i.e. shape two; anything else is a shared
+// object, i.e. shape one. See isELFProgram for why PT_INTERP alone is not
+// that test - libc.so.6 has one. That is a static, deterministic property of
 // the file the consumer attached to. The obvious alternative - readlink or
 // stat /proc/<pid>/exe per launching pid and compare it to the shim - was
 // rejected: it answers the same question later, per pid, on the hot path,
@@ -65,9 +68,18 @@ import (
 // Rejecting a genuine stack loses information; accepting a profiler-only one
 // is the bug this exists to prevent.
 //
-//   - A static-PIE self-contained producer (ET_DYN, no PT_INTERP) is
-//     classified as an injected library, so its legitimate inside-only
-//     stacks are rejected. Information loss, counted, honest.
+//   - A static-PIE self-contained producer (ET_DYN, no PT_INTERP, and no
+//     DF_1_PIE from a toolchain that omits it) is classified as an injected
+//     library, so its legitimate inside-only stacks are rejected.
+//     Information loss, counted, honest.
+//   - The reverse - an injected shim .so deliberately linked with an
+//     interpreter AND with no DT_SONAME, on a toolchain emitting no
+//     DF_1_PIE - would read as a program and disable the guard. That is the
+//     dangerous direction, and it is why DT_SONAME is checked first and why
+//     PT_INTERP is only ever a last-resort fallback. It requires linking
+//     -shared with an explicit --dynamic-linker and suppressing the soname,
+//     which no sane build does; the standard `-shared -Wl,-soname` shim is
+//     classified as a library by rule 2 alone.
 //   - A frame whose module the symbolizer could not name proves nothing, so
 //     it is never read as "outside". A stack of nothing but unnamed modules
 //     is therefore rejected too - and counted separately, in
@@ -81,6 +93,10 @@ import (
 //     "outside" - a false accept, the direction that must not happen. The
 //     cost is that an application module that happens to share the shim's
 //     basename reads as "inside", which can only cause a rejection.
+//   - A mapping the kernel marks " (deleted)" - the shim was replaced while
+//     a profiled process had it mapped - is normalized before matching. See
+//     deletedSuffix: without that, the shim's own frame reads as outside the
+//     shim, which is a false accept.
 //   - An empty ShimPath disables the guard entirely: with no idea which
 //     module is the profiler's, there is no evidence either way, and
 //     rejecting everything on no evidence is destruction, not honesty.
@@ -147,10 +163,38 @@ func newShimScope(shimPath string) shimScope {
 	return s
 }
 
-// isELFProgram reports whether path is a file the kernel can exec directly:
-// ET_EXEC, or an ET_DYN carrying PT_INTERP (a position-independent
-// executable). A shared object is neither. An unreadable or unparseable file
-// reports false, which leaves the guard on - the lossy direction.
+// isELFProgram reports whether path is a program - something the kernel
+// execs as a process image - rather than a shared object something else
+// loads into a process it did not create.
+//
+// PT_INTERP is NOT that test, which is the trap this function was rewritten
+// to avoid. Glibc's own libc.so.6 carries a PT_INTERP segment (it is
+// runnable: `/lib64/libc.so.6` prints its version banner), and so does the
+// dynamic loader. A shim .so linked with an explicit interpreter would
+// therefore have classified as a program and switched the whole guard OFF -
+// silently, in exactly the deployment the guard exists for. Unreachable
+// today only because shim/Makefile links with a plain -shared.
+//
+// The signals, in the order they are consulted:
+//
+//  1. ET_EXEC. A non-PIE executable. Nothing else is ever ET_EXEC.
+//  2. DT_SONAME. A file that declares the name other objects should link
+//     against is a library, whatever else it carries. This is what tells
+//     libc.so.6 (SONAME libc.so.6, PT_INTERP present) apart from a PIE, and
+//     it is consulted BEFORE the two program signals so it can override
+//     them: a mislabelled library must fail towards "library", because that
+//     leaves the guard on.
+//  3. DF_1_PIE in DT_FLAGS_1. Set by the linker on position-independent
+//     EXECUTABLES only, and by nothing else - the most direct statement of
+//     intent an ET_DYN file can make. Present on binutils/lld output for
+//     roughly the last decade.
+//  4. PT_INTERP, as the fallback for an older toolchain that emits no
+//     DF_1_PIE. Only ever reached once DT_SONAME has been ruled out, which
+//     is what makes it safe here and unsafe on its own.
+//
+// Anything else - including an unreadable or unparseable file - is reported
+// as a library, which leaves the guard ON. That is the lossy direction, and
+// the deliberate one.
 func isELFProgram(path string) bool {
 	f, err := elf.Open(path)
 	if err != nil {
@@ -162,6 +206,18 @@ func isELFProgram(path string) bool {
 	}
 	if f.Type != elf.ET_DYN {
 		return false
+	}
+	// DynString returns an error for a file with no dynamic section at all
+	// (a static-PIE); no SONAME either way, so the error is not special.
+	if soname, err := f.DynString(elf.DT_SONAME); err == nil && len(soname) > 0 {
+		return false
+	}
+	if flags, err := f.DynValue(elf.DT_FLAGS_1); err == nil {
+		for _, v := range flags {
+			if v&uint64(elf.DF_1_PIE) != 0 {
+				return true
+			}
+		}
 	}
 	for _, p := range f.Progs {
 		if p.Type == elf.PT_INTERP {
@@ -202,8 +258,30 @@ func (s shimScope) verdict(frames []pp.Frame) stackVerdict {
 // first, then file name - see the failure modes on shimScope for why the
 // basename fallback is there and which way it errs.
 func (s shimScope) isShimModule(module string) bool {
+	module = strings.TrimSuffix(module, deletedSuffix)
 	if _, ok := s.paths[module]; ok {
 		return true
 	}
 	return filepath.Base(module) == s.base
 }
+
+// deletedSuffix is what the kernel appends to a mapping's path in
+// /proc/<pid>/maps once the file behind it has been unlinked - which happens
+// to the shim itself whenever it is upgraded or reinstalled under a running
+// profiled process.
+//
+// It has to be stripped before matching, because an unstripped
+// ".../libperfagent-gpu-nvidia.so (deleted)" matches none of the shim's
+// spellings and not its basename either, so the shim's OWN frame would read
+// as "outside the shim" and a profiler-only stack would be accepted. That is
+// the false-accept direction, the one thing this guard must never do, and it
+// would happen only during an upgrade - the least observable moment
+// possible.
+//
+// blazesym strips the suffix itself when it parses a maps line (src/maps.rs,
+// parse_path_name), so with the LocalSymbolizer this is belt and braces. It
+// is done here anyway because Config.Symbolizer is an interface: nothing
+// obliges another implementation to normalize the path, and the cost of
+// being wrong is a silent false attribution against the cost of one
+// TrimSuffix.
+const deletedSuffix = " (deleted)"

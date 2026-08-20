@@ -2,6 +2,7 @@ package gpuprobe
 
 import (
 	"bufio"
+	"debug/elf"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,17 +39,23 @@ func (s *moduleSymbolizer) SymbolizeProcess(_ uint32, ips []uint64) ([]symbolize
 
 func (s *moduleSymbolizer) Close() error { return nil }
 
-// mappedLibrary returns the path of a shared object mapped into this very
-// process, so the deployment-shape tests run against a real ELF rather than
-// a fixture that only claims to be one. A CGO-linked test binary always maps
-// at least libc; a fully static one maps nothing, and the test says so
-// rather than pretending to have checked.
-func mappedLibrary(t *testing.T) string {
+// mappedSharedObjects returns the paths of the shared objects mapped into
+// this very process, so the deployment-shape tests run against real ELF
+// files rather than fixtures that only claim to be one. A CGO-linked test
+// binary always maps at least libc and the dynamic loader.
+//
+// Note what this does NOT do: filter by isELFProgram. An earlier version
+// skipped any mapped library the classifier called a program, which stepped
+// silently around the one file that proves the classifier wrong - see
+// TestAnInterpreterCarryingSharedObjectIsStillALibrary.
+func mappedSharedObjects(t *testing.T) []string {
 	t.Helper()
 	f, err := os.Open("/proc/self/maps")
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
 
+	var out []string
+	seen := map[string]bool{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
@@ -60,13 +67,65 @@ func mappedLibrary(t *testing.T) string {
 		if !strings.HasSuffix(base, ".so") && !strings.Contains(base, ".so.") {
 			continue
 		}
-		if isELFProgram(path) {
+		if !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	require.NotEmpty(t, out,
+		"no shared object mapped into this process; the test binary must be dynamically linked (it is CGO-linked against blazesym)")
+	return out
+}
+
+// mappedLibrary returns one real shared object to stand in for an injected
+// shim.
+func mappedLibrary(t *testing.T) string {
+	t.Helper()
+	return mappedSharedObjects(t)[0]
+}
+
+// hasPTInterp reports whether an ELF carries an interpreter segment.
+func hasPTInterp(t *testing.T, path string) bool {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return true
+		}
+	}
+	return false
+}
+
+// The counterexample that broke the first version of isELFProgram, pinned.
+//
+// Glibc's libc.so.6 is a shared object that carries a PT_INTERP segment - it
+// is runnable, it prints its own version banner. "Has PT_INTERP" therefore
+// classified it as a program, and a shim .so linked the same way would have
+// switched the guard OFF entirely, in exactly the deployment the guard
+// exists for. DT_SONAME is what actually separates the two, and it is
+// consulted first.
+//
+// This asserts on the real file mapped into this process rather than
+// skipping past it, because a test that skips its own counterexample is not
+// testing.
+func TestAnInterpreterCarryingSharedObjectIsStillALibrary(t *testing.T) {
+	checked := 0
+	for _, so := range mappedSharedObjects(t) {
+		if !hasPTInterp(t, so) {
 			continue
 		}
-		return path
+		checked++
+		assert.False(t, isELFProgram(so),
+			"%s is a shared object that happens to carry PT_INTERP; classifying it as a program would disable the guard", so)
+		assert.True(t, newShimScope(so).guarded,
+			"a shim spelled like %s must still be guarded as an injected library", so)
 	}
-	t.Skip("no shared object mapped into this process; needs a dynamically linked test binary")
-	return ""
+	require.Positive(t, checked,
+		"no PT_INTERP-carrying shared object is mapped into this process, so the counterexample went unchecked; on glibc libc.so.6 is one")
 }
 
 // The two deployment shapes, told apart from the shim's ELF alone.
@@ -81,10 +140,11 @@ func TestShimShapeIsClassifiedFromTheELF(t *testing.T) {
 	assert.False(t, newShimScope("/proc/self/exe").guarded,
 		"a shim that IS the program is the self-contained shape (shim/stub): profiler and application are the same binary, so there is no boundary to police")
 
-	lib := mappedLibrary(t)
-	assert.False(t, isELFProgram(lib), "%s is a shared object, not a program", lib)
-	assert.True(t, newShimScope(lib).guarded,
-		"a shim that is a shared object is the injected shape (the CUPTI adapter): application code lives in other modules by construction")
+	for _, so := range mappedSharedObjects(t) {
+		assert.False(t, isELFProgram(so), "%s is a shared object, not a program", so)
+		assert.True(t, newShimScope(so).guarded,
+			"a shim that is a shared object is the injected shape (the CUPTI adapter): application code lives in other modules by construction")
+	}
 }
 
 // An empty ShimPath is not evidence of anything, so it cannot justify
@@ -132,6 +192,19 @@ func TestVerdictNeedsPositiveEvidenceOfLeavingTheShim(t *testing.T) {
 		// happen.
 		name:   "same shim under another mount namespace's path",
 		frames: []pp.Frame{{Name: "on_callback", Module: "/rootfs/opt/perfagent/libperfagent_cupti.so"}},
+		want:   stackProfilerOnly,
+	}, {
+		// The shim was upgraded under a running process, so the kernel
+		// reports its mapping as deleted. Unstripped, that path matches
+		// neither the spellings nor the basename and the shim's own frame
+		// reads as "outside" - a false accept, during an upgrade, which is
+		// the least observable moment there is.
+		name:   "the shim was replaced while the process had it mapped",
+		frames: []pp.Frame{{Name: "on_callback", Module: shim + " (deleted)"}},
+		want:   stackProfilerOnly,
+	}, {
+		name:   "deleted mapping under another mount namespace's path",
+		frames: []pp.Frame{{Name: "on_callback", Module: "/rootfs" + shim + " (deleted)"}},
 		want:   stackProfilerOnly,
 	}, {
 		name: "a frame with no module proves nothing",
@@ -259,6 +332,12 @@ func TestUnprovenRejectionIsCountedSeparately(t *testing.T) {
 // The guard runs before the stack is parked, so a refused capture never
 // occupies the bounded side table and never gets attached by the other
 // arrival order either.
+//
+// Note what the refusal does NOT do: release the launch it was held for. The
+// guard returns before deferred.take, so the held launch waits exactly as it
+// would for a capture that failed to resolve - for the next batch, for the
+// queue's own bound, or for Flush, which is what releases it here. Bounded
+// and lossless, but it is a wait, not a release.
 func TestRefusedStackIsNeverAttachedInEitherArrivalOrder(t *testing.T) {
 	lib := mappedLibrary(t)
 	sink := &recordingSink{}
@@ -267,7 +346,7 @@ func TestRefusedStackIsNeverAttachedInEitherArrivalOrder(t *testing.T) {
 	sm.put(5, 0x1000)
 
 	// Batched twin first: the launch is held, and the capture that follows
-	// must release it without lending it the refused stack.
+	// must not lend it the refused stack. Flush is what lets it go.
 	apply(t, c, launchBatchWith(4242, 7))
 	apply(t, c, sampledBatchWith(4242, 7, 5, 8))
 	c.Flush()

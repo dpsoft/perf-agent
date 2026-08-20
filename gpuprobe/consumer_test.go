@@ -1536,23 +1536,42 @@ func TestEmptyStackEntryIsCountedAsALookupFailure(t *testing.T) {
 // from a consumer quietly losing captures, which is the whole point of §6.1
 // accounting.
 func TestSampledStackAccountingReconciles(t *testing.T) {
+	// A real shim path, and a symbolizer that places frames in modules, so
+	// the StacksProfilerOnly term is actually exercised: with an empty
+	// ShimPath the guard is off and that term is zero by construction, which
+	// would make the identity below pass without ever having been tested
+	// against a refusal.
+	shim := mappedLibrary(t)
 	sink := &recordingSink{}
-	c, sm, _ := stackConsumer(t, sink, Config{SampledStackCapacity: 1})
+	sym := &moduleSymbolizer{modules: map[uint64]string{
+		0x1000: "/app/train", 0x2000: "/app/train", 0x3000: "/app/train",
+		0x4000: shim, // never left the profiler: refused
+	}}
+	c, sm, _ := stackConsumer(t, sink, Config{SampledStackCapacity: 1, ShimPath: shim, Symbolizer: sym})
 
 	sm.put(1, 0x1000) // resolves, then parks
 	sm.put(2, 0x2000) // resolves, parks, evicting the first
 	sm.put(3, 0x3000) // resolves and attaches to a held launch
+	sm.put(4, 0x4000) // resolves, then is refused as profiler-only
 	apply(t, c, sampledBatchWith(4242, 1, 1, 8))
 	apply(t, c, sampledBatchWith(4242, 2, 2, 8))
 	apply(t, c, launchBatchWith(4242, 3))
 	apply(t, c, sampledBatchWith(4242, 3, 3, 8))
+	apply(t, c, sampledBatchWith(4242, 8, 4, 8))
 	apply(t, c, sampledBatchWith(4242, 4, -1, 8))  // capture failed
 	apply(t, c, sampledBatchWith(4242, 0, 5, 8))   // no correlation
 	apply(t, c, sampledBatchWith(4242, 6, 404, 8)) // no such entry
 	c.Flush()
 
 	st := c.Stats()
-	assert.Equal(t, uint64(6), st.SampledLaunches)
+	assert.Equal(t, uint64(7), st.SampledLaunches)
+	// Every term of the second identity is non-zero here, which is the point
+	// of the arrangement above: one attached, one evicted, one refused, one
+	// still parked.
+	assert.Equal(t, uint64(1), st.StacksAttached)
+	assert.Equal(t, uint64(1), st.StacksEvicted)
+	assert.Equal(t, uint64(1), st.StacksProfilerOnly)
+	assert.Equal(t, 1, st.PendingStacks)
 	assert.Equal(t, st.SampledLaunches,
 		st.StacksMissing+st.StacksUncorrelated+st.StackLookupFailed+st.SymbolizeFailed+st.StacksResolved,
 		"every sampled launch must land in exactly one bucket")

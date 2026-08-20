@@ -2095,7 +2095,16 @@ Phase 3 is done when all of the following hold:
 
 1. `go test ./internal/gpuabi/ ./internal/usdt/ ./gpuprobe/` passes, and `make -C shim test` passes.
 2. `TestStubDrivesThePipelineToPprofWithoutAGPU` passes on a box with no GPU, with zero sequence gaps.
-3. `gpu-stub-profile` writes a pprof whose samples carry `[gpu:launch]` and `[gpu:kernel:*]` frames.
+3. `gpu-stub-profile` writes a pprof whose samples carry `[gpu:launch]` frames and
+   whose executions all joined exactly.
+
+   **Corrected during execution.** This item originally also demanded
+   `[gpu:kernel:*]` frames, which Phase 3 cannot produce: kernel names reach the
+   consumer through `gpu_kernel_name_v1` interning, and that is deferred to Phase 4
+   by the *Deferred* section below. The criterion required a frame whose mechanism
+   the same plan defers. The first privileged gate run surfaced it — the profile
+   came out 100% `[gpu:launch]` with no kernel frames, exactly as the deferral
+   implies. Symbolized kernel frames are Phase 4's gate, not this one.
 4. The stub, unattached, reports every record dropped and emits nothing.
 5. `getcap` on the test binary shows `cap_bpf,cap_perfmon` only — **no `cap_sys_admin`**. If the attach needs it, the consumer is using the wrong mechanism.
 6. **The ABI review has been done on paper** against the rocprofiler bridge's taxonomy on branch `gpu-profiling-spec` (§6.1, §14). Walk `examples/rocprofiler_sdk_preload_bridge.cpp` and confirm each of `gpu_launch_v1`, `gpu_exec_v1`, `gpu_module_load_v1` and `gpu_kernel_name_v1` can be populated from what rocprofiler delivers, or record why not. Do not skip this because NVIDIA ships first — it is the whole reason `core/` is worth having.

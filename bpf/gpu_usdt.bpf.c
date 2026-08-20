@@ -96,7 +96,8 @@ _Static_assert(MAX_RECORD_BYTES <= PAYLOAD_BYTES,
 // stack_id is the BPF stackmap key for the launching thread's user stack,
 // or negative when the capture failed. It is per-batch, not per-record,
 // which is sound only because the one kind that carries it
-// (KIND_LAUNCH_SAMPLED) always arrives with count == 1.
+// (KIND_LAUNCH_SAMPLED) always arrives with count == 1 — enforced by
+// max_records, not merely assumed of the producer.
 struct batch_hdr {
     __u32 kind;
     __u32 count;
@@ -183,10 +184,18 @@ static __always_inline __u32 record_size(__u32 kind)
 // a compile-time constant, so the verifier sees a bounded scalar and clang
 // emits no division.
 //
-// The caps: 48B -> 64, 40B -> 64 (capped), 56B -> 54, 272B -> 11. The two
-// large kinds always fire with count == 1, so their caps are never reached
-// in practice; they exist so the clamp is sound for any count a producer
+// The byte-budget caps are 48B -> 64, 40B -> 64 (capped), 56B -> 54,
+// 272B -> 11. They exist so the clamp is sound for any count a producer
 // could pass, not just the counts this shim passes.
+//
+// KIND_LAUNCH_SAMPLED is capped at 1 for a stronger reason than bytes. Its
+// stack id lives in the batch header, one per batch, so a batch of N sampled
+// launches would attribute one captured stack to N unrelated launches — the
+// exact misattribution this feature exists to avoid, and silent, because
+// every record would still decode. The cap makes a batching producer lose
+// records loudly in the `dropped` map instead. gpuprobe's decodeBatch
+// rejects count != 1 on this kind for the same reason: neither end trusts
+// the other to hold the invariant.
 static __always_inline __u32 max_records(__u32 kind)
 {
     if (kind == KIND_LAUNCH)
@@ -198,11 +207,14 @@ static __always_inline __u32 max_records(__u32 kind)
     if (kind == KIND_PC)
         return BATCH_CAP(REC_PC);
     if (kind == KIND_LAUNCH_SAMPLED)
-        return BATCH_CAP(REC_LAUNCH_SAMPLED);
+        return 1;   // one stack per batch => one record per batch
     if (kind == KIND_KERNEL_NAME)
         return BATCH_CAP(REC_KERNEL_NAME);
     return 0;
 }
+
+_Static_assert(1 <= BATCH_CAP(REC_LAUNCH_SAMPLED),
+               "the sampled-launch cap of 1 must still fit the payload budget");
 
 static __always_inline void count_drop(__u32 kind, __u64 records)
 {

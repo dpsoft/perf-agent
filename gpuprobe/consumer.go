@@ -307,6 +307,17 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	return c, nil
 }
 
+// errSampledBatchNotSingular means a gpu_launch_sampled_v1 batch arrived
+// carrying anything other than exactly one record.
+//
+// The stack id lives in the batch header, one per batch. A batch of N sampled
+// launches would therefore attribute one captured stack to N unrelated
+// launches — silently, since every record still decodes perfectly. The BPF
+// program caps this kind at one record per batch (max_records in
+// bpf/gpu_usdt.bpf.c) and the decoder refuses anything else, so neither end
+// relies on the other, or on the producer, to hold the invariant.
+var errSampledBatchNotSingular = errors.New("gpuprobe: sampled-launch batch must carry exactly one record")
+
 // batch is one decoded ringbuf sample: a header plus the records it carried.
 type batch struct {
 	Kind     uint32
@@ -317,8 +328,10 @@ type batch struct {
 	// or negative when the capture failed. It is a property of the whole
 	// batch because the BPF program stores it in the header — sound only
 	// because the one kind that carries a stack, kindLaunchSampled, always
-	// arrives with count == 1 (the shim emits it unbatched). It is -1 on
-	// every other kind and must only be interpreted for kindLaunchSampled.
+	// arrives with count == 1. That is enforced at both ends (the BPF
+	// program's per-kind cap and decodeBatch), not assumed of the producer;
+	// see errSampledBatchNotSingular. It is -1 on every other kind and must
+	// only be interpreted for kindLaunchSampled.
 	StackID         int32
 	Launches        []gpuabi.Launch
 	Execs           []gpuabi.Exec
@@ -375,6 +388,10 @@ func decodeBatch(b []byte) (batch, error) {
 			out.Execs = append(out.Execs, rec)
 		}
 	case kindLaunchSampled:
+		// One header, one stack id, one launch. See errSampledBatchNotSingular.
+		if count != 1 {
+			return batch{}, fmt.Errorf("%w: count=%d", errSampledBatchNotSingular, count)
+		}
 		if count > len(payload)/gpuabi.SizeLaunchSampled {
 			return batch{}, gpuabi.ErrShortRecord
 		}
@@ -514,20 +531,19 @@ func (c *Consumer) applyBatch(b batch) {
 			}
 		}
 	case kindLaunchSampled:
-		// The stack is a property of the batch, not of a record, and that is
-		// only sound because this kind rides unbatched — the shim emits one
-		// probe fire per sampled launch precisely so a captured stack belongs
-		// to exactly one launch (shim/stub/stub.cc). Counting it per batch
-		// would be wrong the moment that changed, so count it per record and
-		// let the RawCount == 1 invariant hold it together.
+		// One capture per batch, counted once per batch: decodeBatch has
+		// already refused any count but 1, so the loop below runs exactly
+		// once, but counting the capture failure outside it means a future
+		// change to that rule degrades into an obvious undercount rather
+		// than multiplying one failure by the record count.
+		if b.StackID < 0 {
+			// A launch whose stack capture failed is still a launch: it is
+			// counted here and carried on, never discarded.
+			c.stats.StacksMissing++
+		}
 		for range b.SampledLaunches {
 			c.stats.Records++
 			c.stats.SampledLaunches++
-			if b.StackID < 0 {
-				// A launch whose stack capture failed is still a launch: it
-				// is counted here and carried on, never discarded.
-				c.stats.StacksMissing++
-			}
 		}
 		// Deliberately not emitted to the sink in this task. A sampled launch
 		// shares its correlation with the plain gpu_launch_v1 record for the

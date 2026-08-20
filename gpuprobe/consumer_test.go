@@ -748,9 +748,12 @@ func TestDecodeRejectsCountBeyondPayloadForTheLargeKinds(t *testing.T) {
 		name string
 		kind uint32
 		size int
+		want error
 	}{
-		{"sampled", kindLaunchSampled, gpuabi.SizeLaunchSampled},
-		{"kernelname", kindKernelName, gpuabi.SizeKernelName},
+		// kindLaunchSampled never reaches the length check: a count of 2 is
+		// refused outright, because one header carries one stack id.
+		{"sampled", kindLaunchSampled, gpuabi.SizeLaunchSampled, errSampledBatchNotSingular},
+		{"kernelname", kindKernelName, gpuabi.SizeKernelName, gpuabi.ErrShortRecord},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := make([]byte, batchHdrSize+tc.size)
@@ -758,7 +761,7 @@ func TestDecodeRejectsCountBeyondPayloadForTheLargeKinds(t *testing.T) {
 			putU32(buf[4:], 2) // claims two, carries one
 			putU64(buf[24:], uint64(tc.size))
 			_, err := decodeBatch(buf)
-			require.ErrorIs(t, err, gpuabi.ErrShortRecord)
+			require.ErrorIs(t, err, tc.want)
 		})
 	}
 }
@@ -780,4 +783,70 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 	assert.Equal(t, uint32(kindMax), spec.Maps["stacks_missing"].MaxEntries)
 	assert.NotSame(t, spec.Maps["dropped"], spec.Maps["stacks_missing"],
 		"a failed capture is not a dropped record and must not inflate KernelDropped")
+}
+
+// A sampled-launch batch carrying more than one record would attribute the
+// batch's single captured stack to every launch in it — silently, because
+// every record still decodes. Both ends refuse it: the BPF program caps this
+// kind at one record (max_records in bpf/gpu_usdt.bpf.c, asserted below
+// against the source) and decodeBatch rejects any other count.
+func TestSampledBatchWithMoreThanOneRecordIsRejected(t *testing.T) {
+	for _, count := range []uint32{0, 2, 54} {
+		buf := make([]byte, batchHdrSize+2*gpuabi.SizeLaunchSampled)
+		putU32(buf[0:], kindLaunchSampled)
+		putU32(buf[4:], count)
+		putU64(buf[24:], uint64(2*gpuabi.SizeLaunchSampled))
+		putU32(buf[32:], 5) // a perfectly good stack id
+		putU32(buf[batchHdrSize+44:], 8)
+		putU32(buf[batchHdrSize+gpuabi.SizeLaunchSampled+44:], 8)
+
+		_, err := decodeBatch(buf)
+		require.ErrorIsf(t, err, errSampledBatchNotSingular,
+			"count=%d: one header carries one stack id, so it may carry only one launch", count)
+	}
+}
+
+// ...and the rejection is counted, never skipped: Run's decode failure path
+// is the only thing standing between a mis-batched producer and silence.
+func TestRunCountsAMisBatchedSampledBatchAsMalformed(t *testing.T) {
+	reader := newScriptedReader(2)
+	c := newTestConsumer(&recordingSink{})
+	c.reader = reader
+
+	buf := make([]byte, batchHdrSize+2*gpuabi.SizeLaunchSampled)
+	putU32(buf[0:], kindLaunchSampled)
+	putU32(buf[4:], 2)
+	putU64(buf[24:], uint64(2*gpuabi.SizeLaunchSampled))
+	putU32(buf[batchHdrSize+44:], 8)
+	putU32(buf[batchHdrSize+gpuabi.SizeLaunchSampled+44:], 8)
+	reader.recs <- buf
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	require.Eventually(t, func() bool { return c.Stats().Malformed == 1 },
+		5*time.Second, 5*time.Millisecond)
+	require.NoError(t, c.Close())
+	<-done
+
+	st := c.Stats()
+	assert.Zero(t, st.Records, "not one of the two records is normalized")
+	assert.Zero(t, st.SampledLaunches)
+	assert.Zero(t, st.StacksMissing, "a rejected batch is malformed, not a missing stack")
+}
+
+// A single capture failure must be counted once. It is hoisted out of the
+// record loop in applyBatch so that stays true even if the count invariant
+// above is ever loosened.
+func TestAStackFailureIsCountedOncePerBatch(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	b, err := decodeBatch(sampledBatch(-1, 8))
+	require.NoError(t, err)
+	// Force the shape the decoder refuses, to prove applyBatch would not
+	// multiply one capture failure by the record count.
+	b.SampledLaunches = append(b.SampledLaunches, b.SampledLaunches[0], b.SampledLaunches[0])
+	c.applyBatch(b)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksMissing, "one batch, one capture, one failure")
+	assert.Equal(t, uint64(3), st.SampledLaunches)
 }

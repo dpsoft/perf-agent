@@ -12,15 +12,16 @@ import (
 // TestShimBatchSizeFitsKernelCap pins the relationship between the shim's
 // producer-side batch size and the BPF program's consumer-side cap.
 //
-// bpf/gpu_usdt.bpf.c defines MAX_RECORDS_PER_BATCH: a batch larger than that
-// is truncated and the excess counted in the `dropped` map
-// (gpu_usdt_batch's `if (count > MAX_RECORDS_PER_BATCH)` branch). The stub
-// in shim/stub/stub.cc batches at a fixed size via perfagent::Batch<Kind,
-// N>. Today N (32) is comfortably under MAX_RECORDS_PER_BATCH (64), so
-// nothing drops. Nothing currently ties the two together: raising the
-// shim's batch size past the kernel cap would silently start dropping
-// records, defeating the "no loss is ever silent" contract this consumer
-// otherwise upholds (see Consumer.Stats' KernelDropped).
+// gpu_usdt_batch caps each record kind at max_records(kind) records per
+// batch and truncates anything above it, counting the excess in the `dropped`
+// map (the `if (count > cap)` branch). For the two batched kinds checked here
+// that cap is MAX_RECORDS_PER_BATCH, since a 48-byte record fits 64 times in
+// the payload budget. The stub in shim/stub/stub.cc batches at a fixed size
+// via perfagent::Batch<Kind, N>. Today N (32) is comfortably under 64, so
+// nothing drops. Nothing currently ties the two together: raising the shim's
+// batch size past the kernel cap would silently start dropping records,
+// defeating the "no loss is ever silent" contract this consumer otherwise
+// upholds (see Consumer.Stats' KernelDropped).
 //
 // This test reads both constants out of the C sources — no privileges
 // required, no BPF load, no attach — so a future change to either constant
@@ -121,4 +122,17 @@ func TestSampledProbesAreNotBatchedInTheStub(t *testing.T) {
 		require.Containsf(t, string(b), probe+"_emit(",
 			"%s should still be emitted directly", probe)
 	}
+}
+
+// The sampled-launch cap is 1, and not because of bytes: the batch header
+// holds one stack id, so a batch of N sampled launches would attribute one
+// captured stack to N unrelated launches. Its byte budget would allow 54.
+// Pin the 1 against the source, since nothing else in Go can see it.
+func TestSampledLaunchIsCappedAtOneRecordPerBatch(t *testing.T) {
+	b, err := os.ReadFile("../bpf/gpu_usdt.bpf.c")
+	require.NoError(t, err)
+	re := regexp.MustCompile(`(?m)if \(kind == KIND_LAUNCH_SAMPLED\)\s*\n\s*return 1;`)
+	require.NotNil(t, re.Find(b),
+		"max_records must return 1 for KIND_LAUNCH_SAMPLED: one header carries one stack id, "+
+			"so a batch of N would attribute one stack to N unrelated launches")
 }

@@ -1,0 +1,16 @@
+/* The injected library must export exactly one symbol.
+ *
+ * -fvisibility=hidden alone does not achieve that: libstdc++ declares
+ * namespace std with _GLIBCXX_VISIBILITY(default), so the vague-linkage
+ * instantiations this file drags in -- std::thread's _State_impl for
+ * Drainer's lambda, std::function's manager thunks, their typeinfo and
+ * vtables -- come out as exported weak symbols with "perfagent::Drainer" in
+ * their mangled names. Localizing them keeps core/ out of the dynamic symbol
+ * table of whatever process the driver injects us into (spec §6.1).
+ */
+{
+    global:
+        InitializeInjection;
+    local:
+        *;
+};

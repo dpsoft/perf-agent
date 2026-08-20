@@ -174,7 +174,7 @@ func TestProbeKindCookiesMatchTheBPFProgram(t *testing.T) {
 // silently discarded — §6.1 admits no silent loss anywhere.
 func TestUndecodedKindsAreCountedNotDropped(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
-	buf := make([]byte, 32+40)
+	buf := make([]byte, batchHdrSize+40)
 	putU32(buf[0:], kindModule)
 	putU32(buf[4:], 1)
 	putU64(buf[24:], 40)
@@ -188,15 +188,15 @@ func TestUndecodedKindsAreCountedNotDropped(t *testing.T) {
 
 func TestDecodeBatchSplitsRecordsByKind(t *testing.T) {
 	// header: kind=1 count=2 seq=7 pid=11 tid=12 bytes=96
-	buf := make([]byte, 32+96)
+	buf := make([]byte, batchHdrSize+96)
 	putU32(buf[0:], 1)
 	putU32(buf[4:], 2)
 	putU64(buf[8:], 7)
 	putU32(buf[16:], 11)
 	putU32(buf[20:], 12)
 	putU64(buf[24:], 96)
-	putU64(buf[32:], 100) // first launch correlation
-	putU64(buf[32+48:], 101)
+	putU64(buf[batchHdrSize:], 100) // first launch correlation
+	putU64(buf[batchHdrSize+48:], 101)
 
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
@@ -208,7 +208,7 @@ func TestDecodeBatchSplitsRecordsByKind(t *testing.T) {
 }
 
 func TestDecodeBatchRejectsTruncatedPayload(t *testing.T) {
-	buf := make([]byte, 32+10)
+	buf := make([]byte, batchHdrSize+10)
 	putU32(buf[0:], 1)
 	putU32(buf[4:], 2)
 	putU64(buf[24:], 96) // claims 96 bytes it does not have
@@ -224,7 +224,7 @@ func TestDecodeBatchRejectsShortHeader(t *testing.T) {
 // A count larger than the declared payload must fail rather than read past
 // the end of the sample.
 func TestDecodeBatchRejectsCountBeyondPayload(t *testing.T) {
-	buf := make([]byte, 32+48)
+	buf := make([]byte, batchHdrSize+48)
 	putU32(buf[0:], kindLaunch)
 	putU32(buf[4:], 2) // claims two launches
 	putU64(buf[24:], 48)
@@ -278,7 +278,7 @@ func TestSequenceGapsArePerProcess(t *testing.T) {
 func TestApplyBatchKeepsPerProcessSequencesApart(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
 	mk := func(pid uint32, seq uint64) batch {
-		buf := make([]byte, 32+48)
+		buf := make([]byte, batchHdrSize+48)
 		putU32(buf[0:], kindLaunch)
 		putU32(buf[4:], 1)
 		putU64(buf[8:], seq)
@@ -302,15 +302,15 @@ func TestApplyBatchNormalizesLaunches(t *testing.T) {
 	sink := &recordingSink{}
 	c := newTestConsumer(sink)
 
-	buf := make([]byte, 32+48)
+	buf := make([]byte, batchHdrSize+48)
 	putU32(buf[0:], kindLaunch)
 	putU32(buf[4:], 1)
 	putU64(buf[8:], 3)
 	putU32(buf[16:], 4242) // pid comes from the batch header
 	putU64(buf[24:], 48)
-	putU64(buf[32+0:], 77)   // correlation
-	putU64(buf[32+32:], 900) // time_ns
-	putU32(buf[32+40:], 55)  // tid comes from the record
+	putU64(buf[batchHdrSize+0:], 77)   // correlation
+	putU64(buf[batchHdrSize+32:], 900) // time_ns
+	putU32(buf[batchHdrSize+40:], 55)  // tid comes from the record
 
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
@@ -332,13 +332,13 @@ func TestApplyBatchNormalizesExecs(t *testing.T) {
 	sink := &recordingSink{}
 	c := newTestConsumer(sink)
 
-	buf := make([]byte, 32+48)
+	buf := make([]byte, batchHdrSize+48)
 	putU32(buf[0:], kindExec)
 	putU32(buf[4:], 1)
 	putU64(buf[24:], 48)
-	putU64(buf[32+0:], 88)   // correlation
-	putU64(buf[32+32:], 10)  // start_ns
-	putU64(buf[32+40:], 200) // end_ns
+	putU64(buf[batchHdrSize+0:], 88)   // correlation
+	putU64(buf[batchHdrSize+32:], 10)  // start_ns
+	putU64(buf[batchHdrSize+40:], 200) // end_ns
 
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
@@ -354,7 +354,7 @@ func TestApplyBatchNormalizesExecs(t *testing.T) {
 func TestSinkRejectionsAreCounted(t *testing.T) {
 	c := newTestConsumer(&recordingSink{err: gpu.ErrSinkFull})
 
-	buf := make([]byte, 32+96)
+	buf := make([]byte, batchHdrSize+96)
 	putU32(buf[0:], kindLaunch)
 	putU32(buf[4:], 2)
 	putU64(buf[24:], 96)
@@ -550,12 +550,12 @@ func TestZeroWireCorrelationBecomesTheZeroCorrelationID(t *testing.T) {
 	sink := &recordingSink{}
 	c := newTestConsumer(sink)
 
-	buf := make([]byte, 32+96)
+	buf := make([]byte, batchHdrSize+96)
 	putU32(buf[0:], kindLaunch)
 	putU32(buf[4:], 2)
 	putU64(buf[24:], 96)
-	putU64(buf[32+0:], 0)  // no correlation
-	putU64(buf[32+48:], 9) // a real one
+	putU64(buf[batchHdrSize+0:], 0)  // no correlation
+	putU64(buf[batchHdrSize+48:], 9) // a real one
 
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
@@ -579,11 +579,11 @@ func TestZeroWireCorrelationOnExecs(t *testing.T) {
 	sink := &recordingSink{}
 	c := newTestConsumer(sink)
 
-	buf := make([]byte, 32+48)
+	buf := make([]byte, batchHdrSize+48)
 	putU32(buf[0:], kindExec)
 	putU32(buf[4:], 1)
 	putU64(buf[24:], 48)
-	putU64(buf[32+0:], 0) // no correlation
+	putU64(buf[batchHdrSize+0:], 0) // no correlation
 
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
@@ -592,4 +592,192 @@ func TestZeroWireCorrelationOnExecs(t *testing.T) {
 	require.Len(t, sink.execs, 1)
 	assert.Equal(t, gpu.CorrelationID{}, sink.execs[0].Correlation)
 	assert.Equal(t, uint64(1), c.Stats().ZeroCorrelation)
+}
+
+// --- Phase 4a: the batch header carries a stack id -------------------------
+
+// sampledBatch builds a wire-format batch carrying one gpu_launch_sampled_v1
+// record with the given header stack_id. The shim always emits this kind
+// unbatched, which is what makes a per-batch stack id sound.
+func sampledBatch(stackID int32, samplePeriod uint32) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeLaunchSampled)
+	putU32(buf[0:], kindLaunchSampled)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeLaunchSampled))
+	putU32(buf[32:], uint32(stackID))
+	putU64(buf[batchHdrSize:], 7)               // correlation
+	putU32(buf[batchHdrSize+44:], samplePeriod) // sample_period
+	return buf
+}
+
+// batchHdrSize is a hard-coded offset table shared with struct batch_hdr in
+// bpf/gpu_usdt.bpf.c. Nothing errors when the two disagree — every field
+// simply decodes from the wrong place — so pin the number itself.
+func TestBatchHeaderIsFortyBytesAndAppendOnly(t *testing.T) {
+	require.Equal(t, 40, batchHdrSize,
+		"struct batch_hdr grew to 40 bytes in Phase 4a; the C _Static_assert says the same")
+
+	// Every pre-4a field must still decode from its original offset: the new
+	// stack_id was appended at 32, not spliced in.
+	buf := make([]byte, batchHdrSize+gpuabi.SizeLaunch)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], 1)
+	putU64(buf[8:], 99)
+	putU32(buf[16:], 111)
+	putU32(buf[20:], 222)
+	putU64(buf[24:], uint64(gpuabi.SizeLaunch))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(kindLaunch), b.Kind)
+	assert.Equal(t, uint64(99), b.Seq)
+	assert.Equal(t, uint32(111), b.PID)
+	assert.Equal(t, uint32(222), b.TID)
+	assert.Equal(t, uint32(1), b.RawCount)
+	assert.Equal(t, int32(-1), b.StackID)
+	require.Len(t, b.Launches, 1)
+}
+
+func TestProbeKindCookiesCoverTheSampledProbes(t *testing.T) {
+	assert.Equal(t, uint64(5), cookieFor("gpu_launch_sampled_v1"))
+	assert.Equal(t, uint64(6), cookieFor("gpu_kernel_name_v1"))
+}
+
+func TestDecodeBatchCarriesTheStackID(t *testing.T) {
+	b, err := decodeBatch(sampledBatch(4242, 8))
+	require.NoError(t, err)
+	assert.Equal(t, int32(4242), b.StackID)
+	require.Len(t, b.SampledLaunches, 1)
+	assert.Equal(t, uint64(7), b.SampledLaunches[0].Correlation)
+	assert.Equal(t, uint32(8), b.SampledLaunches[0].SamplePeriod)
+}
+
+// A failed bpf_get_stackid is a real outcome — a stack too deep, a full
+// stackmap, a frame-pointer-less binary. It is counted, and the launch still
+// arrives: losing a launch because its stack was lost would be worse than
+// losing the stack.
+func TestMissingStackIsCountedNotDropped(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	b, err := decodeBatch(sampledBatch(-1, 8))
+	require.NoError(t, err)
+	c.applyBatch(b)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksMissing,
+		"a launch whose stack capture failed is still a launch")
+	assert.Equal(t, uint64(1), st.Records)
+	assert.Equal(t, uint64(1), st.SampledLaunches)
+	assert.Zero(t, st.KernelDropped, "a missing stack is not a dropped record")
+	assert.Zero(t, st.Undecoded)
+}
+
+// bpf_get_stackid returns the raw negative errno, not always -1; anything
+// negative means "no stack".
+func TestAnyNegativeStackIDCountsAsMissing(t *testing.T) {
+	for _, id := range []int32{-1, -14 /* -EFAULT */, -7 /* -E2BIG */} {
+		c := newTestConsumer(&recordingSink{})
+		b, err := decodeBatch(sampledBatch(id, 8))
+		require.NoError(t, err)
+		c.applyBatch(b)
+		assert.Equalf(t, uint64(1), c.Stats().StacksMissing, "stack_id %d", id)
+	}
+}
+
+func TestPresentStackIsNotCountedAsMissing(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	b, err := decodeBatch(sampledBatch(0, 8)) // zero is a legal stackmap key
+	require.NoError(t, err)
+	c.applyBatch(b)
+	assert.Zero(t, c.Stats().StacksMissing, "stack id 0 is a real stack, not a failure")
+	assert.Equal(t, uint64(1), c.Stats().Records)
+}
+
+// The BPF program writes stack_id = -1 on every kind it does not capture for.
+// StacksMissing must not turn that into phantom loss.
+func TestNonSampledKindsDoNotCountStacksMissing(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	buf := make([]byte, batchHdrSize+gpuabi.SizeLaunch)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeLaunch))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	c.applyBatch(b)
+	assert.Zero(t, c.Stats().StacksMissing, "only the sampled kind carries a stack")
+	assert.Equal(t, uint64(1), c.Stats().Records)
+}
+
+// A zero sample_period would make the scale factor a division by zero, so the
+// ABI decoder rejects it — and a rejected record must surface as a malformed
+// batch rather than a silently empty one.
+func TestSampledBatchWithZeroSamplePeriodIsRejected(t *testing.T) {
+	_, err := decodeBatch(sampledBatch(1, 0))
+	require.ErrorIs(t, err, gpuabi.ErrInvalidSamplePeriod)
+}
+
+func TestDecodeKernelNameBatch(t *testing.T) {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeKernelName)
+	putU32(buf[0:], kindKernelName)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeKernelName))
+	putU64(buf[batchHdrSize:], 0xAAAA)
+	binary.LittleEndian.PutUint16(buf[batchHdrSize+8:], 5)
+	copy(buf[batchHdrSize+16:], "kAddPfi")
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	require.Len(t, b.KernelNames, 1)
+	assert.Equal(t, uint64(0xAAAA), b.KernelNames[0].KernelID)
+	assert.Equal(t, "kAddP", b.KernelNames[0].Name)
+
+	// Interning is Task 5; until then the record is carried and counted, not
+	// silently dropped.
+	c := newTestConsumer(&recordingSink{})
+	c.applyBatch(b)
+	assert.Equal(t, uint64(1), c.Stats().Undecoded)
+}
+
+// A count larger than the declared payload must fail for the new, larger
+// record kinds too — 272 bytes is the one record big enough that an
+// off-by-one here would read well past the sample.
+func TestDecodeRejectsCountBeyondPayloadForTheLargeKinds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind uint32
+		size int
+	}{
+		{"sampled", kindLaunchSampled, gpuabi.SizeLaunchSampled},
+		{"kernelname", kindKernelName, gpuabi.SizeKernelName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, batchHdrSize+tc.size)
+			putU32(buf[0:], tc.kind)
+			putU32(buf[4:], 2) // claims two, carries one
+			putU64(buf[24:], uint64(tc.size))
+			_, err := decodeBatch(buf)
+			require.ErrorIs(t, err, gpuabi.ErrShortRecord)
+		})
+	}
+}
+
+// The stack map and the kernel-side stack-failure counter are part of the
+// contract this task adds; assert them on the embedded object rather than
+// discovering their absence on a machine with capabilities.
+func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
+	spec, err := loadGpuusdt()
+	require.NoError(t, err)
+
+	require.Contains(t, spec.Maps, "stackmap")
+	assert.Equal(t, ebpf.StackTrace, spec.Maps["stackmap"].Type)
+	assert.Equal(t, uint32(127*8), spec.Maps["stackmap"].ValueSize,
+		"PERF_MAX_STACK_DEPTH frames of u64")
+
+	require.Contains(t, spec.Maps, "stacks_missing")
+	assert.Equal(t, ebpf.Array, spec.Maps["stacks_missing"].Type)
+	assert.Equal(t, uint32(kindMax), spec.Maps["stacks_missing"].MaxEntries)
+	assert.NotSame(t, spec.Maps["dropped"], spec.Maps["stacks_missing"],
+		"a failed capture is not a dropped record and must not inflate KernelDropped")
 }

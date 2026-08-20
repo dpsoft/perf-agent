@@ -63,3 +63,62 @@ func readBatchTemplateArg(t *testing.T, path, probe string) int {
 	require.NoError(t, err)
 	return v
 }
+
+// TestPerKindBatchCapsFitOneReservation pins the Phase 4a payload arithmetic.
+//
+// The reservation is sized for the largest record that ever *batches*
+// (MAX_BATCHED_RECORD_BYTES, 48) times MAX_RECORDS_PER_BATCH, not for the
+// largest record on the wire (MAX_RECORD_BYTES, 272 —
+// gpu_kernel_name_v1). Sizing it for 272 would cost 40 + 64*272 = 17448
+// bytes per batch and leave ~240 batches in a 4MB ring. Instead
+// gpu_usdt_batch caps each kind at BATCH_CAP(size) records.
+//
+// The soundness conditions are: every kind fits at least one record in a
+// reservation, and no kind's cap can ask for more bytes than the payload
+// holds. Both are compile-time in the C (there is a _Static_assert for the
+// first) but neither is visible from Go, and getting them wrong is silent
+// corruption rather than a build error — so re-derive them from the source.
+func TestPerKindBatchCapsFitOneReservation(t *testing.T) {
+	const src = "../bpf/gpu_usdt.bpf.c"
+
+	maxRecords := readDefine(t, src, "MAX_RECORDS_PER_BATCH")
+	batched := readDefine(t, src, "MAX_BATCHED_RECORD_BYTES")
+	largest := readDefine(t, src, "MAX_RECORD_BYTES")
+	payload := maxRecords * batched
+
+	require.Equal(t, 3072, payload, "the payload budget is unchanged by Phase 4a")
+	require.LessOrEqual(t, largest, payload,
+		"a record kind larger than one reservation could never be delivered at all")
+
+	for _, name := range []string{
+		"REC_LAUNCH", "REC_EXEC", "REC_MODULE", "REC_PC",
+		"REC_LAUNCH_SAMPLED", "REC_KERNEL_NAME",
+	} {
+		size := readDefine(t, src, name)
+		require.Positive(t, size)
+		capRecs := payload / size
+		if capRecs > maxRecords {
+			capRecs = maxRecords
+		}
+		require.Positive(t, capRecs, "%s must fit at least one record per batch", name)
+		require.LessOrEqualf(t, capRecs*size, payload,
+			"%s: %d records of %d bytes overruns the %d-byte payload", name, capRecs, size, payload)
+	}
+}
+
+// The two Phase 4a probes must stay unbatched. gpu_launch_sampled_v1 carries
+// one captured stack, so batching it would attach that stack to N unrelated
+// launches; gpu_kernel_name_v1 is 272 bytes, and only count == 1 keeps it
+// comfortably inside the payload budget. Either is silent corruption, not a
+// build error, so pin it against the stub.
+func TestSampledProbesAreNotBatchedInTheStub(t *testing.T) {
+	b, err := os.ReadFile("../shim/stub/stub.cc")
+	require.NoError(t, err)
+	for _, probe := range []string{"gpu_launch_sampled_v1", "gpu_kernel_name_v1"} {
+		re := regexp.MustCompile(`Batch<` + regexp.QuoteMeta(probe) + `\s*,`)
+		require.Nilf(t, re.Find(b),
+			"%s must be emitted one record at a time, never through perfagent::Batch", probe)
+		require.Containsf(t, string(b), probe+"_emit(",
+			"%s should still be emitted directly", probe)
+	}
+}

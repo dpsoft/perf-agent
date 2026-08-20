@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
@@ -36,17 +37,26 @@ import (
 )
 
 const (
-	kindLaunch = 1
-	kindExec   = 2
-	kindModule = 3
-	kindPC     = 4
+	kindLaunch        = 1
+	kindExec          = 2
+	kindModule        = 3
+	kindPC            = 4
+	kindLaunchSampled = 5
+	kindKernelName    = 6
 
 	// kindMax mirrors KIND_MAX in bpf/gpu_usdt.bpf.c: the number of slots in
-	// the BPF-side `dropped` array.
+	// the BPF-side `dropped` and `stacks_missing` arrays.
 	kindMax = 8
 
-	// batchHdrSize mirrors struct batch_hdr in bpf/gpu_usdt.bpf.c.
-	batchHdrSize = 32
+	// batchHdrSize mirrors struct batch_hdr in bpf/gpu_usdt.bpf.c, which is
+	// 40 bytes since Phase 4a appended stack_id and its padding:
+	//
+	//   0 kind  4 count  8 seq  16 pid  20 tid  24 bytes  32 stack_id  36 _pad
+	//
+	// The C side carries a _Static_assert on the same number. The two must
+	// move together in one commit: a mismatch does not error anywhere, it
+	// just decodes every field from the wrong offset.
+	batchHdrSize = 40
 
 	// usdtProvider is the only provider whose probes this consumer attaches.
 	usdtProvider = "perfagent"
@@ -67,6 +77,10 @@ func cookieFor(probeName string) uint64 {
 		return kindModule
 	case "gpu_pc_sample_batch_v1":
 		return kindPC
+	case "gpu_launch_sampled_v1":
+		return kindLaunchSampled
+	case "gpu_kernel_name_v1":
+		return kindKernelName
 	}
 	return 0
 }
@@ -124,8 +138,9 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize (module loads, PC samples). Counted so the loss
-	// is visible rather than silent.
+	// does not yet normalize (module loads, PC samples, and interned kernel
+	// names, which Task 5 turns into KernelName attributes). Counted so the
+	// loss is visible rather than silent.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
@@ -144,6 +159,27 @@ type Stats struct {
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
 	// map on each Stats call.
 	KernelDropped uint64
+	// SampledLaunches counts gpu_launch_sampled_v1 records decoded. It is the
+	// denominator the sampling period is checked against: the producer prints
+	// how many launches it sampled, and the two must agree.
+	SampledLaunches uint64
+	// StacksMissing counts sampled launches that arrived with a negative
+	// batch_hdr.stack_id — bpf_get_stackid failed because the stack was
+	// deeper than PERF_MAX_STACK_DEPTH, the stackmap was full, or the
+	// launching binary has no frame pointers.
+	//
+	// This is NOT loss: the launch record is delivered and normalized
+	// anyway, it simply carries no CPU stack. Folding it into KernelDropped
+	// would report a record loss that did not happen, which is its own kind
+	// of dishonesty.
+	StacksMissing uint64
+	// KernelStacksMissing is the same event counted on the BPF side, read
+	// from the `stacks_missing` map. It is kept separate from StacksMissing
+	// rather than replacing it because the two disagree exactly when a batch
+	// carrying a failed capture was itself lost: the kernel counted it, the
+	// consumer never saw it. KernelStacksMissing > StacksMissing therefore
+	// localizes loss that SequenceGaps can only detect.
+	KernelStacksMissing uint64
 }
 
 // batchReader is the slice of *ringbuf.Reader that Run and Close use. It
@@ -277,8 +313,17 @@ type batch struct {
 	Seq      uint64
 	PID, TID uint32
 	RawCount uint32
-	Launches []gpuabi.Launch
-	Execs    []gpuabi.Exec
+	// StackID is the BPF stackmap key for the launching thread's user stack,
+	// or negative when the capture failed. It is a property of the whole
+	// batch because the BPF program stores it in the header — sound only
+	// because the one kind that carries a stack, kindLaunchSampled, always
+	// arrives with count == 1 (the shim emits it unbatched). It is -1 on
+	// every other kind and must only be interpreted for kindLaunchSampled.
+	StackID         int32
+	Launches        []gpuabi.Launch
+	Execs           []gpuabi.Exec
+	SampledLaunches []gpuabi.LaunchSampled
+	KernelNames     []gpuabi.KernelName
 }
 
 func decodeBatch(b []byte) (batch, error) {
@@ -287,10 +332,11 @@ func decodeBatch(b []byte) (batch, error) {
 	}
 	le := binary.LittleEndian
 	out := batch{
-		Kind: le.Uint32(b[0:]),
-		Seq:  le.Uint64(b[8:]),
-		PID:  le.Uint32(b[16:]),
-		TID:  le.Uint32(b[20:]),
+		Kind:    le.Uint32(b[0:]),
+		Seq:     le.Uint64(b[8:]),
+		PID:     le.Uint32(b[16:]),
+		TID:     le.Uint32(b[20:]),
+		StackID: int32(le.Uint32(b[32:])),
 	}
 	count := int(le.Uint32(b[4:]))
 	out.RawCount = uint32(count)
@@ -327,6 +373,30 @@ func decodeBatch(b []byte) (batch, error) {
 				return batch{}, err
 			}
 			out.Execs = append(out.Execs, rec)
+		}
+	case kindLaunchSampled:
+		if count > len(payload)/gpuabi.SizeLaunchSampled {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.SampledLaunches = make([]gpuabi.LaunchSampled, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeLaunchSampled(payload[i*gpuabi.SizeLaunchSampled:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.SampledLaunches = append(out.SampledLaunches, rec)
+		}
+	case kindKernelName:
+		if count > len(payload)/gpuabi.SizeKernelName {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.KernelNames = make([]gpuabi.KernelName, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeKernelName(payload[i*gpuabi.SizeKernelName:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.KernelNames = append(out.KernelNames, rec)
 		}
 	}
 	return out, nil
@@ -443,6 +513,27 @@ func (c *Consumer) applyBatch(b batch) {
 				c.stats.SinkRejected++
 			}
 		}
+	case kindLaunchSampled:
+		// The stack is a property of the batch, not of a record, and that is
+		// only sound because this kind rides unbatched — the shim emits one
+		// probe fire per sampled launch precisely so a captured stack belongs
+		// to exactly one launch (shim/stub/stub.cc). Counting it per batch
+		// would be wrong the moment that changed, so count it per record and
+		// let the RawCount == 1 invariant hold it together.
+		for range b.SampledLaunches {
+			c.stats.Records++
+			c.stats.SampledLaunches++
+			if b.StackID < 0 {
+				// A launch whose stack capture failed is still a launch: it
+				// is counted here and carried on, never discarded.
+				c.stats.StacksMissing++
+			}
+		}
+		// Deliberately not emitted to the sink in this task. A sampled launch
+		// shares its correlation with the plain gpu_launch_v1 record for the
+		// same launch, so emitting both would hand the timeline two launches
+		// for one. Task 5 resolves the stack ID through the stackmap and
+		// attaches it to the launch that is already flowing.
 	default:
 		// Carried on the wire, not yet normalized. Counted, never silent.
 		c.stats.Undecoded += uint64(b.RawCount)
@@ -459,21 +550,23 @@ func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.stats
-	out.KernelDropped = c.kernelDropped()
+	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
+	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
 	return out
 }
 
-// kernelDropped sums the per-kind drop counters the BPF program maintains.
-// A read failure leaves the total at zero rather than panicking; the map is
-// nil in tests that construct a Consumer directly. Caller holds mu.
-func (c *Consumer) kernelDropped() uint64 {
-	if c.objs.Dropped == nil {
+// sumPerKind totals one of the BPF program's per-kind counter arrays
+// (`dropped`, `stacks_missing`). A read failure leaves the total at zero
+// rather than panicking; the map is nil in tests that construct a Consumer
+// directly. Caller holds mu.
+func (c *Consumer) sumPerKind(m *ebpf.Map) uint64 {
+	if m == nil {
 		return 0
 	}
 	var total uint64
 	for key := uint32(0); key < kindMax; key++ {
 		var v uint64
-		if err := c.objs.Dropped.Lookup(&key, &v); err != nil {
+		if err := m.Lookup(&key, &v); err != nil {
 			continue
 		}
 		total += v

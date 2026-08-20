@@ -31,14 +31,22 @@ func TestShimProbeMacrosProduceAParsableNoteWithPinnedRegisters(t *testing.T) {
 
 	probes, err := usdt.ParseFile(so)
 	require.NoError(t, err)
-	require.Len(t, probes, 1)
+	// Two probes: probe_selftest.cc declares gpu_launch_v1 and gpu_exec_v1 in
+	// the same translation unit. A single-probe self-test cannot catch a
+	// regression in the shared .stapsdt.base guard (PERFAGENT_USDT_BASE is
+	// expanded once per call site); this shipped broken until shim/stub/stub.cc
+	// composed two probes for the first time.
+	require.Len(t, probes, 2)
 
-	p := probes[0]
-	assert.Equal(t, "perfagent", p.Provider)
-	assert.Equal(t, "gpu_launch_v1", p.Name)
-	assert.True(t, p.HasSemaphore, "the shim must be able to skip work when nobody listens")
-	assert.Equal(t, "8@%rdi 8@%rsi 8@%rdx", p.Args,
-		"the ABI pins its argument registers; an unpinned macro lets the compiler choose")
+	names := make(map[string]bool)
+	for _, p := range probes {
+		assert.Equal(t, "perfagent", p.Provider)
+		assert.True(t, p.HasSemaphore, "the shim must be able to skip work when nobody listens")
+		assert.Equal(t, "8@%rdi 8@%rsi 8@%rdx", p.Args,
+			"the ABI pins its argument registers; an unpinned macro lets the compiler choose")
+		names[p.Name] = true
+	}
+	assert.Equal(t, map[string]bool{"gpu_launch_v1": true, "gpu_exec_v1": true}, names)
 }
 
 func repoRoot(t *testing.T) string {

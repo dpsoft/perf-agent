@@ -9,12 +9,14 @@
 #define PERFAGENT_USDT_PROBE_H
 
 #define PERFAGENT_USDT_BASE                                                 \
+    ".ifndef _.stapsdt.base\n"                                              \
     ".pushsection .stapsdt.base,\"aG\",\"progbits\",.stapsdt.base,comdat\n" \
     ".weak _.stapsdt.base\n"                                                \
     ".hidden _.stapsdt.base\n"                                              \
     "_.stapsdt.base: .space 1\n"                                            \
     ".size _.stapsdt.base,1\n"                                              \
-    ".popsection\n"
+    ".popsection\n"                                                         \
+    ".endif\n"
 
 // The semaphore the kernel maintains through link.UprobeOptions RefCtrOffset.
 // Hidden visibility: core/ must not leak symbols into the application it is

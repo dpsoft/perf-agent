@@ -88,3 +88,69 @@ func TestDecodeModuleLoadCarriesCubinCRCFirst(t *testing.T) {
 	assert.Equal(t, uint64(0x45dfed61), got.CubinCRC, "cubin_crc leads: PC samples join on it, not module_id")
 	assert.Equal(t, uint64(22), got.ModuleID)
 }
+
+func TestDecodeLaunchSampledCarriesTheSamplingDenominator(t *testing.T) {
+	require.Equal(t, 56, SizeLaunchSampled, "gpu_launch_sampled_v1 is 56 bytes")
+
+	b := make([]byte, SizeLaunchSampled)
+	le := binary.LittleEndian
+	le.PutUint64(b[0:], 7)      // correlation
+	le.PutUint64(b[8:], 0xAAAA) // kernel_id
+	le.PutUint64(b[16:], 3)     // queue_id
+	le.PutUint64(b[24:], 1)     // context_id
+	le.PutUint64(b[32:], 500)   // time_ns
+	le.PutUint32(b[40:], 4242)  // tid
+	le.PutUint32(b[44:], 64)    // sample_period
+	le.PutUint64(b[48:], 99)    // launch_seq
+
+	got, err := DecodeLaunchSampled(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(7), got.Correlation)
+	assert.Equal(t, uint32(4242), got.TID)
+	assert.Equal(t, uint32(64), got.SamplePeriod, "the N in one-in-N, per record")
+	assert.Equal(t, uint64(99), got.LaunchSeq)
+}
+
+func TestDecodeLaunchSampledRejectsZeroSamplePeriod(t *testing.T) {
+	b := make([]byte, SizeLaunchSampled)
+	binary.LittleEndian.PutUint64(b[0:], 7)
+	// sample_period left zero
+	_, err := DecodeLaunchSampled(b)
+	require.ErrorIs(t, err, ErrInvalidSamplePeriod,
+		"a zero denominator would make the scale factor a division by zero")
+}
+
+func TestDecodeKernelNameTruncatesAtTheDeclaredLength(t *testing.T) {
+	require.Equal(t, 272, SizeKernelName)
+
+	b := make([]byte, SizeKernelName)
+	binary.LittleEndian.PutUint64(b[0:], 0xAAAA) // kernel_id
+	binary.LittleEndian.PutUint16(b[8:], 5)      // name_len
+	copy(b[16:], "_Z4kAddPfi")                   // 10 bytes present, 5 declared
+
+	got, err := DecodeKernelName(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0xAAAA), got.KernelID)
+	assert.Equal(t, "_Z4kA", got.Name, "name_len is authoritative, not the NUL")
+	assert.False(t, got.Truncated)
+}
+
+func TestDecodeKernelNameFlagsTruncation(t *testing.T) {
+	b := make([]byte, SizeKernelName)
+	binary.LittleEndian.PutUint16(b[8:], uint16(GPUKernelNameMax))
+	b[10] = 1 // truncated flag
+	for i := range GPUKernelNameMax {
+		b[16+i] = 'x'
+	}
+	got, err := DecodeKernelName(b)
+	require.NoError(t, err)
+	assert.True(t, got.Truncated, "a truncated name must be visible, not silently short")
+	assert.Len(t, got.Name, GPUKernelNameMax)
+}
+
+func TestDecodeKernelNameRejectsLengthPastTheBuffer(t *testing.T) {
+	b := make([]byte, SizeKernelName)
+	binary.LittleEndian.PutUint16(b[8:], uint16(GPUKernelNameMax+1))
+	_, err := DecodeKernelName(b)
+	require.Error(t, err, "a length past the fixed array must not read out of bounds")
+}

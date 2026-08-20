@@ -61,8 +61,10 @@ type gpuusdtProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtMapSpecs struct {
-	Dropped *ebpf.MapSpec `ebpf:"dropped"`
-	Events  *ebpf.MapSpec `ebpf:"events"`
+	Dropped       *ebpf.MapSpec `ebpf:"dropped"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
+	Stackmap      *ebpf.MapSpec `ebpf:"stackmap"`
+	StacksMissing *ebpf.MapSpec `ebpf:"stacks_missing"`
 }
 
 // gpuusdtVariableSpecs contains global variables before they are loaded into the kernel.
@@ -91,14 +93,18 @@ func (o *gpuusdtObjects) Close() error {
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtMaps struct {
-	Dropped *ebpf.Map `ebpf:"dropped"`
-	Events  *ebpf.Map `ebpf:"events"`
+	Dropped       *ebpf.Map `ebpf:"dropped"`
+	Events        *ebpf.Map `ebpf:"events"`
+	Stackmap      *ebpf.Map `ebpf:"stackmap"`
+	StacksMissing *ebpf.Map `ebpf:"stacks_missing"`
 }
 
 func (m *gpuusdtMaps) Close() error {
 	return _GpuusdtClose(
 		m.Dropped,
 		m.Events,
+		m.Stackmap,
+		m.StacksMissing,
 	)
 }
 

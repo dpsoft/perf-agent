@@ -13,7 +13,10 @@
 // Stats.SequenceGaps; record kinds this phase carries but does not yet
 // normalize are counted as Stats.Undecoded; records whose wire correlation is
 // zero — the ABI's "no correlation", which demotes them to the timeline's
-// heuristic join — are counted as Stats.ZeroCorrelation.
+// heuristic join — are counted as Stats.ZeroCorrelation. Samples that did not
+// decode at all are counted as Stats.Malformed, and *why* they did not decode
+// is kept in Stats.DecodeFailures: a count of malformed samples with no
+// reason attached is loss that is visible but not diagnosable.
 package gpuprobe
 
 import (
@@ -26,27 +29,40 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/internal/usdt"
+	pp "github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 )
 
 const (
-	kindLaunch = 1
-	kindExec   = 2
-	kindModule = 3
-	kindPC     = 4
+	kindLaunch        = 1
+	kindExec          = 2
+	kindModule        = 3
+	kindPC            = 4
+	kindLaunchSampled = 5
+	kindKernelName    = 6
 
 	// kindMax mirrors KIND_MAX in bpf/gpu_usdt.bpf.c: the number of slots in
-	// the BPF-side `dropped` array.
+	// the BPF-side `dropped` and `stacks_missing` arrays.
 	kindMax = 8
 
-	// batchHdrSize mirrors struct batch_hdr in bpf/gpu_usdt.bpf.c.
-	batchHdrSize = 32
+	// batchHdrSize mirrors struct batch_hdr in bpf/gpu_usdt.bpf.c, which is
+	// 40 bytes since Phase 4a appended stack_id and its padding:
+	//
+	//   0 kind  4 count  8 seq  16 pid  20 tid  24 bytes  32 stack_id  36 _pad
+	//
+	// The C side carries a _Static_assert on the same number. The two must
+	// move together in one commit: a mismatch does not error anywhere, it
+	// just decodes every field from the wrong offset.
+	batchHdrSize = 40
 
 	// usdtProvider is the only provider whose probes this consumer attaches.
 	usdtProvider = "perfagent"
@@ -67,6 +83,10 @@ func cookieFor(probeName string) uint64 {
 		return kindModule
 	case "gpu_pc_sample_batch_v1":
 		return kindPC
+	case "gpu_launch_sampled_v1":
+		return kindLaunchSampled
+	case "gpu_kernel_name_v1":
+		return kindKernelName
 	}
 	return 0
 }
@@ -106,7 +126,66 @@ type Config struct {
 	Backend gpu.GPUBackendID
 	// Sink receives the normalized events.
 	Sink gpu.EventSink
+
+	// Symbolizer resolves the instruction pointers of a sampled launch's
+	// captured stack into frames. Nil disables resolution entirely: the
+	// captures still arrive and are still accounted for (each one counts in
+	// Stats.SymbolizeFailed), and every launch still reaches the sink -
+	// without a stack, which projects as unattributed GPU time rather than
+	// as a guess.
+	Symbolizer symbolize.Symbolizer
+
+	// SampledStackCapacity bounds the correlation -> stack side table that
+	// holds a resolved capture until its batched twin arrives. Zero means
+	// defaultSampledStackCapacity. See pendingStacks for why this table
+	// exists and why it must be bounded.
+	SampledStackCapacity int
+
+	// DeferredLaunchCapacity bounds how many launches may be held at once
+	// waiting for a sampled twin that has not arrived yet. Zero means
+	// defaultDeferredLaunchCapacity. See deferredLaunches.
+	DeferredLaunchCapacity int
+
+	// KernelNameCapacity bounds the kernel_id -> name table. Zero means
+	// defaultKernelNameCapacity. A ceiling, not a dial: a workload has one
+	// entry per distinct kernel, but nothing in the ABI promises that.
+	KernelNameCapacity int
+
+	// PendingNamedEventCapacity bounds how many launches and executions may
+	// be held at once waiting for a kernel name that has not arrived yet.
+	// Zero means defaultPendingNamedEventCapacity. See pendingNames.
+	PendingNamedEventCapacity int
 }
+
+const (
+	// defaultSampledStackCapacity bounds the parked-stack side table. A
+	// parked stack is one whose launch has not arrived (or never will,
+	// because the batch carrying it was dropped), so the table has to be
+	// bounded or a profiled application feeds it without limit. 1024 is
+	// generous next to the real occupancy - a capture normally waits less
+	// than one batch - and still trivially small in memory.
+	defaultSampledStackCapacity = 1024
+
+	// defaultDeferredLaunchCapacity bounds the launches held for a possible
+	// sampled twin. Only launches from the most recent batch are ever held
+	// (see Consumer.applyBatch), and a shim batch is 32 records, so this is
+	// several times the working set; it exists as a hard ceiling for a
+	// producer that batches differently, not as a tuning dial.
+	defaultDeferredLaunchCapacity = 256
+
+	// defaultKernelNameCapacity bounds the interned-name table. Real
+	// workloads have tens to low hundreds of distinct kernels; 4096 leaves
+	// room for a generated or JIT-heavy one while keeping the table's worst
+	// case at a few hundred KB.
+	defaultKernelNameCapacity = 4096
+
+	// defaultPendingNamedEventCapacity bounds the events held for a name
+	// that has not arrived. The window it has to cover is the producer's
+	// drain interval (100ms in the shim), so it is sized for a burst of
+	// launches and execs rather than for steady state - in steady state the
+	// name is already interned and nothing waits at all.
+	defaultPendingNamedEventCapacity = 512
+)
 
 // Stats is the consumer's loss record. Every discard has a counter here or
 // in KernelDropped; none of them is silent.
@@ -124,12 +203,36 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize (module loads, PC samples). Counted so the loss
-	// is visible rather than silent.
+	// does not yet normalize: module loads and PC samples. Sampled launches
+	// and interned kernel names are no longer in this class - the first has
+	// its stack attached to the batched launch it belongs to, the second
+	// names the launches and executions that refer to its kernel id.
+	// Counted so the loss is visible rather than silent.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
+	// DecodeFailures says *why*; a bare count of malformed samples is a
+	// symptom nobody can act on.
 	Malformed uint64
+	// DecodeFailures is why the Malformed samples were malformed: the first
+	// maxDecodeFailureReasons distinct reasons, deduplicated by error text,
+	// each with how many samples failed that way. It is the operator-facing
+	// half of Malformed — an ABI drift, a producer emitting a record the
+	// decoder rejects, or a truncated batch all read as "Malformed++"
+	// otherwise, and the three call for completely different responses.
+	//
+	// Bounded on purpose: a producer that fails every sample the same way
+	// must cost one table entry, not one entry per sample. The counts
+	// therefore sum to Malformed only when nothing was crowded out; see
+	// DecodeReasonsUnrecorded for the shortfall.
+	DecodeFailures []DecodeFailure
+	// DecodeReasonsUnrecorded counts decode failures whose reason did not
+	// fit in the bounded table because maxDecodeFailureReasons distinct
+	// reasons had already been seen. Those samples are still in Malformed;
+	// only their reason was dropped, and that drop is not silent either.
+	//
+	//	Malformed = sum(DecodeFailures[i].Count) + DecodeReasonsUnrecorded
+	DecodeReasonsUnrecorded uint64
 	// ZeroCorrelation counts records that arrived carrying a wire correlation
 	// of zero, which the ABI defines as "no correlation" (shim/core/usdt_abi.h;
 	// spec §6.3 finding 3 makes it the normal case for PC samples in the
@@ -144,6 +247,228 @@ type Stats struct {
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
 	// map on each Stats call.
 	KernelDropped uint64
+	// SampledLaunches counts gpu_launch_sampled_v1 records decoded. It is the
+	// denominator the sampling period is checked against: the producer prints
+	// how many launches it sampled, and the two must agree.
+	SampledLaunches uint64
+	// StacksMissing counts sampled launches that arrived with a negative
+	// batch_hdr.stack_id — bpf_get_stackid failed because the stack was
+	// deeper than PERF_MAX_STACK_DEPTH, the stackmap was full, or the
+	// launching binary has no frame pointers.
+	//
+	// This is NOT loss: the launch record is delivered and normalized
+	// anyway, it simply carries no CPU stack. Folding it into KernelDropped
+	// would report a record loss that did not happen, which is its own kind
+	// of dishonesty.
+	StacksMissing uint64
+	// StacksResolved counts captures that made it all the way to frames:
+	// the stackmap entry was there, it held instruction pointers, and the
+	// symbolizer turned them into at least one frame. Every sampled launch
+	// ends in exactly one of the counters below or in StacksMissing, so
+	// they reconcile against SampledLaunches:
+	//
+	//	SampledLaunches = StacksMissing + StacksUncorrelated +
+	//	                  StackLookupFailed + SymbolizeFailed + StacksResolved
+	//	StacksResolved  = StacksAttached + StacksEvicted + PendingStacks
+	//
+	// (the second identity holds at rest; PendingStacks is a gauge). Both
+	// are asserted by TestSampledStackAccountingReconciles.
+	StacksResolved uint64
+	// StackLookupFailed counts captures whose stackmap entry could not be
+	// read back: the map lookup failed, or the entry decoded to no
+	// instruction pointers.
+	//
+	// The expected cause is not a broken map. bpf_get_stackid is
+	// content-addressed, so two launches from the same call site in flight
+	// at once carry the SAME stack id; the consumer resolves the first and
+	// deletes the entry (see freeStackLocked), and the second then finds
+	// nothing. That is a real, bounded loss of attribution - the launch
+	// still ships, without a stack - and it is counted here rather than
+	// being papered over with a cached lookup, which could serve the frames
+	// of a different stack that reused the id after the delete.
+	//
+	// That is the LOSS half of the shared-id race. The aliasing half - a
+	// different stack landing in the freed bucket before a stale in-ring
+	// batch dereferences the old id - is silent and is documented at
+	// freeStackLocked, where the delete that enables it happens.
+	StackLookupFailed uint64
+	// SymbolizeFailed counts captures that were read back but produced no
+	// frames: the symbolizer returned an error, returned nothing, or no
+	// Symbolizer was configured at all. The launch is never dropped for
+	// this - it degrades to no stack, which projects as unattributed GPU
+	// time, and the degradation is visible here.
+	SymbolizeFailed uint64
+	// StacksUnresolved counts captures the symbolizer accepted — no error,
+	// one frame per instruction pointer — in which NOT ONE frame came back
+	// with a real symbol name. Every frame is an address rendered as
+	// "0x<addr>", which pprof will happily display and no human can read.
+	//
+	// This is deliberately NOT folded into SymbolizeFailed, and it does not
+	// take part in the SampledLaunches reconciliation above: the stack is
+	// delivered and attached, so it is a resolution failure, not a loss. It
+	// gets its own counter because the alternative is what actually happened
+	// on this branch — the Phase 4a gate symbolized 63 stacks into 252
+	// hex addresses while SymbolizeFailed sat at zero, and the failure was
+	// only noticed by a human reading the frame names. A profiler that
+	// resolves no names while reporting no failures is lying by omission.
+	//
+	// The usual causes, in the order worth checking:
+	//
+	//   - The target process exited before its stack was symbolized.
+	//     /proc/<pid>/maps is gone, so there is nothing to resolve against.
+	//   - No capability to follow /proc/<pid>/map_files/ and no usable
+	//     fallback (see symbolize.LocalSymbolizer.SymbolizeProcess).
+	//   - The binary genuinely has no symbol table.
+	StacksUnresolved uint64
+	// StackFramesUnresolved counts individual frames — one per captured
+	// instruction pointer — that came back named after their own address.
+	// Unlike StacksUnresolved this is expected to be non-zero in normal
+	// operation: a stripped vendor library or a vDSO frame in an otherwise
+	// well-resolved stack lands here. It is the ratio against
+	// StacksResolved's frame count that is diagnostic, not the raw number.
+	StackFramesUnresolved uint64
+	// StackDeleteFailed counts stackmap entries the consumer read but could
+	// not delete. See freeStackLocked: deletion is what stops the map
+	// filling, so a rising count here is the early warning for capture
+	// failures (StacksMissing) that follow.
+	StackDeleteFailed uint64
+	// StacksUncorrelated counts captures whose sampled launch carried a
+	// wire correlation of zero. The stack is real, but the ABI's "no
+	// correlation" leaves nothing to pair it with: the batched twin cannot
+	// be identified, so the capture cannot be attached to any launch
+	// without guessing which one it belongs to.
+	StacksUncorrelated uint64
+	// StacksAttached counts captures actually attached to a launch that
+	// went to the sink - the number that ends up carrying attribution in
+	// the profile, from both arrival orders.
+	StacksAttached uint64
+	// StacksEvicted counts resolved captures pushed out of the bounded
+	// side table before their batched twin ever arrived, which happens when
+	// the batch carrying that twin was dropped or when the table is too
+	// small for the in-flight window. It is attribution loss, not record
+	// loss: the launches themselves are unaffected.
+	StacksEvicted uint64
+	// KernelNamesLearned counts gpu_kernel_name_v1 records interned. The
+	// producer replays its whole table on late attach, so a name may be
+	// learned more than once for the same kernel; this counts records, not
+	// distinct kernels (PendingNames is the gauge for the latter).
+	KernelNamesLearned uint64
+	// KernelNamesTruncated counts names the producer had to cut off at
+	// GPU_KERNEL_NAME_MAX. Those names still resolve - marked, so a
+	// truncated name is never presented as complete. See
+	// truncatedNameSuffix.
+	KernelNamesTruncated uint64
+	// KernelNamesEvicted counts names pushed out of the bounded table. Not
+	// record loss: events referring to that kernel still flow, unnamed, and
+	// count in KernelNamesUnresolved.
+	KernelNamesEvicted uint64
+	// KernelNamesUnresolved counts launches and executions emitted with no
+	// kernel name: the producer never named that kernel, the name was
+	// evicted, or the event was released (by the queue's bound, or by a
+	// Flush) before its name arrived. Without this counter an unnamed
+	// execution in the profile is a mystery rather than a measurement.
+	KernelNamesUnresolved uint64
+	// PendingStacks, PendingLaunches, PendingNamedEvents and KnownKernelNames
+	// are gauges, not counters: what the side tables hold right now.
+	// PendingLaunches and PendingNamedEvents are also how much event
+	// delivery the consumer is currently holding back - see Consumer.Flush.
+	PendingStacks      int
+	PendingLaunches    int
+	PendingNamedEvents int
+	KnownKernelNames   int
+	// KernelStacksMissing is the same event counted on the BPF side, read
+	// from the `stacks_missing` map. It is kept separate from StacksMissing
+	// rather than replacing it because the two disagree exactly when a batch
+	// carrying a failed capture was itself lost: the kernel counted it, the
+	// consumer never saw it. KernelStacksMissing > StacksMissing therefore
+	// localizes loss that SequenceGaps can only detect.
+	KernelStacksMissing uint64
+}
+
+// maxDecodeFailureReasons bounds the decode-failure table. Four is enough to
+// tell apart the ways decodeBatch can fail — a short header, a payload
+// shorter than the header claims, a record the ABI rejects, a sampled batch
+// that is not singular — while keeping the table a fixed-size array that
+// costs nothing at all when nothing fails.
+const maxDecodeFailureReasons = 4
+
+// DecodeFailure is one reason ringbuf samples failed to decode, and how many
+// samples failed for that reason. Reason is the error text as decodeBatch
+// rendered it, which is what an operator reads.
+type DecodeFailure struct {
+	Reason string
+	Count  uint64
+}
+
+// String renders a failure the way a log line or a test message wants it.
+func (d DecodeFailure) String() string {
+	return fmt.Sprintf("%dx %s", d.Count, d.Reason)
+}
+
+// decodeFailureTable remembers why decoding failed, bounded to the first
+// maxDecodeFailureReasons distinct reasons.
+//
+// The state it has to survive is not a rare one-off: it is a producer whose
+// every sample fails identically, which is exactly the shape of an ABI drift
+// — thousands of failures, one reason. So the repeat path must not allocate,
+// and it does not: errors.Is compares sentinels by identity without
+// formatting anything, and only a reason never seen before is rendered with
+// Error(). At most maxDecodeFailureReasons strings are ever retained.
+//
+// Nothing here is on the success path, which touches this type not at all.
+type decodeFailureTable struct {
+	errs   [maxDecodeFailureReasons]error
+	reason [maxDecodeFailureReasons]string
+	count  [maxDecodeFailureReasons]uint64
+	n      int
+	// unrecorded counts failures that arrived after the table filled up.
+	unrecorded uint64
+}
+
+// note records one decode failure. Caller holds mu.
+func (t *decodeFailureTable) note(err error) {
+	// Identity fast path, allocation-free. It is deliberately symmetric:
+	// errors.Is(err, stored) alone would fold a *wrapped* error into the
+	// bare sentinel it wraps and report it under the bare sentinel's text,
+	// losing the detail the wrapping exists to carry. Requiring the match
+	// both ways means only genuinely identical errors merge here; anything
+	// else falls through to the text comparison below, which is exact.
+	for i := 0; i < t.n; i++ {
+		if errors.Is(err, t.errs[i]) && errors.Is(t.errs[i], err) {
+			t.count[i]++
+			return
+		}
+	}
+	// A wrapped error carrying formatted detail ("...: count=3") reaches
+	// here every time; its text is what "distinct reason" means.
+	reason := err.Error()
+	for i := 0; i < t.n; i++ {
+		if t.reason[i] == reason {
+			t.count[i]++
+			return
+		}
+	}
+	if t.n == len(t.reason) {
+		t.unrecorded++
+		return
+	}
+	t.errs[t.n] = err
+	t.reason[t.n] = reason
+	t.count[t.n] = 1
+	t.n++
+}
+
+// snapshot copies the table out for Stats. Nil when nothing failed, so a
+// healthy consumer's Stats call allocates nothing here either.
+func (t *decodeFailureTable) snapshot() []DecodeFailure {
+	if t.n == 0 {
+		return nil
+	}
+	out := make([]DecodeFailure, t.n)
+	for i := 0; i < t.n; i++ {
+		out[i] = DecodeFailure{Reason: t.reason[i], Count: t.count[i]}
+	}
+	return out
 }
 
 // batchReader is the slice of *ringbuf.Reader that Run and Close use. It
@@ -160,6 +485,16 @@ type batchReader interface {
 	Close() error
 }
 
+// stackStore is the slice of *ebpf.Map that sampled-stack resolution uses:
+// read one stackmap entry, then delete it. It is a seam for the same reason
+// batchReader is - creating a real BPF_MAP_TYPE_STACK_TRACE needs CAP_BPF,
+// so without it the whole resolve/delete/attach path would be untestable -
+// and *ebpf.Map satisfies it as-is.
+type stackStore interface {
+	LookupBytes(key any) ([]byte, error)
+	Delete(key any) error
+}
+
 // Consumer owns the loaded BPF objects, the uprobe_multi link and the
 // ringbuf reader for one shim.
 type Consumer struct {
@@ -167,10 +502,41 @@ type Consumer struct {
 	objs   gpuusdtObjects
 	links  []link.Link
 	reader batchReader
+	// stacks is c.objs.Stackmap behind the stackStore seam. Nil when no BPF
+	// objects were loaded (every unit test), which makes every resolution
+	// count as StackLookupFailed rather than panic.
+	stacks stackStore
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]uint64
-	stats       Stats
+	pending     *pendingStacks
+	deferred    *deferredLaunches
+	names       *kernelNameTable
+	unnamed     *pendingNames
+	// sawKernelName records whether this producer emits kernel names at
+	// all. Holding an event for a name that is never coming would delay
+	// every event a producer without the name probe ever sends, so nothing
+	// waits until the producer has demonstrated, once, that names exist.
+	sawKernelName bool
+	stats         Stats
+	// decodeFailures is the bounded reason table behind Stats.Malformed.
+	// A zero value is a usable empty table, so newConsumer says nothing
+	// about it.
+	decodeFailures decodeFailureTable
+}
+
+// newConsumer builds a Consumer with its side tables sized from cfg. Attach
+// and the unit tests share it so a store can never be forgotten in one of
+// the two paths.
+func newConsumer(cfg Config) *Consumer {
+	return &Consumer{
+		cfg:         cfg,
+		seqByStream: map[seqKey]uint64{},
+		pending:     newPendingStacks(cfg.SampledStackCapacity),
+		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
+		names:       newKernelNameTable(cfg.KernelNameCapacity),
+		unnamed:     newPendingNames(cfg.PendingNamedEventCapacity),
+	}
 }
 
 // seqKey identifies one sequence-number stream. The shim's seq_ counter is
@@ -228,7 +594,7 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		p.KernelVersion = kv
 	}
 
-	c = &Consumer{cfg: cfg, seqByStream: map[seqKey]uint64{}}
+	c = newConsumer(cfg)
 	// Every failure below this point must leave through a *bare* return that
 	// only assigns err. `return nil, err` would set the named result c to nil
 	// before the deferred cleanup runs, so the defer would call Close on a nil
@@ -265,11 +631,26 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	}
 	c.links = append(c.links, l)
 
+	// The stackmap is read (and each resolved entry deleted) by the sampled
+	// stack path; see Consumer.resolveStackLocked.
+	c.stacks = c.objs.Stackmap
+
 	if c.reader, err = ringbuf.NewReader(c.objs.Events); err != nil {
 		return
 	}
 	return c, nil
 }
+
+// errSampledBatchNotSingular means a gpu_launch_sampled_v1 batch arrived
+// carrying anything other than exactly one record.
+//
+// The stack id lives in the batch header, one per batch. A batch of N sampled
+// launches would therefore attribute one captured stack to N unrelated
+// launches — silently, since every record still decodes perfectly. The BPF
+// program caps this kind at one record per batch (max_records in
+// bpf/gpu_usdt.bpf.c) and the decoder refuses anything else, so neither end
+// relies on the other, or on the producer, to hold the invariant.
+var errSampledBatchNotSingular = errors.New("gpuprobe: sampled-launch batch must carry exactly one record")
 
 // batch is one decoded ringbuf sample: a header plus the records it carried.
 type batch struct {
@@ -277,8 +658,19 @@ type batch struct {
 	Seq      uint64
 	PID, TID uint32
 	RawCount uint32
-	Launches []gpuabi.Launch
-	Execs    []gpuabi.Exec
+	// StackID is the BPF stackmap key for the launching thread's user stack,
+	// or negative when the capture failed. It is a property of the whole
+	// batch because the BPF program stores it in the header — sound only
+	// because the one kind that carries a stack, kindLaunchSampled, always
+	// arrives with count == 1. That is enforced at both ends (the BPF
+	// program's per-kind cap and decodeBatch), not assumed of the producer;
+	// see errSampledBatchNotSingular. It is -1 on every other kind and must
+	// only be interpreted for kindLaunchSampled.
+	StackID         int32
+	Launches        []gpuabi.Launch
+	Execs           []gpuabi.Exec
+	SampledLaunches []gpuabi.LaunchSampled
+	KernelNames     []gpuabi.KernelName
 }
 
 func decodeBatch(b []byte) (batch, error) {
@@ -287,10 +679,11 @@ func decodeBatch(b []byte) (batch, error) {
 	}
 	le := binary.LittleEndian
 	out := batch{
-		Kind: le.Uint32(b[0:]),
-		Seq:  le.Uint64(b[8:]),
-		PID:  le.Uint32(b[16:]),
-		TID:  le.Uint32(b[20:]),
+		Kind:    le.Uint32(b[0:]),
+		Seq:     le.Uint64(b[8:]),
+		PID:     le.Uint32(b[16:]),
+		TID:     le.Uint32(b[20:]),
+		StackID: int32(le.Uint32(b[32:])),
 	}
 	count := int(le.Uint32(b[4:]))
 	out.RawCount = uint32(count)
@@ -327,6 +720,34 @@ func decodeBatch(b []byte) (batch, error) {
 				return batch{}, err
 			}
 			out.Execs = append(out.Execs, rec)
+		}
+	case kindLaunchSampled:
+		// One header, one stack id, one launch. See errSampledBatchNotSingular.
+		if count != 1 {
+			return batch{}, fmt.Errorf("%w: count=%d", errSampledBatchNotSingular, count)
+		}
+		if count > len(payload)/gpuabi.SizeLaunchSampled {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.SampledLaunches = make([]gpuabi.LaunchSampled, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeLaunchSampled(payload[i*gpuabi.SizeLaunchSampled:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.SampledLaunches = append(out.SampledLaunches, rec)
+		}
+	case kindKernelName:
+		if count > len(payload)/gpuabi.SizeKernelName {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.KernelNames = make([]gpuabi.KernelName, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeKernelName(payload[i*gpuabi.SizeKernelName:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.KernelNames = append(out.KernelNames, rec)
 		}
 	}
 	return out, nil
@@ -380,6 +801,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 	// as a clean exit.
 	stop := context.AfterFunc(ctx, func() { _ = c.reader.Close() })
 	defer stop()
+	// Nothing more will arrive once this loop ends, so no held launch can
+	// still gain a stack. Releasing here (and not only in Close) is what
+	// lets a caller cancel, wait for Run, and take a complete Snapshot
+	// without closing the consumer.
+	defer c.Flush()
 
 	for {
 		rec, err := c.reader.Read()
@@ -393,6 +819,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 		if err != nil {
 			c.mu.Lock()
 			c.stats.Malformed++
+			// Why, not just how many: the error is the only evidence
+			// that this sample was rejected rather than lost, and
+			// throwing it away here is what makes a malformed-sample
+			// count unactionable. See decodeFailureTable.
+			c.decodeFailures.note(err)
 			c.mu.Unlock()
 			continue
 		}
@@ -406,6 +837,16 @@ func (c *Consumer) applyBatch(b batch) {
 
 	c.stats.Batches++
 	c.noteSeq(b.Kind, b.PID, b.Seq)
+
+	// A held launch is only ever waiting for a sampled record, and the
+	// sampled record it is waiting for would be the very next thing off the
+	// ringbuf (see sampledstacks.go). Anything else arriving means the wait
+	// is over, so the queue is released here rather than left to age: the
+	// timeline's join wants launches promptly, and a launch held past the
+	// window buys nothing.
+	if b.Kind != kindLaunchSampled {
+		c.releaseDeferredLocked()
+	}
 
 	switch b.Kind {
 	case kindLaunch:
@@ -422,13 +863,11 @@ func (c *Consumer) applyBatch(b batch) {
 					PID:    b.PID,
 					TID:    l.TID,
 					TimeNs: l.TimeNs,
-					// CPUStack is deliberately empty: capturing the launch
-					// stack is a later phase.
+					// CPUStack is filled in below if this launch was the one
+					// in SamplePeriod the shim captured a stack for.
 				},
 			}
-			if err := c.cfg.Sink.EmitLaunch(ev); err != nil {
-				c.stats.SinkRejected++
-			}
+			c.admitLaunchLocked(ev, l.KernelID)
 		}
 	case kindExec:
 		for _, e := range b.Execs {
@@ -439,14 +878,436 @@ func (c *Consumer) applyBatch(b batch) {
 				StartNs:     e.StartNs,
 				EndNs:       e.EndNs,
 			}
-			if err := c.cfg.Sink.EmitExec(ev); err != nil {
-				c.stats.SinkRejected++
-			}
+			c.emitExecLocked(ev, e.KernelID)
+		}
+	case kindLaunchSampled:
+		// One capture per batch, counted once per batch: decodeBatch has
+		// already refused any count but 1, so the loop below runs exactly
+		// once, but counting the capture failure outside it means a future
+		// change to that rule degrades into an obvious undercount rather
+		// than multiplying one failure by the record count.
+		if b.StackID < 0 {
+			// A launch whose stack capture failed is still a launch: it is
+			// counted here and carried on, never discarded.
+			c.stats.StacksMissing++
+		}
+		for _, sl := range b.SampledLaunches {
+			c.stats.Records++
+			c.stats.SampledLaunches++
+			// Never emitted as a launch of its own: it is the same launch as
+			// the batched gpu_launch_v1 record with the same correlation, and
+			// the timeline has no dedup that would catch the double. Only its
+			// stack travels on, onto that batched twin.
+			c.attachSampledStackLocked(b.PID, b.StackID, sl)
+		}
+	case kindKernelName:
+		for _, n := range b.KernelNames {
+			c.stats.Records++
+			c.learnKernelNameLocked(n)
 		}
 	default:
 		// Carried on the wire, not yet normalized. Counted, never silent.
 		c.stats.Undecoded += uint64(b.RawCount)
 	}
+}
+
+// admitLaunchLocked decides whether a normalized launch goes to the sink now
+// or waits briefly for a sampled stack. Caller holds mu.
+//
+// Three cases, in the order they are cheapest to decide:
+//
+//   - No correlation. Pairing is by correlation and nothing else - matching
+//     on pid/tid/time would be a guess dressed as a fact - so an
+//     uncorrelated launch can never gain a stack and goes straight out.
+//   - Its stack is already parked (the sampled record arrived first, the
+//     common order). Attach and emit.
+//   - Otherwise hold it: its sampled record may be the next ringbuf sample.
+//     The queue releases on the next batch of any other kind, on Flush, when
+//     Run returns and on Close, so "hold" is bounded by arrivals, not by
+//     time, and never means "drop".
+//
+// The first two cases can therefore overtake a launch already held from the
+// same batch. That reordering is bounded by one batch and is harmless to the
+// consumers that exist: gpu.LaunchCache keys on correlation, orders eviction
+// by insertion rather than by timestamp, and ignores a timestamp older than
+// the newest it has seen (observeTimestampLocked), so an out-of-order Put
+// neither displaces the wrong entry nor moves the horizon.
+func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
+	if ev.Correlation == (gpu.CorrelationID{}) {
+		c.emitLaunchLocked(ev, kernelID)
+		return
+	}
+	key := launchKey{pid: ev.Launch.PID, corr: ev.Correlation}
+	if st, ok := c.pending.take(key); ok {
+		c.attachLocked(&ev, st.frames, st.period)
+		c.emitLaunchLocked(ev, kernelID)
+		return
+	}
+	if released, ok := c.deferred.push(deferredLaunch{launch: ev, kernelID: kernelID}); ok {
+		c.emitLaunchLocked(released.launch, released.kernelID)
+	}
+}
+
+// attachSampledStackLocked resolves one sampled launch's captured stack and
+// gets it onto the launch it belongs to - which is the batched
+// gpu_launch_v1 record with the same correlation, not this record. Caller
+// holds mu.
+func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi.LaunchSampled) {
+	if stackID < 0 {
+		// bpf_get_stackid failed; already counted as StacksMissing by the
+		// caller, and there is no entry to read or free.
+		return
+	}
+	if sl.Correlation == 0 {
+		// Unpairable: the ABI's "no correlation" leaves no way to say which
+		// launch this stack belongs to, and attaching it to a plausible
+		// neighbour would be a fabricated call path. The stackmap slot is
+		// still ours to release.
+		c.stats.StacksUncorrelated++
+		c.freeStackLocked(stackID)
+		return
+	}
+	frames, ok := c.resolveStackLocked(pid, stackID)
+	if !ok {
+		return // counted inside resolveStackLocked
+	}
+	c.stats.StacksResolved++
+
+	// Keyed on (pid, correlation), never correlation alone: see launchKey.
+	// pid is the batch header's, i.e. the process that fired the probe, which
+	// is the same field the batched twin's launch carries.
+	key := launchKey{
+		pid:  pid,
+		corr: gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(sl.Correlation, 10)},
+	}
+	// The batched twin arrived first and is still being held: attach and let
+	// it go now, since nothing more can arrive for it.
+	if held, ok := c.deferred.take(key); ok {
+		c.attachLocked(&held.launch, frames, sl.SamplePeriod)
+		c.emitLaunchLocked(held.launch, held.kernelID)
+		return
+	}
+	// Otherwise the twin is still to come; park the stack for it.
+	c.stats.StacksEvicted += uint64(c.pending.park(key, frames, sl.SamplePeriod))
+}
+
+// attachLocked puts a resolved stack on a launch. SamplePeriod travels with
+// the stack so a consumer can see how much GPU time one sampled call path
+// stands for - it is NOT applied to the launch's own time anywhere in this
+// pipeline. Caller holds mu.
+func (c *Consumer) attachLocked(ev *gpu.GPUKernelLaunch, frames []pp.Frame, period uint32) {
+	ev.Launch.CPUStack = frames
+	ev.Launch.SamplePeriod = period
+	c.stats.StacksAttached++
+}
+
+// resolveStackLocked turns a stackmap key into symbolized frames, exactly as
+// profile/ does it: read the entry, extract the non-zero instruction
+// pointers, symbolize them against the launching process, flatten to pprof
+// frames. Caller holds mu.
+//
+// Two details differ from profile/:
+//
+//   - Order. ToProfFrames returns leaf-first; the gpu projection nests the
+//     [gpu:launch] boundary and the kernel frame *under* the call path, so
+//     the frames are reversed to root-first here, the same way profile/
+//     reverses before handing frames to the pprof builder.
+//   - Deletion. See freeStackLocked.
+//
+// Every failure path returns ok=false with a counter bumped, and the caller
+// then ships the launch without a stack: a launch is never dropped because
+// its stack could not be resolved.
+func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bool) {
+	if c.stacks == nil {
+		c.stats.StackLookupFailed++
+		return nil, false
+	}
+	raw, err := c.stacks.LookupBytes(uint32(stackID))
+	if err != nil || len(raw) == 0 {
+		c.stats.StackLookupFailed++
+		// A failed lookup still leaves the slot occupied, and nothing else
+		// ever removes it: the program calls bpf_get_stackid without
+		// BPF_F_REUSE_STACKID, so an orphaned bucket answers -EEXIST for
+		// every later capture that hashes to it, forever. Free it here, the
+		// same as on the success path - the entry is useless to us either
+		// way. ErrKeyNotExist is the one case with nothing to free, and
+		// calling Delete for it would only inflate StackDeleteFailed.
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			c.freeStackLocked(stackID)
+		}
+		return nil, false
+	}
+	ips := bpfstack.ExtractIPs(raw)
+	// Free the slot as soon as its contents are in hand, before anything
+	// that can fail: the entry is useless to us from here on either way.
+	c.freeStackLocked(stackID)
+	if len(ips) == 0 {
+		c.stats.StackLookupFailed++
+		return nil, false
+	}
+	if c.cfg.Symbolizer == nil {
+		c.stats.SymbolizeFailed++
+		return nil, false
+	}
+	// Kernel-range IPs are not split out the way profile/ does it. This
+	// capture is taken at a uprobe on a USDT probe in the application's own
+	// code, so the walked stack is user context by construction, unlike a
+	// perf_event sample that can land mid-syscall. If that assumption ever
+	// breaks, the symptom is unresolved frames, not misattributed ones.
+	// The stack is symbolized against a LIVE process: blazesym resolves it
+	// through /proc/<pid>/maps, which the kernel removes the moment the
+	// process exits. If the launching process is gone by the time its record
+	// is drained from the ringbuf, every frame comes back as a bare address
+	// and lands in StacksUnresolved below.
+	//
+	// For a long-running GPU process that is a non-issue — the consumer
+	// drains continuously and the producer outlives its own records by
+	// orders of magnitude. For a SHORT-LIVED one it is not: a process that
+	// launches a few kernels and exits can beat the drain, and the real
+	// CUPTI adapter will meet exactly that workload. Fixing it properly
+	// means capturing the maps eagerly (at first sight of a pid, or at
+	// process-exit via a sched_process_exit probe) and symbolizing against
+	// that snapshot rather than against /proc — which is Phase 4b work, not
+	// this phase's. Until then the degradation is at least COUNTED, which is
+	// the part that was missing.
+	frames, err := c.cfg.Symbolizer.SymbolizeProcess(pid, ips)
+	if err != nil {
+		c.stats.SymbolizeFailed++
+		return nil, false
+	}
+	// Symbolization that returns a frame per IP and resolves not one name is
+	// not success. Counted here, before ToProfFrames flattens the inline
+	// chains, because Reason survives only on symbolize.Frame - pprof frames
+	// carry no failure field, so after the conversion an address-only name is
+	// indistinguishable from a function genuinely called "0x4017c2".
+	//
+	// Bounded and allocation-free: one pass over the frames already in hand,
+	// two integer increments, nothing retained.
+	var resolved int
+	for i := range frames {
+		if frames[i].Reason == symbolize.FailureNone {
+			resolved++
+		}
+	}
+	c.stats.StackFramesUnresolved += uint64(len(frames) - resolved)
+	if resolved == 0 && len(frames) > 0 {
+		c.stats.StacksUnresolved++
+	}
+	out := symbolize.ToProfFrames(frames)
+	if len(out) == 0 {
+		c.stats.SymbolizeFailed++
+		return nil, false
+	}
+	pp.Reverse(out)
+	return out, true
+}
+
+// freeStackLocked deletes a stackmap entry once its contents have been read.
+//
+// This is not housekeeping, it is what keeps capture working. The BPF
+// program calls bpf_get_stackid WITHOUT BPF_F_REUSE_STACKID
+// (bpf/gpu_usdt.bpf.c), so a hash bucket already holding a live entry
+// answers -EEXIST instead of overwriting it. Nothing else ever removes an
+// entry, so in a continuously running consumer the map fills up and capture
+// failures climb until every sampled launch reports StacksMissing - which
+// reads exactly like a broken capture path rather than a full map. Deleting
+// each entry as it is consumed keeps the map's occupancy proportional to
+// what is in flight instead of to the length of the run.
+//
+// (profile/ does not need this and does not do it: it drains its stackmap
+// once at the end of a fixed-length profiling run. The continuous consumer
+// here is the case that does.)
+//
+// A delete failure is counted, not ignored: it is the leading indicator of
+// the map filling. ErrKeyNotExist is possible and harmless - two captures of
+// the identical stack share one id, so the first delete may already have
+// removed it - and is counted the same way rather than special-cased, since
+// it points at the same in-flight-duplicate situation StackLookupFailed
+// reports. Caller holds mu.
+//
+// The delete has a second consequence, and unlike the first one it is
+// silent. Stats.StackLookupFailed documents the LOSS case: a second capture
+// sharing this id finds nothing here and its launch ships without a stack,
+// counted. The ALIASING case is the same race won the other way. Freeing
+// this bucket makes it available again, and bpf_get_stackid hashes a
+// different stack into it; if a batch still sitting in the ringbuf refers to
+// the old id, the consumer reads the new occupant and attaches a call path
+// that did not produce that launch. Nothing counts it, because from here it
+// is indistinguishable from a successful resolution.
+//
+// It needs a hash collision on top of the in-flight duplicate, so it is
+// rare - and it is bounded by ringbuf drain latency, which is microseconds
+// on a consumer that is keeping up. It is documented rather than fixed
+// because every fix costs something this phase is not willing to spend: not
+// deleting refills the map and turns capture off entirely (see above);
+// BPF_F_REUSE_STACKID makes the overwrite the normal case rather than the
+// rare one; and a per-id generation stamp would need an ABI field and a
+// second map. What WOULD close it, and is the right place for it, is Phase
+// 4b's eager capture - reading the stack out at probe time rather than
+// handing the consumer an id to dereference later. Until then this comment
+// is the honest statement of it: a comment is not enough on its own, but the
+// remedy belongs to a phase that can carry it.
+func (c *Consumer) freeStackLocked(stackID int32) {
+	if c.stacks == nil {
+		return
+	}
+	if err := c.stacks.Delete(uint32(stackID)); err != nil {
+		c.stats.StackDeleteFailed++
+	}
+}
+
+// emitLaunchLocked names a launch and hands it to the sink, or holds it if
+// its name has not arrived yet. Caller holds mu.
+func (c *Consumer) emitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
+	name, ok := c.resolveKernelNameLocked(kernelID)
+	if !ok && c.waitsForNameLocked(kernelID) {
+		held := ev
+		c.holdForNameLocked(unnamedEvent{kernelID: kernelID, launch: &held})
+		return
+	}
+	ev.KernelName = name
+	c.sinkLaunchLocked(ev, ok)
+}
+
+// emitExecLocked is emitLaunchLocked for an execution. Executions need the
+// name at least as much as launches do: the projection's
+// [gpu:kernel:<name>] frame is built from the *execution's* KernelName, and
+// the timeline's heuristic join matches on it. Caller holds mu.
+func (c *Consumer) emitExecLocked(ev gpu.GPUKernelExec, kernelID uint64) {
+	name, ok := c.resolveKernelNameLocked(kernelID)
+	if !ok && c.waitsForNameLocked(kernelID) {
+		held := ev
+		c.holdForNameLocked(unnamedEvent{kernelID: kernelID, exec: &held})
+		return
+	}
+	ev.KernelName = name
+	c.sinkExecLocked(ev, ok)
+}
+
+// sinkLaunchLocked and sinkExecLocked are the only two places an event
+// reaches the sink. named reports whether a kernel name was resolved; an
+// unnamed event is delivered anyway - a missing name must never cost a
+// record - and counted so it is visible rather than mysterious. Caller
+// holds mu.
+func (c *Consumer) sinkLaunchLocked(ev gpu.GPUKernelLaunch, named bool) {
+	if !named {
+		c.stats.KernelNamesUnresolved++
+	}
+	if err := c.cfg.Sink.EmitLaunch(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+func (c *Consumer) sinkExecLocked(ev gpu.GPUKernelExec, named bool) {
+	if !named {
+		c.stats.KernelNamesUnresolved++
+	}
+	if err := c.cfg.Sink.EmitExec(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+// resolveKernelNameLocked looks a kernel id up in the interned table. A
+// kernel id of zero is the ABI's "no kernel", so it never resolves and
+// never waits. Caller holds mu.
+func (c *Consumer) resolveKernelNameLocked(kernelID uint64) (string, bool) {
+	if kernelID == 0 {
+		return "", false
+	}
+	k, ok := c.names.get(kernelID)
+	if !ok {
+		return "", false
+	}
+	return k.resolved(), true
+}
+
+// waitsForNameLocked decides whether an event with an unknown kernel id is
+// worth holding. Only if this producer emits names at all: otherwise every
+// event from a producer without the name probe would be held to its bound
+// and released late, buying nothing. Caller holds mu.
+func (c *Consumer) waitsForNameLocked(kernelID uint64) bool {
+	return kernelID != 0 && c.sawKernelName
+}
+
+// holdForNameLocked queues an event until its name arrives, releasing the
+// oldest held event if the queue is full. Caller holds mu.
+func (c *Consumer) holdForNameLocked(ev unnamedEvent) {
+	if released, ok := c.unnamed.push(ev); ok {
+		c.releaseUnnamedLocked(released, "")
+	}
+}
+
+// releaseUnnamedLocked sends one held event on, with the name if one was
+// found and without it otherwise. Caller holds mu.
+func (c *Consumer) releaseUnnamedLocked(ev unnamedEvent, name string) {
+	switch {
+	case ev.launch != nil:
+		ev.launch.KernelName = name
+		c.sinkLaunchLocked(*ev.launch, name != "")
+	case ev.exec != nil:
+		ev.exec.KernelName = name
+		c.sinkExecLocked(*ev.exec, name != "")
+	}
+}
+
+// learnKernelNameLocked interns one name and releases everything waiting on
+// it. Caller holds mu.
+func (c *Consumer) learnKernelNameLocked(rec gpuabi.KernelName) {
+	c.stats.KernelNamesLearned++
+	c.sawKernelName = true
+	if rec.Truncated {
+		c.stats.KernelNamesTruncated++
+	}
+	k := kernelName{name: rec.Name, truncated: rec.Truncated}
+	c.stats.KernelNamesEvicted += uint64(c.names.put(rec.KernelID, k))
+	// A name that arrives empty resolves nothing, so held events would be
+	// released as unnamed anyway; releasing them here keeps that decision
+	// in one place.
+	name := k.resolved()
+	for _, waiting := range c.unnamed.takeByKernel(rec.KernelID) {
+		c.releaseUnnamedLocked(waiting, name)
+	}
+}
+
+// releaseDeferredLocked emits every launch being held for a sampled stack,
+// oldest first. They may then be held again for a kernel name, which
+// releaseUnnamedAllLocked resolves - Flush runs the two in that order.
+// Caller holds mu.
+func (c *Consumer) releaseDeferredLocked() {
+	for _, held := range c.deferred.drain() {
+		c.emitLaunchLocked(held.launch, held.kernelID)
+	}
+}
+
+// releaseUnnamedAllLocked sends on every event still waiting for a name,
+// unnamed and counted. Caller holds mu.
+func (c *Consumer) releaseUnnamedAllLocked() {
+	for _, ev := range c.unnamed.drain() {
+		c.releaseUnnamedLocked(ev, "")
+	}
+}
+
+// Flush releases every launch the consumer is holding back for a possible
+// sampled stack, in arrival order.
+//
+// Run calls it on the way out and Close calls it too, so a consumer that is
+// finished never leaves a launch behind. It is exported for the other case:
+// a caller taking a Snapshot while the consumer is still running would
+// otherwise miss up to DeferredLaunchCapacity of the most recent launches -
+// held, not lost, but absent from that snapshot and therefore able to make
+// their executions look unmatched. Call Flush immediately before such a
+// snapshot.
+func (c *Consumer) Flush() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Order matters: releasing a held launch can put it straight into the
+	// name queue, so the launches go first and the name queue is drained
+	// after, leaving nothing behind in either.
+	c.releaseDeferredLocked()
+	c.releaseUnnamedAllLocked()
 }
 
 // Stats returns the loss record, including the BPF-side drop counters read
@@ -459,21 +1320,30 @@ func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.stats
-	out.KernelDropped = c.kernelDropped()
+	out.DecodeFailures = c.decodeFailures.snapshot()
+	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
+	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
+	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
+	// Gauges, read fresh: what the two side tables are holding right now.
+	out.PendingStacks = c.pending.len()
+	out.PendingLaunches = c.deferred.len()
+	out.PendingNamedEvents = c.unnamed.len()
+	out.KnownKernelNames = c.names.len()
 	return out
 }
 
-// kernelDropped sums the per-kind drop counters the BPF program maintains.
-// A read failure leaves the total at zero rather than panicking; the map is
-// nil in tests that construct a Consumer directly. Caller holds mu.
-func (c *Consumer) kernelDropped() uint64 {
-	if c.objs.Dropped == nil {
+// sumPerKind totals one of the BPF program's per-kind counter arrays
+// (`dropped`, `stacks_missing`). A read failure leaves the total at zero
+// rather than panicking; the map is nil in tests that construct a Consumer
+// directly. Caller holds mu.
+func (c *Consumer) sumPerKind(m *ebpf.Map) uint64 {
+	if m == nil {
 		return 0
 	}
 	var total uint64
 	for key := uint32(0); key < kindMax; key++ {
 		var v uint64
-		if err := c.objs.Dropped.Lookup(&key, &v); err != nil {
+		if err := m.Lookup(&key, &v); err != nil {
 			continue
 		}
 		total += v
@@ -501,6 +1371,12 @@ func (c *Consumer) Close() error {
 	if c.reader != nil {
 		errs = append(errs, c.reader.Close())
 	}
+	// Any launch still being held for a sampled stack goes to the sink
+	// before the objects come down: the wait is over, and a held launch
+	// dropped at teardown would be silent record loss - the one thing this
+	// consumer must never do. Flush takes mu itself, so it runs before the
+	// lock below rather than inside it.
+	c.Flush()
 	// The links and objects come down under mu so Stats, which reads the
 	// `dropped` map, cannot be looking at c.objs while it is being closed.
 	c.mu.Lock()

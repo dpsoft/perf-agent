@@ -46,6 +46,17 @@ int main() {
         assert(g_emits.empty());
         assert(b.dropped() == 10);
     }
+    // Records buffered while consumer attached, then consumer detaches before flush.
+    {
+        g_emits.clear(); g_enabled = true;
+        Batch<Rec, 4> b(fake_emit, fake_enabled);
+        for (int i = 0; i < 3; i++) assert(b.add(Rec{(uint64_t)i}));
+        g_enabled = false;
+        b.flush();
+        assert(g_emits.empty());
+        assert(b.dropped() == 3);
+        assert(b.seq() == 0);
+    }
     printf("batch_test OK\n");
     return 0;
 }

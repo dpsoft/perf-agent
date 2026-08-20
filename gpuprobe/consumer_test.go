@@ -760,11 +760,16 @@ func TestDecodeKernelNameBatch(t *testing.T) {
 	assert.Equal(t, uint64(0xAAAA), b.KernelNames[0].KernelID)
 	assert.Equal(t, "kAddP", b.KernelNames[0].Name)
 
-	// Interning is Task 5; until then the record is carried and counted, not
-	// silently dropped.
+	// The record is interned rather than counted as undecoded: it is a
+	// normalized record now, and the name it carries reaches the launches
+	// and executions for kernel 0xAAAA.
 	c := newTestConsumer(&recordingSink{})
 	c.applyBatch(b)
-	assert.Equal(t, uint64(1), c.Stats().Undecoded)
+	st := c.Stats()
+	assert.Zero(t, st.Undecoded, "kernel names are decoded, not carried undecoded")
+	assert.Equal(t, uint64(1), st.Records)
+	assert.Equal(t, uint64(1), st.KernelNamesLearned)
+	assert.Equal(t, 1, st.KnownKernelNames)
 }
 
 // A count larger than the declared payload must fail for the new, larger
@@ -1378,4 +1383,229 @@ func TestSinkRejectionOfAReleasedLaunchIsCounted(t *testing.T) {
 	apply(t, c, launchBatchWith(4242, 7))
 	c.Flush()
 	assert.Equal(t, uint64(1), c.Stats().SinkRejected)
+}
+
+// --- Phase 4a: interned kernel names -------------------------------------
+
+// kernelNameBatch builds a gpu_kernel_name_v1 batch for one kernel.
+func kernelNameBatch(id uint64, name string, truncated bool) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeKernelName)
+	putU32(buf[0:], kindKernelName)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeKernelName))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1 on every non-sampled kind
+	rec := buf[batchHdrSize:]
+	putU64(rec[0:], id)
+	binary.LittleEndian.PutUint16(rec[8:], uint16(len(name)))
+	if truncated {
+		rec[10] = 1
+	}
+	copy(rec[16:], name)
+	return buf
+}
+
+// launchBatchKernels is launchBatchWith with a kernel id on every record.
+func launchBatchKernels(pid uint32, kernelID uint64, corrs ...uint64) []byte {
+	buf := launchBatchWith(pid, corrs...)
+	for i := range corrs {
+		putU64(buf[batchHdrSize+i*gpuabi.SizeLaunch+8:], kernelID)
+	}
+	return buf
+}
+
+// execBatchKernels builds an exec batch carrying one kernel id.
+func execBatchKernels(kernelID uint64, corrs ...uint64) []byte {
+	buf := make([]byte, batchHdrSize+len(corrs)*gpuabi.SizeExec)
+	putU32(buf[0:], kindExec)
+	putU32(buf[4:], uint32(len(corrs)))
+	putU64(buf[24:], uint64(len(corrs)*gpuabi.SizeExec))
+	putU32(buf[32:], ^uint32(0))
+	for i, corr := range corrs {
+		rec := buf[batchHdrSize+i*gpuabi.SizeExec:]
+		putU64(rec[0:], corr)
+		putU64(rec[8:], kernelID)
+		putU64(rec[32:], uint64(10+i))
+		putU64(rec[40:], uint64(60+i))
+	}
+	return buf
+}
+
+// The ordinary order: the producer interns a name the first time it sees a
+// kernel, before the launch that used it is batched out. Both the launch
+// and the execution must carry it - the projection's [gpu:kernel:<name>]
+// frame is built from the *execution's* name, and the timeline's heuristic
+// join matches launches on theirs.
+func TestKernelNamesReachLaunchesAndExecutions(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	apply(t, c, kernelNameBatch(0xAAAA, "kAdd", false))
+	apply(t, c, launchBatchKernels(4242, 0xAAAA, 7))
+	apply(t, c, execBatchKernels(0xAAAA, 7))
+	c.Flush()
+
+	require.Len(t, sink.launches, 1)
+	require.Len(t, sink.execs, 1)
+	assert.Equal(t, "kAdd", sink.launches[0].KernelName)
+	assert.Equal(t, "kAdd", sink.execs[0].KernelName)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.KernelNamesLearned)
+	assert.Zero(t, st.KernelNamesUnresolved)
+	assert.Zero(t, st.Undecoded, "a kernel name is a normalized record now")
+}
+
+// Names are not guaranteed to precede their use: the producer only emits a
+// name at intern time if the name probe was armed then, and otherwise
+// replays its table on the next drain tick - up to a full interval after the
+// launches that referenced it. Those events wait, exactly as a launch waits
+// for a late sampled stack, and are named when the record lands.
+func TestKernelNamesArrivingLateStillNameTheirEvents(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	// One name for an unrelated kernel: this producer demonstrably names
+	// its kernels, so an event for an unknown one is worth waiting for.
+	apply(t, c, kernelNameBatch(0x1111, "kOther", false))
+
+	// The exec batch is also what releases the launch from the sampled-stack
+	// wait, so both events are past that stage and into the name wait. Flush
+	// is deliberately not used here: Flush ends every wait, which is the
+	// case TestFlushAndCloseReleaseEventsWaitingForAName covers.
+	apply(t, c, launchBatchKernels(4242, 0xBBBB, 7))
+	apply(t, c, execBatchKernels(0xBBBB, 7))
+	assert.Zero(t, sink.launchCount(), "an event whose kernel is unnamed waits for the name")
+	assert.Equal(t, 2, c.Stats().PendingNamedEvents)
+
+	apply(t, c, kernelNameBatch(0xBBBB, "kLate", false))
+
+	require.Len(t, sink.launches, 1)
+	require.Len(t, sink.execs, 1)
+	assert.Equal(t, "kLate", sink.launches[0].KernelName)
+	assert.Equal(t, "kLate", sink.execs[0].KernelName)
+	assert.Zero(t, c.Stats().KernelNamesUnresolved, "nothing was released unnamed")
+	assert.Zero(t, c.Stats().PendingNamedEvents)
+}
+
+// A producer that never emits names must not have every one of its events
+// held to the queue's bound waiting for something that is not coming.
+func TestEventsAreNotHeldWhenTheProducerNeverNamesAnything(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	apply(t, c, execBatchKernels(0xCCCC, 7))
+	assert.Equal(t, 1, len(sink.execs), "with no names in play, nothing waits")
+	assert.Zero(t, c.Stats().PendingNamedEvents)
+	assert.Equal(t, uint64(1), c.Stats().KernelNamesUnresolved,
+		"an unnamed execution must be countable, not a mystery")
+}
+
+// A kernel id of zero is the ABI's "no kernel": it can never resolve, so it
+// must never wait either.
+func TestKernelIDZeroNeverWaitsForAName(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+	apply(t, c, kernelNameBatch(0x1111, "kOther", false))
+
+	apply(t, c, execBatchKernels(0, 7))
+	assert.Equal(t, 1, len(sink.execs))
+	assert.Zero(t, c.Stats().PendingNamedEvents)
+	assert.Equal(t, uint64(1), c.Stats().KernelNamesUnresolved)
+}
+
+// Mangled C++ names routinely exceed the ABI's 256-byte inline limit, and
+// two distinct kernels can share their first 256 bytes. A truncated name
+// presented as complete is therefore a claim about which kernel ran that
+// the data does not support: the marker travels with the name into the
+// frame, and the count makes the aggregate visible.
+func TestTruncatedKernelNameIsMarkedNotPresentedAsComplete(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	apply(t, c, kernelNameBatch(0xAAAA, "_Z4kAddPfiLongMangled", true))
+	apply(t, c, execBatchKernels(0xAAAA, 7))
+
+	require.Len(t, sink.execs, 1)
+	assert.Equal(t, "_Z4kAddPfiLongMangled"+truncatedNameSuffix, sink.execs[0].KernelName)
+	assert.Equal(t, uint64(1), c.Stats().KernelNamesTruncated)
+}
+
+// "One entry per distinct kernel" is an assumption about the workload, not
+// a guarantee, so the table is bounded - and what it drops is counted,
+// because every later event for that kernel goes out unnamed.
+func TestKernelNameTableIsBoundedAndEvictionsCounted(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{KernelNameCapacity: 2})
+
+	apply(t, c, kernelNameBatch(1, "kOne", false))
+	apply(t, c, kernelNameBatch(2, "kTwo", false))
+	apply(t, c, kernelNameBatch(3, "kThree", false))
+
+	st := c.Stats()
+	assert.Equal(t, 2, st.KnownKernelNames)
+	assert.Equal(t, uint64(1), st.KernelNamesEvicted, "an evicted name is counted, never silent")
+
+	// Kernel 1 was the oldest: its executions still flow, unnamed.
+	apply(t, c, execBatchKernels(1, 7))
+	c.Flush()
+	require.Len(t, sink.execs, 1)
+	assert.Empty(t, sink.execs[0].KernelName)
+	assert.Equal(t, uint64(1), c.Stats().KernelNamesUnresolved)
+}
+
+// The producer replays its whole name table on late attach, so the same
+// kernel is interned more than once. A replay must not evict anything or
+// duplicate the entry.
+func TestReplayedKernelNameReplacesInPlace(t *testing.T) {
+	c, _, _ := stackConsumer(t, &recordingSink{}, Config{KernelNameCapacity: 2})
+	for range 50 {
+		apply(t, c, kernelNameBatch(1, "kOne", false))
+	}
+	st := c.Stats()
+	assert.Equal(t, 1, st.KnownKernelNames)
+	assert.Equal(t, uint64(50), st.KernelNamesLearned)
+	assert.Zero(t, st.KernelNamesEvicted, "re-interning the same kernel must not push anything out")
+}
+
+// Holding events for a name is bounded, and as with held launches the bound
+// must never become loss: overflow releases the oldest event unnamed rather
+// than dropping it.
+func TestHeldUnnamedEventsAreBoundedAndNeverDropped(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{PendingNamedEventCapacity: 2})
+	apply(t, c, kernelNameBatch(0x1111, "kOther", false))
+
+	apply(t, c, execBatchKernels(0xBBBB, 1, 2, 3, 4))
+	assert.Equal(t, 2, len(sink.execs), "the two oldest are released to make room, not discarded")
+	assert.Equal(t, uint64(2), c.Stats().KernelNamesUnresolved)
+
+	apply(t, c, kernelNameBatch(0xBBBB, "kLate", false))
+	require.Len(t, sink.execs, 4, "every execution reaches the sink exactly once")
+	assert.Empty(t, sink.execs[0].KernelName, "the ones pushed out went unnamed")
+	assert.Equal(t, "kLate", sink.execs[3].KernelName)
+	for i, e := range sink.execs {
+		assert.Equal(t, strconv.Itoa(i+1), e.Correlation.Value, "arrival order is preserved")
+	}
+}
+
+// Flush and Close are the end of the wait: an event still holding out for a
+// name goes on unnamed rather than being dropped at teardown.
+func TestFlushAndCloseReleaseEventsWaitingForAName(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+	c.reader = newScriptedReader(0)
+	apply(t, c, kernelNameBatch(0x1111, "kOther", false))
+
+	apply(t, c, launchBatchKernels(4242, 0xBBBB, 7))
+	apply(t, c, execBatchKernels(0xBBBB, 7))
+	require.Zero(t, sink.launchCount())
+
+	c.Flush()
+	assert.Equal(t, 1, sink.launchCount(), "a launch held for a name is released by Flush, not lost")
+	assert.Equal(t, 1, len(sink.execs))
+	assert.Empty(t, sink.launches[0].KernelName)
+	assert.Equal(t, uint64(2), c.Stats().KernelNamesUnresolved)
+
+	apply(t, c, execBatchKernels(0xBBBB, 8))
+	require.NoError(t, c.Close())
+	assert.Equal(t, 2, len(sink.execs), "an event held at teardown would be silent record loss")
 }

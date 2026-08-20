@@ -142,6 +142,16 @@ type Config struct {
 	// waiting for a sampled twin that has not arrived yet. Zero means
 	// defaultDeferredLaunchCapacity. See deferredLaunches.
 	DeferredLaunchCapacity int
+
+	// KernelNameCapacity bounds the kernel_id -> name table. Zero means
+	// defaultKernelNameCapacity. A ceiling, not a dial: a workload has one
+	// entry per distinct kernel, but nothing in the ABI promises that.
+	KernelNameCapacity int
+
+	// PendingNamedEventCapacity bounds how many launches and executions may
+	// be held at once waiting for a kernel name that has not arrived yet.
+	// Zero means defaultPendingNamedEventCapacity. See pendingNames.
+	PendingNamedEventCapacity int
 }
 
 const (
@@ -159,6 +169,19 @@ const (
 	// several times the working set; it exists as a hard ceiling for a
 	// producer that batches differently, not as a tuning dial.
 	defaultDeferredLaunchCapacity = 256
+
+	// defaultKernelNameCapacity bounds the interned-name table. Real
+	// workloads have tens to low hundreds of distinct kernels; 4096 leaves
+	// room for a generated or JIT-heavy one while keeping the table's worst
+	// case at a few hundred KB.
+	defaultKernelNameCapacity = 4096
+
+	// defaultPendingNamedEventCapacity bounds the events held for a name
+	// that has not arrived. The window it has to cover is the producer's
+	// drain interval (100ms in the shim), so it is sized for a burst of
+	// launches and execs rather than for steady state - in steady state the
+	// name is already interned and nothing waits at all.
+	defaultPendingNamedEventCapacity = 512
 )
 
 // Stats is the consumer's loss record. Every discard has a counter here or
@@ -177,11 +200,11 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize: module loads, PC samples, and interned kernel
-	// names. (Kernel names are the remaining gap before an execution can
-	// carry a resolved KernelName; sampled launches are no longer here -
-	// they are decoded, and their stacks attached to the batched launch they
-	// belong to.) Counted so the loss is visible rather than silent.
+	// does not yet normalize: module loads and PC samples. Sampled launches
+	// and interned kernel names are no longer in this class - the first has
+	// its stack attached to the batched launch it belongs to, the second
+	// names the launches and executions that refer to its kernel id.
+	// Counted so the loss is visible rather than silent.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
@@ -267,12 +290,34 @@ type Stats struct {
 	// small for the in-flight window. It is attribution loss, not record
 	// loss: the launches themselves are unaffected.
 	StacksEvicted uint64
-	// PendingStacks and PendingLaunches are gauges, not counters: what the
-	// two side tables hold right now. PendingLaunches is also how much
-	// launch delivery the consumer is currently holding back - see
-	// Consumer.Flush.
-	PendingStacks   int
-	PendingLaunches int
+	// KernelNamesLearned counts gpu_kernel_name_v1 records interned. The
+	// producer replays its whole table on late attach, so a name may be
+	// learned more than once for the same kernel; this counts records, not
+	// distinct kernels (PendingNames is the gauge for the latter).
+	KernelNamesLearned uint64
+	// KernelNamesTruncated counts names the producer had to cut off at
+	// GPU_KERNEL_NAME_MAX. Those names still resolve - marked, so a
+	// truncated name is never presented as complete. See
+	// truncatedNameSuffix.
+	KernelNamesTruncated uint64
+	// KernelNamesEvicted counts names pushed out of the bounded table. Not
+	// record loss: events referring to that kernel still flow, unnamed, and
+	// count in KernelNamesUnresolved.
+	KernelNamesEvicted uint64
+	// KernelNamesUnresolved counts launches and executions emitted with no
+	// kernel name: the producer never named that kernel, the name was
+	// evicted, or the event was released (by the queue's bound, or by a
+	// Flush) before its name arrived. Without this counter an unnamed
+	// execution in the profile is a mystery rather than a measurement.
+	KernelNamesUnresolved uint64
+	// PendingStacks, PendingLaunches, PendingNamedEvents and KnownKernelNames
+	// are gauges, not counters: what the side tables hold right now.
+	// PendingLaunches and PendingNamedEvents are also how much event
+	// delivery the consumer is currently holding back - see Consumer.Flush.
+	PendingStacks      int
+	PendingLaunches    int
+	PendingNamedEvents int
+	KnownKernelNames   int
 	// KernelStacksMissing is the same event counted on the BPF side, read
 	// from the `stacks_missing` map. It is kept separate from StacksMissing
 	// rather than replacing it because the two disagree exactly when a batch
@@ -322,7 +367,14 @@ type Consumer struct {
 	seqByStream map[seqKey]uint64
 	pending     *pendingStacks
 	deferred    *deferredLaunches
-	stats       Stats
+	names       *kernelNameTable
+	unnamed     *pendingNames
+	// sawKernelName records whether this producer emits kernel names at
+	// all. Holding an event for a name that is never coming would delay
+	// every event a producer without the name probe ever sends, so nothing
+	// waits until the producer has demonstrated, once, that names exist.
+	sawKernelName bool
+	stats         Stats
 }
 
 // newConsumer builds a Consumer with its side tables sized from cfg. Attach
@@ -334,6 +386,8 @@ func newConsumer(cfg Config) *Consumer {
 		seqByStream: map[seqKey]uint64{},
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
+		names:       newKernelNameTable(cfg.KernelNameCapacity),
+		unnamed:     newPendingNames(cfg.PendingNamedEventCapacity),
 	}
 }
 
@@ -660,7 +714,7 @@ func (c *Consumer) applyBatch(b batch) {
 					// in SamplePeriod the shim captured a stack for.
 				},
 			}
-			c.admitLaunchLocked(ev)
+			c.admitLaunchLocked(ev, l.KernelID)
 		}
 	case kindExec:
 		for _, e := range b.Execs {
@@ -671,9 +725,7 @@ func (c *Consumer) applyBatch(b batch) {
 				StartNs:     e.StartNs,
 				EndNs:       e.EndNs,
 			}
-			if err := c.cfg.Sink.EmitExec(ev); err != nil {
-				c.stats.SinkRejected++
-			}
+			c.emitExecLocked(ev, e.KernelID)
 		}
 	case kindLaunchSampled:
 		// One capture per batch, counted once per batch: decodeBatch has
@@ -694,6 +746,11 @@ func (c *Consumer) applyBatch(b batch) {
 			// the timeline has no dedup that would catch the double. Only its
 			// stack travels on, onto that batched twin.
 			c.attachSampledStackLocked(b.PID, b.StackID, sl)
+		}
+	case kindKernelName:
+		for _, n := range b.KernelNames {
+			c.stats.Records++
+			c.learnKernelNameLocked(n)
 		}
 	default:
 		// Carried on the wire, not yet normalized. Counted, never silent.
@@ -722,18 +779,18 @@ func (c *Consumer) applyBatch(b batch) {
 // by insertion rather than by timestamp, and ignores a timestamp older than
 // the newest it has seen (observeTimestampLocked), so an out-of-order Put
 // neither displaces the wrong entry nor moves the horizon.
-func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch) {
+func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
 	if ev.Correlation == (gpu.CorrelationID{}) {
-		c.emitLaunchLocked(ev)
+		c.emitLaunchLocked(ev, kernelID)
 		return
 	}
 	if st, ok := c.pending.take(ev.Correlation); ok {
 		c.attachLocked(&ev, st.frames, st.period)
-		c.emitLaunchLocked(ev)
+		c.emitLaunchLocked(ev, kernelID)
 		return
 	}
-	if released, ok := c.deferred.push(ev); ok {
-		c.emitLaunchLocked(released)
+	if released, ok := c.deferred.push(deferredLaunch{launch: ev, kernelID: kernelID}); ok {
+		c.emitLaunchLocked(released.launch, released.kernelID)
 	}
 }
 
@@ -765,9 +822,9 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 	corr := gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(sl.Correlation, 10)}
 	// The batched twin arrived first and is still being held: attach and let
 	// it go now, since nothing more can arrive for it.
-	if ev, ok := c.deferred.take(corr); ok {
-		c.attachLocked(&ev, frames, sl.SamplePeriod)
-		c.emitLaunchLocked(ev)
+	if held, ok := c.deferred.take(corr); ok {
+		c.attachLocked(&held.launch, frames, sl.SamplePeriod)
+		c.emitLaunchLocked(held.launch, held.kernelID)
 		return
 	}
 	// Otherwise the twin is still to come; park the stack for it.
@@ -872,18 +929,134 @@ func (c *Consumer) freeStackLocked(stackID int32) {
 	}
 }
 
-// emitLaunchLocked hands one launch to the sink. Caller holds mu.
-func (c *Consumer) emitLaunchLocked(ev gpu.GPUKernelLaunch) {
+// emitLaunchLocked names a launch and hands it to the sink, or holds it if
+// its name has not arrived yet. Caller holds mu.
+func (c *Consumer) emitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
+	name, ok := c.resolveKernelNameLocked(kernelID)
+	if !ok && c.waitsForNameLocked(kernelID) {
+		held := ev
+		c.holdForNameLocked(unnamedEvent{kernelID: kernelID, launch: &held})
+		return
+	}
+	ev.KernelName = name
+	c.sinkLaunchLocked(ev, ok)
+}
+
+// emitExecLocked is emitLaunchLocked for an execution. Executions need the
+// name at least as much as launches do: the projection's
+// [gpu:kernel:<name>] frame is built from the *execution's* KernelName, and
+// the timeline's heuristic join matches on it. Caller holds mu.
+func (c *Consumer) emitExecLocked(ev gpu.GPUKernelExec, kernelID uint64) {
+	name, ok := c.resolveKernelNameLocked(kernelID)
+	if !ok && c.waitsForNameLocked(kernelID) {
+		held := ev
+		c.holdForNameLocked(unnamedEvent{kernelID: kernelID, exec: &held})
+		return
+	}
+	ev.KernelName = name
+	c.sinkExecLocked(ev, ok)
+}
+
+// sinkLaunchLocked and sinkExecLocked are the only two places an event
+// reaches the sink. named reports whether a kernel name was resolved; an
+// unnamed event is delivered anyway - a missing name must never cost a
+// record - and counted so it is visible rather than mysterious. Caller
+// holds mu.
+func (c *Consumer) sinkLaunchLocked(ev gpu.GPUKernelLaunch, named bool) {
+	if !named {
+		c.stats.KernelNamesUnresolved++
+	}
 	if err := c.cfg.Sink.EmitLaunch(ev); err != nil {
 		c.stats.SinkRejected++
 	}
 }
 
-// releaseDeferredLocked emits every launch being held, oldest first. Caller
-// holds mu.
+func (c *Consumer) sinkExecLocked(ev gpu.GPUKernelExec, named bool) {
+	if !named {
+		c.stats.KernelNamesUnresolved++
+	}
+	if err := c.cfg.Sink.EmitExec(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+// resolveKernelNameLocked looks a kernel id up in the interned table. A
+// kernel id of zero is the ABI's "no kernel", so it never resolves and
+// never waits. Caller holds mu.
+func (c *Consumer) resolveKernelNameLocked(kernelID uint64) (string, bool) {
+	if kernelID == 0 {
+		return "", false
+	}
+	k, ok := c.names.get(kernelID)
+	if !ok {
+		return "", false
+	}
+	return k.resolved(), true
+}
+
+// waitsForNameLocked decides whether an event with an unknown kernel id is
+// worth holding. Only if this producer emits names at all: otherwise every
+// event from a producer without the name probe would be held to its bound
+// and released late, buying nothing. Caller holds mu.
+func (c *Consumer) waitsForNameLocked(kernelID uint64) bool {
+	return kernelID != 0 && c.sawKernelName
+}
+
+// holdForNameLocked queues an event until its name arrives, releasing the
+// oldest held event if the queue is full. Caller holds mu.
+func (c *Consumer) holdForNameLocked(ev unnamedEvent) {
+	if released, ok := c.unnamed.push(ev); ok {
+		c.releaseUnnamedLocked(released, "")
+	}
+}
+
+// releaseUnnamedLocked sends one held event on, with the name if one was
+// found and without it otherwise. Caller holds mu.
+func (c *Consumer) releaseUnnamedLocked(ev unnamedEvent, name string) {
+	switch {
+	case ev.launch != nil:
+		ev.launch.KernelName = name
+		c.sinkLaunchLocked(*ev.launch, name != "")
+	case ev.exec != nil:
+		ev.exec.KernelName = name
+		c.sinkExecLocked(*ev.exec, name != "")
+	}
+}
+
+// learnKernelNameLocked interns one name and releases everything waiting on
+// it. Caller holds mu.
+func (c *Consumer) learnKernelNameLocked(rec gpuabi.KernelName) {
+	c.stats.KernelNamesLearned++
+	c.sawKernelName = true
+	if rec.Truncated {
+		c.stats.KernelNamesTruncated++
+	}
+	k := kernelName{name: rec.Name, truncated: rec.Truncated}
+	c.stats.KernelNamesEvicted += uint64(c.names.put(rec.KernelID, k))
+	// A name that arrives empty resolves nothing, so held events would be
+	// released as unnamed anyway; releasing them here keeps that decision
+	// in one place.
+	name := k.resolved()
+	for _, waiting := range c.unnamed.takeByKernel(rec.KernelID) {
+		c.releaseUnnamedLocked(waiting, name)
+	}
+}
+
+// releaseDeferredLocked emits every launch being held for a sampled stack,
+// oldest first. They may then be held again for a kernel name, which
+// releaseUnnamedAllLocked resolves - Flush runs the two in that order.
+// Caller holds mu.
 func (c *Consumer) releaseDeferredLocked() {
-	for _, ev := range c.deferred.drain() {
-		c.emitLaunchLocked(ev)
+	for _, held := range c.deferred.drain() {
+		c.emitLaunchLocked(held.launch, held.kernelID)
+	}
+}
+
+// releaseUnnamedAllLocked sends on every event still waiting for a name,
+// unnamed and counted. Caller holds mu.
+func (c *Consumer) releaseUnnamedAllLocked() {
+	for _, ev := range c.unnamed.drain() {
+		c.releaseUnnamedLocked(ev, "")
 	}
 }
 
@@ -903,7 +1076,11 @@ func (c *Consumer) Flush() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Order matters: releasing a held launch can put it straight into the
+	// name queue, so the launches go first and the name queue is drained
+	// after, leaving nothing behind in either.
 	c.releaseDeferredLocked()
+	c.releaseUnnamedAllLocked()
 }
 
 // Stats returns the loss record, including the BPF-side drop counters read
@@ -921,6 +1098,8 @@ func (c *Consumer) Stats() Stats {
 	// Gauges, read fresh: what the two side tables are holding right now.
 	out.PendingStacks = c.pending.len()
 	out.PendingLaunches = c.deferred.len()
+	out.PendingNamedEvents = c.unnamed.len()
+	out.KnownKernelNames = c.names.len()
 	return out
 }
 

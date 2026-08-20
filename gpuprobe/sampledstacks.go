@@ -90,6 +90,7 @@ func (p *pendingStacks) park(corr gpu.CorrelationID, frames []pp.Frame, period u
 	p.gen++
 	p.byCorr[corr] = resolvedStack{frames: frames, period: period, gen: p.gen}
 	p.order = append(p.order, stackPos{corr: corr, gen: p.gen})
+	p.reclaimOrder()
 	for len(p.byCorr) > p.capacity {
 		if !p.evictOldest() {
 			break
@@ -115,6 +116,46 @@ func (p *pendingStacks) evictOldest() bool {
 	}
 	p.compact()
 	return false
+}
+
+// reclaimOrder drops the order positions that no longer describe a live
+// entry, keeping the survivors in their original order.
+//
+// This is what stops the FIFO outgrowing the work it tracks. park is the
+// only thing that appends, and take deliberately leaves a position behind
+// (evictOldest tells a dead position apart from a live one by generation,
+// so no scan is needed on the hot take path). In the ordinary sampled-first
+// steady state the map hovers near empty and evictOldest therefore never
+// runs, so nothing else would ever reclaim those positions: the slice would
+// grow by one position plus a retained correlation string per sampled
+// launch, for the life of the process. Head-advancing alone is not enough
+// either, because a single stack parked and never taken - its launch batch
+// was dropped - sits at the head forever while the dead positions pile up
+// behind it.
+//
+// Live entries are at most capacity, so the slice is rebuilt only once the
+// dead outnumber any possible live set, which makes the O(n) rebuild
+// amortized O(1) per park and bounds the slice at 2*capacity + 1.
+// Eviction order is preserved exactly: the filter keeps survivors in place,
+// so the oldest live position stays the oldest.
+func (p *pendingStacks) reclaimOrder() {
+	if len(p.order)-p.head <= 2*p.capacity {
+		return
+	}
+	n := 0
+	for _, pos := range p.order[p.head:] {
+		cur, ok := p.byCorr[pos.corr]
+		if !ok || cur.gen != pos.gen {
+			continue
+		}
+		// Safe in place: n never runs ahead of the read index, because it
+		// advances at most once per position read and starts no later.
+		p.order[n] = pos
+		n++
+	}
+	clear(p.order[n:])
+	p.order = p.order[:n]
+	p.head = 0
 }
 
 // take removes and returns the capture parked for corr, if any.
@@ -158,9 +199,18 @@ func (p *pendingStacks) compact() {
 //
 // Not internally synchronized; Consumer calls it under its own mutex.
 type deferredLaunches struct {
-	buf      []gpu.GPUKernelLaunch
+	buf      []deferredLaunch
 	head     int
 	capacity int
+}
+
+// deferredLaunch is a held launch plus the kernel id from its wire record.
+// gpu.GPUKernelLaunch carries the kernel *name*, not the id, and the name
+// may not be known yet (see kernelnames.go), so the id has to ride along
+// until the launch is finally emitted and can be named.
+type deferredLaunch struct {
+	launch   gpu.GPUKernelLaunch
+	kernelID uint64
 }
 
 func newDeferredLaunches(capacity int) *deferredLaunches {
@@ -173,7 +223,7 @@ func newDeferredLaunches(capacity int) *deferredLaunches {
 // push queues a launch. If the queue is already at capacity the oldest
 // launch is returned for immediate release, so the bound can never turn
 // into dropped launches.
-func (d *deferredLaunches) push(l gpu.GPUKernelLaunch) (released gpu.GPUKernelLaunch, ok bool) {
+func (d *deferredLaunches) push(l deferredLaunch) (released deferredLaunch, ok bool) {
 	if d.len() >= d.capacity {
 		released, ok = d.pop()
 	}
@@ -182,14 +232,14 @@ func (d *deferredLaunches) push(l gpu.GPUKernelLaunch) (released gpu.GPUKernelLa
 }
 
 // pop removes the oldest launch.
-func (d *deferredLaunches) pop() (gpu.GPUKernelLaunch, bool) {
+func (d *deferredLaunches) pop() (deferredLaunch, bool) {
 	if d.head >= len(d.buf) {
-		return gpu.GPUKernelLaunch{}, false
+		return deferredLaunch{}, false
 	}
 	l := d.buf[d.head]
 	// Clear the slot so the queue does not pin a launch's stack frames and
 	// tag map alive after it has been handed on.
-	d.buf[d.head] = gpu.GPUKernelLaunch{}
+	d.buf[d.head] = deferredLaunch{}
 	d.head++
 	d.compact()
 	return l, true
@@ -199,26 +249,26 @@ func (d *deferredLaunches) pop() (gpu.GPUKernelLaunch, bool) {
 // held. Correlations are unique per launch, so the first match is the only
 // one; the scan runs from the newest end because the twin of a just-arrived
 // sampled record is the launch that was queued most recently.
-func (d *deferredLaunches) take(corr gpu.CorrelationID) (gpu.GPUKernelLaunch, bool) {
+func (d *deferredLaunches) take(corr gpu.CorrelationID) (deferredLaunch, bool) {
 	for i := len(d.buf) - 1; i >= d.head; i-- {
-		if d.buf[i].Correlation != corr {
+		if d.buf[i].launch.Correlation != corr {
 			continue
 		}
 		l := d.buf[i]
 		copy(d.buf[i:], d.buf[i+1:])
-		d.buf[len(d.buf)-1] = gpu.GPUKernelLaunch{}
+		d.buf[len(d.buf)-1] = deferredLaunch{}
 		d.buf = d.buf[:len(d.buf)-1]
 		return l, true
 	}
-	return gpu.GPUKernelLaunch{}, false
+	return deferredLaunch{}, false
 }
 
 // drain empties the queue in FIFO order.
-func (d *deferredLaunches) drain() []gpu.GPUKernelLaunch {
+func (d *deferredLaunches) drain() []deferredLaunch {
 	if d.len() == 0 {
 		return nil
 	}
-	out := make([]gpu.GPUKernelLaunch, d.len())
+	out := make([]deferredLaunch, d.len())
 	copy(out, d.buf[d.head:])
 	clear(d.buf)
 	d.buf = d.buf[:0]

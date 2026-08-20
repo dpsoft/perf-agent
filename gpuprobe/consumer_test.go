@@ -88,11 +88,19 @@ func (s *recordingSink) launchCount() int {
 }
 
 // scriptedReader is a batchReader that hands out queued samples and then
-// blocks in Read, exactly like a real ringbuf with nothing to deliver. Close
-// and SetDeadline wake it with the error the real reader would return, and
-// both are safe to call concurrently and more than once — the properties
-// Consumer.Close relies on.
+// blocks in Read, exactly like a real ringbuf with nothing to deliver.
+//
+// It models ringbuf.(*Reader)'s *locking*, not just its errors, because the
+// locking is where the cancellation bug lived. Read holds mu for the whole
+// blocking wait (ringbuf/reader.go ReadInto locks r.mu and defers the
+// unlock around the epoll wait); SetDeadline wants that same mu, so against
+// a blocked reader it parks forever and wakes nothing; Close signals first
+// and only then takes mu, mirroring the real Close closing its poller before
+// acquiring the lock — which is exactly why Close, and only Close, can
+// interrupt a read in progress. A fake whose SetDeadline returned
+// immediately would have passed with the broken implementation too.
 type scriptedReader struct {
+	mu   sync.Mutex
 	recs chan []byte
 	done chan struct{}
 	once sync.Once
@@ -111,6 +119,9 @@ func (r *scriptedReader) stop(err error) {
 }
 
 func (r *scriptedReader) Read() (ringbuf.Record, error) {
+	// Held across the block, like the real ReadInto.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	select {
 	case b := <-r.recs:
 		return ringbuf.Record{RawSample: b}, nil
@@ -120,8 +131,22 @@ func (r *scriptedReader) Read() (ringbuf.Record, error) {
 	}
 }
 
-func (r *scriptedReader) SetDeadline(time.Time) { r.stop(os.ErrDeadlineExceeded) }
-func (r *scriptedReader) Close() error          { r.stop(ringbuf.ErrClosed); return nil }
+// SetDeadline blocks behind a read in progress, as the real one does. Calling
+// it to cancel a blocked Run is the deadlock this models.
+func (r *scriptedReader) SetDeadline(time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stop(os.ErrDeadlineExceeded)
+}
+
+// Close signals before taking mu, so it can interrupt a read in progress. It
+// is idempotent and safe to call concurrently with Read.
+func (r *scriptedReader) Close() error {
+	r.stop(ringbuf.ErrClosed)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return nil
+}
 
 // oneLaunchBatch builds a wire-format batch carrying a single launch record.
 func oneLaunchBatch(pid uint32, seq uint64) []byte {
@@ -422,8 +447,15 @@ func TestCloseWhileRunIsBlockedReturnsWithoutPanic(t *testing.T) {
 	require.NoError(t, c.Close())
 }
 
-// Run must honour its context: the ringbuf read blocks, so cancellation goes
-// through SetDeadline rather than through Close.
+// Run must honour its context while the read is *blocked* — the only state
+// that matters, since a ringbuf with nothing to deliver is the normal one.
+// Cancellation therefore closes the reader; a deadline would park behind the
+// blocked read forever (see Run, and scriptedReader's doc comment).
+//
+// Regression: with the AfterFunc calling SetDeadline this test hangs until
+// its 5s deadline and fails, because scriptedReader models the real reader's
+// lock. Do not "fix" a future failure here by giving the fake a lock-free
+// SetDeadline.
 func TestRunStopsOnContextCancel(t *testing.T) {
 	reader := newScriptedReader(1)
 	c := newTestConsumer(&recordingSink{})
@@ -433,6 +465,11 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
 
+	// Let Run reach the blocking Read before cancelling: cancelling first
+	// would leave the reader unlocked, which is the one case the broken
+	// implementation also survived.
+	waitForBlockedRead(t, reader)
+
 	cancel()
 	select {
 	case err := <-done:
@@ -440,6 +477,25 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after the context was cancelled")
 	}
+
+	// Cancellation closed the reader; Consumer.Close must still be safe and
+	// must not report the already-closed reader as an error.
+	assert.NoError(t, c.Close())
+}
+
+// waitForBlockedRead blocks until r is parked inside Read holding its mutex.
+// TryLock failing is the observable form of "a read is in progress".
+func waitForBlockedRead(t *testing.T, r *scriptedReader) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !r.mu.TryLock() {
+			return
+		}
+		r.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Run never entered a blocking Read")
 }
 
 // Close and cancellation arriving together is the shape that made the nil

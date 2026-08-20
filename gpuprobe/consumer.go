@@ -150,6 +150,10 @@ type Stats struct {
 // exists so the Run/Close lifecycle — in particular Close racing a blocked
 // Read — is testable without CAP_BPF, which creating a real ringbuf map
 // requires. *ringbuf.Reader satisfies it.
+//
+// SetDeadline is part of the surface but is deliberately never used to
+// interrupt a read: see Run for why it cannot work. It stays here so a fake
+// can model its real locking and prove that Run does not reach for it.
 type batchReader interface {
 	Read() (ringbuf.Record, error)
 	SetDeadline(t time.Time)
@@ -363,9 +367,18 @@ func (c *Consumer) correlationOf(v uint64) gpu.CorrelationID {
 // Run reads batches until the context is cancelled or the consumer is
 // closed. It is not safe to call Run more than once concurrently.
 func (c *Consumer) Run(ctx context.Context) error {
-	// ringbuf.Reader.Read blocks; a deadline in the past is how it is woken
-	// on cancellation without closing the reader out from under Close.
-	stop := context.AfterFunc(ctx, func() { c.reader.SetDeadline(time.Now()) })
+	// Cancellation closes the reader. It cannot use SetDeadline:
+	// ringbuf.(*Reader).ReadInto takes the reader's own mutex and holds it
+	// for the entire blocking loop, epoll wait included, while SetDeadline
+	// wants that same mutex — so a deadline set on a *blocked* reader parks
+	// forever behind the read it was supposed to interrupt, and nothing is
+	// ever woken. Close is the documented interrupt ("It interrupts calls to
+	// Read"), and it works precisely because it closes the poller BEFORE
+	// acquiring the mutex. It is also idempotent: once the poller is closed a
+	// second Close returns nil, so Consumer.Close remains safe afterwards.
+	// The read then fails with ringbuf.ErrClosed, which the loop below treats
+	// as a clean exit.
+	stop := context.AfterFunc(ctx, func() { _ = c.reader.Close() })
 	defer stop()
 
 	for {

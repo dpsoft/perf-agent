@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -50,8 +51,20 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	if !hasBPFAndPerfmon() {
 		t.Skip("needs CAP_BPF and CAP_PERFMON; setcap the test binary")
 	}
-	stub := filepath.Join("..", "shim", "perfagent-gpu-stub")
-	requireBuilt(t, stub)
+	built := filepath.Join("..", "shim", "perfagent-gpu-stub")
+	requireBuilt(t, built)
+	// Attach to a private copy, not to the shared build output. Uprobes key
+	// on the binary's *inode*, and this consumer must attach system-wide
+	// (Config.PID is zero) because the stub process does not exist yet — the
+	// stub only emits once the semaphore says someone is listening, so it has
+	// to be launched after Attach. A system-wide attach on the shared inode
+	// therefore also collects records from *any other* process on the machine
+	// running that same image: a concurrent gate run in CI, a second
+	// developer, a stray perfagent-gpu-stub. That is not hypothetical — a run
+	// failed with "Records: expected 1000, actual 1128" for exactly this
+	// reason. A per-run copy has an inode nobody else can execute, which is
+	// what makes the exact count below deterministic.
+	stub := privateStubCopy(t, built)
 
 	timeline := gpu.NewTimeline(gpu.TimelineConfig{})
 	c, err := gpuprobe.Attach(gpuprobe.Config{
@@ -138,6 +151,50 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// correlation on both sides.
 	assert.Zero(t, snap.JoinStats.HeuristicExecutionJoinCount,
 		"the stub supplies correlations; no join should need the heuristic")
+}
+
+// privateStubCopy copies the built stub into this test's own temp directory
+// and returns the copy's path. The copy is what the test attaches to and what
+// it runs, so the uprobe can only ever match this run's executions.
+//
+// t.TempDir() is removed when the test ends, taking the copy with it. It lives
+// under TMPDIR (/tmp here, mounted rw,nosuid,nodev — not noexec, so the copy
+// is runnable); nosuid is irrelevant because the stub is an ordinary
+// unprivileged producer and carries no file capabilities. If TMPDIR were ever
+// noexec the exec below fails loudly with ENOEXEC/EACCES rather than
+// silently degrading.
+func privateStubCopy(t *testing.T, src string) string {
+	t.Helper()
+	info, err := os.Stat(src)
+	require.NoError(t, err)
+	data, err := os.ReadFile(src)
+	require.NoError(t, err)
+	dst := filepath.Join(t.TempDir(), filepath.Base(src))
+	// Preserve the executable bit from the source rather than assuming 0755.
+	require.NoError(t, os.WriteFile(dst, data, info.Mode().Perm()))
+	require.NotZero(t, info.Mode().Perm()&0o100, "built stub is not executable")
+
+	// A distinct inode is the entire point; assert it rather than trusting the
+	// copy. Two paths sharing an inode (a hard link, or a copy that silently
+	// became a link) would put the shared image back under the uprobe.
+	srcSys, dstInfo := info.Sys(), mustStat(t, dst)
+	require.NotEqual(t, inodeOf(t, srcSys), inodeOf(t, dstInfo.Sys()),
+		"the copy must have its own inode, or the attach is not private to this run")
+	return dst
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info
+}
+
+func inodeOf(t *testing.T, sys any) uint64 {
+	t.Helper()
+	st, ok := sys.(*syscall.Stat_t)
+	require.True(t, ok, "stat did not yield a *syscall.Stat_t")
+	return st.Ino
 }
 
 func requireBuilt(t *testing.T, path string) {

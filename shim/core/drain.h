@@ -12,21 +12,7 @@
 #ifndef PERFAGENT_DRAIN_H
 #define PERFAGENT_DRAIN_H
 
-// usdt_abi.h is written for C (it has its own C-only test, usdt_abi_test.c)
-// and uses C11's `_Static_assert`, which is not a C++ keyword -- only bare
-// `static_assert` is. This is the first C++ translation unit to include it,
-// so the C++ front end has never had to parse those lines before. Rather
-// than edit usdt_abi.h (out of scope for this task and shared with the C
-// build), alias the spelling for the duration of this one include.
-#if defined(__cplusplus) && !defined(_Static_assert)
-#define _Static_assert static_assert
-#define PERFAGENT_DRAIN_UNDEF_STATIC_ASSERT
-#endif
 #include "usdt_abi.h"
-#ifdef PERFAGENT_DRAIN_UNDEF_STATIC_ASSERT
-#undef _Static_assert
-#undef PERFAGENT_DRAIN_UNDEF_STATIC_ASSERT
-#endif
 
 #include <atomic>
 #include <chrono>

@@ -9,6 +9,12 @@
 
 #define GPU_ABI_VERSION 1
 
+#ifdef __cplusplus
+#define GPU_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define GPU_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
 // Emitted when a kernel is submitted. queue_id is optional: zero means
 // unknown. The launch side cannot always derive it (spec §6.3 finding 1).
 struct gpu_launch_v1 {
@@ -67,13 +73,13 @@ struct gpu_dropped_v1 {
     uint8_t  _pad[7];
 };
 
-_Static_assert(sizeof(struct gpu_launch_v1) == 48, "gpu_launch_v1 layout");
-_Static_assert(sizeof(struct gpu_exec_v1) == 48, "gpu_exec_v1 layout");
-_Static_assert(sizeof(struct gpu_module_load_v1) == 40, "gpu_module_load_v1 layout");
-_Static_assert(sizeof(struct gpu_pc_sample_batch_v1) == 40, "gpu_pc_sample_batch_v1 layout");
-_Static_assert(sizeof(struct gpu_config_v1) == 24, "gpu_config_v1 layout");
-_Static_assert(sizeof(struct gpu_dropped_v1) == 16, "gpu_dropped_v1 layout");
-_Static_assert(offsetof(struct gpu_pc_sample_batch_v1, cubin_crc) == 0, "cubin_crc leads");
-_Static_assert(offsetof(struct gpu_module_load_v1, cubin_crc) == 0, "cubin_crc leads");
+GPU_STATIC_ASSERT(sizeof(struct gpu_launch_v1) == 48, "gpu_launch_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_exec_v1) == 48, "gpu_exec_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_module_load_v1) == 40, "gpu_module_load_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_pc_sample_batch_v1) == 40, "gpu_pc_sample_batch_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_config_v1) == 24, "gpu_config_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_dropped_v1) == 16, "gpu_dropped_v1 layout");
+GPU_STATIC_ASSERT(offsetof(struct gpu_pc_sample_batch_v1, cubin_crc) == 0, "cubin_crc leads");
+GPU_STATIC_ASSERT(offsetof(struct gpu_module_load_v1, cubin_crc) == 0, "cubin_crc leads");
 
 #endif

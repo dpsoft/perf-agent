@@ -13,7 +13,10 @@
 // Stats.SequenceGaps; record kinds this phase carries but does not yet
 // normalize are counted as Stats.Undecoded; records whose wire correlation is
 // zero — the ABI's "no correlation", which demotes them to the timeline's
-// heuristic join — are counted as Stats.ZeroCorrelation.
+// heuristic join — are counted as Stats.ZeroCorrelation. Samples that did not
+// decode at all are counted as Stats.Malformed, and *why* they did not decode
+// is kept in Stats.DecodeFailures: a count of malformed samples with no
+// reason attached is loss that is visible but not diagnosable.
 package gpuprobe
 
 import (
@@ -208,7 +211,28 @@ type Stats struct {
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
+	// DecodeFailures says *why*; a bare count of malformed samples is a
+	// symptom nobody can act on.
 	Malformed uint64
+	// DecodeFailures is why the Malformed samples were malformed: the first
+	// maxDecodeFailureReasons distinct reasons, deduplicated by error text,
+	// each with how many samples failed that way. It is the operator-facing
+	// half of Malformed — an ABI drift, a producer emitting a record the
+	// decoder rejects, or a truncated batch all read as "Malformed++"
+	// otherwise, and the three call for completely different responses.
+	//
+	// Bounded on purpose: a producer that fails every sample the same way
+	// must cost one table entry, not one entry per sample. The counts
+	// therefore sum to Malformed only when nothing was crowded out; see
+	// DecodeReasonsUnrecorded for the shortfall.
+	DecodeFailures []DecodeFailure
+	// DecodeReasonsUnrecorded counts decode failures whose reason did not
+	// fit in the bounded table because maxDecodeFailureReasons distinct
+	// reasons had already been seen. Those samples are still in Malformed;
+	// only their reason was dropped, and that drop is not silent either.
+	//
+	//	Malformed = sum(DecodeFailures[i].Count) + DecodeReasonsUnrecorded
+	DecodeReasonsUnrecorded uint64
 	// ZeroCorrelation counts records that arrived carrying a wire correlation
 	// of zero, which the ABI defines as "no correlation" (shim/core/usdt_abi.h;
 	// spec §6.3 finding 3 makes it the normal case for PC samples in the
@@ -327,6 +351,92 @@ type Stats struct {
 	KernelStacksMissing uint64
 }
 
+// maxDecodeFailureReasons bounds the decode-failure table. Four is enough to
+// tell apart the ways decodeBatch can fail — a short header, a payload
+// shorter than the header claims, a record the ABI rejects, a sampled batch
+// that is not singular — while keeping the table a fixed-size array that
+// costs nothing at all when nothing fails.
+const maxDecodeFailureReasons = 4
+
+// DecodeFailure is one reason ringbuf samples failed to decode, and how many
+// samples failed for that reason. Reason is the error text as decodeBatch
+// rendered it, which is what an operator reads.
+type DecodeFailure struct {
+	Reason string
+	Count  uint64
+}
+
+// String renders a failure the way a log line or a test message wants it.
+func (d DecodeFailure) String() string {
+	return fmt.Sprintf("%dx %s", d.Count, d.Reason)
+}
+
+// decodeFailureTable remembers why decoding failed, bounded to the first
+// maxDecodeFailureReasons distinct reasons.
+//
+// The state it has to survive is not a rare one-off: it is a producer whose
+// every sample fails identically, which is exactly the shape of an ABI drift
+// — thousands of failures, one reason. So the repeat path must not allocate,
+// and it does not: errors.Is compares sentinels by identity without
+// formatting anything, and only a reason never seen before is rendered with
+// Error(). At most maxDecodeFailureReasons strings are ever retained.
+//
+// Nothing here is on the success path, which touches this type not at all.
+type decodeFailureTable struct {
+	errs   [maxDecodeFailureReasons]error
+	reason [maxDecodeFailureReasons]string
+	count  [maxDecodeFailureReasons]uint64
+	n      int
+	// unrecorded counts failures that arrived after the table filled up.
+	unrecorded uint64
+}
+
+// note records one decode failure. Caller holds mu.
+func (t *decodeFailureTable) note(err error) {
+	// Identity fast path, allocation-free. It is deliberately symmetric:
+	// errors.Is(err, stored) alone would fold a *wrapped* error into the
+	// bare sentinel it wraps and report it under the bare sentinel's text,
+	// losing the detail the wrapping exists to carry. Requiring the match
+	// both ways means only genuinely identical errors merge here; anything
+	// else falls through to the text comparison below, which is exact.
+	for i := 0; i < t.n; i++ {
+		if errors.Is(err, t.errs[i]) && errors.Is(t.errs[i], err) {
+			t.count[i]++
+			return
+		}
+	}
+	// A wrapped error carrying formatted detail ("...: count=3") reaches
+	// here every time; its text is what "distinct reason" means.
+	reason := err.Error()
+	for i := 0; i < t.n; i++ {
+		if t.reason[i] == reason {
+			t.count[i]++
+			return
+		}
+	}
+	if t.n == len(t.reason) {
+		t.unrecorded++
+		return
+	}
+	t.errs[t.n] = err
+	t.reason[t.n] = reason
+	t.count[t.n] = 1
+	t.n++
+}
+
+// snapshot copies the table out for Stats. Nil when nothing failed, so a
+// healthy consumer's Stats call allocates nothing here either.
+func (t *decodeFailureTable) snapshot() []DecodeFailure {
+	if t.n == 0 {
+		return nil
+	}
+	out := make([]DecodeFailure, t.n)
+	for i := 0; i < t.n; i++ {
+		out[i] = DecodeFailure{Reason: t.reason[i], Count: t.count[i]}
+	}
+	return out
+}
+
 // batchReader is the slice of *ringbuf.Reader that Run and Close use. It
 // exists so the Run/Close lifecycle — in particular Close racing a blocked
 // Read — is testable without CAP_BPF, which creating a real ringbuf map
@@ -375,6 +485,10 @@ type Consumer struct {
 	// waits until the producer has demonstrated, once, that names exist.
 	sawKernelName bool
 	stats         Stats
+	// decodeFailures is the bounded reason table behind Stats.Malformed.
+	// A zero value is a usable empty table, so newConsumer says nothing
+	// about it.
+	decodeFailures decodeFailureTable
 }
 
 // newConsumer builds a Consumer with its side tables sized from cfg. Attach
@@ -671,6 +785,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 		if err != nil {
 			c.mu.Lock()
 			c.stats.Malformed++
+			// Why, not just how many: the error is the only evidence
+			// that this sample was rejected rather than lost, and
+			// throwing it away here is what makes a malformed-sample
+			// count unactionable. See decodeFailureTable.
+			c.decodeFailures.note(err)
 			c.mu.Unlock()
 			continue
 		}
@@ -1093,6 +1212,8 @@ func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.stats
+	out.DecodeFailures = c.decodeFailures.snapshot()
+	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
 	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
 	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
 	// Gauges, read fresh: what the two side tables are holding right now.

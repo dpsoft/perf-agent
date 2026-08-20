@@ -1609,3 +1609,111 @@ func TestFlushAndCloseReleaseEventsWaitingForAName(t *testing.T) {
 	require.NoError(t, c.Close())
 	assert.Equal(t, 2, len(sink.execs), "an event held at teardown would be silent record loss")
 }
+
+// --- Why a sample was malformed --------------------------------------------
+
+// Malformed on its own is a symptom nobody can act on. The reason table is
+// what turns "63 samples were malformed" into "63 samples carried
+// sample_period 0", which is the difference between a debuggable profiler and
+// an opaque one.
+func TestDecodeFailureReasonsAreRecorded(t *testing.T) {
+	reader := newScriptedReader(4)
+	c := newTestConsumer(&recordingSink{})
+	c.reader = reader
+
+	// A sampled batch whose record carries sample_period == 0: the exact wire
+	// shape a producer whose field stores were optimized away produces.
+	reader.recs <- sampledBatch(1, 0)
+	reader.recs <- sampledBatch(1, 0)
+	// ...and one that fails for a different reason, so the table has to keep
+	// the two apart rather than collapsing them into a count.
+	reader.recs <- make([]byte, batchHdrSize-1)
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	require.Eventually(t, func() bool { return c.Stats().Malformed == 3 },
+		5*time.Second, 5*time.Millisecond)
+	require.NoError(t, c.Close())
+	<-done
+
+	st := c.Stats()
+	require.Len(t, st.DecodeFailures, 2, "two distinct reasons, three failures")
+	assert.Equal(t, gpuabi.ErrInvalidSamplePeriod.Error(), st.DecodeFailures[0].Reason,
+		"the first reason seen leads, so the table reads as a history")
+	assert.Equal(t, uint64(2), st.DecodeFailures[0].Count,
+		"both zero-period samples fold into one reason")
+	assert.Equal(t, gpuabi.ErrShortRecord.Error(), st.DecodeFailures[1].Reason)
+	assert.Equal(t, uint64(1), st.DecodeFailures[1].Count)
+	assert.Zero(t, st.DecodeReasonsUnrecorded, "two reasons fit in a table of four")
+
+	var total uint64
+	for _, f := range st.DecodeFailures {
+		total += f.Count
+	}
+	assert.Equal(t, st.Malformed, total+st.DecodeReasonsUnrecorded,
+		"the reasons must account for every malformed sample")
+}
+
+// A healthy consumer pays nothing for the feature, and says nothing either:
+// an empty slice would read as "there were failures" to a %v.
+func TestDecodeFailuresAreNilWhenNothingFailed(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	assert.Nil(t, c.Stats().DecodeFailures)
+	assert.Zero(t, c.Stats().DecodeReasonsUnrecorded)
+}
+
+// The table is a fixed-size array, so a producer inventing endless distinct
+// reasons cannot grow it. What it must not do is lose the fact that those
+// failures happened.
+func TestDecodeFailureTableIsBoundedAndCountsWhatItDropped(t *testing.T) {
+	var tbl decodeFailureTable
+	for i := 0; i < maxDecodeFailureReasons+3; i++ {
+		tbl.note(fmt.Errorf("reason %d", i))
+	}
+	// ...and one repeat of a reason that did fit, which must still land in
+	// its own slot rather than in the unrecorded bucket.
+	tbl.note(errors.New("reason 0"))
+
+	got := tbl.snapshot()
+	require.Len(t, got, maxDecodeFailureReasons)
+	assert.Equal(t, "reason 0", got[0].Reason)
+	assert.Equal(t, uint64(2), got[0].Count)
+	assert.Equal(t, uint64(3), tbl.unrecorded,
+		"the three reasons that did not fit are counted, not dropped silently")
+}
+
+// Distinct detail on the same sentinel is a distinct reason: a batch of two
+// sampled launches and a batch of nine are different producer bugs, and
+// folding them together would hide one of them.
+func TestDecodeFailureWrappedDetailIsNotFoldedIntoItsSentinel(t *testing.T) {
+	var tbl decodeFailureTable
+	tbl.note(errSampledBatchNotSingular)
+	tbl.note(fmt.Errorf("%w: count=2", errSampledBatchNotSingular))
+	tbl.note(fmt.Errorf("%w: count=2", errSampledBatchNotSingular))
+	tbl.note(fmt.Errorf("%w: count=9", errSampledBatchNotSingular))
+
+	got := tbl.snapshot()
+	require.Len(t, got, 3)
+	assert.Equal(t, uint64(1), got[0].Count)
+	assert.Equal(t, errSampledBatchNotSingular.Error()+": count=2", got[1].Reason)
+	assert.Equal(t, uint64(2), got[1].Count)
+	assert.Equal(t, errSampledBatchNotSingular.Error()+": count=9", got[2].Reason)
+}
+
+// The state this has to survive is thousands of identical failures - an ABI
+// drift fails every sample the same way. Formatting the reason each time
+// would make a broken producer expensive on top of broken, so the repeat path
+// must not allocate at all.
+func TestRepeatedDecodeFailuresDoNotAllocate(t *testing.T) {
+	var tbl decodeFailureTable
+	tbl.note(gpuabi.ErrInvalidSamplePeriod) // the one allocation: a new reason
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		tbl.note(gpuabi.ErrInvalidSamplePeriod)
+	})
+	assert.Zero(t, allocs, "a repeat of a known reason must be identity-matched, not formatted")
+	// AllocsPerRun warms up before it measures, so the exact call count is
+	// its business; what matters is that every one of them was counted.
+	assert.Greater(t, tbl.snapshot()[0].Count, uint64(1000),
+		"every repeat must still be counted, allocation-free or not")
+}

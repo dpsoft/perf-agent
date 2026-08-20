@@ -162,7 +162,8 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.SinkRejected,
 		"Records counts before the sink call, so a rejection here means the timeline never took the event")
 	assert.Zero(t, stats.Malformed,
-		"a ringbuf sample that did not decode: a short header, or a payload shorter than the header claims")
+		"a ringbuf sample that did not decode: a short header, or a payload shorter than the header claims; reasons: %v",
+		stats.DecodeFailures)
 	assert.Zero(t, stats.Undecoded,
 		"the stub emits only launches, execs, sampled launches and kernel names, all of which this phase normalizes; an undecoded record means a kind arrived that it does not")
 	assert.Zero(t, stats.KernelDropped,

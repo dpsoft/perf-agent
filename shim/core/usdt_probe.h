@@ -5,6 +5,13 @@
 // The three arguments are bound to explicit registers so the note's argument
 // descriptor is a constant of the ABI. Letting the compiler choose produced
 // "8@%rax 8@%rdx 8@%rcx" in the spike; the consumer reads fixed registers.
+//
+// The probe's first argument is a POINTER, and the consumer dereferences it
+// with bpf_probe_read_user the instant the trap fires. That makes the record
+// buffer an input to the asm even though no operand names it, and the
+// compiler has to be told: without the "memory" clobber it is free to assume
+// nothing ever reads the buffer, and it does exactly that. See
+// PERFAGENT_USDT_PROBE3.
 #ifndef PERFAGENT_USDT_PROBE_H
 #define PERFAGENT_USDT_PROBE_H
 
@@ -37,6 +44,19 @@
 // True when a consumer is attached. Every emit path checks this first.
 #define PERFAGENT_USDT_ENABLED(name) (perfagent_##name##_semaphore != 0)
 
+// The "memory" clobber is load-bearing, not defensive. `ptr` reaches the asm
+// as a plain integer in a register: an operand list without it says the asm
+// touches no memory at all, so the compiler may sink — or delete outright —
+// the stores that filled the record, and the consumer then reads a buffer
+// that was never written. That is not hypothetical. At -O2, g++ dropped the
+// last two field stores of shim/stub/stub.cc's sampled-launch record
+// (sample_period and launch_seq, the two nothing read again), and every
+// sampled launch reached the consumer with sample_period == 0 — rejected by
+// gpuabi.DecodeLaunchSampled, one hundred percent of them.
+//
+// The clobber costs a scheduling barrier at the probe site, which is
+// nothing next to the ~1-2us uprobe trap the probe is about to take, and it
+// is paid only on the path where the semaphore is already armed.
 #define PERFAGENT_USDT_PROBE3(name, ptr, count, seq)                        \
   do {                                                                      \
     register unsigned long _a0 __asm__("rdi") = (unsigned long)(ptr);       \
@@ -58,7 +78,7 @@
       ".asciz \"8@%%rdi 8@%%rsi 8@%%rdx\"\n"                                \
       "994: .balign 4\n"                                                    \
       ".popsection\n"                                                       \
-      :: "r"(_a0), "r"(_a1), "r"(_a2));                                     \
+      :: "r"(_a0), "r"(_a1), "r"(_a2) : "memory");                          \
   } while (0)
 
 // Declares the semaphore for probe `name` plus the two thunks a Batch needs,

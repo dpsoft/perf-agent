@@ -73,6 +73,34 @@ struct gpu_dropped_v1 {
     uint8_t  _pad[7];
 };
 
+// Longest kernel name carried inline. CUDA names are mangled C++ and can
+// exceed this; truncation is flagged per record rather than hidden.
+#define GPU_KERNEL_NAME_MAX 256
+
+// A launch selected for CPU-stack capture. Fires UNBATCHED, one record per
+// probe, so the consumer's bpf_get_stackid captures the stack of the thread
+// that made THIS launch. gpu_launch_v1 stays batched and unchanged.
+struct gpu_launch_sampled_v1 {
+    uint64_t correlation;
+    uint64_t kernel_id;
+    uint64_t queue_id;
+    uint64_t context_id;
+    uint64_t time_ns;
+    uint32_t tid;
+    uint32_t sample_period;   // the N in one-in-N, at capture time; never 0
+    uint64_t launch_seq;      // ordinal among ALL launches, sampled or not
+};
+
+// kernel_id -> name, emitted once on first sight and replayed on late
+// attach. Fixed-size by the ABI's rules; name_len is authoritative.
+struct gpu_kernel_name_v1 {
+    uint64_t kernel_id;
+    uint16_t name_len;
+    uint8_t  truncated;
+    uint8_t  _pad[5];
+    char     name[GPU_KERNEL_NAME_MAX];
+};
+
 GPU_STATIC_ASSERT(sizeof(struct gpu_launch_v1) == 48, "gpu_launch_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_exec_v1) == 48, "gpu_exec_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_module_load_v1) == 40, "gpu_module_load_v1 layout");
@@ -81,5 +109,8 @@ GPU_STATIC_ASSERT(sizeof(struct gpu_config_v1) == 24, "gpu_config_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_dropped_v1) == 16, "gpu_dropped_v1 layout");
 GPU_STATIC_ASSERT(offsetof(struct gpu_pc_sample_batch_v1, cubin_crc) == 0, "cubin_crc leads");
 GPU_STATIC_ASSERT(offsetof(struct gpu_module_load_v1, cubin_crc) == 0, "cubin_crc leads");
+GPU_STATIC_ASSERT(sizeof(struct gpu_launch_sampled_v1) == 56, "gpu_launch_sampled_v1 layout");
+GPU_STATIC_ASSERT(sizeof(struct gpu_kernel_name_v1) == 272, "gpu_kernel_name_v1 layout");
+GPU_STATIC_ASSERT(offsetof(struct gpu_launch_sampled_v1, sample_period) == 44, "sample_period position");
 
 #endif

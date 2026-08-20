@@ -35,21 +35,25 @@ export LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release
 
 Run `go test` directly. Do not run `make test-unit` — it runs `go generate`.
 
-## Prerequisites — resolve before Task 6
+## Prerequisites — resolve before Task 7
 
-**1. clang and llvm are not installed on this box.** `bpf2go` needs `clang` to compile `bpf/*.bpf.c` and `llvm-strip` to strip the object. Tasks 1–5 do not need them; Task 6 onward cannot proceed without them.
+**1. The BPF toolchain is not installed on this box.** `bpf2go` needs `clang` to
+compile `bpf/*.bpf.c`, `llvm-strip` to strip the object, and libbpf's headers —
+every `bpf/*.bpf.c` includes `<bpf/bpf_helpers.h>`, and only the libbpf runtime
+is present here, not `libbpf-devel`. **Task 7** is the first task that needs any
+of this; Tasks 1–6 do not (the shim and stub build with `c++`).
 
 ```bash
-sudo dnf install clang llvm
+sudo dnf install -y clang llvm libbpf-devel
 ```
 
 Verify:
 
 ```bash
-which clang llvm-strip
+which clang llvm-strip && ls /usr/include/bpf/bpf_helpers.h
 ```
 
-Expected: both resolve. If they do not, stop — do not hand-write BPF instructions with `asm.Instructions` as a workaround. That was acceptable for a throwaway spike; it is not maintainable for the consumer, which reads stacks and reserves ringbuf space.
+Expected: all three resolve. If they do not, stop — do not hand-write BPF instructions with `asm.Instructions` as a workaround. That was acceptable for a throwaway spike; it is not maintainable for the consumer, which reads stacks and reserves ringbuf space.
 
 **2. Kernel 6.6+.** Verify `uname -r` reports ≥ 6.6. The dev box runs 6.19.
 
@@ -1444,7 +1448,7 @@ cd gpuprobe && go generate ./... && cd ..
 ls gpuprobe/gpuusdt_bpfel*.o
 ```
 
-Expected: objects for both arches. This is the step that needs `clang` and `llvm-strip` from the prerequisites.
+Expected: objects for both arches. This is the step that needs `clang`, `llvm-strip` and `libbpf-devel` from the prerequisites.
 
 - [ ] **Step 4: Write the failing consumer test**
 

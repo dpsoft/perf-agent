@@ -112,8 +112,12 @@ type Stats struct {
 	// Batches and Records count what arrived and was normalized.
 	Batches uint64
 	Records uint64
-	// SequenceGaps counts records implied by a jump in a probe's per-probe
-	// monotonic sequence number: batches the consumer never saw.
+	// SequenceGaps counts *batches* the consumer never saw, implied by a jump
+	// in a probe's monotonic sequence number. The shim increments seq_ once
+	// per batch (shim/core/batch.h), so one gap is one whole batch of up to
+	// MAX_RECORDS_PER_BATCH records, not one record. It is therefore not
+	// additive with KernelDropped or Records, which are both in records:
+	// a gap is loss the consumer cannot size, only detect.
 	SequenceGaps uint64
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
@@ -131,17 +135,37 @@ type Stats struct {
 	KernelDropped uint64
 }
 
+// batchReader is the slice of *ringbuf.Reader that Run and Close use. It
+// exists so the Run/Close lifecycle — in particular Close racing a blocked
+// Read — is testable without CAP_BPF, which creating a real ringbuf map
+// requires. *ringbuf.Reader satisfies it.
+type batchReader interface {
+	Read() (ringbuf.Record, error)
+	SetDeadline(t time.Time)
+	Close() error
+}
+
 // Consumer owns the loaded BPF objects, the uprobe_multi link and the
 // ringbuf reader for one shim.
 type Consumer struct {
 	cfg    Config
 	objs   gpuusdtObjects
 	links  []link.Link
-	reader *ringbuf.Reader
+	reader batchReader
 
-	mu        sync.Mutex
-	seqByKind map[uint32]uint64
-	stats     Stats
+	mu          sync.Mutex
+	seqByStream map[seqKey]uint64
+	stats       Stats
+}
+
+// seqKey identifies one sequence-number stream. The shim's seq_ counter is
+// per-process (shim/core/batch.h), so a system-wide attach (Config.PID == 0)
+// interleaves one independent stream per profiled process. Keying on kind
+// alone would read those interleavings as enormous gaps — manufacturing
+// exactly the loss the counter exists to detect.
+type seqKey struct {
+	kind uint32
+	pid  uint32
 }
 
 // Attach discovers the shim's probes and attaches them all in one
@@ -189,10 +213,12 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		p.KernelVersion = kv
 	}
 
-	c = &Consumer{cfg: cfg, seqByKind: map[uint32]uint64{}}
+	c = &Consumer{cfg: cfg, seqByStream: map[seqKey]uint64{}}
 	defer func() {
 		if err != nil {
-			c.Close()
+			// Cleanup path: the caller sees the original failure, not
+			// whatever the teardown of a half-built consumer reports.
+			_ = c.Close()
 			c = nil
 		}
 	}()
@@ -255,26 +281,26 @@ func decodeBatch(b []byte) (batch, error) {
 
 	switch out.Kind {
 	case kindLaunch:
+		// Division, not multiplication: count comes from a uint32 field and
+		// count*SizeLaunch could overflow int on a 32-bit build.
+		if count > len(payload)/gpuabi.SizeLaunch {
+			return batch{}, gpuabi.ErrShortRecord
+		}
 		out.Launches = make([]gpuabi.Launch, 0, count)
 		for i := 0; i < count; i++ {
-			off := i * gpuabi.SizeLaunch
-			if off > len(payload) {
-				return batch{}, gpuabi.ErrShortRecord
-			}
-			rec, err := gpuabi.DecodeLaunch(payload[off:])
+			rec, err := gpuabi.DecodeLaunch(payload[i*gpuabi.SizeLaunch:])
 			if err != nil {
 				return batch{}, err
 			}
 			out.Launches = append(out.Launches, rec)
 		}
 	case kindExec:
+		if count > len(payload)/gpuabi.SizeExec {
+			return batch{}, gpuabi.ErrShortRecord
+		}
 		out.Execs = make([]gpuabi.Exec, 0, count)
 		for i := 0; i < count; i++ {
-			off := i * gpuabi.SizeExec
-			if off > len(payload) {
-				return batch{}, gpuabi.ErrShortRecord
-			}
-			rec, err := gpuabi.DecodeExec(payload[off:])
+			rec, err := gpuabi.DecodeExec(payload[i*gpuabi.SizeExec:])
 			if err != nil {
 				return batch{}, err
 			}
@@ -284,14 +310,16 @@ func decodeBatch(b []byte) (batch, error) {
 	return out, nil
 }
 
-// noteSeq counts records lost between batches. A gap is loss the consumer did
-// not observe and must never be silent (spec §6.1). Caller holds mu.
-func (c *Consumer) noteSeq(kind uint32, seq uint64) {
-	prev, seen := c.seqByKind[kind]
+// noteSeq counts batches lost between the ones that arrived. A gap is loss
+// the consumer did not observe and must never be silent (spec §6.1). The
+// stream is identified by (kind, pid): see seqKey. Caller holds mu.
+func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) {
+	key := seqKey{kind: kind, pid: pid}
+	prev, seen := c.seqByStream[key]
 	if seen && seq > prev+1 {
 		c.stats.SequenceGaps += seq - prev - 1
 	}
-	c.seqByKind[kind] = seq
+	c.seqByStream[key] = seq
 }
 
 func correlationOf(backend gpu.GPUBackendID, v uint64) gpu.CorrelationID {
@@ -330,7 +358,7 @@ func (c *Consumer) applyBatch(b batch) {
 	defer c.mu.Unlock()
 
 	c.stats.Batches++
-	c.noteSeq(b.Kind, b.Seq)
+	c.noteSeq(b.Kind, b.PID, b.Seq)
 
 	switch b.Kind {
 	case kindLaunch:
@@ -406,9 +434,13 @@ func (c *Consumer) kernelDropped() uint64 {
 // safe to call on a partially constructed Consumer.
 func (c *Consumer) Close() error {
 	var errs []error
+	// c.reader is deliberately NOT set to nil: Run reads it without holding
+	// mu, and Close is documented to be callable from another goroutine while
+	// Run is blocked in Read. ringbuf.Reader's Close, Read and SetDeadline
+	// are safe to call concurrently and a second Close is a no-op, so leaving
+	// the pointer in place is both race-free and idempotent.
 	if c.reader != nil {
 		errs = append(errs, c.reader.Close())
-		c.reader = nil
 	}
 	for _, l := range c.links {
 		errs = append(errs, l.Close())

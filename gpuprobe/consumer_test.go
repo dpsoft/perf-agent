@@ -1,14 +1,21 @@
 package gpuprobe
 
 import (
+	"context"
 	"encoding/binary"
+	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
 )
 
 func putU32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
@@ -18,38 +25,114 @@ func putU64(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
 // below exercises decode/accounting only, so nothing here needs privileges.
 func newTestConsumer(sink gpu.EventSink) *Consumer {
 	return &Consumer{
-		cfg:       Config{Backend: gpu.BackendCUPTI, Sink: sink},
-		seqByKind: map[uint32]uint64{},
+		cfg:         Config{Backend: gpu.BackendCUPTI, Sink: sink},
+		seqByStream: map[seqKey]uint64{},
 	}
 }
 
 // recordingSink captures what the consumer normalized, and can be told to
-// reject so the SinkRejected accounting is exercised.
+// reject so the SinkRejected accounting is exercised. It is mutex-guarded
+// because the lifecycle tests below drive it from Run's goroutine.
 type recordingSink struct {
+	mu       sync.Mutex
 	launches []gpu.GPUKernelLaunch
 	execs    []gpu.GPUKernelExec
 	err      error
+	// onEmit, if set, is called after each accepted event. The lifecycle
+	// tests use it to know Run has completed a loop iteration.
+	onEmit func()
+}
+
+func (s *recordingSink) note() {
+	if s.onEmit != nil {
+		s.onEmit()
+	}
 }
 
 func (s *recordingSink) EmitLaunch(l gpu.GPUKernelLaunch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.err != nil {
 		return s.err
 	}
 	s.launches = append(s.launches, l)
+	s.note()
 	return nil
 }
 
 func (s *recordingSink) EmitExec(e gpu.GPUKernelExec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.err != nil {
 		return s.err
 	}
 	s.execs = append(s.execs, e)
+	s.note()
 	return nil
 }
 
-func (s *recordingSink) EmitPCSample(gpu.GPUPCSample) error   { return s.err }
-func (s *recordingSink) EmitModule(gpu.GPUModule) error       { return s.err }
-func (s *recordingSink) EmitEvent(gpu.GPUTimelineEvent) error { return s.err }
+func (s *recordingSink) EmitPCSample(gpu.GPUPCSample) error   { return s.errOnly() }
+func (s *recordingSink) EmitModule(gpu.GPUModule) error       { return s.errOnly() }
+func (s *recordingSink) EmitEvent(gpu.GPUTimelineEvent) error { return s.errOnly() }
+
+func (s *recordingSink) errOnly() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *recordingSink) launchCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.launches)
+}
+
+// scriptedReader is a batchReader that hands out queued samples and then
+// blocks in Read, exactly like a real ringbuf with nothing to deliver. Close
+// and SetDeadline wake it with the error the real reader would return, and
+// both are safe to call concurrently and more than once — the properties
+// Consumer.Close relies on.
+type scriptedReader struct {
+	recs chan []byte
+	done chan struct{}
+	once sync.Once
+	err  atomic.Value
+}
+
+func newScriptedReader(n int) *scriptedReader {
+	return &scriptedReader{recs: make(chan []byte, n), done: make(chan struct{})}
+}
+
+func (r *scriptedReader) stop(err error) {
+	r.once.Do(func() {
+		r.err.Store(err)
+		close(r.done)
+	})
+}
+
+func (r *scriptedReader) Read() (ringbuf.Record, error) {
+	select {
+	case b := <-r.recs:
+		return ringbuf.Record{RawSample: b}, nil
+	case <-r.done:
+		err, _ := r.err.Load().(error)
+		return ringbuf.Record{}, err
+	}
+}
+
+func (r *scriptedReader) SetDeadline(time.Time) { r.stop(os.ErrDeadlineExceeded) }
+func (r *scriptedReader) Close() error          { r.stop(ringbuf.ErrClosed); return nil }
+
+// oneLaunchBatch builds a wire-format batch carrying a single launch record.
+func oneLaunchBatch(pid uint32, seq uint64) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeLaunch)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], 1)
+	putU64(buf[8:], seq)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], gpuabi.SizeLaunch)
+	return buf
+}
 
 // Cookie values are part of the contract between the Go attach code and the
 // BPF program's record_size switch. A mismatch decodes garbage silently.
@@ -128,10 +211,10 @@ func TestDecodeBatchRejectsCountBeyondPayload(t *testing.T) {
 // and must not hide (spec §6.1).
 func TestSequenceGapsAreCounted(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
-	c.noteSeq(1, 0)
-	c.noteSeq(1, 1)
+	c.noteSeq(1, 100, 0)
+	c.noteSeq(1, 100, 1)
 	assert.Zero(t, c.stats.SequenceGaps)
-	c.noteSeq(1, 5) // 2,3,4 never arrived
+	c.noteSeq(1, 100, 5) // 2,3,4 never arrived
 	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
 }
 
@@ -139,11 +222,55 @@ func TestSequenceGapsAreCounted(t *testing.T) {
 // from another kind's numbering.
 func TestSequenceGapsArePerKind(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
-	c.noteSeq(kindLaunch, 10)
-	c.noteSeq(kindExec, 0)
-	c.noteSeq(kindLaunch, 11)
-	c.noteSeq(kindExec, 1)
+	c.noteSeq(kindLaunch, 100, 10)
+	c.noteSeq(kindExec, 100, 0)
+	c.noteSeq(kindLaunch, 100, 11)
+	c.noteSeq(kindExec, 100, 1)
 	assert.Zero(t, c.stats.SequenceGaps)
+}
+
+// The shim's seq_ counter is per-process, so a system-wide attach
+// (Config.PID == 0) sees one independent stream per profiled process.
+// Merging them into one counter would manufacture phantom gaps — the exact
+// opposite of what SequenceGaps exists to report.
+func TestSequenceGapsArePerProcess(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	// Two processes, each perfectly monotonic, interleaved on the same kind.
+	for seq := uint64(0); seq < 4; seq++ {
+		c.noteSeq(kindLaunch, 111, seq)
+		c.noteSeq(kindLaunch, 222, seq)
+	}
+	assert.Zero(t, c.stats.SequenceGaps, "independent per-PID streams are not gaps")
+
+	// A real gap inside one process is still counted, and only once.
+	c.noteSeq(kindLaunch, 111, 7) // 4,5,6 never arrived
+	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
+	c.noteSeq(kindLaunch, 222, 4) // 222 continues cleanly
+	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
+}
+
+// applyBatch must take the PID from the batch header, not from Config.
+func TestApplyBatchKeepsPerProcessSequencesApart(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	mk := func(pid uint32, seq uint64) batch {
+		buf := make([]byte, 32+48)
+		putU32(buf[0:], kindLaunch)
+		putU32(buf[4:], 1)
+		putU64(buf[8:], seq)
+		putU32(buf[16:], pid)
+		putU64(buf[24:], 48)
+		b, err := decodeBatch(buf)
+		require.NoError(t, err)
+		return b
+	}
+	for seq := uint64(0); seq < 3; seq++ {
+		c.applyBatch(mk(111, seq))
+		c.applyBatch(mk(222, seq))
+	}
+	st := c.Stats()
+	assert.Zero(t, st.SequenceGaps)
+	assert.Equal(t, uint64(6), st.Batches)
+	assert.Equal(t, uint64(6), st.Records)
 }
 
 func TestApplyBatchNormalizesLaunches(t *testing.T) {
@@ -256,4 +383,103 @@ func TestEmbeddedProgramIsUprobeMulti(t *testing.T) {
 	assert.Equal(t, ebpf.Array, spec.Maps["dropped"].Type)
 	assert.Equal(t, uint32(kindMax), spec.Maps["dropped"].MaxEntries,
 		"Go-side kindMax must match KIND_MAX in the BPF program")
+}
+
+// Close is documented to be callable from another goroutine while Run is
+// blocked in Read. Consumer.Close must therefore not clear c.reader, which
+// Run dereferences without holding mu: doing so both races the read and, on
+// the next iteration, dereferences nil.
+func TestCloseWhileRunIsBlockedReturnsWithoutPanic(t *testing.T) {
+	reader := newScriptedReader(4)
+	applied := make(chan struct{}, 4)
+	sink := &recordingSink{onEmit: func() { applied <- struct{}{} }}
+
+	c := newTestConsumer(sink)
+	c.reader = reader
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+
+	// Get Run past its first iteration so a stale reader pointer would be
+	// dereferenced on the next one.
+	reader.recs <- oneLaunchBatch(7, 0)
+	select {
+	case <-applied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run never delivered the first batch")
+	}
+
+	require.NoError(t, c.Close())
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err, "Run returns cleanly when the reader is closed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Close")
+	}
+	assert.Equal(t, 1, sink.launchCount())
+	// Close is idempotent; a second one must not panic either.
+	require.NoError(t, c.Close())
+}
+
+// Run must honour its context: the ringbuf read blocks, so cancellation goes
+// through SetDeadline rather than through Close.
+func TestRunStopsOnContextCancel(t *testing.T) {
+	reader := newScriptedReader(1)
+	c := newTestConsumer(&recordingSink{})
+	c.reader = reader
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+}
+
+// Close and cancellation arriving together is the shape that made the nil
+// assignment unsafe: the AfterFunc closure touches c.reader too. Under -race
+// this fails if Close writes the field.
+func TestConcurrentCloseAndCancelAreSafe(t *testing.T) {
+	reader := newScriptedReader(1)
+	c := newTestConsumer(&recordingSink{})
+	c.reader = reader
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = c.Close() }()
+	go func() { defer wg.Done(); cancel() }()
+	wg.Wait()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+}
+
+// A sample that does not decode is loss and gets counted, not skipped.
+func TestRunCountsMalformedSamples(t *testing.T) {
+	reader := newScriptedReader(2)
+	c := newTestConsumer(&recordingSink{})
+	c.reader = reader
+
+	reader.recs <- make([]byte, batchHdrSize-1) // too short for a header
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+
+	require.Eventually(t, func() bool { return c.Stats().Malformed == 1 },
+		5*time.Second, 5*time.Millisecond)
+	require.NoError(t, c.Close())
+	<-done
 }

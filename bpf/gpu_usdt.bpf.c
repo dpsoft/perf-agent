@@ -24,6 +24,10 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// Slot 0 is not a record kind: it collects drops for kinds this program does
+// not know, so the "no loss is silent" contract has no hole even on a cookie
+// we never installed.
+#define KIND_UNKNOWN 0
 #define KIND_LAUNCH 1
 #define KIND_EXEC   2
 #define KIND_MODULE 3
@@ -59,9 +63,10 @@ struct {
 } events SEC(".maps");
 
 // dropped[kind] counts *records* this program could not deliver: a batch
-// larger than one reservation can hold, a ringbuf that had no room, or a
-// user-memory read that faulted. Spec §6.1 admits no silent loss, so
-// userspace reads this map in Consumer.Stats().
+// larger than one reservation can hold, a ringbuf that had no room, a
+// user-memory read that faulted, or (in slot KIND_UNKNOWN) a probe fire whose
+// attach cookie names no kind this program can size. Spec §6.1 admits no
+// silent loss, so userspace reads this map in Consumer.Stats().
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, KIND_MAX);
@@ -110,8 +115,16 @@ int gpu_usdt_batch(struct pt_regs *ctx)
     __u64 id;
     struct batch_msg *msg;
 
-    if (rsz == 0 || count == 0)
+    if (rsz == 0) {
+        // An attach cookie this program cannot size. Unreachable while Go
+        // only installs cookies 1-4, but this is the one return that would
+        // otherwise discard a batch without counting it. The producer's own
+        // record count is the best size estimate available here.
+        count_drop(KIND_UNKNOWN, count);
         return 0;
+    }
+    if (count == 0)
+        return 0;   // nothing to lose
     if (count > MAX_RECORDS_PER_BATCH) {
         // Truncation is loss. Count the records that will never be copied.
         count_drop(kind, count - MAX_RECORDS_PER_BATCH);

@@ -244,12 +244,18 @@ type GPUModule struct {
 	LoadedNs  uint64    `json:"loaded_ns"`
 }
 
-// GPUPCSample is one program-counter sample with its stall reason, attributed to
-// a kernel launch by correlation ID. Capability-gated: only backends advertising
-// CapabilityPCSampling emit these, so no backend pays for CUPTI's richness.
+// GPUPCSample is one program-counter sample with its stall reason.
+// Capability-gated: only backends advertising CapabilityPCSampling emit these,
+// so no backend pays for CUPTI's richness.
 //
 // PCOffset is an offset within Module, not an absolute address — it means
 // nothing without the module, which is why the two are separate types.
+//
+// Module, not Correlation, is the identity that always arrives. CUPTI populates
+// a PC sample's correlation ID only in kernel-serialized collection, which
+// serializes execution and so is not what we run; in continuous mode it is
+// always zero. Correlation is therefore optional here (zero means unknown) and
+// attribution goes through the module and PC offset.
 type GPUPCSample struct {
 	Correlation CorrelationID `json:"correlation"`
 	Module      ModuleRef     `json:"module"`

@@ -199,11 +199,25 @@ func ValidateSupportedClockDomain(domain ClockDomain) error {
 // LaunchContext carries the host-side context (CPU stack, thread, tags)
 // captured at kernel launch time.
 type LaunchContext struct {
-	PID      uint32            `json:"pid"`
-	TID      uint32            `json:"tid"`
-	TimeNs   uint64            `json:"time_ns"`
-	CPUStack []pp.Frame        `json:"cpu_stack"`
-	Tags     map[string]string `json:"tags"`
+	PID      uint32     `json:"pid"`
+	TID      uint32     `json:"tid"`
+	TimeNs   uint64     `json:"time_ns"`
+	CPUStack []pp.Frame `json:"cpu_stack"`
+	// SamplePeriod is the launch sampler's denominator at the moment this
+	// launch's stack was captured: one launch in SamplePeriod carries a
+	// CPU stack, the rest carry none (shim/core/sampler.h). It travels
+	// with the stack rather than being reconstructed downstream, because
+	// the period can change between runs and even mid-run.
+	//
+	// It is NOT a scale factor to multiply this launch's GPU time by.
+	// Sampling applies to stack *capture* only: every execution is still
+	// measured and joined, so durations stay exact and the sampled and
+	// unsampled populations sum to the true GPU total. The period is
+	// carried through to a per-sample label so a consumer that wants an
+	// extrapolated estimate computes one deliberately, instead of being
+	// handed an estimate dressed up as a measurement.
+	SamplePeriod uint32            `json:"sample_period,omitempty"`
+	Tags         map[string]string `json:"tags"`
 }
 
 // GPUKernelLaunch is emitted when a kernel is submitted for execution.

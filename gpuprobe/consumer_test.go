@@ -3,7 +3,11 @@ package gpuprobe
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,19 +19,32 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	pp "github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 )
+
+// frameNames renders a frame slice as its symbol names, so a test can pin
+// both the frames and their order in one assertion.
+func frameNames(frames []pp.Frame) []string {
+	out := make([]string, 0, len(frames))
+	for _, f := range frames {
+		out = append(out, f.Name)
+	}
+	return out
+}
 
 func putU32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
 func putU64(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
 
 // newTestConsumer builds a Consumer with no BPF objects attached: every test
 // below exercises decode/accounting only, so nothing here needs privileges.
+// It goes through newConsumer, the same constructor Attach uses, so the side
+// tables a Consumer needs can never be initialized in only one of the two
+// paths.
 func newTestConsumer(sink gpu.EventSink) *Consumer {
-	return &Consumer{
-		cfg:         Config{Backend: gpu.BackendCUPTI, Sink: sink},
-		seqByStream: map[seqKey]uint64{},
-	}
+	return newConsumer(Config{Backend: gpu.BackendCUPTI, Sink: sink})
 }
 
 // recordingSink captures what the consumer normalized, and can be told to
@@ -315,6 +332,11 @@ func TestApplyBatchNormalizesLaunches(t *testing.T) {
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
 	c.applyBatch(b)
+	// A correlated launch is held briefly in case its sampled twin is the
+	// next ringbuf sample (see sampledstacks.go). Flush ends that wait; it
+	// is what Run does on the way out and what Close does, so this asserts
+	// the same launch any caller sees.
+	c.Flush()
 
 	require.Len(t, sink.launches, 1)
 	got := sink.launches[0]
@@ -560,6 +582,11 @@ func TestZeroWireCorrelationBecomesTheZeroCorrelationID(t *testing.T) {
 	b, err := decodeBatch(buf)
 	require.NoError(t, err)
 	c.applyBatch(b)
+	// The uncorrelated launch goes out immediately - it can never be paired
+	// with a sampled stack - while the correlated one waits for a possible
+	// twin until Flush. Arrival order survives that split, which is what the
+	// index-based assertions below rely on.
+	c.Flush()
 
 	require.Len(t, sink.launches, 2)
 	assert.Equal(t, gpu.CorrelationID{}, sink.launches[0].Correlation,
@@ -849,4 +876,506 @@ func TestAStackFailureIsCountedOncePerBatch(t *testing.T) {
 	st := c.Stats()
 	assert.Equal(t, uint64(1), st.StacksMissing, "one batch, one capture, one failure")
 	assert.Equal(t, uint64(3), st.SampledLaunches)
+}
+
+// --- Phase 4a: resolving a capture and getting it onto the right launch ---
+
+// fakeStackmap is a stackStore: the seam that stands in for the BPF
+// stackmap, which cannot be created without CAP_BPF. It records deletions
+// because deleting a consumed entry is load-bearing, not housekeeping - see
+// Consumer.freeStackLocked.
+type fakeStackmap struct {
+	entries   map[uint32][]byte
+	deleted   []uint32
+	lookups   int
+	lookupErr error
+	deleteErr error
+}
+
+func newFakeStackmap() *fakeStackmap {
+	return &fakeStackmap{entries: map[uint32][]byte{}}
+}
+
+// put stores a stack as the kernel would: little-endian u64 instruction
+// pointers, leaf first, in a fixed-size buffer that the first zero slot
+// terminates.
+func (f *fakeStackmap) put(id uint32, ips ...uint64) {
+	buf := make([]byte, bpfstack.MaxFrames*8)
+	for i, ip := range ips {
+		putU64(buf[i*8:], ip)
+	}
+	f.entries[id] = buf
+}
+
+func (f *fakeStackmap) LookupBytes(key any) ([]byte, error) {
+	f.lookups++
+	if f.lookupErr != nil {
+		return nil, f.lookupErr
+	}
+	raw, ok := f.entries[key.(uint32)]
+	if !ok {
+		return nil, ebpf.ErrKeyNotExist
+	}
+	return raw, nil
+}
+
+func (f *fakeStackmap) Delete(key any) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	id := key.(uint32)
+	if _, ok := f.entries[id]; !ok {
+		return ebpf.ErrKeyNotExist
+	}
+	delete(f.entries, id)
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
+func (f *fakeStackmap) wasDeleted(id uint32) bool {
+	return slices.Contains(f.deleted, id)
+}
+
+// fakeSymbolizer names each IP "fn_<hex>" so a test can assert both the
+// frames and their order without a real symbolizer or a real process.
+type fakeSymbolizer struct {
+	err  error
+	pids []uint32
+	ips  [][]uint64
+}
+
+func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Frame, error) {
+	s.pids = append(s.pids, pid)
+	s.ips = append(s.ips, slices.Clone(ips))
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make([]symbolize.Frame, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, symbolize.Frame{Address: ip, Name: fmt.Sprintf("fn_%x", ip)})
+	}
+	return out, nil
+}
+
+func (s *fakeSymbolizer) Close() error { return nil }
+
+// stackConsumer wires a consumer to a fake stackmap and symbolizer.
+func stackConsumer(t *testing.T, sink gpu.EventSink, cfg Config) (*Consumer, *fakeStackmap, *fakeSymbolizer) {
+	t.Helper()
+	sm, sym := newFakeStackmap(), &fakeSymbolizer{}
+	cfg.Backend, cfg.Sink = gpu.BackendCUPTI, sink
+	if cfg.Symbolizer == nil {
+		cfg.Symbolizer = sym
+	}
+	c := newConsumer(cfg)
+	c.stacks = sm
+	return c, sm, sym
+}
+
+// launchBatchWith builds a launch batch carrying the given correlations, in
+// order, all from one pid.
+func launchBatchWith(pid uint32, corrs ...uint64) []byte {
+	buf := make([]byte, batchHdrSize+len(corrs)*gpuabi.SizeLaunch)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], uint32(len(corrs)))
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(len(corrs)*gpuabi.SizeLaunch))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1 on every non-sampled kind
+	for i, corr := range corrs {
+		rec := buf[batchHdrSize+i*gpuabi.SizeLaunch:]
+		putU64(rec[0:], corr)
+		putU64(rec[32:], uint64(100+i)) // time_ns
+	}
+	return buf
+}
+
+// sampledBatchWith is sampledBatch with the correlation and pid under the
+// test's control.
+func sampledBatchWith(pid uint32, corr uint64, stackID int32, period uint32) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeLaunchSampled)
+	putU32(buf[0:], kindLaunchSampled)
+	putU32(buf[4:], 1)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(gpuabi.SizeLaunchSampled))
+	putU32(buf[32:], uint32(stackID))
+	putU64(buf[batchHdrSize:], corr)
+	putU32(buf[batchHdrSize+44:], period)
+	return buf
+}
+
+func apply(t *testing.T, c *Consumer, wire []byte) {
+	t.Helper()
+	b, err := decodeBatch(wire)
+	require.NoError(t, err)
+	c.applyBatch(b)
+}
+
+// The common arrival order: the shim's launch batch only flushes when it
+// fills, so the unbatched sampled record for a launch usually reaches the
+// ringbuf well before the batched record for that same launch. The resolved
+// stack waits for its twin and rides out on it.
+//
+// The frames must come out root-first (main, then the launch site), because
+// the gpu projection nests [gpu:launch] and the kernel frame underneath
+// them. ToProfFrames returns leaf-first, so a missing reverse would invert
+// every GPU flame graph - visible here as fn_2000 leading.
+func TestSampledStackArrivingFirstAttachesToTheBatchedLaunch(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, sym := stackConsumer(t, sink, Config{})
+	sm.put(5, 0x2000, 0x1000) // leaf first, as the kernel stores it
+
+	apply(t, c, sampledBatchWith(4242, 7, 5, 8))
+	assert.Zero(t, sink.launchCount(), "a sampled record is not a launch of its own")
+
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	require.Len(t, sink.launches, 1, "one launch in, one launch out - the sampled twin is not a second launch")
+	got := sink.launches[0]
+	assert.Equal(t, []string{"fn_1000", "fn_2000"}, frameNames(got.Launch.CPUStack),
+		"frames must be root-first; leaf-first would invert every GPU flame graph")
+	assert.Equal(t, uint32(8), got.Launch.SamplePeriod,
+		"the period travels with the stack, so a consumer never has to reconstruct it")
+	assert.Equal(t, []uint32{4242}, sym.pids, "symbolization is against the launching process")
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksResolved)
+	assert.Equal(t, uint64(1), st.StacksAttached)
+	assert.Zero(t, st.PendingStacks, "the parked stack must be taken, not left behind")
+	assert.True(t, sm.wasDeleted(5), "a consumed stackmap entry must be freed")
+}
+
+// The other arrival order, which happens whenever the launch that fills the
+// shim's batch is also the one the sampler picked: the flush is queued
+// inside the add() that precedes the sampler check, so the batched record
+// reaches the ringbuf first. The launch waits for the twin already on its
+// way, then goes out once - with its stack.
+func TestBatchedLaunchArrivingFirstWaitsForItsStack(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(9, 0x3000)
+
+	apply(t, c, launchBatchWith(4242, 7))
+	assert.Zero(t, sink.launchCount(), "a correlated launch waits briefly for a possible sampled twin")
+	assert.Equal(t, 1, c.Stats().PendingLaunches, "held launches are visible, not invisible")
+
+	apply(t, c, sampledBatchWith(4242, 7, 9, 4))
+	require.Len(t, sink.launches, 1, "the launch goes out exactly once, whichever half arrived first")
+	assert.Equal(t, []string{"fn_3000"}, frameNames(sink.launches[0].Launch.CPUStack))
+	assert.Equal(t, uint32(4), sink.launches[0].Launch.SamplePeriod)
+	assert.Zero(t, c.Stats().PendingLaunches, "a paired launch is released, not left held")
+
+	c.Flush()
+	assert.Len(t, sink.launches, 1, "flushing must not emit the paired launch a second time")
+}
+
+// The sampled record shares its correlation with the batched one, so
+// emitting it as a launch would give the timeline two launches for one -
+// and timeline.go has no dedup that would catch it. Nothing but the stack
+// may cross over.
+func TestSampledRecordIsNeverEmittedAsItsOwnLaunch(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	c.Flush()
+
+	assert.Zero(t, sink.launchCount(), "the sampled record must never reach the sink as a launch")
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.SampledLaunches)
+	assert.Equal(t, 1, st.PendingStacks, "its stack waits for the batched twin instead")
+}
+
+// The rule the whole design exists to protect: a launch the sampler did not
+// pick has no CPU call path, and must not be handed one. Here two launches
+// arrive in the same batch and only the first was sampled.
+func TestUnsampledLaunchNeverBorrowsASampledSiblingsStack(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(3, 0x1000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 3, 8))
+	apply(t, c, launchBatchWith(4242, 7, 8))
+	c.Flush()
+
+	require.Len(t, sink.launches, 2)
+	assert.Equal(t, []string{"fn_1000"}, frameNames(sink.launches[0].Launch.CPUStack))
+	assert.Empty(t, sink.launches[1].Launch.CPUStack,
+		"the unsampled sibling must project as unattributed, not under a borrowed call path")
+	assert.Zero(t, sink.launches[1].Launch.SamplePeriod,
+		"a period with no stack would advertise attribution that does not exist")
+}
+
+// A held launch is waiting for a record that would be the next ringbuf
+// sample. Anything else arriving ends the wait: launches must not sit
+// behind an exec batch, because the timeline joins executions against
+// launches it has already been given.
+func TestAnyOtherBatchReleasesHeldLaunches(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	apply(t, c, launchBatchWith(4242, 7))
+	require.Zero(t, sink.launchCount())
+
+	buf := make([]byte, batchHdrSize+gpuabi.SizeExec)
+	putU32(buf[0:], kindExec)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], gpuabi.SizeExec)
+	putU64(buf[batchHdrSize:], 7)
+	apply(t, c, buf)
+
+	assert.Equal(t, 1, sink.launchCount(), "an exec batch means the sampled twin is not coming")
+	assert.Zero(t, c.Stats().PendingLaunches)
+}
+
+// The side table is fed by a profiled application, so it must be bounded -
+// and what it pushes out must be counted, because an evicted stack is
+// attribution that silently never arrives otherwise. The launch itself is
+// untouched: it still ships, without a stack.
+func TestParkedStacksAreBoundedAndEvictionsCounted(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{SampledStackCapacity: 2})
+	for id := uint32(1); id <= 3; id++ {
+		sm.put(id, 0x1000+uint64(id))
+		apply(t, c, sampledBatchWith(4242, uint64(id), int32(id), 8))
+	}
+
+	st := c.Stats()
+	assert.Equal(t, 2, st.PendingStacks, "the table must not grow past its bound")
+	assert.Equal(t, uint64(1), st.StacksEvicted, "an evicted stack is counted, never silent")
+	assert.Equal(t, uint64(3), st.StacksResolved)
+
+	// Correlation 1 is the one that was pushed out: its launch still
+	// arrives, and arrives without a stack rather than with someone else's.
+	apply(t, c, launchBatchWith(4242, 1))
+	c.Flush()
+	require.Len(t, sink.launches, 1)
+	assert.Empty(t, sink.launches[0].Launch.CPUStack)
+}
+
+// Holding launches is bounded too, but the bound must never become loss:
+// pushing past it releases the oldest held launch to the sink rather than
+// dropping it.
+func TestHeldLaunchesAreBoundedAndNeverDropped(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{DeferredLaunchCapacity: 2})
+
+	apply(t, c, launchBatchWith(4242, 1, 2, 3, 4, 5))
+	assert.Equal(t, 3, sink.launchCount(), "the three oldest are released to make room, not discarded")
+	assert.Equal(t, 2, c.Stats().PendingLaunches)
+
+	c.Flush()
+	require.Len(t, sink.launches, 5, "every launch reaches the sink exactly once")
+	for i, l := range sink.launches {
+		assert.Equal(t, strconv.Itoa(i+1), l.Correlation.Value, "arrival order is preserved")
+	}
+}
+
+// Deletion is what keeps capture working, not tidiness: bpf_get_stackid is
+// called without BPF_F_REUSE_STACKID, so a bucket holding a live entry
+// answers -EEXIST. Nothing else ever removes an entry, so without this the
+// map fills and every later capture fails - and reads as a broken capture
+// path rather than a full map. The entry must be freed on every outcome,
+// including the ones where its contents are never used.
+func TestStackmapEntriesAreFreedOnEveryOutcome(t *testing.T) {
+	t.Run("resolved", func(t *testing.T) {
+		c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+		sm.put(1, 0x1000)
+		apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+		assert.True(t, sm.wasDeleted(1))
+	})
+	t.Run("uncorrelated", func(t *testing.T) {
+		c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+		sm.put(2, 0x1000)
+		apply(t, c, sampledBatchWith(4242, 0, 2, 8))
+		assert.True(t, sm.wasDeleted(2), "an unpairable capture still owns its slot")
+		assert.Equal(t, uint64(1), c.Stats().StacksUncorrelated)
+	})
+	t.Run("symbolization failed", func(t *testing.T) {
+		sym := &fakeSymbolizer{err: errors.New("no symbols")}
+		c, sm, _ := stackConsumer(t, &recordingSink{}, Config{Symbolizer: sym})
+		sm.put(3, 0x1000)
+		apply(t, c, sampledBatchWith(4242, 7, 3, 8))
+		assert.True(t, sm.wasDeleted(3), "a slot whose contents could not be symbolized is still consumed")
+	})
+	t.Run("no entry to free", func(t *testing.T) {
+		c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+		apply(t, c, sampledBatchWith(4242, 7, 99, 8))
+		assert.Empty(t, sm.deleted)
+		assert.Equal(t, uint64(1), c.Stats().StackLookupFailed)
+	})
+}
+
+// A delete that fails is the leading indicator of the map filling up, so it
+// is counted rather than ignored.
+func TestStackDeleteFailureIsCounted(t *testing.T) {
+	c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+	sm.put(1, 0x1000)
+	sm.deleteErr = errors.New("permission denied")
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	assert.Equal(t, uint64(1), c.Stats().StackDeleteFailed)
+	assert.Equal(t, uint64(1), c.Stats().StacksResolved, "the capture still resolved; only the free failed")
+}
+
+// bpf_get_stackid is content-addressed: two launches from the same call
+// site in flight at once carry the same stack id, and the first resolution
+// deletes the entry. The second finds nothing. That is real attribution
+// loss and it is counted - the alternative, serving cached frames for an id
+// that a different stack may since have taken, would attribute GPU time to
+// a call path that did not produce it.
+func TestTwoCapturesSharingAStackIDLoseTheSecondVisibly(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, sampledBatchWith(4242, 8, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7, 8))
+	c.Flush()
+
+	require.Len(t, sink.launches, 2)
+	assert.Equal(t, []string{"fn_1000"}, frameNames(sink.launches[0].Launch.CPUStack))
+	assert.Empty(t, sink.launches[1].Launch.CPUStack)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StackLookupFailed, "the second capture's loss is counted")
+	assert.Equal(t, uint64(2), st.SampledLaunches)
+}
+
+// A symbolization failure must cost the stack, never the launch: the launch
+// still reaches the sink, where it projects as unattributed GPU time
+// instead of vanishing from the profile.
+func TestSymbolizationFailureDegradesToNoStackNotALostLaunch(t *testing.T) {
+	sink := &recordingSink{}
+	sym := &fakeSymbolizer{err: errors.New("blazesym: no such process")}
+	c, sm, _ := stackConsumer(t, sink, Config{Symbolizer: sym})
+	sm.put(1, 0x1000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	require.Len(t, sink.launches, 1, "the launch survives its stack")
+	assert.Empty(t, sink.launches[0].Launch.CPUStack)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.SymbolizeFailed)
+	assert.Zero(t, st.StacksResolved)
+	assert.Zero(t, st.StacksAttached)
+}
+
+// A consumer configured without a Symbolizer still delivers every launch;
+// what it cannot do is attribute them, and that is counted rather than
+// looking like a producer that never sampled anything.
+func TestMissingSymbolizerIsCountedNotSilent(t *testing.T) {
+	sink := &recordingSink{}
+	c := newConsumer(Config{Backend: gpu.BackendCUPTI, Sink: sink})
+	sm := newFakeStackmap()
+	sm.put(1, 0x1000)
+	c.stacks = sm
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+
+	require.Len(t, sink.launches, 1)
+	assert.Empty(t, sink.launches[0].Launch.CPUStack)
+	assert.Equal(t, uint64(1), c.Stats().SymbolizeFailed)
+}
+
+// An entry that reads back with no instruction pointers yields no stack,
+// and says so.
+func TestEmptyStackEntryIsCountedAsALookupFailure(t *testing.T) {
+	c, sm, _ := stackConsumer(t, &recordingSink{}, Config{})
+	sm.put(1) // present, but zero-terminated at the first slot
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	assert.Equal(t, uint64(1), c.Stats().StackLookupFailed)
+	assert.Zero(t, c.Stats().StacksResolved)
+}
+
+// Every sampled launch ends in exactly one bucket, and the buckets add up.
+// A reader who cannot reconcile the counters cannot tell a quiet producer
+// from a consumer quietly losing captures, which is the whole point of §6.1
+// accounting.
+func TestSampledStackAccountingReconciles(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{SampledStackCapacity: 1})
+
+	sm.put(1, 0x1000) // resolves, then parks
+	sm.put(2, 0x2000) // resolves, parks, evicting the first
+	sm.put(3, 0x3000) // resolves and attaches to a held launch
+	apply(t, c, sampledBatchWith(4242, 1, 1, 8))
+	apply(t, c, sampledBatchWith(4242, 2, 2, 8))
+	apply(t, c, launchBatchWith(4242, 3))
+	apply(t, c, sampledBatchWith(4242, 3, 3, 8))
+	apply(t, c, sampledBatchWith(4242, 4, -1, 8))  // capture failed
+	apply(t, c, sampledBatchWith(4242, 0, 5, 8))   // no correlation
+	apply(t, c, sampledBatchWith(4242, 6, 404, 8)) // no such entry
+	c.Flush()
+
+	st := c.Stats()
+	assert.Equal(t, uint64(6), st.SampledLaunches)
+	assert.Equal(t, st.SampledLaunches,
+		st.StacksMissing+st.StacksUncorrelated+st.StackLookupFailed+st.SymbolizeFailed+st.StacksResolved,
+		"every sampled launch must land in exactly one bucket")
+	assert.Equal(t, st.StacksResolved,
+		st.StacksAttached+st.StacksEvicted+uint64(st.PendingStacks),
+		"every resolved stack is attached, evicted, or still waiting - nothing else")
+}
+
+// Run must release what it is holding on the way out, so a caller can
+// cancel, wait for Run, and take a complete Snapshot without closing the
+// consumer.
+func TestRunReleasesHeldLaunchesWhenItReturns(t *testing.T) {
+	reader := newScriptedReader(1)
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+	c.reader = reader
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	reader.recs <- launchBatchWith(4242, 7)
+	// Wait for the batch to be applied: it is held, not emitted, so the
+	// sink cannot signal it. The pending gauge can.
+	require.Eventually(t, func() bool { return c.Stats().PendingLaunches == 1 },
+		5*time.Second, time.Millisecond, "Run never applied the launch batch")
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	assert.Equal(t, 1, sink.launchCount(), "a held launch must not wait for Close to be delivered")
+	assert.Zero(t, c.Stats().PendingLaunches)
+}
+
+// Close is the last chance: whatever is still held goes to the sink rather
+// than being dropped at teardown.
+func TestCloseReleasesHeldLaunches(t *testing.T) {
+	sink := &recordingSink{}
+	c, _, _ := stackConsumer(t, sink, Config{})
+	c.reader = newScriptedReader(0)
+
+	apply(t, c, launchBatchWith(4242, 7))
+	require.Zero(t, sink.launchCount())
+
+	require.NoError(t, c.Close())
+	assert.Equal(t, 1, sink.launchCount(), "a launch held at teardown would be silent record loss")
+}
+
+// A sink that rejects a held launch is still a rejection that must be
+// counted when the launch is finally released.
+func TestSinkRejectionOfAReleasedLaunchIsCounted(t *testing.T) {
+	sink := &recordingSink{err: errors.New("full")}
+	c, _, _ := stackConsumer(t, sink, Config{})
+
+	apply(t, c, launchBatchWith(4242, 7))
+	c.Flush()
+	assert.Equal(t, uint64(1), c.Stats().SinkRejected)
 }

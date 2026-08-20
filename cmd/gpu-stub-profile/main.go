@@ -12,16 +12,27 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/symbolize"
 )
 
 func main() {
 	const stub = "./shim/perfagent-gpu-stub"
 
 	timeline := gpu.NewTimeline(gpu.TimelineConfig{})
+	// Without a symbolizer the sampled launch stacks still arrive and are
+	// still accounted for, but every one of them degrades to no stack — the
+	// profile would then be honest and useless, all GPU time unattributed.
+	sym, err := symbolize.NewLocalSymbolizer()
+	if err != nil {
+		log.Fatalf("symbolizer: %v", err)
+	}
+	defer func() { _ = sym.Close() }()
+
 	c, err := gpuprobe.Attach(gpuprobe.Config{
-		ShimPath: stub,
-		Backend:  gpu.GPUBackendID("stub"),
-		Sink:     timeline,
+		ShimPath:   stub,
+		Backend:    gpu.GPUBackendID("stub"),
+		Sink:       timeline,
+		Symbolizer: sym,
 	})
 	if err != nil {
 		log.Fatalf("attach: %v", err)
@@ -44,6 +55,11 @@ func main() {
 	// drain it, not for the stub.
 	time.Sleep(500 * time.Millisecond)
 	cancel()
+	// Release any launch still being held for a sampled twin before the
+	// snapshot: held launches are not lost, but a snapshot taken without
+	// this would be missing the most recent ones and their executions would
+	// read as unmatched.
+	c.Flush()
 
 	snap := timeline.Snapshot()
 	samples := gpu.ProjectExecutions(snap)

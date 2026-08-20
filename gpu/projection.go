@@ -105,6 +105,16 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 // unattributed as an execution that joined no launch at all, and both must
 // project the same way. Deciding this from SamplePeriod instead would claim
 // attribution for a sampled launch whose capture failed.
+//
+// "Carried no stack" also covers a capture the consumer refused
+// to attach because it never left the profiler's own injected module - a
+// frame-pointer walk that died inside the vendor libraries and came back
+// holding nothing but the adapter's own callback (gpuprobe.shimScope,
+// counted as gpuprobe.Stats.StacksProfilerOnly). That judgement needs to
+// know which module is the profiler's and which deployment shape it is in,
+// which is vendor- and deployment-specific knowledge this package
+// deliberately does not hold. It is made where that knowledge lives, and
+// arrives here as what it is: a launch with no stack.
 func sampledStack(view ExecutionView) ([]pp.Frame, bool) {
 	if view.Launch == nil || len(view.Launch.Launch.CPUStack) == 0 {
 		return nil, false

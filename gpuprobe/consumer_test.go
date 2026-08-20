@@ -1557,8 +1557,10 @@ func TestSampledStackAccountingReconciles(t *testing.T) {
 		st.StacksMissing+st.StacksUncorrelated+st.StackLookupFailed+st.SymbolizeFailed+st.StacksResolved,
 		"every sampled launch must land in exactly one bucket")
 	assert.Equal(t, st.StacksResolved,
-		st.StacksAttached+st.StacksEvicted+uint64(st.PendingStacks),
-		"every resolved stack is attached, evicted, or still waiting - nothing else")
+		st.StacksAttached+st.StacksEvicted+st.StacksProfilerOnly+uint64(st.PendingStacks),
+		"every resolved stack is attached, evicted, refused as profiler-only, or still waiting - nothing else")
+	assert.LessOrEqual(t, st.StacksProfilerOnlyUncertain, st.StacksProfilerOnly,
+		"the uncertain count is a subset of the refusals, never a bucket of its own")
 }
 
 // Run must release what it is holding on the way out, so a caller can

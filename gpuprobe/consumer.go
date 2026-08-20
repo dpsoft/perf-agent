@@ -269,7 +269,8 @@ type Stats struct {
 	//
 	//	SampledLaunches = StacksMissing + StacksUncorrelated +
 	//	                  StackLookupFailed + SymbolizeFailed + StacksResolved
-	//	StacksResolved  = StacksAttached + StacksEvicted + PendingStacks
+	//	StacksResolved  = StacksAttached + StacksEvicted +
+	//	                  StacksProfilerOnly + PendingStacks
 	//
 	// (the second identity holds at rest; PendingStacks is a gauge). Both
 	// are asserted by TestSampledStackAccountingReconciles.
@@ -348,6 +349,37 @@ type Stats struct {
 	// small for the in-flight window. It is attribution loss, not record
 	// loss: the launches themselves are unaffected.
 	StacksEvicted uint64
+	// StacksProfilerOnly counts resolved captures the consumer refused to
+	// attach because the walk never left the profiler's own injected shim:
+	// every frame it produced lies inside the .so carrying the probes, so
+	// the stack says where the profiler was, not where the application was.
+	//
+	// This is attribution loss, not record loss - the launch is delivered
+	// without a stack and its execution's measured GPU time projects as
+	// [gpu:launch unsampled], the same bucket as a launch the sampler never
+	// picked. The counter exists because the alternative is what a real
+	// CUPTI run produced: 100% of the attributed GPU time nested under the
+	// adapter's own callback frame, stated as confidently as a true
+	// attribution. A profiler that cannot see the application must say so.
+	//
+	// Zero by construction for a self-contained producer such as shim/stub,
+	// where the shim IS the program and there is no boundary to cross. See
+	// shimScope for how the two deployment shapes are told apart.
+	StacksProfilerOnly uint64
+	// StacksProfilerOnlyUncertain is the SUBSET of StacksProfilerOnly
+	// rejected without proof: no frame was provably outside the shim, but at
+	// least one frame's module was unknown (the symbolizer named the frame
+	// after its own address, or resolved it without a module), so the stack
+	// might have reached the application and been unnameable rather than
+	// never having got there.
+	//
+	// It is a subset, deliberately not additive with StacksProfilerOnly, so
+	// the reconciliation identity above stays a partition. It separates the
+	// two ways this guard can be wrong: the certain rejections are the bug
+	// it was built for, while a rising uncertain count means symbolization
+	// is failing to name modules and the guard is paying for it in lost
+	// attribution.
+	StacksProfilerOnlyUncertain uint64
 	// KernelNamesLearned counts gpu_kernel_name_v1 records interned. The
 	// producer replays its whole table on late attach, so a name may be
 	// learned more than once for the same kernel; this counts records, not
@@ -513,6 +545,12 @@ type Consumer struct {
 	deferred    *deferredLaunches
 	names       *kernelNameTable
 	unnamed     *pendingNames
+	// shim is the attribution guard's view of what the consumer attached
+	// to: whether the shim is an injected library or the program itself,
+	// and which module paths are the shim's own. Immutable after
+	// newConsumer; see shimScope.
+	shim shimScope
+
 	// sawKernelName records whether this producer emits kernel names at
 	// all. Holding an event for a name that is never coming would delay
 	// every event a producer without the name probe ever sends, so nothing
@@ -531,6 +569,7 @@ type Consumer struct {
 func newConsumer(cfg Config) *Consumer {
 	return &Consumer{
 		cfg:         cfg,
+		shim:        newShimScope(cfg.ShimPath),
 		seqByStream: map[seqKey]uint64{},
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
@@ -972,6 +1011,22 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 		return // counted inside resolveStackLocked
 	}
 	c.stats.StacksResolved++
+
+	// A stack that never left the profiler's own injected module is not an
+	// attribution, and attaching it would hand this launch's measured GPU
+	// time to a call path inside the profiler. Withhold it: the launch ships
+	// stackless and projects as unattributed, exactly as if the sampler had
+	// never picked it. See shimScope for the rule and its failure modes.
+	switch c.shim.verdict(frames) {
+	case stackProfilerOnlyUncertain:
+		c.stats.StacksProfilerOnlyUncertain++
+		c.stats.StacksProfilerOnly++
+		return
+	case stackProfilerOnly:
+		c.stats.StacksProfilerOnly++
+		return
+	case stackAttributable:
+	}
 
 	// Keyed on (pid, correlation), never correlation alone: see launchKey.
 	// pid is the batch header's, i.e. the process that fired the probe, which

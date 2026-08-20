@@ -40,7 +40,9 @@ func main() {
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		if err := c.Run(ctx); err != nil {
 			log.Printf("consumer: %v", err)
 		}
@@ -55,10 +57,22 @@ func main() {
 	// drain it, not for the stub.
 	time.Sleep(500 * time.Millisecond)
 	cancel()
+	// Wait for Run to actually return before flushing or snapshotting:
+	// cancelling only asks the reader to stop, it does not block until it
+	// has. Flushing (or reading the timeline) while Run is still applying a
+	// batch races the consumer's own goroutine and can snapshot mid-batch -
+	// c.Flush() and Run's own deferred Flush would then interleave with
+	// applyBatch under the same mutex but in an order this caller cannot
+	// predict, and the snapshot below could be taken before the last batch
+	// landed.
+	<-done
 	// Release any launch still being held for a sampled twin before the
 	// snapshot: held launches are not lost, but a snapshot taken without
 	// this would be missing the most recent ones and their executions would
-	// read as unmatched.
+	// read as unmatched. Run's own deferred Flush already did this once Run
+	// returned; calling it again here is idempotent (there is nothing left
+	// to release) and keeps this call site correct even if Run's internals
+	// ever change.
 	c.Flush()
 
 	snap := timeline.Snapshot()

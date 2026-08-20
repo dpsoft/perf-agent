@@ -4,8 +4,25 @@ import (
 	"fmt"
 	"maps"
 	"math/bits"
+	"strconv"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
+)
+
+// FrameLaunch is the boundary marker under a launch whose real CPU call
+// path is known, i.e. one the launch sampler selected for stack capture.
+// FrameLaunchUnsampled is the marker for an execution whose launch carried
+// no stack - because the launch was not sampled, because the capture or its
+// symbolization failed, or because no launch joined at all.
+//
+// They are deliberately two different frames rather than one marker plus a
+// label: the frame is what a flame graph nests on, so the attributed and
+// unattributed populations must be separable by *shape*, not only by a
+// label a viewer may never render. An unsampled execution never borrows a
+// sampled sibling's call path - see projectionFrames.
+const (
+	FrameLaunch          = "[gpu:launch]"
+	FrameLaunchUnsampled = "[gpu:launch unsampled]"
 )
 
 // ProjectExecutions turns a joined Snapshot into pprof samples.
@@ -17,6 +34,27 @@ import (
 // identity (the per-sample PC, stall reason, queue/device/correlation, and
 // the launch's tags) goes into per-sample labels instead. Two PC samples
 // from the same kernel therefore share one stack and differ only by label.
+//
+// Sampling and honesty. Launch stacks are sampled (one launch in
+// LaunchContext.SamplePeriod carries one), but executions are not: every
+// execution is recorded and joined, so its duration is measured, not
+// estimated. What sampling costs is the *attribution* of that duration to a
+// CPU call path. This function therefore projects two populations and never
+// scales either one:
+//
+//   - an execution whose launch carried a sampled stack projects as
+//     <real CPU stack> -> [gpu:launch] -> [gpu:kernel:<name>], with its own
+//     duration as the value and gpu_sample_period as a label;
+//   - an execution with no stack projects as
+//     [gpu:launch unsampled] -> [gpu:kernel:<name>], again with its own
+//     duration.
+//
+// The two populations sum to exactly the measured GPU total. Multiplying
+// the sampled population by SamplePeriod would turn a measurement into an
+// estimate and present it as fact - the same dishonesty this package
+// already refuses for heuristic joins, which are labelled rather than
+// silently promoted to exact. The period rides along as a label so a
+// consumer that wants the extrapolation computes it deliberately.
 func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 	samples := make([]pp.ProfileSample, 0, len(snap.Executions))
 	for _, view := range snap.Executions {
@@ -60,16 +98,38 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 	return samples
 }
 
-// projectionFrames builds the frame slice: the launch's real CPU stack (if
-// any), the [gpu:launch] boundary, then the kernel frame. Nothing else - not
-// the PC, not the stall reason, not the queue/device/correlation - belongs
-// here; those go through projectionLabels instead.
+// sampledStack returns the launch's captured CPU stack, and whether there is
+// one. It is the single definition of "this execution's time is attributable
+// to a call path": a launch that joined but carried no stack (not sampled,
+// or a capture/symbolization failure the consumer counted) is exactly as
+// unattributed as an execution that joined no launch at all, and both must
+// project the same way. Deciding this from SamplePeriod instead would claim
+// attribution for a sampled launch whose capture failed.
+func sampledStack(view ExecutionView) ([]pp.Frame, bool) {
+	if view.Launch == nil || len(view.Launch.Launch.CPUStack) == 0 {
+		return nil, false
+	}
+	return view.Launch.Launch.CPUStack, true
+}
+
+// projectionFrames builds the frame slice: the launch's real CPU stack when
+// one was sampled, the boundary marker, then the kernel frame. Nothing else
+// - not the PC, not the stall reason, not the queue/device/correlation -
+// belongs here; those go through projectionLabels instead.
+//
+// An execution with no stack gets [gpu:launch unsampled] and nothing above
+// it. It must never be given a stack from anywhere else: the sampled
+// population's call paths belong to the specific launches that were
+// sampled, and lending one to a sibling would put measured GPU time under a
+// call path that provably did not produce it.
 func projectionFrames(view ExecutionView) []pp.Frame {
 	var frames []pp.Frame
-	if view.Launch != nil {
-		frames = append(frames, view.Launch.Launch.CPUStack...)
+	if stack, ok := sampledStack(view); ok {
+		frames = append(frames, stack...)
+		frames = append(frames, pp.FrameFromName(FrameLaunch))
+	} else {
+		frames = append(frames, pp.FrameFromName(FrameLaunchUnsampled))
 	}
-	frames = append(frames, pp.FrameFromName("[gpu:launch]"))
 	if view.Exec.KernelName != "" {
 		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:kernel:%s]", view.Exec.KernelName)))
 	}
@@ -154,6 +214,16 @@ func projectionLabels(view ExecutionView) map[string]string {
 	}
 	if view.Ambiguous {
 		labels["gpu_ambiguous"] = "true"
+	}
+	// gpu_sample_period rides only on the population that actually carries a
+	// sampled stack, and only when the producer declared a period. It is the
+	// denominator a consumer needs to extrapolate "sampled GPU time" to "all
+	// GPU time attributable to this call path" - an estimate this package
+	// refuses to compute on the reader's behalf, because the value beside it
+	// is a measured duration and silently mixing the two would make the
+	// estimate indistinguishable from the measurement.
+	if _, ok := sampledStack(view); ok && view.Launch.Launch.SamplePeriod > 0 {
+		labels["gpu_sample_period"] = strconv.FormatUint(uint64(view.Launch.Launch.SamplePeriod), 10)
 	}
 	return labels
 }

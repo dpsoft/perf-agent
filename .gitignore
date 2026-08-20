@@ -79,6 +79,8 @@ pmu.txt
 
 ### Project binaries ###
 perf-agent
+# GPU shim stub executable (the .so/.a/.o forms are covered above)
+shim/perfagent-gpu-stub
 bench/cmd/scenario/scenario
 bench/cmd/report/report
 

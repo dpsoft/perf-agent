@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -278,8 +279,9 @@ func TestProjectionHandlesUnmatchedExecution(t *testing.T) {
 
 	samples := ProjectExecutions(tl.Snapshot())
 	require.Len(t, samples, 1)
-	assert.Equal(t, []string{"[gpu:launch]", "[gpu:kernel:k_ghost]"}, frameNames(samples[0].Stack),
-		"an execution with no launch still projects, without a fabricated CPU stack")
+	assert.Equal(t, []string{"[gpu:launch unsampled]", "[gpu:kernel:k_ghost]"}, frameNames(samples[0].Stack),
+		"an execution with no launch still projects, without a fabricated CPU stack - and under the "+
+			"unsampled marker, because no CPU call path is being claimed for its time")
 	assert.Equal(t, uint32(0), samples[0].Pid,
 		"no launch means no pid to read - pinned at 0 rather than fabricated")
 	assert.Equal(t, pp.SampleTypeGpu, samples[0].SampleType)
@@ -312,4 +314,131 @@ func TestProjectionDistributionSurvivesOverflow(t *testing.T) {
 		sum += w
 	}
 	assert.Equal(t, execWeight, sum, "distributed weights must sum to the execution duration")
+}
+
+// --- Phase 4a: the two populations stay separable and stay exact ----------
+
+// TestUnsampledExecutionsGetTheirOwnNodeNotAFabricatedStack is the honesty
+// rule of the whole sampled-stack design, as a test.
+//
+// Stack capture is sampled; execution measurement is not. So a profile
+// contains two populations - executions whose launch carried a sampled CPU
+// stack, and executions whose launch did not - and the rules are:
+// neither population's value is ever multiplied by the sample period (that
+// would turn a measured duration into an estimate and print it as fact),
+// and the unsampled population never borrows the sampled one's call path.
+// Their values sum to exactly the GPU time that was measured.
+//
+// Mutations this catches: scaling the sampled sample's value by
+// SamplePeriod (attributed would read 800, and the total 1000, neither of
+// which was ever measured); projecting the stackless execution under
+// [gpu:launch] with the sibling's frames (the NotContains fails); dropping
+// the gpu_sample_period label, which is what lets a consumer compute the
+// extrapolation deliberately rather than being handed one silently.
+func TestUnsampledExecutionsGetTheirOwnNodeNotAFabricatedStack(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 100, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{KernelName: "kAdd", Launch: LaunchContext{
+				CPUStack: []pp.Frame{{Name: "main"}, {Name: "run"}}, SamplePeriod: 8}}},
+		{Exec: GPUKernelExec{StartNs: 100, EndNs: 300, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{KernelName: "kAdd"}}, // joined, no stack
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 2)
+
+	var attributed, unattributed uint64
+	for _, s := range samples {
+		names := frameNames(s.Stack)
+		if slices.Contains(names, FrameLaunchUnsampled) {
+			unattributed += s.Value
+			assert.NotContains(t, names, "main", "an unsampled launch must not borrow a stack")
+		} else {
+			attributed += s.Value
+			assert.Contains(t, names, "main")
+			assert.Equal(t, "8", s.Labels["gpu_sample_period"])
+		}
+	}
+	assert.Equal(t, uint64(100), attributed, "durations are never scaled")
+	assert.Equal(t, uint64(200), unattributed)
+	assert.Equal(t, uint64(300), attributed+unattributed, "the GPU total stays exact")
+}
+
+// A sampled launch's frames nest under the real call path, in the same
+// root-first order the pre-sampling projection used: stack, boundary,
+// kernel. The unsampled sibling gets exactly two frames, and the marker
+// differs so a flame graph separates the two populations by shape - not by
+// a label a viewer may not render.
+func TestSampledAndUnsampledPopulationsHaveDifferentShapes(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{Launch: LaunchContext{
+				CPUStack: pp.FramesFromNames([]string{"main", "train_step"}), SamplePeriod: 4}}},
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 2)
+	assert.Equal(t, []string{"main", "train_step", FrameLaunch, "[gpu:kernel:kAdd]"},
+		frameNames(samples[0].Stack))
+	assert.Equal(t, []string{FrameLaunchUnsampled, "[gpu:kernel:kAdd]"},
+		frameNames(samples[1].Stack))
+}
+
+// The sample period is only meaningful next to a stack. A launch the
+// consumer marked sampled but whose capture or symbolization failed carries
+// a period and no stack; it is unattributed like any other stackless
+// execution, and must not advertise a period as if a call path had been
+// claimed - a consumer multiplying by it would scale nothing at all.
+func TestSamplePeriodLabelOnlyRidesWithARealStack(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{Launch: LaunchContext{SamplePeriod: 16}}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, []string{FrameLaunchUnsampled, "[gpu:kernel:kAdd]"}, frameNames(samples[0].Stack))
+	assert.NotContains(t, samples[0].Labels, "gpu_sample_period",
+		"a period with no stack attributes nothing; advertising it invites a scale of zero data")
+}
+
+// A producer-supplied tag must not be able to forge the sample period, the
+// same rule every other gpu_* label follows.
+func TestSamplePeriodLabelBeatsAForgedTag(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{Launch: LaunchContext{
+				CPUStack:     pp.FramesFromNames([]string{"main"}),
+				SamplePeriod: 32,
+				Tags:         map[string]string{"gpu_sample_period": "1"},
+			}}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, "32", samples[0].Labels["gpu_sample_period"],
+		"a tag named gpu_sample_period must not override the real period")
+}
+
+// PC samples split an execution's duration; they must not change which
+// population it belongs to, and the split parts must still sum to the
+// execution's own unscaled duration.
+func TestSampledExecutionWithPCSamplesStaysExactAndAttributed(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 100, KernelName: "kAdd"},
+			Launch: &GPUKernelLaunch{Launch: LaunchContext{
+				CPUStack: pp.FramesFromNames([]string{"main"}), SamplePeriod: 8}},
+			PCSamples: []GPUPCSample{{PCOffset: 0x10, Count: 1}, {PCOffset: 0x20, Count: 3}}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 2)
+	var total uint64
+	for _, s := range samples {
+		total += s.Value
+		assert.Contains(t, frameNames(s.Stack), "main")
+		assert.Equal(t, "8", s.Labels["gpu_sample_period"])
+	}
+	assert.Equal(t, uint64(100), total, "the split parts still sum to the measured duration, unscaled")
 }

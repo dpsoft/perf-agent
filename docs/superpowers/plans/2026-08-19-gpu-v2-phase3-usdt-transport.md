@@ -35,21 +35,25 @@ export LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release
 
 Run `go test` directly. Do not run `make test-unit` — it runs `go generate`.
 
-## Prerequisites — resolve before Task 6
+## Prerequisites — resolve before Task 7
 
-**1. clang and llvm are not installed on this box.** `bpf2go` needs `clang` to compile `bpf/*.bpf.c` and `llvm-strip` to strip the object. Tasks 1–5 do not need them; Task 6 onward cannot proceed without them.
+**1. The BPF toolchain is not installed on this box.** `bpf2go` needs `clang` to
+compile `bpf/*.bpf.c`, `llvm-strip` to strip the object, and libbpf's headers —
+every `bpf/*.bpf.c` includes `<bpf/bpf_helpers.h>`, and only the libbpf runtime
+is present here, not `libbpf-devel`. **Task 7** is the first task that needs any
+of this; Tasks 1–6 do not (the shim and stub build with `c++`).
 
 ```bash
-sudo dnf install clang llvm
+sudo dnf install -y clang llvm libbpf-devel
 ```
 
 Verify:
 
 ```bash
-which clang llvm-strip
+which clang llvm-strip && ls /usr/include/bpf/bpf_helpers.h
 ```
 
-Expected: both resolve. If they do not, stop — do not hand-write BPF instructions with `asm.Instructions` as a workaround. That was acceptable for a throwaway spike; it is not maintainable for the consumer, which reads stacks and reserves ringbuf space.
+Expected: all three resolve. If they do not, stop — do not hand-write BPF instructions with `asm.Instructions` as a workaround. That was acceptable for a throwaway spike; it is not maintainable for the consumer, which reads stacks and reserves ringbuf space.
 
 **2. Kernel 6.6+.** Verify `uname -r` reports ≥ 6.6. The dev box runs 6.19.
 
@@ -1444,7 +1448,7 @@ cd gpuprobe && go generate ./... && cd ..
 ls gpuprobe/gpuusdt_bpfel*.o
 ```
 
-Expected: objects for both arches. This is the step that needs `clang` and `llvm-strip` from the prerequisites.
+Expected: objects for both arches. This is the step that needs `clang`, `llvm-strip` and `libbpf-devel` from the prerequisites.
 
 - [ ] **Step 4: Write the failing consumer test**
 
@@ -2091,7 +2095,16 @@ Phase 3 is done when all of the following hold:
 
 1. `go test ./internal/gpuabi/ ./internal/usdt/ ./gpuprobe/` passes, and `make -C shim test` passes.
 2. `TestStubDrivesThePipelineToPprofWithoutAGPU` passes on a box with no GPU, with zero sequence gaps.
-3. `gpu-stub-profile` writes a pprof whose samples carry `[gpu:launch]` and `[gpu:kernel:*]` frames.
+3. `gpu-stub-profile` writes a pprof whose samples carry `[gpu:launch]` frames and
+   whose executions all joined exactly.
+
+   **Corrected during execution.** This item originally also demanded
+   `[gpu:kernel:*]` frames, which Phase 3 cannot produce: kernel names reach the
+   consumer through `gpu_kernel_name_v1` interning, and that is deferred to Phase 4
+   by the *Deferred* section below. The criterion required a frame whose mechanism
+   the same plan defers. The first privileged gate run surfaced it — the profile
+   came out 100% `[gpu:launch]` with no kernel frames, exactly as the deferral
+   implies. Symbolized kernel frames are Phase 4's gate, not this one.
 4. The stub, unattached, reports every record dropped and emits nothing.
 5. `getcap` on the test binary shows `cap_bpf,cap_perfmon` only — **no `cap_sys_admin`**. If the attach needs it, the consumer is using the wrong mechanism.
 6. **The ABI review has been done on paper** against the rocprofiler bridge's taxonomy on branch `gpu-profiling-spec` (§6.1, §14). Walk `examples/rocprofiler_sdk_preload_bridge.cpp` and confirm each of `gpu_launch_v1`, `gpu_exec_v1`, `gpu_module_load_v1` and `gpu_kernel_name_v1` can be populated from what rocprofiler delivers, or record why not. Do not skip this because NVIDIA ships first — it is the whole reason `core/` is worth having.

@@ -259,3 +259,40 @@ If the profile comes out empty, the first thing to check is whether the semaphor
 5. **`kernel_id` is an FNV-1a hash of the mangled name**, so two kernels whose names collide would merge in the profile. 64-bit FNV over a few dozen distinct names makes that vanishingly unlikely, and the alternative (a pointer-keyed cache) would not survive CUPTI handing back a different copy of the same string.
 6. **Names are emitted mangled.** Demangling would need `__cxa_demangle` and a malloc on the launch path; it belongs on the consumer side.
 7. `cudaGraph` launches are not covered — only the `cudaLaunchKernel` family. A graph-heavy workload would produce execs with no matching launch. `CUpti_ActivityKernel12::graphNodeId` is the hook if that becomes real.
+
+## Controller note — first real-GPU flame graph, and its limit (2026-08-20)
+
+Ran on the RTX 3090, 2000 iters x 2 kernels, period 8:
+
+    [gpu:kernel:_Z14perfagent_axpyfPKfPfi]  3089.52us  51.60%
+    [gpu:kernel:_Z15perfagent_scalePffi]    2898.07us  48.40%
+    [gpu:launch]                             772.77us  12.91%
+    [gpu:launch unsampled]                  5214.82us  87.09%
+
+WORKS: real mangled CUDA kernel names interned and resolved (KnownKernelNames:2);
+exact duration conservation (772.77 + 5214.82 = 5987.59us, nothing scaled); attributed
+share 12.91% == 1/8, matching the configured sampling period on real hardware.
+KernelStacksMissing:0, PendingLaunches:0, PendingNamedEvents:0.
+
+DOES NOT WORK: the only CPU frame is the adapter's OWN callback,
+`(anonymous namespace)::on_callback(...)`. The application's call path above it is
+absent. The chain from the probe to the app is
+probe -> our callback -> libcupti -> libcudart cudaLaunchKernel -> application,
+and the frame-pointer walk (bpf_get_stackid, BPF_F_USER_STACK) stops at the first
+frame it cannot follow. Net effect: GPU time is attributed to THE PROFILER, which is
+confidently wrong — the one failure mode this design avoids everywhere else.
+
+I attempted a quick objdump count of frame-pointer prologues in libcupti/libcudart to
+confirm the cause; the command was malformed (counted `push %rbp` anywhere against
+exported-symbol counts) and proves nothing. The cause is NOT yet established. Candidates
+to test properly: FP absence in the vendor libraries; the walk depth limit; or
+symbolization dropping frames it could not resolve.
+
+CONSEQUENCE FOR PLANNING: Phase 4a deliberately deferred the DWARF unwind driver
+(unwind_common.h's third consumer) on the grounds that frame-pointer stacks were a
+reasonable first cut. This run shows FP stacks are not merely a reduced-fidelity first
+cut for the CUDA path — they yield an actively misleading attribution, because the
+frames that survive are the profiler's own. Phase 4b is therefore REQUIRED for this
+feature to be truthful, not an enhancement. Until it lands, the honest presentation is
+to treat a stack whose deepest frames are all shim/vendor as unattributed rather than
+projecting it under [gpu:launch].

@@ -233,6 +233,8 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.StackDeleteFailed, "every stackmap entry read must also be deletable")
 	assert.Zero(t, stats.StacksUncorrelated,
 		"the stub never emits correlation 0 on a sampled launch")
+	assert.Zero(t, stats.StacksProfilerOnly,
+		"the stub IS the shim, so main -> perfagent_stub_run is a real attribution; a refusal here means the injected-adapter guard misread a self-contained producer")
 	assert.Zero(t, stats.SymbolizeFailed,
 		"a real Symbolizer is configured; every captured stack must resolve to at least one frame")
 	// The counter that would have caught this branch's symbolization failure

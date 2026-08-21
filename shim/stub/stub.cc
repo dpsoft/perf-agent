@@ -144,7 +144,11 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
 // instant it has what it needs, so the gate does not trade a race for a
 // guessed delay. linger_ms is the backstop for a stub run by hand from a
 // terminal, where stdin never reaches EOF -- it must never hang forever.
-static void linger(unsigned linger_ms) {
+// Not static, and not named `linger`: the FP-less producer
+// (stub/fpless_producer.cc) is a second `main` over this same
+// translation unit, and it needs the identical linger contract. A
+// second copy of this loop would be a second thing to keep correct.
+extern "C" void perfagent_stub_linger(unsigned linger_ms) {
     if (!linger_ms) return;
     struct pollfd p{};
     p.fd = STDIN_FILENO;
@@ -169,12 +173,20 @@ static void linger(unsigned linger_ms) {
     }
 }
 
+// PERFAGENT_STUB_NO_MAIN lets this file be linked under a different
+// entry point without duplicating perfagent_stub_run or the probe
+// emitters. stub/fpless_producer.cc defines that other main; it
+// reaches perfagent_stub_run through a frame-pointer-less bridge so
+// the stack the consumer walks has an FP-less frame in it, which the
+// straight-line binary built from this file alone does not guarantee.
+#ifndef PERFAGENT_STUB_NO_MAIN
 int main(int argc, char **argv) {
     const unsigned n = argc > 1 ? (unsigned)atoi(argv[1]) : 1000;
     const unsigned us = argc > 2 ? (unsigned)atoi(argv[2]) : 100;
     const unsigned sp = argc > 3 ? (unsigned)atoi(argv[3]) : 8;
     const unsigned lm = argc > 4 ? (unsigned)atoi(argv[4]) : 0;
     perfagent_stub_run(n, us, sp);
-    linger(lm);
+    perfagent_stub_linger(lm);
     return 0;
 }
+#endif // PERFAGENT_STUB_NO_MAIN

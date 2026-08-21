@@ -22,7 +22,22 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+// The hybrid DWARF/FP walker, shared with perf_dwarf.bpf.c and
+// offcpu_dwarf.bpf.c: walk_step, the CFI and mapping tables it consults, and
+// the per-CPU walker_scratch it writes into. UNWIND_NO_SAMPLE_RINGBUF drops
+// the emit-side maps (stack_events, kern_stackmap) this driver never touches
+// — it stages its PCs into gpu_stacks below instead, and creating a 16384-
+// entry kernel stackmap for nothing would cost ~16 MB per attach.
+#define UNWIND_NO_SAMPLE_RINGBUF 1
+#include "unwind_common.h"
+
 char LICENSE[] SEC("license") = "GPL";
+
+// vmlinux.h is generated from BTF and carries no errno definitions, so the
+// one value this program has to tell apart is spelled out here. E2BIG is
+// what a full BPF_MAP_TYPE_HASH returns from bpf_map_update_elem, and it is
+// ABI-stable across every Linux architecture.
+#define GPU_E2BIG 7
 
 // Slot 0 is not a record kind: it collects drops for kinds this program does
 // not know, so the "no loss is silent" contract has no hole even on a cookie
@@ -93,8 +108,10 @@ _Static_assert(MAX_RECORD_BYTES <= PAYLOAD_BYTES,
 //
 //   0 kind  4 count  8 seq  16 pid  20 tid  24 bytes  32 stack_id  36 _pad
 //
-// stack_id is the BPF stackmap key for the launching thread's user stack,
-// or negative when the capture failed. It is per-batch, not per-record,
+// stack_id is this program's own handle into gpu_stacks for the launching
+// thread's user stack, or negative when the capture failed. Phase 4b changed
+// what it MEANS — a key we mint rather than one bpf_get_stackid returns —
+// without changing its size or position. It is per-batch, not per-record,
 // which is sound only because the one kind that carries it
 // (KIND_LAUNCH_SAMPLED) always arrives with count == 1 — enforced by
 // max_records, not merely assumed of the producer.
@@ -133,9 +150,11 @@ struct {
     __type(value, __u64);
 } dropped SEC(".maps");
 
-// stacks_missing[kind] counts probe fires whose bpf_get_stackid() failed —
-// a stack deeper than PERF_MAX_STACK_DEPTH, a full stackmap, or a binary
-// built without frame pointers. It is deliberately NOT the `dropped` map:
+// stacks_missing[kind] counts probe fires that produced no usable stack —
+// the walk returned no frames, gpu_stacks was full, or the insert failed.
+// walk_errors below says WHICH; this stays a per-kind count so the userspace
+// cross-check against the stack_id values it actually saw still works.
+// It is deliberately NOT the `dropped` map:
 // the batch is still delivered, with batch_hdr.stack_id negative, so no
 // record is lost and folding this into Stats.KernelDropped would report
 // phantom record loss. Userspace surfaces it as Stats.KernelStacksMissing
@@ -147,17 +166,111 @@ struct {
     __type(value, __u64);
 } stacks_missing SEC(".maps");
 
-#define PERF_MAX_STACK_DEPTH 127
-#define STACK_MAP_SIZE       16384
+// ----- The walker's output map.
+//
+// bpf_get_stackid used to fill a kernel BPF_MAP_TYPE_STACK_TRACE here. It
+// walked frame pointers and nothing else, so on a real CUDA process it
+// stopped at the first frame it could not follow — which is the profiler's
+// own CUPTI callback, one frame above the probe. The chain that matters
+// (callback -> libcupti -> libcudart -> the application) was never reached,
+// and the GPU time it explains was attributed to the profiler.
+//
+// A hand-rolled walk cannot populate a STACK_TRACE map, so the walk stages
+// its PCs in walker_scratch and this program copies them here under an id it
+// mints itself. gpuprobe.Consumer.resolveStackLocked reads the entry and
+// deletes it; nothing else reclaims a slot.
+//
+// One value is 4 + 4 + 127*8 = 1024 bytes, so GPU_STACKS_SIZE entries
+// preallocate 4 MB — the same order as the `events` ringbuf above, and
+// deliberately so: occupancy is proportional to how many captures are in
+// flight between the probe and the consumer's drain, not to the length of
+// the run. 4096 is roughly two full ringbufs' worth of sampled launches, so
+// the map cannot fill before the ringbuf does unless the consumer has
+// stopped draining entirely — in which case the loss is already counted.
+#define GPU_STACKS_SIZE 4096
 
-// The launching thread's user stack, keyed by the id bpf_get_stackid returns
-// and read back by gpuprobe (Task 5) exactly as profile/ does.
+struct gpu_stack {
+    __u32 n_pcs;
+    // walker_flags is the walk's own WALKER_FLAG_* bitmask, copied out of
+    // the scratch record. Nothing reads it yet; it is here because the walk
+    // that produced these PCs is the only place that knows whether DWARF
+    // fired, whether the FP chain terminated naturally, or whether a CFI
+    // lookup cut the walk short — and re-deriving that later is impossible.
+    __u32 walker_flags;
+    __u64 pcs[MAX_FRAMES];
+};
+
+_Static_assert(sizeof(struct gpu_stack) == 1024,
+               "gpu_stack must stay 1024 bytes; see gpuStackSize in gpuprobe/consumer.go");
+
 struct {
-    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
-    __uint(max_entries, STACK_MAP_SIZE);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, PERF_MAX_STACK_DEPTH * sizeof(__u64));
-} stackmap SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, GPU_STACKS_SIZE);
+    __type(key, __u32);
+    __type(value, struct gpu_stack);
+} gpu_stacks SEC(".maps");
+
+// Staging buffer for one gpu_stack. The value is 1024 bytes and the BPF
+// stack is 512, so the copy from walker_scratch has to land in a map.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct gpu_stack);
+} gpu_stack_scratch SEC(".maps");
+
+// ----- Stack id generation.
+//
+// An id must be unique across every CPU that can fire this probe at once,
+// and must stay non-negative: batch_hdr.stack_id is __s32 and negative means
+// "no stack". The construction is a per-CPU counter in the low bits and the
+// CPU index in the high bits, which cannot collide between CPUs by
+// construction — no atomics, no shared cursor, no CAS on a hot path.
+//
+//   bit 30..18  CPU index   (8192 CPUs; masked, see below)
+//   bit 17..0   per-CPU seq (262144 ids before it wraps)
+//   bit 31      always 0
+//
+// On wrap the per-CPU sequence returns to 0 and ids repeat. That is safe
+// because an id is only in use between the probe and the consumer's read,
+// and gpu_stacks holds at most 4096 entries: 262144 captures on one CPU must
+// have come and gone before a value repeats. If one somehow has NOT been
+// consumed, the insert below uses BPF_NOEXIST, so the live entry is kept and
+// the NEW capture is the one that fails — counted in walk_errors, never a
+// silent overwrite that would hand one launch another launch's call path.
+//
+// CPU indices at or above 8192 alias onto low ones. Two such CPUs would also
+// have to hold the same per-CPU sequence value at the same moment to collide,
+// and Linux's CONFIG_NR_CPUS tops out at 8192 on x86_64, so this is a bound
+// worth stating rather than a race worth fearing.
+#define GPU_STACK_SEQ_BITS 18
+#define GPU_STACK_SEQ_MASK ((1U << GPU_STACK_SEQ_BITS) - 1)
+#define GPU_STACK_CPU_MASK 0x1FFFU
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} stack_id_seq SEC(".maps");
+
+// ----- Why a capture produced no stack.
+//
+// stacks_missing says a sampled launch lost its stack; this says why. Every
+// early return in capture_stack lands in exactly one slot, so no failure in
+// the walk path is silent. Read as Stats.StackWalk* / Stats.StackMap* .
+#define WALK_ERR_NO_SCRATCH  0  // a per-CPU scratch lookup failed
+#define WALK_ERR_EMPTY       1  // the walk produced no frames at all
+#define WALK_ERR_MAP_FULL    2  // gpu_stacks is full (-E2BIG)
+#define WALK_ERR_UPDATE      3  // the insert failed some other way
+#define WALK_ERR_MAX         4
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, WALK_ERR_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} walk_errors SEC(".maps");
 
 // record_size is an if-chain rather than a switch so clang cannot lower it
 // to a .rodata table load, which would hand the verifier an unbounded
@@ -240,6 +353,113 @@ static __always_inline void count_stack_missing(__u32 kind)
         __sync_fetch_and_add(d, 1);
 }
 
+// count_walk_error records WHY a capture failed. Companion to
+// count_stack_missing, which records THAT it failed.
+static __always_inline void count_walk_error(__u32 slot)
+{
+    __u64 *d;
+
+    if (slot >= WALK_ERR_MAX)
+        return;
+    d = bpf_map_lookup_elem(&walk_errors, &slot);
+    if (d)
+        __sync_fetch_and_add(d, 1);
+}
+
+// next_stack_id mints a handle for one capture. See the GPU_STACK_SEQ_BITS
+// comment for the uniqueness argument and the wrap behaviour. Returns a
+// negative value only if the per-CPU counter cannot be reached, which the
+// caller counts as a scratch failure.
+static __always_inline __s32 next_stack_id(void)
+{
+    __u32 zero = 0;
+    __u32 *seq = bpf_map_lookup_elem(&stack_id_seq, &zero);
+    if (!seq)
+        return -1;
+    // A per-CPU array value: this CPU is the only writer, and a BPF program
+    // cannot migrate mid-run, so a plain increment is correct and an atomic
+    // would only cost a locked instruction on the probe's hot path.
+    __u32 n = ++(*seq);
+    __u32 cpu = bpf_get_smp_processor_id() & GPU_STACK_CPU_MASK;
+    return (__s32)((cpu << GPU_STACK_SEQ_BITS) | (n & GPU_STACK_SEQ_MASK));
+}
+
+// capture_stack walks the launching thread's user stack with the hybrid
+// DWARF/FP walker and parks the result in gpu_stacks. Returns the handle, or
+// -1 if there is nothing to hand the consumer. Every -1 is counted twice: in
+// walk_errors (why) and, by the caller, in stacks_missing (that it happened).
+//
+// The walk is driven exactly as perf_dwarf.bpf.c and offcpu_dwarf.bpf.c
+// drive it — walker_flags zeroed BEFORE bpf_loop, because walk_step ORs bits
+// into it as it classifies frames.
+static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
+{
+    __u32 zero = 0;
+    __u32 n;
+    __s32 id;
+    long ret;
+
+    struct sample_record *rec = bpf_map_lookup_elem(&walker_scratch, &zero);
+    if (!rec) {
+        count_walk_error(WALK_ERR_NO_SCRATCH);
+        return -1;
+    }
+    struct gpu_stack *out = bpf_map_lookup_elem(&gpu_stack_scratch, &zero);
+    if (!out) {
+        count_walk_error(WALK_ERR_NO_SCRATCH);
+        return -1;
+    }
+
+    // At a USDT probe the register file is the application's own: ip is the
+    // probe site, fp/sp the launching thread's frame. PT_REGS_* expand to
+    // ip/bp/sp on x86_64 and pc/regs[29]/sp on arm64.
+    struct walk_ctx walker = {
+        .pc    = (__u64)PT_REGS_IP(ctx),
+        .fp    = (__u64)PT_REGS_FP(ctx),
+        .sp    = (__u64)PT_REGS_SP(ctx),
+        .pid   = tgid,
+        .n_pcs = 0,
+        .rec   = rec,
+    };
+    rec->hdr.walker_flags = 0;
+    bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
+
+    n = walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs;
+    if (n == 0) {
+        // Not even the probe's own PC came back. Nothing to attribute, and
+        // an entry holding zero frames would only be refused on read.
+        count_walk_error(WALK_ERR_EMPTY);
+        return -1;
+    }
+
+    id = next_stack_id();
+    if (id < 0) {
+        count_walk_error(WALK_ERR_NO_SCRATCH);
+        return -1;
+    }
+
+    out->n_pcs = n;
+    out->walker_flags = rec->hdr.walker_flags;
+    // A constant-size copy of the whole array, not n_pcs elements: the size
+    // has to be a compile-time constant for the verifier, and the slots past
+    // n_pcs are never read — the consumer honours n_pcs rather than scanning
+    // for a zero terminator, precisely because this scratch is per-CPU and
+    // its tail still holds the previous capture's PCs.
+    __builtin_memcpy(out->pcs, rec->pcs, sizeof(out->pcs));
+
+    // BPF_NOEXIST, never BPF_ANY. If this id is somehow still live — a
+    // per-CPU sequence that wrapped past an entry the consumer never read —
+    // the live entry wins and this capture is the one that fails. An
+    // overwrite would hand one launch another launch's call path, and
+    // nothing downstream could tell.
+    ret = bpf_map_update_elem(&gpu_stacks, &id, out, BPF_NOEXIST);
+    if (ret != 0) {
+        count_walk_error(ret == -GPU_E2BIG ? WALK_ERR_MAP_FULL : WALK_ERR_UPDATE);
+        return -1;
+    }
+    return id;
+}
+
 SEC("uprobe.multi")
 int gpu_usdt_batch(struct pt_regs *ctx)
 {
@@ -296,23 +516,23 @@ int gpu_usdt_batch(struct pt_regs *ctx)
         return 0;
     }
 
+    id = bpf_get_current_pid_tgid();
+
     // Only the sampled-launch probe carries a stack: it is the only one that
     // fires on the launching thread, once per launch, unbatched. Captured
     // after the reservation succeeded so a batch that will never be
-    // submitted does not consume a stackmap slot.
+    // submitted does not consume a gpu_stacks slot.
     //
-    // A negative return is a real outcome — a stack deeper than
-    // PERF_MAX_STACK_DEPTH, a full stackmap, or a frame-pointer-less
-    // binary — not an error to bail on. It is counted, and the record still
-    // flows with a negative stack_id, so a launch is never lost merely
-    // because its stack was.
+    // A negative return is a real outcome — an empty walk, a full map, a
+    // refused insert — not an error to bail on. It is counted, and the
+    // record still flows with a negative stack_id, so a launch is never lost
+    // merely because its stack was.
     if (kind == KIND_LAUNCH_SAMPLED) {
-        stack_id = (__s32)bpf_get_stackid(ctx, &stackmap, BPF_F_USER_STACK);
+        stack_id = capture_stack(ctx, (__u32)(id >> 32));
         if (stack_id < 0)
             count_stack_missing(KIND_LAUNCH_SAMPLED);
     }
 
-    id = bpf_get_current_pid_tgid();
     msg->hdr.kind = kind;
     msg->hdr.count = (__u32)count;
     msg->hdr.seq = seq;

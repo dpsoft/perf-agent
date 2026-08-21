@@ -35,7 +35,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/gpu"
-	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/internal/usdt"
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -53,6 +52,89 @@ const (
 	// kindMax mirrors KIND_MAX in bpf/gpu_usdt.bpf.c: the number of slots in
 	// the BPF-side `dropped` and `stacks_missing` arrays.
 	kindMax = 8
+
+	// maxWalkFrames mirrors MAX_FRAMES in bpf/unwind_common.h: the walker's
+	// bpf_loop bound, and therefore the length of a struct gpu_stack's pcs
+	// array. A walk that produced exactly this many frames AND did not reach
+	// a natural terminator (no walkerFlagsTerminated bit) hit the bound and
+	// is truncated (Stats.StackWalkTruncated); one that reached the bound
+	// and also terminated happens to be a complete stack exactly this deep,
+	// not a truncated one.
+	maxWalkFrames = 127
+
+	// walkerFlagFPTerminated, walkerFlagDWARFUsed and walkerFlagCFIMiss
+	// mirror WALKER_FLAG_* in bpf/unwind_common.h. They ride in struct
+	// gpu_stack's walker_flags and say how the walk went, not just how far
+	// it got:
+	//
+	//   - walkerFlagDWARFUsed set means at least one frame was unwound via
+	//     CFI. Clear means every frame the walk kept was reached by frame
+	//     pointer alone — the shape that produced a flame graph rooted in
+	//     the profiler's own callback on real hardware, because an FP walk
+	//     cannot survive the first frame-pointer-omitting vendor frame.
+	//   - walkerFlagFPTerminated set means the FP chain reached its natural
+	//     end (saved_fp == 0 in walk_step): the walk ran off the true root
+	//     of the stack.
+	//   - walkerFlagUnwindTerminated set means the walk ended where the
+	//     unwind information itself says the chain ends: either a frame
+	//     whose CFI gives the return address as UNDEFINED (the DWARF marker
+	//     for an outermost frame), or an FP_SAFE frame reached with no
+	//     caller frame pointer to follow because the CFI below it did not
+	//     preserve one. It is the DWARF-side counterpart of
+	//     walkerFlagFPTerminated and must be read together with it: a hybrid
+	//     walk that crossed a frame-pointer-less frame CANNOT end via
+	//     saved_fp == 0, because the DWARF step that carried it there set
+	//     the frame pointer to zero. Before this bit existed such a walk was
+	//     indistinguishable from one killed by a read fault, so EVERY
+	//     successful DWARF walk was counted in StackWalkAbandoned.
+	//
+	//     With both bits clear the walk stopped for a reason it could do
+	//     nothing about — a user-memory read fault at a live address, a
+	//     non-monotonic frame pointer, a CFI lookup miss, an RA/FP location
+	//     this walker does not track, or bpf_loop exhausting MAX_FRAMES —
+	//     and did NOT reach the root, even though it may have produced
+	//     usable frames.
+	//   - walkerFlagCFIMiss set means the walker classified a frame as
+	//     frame-pointer-less, went looking for the CFI entry covering it,
+	//     and found none — so it stopped. Before Task 3 this could not
+	//     happen in gpuprobe at all (no PID had tables, so no frame ever
+	//     reached the lookup); now that registration installs them, it
+	//     separates "the tables are missing" from "the tables are there and
+	//     do not cover this PC". See Stats.StacksWalkedCFIMiss.
+	walkerFlagFPTerminated     = 0x01
+	walkerFlagDWARFUsed        = 0x02
+	walkerFlagCFIMiss          = 0x04
+	walkerFlagUnwindTerminated = 0x08
+
+	// walkerFlagsTerminated is the set of bits that mean "the walk reached
+	// the end of the chain". Neither StackWalkTruncated nor
+	// StackWalkAbandoned may count a capture with any of them set.
+	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagUnwindTerminated
+
+	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
+	// bpf/gpu_usdt.bpf.c:
+	//
+	//	0 n_pcs  4 walker_flags  8 pcs[MAX_FRAMES]
+	//
+	// The value is fixed-size because a BPF map value is; n_pcs says how
+	// much of it is real. TestEmbeddedProgramCarriesTheStackMap pins
+	// gpuStackSize against the embedded object's own value size, so a change
+	// on either side fails a unit test rather than decoding garbage.
+	gpuStackHdrSize = 8
+	gpuStackSize    = gpuStackHdrSize + maxWalkFrames*8
+
+	// gpuStackCapacity mirrors GPU_STACKS_SIZE: how many captures gpu_stacks
+	// can hold at once, i.e. how many may be in flight between the probe and
+	// the consumer's drain before the BPF side starts refusing them.
+	gpuStackCapacity = 4096
+
+	// The walk_errors slots, mirroring WALK_ERR_* in bpf/gpu_usdt.bpf.c.
+	// Every way capture_stack can fail lands in exactly one of them.
+	walkErrNoScratch = 0
+	walkErrEmpty     = 1
+	walkErrMapFull   = 2
+	walkErrUpdate    = 3
+	walkErrMax       = 4
 
 	// batchHdrSize mirrors struct batch_hdr in bpf/gpu_usdt.bpf.c, which is
 	// 40 bytes since Phase 4a appended stack_id and its padding:
@@ -155,6 +237,14 @@ type Config struct {
 	// be held at once waiting for a kernel name that has not arrived yet.
 	// Zero means defaultPendingNamedEventCapacity. See pendingNames.
 	PendingNamedEventCapacity int
+
+	// UnwindPIDCapacity bounds how many processes hold CFI tables for the
+	// stack walker at once. Zero means defaultUnwindPIDCapacity. A
+	// system-wide attach learns PIDs from the records that arrive, so the
+	// set is fed by a profiled machine and has to be bounded; see
+	// pidRegistry for the bound and Stats.UnwindPIDsEvicted for what it
+	// costs when it bites.
+	UnwindPIDCapacity int
 }
 
 const (
@@ -252,9 +342,9 @@ type Stats struct {
 	// how many launches it sampled, and the two must agree.
 	SampledLaunches uint64
 	// StacksMissing counts sampled launches that arrived with a negative
-	// batch_hdr.stack_id — bpf_get_stackid failed because the stack was
-	// deeper than PERF_MAX_STACK_DEPTH, the stackmap was full, or the
-	// launching binary has no frame pointers.
+	// batch_hdr.stack_id — the BPF-side walk produced nothing to hand over.
+	// StackWalkEmpty, StackMapFull, StackMapUpdateFailed and
+	// StackWalkScratchFailed say which of the ways it can fail happened.
 	//
 	// This is NOT loss: the launch record is delivered and normalized
 	// anyway, it simply carries no CPU stack. Folding it into KernelDropped
@@ -262,7 +352,7 @@ type Stats struct {
 	// of dishonesty.
 	StacksMissing uint64
 	// StacksResolved counts captures that made it all the way to frames:
-	// the stackmap entry was there, it held instruction pointers, and the
+	// the gpu_stacks entry was there, it held instruction pointers, and the
 	// symbolizer turned them into at least one frame. Every sampled launch
 	// ends in exactly one of the counters below or in StacksMissing, so
 	// they reconcile against SampledLaunches:
@@ -275,24 +365,189 @@ type Stats struct {
 	// (the second identity holds at rest; PendingStacks is a gauge). Both
 	// are asserted by TestSampledStackAccountingReconciles.
 	StacksResolved uint64
-	// StackLookupFailed counts captures whose stackmap entry could not be
-	// read back: the map lookup failed, or the entry decoded to no
-	// instruction pointers.
+	// StackLookupFailed counts captures whose gpu_stacks entry could not be
+	// read back: the map lookup failed, the value was too short to be a
+	// struct gpu_stack, or it decoded to no instruction pointers.
 	//
-	// The expected cause is not a broken map. bpf_get_stackid is
-	// content-addressed, so two launches from the same call site in flight
-	// at once carry the SAME stack id; the consumer resolves the first and
-	// deletes the entry (see freeStackLocked), and the second then finds
-	// nothing. That is a real, bounded loss of attribution - the launch
-	// still ships, without a stack - and it is counted here rather than
-	// being papered over with a cached lookup, which could serve the frames
-	// of a different stack that reused the id after the delete.
-	//
-	// That is the LOSS half of the shared-id race. The aliasing half - a
-	// different stack landing in the freed bucket before a stale in-ring
-	// batch dereferences the old id - is silent and is documented at
-	// freeStackLocked, where the delete that enables it happens.
+	// Phase 4a's version of this counter had a routine cause that this one
+	// does not. bpf_get_stackid was content-addressed, so two launches from
+	// the same call site in flight at once shared one stack id and the
+	// second found nothing after the first had deleted it. The walker mints
+	// its own ids (see next_stack_id in bpf/gpu_usdt.bpf.c) and two captures
+	// never share one, so that whole race - both its loss half and its
+	// silent aliasing half - is gone. What is left here is a genuinely
+	// broken read, which is why StackWalkEmpty exists to say when the entry
+	// was there but the walk inside it was empty.
 	StackLookupFailed uint64
+	// StackWalkEmpty counts walks that produced no frames at all. It is a
+	// SUBSET of StackLookupFailed on the consumer side plus the BPF side's
+	// own count of empty walks, and the two are disjoint by construction:
+	// an empty walk never reaches gpu_stacks (capture_stack counts it and
+	// returns -1), so a consumer-side empty can only come from a value some
+	// other writer put there.
+	//
+	// Being a subset keeps the SampledLaunches identity above a partition:
+	// an empty walk still lands in exactly one bucket.
+	StackWalkEmpty uint64
+	// StackWalkTruncated counts resolved captures whose walk hit MAX_FRAMES
+	// without also reaching a natural terminator (no walkerFlagsTerminated
+	// bit at n_pcs == maxWalkFrames). NOT a failure and not part of the
+	// identity: the frames are real and are attributed. It is here because a
+	// truncated stack is missing its outermost frames - the ones nearest
+	// main, which is where a flame graph is read from - so a rising count
+	// means the profile's roots are being cut off even though nothing
+	// failed. This is the "ran out of budget" failure; StackWalkAbandoned
+	// is the other one, "could not proceed" - they are counted apart on
+	// purpose, see StackWalkAbandoned.
+	StackWalkTruncated uint64
+	// StackWalkAbandoned counts resolved captures whose walk stopped before
+	// reaching a natural terminator (no walkerFlagsTerminated bit) AND
+	// before running out of budget (n_pcs < maxWalkFrames). This is the
+	// counter Task 1 was missing: n_pcs == maxWalkFrames is exactly the
+	// wrong test for "the walk failed to make progress", because a walk
+	// that dies at the first frame-pointer-omitting vendor frame produces
+	// n_pcs of roughly 1-3 and used to read as a complete, untruncated
+	// stack - the case that produced a flame graph rooted entirely in the
+	// profiler's own callback, silently, because nothing was counting it.
+	//
+	// The underlying causes are a bpf_probe_read_user fault at a live
+	// address while walking the FP chain, a frame pointer that did not
+	// increase, a CFI lookup miss (walkerFlagCFIMiss, 0x04), or DWARF
+	// giving a return address in a register this walker does not track
+	// (bpf/unwind_common.h walk_step). They stop the walk the same way:
+	// fewer frames than requested, no end of chain.
+	//
+	// It deliberately does NOT count a walk that ended where the unwind
+	// information says the chain ends (walkerFlagUnwindTerminated) even
+	// though such a walk also has walkerFlagFPTerminated clear. A hybrid
+	// walk that crossed a frame-pointer-less frame can only ever end that
+	// way, so counting it here made the counter fire on every SUCCESSFUL
+	// DWARF walk - measured at abandoned == StacksWalkedDWARF == 62 on the
+	// Phase 4b gate - which is both useless as a signal and reads as a
+	// fleet of failures to anyone looking at Stats in production.
+	//
+	// NOT a failure in the record-loss sense - the frames captured are
+	// still symbolized and attributed - but it is missing every frame above
+	// where the walk gave up, and unlike StackWalkTruncated that loss has
+	// no relationship to MAX_FRAMES at all, so it needs its own counter to
+	// be visible rather than reading as zero.
+	StackWalkAbandoned uint64
+	// StacksWalkedDWARF counts non-empty captures where at least one frame
+	// was unwound via CFI (walkerFlagDWARFUsed set). This is the case that
+	// can reach through a vendor library into the application beneath it.
+	//
+	// Like StackWalkTruncated and StackWalkAbandoned, this is counted as
+	// soon as the walk's own flags are known - before symbolization, and
+	// regardless of whether symbolization goes on to succeed - because the
+	// question it answers ("how did the walk get these PCs") is a property
+	// of the walk, not of what the symbolizer later does with them. It is
+	// therefore not part of the SampledLaunches/StacksResolved identities;
+	// it is a diagnostic overlay the same way the other two are.
+	StacksWalkedDWARF uint64
+	// StacksWalkedFPOnly counts non-empty captures where no frame used CFI
+	// (walkerFlagDWARFUsed clear): every frame the walk kept came from the
+	// frame-pointer chain alone. This is exactly the walk shape that
+	// produced a flame graph attributing GPU time to the profiler's own
+	// callback on real hardware - an FP walk cannot survive the first
+	// frame-pointer-omitting vendor frame, so a stack landing here either
+	// never left the profiler (see StacksProfilerOnly) or got lucky and
+	// stayed inside frame-pointer-preserving code the whole way. Every
+	// non-empty capture lands in exactly one of this counter or
+	// StacksWalkedDWARF, whatever happens to it downstream (StacksResolved,
+	// SymbolizeFailed, ...) - see StacksWalkedDWARF for why the split is
+	// made this early rather than gated on symbolization succeeding.
+	StacksWalkedFPOnly uint64
+	// StacksWalkedNoTables counts captures walked for a process the walker
+	// had no CFI tables for. It is the SUBSET of StacksWalkedFPOnly that is
+	// explained rather than merely observed: with no entry in pid_mappings
+	// every frame classifies as MODE_FP_SAFE and the hybrid walker has
+	// nothing to be hybrid about, so an FP-only walk was the only possible
+	// outcome. Deliberately not additive with StacksWalkedFPOnly, so the
+	// two ways of getting a frame-pointer stack stay apart:
+	//
+	//   - StacksWalkedNoTables rising means registration has not caught up
+	//     (or failed) - see UnwindPIDsRegistered / UnwindPIDsFailed /
+	//     UnwindPIDsEvicted for which. It is expected to be non-zero and
+	//     small on a system-wide attach: the walk that carries the first
+	//     sighting of a process necessarily ran before the tables for it
+	//     existed. It is a bug if it keeps rising for a long-lived process.
+	//   - StacksWalkedFPOnly rising while this stays flat means the tables
+	//     were there and the walker still never needed CFI, which is what a
+	//     fully frame-pointer-preserving call path looks like.
+	//
+	// It is a LOWER BOUND, by construction: a PID's tables can land between
+	// the walk and this count, and the error is always in the direction of
+	// under-reporting. See pidRegistry.ready.
+	StacksWalkedNoTables uint64
+	// StacksWalkedCFIMiss counts captures whose walk consulted a CFI table
+	// and found no entry covering the frame's PC (walkerFlagCFIMiss set).
+	// The walker stops there, so these captures are also counted in
+	// StackWalkAbandoned; this is the SUBSET of that with a named cause.
+	//
+	// It is the counterpart to StacksWalkedNoTables, and separating them is
+	// the whole point: "no tables for this process" is fixed by registering
+	// the process, "tables that do not cover this PC" is a gap in what
+	// unwind/ehcompile produced for that binary. Conflating them would hide
+	// the second behind the first, which is the more common of the two.
+	StacksWalkedCFIMiss uint64
+	// UnwindPIDsRegistered counts processes whose CFI tables were installed
+	// for the walker, and UnwindBinariesAttached the distinct binaries
+	// across them - the CFI compiles actually paid for. See pidRegistry.
+	UnwindPIDsRegistered   uint64
+	UnwindBinariesAttached uint64
+	// UnwindPIDsFailed counts processes whose registration installed no
+	// tables at all: the process exited before /proc/<pid>/maps could be
+	// read, /proc was unreadable, or nothing it mapped carried usable
+	// .eh_frame. Every walk for such a process is FP-only and counts in
+	// StacksWalkedNoTables; this says why. UnwindLastError carries the most
+	// recent reason, because a bare count cannot distinguish "the process
+	// exited" from "the profiler cannot read /proc".
+	UnwindPIDsFailed uint64
+	UnwindLastError  string
+	// UnwindPIDsEvicted counts processes pushed out of the bounded
+	// registration set (Config.UnwindPIDCapacity) because
+	// less-recently-seen entries had to make room. Their tables are
+	// released and their later walks degrade to frame pointers, counted in
+	// StacksWalkedNoTables. Attribution loss, never record loss.
+	UnwindPIDsEvicted uint64
+	// UnwindRequestsDropped counts registration or release requests the
+	// worker queue could not accept. A dropped registration means the PID
+	// is forgotten and retried on its next batch; a dropped release means
+	// one process's tables stay installed until the BPF maps are closed.
+	// Neither loses a record; both are counted rather than absorbed.
+	UnwindRequestsDropped uint64
+	// UnwindReleaseFailed counts table teardowns that returned an error, so
+	// a slow leak inside the walker's maps is visible rather than inferred
+	// from a rising StacksWalkedNoTables.
+	UnwindReleaseFailed uint64
+	// UnwindPIDsTracked is a gauge: how many processes the registry is
+	// holding right now, registered or still being compiled. Bounded by
+	// Config.UnwindPIDCapacity.
+	UnwindPIDsTracked int
+	// StackMapFull counts captures the BPF side could not park because
+	// gpu_stacks was full (gpuStackCapacity live entries). Read from the
+	// `walk_errors` map.
+	//
+	// The map only fills if the consumer has stopped draining the ringbuf,
+	// because an entry lives from the probe to resolveStackLocked and
+	// nothing else holds one. It is counted rather than absorbed by
+	// overwriting a live entry: an overwrite would hand one launch another
+	// launch's call path, and no counter downstream could tell.
+	StackMapFull uint64
+	// StackMapUpdateFailed counts captures whose gpu_stacks insert failed
+	// for any reason other than a full map — including the one that means
+	// the id space wrapped onto an entry nobody consumed, which BPF_NOEXIST
+	// turns into a refused insert rather than a silent overwrite. Read from
+	// `walk_errors`.
+	StackMapUpdateFailed uint64
+	// StackWalkScratchFailed counts captures that never got as far as
+	// walking: a per-CPU scratch slot (walker_scratch, gpu_stack_scratch or
+	// stack_id_seq) could not be looked up. Read from `walk_errors`.
+	//
+	// It should be identically zero — a PERCPU_ARRAY lookup at key 0 cannot
+	// fail on a loaded program — and exists so that if it ever is not, the
+	// cause is named rather than showing up as unexplained StacksMissing.
+	StackWalkScratchFailed uint64
 	// SymbolizeFailed counts captures that were read back but produced no
 	// frames: the symbolizer returned an error, returned nothing, or no
 	// Symbolizer was configured at all. The launch is never dropped for
@@ -328,7 +583,7 @@ type Stats struct {
 	// well-resolved stack lands here. It is the ratio against
 	// StacksResolved's frame count that is diagnostic, not the raw number.
 	StackFramesUnresolved uint64
-	// StackDeleteFailed counts stackmap entries the consumer read but could
+	// StackDeleteFailed counts gpu_stacks entries the consumer read but could
 	// not delete. See freeStackLocked: deletion is what stops the map
 	// filling, so a rising count here is the early warning for capture
 	// failures (StacksMissing) that follow.
@@ -518,10 +773,10 @@ type batchReader interface {
 }
 
 // stackStore is the slice of *ebpf.Map that sampled-stack resolution uses:
-// read one stackmap entry, then delete it. It is a seam for the same reason
-// batchReader is - creating a real BPF_MAP_TYPE_STACK_TRACE needs CAP_BPF,
-// so without it the whole resolve/delete/attach path would be untestable -
-// and *ebpf.Map satisfies it as-is.
+// read one gpu_stacks entry, then delete it. It is a seam for the same
+// reason batchReader is - creating a real BPF map needs CAP_BPF, so without
+// it the whole resolve/delete/attach path would be untestable - and
+// *ebpf.Map satisfies it as-is.
 type stackStore interface {
 	LookupBytes(key any) ([]byte, error)
 	Delete(key any) error
@@ -534,10 +789,18 @@ type Consumer struct {
 	objs   gpuusdtObjects
 	links  []link.Link
 	reader batchReader
-	// stacks is c.objs.Stackmap behind the stackStore seam. Nil when no BPF
+	// stacks is c.objs.GpuStacks behind the stackStore seam. Nil when no BPF
 	// objects were loaded (every unit test), which makes every resolution
 	// count as StackLookupFailed rather than panic.
 	stacks stackStore
+	// unwind installs the per-PID CFI tables the BPF walker consults, and
+	// bounds the set of PIDs that hold them. Nil when no BPF objects were
+	// loaded (every unit test that does not inject a fake registrar), in
+	// which case every walk reports no tables — which is the truth.
+	//
+	// It has its own lock and is safe to use under c.mu; none of the methods
+	// c.mu-holding code calls does I/O or blocks. See pidRegistry.
+	unwind *pidRegistry
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]uint64
@@ -653,6 +916,32 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		return
 	}
 
+	// Register PIDs with the stack walker BEFORE the link exists.
+	//
+	// walk_step (bpf/unwind_common.h) unwinds by CFI only for frames it can
+	// find in pid_mappings; with nothing there it silently takes the
+	// frame-pointer path, which is the bug this phase exists to fix. So the
+	// tables have to be installed before the first probe can fire — and
+	// creating the uprobe_multi link is precisely what makes it fire, since
+	// the shim only emits once the link bumps its semaphore. Doing this
+	// after the attach would leave a window whose width is a CFI compile.
+	//
+	// Best-effort, never fatal: a consumer with no CFI tables still profiles
+	// with frame-pointer stacks, and says so in Stats.StacksWalkedNoTables.
+	// Failing the attach instead would turn a degraded profile into no
+	// profile at all.
+	c.unwind = newPIDRegistry(newEhmapsRegistrar(&c.objs), cfg.UnwindPIDCapacity)
+	if cfg.PID != 0 {
+		// Eager, and synchronous: one known process, and the cost is paid
+		// once at startup rather than against a live profiled application.
+		// This is what unwind/dwarfagent does for a per-PID profiler, where
+		// ModeLazy is forced back to ModeEager for the same reason.
+		_, _ = c.unwind.registerNow(uint32(cfg.PID))
+	}
+	// For a system-wide attach (cfg.PID == 0) there is nothing to register
+	// yet — the target may not even be running, which is exactly the gate's
+	// shape. Registration happens on first sight of a PID, in applyBatch.
+
 	var ex *link.Executable
 	if ex, err = link.OpenExecutable(cfg.ShimPath); err != nil {
 		return
@@ -670,9 +959,9 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	}
 	c.links = append(c.links, l)
 
-	// The stackmap is read (and each resolved entry deleted) by the sampled
+	// gpu_stacks is read (and each resolved entry deleted) by the sampled
 	// stack path; see Consumer.resolveStackLocked.
-	c.stacks = c.objs.Stackmap
+	c.stacks = c.objs.GpuStacks
 
 	if c.reader, err = ringbuf.NewReader(c.objs.Events); err != nil {
 		return
@@ -697,8 +986,11 @@ type batch struct {
 	Seq      uint64
 	PID, TID uint32
 	RawCount uint32
-	// StackID is the BPF stackmap key for the launching thread's user stack,
-	// or negative when the capture failed. It is a property of the whole
+	// StackID is the BPF program's own gpu_stacks key for the launching
+	// thread's user stack, or negative when the capture failed. It is a
+	// handle the program mints, not a kernel stackmap id: the hybrid walker
+	// that produces these frames cannot populate a BPF_MAP_TYPE_STACK_TRACE.
+	// The wire field is unchanged in size and position. It is a property of the whole
 	// batch because the BPF program stores it in the header — sound only
 	// because the one kind that carries a stack, kindLaunchSampled, always
 	// arrives with count == 1. That is enforced at both ends (the BPF
@@ -876,6 +1168,21 @@ func (c *Consumer) applyBatch(b batch) {
 
 	c.stats.Batches++
 	c.noteSeq(b.Kind, b.PID, b.Seq)
+	// First sight of a process is what makes it interesting to the walker,
+	// and "first sight" is any batch, not the first sampled launch.
+	//
+	// Sampled launches are one in SamplePeriod, and launch/exec/name batches
+	// from the same process arrive earlier and far more often, so registering
+	// on the sampled record alone would wait for a rare event before starting
+	// work that takes tens to hundreds of milliseconds — and every sampled
+	// launch in that window is an FP-only walk. Registering on the first
+	// batch of any kind makes the un-tabled window as narrow as the transport
+	// allows. Every process reaching here mapped the shim and fired a probe,
+	// so nothing uninteresting is registered.
+	//
+	// O(1) and non-blocking; the compiling happens on the registry's own
+	// goroutine, never on this one. See pidRegistry.
+	c.unwind.note(b.PID)
 
 	// A held launch is only ever waiting for a sampled record, and the
 	// sampled record it is waiting for would be the very next thing off the
@@ -993,14 +1300,15 @@ func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
 // holds mu.
 func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi.LaunchSampled) {
 	if stackID < 0 {
-		// bpf_get_stackid failed; already counted as StacksMissing by the
-		// caller, and there is no entry to read or free.
+		// The capture failed; already counted as StacksMissing by the
+		// caller (and by kind in walk_errors), and there is no entry to
+		// read or free.
 		return
 	}
 	if sl.Correlation == 0 {
 		// Unpairable: the ABI's "no correlation" leaves no way to say which
 		// launch this stack belongs to, and attaching it to a plausible
-		// neighbour would be a fabricated call path. The stackmap slot is
+		// neighbour would be a fabricated call path. The gpu_stacks slot is
 		// still ours to release.
 		c.stats.StacksUncorrelated++
 		c.freeStackLocked(stackID)
@@ -1056,10 +1364,42 @@ func (c *Consumer) attachLocked(ev *gpu.GPUKernelLaunch, frames []pp.Frame, peri
 	c.stats.StacksAttached++
 }
 
-// resolveStackLocked turns a stackmap key into symbolized frames, exactly as
-// profile/ does it: read the entry, extract the non-zero instruction
-// pointers, symbolize them against the launching process, flatten to pprof
-// frames. Caller holds mu.
+// decodeGPUStack reads one struct gpu_stack (bpf/gpu_usdt.bpf.c) out of a map
+// value: n_pcs, walker_flags, then that many little-endian u64 PCs, leaf
+// first. It returns ok=false only when the value is too short to be a
+// gpu_stack at all.
+//
+// internal/bpfstack.ExtractIPs is deliberately NOT used here, even though it
+// decodes the same little-endian u64s. It stops at the first zero slot,
+// which is the right rule for a BPF_MAP_TYPE_STACK_TRACE value (the kernel
+// zero-fills the tail) and the wrong one here: this value is copied out of a
+// per-CPU scratch record whose tail still holds the PREVIOUS capture's
+// frames, so a zero-terminated scan would splice two unrelated stacks into
+// one call path and present it as fact. n_pcs is the only authority, and it
+// is also what makes truncation detectable at all — a full-length walk is
+// indistinguishable from a complete one once the length is thrown away.
+//
+// n_pcs comes off the wire, so it is clamped rather than trusted.
+func decodeGPUStack(raw []byte) (pcs []uint64, flags uint32, ok bool) {
+	if len(raw) < gpuStackSize {
+		return nil, 0, false
+	}
+	le := binary.LittleEndian
+	n := int(le.Uint32(raw[0:]))
+	flags = le.Uint32(raw[4:])
+	if n > maxWalkFrames {
+		n = maxWalkFrames
+	}
+	pcs = make([]uint64, n)
+	for i := range pcs {
+		pcs[i] = le.Uint64(raw[gpuStackHdrSize+i*8:])
+	}
+	return pcs, flags, true
+}
+
+// resolveStackLocked turns a gpu_stacks handle into symbolized frames: read
+// the entry, take the PCs the walk actually produced, symbolize them against
+// the launching process, flatten to pprof frames. Caller holds mu.
 //
 // Two details differ from profile/:
 //
@@ -1081,24 +1421,85 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	if err != nil || len(raw) == 0 {
 		c.stats.StackLookupFailed++
 		// A failed lookup still leaves the slot occupied, and nothing else
-		// ever removes it: the program calls bpf_get_stackid without
-		// BPF_F_REUSE_STACKID, so an orphaned bucket answers -EEXIST for
-		// every later capture that hashes to it, forever. Free it here, the
-		// same as on the success path - the entry is useless to us either
-		// way. ErrKeyNotExist is the one case with nothing to free, and
-		// calling Delete for it would only inflate StackDeleteFailed.
+		// ever removes it, so free it here the same as on the success path -
+		// the entry is useless to us either way and gpu_stacks is finite.
+		// ErrKeyNotExist is the one case with nothing to free, and calling
+		// Delete for it would only inflate StackDeleteFailed.
 		if !errors.Is(err, ebpf.ErrKeyNotExist) {
 			c.freeStackLocked(stackID)
 		}
 		return nil, false
 	}
-	ips := bpfstack.ExtractIPs(raw)
+	ips, flags, ok := decodeGPUStack(raw)
 	// Free the slot as soon as its contents are in hand, before anything
 	// that can fail: the entry is useless to us from here on either way.
 	c.freeStackLocked(stackID)
-	if len(ips) == 0 {
+	if !ok {
+		// A value too short to be a struct gpu_stack. Decoding whatever
+		// prefix arrived would invent a call path out of a layout mismatch.
 		c.stats.StackLookupFailed++
 		return nil, false
+	}
+	if len(ips) == 0 {
+		// The walk produced nothing. Counted twice on purpose: once as the
+		// bucket this capture lands in, once as the reason.
+		c.stats.StackLookupFailed++
+		c.stats.StackWalkEmpty++
+		return nil, false
+	}
+	// walker_flags says how the walk got these frames, independent of what
+	// happens to them next - see Stats.StacksWalkedDWARF for why this is
+	// counted here rather than gated on symbolization succeeding.
+	if flags&walkerFlagDWARFUsed != 0 {
+		c.stats.StacksWalkedDWARF++
+	} else {
+		c.stats.StacksWalkedFPOnly++
+		// Why it was FP-only. A walk for a process the walker has no tables
+		// for could not have been anything else, and that is a different
+		// problem from a walk that had tables and never needed them - the
+		// first is fixed by registering the process, the second is what a
+		// frame-pointer-preserving call path legitimately looks like.
+		// Counting only the FP-only case keeps the two disjoint by
+		// construction: a DWARF walk proves tables existed.
+		if !c.unwind.ready(pid) {
+			c.stats.StacksWalkedNoTables++
+		}
+	}
+	if flags&walkerFlagCFIMiss != 0 {
+		// A table was consulted and did not cover this PC. Not the same
+		// failure as having no table at all, and the walk stopped there, so
+		// this capture is also counted in StackWalkAbandoned below.
+		c.stats.StacksWalkedCFIMiss++
+	}
+	switch terminated := flags&walkerFlagsTerminated != 0; {
+	case terminated:
+		// The walk reached the end of the chain, not the end of a budget
+		// and not a failure: either the FP chain's natural end
+		// (saved_fp == 0, walkerFlagFPTerminated) or the point the unwind
+		// information itself calls outermost (walkerFlagUnwindTerminated).
+		// Both must be honoured here - a hybrid walk that crossed a
+		// frame-pointer-less frame cannot end the first way, because the
+		// DWARF step that carried it there zeroed the frame pointer, so
+		// testing only walkerFlagFPTerminated counted every successful
+		// DWARF walk as abandoned. Not truncated either, even in the
+		// coincidental case where the end is the maxWalkFrames'th frame.
+	case len(ips) == maxWalkFrames:
+		// No natural terminator, and bpf_loop ran out of iterations. The
+		// frames are real and are used; the missing outermost ones - the
+		// ones nearest main - are what this records.
+		c.stats.StackWalkTruncated++
+	default:
+		// No end of chain, and the walk did not run out of budget either:
+		// it stopped because it could not continue - a
+		// bpf_probe_read_user fault at a live address, a frame pointer
+		// that did not increase, a CFI lookup miss, or a return address
+		// in a register this walker does not track
+		// (bpf/unwind_common.h walk_step). This is the case
+		// "len(ips) == maxWalkFrames" alone
+		// could never catch: a walk that dies at the first
+		// frame-pointer-omitting vendor frame produces n_pcs of roughly
+		// 1-3 and used to read as a complete, untruncated stack.
+		c.stats.StackWalkAbandoned++
 	}
 	if c.cfg.Symbolizer == nil {
 		c.stats.SymbolizeFailed++
@@ -1157,51 +1558,34 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	return out, true
 }
 
-// freeStackLocked deletes a stackmap entry once its contents have been read.
+// freeStackLocked deletes a gpu_stacks entry once its contents have been
+// read.
 //
-// This is not housekeeping, it is what keeps capture working. The BPF
-// program calls bpf_get_stackid WITHOUT BPF_F_REUSE_STACKID
-// (bpf/gpu_usdt.bpf.c), so a hash bucket already holding a live entry
-// answers -EEXIST instead of overwriting it. Nothing else ever removes an
-// entry, so in a continuously running consumer the map fills up and capture
-// failures climb until every sampled launch reports StacksMissing - which
-// reads exactly like a broken capture path rather than a full map. Deleting
-// each entry as it is consumed keeps the map's occupancy proportional to
-// what is in flight instead of to the length of the run.
+// This is not housekeeping, it is what keeps capture working. gpu_stacks
+// holds gpuStackCapacity entries and nothing else ever removes one: the BPF
+// side inserts with BPF_NOEXIST, so a full map (or an id that wrapped onto a
+// live entry) refuses the NEW capture rather than overwriting the old one.
+// Leak entries and occupancy grows with the length of the run instead of
+// with what is in flight, until every sampled launch reports StacksMissing -
+// which reads exactly like a broken capture path rather than a full map.
+// Deleting each entry as it is consumed is what keeps the two proportional.
 //
 // (profile/ does not need this and does not do it: it drains its stackmap
 // once at the end of a fixed-length profiling run. The continuous consumer
 // here is the case that does.)
 //
 // A delete failure is counted, not ignored: it is the leading indicator of
-// the map filling. ErrKeyNotExist is possible and harmless - two captures of
-// the identical stack share one id, so the first delete may already have
-// removed it - and is counted the same way rather than special-cased, since
-// it points at the same in-flight-duplicate situation StackLookupFailed
-// reports. Caller holds mu.
+// the map filling, and Stats.StackMapFull is what it leads to.
 //
-// The delete has a second consequence, and unlike the first one it is
-// silent. Stats.StackLookupFailed documents the LOSS case: a second capture
-// sharing this id finds nothing here and its launch ships without a stack,
-// counted. The ALIASING case is the same race won the other way. Freeing
-// this bucket makes it available again, and bpf_get_stackid hashes a
-// different stack into it; if a batch still sitting in the ringbuf refers to
-// the old id, the consumer reads the new occupant and attaches a call path
-// that did not produce that launch. Nothing counts it, because from here it
-// is indistinguishable from a successful resolution.
-//
-// It needs a hash collision on top of the in-flight duplicate, so it is
-// rare - and it is bounded by ringbuf drain latency, which is microseconds
-// on a consumer that is keeping up. It is documented rather than fixed
-// because every fix costs something this phase is not willing to spend: not
-// deleting refills the map and turns capture off entirely (see above);
-// BPF_F_REUSE_STACKID makes the overwrite the normal case rather than the
-// rare one; and a per-id generation stamp would need an ABI field and a
-// second map. What WOULD close it, and is the right place for it, is Phase
-// 4b's eager capture - reading the stack out at probe time rather than
-// handing the consumer an id to dereference later. Until then this comment
-// is the honest statement of it: a comment is not enough on its own, but the
-// remedy belongs to a phase that can carry it.
+// Phase 4a's version of this comment had to document a race it could not
+// fix: bpf_get_stackid is content-addressed, so freeing a bucket let a
+// different stack land in it, and a batch still sitting in the ringbuf that
+// referred to the old id would silently read the new occupant and attach a
+// call path that did not produce that launch. The walker mints its own ids
+// per CPU (next_stack_id in bpf/gpu_usdt.bpf.c) and never reuses one until
+// 2^18 captures on that CPU have gone by, so an id in the ringbuf cannot
+// name a different stack than the one it was minted for. The race is closed,
+// not merely documented. Caller holds mu.
 func (c *Consumer) freeStackLocked(stackID int32) {
 	if c.stacks == nil {
 		return
@@ -1379,12 +1763,47 @@ func (c *Consumer) Stats() Stats {
 	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
 	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
 	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
+	// Why each of those captures failed. StackWalkEmpty already carries the
+	// consumer-side count; the BPF side's is added to it rather than kept
+	// apart because the two are disjoint - an empty walk that the BPF side
+	// counted never reached gpu_stacks for the consumer to see.
+	out.StackWalkEmpty += c.walkError(walkErrEmpty)
+	out.StackMapFull = c.walkError(walkErrMapFull)
+	out.StackMapUpdateFailed = c.walkError(walkErrUpdate)
+	out.StackWalkScratchFailed = c.walkError(walkErrNoScratch)
+	// The registration side of the walker: which processes got CFI tables,
+	// which did not, and what the bound pushed out. Read from the registry's
+	// own lock rather than mirrored into c.stats, because the worker
+	// goroutine — not this one — is what advances them.
+	uw, tracked := c.unwind.snapshot()
+	out.UnwindPIDsRegistered = uw.registered
+	out.UnwindBinariesAttached = uw.binariesAttached
+	out.UnwindPIDsFailed = uw.failed
+	out.UnwindLastError = uw.lastErr
+	out.UnwindPIDsEvicted = uw.evicted
+	out.UnwindRequestsDropped = uw.requestsDropped
+	out.UnwindReleaseFailed = uw.releaseFailed
+	out.UnwindPIDsTracked = tracked
 	// Gauges, read fresh: what the two side tables are holding right now.
 	out.PendingStacks = c.pending.len()
 	out.PendingLaunches = c.deferred.len()
 	out.PendingNamedEvents = c.unnamed.len()
 	out.KnownKernelNames = c.names.len()
 	return out
+}
+
+// walkError reads one slot of the BPF `walk_errors` array: why a capture
+// produced no stack. A read failure, or the nil map every unit test has,
+// reads as zero rather than panicking. Caller holds mu.
+func (c *Consumer) walkError(slot uint32) uint64 {
+	if c.objs.WalkErrors == nil || slot >= walkErrMax {
+		return 0
+	}
+	var v uint64
+	if err := c.objs.WalkErrors.Lookup(&slot, &v); err != nil {
+		return 0
+	}
+	return v
 }
 
 // sumPerKind totals one of the BPF program's per-kind counter arrays
@@ -1432,6 +1851,13 @@ func (c *Consumer) Close() error {
 	// consumer must never do. Flush takes mu itself, so it runs before the
 	// lock below rather than inside it.
 	c.Flush()
+	// Stop the registration worker before anything is torn down, and outside
+	// mu. It writes CFI tables into c.objs' maps, so letting it run past the
+	// close below would mean a compile finishing into closed file
+	// descriptors. Outside mu because Stats takes mu and the wait can last a
+	// whole compile. Idempotent, and a no-op on a nil registry, so a
+	// half-built consumer from a failed Attach is safe.
+	c.unwind.close()
 	// The links and objects come down under mu so Stats, which reads the
 	// `dropped` map, cannot be looking at c.objs while it is being closed.
 	c.mu.Lock()

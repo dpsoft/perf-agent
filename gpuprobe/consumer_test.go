@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"sync"
@@ -19,7 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dpsoft/perf-agent/gpu"
-	"github.com/dpsoft/perf-agent/internal/bpfstack"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
@@ -805,10 +805,28 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 	spec, err := loadGpuusdt()
 	require.NoError(t, err)
 
-	require.Contains(t, spec.Maps, "stackmap")
-	assert.Equal(t, ebpf.StackTrace, spec.Maps["stackmap"].Type)
-	assert.Equal(t, uint32(127*8), spec.Maps["stackmap"].ValueSize,
-		"PERF_MAX_STACK_DEPTH frames of u64")
+	require.Contains(t, spec.Maps, "gpu_stacks")
+	assert.Equal(t, ebpf.Hash, spec.Maps["gpu_stacks"].Type,
+		"a hand-rolled walk cannot populate a kernel BPF_MAP_TYPE_STACK_TRACE")
+	assert.Equal(t, uint32(4), spec.Maps["gpu_stacks"].KeySize, "a u32 handle")
+	assert.Equal(t, uint32(gpuStackSize), spec.Maps["gpu_stacks"].ValueSize,
+		"n_pcs, walker_flags, then MAX_FRAMES u64 PCs")
+	assert.Equal(t, uint32(gpuStackCapacity), spec.Maps["gpu_stacks"].MaxEntries)
+
+	assert.NotContains(t, spec.Maps, "stackmap",
+		"the kernel stackmap is gone: bpf_get_stackid stopped at the first frame it could not follow")
+
+	require.Contains(t, spec.Maps, "walk_errors")
+	assert.Equal(t, ebpf.Array, spec.Maps["walk_errors"].Type)
+	assert.Equal(t, uint32(walkErrMax), spec.Maps["walk_errors"].MaxEntries,
+		"one slot per way the capture can fail; none of them is silent")
+
+	// The walker's own tables must have come along with the header, or the
+	// walk degrades to the frame-pointer path this phase exists to replace.
+	for _, name := range []string{"walker_scratch", "gpu_stack_scratch", "stack_id_seq",
+		"pids", "pid_mappings", "cfi_rules", "cfi_classification", "cfi_miss_events"} {
+		assert.Contains(t, spec.Maps, name)
+	}
 
 	require.Contains(t, spec.Maps, "stacks_missing")
 	assert.Equal(t, ebpf.Array, spec.Maps["stacks_missing"].Type)
@@ -885,60 +903,97 @@ func TestAStackFailureIsCountedOncePerBatch(t *testing.T) {
 
 // --- Phase 4a: resolving a capture and getting it onto the right launch ---
 
-// fakeStackmap is a stackStore: the seam that stands in for the BPF
-// stackmap, which cannot be created without CAP_BPF. It records deletions
-// because deleting a consumed entry is load-bearing, not housekeeping - see
-// Consumer.freeStackLocked.
-type fakeStackmap struct {
-	entries   map[uint32][]byte
+// fakeStackStore is a stackStore: the seam that stands in for the BPF
+// gpu_stacks map, which cannot be created without CAP_BPF. It records
+// deletions because deleting a consumed entry is load-bearing, not
+// housekeeping - see Consumer.freeStackLocked.
+//
+// entries holds PCs rather than bytes so a test reads as a list of program
+// counters; encodeGPUStack lays them out on the wire exactly as
+// bpf/gpu_usdt.bpf.c writes a struct gpu_stack.
+type fakeStackStore struct {
+	entries map[uint32][]uint64
+	flags   map[uint32]uint32
+	// raw overrides the encoding for one id, so a test can hand the decoder
+	// a value the encoder would never produce.
+	raw       map[uint32][]byte
 	deleted   []uint32
 	lookups   int
 	lookupErr error
 	deleteErr error
 }
 
-func newFakeStackmap() *fakeStackmap {
-	return &fakeStackmap{entries: map[uint32][]byte{}}
+func newFakeStackStore() *fakeStackStore {
+	return &fakeStackStore{entries: map[uint32][]uint64{}, flags: map[uint32]uint32{}}
 }
 
-// put stores a stack as the kernel would: little-endian u64 instruction
-// pointers, leaf first, in a fixed-size buffer that the first zero slot
-// terminates.
-func (f *fakeStackmap) put(id uint32, ips ...uint64) {
-	buf := make([]byte, bpfstack.MaxFrames*8)
-	for i, ip := range ips {
-		putU64(buf[i*8:], ip)
+// encodeGPUStack lays out a struct gpu_stack the way the BPF program does:
+// a u32 count, a u32 walker_flags, then MAX_FRAMES u64 PCs, leaf first, in a
+// fixed-size buffer. Slots past n_pcs are whatever the per-CPU scratch last
+// held, so this deliberately fills them with a poison value: a decoder that
+// scans for a zero terminator instead of honouring n_pcs must fail loudly
+// here rather than in production.
+func encodeGPUStack(pcs []uint64, flags uint32) []byte {
+	buf := make([]byte, gpuStackSize)
+	putU32(buf[0:], uint32(len(pcs)))
+	putU32(buf[4:], flags)
+	for i := 0; i < maxWalkFrames; i++ {
+		if i < len(pcs) {
+			putU64(buf[gpuStackHdrSize+i*8:], pcs[i])
+			continue
+		}
+		putU64(buf[gpuStackHdrSize+i*8:], 0xdeadbeefdeadbeef)
 	}
-	f.entries[id] = buf
+	return buf
 }
 
-func (f *fakeStackmap) LookupBytes(key any) ([]byte, error) {
+// put stores a walk result under the given id.
+func (f *fakeStackStore) put(id uint32, pcs ...uint64) {
+	f.entries[id] = pcs
+}
+
+func (f *fakeStackStore) LookupBytes(key any) ([]byte, error) {
 	f.lookups++
 	if f.lookupErr != nil {
 		return nil, f.lookupErr
 	}
-	raw, ok := f.entries[key.(uint32)]
+	id := key.(uint32)
+	if b, ok := f.raw[id]; ok {
+		return b, nil
+	}
+	pcs, ok := f.entries[id]
 	if !ok {
 		return nil, ebpf.ErrKeyNotExist
 	}
-	return raw, nil
+	return encodeGPUStack(pcs, f.flags[id]), nil
 }
 
-func (f *fakeStackmap) Delete(key any) error {
+func (f *fakeStackStore) Delete(key any) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
 	id := key.(uint32)
-	if _, ok := f.entries[id]; !ok {
+	_, inEntries := f.entries[id]
+	_, inRaw := f.raw[id]
+	if !inEntries && !inRaw {
 		return ebpf.ErrKeyNotExist
 	}
 	delete(f.entries, id)
+	delete(f.raw, id)
 	f.deleted = append(f.deleted, id)
 	return nil
 }
 
-func (f *fakeStackmap) wasDeleted(id uint32) bool {
+func (f *fakeStackStore) wasDeleted(id uint32) bool {
 	return slices.Contains(f.deleted, id)
+}
+
+// resolveStackForTest is the locking wrapper the resolve-path tests use;
+// resolveStackLocked itself requires mu.
+func (c *Consumer) resolveStackForTest(stackID int32, pid uint32) ([]pp.Frame, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resolveStackLocked(pid, stackID)
 }
 
 // fakeSymbolizer names each IP "fn_<hex>" so a test can assert both the
@@ -980,9 +1035,9 @@ func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize
 func (s *fakeSymbolizer) Close() error { return nil }
 
 // stackConsumer wires a consumer to a fake stackmap and symbolizer.
-func stackConsumer(t *testing.T, sink gpu.EventSink, cfg Config) (*Consumer, *fakeStackmap, *fakeSymbolizer) {
+func stackConsumer(t *testing.T, sink gpu.EventSink, cfg Config) (*Consumer, *fakeStackStore, *fakeSymbolizer) {
 	t.Helper()
-	sm, sym := newFakeStackmap(), &fakeSymbolizer{}
+	sm, sym := newFakeStackStore(), &fakeSymbolizer{}
 	cfg.Backend, cfg.Sink = gpu.BackendCUPTI, sink
 	if cfg.Symbolizer == nil {
 		cfg.Symbolizer = sym
@@ -1028,6 +1083,274 @@ func apply(t *testing.T, c *Consumer, wire []byte) {
 	b, err := decodeBatch(wire)
 	require.NoError(t, err)
 	c.applyBatch(b)
+}
+
+// --- Phase 4b: stack_id is a handle into the walker's own map ---
+
+// The read path's shape is unchanged from the stackmap days, and so is the
+// discipline that keeps it working: an entry is deleted the moment it is
+// read. Nothing else reclaims a gpu_stacks slot, so a resolve that leaked
+// one would fill the map and turn capture off for the rest of the run.
+func TestResolveReadsTheWalkerMapAndDeletesTheEntry(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(7, 0x401000, 0x401100, 0x7f0000001000)
+
+	frames, ok := c.resolveStackForTest(7, 4242)
+	require.True(t, ok)
+	require.Len(t, frames, 3)
+	assert.Zero(t, c.Stats().StackLookupFailed)
+	assert.NotContains(t, stacks.entries, uint32(7),
+		"a resolved entry must be deleted so the id can be reused")
+	assert.True(t, stacks.wasDeleted(7))
+}
+
+// A walk that produced nothing is not an attribution. The BPF side does not
+// normally insert one - it counts the empty walk and hands the consumer -1 -
+// so this is the defensive half: if an empty entry ever does arrive, it is
+// counted rather than attached to a launch as a zero-frame call path.
+func TestAnEmptyWalkIsCountedNotAttached(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(9)
+
+	_, ok := c.resolveStackForTest(9, 4242)
+	assert.False(t, ok, "a walk that produced no frames is not an attribution")
+	assert.Equal(t, uint64(1), c.Stats().StackWalkEmpty)
+	assert.Equal(t, uint64(1), c.Stats().StackLookupFailed,
+		"StackWalkEmpty says why; the launch still lands in exactly one bucket")
+	assert.True(t, stacks.wasDeleted(9), "an empty entry is still ours to release")
+}
+
+// MAX_FRAMES worth of PCs means the walk hit its bound; the frames we have
+// are real and worth attributing, but the truncation is visible.
+func TestATruncatedWalkIsCountedButStillUsed(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(11, full...)
+
+	frames, ok := c.resolveStackForTest(11, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, maxWalkFrames)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkTruncated)
+	assert.Zero(t, c.Stats().StackLookupFailed, "a truncated walk is not a failed one")
+}
+
+// A walk shorter than MAX_FRAMES is not truncated, and nothing past n_pcs is
+// read. The scratch record is per-CPU and reused, so the slots past the walk
+// hold the previous sample's PCs - a decoder that scanned for a zero
+// terminator instead of honouring n_pcs would splice two unrelated stacks
+// together and present the result as one call path.
+func TestResolveHonoursNPcsRatherThanScanningForAZero(t *testing.T) {
+	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(13, 0x401000, 0x401100)
+
+	frames, ok := c.resolveStackForTest(13, 4242)
+	require.True(t, ok)
+	require.Len(t, frames, 2)
+	require.Len(t, sym.ips, 1)
+	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0],
+		"only the PCs the walk actually produced reach the symbolizer")
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+}
+
+// walker_flags rides along with the PCs because the walk is the only place
+// that knows how it went: whether DWARF fired, whether the FP chain reached
+// a natural terminator, whether a CFI lookup cut it short. Nothing reads it
+// yet - Task 2 does - and re-deriving it after the fact is impossible, which
+// is why it is in the map value from the start rather than added later.
+func TestDecodeGPUStackCarriesTheWalkersFlags(t *testing.T) {
+	pcs, flags, ok := decodeGPUStack(encodeGPUStack([]uint64{0x401000, 0x401100}, 0x06))
+	require.True(t, ok)
+	assert.Equal(t, []uint64{0x401000, 0x401100}, pcs)
+	assert.Equal(t, uint32(0x06), flags, "WALKER_FLAG_DWARF_USED | WALKER_FLAG_CFI_MISS")
+}
+
+// Identical PCs; only the flags the walker reported differ. An FP-only walk
+// through vendor libraries is exactly the case that produced a
+// profiler-only stack on real hardware, so the two must be countable apart -
+// a single "we got a stack" counter cannot express it.
+func TestFPOnlyAndDWARFWalksAreCountedSeparately(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	pcs := []uint64{0x401000, 0x401100}
+	stacks.put(1, pcs...)
+	stacks.flags[1] = walkerFlagDWARFUsed
+	stacks.put(2, pcs...)
+	stacks.flags[2] = walkerFlagFPTerminated
+
+	_, ok := c.resolveStackForTest(1, 4242)
+	require.True(t, ok)
+	_, ok = c.resolveStackForTest(2, 4242)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedFPOnly)
+}
+
+// n_pcs == maxWalkFrames used to be the only truncation signal, and it
+// misses exactly the failure this phase exists to fix: a walk that dies at
+// the first vendor-library frame produces two or three PCs, not 127, and
+// used to read as a complete, untruncated stack - silently, on the workload
+// this phase is about. WALKER_FLAG_FP_TERMINATED clear at a short length is
+// what makes that failure visible instead.
+func TestAWalkThatDiesEarlyIsCountedAbandonedNotSilent(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// Two frames: the probe's own PC, then one vendor frame the FP chain
+	// could not continue past. flags left at zero - no
+	// WALKER_FLAG_FP_TERMINATED, no WALKER_FLAG_DWARF_USED - which is
+	// exactly what a bpf_probe_read_user fault on that frame produces.
+	stacks.put(21, 0x401000, 0x401100)
+
+	frames, ok := c.resolveStackForTest(21, 4242)
+	require.True(t, ok, "the frames captured before the walk died are still used")
+	assert.Len(t, frames, 2)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned)
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"cut short of a natural end is a different failure than hitting MAX_FRAMES")
+}
+
+// A genuinely complete short walk - the FP chain reached its natural end -
+// is neither truncated nor abandoned. Only a walk that stopped WITHOUT
+// reaching that terminator counts against either bucket.
+func TestACompleteShortWalkIsNeitherTruncatedNorAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(23, 0x401000, 0x401100)
+	stacks.flags[23] = walkerFlagFPTerminated
+
+	_, ok := c.resolveStackForTest(23, 4242)
+	require.True(t, ok)
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// The walkerFlag* constants are a hand-copied mirror of the WALKER_FLAG_*
+// macros in bpf/unwind_common.h, and nothing in the build makes them agree.
+// A wrong bit here does not fail to compile - it silently reclassifies every
+// walk, which is exactly the class of defect this file is full of tests
+// about. So read the header and check.
+func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_common.h")
+	require.NoError(t, err)
+
+	re := regexp.MustCompile(`(?m)^#define\s+(WALKER_FLAG_\w+)\s+(0x[0-9a-fA-F]+)`)
+	got := map[string]uint32{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		v, err := strconv.ParseUint(m[2], 0, 32)
+		require.NoError(t, err)
+		got[m[1]] = uint32(v)
+	}
+	assert.Equal(t, map[string]uint32{
+		"WALKER_FLAG_FP_TERMINATED":     walkerFlagFPTerminated,
+		"WALKER_FLAG_DWARF_USED":        walkerFlagDWARFUsed,
+		"WALKER_FLAG_CFI_MISS":          walkerFlagCFIMiss,
+		"WALKER_FLAG_UNWIND_TERMINATED": walkerFlagUnwindTerminated,
+	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
+}
+
+// The defect this test exists for, measured on the Phase 4b gate:
+// abandoned == 62 alongside dwarf == 62. EVERY successful DWARF walk was
+// counted abandoned.
+//
+// A hybrid walk that crosses a frame-pointer-less frame cannot end via
+// walkerFlagFPTerminated: the DWARF step that carried it across set the
+// frame pointer to zero (fp_type UNDEFINED), so the walk ends at the next
+// FP_SAFE frame with nothing to follow. walk_step now says so with
+// walkerFlagUnwindTerminated, and that has to count as an end of chain -
+// otherwise the counter fires on success and carries no information.
+func TestASuccessfulDWARFWalkIsNotCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// The gate's shape: probe frame, two frame-pointer-less bridges, main.
+	stacks.put(31, 0x401000, 0x401100, 0x401200, 0x401300)
+	stacks.flags[31] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+
+	frames, ok := c.resolveStackForTest(31, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 4)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Zero(t, c.Stats().StackWalkAbandoned,
+		"the unwind information said the chain ends here; the walk succeeded")
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+}
+
+// The other half of the same fact: narrowing StackWalkAbandoned must not
+// hollow it out. A DWARF walk that stopped WITHOUT either terminator - a
+// read fault at a live address, a non-monotonic frame pointer, a return
+// address in an untracked register - is still a walk that could not
+// proceed, and must still be counted.
+func TestADWARFWalkThatCouldNotProceedIsStillCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(33, 0x401000, 0x401100)
+	stacks.flags[33] = walkerFlagDWARFUsed
+
+	_, ok := c.resolveStackForTest(33, 4242)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned,
+		"neither terminator bit set and short of MAX_FRAMES is the failure case")
+}
+
+// walkerFlagUnwindTerminated has to suppress truncation for the same reason
+// walkerFlagFPTerminated does: a stack that is exactly maxWalkFrames deep
+// and ended at the chain's end is complete, not cut off at the budget.
+func TestAFullLengthWalkTerminatedByUnwindInfoIsNotCountedTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(35, full...)
+	stacks.flags[35] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+
+	_, ok := c.resolveStackForTest(35, 4242)
+	require.True(t, ok)
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// A stack that is genuinely maxWalkFrames deep AND reached a natural
+// terminator on its last frame is a complete stack, not a truncated one:
+// n_pcs == maxWalkFrames alone cannot tell the two apart, and
+// walkerFlagFPTerminated is what does.
+func TestAFullLengthWalkThatTerminatedNaturallyIsNotCountedTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(25, full...)
+	stacks.flags[25] = walkerFlagFPTerminated
+
+	frames, ok := c.resolveStackForTest(25, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, maxWalkFrames)
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"maxWalkFrames deep and naturally terminated is complete, not truncated")
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// A value shorter than one struct gpu_stack cannot be decoded into a call
+// path, and guessing at a partial one would be a fabrication.
+func TestAShortStackValueIsRefused(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.raw = map[uint32][]byte{15: make([]byte, gpuStackHdrSize+8*4)}
+
+	_, ok := c.resolveStackForTest(15, 4242)
+	assert.False(t, ok)
+	assert.Equal(t, uint64(1), c.Stats().StackLookupFailed)
+}
+
+// n_pcs is read off the wire, so a value claiming more frames than the map
+// can hold must be clamped rather than trusted into an out-of-range slice.
+func TestAnOverlongNPcsIsClampedNotTrusted(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	raw := encodeGPUStack([]uint64{0x401000}, 0)
+	putU32(raw[0:], maxWalkFrames+9)
+	stacks.raw = map[uint32][]byte{17: raw}
+
+	frames, ok := c.resolveStackForTest(17, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, maxWalkFrames, "clamped to what the value can hold")
 }
 
 // The common arrival order: the shim's launch batch only flushes when it
@@ -1444,7 +1767,7 @@ func TestSymbolizationFailureDegradesToNoStackNotALostLaunch(t *testing.T) {
 func TestMissingSymbolizerIsCountedNotSilent(t *testing.T) {
 	sink := &recordingSink{}
 	c := newConsumer(Config{Backend: gpu.BackendCUPTI, Sink: sink})
-	sm := newFakeStackmap()
+	sm := newFakeStackStore()
 	sm.put(1, 0x1000)
 	c.stacks = sm
 

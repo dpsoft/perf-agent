@@ -8,9 +8,78 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
+
+type gpuusdtCfiEntry struct {
+	_          structs.HostLayout
+	PcStart    uint64
+	PcEndDelta uint32
+	CfaType    uint8
+	FpType     uint8
+	CfaOffset  int16
+	FpOffset   int16
+	RaOffset   int16
+	RaType     uint8
+	Pad        [5]uint8
+	_          [6]byte
+}
+
+type gpuusdtCfiMissRatelimitKey struct {
+	_       structs.HostLayout
+	Pid     uint32
+	TableId uint64
+}
+
+type gpuusdtClassification struct {
+	_          structs.HostLayout
+	PcStart    uint64
+	PcEndDelta uint32
+	Mode       uint8
+	Pad        [3]uint8
+}
+
+type gpuusdtGpuStack struct {
+	_           structs.HostLayout
+	N_pcs       uint32
+	WalkerFlags uint32
+	Pcs         [127]uint64
+}
+
+type gpuusdtPidConfig struct {
+	_             structs.HostLayout
+	Type          uint8
+	CollectUser   uint8
+	CollectKernel uint8
+}
+
+type gpuusdtPidMapping struct {
+	_        structs.HostLayout
+	VmaStart uint64
+	VmaEnd   uint64
+	LoadBias uint64
+	TableId  uint64
+}
+
+type gpuusdtSampleRecord struct {
+	_   structs.HostLayout
+	Hdr struct {
+		_           structs.HostLayout
+		Pid         uint32
+		Tid         uint32
+		TimeNs      uint64
+		Value       uint64
+		Mode        uint8
+		N_pcs       uint8
+		WalkerFlags uint8
+		Pad         uint8
+		Pad2        uint32
+		KernStack   int64
+	}
+	Pcs [127]uint64
+}
 
 // loadGpuusdt returns the embedded CollectionSpec for gpuusdt.
 func loadGpuusdt() (*ebpf.CollectionSpec, error) {
@@ -61,16 +130,32 @@ type gpuusdtProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtMapSpecs struct {
-	Dropped       *ebpf.MapSpec `ebpf:"dropped"`
-	Events        *ebpf.MapSpec `ebpf:"events"`
-	Stackmap      *ebpf.MapSpec `ebpf:"stackmap"`
-	StacksMissing *ebpf.MapSpec `ebpf:"stacks_missing"`
+	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
+	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
+	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
+	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
+	Dropped                  *ebpf.MapSpec `ebpf:"dropped"`
+	Events                   *ebpf.MapSpec `ebpf:"events"`
+	GpuStackScratch          *ebpf.MapSpec `ebpf:"gpu_stack_scratch"`
+	GpuStacks                *ebpf.MapSpec `ebpf:"gpu_stacks"`
+	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
+	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
+	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
+	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
+	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
+	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
 // gpuusdtVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtVariableSpecs struct {
+	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
+	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
 }
 
 // gpuusdtObjects contains all objects after they have been loaded into the kernel.
@@ -93,18 +178,44 @@ func (o *gpuusdtObjects) Close() error {
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtMaps struct {
-	Dropped       *ebpf.Map `ebpf:"dropped"`
-	Events        *ebpf.Map `ebpf:"events"`
-	Stackmap      *ebpf.Map `ebpf:"stackmap"`
-	StacksMissing *ebpf.Map `ebpf:"stacks_missing"`
+	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
+	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
+	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
+	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
+	Dropped                  *ebpf.Map `ebpf:"dropped"`
+	Events                   *ebpf.Map `ebpf:"events"`
+	GpuStackScratch          *ebpf.Map `ebpf:"gpu_stack_scratch"`
+	GpuStacks                *ebpf.Map `ebpf:"gpu_stacks"`
+	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
+	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
+	Pids                     *ebpf.Map `ebpf:"pids"`
+	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
+	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
+	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
+	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
 
 func (m *gpuusdtMaps) Close() error {
 	return _GpuusdtClose(
+		m.CfiClassification,
+		m.CfiClassificationLengths,
+		m.CfiLengths,
+		m.CfiMissEvents,
+		m.CfiMissRatelimit,
+		m.CfiRules,
 		m.Dropped,
 		m.Events,
-		m.Stackmap,
+		m.GpuStackScratch,
+		m.GpuStacks,
+		m.PidMappingLengths,
+		m.PidMappings,
+		m.Pids,
+		m.StackIdSeq,
 		m.StacksMissing,
+		m.WalkErrors,
+		m.WalkerScratch,
 	)
 }
 
@@ -112,6 +223,9 @@ func (m *gpuusdtMaps) Close() error {
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtVariables struct {
+	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
+	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
 }
 
 // gpuusdtPrograms contains all programs after they have been loaded into the kernel.

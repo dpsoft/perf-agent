@@ -3,6 +3,7 @@ package gpuprobe_test
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/ehcompile"
 )
 
 // hasCaps mirrors perfagent/agent.go's hasCapSysPtrace: check Permitted as
@@ -62,8 +64,49 @@ func hasBPFAndPerfmon() bool { return hasCaps(cap.BPF, cap.PERFMON) }
 // output.
 func hasGateCaps() bool { return hasCaps(cap.BPF, cap.PERFMON, cap.CHECKPOINT_RESTORE) }
 
-// The Phase 3 gate: the stub drives the full pipeline to pprof samples on a
-// machine with no GPU.
+// The phase gate: a GPU-free producer drives the full pipeline to pprof
+// samples on a machine with no GPU.
+//
+// # Why this drives perfagent-gpu-fpless and not perfagent-gpu-stub
+//
+// Through Phase 4a this gate drove `shim/perfagent-gpu-stub`, whose chain is
+// main -> perfagent_stub_run -> probe. Phase 4a's assertion was "some frame
+// is named perfagent_stub_run", which the leaf satisfies on its own, so the
+// gate passed before the DWARF walker existed and would pass again if the
+// DWARF walker were deleted: it could not tell this phase from the previous
+// one. Adding `StacksWalkedDWARF > 0` to a gate driven by that producer would
+// have been worse than useless - a green assertion that never ran the code it
+// names.
+//
+// It is worse than "an FP walk follows that chain on its own", which is what
+// this comment used to say. It does not. GCC 16 at -O2 gives that `main` no
+// frame pointer at all: it spills the caller's %rbp to the stack and holds
+// the launch count there instead (`mov %rbp,0x20(%rsp)` ... `mov $0x3e8,%ebp`
+// - re-derivable with objdump on shim/perfagent-gpu-stub), so
+// perfagent_stub_run saves an integer as its caller's frame pointer and the
+// chain dies one step out. Phase 4a captured with bpf_get_stackid, and the
+// kernel's perf_callchain_user stores each frame's return address BEFORE it
+// follows that frame's saved FP, so those stacks were two frames deep -
+// perfagent_stub_run and main - and reached nothing above main. This walker
+// is stricter: walk_step drops a frame whose saved FP is not monotonic
+// without keeping the return address it already read, so the SAME producer
+// under THIS walker yields one frame. Either way, driving the phase off that
+// producer would prove nothing about crossing an FP-less frame.
+//
+// `shim/perfagent-gpu-fpless` emits byte-for-byte the same records (it links
+// the same stub/stub.cc and the same shim/core/), but reaches them through
+// two frames compiled -fomit-frame-pointer:
+//
+//	main                      frame pointer      <- the walk must reach here
+//	perfagent_fpless_caller   NO frame pointer      DWARF only
+//	perfagent_fpless_bridge   NO frame pointer      DWARF only
+//	perfagent_stub_run        frame pointer      <- the probe fires here
+//
+// so every Phase 4a assertion below still means exactly what it meant, and
+// the new ones have something real to bite on. See shim/stub/fpless_bridge.cc
+// for why a saved-RBP walk provably cannot produce `perfagent_fpless_caller`,
+// and `make -C shim check-fpless` (run below) for the build-time proof that
+// the toolchain actually omitted those frame pointers.
 func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	if !hasGateCaps() {
 		t.Skip("needs CAP_BPF, CAP_PERFMON and CAP_CHECKPOINT_RESTORE " +
@@ -71,8 +114,15 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 			"symbolize.NewLocalSymbolizer refuses and every frame would be a bare address); " +
 			"sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep <test binary>")
 	}
-	built := filepath.Join("..", "shim", "perfagent-gpu-stub")
+	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
+	// Not a build step: a check. If GCC ignored -fomit-frame-pointer - and
+	// Fedora ships -fno-omit-frame-pointer in its RPM build flags, so that is
+	// a real failure mode - the two bridge frames would be followable by the
+	// frame-pointer walker this phase replaces, and every new assertion below
+	// would go green while proving nothing. Fail here, where the cause is
+	// legible, rather than there.
+	requireFPLess(t, built)
 	// Attach to a private copy, not to the shared build output. Uprobes key
 	// on the binary's *inode*, and this consumer must attach system-wide
 	// (Config.PID is zero) because the stub process does not exist yet — the
@@ -136,7 +186,23 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// has nothing to do with the capture path. Holding the producer open
 	// until the consumer has counted every sampled launch removes the race
 	// instead of papering over it with a longer sleep.
-	cmd := exec.Command(stub, "500", "200", "8", "10000")
+	// period_us is 1000, not the 200 this gate used through Phase 4a. In
+	// system-wide mode (Config.PID == 0, which this gate uses because the
+	// producer does not exist at Attach time) the walker's CFI tables for a
+	// process are compiled on the first batch the consumer sees FROM that
+	// process, on a worker goroutine, and that compile takes tens of
+	// milliseconds - it reads .eh_frame out of the producer, libstdc++, libm
+	// and libc. Sampled launches taken before it finishes are walked with no
+	// tables at all and land in StacksWalkedNoTables, which is correct
+	// behaviour and NOT asserted zero below.
+	//
+	// At 200us the whole 500-launch run lasted ~100ms, the same order as the
+	// compile, so the share of launches that got a DWARF walk was a coin
+	// toss. At 1000us the run lasts ~500ms against a ~50ms compile, so the
+	// large majority of the 63 sampled launches are walked with tables
+	// present. Nothing else depends on the period: the sampler is counting
+	// launches, not time, so the 63 below is unchanged.
+	cmd := exec.Command(stub, "500", "1000", "8", "10000")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -241,16 +307,37 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.ZeroCorrelation,
 		"the stub never emits correlation 0, so no record may have been demoted to the heuristic join")
 	assert.Zero(t, stats.StacksMissing,
-		"the stub is built with frame pointers; a missing capture means bpf_get_stackid failed on a binary that should always succeed")
+		"StacksMissing is BPF-side capture loss - no scratch, an empty walk, a full or unwritable gpu_stacks - none of which depends on how deep the walk got")
+	// StacksMissing says a capture failed; these say how it could have. All
+	// four are zero on a healthy run, and each one that is not points at a
+	// different part of the walk, which is the whole reason they are apart.
+	assert.Zero(t, stats.StackWalkEmpty, "a walk that produced not one frame, not even the probe's own PC")
+	assert.Zero(t, stats.StackMapFull, "gpu_stacks fills only if the consumer stopped draining")
+	assert.Zero(t, stats.StackMapUpdateFailed, "an insert refused for any reason other than a full map")
+	assert.Zero(t, stats.StackWalkScratchFailed, "a per-CPU scratch lookup at key 0 cannot fail on a loaded program")
 	assert.Zero(t, stats.StacksEvicted,
 		"the parked-stack side table must never overflow at this launch rate and capacity")
 	assert.Zero(t, stats.StackLookupFailed,
-		"every resolved stack's stackmap entry must be readable back exactly once")
-	assert.Zero(t, stats.StackDeleteFailed, "every stackmap entry read must also be deletable")
+		"every resolved stack's gpu_stacks entry must be readable back exactly once")
+	assert.Zero(t, stats.StackDeleteFailed, "every gpu_stacks entry read must also be deletable")
 	assert.Zero(t, stats.StacksUncorrelated,
 		"the stub never emits correlation 0 on a sampled launch")
+	// Kept from Phase 4a, and worth being honest about: for THIS producer
+	// this assertion cannot fail, and it is not the phase's proof.
+	// shimScope disables itself outright when the shim it was pointed at is
+	// an ET_EXEC program rather than a shared object (see newShimScope), and
+	// perfagent-gpu-fpless is a program - the profiler and the application
+	// are the same binary, so "the stack never left the shim" is not a
+	// defect there and there is no boundary to police. The guard is only
+	// ever armed for the injected-adapter shape, i.e. the CUDA run in Task
+	// 5, and that is where "the guard went quiet" becomes evidence.
+	// Asserted here anyway because a non-zero value would mean the guard
+	// armed itself against a self-contained producer, which is a bug in the
+	// classifier.
 	assert.Zero(t, stats.StacksProfilerOnly,
-		"the stub IS the shim, so main -> perfagent_stub_run is a real attribution; a refusal here means the injected-adapter guard misread a self-contained producer")
+		"the producer IS the shim and is an ET_EXEC program, so shimScope must not have armed itself at all; a refusal here means the injected-adapter guard misread a self-contained producer")
+	assert.Zero(t, stats.StacksProfilerOnlyUncertain,
+		"same guard, the without-proof half: it must be inert for a self-contained producer too")
 	assert.Zero(t, stats.SymbolizeFailed,
 		"a real Symbolizer is configured; every captured stack must resolve to at least one frame")
 	// The counter that would have caught this branch's symbolization failure
@@ -270,6 +357,70 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	t.Logf("frames that resolved to a bare address: %d", stats.StackFramesUnresolved)
 	assert.Zero(t, stats.KernelNamesUnresolved,
 		"the stub interns both kernel names before any launch or exec references them; every event must carry a name")
+
+	// ---- the assertions this phase exists for ----------------------------
+	//
+	// This is the one number that tells this phase from the previous one.
+	// WALKER_FLAG_DWARF_USED is set by walk_step only on a frame it
+	// classified MODE_FP_LESS and then unwound through a cfi_entry read out
+	// of the cfi_rules table - i.e. only when the walker actually read this
+	// producer's .eh_frame. The frame-pointer walker Phase 4a shipped could
+	// not set it under any input.
+	//
+	// It cannot pass vacuously: the two FP-less frames are between the probe
+	// and main by construction (make check-fpless, run above, fails the test
+	// if the toolchain did not omit those frame pointers), so a walk that
+	// gets past perfagent_stub_run's frame at all has to cross one.
+	assert.Positive(t, stats.StacksWalkedDWARF,
+		"no capture used the DWARF path: the walker never unwound an FP-less frame, so this run proves nothing the frame-pointer walker could not. FP-only=%d no-tables=%d cfi-miss=%d abandoned=%d",
+		stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables, stats.StacksWalkedCFIMiss, stats.StackWalkAbandoned)
+	assert.Equal(t, uint64(wantSampled), stats.StacksWalkedDWARF+stats.StacksWalkedFPOnly,
+		"every non-empty capture is counted exactly once as either a DWARF walk or an FP-only walk; a shortfall means captures went uncounted")
+
+	// Deliberately NOT asserted zero, and this is the trap in the shape of
+	// an obvious assertion: in system-wide mode the CFI tables for a process
+	// are compiled after the consumer sees that process's first batch, so
+	// the first sampled launches from a newly-seen producer are legitimately
+	// walked before its tables exist. A small non-zero count here is correct
+	// behaviour. What would be wrong is ALL of them, which is what the
+	// bound below says - and which StacksWalkedDWARF > 0 already implies,
+	// stated separately so the intent survives a future edit.
+	assert.Less(t, stats.StacksWalkedNoTables, uint64(wantSampled),
+		"every single capture was walked without CFI tables: registration never completed for the producer. last registration error: %q",
+		stats.UnwindLastError)
+	assert.Positive(t, stats.UnwindPIDsRegistered,
+		"the consumer never registered the producer's PID with the walker, so no capture could have had tables to use")
+	assert.Zero(t, stats.UnwindPIDsFailed,
+		"a registration that installed nothing: %q", stats.UnwindLastError)
+
+	// StackWalkAbandoned means "the walk stopped because it could not
+	// proceed". Every walk in this run has an end of chain the walker can
+	// see, so it must read zero:
+	//
+	//   - a DWARF walk crosses the two FP-less bridges and arrives at main
+	//     with no caller frame pointer (their CFI carries no rule for it),
+	//     which walk_step now reports as WALKER_FLAG_UNWIND_TERMINATED;
+	//   - an FP-only walk (the first capture or two, before the tables land)
+	//     follows the frame-pointer chain out through
+	//     __libc_start_call_main and __libc_start_main_impl into _start,
+	//     whose saved frame pointer is zero - WALKER_FLAG_FP_TERMINATED.
+	//     Verified under gdb on this exact producer.
+	//
+	// The first run of this gate reported abandoned == StacksWalkedDWARF ==
+	// 62: the counter fired on every SUCCESSFUL DWARF walk, because
+	// WALKER_FLAG_FP_TERMINATED was the only end-of-chain signal and a
+	// hybrid walk that crossed an FP-less frame can never set it. That is
+	// what this assertion pins shut. A non-zero value here now means real
+	// walks really did fail, and cfi-miss below says whether the tables are
+	// why.
+	assert.Zero(t, stats.StackWalkAbandoned,
+		"walks stopped without reaching an end of chain: %d of %d captures. cfi-miss=%d no-tables=%d dwarf=%d fp-only=%d",
+		stats.StackWalkAbandoned, wantSampled, stats.StacksWalkedCFIMiss,
+		stats.StacksWalkedNoTables, stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly)
+	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d registered=%d binaries=%d",
+		stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables,
+		stats.StacksWalkedCFIMiss, stats.StackWalkTruncated, stats.StackWalkAbandoned,
+		stats.UnwindPIDsRegistered, stats.UnwindBinariesAttached)
 
 	snap := timeline.Snapshot()
 	samples := gpu.ProjectExecutions(snap)
@@ -303,10 +454,33 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 
 	// Sampled-stack accounting: exactly 63 of the 500 launches reached the
 	// timeline with a non-empty CPUStack, and every one of those stacks
-	// names the stub's own launch function. The stub is built with frame
-	// pointers, so a failure here is the capture or symbolization path, not
-	// the workload — see resolveStackLocked in consumer.go.
-	var sampledLaunches int
+	// names the function the probe fired in. perfagent_stub_run keeps its
+	// frame pointer (see shim/Makefile), so a failure on that one is the
+	// capture or symbolization path, not the workload — see
+	// resolveStackLocked in consumer.go.
+	//
+	// sawFPLessCaller is the by-name half of the DWARF assertion, and it is
+	// a strictly stronger statement than a counter. perfagent_fpless_caller
+	// is reachable ONLY through perfagent_fpless_bridge's frame, which has
+	// no frame pointer and does not touch %rbp — so throughout both of them
+	// %rbp still holds main's frame pointer, and a saved-RBP walk steps from
+	// perfagent_stub_run's frame straight past both of them into main. An
+	// FP-only walk therefore yields
+	//
+	//	perfagent_stub_run, perfagent_fpless_bridge, main, ...
+	//
+	// (the bridge's PC is the return address stored in perfagent_stub_run's
+	// own frame — reaching a frame's return address is not unwinding that
+	// frame) and a hybrid walk yields
+	//
+	//	perfagent_stub_run, perfagent_fpless_bridge,
+	//	perfagent_fpless_caller, main
+	//
+	// so this name in a resolved stack is a positive witness that the
+	// walker read .eh_frame and unwound an FP-less frame with it. That is
+	// why it is asserted by name rather than by depth: a deeper stack could
+	// come from anywhere, this name could not.
+	var sampledLaunches, sawFPLessCaller int
 	for _, view := range snap.Executions {
 		require.NotNil(t, view.Launch,
 			"every execution joined its launch exactly (asserted above), so Launch must never be nil here")
@@ -314,19 +488,36 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 			continue
 		}
 		sampledLaunches++
-		var sawStubFrame bool
+		var sawStubFrame, sawCaller bool
 		for _, f := range view.Launch.Launch.CPUStack {
 			if strings.Contains(f.Name, "perfagent_stub_run") {
 				sawStubFrame = true
-				break
+			}
+			if strings.Contains(f.Name, "perfagent_fpless_caller") {
+				sawCaller = true
 			}
 		}
 		assert.True(t, sawStubFrame,
-			"sampled launch's CPUStack does not contain a frame from the stub's own launch function: %+v",
+			"sampled launch's CPUStack does not contain a frame from the function the probe fires in: %+v",
 			view.Launch.Launch.CPUStack)
+		if sawCaller {
+			sawFPLessCaller++
+		}
 	}
 	assert.Equal(t, 63, sampledLaunches,
 		"exactly 63 launches on the timeline must carry a non-empty CPUStack, matching Stats.SampledLaunches")
+	assert.Positive(t, sawFPLessCaller,
+		"not one of the %d sampled stacks names perfagent_fpless_caller, which is only reachable by unwinding an FP-less frame through CFI: the walk never crossed one, or the symbolizer could not name it",
+		sampledLaunches)
+	// The two halves of the same fact must agree, and in this direction:
+	// a stack can only carry that frame if the walk that produced it used
+	// CFI, so the by-name count can never exceed the flag count. If it did,
+	// the flag is being cleared or lost somewhere between walk_step and
+	// Stats — which would make StacksWalkedDWARF an unreliable gate.
+	assert.LessOrEqual(t, uint64(sawFPLessCaller), stats.StacksWalkedDWARF,
+		"more stacks name perfagent_fpless_caller (%d) than the walker flagged as having used DWARF (%d)",
+		sawFPLessCaller, stats.StacksWalkedDWARF)
+	t.Logf("sampled stacks naming perfagent_fpless_caller: %d/%d", sawFPLessCaller, sampledLaunches)
 
 	// The two projected populations - stack-attributed and unattributed -
 	// must sum to the exact total GPU duration, and no sample's value may
@@ -422,4 +613,102 @@ func requireBuilt(t *testing.T, path string) {
 	cmd := exec.Command("make", "-C", filepath.Dir(path), "perfagent-gpu-stub")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "build stub: %s", out)
+}
+
+// requireFPLess runs `make -C shim check-fpless`, which disassembles the
+// producer and fails if the toolchain did not do what the per-file flags in
+// shim/Makefile asked: no frame pointer and no write to %rbp in either
+// bridge function, a frame pointer in perfagent_stub_run, and an .eh_frame
+// section to read.
+//
+// It is here rather than left to the build because the failure it catches is
+// silent in the worst way. A bridge with a frame pointer is followable by the
+// frame-pointer walker this phase replaces, so every new assertion in the
+// gate would pass on a run that exercised none of the new code. Fedora ships
+// -fno-omit-frame-pointer in its RPM build flags, so a toolchain that
+// re-enables frame pointers is a real possibility, not a theoretical one.
+func requireFPLess(t *testing.T, built string) {
+	t.Helper()
+	for _, tool := range []string{"make", "objdump", "readelf"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s unavailable: cannot prove %s has no frame pointers, and running the gate without that proof would assert nothing",
+				tool, filepath.Base(built))
+		}
+	}
+	out, err := exec.Command("make", "-C", filepath.Dir(built), "check-fpless").CombinedOutput()
+	require.NoError(t, err, "check-fpless: %s", out)
+	t.Logf("check-fpless: %s", bytes.TrimSpace(out))
+}
+
+// TestTheProducersBridgeFramesAreFPLessInTheCFI is the same proof as
+// `make check-fpless`, one level up: check-fpless reads the instruction
+// stream, this reads what the walker actually consults.
+//
+// walk_step does not look at instructions. It looks up (table_id, rel_pc) in
+// cfi_classification and takes the DWARF path only for MODE_FP_LESS, which
+// ehcompile derives from one thing: whether the CFA rule at that PC is rooted
+// at SP or at FP. So "the function has no `push %rbp; mov %rsp,%rbp`" and
+// "the walker will unwind it with CFI" are two different claims, and only the
+// second one makes the gate mean anything. This test makes the second claim
+// checkable without CAP_BPF - it compiles the producer's .eh_frame with the
+// very same ehcompile the consumer uses and asserts the modes directly.
+//
+// Without it, the only evidence for the walker's behaviour would be a gate
+// that a developer without capabilities cannot run.
+func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
+	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
+	requireBuilt(t, built)
+
+	_, classes, ehBytes, err := ehcompile.Compile(built)
+	require.NoError(t, err, "the producer's .eh_frame must compile: it is the only way the walker can cross an FP-less frame")
+	require.Positive(t, ehBytes, "no .eh_frame bytes: the DWARF walker would have nothing to read")
+
+	ef, err := elf.Open(built)
+	require.NoError(t, err)
+	defer func() { _ = ef.Close() }()
+	syms, err := ef.Symbols()
+	require.NoError(t, err, "the producer must not be stripped; the gate asserts on frame names")
+
+	// The midpoint of the function body, not its entry. At entry the CFA is
+	// still SP-rooted even in a function that does establish a frame pointer
+	// - the prologue has not run yet - so classifying on the entry PC would
+	// call every function FP-less and the test would pass for the wrong
+	// reason.
+	classify := func(t *testing.T, name string) ehcompile.Mode {
+		t.Helper()
+		var sym *elf.Symbol
+		for i := range syms {
+			if syms[i].Name == name {
+				sym = &syms[i]
+				break
+			}
+		}
+		require.NotNilf(t, sym, "symbol %s not found in %s", name, built)
+		require.Positivef(t, sym.Size, "symbol %s has no size; cannot pick a PC inside it", name)
+		pc := sym.Value + sym.Size/2
+		for _, c := range classes {
+			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
+				return c.Mode
+			}
+		}
+		t.Fatalf("no classification row covers %#x, the midpoint of %s: the walker would treat it as FP_SAFE and never take the DWARF path", pc, name)
+		return 0
+	}
+
+	// The two frames between the probe and main. MODE_FP_LESS is exactly
+	// what makes walk_step read cfi_rules and set WALKER_FLAG_DWARF_USED.
+	for _, name := range []string{"perfagent_fpless_bridge", "perfagent_fpless_caller"} {
+		assert.Equalf(t, ehcompile.ModeFPLess, classify(t, name),
+			"%s classifies as something other than FP_LESS, so walk_step would take the frame-pointer path through it and the gate's StacksWalkedDWARF assertion could not be satisfied by this producer", name)
+	}
+
+	// The other half of the hybrid, and not a formality: the walk's FIRST
+	// step is an FP step out of perfagent_stub_run's frame, and main is the
+	// frame it has to land on afterwards. If either were FP-less the walk
+	// would still work but would no longer exercise the FP -> DWARF -> FP
+	// handoff this producer exists to reproduce.
+	for _, name := range []string{"perfagent_stub_run", "main"} {
+		assert.Equalf(t, ehcompile.ModeFPSafe, classify(t, name),
+			"%s is not FP_SAFE, so the walk would not cross an FP/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
+	}
 }

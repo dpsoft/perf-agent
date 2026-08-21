@@ -70,12 +70,28 @@ func hasGateCaps() bool { return hasCaps(cap.BPF, cap.PERFMON, cap.CHECKPOINT_RE
 // # Why this drives perfagent-gpu-fpless and not perfagent-gpu-stub
 //
 // Through Phase 4a this gate drove `shim/perfagent-gpu-stub`, whose chain is
-// main -> perfagent_stub_run -> probe. A frame-pointer walk follows that on
-// its own, so the gate passed before the DWARF walker existed and would pass
-// again if the DWARF walker were deleted: it could not tell this phase from
-// the previous one. Adding `StacksWalkedDWARF > 0` to a gate driven by that
-// producer would have been worse than useless - a green assertion that never
-// ran the code it names.
+// main -> perfagent_stub_run -> probe. Phase 4a's assertion was "some frame
+// is named perfagent_stub_run", which the leaf satisfies on its own, so the
+// gate passed before the DWARF walker existed and would pass again if the
+// DWARF walker were deleted: it could not tell this phase from the previous
+// one. Adding `StacksWalkedDWARF > 0` to a gate driven by that producer would
+// have been worse than useless - a green assertion that never ran the code it
+// names.
+//
+// It is worse than "an FP walk follows that chain on its own", which is what
+// this comment used to say. It does not. GCC 16 at -O2 gives that `main` no
+// frame pointer at all: it spills the caller's %rbp to the stack and holds
+// the launch count there instead (`mov %rbp,0x20(%rsp)` ... `mov $0x3e8,%ebp`
+// - re-derivable with objdump on shim/perfagent-gpu-stub), so
+// perfagent_stub_run saves an integer as its caller's frame pointer and the
+// chain dies one step out. Phase 4a captured with bpf_get_stackid, and the
+// kernel's perf_callchain_user stores each frame's return address BEFORE it
+// follows that frame's saved FP, so those stacks were two frames deep -
+// perfagent_stub_run and main - and reached nothing above main. This walker
+// is stricter: walk_step drops a frame whose saved FP is not monotonic
+// without keeping the return address it already read, so the SAME producer
+// under THIS walker yields one frame. Either way, driving the phase off that
+// producer would prove nothing about crossing an FP-less frame.
 //
 // `shim/perfagent-gpu-fpless` emits byte-for-byte the same records (it links
 // the same stub/stub.cc and the same shim/core/), but reaches them through
@@ -376,6 +392,31 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		"the consumer never registered the producer's PID with the walker, so no capture could have had tables to use")
 	assert.Zero(t, stats.UnwindPIDsFailed,
 		"a registration that installed nothing: %q", stats.UnwindLastError)
+
+	// StackWalkAbandoned means "the walk stopped because it could not
+	// proceed". Every walk in this run has an end of chain the walker can
+	// see, so it must read zero:
+	//
+	//   - a DWARF walk crosses the two FP-less bridges and arrives at main
+	//     with no caller frame pointer (their CFI carries no rule for it),
+	//     which walk_step now reports as WALKER_FLAG_UNWIND_TERMINATED;
+	//   - an FP-only walk (the first capture or two, before the tables land)
+	//     follows the frame-pointer chain out through
+	//     __libc_start_call_main and __libc_start_main_impl into _start,
+	//     whose saved frame pointer is zero - WALKER_FLAG_FP_TERMINATED.
+	//     Verified under gdb on this exact producer.
+	//
+	// The first run of this gate reported abandoned == StacksWalkedDWARF ==
+	// 62: the counter fired on every SUCCESSFUL DWARF walk, because
+	// WALKER_FLAG_FP_TERMINATED was the only end-of-chain signal and a
+	// hybrid walk that crossed an FP-less frame can never set it. That is
+	// what this assertion pins shut. A non-zero value here now means real
+	// walks really did fail, and cfi-miss below says whether the tables are
+	// why.
+	assert.Zero(t, stats.StackWalkAbandoned,
+		"walks stopped without reaching an end of chain: %d of %d captures. cfi-miss=%d no-tables=%d dwarf=%d fp-only=%d",
+		stats.StackWalkAbandoned, wantSampled, stats.StacksWalkedCFIMiss,
+		stats.StacksWalkedNoTables, stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly)
 	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d registered=%d binaries=%d",
 		stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables,
 		stats.StacksWalkedCFIMiss, stats.StackWalkTruncated, stats.StackWalkAbandoned,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"sync"
@@ -1218,6 +1219,90 @@ func TestACompleteShortWalkIsNeitherTruncatedNorAbandoned(t *testing.T) {
 	stacks.flags[23] = walkerFlagFPTerminated
 
 	_, ok := c.resolveStackForTest(23, 4242)
+	require.True(t, ok)
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// The walkerFlag* constants are a hand-copied mirror of the WALKER_FLAG_*
+// macros in bpf/unwind_common.h, and nothing in the build makes them agree.
+// A wrong bit here does not fail to compile - it silently reclassifies every
+// walk, which is exactly the class of defect this file is full of tests
+// about. So read the header and check.
+func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_common.h")
+	require.NoError(t, err)
+
+	re := regexp.MustCompile(`(?m)^#define\s+(WALKER_FLAG_\w+)\s+(0x[0-9a-fA-F]+)`)
+	got := map[string]uint32{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		v, err := strconv.ParseUint(m[2], 0, 32)
+		require.NoError(t, err)
+		got[m[1]] = uint32(v)
+	}
+	assert.Equal(t, map[string]uint32{
+		"WALKER_FLAG_FP_TERMINATED":     walkerFlagFPTerminated,
+		"WALKER_FLAG_DWARF_USED":        walkerFlagDWARFUsed,
+		"WALKER_FLAG_CFI_MISS":          walkerFlagCFIMiss,
+		"WALKER_FLAG_UNWIND_TERMINATED": walkerFlagUnwindTerminated,
+	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
+}
+
+// The defect this test exists for, measured on the Phase 4b gate:
+// abandoned == 62 alongside dwarf == 62. EVERY successful DWARF walk was
+// counted abandoned.
+//
+// A hybrid walk that crosses a frame-pointer-less frame cannot end via
+// walkerFlagFPTerminated: the DWARF step that carried it across set the
+// frame pointer to zero (fp_type UNDEFINED), so the walk ends at the next
+// FP_SAFE frame with nothing to follow. walk_step now says so with
+// walkerFlagUnwindTerminated, and that has to count as an end of chain -
+// otherwise the counter fires on success and carries no information.
+func TestASuccessfulDWARFWalkIsNotCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// The gate's shape: probe frame, two frame-pointer-less bridges, main.
+	stacks.put(31, 0x401000, 0x401100, 0x401200, 0x401300)
+	stacks.flags[31] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+
+	frames, ok := c.resolveStackForTest(31, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 4)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Zero(t, c.Stats().StackWalkAbandoned,
+		"the unwind information said the chain ends here; the walk succeeded")
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+}
+
+// The other half of the same fact: narrowing StackWalkAbandoned must not
+// hollow it out. A DWARF walk that stopped WITHOUT either terminator - a
+// read fault at a live address, a non-monotonic frame pointer, a return
+// address in an untracked register - is still a walk that could not
+// proceed, and must still be counted.
+func TestADWARFWalkThatCouldNotProceedIsStillCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(33, 0x401000, 0x401100)
+	stacks.flags[33] = walkerFlagDWARFUsed
+
+	_, ok := c.resolveStackForTest(33, 4242)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned,
+		"neither terminator bit set and short of MAX_FRAMES is the failure case")
+}
+
+// walkerFlagUnwindTerminated has to suppress truncation for the same reason
+// walkerFlagFPTerminated does: a stack that is exactly maxWalkFrames deep
+// and ended at the chain's end is complete, not cut off at the budget.
+func TestAFullLengthWalkTerminatedByUnwindInfoIsNotCountedTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(35, full...)
+	stacks.flags[35] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+
+	_, ok := c.resolveStackForTest(35, 4242)
 	require.True(t, ok)
 	assert.Zero(t, c.Stats().StackWalkTruncated)
 	assert.Zero(t, c.Stats().StackWalkAbandoned)

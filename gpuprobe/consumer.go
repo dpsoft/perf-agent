@@ -56,10 +56,10 @@ const (
 	// maxWalkFrames mirrors MAX_FRAMES in bpf/unwind_common.h: the walker's
 	// bpf_loop bound, and therefore the length of a struct gpu_stack's pcs
 	// array. A walk that produced exactly this many frames AND did not reach
-	// a natural terminator (walkerFlagFPTerminated clear) hit the bound and
+	// a natural terminator (no walkerFlagsTerminated bit) hit the bound and
 	// is truncated (Stats.StackWalkTruncated); one that reached the bound
-	// and also set walkerFlagFPTerminated happens to be a complete stack
-	// exactly this deep, not a truncated one.
+	// and also terminated happens to be a complete stack exactly this deep,
+	// not a truncated one.
 	maxWalkFrames = 127
 
 	// walkerFlagFPTerminated, walkerFlagDWARFUsed and walkerFlagCFIMiss
@@ -74,10 +74,26 @@ const (
 	//     cannot survive the first frame-pointer-omitting vendor frame.
 	//   - walkerFlagFPTerminated set means the FP chain reached its natural
 	//     end (saved_fp == 0 in walk_step): the walk ran off the true root
-	//     of the stack. Clear means the walk stopped for some other reason —
-	//     a user-memory read fault, a CFI lookup miss, an unsupported RA/FP
-	//     location, or bpf_loop exhausting MAX_FRAMES — and did NOT reach
-	//     the root, even though it may have produced usable frames.
+	//     of the stack.
+	//   - walkerFlagUnwindTerminated set means the walk ended where the
+	//     unwind information itself says the chain ends: either a frame
+	//     whose CFI gives the return address as UNDEFINED (the DWARF marker
+	//     for an outermost frame), or an FP_SAFE frame reached with no
+	//     caller frame pointer to follow because the CFI below it did not
+	//     preserve one. It is the DWARF-side counterpart of
+	//     walkerFlagFPTerminated and must be read together with it: a hybrid
+	//     walk that crossed a frame-pointer-less frame CANNOT end via
+	//     saved_fp == 0, because the DWARF step that carried it there set
+	//     the frame pointer to zero. Before this bit existed such a walk was
+	//     indistinguishable from one killed by a read fault, so EVERY
+	//     successful DWARF walk was counted in StackWalkAbandoned.
+	//
+	//     With both bits clear the walk stopped for a reason it could do
+	//     nothing about — a user-memory read fault at a live address, a
+	//     non-monotonic frame pointer, a CFI lookup miss, an RA/FP location
+	//     this walker does not track, or bpf_loop exhausting MAX_FRAMES —
+	//     and did NOT reach the root, even though it may have produced
+	//     usable frames.
 	//   - walkerFlagCFIMiss set means the walker classified a frame as
 	//     frame-pointer-less, went looking for the CFI entry covering it,
 	//     and found none — so it stopped. Before Task 3 this could not
@@ -85,9 +101,15 @@ const (
 	//     reached the lookup); now that registration installs them, it
 	//     separates "the tables are missing" from "the tables are there and
 	//     do not cover this PC". See Stats.StacksWalkedCFIMiss.
-	walkerFlagFPTerminated = 0x01
-	walkerFlagDWARFUsed    = 0x02
-	walkerFlagCFIMiss      = 0x04
+	walkerFlagFPTerminated     = 0x01
+	walkerFlagDWARFUsed        = 0x02
+	walkerFlagCFIMiss          = 0x04
+	walkerFlagUnwindTerminated = 0x08
+
+	// walkerFlagsTerminated is the set of bits that mean "the walk reached
+	// the end of the chain". Neither StackWalkTruncated nor
+	// StackWalkAbandoned may count a capture with any of them set.
+	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagUnwindTerminated
 
 	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
 	// bpf/gpu_usdt.bpf.c:
@@ -368,8 +390,8 @@ type Stats struct {
 	// an empty walk still lands in exactly one bucket.
 	StackWalkEmpty uint64
 	// StackWalkTruncated counts resolved captures whose walk hit MAX_FRAMES
-	// without also reaching a natural terminator (walkerFlagFPTerminated
-	// clear at n_pcs == maxWalkFrames). NOT a failure and not part of the
+	// without also reaching a natural terminator (no walkerFlagsTerminated
+	// bit at n_pcs == maxWalkFrames). NOT a failure and not part of the
 	// identity: the frames are real and are attributed. It is here because a
 	// truncated stack is missing its outermost frames - the ones nearest
 	// main, which is where a flame graph is read from - so a rising count
@@ -379,7 +401,7 @@ type Stats struct {
 	// purpose, see StackWalkAbandoned.
 	StackWalkTruncated uint64
 	// StackWalkAbandoned counts resolved captures whose walk stopped before
-	// reaching a natural terminator (walkerFlagFPTerminated clear) AND
+	// reaching a natural terminator (no walkerFlagsTerminated bit) AND
 	// before running out of budget (n_pcs < maxWalkFrames). This is the
 	// counter Task 1 was missing: n_pcs == maxWalkFrames is exactly the
 	// wrong test for "the walk failed to make progress", because a walk
@@ -388,11 +410,21 @@ type Stats struct {
 	// stack - the case that produced a flame graph rooted entirely in the
 	// profiler's own callback, silently, because nothing was counting it.
 	//
-	// The underlying causes are a bpf_probe_read_user fault walking the FP
-	// chain, a CFI lookup miss (walkerFlagCFIMiss, 0x04), or DWARF
-	// classifying a return-address or frame-pointer location this walker
-	// does not track (bpf/unwind_common.h walk_step). All three stop the
-	// walk the same way: fewer frames than requested, no natural end.
+	// The underlying causes are a bpf_probe_read_user fault at a live
+	// address while walking the FP chain, a frame pointer that did not
+	// increase, a CFI lookup miss (walkerFlagCFIMiss, 0x04), or DWARF
+	// giving a return address in a register this walker does not track
+	// (bpf/unwind_common.h walk_step). They stop the walk the same way:
+	// fewer frames than requested, no end of chain.
+	//
+	// It deliberately does NOT count a walk that ended where the unwind
+	// information says the chain ends (walkerFlagUnwindTerminated) even
+	// though such a walk also has walkerFlagFPTerminated clear. A hybrid
+	// walk that crossed a frame-pointer-less frame can only ever end that
+	// way, so counting it here made the counter fire on every SUCCESSFUL
+	// DWARF walk - measured at abandoned == StacksWalkedDWARF == 62 on the
+	// Phase 4b gate - which is both useless as a signal and reads as a
+	// fleet of failures to anyone looking at Stats in production.
 	//
 	// NOT a failure in the record-loss sense - the frames captured are
 	// still symbolized and attributed - but it is missing every frame above
@@ -1439,23 +1471,31 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// this capture is also counted in StackWalkAbandoned below.
 		c.stats.StacksWalkedCFIMiss++
 	}
-	switch fpTerminated := flags&walkerFlagFPTerminated != 0; {
-	case fpTerminated:
-		// The FP chain reached its natural end (saved_fp == 0): the walk
-		// ran off the true root of the stack, not off a budget or a
-		// failure. Not truncated even in the coincidental case where that
-		// also happens to be the maxWalkFrames'th frame.
+	switch terminated := flags&walkerFlagsTerminated != 0; {
+	case terminated:
+		// The walk reached the end of the chain, not the end of a budget
+		// and not a failure: either the FP chain's natural end
+		// (saved_fp == 0, walkerFlagFPTerminated) or the point the unwind
+		// information itself calls outermost (walkerFlagUnwindTerminated).
+		// Both must be honoured here - a hybrid walk that crossed a
+		// frame-pointer-less frame cannot end the first way, because the
+		// DWARF step that carried it there zeroed the frame pointer, so
+		// testing only walkerFlagFPTerminated counted every successful
+		// DWARF walk as abandoned. Not truncated either, even in the
+		// coincidental case where the end is the maxWalkFrames'th frame.
 	case len(ips) == maxWalkFrames:
 		// No natural terminator, and bpf_loop ran out of iterations. The
 		// frames are real and are used; the missing outermost ones - the
 		// ones nearest main - are what this records.
 		c.stats.StackWalkTruncated++
 	default:
-		// No natural terminator, and the walk did not run out of budget
-		// either: it stopped because it could not continue - a
-		// bpf_probe_read_user fault, a CFI lookup miss, or an RA/FP
-		// location this walker does not track (bpf/unwind_common.h
-		// walk_step). This is the case "len(ips) == maxWalkFrames" alone
+		// No end of chain, and the walk did not run out of budget either:
+		// it stopped because it could not continue - a
+		// bpf_probe_read_user fault at a live address, a frame pointer
+		// that did not increase, a CFI lookup miss, or a return address
+		// in a register this walker does not track
+		// (bpf/unwind_common.h walk_step). This is the case
+		// "len(ips) == maxWalkFrames" alone
 		// could never catch: a walk that dies at the first
 		// frame-pointer-omitting vendor frame produces n_pcs of roughly
 		// 1-3 and used to read as a complete, untruncated stack.

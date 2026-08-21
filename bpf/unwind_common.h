@@ -473,13 +473,34 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 // walker_flags bits, exposed via sample_header.walker_flags:
 //
 //   bit 0 — FP walk reached a natural terminator (saved_fp == 0). Clear
-//           means the walk was cut short by a read failure or MAX_FRAMES.
+//           means the FP path did not end the walk at the root.
 //   bit 1 — at least one frame used the DWARF path.
 //   bit 2 — at least one frame's CFI lookup missed while classified FP_LESS
 //           (walk truncated at that frame).
-#define WALKER_FLAG_FP_TERMINATED  0x01
-#define WALKER_FLAG_DWARF_USED     0x02
-#define WALKER_FLAG_CFI_MISS       0x04
+//   bit 3 — the walk ended where the unwind information itself says the
+//           chain ends, rather than because the walker could not proceed.
+//           Two ways that happens, both benign:
+//             * a frame's CFI gives the return address as UNDEFINED, the
+//               DWARF marker for an outermost frame (glibc emits it for
+//               _start and for thread entry points); or
+//             * the walker arrived at an FP_SAFE frame with no caller frame
+//               pointer to follow (ctx->fp == 0), because the CFI of the
+//               frame below it did not preserve one — the same end-of-chain
+//               condition saved_fp == 0 reports one step later.
+//
+// Bits 0 and 3 are the two "the walk finished" bits; a walk with neither
+// stopped for a reason it could not do anything about (a user-memory read
+// fault, a CFI miss, an RA/FP location this walker does not track, or
+// MAX_FRAMES). Consumers must treat them as a pair — see
+// gpuprobe/consumer.go Stats.StackWalkAbandoned, which counts exactly the
+// walks that set neither and did not hit MAX_FRAMES. Bit 3 is additive:
+// perf_dwarf.bpf.c and offcpu_dwarf.bpf.c read walker_flags only for
+// WALKER_FLAG_DWARF_USED when computing sample_header.mode, so it changes
+// nothing for them.
+#define WALKER_FLAG_FP_TERMINATED    0x01
+#define WALKER_FLAG_DWARF_USED       0x02
+#define WALKER_FLAG_CFI_MISS         0x04
+#define WALKER_FLAG_UNWIND_TERMINATED 0x08
 
 // walk_step is the per-frame bpf_loop callback for the hybrid walker.
 // Classifies ctx->pc, picks FP or DWARF path, and advances the walk
@@ -530,9 +551,16 @@ static long walk_step(__u32 idx, void *arg) {
         if (e.ra_type == RA_TYPE_OFFSET_CFA) {
             if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
                                     (void *)(cfa + (__s64)e.ra_offset)) != 0) return 1;
+        } else if (e.ra_type == RA_TYPE_UNDEFINED) {
+            // The CFI says this frame has no return address: it is the
+            // outermost frame of the chain (glibc marks _start and thread
+            // entry points this way). The walk is COMPLETE, not stuck.
+            ctx->rec->hdr.walker_flags |= WALKER_FLAG_UNWIND_TERMINATED;
+            return 1;
         } else {
-            // SAME_VALUE (leaf on arm64) or REGISTER — we don't track
-            // non-FP registers, so stop.
+            // SAME_VALUE (leaf on arm64) or REGISTER — the return address
+            // lives in a register we do not track, so we cannot proceed
+            // even though a caller exists. A genuine stop, left unflagged.
             return 1;
         }
 
@@ -556,6 +584,19 @@ static long walk_step(__u32 idx, void *arg) {
     }
 
     // FP_SAFE or FALLBACK — same path: FP walk.
+    if (ctx->fp == 0) {
+        // No caller frame pointer to follow. Either the DWARF rules of the
+        // frame below this one did not preserve one (fp_type UNDEFINED /
+        // REGISTER sets new_fp = 0 above), or the thread's FP register was
+        // already zero at capture. Either way the frame-pointer chain ends
+        // HERE, which is the same fact saved_fp == 0 records one step
+        // later — not a failure to make progress. Reading user memory at
+        // address 0 to rediscover that would fault and, before this check
+        // existed, made every such walk indistinguishable from one killed
+        // by a genuine read fault.
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_UNWIND_TERMINATED;
+        return 1;
+    }
     __u64 saved_fp = 0, ret_addr = 0;
     if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) return 1;
     if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) return 1;

@@ -62,10 +62,10 @@ const (
 	// exactly this deep, not a truncated one.
 	maxWalkFrames = 127
 
-	// walkerFlagFPTerminated and walkerFlagDWARFUsed mirror WALKER_FLAG_* in
-	// bpf/unwind_common.h (0x01 and 0x02; 0x04 is WALKER_FLAG_CFI_MISS,
-	// which nothing here reads yet). They ride in struct gpu_stack's
-	// walker_flags and say how the walk went, not just how far it got:
+	// walkerFlagFPTerminated, walkerFlagDWARFUsed and walkerFlagCFIMiss
+	// mirror WALKER_FLAG_* in bpf/unwind_common.h. They ride in struct
+	// gpu_stack's walker_flags and say how the walk went, not just how far
+	// it got:
 	//
 	//   - walkerFlagDWARFUsed set means at least one frame was unwound via
 	//     CFI. Clear means every frame the walk kept was reached by frame
@@ -78,8 +78,16 @@ const (
 	//     a user-memory read fault, a CFI lookup miss, an unsupported RA/FP
 	//     location, or bpf_loop exhausting MAX_FRAMES — and did NOT reach
 	//     the root, even though it may have produced usable frames.
+	//   - walkerFlagCFIMiss set means the walker classified a frame as
+	//     frame-pointer-less, went looking for the CFI entry covering it,
+	//     and found none — so it stopped. Before Task 3 this could not
+	//     happen in gpuprobe at all (no PID had tables, so no frame ever
+	//     reached the lookup); now that registration installs them, it
+	//     separates "the tables are missing" from "the tables are there and
+	//     do not cover this PC". See Stats.StacksWalkedCFIMiss.
 	walkerFlagFPTerminated = 0x01
 	walkerFlagDWARFUsed    = 0x02
+	walkerFlagCFIMiss      = 0x04
 
 	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
 	// bpf/gpu_usdt.bpf.c:
@@ -207,6 +215,14 @@ type Config struct {
 	// be held at once waiting for a kernel name that has not arrived yet.
 	// Zero means defaultPendingNamedEventCapacity. See pendingNames.
 	PendingNamedEventCapacity int
+
+	// UnwindPIDCapacity bounds how many processes hold CFI tables for the
+	// stack walker at once. Zero means defaultUnwindPIDCapacity. A
+	// system-wide attach learns PIDs from the records that arrive, so the
+	// set is fed by a profiled machine and has to be bounded; see
+	// pidRegistry for the bound and Stats.UnwindPIDsEvicted for what it
+	// costs when it bites.
+	UnwindPIDCapacity int
 }
 
 const (
@@ -409,6 +425,73 @@ type Stats struct {
 	// SymbolizeFailed, ...) - see StacksWalkedDWARF for why the split is
 	// made this early rather than gated on symbolization succeeding.
 	StacksWalkedFPOnly uint64
+	// StacksWalkedNoTables counts captures walked for a process the walker
+	// had no CFI tables for. It is the SUBSET of StacksWalkedFPOnly that is
+	// explained rather than merely observed: with no entry in pid_mappings
+	// every frame classifies as MODE_FP_SAFE and the hybrid walker has
+	// nothing to be hybrid about, so an FP-only walk was the only possible
+	// outcome. Deliberately not additive with StacksWalkedFPOnly, so the
+	// two ways of getting a frame-pointer stack stay apart:
+	//
+	//   - StacksWalkedNoTables rising means registration has not caught up
+	//     (or failed) - see UnwindPIDsRegistered / UnwindPIDsFailed /
+	//     UnwindPIDsEvicted for which. It is expected to be non-zero and
+	//     small on a system-wide attach: the walk that carries the first
+	//     sighting of a process necessarily ran before the tables for it
+	//     existed. It is a bug if it keeps rising for a long-lived process.
+	//   - StacksWalkedFPOnly rising while this stays flat means the tables
+	//     were there and the walker still never needed CFI, which is what a
+	//     fully frame-pointer-preserving call path looks like.
+	//
+	// It is a LOWER BOUND, by construction: a PID's tables can land between
+	// the walk and this count, and the error is always in the direction of
+	// under-reporting. See pidRegistry.ready.
+	StacksWalkedNoTables uint64
+	// StacksWalkedCFIMiss counts captures whose walk consulted a CFI table
+	// and found no entry covering the frame's PC (walkerFlagCFIMiss set).
+	// The walker stops there, so these captures are also counted in
+	// StackWalkAbandoned; this is the SUBSET of that with a named cause.
+	//
+	// It is the counterpart to StacksWalkedNoTables, and separating them is
+	// the whole point: "no tables for this process" is fixed by registering
+	// the process, "tables that do not cover this PC" is a gap in what
+	// unwind/ehcompile produced for that binary. Conflating them would hide
+	// the second behind the first, which is the more common of the two.
+	StacksWalkedCFIMiss uint64
+	// UnwindPIDsRegistered counts processes whose CFI tables were installed
+	// for the walker, and UnwindBinariesAttached the distinct binaries
+	// across them - the CFI compiles actually paid for. See pidRegistry.
+	UnwindPIDsRegistered   uint64
+	UnwindBinariesAttached uint64
+	// UnwindPIDsFailed counts processes whose registration installed no
+	// tables at all: the process exited before /proc/<pid>/maps could be
+	// read, /proc was unreadable, or nothing it mapped carried usable
+	// .eh_frame. Every walk for such a process is FP-only and counts in
+	// StacksWalkedNoTables; this says why. UnwindLastError carries the most
+	// recent reason, because a bare count cannot distinguish "the process
+	// exited" from "the profiler cannot read /proc".
+	UnwindPIDsFailed uint64
+	UnwindLastError  string
+	// UnwindPIDsEvicted counts processes pushed out of the bounded
+	// registration set (Config.UnwindPIDCapacity) because
+	// less-recently-seen entries had to make room. Their tables are
+	// released and their later walks degrade to frame pointers, counted in
+	// StacksWalkedNoTables. Attribution loss, never record loss.
+	UnwindPIDsEvicted uint64
+	// UnwindRequestsDropped counts registration or release requests the
+	// worker queue could not accept. A dropped registration means the PID
+	// is forgotten and retried on its next batch; a dropped release means
+	// one process's tables stay installed until the BPF maps are closed.
+	// Neither loses a record; both are counted rather than absorbed.
+	UnwindRequestsDropped uint64
+	// UnwindReleaseFailed counts table teardowns that returned an error, so
+	// a slow leak inside the walker's maps is visible rather than inferred
+	// from a rising StacksWalkedNoTables.
+	UnwindReleaseFailed uint64
+	// UnwindPIDsTracked is a gauge: how many processes the registry is
+	// holding right now, registered or still being compiled. Bounded by
+	// Config.UnwindPIDCapacity.
+	UnwindPIDsTracked int
 	// StackMapFull counts captures the BPF side could not park because
 	// gpu_stacks was full (gpuStackCapacity live entries). Read from the
 	// `walk_errors` map.
@@ -678,6 +761,14 @@ type Consumer struct {
 	// objects were loaded (every unit test), which makes every resolution
 	// count as StackLookupFailed rather than panic.
 	stacks stackStore
+	// unwind installs the per-PID CFI tables the BPF walker consults, and
+	// bounds the set of PIDs that hold them. Nil when no BPF objects were
+	// loaded (every unit test that does not inject a fake registrar), in
+	// which case every walk reports no tables — which is the truth.
+	//
+	// It has its own lock and is safe to use under c.mu; none of the methods
+	// c.mu-holding code calls does I/O or blocks. See pidRegistry.
+	unwind *pidRegistry
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]uint64
@@ -792,6 +883,32 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		err = fmt.Errorf("load gpu usdt objects: %w", err)
 		return
 	}
+
+	// Register PIDs with the stack walker BEFORE the link exists.
+	//
+	// walk_step (bpf/unwind_common.h) unwinds by CFI only for frames it can
+	// find in pid_mappings; with nothing there it silently takes the
+	// frame-pointer path, which is the bug this phase exists to fix. So the
+	// tables have to be installed before the first probe can fire — and
+	// creating the uprobe_multi link is precisely what makes it fire, since
+	// the shim only emits once the link bumps its semaphore. Doing this
+	// after the attach would leave a window whose width is a CFI compile.
+	//
+	// Best-effort, never fatal: a consumer with no CFI tables still profiles
+	// with frame-pointer stacks, and says so in Stats.StacksWalkedNoTables.
+	// Failing the attach instead would turn a degraded profile into no
+	// profile at all.
+	c.unwind = newPIDRegistry(newEhmapsRegistrar(&c.objs), cfg.UnwindPIDCapacity)
+	if cfg.PID != 0 {
+		// Eager, and synchronous: one known process, and the cost is paid
+		// once at startup rather than against a live profiled application.
+		// This is what unwind/dwarfagent does for a per-PID profiler, where
+		// ModeLazy is forced back to ModeEager for the same reason.
+		_, _ = c.unwind.registerNow(uint32(cfg.PID))
+	}
+	// For a system-wide attach (cfg.PID == 0) there is nothing to register
+	// yet — the target may not even be running, which is exactly the gate's
+	// shape. Registration happens on first sight of a PID, in applyBatch.
 
 	var ex *link.Executable
 	if ex, err = link.OpenExecutable(cfg.ShimPath); err != nil {
@@ -1019,6 +1136,21 @@ func (c *Consumer) applyBatch(b batch) {
 
 	c.stats.Batches++
 	c.noteSeq(b.Kind, b.PID, b.Seq)
+	// First sight of a process is what makes it interesting to the walker,
+	// and "first sight" is any batch, not the first sampled launch.
+	//
+	// Sampled launches are one in SamplePeriod, and launch/exec/name batches
+	// from the same process arrive earlier and far more often, so registering
+	// on the sampled record alone would wait for a rare event before starting
+	// work that takes tens to hundreds of milliseconds — and every sampled
+	// launch in that window is an FP-only walk. Registering on the first
+	// batch of any kind makes the un-tabled window as narrow as the transport
+	// allows. Every process reaching here mapped the shim and fired a probe,
+	// so nothing uninteresting is registered.
+	//
+	// O(1) and non-blocking; the compiling happens on the registry's own
+	// goroutine, never on this one. See pidRegistry.
+	c.unwind.note(b.PID)
 
 	// A held launch is only ever waiting for a sampled record, and the
 	// sampled record it is waiting for would be the very next thing off the
@@ -1290,6 +1422,22 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		c.stats.StacksWalkedDWARF++
 	} else {
 		c.stats.StacksWalkedFPOnly++
+		// Why it was FP-only. A walk for a process the walker has no tables
+		// for could not have been anything else, and that is a different
+		// problem from a walk that had tables and never needed them - the
+		// first is fixed by registering the process, the second is what a
+		// frame-pointer-preserving call path legitimately looks like.
+		// Counting only the FP-only case keeps the two disjoint by
+		// construction: a DWARF walk proves tables existed.
+		if !c.unwind.ready(pid) {
+			c.stats.StacksWalkedNoTables++
+		}
+	}
+	if flags&walkerFlagCFIMiss != 0 {
+		// A table was consulted and did not cover this PC. Not the same
+		// failure as having no table at all, and the walk stopped there, so
+		// this capture is also counted in StackWalkAbandoned below.
+		c.stats.StacksWalkedCFIMiss++
 	}
 	switch fpTerminated := flags&walkerFlagFPTerminated != 0; {
 	case fpTerminated:
@@ -1583,6 +1731,19 @@ func (c *Consumer) Stats() Stats {
 	out.StackMapFull = c.walkError(walkErrMapFull)
 	out.StackMapUpdateFailed = c.walkError(walkErrUpdate)
 	out.StackWalkScratchFailed = c.walkError(walkErrNoScratch)
+	// The registration side of the walker: which processes got CFI tables,
+	// which did not, and what the bound pushed out. Read from the registry's
+	// own lock rather than mirrored into c.stats, because the worker
+	// goroutine — not this one — is what advances them.
+	uw, tracked := c.unwind.snapshot()
+	out.UnwindPIDsRegistered = uw.registered
+	out.UnwindBinariesAttached = uw.binariesAttached
+	out.UnwindPIDsFailed = uw.failed
+	out.UnwindLastError = uw.lastErr
+	out.UnwindPIDsEvicted = uw.evicted
+	out.UnwindRequestsDropped = uw.requestsDropped
+	out.UnwindReleaseFailed = uw.releaseFailed
+	out.UnwindPIDsTracked = tracked
 	// Gauges, read fresh: what the two side tables are holding right now.
 	out.PendingStacks = c.pending.len()
 	out.PendingLaunches = c.deferred.len()
@@ -1650,6 +1811,13 @@ func (c *Consumer) Close() error {
 	// consumer must never do. Flush takes mu itself, so it runs before the
 	// lock below rather than inside it.
 	c.Flush()
+	// Stop the registration worker before anything is torn down, and outside
+	// mu. It writes CFI tables into c.objs' maps, so letting it run past the
+	// close below would mean a compile finishing into closed file
+	// descriptors. Outside mu because Stats takes mu and the wait can last a
+	// whole compile. Idempotent, and a no-op on a nil registry, so a
+	// half-built consumer from a failed Attach is safe.
+	c.unwind.close()
 	// The links and objects come down under mu so Stats, which reads the
 	// `dropped` map, cannot be looking at c.objs while it is being closed.
 	c.mu.Lock()

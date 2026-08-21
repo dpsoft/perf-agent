@@ -8,33 +8,118 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
-
-	blazesym "github.com/libbpf/blazesym/go"
 )
 
-// Symbolizing a live process must produce real names WITHOUT any capability.
-// It did not: blazesym's process source resolves each mapping through
-// /proc/<pid>/map_files/, whose magic symlinks the kernel refuses to open
-// unless the caller holds CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN), so every
-// batch failed with "permission denied" and SymbolizeProcess quietly handed
-// back hex-named frames. This test used to SKIP on exactly that condition,
-// which is why nothing caught it — the GPU phase-4a gate, run from a binary
-// setcap'd with only cap_bpf,cap_perfmon, symbolized 63 stacks into nothing
-// but addresses. The capability skip is gone on purpose: the no_map_files
-// retry in SymbolizeProcess is what makes this pass unprivileged.
+// requireMapFilesAccess skips when this process cannot follow
+// /proc/<pid>/map_files/, which is the capability perf-agent documents as
+// required and NewLocalSymbolizer now refuses to start without.
 //
-// The remaining skip is an environment fact, not a permission one: `go test`
-// links the test binary it RUNS with the symbol table stripped (`go test -c`
-// does not), so under a plain `go test ./symbolize/` there is genuinely
-// nothing here to resolve. TestLocalSymbolizerResolvesRealNamesUnprivileged
-// below covers the same ground with a target that always has symbols, and it
-// never skips.
+// Gating on checkMapFilesAccess - the same probe the constructor uses - can
+// only ever cause a false SKIP, never a false pass: if the probe wrongly
+// reports access, the constructor proceeds and the assertions below run for
+// real against a process that cannot resolve anything, and fail. The skip
+// this replaces was different in kind. It hid a bug that was present *with*
+// the capability set the gate mandated, because the product claimed to work
+// there and did not.
+func requireMapFilesAccess(t *testing.T) {
+	t.Helper()
+	if err := checkMapFilesAccess(); err != nil {
+		t.Skipf("needs CAP_CHECKPOINT_RESTORE: %v", err)
+	}
+}
+
+// The contract NewLocalSymbolizer now carries, pinned in both directions with
+// no skip in either: without the capability it must refuse loudly and name
+// the fix, and with it, symbolizing a live process must produce a real name
+// rather than a hex address.
+//
+// The target is a shared library mapped into this very process. Unlike the Go
+// test binary (`go test` strips the symbol table from the binary it runs;
+// `go test -c` does not), libc always carries a dynamic symbol table, so a
+// bare address here means symbolization failed and nothing else. That is the
+// exact shape the map_files EPERM produced: 63 GPU stacks in the phase gate
+// symbolized into nothing but addresses, silently, because a no_map_files
+// retry stood underneath and swallowed the error.
+func TestLocalSymbolizerRefusesWithoutMapFilesAndResolvesWithIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uses /proc/self/maps")
+	}
+	probeErr := checkMapFilesAccess()
+
+	s, err := NewLocalSymbolizer()
+	if probeErr != nil {
+		if s != nil {
+			_ = s.Close()
+		}
+		if !errors.Is(err, ErrMapFilesUnavailable) {
+			t.Fatalf("without map_files access the constructor must refuse with ErrMapFilesUnavailable, got %v", err)
+		}
+		// The error is the only thing an operator sees, so it has to carry
+		// the remedy, not just the diagnosis.
+		for _, want := range []string{"CAP_CHECKPOINT_RESTORE", "cap_checkpoint_restore+ep", "hex address"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal must be actionable: %q missing from %q", want, err.Error())
+			}
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("NewLocalSymbolizer: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	addr, want := mappedLibcFuncAddr(t)
+	frames, err := s.SymbolizeProcess(uint32(os.Getpid()), []uint64{addr})
+	if err != nil {
+		t.Fatalf("SymbolizeProcess: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("got %d frames, want 1", len(frames))
+	}
+	// Not an equality check against `want`: aliases (memcpy/__memcpy_avx_unaligned
+	// and friends) mean blazesym may legitimately name it something else. The
+	// property under test is that it resolved a NAME rather than an address.
+	if frames[0].Reason != FailureNone || strings.HasPrefix(frames[0].Name, "0x") {
+		t.Fatalf("0x%x (%s in libc) did not resolve: Name=%q Reason=%s",
+			addr, want, frames[0].Name, frames[0].Reason)
+	}
+	if st := s.Stats(); st.RawAddrBatches != 0 {
+		t.Fatalf("a resolved batch must not be counted as a raw-address batch: %+v", st)
+	}
+}
+
+// A batch for a pid that does not exist is a genuine per-process failure, not
+// a capability one: it must still yield hex frames rather than an error (the
+// stack shape is worth keeping), and it must be counted.
+func TestSymbolizeProcessCountsGenuineResolutionFailures(t *testing.T) {
+	requireMapFilesAccess(t)
+	s, err := NewLocalSymbolizer()
+	if err != nil {
+		t.Fatalf("NewLocalSymbolizer: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// PID 0 is never a live process, so blazesym cannot read its /proc entry.
+	frames, err := s.SymbolizeProcess(0, []uint64{0xdeadbeef})
+	if err != nil {
+		t.Fatalf("a dead pid must not fail the batch: %v", err)
+	}
+	if len(frames) != 1 || frames[0].Reason != FailureMissingSymbols || frames[0].Name != "0xdeadbeef" {
+		t.Fatalf("want one hex-named unresolved frame, got %+v", frames)
+	}
+	if st := s.Stats(); st.RawAddrBatches != 1 {
+		t.Fatalf("a per-process failure must be counted, not silent: %+v", st)
+	}
+}
+
+// The second real-resolution target: this test binary itself. Kept alongside
+// the libc one because it exercises .symtab rather than .dynsym.
 func TestLocalSymbolizerSymbolizeSelf(t *testing.T) {
 	if testing.Short() {
 		t.Skip("uses /proc/self/maps")
 	}
+	requireMapFilesAccess(t)
 	if !hasSymtab(t, "/proc/self/exe") {
 		t.Skip("this test binary was linked without a symbol table (go test strips the binary it runs; go test -c does not)")
 	}
@@ -69,6 +154,7 @@ func TestLocalSymbolizerSymbolizeSelf(t *testing.T) {
 }
 
 func TestLocalSymbolizerCloseIdempotent(t *testing.T) {
+	requireMapFilesAccess(t)
 	s, err := NewLocalSymbolizer()
 	if err != nil {
 		t.Fatalf("NewLocalSymbolizer: %v", err)
@@ -86,43 +172,6 @@ func TestLocalSymbolizerCloseIdempotent(t *testing.T) {
 func getOsGetpidAddr() uintptr {
 	// Reflect on os.Getpid's PC. It's a real function we can guarantee is mapped.
 	return reflect.ValueOf(os.Getpid).Pointer()
-}
-
-// The regression guard for the map_files EPERM, with a target that cannot
-// go missing: a shared library mapped into this very process. Unlike the Go
-// test binary above, libc always carries a dynamic symbol table, so a bare
-// address here means symbolization failed and nothing else.
-//
-// No capability gate, by design. This test is the assertion that perf-agent
-// resolves user symbols when running with cap_bpf,cap_perfmon and nothing
-// more, which is the capability set its own phase gates mandate.
-func TestLocalSymbolizerResolvesRealNamesUnprivileged(t *testing.T) {
-	if testing.Short() {
-		t.Skip("uses /proc/self/maps")
-	}
-	addr, want := mappedLibcFuncAddr(t)
-
-	s, err := NewLocalSymbolizer()
-	if err != nil {
-		t.Fatalf("NewLocalSymbolizer: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	frames, err := s.SymbolizeProcess(uint32(os.Getpid()), []uint64{addr})
-	if err != nil {
-		t.Fatalf("SymbolizeProcess: %v", err)
-	}
-	if len(frames) != 1 {
-		t.Fatalf("got %d frames, want 1", len(frames))
-	}
-	// Not an equality check against `want`: aliases (memcpy/__memcpy_avx_unaligned
-	// and friends) mean blazesym may legitimately name it something else. The
-	// property under test is that it resolved a NAME rather than an address.
-	if frames[0].Reason != FailureNone || strings.HasPrefix(frames[0].Name, "0x") {
-		t.Fatalf("0x%x (%s in libc) did not resolve: Name=%q Reason=%s\n"+
-			"this is the map_files/CAP_CHECKPOINT_RESTORE failure if it says missing_symbols",
-			addr, want, frames[0].Name, frames[0].Reason)
-	}
 }
 
 // hasSymtab reports whether the ELF at path carries a .symtab section.
@@ -214,129 +263,4 @@ func libcExecMapping(t *testing.T) (uint64, uint64, string) {
 	}
 	t.Skip("no executable libc mapping in this process (static binary?)")
 	return 0, 0, ""
-}
-
-// The map_files fallback used to latch on ANY first-attempt failure, and
-// then stay latched, for every process, for the life of the symbolizer -
-// with no counter and no log. That is a permanent, invisible loss of
-// inode-accurate resolution bought with one transient failure: a mapping
-// deleted between the walk and the read, a JIT region, a pid that vanished
-// mid-batch. And it is not merely a loss of precision: a symbolic path can
-// be re-pointed between the mmap and the read (overlayfs), which resolves to
-// the WRONG symbols rather than to none.
-//
-// Only a permission failure may latch, because only a permission failure
-// cannot improve on its own.
-func TestOnlyAPermissionFailureLatchesTheMapFilesFallback(t *testing.T) {
-	if testing.Short() {
-		t.Skip("uses /proc/self/maps")
-	}
-	addr, _ := mappedLibcFuncAddr(t)
-	self := uint32(os.Getpid())
-
-	// Both cases inject only the FIRST attempt's failure; the no_map_files
-	// retry underneath is the real one, against this live process, so the
-	// rescue being asserted is a real rescue.
-	newForcedFailure := func(t *testing.T, injected error) *LocalSymbolizer {
-		t.Helper()
-		s, err := NewLocalSymbolizer()
-		if err != nil {
-			t.Fatalf("NewLocalSymbolizer: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Close() })
-		// Undo whatever the startup capability probe decided: this test is
-		// about the runtime decision, and it must read the same on a root
-		// host and on a cap_bpf-only one.
-		s.noMapFiles.Store(false)
-		s.stats.disabledReason.Store("")
-		s.mapFilesAttempt = func([]uint64, uint32, []blazesym.ProcessSourceOption) ([]blazesym.Sym, error) {
-			return nil, injected
-		}
-		return s
-	}
-
-	t.Run("transient failure does not latch", func(t *testing.T) {
-		s := newForcedFailure(t, errors.New("failed to read /proc/1234/maps: entity not found"))
-		frames, err := s.SymbolizeProcess(self, []uint64{addr})
-		if err != nil {
-			t.Fatalf("SymbolizeProcess: %v", err)
-		}
-		if len(frames) != 1 || frames[0].Reason != FailureNone {
-			t.Fatalf("the retry must still rescue the batch: %+v", frames)
-		}
-		st := s.Stats()
-		if st.MapFilesDisabled {
-			t.Fatalf("a transient failure must not cost inode accuracy for the rest of the run (reason %q)",
-				st.MapFilesDisabledReason)
-		}
-		if st.MapFilesTransientFailure != 1 || st.MapFilesPermissionDenied != 0 {
-			t.Fatalf("misclassified: %+v", st)
-		}
-		if st.FallbackRescued != 1 {
-			t.Fatalf("the rescue must be counted, not silent: %+v", st)
-		}
-	})
-
-	t.Run("permission failure latches", func(t *testing.T) {
-		// Exactly what blazesym produces: BLAZE_ERR_PERMISSION_DENIED is
-		// rendered by blaze_err_str as this bare string and wrapped with
-		// errors.New, so no errno survives to match on.
-		s := newForcedFailure(t, errors.New("permission denied"))
-		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
-			t.Fatalf("SymbolizeProcess: %v", err)
-		}
-		st := s.Stats()
-		if !st.MapFilesDisabled {
-			t.Fatal("a permission failure cannot improve on its own; it must latch")
-		}
-		if st.MapFilesDisabledReason == "" {
-			t.Fatal("the transition must never be silent: it needs a reason")
-		}
-		if st.MapFilesPermissionDenied != 1 || st.MapFilesTransientFailure != 0 {
-			t.Fatalf("misclassified: %+v", st)
-		}
-		// Latched means latched: the second batch skips the first attempt
-		// outright, so neither classification counter moves again.
-		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
-			t.Fatalf("second SymbolizeProcess: %v", err)
-		}
-		if st2 := s.Stats(); st2.MapFilesPermissionDenied != 1 || st2.MapFilesTransientFailure != 0 {
-			t.Fatalf("a skipped first attempt is not a failure: %+v", st2)
-		}
-	})
-
-	t.Run("errno-typed permission errors are recognized too", func(t *testing.T) {
-		s := newForcedFailure(t, fmt.Errorf("open: %w", syscall.EACCES))
-		if _, err := s.SymbolizeProcess(self, []uint64{addr}); err != nil {
-			t.Fatalf("SymbolizeProcess: %v", err)
-		}
-		if !s.Stats().MapFilesDisabled {
-			t.Fatal("EACCES is a permission failure")
-		}
-	})
-}
-
-// The classifier is the whole difference between the fixed behavior and the
-// bug, so it is pinned directly.
-func TestIsPermissionDenied(t *testing.T) {
-	cases := []struct {
-		err  error
-		want bool
-	}{
-		{nil, false},
-		{errors.New("permission denied"), true},
-		{errors.New("Permission denied (os error 13)"), true},
-		{fmt.Errorf("wrapped: %w", syscall.EPERM), true},
-		{fmt.Errorf("wrapped: %w", syscall.EACCES), true},
-		{os.ErrPermission, true},
-		{errors.New("entity not found"), false},
-		{errors.New("invalid data"), false},
-		{fmt.Errorf("wrapped: %w", syscall.ENOENT), false},
-		{errSkippedMapFiles, false},
-	}
-	for _, c := range cases {
-		if got := isPermissionDenied(c.err); got != c.want {
-			t.Errorf("isPermissionDenied(%v) = %v, want %v", c.err, got, c.want)
-		}
-	}
 }

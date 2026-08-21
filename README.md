@@ -126,6 +126,13 @@ See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walk
 | `cap_checkpoint_restore` | Follow `/proc/<pid>/map_files/` symlinks during symbolization |
 | `cap_sys_admin` | Only on kernels older than 5.8/5.9 — see below |
 
+`cap_checkpoint_restore` (or `cap_sys_admin`) is **required, not optional**.
+blazesym reaches the file behind every mapping through
+`/proc/<pid>/map_files/`, and the kernel refuses to follow those magic
+symlinks without one of the two — so without it every user-space frame in a
+profile is a bare hex address. perf-agent checks this at startup and refuses
+to run rather than write a profile that looks like a result and is not.
+
 `cap_sys_admin` is kept for backward compatibility. Two capabilities were added
 to the kernel to carve out the roles perf-agent used it for — but they did not
 arrive in the same release:

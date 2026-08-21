@@ -81,6 +81,10 @@ pmu.txt
 perf-agent
 # GPU shim stub executable (the .so/.a/.o forms are covered above)
 shim/perfagent-gpu-stub
+# The CUDA test workload the NVIDIA adapter is proven against: built by
+# `make -C shim nvidia-workload`, needs the CUDA toolkit, and has no extension
+# for the *.so / *.o rules above to catch.
+shim/nvidia/testdata/cuda_workload
 bench/cmd/scenario/scenario
 bench/cmd/report/report
 

@@ -2,6 +2,8 @@
 #   all         libperfagent-gpu-core.a
 #   test        fast unit tests: batch, clock, drain, and the C11 ABI header
 #   test-tsan   the concurrency case under ThreadSanitizer (clang++ only)
+#   nvidia      libperfagent-gpu-nvidia.so, the CUPTI adapter (needs the CUDA toolkit)
+#   nvidia-workload  the CUDA test workload the adapter is proven against
 #   clean
 CXX ?= c++
 CC ?= cc
@@ -10,10 +12,19 @@ CC ?= cc
 TSAN_CXX ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden -I core
 
+# The CUDA toolkit is not a build dependency of perf-agent: only the `nvidia`
+# targets need it, and they are not reachable from `all` or `test`.
+CUDA_HOME ?= /usr/local/cuda-13.3
+CUDA_INC := $(CUDA_HOME)/targets/x86_64-linux/include
+CUDA_LIB := $(CUDA_HOME)/targets/x86_64-linux/lib
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+# sm_86 is the RTX 3090 this adapter was proven on.
+CUDA_ARCH ?= sm_86
+
 CORE_SRC := core/batch.cc core/clock.cc core/drain.cc core/sampler.cc
 CORE_OBJ := $(CORE_SRC:.cc=.o)
 
-.PHONY: all test test-tsan clean
+.PHONY: all test test-tsan nvidia nvidia-workload clean
 all: libperfagent-gpu-core.a
 
 libperfagent-gpu-core.a: $(CORE_OBJ)
@@ -27,6 +38,29 @@ perfagent-gpu-stub: stub/stub.cc $(CORE_SRC)
 
 libperfagent-gpu-stub.so: stub/stub.cc $(CORE_SRC)
 	$(CXX) $(CXXFLAGS) -pthread -I core -shared -o $@ stub/stub.cc $(CORE_SRC)
+
+# The CUPTI adapter. The CUDA driver dlopens this through CUDA_INJECTION64_PATH
+# into a process that links no CUPTI of its own, so the rpath is load-bearing:
+# libcupti.so is not on the default loader path and the injected process has no
+# reason to have it there.
+#
+# -fvisibility=hidden comes from CXXFLAGS and is what keeps core/ from leaking
+# symbols into somebody else's address space; InitializeInjection carries an
+# explicit default-visibility attribute to survive it (see cupti_adapter.cc).
+nvidia: libperfagent-gpu-nvidia.so
+libperfagent-gpu-nvidia.so: nvidia/cupti_adapter.cc nvidia/export.map $(CORE_SRC)
+	$(CXX) $(CXXFLAGS) -pthread -I core -I $(CUDA_INC) -shared -o $@ \
+		nvidia/cupti_adapter.cc $(CORE_SRC) \
+		-Wl,--version-script=nvidia/export.map \
+		-L $(CUDA_LIB) -lcupti -Wl,-rpath,$(CUDA_LIB)
+
+# Not stripped, and built with -g: a sampled launch's CPU stack is symbolized
+# against this binary's own symbols, so a stripped workload would prove the
+# pipeline runs and name nothing in it.
+nvidia-workload: nvidia/testdata/cuda_workload
+nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
+	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
+		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
 
 # core/probe_args_test.cc is the one test here built with -O2, and that is not
 # a detail: it checks that the record a probe points at has actually been
@@ -58,4 +92,5 @@ test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc co
 		-o /tmp/sampler_test_tsan core/sampler_test.cc core/sampler.cc && /tmp/sampler_test_tsan
 
 clean:
-	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so
+	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so \
+		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload

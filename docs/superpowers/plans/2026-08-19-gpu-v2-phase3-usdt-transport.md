@@ -1976,7 +1976,7 @@ Expected: FAIL or SKIP. If it skips, setcap the test binary:
 
 ```bash
 go test -c ./gpuprobe/ -o /home/diego/gpuprobe.test
-sudo setcap cap_bpf,cap_perfmon+ep /home/diego/gpuprobe.test
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep /home/diego/gpuprobe.test
 /home/diego/gpuprobe.test -test.run TestStubDrives -test.v
 ```
 
@@ -2074,7 +2074,7 @@ func main() {
 
 ```bash
 go build -o /home/diego/gpu-stub-profile ./cmd/gpu-stub-profile
-sudo setcap cap_bpf,cap_perfmon+ep /home/diego/gpu-stub-profile
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep /home/diego/gpu-stub-profile
 /home/diego/gpu-stub-profile && go tool pprof -top gpu-stub.pb.gz | head -20
 ```
 
@@ -2106,7 +2106,7 @@ Phase 3 is done when all of the following hold:
    came out 100% `[gpu:launch]` with no kernel frames, exactly as the deferral
    implies. Symbolized kernel frames are Phase 4's gate, not this one.
 4. The stub, unattached, reports every record dropped and emits nothing.
-5. `getcap` on the test binary shows `cap_bpf,cap_perfmon` only — **no `cap_sys_admin`**. If the attach needs it, the consumer is using the wrong mechanism.
+5. `getcap` on the test binary shows `cap_bpf,cap_perfmon,cap_checkpoint_restore` — **no `cap_sys_admin`**. If the attach needs it, the consumer is using the wrong mechanism. (`cap_checkpoint_restore` is for symbolization, not the attach: blazesym follows `/proc/<pid>/map_files/` and `symbolize.NewLocalSymbolizer` refuses without it.)
 6. **The ABI review has been done on paper** against the rocprofiler bridge's taxonomy on branch `gpu-profiling-spec` (§6.1, §14). Walk `examples/rocprofiler_sdk_preload_bridge.cpp` and confirm each of `gpu_launch_v1`, `gpu_exec_v1`, `gpu_module_load_v1` and `gpu_kernel_name_v1` can be populated from what rocprofiler delivers, or record why not. Do not skip this because NVIDIA ships first — it is the whole reason `core/` is worth having.
 
 ## Deferred to Phase 4, deliberately

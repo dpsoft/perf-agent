@@ -23,10 +23,10 @@ import (
 	"github.com/dpsoft/perf-agent/symbolize"
 )
 
-// hasBPFAndPerfmon mirrors perfagent/agent.go's hasCapSysPtrace: check
-// Permitted as well as Effective, because a setcap'd binary has not promoted
-// Permitted yet, and never gate on Getuid alone.
-func hasBPFAndPerfmon() bool {
+// hasCaps mirrors perfagent/agent.go's hasCapSysPtrace: check Permitted as
+// well as Effective, because a setcap'd binary has not promoted Permitted
+// yet, and never gate on Getuid alone.
+func hasCaps(want ...cap.Value) bool {
 	if os.Geteuid() == 0 {
 		return true
 	}
@@ -34,10 +34,10 @@ func hasBPFAndPerfmon() bool {
 	if set == nil {
 		return false
 	}
-	for _, want := range []cap.Value{cap.BPF, cap.PERFMON} {
+	for _, w := range want {
 		ok := false
 		for _, flag := range []cap.Flag{cap.Permitted, cap.Effective} {
-			if have, err := set.GetFlag(flag, want); err == nil && have {
+			if have, err := set.GetFlag(flag, w); err == nil && have {
 				ok = true
 				break
 			}
@@ -49,11 +49,27 @@ func hasBPFAndPerfmon() bool {
 	return true
 }
 
+// hasBPFAndPerfmon is the attach-side capability question: can this binary
+// load the BPF object and attach the uprobes at all.
+func hasBPFAndPerfmon() bool { return hasCaps(cap.BPF, cap.PERFMON) }
+
+// hasGateCaps is the whole-pipeline question, and it is strictly larger.
+// CAP_CHECKPOINT_RESTORE is what lets blazesym follow /proc/<pid>/map_files/;
+// without it symbolize.NewLocalSymbolizer refuses outright, and before it
+// refused, this gate ran green while all 63 sampled stacks resolved to bare
+// hex addresses. Gating on the capability the code actually needs is what
+// turns that into a visible skip instead of a passing run with useless
+// output.
+func hasGateCaps() bool { return hasCaps(cap.BPF, cap.PERFMON, cap.CHECKPOINT_RESTORE) }
+
 // The Phase 3 gate: the stub drives the full pipeline to pprof samples on a
 // machine with no GPU.
 func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
-	if !hasBPFAndPerfmon() {
-		t.Skip("needs CAP_BPF and CAP_PERFMON; setcap the test binary")
+	if !hasGateCaps() {
+		t.Skip("needs CAP_BPF, CAP_PERFMON and CAP_CHECKPOINT_RESTORE " +
+			"(the last one so blazesym can follow /proc/<pid>/map_files/; without it " +
+			"symbolize.NewLocalSymbolizer refuses and every frame would be a bare address); " +
+			"sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep <test binary>")
 	}
 	built := filepath.Join("..", "shim", "perfagent-gpu-stub")
 	requireBuilt(t, built)

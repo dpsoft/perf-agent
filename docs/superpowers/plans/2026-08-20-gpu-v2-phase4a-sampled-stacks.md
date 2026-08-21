@@ -36,12 +36,12 @@ export LD_LIBRARY_PATH=/home/diego/github/blazesym/target/release
 
 Run `go test` and `go generate` directly. Do not run `make test-unit`.
 
-Privileged tests need `cap_bpf,cap_perfmon`. Build such binaries **outside `/tmp`** (it is `nosuid`, so file capabilities do not survive exec) and link blazesym statically (a setcap'd binary runs in secure-execution mode and ignores `LD_LIBRARY_PATH`):
+Privileged tests need `cap_bpf,cap_perfmon,cap_checkpoint_restore` — the last one because blazesym resolves every mapping through `/proc/<pid>/map_files/`, and `symbolize.NewLocalSymbolizer` refuses to construct without it rather than hand back a profile of bare hex addresses. Build such binaries **outside `/tmp`** (it is `nosuid`, so file capabilities do not survive exec) and link blazesym statically (a setcap'd binary runs in secure-execution mode and ignores `LD_LIBRARY_PATH`):
 
 ```bash
 go test -c ./gpuprobe/ -o /home/diego/gpuprobe.test \
   -ldflags '-linkmode external -extldflags "-Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic"'
-sudo setcap cap_bpf,cap_perfmon+ep /home/diego/gpuprobe.test
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep /home/diego/gpuprobe.test
 ```
 **Rebuilding strips the capability bit.** Do all source work first, rebuild once, then re-`setcap`.
 
@@ -860,7 +860,7 @@ Keep every Phase 3 assertion. Add, against a stub run with `sample_period = 8` a
 ```bash
 go test -c ./gpuprobe/ -o /home/diego/gpuprobe.test \
   -ldflags '-linkmode external -extldflags "-Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic"'
-sudo setcap cap_bpf,cap_perfmon+ep /home/diego/gpuprobe.test
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep /home/diego/gpuprobe.test
 cd gpuprobe && /home/diego/gpuprobe.test -test.run TestStubDrives -test.v -test.timeout=120s
 ```
 
@@ -868,7 +868,7 @@ cd gpuprobe && /home/diego/gpuprobe.test -test.run TestStubDrives -test.v -test.
 
 ```bash
 go build -o /home/diego/gpu-stub-profile ./cmd/gpu-stub-profile
-sudo setcap cap_bpf,cap_perfmon+ep /home/diego/gpu-stub-profile
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep /home/diego/gpu-stub-profile
 /home/diego/gpu-stub-profile && go tool pprof -top gpu-stub.pb.gz | head -25
 ```
 
@@ -889,7 +889,7 @@ git -c user.name="diego" -c user.email="diegolparra@gmail.com" commit -m "test(g
 2. The gate test passes with the sampled-stack and kernel-name assertions, on a machine with no GPU.
 3. `gpu-stub-profile` writes a pprof containing real CPU frames above `[gpu:launch]` above `[gpu:kernel:<name>]`, plus a distinct `[gpu:launch unsampled]` subtree.
 4. Attributed and unattributed GPU time sum to the exact measured total; no duration is scaled.
-5. `getcap` on the test binary shows `cap_bpf,cap_perfmon` and **no `cap_sys_admin`**.
+5. `getcap` on the test binary shows `cap_bpf,cap_perfmon,cap_checkpoint_restore` and **no `cap_sys_admin`**.
 6. `golangci-lint run --timeout=5m` (v2.11.4, CI's pin) reports 0 issues.
 7. The unattached stub still emits nothing and counts every record dropped.
 
@@ -899,7 +899,7 @@ git -c user.name="diego" -c user.email="diegolparra@gmail.com" commit -m "test(g
 
   The fix is to stop symbolizing against live `/proc`: capture the maps eagerly — on first sight of a pid, or from a `sched_process_exit` probe — and resolve against that snapshot, the way `profile/` will have to for short-lived targets too. It is deliberately not attempted here: it needs a per-pid maps cache with its own eviction policy and a build-id keyed module store, which is a Phase 4b feature, not a patch to this one. The gate sidesteps it by holding the stub open (its `linger_ms` argument) until the consumer has counted every sampled launch, so the gate proves the *symbolization path* works without also depending on the unsolved lifetime problem.
 
-  Related, and already fixed here rather than deferred: blazesym's process source resolves each mapping through `/proc/<pid>/map_files/`, whose magic symlinks the kernel refuses to open without `CAP_CHECKPOINT_RESTORE` (or `CAP_SYS_ADMIN`). A perf-agent setcap'd with only `cap_bpf,cap_perfmon` — which is what the phase gate above mandates — therefore got `permission denied` for **every** batch and degraded every frame to a bare address. `symbolize.LocalSymbolizer.SymbolizeProcess` now retries once with `no_map_files`, reading the symbolic paths out of `/proc/<pid>/maps` instead, and latches the doomed first attempt off once the retry has rescued a batch. This affects `profile/` and `offcpu/` identically; it was invisible there for the same reason it was invisible here — blazesym's error is swallowed into hex-named frames and never reaches a counter.
+  Related, and settled rather than deferred: blazesym's process source resolves each mapping through `/proc/<pid>/map_files/`, whose magic symlinks the kernel refuses to open without `CAP_CHECKPOINT_RESTORE` (or `CAP_SYS_ADMIN`). A binary setcap'd with only `cap_bpf,cap_perfmon` — which is what this phase gate originally mandated — therefore got `permission denied` for **every** batch and degraded every frame to a bare address. The first fix retried with `no_map_files`, reading the symbolic paths out of `/proc/<pid>/maps`, and latched the doomed first attempt off; that has since been **removed**. `CAP_CHECKPOINT_RESTORE` is already in perf-agent's documented required set (`README.md`, `SECURITY.md`, `perfagent/agent.go`) and `unwind/procmap`, `unwind/dwarfagent` and `symbolize/debuginfod` already depend on it, so the retry existed only to tolerate an unsupported capability configuration — at the cost of a permanent latch, a startup probe, and a string match on blazesym's error text. `symbolize.NewLocalSymbolizer` now probes the kernel gate once, by `open()`ing a real `map_files` entry for itself, and returns `symbolize.ErrMapFilesUnavailable` naming the missing capability and the `setcap` line. The gate's own capability check was widened to match, so a run that would produce hex frames now skips loudly instead of passing green. This affects `profile/` and `offcpu/` identically.
 
 - **The DWARF unwind driver.** Frame-pointer stacks via `bpf_get_stackid` cover binaries built with frame pointers; the third `unwind_common.h` driver covers the rest. The wire format does not change — `stack_id` becomes a walker handle instead — so this is additive.
 - The CUPTI adapter itself, and everything needing a GPU.

@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"log"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -16,9 +14,10 @@ import (
 // ErrClosed is returned from operations on a closed Symbolizer.
 var ErrClosed = errors.New("symbolize: closed")
 
-// errSkippedMapFiles stands in for the first attempt's error once the
-// map_files path has been latched off. It never escapes SymbolizeProcess.
-var errSkippedMapFiles = errors.New("symbolize: map_files disabled")
+// ErrMapFilesUnavailable is returned from NewLocalSymbolizer when this process
+// cannot follow /proc/<pid>/map_files/ magic symlinks. Wrapped, so callers can
+// test for it with errors.Is.
+var ErrMapFilesUnavailable = errors.New("symbolize: cannot follow /proc/<pid>/map_files/")
 
 // LocalSymbolizer wraps blazesym's Process source with no off-box hooks —
 // preserves perf-agent's pre-debuginfod behavior. Used when no debuginfod
@@ -26,166 +25,117 @@ var errSkippedMapFiles = errors.New("symbolize: map_files disabled")
 type LocalSymbolizer struct {
 	bz     *blazesym.Symbolizer
 	closed atomic.Bool
-	// noMapFiles latches once /proc/<pid>/map_files/ has been proven
-	// unusable for this process - either because the startup capability
-	// probe said so, or because a symbolization actually failed with
-	// permission denied (see SymbolizeProcess).
-	//
-	// It is NOT a plain performance latch, which is what it was first
-	// written as, and what made it wrong: it downgrades every later
-	// symbolization, for every process, to symbolic /proc/<pid>/maps paths,
-	// which under overlayfs can be re-pointed between the mmap and the read
-	// and then resolve to the WRONG symbols rather than to none. Paying that
-	// for the life of the symbolizer because one pid vanished mid-batch, or
-	// because a frame landed in a JIT region, is not a trade worth making
-	// silently. So only a permission failure - the one cause that cannot
-	// improve on its own - may set it.
-	noMapFiles atomic.Bool
-	stats      localCounters
-	// mapFilesAttempt overrides the first, inode-accurate attempt. It is a
-	// field only so a test can inject the two failure kinds SymbolizeProcess
-	// has to tell apart - blazesym itself offers no way to ask for one -
-	// while the retry underneath stays real. Nil in production.
-	mapFilesAttempt func(ips []uint64, pid uint32, opts []blazesym.ProcessSourceOption) ([]blazesym.Sym, error)
-}
-
-// symbolizeMapFiles runs the first attempt, through the test seam if one is
-// installed.
-func (s *LocalSymbolizer) symbolizeMapFiles(ips []uint64, pid uint32, opts []blazesym.ProcessSourceOption) ([]blazesym.Sym, error) {
-	if s.mapFilesAttempt != nil {
-		return s.mapFilesAttempt(ips, pid, opts)
-	}
-	return s.bz.SymbolizeProcessAbsAddrs(ips, pid, opts...)
+	stats  localCounters
 }
 
 // localCounters are the process-side symbolization counters. Kept separate
 // from Counters, which is the kernel symbolizer's and is already wired into
 // the /metrics endpoint with a fixed field set.
 type localCounters struct {
-	mapFilesPermissionDenied atomic.Uint64
-	mapFilesTransientFailure atomic.Uint64
-	fallbackRescued          atomic.Uint64
-	rawAddrBatches           atomic.Uint64
-	disabledReason           atomic.Value // string
+	rawAddrBatches atomic.Uint64
 }
 
-// LocalStats is a point-in-time view of what SymbolizeProcess has had to
-// degrade to. The map_files transition used to be invisible - no counter, no
-// log - which meant a profiler could silently spend an entire run resolving
-// through re-pointable symbolic paths and nothing would say so.
+// LocalStats is a point-in-time view of what SymbolizeProcess could not
+// resolve.
 type LocalStats struct {
-	// MapFilesDisabled reports whether the inode-accurate
-	// /proc/<pid>/map_files/ path has been latched off.
-	MapFilesDisabled bool
-	// MapFilesDisabledReason says why, and is empty while it is still on.
-	MapFilesDisabledReason string
-	// MapFilesPermissionDenied counts first attempts that failed with
-	// permission denied. Only these latch.
-	MapFilesPermissionDenied uint64
-	// MapFilesTransientFailure counts first attempts that failed for any
-	// other reason - a deleted mapping, a JIT region, a pid that exited
-	// mid-batch. These deliberately do NOT latch: the next batch gets the
-	// inode-accurate path back.
-	MapFilesTransientFailure uint64
-	// FallbackRescued counts batches the no_map_files retry saved.
-	FallbackRescued uint64
-	// RawAddrBatches counts batches where the retry failed too and every
-	// frame came back as a bare hex address.
+	// RawAddrBatches counts batches blazesym refused outright — the usual
+	// cause being a pid that exited before its /proc entry could be read —
+	// and where every frame therefore came back as a bare hex address.
 	RawAddrBatches uint64
 }
 
 // Stats returns the current process-side symbolization counters.
 func (s *LocalSymbolizer) Stats() LocalStats {
-	reason, _ := s.stats.disabledReason.Load().(string)
-	return LocalStats{
-		MapFilesDisabled:         s.noMapFiles.Load(),
-		MapFilesDisabledReason:   reason,
-		MapFilesPermissionDenied: s.stats.mapFilesPermissionDenied.Load(),
-		MapFilesTransientFailure: s.stats.mapFilesTransientFailure.Load(),
-		FallbackRescued:          s.stats.fallbackRescued.Load(),
-		RawAddrBatches:           s.stats.rawAddrBatches.Load(),
-	}
+	return LocalStats{RawAddrBatches: s.stats.rawAddrBatches.Load()}
 }
 
-// disableMapFiles latches the fallback on and says so exactly once. The
-// compare-and-swap is what makes it once: a second caller finds the latch
-// already set and returns without logging again.
-func (s *LocalSymbolizer) disableMapFiles(reason string) {
-	if !s.noMapFiles.CompareAndSwap(false, true) {
-		return
-	}
-	s.stats.disabledReason.Store(reason)
-	log.Printf("symbolize: /proc/<pid>/map_files/ unusable (%s); "+
-		"falling back to /proc/<pid>/maps symbolic paths for all "+
-		"processes - symbols stay resolvable but are no longer "+
-		"inode-accurate", reason)
-}
-
-// capCheckpointRestore and capSysAdmin are the two capabilities the kernel's
-// proc_map_files_get_link() accepts; without either, following a map_files
-// magic symlink is EPERM no matter which process is targeted.
-const (
-	capSysAdmin          = 21
-	capCheckpointRestore = 40
-)
-
-// canFollowMapFiles reports whether this process holds a capability that lets
-// it follow /proc/<pid>/map_files/ links. Probed once, at construction, so
-// the common setcap'd case (cap_bpf,cap_perfmon and nothing else - the
-// configuration that produced hex-named frames in every shipped profile/ and
-// offcpu/ run) skips the doomed first attempt from the very first batch
-// instead of discovering it by failing.
+// checkMapFilesAccess reports whether this process may follow a
+// /proc/<pid>/map_files/ magic symlink, which is the single path blazesym's
+// process source uses to reach the file behind a mapping. The kernel's
+// proc_map_files_get_link() rejects the open with EPERM unless the caller
+// holds CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN); perf-agent documents both
+// in its required set, and unwind/procmap, unwind/dwarfagent and
+// symbolize/debuginfod already depend on it directly.
 //
-// An unreadable or unparsable /proc/self/status returns true: the cost of
-// guessing "capable" wrongly is one failed attempt per batch until a real
-// permission error latches it, whereas guessing "incapable" wrongly would
-// give up inode accuracy that the process actually has.
-func canFollowMapFiles() bool {
-	f, err := os.Open("/proc/self/status")
+// The check is an actual open() of a real map_files entry, not a read of
+// CapEff out of /proc/self/status. It exercises the exact kernel gate that
+// symbolization will hit, so it cannot be wrong about which capability the
+// running kernel consults, about a capability held only in a non-initial user
+// namespace (checkpoint_restore_ns_capable() checks &init_user_ns), or about
+// Permitted-but-not-Effective. It also yields a typed errno, which is what
+// lets this refuse without string-matching blazesym's error text.
+//
+// Only a definite EPERM is a verdict. An unreadable /proc/self/maps, a
+// process with no file-backed mapping, or a mapping that was unmapped between
+// the read and the open returns nil: a probe that could not decide must never
+// be the reason a profiler refuses to start.
+func checkMapFilesAccess() error {
+	f, err := os.Open("/proc/self/maps")
 	if err != nil {
-		return true
+		return nil
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := sc.Text()
-		hex, ok := strings.CutPrefix(line, "CapEff:")
-		if !ok {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 6 || !strings.HasPrefix(fields[5], "/") {
 			continue
 		}
-		caps, err := strconv.ParseUint(strings.TrimSpace(hex), 16, 64)
-		if err != nil {
-			return true
+		var start, end uint64
+		if _, err := fmt.Sscanf(fields[0], "%x-%x", &start, &end); err != nil {
+			continue
 		}
-		return caps&(1<<capSysAdmin) != 0 || caps&(1<<capCheckpointRestore) != 0
+		// Reformatted with %x rather than reused from /proc/self/maps: maps
+		// pads each address to the word width, and the kernel's
+		// dname_to_vma_addr() rejects a leading zero with -EINVAL, which
+		// would surface as ENOENT and be mistaken for a vanished mapping.
+		name := fmt.Sprintf("/proc/self/map_files/%x-%x", start, end)
+		fh, err := os.Open(name)
+		if err == nil {
+			_ = fh.Close()
+			return nil
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return fmt.Errorf("%w (%v): every user-space frame would resolve to a bare "+
+				"hex address. Grant CAP_CHECKPOINT_RESTORE - "+
+				"sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep <binary> - "+
+				"or run as root", ErrMapFilesUnavailable, err)
+		}
+		// Any other error is not an answer about capabilities: the mapping
+		// was unmapped between the read and the open. Try the next one.
 	}
-	return true
-}
-
-// isPermissionDenied reports whether err is the one failure that can never
-// improve on its own.
-//
-// The typed check comes first and covers anything that carries an errno
-// (syscall.EPERM and syscall.EACCES both satisfy errors.Is(_, os.ErrPermission)).
-// blazesym is not that: its C API collapses the errno into an enum, blaze_err_str
-// renders BLAZE_ERR_PERMISSION_DENIED as the bare string "permission denied",
-// and the Go binding wraps that with errors.New - so by the time the error
-// reaches here there is nothing typed left to match, and the string is the
-// only evidence. Matching it is narrow and it is checked by a test; the
-// alternative is latching on every failure, which is the bug being fixed.
-func isPermissionDenied(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "permission denied")
+	return nil
 }
 
 // NewLocalSymbolizer constructs a LocalSymbolizer with code-info and
 // inlined-fns enabled (matches today's behavior at the three call sites).
+//
+// It refuses, rather than degrading, when /proc/<pid>/map_files/ is closed to
+// this process. That is a deliberate trade. There used to be a second
+// resolution path here - a retry with blazesym's no_map_files option, which
+// reads the symbolic paths out of /proc/<pid>/maps and needs no capability -
+// plus a latch, a once-only log, a startup CapEff probe and a string match on
+// blazesym's "permission denied" text to drive them. All of it existed to
+// tolerate one unsupported configuration: a binary setcap'd with only
+// cap_bpf,cap_perfmon, which is narrower than the set perf-agent's own README,
+// SECURITY.md and agent.go document as required.
+//
+// Keeping map_files as the single path costs nothing a supported deployment
+// has, and buys two things. Inode accuracy: a symbolic path out of
+// /proc/<pid>/maps can be re-pointed at different contents between the mmap
+// and the read - under overlayfs that resolves to the WRONG symbols rather
+// than to none - while a map_files link cannot. And a failure that is
+// impossible to miss: the alternative considered here was a prominent
+// one-time log plus a flag on LocalStats, which is silent degradation wearing
+// a hat, because no caller in this repository reads LocalStats and a log line
+// emitted at startup is gone by the time a sixty-second run writes a
+// profile.pb.gz full of hex. A profiler whose every user frame is "0x7f..."
+// is not degraded, it is useless, and this codebase refuses everywhere else
+// rather than hand back output that looks like a result.
 func NewLocalSymbolizer() (*LocalSymbolizer, error) {
+	if err := checkMapFilesAccess(); err != nil {
+		return nil, err
+	}
 	bz, err := blazesym.NewSymbolizer(
 		blazesym.SymbolizerWithCodeInfo(true),
 		blazesym.SymbolizerWithInlinedFns(true),
@@ -193,55 +143,23 @@ func NewLocalSymbolizer() (*LocalSymbolizer, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &LocalSymbolizer{bz: bz}
-	if !canFollowMapFiles() {
-		s.disableMapFiles("no CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN")
-	}
-	return s, nil
+	return &LocalSymbolizer{bz: bz}, nil
 }
 
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
 // expanded into the Frame.Inlined slice in caller-most-to-callee order.
 //
-// blazesym's process source resolves each mapping through
-// /proc/<pid>/map_files/<range>, which is inode-accurate: it cannot be
-// fooled by a binary that was replaced or deleted since it was mapped.
-// Following those magic symlinks is privileged — the kernel's
-// proc_map_files_get_link() rejects the open with EPERM unless the caller
-// holds CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) — so on a perf-agent that
-// was setcap'd with only cap_bpf,cap_perfmon the ENTIRE batch fails with
-// "permission denied" and every frame degrades to a bare address. Nothing
-// about that failure is visible in the returned error, because the fallback
-// below deliberately does not propagate it.
-//
-// So: on any error, retry once with no_map_files, which reads the symbolic
-// paths out of /proc/<pid>/maps instead. That is what every other profiler
-// does and needs no capability at all; it is second choice only because a
-// symbolic path can be re-pointed at different contents between the mmap and
-// the read - under overlayfs that yields WRONG symbols, not merely
-// unresolved ones.
-//
-// The retry always runs. What is conditional is the LATCH that turns the
-// first attempt off for every later batch and every later process: that
-// happens only when map_files is closed to us for good, which means either
-// the startup capability probe said so (canFollowMapFiles) or a first
-// attempt actually failed with permission denied. A transient failure - a
-// mapping deleted between the walk and the read, a JIT region with no file
-// behind it, a pid that exited mid-batch - is rescued by the retry and then
-// forgotten, because the next batch may well be fine and inode accuracy is
-// worth one doomed attempt to get back. Latching on any failure at all,
-// which is what this used to do, permanently traded accuracy for one bad
-// moment, silently. Both paths are counted, and the latch logs once (see
-// Stats and disableMapFiles).
-//
-// If the retry fails too — the usual reason being that the process exited and
-// /proc/<pid>/maps is gone, "entity not found" — returns raw hex-named Frames
-// instead of dropping the batch. That preserves stack shape and addresses so
-// operators can decode with addr2line and the pprof's user mapping still has
-// somewhere to attach. Those frames carry Reason == FailureMissingSymbols;
-// callers that need to know symbolization resolved nothing must inspect
-// Frame.Reason, because err is nil on this path (see
-// gpuprobe.Stats.StacksUnresolved for a consumer that does).
+// If blazesym fails the batch — with the capability check in
+// NewLocalSymbolizer standing, the realistic reason is that the process
+// exited and /proc/<pid>/maps is gone, "entity not found" — returns raw
+// hex-named Frames instead of dropping the batch. That preserves stack shape
+// and addresses so operators can decode with addr2line and the pprof's user
+// mapping still has somewhere to attach. Those frames carry Reason ==
+// FailureMissingSymbols; callers that need to know symbolization resolved
+// nothing must inspect Frame.Reason, because err is nil on this path (see
+// gpuprobe.Stats.StacksUnresolved for a consumer that does). The batch is
+// counted in LocalStats.RawAddrBatches: a per-process failure is real signal
+// about that process and must not be silent.
 func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -249,47 +167,13 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	if len(ips) == 0 {
 		return nil, nil
 	}
-	opts := []blazesym.ProcessSourceOption{
+	syms, err := s.bz.SymbolizeProcessAbsAddrs(ips, pid,
 		blazesym.ProcessSourceWithPerfMap(true),
 		blazesym.ProcessSourceWithDebugSyms(true),
-	}
-	var syms []blazesym.Sym
-	var err error
-	skipped := s.noMapFiles.Load()
-	if !skipped {
-		syms, err = s.symbolizeMapFiles(ips, pid, opts)
-	} else {
-		err = errSkippedMapFiles
-	}
+	)
 	if err != nil {
-		denied := !skipped && isPermissionDenied(err)
-		if !skipped {
-			if denied {
-				s.stats.mapFilesPermissionDenied.Add(1)
-			} else {
-				s.stats.mapFilesTransientFailure.Add(1)
-			}
-		}
-		// A fresh slice, not append(opts, ...): opts must not gain the
-		// no_map_files option as a side effect if this function ever grows a
-		// second use of it.
-		retryOpts := make([]blazesym.ProcessSourceOption, 0, len(opts)+1)
-		retryOpts = append(retryOpts, opts...)
-		retryOpts = append(retryOpts, blazesym.ProcessSourceWithoutMapFiles(true))
-		var retryErr error
-		syms, retryErr = s.bz.SymbolizeProcessAbsAddrs(ips, pid, retryOpts...)
-		if retryErr != nil {
-			s.stats.rawAddrBatches.Add(1)
-			return rawUserAddrFrames(ips), nil
-		}
-		if !skipped {
-			s.stats.fallbackRescued.Add(1)
-		}
-		// Only a permission failure means map_files will still be closed on
-		// the next batch. Anything else gets the inode-accurate path back.
-		if denied {
-			s.disableMapFiles("blazesym reported permission denied")
-		}
+		s.stats.rawAddrBatches.Add(1)
+		return rawUserAddrFrames(ips), nil
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {

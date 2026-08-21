@@ -1166,6 +1166,84 @@ func TestDecodeGPUStackCarriesTheWalkersFlags(t *testing.T) {
 	assert.Equal(t, uint32(0x06), flags, "WALKER_FLAG_DWARF_USED | WALKER_FLAG_CFI_MISS")
 }
 
+// Identical PCs; only the flags the walker reported differ. An FP-only walk
+// through vendor libraries is exactly the case that produced a
+// profiler-only stack on real hardware, so the two must be countable apart -
+// a single "we got a stack" counter cannot express it.
+func TestFPOnlyAndDWARFWalksAreCountedSeparately(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	pcs := []uint64{0x401000, 0x401100}
+	stacks.put(1, pcs...)
+	stacks.flags[1] = walkerFlagDWARFUsed
+	stacks.put(2, pcs...)
+	stacks.flags[2] = walkerFlagFPTerminated
+
+	_, ok := c.resolveStackForTest(1, 4242)
+	require.True(t, ok)
+	_, ok = c.resolveStackForTest(2, 4242)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedDWARF)
+	assert.Equal(t, uint64(1), c.Stats().StacksWalkedFPOnly)
+}
+
+// n_pcs == maxWalkFrames used to be the only truncation signal, and it
+// misses exactly the failure this phase exists to fix: a walk that dies at
+// the first vendor-library frame produces two or three PCs, not 127, and
+// used to read as a complete, untruncated stack - silently, on the workload
+// this phase is about. WALKER_FLAG_FP_TERMINATED clear at a short length is
+// what makes that failure visible instead.
+func TestAWalkThatDiesEarlyIsCountedAbandonedNotSilent(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// Two frames: the probe's own PC, then one vendor frame the FP chain
+	// could not continue past. flags left at zero - no
+	// WALKER_FLAG_FP_TERMINATED, no WALKER_FLAG_DWARF_USED - which is
+	// exactly what a bpf_probe_read_user fault on that frame produces.
+	stacks.put(21, 0x401000, 0x401100)
+
+	frames, ok := c.resolveStackForTest(21, 4242)
+	require.True(t, ok, "the frames captured before the walk died are still used")
+	assert.Len(t, frames, 2)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned)
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"cut short of a natural end is a different failure than hitting MAX_FRAMES")
+}
+
+// A genuinely complete short walk - the FP chain reached its natural end -
+// is neither truncated nor abandoned. Only a walk that stopped WITHOUT
+// reaching that terminator counts against either bucket.
+func TestACompleteShortWalkIsNeitherTruncatedNorAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(23, 0x401000, 0x401100)
+	stacks.flags[23] = walkerFlagFPTerminated
+
+	_, ok := c.resolveStackForTest(23, 4242)
+	require.True(t, ok)
+	assert.Zero(t, c.Stats().StackWalkTruncated)
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// A stack that is genuinely maxWalkFrames deep AND reached a natural
+// terminator on its last frame is a complete stack, not a truncated one:
+// n_pcs == maxWalkFrames alone cannot tell the two apart, and
+// walkerFlagFPTerminated is what does.
+func TestAFullLengthWalkThatTerminatedNaturallyIsNotCountedTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(25, full...)
+	stacks.flags[25] = walkerFlagFPTerminated
+
+	frames, ok := c.resolveStackForTest(25, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, maxWalkFrames)
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"maxWalkFrames deep and naturally terminated is complete, not truncated")
+	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
 // A value shorter than one struct gpu_stack cannot be decoded into a call
 // path, and guessing at a partial one would be a fabrication.
 func TestAShortStackValueIsRefused(t *testing.T) {

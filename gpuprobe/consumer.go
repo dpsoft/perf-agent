@@ -55,9 +55,31 @@ const (
 
 	// maxWalkFrames mirrors MAX_FRAMES in bpf/unwind_common.h: the walker's
 	// bpf_loop bound, and therefore the length of a struct gpu_stack's pcs
-	// array. A walk that produced exactly this many frames hit the bound and
-	// is truncated (Stats.StackWalkTruncated), not complete.
+	// array. A walk that produced exactly this many frames AND did not reach
+	// a natural terminator (walkerFlagFPTerminated clear) hit the bound and
+	// is truncated (Stats.StackWalkTruncated); one that reached the bound
+	// and also set walkerFlagFPTerminated happens to be a complete stack
+	// exactly this deep, not a truncated one.
 	maxWalkFrames = 127
+
+	// walkerFlagFPTerminated and walkerFlagDWARFUsed mirror WALKER_FLAG_* in
+	// bpf/unwind_common.h (0x01 and 0x02; 0x04 is WALKER_FLAG_CFI_MISS,
+	// which nothing here reads yet). They ride in struct gpu_stack's
+	// walker_flags and say how the walk went, not just how far it got:
+	//
+	//   - walkerFlagDWARFUsed set means at least one frame was unwound via
+	//     CFI. Clear means every frame the walk kept was reached by frame
+	//     pointer alone — the shape that produced a flame graph rooted in
+	//     the profiler's own callback on real hardware, because an FP walk
+	//     cannot survive the first frame-pointer-omitting vendor frame.
+	//   - walkerFlagFPTerminated set means the FP chain reached its natural
+	//     end (saved_fp == 0 in walk_step): the walk ran off the true root
+	//     of the stack. Clear means the walk stopped for some other reason —
+	//     a user-memory read fault, a CFI lookup miss, an unsupported RA/FP
+	//     location, or bpf_loop exhausting MAX_FRAMES — and did NOT reach
+	//     the root, even though it may have produced usable frames.
+	walkerFlagFPTerminated = 0x01
+	walkerFlagDWARFUsed    = 0x02
 
 	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
 	// bpf/gpu_usdt.bpf.c:
@@ -329,13 +351,64 @@ type Stats struct {
 	// Being a subset keeps the SampledLaunches identity above a partition:
 	// an empty walk still lands in exactly one bucket.
 	StackWalkEmpty uint64
-	// StackWalkTruncated counts resolved captures whose walk hit MAX_FRAMES.
-	// NOT a failure and not part of the identity: the frames are real and
-	// are attributed. It is here because a truncated stack is missing its
-	// outermost frames - the ones nearest main, which is where a flame graph
-	// is read from - so a rising count means the profile's roots are being
-	// cut off even though nothing failed.
+	// StackWalkTruncated counts resolved captures whose walk hit MAX_FRAMES
+	// without also reaching a natural terminator (walkerFlagFPTerminated
+	// clear at n_pcs == maxWalkFrames). NOT a failure and not part of the
+	// identity: the frames are real and are attributed. It is here because a
+	// truncated stack is missing its outermost frames - the ones nearest
+	// main, which is where a flame graph is read from - so a rising count
+	// means the profile's roots are being cut off even though nothing
+	// failed. This is the "ran out of budget" failure; StackWalkAbandoned
+	// is the other one, "could not proceed" - they are counted apart on
+	// purpose, see StackWalkAbandoned.
 	StackWalkTruncated uint64
+	// StackWalkAbandoned counts resolved captures whose walk stopped before
+	// reaching a natural terminator (walkerFlagFPTerminated clear) AND
+	// before running out of budget (n_pcs < maxWalkFrames). This is the
+	// counter Task 1 was missing: n_pcs == maxWalkFrames is exactly the
+	// wrong test for "the walk failed to make progress", because a walk
+	// that dies at the first frame-pointer-omitting vendor frame produces
+	// n_pcs of roughly 1-3 and used to read as a complete, untruncated
+	// stack - the case that produced a flame graph rooted entirely in the
+	// profiler's own callback, silently, because nothing was counting it.
+	//
+	// The underlying causes are a bpf_probe_read_user fault walking the FP
+	// chain, a CFI lookup miss (walkerFlagCFIMiss, 0x04), or DWARF
+	// classifying a return-address or frame-pointer location this walker
+	// does not track (bpf/unwind_common.h walk_step). All three stop the
+	// walk the same way: fewer frames than requested, no natural end.
+	//
+	// NOT a failure in the record-loss sense - the frames captured are
+	// still symbolized and attributed - but it is missing every frame above
+	// where the walk gave up, and unlike StackWalkTruncated that loss has
+	// no relationship to MAX_FRAMES at all, so it needs its own counter to
+	// be visible rather than reading as zero.
+	StackWalkAbandoned uint64
+	// StacksWalkedDWARF counts non-empty captures where at least one frame
+	// was unwound via CFI (walkerFlagDWARFUsed set). This is the case that
+	// can reach through a vendor library into the application beneath it.
+	//
+	// Like StackWalkTruncated and StackWalkAbandoned, this is counted as
+	// soon as the walk's own flags are known - before symbolization, and
+	// regardless of whether symbolization goes on to succeed - because the
+	// question it answers ("how did the walk get these PCs") is a property
+	// of the walk, not of what the symbolizer later does with them. It is
+	// therefore not part of the SampledLaunches/StacksResolved identities;
+	// it is a diagnostic overlay the same way the other two are.
+	StacksWalkedDWARF uint64
+	// StacksWalkedFPOnly counts non-empty captures where no frame used CFI
+	// (walkerFlagDWARFUsed clear): every frame the walk kept came from the
+	// frame-pointer chain alone. This is exactly the walk shape that
+	// produced a flame graph attributing GPU time to the profiler's own
+	// callback on real hardware - an FP walk cannot survive the first
+	// frame-pointer-omitting vendor frame, so a stack landing here either
+	// never left the profiler (see StacksProfilerOnly) or got lucky and
+	// stayed inside frame-pointer-preserving code the whole way. Every
+	// non-empty capture lands in exactly one of this counter or
+	// StacksWalkedDWARF, whatever happens to it downstream (StacksResolved,
+	// SymbolizeFailed, ...) - see StacksWalkedDWARF for why the split is
+	// made this early rather than gated on symbolization succeeding.
+	StacksWalkedFPOnly uint64
 	// StackMapFull counts captures the BPF side could not park because
 	// gpu_stacks was full (gpuStackCapacity live entries). Read from the
 	// `walk_errors` map.
@@ -1193,7 +1266,7 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		}
 		return nil, false
 	}
-	ips, _, ok := decodeGPUStack(raw)
+	ips, flags, ok := decodeGPUStack(raw)
 	// Free the slot as soon as its contents are in hand, before anything
 	// that can fail: the entry is useless to us from here on either way.
 	c.freeStackLocked(stackID)
@@ -1210,10 +1283,35 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		c.stats.StackWalkEmpty++
 		return nil, false
 	}
-	if len(ips) == maxWalkFrames {
-		// The walk hit MAX_FRAMES. The frames are real and are used; the
-		// missing outermost ones are what this records.
+	// walker_flags says how the walk got these frames, independent of what
+	// happens to them next - see Stats.StacksWalkedDWARF for why this is
+	// counted here rather than gated on symbolization succeeding.
+	if flags&walkerFlagDWARFUsed != 0 {
+		c.stats.StacksWalkedDWARF++
+	} else {
+		c.stats.StacksWalkedFPOnly++
+	}
+	switch fpTerminated := flags&walkerFlagFPTerminated != 0; {
+	case fpTerminated:
+		// The FP chain reached its natural end (saved_fp == 0): the walk
+		// ran off the true root of the stack, not off a budget or a
+		// failure. Not truncated even in the coincidental case where that
+		// also happens to be the maxWalkFrames'th frame.
+	case len(ips) == maxWalkFrames:
+		// No natural terminator, and bpf_loop ran out of iterations. The
+		// frames are real and are used; the missing outermost ones - the
+		// ones nearest main - are what this records.
 		c.stats.StackWalkTruncated++
+	default:
+		// No natural terminator, and the walk did not run out of budget
+		// either: it stopped because it could not continue - a
+		// bpf_probe_read_user fault, a CFI lookup miss, or an RA/FP
+		// location this walker does not track (bpf/unwind_common.h
+		// walk_step). This is the case "len(ips) == maxWalkFrames" alone
+		// could never catch: a walk that dies at the first
+		// frame-pointer-omitting vendor frame produces n_pcs of roughly
+		// 1-3 and used to read as a complete, untruncated stack.
+		c.stats.StackWalkAbandoned++
 	}
 	if c.cfg.Symbolizer == nil {
 		c.stats.SymbolizeFailed++

@@ -394,32 +394,60 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		"a registration that installed nothing: %q", stats.UnwindLastError)
 
 	// StackWalkAbandoned means "the walk stopped because it could not
-	// proceed". Every walk in this run has an end of chain the walker can
-	// see, so it must read zero:
+	// proceed". Every walk in this run stops for one of exactly two reasons,
+	// and issue #44 is the story of them having been indistinguishable:
 	//
 	//   - a DWARF walk crosses the two FP-less bridges and arrives at main
-	//     with no caller frame pointer (their CFI carries no rule for it),
-	//     which walk_step now reports as WALKER_FLAG_UNWIND_TERMINATED;
+	//     with no caller frame pointer, because their CFI carries no rule
+	//     for %rbp and ehcompile reads that as UNDEFINED (issue #45) where
+	//     the psABI says unchanged. walk_step reports it as
+	//     WALKER_FLAG_FP_EXHAUSTED and it is a real truncation: main's
+	//     callers - __libc_start_call_main, __libc_start_main_impl, _start -
+	//     are on the stack and are missing from the capture.
 	//   - an FP-only walk (the first capture or two, before the tables land)
 	//     follows the frame-pointer chain out through
 	//     __libc_start_call_main and __libc_start_main_impl into _start,
 	//     whose saved frame pointer is zero - WALKER_FLAG_FP_TERMINATED.
 	//     Verified under gdb on this exact producer.
 	//
+	// So abandoned is NOT zero here, and asserting that it were would be
+	// asserting the bug. What it must be is fully explained: every
+	// abandonment accounted for by the one cause this producer has, with no
+	// unexplained remainder and no CFI misses. That is the instrument issue
+	// #45 will be measured against - when "no rule for %rbp" starts meaning
+	// unchanged, these walks reach _start instead, and the counts move from
+	// StackWalkFPExhausted to StackWalkReachedRoot with abandoned falling to
+	// zero.
+	//
 	// The first run of this gate reported abandoned == StacksWalkedDWARF ==
-	// 62: the counter fired on every SUCCESSFUL DWARF walk, because
-	// WALKER_FLAG_FP_TERMINATED was the only end-of-chain signal and a
-	// hybrid walk that crossed an FP-less frame can never set it. That is
-	// what this assertion pins shut. A non-zero value here now means real
-	// walks really did fail, and cfi-miss below says whether the tables are
-	// why.
-	assert.Zero(t, stats.StackWalkAbandoned,
-		"walks stopped without reaching an end of chain: %d of %d captures. cfi-miss=%d no-tables=%d dwarf=%d fp-only=%d",
-		stats.StackWalkAbandoned, wantSampled, stats.StacksWalkedCFIMiss,
+	// 62 for an unrelated reason: WALKER_FLAG_FP_TERMINATED was then the
+	// only end-of-chain signal, and a hybrid walk that crossed an FP-less
+	// frame can never set it, so the counter fired on successful walks too.
+	// The equality below looks the same and means something different -
+	// these walks really are cut short - so the two must not be confused.
+	assert.Zero(t, stats.StacksWalkedCFIMiss,
+		"the tables were consulted and did not cover a frame's PC: a gap in what ehcompile produced for this binary, not the known #45 truncation")
+	assert.Equal(t, stats.StackWalkFPExhausted, stats.StackWalkAbandoned,
+		"walks stopped for a reason other than the known lost-frame-pointer one: %d abandoned, %d of them fp-exhausted, of %d captures. cfi-miss=%d no-tables=%d dwarf=%d fp-only=%d",
+		stats.StackWalkAbandoned, stats.StackWalkFPExhausted, wantSampled, stats.StacksWalkedCFIMiss,
 		stats.StacksWalkedNoTables, stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly)
-	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d registered=%d binaries=%d",
+	// The measurement itself, and the reason this gate is also the
+	// instrument for #45: on this producer a DWARF walk CANNOT end any other
+	// way, because every FP-less bridge frame loses %rbp and main above it
+	// is FP_SAFE - see TestTheReportedTerminationArmIsTheOneTheCFIForces,
+	// which derives that from the binary's own CFI without any capability.
+	// If this ever reads less than StacksWalkedDWARF, some walk found a
+	// different ending and the CFI-level derivation no longer describes the
+	// producer.
+	assert.Equal(t, stats.StacksWalkedDWARF, stats.StackWalkFPExhausted,
+		"a DWARF walk on this producer ended some way other than running out of frame pointer: dwarf=%d fp-exhausted=%d reached-root=%d",
+		stats.StacksWalkedDWARF, stats.StackWalkFPExhausted, stats.StackWalkReachedRoot)
+	assert.Zero(t, stats.StackWalkReachedRoot,
+		"a walk reached a frame whose CFI marks it outermost: with %%rbp lost at every bridge that should be unreachable until issue #45 is fixed, and when it IS fixed this is the assertion to invert")
+	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d fp-exhausted=%d reached-root=%d registered=%d binaries=%d",
 		stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables,
 		stats.StacksWalkedCFIMiss, stats.StackWalkTruncated, stats.StackWalkAbandoned,
+		stats.StackWalkFPExhausted, stats.StackWalkReachedRoot,
 		stats.UnwindPIDsRegistered, stats.UnwindBinariesAttached)
 
 	snap := timeline.Snapshot()
@@ -602,17 +630,22 @@ func inodeOf(t *testing.T, sys any) uint64 {
 	return st.Ino
 }
 
+// requireBuilt builds the producer at path. The make target is the file's own
+// base name, not a fixed "perfagent-gpu-stub": shim/Makefile has a target per
+// producer, and building the wrong one leaves the caller pointing at a path
+// that may not exist at all on a clean tree - which fails later, in
+// ehcompile.Compile, where the cause is not legible.
 func requireBuilt(t *testing.T, path string) {
 	t.Helper()
 	if _, err := exec.LookPath("make"); err != nil {
 		t.Skip("make unavailable")
 	}
 	// filepath.Dir(path), not a double Dir: path is ".../shim/perfagent-gpu-stub"
-	// and the Makefile with the perfagent-gpu-stub target lives in
-	// ".../shim", not one level above it.
-	cmd := exec.Command("make", "-C", filepath.Dir(path), "perfagent-gpu-stub")
+	// and the Makefile with that target lives in ".../shim", not one level
+	// above it.
+	cmd := exec.Command("make", "-C", filepath.Dir(path), filepath.Base(path))
 	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "build stub: %s", out)
+	require.NoError(t, err, "build %s: %s", filepath.Base(path), out)
 }
 
 // requireFPLess runs `make -C shim check-fpless`, which disassembles the
@@ -655,6 +688,117 @@ func requireFPLess(t *testing.T, built string) {
 //
 // Without it, the only evidence for the walker's behaviour would be a gate
 // that a developer without capabilities cannot run.
+// Issue #44 asserts that on the RTX 3090 validation run EVERY DWARF walk
+// terminated via walk_step's `ctx->fp == 0` arm rather than its
+// `ra_type == UNDEFINED` arm. That assertion came out of a report, and it is
+// the justification for splitting WALKER_FLAG_UNWIND_TERMINATED in two, so it
+// deserves a measurement rather than a citation.
+//
+// The GPU is not reachable from here, but the MECHANISM is: which arm fires
+// is decided entirely by data this test can read without any capability at
+// all. walk_step's choice at each frame comes from two facts and nothing
+// else:
+//
+//   - the mode of the frame it is ON (FP_LESS takes the DWARF path, FP_SAFE
+//     and FALLBACK take the frame-pointer path), and
+//   - the fp_type of the frame it stepped OUT of (UNDEFINED or REGISTER set
+//     new_fp = 0, and the FP path then finds ctx->fp == 0).
+//
+// Both come straight out of ehcompile, from a real binary, and the memory
+// contents cannot change the answer: the arm is reached before any read.
+//
+// The binary is the gate's own producer, whose stack is built to reproduce
+// the CUDA shape - an FP-less bridge between the probe frame and main. If the
+// issue's claim holds anywhere it holds here.
+func TestTheReportedTerminationArmIsTheOneTheCFIForces(t *testing.T) {
+	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
+	requireBuilt(t, built)
+
+	entries, classes, _, err := ehcompile.Compile(built)
+	require.NoError(t, err)
+
+	ef, err := elf.Open(built)
+	require.NoError(t, err)
+	defer func() { _ = ef.Close() }()
+	syms, err := ef.Symbols()
+	require.NoError(t, err, "the producer must not be stripped")
+
+	// The midpoint of the body, not the entry PC: at entry the CFA is still
+	// SP-rooted even in a function that does establish a frame pointer.
+	pcOf := func(name string) uint64 {
+		for i := range syms {
+			if syms[i].Name == name && syms[i].Size > 0 {
+				return syms[i].Value + syms[i].Size/2
+			}
+		}
+		t.Fatalf("symbol %s not found in %s", name, built)
+		return 0
+	}
+	modeOf := func(pc uint64) ehcompile.Mode {
+		for _, c := range classes {
+			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
+				return c.Mode
+			}
+		}
+		// walk_step's own default for an uncovered PC.
+		return ehcompile.ModeFPSafe
+	}
+	cfiOf := func(pc uint64) *ehcompile.CFIEntry {
+		for i := range entries {
+			if pc >= entries[i].PCStart && pc < entries[i].PCStart+uint64(entries[i].PCEndDelta) {
+				return &entries[i]
+			}
+		}
+		return nil
+	}
+
+	// The frame the walk steps OUT of last: the outermost FP-less bridge,
+	// which walk_step unwinds with CFI.
+	caller := cfiOf(pcOf("perfagent_fpless_caller"))
+	require.NotNil(t, caller, "no CFI row covers perfagent_fpless_caller")
+	require.Equal(t, ehcompile.ModeFPLess, modeOf(pcOf("perfagent_fpless_caller")),
+		"not FP-less, so walk_step would never take the DWARF path here")
+
+	// This is the whole mechanism, and it is issue #45 seen from the outside:
+	// the function never touches %rbp, its CFI therefore carries no rule for
+	// %rbp, and ehcompile calls that UNDEFINED where the x86-64 psABI says
+	// unchanged. walk_step turns UNDEFINED into new_fp = 0.
+	require.Equal(t, ehcompile.FPTypeUndefined, caller.FPType,
+		"the FP-less frame preserves a frame pointer after all; the walk would not lose it and the claim under test would not arise here")
+	require.Equal(t, ehcompile.RATypeOffsetCFA, caller.RAType,
+		"the FP-less frame is already the outermost per its own CFI; the walk would end before reaching main")
+
+	// The frame the walk lands ON next, with ctx->fp now zero.
+	mainPC := pcOf("main")
+	require.Equal(t, ehcompile.ModeFPSafe, modeOf(mainPC),
+		"main is not FP_SAFE, so walk_step would take the DWARF path and never reach the ctx->fp == 0 check")
+
+	// Therefore: FP path, ctx->fp == 0, WALKER_FLAG_FP_EXHAUSTED. The other
+	// arm is not merely unfired here - it is unreachable, because reaching
+	// it needs a frame whose CFI marks it outermost, and the only such frame
+	// on this stack is _start, three FP_SAFE frames further up
+	// (__libc_start_call_main, __libc_start_main, then _start) that the walk
+	// can no longer reach with a zeroed frame pointer.
+	require.NotEqual(t, ehcompile.RATypeUndefined, caller.RAType)
+	mainCFI := cfiOf(mainPC)
+	require.NotNil(t, mainCFI)
+	assert.NotEqual(t, ehcompile.RATypeUndefined, mainCFI.RAType,
+		"main marks itself outermost, which would fire the RA_UNDEFINED arm instead")
+
+	// And the arm that SHOULD have fired is real, not hypothetical: _start in
+	// this very binary is marked outermost exactly as the issue describes.
+	// It is simply unreachable once the frame pointer is gone. That is the
+	// whole of issue #44's claim, reproduced locally.
+	startCFI := cfiOf(pcOf("_start"))
+	require.NotNil(t, startCFI, "no CFI row covers _start")
+	assert.Equal(t, ehcompile.RATypeUndefined, startCFI.RAType,
+		"_start does not mark itself outermost, so the RA_UNDEFINED arm would never fire for ANY walk on this binary")
+
+	t.Logf("perfagent_fpless_caller: mode=FP_LESS fp_type=UNDEFINED -> new_fp = 0")
+	t.Logf("main: mode=FP_SAFE, reached with ctx->fp == 0 -> WALKER_FLAG_FP_EXHAUSTED")
+	t.Logf("_start: ra_type=UNDEFINED (the WALKER_FLAG_RA_UNDEFINED arm), unreachable from main with no frame pointer")
+}
+
 func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)

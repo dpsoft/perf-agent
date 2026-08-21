@@ -477,30 +477,49 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 //   bit 1 — at least one frame used the DWARF path.
 //   bit 2 — at least one frame's CFI lookup missed while classified FP_LESS
 //           (walk truncated at that frame).
-//   bit 3 — the walk ended where the unwind information itself says the
-//           chain ends, rather than because the walker could not proceed.
-//           Two ways that happens, both benign:
-//             * a frame's CFI gives the return address as UNDEFINED, the
-//               DWARF marker for an outermost frame (glibc emits it for
-//               _start and for thread entry points); or
-//             * the walker arrived at an FP_SAFE frame with no caller frame
-//               pointer to follow (ctx->fp == 0), because the CFI of the
-//               frame below it did not preserve one — the same end-of-chain
-//               condition saved_fp == 0 reports one step later.
+//   bit 3 — a frame's CFI gives the return address as UNDEFINED, the DWARF
+//           marker for an outermost frame (glibc emits it for _start and for
+//           thread entry points). The unwind information itself says the
+//           chain ends here: a SUCCESS, the DWARF-side counterpart of bit 0.
+//   bit 4 — the walker arrived at an FP_SAFE frame with ctx->fp == 0 and
+//           could not continue. A FAILURE to make progress, not an end of
+//           chain: the frame pointer was lost one step earlier, because the
+//           DWARF rules of the FP_LESS frame below gave no location for it
+//           (fp_type UNDEFINED / REGISTER → new_fp = 0). Whatever called the
+//           FP_SAFE frame is missing from the stack, and nothing about the
+//           unwind information says that frame was outermost.
+//
+// Bits 3 and 4 were one bit (WALKER_FLAG_UNWIND_TERMINATED) until issue #44.
+// Merging them was wrong, and wrong in the direction that reads green: on the
+// RTX 3090 validation run for #43 every DWARF walk ended via what is now bit
+// 4 — stopped at main, missing __libc_start_main_impl and _start — and every
+// one was classified a complete walk. Harmless there only because the lost
+// frames were uninteresting. When the frame pointer is lost inside a vendor
+// library with an FP_SAFE APPLICATION frame above it, the same bit means the
+// walk stopped mid-application-stack. The root cause of bit 4 firing at all
+// is issue #45 (ehcompile reads "no rule for %rbp" as UNDEFINED where the
+// x86-64 psABI says unchanged); until that is fixed, bit 4 vs bit 3 is the
+// measurement of how often it bites.
 //
 // Bits 0 and 3 are the two "the walk finished" bits; a walk with neither
 // stopped for a reason it could not do anything about (a user-memory read
-// fault, a CFI miss, an RA/FP location this walker does not track, or
-// MAX_FRAMES). Consumers must treat them as a pair — see
-// gpuprobe/consumer.go Stats.StackWalkAbandoned, which counts exactly the
-// walks that set neither and did not hit MAX_FRAMES. Bit 3 is additive:
+// fault, a lost frame pointer (bit 4), a CFI miss, an RA/FP location this
+// walker does not track, or MAX_FRAMES). Consumers must treat bits 0 and 3
+// as a pair — see gpuprobe/consumer.go Stats.StackWalkAbandoned, which
+// counts exactly the walks that set neither and did not hit MAX_FRAMES, and
+// Stats.StackWalkFPExhausted, which names bit 4 as the subset of those with
+// a known cause.
+//
 // perf_dwarf.bpf.c and offcpu_dwarf.bpf.c read walker_flags only for
-// WALKER_FLAG_DWARF_USED when computing sample_header.mode, so it changes
-// nothing for them.
+// WALKER_FLAG_DWARF_USED when computing sample_header.mode, and no Go code
+// reads the field they emit (unwind/dwarfagent/sample.go decodes it and
+// nothing consults it), so splitting bit 3 and adding bit 4 changes nothing
+// for them — verified by disassembling both objects before and after.
 #define WALKER_FLAG_FP_TERMINATED    0x01
 #define WALKER_FLAG_DWARF_USED       0x02
 #define WALKER_FLAG_CFI_MISS         0x04
-#define WALKER_FLAG_UNWIND_TERMINATED 0x08
+#define WALKER_FLAG_RA_UNDEFINED     0x08
+#define WALKER_FLAG_FP_EXHAUSTED     0x10
 
 // walk_step is the per-frame bpf_loop callback for the hybrid walker.
 // Classifies ctx->pc, picks FP or DWARF path, and advances the walk
@@ -555,7 +574,7 @@ static long walk_step(__u32 idx, void *arg) {
             // The CFI says this frame has no return address: it is the
             // outermost frame of the chain (glibc marks _start and thread
             // entry points this way). The walk is COMPLETE, not stuck.
-            ctx->rec->hdr.walker_flags |= WALKER_FLAG_UNWIND_TERMINATED;
+            ctx->rec->hdr.walker_flags |= WALKER_FLAG_RA_UNDEFINED;
             return 1;
         } else {
             // SAME_VALUE (leaf on arm64) or REGISTER — the return address
@@ -585,16 +604,31 @@ static long walk_step(__u32 idx, void *arg) {
 
     // FP_SAFE or FALLBACK — same path: FP walk.
     if (ctx->fp == 0) {
-        // No caller frame pointer to follow. Either the DWARF rules of the
-        // frame below this one did not preserve one (fp_type UNDEFINED /
-        // REGISTER sets new_fp = 0 above), or the thread's FP register was
-        // already zero at capture. Either way the frame-pointer chain ends
-        // HERE, which is the same fact saved_fp == 0 records one step
-        // later — not a failure to make progress. Reading user memory at
-        // address 0 to rediscover that would fault and, before this check
-        // existed, made every such walk indistinguishable from one killed
-        // by a genuine read fault.
-        ctx->rec->hdr.walker_flags |= WALKER_FLAG_UNWIND_TERMINATED;
+        // No caller frame pointer to follow, so this walk stops HERE — and
+        // this is a FAILURE, not an end of chain. Nothing in the unwind
+        // information said this frame was outermost. Almost always the frame
+        // pointer was lost one step earlier, when the DWARF rules of the
+        // FP_LESS frame below gave no location for it (fp_type UNDEFINED /
+        // REGISTER sets new_fp = 0 above); the remaining case is a thread
+        // whose FP register was already zero when the sample was taken,
+        // which for a probe firing deep inside application code means the
+        // register was in use for something else, not that the stack ended.
+        // Either way whatever called this frame is real and is missing.
+        //
+        // This flag used to be WALKER_FLAG_UNWIND_TERMINATED, shared with
+        // the ra_type == UNDEFINED arm above, on the claim that it recorded
+        // "the same fact saved_fp == 0 records one step later". That claim
+        // was false (issue #44): saved_fp == 0 is a real chain root read out
+        // of live memory, while ctx->fp == 0 here is the walker's own DWARF
+        // step having zeroed the register. Sharing one bit made every such
+        // truncation read as a clean termination.
+        //
+        // Reading user memory at address 0 to rediscover this would fault,
+        // which before this check existed made such a walk indistinguishable
+        // from one killed by a genuine read fault — hence a flag rather than
+        // a bare `return 1`. The distinction it now carries is which KIND of
+        // stop it was, and this one belongs with the failures.
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_EXHAUSTED;
         return 1;
     }
     __u64 saved_fp = 0, ret_addr = 0;

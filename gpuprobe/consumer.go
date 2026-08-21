@@ -56,16 +56,16 @@ const (
 	// maxWalkFrames mirrors MAX_FRAMES in bpf/unwind_common.h: the walker's
 	// bpf_loop bound, and therefore the length of a struct gpu_stack's pcs
 	// array. A walk that produced exactly this many frames AND did not reach
-	// a natural terminator (no walkerFlagsTerminated bit) hit the bound and
-	// is truncated (Stats.StackWalkTruncated); one that reached the bound
-	// and also terminated happens to be a complete stack exactly this deep,
-	// not a truncated one.
+	// a natural terminator (no walkerFlagsTerminated bit) AND did not stop
+	// for a named reason of its own (no walkerFlagFPExhausted) hit the bound
+	// and is truncated (Stats.StackWalkTruncated); one that reached the
+	// bound and also terminated happens to be a complete stack exactly this
+	// deep, not a truncated one.
 	maxWalkFrames = 127
 
-	// walkerFlagFPTerminated, walkerFlagDWARFUsed and walkerFlagCFIMiss
-	// mirror WALKER_FLAG_* in bpf/unwind_common.h. They ride in struct
-	// gpu_stack's walker_flags and say how the walk went, not just how far
-	// it got:
+	// The walkerFlag* constants mirror WALKER_FLAG_* in
+	// bpf/unwind_common.h. They ride in struct gpu_stack's walker_flags and
+	// say how the walk went, not just how far it got:
 	//
 	//   - walkerFlagDWARFUsed set means at least one frame was unwound via
 	//     CFI. Clear means every frame the walk kept was reached by frame
@@ -75,25 +75,30 @@ const (
 	//   - walkerFlagFPTerminated set means the FP chain reached its natural
 	//     end (saved_fp == 0 in walk_step): the walk ran off the true root
 	//     of the stack.
-	//   - walkerFlagUnwindTerminated set means the walk ended where the
-	//     unwind information itself says the chain ends: either a frame
-	//     whose CFI gives the return address as UNDEFINED (the DWARF marker
-	//     for an outermost frame), or an FP_SAFE frame reached with no
-	//     caller frame pointer to follow because the CFI below it did not
-	//     preserve one. It is the DWARF-side counterpart of
-	//     walkerFlagFPTerminated and must be read together with it: a hybrid
-	//     walk that crossed a frame-pointer-less frame CANNOT end via
-	//     saved_fp == 0, because the DWARF step that carried it there set
-	//     the frame pointer to zero. Before this bit existed such a walk was
-	//     indistinguishable from one killed by a read fault, so EVERY
-	//     successful DWARF walk was counted in StackWalkAbandoned.
+	//   - walkerFlagRAUndefined set means a frame's CFI gives the return
+	//     address as UNDEFINED — the DWARF marker for an outermost frame,
+	//     which glibc emits for _start and for thread entry points. The
+	//     unwind information itself says the chain ends here, so this is the
+	//     DWARF-side counterpart of walkerFlagFPTerminated and must be read
+	//     together with it: a hybrid walk that crossed a frame-pointer-less
+	//     frame CANNOT end via saved_fp == 0, because the DWARF step that
+	//     carried it there set the frame pointer to zero.
+	//   - walkerFlagFPExhausted set means the walk arrived at an FP_SAFE
+	//     frame with no frame pointer to follow (ctx->fp == 0) and stopped.
+	//     This is a FAILURE, not an end of chain, and the two used to share
+	//     one bit (issue #44). Nothing said that frame was outermost; the
+	//     frame pointer was lost one step earlier, when the DWARF rules of
+	//     the FP_LESS frame below gave no location for it. Whatever called
+	//     the FP_SAFE frame is real and is missing from the stack. See
+	//     Stats.StackWalkFPExhausted for why it gets its own counter.
 	//
-	//     With both bits clear the walk stopped for a reason it could do
-	//     nothing about — a user-memory read fault at a live address, a
-	//     non-monotonic frame pointer, a CFI lookup miss, an RA/FP location
-	//     this walker does not track, or bpf_loop exhausting MAX_FRAMES —
-	//     and did NOT reach the root, even though it may have produced
-	//     usable frames.
+	//     With walkerFlagFPTerminated and walkerFlagRAUndefined both clear
+	//     the walk stopped for a reason it could do nothing about — a
+	//     user-memory read fault at a live address, a lost frame pointer
+	//     (walkerFlagFPExhausted), a non-monotonic frame pointer, a CFI
+	//     lookup miss, an RA/FP location this walker does not track, or
+	//     bpf_loop exhausting MAX_FRAMES — and did NOT reach the root, even
+	//     though it may have produced usable frames.
 	//   - walkerFlagCFIMiss set means the walker classified a frame as
 	//     frame-pointer-less, went looking for the CFI entry covering it,
 	//     and found none — so it stopped. Before Task 3 this could not
@@ -101,15 +106,22 @@ const (
 	//     reached the lookup); now that registration installs them, it
 	//     separates "the tables are missing" from "the tables are there and
 	//     do not cover this PC". See Stats.StacksWalkedCFIMiss.
-	walkerFlagFPTerminated     = 0x01
-	walkerFlagDWARFUsed        = 0x02
-	walkerFlagCFIMiss          = 0x04
-	walkerFlagUnwindTerminated = 0x08
+	walkerFlagFPTerminated = 0x01
+	walkerFlagDWARFUsed    = 0x02
+	walkerFlagCFIMiss      = 0x04
+	walkerFlagRAUndefined  = 0x08
+	walkerFlagFPExhausted  = 0x10
 
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
 	// the end of the chain". Neither StackWalkTruncated nor
 	// StackWalkAbandoned may count a capture with any of them set.
-	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagUnwindTerminated
+	//
+	// walkerFlagFPExhausted is deliberately NOT in it. It marks a walk that
+	// could not continue, which is exactly what StackWalkAbandoned counts;
+	// including it here is the bug issue #44 describes, where a walk stopped
+	// mid-stack by a lost frame pointer read as a clean termination and no
+	// counter moved.
+	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagRAUndefined
 
 	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
 	// bpf/gpu_usdt.bpf.c:
@@ -417,14 +429,18 @@ type Stats struct {
 	// (bpf/unwind_common.h walk_step). They stop the walk the same way:
 	// fewer frames than requested, no end of chain.
 	//
-	// It deliberately does NOT count a walk that ended where the unwind
-	// information says the chain ends (walkerFlagUnwindTerminated) even
-	// though such a walk also has walkerFlagFPTerminated clear. A hybrid
-	// walk that crossed a frame-pointer-less frame can only ever end that
-	// way, so counting it here made the counter fire on every SUCCESSFUL
-	// DWARF walk - measured at abandoned == StacksWalkedDWARF == 62 on the
-	// Phase 4b gate - which is both useless as a signal and reads as a
-	// fleet of failures to anyone looking at Stats in production.
+	// It deliberately does NOT count a walk whose CFI said the chain ends
+	// there (walkerFlagRAUndefined, StackWalkReachedRoot) even though such a
+	// walk also has walkerFlagFPTerminated clear. A hybrid walk that crossed
+	// a frame-pointer-less frame can only ever end that way, so counting it
+	// here made the counter fire on every SUCCESSFUL DWARF walk - measured
+	// at abandoned == StacksWalkedDWARF == 62 on the Phase 4b gate - which
+	// is both useless as a signal and reads as a fleet of failures to anyone
+	// looking at Stats in production.
+	//
+	// It DOES count a walk that stopped because the frame pointer was lost
+	// (walkerFlagFPExhausted, StackWalkFPExhausted), which until issue #44
+	// shared a bit with the case above and was therefore invisible.
 	//
 	// NOT a failure in the record-loss sense - the frames captured are
 	// still symbolized and attributed - but it is missing every frame above
@@ -432,6 +448,40 @@ type Stats struct {
 	// no relationship to MAX_FRAMES at all, so it needs its own counter to
 	// be visible rather than reading as zero.
 	StackWalkAbandoned uint64
+	// StackWalkReachedRoot and StackWalkFPExhausted are the two ways a walk
+	// can end without the frame-pointer chain running out (which is
+	// walkerFlagFPTerminated, and is not counted here). They were ONE
+	// counter's worth of information - a single WALKER_FLAG_UNWIND_TERMINATED
+	// bit - until issue #44 split them, and the split is the point: one is
+	// the good outcome and the other is the bad one.
+	//
+	// StackWalkReachedRoot counts walks that ended at a frame whose CFI
+	// gives the return address as UNDEFINED (walkerFlagRAUndefined): the
+	// DWARF marker for an outermost frame, which glibc emits for _start and
+	// for thread entry points. The walk saw the whole stack. This is the
+	// GOOD outcome, and it is a subset of the walks StackWalkAbandoned does
+	// not count.
+	StackWalkReachedRoot uint64
+	// StackWalkFPExhausted counts walks that stopped at an FP_SAFE frame
+	// with no frame pointer to follow (walkerFlagFPExhausted): the DWARF
+	// step out of the FP_LESS frame below it gave no location for %rbp and
+	// zeroed it. This is the BAD outcome - the caller of that FP_SAFE frame
+	// is real and is missing - and it is a SUBSET of StackWalkAbandoned,
+	// the subset with this specific named cause, the same way
+	// StacksWalkedCFIMiss is.
+	//
+	// It is also the instrument for issue #45, the root cause: ehcompile
+	// emits fpType UNDEFINED wherever the CFI carries no rule for %rbp,
+	// where the x86-64 psABI says a callee-saved register with no rule is
+	// unchanged. Every walk crossing such a frame lands here. When #45 is
+	// fixed, walks migrate from this counter to StackWalkReachedRoot, and
+	// that migration is how the fix is measured rather than asserted.
+	//
+	// On the RTX 3090 validation run for #43 this was, in effect, all 452
+	// DWARF walks: every one stopped at main, losing __libc_start_main_impl
+	// and _start, and every one read as a complete walk because the two
+	// outcomes shared a bit.
+	StackWalkFPExhausted uint64
 	// StacksWalkedDWARF counts non-empty captures where at least one frame
 	// was unwound via CFI (walkerFlagDWARFUsed set). This is the case that
 	// can reach through a vendor library into the application beneath it.
@@ -1471,18 +1521,37 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// this capture is also counted in StackWalkAbandoned below.
 		c.stats.StacksWalkedCFIMiss++
 	}
-	switch terminated := flags&walkerFlagsTerminated != 0; {
-	case terminated:
+	// How the walk ENDED, split into the good end and the bad one. At most
+	// one of these bits can be set: each arm in walk_step returns 1 the
+	// moment it sets its flag, so a walk ends exactly once.
+	if flags&walkerFlagRAUndefined != 0 {
+		c.stats.StackWalkReachedRoot++
+	}
+	if flags&walkerFlagFPExhausted != 0 {
+		// A lost frame pointer, not an end of chain - see
+		// Stats.StackWalkFPExhausted. Also counted in StackWalkAbandoned
+		// below, of which this is the named-cause subset.
+		c.stats.StackWalkFPExhausted++
+	}
+	switch {
+	case flags&walkerFlagsTerminated != 0:
 		// The walk reached the end of the chain, not the end of a budget
 		// and not a failure: either the FP chain's natural end
 		// (saved_fp == 0, walkerFlagFPTerminated) or the point the unwind
-		// information itself calls outermost (walkerFlagUnwindTerminated).
+		// information itself calls outermost (walkerFlagRAUndefined).
 		// Both must be honoured here - a hybrid walk that crossed a
 		// frame-pointer-less frame cannot end the first way, because the
 		// DWARF step that carried it there zeroed the frame pointer, so
 		// testing only walkerFlagFPTerminated counted every successful
 		// DWARF walk as abandoned. Not truncated either, even in the
 		// coincidental case where the end is the maxWalkFrames'th frame.
+	case flags&walkerFlagFPExhausted != 0:
+		// The frame pointer was lost and the walk could not continue. This
+		// case is checked BEFORE the maxWalkFrames one on purpose: a walk
+		// that ran out of frame pointer on its 127th frame did not stop
+		// because of the budget, and calling it truncated would file a
+		// known failure under "ran out of room".
+		c.stats.StackWalkAbandoned++
 	case len(ips) == maxWalkFrames:
 		// No natural terminator, and bpf_loop ran out of iterations. The
 		// frames are real and are used; the missing outermost ones - the

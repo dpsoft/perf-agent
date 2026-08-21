@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1241,10 +1242,11 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 		got[m[1]] = uint32(v)
 	}
 	assert.Equal(t, map[string]uint32{
-		"WALKER_FLAG_FP_TERMINATED":     walkerFlagFPTerminated,
-		"WALKER_FLAG_DWARF_USED":        walkerFlagDWARFUsed,
-		"WALKER_FLAG_CFI_MISS":          walkerFlagCFIMiss,
-		"WALKER_FLAG_UNWIND_TERMINATED": walkerFlagUnwindTerminated,
+		"WALKER_FLAG_FP_TERMINATED": walkerFlagFPTerminated,
+		"WALKER_FLAG_DWARF_USED":    walkerFlagDWARFUsed,
+		"WALKER_FLAG_CFI_MISS":      walkerFlagCFIMiss,
+		"WALKER_FLAG_RA_UNDEFINED":  walkerFlagRAUndefined,
+		"WALKER_FLAG_FP_EXHAUSTED":  walkerFlagFPExhausted,
 	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
 }
 
@@ -1255,14 +1257,15 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 // A hybrid walk that crosses a frame-pointer-less frame cannot end via
 // walkerFlagFPTerminated: the DWARF step that carried it across set the
 // frame pointer to zero (fp_type UNDEFINED), so the walk ends at the next
-// FP_SAFE frame with nothing to follow. walk_step now says so with
-// walkerFlagUnwindTerminated, and that has to count as an end of chain -
-// otherwise the counter fires on success and carries no information.
+// FP_SAFE frame with nothing to follow. walk_step says so with
+// walkerFlagRAUndefined when the CFI itself marks the frame outermost, and
+// that has to count as an end of chain - otherwise the counter fires on
+// success and carries no information.
 func TestASuccessfulDWARFWalkIsNotCountedAbandoned(t *testing.T) {
 	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
 	// The gate's shape: probe frame, two frame-pointer-less bridges, main.
 	stacks.put(31, 0x401000, 0x401100, 0x401200, 0x401300)
-	stacks.flags[31] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+	stacks.flags[31] = walkerFlagDWARFUsed | walkerFlagRAUndefined
 
 	frames, ok := c.resolveStackForTest(31, 4242)
 	require.True(t, ok)
@@ -1271,6 +1274,9 @@ func TestASuccessfulDWARFWalkIsNotCountedAbandoned(t *testing.T) {
 	assert.Zero(t, c.Stats().StackWalkAbandoned,
 		"the unwind information said the chain ends here; the walk succeeded")
 	assert.Zero(t, c.Stats().StackWalkTruncated)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkReachedRoot,
+		"the good outcome needs a counter of its own, not just the absence of a bad one")
+	assert.Zero(t, c.Stats().StackWalkFPExhausted)
 }
 
 // The other half of the same fact: narrowing StackWalkAbandoned must not
@@ -1290,7 +1296,7 @@ func TestADWARFWalkThatCouldNotProceedIsStillCountedAbandoned(t *testing.T) {
 		"neither terminator bit set and short of MAX_FRAMES is the failure case")
 }
 
-// walkerFlagUnwindTerminated has to suppress truncation for the same reason
+// walkerFlagRAUndefined has to suppress truncation for the same reason
 // walkerFlagFPTerminated does: a stack that is exactly maxWalkFrames deep
 // and ended at the chain's end is complete, not cut off at the budget.
 func TestAFullLengthWalkTerminatedByUnwindInfoIsNotCountedTruncated(t *testing.T) {
@@ -1300,12 +1306,127 @@ func TestAFullLengthWalkTerminatedByUnwindInfoIsNotCountedTruncated(t *testing.T
 	}
 	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
 	stacks.put(35, full...)
-	stacks.flags[35] = walkerFlagDWARFUsed | walkerFlagUnwindTerminated
+	stacks.flags[35] = walkerFlagDWARFUsed | walkerFlagRAUndefined
 
 	_, ok := c.resolveStackForTest(35, 4242)
 	require.True(t, ok)
 	assert.Zero(t, c.Stats().StackWalkTruncated)
 	assert.Zero(t, c.Stats().StackWalkAbandoned)
+}
+
+// Issue #44. WALKER_FLAG_UNWIND_TERMINATED (0x08) used to be set on two
+// unrelated conditions: a frame whose CFI marks it outermost, and a walk that
+// arrived at an FP_SAFE frame with the frame pointer already zeroed by the
+// DWARF step below it. The first is the walk succeeding; the second is the
+// walk being cut off mid-stack with the caller of that frame still real and
+// still on the stack. Sharing a bit made the second read as the first, so a
+// truncation nothing else could see moved NO counter at all: not
+// StackWalkAbandoned, not StackWalkTruncated, not StacksWalkedCFIMiss.
+//
+// walkerFlagFPExhausted (0x10) is that second condition, and it belongs with
+// the failures. Against the pre-#44 walker this capture's flags would have
+// been 0x08 and every assertion below would read the opposite way.
+func TestAWalkThatRanOutOfFramePointerIsCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// The measured shape: probe frame, two FP-less bridges, then main -
+	// where the walk stops because unwinding the last bridge produced no
+	// %rbp. __libc_start_call_main and _start are missing and nothing in
+	// the capture says so except this flag.
+	stacks.put(41, 0x401000, 0x401100, 0x401200, 0x401300)
+	stacks.flags[41] = walkerFlagDWARFUsed | walkerFlagFPExhausted
+
+	frames, ok := c.resolveStackForTest(41, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 4, "the frames it did get are real and are still attributed")
+	assert.Equal(t, uint64(1), c.Stats().StackWalkFPExhausted,
+		"the lost frame pointer is the named cause and needs to be visible")
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned,
+		"a walk stopped by a lost frame pointer did not reach the root; it is a failure")
+	assert.Zero(t, c.Stats().StackWalkReachedRoot,
+		"nothing in the unwind information said this frame was outermost")
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"it did not run out of budget; it ran out of frame pointer")
+}
+
+// The two outcomes must stay apart in BOTH directions. A walk that ended
+// because the CFI marked the frame outermost is not an FP exhaustion, and
+// must not inflate the counter that measures issue #45.
+func TestReachedRootAndFPExhaustedAreDisjoint(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(43, 0x401000, 0x401100)
+	stacks.flags[43] = walkerFlagDWARFUsed | walkerFlagRAUndefined
+	_, ok := c.resolveStackForTest(43, 4242)
+	require.True(t, ok)
+
+	stacks.put(44, 0x402000, 0x402100)
+	stacks.flags[44] = walkerFlagDWARFUsed | walkerFlagFPExhausted
+	_, ok = c.resolveStackForTest(44, 4242)
+	require.True(t, ok)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StackWalkReachedRoot)
+	assert.Equal(t, uint64(1), st.StackWalkFPExhausted)
+	assert.Equal(t, uint64(1), st.StackWalkAbandoned,
+		"exactly the FP-exhausted one; the one that reached the root is not a failure")
+	assert.Zero(t, st.StackWalkTruncated)
+}
+
+// A walk whose frame pointer ran out on its LAST permitted frame stopped for
+// a reason it named, not because bpf_loop ran out of iterations. Filing it
+// under StackWalkTruncated would hide a known failure inside "ran out of
+// room", which is the same kind of mislabelling issue #44 is about.
+func TestAFullLengthWalkThatRanOutOfFramePointerIsAbandonedNotTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(45, full...)
+	stacks.flags[45] = walkerFlagDWARFUsed | walkerFlagFPExhausted
+
+	_, ok := c.resolveStackForTest(45, 4242)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkFPExhausted)
+	assert.Zero(t, c.Stats().StackWalkTruncated,
+		"the budget was incidental; the walk had already lost the frame pointer")
+}
+
+// The two arms of the old shared bit must be set by DIFFERENT bits in the
+// walker source itself, not merely be different constants in this file. Both
+// arms live in walk_step in bpf/unwind_common.h; if a future edit points them
+// at the same macro again the Go side would keep classifying happily and the
+// counter would go quiet exactly as it did before #44.
+func TestTheTwoTerminationArmsSetDifferentFlagsInWalkStep(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_common.h")
+	require.NoError(t, err)
+	body := string(src)
+	step := body[strings.Index(body, "static long walk_step("):]
+	require.NotEmpty(t, step, "walk_step not found in the shared header")
+
+	// The RA-undefined arm: inside the DWARF path, guarded by the CFI's own
+	// ra_type. The FP-exhausted arm: inside the FP path, guarded by ctx->fp.
+	raArm := strings.Index(step, "e.ra_type == RA_TYPE_UNDEFINED")
+	fpArm := strings.Index(step, "if (ctx->fp == 0)")
+	require.Positive(t, raArm, "the ra_type == UNDEFINED arm is gone")
+	require.Positive(t, fpArm, "the ctx->fp == 0 arm is gone")
+	require.Less(t, raArm, fpArm, "arms found out of order; the slices below would be wrong")
+
+	flagIn := func(region string) string {
+		i := strings.Index(region, "walker_flags |= WALKER_FLAG_")
+		require.Positive(t, i, "no walker_flags assignment in this arm")
+		rest := region[i+len("walker_flags |= "):]
+		return rest[:strings.IndexAny(rest, ";")]
+	}
+	raFlag := flagIn(step[raArm:fpArm])
+	fpFlag := flagIn(step[fpArm:])
+
+	assert.Equal(t, "WALKER_FLAG_RA_UNDEFINED", raFlag,
+		"the CFI-says-outermost arm must set the success flag")
+	assert.Equal(t, "WALKER_FLAG_FP_EXHAUSTED", fpFlag,
+		"the lost-frame-pointer arm must set the failure flag, not the success one")
+	assert.NotEqual(t, raFlag, fpFlag,
+		"one bit for two unrelated outcomes is the defect in issue #44")
 }
 
 // A stack that is genuinely maxWalkFrames deep AND reached a natural

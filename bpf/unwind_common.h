@@ -8,8 +8,15 @@
 // Scope: the sample-record shape, per-CPU walker scratch, ringbuf for
 // emitted samples, PID filter, CFI tables, and per-instruction classification
 // + pid_mappings HASH_OF_MAPS tables that the hybrid walker consults
-// per frame. The walker itself lives in perf_dwarf.bpf.c (CPU) /
-// offcpu_dwarf.bpf.c (off-CPU).
+// per frame. The walker itself — walk_step, the bpf_loop callback — lives
+// HERE, in this header; the drivers only fill a walk_ctx and call bpf_loop.
+//
+// Drivers: perf_dwarf.bpf.c (perf_event), offcpu_dwarf.bpf.c (tp_btf) and
+// gpu_usdt.bpf.c (uprobe.multi). The first two emit sample_records through
+// the stack_events ringbuf; the third stages its PCs into a map of its own
+// and defines UNWIND_NO_SAMPLE_RINGBUF to skip the emit-side maps, which
+// would otherwise cost it ~16 MB of preallocated kern_stackmap it never
+// reads.
 //
 // See docs/dwarf-unwinding-design.md for architecture.
 #ifndef PERF_AGENT_UNWIND_COMMON_H
@@ -134,10 +141,16 @@ struct {
 } walker_scratch SEC(".maps");
 
 // ----- Ringbuf for emitted sample records.
+//
+// Emit-side only: a driver that stages its walk elsewhere (see
+// UNWIND_NO_SAMPLE_RINGBUF above) never touches this or kern_stackmap, and
+// creating them anyway would preallocate ~16 MB per attach for nothing.
+#ifndef UNWIND_NO_SAMPLE_RINGBUF
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, RINGBUF_BYTES);
 } stack_events SEC(".maps");
+#endif
 
 // ----- Kernel-stack capture (gated by kernel_stacks_enabled).
 //
@@ -155,12 +168,14 @@ struct {
 #define PROFILE_MAPS_SIZE    16384
 #define KERN_STACKID_FLAGS   (0 | BPF_F_FAST_STACK_CMP)
 
+#ifndef UNWIND_NO_SAMPLE_RINGBUF
 struct {
     __uint(type, BPF_MAP_TYPE_STACK_TRACE);
     __uint(key_size, sizeof(__u32));
     __uint(value_size, PERF_MAX_STACK_DEPTH * sizeof(__u64));
     __uint(max_entries, PROFILE_MAPS_SIZE);
 } kern_stackmap SEC(".maps");
+#endif
 
 // ----- Lazy CFI: miss-notify ringbuf (Option A2).
 //

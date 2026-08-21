@@ -241,12 +241,19 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.ZeroCorrelation,
 		"the stub never emits correlation 0, so no record may have been demoted to the heuristic join")
 	assert.Zero(t, stats.StacksMissing,
-		"the stub is built with frame pointers; a missing capture means bpf_get_stackid failed on a binary that should always succeed")
+		"the stub is built with frame pointers, so even the FP half of the hybrid walker must reach a terminator on every capture")
+	// StacksMissing says a capture failed; these say how it could have. All
+	// four are zero on a healthy run, and each one that is not points at a
+	// different part of the walk, which is the whole reason they are apart.
+	assert.Zero(t, stats.StackWalkEmpty, "a walk that produced not one frame, not even the probe's own PC")
+	assert.Zero(t, stats.StackMapFull, "gpu_stacks fills only if the consumer stopped draining")
+	assert.Zero(t, stats.StackMapUpdateFailed, "an insert refused for any reason other than a full map")
+	assert.Zero(t, stats.StackWalkScratchFailed, "a per-CPU scratch lookup at key 0 cannot fail on a loaded program")
 	assert.Zero(t, stats.StacksEvicted,
 		"the parked-stack side table must never overflow at this launch rate and capacity")
 	assert.Zero(t, stats.StackLookupFailed,
-		"every resolved stack's stackmap entry must be readable back exactly once")
-	assert.Zero(t, stats.StackDeleteFailed, "every stackmap entry read must also be deletable")
+		"every resolved stack's gpu_stacks entry must be readable back exactly once")
+	assert.Zero(t, stats.StackDeleteFailed, "every gpu_stacks entry read must also be deletable")
 	assert.Zero(t, stats.StacksUncorrelated,
 		"the stub never emits correlation 0 on a sampled launch")
 	assert.Zero(t, stats.StacksProfilerOnly,

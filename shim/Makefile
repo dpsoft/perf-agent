@@ -39,6 +39,74 @@ perfagent-gpu-stub: stub/stub.cc $(CORE_SRC)
 libperfagent-gpu-stub.so: stub/stub.cc $(CORE_SRC)
 	$(CXX) $(CXXFLAGS) -pthread -I core -shared -o $@ stub/stub.cc $(CORE_SRC)
 
+# The frame-pointer-less producer: the same records as perfagent-gpu-stub,
+# reached through two frames with no FP link, so the consumer's walk has to
+# cross FP-less frames exactly as it does in a CUDA process. gate_test.go
+# drives this, not perfagent-gpu-stub, because the plain stub's stack is one
+# a frame-pointer walk can follow -- a gate driven by it passes whether or not
+# the DWARF walker works.
+#
+# The per-file flags ARE the test, not tidiness:
+#   stub/fpless_bridge.cc   -fomit-frame-pointer      the FP-less frames
+#   stub/fpless_main.cc     -fno-omit-frame-pointer   the frame the walk must
+#                                                     reach across them
+#   stub/stub.cc            -fno-omit-frame-pointer   the frame the probe
+#                                                     fires in; its FP link is
+#                                                     the walk's first step
+# -fasynchronous-unwind-tables is explicit rather than left to the x86-64
+# psABI default: .eh_frame is the ONLY way the walker can cross an FP-less
+# frame, so a toolchain that quietly dropped it would turn this producer into
+# one that proves nothing. -g is for the gate's by-name assertions.
+#
+# `make check-fpless` proves the flags took effect instead of assuming it.
+perfagent-gpu-fpless: stub/fpless_bridge.cc stub/fpless_main.cc stub/stub.cc $(CORE_SRC)
+	$(CXX) $(CXXFLAGS) -g -pthread -I core -fomit-frame-pointer \
+		-fasynchronous-unwind-tables -c stub/fpless_bridge.cc -o stub/fpless_bridge.o
+	$(CXX) $(CXXFLAGS) -g -pthread -I core -fno-omit-frame-pointer \
+		-fasynchronous-unwind-tables -c stub/fpless_main.cc -o stub/fpless_main.o
+	$(CXX) $(CXXFLAGS) -g -pthread -I core -fno-omit-frame-pointer \
+		-fasynchronous-unwind-tables -DPERFAGENT_STUB_NO_MAIN \
+		-c stub/stub.cc -o stub/fpless_stub.o
+	$(CXX) $(CXXFLAGS) -g -pthread -fno-omit-frame-pointer -o $@ \
+		stub/fpless_bridge.o stub/fpless_main.o stub/fpless_stub.o $(CORE_SRC)
+
+# Fails the BUILD rather than the gate if the toolchain did not do what the
+# flags asked. Three separate things are checked, because three separate
+# things would each silently turn the gate green while proving nothing:
+#
+#   1. The two bridge functions must not open with `push %rbp; mov %rsp,%rbp`.
+#      Fedora ships -fno-omit-frame-pointer in its RPM build flags, so a
+#      toolchain that re-enables frame pointers is a real failure mode here,
+#      not a theoretical one. With frame pointers they are followable by the
+#      walker this phase replaces.
+#   2. They must not WRITE %rbp at all. -fomit-frame-pointer frees rbp as a
+#      general-purpose register; if either function used it, perfagent_stub_run
+#      would save that garbage in its prologue and the walk would die at its
+#      first FP step, never reaching an FP-less frame and never taking the
+#      DWARF path.
+#   3. perfagent_stub_run must KEEP its frame pointer, since the walk's first
+#      step is an FP step out of its frame.
+.PHONY: check-fpless
+check-fpless: perfagent-gpu-fpless
+	@rc=0; for fn in perfagent_fpless_bridge perfagent_fpless_caller; do \
+	  objdump -d --no-show-raw-insn perfagent-gpu-fpless \
+	    | awk -v f="<$$fn>:" 'index($$0,f){g=1;next} g&&/^$$/{exit} g' > /tmp/fpless_$$fn.asm; \
+	  if [ ! -s /tmp/fpless_$$fn.asm ]; then echo "$$fn: not found in the binary"; rc=1; continue; fi; \
+	  if grep -q 'mov  *%rsp,%rbp' /tmp/fpless_$$fn.asm; then \
+	    echo "$$fn: establishes a frame pointer; -fomit-frame-pointer did not take"; rc=1; fi; \
+	  if grep -qE ',%rbp|%rbp,|pop  *%rbp|push  *%rbp' /tmp/fpless_$$fn.asm; then \
+	    echo "$$fn: touches %rbp; the FP chain into perfagent_stub_run would be poisoned"; \
+	    grep -nE ',%rbp|%rbp,|%rbp' /tmp/fpless_$$fn.asm; rc=1; fi; \
+	  echo "$$fn: no frame pointer, %rbp untouched"; \
+	done; \
+	objdump -d --no-show-raw-insn perfagent-gpu-fpless \
+	  | awk 'index($$0,"<perfagent_stub_run>:"){g=1;next} g&&/^$$/{exit} g' | head -4 > /tmp/fpless_stubrun.asm; \
+	grep -q 'mov  *%rsp,%rbp' /tmp/fpless_stubrun.asm || { \
+	  echo "perfagent_stub_run: no frame pointer; the walk's first FP step would fail"; rc=1; }; \
+	readelf -S perfagent-gpu-fpless | grep -q '\.eh_frame' || { \
+	  echo "no .eh_frame: the DWARF walker has nothing to read"; rc=1; }; \
+	[ $$rc -eq 0 ] && echo "check-fpless: OK"; exit $$rc
+
 # The CUPTI adapter. The CUDA driver dlopens this through CUDA_INJECTION64_PATH
 # into a process that links no CUPTI of its own, so the rpath is load-bearing:
 # libcupti.so is not on the default loader path and the injected process has no
@@ -93,4 +161,5 @@ test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc co
 
 clean:
 	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so \
+		perfagent-gpu-fpless stub/fpless_bridge.o stub/fpless_main.o stub/fpless_stub.o \
 		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload

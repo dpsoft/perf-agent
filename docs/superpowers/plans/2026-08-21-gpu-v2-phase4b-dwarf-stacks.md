@@ -74,7 +74,7 @@ Verify with `readelf -d /home/diego/gpuprobe.test | grep -c blazesym` → `0`. *
 
 **Frame pointers stay as the fallback, not as a rival.** `walk_step` is already a *hybrid* walker: it classifies each frame and picks FP or CFI per frame. That is precisely why the vendor libraries are the hard case and the application is not — so there is nothing to choose between; drive the hybrid walker and let it decide.
 
-**The consumer must register PIDs.** `walk_step` consults the `pids` map and the per-PID CFI tables. Nothing in `gpuprobe` populates those today, because `bpf_get_stackid` needed no setup. This is the integration work of the phase, and Task 3 is where it lands.
+**The consumer must register PIDs.** `walk_step` consults the per-PID CFI tables — `pid_mappings` / `pid_mapping_lengths` (via `mapping_for_pc`) and the four `cfi_*` maps. It does **not** consult `pids`: that map is a sampling whitelist, read only by `perf_dwarf.bpf.c` and `offcpu_dwarf.bpf.c`, which hook events that fire for every process on the machine and therefore need one. A `uprobe.multi` on the shim inode only fires in processes that mapped the shim, so gpuprobe needs no whitelist and must not populate `pids` — doing so would be dead work that looks like the task was done. Nothing in `gpuprobe` populates the CFI tables today, because `bpf_get_stackid` needed no setup. This is the integration work of the phase, and Task 3 is where it lands.
 
 ---
 
@@ -249,7 +249,7 @@ func TestFPOnlyAndDWARFWalksAreCountedSeparately(t *testing.T) {
 - Modify: `gpuprobe/consumer.go`, `gpuprobe/attach.go` (or wherever `Attach` lives)
 - Test: `gpuprobe/consumer_test.go`
 
-**This is the integration work of the phase.** `walk_step` consults the `pids` map and the per-PID CFI tables built by `unwind/ehcompile` and `unwind/procmap`. `bpf_get_stackid` needed none of that, so `gpuprobe` populates none of it today — and a walker with no tables silently degrades to the frame-pointer path, i.e. straight back to the bug this phase exists to fix.
+**This is the integration work of the phase.** `walk_step` consults the per-PID mapping tables (`pid_mappings`, `pid_mapping_lengths`) and the four `cfi_*` tables built by `unwind/ehcompile` and `unwind/procmap`. It does **not** consult `pids` — see the correction in the preamble; that map is the samplers' whitelist and gpuprobe has no use for it. `bpf_get_stackid` needed none of that, so `gpuprobe` populates none of it today — and a walker with no tables silently degrades to the frame-pointer path, i.e. straight back to the bug this phase exists to fix.
 
 > **This task is deliberately investigation-first.** Unlike Tasks 1 and 2, it does
 > not carry the code to write, because the mechanism already exists in
@@ -261,7 +261,7 @@ func TestFPOnlyAndDWARFWalksAreCountedSeparately(t *testing.T) {
 
 - [ ] **Step 1: Establish how the existing agents do it**
 
-Read how `profile/` and `unwind/dwarfagent/` populate `pids` and attach CFI tables — including `AttachAllMappings` and the lazy-attach path visible in the integration logs. **Do not invent a second mechanism.** Report what you found and which of it `gpuprobe` must reuse.
+Read how `profile/` and `unwind/dwarfagent/` attach CFI tables (and, for the samplers only, populate `pids`) — including `AttachAllMappings` and the lazy-attach path visible in the integration logs. **Do not invent a second mechanism.** Report what you found and which of it `gpuprobe` must reuse.
 
 - [ ] **Step 2: Register the profiled PID(s)**
 

@@ -62,22 +62,25 @@ import (
 // rate, which is exactly the class of bug the bounded stores in gpu/ exist
 // to avoid.
 
-// launchKey identifies one launch. A correlation alone does not.
+// The side tables below key on gpu.CorrelationID, which carries the
+// producing process. A correlation VALUE alone does not identify a launch.
 //
 // The probes are attached with uprobe_multi against the shim *file*, so
 // every process that maps it fires them, and Config.PID == 0 (system-wide)
 // is a supported mode. CUPTI hands out correlation ids per process, each
 // sequence starting from a low value, so two profiled processes collide on
-// correlation within the first handful of launches. Keying the side tables
-// on correlation alone would let process A's stack - symbolized against
+// correlation within the first handful of launches. Keying these tables on
+// the value alone would let process A's stack - symbolized against
 // /proc/A/maps - be attached to process B's launch, projecting B's measured
 // GPU time under a call path that provably did not produce it. A fabricated
-// flame graph is worse than no flame graph, so the pid is part of the key on
-// every insert, lookup, eviction and drain path.
-type launchKey struct {
-	pid  uint32
-	corr gpu.CorrelationID
-}
+// flame graph is worse than no flame graph.
+//
+// This used to be a local launchKey{pid, corr} pair, because the core's
+// CorrelationID was pid-blind and the timeline underneath these tables had
+// the same defect (issue #36). Now that the pid lives in the id itself, the
+// pair would be two copies of the same fact that could drift apart, so the
+// key IS the correlation: Consumer builds every one of them through
+// correlationOf, which cannot be called without naming a process.
 
 // resolvedStack is a capture that has already been read out of the stackmap
 // and symbolized, waiting for the batched launch it belongs to.
@@ -93,7 +96,7 @@ type resolvedStack struct {
 	gen uint64
 }
 
-// pendingStacks is the bounded (pid, correlation) -> stack side table for
+// pendingStacks is the bounded correlation -> stack side table for
 // captures that arrived before their batched twin. Eviction is FIFO: the
 // oldest
 // parked capture is the one whose twin is least likely to still be coming
@@ -102,7 +105,7 @@ type resolvedStack struct {
 //
 // Not internally synchronized; Consumer calls it under its own mutex.
 type pendingStacks struct {
-	byKey    map[launchKey]resolvedStack
+	byKey    map[gpu.CorrelationID]resolvedStack
 	order    []stackPos
 	head     int
 	gen      uint64
@@ -110,7 +113,7 @@ type pendingStacks struct {
 }
 
 type stackPos struct {
-	key launchKey
+	key gpu.CorrelationID
 	gen uint64
 }
 
@@ -119,7 +122,7 @@ func newPendingStacks(capacity int) *pendingStacks {
 		capacity = defaultSampledStackCapacity
 	}
 	return &pendingStacks{
-		byKey:    make(map[launchKey]resolvedStack),
+		byKey:    make(map[gpu.CorrelationID]resolvedStack),
 		capacity: capacity,
 	}
 }
@@ -130,7 +133,7 @@ func newPendingStacks(capacity int) *pendingStacks {
 // is not itself an eviction of a *pending* stack - the caller counts the
 // replaced one as evicted all the same, because its stack will never reach
 // a launch either.
-func (p *pendingStacks) park(key launchKey, frames []pp.Frame, period uint32) (evicted int) {
+func (p *pendingStacks) park(key gpu.CorrelationID, frames []pp.Frame, period uint32) (evicted int) {
 	if _, replaced := p.byKey[key]; replaced {
 		evicted++
 	}
@@ -206,7 +209,7 @@ func (p *pendingStacks) reclaimOrder() {
 }
 
 // take removes and returns the capture parked for key, if any.
-func (p *pendingStacks) take(key launchKey) (resolvedStack, bool) {
+func (p *pendingStacks) take(key gpu.CorrelationID) (resolvedStack, bool) {
 	st, ok := p.byKey[key]
 	if !ok {
 		return resolvedStack{}, false
@@ -292,14 +295,14 @@ func (d *deferredLaunches) pop() (deferredLaunch, bool) {
 	return l, true
 }
 
-// take removes the queued launch with this (pid, correlation), if it is
-// still held. The pair is unique per launch - a correlation on its own is
-// not, see launchKey - so the first match is the only one; the scan runs
-// from the newest end because the twin of a just-arrived sampled record is
-// the launch that was queued most recently.
-func (d *deferredLaunches) take(key launchKey) (deferredLaunch, bool) {
+// take removes the queued launch with this correlation, if it is still held.
+// A process-qualified correlation is unique per launch - a correlation value
+// on its own is not, see the note above pendingStacks - so the first match is
+// the only one; the scan runs from the newest end because the twin of a
+// just-arrived sampled record is the launch that was queued most recently.
+func (d *deferredLaunches) take(key gpu.CorrelationID) (deferredLaunch, bool) {
 	for i := len(d.buf) - 1; i >= d.head; i-- {
-		if d.buf[i].launch.Launch.PID != key.pid || d.buf[i].launch.Correlation != key.corr {
+		if d.buf[i].launch.Correlation != key {
 			continue
 		}
 		l := d.buf[i]

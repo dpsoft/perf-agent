@@ -291,12 +291,18 @@ func assertHeuristicAlwaysMarked(t *testing.T, snap Snapshot) {
 // Correlation (a backend, like DRM, that never supplies one) may take the
 // heuristic path at all. See TestConformanceEvictedLaunchDegradesToUnattributed
 // below for the specific reproduction this generalizes.
+//
+// The test is Present(), not equality with the zero CorrelationID: since
+// issue #36 a correlation also carries the producing process, so a record
+// with a pid and no vendor value is not the zero value yet still supplied no
+// correlation.
 func assertHeuristicOnlyForCorrelationlessExecs(t *testing.T, snap Snapshot) {
 	t.Helper()
 	for _, view := range snap.Executions {
 		if view.Join == JoinHeuristic {
-			assert.Equal(t, CorrelationID{}, view.Exec.Correlation,
-				"a heuristic join must only ever attach to an exec that never supplied a correlation ID at all")
+			assert.False(t, view.Exec.Correlation.Present(),
+				"a heuristic join must only ever attach to an exec that never supplied a correlation ID at all, got %+v",
+				view.Exec.Correlation)
 		}
 	}
 }

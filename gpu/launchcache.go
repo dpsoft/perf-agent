@@ -64,6 +64,10 @@ type cacheEntry struct {
 }
 
 // LaunchCache is a bounded FIFO of recent launches indexed by correlation ID.
+// The correlation carries the producing process (see CorrelationID), so the
+// index is process-qualified: two processes reusing the same vendor value -
+// the norm system-wide, since vendor counters restart per process - occupy
+// two entries and neither can be handed out for the other's execution.
 // Put and Get are O(1) amortized. It replaces the unbounded slice plus linear
 // scan the earlier prototype used, which was quadratic at snapshot time.
 //

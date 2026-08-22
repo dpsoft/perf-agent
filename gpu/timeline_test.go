@@ -74,7 +74,7 @@ func TestTimelineAttachesPCSamplesByCorrelation(t *testing.T) {
 //
 // Both launches deliberately share KernelName "hot_kernel" here so that a
 // reversion of the Critical 2 fix (dropping the
-// `exec.Correlation != (CorrelationID{})` gate in Snapshot, or restoring an
+// `exec.Correlation.Present()` gate in Snapshot, or restoring an
 // unconditional heuristic attempt) would make this test fail by reattaching
 // exec "a" to launch "b" - proving the fix is what prevents it, not an
 // accidental kernel-name mismatch.

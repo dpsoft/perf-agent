@@ -112,10 +112,51 @@ type GPUExecutionRef struct {
 
 // CorrelationID ties a launch to its later execution/sample events. It is
 // comparable and safe to use directly as a map key.
+//
+// A vendor correlation value is unique only WITHIN one process. CUPTI's
+// correlationId is a process-wide counter (§6.3 finding 4) and ROCm's
+// correlation_id.internal is no different: every process starts its sequence
+// from a low value. The probes, meanwhile, are attached with uprobe_multi
+// against the shim *file*, so every process that maps it feeds one consumer
+// and one Timeline, and system-wide (Config.PID == 0) is the documented
+// default. Two profiled processes therefore collide on correlation within the
+// first handful of launches.
+//
+// PID is what makes the identity whole, and it lives here - rather than as a
+// separate argument each join site is trusted to remember - so the compiler
+// enforces it at every construction site instead. That matters because a
+// launch carries a symbolized CPU stack resolved against /proc/<pid>/maps of
+// the process that produced it: a join across processes does not merely swap
+// metadata, it attributes one process's measured GPU time to a call path in a
+// different address space. A fabricated flame graph is worse than no flame
+// graph (spec §4).
+//
+// PID is the process that produced the event, as observed by the probe (the
+// batch header's pid), not a thread id; LaunchContext.TID carries the thread.
+// A backend with no process to name (a device-global lifecycle producer)
+// leaves it zero, and all such events then share one process namespace, which
+// is exactly what they mean.
+//
+// Present, not the zero value, is the test for "this record carried a
+// correlation at all" - see that method.
 type CorrelationID struct {
 	Backend GPUBackendID `json:"backend"`
+	PID     uint32       `json:"pid,omitempty"`
 	Value   string       `json:"value"`
 }
+
+// Present reports whether a correlation was actually supplied for this
+// record. Value is the whole of that answer: PID and Backend are context the
+// producer knows regardless, so a record that carries no vendor correlation
+// may still arrive with both filled in, and comparing against the zero
+// CorrelationID would then read it as a real, joinable id.
+//
+// This distinction is load-bearing. Timeline.Snapshot routes a correlation-
+// less execution to the heuristic join and an execution whose correlation
+// merely MISSED the cache to unattributed (spec §13, review Critical 2);
+// mistaking the first for the second, or the reverse, is how an execution
+// gets guess-attached to a launch it has no relationship with.
+func (c CorrelationID) Present() bool { return c.Value != "" }
 
 // ClockDomain identifies which clock a *_ns timestamp was measured against.
 //
@@ -232,6 +273,12 @@ type GPUKernelLaunch struct {
 
 // GPUKernelExec is emitted when a launched kernel's execution window is
 // known (start/end on-device), joined back to its launch by Correlation.
+//
+// There is no separate PID field: the process that produced this execution is
+// carried by Correlation (see CorrelationID), which is the only identity the
+// join uses and therefore the only place it cannot be forgotten. An execution
+// that carried no correlation at all has no process either, and takes the
+// heuristic path.
 type GPUKernelExec struct {
 	Execution   GPUExecutionRef `json:"execution"`
 	Correlation CorrelationID   `json:"correlation"`
@@ -268,8 +315,12 @@ type GPUModule struct {
 // Module, not Correlation, is the identity that always arrives. CUPTI populates
 // a PC sample's correlation ID only in kernel-serialized collection, which
 // serializes execution and so is not what we run; in continuous mode it is
-// always zero. Correlation is therefore optional here (zero means unknown) and
-// attribution goes through the module and PC offset.
+// always zero. Correlation is therefore optional here (Present() == false
+// means unknown) and attribution goes through the module and PC offset.
+//
+// When a correlation IS supplied, it carries the producing process with it
+// (see CorrelationID), so a sample can only ever be handed to an execution
+// from the same process.
 type GPUPCSample struct {
 	Correlation CorrelationID `json:"correlation"`
 	Module      ModuleRef     `json:"module"`

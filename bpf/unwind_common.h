@@ -472,8 +472,18 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 
 // walker_flags bits, exposed via sample_header.walker_flags:
 //
-//   bit 0 — FP walk reached a natural terminator (saved_fp == 0). Clear
-//           means the FP path did not end the walk at the root.
+//   bit 0 — the frame-pointer chain reached its natural terminator: a frame
+//           whose saved-FP slot holds zero, which is the x86-64 psABI's
+//           marker for the outermost frame (_start does `xorl %ebp, %ebp`
+//           before calling __libc_start_main, and the clone child does the
+//           same before calling the thread entry point). Clear means the FP
+//           path did not end the walk at the root. The walk does not stop
+//           here: the return address stored beside that zero is a real
+//           caller PC (`_start`'s), so it is carried forward for exactly one
+//           more step with fp == 0 so the unwind tables can confirm the root
+//           (bit 3) instead of the walk merely assuming it. This bit is also
+//           the walker's own record that it has taken that step: see
+//           fp_chain_ended().
 //   bit 1 — at least one frame used the DWARF path.
 //   bit 2 — at least one frame's CFI lookup missed while classified FP_LESS
 //           (walk truncated at that frame).
@@ -488,6 +498,24 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 //           (fp_type UNDEFINED / REGISTER → new_fp = 0). Whatever called the
 //           FP_SAFE frame is missing from the stack, and nothing about the
 //           unwind information says that frame was outermost.
+//           NOT set when the frame pointer is zero because the chain ended
+//           legitimately one step earlier (bit 0) — see fp_chain_ended().
+//   bit 5 — the saved-FP slot of a frame held a value that is neither zero
+//           nor above the current frame pointer, so the chain cannot be
+//           followed further. The return address read out of the SAME frame
+//           is still recorded (it is a separate slot and does not depend on
+//           the saved FP being sane), then the walk stops. Like bit 4 this
+//           is a FAILURE; it gets its own bit because the cause is different
+//           and, unlike bit 4, it points at a corrupt or hand-rolled frame
+//           rather than at unwind tables that dropped the register.
+//   bit 6 — the step taken past the end of the frame-pointer chain (bit 0)
+//           landed on a frame whose CFI says a caller EXISTS
+//           (ra_type OFFSET_CFA) rather than declaring it outermost. The
+//           frame-pointer chain and the unwind tables disagree about where
+//           the stack ends; the walker believes the chain and stops. Always
+//           accompanied by bit 0, never by bit 3, and it is what keeps that
+//           pair from reading as an unqualified success: consumers must
+//           treat a walk carrying it as one whose ending is UNCONFIRMED.
 //
 // Bits 3 and 4 were one bit (WALKER_FLAG_UNWIND_TERMINATED) until issue #44.
 // Merging them was wrong, and wrong in the direction that reads green: on the
@@ -503,23 +531,55 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 //
 // Bits 0 and 3 are the two "the walk finished" bits; a walk with neither
 // stopped for a reason it could not do anything about (a user-memory read
-// fault, a lost frame pointer (bit 4), a CFI miss, an RA/FP location this
-// walker does not track, or MAX_FRAMES). Consumers must treat bits 0 and 3
-// as a pair — see gpuprobe/consumer.go Stats.StackWalkAbandoned, which
-// counts exactly the walks that set neither and did not hit MAX_FRAMES, and
-// Stats.StackWalkFPExhausted, which names bit 4 as the subset of those with
-// a known cause.
+// fault, a lost frame pointer (bit 4), a non-monotonic one (bit 5), a CFI
+// miss, an RA/FP location this walker does not track, or MAX_FRAMES).
+// Consumers must treat bits 0 and 3 as a pair — see gpuprobe/consumer.go
+// Stats.StackWalkAbandoned, which counts exactly the walks that set neither
+// and did not hit MAX_FRAMES, and Stats.StackWalkFPExhausted /
+// Stats.StackWalkFPNonMonotonic, which name bits 4 and 5 as the subsets of
+// those with a known cause.
+//
+// Bits 0 and 3 are NOT mutually exclusive since issue #45: a walk that runs
+// off the end of the frame-pointer chain (bit 0) takes one further step with
+// fp == 0, and if the unwind tables classify that last frame FP_LESS and
+// give its return address as UNDEFINED it sets bit 3 as well. That pair is
+// the strongest possible ending — the FP chain and the CFI agreeing on where
+// the stack stops — and it is the normal shape for a hybrid walk on glibc.
+// When they disagree instead, bit 6 says so, and bit 0 alone then means
+// "the frame pointer ran out" rather than "the stack ended".
 //
 // perf_dwarf.bpf.c and offcpu_dwarf.bpf.c read walker_flags only for
 // WALKER_FLAG_DWARF_USED when computing sample_header.mode, and no Go code
 // reads the field they emit (unwind/dwarfagent/sample.go decodes it and
-// nothing consults it), so splitting bit 3 and adding bit 4 changes nothing
-// for them — verified by disassembling both objects before and after.
+// nothing consults it), so the bits themselves change nothing for them. The
+// FRAMES they capture do change: issue #45's fix stops the DWARF path
+// zeroing the frame pointer when the CFI carries no rule for it, and the
+// step past the FP-chain root adds the outermost frame both used to drop.
 #define WALKER_FLAG_FP_TERMINATED    0x01
 #define WALKER_FLAG_DWARF_USED       0x02
 #define WALKER_FLAG_CFI_MISS         0x04
 #define WALKER_FLAG_RA_UNDEFINED     0x08
 #define WALKER_FLAG_FP_EXHAUSTED     0x10
+#define WALKER_FLAG_FP_NONMONOTONIC  0x20
+#define WALKER_FLAG_ROOT_DISAGREEMENT 0x40
+
+// fp_chain_ended reports whether this walk has already stepped PAST the end
+// of the frame-pointer chain: it left a frame whose saved-FP slot held zero,
+// carried that frame's return address forward, and is now standing on the
+// caller the slot named with ctx->fp == 0.
+//
+// It reads the reported bit rather than carrying separate state because
+// WALKER_FLAG_FP_TERMINATED is set at exactly one site in walk_step — the
+// saved_fp == 0 arm — and that site is the only one that continues with a
+// zeroed frame pointer. Keeping it out of struct walk_ctx also keeps the
+// struct at 40 bytes, so the three drivers' entry code (which builds one on
+// the stack) is untouched by this change.
+//
+// Every arm that can be reached with it set stops the walk, so the step past
+// the root is bounded to exactly one.
+static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
+    return (ctx->rec->hdr.walker_flags & WALKER_FLAG_FP_TERMINATED) != 0;
+}
 
 // walk_step is the per-frame bpf_loop callback for the hybrid walker.
 // Classifies ctx->pc, picks FP or DWARF path, and advances the walk
@@ -568,6 +628,26 @@ static long walk_step(__u32 idx, void *arg) {
 
         __u64 ret_addr = 0;
         if (e.ra_type == RA_TYPE_OFFSET_CFA) {
+            if (fp_chain_ended(ctx)) {
+                // This frame is the one step taken past the end of the
+                // frame-pointer chain, and its CFI had the chance to say the
+                // chain ends here (RA_TYPE_UNDEFINED, below) and did not.
+                // The two sources DISAGREE: the frame pointer read out of
+                // the running stack says this is the root, the unwind tables
+                // say a caller exists. One of them is wrong and this walker
+                // cannot tell which, so it believes the FP chain — following
+                // the CFI would mean reading a caller slot at a CFA derived
+                // from a frame the psABI has already called outermost.
+                //
+                // But it does NOT stop quietly. WALKER_FLAG_FP_TERMINATED is
+                // already set from one frame below, so without a bit of its
+                // own this walk would be filed as a clean termination and no
+                // counter would move — a counter reading green in a case
+                // that may well be a failure, which is precisely the defect
+                // issue #44 exists to remove. Flag it.
+                ctx->rec->hdr.walker_flags |= WALKER_FLAG_ROOT_DISAGREEMENT;
+                return 1;
+            }
             if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
                                     (void *)(cfa + (__s64)e.ra_offset)) != 0) return 1;
         } else if (e.ra_type == RA_TYPE_UNDEFINED) {
@@ -588,10 +668,46 @@ static long walk_step(__u32 idx, void *arg) {
             if (bpf_probe_read_user(&new_fp, sizeof(new_fp),
                                     (void *)(cfa + (__s64)e.fp_offset)) != 0) return 1;
         } else if (e.fp_type == FP_TYPE_SAME_VALUE) {
-            // new_fp unchanged
+            // The callee-saved register was never touched in this frame, so
+            // the caller's value is still live in it: new_fp unchanged.
+            //
+            // Since issue #45 this is also what "the CFI carries no rule for
+            // the frame-pointer register" compiles to — the x86-64 psABI and
+            // AAPCS64 both make an unmentioned callee-saved register
+            // unchanged, and ehcompile used to emit UNDEFINED for it. That
+            // one-value change is why an FP_SAFE frame above an FP-less one
+            // now has a frame pointer to walk. See unwind/ehcompile's
+            // archDefaultFPRule.
+            //
+            // KNOWN LIMITATION, and it is a real one rather than a
+            // theoretical one. "No rule" is an inference about the producer,
+            // not a statement by it, and hand-written assembly can break the
+            // inference: a routine that does `push %rbp` and then uses %rbp
+            // as a scratch register under an FDE that is entirely
+            // DW_CFA_nop tells the unwinder nothing, and this rule then
+            // propagates a %rbp that holds arithmetic, not a frame base.
+            // Three such functions exist in Fedora's glibc — __mpn_addmul_1,
+            // __mpn_submul_1 (scratch use) and __swapcontext (reloads %rbp
+            // from the target ucontext) — out of 20976 no-rule FDEs across
+            // six binaries surveyed for #45, and none at all in
+            // libcuda.so.1. See the report for the scan.
+            //
+            // What changed is the FAILURE MODE, not the outcome: in those
+            // ranges the walk was already lost (for the two __mpn_ routines
+            // the CFA rule is wrong too — it stays rsp+8 after two pushes),
+            // but it used to be lost LOUDLY, as new_fp = 0 and a counted
+            // WALKER_FLAG_FP_EXHAUSTED one frame later. Now the garbage
+            // propagates: most often it faults on the next read (an
+            // unflagged stop), sometimes it lands in
+            // WALKER_FLAG_FP_NONMONOTONIC, and with small probability it
+            // yields a plausible bogus frame. That last case is the one
+            // nothing catches, and it is the price of the 12-27% of every
+            // shipped library's code that this rule un-truncates.
         } else {
-            // UNDEFINED / REGISTER — FP is lost; continuing via DWARF
-            // further is fine but FP-based frames further up will fail.
+            // UNDEFINED / REGISTER — the CFI positively says the register
+            // does not hold the caller's value and does not say where it
+            // does, so the FP is lost. Continuing via DWARF is still fine;
+            // FP-based frames further up will hit the ctx->fp == 0 arm.
             new_fp = 0;
         }
 
@@ -604,6 +720,17 @@ static long walk_step(__u32 idx, void *arg) {
 
     // FP_SAFE or FALLBACK — same path: FP walk.
     if (ctx->fp == 0) {
+        if (fp_chain_ended(ctx)) {
+            // The frame pointer is zero because the chain ended one step
+            // below, at a frame whose saved-FP slot held the psABI's
+            // outermost-frame marker, and this frame is the caller that slot
+            // named. It has been recorded. Without unwind tables classifying
+            // it FP_LESS there is nothing further to read — but the walk
+            // FINISHED, it did not fail, and bit 0 already says so. Falling
+            // into the WALKER_FLAG_FP_EXHAUSTED arm below would relabel
+            // every complete frame-pointer walk a failure.
+            return 1;
+        }
         // No caller frame pointer to follow, so this walk stops HERE — and
         // this is a FAILURE, not an end of chain. Nothing in the unwind
         // information said this frame was outermost. Almost always the frame
@@ -634,11 +761,49 @@ static long walk_step(__u32 idx, void *arg) {
     __u64 saved_fp = 0, ret_addr = 0;
     if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) return 1;
     if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) return 1;
-    if (saved_fp == 0) {
-        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_TERMINATED;
+    if (saved_fp <= ctx->fp) {
+        // The saved-FP slot does not name a caller frame. Two causes, and
+        // they are reported apart because they mean different things:
+        //
+        //   saved_fp == 0  the psABI's outermost-frame marker. _start does
+        //                  `xorl %ebp, %ebp` before calling
+        //                  __libc_start_main, and the clone child does the
+        //                  same before calling a thread entry point, so the
+        //                  frame that reads zero here is the LAST one with a
+        //                  frame pointer, not a broken one. A SUCCESS.
+        //   otherwise      a frame pointer that does not increase: a corrupt
+        //                  or hand-rolled frame, or a %rbp holding something
+        //                  that is not a frame base at all. A FAILURE.
+        //
+        // Either way ret_addr was already read, out of a DIFFERENT slot of
+        // the same frame, and it is the caller's PC regardless of what the
+        // saved-FP slot holds. Both arms used to `return 1` and throw it
+        // away, which cost the outermost frame of every stack the walker
+        // produced — `_start` on a main-thread stack (issue #45).
+        if (saved_fp == 0) {
+            ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_TERMINATED;
+            if (ret_addr == 0) return 1;
+            // Hand the caller's PC to the next iteration rather than
+            // appending it here: the loop head records it and then lets the
+            // unwind tables classify it, which is the only way the walk can
+            // reach a frame whose CFI marks it outermost (glibc's `_start`
+            // and clone child) and end with WALKER_FLAG_RA_UNDEFINED. Both
+            // guards above (fp_chain_ended) bound this to a SINGLE extra
+            // step, so a walk cannot wander past the root on a bad read.
+            ctx->sp = ctx->fp + 16;
+            ctx->pc = ret_addr;
+            ctx->fp = 0;
+            return 0;
+        }
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_NONMONOTONIC;
+        // Not carried forward the way the zero case is: the frame this came
+        // out of is already suspect, so record the one value that is still
+        // meaningful and stop rather than classify a PC on its say-so.
+        if (ret_addr != 0 && ctx->n_pcs < MAX_FRAMES) {
+            ctx->rec->pcs[ctx->n_pcs++] = ret_addr;
+        }
         return 1;
     }
-    if (saved_fp <= ctx->fp) return 1;
 
     // Caller's resume SP: after a standard prologue (push FP; move FP=SP
     // on x86_64; equivalent stp x29, x30 on arm64), the caller's SP at

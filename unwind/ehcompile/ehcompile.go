@@ -65,6 +65,11 @@ func Compile(elfPath string) (entries []CFIEntry, classifications []Classificati
 		if err := interp.run(fd.initialLocation, fd.initialLocation, fd.cie.initialInstructions); err != nil {
 			return fmt.Errorf("CIE init at PC 0x%x: %w", fd.initialLocation, err)
 		}
+		// DW_CFA_restore in the FDE reverts a register to the rule the CIE's
+		// initial instructions left in place, not to an architectural
+		// default (DWARF 5 §6.4.2.3). Seal that state here, between the two
+		// runs, so the FDE's restores have something correct to revert to.
+		interp.sealInitialRules()
 		interp.lastEmittedPC = fd.initialLocation
 		if err := interp.run(fd.initialLocation, fd.initialLocation+fd.addressRange, fd.instructions); err != nil {
 			return fmt.Errorf("FDE at PC 0x%x: %w", fd.initialLocation, err)

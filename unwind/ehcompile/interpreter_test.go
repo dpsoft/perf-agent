@@ -350,7 +350,17 @@ func TestInterpret_SameValueOpcode(t *testing.T) {
 }
 
 func TestInterpret_CompressedRestore(t *testing.T) {
-	// Compressed DW_CFA_restore(RBP) resets to undefined.
+	// Compressed DW_CFA_restore(RBP) reverts RBP to the rule the CIE's
+	// initial instructions left in place (DWARF 5 6.4.2.3). This CIE has no
+	// initial instructions at all, so that rule is the architectural default
+	// for a callee-saved register: SAME VALUE.
+	//
+	// This assertion used to read FPTypeUndefined, matching a
+	// restoreRegInitial that reset to undefined unconditionally and a comment
+	// calling that a simplification. It was pinning the simplification, not
+	// the DWARF semantics: nothing in this program says %rbp is dead, and
+	// under the x86-64 psABI an unmentioned callee-saved register still holds
+	// the caller's value (issue #45).
 	c := newTestCIE()
 	program := []byte{
 		cfaDefCFA, x86RSP, 16,
@@ -364,7 +374,96 @@ func TestInterpret_CompressedRestore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, s.entries, 2)
 	assert.Equal(t, FPTypeOffsetCFA, s.entries[0].FPType)
-	assert.Equal(t, FPTypeUndefined, s.entries[1].FPType)
+	assert.Equal(t, FPTypeSameValue, s.entries[1].FPType)
+}
+
+// DW_CFA_restore reverts to the CIE's rule, which is NOT always the
+// architectural default - and this is the case a bare "flip the default from
+// undefined to same-value" fix gets wrong. Here the CIE saves %rbp at CFA-16
+// in its own initial instructions; a restore in the FDE must give that rule
+// back, not same-value.
+func TestInterpret_RestoreRevertsToTheCIERuleNotTheArchDefault(t *testing.T) {
+	c := newTestCIE()
+	s := newInterpreter(c, archX86_64())
+
+	// CIE initial instructions: offset(RBP, -16). Run with an empty PC range
+	// so nothing is emitted, exactly as Compile does.
+	require.NoError(t, s.run(0x1000, 0x1000, []byte{0x80 | x86RBP, 2}))
+	s.sealInitialRules()
+	s.lastEmittedPC = 0x1000
+
+	// FDE: establish a CFA, override %rbp with same_value, then restore it.
+	program := []byte{
+		cfaDefCFA, x86RSP, 16,
+		cfaSameValue, x86RBP,
+		0x40 | 2,
+		0xc0 | x86RBP, // DW_CFA_restore(RBP)
+		0x40 | 4,
+	}
+	require.NoError(t, s.run(0x1000, 0x1006, program))
+	require.Len(t, s.entries, 2)
+	assert.Equal(t, FPTypeSameValue, s.entries[0].FPType)
+	assert.Equal(t, FPTypeOffsetCFA, s.entries[1].FPType,
+		"restore must give back the CIE's offset rule, not the architectural default")
+	assert.Equal(t, int16(-16), s.entries[1].FPOffset)
+}
+
+// The same defect on the return-address column, which is where it bites
+// hardest: every x86-64 CIE's initial instructions carry
+// DW_CFA_offset r16, -8, so a DW_CFA_restore of the RA column must give that
+// back. Resetting it to undefined instead synthesises a "this frame is
+// outermost" marker in the middle of a function - walk_step would set
+// WALKER_FLAG_RA_UNDEFINED and stop the walk while reporting success.
+//
+// No producer in the five system binaries surveyed for issue #45 emits
+// DW_CFA_restore on r16 (0 occurrences in ~200k rows), so this changes no
+// table today. It is the latent half of the same bug.
+func TestInterpret_RestoreOfTheRAColumnRevertsToTheCIERule(t *testing.T) {
+	c := newTestCIE()
+	s := newInterpreter(c, archX86_64())
+
+	// The universal x86-64 CIE preamble: def_cfa(rsp, 8); offset(r16, -8).
+	require.NoError(t, s.run(0x1000, 0x1000, []byte{
+		cfaDefCFA, x86RSP, 8,
+		0x80 | 16, 1,
+	}))
+	s.sealInitialRules()
+	s.lastEmittedPC = 0x1000
+
+	program := []byte{
+		cfaUndefined, 16, // pretend a producer marks the RA dead
+		0x40 | 2,
+		0xc0 | 16, // DW_CFA_restore(r16)
+		0x40 | 4,
+	}
+	require.NoError(t, s.run(0x1000, 0x1006, program))
+	require.Len(t, s.entries, 2)
+	assert.Equal(t, RATypeUndefined, s.entries[0].RAType)
+	assert.Equal(t, RATypeOffsetCFA, s.entries[1].RAType,
+		"restore must give back the CIE's DW_CFA_offset r16, -8, not undefined")
+	assert.Equal(t, int16(-8), s.entries[1].RAOffset)
+}
+
+// The architectural defaults, stated as a test rather than as a comment:
+// the frame-pointer register starts SAME VALUE (callee-saved, x86-64 psABI
+// 3.2.1 / AAPCS64 6.1.1) and the return-address column starts UNDEFINED
+// (DWARF 5 6.4.1, and the marker glibc uses for _start). Issue #44's
+// WALKER_FLAG_RA_UNDEFINED depends on the second one staying as it is.
+func TestInterpret_ArchDefaultsAreFPSameValueAndRAUndefined(t *testing.T) {
+	for _, arch := range []archInfo{archX86_64(), archARM64()} {
+		t.Run(arch.name, func(t *testing.T) {
+			c := newTestCIE()
+			c.raColumn = uint64(arch.raReg)
+			s := newInterpreter(c, arch)
+			// A CFA and nothing else: no rule for either tracked register.
+			require.NoError(t, s.run(0x1000, 0x1004, []byte{cfaDefCFA, arch.spReg, 8, 0x40 | 4}))
+			require.Len(t, s.entries, 1)
+			assert.Equal(t, FPTypeSameValue, s.entries[0].FPType,
+				"a callee-saved register with no rule is unchanged, not destroyed")
+			assert.Equal(t, RATypeUndefined, s.entries[0].RAType,
+				"the return-address column's initial rule is undefined and must stay so")
+		})
+	}
 }
 
 func TestInterpret_ValOffsetProducesFallback(t *testing.T) {

@@ -37,6 +37,17 @@ type interpreter struct {
 	fpRule    regRule // rule for arch.fpReg (RBP / x29)
 	raRule    regRule // rule for cie.raColumn (x86 column 16 / arm64 x30)
 
+	// The rules DW_CFA_restore / DW_CFA_restore_extended revert to: the
+	// state the CIE's initial instructions left behind, sealed by
+	// sealInitialRules once those instructions have run. DWARF 5 §6.4.2.3
+	// defines restore as "the rule assigned it by the initial instructions",
+	// NOT a fixed architectural default, and the two differ whenever the CIE
+	// says anything about FP or RA — which every x86-64 CIE does for RA
+	// (DW_CFA_offset r16, -8). Seeded with the architectural defaults so an
+	// interpreter that never sees a CIE still restores to something sane.
+	initFPRule regRule
+	initRARule regRule
+
 	// Snapshot of last-emitted state for dedup.
 	lastEmittedPC uint64
 	lastState     emittedState
@@ -67,15 +78,58 @@ type savedState struct {
 	raRule    regRule
 }
 
+// archDefaultFPRule is the rule in force for the frame-pointer register
+// before any CFI instruction has run.
+//
+// SAME VALUE, not UNDEFINED. %rbp (x86-64) and x29 (arm64) are callee-saved:
+// the x86-64 psABI (§3.2.1, Fig. 3.4) and AAPCS64 (§6.1.1) both oblige a
+// callee to preserve them across a call, so a frame whose CFI says nothing
+// about the register is a frame that did not touch it — the caller's value is
+// still live in it. DWARF 5 §6.4.1 leaves the initial rule for a register
+// "unspecified"/architecture-defined precisely so the ABI can say this, and
+// libgcc's own unwinder agrees: unwind-dw2.c starts every column at
+// REG_UNSAVED and __frame_state_for/uw_update_context_1 simply do not touch a
+// REG_UNSAVED column, i.e. it keeps its current value.
+//
+// Reading it as UNDEFINED instead (issue #45) made walk_step zero the frame
+// pointer on the way out of any frame with no %rbp rule — 12.3% of libc's CFI
+// rows, 27.5% of libstdc++'s and 15.9% of libcuda.so.1's — and every FP_SAFE
+// frame above such a frame then had nothing to walk. It is also not a reading
+// producers ask for: across ~200k CFI rows in five system binaries
+// DW_CFA_undefined appears three times and every one is on the return-address
+// column, never on %rbp. A compiler that genuinely destroys a callee-saved
+// register has the opcode available to say so and does not use it, because
+// restoring before return is the ABI contract.
+func archDefaultFPRule() regRule { return regRule{kind: ruleSameValue} }
+
+// archDefaultRARule is the rule in force for the return-address column before
+// any CFI instruction has run: UNDEFINED, which is DWARF 5 §6.4.1's own
+// initial rule for that column and the marker producers use for "this frame is
+// outermost" (glibc emits DW_CFA_undefined r16 for _start and thread entry
+// points). Deliberately NOT same-value: WALKER_FLAG_RA_UNDEFINED (issue #44)
+// is how a walk recognises a genuine root, and making the RA column
+// same-value by default would delete that signal.
+func archDefaultRARule() regRule { return regRule{kind: ruleUndefined} }
+
 func newInterpreter(c *cie, arch archInfo) *interpreter {
 	return &interpreter{
-		cie:     c,
-		arch:    arch,
-		cfaType: CFATypeUndefined,
-		cfaRule: ruleUndefined,
-		fpRule:  regRule{kind: ruleUndefined},
-		raRule:  regRule{kind: ruleUndefined},
+		cie:        c,
+		arch:       arch,
+		cfaType:    CFATypeUndefined,
+		cfaRule:    ruleUndefined,
+		fpRule:     archDefaultFPRule(),
+		raRule:     archDefaultRARule(),
+		initFPRule: archDefaultFPRule(),
+		initRARule: archDefaultRARule(),
 	}
+}
+
+// sealInitialRules records the current FP/RA rules as the ones
+// DW_CFA_restore reverts to. Call it once, after the CIE's initial
+// instructions have run and before the FDE's instructions do.
+func (s *interpreter) sealInitialRules() {
+	s.initFPRule = s.fpRule
+	s.initRARule = s.raRule
 }
 
 // run executes the CFI program. [startPC, endPC) is the PC range this
@@ -453,9 +507,22 @@ func (s *interpreter) setRegRule(reg uint8, r regRule) {
 	}
 }
 
-// restoreRegInitial resets the register's rule to undefined. Simplification:
-// tracking CIE's initial rules precisely would help correctness in a few
-// edge cases but matters little for CFA+FP+RA tracking.
+// restoreRegInitial implements DW_CFA_restore / DW_CFA_restore_extended.
+//
+// DWARF 5 §6.4.2.3: the register's rule reverts to "the rule assigned it by
+// the initial instructions" of the CIE — not to a fixed default. This used to
+// reset to UNDEFINED unconditionally, with a comment calling that a
+// simplification; it was wrong for exactly the registers this package tracks.
+// Every x86-64 CIE's initial instructions contain DW_CFA_offset r16, -8, so
+// DW_CFA_restore on the RA column must return it to OffsetCFA(-8), and the
+// old code turned it into UNDEFINED — synthesising a "this frame is
+// outermost" marker in the middle of a function. Restoring against the sealed
+// post-CIE snapshot removes both errors at once.
 func (s *interpreter) restoreRegInitial(reg uint8) {
-	s.setRegRule(reg, regRule{kind: ruleUndefined})
+	switch {
+	case reg == s.arch.fpReg:
+		s.fpRule = s.initFPRule
+	case uint64(reg) == s.cie.raColumn:
+		s.raRule = s.initRARule
+	}
 }

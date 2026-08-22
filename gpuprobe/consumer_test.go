@@ -1242,11 +1242,13 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 		got[m[1]] = uint32(v)
 	}
 	assert.Equal(t, map[string]uint32{
-		"WALKER_FLAG_FP_TERMINATED": walkerFlagFPTerminated,
-		"WALKER_FLAG_DWARF_USED":    walkerFlagDWARFUsed,
-		"WALKER_FLAG_CFI_MISS":      walkerFlagCFIMiss,
-		"WALKER_FLAG_RA_UNDEFINED":  walkerFlagRAUndefined,
-		"WALKER_FLAG_FP_EXHAUSTED":  walkerFlagFPExhausted,
+		"WALKER_FLAG_FP_TERMINATED":     walkerFlagFPTerminated,
+		"WALKER_FLAG_DWARF_USED":        walkerFlagDWARFUsed,
+		"WALKER_FLAG_CFI_MISS":          walkerFlagCFIMiss,
+		"WALKER_FLAG_RA_UNDEFINED":      walkerFlagRAUndefined,
+		"WALKER_FLAG_FP_EXHAUSTED":      walkerFlagFPExhausted,
+		"WALKER_FLAG_FP_NONMONOTONIC":   walkerFlagFPNonMonotonic,
+		"WALKER_FLAG_ROOT_DISAGREEMENT": walkerFlagRootDisagreement,
 	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
 }
 
@@ -1369,6 +1371,103 @@ func TestReachedRootAndFPExhaustedAreDisjoint(t *testing.T) {
 	assert.Equal(t, uint64(1), st.StackWalkAbandoned,
 		"exactly the FP-exhausted one; the one that reached the root is not a failure")
 	assert.Zero(t, st.StackWalkTruncated)
+}
+
+// The shape issue #45 produces on a real main-thread stack: the walk runs
+// off the end of the frame-pointer chain (walkerFlagFPTerminated) AND the
+// unwind tables of the frame it steps onto declare it outermost
+// (walkerFlagRAUndefined). Both bits, one walk, one root.
+//
+// Before #45 walk_step stopped at the zero saved frame pointer and the second
+// bit could not be set on such a walk at all, so the pair was impossible and
+// the classification switch documented the two as mutually exclusive. They
+// are not, and the walk must still be counted exactly once - as a success.
+func TestAWalkMayReachTheRootByBothTheFPChainAndTheCFI(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	// probe frame, two FP-less bridges, main, two libc frames, _start.
+	stacks.put(47, 0x401000, 0x401100, 0x401200, 0x401300, 0x7f0000, 0x7f0100, 0x400875)
+	stacks.flags[47] = walkerFlagDWARFUsed | walkerFlagFPTerminated | walkerFlagRAUndefined
+
+	frames, ok := c.resolveStackForTest(47, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 7)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StackWalkReachedRoot,
+		"the CFI said this frame was outermost; that is the good outcome and it must be counted")
+	assert.Zero(t, st.StackWalkAbandoned,
+		"a walk that reached the root by BOTH routes is not abandoned")
+	assert.Zero(t, st.StackWalkFPExhausted,
+		"the frame pointer ran out at the root, which is not an exhaustion")
+	assert.Zero(t, st.StackWalkTruncated)
+}
+
+// The step past the frame-pointer root that issue #45 added can land on a
+// frame whose CFI says a caller EXISTS. The two sources then disagree about
+// where the stack ends, and walkerFlagFPTerminated is ALREADY set from the
+// frame below - so without a bit of its own that walk is indistinguishable
+// from a clean termination and no counter moves.
+//
+// That is the exact defect issue #44 exists to remove, recreated by #45's own
+// fix, which is why the classification switch tests this bit BEFORE
+// walkerFlagsTerminated.
+func TestAWalkWhoseRootTheCFIContradictsIsNotCountedASuccess(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(50, 0x401000, 0x401100, 0x401200)
+	// Exactly the shape walk_step produces: FP_TERMINATED from the frame
+	// below, then the disagreement on the step past it.
+	stacks.flags[50] = walkerFlagDWARFUsed | walkerFlagFPTerminated | walkerFlagRootDisagreement
+
+	_, ok := c.resolveStackForTest(50, 4242)
+	require.True(t, ok)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StackWalkRootDisagreement)
+	assert.Equal(t, uint64(1), st.StackWalkAbandoned,
+		"an ending the frame-pointer chain and the unwind tables disagree about must not be filed as a success just because FP_TERMINATED is set")
+	assert.Zero(t, st.StackWalkReachedRoot,
+		"nothing declared this frame outermost; the CFI said the opposite")
+	assert.Zero(t, st.StackWalkTruncated)
+}
+
+// A frame pointer that does not increase used to be an unflagged bare
+// `return 1` in walk_step - indistinguishable, from the outside, from a
+// bpf_probe_read_user fault. It now has a bit, and that bit is a failure:
+// counted in StackWalkAbandoned like walkerFlagFPExhausted, with its own
+// named-cause counter beside it.
+func TestAWalkStoppedByANonMonotonicFramePointerIsCountedAbandoned(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(48, 0x401000, 0x401100, 0x401200)
+	stacks.flags[48] = walkerFlagDWARFUsed | walkerFlagFPNonMonotonic
+
+	frames, ok := c.resolveStackForTest(48, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 3,
+		"the last frame is the return address walk_step now records before stopping")
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StackWalkFPNonMonotonic)
+	assert.Equal(t, uint64(1), st.StackWalkAbandoned,
+		"a corrupt frame link is a failure to continue, not an end of chain")
+	assert.Zero(t, st.StackWalkFPExhausted,
+		"the two failures have different causes and must not share a counter")
+	assert.Zero(t, st.StackWalkReachedRoot)
+	assert.Zero(t, st.StackWalkTruncated)
+}
+
+// Same reasoning as the FP-exhausted case: a named failure on the last
+// permitted frame is abandonment, not "ran out of room".
+func TestAFullLengthNonMonotonicWalkIsAbandonedNotTruncated(t *testing.T) {
+	full := make([]uint64, maxWalkFrames)
+	for i := range full {
+		full[i] = uint64(0x401000 + i*16)
+	}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(49, full...)
+	stacks.flags[49] = walkerFlagDWARFUsed | walkerFlagFPNonMonotonic
+
+	_, ok := c.resolveStackForTest(49, 4242)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkAbandoned)
+	assert.Equal(t, uint64(1), c.Stats().StackWalkFPNonMonotonic)
+	assert.Zero(t, c.Stats().StackWalkTruncated)
 }
 
 // A walk whose frame pointer ran out on its LAST permitted frame stopped for

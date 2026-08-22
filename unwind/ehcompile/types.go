@@ -24,6 +24,13 @@
 //   - Register saves: offset / offset_extended / offset_extended_sf /
 //     restore / restore_extended / same_value / undefined / register.
 //     Only FP and RA are tracked; other register saves are ignored.
+//     restore / restore_extended revert to the rule the CIE's initial
+//     instructions left in place (DWARF 5 6.4.2.3), not to a fixed default.
+//   - Initial rules, before any instruction runs: the frame-pointer register
+//     is SAME VALUE (callee-saved under the x86-64 psABI and AAPCS64, so a
+//     frame that never mentions it has not changed it) and the
+//     return-address column is UNDEFINED (DWARF 5 6.4.1, and the marker
+//     producers use for an outermost frame).
 //   - State stack: remember_state / restore_state (16 deep).
 //   - Expressions: def_cfa_expression / expression / val_expression
 //     → FALLBACK for the covered PC range, no CFIEntry.
@@ -56,7 +63,22 @@ const (
 type FPType uint8
 
 const (
-	FPTypeUndefined FPType = 0 // FP is not tracked / not callee-saved here
+	// FPTypeUndefined means the CFI positively asserts the frame-pointer
+	// register does not hold the caller's value and says nothing about where
+	// it does: DW_CFA_undefined on %rbp / x29. The BPF walker zeroes the
+	// frame pointer on such a step, so every FP-based frame above is lost.
+	//
+	// It is NOT what "the CFI carries no rule for the register" produces.
+	// A callee-saved register with no rule is UNCHANGED under the x86-64
+	// psABI and AAPCS64, so that compiles to FPTypeSameValue - see
+	// archDefaultFPRule in interpreter.go and issue #45. Emitting
+	// FPTypeUndefined for it truncated 12-27% of every shipped library's
+	// code ranges. In practice producers never emit DW_CFA_undefined for the
+	// frame-pointer register at all (0 occurrences across ~200k CFI rows in
+	// five system binaries), so this value is close to unreachable in the
+	// wild - which is exactly why conflating it with "no rule" was so
+	// damaging.
+	FPTypeUndefined FPType = 0
 	FPTypeOffsetCFA FPType = 1 // saved at [CFA + FPOffset]
 	FPTypeSameValue FPType = 2 // caller's FP == current FP (unchanged)
 	FPTypeRegister  FPType = 3 // saved in another register (rare; we FALLBACK)

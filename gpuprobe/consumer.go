@@ -73,8 +73,15 @@ const (
 	//     the profiler's own callback on real hardware, because an FP walk
 	//     cannot survive the first frame-pointer-omitting vendor frame.
 	//   - walkerFlagFPTerminated set means the FP chain reached its natural
-	//     end (saved_fp == 0 in walk_step): the walk ran off the true root
-	//     of the stack.
+	//     end: a frame whose saved-FP slot held zero, which is the x86-64
+	//     psABI's outermost-frame marker (_start zeroes %rbp before calling
+	//     __libc_start_main; the clone child does the same). Since issue #45
+	//     walk_step does not stop there - the return address stored beside
+	//     that zero is a real caller PC, so it takes ONE further step with
+	//     fp == 0 to let the unwind tables confirm the root. So this bit and
+	//     walkerFlagRAUndefined are no longer mutually exclusive: a hybrid
+	//     walk on glibc normally ends with BOTH, which is the strongest
+	//     ending there is.
 	//   - walkerFlagRAUndefined set means a frame's CFI gives the return
 	//     address as UNDEFINED — the DWARF marker for an outermost frame,
 	//     which glibc emits for _start and for thread entry points. The
@@ -91,6 +98,23 @@ const (
 	//     the FP_LESS frame below gave no location for it. Whatever called
 	//     the FP_SAFE frame is real and is missing from the stack. See
 	//     Stats.StackWalkFPExhausted for why it gets its own counter.
+	//     walk_step does NOT set it when the frame pointer is zero because
+	//     the chain ended legitimately one step earlier - that case already
+	//     carries walkerFlagFPTerminated and is a success.
+	//   - walkerFlagFPNonMonotonic set means a frame's saved-FP slot held a
+	//     value that is neither zero nor above the current frame pointer, so
+	//     the chain could not be followed. Also a FAILURE, and also a subset
+	//     of Stats.StackWalkAbandoned, but pointing at a corrupt or
+	//     hand-rolled frame rather than at unwind tables that dropped the
+	//     register. The return address read out of the same frame IS still
+	//     recorded before the walk stops.
+	//   - walkerFlagRootDisagreement set means the step past the end of the
+	//     frame-pointer chain landed on a frame whose CFI says a caller
+	//     EXISTS instead of declaring it outermost: the two sources disagree
+	//     about where the stack ends. Always arrives with
+	//     walkerFlagFPTerminated, and its whole job is to stop that bit from
+	//     reading as an unqualified success. See
+	//     Stats.StackWalkRootDisagreement.
 	//
 	//     With walkerFlagFPTerminated and walkerFlagRAUndefined both clear
 	//     the walk stopped for a reason it could do nothing about — a
@@ -106,21 +130,28 @@ const (
 	//     reached the lookup); now that registration installs them, it
 	//     separates "the tables are missing" from "the tables are there and
 	//     do not cover this PC". See Stats.StacksWalkedCFIMiss.
-	walkerFlagFPTerminated = 0x01
-	walkerFlagDWARFUsed    = 0x02
-	walkerFlagCFIMiss      = 0x04
-	walkerFlagRAUndefined  = 0x08
-	walkerFlagFPExhausted  = 0x10
+	walkerFlagFPTerminated     = 0x01
+	walkerFlagDWARFUsed        = 0x02
+	walkerFlagCFIMiss          = 0x04
+	walkerFlagRAUndefined      = 0x08
+	walkerFlagFPExhausted      = 0x10
+	walkerFlagFPNonMonotonic   = 0x20
+	walkerFlagRootDisagreement = 0x40
 
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
 	// the end of the chain". Neither StackWalkTruncated nor
 	// StackWalkAbandoned may count a capture with any of them set.
 	//
-	// walkerFlagFPExhausted is deliberately NOT in it. It marks a walk that
-	// could not continue, which is exactly what StackWalkAbandoned counts;
-	// including it here is the bug issue #44 describes, where a walk stopped
-	// mid-stack by a lost frame pointer read as a clean termination and no
-	// counter moved.
+	// walkerFlagFPExhausted and walkerFlagFPNonMonotonic are deliberately NOT
+	// in it. They mark walks that could not continue, which is exactly what
+	// StackWalkAbandoned counts; including the first is the bug issue #44
+	// describes, where a walk stopped mid-stack by a lost frame pointer read
+	// as a clean termination and no counter moved.
+	//
+	// walkerFlagRootDisagreement is not in it either, and it OVERRIDES the
+	// bits that are: it can only arrive alongside walkerFlagFPTerminated,
+	// and it says that termination was contradicted by the unwind tables.
+	// See the classification switch, which tests it first.
 	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagRAUndefined
 
 	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
@@ -482,6 +513,39 @@ type Stats struct {
 	// and _start, and every one read as a complete walk because the two
 	// outcomes shared a bit.
 	StackWalkFPExhausted uint64
+	// StackWalkFPNonMonotonic counts walks that stopped because a frame's
+	// saved-FP slot held a value that is neither zero nor above the current
+	// frame pointer (walkerFlagFPNonMonotonic): a corrupt frame, a
+	// hand-rolled one, or a %rbp holding something that is not a frame base.
+	// Like StackWalkFPExhausted it is a named-cause SUBSET of
+	// StackWalkAbandoned.
+	//
+	// Before issue #45 this case was indistinguishable from a read fault:
+	// walk_step tested it with a bare `return 1`, which also threw away the
+	// return address it had already read out of a different slot of the same
+	// frame. That address is now recorded before the walk stops, so the
+	// outermost frame survives, and the stop is counted here.
+	StackWalkFPNonMonotonic uint64
+	// StackWalkRootDisagreement counts walks whose two sources disagreed
+	// about where the stack ends (walkerFlagRootDisagreement): the
+	// frame-pointer chain reached the psABI's outermost-frame marker, the
+	// walk took its one step past it, and the CFI of the frame it landed on
+	// says a caller exists rather than declaring it outermost. The walker
+	// believes the frame pointer and stops.
+	//
+	// It exists because without it that walk is INDISTINGUISHABLE from a
+	// clean one: walkerFlagFPTerminated is already set, so the walk would be
+	// classified terminated and no counter would move - a counter reading
+	// green in a case that may well be a truncation. That is the defect
+	// class issue #44 exists to remove, and the step past the frame-pointer
+	// root added in issue #45 is what created this instance of it.
+	//
+	// Counted in StackWalkAbandoned as well, like StackWalkFPExhausted and
+	// StackWalkFPNonMonotonic: the ending is UNCONFIRMED, and an unconfirmed
+	// ending must not be filed as a success. On the Phase 4b gate's producer
+	// it is zero, because _start's CFI declares the root and the two sources
+	// agree.
+	StackWalkRootDisagreement uint64
 	// StacksWalkedDWARF counts non-empty captures where at least one frame
 	// was unwound via CFI (walkerFlagDWARFUsed set). This is the case that
 	// can reach through a vendor library into the application beneath it.
@@ -1521,9 +1585,13 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// this capture is also counted in StackWalkAbandoned below.
 		c.stats.StacksWalkedCFIMiss++
 	}
-	// How the walk ENDED, split into the good end and the bad one. At most
-	// one of these bits can be set: each arm in walk_step returns 1 the
-	// moment it sets its flag, so a walk ends exactly once.
+	// How the walk ENDED. The three FAILURE bits are mutually exclusive -
+	// each of those arms in walk_step returns 1 the moment it sets its flag.
+	// walkerFlagRAUndefined is not exclusive with walkerFlagFPTerminated:
+	// since issue #45 a walk that runs off the end of the frame-pointer
+	// chain takes one further step and the CFI of that last frame may also
+	// declare it outermost, in which case both are set and the walk is
+	// counted here once.
 	if flags&walkerFlagRAUndefined != 0 {
 		c.stats.StackWalkReachedRoot++
 	}
@@ -1533,7 +1601,27 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// below, of which this is the named-cause subset.
 		c.stats.StackWalkFPExhausted++
 	}
+	if flags&walkerFlagFPNonMonotonic != 0 {
+		// A saved frame pointer that does not name a caller frame - see
+		// Stats.StackWalkFPNonMonotonic. Also a named-cause subset of
+		// StackWalkAbandoned.
+		c.stats.StackWalkFPNonMonotonic++
+	}
+	if flags&walkerFlagRootDisagreement != 0 {
+		// The FP chain said root and the CFI said otherwise - see
+		// Stats.StackWalkRootDisagreement. Also a named-cause subset of
+		// StackWalkAbandoned.
+		c.stats.StackWalkRootDisagreement++
+	}
 	switch {
+	case flags&walkerFlagRootDisagreement != 0:
+		// Checked BEFORE walkerFlagsTerminated, and that order is the whole
+		// point: this bit only ever arrives WITH walkerFlagFPTerminated, so
+		// testing termination first would swallow it and the walk would read
+		// as a clean success with nothing to show otherwise. An ending the
+		// two sources disagree about is not an ending this consumer will
+		// vouch for.
+		c.stats.StackWalkAbandoned++
 	case flags&walkerFlagsTerminated != 0:
 		// The walk reached the end of the chain, not the end of a budget
 		// and not a failure: either the FP chain's natural end
@@ -1545,12 +1633,14 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// testing only walkerFlagFPTerminated counted every successful
 		// DWARF walk as abandoned. Not truncated either, even in the
 		// coincidental case where the end is the maxWalkFrames'th frame.
-	case flags&walkerFlagFPExhausted != 0:
-		// The frame pointer was lost and the walk could not continue. This
-		// case is checked BEFORE the maxWalkFrames one on purpose: a walk
-		// that ran out of frame pointer on its 127th frame did not stop
-		// because of the budget, and calling it truncated would file a
-		// known failure under "ran out of room".
+	case flags&(walkerFlagFPExhausted|walkerFlagFPNonMonotonic) != 0:
+		// The frame-pointer chain gave out and the walk could not continue,
+		// either because there was no frame pointer left to follow or
+		// because the one it found did not name a caller frame. This case is
+		// checked BEFORE the maxWalkFrames one on purpose: a walk that ran
+		// out of frame pointer on its 127th frame did not stop because of
+		// the budget, and calling it truncated would file a known failure
+		// under "ran out of room".
 		c.stats.StackWalkAbandoned++
 	case len(ips) == maxWalkFrames:
 		// No natural terminator, and bpf_loop ran out of iterations. The

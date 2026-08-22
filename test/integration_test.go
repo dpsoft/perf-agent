@@ -2,13 +2,11 @@ package test
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,31 +49,31 @@ var workloads = []TestWorkload{
 	{
 		Name:     "go-cpu",
 		Binary:   "./workloads/go/cpu_bound",
-		Args:     []string{"-duration=20s", "-threads=4"},
+		Args:     []string{workloadRuntimeFlag, "-threads=4"},
 		Language: "go",
 	},
 	{
 		Name:     "go-io",
 		Binary:   "./workloads/go/io_bound",
-		Args:     []string{"-duration=20s", "-threads=2"},
+		Args:     []string{workloadRuntimeFlag, "-threads=2"},
 		Language: "go",
 	},
 	{
 		Name:     "rust-cpu",
 		Binary:   "./workloads/rust/target/release/rust-workload",
-		Args:     []string{"20", "4"},
+		Args:     []string{workloadRuntimeSecs, "4"},
 		Language: "rust",
 	},
 	{
 		Name:     "python-cpu",
 		Binary:   "python3",
-		Args:     []string{"-X", "perf", "./workloads/python/cpu_bound.py", "20", "4"},
+		Args:     []string{"-X", "perf", "./workloads/python/cpu_bound.py", workloadRuntimeSecs, "4"},
 		Language: "python",
 	},
 	{
 		Name:     "python-io",
 		Binary:   "python3",
-		Args:     []string{"-X", "perf", "./workloads/python/io_bound.py", "20", "2"},
+		Args:     []string{"-X", "perf", "./workloads/python/io_bound.py", workloadRuntimeSecs, "2"},
 		Language: "python",
 	},
 }
@@ -105,31 +103,46 @@ func TestProfileMode(t *testing.T) {
 				time.Sleep(2 * time.Second) // Let workload stabilize
 			}
 
-			// Run perf-agent
+			// Run perf-agent. Collect until the capture is one the
+			// assertions below can actually speak to — samples, stacks
+			// and at least one symbol — rather than sampling once for a
+			// fixed window and asserting on whatever landed (issue #42).
+			// If the budget runs out we fall through to the historical
+			// tolerance ladder unchanged, so this can only add signal.
 			outputFile := "profile.pb.gz"
 			defer os.Remove(outputFile)
 
-			agent := exec.Command(agentPath,
-				"--profile",
-				"--profile-output", outputFile,
-				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-				"--duration", "10s",
-			)
-
-			output, err := agent.CombinedOutput()
-			if err != nil {
-				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			const window = 10 * time.Second
+			prof, collected, report := collectProfileUntil(t,
+				"a CPU profile with samples, stack traces and at least one symbolized function",
+				window,
+				func(int) (*profile.Profile, error) {
+					requireWorkloadAlive(t, workload, wl.Name)
+					agent := exec.Command(agentPath,
+						"--profile",
+						"--profile-output", outputFile,
+						"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+						"--duration", window.String(),
+					)
+					output, err := agent.CombinedOutput()
+					if err != nil {
+						t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+					}
+					return readProfile(outputFile)
+				},
+				func(p *profile.Profile) bool {
+					return len(p.Sample) > 0 && profileHasStacks(p) && profileHasSymbols(p)
+				})
+			if !collected {
+				t.Logf("WARN: %s", report)
 			}
+			require.NotNil(t, prof, "no readable profile after the collect-until budget: %s", report)
 
 			// Verify profile.pb.gz was created
 			assert.FileExists(t, outputFile)
 
-			// Parse and validate profile
-			prof := parseProfile(t, outputFile)
-			require.NotNil(t, prof)
-
 			// Should have samples
-			assert.Greater(t, len(prof.Sample), 0, "Profile should contain samples")
+			assert.Greater(t, len(prof.Sample), 0, "Profile should contain samples: %s", describeProfile(prof))
 
 			// Should have valid sample types
 			require.Greater(t, len(prof.SampleType), 0)
@@ -138,14 +151,7 @@ func TestProfileMode(t *testing.T) {
 				"Expected sample type to be 'sample', 'cpu', or 'samples', got: %s", sampleType)
 
 			// Verify we captured stack traces
-			hasStacks := false
-			for _, sample := range prof.Sample {
-				if len(sample.Location) > 0 {
-					hasStacks = true
-					break
-				}
-			}
-			assert.True(t, hasStacks, "Profile should contain stack traces")
+			assert.True(t, profileHasStacks(prof), "Profile should contain stack traces: %s", describeProfile(prof))
 
 			// Verify symbolization worked (at least some symbols).
 			//
@@ -159,13 +165,7 @@ func TestProfileMode(t *testing.T) {
 			// that as a known environmental limitation rather than a
 			// regression — the agent did capture samples, just couldn't
 			// symbolize them.
-			hasSymbols := false
-			for _, fn := range prof.Function {
-				if fn.Name != "" && fn.Name != "??" {
-					hasSymbols = true
-					break
-				}
-			}
+			hasSymbols := profileHasSymbols(prof)
 			switch {
 			case hasSymbols:
 				// good
@@ -177,7 +177,7 @@ func TestProfileMode(t *testing.T) {
 				t.Logf("WARN: only %d samples captured (< %d threshold); symbolization assertion skipped — too few user-space PCs to reliably hit symbolizable code",
 					len(prof.Sample), degenerateSampleFloor)
 			default:
-				assert.True(t, hasSymbols, "Profile should contain symbolized functions")
+				assert.True(t, hasSymbols, "Profile should contain symbolized functions: %s", describeProfile(prof))
 			}
 
 			// verify pprof fidelity guarantees
@@ -208,31 +208,41 @@ func TestOffCPUMode(t *testing.T) {
 
 			time.Sleep(2 * time.Second)
 
-			// Run perf-agent with off-CPU profiling
+			// Run perf-agent with off-CPU profiling, re-collecting until
+			// the I/O workload's blocking actually landed in a capture
+			// (issue #42) rather than asserting on one fixed window.
 			outputFile := "offcpu.pb.gz"
 			defer os.Remove(outputFile)
 
-			agent := exec.Command(agentPath,
-				"--offcpu",
-				"--offcpu-output", outputFile,
-				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-				"--duration", "10s",
-			)
-
-			output, err := agent.CombinedOutput()
-			if err != nil {
-				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			const window = 10 * time.Second
+			prof, collected, report := collectProfileUntil(t,
+				"an off-CPU profile with at least one blocking sample",
+				window,
+				func(int) (*profile.Profile, error) {
+					requireWorkloadAlive(t, workload, wl.Name)
+					agent := exec.Command(agentPath,
+						"--offcpu",
+						"--offcpu-output", outputFile,
+						"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+						"--duration", window.String(),
+					)
+					output, err := agent.CombinedOutput()
+					if err != nil {
+						t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+					}
+					return readProfile(outputFile)
+				},
+				func(p *profile.Profile) bool { return len(p.Sample) > 0 })
+			if !collected {
+				t.Logf("WARN: %s", report)
 			}
+			require.NotNil(t, prof, "no readable off-CPU profile after the collect-until budget: %s", report)
 
 			// Verify offcpu.pb.gz was created
 			assert.FileExists(t, outputFile)
 
-			// Parse and validate profile
-			prof := parseProfile(t, outputFile)
-			require.NotNil(t, prof)
-
 			// Should have samples (I/O workloads block on I/O)
-			assert.Greater(t, len(prof.Sample), 0, "Off-CPU profile should contain samples")
+			assert.Greater(t, len(prof.Sample), 0, "Off-CPU profile should contain samples: %s", describeProfile(prof))
 
 			// verify pprof fidelity guarantees
 			assertPprofFidelity(t, outputFile)
@@ -306,33 +316,47 @@ func TestCombinedMode(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	// Run perf-agent with all features
-	agent := exec.Command(agentPath,
-		"--profile",
-		"--profile-output", "profile.pb.gz",
-		"--offcpu",
-		"--offcpu-output", "offcpu.pb.gz",
-		"--pmu",
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "10s",
-	)
-
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
-	}
-
 	// Verify both profile files exist
 	defer os.Remove("profile.pb.gz")
 	defer os.Remove("offcpu.pb.gz")
+
+	// Run perf-agent with all features, re-collecting until the CPU
+	// profile has samples (issue #42).
+	const window = 10 * time.Second
+	var output []byte
+	cpuProf, collected, report := collectProfileUntil(t,
+		"a combined-mode CPU profile with samples",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, wl.Name)
+			agent := exec.Command(agentPath,
+				"--profile",
+				"--profile-output", "profile.pb.gz",
+				"--offcpu",
+				"--offcpu-output", "offcpu.pb.gz",
+				"--pmu",
+				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+				"--duration", window.String(),
+			)
+			var err error
+			output, err = agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile("profile.pb.gz")
+		},
+		func(p *profile.Profile) bool { return len(p.Sample) > 0 })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
+	require.NotNil(t, cpuProf, "no readable CPU profile after the collect-until budget: %s", report)
 
 	assert.FileExists(t, "profile.pb.gz")
 	assert.FileExists(t, "offcpu.pb.gz")
 	assert.Contains(t, string(output), "Metrics")
 
 	// Verify profiles are valid
-	cpuProf := parseProfile(t, "profile.pb.gz")
-	assert.Greater(t, len(cpuProf.Sample), 0)
+	assert.Greater(t, len(cpuProf.Sample), 0, "combined-mode CPU profile should contain samples: %s", describeProfile(cpuProf))
 
 	offcpuProf := parseProfile(t, "offcpu.pb.gz")
 	assert.NotNil(t, offcpuProf)
@@ -438,13 +462,6 @@ func isDegenerateProfile(p *profile.Profile) bool {
 	return true
 }
 
-// degenerateSampleFloor is the sample-count threshold below which the
-// pprof fidelity / symbolization assertions are considered too noisy
-// to be meaningful. A healthy 10s @ 99Hz CPU-bound run produces
-// hundreds of user-space samples; the IO-bound subtests on slow CI
-// runners can drop into the low tens or single digits.
-const degenerateSampleFloor = 20
-
 // assertPprofFidelity verifies pprof fidelity guarantees on a
 // captured profile: >=1 real (non-sentinel) mapping and every
 // user-space Location has a non-zero Address. BuildID presence is
@@ -453,36 +470,17 @@ const degenerateSampleFloor = 20
 // older system binaries, custom builds with --build-id=none).
 func assertPprofFidelity(t *testing.T, path string) {
 	t.Helper()
-	f, err := os.Open(path)
+	p, err := readProfile(path)
 	if err != nil {
-		t.Fatalf("open profile: %v", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	p, err := profile.Parse(f)
-	if err != nil {
-		t.Fatalf("parse profile: %v", err)
+		t.Fatalf("pprof fidelity: %v", err)
 	}
 	if err := p.CheckValid(); err != nil {
 		t.Fatalf("pprof invalid: %v", err)
 	}
 
-	var real int
-	var hasJit bool
-	var hasBuildID bool
-	for _, m := range p.Mapping {
-		switch {
-		case m.File == "" || m.File == "[kernel]":
-			// ignore
-		case m.File == "[jit]":
-			hasJit = true
-		default:
-			real++
-		}
-		if m.BuildID != "" {
-			hasBuildID = true
-		}
-	}
+	sum := summarizeProfile(p)
+	real := sum.RealMappings
+	hasJit := sum.JitMappings > 0
 	// At least one real mapping — proves we're not falling back to the
 	// hardcoded single-mapping default. Static binaries (Go) legitimately
 	// produce exactly 1; dynamically-linked binaries produce N+ (target +
@@ -496,15 +494,19 @@ func assertPprofFidelity(t *testing.T, path string) {
 	case hasJit:
 		t.Logf("WARN: profile has only [jit] mapping (no file-backed); accepting JIT-only profile")
 	case isDegenerateProfile(p):
-		t.Logf("WARN: degenerate profile (real=0, jit=0); known CI flake on slow runners: %+v", p.Mapping)
+		t.Logf("WARN: degenerate profile (real=0, jit=0); known CI flake on slow runners: %s", describeMappings(p))
 	default:
-		t.Errorf("expected >=1 real mapping, got %d: %+v", real, p.Mapping)
+		t.Errorf("expected >=1 real (file-backed) mapping, got 0.\n"+
+			"  captured: %s\n"+
+			"  reading:  %s\n"+
+			"  mappings: %s",
+			sum, fidelityDiagnosis(sum), describeMappings(p))
 	}
 	// BuildID is observational only — record presence/absence so a
 	// regression that wipes BuildIDs across the board is visible in
 	// test output, but don't fail when the captured binaries simply
 	// don't carry build-ids.
-	t.Logf("pprof fidelity: real_mappings=%d has_build_id=%v", real, hasBuildID)
+	t.Logf("pprof fidelity: %s", sum)
 
 	for _, loc := range p.Location {
 		if loc.Mapping == nil {
@@ -520,22 +522,42 @@ func assertPprofFidelity(t *testing.T, path string) {
 	}
 }
 
+// parseProfile reads a captured pprof and fails the test if it cannot be
+// read.
+//
+// It does NOT assert on sample count — callers keep their own
+// expectations about that — but an empty or truncated file is reported
+// as "EMPTY (0 bytes): the agent collected 0 samples", not as the bare
+// `EOF` from a gzip reader that issue #42's arm64 run had to be
+// diagnosed from.
 func parseProfile(t *testing.T, filename string) *profile.Profile {
-	f, err := os.Open(filename)
-	require.NoError(t, err)
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	require.NoError(t, err)
-	defer gzr.Close()
-
-	data, err := io.ReadAll(gzr)
-	require.NoError(t, err)
-
-	prof, err := profile.Parse(bytes.NewReader(data))
-	require.NoError(t, err)
-
+	t.Helper()
+	prof, err := readProfile(filename)
+	if err != nil {
+		t.Fatalf("parse profile: %v", err)
+	}
 	return prof
+}
+
+// fidelityDiagnosis turns a profile summary into the sentence a reader
+// needs to decide whether a "no real mapping" failure is a profiler
+// regression or a workload that was never on-CPU in user space —
+// precisely the distinction issue #42 called out as missing.
+func fidelityDiagnosis(s profileSummary) string {
+	switch {
+	case s.Samples == 0:
+		return "nothing was sampled at all, so this says nothing about mapping resolution"
+	case s.UnmappedFrames > 0:
+		return fmt.Sprintf(
+			"%d frame(s) carried a user-space PC that resolved to no binary mapping — "+
+				"mapping resolution (procmap/blazesym) is the suspect", s.UnmappedFrames)
+	case s.KernelFrames > 0 && s.UserFrames == 0:
+		return fmt.Sprintf(
+			"all %d sampled frames were kernel-side and none were user-side — "+
+				"the target was never on-CPU in user space during this window", s.KernelFrames)
+	default:
+		return "samples exist but carry no file-backed mapping"
+	}
 }
 
 // System-wide profiling tests
@@ -546,8 +568,8 @@ func TestSystemWideProfile(t *testing.T) {
 	agentPath := getAgentPath(t)
 
 	// Start multiple workloads
-	workload1 := exec.Command("./workloads/go/cpu_bound", "-duration=15s", "-threads=2")
-	workload2 := exec.Command("./workloads/go/io_bound", "-duration=15s", "-threads=2")
+	workload1 := exec.Command("./workloads/go/cpu_bound", workloadRuntimeFlag, "-threads=2")
+	workload2 := exec.Command("./workloads/go/io_bound", workloadRuntimeFlag, "-threads=2")
 	require.NoError(t, workload1.Start())
 	require.NoError(t, workload2.Start())
 	defer func() {
@@ -563,22 +585,35 @@ func TestSystemWideProfile(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	// Run system-wide profiling
+	// Run system-wide profiling, re-collecting until samples land
+	// (issue #42).
 	outputFile := "profile.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath, "--profile", "--profile-output", outputFile, "-a", "--duration", "5s")
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	const window = 5 * time.Second
+	var output []byte
+	prof, collected, report := collectProfileUntil(t,
+		"a system-wide CPU profile with samples",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload1, "go/cpu_bound")
+			agent := exec.Command(agentPath, "--profile", "--profile-output", outputFile, "-a", "--duration", window.String())
+			var err error
+			output, err = agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		func(p *profile.Profile) bool { return len(p.Sample) > 0 })
+	if !collected {
+		t.Logf("WARN: %s", report)
 	}
+	require.NotNil(t, prof, "no readable system-wide profile after the collect-until budget: %s", report)
 
 	assert.Contains(t, string(output), "system-wide")
 	assert.FileExists(t, outputFile)
-
-	prof := parseProfile(t, outputFile)
-	require.NotNil(t, prof)
-	assert.Greater(t, len(prof.Sample), 0, "System-wide profile should contain samples")
+	assert.Greater(t, len(prof.Sample), 0, "System-wide profile should contain samples: %s", describeProfile(prof))
 }
 
 func TestSystemWideOffCPU(t *testing.T) {
@@ -586,7 +621,7 @@ func TestSystemWideOffCPU(t *testing.T) {
 
 	agentPath := getAgentPath(t)
 
-	workload := exec.Command("./workloads/go/io_bound", "-duration=15s", "-threads=2")
+	workload := exec.Command("./workloads/go/io_bound", workloadRuntimeFlag, "-threads=2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -600,11 +635,31 @@ func TestSystemWideOffCPU(t *testing.T) {
 	outputFile := "offcpu.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath, "--offcpu", "--offcpu-output", outputFile, "-a", "--duration", "5s")
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	// Collect until the capture is one assertPprofFidelity's verdict can
+	// mean something: enough samples to be worth judging, at least one
+	// of them from user space (issue #42). Deliberately NOT "at least
+	// one file-backed mapping" — that is what the assertion checks, and
+	// a loop that waits for it could never fail it.
+	const window = 5 * time.Second
+	var output []byte
+	prof, collected, report := collectProfileUntil(t,
+		"a system-wide off-CPU profile with enough samples to judge and at least one user-space frame",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "go/io_bound")
+			agent := exec.Command(agentPath, "--offcpu", "--offcpu-output", outputFile, "-a", "--duration", window.String())
+			var err error
+			output, err = agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		profileFidelityJudgeable)
+	if !collected {
+		t.Logf("WARN: %s", report)
 	}
+	require.NotNil(t, prof, "no readable system-wide off-CPU profile after the collect-until budget: %s", report)
 
 	assert.Contains(t, string(output), "system-wide")
 	assert.FileExists(t, outputFile)
@@ -932,7 +987,7 @@ func TestStreamingProfileOutput(t *testing.T) {
 	requireBPFRunnable(t, "")
 
 	// Start a CPU workload
-	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	workload := exec.Command("./workloads/go/cpu_bound", workloadRuntimeFlag, "-threads=4")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -943,46 +998,57 @@ func TestStreamingProfileOutput(t *testing.T) {
 
 	time.Sleep(2 * time.Second) // warmup
 
+	// One attempt = one full Start/collect/Stop cycle of the in-process
+	// agent; the streamed profile is only written on Stop. Collect until
+	// the profile carries samples and symbols (issue #42).
+	const window = 3 * time.Second
 	var buf bytes.Buffer
+	prof, collected, report := collectProfileUntil(t,
+		"a streamed CPU profile with samples and at least one symbolized function",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "go/cpu_bound")
+			buf.Reset()
 
-	agent, err := perfagent.New(
-		perfagent.WithPID(workload.Process.Pid),
-		perfagent.WithCPUProfileWriter(&buf),
-		perfagent.WithSampleRate(99),
-	)
-	require.NoError(t, err)
-	defer agent.Close()
+			agent, err := perfagent.New(
+				perfagent.WithPID(workload.Process.Pid),
+				perfagent.WithCPUProfileWriter(&buf),
+				perfagent.WithSampleRate(99),
+			)
+			require.NoError(t, err)
+			defer agent.Close()
 
-	ctx := context.Background()
-	require.NoError(t, agent.Start(ctx))
+			ctx := context.Background()
+			require.NoError(t, agent.Start(ctx))
+			time.Sleep(window)
+			require.NoError(t, agent.Stop(ctx))
 
-	time.Sleep(3 * time.Second)
-
-	require.NoError(t, agent.Stop(ctx))
+			if buf.Len() == 0 {
+				return nil, fmt.Errorf("profile writer received 0 bytes: the agent captured no samples in this %s window", window)
+			}
+			return profile.Parse(bytes.NewReader(buf.Bytes()))
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && profileHasSymbols(p)
+		})
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
 
 	// Verify profile
-	require.Greater(t, buf.Len(), 0, "profile buffer should have data")
-
-	prof, err := profile.Parse(&buf)
-	require.NoError(t, err)
-	require.Greater(t, len(prof.Sample), 0, "profile should contain samples")
+	require.Greater(t, buf.Len(), 0, "profile buffer should have data: %s", report)
+	require.NotNil(t, prof, "streamed profile did not parse: %s", report)
+	require.Greater(t, len(prof.Sample), 0, "profile should contain samples: %s", describeProfile(prof))
 
 	// Verify we got symbolized functions
-	hasSymbols := false
-	for _, fn := range prof.Function {
-		if fn.Name != "" && fn.Name != "??" {
-			hasSymbols = true
-			break
-		}
-	}
-	assert.True(t, hasSymbols, "Profile should contain symbolized functions")
+	assert.True(t, profileHasSymbols(prof), "Profile should contain symbolized functions: %s", describeProfile(prof))
 }
 
 func TestStreamingOffCPUProfileOutput(t *testing.T) {
 	requireBPFRunnable(t, "")
 
 	// Start an I/O workload
-	workload := exec.Command("./workloads/go/io_bound", "-duration=20s", "-threads=2")
+	workload := exec.Command("./workloads/go/io_bound", workloadRuntimeFlag, "-threads=2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -993,27 +1059,44 @@ func TestStreamingOffCPUProfileOutput(t *testing.T) {
 
 	time.Sleep(2 * time.Second) // warmup
 
+	const window = 3 * time.Second
 	var buf bytes.Buffer
+	prof, collected, report := collectProfileUntil(t,
+		"a streamed off-CPU profile with at least one blocking sample",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "go/io_bound")
+			buf.Reset()
 
-	agent, err := perfagent.New(
-		perfagent.WithPID(workload.Process.Pid),
-		perfagent.WithOffCPUProfileWriter(&buf),
-	)
-	require.NoError(t, err)
-	defer agent.Close()
+			agent, err := perfagent.New(
+				perfagent.WithPID(workload.Process.Pid),
+				perfagent.WithOffCPUProfileWriter(&buf),
+			)
+			require.NoError(t, err)
+			defer agent.Close()
 
-	ctx := context.Background()
-	require.NoError(t, agent.Start(ctx))
+			ctx := context.Background()
+			require.NoError(t, agent.Start(ctx))
+			time.Sleep(window)
+			require.NoError(t, agent.Stop(ctx))
 
-	time.Sleep(3 * time.Second)
+			if buf.Len() == 0 {
+				return nil, fmt.Errorf("off-CPU profile writer received 0 bytes in this %s window", window)
+			}
+			return profile.Parse(bytes.NewReader(buf.Bytes()))
+		},
+		func(p *profile.Profile) bool { return len(p.Sample) > 0 })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
 
-	require.NoError(t, agent.Stop(ctx))
-
-	// Off-CPU profile should have data for I/O workload
+	// Off-CPU profile should have data for I/O workload. Kept
+	// conditional: this assertion has always tolerated an empty
+	// buffer, and the collect-until loop above only improves the odds
+	// of having one to check.
 	if buf.Len() > 0 {
-		prof, err := profile.Parse(&buf)
-		require.NoError(t, err)
-		require.Greater(t, len(prof.Sample), 0, "off-CPU profile should contain samples")
+		require.NotNil(t, prof, "off-CPU profile did not parse: %s", report)
+		require.Greater(t, len(prof.Sample), 0, "off-CPU profile should contain samples: %s", describeProfile(prof))
 	}
 }
 
@@ -1021,7 +1104,7 @@ func TestStreamingCombinedProfileOutput(t *testing.T) {
 	requireBPFRunnable(t, "")
 
 	// Start workload
-	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	workload := exec.Command("./workloads/go/cpu_bound", workloadRuntimeFlag, "-threads=4")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -1032,33 +1115,48 @@ func TestStreamingCombinedProfileOutput(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
+	const window = 3 * time.Second
 	var cpuBuf, offcpuBuf bytes.Buffer
+	cpuProf, collected, report := collectProfileUntil(t,
+		"a streamed combined-mode CPU profile with samples",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "go/cpu_bound")
+			cpuBuf.Reset()
+			offcpuBuf.Reset()
 
-	agent, err := perfagent.New(
-		perfagent.WithPID(workload.Process.Pid),
-		perfagent.WithCPUProfileWriter(&cpuBuf),
-		perfagent.WithOffCPUProfileWriter(&offcpuBuf),
-		perfagent.WithSampleRate(99),
-	)
-	require.NoError(t, err)
-	defer agent.Close()
+			agent, err := perfagent.New(
+				perfagent.WithPID(workload.Process.Pid),
+				perfagent.WithCPUProfileWriter(&cpuBuf),
+				perfagent.WithOffCPUProfileWriter(&offcpuBuf),
+				perfagent.WithSampleRate(99),
+			)
+			require.NoError(t, err)
+			defer agent.Close()
 
-	ctx := context.Background()
-	require.NoError(t, agent.Start(ctx))
+			ctx := context.Background()
+			require.NoError(t, agent.Start(ctx))
+			time.Sleep(window)
+			require.NoError(t, agent.Stop(ctx))
 
-	time.Sleep(3 * time.Second)
-
-	require.NoError(t, agent.Stop(ctx))
+			if cpuBuf.Len() == 0 {
+				return nil, fmt.Errorf("CPU profile writer received 0 bytes in this %s window", window)
+			}
+			return profile.Parse(bytes.NewReader(cpuBuf.Bytes()))
+		},
+		func(p *profile.Profile) bool { return len(p.Sample) > 0 })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
 
 	// Verify CPU profile
-	require.Greater(t, cpuBuf.Len(), 0, "CPU profile buffer should have data")
-	cpuProf, err := profile.Parse(&cpuBuf)
-	require.NoError(t, err)
-	require.NotNil(t, cpuProf)
+	require.Greater(t, cpuBuf.Len(), 0, "CPU profile buffer should have data: %s", report)
+	require.NotNil(t, cpuProf, "streamed CPU profile did not parse: %s", report)
+	require.Greater(t, len(cpuProf.Sample), 0, "streamed CPU profile should contain samples: %s", describeProfile(cpuProf))
 
 	// Off-CPU may or may not have data for CPU-bound workload
 	if offcpuBuf.Len() > 0 {
-		offcpuProf, err := profile.Parse(&offcpuBuf)
+		offcpuProf, err := profile.Parse(bytes.NewReader(offcpuBuf.Bytes()))
 		require.NoError(t, err)
 		require.NotNil(t, offcpuProf)
 	}
@@ -1068,7 +1166,7 @@ func TestLibraryPMUMetrics(t *testing.T) {
 	requireBPFRunnable(t, "")
 
 	// Start a CPU workload
-	workload := exec.Command("./workloads/go/cpu_bound", "-duration=20s", "-threads=4")
+	workload := exec.Command("./workloads/go/cpu_bound", workloadRuntimeFlag, "-threads=4")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -1090,8 +1188,29 @@ func TestLibraryPMUMetrics(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, agent.Start(ctx))
 
-	// Collect for a few seconds
-	time.Sleep(3 * time.Second)
+	// Collect until the PMU snapshot actually carries a process, with a
+	// deadline, instead of sleeping a fixed 3s and asserting on whatever
+	// the monitor happened to have (issue #42). The agent keeps running
+	// across attempts — GetMetrics is a read of accumulating state — so
+	// this only re-reads, it does not re-collect.
+	const window = 3 * time.Second
+	ok, report := collectUntil(t, "a PMU snapshot containing at least one process with samples",
+		window, collectBudgetFor(window), func(int) (bool, string) {
+			requireWorkloadAlive(t, workload, "go/cpu_bound")
+			time.Sleep(window)
+			snap, err := agent.GetMetrics()
+			require.NoError(t, err)
+			require.NotNil(t, snap)
+			for _, pm := range snap.Processes {
+				if pm.SampleCount > 0 {
+					return true, fmt.Sprintf("%d process(es) in snapshot", len(snap.Processes))
+				}
+			}
+			return false, fmt.Sprintf("%d process(es) in snapshot, none with samples", len(snap.Processes))
+		})
+	if !ok {
+		t.Logf("WARN: %s", report)
+	}
 
 	// Test GetMetrics() API
 	snapshot, err := agent.GetMetrics()
@@ -1134,7 +1253,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -1227,11 +1346,22 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, err)
 	defer rd.Close()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// Collect until the ringbuf has produced the evidence all three
+	// assertions below need — enough samples, a chain deeper than 2,
+	// and at least one DWARF-unwound sample — bounded by a deadline
+	// (issue #42). The old loop stopped at 40 samples and then asserted
+	// on whatever those 40 happened to contain; on a contended runner a
+	// 5s window can deliver 40 shallow FP-only samples and no DWARF
+	// one. The `samples < 40` term is retained so a healthy run still
+	// gathers at least as much evidence as it used to.
+	const walkerBudget = 20 * time.Second
+	start := time.Now()
+	deadline := start.Add(walkerBudget)
 	var samples, dwarfSamples, maxFrames int
 	flagCounts := map[byte]int{}
 	var samplePrinted bool
-	for samples < 40 && time.Now().Before(deadline) {
+	enough := func() bool { return samples > 5 && maxFrames > 2 && dwarfSamples > 0 }
+	for (samples < 40 || !enough()) && time.Now().Before(deadline) {
 		rd.SetDeadline(time.Now().Add(500 * time.Millisecond))
 		rec, err := rd.Read()
 		if err != nil {
@@ -1269,10 +1399,12 @@ func TestPerfDwarfWalker(t *testing.T) {
 		}
 	}
 
-	t.Logf("samples=%d dwarf_samples=%d max_frames=%d flag_counts=%v", samples, dwarfSamples, maxFrames, flagCounts)
-	require.Greater(t, samples, 5, "no samples consumed — perf events may not have fired")
-	require.Greater(t, maxFrames, 2, "chains too shallow — walker producing tiny stacks")
-	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release")
+	stats := fmt.Sprintf("samples=%d dwarf_samples=%d max_frames=%d flag_counts=%v collected_for=%s (budget %s)",
+		samples, dwarfSamples, maxFrames, flagCounts, time.Since(start).Round(time.Millisecond), walkerBudget)
+	t.Logf("%s", stats)
+	require.Greater(t, samples, 5, "no samples consumed — perf events may not have fired; %s", stats)
+	require.Greater(t, maxFrames, 2, "chains too shallow — walker producing tiny stacks; %s", stats)
+	require.Greater(t, dwarfSamples, 0, "DWARF path never fired — libstd/Rust frames should be FP-less in release; %s", stats)
 }
 
 // TestPerfAgentSystemWideDwarfProfile runs perf-agent with
@@ -1290,7 +1422,7 @@ func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		_ = workload.Process.Kill()
@@ -1301,22 +1433,50 @@ func TestPerfAgentSystemWideDwarfProfile(t *testing.T) {
 	outputFile := "profile-dwarf-sys.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath,
-		"--profile",
-		"--profile-output", outputFile,
-		"--unwind", "dwarf",
-		"-a",
-		"--duration", "5s",
-	)
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	// Collect until the capture is worth judging — enough samples, at
+	// least one from user space — and then let assertPprofFidelity
+	// render the verdict. Whether those user PCs resolved to a real
+	// mapping stays OUT of the loop condition on purpose: a loop that
+	// waits for a real mapping can never fail the assertion that one
+	// exists.
+	//
+	// This is the test and the assertion from issue #42's third
+	// comment. Note that this does NOT make that failure green — see
+	// the report's "Does this fix symptom 3?" section. That capture had
+	// >= 20 samples and at least one user-space PC, so it clears this
+	// precondition and is judged, not retried. Making it green would
+	// require looping on the assertion itself, which is the one thing
+	// this harness must not do.
+	const window = 5 * time.Second
+	prof, collected, report := collectProfileUntil(t,
+		"a system-wide DWARF profile with enough samples to judge, a symbolized function and at least one user-space frame",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "rust-workload")
+			agent := exec.Command(agentPath,
+				"--profile",
+				"--profile-output", outputFile,
+				"--unwind", "dwarf",
+				"-a",
+				"--duration", window.String(),
+			)
+			output, err := agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		func(p *profile.Profile) bool {
+			return profileFidelityJudgeable(p) && len(p.Function) > 0
+		})
+	if !collected {
+		t.Logf("WARN: %s", report)
 	}
+	require.NotNil(t, prof, "no readable system-wide DWARF profile after the collect-until budget: %s", report)
+
 	assert.FileExists(t, outputFile)
-	prof := parseProfile(t, outputFile)
-	require.NotNil(t, prof)
-	require.Greater(t, len(prof.Sample), 0, "system-wide profile should have samples")
-	require.Greater(t, len(prof.Function), 0, "system-wide profile should have at least one symbolized function")
+	require.Greater(t, len(prof.Sample), 0, "system-wide profile should have samples: %s", describeProfile(prof))
+	require.Greater(t, len(prof.Function), 0, "system-wide profile should have at least one symbolized function: %s", describeProfile(prof))
 
 	// verify pprof fidelity guarantees
 	assertPprofFidelity(t, outputFile)
@@ -1334,7 +1494,7 @@ func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		_ = workload.Process.Kill()
@@ -1345,29 +1505,40 @@ func TestPerfAgentSystemWideDwarfOffCPU(t *testing.T) {
 	outputFile := "offcpu-dwarf-sys.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath,
-		"--offcpu",
-		"--offcpu-output", outputFile,
-		"--unwind", "dwarf",
-		"-a",
-		"--duration", "5s",
-	)
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	// As above: enough samples plus a user-space frame is the
+	// precondition; the mapping verdict belongs to assertPprofFidelity.
+	const window = 5 * time.Second
+	prof, collected, report := collectProfileUntil(t,
+		"a system-wide DWARF off-CPU profile with enough samples to judge, non-zero blocking time and at least one user-space frame",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "rust-workload")
+			agent := exec.Command(agentPath,
+				"--offcpu",
+				"--offcpu-output", outputFile,
+				"--unwind", "dwarf",
+				"-a",
+				"--duration", window.String(),
+			)
+			output, err := agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		func(p *profile.Profile) bool {
+			return profileFidelityJudgeable(p) && profileTotalValue(p) > 0
+		})
+	if !collected {
+		t.Logf("WARN: %s", report)
 	}
-	assert.FileExists(t, outputFile)
-	prof := parseProfile(t, outputFile)
-	require.NotNil(t, prof)
-	require.Greater(t, len(prof.Sample), 0, "system-wide off-CPU profile should have samples")
+	require.NotNil(t, prof, "no readable system-wide DWARF off-CPU profile after the collect-until budget: %s", report)
 
-	var totalNs int64
-	for _, s := range prof.Sample {
-		for _, v := range s.Value {
-			totalNs += v
-		}
-	}
-	require.Greater(t, totalNs, int64(0), "system-wide off-CPU profile should have non-zero blocking-ns")
+	assert.FileExists(t, outputFile)
+	require.Greater(t, len(prof.Sample), 0, "system-wide off-CPU profile should have samples: %s", describeProfile(prof))
+
+	totalNs := profileTotalValue(prof)
+	require.Greater(t, totalNs, int64(0), "system-wide off-CPU profile should have non-zero blocking-ns: %s", describeProfile(prof))
 	t.Logf("system-wide off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
 
 	// verify pprof fidelity guarantees
@@ -1480,7 +1651,7 @@ func TestPerfAgentDwarfUnwind(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		_ = workload.Process.Kill()
@@ -1491,40 +1662,41 @@ func TestPerfAgentDwarfUnwind(t *testing.T) {
 	outputFile := "profile-dwarf.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath,
-		"--profile",
-		"--profile-output", outputFile,
-		"--unwind", "dwarf",
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "5s",
-	)
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	// Collect until the workload's hot function shows up, with a
+	// deadline (issue #42): a single 5s window can miss it entirely on
+	// a contended runner, and "missed it" and "the DWARF walker is
+	// broken" then look identical.
+	const window = 5 * time.Second
+	prof, collected, report := collectProfileUntil(t,
+		"a DWARF-unwound profile containing the workload's cpu_intensive_work frame",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "rust-workload")
+			agent := exec.Command(agentPath,
+				"--profile",
+				"--profile-output", outputFile,
+				"--unwind", "dwarf",
+				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+				"--duration", window.String(),
+			)
+			output, err := agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && hasFunctionContaining(p, "cpu_intensive_work")
+		})
+	if !collected {
+		t.Fatalf("%s\n  first few symbolized functions: %v", report, topFunctionNames(prof, 10))
 	}
 	assert.FileExists(t, outputFile)
-
-	prof := parseProfile(t, outputFile)
 	require.NotNil(t, prof)
-	require.Greater(t, len(prof.Sample), 0, "profile should have samples")
-
-	hit := false
-	for _, fn := range prof.Function {
-		if strings.Contains(fn.Name, "cpu_intensive_work") {
-			hit = true
-			break
-		}
-	}
-	if !hit {
-		names := make([]string, 0, min(10, len(prof.Function)))
-		for i, fn := range prof.Function {
-			if i >= 10 {
-				break
-			}
-			names = append(names, fn.Name)
-		}
-		t.Fatalf("no function named *cpu_intensive_work* in pprof; first few: %v", names)
-	}
+	require.Greater(t, len(prof.Sample), 0, "profile should have samples: %s", describeProfile(prof))
+	require.True(t, hasFunctionContaining(prof, "cpu_intensive_work"),
+		"no function named *cpu_intensive_work* in pprof; %s; first few: %v",
+		describeProfile(prof), topFunctionNames(prof, 10))
 }
 
 // TestPerfAgentOffCPUDwarfUnwind runs the full perf-agent binary with
@@ -1544,7 +1716,7 @@ func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		_ = workload.Process.Kill()
@@ -1555,30 +1727,37 @@ func TestPerfAgentOffCPUDwarfUnwind(t *testing.T) {
 	outputFile := "offcpu-dwarf.pb.gz"
 	defer os.Remove(outputFile)
 
-	agent := exec.Command(agentPath,
-		"--offcpu",
-		"--offcpu-output", outputFile,
-		"--unwind", "dwarf",
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "5s",
-	)
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+	const window = 5 * time.Second
+	prof, collected, report := collectProfileUntil(t,
+		"a DWARF-unwound off-CPU profile with non-zero blocking time",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, workload, "rust-workload")
+			agent := exec.Command(agentPath,
+				"--offcpu",
+				"--offcpu-output", outputFile,
+				"--unwind", "dwarf",
+				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+				"--duration", window.String(),
+			)
+			output, err := agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
+			return readProfile(outputFile)
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && profileTotalValue(p) > 0
+		})
+	if !collected {
+		t.Fatal(report)
 	}
 	assert.FileExists(t, outputFile)
-
-	prof := parseProfile(t, outputFile)
 	require.NotNil(t, prof)
-	require.Greater(t, len(prof.Sample), 0, "off-CPU profile should have samples")
+	require.Greater(t, len(prof.Sample), 0, "off-CPU profile should have samples: %s", describeProfile(prof))
 
-	var totalNs int64
-	for _, s := range prof.Sample {
-		for _, v := range s.Value {
-			totalNs += v
-		}
-	}
-	require.Greater(t, totalNs, int64(0), "off-CPU profile should have non-zero blocking-ns values")
+	totalNs := profileTotalValue(prof)
+	require.Greater(t, totalNs, int64(0), "off-CPU profile should have non-zero blocking-ns values: %s", describeProfile(prof))
 	t.Logf("off-CPU total: %d ns across %d samples", totalNs, len(prof.Sample))
 }
 
@@ -1605,7 +1784,7 @@ func TestPerfDataOutput(t *testing.T) {
 		t.Skipf("rust workload not built: %v", err)
 	}
 
-	workload := exec.Command(binPath, "20", "2")
+	workload := exec.Command(binPath, workloadRuntimeSecs, "2")
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -1619,26 +1798,52 @@ func TestPerfDataOutput(t *testing.T) {
 	pprofOut := filepath.Join(outDir, "profile.pb.gz")
 	perfDataOut := filepath.Join(outDir, "test.perf.data")
 
-	agent := exec.Command(getAgentPath(t),
-		"--profile",
-		"--profile-output", pprofOut,
-		"--perf-data-output", perfDataOut,
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "5s",
-	)
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
-	}
+	// Collect until the capture is one `perf script` can decode into at
+	// least one line, with a deadline (issue #42). A perf.data with
+	// headers but no samples is the "nothing landed" shape, not a
+	// perf.data-format regression, and the two used to be
+	// indistinguishable here.
+	const window = 5 * time.Second
+	var scriptOut []byte
+	ok, report := collectUntil(t,
+		"a perf.data that `perf script` decodes into at least one line",
+		window, collectBudgetFor(window),
+		func(int) (bool, string) {
+			requireWorkloadAlive(t, workload, "rust-workload")
+			agent := exec.Command(getAgentPath(t),
+				"--profile",
+				"--profile-output", pprofOut,
+				"--perf-data-output", perfDataOut,
+				"--pid", fmt.Sprintf("%d", workload.Process.Pid),
+				"--duration", window.String(),
+			)
+			output, err := agent.CombinedOutput()
+			if err != nil {
+				t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
+			}
 
-	st, err := os.Stat(perfDataOut)
-	require.NoError(t, err, "perf.data not created")
-	require.Greater(t, st.Size(), int64(200), "perf.data suspiciously small: %d bytes", st.Size())
+			st, err := os.Stat(perfDataOut)
+			if err != nil {
+				return false, fmt.Sprintf("perf.data was not created: %v", err)
+			}
+			if st.Size() <= 200 {
+				return false, fmt.Sprintf("perf.data is only %d bytes (want > 200): headers were written but no samples", st.Size())
+			}
 
-	cmd := exec.Command("perf", "script", "-i", perfDataOut)
-	scriptOut, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf script failed on our output: %v\n%s", err, string(scriptOut))
+			cmd := exec.Command("perf", "script", "-i", perfDataOut)
+			scriptOut, err = cmd.CombinedOutput()
+			if err != nil {
+				// A decode failure is a real regression in our
+				// perf.data writer, not a scheduling miss — fail now.
+				t.Fatalf("perf script failed on our output: %v\n%s", err, string(scriptOut))
+			}
+			if len(scriptOut) == 0 {
+				return false, fmt.Sprintf("perf script decoded a %d-byte perf.data into 0 bytes of output (no samples in perf.data)", st.Size())
+			}
+			return true, fmt.Sprintf("perf.data %d bytes, perf script output %d bytes", st.Size(), len(scriptOut))
+		})
+	if !ok {
+		t.Fatal(report)
 	}
 	require.NotEmpty(t, scriptOut, "perf script produced no output (no samples in perf.data?)")
 	t.Logf("perf script captured %d bytes of output", len(scriptOut))
@@ -1660,49 +1865,74 @@ func TestKernelStackResolution(t *testing.T) {
 	defer cleanup()
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
-	agent := exec.Command(bin,
-		"--profile",
-		"--kernel-stacks",
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "3s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
+
+	// The io_bound workload is only on-CPU in user space in short
+	// bursts between blocking I/O, so a single fixed 3s window at 99 Hz
+	// can legitimately capture zero samples, or samples whose every
+	// frame is kernel-side. Issue #42 saw both, on the same commit.
+	// Collect until the profile is one the assertions below can speak
+	// to, with a deadline; a profiler that has genuinely stopped
+	// producing user frames still fails, at the deadline, with the
+	// frame split printed.
+	kernelRe := regexp.MustCompile(`^(do_sys_|ksys_|__x64_sys_|vfs_|__schedule|read_|sock_|tcp_)`)
+	hasUserFn := func(p *profile.Profile) bool {
+		return hasFunctionContaining(p, "main.", "runtime.")
+	}
+	hasKernelFn := func(p *profile.Profile) bool {
+		for _, fn := range p.Function {
+			if kernelRe.MatchString(fn.Name) {
+				return true
+			}
+		}
+		return false
 	}
 
-	p := parseProfile(t, out)
+	what := "a kernel-stacks profile containing at least one user-side (main.*/runtime.*) frame"
+	if kptrZero {
+		what += " and at least one resolved kernel symbol"
+	}
+
+	const window = 3 * time.Second
+	p, collected, report := collectProfileUntil(t, what, window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "go/io_bound")
+			agent := exec.Command(bin,
+				"--profile",
+				"--kernel-stacks",
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && hasUserFn(p) && (!kptrZero || hasKernelFn(p))
+		})
+
 	got := map[string]bool{}
-	for _, fn := range p.Function {
-		got[fn.Name] = true
+	if p != nil {
+		for _, fn := range p.Function {
+			got[fn.Name] = true
+		}
+	}
+	if !collected {
+		t.Fatalf("%s\n  functions in the last capture: %v", report, sortedKeys(got))
 	}
 
 	// Always assert at least one user-side function from io_bound appears.
-	hasUser := false
-	for name := range got {
-		if strings.Contains(name, "main.") || strings.Contains(name, "runtime.") {
-			hasUser = true
-			break
-		}
-	}
-	if !hasUser {
-		t.Fatalf("no user-side function in profile; got: %v", sortedKeys(got))
+	if !hasUserFn(p) {
+		t.Fatalf("no user-side function in profile; %s; got: %v", describeProfile(p), sortedKeys(got))
 	}
 
 	if kptrZero {
 		// Expect at least one resolved kernel symbol.
-		kernelRe := regexp.MustCompile(`^(do_sys_|ksys_|__x64_sys_|vfs_|__schedule|read_|sock_|tcp_)`)
-		matched := false
-		for name := range got {
-			if kernelRe.MatchString(name) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			t.Fatalf("no resolved kernel symbol matched expected regex; got: %v", sortedKeys(got))
+		if !hasKernelFn(p) {
+			t.Fatalf("no resolved kernel symbol matched expected regex; %s; got: %v", describeProfile(p), sortedKeys(got))
 		}
 	} else {
 		// kptr_restrict != 0 → kernel frames may appear as raw 0xffff… names
@@ -1839,28 +2069,49 @@ func TestPerfDataUserspaceMmap2_SystemWide(t *testing.T) {
 
 	bin := getAgentPath(t)
 
-	_, cleanup := spawnIoBoundWorkload(t)
+	cmd, cleanup := spawnIoBoundWorkload(t)
 	defer cleanup()
 
 	outDir := t.TempDir()
 	pb := filepath.Join(outDir, "profile.pb.gz")
 	pd := filepath.Join(outDir, "perf.data")
-	agent := exec.Command(bin,
-		"--profile",
-		"--all",
-		"--duration", "3s",
-		"--profile-output", pb,
-		"--perf-data-output", pd,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
-	}
 
-	body, err := os.ReadFile(pd)
-	if err != nil {
-		t.Fatalf("read perf.data: %v", err)
+	// Under --all, COMM+MMAP2 are emitted LAZILY on the first sample
+	// seen per PID (perfagent/agent.go), so this test's assertions are
+	// sampling-dependent: a window in which the workload never got a
+	// sample produces a perf.data with no io_bound MMAP2 at all.
+	// Collect until the records are there, with a deadline (issue #42).
+	const window = 3 * time.Second
+	var body []byte
+	ok, report := collectUntil(t,
+		"a system-wide perf.data carrying MMAP2 records for io_bound and for >= 2 distinct PIDs",
+		window, collectBudgetFor(window),
+		func(int) (bool, string) {
+			requireWorkloadAlive(t, cmd, "go/io_bound")
+			agent := exec.Command(bin,
+				"--profile",
+				"--all",
+				"--duration", window.String(),
+				"--profile-output", pb,
+				"--perf-data-output", pd,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			var err error
+			body, err = os.ReadFile(pd)
+			if err != nil {
+				t.Fatalf("read perf.data: %v", err)
+			}
+			hasWorkload := bytes.Contains(body, []byte("io_bound"))
+			pids := countDistinctNonSentinelPIDsInPerfData(body)
+			return hasWorkload && pids >= 2,
+				fmt.Sprintf("perf.data %d bytes, io_bound MMAP2 present=%v, distinct PIDs=%d", len(body), hasWorkload, pids)
+		})
+	if !ok {
+		t.Fatal(report)
 	}
 
 	// Workload binary must show up in at least one MMAP2 record.
@@ -1922,7 +2173,7 @@ func spawnIoBoundWorkload(t *testing.T) (*exec.Cmd, func()) {
 	if _, err := os.Stat(bin); err != nil {
 		t.Skipf("io_bound workload not built: %v", err)
 	}
-	cmd := exec.Command(bin, "-duration=30s", "-threads=2")
+	cmd := exec.Command(bin, workloadRuntimeFlag, "-threads=2")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start io_bound: %v", err)
 	}
@@ -1981,34 +2232,50 @@ func TestStrippedRustOffBoxSymbolization(t *testing.T) {
 	stripWorkload(t, rustSrc, stripped)
 	waitForDebuginfodReady(t, buildID)
 
-	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped, workloadRuntimeSecs)
 	defer cleanup()
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
-	agent := exec.Command(agentBin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "6s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
-	}
-
-	p := parseProfile(t, out)
-	got := map[string]bool{}
-	for _, fn := range p.Function {
-		got[fn.Name] = true
-	}
 
 	want := []string{
 		"rust_workload::cpu_intensive_work",
 		"core::num::<impl u64>::wrapping_add",
+	}
+
+	// Collect until the off-box symbols land, with a deadline: a window
+	// that caught the workload off-CPU proves nothing about
+	// symbolization (issue #42).
+	const window = 6 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile of the stripped rust workload carrying its off-box-resolved symbols",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "rust-workload-stripped")
+			agent := exec.Command(agentBin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool { return hasFunctionContaining(p, want...) })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
+	require.NotNil(t, p, "no readable profile after the collect-until budget: %s", report)
+
+	got := map[string]bool{}
+	for _, fn := range p.Function {
+		got[fn.Name] = true
 	}
 	for _, w := range want {
 		found := false
@@ -2019,7 +2286,7 @@ func TestStrippedRustOffBoxSymbolization(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("missing expected symbol %q in stripped pprof; got: %v", w, sortedKeys(got))
+			t.Errorf("missing expected symbol %q in stripped pprof; %s; got: %v", w, describeProfile(p), sortedKeys(got))
 		}
 	}
 }
@@ -2043,11 +2310,20 @@ func requireTool(t *testing.T, tool string) {
 }
 
 // spawnBinaryAsWorkload starts the binary and returns the running command.
-// Caller MUST call cleanup() to kill+wait the process. The binary is
-// expected to be CPU-bound for at least 15s.
-func spawnBinaryAsWorkload(t *testing.T, bin string) (*exec.Cmd, func()) {
+// Caller MUST call cleanup() to kill+wait the process.
+//
+// `args` MUST carry a run duration in the form the binary understands —
+// bare seconds (workloadRuntimeSecs) for the Rust workload, a
+// `-duration=` flag (workloadRuntimeFlag) for the Go ones — long enough
+// to outlive the collect-until budget the caller spends against it. The
+// Go workloads silently ignore a positional argument and fall back to
+// their 30s default, so the two forms are not interchangeable.
+func spawnBinaryAsWorkload(t *testing.T, bin string, args ...string) (*exec.Cmd, func()) {
 	t.Helper()
-	cmd := exec.Command(bin)
+	if len(args) == 0 {
+		t.Fatalf("spawnBinaryAsWorkload(%s): pass an explicit run duration", bin)
+	}
+	cmd := exec.Command(bin, args...)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", bin, err)
 	}
@@ -2089,33 +2365,47 @@ func TestStrippedGoOffBoxSymbolization(t *testing.T) {
 	stripWorkload(t, goSrc, stripped)
 	waitForDebuginfodReady(t, buildID)
 
-	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped, workloadRuntimeFlag)
 	defer cleanup()
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
-	agent := exec.Command(bin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "6s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
-	}
 
-	p := parseProfile(t, out)
+	// main.main is always present in a Go binary; cpu_bound's worker
+	// loop is typically in main.cpuWork or main.run — accept either.
+	wantAny := []string{"main.main", "main.cpuWork", "main.run", "main.worker"}
+
+	const window = 6 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile of the stripped Go workload carrying an off-box-resolved user function",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "go-cpu-bound-stripped")
+			agent := exec.Command(bin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool { return hasFunctionContaining(p, wantAny...) })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
+	require.NotNil(t, p, "no readable profile after the collect-until budget: %s", report)
+
 	got := map[string]bool{}
 	for _, fn := range p.Function {
 		got[fn.Name] = true
 	}
-	// main.main is always present in a Go binary; cpu_bound's worker
-	// loop is typically in main.cpuWork or main.run — accept either.
-	wantAny := []string{"main.main", "main.cpuWork", "main.run", "main.worker"}
 	found := false
 	for _, w := range wantAny {
 		for name := range got {
@@ -2129,7 +2419,7 @@ func TestStrippedGoOffBoxSymbolization(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("no Go user-side function found in stripped pprof; got: %v", sortedKeys(got))
+		t.Errorf("no Go user-side function found in stripped pprof; %s; got: %v", describeProfile(p), sortedKeys(got))
 	}
 }
 
@@ -2174,26 +2464,41 @@ func TestFileModeFrameAddressPreservesMapping(t *testing.T) {
 	stripWorkload(t, rustSrc, stripped)
 	waitForDebuginfodReady(t, buildID)
 
-	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped, workloadRuntimeSecs)
 	defer cleanup()
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
-	agent := exec.Command(bin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "6s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
-	}
 
-	p := parseProfile(t, out)
+	// Collect until at least one Rust frame is present — the invariant
+	// below is checked per Rust frame, so a capture with none proves
+	// nothing (issue #42).
+	const window = 6 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile containing at least one symbolized rust_workload frame",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "rust-workload-stripped")
+			agent := exec.Command(bin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool { return hasFunctionContaining(p, "rust_workload::") })
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
+	require.NotNil(t, p, "no readable profile after the collect-until budget: %s", report)
 
 	// For each Location whose function name looks like a Rust symbol
 	// (rust_workload::*), assert it is tied to a real Mapping with the
@@ -2233,7 +2538,7 @@ func TestFileModeFrameAddressPreservesMapping(t *testing.T) {
 		}
 	}
 	if checked == 0 {
-		t.Fatal("no rust frames in pprof — symbolization didn't fire at all")
+		t.Fatalf("no rust frames in pprof — symbolization didn't fire at all; %s", describeProfile(p))
 	}
 }
 
@@ -2261,13 +2566,13 @@ func TestStrippedCachedHitNoFetch(t *testing.T) {
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
 
 	// First run: should fetch.
-	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+	runStripped(t, bin, stripped, cacheDir, t.TempDir(), buildID)
 
 	// Snapshot the debuginfod container access log line count.
 	prevHits := countDebuginfodHits(t, buildID)
 
 	// Second run: should NOT fetch (cache hit).
-	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+	runStripped(t, bin, stripped, cacheDir, t.TempDir(), buildID)
 
 	newHits := countDebuginfodHits(t, buildID)
 	delta := newHits - prevHits
@@ -2277,25 +2582,62 @@ func TestStrippedCachedHitNoFetch(t *testing.T) {
 	}
 }
 
-// runStripped is a small helper that runs the agent for one short profile.
-func runStripped(t *testing.T, agentBin, target, cacheDir, outDir string) {
+// runStripped runs the agent against the stripped target until the
+// debuginfod fetch it is supposed to trigger has actually populated the
+// cache, or the deadline expires.
+//
+// The fetch is driven by symbolizing a sampled PC inside the stripped
+// binary: a window that captured no samples performs no fetch, leaves
+// the cache empty, and makes the callers' later assertions
+// ("expected cached .debug at ...", "0 new fetches on the second run")
+// meaningless. Issue #42's condition, one step removed.
+//
+// `target` is a copy of the Rust workload (argv[1] = seconds).
+func runStripped(t *testing.T, agentBin, target, cacheDir, outDir, buildID string) {
 	t.Helper()
-	cmd, cleanup := spawnBinaryAsWorkload(t, target)
+	cmd, cleanup := spawnBinaryAsWorkload(t, target, workloadRuntimeSecs)
 	defer cleanup()
 	out := filepath.Join(outDir, "profile.pb.gz")
-	agent := exec.Command(agentBin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "3s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
+	cached := cachedDebugPath(cacheDir, buildID)
+
+	const window = 3 * time.Second
+	ok, report := collectUntil(t,
+		fmt.Sprintf("the debuginfod cache to hold %s", cached),
+		window, collectBudgetFor(window),
+		func(int) (bool, string) {
+			requireWorkloadAlive(t, cmd, target)
+			agent := exec.Command(agentBin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			st, err := os.Stat(cached)
+			if err != nil {
+				p, rerr := readProfile(out)
+				if rerr != nil {
+					return false, fmt.Sprintf("cache still empty and %v", rerr)
+				}
+				return false, fmt.Sprintf("cache still empty (%v); captured %s", err, describeProfile(p))
+			}
+			return true, fmt.Sprintf("cached .debug is %d bytes", st.Size())
+		})
+	if !ok {
+		t.Fatal(report)
 	}
+}
+
+// cachedDebugPath is the symbol cache layout perf-agent writes fetched
+// debuginfo into: <cacheDir>/.build-id/<first 2>/<rest>.debug
+func cachedDebugPath(cacheDir, buildID string) string {
+	return filepath.Join(cacheDir, ".build-id", buildID[:2], buildID[2:]+".debug")
 }
 
 // countDebuginfodHits returns the number of `GET /buildid/<buildID>/debuginfo`
@@ -2343,10 +2685,10 @@ func TestFileModeParseFailDemotes(t *testing.T) {
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
 
 	// First run: populates the cache.
-	runStripped(t, bin, stripped, cacheDir, t.TempDir())
+	runStripped(t, bin, stripped, cacheDir, t.TempDir(), buildID)
 
 	// Corrupt the cached .debug.
-	cached := filepath.Join(cacheDir, ".build-id", buildID[:2], buildID[2:]+".debug")
+	cached := cachedDebugPath(cacheDir, buildID)
 	if _, err := os.Stat(cached); err != nil {
 		t.Fatalf("expected cached .debug at %s: %v", cached, err)
 	}
@@ -2357,37 +2699,52 @@ func TestFileModeParseFailDemotes(t *testing.T) {
 	// Second run: parse fails, mapping demotes to process-mode.
 	// pprof must still emit frames for the workload's mapping.
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
-	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped, workloadRuntimeSecs)
 	defer cleanup()
-	agent := exec.Command(bin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "3s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
+
+	workloadMappingOf := func(p *profile.Profile) *profile.Mapping {
+		for _, m := range p.Mapping {
+			if strings.Contains(m.File, "rust-workload") {
+				return m
+			}
+		}
+		return nil
 	}
 
-	p := parseProfile(t, out)
+	const window = 3 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile with samples routed to the demoted rust-workload mapping",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "rust-workload-stripped")
+			agent := exec.Command(bin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && workloadMappingOf(p) != nil
+		})
+	if !collected {
+		t.Fatal(report)
+	}
 	if len(p.Sample) == 0 {
-		t.Fatalf("no samples in pprof — agent crashed or got 0 frames")
+		t.Fatalf("no samples in pprof — agent crashed or got 0 frames; %s", describeProfile(p))
 	}
 	// At least one sample's leaf should fall in the workload's mapping
 	// (even if unsymbolized).
-	var workloadMapping *profile.Mapping
-	for _, m := range p.Mapping {
-		if strings.Contains(m.File, "rust-workload") {
-			workloadMapping = m
-			break
-		}
-	}
-	if workloadMapping == nil {
-		t.Fatalf("no rust-workload mapping in pprof — agent didn't see the binary")
+	if workloadMappingOf(p) == nil {
+		t.Fatalf("no rust-workload mapping in pprof — agent didn't see the binary; %s", describeProfile(p))
 	}
 }
 
@@ -2417,7 +2774,7 @@ func TestStrippedSidecarUnreachableSymbolicPath(t *testing.T) {
 	stripWorkload(t, rustSrc, stripped)
 	waitForDebuginfodReady(t, buildID)
 
-	cmd, cleanup := spawnBinaryAsWorkload(t, stripped)
+	cmd, cleanup := spawnBinaryAsWorkload(t, stripped, workloadRuntimeSecs)
 	defer cleanup()
 
 	// Delete the binary from disk; the running process keeps it alive
@@ -2428,35 +2785,43 @@ func TestStrippedSidecarUnreachableSymbolicPath(t *testing.T) {
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
-	agent := exec.Command(bin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "6s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
-	}
 
-	p := parseProfile(t, out)
+	const window = 6 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile of the deleted-on-disk workload carrying map_files-resolved symbols",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "rust-workload-stripped(deleted)")
+			agent := exec.Command(bin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool {
+			return hasFunctionContaining(p, "rust_workload::cpu_intensive_work")
+		})
+	if !collected {
+		t.Logf("WARN: %s", report)
+	}
+	require.NotNil(t, p, "no readable profile after the collect-until budget: %s", report)
+
 	got := map[string]bool{}
 	for _, fn := range p.Function {
 		got[fn.Name] = true
 	}
 	// Assert symbol resolved through map_files-derived path.
-	found := false
-	for name := range got {
-		if strings.Contains(name, "rust_workload::cpu_intensive_work") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("sidecar-style profiling didn't resolve symbols; got: %v", sortedKeys(got))
+	if !hasFunctionContaining(p, "rust_workload::cpu_intensive_work") {
+		t.Errorf("sidecar-style profiling didn't resolve symbols; %s; got: %v", describeProfile(p), sortedKeys(got))
 	}
 	// Assert Mapping.BuildID is populated (i.e., Resolver.populate read
 	// it via map_files since the symbolic path is gone).
@@ -2492,23 +2857,53 @@ func TestOffBoxLibcResolution(t *testing.T) {
 	if _, err := os.Stat(rustSrc); err != nil {
 		t.Skipf("rust workload not built: %v", err)
 	}
-	cmd, cleanup := spawnBinaryAsWorkload(t, rustSrc)
+	cmd, cleanup := spawnBinaryAsWorkload(t, rustSrc, workloadRuntimeSecs)
 	defer cleanup()
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
-	agent := exec.Command(bin,
-		"--profile",
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", cacheDir,
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "6s",
-		"--profile-output", out,
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run: %v", err)
+
+	// This test's only hard assertion is a NEGATIVE one — "libc was not
+	// fetched from debuginfod" — and a capture that sampled nothing
+	// symbolizes nothing, fetches nothing, and satisfies it vacuously.
+	// So collect until symbolization demonstrably ran end to end against
+	// the target (its own symbols resolved), and only then ask whether
+	// libc was fetched.
+	//
+	// The precondition is the workload's symbols, not libc's: the test
+	// documents libc frames as environment-dependent and only logs when
+	// they are absent, so requiring them here would invent a
+	// requirement the test deliberately does not make. That leaves a
+	// residual gap — a run that resolved rust_workload but never
+	// sampled a libc PC still passes without exercising the libc path —
+	// which is narrower than the vacuous pass it replaces, but not zero.
+	const window = 6 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		"a profile in which the workload's own symbols resolved (proving symbolization ran)",
+		window,
+		func(int) (*profile.Profile, error) {
+			requireWorkloadAlive(t, cmd, "rust-workload")
+			agent := exec.Command(bin,
+				"--profile",
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run: %v", err)
+			}
+			return readProfile(out)
+		},
+		func(p *profile.Profile) bool {
+			return len(p.Sample) > 0 && hasFunctionContaining(p, "rust_workload::")
+		})
+	if !collected {
+		t.Fatalf("symbolization never resolved a workload symbol, so the "+
+			"\"libc was not fetched\" assertion below would pass vacuously: %s", report)
 	}
 
 	// libc should NOT have been fetched via debuginfod — it was resolvable
@@ -2521,7 +2916,6 @@ func TestOffBoxLibcResolution(t *testing.T) {
 
 	// libc functions should appear in the pprof (best-effort — on hosts
 	// without libc debuginfo this assertion is a soft log).
-	p := parseProfile(t, out)
 	got := map[string]bool{}
 	for _, fn := range p.Function {
 		got[fn.Name] = true

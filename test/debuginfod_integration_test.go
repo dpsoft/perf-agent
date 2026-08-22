@@ -3,10 +3,8 @@
 package test
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"io"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -147,66 +145,60 @@ func profileAndAssert(t *testing.T, fixtureDir string, fx fixture) {
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
-	agent := exec.Command(bin,
-		"--profile",
-		"--pid", strconv.Itoa(cmd.Process.Pid),
-		"--duration", "3s",
-		"--profile-output", out,
-		"--debuginfod-url", "http://localhost:8002",
-		"--symbol-cache-dir", t.TempDir(),
-	)
-	agent.Stdout = os.Stdout
-	agent.Stderr = os.Stderr
-	if err := agent.Run(); err != nil {
-		t.Fatalf("perf-agent run for %s: %v", fx.name, err)
-	}
+	cacheDir := t.TempDir()
 
-	body, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatalf("read profile: %v", err)
-	}
-	gr, err := gzip.NewReader(bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("gunzip: %v", err)
-	}
-	defer func() { _ = gr.Close() }()
-	raw, err := io.ReadAll(gr)
-	if err != nil {
-		t.Fatalf("read inflated: %v", err)
-	}
-
-	p, err := pprofpb.ParseUncompressed(raw)
-	if err != nil {
-		t.Fatalf("parse pprof: %v", err)
-	}
-
-	got := map[string]bool{}
-	for _, fn := range p.Function {
-		got[fn.Name] = true
-		// Rust mangling preserves the unmangled name in DWARF; blazesym
-		// demangles to a Rust-style "crate::module::func" form. Match the
-		// suffix in case we got the mangled symbol.
-		for _, want := range fx.wantAnyFunc {
-			if fn.Name == want {
-				return
+	// Rust mangling preserves the unmangled name in DWARF; blazesym
+	// demangles to a Rust-style "crate::module::func" form, so match on
+	// substring as well as equality.
+	matches := func(p *pprofpb.Profile) bool {
+		for _, fn := range p.Function {
+			for _, want := range fx.wantAnyFunc {
+				if fn.Name == want || contains(fn.Name, want) {
+					return true
+				}
 			}
 		}
+		return false
 	}
-	// Also scan as fuzzy contains for Rust-mangled-name fallback.
-	for _, fn := range p.Function {
-		for _, want := range fx.wantAnyFunc {
-			if want != "" && contains(fn.Name, want) {
-				return
+
+	// Collect until the fixture's own functions appear, with a deadline
+	// (issue #42): a 3s window that caught the fixture off-CPU says
+	// nothing about whether debuginfod symbolization worked.
+	const window = 3 * time.Second
+	p, collected, report := collectProfileUntil(t,
+		fmt.Sprintf("a profile of the %s fixture containing any of %v", fx.name, fx.wantAnyFunc),
+		window,
+		func(int) (*pprofpb.Profile, error) {
+			requireWorkloadAlive(t, cmd, fx.spawn)
+			agent := exec.Command(bin,
+				"--profile",
+				"--pid", strconv.Itoa(cmd.Process.Pid),
+				"--duration", window.String(),
+				"--profile-output", out,
+				"--debuginfod-url", "http://localhost:8002",
+				"--symbol-cache-dir", cacheDir,
+			)
+			agent.Stdout = os.Stdout
+			agent.Stderr = os.Stderr
+			if err := agent.Run(); err != nil {
+				t.Fatalf("perf-agent run for %s: %v", fx.name, err)
 			}
-		}
+			return readProfile(out)
+		},
+		matches)
+	if collected {
+		return
 	}
-	names := make([]string, 0, len(got))
-	for k := range got {
-		names = append(names, k)
+
+	names := make([]string, 0)
+	if p != nil {
+		for _, fn := range p.Function {
+			names = append(names, fn.Name)
+		}
 	}
 	slices.Sort(names)
-	t.Fatalf("no expected fixture function for %s; wanted any of %v; got: %v",
-		fx.name, fx.wantAnyFunc, names)
+	t.Fatalf("no expected fixture function for %s; wanted any of %v; %s; got: %v\n%s",
+		fx.name, fx.wantAnyFunc, describeProfile(p), names, report)
 }
 
 func contains(s, sub string) bool {

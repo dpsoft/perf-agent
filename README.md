@@ -436,3 +436,5 @@ If you find a security issue, please do **not** open a public issue. See [SECURI
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+<!-- ci control run for issue #42; delete with the branch -->

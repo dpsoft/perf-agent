@@ -341,7 +341,9 @@ func TestApplyBatchNormalizesLaunches(t *testing.T) {
 
 	require.Len(t, sink.launches, 1)
 	got := sink.launches[0]
-	assert.Equal(t, gpu.CorrelationID{Backend: gpu.BackendCUPTI, Value: "77"}, got.Correlation)
+	// The correlation carries the batch header's pid: a vendor value alone
+	// collides across processes (gpu.CorrelationID, issue #36).
+	assert.Equal(t, gpu.CorrelationID{Backend: gpu.BackendCUPTI, PID: 4242, Value: "77"}, got.Correlation)
 	assert.Equal(t, uint64(900), got.TimeNs)
 	assert.Equal(t, uint32(4242), got.Launch.PID)
 	assert.Equal(t, uint32(55), got.Launch.TID)
@@ -358,6 +360,7 @@ func TestApplyBatchNormalizesExecs(t *testing.T) {
 	buf := make([]byte, batchHdrSize+48)
 	putU32(buf[0:], kindExec)
 	putU32(buf[4:], 1)
+	putU32(buf[16:], 4242) // pid comes from the batch header
 	putU64(buf[24:], 48)
 	putU64(buf[batchHdrSize+0:], 88)   // correlation
 	putU64(buf[batchHdrSize+32:], 10)  // start_ns
@@ -369,6 +372,11 @@ func TestApplyBatchNormalizesExecs(t *testing.T) {
 
 	require.Len(t, sink.execs, 1)
 	assert.Equal(t, "88", sink.execs[0].Correlation.Value)
+	// GPUKernelExec has no PID field of its own; the correlation is where an
+	// execution's process identity lives, and the join depends on it being
+	// there (issue #36).
+	assert.Equal(t, uint32(4242), sink.execs[0].Correlation.PID,
+		"an execution's correlation must name the process that produced it")
 	assert.Equal(t, uint64(10), sink.execs[0].StartNs)
 	assert.Equal(t, uint64(200), sink.execs[0].EndNs)
 }
@@ -2512,4 +2520,68 @@ func TestRepeatedDecodeFailuresDoNotAllocate(t *testing.T) {
 	// its business; what matters is that every one of them was counted.
 	assert.Greater(t, tbl.snapshot()[0].Count, uint64(1000),
 		"every repeat must still be counted, allocation-free or not")
+}
+
+// execBatchWith builds an exec batch carrying the given correlations, in
+// order, all from one pid.
+func execBatchWith(pid uint32, startNs uint64, corrs ...uint64) []byte {
+	buf := make([]byte, batchHdrSize+len(corrs)*gpuabi.SizeExec)
+	putU32(buf[0:], kindExec)
+	putU32(buf[4:], uint32(len(corrs)))
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(len(corrs)*gpuabi.SizeExec))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1 on every non-sampled kind
+	for i, corr := range corrs {
+		rec := buf[batchHdrSize+i*gpuabi.SizeExec:]
+		putU64(rec[0:], corr)
+		putU64(rec[32:], startNs+uint64(i)) // start_ns
+		putU64(rec[40:], startNs+uint64(i)+10)
+	}
+	return buf
+}
+
+// TestSameCorrelationInTwoProcessesJoinsInTheTimeline is issue #36 end to
+// end: the consumer's own side tables were already (pid, correlation)-keyed,
+// but the gpu.Timeline underneath them was not, so a launch that kept its own
+// stack all the way through the consumer could still be handed to the other
+// process's execution one layer down.
+//
+// Both processes use wire correlation 7 - the collision is not contrived,
+// vendor correlation counters restart from a low value in every process and
+// the probes fire for every process that maps the shim.
+func TestSameCorrelationInTwoProcessesJoinsInTheTimeline(t *testing.T) {
+	tl := gpu.NewTimeline(gpu.TimelineConfig{})
+	c, sm, _ := stackConsumer(t, tl, Config{})
+	sm.put(1, 0x1000) // the stack captured in pid 4242
+	sm.put(2, 0x2000) // the stack captured in pid 5353
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, sampledBatchWith(5353, 7, 2, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	apply(t, c, launchBatchWith(5353, 7))
+	c.Flush()
+	apply(t, c, execBatchWith(4242, 1000, 7))
+	apply(t, c, execBatchWith(5353, 2000, 7))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 2)
+
+	wantStack := map[uint64]string{1000: "fn_1000", 2000: "fn_2000"}
+	wantPID := map[uint64]uint32{1000: 4242, 2000: 5353}
+	for _, view := range snap.Executions {
+		pid := wantPID[view.Exec.StartNs]
+		require.NotNilf(t, view.Launch, "pid %d's execution lost its launch", pid)
+		assert.Equalf(t, gpu.JoinExact, view.Join,
+			"pid %d supplied a correlation live in its own process", pid)
+		assert.Equalf(t, pid, view.Launch.Launch.PID,
+			"pid %d's execution joined a launch from pid %d", pid, view.Launch.Launch.PID)
+		assert.Equalf(t, []string{wantStack[view.Exec.StartNs]}, frameNames(view.Launch.Launch.CPUStack),
+			"pid %d's GPU time must carry the call path captured in pid %d, not the other process's", pid, pid)
+	}
+	assert.Equal(t, uint64(2), snap.JoinStats.ExactExecutionJoinCount)
+	assert.Equal(t, uint64(2), snap.JoinStats.MatchedLaunchCount,
+		"two distinct launches were matched, not one matched twice")
+	assert.Zero(t, snap.JoinStats.UnmatchedExecutionCount)
+	assert.Zero(t, snap.JoinStats.UnmatchedLaunchCount)
+	assert.Equal(t, uint64(2), c.Stats().StacksAttached)
 }

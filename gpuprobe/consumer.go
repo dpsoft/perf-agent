@@ -1212,22 +1212,33 @@ func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) {
 
 // correlationOf converts a wire correlation into the core's CorrelationID.
 //
+// pid is the batch header's — the process that fired the probe — and it is
+// part of the id, not decoration. Vendor correlation counters restart from a
+// low value in every process and the probes fire for every process that maps
+// the shim, so a correlation without its pid collides across processes within
+// the first handful of launches; see gpu.CorrelationID. Taking it as a
+// parameter is what makes it impossible to build one of these without
+// deciding whose it is.
+//
 // A wire value of zero means "this record carries no correlation" — the ABI
 // says so explicitly for PC samples in continuous collection, the mode this
-// project ships (shim/core/usdt_abi.h, spec §6.3 finding 3). It must map to
-// the *zero* gpu.CorrelationID, because that is the value gpu/timeline.go
+// project ships (shim/core/usdt_abi.h, spec §6.3 finding 3). It must map to a
+// correlation that is not Present(), because that is what gpu/timeline.go
 // tests to decide a record needs the heuristic join. Formatting it as the
 // string "0" would produce a perfectly valid-looking ID that every
-// uncorrelated record shares, collapsing them into one exact-join bucket and
-// yielding confident, wrong joins with nothing counted.
+// uncorrelated record in one process shares, collapsing them into one
+// exact-join bucket and yielding confident, wrong joins with nothing counted.
+// The whole zero value is returned rather than one carrying only the pid, so
+// that the older `== gpu.CorrelationID{}` reading and the Present() reading
+// agree on these records.
 //
 // Caller holds mu: the zero case bumps a counter so the demotion is visible.
-func (c *Consumer) correlationOf(v uint64) gpu.CorrelationID {
+func (c *Consumer) correlationOf(pid uint32, v uint64) gpu.CorrelationID {
 	if v == 0 {
 		c.stats.ZeroCorrelation++
 		return gpu.CorrelationID{}
 	}
-	return gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(v, 10)}
+	return gpu.CorrelationID{Backend: c.cfg.Backend, PID: pid, Value: strconv.FormatUint(v, 10)}
 }
 
 // Run reads batches until the context is cancelled or the consumer is
@@ -1313,7 +1324,7 @@ func (c *Consumer) applyBatch(b batch) {
 		for _, l := range b.Launches {
 			c.stats.Records++
 			ev := gpu.GPUKernelLaunch{
-				Correlation: c.correlationOf(l.Correlation),
+				Correlation: c.correlationOf(b.PID, l.Correlation),
 				// The shim stamps CLOCK_MONOTONIC, which is the only domain
 				// the core accepts; say so rather than leaning on
 				// NormalizeClockDomain's zero-value default.
@@ -1333,7 +1344,7 @@ func (c *Consumer) applyBatch(b batch) {
 		for _, e := range b.Execs {
 			c.stats.Records++
 			ev := gpu.GPUKernelExec{
-				Correlation: c.correlationOf(e.Correlation),
+				Correlation: c.correlationOf(b.PID, e.Correlation),
 				ClockDomain: gpu.ClockDomainCPUMonotonic,
 				StartNs:     e.StartNs,
 				EndNs:       e.EndNs,
@@ -1388,16 +1399,19 @@ func (c *Consumer) applyBatch(b batch) {
 //
 // The first two cases can therefore overtake a launch already held from the
 // same batch. That reordering is bounded by one batch and is harmless to the
-// consumers that exist: gpu.LaunchCache keys on correlation, orders eviction
+// consumers that exist: gpu.LaunchCache keys on the process-qualified
+// correlation, orders eviction
 // by insertion rather than by timestamp, and ignores a timestamp older than
 // the newest it has seen (observeTimestampLocked), so an out-of-order Put
 // neither displaces the wrong entry nor moves the horizon.
 func (c *Consumer) admitLaunchLocked(ev gpu.GPUKernelLaunch, kernelID uint64) {
-	if ev.Correlation == (gpu.CorrelationID{}) {
+	if !ev.Correlation.Present() {
 		c.emitLaunchLocked(ev, kernelID)
 		return
 	}
-	key := launchKey{pid: ev.Launch.PID, corr: ev.Correlation}
+	// The correlation already names the process (correlationOf), so it is the
+	// whole key: nothing here has to remember to add a pid.
+	key := ev.Correlation
 	if st, ok := c.pending.take(key); ok {
 		c.attachLocked(&ev, st.frames, st.period)
 		c.emitLaunchLocked(ev, kernelID)
@@ -1450,13 +1464,12 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 	case stackAttributable:
 	}
 
-	// Keyed on (pid, correlation), never correlation alone: see launchKey.
-	// pid is the batch header's, i.e. the process that fired the probe, which
-	// is the same field the batched twin's launch carries.
-	key := launchKey{
-		pid:  pid,
-		corr: gpu.CorrelationID{Backend: c.cfg.Backend, Value: strconv.FormatUint(sl.Correlation, 10)},
-	}
+	// Built through the same correlationOf as the batched twin's, from the
+	// same batch-header pid, so the two keys are equal by construction and
+	// neither can be a bare correlation value. sl.Correlation is non-zero
+	// here (checked above), so correlationOf cannot take its ZeroCorrelation
+	// branch and this does not double-count that demotion.
+	key := c.correlationOf(pid, sl.Correlation)
 	// The batched twin arrived first and is still being held: attach and let
 	// it go now, since nothing more can arrive for it.
 	if held, ok := c.deferred.take(key); ok {

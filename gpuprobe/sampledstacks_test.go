@@ -11,11 +11,8 @@ import (
 	pp "github.com/dpsoft/perf-agent/pprof"
 )
 
-func testCorr(i int) launchKey {
-	return launchKey{
-		pid:  1,
-		corr: gpu.CorrelationID{Backend: gpu.BackendCUPTI, Value: strconv.Itoa(i)},
-	}
+func testCorr(i int) gpu.CorrelationID {
+	return gpu.CorrelationID{Backend: gpu.BackendCUPTI, PID: 1, Value: strconv.Itoa(i)}
 }
 
 // The steady state of the sampled-first path is park-then-take with the map

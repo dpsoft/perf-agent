@@ -182,7 +182,7 @@ func projectionPID(view ExecutionView) uint32 {
 // all. This label reports what was actually observed on the execution, not
 // what was inferred by the join; a heuristic match has no vendor-provided
 // correlation for this execution to report, so the label reflects that
-// honestly (present-if-nonzero, exactly as for an exact join) rather than
+// honestly (CorrelationID.Present(), exactly as for an exact join) rather than
 // borrowing the launch's Correlation and presenting an inference as an
 // observation.
 //
@@ -211,7 +211,7 @@ func projectionLabels(view ExecutionView) map[string]string {
 	if view.Exec.Queue.Device.DeviceID != "" {
 		labels["gpu_device"] = view.Exec.Queue.Device.DeviceID
 	}
-	if view.Exec.Correlation.Value != "" {
+	if view.Exec.Correlation.Present() {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
 	}
 	switch view.Join {

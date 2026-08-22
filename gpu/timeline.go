@@ -174,8 +174,10 @@ type Timeline struct {
 
 	execs *ring[GPUKernelExec]
 
-	// pending holds PC samples keyed by correlation ID until an exec with a
-	// matching Correlation is joined at Snapshot time. A correlation's
+	// pending holds PC samples keyed by correlation ID - which carries the
+	// producing process, so two processes reusing the same vendor value never
+	// share a bucket (see CorrelationID) - until an exec with a matching
+	// Correlation is joined at Snapshot time. A correlation's
 	// samples are deleted from pending the moment they are attached to an
 	// execution's view - they are consumed, not cached indefinitely. Since
 	// review Critical 3 made Snapshot drain execs the same way (an exec is
@@ -541,7 +543,7 @@ func (t *Timeline) Snapshot() Snapshot {
 
 	// The heuristic's candidate set is built lazily - only once the loop
 	// below hits its first exec that actually needs it (see the
-	// exec.Correlation zero-value branch), not unconditionally on every
+	// exec.Correlation.Present() branch), not unconditionally on every
 	// Snapshot call - review Important 4. LaunchCache.Entries() and the
 	// per-group sort are O(capacity); a CUPTI-style workload where every
 	// join is exact never touches this at all. Grouping by (queue, kernel
@@ -559,7 +561,7 @@ func (t *Timeline) Snapshot() Snapshot {
 	for i, exec := range execs {
 		view := ExecutionView{Exec: exec, PCSamples: execSamples[i]}
 
-		if exec.Correlation != (CorrelationID{}) {
+		if exec.Correlation.Present() {
 			if l, ok := t.cache.Get(exec.Correlation); ok {
 				launch := l
 				view.Launch = &launch
@@ -578,6 +580,12 @@ func (t *Timeline) Snapshot() Snapshot {
 			// different, still-live launch's PID and Tags to this
 			// execution merely because it shares a kernel name and queue -
 			// spec §13 requires degrading to unattributed instead.
+			//
+			// Since the correlation carries the producing process (issue
+			// #36), a launch from ANOTHER process with the same vendor
+			// value is now one of the things that legitimately misses here,
+			// and lands in UnmatchedExecutionCount rather than being
+			// reported as an exact join to the wrong process's call stack.
 			stats.UnmatchedExecutionCount++
 			views = append(views, view)
 			continue
@@ -651,6 +659,18 @@ func queueKeyOf(q GPUQueueRef) queueKey {
 	return queueKey{backend: q.Backend, queueID: q.QueueID}
 }
 
+// candidateGroupKey deliberately carries no process. It cannot: the heuristic
+// runs only for an execution that supplied no correlation at all, and since
+// issue #36 the correlation is the only place an execution's process
+// identity lives, so a correlation-less execution has no pid to group by.
+// A correlation-less backend in system-wide mode can therefore still match an
+// execution to another process's launch on (queue, kernel name, time) alone.
+// Closing that needs a process field on GPUKernelExec itself, which no
+// producer in the tree would populate today: the one shipping backend
+// (gpuprobe) supplies a correlation on every launch and execution, as spec §6
+// requires without exception, so nothing reaches this path. Left as a known,
+// documented gap rather than a field nobody writes.
+//
 // candidateGroupKey is the exact equivalence launchKernelNamesCompatible
 // defines (queue match plus kernel-name equality) turned into a map key.
 // Grouping candidates by this key and looking a miss up by its own
@@ -694,7 +714,7 @@ func buildHeuristicCandidateIndex(entries []GPUKernelLaunch) map[candidateGroupK
 }
 
 // findLaunchHeuristic is the fallback path when an exec never carried a
-// correlation ID at all (see the exec.Correlation zero-value branch in
+// correlation ID at all (see the exec.Correlation.Present() branch in
 // Snapshot). Ported decision from the prototype's findLaunchHeuristic: a
 // launch that precedes the exec's start, preferring the most recent such
 // launch, and flagging Ambiguous when more than one candidate qualified.

@@ -12,6 +12,7 @@
 #include "batch.h"
 #include "clock.h"
 #include "drain.h"
+#include "enroll.h"
 #include "kernelnames.h"
 #include "sampler.h"
 #include "usdt_abi.h"
@@ -479,6 +480,29 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
 
     open_log();
 
+    // The #49 startup rendezvous, and this is the one place in a CUDA process
+    // where it can be done: the driver dlopened us during cuInit, so libcuda,
+    // libcupti and the application are all mapped, and NO kernel has been
+    // launched yet. Blocking here until the consumer has installed this
+    // process's CFI tables is what makes the kernel-side walk of the first
+    // sampled launch -- and of every launch during what would otherwise be a
+    // ~73ms libcuda compile -- find tables instead of falling through to the
+    // frame-pointer path.
+    //
+    // BEFORE cuptiSubscribe, not after: subscribing is what makes on_callback
+    // reachable, and on_callback is the only thing that fires a probe. Doing
+    // the rendezvous first means no probe of any kind can have fired from
+    // this process before it completes -- not even from another thread
+    // already inside a CUDA call.
+    //
+    // Only when a consumer is attached (the semaphore is what says so, and it
+    // was armed by the kernel when this library was mapped), bounded by
+    // PERFAGENT_GPU_ENROLL_TIMEOUT_MS, and never fatal: see core/enroll.h.
+    perfagent::EnrollResult enrolled = perfagent::kEnrollDisabled;
+    if (gpu_launch_sampled_v1_enabled()) {
+        enrolled = perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
+    }
+
     // Leaked on purpose, never deleted: CUPTI worker threads keep calling
     // buffer_completed during process teardown, and a destroyed Batch or
     // Sampler under them is a use-after-free in somebody else's process.
@@ -514,7 +538,8 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     atexit(at_exit_handler);
 
     logf("perfagent-cupti: initialized pid=%d sample_period=%u drain_ms=%u "
-         "clock_offset_ns=%lld\n",
-         (int)getpid(), g_sampler->period(), drain_ms, (long long)g_clock.offset_ns());
+         "clock_offset_ns=%lld enroll=%s\n",
+         (int)getpid(), g_sampler->period(), drain_ms, (long long)g_clock.offset_ns(),
+         perfagent::enroll_result_name(enrolled));
     return 1;
 }

@@ -4,6 +4,7 @@
 #include "batch.h"
 #include "clock.h"
 #include "drain.h"
+#include "enroll.h"
 #include "kernelnames.h"
 #include "sampler.h"
 #include "usdt_abi.h"
@@ -47,6 +48,16 @@ static uint64_t mono_ns() {
 // whatever process it's injected into.
 extern "C" __attribute__((visibility("default"))) void
 perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period) {
+    // The #49 startup rendezvous, before the first launch and therefore
+    // before the first probe: wait for the consumer to install this
+    // process's CFI tables, so the kernel-side walk of every sampled launch
+    // has them. Only when a consumer is actually attached -- the semaphore
+    // is what says so -- and never fatal: see core/enroll.h.
+    perfagent::EnrollResult enrolled = perfagent::kEnrollDisabled;
+    if (gpu_launch_sampled_v1_enabled()) {
+        enrolled = perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
+    }
+
     perfagent::Batch<gpu_launch_v1, 32> lb(gpu_launch_v1_emit, gpu_launch_v1_enabled);
     perfagent::Batch<gpu_exec_v1, 32> eb(gpu_exec_v1_emit, gpu_exec_v1_enabled);
     perfagent::Sampler sampler(sample_period);
@@ -124,10 +135,11 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     eb.flush();
     drainer.stop();
     fprintf(stderr, "stub: launches=%u observed=%llu sampled=%llu period=%u "
-                    "launch_dropped=%llu exec_dropped=%llu\n",
+                    "launch_dropped=%llu exec_dropped=%llu enroll=%s\n",
             launches, (unsigned long long)sampler.observed(),
             (unsigned long long)sampler.sampled(), sampler.period(),
-            (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped());
+            (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
+            perfagent::enroll_result_name(enrolled));
 }
 
 // linger keeps this process alive after its records are flushed, until the

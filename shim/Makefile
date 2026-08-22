@@ -21,7 +21,7 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 # sm_86 is the RTX 3090 this adapter was proven on.
 CUDA_ARCH ?= sm_86
 
-CORE_SRC := core/batch.cc core/clock.cc core/drain.cc core/sampler.cc
+CORE_SRC := core/batch.cc core/clock.cc core/drain.cc core/enroll.cc core/sampler.cc
 CORE_OBJ := $(CORE_SRC:.cc=.o)
 
 .PHONY: all test test-tsan nvidia nvidia-workload clean
@@ -140,10 +140,11 @@ nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: core/batch_test.cc core/clock_test.cc core/drain_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc $(CORE_SRC)
+test: core/batch_test.cc core/clock_test.cc core/drain_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
+	$(CXX) -std=c++17 -pthread -I core -o /tmp/enroll_test core/enroll_test.cc core/enroll.cc && /tmp/enroll_test
 	$(CC) -std=c11 -Wall -Werror -I core -o /tmp/usdt_abi_test core/usdt_abi_test.c && /tmp/usdt_abi_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/sampler_test core/sampler_test.cc core/sampler.cc && /tmp/sampler_test
 	$(CXX) -std=c++17 -O2 -Wall -Werror -I core -o /tmp/probe_args_test core/probe_args_test.cc && /tmp/probe_args_test

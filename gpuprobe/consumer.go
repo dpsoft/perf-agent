@@ -624,6 +624,21 @@ type Stats struct {
 	// released and their later walks degrade to frame pointers, counted in
 	// StacksWalkedNoTables. Attribution loss, never record loss.
 	UnwindPIDsEvicted uint64
+	// UnwindEnrolledPIDsEvicted is the subset of the above that had completed
+	// the startup rendezvous: producers that were released on the promise
+	// that their tables were installed, and then had them taken back to make
+	// room. Non-zero means the capacity bound is biting on exactly the
+	// processes the rendezvous exists to protect, and is the benign
+	// explanation to check first when StacksNoTablesAfterEnroll is non-zero.
+	UnwindEnrolledPIDsEvicted uint64
+	// UnwindEnrolledMarksDropped counts rendezvous marks that aged out of the
+	// bounded set pidRegistry keeps so the mark can outlive an eviction. Each
+	// one is a PID whose later tableless walks will NOT be counted in
+	// StacksNoTablesAfterEnroll even though they should be - an under-report,
+	// which is the direction this counter exists to keep visible. Non-zero
+	// means the set is small relative to how many distinct producers enrolled;
+	// Config.UnwindPIDCapacity sizes both.
+	UnwindEnrolledMarksDropped uint64
 	// UnwindRequestsDropped counts registration or release requests the
 	// worker queue could not accept. A dropped registration means the PID
 	// is forgotten and retried on its next batch; a dropped release means
@@ -638,6 +653,85 @@ type Stats struct {
 	// holding right now, registered or still being compiled. Bounded by
 	// Config.UnwindPIDCapacity.
 	UnwindPIDsTracked int
+	// UnwindEnrollListening says whether the startup rendezvous (enroll.go)
+	// is open for this consumer. False means the address could not be bound
+	// - another consumer already holds it for this shim inode, or abstract
+	// sockets are unavailable - and every producer therefore falls back to
+	// lazy registration, i.e. exactly the pre-#49 behaviour, with the
+	// startup window it implies. UnwindEnrollLastError says why.
+	//
+	// It is a flag rather than a silent fallback because a run that lost the
+	// rendezvous and a run that never needed it are otherwise
+	// indistinguishable from the counters, and the first is the one that
+	// loses ~38% of its stacks.
+	UnwindEnrollListening bool
+	// UnwindEnrollRequests counts producers that reached the rendezvous and
+	// passed both identity checks (SO_PEERCRED, and actually mapping this
+	// consumer's shim inode), so registration was attempted for them.
+	UnwindEnrollRequests uint64
+	// UnwindEnrollConfirmed counts producers released with "your tables are
+	// installed". Each one is a process whose FIRST sampled launch was
+	// walked with CFI, which is the entire point of issue #49. Compare it
+	// against the number of distinct producers a run had: a shortfall means
+	// some producer took the lazy path.
+	UnwindEnrollConfirmed uint64
+	// UnwindEnrollRefused counts connections turned away without any
+	// registration: no peer credentials, a PID other than Config.PID on a
+	// per-PID attach, or a peer that does not map the shim. The last is the
+	// interesting one - it is a process on this machine reaching the
+	// rendezvous address for a shim it has not loaded.
+	UnwindEnrollRefused uint64
+	// UnwindEnrollThrottled counts connections refused by the rendezvous rate
+	// limiter before any check or /proc read. The listener serves one
+	// producer at a time, so a fork loop of shim-mapping processes could
+	// otherwise monopolise it and expire genuine producers' budgets; see
+	// enrollAdmission. A throttled producer is released instantly and runs on
+	// the lazy path, so this is attribution loss, never a stalled
+	// application. Non-zero on a machine that is not under attack means the
+	// burst is genuinely larger than enrollUIDBurst per second.
+	UnwindEnrollThrottled uint64
+	// UnwindEnrollFailed counts producers whose registration was attempted
+	// and installed nothing. They are released rather than parked, so they
+	// run with frame-pointer stacks; every stack they go on to take is
+	// counted in both StacksWalkedNoTables and StacksNoTablesAfterEnroll.
+	UnwindEnrollFailed uint64
+	// UnwindEnrollLastError is the most recent reason a rendezvous did not
+	// end in a confirmation, including a failure to bind the address at all.
+	UnwindEnrollLastError string
+	// StacksNoTablesAfterEnroll is the counter that says the fix stopped
+	// working.
+	//
+	// It is the subset of StacksWalkedNoTables whose process DID complete the
+	// startup rendezvous. The rendezvous is meant to make that impossible:
+	// the producer is blocked in its own initialisation until the tables are
+	// installed, so a walk from it should never find them missing.
+	//
+	// There are exactly three ways it can be non-zero, and they are not
+	// equally alarming - read it together with the two counters that name the
+	// benign ones:
+	//
+	//   - the rendezvous ran and registration installed nothing. The producer
+	//     was released anyway (a degraded profile beats a stalled process)
+	//     and its walks are honestly tableless. Also counted in
+	//     UnwindEnrollFailed.
+	//   - the PID was evicted from the bounded set afterwards, so the tables
+	//     were taken back. Also counted in UnwindEnrolledPIDsEvicted.
+	//   - neither of those, in which case the ordering argument the whole fix
+	//     rests on is false: a walk happened before the reply went out, or
+	//     registration reported success it had not delivered. THAT has no
+	//     benign reading.
+	//
+	// The enrolled mark deliberately outlives eviction (pidRegistry's
+	// wasEnrolled set): if it did not, the second case above would leave this
+	// counter reading zero while StacksWalkedNoTables climbed - green exactly
+	// when things were worst, in the counter added to prevent that. The set
+	// is bounded, so a PID evicted long ago can be forgotten (a false
+	// negative, the safe direction) and a recycled PID can be miscredited (a
+	// false positive, which UnwindEnrolledPIDsEvicted cross-checks).
+	//
+	// Deliberately NOT a way to make StacksWalkedNoTables read zero: that
+	// counter still counts every tableless walk, enrolled or not.
+	StacksNoTablesAfterEnroll uint64
 	// StackMapFull counts captures the BPF side could not park because
 	// gpu_stacks was full (gpuStackCapacity live entries). Read from the
 	// `walk_errors` map.
@@ -915,6 +1009,14 @@ type Consumer struct {
 	// It has its own lock and is safe to use under c.mu; none of the methods
 	// c.mu-holding code calls does I/O or blocks. See pidRegistry.
 	unwind *pidRegistry
+	// enroll serves the startup rendezvous that makes those tables exist
+	// before the first probe fires. Nil when the address could not be bound,
+	// which is not fatal: producers then register lazily on their first
+	// batch, exactly as before issue #49. See enroll.go.
+	enroll *enrollListener
+	// enrollErr is why there is no listener, surfaced as
+	// Stats.UnwindEnrollLastError. Written once in Attach, read under mu.
+	enrollErr string
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]uint64
@@ -1054,7 +1156,25 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	}
 	// For a system-wide attach (cfg.PID == 0) there is nothing to register
 	// yet — the target may not even be running, which is exactly the gate's
-	// shape. Registration happens on first sight of a PID, in applyBatch.
+	// shape. What closes that window is the startup rendezvous below: the
+	// producer blocks in its own initialisation until its tables are in.
+	// Registration on first sight of a PID (applyBatch -> note) remains as
+	// the fallback for a producer that never reached it.
+
+	// Bound BEFORE the link, for the same reason registration is: creating
+	// the uprobe_multi link is what arms the shim's semaphores, and an armed
+	// semaphore is what makes a producer try the rendezvous at all. A
+	// listener bound after the link would miss a producer that started in
+	// between.
+	//
+	// Best-effort, never fatal, for the same reason as everything else here:
+	// a consumer with no rendezvous still profiles, registers lazily, and
+	// says so in Stats.UnwindEnrollListening.
+	if el, eerr := newEnrollListener(cfg, c.unwind); eerr != nil {
+		c.enrollErr = eerr.Error()
+	} else {
+		c.enroll = el
+	}
 
 	var ex *link.Executable
 	if ex, err = link.OpenExecutable(cfg.ShimPath); err != nil {
@@ -1590,6 +1710,13 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// construction: a DWARF walk proves tables existed.
 		if !c.unwind.ready(pid) {
 			c.stats.StacksWalkedNoTables++
+			if c.unwind.enrolled(pid) {
+				// The producer blocked in its own initialisation waiting for
+				// exactly these tables and was told to go. Finding them
+				// missing now is a contradiction, not a startup transient -
+				// see Stats.StacksNoTablesAfterEnroll.
+				c.stats.StacksNoTablesAfterEnroll++
+			}
 		}
 	}
 	if flags&walkerFlagCFIMiss != 0 {
@@ -1953,9 +2080,22 @@ func (c *Consumer) Stats() Stats {
 	out.UnwindPIDsFailed = uw.failed
 	out.UnwindLastError = uw.lastErr
 	out.UnwindPIDsEvicted = uw.evicted
+	out.UnwindEnrolledPIDsEvicted = uw.enrolledEvicted
+	out.UnwindEnrolledMarksDropped = uw.enrolledMarksDropped
 	out.UnwindRequestsDropped = uw.requestsDropped
 	out.UnwindReleaseFailed = uw.releaseFailed
 	out.UnwindPIDsTracked = tracked
+	en := c.enroll.snapshot()
+	out.UnwindEnrollListening = c.enroll != nil
+	out.UnwindEnrollRequests = en.requests
+	out.UnwindEnrollConfirmed = en.confirmed
+	out.UnwindEnrollRefused = en.refused
+	out.UnwindEnrollThrottled = en.throttled
+	out.UnwindEnrollFailed = en.failed
+	out.UnwindEnrollLastError = en.lastErr
+	if out.UnwindEnrollLastError == "" {
+		out.UnwindEnrollLastError = c.enrollErr
+	}
 	// Gauges, read fresh: what the two side tables are holding right now.
 	out.PendingStacks = c.pending.len()
 	out.PendingLaunches = c.deferred.len()
@@ -2029,6 +2169,14 @@ func (c *Consumer) Close() error {
 	// descriptors. Outside mu because Stats takes mu and the wait can last a
 	// whole compile. Idempotent, and a no-op on a nil registry, so a
 	// half-built consumer from a failed Attach is safe.
+	// The rendezvous goes down before the registry: it is the only other
+	// thing that calls into the registrar, and closing it first means the
+	// wait below is the last compile there can be. A producer blocked on an
+	// accepted connection is released by the close (it reads EOF and takes
+	// the lazy path), never left parked on a consumer that has gone.
+	if err := c.enroll.close(); err != nil {
+		errs = append(errs, err)
+	}
 	c.unwind.close()
 	// The links and objects come down under mu so Stats, which reads the
 	// `dropped` map, cannot be looking at c.objs while it is being closed.

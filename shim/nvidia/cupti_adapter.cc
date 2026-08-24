@@ -458,6 +458,21 @@ unsigned env_uint(const char *name, unsigned dflt) {
     return (unsigned)n;
 }
 
+// The sampler's seed. Defaulted to Sampler::kDefaultSeed rather than randomized
+// per process: a fixed seed is what keeps two runs of the same workload
+// sampling the same launches, which is why this sampler was deterministic in
+// the first place (shim/core/sampler.h). Set PERFAGENT_GPU_SAMPLE_SEED to any
+// non-zero value -- decimal or 0x-prefixed -- to vary the schedule per process,
+// e.g. to average several runs of the same workload.
+uint64_t env_u64(const char *name, uint64_t dflt) {
+    const char *v = getenv(name);
+    if (!v || !*v) return dflt;
+    char *end = nullptr;
+    const unsigned long long n = strtoull(v, &end, 0);
+    if (end == v || *end) return dflt;
+    return (uint64_t)n;
+}
+
 bool check(CUptiResult r, const char *what) {
     if (r == CUPTI_SUCCESS) return true;
     const char *msg = "?";
@@ -508,7 +523,9 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // Sampler under them is a use-after-free in somebody else's process.
     g_lb = new perfagent::Batch<gpu_launch_v1, 32>(gpu_launch_v1_emit, gpu_launch_v1_enabled);
     g_eb = new perfagent::Batch<gpu_exec_v1, 32>(gpu_exec_v1_emit, gpu_exec_v1_enabled);
-    g_sampler = new perfagent::Sampler(env_uint("PERFAGENT_GPU_SAMPLE_PERIOD", 8));
+    g_sampler = new perfagent::Sampler(env_uint("PERFAGENT_GPU_SAMPLE_PERIOD", 8),
+                                      env_u64("PERFAGENT_GPU_SAMPLE_SEED",
+                                              perfagent::Sampler::kDefaultSeed));
     g_names = new perfagent::KernelNameTable();
     g_drainer = new perfagent::Drainer();
 
@@ -537,9 +554,14 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
 
     atexit(at_exit_handler);
 
-    logf("perfagent-cupti: initialized pid=%d sample_period=%u drain_ms=%u "
-         "clock_offset_ns=%lld enroll=%s\n",
-         (int)getpid(), g_sampler->period(), drain_ms, (long long)g_clock.offset_ns(),
+    // The seed is logged because it IS the schedule: with it and the period,
+    // the exact set of sampled launch ordinals is replayable offline
+    // (internal/gpuabi.SampleSchedule). Without it a run using a non-default
+    // seed could not be audited after the fact.
+    logf("perfagent-cupti: initialized pid=%d sample_period=%u sample_seed=0x%016llx "
+         "drain_ms=%u clock_offset_ns=%lld enroll=%s\n",
+         (int)getpid(), g_sampler->period(),
+         (unsigned long long)g_sampler->seed(), drain_ms, (long long)g_clock.offset_ns(),
          perfagent::enroll_result_name(enrolled));
     return 1;
 }

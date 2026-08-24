@@ -21,6 +21,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 )
@@ -93,11 +94,18 @@ func main() {
 		}
 	}()
 
-	// The sampler is deterministic one-in-N over every launch, and the
-	// workload launches exactly two kernels per iteration, so the expected
-	// count is exact rather than approximate.
+	// The sampler jitters each gap around the period so it cannot lock phase
+	// against the workload's alternating axpy/scale pair (issue #50), but the
+	// schedule is still a deterministic chain from (seed, period): replaying
+	// it gives the EXACT sampled count, not an estimate. The workload
+	// launches exactly two kernels per iteration and the adapter samples on
+	// every launch, attached or not, so this number is what the consumer must
+	// see before the workload may be released.
+	if *iters <= 0 || *period <= 0 {
+		log.Fatalf("iters and period must both be positive, got iters=%d period=%d", *iters, *period)
+	}
 	launches := *iters * 2
-	wantSampled := (launches + *period - 1) / *period
+	wantSampled := int(gpuabi.SampledCount(uint64(launches), uint32(*period), gpuabi.DefaultSampleSeed)) //nolint:gosec // both bounds-checked positive above
 
 	cmd := exec.Command(*workload,
 		fmt.Sprint(*iters), fmt.Sprint(*sleepUs), fmt.Sprint(*linger))

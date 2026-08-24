@@ -134,10 +134,15 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     lb.flush();
     eb.flush();
     drainer.stop();
-    fprintf(stderr, "stub: launches=%u observed=%llu sampled=%llu period=%u "
+    // seed= is part of the accounting, not decoration: the sampler's schedule
+    // is a deterministic chain from (seed, period), so this line is what makes
+    // the exact sampled= count above reproducible and auditable offline
+    // (internal/gpuabi.SampleSchedule replays it).
+    fprintf(stderr, "stub: launches=%u observed=%llu sampled=%llu period=%u seed=0x%016llx "
                     "launch_dropped=%llu exec_dropped=%llu enroll=%s\n",
             launches, (unsigned long long)sampler.observed(),
             (unsigned long long)sampler.sampled(), sampler.period(),
+            (unsigned long long)sampler.seed(),
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
             perfagent::enroll_result_name(enrolled));
 }

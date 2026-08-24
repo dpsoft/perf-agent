@@ -87,7 +87,13 @@ struct gpu_launch_sampled_v1 {
     uint64_t context_id;
     uint64_t time_ns;
     uint32_t tid;
-    uint32_t sample_period;   // the N in one-in-N, at capture time; never 0
+    // The N in one-in-N, at capture time; never 0. The MEAN stride, not an
+    // exact one: the sampler jitters each gap around N so it cannot lock
+    // phase against a periodic launch pattern (shim/core/sampler.h, issue
+    // #50). The rate it names -- one launch in N carries a stack -- is
+    // unchanged, and it is still not a scale factor: durations are never
+    // scaled by it.
+    uint32_t sample_period;
     uint64_t launch_seq;      // ordinal among ALL launches, sampled or not
 };
 

@@ -5,9 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +30,35 @@ import (
 // listener at /proc/self/exe. The test binary genuinely maps that inode, so
 // the peer check passes for real, and the registrar behind the registry is
 // the same fake the rest of gpuprobe's unwind tests use.
+
+// repoTempDir makes a scratch directory ON THE SAME FILESYSTEM AS THE SOURCE
+// TREE, rather than in t.TempDir().
+//
+// That is not fussiness, it is the regression. t.TempDir() is under TMPDIR,
+// which on this machine (and most Linux distributions) is tmpfs. The
+// rendezvous name embeds a device number, and stat(2) and /proc/<pid>/maps
+// report the SAME device for a file on tmpfs and DIFFERENT devices for a file
+// on btrfs - the Fedora default, and where the shim is actually built. So
+// every test that put its fixture in t.TempDir() proved the two ends agree on
+// the one filesystem where they cannot disagree, while the real CUDA run
+// failed with enroll=no-listener and all of them stayed green.
+//
+// Measured, same file, same instant:
+//
+//	/tmp/file        (tmpfs)  stat=0:48  maps=0:48   agree
+//	<repo>/shim/...  (btrfs)  stat=0:49  maps=0:34   MISMATCH
+//
+// Anything checking that the producer and consumer compute the same name must
+// run where the shim really lives.
+func repoTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(".", "enrolltest")
+	require.NoError(t, err, "scratch dir on the source filesystem")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	abs, err := filepath.Abs(dir)
+	require.NoError(t, err)
+	return abs
+}
 
 // selfExe is the shim path a test listener attaches to: this process's own
 // executable, which this process therefore provably maps.
@@ -73,7 +105,10 @@ func dialEnroll(t *testing.T, shimPath string) byte {
 // two consumers watching two copies of the same shim apart. The gate makes a
 // private copy of the stub per run for exactly that reason.
 func TestTheRendezvousAddressIsTheShimsDeviceAndInode(t *testing.T) {
-	dir := t.TempDir()
+	// The source tree's filesystem, not TMPDIR: on tmpfs stat(2) and /proc
+	// report the same device and the assertions below cannot tell a
+	// stat-derived address from a /proc-derived one.
+	dir := repoTempDir(t)
 	a := filepath.Join(dir, "shim-a")
 	b := filepath.Join(dir, "shim-b")
 	require.NoError(t, os.WriteFile(a, []byte("a"), 0o600))
@@ -93,17 +128,64 @@ func TestTheRendezvousAddressIsTheShimsDeviceAndInode(t *testing.T) {
 
 	// The exact spelling is an ABI with shim/core/enroll.cc, which builds it
 	// from the decimal major/minor and inode it reads out of
-	// /proc/self/maps. Pin it here so a change on this side cannot silently
-	// stop matching the producer.
-	var st unix.Stat_t
-	require.NoError(t, unix.Stat(a, &st))
-	dev := uint64(st.Dev) //nolint:unconvert // matches enrollAddress
+	// /proc/<pid>/maps. Pin it against THAT source - not against stat(2),
+	// which is a different number for the same file on btrfs and is exactly
+	// the mistake this address derivation used to make.
+	wantDev, wantIno := mapsIdentityOf(t, a)
 	assert.Equal(t,
-		"@perfagent-gpu-enroll.v1."+itoa(uint64(unix.Major(dev)))+"."+itoa(uint64(unix.Minor(dev)))+"."+itoa(st.Ino),
+		"@perfagent-gpu-enroll.v1."+itoa(uint64(unix.Major(wantDev)))+"."+
+			itoa(uint64(unix.Minor(wantDev)))+"."+itoa(wantIno),
 		addrA)
 
+	// And on a filesystem where the two sources disagree, the address must
+	// follow /proc rather than stat(2). On tmpfs this is vacuous, which is
+	// why the fixture lives on the source tree's filesystem.
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(a, &st))
+	if statDev := uint64(st.Dev); statDev != wantDev { //nolint:unconvert // widened on some arches
+		t.Logf("stat(2) and /proc disagree here (stat=%d:%d proc=%d:%d) - the case that broke CUDA",
+			unix.Major(statDev), unix.Minor(statDev), unix.Major(wantDev), unix.Minor(wantDev))
+		assert.NotContains(t, addrA,
+			"."+itoa(uint64(unix.Major(statDev)))+"."+itoa(uint64(unix.Minor(statDev)))+".",
+			"the address was built from stat(2)'s device; the producer reads /proc and would compute a different name")
+	}
+
 	_, err = enrollAddress(filepath.Join(dir, "not-there"))
-	assert.Error(t, err, "an unstattable shim has no address, and Attach must hear about it")
+	assert.Error(t, err, "a shim that cannot be opened has no address, and Attach must hear about it")
+}
+
+// mapsIdentityOf reads the dev:inode the KERNEL reports for path in
+// /proc/self/maps, the way shim/core/enroll.cc does, independently of the
+// production helper so the test is not checking the code against itself.
+func mapsIdentityOf(t *testing.T, path string) (dev, ino uint64) {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	page, err := unix.Mmap(int(f.Fd()), 0, os.Getpagesize(), unix.PROT_READ, unix.MAP_PRIVATE)
+	require.NoError(t, err)
+	defer func() { _ = unix.Munmap(page) }()
+	at := uint64(uintptr(unsafe.Pointer(&page[0])))
+
+	raw, err := os.ReadFile("/proc/self/maps")
+	require.NoError(t, err)
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		lo, hi, ok := parseMapsRange(fields[0])
+		if !ok || at < lo || at >= hi {
+			continue
+		}
+		maj, min, ok := parseMapsDev(fields[3])
+		require.True(t, ok, "maps line: %s", line)
+		n, err := strconv.ParseUint(fields[4], 10, 64)
+		require.NoError(t, err)
+		return unix.Mkdev(maj, min), n
+	}
+	t.Fatalf("no maps line covers our own mapping of %s", path)
+	return 0, 0
 }
 
 // The property the whole change rests on: the producer is not released until
@@ -345,49 +427,82 @@ func TestTheCppProducerAndTheGoListenerAgreeOnTheWire(t *testing.T) {
 		t.Skipf("shim/core not present: %v", err)
 	}
 
-	dir := t.TempDir()
-	src := filepath.Join(dir, "producer.cc")
-	require.NoError(t, os.WriteFile(src, []byte(`
+	// BOTH filesystems, and that is the whole point of the subtests.
+	//
+	// This test existed before the second CUDA attempt and passed, while the
+	// real run failed with enroll=no-listener and UnwindEnrollRequests:0,
+	// because it built its producer in t.TempDir() - tmpfs, the one
+	// filesystem where stat(2) and /proc/<pid>/maps report the same device.
+	// The shim is built in the source tree, which on Fedora is btrfs, where
+	// they do not. See repoTempDir.
+	for _, tc := range []struct{ name, dir string }{
+		{name: "source filesystem, where the shim is really built", dir: repoTempDir(t)},
+		{name: "TMPDIR", dir: t.TempDir()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := filepath.Join(tc.dir, "producer.cc")
+			require.NoError(t, os.WriteFile(src, []byte(producerSrc), 0o600))
+			bin := filepath.Join(tc.dir, "producer")
+			build := exec.Command(cxx, "-std=c++17", "-O2", "-fvisibility=hidden",
+				"-I", core, "-o", bin, src, filepath.Join(core, "enroll.cc"))
+			if out, err := build.CombinedOutput(); err != nil {
+				t.Skipf("could not build the producer half: %v\n%s", err, out)
+			}
+
+			// The consumer's derivation for the very file the producer will
+			// map. If these two strings differ, the ends bind and dial
+			// different addresses and every counter on both sides reads zero.
+			want, err := enrollAddress(bin)
+			require.NoError(t, err)
+
+			fake := newFakeRegistrar()
+			l, r := testEnrollListener(t, bin, 0, fake)
+			require.Equal(t, want, l.address(), "the listener bound a name other than the derived one")
+
+			run := exec.Command(bin)
+			out, err := run.Output()
+			require.NoError(t, err, "producer failed: %s", out)
+			got := strings.Fields(strings.TrimSpace(string(out)))
+			require.Len(t, got, 2, "producer output: %q", out)
+
+			// Asserted before the outcome, so a mismatch reports the two
+			// names rather than just "no-listener".
+			assert.Equal(t, want, got[1],
+				"the two ends derived DIFFERENT rendezvous names for the same file under %s. "+
+					"consumer=%s producer=%s. They never exchange this string, so a mismatch makes "+
+					"every counter on both sides read zero - which is exactly how a stat(2)-derived "+
+					"device number silently disabled the whole mechanism on btrfs",
+				tc.dir, want, got[1])
+			assert.Equal(t, "confirmed", got[0],
+				"the producer got no confirmation even though both ends derived the same name (%s), "+
+					"so this is the wire protocol rather than the address", want)
+
+			pids := fake.registeredPIDs()
+			require.Len(t, pids, 1)
+			assert.Equal(t, uint64(1), l.snapshot().confirmed)
+			assert.True(t, r.ready(pids[0]))
+			assert.True(t, r.enrolled(pids[0]))
+			assert.NotEqual(t, uint32(os.Getpid()), pids[0],
+				"the registered PID is the test's own: the peer lookup is not reading the peer")
+		})
+	}
+}
+
+// producerSrc is the shim's producer half in miniature: derive the name, print
+// it, run the rendezvous, print the outcome. Kept out of the test body so the
+// C++ braces cannot be confused for Go ones by anything editing this file.
+const producerSrc = `
 #include "enroll.h"
 #include <cstdio>
 int main() {
-    // Unconditional: in a real producer this is gated on the sampled-launch
-    // probe's semaphore, which needs a live uprobe to arm.
-    printf("%s\n", perfagent::enroll_result_name(
-        perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(5000))));
+    char name[128];
+    if (!perfagent::enroll_self_name(name, sizeof(name))) { printf("no-address -\n"); return 1; }
+    const perfagent::EnrollResult r =
+        perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(5000));
+    printf("%s @%s\n", perfagent::enroll_result_name(r), name);
     return 0;
 }
-`), 0o600))
-	// Built where the test runs, not in /tmp only, so the binary's device and
-	// inode are ordinary ones; the address embeds both.
-	bin := filepath.Join(dir, "producer")
-	build := exec.Command(cxx, "-std=c++17", "-O2", "-fvisibility=hidden",
-		"-I", core, "-o", bin, src, filepath.Join(core, "enroll.cc"))
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Skipf("could not build the producer half: %v\n%s", err, out)
-	}
-
-	fake := newFakeRegistrar()
-	l, r := testEnrollListener(t, bin, 0, fake)
-
-	run := exec.Command(bin)
-	out, err := run.Output()
-	require.NoError(t, err, "producer failed: %s", out)
-
-	assert.Equal(t, "confirmed\n", string(out),
-		"the producer did not get a confirmation. Either the two ends spell the socket name differently - C++ builds it from /proc/self/maps, Go from stat(2) - or the reply byte changed on one side only")
-
-	// And the consumer registered the process that was waiting, not some
-	// other one: the PID came from SO_PEERCRED, and the producer sent no
-	// payload at all.
-	pids := fake.registeredPIDs()
-	require.Len(t, pids, 1)
-	assert.Equal(t, uint64(1), l.snapshot().confirmed)
-	assert.True(t, r.ready(pids[0]))
-	assert.True(t, r.enrolled(pids[0]))
-	assert.NotEqual(t, uint32(os.Getpid()), pids[0],
-		"the registered PID is the test's own: the peer lookup is not reading the peer")
-}
+`
 
 // The rendezvous serves one producer at a time, so the cost of admitting one
 // is the cost of blocking every other. Any local user who can map the shim

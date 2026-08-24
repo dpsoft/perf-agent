@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
@@ -233,13 +234,111 @@ func refillTokens(tokens float64, since, now time.Time, perSec, max float64) flo
 // from the same two numbers the kernel reports for the file, so they agree
 // without exchanging anything.
 func enrollAddress(shimPath string) (string, error) {
-	var st unix.Stat_t
-	if err := unix.Stat(shimPath, &st); err != nil {
-		return "", fmt.Errorf("stat shim %s: %w", shimPath, err)
+	dev, ino, err := enrollShimIdentity(shimPath)
+	if err != nil {
+		return "", err
 	}
-	dev := uint64(st.Dev) //nolint:unconvert // st.Dev is uint64 on amd64, uint32-widened elsewhere
+	return enrollAddressFor(dev, ino), nil
+}
+
+// enrollAddressFor is the one place the name is spelled, so the two callers
+// that need it - the listener's bind and the tests' dial - cannot drift.
+func enrollAddressFor(dev, ino uint64) string {
 	return fmt.Sprintf("@perfagent-gpu-enroll.v1.%d.%d.%d",
-		unix.Major(dev), unix.Minor(dev), st.Ino), nil
+		unix.Major(dev), unix.Minor(dev), ino)
+}
+
+// enrollShimIdentity returns the device and inode of shimPath AS
+// /proc/<pid>/maps reports them, by mapping the file and reading our own maps.
+//
+// # Why not stat(2), which is obviously the right call
+//
+// Because on btrfs it returns a different device, and the rendezvous then has
+// two ends computing two different socket names and never meeting. Measured on
+// this machine, same file, same instant:
+//
+//	/tmp/file            (tmpfs)  stat=0:48  maps=0:48   agree
+//	<repo>/shim/...      (btrfs)  stat=0:49  maps=0:34   MISMATCH
+//	/bin/true            (btrfs)  stat=0:36  maps=0:34   MISMATCH
+//
+// They are genuinely different numbers, not a parsing bug. btrfs_getattr sets
+// stat->dev to the SUBVOLUME's anonymous device, while show_map_vma prints
+// inode->i_sb->s_dev, the filesystem's. Every btrfs subvolume gets its own
+// anon_dev, so the two disagree for every file on a btrfs root - which is the
+// Fedora default, and where the shim is built.
+//
+// This is what made the second CUDA attempt fail with enroll=no-listener and
+// UnwindEnrollRequests:0 while both GPU-free gates passed: the gates put their
+// shim copy in t.TempDir(), i.e. /tmp, i.e. tmpfs, where the two numbers agree.
+//
+// So the consumer derives its identity through exactly the mechanism the
+// producer uses - map the file, ask /proc what the kernel calls it - and the
+// two cannot disagree by construction. shim/core/enroll.cc reads the same
+// field of the same file for the mapping that contains its own code.
+func enrollShimIdentity(shimPath string) (dev, ino uint64, err error) {
+	f, err := os.Open(shimPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open shim %s: %w", shimPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// One page, read-only, private: enough for the kernel to create a vma
+	// whose maps line names the file. Never dereferenced.
+	page, err := unix.Mmap(int(f.Fd()), 0, os.Getpagesize(),
+		unix.PROT_READ, unix.MAP_PRIVATE)
+	if err != nil {
+		return 0, 0, fmt.Errorf("mmap shim %s: %w", shimPath, err)
+	}
+	defer func() { _ = unix.Munmap(page) }()
+	at := uint64(uintptr(unsafe.Pointer(&page[0])))
+
+	maps, err := os.Open("/proc/self/maps")
+	if err != nil {
+		return 0, 0, fmt.Errorf("open /proc/self/maps: %w", err)
+	}
+	defer func() { _ = maps.Close() }()
+
+	sc := bufio.NewScanner(maps)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		lo, hi, ok := parseMapsRange(fields[0])
+		if !ok || at < lo || at >= hi {
+			continue
+		}
+		maj, min, ok := parseMapsDev(fields[3])
+		if !ok {
+			continue
+		}
+		gotIno, perr := strconv.ParseUint(fields[4], 10, 64)
+		if perr != nil || gotIno == 0 {
+			continue
+		}
+		return unix.Mkdev(maj, min), gotIno, nil
+	}
+	if err := sc.Err(); err != nil {
+		return 0, 0, fmt.Errorf("read /proc/self/maps: %w", err)
+	}
+	return 0, 0, fmt.Errorf("shim %s: own mapping not found in /proc/self/maps", shimPath)
+}
+
+// parseMapsRange splits the "lo-hi" address field of a maps line.
+func parseMapsRange(field string) (lo, hi uint64, ok bool) {
+	l, h, cut := strings.Cut(field, "-")
+	if !cut {
+		return 0, 0, false
+	}
+	lv, err := strconv.ParseUint(l, 16, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	hv, err := strconv.ParseUint(h, 16, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return lv, hv, true
 }
 
 // enrollStats is the listener's slice of gpuprobe.Stats, under its own lock.
@@ -254,8 +353,15 @@ type enrollStats struct {
 
 // enrollListener serves the producer-side rendezvous for one consumer.
 type enrollListener struct {
-	ln  *net.UnixListener
-	reg *pidRegistry
+	ln *net.UnixListener
+	// addr is the name this listener actually bound, surfaced as
+	// Stats.UnwindEnrollAddress. It exists because "listening, nobody came"
+	// and "the producer computed a different name" are indistinguishable from
+	// the counters alone - every one of them reads zero either way - and
+	// telling those two apart is what a whole CUDA round trip was spent on.
+	// Printing the string both ends derive turns that into one glance.
+	addr string
+	reg  *pidRegistry
 	// pid mirrors Config.PID: non-zero means this consumer's uprobes are
 	// filtered to one process, so an enrollment from any other PID is
 	// refused. The socket name is not PID-scoped and cannot be.
@@ -301,24 +407,25 @@ func newEnrollListener(cfg Config, reg *pidRegistry) (*enrollListener, error) {
 // lock precisely because only the serving goroutine reaches it, and a test
 // that reached in while it ran would be racing the code it is checking.
 func buildEnrollListener(cfg Config, reg *pidRegistry) (*enrollListener, error) {
-	addr, err := enrollAddress(cfg.ShimPath)
+	// One derivation, used for BOTH the address and the peer identity check.
+	// They have to be the same numbers: a consumer that bound one device and
+	// checked peers against another would refuse every genuine producer.
+	dev, ino, err := enrollShimIdentity(cfg.ShimPath)
 	if err != nil {
 		return nil, err
 	}
-	var st unix.Stat_t
-	if err := unix.Stat(cfg.ShimPath, &st); err != nil {
-		return nil, fmt.Errorf("stat shim %s: %w", cfg.ShimPath, err)
-	}
+	addr := enrollAddressFor(dev, ino)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: addr, Net: "unix"})
 	if err != nil {
 		return nil, fmt.Errorf("bind %s: %w", addr, err)
 	}
 	l := &enrollListener{
 		ln:         ln,
+		addr:       addr,
 		reg:        reg,
 		pid:        uint32(cfg.PID),
-		dev:        uint64(st.Dev), //nolint:unconvert // see enrollAddress
-		ino:        st.Ino,
+		dev:        dev,
+		ino:        ino,
 		procRoot:   "/proc",
 		admit:      newEnrollAdmission(nil),
 		requireUID: enrollRequiredUID(),
@@ -458,6 +565,14 @@ func (l *enrollListener) snapshot() enrollStats {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.stats
+}
+
+// address is the bound rendezvous name, or "" when nothing is bound.
+func (l *enrollListener) address() string {
+	if l == nil {
+		return ""
+	}
+	return l.addr
 }
 
 // close stops accepting and waits for the goroutine. Safe on a nil listener

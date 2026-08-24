@@ -87,25 +87,72 @@ perfagent-gpu-fpless: stub/fpless_bridge.cc stub/fpless_main.cc stub/stub.cc $(C
 #   3. perfagent_stub_run must KEEP its frame pointer, since the walk's first
 #      step is an FP step out of its frame.
 .PHONY: check-fpless
-check-fpless: perfagent-gpu-fpless
-	@rc=0; for fn in perfagent_fpless_bridge perfagent_fpless_caller; do \
-	  objdump -d --no-show-raw-insn perfagent-gpu-fpless \
+check-fpless: perfagent-gpu-fpless libperfagent-gpu-fpless.so
+	@rc=0; for img in perfagent-gpu-fpless libperfagent-gpu-fpless.so; do \
+	 echo "== $$img"; \
+	 for fn in perfagent_fpless_bridge perfagent_fpless_caller; do \
+	  objdump -d --no-show-raw-insn $$img \
 	    | awk -v f="<$$fn>:" 'index($$0,f){g=1;next} g&&/^$$/{exit} g' > /tmp/fpless_$$fn.asm; \
-	  if [ ! -s /tmp/fpless_$$fn.asm ]; then echo "$$fn: not found in the binary"; rc=1; continue; fi; \
+	  if [ ! -s /tmp/fpless_$$fn.asm ]; then echo "$$img: $$fn: not found in the binary"; rc=1; continue; fi; \
 	  if grep -q 'mov  *%rsp,%rbp' /tmp/fpless_$$fn.asm; then \
 	    echo "$$fn: establishes a frame pointer; -fomit-frame-pointer did not take"; rc=1; fi; \
 	  if grep -qE ',%rbp|%rbp,|pop  *%rbp|push  *%rbp' /tmp/fpless_$$fn.asm; then \
 	    echo "$$fn: touches %rbp; the FP chain into perfagent_stub_run would be poisoned"; \
 	    grep -nE ',%rbp|%rbp,|%rbp' /tmp/fpless_$$fn.asm; rc=1; fi; \
-	  echo "$$fn: no frame pointer, %rbp untouched"; \
+	  echo "$$img: $$fn: no frame pointer, %rbp untouched"; \
+	 done; \
+	 objdump -d --no-show-raw-insn $$img \
+	   | awk 'index($$0,"<perfagent_stub_run>:"){g=1;next} g&&/^$$/{exit} g' | head -4 > /tmp/fpless_stubrun.asm; \
+	 grep -q 'mov  *%rsp,%rbp' /tmp/fpless_stubrun.asm || { \
+	   echo "$$img: perfagent_stub_run: no frame pointer; the walk's first FP step would fail"; rc=1; }; \
+	 readelf -S $$img | grep -q '\.eh_frame' || { \
+	   echo "$$img: no .eh_frame: the DWARF walker has nothing to read"; rc=1; }; \
 	done; \
-	objdump -d --no-show-raw-insn perfagent-gpu-fpless \
-	  | awk 'index($$0,"<perfagent_stub_run>:"){g=1;next} g&&/^$$/{exit} g' | head -4 > /tmp/fpless_stubrun.asm; \
-	grep -q 'mov  *%rsp,%rbp' /tmp/fpless_stubrun.asm || { \
-	  echo "perfagent_stub_run: no frame pointer; the walk's first FP step would fail"; rc=1; }; \
-	readelf -S perfagent-gpu-fpless | grep -q '\.eh_frame' || { \
-	  echo "no .eh_frame: the DWARF walker has nothing to read"; rc=1; }; \
 	[ $$rc -eq 0 ] && echo "check-fpless: OK"; exit $$rc
+
+# The CUDA shape without CUDA: a host that DLOPENS the producer .so instead of
+# being it. stub/dlopen_host.cc explains why the gate needs this as well as
+# perfagent-gpu-fpless -- an exec'd producer cannot exercise the kernel path on
+# which issue #49's first fix silently did nothing.
+#
+# -fno-omit-frame-pointer and -g on both halves: the walk has to cross from the
+# producer .so into the host executable for the #39 attribution guard to pass,
+# which is the same boundary the CUDA run crosses and the plain stub has no
+# equivalent of.
+# The producer .so the dlopen host loads, with FP-LESS frames between the probe
+# and the host's main -- the CUDA shape, and the reason this is a separate .so
+# from libperfagent-gpu-stub.so.
+#
+# The first version of the dlopen gate loaded libperfagent-gpu-stub.so, which is
+# built with frame pointers throughout, and reported dwarf=0 fp-only=63 with
+# no-tables=0: the tables were installed and NO walk ever needed them. That is
+# legitimate for that producer -- walk_step only sets WALKER_FLAG_DWARF_USED for
+# a frame it classified FP_LESS -- but it means the gate proved the rendezvous
+# fired and proved nothing about the DWARF unwinding the rendezvous exists to
+# feed. A real CUDA stack crosses libcupti and libcudart, which have no frame
+# pointers; this .so reproduces that with stub/fpless_bridge.cc.
+#
+#   host main                 frame pointer      <- the walk must reach here
+#   perfagent_fpless_caller   NO frame pointer      DWARF only
+#   perfagent_fpless_bridge   NO frame pointer      DWARF only
+#   perfagent_stub_run        frame pointer      <- the probe fires here
+#
+# check-fpless proves the toolchain actually omitted those frame pointers, for
+# this .so as well as for the executable.
+libperfagent-gpu-fpless.so: stub/fpless_bridge.cc stub/stub.cc $(CORE_SRC)
+	$(CXX) $(CXXFLAGS) -g -pthread -I core -fomit-frame-pointer \
+		-fasynchronous-unwind-tables -c stub/fpless_bridge.cc -o stub/so_fpless_bridge.o
+	$(CXX) $(CXXFLAGS) -g -pthread -I core -fno-omit-frame-pointer \
+		-fasynchronous-unwind-tables -DPERFAGENT_STUB_NO_MAIN \
+		-c stub/stub.cc -o stub/so_fpless_stub.o
+	$(CXX) $(CXXFLAGS) -g -pthread -fno-omit-frame-pointer -shared -o $@ \
+		stub/so_fpless_bridge.o stub/so_fpless_stub.o $(CORE_SRC)
+
+perfagent-gpu-dlopen-host: stub/dlopen_host.cc
+	$(CXX) $(CXXFLAGS) -g -fno-omit-frame-pointer -fasynchronous-unwind-tables \
+		-o $@ stub/dlopen_host.cc -ldl
+
+libperfagent-gpu-stub.so: CXXFLAGS += -g -fno-omit-frame-pointer -fasynchronous-unwind-tables
 
 # The CUPTI adapter. The CUDA driver dlopens this through CUDA_INJECTION64_PATH
 # into a process that links no CUPTI of its own, so the rpath is load-bearing:
@@ -162,5 +209,7 @@ test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc co
 
 clean:
 	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so \
+		perfagent-gpu-dlopen-host libperfagent-gpu-fpless.so \
+		stub/so_fpless_bridge.o stub/so_fpless_stub.o \
 		perfagent-gpu-fpless stub/fpless_bridge.o stub/fpless_main.o stub/fpless_stub.o \
 		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload

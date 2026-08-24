@@ -44,6 +44,16 @@
 // True when a consumer is attached. Every emit path checks this first.
 #define PERFAGENT_USDT_ENABLED(name) (perfagent_##name##_semaphore != 0)
 
+// The raw semaphore count, for diagnosis rather than for control.
+//
+// "Is a consumer attached?" and "has the kernel got round to telling this
+// process so?" are different questions, and issue #49's first fix conflated
+// them: it gated the startup rendezvous on PERFAGENT_USDT_ENABLED, which on
+// the CUDA path read zero at InitializeInjection time even though the probes
+// fired perfectly later. Reading the count out lets a producer report when
+// the semaphore actually armed instead of anyone inferring it.
+#define PERFAGENT_USDT_SEMAPHORE_COUNT(name) ((unsigned)perfagent_##name##_semaphore)
+
 // The "memory" clobber is load-bearing, not defensive. `ptr` reaches the asm
 // as a plain integer in a register: an operand list without it says the asm
 // touches no memory at all, so the compiler may sink — or delete outright —
@@ -100,6 +110,9 @@
     static_assert(sizeof(struct name) == (wire_size),                       \
                   #name " record size is frozen; the BPF cookie assumes it");\
     static bool name##_enabled() { return PERFAGENT_USDT_ENABLED(name); }   \
+    __attribute__((unused)) static unsigned name##_semaphore_count() {      \
+        return PERFAGENT_USDT_SEMAPHORE_COUNT(name);                        \
+    }                                                                       \
     static void name##_emit(const struct name *ptr, unsigned long count,    \
                             unsigned long seq) {                            \
         PERFAGENT_USDT_PROBE3(name, ptr, count, seq);                       \

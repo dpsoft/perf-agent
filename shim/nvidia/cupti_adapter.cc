@@ -388,7 +388,7 @@ void report(const char *why) {
          "activity_kernels=%llu activity_other=%llu buffers=%llu buffer_alloc_failed=%llu "
          "exec_unattached=%llu exec_batch_dropped=%llu exec_no_clock=%llu "
          "exec_no_time=%llu cupti_dropped=%llu names=%zu "
-         "clock_steps=%llu clock_offset_ns=%lld\n",
+         "clock_steps=%llu clock_offset_ns=%lld sem_at_exit=%u\n",
          why, (int)getpid(),
          (unsigned long long)g_sampler->observed(),
          (unsigned long long)g_sampler->sampled(), g_sampler->period(),
@@ -405,7 +405,8 @@ void report(const char *why) {
          (unsigned long long)g_cupti_dropped.load(),
          g_names->size(),
          (unsigned long long)g_clock.steps(),
-         (long long)g_clock.offset_ns());
+         (long long)g_clock.offset_ns(),
+         gpu_launch_sampled_v1_semaphore_count());
     for (unsigned i = 0; i < kResourceCbidMax; i++) {
         const uint64_t n = g_resource_events[i].load();
         if (n) logf("perfagent-cupti: resource cbid=%u count=%llu\n", i,
@@ -510,13 +511,34 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // this process before it completes -- not even from another thread
     // already inside a CUDA call.
     //
-    // Only when a consumer is attached (the semaphore is what says so, and it
-    // was armed by the kernel when this library was mapped), bounded by
-    // PERFAGENT_GPU_ENROLL_TIMEOUT_MS, and never fatal: see core/enroll.h.
-    perfagent::EnrollResult enrolled = perfagent::kEnrollDisabled;
-    if (gpu_launch_sampled_v1_enabled()) {
-        enrolled = perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
-    }
+    // NOT gated on the probe semaphore, and that is the whole of issue #49's
+    // second fix. The first version ran the rendezvous only under
+    // gpu_launch_sampled_v1_enabled(), and on the RTX 3090 that read ZERO
+    // here - 500 launches were sampled and 4000 probes fired later in the
+    // same process, so the semaphore armed, just not by the time the driver
+    // called InitializeInjection. Measured: UnwindEnrollRequests was 0 across
+    // three runs and NoTables was unchanged at ~175/500.
+    //
+    // The semaphore answers "has the kernel told this process yet", not "is a
+    // consumer attached". Under CUDA_INJECTION64_PATH this function runs
+    // essentially the instant libcuda dlopens us, which is the earliest point
+    // that question can be asked and the least likely to be answered yet.
+    //
+    // The connect is the gate instead, and it is a better one: the consumer
+    // binds the rendezvous BEFORE it creates the uprobe link, so it is
+    // listening whenever profiling is happening, and an unbound abstract
+    // address refuses immediately in an unprofiled process. sem_at_init is
+    // recorded so the arming time stays visible rather than inferred.
+    const unsigned sem_at_init = gpu_launch_sampled_v1_semaphore_count();
+    // Logged BEFORE the attempt: the two ends derive this name independently
+    // and never exchange it, so when they disagree every counter on both sides
+    // reads zero and nothing says why. Compare it against
+    // Stats.UnwindEnrollAddress.
+    char enroll_name[128];
+    if (!perfagent::enroll_self_name(enroll_name, sizeof(enroll_name)))
+        snprintf(enroll_name, sizeof(enroll_name), "<no-address>");
+    perfagent::EnrollResult enrolled =
+        perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
 
     // Leaked on purpose, never deleted: CUPTI worker threads keep calling
     // buffer_completed during process teardown, and a destroyed Batch or
@@ -558,10 +580,15 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // the exact set of sampled launch ordinals is replayable offline
     // (internal/gpuabi.SampleSchedule). Without it a run using a non-default
     // seed could not be audited after the fact.
+    //
+    // sem_at_init vs sem_after_init is the measurement #49 needed: the first
+    // fix gated the rendezvous on the semaphore and lost the CUDA path.
     logf("perfagent-cupti: initialized pid=%d sample_period=%u sample_seed=0x%016llx "
-         "drain_ms=%u clock_offset_ns=%lld enroll=%s\n",
+         "drain_ms=%u clock_offset_ns=%lld enroll=%s sem_at_init=%u sem_after_init=%u "
+         "enroll_addr=@%s\n",
          (int)getpid(), g_sampler->period(),
          (unsigned long long)g_sampler->seed(), drain_ms, (long long)g_clock.offset_ns(),
-         perfagent::enroll_result_name(enrolled));
+         perfagent::enroll_result_name(enrolled), sem_at_init,
+         gpu_launch_sampled_v1_semaphore_count(), enroll_name);
     return 1;
 }

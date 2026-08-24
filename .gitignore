@@ -79,8 +79,11 @@ pmu.txt
 
 ### Project binaries ###
 perf-agent
-# GPU shim stub executable (the .so/.a/.o forms are covered above)
+# GPU shim executables (the .so/.a/.o forms are covered above; these have no
+# extension for those rules to catch). Built by `make -C shim`.
 shim/perfagent-gpu-stub
+shim/perfagent-gpu-fpless
+shim/perfagent-gpu-dlopen-host
 # The frame-pointer-less producer the phase gate drives, same story
 shim/perfagent-gpu-fpless
 # The CUDA test workload the NVIDIA adapter is proven against: built by

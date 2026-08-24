@@ -41,6 +41,20 @@ type Config struct {
 	// are written; off-CPU and PMU modes ignore this option.
 	PerfDataOutput string
 
+	// CPUFlamegraphPath is the path for a self-contained HTML flame graph
+	// rendered from the CPU profile this run writes. Empty disables it.
+	// Set via WithCPUFlamegraph.
+	//
+	// The renderer reads back the pprof file the agent just wrote, so it
+	// only runs when the profile went to a path. With CPUProfileWriter
+	// there is no file to re-read and the agent says so rather than
+	// quietly skipping.
+	CPUFlamegraphPath string
+
+	// OffCPUFlamegraphPath is the same for the off-CPU profile. Set via
+	// WithOffCPUFlamegraph.
+	OffCPUFlamegraphPath string
+
 	// EnablePMU enables PMU hardware counter monitoring.
 	EnablePMU bool
 
@@ -299,6 +313,22 @@ func WithOffCPUProfileWriter(w io.Writer) Option {
 // create_llvm_prof (AutoFDO PGO), FlameGraph, hotspot, etc.
 func WithPerfDataOutput(path string) Option {
 	return func(c *Config) { c.PerfDataOutput = path }
+}
+
+// WithCPUFlamegraph writes a self-contained interactive HTML flame graph of
+// the CPU profile, alongside the .pb.gz. One file, no external scripts or
+// fonts, correct when opened straight off disk.
+//
+// Requires CPU profiling to be writing to a path: the flame graph is
+// rendered from the profile file after it is written, not from a second
+// in-memory path, so what you look at is the artifact you were given.
+func WithCPUFlamegraph(path string) Option {
+	return func(c *Config) { c.CPUFlamegraphPath = path }
+}
+
+// WithOffCPUFlamegraph is WithCPUFlamegraph for the off-CPU profile.
+func WithOffCPUFlamegraph(path string) Option {
+	return func(c *Config) { c.OffCPUFlamegraphPath = path }
 }
 
 // WithDebuginfodURL appends a debuginfod server URL. Repeatable.

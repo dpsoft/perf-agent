@@ -902,14 +902,24 @@ func TestPMUIOWorkloadHasIOWait(t *testing.T) {
 
 	outputStr := string(output)
 
-	// I/O workload should show some I/O wait or voluntary sleep
-	// (file operations cause both)
-	hasIOActivity := false
-	if assert.Contains(t, outputStr, "I/O Wait (D state):") ||
-		assert.Contains(t, outputStr, "Voluntary (sleep/mutex):") {
-		hasIOActivity = true
-	}
-	assert.True(t, hasIOActivity, "I/O workload should show I/O or voluntary sleep activity")
+	// An I/O workload should show I/O wait or voluntary sleep; file
+	// operations cause both.
+	//
+	// strings.Contains, not assert.Contains: assert.Contains records a
+	// failure on t as a side effect and returns a bool, so writing this as
+	// `if assert.Contains(...) || assert.Contains(...)` marked the test
+	// failed on the first branch before the second was ever considered -
+	// the || read as a tolerance but never tolerated anything, and a
+	// genuine miss recorded three failures for one condition.
+	//
+	// Note this is a weaker check than it appears: metrics/console.go
+	// prints both lines inside one `if totalSwitches > 0` block, so they
+	// appear together or not at all. What it really asserts is that some
+	// context switch was recorded. See issue #63.
+	hasIOActivity := strings.Contains(outputStr, "I/O Wait (D state):") ||
+		strings.Contains(outputStr, "Voluntary (sleep/mutex):")
+	assert.True(t, hasIOActivity,
+		"I/O workload should report I/O wait or voluntary sleep; output had neither line:\n%s", outputStr)
 }
 
 func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {

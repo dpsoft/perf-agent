@@ -28,6 +28,11 @@ var (
 	flagProfileOutput  = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
 	flagOffcpuOutput   = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
 	flagPMUOutput      = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagFlamegraph     = flag.String("flamegraph-output", "",
+		"Also write a self-contained interactive HTML flame graph of the profile. "+
+			"Pass a path, or 'auto' to name it like the other outputs "+
+			"({process}-{timestamp}-{on-cpu|off-cpu}.html). With both --profile and "+
+			"--offcpu, only 'auto' is accepted: one path cannot name two graphs.")
 	flagPerfDataOutput = flag.String("perf-data-output", "",
 		"Write a kernel-format perf.data file alongside the pprof output. "+
 			"Consumable by perf script, perf report, create_llvm_prof (AutoFDO PGO), "+
@@ -165,12 +170,27 @@ func buildOptions() []perfagent.Option {
 		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
 	}
 
+	// --flamegraph-output names at most one file, so with both stack
+	// profiling modes on it can only be "auto". Silently rendering one mode
+	// and dropping the other would leave a plausible-looking graph that is
+	// missing half the run.
+	if *flagFlamegraph != "" && *flagFlamegraph != "auto" && *flagProfile && *flagOffCpu {
+		log.Fatal("--flamegraph-output with an explicit path cannot serve both --profile and --offcpu; use --flamegraph-output auto, or run one mode at a time")
+	}
+	if *flagFlamegraph != "" && !*flagProfile && !*flagOffCpu {
+		log.Fatal("--flamegraph-output requires --profile or --offcpu; there is no stack profile to render")
+	}
+
 	if *flagProfile {
 		outputPath := *flagProfileOutput
 		if outputPath == "" {
 			outputPath = generateOutputName(*flagPID, *flagAll, "on-cpu", "pb.gz")
 		}
 		opts = append(opts, perfagent.WithCPUProfile(outputPath))
+
+		if path := flamegraphPath(*flagFlamegraph, "on-cpu"); path != "" {
+			opts = append(opts, perfagent.WithCPUFlamegraph(path))
+		}
 
 		if *flagPerfDataOutput != "" {
 			opts = append(opts, perfagent.WithPerfDataOutput(*flagPerfDataOutput))
@@ -183,6 +203,10 @@ func buildOptions() []perfagent.Option {
 			outputPath = generateOutputName(*flagPID, *flagAll, "off-cpu", "pb.gz")
 		}
 		opts = append(opts, perfagent.WithOffCPUProfile(outputPath))
+
+		if path := flamegraphPath(*flagFlamegraph, "off-cpu"); path != "" {
+			opts = append(opts, perfagent.WithOffCPUFlamegraph(path))
+		}
 	}
 
 	if *flagPMU {
@@ -260,6 +284,21 @@ func buildOptions() []perfagent.Option {
 	}
 
 	return opts
+}
+
+// flamegraphPath resolves --flamegraph-output for one profiling mode.
+// "auto" follows the same naming convention as the other outputs, which is
+// also what --pmu-output auto does; an explicit path is used verbatim, and
+// buildOptions has already rejected the one case where that is ambiguous.
+func flamegraphPath(flagValue, suffix string) string {
+	switch flagValue {
+	case "":
+		return ""
+	case "auto":
+		return generateOutputName(*flagPID, *flagAll, suffix, "html")
+	default:
+		return flagValue
+	}
 }
 
 func generateOutputName(pid int, systemWide bool, suffix, ext string) string {

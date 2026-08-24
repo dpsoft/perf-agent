@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/inject/ptraceop"
 	"github.com/dpsoft/perf-agent/inject/python"
+	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
 	"github.com/dpsoft/perf-agent/internal/perfdata"
@@ -634,9 +636,13 @@ func (a *Agent) Stop(ctx context.Context) error {
 				log.Printf("Failed to write CPU profile: %v", err)
 				lastErr = err
 			}
+			a.warnFlamegraphNeedsPath(a.config.CPUFlamegraphPath, "CPU")
 		} else {
 			if err := a.cpuProfiler.CollectAndWrite(a.config.CPUProfilePath); err != nil {
 				log.Printf("Failed to write CPU profile: %v", err)
+				lastErr = err
+			} else if err := a.writeFlamegraph(a.config.CPUProfilePath, a.config.CPUFlamegraphPath, "on-CPU"); err != nil {
+				log.Printf("Failed to write CPU flame graph: %v", err)
 				lastErr = err
 			}
 		}
@@ -649,9 +655,13 @@ func (a *Agent) Stop(ctx context.Context) error {
 				log.Printf("Failed to write off-CPU profile: %v", err)
 				lastErr = err
 			}
+			a.warnFlamegraphNeedsPath(a.config.OffCPUFlamegraphPath, "off-CPU")
 		} else {
 			if err := a.offcpuProfiler.CollectAndWrite(a.config.OffCPUProfilePath); err != nil {
 				log.Printf("Failed to write off-CPU profile: %v", err)
+				lastErr = err
+			} else if err := a.writeFlamegraph(a.config.OffCPUProfilePath, a.config.OffCPUFlamegraphPath, "off-CPU"); err != nil {
+				log.Printf("Failed to write off-CPU flame graph: %v", err)
 				lastErr = err
 			}
 		}
@@ -664,6 +674,54 @@ func (a *Agent) Stop(ctx context.Context) error {
 	}
 
 	return lastErr
+}
+
+// writeFlamegraph renders htmlPath from the pprof file just written to
+// profilePath. It is a no-op when no flame graph was requested.
+//
+// Every honest number the page carries is also echoed to the terminal. A
+// profile that folded to nothing still produces a page - one that says so -
+// and still logs why, because a silently empty flame graph is exactly the
+// failure this feature must not add.
+func (a *Agent) writeFlamegraph(profilePath, htmlPath, mode string) error {
+	if htmlPath == "" {
+		return nil
+	}
+	res, err := flamegraph.FromProfileFile(profilePath, htmlPath, flamegraph.Options{
+		Title: fmt.Sprintf("%s flame graph - %s", mode, filepath.Base(profilePath)),
+		Meta: []flamegraph.MetaItem{
+			{Label: "mode", Value: mode},
+			{Label: "target", Value: a.targetDescription()},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	log.Printf("Flame graph written to %s (%s across %d samples in %d distinct stacks)",
+		htmlPath, flamegraph.FormatValue(res.Total, res.Unit), res.Samples, len(res.Stacks))
+	for _, w := range res.Warnings {
+		log.Printf("Flame graph note: %s", w)
+	}
+	return nil
+}
+
+// warnFlamegraphNeedsPath says out loud why no flame graph appeared. The
+// writer-based options hand the profile to an io.Writer the agent cannot
+// re-read, so there is nothing to render from; staying quiet about it would
+// look identical to the flag having worked.
+func (a *Agent) warnFlamegraphNeedsPath(htmlPath, mode string) {
+	if htmlPath == "" {
+		return
+	}
+	log.Printf("No %s flame graph written to %s: this run streams the profile to a writer rather than a file, and the renderer reads the written profile back. Use the path-based profile option to get one.", mode, htmlPath)
+}
+
+// targetDescription is the header chip naming what was profiled.
+func (a *Agent) targetDescription() string {
+	if a.config.SystemWide {
+		return "system-wide"
+	}
+	return fmt.Sprintf("pid %d", a.config.PID)
 }
 
 // GetMetrics returns the current PMU metrics snapshot.

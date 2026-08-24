@@ -55,3 +55,28 @@ func TestWithPerfDataOutput_SetsConfig(t *testing.T) {
 		t.Errorf("PerfDataOutput = %q, want %q", cfg.PerfDataOutput, "app.perf.data")
 	}
 }
+
+func TestWithCPUFlamegraph_SetsConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.CPUFlamegraphPath != "" {
+		t.Fatalf("CPUFlamegraphPath should default to off, got %q", cfg.CPUFlamegraphPath)
+	}
+	WithCPUFlamegraph("app-on-cpu.html")(cfg)
+	if cfg.CPUFlamegraphPath != "app-on-cpu.html" {
+		t.Errorf("CPUFlamegraphPath = %q, want %q", cfg.CPUFlamegraphPath, "app-on-cpu.html")
+	}
+	if cfg.OffCPUFlamegraphPath != "" {
+		t.Errorf("WithCPUFlamegraph must not touch the off-CPU path, got %q", cfg.OffCPUFlamegraphPath)
+	}
+}
+
+func TestWithOffCPUFlamegraph_SetsConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	WithOffCPUFlamegraph("app-off-cpu.html")(cfg)
+	if cfg.OffCPUFlamegraphPath != "app-off-cpu.html" {
+		t.Errorf("OffCPUFlamegraphPath = %q, want %q", cfg.OffCPUFlamegraphPath, "app-off-cpu.html")
+	}
+	if cfg.CPUFlamegraphPath != "" {
+		t.Errorf("WithOffCPUFlamegraph must not touch the CPU path, got %q", cfg.CPUFlamegraphPath)
+	}
+}

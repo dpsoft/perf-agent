@@ -108,6 +108,25 @@ For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to
 
 See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walkthrough.
 
+#### Built-in HTML flame graph
+
+`--flamegraph-output auto` writes an interactive flame graph beside the pprof file — one HTML file, no server, no CDN, no external script or font, correct opened straight off disk. Click a frame to zoom, `/` to search, `Esc` to clear then reset.
+
+```bash
+sudo ./perf-agent --pid 1234 --profile --flamegraph-output auto --duration 30s
+```
+
+To render a profile written earlier, or one from any other pprof producer:
+
+```bash
+go run ./cmd/flamegraph -o profile.html profile.pb.gz
+go run ./cmd/flamegraph -folded profile.pb.gz     # the a;b;c 123 text form
+```
+
+Colour encodes **domain** — application, libc/startup, GPU runtime, unsymbolized, perf-agent's own shim, the `[gpu:launch]` CPU→GPU boundary, GPU kernel — not a hash of the frame name, and the page carries a legend saying so.
+
+The page also states what it is *not* showing: the count of frames with no symbol, the share of GPU time sitting under `[gpu:launch unsampled]` with no CPU caller, the launch sampling period and what it does to the widths, and every per-sample label that is deliberately kept out of the tree. A profile with no samples renders a page that says so rather than an empty rectangle.
+
 ---
 
 ## Requirements
@@ -211,6 +230,7 @@ For Python workloads, see [docs/python-profiling.md](docs/python-profiling.md).
 | `--profile-output` | Output path for CPU profile | auto-named |
 | `--offcpu-output` | Output path for off-CPU profile | auto-named |
 | `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
+| `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile` or `--offcpu`. | - |
 | `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
 | `--inject-python` | Activate Python 3.12+ perf trampoline on the target before profiling | `false` |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
@@ -235,6 +255,7 @@ Output files are auto-named by process name + timestamp + profile type:
 | `--profile` | `myapp-202604021430-on-cpu.pb.gz` | `202604021430-on-cpu.pb.gz` |
 | `--offcpu` | `myapp-202604021430-off-cpu.pb.gz` | `202604021430-off-cpu.pb.gz` |
 | `--pmu-output auto` | `myapp-202604021430-pmu.txt` | `202604021430-pmu.txt` |
+| `--flamegraph-output auto` | `myapp-202604021430-on-cpu.html` | `202604021430-on-cpu.html` |
 
 Process name comes from `/proc/<pid>/comm`. Override with `--profile-output` / `--offcpu-output`.
 

@@ -173,4 +173,12 @@ func main() {
 	st := c.Stats()
 	log.Printf("wrote %s: %d samples, launches=%d expected_sampled=%d stats=%+v",
 		*out, len(samples), launches, wantSampled, st)
+	// c.Stats() above is ingestion: what arrived off the ringbuf. This is
+	// attribution: what the timeline could join it to, and what it evicted
+	// trying. A run can be perfect on the first and quietly useless on the
+	// second, so both are printed - one line when the join is clean, one
+	// extra line per anomaly when it is not (see gpu.JoinHealth).
+	for _, line := range gpu.JoinHealth(snap) {
+		log.Print(line)
+	}
 }

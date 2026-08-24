@@ -31,8 +31,9 @@ const (
 // identity, so only what should nest in a flame graph goes there - the
 // launch's real CPU stack, the [gpu:launch] boundary marker, then
 // [gpu:kernel:<name>]. Everything that would otherwise fragment that
-// identity (the per-sample PC, stall reason, queue/device/correlation, and
-// the launch's tags) goes into per-sample labels instead. Two PC samples
+// identity (the per-sample PC, stall reason, queue/device/correlation, the
+// producing process, and the launch's tags) goes into per-sample labels
+// instead. Two PC samples
 // from the same kernel therefore share one stack and differ only by label.
 //
 // Sampling and honesty. Launch stacks are sampled (one launch in
@@ -156,6 +157,38 @@ func projectionPID(view ExecutionView) uint32 {
 	return 0
 }
 
+// labelPID resolves the process to name in the gpu_pid label.
+//
+// It is NOT always projectionPID. projectionPID answers "whose address space
+// were these frames symbolized in", and an unmatched execution honestly has
+// no answer: it carries no launch, so no stack, so no address space. gpu_pid
+// answers a different question - "which process produced this GPU work" - and
+// an unmatched execution usually can answer it, because since issue #36 the
+// producing process rides on the execution's own CorrelationID. An execution
+// whose correlation merely MISSED the cache (its launch aged out) is exactly
+// that case, and it is the population issue #53 cares most about: it keeps
+// gpu_correlation, so without this fallback it would keep the ambiguity too.
+//
+// The launch wins when there is one, so gpu_pid never contradicts the pid the
+// frames were resolved against. For an exact join the two are equal by
+// construction - (backend, pid, value) is the join key. For a heuristic join
+// the execution supplied no correlation at all (that is the only way it
+// reaches the heuristic), so the launch's pid is the only pid in play; it is
+// an inference, and gpu_join="heuristic" already says so on the same sample.
+//
+// Zero means no process is known - a correlation-less execution that matched
+// nothing, or a device-global producer that names no process (see
+// CorrelationID.PID). The label is then omitted rather than emitted as
+// "gpu_pid=0", which would name pid 0 - a real pid, the kernel's - as the
+// producer. Absence here is readable, because gpu_join on the same sample
+// says why.
+func labelPID(view ExecutionView) uint32 {
+	if pid := projectionPID(view); pid != 0 {
+		return pid
+	}
+	return view.Exec.Correlation.PID
+}
+
 // projectionLabels builds the labels shared by every sample projected from
 // one execution: the launch's tags (pod/container/cgroup) plus queue, device
 // and correlation. Per-PC-sample labels (gpu_stall, gpu_pc) are layered on
@@ -171,6 +204,48 @@ func projectionPID(view ExecutionView) uint32 {
 // the real profiler-derived value; reserved names always win. gpu_stall and
 // gpu_pc get the same protection by virtue of being set in ProjectExecutions
 // after this function's map is cloned, i.e. also strictly after Tags.
+//
+// gpu_pid names the process that produced the GPU work (issue #53). Before
+// it, a system-wide profile carried no gpu_* label naming a process at all:
+// the pid was load-bearing internally after issue #36 - it is what keeps one
+// process's GPU time off another's call path - but invisible in the output.
+// See labelPID for which pid it reports and when it is omitted.
+//
+// It is a label, not a frame, per spec §8: frames are exhaustively the real
+// CPU stack, the [gpu:launch] boundary and the kernel name, and every piece
+// of context ABOUT a sample - queue, device, correlation, cgroup, pod UID,
+// container ID - is a label. Process identity is the same kind of thing as
+// the cgroup/pod/container identity already listed there, and a per-process
+// frame would fragment stack identity for a fact no flame graph nests on.
+//
+// It is emitted unconditionally, including in single-process mode
+// (Config.PID != 0) where every sample carries the same value. This package
+// has no access to the agent's mode and should not grow one for this; more to
+// the point, a consumer reading a profile cannot tell "single-process, so the
+// label was skipped" from "GPU labels absent entirely", so a label that
+// disappears in one mode is harder to consume than one that is always there.
+// Its cardinality is one string-table value per distinct process (one, in
+// that mode) plus one for the key - bounded by the process count, not by the
+// execution or PC-sample count.
+//
+// gpu_correlation keeps its "backend:value" format and does NOT gain the pid.
+// The ambiguity issue #53 describes is real - two processes can emit the same
+// gpu_correlation string - but qualifying it in place is a compatibility
+// break with a silent failure mode: an existing
+// `pprof -tagfocus gpu_correlation=cupti:4294967301` would stop matching
+// anything and render an empty profile, which reads as "no such GPU work"
+// rather than "your filter is stale". Adding gpu_pid alongside instead leaves
+// every existing filter matching exactly what it matched before, and makes
+// the over-grouping visible and resolvable in the output (`-tags` shows the
+// process breakdown; `-tagignore gpu_pid=<other>` narrows it) rather than
+// silently invisible. It also keeps one fact per label - the shape pod_uid
+// and container_id already use - and keeps this label what its comment below
+// says it is: a report of what the vendor actually observed on this
+// execution, not a composite this package assembled. A third label carrying
+// the composite was considered and rejected on cardinality: gpu_correlation
+// is already the highest-cardinality label here (roughly one distinct string
+// per execution), and a parallel fully-qualified copy would double that,
+// where gpu_pid adds one string per process.
 //
 // gpu_correlation is built from view.Exec.Correlation - the execution's own,
 // vendor-reported correlation - not from the joined launch's Correlation.
@@ -204,6 +279,9 @@ func projectionLabels(view ExecutionView) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {
 		maps.Copy(labels, view.Launch.Launch.Tags)
+	}
+	if pid := labelPID(view); pid != 0 {
+		labels["gpu_pid"] = strconv.FormatUint(uint64(pid), 10)
 	}
 	if view.Exec.Queue.QueueID != "" {
 		labels["gpu_queue"] = view.Exec.Queue.QueueID

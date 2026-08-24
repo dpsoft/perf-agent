@@ -80,6 +80,7 @@ func TestProjectionReservedLabelsWinOverTags(t *testing.T) {
 		"gpu_correlation": "HIJACKED",
 		"gpu_stall":       "HIJACKED",
 		"gpu_pc":          "HIJACKED",
+		"gpu_pid":         "HIJACKED",
 	}
 	require.NoError(t, tl.EmitLaunch(l))
 
@@ -99,6 +100,7 @@ func TestProjectionReservedLabelsWinOverTags(t *testing.T) {
 	assert.Equal(t, "cupti:a", samples[0].Labels["gpu_correlation"], "a tag named gpu_correlation must not override the real correlation")
 	assert.Equal(t, "long_scoreboard", samples[0].Labels["gpu_stall"], "a tag named gpu_stall must not override the real stall reason")
 	assert.Equal(t, "0x1a40", samples[0].Labels["gpu_pc"], "a tag named gpu_pc must not override the real pc")
+	assert.Equal(t, "1", samples[0].Labels["gpu_pid"], "a tag named gpu_pid must not override the real process")
 }
 
 func TestProjectionSetsPidSampleTypeAndAggregationFromLaunch(t *testing.T) {

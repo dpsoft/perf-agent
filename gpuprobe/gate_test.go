@@ -173,8 +173,18 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// before it ever reaches a probe. A consumer-side counter cannot see that
 	// loss — it happens in the producer, upstream of the ringbuf.
 	// sample_period=8 explicit (it also happens to be the stub's default):
-	// with 500 launches the sampler is deterministic and yields exactly 63
-	// sampled launches (n%8==0 for n in 0..499, i.e. ceil(500/8)).
+	// with 500 launches the sampler yields exactly 58 sampled launches.
+	//
+	// 58, not ceil(500/8)==63, since issue #50: the sampler no longer takes
+	// every 8th launch. It draws each gap uniformly from [4,12] -- mean
+	// exactly 8, so the RATE is unchanged -- from a hash of (seed, sample
+	// point), which is why this count is still an equality and not a
+	// tolerance band. The schedule is a deterministic chain from the stub's
+	// seed, and 58 is its exact length over 500 launches; it is pinned on
+	// both sides of the shim/consumer boundary by
+	// shim/core/sampler_test.cc's schedule pin and by
+	// TestTheGoReplicaMatchesTheShimSampler, so a change to the sampler
+	// fails there with a legible cause before it reaches this gate.
 	//
 	// The fourth argument is the linger: after flushing, the stub waits for
 	// EOF on stdin (up to 10s) before exiting. Start(), not Run(): the
@@ -200,7 +210,7 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// until the consumer has installed its tables (shim/core/enroll.h), so
 	// the split is no longer timing-dependent at all and StacksWalkedNoTables
 	// is asserted zero below. The period is left at 1000 anyway: nothing
-	// depends on it - the sampler counts launches, not time, so the 63 below
+	// depends on it - the sampler counts launches, not time, so the 58 below
 	// is unchanged either way - and a slower run is the more demanding one
 	// for every other counter here.
 	cmd := exec.Command(stub, "500", "1000", "8", "10000")
@@ -218,9 +228,9 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// Wait for the consumer to have OBSERVED every sampled launch, rather
 	// than sleeping and hoping. Stats is the right handle: SampledLaunches is
 	// incremented on the decode path, and stacks are symbolized on that same
-	// path, so once it reads 63 every symbolization has already happened —
+	// path, so once it reads 58 every symbolization has already happened —
 	// and happened while the stub was alive.
-	const wantSampled = 63
+	const wantSampled = 58
 	deadline := time.Now().Add(10 * time.Second)
 	var lastSampled uint64
 	for {
@@ -278,7 +288,10 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(500), stubObserved, "the sampler must see every one of the 500 launches")
 	assert.Equal(t, uint64(8), stubPeriod, "the stub was invoked with sample_period=8")
-	assert.Equal(t, uint64(63), stubSampled, "ceil(500/8): the sampler is deterministic at period 8 over 500 launches")
+	assert.Equal(t, uint64(58), stubSampled,
+		"the deterministic jittered schedule at period 8 over 500 launches is exactly 58 samples long")
+	assert.Contains(t, stubErr, "seed=0x9e3779b97f4a7c15",
+		"the stub ran on a seed other than the shim's default, so the exact count above describes a different schedule than the one asserted")
 
 	stats := c.Stats()
 	assert.Zero(t, stats.SequenceGaps, "no batch may be lost silently")
@@ -291,8 +304,8 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// vary.
 	assert.Equal(t, stubSampled, stats.SampledLaunches,
 		"the producer's own sampled= count and the consumer's SampledLaunches must not disagree")
-	assert.Equal(t, uint64(63), stats.SampledLaunches,
-		"ceil(500/8) sampled launches, deterministic because the sampler is")
+	assert.Equal(t, uint64(wantSampled), stats.SampledLaunches,
+		"the sampler is deterministic given its seed, so this stays an exact count")
 	// Records is incremented *before* the sink call, so it alone does not
 	// prove the timeline accepted anything — every other loss counter has to
 	// be zero for the count above to mean what it looks like it means.
@@ -518,7 +531,7 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 			"execution for correlation %s has no kernel name", view.Exec.Correlation.Value)
 	}
 
-	// Sampled-stack accounting: exactly 63 of the 500 launches reached the
+	// Sampled-stack accounting: exactly 58 of the 500 launches reached the
 	// timeline with a non-empty CPUStack, and every one of those stacks
 	// names the function the probe fired in. perfagent_stub_run keeps its
 	// frame pointer (see shim/Makefile), so a failure on that one is the
@@ -547,6 +560,7 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// why it is asserted by name rather than by depth: a deeper stack could
 	// come from anywhere, this name could not.
 	var sampledLaunches, sawFPLessCaller int
+	stackedKernels := map[string]int{}
 	for _, view := range snap.Executions {
 		require.NotNil(t, view.Launch,
 			"every execution joined its launch exactly (asserted above), so Launch must never be nil here")
@@ -554,6 +568,7 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 			continue
 		}
 		sampledLaunches++
+		stackedKernels[view.Exec.KernelName]++
 		var sawStubFrame, sawCaller bool
 		for _, f := range view.Launch.Launch.CPUStack {
 			if strings.Contains(f.Name, "perfagent_stub_run") {
@@ -570,8 +585,19 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 			sawFPLessCaller++
 		}
 	}
-	assert.Equal(t, 63, sampledLaunches,
-		"exactly 63 launches on the timeline must carry a non-empty CPUStack, matching Stats.SampledLaunches")
+	assert.Equal(t, wantSampled, sampledLaunches,
+		"exactly %d launches on the timeline must carry a non-empty CPUStack, matching Stats.SampledLaunches",
+		wantSampled)
+	// Issue #50, at the pipeline level rather than the unit level. The stub
+	// alternates two kernel ids, one per launch, so its launch stream is a
+	// 2-cycle -- the exact shape the fixed-stride sampler aliased against. At
+	// period 8 every sampled ordinal used to be even, so kernel_1111 took
+	// every stack on this producer and kernel_2222 took none, in a run that
+	// otherwise passed every assertion above. Both must now be represented.
+	assert.Greater(t, len(stackedKernels), 1,
+		"every stack-carrying launch on this producer names the same kernel (%v): the sampler locked phase against the stub's alternating 2-kernel stream, which is issue #50",
+		stackedKernels)
+	t.Logf("stacks per kernel: %v", stackedKernels)
 	assert.Positive(t, sawFPLessCaller,
 		"not one of the %d sampled stacks names perfagent_fpless_caller, which is only reachable by unwinding an FP-less frame through CFI: the walk never crossed one, or the symbolizer could not name it",
 		sampledLaunches)

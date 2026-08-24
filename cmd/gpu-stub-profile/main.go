@@ -11,6 +11,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 )
@@ -55,7 +56,12 @@ func main() {
 	// the process (the previous CombinedOutput) meant every record still in
 	// the ringbuf at that moment resolved to bare hex addresses — an artifact
 	// that looks like a working profile and names nothing.
-	const wantSampled = 2000 / 8 // the sampler is deterministic at period 8
+	// The sampler jitters each gap around the period (issue #50), so this is
+	// not 2000/8; it is the exact length of the deterministic schedule the
+	// stub will follow, replayed here from the same seed the stub uses.
+	// Rounding it up to 250 would park this loop on its 30s deadline for a
+	// count that is never reached.
+	wantSampled := gpuabi.SampledCount(2000, 8, gpuabi.DefaultSampleSeed)
 	cmd := exec.Command(stub, "2000", "200", "8", "30000")
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	release, err := cmd.StdinPipe()

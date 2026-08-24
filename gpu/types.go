@@ -250,6 +250,15 @@ type LaunchContext struct {
 	// with the stack rather than being reconstructed downstream, because
 	// the period can change between runs and even mid-run.
 	//
+	// It is the MEAN stride, not an exact one. The shim jitters each gap
+	// around SamplePeriod so the sampler cannot lock phase against a
+	// periodic launch pattern -- a fixed stride at an even period gave one
+	// kernel of an alternating pair every stack and the other none (issue
+	// #50). The rate is unchanged: gaps are drawn from a set of consecutive
+	// integers centred on SamplePeriod, so the long-run rate is exactly
+	// 1/SamplePeriod. The exact schedule is replayable from the shim's seed
+	// via internal/gpuabi.SampleSchedule.
+	//
 	// It is NOT a scale factor to multiply this launch's GPU time by.
 	// Sampling applies to stack *capture* only: every execution is still
 	// measured and joined, so durations stay exact and the sampled and

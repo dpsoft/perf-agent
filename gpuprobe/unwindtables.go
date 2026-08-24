@@ -2,6 +2,7 @@ package gpuprobe
 
 import (
 	"container/list"
+	"errors"
 	"sync"
 
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
@@ -104,6 +105,13 @@ type pidRegEntry struct {
 	pid   uint32
 	state pidRegState
 	elem  *list.Element
+	// enrolled records that this PID came through the startup rendezvous
+	// (enrollListener), i.e. that the producer blocked in its own init
+	// waiting for these tables. It exists so a walk that still found no
+	// tables can be told apart from one whose process never enrolled at
+	// all - see Stats.StacksNoTablesAfterEnroll, which is zero by
+	// construction unless the handshake failed to do its job.
+	enrolled bool
 }
 
 // pidWork is one unit of registrar I/O, handed to the worker goroutine.
@@ -117,14 +125,35 @@ type pidWork struct {
 // unwindStats is the registry's slice of gpuprobe.Stats. Kept separate so the
 // registry can be snapshotted under its own lock.
 type unwindStats struct {
-	registered       uint64
-	failed           uint64
-	evicted          uint64
-	requestsDropped  uint64
-	releaseFailed    uint64
-	binariesAttached uint64
-	lastErr          string
+	registered           uint64
+	failed               uint64
+	evicted              uint64
+	enrolledEvicted      uint64
+	enrolledMarksDropped uint64
+	requestsDropped      uint64
+	releaseFailed        uint64
+	binariesAttached     uint64
+	lastErr              string
 }
+
+// enrollOutcome is what the rendezvous decided for one connecting producer.
+type enrollOutcome uint8
+
+const (
+	// enrollInstalled: the tables were compiled and installed by this call.
+	enrollInstalled enrollOutcome = iota
+	// enrollAlreadyHeld: the walker already had tables for this PID, so
+	// nothing was recompiled. ehmaps.PIDTracker.Attach accumulates mappings
+	// and takes a table reference every time it is called, so a second
+	// registration for the same PID would duplicate both.
+	enrollAlreadyHeld
+	// enrollInFlight: another path (the lazy worker) is registering this PID
+	// right now. The producer is released without a promise, because the
+	// registry cannot honestly make one.
+	enrollInFlight
+	// enrollFailed: registration ran and installed nothing.
+	enrollFailed
+)
 
 // pidRegistry decides which PIDs get CFI tables, and bounds the set.
 //
@@ -134,11 +163,25 @@ type unwindStats struct {
 //     so the tables are in place before the probe can fire even once. This is
 //     the eager path, and it is what unwind/dwarfagent does for a per-PID
 //     profiler (mode is forced to ModeEager there for the same reason).
+//
 //   - Config.PID == 0 (system-wide, the documented default). The target
 //     process may not exist at Attach time - the gate's stub is launched after
 //     Attach, because the shim only emits once the uprobe's semaphore says
-//     someone is listening. A PID becomes interesting the first time any batch
-//     arrives from it, and note() requests registration then.
+//     someone is listening. Two things can feed the registry here, and only
+//     one of them is in time:
+//
+//     enroll(), from the startup rendezvous (enroll.go). The producer blocks
+//     in its own initialisation - before its first launch, and therefore
+//     before its first probe - until this call has installed its tables. This
+//     is the #49 fix, and it is the only path that puts tables in the maps
+//     before the kernel-side walk needs them.
+//
+//     note(), on the first batch from a PID. The fallback, for a producer
+//     that never reached the rendezvous (it was already running when the
+//     consumer attached, or the socket was unavailable). Everything sampled
+//     during the compile it starts is walked without tables; that is the
+//     ~38% loss issue #49 measured, and it is what Stats.StacksWalkedNoTables
+//     still counts, truthfully.
 //
 // Registration is NOT done on the caller's goroutine in the lazy case. It is
 // ehcompile.Compile per binary, and that is not free: measured on this branch,
@@ -163,11 +206,37 @@ type pidRegistry struct {
 	work     chan pidWork
 	wg       sync.WaitGroup
 
-	mu     sync.Mutex
-	byPID  map[uint32]*pidRegEntry
-	lru    *list.List // front = most recently seen
-	stats  unwindStats
-	closed bool
+	mu    sync.Mutex
+	byPID map[uint32]*pidRegEntry
+	lru   *list.List // front = most recently seen
+	// wasEnrolled remembers PIDs that completed the startup rendezvous and
+	// were later evicted from byPID.
+	//
+	// Without it the enrolled mark dies with the entry, and the one case
+	// StacksNoTablesAfterEnroll exists to catch - "we promised a producer its
+	// tables and then took them back" - reads as zero while
+	// StacksWalkedNoTables climbs. That is this project's signature defect
+	// (a counter green exactly when things are worst) inside the counter
+	// added to prevent it.
+	//
+	// Bounded FIFO, same order of size as the registry itself, so it cannot
+	// grow with a profiled machine's process churn. The bound's cost is a
+	// false NEGATIVE for a PID whose mark has aged out, counted in
+	// Stats.UnwindEnrolledMarksDropped so the under-report is never silent;
+	// PID recycling can produce a false POSITIVE, which UnwindEnrolledPIDsEvicted
+	// is the cross-check for. See rememberEnrolledLocked for why it fills per
+	// enrolment rather than per eviction.
+	wasEnrolled     map[uint32]struct{}
+	wasEnrolledFIFO *list.List
+	// wasEnrolledCap bounds it. Deliberately larger than the registry's own
+	// capacity: the set is fed once per ENROLMENT and once per eviction of an
+	// enrolled PID, so sizing it equal to the LRU made the two churn against
+	// each other and aged marks out roughly twice as fast as evictions
+	// happened. A multiple leaves an evicted PID's mark comfortably alive
+	// while it is the thing the counter needs to see.
+	wasEnrolledCap int
+	stats          unwindStats
+	closed         bool
 }
 
 const (
@@ -180,6 +249,14 @@ const (
 	// shared CFI table, so the real memory is dominated by the distinct
 	// binaries, which PIDs share.
 	defaultUnwindPIDCapacity = 128
+
+	// enrolledMarkOvercommit sizes the evicted-enrolment memory relative to
+	// the PID capacity. See pidRegistry.wasEnrolledCap: at 1x the set churned
+	// against the LRU itself and dropped marks about twice as fast as
+	// evictions occurred, which is under-reporting in the one counter that
+	// must not under-report silently. Four PIDs' worth of marks per tracked
+	// PID is a few kilobytes at the default capacity.
+	enrolledMarkOvercommit = 4
 
 	// unwindWorkDepth is the registrar work queue. Requests are one per
 	// distinct PID, not one per record, so this is deep enough to absorb a
@@ -195,11 +272,14 @@ func newPIDRegistry(reg pidRegistrar, capacity int) *pidRegistry {
 		capacity = defaultUnwindPIDCapacity
 	}
 	r := &pidRegistry{
-		reg:      reg,
-		capacity: capacity,
-		work:     make(chan pidWork, unwindWorkDepth),
-		byPID:    map[uint32]*pidRegEntry{},
-		lru:      list.New(),
+		reg:             reg,
+		capacity:        capacity,
+		work:            make(chan pidWork, unwindWorkDepth),
+		byPID:           map[uint32]*pidRegEntry{},
+		lru:             list.New(),
+		wasEnrolled:     map[uint32]struct{}{},
+		wasEnrolledFIFO: list.New(),
+		wasEnrolledCap:  capacity * enrolledMarkOvercommit,
 	}
 	r.wg.Add(1)
 	go r.run()
@@ -229,7 +309,7 @@ func (r *pidRegistry) note(pid uint32) bool {
 	if r.closed {
 		return false
 	}
-	e := &pidRegEntry{pid: pid, state: pidPending}
+	e := &pidRegEntry{pid: pid, state: pidPending, enrolled: r.wasEnrolledLocked(pid)}
 	e.elem = r.lru.PushFront(e)
 	r.byPID[pid] = e
 	r.evictLocked()
@@ -259,6 +339,14 @@ func (r *pidRegistry) evictLocked() {
 		}
 		delete(r.byPID, ve.pid)
 		r.stats.evicted++
+		if ve.enrolled {
+			// A producer we released on the promise that its tables were
+			// installed, whose tables we are now taking back. Counted, and
+			// remembered, so its next tableless walk is not read as an
+			// ordinary startup transient.
+			r.stats.enrolledEvicted++
+			r.rememberEnrolledLocked(ve.pid)
+		}
 		// Only a PID that actually holds tables has anything to release. A
 		// pending one is handled by the worker, which finds it gone and
 		// releases whatever it just installed (see run).
@@ -297,13 +385,144 @@ func (r *pidRegistry) registerNow(pid uint32) (int, error) {
 	defer r.mu.Unlock()
 	e, ok := r.byPID[pid]
 	if !ok {
-		e = &pidRegEntry{pid: pid, state: pidPending}
+		e = &pidRegEntry{pid: pid, state: pidPending, enrolled: r.wasEnrolledLocked(pid)}
 		e.elem = r.lru.PushFront(e)
 		r.byPID[pid] = e
 	}
 	r.recordLocked(e, n, err)
 	r.evictLocked()
 	return n, err
+}
+
+// wasEnrolledLocked reports whether pid completed the rendezvous before it was
+// evicted. Caller holds mu.
+func (r *pidRegistry) wasEnrolledLocked(pid uint32) bool {
+	_, ok := r.wasEnrolled[pid]
+	return ok
+}
+
+// rememberEnrolledLocked records a PID's rendezvous so the mark can outlive
+// its registry entry. Bounded FIFO. Caller holds mu.
+//
+// Note that it fills once per ENROLMENT, not once per eviction: enroll()
+// records the PID before it starts compiling, because that entry can be
+// evicted while its tables are still being built and the mark has to survive
+// that. So the set holds the last `capacity` enrolled PIDs, and a mark ages
+// out after `capacity` further enrolments rather than after `capacity`
+// evictions. Every mark that falls off the end is counted
+// (Stats.UnwindEnrolledMarksDropped): the consequence is that
+// StacksNoTablesAfterEnroll under-reports for that PID, and a silent
+// under-report in this particular counter is exactly the failure it exists
+// to prevent.
+func (r *pidRegistry) rememberEnrolledLocked(pid uint32) {
+	if _, ok := r.wasEnrolled[pid]; ok {
+		return
+	}
+	r.wasEnrolled[pid] = struct{}{}
+	r.wasEnrolledFIFO.PushFront(pid)
+	for r.wasEnrolledFIFO.Len() > r.wasEnrolledCap {
+		back := r.wasEnrolledFIFO.Back()
+		if back == nil {
+			return
+		}
+		r.wasEnrolledFIFO.Remove(back)
+		if old, ok := back.Value.(uint32); ok {
+			delete(r.wasEnrolled, old)
+			r.stats.enrolledMarksDropped++
+		}
+	}
+}
+
+// enroll installs pid's tables for the startup rendezvous and reports what it
+// found. Called on the enrollListener's goroutine, with a producer blocked in
+// its own initialisation waiting for the answer, which is the whole point:
+// the compile happens while nothing has launched yet.
+//
+// Not the same call as registerNow, for two reasons that both bite:
+//
+//   - It claims the registry entry BEFORE the compile, so a batch that
+//     arrives mid-compile (Consumer.applyBatch -> note) sees a known PID and
+//     does not queue a second registration for it. Two registrations for one
+//     PID would duplicate its pid_mappings rows and double the reference it
+//     holds on every shared CFI table.
+//   - It never recompiles a PID the walker already has tables for. Repeat
+//     connections - a producer that re-enrolls, or anything else that reaches
+//     the socket - therefore cost a map lookup, not a libcuda compile.
+//
+// The entry is marked enrolled either way, so a later walk that still finds
+// no tables is counted as the contradiction it is.
+func (r *pidRegistry) enroll(pid uint32) (enrollOutcome, error) {
+	if r == nil || pid == 0 {
+		return enrollFailed, errors.New("gpuprobe: no unwind registry")
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return enrollFailed, errors.New("gpuprobe: consumer is closing")
+	}
+	if e, ok := r.byPID[pid]; ok {
+		e.enrolled = true
+		r.lru.MoveToFront(e.elem)
+		state := e.state
+		r.mu.Unlock()
+		switch state {
+		case pidReady:
+			return enrollAlreadyHeld, nil
+		case pidPending:
+			return enrollInFlight, nil
+		default:
+			return enrollFailed, errors.New("gpuprobe: registration already failed for this pid")
+		}
+	}
+	e := &pidRegEntry{pid: pid, state: pidPending, enrolled: true}
+	e.elem = r.lru.PushFront(e)
+	r.byPID[pid] = e
+	// Recorded before the compile, not after: this entry can be evicted while
+	// its tables are still being built, and the mark has to outlive it.
+	r.rememberEnrolledLocked(pid)
+	r.evictLocked()
+	r.mu.Unlock()
+
+	n, err := r.reg.Register(pid)
+
+	r.mu.Lock()
+	cur := r.byPID[pid]
+	r.recordLocked(cur, n, err)
+	// The bound pushed this PID out while its tables were being compiled;
+	// same hazard, and same remedy, as the worker's evictedMidFlight arm.
+	evictedMidFlight := cur == nil && err == nil && n > 0
+	r.mu.Unlock()
+	if evictedMidFlight {
+		if uerr := r.reg.Unregister(pid); uerr != nil {
+			r.mu.Lock()
+			r.stats.releaseFailed++
+			r.mu.Unlock()
+		}
+		return enrollFailed, errors.New("gpuprobe: pid evicted while its tables were compiling")
+	}
+	if err != nil {
+		return enrollFailed, err
+	}
+	if n == 0 {
+		return enrollFailed, errors.New("gpuprobe: no binary with usable .eh_frame")
+	}
+	return enrollInstalled, nil
+}
+
+// enrolled reports whether pid went through the startup rendezvous. Used only
+// to make StacksNoTablesAfterEnroll mean what it says; see pidRegEntry.
+func (r *pidRegistry) enrolled(pid uint32) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.byPID[pid]; ok {
+		return e.enrolled
+	}
+	// Not tracked right now, but it may have been evicted after a successful
+	// rendezvous - which is precisely the case this counter must not miss.
+	return r.wasEnrolledLocked(pid)
 }
 
 // recordLocked folds one registration outcome into the entry and the counters.
@@ -382,6 +601,17 @@ func (r *pidRegistry) ready(pid uint32) bool {
 	defer r.mu.Unlock()
 	e, ok := r.byPID[pid]
 	return ok && e.state == pidReady
+}
+
+// snapshotTracked is the tracked-PID gauge on its own, for tests that need to
+// observe the moment an entry is claimed.
+func (r *pidRegistry) snapshotTracked() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.byPID)
 }
 
 // snapshot returns the registry's counters plus the current tracked-PID gauge.

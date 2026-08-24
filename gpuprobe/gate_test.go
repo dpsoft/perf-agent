@@ -186,22 +186,23 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// has nothing to do with the capture path. Holding the producer open
 	// until the consumer has counted every sampled launch removes the race
 	// instead of papering over it with a longer sleep.
-	// period_us is 1000, not the 200 this gate used through Phase 4a. In
+	// period_us is 1000, not the 200 this gate used through Phase 4a. That
+	// was a workaround for the startup window issue #49 has since closed: in
 	// system-wide mode (Config.PID == 0, which this gate uses because the
-	// producer does not exist at Attach time) the walker's CFI tables for a
-	// process are compiled on the first batch the consumer sees FROM that
-	// process, on a worker goroutine, and that compile takes tens of
-	// milliseconds - it reads .eh_frame out of the producer, libstdc++, libm
-	// and libc. Sampled launches taken before it finishes are walked with no
-	// tables at all and land in StacksWalkedNoTables, which is correct
-	// behaviour and NOT asserted zero below.
+	// producer does not exist at Attach time) the walker's CFI tables used to
+	// be compiled on the first batch the consumer saw FROM that process, so
+	// every launch sampled during the compile was walked with no tables. At
+	// 200us the whole 500-launch run lasted ~100ms against a ~50ms compile
+	// and the split was a coin toss; 1000us stretched the run to ~500ms so
+	// that most captures landed on the right side of it.
 	//
-	// At 200us the whole 500-launch run lasted ~100ms, the same order as the
-	// compile, so the share of launches that got a DWARF walk was a coin
-	// toss. At 1000us the run lasts ~500ms against a ~50ms compile, so the
-	// large majority of the 63 sampled launches are walked with tables
-	// present. Nothing else depends on the period: the sampler is counting
-	// launches, not time, so the 63 below is unchanged.
+	// The producer now blocks in perfagent_stub_run, before its first launch,
+	// until the consumer has installed its tables (shim/core/enroll.h), so
+	// the split is no longer timing-dependent at all and StacksWalkedNoTables
+	// is asserted zero below. The period is left at 1000 anyway: nothing
+	// depends on it - the sampler counts launches, not time, so the 63 below
+	// is unchanged either way - and a slower run is the more demanding one
+	// for every other counter here.
 	cmd := exec.Command(stub, "500", "1000", "8", "10000")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -377,21 +378,58 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Equal(t, uint64(wantSampled), stats.StacksWalkedDWARF+stats.StacksWalkedFPOnly,
 		"every non-empty capture is counted exactly once as either a DWARF walk or an FP-only walk; a shortfall means captures went uncounted")
 
-	// Deliberately NOT asserted zero, and this is the trap in the shape of
-	// an obvious assertion: in system-wide mode the CFI tables for a process
-	// are compiled after the consumer sees that process's first batch, so
-	// the first sampled launches from a newly-seen producer are legitimately
-	// walked before its tables exist. A small non-zero count here is correct
-	// behaviour. What would be wrong is ALL of them, which is what the
-	// bound below says - and which StacksWalkedDWARF > 0 already implies,
-	// stated separately so the intent survives a future edit.
-	assert.Less(t, stats.StacksWalkedNoTables, uint64(wantSampled),
-		"every single capture was walked without CFI tables: registration never completed for the producer. last registration error: %q",
+	// ---- issue #49: the tables exist before the first probe fires --------
+	//
+	// This assertion was `Less(NoTables, wantSampled)` through Phase 4b, with
+	// a comment calling zero a trap: in system-wide mode the tables were
+	// compiled after the consumer saw the producer's first batch, so the
+	// first sampled launches were legitimately walked before they existed. On
+	// the RTX 3090 that cost ~38% of all sampled stacks (issue #49), and here
+	// it was one or two of the 63.
+	//
+	// It is zero now because the producer no longer races the compile: it
+	// blocks in perfagent_stub_run, before its first launch and therefore
+	// before its first probe, until this consumer has installed its tables
+	// (shim/core/enroll.h, gpuprobe/enroll.go). There is no launch, so no
+	// probe, so no walk, until that is done - so a non-zero count here does
+	// not mean "the timing was unlucky", it means the rendezvous did not
+	// happen or did not do its job, and the counters below say which.
+	assert.Zero(t, stats.StacksWalkedNoTables,
+		"a capture was walked with no CFI tables even though the producer waits for them before it launches anything. enroll: listening=%v requests=%d confirmed=%d refused=%d failed=%d err=%q; registration err=%q",
+		stats.UnwindEnrollListening, stats.UnwindEnrollRequests, stats.UnwindEnrollConfirmed,
+		stats.UnwindEnrollRefused, stats.UnwindEnrollFailed, stats.UnwindEnrollLastError,
 		stats.UnwindLastError)
+	assert.Zero(t, stats.StacksNoTablesAfterEnroll,
+		"the producer was released on a promise that its tables were installed, and a later walk found none: the rendezvous is reporting success it did not deliver")
+	assert.True(t, stats.UnwindEnrollListening,
+		"the rendezvous address could not be bound, so the producer had nothing to wait on and fell back to the pre-#49 lazy path: %q",
+		stats.UnwindEnrollLastError)
+	assert.Equal(t, uint64(1), stats.UnwindEnrollConfirmed,
+		"exactly one producer runs against this private stub copy, and it must have been told its tables are in. requests=%d refused=%d failed=%d err=%q",
+		stats.UnwindEnrollRequests, stats.UnwindEnrollRefused, stats.UnwindEnrollFailed,
+		stats.UnwindEnrollLastError)
+	assert.Zero(t, stats.UnwindEnrollRefused,
+		"a connection was turned away: either the peer credentials were unreadable or the producer did not map the inode this consumer attached to, which cannot be true of the process the uprobes fired in. %q",
+		stats.UnwindEnrollLastError)
+	assert.Zero(t, stats.UnwindEnrollFailed,
+		"the rendezvous ran and installed no tables: %q", stats.UnwindEnrollLastError)
+	assert.Zero(t, stats.UnwindEnrollThrottled,
+		"one producer cannot exceed the rendezvous rate limit; if this fires the limiter is refusing legitimate traffic: %q",
+		stats.UnwindEnrollLastError)
+	assert.Zero(t, stats.UnwindEnrolledPIDsEvicted,
+		"one producer against the default 128-PID bound cannot be evicted, so its tables cannot have been taken back")
+	// The producer's own account of the same exchange, from its stderr. A
+	// consumer-side counter cannot see a producer that never reached the
+	// socket - it would simply never appear - so both ends are checked.
+	assert.Contains(t, stubErr, "enroll=confirmed",
+		"the producer did not get a confirmation before it started launching; it ran on the pre-#49 lazy path")
 	assert.Positive(t, stats.UnwindPIDsRegistered,
 		"the consumer never registered the producer's PID with the walker, so no capture could have had tables to use")
 	assert.Zero(t, stats.UnwindPIDsFailed,
 		"a registration that installed nothing: %q", stats.UnwindLastError)
+	assert.Equal(t, uint64(wantSampled), stats.StacksWalkedDWARF,
+		"every capture should now be a DWARF walk: the tables were installed before the producer launched anything, and the two FP-less bridge frames force the walker onto the CFI path. fp-only=%d no-tables=%d",
+		stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables)
 
 	// StackWalkAbandoned means "the walk stopped because it could not
 	// proceed". Through issue #44 it read 62 here alongside dwarf == 62 -

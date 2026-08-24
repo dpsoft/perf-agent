@@ -28,9 +28,23 @@ func newFakeRegistrar() *fakeRegistrar {
 	return &fakeRegistrar{binaries: 3}
 }
 
+// blockFrom makes every subsequent Register wait, so a test can pin the exact
+// moment a registration is still in flight. Safe to call while the registry's
+// worker is running, which is the point: `gate` is read under the same lock.
+func (f *fakeRegistrar) blockFrom() chan struct{} {
+	g := make(chan struct{})
+	f.mu.Lock()
+	f.gate = g
+	f.mu.Unlock()
+	return g
+}
+
 func (f *fakeRegistrar) Register(pid uint32) (int, error) {
-	if f.gate != nil {
-		<-f.gate
+	f.mu.Lock()
+	g := f.gate
+	f.mu.Unlock()
+	if g != nil {
+		<-g
 	}
 	f.mu.Lock()
 	f.registered = append(f.registered, pid)
@@ -346,4 +360,266 @@ func TestAConsumerWithNoRegistryReportsNoTables(t *testing.T) {
 	st := c.Stats()
 	assert.Equal(t, uint64(1), st.StacksWalkedNoTables)
 	assert.Zero(t, st.UnwindPIDsTracked)
+}
+
+// --- Issue #49: the rendezvous path through the registry.
+
+// The rendezvous claims the entry before it starts compiling, so a batch that
+// arrives mid-compile does not queue a second registration for the same PID.
+// Two registrations for one PID would append its mappings twice and take two
+// references on every shared CFI table.
+func TestABatchArrivingMidEnrollDoesNotQueueASecondRegistration(t *testing.T) {
+	f := newFakeRegistrar()
+	f.gate = make(chan struct{})
+	r := testRegistry(t, f, 8)
+
+	done := make(chan enrollOutcome, 1)
+	go func() {
+		o, _ := r.enroll(555)
+		done <- o
+	}()
+
+	// The enroll goroutine is inside Register. note() must see a known PID.
+	require.Eventually(t, func() bool { return r.snapshotTracked() == 1 },
+		2*time.Second, time.Millisecond,
+		"enroll must claim the registry entry before it compiles, not after")
+	assert.False(t, r.note(555),
+		"the PID has no tables yet, and note must say so rather than guess")
+
+	close(f.gate)
+	assert.Equal(t, enrollInstalled, <-done)
+	// Give any wrongly-queued work a chance to run before counting.
+	require.Eventually(t, func() bool { return r.ready(555) }, 2*time.Second, time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, []uint32{555}, f.registeredPIDs(),
+		"the lazy path registered the same PID a second time")
+}
+
+// A PID the walker already has tables for is never recompiled, whichever path
+// asked. This is what makes a repeat rendezvous cost a map lookup rather than
+// a libcuda compile.
+func TestEnrollDoesNotRecompileAPIDThatAlreadyHasTables(t *testing.T) {
+	f := newFakeRegistrar()
+	r := testRegistry(t, f, 8)
+	_, err := r.registerNow(555)
+	require.NoError(t, err)
+
+	o, err := r.enroll(555)
+	require.NoError(t, err)
+	assert.Equal(t, enrollAlreadyHeld, o)
+	assert.Len(t, f.registeredPIDs(), 1)
+	assert.True(t, r.enrolled(555),
+		"the eager path did not mark it; a later tableless walk would then hide in the ordinary startup population")
+}
+
+// A registration that installs nothing still marks the PID enrolled: the
+// producer was released on the strength of this call, so a later tableless
+// walk from it is a contradiction and must be countable as one.
+func TestAFailedEnrollStillMarksThePID(t *testing.T) {
+	f := newFakeRegistrar()
+	f.err = errors.New("no /proc")
+	r := testRegistry(t, f, 8)
+
+	o, err := r.enroll(555)
+	require.Error(t, err)
+	assert.Equal(t, enrollFailed, o)
+	assert.True(t, r.enrolled(555))
+	assert.False(t, r.ready(555))
+}
+
+// enrolled() is only ever true for a PID that went through the rendezvous.
+// A PID registered lazily must NOT be marked, or StacksNoTablesAfterEnroll
+// would count ordinary startup transients as defects.
+func TestALazilyRegisteredPIDIsNotMarkedEnrolled(t *testing.T) {
+	f := newFakeRegistrar()
+	r := testRegistry(t, f, 8)
+	r.note(555)
+	require.Eventually(t, func() bool { return r.ready(555) }, 2*time.Second, time.Millisecond)
+	assert.False(t, r.enrolled(555))
+	assert.False(t, r.enrolled(556), "an unknown PID never enrolled")
+}
+
+// A closing consumer refuses the rendezvous rather than compiling into maps
+// that are about to be closed. The producer is released, not parked.
+func TestEnrollOnAClosedRegistryIsRefused(t *testing.T) {
+	f := newFakeRegistrar()
+	r := newPIDRegistry(f, 8)
+	r.close()
+
+	o, err := r.enroll(555)
+	assert.Equal(t, enrollFailed, o)
+	assert.Error(t, err)
+	assert.Empty(t, f.registeredPIDs())
+}
+
+// The counter that says the fix stopped working: a tableless walk from a PID
+// that DID complete the rendezvous. It is a strict subset of
+// StacksWalkedNoTables, which must keep counting every tableless walk.
+func TestATablelessWalkAfterAnEnrollIsCountedSeparately(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	f := newFakeRegistrar()
+	f.err = errors.New("process exited")
+	c.unwind = testRegistry(t, f, 8)
+	_, err := c.unwind.enroll(555)
+	require.Error(t, err)
+
+	walkWithFlags(t, c, sm, 555, 1, 0)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksWalkedNoTables,
+		"the enrolled subset must never be netted out of the honest total")
+	assert.Equal(t, uint64(1), st.StacksNoTablesAfterEnroll,
+		"the producer was released on a promise the registry could not keep, and nothing said so")
+}
+
+// The same walk from a PID that never enrolled is an ordinary startup
+// transient, and must not read as a defect.
+func TestATablelessWalkWithoutAnEnrollIsNotCountedAsADefect(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	f := newFakeRegistrar()
+	f.gate = make(chan struct{})
+	c.unwind = newPIDRegistry(f, 8)
+	defer func() {
+		close(f.gate)
+		c.unwind.close()
+	}()
+
+	walkWithFlags(t, c, sm, 555, 1, 0)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksWalkedNoTables)
+	assert.Zero(t, st.StacksNoTablesAfterEnroll)
+}
+
+// Eviction is the one benign way the rendezvous promise gets broken, and it
+// used to be invisible: the enrolled flag lived on the registry entry, and
+// eviction deleted the entry. StacksNoTablesAfterEnroll then read zero while
+// StacksWalkedNoTables climbed - green exactly when things were worst, in the
+// counter added to prevent that.
+func TestAnEnrolledPIDEvictedFromTheBoundKeepsItsMark(t *testing.T) {
+	f := newFakeRegistrar()
+	r := testRegistry(t, f, 1) // room for exactly one PID
+
+	_, err := r.enroll(555)
+	require.NoError(t, err)
+	require.True(t, r.ready(555))
+
+	// A second PID pushes the first out.
+	_, err = r.enroll(556)
+	require.NoError(t, err)
+
+	assert.False(t, r.ready(555), "555 was evicted; its tables are gone")
+	assert.True(t, r.enrolled(555),
+		"the mark died with the entry, so a tableless walk from 555 now reads as an ordinary startup transient")
+
+	st, _ := r.snapshot()
+	assert.Equal(t, uint64(1), st.evicted)
+	assert.Equal(t, uint64(1), st.enrolledEvicted,
+		"the eviction of a PID we had promised must be nameable on its own")
+}
+
+// And the mark survives the PID coming back through the lazy path, which is
+// how it actually returns: note() re-creates the entry on the next batch.
+func TestAnEvictedEnrolledPIDIsStillMarkedWhenItComesBackLazily(t *testing.T) {
+	f := newFakeRegistrar()
+	f.gate = make(chan struct{})
+	r := newPIDRegistry(f, 1)
+	defer func() { close(f.gate); r.close() }()
+
+	go func() { _, _ = r.enroll(555) }()
+	require.Eventually(t, func() bool { return r.enrolled(555) }, 2*time.Second, time.Millisecond)
+
+	// Evict it while its compile is still in flight.
+	r.note(556)
+
+	assert.False(t, r.ready(555))
+	assert.True(t, r.note(555) == false && r.enrolled(555),
+		"555 came back through the lazy path and lost the fact that it had been promised tables")
+}
+
+// The bound on the shadow set is a bound: it must not grow with a profiled
+// machine's process churn.
+func TestTheEnrolledShadowSetIsBounded(t *testing.T) {
+	f := newFakeRegistrar()
+	r := testRegistry(t, f, 2)
+	for pid := uint32(1); pid <= 40; pid++ {
+		_, err := r.enroll(pid)
+		require.NoError(t, err)
+	}
+	r.mu.Lock()
+	n := len(r.wasEnrolled)
+	fifo := r.wasEnrolledFIFO.Len()
+	bound := r.wasEnrolledCap
+	r.mu.Unlock()
+	assert.LessOrEqual(t, n, bound, "the shadow set grew past its bound with process churn")
+	assert.Equal(t, n, fifo, "the map and the FIFO must not drift apart")
+	// The oldest is forgotten, the newest is not: a false negative for an
+	// ancient PID is the safe direction.
+	assert.False(t, r.enrolled(1))
+	assert.True(t, r.enrolled(40))
+
+	// Every forgotten mark is counted, and the books balance: a mark is
+	// either still held or was counted on the way out. An aged-out mark makes
+	// StacksNoTablesAfterEnroll under-report for that PID, and a silent
+	// under-report is precisely what that counter exists to prevent.
+	st, _ := r.snapshot()
+	assert.Equal(t, uint64(40), st.enrolledMarksDropped+uint64(n),
+		"marks vanished without being counted: dropped=%d held=%d of 40 enrolments",
+		st.enrolledMarksDropped, n)
+	assert.Positive(t, st.enrolledMarksDropped, "40 enrolments against a %d-entry set must drop some", bound)
+}
+
+// The mark set is sized ABOVE the PID capacity on purpose: it is fed once per
+// enrolment and again when an enrolled PID is evicted, so at 1x it churned
+// against the LRU and aged marks out about twice as fast as evictions
+// happened - under-reporting the very thing it exists to report.
+func TestTheEnrolledMarkSetOutlivesTheEvictionItMustWitness(t *testing.T) {
+	f := newFakeRegistrar()
+	r := testRegistry(t, f, 2)
+	for pid := uint32(1); pid <= 4; pid++ {
+		_, err := r.enroll(pid)
+		require.NoError(t, err)
+	}
+	// 1 and 2 have been evicted from the registry by now...
+	assert.False(t, r.ready(1))
+	assert.False(t, r.ready(2))
+	// ...and both must still be known to have enrolled, or the walk that
+	// notices their missing tables reads as an ordinary startup transient.
+	assert.True(t, r.enrolled(1), "the mark aged out before the eviction it had to witness")
+	assert.True(t, r.enrolled(2))
+	st, _ := r.snapshot()
+	assert.Zero(t, st.enrolledMarksDropped, "nothing should have aged out this early")
+}
+
+// A tableless walk from a PID whose tables were evicted after a successful
+// rendezvous must be counted as the broken promise it is.
+func TestATablelessWalkAfterAnEnrolledEvictionIsCounted(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	f := newFakeRegistrar()
+	c.unwind = testRegistry(t, f, 1)
+	_, err := c.unwind.enroll(555)
+	require.NoError(t, err)
+	_, err = c.unwind.enroll(556) // evicts 555
+	require.NoError(t, err)
+
+	// applyBatch calls note(), which queues a lazy re-registration of 555 on
+	// the worker. Wedge it so the walk below is counted while 555 genuinely
+	// has no tables - otherwise the worker sometimes wins and the test is
+	// asserting a scheduling outcome instead of the counter.
+	gate := f.blockFrom()
+	defer close(gate)
+
+	walkWithFlags(t, c, sm, 555, 1, 0)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksWalkedNoTables)
+	assert.Equal(t, uint64(1), st.StacksNoTablesAfterEnroll)
+	// Not an exact count: re-admitting 555 through note() pushes 556 out in
+	// turn, and both evictions are of enrolled PIDs. What matters is that the
+	// benign explanation for the counter above is readable next to it.
+	assert.Positive(t, st.UnwindEnrolledPIDsEvicted,
+		"an enrolled PID lost its tables to the capacity bound and nothing said so")
 }

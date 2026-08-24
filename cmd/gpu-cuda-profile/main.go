@@ -65,6 +65,15 @@ func main() {
 		// yet, so the attachment has to be system-wide. The semaphore the
 		// uprobe refcount maintains is what arms the probes in it once the
 		// driver maps the .so.
+		//
+		// Attach also binds the startup rendezvous before it creates the
+		// uprobe link, which is what keeps the workload's first sampled
+		// launches from being walked before their CFI tables exist: the
+		// adapter blocks in InitializeInjection - during cuInit, after
+		// libcuda is mapped and before any kernel can be launched - until
+		// this consumer has installed them. See gpuprobe/enroll.go. Nothing
+		// is needed here for that, and nothing here may set
+		// PERFAGENT_GPU_ENROLL_TIMEOUT_MS to 0, which turns it off.
 		PID:        0,
 		Backend:    gpu.BackendCUPTI,
 		Sink:       timeline,

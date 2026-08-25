@@ -307,6 +307,20 @@ type Config struct {
 	// pidRegistry for the bound and Stats.UnwindPIDsEvicted for what it
 	// costs when it bites.
 	UnwindPIDCapacity int
+
+	// CubinMaxBytes bounds ONE cubin offered over the cubin transport
+	// (cubin.go). Zero means defaultCubinMaxBytes. An offer over the ceiling
+	// is rejected whole and counted in CubinsRejectedTooLarge; it is never
+	// truncated to fit, because a truncated cubin parses into a wrong line
+	// table, which is the one failure worse than no line table.
+	CubinMaxBytes int
+
+	// CubinTotalBytes bounds every cubin this consumer will hold. Zero means
+	// defaultCubinTotalBytes. This is the memory a JIT- or template-explosion
+	// workload can make the agent hold, so it is a ceiling rather than a dial;
+	// an offer that would pass it is refused and counted, again in
+	// CubinsRejectedTooLarge.
+	CubinTotalBytes int64
 }
 
 const (
@@ -931,6 +945,61 @@ type Stats struct {
 	// consumer never saw it. KernelStacksMissing > StacksMissing therefore
 	// localizes loss that SequenceGaps can only detect.
 	KernelStacksMissing uint64
+
+	// The cubin transport (cubin.go): the dedicated AF_UNIX channel that
+	// carries a module's BYTES, beside and deliberately not shared with the
+	// enrolment rendezvous. Everything Tier B attribution can say about a PC
+	// sample comes through here, so every way an offer can fail is counted
+	// and none of them is silent.
+	//
+	// CubinsListening says whether the channel bound at all. A run with it
+	// false resolves nothing: every PC sample reads gpu_src_status
+	// "no-module". CubinsAddress is the abstract name that was bound, printed
+	// for the same reason UnwindEnrollAddress is - when the two ends derive
+	// different names every counter on both sides reads zero and nothing says
+	// why.
+	CubinsListening bool
+	CubinsAddress   string
+	// CubinsReceived counts offers accepted and stored. CubinBytesReceived is
+	// their total size, so the total ceiling can be reasoned about from the
+	// outside rather than trusted.
+	CubinsReceived     uint64
+	CubinBytesReceived uint64
+	// CubinsDuplicate counts offers for a CRC already held. A counted no-op:
+	// cubin_crc is content-addressed, so the same CRC is the same bytes and
+	// re-reading them costs an mmap and a parse to reach the same answer. The
+	// payload is never mapped for one of these.
+	CubinsDuplicate uint64
+	// CubinsRejectedTooLarge counts offers refused for size - past the
+	// per-cubin ceiling (Config.CubinMaxBytes) or past the total
+	// (Config.CubinTotalBytes). Nothing partial is ever stored for either.
+	CubinsRejectedTooLarge uint64
+	// CubinsRejectedMalformed counts offers with a bad header, a bad magic, an
+	// unknown version or flag, no descriptor or more than one, or a payload
+	// whose real size disagrees with the size the header declared.
+	CubinsRejectedMalformed uint64
+	// CubinsRejectedUnsealed counts offers whose memfd was missing at least
+	// one of F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE, verified
+	// with F_GET_SEALS BEFORE anything is mapped. Without F_SEAL_SHRINK a peer
+	// can ftruncate under our mmap and SIGBUS this process; without
+	// F_SEAL_WRITE the ELF mutates under the parser. There is no fallback that
+	// reads one anyway.
+	CubinsRejectedUnsealed uint64
+	// CubinsRejectedUnauthorized counts peers refused by the same identity
+	// rules the enrolment rendezvous uses, reused verbatim: no SO_PEERCRED, a
+	// uid an unprivileged consumer will not serve, a PID other than the
+	// attached one, or a peer that does not map the shim inode.
+	CubinsRejectedUnauthorized uint64
+	// CubinsThrottled counts offers refused by the CUBIN admission bucket.
+	//
+	// It reads as its own number because the bucket is its own bucket. That
+	// is the whole reason this channel is separate: a module-heavy workload
+	// can exhaust cubin admission all it likes and UnwindEnrollThrottled will
+	// not move, so a throttled offer costs one module's source resolution and
+	// cannot cost an enrolment - which is issue #49's ~38% stack loss.
+	CubinsThrottled uint64
+	// CubinsLastError is the most recent reason an offer did not land.
+	CubinsLastError string
 }
 
 // maxDecodeFailureReasons bounds the decode-failure table. Four is enough to
@@ -1070,6 +1139,16 @@ type Consumer struct {
 	// enrollErr is why there is no listener, surfaced as
 	// Stats.UnwindEnrollLastError. Written once in Attach, read under mu.
 	enrollErr string
+	// cubin serves the cubin offer channel: a second abstract socket, a
+	// second goroutine and a second admission bucket, beside and never
+	// shared with the rendezvous above. Nil when the address could not be
+	// bound, which is not fatal - every PC sample then reads gpu_src_status
+	// "no-module", which is the truth. See cubin.go for why sharing the
+	// enrolment socket would reintroduce issue #49.
+	cubin *cubinListener
+	// cubinErr is why there is no cubin listener, surfaced as
+	// Stats.CubinsLastError. Written once in Attach, read under mu.
+	cubinErr string
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]uint64
@@ -1227,6 +1306,17 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		c.enrollErr = eerr.Error()
 	} else {
 		c.enroll = el
+	}
+
+	// The cubin channel. Bound here beside the rendezvous and NOT as part of
+	// it: its own address, its own listener, its own goroutine, its own
+	// admission bucket. Best-effort in exactly the same way - a consumer
+	// that cannot bind it still profiles, still walks stacks, and simply
+	// resolves no source lines.
+	if cl, cerr := newCubinListener(cfg, nil); cerr != nil {
+		c.cubinErr = cerr.Error()
+	} else {
+		c.cubin = cl
 	}
 
 	var ex *link.Executable
@@ -2200,6 +2290,21 @@ func (c *Consumer) Stats() Stats {
 	if out.UnwindEnrollLastError == "" {
 		out.UnwindEnrollLastError = c.enrollErr
 	}
+	cu := c.cubin.snapshot()
+	out.CubinsListening = c.cubin != nil
+	out.CubinsAddress = c.cubin.address()
+	out.CubinsReceived = cu.received
+	out.CubinBytesReceived = cu.bytes
+	out.CubinsDuplicate = cu.duplicate
+	out.CubinsRejectedTooLarge = cu.tooLarge
+	out.CubinsRejectedMalformed = cu.malformed
+	out.CubinsRejectedUnsealed = cu.unsealed
+	out.CubinsRejectedUnauthorized = cu.unauthorized
+	out.CubinsThrottled = cu.throttled
+	out.CubinsLastError = cu.lastErr
+	if out.CubinsLastError == "" {
+		out.CubinsLastError = c.cubinErr
+	}
 	// Gauges, read fresh: what the two side tables are holding right now.
 	out.PendingStacks = c.pending.len()
 	out.PendingLaunches = c.deferred.len()
@@ -2279,6 +2384,13 @@ func (c *Consumer) Close() error {
 	// accepted connection is released by the close (it reads EOF and takes
 	// the lazy path), never left parked on a consumer that has gone.
 	if err := c.enroll.close(); err != nil {
+		errs = append(errs, err)
+	}
+	// The cubin channel comes down beside it. Nothing blocks on this one, so
+	// the ordering carries no requirement; it is closed here so a peer
+	// mid-offer is released rather than left writing into a consumer that
+	// has gone.
+	if err := c.cubin.close(); err != nil {
 		errs = append(errs, err)
 	}
 	c.unwind.close()

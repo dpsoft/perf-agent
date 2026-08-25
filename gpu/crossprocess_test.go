@@ -254,3 +254,98 @@ func TestCorrelationCarryingOnlyAProcessIsNotPresent(t *testing.T) {
 		"an exec with a pid but no correlation value supplied no correlation at all")
 	assert.True(t, snap.Executions[0].Heuristic, "a guess must always be marked as one")
 }
+
+// TestProjectionLabelsNameTheProducingProcess is issue #53's projection half.
+// The join (above) already keeps the two processes apart internally; this
+// pins that the separation is VISIBLE in the profile. Both executions carry
+// the identical gpu_correlation string - that is the ambiguity #53 names, and
+// it is deliberately left in place - so gpu_pid must be the thing that tells
+// them apart.
+func TestProjectionLabelsNameTheProducingProcess(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(launchIn(4242, "7", 10, "a_work")))
+	require.NoError(t, tl.EmitLaunch(launchIn(5353, "7", 11, "b_work")))
+	require.NoError(t, tl.EmitExec(execIn(4242, "7", 20, 30)))
+	require.NoError(t, tl.EmitExec(execIn(5353, "7", 21, 31)))
+
+	samples := ProjectExecutions(tl.Snapshot())
+	require.Len(t, samples, 2)
+
+	byPID := map[string]pp.ProfileSample{}
+	for _, s := range samples {
+		byPID[s.Labels["gpu_pid"]] = s
+	}
+	require.Contains(t, byPID, "4242", "no sample named pid 4242 as its producer")
+	require.Contains(t, byPID, "5353", "no sample named pid 5353 as its producer")
+
+	assert.Equal(t, "cupti:7", byPID["4242"].Labels["gpu_correlation"])
+	assert.Equal(t, "cupti:7", byPID["5353"].Labels["gpu_correlation"],
+		"gpu_correlation deliberately keeps its backend:value format, so the two "+
+			"processes still share one string - gpu_pid is what disambiguates them")
+
+	// gpu_pid must agree with the pid the frames were symbolized against;
+	// a label naming one process over another's call path is worse than none.
+	assert.Equal(t, uint32(4242), byPID["4242"].Pid)
+	assert.Equal(t, uint32(5353), byPID["5353"].Pid)
+	assert.Contains(t, frameNames(byPID["4242"].Stack), "a_work")
+	assert.Contains(t, frameNames(byPID["5353"].Stack), "b_work")
+}
+
+// TestProjectionNamesTheProcessOfAnUnmatchedExecution covers the population
+// that keeps gpu_correlation without a launch: the correlation was supplied
+// but missed the cache (its launch aged out), so there is no stack and
+// ProfileSample.Pid is honestly 0 - no address space to symbolize against -
+// yet the execution's own correlation still names the process that produced
+// it. Without this, the exact samples that keep the ambiguous label would
+// keep the ambiguity too.
+func TestProjectionNamesTheProcessOfAnUnmatchedExecution(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitExec(execIn(4242, "7", 20, 30)))
+
+	snap := tl.Snapshot()
+	require.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, "unmatched", samples[0].Labels["gpu_join"])
+	assert.Equal(t, "cupti:7", samples[0].Labels["gpu_correlation"])
+	assert.Equal(t, "4242", samples[0].Labels["gpu_pid"],
+		"an unmatched execution still knows which process produced it")
+	assert.Equal(t, uint32(0), samples[0].Pid,
+		"with no launch there is no address space, so the sample's pid stays 0")
+}
+
+// TestProjectionOmitsPidWhenNoProcessIsKnown is the honesty half: an
+// execution that carried no correlation at all and matched no launch has no
+// process to name. Emitting gpu_pid="0" would name pid 0 - the kernel - as
+// the producer; the label is omitted instead, and gpu_join says why.
+func TestProjectionOmitsPidWhenNoProcessIsKnown(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitExec(GPUKernelExec{KernelName: "orphan", StartNs: 20, EndNs: 30}))
+
+	samples := ProjectExecutions(tl.Snapshot())
+	require.Len(t, samples, 1)
+	assert.Equal(t, "unmatched", samples[0].Labels["gpu_join"])
+	assert.NotContains(t, samples[0].Labels, "gpu_pid",
+		"no process is known, so no process may be named")
+}
+
+// TestProjectionEmitsPidInSingleProcessMode pins the deliberate choice to
+// emit gpu_pid even when every sample carries the same value (Config.PID !=
+// 0). A consumer cannot distinguish "skipped because single-process" from
+// "GPU labels absent entirely", so the label is always present; its cost is
+// one string-table value for the whole profile.
+func TestProjectionEmitsPidInSingleProcessMode(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	for i := range 3 {
+		v := strconv.Itoa(i)
+		require.NoError(t, tl.EmitLaunch(launchIn(4242, v, uint64(i*10)+1, "work")))
+		require.NoError(t, tl.EmitExec(execIn(4242, v, uint64(i*10)+2, uint64(i*10)+3)))
+	}
+
+	samples := ProjectExecutions(tl.Snapshot())
+	require.Len(t, samples, 3)
+	for _, s := range samples {
+		assert.Equal(t, "4242", s.Labels["gpu_pid"])
+	}
+}

@@ -49,7 +49,18 @@ char LICENSE[] SEC("license") = "GPL";
 #define KIND_PC             4
 #define KIND_LAUNCH_SAMPLED 5
 #define KIND_KERNEL_NAME    6
-#define KIND_MAX            8
+#define KIND_STALL_MAP      7
+#define KIND_SAMPLING_WINDOW 8
+#define KIND_CONFIG         9
+// KIND_MAX sizes the `dropped` and `stacks_missing` arrays below and bounds
+// count_drop / count_stack_missing. It is deliberately larger than the
+// highest kind in use: an array resize is an unavoidable map-layout change,
+// and doing it once with headroom is better than doing it on every probe
+// added. Go's kindMax (gpuprobe/consumer.go) mirrors this and MUST move in
+// the same commit — a mismatch mis-sizes the drop accounting silently, so a
+// drop storm reads as zero drops. TestKindMaxPinsTheBPFDropAccountingArrays
+// pins the pair against this compiled object.
+#define KIND_MAX            16
 
 // The wire record sizes, frozen in shim/core/usdt_abi.h and mirrored by
 // internal/gpuabi. They live here as named constants because the payload
@@ -60,11 +71,15 @@ char LICENSE[] SEC("license") = "GPL";
 #define REC_PC             40
 #define REC_LAUNCH_SAMPLED 56
 #define REC_KERNEL_NAME    272
+#define REC_STALL_MAP      136
+#define REC_SAMPLING_WINDOW 24
+#define REC_CONFIG         24
 
 #define MAX_RECORDS_PER_BATCH 64
 
 // MAX_RECORD_BYTES is the largest record on the wire: gpu_kernel_name_v1 at
-// 272 bytes. It deliberately does NOT size the reservation. Sizing the
+// 272 bytes. gpu_stall_reason_map_v1 (136) is the second largest and does not
+// move it. It deliberately does NOT size the reservation. Sizing the
 // reservation for the worst case of every kind would cost
 // 40 + 64*272 = 17448 bytes per batch, i.e. ~240 batches in a 4MB ring —
 // too few to absorb a burst, and paid on every launch batch to serve two
@@ -75,6 +90,14 @@ char LICENSE[] SEC("license") = "GPL";
 // count > 1: gpu_launch_v1 / gpu_exec_v1, both 48 bytes. gpu_launch_sampled_v1
 // (56) rides alone because its stack must belong to exactly one launch, and
 // gpu_kernel_name_v1 (272) is emitted one record per interned name.
+//
+// gpu_stall_reason_map_v1 is 136 and deliberately does NOT raise this. It
+// fires a few dozen times per process — once per stall reason the device
+// reports — so sizing it in would enlarge EVERY launch batch's reservation
+// from 3072 to 8704 bytes and cut the 4MB ring from ~1300 batches to ~480,
+// paid on the hot path to serve a one-shot table. BATCH_CAP gives it its own
+// cap of 22 records instead, and the excess is counted as a drop rather than
+// truncated silently.
 #define MAX_BATCHED_RECORD_BYTES 48
 
 // The ringbuf reservation is fixed-size: bpf_ringbuf_reserve takes a
@@ -289,6 +312,12 @@ static __always_inline __u32 record_size(__u32 kind)
         return REC_LAUNCH_SAMPLED;
     if (kind == KIND_KERNEL_NAME)
         return REC_KERNEL_NAME;
+    if (kind == KIND_STALL_MAP)
+        return REC_STALL_MAP;
+    if (kind == KIND_SAMPLING_WINDOW)
+        return REC_SAMPLING_WINDOW;
+    if (kind == KIND_CONFIG)
+        return REC_CONFIG;
     return 0;
 }
 
@@ -298,8 +327,9 @@ static __always_inline __u32 record_size(__u32 kind)
 // emits no division.
 //
 // The byte-budget caps are 48B -> 64, 40B -> 64 (capped), 56B -> 54,
-// 272B -> 11. They exist so the clamp is sound for any count a producer
-// could pass, not just the counts this shim passes.
+// 272B -> 11, 136B -> 22, 24B -> 64 (capped). They exist so the clamp is
+// sound for any count a producer could pass, not just the counts this shim
+// passes.
 //
 // KIND_LAUNCH_SAMPLED is capped at 1 for a stronger reason than bytes. Its
 // stack id lives in the batch header, one per batch, so a batch of N sampled
@@ -323,11 +353,32 @@ static __always_inline __u32 max_records(__u32 kind)
         return 1;   // one stack per batch => one record per batch
     if (kind == KIND_KERNEL_NAME)
         return BATCH_CAP(REC_KERNEL_NAME);
+    if (kind == KIND_STALL_MAP)
+        return BATCH_CAP(REC_STALL_MAP);
+    if (kind == KIND_SAMPLING_WINDOW)
+        return BATCH_CAP(REC_SAMPLING_WINDOW);
+    if (kind == KIND_CONFIG)
+        return BATCH_CAP(REC_CONFIG);
     return 0;
 }
 
 _Static_assert(1 <= BATCH_CAP(REC_LAUNCH_SAMPLED),
                "the sampled-launch cap of 1 must still fit the payload budget");
+
+// Every kind in use must be addressable in the drop arrays. A kind at or past
+// KIND_MAX is discarded by count_drop without being counted anywhere, which
+// is loss with no counter at all.
+_Static_assert(KIND_CONFIG < KIND_MAX,
+               "the highest kind must fit the dropped/stacks_missing arrays");
+
+// The two 24-byte records saturate MAX_RECORDS_PER_BATCH rather than the byte
+// budget, and the 136-byte one must still fit at least one record.
+_Static_assert(BATCH_CAP(REC_STALL_MAP) * REC_STALL_MAP <= PAYLOAD_BYTES,
+               "the stall-map cap must not overrun the payload");
+_Static_assert(BATCH_CAP(REC_STALL_MAP) >= 1,
+               "a stall-map record must fit one reservation");
+_Static_assert(BATCH_CAP(REC_SAMPLING_WINDOW) == MAX_RECORDS_PER_BATCH,
+               "a 24-byte record is capped by the record count, not by bytes");
 
 static __always_inline void count_drop(__u32 kind, __u64 records)
 {
@@ -478,7 +529,7 @@ int gpu_usdt_batch(struct pt_regs *ctx)
 
     if (rsz == 0) {
         // An attach cookie this program cannot size. Unreachable while Go
-        // only installs cookies 1-6, but this is the one return that would
+        // only installs cookies 1-9, but this is the one return that would
         // otherwise discard a batch without counting it. The producer's own
         // record count is the best size estimate available here.
         count_drop(KIND_UNKNOWN, count);

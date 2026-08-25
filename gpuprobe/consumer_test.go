@@ -2675,3 +2675,173 @@ func TestSameCorrelationInTwoProcessesJoinsInTheTimeline(t *testing.T) {
 	assert.Zero(t, snap.JoinStats.UnmatchedLaunchCount)
 	assert.Equal(t, uint64(2), c.Stats().StacksAttached)
 }
+
+// ----- The two PC-sampling probes, plus gpu_config_v1's first decoder.
+//
+// Task 2 puts these on the wire and decodes them; normalizing them into
+// events is a later task. Until then they still land in applyBatch's
+// `default:` arm and are counted as Stats.Undecoded, which is the contract:
+// a kind the transport carries but the consumer does not yet interpret is
+// counted, never dropped quietly. These tests assert BOTH halves — that
+// decodeBatch reads the records correctly, and that the count they produce is
+// visible — so the later change that makes Undecoded go to zero for them has
+// something concrete to flip.
+
+func TestDecodeStallReasonMapBatch(t *testing.T) {
+	const n = 3
+	buf := make([]byte, batchHdrSize+n*gpuabi.SizeStallReason)
+	putU32(buf[0:], kindStallMap)
+	putU32(buf[4:], n)
+	putU64(buf[24:], uint64(n*gpuabi.SizeStallReason))
+	names := []string{"selected", "long_scoreboard", "mio_throttle"}
+	for i, name := range names {
+		off := batchHdrSize + i*gpuabi.SizeStallReason
+		putU32(buf[off:], uint32(10+i))
+		binary.LittleEndian.PutUint16(buf[off+4:], uint16(len(name)))
+		copy(buf[off+8:], name)
+	}
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	require.Len(t, b.StallReasons, n)
+	for i, name := range names {
+		assert.Equal(t, uint32(10+i), b.StallReasons[i].Index)
+		assert.Equal(t, name, b.StallReasons[i].Name,
+			"record %d decoded at the wrong stride: 136 bytes per entry", i)
+	}
+}
+
+// name_len is producer-supplied and indexes a fixed 128-byte array. The
+// decode runs on the ringbuf drain goroutine, so a slice-out-of-range here
+// takes the consumer down and loses everything still in the ring — much worse
+// than refusing one batch. It must be an error at the batch boundary.
+func TestDecodeStallReasonMapRejectsAnOverlongNameWithoutPanicking(t *testing.T) {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeStallReason)
+	putU32(buf[0:], kindStallMap)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeStallReason))
+	binary.LittleEndian.PutUint16(buf[batchHdrSize+4:], uint16(gpuabi.GPUStallNameMax)+1)
+
+	require.NotPanics(t, func() {
+		_, err := decodeBatch(buf)
+		require.Error(t, err, "a name_len past the fixed array must be refused, not sliced")
+	})
+}
+
+func TestDecodeSamplingWindowBatch(t *testing.T) {
+	buf := make([]byte, batchHdrSize+2*gpuabi.SizeSamplingWindow)
+	putU32(buf[0:], kindSamplingWindow)
+	putU32(buf[4:], 2)
+	putU64(buf[24:], uint64(2*gpuabi.SizeSamplingWindow))
+	// A closed burst, then one still open at the producer's last report.
+	putU64(buf[batchHdrSize:], 1_000)
+	putU64(buf[batchHdrSize+8:], 51_000)
+	buf[batchHdrSize+16] = gpuabi.SamplingModeKernelSerialized
+	off := batchHdrSize + gpuabi.SizeSamplingWindow
+	putU64(buf[off:], 100_000)
+	putU64(buf[off+8:], 0)
+	buf[off+16] = gpuabi.SamplingModeKernelSerialized
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	require.Len(t, b.SamplingWindows, 2)
+	assert.Equal(t, uint64(1_000), b.SamplingWindows[0].StartNs)
+	assert.Equal(t, uint64(51_000), b.SamplingWindows[0].EndNs)
+	assert.False(t, b.SamplingWindows[0].Open())
+	assert.True(t, b.SamplingWindows[1].Open(),
+		"end_ns == 0 means the producer stopped mid-burst; it is not a zero-length window")
+}
+
+func TestDecodeConfigBatch(t *testing.T) {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeConfig)
+	putU32(buf[0:], kindConfig)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeConfig))
+	putU64(buf[batchHdrSize:], 1_695_000_000)
+	putU32(buf[batchHdrSize+8:], 5)
+	putU32(buf[batchHdrSize+12:], 82)
+	buf[batchHdrSize+16] = 1
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	require.Len(t, b.Configs, 1)
+	assert.Equal(t, uint64(1_695_000_000), b.Configs[0].ClockHz)
+	assert.Equal(t, uint32(5), b.Configs[0].SamplingFactor)
+	assert.Equal(t, uint32(82), b.Configs[0].SMCount)
+}
+
+// A count that overruns the declared payload must be refused for each new
+// kind exactly as it is for the frozen ones.
+func TestDecodeRejectsCountBeyondPayloadForTheNewKinds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind uint32
+		size int
+	}{
+		{"stallmap", kindStallMap, gpuabi.SizeStallReason},
+		{"samplingwindow", kindSamplingWindow, gpuabi.SizeSamplingWindow},
+		{"config", kindConfig, gpuabi.SizeConfig},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, batchHdrSize+tc.size)
+			putU32(buf[0:], tc.kind)
+			putU32(buf[4:], 2) // claims two, carries one
+			putU64(buf[24:], uint64(tc.size))
+			_, err := decodeBatch(buf)
+			require.ErrorIs(t, err, gpuabi.ErrShortRecord)
+		})
+	}
+}
+
+// Until applyBatch grows arms for them, the new kinds are carried undecoded
+// and counted. "Counted" is the whole point: spec §6.1 admits no silent loss,
+// and a kind the consumer ignores without counting is exactly that.
+func TestNewKindsAreCarriedUndecodedAndCounted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind uint32
+		size int
+	}{
+		{"stallmap", kindStallMap, gpuabi.SizeStallReason},
+		{"samplingwindow", kindSamplingWindow, gpuabi.SizeSamplingWindow},
+		{"config", kindConfig, gpuabi.SizeConfig},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, batchHdrSize+tc.size)
+			putU32(buf[0:], tc.kind)
+			putU32(buf[4:], 1)
+			putU64(buf[24:], uint64(tc.size))
+
+			b, err := decodeBatch(buf)
+			require.NoError(t, err)
+
+			c := newTestConsumer(&recordingSink{})
+			c.applyBatch(b)
+			assert.Equal(t, uint64(1), c.Stats().Undecoded,
+				"a kind the transport carries but applyBatch does not normalize must be counted")
+		})
+	}
+}
+
+func TestCookieForCoversTheNewProbes(t *testing.T) {
+	assert.Equal(t, uint64(7), cookieFor("gpu_stall_reason_map_v1"))
+	assert.Equal(t, uint64(8), cookieFor("gpu_sampling_window_v1"))
+	assert.Equal(t, uint64(9), cookieFor("gpu_config_v1"))
+}
+
+// record_size and max_records must have grown arms for the new kinds. A kind
+// cookieFor installs but record_size cannot size is not merely undelivered:
+// gpu_usdt_batch charges the whole batch to KIND_UNKNOWN and returns, so
+// every record of that kind is lost and attributed to slot 0.
+func TestBPFSizesEveryKindCookieForInstalls(t *testing.T) {
+	src, err := os.ReadFile("../bpf/gpu_usdt.bpf.c")
+	require.NoError(t, err)
+	text := string(src)
+
+	for _, kind := range []string{"KIND_STALL_MAP", "KIND_SAMPLING_WINDOW", "KIND_CONFIG"} {
+		assert.Containsf(t, text, "if (kind == "+kind+")\n        return REC_",
+			"record_size has no arm for %s; its batches would be charged to KIND_UNKNOWN and lost", kind)
+		assert.Containsf(t, text, "if (kind == "+kind+")\n        return BATCH_CAP(REC_",
+			"max_records has no arm for %s", kind)
+	}
+}

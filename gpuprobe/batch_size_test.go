@@ -88,13 +88,18 @@ func TestPerKindBatchCapsFitOneReservation(t *testing.T) {
 	largest := readDefine(t, src, "MAX_RECORD_BYTES")
 	payload := maxRecords * batched
 
-	require.Equal(t, 3072, payload, "the payload budget is unchanged by Phase 4a")
+	require.Equal(t, 3072, payload,
+		"the payload budget is unchanged by Phase 4a, and unchanged again by the two "+
+			"PC-sampling probes: gpu_stall_reason_map_v1 is 136 bytes and takes its own "+
+			"BATCH_CAP of 22 rather than raising MAX_BATCHED_RECORD_BYTES, which would "+
+			"enlarge every launch batch's reservation to serve a one-shot table")
 	require.LessOrEqual(t, largest, payload,
 		"a record kind larger than one reservation could never be delivered at all")
 
 	for _, name := range []string{
 		"REC_LAUNCH", "REC_EXEC", "REC_MODULE", "REC_PC",
 		"REC_LAUNCH_SAMPLED", "REC_KERNEL_NAME",
+		"REC_STALL_MAP", "REC_SAMPLING_WINDOW", "REC_CONFIG",
 	} {
 		size := readDefine(t, src, name)
 		require.Positive(t, size)

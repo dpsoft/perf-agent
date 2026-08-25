@@ -21,8 +21,26 @@ const (
 	SizeLaunchSampled = 56
 	SizeKernelName    = 272
 
+	// SizeStallReason and SizeSamplingWindow are the two probes added for PC
+	// sampling. Neither mutates a frozen record; both are new probes.
+	SizeStallReason    = 136
+	SizeSamplingWindow = 24
+
 	// GPUKernelNameMax mirrors GPU_KERNEL_NAME_MAX in shim/core/usdt_abi.h.
 	GPUKernelNameMax = 256
+
+	// GPUStallNameMax mirrors GPU_STALL_NAME_MAX in shim/core/usdt_abi.h,
+	// which is CUPTI's CUPTI_STALL_REASON_STRING_SIZE.
+	GPUStallNameMax = 128
+)
+
+// Sampling modes for SamplingWindow.Mode, mirroring GPU_SAMPLING_MODE_* in
+// shim/core/usdt_abi.h. Zero is not a mode: it means the producer left the
+// field unset, which the consumer must treat as unknown rather than as
+// continuous.
+const (
+	SamplingModeContinuous       uint8 = 1
+	SamplingModeKernelSerialized uint8 = 2
 )
 
 // ErrShortRecord means the buffer is smaller than the record it must hold.
@@ -129,6 +147,105 @@ func DecodePCSample(b []byte) (PCSample, error) {
 		StallIndex:    le.Uint32(b[28:]),
 		Count:         le.Uint32(b[32:]),
 	}, nil
+}
+
+// Config is the producer's sampling configuration, emitted once per process.
+// It has been on the wire since Phase 3 with no decoder; nothing reads its
+// fields yet.
+type Config struct {
+	ClockHz        uint64
+	SamplingFactor uint32
+	SMCount        uint32
+	Vendor         uint8
+}
+
+// StallReason is one entry of the device's index -> name stall table.
+//
+// Index is the vendor's own and is not stable across devices or driver
+// versions. Name is the only portable identity a stall reason has, which is
+// why an unresolved index must never be rendered into a label as
+// "stall#<n>": that would put an unstable internal number in front of a
+// human as though it meant something.
+type StallReason struct {
+	Index     uint32
+	Name      string
+	Truncated bool
+}
+
+// SamplingWindow is one PC-sampling burst.
+//
+// EndNs == 0 means the window was still open when the producer stopped
+// reporting — a hard exit mid-burst — and is NOT a zero-length window. See
+// Open.
+type SamplingWindow struct {
+	StartNs uint64
+	EndNs   uint64
+	Mode    uint8
+}
+
+// Open reports whether the window never closed. An execution at or after an
+// open window's StartNs is "unknown", never "not serialized": the producer
+// stopped reporting, it did not report that sampling had stopped.
+func (w SamplingWindow) Open() bool { return w.EndNs == 0 }
+
+// ErrWindowInverted means a sampling window ended before it started. It is a
+// producer contract violation rather than a short buffer, so it is a distinct
+// error: silently accepting it would let a negative duration reach the
+// serialization disclosure, where it would mark an arbitrary set of
+// executions perturbed.
+var ErrWindowInverted = errors.New("gpuabi: sampling window ends before it starts")
+
+func DecodeConfig(b []byte) (Config, error) {
+	if len(b) < SizeConfig {
+		return Config{}, ErrShortRecord
+	}
+	le := binary.LittleEndian
+	return Config{
+		ClockHz:        le.Uint64(b[0:]),
+		SamplingFactor: le.Uint32(b[8:]),
+		SMCount:        le.Uint32(b[12:]),
+		Vendor:         b[16],
+	}, nil
+}
+
+// DecodeStallReason reads one index -> name entry.
+//
+// name_len is authoritative but producer-supplied, so it is range-checked
+// before it indexes the fixed-size buffer. Without the check a hostile or
+// merely buggy producer sets name_len to 65535 and the slice expression
+// panics inside the ringbuf drain goroutine, taking the consumer down — the
+// record is 136 bytes on the wire whatever the field says.
+func DecodeStallReason(b []byte) (StallReason, error) {
+	if len(b) < SizeStallReason {
+		return StallReason{}, ErrShortRecord
+	}
+	le := binary.LittleEndian
+	n := int(le.Uint16(b[4:]))
+	if n > GPUStallNameMax {
+		return StallReason{}, fmt.Errorf("gpuabi: stall name length %d exceeds %d", n, GPUStallNameMax)
+	}
+	return StallReason{
+		Index:     le.Uint32(b[0:]),
+		Name:      string(b[8 : 8+n]),
+		Truncated: b[6] != 0,
+	}, nil
+}
+
+func DecodeSamplingWindow(b []byte) (SamplingWindow, error) {
+	if len(b) < SizeSamplingWindow {
+		return SamplingWindow{}, ErrShortRecord
+	}
+	le := binary.LittleEndian
+	out := SamplingWindow{
+		StartNs: le.Uint64(b[0:]),
+		EndNs:   le.Uint64(b[8:]),
+		Mode:    b[16],
+	}
+	// EndNs == 0 is the encoded "still open" case, not an inversion.
+	if out.EndNs != 0 && out.EndNs < out.StartNs {
+		return SamplingWindow{}, fmt.Errorf("%w: start=%d end=%d", ErrWindowInverted, out.StartNs, out.EndNs)
+	}
+	return out, nil
 }
 
 func DecodeDropped(b []byte) (Dropped, error) {

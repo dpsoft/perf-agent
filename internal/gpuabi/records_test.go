@@ -154,3 +154,145 @@ func TestDecodeKernelNameRejectsLengthPastTheBuffer(t *testing.T) {
 	_, err := DecodeKernelName(b)
 	require.Error(t, err, "a length past the fixed array must not read out of bounds")
 }
+
+// ----- The PC-sampling additions: gpu_stall_reason_map_v1,
+// gpu_sampling_window_v1, and gpu_config_v1's first decoder.
+
+func TestDecodeStallReasonMatchesTheWireLayout(t *testing.T) {
+	require.Equal(t, 136, SizeStallReason, "gpu_stall_reason_map_v1 is 136 bytes")
+
+	b := make([]byte, SizeStallReason)
+	binary.LittleEndian.PutUint32(b[0:], 17) // index
+	binary.LittleEndian.PutUint16(b[4:], 16) // name_len
+	copy(b[8:], "long_scoreboardEXTRA")      // 20 bytes present, 16 declared
+
+	got, err := DecodeStallReason(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(17), got.Index)
+	assert.Equal(t, "long_scoreboard", got.Name[:15])
+	assert.Len(t, got.Name, 16, "name_len is authoritative, not the NUL")
+	assert.False(t, got.Truncated)
+}
+
+func TestDecodeStallReasonFlagsTruncation(t *testing.T) {
+	b := make([]byte, SizeStallReason)
+	binary.LittleEndian.PutUint16(b[4:], uint16(GPUStallNameMax))
+	b[6] = 1 // truncated
+	for i := range GPUStallNameMax {
+		b[8+i] = 'x'
+	}
+	got, err := DecodeStallReason(b)
+	require.NoError(t, err)
+	assert.True(t, got.Truncated, "a truncated stall name must be visible, not silently short")
+	assert.Len(t, got.Name, GPUStallNameMax)
+}
+
+// The decoder reads name_len straight out of a producer-supplied field and
+// then uses it to slice a fixed 128-byte array. A length past the end must
+// come back as an error: a panic here happens on the consumer's ringbuf drain
+// goroutine and takes the whole consumer down, which is a far worse outcome
+// than one refused record. The record is 136 bytes on the wire whatever the
+// field claims, so there is never anything past the array to read.
+func TestDecodeStallReasonRejectsLengthPastTheBuffer(t *testing.T) {
+	for _, n := range []uint16{uint16(GPUStallNameMax) + 1, 200, 0xFFFF} {
+		b := make([]byte, SizeStallReason)
+		binary.LittleEndian.PutUint16(b[4:], n)
+		require.NotPanicsf(t, func() {
+			_, err := DecodeStallReason(b)
+			require.Errorf(t, err, "name_len=%d must be refused", n)
+		}, "name_len=%d must error, never slice out of range", n)
+	}
+
+	// The boundary itself is legal: exactly GPUStallNameMax fills the array.
+	b := make([]byte, SizeStallReason)
+	binary.LittleEndian.PutUint16(b[4:], uint16(GPUStallNameMax))
+	_, err := DecodeStallReason(b)
+	require.NoError(t, err, "a full-length name is not an overrun")
+}
+
+func TestDecodeStallReasonRejectsShortBuffer(t *testing.T) {
+	_, err := DecodeStallReason(make([]byte, SizeStallReason-1))
+	require.ErrorIs(t, err, ErrShortRecord)
+}
+
+func TestDecodeSamplingWindowMatchesTheWireLayout(t *testing.T) {
+	require.Equal(t, 24, SizeSamplingWindow, "gpu_sampling_window_v1 is 24 bytes")
+
+	b := make([]byte, SizeSamplingWindow)
+	binary.LittleEndian.PutUint64(b[0:], 1_000_000_000)
+	binary.LittleEndian.PutUint64(b[8:], 1_050_000_000)
+	b[16] = SamplingModeKernelSerialized
+
+	got, err := DecodeSamplingWindow(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1_000_000_000), got.StartNs)
+	assert.Equal(t, uint64(1_050_000_000), got.EndNs)
+	assert.Equal(t, SamplingModeKernelSerialized, got.Mode)
+	assert.False(t, got.Open(), "a window with an end is closed")
+}
+
+// end_ns == 0 encodes "the producer stopped reporting mid-burst", which is a
+// different fact from a zero-length window and must survive decode as such.
+// Everything at or after such a window's start is "unknown", never "not
+// serialized", so collapsing the two would let perturbed executions be
+// reported as clean ones.
+func TestDecodeSamplingWindowKeepsAnOpenWindowOpen(t *testing.T) {
+	b := make([]byte, SizeSamplingWindow)
+	binary.LittleEndian.PutUint64(b[0:], 1_000_000_000)
+	binary.LittleEndian.PutUint64(b[8:], 0)
+	b[16] = SamplingModeContinuous
+
+	got, err := DecodeSamplingWindow(b)
+	require.NoError(t, err, "an open window is a valid record, not a malformed one")
+	assert.True(t, got.Open())
+	assert.Equal(t, uint64(0), got.EndNs)
+	assert.Equal(t, uint64(1_000_000_000), got.StartNs)
+}
+
+// An inverted window would produce a negative duration in the serialization
+// disclosure and mark an arbitrary set of executions perturbed. It is a
+// producer contract violation and gets its own error rather than being
+// quietly normalized.
+func TestDecodeSamplingWindowRejectsAnInvertedWindow(t *testing.T) {
+	b := make([]byte, SizeSamplingWindow)
+	binary.LittleEndian.PutUint64(b[0:], 2_000)
+	binary.LittleEndian.PutUint64(b[8:], 1_000)
+	_, err := DecodeSamplingWindow(b)
+	require.ErrorIs(t, err, ErrWindowInverted)
+}
+
+func TestDecodeSamplingWindowRejectsShortBuffer(t *testing.T) {
+	_, err := DecodeSamplingWindow(make([]byte, SizeSamplingWindow-1))
+	require.ErrorIs(t, err, ErrShortRecord)
+}
+
+// Mode 0 is not a mode. The producer leaving the field unset must stay
+// distinguishable from it declaring continuous collection, or an unconfigured
+// burst reads as a non-serializing one.
+func TestSamplingModesAreNonZeroAndDistinct(t *testing.T) {
+	assert.NotZero(t, SamplingModeContinuous)
+	assert.NotZero(t, SamplingModeKernelSerialized)
+	assert.NotEqual(t, SamplingModeContinuous, SamplingModeKernelSerialized)
+}
+
+func TestDecodeConfigMatchesTheWireLayout(t *testing.T) {
+	require.Equal(t, 24, SizeConfig)
+
+	b := make([]byte, SizeConfig)
+	binary.LittleEndian.PutUint64(b[0:], 1_695_000_000)
+	binary.LittleEndian.PutUint32(b[8:], 5)
+	binary.LittleEndian.PutUint32(b[12:], 82) // GA102 SM count
+	b[16] = 1
+
+	got, err := DecodeConfig(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1_695_000_000), got.ClockHz)
+	assert.Equal(t, uint32(5), got.SamplingFactor)
+	assert.Equal(t, uint32(82), got.SMCount)
+	assert.Equal(t, uint8(1), got.Vendor)
+}
+
+func TestDecodeConfigRejectsShortBuffer(t *testing.T) {
+	_, err := DecodeConfig(make([]byte, SizeConfig-1))
+	require.ErrorIs(t, err, ErrShortRecord)
+}

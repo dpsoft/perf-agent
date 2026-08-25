@@ -127,6 +127,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 		ew.s(paletteCSS)
 		ew.s(jitterCSS)
 		ew.s(rowCSS(maxDepth))
+		ew.s(treeCSS)
 	}
 	ew.s("</style>\n</head>\n<body>\n")
 
@@ -141,6 +142,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	if err := writeChart(ew, root, maxDepth, res); err != nil {
 		return err
 	}
+	writeTreeContainer(ew, res)
 	writeStatusBar(ew, res)
 	ew.s("<div id=\"tip\" hidden></div>\n")
 
@@ -519,6 +521,8 @@ func writeTopBar(ew *errWriter, opts Options, res *foldedstacks.Result, root *no
 	ew.esc(opts.Title)
 	ew.s("</h1>\n")
 	writeInfoPanel(ew, root, res, opts)
+	ew.s("<button id=\"inv-btn\" type=\"button\" title=\"Invert: root at top (I)\" aria-label=\"Invert the graph\">&#8645;</button>\n")
+	ew.s("<button id=\"tree-btn\" type=\"button\" title=\"Tree view (T)\" aria-label=\"Toggle the tree view\">&#9776;</button>\n")
 	ew.s("<button id=\"theme-btn\" type=\"button\" title=\"Light / dark (D)\" aria-label=\"Toggle light or dark\">&#9680;</button>\n")
 	ew.s("</div>\n")
 }
@@ -549,6 +553,24 @@ func samplePeriod(res *foldedstacks.Result) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// writeTreeContainer emits the empty box the tree view is built into.
+//
+// Empty, and hidden, because the tree is the same data the chart already
+// carries: the script reconstructs it from the frames' depth classes and
+// their document order, which is a pre-order walk. Emitting the rows from Go
+// as well would put every symbol on the page twice — the tree is the one
+// view here that is genuinely scripted, so it costs 61 bytes of markup and
+// nothing at all to a reader who never presses T.
+//
+// role="group" for the same reason the chart has it rather than role="img":
+// it takes an accessible name and leaves its children — a nested <ul> of
+// native <details> disclosures — exposed. See the report for why the tree is
+// a list of disclosures and not role="tree".
+func writeTreeContainer(ew *errWriter, res *foldedstacks.Result) {
+	ew.f("<div id=\"tree\" role=\"group\" aria-label=\"Call tree, %s\" hidden></div>\n",
+		html.EscapeString(res.SampleTypeName+"/"+res.Unit))
 }
 
 // writeStatusBar emits the single permanent line of text on the page. Its
@@ -587,11 +609,14 @@ func writeInfoPanel(ew *errWriter, root *node, res *foldedstacks.Result, opts Op
 
 	ew.s("<h2>Keys</h2>\n<ul class=\"keys\">\n")
 	for _, k := range [][2]string{
+		{"I", "invert: root at top"},
+		{"T", "tree view"},
 		{"Ctrl+F", "search frames"},
+		{"N / Shift+N", "next / previous match (Enter in the field)"},
 		{"0", "reset zoom"},
 		{"Esc", "close this, then clear search, then reset zoom"},
 		{"D", "light / dark"},
-		{"? or I", "this panel"},
+		{"?", "this panel"},
 	} {
 		ew.s("<li><kbd>")
 		ew.esc(k[0])
@@ -651,6 +676,7 @@ func writeLegend(ew *errWriter, root *node) {
 	} else {
 		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching</b> The frame has no symbol, or no CPU stack stands behind it. Hover the frame for which.</li>\n")
 	}
+	ew.s("<li><span class=\"sw\" style=\"background-color:var(--fill-match)\"></span><b>magenta</b> Not a domain: a frame matching the current search. It is the only colour on the page that means something other than which layer a frame belongs to, which is why nothing else uses it.</li>\n")
 	ew.s("</ul>\n")
 	if present[DomainGPUKernel] {
 		ew.s("<p class=\"muted\">A <code>[gpu:kernel:&hellip;]</code> frame is one kernel and its duration.</p>\n")

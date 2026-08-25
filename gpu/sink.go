@@ -41,6 +41,12 @@ type SinkStats struct {
 	PCSamples EventKindStats `json:"pc_samples,omitempty"`
 	Modules   EventKindStats `json:"modules,omitempty"`
 	Events    EventKindStats `json:"events,omitempty"`
+	// SamplingWindows is the serialization disclosure's ingest record. A
+	// dropped window does not lose a measurement — it loses the ability to
+	// say an execution ran unperturbed, which degrades the answer to
+	// "unknown". Counting it here is what makes that degradation visible
+	// rather than looking like a quiet run.
+	SamplingWindows EventKindStats `json:"sampling_windows,omitempty"`
 }
 
 // eventKind identifies which EventKindStats an admission outcome is
@@ -56,6 +62,7 @@ const (
 	kindPCSample
 	kindModule
 	kindEvent
+	kindSamplingWindow
 )
 
 // statsFor returns the EventKindStats field to record kind's outcome
@@ -70,6 +77,8 @@ func (s *CountingSink) statsFor(kind eventKind) *EventKindStats {
 		return &s.stats.PCSamples
 	case kindModule:
 		return &s.stats.Modules
+	case kindSamplingWindow:
+		return &s.stats.SamplingWindows
 	default:
 		return &s.stats.Events
 	}
@@ -372,6 +381,37 @@ func (s *CountingSink) EmitEvent(e GPUTimelineEvent) error {
 		return err
 	}
 	s.statsFor(kindEvent).Accepted++
+	return nil
+}
+
+// EmitSamplingWindow draws on the ANCHOR budget, not the data one, and skips
+// the clock-domain check for the same reason EmitModule does — a window is
+// two timestamps and a mode, with no per-event domain to validate beyond what
+// the wire decoder already enforced.
+//
+// classAnchor because a window is the anchor of the serialization disclosure
+// exactly as a launch is the anchor of a join: bursts are a handful per
+// second while executions are thousands, and letting exec volume starve the
+// windows out of the sink would turn every execution in the run "unknown"
+// while the profile still looked full.
+func (s *CountingSink) EmitSamplingWindow(w GPUSamplingWindow) error {
+	s.mu.Lock()
+	if err := s.admitCapacity(kindSamplingWindow, classAnchor); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
+	err := s.inner.EmitSamplingWindow(w)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.release(classAnchor)
+		s.statsFor(kindSamplingWindow).DroppedDownstream++
+		return err
+	}
+	s.statsFor(kindSamplingWindow).Accepted++
 	return nil
 }
 

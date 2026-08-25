@@ -359,6 +359,123 @@ type GPUPCSample struct {
 	Count         uint64        `json:"count"`
 }
 
+// SamplingMode says which PC-sampling collection mode a GPUSamplingWindow
+// describes. It mirrors GPU_SAMPLING_MODE_* in shim/core/usdt_abi.h, and the
+// zero value is deliberately not one of the two real modes: a producer that
+// left the field unset must not be read as having said "continuous".
+type SamplingMode uint8
+
+const (
+	// SamplingModeUnset is the zero value. A window carrying it says nothing
+	// about whether kernels were serialized, so the interval it covers is
+	// "unknown" rather than either answer.
+	SamplingModeUnset SamplingMode = 0
+	// SamplingModeContinuous is Tier B. Nothing is serialized, so a window in
+	// this mode marks nothing perturbed; it still says the producer was
+	// reporting over that interval.
+	SamplingModeContinuous SamplingMode = 1
+	// SamplingModeKernelSerialized is Tier A. Every kernel that executed while
+	// this window was open ran serialized, sampled or not.
+	SamplingModeKernelSerialized SamplingMode = 2
+)
+
+func (m SamplingMode) String() string {
+	switch m {
+	case SamplingModeContinuous:
+		return "continuous"
+	case SamplingModeKernelSerialized:
+		return "kernel-serialized"
+	default:
+		return "unset"
+	}
+}
+
+// GPUSamplingWindow is one PC-sampling burst: the interval over which the
+// producer had PC sampling enabled on a context.
+//
+// It exists for exactly one reason, and it is not sampling coverage. In
+// kernel-serialized collection the GPU serializes kernels while sampling is
+// on, so every kernel that executed inside a window ran perturbed — SAMPLED OR
+// NOT. The window, not the set of sampled kernels, is therefore the honest
+// unit of the disclosure, and an execution is marked from its overlap with a
+// window rather than from whether any PC sample was attributed to it.
+//
+// EndNs == 0 means the window was still OPEN when the producer stopped
+// reporting. It is NOT a zero-length window and must never be read as one: the
+// producer emits an open record the instant a burst starts and a closed record
+// with the same StartNs when it stops, so a zero here means the closed record
+// never came — a hard exit mid-burst. Treating it as zero-length would mark a
+// whole perturbed tail "not serialized", which is the one answer that must
+// never be reachable by accident.
+type GPUSamplingWindow struct {
+	Backend     GPUBackendID `json:"backend"`
+	PID         uint32       `json:"pid,omitempty"`
+	ClockDomain ClockDomain  `json:"clock_domain,omitempty"`
+	StartNs     uint64       `json:"start_ns"`
+	EndNs       uint64       `json:"end_ns,omitempty"`
+	Mode        SamplingMode `json:"mode,omitempty"`
+	// Lost is how many gpu_sampling_window_v1 records the consumer knows were
+	// dropped between the previous window from this process and this one, from
+	// the producer's own sequence numbers. It is not decoration: a hole in the
+	// window history means the intervals either side of it cannot be shown to
+	// be gaps, so the store uses this to move its coverage start forward
+	// rather than spanning across the hole and reporting an unknown interval
+	// as a proven one.
+	Lost uint64 `json:"lost,omitempty"`
+}
+
+// Open reports whether this window never closed. See the EndNs doc comment:
+// an execution at or after an open window's StartNs is "unknown", never "not
+// serialized".
+func (w GPUSamplingWindow) Open() bool { return w.EndNs == 0 }
+
+// SerializationState is the gpu_serialized disclosure: whether an execution's
+// measured duration was perturbed by kernel serialization.
+//
+// The ZERO VALUE IS "unknown", and that is the whole design. The failure this
+// type exists to make unreachable is a profile that says "not perturbed" when
+// it means "cannot tell" — spec §4 forbids exactly that, and it is the shape
+// of the gpu_join precedent. Making "unknown" the zero value means a field
+// nobody set, a struct built by a test, a value lost in a copy and a code path
+// that forgot to classify all degrade to "unknown"; NONE of them can degrade
+// to "false", because "false" has to be written deliberately.
+type SerializationState uint8
+
+const (
+	// SerializationUnknown: kernel-serialized sampling was selected but no
+	// window covering this execution arrived — a dropped batch, a late
+	// attach, a sequence gap, or a burst that was still open when the
+	// producer stopped reporting. It must never degrade to
+	// SerializationNotSerialized.
+	SerializationUnknown SerializationState = iota
+	// SerializationSerialized: this execution overlapped a burst. Its
+	// duration is PERTURBED BY THE MEASUREMENT and must be read as such.
+	SerializationSerialized
+	// SerializationNotSerialized: nothing was serialized over this
+	// execution's interval. Unconditionally correct in continuous collection
+	// and with PC sampling off — nothing is ever serialized there — and in
+	// kernel-serialized collection only when the agent holds a proven gap.
+	SerializationNotSerialized
+)
+
+// String is the label value. "true"/"false"/"unknown" rather than a Go-ish
+// spelling because these strings ARE the gpu_serialized pprof label values,
+// and the one place they are written is here.
+func (s SerializationState) String() string {
+	switch s {
+	case SerializationSerialized:
+		return "true"
+	case SerializationNotSerialized:
+		return "false"
+	default:
+		return "unknown"
+	}
+}
+
+// MarshalJSON renders the label value rather than the underlying integer, so a
+// serialized Snapshot reads the same way the profile does.
+func (s SerializationState) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
 // TimelineEventKind classifies a GPUTimelineEvent.
 type TimelineEventKind string
 
@@ -487,6 +604,12 @@ type EventSink interface {
 	EmitPCSample(GPUPCSample) error
 	EmitModule(GPUModule) error
 	EmitEvent(GPUTimelineEvent) error
+	// EmitSamplingWindow delivers one PC-sampling burst. It is a method of
+	// its own rather than a GPUTimelineEvent with attributes because the
+	// disclosure it carries must not depend on string parsing: an execution
+	// is marked perturbed from these intervals, and a window that failed to
+	// be recognised would silently downgrade "unknown" to "false".
+	EmitSamplingWindow(GPUSamplingWindow) error
 }
 
 // Backend produces normalized GPU events into an EventSink.

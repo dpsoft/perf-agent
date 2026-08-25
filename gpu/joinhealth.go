@@ -147,6 +147,18 @@ func joinSummary(snap Snapshot, anomalies int) string {
 			plural(uint64(snap.PendingModuleGroups), "kernel group", "kernel groups"))
 	}
 
+	// The serialization disclosure, and only when there is one to make. With
+	// PC sampling off or in continuous collection every execution is "false"
+	// and nothing was ever serialized, so a permanent "0 serialized" clause
+	// would be exactly the zero-valued noise this format avoids.
+	if snap.ExecutionsSerialized > 0 || snap.ExecutionsSerializationUnknown > 0 ||
+		snap.SamplingWindowsReceived > 0 {
+		fmt.Fprintf(&b, "; serialization %d true, %d false, %d unknown over %s",
+			snap.ExecutionsSerialized, snap.ExecutionsNotSerialized,
+			snap.ExecutionsSerializationUnknown,
+			plural(uint64(snap.SamplingWindowsHeld), "burst", "bursts"))
+	}
+
 	switch anomalies {
 	case 0:
 		b.WriteString("; no anomalies")
@@ -195,6 +207,48 @@ func joinAnomalies(snap Snapshot, proj ProjectionStats) []string {
 		add("join outcomes sum to %d but the snapshot holds %d executions — the join counters "+
 			"disagree with what is actually present; treat every figure below as unreliable",
 			outcomes, execs)
+	}
+	// The serialization disclosure's own sum identity, and it is raised in the
+	// same place and for the same reason as the join one above: three
+	// mutually-exclusive outcomes, every execution takes exactly one, so they
+	// must add up to what is actually in the snapshot. A shortfall means an
+	// execution reached the profile with no disclosure at all.
+	if serialization := snap.ExecutionsSerialized + snap.ExecutionsNotSerialized +
+		snap.ExecutionsSerializationUnknown; serialization != execs {
+		add("serialization outcomes sum to %d but the snapshot holds %d executions — some "+
+			"execution carries no gpu_serialized disclosure at all; treat every duration "+
+			"in this profile as unqualified",
+			serialization, execs)
+	}
+	// The whole point of Tier A's disclosure. Raised BEFORE the join
+	// anomalies below because it qualifies the durations themselves rather
+	// than what they were attributed to: a perturbed measurement joined
+	// perfectly is still a perturbed measurement.
+	if snap.ExecutionsSerialized > 0 {
+		add("%d of %d executions ran while GPU kernels were SERIALIZED by the profiler — "+
+			"their durations are inflated by the measurement and are marked "+
+			"gpu_serialized=\"true\". CPU and off-CPU samples taken during those bursts are "+
+			"distorted too and carry no marking at all",
+			snap.ExecutionsSerialized, execs)
+	}
+	if snap.ExecutionsSerializationUnknown > 0 && snap.SamplingWindowsReceived > 0 {
+		add("%d of %d executions cannot be said to have run unperturbed — no sampling window "+
+			"covers them (a dropped batch, a late attach, a sequence gap, or a burst that "+
+			"never closed). They are marked gpu_serialized=\"unknown\" and MUST NOT be read "+
+			"as \"false\"",
+			snap.ExecutionsSerializationUnknown, execs)
+	}
+	if snap.SamplingWindowsOpen > 0 {
+		add("%s still open — the producer stopped reporting mid-burst (a hard exit), so the "+
+			"end of the burst is unknown and every execution from its start onward is "+
+			"gpu_serialized=\"unknown\"",
+			plural(uint64(snap.SamplingWindowsOpen), "sampling window", "sampling windows"))
+	}
+	if dr.EvictedSamplingWindows > 0 {
+		add("%s evicted from the serialization disclosure store — executions that far back "+
+			"degrade from \"false\" to \"unknown\"; raise "+
+			"TimelineConfig.MaxSamplingWindowsPerPID or snapshot more often",
+			plural(dr.EvictedSamplingWindows, "sampling window", "sampling windows"))
 	}
 	if js.UnmatchedExecutionCount > 0 {
 		add("%d of %d executions unmatched — GPU time arrived with no launch to attach it to; "+

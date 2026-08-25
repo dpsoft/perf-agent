@@ -17,6 +17,7 @@ type recordingSink struct {
 	pcSamples int
 	modules   int
 	events    int
+	windows   int
 }
 
 func (r *recordingSink) EmitLaunch(GPUKernelLaunch) error { r.launches++; return nil }
@@ -24,6 +25,10 @@ func (r *recordingSink) EmitExec(GPUKernelExec) error     { r.execs++; return ni
 func (r *recordingSink) EmitPCSample(GPUPCSample) error   { r.pcSamples++; return nil }
 func (r *recordingSink) EmitModule(GPUModule) error       { r.modules++; return nil }
 func (r *recordingSink) EmitEvent(GPUTimelineEvent) error { r.events++; return nil }
+func (r *recordingSink) EmitSamplingWindow(GPUSamplingWindow) error {
+	r.windows++
+	return nil
+}
 
 // erroringSink lets a test control exactly what the downstream sink returns,
 // to exercise the reserve/delegate/settle path when delivery fails.
@@ -31,11 +36,12 @@ type erroringSink struct {
 	err error
 }
 
-func (e *erroringSink) EmitLaunch(GPUKernelLaunch) error { return e.err }
-func (e *erroringSink) EmitExec(GPUKernelExec) error     { return e.err }
-func (e *erroringSink) EmitPCSample(GPUPCSample) error   { return e.err }
-func (e *erroringSink) EmitModule(GPUModule) error       { return e.err }
-func (e *erroringSink) EmitEvent(GPUTimelineEvent) error { return e.err }
+func (e *erroringSink) EmitLaunch(GPUKernelLaunch) error           { return e.err }
+func (e *erroringSink) EmitExec(GPUKernelExec) error               { return e.err }
+func (e *erroringSink) EmitPCSample(GPUPCSample) error             { return e.err }
+func (e *erroringSink) EmitModule(GPUModule) error                 { return e.err }
+func (e *erroringSink) EmitEvent(GPUTimelineEvent) error           { return e.err }
+func (e *erroringSink) EmitSamplingWindow(GPUSamplingWindow) error { return e.err }
 
 // atomicSink is a genuinely concurrency-safe EventSink, used only by the
 // concurrent-access test so a data race in the test double itself can never
@@ -44,11 +50,12 @@ type atomicSink struct {
 	launches atomic.Int64
 }
 
-func (a *atomicSink) EmitLaunch(GPUKernelLaunch) error { a.launches.Add(1); return nil }
-func (a *atomicSink) EmitExec(GPUKernelExec) error     { return nil }
-func (a *atomicSink) EmitPCSample(GPUPCSample) error   { return nil }
-func (a *atomicSink) EmitModule(GPUModule) error       { return nil }
-func (a *atomicSink) EmitEvent(GPUTimelineEvent) error { return nil }
+func (a *atomicSink) EmitLaunch(GPUKernelLaunch) error           { a.launches.Add(1); return nil }
+func (a *atomicSink) EmitExec(GPUKernelExec) error               { return nil }
+func (a *atomicSink) EmitPCSample(GPUPCSample) error             { return nil }
+func (a *atomicSink) EmitModule(GPUModule) error                 { return nil }
+func (a *atomicSink) EmitEvent(GPUTimelineEvent) error           { return nil }
+func (a *atomicSink) EmitSamplingWindow(GPUSamplingWindow) error { return nil }
 
 // fakeClock is an injectable, manually-advanced clock so the token-bucket
 // refill can be tested deterministically instead of racing the wall clock.
@@ -227,6 +234,37 @@ func TestCountingSinkEmitModuleForwardsCountsAndEnforcesCapacity(t *testing.T) {
 	require.Error(t, err, "capacity must still be enforced for modules")
 	assert.True(t, errors.Is(err, ErrSinkFull))
 	assert.Equal(t, uint64(1), s.Stats().Modules.DroppedFull)
+}
+
+// A sampling window draws on the ANCHOR budget, not the data one. That is the
+// whole reason it has its own eventKind: bursts are a handful per second while
+// executions are thousands, and if window admission shared the data bucket a
+// busy workload could starve the disclosure out of the sink — turning every
+// execution in the run gpu_serialized="unknown" while the profile still looked
+// full.
+func TestCountingSinkEmitSamplingWindowDrawsOnTheAnchorBudget(t *testing.T) {
+	inner := &recordingSink{}
+	s := NewCountingSink(inner, 2)
+
+	// Spend the DATA budget entirely; the anchor budget is separate.
+	require.NoError(t, s.EmitExec(GPUKernelExec{ClockDomain: ClockDomainCPUMonotonic}))
+	require.NoError(t, s.EmitExec(GPUKernelExec{ClockDomain: ClockDomainCPUMonotonic}))
+	require.Error(t, s.EmitExec(GPUKernelExec{ClockDomain: ClockDomainCPUMonotonic}))
+
+	require.NoError(t, s.EmitSamplingWindow(GPUSamplingWindow{
+		Backend: BackendCUPTI, PID: 7, StartNs: 100, Mode: SamplingModeKernelSerialized,
+	}))
+	assert.Equal(t, 1, inner.windows)
+	assert.Equal(t, uint64(1), s.Stats().SamplingWindows.Accepted)
+
+	// It is still bounded, and the loss is counted against its own kind
+	// rather than folded into another's.
+	require.NoError(t, s.EmitSamplingWindow(GPUSamplingWindow{Backend: BackendCUPTI, PID: 7, StartNs: 100, EndNs: 200}))
+	err := s.EmitSamplingWindow(GPUSamplingWindow{Backend: BackendCUPTI, PID: 7, StartNs: 300})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrSinkFull))
+	assert.Equal(t, uint64(1), s.Stats().SamplingWindows.DroppedFull)
+	assert.Zero(t, s.Stats().Modules.DroppedFull, "a window's loss must not read as a module's")
 }
 
 // TestCountingSinkConcurrentEmitAndStats exercises CountingSink from many

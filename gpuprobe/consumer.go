@@ -1095,30 +1095,38 @@ type Stats struct {
 	// PC sampling, silently absent, if it were not counted.
 	StallNamesMissing uint64
 	// SamplingWindowsDecoded counts gpu_sampling_window_v1 records read.
-	// One record is one PC-sampling burst. Tier A duty-cycles, so a Tier A
-	// run produces many; Tier B does not burst, so a Tier B run produces
-	// at most one.
+	// A burst reaches the wire TWICE - an open record the instant it starts
+	// and a closed record with the same start_ns when it stops - so this is
+	// about twice the number of bursts on a clean Tier A run. Tier B does
+	// not burst and emits none.
 	//
-	// The windows' CONTENT is not retained yet - the serialization
-	// disclosure that consumes it is Task 10 - so this counter is
-	// deliberately the whole of what the consumer does with them. That
-	// makes the discard sized and visible rather than silent, which is the
-	// contract; it is not a claim that the windows have been used.
+	// The windows are normalized and handed to the sink, where the
+	// serialization disclosure consumes them (gpu/serialization.go). This
+	// counter is the wire-side half of the reconciliation:
+	// Snapshot.SamplingWindowsReceived is what actually reached the store.
 	//
-	// Healthy: non-zero in Tier A, zero or one in Tier B. Worst: zero in
-	// Tier A, where nothing would then say which executions ran perturbed.
+	// Healthy: non-zero in Tier A, zero in Tier B. Worst: zero in Tier A,
+	// where nothing would then say which executions ran perturbed and every
+	// one of them reads serialized="unknown".
 	SamplingWindowsDecoded uint64
 	// SamplingWindowsOpen is the subset of SamplingWindowsDecoded that
 	// arrived with end_ns == 0, which the ABI defines as "still open when
-	// the producer stopped reporting" - a hard exit mid-burst, since the
-	// shim's atexit handler closes the window on the ordinary path. It is
-	// NOT a zero-length window, and the two must never be conflated: an
-	// open window means every execution at or after its start_ns is
-	// serialized="unknown", never "false".
+	// the producer stopped reporting". It is NOT a zero-length window, and
+	// the two must never be conflated: an open window means every execution
+	// at or after its start_ns is serialized="unknown", never "false".
 	//
-	// Healthy: zero. Worst: non-zero, meaning a burst's end is unknown and
-	// an unbounded tail of executions cannot be said to have run
-	// unperturbed.
+	// It is NOT an anomaly by itself, and this is the counter's one
+	// subtlety. The producer emits an open record at every burst START
+	// precisely so that a hard exit leaves the burst visible instead of
+	// losing it, so a healthy Tier A run produces one of these per burst and
+	// this counter tracks SamplingWindowsDecoded / 2. What IS an anomaly is
+	// a window still open once its close should have arrived, which is
+	// Snapshot.SamplingWindowsOpen - a gauge of the store, not a count of
+	// records.
+	//
+	// Healthy: about half of SamplingWindowsDecoded in Tier A, zero in Tier
+	// B. Worst: zero in Tier A, meaning the burst-start records are being
+	// lost and a hard exit would take its whole perturbed tail with it.
 	SamplingWindowsOpen uint64
 	// ConfigsDecoded counts gpu_config_v1 records read. The producer emits
 	// one per process and replays it on late attach, so this counts
@@ -1777,13 +1785,27 @@ func decodeBatch(b []byte) (batch, error) {
 // noteSeq counts batches lost between the ones that arrived. A gap is loss
 // the consumer did not observe and must never be silent (spec §6.1). The
 // stream is identified by (kind, pid): see seqKey. Caller holds mu.
-func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) {
+// noteSeq records a batch's producer sequence number and returns how many
+// records of this kind, from this process, are known to have been lost since
+// the previous one.
+//
+// The return value is not decoration. The serialization disclosure below needs
+// it: a hole in the sampling-window history means the intervals either side of
+// it cannot be shown to be gaps, so the window store has to restart its
+// coverage rather than span across the hole and report an unproven gap as a
+// proven one. That is the difference between gpu_serialized="unknown" and
+// gpu_serialized="false", and it is the one distinction this tier exists to
+// keep.
+func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) uint64 {
 	key := seqKey{kind: kind, pid: pid}
 	prev, seen := c.seqByStream[key]
+	var lost uint64
 	if seen && seq > prev+1 {
-		c.stats.SequenceGaps += seq - prev - 1
+		lost = seq - prev - 1
+		c.stats.SequenceGaps += lost
 	}
 	c.seqByStream[key] = seq
+	return lost
 }
 
 // correlationOf converts a wire correlation into the core's CorrelationID.
@@ -1868,7 +1890,7 @@ func (c *Consumer) applyBatch(b batch) {
 	defer c.mu.Unlock()
 
 	c.stats.Batches++
-	c.noteSeq(b.Kind, b.PID, b.Seq)
+	lost := c.noteSeq(b.Kind, b.PID, b.Seq)
 	// First sight of a process is what makes it interesting to the walker,
 	// and "first sight" is any batch, not the first sampled launch.
 	//
@@ -1976,9 +1998,18 @@ func (c *Consumer) applyBatch(b batch) {
 			c.learnStallNameLocked(s)
 		}
 	case kindSamplingWindow:
-		for _, w := range b.SamplingWindows {
+		for i, w := range b.SamplingWindows {
 			c.stats.Records++
-			c.noteSamplingWindowLocked(w)
+			// The loss is attributed to the FIRST window in the batch and to
+			// no other: `lost` counts records missing before this batch, so
+			// charging it to every record in it would restart the store's
+			// coverage once per window and throw away the rest of the batch's
+			// evidence.
+			var recLost uint64
+			if i == 0 {
+				recLost = lost
+			}
+			c.noteSamplingWindowLocked(b.PID, w, recLost)
 		}
 	case kindConfig:
 		for _, cfg := range b.Configs {
@@ -2147,20 +2178,47 @@ func (c *Consumer) learnStallNameLocked(rec gpuabi.StallReason) {
 	}
 }
 
-// noteSamplingWindowLocked records one PC-sampling burst. Caller holds mu.
+// noteSamplingWindowLocked normalizes one PC-sampling burst and hands it to
+// the sink. Caller holds mu.
 //
-// The window's content is not retained: the serialization disclosure that
-// consumes it - marking which executions ran perturbed - is a later task,
-// and building half of it here would leave a store nothing reads. What this
-// does is make the discard sized and visible, which is the standing rule:
-// counted is not the same as used, and Stats.SamplingWindowsDecoded says so.
-func (c *Consumer) noteSamplingWindowLocked(w gpuabi.SamplingWindow) {
+// The PID comes from the batch header - the process that fired the probe - and
+// travels IN the event rather than being checked somewhere else, the same
+// discipline CorrelationID carries. Two processes both running Tier A produce
+// interleaved windows on one system-wide attach, and a window store that
+// mixed them would mark one process's executions perturbed because the other
+// one was bursting.
+//
+// lost is how many window records from this process are known to have been
+// dropped just before this one. It is the difference between "we hold an
+// unbroken history and can prove this interval was a gap" and "we cannot", so
+// it is carried on the event rather than left as a global counter nobody can
+// attribute.
+func (c *Consumer) noteSamplingWindowLocked(pid uint32, w gpuabi.SamplingWindow, lost uint64) {
 	c.stats.SamplingWindowsDecoded++
 	if w.Open() {
 		// end_ns == 0 is the ABI's "still open when the producer stopped
 		// reporting", not a zero-length window. DecodeSamplingWindow has
 		// already refused a genuinely inverted one.
+		//
+		// This is NOT an anomaly by itself, and its doc comment on Stats says
+		// why: the producer emits an open record at every burst START so that
+		// a hard exit leaves the burst visible rather than losing it, so a
+		// healthy Tier A run produces one of these per burst. What is an
+		// anomaly is a window still open at Snapshot time, which
+		// Snapshot.SamplingWindowsOpen reports.
 		c.stats.SamplingWindowsOpen++
+	}
+	ev := gpu.GPUSamplingWindow{
+		Backend:     c.cfg.Backend,
+		PID:         pid,
+		ClockDomain: gpu.ClockDomainCPUMonotonic,
+		StartNs:     w.StartNs,
+		EndNs:       w.EndNs,
+		Mode:        gpu.SamplingMode(w.Mode),
+		Lost:        lost,
+	}
+	if err := c.cfg.Sink.EmitSamplingWindow(ev); err != nil {
+		c.stats.SinkRejected++
 	}
 }
 

@@ -103,6 +103,28 @@ int main() {
         assert(s.periodic() + s.coalesced() == (uint64_t)kIter);
     }
 
+    // Tier A's range-end drain: mandatory like an unload, counted apart from
+    // it, and it resets the phase so the next tick does not immediately
+    // repeat the pull. cupti_pcsampling.h requires a flush after every
+    // cuptiPCSamplingStop(), so a range-end drain that could be skipped is
+    // the same class of silent PC-identity corruption the unload drain
+    // exists to prevent.
+    {
+        PCDrainSchedule s(100 * kMs);
+        assert(s.due(0));
+        for (int i = 1; i <= 5; i++) s.force((uint64_t)i * kMs, PCDrainReason::kRangeEnd);
+        assert(s.range_end() == 5);
+        assert(s.unload() == 0);
+        assert(s.teardown() == 0);
+        assert(s.periodic() == 1);
+        assert(s.total() == 6);
+        // The phase moved with the last forced drain, so a tick 50ms later
+        // coalesces rather than pulling again.
+        assert(!s.due(55 * kMs));
+        assert(s.coalesced() == 1);
+        assert(s.due(106 * kMs));
+    }
+
     printf("pcdrain_test OK\n");
     return 0;
 }

@@ -100,6 +100,7 @@ type attemptSink struct {
 	pcAttempts     uint64
 	moduleAttempts uint64
 	eventAttempts  uint64
+	windowAttempts uint64
 }
 
 func newAttemptSink(inner EventSink) *attemptSink {
@@ -133,6 +134,11 @@ func (a *attemptSink) EmitModule(m GPUModule) error {
 func (a *attemptSink) EmitEvent(e GPUTimelineEvent) error {
 	a.eventAttempts++
 	return a.inner.EmitEvent(e)
+}
+
+func (a *attemptSink) EmitSamplingWindow(w GPUSamplingWindow) error {
+	a.windowAttempts++
+	return a.inner.EmitSamplingWindow(w)
 }
 
 // conformanceHarness is a fresh Timeline + CountingSink pair, wired the way a
@@ -254,6 +260,14 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	assertPCSampleLossesAccounted(t, snap, sinkStats, h.attempt.pcAttempts)
 	assertPCAttribAccompaniesSamples(t, snap)
 
+	// The serialization disclosure's sum identity, on EVERY scenario in this
+	// file rather than only on the ones that emit windows. That is the point:
+	// the three outcomes are exhaustive and mutually exclusive, so they must
+	// add up in a run with no windows at all exactly as they do in one full of
+	// them, and an execution that reached the profile carrying no disclosure
+	// would otherwise be invisible.
+	assertSerializationOutcomesAccounted(t, snap)
+
 	return snap
 }
 
@@ -285,6 +299,31 @@ func assertPCAttribAccompaniesSamples(t *testing.T, snap Snapshot) {
 		assert.Truef(t, ok,
 			"execution %+v holds %d PC samples with gpu_pc_attrib %q, which is not one of %v",
 			view.Exec.Correlation, len(view.PCSamples), view.PCAttrib, PCAttribs())
+	}
+}
+
+// assertSerializationOutcomesAccounted extends invariant 5's discipline to
+// gpu_serialized: every execution in the snapshot takes exactly one of the
+// three outcomes, so they sum to len(snap.Executions).
+//
+// It also asserts the negative that matters more than the sum: with the
+// default harness configuration (SerializedSampling unset — nothing is ever
+// serialized) NO execution may read "true" or "unknown". A conformance run
+// that started reporting perturbation nobody caused would be as wrong as one
+// that stopped reporting perturbation that happened.
+func assertSerializationOutcomesAccounted(t *testing.T, snap Snapshot) {
+	t.Helper()
+	sum := snap.ExecutionsSerialized + snap.ExecutionsNotSerialized +
+		snap.ExecutionsSerializationUnknown
+	assert.Equal(t, uint64(len(snap.Executions)), sum,
+		"the three gpu_serialized outcomes must sum to the executions in the snapshot")
+	assert.Zero(t, snap.ExecutionsSerialized,
+		"nothing serializes kernels in this configuration")
+	assert.Zero(t, snap.ExecutionsSerializationUnknown,
+		"with no serialized sampling selected, \"false\" is unconditional and correct")
+	for _, v := range snap.Executions {
+		assert.Equal(t, SerializationNotSerialized, v.Serialized,
+			"execution %+v", v.Exec.Correlation)
 	}
 }
 

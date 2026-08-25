@@ -285,9 +285,16 @@ type GPUKernelLaunch struct {
 //
 // There is no separate PID field: the process that produced this execution is
 // carried by Correlation (see CorrelationID), which is the only identity the
-// join uses and therefore the only place it cannot be forgotten. An execution
-// that carried no correlation at all has no process either, and takes the
-// heuristic path.
+// join uses and therefore the only place it cannot be forgotten.
+//
+// An execution that carried no correlation VALUE takes the heuristic path,
+// but that does not make it process-less: Correlation.PID and
+// Correlation.Value are independent (Present() tests Value alone), so a
+// producer that knows which process fired the probe can - and must - say so
+// even when the vendor gave it nothing to correlate on. Issue #52: the
+// heuristic join uses exactly that field to refuse a match across processes,
+// so a record that leaves it zero cannot be joined heuristically at all and
+// degrades to unattributed instead.
 type GPUKernelExec struct {
 	Execution   GPUExecutionRef `json:"execution"`
 	Correlation CorrelationID   `json:"correlation"`
@@ -402,6 +409,52 @@ type JoinStats struct {
 	HeuristicExecutionJoinCount  uint64 `json:"heuristic_execution_join_count,omitempty"`
 	AmbiguousHeuristicMatchCount uint64 `json:"ambiguous_heuristic_match_count,omitempty"`
 	UnmatchedExecutionCount      uint64 `json:"unmatched_execution_count,omitempty"`
+	// CorrelationlessExecutionCount counts executions that arrived carrying
+	// no vendor correlation at all (CorrelationID.Present() == false) and
+	// were therefore routed to the heuristic join instead of the exact one.
+	//
+	// It is the witness that issue #52's path was entered. The heuristic is
+	// meant to be dead code on every backend shipping today: spec §6 makes a
+	// correlation mandatory on every launch and execution, and gpuprobe
+	// supplies one, so this counter reads zero on a healthy run. A path that
+	// is unreachable *by convention* and counts nothing is indistinguishable
+	// from a path nobody exercised; this makes the difference observable, so
+	// a future backend, a malformed record or an adapter written to a
+	// different assumption announces itself instead of quietly starting to
+	// guess.
+	//
+	// It deliberately OVERLAPS the three mutually-exclusive outcome
+	// counters: every execution counted here also lands in exactly one of
+	// HeuristicExecutionJoinCount or UnmatchedExecutionCount (never in
+	// ExactExecutionJoinCount, which by definition requires a correlation).
+	// It is not part of the sum joinAnomalies checks.
+	CorrelationlessExecutionCount uint64 `json:"correlationless_execution_count,omitempty"`
+	// CrossProcessHeuristicBlockedCount counts heuristic joins that were
+	// refused because the execution and the candidate launch could not be
+	// shown to come from the same process - issue #52.
+	//
+	// A candidate DID qualify on queue, kernel name and the time window: had
+	// the join been process-blind, as it was before this counter existed,
+	// this execution would have been handed that launch, along with its
+	// symbolized CPU stack and its Tags (pod_uid, container_id). Every
+	// increment is therefore one cross-container attribution that did not
+	// happen. "Cross-process" includes the case where the process is merely
+	// unknown on one side rather than known-and-different: an unproven
+	// match and a disproven one are refused identically, because a heuristic
+	// join is already a guess and a guess about *which process* is the one
+	// spec §4 forbids.
+	//
+	// The executions are not dropped. They degrade to unattributed - their
+	// measured GPU time stays in the profile under FrameLaunchUnsampled,
+	// carrying no stack and no tags - and are counted in
+	// UnmatchedExecutionCount like any other miss. This counter says why.
+	//
+	// The remedy for a backend that trips it is to populate
+	// CorrelationID.PID even on records that carry no vendor correlation
+	// value: PID and Value are independent there (see CorrelationID.Present),
+	// so "no correlation" and "no process" are separate statements and a
+	// producer that knows the pid can always say so.
+	CrossProcessHeuristicBlockedCount uint64 `json:"cross_process_heuristic_blocked_count,omitempty"`
 	// OutOfWindowDropCount counts heuristic-join misses caused specifically
 	// by LaunchEventJoinWindowNs excluding every candidate that would
 	// otherwise have qualified (i.e. at least one candidate preceded the

@@ -261,12 +261,19 @@ func TestProjectionEmitsGpuJoinHeuristicAndAmbiguous(t *testing.T) {
 		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "newer"},
 		KernelName:  "k_x",
 		TimeNs:      15,
-		Launch:      LaunchContext{PID: 2, TID: 2, TimeNs: 15},
+		// Same process as "older": issue #52 confines a heuristic join to one
+		// process, so two candidates from two processes are no longer
+		// ambiguous - they are in different candidate groups. The ambiguity
+		// this test is about is two launches from the SAME process, which is
+		// the only ambiguity the heuristic can still produce.
+		Launch: LaunchContext{PID: 1, TID: 1, TimeNs: 15},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		// Correlation deliberately zero-valued so the heuristic runs at all.
-		KernelName: "k_x",
-		StartNs:    20, EndNs: 30,
+		// No correlation value, so the heuristic runs at all; pid 1 so it is
+		// allowed to run against pid 1's launches (issue #52).
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     20, EndNs: 30,
 	}))
 
 	samples := ProjectExecutions(tl.Snapshot())

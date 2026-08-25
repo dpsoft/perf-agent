@@ -553,10 +553,43 @@ func (t *Timeline) Snapshot() Snapshot {
 	// not a pathological input, it is what most workloads look like, and a
 	// linear scan there is still O(misses x candidates) even without a
 	// per-miss allocation.
+	//
+	// cacheEntries is read once and shared by both indexes below, so a
+	// snapshot that needs them both still pays LaunchCache.Entries() once.
+	stats := JoinStats{LaunchCount: launchCount}
+	var cacheEntries []GPUKernelLaunch
+	var cacheRead bool
+	entries := func() []GPUKernelLaunch {
+		if !cacheRead {
+			cacheEntries, cacheRead = t.cache.Entries(), true
+		}
+		return cacheEntries
+	}
 	var candidateIndex map[candidateGroupKey][]GPUKernelLaunch
+	// anyProcessIndex is the same grouping with the process dropped, and it
+	// exists ONLY to answer "would a process-blind join have matched here?"
+	// for CrossProcessHeuristicBlockedCount - never to produce a join. It is
+	// built lazily on the first refusal, so a snapshot with no
+	// correlation-less executions (every snapshot on every shipping backend)
+	// never allocates it, and one whose heuristic joins all land in their own
+	// process never allocates it either.
+	var anyProcessIndex map[anyProcessGroupKey][]GPUKernelLaunch
+	// noteBlockedHeuristic counts a refused heuristic join, but only when a
+	// candidate genuinely qualified: an execution that would have missed
+	// anyway is an ordinary miss, and counting it here would make the
+	// "cross-process attributions prevented" figure read high for reasons
+	// that have nothing to do with processes.
+	noteBlockedHeuristic := func(exec GPUKernelExec) {
+		if anyProcessIndex == nil {
+			anyProcessIndex = buildAnyProcessCandidateIndex(entries())
+		}
+		key := anyProcessGroupKey{queue: queueKeyOf(exec.Queue), kernelName: exec.KernelName}
+		if match := findLaunchHeuristic(anyProcessIndex[key], exec, t.joinWindowNs); match.launch != nil {
+			stats.CrossProcessHeuristicBlockedCount++
+		}
+	}
 
 	views := make([]ExecutionView, 0, len(execs))
-	stats := JoinStats{LaunchCount: launchCount}
 	matched := make(map[CorrelationID]struct{})
 	for i, exec := range execs {
 		view := ExecutionView{Exec: exec, PCSamples: execSamples[i]}
@@ -591,10 +624,36 @@ func (t *Timeline) Snapshot() Snapshot {
 			continue
 		}
 
-		if candidateIndex == nil {
-			candidateIndex = buildHeuristicCandidateIndex(t.cache.Entries())
+		// No correlation at all: the heuristic path (spec §10). Counted
+		// before anything else is decided, because this is the boundary
+		// issue #52 is about - see CorrelationlessExecutionCount.
+		stats.CorrelationlessExecutionCount++
+
+		// Issue #52: a heuristic join is only allowed within one process,
+		// and an execution that does not name its process cannot make one.
+		// The pid lives on the correlation even when the correlation carries
+		// no value (CorrelationID.Present tests Value alone), so "no vendor
+		// correlation" and "no process" are separate facts and a producer
+		// that knows the pid can always supply it. When it did not, refuse
+		// and degrade to unattributed rather than guess which process this
+		// GPU time - and the pod_uid/container_id it would inherit from the
+		// chosen launch's Tags - belongs to.
+		execPID := exec.Correlation.PID
+		if execPID == 0 {
+			stats.UnmatchedExecutionCount++
+			noteBlockedHeuristic(exec)
+			views = append(views, view)
+			continue
 		}
-		key := candidateGroupKey{queue: queueKeyOf(exec.Queue), kernelName: exec.KernelName}
+
+		if candidateIndex == nil {
+			candidateIndex = buildHeuristicCandidateIndex(entries())
+		}
+		key := candidateGroupKey{
+			pid:        execPID,
+			queue:      queueKeyOf(exec.Queue),
+			kernelName: exec.KernelName,
+		}
 		if match := findLaunchHeuristic(candidateIndex[key], exec, t.joinWindowNs); match.launch != nil {
 			view.Launch = match.launch
 			view.Join = JoinHeuristic
@@ -610,6 +669,15 @@ func (t *Timeline) Snapshot() Snapshot {
 			if match.outOfWindow {
 				stats.OutOfWindowDropCount++
 			}
+			// The execution named its process and its process had nothing
+			// for it. Another process might still have held a candidate that
+			// a process-blind join would have handed over - the exact
+			// misattribution issue #52 describes - so ask, and count it if
+			// so. A match found here is necessarily another process's: our
+			// own group is a subset of the process-blind one under the same
+			// window, so a candidate of ours that qualified there would have
+			// qualified above.
+			noteBlockedHeuristic(exec)
 		}
 		views = append(views, view)
 	}
@@ -659,17 +727,30 @@ func queueKeyOf(q GPUQueueRef) queueKey {
 	return queueKey{backend: q.Backend, queueID: q.QueueID}
 }
 
-// candidateGroupKey deliberately carries no process. It cannot: the heuristic
-// runs only for an execution that supplied no correlation at all, and since
-// issue #36 the correlation is the only place an execution's process
-// identity lives, so a correlation-less execution has no pid to group by.
-// A correlation-less backend in system-wide mode can therefore still match an
-// execution to another process's launch on (queue, kernel name, time) alone.
-// Closing that needs a process field on GPUKernelExec itself, which no
-// producer in the tree would populate today: the one shipping backend
-// (gpuprobe) supplies a correlation on every launch and execution, as spec §6
-// requires without exception, so nothing reaches this path. Left as a known,
-// documented gap rather than a field nobody writes.
+// candidateGroupKey carries the process, and that is issue #52's fix.
+//
+// It used to carry only (queue, kernel name), on the reasoning that a
+// correlation-less execution has no pid to group by - the heuristic runs only
+// when no correlation was supplied, and since issue #36 the correlation is
+// where an execution's process identity lives. That reasoning was wrong in
+// one specific way: CorrelationID.Present() tests Value alone, so PID and
+// Value are independent fields and a record can carry a process without
+// carrying a correlation (see CorrelationID.Present, and the
+// CorrelationID{Backend: BackendLinuxDRM, PID: 4242} shape the tests pin).
+// The pid #52 says would need a new field on GPUKernelExec was already there.
+//
+// So the heuristic groups by process too, and Timeline.Snapshot refuses the
+// join outright for an execution whose Correlation.PID is zero. The effect is
+// that a correlation-less execution can only ever be handed a launch from its
+// own process, and one that names no process is handed nothing at all - it
+// degrades to unattributed (spec §13) rather than inheriting another
+// process's CPU stack, pod_uid and container_id. Neither refusal is silent:
+// see JoinStats.CorrelationlessExecutionCount and
+// JoinStats.CrossProcessHeuristicBlockedCount.
+//
+// The launch's side of the pid is launchProcessID, not Correlation.PID alone,
+// because a launch carries LaunchContext.PID as well and producers populate
+// them independently.
 //
 // candidateGroupKey is the exact equivalence launchKernelNamesCompatible
 // defines (queue match plus kernel-name equality) turned into a map key.
@@ -684,8 +765,41 @@ func queueKeyOf(q GPUQueueRef) queueKey {
 // fallback design, at the cost of an O(prefix) scan per miss instead of
 // O(log candidates).
 type candidateGroupKey struct {
+	pid        uint32
 	queue      queueKey
 	kernelName string
+}
+
+// anyProcessGroupKey is candidateGroupKey with the process dropped: the
+// grouping the heuristic used BEFORE issue #52. It exists only so
+// Timeline.Snapshot can ask "would the old, process-blind rule have matched
+// here?" and count the answer in
+// JoinStats.CrossProcessHeuristicBlockedCount. Nothing looked up through this
+// key is ever attached to an ExecutionView.
+//
+// Keeping the old rule executable, rather than deleting it, is what stops the
+// guarded path from going dark: a refusal that produced no join and no
+// counter would be indistinguishable from a workload that never had a
+// candidate in the first place, and the whole point of the guard is to know
+// how often it fires.
+type anyProcessGroupKey struct {
+	queue      queueKey
+	kernelName string
+}
+
+// launchProcessID is the process a launch is attributed to, for heuristic
+// grouping. LaunchContext.PID is preferred because it is the host-side
+// observation of who submitted the work and every producer in the tree fills
+// it in; Correlation.PID is the fallback for a launch that carries the
+// process only on its correlation. Zero means the producer named no process,
+// and such a launch can never be a heuristic candidate: Snapshot refuses the
+// join for a zero-pid execution, so the zero group is only ever built, never
+// queried.
+func launchProcessID(l GPUKernelLaunch) uint32 {
+	if l.Launch.PID != 0 {
+		return l.Launch.PID
+	}
+	return l.Correlation.PID
 }
 
 // buildHeuristicCandidateIndex groups cache entries by candidateGroupKey and
@@ -698,9 +812,33 @@ type candidateGroupKey struct {
 // and a linear scan of that group per miss is the same quadratic shape this
 // phase exists to remove, just without the allocation on top.
 func buildHeuristicCandidateIndex(entries []GPUKernelLaunch) map[candidateGroupKey][]GPUKernelLaunch {
-	byGroup := make(map[candidateGroupKey][]GPUKernelLaunch, len(entries))
+	return groupLaunchesByTime(entries, func(l GPUKernelLaunch) candidateGroupKey {
+		return candidateGroupKey{
+			pid:        launchProcessID(l),
+			queue:      queueKeyOf(l.Queue),
+			kernelName: l.KernelName,
+		}
+	})
+}
+
+// buildAnyProcessCandidateIndex is buildHeuristicCandidateIndex without the
+// process in the key - the pre-#52 grouping, retained solely for counting
+// (see anyProcessGroupKey).
+func buildAnyProcessCandidateIndex(entries []GPUKernelLaunch) map[anyProcessGroupKey][]GPUKernelLaunch {
+	return groupLaunchesByTime(entries, func(l GPUKernelLaunch) anyProcessGroupKey {
+		return anyProcessGroupKey{queue: queueKeyOf(l.Queue), kernelName: l.KernelName}
+	})
+}
+
+// groupLaunchesByTime is the shared body of the two indexes above: bucket by
+// keyOf, then sort each bucket by TimeNs ascending so findLaunchHeuristic can
+// binary-search it. The two differ only in their key, and keeping one
+// implementation is what guarantees the "blocked" count is computed under
+// exactly the rule the join itself uses, minus the process.
+func groupLaunchesByTime[K comparable](entries []GPUKernelLaunch, keyOf func(GPUKernelLaunch) K) map[K][]GPUKernelLaunch {
+	byGroup := make(map[K][]GPUKernelLaunch, len(entries))
 	for _, l := range entries {
-		k := candidateGroupKey{queue: queueKeyOf(l.Queue), kernelName: l.KernelName}
+		k := keyOf(l)
 		byGroup[k] = append(byGroup[k], l)
 	}
 	for _, group := range byGroup {

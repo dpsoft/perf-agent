@@ -575,10 +575,22 @@ but the thing worth being adaptive about is the activity path.
 ## 10. Correlation and joins
 
 The join ladder from PR #10 `gpu/timeline.go` is kept: exact correlation ID first,
-then queue + kernel-name + bounded-time heuristic, with `Heuristic` and
+then process + queue + kernel-name + bounded-time heuristic, with `Heuristic` and
 `Ambiguous` marked per view and rolled into `JoinStats`. A guessed join is never
 presented as a vendor-provided one. NVIDIA will mostly take the exact path, but
 PC sample batches arrive late and need the honesty machinery.
+
+Both rungs are process-qualified, and neither may reach across processes (#36 for
+the exact rung, #52 for the heuristic one). The process rides on `CorrelationID.PID`,
+which is independent of `CorrelationID.Value`: `Present()` tests the value alone, so
+a backend with no vendor correlation to report still names the process that produced
+the record. An execution that names neither is refused rather than guessed at — it
+degrades to unattributed, keeping its measured GPU time but taking no launch's CPU
+stack and no launch's `pod_uid`/`container_id`. `JoinStats.CorrelationlessExecutionCount`
+counts every entry into the heuristic rung and
+`JoinStats.CrossProcessHeuristicBlockedCount` counts the refusals where a candidate
+otherwise qualified, so a guarded path that starts firing is visible rather than
+silent.
 
 PC samples are a special case the spike forced (§6.3, finding 3): in continuous
 mode they carry **no correlation ID**, so the exact-correlation rung is not

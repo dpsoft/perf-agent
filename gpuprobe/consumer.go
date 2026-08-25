@@ -375,6 +375,28 @@ type Stats struct {
 	// counter exists because that demotion changes how confidently the join
 	// can be read, and a silent demotion is as bad as silent loss.
 	ZeroCorrelation uint64
+	// ZeroCorrelationExecs is the subset of ZeroCorrelation that arrived on a
+	// gpu_exec_v1 record, and it means something completely different from
+	// the rest of that counter — issue #52.
+	//
+	// A PC sample with no correlation is normal and expected (spec §6.3
+	// finding 3: continuous collection never populates it), and PC samples
+	// dominate the traffic, so ZeroCorrelation is large on a healthy run and
+	// a handful of correlation-less EXECUTIONS is invisible inside it. But an
+	// execution is exactly the record spec §6 says must always carry one: it
+	// is the anchor the exact join runs on, and without it the execution can
+	// only be guessed at (gpu.JoinStats.CorrelationlessExecutionCount is the
+	// consumer-side witness of the same event).
+	//
+	// This counter is therefore the shim contract, made checkable. It must
+	// read zero, and gate_test.go asserts that. Nothing is dropped when it
+	// does not: the execution is normalized and emitted with the zero
+	// correlation, which routes it to the timeline's heuristic join — where,
+	// since #52, it is refused rather than joined across processes, because
+	// correlationOf's zero value carries no pid either. Losing the record
+	// would lose measured GPU time, which is a worse failure than losing its
+	// stack.
+	ZeroCorrelationExecs uint64
 	// KernelDropped counts records the BPF program itself could not deliver:
 	// a batch bigger than one ringbuf reservation, a full ringbuf, or a
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
@@ -1475,6 +1497,14 @@ func (c *Consumer) applyBatch(b batch) {
 	case kindExec:
 		for _, e := range b.Execs {
 			c.stats.Records++
+			if e.Correlation == 0 {
+				// Counted here rather than inside correlationOf, which is
+				// shared with the launch, PC-sample and sampled-stack paths
+				// and cannot tell them apart. See Stats.ZeroCorrelationExecs
+				// for why an execution's zero is a contract violation while a
+				// PC sample's is routine.
+				c.stats.ZeroCorrelationExecs++
+			}
 			ev := gpu.GPUKernelExec{
 				Correlation: c.correlationOf(b.PID, e.Correlation),
 				ClockDomain: gpu.ClockDomainCPUMonotonic,

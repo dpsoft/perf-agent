@@ -472,21 +472,30 @@ func driveCorrelationGaps(sink EventSink) error {
 	}
 
 	// Heuristic-recoverable group: launch and exec share a kernel name and
-	// queue, and the exec's Correlation is left at its zero value - review
-	// Critical 2 restricts the heuristic path to execs that never supplied a
+	// queue, and the exec's Correlation carries no value - review Critical 2
+	// restricts the heuristic path to execs that never supplied a
 	// correlation ID at all (the exact case this group models: a backend,
 	// like DRM, with no correlation concept), so only the heuristic join
 	// (kernel name + queue + causal timing) can attach a launch here.
+	//
+	// It does carry the producing process, matching launch()'s
+	// LaunchContext.PID. Issue #52 made that mandatory: an execution that
+	// names neither a correlation nor a process cannot be joined heuristically
+	// at all, because nothing would stop the guess from reaching into another
+	// process's launch - and its CPU stack and pod_uid/container_id tags. A
+	// correlation-less backend that wants this group's behavior has to say
+	// whose execution it is, which every probe-based producer can.
 	for i := 0; i < 3; i++ {
 		l := launch("gap-heur-"+strconv.Itoa(i), uint64(i*100)+1) // KernelName -> "k_gap-heur-<i>"
 		if err := sink.EmitLaunch(l); err != nil {
 			return err
 		}
 		e := GPUKernelExec{
-			KernelName: l.KernelName,
-			Queue:      l.Queue,
-			StartNs:    uint64(i*100) + 10,
-			EndNs:      uint64(i*100) + 20,
+			Correlation: CorrelationID{Backend: BackendCUPTI, PID: l.Launch.PID},
+			KernelName:  l.KernelName,
+			Queue:       l.Queue,
+			StartNs:     uint64(i*100) + 10,
+			EndNs:       uint64(i*100) + 20,
 		}
 		if err := sink.EmitExec(e); err != nil {
 			return err

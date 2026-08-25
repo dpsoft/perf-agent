@@ -320,6 +320,8 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		"records the BPF program could not deliver: an oversized batch, a full ringbuf, or a faulting read of the producer's buffer")
 	assert.Zero(t, stats.ZeroCorrelation,
 		"the stub never emits correlation 0, so no record may have been demoted to the heuristic join")
+	assert.Zero(t, stats.ZeroCorrelationExecs,
+		"spec §6 makes a correlation mandatory on every execution; a non-zero here is the shim breaking its own contract, and the execution can then only be guessed at (issue #52)")
 	assert.Zero(t, stats.StacksMissing,
 		"StacksMissing is BPF-side capture loss - no scratch, an empty walk, a full or unwritable gpu_stacks - none of which depends on how deep the walk got")
 	// StacksMissing says a capture failed; these say how it could have. All

@@ -57,6 +57,7 @@ type recordingSink struct {
 	execs     []gpu.GPUKernelExec
 	pcSamples []gpu.GPUPCSample
 	modules   []gpu.GPUModule
+	windows   []gpu.GPUSamplingWindow
 	err       error
 	// onEmit, if set, is called after each accepted event. The lifecycle
 	// tests use it to know Run has completed a loop iteration.
@@ -114,6 +115,17 @@ func (s *recordingSink) EmitModule(m gpu.GPUModule) error {
 }
 
 func (s *recordingSink) EmitEvent(gpu.GPUTimelineEvent) error { return s.errOnly() }
+
+func (s *recordingSink) EmitSamplingWindow(w gpu.GPUSamplingWindow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.windows = append(s.windows, w)
+	s.note()
+	return nil
+}
 
 func (s *recordingSink) errOnly() error {
 	s.mu.Lock()
@@ -3239,6 +3251,102 @@ func TestSamplingWindowsAreCountedAndTheOpenOneIsSeparate(t *testing.T) {
 	assert.Equal(t, uint64(1), st.SamplingWindowsOpen,
 		"end_ns == 0 is a hard exit mid-burst, not a zero-length window")
 	assert.Zero(t, st.Undecoded)
+}
+
+// samplingWindowBatchFor is samplingWindowBatch with the batch header's pid
+// and producer sequence spelled out, because both are load-bearing for the
+// serialization disclosure: the pid is what keeps one process's bursts off
+// another's executions, and the sequence is what tells the consumer records
+// were lost.
+func samplingWindowBatchFor(pid uint32, seq uint64, wins ...[3]uint64) []byte {
+	buf := make([]byte, batchHdrSize+len(wins)*gpuabi.SizeSamplingWindow)
+	putU32(buf[0:], kindSamplingWindow)
+	putU32(buf[4:], uint32(len(wins)))
+	putU64(buf[8:], seq)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(len(wins)*gpuabi.SizeSamplingWindow))
+	putU32(buf[32:], ^uint32(0))
+	for i, w := range wins {
+		off := batchHdrSize + i*gpuabi.SizeSamplingWindow
+		putU64(buf[off:], w[0])
+		putU64(buf[off+8:], w[1])
+		buf[off+16] = uint8(w[2])
+	}
+	return buf
+}
+
+// The window has to REACH the sink, carrying the producing process. Counting
+// it and dropping it would leave the disclosure with no evidence at all and
+// every execution reading "unknown" — the exact state Task 7 left this in and
+// said so.
+func TestSamplingWindowsReachTheSinkWithTheirProcess(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, samplingWindowBatchFor(4242, 0,
+		[3]uint64{1_000, 51_000, uint64(gpuabi.SamplingModeKernelSerialized)}))
+
+	require.Len(t, sink.windows, 1)
+	w := sink.windows[0]
+	assert.Equal(t, gpu.BackendCUPTI, w.Backend)
+	assert.Equal(t, uint32(4242), w.PID,
+		"windows are per-process; the pid travels IN the event, not in a check elsewhere")
+	assert.Equal(t, gpu.ClockDomainCPUMonotonic, w.ClockDomain)
+	assert.Equal(t, uint64(1_000), w.StartNs)
+	assert.Equal(t, uint64(51_000), w.EndNs)
+	assert.Equal(t, gpu.SamplingModeKernelSerialized, w.Mode)
+	assert.False(t, w.Open())
+	assert.Zero(t, w.Lost)
+}
+
+// A gap in the producer's window sequence is the difference between "we hold
+// an unbroken history and can prove this interval was a gap" and "we cannot".
+// It is carried on the first window of the batch that noticed it, and on no
+// other — charging it to every record would restart the store's coverage once
+// per window and throw the rest of the batch's evidence away.
+func TestSamplingWindowSequenceGapIsCarriedOnTheFirstWindowOnly(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, samplingWindowBatchFor(4242, 0,
+		[3]uint64{1_000, 2_000, uint64(gpuabi.SamplingModeKernelSerialized)}))
+	// seq jumps 0 -> 3: two records lost.
+	apply(t, c, samplingWindowBatchFor(4242, 3,
+		[3]uint64{9_000, 10_000, uint64(gpuabi.SamplingModeKernelSerialized)},
+		[3]uint64{11_000, 12_000, uint64(gpuabi.SamplingModeKernelSerialized)}))
+
+	require.Len(t, sink.windows, 3)
+	assert.Zero(t, sink.windows[0].Lost)
+	assert.Equal(t, uint64(2), sink.windows[1].Lost)
+	assert.Zero(t, sink.windows[2].Lost,
+		"the loss precedes the batch; it belongs to one record in it, not to all of them")
+	assert.Equal(t, uint64(2), c.Stats().SequenceGaps)
+}
+
+// Another process's sequence is its own. A gap in one must not be charged to
+// the other, or one busy producer would permanently degrade a quiet one's
+// disclosure to "unknown".
+func TestSamplingWindowSequencesArePerProcess(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, samplingWindowBatchFor(1, 0, [3]uint64{1_000, 2_000, 2}))
+	apply(t, c, samplingWindowBatchFor(2, 0, [3]uint64{1_000, 2_000, 2}))
+	apply(t, c, samplingWindowBatchFor(1, 5, [3]uint64{3_000, 4_000, 2}))
+	apply(t, c, samplingWindowBatchFor(2, 1, [3]uint64{3_000, 4_000, 2}))
+
+	require.Len(t, sink.windows, 4)
+	assert.Equal(t, uint64(4), sink.windows[2].Lost, "pid 1 lost four")
+	assert.Zero(t, sink.windows[3].Lost, "pid 2's stream is contiguous")
+}
+
+// A sink that refuses a window is counted, never silent: a refused window is
+// evidence the disclosure will not have.
+func TestRefusedSamplingWindowIsCounted(t *testing.T) {
+	sink := &recordingSink{err: errors.New("full")}
+	c := newTestConsumer(sink)
+	apply(t, c, samplingWindowBatchFor(4242, 0, [3]uint64{1_000, 2_000, 2}))
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.SamplingWindowsDecoded)
+	assert.Equal(t, uint64(1), st.SinkRejected)
 }
 
 // An inverted window is a producer contract violation, not a short buffer.

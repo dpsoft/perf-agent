@@ -39,6 +39,7 @@ namespace perfagent {
 enum class PCDrainReason {
     kPeriodic,      // the drain timer, and the period had elapsed
     kModuleUnload,  // CUPTI_CBID_RESOURCE_MODULE_UNLOAD_STARTING
+    kRangeEnd,      // Tier A: immediately after cuptiPCSamplingStop()
     kTeardown,      // context destroy, finalize or exit
 };
 
@@ -71,10 +72,10 @@ public:
     void force(uint64_t now_ns, PCDrainReason reason) {
         std::lock_guard<std::mutex> g(mu_);
         mark_locked(now_ns);
-        if (reason == PCDrainReason::kModuleUnload) {
-            unload_++;
-        } else {
-            teardown_++;
+        switch (reason) {
+            case PCDrainReason::kModuleUnload: unload_++; break;
+            case PCDrainReason::kRangeEnd: range_end_++; break;
+            default: teardown_++; break;
         }
     }
 
@@ -85,6 +86,11 @@ public:
     // otherwise look exactly like a workload that stopped stalling.
     uint64_t periodic() const { std::lock_guard<std::mutex> g(mu_); return periodic_; }
     uint64_t unload() const { std::lock_guard<std::mutex> g(mu_); return unload_; }
+    // Tier A only. cupti_pcsampling.h requires a PC-data flush "after every
+    // range end i.e. cuptiPCSamplingStop()" when ENABLE_START_STOP_CONTROL is
+    // on, so this is not a rate-limited drain either: it must equal the number
+    // of bursts that closed. Zero in Tier B and with sampling off.
+    uint64_t range_end() const { std::lock_guard<std::mutex> g(mu_); return range_end_; }
     uint64_t teardown() const { std::lock_guard<std::mutex> g(mu_); return teardown_; }
     // Ticks that found the period had not elapsed, because a forced drain had
     // just taken the data. Non-zero is healthy on a module-churning process
@@ -93,7 +99,7 @@ public:
     uint64_t coalesced() const { std::lock_guard<std::mutex> g(mu_); return coalesced_; }
     uint64_t total() const {
         std::lock_guard<std::mutex> g(mu_);
-        return periodic_ + unload_ + teardown_;
+        return periodic_ + unload_ + range_end_ + teardown_;
     }
 
 private:
@@ -108,6 +114,7 @@ private:
     bool drained_ = false;
     uint64_t periodic_ = 0;
     uint64_t unload_ = 0;
+    uint64_t range_end_ = 0;
     uint64_t teardown_ = 0;
     uint64_t coalesced_ = 0;
 };

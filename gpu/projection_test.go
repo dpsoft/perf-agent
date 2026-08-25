@@ -943,3 +943,71 @@ func TestProjectionSourceLabelsCannotBeForgedByAbsence(t *testing.T) {
 		"gpu_src_status is unconditional on PC-DERIVED samples; an execution with none has nothing to say")
 	assert.NotContains(t, samples[2].Labels, "gpu_pc_attrib")
 }
+
+// gpu_serialized is on EVERY sample projected from EVERY execution, with one
+// of exactly three values. It is not omitempty and there is no "only if
+// interesting" branch: an absent label reads as "not perturbed" to a consumer
+// that does not know to check for its absence, which is the failure the whole
+// disclosure exists to prevent.
+func TestSerializedLabelIsUnconditionalAndHasThreeValues(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kA"},
+			Serialized: SerializationSerialized},
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kB"},
+			Serialized: SerializationNotSerialized},
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kC"},
+			Serialized: SerializationUnknown},
+		// A view nobody classified at all. The zero value of
+		// SerializationState is "unknown", so this degrades to the safe
+		// answer rather than to "false".
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kD"}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 4)
+	assert.Equal(t, "true", samples[0].Labels["gpu_serialized"])
+	assert.Equal(t, "false", samples[1].Labels["gpu_serialized"])
+	assert.Equal(t, "unknown", samples[2].Labels["gpu_serialized"])
+	assert.Equal(t, "unknown", samples[3].Labels["gpu_serialized"],
+		"an unclassified execution must degrade to \"unknown\", never to \"false\"")
+	for i, s := range samples {
+		assert.Contains(t, s.Labels, "gpu_serialized", "sample %d", i)
+	}
+}
+
+// It rides on the PC-derived samples too — one per PC sample, all carrying the
+// execution's own disclosure. Serialization is a property of the interval, not
+// of whether a sample landed.
+func TestSerializedLabelReachesEveryPCDerivedSample(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 100, KernelName: "kAdd"},
+			Serialized: SerializationSerialized,
+			PCSamples: []GPUPCSample{
+				{PCOffset: 0x10, Count: 1}, {PCOffset: 0x20, Count: 3}}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 2)
+	for i, s := range samples {
+		assert.Equal(t, "true", s.Labels["gpu_serialized"], "pc sample %d", i)
+	}
+}
+
+// A producer-supplied tag must not be able to forge the disclosure — this is
+// the reserved-name rule, and it matters more here than anywhere else: a tag
+// named gpu_serialized set to "false" would claim a perturbed measurement was
+// clean.
+func TestSerializedLabelBeatsAForgedTag(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"},
+			Serialized: SerializationSerialized,
+			Launch: &GPUKernelLaunch{Launch: LaunchContext{
+				Tags: map[string]string{"gpu_serialized": "false"},
+			}}},
+	}}
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, "true", samples[0].Labels["gpu_serialized"],
+		"a tag named gpu_serialized must never override the derived disclosure")
+}

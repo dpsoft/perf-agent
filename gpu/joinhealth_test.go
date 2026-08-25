@@ -20,6 +20,12 @@ func healthySnapshot() Snapshot {
 			ExactExecutionJoinCount: 512,
 		},
 		LaunchCache: LaunchCacheStats{Live: 256},
+		// PC sampling off, so every execution is "false" unconditionally and
+		// correctly: nothing was ever serialized. Set here rather than left
+		// zero because the zero value of SerializationState is "unknown" and
+		// the three counters must sum to len(Executions) — the same identity
+		// the join outcomes carry, checked in the same place.
+		ExecutionsNotSerialized: 512,
 	}
 }
 
@@ -57,6 +63,16 @@ func anomalousSnapshot() Snapshot {
 		AttributedPCSamples: 900,
 		PendingSamples:      12,
 		PendingCorrelations: 5,
+
+		// Tier A gone wrong in all three ways at once: bursts perturbed some
+		// executions, an unbroken history proved others were untouched, and a
+		// window that never closed leaves the rest unplaceable.
+		SamplingWindowsReceived:        41,
+		SamplingWindowsHeld:            21,
+		SamplingWindowsOpen:            1,
+		ExecutionsSerialized:           120,
+		ExecutionsNotSerialized:        300,
+		ExecutionsSerializationUnknown: 92,
 	}
 }
 
@@ -93,6 +109,10 @@ func TestJoinHealthAnomaliesEachGetTheirOwnLine(t *testing.T) {
 		"11 timeline events evicted",
 		"1 module evicted before this snapshot — kernels from evicted modules resolve",
 		"sink dropped 64 PC samples at admission",
+		"120 of 512 executions ran while GPU kernels were SERIALIZED",
+		"92 of 512 executions cannot be said to have run unperturbed",
+		"1 sampling window still open",
+		"serialization 120 true, 300 false, 92 unknown over 21 bursts",
 	} {
 		assert.Contains(t, joined, want)
 	}

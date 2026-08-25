@@ -10,6 +10,7 @@
 // If this file emits what the stub emits, the consumer, the BPF program, the
 // stack capture and the projection all work unchanged.
 #include "batch.h"
+#include "burst.h"
 #include "clock.h"
 #include "cubin.h"
 #include "cubinqueue.h"
@@ -53,12 +54,17 @@ PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
 // the record must be emitted at a very particular instant (see
 // on_cubin_captured), which a batch's flush would move.
 PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
-// PC sampling (Tier B). All four fire only when PERFAGENT_GPU_PC_SAMPLING is
-// set AND a consumer is attached; the semaphore gate is inside the emitter,
-// the tier gate is g_pc_tier_b.
+// PC sampling. All of these fire only when PERFAGENT_GPU_PC_SAMPLING is set
+// AND a consumer is attached; the semaphore gate is inside the emitter, the
+// tier gate is g_pc_enabled.
 PERFAGENT_USDT_EMITTER(gpu_pc_sample_batch_v1, 40);
 PERFAGENT_USDT_EMITTER(gpu_stall_reason_map_v1, 136);
 PERFAGENT_USDT_EMITTER(gpu_config_v1, 24);
+// Tier A ONLY, and the whole of that tier's honesty obligation: one record
+// per PC-sampling burst, so the consumer can say which executions ran while
+// kernels were serialized. Never fired in Tier B --- nothing is serialized
+// there, so there is no window to disclose.
+PERFAGENT_USDT_EMITTER(gpu_sampling_window_v1, 24);
 // Producer-side loss of every class, including the two PC-sampling omissions
 // CUPTI documents and cannot recover.
 PERFAGENT_USDT_EMITTER(gpu_dropped_v1, 16);
@@ -347,18 +353,47 @@ void on_module_loaded(const CUpti_ResourceData *rd) {
 bool check(CUptiResult r, const char *what);
 unsigned env_uint(const char *name, unsigned dflt);
 
-// ------------------------------------------------- PC sampling (Tier B)
+// --------------------------------------------------------- PC sampling
 //
-// CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS. Kernels are NOT serialized in
-// this mode, which is the only reason it is a candidate for always-on
-// profiling; the cost is that every PC record's correlationId is zero, so a
-// PC sample joins to a kernel through its module and never to the launch that
-// issued it. Tier A (KERNEL_SERIALIZED, duty-cycled) is a separate task and is
-// deliberately not implemented here.
+// Two collection tiers, mutually exclusive, both OFF BY DEFAULT. Nothing
+// below runs, allocates or calls CUPTI unless PERFAGENT_GPU_PC_SAMPLING is
+// set, so merging either of them cannot degrade a profiler that is shipping
+// today.
 //
-// OFF BY DEFAULT. PERFAGENT_GPU_PC_SAMPLING=1 turns it on. Nothing below runs,
-// allocates or calls CUPTI unless that is set, so merging this cannot degrade
-// a profiler that is shipping today.
+// Tier B --- PERFAGENT_GPU_PC_SAMPLING=1, CUPTI_PC_SAMPLING_COLLECTION_MODE_
+// CONTINUOUS. Kernels are NOT serialized in this mode, which is the only
+// reason it is a candidate for always-on profiling; the cost is that every PC
+// record's correlationId is zero, so a PC sample joins to a kernel through its
+// module and never to the launch that issued it.
+//
+// Tier A --- PERFAGENT_GPU_PC_SAMPLING=2, CUPTI_PC_SAMPLING_COLLECTION_MODE_
+// KERNEL_SERIALIZED with ENABLE_START_STOP_CONTROL, duty-cycled by
+// core/burst.h. CUPTI populates correlationId on every PC record here, so a
+// sample joins to a launch --- and therefore to a CPU stack --- exactly. The
+// price is that every kernel that runs while a burst is open runs SERIALIZED,
+// which perturbs the very durations the profile reports. Three things follow
+// and all three are implemented below rather than documented and skipped:
+//
+//   1. The perturbation is BOUNDED by the duty cycle (core/burst.h), not left
+//      to run continuously.
+//   2. The perturbation is DISCLOSED: every burst emits gpu_sampling_window_v1
+//      the moment it opens and again when it closes, and the consumer marks
+//      every execution overlapping a window gpu_serialized="true". The window,
+//      not the set of sampled kernels, is the honest unit --- every kernel
+//      that ran inside a burst ran serialized whether it was sampled or not.
+//   3. Tier A REFUSES to run where CUDA graphs have been observed. A graph
+//      launch fires one runtime callback for N kernels, so N executions share
+//      one correlation and Tier A's exactness claim becomes false while still
+//      looking exact. The refusal is loud and counted (g_tier_a_graph_refused),
+//      never a silent downgrade to Tier B.
+//
+// Start/Stop, not Enable/Disable. cuptiPCSamplingEnable/Disable tears the
+// configuration down and rebuilds it, which is not what the start/stop control
+// exists for; Start/Stop is the documented way to duty-cycle a configured
+// context. CUPTI additionally requires a PC-data flush "after every range end
+// i.e. cuptiPCSamplingStop()" in this configuration, so the stop path drains
+// immediately and marks the shared PCDrainSchedule so the periodic tick does
+// not redundantly repeat it.
 //
 // What CUPTI will not tell us, which the profile must state rather than imply
 // -------------------------------------------------------------------------
@@ -407,7 +442,11 @@ constexpr size_t kPCDefaultCollectNumPcs = 2048;
 // else's process; hitting the bound is counted rather than retried forever.
 constexpr unsigned kPCMaxDrainRounds = 64;
 
-bool g_pc_tier_b = false;                 // PERFAGENT_GPU_PC_SAMPLING
+bool g_pc_enabled = false;                // PERFAGENT_GPU_PC_SAMPLING != 0
+// Tier A. Set from the SAME variable as g_pc_enabled (value 2), so the two
+// tiers are mutually exclusive by construction rather than by a check that
+// can be forgotten --- which is what Task 11's tier selection wants anyway.
+bool g_pc_tier_a = false;
 uint32_t g_pc_period = 0;                 // the exponent actually in force
 size_t g_pc_collect_num_pcs = kPCDefaultCollectNumPcs;
 size_t g_pc_scratch_bytes = 0;            // 0 = CUPTI's default
@@ -454,6 +493,41 @@ std::atomic<unsigned long> g_pc_seq{0};
 std::atomic<unsigned long> g_stall_seq{0};
 std::atomic<unsigned long> g_config_seq{0};
 std::atomic<unsigned long> g_dropped_seq{0};
+std::atomic<unsigned long> g_window_seq{0};
+
+// ------------------------------------------------------ Tier A duty cycle
+//
+// The burst controller and its own timer. It is a SECOND timer, not the drain
+// tick, and that is a deliberate deviation from the plan's "the existing drain
+// timer is its natural home": the drain tick is 100 ms and a 50 ms burst
+// cannot be expressed on it. Quantizing the burst to the drain period would
+// silently double the burst length and therefore the duty fraction --- the one
+// number this tier exists to bound --- so the burst rides a tick of its own
+// whose period is a fraction of the burst length. The flush that CUPTI
+// requires after every range end runs on the stop, immediately, and marks the
+// SHARED PCDrainSchedule so the 100 ms tick coalesces instead of repeating it.
+perfagent::BurstController *g_burst = nullptr;
+perfagent::Drainer *g_burst_timer = nullptr;
+unsigned g_burst_tick_ms = 10;
+
+// Bursts and their total open time. The pair is what bounds the perturbation:
+// burst_ns / wall_ns is the fraction of the run that ran serialized, and it is
+// REPORTED rather than assumed to equal the configured ceiling.
+std::atomic<uint64_t> g_sampling_bursts{0};
+std::atomic<uint64_t> g_sampling_burst_ns{0};
+// Windows actually put on the wire. Two per burst on the ordinary path --- one
+// open at the start, one closed at the end --- so the consumer sees an open
+// window if the process dies mid-burst instead of seeing nothing at all.
+std::atomic<uint64_t> g_windows_emitted{0};
+// cuptiPCSamplingStart / Stop failures. MUST be 0 on a healthy run: a failed
+// start means a window was announced for a burst that never sampled, and a
+// failed stop means kernels stayed serialized past the window's end.
+std::atomic<uint64_t> g_burst_start_failed{0};
+std::atomic<uint64_t> g_burst_stop_failed{0};
+// The CUDA-graph refusal. Non-zero means Tier A stopped, permanently, because
+// exact launch attribution had become false. It is never zero-and-silent: the
+// same condition also rides gpu_dropped_v1 under GPU_DROP_CLASS_GRAPH_EXEC.
+std::atomic<uint64_t> g_tier_a_graph_refused{0};
 
 // Every one of these is assertable at a known value on a healthy run, which is
 // the whole point: a context that failed to enable is otherwise a silent hole
@@ -633,6 +707,23 @@ void pc_disable_ctx(PCContext *c, const char *why) {
 // uses. If any step after the enable fails, the enable is undone rather than
 // left half-applied.
 void pc_enable_ctx(CUcontext ctx) {
+    // The CUDA-graph refusal, at its earliest reachable point. If a graph
+    // execution has already been seen, Tier A's exact-correlation claim is
+    // already false for this process and the tier must not start at all. It
+    // does NOT fall back to CONTINUOUS: a silent downgrade would leave the
+    // operator reading a Tier B profile while believing they asked for Tier A.
+    if (g_pc_tier_a && g_exec_from_graph.load(std::memory_order_relaxed)) {
+        if (g_tier_a_graph_refused.fetch_add(1, std::memory_order_relaxed) == 0) {
+            logf("perfagent-cupti: REFUSING Tier A: %llu CUDA-graph execution(s) already "
+                 "observed. A graph launch fires one callback for N kernels, so N "
+                 "executions share one correlation and Tier A's exact launch "
+                 "attribution would be confidently wrong. PC sampling is NOT enabled "
+                 "for this context; this is not a downgrade to Tier B.\n",
+                 (unsigned long long)g_exec_from_graph.load(std::memory_order_relaxed));
+        }
+        g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     CUpti_PCSamplingEnableParams en{};
     en.size = CUpti_PCSamplingEnableParamsSize;
     en.ctx = ctx;
@@ -653,11 +744,22 @@ void pc_enable_ctx(CUcontext ctx) {
     }
     pc_setup_buffer(c);
 
-    CUpti_PCSamplingConfigurationInfo info[7]{};
+    CUpti_PCSamplingConfigurationInfo info[8]{};
     size_t n = 0;
     info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
     info[n++].attributeData.collectionModeData.collectionMode =
-        CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
+        g_pc_tier_a ? CUPTI_PC_SAMPLING_COLLECTION_MODE_KERNEL_SERIALIZED
+                    : CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
+    if (g_pc_tier_a) {
+        // The duty cycle's mechanism. Without it cuptiPCSamplingStart/Stop
+        // return an error and the only way to bound the perturbation would be
+        // Enable/Disable per burst --- which tears the configuration down and
+        // rebuilds it every 500 ms, re-queries nothing, and is not what the
+        // start/stop control exists for.
+        info[n].attributeType =
+            CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_ENABLE_START_STOP_CONTROL;
+        info[n++].attributeData.enableStartStopControlData.enableStartStopControl = 1;
+    }
     // All stall reasons. The label cardinality is device-fixed (38 on GA102),
     // so collecting all of them costs bytes per PC and nothing that grows with
     // the length of the run.
@@ -681,10 +783,10 @@ void pc_enable_ctx(CUcontext ctx) {
         info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE;
         info[n++].attributeData.hardwareBufferSizeData.hardwareBufferSize = g_pc_hw_buffer_bytes;
     }
-    // ENABLE_START_STOP_CONTROL is deliberately left off. It is what Tier A's
-    // duty cycling needs; in CONTINUOUS mode turning it on would change when a
-    // flush is required (cupti_pcsampling.h: "after every range end") without
-    // buying this tier anything.
+    // In Tier B, ENABLE_START_STOP_CONTROL is deliberately left off: turning
+    // it on in CONTINUOUS mode would change when a flush is required
+    // (cupti_pcsampling.h: "after every range end") without buying that tier
+    // anything. It is set above for Tier A, where it is the whole mechanism.
 
     CUpti_PCSamplingConfigurationInfoParams cp{};
     cp.size = CUpti_PCSamplingConfigurationInfoParamsSize;
@@ -841,6 +943,149 @@ void pc_drain_all(perfagent::PCDrainReason reason) {
     if (reason != perfagent::PCDrainReason::kPeriodic && g_pcb) g_pcb->flush();
 }
 
+// ---------------------------------------------- Tier A: bursts and windows
+//
+// gpu_sampling_window_v1, twice per burst.
+//
+// The OPEN record goes out the instant cuptiPCSamplingStart succeeds, with
+// end_ns = 0. That is what makes end_ns == 0 mean something on the wire: if
+// this process is killed mid-burst, the consumer still holds a record saying a
+// burst was open from start_ns and never closed, and every execution from
+// start_ns onward is gpu_serialized="unknown". Emitting only on the stop would
+// lose the whole burst on a hard exit, and the executions inside it would then
+// read "false" --- "not perturbed" when the truth is "cannot tell", which is
+// the one answer that must never be reachable by accident.
+//
+// The CLOSED record goes out on the stop with the real end_ns and the SAME
+// start_ns, and supersedes the open one in the consumer's store. A closed
+// record never loses to an open one there, so the two orderings a lossy
+// transport can produce both end up correct.
+void emit_window(uint64_t start_ns, uint64_t end_ns) {
+    if (!gpu_sampling_window_v1_enabled()) return;
+    gpu_sampling_window_v1 w{};
+    w.start_ns = start_ns;
+    w.end_ns = end_ns;
+    w.mode = GPU_SAMPLING_MODE_KERNEL_SERIALIZED;
+    // UNBATCHED, like gpu_dropped_v1 and for the same reason: two records per
+    // burst at a few bursts per second is not volume, and a window still
+    // sitting in a partly filled batch when the process dies is a window that
+    // never existed --- which would take the hard-exit disclosure with it.
+    gpu_sampling_window_v1_emit(&w, 1, g_window_seq.fetch_add(1, std::memory_order_relaxed));
+    g_windows_emitted.fetch_add(1, std::memory_order_relaxed);
+}
+
+void pc_start_ctxs_locked() {
+    for (PCContext *c : g_pc_ctxs) {
+        if (!c->enabled) continue;
+        CUpti_PCSamplingStartParams sp{};
+        sp.size = CUpti_PCSamplingStartParamsSize;
+        sp.ctx = c->ctx;
+        if (!check(cuptiPCSamplingStart(&sp), "cuptiPCSamplingStart"))
+            g_burst_start_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void pc_stop_ctxs_locked() {
+    for (PCContext *c : g_pc_ctxs) {
+        if (!c->enabled) continue;
+        CUpti_PCSamplingStopParams sp{};
+        sp.size = CUpti_PCSamplingStopParamsSize;
+        sp.ctx = c->ctx;
+        if (!check(cuptiPCSamplingStop(&sp), "cuptiPCSamplingStop"))
+            g_burst_stop_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Closes an open burst: stop every context, drain (CUPTI requires the flush
+// after every range end), close the window, and hand the yield to the loop.
+// Caller must NOT hold g_pc_mu.
+void burst_close(uint64_t now_ns, uint64_t start_ns) {
+    {
+        std::lock_guard<std::mutex> g(g_pc_mu);
+        pc_stop_ctxs_locked();
+    }
+    // The range-end flush. cupti_pcsampling.h: "If configuration option
+    // ENABLE_START_STOP_CONTROL is enabled, then after every range end i.e.
+    // cuptiPCSamplingStop()". Missing it does not lose data --- it makes two
+    // instructions share a PC identity, silently. force() also moves the
+    // shared schedule's phase so the 100 ms tick coalesces rather than
+    // repeating the pull microseconds later.
+    if (g_pc_schedule) g_pc_schedule->force(now_ns, perfagent::PCDrainReason::kRangeEnd);
+    pc_drain_all(perfagent::PCDrainReason::kRangeEnd);
+    emit_window(start_ns, now_ns);
+    g_sampling_burst_ns.fetch_add(now_ns > start_ns ? now_ns - start_ns : 0,
+                                  std::memory_order_relaxed);
+    // AFTER the drain, which is the whole reason BurstController::closed is a
+    // separate call: the pairs this burst produced only reach g_pc_records on
+    // the flush that follows the stop, so a loop that read the count at stop
+    // time would measure every burst as having yielded nothing and would sit
+    // at the duty floor for the entire run.
+    if (g_burst) g_burst->closed(g_pc_records.load(std::memory_order_relaxed));
+}
+
+// The burst timer's tick. Runs on its own thread; see the note on g_burst.
+void on_burst_tick() {
+    if (!g_pc_tier_a || !g_burst) return;
+    // No enabled context means nothing can be serialized, so there is no
+    // burst to open and no window to announce. This timer starts at the end
+    // of InitializeInjection, which is before the first CONTEXT_CREATED
+    // callback can have fired, so without this the first burst would announce
+    // a window covering executions that were never perturbed. Over-stating
+    // perturbation is the safe direction and would not be a defect --- but it
+    // would be a lie about an interval nothing was sampling, and there is no
+    // reason to tell it.
+    if (!g_ctx_enabled.load(std::memory_order_relaxed) && !g_burst->sampling()) return;
+    const uint64_t now = mono_ns();
+    // The graph refusal, re-checked on every tick and not only at enable
+    // time: a process can run for minutes before its first graph launch, and
+    // the moment one arrives Tier A's exactness claim stops being true. The
+    // controller closes any open burst and never starts another.
+    const bool graphs = g_exec_from_graph.load(std::memory_order_relaxed) != 0;
+    const bool was_refused = g_burst->refused();
+    const uint64_t start_ns = g_burst->burst_start_ns();
+    switch (g_burst->poll(now, graphs)) {
+        case perfagent::BurstAction::kStart: {
+            {
+                std::lock_guard<std::mutex> g(g_pc_mu);
+                pc_start_ctxs_locked();
+            }
+            g_sampling_bursts.fetch_add(1, std::memory_order_relaxed);
+            // The window is announced even if some or all contexts refused to
+            // start (g_burst_start_failed counts that, and must be 0 on a
+            // healthy run). Over-stating the perturbation for one burst marks
+            // executions "true" that were not perturbed, which is the SAFE
+            // direction: the answer that must never be reachable by accident
+            // is "false", and no path here can produce it.
+            emit_window(now, 0);   // open; closed by the kStop below
+            break;
+        }
+        case perfagent::BurstAction::kStop:
+            burst_close(now, start_ns);
+            break;
+        case perfagent::BurstAction::kNone:
+            break;
+    }
+    if (!was_refused && g_burst->refused() && graphs) {
+        g_tier_a_graph_refused.fetch_add(1, std::memory_order_relaxed);
+        logf("perfagent-cupti: REFUSING Tier A: %llu CUDA-graph execution(s) observed "
+             "mid-run. N executions share one correlation, so exact launch "
+             "attribution is false while still looking exact. Bursts have STOPPED "
+             "permanently; this is not a downgrade to Tier B. Executions already "
+             "inside a window stay marked serialized.\n",
+             (unsigned long long)g_exec_from_graph.load(std::memory_order_relaxed));
+    }
+}
+
+// Teardown for the duty cycle. Closes an open burst with a real end timestamp,
+// which is exactly what makes end_ns == 0 on the wire mean a HARD exit and
+// nothing else.
+void burst_shutdown() {
+    if (!g_pc_tier_a || !g_burst) return;
+    const uint64_t now = mono_ns();
+    const uint64_t start_ns = g_burst->burst_start_ns();
+    if (g_burst->shutdown(now) == perfagent::BurstAction::kStop) burst_close(now, start_ns);
+}
+
 // gpu_config_v1: the sampling configuration in force, emitted once, replayed
 // on late attach. sampling_factor is "one PC sample per N SM cycles" --- it is
 // NOT a scale factor and no count is ever multiplied by it.
@@ -879,7 +1124,21 @@ void on_finalize(const char *why) {
     bool expected = false;
     if (!done.compare_exchange_strong(expected, true)) return;
     g_finalize_seen.fetch_add(1, std::memory_order_relaxed);
-    if (!g_pc_tier_b) return;
+    if (!g_pc_enabled) return;
+
+    // Tier A: stop the duty cycle before anything else, so no burst can open
+    // against contexts this function is about to disable. Only the
+    // controller's own mutex is taken here --- deliberately NOT g_pc_mu, which
+    // this function may fail to acquire below and which the fatal-error
+    // callback can already be holding.
+    //
+    // On the fatal-error path an open window is left OPEN on the wire. That is
+    // correct and it is the point: a CUPTI fatal error IS the hard case, and
+    // end_ns == 0 is how the consumer learns that the tail of the run cannot
+    // be said to have run unperturbed. The ordinary exit path closes it first
+    // (at_exit_handler -> burst_shutdown), which is what makes a zero here
+    // mean the hard case specifically.
+    if (g_burst) g_burst->shutdown(mono_ns());
 
     // try_lock, not lock, and this is the one place that is right.
     //
@@ -1011,7 +1270,7 @@ void on_launch(const CUpti_CallbackData *cb) {
 // The RESOURCE callbacks PC sampling needs. Everything here is a no-op unless
 // Tier B is on.
 void on_resource(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
-    if (!g_pc_tier_b || !rd) return;
+    if (!g_pc_enabled || !rd) return;
     switch (cbid) {
         case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
             g_ctx_seen.fetch_add(1, std::memory_order_relaxed);
@@ -1254,7 +1513,7 @@ void report(const char *why) {
     logf("perfagent-cupti: graph_execs=%llu multi_device=%llu devices=%zu\n",
          (unsigned long long)g_exec_from_graph.load(),
          (unsigned long long)g_multi_device.load(), g_devices_seen.size());
-    if (!g_pc_tier_b) {
+    if (!g_pc_enabled) {
         logf("perfagent-cupti: pc_sampling=off (set PERFAGENT_GPU_PC_SAMPLING=1)\n");
         return;
     }
@@ -1263,13 +1522,35 @@ void report(const char *why) {
     // getdata_failed, drain_rounds_capped, pc_dropped_hw, pc_buffer_full and
     // multi_device are all zero. pc_non_user is NOT expected to be zero --- it
     // is the size of a structural omission, not a fault.
+    if (g_pc_tier_a) {
+        // The perturbation, reported rather than assumed. bursts x burst_ns is
+        // how much of this run ran with kernels serialized; duty is that as a
+        // fraction of the interval since the first burst opened. windows must
+        // be 2 x bursts on a clean run (one open, one closed per burst) and
+        // 2 x bursts - 1 when the process died mid-burst.
+        const uint64_t now = mono_ns();
+        logf("perfagent-cupti: tier A bursts=%llu burst_ns=%llu duty=%.4f gap_ns=%llu "
+             "windows=%llu range_end_drains=%llu start_failed=%llu stop_failed=%llu "
+             "graph_refused=%llu sampling_now=%d\n",
+             (unsigned long long)g_sampling_bursts.load(),
+             (unsigned long long)g_sampling_burst_ns.load(),
+             g_burst ? g_burst->duty(now) : 0.0,
+             (unsigned long long)(g_burst ? g_burst->gap_ns() : 0),
+             (unsigned long long)g_windows_emitted.load(),
+             (unsigned long long)(g_pc_schedule ? g_pc_schedule->range_end() : 0),
+             (unsigned long long)g_burst_start_failed.load(),
+             (unsigned long long)g_burst_stop_failed.load(),
+             (unsigned long long)g_tier_a_graph_refused.load(),
+             g_burst && g_burst->sampling() ? 1 : 0);
+    }
     logf("perfagent-cupti: pc %s period=%u(=%u cycles) stall_reasons=%zu "
          "ctx_seen=%llu ctx_enabled=%llu ctx_enable_failed=%llu "
          "ctx_destroyed=%llu ctx_disable_failed=%llu "
          "pc_records=%llu pcs=%llu pc_batch_dropped=%llu pc_unattached=%llu "
          "zero_stall_pairs=%llu getdata=%llu getdata_failed=%llu "
          "drain_rounds_capped=%llu drains_periodic=%llu drains_unload=%llu "
-         "drains_teardown=%llu drains_coalesced=%llu module_unload_drains=%llu "
+         "drains_range_end=%llu drains_teardown=%llu drains_coalesced=%llu "
+         "module_unload_drains=%llu "
          "dropped_hw=%llu buffer_full=%llu non_user_samples=%llu "
          "total_samples=%llu emitted_counts=%llu "
          "graph_execs=%llu multi_device=%llu finalize_seen=%llu "
@@ -1293,6 +1574,7 @@ void report(const char *why) {
          (unsigned long long)g_pc_drain_rounds_capped.load(),
          (unsigned long long)(g_pc_schedule ? g_pc_schedule->periodic() : 0),
          (unsigned long long)(g_pc_schedule ? g_pc_schedule->unload() : 0),
+         (unsigned long long)(g_pc_schedule ? g_pc_schedule->range_end() : 0),
          (unsigned long long)(g_pc_schedule ? g_pc_schedule->teardown() : 0),
          (unsigned long long)(g_pc_schedule ? g_pc_schedule->coalesced() : 0),
          (unsigned long long)g_module_unload_drains.load(),
@@ -1357,7 +1639,7 @@ void on_tick() {
     //
     // It MUST stay above the Tier B gate below. Cubin capture is not part of
     // PC sampling and is on whenever a consumer is attached, so putting this
-    // after `if (!g_pc_tier_b) return;` would silence the offer half of every
+    // after `if (!g_pc_enabled) return;` would silence the offer half of every
     // module capture in the DEFAULT configuration -- with modules_captured
     // still counting up and cubins_sent stuck at zero.
     if (g_cubins) g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
@@ -1375,7 +1657,7 @@ void on_tick() {
         emit_dropped(graphs - reported, GPU_DROP_CLASS_GRAPH_EXEC);
     }
 
-    if (!g_pc_tier_b) return;
+    if (!g_pc_enabled) return;
 
     // The config record is emitted from the tick rather than from the enable
     // path, because sm_count and clock_hz come from a DEVICE activity record
@@ -1404,7 +1686,14 @@ void on_tick() {
 // a partly filled CUPTI buffer at exit are lost, and so is whatever is in the
 // batches.
 void at_exit_handler() {
-    // PC sampling first, and specifically before cuptiActivityFlushAll: the
+    // Tier A's duty cycle first of all. The timer thread is stopped before the
+    // controller is asked to close, so no tick can open a burst against
+    // contexts the finalize below is about to disable -- and the open window
+    // is closed with the exit timestamp, which is precisely what makes
+    // end_ns == 0 on the wire mean a HARD exit and nothing else.
+    if (g_burst_timer) g_burst_timer->stop();
+    burst_shutdown();
+    // PC sampling next, and specifically before cuptiActivityFlushAll: the
     // finalize handler drains and then disables each context, and
     // cuptiPCSamplingDisable is what joins CUPTI's PC worker threads. Doing it
     // after the activity flush would leave those threads running across the
@@ -1550,8 +1839,21 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // here; tier selection is another. This flag is the whole of the switch
     // for now, and its default is what keeps a merge from changing what a
     // shipping profiler does.
-    g_pc_tier_b = env_uint("PERFAGENT_GPU_PC_SAMPLING", 0) != 0;
-    if (g_pc_tier_b) {
+    // 0/unset = off, 1 = Tier B (CONTINUOUS), 2 = Tier A (KERNEL_SERIALIZED,
+    // duty-cycled). One variable, so the two tiers cannot both be selected --
+    // they configure the same per-context CUPTI attribute and "both" would
+    // produce a profile whose attribution quality varied by an axis the
+    // operator cannot see. Task 11 replaces this with a named setting and a
+    // CLI flag; the exclusivity is already structural here.
+    const unsigned pc_mode = env_uint("PERFAGENT_GPU_PC_SAMPLING", 0);
+    g_pc_enabled = pc_mode != 0;
+    g_pc_tier_a = pc_mode == 2;
+    if (pc_mode > 2) {
+        logf("perfagent-cupti: PERFAGENT_GPU_PC_SAMPLING=%u is not a tier "
+             "(1=continuous, 2=serialized); treating it as 1\n", pc_mode);
+        g_pc_tier_a = false;
+    }
+    if (g_pc_enabled) {
         // 0 = leave CUPTI's own SM-count-derived default, which is then read
         // back so gpu_config_v1 reports the real period. Anything outside
         // CUPTI's documented 5..31 is refused here rather than passed through
@@ -1585,6 +1887,31 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                 gpu_config_v1_emit(&r, 1, g_config_seq.fetch_add(1, std::memory_order_relaxed));
         });
     }
+    if (g_pc_tier_a) {
+        perfagent::BurstConfig bc;
+        bc.burst_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_BURST_MS", 50) * 1000000ull;
+        bc.target_rate = (double)env_uint("PERFAGENT_GPU_PC_TARGET_RATE", 100);
+        // Per-mille, so a ceiling can be expressed without a float in the
+        // environment. 100 = 10%.
+        bc.max_duty = (double)env_uint("PERFAGENT_GPU_PC_MAX_DUTY_PERMILLE", 100) / 1000.0;
+        bc.max_gap_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_MAX_GAP_MS", 10000) * 1000000ull;
+        g_burst = new perfagent::BurstController(bc);
+        // The burst timer's period. A fifth of the burst length by default, so
+        // a "50 ms" burst is 50..60 ms rather than 50..150 ms on the 100 ms
+        // drain tick. It costs one wakeup per period doing an atomic load and
+        // a compare when no transition is due.
+        unsigned burst_tick_ms = env_uint("PERFAGENT_GPU_PC_BURST_TICK_MS",
+                                          (unsigned)(bc.burst_ns / 5000000ull));
+        if (!burst_tick_ms) burst_tick_ms = 1;
+        g_burst_timer = new perfagent::Drainer();
+        g_burst_timer->on_tick(on_burst_tick);
+        logf("perfagent-cupti: tier A duty cycle burst_ms=%llu target_rate=%.0f/s "
+             "max_duty=%.3f min_gap_ms=%llu max_gap_ms=%llu tick_ms=%u\n",
+             (unsigned long long)(bc.burst_ns / 1000000ull), bc.target_rate, bc.max_duty,
+             (unsigned long long)(perfagent::burst_min_gap_ns(bc) / 1000000ull),
+             (unsigned long long)(bc.max_gap_ns / 1000000ull), burst_tick_ms);
+        g_burst_tick_ms = burst_tick_ms;
+    }
 
     if (!check(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback, nullptr),
                "cuptiSubscribe"))
@@ -1596,7 +1923,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
           "enable RUNTIME_API");
     check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE),
           "enable RESOURCE");
-    if (g_pc_tier_b) {
+    if (g_pc_enabled) {
         // The only notification that CUPTI is about to finalize itself. Not
         // subscribed when Tier B is off: with no PC sampling enabled there is
         // nothing for the handler to tear down, and the subscription is not
@@ -1609,7 +1936,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
           "cuptiActivityRegisterCallbacks");
     check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL),
           "enable CONCURRENT_KERNEL");
-    if (g_pc_tier_b) {
+    if (g_pc_enabled) {
         // sm_count and clock_hz for gpu_config_v1 have no other source: CUPTI
         // has no device attribute for either and this adapter does not link
         // libcuda. One record per device, delivered once.
@@ -1623,6 +1950,11 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     g_drainer->on_tick(on_tick);
     g_drainer->start(drain_ms);
 
+    // Started AFTER the drain timer and after atexit is armed: a burst that
+    // opened before the exit handler existed could not be closed by it, and
+    // an unclosed window would report a hard exit that did not happen.
+    if (g_burst_timer) g_burst_timer->start(g_burst_tick_ms);
+
     atexit(at_exit_handler);
 
     // The seed is logged because it IS the schedule: with it and the period,
@@ -1633,7 +1965,15 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // sem_at_init vs sem_after_init is the measurement #49 needed: the first
     // fix gated the rendezvous on the semaphore and lost the CUDA path.
     logf("perfagent-cupti: pc_sampling=%s tier=%s\n",
-         g_pc_tier_b ? "on" : "off", g_pc_tier_b ? "B/continuous" : "none");
+         g_pc_enabled ? "on" : "off",
+         !g_pc_enabled ? "none" : (g_pc_tier_a ? "A/kernel-serialized" : "B/continuous"));
+    if (g_pc_tier_a) {
+        logf("perfagent-cupti: WARNING Tier A SERIALIZES GPU kernels while a burst is "
+             "open. Kernel durations inside a window are inflated by the measurement "
+             "and are marked gpu_serialized=\"true\"; CPU and off-CPU samples taken "
+             "during a burst are distorted and carry NO marking at all; and Tier A "
+             "refuses to run where CUDA graphs are in use.\n");
+    }
     logf("perfagent-cupti: initialized pid=%d sample_period=%u sample_seed=0x%016llx "
          "drain_ms=%u clock_offset_ns=%lld enroll=%s sem_at_init=%u sem_after_init=%u "
          "enroll_addr=@%s cubin_addr=@%s cubin_timeout_ms=%u\n",

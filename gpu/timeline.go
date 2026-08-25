@@ -43,6 +43,18 @@ type ExecutionView struct {
 	// execution. Empty exactly when PCSamples is empty, since there is then
 	// nothing to describe; one of PCAttribs() otherwise.
 	PCAttrib PCAttrib `json:"pc_attrib,omitempty"`
+
+	// Serialized is the gpu_serialized disclosure: whether this execution's
+	// measured duration was perturbed by the profiler serializing kernels
+	// around it. Set on EVERY execution, in every tier, by Snapshot — never
+	// left to a caller and never omitted.
+	//
+	// It is NOT `omitempty`, and the JSON tag says so on purpose. An absent
+	// field would read as "not perturbed" to a consumer that does not know to
+	// check for its absence, which is the same failure gpu_join's
+	// unconditional label exists to prevent. The type's zero value is
+	// "unknown" for the same reason (see SerializationState).
+	Serialized SerializationState `json:"serialized"`
 }
 
 // TimelineDropStats counts what Timeline's own bounded storage evicted.
@@ -73,6 +85,13 @@ type TimelineDropStats struct {
 	//
 	// Zero on a healthy run of either tier.
 	EvictedPendingModuleSamples uint64 `json:"evicted_pending_module_samples,omitempty"`
+
+	// EvictedSamplingWindows counts PC-sampling bursts dropped from the
+	// bounded serialization-disclosure store (see windowStore). Eviction there
+	// only ever moves an execution's answer from "false" towards "unknown" —
+	// never the other way — so a non-zero value here costs certainty, not
+	// correctness. Zero on any run shorter than the store's bound.
+	EvictedSamplingWindows uint64 `json:"evicted_sampling_windows,omitempty"`
 }
 
 // Snapshot is a point-in-time, fully-joined view of everything Timeline
@@ -142,6 +161,40 @@ type Snapshot struct {
 	// many executions ended up carrying an inferred gpu_pc_attrib. See
 	// PCJoinStats.
 	PCJoin PCJoinStats `json:"pc_join,omitempty"`
+	// ---- The serialization disclosure (Tier A).
+
+	// SamplingWindowsReceived is the CUMULATIVE number of PC-sampling burst
+	// records accepted into the disclosure store, and SamplingWindowsHeld /
+	// SamplingWindowsOpen are gauges of what it holds right now. A burst
+	// reaches the wire twice — open at its start, closed at its end — so on a
+	// clean Tier A run Received is about twice the number of bursts and Held
+	// is the number of distinct bursts.
+	//
+	// SamplingWindowsOpen is the one to read: non-zero means a burst's end is
+	// unknown, which is what a hard exit mid-burst looks like, and every
+	// execution from that burst's start onward reads "unknown".
+	//
+	// Zero everywhere in Tier B and with sampling off, where nothing is ever
+	// serialized and no window is ever emitted.
+	SamplingWindowsReceived uint64 `json:"sampling_windows_received,omitempty"`
+	SamplingWindowsHeld     int    `json:"sampling_windows_held,omitempty"`
+	SamplingWindowsOpen     int    `json:"sampling_windows_open,omitempty"`
+
+	// The three gpu_serialized outcomes for the executions in THIS snapshot.
+	//
+	// THEY SUM TO len(Executions), EXACTLY. That identity is the same
+	// discipline gpu_join's three outcomes carry, and it is what makes the
+	// disclosure auditable rather than decorative: an execution that fell
+	// through every branch would show up as a shortfall in the sum instead of
+	// silently reading as one of the three. gpu/conformance_test.go asserts
+	// it, including on an empty snapshot.
+	//
+	// ExecutionsSerializationUnknown is the one that matters. It must never
+	// be reported as ExecutionsNotSerialized: "not perturbed" when the truth
+	// is "cannot tell" is precisely what spec §4 forbids.
+	ExecutionsSerialized           uint64 `json:"executions_serialized,omitempty"`
+	ExecutionsNotSerialized        uint64 `json:"executions_not_serialized,omitempty"`
+	ExecutionsSerializationUnknown uint64 `json:"executions_serialization_unknown,omitempty"`
 }
 
 // TimelineConfig configures Timeline's storage bounds.
@@ -235,6 +288,28 @@ type TimelineConfig struct {
 	// against. It is NOT silently skipped, which would make a missing store
 	// look identical to a healthy run with no PC samples.
 	Modules *ModuleStore
+	// SerializedSampling says that KERNEL_SERIALIZED PC sampling (Tier A) was
+	// SELECTED for this run. It is the agent's own configuration, not
+	// something inferred from the wire, and that is the point: "Tier A was
+	// asked for and no window arrived" and "Tier A was never asked for" are
+	// different facts with different answers, and only the agent knows which
+	// one holds.
+	//
+	// FALSE (the default) means every execution is gpu_serialized="false",
+	// unconditionally and correctly — with sampling off or in continuous
+	// collection nothing is ever serialized, so there is nothing to be unsure
+	// about.
+	//
+	// TRUE routes every execution through the window store, where the answer
+	// is "true", "false" or "unknown" depending on the evidence. Task 11 owns
+	// the setting that flips this; nothing here selects a tier.
+	SerializedSampling bool
+
+	// MaxSamplingWindowsPerPID and MaxSamplingWindowPIDs bound the disclosure
+	// store. Zero means defaultMaxSamplingWindowsPerPID /
+	// defaultMaxSamplingWindowPIDs.
+	MaxSamplingWindowsPerPID int
+	MaxSamplingWindowPIDs    int
 }
 
 // Timeline is the indexed join point: it ingests launches, executions, PC
@@ -430,6 +505,20 @@ type Timeline struct {
 	events  *ring[GPUTimelineEvent]
 	modules *ring[GPUModule]
 
+	// windows is the serialization disclosure's evidence store: the
+	// PC-sampling bursts this Timeline has been told about, per process. It is
+	// consulted at Snapshot rather than at EmitExec because a burst's closing
+	// record routinely arrives after the executions it covers — the producer
+	// drains on a timer — so classifying at ingest would mark a burst's own
+	// executions "unknown" for the very reason the window exists.
+	//
+	// serializedSampling is TimelineConfig.SerializedSampling, copied out at
+	// construction. When it is false this store is never consulted and every
+	// execution is "false", which is unconditionally correct in that
+	// configuration.
+	windows            *windowStore
+	serializedSampling bool
+
 	dropped TimelineDropStats
 }
 
@@ -568,7 +657,26 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		modstore:           cfg.Modules,
 
 		devicesByPID: make(map[uint32]processDevices),
+
+		windows:            newWindowStore(cfg.MaxSamplingWindowsPerPID, cfg.MaxSamplingWindowPIDs),
+		serializedSampling: cfg.SerializedSampling,
 	}
+}
+
+// EmitSamplingWindow records one PC-sampling burst.
+//
+// It is accepted in EVERY configuration, not only when SerializedSampling is
+// set. A producer that is emitting windows is a producer that is bursting, and
+// dropping the evidence because the agent's own config disagrees would leave
+// the two ends silently out of step. What SerializedSampling gates is the
+// ANSWER, not the ingest.
+func (t *Timeline) EmitSamplingWindow(w GPUSamplingWindow) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	before := t.windows.evicted
+	t.windows.add(w)
+	t.dropped.EvictedSamplingWindows += t.windows.evicted - before
+	return nil
 }
 
 // isPendingLiveLocked answers orderedFIFO's isLive callback for pendingOrder:
@@ -1155,6 +1263,26 @@ func (t *Timeline) Snapshot() Snapshot {
 	pendingSamples := t.pendingSampleTotal
 	pendingModuleGroups := len(t.pendingModule)
 	pendingModuleSamples := t.pendingModuleSampleTotal
+	// The disclosure's evidence, classified under the lock rather than copied
+	// out: the store is not drained by Snapshot (a window covers executions
+	// that have not arrived yet, and the next snapshot needs it), so the
+	// alternative would be to clone every burst on every call.
+	//
+	// serializedSampling FALSE takes the constant branch. With PC sampling off
+	// or in continuous collection nothing is ever serialized, so "false" is
+	// correct and unconditional and no store is consulted at all.
+	serialization := make([]SerializationState, len(execs))
+	if t.serializedSampling {
+		for i, exec := range execs {
+			serialization[i] = t.windows.classify(exec.Correlation.PID, exec.StartNs, exec.EndNs)
+		}
+	} else {
+		for i := range serialization {
+			serialization[i] = SerializationNotSerialized
+		}
+	}
+	windowsReceived := t.windows.received
+	windowsHeld, windowsOpen := t.windows.windows()
 	t.mu.Unlock()
 
 	// The heuristic's candidate set is built lazily - only once the loop
@@ -1207,8 +1335,14 @@ func (t *Timeline) Snapshot() Snapshot {
 
 	views := make([]ExecutionView, 0, len(execs))
 	matched := make(map[CorrelationID]struct{})
+	// The three gpu_serialized outcomes, counted where the view is BUILT and
+	// before any of the loop's `continue`s, so every execution is counted
+	// exactly once on every path through the join. That is what makes the sum
+	// identity (the three equal len(Executions)) hold by construction rather
+	// than by remembering to count in each branch.
+	var serializedCount, notSerializedCount, serializationUnknownCount uint64
 	for i, exec := range execs {
-		view := ExecutionView{Exec: exec, PCSamples: execSamples[i]}
+		view := ExecutionView{Exec: exec, PCSamples: execSamples[i], Serialized: serialization[i]}
 		// gpu_pc_attrib, decided entirely by which index served this
 		// execution. It is set independently of view.Join and view.Ambiguous
 		// below and never reads or writes either: an execution can be joined
@@ -1220,6 +1354,14 @@ func (t *Timeline) Snapshot() Snapshot {
 			view.PCAttrib = PCAttribExact
 		case len(view.PCSamples) > 0:
 			view.PCAttrib = pcJoin.attribAt(i)
+		}
+		switch view.Serialized {
+		case SerializationSerialized:
+			serializedCount++
+		case SerializationNotSerialized:
+			notSerializedCount++
+		default:
+			serializationUnknownCount++
 		}
 
 		if exec.Correlation.Present() {
@@ -1329,6 +1471,14 @@ func (t *Timeline) Snapshot() Snapshot {
 		PendingModuleSamples: int(pendingModuleSamples),
 		PendingModuleGroups:  pendingModuleGroups,
 		PCJoin:               pcJoin.stats,
+
+		SamplingWindowsReceived: windowsReceived,
+		SamplingWindowsHeld:     windowsHeld,
+		SamplingWindowsOpen:     windowsOpen,
+
+		ExecutionsSerialized:           serializedCount,
+		ExecutionsNotSerialized:        notSerializedCount,
+		ExecutionsSerializationUnknown: serializationUnknownCount,
 	}
 }
 

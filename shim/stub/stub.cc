@@ -53,6 +53,11 @@ PERFAGENT_USDT_EMITTER(gpu_pc_sample_batch_v1, 40);
 PERFAGENT_USDT_EMITTER(gpu_stall_reason_map_v1, 136);
 PERFAGENT_USDT_EMITTER(gpu_config_v1, 24);
 PERFAGENT_USDT_EMITTER(gpu_dropped_v1, 16);
+// Tier A's disclosure. PERFAGENT_STUB_SAMPLING_WINDOWS=<n> synthesizes n
+// KERNEL_SERIALIZED bursts bracketing the executions this stub emits, so the
+// consumer's window -> execution intersection and all three gpu_serialized
+// values are reachable on a machine with no GPU.
+PERFAGENT_USDT_EMITTER(gpu_sampling_window_v1, 24);
 
 // The synthetic stall table. Real names from GA102 rather than invented ones:
 // a consumer that renders these into gpu_stall label values should show what a
@@ -218,7 +223,23 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     unsigned long stall_seq = 0;
     unsigned long config_seq = 0;
     unsigned long dropped_seq = 0;
+    unsigned long window_seq = 0;
     bool names_was_attached = false;
+
+    // Tier A, synthesized. n bursts spread across the executions below, each
+    // emitting an OPEN record (end_ns = 0) and then a CLOSED one with the same
+    // start_ns -- the same two-record shape the CUPTI adapter uses, because
+    // that is what makes a hard exit mid-burst visible instead of losing the
+    // window entirely.
+    //
+    // PERFAGENT_STUB_SAMPLING_WINDOW_OPEN=1 leaves the LAST burst open: the
+    // hard-exit case, where every execution from that start_ns onward is
+    // gpu_serialized="unknown" and must never read "false".
+    const char *winenv = getenv("PERFAGENT_STUB_SAMPLING_WINDOWS");
+    const unsigned sampling_windows = (winenv && *winenv) ? (unsigned)atoi(winenv) : 0;
+    const char *openenv = getenv("PERFAGENT_STUB_SAMPLING_WINDOW_OPEN");
+    const bool leave_last_open = openenv && *openenv && atoi(openenv) != 0;
+    uint64_t first_exec_ns = 0, last_exec_ns = 0;
 
     // The same queue the CUPTI adapter runs, wired the same way: capture on
     // the caller's thread, offer on the drain thread.
@@ -344,6 +365,8 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
         e.device_id = 0;
         e.start_ns = now + 10000;          // 10us after the launch
         e.end_ns = now + 10000 + 50000;    // 50us on device
+        if (!first_exec_ns) first_exec_ns = e.start_ns;
+        last_exec_ns = e.end_ns;
         eb.add(e);
 
         if (period_us) std::this_thread::sleep_for(std::chrono::microseconds(period_us));
@@ -351,6 +374,33 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
 
     lb.flush();
     eb.flush();
+
+    // ---- Tier A, synthesized: the serialization windows.
+    //
+    // The span the executions occupy is cut into 2n slices and every other one
+    // is a burst, so roughly half the executions fall inside a window and half
+    // fall in a gap. That is the shape the consumer has to get right: an
+    // execution intersecting a window is "true", one in a proven gap is
+    // "false", and one outside the covered span entirely is "unknown".
+    if (sampling_windows && last_exec_ns > first_exec_ns) {
+        const uint64_t span = last_exec_ns - first_exec_ns;
+        const uint64_t slice = span / (2ull * sampling_windows);
+        for (unsigned i = 0; i < sampling_windows && slice; i++) {
+            const uint64_t ws = first_exec_ns + (uint64_t)(2 * i) * slice;
+            const uint64_t we = ws + slice;
+            gpu_sampling_window_v1 w{};
+            w.start_ns = ws;
+            w.mode = GPU_SAMPLING_MODE_KERNEL_SERIALIZED;
+            // Open first, always: the consumer must supersede it with the
+            // closed record rather than double-count the burst.
+            if (gpu_sampling_window_v1_enabled())
+                gpu_sampling_window_v1_emit(&w, 1, window_seq++);
+            if (leave_last_open && i + 1 == sampling_windows) break;
+            w.end_ns = we;
+            if (gpu_sampling_window_v1_enabled())
+                gpu_sampling_window_v1_emit(&w, 1, window_seq++);
+        }
+    }
 
     // ---- Tier B, synthesized.
     //
@@ -456,6 +506,11 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
             perfagent::enroll_result_name(enrolled),
             sem_at_enroll, gpu_launch_sampled_v1_semaphore_count(), enroll_name);
+    if (sampling_windows)
+        fprintf(stderr, "stub: sampling_windows=%u records=%lu last_open=%d "
+                        "exec_span=[%llu,%llu]\n",
+                sampling_windows, window_seq, leave_last_open ? 1 : 0,
+                (unsigned long long)first_exec_ns, (unsigned long long)last_exec_ns);
     if (pc_samples)
         fprintf(stderr, "stub: pc_samples=%u stall_reasons=%u cubins=2 functions=4 "
                         "drop_classes=4 replays=%llu\n",

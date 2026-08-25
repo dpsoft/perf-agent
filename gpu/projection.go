@@ -623,6 +623,28 @@ func projectionLabels(view ExecutionView) map[string]string {
 	if view.Ambiguous {
 		labels["gpu_ambiguous"] = "true"
 	}
+	// gpu_serialized is set UNCONDITIONALLY on every execution, exactly as
+	// gpu_join is and for exactly the same reason: an absent label would read
+	// as "not perturbed" to a consumer that does not know to check for its
+	// absence, and "not perturbed" is the one answer that must never be
+	// reachable by accident.
+	//
+	// It rides on every execution rather than only on PC-bearing ones because
+	// serialization is a property of the INTERVAL, not of whether a sample
+	// landed: every kernel that ran inside a burst ran serialized, sampled or
+	// not (see gpu/serialization.go).
+	//
+	// The value comes from SerializationState.String(), whose zero value is
+	// "unknown" — so a view that never reached the classifier degrades to
+	// "unknown" here rather than to "false".
+	//
+	// LIMITATION, stated rather than left to be discovered: this is the GPU
+	// projection. On-CPU and off-CPU samples taken during a burst are
+	// distorted too — serialization inflates precisely the synchronization
+	// wait that off-CPU profiling exists to measure — and they carry no
+	// marking at all, because those profilers know nothing about GPUs.
+	// joinhealth reports it whenever any window was recorded.
+	labels["gpu_serialized"] = view.Serialized.String()
 	// gpu_sample_period rides only on the population that actually carries a
 	// sampled stack, and only when the producer declared a period. It is the
 	// denominator a consumer needs to extrapolate "sampled GPU time" to "all

@@ -128,17 +128,17 @@ func TestEveryProducerProbeHasACookieAndViceVersa(t *testing.T) {
 				"attached, its semaphore never arms, and every record it would carry "+
 				"is silently never produced", probe)
 	}
-	// One probe has a cookie and no producer yet, waiting on a task that is
-	// explicitly not this one. Named rather than skipped: a cookie with no
-	// producer is dead wire surface that reads as coverage, so the list has to
-	// shrink to empty and every entry has to say what shrinks it.
+	// THE LIST IS EMPTY, and that is the state it was built to reach: every
+	// probe the ABI defines is now fired by a producer, so no cookie names
+	// dead wire surface that reads as coverage.
 	//
-	// gpu_module_load_v1 left this list when Task 5 landed: both producers
-	// fire it now, and the assertion below is what forced the entry out rather
-	// than letting it sit here claiming a gap that had closed.
-	notYetFired := map[string]string{
-		"gpu_sampling_window_v1": "Tier A, KERNEL_SERIALIZED, duty-cycled (Task 10)",
-	}
+	// It emptied one entry at a time and each time because this assertion
+	// forced it, not because anyone remembered. gpu_module_load_v1 left when
+	// Task 5 landed; gpu_sampling_window_v1 left when Tier A started emitting
+	// a window around every burst. A future probe added ahead of its producer
+	// goes back in here with the task that will fire it named, and comes out
+	// the same way.
+	notYetFired := map[string]string{}
 	for _, probe := range knownProbeNames {
 		if _, ok := emitted[probe]; ok {
 			assert.NotContainsf(t, notYetFired, probe,

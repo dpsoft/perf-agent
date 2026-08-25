@@ -52,10 +52,12 @@ func newTestConsumer(sink gpu.EventSink) *Consumer {
 // reject so the SinkRejected accounting is exercised. It is mutex-guarded
 // because the lifecycle tests below drive it from Run's goroutine.
 type recordingSink struct {
-	mu       sync.Mutex
-	launches []gpu.GPUKernelLaunch
-	execs    []gpu.GPUKernelExec
-	err      error
+	mu        sync.Mutex
+	launches  []gpu.GPUKernelLaunch
+	execs     []gpu.GPUKernelExec
+	pcSamples []gpu.GPUPCSample
+	modules   []gpu.GPUModule
+	err       error
 	// onEmit, if set, is called after each accepted event. The lifecycle
 	// tests use it to know Run has completed a loop iteration.
 	onEmit func()
@@ -89,8 +91,28 @@ func (s *recordingSink) EmitExec(e gpu.GPUKernelExec) error {
 	return nil
 }
 
-func (s *recordingSink) EmitPCSample(gpu.GPUPCSample) error   { return s.errOnly() }
-func (s *recordingSink) EmitModule(gpu.GPUModule) error       { return s.errOnly() }
+func (s *recordingSink) EmitPCSample(p gpu.GPUPCSample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.pcSamples = append(s.pcSamples, p)
+	s.note()
+	return nil
+}
+
+func (s *recordingSink) EmitModule(m gpu.GPUModule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.modules = append(s.modules, m)
+	s.note()
+	return nil
+}
+
 func (s *recordingSink) EmitEvent(gpu.GPUTimelineEvent) error { return s.errOnly() }
 
 func (s *recordingSink) errOnly() error {
@@ -187,13 +209,15 @@ func TestProbeKindCookiesMatchTheBPFProgram(t *testing.T) {
 	assert.Equal(t, uint64(0), cookieFor("gpu_unknown_v9"), "unknown probes are not attached")
 }
 
-// Module and PC-sample records are on the wire in Phase 3 but are not turned
-// into canonical events until Phases 4 and 6. They must be counted, not
-// silently discarded — §6.1 admits no silent loss anywhere.
+// Stats.Undecoded is the "carried but not interpreted" counter. Every kind
+// the ABI defines now has an applyBatch arm, so the only way to reach it is
+// with a kind neither side of the wire knows - which is the ABI having
+// drifted, and which must still be counted rather than dropped quietly
+// (§6.1 admits no silent loss anywhere).
 func TestUndecodedKindsAreCountedNotDropped(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
 	buf := make([]byte, batchHdrSize+40)
-	putU32(buf[0:], kindModule)
+	putU32(buf[0:], 15) // below kindMax, above every kind either side defines
 	putU32(buf[4:], 1)
 	putU64(buf[24:], 40)
 
@@ -2793,15 +2817,21 @@ func TestDecodeRejectsCountBeyondPayloadForTheNewKinds(t *testing.T) {
 	}
 }
 
-// Until applyBatch grows arms for them, the new kinds are carried undecoded
-// and counted. "Counted" is the whole point: spec §6.1 admits no silent loss,
-// and a kind the consumer ignores without counting is exactly that.
-func TestNewKindsAreCarriedUndecodedAndCounted(t *testing.T) {
+// ----- Task 7: the five PC-sampling kinds are normalized, not carried.
+//
+// This is the assertion Task 2 left to be flipped. Undecoded was the
+// contract while the kinds were on the wire and uninterpreted; now every one
+// of them has an applyBatch arm, so the counter must read zero for all five
+// and the records must be counted in Records instead.
+
+func TestTheFivePCSamplingKindsAreDecodedNotCountedUndecoded(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		kind uint32
 		size int
 	}{
+		{"module", kindModule, gpuabi.SizeModuleLoad},
+		{"pc", kindPC, gpuabi.SizePCSample},
 		{"stallmap", kindStallMap, gpuabi.SizeStallReason},
 		{"samplingwindow", kindSamplingWindow, gpuabi.SizeSamplingWindow},
 		{"config", kindConfig, gpuabi.SizeConfig},
@@ -2811,16 +2841,490 @@ func TestNewKindsAreCarriedUndecodedAndCounted(t *testing.T) {
 			putU32(buf[0:], tc.kind)
 			putU32(buf[4:], 1)
 			putU64(buf[24:], uint64(tc.size))
+			// A sampling window with end_ns == 0 is the "open" case, which
+			// is legal; give this one a real end so the healthy-run
+			// assertions below hold for every kind alike.
+			if tc.kind == kindSamplingWindow {
+				putU64(buf[batchHdrSize:], 1_000)
+				putU64(buf[batchHdrSize+8:], 2_000)
+				buf[batchHdrSize+16] = gpuabi.SamplingModeContinuous
+			}
 
 			b, err := decodeBatch(buf)
 			require.NoError(t, err)
 
 			c := newTestConsumer(&recordingSink{})
 			c.applyBatch(b)
-			assert.Equal(t, uint64(1), c.Stats().Undecoded,
-				"a kind the transport carries but applyBatch does not normalize must be counted")
+			c.Flush()
+			st := c.Stats()
+			assert.Zero(t, st.Undecoded,
+				"applyBatch has an arm for this kind now; Undecoded reading non-zero means it fell through to default:")
+			assert.Equal(t, uint64(1), st.Records,
+				"a decoded record is counted in Records, which is what Undecoded stopped counting")
+			assert.Zero(t, st.SinkRejected)
+			assert.Zero(t, st.Malformed)
+			assert.Zero(t, st.SamplingWindowsOpen)
+			assert.Zero(t, st.ConfigsDisagreed)
+			assert.Zero(t, st.StallNamesEvicted)
+			assert.Zero(t, st.StallNamesTruncated)
 		})
 	}
+}
+
+// moduleBatch builds one gpu_module_load_v1 batch.
+func moduleBatch(pid uint32, crc, moduleID, size, loadNs, bytesPtr uint64) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeModuleLoad)
+	putU32(buf[0:], kindModule)
+	putU32(buf[4:], 1)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(gpuabi.SizeModuleLoad))
+	putU32(buf[32:], ^uint32(0)) // stack_id = -1 on every non-sampled kind
+	rec := buf[batchHdrSize:]
+	putU64(rec[0:], crc)
+	putU64(rec[8:], moduleID)
+	putU64(rec[16:], size)
+	putU64(rec[24:], loadNs)
+	putU64(rec[32:], bytesPtr)
+	return buf
+}
+
+// pcSample is one wire gpu_pc_sample_batch_v1 record's worth of fields.
+type pcSample struct {
+	crc         uint64
+	correlation uint64
+	pcOffset    uint64
+	fnIndex     uint32
+	stallIndex  uint32
+	count       uint32
+}
+
+// pcBatch builds one gpu_pc_sample_batch_v1 batch of n records.
+func pcBatch(pid uint32, seq uint64, samples ...pcSample) []byte {
+	n := len(samples)
+	buf := make([]byte, batchHdrSize+n*gpuabi.SizePCSample)
+	putU32(buf[0:], kindPC)
+	putU32(buf[4:], uint32(n))
+	putU64(buf[8:], seq)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(n*gpuabi.SizePCSample))
+	putU32(buf[32:], ^uint32(0))
+	for i, s := range samples {
+		rec := buf[batchHdrSize+i*gpuabi.SizePCSample:]
+		putU64(rec[0:], s.crc)
+		putU64(rec[8:], s.correlation)
+		putU64(rec[16:], s.pcOffset)
+		putU32(rec[24:], s.fnIndex)
+		putU32(rec[28:], s.stallIndex)
+		putU32(rec[32:], s.count)
+	}
+	return buf
+}
+
+// stallMapBatch builds one gpu_stall_reason_map_v1 batch from index -> name
+// pairs, in the given order.
+func stallMapBatch(seq uint64, indices []uint32, names []string, truncated bool) []byte {
+	n := len(indices)
+	buf := make([]byte, batchHdrSize+n*gpuabi.SizeStallReason)
+	putU32(buf[0:], kindStallMap)
+	putU32(buf[4:], uint32(n))
+	putU64(buf[8:], seq)
+	putU64(buf[24:], uint64(n*gpuabi.SizeStallReason))
+	putU32(buf[32:], ^uint32(0))
+	for i := range indices {
+		rec := buf[batchHdrSize+i*gpuabi.SizeStallReason:]
+		putU32(rec[0:], indices[i])
+		binary.LittleEndian.PutUint16(rec[4:], uint16(len(names[i])))
+		if truncated {
+			rec[6] = 1
+		}
+		copy(rec[8:], names[i])
+	}
+	return buf
+}
+
+func samplingWindowBatch(startNs, endNs uint64, mode uint8) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeSamplingWindow)
+	putU32(buf[0:], kindSamplingWindow)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeSamplingWindow))
+	putU32(buf[32:], ^uint32(0))
+	putU64(buf[batchHdrSize:], startNs)
+	putU64(buf[batchHdrSize+8:], endNs)
+	buf[batchHdrSize+16] = mode
+	return buf
+}
+
+func configBatch(clockHz uint64, factor, smCount uint32) []byte {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeConfig)
+	putU32(buf[0:], kindConfig)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], uint64(gpuabi.SizeConfig))
+	putU32(buf[32:], ^uint32(0))
+	putU64(buf[batchHdrSize:], clockHz)
+	putU32(buf[batchHdrSize+8:], factor)
+	putU32(buf[batchHdrSize+12:], smCount)
+	buf[batchHdrSize+16] = 1 // vendor
+	return buf
+}
+
+// A module load says THAT a module loaded, with its content hash and size.
+// bytes_ptr is decoded and deliberately dropped: it points into the
+// producer's address space and following it would need CAP_SYS_PTRACE.
+func TestModuleLoadIsNormalizedAndBytesPtrIsNotFollowed(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, moduleBatch(4242, 0xC0FFEE, 9, 8192, 1_700_000, 0x7f1234560000))
+
+	require.Len(t, sink.modules, 1)
+	assert.Equal(t, gpu.ModuleRef{Backend: gpu.BackendCUPTI, CRC: 0xC0FFEE}, sink.modules[0].Ref,
+		"a module is identified by content hash, never by the producer's module id")
+	assert.Equal(t, uint64(8192), sink.modules[0].SizeBytes)
+	assert.Equal(t, uint64(1_700_000), sink.modules[0].LoadedNs)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.ModulesDecoded)
+	assert.Zero(t, st.Undecoded)
+	assert.Zero(t, st.SinkRejected)
+}
+
+// The ordinary Tier B order: the stall map first, then the PC samples that
+// refer to it. Every sample resolves, nothing waits, nothing is missing.
+func TestPCSamplesResolveStallNamesFromTheMap(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, stallMapBatch(1,
+		[]uint32{0, 17, 23},
+		[]string{"selected", "long_scoreboard", "mio_throttle"}, false))
+	apply(t, c, pcBatch(4242, 1,
+		pcSample{crc: 0xAA, pcOffset: 0x40, fnIndex: 3, stallIndex: 17, count: 5},
+		pcSample{crc: 0xAA, pcOffset: 0x50, fnIndex: 3, stallIndex: 0, count: 2},
+	))
+
+	require.Len(t, sink.pcSamples, 2)
+	assert.Equal(t, "long_scoreboard", sink.pcSamples[0].StallReason)
+	assert.Equal(t, "selected", sink.pcSamples[1].StallReason,
+		"stall index 0 is an ordinary vendor index, not a sentinel meaning 'no stall reason'")
+	assert.Equal(t, gpu.ModuleRef{Backend: gpu.BackendCUPTI, CRC: 0xAA}, sink.pcSamples[0].Module)
+	assert.Equal(t, uint64(0x40), sink.pcSamples[0].PCOffset)
+	assert.Equal(t, uint64(5), sink.pcSamples[0].Count)
+	assert.Equal(t, gpu.ClockDomainCPUMonotonic, sink.pcSamples[0].ClockDomain)
+
+	st := c.Stats()
+	assert.Zero(t, st.Undecoded)
+	assert.Zero(t, st.StallNamesMissing, "every index was in the map")
+	assert.Zero(t, st.PendingStallSamples)
+	assert.Equal(t, uint64(2), st.PCSamplesDecoded)
+	assert.Equal(t, uint64(3), st.StallNamesLearned)
+	assert.Equal(t, 3, st.KnownStallNames)
+}
+
+// The order the ABI actually produces on a fresh attach: the stall map is
+// one-shot plus late-attach replay, so the FIRST PC batch of a run routinely
+// precedes it. Those samples must be held and resolved when the map lands,
+// not sent out permanently blank.
+func TestPCBatchBeforeItsStallMapStillResolves(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, pcBatch(4242, 1,
+		pcSample{crc: 0xAA, pcOffset: 0x40, stallIndex: 17, count: 5},
+		pcSample{crc: 0xAA, pcOffset: 0x50, stallIndex: 17, count: 1},
+	))
+	assert.Empty(t, sink.pcSamples, "a sample with an unmapped index waits rather than going out blank")
+	assert.Equal(t, 2, c.Stats().PendingStallSamples)
+
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+
+	require.Len(t, sink.pcSamples, 2)
+	assert.Equal(t, "long_scoreboard", sink.pcSamples[0].StallReason)
+	assert.Equal(t, "long_scoreboard", sink.pcSamples[1].StallReason)
+	assert.Equal(t, uint64(0x40), sink.pcSamples[0].PCOffset,
+		"held samples are released oldest first")
+
+	st := c.Stats()
+	assert.Zero(t, st.StallNamesMissing, "a sample that resolved late is not a missing name")
+	assert.Zero(t, st.PendingStallSamples)
+	assert.Zero(t, st.Undecoded)
+}
+
+// An index the map never carried has no name and never will. It becomes the
+// empty string - never "stall#17", which would put an unstable vendor number
+// into a label value - and it is counted, because a blank stall reason with
+// no counter behind it is a mystery rather than a measurement.
+func TestUnmappedStallIndexYieldsEmptyStringAndIsCounted(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, pcOffset: 0x40, stallIndex: 99, count: 3}))
+	// The map for 99 is never coming; the sample is held until Flush, then
+	// released unresolved rather than dropped.
+	c.Flush()
+
+	require.Len(t, sink.pcSamples, 1)
+	assert.Equal(t, "", sink.pcSamples[0].StallReason,
+		"an unresolved stall index must be empty, never a rendered index")
+	assert.NotContains(t, sink.pcSamples[0].StallReason, "99")
+	assert.Equal(t, uint64(3), sink.pcSamples[0].Count,
+		"the sample itself is delivered intact; only its stall reason is missing")
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StallNamesMissing)
+	assert.Equal(t, uint64(1), st.PCSamplesDecoded)
+	assert.Zero(t, st.Undecoded)
+	assert.Zero(t, st.SinkRejected)
+}
+
+// A producer that never emits a stall map at all must not cost a record. The
+// pending queue releases its oldest on every push, so the samples flow with
+// a bounded lag and every one of them is counted as missing.
+func TestPCSamplesFlowWhenNoStallMapEverArrives(t *testing.T) {
+	sink := &recordingSink{}
+	c := newConsumer(Config{
+		Backend:                    gpu.BackendCUPTI,
+		Sink:                       sink,
+		PendingStallSampleCapacity: 4,
+	})
+	for i := 0; i < 20; i++ {
+		apply(t, c, pcBatch(4242, uint64(i+1),
+			pcSample{crc: 0xAA, pcOffset: uint64(i), stallIndex: 7, count: 1}))
+	}
+	assert.Equal(t, 4, c.Stats().PendingStallSamples, "the queue is bounded")
+	c.Flush()
+
+	require.Len(t, sink.pcSamples, 20, "a missing stall name must never cost a record")
+	for i, s := range sink.pcSamples {
+		assert.Equalf(t, uint64(i), s.PCOffset, "released in arrival order")
+		assert.Equal(t, "", s.StallReason)
+	}
+	st := c.Stats()
+	assert.Equal(t, uint64(20), st.StallNamesMissing)
+	assert.Equal(t, uint64(20), st.PCSamplesDecoded)
+	assert.Zero(t, st.KnownStallNames)
+	assert.Zero(t, st.PendingStallSamples)
+}
+
+// A truncated stall name still resolves, marked, so it is never presented as
+// complete. The ABI's buffer is exactly CUPTI's own maximum, so this counter
+// reading non-zero says the producer is not the producer we think it is.
+func TestTruncatedStallNameIsMarkedAndCounted(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreb"}, true))
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, stallIndex: 17, count: 1}))
+
+	require.Len(t, sink.pcSamples, 1)
+	assert.Equal(t, "long_scoreb"+truncatedStallSuffix, sink.pcSamples[0].StallReason)
+	assert.Equal(t, uint64(1), c.Stats().StallNamesTruncated)
+	assert.Zero(t, c.Stats().StallNamesMissing, "a truncated name resolved; it is not a missing one")
+}
+
+// The bounded table is a ceiling, not a dial. When it bites the PC samples
+// still flow - unresolved, and counted twice over: once as an eviction and
+// once as a missing name.
+func TestStallNameTableEvictionIsCountedAndCostsNoRecord(t *testing.T) {
+	sink := &recordingSink{}
+	c := newConsumer(Config{Backend: gpu.BackendCUPTI, Sink: sink, StallNameCapacity: 2})
+	apply(t, c, stallMapBatch(1, []uint32{1, 2, 3}, []string{"a", "b", "c"}, false))
+	assert.Equal(t, uint64(1), c.Stats().StallNamesEvicted)
+	assert.Equal(t, 2, c.Stats().KnownStallNames)
+
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, stallIndex: 1, count: 1}))
+	c.Flush()
+	require.Len(t, sink.pcSamples, 1)
+	assert.Equal(t, "", sink.pcSamples[0].StallReason, "index 1 was evicted")
+	assert.Equal(t, uint64(1), c.Stats().StallNamesMissing)
+}
+
+// A re-interned index (the late-attach replay case) replaces the value in
+// place without taking a second FIFO position, exactly as kernelNameTable
+// does - otherwise a replayed table would evict itself.
+func TestStallMapReplayDoesNotEvictItself(t *testing.T) {
+	c := newConsumer(Config{Backend: gpu.BackendCUPTI, Sink: &recordingSink{}, StallNameCapacity: 3})
+	for range 5 {
+		apply(t, c, stallMapBatch(1, []uint32{1, 2, 3}, []string{"a", "b", "c"}, false))
+	}
+	st := c.Stats()
+	assert.Zero(t, st.StallNamesEvicted, "a replayed table must not push itself out")
+	assert.Equal(t, 3, st.KnownStallNames)
+	assert.Equal(t, uint64(15), st.StallNamesLearned, "records, not distinct indices")
+}
+
+// Tier B populates no correlation at all, so every PC record carries zero by
+// design. That is exactly why it needs a counter of its own: ZeroCorrelation
+// is enormous and healthy here, and a Tier A contract violation - where
+// CUPTI populates every record - would be invisible inside it (issue #52's
+// defect, in the PC-sample population).
+func TestTierBZeroCorrelationIsCountedApartFromTheAggregate(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+	apply(t, c, pcBatch(4242, 1,
+		pcSample{crc: 0xAA, correlation: 0, stallIndex: 17, count: 1},
+		pcSample{crc: 0xAA, correlation: 0, stallIndex: 17, count: 1},
+		pcSample{crc: 0xAA, correlation: 0, stallIndex: 17, count: 1},
+	))
+
+	st := c.Stats()
+	assert.Equal(t, uint64(3), st.PCSamplesWithoutCorrelation,
+		"in Tier B this equals PCSamplesDecoded on a perfectly healthy run")
+	assert.Equal(t, st.PCSamplesDecoded, st.PCSamplesWithoutCorrelation)
+	assert.Equal(t, uint64(3), st.ZeroCorrelation, "the aggregate still counts them")
+	assert.Zero(t, st.ZeroCorrelationExecs,
+		"an execution's zero is a different fact and must not be moved by a PC sample")
+
+	require.Len(t, sink.pcSamples, 3)
+	for _, s := range sink.pcSamples {
+		assert.False(t, s.Correlation.Present(),
+			"a wire zero must yield the zero CorrelationID, not one carrying only a pid")
+		assert.Equal(t, gpu.CorrelationID{}, s.Correlation)
+	}
+}
+
+// Tier A is the opposite condition: CUPTI populates correlationId on every
+// record, so PCSamplesWithoutCorrelation must read zero and the correlation
+// must carry the batch header's pid, exactly as launches and executions do.
+func TestTierAPCSampleCarriesTheProcessQualifiedCorrelation(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, correlation: 99, stallIndex: 17, count: 1}))
+
+	require.Len(t, sink.pcSamples, 1)
+	assert.Equal(t, gpu.CorrelationID{Backend: gpu.BackendCUPTI, PID: 4242, Value: "99"},
+		sink.pcSamples[0].Correlation,
+		"vendor correlation counters restart in every process, so the pid is part of the id")
+
+	st := c.Stats()
+	assert.Zero(t, st.PCSamplesWithoutCorrelation,
+		"a single non-zero here breaks Tier A's whole claim of exact launch attribution")
+	assert.Zero(t, st.ZeroCorrelation)
+}
+
+// A sampling window is decoded and counted; end_ns == 0 is the ABI's "open
+// when the producer stopped reporting" and is counted apart, because an open
+// window means the executions after its start are serialized="unknown"
+// rather than "false".
+func TestSamplingWindowsAreCountedAndTheOpenOneIsSeparate(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	apply(t, c, samplingWindowBatch(1_000, 51_000, gpuabi.SamplingModeKernelSerialized))
+	assert.Zero(t, c.Stats().SamplingWindowsOpen)
+
+	apply(t, c, samplingWindowBatch(100_000, 0, gpuabi.SamplingModeKernelSerialized))
+	st := c.Stats()
+	assert.Equal(t, uint64(2), st.SamplingWindowsDecoded)
+	assert.Equal(t, uint64(1), st.SamplingWindowsOpen,
+		"end_ns == 0 is a hard exit mid-burst, not a zero-length window")
+	assert.Zero(t, st.Undecoded)
+}
+
+// An inverted window is a producer contract violation, not a short buffer.
+// It is refused at the batch boundary so a negative duration can never reach
+// the serialization disclosure.
+func TestInvertedSamplingWindowIsRefusedAtTheBoundary(t *testing.T) {
+	_, err := decodeBatch(samplingWindowBatch(51_000, 1_000, gpuabi.SamplingModeKernelSerialized))
+	require.ErrorIs(t, err, gpuabi.ErrWindowInverted)
+}
+
+// gpu_config_v1 has been on the wire since Phase 3 with nothing reading it.
+// Its three fields are reachable now, and a second producer disagreeing with
+// the first is counted rather than silently overwriting the answer.
+func TestConfigIsDecodedAndDisagreementIsCounted(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	apply(t, c, configBatch(1_695_000_000, 5, 82))
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.ConfigsDecoded)
+	assert.Equal(t, uint32(5), st.ConfigSamplingFactor)
+	assert.Equal(t, uint32(82), st.ConfigSMCount)
+	assert.Equal(t, uint64(1_695_000_000), st.ConfigClockHz)
+	assert.Zero(t, st.ConfigsDisagreed)
+	assert.Zero(t, st.Undecoded)
+
+	// The late-attach replay: the same record again is not a disagreement.
+	apply(t, c, configBatch(1_695_000_000, 5, 82))
+	assert.Zero(t, c.Stats().ConfigsDisagreed)
+
+	// A second producer with a different configuration is.
+	apply(t, c, configBatch(1_695_000_000, 9, 82))
+	st = c.Stats()
+	assert.Equal(t, uint64(1), st.ConfigsDisagreed,
+		"last-writer-wins gauges must say when they describe an arbitrary one of several producers")
+	assert.Equal(t, uint32(9), st.ConfigSamplingFactor)
+}
+
+// Sequence-gap accounting is per (kind, pid) and must work on the new kinds
+// exactly as it does on launches: a jump in a probe's monotonic sequence is
+// a whole batch the consumer never saw.
+func TestSequenceGapsAreCountedOnTheNewKinds(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, stallIndex: 17, count: 1}))
+	apply(t, c, pcBatch(4242, 4, pcSample{crc: 0xAA, stallIndex: 17, count: 1}))
+	assert.Equal(t, uint64(2), c.Stats().SequenceGaps,
+		"seq 2 and 3 never arrived; each is a whole batch of PC records")
+
+	// A different pid is an independent stream, not a gap.
+	apply(t, c, pcBatch(7, 1, pcSample{crc: 0xAA, stallIndex: 17, count: 1}))
+	assert.Equal(t, uint64(2), c.Stats().SequenceGaps)
+
+	// And so is a different kind from the same pid.
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+	assert.Equal(t, uint64(2), c.Stats().SequenceGaps)
+}
+
+// A sink at capacity refuses PC samples and modules the same way it refuses
+// launches: the record is not retried and not silently dropped, it is
+// counted in SinkRejected.
+func TestRejectedPCSamplesAndModulesAreCounted(t *testing.T) {
+	sink := &recordingSink{err: errors.New("full")}
+	c := newTestConsumer(sink)
+	apply(t, c, stallMapBatch(1, []uint32{17}, []string{"long_scoreboard"}, false))
+	apply(t, c, pcBatch(4242, 1, pcSample{crc: 0xAA, stallIndex: 17, count: 1}))
+	apply(t, c, moduleBatch(4242, 0xC0FFEE, 9, 8192, 1_700_000, 0))
+
+	st := c.Stats()
+	assert.Equal(t, uint64(2), st.SinkRejected)
+	assert.Zero(t, st.Undecoded)
+}
+
+// A whole Tier B run's worth of the five kinds, in the order a late-attaching
+// consumer sees them: PC samples first, then the replayed map, config and
+// module. Every loss counter must read zero at the end - which is the
+// "assertable at zero on a healthy run" rule for all of them at once.
+func TestHealthyTierBRunLeavesEveryNewLossCounterAtZero(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, pcBatch(4242, 1,
+		pcSample{crc: 0xAA, pcOffset: 0x40, fnIndex: 3, stallIndex: 17, count: 5},
+		pcSample{crc: 0xAA, pcOffset: 0x50, fnIndex: 3, stallIndex: 23, count: 2},
+	))
+	apply(t, c, stallMapBatch(1,
+		[]uint32{17, 23}, []string{"long_scoreboard", "mio_throttle"}, false))
+	apply(t, c, configBatch(1_695_000_000, 5, 82))
+	apply(t, c, moduleBatch(4242, 0xAA, 9, 8192, 1_700_000, 0x7f0000000000))
+	apply(t, c, samplingWindowBatch(1_000, 51_000, gpuabi.SamplingModeContinuous))
+	c.Flush()
+
+	require.Len(t, sink.pcSamples, 2)
+	require.Len(t, sink.modules, 1)
+
+	st := c.Stats()
+	assert.Zero(t, st.Undecoded)
+	assert.Zero(t, st.Malformed)
+	assert.Zero(t, st.SequenceGaps)
+	assert.Zero(t, st.SinkRejected)
+	assert.Zero(t, st.StallNamesMissing)
+	assert.Zero(t, st.StallNamesEvicted)
+	assert.Zero(t, st.StallNamesTruncated)
+	assert.Zero(t, st.SamplingWindowsOpen)
+	assert.Zero(t, st.ConfigsDisagreed)
+	assert.Zero(t, st.PendingStallSamples)
+	assert.Zero(t, st.ZeroCorrelationExecs)
+	// The one new counter that is NOT zero on a healthy Tier B run, and the
+	// reason it is its own counter rather than a share of ZeroCorrelation.
+	assert.Equal(t, uint64(2), st.PCSamplesWithoutCorrelation)
+	assert.Equal(t, uint64(7), st.Records,
+		"2 PC samples + 2 stall names + 1 config + 1 module + 1 window")
 }
 
 func TestCookieForCoversTheNewProbes(t *testing.T) {

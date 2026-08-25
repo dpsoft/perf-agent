@@ -13,7 +13,10 @@
 // Stats.SequenceGaps; record kinds this phase carries but does not yet
 // normalize are counted as Stats.Undecoded; records whose wire correlation is
 // zero — the ABI's "no correlation", which demotes them to the timeline's
-// heuristic join — are counted as Stats.ZeroCorrelation. Samples that did not
+// heuristic join — are counted as Stats.ZeroCorrelation, and separately in
+// Stats.ZeroCorrelationExecs and Stats.PCSamplesWithoutCorrelation, because
+// those two populations have opposite healthy readings and one counter
+// cannot be read for both. Samples that did not
 // decode at all are counted as Stats.Malformed, and *why* they did not decode
 // is kept in Stats.DecodeFailures: a count of malformed samples with no
 // reason attached is loss that is visible but not diagnosable.
@@ -300,6 +303,16 @@ type Config struct {
 	// Zero means defaultPendingNamedEventCapacity. See pendingNames.
 	PendingNamedEventCapacity int
 
+	// StallNameCapacity bounds the stall_index -> name table. Zero means
+	// defaultStallNameCapacity. A ceiling, not a dial: a device's stall
+	// reasons are a fixed enum, but nothing on the wire promises that.
+	StallNameCapacity int
+
+	// PendingStallSampleCapacity bounds how many PC samples may be held at
+	// once waiting for a stall name that has not arrived yet. Zero means
+	// defaultPendingStallSampleCapacity. See pendingStallSamples.
+	PendingStallSampleCapacity int
+
 	// UnwindPIDCapacity bounds how many processes hold CFI tables for the
 	// stack walker at once. Zero means defaultUnwindPIDCapacity. A
 	// system-wide attach learns PIDs from the records that arrive, so the
@@ -351,6 +364,23 @@ const (
 	// launches and execs rather than for steady state - in steady state the
 	// name is already interned and nothing waits at all.
 	defaultPendingNamedEventCapacity = 512
+
+	// defaultStallNameCapacity bounds the interned stall-reason table. A
+	// device's stall reasons are a fixed enum - 38 on GA102 - so 256 is an
+	// order of magnitude of headroom over anything a CUPTI device can
+	// report, and a run that evicts from this table is a run whose producer
+	// is not describing one device.
+	defaultStallNameCapacity = 256
+
+	// defaultPendingStallSampleCapacity bounds the PC samples held for a
+	// stall name that has not arrived. The window it has to cover is the
+	// gap between the consumer attaching and the producer's late-attach
+	// replay of the stall map - up to one drain interval (100ms in the
+	// shim) - during which PC batches arrive at their full rate. It is
+	// sized like Timeline's own pendingSampleCap for that reason. Nothing
+	// is dropped when it bites: the oldest sample is RELEASED, unresolved
+	// and counted in StallNamesMissing.
+	defaultPendingStallSampleCapacity = 4096
 )
 
 // Stats is the consumer's loss record. Every discard has a counter here or
@@ -369,11 +399,17 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize: module loads and PC samples. Sampled launches
-	// and interned kernel names are no longer in this class - the first has
-	// its stack attached to the batched launch it belongs to, the second
-	// names the launches and executions that refer to its kernel id.
-	// Counted so the loss is visible rather than silent.
+	// does not yet normalize. Nothing the ABI defines is in that class any
+	// more: launches, executions, sampled launches, kernel names, module
+	// loads, PC samples, the stall-reason map, sampling windows and the
+	// config record all have an applyBatch arm. What is left is a kind the
+	// producer invented, or a KIND_* added on one side of the wire and not
+	// the other - both of which are silent loss unless counted, which is
+	// why the counter stays after its original population emptied.
+	//
+	// Healthy: zero, and gate_test.go asserts it. Worst: equal to the
+	// record count of every batch of some kind the consumer cannot read,
+	// which is the ABI having drifted.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
@@ -407,7 +443,37 @@ type Stats struct {
 	// them to the timeline's heuristic join instead of the exact one. The
 	// counter exists because that demotion changes how confidently the join
 	// can be read, and a silent demotion is as bad as silent loss.
+	//
+	// It is an aggregate over populations whose healthy values are
+	// OPPOSITE, so it must never be read alone. ZeroCorrelationExecs and
+	// PCSamplesWithoutCorrelation are the two subsets that carry the
+	// meaning; see both.
 	ZeroCorrelation uint64
+	// PCSamplesWithoutCorrelation is the subset of ZeroCorrelation that
+	// arrived on a gpu_pc_sample_batch_v1 record. It is the PC-sample twin
+	// of ZeroCorrelationExecs and exists for the same reason: one counter
+	// cannot serve two populations whose healthy readings are opposites.
+	//
+	// In Tier B (CONTINUOUS) CUPTI populates no correlation at all, so
+	// EVERY PC record carries zero by design and this counter equals
+	// PCSamplesDecoded on a perfectly healthy run. In Tier A
+	// (KERNEL_SERIALIZED) CUPTI populates it on every record - the spike
+	// measured 1,828 of 1,828 - so a single non-zero here is the shim
+	// breaking Tier A's whole claim, that a PC sample joins to a launch
+	// exactly.
+	//
+	// That is why it is not folded into ZeroCorrelation: with PC samples
+	// dominating the traffic, ZeroCorrelation is enormous and healthy in
+	// Tier B, and a Tier A contract violation would be invisible inside it
+	// - the same defect issue #52 found for executions. Nothing is dropped
+	// either way; the sample is normalized with the zero CorrelationID,
+	// which routes it to the module-granularity attribution Tier B is
+	// built on.
+	//
+	// Healthy: zero in Tier A, PCSamplesDecoded in Tier B. Worst: non-zero
+	// in Tier A, where every such sample can only ever be attributed by
+	// inference.
+	PCSamplesWithoutCorrelation uint64
 	// ZeroCorrelationExecs is the subset of ZeroCorrelation that arrived on a
 	// gpu_exec_v1 record, and it means something completely different from
 	// the rest of that counter — issue #52.
@@ -938,6 +1004,144 @@ type Stats struct {
 	PendingLaunches    int
 	PendingNamedEvents int
 	KnownKernelNames   int
+
+	// ----- PC sampling: the five kinds applyBatch decodes for Tier A and
+	// Tier B. None of these resolves a source line or attributes a sample
+	// to an execution; that is the module store's and the timeline's work.
+	// These say what arrived and what could not be read.
+
+	// PCSamplesDecoded counts gpu_pc_sample_batch_v1 records normalized
+	// into gpu.GPUPCSample and handed to the sink. It is the denominator
+	// the counters below are read against, and the answer to "did PC
+	// sampling produce anything at all", which no other counter gives:
+	// Records aggregates every kind.
+	//
+	// Healthy: non-zero whenever a tier is enabled. Worst: zero with a
+	// tier enabled, which means the shim never drained a PC buffer - a
+	// silent, total absence that looks exactly like an idle GPU.
+	PCSamplesDecoded uint64
+	// ModulesDecoded counts gpu_module_load_v1 records normalized into
+	// gpu.GPUModule. It records that a module loaded, with its CRC and
+	// size; it does NOT mean the module's BYTES arrived. Those travel the
+	// cubin channel and are counted in CubinsReceived, and the two
+	// disagreeing is the ordinary Tier B failure - a module announced but
+	// unresolvable, every one of whose PC samples reads gpu_src_status
+	// "no-module".
+	//
+	// ModuleLoad.BytesPtr is decoded and deliberately unused: it is a
+	// pointer into the PRODUCER's address space, and following it would
+	// need CAP_SYS_PTRACE, which this agent does not have and will not
+	// take. See cubin.go.
+	//
+	// Healthy: one per distinct module the process loaded. Worst: zero
+	// while executions flow, meaning no module ever reached the agent.
+	ModulesDecoded uint64
+	// StallNamesLearned counts gpu_stall_reason_map_v1 records interned.
+	// The producer replays its whole table on late attach, so an index may
+	// be learned more than once; this counts records, not distinct indices
+	// (KnownStallNames is the gauge for the latter).
+	//
+	// Healthy: at least one full table - 38 entries on GA102 - per
+	// producer. Worst: zero while PC samples flow, in which case every
+	// sample's stall reason is "" and StallNamesMissing equals
+	// PCSamplesDecoded.
+	StallNamesLearned uint64
+	// StallNamesTruncated counts stall names the producer had to cut off
+	// at GPU_STALL_NAME_MAX. Those names still resolve, marked with
+	// truncatedStallSuffix, so a truncated name is never presented as
+	// complete.
+	//
+	// Healthy: zero. The ABI's buffer is exactly CUPTI's own
+	// CUPTI_STALL_REASON_STRING_SIZE, so a CUPTI producer cannot overflow
+	// it. Worst: non-zero, meaning stall names are being cut and two
+	// distinct reasons sharing a prefix would otherwise have aggregated
+	// into one label value.
+	StallNamesTruncated uint64
+	// StallNamesEvicted counts stall names pushed out of the bounded
+	// table. Not record loss: the PC samples still flow, with an empty
+	// stall reason, and count in StallNamesMissing.
+	//
+	// Healthy: zero - a device's stall reasons are a fixed enum far below
+	// the bound. Worst: non-zero, meaning the table is churning and the
+	// stall labels in the profile describe whichever indices happened to
+	// be resident.
+	StallNamesEvicted uint64
+	// StallNamesMissing counts PC samples emitted with an EMPTY stall
+	// reason: the producer never mapped that index, the name was evicted,
+	// or the sample was released (by the pending queue's bound, or by a
+	// Flush) before its name arrived.
+	//
+	// The sample is never dropped for this - it reaches the sink and its
+	// GPU time is still measured - and the stall reason is never faked. An
+	// index with no name becomes "", never "stall#17": the index is the
+	// vendor's own and is not stable across devices or driver versions, so
+	// rendering it would leak an unstable internal number into a label
+	// value where a consumer would aggregate on it. This counter is what
+	// makes the resulting blank visible instead of mysterious.
+	//
+	// Healthy: zero. Worst: equal to PCSamplesDecoded, which is a profile
+	// full of PC samples with no stall reason at all - the whole point of
+	// PC sampling, silently absent, if it were not counted.
+	StallNamesMissing uint64
+	// SamplingWindowsDecoded counts gpu_sampling_window_v1 records read.
+	// One record is one PC-sampling burst. Tier A duty-cycles, so a Tier A
+	// run produces many; Tier B does not burst, so a Tier B run produces
+	// at most one.
+	//
+	// The windows' CONTENT is not retained yet - the serialization
+	// disclosure that consumes it is Task 10 - so this counter is
+	// deliberately the whole of what the consumer does with them. That
+	// makes the discard sized and visible rather than silent, which is the
+	// contract; it is not a claim that the windows have been used.
+	//
+	// Healthy: non-zero in Tier A, zero or one in Tier B. Worst: zero in
+	// Tier A, where nothing would then say which executions ran perturbed.
+	SamplingWindowsDecoded uint64
+	// SamplingWindowsOpen is the subset of SamplingWindowsDecoded that
+	// arrived with end_ns == 0, which the ABI defines as "still open when
+	// the producer stopped reporting" - a hard exit mid-burst, since the
+	// shim's atexit handler closes the window on the ordinary path. It is
+	// NOT a zero-length window, and the two must never be conflated: an
+	// open window means every execution at or after its start_ns is
+	// serialized="unknown", never "false".
+	//
+	// Healthy: zero. Worst: non-zero, meaning a burst's end is unknown and
+	// an unbounded tail of executions cannot be said to have run
+	// unperturbed.
+	SamplingWindowsOpen uint64
+	// ConfigsDecoded counts gpu_config_v1 records read. The producer emits
+	// one per process and replays it on late attach, so this counts
+	// records rather than producers.
+	//
+	// Healthy: at least one per producer. Worst: zero, in which case the
+	// three gauges below are unset and the sampling period behind every PC
+	// sample is unknown.
+	ConfigsDecoded uint64
+	// ConfigsDisagreed counts config records whose values differ from the
+	// ones already held. The three gauges below are last-writer-wins, so
+	// with a system-wide attach they describe whichever producer reported
+	// most recently; this counter is what says the answer is ambiguous
+	// instead of letting one process's configuration stand for the
+	// machine's.
+	//
+	// Healthy: zero - one producer, one configuration, replayed
+	// identically. Worst: non-zero, meaning ConfigSamplingFactor,
+	// ConfigSMCount and ConfigClockHz describe an arbitrary one of several
+	// producers and must not be used to scale anything.
+	ConfigsDisagreed uint64
+	// ConfigSamplingFactor, ConfigSMCount and ConfigClockHz are the
+	// producer's own sampling configuration, from the most recent
+	// gpu_config_v1. Gauges, not counters, and meaningful only while
+	// ConfigsDisagreed is zero. Zero means no config record has arrived.
+	ConfigSamplingFactor uint32
+	ConfigSMCount        uint32
+	ConfigClockHz        uint64
+	// PendingStallSamples and KnownStallNames are gauges: what the two
+	// stall-reason side tables hold right now. PendingStallSamples is also
+	// how many PC samples the consumer is currently holding back - see
+	// Consumer.Flush.
+	PendingStallSamples int
+	KnownStallNames     int
 	// KernelStacksMissing is the same event counted on the BPF side, read
 	// from the `stacks_missing` map. It is kept separate from StacksMissing
 	// rather than replacing it because the two disagree exactly when a batch
@@ -1156,6 +1360,16 @@ type Consumer struct {
 	deferred    *deferredLaunches
 	names       *kernelNameTable
 	unnamed     *pendingNames
+	// stalls and unresolvedStalls are the stall-reason twins of names and
+	// unnamed: the bounded stall_index -> name table, and the bounded FIFO
+	// of PC samples held until their index resolves. See stallnames.go.
+	stalls          *stallNameTable
+	unresolvedStall *pendingStallSamples
+	// config is the most recent gpu_config_v1, and configSeen says whether
+	// one has arrived at all - which the zero value cannot, because a
+	// producer may legitimately report a zero sampling factor.
+	config     gpuabi.Config
+	configSeen bool
 	// shim is the attribution guard's view of what the consumer attached
 	// to: whether the shim is an injected library or the program itself,
 	// and which module paths are the shim's own. Immutable after
@@ -1186,6 +1400,9 @@ func newConsumer(cfg Config) *Consumer {
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
 		names:       newKernelNameTable(cfg.KernelNameCapacity),
 		unnamed:     newPendingNames(cfg.PendingNamedEventCapacity),
+
+		stalls:          newStallNameTable(cfg.StallNameCapacity),
+		unresolvedStall: newPendingStallSamples(cfg.PendingStallSampleCapacity),
 	}
 }
 
@@ -1379,9 +1596,8 @@ type batch struct {
 	Execs           []gpuabi.Exec
 	SampledLaunches []gpuabi.LaunchSampled
 	KernelNames     []gpuabi.KernelName
-	// Decoded here, normalized in a later phase. Until applyBatch grows arms
-	// for these kinds they still land in its default: case and are counted as
-	// Stats.Undecoded, so nothing about them is silent in the meantime.
+	Modules         []gpuabi.ModuleLoad
+	PCSamples       []gpuabi.PCSample
 	StallReasons    []gpuabi.StallReason
 	SamplingWindows []gpuabi.SamplingWindow
 	Configs         []gpuabi.Config
@@ -1434,6 +1650,30 @@ func decodeBatch(b []byte) (batch, error) {
 				return batch{}, err
 			}
 			out.Execs = append(out.Execs, rec)
+		}
+	case kindModule:
+		if count > len(payload)/gpuabi.SizeModuleLoad {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.Modules = make([]gpuabi.ModuleLoad, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeModuleLoad(payload[i*gpuabi.SizeModuleLoad:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.Modules = append(out.Modules, rec)
+		}
+	case kindPC:
+		if count > len(payload)/gpuabi.SizePCSample {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.PCSamples = make([]gpuabi.PCSample, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodePCSample(payload[i*gpuabi.SizePCSample:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.PCSamples = append(out.PCSamples, rec)
 		}
 	case kindLaunchSampled:
 		// One header, one stack id, one launch. See errSampledBatchNotSingular.
@@ -1689,10 +1929,218 @@ func (c *Consumer) applyBatch(b batch) {
 			c.stats.Records++
 			c.learnKernelNameLocked(n)
 		}
+	case kindModule:
+		for _, m := range b.Modules {
+			c.stats.Records++
+			c.emitModuleLocked(m)
+		}
+	case kindPC:
+		for _, p := range b.PCSamples {
+			c.stats.Records++
+			c.emitPCSampleLocked(b.PID, p)
+		}
+	case kindStallMap:
+		for _, s := range b.StallReasons {
+			c.stats.Records++
+			c.learnStallNameLocked(s)
+		}
+	case kindSamplingWindow:
+		for _, w := range b.SamplingWindows {
+			c.stats.Records++
+			c.noteSamplingWindowLocked(w)
+		}
+	case kindConfig:
+		for _, cfg := range b.Configs {
+			c.stats.Records++
+			c.noteConfigLocked(cfg)
+		}
 	default:
-		// Carried on the wire, not yet normalized. Counted, never silent.
+		// Carried on the wire, not normalized. Counted, never silent. No
+		// kind the ABI defines reaches here any more; see Stats.Undecoded
+		// for what it means when one does.
 		c.stats.Undecoded += uint64(b.RawCount)
 	}
+}
+
+// emitModuleLocked normalizes one gpu_module_load_v1 record and hands it to
+// the sink. Caller holds mu.
+//
+// ModuleLoad.BytesPtr is decoded and deliberately NOT used. It is a pointer
+// into the producer's address space; reading it would need /proc/<pid>/mem
+// or process_vm_readv, both of which need CAP_SYS_PTRACE, which this agent
+// does not have and does not take. The bytes travel the cubin channel
+// instead (cubin.go). This record says that a module loaded, with its CRC
+// and size, and nothing more.
+func (c *Consumer) emitModuleLocked(rec gpuabi.ModuleLoad) {
+	c.stats.ModulesDecoded++
+	ev := gpu.GPUModule{
+		Ref:       gpu.ModuleRef{Backend: c.cfg.Backend, CRC: rec.CubinCRC},
+		SizeBytes: rec.SizeBytes,
+		LoadedNs:  rec.LoadNs,
+	}
+	if err := c.cfg.Sink.EmitModule(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+// emitPCSampleLocked normalizes one gpu_pc_sample_batch_v1 record, resolving
+// its stall index, and either hands it to the sink or holds it until the
+// stall map arrives. Caller holds mu.
+//
+// The identity that always arrives is the MODULE, not the correlation:
+// {Backend, CRC}, content-addressed, which is what Tier B attribution runs
+// through. The correlation is taken from the batch header's pid through
+// correlationOf, so a wire value of zero yields the zero CorrelationID (not
+// one carrying only a pid) and a non-zero one is qualified by the process
+// that produced it - the same rule launches and executions follow, for the
+// same reason: vendor correlation counters restart in every process.
+func (c *Consumer) emitPCSampleLocked(pid uint32, rec gpuabi.PCSample) {
+	c.stats.PCSamplesDecoded++
+	if rec.Correlation == 0 {
+		// Counted here rather than inside correlationOf, which is shared
+		// with the launch, exec and sampled-stack paths and cannot tell
+		// them apart. See Stats.PCSamplesWithoutCorrelation for why a PC
+		// sample's zero is routine in Tier B and a contract violation in
+		// Tier A - two opposite healthy values that one counter cannot
+		// carry.
+		c.stats.PCSamplesWithoutCorrelation++
+	}
+	ev := gpu.GPUPCSample{
+		Correlation: c.correlationOf(pid, rec.Correlation),
+		Module:      gpu.ModuleRef{Backend: c.cfg.Backend, CRC: rec.CubinCRC},
+		// The shim stamps CLOCK_MONOTONIC, which is the only domain the
+		// core accepts; say so rather than leaning on
+		// NormalizeClockDomain's zero-value default.
+		//
+		// TimeNs stays zero: gpu_pc_sample_batch_v1 carries no timestamp
+		// and neither does the batch header, so there is nothing to put
+		// there. Stamping the arrival time would present a consumer-side
+		// clock reading as a measurement of when the instruction stalled,
+		// which is exactly the inference-as-measurement this project
+		// forbids. The timeline's pending horizon therefore does not age
+		// these out by time; bounding them is Task 8a's second pending
+		// index.
+		ClockDomain: gpu.ClockDomainCPUMonotonic,
+		PCOffset:    rec.PCOffset,
+		Count:       uint64(rec.Count),
+	}
+	if name, ok := c.resolveStallNameLocked(rec.StallIndex); ok {
+		ev.StallReason = name
+		c.sinkPCSampleLocked(ev, true)
+		return
+	}
+	c.holdForStallNameLocked(unresolvedSample{stallIndex: rec.StallIndex, sample: ev})
+}
+
+// sinkPCSampleLocked is the only place a PC sample reaches the sink.
+// resolved reports whether a stall name was found; an unresolved sample is
+// delivered anyway - a missing name must never cost a record - with an
+// EMPTY stall reason and a counter, never with the raw index rendered into
+// it. Caller holds mu.
+func (c *Consumer) sinkPCSampleLocked(ev gpu.GPUPCSample, resolved bool) {
+	if !resolved {
+		c.stats.StallNamesMissing++
+	}
+	if err := c.cfg.Sink.EmitPCSample(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+// resolveStallNameLocked looks a stall index up in the interned table.
+//
+// Deliberate divergence from resolveKernelNameLocked: there is no sentinel
+// index. A kernel id of zero is the ABI's "no kernel", so that path can
+// short-circuit; CUPTI's stall reason indices are opaque vendor numbers and
+// zero is a perfectly ordinary one, so treating it as "none" would silently
+// blank one real stall reason on every device where it happens to be index
+// 0. Caller holds mu.
+func (c *Consumer) resolveStallNameLocked(index uint32) (string, bool) {
+	s, ok := c.stalls.get(index)
+	if !ok {
+		return "", false
+	}
+	return s.resolved(), true
+}
+
+// holdForStallNameLocked queues a PC sample until its stall name arrives,
+// releasing the oldest held sample if the queue is full. Caller holds mu.
+//
+// The second deliberate divergence from the kernel-name path: there is no
+// waitsForNameLocked gate here, so a sample with an unknown index is held
+// whether or not a stall map has ever been seen. A launch is held only once
+// the producer has demonstrated that names exist, because holding one for a
+// name that is never coming delays the join; a PC sample is not on that
+// path, and the case the gate would break is the one the ABI makes normal -
+// the stall map is one-shot plus replay, so the FIRST PC batch of a run
+// routinely precedes it, and a gate keyed on "have we seen a map yet" would
+// send exactly those samples out permanently unresolved. A producer that
+// never maps its indices costs a fixed lag of PendingStallSampleCapacity
+// samples and nothing else: the queue releases its oldest on every push, so
+// every sample is still delivered, counted in StallNamesMissing.
+func (c *Consumer) holdForStallNameLocked(s unresolvedSample) {
+	if released, ok := c.unresolvedStall.push(s); ok {
+		c.releaseUnresolvedStallLocked(released, "")
+	}
+}
+
+// releaseUnresolvedStallLocked sends one held PC sample on, with the stall
+// name if one was found and without it otherwise. Caller holds mu.
+func (c *Consumer) releaseUnresolvedStallLocked(s unresolvedSample, name string) {
+	s.sample.StallReason = name
+	c.sinkPCSampleLocked(s.sample, name != "")
+}
+
+// learnStallNameLocked interns one stall reason name and releases every PC
+// sample waiting on it. The twin of learnKernelNameLocked. Caller holds mu.
+func (c *Consumer) learnStallNameLocked(rec gpuabi.StallReason) {
+	c.stats.StallNamesLearned++
+	if rec.Truncated {
+		c.stats.StallNamesTruncated++
+	}
+	s := stallName{name: rec.Name, truncated: rec.Truncated}
+	c.stats.StallNamesEvicted += uint64(c.stalls.put(rec.Index, s))
+	// A name that arrives empty resolves nothing, so held samples would be
+	// released unresolved anyway; releasing them here keeps that decision
+	// in one place.
+	name := s.resolved()
+	for _, waiting := range c.unresolvedStall.takeByIndex(rec.Index) {
+		c.releaseUnresolvedStallLocked(waiting, name)
+	}
+}
+
+// noteSamplingWindowLocked records one PC-sampling burst. Caller holds mu.
+//
+// The window's content is not retained: the serialization disclosure that
+// consumes it - marking which executions ran perturbed - is a later task,
+// and building half of it here would leave a store nothing reads. What this
+// does is make the discard sized and visible, which is the standing rule:
+// counted is not the same as used, and Stats.SamplingWindowsDecoded says so.
+func (c *Consumer) noteSamplingWindowLocked(w gpuabi.SamplingWindow) {
+	c.stats.SamplingWindowsDecoded++
+	if w.Open() {
+		// end_ns == 0 is the ABI's "still open when the producer stopped
+		// reporting", not a zero-length window. DecodeSamplingWindow has
+		// already refused a genuinely inverted one.
+		c.stats.SamplingWindowsOpen++
+	}
+}
+
+// noteConfigLocked records the producer's sampling configuration. Caller
+// holds mu.
+//
+// Last writer wins, and ConfigsDisagreed is what stops that being a lie: a
+// system-wide attach sees one of these per producer, so without the counter
+// one process's sampling factor would silently stand for the machine's.
+func (c *Consumer) noteConfigLocked(cfg gpuabi.Config) {
+	c.stats.ConfigsDecoded++
+	if c.configSeen && cfg != c.config {
+		c.stats.ConfigsDisagreed++
+	}
+	c.config = cfg
+	c.configSeen = true
+	c.stats.ConfigSamplingFactor = cfg.SamplingFactor
+	c.stats.ConfigSMCount = cfg.SMCount
+	c.stats.ConfigClockHz = cfg.ClockHz
 }
 
 // admitLaunchLocked decides whether a normalized launch goes to the sink now
@@ -2218,8 +2666,17 @@ func (c *Consumer) releaseUnnamedAllLocked() {
 	}
 }
 
-// Flush releases every launch the consumer is holding back for a possible
-// sampled stack, in arrival order.
+// releaseUnresolvedStallAllLocked sends on every PC sample still waiting for
+// a stall name, unresolved and counted. Caller holds mu.
+func (c *Consumer) releaseUnresolvedStallAllLocked() {
+	for _, s := range c.unresolvedStall.drain() {
+		c.releaseUnresolvedStallLocked(s, "")
+	}
+}
+
+// Flush releases everything the consumer is holding back, in arrival order:
+// launches waiting for a sampled stack, launches and executions waiting for
+// a kernel name, and PC samples waiting for a stall name.
 //
 // Run calls it on the way out and Close calls it too, so a consumer that is
 // finished never leaves a launch behind. It is exported for the other case:
@@ -2239,6 +2696,9 @@ func (c *Consumer) Flush() {
 	// after, leaving nothing behind in either.
 	c.releaseDeferredLocked()
 	c.releaseUnnamedAllLocked()
+	// PC samples held for a stall name are on their own queue and are
+	// independent of the two above; a snapshot must not miss them either.
+	c.releaseUnresolvedStallAllLocked()
 }
 
 // Stats returns the loss record, including the BPF-side drop counters read
@@ -2310,6 +2770,8 @@ func (c *Consumer) Stats() Stats {
 	out.PendingLaunches = c.deferred.len()
 	out.PendingNamedEvents = c.unnamed.len()
 	out.KnownKernelNames = c.names.len()
+	out.PendingStallSamples = c.unresolvedStall.len()
+	out.KnownStallNames = c.stalls.len()
 	return out
 }
 

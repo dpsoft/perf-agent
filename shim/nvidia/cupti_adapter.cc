@@ -16,13 +16,14 @@
 #include "drain.h"
 #include "enroll.h"
 #include "kernelnames.h"
+#include "pcdrain.h"
 #include "sampler.h"
 #include "usdt_abi.h"
 #include "usdt_probe.h"
 
 #include <cupti.h>
-// cuptiGetCubinCrc lives here, not in cupti.h. It is the ONLY thing this
-// adapter uses from the PC-sampling header today; Task 6 uses the rest.
+// cuptiGetCubinCrc lives here, not in cupti.h -- so this header is needed by
+// the module-capture path as well as by the whole PC-sampling block below.
 #include <cupti_pcsampling.h>
 
 #include <atomic>
@@ -34,6 +35,7 @@
 #include <mutex>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <vector>
 
 // One line per probe: semaphore, enabled/emit thunks, and the frozen wire
 // size the consumer's BPF attach cookie assumes. See PERFAGENT_USDT_EMITTER.
@@ -51,6 +53,15 @@ PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
 // the record must be emitted at a very particular instant (see
 // on_cubin_captured), which a batch's flush would move.
 PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
+// PC sampling (Tier B). All four fire only when PERFAGENT_GPU_PC_SAMPLING is
+// set AND a consumer is attached; the semaphore gate is inside the emitter,
+// the tier gate is g_pc_tier_b.
+PERFAGENT_USDT_EMITTER(gpu_pc_sample_batch_v1, 40);
+PERFAGENT_USDT_EMITTER(gpu_stall_reason_map_v1, 136);
+PERFAGENT_USDT_EMITTER(gpu_config_v1, 24);
+// Producer-side loss of every class, including the two PC-sampling omissions
+// CUPTI documents and cannot recover.
+PERFAGENT_USDT_EMITTER(gpu_dropped_v1, 16);
 
 namespace {
 
@@ -331,6 +342,571 @@ void on_module_loaded(const CUpti_ResourceData *rd) {
                       (void *)(uintptr_t)m->moduleId);
 }
 
+// Defined further down with the rest of the process setup; declared here
+// because the PC-sampling block below is the first thing that needs them.
+bool check(CUptiResult r, const char *what);
+unsigned env_uint(const char *name, unsigned dflt);
+
+// ------------------------------------------------- PC sampling (Tier B)
+//
+// CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS. Kernels are NOT serialized in
+// this mode, which is the only reason it is a candidate for always-on
+// profiling; the cost is that every PC record's correlationId is zero, so a
+// PC sample joins to a kernel through its module and never to the launch that
+// issued it. Tier A (KERNEL_SERIALIZED, duty-cycled) is a separate task and is
+// deliberately not implemented here.
+//
+// OFF BY DEFAULT. PERFAGENT_GPU_PC_SAMPLING=1 turns it on. Nothing below runs,
+// allocates or calls CUPTI unless that is set, so merging this cannot degrade
+// a profiler that is shipping today.
+//
+// What CUPTI will not tell us, which the profile must state rather than imply
+// -------------------------------------------------------------------------
+// cupti_pcsampling.h documents two omissions on CUpti_PCSamplingData:
+//
+//   "CUPTI does not provide PC records for non-user kernels."
+//   "CUPTI does not provide PC records for instructions for which all
+//    selected stall reason metrics counts are zero."
+//
+// Neither is a drop and no counter can recover the records. The first has a
+// size --- nonUsrKernelsTotalSamples --- and that number rides out as a
+// gpu_dropped_v1 under GPU_DROP_CLASS_PC_NON_USER_KERNEL, so a reader can see
+// how much of the device's sampled time this mechanism structurally cannot
+// attribute. The second has no size at all: an instruction that never stalled
+// for any selected reason simply is not in the data, and the profile can only
+// say so in prose. Neither is presented as a measurement of anything else.
+//
+// totalSamples is NOT loss --- it is every sample the hardware took, including
+// the ones that became records. The identity
+//
+//   totalSamples == sum(record counts) + droppedSamples + nonUsrKernelsTotalSamples
+//                   + the all-zero-stall instructions
+//
+// is therefore checkable only here, in this process's log, and the last term
+// is unobservable, so even here it is an inequality. It is stated as a
+// limitation and never claimed as a check; closing it would need a
+// gpu_config_v2 field for totalSamples, which is not worth a version bump for
+// a diagnostic.
+
+// The sampling period CUPTI takes is an EXPONENT: one sample per 2^period SM
+// cycles, valid 5..31. Zero means "leave CUPTI's own default alone", and in
+// that case the value is read back rather than guessed, so gpu_config_v1
+// reports what the device is actually doing.
+constexpr uint32_t kPCPeriodMin = 5;
+constexpr uint32_t kPCPeriodMax = 31;
+
+// How many distinct PCs one GetData call may return. The Phase 3 spike saw
+// 352 PC records in CONTINUOUS mode for ~103k samples, so this is roughly six
+// times the measured need and still under a megabyte with 38 stall reasons.
+// The drain loop below keeps calling while remainingNumPcs is non-zero, so
+// this bounds one call's allocation, not the run's data.
+constexpr size_t kPCDefaultCollectNumPcs = 2048;
+
+// The bound on that loop. CUPTI hands back remainingNumPcs and we keep
+// pulling, but an unbounded loop inside a drain tick is a hang in somebody
+// else's process; hitting the bound is counted rather than retried forever.
+constexpr unsigned kPCMaxDrainRounds = 64;
+
+bool g_pc_tier_b = false;                 // PERFAGENT_GPU_PC_SAMPLING
+uint32_t g_pc_period = 0;                 // the exponent actually in force
+size_t g_pc_collect_num_pcs = kPCDefaultCollectNumPcs;
+size_t g_pc_scratch_bytes = 0;            // 0 = CUPTI's default
+size_t g_pc_hw_buffer_bytes = 0;          // 0 = CUPTI's default
+
+// The device's stall-reason table. Queried once, from the first context that
+// enables sampling: the indices are the device's own and are not stable across
+// devices or driver versions, which is why gpu_stall_reason_map_v1 exists at
+// all. Read-only after the query, so the drain path needs no lock for it.
+std::vector<uint32_t> g_stall_indices;
+size_t g_num_stall_reasons = 0;
+bool g_stall_queried = false;
+
+// Per-context PC sampling state. Enable, configure, drain and disable are all
+// per CUcontext in CUPTI --- not per process --- so a process with two
+// contexts that only tracked one would silently sample half its work.
+struct PCContext {
+    CUcontext ctx = nullptr;
+    CUpti_PCSamplingData data{};
+    std::vector<CUpti_PCSamplingPCData> pcs;
+    std::vector<CUpti_PCSamplingStallReason> stalls;
+    // Cumulative counters CUPTI reports; the wire carries deltas so a
+    // consumer can add drop records up without double counting.
+    uint64_t last_dropped = 0;
+    uint64_t last_non_user = 0;
+    bool enabled = false;
+};
+
+// One mutex over the map AND the per-context buffers. It is held across
+// cuptiPCSamplingGetData, which is what makes the module-unload drain safe:
+// that callback runs on the application's thread while the drain timer runs on
+// ours, and CUPTI's buffer is a single-writer structure. The unload path
+// BLOCKS on this rather than trying the lock, because a skipped unload flush
+// is exactly the silent PC-identity corruption this whole path exists to
+// avoid.
+std::mutex g_pc_mu;
+std::vector<PCContext *> g_pc_ctxs;       // leaked with everything else; see below
+
+perfagent::PCDrainSchedule *g_pc_schedule = nullptr;
+perfagent::Batch<gpu_pc_sample_batch_v1, 32> *g_pcb = nullptr;
+perfagent::ReplayLog *g_replay = nullptr;
+
+std::atomic<unsigned long> g_pc_seq{0};
+std::atomic<unsigned long> g_stall_seq{0};
+std::atomic<unsigned long> g_config_seq{0};
+std::atomic<unsigned long> g_dropped_seq{0};
+
+// Every one of these is assertable at a known value on a healthy run, which is
+// the whole point: a context that failed to enable is otherwise a silent hole
+// in coverage, and a drop class with no counter is a loss nobody can see.
+std::atomic<uint64_t> g_ctx_seen{0};            // CONTEXT_CREATED callbacks
+std::atomic<uint64_t> g_ctx_enabled{0};         // sampling enabled and configured
+std::atomic<uint64_t> g_ctx_enable_failed{0};   // MUST be 0 on a healthy run
+std::atomic<uint64_t> g_ctx_destroyed{0};       // CONTEXT_DESTROY_STARTING
+std::atomic<uint64_t> g_ctx_disable_failed{0};  // MUST be 0 on a healthy run
+std::atomic<uint64_t> g_pc_records{0};          // (PC, stall) pairs put on the wire
+std::atomic<uint64_t> g_pc_pcs{0};              // distinct PCs seen
+std::atomic<uint64_t> g_pc_getdata_calls{0};
+std::atomic<uint64_t> g_pc_getdata_failed{0};
+std::atomic<uint64_t> g_pc_drain_rounds_capped{0};
+std::atomic<uint64_t> g_pc_dropped_hw{0};       // CUpti_PCSamplingData.droppedSamples
+std::atomic<uint64_t> g_pc_buffer_full{0};      // hardwareBufferFull observations
+std::atomic<uint64_t> g_pc_non_user{0};         // nonUsrKernelsTotalSamples
+// The two halves of the identity the agent cannot check. Process-wide rather
+// than per-context, so a context destroyed mid-run does not take its share of
+// the accounting with it.
+std::atomic<uint64_t> g_pc_total_samples{0};    // log only; see the note above
+std::atomic<uint64_t> g_pc_emitted_counts{0};   // log only
+std::atomic<uint64_t> g_pc_unattached{0};       // records dropped: no consumer
+std::atomic<uint64_t> g_pc_zero_stall{0};       // (PC, stall) pairs with count 0
+std::atomic<uint64_t> g_module_unload_drains{0};
+std::atomic<uint64_t> g_finalize_seen{0};
+// Finalize arrived while a drain held the PC lock and the teardown was
+// skipped rather than deadlocking the host. MUST be 0 on a healthy run.
+std::atomic<uint64_t> g_finalize_contended{0};
+std::atomic<uint64_t> g_exec_from_graph{0};     // executions launched from a graph
+std::atomic<uint64_t> g_graph_exec_reported{0}; // the delta already on the wire
+std::atomic<uint64_t> g_config_emitted{0};
+std::atomic<uint64_t> g_config_no_device{0};    // config emitted with sm_count 0
+
+// Device facts for gpu_config_v1, filled from a CUPTI_ACTIVITY_KIND_DEVICE
+// record. There is no cuptiDeviceGetAttribute for either, and the adapter does
+// not link libcuda, so the activity record is the only source.
+std::atomic<uint32_t> g_sm_count{0};
+std::atomic<uint64_t> g_core_clock_hz{0};
+
+// The multi-GPU guard. gpu_pc_sample_batch_v1 carries no device_id and two
+// devices running the same binary produce the SAME cubin_crc, so their PC
+// samples are indistinguishable on the wire. Detection is on gpu_exec_v1,
+// which does carry device_id. For this phase a two-GPU process is a
+// configuration mistake, not a condition to tolerate: it is logged once here
+// and the agent marks the affected samples.
+std::mutex g_dev_mu;
+std::vector<uint64_t> g_devices_seen;
+std::atomic<uint64_t> g_multi_device{0};
+// The single-device fast path. This runs on every kernel activity record, on
+// the CUPTI worker thread, whether or not Tier B is on, so the common case
+// must not take a lock: one relaxed load and a compare.
+std::atomic<uint64_t> g_first_device{~0ull};
+
+void note_device(uint64_t device_id) {
+    if (g_first_device.load(std::memory_order_relaxed) == device_id) return;
+    std::lock_guard<std::mutex> g(g_dev_mu);
+    if (g_devices_seen.empty()) g_first_device.store(device_id, std::memory_order_relaxed);
+    for (uint64_t d : g_devices_seen)
+        if (d == device_id) return;
+    g_devices_seen.push_back(device_id);
+    if (g_devices_seen.size() > 1) {
+        g_multi_device.fetch_add(1, std::memory_order_relaxed);
+        logf("perfagent-cupti: WARNING multiple devices in one process "
+             "(device_id=%llu, %zu distinct so far). gpu_pc_sample_batch_v1 "
+             "carries no device_id and identical binaries produce identical "
+             "cubin_crc, so PC samples from these devices are not separable on "
+             "the wire. PC sampling is single-GPU in this phase.\n",
+             (unsigned long long)device_id, g_devices_seen.size());
+    }
+}
+
+// Producer-side loss, one record per class per drain. Fires unbatched with
+// count 1: it happens a handful of times per process and batching it would buy
+// nothing while making a partial batch at exit lose the last drop counts.
+void emit_dropped(uint64_t count, uint8_t klass) {
+    if (!count) return;
+    if (!gpu_dropped_v1_enabled()) return;
+    gpu_dropped_v1 d{};
+    d.count = count;
+    d.klass = klass;
+    gpu_dropped_v1_emit(&d, 1, g_dropped_seq.fetch_add(1, std::memory_order_relaxed));
+}
+
+// Queries the device's stall-reason table and puts it on the wire. Called once
+// per process, under g_pc_mu, from the first context that enables sampling.
+//
+// The table is also handed to the ReplayLog: the query happens at context
+// creation, which on a CUDA process is before a consumer can realistically
+// have attached, so without replay every stall index for the whole run would
+// arrive unresolvable.
+bool pc_query_stall_reasons(CUcontext ctx) {
+    if (g_stall_queried) return g_num_stall_reasons > 0;
+    g_stall_queried = true;
+
+    size_t num = 0;
+    CUpti_PCSamplingGetNumStallReasonsParams np{};
+    np.size = CUpti_PCSamplingGetNumStallReasonsParamsSize;
+    np.ctx = ctx;
+    np.numStallReasons = &num;
+    if (!check(cuptiPCSamplingGetNumStallReasons(&np), "cuptiPCSamplingGetNumStallReasons"))
+        return false;
+    if (!num) {
+        logf("perfagent-cupti: PC sampling reports zero stall reasons; not enabling\n");
+        return false;
+    }
+
+    std::vector<uint32_t> indices(num);
+    std::vector<char *> names(num);
+    // One flat block, so the char* array CUPTI fills points into storage that
+    // outlives the call and is freed exactly once.
+    std::vector<char> storage(num * CUPTI_STALL_REASON_STRING_SIZE, 0);
+    for (size_t i = 0; i < num; i++) names[i] = &storage[i * CUPTI_STALL_REASON_STRING_SIZE];
+
+    CUpti_PCSamplingGetStallReasonsParams sp{};
+    sp.size = CUpti_PCSamplingGetStallReasonsParamsSize;
+    sp.ctx = ctx;
+    sp.numStallReasons = num;
+    sp.stallReasonIndex = indices.data();
+    sp.stallReasons = names.data();
+    if (!check(cuptiPCSamplingGetStallReasons(&sp), "cuptiPCSamplingGetStallReasons"))
+        return false;
+
+    g_stall_indices = indices;
+    g_num_stall_reasons = num;
+
+    for (size_t i = 0; i < num; i++) {
+        gpu_stall_reason_map_v1 r{};
+        r.index = indices[i];
+        const char *nm = names[i] ? names[i] : "";
+        size_t n = strnlen(nm, CUPTI_STALL_REASON_STRING_SIZE);
+        if (n > GPU_STALL_NAME_MAX) { n = GPU_STALL_NAME_MAX; r.truncated = 1; }
+        r.name_len = (uint16_t)n;
+        if (n) memcpy(r.name, nm, n);
+        // Recorded first, emitted second: the replay copy must exist even if
+        // no consumer is attached right now, which is the common case.
+        g_replay->record_stall_reason(r);
+        if (gpu_stall_reason_map_v1_enabled())
+            gpu_stall_reason_map_v1_emit(&r, 1, g_stall_seq.fetch_add(1, std::memory_order_relaxed));
+    }
+    logf("perfagent-cupti: pc sampling stall reasons=%zu\n", num);
+    return true;
+}
+
+// Sizes and wires one context's parsed-data buffer. CUPTI writes into memory
+// the client owns: a CUpti_PCSamplingData whose pPcData points at an array of
+// collectNumPcs CUpti_PCSamplingPCData, each of whose stallReason points at
+// its own numStallReasons-entry array.
+void pc_setup_buffer(PCContext *c) {
+    c->pcs.assign(g_pc_collect_num_pcs, CUpti_PCSamplingPCData{});
+    c->stalls.assign(g_pc_collect_num_pcs * g_num_stall_reasons, CUpti_PCSamplingStallReason{});
+    for (size_t i = 0; i < g_pc_collect_num_pcs; i++) {
+        c->pcs[i].size = sizeof(CUpti_PCSamplingPCData);
+        c->pcs[i].stallReason = &c->stalls[i * g_num_stall_reasons];
+    }
+    c->data = CUpti_PCSamplingData{};
+    c->data.size = sizeof(CUpti_PCSamplingData);
+    c->data.collectNumPcs = g_pc_collect_num_pcs;
+    c->data.pPcData = c->pcs.data();
+}
+
+void pc_disable_ctx(PCContext *c, const char *why) {
+    if (!c->enabled) return;
+    CUpti_PCSamplingDisableParams dp{};
+    dp.size = CUpti_PCSamplingDisableParamsSize;
+    dp.ctx = c->ctx;
+    if (!check(cuptiPCSamplingDisable(&dp), why))
+        g_ctx_disable_failed.fetch_add(1, std::memory_order_relaxed);
+    c->enabled = false;
+}
+
+// Enables and configures PC sampling on one context. Caller holds g_pc_mu.
+//
+// Enable first, then configure: cuptiPCSamplingGetNumStallReasons and the
+// configuration attributes are all keyed on a context CUPTI already knows is
+// being sampled, and this is the order NVIDIA's own continuous-sampling sample
+// uses. If any step after the enable fails, the enable is undone rather than
+// left half-applied.
+void pc_enable_ctx(CUcontext ctx) {
+    CUpti_PCSamplingEnableParams en{};
+    en.size = CUpti_PCSamplingEnableParamsSize;
+    en.ctx = ctx;
+    if (!check(cuptiPCSamplingEnable(&en), "cuptiPCSamplingEnable")) {
+        g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    PCContext *c = new PCContext();
+    c->ctx = ctx;
+    c->enabled = true;
+
+    if (!pc_query_stall_reasons(ctx)) {
+        pc_disable_ctx(c, "cuptiPCSamplingDisable (stall query failed)");
+        g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
+        delete c;
+        return;
+    }
+    pc_setup_buffer(c);
+
+    CUpti_PCSamplingConfigurationInfo info[7]{};
+    size_t n = 0;
+    info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
+    info[n++].attributeData.collectionModeData.collectionMode =
+        CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
+    // All stall reasons. The label cardinality is device-fixed (38 on GA102),
+    // so collecting all of them costs bytes per PC and nothing that grows with
+    // the length of the run.
+    info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_STALL_REASON;
+    info[n].attributeData.stallReasonData.stallReasonCount = g_num_stall_reasons;
+    info[n++].attributeData.stallReasonData.pStallReasonIndex = g_stall_indices.data();
+    info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_OUTPUT_DATA_FORMAT;
+    info[n++].attributeData.outputDataFormatData.outputDataFormat =
+        CUPTI_PC_SAMPLING_OUTPUT_DATA_FORMAT_PARSED;
+    info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_DATA_BUFFER;
+    info[n++].attributeData.samplingDataBufferData.samplingDataBuffer = &c->data;
+    if (g_pc_period) {
+        info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
+        info[n++].attributeData.samplingPeriodData.samplingPeriod = g_pc_period;
+    }
+    if (g_pc_scratch_bytes) {
+        info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SCRATCH_BUFFER_SIZE;
+        info[n++].attributeData.scratchBufferSizeData.scratchBufferSize = g_pc_scratch_bytes;
+    }
+    if (g_pc_hw_buffer_bytes) {
+        info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE;
+        info[n++].attributeData.hardwareBufferSizeData.hardwareBufferSize = g_pc_hw_buffer_bytes;
+    }
+    // ENABLE_START_STOP_CONTROL is deliberately left off. It is what Tier A's
+    // duty cycling needs; in CONTINUOUS mode turning it on would change when a
+    // flush is required (cupti_pcsampling.h: "after every range end") without
+    // buying this tier anything.
+
+    CUpti_PCSamplingConfigurationInfoParams cp{};
+    cp.size = CUpti_PCSamplingConfigurationInfoParamsSize;
+    cp.ctx = ctx;
+    cp.numAttributes = n;
+    cp.pPCSamplingConfigurationInfo = info;
+    if (!check(cuptiPCSamplingSetConfigurationAttribute(&cp),
+               "cuptiPCSamplingSetConfigurationAttribute")) {
+        pc_disable_ctx(c, "cuptiPCSamplingDisable (configure failed)");
+        g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
+        delete c;
+        return;
+    }
+    // Per-attribute status, not just the call's. A configuration call can
+    // succeed with an individual attribute refused, and a silently unapplied
+    // COLLECTION_MODE would serialize every kernel in the process while the
+    // profile claimed it had not.
+    for (size_t i = 0; i < n; i++) {
+        if (info[i].attributeStatus != CUPTI_SUCCESS) {
+            const char *msg = "?";
+            cuptiGetResultString(info[i].attributeStatus, &msg);
+            logf("perfagent-cupti: pc sampling attribute %d refused: %s\n",
+                 (int)info[i].attributeType, msg);
+            pc_disable_ctx(c, "cuptiPCSamplingDisable (attribute refused)");
+            g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
+            delete c;
+            return;
+        }
+    }
+
+    // Read the period back when we did not set one, so gpu_config_v1 reports
+    // what the device is doing rather than what we asked for.
+    if (!g_pc_period) {
+        CUpti_PCSamplingConfigurationInfo q{};
+        q.attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
+        CUpti_PCSamplingConfigurationInfoParams qp{};
+        qp.size = CUpti_PCSamplingConfigurationInfoParamsSize;
+        qp.ctx = ctx;
+        qp.numAttributes = 1;
+        qp.pPCSamplingConfigurationInfo = &q;
+        if (cuptiPCSamplingGetConfigurationAttribute(&qp) == CUPTI_SUCCESS &&
+            q.attributeStatus == CUPTI_SUCCESS)
+            g_pc_period = q.attributeData.samplingPeriodData.samplingPeriod;
+    }
+
+    g_pc_ctxs.push_back(c);
+    g_ctx_enabled.fetch_add(1, std::memory_order_relaxed);
+    // The CUcontext itself, not a uid: CUpti_ResourceData carries no
+    // contextUid, and inventing a zero would put a plausible-looking id in a
+    // log that no other record shares.
+    logf("perfagent-cupti: pc sampling enabled ctx=%p period=%u collect_num_pcs=%zu\n",
+         (void *)ctx, g_pc_period, g_pc_collect_num_pcs);
+}
+
+// Pulls whatever CUPTI has for one context and turns it into wire records.
+// Caller holds g_pc_mu.
+//
+// ONE RECORD PER (PC, stall reason) PAIR. That is the price of the ABI's
+// fixed-size record rule (spec §6.3): CUpti_PCSamplingPCData carries a
+// variable-length stall array and gpu_pc_sample_batch_v1 cannot, so the array
+// is flattened. A (PC, stall) pair whose count is zero is not emitted --- it
+// carries no information and would multiply the wire volume by the number of
+// stall reasons the device has.
+void pc_drain_ctx_locked(PCContext *c) {
+    if (!c->enabled) return;
+    for (unsigned round = 0; round < kPCMaxDrainRounds; round++) {
+        c->data.totalNumPcs = 0;
+        c->data.remainingNumPcs = 0;
+        c->data.droppedSamples = 0;
+        c->data.totalSamples = 0;
+        c->data.nonUsrKernelsTotalSamples = 0;
+        c->data.hardwareBufferFull = 0;
+
+        CUpti_PCSamplingGetDataParams gp{};
+        gp.size = CUpti_PCSamplingGetDataParamsSize;
+        gp.ctx = c->ctx;
+        gp.pcSamplingData = &c->data;
+        g_pc_getdata_calls.fetch_add(1, std::memory_order_relaxed);
+        const CUptiResult st = cuptiPCSamplingGetData(&gp);
+        if (st == CUPTI_ERROR_OUT_OF_MEMORY) {
+            // The documented "hardware buffer is full" return. The PC data for
+            // this window is gone; the fact that it is gone is not.
+            g_pc_buffer_full.fetch_add(1, std::memory_order_relaxed);
+            emit_dropped(1, GPU_DROP_CLASS_PC_BUFFER_FULL);
+            return;
+        }
+        if (st != CUPTI_SUCCESS) {
+            g_pc_getdata_failed.fetch_add(1, std::memory_order_relaxed);
+            check(st, "cuptiPCSamplingGetData");
+            return;
+        }
+
+        // hardwareBufferFull is also reported in-band, on an otherwise
+        // successful call. Both spellings feed the same class.
+        if (c->data.hardwareBufferFull) {
+            g_pc_buffer_full.fetch_add(1, std::memory_order_relaxed);
+            emit_dropped(1, GPU_DROP_CLASS_PC_BUFFER_FULL);
+        }
+        // Deltas, not totals: CUPTI's counters are cumulative per context and
+        // the consumer sums drop records.
+        if (c->data.droppedSamples > c->last_dropped) {
+            const uint64_t d = c->data.droppedSamples - c->last_dropped;
+            c->last_dropped = c->data.droppedSamples;
+            g_pc_dropped_hw.fetch_add(d, std::memory_order_relaxed);
+            emit_dropped(d, GPU_DROP_CLASS_PC_DROPPED_HW);
+        }
+        if (c->data.nonUsrKernelsTotalSamples > c->last_non_user) {
+            const uint64_t d = c->data.nonUsrKernelsTotalSamples - c->last_non_user;
+            c->last_non_user = c->data.nonUsrKernelsTotalSamples;
+            g_pc_non_user.fetch_add(d, std::memory_order_relaxed);
+            emit_dropped(d, GPU_DROP_CLASS_PC_NON_USER_KERNEL);
+        }
+        g_pc_total_samples.fetch_add(c->data.totalSamples, std::memory_order_relaxed);
+
+        size_t npcs = c->data.totalNumPcs;
+        if (npcs > g_pc_collect_num_pcs) npcs = g_pc_collect_num_pcs;
+        g_pc_pcs.fetch_add(npcs, std::memory_order_relaxed);
+        for (size_t i = 0; i < npcs; i++) {
+            const CUpti_PCSamplingPCData &pc = c->pcs[i];
+            size_t nst = pc.stallReasonCount;
+            if (nst > g_num_stall_reasons) nst = g_num_stall_reasons;
+            for (size_t j = 0; j < nst; j++) {
+                const CUpti_PCSamplingStallReason &sr = pc.stallReason[j];
+                if (!sr.samples) {
+                    g_pc_zero_stall.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                gpu_pc_sample_batch_v1 r{};
+                r.cubin_crc = pc.cubinCrc;
+                // Zero in CONTINUOUS mode, always. The ABI says so and the
+                // consumer relies on it to route these through the module
+                // join rather than the exact one.
+                r.correlation = pc.correlationId;
+                r.pc_offset = pc.pcOffset;
+                r.function_index = pc.functionIndex;
+                r.stall_index = sr.pcSamplingStallReasonIndex;
+                r.count = sr.samples;
+                g_pc_emitted_counts.fetch_add(sr.samples, std::memory_order_relaxed);
+                if (g_pcb->add(r))
+                    g_pc_records.fetch_add(1, std::memory_order_relaxed);
+                else
+                    g_pc_unattached.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!c->data.remainingNumPcs) return;
+        if (round + 1 == kPCMaxDrainRounds)
+            g_pc_drain_rounds_capped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void pc_drain_all(perfagent::PCDrainReason reason) {
+    std::lock_guard<std::mutex> g(g_pc_mu);
+    for (PCContext *c : g_pc_ctxs) pc_drain_ctx_locked(c);
+    if (reason != perfagent::PCDrainReason::kPeriodic && g_pcb) g_pcb->flush();
+}
+
+// gpu_config_v1: the sampling configuration in force, emitted once, replayed
+// on late attach. sampling_factor is "one PC sample per N SM cycles" --- it is
+// NOT a scale factor and no count is ever multiplied by it.
+void pc_emit_config_once() {
+    if (g_config_emitted.load(std::memory_order_relaxed)) return;
+    gpu_config_v1 cfg{};
+    cfg.vendor = GPU_VENDOR_NVIDIA;
+    cfg.sm_count = g_sm_count.load(std::memory_order_relaxed);
+    cfg.clock_hz = g_core_clock_hz.load(std::memory_order_relaxed);
+    // 2^period cycles between samples. The exponent is what CUPTI takes; the
+    // cycle count is what a reader can reason about, and 2^31 still fits.
+    cfg.sampling_factor = (g_pc_period >= kPCPeriodMin && g_pc_period <= kPCPeriodMax)
+                              ? (1u << g_pc_period)
+                              : 0;
+    if (!cfg.sm_count) g_config_no_device.fetch_add(1, std::memory_order_relaxed);
+    g_replay->record_config(cfg);
+    if (gpu_config_v1_enabled())
+        gpu_config_v1_emit(&cfg, 1, g_config_seq.fetch_add(1, std::memory_order_relaxed));
+    g_config_emitted.fetch_add(1, std::memory_order_relaxed);
+}
+
+// The finalize handler. There has never been one in shim/: the adapter's only
+// teardown path was atexit, and calling cuptiFinalize with PC sampling still
+// enabled is undefined for us.
+//
+// It disables sampling on every tracked context BEFORE anything else, because
+// cuptiPCSamplingDisable is also the API that tears down CUPTI's worker
+// threads and copies the last records into our buffer --- so a drain has to
+// happen first or the tail of the profile is silently lost.
+//
+// Reached from two places: the CUPTI_CB_DOMAIN_STATE fatal-error callback,
+// which is exactly when CUPTI invokes cuptiFinalize itself, and the atexit
+// handler.
+void on_finalize(const char *why) {
+    static std::atomic<bool> done{false};
+    bool expected = false;
+    if (!done.compare_exchange_strong(expected, true)) return;
+    g_finalize_seen.fetch_add(1, std::memory_order_relaxed);
+    if (!g_pc_tier_b) return;
+
+    // try_lock, not lock, and this is the one place that is right.
+    //
+    // The fatal-error callback can arrive on the very thread that is inside a
+    // CUPTI call this adapter made while holding g_pc_mu --- a drain, say ---
+    // and a blocking acquire there would deadlock somebody else's process at
+    // the worst possible moment. Skipping the teardown loses the tail of the
+    // profile; deadlocking loses the application. The skip is counted so it is
+    // a known outcome rather than an invisible one.
+    std::unique_lock<std::mutex> g(g_pc_mu, std::try_to_lock);
+    if (!g.owns_lock()) {
+        g_finalize_contended.fetch_add(1, std::memory_order_relaxed);
+        logf("perfagent-cupti: finalize (%s): pc sampling lock held; teardown skipped\n", why);
+        return;
+    }
+    logf("perfagent-cupti: finalize (%s): disabling pc sampling on %zu context(s)\n",
+         why, g_pc_ctxs.size());
+    for (PCContext *c : g_pc_ctxs) {
+        // Drain before disable: cuptiPCSamplingDisable joins CUPTI's worker
+        // threads and copies what it has into our buffer, discarding whatever
+        // did not fit. Whatever we did not pull first is simply gone.
+        pc_drain_ctx_locked(c);
+        pc_disable_ctx(c, "cuptiPCSamplingDisable (finalize)");
+    }
+    if (g_pcb) g_pcb->flush();
+}
+
 // ------------------------------------------------------------ launch path
 
 // The runtime entry points that submit a kernel. CUDA 13 routes
@@ -432,6 +1008,55 @@ void on_launch(const CUpti_CallbackData *cb) {
     g_lb->add(l);
 }
 
+// The RESOURCE callbacks PC sampling needs. Everything here is a no-op unless
+// Tier B is on.
+void on_resource(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
+    if (!g_pc_tier_b || !rd) return;
+    switch (cbid) {
+        case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
+            g_ctx_seen.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> g(g_pc_mu);
+            pc_enable_ctx(rd->context);
+            break;
+        }
+        case CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING: {
+            g_ctx_destroyed.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> g(g_pc_mu);
+            for (size_t i = 0; i < g_pc_ctxs.size(); i++) {
+                if (g_pc_ctxs[i]->ctx != rd->context) continue;
+                PCContext *c = g_pc_ctxs[i];
+                // Drain before disabling: cuptiPCSamplingDisable tears down
+                // CUPTI's worker threads, and whatever has not been pulled by
+                // then is discarded.
+                pc_drain_ctx_locked(c);
+                pc_disable_ctx(c, "cuptiPCSamplingDisable (context destroy)");
+                g_pc_ctxs.erase(g_pc_ctxs.begin() + (long)i);
+                delete c;
+                break;
+            }
+            if (g_pcb) g_pcb->flush();
+            if (g_pc_schedule) g_pc_schedule->force(mono_ns(), perfagent::PCDrainReason::kTeardown);
+            break;
+        }
+        case CUPTI_CBID_RESOURCE_MODULE_UNLOAD_STARTING: {
+            // cupti_pcsampling.h: in CONTINUOUS mode a PC-data flush is
+            // REQUIRED after every module load-unload-load to keep PCs
+            // unique. Missing it does not lose data -- it makes two different
+            // instructions share a PC identity, silently, which is the worst
+            // failure available here. So this drains before returning, and it
+            // BLOCKS on g_pc_mu rather than trying the lock: a skipped flush
+            // is exactly what must not happen.
+            g_module_unload_drains.fetch_add(1, std::memory_order_relaxed);
+            if (g_pc_schedule)
+                g_pc_schedule->force(mono_ns(), perfagent::PCDrainReason::kModuleUnload);
+            pc_drain_all(perfagent::PCDrainReason::kModuleUnload);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId cbid,
                           const void *cbdata) {
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
@@ -443,6 +1068,21 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
         // is now read rather than only counted.
         if (cbid == CUPTI_CBID_RESOURCE_MODULE_LOADED && cbdata)
             on_module_loaded((const CUpti_ResourceData *)cbdata);
+        // The other half of this domain, and it must run for EVERY cbid, not
+        // as an else: on_resource owns CONTEXT_CREATED, CONTEXT_DESTROY and
+        // -- the one that must never be skipped -- MODULE_UNLOAD_STARTING,
+        // whose PC-data flush is what keeps PCs unique in CONTINUOUS mode.
+        // It is disjoint by cbid from the capture above (MODULE_LOADED hits
+        // its default: arm) and a no-op entirely unless Tier B is on, so
+        // neither path can shadow the other.
+        on_resource(cbid, (const CUpti_ResourceData *)cbdata);
+        return;
+    }
+    if (domain == CUPTI_CB_DOMAIN_STATE) {
+        // CUPTI invokes cuptiFinalize() itself on a fatal error, which would
+        // pull the rug from under an enabled PC sampling session. This is the
+        // only notification we get, so it is where the finalize handler runs.
+        if (cbid == CUPTI_CBID_STATE_FATAL_ERROR) on_finalize("cupti fatal error");
         return;
     }
     if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) return;
@@ -470,6 +1110,20 @@ void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size, size_t *max_recor
 
 void handle_kernel(const CUpti_ActivityKernel12 *k) {
     g_activity_records.fetch_add(1, std::memory_order_relaxed);
+    note_device(k->deviceId);
+    // A CUDA graph launch fires ONE runtime callback for the whole graph, so
+    // gpu_launch_v1 gets one record where N kernels ran. The activity records
+    // still arrive per node and carry graphId -- but gpu_exec_v1 is frozen at
+    // 48 bytes with nowhere to put it, so the one-launch-to-many-executions
+    // shape reaches the join undeclared and produces confident, exact-looking
+    // attribution of many kernels to one call site.
+    //
+    // This adapter cannot fix that (it needs gpu_exec_v2 and a new join
+    // shape). What it can do is refuse to be silent: the condition is counted
+    // and put on the wire under its own drop class, so Tier A can refuse to
+    // start in such a process. Tier B is unaffected -- its attribution runs
+    // through the module, not the launch.
+    if (k->graphId != 0) g_exec_from_graph.fetch_add(1, std::memory_order_relaxed);
 
     if (!gpu_exec_v1_enabled()) {
         g_exec_unattached.fetch_add(1, std::memory_order_relaxed);
@@ -516,6 +1170,15 @@ void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t *buffer, size_t,
             if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
                 record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
                 handle_kernel((const CUpti_ActivityKernel12 *)record);
+            } else if (record->kind == CUPTI_ACTIVITY_KIND_DEVICE) {
+                // The only source for gpu_config_v1's sm_count and clock_hz:
+                // there is no cuptiDeviceGetAttribute for either and this
+                // adapter does not link libcuda. Enabled only under Tier B.
+                const CUpti_ActivityDevice6 *d = (const CUpti_ActivityDevice6 *)record;
+                g_sm_count.store(d->numMultiprocessors, std::memory_order_relaxed);
+                // coreClockRate is kHz.
+                g_core_clock_hz.store((uint64_t)d->coreClockRate * 1000ull,
+                                      std::memory_order_relaxed);
             } else {
                 g_activity_other.fetch_add(1, std::memory_order_relaxed);
             }
@@ -584,6 +1247,80 @@ void report(const char *why) {
         if (n) logf("perfagent-cupti: resource cbid=%u count=%llu\n", i,
                     (unsigned long long)n);
     }
+    // Reported whatever the tier: both are properties of the process, not of
+    // PC sampling, and both are conditions this pipeline cannot represent on
+    // the wire. Silence about them with the tier off would be the same silence
+    // the drop classes exist to end.
+    logf("perfagent-cupti: graph_execs=%llu multi_device=%llu devices=%zu\n",
+         (unsigned long long)g_exec_from_graph.load(),
+         (unsigned long long)g_multi_device.load(), g_devices_seen.size());
+    if (!g_pc_tier_b) {
+        logf("perfagent-cupti: pc_sampling=off (set PERFAGENT_GPU_PC_SAMPLING=1)\n");
+        return;
+    }
+    // Every drop class and every context-enable failure has a counter here,
+    // and on a healthy run ctx_enable_failed, ctx_disable_failed,
+    // getdata_failed, drain_rounds_capped, pc_dropped_hw, pc_buffer_full and
+    // multi_device are all zero. pc_non_user is NOT expected to be zero --- it
+    // is the size of a structural omission, not a fault.
+    logf("perfagent-cupti: pc %s period=%u(=%u cycles) stall_reasons=%zu "
+         "ctx_seen=%llu ctx_enabled=%llu ctx_enable_failed=%llu "
+         "ctx_destroyed=%llu ctx_disable_failed=%llu "
+         "pc_records=%llu pcs=%llu pc_batch_dropped=%llu pc_unattached=%llu "
+         "zero_stall_pairs=%llu getdata=%llu getdata_failed=%llu "
+         "drain_rounds_capped=%llu drains_periodic=%llu drains_unload=%llu "
+         "drains_teardown=%llu drains_coalesced=%llu module_unload_drains=%llu "
+         "dropped_hw=%llu buffer_full=%llu non_user_samples=%llu "
+         "total_samples=%llu emitted_counts=%llu "
+         "graph_execs=%llu multi_device=%llu finalize_seen=%llu "
+         "finalize_contended=%llu "
+         "config_emitted=%llu config_no_device=%llu sm_count=%u clock_hz=%llu\n",
+         why, g_pc_period,
+         (g_pc_period >= kPCPeriodMin && g_pc_period <= kPCPeriodMax) ? (1u << g_pc_period) : 0u,
+         g_num_stall_reasons,
+         (unsigned long long)g_ctx_seen.load(),
+         (unsigned long long)g_ctx_enabled.load(),
+         (unsigned long long)g_ctx_enable_failed.load(),
+         (unsigned long long)g_ctx_destroyed.load(),
+         (unsigned long long)g_ctx_disable_failed.load(),
+         (unsigned long long)g_pc_records.load(),
+         (unsigned long long)g_pc_pcs.load(),
+         (unsigned long long)(g_pcb ? g_pcb->dropped() : 0),
+         (unsigned long long)g_pc_unattached.load(),
+         (unsigned long long)g_pc_zero_stall.load(),
+         (unsigned long long)g_pc_getdata_calls.load(),
+         (unsigned long long)g_pc_getdata_failed.load(),
+         (unsigned long long)g_pc_drain_rounds_capped.load(),
+         (unsigned long long)(g_pc_schedule ? g_pc_schedule->periodic() : 0),
+         (unsigned long long)(g_pc_schedule ? g_pc_schedule->unload() : 0),
+         (unsigned long long)(g_pc_schedule ? g_pc_schedule->teardown() : 0),
+         (unsigned long long)(g_pc_schedule ? g_pc_schedule->coalesced() : 0),
+         (unsigned long long)g_module_unload_drains.load(),
+         (unsigned long long)g_pc_dropped_hw.load(),
+         (unsigned long long)g_pc_buffer_full.load(),
+         (unsigned long long)g_pc_non_user.load(),
+         (unsigned long long)g_pc_total_samples.load(),
+         (unsigned long long)g_pc_emitted_counts.load(),
+         (unsigned long long)g_exec_from_graph.load(),
+         (unsigned long long)g_multi_device.load(),
+         (unsigned long long)g_finalize_seen.load(),
+         (unsigned long long)g_finalize_contended.load(),
+         (unsigned long long)g_config_emitted.load(),
+         (unsigned long long)g_config_no_device.load(),
+         g_sm_count.load(), (unsigned long long)g_core_clock_hz.load());
+    // The identity CUPTI does not let the agent check. totalSamples counts
+    // every sample the hardware took, including samples for instructions whose
+    // selected stall counts were all zero -- which produce no record at all --
+    // so this is an inequality, not an equation, and it is stated here rather
+    // than claimed anywhere as a check. Closing it would need a
+    // gpu_config_v2 field, which is not worth a version bump for a diagnostic.
+    logf("perfagent-cupti: pc identity (log only, not a check): "
+         "emitted_counts + dropped_hw + non_user = %llu <= total_samples = %llu; "
+         "the gap is instructions with all selected stall counts zero, which "
+         "CUPTI never reports\n",
+         (unsigned long long)(g_pc_emitted_counts.load() + g_pc_dropped_hw.load() +
+                              g_pc_non_user.load()),
+         (unsigned long long)g_pc_total_samples.load());
 }
 
 // ------------------------------------------------------------------ drain
@@ -617,16 +1354,67 @@ void on_tick() {
     // handover on the application's cuModuleLoad path would stall the
     // application for the profiler's benefit. Nothing is waiting on this
     // thread. The copy already happened, on time, in the callback.
+    //
+    // It MUST stay above the Tier B gate below. Cubin capture is not part of
+    // PC sampling and is on whenever a consumer is attached, so putting this
+    // after `if (!g_pc_tier_b) return;` would silence the offer half of every
+    // module capture in the DEFAULT configuration -- with modules_captured
+    // still counting up and cubins_sent stuck at zero.
     if (g_cubins) g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
+
+    // Graph-launched executions: counted continuously, put on the wire as a
+    // delta whenever it moves. Deliberately BEFORE the Tier B gate --- the
+    // condition it discloses is a property of the join, not of PC sampling,
+    // and it is exactly as invisible with PC sampling off as with it on.
+    // Emitting only the first would leave an operator unable to tell one graph
+    // launch from a million; emitting the running total would double-count.
+    const uint64_t graphs = g_exec_from_graph.load(std::memory_order_relaxed);
+    const uint64_t reported = g_graph_exec_reported.load(std::memory_order_relaxed);
+    if (graphs > reported) {
+        g_graph_exec_reported.store(graphs, std::memory_order_relaxed);
+        emit_dropped(graphs - reported, GPU_DROP_CLASS_GRAPH_EXEC);
+    }
+
+    if (!g_pc_tier_b) return;
+
+    // The config record is emitted from the tick rather than from the enable
+    // path, because sm_count and clock_hz come from a DEVICE activity record
+    // that the flush above is what delivers. By the first tick after a context
+    // was enabled it is normally in hand; if it is not, the record still goes
+    // out with sm_count 0 and g_config_no_device counts that, rather than the
+    // record being withheld for a field it does not need.
+    if (g_ctx_enabled.load(std::memory_order_relaxed)) pc_emit_config_once();
+
+    // The schedule, not the tick, decides. A module unload may already have
+    // pulled this data microseconds ago, and draining again would cost a
+    // CUPTI call per context for nothing; skipped ticks are counted so a
+    // schedule that stopped firing cannot look like a workload that stopped
+    // stalling. See core/pcdrain.h.
+    if (g_pc_schedule->due(mono_ns()))
+        pc_drain_all(perfagent::PCDrainReason::kPeriodic);
+    g_pcb->flush();
+
+    // The stall map and the config record are one-shot and are queried at
+    // context creation, long before a consumer can attach. ReplayLog replays
+    // both on the unattached -> attached edge.
+    g_replay->replay_if_newly_attached(gpu_stall_reason_map_v1_enabled());
 }
 
 // The documented CUPTI shutdown hook. Without it the records still sitting in
 // a partly filled CUPTI buffer at exit are lost, and so is whatever is in the
 // batches.
 void at_exit_handler() {
+    // PC sampling first, and specifically before cuptiActivityFlushAll: the
+    // finalize handler drains and then disables each context, and
+    // cuptiPCSamplingDisable is what joins CUPTI's PC worker threads. Doing it
+    // after the activity flush would leave those threads running across the
+    // flush for no reason, and doing it not at all is the undefined state this
+    // handler exists to remove.
+    on_finalize("exit");
     cuptiActivityFlushAll(1);
     if (g_lb) g_lb->flush();
     if (g_eb) g_eb->flush();
+    if (g_pcb) g_pcb->flush();
     // One last offer pass, for modules captured inside the final drain
     // interval. Bounded: drain() offers at most the entries present when it
     // was entered, the queue holds at most CubinQueueLimits::max_entries, and
@@ -753,6 +1541,51 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     g_cubins = new perfagent::CubinQueue();
     g_cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
 
+    g_replay = new perfagent::ReplayLog();
+
+    // Tier B. OFF unless asked for, and read before cuptiSubscribe so the
+    // RESOURCE callback cannot reach a half-initialized PC path.
+    //
+    // Tier A (KERNEL_SERIALIZED) is a separate task and is not reachable from
+    // here; tier selection is another. This flag is the whole of the switch
+    // for now, and its default is what keeps a merge from changing what a
+    // shipping profiler does.
+    g_pc_tier_b = env_uint("PERFAGENT_GPU_PC_SAMPLING", 0) != 0;
+    if (g_pc_tier_b) {
+        // 0 = leave CUPTI's own SM-count-derived default, which is then read
+        // back so gpu_config_v1 reports the real period. Anything outside
+        // CUPTI's documented 5..31 is refused here rather than passed through
+        // to be rejected per-attribute later.
+        const unsigned want = env_uint("PERFAGENT_GPU_PC_PERIOD", 0);
+        if (want && (want < kPCPeriodMin || want > kPCPeriodMax)) {
+            logf("perfagent-cupti: PERFAGENT_GPU_PC_PERIOD=%u outside %u..%u; "
+                 "using CUPTI's default\n", want, kPCPeriodMin, kPCPeriodMax);
+        } else {
+            g_pc_period = want;
+        }
+        g_pc_collect_num_pcs = env_uint("PERFAGENT_GPU_PC_MAX_PCS",
+                                        (unsigned)kPCDefaultCollectNumPcs);
+        g_pc_scratch_bytes = (size_t)env_uint("PERFAGENT_GPU_PC_SCRATCH_MB", 0) << 20;
+        g_pc_hw_buffer_bytes = (size_t)env_uint("PERFAGENT_GPU_PC_HW_BUFFER_MB", 0) << 20;
+        g_pcb = new perfagent::Batch<gpu_pc_sample_batch_v1, 32>(
+            gpu_pc_sample_batch_v1_emit, gpu_pc_sample_batch_v1_enabled);
+        // The PC drain rides the drain timer, so its period is the drain
+        // period unless overridden. See core/pcdrain.h for why the schedule is
+        // a thing of its own rather than an `if` in on_tick.
+        g_pc_schedule = new perfagent::PCDrainSchedule(
+            (uint64_t)env_uint("PERFAGENT_GPU_PC_DRAIN_MS",
+                               env_uint("PERFAGENT_GPU_DRAIN_MS", 100)) * 1000000ull);
+        g_replay->on_replay_stall([](const gpu_stall_reason_map_v1 &r) {
+            if (gpu_stall_reason_map_v1_enabled())
+                gpu_stall_reason_map_v1_emit(&r, 1,
+                    g_stall_seq.fetch_add(1, std::memory_order_relaxed));
+        });
+        g_replay->on_replay_config([](const gpu_config_v1 &r) {
+            if (gpu_config_v1_enabled())
+                gpu_config_v1_emit(&r, 1, g_config_seq.fetch_add(1, std::memory_order_relaxed));
+        });
+    }
+
     if (!check(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback, nullptr),
                "cuptiSubscribe"))
         return 0;
@@ -763,11 +1596,25 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
           "enable RUNTIME_API");
     check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE),
           "enable RESOURCE");
+    if (g_pc_tier_b) {
+        // The only notification that CUPTI is about to finalize itself. Not
+        // subscribed when Tier B is off: with no PC sampling enabled there is
+        // nothing for the handler to tear down, and the subscription is not
+        // free.
+        check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_STATE),
+              "enable STATE");
+    }
 
     check(cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed),
           "cuptiActivityRegisterCallbacks");
     check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL),
           "enable CONCURRENT_KERNEL");
+    if (g_pc_tier_b) {
+        // sm_count and clock_hz for gpu_config_v1 have no other source: CUPTI
+        // has no device attribute for either and this adapter does not link
+        // libcuda. One record per device, delivered once.
+        check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DEVICE), "enable DEVICE");
+    }
 
     // Seed the fit before any activity record can be converted.
     resample_clock();
@@ -785,6 +1632,8 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     //
     // sem_at_init vs sem_after_init is the measurement #49 needed: the first
     // fix gated the rendezvous on the semaphore and lost the CUDA path.
+    logf("perfagent-cupti: pc_sampling=%s tier=%s\n",
+         g_pc_tier_b ? "on" : "off", g_pc_tier_b ? "B/continuous" : "none");
     logf("perfagent-cupti: initialized pid=%d sample_period=%u sample_seed=0x%016llx "
          "drain_ms=%u clock_offset_ns=%lld enroll=%s sem_at_init=%u sem_after_init=%u "
          "enroll_addr=@%s cubin_addr=@%s cubin_timeout_ms=%u\n",

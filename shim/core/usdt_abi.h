@@ -67,11 +67,46 @@ struct gpu_config_v1 {
     uint8_t  _pad[7];
 };
 
+// gpu_config_v1.vendor. Zero means the producer did not say, which is a
+// different fact from "not NVIDIA" and must stay tellable apart.
+#define GPU_VENDOR_UNKNOWN 0
+#define GPU_VENDOR_NVIDIA  1
+#define GPU_VENDOR_AMD     2
+
 struct gpu_dropped_v1 {
     uint64_t count;
     uint8_t  klass;
     uint8_t  _pad[7];
 };
+
+// The classes gpu_dropped_v1.klass may carry.
+//
+// The record has been in this header since Phase 3 with no enum beside it and
+// no probe on the wire; these are the first classes ever defined for it. The
+// values are part of the wire contract: append only, never renumber. Zero is
+// deliberately not a class -- a producer that memsets a record and forgets to
+// set klass must not land on a real class and have its loss filed under
+// somebody else's heading.
+//
+// The first three are PC sampling's losses, and they are three rather than
+// one because the operator's action differs for each. HW backpressure says
+// lower the sampling frequency; a full hardware buffer says raise
+// HARDWARE_BUFFER_SIZE or drain more often; non-user-kernel samples say
+// nothing is wrong at all and that much of the device's time simply cannot be
+// attributed by this mechanism. Folding them together would produce one
+// number that no action follows from.
+//
+// GPU_DROP_CLASS_PC_NON_USER_KERNEL is not loss the way the other two are --
+// nothing was dropped, CUPTI never produced the records. It rides here anyway
+// because it is the SIZE of a structural omission (see the header comment on
+// gpu_pc_sample_batch_v1's emitter in the adapter), and the alternative was a
+// new record for a diagnostic.
+#define GPU_DROP_CLASS_INVALID            0
+#define GPU_DROP_CLASS_PC_DROPPED_HW      1   // CUpti_PCSamplingData.droppedSamples
+#define GPU_DROP_CLASS_PC_BUFFER_FULL     2   // ...hardwareBufferFull observations
+#define GPU_DROP_CLASS_PC_NON_USER_KERNEL 3   // ...nonUsrKernelsTotalSamples
+#define GPU_DROP_CLASS_GRAPH_EXEC         4   // executions launched from a CUDA graph
+#define GPU_DROP_CLASS_MAX                4
 
 // Longest kernel name carried inline. CUDA names are mangled C++ and can
 // exceed this; truncation is flagged per record rather than hidden.
@@ -162,6 +197,11 @@ GPU_STATIC_ASSERT(sizeof(struct gpu_module_load_v1) == 40, "gpu_module_load_v1 l
 GPU_STATIC_ASSERT(sizeof(struct gpu_pc_sample_batch_v1) == 40, "gpu_pc_sample_batch_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_config_v1) == 24, "gpu_config_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_dropped_v1) == 16, "gpu_dropped_v1 layout");
+// Pinned for the first time now that the record is actually emitted and
+// internal/gpuabi decodes it by hard-coded offset.
+GPU_STATIC_ASSERT(offsetof(struct gpu_dropped_v1, count) == 0, "dropped count leads");
+GPU_STATIC_ASSERT(offsetof(struct gpu_dropped_v1, klass) == 8, "dropped klass position");
+GPU_STATIC_ASSERT(GPU_DROP_CLASS_INVALID == 0, "class 0 is reserved for an unset klass");
 GPU_STATIC_ASSERT(offsetof(struct gpu_pc_sample_batch_v1, cubin_crc) == 0, "cubin_crc leads");
 GPU_STATIC_ASSERT(offsetof(struct gpu_module_load_v1, cubin_crc) == 0, "cubin_crc leads");
 GPU_STATIC_ASSERT(sizeof(struct gpu_launch_sampled_v1) == 56, "gpu_launch_sampled_v1 layout");

@@ -52,6 +52,12 @@ char LICENSE[] SEC("license") = "GPL";
 #define KIND_STALL_MAP      7
 #define KIND_SAMPLING_WINDOW 8
 #define KIND_CONFIG         9
+// Producer-side loss, by class. gpu_dropped_v1 has been in the ABI header
+// since Phase 3 with no kind, no cookie and no probe, so it has never reached
+// the wire -- which meant every drop class the shim could define was a
+// counter that could not go non-zero. Tier B defines the first four classes
+// and this is the kind that carries them.
+#define KIND_DROPPED        10
 // KIND_MAX sizes the `dropped` and `stacks_missing` arrays below and bounds
 // count_drop / count_stack_missing. It is deliberately larger than the
 // highest kind in use: an array resize is an unavoidable map-layout change,
@@ -74,6 +80,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define REC_STALL_MAP      136
 #define REC_SAMPLING_WINDOW 24
 #define REC_CONFIG         24
+#define REC_DROPPED        16
 
 #define MAX_RECORDS_PER_BATCH 64
 
@@ -318,6 +325,8 @@ static __always_inline __u32 record_size(__u32 kind)
         return REC_SAMPLING_WINDOW;
     if (kind == KIND_CONFIG)
         return REC_CONFIG;
+    if (kind == KIND_DROPPED)
+        return REC_DROPPED;
     return 0;
 }
 
@@ -359,6 +368,8 @@ static __always_inline __u32 max_records(__u32 kind)
         return BATCH_CAP(REC_SAMPLING_WINDOW);
     if (kind == KIND_CONFIG)
         return BATCH_CAP(REC_CONFIG);
+    if (kind == KIND_DROPPED)
+        return BATCH_CAP(REC_DROPPED);
     return 0;
 }
 
@@ -368,7 +379,7 @@ _Static_assert(1 <= BATCH_CAP(REC_LAUNCH_SAMPLED),
 // Every kind in use must be addressable in the drop arrays. A kind at or past
 // KIND_MAX is discarded by count_drop without being counted anywhere, which
 // is loss with no counter at all.
-_Static_assert(KIND_CONFIG < KIND_MAX,
+_Static_assert(KIND_DROPPED < KIND_MAX,
                "the highest kind must fit the dropped/stacks_missing arrays");
 
 // The two 24-byte records saturate MAX_RECORDS_PER_BATCH rather than the byte

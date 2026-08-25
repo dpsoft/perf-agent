@@ -32,7 +32,17 @@ type ExecutionView struct {
 	PCSamples []GPUPCSample    `json:"pc_samples,omitempty"`
 	Join      JoinKind         `json:"join,omitempty"`
 	Heuristic bool             `json:"heuristic"`
-	Ambiguous bool             `json:"ambiguous,omitempty"`
+
+	// Ambiguous means the heuristic LAUNCH join picked one of several
+	// candidate launches. It says nothing about PC samples, and nothing about
+	// PC samples ever sets it - see PCAttrib for why the two are kept apart
+	// and what would break if they were not.
+	Ambiguous bool `json:"ambiguous,omitempty"`
+
+	// PCAttrib is gpu_pc_attrib: how the PC samples above reached this
+	// execution. Empty exactly when PCSamples is empty, since there is then
+	// nothing to describe; one of PCAttribs() otherwise.
+	PCAttrib PCAttrib `json:"pc_attrib,omitempty"`
 }
 
 // TimelineDropStats counts what Timeline's own bounded storage evicted.
@@ -119,14 +129,19 @@ type Snapshot struct {
 	// every PC sample the sink accepted is attributed, still pending in one
 	// of the two stores, or evicted from one of them.
 	//
-	// Nothing joins out of this store yet — that is the Snapshot join, and it
-	// is deliberately NOT part of this change. Until it lands, a continuous-
-	// mode run shows these two gauges rising and AttributedPCSamples flat,
-	// which is the honest reading of "collected, correctly grouped, not yet
-	// attributed" rather than the previous "collapsed onto one key and
-	// silently evicted".
+	// A group that this Snapshot's join could not place is left here rather
+	// than attached to a plausible neighbour, so a persistently high
+	// PendingModuleSamples alongside a low PCJoin.AttributedKernel means the
+	// join is not finding executions for these kernels - see PCJoin for which
+	// of the four reasons it was.
 	PendingModuleSamples int `json:"pending_module_samples,omitempty"`
 	PendingModuleGroups  int `json:"pending_module_groups,omitempty"`
+
+	// PCJoin accounts for the module-keyed PC join: how each pending group
+	// fared, how the attributed samples split between the two indexes, and how
+	// many executions ended up carrying an inferred gpu_pc_attrib. See
+	// PCJoinStats.
+	PCJoin PCJoinStats `json:"pc_join,omitempty"`
 }
 
 // TimelineConfig configures Timeline's storage bounds.
@@ -203,6 +218,23 @@ type TimelineConfig struct {
 	//
 	// Zero means defaultMaxPendingModuleGroups.
 	MaxPendingModuleGroups int
+
+	// Modules is the module store the Snapshot join resolves a pending
+	// group's (cubin CRC, functionIndex) through to a device function name.
+	// It is injected rather than owned because it is filled by the cubin
+	// transport, not by Timeline, and because the projection resolves source
+	// lines against the same store: one store, two readers, no second copy of
+	// the bytes.
+	//
+	// Nil is a supported configuration and is what every backend that does
+	// not do PC sampling passes. With no store, no correlation-less group can
+	// be named, so none is joined - every one of them is counted in
+	// PCJoinStats.GroupsUnresolvedName and left pending. That is deliberately
+	// the same accounting as "the cubin never arrived", because for the
+	// profile it is the same fact: there is nothing to resolve the group
+	// against. It is NOT silently skipped, which would make a missing store
+	// look identical to a healthy run with no PC samples.
+	Modules *ModuleStore
 }
 
 // Timeline is the indexed join point: it ingests launches, executions, PC
@@ -349,20 +381,75 @@ type Timeline struct {
 	// *read*, which orderedFIFO has no notion of. This store is pure FIFO by
 	// arrival like pending, so that reason does not apply.)
 	//
-	// Nothing joins out of this store yet. Getting samples into a correctly
-	// keyed index and getting them attached to an execution are separate
-	// changes on purpose; the second one is where the module store, the
-	// kernel-name match and the attribution-quality label live.
+	// Snapshot consumes from this store exactly as it consumes from pending,
+	// via joinPendingModuleLocked: a group whose (CRC, functionIndex) names a
+	// device function that an execution in the snapshot carries as its
+	// KernelName is handed over whole and deleted. A group that cannot be
+	// named, or that finds no execution, is left here untouched and stays
+	// eligible for a later Snapshot - never attached to a plausible
+	// neighbour.
 	pendingModule            map[pendingModuleKey]pendingSamples
 	pendingModuleOrder       *orderedFIFO[pendingModuleKey]
 	pendingModuleCap         int
 	pendingModuleSampleTotal uint64
+
+	// modstore resolves a pendingModule key's (CRC, functionIndex) to a
+	// device function name at Snapshot time. Nil is supported - see
+	// TimelineConfig.Modules. Named apart from the modules ring below, which
+	// records THAT a module loaded; this one holds what a module IS.
+	modstore *ModuleStore
+
+	// devicesByPID is the multi-GPU guard's whole state: for each process
+	// that has produced an execution naming a device, the first device id
+	// seen and whether a second, different one has since arrived.
+	//
+	// It exists because gpu_pc_sample_batch_v1 carries no device id and two
+	// devices running the same binary produce the same cubin CRC, so a
+	// process's PC samples are indistinguishable BETWEEN its devices on the
+	// wire. There is no way to make the join right in that case; there is
+	// only a way to stop it from looking right, which is what
+	// PCAttribKernelMultiDevice does. Detection is on executions, which do
+	// carry a device id.
+	//
+	// It is cumulative rather than per-snapshot on purpose. The condition is
+	// a property of the process, and a process that used two devices in an
+	// earlier snapshot has not stopped having done so; per-snapshot detection
+	// would clear the mark on exactly the snapshots where only one device
+	// happened to report, which is the reading-green-when-worst failure this
+	// project keeps hitting.
+	//
+	// It is bounded, because a system-wide profile has no a-priori bound on
+	// distinct pids. Past maxTrackedDeviceProcesses a new process is not
+	// admitted and is therefore treated as single-device - the right guess,
+	// and still a guess, which is why the refusal is counted in
+	// deviceTrackingCapped and raised in joinhealth rather than absorbed.
+	devicesByPID         map[uint32]processDevices
+	multiDeviceProcesses uint64
+	deviceTrackingCapped uint64
 
 	events  *ring[GPUTimelineEvent]
 	modules *ring[GPUModule]
 
 	dropped TimelineDropStats
 }
+
+// processDevices is one process's entry in Timeline.devicesByPID: the first
+// device id observed for it, and whether a different one has since been seen.
+// Only two states matter to the join (one device, or more than one), so the
+// set itself is never retained - the whole point is a decision, not an
+// inventory, and retaining the set would make the guard's memory a function of
+// the machine's GPU count for no gain.
+type processDevices struct {
+	first string
+	multi bool
+}
+
+// maxTrackedDeviceProcesses bounds Timeline.devicesByPID. One entry is a pid,
+// a short device id string and a bool; 4,096 of them is a few hundred
+// kilobytes at most, and reaching it needs thousands of concurrently profiled
+// processes that each run GPU kernels. See the devicesByPID doc comment for
+// what happens past it and why that is counted.
+const maxTrackedDeviceProcesses = 4096
 
 // pendingSamples is a pending correlation's accumulated samples, tagged with
 // the sequence number of its current (live) generation - see the pending
@@ -478,6 +565,9 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		// mode sampling should not pay for a preallocated slice.
 		pendingModuleOrder: newOrderedFIFO[pendingModuleKey](0),
 		pendingModuleCap:   moduleGroupCap,
+		modstore:           cfg.Modules,
+
+		devicesByPID: make(map[uint32]processDevices),
 	}
 }
 
@@ -509,10 +599,63 @@ func (t *Timeline) EmitLaunch(l GPUKernelLaunch) error {
 func (t *Timeline) EmitExec(e GPUKernelExec) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.observeExecDeviceLocked(e)
 	if t.execs.push(e) {
 		t.dropped.EvictedExecutions++
 	}
 	return nil
+}
+
+// execDeviceID is the device an execution ran on. GPUExecutionRef is the
+// authoritative place (it is the execution's own identity); GPUQueueRef's
+// device is the fallback for a producer that fills in the queue and not the
+// execution ref. Empty means the producer named no device at all, which is not
+// evidence of one device or of two and is therefore not an observation.
+func execDeviceID(e GPUKernelExec) string {
+	if e.Execution.DeviceID != "" {
+		return e.Execution.DeviceID
+	}
+	return e.Queue.Device.DeviceID
+}
+
+// observeExecDeviceLocked feeds the multi-GPU guard. It runs on every
+// execution, not only when PC sampling is on: the executions that reveal a
+// second device are not necessarily the ones whose kernels get sampled, and a
+// guard that only watched while sampling was running would learn the fact too
+// late to mark anything. Caller holds t.mu.
+func (t *Timeline) observeExecDeviceLocked(e GPUKernelExec) {
+	device := execDeviceID(e)
+	if device == "" {
+		return
+	}
+	pid := e.Correlation.PID
+
+	cur, ok := t.devicesByPID[pid]
+	if !ok {
+		if len(t.devicesByPID) >= maxTrackedDeviceProcesses {
+			t.deviceTrackingCapped++
+			return
+		}
+		t.devicesByPID[pid] = processDevices{first: device}
+		return
+	}
+	if cur.multi || cur.first == device {
+		return
+	}
+	cur.multi = true
+	t.devicesByPID[pid] = cur
+	t.multiDeviceProcesses++
+}
+
+// isMultiDeviceLocked reports whether this process has been observed running
+// kernels on more than one device. An untracked process answers false: it has
+// produced no execution naming a device, or the tracker was full, and in both
+// cases there is no evidence of a second device. The absence of evidence is
+// reported honestly by deviceTrackingCapped rather than by turning every
+// unknown into a multidevice mark, which would bury the real ones. Caller
+// holds t.mu.
+func (t *Timeline) isMultiDeviceLocked(pid uint32) bool {
+	return t.devicesByPID[pid].multi
 }
 
 func (t *Timeline) EmitPCSample(p GPUPCSample) error {
@@ -703,6 +846,198 @@ func (t *Timeline) evictPendingModuleLocked() {
 	}
 }
 
+// pcModuleJoin is joinPendingModuleLocked's result: the per-execution
+// attribution it decided, the samples it moved, and the accounting for every
+// group it looked at.
+type pcModuleJoin struct {
+	// attrib is parallel to the execs slice the join was given, empty at every
+	// index the join did not attach samples to. It is nil when the join did no
+	// work at all, which attribAt handles so callers need no length check.
+	attrib  []PCAttrib
+	samples uint64
+	stats   PCJoinStats
+}
+
+func (r pcModuleJoin) attribAt(i int) PCAttrib {
+	if i < len(r.attrib) {
+		return r.attrib[i]
+	}
+	return ""
+}
+
+// execKernelKey is the identity the module join matches on: the process, and
+// the kernel's name. Both halves are load-bearing.
+//
+// The PROCESS is in the key for the reason issue #52 put it in
+// candidateGroupKey: two processes running the identical binary produce the
+// identical cubin CRC and the identical function index, so the module side of
+// this join cannot distinguish them at all, and only the pid can. It is a
+// field of the key rather than a check beside it so there is nothing to
+// forget.
+//
+// The NAME is a plain string comparison against the name the module store read
+// out of the cubin's symbol table, and it is deliberately exact. No
+// demangling, no prefix or suffix trimming, no "close enough" - the design's
+// rule is that kernel identity comes from the module and never from guessing
+// on the kernel-name string, and every relaxation of this comparison is a way
+// to attach a sample to a kernel that merely looks related. Where the two
+// spellings do not match, the group stays pending and is counted; a sample
+// left pending is recoverable, a sample on the wrong kernel is not.
+type execKernelKey struct {
+	pid        uint32
+	kernelName string
+}
+
+// joinPendingModuleLocked is the continuous-mode half of the Snapshot join:
+// for every correlation-less pending group, resolve (cubin CRC,
+// functionIndex) through the module store to a device function name, and hand
+// the group's samples to the execution of that kernel in this snapshot.
+//
+// It runs only after the exact-correlation pass, and only over executions that
+// pass left unserved - exactServed marks the rest. That ordering is the
+// design's: Tier A keeps taking the exact index, untouched, and the module
+// path is strictly what happens on a miss.
+//
+// Four outcomes per group, and they partition the groups examined:
+//
+//	no process        the producer named no pid; refused (see execKernelKey)
+//	unnameable        no module store, no module, or an unknown functionIndex
+//	no execution      named, but no eligible execution of that kernel is here
+//	joined            attached, with the attribution quality below
+//
+// The first three leave the group in the store, untouched and still eligible
+// for a later Snapshot; they are not losses, and the loss - if the group never
+// becomes joinable - is counted where it happens, at horizon eviction.
+//
+// Attribution quality:
+//
+//	one execution of that kernel in the snapshot     -> kernel
+//	more than one                                    -> kernel-ambiguous
+//	either, in a process observed on 2+ devices      -> kernel-multidevice
+//
+// Ambiguity is counted over EVERY execution of that kernel in the snapshot,
+// not only the eligible ones, because "how many invocations of this kernel
+// could these samples have come from" is a question about the horizon, not
+// about which of them the join happened to be allowed to use.
+//
+// Where more than one execution qualifies, the group's samples go to the
+// earliest of them by StartNs, whole. Splitting them across the candidates would
+// manufacture a distribution the data does not contain, and it would make each
+// resulting execution look individually more certain than the group is; the
+// label is what carries the doubt instead. Caller holds t.mu.
+func (t *Timeline) joinPendingModuleLocked(execs []GPUKernelExec, execSamples [][]GPUPCSample, exactServed []bool) pcModuleJoin {
+	res := pcModuleJoin{
+		stats: PCJoinStats{
+			MultiDeviceProcesses: t.multiDeviceProcesses,
+			DeviceTrackingCapped: t.deviceTrackingCapped,
+		},
+	}
+	if len(t.pendingModule) == 0 {
+		return res
+	}
+
+	// byKernel indexes every named execution of this snapshot. len(indices) is
+	// the ambiguity test; the first index whose exact pass came up empty is
+	// the target.
+	byKernel := make(map[execKernelKey][]int, len(execs))
+	for i, e := range execs {
+		if e.KernelName == "" || e.Correlation.PID == 0 {
+			continue
+		}
+		key := execKernelKey{pid: e.Correlation.PID, kernelName: e.KernelName}
+		byKernel[key] = append(byKernel[key], i)
+	}
+
+	res.attrib = make([]PCAttrib, len(execs))
+
+	// Map iteration order is randomized, and two groups can legitimately
+	// resolve to the same kernel name (the same device function in two cubin
+	// generations, after a JIT reload). Walking the keys in a fixed order
+	// makes the resulting sample order, and therefore the profile, the same
+	// for the same inputs.
+	keys := slices.SortedFunc(maps.Keys(t.pendingModule), comparePendingModuleKey)
+	for _, key := range keys {
+		if key.PID == 0 {
+			res.stats.GroupsNoProcess++
+			continue
+		}
+		name, ok := "", false
+		if t.modstore != nil {
+			name, ok = t.modstore.FunctionName(key.CubinCRC, key.FunctionIndex)
+		}
+		if !ok {
+			res.stats.GroupsUnresolvedName++
+			continue
+		}
+		candidates := byKernel[execKernelKey{pid: key.PID, kernelName: name}]
+		target := -1
+		for _, i := range candidates {
+			// Earliest by StartNs, not first in ring order: executions reach
+			// the ring in the order the producer drained them, which is not
+			// the order they ran, and "which invocation" must not depend on
+			// that. Ties break on the ring index, which is stable.
+			if exactServed[i] {
+				continue
+			}
+			if target < 0 || execs[i].StartNs < execs[target].StartNs {
+				target = i
+			}
+		}
+		if target < 0 {
+			res.stats.GroupsNoExecution++
+			continue
+		}
+
+		attrib := PCAttribKernel
+		if len(candidates) > 1 {
+			attrib = PCAttribKernelAmbiguous
+		}
+		if t.isMultiDeviceLocked(key.PID) {
+			attrib = PCAttribKernelMultiDevice
+		}
+
+		entry := t.pendingModule[key]
+		execSamples[target] = append(execSamples[target], entry.samples...)
+		res.attrib[target] = worsePCAttrib(res.attrib[target], attrib)
+		res.samples += uint64(len(entry.samples))
+		res.stats.GroupsJoined++
+
+		delete(t.pendingModule, key)
+		t.pendingModuleSampleTotal -= uint64(len(entry.samples))
+	}
+
+	// Counted over executions after the fact, not incremented per group: two
+	// groups landing on one execution are one execution carrying the label,
+	// and incrementing inline would double-count it.
+	for _, a := range res.attrib {
+		switch a {
+		case PCAttribKernelAmbiguous:
+			res.stats.AmbiguousAttributions++
+		case PCAttribKernelMultiDevice:
+			res.stats.MultiDeviceAttributions++
+		case PCAttribExact, PCAttribKernel:
+		}
+	}
+	res.stats.AttributedKernel = res.samples
+	return res
+}
+
+// comparePendingModuleKey orders the pending module store's keys for the
+// deterministic walk in joinPendingModuleLocked. The field order is
+// arbitrary; only its stability matters.
+func comparePendingModuleKey(a, b pendingModuleKey) int {
+	if c := cmp.Compare(a.PID, b.PID); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.CubinCRC, b.CubinCRC); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.FunctionIndex, b.FunctionIndex); c != 0 {
+		return c
+	}
+	return cmp.Compare(string(a.Backend), string(b.Backend))
+}
+
 func (t *Timeline) EmitModule(m GPUModule) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -746,7 +1081,8 @@ func cloneTimelineEvent(in GPUTimelineEvent) GPUTimelineEvent {
 // guards: execs, events and modules are drained from their rings (a second
 // consecutive Snapshot call returns none of them unless new ones arrived in
 // between), and PC samples matched to an execution in this call are removed
-// from the pending store the same way. This is a deliberate, uniform
+// from the pending stores - both of them, correlation-keyed and module-keyed -
+// the same way. This is a deliberate, uniform
 // lifecycle across all five stores - see review Critical 3: execs used to be
 // merely copied (re-reported in every Snapshot until the ring rotated, so a
 // polling caller double-, triple-, N-counted the same kernel time) while PC
@@ -792,23 +1128,31 @@ func (t *Timeline) Snapshot() Snapshot {
 	// actually use, rather than copying the whole map: a correlation with
 	// no live exec this round is left untouched (still eligible for a
 	// later snapshot, or eventual orphan eviction).
-	var attributedPCSamples uint64
+	var attributedExact uint64
 	t.mu.Lock()
 	execSamples := make([][]GPUPCSample, len(execs))
+	exactServed := make([]bool, len(execs))
 	for i, exec := range execs {
 		if entry, ok := t.pending[exec.Correlation]; ok {
 			execSamples[i] = entry.samples
+			exactServed[i] = true
 			delete(t.pending, exec.Correlation)
 			t.pendingSampleTotal -= uint64(len(entry.samples))
-			attributedPCSamples += uint64(len(entry.samples))
+			attributedExact += uint64(len(entry.samples))
 		}
 	}
+	// The module-keyed join runs strictly after the loop above and strictly
+	// over what it left unserved: the exact-correlation path is unchanged and
+	// keeps first claim. It consumes from the module store exactly as the loop
+	// above consumes from the correlation-keyed one - a group it can place is
+	// deleted, a group it cannot is left alone and stays eligible for a later
+	// Snapshot.
+	pcJoin := t.joinPendingModuleLocked(execs, execSamples, exactServed)
+	pcJoin.stats.AttributedExact = attributedExact
+	attributedPCSamples := attributedExact + pcJoin.samples
+
 	pendingCorrelations := len(t.pending)
 	pendingSamples := t.pendingSampleTotal
-	// Read, never drained: nothing joins out of the module-keyed store yet,
-	// so every group here survives this Snapshot. When the join lands it
-	// consumes from this store the same way the loop above consumes from the
-	// correlation-keyed one.
 	pendingModuleGroups := len(t.pendingModule)
 	pendingModuleSamples := t.pendingModuleSampleTotal
 	t.mu.Unlock()
@@ -865,6 +1209,18 @@ func (t *Timeline) Snapshot() Snapshot {
 	matched := make(map[CorrelationID]struct{})
 	for i, exec := range execs {
 		view := ExecutionView{Exec: exec, PCSamples: execSamples[i]}
+		// gpu_pc_attrib, decided entirely by which index served this
+		// execution. It is set independently of view.Join and view.Ambiguous
+		// below and never reads or writes either: an execution can be joined
+		// to its launch exactly and still have INFERRED PC samples, which is
+		// precisely the pair of facts one boolean could not carry. See
+		// PCAttrib.
+		switch {
+		case exactServed[i]:
+			view.PCAttrib = PCAttribExact
+		case len(view.PCSamples) > 0:
+			view.PCAttrib = pcJoin.attribAt(i)
+		}
 
 		if exec.Correlation.Present() {
 			if l, ok := t.cache.Get(exec.Correlation); ok {
@@ -972,6 +1328,7 @@ func (t *Timeline) Snapshot() Snapshot {
 
 		PendingModuleSamples: int(pendingModuleSamples),
 		PendingModuleGroups:  pendingModuleGroups,
+		PCJoin:               pcJoin.stats,
 	}
 }
 

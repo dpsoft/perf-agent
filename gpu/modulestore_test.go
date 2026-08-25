@@ -693,3 +693,171 @@ func TestModuleStoreConcurrentPutAndResolve(t *testing.T) {
 	assert.Equal(t, s.ModulesStored-uint64(s.Live), s.ModulesEvicted,
 		"every stored module is either live or evicted")
 }
+
+// ---------------------------------------------------------------------------
+// FunctionName - the accessor the continuous-mode join needs
+// ---------------------------------------------------------------------------
+
+// TestFunctionNameWorksWithoutLineInfo is the reason this accessor exists at
+// all. Resolve carries a function name only under SrcResolved, which is
+// correct for source labels and wrong for attribution: the continuous-mode
+// chain is cubin_crc -> module -> function -> KERNEL, and a kernel built
+// without -lineinfo still has a name, still runs, and still owns its PC
+// samples. If attribution went through Resolve, a missing build flag would
+// silently cost the whole join rather than just the source lines.
+func TestFunctionNameWorksWithoutLineInfo(t *testing.T) {
+	withInfo := fixture(t, "single_lineinfo.cubin")
+	noInfo := fixture(t, "single_nolineinfo.cubin")
+
+	st := NewModuleStore(ModuleStoreConfig{})
+	require.NoError(t, st.Put(1, withInfo))
+	require.NoError(t, st.Put(2, noInfo))
+
+	name, ok := st.FunctionName(1, symIndexOf(t, withInfo, "addOne"))
+	require.True(t, ok)
+	assert.Equal(t, "addOne", name)
+
+	name, ok = st.FunctionName(2, symIndexOf(t, noInfo, "addOne"))
+	require.True(t, ok, "a module with no line table still has a symbol table")
+	assert.Equal(t, "addOne", name)
+
+	// And the contrast that makes the point: the same module answers
+	// no-lineinfo for source, with no name at all.
+	res := st.Resolve(2, symIndexOf(t, noInfo, "addOne"), 0)
+	assert.Equal(t, SrcNoLineInfo, res.Status())
+	_, _, _, hasSource := res.Source()
+	assert.False(t, hasSource, "no-lineinfo carries no location, and that is unchanged")
+}
+
+// TestFunctionNameBindsTheIndexToTheRightKernel uses the two-kernel fixture:
+// an accessor that returned a neighbouring function would still look healthy
+// on a single-kernel module. Attribution built on a swapped index puts a
+// kernel's stalls on a different kernel, confidently.
+func TestFunctionNameBindsTheIndexToTheRightKernel(t *testing.T) {
+	b := fixture(t, "two_kernels_lineinfo.cubin")
+	st := NewModuleStore(ModuleStoreConfig{})
+	require.NoError(t, st.Put(7, b))
+
+	for _, kernel := range []string{"scale", "offset"} {
+		name, ok := st.FunctionName(7, symIndexOf(t, b, kernel))
+		require.Truef(t, ok, "kernel %s", kernel)
+		assert.Equal(t, kernel, name)
+	}
+}
+
+// TestFunctionNameRefusesRatherThanGuesses covers every way the answer is
+// unavailable. Each returns ok=false and an empty name; none returns a
+// neighbouring function, and none is a partial answer a caller could mistake
+// for a real one.
+func TestFunctionNameRefusesRatherThanGuesses(t *testing.T) {
+	withInfo := fixture(t, "single_lineinfo.cubin")
+	idx := symIndexOf(t, withInfo, "addOne")
+
+	st := NewModuleStore(ModuleStoreConfig{})
+	require.NoError(t, st.Put(1, withInfo))
+	require.Error(t, st.Put(2, []byte("not an ELF at all")))
+
+	cases := []struct {
+		name    string
+		crc     uint64
+		fnIndex uint32
+	}{
+		{"a CRC nothing was ever offered for", 99, idx},
+		{"a module whose bytes did not parse", 2, idx},
+		{"an index that is not in the symbol table", 1, idx + 9999},
+		{"index zero, which is the ELF null symbol", 1, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name, ok := st.FunctionName(tc.crc, tc.fnIndex)
+			assert.False(t, ok)
+			assert.Empty(t, name, "a refusal must carry no name at all, not a plausible one")
+		})
+	}
+}
+
+// TestFunctionNameSurvivesADamagedLineTable pins the one case where
+// FunctionName and Resolve deliberately disagree. A cubin whose .debug_line
+// cannot be read resolves as no-module - we hold bytes we cannot use for
+// source - but its symbol table is intact and the kernel's identity does not
+// come from DWARF. Attribution must not be lost to a broken line table.
+func TestFunctionNameSurvivesADamagedLineTable(t *testing.T) {
+	damaged := damagedLineInfo(t)
+	idx := symIndexOf(t, damaged, "addOne")
+
+	st := NewModuleStore(ModuleStoreConfig{})
+	require.NoError(t, st.Put(1, damaged))
+
+	assert.Equal(t, SrcNoModule, st.Resolve(1, idx, 0).Status(),
+		"source resolution is correctly lost")
+	name, ok := st.FunctionName(1, idx)
+	require.True(t, ok, "attribution is not")
+	assert.Equal(t, "addOne", name)
+}
+
+// TestFunctionNameAfterEvictionIsRefusedNotStale is the store's central
+// no-memo guarantee applied to this accessor: an answer must never outlive the
+// bytes it came from.
+func TestFunctionNameAfterEvictionIsRefusedNotStale(t *testing.T) {
+	b := fixture(t, "single_lineinfo.cubin")
+	idx := symIndexOf(t, b, "addOne")
+
+	st := NewModuleStore(ModuleStoreConfig{Capacity: 1})
+	require.NoError(t, st.Put(1, b))
+	name, ok := st.FunctionName(1, idx)
+	require.True(t, ok)
+	require.Equal(t, "addOne", name)
+
+	require.NoError(t, st.Put(2, b)) // evicts CRC 1
+
+	name, ok = st.FunctionName(1, idx)
+	assert.False(t, ok, "an evicted module must answer nothing, not its last known name")
+	assert.Empty(t, name)
+}
+
+// TestFunctionNameRefreshesRecency: a module whose functions are being joined
+// is a module in use. Without the touch, a burst of unrelated module loads
+// would silently stop attribution for a live kernel while the store still had
+// room for it.
+func TestFunctionNameRefreshesRecency(t *testing.T) {
+	b := fixture(t, "single_lineinfo.cubin")
+	idx := symIndexOf(t, b, "addOne")
+
+	st := NewModuleStore(ModuleStoreConfig{Capacity: 2})
+	require.NoError(t, st.Put(1, b))
+	require.NoError(t, st.Put(2, b))
+
+	// Touch 1 through FunctionName only, then push a third module in.
+	_, ok := st.FunctionName(1, idx)
+	require.True(t, ok)
+	require.NoError(t, st.Put(3, b))
+
+	_, ok = st.FunctionName(1, idx)
+	assert.True(t, ok, "the module FunctionName just used must not be the one evicted")
+	_, ok = st.FunctionName(2, idx)
+	assert.False(t, ok, "the untouched module is the one that goes")
+}
+
+// TestFunctionNameDoesNotDisturbTheResolveIdentity pins the deliberate
+// omission: FunctionName increments none of the four Resolve* counters,
+// because those four partition calls to Resolve exactly and that identity is
+// the store's main self-check. Folding a second entry point into it would
+// break the identity while looking like better instrumentation.
+func TestFunctionNameDoesNotDisturbTheResolveIdentity(t *testing.T) {
+	b := fixture(t, "single_lineinfo.cubin")
+	idx := symIndexOf(t, b, "addOne")
+
+	c := &counting{ModuleStore: NewModuleStore(ModuleStoreConfig{})}
+	require.NoError(t, c.Put(1, b))
+
+	for range 5 {
+		_, _ = c.FunctionName(1, idx)
+		_, _ = c.FunctionName(99, idx)
+	}
+	require.Zero(t, c.Stats().ResolveTotal(), "no Resolve call has been made yet")
+
+	for range 3 {
+		c.Resolve(1, idx, 0x10)
+	}
+	requireSumIdentity(t, c)
+}

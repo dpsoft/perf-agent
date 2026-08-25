@@ -107,6 +107,17 @@ func joinSummary(snap Snapshot, anomalies int) string {
 	if snap.AttributedPCSamples > 0 || snap.PendingSamples > 0 {
 		fmt.Fprintf(&b, "; pc samples %d attributed, %d pending",
 			snap.AttributedPCSamples, snap.PendingSamples)
+		// The split by index is printed only when both are actually in play.
+		// A pure Tier A run (every sample exact) and a pure Tier B run (every
+		// sample through the module) each need one number, not two, and
+		// printing "0 by kernel" on every CUPTI run is the zero-valued noise
+		// this format exists to avoid.
+		if snap.PCJoin.AttributedExact > 0 && snap.PCJoin.AttributedKernel > 0 {
+			fmt.Fprintf(&b, " (%d exact, %d by kernel)",
+				snap.PCJoin.AttributedExact, snap.PCJoin.AttributedKernel)
+		} else if snap.PCJoin.AttributedKernel > 0 {
+			b.WriteString(" by kernel")
+		}
 	}
 
 	// Its own clause rather than folded into the one above, for the same
@@ -116,8 +127,8 @@ func joinSummary(snap Snapshot, anomalies int) string {
 	// collection is optional and off by default, so the clause is absent
 	// entirely when nothing produced such samples.
 	if snap.PendingModuleSamples > 0 {
-		fmt.Fprintf(&b, "; %d correlation-less pc samples pending over %d %s",
-			snap.PendingModuleSamples, snap.PendingModuleGroups,
+		fmt.Fprintf(&b, "; %s pending over %s",
+			plural(uint64(snap.PendingModuleSamples), "correlation-less pc sample", "correlation-less pc samples"),
 			plural(uint64(snap.PendingModuleGroups), "kernel group", "kernel groups"))
 	}
 
@@ -229,6 +240,42 @@ func joinAnomalies(snap Snapshot) []string {
 		add("%s carried an out-of-range timestamp — the producer's clock is suspect and "+
 			"horizon eviction is running against a clamped anchor",
 			plural(lc.AnomalousTimestamp, "launch", "launches"))
+	}
+	// PC-attribution quality, kept strictly apart from the heuristic-launch
+	// clauses above. An execution can appear in both sets - joined to its
+	// launch by vendor correlation and still carrying inferred PC samples -
+	// and the two lines say different things about different joins.
+	if pj := snap.PCJoin; pj.AmbiguousAttributions > 0 {
+		add("%s carrying PC samples attributed by kernel with more than one execution of that "+
+			"kernel in the snapshot — the stall detail is on the right kernel but not provably on "+
+			"the right invocation; these samples are marked %s, which is NOT the same flag as an "+
+			"ambiguous heuristic launch join",
+			plural(pj.AmbiguousAttributions, "execution", "executions"), PCAttribKernelAmbiguous)
+	}
+	if pj := snap.PCJoin; pj.MultiDeviceProcesses > 0 {
+		add("%s ran kernels on more than one device — PC samples carry no device id and one binary "+
+			"has one cubin CRC on both, so their samples cannot be told apart; %s are marked %s. "+
+			"PC sampling is single-GPU in this phase",
+			plural(pj.MultiDeviceProcesses, "process", "processes"),
+			plural(pj.MultiDeviceAttributions, "execution", "executions"),
+			PCAttribKernelMultiDevice)
+	}
+	if pj := snap.PCJoin; pj.DeviceTrackingCapped > 0 {
+		add("%s could not be admitted to the multi-device guard (it is full) and are being treated "+
+			"as single-device — a second device in one of them would go unmarked",
+			plural(pj.DeviceTrackingCapped, "process", "processes"))
+	}
+	if pj := snap.PCJoin; pj.GroupsUnresolvedName > 0 {
+		add("%s could not be resolved to a device function — no cubin for that CRC reached the "+
+			"agent, it was evicted, or the function index is not in its symbol table; those samples "+
+			"stay pending and will age out unattributed rather than be attached to a nearby kernel",
+			plural(pj.GroupsUnresolvedName, "correlation-less PC group", "correlation-less PC groups"))
+	}
+	if pj := snap.PCJoin; pj.GroupsNoProcess > 0 {
+		add("%s arrived naming no process — every process that names none shares one key, so they "+
+			"cannot be joined to any execution without risking another process's kernel; have the "+
+			"producer set CorrelationID.PID",
+			plural(pj.GroupsNoProcess, "correlation-less PC group", "correlation-less PC groups"))
 	}
 	if dr.EvictedPendingSamples > 0 {
 		add("%s evicted while waiting for their execution — never attributed, so the "+

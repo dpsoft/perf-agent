@@ -604,3 +604,53 @@ func (s *ModuleStore) evictOldestLocked() bool {
 	s.stats.ModulesEvicted++
 	return true
 }
+
+// FunctionName returns the device function a PC record's functionIndex names
+// inside the module with this CRC, and ok reporting whether the store could
+// answer at all.
+//
+// It exists because Resolve deliberately cannot answer this question. Resolve
+// carries a function name only under SrcResolved - that is the four-valued
+// status doing its job, since a name paired with no-lineinfo would invite a
+// caller to emit gpu_src_func for a module that has no source information.
+// But the continuous-mode attribution chain is cubin_crc -> module ->
+// function -> KERNEL, and it needs the name whether or not the module was
+// built with -lineinfo: a kernel compiled without -lineinfo still has a name,
+// still executes, and its PC samples still belong to it. Routing that need
+// through Resolve would either leak a name out of a non-resolved status or
+// make attribution depend on a build flag it has nothing to do with.
+//
+// ok is false when the CRC is not held (never arrived, or evicted), when the
+// bytes did not parse, or when functionIndex is not in the module's symbol
+// table. A damaged .debug_line does NOT make it false: the symbol table is
+// intact in that case and the function's identity does not come from DWARF.
+// There is never a nearest-index guess - an index this store cannot map is
+// reported as unmappable, and the caller's business is then to leave the
+// samples unattributed rather than to attach them to a plausible neighbour.
+//
+// Like Resolve, it refreshes LRU recency: a module whose functions are being
+// joined is a module in use, and letting it age out under a burst of
+// unrelated loads would silently stop attribution for a live kernel.
+//
+// It deliberately increments none of the Resolve* counters. Those four
+// partition calls to Resolve exactly, and that identity is the store's main
+// self-check; folding a second entry point into it would break the identity
+// while looking like an improvement. What this call's failures cost is
+// counted where the loss actually happens - at the join, which reports the
+// groups it could not name.
+func (s *ModuleStore) FunctionName(crc uint64, functionIndex uint32) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.byCRC[crc]
+	if !ok {
+		return "", false
+	}
+	s.lru.MoveToFront(e.elem)
+	if e.byIndex == nil {
+		// parseErr != nil: we hold bytes we cannot read. Nothing to name.
+		return "", false
+	}
+	name, ok := e.byIndex[functionIndex]
+	return name, ok
+}

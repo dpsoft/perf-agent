@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -121,6 +122,43 @@ func TestSampledProbesAreNotBatchedInTheStub(t *testing.T) {
 			"%s must be emitted one record at a time, never through perfagent::Batch", probe)
 		require.Containsf(t, string(b), probe+"_emit(",
 			"%s should still be emitted directly", probe)
+	}
+}
+
+// Issue #67, for the producer no unprivileged test can execute.
+//
+// The sampled record and the batched gpu_launch_v1 record for one launch are
+// twins, and the consumer's join is only safe when the sampled one leads:
+// batched-first leaves the launch in deferredLaunches, where the next batch
+// of any other kind releases it stackless, and the stack then parks with
+// nothing to join (sampledstacks.go). Both shims therefore fire the sampled
+// probe BEFORE the batched add().
+//
+// For shim/stub/stub.cc that order is proven rather than asserted -
+// shim/stub/probe_order_test.cc patches the probe sites with int3 and reads
+// the wire order back, and it fails on the pre-#67 producer. The CUPTI
+// adapter cannot be driven without a CUDA process and a GPU, so the same
+// fact is pinned against its source here. A regex over C++ is a weak
+// instrument; it is here because the alternative for this file is nothing at
+// all, and because a reorder is exactly the kind of edit that looks harmless
+// in review.
+func TestBothShimsFireTheSampledProbeBeforeTheBatchedAdd(t *testing.T) {
+	for _, tc := range []struct{ file, add string }{
+		{"../shim/stub/stub.cc", "lb.add(l);"},
+		{"../shim/nvidia/cupti_adapter.cc", "g_lb->add(l);"},
+	} {
+		b, err := os.ReadFile(tc.file)
+		require.NoError(t, err)
+		src := string(b)
+		emit := strings.Index(src, "gpu_launch_sampled_v1_emit(&")
+		batched := strings.Index(src, tc.add)
+		require.Positivef(t, emit, "%s: no unbatched sampled-launch emit found", tc.file)
+		require.Positivef(t, batched, "%s: no %q found", tc.file, tc.add)
+		require.Lessf(t, emit, batched,
+			"%s: the launch is added to its batch before the sampled probe fires. "+
+				"A launch that fills the batch then reaches the consumer ahead of its own "+
+				"stack, is released stackless by the next exec batch, and the stack parks "+
+				"in PendingStacks forever (issue #67)", tc.file)
 	}
 }
 

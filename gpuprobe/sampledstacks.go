@@ -16,46 +16,54 @@ import (
 // launch that arrives on the *batched* probe, and only that launch is
 // emitted.
 //
-// The two halves can arrive in either order, and both happen:
+// The two halves can arrive in either order, and the consumer handles both:
 //
-//   - Sampled first (the common case). The shim's launch batch flushes only
-//     when it fills, so the batched record for launch N usually reaches the
-//     ringbuf long after the unbatched sampled record for the same launch.
-//     The resolved stack waits in pendingStacks until its twin shows up.
-//   - Batched first. When launch N is the record that fills the batch, the
-//     flush happens inside the same add() call that precedes the sampler
-//     check, so the batch - whose last record is launch N - is queued before
-//     N's own sampled record. The launch waits in deferredLaunches, briefly,
-//     for the twin that is already on its way.
+//   - Sampled first. The resolved stack waits in pendingStacks until its
+//     twin shows up. Nothing can take it but the twin, and any number of
+//     unrelated batches may pass in the meantime.
+//   - Batched first. The launch waits in deferredLaunches for a twin that
+//     had better be the very next thing off the ringbuf, because the first
+//     batch of any other kind releases the whole queue (Consumer.applyBatch,
+//     deliberately: the timeline wants launches promptly).
 //
-// The batched-first case has a known, counted, rate-dependent way of losing
-// the join, and it is the cause of the PendingStacks the demo run reports
-// (24 of 250 captures at 2000 launches; none at 500). The producer queues
-// the launch batch, then the EXEC batch, then the sampled probe. So when one
-// launch is both the record that fills the launch batch and the one the
-// sampler picks, the exec batch lands between the twins - and any batch that
-// is not a sampled launch releases the deferred queue (Consumer.applyBatch,
-// deliberately: the timeline needs launches promptly). The launch goes out
-// stackless and its stack, arriving next, parks with nothing to join.
+// Only the first order is safe, and issue #67 is the measurement of that.
+// The shim used to add the launch to its batch and only then fire the
+// sampled probe, so a launch that both FILLED the batch and was sampled put
+// its own batched record on the wire first - with the exec batch of the same
+// loop iteration landing between the twins. The exec batch released the
+// launch stackless and the stack, arriving next, parked with nothing to
+// join: 58 sampled, 57 attached, 1 in PendingStacks on the privileged gate.
 //
-// It looks arithmetically impossible in the stub, which is why it went
-// unexplained: batches hold 32 records and the sampler takes one in 8, so
-// "fills the batch" (i = 0 mod 32) and "is sampled" (i = 1 mod 8) cannot
-// both hold. What breaks that is the producer's periodic drain tick, which
-// flushes a PARTIAL batch every 100ms and so re-phases the batch boundary to
-// wherever the launch loop had got to. About one tick in eight leaves the
-// new boundary sitting on a sampled launch, and until the next tick moves it
-// again every remaining fill - one per 32 launches - loses its stack this
-// way. Hence rate-dependent: more launches, more ticks, more chances to land
-// in phase and more fills to spend there.
+// At the old fixed sampler stride that collision was arithmetically
+// unreachable - batches hold 32 records and the sampler took one in 8, and a
+// multiple of 8 is never 31 mod 32 - which is why the join looked sound for
+// a whole phase. Issue #50's jittered stride draws each gap from [4,12], so
+// a sampled ordinal eventually lands exactly on a batch boundary. #50 did
+// not cause this; it removed the arithmetic that was hiding it.
 //
-// The cost is attribution, never a record: the launch ships, the execution
+// The fix is in the producer, not here: shim/stub/stub.cc and
+// shim/nvidia/cupti_adapter.cc fire the sampled probe BEFORE the batched
+// add(). A record cannot be in a batch before add() puts it there, so no
+// flush - on the launching thread or on the drain thread - can carry the
+// twin past the sampled probe, and sampled-first holds unconditionally.
+// shim/stub/probe_order_test.cc pins that order by patching the probe sites
+// with int3 and reading the wire order back, with no privilege and no
+// consumer; it fails on the pre-#67 producer at every sampled launch that
+// fills a batch.
+//
+// deferredLaunches stays, because this consumer does not only see shims this
+// repository builds: the ABI is public (spec §6), a vendor bridge or an
+// older shim may still emit batched-first, and for those the queue is the
+// difference between "usually joins" and "never joins". What it cannot do is
+// make batched-first lossless - the launch has to go out before the next
+// exec batch, and once it has gone out there is nothing left to attach to
+// without re-emitting an event the sink has already been given. So the cost
+// there is attribution and never a record: the launch ships, the execution
 // ships, the GPU time is measured and projects as unattributed, and the
-// orphaned stack is visible in Stats.PendingStacks. The alternative -
-// holding launches past the next batch - trades a rare attribution gain for
-// a systematic delay in launch delivery that the timeline's join depends on.
-// Reproduced without any privilege by
-// TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins.
+// orphaned stack is counted in Stats.PendingStacks rather than vanishing.
+// That path is held to its documented behaviour by
+// TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins, which is now a
+// statement about foreign producers rather than about ours.
 //
 // Both stores are bounded, and both count what they push out. An unbounded
 // map on either side is a leak driven by a profiled application's launch

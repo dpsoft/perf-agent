@@ -272,8 +272,28 @@ void on_launch(const CUpti_CallbackData *cb) {
     l.context_id = cb->contextUid;
     l.time_ns = now;
     l.tid = current_tid();
-    g_lb->add(l);
 
+    // The sampled probe fires BEFORE the launch reaches its batch (issue
+    // #67), and the record is fully built above so this reorder changes only
+    // when the two probes fire, never what they carry.
+    //
+    // The two records are twins - same correlation, one carrying the launch,
+    // the other only the CPU stack the consumer staples onto it - and the
+    // consumer's two join paths are not equally safe. Sampled first parks the
+    // stack in pendingStacks, where only the twin can claim it. Batched first
+    // holds the launch in deferredLaunches, which the next batch of any other
+    // kind releases stackless, leaving the stack with nothing to join
+    // (gpuprobe/sampledstacks.go).
+    //
+    // With the add() first, a launch that FILLED the batch put its own
+    // batched record on the wire inside that add(), before this probe. In the
+    // stub that collision is same-thread and was measured on the gate; here
+    // it is a thread race - the exec batch is flushed by the CUPTI worker and
+    // the drain timer, not by this callback - so the window between add() and
+    // this probe was small but real, and nothing made it impossible. Firing
+    // here closes it: a record cannot be in a batch before add() puts it
+    // there, so no flush on any thread can carry the twin past this probe.
+    //
     // Unbatched, one record per fire: this probe is the whole reason the
     // consumer can attribute GPU time to a CPU stack.
     if (sample && gpu_launch_sampled_v1_enabled()) {
@@ -288,6 +308,8 @@ void on_launch(const CUpti_CallbackData *cb) {
         s.launch_seq = ordinal;
         gpu_launch_sampled_v1_emit(&s, 1, g_sampled_seq.fetch_add(1, std::memory_order_relaxed));
     }
+
+    g_lb->add(l);
 }
 
 void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId cbid,

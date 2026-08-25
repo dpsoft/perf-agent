@@ -331,6 +331,35 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.StackWalkScratchFailed, "a per-CPU scratch lookup at key 0 cannot fail on a loaded program")
 	assert.Zero(t, stats.StacksEvicted,
 		"the parked-stack side table must never overflow at this launch rate and capacity")
+	// Issue #67, and the assertion that keeps it from regressing silently.
+	// Every sampled record now reaches the ringbuf before the batched twin it
+	// belongs to (shim/stub/stub.cc fires the probe before the batched add(),
+	// pinned unprivileged by shim/stub/probe_order_test.cc), so every parked
+	// stack has a launch still to come and the run is flushed by the time
+	// this reads. A stack left parked at rest is a stack whose twin was
+	// emitted before it and released stackless: attribution lost, silently
+	// except for this gauge. It read 1 of 58 on main at 75ecc513.
+	//
+	// Checked before StacksAttached below because it is the more specific
+	// failure: a shortfall in attached stacks could come from a dozen places,
+	// a non-zero PendingStacks names one.
+	assert.Zero(t, stats.PendingStacks,
+		"a resolved stack is still parked with no launch to join, at rest and after Flush: sampled=%d resolved=%d attached=%d evicted=%d profiler-only=%d uncorrelated=%d",
+		stats.SampledLaunches, stats.StacksResolved, stats.StacksAttached,
+		stats.StacksEvicted, stats.StacksProfilerOnly, stats.StacksUncorrelated)
+	assert.Equal(t, uint64(wantSampled), stats.StacksAttached,
+		"every sampled launch must reach the timeline carrying its own stack; resolved=%d pending=%d evicted=%d profiler-only=%d uncorrelated=%d missing=%d",
+		stats.StacksResolved, stats.PendingStacks, stats.StacksEvicted,
+		stats.StacksProfilerOnly, stats.StacksUncorrelated, stats.StacksMissing)
+	// The whole join, on one line, in the shape the accounting identity above
+	// StacksResolved is written in: resolved = attached + evicted +
+	// profiler-only + pending. Printed whether or not the assertions pass,
+	// because "58 = 57 + 0 + 0 + 1" is what told issue #67 apart from silent
+	// loss in the first place.
+	t.Logf("stack attach: sampled=%d resolved=%d attached=%d evicted=%d profiler-only=%d pending=%d missing=%d uncorrelated=%d",
+		stats.SampledLaunches, stats.StacksResolved, stats.StacksAttached,
+		stats.StacksEvicted, stats.StacksProfilerOnly, stats.PendingStacks,
+		stats.StacksMissing, stats.StacksUncorrelated)
 	assert.Zero(t, stats.StackLookupFailed,
 		"every resolved stack's gpu_stacks entry must be readable back exactly once")
 	assert.Zero(t, stats.StackDeleteFailed, "every gpu_stacks entry read must also be deletable")

@@ -177,17 +177,22 @@ nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
 	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
 		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
 
-# core/probe_args_test.cc is the one test here built with -O2, and that is not
-# a detail: it checks that the record a probe points at has actually been
-# written to memory when the probe fires, which only an optimizer can get
-# wrong. At -O0 it cannot fail, so the flag is part of the test.
+# core/probe_args_test.cc and stub/probe_order_test.cc are the two tests here
+# built with -O2, and that is not a detail. probe_args_test checks that the
+# record a probe points at has actually been written to memory when the probe
+# fires, which only an optimizer can get wrong; at -O0 it cannot fail, so the
+# flag is part of the test. probe_order_test drives the real producer
+# (stub/stub.cc, with PERFAGENT_STUB_NO_MAIN) and reads the wire ORDER of its
+# probe fires by patching their nops with int3 - so it has to be the same
+# optimized build the gate runs, not a debug one that the compiler laid out
+# differently.
 #
 # core/usdt_abi_test.c is built with a C compiler on purpose: usdt_abi.h is the
 # ABI both the C++ shim and any C vendor adapter include, and its
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: core/batch_test.cc core/clock_test.cc core/drain_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc $(CORE_SRC)
+test: core/batch_test.cc core/clock_test.cc core/drain_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/stub.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
@@ -195,6 +200,8 @@ test: core/batch_test.cc core/clock_test.cc core/drain_test.cc core/enroll_test.
 	$(CC) -std=c11 -Wall -Werror -I core -o /tmp/usdt_abi_test core/usdt_abi_test.c && /tmp/usdt_abi_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/sampler_test core/sampler_test.cc core/sampler.cc && /tmp/sampler_test
 	$(CXX) -std=c++17 -O2 -Wall -Werror -I core -o /tmp/probe_args_test core/probe_args_test.cc && /tmp/probe_args_test
+	$(CXX) -std=c++17 -O2 -Wall -Werror -pthread -I core -DPERFAGENT_STUB_NO_MAIN \
+		-o /tmp/probe_order_test stub/probe_order_test.cc stub/stub.cc $(CORE_SRC) && /tmp/probe_order_test
 
 # Not a prerequisite of `test`: a TSan build is ~10x slower and `test` is the
 # fast path. batch_test.cc's concurrent case asserts emitted + dropped == kAdds,

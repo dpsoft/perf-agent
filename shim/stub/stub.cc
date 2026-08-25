@@ -110,17 +110,31 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
         l.context_id = 1;
         l.time_ns = now;
         l.tid = current_tid();
-        lb.add(l);
 
-        gpu_exec_v1 e{};
-        e.correlation = i;
-        e.kernel_id = l.kernel_id;
-        e.queue_id = 1;
-        e.device_id = 0;
-        e.start_ns = now + 10000;          // 10us after the launch
-        e.end_ns = now + 10000 + 50000;    // 50us on device
-        eb.add(e);
-
+        // The sampled probe fires BEFORE the launch reaches its batch, and
+        // that order is the fix for issue #67 rather than a stylistic
+        // preference. The two records are twins - same correlation, one
+        // carrying the launch, the other only the CPU stack the consumer
+        // staples onto it (gpuprobe/sampledstacks.go) - and the consumer's
+        // two join paths are not equally safe. Sampled first parks the stack
+        // in pendingStacks, where only the twin can claim it and any number
+        // of unrelated batches may pass in between. Batched first holds the
+        // launch in deferredLaunches, which the very next batch of any other
+        // kind releases stackless - deliberately, since the timeline wants
+        // launches promptly - leaving the stack to park with nothing to join.
+        //
+        // With the add() first, a launch that both FILLED the batch and was
+        // sampled put the batched record on the wire inside that add(), and
+        // the exec batch below landed between the twins: 58 sampled, 57
+        // attached, 1 parked forever on the privileged gate. Firing here
+        // instead makes sampled-first unconditional, because a record cannot
+        // be in a batch before add() puts it there - so no flush, on this
+        // thread or on the Drainer's, can carry the twin past this probe.
+        //
+        // should_sample() is called on every launch regardless (&& is
+        // short-circuit and the sampler call is the left operand), so the
+        // schedule does not depend on whether a consumer is attached.
+        //
         // Unbatched: the eBPF consumer captures the calling thread's stack
         // the instant this probe fires, so the record must ride alone.
         if (sampler.should_sample() && gpu_launch_sampled_v1_enabled()) {
@@ -135,6 +149,17 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             sl.launch_seq = i - 1;         // ordinal among ALL launches
             gpu_launch_sampled_v1_emit(&sl, 1, sampled_seq++);
         }
+
+        lb.add(l);
+
+        gpu_exec_v1 e{};
+        e.correlation = i;
+        e.kernel_id = l.kernel_id;
+        e.queue_id = 1;
+        e.device_id = 0;
+        e.start_ns = now + 10000;          // 10us after the launch
+        e.end_ns = now + 10000 + 50000;    // 50us on device
+        eb.add(e);
 
         if (period_us) std::this_thread::sleep_for(std::chrono::microseconds(period_us));
     }

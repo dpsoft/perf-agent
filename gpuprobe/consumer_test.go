@@ -1616,11 +1616,11 @@ func TestSampledStackArrivingFirstAttachesToTheBatchedLaunch(t *testing.T) {
 	assert.True(t, sm.wasDeleted(5), "a consumed stackmap entry must be freed")
 }
 
-// The other arrival order, which happens whenever the launch that fills the
-// shim's batch is also the one the sampler picked: the flush is queued
-// inside the add() that precedes the sampler check, so the batched record
-// reaches the ringbuf first. The launch waits for the twin already on its
-// way, then goes out once - with its stack.
+// The other arrival order. No shim in this repository produces it any more -
+// they fire the sampled probe before the batched add(), see issue #67 and
+// sampledstacks.go - but the ABI is public and a foreign or older producer
+// may still emit batched-first, so the consumer must join it. The launch
+// waits for the twin, then goes out once, with its stack.
 func TestBatchedLaunchArrivingFirstWaitsForItsStack(t *testing.T) {
 	sink := &recordingSink{}
 	c, sm, _ := stackConsumer(t, sink, Config{})
@@ -1753,36 +1753,35 @@ func TestHeldLaunchDoesNotTakeAnotherProcessesStack(t *testing.T) {
 		"the pid-4242 launch was released before its own stack arrived: no stack is correct, a borrowed one is not")
 }
 
-// The measured cause of the unattached stacks in cmd/gpu-stub-profile's
-// 2000-launch run (PendingStacks:24 of 250 captured), reproduced here with
-// no privileges and no attach - just the batch order the stub actually
-// produces.
+// What a batched-first producer costs, and the reason no shim here is one.
 //
-// The stub adds to the launch batch, then to the exec batch, then fires the
-// unbatched sampled probe. When one launch is both the record that FILLS
-// the launch batch and the one the sampler picks, all three land on the
-// ringbuf in that order: launch batch, exec batch, sampled record. The
-// launch is held for its twin; the exec batch releases it stackless (which
-// is correct - the timeline needs launches promptly); and the twin then
-// arrives with nowhere to go and parks forever.
+// Three records land in this order: launch batch, exec batch, sampled
+// record. The launch is held for its twin; the exec batch releases it
+// stackless (which is correct - the timeline wants launches promptly); the
+// twin then arrives with nowhere to go and parks forever.
 //
-// With 32-record batches and a period of 8 those two conditions are
-// disjoint by arithmetic - the batch fills at launch i = 0 mod 32 and the
-// sampler picks i = 1 mod 8 - which is why a short run never shows it. What
-// breaks the arithmetic is the stub's Drainer: it flushes both partial
-// batches every 100ms, which RE-PHASES the batch boundary to wherever the
-// loop happened to be. Roughly one tick in eight leaves the new boundary on
-// a sampled launch, and from then until the next tick every one of the
-// remaining fills - one per 32 launches - loses its stack this way. That is
-// the whole rate dependence: a 500-launch run has about one tick and
-// usually shows none, a 2000-launch run has several and showed 24.
+// This WAS the shipped stub. It added to the launch batch, then to the exec
+// batch, then fired the unbatched sampled probe, so a launch that both
+// FILLED the batch and was sampled produced exactly this sequence: 58
+// sampled, 57 attached, 1 parked, on the privileged gate (issue #67). Issue
+// #50's jittered stride is what made a sampled ordinal able to land on a
+// batch boundary at all - at the old fixed stride of 8 the collision was
+// arithmetically impossible against 32-record batches.
 //
-// It costs attribution only. The launch ships, the execution ships, the GPU
-// time is measured and projects as unattributed, and the stack is counted
-// in PendingStacks rather than vanishing. Fixing it would mean holding
-// launches past the next batch, which trades a rare attribution gain for a
-// systematic delay in launch delivery that the timeline's join depends on -
-// a worse trade, so this is documented and counted, not "fixed".
+// The fix is in the producer: both shims now fire the sampled probe BEFORE
+// the batched add(), which makes sampled-first unconditional, and
+// shim/stub/probe_order_test.cc pins that order without any privilege. This
+// test therefore no longer describes our producers. It stays because the
+// ABI is public and a foreign or older producer may still emit in this
+// order, and because what the consumer does then must be a documented,
+// counted outcome rather than a surprise: the launch ships, the execution
+// ships, the GPU time is measured and projects as unattributed, and the
+// stack is counted in PendingStacks rather than vanishing.
+//
+// It is not fixable on this side without giving something up. Holding the
+// launch past the exec batch delays every launch systematically to buy back
+// a rare attribution, and attaching the stack after the fact means
+// re-emitting a launch the sink has already been given.
 func TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins(t *testing.T) {
 	sink := &recordingSink{}
 	c, sm, _ := stackConsumer(t, sink, Config{})
@@ -1816,6 +1815,62 @@ func TestStackParksUnattachedWhenAnotherBatchSplitsTheTwins(t *testing.T) {
 	assert.Empty(t, sink.launches[2].Launch.CPUStack,
 		"launch 7 still ships; it just ships without a call path")
 	assert.Zero(t, st.StacksEvicted, "nothing was pushed out; it is still parked")
+}
+
+// The same batch boundary, in the order the fixed producers actually emit
+// (issue #67): the sampled record for the launch that fills the batch goes
+// out BEFORE the batched add(), so it reaches the ringbuf ahead of the batch
+// that carries its twin.
+//
+// Correlation 7 is the record that fills the launch batch here, and the exec
+// batch of that same producer loop iteration follows immediately - the batch
+// that released the launch stackless in the test above. The stack is parked
+// rather than held, so it is not the deferred queue's to release, and the
+// join survives the exec batch untouched. That is the whole difference the
+// reorder buys, stated in the consumer's own vocabulary rather than the
+// producer's; shim/stub/probe_order_test.cc is what pins the producer to
+// this order.
+func TestStackSurvivesASplittingBatchWhenTheSampledRecordLeads(t *testing.T) {
+	sink := &recordingSink{}
+	c, sm, _ := stackConsumer(t, sink, Config{})
+	sm.put(1, 0x1000)
+
+	// Sampled first: the producer fires this probe before the add() that
+	// flushes the batch below.
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	require.Equal(t, 1, c.Stats().PendingStacks, "the stack waits for its twin")
+
+	// The batch the twin fills, then the exec batch of the same iteration.
+	apply(t, c, launchBatchWith(4242, 5, 6, 7))
+	execs := make([]byte, batchHdrSize+gpuabi.SizeExec)
+	putU32(execs[0:], kindExec)
+	putU32(execs[4:], 1)
+	putU32(execs[16:], 4242)
+	putU64(execs[24:], gpuabi.SizeExec)
+	putU64(execs[batchHdrSize:], 7)
+	apply(t, c, execs)
+	c.Flush()
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.StacksResolved)
+	assert.Equal(t, uint64(1), st.StacksAttached,
+		"the launch that filled the batch must still carry its stack")
+	assert.Zero(t, st.PendingStacks,
+		"nothing may be left parked: the exec batch cannot take a stack, only a held launch")
+	assert.Zero(t, st.StacksEvicted)
+	require.Len(t, sink.launches, 3)
+	// By correlation, not by position: a launch that collects a parked stack
+	// is emitted on the spot while its batch-mates are still held, so
+	// correlation 7 overtakes 5 and 6 here. admitLaunchLocked documents that
+	// reordering and bounds it to one batch.
+	byCorr := map[string][]string{}
+	for _, l := range sink.launches {
+		byCorr[l.Correlation.Value] = frameNames(l.Launch.CPUStack)
+	}
+	assert.Equal(t, []string{"fn_1000"}, byCorr["7"],
+		"correlation 7 is the sampled one and must carry its own stack")
+	assert.Empty(t, byCorr["5"], "an unsampled batch-mate must stay stackless")
+	assert.Empty(t, byCorr["6"], "an unsampled batch-mate must stay stackless")
 }
 
 // A held launch is waiting for a record that would be the next ringbuf

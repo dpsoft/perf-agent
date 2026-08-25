@@ -83,9 +83,9 @@ type DomainInfo struct {
 	Desc string
 	// Fill is a CSS colour.
 	Fill string
-	// Overlay names an SVG pattern painted over the fill, or "" for none.
-	// Patterns encode uncertainty: a hatched frame is one the profile
-	// could not fully account for.
+	// Overlay is a CSS background-image layered over the fill, or "" for
+	// none. It is always a hatch, and a hatch always encodes uncertainty: a
+	// hatched frame is one the profile could not fully account for.
 	Overlay string
 	// Stroke is an explicit outline colour, or "" for the default.
 	Stroke string
@@ -113,20 +113,20 @@ var domainInfo = [numDomains]DomainInfo{
 		Desc: "CUDA/HIP/HSA runtime and driver frames: the CPU path that initiates GPU work. Yellow, Gregg's C++ layer.",
 	},
 	DomainUnsymbolized: {
-		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)", Overlay: "url(#p-gap)",
-		Desc: "Unwound correctly; no symbol table could name it. The depth here is real — the names are missing, usually because a stripped vendor library has no exported symbols. The CPU band's hue, drained: right layer, no name.",
+		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)", Overlay: "var(--hatch-gap)",
+		Desc: "Unwound correctly; no symbol table could name it. The depth is real, the names are missing — usually a stripped vendor library with no exported symbols. The CPU band's hue, drained: right layer, no name.",
 	},
 	DomainProfilerShim: {
 		Key: "shim", Label: "perf-agent", Fill: "var(--fill-shim)", Stroke: "var(--edge-shim)",
-		Desc: "The profiler observing itself: perf-agent's injected callback, not work your program asked for. Cool slate, outside the warm CPU band, because it is not part of your computation.",
+		Desc: "The profiler observing itself: perf-agent's injected callback, not work your program asked for. Cool slate, outside the warm CPU band, because it is not your computation.",
 	},
 	DomainBoundary: {
 		Key: "boundary", Label: "CPU→GPU boundary", Fill: "var(--fill-boundary)", Stroke: "var(--edge-boundary)",
 		Desc: "[gpu:launch] — the launch this execution was joined to. Everything below it ran on the CPU; everything above it ran on the accelerator. Grey, Gregg's boundary marker.",
 	},
 	DomainBoundaryUnattributed: {
-		Key: "boundary-unattributed", Label: "GPU work with no CPU stack", Fill: "var(--fill-boundary-unattributed)", Overlay: "url(#p-gap)", Stroke: "var(--edge-unattributed)",
-		Desc: "[gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones, so no CPU call path exists for it. Its duration is measured; its caller is unknown, and is not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed, because it is a boundary with nothing behind it.",
+		Key: "boundary-unattributed", Label: "GPU work with no CPU stack", Fill: "var(--fill-boundary-unattributed)", Overlay: "var(--hatch-gap)", Stroke: "var(--edge-unattributed)",
+		Desc: "[gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones: its duration is measured, its caller unknown and not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed: a boundary with nothing behind it.",
 	},
 	DomainGPUKernel: {
 		Key: "gpu-kernel", Label: "GPU kernel execution", Fill: "var(--fill-gpu-kernel)",

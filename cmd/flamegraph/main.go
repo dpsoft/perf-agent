@@ -28,7 +28,6 @@ func main() {
 	var (
 		out        = flag.String("o", "", "HTML output path (default: <input>.html)")
 		title      = flag.String("title", "", "page title (default: the input file name)")
-		width      = flag.Int("width", 0, "graph width in pixels (default: 1280)")
 		folded     = flag.Bool("folded", false, "write folded stacks to stdout instead of HTML")
 		sampleIdx  = flag.Int("sample-index", -1, "which sample type to fold; -1 chooses automatically")
 		stackOrder = flag.String("stack-order", "root-first", "how the profile stores Sample.Location: root-first (perf-agent) | leaf-first (pprof proto)")
@@ -65,7 +64,6 @@ func main() {
 	}
 	res, err := flamegraph.FromProfileFile(in, dst, flamegraph.Options{
 		Title: *title,
-		Width: *width,
 	})
 	if err != nil {
 		fatalf("%v", err)

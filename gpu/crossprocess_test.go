@@ -2,6 +2,7 @@ package gpu
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -348,4 +349,244 @@ func TestProjectionEmitsPidInSingleProcessMode(t *testing.T) {
 	for _, s := range samples {
 		assert.Equal(t, "4242", s.Labels["gpu_pid"])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #52: the heuristic join path.
+//
+// #36 process-qualified the EXACT join, and the tests above pin it. The
+// heuristic path was left process-blind: it runs only for an execution that
+// supplied no correlation, and the reasoning at the time was that such an
+// execution has no process to group by. That reasoning was wrong.
+// CorrelationID.Present() tests Value alone, so PID and Value are independent
+// and a record can name its process while carrying no correlation - which is
+// what TestCorrelationCarryingOnlyAProcessIsNotPresent above already
+// constructs. The heuristic therefore groups by process too, and refuses to
+// join an execution that names none.
+//
+// What was at stake is one step worse than #36's: a heuristic match takes the
+// chosen launch's CPUStack AND its Launch.Tags, which carry pod_uid and
+// container_id. A cross-process guess is a cross-CONTAINER billing error.
+// ---------------------------------------------------------------------------
+
+// heurExecIn is execIn for the heuristic path: it names the producing process
+// but carries no vendor correlation value, so Present() is false and the
+// execution takes the heuristic join. Everything else - queue, kernel name,
+// timing - is identical to launchIn's, so only the process can separate them.
+func heurExecIn(pid uint32, startNs, endNs uint64) GPUKernelExec {
+	return GPUKernelExec{
+		Correlation: CorrelationID{Backend: BackendCUPTI, PID: pid},
+		KernelName:  "hot_kernel",
+		StartNs:     startNs,
+		EndNs:       endNs,
+	}
+}
+
+// taggedLaunchIn is launchIn plus the container attribution a real launch
+// carries. These tags are the actual payload of the defect: a mis-joined
+// execution inherits them and bills its GPU time to a container that never
+// ran it.
+func taggedLaunchIn(pid uint32, value string, timeNs uint64, fn, pod string) GPUKernelLaunch {
+	l := launchIn(pid, value, timeNs, fn)
+	l.Launch.Tags = map[string]string{"pod_uid": pod, "container_id": "c-" + pod}
+	return l
+}
+
+// TestHeuristicJoinRefusesAnotherProcessLaunch is issue #52's motivating case.
+// Only pid 4242 ever launched anything; pid 5353's correlation-less execution
+// matches that launch on queue, kernel name and causal timing, which is
+// exactly the "plausible candidate" the old, process-blind grouping would
+// have handed over - along with a_work's call stack and pod-a's pod_uid.
+//
+// Mutation this catches: candidateGroupKey losing its pid field, or Snapshot
+// looking up the process-blind index for a join rather than only for the
+// blocked counter.
+func TestHeuristicJoinRefusesAnotherProcessLaunch(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "7", 10, "a_work", "pod-a")))
+	require.NoError(t, tl.EmitExec(heurExecIn(5353, 20, 30)))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	view := snap.Executions[0]
+	assert.Nil(t, view.Launch,
+		"pid 5353 has no launch of its own; pid 4242's must not stand in for it")
+	assert.False(t, view.Heuristic, "a refused join is not a heuristic join")
+	assert.NotEqual(t, JoinHeuristic, view.Join)
+
+	js := snap.JoinStats
+	assert.Equal(t, uint64(1), js.CorrelationlessExecutionCount,
+		"entering the heuristic path at all must be counted, not just succeeding at it")
+	assert.Equal(t, uint64(1), js.CrossProcessHeuristicBlockedCount,
+		"a candidate did qualify on queue, kernel name and timing - the refusal is the process guard's, and must be visible")
+	assert.Equal(t, uint64(1), js.UnmatchedExecutionCount,
+		"the execution degrades to unattributed; it is not dropped")
+	assert.Zero(t, js.HeuristicExecutionJoinCount)
+	assert.Zero(t, js.ExactExecutionJoinCount)
+
+	// The GPU time survives, and carries none of pid 4242's container.
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, "unmatched", samples[0].Labels["gpu_join"])
+	assert.NotContains(t, samples[0].Labels, "pod_uid",
+		"a refused join must not inherit the other container's attribution")
+	assert.NotContains(t, samples[0].Labels, "container_id")
+	assert.Equal(t, "5353", samples[0].Labels["gpu_pid"],
+		"the execution still knows which process produced it")
+	assert.NotContains(t, frameNames(samples[0].Stack), "a_work",
+		"a refused join must not inherit the other process's call path either")
+}
+
+// TestHeuristicJoinStaysWithinItsOwnProcess is the other half: with both
+// processes launching, each correlation-less execution must find its OWN
+// process's launch. Refusing everything would be a safe but useless guard;
+// this pins that the heuristic still works, process-scoped.
+//
+// The two launches are identical but for pid, stack and tags, and the
+// timestamps are interleaved (10 and 11, execs at 20 and 21) so that the
+// "most recent preceding launch" rule alone would pick pid 5353's for both.
+func TestHeuristicJoinStaysWithinItsOwnProcess(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "7", 10, "a_work", "pod-a")))
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(5353, "7", 11, "b_work", "pod-b")))
+	require.NoError(t, tl.EmitExec(heurExecIn(4242, 20, 30)))
+	require.NoError(t, tl.EmitExec(heurExecIn(5353, 21, 31)))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 2)
+
+	wantStack := map[uint32]string{4242: "a_work", 5353: "b_work"}
+	wantPod := map[uint32]string{4242: "pod-a", 5353: "pod-b"}
+	for _, view := range snap.Executions {
+		pid := view.Exec.Correlation.PID
+		require.NotNilf(t, view.Launch, "pid %d's own launch was available and must have been used", pid)
+		assert.Equalf(t, JoinHeuristic, view.Join, "pid %d: a guess must still be labelled a guess", pid)
+		assert.Truef(t, view.Heuristic, "pid %d", pid)
+		assert.Falsef(t, view.Ambiguous, "pid %d: one candidate per process, so nothing is ambiguous", pid)
+		assert.Equalf(t, pid, view.Launch.Launch.PID, "pid %d joined pid %d's launch", pid, view.Launch.Launch.PID)
+		assert.Equalf(t, []string{wantStack[pid]}, stackNames(view.Launch), "pid %d got the wrong call path", pid)
+		assert.Equalf(t, wantPod[pid], view.Launch.Launch.Tags["pod_uid"], "pid %d got the wrong container", pid)
+	}
+
+	js := snap.JoinStats
+	assert.Equal(t, uint64(2), js.HeuristicExecutionJoinCount)
+	assert.Equal(t, uint64(2), js.CorrelationlessExecutionCount,
+		"both executions entered the heuristic path, whether or not they succeeded")
+	assert.Zero(t, js.CrossProcessHeuristicBlockedCount,
+		"each process had its own candidate, so nothing was refused")
+	assert.Zero(t, js.UnmatchedExecutionCount)
+
+	// Every sample still says it is a guess. #52 must not be closed by
+	// quietly promoting the survivors to something they are not.
+	for _, s := range ProjectExecutions(snap) {
+		assert.Equal(t, "heuristic", s.Labels["gpu_join"],
+			"a process-scoped guess is still a guess")
+	}
+}
+
+// TestHeuristicJoinRefusedWhenExecutionNamesNoProcess is the shape gpuprobe
+// would actually produce if it ever violated spec §6: correlationOf(pid, 0)
+// returns the whole zero CorrelationID, discarding the pid, so the execution
+// names neither a correlation nor a process. There is nothing to group it by
+// and nothing to check a candidate against, so it must be refused - and the
+// refusal counted, because this is precisely the "reachable by accident" case
+// the issue is about.
+func TestHeuristicJoinRefusedWhenExecutionNamesNoProcess(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "7", 10, "a_work", "pod-a")))
+	require.NoError(t, tl.EmitExec(GPUKernelExec{
+		// Exactly gpuprobe's correlationOf(pid, 0) result: no value, no pid.
+		KernelName: "hot_kernel",
+		StartNs:    20, EndNs: 30,
+	}))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	assert.Nil(t, snap.Executions[0].Launch,
+		"an execution that names no process cannot be shown to share one with any launch")
+
+	js := snap.JoinStats
+	assert.Equal(t, uint64(1), js.CorrelationlessExecutionCount)
+	assert.Equal(t, uint64(1), js.CrossProcessHeuristicBlockedCount,
+		"a candidate qualified on everything except a provable process, which is the whole point")
+	assert.Equal(t, uint64(1), js.UnmatchedExecutionCount)
+	assert.Zero(t, js.HeuristicExecutionJoinCount)
+
+	samples := ProjectExecutions(snap)
+	require.Len(t, samples, 1)
+	assert.Equal(t, "unmatched", samples[0].Labels["gpu_join"])
+	assert.NotContains(t, samples[0].Labels, "gpu_pid", "no process is known, so none may be named")
+	assert.NotContains(t, samples[0].Labels, "pod_uid")
+	assert.Equal(t, uint64(10), samples[0].Value,
+		"the measured GPU time is kept: this is degrade-to-unattributed, not drop")
+}
+
+// TestCorrelationlessExecutionIsCountedWithNoCandidateToRefuse separates the
+// two counters. Here the heuristic path is entered but no launch qualified at
+// all, so nothing was refused on process grounds - the blocked counter must
+// stay at zero while the path-entered counter still fires.
+//
+// This is the counter-honesty half of #52: if CrossProcessHeuristicBlockedCount
+// counted every correlation-less miss, it would read high for reasons that
+// have nothing to do with processes, and "N cross-container attributions
+// prevented" would stop meaning that.
+func TestCorrelationlessExecutionIsCountedWithNoCandidateToRefuse(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitExec(heurExecIn(5353, 20, 30)))
+
+	snap := tl.Snapshot()
+	js := snap.JoinStats
+	assert.Equal(t, uint64(1), js.CorrelationlessExecutionCount,
+		"the heuristic path was entered, and entering it is what #52 wants visible")
+	assert.Zero(t, js.CrossProcessHeuristicBlockedCount,
+		"no launch existed at all, so no cross-process join was prevented")
+	assert.Equal(t, uint64(1), js.UnmatchedExecutionCount)
+}
+
+// TestExactJoinsNeverEnterTheHeuristicCounters is the non-regression guard for
+// #36's path, which this change must not touch: an execution that supplies a
+// correlation takes the exact join (or an honest miss) and must not appear in
+// either of #52's counters, whatever the process layout.
+func TestExactJoinsNeverEnterTheHeuristicCounters(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(launchIn(4242, "7", 10, "a_work")))
+	require.NoError(t, tl.EmitLaunch(launchIn(5353, "7", 11, "b_work")))
+	require.NoError(t, tl.EmitExec(execIn(4242, "7", 20, 30)))
+	require.NoError(t, tl.EmitExec(execIn(5353, "7", 21, 31)))
+	// A correlation that exists only in another process: an honest miss.
+	require.NoError(t, tl.EmitExec(execIn(6464, "7", 22, 32)))
+
+	js := tl.Snapshot().JoinStats
+	assert.Equal(t, uint64(2), js.ExactExecutionJoinCount)
+	assert.Equal(t, uint64(1), js.UnmatchedExecutionCount)
+	assert.Zero(t, js.CorrelationlessExecutionCount,
+		"every execution here supplied a correlation, so none entered the heuristic path")
+	assert.Zero(t, js.CrossProcessHeuristicBlockedCount,
+		"the exact path's cross-process miss is not the heuristic guard's doing, and must not be credited to it")
+}
+
+// TestJoinHealthSurfacesTheHeuristicProcessGuard closes the loop #51 opens:
+// a counter nobody prints is a counter nobody reads. Both of #52's counters
+// must reach the operator-facing lines, and the healthy case must stay silent
+// about them.
+func TestJoinHealthSurfacesTheHeuristicProcessGuard(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{})
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "7", 10, "a_work", "pod-a")))
+	require.NoError(t, tl.EmitExec(heurExecIn(5353, 20, 30)))
+
+	lines := JoinHealth(tl.Snapshot())
+	joined := strings.Join(lines, "\n")
+	assert.Contains(t, joined, "arrived with no vendor correlation",
+		"entering the heuristic path is a producer contract violation and must be said out loud")
+	assert.Contains(t, joined, "could not be shown to come from the same process",
+		"the prevented cross-container attribution must be reported, not merely counted")
+	assert.Contains(t, lines[0], "anomalies", "the summary must agree that something is wrong")
+
+	// Healthy run: exact joins only, and neither line appears.
+	clean := NewTimeline(TimelineConfig{})
+	require.NoError(t, clean.EmitLaunch(launchIn(4242, "7", 10, "a_work")))
+	require.NoError(t, clean.EmitExec(execIn(4242, "7", 20, 30)))
+	cleanLines := JoinHealth(clean.Snapshot())
+	require.Len(t, cleanLines, 1, "a healthy snapshot must stay one line: %v", cleanLines)
+	assert.Contains(t, cleanLines[0], "no anomalies")
 }

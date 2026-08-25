@@ -165,8 +165,28 @@ func joinAnomalies(snap Snapshot) []string {
 	}
 	if js.HeuristicExecutionJoinCount > 0 {
 		add("%d of %d executions joined heuristically — matched on queue, kernel name and timing "+
-			"rather than vendor correlation; the CPU stack may be another launch's",
+			"rather than vendor correlation; the CPU stack may be another launch's from the same process",
 			js.HeuristicExecutionJoinCount, execs)
+	}
+	// Issue #52's two witnesses. The first fires whenever the heuristic path
+	// is entered at all, which on every backend shipping today means a
+	// producer broke spec §6's "every launch and execution carries a
+	// correlation" — the heuristic is meant to be dead code, and a dead path
+	// that reports nothing when it wakes up is indistinguishable from one
+	// nobody exercised. The second fires when the process guard actually
+	// stopped a join, i.e. counts the cross-container attributions that would
+	// have happened under the old, process-blind rule.
+	if js.CorrelationlessExecutionCount > 0 {
+		add("%d of %d executions arrived with no vendor correlation — spec §6 requires one on "+
+			"every execution, so a producer is violating its own contract; these can only be "+
+			"guessed at, never joined exactly",
+			js.CorrelationlessExecutionCount, execs)
+	}
+	if js.CrossProcessHeuristicBlockedCount > 0 {
+		add("%s refused because the candidate launch could not be shown to come from the same "+
+			"process — those executions are unattributed rather than billed to another process's "+
+			"call stack and container; have the producer set CorrelationID.PID",
+			plural(js.CrossProcessHeuristicBlockedCount, "heuristic join", "heuristic joins"))
 	}
 	if js.AmbiguousHeuristicMatchCount > 0 {
 		add("%s flagged ambiguous — more than one launch qualified and one was chosen; "+

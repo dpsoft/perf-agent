@@ -627,7 +627,42 @@ func TestZeroWireCorrelationOnExecs(t *testing.T) {
 
 	require.Len(t, sink.execs, 1)
 	assert.Equal(t, gpu.CorrelationID{}, sink.execs[0].Correlation)
-	assert.Equal(t, uint64(1), c.Stats().ZeroCorrelation)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.ZeroCorrelation)
+	assert.Equal(t, uint64(1), st.ZeroCorrelationExecs,
+		"an execution's zero correlation is a spec §6 contract violation, and must be countable "+
+			"apart from the PC samples that make ZeroCorrelation large on a healthy run (issue #52)")
+}
+
+// TestZeroCorrelationExecsCountsOnlyExecutions is the separation itself.
+// ZeroCorrelation is an aggregate over every record kind, and the kinds mean
+// different things when they carry no correlation: for a PC sample in
+// continuous collection it is the documented normal case (spec §6.3 finding
+// 3) and for a launch it is at worst a lost anchor, while for an EXECUTION it
+// is the shim breaking spec §6 outright. The whole value of the narrow
+// counter is that it can be asserted zero while the aggregate cannot, so it
+// must not move for anything but an execution.
+func TestZeroCorrelationExecsCountsOnlyExecutions(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	buf := make([]byte, batchHdrSize+48)
+	putU32(buf[0:], kindLaunch)
+	putU32(buf[4:], 1)
+	putU64(buf[24:], 48)
+	putU64(buf[batchHdrSize+0:], 0) // no correlation
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	c.applyBatch(b)
+	c.Flush()
+
+	require.Len(t, sink.launches, 1)
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.ZeroCorrelation, "the aggregate still sees it")
+	assert.Zero(t, st.ZeroCorrelationExecs,
+		"no execution arrived, so the contract-violation counter must stay clean - "+
+			"otherwise it would move for records whose zero correlation is not a violation at all")
 }
 
 // --- Phase 4a: the batch header carries a stack id -------------------------

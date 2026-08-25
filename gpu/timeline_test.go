@@ -10,6 +10,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// noCorrelation is the correlation a record carries when the vendor supplied
+// nothing to correlate on but the producer still knows which process fired
+// the probe: Value empty (so Present() is false and the record takes the
+// heuristic path) and PID set.
+//
+// It is not an exotic shape - it is what issue #52's fix requires of any
+// backend that wants a heuristic join at all. CorrelationID.Present() tests
+// Value alone, so "no correlation" and "no process" are independent
+// statements, and Timeline refuses to join an execution that makes both:
+// with no process there is nothing stopping the guess from crossing into
+// another container's launch, its CPU stack and its pod_uid/container_id
+// tags. Tests that want the heuristic to run therefore say whose execution
+// it is, exactly as a real correlation-less backend would have to.
+func noCorrelation(pid uint32) CorrelationID {
+	return CorrelationID{Backend: BackendCUPTI, PID: pid}
+}
+
 func execFor(value string, startNs, endNs uint64) GPUKernelExec {
 	return GPUKernelExec{
 		Correlation: CorrelationID{Backend: BackendCUPTI, Value: value},
@@ -402,9 +419,12 @@ func TestTimelineHeuristicJoinsSingleCandidate(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 10},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		// Correlation deliberately left at its zero value - see comment above.
-		KernelName: "k_x",
-		StartNs:    20, EndNs: 30,
+		// No correlation VALUE - see comment above - but the producing
+		// process is named, which issue #52 makes the price of admission to
+		// the heuristic path. It matches the candidate launch's PID.
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -442,10 +462,13 @@ func TestTimelineHeuristicMarksAmbiguousAndPicksMostRecent(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 15},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		// Correlation deliberately left at its zero value - see the
-		// single-candidate test above for why (review Critical 2 gate).
-		KernelName: "k_x",
-		StartNs:    20, EndNs: 30,
+		// No correlation value - see the single-candidate test above for why
+		// (review Critical 2's gate) - and pid 1, matching both candidates,
+		// so issue #52's process guard lets the ambiguity be the only thing
+		// under test.
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -479,8 +502,9 @@ func TestTimelineHeuristicRejectsLaunchAfterExecStart(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 100},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		KernelName: "k_x",
-		StartNs:    20, EndNs: 30,
+		Correlation: noCorrelation(1), // same process as the candidate: only causality may reject it
+		KernelName:  "k_x",
+		StartNs:     20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -488,6 +512,8 @@ func TestTimelineHeuristicRejectsLaunchAfterExecStart(t *testing.T) {
 	assert.Nil(t, snap.Executions[0].Launch,
 		"a launch that starts after the exec cannot have produced it")
 	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+	assert.Zero(t, snap.JoinStats.CrossProcessHeuristicBlockedCount,
+		"the rejection is causal, not a process guard - counting it as one would inflate #52's figure")
 }
 
 // TestTimelineHeuristicRejectsWrongQueueAndKernelName is the fourth
@@ -516,11 +542,14 @@ func TestTimelineHeuristicRejectsWrongQueueAndKernelName(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 10},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		// Queue and Correlation left zero-value: "wrong-queue"'s non-zero
-		// QueueID must not match, and a zero Correlation is required for the
-		// heuristic to run at all (review Critical 2's gate).
-		KernelName: "k_x",
-		StartNs:    20, EndNs: 30,
+		// Queue left zero-value: "wrong-queue"'s non-zero QueueID must not
+		// match. The correlation carries no value (required for the
+		// heuristic to run at all - review Critical 2's gate) but does carry
+		// pid 1, so both decoys are in the exec's own process and only the
+		// queue and kernel-name filters can reject them.
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     20, EndNs: 30,
 	}))
 
 	snap := tl.Snapshot()
@@ -528,6 +557,8 @@ func TestTimelineHeuristicRejectsWrongQueueAndKernelName(t *testing.T) {
 	assert.Nil(t, snap.Executions[0].Launch,
 		"neither the wrong-queue nor the wrong-kernel-name launch should qualify")
 	assert.Equal(t, uint64(1), snap.JoinStats.UnmatchedExecutionCount)
+	assert.Zero(t, snap.JoinStats.CrossProcessHeuristicBlockedCount,
+		"both decoys are in the exec's own process; the process guard must not take credit for filtering them")
 }
 
 // BenchmarkTimelineSnapshotAllMisses is the regression benchmark for review
@@ -556,7 +587,9 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 		// takes the full exact-miss + heuristic-scan path with zero result,
 		// the worst case for the candidate scan.
 		e := execFor("miss-"+strconv.Itoa(i), uint64(3000+i), uint64(3000+i+5))
-		e.Correlation = CorrelationID{}
+		// pid 1 matches launch()'s, so the process guard (issue #52) lets the
+		// candidate scan run; the kernel name is what makes every exec miss.
+		e.Correlation = noCorrelation(1)
 		if err := tl.EmitExec(e); err != nil {
 			b.Fatal(err)
 		}
@@ -592,8 +625,8 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 // in milliseconds either way. This test pins the complexity directly, via a
 // generous wall-clock bound at a scale deliberately too large for a linear
 // scan to hide in: one queue, one kernel name (so every candidate lands in
-// the same group), 50,000 live launches, 10,000 exec misses that all share
-// that one group. That is 5*10^8 candidate comparisons for a linear scan -
+// the same group), 50,000 live launches, 10,000 exact-join misses that all
+// share that one group. That is 5*10^8 candidate comparisons for a linear scan -
 // which this exact setup measured in the tens of seconds against the
 // pre-fix code (see the round-3 report) - versus roughly
 // 10,000 * log2(50,000) ~= 170,000 comparisons for a binary search, which
@@ -603,12 +636,14 @@ func BenchmarkTimelineSnapshotAllMisses(b *testing.B) {
 // to a linear scan over the candidate group (or buildHeuristicCandidateIndex
 // grouping by queue alone again, without kernel name, or without sorting).
 //
-// Each exec's Correlation is explicitly zeroed: review Critical 2 gates the
-// heuristic path on a zero-value Correlation, and execFor always sets a
-// non-zero one. Left as execFor produces it, every exec here would miss the
-// exact lookup and then skip the heuristic entirely (Critical 2's intended
-// behavior for a non-zero, non-matching correlation), making this a
-// near-instant no-op that proves nothing about the binary-search fix.
+// Each exec's Correlation is replaced with noCorrelation(1): review
+// Critical 2 gates the heuristic path on an absent correlation VALUE (execFor
+// always sets one, and left as execFor produces it every exec here would miss
+// the exact lookup and then skip the heuristic entirely), while issue #52
+// gates it on a PRESENT process, matching launch()'s LaunchContext.PID. Get
+// either wrong and this is a near-instant no-op that proves nothing about the
+// binary-search fix - which is why the assertions after the timing bound pin
+// the number of searches that actually ran.
 func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	const candidates = 50_000
 	const misses = 10_000
@@ -622,15 +657,20 @@ func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	for i := 0; i < misses; i++ {
 		e := execFor("ghost-"+strconv.Itoa(i), uint64(i), uint64(i))
 		e.KernelName = "hot_kernel" // same group
-		e.Correlation = CorrelationID{}
+		// No correlation value (so the heuristic runs) but pid 1, matching
+		// launch()'s LaunchContext.PID - without it issue #52's process
+		// guard refuses every join before the search happens and this test
+		// becomes the near-instant no-op it exists to avoid.
+		e.Correlation = noCorrelation(1)
 		require.NoError(t, tl.EmitExec(e))
 	}
 
 	done := make(chan struct{})
 	var elapsed time.Duration
+	var snap Snapshot
 	go func() {
 		start := time.Now()
-		_ = tl.Snapshot()
+		snap = tl.Snapshot()
 		elapsed = time.Since(start)
 		close(done)
 	}()
@@ -643,6 +683,28 @@ func TestTimelineHeuristicScalesWithSingleQueueSingleKernelName(t *testing.T) {
 	case <-time.After(25 * time.Second):
 		t.Fatal("Snapshot did not return within 25s - the heuristic join is scanning its candidate group, not binary-searching it")
 	}
+
+	// A timing assertion must never stand alone: this test's failure mode is
+	// a Snapshot that is fast because it did no work, and every guard added
+	// ahead of the search is a fresh way to arrive there. Issue #52's process
+	// guard is exactly such a guard - refuse every exec before the binary
+	// search and this test finishes FASTER and passes more comfortably than
+	// before, while proving nothing at all. So pin the work as well as the
+	// clock.
+	//
+	// Every exec must join: exec i starts at TimeNs i and launch i was
+	// emitted at TimeNs i, so a qualifying candidate always precedes it
+	// (window unbounded here), and all of them share pid 1 with it.
+	js := snap.JoinStats
+	require.Len(t, snap.Executions, misses)
+	assert.Equal(t, uint64(misses), js.CorrelationlessExecutionCount,
+		"every exec must actually reach the heuristic path - a guard that skips it makes this test a fast no-op")
+	assert.Equal(t, uint64(misses), js.HeuristicExecutionJoinCount,
+		"every exec must actually complete a heuristic join; the elapsed bound above only means something if this many searches ran")
+	assert.Zero(t, js.UnmatchedExecutionCount,
+		"a candidate precedes every exec, so nothing may degrade to unattributed")
+	assert.Zero(t, js.CrossProcessHeuristicBlockedCount,
+		"one process throughout: the process guard must not be what ends these searches")
 }
 
 // TestTimelineSnapshotConsumesExecutions is the regression test for review
@@ -755,11 +817,14 @@ func TestTimelineHeuristicRespectsJoinWindow(t *testing.T) {
 		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "near"},
 		KernelName:  "k_x",
 		TimeNs:      95,
-		Launch:      LaunchContext{PID: 2, TID: 2, TimeNs: 95},
+		// Same pid as "far" and as the exec below, so issue #52's process
+		// guard cannot be what separates the two candidates - the window is.
+		Launch: LaunchContext{PID: 1, TID: 1, TimeNs: 95},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		KernelName: "k_x",
-		StartNs:    100, EndNs: 110,
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     100, EndNs: 110,
 	}))
 
 	snap := tl.Snapshot()
@@ -790,8 +855,9 @@ func TestTimelineHeuristicOutOfWindowDropIsCounted(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 0},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		KernelName: "k_x",
-		StartNs:    100, EndNs: 110, // "far" (TimeNs=0) precedes this but is 100ns away, outside the 10ns window
+		Correlation: noCorrelation(1), // same process as "far": only the window may reject it
+		KernelName:  "k_x",
+		StartNs:     100, EndNs: 110, // "far" (TimeNs=0) precedes this but is 100ns away, outside the 10ns window
 	}))
 
 	snap := tl.Snapshot()
@@ -817,8 +883,9 @@ func TestTimelineHeuristicWindowZeroIsUnbounded(t *testing.T) {
 		Launch:      LaunchContext{PID: 1, TID: 1, TimeNs: 0},
 	}))
 	require.NoError(t, tl.EmitExec(GPUKernelExec{
-		KernelName: "k_x",
-		StartNs:    100, EndNs: 110,
+		Correlation: noCorrelation(1),
+		KernelName:  "k_x",
+		StartNs:     100, EndNs: 110,
 	}))
 
 	snap := tl.Snapshot()

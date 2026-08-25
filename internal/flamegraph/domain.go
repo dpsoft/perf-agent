@@ -11,18 +11,46 @@ import (
 // to. A hashed palette carries no information; these profiles have real
 // structure worth showing — application code, the CPU path that initiates
 // GPU work, an explicit boundary marker, and the accelerator side — so the
-// palette carries that instead. (The idea of colouring a mixed CPU/GPU flame
-// graph by domain is Brendan Gregg's.)
+// palette carries that instead.
 //
-// Two domains have no counterpart in that scheme and exist here because they
-// are honesty features rather than decoration:
+// The colours are Brendan Gregg's AI Flame Graph palette
+// (https://www.brendangregg.com/blog/2024-10-29/ai-flame-graphs.html), whose
+// layers map onto our domains like this:
+//
+//	pink    application code                DomainApplication
+//	red     C: process startup and libc     DomainSystem
+//	yellow  C++: the GPU runtime and driver DomainVendorRuntime
+//	orange  kernel                          DomainKernel
+//	grey    the CPU/accelerator boundary    DomainBoundary, …Unattributed
+//	aqua    accelerator source lines        (reserved — see below)
+//	green   accelerator execution           DomainGPUKernel
+//
+// Aqua is deliberately unused. It is Gregg's colour for the *source* of
+// functions running on the accelerator, which needs GPU PC sampling with a
+// SASS→source mapping; perf-agent does not emit those frames yet. Reserving
+// the hue now means the layer has a home when it arrives, and means nothing
+// on the page can be mistaken for it in the meantime. The token exists in
+// the stylesheet (--fill-accel-source) with no domain pointing at it, and
+// the legend says so.
+//
+// Two domains have no counterpart in Gregg's scheme and exist here because
+// they are honesty features rather than decoration. Neither gets a sixth
+// hue; both are drained almost to grey, which is the palette's way of
+// saying "this frame is not a layer of your computation":
 //
 //   - DomainUnsymbolized. These frames were unwound correctly; no symbol
 //     table could name them. That is a symbolization gap, not a hole in the
 //     stack, and the reader must be able to tell the difference at a glance.
+//     They keep the CPU band's warm hue drained to a pale sand, and keep the
+//     hatch: the layer is known, the name is not. Warm-but-colourless, so it
+//     never reads as one of the named CPU layers and never steals the pure
+//     grey the boundary markers own.
 //   - DomainProfilerShim. perf-agent's own injected callback appears in
 //     perf-agent's own profile. Colouring it as ordinary CPU work would bill
-//     the profiler's overhead to the program being profiled.
+//     the profiler's overhead to the program being profiled. It gets the
+//     opposite drain — a cool slate with a cool outline — so the instrument
+//     sits visibly outside the warm CPU band without claiming a hue of its
+//     own.
 //
 // Classification is INFERRED — from the mapping file when the profile
 // supplies one, otherwise from the symbol name. The legend says so. It is a
@@ -65,44 +93,44 @@ type DomainInfo struct {
 
 var domainInfo = [numDomains]DomainInfo{
 	DomainRoot: {
-		Key: "root", Label: "all", Fill: "hsl(30 8% 78%)",
+		Key: "root", Label: "all", Fill: "var(--fill-root)",
 		Desc: "Synthetic root. Its width is the whole profile.",
 	},
 	DomainApplication: {
-		Key: "app", Label: "application", Fill: "hsl(336 62% 74%)",
-		Desc: "Your program's own code, and compiler-generated glue in its binary.",
+		Key: "app", Label: "application", Fill: "var(--fill-app)",
+		Desc: "Your program's own code, and compiler-generated glue in its binary. Pink, Gregg's application layer.",
 	},
 	DomainSystem: {
-		Key: "system", Label: "process startup and libc", Fill: "hsl(4 62% 67%)",
-		Desc: "The C runtime, dynamic loader and thread entry that get to main.",
+		Key: "system", Label: "CPU: process startup and libc", Fill: "var(--fill-system)",
+		Desc: "The C runtime, dynamic loader and thread entry that get to main. Red, Gregg's C layer.",
 	},
 	DomainKernel: {
-		Key: "kernel", Label: "kernel", Fill: "hsl(48 82% 62%)",
-		Desc: "Kernel-mode frames, identified by the profile's [kernel] mapping.",
+		Key: "kernel", Label: "CPU: kernel", Fill: "var(--fill-kernel)",
+		Desc: "Kernel-mode frames, identified by the profile's [kernel] mapping. Orange, Gregg's kernel layer.",
 	},
 	DomainVendorRuntime: {
-		Key: "vendor", Label: "GPU runtime, CPU side", Fill: "hsl(26 88% 64%)",
-		Desc: "CUDA/HIP/HSA runtime and driver frames: the CPU path that initiates GPU work.",
+		Key: "vendor", Label: "CPU: GPU runtime and driver", Fill: "var(--fill-vendor)",
+		Desc: "CUDA/HIP/HSA runtime and driver frames: the CPU path that initiates GPU work. Yellow, Gregg's C++ layer.",
 	},
 	DomainUnsymbolized: {
-		Key: "unsym", Label: "unsymbolized", Fill: "hsl(214 10% 68%)", Overlay: "url(#p-gap)",
-		Desc: "Unwound correctly; no symbol table could name it. The depth here is real — the names are missing, usually because a stripped vendor library has no exported symbols.",
+		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)", Overlay: "url(#p-gap)",
+		Desc: "Unwound correctly; no symbol table could name it. The depth here is real — the names are missing, usually because a stripped vendor library has no exported symbols. The CPU band's hue, drained: right layer, no name.",
 	},
 	DomainProfilerShim: {
-		Key: "shim", Label: "perf-agent's own shim", Fill: "hsl(272 32% 70%)",
-		Desc: "The profiler observing itself: perf-agent's injected callback, not work your program asked for.",
+		Key: "shim", Label: "perf-agent", Fill: "var(--fill-shim)", Stroke: "var(--edge-shim)",
+		Desc: "The profiler observing itself: perf-agent's injected callback, not work your program asked for. Cool slate, outside the warm CPU band, because it is not part of your computation.",
 	},
 	DomainBoundary: {
-		Key: "boundary", Label: "CPU→GPU boundary", Fill: "hsl(0 0% 82%)", Stroke: "hsl(0 0% 42%)",
-		Desc: "[gpu:launch] — the launch this execution was joined to. Everything below it ran on the CPU; everything above it ran on the accelerator.",
+		Key: "boundary", Label: "CPU→GPU boundary", Fill: "var(--fill-boundary)", Stroke: "var(--edge-boundary)",
+		Desc: "[gpu:launch] — the launch this execution was joined to. Everything below it ran on the CPU; everything above it ran on the accelerator. Grey, Gregg's boundary marker.",
 	},
 	DomainBoundaryUnattributed: {
-		Key: "boundary-unattributed", Label: "GPU work with no CPU stack", Fill: "hsl(0 0% 88%)", Overlay: "url(#p-gap)", Stroke: "hsl(0 0% 55%)",
-		Desc: "[gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones, so no CPU call path exists for it. Its duration is measured; its caller is unknown, and is not borrowed from a sampled sibling.",
+		Key: "boundary-unattributed", Label: "GPU work with no CPU stack", Fill: "var(--fill-boundary-unattributed)", Overlay: "url(#p-gap)", Stroke: "var(--edge-unattributed)",
+		Desc: "[gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones, so no CPU call path exists for it. Its duration is measured; its caller is unknown, and is not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed, because it is a boundary with nothing behind it.",
 	},
 	DomainGPUKernel: {
-		Key: "gpu-kernel", Label: "GPU kernel execution", Fill: "hsl(142 44% 55%)",
-		Desc: "The kernel that ran on the accelerator, and how long it ran for.",
+		Key: "gpu-kernel", Label: "GPU kernel execution", Fill: "var(--fill-gpu-kernel)",
+		Desc: "The kernel that ran on the accelerator, and how long it ran for. Green, Gregg's accelerator-execution layer.",
 	},
 }
 

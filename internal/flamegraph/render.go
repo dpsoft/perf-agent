@@ -94,6 +94,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	ew.esc(opts.Title)
 	ew.s("</title>\n<style>\n")
 	ew.s(styleSheet)
+	ew.s(paletteCSS)
 	ew.s("</style>\n</head>\n<body>\n<main>\n")
 
 	writeHeader(ew, res, opts, degenerate)
@@ -104,7 +105,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	} else {
 		writeToolbar(ew)
 		ew.s("<div class=\"chart\">\n")
-		if err := writeSVG(ew, root, maxDepth, res, opts); err != nil {
+		if err := writeSVG(ew, root, maxDepth, res, opts, false); err != nil {
 			return err
 		}
 		ew.s("</div>\n")
@@ -124,10 +125,12 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	return ew.err
 }
 
-// RenderSVG writes just the graph, for embedding. It carries none of the
-// interactivity, none of the legend and none of the warning text, so it is
-// not a substitute for RenderHTML when the profile is degenerate: it returns
-// an error rather than emitting a blank canvas.
+// RenderSVG writes just the graph, for embedding. It carries its own copy of
+// the palette — a graph pulled out of the page must still be the right
+// colours, and must still follow the reader's light or dark theme — but none
+// of the interactivity, none of the legend and none of the warning text. It
+// is therefore not a substitute for RenderHTML when the profile is
+// degenerate: it returns an error rather than emitting a blank canvas.
 func RenderSVG(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	opts = opts.withDefaults()
 	if res == nil {
@@ -139,7 +142,7 @@ func RenderSVG(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	}
 	root, maxDepth := buildTree(res)
 	ew := &errWriter{w: w}
-	if err := writeSVG(ew, root, maxDepth, res, opts); err != nil {
+	if err := writeSVG(ew, root, maxDepth, res, opts, true); err != nil {
 		return err
 	}
 	return ew.err
@@ -234,7 +237,11 @@ func layout(n *node, x float64, scale float64) {
 	}
 }
 
-func writeSVG(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Result, opts Options) error {
+// writeSVG draws the graph. standalone asks it to carry the palette inside
+// the <svg>, which RenderSVG needs and RenderHTML must not have: the page
+// already emitted paletteCSS in its <style>, and a second copy would be dead
+// weight in every file perf-agent writes.
+func writeSVG(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Result, opts Options, standalone bool) error {
 	if root.value <= 0 {
 		return fmt.Errorf("flamegraph: tree total is %d", root.value)
 	}
@@ -246,6 +253,11 @@ func writeSVG(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Result,
 	ew.f(`<svg class="flame" width="%d" height="%d" viewBox="0 0 %d %d" `, opts.Width, height, opts.Width, height)
 	ew.f(`xmlns="http://www.w3.org/2000/svg" data-total="%d" data-inexact="%d" data-unit="%s" data-side-pad="%d" data-plot-width="%.2f" data-min-text="%d" data-text-pad="%d" data-char-width="%.2f">`+"\n",
 		root.value, root.inexact, html.EscapeString(res.Unit), sidePad, plotWidth, minTextWidth, textPad, charWidth)
+	if standalone {
+		ew.s("<style>\n")
+		ew.s(paletteCSS)
+		ew.s("</style>\n")
+	}
 	ew.s(svgDefs)
 	writeNode(ew, root, maxDepth, res, "")
 	ew.s("</svg>\n")
@@ -258,13 +270,12 @@ func writeNode(ew *errWriter, n *node, maxDepth int, res *foldedstacks.Result, p
 	if parentPath != "" {
 		path = parentPath + " › " + n.name
 	}
-	info := n.domain.Info()
-
 	cls := "frame"
 	if n.inexact > 0 {
 		cls += " inexact"
 	}
 
+	info := n.domain.Info()
 	ew.f(`<g class="%s" data-name="%s" data-path="%s" data-domain="%s" data-domain-label="%s" data-value="%d" data-inexact="%d" data-orig-x="%.3f" data-orig-width="%.3f" data-depth="%d">`,
 		cls, html.EscapeString(n.name), html.EscapeString(path),
 		html.EscapeString(info.Key), html.EscapeString(info.Label),
@@ -273,12 +284,12 @@ func writeNode(ew *errWriter, n *node, maxDepth int, res *foldedstacks.Result, p
 	ew.esc(tooltip(n, res))
 	ew.s("</title>")
 
-	stroke := ""
-	if info.Stroke != "" {
-		stroke = fmt.Sprintf(` stroke="%s" stroke-width="0.8"`, info.Stroke)
-	}
-	ew.f(`<rect class="bg" x="%.3f" y="%.1f" width="%.3f" height="%d" rx="2" fill="%s"%s/>`,
-		n.x, y, n.width, frameHeight-1, info.Fill, stroke)
+	// No fill or stroke attribute: data-domain above selects both, from
+	// paletteCSS. A presentation attribute loses to any rule in the
+	// stylesheet, so a fill written here would have been overridden anyway
+	// — and a stroke written here silently was.
+	ew.f(`<rect class="bg" x="%.3f" y="%.1f" width="%.3f" height="%d" rx="2"/>`,
+		n.x, y, n.width, frameHeight-1)
 	if info.Overlay != "" {
 		ew.f(`<rect class="ov" x="%.3f" y="%.1f" width="%.3f" height="%d" rx="2" fill="%s"/>`,
 			n.x, y, n.width, frameHeight-1, info.Overlay)
@@ -503,6 +514,10 @@ func writeLegend(ew *errWriter, root *node) {
 	if present[DomainGPUKernel] {
 		ew.s("<p class=\"muted depth-note\">A <code>[gpu:kernel:…]</code> frame is one kernel and its duration.</p>\n")
 	}
+	// Say out loud that one colour of the palette is missing on purpose.
+	// Otherwise its absence looks like an oversight, and its arrival later
+	// looks like a new colour rather than a layer that finally has data.
+	ew.s("<p class=\"muted legend-note\">The colours are Brendan Gregg&rsquo;s AI Flame Graph palette. One of them, <span class=\"sw\" style=\"background-color:var(--fill-accel-source)\"></span><b>aqua</b>, is reserved and unused: it belongs to source lines of functions running on the accelerator, which needs per-instruction GPU sampling resolved back to source. perf-agent does not produce that yet, so no frame on this page is aqua.</p>\n")
 	ew.s("</section>\n")
 }
 

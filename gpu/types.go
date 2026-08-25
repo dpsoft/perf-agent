@@ -337,14 +337,26 @@ type GPUModule struct {
 // When a correlation IS supplied, it carries the producing process with it
 // (see CorrelationID), so a sample can only ever be handed to an execution
 // from the same process.
+// FunctionIndex is the sampled instruction's device function within Module —
+// CUPTI's per-module functionIndex, carried on gpu_pc_sample_batch_v1 since
+// the ABI froze and populated by the consumer straight off the wire. It is
+// meaningless without Module, exactly as PCOffset is: the pair
+// (Module.CRC, FunctionIndex) is what names a device function, and
+// (Module.CRC, FunctionIndex, PCOffset) is what names an instruction.
+//
+// It is load-bearing for continuous-mode collection specifically. With no
+// correlation, {PID, Module.CRC, FunctionIndex} is the only key a sample can
+// be grouped under, and without this field every sample a process produces
+// keys identically — see Timeline.pendingModule.
 type GPUPCSample struct {
-	Correlation CorrelationID `json:"correlation"`
-	Module      ModuleRef     `json:"module"`
-	ClockDomain ClockDomain   `json:"clock_domain,omitempty"`
-	TimeNs      uint64        `json:"time_ns"`
-	PCOffset    uint64        `json:"pc_offset"`
-	StallReason string        `json:"stall_reason,omitempty"`
-	Count       uint64        `json:"count"`
+	Correlation   CorrelationID `json:"correlation"`
+	Module        ModuleRef     `json:"module"`
+	FunctionIndex uint32        `json:"function_index,omitempty"`
+	ClockDomain   ClockDomain   `json:"clock_domain,omitempty"`
+	TimeNs        uint64        `json:"time_ns"`
+	PCOffset      uint64        `json:"pc_offset"`
+	StallReason   string        `json:"stall_reason,omitempty"`
+	Count         uint64        `json:"count"`
 }
 
 // TimelineEventKind classifies a GPUTimelineEvent.

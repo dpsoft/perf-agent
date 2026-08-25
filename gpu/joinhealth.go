@@ -109,6 +109,18 @@ func joinSummary(snap Snapshot, anomalies int) string {
 			snap.AttributedPCSamples, snap.PendingSamples)
 	}
 
+	// Its own clause rather than folded into the one above, for the same
+	// reason it has its own counter: these samples carried no correlation, so
+	// they are pending on a different index under different bounds, and a
+	// reader who sees one number cannot tell which. Continuous-mode
+	// collection is optional and off by default, so the clause is absent
+	// entirely when nothing produced such samples.
+	if snap.PendingModuleSamples > 0 {
+		fmt.Fprintf(&b, "; %d correlation-less pc samples pending over %d %s",
+			snap.PendingModuleSamples, snap.PendingModuleGroups,
+			plural(uint64(snap.PendingModuleGroups), "kernel group", "kernel groups"))
+	}
+
 	switch anomalies {
 	case 0:
 		b.WriteString("; no anomalies")
@@ -222,6 +234,12 @@ func joinAnomalies(snap Snapshot) []string {
 		add("%s evicted while waiting for their execution — never attributed, so the "+
 			"stall detail on those kernels is under-reported",
 			plural(dr.EvictedPendingSamples, "PC sample", "PC samples"))
+	}
+	if dr.EvictedPendingModuleSamples > 0 {
+		add("%s evicted while waiting for their kernel — these carried no correlation, so "+
+			"they were grouped by module and function; the group index is too small, its "+
+			"horizon too short, or their executions never arrived at all",
+			plural(dr.EvictedPendingModuleSamples, "correlation-less PC sample", "correlation-less PC samples"))
 	}
 	if dr.EvictedExecutions > 0 {
 		add("%s evicted from the timeline ring before this snapshot — that GPU time is "+

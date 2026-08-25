@@ -390,8 +390,17 @@ func assertPCSampleLossesAccounted(t *testing.T, snap Snapshot, sinkStats SinkSt
 	accepted := sinkStats.PCSamples.Accepted
 	require.Equal(t, pcAttempts, accepted+rejected,
 		"every attempted PC sample must have been either accepted by the sink or rejected and counted")
-	assert.Equal(t, accepted, snap.AttributedPCSamples+uint64(snap.PendingSamples)+snap.Dropped.EvictedPendingSamples,
-		"every PC sample the sink accepted must be attributed, still pending, or evicted from the pending store - never unaccounted for")
+	// There are two pending stores, not one: a sample carrying no correlation
+	// value goes to the module-keyed index instead (Timeline.pendingModule),
+	// with its own bound and its own eviction counter. Both stores' terms
+	// belong in the identity - counting only the correlation-keyed one would
+	// make every continuous-mode sample read as unaccounted-for the moment
+	// such a scenario exists.
+	assert.Equal(t, accepted,
+		snap.AttributedPCSamples+
+			uint64(snap.PendingSamples)+snap.Dropped.EvictedPendingSamples+
+			uint64(snap.PendingModuleSamples)+snap.Dropped.EvictedPendingModuleSamples,
+		"every PC sample the sink accepted must be attributed, still pending in one of the two pending stores, or evicted from one of them - never unaccounted for")
 }
 
 // TestConformance runs the producer-scenario table against every invariant.

@@ -45,6 +45,24 @@ type TimelineDropStats struct {
 	EvictedEvents         uint64 `json:"evicted_events,omitempty"`
 	EvictedModules        uint64 `json:"evicted_modules,omitempty"`
 	EvictedPendingSamples uint64 `json:"evicted_pending_samples,omitempty"`
+
+	// EvictedPendingModuleSamples is EvictedPendingSamples' counterpart for
+	// the correlation-less (continuous-mode) pending store — see
+	// Timeline.pendingModule. Kept deliberately SEPARATE rather than summed
+	// into EvictedPendingSamples: the two stores are keyed differently, are
+	// bounded by different things, and fail for different reasons, so one
+	// counter for both would make the two diagnoses indistinguishable at
+	// exactly the moment they matter. A non-zero EvictedPendingSamples says
+	// executions are not arriving for the correlations their samples carry;
+	// a non-zero EvictedPendingModuleSamples says the module index is too
+	// small for the workload's distinct device functions, its horizon is
+	// shorter than the gap between a sample and its execution, or one
+	// device function's samples outran MaxPendingSamplesPerCorrelation
+	// because its execution never came. All three of the latter are Tier B
+	// eviction storms and none of them is a Tier A problem.
+	//
+	// Zero on a healthy run of either tier.
+	EvictedPendingModuleSamples uint64 `json:"evicted_pending_module_samples,omitempty"`
 }
 
 // Snapshot is a point-in-time, fully-joined view of everything Timeline
@@ -90,6 +108,25 @@ type Snapshot struct {
 	// evicted.
 	PendingSamples      int `json:"pending_samples,omitempty"`
 	PendingCorrelations int `json:"pending_correlations,omitempty"`
+
+	// PendingModuleSamples and PendingModuleGroups are the same pair of
+	// gauges for the correlation-less pending store (Timeline.pendingModule):
+	// PendingModuleGroups counts distinct {backend, pid, cubin CRC, function
+	// index} groups held, PendingModuleSamples the individual GPUPCSample
+	// entries across them. Together with Dropped.EvictedPendingModuleSamples
+	// they close the reconciliation identity for continuous-mode samples the
+	// same way the correlation-keyed trio does for correlation-bearing ones:
+	// every PC sample the sink accepted is attributed, still pending in one
+	// of the two stores, or evicted from one of them.
+	//
+	// Nothing joins out of this store yet — that is the Snapshot join, and it
+	// is deliberately NOT part of this change. Until it lands, a continuous-
+	// mode run shows these two gauges rising and AttributedPCSamples flat,
+	// which is the honest reading of "collected, correctly grouped, not yet
+	// attributed" rather than the previous "collapsed onto one key and
+	// silently evicted".
+	PendingModuleSamples int `json:"pending_module_samples,omitempty"`
+	PendingModuleGroups  int `json:"pending_module_groups,omitempty"`
 }
 
 // TimelineConfig configures Timeline's storage bounds.
@@ -145,8 +182,27 @@ type TimelineConfig struct {
 	// fall before that correlation is evicted as an orphan, in addition to
 	// the cardinality bound (pendingCap). Mirrors LaunchCacheConfig.HorizonNs.
 	// Zero disables horizon-based pending eviction, leaving only the
-	// cardinality bound.
+	// cardinality bound. It applies to BOTH pending stores: the
+	// correlation-keyed one and the module-keyed one (Timeline.pendingModule)
+	// share this horizon, because they hold the same kind of thing (a PC
+	// sample waiting for its execution) for the same reason and over the same
+	// producer drain interval. What they do not share is the counter the
+	// eviction lands on.
 	PendingSampleHorizonNs uint64
+
+	// MaxPendingModuleGroups bounds how many distinct {backend, pid, cubin
+	// CRC, function index} groups the correlation-less pending store may hold
+	// before the oldest are evicted into
+	// Dropped.EvictedPendingModuleSamples. It is deliberately NOT
+	// LaunchCache.Capacity, which every other store here reuses: that
+	// capacity tracks launch volume, and launch volume is a function of run
+	// length, whereas this store's cardinality is a function of the profiled
+	// *binary* — one group per device function per process, tens to low
+	// hundreds for a real workload. Sizing it off launch volume would reserve
+	// a 65,536-entry map for a workload that will only ever fill fifty of it.
+	//
+	// Zero means defaultMaxPendingModuleGroups.
+	MaxPendingModuleGroups int
 }
 
 // Timeline is the indexed join point: it ingests launches, executions, PC
@@ -249,6 +305,59 @@ type Timeline struct {
 	// O(pendingCap) cost to every snapshot even when nothing changed.
 	pendingSampleTotal uint64
 
+	// pendingModule is the second pending index: the one a PC sample that
+	// carries NO correlation value lands in. CUPTI populates a PC record's
+	// correlationId only in KERNEL_SERIALIZED collection; in CONTINUOUS mode
+	// — the only mode that is a candidate for always-on, because it does not
+	// serialize kernels — it is zero on every record.
+	//
+	// Why a second index at all, rather than letting those samples share
+	// pending above. pending keys on the whole CorrelationID, and a
+	// correlation-less sample still arrives with Backend and PID filled in
+	// (they are context the producer knows regardless — see
+	// CorrelationID.Present), so EVERY such sample from one process hashes to
+	// the single key {backend, pid, ""}. Two things then go wrong at once and
+	// neither is visible as what it is: pendingSampleCap bounds an entire
+	// process's PC samples to that one entry and evicts the rest, and
+	// Snapshot's t.pending[exec.Correlation] lookup matches none of them
+	// anyway, because no execution ever carries an empty correlation value.
+	// The observable symptom is "PC sampling produces almost nothing" with an
+	// eviction counter as the only clue — spec §6.1's pathology for
+	// correlation-less launches, reached here through a different door.
+	//
+	// The key is {Backend, PID, CubinCRC, FunctionIndex}: the coarsest
+	// identity a continuous-mode sample actually carries, and the one the
+	// module store can resolve back to a device function. The PID is IN the
+	// key rather than in a check performed somewhere else, which is issue
+	// #52's discipline: two processes running the identical binary produce
+	// the identical cubin CRC and the identical function index, so the only
+	// thing separating their samples is the PID, and a structural refusal
+	// cannot be forgotten by a later edit the way a guard can. Backend is
+	// present for the same reason CorrelationID carries it — nothing today
+	// emits PC samples from two backends into one Timeline, and this costs
+	// nothing to make impossible.
+	//
+	// pendingModule holds pendingSamples values, identical in shape and
+	// contract to pending's: the seq/generation pairing with an orderedFIFO
+	// (see the pending field's doc comment for the deleted-then-reused hazard
+	// it exists to solve, which applies here unchanged) and anchorNs as the
+	// O(1) horizon anchor. Reusing orderedFIFO rather than writing a third
+	// eviction walk is deliberate — LaunchCache and pending each grew a
+	// hand-written copy of it and each hit the same liveness bug separately.
+	// (ModuleStore deliberately does not reuse it, but for a reason specific
+	// to LRU touching: an LRU has to move an entry to the front on every
+	// *read*, which orderedFIFO has no notion of. This store is pure FIFO by
+	// arrival like pending, so that reason does not apply.)
+	//
+	// Nothing joins out of this store yet. Getting samples into a correctly
+	// keyed index and getting them attached to an execution are separate
+	// changes on purpose; the second one is where the module store, the
+	// kernel-name match and the attribution-quality label live.
+	pendingModule            map[pendingModuleKey]pendingSamples
+	pendingModuleOrder       *orderedFIFO[pendingModuleKey]
+	pendingModuleCap         int
+	pendingModuleSampleTotal uint64
+
 	events  *ring[GPUTimelineEvent]
 	modules *ring[GPUModule]
 
@@ -278,6 +387,53 @@ type pendingSamples struct {
 // unbounded append.
 const defaultMaxPendingSamplesPerCorrelation = 4096
 
+// pendingModuleKey is Timeline.pendingModule's key: the identity a PC sample
+// with no correlation value still carries. Every field is comparable and
+// sized, so this is a plain map key with no allocation and no hashing helper.
+//
+// The PID is a field of the key, not a filter applied to it. See the
+// pendingModule doc comment.
+type pendingModuleKey struct {
+	Backend       GPUBackendID
+	PID           uint32
+	CubinCRC      uint64
+	FunctionIndex uint32
+}
+
+// pendingModuleKeyFor derives the key from the sample. It reads the PID off
+// the Correlation (which carries it even when Value is empty) and the CRC and
+// backend off the Module, so a producer that fills in neither still keys
+// consistently — into a single group per process, which is the honest answer
+// when a sample genuinely carries no module identity, rather than a fabricated
+// distinction.
+func pendingModuleKeyFor(p GPUPCSample) pendingModuleKey {
+	backend := p.Module.Backend
+	if backend == "" {
+		backend = p.Correlation.Backend
+	}
+	return pendingModuleKey{
+		Backend:       backend,
+		PID:           p.Correlation.PID,
+		CubinCRC:      p.Module.CRC,
+		FunctionIndex: p.FunctionIndex,
+	}
+}
+
+// defaultMaxPendingModuleGroups bounds Timeline.pendingModule's cardinality
+// when TimelineConfig doesn't set MaxPendingModuleGroups. One group is one
+// device function in one process; a real workload has tens to low hundreds,
+// and even a template- or JIT-heavy one that loads thousands of cubins is
+// covered here with room to spare. It is not sized off launch volume — see
+// TimelineConfig.MaxPendingModuleGroups for why that would be the wrong
+// dial.
+//
+// Worst case with the defaults, and it is worth stating plainly: 4,096 groups
+// x 4,096 samples per group of GPUPCSample. That ceiling is only reachable by
+// a producer emitting thousands of distinct device functions whose executions
+// never arrive at all, which is itself the condition
+// EvictedPendingModuleSamples exists to report.
+const defaultMaxPendingModuleGroups = 4096
+
 // NewTimeline constructs a Timeline. cfg.LaunchCache is passed through to
 // NewLaunchCache unmodified (including its own zero-value defaulting); the
 // cache's own normalized capacity is reused for the exec/module rings and
@@ -299,6 +455,11 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		sampleCap = defaultMaxPendingSamplesPerCorrelation
 	}
 
+	moduleGroupCap := cfg.MaxPendingModuleGroups
+	if moduleGroupCap <= 0 {
+		moduleGroupCap = defaultMaxPendingModuleGroups
+	}
+
 	return &Timeline{
 		cache:            cache,
 		joinWindowNs:     cfg.LaunchEventJoinWindowNs,
@@ -310,6 +471,13 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 		pendingCap:       capacity,
 		pendingSampleCap: sampleCap,
 		pendingHorizonNs: cfg.PendingSampleHorizonNs,
+
+		pendingModule: make(map[pendingModuleKey]pendingSamples),
+		// No capacity hint, matching pending's orderedFIFO: the store is
+		// bounded by cardinality but a workload that never uses continuous-
+		// mode sampling should not pay for a preallocated slice.
+		pendingModuleOrder: newOrderedFIFO[pendingModuleKey](0),
+		pendingModuleCap:   moduleGroupCap,
 	}
 }
 
@@ -318,6 +486,15 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 // with exactly seq. The caller must hold t.mu.
 func (t *Timeline) isPendingLiveLocked(id CorrelationID, seq uint64) bool {
 	cur, ok := t.pending[id]
+	return ok && cur.seq == seq
+}
+
+// isPendingModuleLiveLocked is isPendingLiveLocked for pendingModuleOrder. The
+// hazard it answers is identical and is described on the pending field; the
+// stores are separate only so their bounds and their loss counters are.
+// The caller must hold t.mu.
+func (t *Timeline) isPendingModuleLiveLocked(k pendingModuleKey, seq uint64) bool {
+	cur, ok := t.pendingModule[k]
 	return ok && cur.seq == seq
 }
 
@@ -343,6 +520,18 @@ func (t *Timeline) EmitPCSample(p GPUPCSample) error {
 	defer t.mu.Unlock()
 
 	t.observePendingTimestampLocked(p.TimeNs)
+
+	// Correlation.Present() — the presence of a vendor correlation VALUE, not
+	// of a non-zero CorrelationID — is the whole of the routing decision, and
+	// it is the same gate Snapshot already uses to route a correlation-less
+	// execution to the heuristic join. A sample that carries a value keeps
+	// taking the exact-correlation path below, unchanged; one that does not
+	// would otherwise collapse onto {backend, pid, ""} there. See the
+	// pendingModule field's doc comment.
+	if !p.Correlation.Present() {
+		t.emitPendingModuleLocked(p)
+		return nil
+	}
 
 	entry, exists := t.pending[p.Correlation]
 	if !exists {
@@ -434,6 +623,83 @@ func (t *Timeline) evictPendingLocked() {
 		delete(t.pending, id)
 		t.pendingSampleTotal -= uint64(len(cur.samples))
 		t.dropped.EvictedPendingSamples += uint64(len(cur.samples))
+	}
+}
+
+// emitPendingModuleLocked is EmitPCSample's body for a sample with no
+// correlation value: the same three bounds as the correlation-keyed path
+// (per-group sample cap, horizon, cardinality), the same generation
+// discipline, and its own counter. Deliberately a near-mirror rather than a
+// shared generic: the two stores' keys, bounds and loss counters all differ,
+// and the only piece worth sharing — the order/liveness walk, which is where
+// both of the earlier hand-written copies had a real bug — already is, via
+// orderedFIFO. Caller holds t.mu.
+func (t *Timeline) emitPendingModuleLocked(p GPUPCSample) {
+	key := pendingModuleKeyFor(p)
+
+	entry, exists := t.pendingModule[key]
+	if !exists {
+		// Absent-to-present transition only, exactly as pending does it: a
+		// group accumulates samples into one live generation across many
+		// calls, so re-stamping per append would orphan its own live order
+		// position. See the pending field's doc comment.
+		entry.seq = t.pendingModuleOrder.insert(key)
+	}
+
+	if len(entry.samples) >= t.pendingSampleCap {
+		// The per-group bound is MaxPendingSamplesPerCorrelation, shared with
+		// the correlation-keyed store: it answers the same question ("how
+		// many samples may one not-yet-matched thing accumulate") about the
+		// same objects over the same drain interval, and a second dial for it
+		// would be two names for one decision. The eviction it causes is
+		// still counted separately.
+		t.dropped.EvictedPendingModuleSamples++
+		t.pendingModule[key] = entry
+		t.evictPendingModuleLocked()
+		return
+	}
+
+	entry.samples = append(entry.samples, p)
+	if p.TimeNs > entry.anchorNs {
+		entry.anchorNs = p.TimeNs
+	}
+	t.pendingModule[key] = entry
+	t.pendingModuleSampleTotal++
+	t.evictPendingModuleLocked()
+}
+
+// evictPendingModuleLocked is evictPendingLocked for the module-keyed store:
+// horizon first, then cardinality, both delegating the superseded-position
+// walk to orderedFIFO. pendingNewestNs is shared with the correlation-keyed
+// store — one PC-sample stream, one clock domain, one anomalous-jump clamp —
+// while pendingHorizonNs is shared by value and the counter is not shared at
+// all. Caller holds t.mu.
+func (t *Timeline) evictPendingModuleLocked() {
+	if t.pendingHorizonNs > 0 {
+		for {
+			key, ok := t.pendingModuleOrder.peekOldestLive(t.isPendingModuleLiveLocked)
+			if !ok {
+				break
+			}
+			cur := t.pendingModule[key] // guaranteed present: peekOldestLive just confirmed liveness
+			if t.pendingNewestNs <= cur.anchorNs || t.pendingNewestNs-cur.anchorNs <= t.pendingHorizonNs {
+				break
+			}
+			t.pendingModuleOrder.evictOldestLive(t.isPendingModuleLiveLocked)
+			delete(t.pendingModule, key)
+			t.pendingModuleSampleTotal -= uint64(len(cur.samples))
+			t.dropped.EvictedPendingModuleSamples += uint64(len(cur.samples))
+		}
+	}
+	for len(t.pendingModule) > t.pendingModuleCap {
+		key, ok := t.pendingModuleOrder.evictOldestLive(t.isPendingModuleLiveLocked)
+		if !ok {
+			break
+		}
+		cur := t.pendingModule[key]
+		delete(t.pendingModule, key)
+		t.pendingModuleSampleTotal -= uint64(len(cur.samples))
+		t.dropped.EvictedPendingModuleSamples += uint64(len(cur.samples))
 	}
 }
 
@@ -539,6 +805,12 @@ func (t *Timeline) Snapshot() Snapshot {
 	}
 	pendingCorrelations := len(t.pending)
 	pendingSamples := t.pendingSampleTotal
+	// Read, never drained: nothing joins out of the module-keyed store yet,
+	// so every group here survives this Snapshot. When the join lands it
+	// consumes from this store the same way the loop above consumes from the
+	// correlation-keyed one.
+	pendingModuleGroups := len(t.pendingModule)
+	pendingModuleSamples := t.pendingModuleSampleTotal
 	t.mu.Unlock()
 
 	// The heuristic's candidate set is built lazily - only once the loop
@@ -697,6 +969,9 @@ func (t *Timeline) Snapshot() Snapshot {
 		AttributedPCSamples: attributedPCSamples,
 		PendingSamples:      int(pendingSamples),
 		PendingCorrelations: pendingCorrelations,
+
+		PendingModuleSamples: int(pendingModuleSamples),
+		PendingModuleGroups:  pendingModuleGroups,
 	}
 }
 

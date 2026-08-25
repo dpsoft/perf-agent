@@ -3047,6 +3047,27 @@ func TestPCBatchBeforeItsStallMapStillResolves(t *testing.T) {
 	assert.Zero(t, st.Undecoded)
 }
 
+// FunctionIndex is half of the key Timeline.pendingModule groups Tier B samples
+// by, so dropping it on the decode path would put every sample of a process into
+// one group per cubin - a partial re-run of the collapse Task 8a exists to fix.
+// It reads as healthy from the counters alone, which only see samples arriving
+// and being grouped, never which group. Hence a test on the value, not a count.
+func TestDecodedPCSamplesCarryTheirFunctionIndex(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, stallMapBatch(1, []uint32{3}, []string{"mio_throttle"}, false))
+	apply(t, c, pcBatch(4242, 2,
+		pcSample{crc: 0xAA, pcOffset: 0x40, fnIndex: 7, stallIndex: 3, count: 5},
+		pcSample{crc: 0xAA, pcOffset: 0x80, fnIndex: 11, stallIndex: 3, count: 2},
+	))
+
+	require.Len(t, sink.pcSamples, 2)
+	assert.Equal(t, uint32(7), sink.pcSamples[0].FunctionIndex)
+	assert.Equal(t, uint32(11), sink.pcSamples[1].FunctionIndex,
+		"two samples in one cubin must keep distinct function indices, or they group as one")
+}
+
 // An index the map never carried has no name and never will. It becomes the
 // empty string - never "stall#17", which would put an unstable vendor number
 // into a label value - and it is counted, because a blank stall reason with

@@ -2022,7 +2022,14 @@ func (c *Consumer) emitPCSampleLocked(pid uint32, rec gpuabi.PCSample) {
 		// index.
 		ClockDomain: gpu.ClockDomainCPUMonotonic,
 		PCOffset:    rec.PCOffset,
-		Count:       uint64(rec.Count),
+		// Carried, not dropped: FunctionIndex is half of the key
+		// Timeline.pendingModule groups Tier B samples by. Leaving it zero
+		// would put every sample of a process into one group per cubin -
+		// a partial re-run of the collapse Task 8a exists to fix, and one
+		// that reads as perfectly healthy because the counters only see
+		// samples arriving and being grouped, not which group.
+		FunctionIndex: rec.FunctionIndex,
+		Count:         uint64(rec.Count),
 	}
 	if name, ok := c.resolveStallNameLocked(rec.StallIndex); ok {
 		ev.StallReason = name

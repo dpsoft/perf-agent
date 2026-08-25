@@ -2,6 +2,7 @@ package gpuprobe
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -98,8 +99,20 @@ func offerCubinFDs(t *testing.T, addr string, hdr []byte, fds []int) byte {
 	if len(fds) > 0 {
 		rights = unix.UnixRights(fds...)
 	}
-	_, _, err = uc.WriteMsgUnix(hdr, rights, nil)
-	require.NoError(t, err)
+	// EPIPE / ECONNRESET here is not a failure: the listener decides
+	// unauthorized and throttled offers from the peer's credentials alone,
+	// without ever reading, so it can have replied 'X' and closed before this
+	// write lands. The status byte it wrote is still queued on this end and
+	// the read below returns it. Failing on the write instead makes every
+	// reject-before-read test a coin toss on how the two ends interleave -
+	// reproducibly lost on 6.19, and the reason this is not a require.
+	//
+	// (Task 5 note: pre-existing. TestAPerPIDConsumerRefusesCubinsFromEveryOtherPID
+	// fails identically on origin/feat/cubin-transport unmodified.)
+	if _, _, werr := uc.WriteMsgUnix(hdr, rights, nil); werr != nil {
+		require.True(t, errors.Is(werr, unix.EPIPE) || errors.Is(werr, unix.ECONNRESET),
+			"unexpected write error: %v", werr)
+	}
 	var b [1]byte
 	n, err := uc.Read(b[:])
 	if err != nil || n != 1 {
@@ -1145,3 +1158,197 @@ int main() {
     return 0;
 }
 `
+
+// ---------------------------------------------------------------------------
+// Task 5: the stub's fake module-load path, end to end over the real channel.
+//
+// This is the assertion that makes Task 5 verifiable without a GPU. The stub
+// runs the SAME perfagent::CubinQueue the CUPTI adapter runs - same
+// CubinView, same copy-inside-the-callback, same crc-over-the-copy, same
+// offer-on-the-drain-thread - over a checked-in cubin from
+// internal/cubin/testdata. Reusing that fixture rather than inventing bytes
+// is what makes "the reader parses what the transport delivers" one set of
+// bytes instead of two that agree by assumption.
+//
+// What it cannot prove is anything about CUPTI: that MODULE_LOADED fires at
+// all, that cuptiGetCubinCrc() over our copy matches the PC records' cubinCrc,
+// or that a cuModuleUnload leaves our copy intact. Those are on the RTX 3090.
+
+// stubCubinFixture reads one of Task 1's checked-in cubins.
+func stubCubinFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	p := filepath.Join("..", "internal", "cubin", "testdata", name)
+	b, err := os.ReadFile(p)
+	require.NoError(t, err, "the Task 1 fixture must be checked in")
+	require.NotEmpty(t, b)
+	return b
+}
+
+// stubCubinCRC is an independent Go spelling of stub.cc's stub_cubin_crc.
+// Two spellings, so "the key the consumer stored is the key the producer
+// meant" is an assertion rather than a read-back.
+//
+// It stands in for cuptiGetCubinCrc(), which needs a CUDA toolkit this side
+// does not have. What the join requires is that one number names one set of
+// bytes and that the same number reaches both ends; a content hash satisfies
+// that exactly as CUPTI's unpublished polynomial does.
+func stubCubinCRC(b []byte) uint64 {
+	h := uint64(1469598103934665603)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	if h == 0 {
+		return 1
+	}
+	return h
+}
+
+// buildStub builds shim/perfagent-gpu-stub and hands back a copy with an
+// inode of its own. The inode is the point: the cubin address embeds it, so a
+// private copy is what stops a concurrent stub run - a second developer, a CI
+// job - offering into this test's listener.
+func buildStub(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skip("make unavailable")
+	}
+	shim, err := filepath.Abs(filepath.Join("..", "shim"))
+	require.NoError(t, err)
+	if _, serr := os.Stat(filepath.Join(shim, "stub", "stub.cc")); serr != nil {
+		t.Skipf("shim/stub not present: %v", serr)
+	}
+	out, err := exec.Command("make", "-C", shim, "perfagent-gpu-stub").CombinedOutput()
+	require.NoError(t, err, "build perfagent-gpu-stub: %s", out)
+
+	src := filepath.Join(shim, "perfagent-gpu-stub")
+	data, err := os.ReadFile(src)
+	require.NoError(t, err)
+	dst := filepath.Join(repoTempDir(t), "perfagent-gpu-stub")
+	require.NoError(t, os.WriteFile(dst, data, 0o700))
+	return dst
+}
+
+// runStubWithCubins runs the stub with no launches at all, so the only thing
+// it does is the fake module load. Returns its stderr.
+func runStubWithCubins(t *testing.T, stub string, paths ...string) string {
+	t.Helper()
+	cmd := exec.Command(stub, "0", "0", "8", "0")
+	cmd.Env = append(os.Environ(), "PERFAGENT_STUB_CUBINS="+strings.Join(paths, ":"))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Run(), "stub failed: %s", stderr.String())
+	return stderr.String()
+}
+
+func TestTheStubsFakeModuleLoadDeliversACheckedInCubin(t *testing.T) {
+	stub := buildStub(t)
+	fixture := stubCubinFixture(t, "single_lineinfo.cubin")
+	want := stubCubinCRC(fixture)
+
+	sink := newRecordingCubinSink()
+	l := testCubinListener(t, Config{ShimPath: stub}, sink)
+
+	path, err := filepath.Abs(filepath.Join("..", "internal", "cubin", "testdata", "single_lineinfo.cubin"))
+	require.NoError(t, err)
+	out := runStubWithCubins(t, stub, path)
+
+	// The address first: when the two ends derive different names every
+	// counter on both sides reads zero and nothing else in this test says why.
+	assert.Contains(t, out, "cubin_addr=@"+strings.TrimPrefix(l.address(), "@"),
+		"the stub derived a different cubin address than the listener bound")
+
+	stored, ok := sink.get(want)
+	require.True(t, ok, "nothing stored under the CRC the stub declared. stub said: %s", out)
+	assert.True(t, bytes.Equal(fixture, stored),
+		"the bytes the stub offered are not the fixture's bytes")
+
+	st := l.snapshot()
+	assert.Equal(t, uint64(1), st.received)
+	assert.Equal(t, uint64(len(fixture)), st.bytes)
+	assertNoCubinRejections(t, st)
+
+	// The producer's own accounting, which no consumer-side counter can see:
+	// a module dropped before it ever reached the wire is upstream of
+	// everything above.
+	assert.Contains(t, out, "captured=1 reload_skipped=0 queue_full=0 too_large=0 "+
+		"crc_failed=0 alloc_failed=0 sent=1 send_failed=0 pending=0")
+}
+
+func TestTheStubDeliversSeveralModulesInOneRun(t *testing.T) {
+	stub := buildStub(t)
+	sink := newRecordingCubinSink()
+	l := testCubinListener(t, Config{ShimPath: stub}, sink)
+
+	names := []string{"single_lineinfo.cubin", "single_nolineinfo.cubin", "two_kernels_lineinfo.cubin"}
+	var paths []string
+	total := 0
+	for _, n := range names {
+		p, err := filepath.Abs(filepath.Join("..", "internal", "cubin", "testdata", n))
+		require.NoError(t, err)
+		paths = append(paths, p)
+		total += len(stubCubinFixture(t, n))
+	}
+	out := runStubWithCubins(t, stub, paths...)
+
+	// A -lineinfo cubin and a no-lineinfo one in one run is what lets the
+	// gate reach more than one gpu_src_status value from a single producer.
+	for _, n := range names {
+		fixture := stubCubinFixture(t, n)
+		stored, ok := sink.get(stubCubinCRC(fixture))
+		require.True(t, ok, "%s did not arrive. stub said: %s", n, out)
+		assert.True(t, bytes.Equal(fixture, stored), "%s arrived with different bytes", n)
+	}
+	st := l.snapshot()
+	assert.Equal(t, uint64(3), st.received)
+	assert.Equal(t, uint64(total), st.bytes)
+	assertNoCubinRejections(t, st)
+}
+
+// The adapter-side intern: CUDA's lazy loading re-loads modules, and a
+// re-load of the same CRC must not re-offer. Counted on the producer, since
+// the consumer would only ever see it as a duplicate.
+func TestTheStubDoesNotReofferAReloadedModule(t *testing.T) {
+	stub := buildStub(t)
+	fixture := stubCubinFixture(t, "unrolled_lineinfo.cubin")
+
+	sink := newRecordingCubinSink()
+	l := testCubinListener(t, Config{ShimPath: stub}, sink)
+
+	path, err := filepath.Abs(filepath.Join("..", "internal", "cubin", "testdata", "unrolled_lineinfo.cubin"))
+	require.NoError(t, err)
+	out := runStubWithCubins(t, stub, path, path, path)
+
+	assert.Contains(t, out, "captured=1 reload_skipped=2")
+	st := l.snapshot()
+	assert.Equal(t, uint64(1), st.received)
+	assert.Equal(t, uint64(len(fixture)), st.bytes)
+	// A re-offer would have shown up here rather than as a rejection, so the
+	// duplicate counter is checked at zero too: the producer suppressed it,
+	// the consumer never had to.
+	assert.Zero(t, st.duplicate, "the consumer had to absorb a re-offer the producer should have suppressed")
+	assertNoCubinRejections(t, st)
+}
+
+// The boring run must read zero everywhere. Eleven defects on this project
+// were counters reading green exactly when things were worst, so the
+// direction that matters is asserted in both.
+func TestAStubRunWithNoModulesTouchesTheCubinChannelAtAll(t *testing.T) {
+	stub := buildStub(t)
+	sink := newRecordingCubinSink()
+	l := testCubinListener(t, Config{ShimPath: stub}, sink)
+
+	cmd := exec.Command(stub, "0", "0", "8", "0")
+	cmd.Env = append(os.Environ(), "PERFAGENT_STUB_CUBINS=")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Run(), "stub failed: %s", stderr.String())
+
+	assert.Contains(t, stderr.String(), "cubins requested=0 captured=0 reload_skipped=0 "+
+		"queue_full=0 too_large=0 crc_failed=0 alloc_failed=0 sent=0 send_failed=0 pending=0")
+	st := l.snapshot()
+	assert.Zero(t, st.received)
+	assert.Zero(t, st.bytes)
+	assert.Zero(t, st.mapped)
+	assertNoCubinRejections(t, st)
+}

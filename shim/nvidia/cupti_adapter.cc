@@ -11,6 +11,8 @@
 // stack capture and the projection all work unchanged.
 #include "batch.h"
 #include "clock.h"
+#include "cubin.h"
+#include "cubinqueue.h"
 #include "drain.h"
 #include "enroll.h"
 #include "kernelnames.h"
@@ -19,6 +21,9 @@
 #include "usdt_probe.h"
 
 #include <cupti.h>
+// cuptiGetCubinCrc lives here, not in cupti.h. It is the ONLY thing this
+// adapter uses from the PC-sampling header today; Task 6 uses the rest.
+#include <cupti_pcsampling.h>
 
 #include <atomic>
 #include <cstdarg>
@@ -40,6 +45,12 @@ PERFAGENT_USDT_EMITTER(gpu_exec_v1, 48);
 // N unrelated launches.
 PERFAGENT_USDT_EMITTER(gpu_launch_sampled_v1, 56);
 PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
+// gpu_module_load_v1 fires UNBATCHED, one record per captured module. Module
+// loads are tens per process rather than hundreds of thousands per second, so
+// a batch would only delay the record behind a drain tick for no saving -- and
+// the record must be emitted at a very particular instant (see
+// on_cubin_captured), which a batch's flush would move.
+PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
 
 namespace {
 
@@ -183,11 +194,19 @@ perfagent::Batch<gpu_exec_v1, 32> *g_eb = nullptr;
 perfagent::Sampler *g_sampler = nullptr;
 perfagent::KernelNameTable *g_names = nullptr;
 perfagent::Drainer *g_drainer = nullptr;
+perfagent::CubinQueue *g_cubins = nullptr;
 CUpti_SubscriberHandle g_subscriber = nullptr;
 
 std::atomic<unsigned long> g_sampled_seq{0};
 std::atomic<unsigned long> g_name_seq{0};
+std::atomic<unsigned long> g_module_seq{0};
 std::atomic<uint64_t> g_launch_ordinal{0};
+
+// The offer budget, read once at init so the drain thread does not re-parse
+// an environment variable every 100ms. Zero disables offers outright.
+unsigned g_cubin_timeout_ms = 0;
+// True when the startup rendezvous confirmed a consumer. See capture_enabled.
+bool g_consumer_enrolled = false;
 
 // Every discard has a counter. Nothing here is allowed to be silent (§6.1).
 std::atomic<uint64_t> g_launch_unattached{0};   // no consumer at launch time
@@ -208,8 +227,109 @@ std::atomic<uint64_t> g_buffers{0};
 // declined request is not documented, so whatever it does with the records
 // for that window, the refusal itself is on the record here.
 std::atomic<uint64_t> g_buffer_alloc_failed{0};
+// A MODULE_LOADED callback we declined to copy because no consumer was
+// believed present, and one whose descriptor carried no bytes at all. Both
+// are modules that will read gpu_src_status "no-module" later, so both are
+// counted here rather than being invisible.
+std::atomic<uint64_t> g_module_unattached{0};
+std::atomic<uint64_t> g_module_no_bytes{0};
 
 bool g_names_was_attached = false;
+
+// ------------------------------------------------------------ module path
+
+// Whether a module's bytes are worth copying at all.
+//
+// The copy is a bounded memcpy on the APPLICATION's cuModuleLoad path, so an
+// unprofiled process must not pay it. But the probe semaphore alone is the
+// wrong gate here and issue #49 is why: at InitializeInjection the semaphore
+// read ZERO on the RTX 3090 across three runs even though four thousand
+// probes fired later in the same process, because it answers "has the kernel
+// told this process yet" and not "is a consumer attached". CUDA's lazy
+// loading can put the first MODULE_LOADED very close to that moment, and a
+// module missed there is missed permanently -- there is no "copy it later"
+// (spec 6.3 finding 2).
+//
+// So the gate is the same one #49's second fix settled on, plus the
+// semaphore: the rendezvous CONNECT succeeded, which the consumer performs
+// before it creates the uprobe link, or the semaphore has since armed. In an
+// unprofiled process both read false and no module is ever copied.
+bool capture_enabled() {
+    return g_consumer_enrolled || gpu_module_load_v1_enabled();
+}
+
+// The join key, over the adapter-owned COPY -- CubinQueue hands this function
+// the copy and cannot hand it anything else, which is the point of the shape
+// in cubinqueue.h.
+//
+// Returning 0 means "could not". A zero CRC on the wire would be a module
+// record joining to nothing, so CubinQueue counts it and sends nothing.
+uint64_t cupti_cubin_crc(const void *bytes, size_t len) {
+    CUpti_GetCubinCrcParams p;
+    memset(&p, 0, sizeof(p));
+    p.size = CUpti_GetCubinCrcParamsSize;
+    p.cubinSize = len;
+    p.cubin = bytes;
+    if (cuptiGetCubinCrc(&p) != CUPTI_SUCCESS) return 0;
+    return p.cubinCrc;
+}
+
+// Fired by CubinQueue::capture, on the application's thread, at the one
+// instant the copy is owned by nobody else: the CRC is computed and the entry
+// has not been pushed, so the drain thread cannot yet have offered and freed
+// it. That is what keeps bytes_ptr accurate.
+//
+// bytes_ptr stays in the ABI and stays true, and it is still NOT a transport:
+// it points into this process's address space and the consumer would need
+// CAP_SYS_PTRACE to read it. The bytes travel over the cubin channel
+// (core/cubin.h); this record announces THAT a module loaded, with its CRC
+// and size.
+void on_cubin_captured(void *ctx, uint64_t crc, const void *bytes, size_t len) {
+    if (!gpu_module_load_v1_enabled()) return;
+    gpu_module_load_v1 r{};
+    r.cubin_crc = crc;
+    r.module_id = (uint64_t)(uintptr_t)ctx;
+    r.size_bytes = (uint64_t)len;
+    r.load_ns = mono_ns();
+    r.bytes_ptr = (uint64_t)(uintptr_t)bytes;
+    gpu_module_load_v1_emit(&r, 1, g_module_seq.fetch_add(1, std::memory_order_relaxed));
+}
+
+// CUPTI_CBID_RESOURCE_MODULE_LOADED.
+//
+// Everything this function does with the vendor's buffer happens before it
+// returns, and the type system is what says so: CubinView has no copy, no
+// move, no assignment, no operator new and no accessor for its pointer, so
+// the pointer has exactly one consumer -- the memcpy inside capture(). See
+// core/cubinqueue.h and `make -C shim check-cubin-defer`, which fails the
+// build if any of five ways to defer the copy starts compiling.
+//
+// The reason the deadline is real: CUPTI's header says the module data is
+// valid only within this callback, and the spike measured what "invalid"
+// means here -- after cuModuleUnload the buffer is still mapped and still
+// readable, with DIFFERENT CONTENTS. A deferred read gets silently wrong
+// bytes, which parse into a wrong line table and produce confidently
+// incorrect source lines. A fault would have been the kinder failure.
+void on_module_loaded(const CUpti_ResourceData *rd) {
+    const CUpti_ModuleResourceData *m =
+        (const CUpti_ModuleResourceData *)rd->resourceDescriptor;
+    if (!m || !m->pCubin || m->cubinSize == 0) {
+        g_module_no_bytes.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // g_cubins is constructed before cuptiSubscribe, so a callback cannot
+    // arrive ahead of it -- but a null here would be a segfault in somebody
+    // else's process, which is not a way to find that out.
+    if (!capture_enabled() || !g_cubins) {
+        g_module_unattached.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const perfagent::CubinView view(m->pCubin, m->cubinSize);
+    // moduleId travels as the context, not as a captured pointer: nothing
+    // about this call may outlive the callback except the owned copy.
+    g_cubins->capture(view, cupti_cubin_crc, on_cubin_captured,
+                      (void *)(uintptr_t)m->moduleId);
+}
 
 // ------------------------------------------------------------ launch path
 
@@ -317,6 +437,12 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
         if (cbid < kResourceCbidMax)
             g_resource_events[cbid].fetch_add(1, std::memory_order_relaxed);
+        // The histogram stays: the RESOURCE subscription is enabled for the
+        // whole process and this is still the only way to see what it costs
+        // and which cbids actually arrive. What changes is that one of them
+        // is now read rather than only counted.
+        if (cbid == CUPTI_CBID_RESOURCE_MODULE_LOADED && cbdata)
+            on_module_loaded((const CUpti_ResourceData *)cbdata);
         return;
     }
     if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) return;
@@ -410,6 +536,11 @@ void report(const char *why) {
          "activity_kernels=%llu activity_other=%llu buffers=%llu buffer_alloc_failed=%llu "
          "exec_unattached=%llu exec_batch_dropped=%llu exec_no_clock=%llu "
          "exec_no_time=%llu cupti_dropped=%llu names=%zu "
+         "modules_captured=%llu module_reload_skipped=%llu module_unattached=%llu "
+         "module_no_bytes=%llu cubin_too_large=%llu cubin_crc_failed=%llu "
+         "cubin_alloc_failed=%llu cubin_queue_full=%llu cubin_queue_depth=%zu "
+         "cubins_sent=%llu cubin_send_failed=%llu "
+         "cubins_offered=%llu cubin_transport_send_failed=%llu "
          "clock_steps=%llu clock_offset_ns=%lld sem_at_exit=%u\n",
          why, (int)getpid(),
          (unsigned long long)g_sampler->observed(),
@@ -426,6 +557,25 @@ void report(const char *why) {
          (unsigned long long)g_exec_no_time.load(),
          (unsigned long long)g_cupti_dropped.load(),
          g_names->size(),
+         // The four Task 5 counters, plus the three drop paths they do not
+         // cover and the two the transport itself keeps. A module counted
+         // anywhere but modules_captured/cubins_sent is a module whose PC
+         // samples will read gpu_src_status "no-module", so the gap between
+         // the first number here and cubins_sent is exactly the size of what
+         // this process could not explain.
+         (unsigned long long)(g_cubins ? g_cubins->modules_captured() : 0),
+         (unsigned long long)(g_cubins ? g_cubins->module_reload_skipped() : 0),
+         (unsigned long long)g_module_unattached.load(),
+         (unsigned long long)g_module_no_bytes.load(),
+         (unsigned long long)(g_cubins ? g_cubins->cubin_too_large() : 0),
+         (unsigned long long)(g_cubins ? g_cubins->cubin_crc_failed() : 0),
+         (unsigned long long)(g_cubins ? g_cubins->cubin_alloc_failed() : 0),
+         (unsigned long long)(g_cubins ? g_cubins->cubin_queue_full() : 0),
+         g_cubins ? g_cubins->depth() : (size_t)0,
+         (unsigned long long)(g_cubins ? g_cubins->cubins_sent() : 0),
+         (unsigned long long)(g_cubins ? g_cubins->cubin_send_failed() : 0),
+         (unsigned long long)perfagent::cubins_offered(),
+         (unsigned long long)perfagent::cubins_send_failed(),
          (unsigned long long)g_clock.steps(),
          (long long)g_clock.offset_ns(),
          gpu_launch_sampled_v1_semaphore_count());
@@ -461,6 +611,13 @@ void on_tick() {
         });
     }
     g_names_was_attached = now_attached;
+
+    // The SEND half of a cubin capture, and the whole reason this is here and
+    // not in the MODULE_LOADED callback: a connect() plus an up-to-8 MiB
+    // handover on the application's cuModuleLoad path would stall the
+    // application for the profiler's benefit. Nothing is waiting on this
+    // thread. The copy already happened, on time, in the callback.
+    if (g_cubins) g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
 }
 
 // The documented CUPTI shutdown hook. Without it the records still sitting in
@@ -470,6 +627,12 @@ void at_exit_handler() {
     cuptiActivityFlushAll(1);
     if (g_lb) g_lb->flush();
     if (g_eb) g_eb->flush();
+    // One last offer pass, for modules captured inside the final drain
+    // interval. Bounded: drain() offers at most the entries present when it
+    // was entered, the queue holds at most CubinQueueLimits::max_entries, and
+    // an offer to an absent listener refuses immediately -- so this cannot
+    // turn process exit into a multi-second wait.
+    if (g_cubins) g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
     report("exit");
 }
 
@@ -559,8 +722,19 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     char enroll_name[128];
     if (!perfagent::enroll_self_name(enroll_name, sizeof(enroll_name)))
         snprintf(enroll_name, sizeof(enroll_name), "<no-address>");
+    // Logged for the same reason and compared against Stats.CubinsAddress:
+    // the two ends derive this name independently and never exchange it, so
+    // when they disagree every cubin counter on both sides reads zero and
+    // every module is unresolvable with nothing saying why.
+    char cubin_name[128];
+    if (!perfagent::cubin_self_name(cubin_name, sizeof(cubin_name)))
+        snprintf(cubin_name, sizeof(cubin_name), "<no-address>");
     perfagent::EnrollResult enrolled =
         perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
+    // The gate for cubin capture -- see capture_enabled(). A confirmed
+    // rendezvous is a positive statement that a consumer is attached, made
+    // at a moment when the probe semaphore may still read zero.
+    g_consumer_enrolled = (enrolled == perfagent::kEnrollConfirmed);
 
     // Leaked on purpose, never deleted: CUPTI worker threads keep calling
     // buffer_completed during process teardown, and a destroyed Batch or
@@ -572,6 +746,12 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                                               perfagent::Sampler::kDefaultSeed));
     g_names = new perfagent::KernelNameTable();
     g_drainer = new perfagent::Drainer();
+    // Leaked with the rest, and for the same reason: a CUPTI worker thread
+    // can still be inside a RESOURCE callback during teardown, and a
+    // destroyed queue under it is a use-after-free in somebody else's
+    // process.
+    g_cubins = new perfagent::CubinQueue();
+    g_cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
 
     if (!check(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback, nullptr),
                "cuptiSubscribe"))
@@ -607,10 +787,11 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     // fix gated the rendezvous on the semaphore and lost the CUDA path.
     logf("perfagent-cupti: initialized pid=%d sample_period=%u sample_seed=0x%016llx "
          "drain_ms=%u clock_offset_ns=%lld enroll=%s sem_at_init=%u sem_after_init=%u "
-         "enroll_addr=@%s\n",
+         "enroll_addr=@%s cubin_addr=@%s cubin_timeout_ms=%u\n",
          (int)getpid(), g_sampler->period(),
          (unsigned long long)g_sampler->seed(), drain_ms, (long long)g_clock.offset_ns(),
          perfagent::enroll_result_name(enrolled), sem_at_init,
-         gpu_launch_sampled_v1_semaphore_count(), enroll_name);
+         gpu_launch_sampled_v1_semaphore_count(), enroll_name, cubin_name,
+         g_cubin_timeout_ms);
     return 1;
 }

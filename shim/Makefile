@@ -21,10 +21,10 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 # sm_86 is the RTX 3090 this adapter was proven on.
 CUDA_ARCH ?= sm_86
 
-CORE_SRC := core/batch.cc core/clock.cc core/cubin.cc core/drain.cc core/enroll.cc core/sampler.cc
+CORE_SRC := core/batch.cc core/clock.cc core/cubin.cc core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc
 CORE_OBJ := $(CORE_SRC:.cc=.o)
 
-.PHONY: all test test-tsan nvidia nvidia-workload clean
+.PHONY: all test test-tsan check-cubin-defer nvidia nvidia-workload clean
 all: libperfagent-gpu-core.a
 
 libperfagent-gpu-core.a: $(CORE_OBJ)
@@ -177,6 +177,42 @@ nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
 	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
 		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
 
+# Task 5's structural assertion, run as a BUILD step rather than asserted in a
+# comment: the copy of a cubin must happen inside the vendor callback, so no
+# deferral may sit between callback entry and the memcpy. core/cubinqueue.h
+# enforces that by shape - CubinView has no copy, no move, no assignment, no
+# operator new and NO ACCESSOR FOR ITS POINTER - and this target is the proof
+# that the enforcement works, by trying to violate it five ways and requiring
+# every one to be rejected by the compiler.
+#
+# Mode 0 is the control and it MUST compile. Without it the whole check would
+# pass just as happily on a file that fails to build for an unrelated reason -
+# a typo, a renamed header - and would then be proving nothing, which is the
+# exact shape of the eleven counters this project has shipped reading green at
+# the worst possible moment.
+#
+# 2>/dev/null on the negative arms: the compiler errors ARE the pass, and
+# printing five screens of them would bury the one line that matters.
+.PHONY: check-cubin-defer
+check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
+	@$(CXX) -std=c++17 -Wall -Werror -I core -fsyntax-only \
+		-DPERFAGENT_CUBIN_DEFER=0 core/cubin_defer_test.cc || { \
+	  echo "check-cubin-defer: the COMPLIANT capture does not compile; this check would"; \
+	  echo "                   otherwise pass for the wrong reason. Fix core/cubinqueue.h."; \
+	  exit 1; }
+	@rc=0; for m in 1 2 3 4 5; do \
+	  if $(CXX) -std=c++17 -Wall -Werror -I core -fsyntax-only \
+		-DPERFAGENT_CUBIN_DEFER=$$m core/cubin_defer_test.cc 2>/dev/null; then \
+	    echo "check-cubin-defer: deferral mode $$m COMPILED. The vendor's pointer can escape"; \
+	    echo "                   the callback, so the copy can be deferred past the buffer's"; \
+	    echo "                   lifetime and a late reader gets silently WRONG bytes (spec"; \
+	    echo "                   6.3 finding 2). See core/cubin_defer_test.cc mode $$m."; \
+	    rc=1; \
+	  fi; \
+	done; \
+	[ $$rc -eq 0 ] && echo "check-cubin-defer: OK - the compliant capture compiles, all 5 deferrals do not"; \
+	exit $$rc
+
 # core/probe_args_test.cc and stub/probe_order_test.cc are the two tests here
 # built with -O2, and that is not a detail. probe_args_test checks that the
 # record a probe points at has actually been written to memory when the probe
@@ -192,12 +228,13 @@ nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/drain_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/stub.cc $(CORE_SRC)
+test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/stub.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/enroll_test core/enroll_test.cc core/enroll.cc && /tmp/enroll_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubin_test core/cubin_test.cc core/cubin.cc core/enroll.cc && /tmp/cubin_test
+	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubinqueue_test core/cubinqueue_test.cc core/cubinqueue.cc && /tmp/cubinqueue_test
 	$(CC) -std=c11 -Wall -Werror -I core -o /tmp/usdt_abi_test core/usdt_abi_test.c && /tmp/usdt_abi_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/sampler_test core/sampler_test.cc core/sampler.cc && /tmp/sampler_test
 	$(CXX) -std=c++17 -O2 -Wall -Werror -I core -o /tmp/probe_args_test core/probe_args_test.cc && /tmp/probe_args_test
@@ -209,11 +246,19 @@ test: core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/drain_test.c
 # which passes on most runs even with Batch's mutex deleted -- only the
 # sanitizer actually proves the absence of the race. sampler_test.cc's
 # concurrent case is the same shape, for Sampler's atomics.
-test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc core/sampler.cc core/sampler.h
+#
+# cubinqueue_test.cc belongs here for a third reason: its capture path runs on
+# the APPLICATION's thread while drain() runs on the profiler's, and the whole
+# design turns on drain() not holding the mutex across an offer. A test that
+# only checks the counters passes with the lock held the wrong way round; only
+# TSan sees the unsynchronized access if one is ever introduced.
+test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc core/sampler.cc core/sampler.h core/cubinqueue_test.cc core/cubinqueue.cc core/cubinqueue.h
 	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
 		-o /tmp/batch_test_tsan core/batch_test.cc core/batch.cc && /tmp/batch_test_tsan
 	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
 		-o /tmp/sampler_test_tsan core/sampler_test.cc core/sampler.cc && /tmp/sampler_test_tsan
+	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
+		-o /tmp/cubinqueue_test_tsan core/cubinqueue_test.cc core/cubinqueue.cc && /tmp/cubinqueue_test_tsan
 
 clean:
 	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so \

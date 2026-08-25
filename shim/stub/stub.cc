@@ -3,6 +3,8 @@
 // (spec §14, Phase 3 gate).
 #include "batch.h"
 #include "clock.h"
+#include "cubin.h"
+#include "cubinqueue.h"
 #include "drain.h"
 #include "enroll.h"
 #include "kernelnames.h"
@@ -12,6 +14,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <string>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -35,11 +39,121 @@ PERFAGENT_USDT_EMITTER(gpu_exec_v1, 48);
 // stack to N unrelated launches, defeating the entire feature.
 PERFAGENT_USDT_EMITTER(gpu_launch_sampled_v1, 56);
 PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
+// gpu_module_load_v1 fires UNBATCHED, one record per module, exactly as the
+// CUPTI adapter fires it -- and from inside CubinQueue::capture, at the one
+// instant the copy is owned by nobody else, so bytes_ptr is true when the
+// probe reads it.
+PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
 
 static uint64_t mono_ns() {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+// ------------------------------------------------------- the fake module load
+//
+// A GPU-free MODULE_LOADED. It reads a checked-in cubin from disk, runs it
+// through the SAME CubinQueue the CUPTI adapter uses -- same capture, same
+// CubinView, same crc-over-the-copy, same drain-thread offer -- and fires
+// gpu_module_load_v1 from inside capture(). That drives the cubin transport
+// (Task 3), the module store (Task 4), the consumer's decode (Task 7) and the
+// projection's source labels (Task 9) end to end on a machine with no GPU,
+// which is what the phase gate needs.
+//
+// PERFAGENT_STUB_CUBINS is a ':'-separated list of paths, in the shape PATH
+// itself uses, so a gate can drive several modules -- the -lineinfo fixture
+// and the no-lineinfo one -- through one run and reach more than one
+// gpu_src_status value.
+//
+// Reuse the fixtures in internal/cubin/testdata/ rather than inventing bytes:
+// the same cubins are then exercised by the reader's tests, by the module
+// store's, and by the transport's, so "the reader parses what the transport
+// delivers" is one fixture rather than two that agree by assumption.
+
+// The stand-in for cuptiGetCubinCrc(), and it is NOT that function.
+//
+// CUPTI's polynomial is unpublished and there is no CUDA toolkit on this
+// path. What the join actually requires is that ONE number identifies one set
+// of bytes and that the same number reaches both ends -- so a stub that
+// declares a content hash produces a pipeline that is exercised exactly as a
+// real one is, keyed on a number that means the same thing.
+//
+// FNV-1a, the same spelling hash_name() uses in the adapter, so a test can
+// recompute it independently and assert the key rather than read it back.
+static uint64_t stub_cubin_crc(const void *bytes, size_t len) {
+    const unsigned char *p = (const unsigned char *)bytes;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;   // zero is the ABI's "no module"
+}
+
+static unsigned long g_stub_module_seq = 0;
+
+// Fired by CubinQueue::capture, before the copy is visible to any drain, so
+// bytes_ptr names live adapter-owned bytes at the moment the probe reads it.
+// It is still not a transport: the consumer cannot read another process's
+// address space without CAP_SYS_PTRACE. The bytes go over the cubin channel.
+static void stub_on_cubin_captured(void *ctx, uint64_t crc, const void *bytes, size_t len) {
+    if (!gpu_module_load_v1_enabled()) return;
+    gpu_module_load_v1 r{};
+    r.cubin_crc = crc;
+    r.module_id = (uint64_t)(uintptr_t)ctx;
+    r.size_bytes = (uint64_t)len;
+    r.load_ns = mono_ns();
+    r.bytes_ptr = (uint64_t)(uintptr_t)bytes;
+    gpu_module_load_v1_emit(&r, 1, g_stub_module_seq++);
+}
+
+static bool read_whole_file(const char *path, std::vector<char> *out) {
+    FILE *f = fopen(path, "rbe");
+    if (!f) return false;
+    char buf[65536];
+    for (;;) {
+        const size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n) out->insert(out->end(), buf, buf + n);
+        if (n < sizeof(buf)) break;
+    }
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+// Captures every module named by PERFAGENT_STUB_CUBINS. Returns how many
+// reached the queue. Reading the file is the stub's stand-in for the vendor
+// handing us a buffer, so the CubinView is built over the file buffer and
+// dies with this function, exactly as the adapter's dies with its callback.
+static unsigned stub_capture_modules(perfagent::CubinQueue &q) {
+    const char *list = getenv("PERFAGENT_STUB_CUBINS");
+    if (!list || !*list) return 0;
+    unsigned n = 0;
+    std::string spec(list);
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t sep = spec.find(':', pos);
+        const std::string path =
+            spec.substr(pos, sep == std::string::npos ? std::string::npos : sep - pos);
+        pos = (sep == std::string::npos) ? spec.size() + 1 : sep + 1;
+        if (path.empty()) continue;
+
+        std::vector<char> bytes;
+        if (!read_whole_file(path.c_str(), &bytes) || bytes.empty()) {
+            fprintf(stderr, "stub: module read failed path=%s\n", path.c_str());
+            continue;
+        }
+        const uint64_t crc = stub_cubin_crc(bytes.data(), bytes.size());
+        const perfagent::CubinView view(bytes.data(), bytes.size());
+        const bool ok = q.capture(view, stub_cubin_crc, stub_on_cubin_captured,
+                                  (void *)(uintptr_t)(n + 1));
+        fprintf(stderr, "stub: module id=%u path=%s size=%zu crc=0x%016llx captured=%s\n",
+                n + 1, path.c_str(), bytes.size(), (unsigned long long)crc,
+                ok ? "yes" : "no");
+        if (ok) n++;
+    }
+    return n;
 }
 
 // Default visibility: this is the one symbol libperfagent-gpu-stub.so must
@@ -63,6 +177,12 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     char enroll_name[128];
     if (!perfagent::enroll_self_name(enroll_name, sizeof(enroll_name)))
         snprintf(enroll_name, sizeof(enroll_name), "<no-address>");
+    // The cubin channel's name, printed for the reason the rendezvous name is:
+    // the two ends derive it independently and never exchange it, so a
+    // disagreement makes every counter on both sides read zero.
+    char cubin_name[128];
+    if (!perfagent::cubin_self_name(cubin_name, sizeof(cubin_name)))
+        snprintf(cubin_name, sizeof(cubin_name), "<no-address>");
     perfagent::EnrollResult enrolled =
         perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
 
@@ -74,10 +194,19 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     unsigned long name_seq = 0;
     bool names_was_attached = false;
 
+    // The same queue the CUPTI adapter runs, wired the same way: capture on
+    // the caller's thread, offer on the drain thread.
+    perfagent::CubinQueue cubins;
+    const unsigned cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
+
     perfagent::Drainer drainer;
     drainer.on_tick([&] {
         lb.flush();
         eb.flush();
+        // The offer, on the drain thread and nowhere else. In an application
+        // this is what keeps a connect() and a multi-megabyte handover off
+        // the cuModuleLoad path; here it is what proves that wiring works.
+        cubins.drain(perfagent::cubin_offer_to_consumer, cubin_timeout_ms);
         // Late-attach replay: only on the unattached -> attached transition,
         // so an already-attached consumer does not get names re-sent every
         // tick (spec §6.1's replay contract).
@@ -91,6 +220,18 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
         names_was_attached = now_attached;
     });
     drainer.start(100);
+
+    // Modules load before kernels run, as they do in a CUDA process. The
+    // capture is synchronous; the offers are not, so wait -- bounded -- for
+    // the drain thread to have emptied the queue before the launches start,
+    // so a gate can assert on a module the consumer provably already holds.
+    const unsigned modules = stub_capture_modules(cubins);
+    if (modules) {
+        const uint64_t wait_until = mono_ns() + 5000000000ULL;
+        while (cubins.depth() && mono_ns() < wait_until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
 
     for (unsigned i = 1; i <= launches; i++) {
         const uint64_t now = mono_ns();
@@ -166,7 +307,30 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
 
     lb.flush();
     eb.flush();
+    // A final pass for anything the tick did not reach. drain() is bounded by
+    // the depth it saw on entry, so this cannot become an unbounded wait.
+    cubins.drain(perfagent::cubin_offer_to_consumer, cubin_timeout_ms);
     drainer.stop();
+    // Every cubin counter, always -- not only when modules were requested.
+    // A run that asked for none must read zero everywhere, and a line that
+    // appears only on the interesting runs is a line no one checks on the
+    // boring ones.
+    fprintf(stderr, "stub: cubins requested=%u captured=%llu reload_skipped=%llu "
+                    "queue_full=%llu too_large=%llu crc_failed=%llu alloc_failed=%llu "
+                    "sent=%llu send_failed=%llu pending=%zu "
+                    "offered=%llu transport_send_failed=%llu timeout_ms=%u cubin_addr=@%s\n",
+            modules, (unsigned long long)cubins.modules_captured(),
+            (unsigned long long)cubins.module_reload_skipped(),
+            (unsigned long long)cubins.cubin_queue_full(),
+            (unsigned long long)cubins.cubin_too_large(),
+            (unsigned long long)cubins.cubin_crc_failed(),
+            (unsigned long long)cubins.cubin_alloc_failed(),
+            (unsigned long long)cubins.cubins_sent(),
+            (unsigned long long)cubins.cubin_send_failed(),
+            cubins.depth(),
+            (unsigned long long)perfagent::cubins_offered(),
+            (unsigned long long)perfagent::cubins_send_failed(),
+            cubin_timeout_ms, cubin_name);
     // seed= is part of the accounting, not decoration: the sampler's schedule
     // is a deterministic chain from (seed, period), so this line is what makes
     // the exact sampled= count above reproducible and auditable offline

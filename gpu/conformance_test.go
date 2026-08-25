@@ -161,10 +161,19 @@ type conformanceHarness struct {
 // set. The clock is always frozen, for the same reason newConformanceHarness
 // freezes it.
 func newConformanceHarnessWithConfig(cacheCfg LaunchCacheConfig, sinkBurst int) *conformanceHarness {
-	tl := NewTimeline(TimelineConfig{LaunchCache: cacheCfg})
+	return newConformanceHarnessWithTimeline(TimelineConfig{LaunchCache: cacheCfg}, sinkBurst)
+}
+
+// newConformanceHarnessWithTimeline is the same generalized over the whole
+// TimelineConfig, for the continuous-mode scenarios that need a module store
+// wired in - without one no correlation-less group can ever be named, so the
+// attributed-by-kernel bucket of the reconciliation identity would be
+// structurally unreachable and the term would be dead.
+func newConformanceHarnessWithTimeline(cfg TimelineConfig, sinkBurst int) *conformanceHarness {
+	tl := NewTimeline(cfg)
 	clock := newFakeClock(time.Unix(0, 0))
 	sink := NewCountingSinkWithRate(tl, sinkBurst, 0, clock.Now)
-	return &conformanceHarness{tl: tl, sink: sink, attempt: newAttemptSink(sink), cacheCapacity: cacheCfg.Capacity}
+	return &conformanceHarness{tl: tl, sink: sink, attempt: newAttemptSink(sink), cacheCapacity: cfg.LaunchCache.Capacity}
 }
 
 func newConformanceHarness() *conformanceHarness {
@@ -243,8 +252,40 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	// this-call gauges, not cumulative, so a second Snapshot call would need
 	// its own reconciliation, not this one.
 	assertPCSampleLossesAccounted(t, snap, sinkStats, h.attempt.pcAttempts)
+	assertPCAttribAccompaniesSamples(t, snap)
 
 	return snap
+}
+
+// assertPCAttribAccompaniesSamples is the gpu_pc_attrib presence invariant:
+// every ExecutionView holding at least one PC sample carries one of
+// PCAttribs(), and every view holding none carries the empty value.
+//
+// It matters because gpu_pc_attrib is emitted unconditionally on PC-derived
+// samples, for the same reason gpu_join is: an ABSENT label must never be
+// readable as "exact" by a consumer that does not know to check for its
+// absence. A view that reached the profile with samples and no attribution
+// would produce exactly that, and PCAttrib.MarshalJSON refusing the empty
+// value only catches it at the serialization boundary, which not every
+// consumer crosses.
+func assertPCAttribAccompaniesSamples(t *testing.T, snap Snapshot) {
+	t.Helper()
+	valid := make(map[PCAttrib]struct{}, len(PCAttribs()))
+	for _, a := range PCAttribs() {
+		valid[a] = struct{}{}
+	}
+	for _, view := range snap.Executions {
+		if len(view.PCSamples) == 0 {
+			assert.Empty(t, string(view.PCAttrib),
+				"execution %+v holds no PC samples, so there is nothing for gpu_pc_attrib to describe",
+				view.Exec.Correlation)
+			continue
+		}
+		_, ok := valid[view.PCAttrib]
+		assert.Truef(t, ok,
+			"execution %+v holds %d PC samples with gpu_pc_attrib %q, which is not one of %v",
+			view.Exec.Correlation, len(view.PCSamples), view.PCAttrib, PCAttribs())
+	}
 }
 
 // assertNoFabricatedLaunch is invariant 3: every non-nil view.Launch must
@@ -401,6 +442,26 @@ func assertPCSampleLossesAccounted(t *testing.T, snap Snapshot, sinkStats SinkSt
 			uint64(snap.PendingSamples)+snap.Dropped.EvictedPendingSamples+
 			uint64(snap.PendingModuleSamples)+snap.Dropped.EvictedPendingModuleSamples,
 		"every PC sample the sink accepted must be attributed, still pending in one of the two pending stores, or evicted from one of them - never unaccounted for")
+
+	// The attributed term now has two sources - the exact-correlation index
+	// and the module-keyed join - and the breakdown must account for all of
+	// it. Without this, a module join that attached samples while forgetting
+	// to count them would still satisfy the identity above (the samples left
+	// the pending store and arrived on an execution) while reporting a
+	// per-tier split that was quietly wrong.
+	assert.Equal(t, snap.AttributedPCSamples, snap.PCJoin.AttributedTotal(),
+		"AttributedExact + AttributedKernel must account for every attributed PC sample: %+v", snap.PCJoin)
+
+	// The group-level identity. Snapshot's join runs entirely under the lock,
+	// so no group can be created or evicted between the walk and the gauge:
+	// every group the join examined was either consumed (GroupsJoined) or is
+	// still in the store, and the three not-joined reasons partition the
+	// latter exactly. A refusal path that returned without incrementing any
+	// counter - the easiest mistake to make here, and an invisible one -
+	// breaks this.
+	assert.Equal(t, snap.PCJoin.GroupsExamined(),
+		snap.PCJoin.GroupsJoined+uint64(snap.PendingModuleGroups),
+		"every pending module group must be joined or left pending for exactly one counted reason: %+v", snap.PCJoin)
 }
 
 // TestConformance runs the producer-scenario table against every invariant.
@@ -845,6 +906,96 @@ func TestConformancePCSampleReconciliationCoversPendingAndEvicted(t *testing.T) 
 	assert.Equal(t, 1, snap.PendingCorrelations)
 	assert.Equal(t, uint64(2), snap.Dropped.EvictedPendingSamples,
 		"evict-a and evict-b (1 sample each) must have been evicted from pending entirely by the cardinality bound")
+
+	// The continuous-mode terms are structurally zero in this scenario -
+	// every sample here carries a correlation - and asserting so is what
+	// keeps the two halves of the identity from being confused for each
+	// other. Their non-dead counterpart is
+	// TestConformancePCSampleReconciliationCoversAttributedByKernel below.
+	assert.Zero(t, snap.PendingModuleSamples)
+	assert.Zero(t, snap.Dropped.EvictedPendingModuleSamples)
+	assert.Equal(t, snap.AttributedPCSamples, snap.PCJoin.AttributedExact,
+		"a scenario in which every sample carried a correlation must attribute all of them exactly")
+}
+
+// drivePCSampleMixedFateContinuous is drivePCSampleMixedFate's continuous-mode
+// twin: it forces the buckets the module-keyed join added - attributed by
+// kernel, still pending in the module store, and evicted from it - non-zero in
+// one run, so none of them is a dead term where the reconciliation actually
+// runs.
+//
+// Every sample here carries NO correlation value, which is what continuous
+// collection produces on every record. Attribution therefore runs entirely
+// through the module: the "joined" group's (CRC, functionIndex) names a device
+// function the execution below carries as its KernelName, and the "unnameable"
+// group's CRC is one no cubin ever arrived for.
+//
+// The harness this runs under sets MaxPendingSamplesPerCorrelation to 2, which
+// is what makes the eviction bucket reachable: the joined group is offered
+// four samples and may hold two.
+func drivePCSampleMixedFateContinuous(sink EventSink, crc uint64, fnIndex uint32, kernel string) error {
+	const pid = 4242
+
+	// Joined, with two of its four samples evicted by the per-group cap.
+	for i := range 4 {
+		if err := sink.EmitPCSample(tierBSample(pid, crc, fnIndex, uint64(10+i))); err != nil {
+			return err
+		}
+	}
+	// Unnameable: no cubin for this CRC ever reached the agent, so nothing can
+	// turn its function index into a name. It stays pending rather than being
+	// attached to the execution below, whose kernel name would have matched.
+	if err := sink.EmitPCSample(tierBSample(pid, 0xBAD0BAD0, fnIndex, 20)); err != nil {
+		return err
+	}
+	return sink.EmitExec(pcExec(pid, kernel, "0", 30, 40))
+}
+
+// TestConformancePCSampleReconciliationCoversAttributedByKernel is
+// TestConformancePCSampleReconciliationCoversPendingAndEvicted for the
+// continuous-mode half of the identity. It runs the full invariant suite -
+// including assertPCSampleLossesAccounted and both PC-join identities - over a
+// scenario whose samples reach their execution through the module and nothing
+// else, then asserts each new term is genuinely non-zero.
+//
+// Mutations this catches: dropping AttributedKernel from the attributed
+// breakdown; a join that consumed a group without counting it in GroupsJoined;
+// and a refusal path that left a group pending without incrementing any of the
+// three not-joined counters, which is the easiest and most invisible mistake
+// available in that function.
+func TestConformancePCSampleReconciliationCoversAttributedByKernel(t *testing.T) {
+	b := fixture(t, "single_lineinfo.cubin")
+	store := NewModuleStore(ModuleStoreConfig{})
+	require.NoError(t, store.Put(pcJoinCRC, b))
+	fnIndex := symIndexOf(t, b, "addOne")
+
+	h := newConformanceHarnessWithTimeline(TimelineConfig{
+		LaunchCache:                     LaunchCacheConfig{Capacity: conformanceCacheCapacity},
+		MaxPendingSamplesPerCorrelation: 2,
+		Modules:                         store,
+	}, conformanceSinkBurst)
+
+	snap := runConformanceWithHarness(t, "pc-sample-mixed-fate-continuous", h,
+		func(sink EventSink) error {
+			return drivePCSampleMixedFateContinuous(sink, pcJoinCRC, fnIndex, "addOne")
+		})
+
+	assert.Equal(t, uint64(2), snap.AttributedPCSamples,
+		"the joined group's two held samples must reach their execution")
+	assert.Equal(t, uint64(2), snap.PCJoin.AttributedKernel)
+	assert.Zero(t, snap.PCJoin.AttributedExact, "not one of these samples carried a correlation")
+	assert.Equal(t, 1, snap.PendingModuleSamples, "the unnameable group's sample stays pending")
+	assert.Equal(t, uint64(2), snap.Dropped.EvictedPendingModuleSamples,
+		"the per-group cap's two refusals are counted, and on the continuous-mode counter")
+	assert.Zero(t, snap.Dropped.EvictedPendingSamples,
+		"never on the correlation-keyed counter, or a Tier B storm reads as a Tier A one")
+
+	assert.Equal(t, uint64(1), snap.PCJoin.GroupsJoined)
+	assert.Equal(t, uint64(1), snap.PCJoin.GroupsUnresolvedName)
+	assert.Equal(t, uint64(2), snap.PCJoin.GroupsExamined())
+
+	require.Len(t, snap.Executions, 1)
+	assert.Equal(t, PCAttribKernel, snap.Executions[0].PCAttrib)
 }
 
 // BenchmarkSnapshotAtScale is the Phase 2 gate: a million launches through a

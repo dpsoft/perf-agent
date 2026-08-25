@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dpsoft/perf-agent/gpu"
@@ -35,8 +36,47 @@ func main() {
 		period   = flag.Int("period", 8, "one-in-N launch sampling period (PERFAGENT_GPU_SAMPLE_PERIOD)")
 		linger   = flag.Int("linger-ms", 30000, "how long the workload may wait to be released after it finishes")
 		out      = flag.String("out", "gpu-cuda.pb.gz", "output pprof profile")
+
+		// One setting, three values, and no way to ask for two. The default
+		// is the empty string rather than "off" so that an unspecified flag
+		// DEFERS to an inherited PERFAGENT_GPU_PC_SAMPLING instead of
+		// contradicting it — an explicit --gpu-pc-sampling=off against an
+		// exported "serialized" is a disagreement and is refused, but not
+		// setting the flag at all is not.
+		pcSampling = flag.String("gpu-pc-sampling", "",
+			"GPU PC-sampling tier: "+strings.Join(gpu.PCSamplingTierNames, " | ")+
+				" (default off; also read from "+gpu.PCSamplingEnvVar+"). "+
+				"\"continuous\" does not serialize kernels; \"serialized\" does, and requires "+
+				"-gpu-pc-sampling-acknowledge-perturbation")
+		pcAck = flag.Bool("gpu-pc-sampling-acknowledge-perturbation", false,
+			"acknowledge that the \"serialized\" tier perturbs the workload: it inflates GPU "+
+				"kernel durations inside a burst, it distorts any CPU and off-CPU profile taken "+
+				"alongside it with no marking in those profiles at all, and it is unavailable "+
+				"where CUDA graphs are in use")
 	)
 	flag.Parse()
+
+	// Tier selection, and it happens BEFORE anything is attached or launched.
+	// Every refusal here is a startup error: an unknown value, a value naming
+	// two tiers, the flag and the environment naming two tiers, or Tier A
+	// without its acknowledgement. None of them is resolved to a tier — a
+	// profile produced under a tier nobody chose is worse than no profile,
+	// because nothing in it says which one ran.
+	tier, err := gpu.PCSamplingRequest{
+		Flag:                    *pcSampling,
+		Env:                     os.Getenv(gpu.PCSamplingEnvVar),
+		AcknowledgePerturbation: *pcAck,
+	}.Select()
+	if err != nil {
+		log.Fatalf("gpu pc sampling: %v", err)
+	}
+	// Printed at startup as well as standing in every JoinHealth render
+	// below. The startup copy is for the operator who is watching the run
+	// begin; the standing copy is for the one who reads the profile an hour
+	// later, which is the reader the warning is actually for.
+	for _, line := range gpu.PCSamplingStandingWarning(tier) {
+		log.Print(line)
+	}
 
 	shimPath, err := filepath.Abs(*shim)
 	if err != nil {
@@ -50,7 +90,11 @@ func main() {
 		log.Fatalf("adapter %s: %v (build it with: make -C shim nvidia)", shimPath, err)
 	}
 
-	timeline := gpu.NewTimeline(gpu.TimelineConfig{})
+	// The selected tier reaches the agent's own join here and the producer's
+	// environment below, from ONE variable. Two copies that could disagree
+	// about which tier ran is how a profile ends up disclosing one thing and
+	// doing another.
+	timeline := gpu.NewTimeline(gpu.TimelineConfig{PCSampling: tier})
 	// Without a symbolizer the sampled launch stacks still arrive and are
 	// still accounted for, but every one of them degrades to no stack — the
 	// profile would then be honest and useless, all GPU time unattributed.
@@ -113,6 +157,12 @@ func main() {
 		"CUDA_INJECTION64_PATH="+shimPath,
 		fmt.Sprintf("PERFAGENT_GPU_SAMPLE_PERIOD=%d", *period),
 		"PERFAGENT_GPU_LOG=stderr",
+		// Set EXPLICITLY on every run including an off one, never left to be
+		// inherited. os.Environ() may already carry this variable from the
+		// operator's shell; appending the resolved value last is what keeps a
+		// stale export from turning a run this agent believes is off into a
+		// producer that serializes the workload's kernels.
+		gpu.PCSamplingEnvVar+"="+tier.EnvValue(),
 	)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	// Same release protocol as the stub: the workload's CPU stacks are

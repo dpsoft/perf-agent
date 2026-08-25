@@ -8,6 +8,7 @@
 #include "drain.h"
 #include "enroll.h"
 #include "kernelnames.h"
+#include "pctier.h"
 #include "sampler.h"
 #include "usdt_abi.h"
 #include "usdt_probe.h"
@@ -46,17 +47,28 @@ PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
 PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
 // The PC-sampling records, so the whole Tier B decode path -- PC samples, the
 // stall-reason map, the config record and every producer-side drop class --
-// can be driven on a machine with no GPU. Off unless PERFAGENT_STUB_PC_SAMPLES
-// asks for them, so the existing gates and probe_order_test see exactly the
-// wire they saw before.
+// can be driven on a machine with no GPU. Off unless PERFAGENT_GPU_PC_SAMPLING
+// selects a tier AND PERFAGENT_STUB_PC_SAMPLES asks for a count, so the
+// existing gates and probe_order_test see exactly the wire they saw before.
+//
+// The TIER gate is the outer one, and it is not decoration. The stub is the
+// producer the agent hands its selection to on a machine with no GPU, so "off
+// means off" is only assertable here if this producer honours the same setting
+// the CUPTI adapter does -- from the same parser, core/pctier.h.
+// stub/pc_tier_test.cc patches these four probe sites with int3 and requires
+// that with the tier off NOT ONE of them fires, while the launch and exec
+// probes still do (so the assertion cannot pass by the producer being inert).
 PERFAGENT_USDT_EMITTER(gpu_pc_sample_batch_v1, 40);
 PERFAGENT_USDT_EMITTER(gpu_stall_reason_map_v1, 136);
 PERFAGENT_USDT_EMITTER(gpu_config_v1, 24);
 PERFAGENT_USDT_EMITTER(gpu_dropped_v1, 16);
-// Tier A's disclosure. PERFAGENT_STUB_SAMPLING_WINDOWS=<n> synthesizes n
-// KERNEL_SERIALIZED bursts bracketing the executions this stub emits, so the
-// consumer's window -> execution intersection and all three gpu_serialized
-// values are reachable on a machine with no GPU.
+// Tier A's disclosure. With PERFAGENT_GPU_PC_SAMPLING=serialized,
+// PERFAGENT_STUB_SAMPLING_WINDOWS=<n> synthesizes n KERNEL_SERIALIZED bursts
+// bracketing the executions this stub emits, so the consumer's window ->
+// execution intersection and all three gpu_serialized values are reachable on
+// a machine with no GPU. In any other tier no window is emitted at all: a
+// window record is Tier A's own disclosure, and a producer that emitted one
+// while running CONTINUOUS would be claiming a perturbation it did not cause.
 PERFAGENT_USDT_EMITTER(gpu_sampling_window_v1, 24);
 
 // The synthetic stall table. Real names from GA102 rather than invented ones:
@@ -190,6 +202,31 @@ static unsigned stub_capture_modules(perfagent::CubinQueue &q) {
 // whatever process it's injected into.
 extern "C" __attribute__((visibility("default"))) void
 perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period) {
+    // The tier, read FIRST and from the same parser the CUPTI adapter uses
+    // (core/pctier.h), because everything PC-sampling below is gated on it and
+    // "off means off" is a claim about this producer as much as about that
+    // one. Any unreadable or non-exclusive setting falls closed to off and
+    // says so; it never picks a tier.
+    perfagent::PCSamplingTier tier = perfagent::PCSamplingTier::kOff;
+    {
+        const char *raw = getenv("PERFAGENT_GPU_PC_SAMPLING");
+        char bad[96];
+        switch (perfagent::pc_tier_parse(raw, &tier, bad, sizeof(bad))) {
+        case perfagent::PCTierParse::kOK:
+            break;
+        case perfagent::PCTierParse::kUnknown:
+            fprintf(stderr, "stub: PERFAGENT_GPU_PC_SAMPLING=\"%s\" names \"%s\", which is not "
+                            "a tier (off, continuous, serialized); PC SAMPLING IS OFF\n",
+                    raw ? raw : "", bad);
+            break;
+        case perfagent::PCTierParse::kNotExclusive:
+            fprintf(stderr, "stub: PERFAGENT_GPU_PC_SAMPLING=\"%s\" names MORE THAN ONE TIER; "
+                            "they are mutually exclusive and process-wide, so PC SAMPLING IS "
+                            "OFF. Name exactly one of off, continuous, serialized\n", bad);
+            break;
+        }
+    }
+
     // The #49 startup rendezvous, before the first launch and therefore
     // before the first probe: wait for the consumer to install this process's
     // CFI tables, so the kernel-side walk of every sampled launch has them.
@@ -236,7 +273,9 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     // hard-exit case, where every execution from that start_ns onward is
     // gpu_serialized="unknown" and must never read "false".
     const char *winenv = getenv("PERFAGENT_STUB_SAMPLING_WINDOWS");
-    const unsigned sampling_windows = (winenv && *winenv) ? (unsigned)atoi(winenv) : 0;
+    const unsigned sampling_windows =
+        (tier == perfagent::PCSamplingTier::kSerialized && winenv && *winenv)
+            ? (unsigned)atoi(winenv) : 0;
     const char *openenv = getenv("PERFAGENT_STUB_SAMPLING_WINDOW_OPEN");
     const bool leave_last_open = openenv && *openenv && atoi(openenv) != 0;
     uint64_t first_exec_ns = 0, last_exec_ns = 0;
@@ -246,11 +285,19 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     perfagent::CubinQueue cubins;
     const unsigned cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
 
-    // Tier B is off unless asked for, here as in the adapter. The count is the
-    // number of synthetic (PC, stall reason) records -- one record per pair,
-    // which is what the fixed-size ABI record forces.
+    // PC sampling is off unless a TIER asks for it, here as in the adapter.
+    // PERFAGENT_STUB_PC_SAMPLES then says how many synthetic (PC, stall
+    // reason) records to emit -- one record per pair, which is what the
+    // fixed-size ABI record forces.
+    //
+    // The tier is the OUTER gate and the stub knob the inner one. With the
+    // tier off this producer must make no PC-sampling call at all no matter
+    // what the stub knobs say, which is precisely the claim
+    // stub/pc_tier_test.cc asserts by trapping the probe sites.
     const char *pcenv = getenv("PERFAGENT_STUB_PC_SAMPLES");
-    const unsigned pc_samples = (pcenv && *pcenv) ? (unsigned)atoi(pcenv) : 0;
+    const unsigned pc_samples =
+        (tier != perfagent::PCSamplingTier::kOff && pcenv && *pcenv)
+            ? (unsigned)atoi(pcenv) : 0;
     perfagent::ReplayLog replay;
     replay.on_replay_stall([&](const gpu_stall_reason_map_v1 &r) {
         if (gpu_stall_reason_map_v1_enabled())
@@ -506,6 +553,12 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
             perfagent::enroll_result_name(enrolled),
             sem_at_enroll, gpu_launch_sampled_v1_semaphore_count(), enroll_name);
+    // Always, not only on the runs that sampled. "off" has to be readable in
+    // the output of a run that was off -- a line that appears only on the
+    // interesting runs is a line nobody checks on the boring ones, and the
+    // boring one is exactly where "off did not mean off" would hide.
+    fprintf(stderr, "stub: pc_sampling=%s pc_samples=%u sampling_windows=%u\n",
+            perfagent::pc_tier_name(tier), pc_samples, sampling_windows);
     if (sampling_windows)
         fprintf(stderr, "stub: sampling_windows=%u records=%lu last_open=%d "
                         "exec_span=[%llu,%llu]\n",

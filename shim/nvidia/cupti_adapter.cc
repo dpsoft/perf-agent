@@ -18,6 +18,7 @@
 #include "enroll.h"
 #include "kernelnames.h"
 #include "pcdrain.h"
+#include "pctier.h"
 #include "sampler.h"
 #include "usdt_abi.h"
 #include "usdt_probe.h"
@@ -356,18 +357,20 @@ unsigned env_uint(const char *name, unsigned dflt);
 // --------------------------------------------------------- PC sampling
 //
 // Two collection tiers, mutually exclusive, both OFF BY DEFAULT. Nothing
-// below runs, allocates or calls CUPTI unless PERFAGENT_GPU_PC_SAMPLING is
-// set, so merging either of them cannot degrade a profiler that is shipping
-// today.
+// below runs, allocates or calls CUPTI unless PERFAGENT_GPU_PC_SAMPLING names
+// a tier, so merging either of them cannot degrade a profiler that is shipping
+// today. OFF MEANS OFF: no PC buffer, no extra CUPTI domain, no cupti PC entry
+// point and no PC-sampling probe fire. See core/pctier.h for the parse and for
+// why naming both tiers is refused rather than resolved.
 //
-// Tier B --- PERFAGENT_GPU_PC_SAMPLING=1, CUPTI_PC_SAMPLING_COLLECTION_MODE_
-// CONTINUOUS. Kernels are NOT serialized in this mode, which is the only
+// Tier B --- PERFAGENT_GPU_PC_SAMPLING=continuous (1),
+// CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS. Kernels are NOT serialized in this mode, which is the only
 // reason it is a candidate for always-on profiling; the cost is that every PC
 // record's correlationId is zero, so a PC sample joins to a kernel through its
 // module and never to the launch that issued it.
 //
-// Tier A --- PERFAGENT_GPU_PC_SAMPLING=2, CUPTI_PC_SAMPLING_COLLECTION_MODE_
-// KERNEL_SERIALIZED with ENABLE_START_STOP_CONTROL, duty-cycled by
+// Tier A --- PERFAGENT_GPU_PC_SAMPLING=serialized (2),
+// CUPTI_PC_SAMPLING_COLLECTION_MODE_KERNEL_SERIALIZED with ENABLE_START_STOP_CONTROL, duty-cycled by
 // core/burst.h. CUPTI populates correlationId on every PC record here, so a
 // sample joins to a launch --- and therefore to a CPU stack --- exactly. The
 // price is that every kernel that runs while a burst is open runs SERIALIZED,
@@ -442,11 +445,17 @@ constexpr size_t kPCDefaultCollectNumPcs = 2048;
 // else's process; hitting the bound is counted rather than retried forever.
 constexpr unsigned kPCMaxDrainRounds = 64;
 
-bool g_pc_enabled = false;                // PERFAGENT_GPU_PC_SAMPLING != 0
-// Tier A. Set from the SAME variable as g_pc_enabled (value 2), so the two
-// tiers are mutually exclusive by construction rather than by a check that
-// can be forgotten --- which is what Task 11's tier selection wants anyway.
-bool g_pc_tier_a = false;
+// The selected tier, and the two booleans derived from it. All three come
+// from ONE parse of ONE variable (core/pctier.h), so the tiers are mutually
+// exclusive by construction rather than by a check that can be forgotten.
+perfagent::PCSamplingTier g_pc_tier = perfagent::PCSamplingTier::kOff;
+bool g_pc_enabled = false;                // g_pc_tier != kOff
+bool g_pc_tier_a = false;                 // g_pc_tier == kSerialized
+// A setting that named no tier we know, or named two. Counted rather than only
+// logged: a startup log line in somebody else's process is routinely swallowed
+// by whatever captures its stderr, and "PC sampling produced nothing" and "PC
+// sampling was refused at startup" must not look the same in the report.
+std::atomic<uint64_t> g_pc_tier_refused{0};
 uint32_t g_pc_period = 0;                 // the exponent actually in force
 size_t g_pc_collect_num_pcs = kPCDefaultCollectNumPcs;
 size_t g_pc_scratch_bytes = 0;            // 0 = CUPTI's default
@@ -1514,7 +1523,9 @@ void report(const char *why) {
          (unsigned long long)g_exec_from_graph.load(),
          (unsigned long long)g_multi_device.load(), g_devices_seen.size());
     if (!g_pc_enabled) {
-        logf("perfagent-cupti: pc_sampling=off (set PERFAGENT_GPU_PC_SAMPLING=1)\n");
+        logf("perfagent-cupti: pc_sampling=off tier_refused=%llu "
+             "(set PERFAGENT_GPU_PC_SAMPLING=continuous or =serialized)\n",
+             (unsigned long long)g_pc_tier_refused.load());
         return;
     }
     // Every drop class and every context-enable failure has a counter here,
@@ -1543,7 +1554,7 @@ void report(const char *why) {
              (unsigned long long)g_tier_a_graph_refused.load(),
              g_burst && g_burst->sampling() ? 1 : 0);
     }
-    logf("perfagent-cupti: pc %s period=%u(=%u cycles) stall_reasons=%zu "
+    logf("perfagent-cupti: pc %s tier=%s period=%u(=%u cycles) stall_reasons=%zu "
          "ctx_seen=%llu ctx_enabled=%llu ctx_enable_failed=%llu "
          "ctx_destroyed=%llu ctx_disable_failed=%llu "
          "pc_records=%llu pcs=%llu pc_batch_dropped=%llu pc_unattached=%llu "
@@ -1556,7 +1567,7 @@ void report(const char *why) {
          "graph_execs=%llu multi_device=%llu finalize_seen=%llu "
          "finalize_contended=%llu "
          "config_emitted=%llu config_no_device=%llu sm_count=%u clock_hz=%llu\n",
-         why, g_pc_period,
+         why, perfagent::pc_tier_name(g_pc_tier), g_pc_period,
          (g_pc_period >= kPCPeriodMin && g_pc_period <= kPCPeriodMax) ? (1u << g_pc_period) : 0u,
          g_num_stall_reasons,
          (unsigned long long)g_ctx_seen.load(),
@@ -1832,27 +1843,45 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
 
     g_replay = new perfagent::ReplayLog();
 
-    // Tier B. OFF unless asked for, and read before cuptiSubscribe so the
+    // The tier. OFF unless asked for, and read before cuptiSubscribe so the
     // RESOURCE callback cannot reach a half-initialized PC path.
     //
-    // Tier A (KERNEL_SERIALIZED) is a separate task and is not reachable from
-    // here; tier selection is another. This flag is the whole of the switch
-    // for now, and its default is what keeps a merge from changing what a
-    // shipping profiler does.
-    // 0/unset = off, 1 = Tier B (CONTINUOUS), 2 = Tier A (KERNEL_SERIALIZED,
-    // duty-cycled). One variable, so the two tiers cannot both be selected --
-    // they configure the same per-context CUPTI attribute and "both" would
-    // produce a profile whose attribution quality varied by an axis the
-    // operator cannot see. Task 11 replaces this with a named setting and a
-    // CLI flag; the exclusivity is already structural here.
-    const unsigned pc_mode = env_uint("PERFAGENT_GPU_PC_SAMPLING", 0);
-    g_pc_enabled = pc_mode != 0;
-    g_pc_tier_a = pc_mode == 2;
-    if (pc_mode > 2) {
-        logf("perfagent-cupti: PERFAGENT_GPU_PC_SAMPLING=%u is not a tier "
-             "(1=continuous, 2=serialized); treating it as 1\n", pc_mode);
-        g_pc_tier_a = false;
+    // off | continuous | serialized (0 | 1 | 2), one variable, so the two
+    // tiers cannot both be selected: they configure the same per-CUcontext
+    // COLLECTION_MODE attribute, and "both" would produce a profile whose
+    // attribution quality varied along an axis the operator can neither see
+    // nor control. See core/pctier.h; the agent's half is gpu/tier.go.
+    //
+    // Every refusal below falls CLOSED to off and says so at length. It never
+    // picks a tier: an unreadable setting resolved to "the cheaper one" is a
+    // decision the operator did not make and cannot see in the output.
+    {
+        const char *raw = getenv("PERFAGENT_GPU_PC_SAMPLING");
+        char bad[96];
+        switch (perfagent::pc_tier_parse(raw, &g_pc_tier, bad, sizeof(bad))) {
+        case perfagent::PCTierParse::kOK:
+            break;
+        case perfagent::PCTierParse::kUnknown:
+            g_pc_tier_refused.fetch_add(1, std::memory_order_relaxed);
+            logf("perfagent-cupti: PERFAGENT_GPU_PC_SAMPLING=\"%s\" names \"%s\", which is "
+                 "not a tier. The three values are off, continuous and serialized (0, 1, 2). "
+                 "PC SAMPLING IS OFF for this process -- a setting that cannot be read is not "
+                 "resolved to a guess.\n", raw ? raw : "", bad);
+            break;
+        case perfagent::PCTierParse::kNotExclusive:
+            g_pc_tier_refused.fetch_add(1, std::memory_order_relaxed);
+            logf("perfagent-cupti: PERFAGENT_GPU_PC_SAMPLING=\"%s\" names MORE THAN ONE TIER. "
+                 "They are mutually exclusive and the selection is process-wide: "
+                 "COLLECTION_MODE is a single per-CUcontext CUPTI attribute, and which context "
+                 "a kernel lands on is the application's choice rather than the profiler's, so "
+                 "\"both\" would produce one profile whose attribution quality varied along an "
+                 "axis the operator can neither see nor control. PC SAMPLING IS OFF for this "
+                 "process; name exactly one of off, continuous, serialized.\n", bad);
+            break;
+        }
     }
+    g_pc_enabled = g_pc_tier != perfagent::PCSamplingTier::kOff;
+    g_pc_tier_a = g_pc_tier == perfagent::PCSamplingTier::kSerialized;
     if (g_pc_enabled) {
         // 0 = leave CUPTI's own SM-count-derived default, which is then read
         // back so gpu_config_v1 reports the real period. Anything outside

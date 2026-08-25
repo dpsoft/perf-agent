@@ -163,6 +163,18 @@ type Snapshot struct {
 	PCJoin PCJoinStats `json:"pc_join,omitempty"`
 	// ---- The serialization disclosure (Tier A).
 
+	// PCSampling is the tier this Timeline was configured with, carried on
+	// the Snapshot so every reader of one — JoinHealth, a serialized
+	// artifact, a test — can tell which of the three regimes below applies
+	// without being told separately.
+	//
+	// It is the DIFFERENCE between "Tier A was asked for and no window
+	// arrived" (every execution "unknown") and "Tier A was never asked for"
+	// (every execution "false"), which is why it rides here rather than being
+	// inferred from SamplingWindowsReceived: a Tier A run that received no
+	// window at all is exactly the case an inference would get backwards.
+	PCSampling PCSamplingTier `json:"pc_sampling,omitempty"`
+
 	// SamplingWindowsReceived is the CUMULATIVE number of PC-sampling burst
 	// records accepted into the disclosure store, and SamplingWindowsHeld /
 	// SamplingWindowsOpen are gauges of what it holds right now. A burst
@@ -288,22 +300,27 @@ type TimelineConfig struct {
 	// against. It is NOT silently skipped, which would make a missing store
 	// look identical to a healthy run with no PC samples.
 	Modules *ModuleStore
-	// SerializedSampling says that KERNEL_SERIALIZED PC sampling (Tier A) was
-	// SELECTED for this run. It is the agent's own configuration, not
-	// something inferred from the wire, and that is the point: "Tier A was
-	// asked for and no window arrived" and "Tier A was never asked for" are
-	// different facts with different answers, and only the agent knows which
-	// one holds.
+	// PCSampling is the GPU PC-sampling tier SELECTED for this run — the one
+	// setting, with its three values, that gpu/tier.go defines. It is the
+	// agent's own configuration, not something inferred from the wire, and
+	// that is the point: "Tier A was asked for and no window arrived" and
+	// "Tier A was never asked for" are different facts with different
+	// answers, and only the agent knows which one holds.
 	//
-	// FALSE (the default) means every execution is gpu_serialized="false",
-	// unconditionally and correctly — with sampling off or in continuous
-	// collection nothing is ever serialized, so there is nothing to be unsure
-	// about.
+	// PCSamplingOff (the zero value) and PCSamplingContinuous both mean every
+	// execution is gpu_serialized="false", unconditionally and correctly —
+	// with sampling off or in continuous collection nothing is ever
+	// serialized, so there is nothing to be unsure about.
 	//
-	// TRUE routes every execution through the window store, where the answer
-	// is "true", "false" or "unknown" depending on the evidence. Task 11 owns
-	// the setting that flips this; nothing here selects a tier.
-	SerializedSampling bool
+	// PCSamplingSerialized routes every execution through the window store,
+	// where the answer is "true", "false" or "unknown" depending on the
+	// evidence, and makes JoinHealth carry the standing perturbation warning
+	// for the whole run (PCSamplingStandingWarning).
+	//
+	// One field, not a tier plus a bool: two fields that can disagree about
+	// which tier is running is exactly how a profile ends up disclosing one
+	// thing and doing another.
+	PCSampling PCSamplingTier
 
 	// MaxSamplingWindowsPerPID and MaxSamplingWindowPIDs bound the disclosure
 	// store. Zero means defaultMaxSamplingWindowsPerPID /
@@ -512,12 +529,13 @@ type Timeline struct {
 	// drains on a timer — so classifying at ingest would mark a burst's own
 	// executions "unknown" for the very reason the window exists.
 	//
-	// serializedSampling is TimelineConfig.SerializedSampling, copied out at
-	// construction. When it is false this store is never consulted and every
-	// execution is "false", which is unconditionally correct in that
-	// configuration.
-	windows            *windowStore
-	serializedSampling bool
+	// pcSampling is TimelineConfig.PCSampling, copied out at construction.
+	// Unless it is PCSamplingSerialized this store is never consulted and
+	// every execution is "false", which is unconditionally correct in the
+	// other two tiers. It also rides out on the Snapshot, so JoinHealth can
+	// stand its Tier A warning up on every render without a second channel.
+	windows    *windowStore
+	pcSampling PCSamplingTier
 
 	dropped TimelineDropStats
 }
@@ -658,18 +676,18 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 
 		devicesByPID: make(map[uint32]processDevices),
 
-		windows:            newWindowStore(cfg.MaxSamplingWindowsPerPID, cfg.MaxSamplingWindowPIDs),
-		serializedSampling: cfg.SerializedSampling,
+		windows:    newWindowStore(cfg.MaxSamplingWindowsPerPID, cfg.MaxSamplingWindowPIDs),
+		pcSampling: cfg.PCSampling,
 	}
 }
 
 // EmitSamplingWindow records one PC-sampling burst.
 //
-// It is accepted in EVERY configuration, not only when SerializedSampling is
-// set. A producer that is emitting windows is a producer that is bursting, and
-// dropping the evidence because the agent's own config disagrees would leave
-// the two ends silently out of step. What SerializedSampling gates is the
-// ANSWER, not the ingest.
+// It is accepted in EVERY tier, not only in PCSamplingSerialized. A producer
+// that is emitting windows is a producer that is bursting, and dropping the
+// evidence because the agent's own config disagrees would leave the two ends
+// silently out of step. What TimelineConfig.PCSampling gates is the ANSWER,
+// not the ingest.
 func (t *Timeline) EmitSamplingWindow(w GPUSamplingWindow) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1268,11 +1286,11 @@ func (t *Timeline) Snapshot() Snapshot {
 	// that have not arrived yet, and the next snapshot needs it), so the
 	// alternative would be to clone every burst on every call.
 	//
-	// serializedSampling FALSE takes the constant branch. With PC sampling off
-	// or in continuous collection nothing is ever serialized, so "false" is
-	// correct and unconditional and no store is consulted at all.
+	// Any tier but PCSamplingSerialized takes the constant branch. With PC
+	// sampling off or in continuous collection nothing is ever serialized, so
+	// "false" is correct and unconditional and no store is consulted at all.
 	serialization := make([]SerializationState, len(execs))
-	if t.serializedSampling {
+	if t.pcSampling == PCSamplingSerialized {
 		for i, exec := range execs {
 			serialization[i] = t.windows.classify(exec.Correlation.PID, exec.StartNs, exec.EndNs)
 		}
@@ -1283,6 +1301,7 @@ func (t *Timeline) Snapshot() Snapshot {
 	}
 	windowsReceived := t.windows.received
 	windowsHeld, windowsOpen := t.windows.windows()
+	pcSampling := t.pcSampling
 	t.mu.Unlock()
 
 	// The heuristic's candidate set is built lazily - only once the loop
@@ -1471,6 +1490,8 @@ func (t *Timeline) Snapshot() Snapshot {
 		PendingModuleSamples: int(pendingModuleSamples),
 		PendingModuleGroups:  pendingModuleGroups,
 		PCJoin:               pcJoin.stats,
+
+		PCSampling: pcSampling,
 
 		SamplingWindowsReceived: windowsReceived,
 		SamplingWindowsHeld:     windowsHeld,

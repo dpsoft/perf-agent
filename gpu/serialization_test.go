@@ -21,7 +21,7 @@ import (
 const tierAPID = uint32(4242)
 
 func tierATimeline() *Timeline {
-	return NewTimeline(TimelineConfig{SerializedSampling: true})
+	return NewTimeline(TimelineConfig{PCSampling: PCSamplingSerialized})
 }
 
 // serializedExec is an execution from tierAPID over [startNs, endNs]. The PID
@@ -357,7 +357,7 @@ func TestSerializationWindowsNeverCrossProcesses(t *testing.T) {
 // That can only turn "false" into "unknown" — never the reverse — and this
 // asserts the direction rather than trusting the comment.
 func TestSerializationEvictionDegradesTowardsUnknownNeverTowardsFalse(t *testing.T) {
-	tl := NewTimeline(TimelineConfig{SerializedSampling: true, MaxSamplingWindowsPerPID: 4})
+	tl := NewTimeline(TimelineConfig{PCSampling: PCSamplingSerialized, MaxSamplingWindowsPerPID: 4})
 	// The gap between bursts 1 and 2 is provable while both are held.
 	emitBurst(t, tl, uint64(tierAPID), 1000, 2000)
 	emitBurst(t, tl, uint64(tierAPID), 3000, 4000)
@@ -382,7 +382,7 @@ func TestSerializationEvictionDegradesTowardsUnknownNeverTowardsFalse(t *testing
 // A process past the PID bound gets no window history, so its executions read
 // "unknown". It must not inherit somebody else's.
 func TestSerializationRefusedPIDReadsUnknown(t *testing.T) {
-	tl := NewTimeline(TimelineConfig{SerializedSampling: true, MaxSamplingWindowPIDs: 1})
+	tl := NewTimeline(TimelineConfig{PCSampling: PCSamplingSerialized, MaxSamplingWindowPIDs: 1})
 	emitBurst(t, tl, 1, 1000, 2000)
 	emitBurst(t, tl, 2, 1000, 2000) // refused: the store already holds one PID
 

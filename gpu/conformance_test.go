@@ -307,7 +307,7 @@ func assertPCAttribAccompaniesSamples(t *testing.T, snap Snapshot) {
 // three outcomes, so they sum to len(snap.Executions).
 //
 // It also asserts the negative that matters more than the sum: with the
-// default harness configuration (SerializedSampling unset — nothing is ever
+// default harness configuration (PCSampling off — nothing is ever
 // serialized) NO execution may read "true" or "unknown". A conformance run
 // that started reporting perturbation nobody caused would be as wrong as one
 // that stopped reporting perturbation that happened.

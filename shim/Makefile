@@ -213,6 +213,14 @@ check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
 	[ $$rc -eq 0 ] && echo "check-cubin-defer: OK - the compliant capture compiles, all 5 deferrals do not"; \
 	exit $$rc
 
+# stub/pc_tier_test.cc is the "off means off" assertion, and it is built the
+# same way probe_order_test is and for the same reason: it drives the real
+# producer (stub/stub.cc with PERFAGENT_STUB_NO_MAIN) and reads its probe fires
+# by patching the nops with int3, so it has to be the optimized build the gate
+# runs. It asserts NEGATIVELY -- with the tier off, not one of the four
+# PC-sampling probes may fire -- with the launch and exec probes trapped as
+# controls so an inert producer cannot make it pass.
+#
 # core/probe_args_test.cc and stub/probe_order_test.cc are the two tests here
 # built with -O2, and that is not a detail. probe_args_test checks that the
 # record a probe points at has actually been written to memory when the probe
@@ -228,12 +236,13 @@ check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/stub.cc $(CORE_SRC)
+test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/pctier_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/pcdrain_test core/pcdrain_test.cc && /tmp/pcdrain_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/burst_test core/burst_test.cc && /tmp/burst_test
+	$(CXX) -std=c++17 -Wall -Werror -I core -o /tmp/pctier_test core/pctier_test.cc && /tmp/pctier_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/enroll_test core/enroll_test.cc core/enroll.cc && /tmp/enroll_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubin_test core/cubin_test.cc core/cubin.cc core/enroll.cc && /tmp/cubin_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubinqueue_test core/cubinqueue_test.cc core/cubinqueue.cc && /tmp/cubinqueue_test
@@ -242,6 +251,8 @@ test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc
 	$(CXX) -std=c++17 -O2 -Wall -Werror -I core -o /tmp/probe_args_test core/probe_args_test.cc && /tmp/probe_args_test
 	$(CXX) -std=c++17 -O2 -Wall -Werror -pthread -I core -DPERFAGENT_STUB_NO_MAIN \
 		-o /tmp/probe_order_test stub/probe_order_test.cc stub/stub.cc $(CORE_SRC) && /tmp/probe_order_test
+	$(CXX) -std=c++17 -O2 -Wall -Werror -pthread -I core -DPERFAGENT_STUB_NO_MAIN \
+		-o /tmp/pc_tier_test stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC) && /tmp/pc_tier_test
 
 # Not a prerequisite of `test`: a TSan build is ~10x slower and `test` is the
 # fast path. batch_test.cc's concurrent case asserts emitted + dropped == kAdds,

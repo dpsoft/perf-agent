@@ -107,6 +107,55 @@ struct gpu_kernel_name_v1 {
     char     name[GPU_KERNEL_NAME_MAX];
 };
 
+// Longest stall-reason name carried inline, mirroring CUPTI's
+// CUPTI_STALL_REASON_STRING_SIZE. GA102 reports 38 reasons whose names are
+// far shorter, so truncation is not expected here — but name_len is
+// authoritative and `truncated` is flagged per record rather than hidden,
+// exactly as gpu_kernel_name_v1 does it.
+#define GPU_STALL_NAME_MAX 128
+
+// index -> name for the device's stall reasons. One-shot, emitted when
+// sampling is first enabled and replayed on late attach, so a consumer that
+// attaches mid-run still learns the table. The index is the vendor's own and
+// is NOT stable across devices or driver versions, which is precisely why it
+// must never escape into a label value un-resolved: the name is the only
+// portable identity a stall reason has.
+//
+// Fixed-size by the ABI's rules (spec §6.3): the wire record does not shrink
+// to fit a short name.
+struct gpu_stall_reason_map_v1 {
+    uint32_t index;
+    uint16_t name_len;
+    uint8_t  truncated;
+    uint8_t  _pad;
+    char     name[GPU_STALL_NAME_MAX];
+};
+
+// mode values for gpu_sampling_window_v1. They mirror the two collection
+// tiers and are part of the wire contract, not an internal enum.
+#define GPU_SAMPLING_MODE_CONTINUOUS        1
+#define GPU_SAMPLING_MODE_KERNEL_SERIALIZED 2
+
+// One PC-sampling burst: the interval over which PC sampling was enabled.
+//
+// This is Tier A's disclosure mechanism. In KERNEL_SERIALIZED mode kernels
+// serialize while sampling is on, so every execution overlapping a window is
+// perturbed and the profile must be able to say so rather than presenting a
+// perturbed duration as an ordinary one.
+//
+// end_ns == 0 means the window was still OPEN when the producer stopped
+// reporting — a hard exit mid-burst. It is not "zero length" and must never
+// be read as one: an execution at or after such a window's start_ns is
+// "unknown", never "not serialized". The ordinary teardown path closes the
+// window with the exit timestamp, so a zero here is specifically the hard
+// case.
+struct gpu_sampling_window_v1 {
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint8_t  mode;
+    uint8_t  _pad[7];
+};
+
 GPU_STATIC_ASSERT(sizeof(struct gpu_launch_v1) == 48, "gpu_launch_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_exec_v1) == 48, "gpu_exec_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_module_load_v1) == 40, "gpu_module_load_v1 layout");
@@ -118,5 +167,37 @@ GPU_STATIC_ASSERT(offsetof(struct gpu_module_load_v1, cubin_crc) == 0, "cubin_cr
 GPU_STATIC_ASSERT(sizeof(struct gpu_launch_sampled_v1) == 56, "gpu_launch_sampled_v1 layout");
 GPU_STATIC_ASSERT(sizeof(struct gpu_kernel_name_v1) == 272, "gpu_kernel_name_v1 layout");
 GPU_STATIC_ASSERT(offsetof(struct gpu_launch_sampled_v1, sample_period) == 44, "sample_period position");
+
+// The two probes added for PC sampling. Sizes AND offsets are asserted: a
+// field that moved while the size held would decode as garbage at every
+// consumer without any of them erroring, which is the failure mode the
+// hard-coded offsets in internal/gpuabi make possible.
+GPU_STATIC_ASSERT(sizeof(struct gpu_stall_reason_map_v1) == 136, "gpu_stall_reason_map_v1 layout");
+GPU_STATIC_ASSERT(offsetof(struct gpu_stall_reason_map_v1, index) == 0, "stall map index leads");
+GPU_STATIC_ASSERT(offsetof(struct gpu_stall_reason_map_v1, name_len) == 4, "stall map name_len position");
+GPU_STATIC_ASSERT(offsetof(struct gpu_stall_reason_map_v1, truncated) == 6, "stall map truncated position");
+GPU_STATIC_ASSERT(offsetof(struct gpu_stall_reason_map_v1, name) == 8, "stall map name position");
+GPU_STATIC_ASSERT(sizeof(((struct gpu_stall_reason_map_v1 *)0)->name) == GPU_STALL_NAME_MAX,
+                  "stall map name is a fixed GPU_STALL_NAME_MAX buffer");
+
+GPU_STATIC_ASSERT(sizeof(struct gpu_sampling_window_v1) == 24, "gpu_sampling_window_v1 layout");
+GPU_STATIC_ASSERT(offsetof(struct gpu_sampling_window_v1, start_ns) == 0, "sampling window start_ns leads");
+GPU_STATIC_ASSERT(offsetof(struct gpu_sampling_window_v1, end_ns) == 8, "sampling window end_ns position");
+GPU_STATIC_ASSERT(offsetof(struct gpu_sampling_window_v1, mode) == 16, "sampling window mode position");
+
+// gpu_config_v1 has been in this header since Phase 3 with no consumer. Its
+// offsets are pinned here for the first time now that internal/gpuabi decodes
+// it by hard-coded offset.
+GPU_STATIC_ASSERT(offsetof(struct gpu_config_v1, clock_hz) == 0, "config clock_hz leads");
+GPU_STATIC_ASSERT(offsetof(struct gpu_config_v1, sampling_factor) == 8, "config sampling_factor position");
+GPU_STATIC_ASSERT(offsetof(struct gpu_config_v1, sm_count) == 12, "config sm_count position");
+GPU_STATIC_ASSERT(offsetof(struct gpu_config_v1, vendor) == 16, "config vendor position");
+
+// Neither new record may exceed the largest record the BPF consumer sizes its
+// reservation against. 136 <= 272, so MAX_RECORD_BYTES is unchanged and
+// bpf/gpu_usdt.bpf.c's _Static_assert(MAX_RECORD_BYTES <= PAYLOAD_BYTES) still
+// holds untouched.
+GPU_STATIC_ASSERT(sizeof(struct gpu_stall_reason_map_v1) <= sizeof(struct gpu_kernel_name_v1),
+                  "a record larger than gpu_kernel_name_v1 would raise MAX_RECORD_BYTES in bpf/gpu_usdt.bpf.c");
 
 #endif

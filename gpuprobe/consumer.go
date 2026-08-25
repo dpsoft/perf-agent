@@ -42,16 +42,29 @@ import (
 )
 
 const (
-	kindLaunch        = 1
-	kindExec          = 2
-	kindModule        = 3
-	kindPC            = 4
-	kindLaunchSampled = 5
-	kindKernelName    = 6
+	kindLaunch         = 1
+	kindExec           = 2
+	kindModule         = 3
+	kindPC             = 4
+	kindLaunchSampled  = 5
+	kindKernelName     = 6
+	kindStallMap       = 7
+	kindSamplingWindow = 8
+	kindConfig         = 9
 
 	// kindMax mirrors KIND_MAX in bpf/gpu_usdt.bpf.c: the number of slots in
 	// the BPF-side `dropped` and `stacks_missing` arrays.
-	kindMax = 8
+	//
+	// It is larger than the highest kind on purpose. Resizing those arrays is
+	// a map-layout change on both sides at once, so it is done once with
+	// headroom rather than on every probe added. The pair is NOT free to
+	// drift: a Go value larger than the C one reads slots the map does not
+	// have and every lookup fails silently, so a drop storm reports zero
+	// drops; a Go value smaller never reads the top kinds at all, with the
+	// same symptom. Neither end errors. TestKindMaxPinsTheBPFDropAccountingArrays
+	// pins this against the embedded object, which is the only artefact that
+	// can settle the question.
+	kindMax = 16
 
 	// maxWalkFrames mirrors MAX_FRAMES in bpf/unwind_common.h: the walker's
 	// bpf_loop bound, and therefore the length of a struct gpu_stack's pcs
@@ -212,6 +225,12 @@ func cookieFor(probeName string) uint64 {
 		return kindLaunchSampled
 	case "gpu_kernel_name_v1":
 		return kindKernelName
+	case "gpu_stall_reason_map_v1":
+		return kindStallMap
+	case "gpu_sampling_window_v1":
+		return kindSamplingWindow
+	case "gpu_config_v1":
+		return kindConfig
 	}
 	return 0
 }
@@ -1270,6 +1289,12 @@ type batch struct {
 	Execs           []gpuabi.Exec
 	SampledLaunches []gpuabi.LaunchSampled
 	KernelNames     []gpuabi.KernelName
+	// Decoded here, normalized in a later phase. Until applyBatch grows arms
+	// for these kinds they still land in its default: case and are counted as
+	// Stats.Undecoded, so nothing about them is silent in the meantime.
+	StallReasons    []gpuabi.StallReason
+	SamplingWindows []gpuabi.SamplingWindow
+	Configs         []gpuabi.Config
 }
 
 func decodeBatch(b []byte) (batch, error) {
@@ -1347,6 +1372,42 @@ func decodeBatch(b []byte) (batch, error) {
 				return batch{}, err
 			}
 			out.KernelNames = append(out.KernelNames, rec)
+		}
+	case kindStallMap:
+		if count > len(payload)/gpuabi.SizeStallReason {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.StallReasons = make([]gpuabi.StallReason, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeStallReason(payload[i*gpuabi.SizeStallReason:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.StallReasons = append(out.StallReasons, rec)
+		}
+	case kindSamplingWindow:
+		if count > len(payload)/gpuabi.SizeSamplingWindow {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.SamplingWindows = make([]gpuabi.SamplingWindow, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeSamplingWindow(payload[i*gpuabi.SizeSamplingWindow:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.SamplingWindows = append(out.SamplingWindows, rec)
+		}
+	case kindConfig:
+		if count > len(payload)/gpuabi.SizeConfig {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.Configs = make([]gpuabi.Config, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeConfig(payload[i*gpuabi.SizeConfig:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.Configs = append(out.Configs, rec)
 		}
 	}
 	return out, nil

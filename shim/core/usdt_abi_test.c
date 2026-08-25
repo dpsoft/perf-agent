@@ -100,11 +100,39 @@ static void config(void)
     CHECK(b[16] == 1);
 }
 
+// gpu_dropped_v1 is the record every producer-side loss rides on, and Task 6
+// gave it its first classes. The byte positions matter as much as the values:
+// internal/gpuabi.DecodeDropped reads count at 0 and klass at 8 by hard-coded
+// offset, so a klass that moved would decode as part of the count and a drop
+// storm would read as a plausible-looking number under class 0.
+static void dropped(void)
+{
+    struct gpu_dropped_v1 d;
+    memset(&d, 0, sizeof(d));
+    d.count = 0x1122334455667788ull;
+    d.klass = GPU_DROP_CLASS_PC_NON_USER_KERNEL;
+
+    const unsigned char *b = (const unsigned char *)&d;
+    CHECK(sizeof(d) == 16);
+    CHECK(rd64(b + 0) == 0x1122334455667788ull);
+    CHECK(b[8] == 3);
+
+    // Wire constants: append only. A renumber silently refiles every past
+    // profile's losses under the wrong heading.
+    CHECK(GPU_DROP_CLASS_INVALID == 0);
+    CHECK(GPU_DROP_CLASS_PC_DROPPED_HW == 1);
+    CHECK(GPU_DROP_CLASS_PC_BUFFER_FULL == 2);
+    CHECK(GPU_DROP_CLASS_PC_NON_USER_KERNEL == 3);
+    CHECK(GPU_DROP_CLASS_GRAPH_EXEC == 4);
+    CHECK(GPU_DROP_CLASS_MAX == 4);
+}
+
 int main(void)
 {
     stall_reason_map();
     sampling_window();
     config();
+    dropped();
     if (failures) {
         fprintf(stderr, "usdt_abi_test: %d failure(s)\n", failures);
         return 1;

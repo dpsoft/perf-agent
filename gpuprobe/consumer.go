@@ -54,6 +54,12 @@ const (
 	kindStallMap       = 7
 	kindSamplingWindow = 8
 	kindConfig         = 9
+	// kindDropped carries producer-side loss by class. The probe has existed
+	// in the ABI header since Phase 3 with no kind and no cookie, so it was
+	// never attached and never fired; without it every drop class the shim
+	// could define would be a counter that could not go non-zero, which is
+	// the failure mode this project has hit twelve times.
+	kindDropped = 10
 
 	// kindMax mirrors KIND_MAX in bpf/gpu_usdt.bpf.c: the number of slots in
 	// the BPF-side `dropped` and `stacks_missing` arrays.
@@ -234,6 +240,8 @@ func cookieFor(probeName string) uint64 {
 		return kindSamplingWindow
 	case "gpu_config_v1":
 		return kindConfig
+	case "gpu_dropped_v1":
+		return kindDropped
 	}
 	return 0
 }
@@ -399,17 +407,20 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize. Nothing the ABI defines is in that class any
-	// more: launches, executions, sampled launches, kernel names, module
-	// loads, PC samples, the stall-reason map, sampling windows and the
-	// config record all have an applyBatch arm. What is left is a kind the
-	// producer invented, or a KIND_* added on one side of the wire and not
-	// the other - both of which are silent loss unless counted, which is
-	// why the counter stays after its original population emptied.
+	// does not yet normalize. Launches, executions, sampled launches, kernel
+	// names, module loads, PC samples, the stall-reason map, sampling windows
+	// and the config record all have an applyBatch arm. gpu_dropped_v1
+	// (kindDropped) is the one kind the ABI defines that is still in the
+	// original class: it is decoded into batch.Drops and carried, and
+	// normalizing a drop class into an operator-visible number is the
+	// consumer task that follows this one. Everything else that reaches here
+	// is a kind the producer invented, or a KIND_* added on one side of the
+	// wire and not the other - both of which are silent loss unless counted.
 	//
-	// Healthy: zero, and gate_test.go asserts it. Worst: equal to the
-	// record count of every batch of some kind the consumer cannot read,
-	// which is the ABI having drifted.
+	// Healthy: zero, and gate_test.go asserts it - the gate runs the stub
+	// without PERFAGENT_STUB_PC_SAMPLES, so no dropped batch is fired.
+	// Worst: equal to the record count of every batch of some kind the
+	// consumer cannot read, which is the ABI having drifted.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
@@ -1601,6 +1612,14 @@ type batch struct {
 	StallReasons    []gpuabi.StallReason
 	SamplingWindows []gpuabi.SamplingWindow
 	Configs         []gpuabi.Config
+	// Drops are decoded here and normalized in a later phase. The wire path
+	// had to exist before the shim could emit a drop class at all -- without
+	// it every class Tier B defines would be a counter that could not go
+	// non-zero -- but turning a class into an operator-visible number is the
+	// consumer task, not the producer one. Until that arm exists a dropped
+	// batch lands in applyBatch's default: case and is counted as
+	// Stats.Undecoded, so nothing about it is silent in the meantime.
+	Drops []gpuabi.Dropped
 }
 
 func decodeBatch(b []byte) (batch, error) {
@@ -1738,6 +1757,18 @@ func decodeBatch(b []byte) (batch, error) {
 				return batch{}, err
 			}
 			out.Configs = append(out.Configs, rec)
+		}
+	case kindDropped:
+		if count > len(payload)/gpuabi.SizeDropped {
+			return batch{}, gpuabi.ErrShortRecord
+		}
+		out.Drops = make([]gpuabi.Dropped, 0, count)
+		for i := 0; i < count; i++ {
+			rec, err := gpuabi.DecodeDropped(payload[i*gpuabi.SizeDropped:])
+			if err != nil {
+				return batch{}, err
+			}
+			out.Drops = append(out.Drops, rec)
 		}
 	}
 	return out, nil
@@ -1955,9 +1986,10 @@ func (c *Consumer) applyBatch(b batch) {
 			c.noteConfigLocked(cfg)
 		}
 	default:
-		// Carried on the wire, not normalized. Counted, never silent. No
-		// kind the ABI defines reaches here any more; see Stats.Undecoded
-		// for what it means when one does.
+		// Carried on the wire, not normalized. Counted, never silent.
+		// kindDropped is the only kind the ABI defines that still reaches
+		// here; see Stats.Undecoded for that, and for what it means when
+		// any other kind does.
 		c.stats.Undecoded += uint64(b.RawCount)
 	}
 }

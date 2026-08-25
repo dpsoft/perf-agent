@@ -32,7 +32,7 @@ import (
 func TestShimBatchSizeFitsKernelCap(t *testing.T) {
 	bpfCap := readDefine(t, "../bpf/gpu_usdt.bpf.c", "MAX_RECORDS_PER_BATCH")
 
-	for _, probe := range []string{"gpu_launch_v1", "gpu_exec_v1"} {
+	for _, probe := range []string{"gpu_launch_v1", "gpu_exec_v1", "gpu_pc_sample_batch_v1"} {
 		shimBatch := readBatchTemplateArg(t, "../shim/stub/stub.cc", probe)
 		require.LessOrEqualf(t, shimBatch, bpfCap,
 			"shim batches %s at %d records, but bpf/gpu_usdt.bpf.c caps MAX_RECORDS_PER_BATCH at %d; "+
@@ -100,6 +100,7 @@ func TestPerKindBatchCapsFitOneReservation(t *testing.T) {
 		"REC_LAUNCH", "REC_EXEC", "REC_MODULE", "REC_PC",
 		"REC_LAUNCH_SAMPLED", "REC_KERNEL_NAME",
 		"REC_STALL_MAP", "REC_SAMPLING_WINDOW", "REC_CONFIG",
+		"REC_DROPPED",
 	} {
 		size := readDefine(t, src, name)
 		require.Positive(t, size)

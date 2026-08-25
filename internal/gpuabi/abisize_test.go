@@ -89,6 +89,32 @@ func TestGoNameBoundsMatchTheCDefines(t *testing.T) {
 	assert.Equal(t, int(SamplingModeKernelSerialized), cDefine(t, src, "GPU_SAMPLING_MODE_KERNEL_SERIALIZED"))
 }
 
+// The drop classes are wire constants shared with the shim by nothing but
+// agreement. A renumber on one side silently refiles every loss under the
+// wrong heading — the reader sees a plausible number attached to the wrong
+// cause, which is worse than seeing nothing.
+func TestGoDropClassesMatchTheCDefines(t *testing.T) {
+	src, err := os.ReadFile(abiHeader)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		def string
+		got uint8
+	}{
+		{"GPU_DROP_CLASS_INVALID", DropClassInvalid},
+		{"GPU_DROP_CLASS_PC_DROPPED_HW", DropClassPCDroppedHW},
+		{"GPU_DROP_CLASS_PC_BUFFER_FULL", DropClassPCBufferFull},
+		{"GPU_DROP_CLASS_PC_NON_USER_KERNEL", DropClassPCNonUserKernel},
+		{"GPU_DROP_CLASS_GRAPH_EXEC", DropClassGraphExec},
+	} {
+		assert.Equalf(t, cDefine(t, src, tc.def), int(tc.got), "drop class %s", tc.def)
+	}
+	assert.Equal(t, cDefine(t, src, "GPU_DROP_CLASS_MAX"), int(DropClassGraphExec),
+		"GPU_DROP_CLASS_MAX must name the highest class Go knows, or a class "+
+			"added on the C side has no Go constant and renders as unknown")
+	assert.Equal(t, cDefine(t, src, "GPU_VENDOR_NVIDIA"), 1)
+}
+
 // The BPF program copies `count * REC_<kind>` bytes out of user memory and
 // writes that byte count into the batch header. If REC_* disagrees with the
 // Go Size*, the consumer's `count > len(payload)/Size*` guard is computed

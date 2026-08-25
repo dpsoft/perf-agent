@@ -210,10 +210,12 @@ func TestProbeKindCookiesMatchTheBPFProgram(t *testing.T) {
 }
 
 // Stats.Undecoded is the "carried but not interpreted" counter. Every kind
-// the ABI defines now has an applyBatch arm, so the only way to reach it is
-// with a kind neither side of the wire knows - which is the ABI having
-// drifted, and which must still be counted rather than dropped quietly
-// (§6.1 admits no silent loss anywhere).
+// the ABI defines has an applyBatch arm except kindDropped, which is decoded
+// and carried while its normalization waits for the consumer task that
+// follows this one. The kind used below is neither - it is a kind neither
+// side of the wire knows, which is the ABI having drifted, and which must
+// still be counted rather than dropped quietly (§6.1 admits no silent loss
+// anywhere).
 func TestUndecodedKindsAreCountedNotDropped(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
 	buf := make([]byte, batchHdrSize+40)
@@ -3369,4 +3371,46 @@ func TestBPFSizesEveryKindCookieForInstalls(t *testing.T) {
 		assert.Containsf(t, text, "if (kind == "+kind+")\n        return BATCH_CAP(REC_",
 			"max_records has no arm for %s", kind)
 	}
+}
+
+// gpu_dropped_v1 gets its first kind, cookie and decode path in this phase.
+//
+// Without them the shim's drop classes are unreachable: the probe never
+// attaches, its semaphore never arms, the shim never emits, and every class
+// reads zero exactly when loss is worst. That is the shape of twelve past
+// defects on this project, so the wire path is asserted here rather than
+// assumed from the shim's side.
+func TestDroppedProbeHasAKindAndDecodes(t *testing.T) {
+	require.Equal(t, uint64(kindDropped), cookieFor("gpu_dropped_v1"),
+		"an unattached probe is a drop class that can never go non-zero")
+
+	const n = 2
+	buf := make([]byte, batchHdrSize+n*gpuabi.SizeDropped)
+	putU32(buf[0:], kindDropped)
+	putU32(buf[4:], n)
+	putU64(buf[24:], uint64(n*gpuabi.SizeDropped))
+	putU64(buf[batchHdrSize:], 17)
+	buf[batchHdrSize+8] = gpuabi.DropClassPCNonUserKernel
+	putU64(buf[batchHdrSize+gpuabi.SizeDropped:], 3)
+	buf[batchHdrSize+gpuabi.SizeDropped+8] = gpuabi.DropClassPCDroppedHW
+
+	b, err := decodeBatch(buf)
+	require.NoError(t, err)
+	require.Len(t, b.Drops, 2)
+	assert.Equal(t, uint64(17), b.Drops[0].Count)
+	assert.Equal(t, gpuabi.DropClassPCNonUserKernel, b.Drops[0].Class)
+	assert.Equal(t, uint64(3), b.Drops[1].Count)
+	assert.Equal(t, gpuabi.DropClassPCDroppedHW, b.Drops[1].Class)
+}
+
+// A count that overruns the payload must error rather than slice past the end
+// inside the ringbuf drain goroutine.
+func TestDecodeBatchRejectsAnOverlongDroppedBatch(t *testing.T) {
+	buf := make([]byte, batchHdrSize+gpuabi.SizeDropped)
+	putU32(buf[0:], kindDropped)
+	putU32(buf[4:], 4)
+	putU64(buf[24:], uint64(gpuabi.SizeDropped))
+
+	_, err := decodeBatch(buf)
+	assert.ErrorIs(t, err, gpuabi.ErrShortRecord)
 }

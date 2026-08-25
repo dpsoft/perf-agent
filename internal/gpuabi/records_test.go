@@ -296,3 +296,43 @@ func TestDecodeConfigRejectsShortBuffer(t *testing.T) {
 	_, err := DecodeConfig(make([]byte, SizeConfig-1))
 	require.ErrorIs(t, err, ErrShortRecord)
 }
+
+// gpu_dropped_v1 reaches a consumer for the first time in this phase. Its two
+// fields are read by hard-coded offset, so a klass that moved would decode as
+// part of the count: a drop storm would read as a plausible number under class
+// 0 rather than as an error anywhere.
+func TestDecodeDroppedMatchesTheWireLayout(t *testing.T) {
+	b := make([]byte, SizeDropped)
+	binary.LittleEndian.PutUint64(b[0:], 0x1122334455667788)
+	b[8] = DropClassPCNonUserKernel
+
+	got, err := DecodeDropped(b)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x1122334455667788), got.Count)
+	assert.Equal(t, DropClassPCNonUserKernel, got.Class)
+}
+
+func TestDecodeDroppedRejectsShortBuffer(t *testing.T) {
+	_, err := DecodeDropped(make([]byte, SizeDropped-1))
+	assert.ErrorIs(t, err, ErrShortRecord)
+}
+
+// Every class is distinct and non-zero, and zero stays reserved. A producer
+// that memsets a record and forgets to set the class must not land on a real
+// class and have its loss filed under somebody else's heading.
+func TestDropClassesAreDistinctAndNonZero(t *testing.T) {
+	seen := map[uint8]string{}
+	for _, c := range []uint8{
+		DropClassPCDroppedHW, DropClassPCBufferFull,
+		DropClassPCNonUserKernel, DropClassGraphExec,
+	} {
+		require.NotZero(t, c, "zero is reserved for an unset class")
+		prev, dup := seen[c]
+		require.Falsef(t, dup, "class %d is shared with %s", c, prev)
+		seen[c] = DropClassName(c)
+	}
+	assert.Equal(t, "unset", DropClassName(DropClassInvalid))
+	// A producer newer than this consumer is a real case; its losses must
+	// still render as losses rather than vanish or be guessed at.
+	assert.Equal(t, "unknown-class-200", DropClassName(200))
+}

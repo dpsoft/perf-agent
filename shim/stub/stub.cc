@@ -44,6 +44,29 @@ PERFAGENT_USDT_EMITTER(gpu_kernel_name_v1, 272);
 // instant the copy is owned by nobody else, so bytes_ptr is true when the
 // probe reads it.
 PERFAGENT_USDT_EMITTER(gpu_module_load_v1, 40);
+// The PC-sampling records, so the whole Tier B decode path -- PC samples, the
+// stall-reason map, the config record and every producer-side drop class --
+// can be driven on a machine with no GPU. Off unless PERFAGENT_STUB_PC_SAMPLES
+// asks for them, so the existing gates and probe_order_test see exactly the
+// wire they saw before.
+PERFAGENT_USDT_EMITTER(gpu_pc_sample_batch_v1, 40);
+PERFAGENT_USDT_EMITTER(gpu_stall_reason_map_v1, 136);
+PERFAGENT_USDT_EMITTER(gpu_config_v1, 24);
+PERFAGENT_USDT_EMITTER(gpu_dropped_v1, 16);
+
+// The synthetic stall table. Real names from GA102 rather than invented ones:
+// a consumer that renders these into gpu_stall label values should show what a
+// hardware run would show, so a gate can assert on them.
+static const char *const kStallNames[] = {
+    "selected",  "no_instruction", "long_scoreboard", "short_scoreboard",
+    "wait",      "membar",         "barrier",         "dispatch_stall",
+};
+static const unsigned kNumStalls = sizeof(kStallNames) / sizeof(kStallNames[0]);
+
+// Two modules, four functions. Enough for the consumer's Tier B pending index
+// -- keyed on {PID, CubinCRC, FunctionIndex} -- to have more than one bucket,
+// which is the thing that would collapse if the key were wrong.
+static const uint64_t kStubCubinCRC[] = {0xC0FFEE01ull, 0xC0FFEE02ull};
 
 static uint64_t mono_ns() {
     struct timespec t;
@@ -192,12 +215,29 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     perfagent::KernelNameTable names;
     unsigned long sampled_seq = 0;
     unsigned long name_seq = 0;
+    unsigned long stall_seq = 0;
+    unsigned long config_seq = 0;
+    unsigned long dropped_seq = 0;
     bool names_was_attached = false;
 
     // The same queue the CUPTI adapter runs, wired the same way: capture on
     // the caller's thread, offer on the drain thread.
     perfagent::CubinQueue cubins;
     const unsigned cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
+
+    // Tier B is off unless asked for, here as in the adapter. The count is the
+    // number of synthetic (PC, stall reason) records -- one record per pair,
+    // which is what the fixed-size ABI record forces.
+    const char *pcenv = getenv("PERFAGENT_STUB_PC_SAMPLES");
+    const unsigned pc_samples = (pcenv && *pcenv) ? (unsigned)atoi(pcenv) : 0;
+    perfagent::ReplayLog replay;
+    replay.on_replay_stall([&](const gpu_stall_reason_map_v1 &r) {
+        if (gpu_stall_reason_map_v1_enabled())
+            gpu_stall_reason_map_v1_emit(&r, 1, stall_seq++);
+    });
+    replay.on_replay_config([&](const gpu_config_v1 &r) {
+        if (gpu_config_v1_enabled()) gpu_config_v1_emit(&r, 1, config_seq++);
+    });
 
     perfagent::Drainer drainer;
     drainer.on_tick([&] {
@@ -218,6 +258,10 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             });
         }
         names_was_attached = now_attached;
+        // The stall map and the config record replay on the same edge, from
+        // the same ReplayLog the adapter uses, so a consumer that attaches
+        // after they were first emitted still learns them.
+        replay.replay_if_newly_attached(gpu_stall_reason_map_v1_enabled());
     });
     drainer.start(100);
 
@@ -307,6 +351,69 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
 
     lb.flush();
     eb.flush();
+
+    // ---- Tier B, synthesized.
+    //
+    // PC samples FIRST and the stall map after them, deliberately: a stall
+    // index is unresolvable until the map arrives, and the consumer has to
+    // hold those samples rather than render "stall#17" or drop them. That
+    // ordering is the common one on real hardware too, because the map is
+    // emitted once at context creation and replayed on the attach edge.
+    if (pc_samples) {
+        perfagent::Batch<gpu_pc_sample_batch_v1, 32> pcb(gpu_pc_sample_batch_v1_emit,
+                                                         gpu_pc_sample_batch_v1_enabled);
+        for (unsigned i = 0; i < pc_samples; i++) {
+            gpu_pc_sample_batch_v1 r{};
+            r.cubin_crc = kStubCubinCRC[i % 2];
+            // Zero, always: CONTINUOUS collection supplies no correlation, and
+            // a stub that invented one would hide the join the consumer must
+            // actually make (spec §6.3 finding 3).
+            r.correlation = 0;
+            r.function_index = i % 4;
+            r.pc_offset = (uint64_t)((i % 24) * 16);   // 16-byte SASS instructions
+            r.stall_index = i % kNumStalls;
+            r.count = 1 + (i % 7);
+            pcb.add(r);
+        }
+        pcb.flush();
+
+        for (unsigned i = 0; i < kNumStalls; i++) {
+            gpu_stall_reason_map_v1 m{};
+            m.index = i;
+            const size_t n = strlen(kStallNames[i]);
+            m.name_len = (uint16_t)n;
+            memcpy(m.name, kStallNames[i], n);
+            replay.record_stall_reason(m);
+            if (gpu_stall_reason_map_v1_enabled())
+                gpu_stall_reason_map_v1_emit(&m, 1, stall_seq++);
+        }
+
+        gpu_config_v1 cfg{};
+        cfg.vendor = GPU_VENDOR_NVIDIA;
+        cfg.sm_count = 82;                 // GA102
+        cfg.clock_hz = 1695000000ull;
+        cfg.sampling_factor = 1u << 12;    // one sample per 4096 SM cycles
+        replay.record_config(cfg);
+        if (gpu_config_v1_enabled())
+            gpu_config_v1_emit(&cfg, 1, config_seq++);
+
+        // One drop record per class, so every class the ABI defines is
+        // reachable from a test rather than only from hardware. A counter that
+        // cannot go non-zero is not a counter.
+        const struct { uint64_t count; uint8_t klass; } drops[] = {
+            {3, GPU_DROP_CLASS_PC_DROPPED_HW},
+            {1, GPU_DROP_CLASS_PC_BUFFER_FULL},
+            {17, GPU_DROP_CLASS_PC_NON_USER_KERNEL},
+            {2, GPU_DROP_CLASS_GRAPH_EXEC},
+        };
+        for (const auto &d : drops) {
+            gpu_dropped_v1 rec{};
+            rec.count = d.count;
+            rec.klass = d.klass;
+            if (gpu_dropped_v1_enabled()) gpu_dropped_v1_emit(&rec, 1, dropped_seq++);
+        }
+    }
+
     // A final pass for anything the tick did not reach. drain() is bounded by
     // the depth it saw on entry, so this cannot become an unbounded wait.
     cubins.drain(perfagent::cubin_offer_to_consumer, cubin_timeout_ms);
@@ -349,6 +456,10 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
             perfagent::enroll_result_name(enrolled),
             sem_at_enroll, gpu_launch_sampled_v1_semaphore_count(), enroll_name);
+    if (pc_samples)
+        fprintf(stderr, "stub: pc_samples=%u stall_reasons=%u cubins=2 functions=4 "
+                        "drop_classes=4 replays=%llu\n",
+                pc_samples, kNumStalls, (unsigned long long)replay.replays());
 }
 
 // linger keeps this process alive after its records are flushed, until the

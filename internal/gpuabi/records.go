@@ -90,6 +90,63 @@ type Dropped struct {
 	Class uint8
 }
 
+// The classes Dropped.Class may carry, mirroring GPU_DROP_CLASS_* in
+// shim/core/usdt_abi.h. Wire constants: append only, never renumber.
+//
+// gpu_dropped_v1 has been in the ABI header since Phase 3 with no enum, no
+// kind and no probe, so no producer-side loss has ever reached a consumer.
+// These are the first four classes, and they exist because Tier B PC sampling
+// loses records in three distinguishable ways plus one that is not loss at
+// all — see DropClassPCNonUserKernel.
+const (
+	// DropClassInvalid is what a producer that memset a record and forgot to
+	// set the class lands on. It is deliberately not a real class, so such a
+	// record cannot be filed under somebody else's heading.
+	DropClassInvalid uint8 = 0
+	// DropClassPCDroppedHW is CUpti_PCSamplingData.droppedSamples: samples the
+	// hardware discarded under backpressure. The action is to lower the
+	// sampling frequency.
+	DropClassPCDroppedHW uint8 = 1
+	// DropClassPCBufferFull is CUpti_PCSamplingData.hardwareBufferFull, and
+	// also the CUPTI_ERROR_OUT_OF_MEMORY return from cuptiPCSamplingGetData.
+	// The action is to raise the hardware buffer size or drain more often.
+	DropClassPCBufferFull uint8 = 2
+	// DropClassPCNonUserKernel is CUpti_PCSamplingData.nonUsrKernelsTotalSamples.
+	//
+	// It is NOT loss in the sense the other two are: nothing was dropped,
+	// CUPTI simply "does not provide PC records for non-user kernels". It
+	// rides here because it is the SIZE of a structural omission, and a reader
+	// who does not know how much of the device's sampled time this mechanism
+	// cannot see would read the rest as more complete than it is. No action
+	// follows from it; it is a completeness bound.
+	DropClassPCNonUserKernel uint8 = 3
+	// DropClassGraphExec counts executions launched from a CUDA graph. One
+	// graph launch fires one launch callback for N kernels, and gpu_exec_v1
+	// has no field for graphId, so the exact-correlation join silently becomes
+	// one-to-many. Nothing else in the pipeline detects it.
+	DropClassGraphExec uint8 = 4
+)
+
+// DropClassName renders a class for an operator. An unknown class is rendered
+// with its number rather than as a blank or a guess: a producer newer than
+// this consumer is a real case, and dropping its losses on the floor would be
+// the one thing this record exists to prevent.
+func DropClassName(c uint8) string {
+	switch c {
+	case DropClassInvalid:
+		return "unset"
+	case DropClassPCDroppedHW:
+		return "pc-dropped-hw"
+	case DropClassPCBufferFull:
+		return "pc-buffer-full"
+	case DropClassPCNonUserKernel:
+		return "pc-non-user-kernel"
+	case DropClassGraphExec:
+		return "graph-exec"
+	}
+	return fmt.Sprintf("unknown-class-%d", c)
+}
+
 func DecodeLaunch(b []byte) (Launch, error) {
 	if len(b) < SizeLaunch {
 		return Launch{}, ErrShortRecord

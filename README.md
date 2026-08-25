@@ -52,7 +52,7 @@ go tool pprof <output>.pb.gz
 
 ### 🔥 On-demand production profiling
 
-Hot-attach to a running process — no restart, no preinstalled agent. For Python 3.12+, `--inject-python` enables the perf trampoline only for the capture window, so there's no persistent overhead.
+Hot-attach to a running process — no restart, no preinstalled agent. The agent never modifies the process it measures.
 
 ### 💤 Off-CPU stalls and blocking analysis
 
@@ -60,7 +60,21 @@ Find why a service is "slow but not CPU-busy." `--offcpu` hooks `sched_switch` a
 
 ### 🐍 Cross-language flame graphs
 
-One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Python (`-X perf` perf-maps, optionally activated on demand), Node.js (`--perf-basic-prof`), and Go. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
+One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Node.js (`--perf-basic-prof`), Go, and any runtime that writes a `/tmp/perf-<pid>.map`. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
+
+> **Python frames: not currently supported.** The `--inject-python` flag and its
+> perf-trampoline injector have been **removed**. It mutated the process it
+> measured, required CPython 3.12+, and required `CAP_SYS_PTRACE` to ptrace into
+> the target. Its replacement — walking the interpreter's frame chain from BPF,
+> which needs no injection and covers CPython 3.6+ — is tracked in
+> [#83](https://github.com/dpsoft/perf-agent/issues/83) and is **not built yet**.
+>
+> Until #83 lands, perf-agent has **no Python-level frames of its own**. Python
+> processes still profile fine, but the stacks show C interpreter frames
+> (`_PyEval_EvalFrameDefault`, …) instead of Python qualnames. If you control how
+> the interpreter starts, launching it yourself with `python -X perf` (3.12+)
+> makes CPython write `/tmp/perf-<pid>.map`, and perf-agent will read and decode
+> those entries — that path is unchanged.
 
 ### 📊 Hardware-counter performance investigations
 
@@ -210,7 +224,9 @@ capability that gets a workload rejected by admission policy.
     --tag service=api
 ```
 
-For Python workloads, see [docs/python-profiling.md](docs/python-profiling.md).
+Profiling a Python workload? See the note under [Cross-language flame
+graphs](#-cross-language-flame-graphs) — Python-level frames are unavailable
+until [#83](https://github.com/dpsoft/perf-agent/issues/83) lands.
 
 ---
 
@@ -232,7 +248,6 @@ For Python workloads, see [docs/python-profiling.md](docs/python-profiling.md).
 | `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
 | `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile` or `--offcpu`. | - |
 | `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
-| `--inject-python` | Activate Python 3.12+ perf trampoline on the target before profiling | `false` |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
 | `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable). Falls back to `DEBUGINFOD_URLS` env. Unset → off. | - |
 | `--symbol-cache-dir=DIR` | Local directory for fetched artifacts. | `/tmp/perf-agent-debuginfod` |

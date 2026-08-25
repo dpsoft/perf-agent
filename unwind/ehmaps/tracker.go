@@ -54,8 +54,8 @@ func NewPIDTracker(store *TableStore, pidMappings, pidMapLengths *ebpf.Map) *PID
 // hook. Must be called before Run to avoid races.
 //
 // The hook runs synchronously on Run's goroutine. When no hook is registered
-// (the default), Run performs a single nil check and skips dispatch entirely —
-// zero producer overhead when --inject-python is off.
+// (the default), Run performs a single nil check and skips dispatch entirely,
+// so an unused hook costs one branch per exec.
 func (t *PIDTracker) SetOnNewExec(fn func(pid uint32)) {
 	t.onNewExec = fn
 }

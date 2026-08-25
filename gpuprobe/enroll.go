@@ -606,9 +606,9 @@ func (l *enrollListener) close() error {
 // other local user on a multi-user box. Privileged consumers - root, or
 // setcap'd with CAP_SYS_PTRACE - keep the inode check alone.
 //
-// Permitted as well as Effective, for the same reason perfagent's
-// hasCapSysPtrace checks both: a setcap'd binary has not promoted Permitted
-// yet, and gating on Effective alone would misread it as unprivileged.
+// Permitted as well as Effective: a setcap'd binary has not promoted
+// Permitted yet, and gating on Effective alone would misread it as
+// unprivileged.
 func enrollRequiredUID() *uint32 {
 	if os.Geteuid() == 0 {
 		return nil

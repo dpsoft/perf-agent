@@ -25,9 +25,8 @@ import (
 	"github.com/dpsoft/perf-agent/unwind/ehcompile"
 )
 
-// hasCaps mirrors perfagent/agent.go's hasCapSysPtrace: check Permitted as
-// well as Effective, because a setcap'd binary has not promoted Permitted
-// yet, and never gate on Getuid alone.
+// hasCaps checks Permitted as well as Effective, because a setcap'd binary
+// has not promoted Permitted yet, and never gates on Getuid alone.
 func hasCaps(want ...cap.Value) bool {
 	if os.Geteuid() == 0 {
 		return true

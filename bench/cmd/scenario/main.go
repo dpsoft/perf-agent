@@ -50,11 +50,6 @@ func main() {
 		cpuBudget        = flag.Float64("cpu-budget", 0, "self scenario: max allowed CPU overhead ratio (agent samples / workload samples); 0 disables the gate")
 		resolutionBudget = flag.Float64("resolution-budget", 0, "self scenario: min allowed kernel-symbol resolution rate; 0 disables the gate")
 	)
-	// NOTE: --inject-python was previously plumbed here, but the bench
-	// constructs dwarfagent.NewProfilerWithMode directly rather than going
-	// through perfagent.Agent, so the flag had no behavioural effect — it
-	// only landed in the JSON. Re-add when the bench is reworked around
-	// perfagent.Agent (which owns the python.Manager wiring).
 	flag.Parse()
 
 	if *scenario == "" {

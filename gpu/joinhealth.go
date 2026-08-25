@@ -60,7 +60,22 @@ func plural(n uint64, one, many string) string {
 // at the end, so the two coincide there; a caller that snapshots
 // periodically should read the eviction counters as running totals.
 func JoinHealth(snap Snapshot) []string {
-	anomalies := joinAnomalies(snap)
+	return JoinHealthWith(snap, ProjectionStats{})
+}
+
+// JoinHealthWith is JoinHealth plus what the projection itself dropped.
+//
+// The split exists because ProjectionStats is not in the Snapshot and cannot
+// be: it is produced by ProjectExecutionsWith, which runs after the snapshot
+// is taken. It is the same shape as SinkStats, which Timeline also cannot see
+// and which a caller supplies through CountingSink.SnapshotWith.
+//
+// The zero value is the "nothing was suppressed" reading, which is also what
+// JoinHealth passes, so a caller that does not project through
+// ProjectExecutionsWith reports no suppression - correctly, since without that
+// call nothing suppressed anything.
+func JoinHealthWith(snap Snapshot, proj ProjectionStats) []string {
+	anomalies := joinAnomalies(snap, proj)
 	return append([]string{joinSummary(snap, len(anomalies))}, anomalies...)
 }
 
@@ -153,7 +168,7 @@ func joinSummary(snap Snapshot, anomalies int) string {
 // - it is in the summary line, where it is readable, but raising it would
 // fire on every healthy periodic snapshot and devalue the word "anomaly"
 // for the counters that do mean something is wrong.
-func joinAnomalies(snap Snapshot) []string {
+func joinAnomalies(snap Snapshot, proj ProjectionStats) []string {
 	js, lc, dr := snap.JoinStats, snap.LaunchCache, snap.Dropped
 	execs := uint64(len(snap.Executions))
 
@@ -300,6 +315,20 @@ func joinAnomalies(snap Snapshot) []string {
 	if dr.EvictedModules > 0 {
 		add("%s evicted before this snapshot — kernels from evicted modules resolve to bare addresses",
 			plural(dr.EvictedModules, "module", "modules"))
+	}
+	// Raised because the alternative is invisible. A profile whose gpu_pc
+	// labels were suppressed looks exactly like a profile that never had any:
+	// the samples are all there, carrying their weight, their stall reason and
+	// their source line, and nothing in the pprof output says an instruction
+	// offset was ever meant to be on them. This is the only place that fact is
+	// reported at all, which is why it is an anomaly rather than a summary
+	// clause - see ProjectionStats.PCLabelsSuppressed.
+	if proj.PCLabelsSuppressed > 0 {
+		add("%s projected without gpu_pc — this profile reached its ceiling of %d distinct "+
+			"instruction offsets, so those samples keep their stall reason and source line but "+
+			"carry no offset; the workload is loading far more distinct hot code than the "+
+			"cardinality budget expects, or ProjectionConfig.MaxDistinctPCLabels is set too low",
+			plural(proj.PCLabelsSuppressed, "PC sample", "PC samples"), proj.PCLabelCap)
 	}
 
 	for _, k := range []struct {

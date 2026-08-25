@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"math/bits"
+	"path"
 	"strconv"
 
 	pp "github.com/dpsoft/perf-agent/pprof"
@@ -56,7 +57,64 @@ const (
 // already refuses for heuristic joins, which are labelled rather than
 // silently promoted to exact. The period rides along as a label so a
 // consumer that wants the extrapolation computes it deliberately.
+//
+// # The PC-sample label set
+//
+// Every sample projected from a PC sample carries, on top of the execution's
+// shared labels:
+//
+//	gpu_stall       the instruction's stall reason, when the producer named one
+//	gpu_pc          the instruction's offset within its module, subject to the
+//	                cardinality budget - see pcLabelBudget
+//	gpu_pc_attrib   how the sample reached this execution - unconditional
+//	gpu_src_status  why the sample does or does not have a source location -
+//	                unconditional
+//	gpu_src_file    the source file's BASENAME, only under "resolved"
+//	gpu_src_line    the source line, only under "resolved"
+//	gpu_src_func    the device function, only under "resolved"
+//
+// The two unconditional ones are unconditional for gpu_join's reason: an
+// absent label must never be readable as a positive answer by a consumer who
+// does not know to check for its absence.
+//
+// One label the design lists is deliberately NOT here: gpu_serialized, whose
+// three values come from the Tier A sampling windows that do not exist in this
+// tree yet. A gpu_serialized="false" that means "we have no windows to check"
+// is precisely the answer the design forbids, so until the windows arrive the
+// label is absent rather than meaningless.
 func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
+	samples, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
+	return samples
+}
+
+// ProjectExecutionsWith is ProjectExecutions with a source resolver and a
+// cardinality budget, returning the projection's own counters beside the
+// samples.
+//
+// The split mirrors CountingSink.Snapshot / SnapshotWith: the plain form stays
+// the whole API for a caller with no module store and no interest in the
+// counters, and this form is what a driver calls when it has either. The stats
+// are RETURNED rather than accumulated on a field somewhere, because they
+// describe one projection of one snapshot - a second call over the same
+// snapshot suppresses the same labels again, and a running total of that would
+// count the same loss twice.
+//
+// See ProjectionConfig for why a nil Modules is a supported, accounted-for
+// state rather than a skipped one.
+func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSample, ProjectionStats) {
+	// A nil Modules is answered by an EMPTY STORE, not by this function
+	// deciding a status for itself. ModuleStore is the single place
+	// gpu_src_status is decided (see SrcStatus), and an empty store answers
+	// every Resolve with no-module - which is exactly the truth when no store
+	// was configured: no usable module bytes exist for that CRC. Synthesizing
+	// the same answer here would put a second decision site in the codebase
+	// and would be the first place a fifth value could ever appear.
+	modules := cfg.Modules
+	if modules == nil {
+		modules = NewModuleStore(ModuleStoreConfig{})
+	}
+	budget := newPCLabelBudget(cfg.MaxDistinctPCLabels)
+
 	samples := make([]pp.ProfileSample, 0, len(snap.Executions))
 	for _, view := range snap.Executions {
 		frames := projectionFrames(view)
@@ -75,16 +133,32 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 			continue
 		}
 
+		// One value per execution, read once: every PC sample on this view
+		// reached it the same way, so resolving it per sample would be the
+		// same answer computed len(PCSamples) times.
+		attrib := projectionPCAttrib(view)
+
 		weights := distributeExecutionWeight(executionWeight(view.Exec), view.PCSamples)
 		for i, pcs := range view.PCSamples {
 			// common is projectionLabels' return value, which always starts
 			// from `make(map[string]string)` - never nil - so maps.Clone(common)
 			// is never nil either; no separate nil-guard is needed here.
+			//
+			// Every label set from here down is set AFTER this clone, which is
+			// itself taken after projectionLabels copied the producer-supplied
+			// Tags. That ordering is the whole reserved-name defence: a launch
+			// tagged "gpu_src_file" or "gpu_pc_attrib" is overwritten by the
+			// value this package derived, never the other way round. See
+			// projectionLabels' note, and TestProjectionReservedLabelsWinOverTags.
 			labels := maps.Clone(common)
 			if pcs.StallReason != "" {
 				labels["gpu_stall"] = pcs.StallReason
 			}
-			labels["gpu_pc"] = fmt.Sprintf("%#x", pcs.PCOffset)
+			if budget.admit(pcs.PCOffset) {
+				labels["gpu_pc"] = fmt.Sprintf("%#x", pcs.PCOffset)
+			}
+			labels["gpu_pc_attrib"] = attrib
+			setSourceLabels(labels, modules.Resolve(pcs.Module.CRC, pcs.FunctionIndex, pcs.PCOffset))
 
 			samples = append(samples, pp.ProfileSample{
 				Pid:         pid,
@@ -96,7 +170,229 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 			})
 		}
 	}
-	return samples
+	return samples, budget.stats()
+}
+
+// ProjectionConfig configures ProjectExecutionsWith.
+type ProjectionConfig struct {
+	// Modules is the store the source labels are resolved against.
+	//
+	// Nil is supported and is ACCOUNTED FOR rather than skipped: with no
+	// store, every PC sample carries gpu_src_status="no-module" and no
+	// location, which is the same fact for the reader as a cubin that never
+	// reached the agent (see SrcNoModule). The labels do not disappear,
+	// because a profile whose source labels are absent is indistinguishable
+	// from one taken before this phase existed, while a profile that says
+	// "no-module" on every sample points straight at the missing store.
+	// This is the same accounting Timeline's module join uses for a nil
+	// store - see PCJoinStats.GroupsUnresolvedName.
+	Modules *ModuleStore
+
+	// MaxDistinctPCLabels caps how many DISTINCT gpu_pc values one
+	// projection may emit. Zero (and anything negative) means
+	// defaultMaxDistinctPCLabels. See pcLabelBudget for what happens past
+	// the cap and why gpu_pc is the label that gives way.
+	MaxDistinctPCLabels int
+}
+
+// ProjectionStats is what one ProjectExecutionsWith call did to the labels it
+// was asked to emit. It is per-call, not cumulative - see ProjectExecutionsWith.
+type ProjectionStats struct {
+	// DistinctPCLabels is how many distinct gpu_pc values this projection
+	// emitted, and PCLabelCap the ceiling it was allowed. Both are reported
+	// so that "we were nowhere near the cap" and "we sat exactly on it" are
+	// distinguishable without recomputing anything from the profile.
+	DistinctPCLabels uint64 `json:"distinct_pc_labels,omitempty"`
+	PCLabelCap       uint64 `json:"pc_label_cap,omitempty"`
+
+	// PCLabelsSuppressed is the design's ProjectionPCLabelsSuppressed: PC
+	// samples that were projected WITHOUT a gpu_pc label because admitting
+	// their offset would have pushed the profile past PCLabelCap distinct
+	// values. Every one of those samples still carries its gpu_stall,
+	// gpu_pc_attrib and gpu_src_* labels and still carries its full share of
+	// the execution's duration - only the instruction offset is missing.
+	//
+	// Zero is the ordinary reading. Non-zero is surfaced by JoinHealthWith,
+	// because a profile that silently lost its PC labels looks exactly like
+	// one that never had any.
+	PCLabelsSuppressed uint64 `json:"projection_pc_labels_suppressed,omitempty"`
+}
+
+// defaultMaxDistinctPCLabels is the ceiling on distinct gpu_pc values in one
+// projection.
+//
+// It is REASONED, NOT MEASURED, and the design says so: the real distinct-PC
+// count on a genuine profile is one of the things deferred to hardware. The
+// number comes from the design's own pathological estimate - 20,000 distinct
+// PCs costing roughly 400 KB of string table before gzip and ~140 KB after,
+// which it calls tolerable. Setting the ceiling at the top of the range the
+// design already accepted means it cannot fire on any workload that design
+// considered reasonable, and fires only past it. Once the count is measured on
+// real cubins this becomes a number rather than a bound on an estimate.
+//
+// gpu_pc saturates - once every hot instruction has been sampled at least
+// once, a longer run adds no new values - so this bounds the profile's string
+// table, not its length.
+const defaultMaxDistinctPCLabels = 20_000
+
+// pcLabelBudget bounds the distinct gpu_pc values one projection emits.
+//
+// # Why gpu_pc is the label that gives way
+//
+// gpu_pc is the most numerous label in the set (one value per distinct sampled
+// instruction) and the least actionable on its own: a bare instruction offset
+// tells a reader nothing that gpu_stall (what the instruction was waiting for)
+// and gpu_src_file/_line/_func (where it is in their source) do not tell them
+// better. So under cardinality pressure the numerous label is dropped and the
+// useful ones are kept, and the drop is counted rather than silent.
+//
+// # Why an already-seen offset is always admitted
+//
+// The cap exists to bound the pprof STRING TABLE, which stores one entry per
+// distinct label value. A repeat of an offset already emitted costs nothing
+// there, so refusing it would suppress information that has already been paid
+// for while leaving the bound exactly where it was. The rule is therefore
+// "admit no NEW value past the cap", not "emit nothing past the cap": distinct
+// values are bounded at exactly the ceiling either way, and the second reading
+// would throw away strictly more of the profile for no saving. Suppression is
+// counted per SAMPLE, not per distinct offset, because the sample is the thing
+// that went out incomplete.
+type pcLabelBudget struct {
+	seen       map[uint64]struct{}
+	ceiling    int
+	suppressed uint64
+}
+
+func newPCLabelBudget(max int) *pcLabelBudget {
+	if max <= 0 {
+		max = defaultMaxDistinctPCLabels
+	}
+	return &pcLabelBudget{seen: make(map[uint64]struct{}), ceiling: max}
+}
+
+// admit reports whether this PC sample may carry a gpu_pc label, counting the
+// refusal when it may not. %#x is injective over uint64, so the set of
+// admitted offsets is exactly the set of distinct label values.
+func (b *pcLabelBudget) admit(pcOffset uint64) bool {
+	if _, ok := b.seen[pcOffset]; ok {
+		return true
+	}
+	if len(b.seen) >= b.ceiling {
+		b.suppressed++
+		return false
+	}
+	b.seen[pcOffset] = struct{}{}
+	return true
+}
+
+func (b *pcLabelBudget) stats() ProjectionStats {
+	return ProjectionStats{
+		DistinctPCLabels:   uint64(len(b.seen)),
+		PCLabelCap:         uint64(b.ceiling), //nolint:gosec // newPCLabelBudget forces a positive ceiling.
+		PCLabelsSuppressed: b.suppressed,
+	}
+}
+
+// projectionPCAttrib renders gpu_pc_attrib for an execution that carries PC
+// samples: HOW those samples reached this execution, and therefore how far the
+// attribution can be trusted. One of PCAttribs() - exact, kernel,
+// kernel-ambiguous or kernel-multidevice - decided entirely by the join (see
+// PCAttrib) and only rendered here.
+//
+// It is emitted UNCONDITIONALLY on every PC-derived sample, for gpu_join's
+// reason: an absent label must never be readable as "exact" by a consumer that
+// does not know to check for its absence. Absence is the answer this label can
+// least afford, because the value it would be mistaken for is the only one of
+// the four that is not an inference.
+//
+// A view carrying PC samples and no attribution is a bug in the join - the
+// conformance suite's assertPCAttribAccompaniesSamples exists to catch it -
+// and it renders as a value no consumer can read as one of the four, in the
+// same shape and for the same reason as SrcStatus.String's "unset-src-status".
+// It is not a fifth value of the label's domain; it is what a join bug looks
+// like from the outside. Omitting the label instead would hide the bug behind
+// the one reading that must never be reachable by accident.
+func projectionPCAttrib(view ExecutionView) string {
+	if pcAttribRank(view.PCAttrib) == 0 {
+		return "unset-pc-attrib"
+	}
+	return string(view.PCAttrib)
+}
+
+// pcSampleReservedLabels is every label name ProjectExecutionsWith derives per
+// PC sample. It is the list projectionLabels clears from the producer-supplied
+// Tags; a name added to the projection and forgotten here is a name a producer
+// can forge whenever the projection has no value for it.
+var pcSampleReservedLabels = []string{
+	"gpu_stall",
+	"gpu_pc",
+	"gpu_pc_attrib",
+	"gpu_src_status",
+	"gpu_src_file",
+	"gpu_src_line",
+	"gpu_src_func",
+}
+
+// setSourceLabels writes gpu_src_status and, only under a resolved status, the
+// source location.
+//
+// gpu_src_status is unconditional. An ABSENT source label reads as "not
+// sampled"; an explicit status reads as "sampled, and here is why there is no
+// location", and those are different facts needing different actions from the
+// reader - recompile with -lineinfo, ship the cubin to the agent, or accept
+// that the compiler emitted no line for this instruction. The four values are
+// decided by ModuleStore and nowhere else; this function only spells them.
+//
+// The location is taken through Resolution.Source, whose ok comes back in the
+// same expression as the data, so a location can only be emitted under
+// SrcResolved. There is no branch here that could pair a file with
+// "no-lineinfo".
+func setSourceLabels(labels map[string]string, res Resolution) {
+	labels["gpu_src_status"] = res.Status().String()
+
+	fn, file, line, ok := res.Source()
+	if !ok {
+		return
+	}
+	// An empty string is not a value: a label present and blank reads as "the
+	// name is blank", while an absent one under gpu_src_status="resolved"
+	// reads as "the line table had no name for this", which is what happened.
+	// Neither is expected - the store's resolved path always has both - so
+	// this is a guard, not a case.
+	if base := srcFileBase(file); base != "" {
+		labels["gpu_src_file"] = base
+	}
+	if fn != "" {
+		labels["gpu_src_func"] = fn
+	}
+	labels["gpu_src_line"] = strconv.FormatUint(uint64(line), 10)
+}
+
+// srcFileBase reduces a line table's file name to its BASENAME. The directory
+// goes nowhere at all.
+//
+// A cubin's DWARF file names are build-host absolute paths (the fixtures in
+// internal/cubin/testdata carry /tmp/perf-agent-cubin-fixtures/single.cu).
+// Three reasons not to carry them: they vary per build, so the same kernel
+// built twice produces two distinct label values where the reader sees one
+// file; they cost a long string in the pprof string table for information no
+// reader acts on; and they leak the build environment's layout into a profile
+// that may be shared outside the organisation that built it. The basename
+// beside gpu_src_func is enough to find the line in the repository it came
+// from, which is the only thing a reader does with it.
+//
+// path.Base, not filepath.Base: the separator in a cubin's line table is the
+// build host's, and this must not depend on the agent's own OS. The agent is
+// Linux-only and nvcc emits '/' there.
+func srcFileBase(file string) string {
+	if file == "" {
+		return ""
+	}
+	base := path.Base(file)
+	if base == "." || base == "/" {
+		return ""
+	}
+	return base
 }
 
 // sampledStack returns the launch's captured CPU stack, and whether there is
@@ -275,10 +571,34 @@ func labelPID(view ExecutionView) uint32 {
 // unmatched paths is unambiguous either way. Like every other gpu_* label,
 // both are set after the Tags copy so a producer-supplied tag can never
 // forge them.
+//
+// The same rule covers every label ProjectExecutionsWith layers on top of a
+// clone of this map - gpu_stall, gpu_pc, gpu_pc_attrib and the gpu_src_*
+// family - because the clone is taken after this function returns and they are
+// written after the clone. A tag literally named "gpu_src_file" therefore
+// loses to the file the module store resolved, which is the only ordering
+// under which a producer-controlled string cannot claim to be a source
+// location this package derived.
 func projectionLabels(view ExecutionView) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {
 		maps.Copy(labels, view.Launch.Launch.Tags)
+	}
+	// Every per-PC-sample reserved name is cleared here, immediately after the
+	// Tags copy and before anything is derived.
+	//
+	// Overwriting is not enough on its own, because those labels are
+	// CONDITIONAL: gpu_src_file is emitted only under a resolved status,
+	// gpu_stall only when the producer named a reason, gpu_pc only inside the
+	// cardinality budget, and none of them at all on an execution that carries
+	// no PC samples. A tag named "gpu_src_file" would therefore survive
+	// untouched in exactly the cases where this package has no value of its
+	// own - a forged source location standing beside
+	// gpu_src_status="no-module", which is the strongest possible form of the
+	// lie the reserved-name discipline exists to prevent. Reserved names win
+	// by absence too.
+	for _, k := range pcSampleReservedLabels {
+		delete(labels, k)
 	}
 	if pid := labelPID(view); pid != 0 {
 		labels["gpu_pid"] = strconv.FormatUint(uint64(pid), 10)

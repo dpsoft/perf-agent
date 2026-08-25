@@ -155,7 +155,11 @@ func main() {
 	c.Flush()
 
 	snap := timeline.Snapshot()
-	samples := gpu.ProjectExecutions(snap)
+	// ProjectExecutionsWith rather than ProjectExecutions so the projection's
+	// own losses reach the operator: gpu_pc labels dropped at the cardinality
+	// ceiling are invisible in the profile itself, and JoinHealthWith below is
+	// the only place they are reported.
+	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{})
 	if len(samples) == 0 {
 		log.Fatal("no samples projected; the pipeline produced nothing")
 	}
@@ -185,8 +189,8 @@ func main() {
 	// attribution: what the timeline could join it to, and what it evicted
 	// trying. A run can be perfect on the first and quietly useless on the
 	// second, so both are printed - one line when the join is clean, one
-	// extra line per anomaly when it is not (see gpu.JoinHealth).
-	for _, line := range gpu.JoinHealth(snap) {
+	// extra line per anomaly when it is not (see gpu.JoinHealthWith).
+	for _, line := range gpu.JoinHealthWith(snap, projStats) {
 		log.Print(line)
 	}
 }

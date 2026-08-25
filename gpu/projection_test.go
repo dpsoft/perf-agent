@@ -1,7 +1,9 @@
 package gpu
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,7 +74,15 @@ func TestProjectionReservedLabelsWinOverTags(t *testing.T) {
 	// name this package itself derives from the joined execution/PC sample.
 	// Reserved gpu_* names must always report the real, profiler-derived
 	// value - a tag must never be able to forge it.
-	tl := NewTimeline(TimelineConfig{})
+	//
+	// The gpu_src_* family is the sharpest case: those labels name a file and
+	// a line in the profiled program's own source, which is the single most
+	// believable thing a profile can say. A tag that could set them would let
+	// a producer point every stalled instruction at a source line of its
+	// choosing. See TestProjectionSourceLabelsCannotBeForgedByAbsence for the
+	// other direction - the cases where this package derives no value at all.
+	st, idx := projStore(t)
+	tl := NewTimeline(TimelineConfig{Modules: st})
 	l := launch("a", 10)
 	l.Launch.Tags = map[string]string{
 		"gpu_queue":       "HIJACKED",
@@ -81,6 +91,11 @@ func TestProjectionReservedLabelsWinOverTags(t *testing.T) {
 		"gpu_stall":       "HIJACKED",
 		"gpu_pc":          "HIJACKED",
 		"gpu_pid":         "HIJACKED",
+		"gpu_pc_attrib":   "HIJACKED",
+		"gpu_src_status":  "HIJACKED",
+		"gpu_src_file":    "HIJACKED",
+		"gpu_src_line":    "HIJACKED",
+		"gpu_src_func":    "HIJACKED",
 	}
 	require.NoError(t, tl.EmitLaunch(l))
 
@@ -89,18 +104,24 @@ func TestProjectionReservedLabelsWinOverTags(t *testing.T) {
 	require.NoError(t, tl.EmitExec(exec))
 	require.NoError(t, tl.EmitPCSample(GPUPCSample{
 		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "a"},
-		PCOffset:    0x1a40, StallReason: "long_scoreboard", Count: 1, TimeNs: 25,
+		Module:      ModuleRef{Backend: BackendCUPTI, CRC: projCRC}, FunctionIndex: idx,
+		PCOffset: 0x10, StallReason: "long_scoreboard", Count: 1, TimeNs: 25,
 	}))
 
-	samples := ProjectExecutions(tl.Snapshot())
+	samples, _ := ProjectExecutionsWith(tl.Snapshot(), ProjectionConfig{Modules: st})
 	require.Len(t, samples, 1)
 
 	assert.Equal(t, "q1", samples[0].Labels["gpu_queue"], "a tag named gpu_queue must not override the real queue")
 	assert.Equal(t, "dev1", samples[0].Labels["gpu_device"], "a tag named gpu_device must not override the real device")
 	assert.Equal(t, "cupti:a", samples[0].Labels["gpu_correlation"], "a tag named gpu_correlation must not override the real correlation")
 	assert.Equal(t, "long_scoreboard", samples[0].Labels["gpu_stall"], "a tag named gpu_stall must not override the real stall reason")
-	assert.Equal(t, "0x1a40", samples[0].Labels["gpu_pc"], "a tag named gpu_pc must not override the real pc")
+	assert.Equal(t, "0x10", samples[0].Labels["gpu_pc"], "a tag named gpu_pc must not override the real pc")
 	assert.Equal(t, "1", samples[0].Labels["gpu_pid"], "a tag named gpu_pid must not override the real process")
+	assert.Equal(t, "exact", samples[0].Labels["gpu_pc_attrib"], "a tag named gpu_pc_attrib must not override how the sample was joined")
+	assert.Equal(t, "resolved", samples[0].Labels["gpu_src_status"], "a tag named gpu_src_status must not override what the module store decided")
+	assert.Equal(t, "single.cu", samples[0].Labels["gpu_src_file"], "a tag named gpu_src_file must not override the resolved source file")
+	assert.Equal(t, "6", samples[0].Labels["gpu_src_line"], "a tag named gpu_src_line must not override the resolved line")
+	assert.Equal(t, "addOne", samples[0].Labels["gpu_src_func"], "a tag named gpu_src_func must not override the resolved function")
 }
 
 func TestProjectionSetsPidSampleTypeAndAggregationFromLaunch(t *testing.T) {
@@ -450,4 +471,475 @@ func TestSampledExecutionWithPCSamplesStaysExactAndAttributed(t *testing.T) {
 		assert.Equal(t, "8", s.Labels["gpu_sample_period"])
 	}
 	assert.Equal(t, uint64(100), total, "the split parts still sum to the measured duration, unscaled")
+}
+
+// --- Phase 6: the PC-sample label set -------------------------------------
+
+// projCRC is the CRC the projection tests store their cubin under. Its value
+// is arbitrary; what matters is that the sample and the store agree, exactly
+// as cubin_crc makes them agree on the wire.
+const projCRC = 0xABCDEF
+
+// projStore holds one real -lineinfo cubin and returns the symbol index its
+// kernel occupies. The index is read out of the fixture rather than
+// hard-coded, for the reason modulestore_test.go's symIndexOf gives: whether
+// CUPTI's functionIndex IS the .symtab index is measured on hardware, and
+// these tests assert only that the projection reports whatever the store
+// resolved.
+func projStore(t *testing.T) (*ModuleStore, uint32) {
+	t.Helper()
+	b := fixture(t, "single_lineinfo.cubin")
+	st := NewModuleStore(ModuleStoreConfig{Capacity: 8})
+	require.NoError(t, st.Put(projCRC, b))
+	return st, symIndexOf(t, b, "addOne")
+}
+
+// pcSampleAt is one PC sample against a module, with a stall reason so that
+// every test below also carries the label the cap must never touch.
+func pcSampleAt(crc uint64, fnIndex uint32, pcOffset uint64) GPUPCSample {
+	return GPUPCSample{
+		Module:        ModuleRef{Backend: BackendCUPTI, CRC: crc},
+		FunctionIndex: fnIndex,
+		PCOffset:      pcOffset,
+		StallReason:   "long_scoreboard",
+		Count:         1,
+	}
+}
+
+// pcView is an execution carrying PC samples, with the attribution the join
+// would have decided for it.
+func pcView(attrib PCAttrib, pcs ...GPUPCSample) ExecutionView {
+	return ExecutionView{
+		Exec:      GPUKernelExec{StartNs: 0, EndNs: 100, KernelName: "addOne"},
+		PCSamples: pcs,
+		PCAttrib:  attrib,
+	}
+}
+
+// TestProjectionEmitsAllFourSrcStatuses is the core table: every value of
+// gpu_src_status reaches a projected sample, from a real fixture through the
+// real store, and the source labels ride only under "resolved".
+//
+// The unconditional half is the load-bearing one. An ABSENT source label reads
+// as "this sample was never source-mapped"; an explicit status reads as
+// "sampled, and here is precisely why there is no location" - a build flag, a
+// missing cubin, or an instruction the compiler emitted no line for. Those are
+// three different actions for the reader, and a status that could go missing
+// would collapse them into one shrug.
+//
+// Mutations this catches: making gpu_src_status conditional on anything;
+// emitting gpu_src_file/_line/_func under a status other than resolved;
+// renaming any of the four wire spellings.
+func TestProjectionEmitsAllFourSrcStatuses(t *testing.T) {
+	withInfo := fixture(t, "single_lineinfo.cubin")
+	noInfo := fixture(t, "single_nolineinfo.cubin")
+
+	const (
+		crcWithInfo = 0x1111
+		crcNoInfo   = 0x2222
+		crcAbsent   = 0x3333
+	)
+	st := NewModuleStore(ModuleStoreConfig{Capacity: 8})
+	require.NoError(t, st.Put(crcWithInfo, withInfo))
+	require.NoError(t, st.Put(crcNoInfo, noInfo))
+	idx := symIndexOf(t, withInfo, "addOne")
+	noInfoIdx := symIndexOf(t, noInfo, "addOne")
+
+	cases := []struct {
+		name   string
+		sample GPUPCSample
+		want   SrcStatus
+	}{
+		{"line table covers this pc", pcSampleAt(crcWithInfo, idx, 0x10), SrcResolved},
+		{"module built without -lineinfo", pcSampleAt(crcNoInfo, noInfoIdx, 0x10), SrcNoLineInfo},
+		{"cubin never reached the agent", pcSampleAt(crcAbsent, idx, 0x10), SrcNoModule},
+		{"pc past the end of the function", pcSampleAt(crcWithInfo, idx, 0x180), SrcUnmapped},
+	}
+
+	views := make([]ExecutionView, 0, len(cases))
+	for _, tc := range cases {
+		views = append(views, pcView(PCAttribKernel, tc.sample))
+	}
+	samples, _ := ProjectExecutionsWith(Snapshot{Executions: views}, ProjectionConfig{Modules: st})
+	require.Len(t, samples, len(cases))
+
+	seen := make(map[SrcStatus]bool)
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			labels := samples[i].Labels
+			require.Contains(t, labels, "gpu_src_status",
+				"gpu_src_status is unconditional: an absent label reads as 'not sampled', which is a different fact")
+			assert.Equal(t, tc.want.String(), labels["gpu_src_status"])
+
+			if tc.want != SrcResolved {
+				assert.NotContains(t, labels, "gpu_src_file",
+					"a location may only ride under a resolved status")
+				assert.NotContains(t, labels, "gpu_src_line")
+				assert.NotContains(t, labels, "gpu_src_func")
+				return
+			}
+			assert.Equal(t, "single.cu", labels["gpu_src_file"])
+			assert.Equal(t, "6", labels["gpu_src_line"])
+			assert.Equal(t, "addOne", labels["gpu_src_func"])
+		})
+		seen[tc.want] = true
+	}
+
+	for _, s := range SrcStatuses() {
+		assert.True(t, seen[s], "gpu_src_status %s is not reachable from this table", s)
+	}
+}
+
+// TestProjectionWithoutAModuleStoreStillAnswersEveryPCSample pins the nil
+// case. With no store nothing can be resolved, and the honest answer is
+// "no-module" on every sample - the same fact as a cubin that never arrived.
+//
+// The failure this prevents is the quiet one: if the labels simply vanished
+// when no store was configured, a profile taken with the store unwired would
+// be byte-identical to one taken before this phase existed, and nothing would
+// point at the missing store. "no-module" on every sample points straight at
+// it.
+func TestProjectionWithoutAModuleStoreStillAnswersEveryPCSample(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		pcView(PCAttribKernel, pcSampleAt(projCRC, 7, 0x10), pcSampleAt(projCRC, 7, 0x20)),
+	}}
+
+	samples, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
+	require.Len(t, samples, 2)
+	for _, s := range samples {
+		assert.Equal(t, "no-module", s.Labels["gpu_src_status"],
+			"no store means no usable module bytes, which is exactly what no-module says")
+		assert.NotContains(t, s.Labels, "gpu_src_file")
+	}
+
+	// And the plain entry point behaves identically - it is the same call.
+	plain := ProjectExecutions(snap)
+	require.Len(t, plain, 2)
+	assert.Equal(t, "no-module", plain[0].Labels["gpu_src_status"])
+}
+
+// TestProjectionSrcFileIsABasenameNotABuildHostPath pins the directory
+// decision. The fixture's line table carries an absolute build-host path
+// (/tmp/perf-agent-cubin-fixtures/single.cu), so this test fails the moment
+// the projection passes the file through unchanged.
+//
+// Three reasons the directory goes nowhere, all of which this asserts the
+// consequence of: the path varies per build, so the same kernel built twice
+// would produce two label values for one file; it is a long string in the
+// pprof string table that no reader acts on; and it leaks the build
+// environment's layout into a profile that may be shared. No OTHER label may
+// smuggle it back in either, which is what the second loop checks.
+func TestProjectionSrcFileIsABasenameNotABuildHostPath(t *testing.T) {
+	st, idx := projStore(t)
+
+	samples, _ := ProjectExecutionsWith(
+		Snapshot{Executions: []ExecutionView{pcView(PCAttribKernel, pcSampleAt(projCRC, idx, 0x10))}},
+		ProjectionConfig{Modules: st})
+	require.Len(t, samples, 1)
+
+	assert.Equal(t, "single.cu", samples[0].Labels["gpu_src_file"])
+	for k, v := range samples[0].Labels {
+		assert.NotContains(t, v, "/", "no label may carry a directory: %s=%q", k, v)
+		assert.NotContains(t, v, "perf-agent-cubin-fixtures",
+			"no label may leak the build host's layout: %s=%q", k, v)
+	}
+}
+
+// TestSrcFileBaseRejectsWhatIsNotAName covers srcFileBase directly, including
+// the inputs a line table should never produce but which must not turn into a
+// label value of "." or "/" if it ever does.
+func TestSrcFileBaseRejectsWhatIsNotAName(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/home/build/src/kernels/matmul.cu", "matmul.cu"},
+		{"kernels/matmul.cu", "matmul.cu"},
+		{"matmul.cu", "matmul.cu"},
+		{"", ""},
+		{".", ""},
+		{"/", ""},
+	} {
+		assert.Equal(t, tc.want, srcFileBase(tc.in), "srcFileBase(%q)", tc.in)
+	}
+}
+
+// TestProjectionEmitsAllFourPCAttribValues walks the enum itself rather than a
+// hand-copied list, so a fifth value added to PCAttribs() without a projection
+// case fails here rather than shipping as a label nobody rendered.
+func TestProjectionEmitsAllFourPCAttribValues(t *testing.T) {
+	attribs := PCAttribs()
+	require.Len(t, attribs, 4)
+
+	views := make([]ExecutionView, 0, len(attribs))
+	for _, a := range attribs {
+		views = append(views, pcView(a, pcSampleAt(projCRC, 7, 0x10)))
+	}
+	samples, _ := ProjectExecutionsWith(Snapshot{Executions: views}, ProjectionConfig{})
+	require.Len(t, samples, len(attribs))
+
+	for i, a := range attribs {
+		assert.Equal(t, string(a), samples[i].Labels["gpu_pc_attrib"],
+			"gpu_pc_attrib must report exactly what the join decided")
+	}
+	assert.Equal(t, "exact", samples[0].Labels["gpu_pc_attrib"],
+		"the one value that is not an inference must be spelled exactly this way")
+}
+
+// TestProjectionPCAttribIsNeverSilentlyAbsent is the honesty half of the
+// label. A view carrying PC samples with no attribution is a join bug; the
+// projection must make that visible rather than omit the label, because an
+// absent gpu_pc_attrib is readable as "exact" - the only one of the four that
+// claims vendor-provided truth - by a consumer who does not know to check.
+//
+// Mutation this catches: `if view.PCAttrib != "" { labels[...] = ... }`.
+func TestProjectionPCAttribIsNeverSilentlyAbsent(t *testing.T) {
+	samples, _ := ProjectExecutionsWith(
+		Snapshot{Executions: []ExecutionView{pcView("", pcSampleAt(projCRC, 7, 0x10))}},
+		ProjectionConfig{})
+	require.Len(t, samples, 1)
+
+	got, ok := samples[0].Labels["gpu_pc_attrib"]
+	require.True(t, ok, "a PC sample with no attribution must still carry the label")
+	for _, a := range PCAttribs() {
+		assert.NotEqual(t, string(a), got,
+			"a join bug must not render as one of the four real values, least of all %s", PCAttribExact)
+	}
+}
+
+// TestProjectionKernelAmbiguousNeverCoincidesWithGpuAmbiguous is the
+// de-overloading assertion, driven end to end through the real join rather
+// than a hand-built view.
+//
+// Two executions of one kernel are in the horizon, so which invocation the
+// samples came from is an inference. It is marked in gpu_pc_attrib, and
+// gpu_ambiguous - which means "the heuristic LAUNCH join chose between
+// candidate launches" and feeds AmbiguousHeuristicMatchCount - stays absent.
+// Emitting both on one sample would put two unrelated facts on one flag.
+func TestProjectionKernelAmbiguousNeverCoincidesWithGpuAmbiguous(t *testing.T) {
+	const pid = 4242
+	f := newPCJoinFixture(t, TimelineConfig{})
+
+	f.sample(t, pid, 10)
+	f.sample(t, pid, 11)
+	require.NoError(t, f.tl.EmitExec(pcExec(pid, f.kernel, "0", 20, 30)))
+	require.NoError(t, f.tl.EmitExec(pcExec(pid, f.kernel, "0", 40, 50)))
+
+	snap := f.tl.Snapshot()
+	samples, _ := ProjectExecutionsWith(snap, ProjectionConfig{Modules: f.store})
+
+	var ambiguous int
+	for _, s := range samples {
+		if s.Labels["gpu_pc_attrib"] != string(PCAttribKernelAmbiguous) {
+			continue
+		}
+		ambiguous++
+		assert.NotContains(t, s.Labels, "gpu_ambiguous",
+			"PC ambiguity and heuristic-launch ambiguity are different joins with different failure "+
+				"modes; one flag cannot carry both")
+	}
+	assert.Equal(t, 2, ambiguous, "both samples of the ambiguous group must carry the mark")
+	assert.Zero(t, snap.JoinStats.AmbiguousHeuristicMatchCount,
+		"no launch was joined heuristically here, so that counter must not have moved")
+}
+
+// TestProjectionCapSuppressesGpuPCAndOnlyGpuPC is the cardinality budget.
+//
+// Five distinct instruction offsets against a ceiling of two: the first two
+// distinct values are emitted, the remaining three samples go out without an
+// offset, and ProjectionPCLabelsSuppressed reads exactly three. Every one of
+// the five keeps its stall reason, its attribution, its source status and its
+// full share of the execution's duration - the label that gives way under
+// pressure is the numerous one, not the actionable ones.
+//
+// Mutations this catches: capping the wrong label; dropping the sample instead
+// of the label (the weights would no longer sum to the duration); counting
+// distinct suppressed offsets rather than suppressed samples.
+func TestProjectionCapSuppressesGpuPCAndOnlyGpuPC(t *testing.T) {
+	st, idx := projStore(t)
+	pcs := []GPUPCSample{
+		pcSampleAt(projCRC, idx, 0x10),
+		pcSampleAt(projCRC, idx, 0x20),
+		pcSampleAt(projCRC, idx, 0x30),
+		pcSampleAt(projCRC, idx, 0x40),
+		pcSampleAt(projCRC, idx, 0x50),
+	}
+	snap := Snapshot{Executions: []ExecutionView{pcView(PCAttribKernel, pcs...)}}
+
+	samples, stats := ProjectExecutionsWith(snap, ProjectionConfig{Modules: st, MaxDistinctPCLabels: 2})
+	require.Len(t, samples, 5)
+
+	assert.Equal(t, uint64(3), stats.PCLabelsSuppressed,
+		"three samples past a ceiling of two distinct offsets")
+	assert.Equal(t, uint64(2), stats.DistinctPCLabels)
+	assert.Equal(t, uint64(2), stats.PCLabelCap)
+
+	var total uint64
+	for i, s := range samples {
+		total += s.Value
+		if i < 2 {
+			assert.Equal(t, fmt.Sprintf("%#x", pcs[i].PCOffset), s.Labels["gpu_pc"],
+				"the first distinct offsets inside the budget are emitted")
+		} else {
+			assert.NotContains(t, s.Labels, "gpu_pc", "sample %d is past the ceiling", i)
+		}
+		assert.Equal(t, "long_scoreboard", s.Labels["gpu_stall"], "the cap must not touch gpu_stall")
+		assert.Equal(t, "kernel", s.Labels["gpu_pc_attrib"], "the cap must not touch gpu_pc_attrib")
+		assert.Equal(t, "resolved", s.Labels["gpu_src_status"], "the cap must not touch gpu_src_status")
+		assert.Equal(t, "single.cu", s.Labels["gpu_src_file"], "the cap must not touch the source location")
+		assert.Equal(t, "addOne", s.Labels["gpu_src_func"])
+		assert.Contains(t, s.Labels, "gpu_src_line")
+	}
+	assert.Equal(t, uint64(100), total,
+		"a suppressed label must not cost the sample its weight; the parts still sum to the duration")
+}
+
+// TestProjectionCapReadmitsAnOffsetItAlreadyEmitted pins the rule that the cap
+// bounds DISTINCT values, not samples. A repeat of an offset already in the
+// profile costs the pprof string table nothing, so refusing it would drop
+// information already paid for while leaving the bound exactly where it was.
+func TestProjectionCapReadmitsAnOffsetItAlreadyEmitted(t *testing.T) {
+	offsets := []uint64{0x10, 0x20, 0x10, 0x30}
+	pcs := make([]GPUPCSample, 0, len(offsets))
+	for _, off := range offsets {
+		pcs = append(pcs, pcSampleAt(projCRC, 7, off))
+	}
+
+	samples, stats := ProjectExecutionsWith(
+		Snapshot{Executions: []ExecutionView{pcView(PCAttribKernel, pcs...)}},
+		ProjectionConfig{MaxDistinctPCLabels: 2})
+	require.Len(t, samples, 4)
+
+	assert.Equal(t, "0x10", samples[2].Labels["gpu_pc"],
+		"an offset already in the string table costs nothing to repeat")
+	assert.NotContains(t, samples[3].Labels, "gpu_pc", "a third DISTINCT value is what the cap refuses")
+	assert.Equal(t, uint64(1), stats.PCLabelsSuppressed)
+	assert.Equal(t, uint64(2), stats.DistinctPCLabels)
+}
+
+// TestProjectionCapIsSurfacedInJoinHealth closes the loop the design demands:
+// a profile that silently lost its PC labels looks identical to one that never
+// had any, so the suppression has to be readable somewhere outside the
+// profile.
+func TestProjectionCapIsSurfacedInJoinHealth(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		pcView(PCAttribKernel, pcSampleAt(projCRC, 7, 0x10), pcSampleAt(projCRC, 7, 0x20)),
+	}}
+	_, stats := ProjectExecutionsWith(snap, ProjectionConfig{MaxDistinctPCLabels: 1})
+	require.Equal(t, uint64(1), stats.PCLabelsSuppressed)
+
+	withProj := strings.Join(JoinHealthWith(snap, stats), "\n")
+	assert.Contains(t, withProj, "without gpu_pc",
+		"the operator must be told the labels were dropped; nothing in the profile says so")
+	assert.Contains(t, withProj, "anomal")
+
+	assert.NotContains(t, strings.Join(JoinHealth(snap), "\n"), "without gpu_pc",
+		"a caller that suppressed nothing must not be told it did")
+}
+
+// TestProjectionAddsNoFrames is the negative assertion the design requires:
+// this phase adds labels and NOTHING to stack identity. At PC-sampling rates a
+// frame per instruction or per source line destroys aggregation and fragments
+// the kernel's own block, so frames stay exhaustively
+// <CPU stack> -> [gpu:launch] -> [gpu:kernel:<name>].
+//
+// Mutation this catches: promoting the PC, the stall reason or the source line
+// to a frame, in any spelling.
+func TestProjectionAddsNoFrames(t *testing.T) {
+	st, idx := projStore(t)
+	view := pcView(PCAttribKernelAmbiguous, pcSampleAt(projCRC, idx, 0x10), pcSampleAt(projCRC, idx, 0x40))
+	view.Launch = &GPUKernelLaunch{Launch: LaunchContext{CPUStack: pp.FramesFromNames([]string{"main"})}}
+
+	samples, _ := ProjectExecutionsWith(Snapshot{Executions: []ExecutionView{view}},
+		ProjectionConfig{Modules: st})
+	require.Len(t, samples, 2)
+
+	// The kernel name is deliberately NOT on this list: [gpu:kernel:<name>] is
+	// one of the three frames the design fixes, and it is the deepest one. The
+	// forbidden strings are the per-sample detail this phase adds - the offset,
+	// the stall reason, the source location and the attribution quality -
+	// every one of which would fragment that kernel's own block if promoted.
+	forbidden := []string{
+		"gpu:pc", "gpu:src", "long_scoreboard", "single.cu",
+		"kernel-ambiguous", "resolved", "0x10", "0x40",
+	}
+	for _, s := range samples {
+		names := frameNames(s.Stack)
+		assert.Equal(t, []string{"main", FrameLaunch, "[gpu:kernel:addOne]"}, names)
+		for _, name := range names {
+			for _, bad := range forbidden {
+				assert.NotContains(t, name, bad, "frame %q must not carry per-sample detail", name)
+			}
+		}
+	}
+	assert.Equal(t, frameNames(samples[0].Stack), frameNames(samples[1].Stack),
+		"two PC samples from one kernel must share one stack and differ only by label")
+}
+
+// TestProjectionSourceLabelsCannotBeForgedByAbsence is the second half of the
+// reserved-name discipline, and the half the conditional labels made
+// necessary.
+//
+// Overwriting alone is not enough: gpu_src_file is emitted ONLY under a
+// resolved status, so a producer tag of that name would survive untouched in
+// exactly the cases where this package has no value of its own - a forged
+// source location standing beside gpu_src_status="no-module", which is worse
+// than any value it could overwrite. The same goes for gpu_pc past the
+// cardinality cap, for gpu_stall when the producer named no reason, and for
+// every one of these names on an execution that carries no PC samples at all.
+// Reserved names win by absence too.
+func TestProjectionSourceLabelsCannotBeForgedByAbsence(t *testing.T) {
+	forged := map[string]string{
+		"gpu_src_status": "resolved",
+		"gpu_src_file":   "attacker.cu",
+		"gpu_src_line":   "1",
+		"gpu_src_func":   "attacker_kernel",
+		"gpu_pc":         "0xdeadbeef",
+		"gpu_stall":      "not_stalled",
+		"gpu_pc_attrib":  "exact",
+		"pod_uid":        "pod-a",
+	}
+	tagged := func(pcs ...GPUPCSample) ExecutionView {
+		v := pcView(PCAttribKernel, pcs...)
+		v.Launch = &GPUKernelLaunch{Launch: LaunchContext{Tags: forged}}
+		return v
+	}
+
+	// No module for this CRC, so no location is derived; one PC sample past a
+	// ceiling of zero distinct offsets... the ceiling cannot be zero (0 means
+	// "default"), so the second sample is the one the cap refuses.
+	unresolved := pcSampleAt(0xDEAD, 7, 0x10)
+	unresolved.StallReason = "" // the producer named none
+	second := pcSampleAt(0xDEAD, 7, 0x20)
+	second.StallReason = ""
+
+	snap := Snapshot{Executions: []ExecutionView{
+		tagged(unresolved, second),
+		func() ExecutionView { // an execution with no PC samples at all
+			v := ExecutionView{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "addOne"}}
+			v.Launch = &GPUKernelLaunch{Launch: LaunchContext{Tags: forged}}
+			return v
+		}(),
+	}}
+
+	samples, stats := ProjectExecutionsWith(snap, ProjectionConfig{MaxDistinctPCLabels: 1})
+	require.Len(t, samples, 3)
+	require.Equal(t, uint64(1), stats.PCLabelsSuppressed)
+
+	for i, s := range samples {
+		assert.Equal(t, "pod-a", s.Labels["pod_uid"], "ordinary tags still ride, sample %d", i)
+		assert.NotContains(t, s.Labels, "gpu_src_file",
+			"a tag named gpu_src_file must not survive where no location was resolved (sample %d)", i)
+		assert.NotContains(t, s.Labels, "gpu_src_line")
+		assert.NotContains(t, s.Labels, "gpu_src_func")
+		assert.NotContains(t, s.Labels, "gpu_stall",
+			"a tag named gpu_stall must not survive where the producer named no reason (sample %d)", i)
+	}
+	assert.Equal(t, "no-module", samples[0].Labels["gpu_src_status"],
+		"the derived status must overwrite a tag claiming 'resolved'")
+	assert.Equal(t, "0x10", samples[0].Labels["gpu_pc"])
+	assert.NotContains(t, samples[1].Labels, "gpu_pc",
+		"a tag named gpu_pc must not survive the cardinality cap")
+	assert.NotContains(t, samples[2].Labels, "gpu_pc",
+		"an execution with no PC samples has no offset to report, forged or otherwise")
+	assert.NotContains(t, samples[2].Labels, "gpu_src_status",
+		"gpu_src_status is unconditional on PC-DERIVED samples; an execution with none has nothing to say")
+	assert.NotContains(t, samples[2].Labels, "gpu_pc_attrib")
 }

@@ -68,7 +68,7 @@ func TestWriteFlamegraphRendersFromTheProfileTheUserWasGiven(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"<!DOCTYPE html>", "data-name=\"main\"", "data-name=\"hot\"", "pid 4321", "on-CPU"} {
+	for _, want := range []string{"<!DOCTYPE html>", ">main</div>", ">hot</div>", "pid 4321", "on-CPU"} {
 		if !strings.Contains(string(page), want) {
 			t.Errorf("page missing %q", want)
 		}

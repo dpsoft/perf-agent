@@ -21,7 +21,11 @@ var (
 	// hsl(H calc(S% * var(--fill-ds)) calc(L% + var(--fill-dl)))
 	fillTokenRe = regexp.MustCompile(
 		`--(fill-[a-z-]+): hsl\( ?(\d+) (?:calc\((\d+)% \* var\(--fill-ds\)\)|(\d+)%) calc\((\d+)% \+ var\(--fill-dl\)\)\);`)
-	darkBlockRe = regexp.MustCompile(`(?s)@media \(prefers-color-scheme: dark\)\{\s*:root\{([^}]*)\}`)
+	// The dark theme is reachable two ways — the reader's OS setting and the
+	// D key — so it is declared twice, from one Go constant. Both blocks are
+	// parsed and both are held to the same rule.
+	darkBlockRe = regexp.MustCompile(`(?s)@media \(prefers-color-scheme: dark\)\{:root:not\(\[data-theme="light"\]\)\{([^}]*)\}\}`)
+	darkThemeRe = regexp.MustCompile(`(?s):root\[data-theme="dark"\]\{([^}]*)\}`)
 )
 
 type hsl struct{ h, s, l float64 }
@@ -105,10 +109,21 @@ func contrast(a, b hsl) float64 {
 func overHatch(c hsl, alpha float64) hsl {
 	r, g, b := c.rgb()
 	mix := func(v, ink float64) float64 { return v*(1-alpha) + ink*alpha }
+	return fromRGB(mix(r, 22.0/255), mix(g, 20.0/255), mix(b, 18.0/255))
+}
+
+// lightened is the jitter, as the browser computes it:
+// hsl(from fill h s calc(l + N)). Hue and saturation do not move, so a
+// jittered frame is the same colour at a different lightness — and N is a
+// ladder step, never negative. See the jitter tests below for why that
+// direction is forced.
+func lightened(c hsl, delta float64) hsl { return hsl{c.h, c.s, c.l + delta} }
+
+// fromRGB converts back to the hsl the rest of this file speaks. Mixing in
+// sRGB and re-deriving lightness is what a browser draws; contrast() only
+// reads luminance, so this is a luminance-preserving round trip.
+func fromRGB(rr, gg, bb float64) hsl {
 	m := hsl{}
-	// Back to a luminance-only stand-in: contrast() only reads luminance,
-	// and mixing in sRGB then re-deriving lightness is what a browser draws.
-	rr, gg, bb := mix(r, 22.0/255), mix(g, 20.0/255), mix(b, 18.0/255)
 	maxc, minc := math.Max(rr, math.Max(gg, bb)), math.Min(rr, math.Min(gg, bb))
 	m.l = (maxc + minc) / 2 * 100
 	if maxc != minc {
@@ -154,7 +169,7 @@ func TestPaletteDeclaresATokenForEveryDomain(t *testing.T) {
 func TestEveryDomainKeyIsSelectedByARule(t *testing.T) {
 	for d := Domain(0); d < numDomains; d++ {
 		info := d.Info()
-		sel := fmt.Sprintf(`g.frame[data-domain="%s"] rect.bg{fill:%s`, info.Key, info.Fill)
+		sel := fmt.Sprintf(`.frame[data-domain="%s"]{--fill-x:%s`, info.Key, info.Fill)
 		assert.Contains(t, paletteCSS, sel, "no rule paints domain %q", info.Key)
 	}
 }
@@ -164,7 +179,7 @@ func TestEveryDomainKeyIsSelectedByARule(t *testing.T) {
 // the page says so instead of leaving a silent gap in the palette.
 func TestAquaIsReservedAndUnused(t *testing.T) {
 	assert.Contains(t, palette(t), "fill-accel-source", "the reserved aqua token must exist")
-	assert.NotContains(t, paletteCSS, "rect.bg{fill:var(--fill-accel-source)",
+	assert.NotContains(t, paletteCSS, "]{--fill-x:var(--fill-accel-source)",
 		"aqua must not paint any frame until accelerator source frames exist")
 	for d := Domain(0); d < numDomains; d++ {
 		assert.NotEqual(t, "var(--fill-accel-source)", d.Info().Fill, "domain %q took the reserved hue", d.Info().Key)
@@ -176,7 +191,12 @@ func TestAquaIsReservedAndUnused(t *testing.T) {
 // the media block, the two themes have started to drift into two designs.
 func TestDarkThemeMovesOnlyTheThemeKnobs(t *testing.T) {
 	m := darkBlockRe.FindStringSubmatch(paletteCSS)
-	require.Len(t, m, 2, "paletteCSS must have exactly one dark-theme block")
+	require.Len(t, m, 2, "paletteCSS must have exactly one dark-theme media block")
+	d := darkThemeRe.FindStringSubmatch(paletteCSS)
+	require.Len(t, d, 2, "paletteCSS must have exactly one [data-theme=dark] block for the D key")
+	assert.Equal(t, m[1], d[1],
+		"the OS dark theme and the D key must apply the same declarations, or the page has two dark themes")
+
 	for _, decl := range strings.Split(m[1], ";") {
 		decl = strings.TrimSpace(decl)
 		if decl == "" {
@@ -187,6 +207,17 @@ func TestDarkThemeMovesOnlyTheThemeKnobs(t *testing.T) {
 			"the dark theme may only move the knobs, but it sets %s", prop)
 	}
 	assert.Equal(t, 1, strings.Count(paletteCSS, "@media"), "one media block, or the themes are diverging")
+}
+
+// The D key must be able to overrule the OS in both directions: a reader on
+// a dark desktop who wants the light palette gets it from the same token set.
+func TestTheDarkKeyCanOverrideTheOSInBothDirections(t *testing.T) {
+	assert.Contains(t, paletteCSS, `:root:not([data-theme="light"])`,
+		"[data-theme=light] must be able to win against prefers-color-scheme: dark")
+	assert.Contains(t, paletteCSS, `:root[data-theme="dark"]`,
+		"[data-theme=dark] must be able to win against a light OS")
+	assert.Contains(t, styleSheet, `:root:not([data-theme="light"])`)
+	assert.Contains(t, styleSheet, `:root[data-theme="dark"]`)
 }
 
 // Gregg's layers are hues; the hue is the meaning. Anchor them, so a tweak
@@ -234,9 +265,9 @@ func TestTheTwoBoundariesStayTellableApart(t *testing.T) {
 	assert.Greater(t, tokens["fill-boundary-unattributed"].l, tokens["fill-boundary"].l+5,
 		"the unattributed boundary must be visibly paler")
 	assert.NotEmpty(t, DomainBoundaryUnattributed.Info().Overlay, "and hatched")
-	assert.Contains(t, paletteCSS, `g.frame[data-domain="boundary-unattributed"] rect.bg{fill:var(--fill-boundary-unattributed);stroke:var(--edge-unattributed);stroke-width:1;stroke-dasharray:3 2}`,
+	assert.Contains(t, paletteCSS, `.frame[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}`,
 		"and dashed, because there is nothing behind it")
-	assert.NotContains(t, paletteCSS, `data-domain="boundary"] rect.bg{fill:var(--fill-boundary);stroke:var(--edge-boundary);stroke-width:1;stroke-dasharray`)
+	assert.NotContains(t, paletteCSS, `.frame[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary);outline`)
 }
 
 // Frame labels are drawn on the fills. Gregg's palette was designed for a
@@ -257,14 +288,66 @@ func TestLabelsStayLegibleOnEveryFillInBothThemes(t *testing.T) {
 		{"dark", darkDL, darkDS, darkHatch},
 	} {
 		for name, c := range palette(t) {
-			fill := c.themed(theme.dl, theme.ds)
-			assert.GreaterOrEqual(t, contrast(ink, fill), 4.5,
-				"%s theme: label ink on %s is %.2f:1", theme.name, name, contrast(ink, fill))
-			hatched := overHatch(fill, theme.alpha)
-			assert.GreaterOrEqual(t, contrast(ink, hatched), 4.5,
-				"%s theme: label ink on hatched %s is %.2f:1", theme.name, name, contrast(ink, hatched))
+			// Every fill is checked at every rung of the jitter ladder, not
+			// just at its declared value: a frame on the page is a jittered
+			// fill, and an untested rung is an untested colour.
+			for step := range jitterSteps {
+				base := c.themed(theme.dl, theme.ds)
+				fill := lightened(base, jitterLightness(step))
+				assert.GreaterOrEqual(t, contrast(ink, fill), 4.5,
+					"%s theme: label ink on %s at jitter step %d is %.2f:1", theme.name, name, step, contrast(ink, fill))
+				hatched := overHatch(fill, theme.alpha)
+				assert.GreaterOrEqual(t, contrast(ink, hatched), 4.5,
+					"%s theme: label ink on hatched %s at jitter step %d is %.2f:1", theme.name, name, step, contrast(ink, hatched))
+			}
 		}
 	}
+}
+
+// The jitter's direction is not a taste. The darkest thing a label is ever
+// drawn on clears 4.5:1 by about a tenth, so there is no room to darken a
+// fill and plenty to lighten one — and mixing white in raises luminance
+// monotonically, which makes the un-jittered fill the worst case and leaves
+// the floor exactly where the test above found it.
+func TestJitterOnlyEverLightensSoTheContrastFloorCannotMove(t *testing.T) {
+	ink := hsl{frameInkH, frameInkS, frameInkL}
+
+	worstUnjittered, worstAny := math.Inf(1), math.Inf(1)
+	for _, theme := range []struct{ dl, ds, alpha float64 }{{lightDL, lightDS, lightHatch}, {darkDL, darkDS, darkHatch}} {
+		for _, c := range palette(t) {
+			base := c.themed(theme.dl, theme.ds)
+			prev := math.Inf(-1)
+			for step := range jitterSteps {
+				require.GreaterOrEqual(t, jitterLightness(step), 0.0, "a rung of the ladder darkens a fill")
+				fill := lightened(base, jitterLightness(step))
+				require.LessOrEqual(t, fill.l, 100.0, "a rung of the ladder clips at white")
+				got := contrast(ink, overHatch(fill, theme.alpha))
+				assert.Greater(t, got, prev, "each rung must be lighter than the last, or the ladder is not monotone")
+				prev = got
+				worstAny = math.Min(worstAny, got)
+				if step == 0 {
+					worstUnjittered = math.Min(worstUnjittered, got)
+				}
+			}
+		}
+	}
+	assert.Equal(t, worstUnjittered, worstAny, "jitter must not create a worse case than the palette already had")
+	assert.GreaterOrEqual(t, worstAny, 4.5)
+	assert.Less(t, worstAny, 4.7, "if the floor has grown this much headroom, the jitter could be bolder")
+}
+
+// The ladder in the stylesheet is the ladder the renderer assigns steps on.
+// A mismatch would put a frame on a rung that has no rule and paint it with
+// the default 0%, silently un-jittering it.
+func TestTheJitterLadderInTheStylesheetMatchesTheRenderer(t *testing.T) {
+	assert.Contains(t, paletteCSS, "--fill-j:0;", "the ladder needs a zero rung at :root")
+	assert.Contains(t, paletteCSS, "background-color:var(--fill-x);background-color:hsl(from var(--fill-x) h s calc(l + var(--fill-j)))",
+		"the fill must be composed on the frame (var() inside a :root custom property freezes at :root), and the plain fill must precede it so an engine without relative colour syntax falls back to the palette rather than to nothing")
+	assert.NotContains(t, jitterCSS, ".j0{", "step 0 is the palette's own colour and needs no rule")
+	for step := 1; step < jitterSteps; step++ {
+		assert.Contains(t, jitterCSS, fmt.Sprintf(".j%d{--fill-j:%.2f}", step, jitterLightness(step)))
+	}
+	assert.InDelta(t, jitterMaxL, jitterLightness(jitterSteps-1), 0.001, "the top rung is the stated amplitude")
 }
 
 // A label drawn in a colour that flips with the page would be dark ink on a
@@ -273,7 +356,47 @@ func TestLabelsStayLegibleOnEveryFillInBothThemes(t *testing.T) {
 func TestInkAndFrameOutlinesDoNotFollowThePageTheme(t *testing.T) {
 	assert.NotContains(t, paletteCSS, "var(--ink)",
 		"the page's ink inverts with the page; a frame's does not")
-	assert.Contains(t, paletteCSS, "svg.flame text{fill:var(--frame-ink)}")
-	assert.Contains(t, paletteCSS, "g.frame:hover rect.bg{stroke:var(--frame-ink)")
-	assert.Contains(t, paletteCSS, "g.frame.match rect.bg{stroke:var(--frame-ink)")
+	assert.Contains(t, paletteCSS, ".frame{color:var(--frame-ink)")
+	assert.Contains(t, paletteCSS, ".frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink)")
+	assert.Contains(t, paletteCSS, ".frame.match{box-shadow:inset 0 0 0 1.8px var(--frame-ink)")
+}
+
+// A hatch used to be an SVG <pattern> painted by a second <rect> per frame.
+// It is a background-image now, so the honesty signal it carries — "the
+// profile could not fully account for this frame" — has to be reattached to
+// every domain that claims it, by a rule rather than by an extra element.
+func TestEveryHatchedDomainIsActuallyHatchedByARule(t *testing.T) {
+	for d := Domain(0); d < numDomains; d++ {
+		info := d.Info()
+		if info.Overlay == "" {
+			continue
+		}
+		assert.Contains(t, paletteCSS, fmt.Sprintf(`.frame[data-domain="%s"]{--fill-x:%s;background-image:%s`, info.Key, info.Fill, info.Overlay),
+			"domain %q says it is hatched but no rule hatches it", info.Key)
+		assert.Contains(t, paletteCSS, strings.TrimSuffix(strings.TrimPrefix(info.Overlay, "var("), ")")+":",
+			"domain %q names a hatch token the stylesheet does not declare", info.Key)
+	}
+	// A frame can be both unnamed and inferred; it must then show both
+	// hatches rather than silently losing one to the cascade.
+	assert.Contains(t, paletteCSS, `.frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}`)
+	// The two hatches run opposite ways, so which uncertainty a frame
+	// carries is visible without hovering it.
+	assert.Contains(t, paletteCSS, "--hatch-gap: repeating-linear-gradient(45deg,")
+	assert.Contains(t, paletteCSS, "--hatch-inf: repeating-linear-gradient(-45deg,")
+}
+
+// A border would be laid out; a 3px-wide frame with a 1px border on each
+// side would have no content box left. Every outline on a frame is painted
+// instead — an inset box-shadow, or an outline pulled inside by a negative
+// offset — so a sliver stays the width its value earned.
+func TestFrameOutlinesAreNeverLaidOut(t *testing.T) {
+	for _, decl := range strings.Split(paletteCSS, "\n") {
+		if !strings.HasPrefix(decl, ".frame") {
+			continue
+		}
+		assert.NotContains(t, decl, "border:", "a frame outline must not take width from the frame: %s", decl)
+		assert.NotContains(t, decl, "border-width", decl)
+	}
+	assert.Contains(t, paletteCSS, "outline:1px dashed var(--edge-unattributed);outline-offset:-1px",
+		"the one dashed outline needs outline, which box-shadow cannot do — but it still must not be laid out")
 }

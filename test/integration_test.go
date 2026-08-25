@@ -870,6 +870,23 @@ func TestPMUTaskStateClassification(t *testing.T) {
 	assert.Contains(t, outputStr, "times)")
 }
 
+// TestPMUIOWorkloadHasIOWait asserts that an I/O-bound workload's
+// context switches were CLASSIFIED as blocking — not merely that some
+// context switch happened.
+//
+// The previous version asked whether the output contained
+// "I/O Wait (D state):" or "Voluntary (sleep/mutex):". metrics/console.go
+// prints all three reason lines inside one `if totalSwitches > 0` guard,
+// so those two strings appear together or not at all: the `||` could not
+// distinguish them, and the real assertion was "at least one context
+// switch of any kind was recorded". A collector that filed every blocked
+// read under "Preempted" and classified zero I/O wait passed it — which
+// is the regression a test with this name exists to catch (issue #63).
+//
+// Now the counts are read off those lines and the assertion is on the
+// values. The sum of voluntary + I/O wait is used rather than I/O wait
+// alone: see contextSwitchCounts.Blocking for why the split between them
+// is a property of the filesystem, not of the collector.
 func TestPMUIOWorkloadHasIOWait(t *testing.T) {
 	requireBPFRunnable(t, getAgentPath(t))
 
@@ -888,48 +905,52 @@ func TestPMUIOWorkloadHasIOWait(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	// Run perf-agent with PMU
-	agent := exec.Command(agentPath,
-		"--pmu",
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "5s",
-	)
+	counts, output := collectPMUContextSwitches(t, agentPath, workload, wl.Name,
+		"--pmu", "--pid", fmt.Sprintf("%d", workload.Process.Pid))
+	t.Logf("%s", counts)
 
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
-	}
-
-	outputStr := string(output)
-
-	// An I/O workload should show I/O wait or voluntary sleep; file
-	// operations cause both.
-	//
-	// strings.Contains, not assert.Contains: assert.Contains records a
-	// failure on t as a side effect and returns a bool, so writing this as
-	// `if assert.Contains(...) || assert.Contains(...)` marked the test
-	// failed on the first branch before the second was ever considered -
-	// the || read as a tolerance but never tolerated anything, and a
-	// genuine miss recorded three failures for one condition.
-	//
-	// Note this is a weaker check than it appears: metrics/console.go
-	// prints both lines inside one `if totalSwitches > 0` block, so they
-	// appear together or not at all. What it really asserts is that some
-	// context switch was recorded. See issue #63.
-	hasIOActivity := strings.Contains(outputStr, "I/O Wait (D state):") ||
-		strings.Contains(outputStr, "Voluntary (sleep/mutex):")
-	assert.True(t, hasIOActivity,
-		"I/O workload should report I/O wait or voluntary sleep; output had neither line:\n%s", outputStr)
+	assert.Positive(t, counts.Blocking(),
+		"an I/O-bound workload must record context switches classified as blocking "+
+			"(voluntary sleep, or D-state I/O wait), but all %d of its switches were filed "+
+			"as preemption — task-state classification is broken.\n%s\nOutput:\n%s",
+		counts.Total(), counts, output)
 }
 
+// TestPMUCPUWorkloadMostlyRunning is the mirror of the test above, and
+// had the same defect: it asserted `Contains(out, "Preempted (running):")`,
+// a line console.go prints whenever ANY switch was recorded, so a
+// collector that filed every switch as voluntary sleep passed a test
+// named for a workload that never voluntarily yields.
+//
+// It now asserts on the counts: at least one switch classified as
+// preemption, and I/O wait not the dominant reason for a workload that
+// touches no files after start-up.
+//
+// The workload is deliberately oversubscribed — see below — so that
+// "was preempted at least once in 5 seconds" is true by construction of
+// the run rather than by luck of the runner's core count.
+//
+// What is deliberately NOT asserted is that preemption is the MAJORITY.
+// The Go runtime's sysmon thread parks and wakes on the order of 100
+// times a second and each park is a voluntary switch, so the majority
+// reason for a spinning Go program is a property of the runtime's
+// bookkeeping threads, not of the workload.
 func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {
 	requireBPFRunnable(t, getAgentPath(t))
 
 	agentPath := getAgentPath(t)
-	wl := workloads[0] // Go CPU workload
 
-	// Start CPU-bound workload
-	workload := exec.Command(wl.Binary, wl.Args...)
+	// Oversubscribe: 2x NumCPU spinning goroutines AND GOMAXPROCS raised
+	// to match, so they become that many runnable OS threads rather than
+	// NumCPU threads multiplexing them in user space. Goroutines alone
+	// would not do it — Go would still run only GOMAXPROCS threads, and
+	// on an idle many-core machine each could sit on its own CPU and
+	// never be preempted for the whole window, which is exactly how
+	// "assert Preempted > 0" would otherwise become flaky.
+	threads := 2 * runtime.NumCPU()
+	workload := exec.Command("./workloads/go/cpu_bound",
+		workloadRuntimeFlag, fmt.Sprintf("-threads=%d", threads))
+	workload.Env = append(os.Environ(), fmt.Sprintf("GOMAXPROCS=%d", threads))
 	require.NoError(t, workload.Start())
 	defer func() {
 		if workload.Process != nil {
@@ -940,24 +961,21 @@ func TestPMUCPUWorkloadMostlyRunning(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	// Run perf-agent with PMU
-	agent := exec.Command(agentPath,
-		"--pmu",
-		"--pid", fmt.Sprintf("%d", workload.Process.Pid),
-		"--duration", "5s",
-	)
+	counts, output := collectPMUContextSwitches(t, agentPath, workload, "go/cpu_bound",
+		"--pmu", "--pid", fmt.Sprintf("%d", workload.Process.Pid))
+	t.Logf("%s (%d spinning threads on %d CPUs)", counts, threads, runtime.NumCPU())
 
-	output, err := agent.CombinedOutput()
-	if err != nil {
-		t.Fatalf("perf-agent failed: %v\nOutput: %s", err, string(output))
-	}
+	assert.Positive(t, counts.Preempted,
+		"a CPU-bound workload oversubscribing every CPU (%d threads on %d CPUs) must record "+
+			"switches classified as preemption, but none of its %d switches were — "+
+			"task-state classification is broken.\n%s\nOutput:\n%s",
+		threads, runtime.NumCPU(), counts.Total(), counts, output)
 
-	outputStr := string(output)
-	t.Logf("Output:\n%s", outputStr)
-
-	// CPU-bound workload should show preempted switches
-	// (it gets preempted because it never voluntarily yields)
-	assert.Contains(t, outputStr, "Preempted (running):")
+	assert.Less(t, counts.Percent(counts.IOWait), 50.0,
+		"a CPU-bound workload that touches no files after start-up should not spend most of "+
+			"its context switches in uninterruptible I/O wait; %d of %d switches were classified "+
+			"as D state.\n%s\nOutput:\n%s",
+		counts.IOWait, counts.Total(), counts, output)
 }
 
 func TestSystemWidePMUWithNewMetrics(t *testing.T) {

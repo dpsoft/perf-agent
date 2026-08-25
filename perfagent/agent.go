@@ -12,7 +12,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +21,6 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
-	"github.com/dpsoft/perf-agent/inject/ptraceop"
-	"github.com/dpsoft/perf-agent/inject/python"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
@@ -82,7 +79,6 @@ type Agent struct {
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
 	pmuMonitor     *cpu.PMUMonitor
-	pyInjector     *python.Manager // nil unless --inject-python is set
 	perfDataWriter *perfdata.Writer // nil when --perf-data-output not set
 
 	// symbolizer is the agent-owned shared symbol resolver. Selected at
@@ -115,16 +111,6 @@ func New(opts ...Option) (*Agent, error) {
 
 	a := &Agent{config: config}
 
-	if config.InjectPython {
-		low := &ptraceopBridge{inj: ptraceop.New(slog.Default())}
-		a.pyInjector = python.NewManager(python.Options{
-			StrictPerPID: config.PID != 0, // single-PID is strict; -a is lenient
-			Logger:       slog.Default(),
-			Detector:     python.NewDetector("/proc", slog.Default()),
-			Injector:     low,
-		})
-	}
-
 	return a, nil
 }
 
@@ -150,38 +136,7 @@ func (c *Config) validate() error {
 		return errors.New("per-PID is only valid with PMU enabled")
 	}
 
-	if c.InjectPython && !c.EnableCPUProfile {
-		return errors.New("--inject-python requires --profile (off-cpu and pmu are not supported)")
-	}
-
-	if c.InjectPython && !hasCapSysPtrace() {
-		return errors.New("--inject-python requires CAP_SYS_PTRACE; use sudo or setcap")
-	}
-
 	return nil
-}
-
-// hasCapSysPtrace reports whether the current process holds CAP_SYS_PTRACE
-// in either the Permitted or Effective set. validate() runs before Start()
-// promotes Permitted → Effective via SetFlag, so checking Effective alone
-// would falsely reject runs where the cap was granted via setcap or
-// inherited but not yet promoted. Mirrors test/integration_test.go's
-// nil-safe probing against libcap.
-func hasCapSysPtrace() bool {
-	if os.Geteuid() == 0 {
-		return true
-	}
-	caps := cap.GetProc()
-	if caps == nil {
-		return false
-	}
-	for _, flag := range []cap.Flag{cap.Permitted, cap.Effective} {
-		have, err := caps.GetFlag(flag, cap.SYS_PTRACE)
-		if err == nil && have {
-			return true
-		}
-	}
-	return false
 }
 
 // resolveTarget translates the configured PID to its host-namespace
@@ -417,15 +372,6 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
-	// Inject Python perf-trampoline before BPF attach so early samples have
-	// JIT symbol names. Runs only when --inject-python is set.
-	if a.pyInjector != nil {
-		pids := a.scanPythonTargets(hostPID)
-		if err := a.pyInjector.ActivateAll(pids); err != nil {
-			return fmt.Errorf("python injection: %w", err)
-		}
-	}
-
 	// Construct the shared symbolizer once. All profilers below share the
 	// same instance. chooseSymbolizer picks LocalSymbolizer when no
 	// debuginfod URLs are configured, or DebuginfodSymbolizer otherwise.
@@ -458,14 +404,13 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.config.EnableCPUProfile {
 		switch a.config.Unwind {
 		case "dwarf":
-			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
 				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
-				hooks,
+				nil, // dwarfagent.Hooks: no observers wired
 				dwarfagent.ModeEager,
 				labels,
 				a.perfDataWriter,
@@ -484,14 +429,13 @@ func (a *Agent) Start(ctx context.Context) error {
 				log.Printf("CPU profiler enabled (PID: %s, %d Hz, DWARF)", a.pidLogStr(hostPID), a.config.SampleRate)
 			}
 		case "auto":
-			hooks := dwarfHooksForAgent(a)
 			p, err := dwarfagent.NewProfilerWithMode(
 				hostPID,
 				a.config.SystemWide,
 				cpus,
 				a.config.Tags,
 				a.config.SampleRate,
-				hooks,
+				nil, // dwarfagent.Hooks: no observers wired
 				dwarfagent.ModeLazy,
 				labels,
 				a.perfDataWriter,
@@ -667,12 +611,6 @@ func (a *Agent) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Deactivate Python trampolines after profile finalization but before BPF
-	// teardown. Tolerates ESRCH (process gone) and respects the 5s deadline.
-	if a.pyInjector != nil {
-		a.pyInjector.DeactivateAll(ctx)
-	}
-
 	return lastErr
 }
 
@@ -812,88 +750,6 @@ func (a *Agent) Config() Config {
 	return *a.config
 }
 
-// PythonInjectStats returns counters for the Python injector. Returns a
-// zero-value Stats if --inject-python was not enabled.
-func (a *Agent) PythonInjectStats() *python.Stats {
-	if a.pyInjector == nil {
-		return &python.Stats{}
-	}
-	return a.pyInjector.Stats()
-}
-
-// scanPythonTargets returns the PIDs to consider for injection. For --pid
-// mode, just [hostPID] (the host-namespace PID that ptrace(2) requires).
-// For -a mode, walks /proc and returns all numeric PID directories (the
-// Manager's Detect call filters down to actual Python processes).
-func (a *Agent) scanPythonTargets(hostPID int) []uint32 {
-	if a.config.PID != 0 {
-		return []uint32{uint32(hostPID)}
-	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	pids := make([]uint32, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		v, err := strconv.ParseUint(e.Name(), 10, 32)
-		if err != nil {
-			continue
-		}
-		pids = append(pids, uint32(v))
-	}
-	return pids
-}
-
-// ptraceopBridge adapts ptraceop.Injector to python.LowLevelInjector,
-// supplying the activate/deactivate payloads from inject/python and
-// translating ptraceop's language-agnostic typed errors into Python-specific
-// sentinels the manager can classify (e.g. PyRun_SimpleString returning -1
-// → python.ErrNoPerfTrampoline so the manager records SkippedNoTramp instead
-// of an opaque ActivateFailed).
-type ptraceopBridge struct {
-	inj *ptraceop.Injector
-}
-
-func (b *ptraceopBridge) RemoteActivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
-	err := b.inj.RemoteActivate(pid, ptraceop.SymbolAddrs{
-		PyGILEnsure:  addrs.PyGILEnsure,
-		PyGILRelease: addrs.PyGILRelease,
-		PyRunString:  addrs.PyRunString,
-	}, python.ActivatePayload())
-	return mapPtraceopErrToPython(err)
-}
-
-func (b *ptraceopBridge) RemoteDeactivate(pid uint32, addrs python.SymbolAddrsForTarget) error {
-	err := b.inj.RemoteDeactivate(pid, ptraceop.SymbolAddrs{
-		PyGILEnsure:  addrs.PyGILEnsure,
-		PyGILRelease: addrs.PyGILRelease,
-		PyRunString:  addrs.PyRunString,
-	}, python.DeactivatePayload())
-	return mapPtraceopErrToPython(err)
-}
-
-// mapPtraceopErrToPython translates a ptraceop typed error into a
-// python-domain sentinel-wrapped error when the result code corresponds to
-// a Python-level failure. PyRun_SimpleString returns -1 on any Python error;
-// in the activate/deactivate payload context this is overwhelmingly the
-// "perf trampoline not supported" path (the test gate already runs the
-// payload from a normal interpreter, so structurally-different errors at
-// inject time are rare and worth surfacing as ActivateFailed).
-func mapPtraceopErrToPython(err error) error {
-	if err == nil {
-		return nil
-	}
-	var nonZero *ptraceop.ErrRemoteCallNonZero
-	if errors.As(err, &nonZero) && int32(nonZero.Result) == -1 {
-		return fmt.Errorf("activation refused (PyRun_SimpleString returned -1): %w",
-			python.ErrNoPerfTrampoline)
-	}
-	return err
-}
-
 // emitCommForPID reads /proc/<pid>/comm and writes a PERF_RECORD_COMM.
 // Best-effort: returns silently if /proc/<pid>/comm is unreadable
 // (process exited, restricted) — without COMM `perf script` shows
@@ -956,21 +812,4 @@ func emitUserspaceMmapsForPID(w *perfdata.Writer, r *procmap.Resolver, pid int) 
 		})
 	}
 	w.AddUserspaceMmaps(pid, user)
-}
-
-// dwarfHooksForAgent builds a *dwarfagent.Hooks for this agent. When
-// --inject-python is enabled and the target is system-wide, OnNewExec is
-// wired to pyInjector.ActivateLate so late-arriving Python processes are
-// injected without a polling loop. When --inject-python is off (default),
-// hooks is nil — the PIDTracker performs a single nil check per fork event
-// and does zero additional work.
-func dwarfHooksForAgent(a *Agent) *dwarfagent.Hooks {
-	if a.pyInjector == nil || a.config.PID != 0 {
-		// No injector, or per-PID mode: late subscription is a no-op
-		// (single-PID already handled at startup).
-		return nil
-	}
-	return &dwarfagent.Hooks{
-		OnNewExec: a.pyInjector.ActivateLate,
-	}
 }

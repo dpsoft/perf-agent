@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The Python perf-trampoline injector (`--inject-python`) and the `inject/`
+  tree behind it.** The injector ptraced into a running CPython 3.12+ target and
+  remote-called `sys.activate_stack_trampoline('perf')`. It was removed because
+  it mutated the process it measured (and left trampoline overhead behind), only
+  worked on CPython 3.12+, required `CAP_SYS_PTRACE` to ptrace into the target,
+  and could not profile an already-running process without injecting into it.
+
+  **This removes a shipped capability with no replacement yet.** Until
+  [#83](https://github.com/dpsoft/perf-agent/issues/83) lands, perf-agent
+  produces **no Python-level frames of its own** — Python processes still
+  profile, but with C interpreter frames (`_PyEval_EvalFrameDefault`, …) rather
+  than Python qualnames. #83 replaces the injector by walking the interpreter's
+  frame chain from BPF (no injection, CPython 3.6+, no new capability); it is
+  queued behind the GPU PC-sampling phase and is not built yet.
+
+  Unaffected: if the interpreter is started with `python -X perf` (3.12+) by
+  whoever launches it, CPython writes `/tmp/perf-<pid>.map` itself and
+  perf-agent still reads and decodes those `py::` entries as before.
+
 ## [1.2.1] - 2026-08-13
 
 ### Fixed

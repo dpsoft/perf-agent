@@ -95,10 +95,6 @@ type Config struct {
 	// CPUs is the list of CPUs to monitor. If nil, all online CPUs are used.
 	CPUs []uint
 
-	// InjectPython enables Python perf-trampoline injection during profiling.
-	// Only valid with EnableCPUProfile. Requires CAP_SYS_PTRACE.
-	InjectPython bool
-
 	// Labels are static per-sample pprof labels. Merged on top of the enricher
 	// output (Labels wins on key collision). Set via WithLabels.
 	Labels map[string]string
@@ -252,14 +248,6 @@ func WithUnwind(mode string) Option {
 	return func(c *Config) {
 		c.Unwind = mode
 	}
-}
-
-// WithInjectPython enables Python perf-trampoline injection during profiling.
-// Caller must hold CAP_SYS_PTRACE. With --pid N, any per-target failure exits
-// non-zero (strict). With -a, failures are logged and the profile continues
-// (lenient). Only valid when CPU profiling is enabled.
-func WithInjectPython(enabled bool) Option {
-	return func(c *Config) { c.InjectPython = enabled }
 }
 
 // WithLabels attaches static per-sample labels to every emitted pprof

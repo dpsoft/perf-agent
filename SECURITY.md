@@ -26,7 +26,6 @@ In scope:
 - Userspace bugs that allow a non-root caller to escalate via the agent (e.g. crafted `/proc` content, malicious target processes).
 - Bugs in capability handling — the agent dropping caps incorrectly, or running with broader caps than required.
 - Symbolizer / ELF parser bugs that crash on malformed input from `/proc/<pid>/maps` targets.
-- Issues in the optional Python perf-trampoline injector (`--inject-python`) — ptrace into untrusted targets, race conditions on attach.
 
 Out of scope:
 

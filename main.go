@@ -25,10 +25,10 @@ var (
 	flagPerPID        = flag.Bool("per-pid", false, "Show per-PID breakdown (only with -a --pmu)")
 	flagDuration      = flag.Duration("duration", 10*time.Second, "Collection duration")
 	flagSampleRate    = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
-	flagProfileOutput  = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
-	flagOffcpuOutput   = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
-	flagPMUOutput      = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
-	flagFlamegraph     = flag.String("flamegraph-output", "",
+	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
+	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
+	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagFlamegraph    = flag.String("flamegraph-output", "",
 		"Also write a self-contained interactive HTML flame graph of the profile. "+
 			"Pass a path, or 'auto' to name it like the other outputs "+
 			"({process}-{timestamp}-{on-cpu|off-cpu}.html). With both --profile and "+
@@ -37,12 +37,10 @@ var (
 		"Write a kernel-format perf.data file alongside the pprof output. "+
 			"Consumable by perf script, perf report, create_llvm_prof (AutoFDO PGO), "+
 			"FlameGraph, hotspot, etc.")
-	flagUnwind        = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
-	flagInjectPython  = flag.Bool("inject-python", false,
-		"Inject sys.activate_stack_trampoline('perf') into running CPython 3.12+ targets via ptrace. Requires CAP_SYS_PTRACE. Off by default.")
-	flagTags               tagFlags
-	flagDebuginfodURLs     urlFlags
-	flagSymbolCacheDir     = flag.String("symbol-cache-dir", "",
+	flagUnwind         = flag.String("unwind", "auto", "Stack unwinding strategy: fp | dwarf | auto (auto → dwarf)")
+	flagTags           tagFlags
+	flagDebuginfodURLs urlFlags
+	flagSymbolCacheDir = flag.String("symbol-cache-dir", "",
 		"Directory for debuginfod-fetched artifacts. Default: /tmp/perf-agent-debuginfod.")
 	flagSymbolCacheMax = flag.Int64("symbol-cache-max", 0,
 		"Maximum size of the debuginfod cache in bytes. Default: 2 GiB.")
@@ -276,11 +274,6 @@ func buildOptions() []perfagent.Option {
 	// Unwinding strategy
 	if *flagUnwind != "" {
 		opts = append(opts, perfagent.WithUnwind(*flagUnwind))
-	}
-
-	// Python perf-trampoline injection
-	if *flagInjectPython {
-		opts = append(opts, perfagent.WithInjectPython(true))
 	}
 
 	return opts

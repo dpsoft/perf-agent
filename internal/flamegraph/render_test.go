@@ -49,7 +49,8 @@ func TestRenderHTMLProducesAStandalonePage(t *testing.T) {
 		"<!DOCTYPE html>", "<html lang=\"en\">", "<title>GPU flame graph</title>",
 		"<div class=\"chart\"", ">main</div>", ">work</div>",
 		`id="status"`, `id="tip"`, `id="info"`, `id="q"`, `id="info-btn"`, `id="theme-btn"`,
-		"function zoom(target)", "function applySearch(query)",
+		`id="tree"`, `id="inv-btn"`, `id="tree-btn"`,
+		"function zoom(target)", "function applySearch()", "function buildTree()", "function toggleInvert()",
 	} {
 		assert.Contains(t, got, want)
 	}
@@ -549,11 +550,16 @@ func TestTypographyAndRowPitchAreFixedPixelsAtEveryWindowWidth(t *testing.T) {
 	assert.Contains(t, styleSheet, "font-size:11px")
 	assert.Contains(t, styleSheet, "height:17px")
 	assert.Contains(t, styleSheet, "line-height:17px")
-	// One rule per depth, offset from the floor: a depth is the same number
-	// of pixels up whatever the profile and whatever the window.
-	for d, top := range map[int]int{0: 0, 1: frameHeight, 3: 3 * frameHeight} {
-		assert.Contains(t, got, fmt.Sprintf(".d%d{bottom:%dpx}", d, top))
+	// One rule per depth, and one rule that turns a depth into an offset
+	// from the floor: a depth is the same number of pixels up whatever the
+	// profile and whatever the window. The pitch is a px literal in a
+	// stylesheet, so there is nothing in it for a window width to change.
+	for d := range 4 {
+		assert.Contains(t, got, fmt.Sprintf(".d%d{--d:%d}", d, d))
 	}
+	assert.Contains(t, got, fmt.Sprintf(".frame{bottom:calc(var(--d)*%dpx)}", frameHeight))
+	assert.Contains(t, got, fmt.Sprintf(".inv .frame{bottom:auto;top:calc(var(--d)*%dpx)}", frameHeight),
+		"the icicle is the same ladder measured from the other end")
 	assert.Contains(t, got, `class="frame d3 `, "the leaf sits three rows up")
 	assert.NotContains(t, got, ".d4{", "and there is no fourth row to sit on")
 }
@@ -620,11 +626,133 @@ func TestRenderFragmentCarriesTheGraphAndItsColoursAndNothingElse(t *testing.T) 
 	assert.Contains(t, got, `<div class="chart"`)
 	assert.Contains(t, got, `style="left:25%;width:75%"`, "the same percentage geometry as the page")
 	assert.Contains(t, got, "--fill-app:", "and its own palette, since a host page has none")
-	assert.Contains(t, got, ".d2{bottom:36px}")
+	assert.Contains(t, got, ".d2{--d:2}")
+	assert.Contains(t, got, fmt.Sprintf(".frame{bottom:calc(var(--d)*%dpx)}", frameHeight))
 	assert.Contains(t, got, "text-overflow:ellipsis", "including the rule that does the truncating")
 
 	// None of the page's chrome, and none of its interactivity.
 	for _, gone := range []string{"<script", "<!DOCTYPE", "id=\"status\"", "id=\"info\"", "Colour means domain"} {
 		assert.NotContains(t, got, gone)
+	}
+}
+
+// The three new views are scripted, and the page must not become one of them
+// by default: with the <script> deleted, a reader still gets the flame graph
+// — right way up, chart visible, tree box empty and hidden.
+func TestTheDefaultViewIsTheUnscriptedOne(t *testing.T) {
+	got := renderString(t, result(
+		foldedstacks.Stack{Frames: []string{"main", "work"}, Value: 3000},
+		foldedstacks.Stack{Frames: []string{"main", "idle"}, Value: 1000},
+	), Options{})
+	body := got[strings.Index(got, "<body>"):strings.Index(got, "<script>")]
+
+	assert.Contains(t, body, `<div class="chart"`)
+	assert.NotContains(t, body, `class="chart inv`, "the icicle is a class the script adds, never the markup")
+	assert.NotContains(t, body, `<div class="chart" hidden`)
+	assert.Contains(t, body, `<div id="tree" role="group" aria-label="Call tree, gpu/nanoseconds`)
+	assert.Contains(t, body, `hidden></div>`, "the tree box is empty and hidden until T")
+	// Empty: the tree's rows are the frames the chart already carries, so
+	// nothing on the page is a second copy of a symbol.
+	assert.Equal(t, 1, strings.Count(got, ">work</div>"))
+	assert.Equal(t, 1, strings.Count(got, ">idle</div>"))
+	// Both directions of the ladder ship, so inverting needs no re-render.
+	assert.Contains(t, got, ".inv .frame{bottom:auto;top:")
+}
+
+// async-profiler's I is a visual flip: the same tree, drawn downward. It is
+// not a callee-centric reverse merge — that is their converter's --reverse
+// flag, which builds a different tree before the page exists. Ours matches,
+// which means the client must not be aggregating anything: inverting is a
+// class on the chart and the widths are untouched, so I and I again is the
+// page it started as.
+func TestInvertIsAVisualFlipAndMergesNothing(t *testing.T) {
+	assert.Contains(t, script, `chart.classList.toggle("inv",inverted)`)
+	// No second aggregation, no rebuilding of spans: the only writes to a
+	// frame's geometry are place(), which zoom and reset drive.
+	assert.Equal(t, 1, strings.Count(script, "it.el.style.left="),
+		"one place to write a frame's span, or inverting has grown a second layout")
+	assert.NotContains(t, script, "it.x=")
+	assert.NotContains(t, script, "it.w=")
+	assert.NotContains(t, script, "it.value=")
+	// The row ladder does the flip, and it is the same ladder both ways.
+	assert.Contains(t, rowCSS(4), ".frame{bottom:calc(var(--d)*18px)}")
+	assert.Contains(t, rowCSS(4), ".inv .frame{bottom:auto;top:calc(var(--d)*18px)}")
+}
+
+// The tree is the same data, so it is built from the frames rather than
+// emitted beside them: depth class plus document order is a pre-order walk,
+// and writeNode already emits one.
+func TestTheFramesCarryEnoughToRebuildTheTree(t *testing.T) {
+	got := renderString(t, result(
+		foldedstacks.Stack{Frames: []string{"main", "a", "deep"}, Value: 3000},
+		foldedstacks.Stack{Frames: []string{"main", "b"}, Value: 1000},
+	), Options{})
+
+	// Document order is the pre-order walk the script assumes.
+	order := regexp.MustCompile(`class="frame d(\d+)[^"]*"[^>]*>([^<]*)</div>`).FindAllStringSubmatch(got, -1)
+	require.Len(t, order, 5)
+	var seen []string
+	for _, m := range order {
+		seen = append(seen, m[1]+":"+m[2])
+	}
+	assert.Equal(t, []string{"0:all", "1:main", "2:a", "3:deep", "2:b"}, seen)
+
+	// And the value every row needs is already on the frame.
+	assert.Contains(t, got, `data-value="3000"`)
+	assert.Contains(t, script, "function buildTree()")
+	assert.Contains(t, script, "doc.createElement(\"details\")", "the tree's disclosure is native, not an aria-expanded we keep in sync")
+	assert.Contains(t, script, "doc.createElement(\"summary\")")
+
+	// The tree's rules ship with the graph page and only with it: a
+	// degenerate profile has no tree to press T for.
+	assert.Contains(t, got, "#tree summary::before")
+	var b strings.Builder
+	require.NoError(t, RenderHTML(&b, &foldedstacks.Result{SampleTypeName: "gpu", Unit: "nanoseconds"}, Options{}))
+	assert.NotContains(t, b.String(), "#tree", "the degenerate page must not carry the tree's stylesheet")
+}
+
+// Search grew a match count, a share of the total and N/Shift+N stepping.
+// The share must be a share: a match nested inside a match is highlighted,
+// but its value is not added a second time, or the page can report 140% of
+// the profile matching one word.
+func TestSearchCountsTheOutermostMatchesOnce(t *testing.T) {
+	assert.Contains(t, script, "if(it.x>=end){nav.push(it);v+=it.value;end=it.x+it.w;}")
+	assert.Contains(t, script, `grouped(n)+" matched · "+fmt(v)+" · "+pct(v)`)
+	assert.Contains(t, script, "function stepMatch(dir)")
+	assert.Contains(t, script, `" ("+(navIdx+1)+" of "+nav.length+")"`)
+	// The count is over the profile, not over what the zoom happens to show,
+	// so it answers the same question at every zoom level.
+	assert.NotContains(t, script, "if(hit&&it.shown)")
+}
+
+// The keyboard map is only discoverable from the panel, so the panel must
+// carry the map the script actually implements.
+func TestTheInfoPanelListsTheKeysTheScriptImplements(t *testing.T) {
+	got := renderString(t, result(foldedstacks.Stack{Frames: []string{"main"}, Value: 1}), Options{})
+	for _, k := range []string{"I", "T", "Ctrl+F", "N / Shift+N", "0", "Esc", "D", "?"} {
+		assert.Contains(t, got, "<kbd>"+html.EscapeString(k)+"</kbd>")
+	}
+	// I moved to invert, so the panel must no longer promise it opens this.
+	assert.NotContains(t, got, "<kbd>? or I</kbd>")
+	assert.NotContains(t, script, `e.key==="?"||e.key==="i"`)
+	assert.Contains(t, script, `e.key==="i"||e.key==="I"){toggleInvert()`)
+	assert.Contains(t, script, `e.key==="t"||e.key==="T"){toggleTree()`)
+	assert.Contains(t, script, `e.key==="?"){toggleInfo()`)
+}
+
+// Every byte of these constants is shipped to every reader of every page
+// perf-agent writes, so the prose that explains them lives in Go comments
+// beside them, not inside them. The rule is stated at the top of assets.go;
+// this is what keeps it true.
+func TestTheShippedAssetsCarryNoProseComments(t *testing.T) {
+	for name, asset := range map[string]string{
+		"script": script, "styleSheet": styleSheet, "paletteCSS": paletteCSS,
+		"reportCSS": reportCSS, "embedCSS": embedCSS, "jitterCSS": jitterCSS,
+	} {
+		for i, l := range strings.Split(asset, "\n") {
+			line := strings.TrimSpace(l)
+			assert.False(t, strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*"),
+				"%s line %d is a comment shipped to every reader; explain it in a Go comment instead: %s", name, i+1, line)
+		}
 	}
 }

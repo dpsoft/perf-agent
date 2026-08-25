@@ -98,6 +98,37 @@ th{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mu
 .lv{display:inline-block;margin:0 8px 2px 0;white-space:nowrap}
 `
 
+// treeCSS is the tree view's own rules, kept out of styleSheet because a
+// degenerate profile has no tree to press T for and should not carry 1.1 KB
+// of rules for one. Same reasoning as reportCSS, which the graph page does
+// not carry either.
+//
+// A row is a native <summary> inside a <details>, so the triangle is CSS on
+// ::before rather than an aria-expanded the script has to keep in sync, and
+// the marker the UA would draw is suppressed. The percentage and the value
+// are fixed-width columns so the numbers line up down the page; the swatch
+// takes its colour from the same [data-domain] rules the frames use, which
+// is why those rules are not scoped to .frame.
+const treeCSS = `
+#tree{margin:8px 0 0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+#tree ul{list-style:none;margin:0;padding:0 0 0 15px}
+#tree>ul{padding-left:0}
+#tree li{white-space:nowrap}
+#tree summary,#tree .leaf{display:block;padding:1px 3px;border-radius:3px;list-style:none}
+#tree summary{cursor:pointer}
+#tree .leaf{padding-left:16px}
+#tree summary::-webkit-details-marker{display:none}
+#tree summary::before{content:"\25B8";display:inline-block;width:13px;color:var(--muted)}
+#tree details[open]>summary::before{content:"\25BE"}
+#tree summary:hover,#tree .leaf:hover{background:var(--line)}
+#tree summary:focus-visible{outline:2px solid var(--accent)}
+#tree .p{display:inline-block;width:5em;text-align:right;color:var(--muted)}
+#tree .v{display:inline-block;width:8.5em;text-align:right;color:var(--muted);padding-right:9px}
+#tree .sw{width:10px;height:10px;margin-right:5px}
+#tree .m{background:var(--fill-match);color:var(--frame-ink);border-radius:2px;padding:0 2px}
+#tree .cur{outline:2px solid var(--accent);outline-offset:-2px}
+`
+
 // reportCSS styles the page a degenerate profile gets: no graph, no status
 // bar, no info panel — a written report about why there is nothing to draw.
 // It is emitted only on that page, so the 99% case does not carry it.
@@ -212,26 +243,29 @@ const paletteCSS = `
   --edge-shim:         hsl(215 24% calc(46% + var(--fill-dl)));
 
   --frame-ink: hsl(30 12% 9%);
+  --fill-match: hsl(300 100% 71%);
 }
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){` + darkKnobs + `}}
 :root[data-theme="dark"]{` + darkKnobs + `}
 
 .frame{color:var(--frame-ink);background-color:var(--fill-x);background-color:hsl(from var(--fill-x) h s calc(l + var(--fill-j)));box-shadow:inset 0 0 0 .5px var(--edge-frame)}
-.frame[data-domain="root"]{--fill-x:var(--fill-root)}
-.frame[data-domain="app"]{--fill-x:var(--fill-app)}
-.frame[data-domain="system"]{--fill-x:var(--fill-system)}
-.frame[data-domain="kernel"]{--fill-x:var(--fill-kernel)}
-.frame[data-domain="vendor"]{--fill-x:var(--fill-vendor)}
-.frame[data-domain="unsym"]{--fill-x:var(--fill-unsym);background-image:var(--hatch-gap)}
-.frame[data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
-.frame[data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
-.frame[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
-.frame[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
+[data-domain="root"]{--fill-x:var(--fill-root)}
+[data-domain="app"]{--fill-x:var(--fill-app)}
+[data-domain="system"]{--fill-x:var(--fill-system)}
+[data-domain="kernel"]{--fill-x:var(--fill-kernel)}
+[data-domain="vendor"]{--fill-x:var(--fill-vendor)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym);background-image:var(--hatch-gap)}
+[data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
+[data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
+[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
+[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
 .frame.inexact{background-image:var(--hatch-inf)}
 .frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
 
 .frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
-.frame.match{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
+.frame.match{background-color:var(--fill-match)}
+.frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
+.sw[data-domain]{background-color:var(--fill-x)}
 `
 
 // The jitter ladder. jitterSteps shades per domain, evenly spaced from 0 to
@@ -266,19 +300,25 @@ func buildJitterCSS() string {
 	return b.String()
 }
 
-// rowCSS is the vertical half of the geometry: one rule per depth, offset
-// from the bottom of the chart because a flame graph grows upward from its
-// root. It is a rule per depth rather than an inline top on every frame
-// because a profile has far more frames than it has depths — 20 frames over
-// 17 depths here, but 20,000 over 60 in anything real.
+// rowCSS is the vertical half of the geometry: one rule per depth, and the
+// two rules that turn a depth into an offset.
 //
-// Measured from the bottom, so a depth means the same number of pixels
-// whatever the profile's height; measured from the top it would depend on
-// maxDepth, and the same class would mean two different things in two pages.
+// A depth class carries a NUMBER, not an offset — .d3{--d:3} — and the frame
+// multiplies it by the row pitch. That indirection is what buys the icicle:
+// the flame graph offsets from the bottom because it grows upward from its
+// root, the icicle offsets from the top because it grows downward from it,
+// and the difference is one extra rule rather than a second ladder of
+// per-depth offsets. It is also shorter than the offsets were — ".d59{--d:59}"
+// against ".d59{bottom:1062px}" — and a profile has far more frames than
+// depths, which is why the depth is a class at all and not an inline style.
+//
+// Both rules are in px and neither mentions the window, so the row pitch is
+// the same number of pixels at 800px and at 1990px, in either direction.
 func rowCSS(maxDepth int) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, ".frame{bottom:calc(var(--d)*%dpx)}\n.inv .frame{bottom:auto;top:calc(var(--d)*%dpx)}\n", frameHeight, frameHeight)
 	for d := range maxDepth {
-		fmt.Fprintf(&b, ".d%d{bottom:%dpx}", d, d*frameHeight)
+		fmt.Fprintf(&b, ".d%d{--d:%d}", d, d)
 	}
 	b.WriteByte('\n')
 	return b.String()
@@ -298,6 +338,36 @@ func rowCSS(maxDepth int) string {
 //     resize because nothing in it was ever in pixels.
 //   - fmt() mirrors flamegraph.FormatValue exactly: never invent a unit the
 //     profile did not give, and never call nanoseconds "samples".
+//
+// The three views it adds to that:
+//
+// toggleInvert is async-profiler's I, and theirs is a visual flip: the same
+// tree, drawn from the top down. It merges nothing and aggregates nothing —
+// the callee-centric reverse merge is their converter's --reverse flag,
+// which builds a different tree before the page exists. So inverting here is
+// one class on the chart, which swaps every frame's offset from bottom to
+// top (see rowCSS); no width, no value and no zoom is touched, and inverting
+// twice is the page it started as.
+//
+// buildTree reconstructs the call tree from the frames already in the
+// document. A frame carries its depth as a class and writeNode emits frames
+// in pre-order, so depth plus document order is a parent link — which means
+// the tree view costs no markup at all until someone presses T, and no
+// symbol is ever on the page twice. Rows are made when their parent first
+// opens, so a 20,000-frame profile builds the rows someone looked at; a
+// frame with exactly one child opens all the way through, because this
+// profile's CPU path is a corridor fourteen frames long with no doors off
+// it and clicking fourteen times down it is not navigation.
+//
+// applySearch counts over the whole profile, not over what the zoom happens
+// to show: a count and a share that changed when you zoomed would answer a
+// different question from the one the reader asked. nav holds only the
+// OUTERMOST matches — a match inside a match is highlighted but not walked
+// to, and its value is not added a second time, so the share can never
+// exceed 100%. Stepping (N, Shift+N, and Enter from inside the field, which
+// swallows N) zooms the flame view to the match or reveals it in the tree.
+// A match outside the tree's current root has no row to scroll to, so the
+// tree drops back to the whole profile rather than doing nothing.
 const script = `
 (function(){
 "use strict";
@@ -307,15 +377,33 @@ if(!chart){return;}
 var info=doc.getElementById("info");
 var st=doc.getElementById("st"),mc=doc.getElementById("mc");
 var q=doc.getElementById("q"),tip=doc.getElementById("tip");
+var tree=doc.getElementById("tree");
 var unit=chart.dataset.unit||"",total=+chart.dataset.total||0;
 var idle=st.textContent,zoomTarget=null;
+var axis=chart.getAttribute("aria-label");
+var inverted=false,treeOn=false,treeRoot=null;
+var nav=[],navIdx=-1,cur=null,tally="";
 
 var items=[].map.call(chart.querySelectorAll(".frame"),function(el){
   var name=el.textContent;
   return {el:el,name:name,lower:name.toLowerCase(),
+    d:+/(?:^| )d(\d+)(?: |$)/.exec(el.className)[1],
     value:+el.dataset.value||0,inexact:+el.dataset.inexact||0,
-    x:parseFloat(el.style.left),w:parseFloat(el.style.width),shown:true};
+    x:parseFloat(el.style.left),w:parseFloat(el.style.width),shown:true,kids:[]};
 });
+(function(){
+  var stack=[];
+  items.forEach(function(it){
+    stack.length=it.d;
+    if(it.d>0){it.up=stack[it.d-1];it.up.kids.push(it);}
+    stack.push(it);
+  });
+  items.forEach(function(it){
+    it.kids.sort(function(a,b){return b.value-a.value;});
+    it.self=it.value;
+    it.kids.forEach(function(c){it.self-=c.value;});
+  });
+})();
 
 function grouped(n){
   var s=String(Math.round(n)),out="",i;
@@ -347,6 +435,7 @@ function place(it,x,w,vis){
 function line(it){return it.name+"  ·  "+fmt(it.value)+"  ·  "+pct(it.value)+" of total";}
 function detail(it){
   var s=line(it),d=it.el.dataset;
+  if(it.kids.length&&it.self>0){s+="\nself: "+fmt(it.self);}
   if(d.module){s+="\nmodule: "+d.module;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
   if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
@@ -367,7 +456,6 @@ function showTip(evt,it){
 function reset(){
   zoomTarget=null;
   items.forEach(function(it){place(it,it.x,it.w,true);});
-  applySearch(q.value);
   status(null);
 }
 function zoom(target){
@@ -380,26 +468,144 @@ function zoom(target){
     if(it.x>=target.x&&end<=tEnd){place(it,(it.x-target.x)*ratio,it.w*ratio,true);return;}
     place(it,it.x,it.w,false);
   });
-  applySearch(q.value);
   status(null);
 }
-function applySearch(query){
-  var s=(query||"").trim().toLowerCase(),n=0,v=0;
+
+function applySearch(){
+  var s=q.value.trim().toLowerCase(),n=0,v=0,end=-1,keep=cur;
+  nav=[];
   items.forEach(function(it){
     var hit=s!==""&&it.lower.indexOf(s)!==-1;
-    it.el.classList.toggle("match",hit&&it.shown);
-    it.el.classList.toggle("dim",s!==""&&it.shown&&!hit);
-    if(hit&&it.shown){n++;v+=it.value;}
+    it.hit=hit;
+    it.el.classList.toggle("match",hit);
+    it.el.classList.toggle("dim",s!==""&&!hit);
+    it.el.classList.remove("cur");
+    if(it.nm){it.nm.classList.toggle("m",hit);}
+    if(it.head){it.head.classList.remove("cur");}
+    if(hit){
+      n++;
+      if(it.x>=end){nav.push(it);v+=it.value;end=it.x+it.w;}
+    }
   });
-  mc.textContent=s===""?"":(n===0?"no match":grouped(n)+" matched · "+fmt(v)+" · "+pct(v));
+  tally=s===""?"":(n===0?"no match":grouped(n)+" matched · "+fmt(v)+" · "+pct(v));
+  navIdx=keep?nav.indexOf(keep):-1;
+  cur=navIdx<0?null:keep;
+  if(cur){markCur();}
+  showTally();
 }
+function showTally(){
+  mc.textContent=tally+(cur?" ("+(navIdx+1)+" of "+nav.length+")":"");
+}
+function markCur(){
+  cur.el.classList.add("cur");
+  if(cur.head){cur.head.classList.add("cur");}
+}
+function stepMatch(dir){
+  if(nav.length===0){return;}
+  if(cur){cur.el.classList.remove("cur");if(cur.head){cur.head.classList.remove("cur");}}
+  navIdx=(navIdx+dir+nav.length)%nav.length;
+  cur=nav[navIdx];
+  if(treeOn){revealInTree(cur);}else{zoom(cur);cur.el.scrollIntoView({block:"center"});}
+  markCur();
+  status(cur);
+  showTally();
+}
+function openSearch(){q.hidden=false;q.focus();q.select();}
+function closeSearch(){q.value="";cur=null;applySearch();q.hidden=true;q.blur();}
+
 function toggleInfo(){info.open=!info.open;}
 function toggleTheme(){
   var dark=root.dataset.theme?root.dataset.theme==="dark":matchMedia("(prefers-color-scheme: dark)").matches;
   root.dataset.theme=dark?"light":"dark";
 }
-function openSearch(){q.hidden=false;q.focus();q.select();}
-function closeSearch(){q.value="";applySearch("");q.hidden=true;q.blur();}
+
+function toggleInvert(){
+  inverted=!inverted;
+  chart.classList.toggle("inv",inverted);
+  chart.setAttribute("aria-label",inverted?axis+", inverted: root at top":axis);
+  tip.hidden=true;
+}
+
+function toggleTree(){
+  treeOn=!treeOn;
+  if(treeOn){buildTree();}
+  tip.hidden=true;
+  tree.hidden=!treeOn;
+  chart.hidden=treeOn;
+}
+function buildTree(){
+  var r=zoomTarget||items[0];
+  if(treeRoot===r){return;}
+  treeRoot=r;
+  items.forEach(function(it){it.det=it.head=it.nm=it.filled=null;});
+  tree.textContent="";
+  var ul=doc.createElement("ul");
+  ul.appendChild(makeRow(r));
+  tree.appendChild(ul);
+  expand(r);
+}
+function makeRow(it){
+  var li=doc.createElement("li"),head;
+  if(it.kids.length){
+    var det=doc.createElement("details");
+    head=doc.createElement("summary");
+    det.appendChild(head);
+    det.addEventListener("toggle",function(){if(det.open){expand(it);}});
+    li.appendChild(det);
+    it.det=det;
+  }else{
+    head=doc.createElement("div");
+    head.className="leaf";
+    li.appendChild(head);
+  }
+  var sw=doc.createElement("span");
+  sw.className="sw";
+  sw.dataset.domain=it.el.dataset.domain||"";
+  sw.setAttribute("aria-hidden","true");
+  var p=doc.createElement("span");
+  p.className="p";
+  p.textContent=pct(it.value);
+  var v=doc.createElement("span");
+  v.className="v";
+  v.textContent=fmt(it.value);
+  var nm=doc.createElement("span");
+  nm.textContent=it.name;
+  if(it.hit){nm.className="m";}
+  head.appendChild(p);
+  head.appendChild(v);
+  head.appendChild(sw);
+  head.appendChild(nm);
+  head.title=detail(it);
+  it.head=head;
+  it.nm=nm;
+  if(cur===it){head.classList.add("cur");}
+  return li;
+}
+function expand(it){
+  if(!it.kids.length){return;}
+  if(!it.filled){
+    it.filled=true;
+    var ul=doc.createElement("ul");
+    it.kids.forEach(function(c){ul.appendChild(makeRow(c));});
+    it.det.appendChild(ul);
+  }
+  it.det.open=true;
+  if(it.kids.length===1){expand(it.kids[0]);}
+}
+function revealInTree(it){
+  var chain=[],p=it;
+  while(p&&p!==treeRoot){chain.push(p);p=p.up;}
+  if(p!==treeRoot){
+    treeRoot=null;
+    zoomTarget=null;
+    buildTree();
+    return revealInTree(it);
+  }
+  chain.push(treeRoot);
+  chain.reverse();
+  chain.forEach(function(o,i){if(i<chain.length-1){expand(o);}});
+  if(it.head){it.head.scrollIntoView({block:"center"});}
+}
 
 items.forEach(function(it){
   it.el.addEventListener("click",function(e){e.stopPropagation();zoom(it);});
@@ -408,8 +614,10 @@ items.forEach(function(it){
   it.el.addEventListener("mouseleave",function(){tip.hidden=true;status(null);});
 });
 chart.addEventListener("click",function(e){if(e.target===chart){reset();}});
-q.addEventListener("input",function(e){applySearch(e.target.value);});
+q.addEventListener("input",function(){cur=null;applySearch();});
 doc.getElementById("theme-btn").addEventListener("click",toggleTheme);
+doc.getElementById("inv-btn").addEventListener("click",toggleInvert);
+doc.getElementById("tree-btn").addEventListener("click",toggleTree);
 doc.getElementById("close").addEventListener("click",function(){info.open=false;});
 doc.addEventListener("click",function(e){
   if(info.open&&!info.contains(e.target)){info.open=false;}
@@ -422,10 +630,18 @@ doc.addEventListener("keydown",function(e){
     else{reset();}
     return;
   }
-  if(e.ctrlKey||e.metaKey||e.altKey||doc.activeElement===q){return;}
+  if(doc.activeElement===q){
+    if(e.key==="Enter"){e.preventDefault();stepMatch(e.shiftKey?-1:1);}
+    return;
+  }
+  if(e.ctrlKey||e.metaKey||e.altKey){return;}
   if(e.key==="0"){reset();}
   else if(e.key==="d"||e.key==="D"){toggleTheme();}
-  else if(e.key==="?"||e.key==="i"||e.key==="I"){toggleInfo();}
+  else if(e.key==="i"||e.key==="I"){toggleInvert();}
+  else if(e.key==="t"||e.key==="T"){toggleTree();}
+  else if(e.key==="n"){stepMatch(1);}
+  else if(e.key==="N"){stepMatch(-1);}
+  else if(e.key==="?"){toggleInfo();}
 });
 reset();
 })();

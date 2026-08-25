@@ -169,7 +169,7 @@ func TestPaletteDeclaresATokenForEveryDomain(t *testing.T) {
 func TestEveryDomainKeyIsSelectedByARule(t *testing.T) {
 	for d := Domain(0); d < numDomains; d++ {
 		info := d.Info()
-		sel := fmt.Sprintf(`.frame[data-domain="%s"]{--fill-x:%s`, info.Key, info.Fill)
+		sel := fmt.Sprintf(`[data-domain="%s"]{--fill-x:%s`, info.Key, info.Fill)
 		assert.Contains(t, paletteCSS, sel, "no rule paints domain %q", info.Key)
 	}
 }
@@ -265,9 +265,9 @@ func TestTheTwoBoundariesStayTellableApart(t *testing.T) {
 	assert.Greater(t, tokens["fill-boundary-unattributed"].l, tokens["fill-boundary"].l+5,
 		"the unattributed boundary must be visibly paler")
 	assert.NotEmpty(t, DomainBoundaryUnattributed.Info().Overlay, "and hatched")
-	assert.Contains(t, paletteCSS, `.frame[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}`,
+	assert.Contains(t, paletteCSS, `[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}`,
 		"and dashed, because there is nothing behind it")
-	assert.NotContains(t, paletteCSS, `.frame[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary);outline`)
+	assert.NotContains(t, paletteCSS, `[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary);outline`)
 }
 
 // Frame labels are drawn on the fills. Gregg's palette was designed for a
@@ -358,7 +358,7 @@ func TestInkAndFrameOutlinesDoNotFollowThePageTheme(t *testing.T) {
 		"the page's ink inverts with the page; a frame's does not")
 	assert.Contains(t, paletteCSS, ".frame{color:var(--frame-ink)")
 	assert.Contains(t, paletteCSS, ".frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink)")
-	assert.Contains(t, paletteCSS, ".frame.match{box-shadow:inset 0 0 0 1.8px var(--frame-ink)")
+	assert.Contains(t, paletteCSS, ".frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink)")
 }
 
 // A hatch used to be an SVG <pattern> painted by a second <rect> per frame.
@@ -371,7 +371,7 @@ func TestEveryHatchedDomainIsActuallyHatchedByARule(t *testing.T) {
 		if info.Overlay == "" {
 			continue
 		}
-		assert.Contains(t, paletteCSS, fmt.Sprintf(`.frame[data-domain="%s"]{--fill-x:%s;background-image:%s`, info.Key, info.Fill, info.Overlay),
+		assert.Contains(t, paletteCSS, fmt.Sprintf(`[data-domain="%s"]{--fill-x:%s;background-image:%s`, info.Key, info.Fill, info.Overlay),
 			"domain %q says it is hatched but no rule hatches it", info.Key)
 		assert.Contains(t, paletteCSS, strings.TrimSuffix(strings.TrimPrefix(info.Overlay, "var("), ")")+":",
 			"domain %q names a hatch token the stylesheet does not declare", info.Key)
@@ -399,4 +399,54 @@ func TestFrameOutlinesAreNeverLaidOut(t *testing.T) {
 	}
 	assert.Contains(t, paletteCSS, "outline:1px dashed var(--edge-unattributed);outline-offset:-1px",
 		"the one dashed outline needs outline, which box-shadow cannot do — but it still must not be laid out")
+}
+
+// Magenta is the only colour on the page that does not mean "domain", and it
+// has to clear the same floor as the ones that do: a matched frame still has
+// a label on it, and a matched frame that is unsymbolized still has a hatch
+// over it. It is deliberately outside the themed --fill-* family — it is a
+// signal, not a layer, so it must not shift when the page does — which means
+// the light theme's heavier hatch is the binding case for both themes.
+func TestTheSearchColourIsLegibleAndReservedToSearch(t *testing.T) {
+	const matchH, matchS, matchL = 300, 100, 71
+	require.Contains(t, paletteCSS,
+		fmt.Sprintf("--fill-match: hsl(%d %d%% %d%%)", matchH, matchS, matchL),
+		"this test's magenta must be the magenta the page uses")
+
+	ink := hsl{frameInkH, frameInkS, frameInkL}
+	match := hsl{matchH, matchS, matchL}
+	assert.GreaterOrEqual(t, contrast(ink, match), 4.5,
+		"label ink on the search fill is %.2f:1", contrast(ink, match))
+	for _, alpha := range []float64{lightHatch, darkHatch} {
+		got := contrast(ink, overHatch(match, alpha))
+		assert.GreaterOrEqual(t, got, 4.5,
+			"label ink on a hatched search fill at hatch alpha %.2f is %.2f:1", alpha, got)
+	}
+
+	// It does not move with the theme, and no domain may spend it.
+	assert.NotContains(t, paletteCSS, "--fill-match: hsl(300 calc(",
+		"the search colour is a signal, not a palette member; the theme knobs must not touch it")
+	m := darkBlockRe.FindStringSubmatch(paletteCSS)
+	require.Len(t, m, 2)
+	assert.NotContains(t, m[1], "--fill-match")
+	assert.NotContains(t, paletteCSS, "]{--fill-x:var(--fill-match)")
+	for d := Domain(0); d < numDomains; d++ {
+		assert.NotEqual(t, "var(--fill-match)", d.Info().Fill, "domain %q took the search colour", d.Info().Key)
+	}
+	// Search paints the fill; only the one match N is standing on is outlined.
+	assert.Contains(t, paletteCSS, ".frame.match{background-color:var(--fill-match)}")
+	assert.NotContains(t, paletteCSS, ".frame.match{box-shadow")
+}
+
+// A domain is a domain wherever it is drawn. The tree view's swatches carry
+// data-domain and take their colour, their hatch and their outline from the
+// same rules the frames do, so a domain cannot come out one colour in the
+// graph and another in the tree.
+func TestDomainRulesAreNotFrameOnly(t *testing.T) {
+	for d := Domain(0); d < numDomains; d++ {
+		info := d.Info()
+		assert.NotContains(t, paletteCSS, fmt.Sprintf(`.frame[data-domain="%s"]{--fill-x:`, info.Key),
+			"domain %q paints only frames, so a tree swatch would have no colour", info.Key)
+	}
+	assert.Contains(t, paletteCSS, ".sw[data-domain]{background-color:var(--fill-x)}")
 }

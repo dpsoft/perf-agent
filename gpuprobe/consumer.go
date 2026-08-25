@@ -935,6 +935,20 @@ type Stats struct {
 	// well-resolved stack lands here. It is the ratio against
 	// StacksResolved's frame count that is diagnostic, not the raw number.
 	StackFramesUnresolved uint64
+	// StackFramesModuleOnly is the subset of StackFramesUnresolved that at
+	// least knows which file the address fell in, and therefore renders as
+	// "libcuda.so.1+0x1b71c6" instead of "0x7f2c945b2c2b". NVIDIA ships no
+	// symbols for the libcuda/libcupti internals a launch stack is full of,
+	// so the name is genuinely unrecoverable while the module is not, and
+	// knowing a frame is seven deep inside libcuda is most of the answer.
+	//
+	// Healthy: close to StackFramesUnresolved. Worst: zero while
+	// StackFramesUnresolved is large - no ModuleIndex is wired into the
+	// symbolizer, or the target exits before its stacks are drained, and
+	// every unresolved frame is an ASLR'd address that means nothing across
+	// runs. The two are counted apart precisely so that case cannot hide
+	// inside the total.
+	StackFramesModuleOnly uint64
 	// StackDeleteFailed counts gpu_stacks entries the consumer read but could
 	// not delete. See freeStackLocked: deletion is what stops the map
 	// filling, so a rising count here is the early warning for capture
@@ -2575,14 +2589,23 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	// indistinguishable from a function genuinely called "0x4017c2".
 	//
 	// Bounded and allocation-free: one pass over the frames already in hand,
-	// two integer increments, nothing retained.
-	var resolved int
+	// a few integer increments, nothing retained.
+	var resolved, moduleOnly int
 	for i := range frames {
 		if frames[i].Reason == symbolize.FailureNone {
 			resolved++
+			continue
+		}
+		// Unresolved, but the symbolizer placed it in a mapping - see
+		// symbolize.attachModules. Counted apart from the plain total so a
+		// run that recovers no modules at all cannot read the same as one
+		// that recovers them for every frame.
+		if _, ok := frames[i].ModuleOffset(); ok {
+			moduleOnly++
 		}
 	}
 	c.stats.StackFramesUnresolved += uint64(len(frames) - resolved)
+	c.stats.StackFramesModuleOnly += uint64(moduleOnly)
 	if resolved == 0 && len(frames) > 0 {
 		c.stats.StacksUnresolved++
 	}

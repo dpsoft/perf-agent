@@ -73,11 +73,24 @@ func New(opts Options) (*Symbolizer, error) {
 	// /proc/<pid>/exe is restricted). Construct lazily-tolerant:
 	// failure to build the fallback is non-fatal — the dispatcher
 	// just runs without it.
-	if lf, lfErr := symbolize.NewLocalSymbolizer(); lfErr == nil {
+	// opts.Resolver doubles as the fallback's module index, so a frame the
+	// fallback cannot name still says which library it is in. It may be nil,
+	// in which case those frames stay bare addresses.
+	if lf, lfErr := symbolize.NewLocalSymbolizer(symbolize.WithModuleIndex(moduleIndex(opts.Resolver))); lfErr == nil {
 		st.localFallback = lf
 	}
 	s.cgo = st
 	return s, nil
+}
+
+// moduleIndex adapts a possibly-nil *procmap.Resolver to symbolize.ModuleIndex
+// without handing over a non-nil interface wrapping a nil pointer, which would
+// panic on the first Lookup instead of being skipped.
+func moduleIndex(r *procmap.Resolver) symbolize.ModuleIndex {
+	if r == nil {
+		return nil
+	}
+	return r
 }
 
 // SymbolizeProcess resolves abs IPs into Frames. Each address is routed

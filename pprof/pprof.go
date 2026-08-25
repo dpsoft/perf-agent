@@ -16,6 +16,7 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 
+	"github.com/dpsoft/perf-agent/internal/framename"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
@@ -75,6 +76,18 @@ type Frame struct {
 	MapLimit uint64
 	MapOff   uint64
 	IsKernel bool
+
+	// Unresolved says this frame was unwound correctly but could not be
+	// given a symbol name, and that Name therefore holds a placeholder
+	// (perf-agent's symbolizers write the hex PC) rather than a function.
+	//
+	// It has to be carried rather than inferred: "0x4017c2" is a valid C
+	// identifier for a symbol and pprof has no unsymbolized bit to consult.
+	// Set by symbolize.ToProfFrames from symbolize.Frame.Reason. When it is
+	// set AND the frame lands in a real file-backed mapping, addLocationByAddr
+	// renames it to "<module>+0x<file offset>"; a resolved frame is never
+	// renamed.
+	Unresolved bool
 }
 
 // FrameFromName is a convenience constructor for callers that only know the
@@ -355,8 +368,48 @@ func (p *ProfileBuilder) addLocation(frame Frame, pid uint32) *profile.Location 
 		}
 	}
 
-	// 4. Fallback: name-based dedup on the default single mapping.
+	// 3b. Frame-carried mapping. The frame already knows which file it fell
+	// in because the symbolizer looked it up while the target was still
+	// alive (symbolize.attachModules). This is the only path that works when
+	// the profile is built after the process exited - the GPU tools do
+	// exactly that - and it is also the only mapping the GPU pipeline has at
+	// all, since it wires no Resolver into the builder.
+	//
+	// Deliberately below the Resolver: when both are available they agree,
+	// and preferring the live lookup keeps this a pure addition rather than
+	// a change to what the CPU profilers already produce.
+	if m, ok := frameMapping(frame); ok {
+		mapping := p.addMapping(m, frame)
+		return p.addLocationByAddr(mapping, frame)
+	}
+
+	// 4. Fallback: name-based dedup on the default single mapping. Nothing
+	// is known about where this address lives, so an Unresolved frame keeps
+	// its bare "0x..." name here. That is not the same outcome as branch 3b
+	// and must never be made to look like it.
 	return p.addLocationByFallback(p.Profile.Mapping[0], frame)
+}
+
+// frameMapping reconstructs the procmap.Mapping a Frame carries, when it
+// carries a usable one. Requires the address to fall inside the range: a
+// frame whose MapStart/MapLimit do not actually contain its Address is a bug
+// upstream, and building a mapping from it would put the location at a
+// nonsense file offset under a confidently-named file.
+func frameMapping(frame Frame) (procmap.Mapping, bool) {
+	if frame.Module == "" || frame.Address == 0 || frame.MapLimit <= frame.MapStart {
+		return procmap.Mapping{}, false
+	}
+	if frame.Address < frame.MapStart || frame.Address >= frame.MapLimit {
+		return procmap.Mapping{}, false
+	}
+	return procmap.Mapping{
+		Path:    frame.Module,
+		Start:   frame.MapStart,
+		Limit:   frame.MapLimit,
+		Offset:  frame.MapOff,
+		BuildID: frame.BuildID,
+		IsExec:  true,
+	}, true
 }
 
 func (p *ProfileBuilder) addMapping(m procmap.Mapping, frame Frame) *profile.Mapping {
@@ -383,7 +436,11 @@ func (p *ProfileBuilder) addMapping(m procmap.Mapping, frame Frame) *profile.Map
 }
 
 func (p *ProfileBuilder) updateMappingFlags(m *profile.Mapping, f Frame) {
-	if f.Name != "" {
+	// An unresolved frame is not a function this mapping has. Setting
+	// HasFunctions for it would tell every downstream reader that the
+	// mapping's symbols are present when the reason we are here is that
+	// they are not.
+	if f.Name != "" && !f.Unresolved {
 		m.HasFunctions = true
 	}
 	if f.File != "" {
@@ -404,6 +461,20 @@ func (p *ProfileBuilder) addLocationByAddr(mapping *profile.Mapping, frame Frame
 	key := locationKey{MappingID: mapping.ID, Address: offset}
 	if loc, ok := p.locations[key]; ok {
 		return loc
+	}
+	// An unresolved frame that landed in a real file gets named after that
+	// file and its module-relative offset. The absolute PC it arrived with
+	// is an ASLR'd runtime address, meaningless across runs; the offset is
+	// the mapping-relative one pprof already stores in Location.Address, so
+	// the name and the Location agree and either can be fed to addr2line.
+	//
+	// This goes into Function.Name rather than being left for the flame
+	// graph because the same .pb.gz is read by `go tool pprof`, which shows
+	// Function.Name and knows nothing about perf-agent's conventions.
+	if frame.Unresolved {
+		if n := framename.Format(mapping.File, offset); n != "" {
+			frame.Name = n
+		}
 	}
 	id := uint64(len(p.Profile.Location) + 1)
 	loc := &profile.Location{

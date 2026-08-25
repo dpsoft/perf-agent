@@ -15,10 +15,11 @@ import "fmt"
 // flamegraph of perf-agent #1 was 100% [unknown] — the discovery
 // case that motivated this fix.
 //
-// Module is left empty: the pprof builder routes user-side Locations
-// through their /proc/<pid>/maps-derived mapping (Bug 3 fix), so the
-// mapping's filename still appears next to the raw-hex name in
-// downstream tooling.
+// Module is left empty here on purpose. LocalSymbolizer.withModules fills
+// it in afterwards from /proc/<pid>/maps when a ModuleIndex is configured,
+// which is the only place that can tell an address with a mapping from one
+// without. Frames that come back from here with Module still empty are
+// exactly the ones nothing is known about.
 func rawUserAddrFrames(ips []uint64) []Frame {
 	out := make([]Frame, len(ips))
 	for i, ip := range ips {

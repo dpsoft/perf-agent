@@ -23,16 +23,41 @@ var ErrMapFilesUnavailable = errors.New("symbolize: cannot follow /proc/<pid>/ma
 // preserves perf-agent's pre-debuginfod behavior. Used when no debuginfod
 // URL is configured.
 type LocalSymbolizer struct {
-	bz     *blazesym.Symbolizer
-	closed atomic.Bool
-	stats  localCounters
+	bz      *blazesym.Symbolizer
+	modules ModuleIndex
+	closed  atomic.Bool
+	stats   localCounters
+}
+
+// LocalOption configures a LocalSymbolizer.
+type LocalOption func(*LocalSymbolizer)
+
+// WithModuleIndex supplies the /proc/<pid>/maps index used to name the module
+// behind an address blazesym could not resolve to a symbol. Without it, an
+// unresolved frame stays a bare hex address - which is the honest result, not
+// a degraded one, because there is then nothing to say about it.
+//
+// Pass the *procmap.Resolver the rest of the pipeline already owns rather
+// than building a private one: a second cache doubles the /proc parsing and
+// gives the caller two things to keep fresh instead of one.
+//
+// The index is consulted only for frames blazesym failed on, and only with
+// Lookup - a miss leaves the frame bare rather than guessing at a neighbour.
+// What it cannot defend against is a Resolver whose cache has gone stale
+// because the PID exited and was reused; keeping the cache honest is the
+// owner's job, exactly as it already is for the Resolver the pprof builder
+// uses to attribute every user frame.
+func WithModuleIndex(idx ModuleIndex) LocalOption {
+	return func(s *LocalSymbolizer) { s.modules = idx }
 }
 
 // localCounters are the process-side symbolization counters. Kept separate
 // from Counters, which is the kernel symbolizer's and is already wired into
 // the /metrics endpoint with a fixed field set.
 type localCounters struct {
-	rawAddrBatches atomic.Uint64
+	rawAddrBatches  atomic.Uint64
+	modulesAttached atomic.Uint64
+	modulesBare     atomic.Uint64
 }
 
 // LocalStats is a point-in-time view of what SymbolizeProcess could not
@@ -42,11 +67,27 @@ type LocalStats struct {
 	// cause being a pid that exited before its /proc entry could be read —
 	// and where every frame therefore came back as a bare hex address.
 	RawAddrBatches uint64
+	// ModulesAttached counts frames that blazesym could not name but which
+	// a mapping lookup placed inside a known file: they render as
+	// "libcuda.so.1+0x1b71c6" rather than as a bare address.
+	ModulesAttached uint64
+	// ModulesBare counts frames that blazesym could not name and for which
+	// no mapping was found either - no ModuleIndex configured, the process
+	// already gone, or a PC genuinely outside every file-backed executable
+	// range. These stay bare hex, and they are deliberately counted apart
+	// from ModulesAttached: recovering the module is a real improvement and
+	// a run where it never happens must not look like one where it always
+	// did.
+	ModulesBare uint64
 }
 
 // Stats returns the current process-side symbolization counters.
 func (s *LocalSymbolizer) Stats() LocalStats {
-	return LocalStats{RawAddrBatches: s.stats.rawAddrBatches.Load()}
+	return LocalStats{
+		RawAddrBatches:  s.stats.rawAddrBatches.Load(),
+		ModulesAttached: s.stats.modulesAttached.Load(),
+		ModulesBare:     s.stats.modulesBare.Load(),
+	}
 }
 
 // checkMapFilesAccess reports whether this process may follow a
@@ -132,7 +173,7 @@ func checkMapFilesAccess() error {
 // profile.pb.gz full of hex. A profiler whose every user frame is "0x7f..."
 // is not degraded, it is useless, and this codebase refuses everywhere else
 // rather than hand back output that looks like a result.
-func NewLocalSymbolizer() (*LocalSymbolizer, error) {
+func NewLocalSymbolizer(opts ...LocalOption) (*LocalSymbolizer, error) {
 	if err := checkMapFilesAccess(); err != nil {
 		return nil, err
 	}
@@ -143,7 +184,11 @@ func NewLocalSymbolizer() (*LocalSymbolizer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &LocalSymbolizer{bz: bz}, nil
+	s := &LocalSymbolizer{bz: bz}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
@@ -173,7 +218,7 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	)
 	if err != nil {
 		s.stats.rawAddrBatches.Add(1)
-		return rawUserAddrFrames(ips), nil
+		return s.withModules(pid, rawUserAddrFrames(ips)), nil
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {
@@ -183,7 +228,22 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 		}
 		out = append(out, fromBlazesymSym(sym, addr))
 	}
-	return out, nil
+	return s.withModules(pid, out), nil
+}
+
+// withModules names the module behind every frame blazesym left unresolved,
+// and counts what it could and could not place. Called on both return paths
+// of SymbolizeProcess: the whole-batch failure produces exactly the frames
+// that need this most.
+func (s *LocalSymbolizer) withModules(pid uint32, frames []Frame) []Frame {
+	attached, bare := attachModules(s.modules, pid, frames)
+	if attached > 0 {
+		s.stats.modulesAttached.Add(uint64(attached))
+	}
+	if bare > 0 {
+		s.stats.modulesBare.Add(uint64(bare))
+	}
+	return frames
 }
 
 // Close releases the underlying blazesym Symbolizer. Idempotent.

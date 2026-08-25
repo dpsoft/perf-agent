@@ -200,7 +200,19 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 		}
 	}
 	if len(urls) == 0 {
-		return symbolize.NewLocalSymbolizer()
+		// res names the module behind an address blazesym could not resolve
+		// to a symbol, so an unresolved frame reads "libcuda.so.1+0x1b71c6"
+		// instead of an ASLR'd address. It is the same Resolver the
+		// debuginfod branch below takes, so exactly one maps cache exists
+		// per agent either way.
+		//
+		// It is never invalidated, which it shares with the Resolvers
+		// profile/ and offcpu/ hand to the pprof builders: a PID that exits
+		// and is reused within one run would keep the first process's
+		// mappings. Adding module attribution here does not widen that
+		// window - the builders already attribute every user frame through
+		// the same kind of cache - but it does not narrow it either.
+		return symbolize.NewLocalSymbolizer(symbolize.WithModuleIndex(res))
 	}
 	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
 	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))

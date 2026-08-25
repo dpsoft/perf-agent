@@ -24,6 +24,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 func main() {
@@ -54,7 +55,16 @@ func main() {
 	// Without a symbolizer the sampled launch stacks still arrive and are
 	// still accounted for, but every one of them degrades to no stack — the
 	// profile would then be honest and useless, all GPU time unattributed.
-	sym, err := symbolize.NewLocalSymbolizer()
+	// The maps index the symbolizer falls back on for addresses blazesym
+	// cannot name. It is consulted DURING the run, while the workload is
+	// alive; by the time this tool builds the profile the workload has
+	// exited and /proc/<pid>/maps is gone, so a lookup at build time would
+	// find nothing. Without this, every frame inside a stripped vendor
+	// library (libcuda, libcupti - NVIDIA ships no symbols for their
+	// internals) renders as a bare ASLR'd address.
+	modules := procmap.NewResolver()
+	defer modules.Close()
+	sym, err := symbolize.NewLocalSymbolizer(symbolize.WithModuleIndex(modules))
 	if err != nil {
 		log.Fatalf("symbolizer: %v", err)
 	}

@@ -48,14 +48,40 @@
 //	'K'  tables are installed; go
 //	'X'  registration was refused or installed nothing; go anyway
 //
+// # Do NOT gate this on the probe semaphore
+//
+// The first version of this fix ran only under PERFAGENT_USDT_ENABLED, on the
+// reasoning that the semaphore says a consumer is attached. It does not. It
+// says the KERNEL HAS TOLD THIS PROCESS SO, which is a different fact with a
+// different arrival time, and the two diverge exactly where it matters.
+//
+// Measured on an RTX 3090: with the gate in place, UnwindEnrollRequests was 0
+// across three runs and the loss was unchanged (~175 of 500 sampled stacks
+// walked with no tables). The same build passed the GPU-free gate with
+// no-tables=0, because that producer is EXEC'd - the kernel arms the
+// semaphore while building the new mm, long before main runs. A CUDA adapter
+// is DLOPEN'd by libcuda and InitializeInjection is called essentially the
+// instant the mapping appears, which is the earliest moment the question can
+// be asked and the least likely moment for it to have been answered. The
+// probes fired perfectly later in those same runs - 4000 of them - so the
+// semaphore did arm; just not yet.
+//
+// The connect is the gate, and it is strictly better:
+//
+//   - It is authoritative. The consumer binds this address BEFORE it creates
+//     the uprobe link (gpuprobe/enroll.go), so it is listening whenever any
+//     profiling of this shim is happening - there is no window in which a
+//     consumer exists and the address does not.
+//   - It is already free. An abstract-socket connect to an unbound address
+//     fails immediately with ECONNREFUSED; the semaphore gate was never what
+//     made the unprofiled case cheap.
+//
 // # Every failure falls through to today's behaviour
 //
-// No consumer attached (the semaphore reads zero), nothing bound the
-// address, the connect failed, the reply never came: the producer proceeds
-// immediately and the consumer registers lazily on the first batch exactly
-// as before. A degraded profile is never turned into no profile, and an
-// unprofiled process pays nothing at all -- the caller checks its probe
-// semaphore before it ever gets here.
+// Nothing bound the address, the connect failed, the reply never came: the
+// producer proceeds immediately and the consumer registers lazily on the
+// first batch exactly as before. A degraded profile is never turned into no
+// profile.
 #ifndef PERFAGENT_ENROLL_H
 #define PERFAGENT_ENROLL_H
 
@@ -97,14 +123,22 @@ bool enroll_name_from_maps(const char *maps_path, unsigned long addr,
 // inside its own initialisation, so it is stated as one.
 EnrollResult enroll_connect(const char *name, unsigned timeout_ms);
 
+// Writes the rendezvous name this image derives for itself into `out`, without
+// connecting to anything. Exists so a producer can LOG the name it computed:
+// the two ends derive it independently and never exchange it, so when they
+// disagree every counter on both sides reads zero and nothing says why. One
+// CUDA run comparing this string against Stats.UnwindEnrollAddress settles
+// what a round trip of inference could not.
+bool enroll_self_name(char *out, size_t outsz);
+
 // The whole rendezvous for the image this function is linked into: derive
 // the name from our own mapping, connect, wait. `timeout_ms` of 0 disables
 // it outright.
 //
 // Blocks the calling thread for at most `timeout_ms` in total, signals
-// included. Call it only when a consumer is attached -- i.e. under the
-// sampled-launch probe's semaphore -- so a process nobody is profiling never
-// touches a socket.
+// included. Call it UNCONDITIONALLY at producer init - see "Do NOT gate this
+// on the probe semaphore" above. In an unprofiled process the whole call is
+// one /proc/self/maps read and a connect that is refused before it blocks.
 EnrollResult enroll_with_consumer(unsigned timeout_ms);
 
 // The rendezvous budget, from PERFAGENT_GPU_ENROLL_TIMEOUT_MS, or `dflt`

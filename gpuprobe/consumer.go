@@ -665,6 +665,18 @@ type Stats struct {
 	// indistinguishable from the counters, and the first is the one that
 	// loses ~38% of its stacks.
 	UnwindEnrollListening bool
+	// UnwindEnrollAddress is the abstract socket name this consumer bound, or
+	// "" when it bound none.
+	//
+	// It is here because every enrolment counter reading zero is ambiguous in
+	// the one way that matters: "listening, and nobody came" and "the producer
+	// computed a different name and connected to nothing" look identical.
+	// That ambiguity cost a full CUDA round trip - a run where the producer
+	// logged enroll=no-listener while the consumer was listening perfectly, on
+	// an address derived from a different device number (see
+	// enrollShimIdentity). The producer logs the name it derived; this is the
+	// name the consumer derived; comparing two strings settles it.
+	UnwindEnrollAddress string
 	// UnwindEnrollRequests counts producers that reached the rendezvous and
 	// passed both identity checks (SO_PEERCRED, and actually mapping this
 	// consumer's shim inode), so registration was attempted for them.
@@ -2087,6 +2099,7 @@ func (c *Consumer) Stats() Stats {
 	out.UnwindPIDsTracked = tracked
 	en := c.enroll.snapshot()
 	out.UnwindEnrollListening = c.enroll != nil
+	out.UnwindEnrollAddress = c.enroll.address()
 	out.UnwindEnrollRequests = en.requests
 	out.UnwindEnrollConfirmed = en.confirmed
 	out.UnwindEnrollRefused = en.refused

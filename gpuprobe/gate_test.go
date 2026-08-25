@@ -650,23 +650,33 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Positive(t, unattributedValue, "the unattributed population must be non-empty at sample_period=8")
 }
 
-// privateStubCopy copies the built stub into this test's own temp directory
-// and returns the copy's path. The copy is what the test attaches to and what
-// it runs, so the uprobe can only ever match this run's executions.
+// privateStubCopy copies the built stub into a scratch directory NEXT TO THE
+// SOURCE and returns the copy's path. The copy is what the test attaches to
+// and what it runs, so the uprobe can only ever match this run's executions.
 //
-// t.TempDir() is removed when the test ends, taking the copy with it. It lives
-// under TMPDIR (/tmp here, mounted rw,nosuid,nodev — not noexec, so the copy
-// is runnable); nosuid is irrelevant because the stub is an ordinary
-// unprivileged producer and carries no file capabilities. If TMPDIR were ever
-// noexec the exec below fails loudly with ENOEXEC/EACCES rather than
-// silently degrading.
+// Next to the source, not in t.TempDir(), and that is load-bearing rather than
+// tidy. The rendezvous name embeds a device number; stat(2) and
+// /proc/<pid>/maps report the SAME device on tmpfs and DIFFERENT devices on
+// btrfs (measured here: stat=0:49 vs maps=0:34). TMPDIR is tmpfs on this
+// machine, so a gate whose fixture lived there proved the two ends agree on
+// the one filesystem where they cannot disagree - and both gates passed while
+// the real CUDA run failed with enroll=no-listener. The shim is built in the
+// source tree, so that is where the gate's copy of it belongs.
+//
+// The directory is removed when the test ends. It is on the same filesystem as
+// the repository, which is not noexec (the build output next to it is executed
+// by every other test here); an exec failure would surface as ENOEXEC/EACCES
+// rather than silently degrading.
 func privateStubCopy(t *testing.T, src string) string {
 	t.Helper()
 	info, err := os.Stat(src)
 	require.NoError(t, err)
 	data, err := os.ReadFile(src)
 	require.NoError(t, err)
-	dst := filepath.Join(t.TempDir(), filepath.Base(src))
+	dir, err := os.MkdirTemp(filepath.Dir(src), "gate")
+	require.NoError(t, err, "scratch dir beside the built shim")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dst := filepath.Join(dir, filepath.Base(src))
 	// Preserve the executable bit from the source rather than assuming 0755.
 	require.NoError(t, os.WriteFile(dst, data, info.Mode().Perm()))
 	require.NotZero(t, info.Mode().Perm()&0o100, "built stub is not executable")
@@ -1006,4 +1016,195 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 		assert.Equalf(t, ehcompile.ModeFPSafe, classify(t, name),
 			"%s is not FP_SAFE, so the walk would not cross an FP/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
 	}
+}
+
+// The gate hole that let issue #49's first fix ship broken.
+//
+// That fix passed TestStubDrivesThePipelineToPprofWithoutAGPU with
+// no-tables=0, and then did nothing whatsoever on the RTX 3090:
+// UnwindEnrollRequests read 0 across three runs and the loss was unchanged at
+// ~175 of 500 sampled stacks. The gate could not see it because it drives an
+// EXEC'd producer, and the two paths differ in exactly the respect that
+// mattered - the kernel arms a uprobe's reference-count semaphore while it
+// builds the mm for an exec, so it is already non-zero when main runs, whereas
+// a CUPTI adapter is DLOPEN'd and libcuda calls InitializeInjection
+// essentially the instant the mapping appears. A rendezvous gated on that
+// semaphore therefore ran on one path and not the other, and the gate only
+// covered the path where it worked.
+//
+// So this drives a producer .so loaded with dlopen(3) by a separate host
+// (shim/stub/dlopen_host.cc), which puts producer initialisation on the same
+// kernel path the CUDA adapter's is on. It is deliberately a second test
+// rather than a change to the first: both shapes have to keep working, and a
+// single test cannot be both.
+//
+// It also records the producer's own view of the semaphore at the moment it
+// enrolled (sem_at_enroll). That number is the measurement this whole episode
+// turned on, and logging it on every run means the next person does not have
+// to infer it.
+func TestADlopenedProducerEnrollsBeforeItsFirstLaunch(t *testing.T) {
+	if !hasGateCaps() {
+		t.Skip("needs CAP_BPF, CAP_PERFMON and CAP_CHECKPOINT_RESTORE; " +
+			"sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep <test binary>")
+	}
+	host := filepath.Join("..", "shim", "perfagent-gpu-dlopen-host")
+	producer := filepath.Join("..", "shim", "libperfagent-gpu-fpless.so")
+	requireBuilt(t, host)
+	requireBuilt(t, producer)
+	// The same build-time proof the exec gate takes: if the toolchain kept
+	// frame pointers in the bridge, the walk below never reaches an FP-less
+	// frame, never takes the DWARF path, and the assertion on it would pass
+	// while proving nothing.
+	requireFPLess(t, producer)
+
+	// Same inode-privacy reasoning as the exec gate: the attach is
+	// system-wide, so a shared image would also collect from any other
+	// process running it.
+	so := privateStubCopy(t, producer)
+
+	sym, err := symbolize.NewLocalSymbolizer()
+	require.NoError(t, err)
+	defer func() { _ = sym.Close() }()
+
+	timeline := gpu.NewTimeline(gpu.TimelineConfig{})
+	c, err := gpuprobe.Attach(gpuprobe.Config{
+		ShimPath:   so,
+		Backend:    gpu.GPUBackendID("stub"),
+		Sink:       timeline,
+		Symbolizer: sym,
+	})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	// The host is started after Attach, so the .so is dlopened into a process
+	// that did not exist when the uprobe link was created - the CUDA ordering.
+	cmd := exec.Command(host, so, "500", "1000", "8", "10000")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	release, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	defer func() { _ = release.Close() }()
+
+	// 58, not ceil(500/8)==63: since #50 the sampler jitters its stride, so
+	// 500 launches at period 8 yield 58 sampled, not 63. Cross-checked against
+	// internal/gpuabi.SampleSchedule(500, 8, DefaultSampleSeed), which replays
+	// the shim's schedule exactly. Left as an equality rather than a floor -
+	// the count is deterministic given the seed, and a floor would let a
+	// silently under-sampling shim pass.
+	const wantSampled = 58
+	deadline := time.Now().Add(10 * time.Second)
+	for c.Stats().SampledLaunches < wantSampled {
+		if time.Now().After(deadline) {
+			_ = release.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			cancel()
+			<-done
+			t.Fatalf("timed out waiting for %d sampled launches; consumer saw %d. stats: %+v stderr: %s",
+				wantSampled, c.Stats().SampledLaunches, c.Stats(), stderr.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.NoError(t, release.Close())
+	require.NoError(t, cmd.Wait(), "stdout: %s stderr: %s", stdout.String(), stderr.String())
+	producerErr := stderr.String()
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	<-done
+
+	stats := c.Stats()
+
+	// The measurement, logged whether the test passes or fails. sem_at_enroll
+	// is what the producer saw when it ran the rendezvous; if it reads 0 here
+	// while the run still confirms, that is direct evidence for why gating on
+	// the semaphore was wrong, on a machine with no GPU in it.
+	sem := regexp.MustCompile(`sem_at_enroll=(\d+) sem_at_exit=(\d+)`).FindStringSubmatch(producerErr)
+	if len(sem) == 3 {
+		t.Logf("producer semaphore: at_enroll=%s at_exit=%s (0 then non-zero means the "+
+			"kernel had not armed it when the rendezvous ran - the CUDA failure mode, reproduced without a GPU)",
+			sem[1], sem[2])
+	} else {
+		t.Logf("producer did not report semaphore counts; stderr: %s", producerErr)
+	}
+	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d profiler-only=%d cfi-miss=%d abandoned=%d registered=%d binaries=%d",
+		stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables,
+		stats.StacksProfilerOnly, stats.StacksWalkedCFIMiss, stats.StackWalkAbandoned,
+		stats.UnwindPIDsRegistered, stats.UnwindBinariesAttached)
+
+	assert.Zero(t, stats.SequenceGaps, "no batch may be lost silently")
+	assert.Equal(t, uint64(wantSampled), stats.SampledLaunches,
+		"ceil(500/8): the sampler is deterministic, and a dlopened producer samples exactly as an exec'd one does")
+
+	// ---- the assertions this test exists for -----------------------------
+	//
+	// The first of these is the one that was 0 on the RTX 3090 while the exec
+	// gate was green. It is asserted BEFORE the no-tables assertion on
+	// purpose: "the producer never even tried" and "it tried and the tables
+	// still were not there" are different failures, and a bare no-tables
+	// check reports them identically.
+	assert.True(t, stats.UnwindEnrollListening,
+		"the rendezvous address could not be bound, so this test cannot say anything about dlopen-time arming: %q",
+		stats.UnwindEnrollLastError)
+	assert.Equal(t, uint64(1), stats.UnwindEnrollRequests,
+		"the dlopened producer never reached the rendezvous. This is the exact CUDA failure: "+
+			"UnwindEnrollRequests was 0 on the RTX 3090 while the exec-driven gate passed. "+
+			"refused=%d throttled=%d err=%q producer stderr: %s",
+		stats.UnwindEnrollRefused, stats.UnwindEnrollThrottled, stats.UnwindEnrollLastError, producerErr)
+	assert.Equal(t, uint64(1), stats.UnwindEnrollConfirmed,
+		"the producer reached the rendezvous but was not told its tables were installed: failed=%d err=%q",
+		stats.UnwindEnrollFailed, stats.UnwindEnrollLastError)
+	assert.Contains(t, producerErr, "enroll=confirmed",
+		"the producer's own account disagrees with the consumer's; a producer that never reached the "+
+			"socket is invisible to every consumer-side counter, which is why both ends are checked")
+	assert.Zero(t, stats.StacksWalkedNoTables,
+		"a capture was walked with no CFI tables even though the producer waits for them before it "+
+			"launches anything. enroll: requests=%d confirmed=%d refused=%d failed=%d err=%q",
+		stats.UnwindEnrollRequests, stats.UnwindEnrollConfirmed, stats.UnwindEnrollRefused,
+		stats.UnwindEnrollFailed, stats.UnwindEnrollLastError)
+	assert.Zero(t, stats.StacksNoTablesAfterEnroll,
+		"the producer was released on a promise its tables were installed and a later walk found none")
+	assert.Zero(t, stats.UnwindEnrollRefused,
+		"the process the uprobes fired in was refused by the identity check: %q", stats.UnwindEnrollLastError)
+
+	// The tables have to be USED, not merely present.
+	//
+	// The first version of this test loaded libperfagent-gpu-stub.so, which is
+	// built with frame pointers throughout, and reported dwarf=0 fp-only=63
+	// with no-tables=0 - the rendezvous fired, the tables were installed, and
+	// not one walk ever needed them. That is legitimate for that producer
+	// (walk_step only sets WALKER_FLAG_DWARF_USED for a frame it classified
+	// FP_LESS) and it is also useless: it proves the rendezvous fired and
+	// nothing about the DWARF unwinding the rendezvous exists to feed.
+	//
+	// This producer puts two -fomit-frame-pointer frames between the probe and
+	// the host's main, which is where libcupti and libcudart sit in a real
+	// CUDA stack, so a walk that gets out of perfagent_stub_run's frame at all
+	// has to cross one. requireFPLess above fails the test if the toolchain
+	// did not actually omit them, so this cannot pass vacuously.
+	assert.Positive(t, stats.StacksWalkedDWARF,
+		"no capture used the DWARF path: the tables were installed before the first launch and then "+
+			"never needed, so this run proves nothing about unwinding a CUDA-shaped stack. fp-only=%d no-tables=%d",
+		stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables)
+	assert.Equal(t, uint64(wantSampled), stats.StacksWalkedDWARF+stats.StacksWalkedFPOnly,
+		"every non-empty capture is counted exactly once as either a DWARF walk or an FP-only walk")
+
+	// StacksProfilerOnly is LOGGED above and deliberately not asserted.
+	//
+	// This producer is an ET_DYN with no DT_SONAME and no PT_INTERP, so
+	// shimScope classifies it as an injected library and the #39 guard IS
+	// armed - the same shape as the CUDA adapter, and unlike the exec gate
+	// where the guard disables itself. That makes the counter meaningful
+	// here, and it is why it is worth printing. But its value depends on the
+	// walk crossing out of the .so into the host executable, and while the
+	// FP-less bridge makes that the DWARF walker's job rather than the frame
+	// pointer chain's, this test has not derived the result and could not run
+	// it. Asserting an underived number is how a gate goes green while
+	// proving nothing, which is the failure this whole test exists to
+	// correct; the DWARF assertion above is the derived one.
 }

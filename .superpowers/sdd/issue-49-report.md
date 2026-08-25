@@ -45,8 +45,8 @@ The producer has a point in its life that provably precedes every launch, and th
 consumer does not. So the producer is the one that waits.
 
 **`shim/core/enroll.{h,cc}` — the producer half.** At initialisation, and only when the
-sampled-launch probe's semaphore says a consumer is attached, the shim connects to an
-abstract `AF_UNIX` socket and blocks for one status byte.
+shim connects to an abstract `AF_UNIX` socket and blocks for one status byte.
+Unconditionally — §5.3 is what happened when this was gated on the probe semaphore.
 
 **`gpuprobe/enroll.go` — the consumer half.** `Attach` binds that socket *before* it
 creates the `uprobe_multi` link. It accepts one producer at a time, takes the peer's PID
@@ -117,9 +117,9 @@ else half-installed at the time.
 Stated plainly, because the fix is a mechanism with a scope, not a blanket.
 
 1. **A process that was already running when the consumer attached.** Its
-   `InitializeInjection` ran with the semaphore at zero; it never reaches the rendezvous.
-   Its first batch triggers lazy registration exactly as before, and everything sampled
-   during that compile is walked without tables. **This is the genuine residual of #49**,
+   `InitializeInjection` ran before the consumer bound the rendezvous address, so its
+   connect was refused and it never enrolled. Its first batch triggers lazy registration
+   exactly as before, and everything sampled during that compile is walked without tables. **This is the genuine residual of #49**,
    and it is visible as `StacksWalkedNoTables > 0` with `StacksNoTablesAfterEnroll == 0`.
    Closing it needs the process stopped or its launches suppressed from outside, which
    nothing here does.
@@ -158,7 +158,7 @@ nothing here can fail an attach or fail a run.
 
 | what fails | producer | consumer |
 |---|---|---|
-| no consumer attached (semaphore 0) | never connects; zero cost | — |
+| no consumer attached | connect refused immediately; ~11 µs, see §5.4 | — |
 | address unbindable (already held, no abstract sockets) | `no-listener`, runs immediately | `Attach` continues, `UnwindEnrollListening=false`, reason in `UnwindEnrollLastError` |
 | peer credentials unreadable / peer does not map the shim / wrong PID on a per-PID attach | reads `'X'`, runs | `UnwindEnrollRefused++`, no compile at all |
 | registration installs nothing | reads `'X'`, runs | `UnwindEnrollFailed++`, PID marked enrolled so its walks are counted as the contradiction they are |
@@ -297,69 +297,98 @@ setter.
 
 ---
 
-## 5. Predicted counters on the RTX 3090, and the derivation
+## 5. Two wrong diagnoses, and the measured cause
 
-500 sampled launches, `cmd/gpu-cuda-profile` defaults, one workload.
+This section is a log rather than an argument, because the argument was wrong twice and
+the log is the part worth keeping.
+
+### 5.1 Attempt 1 — predicted, and wrong
+
+Predicted from the mechanism: `StacksWalkedDWARF 500`, `StacksWalkedNoTables 0`,
+`UnwindEnrollRequests 1`. Measured on the RTX 3090, three runs:
 
 ```
-StacksWalkedDWARF          500      (was mean 308)
-StacksWalkedNoTables         0      (was mean ~192)
-StacksWalkedFPOnly           0
-StacksProfilerOnly           0      (was == NoTables)
-StacksNoTablesAfterEnroll    0
-UnwindEnrollListening     true
-UnwindEnrollRequests         1
-UnwindEnrollConfirmed        1
-UnwindEnrollRefused          0
-UnwindEnrollFailed           0
-UnwindEnrollThrottled        0
-UnwindEnrolledPIDsEvicted    0
-UnwindEnrolledMarksDropped   0
-UnwindPIDsRegistered         1
-SequenceGaps                 0      (unchanged)
+DWARF:311/338/326   NoTables:189/162/174   ProfilerOnly:same   ReachedRoot==DWARF
+UnwindEnrollRequests:0  Confirmed:0  Refused:0  Throttled:0  Failed:0
 ```
 
-Derivation, step by step:
+`NoTables` ~175 against a baseline of ~187: unchanged. The GPU-free gate passed with
+`no-tables=0`. **The mechanism never fired.** `UnwindEnrollRequests:0` made it a clean
+negative — the producer never tried — rather than an ambiguous one.
 
-1. `StacksWalkedNoTables == 0`. It is incremented only for an FP-only walk from a PID the
-   registry does not have as `pidReady`. The single producer reaches `pidReady` before
-   `InitializeInjection` returns, and `InitializeInjection` returns before `cuptiSubscribe`
-   runs, which is before any callback can fire a probe. So no walk can happen from a
-   not-ready PID.
-2. `StacksWalkedFPOnly == 0`, hence `StacksWalkedDWARF == 500`. The existing invariant
-   `DWARF + FPOnly == sampled` holds unconditionally. In the twelve baseline runs
-   `FPOnly == NoTables` exactly, i.e. **there was never an FP-only walk that had tables**
-   — the walk from the adapter's callback out to the application crosses libcupti and
-   libcudart, which are FP-less, so with tables present it always sets `DWARF_USED`.
-   With `NoTables == 0` that forces `FPOnly == 0` and `DWARF == 500`.
-3. `StacksProfilerOnly == 0`. It equalled `NoTables` in every baseline run: the refused
-   stacks were exactly the tableless ones, because those are the walks that die in the
-   adapter's own frame. With no tableless walks there is nothing for the #39 guard to
-   refuse. This is the number that says the *attribution* was recovered, not just the
-   walk — 500 launches now reach the profile with a real application call path.
-4. `UnwindEnrollRequests == UnwindEnrollConfirmed == 1`. One workload process, one
-   `InitializeInjection`, one connection that passes both identity checks. One connection
-   cannot exceed a 32-per-uid-per-second bucket, so `UnwindEnrollThrottled == 0`; one PID
-   against a 128-PID bound cannot be evicted, so `UnwindEnrolledPIDsEvicted == 0` and
-   `UnwindEnrolledMarksDropped == 0`. The workload runs as the same user as the profiler
-   here, and the profiler is privileged, so the uid gate is inert either way.
-5. `SequenceGaps == 0`. Nothing was added to the drain path.
+### 5.2 Attempt 1's diagnosis — the `dlopen` semaphore — was also wrong
 
-Also expected, not asserted: the workload's `cuInit` gains roughly 150–250 ms (the
-compile of libcuda, libcupti, libcudart, libc and the workload binary) before its first
-launch; the adapter logs `enroll=confirmed` on its `PERFAGENT_GPU_LOG` line.
+The rendezvous was gated on `gpu_launch_sampled_v1_enabled()`, and the leading hypothesis
+was that the uprobe reference-count semaphore had not armed by the time libcuda called
+`InitializeInjection`. The gate covered only `exec`'d producers, where it certainly is
+armed, which fitted the exec-green/CUDA-silent split exactly.
 
-**What would falsify this.** `UnwindEnrollListening == false` means the address could not
-be bound and the run is entirely on the old path. `UnwindEnrollRefused > 0` means the
-identity check rejected the process the uprobes fired in, which cannot be true and would
-mean the `/proc` inode match is wrong. `StacksWalkedNoTables > 0` with
-`UnwindEnrollConfirmed == 1` means a walk happened before the reply, i.e. the ordering
-argument in §2 is false. `StacksNoTablesAfterEnroll > 0` **while `UnwindEnrollFailed` and
-`UnwindEnrolledPIDsEvicted` are both zero** means the rendezvous reported success it did
-not deliver. Any of these is a real defect, not a timing transient — which is the
-difference from the pre-#49 code, where a non-zero `NoTables` was expected.
+Ungating was shipped, along with the instrumentation to settle it. Attempt 2:
 
----
+```
+enroll=no-listener sem_at_init=1 sem_after_init=1 sem_at_exit=1
+UnwindEnrollRequests:0  DWARF:298/336/315  NoTables:202/164/185
+```
+
+`sem_at_init=1`. **The semaphore was already armed and the hypothesis is dead.** Ungating
+was still right — it is what let the attempt happen at all, and therefore what produced
+`enroll=no-listener` instead of silence — but it did not fix anything, and the new
+`dlopen` gate passed while the real path still failed.
+
+### 5.3 The measured cause: stat(2) and /proc report different devices
+
+`enroll=no-listener` says the producer computed an address and found nothing bound there.
+The two ends derive that name independently and never exchange it, so the question was
+whether the strings matched. They did not, and this is measurable locally — no GPU, no
+capabilities:
+
+```
+/tmp/devcheck_tmpfile   (tmpfs)  stat=0:48 ino=341002   maps=0:48 ino=341002   AGREE
+<repo>/shim/core/...    (btrfs)  stat=0:49 ino=1961899  maps=0:34 ino=1961899  *** MISMATCH ***
+/bin/true               (btrfs)  stat=0:36 ino=13268    maps=0:34 ino=13268    *** MISMATCH ***
+```
+
+The consumer built the name from `stat(2)`'s `st_dev`; the producer reads the device field
+of `/proc/self/maps`. On btrfs those are **different numbers for the same file**, and not
+by accident: `btrfs_getattr` reports the *subvolume's* anonymous device, while
+`show_map_vma` prints `inode->i_sb->s_dev`, the *filesystem's*. Every btrfs subvolume gets
+its own `anon_dev`. Fedora's default root is btrfs, and the shim is built in the source
+tree.
+
+So the consumer bound `@perfagent-gpu-enroll.v1.0.49.<ino>` and the producer dialled
+`@perfagent-gpu-enroll.v1.0.34.<ino>`. Everything else worked perfectly.
+
+**And that is why every gate was green.** They all put their fixture in `t.TempDir()`,
+i.e. `/tmp`, i.e. tmpfs — the one filesystem where the two numbers agree. The
+cross-language test written specifically to prove the two ends compute the same name was
+building its producer there too.
+
+### 5.4 The fix
+
+`enrollShimIdentity` derives the consumer's device and inode the same way the producer
+does: map the file, read `/proc/self/maps`, take the device and inode the kernel reports
+for that mapping. Symmetric by construction — there is no second source to disagree with.
+The same pair feeds both the socket name and `procMapsHaveInode`, which had the identical
+bug one step later and would have refused every genuine producer had they ever met.
+
+### 5.5 The prediction
+
+```
+StacksWalkedDWARF          500        StacksNoTablesAfterEnroll    0
+StacksWalkedNoTables         0        UnwindEnrollRequests         1
+StacksWalkedFPOnly           0        UnwindEnrollConfirmed        1
+StacksProfilerOnly           0        UnwindEnrollRefused          0
+```
+
+`UnwindEnrollAddress` in `Stats` and `enroll_addr=` in the producer's log will now print
+the two names, so if this is wrong a third time it is one string comparison rather than a
+round trip. The full decision table from the previous round still stands, plus:
+
+| observation | conclusion |
+|---|---|
+| `enroll_addr` == `UnwindEnrollAddress`, `enroll=no-listener` | the addresses agree; look at bind lifetime or network namespace |
+| `enroll_addr` != `UnwindEnrollAddress` | still a derivation mismatch; the differing field says which |
+
 
 ## 6. Counters
 
@@ -395,6 +424,12 @@ Six defects on this project were counters reading green when things were worst, 
   churned against the LRU and aged marks out roughly twice as fast as evictions happened.
   `TestTheEnrolledMarkSetOutlivesTheEvictionItMustWitness` pins that, and the bounds test
   asserts the books balance (`dropped + held == enrolments`).
+- **`UnwindEnrollAddress`** is the counter this episode was actually short of. Every
+  enrolment counter reading zero is ambiguous in the one way that mattered: "listening, and
+  nobody came" and "the producer computed a different name" look identical, and telling them
+  apart cost a full CUDA round trip. The consumer now reports the name it bound, the producer
+  logs the name it derived (`enroll_addr=`), and a mismatch is one string comparison.
+  `UnwindEnrollListening` still distinguishes "bound nothing at all".
 - **`UnwindEnrollThrottled`** makes the rate limiter visible. Non-zero on a machine that is
   not under attack means a legitimate burst exceeded the per-uid bucket and those producers
   fell back to the lazy path — the limiter causing a small version of the loss it protects.
@@ -450,7 +485,84 @@ must not extend the budget**, **both phases sharing one budget rather than each 
 it**, oversized and empty names, and the `PERFAGENT_GPU_ENROLL_TIMEOUT_MS` parse where an
 explicit `0` means off rather than "use the default".
 
-Gate (`TestStubDrivesThePipelineToPprofWithoutAGPU`), which still runs GPU-free with
+### 7.3 The gate hole, which is the real finding of this round
+
+The first version of this fix **passed the GPU-free gate and did nothing under CUDA**. A
+gate that can do that is not a gate. The cause was that
+`TestStubDrivesThePipelineToPprofWithoutAGPU` drives an `exec`'d producer, and the two paths
+differ in the one respect that mattered:
+
+| | how the producer starts | semaphore when its init runs |
+|---|---|---|
+| `perfagent-gpu-fpless` | `exec` | armed while the kernel builds the mm, before `main` |
+| the CUPTI adapter | `dlopen` by libcuda | asked at the instant the mapping appears |
+
+`TestADlopenedProducerEnrollsBeforeItsFirstLaunch` closes it. `shim/stub/dlopen_host.cc` is
+a host that `exec`s and then **`dlopen`s** `libperfagent-gpu-stub.so` and calls into it, so
+producer initialisation happens on the same kernel path the adapter's does. It is
+deliberately a second test rather than a change to the first: both shapes have to keep
+working, and one test cannot be both. The `.so` is *not* a `DT_NEEDED` dependency, because
+the loader maps those before `main` — that is the exec path wearing a different hat.
+
+Its first assertion is `UnwindEnrollRequests == 1`, before the `no-tables` one, because
+"the producer never tried" and "it tried and the tables still were not there" are different
+failures that a bare `no-tables` check reports identically. It also logs the producer's
+`sem_at_enroll` on every run, so the number this episode turned on is recorded rather than
+inferred — on a machine with no GPU in it.
+
+One thing it does **not** assert: `StacksProfilerOnly`. This producer is an ET_DYN with no
+`DT_SONAME` and no `PT_INTERP`, so `shimScope` classifies it as an injected library and the
+#39 guard *is* armed — the same shape as the CUDA adapter, and unlike the exec gate where
+the guard disables itself. That makes the counter meaningful and worth printing, but its
+value depends on the walk crossing from the `.so` into the host executable, which is a
+property of two binaries' CFI and which this test has not derived. Asserting an underived
+number is how a gate goes green while proving nothing, which is the failure this test exists
+to correct.
+
+### 7.3b What the dlopen gate did not catch, and what fixes that
+
+It passed while the real path failed, twice over, so it is worth being precise about what
+it was and was not covering.
+
+**It did not reproduce the filesystem.** `privateStubCopy` put the shim copy in
+`t.TempDir()` — tmpfs, where `stat(2)` and `/proc` agree. That is now a scratch directory
+*beside the built shim*, on the source tree's filesystem, for both gates. The unit-level
+version matters more, because it needs no privilege and runs everywhere:
+`TestTheCppProducerAndTheGoListenerAgreeOnTheWire` is now a pair of subtests over the
+source filesystem **and** TMPDIR, and it compares the two derived name strings directly
+rather than inferring a mismatch from "no-listener".
+
+Falsified to prove it bites — reverting the derivation to `stat(2)`:
+
+```
+--- FAIL: .../source_filesystem,_where_the_shim_is_really_built
+    the two ends derived DIFFERENT rendezvous names for the same file
+    consumer=@perfagent-gpu-enroll.v1.0.49.1986646
+    producer=@perfagent-gpu-enroll.v1.0.34.1986646
+--- PASS: .../TMPDIR
+```
+
+The TMPDIR subtest passing there is the old behaviour reproduced exactly.
+
+`TestTheRendezvousAddressIsTheShimsDeviceAndInode` also moved to the source filesystem and
+now pins the address against `/proc` rather than `stat(2)`, and logs when the two disagree.
+
+**It did not exercise the DWARF path.** It reported `dwarf=0 fp-only=63` with
+`no-tables=0`: tables installed, never used. That is legitimate for the producer it was
+loading — `libperfagent-gpu-stub.so` has frame pointers throughout, and `walk_step` sets
+`WALKER_FLAG_DWARF_USED` only for a frame it classified FP_LESS — but it means the gate
+proved the rendezvous fired and proved nothing about the unwinding the rendezvous exists to
+feed. A real CUDA stack crosses libcupti and libcudart, which have no frame pointers.
+
+So the gate now loads a new `libperfagent-gpu-fpless.so`, which puts two
+`-fomit-frame-pointer` frames between the probe and the host's `main` — the same
+`stub/fpless_bridge.cc` the exec gate uses, in a shared object — and asserts
+`StacksWalkedDWARF > 0`. `make check-fpless` was extended to cover the `.so` as well as the
+executable, so the assertion cannot pass vacuously if the toolchain keeps frame pointers.
+
+### 7.4 The exec gate
+
+`TestStubDrivesThePipelineToPprofWithoutAGPU`, which still runs GPU-free with
 `PID: 0` and the target not yet running — the shape is unchanged, the producer is still
 launched after `Attach`, and the assertions were **tightened, not relaxed**:
 
@@ -477,18 +589,43 @@ StacksWalkedDWARF` still holds, now at 63, and `StackWalkAbandoned`,
 go build ./... && go vet ./...                                        pass
 go test ./gpu/ ./gpuprobe/ ./internal/... ./unwind/... -count=1        pass
 go test ./gpu/ ./gpuprobe/ ./unwind/ehmaps/ -race -count=4             pass
+make -C shim libperfagent-gpu-fpless.so perfagent-gpu-dlopen-host       builds
+make -C shim check-fpless (now covers the .so too)                     OK
+stat(2) vs /proc device, tmpfs and btrfs                               MISMATCH on btrfs (§5.3)
+cross-language name agreement, source fs + TMPDIR                      pass; fails on btrfs if reverted to stat(2)
+./perfagent-gpu-dlopen-host ./libperfagent-gpu-stub.so (no consumer)   enroll=no-listener, sem 0/0
+ungated unprofiled cost, 200 iters x3, both listener cases            ~11 us (§5.4)
+worst-case maps scan, 25/400/900/2000 lines                           9.4/85/185/325 us
 golangci-lint run --timeout=5m                                        0 issues
 make -C shim test                                                     pass (incl. enroll_test)
 make -C shim perfagent-gpu-stub perfagent-gpu-fpless check-fpless      pass
 make -C shim nvidia                                                   builds; exports only InitializeInjection
 ```
 
-**Cannot verify:** `CapEff: 0` on this machine. No BPF object could be loaded, no uprobe
-attached, and no CUDA device is present, so `TestStubDrivesThePipelineToPprofWithoutAGPU`
-skips and no RTX 3090 run was made. Nothing in §5 has been observed; it is derived, and
-the tightened gate assertions are unproven against real BPF. In particular, the claim that
-the uprobe reference-count semaphore is already armed when `InitializeInjection` runs
-(kernel `uprobe_mmap` / delayed-uprobe handling at `dlopen`) is read from the kernel's
-contract, not measured here — if it were false, the producer would skip the rendezvous
-and the run would simply look like the pre-#49 baseline, with `UnwindEnrollRequests == 0`
-saying so.
+**Cannot verify.** `CapEff: 0` on this machine and no GPU. No BPF object could be loaded
+and no uprobe attached, so **both** gates skip — including the new
+`TestADlopenedProducerEnrollsBeforeItsFirstLaunch`, which is the test written specifically
+to catch this class of failure and which has therefore never been observed to pass or fail.
+No RTX 3090 run was made.
+
+What **is** verified this time, and was not before: the cause itself. The device mismatch in
+§5.3 was measured on this machine, and the regression test for it fails on btrfs and passes
+on tmpfs when the fix is reverted. That is the first link in this chain that rests on a
+measurement rather than a derivation.
+
+Specifically **not** verified here:
+
+- That the fixed derivation makes the rendezvous fire under CUDA. §5.5 is a prediction for
+  the third time. It is a much narrower one — the two ends now compute the same string on
+  the filesystem the shim is built on, which is the only thing that was wrong — but it is
+  still unrun against a GPU.
+- Both gates, which skip: `CapEff: 0`. Including the new DWARF assertion in the dlopen gate
+  and both gates' move onto the source filesystem.
+- That the walk escapes the shim in the dlopen gate, which is why §7.3 logs
+  `StacksProfilerOnly` rather than asserting it.
+
+Two rounds of this report have had a derivation in the "cannot verify" list turn out to be
+the bug. Both times the counter that caught it was one added in the previous round —
+`UnwindEnrollRequests` for attempt 1, `sem_at_init` and `enroll_addr` for attempt 2. That is
+the pattern worth keeping: when a mechanism cannot be run, spend the effort on making its
+failure legible rather than on arguing it will not fail.

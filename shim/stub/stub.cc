@@ -49,14 +49,22 @@ static uint64_t mono_ns() {
 extern "C" __attribute__((visibility("default"))) void
 perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period) {
     // The #49 startup rendezvous, before the first launch and therefore
-    // before the first probe: wait for the consumer to install this
-    // process's CFI tables, so the kernel-side walk of every sampled launch
-    // has them. Only when a consumer is actually attached -- the semaphore
-    // is what says so -- and never fatal: see core/enroll.h.
-    perfagent::EnrollResult enrolled = perfagent::kEnrollDisabled;
-    if (gpu_launch_sampled_v1_enabled()) {
-        enrolled = perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
-    }
+    // before the first probe: wait for the consumer to install this process's
+    // CFI tables, so the kernel-side walk of every sampled launch has them.
+    //
+    // NOT gated on the probe semaphore. See core/enroll.h: the semaphore
+    // answers "has the kernel told this process a consumer is attached yet",
+    // which is a different question from "is one attached", and on the CUDA
+    // path the two differ at exactly this moment. The connect is the gate -
+    // an unbound abstract address refuses immediately.
+    const unsigned sem_at_enroll = gpu_launch_sampled_v1_semaphore_count();
+    // See the adapter: the name is logged so a disagreement between the two
+    // ends is one string comparison rather than a round trip of inference.
+    char enroll_name[128];
+    if (!perfagent::enroll_self_name(enroll_name, sizeof(enroll_name)))
+        snprintf(enroll_name, sizeof(enroll_name), "<no-address>");
+    perfagent::EnrollResult enrolled =
+        perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
 
     perfagent::Batch<gpu_launch_v1, 32> lb(gpu_launch_v1_emit, gpu_launch_v1_enabled);
     perfagent::Batch<gpu_exec_v1, 32> eb(gpu_exec_v1_emit, gpu_exec_v1_enabled);
@@ -138,13 +146,20 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     // is a deterministic chain from (seed, period), so this line is what makes
     // the exact sampled= count above reproducible and auditable offline
     // (internal/gpuabi.SampleSchedule replays it).
+    //
+    // sem_at_enroll vs sem_at_exit is the measurement issue #49's first fix
+    // needed and did not have: 0 then non-zero means the semaphore had not
+    // armed when the rendezvous ran, which is why gating on it lost the CUDA
+    // path entirely.
     fprintf(stderr, "stub: launches=%u observed=%llu sampled=%llu period=%u seed=0x%016llx "
-                    "launch_dropped=%llu exec_dropped=%llu enroll=%s\n",
+                    "launch_dropped=%llu exec_dropped=%llu enroll=%s "
+                    "sem_at_enroll=%u sem_at_exit=%u enroll_addr=@%s\n",
             launches, (unsigned long long)sampler.observed(),
             (unsigned long long)sampler.sampled(), sampler.period(),
             (unsigned long long)sampler.seed(),
             (unsigned long long)lb.dropped(), (unsigned long long)eb.dropped(),
-            perfagent::enroll_result_name(enrolled));
+            perfagent::enroll_result_name(enrolled),
+            sem_at_enroll, gpu_launch_sampled_v1_semaphore_count(), enroll_name);
 }
 
 // linger keeps this process alive after its records are flushed, until the

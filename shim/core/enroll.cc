@@ -210,6 +210,13 @@ unsigned enroll_timeout_ms(unsigned dflt) {
     return (unsigned)n;
 }
 
+bool enroll_self_name(char *out, size_t outsz) {
+    // The address of THIS function: enroll.cc is linked into the shim, so the
+    // mapping containing it is the mapping the consumer's uprobes are on.
+    const void *self = (const void *)&enroll_self_name;
+    return enroll_name_from_maps("/proc/self/maps", (unsigned long)self, out, outsz);
+}
+
 EnrollResult enroll_with_consumer(unsigned timeout_ms) {
     if (timeout_ms == 0) return kEnrollDisabled;
     char name[sizeof(((struct sockaddr_un *)nullptr)->sun_path)];

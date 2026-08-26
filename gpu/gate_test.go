@@ -83,6 +83,14 @@ func TestPhase6Gate(t *testing.T) {
 	t.Run("assertion-04-four-statuses-in-the-labels", TestProjectionEmitsAllFourSrcStatuses)
 	t.Run("assertion-04-status-enum-is-exhaustive", TestSrcStatusesIsExhaustiveAndStable)
 	t.Run("assertion-04-zero-value-is-not-a-status", TestSrcStatusZeroValueIsNotAStatus)
+	// no-module has to stay reachable now that the cubin transport actually
+	// feeds this store (issue #93). The two ways it is reached are a CRC
+	// nothing was ever offered under, and a module the bounds evicted - and
+	// the second must never answer with the line it used to have.
+	t.Run("assertion-04-an-evicted-module-is-no-module-not-stale",
+		TestResolveAfterEvictionIsNoModuleNotStale)
+	t.Run("assertion-04-membership-is-live-and-counts-as-use",
+		TestHasIsLiveMembershipAndCountsAsUse)
 
 	// 5. Reconciliation: every emitted PC record lands in exactly one of
 	//    attributed-exact, attributed-kernel, pending, evicted.

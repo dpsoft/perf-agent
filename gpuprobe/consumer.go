@@ -336,6 +336,37 @@ type Config struct {
 	// table, which is the one failure worse than no line table.
 	CubinMaxBytes int
 
+	// Modules is the store every cubin that arrives over the cubin transport
+	// (cubin.go) is written into. It is the ONE hop between the bytes
+	// crossing the socket and gpu_src_status meaning anything: without it the
+	// cubins are received, sealed, verified, size-checked and stored where
+	// nothing reads them, and every PC sample in the profile reads
+	// "no-module" (issue #93).
+	//
+	// It is INJECTED rather than owned, and the caller must hand the SAME
+	// store to gpu.TimelineConfig.Modules (which resolves a pending PC group's
+	// (crc, functionIndex) to a device function name) and to
+	// gpu.ProjectionConfig.Modules (which resolves the source location). One
+	// store, three references, no second copy of the bytes - a store this
+	// package constructed for itself would be one the join and the projection
+	// cannot see, which is exactly the shape of the bug this field closes.
+	//
+	// Nil is supported and is what every backend that does not resolve source
+	// lines passes. With no store the channel still binds and offers are still
+	// admitted, authenticated and counted; they land in a bounded placeholder
+	// nothing reads, and every PC sample carries gpu_src_status="no-module".
+	// That is the same fact for the reader as a cubin that never arrived (see
+	// gpu.SrcNoModule), and it is deliberately not silent: a profile that says
+	// "no-module" on every sample points straight at the missing store, while
+	// one with the source labels absent is indistinguishable from a profile
+	// taken before this phase existed.
+	//
+	// The store's own bounds (gpu.ModuleStoreConfig.Capacity and MaxBytes) are
+	// the caller's, and they are enforced by eviction: a module the store drops
+	// answers "no-module" from then on, never a stale line. CubinMaxBytes and
+	// CubinTotalBytes below bound the TRANSPORT and are separate from them.
+	Modules *gpu.ModuleStore
+
 	// CubinTotalBytes bounds every cubin this consumer will hold. Zero means
 	// defaultCubinTotalBytes. This is the memory a JIT- or template-explosion
 	// workload can make the agent hold, so it is a ceiling rather than a dial;
@@ -1563,6 +1594,11 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	// admission bucket. Best-effort in exactly the same way - a consumer
 	// that cannot bind it still profiles, still walks stacks, and simply
 	// resolves no source lines.
+	//
+	// The nil sink means "the one cfg asks for": cubinSinkFor writes accepted
+	// cubins into Config.Modules when the caller supplied a store, and into
+	// the bounded placeholder nothing reads when it did not. An explicit sink
+	// is a test seam and nothing else.
 	if cl, cerr := newCubinListener(cfg, nil); cerr != nil {
 		c.cubinErr = cerr.Error()
 	} else {

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/dpsoft/perf-agent/gpu"
 )
 
 // The cubin transport: how a module's bytes get from the producer to this
@@ -182,10 +184,12 @@ const (
 	// make the agent hold, so it is a hard ceiling rather than a dial.
 	defaultCubinTotalBytes = 256 << 20
 	// defaultCubinStoreCapacity bounds the number of distinct CRCs the
-	// built-in store holds. Task 4 replaces this store with the LRU,
-	// line-table-backed gpu.ModuleStore; until then the bound still has to
-	// exist, because an unbounded map fed by a profiled application is the
-	// same defect whoever owns it.
+	// built-in store holds - the one a consumer with no Config.Modules gets,
+	// where the bytes land and nothing reads them. A consumer that resolves
+	// source lines supplies gpu.ModuleStore instead and is bounded by
+	// gpu.ModuleStoreConfig. The bound exists on both paths because an
+	// unbounded map fed by a profiled application is the same defect whoever
+	// owns it.
 	defaultCubinStoreCapacity = 512
 )
 
@@ -284,10 +288,11 @@ func newCubinAdmission(now func() time.Time) *enrollAdmission {
 	}
 }
 
-// cubinSink is what an accepted cubin is handed to. Task 4's
-// gpu.ModuleStore - bounded, LRU, line-table-backed - implements this; until
-// then memCubinStore does, so the transport is complete and testable on its
-// own rather than half-built behind a store that does not exist yet.
+// cubinSink is what an accepted cubin is handed to. gpu.ModuleStore - bounded,
+// LRU, line-table-backed - is the sink a consumer that resolves source lines
+// installs, through Config.Modules and moduleStoreSink below. memCubinStore is
+// what a consumer with no store gets, so the transport is complete and
+// testable on its own.
 type cubinSink interface {
 	// HasCubin reports whether this CRC is already held. Asked BEFORE the
 	// payload is touched, so a duplicate costs no mmap and no parse.
@@ -296,8 +301,64 @@ type cubinSink interface {
 	PutCubin(crc uint64, bytes []byte) error
 }
 
-// memCubinStore is the placeholder store: bounded by count, no line table, no
-// LRU. Task 4 replaces it.
+// moduleStoreSink is the one hop between the cubin transport and the store
+// that turns (cubin_crc, functionIndex, pcOffset) into a function, a file and
+// a line. It is the whole of issue #93: both ends were built and tested and
+// nothing connected them, so every PC sample in a real profile read
+// gpu_src_status="no-module".
+//
+// It is an adapter rather than a set of methods on gpu.ModuleStore because the
+// two contracts differ in one place that matters - see PutCubin - and because
+// gpu must not grow a method named for this transport.
+//
+// It holds the store the CALLER built (Config.Modules) and never one of its
+// own. gpu.TimelineConfig.Modules and gpu.ProjectionConfig.Modules read the
+// same instance: one store, three references, no second copy of the bytes. A
+// store constructed here would be a store the projection cannot see, which is
+// the shape of the bug this closes.
+type moduleStoreSink struct {
+	store *gpu.ModuleStore
+}
+
+// HasCubin asks the store for LIVE membership, which is what makes the
+// duplicate no-op safe against eviction: a module the store's bounds dropped
+// answers false, so the next offer for it is admitted and stores it again. No
+// set of "CRCs seen once" is kept anywhere on this path, deliberately - one
+// would turn a single eviction into permanent unresolvability while
+// CubinsReceived, CubinsDuplicate and every store counter still read healthy.
+func (m moduleStoreSink) HasCubin(crc uint64) bool { return m.store.Has(crc) }
+
+// PutCubin stores the bytes and reports only a failure to STORE them.
+//
+// gpu.ModuleStore.Put's error is diagnostic, not a rejection: bytes that do
+// not parse are still stored (so a re-offer is not re-parsed), counted in
+// ModuleStoreStats.ModulesUnparseable, and resolve as no-module. Propagating
+// it here would make the listener count a rejection for a cubin it is holding
+// - CubinsRejectedMalformed non-zero on a healthy run, CubinsReceived and
+// CubinBytesReceived understating what the agent actually holds, and the
+// producer told 'X' for an offer that landed. The two facts stay where each is
+// true: the transport counts what arrived, and the store counts what it can
+// read. Put has no other error, so nothing is being swallowed - if it grows
+// one, this returns it.
+func (m moduleStoreSink) PutCubin(crc uint64, b []byte) error {
+	_ = m.store.Put(crc, b)
+	return nil
+}
+
+// cubinSinkFor picks the sink for a consumer's configuration. A store supplied
+// by the caller is the sink; nothing is constructed here when one is missing,
+// because a store this package owned would be one the projection cannot read.
+func cubinSinkFor(cfg Config) cubinSink {
+	if cfg.Modules != nil {
+		return moduleStoreSink{store: cfg.Modules}
+	}
+	return newMemCubinStore(defaultCubinStoreCapacity)
+}
+
+// memCubinStore is what a consumer with no Config.Modules gets: bounded by
+// count, no line table, no LRU, and nothing reads it. Its PC samples resolve
+// gpu_src_status="no-module", which is the truth for them - there is no store
+// to resolve against. See Config.Modules.
 type memCubinStore struct {
 	mu   sync.Mutex
 	cap  int
@@ -432,7 +493,7 @@ func buildCubinListener(cfg Config, sink cubinSink) (*cubinListener, error) {
 		totalBytes = uint64(cfg.CubinTotalBytes)
 	}
 	if sink == nil {
-		sink = newMemCubinStore(defaultCubinStoreCapacity)
+		sink = cubinSinkFor(cfg)
 	}
 	return &cubinListener{
 		ln:         ln,

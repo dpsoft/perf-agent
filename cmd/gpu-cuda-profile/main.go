@@ -91,11 +91,33 @@ func main() {
 		log.Fatalf("adapter %s: %v (build it with: make -C shim nvidia)", shimPath, err)
 	}
 
+	// The module store, built HERE because it has three readers and no owner
+	// among them: the cubin listener writes every arriving cubin into it
+	// (gpuprobe.Config.Modules), the Timeline's join resolves a pending PC
+	// group's (cubin_crc, functionIndex) to a device function name through it
+	// (gpu.TimelineConfig.Modules), and the projection resolves the source
+	// location against it (gpu.ProjectionConfig.Modules). It is ONE instance
+	// in all three places on purpose: a second store would hold a second copy
+	// of every cubin and answer "no-module" for modules the first one holds.
+	//
+	// The bounds are gpu.ModuleStoreConfig's defaults - 512 modules and
+	// 64 MiB - and they are taken rather than restated. 512 distinct cubins is
+	// already the JIT/template-explosion case rather than a normal workload,
+	// and 64 MiB is a tighter resident bound than anything the transport
+	// enforces (8 MiB per cubin, 256 MiB total offered), so the store is what
+	// actually caps what this process holds. Writing the numbers again here
+	// would put a second copy of the sizing where drift is invisible.
+	//
+	// Both bounds evict least-recently-used, and eviction is honest: a PC
+	// sample for a module that was dropped resolves "no-module", never a stale
+	// line from a module that is no longer here.
+	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
+
 	// The selected tier reaches the agent's own join here and the producer's
 	// environment below, from ONE variable. Two copies that could disagree
 	// about which tier ran is how a profile ends up disclosing one thing and
 	// doing another.
-	timeline := gpu.NewTimeline(gpu.TimelineConfig{PCSampling: tier})
+	timeline := gpu.NewTimeline(gpu.TimelineConfig{PCSampling: tier, Modules: store})
 	// Without a symbolizer the sampled launch stacks still arrive and are
 	// still accounted for, but every one of them degrades to no stack — the
 	// profile would then be honest and useless, all GPU time unattributed.
@@ -133,6 +155,10 @@ func main() {
 		Backend:    gpu.BackendCUPTI,
 		Sink:       timeline,
 		Symbolizer: sym,
+		// Where the cubins land. Without this the bytes cross the socket,
+		// are sealed, verified and stored where nothing reads them, and
+		// every PC sample in this profile says gpu_src_status="no-module".
+		Modules: store,
 	})
 	if err != nil {
 		log.Fatalf("attach: %v", err)
@@ -219,7 +245,7 @@ func main() {
 	// own losses reach the operator: gpu_pc labels dropped at the cardinality
 	// ceiling are invisible in the profile itself, and JoinHealthWith below is
 	// the only place they are reported.
-	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{})
+	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
 	if len(samples) == 0 {
 		log.Fatal("no samples projected; the pipeline produced nothing")
 	}
@@ -253,4 +279,12 @@ func main() {
 	for _, line := range gpu.JoinHealthWith(snap, projStats) {
 		log.Print(line)
 	}
+	// And the store's own account, which is neither of the above: what
+	// arrived, what it could read, and what it evicted trying. A run where
+	// every sample says "no-module" is a different problem depending on
+	// whether this line reads modules_stored=0 (nothing arrived - look at the
+	// Cubins* counters above) or modules_stored>0 with resolve_no_module high
+	// (the CRCs the PC records join on are not the CRCs the cubins arrived
+	// under, which is hardware assertion 13).
+	log.Printf("module store: %+v", store.Stats())
 }

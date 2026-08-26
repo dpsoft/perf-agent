@@ -861,3 +861,48 @@ func TestFunctionNameDoesNotDisturbTheResolveIdentity(t *testing.T) {
 	}
 	requireSumIdentity(t, c)
 }
+
+// TestHasIsLiveMembershipAndCountsAsUse covers the accessor the cubin
+// transport asks before it maps a payload (gpuprobe.Config.Modules).
+//
+// Two properties, and the store is the only place either can be guaranteed:
+//
+//   - it answers about what is held NOW. An evicted module answers false, so
+//     the transport admits the next offer for it and the module comes back.
+//     Anything that remembered CRCs across an eviction would turn one eviction
+//     into permanent unresolvability, with every counter on both sides reading
+//     healthy;
+//   - it counts as use. A producer re-announcing a module is evidence the
+//     module is live, exactly as Put's already-held path treats it, so a
+//     module offered often but sampled rarely does not age out under a burst
+//     of unrelated loads.
+//
+// And it must not touch the Resolve* counters: those four partition calls to
+// Resolve exactly, and that identity is this store's main self-check.
+func TestHasIsLiveMembershipAndCountsAsUse(t *testing.T) {
+	b := fixture(t, "single_lineinfo.cubin")
+	idx := symIndexOf(t, b, "addOne")
+
+	st := &counting{ModuleStore: NewModuleStore(ModuleStoreConfig{Capacity: 2})}
+	require.NoError(t, st.Put(1, b))
+	require.NoError(t, st.Put(2, b))
+	assert.False(t, st.Has(3), "a CRC that was never offered is not held")
+
+	// Touch 1 through Has alone, making 2 the least recently used.
+	require.True(t, st.Has(1))
+	require.NoError(t, st.Put(3, b))
+	assert.True(t, st.Has(1), "Has did not count as use, so the module it asked about aged out")
+	assert.False(t, st.Has(2), "the untouched module is the one that goes")
+
+	// Live membership, not a memory: the evicted CRC answers false, and
+	// offering it again brings it back.
+	require.Equal(t, SrcNoModule, st.Resolve(2, idx, 0x10).Status())
+	require.NoError(t, st.Put(2, b))
+	assert.True(t, st.Has(2))
+	assert.Equal(t, SrcResolved, st.Resolve(2, idx, 0x10).Status(),
+		"a re-offered module did not become resolvable again")
+
+	// The identity still holds: Has is not a fifth Resolve.
+	assert.Equal(t, st.calls, st.Stats().ResolveTotal(),
+		"Has incremented a Resolve counter; the four no longer partition Resolve calls")
+}

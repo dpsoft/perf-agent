@@ -20,7 +20,20 @@ import (
 func main() {
 	const stub = "./shim/perfagent-gpu-stub"
 
-	timeline := gpu.NewTimeline(gpu.TimelineConfig{})
+	// The module store. Same three readers as cmd/gpu-cuda-profile - the cubin
+	// listener writes it, the Timeline's join names device functions through
+	// it, the projection resolves source lines against it - and the same
+	// defaults (512 modules, 64 MiB), for the same reason: the transport's own
+	// ceilings sit outside them, so this is the bound that decides what the
+	// process holds.
+	//
+	// The stub offers cubins when PERFAGENT_STUB_CUBINS names them and emits
+	// PC records when PERFAGENT_GPU_PC_SAMPLING is on, both inherited from the
+	// operator's environment, so this driver produces real source labels for a
+	// run configured that way and an empty store for one that is not.
+	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
+
+	timeline := gpu.NewTimeline(gpu.TimelineConfig{Modules: store})
 	// Without a symbolizer the sampled launch stacks still arrive and are
 	// still accounted for, but every one of them degrades to no stack — the
 	// profile would then be honest and useless, all GPU time unattributed.
@@ -44,6 +57,7 @@ func main() {
 		Backend:    gpu.GPUBackendID("stub"),
 		Sink:       timeline,
 		Symbolizer: sym,
+		Modules:    store,
 	})
 	if err != nil {
 		log.Fatalf("attach: %v", err)
@@ -128,7 +142,7 @@ func main() {
 	// own losses reach the operator: gpu_pc labels dropped at the cardinality
 	// ceiling are invisible in the profile itself, and JoinHealthWith below is
 	// the only place they are reported.
-	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{})
+	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
 	if len(samples) == 0 {
 		log.Fatal("no samples projected; the pipeline produced nothing")
 	}
@@ -160,4 +174,5 @@ func main() {
 	for _, line := range gpu.JoinHealthWith(snap, projStats) {
 		log.Print(line)
 	}
+	log.Printf("module store: %+v", store.Stats())
 }

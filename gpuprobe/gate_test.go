@@ -1302,6 +1302,13 @@ const gateCRCAbsent uint64 = 0x6A7E0003
 // is the consumer's decode arm for KIND_PC, and that is asserted separately and
 // exactly by the 64 records above.
 //
+// The MODULES those injected samples resolve against are no longer supplied by
+// the gate. Issue #93 - the cubin transport never feeding gpu.ModuleStore - is
+// closed, so the store below is handed to gpuprobe.Config.Modules and FILLED BY
+// THE PRODUCT from the bytes the producer sent, and this test asserts what it
+// holds rather than putting it there. Only the PC records are still injected,
+// and only for the reason above.
+//
 // # Assertion 11 is not here
 //
 // getcap on the gate binary is asserted in gate_compose_test.go, where it runs
@@ -1321,20 +1328,19 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 	requireFPLess(t, built)
 	stub := privateStubCopy(t, built)
 
-	// The module store. It is built HERE, and filled after the run from the
-	// CRCs the PRODUCER declared, rather than by the consumer - and that is
-	// the second finding this gate records rather than papers over:
+	// The module store, built here exactly as cmd/gpu-cuda-profile builds it:
+	// one instance, handed to gpuprobe.Config.Modules (where the cubin
+	// listener writes it), to gpu.TimelineConfig.Modules (where the join reads
+	// device function names out of it) and to gpu.ProjectionConfig.Modules
+	// (where the source labels are resolved). The defaults are taken rather
+	// than restated - 512 modules and 64 MiB - because the sizing belongs in
+	// one place.
 	//
-	//	The cubin listener's sink is gpuprobe's own bounded memCubinStore
-	//	(gpuprobe/cubin.go). Nothing in gpuprobe, in gpu, or in
-	//	cmd/gpu-cuda-profile ever hands a gpu.ModuleStore to gpuprobe.Config
-	//	or to gpu.ProjectionConfig. The bytes cross the socket, are sealed,
-	//	verified and stored - and stop there. As shipped, every PC sample in a
-	//	real profile therefore reads gpu_src_status="no-module".
-	//
-	// CubinsReceived and snap.Modules are asserted below so the transport half
-	// is still proven end to end on this run, and the missing hop is one named
-	// gap rather than an invisible one.
+	// Nothing in this test PUTS anything into it. It is filled by the product,
+	// over the cubin channel, from the bytes the producer sends, and what it
+	// ends up holding is asserted below against the CRCs the producer itself
+	// declared. That is the hop issue #93 was about, and it is why this gate
+	// no longer says "as shipped every PC sample reads no-module".
 	lineInfo := readFixture(t, "single_lineinfo.cubin")
 	noLineInfo := readFixture(t, "single_nolineinfo.cubin")
 	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
@@ -1359,6 +1365,11 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 		Backend:    gpu.GPUBackendID("stub"),
 		Sink:       timeline,
 		Symbolizer: sym,
+		// The same store the Timeline above and the projection below read.
+		// Without this the cubins still arrive, are still sealed, verified
+		// and counted - and land where nothing reads them, which is what
+		// issue #93 was.
+		Modules: store,
 	})
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
@@ -1445,8 +1456,31 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 		"same, for single_nolineinfo.cubin")
 	assert.NotEqual(t, gateCRCLineInfo, gateCRCNoLineInfo,
 		"two different cubins collided on one CRC, which would make them indistinguishable to the store")
-	require.NoError(t, store.Put(gateCRCLineInfo, lineInfo))
-	require.NoError(t, store.Put(gateCRCNoLineInfo, noLineInfo))
+
+	// And the hop: the store the consumer was handed holds both modules, under
+	// those CRCs, because the cubin listener wrote them there. This test put
+	// nothing in it.
+	//
+	// This is issue #93's assertion. Before it was closed the listener's sink
+	// was a bounded map with no line table, gpuprobe.Config had no field for a
+	// store, and this block could not be written at all - the gate filled the
+	// store itself and recorded the gap as a finding.
+	ms := store.Stats()
+	require.Equal(t, 2, store.Len(),
+		"the cubin transport did not feed the module store: %d modules held after %d cubins were received. "+
+			"Every PC sample in a real profile would read gpu_src_status=\"no-module\" (issue #93)",
+		store.Len(), c.Stats().CubinsReceived)
+	assert.Equal(t, uint64(1), ms.ModulesWithLineInfo,
+		"the -lineinfo fixture did not arrive as a module with a usable line table: %+v", ms)
+	assert.Equal(t, uint64(1), ms.ModulesWithoutLineInfo,
+		"the no-lineinfo fixture did not arrive as a module without one: %+v", ms)
+	assert.Zero(t, ms.ModulesUnparseable,
+		"a cubin crossed the transport and did not survive as an ELF: %+v", ms)
+	assert.Zero(t, ms.ModulesEvicted, "two modules cannot pressure a 512-module, 64 MiB store")
+	assert.Equal(t, gpu.SrcResolved, store.Resolve(gateCRCLineInfo, lineIdx, 0x10).Status(),
+		"the module the PRODUCER declared under %#x does not resolve a source line in the store the product filled",
+		gateCRCLineInfo)
+	assert.Equal(t, gpu.SrcNoLineInfo, store.Resolve(gateCRCNoLineInfo, noLineIdx, 0x10).Status())
 
 	// The tail: PC batches, the stall map, the config record, the windows and
 	// the drop records are all flushed after the last launch, so they are the

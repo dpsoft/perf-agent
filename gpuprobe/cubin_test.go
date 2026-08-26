@@ -1013,9 +1013,10 @@ func TestClosingTheCubinListenerIsSafeAndReleasesPeers(t *testing.T) {
 	}
 }
 
-// The built-in store is bounded. Task 4 replaces it with the LRU,
-// line-table-backed gpu.ModuleStore, but an unbounded map fed by a profiled
-// application is the same defect whoever owns it, so the bound exists now.
+// The built-in store is bounded. It is what a consumer with no Config.Modules
+// gets - see TestAConsumerWithNoModuleStoreKeepsTheBoundedPlaceholder - and an
+// unbounded map fed by a profiled application is the same defect whoever owns
+// it, so the bound is asserted on that path too.
 func TestTheBuiltInCubinStoreIsBounded(t *testing.T) {
 	s := newMemCubinStore(2)
 	require.NoError(t, s.PutCubin(1, []byte("a")))

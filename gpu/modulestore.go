@@ -544,6 +544,45 @@ func (s *ModuleStore) Resolve(crc uint64, functionIndex uint32, pcOffset uint64)
 	return resolvedAt(fn, file, line)
 }
 
+// Has reports whether this CRC is held RIGHT NOW, and refreshes its recency
+// when it is.
+//
+// It exists for the cubin transport, which asks before it maps a payload: an
+// offer for a CRC already held is a counted no-op, so the answer decides
+// whether a memfd is mapped, copied and parsed again for bytes that are
+// already here. cubin_crc is content-addressed, so "the same CRC" is the same
+// bytes and re-reading them could only produce the same answer at the cost of
+// doing it again.
+//
+// It is deliberately LIVE membership and not a memory of everything ever
+// stored. A module the bounds evicted answers false, so the next offer for it
+// is admitted and stores it again - which is the only way a re-offered module
+// can come back. A "seen once" set kept anywhere on this path would turn one
+// eviction into permanent unresolvability, silently, with every counter on
+// both sides reading green.
+//
+// Recency is refreshed for the same reason Put's already-held path refreshes
+// it: a re-offer is the producer telling us this module is being loaded again,
+// which is use. Without that, a module offered repeatedly but sampled rarely
+// would age out under a burst of unrelated loads.
+//
+// It increments none of the Resolve* counters. Those four partition calls to
+// Resolve exactly, and that identity is this store's main self-check; folding
+// a second entry point into it would break the identity while looking like an
+// improvement. What an offer did is counted by the transport, which is where
+// it happened.
+func (s *ModuleStore) Has(crc uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.byCRC[crc]
+	if !ok {
+		return false
+	}
+	s.lru.MoveToFront(e.elem)
+	return true
+}
+
 // Len reports how many modules are currently held.
 func (s *ModuleStore) Len() int {
 	s.mu.Lock()

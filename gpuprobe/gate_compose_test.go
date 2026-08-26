@@ -3,7 +3,6 @@ package gpuprobe
 import (
 	"os"
 	"os/exec"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -14,7 +13,9 @@ import (
 )
 
 // TestPhase6GateConsumerHalf is the consumer-side quarter of the Phase 6 phase
-// gate: assertions 10, 10a, 11 and 12 of Task 13.
+// gate: assertions 10, 10a, 11 and 12 of Task 13, plus the half of assertion 2
+// this package owns - the hop from the cubin transport into gpu.ModuleStore
+// (issue #93), which used to be a pin here and is now an assertion.
 //
 // It is a SECOND gate entry point, in package gpuprobe rather than
 // gpuprobe_test, and both halves of that are load-bearing:
@@ -87,11 +88,32 @@ func TestPhase6GateConsumerHalf(t *testing.T) {
 	t.Run("assertion-12-kindmax-matches-the-bpf-object", TestEmbeddedProgramIsUprobeMulti)
 	t.Run("assertion-12-every-cookie-has-a-sized-kind", TestBPFSizesEveryKindCookieForInstalls)
 
-	// Not one of the twelve: the wiring gap that stops assertion 2 from being
-	// reachable by the shipping product. Pinned here so it fails the moment it
-	// is closed, rather than being remembered only in a report.
-	t.Run("outstanding-cubin-transport-does-not-feed-the-module-store",
-		TestGateTheCubinTransportDoesNotYetFeedTheModuleStore)
+	// 2, at the level this package owns: the hop from the cubin transport to
+	// gpu.ModuleStore. Until issue #93 was closed this slot held a PIN - a
+	// test that passed BECAUSE the hop was missing - because assertion 2 was
+	// not reachable through the shipping path at all: Attach installed a
+	// placeholder store with no line table, and gpuprobe.Config had no field
+	// by which a caller could supply the real one. It is now the real thing: a
+	// cubin crosses the socket and comes out of the projection as a named line
+	// of the CUDA source it was built from.
+	//
+	// Catches: a sink that writes into a store the projection cannot see (the
+	// bug #93 filed, in its subtler form); a wiring that remembers CRCs
+	// outside the store, which would make one eviction permanent while every
+	// counter read healthy; a Put error translated into a transport rejection,
+	// which would have the transport report a refusal for a cubin the agent is
+	// holding.
+	t.Run("assertion-02-an-offered-cubin-becomes-a-source-line",
+		TestACubinOfferedOverTheChannelBecomesASourceLine)
+	t.Run("assertion-02-an-evicted-module-is-no-module-and-can-return",
+		TestAnEvictedModuleAnswersNoModuleAndIsOfferedAgainNotSuppressed)
+	t.Run("assertion-02-an-unreadable-cubin-still-lands-and-is-counted-apart",
+		TestACubinTheStoreCannotParseStillLandsAndIsCountedApart)
+	// And assertion 4's floor: no-module stays reachable after the wiring,
+	// both from a consumer that configured no store at all and from a CRC
+	// nothing was ever offered under.
+	t.Run("assertion-04-no-store-is-a-supported-no-module-state",
+		TestAConsumerWithNoModuleStoreKeepsTheBoundedPlaceholder)
 }
 
 // TestPhase6GateBinaryDoesNotAskForCapSysAdmin is gate assertion 11, the
@@ -207,70 +229,4 @@ func TestGetcapAgreesWithTheLibraryReading(t *testing.T) {
 	t.Logf("getcap %s -> %q", self, strings.TrimSpace(text))
 	assert.NotContains(t, strings.ToLower(text), "cap_sys_admin",
 		"getcap names cap_sys_admin on the gate binary")
-}
-
-// TestGateTheCubinTransportDoesNotYetFeedTheModuleStore pins the gap that
-// stops the Phase 6 exit condition from being reachable by the shipping
-// product, so that it is a named, self-invalidating fact rather than prose in
-// a report nobody re-reads.
-//
-// # The gap
-//
-// Task 3 built the cubin channel and Task 4 built gpu.ModuleStore - the store
-// that turns (cubin_crc, functionIndex, pcOffset) into a source line and is
-// "the single place gpu_src_status is decided". Nothing connects them:
-//
-//   - Attach calls newCubinListener(cfg, nil), and a nil sink becomes
-//     memCubinStore - a bounded map of CRC to bytes with no line table, no LRU
-//     and no Resolve. Its own comment says "Task 4 replaces it";
-//   - gpuprobe.Config has no field by which a caller could supply one, and
-//     gpu.ModuleStore does not implement cubinSink (Put/HasCubin versus
-//     PutCubin/HasCubin) even if it had;
-//   - cmd/gpu-cuda-profile builds neither: it calls ProjectExecutionsWith with
-//     a zero ProjectionConfig and NewTimeline without Modules.
-//
-// So on hardware today, every cubin is received, sealed, verified, size- and
-// identity-checked, stored - and then never read. Every PC sample in a real
-// profile reads gpu_src_status="no-module", and gate assertion 2 (a source
-// line reached from a CPU stack) cannot be satisfied end to end by the product
-// as shipped. TestStubDrivesPCSamplingToPprofWithoutAGPU therefore builds the
-// store itself, from the CRCs the producer declared, and says so.
-//
-// This is the ONE hop between the transport and the labels, and both ends of
-// it are built and tested. It is a wiring task, not a design gap.
-//
-// # Why a passing test rather than a failing one
-//
-// Same reason as gpu's TestGateGraphExecutionRefusalIsNotAssertableYet: the
-// gate must not ship red, and it must not ship silently short of an assertion
-// either. When the hop is wired, this test fails - by name, in the gate's own
-// file - and the person wiring it deletes it and drops the injection from the
-// end-to-end gate.
-func TestGateTheCubinTransportDoesNotYetFeedTheModuleStore(t *testing.T) {
-	// The default sink a real Attach installs.
-	l, err := newCubinListener(Config{ShimPath: selfExe(t)}, nil)
-	require.NoError(t, err)
-	defer func() { _ = l.close() }()
-
-	_, isPlaceholder := l.sink.(*memCubinStore)
-	assert.True(t, isPlaceholder,
-		"the cubin listener's default sink is no longer the placeholder memCubinStore (it is %T). "+
-			"If that is gpu.ModuleStore, gate assertion 2 is now reachable end to end: delete this "+
-			"test and drop the PC-sample injection from TestStubDrivesPCSamplingToPprofWithoutAGPU.",
-		l.sink)
-
-	// And no caller can supply one, which is why the default is the whole
-	// story rather than merely a default.
-	typ := reflect.TypeOf(Config{})
-	for i := range typ.NumField() {
-		name := strings.ToLower(typ.Field(i).Name)
-		assert.NotContains(t, name, "module",
-			"gpuprobe.Config grew a field naming a module store (%s); the hop may now be wired - see this test's doc comment",
-			typ.Field(i).Name)
-		assert.NotContains(t, name, "store",
-			"gpuprobe.Config grew a store field (%s); the hop may now be wired - see this test's doc comment",
-			typ.Field(i).Name)
-	}
-	t.Log("cubin transport -> gpu.ModuleStore: OUTSTANDING - the bytes arrive and stop at " +
-		"memCubinStore; see .superpowers/sdd/task-13-gate-report.md")
 }

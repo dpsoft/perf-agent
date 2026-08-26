@@ -20,7 +20,7 @@ import "fmt"
 // says. So the two stay entirely separate: Ambiguous keeps its meaning
 // untouched, and PC-attribution quality lives here.
 //
-// # The four values
+// # The five values
 //
 //	exact               the sample carried a vendor correlation and joined
 //	                    through it. Kernel-serialized collection only; this is
@@ -43,11 +43,19 @@ import "fmt"
 //	                    indistinguishable on the wire. PC sampling is
 //	                    single-GPU in this phase; this value is the refusal,
 //	                    made visible rather than silent.
+//	graph-refused       what "exact" becomes in a process the producer
+//	                    reported launching kernels from a CUDA graph, when
+//	                    Tier A was selected. A graph launch fires ONE runtime
+//	                    callback for N kernels, so the correlation those
+//	                    samples joined through is shared by N executions and
+//	                    "exact" is false while looking like the strongest
+//	                    answer available. It is the refusal Tier A owes,
+//	                    made visible rather than silent.
 //
-// The empty value is not one of the four and is not a fifth outcome: it is
+// The empty value is not one of the five and is not a sixth outcome: it is
 // what an ExecutionView with no PC samples at all carries, because there is
 // nothing to describe. Every ExecutionView holding at least one PC sample
-// carries one of the four.
+// carries one of the five.
 type PCAttrib string
 
 const (
@@ -65,18 +73,38 @@ const (
 	// PCAttribKernelMultiDevice is the module join in a multi-device process,
 	// where cubin_crc cannot distinguish the devices.
 	PCAttribKernelMultiDevice PCAttrib = "kernel-multidevice"
+
+	// PCAttribGraphRefused is the correlation-keyed join in a process that
+	// launched kernels from a CUDA graph, under Tier A.
+	//
+	// It is reached ONLY by replacing PCAttribExact and never by ranking (see
+	// worsePCAttrib and Timeline.Snapshot). The module-keyed values are not
+	// downgraded to it, however many graph executions were reported: Tier B
+	// reaches its execution through the cubin and the function index rather
+	// than through the launch, so a graph does not make its attribution any
+	// less true. Ranking it above them would weaken Tier B for a condition
+	// that does not affect it, and would bury the executions where the claim
+	// really did become false among ones where it did not.
+	PCAttribGraphRefused PCAttrib = "graph-refused"
 )
 
-// pcAttribs lists the four in stable order, worst-caveat last. The order is
+// pcAttribs lists the five in stable order, worst-caveat last. The order is
 // also the precedence order used by worsePCAttrib.
+//
+// PCAttribGraphRefused sits at the end so that MarshalJSON accepts it and
+// PCAttribs() is exhaustive, NOT because anything ranks its way there: no code
+// path reaches it through worsePCAttrib. It describes a claim that was
+// withdrawn rather than a join whose quality was measured, and the two are
+// only comparable by accident.
 var pcAttribs = []PCAttrib{
 	PCAttribExact,
 	PCAttribKernel,
 	PCAttribKernelAmbiguous,
 	PCAttribKernelMultiDevice,
+	PCAttribGraphRefused,
 }
 
-// PCAttribs returns the four gpu_pc_attrib values in stable order.
+// PCAttribs returns the five gpu_pc_attrib values in stable order.
 //
 // It exists for the same reason SrcStatuses does: a consumer switching on the
 // value can be tested for exhaustiveness against the enum itself rather than
@@ -87,7 +115,7 @@ func PCAttribs() []PCAttrib {
 	return out
 }
 
-// pcAttribRank orders the four by how much doubt they carry, so that an
+// pcAttribRank orders them by how much doubt they carry, so that an
 // execution served by two pending groups of differing quality reports the
 // worse of the two rather than whichever happened to be processed last. A
 // value not in the table ranks below everything, which is what makes the empty
@@ -112,7 +140,7 @@ func worsePCAttrib(a, b PCAttrib) PCAttrib {
 	return a
 }
 
-// MarshalJSON refuses any value that is not one of the four, matching
+// MarshalJSON refuses any value that is not one of the five, matching
 // SrcStatus, ClockDomain and GPUCapability in this package. The empty value is
 // refused too: an ExecutionView that holds PC samples and no attribution is a
 // bug in the join, and it must fail at the serialization boundary rather than
@@ -183,6 +211,20 @@ type PCJoinStats struct {
 	// attributions. See PCAttrib.
 	AmbiguousAttributions   uint64 `json:"ambiguous_attributions,omitempty"`
 	MultiDeviceAttributions uint64 `json:"multi_device_attributions,omitempty"`
+
+	// GraphRefusedAttributions counts EXECUTIONS in this snapshot whose
+	// gpu_pc_attrib was withdrawn from "exact" to "graph-refused" because
+	// their process launched kernels from a CUDA graph under Tier A.
+	//
+	// It is a strict subset of Snapshot.ExecutionsGraphRefused: that counts
+	// every execution of an affected process, this counts only the ones that
+	// were actually carrying an exact PC attribution to withdraw. The gap
+	// between them is executions whose launch attribution is equally damaged
+	// but which carried no PC samples, and it is normally most of them.
+	//
+	// Zero on any run with no graph executions, and zero in Tier B however
+	// many there were.
+	GraphRefusedAttributions uint64 `json:"graph_refused_attributions,omitempty"`
 
 	// MultiDeviceProcesses counts distinct processes the Timeline has ever
 	// seen execute kernels on more than one device. Cumulative, not

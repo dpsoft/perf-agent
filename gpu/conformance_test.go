@@ -101,6 +101,7 @@ type attemptSink struct {
 	moduleAttempts uint64
 	eventAttempts  uint64
 	windowAttempts uint64
+	graphAttempts  uint64
 }
 
 func newAttemptSink(inner EventSink) *attemptSink {
@@ -139,6 +140,11 @@ func (a *attemptSink) EmitEvent(e GPUTimelineEvent) error {
 func (a *attemptSink) EmitSamplingWindow(w GPUSamplingWindow) error {
 	a.windowAttempts++
 	return a.inner.EmitSamplingWindow(w)
+}
+
+func (a *attemptSink) EmitGraphExecutions(g GPUGraphExecutions) error {
+	a.graphAttempts++
+	return a.inner.EmitGraphExecutions(g)
 }
 
 // conformanceHarness is a fresh Timeline + CountingSink pair, wired the way a
@@ -267,6 +273,7 @@ func assertConformanceInvariants(t *testing.T, h *conformanceHarness) Snapshot {
 	// them, and an execution that reached the profile carrying no disclosure
 	// would otherwise be invisible.
 	assertSerializationOutcomesAccounted(t, snap)
+	assertGraphRefusalAccounted(t, snap)
 
 	return snap
 }
@@ -324,6 +331,32 @@ func assertSerializationOutcomesAccounted(t *testing.T, snap Snapshot) {
 	for _, v := range snap.Executions {
 		assert.Equal(t, SerializationNotSerialized, v.Serialized,
 			"execution %+v", v.Exec.Correlation)
+	}
+}
+
+// assertGraphRefusalAccounted runs on EVERY conformance scenario, and asserts
+// the negative: no scenario here reports a CUDA-graph execution, so the
+// refusal must be entirely unarmed. A run that started withdrawing attribution
+// nobody's graph caused would be as wrong as one that stopped withdrawing it
+// when a graph did.
+//
+// The two containment relations are the identity that keeps the counters
+// checkable rather than merely reported: an execution cannot be
+// graph-refused-and-not-in-the-snapshot, and an attribution cannot have been
+// withdrawn from an execution that was not marked.
+func assertGraphRefusalAccounted(t *testing.T, snap Snapshot) {
+	t.Helper()
+	assert.Zero(t, snap.GraphExecutions, "no scenario here reports a CUDA-graph execution")
+	assert.Zero(t, snap.ExecutionsGraphRefused)
+	assert.Zero(t, snap.PCJoin.GraphRefusedAttributions)
+	assert.False(t, snap.TierAGraphRefused())
+	assert.LessOrEqual(t, snap.ExecutionsGraphRefused, uint64(len(snap.Executions)),
+		"more executions were marked graph-refused than the snapshot holds")
+	assert.LessOrEqual(t, snap.PCJoin.GraphRefusedAttributions, snap.ExecutionsGraphRefused,
+		"an attribution was withdrawn from an execution that was never marked")
+	for _, v := range snap.Executions {
+		assert.False(t, v.GraphRefused, "execution %+v", v.Exec.Correlation)
+		assert.NotEqual(t, PCAttribGraphRefused, v.PCAttrib)
 	}
 }
 

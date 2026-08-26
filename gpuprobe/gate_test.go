@@ -1517,16 +1517,23 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 	assert.Zero(t, stats.KernelDropped)
 	assert.Zero(t, stats.SinkRejected)
 
-	// Assertion 12. Undecoded is zero for every kind THIS PHASE DECODES, and
-	// gpu_dropped_v1 is not one of them: it is decoded into batch.Drops and
-	// carried, and normalizing a drop class into an operator-visible number is
-	// the consumer task after this one (see Stats.Undecoded's own comment). The
-	// stub emits exactly one record per drop class when PC sampling is on, so
-	// this is an equality rather than a tolerance - a sixth undecoded record
-	// would mean a kind arrived that nothing on this side knows about, which is
-	// silent loss.
-	assert.Equal(t, uint64(wantDropRecs), stats.Undecoded,
-		"the only undecoded records in a PC-sampling stub run are the four gpu_dropped_v1 class records; anything else is a KIND_* added on one side of the wire and not the other")
+	// Assertion 12. Undecoded is now zero for EVERY kind the ABI defines,
+	// gpu_dropped_v1 included: issue #94 gave it an applyBatch arm so the
+	// CUDA-graph drop class could arm Tier A's refusal. It used to read
+	// wantDropRecs here, and that is the assertion this one replaces.
+	//
+	// The four class records the stub emits are accounted for exactly, and
+	// they PARTITION: one graph-exec record acted on, three Tier B loss
+	// classes decoded and counted unconsumed until the task that gives each an
+	// operator-visible number lands. A fifth record, or a shortfall in the
+	// partition, means a class arrived that nothing on this side knows about.
+	assert.Zero(t, stats.Undecoded,
+		"every kind the ABI defines has a decode arm; a non-zero Undecoded is a KIND_* added on one side of the wire and not the other")
+	assert.Equal(t, uint64(wantDropRecs), stats.DropsDecoded,
+		"the stub emits exactly one gpu_dropped_v1 record per drop class")
+	assert.Equal(t, stats.DropsDecoded, stats.GraphExecReports+stats.DropsUnconsumed,
+		"every decoded drop record is acted on or counted unconsumed: %+v", stats)
+	assert.Equal(t, uint64(wantDropRecs-1), stats.DropsUnconsumed)
 	assert.Equal(t, uint64(wantPC), stats.PCSamplesDecoded,
 		"every PC record the stub emitted must have been decoded, not carried")
 	assert.Equal(t, uint64(wantCubins), stats.CubinsReceived,
@@ -1606,7 +1613,7 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 		}))
 	}
 	// One per gpu_src_status, each on its own stack-carrying execution.
-	inject(corrOf(0), gateCRCLineInfo, lineIdx, 0x10)    // resolved
+	inject(corrOf(0), gateCRCLineInfo, lineIdx, 0x10)     // resolved
 	inject(corrOf(1), gateCRCNoLineInfo, noLineIdx, 0x10) // no-lineinfo
 	inject(corrOf(2), gateCRCAbsent, 0, 0x10)             // no-module
 	inject(corrOf(3), gateCRCLineInfo, lineIdx, 0x180)    // unmapped: past the function
@@ -1732,6 +1739,44 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 			"every execution at or after an open window's start is either perturbed or unknown, and nothing else")
 	})
 
+	// ---- assertion 10b, first clause: the CUDA-graph refusal, end to end ---
+	//
+	// The stub emits one gpu_dropped_v1 record under GPU_DROP_CLASS_GRAPH_EXEC
+	// whenever PC sampling is on, so this run - Tier A, from a real producer,
+	// across a real uprobe - arms the refusal for real. That is the whole
+	// difference between this and the unprivileged half in gpu/gate_test.go:
+	// here the class crosses the wire, is decoded by the consumer's own arm,
+	// is scoped to the producer's pid from the batch header, and reaches the
+	// Timeline through the ordinary sink.
+	//
+	// Without the refusal this run would report gpu_join="exact" and
+	// gpu_pc_attrib="exact" on every one of the injected samples while a graph
+	// launch was in play - exact-LOOKING and many-to-one, which is issue #94.
+	assert.Equal(t, uint64(2), stats.GraphExecutions,
+		"the stub emits {count: 2, GPU_DROP_CLASS_GRAPH_EXEC}; a zero here means the class crossed the wire and nothing consumed it")
+	assert.Equal(t, uint64(1), stats.GraphExecReports)
+	assert.Equal(t, stats.GraphExecutions, snap.GraphExecutions,
+		"every graph report the consumer decoded must have reached the Timeline; a gap is loss between the wire and the join")
+	assert.Equal(t, uint64(1), snap.GraphExecProcesses)
+	assert.Zero(t, snap.GraphExecUnscoped,
+		"the producer named its process on the batch header, so the refusal must be scoped to it")
+	assert.Zero(t, snap.GraphExecTrackingCapped)
+	assert.True(t, snap.TierAGraphRefused())
+	assert.Equal(t, uint64(len(snap.Executions)), snap.ExecutionsGraphRefused,
+		"every execution of the one graph-using process in this run must be marked")
+	assert.Positive(t, snap.PCJoin.GraphRefusedAttributions,
+		"the injected PC samples joined by correlation, so their gpu_pc_attrib must have been withdrawn from \"exact\"")
+	for i, v := range snap.Executions {
+		require.True(t, v.GraphRefused, "execution %d unmarked", i)
+		assert.NotEqual(t, gpu.PCAttribExact, v.PCAttrib,
+			"execution %d still claims exact attribution in a graph-using process", i)
+	}
+	// And the refusal is LOUD: it reaches the operator on the summary line
+	// every run prints, not only in an anomaly they have to scroll to.
+	graphHealth := gpu.JoinHealth(snap)
+	assert.Contains(t, graphHealth[0], "WITHDRAWN")
+	assert.Contains(t, strings.Join(graphHealth, "\n"), "launched from CUDA GRAPHS")
+
 	// ---- the projection ---------------------------------------------------
 	//
 	// Projected TWICE over the SAME snapshot: once with the default budget, for
@@ -1831,6 +1876,21 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 	}
 	require.Equal(t, len(samples), si, "every projected sample must belong to an execution")
 	t.Logf("pc-derived samples: %d  by status: %v  by attrib: %v", pcDerived, byStatus, byAttrib)
+
+	// Assertion 10b's first clause, at the label. This run's PC samples all
+	// joined by vendor correlation, so without the CUDA-graph refusal every
+	// one of them would read gpu_pc_attrib="exact" - in a run where the
+	// producer reported a graph execution, which makes that word false. There
+	// must be no "exact" left, and the withdrawal must be visible on every
+	// sample rather than only in a counter.
+	assert.Zero(t, byAttrib[string(gpu.PCAttribExact)],
+		"a graph execution was reported on this run; no sample may still claim exact attribution: %v", byAttrib)
+	assert.Equal(t, pcDerived, byAttrib[string(gpu.PCAttribGraphRefused)],
+		"every correlation-joined sample's attribution must have been withdrawn: %v", byAttrib)
+	for i := range samples {
+		assert.Equal(t, "true", samples[i].Labels["gpu_graph_refused"],
+			"gpu_graph_refused rides on EVERY execution of a graph-using process, PC-bearing or not (sample %d)", i)
+	}
 
 	// Assertion 2, stated as a number rather than left implicit in the loop.
 	assert.Positive(t, resolvedWithStack,

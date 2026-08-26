@@ -16,12 +16,13 @@ import (
 // nothing here is ever called on these error paths.
 type nopSink struct{}
 
-func (nopSink) EmitLaunch(gpu.GPUKernelLaunch) error           { return nil }
-func (nopSink) EmitExec(gpu.GPUKernelExec) error               { return nil }
-func (nopSink) EmitPCSample(gpu.GPUPCSample) error             { return nil }
-func (nopSink) EmitModule(gpu.GPUModule) error                 { return nil }
-func (nopSink) EmitEvent(gpu.GPUTimelineEvent) error           { return nil }
-func (nopSink) EmitSamplingWindow(gpu.GPUSamplingWindow) error { return nil }
+func (nopSink) EmitLaunch(gpu.GPUKernelLaunch) error             { return nil }
+func (nopSink) EmitExec(gpu.GPUKernelExec) error                 { return nil }
+func (nopSink) EmitPCSample(gpu.GPUPCSample) error               { return nil }
+func (nopSink) EmitModule(gpu.GPUModule) error                   { return nil }
+func (nopSink) EmitEvent(gpu.GPUTimelineEvent) error             { return nil }
+func (nopSink) EmitSamplingWindow(gpu.GPUSamplingWindow) error   { return nil }
+func (nopSink) EmitGraphExecutions(gpu.GPUGraphExecutions) error { return nil }
 
 // Attach must return an error, never panic, when there is no such file.
 func TestAttachNonexistentShimReturnsError(t *testing.T) {

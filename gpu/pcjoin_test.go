@@ -607,11 +607,15 @@ func assertPCJoinIdentities(t *testing.T, snap Snapshot) {
 // The enum itself
 // ---------------------------------------------------------------------------
 
-// TestPCAttribsAreExhaustiveAndStable pins the four wire strings. They are the
+// TestPCAttribsAreExhaustiveAndStable pins the five wire strings. They are the
 // gpu_pc_attrib label values; rewording one silently changes the profile.
+//
+// "graph-refused" is last and is the one value no join ever chooses: it
+// REPLACES "exact" in a process the producer reported launching kernels from a
+// CUDA graph, under Tier A. See PCAttribGraphRefused, and issue #94.
 func TestPCAttribsAreExhaustiveAndStable(t *testing.T) {
 	assert.Equal(t,
-		[]PCAttrib{"exact", "kernel", "kernel-ambiguous", "kernel-multidevice"},
+		[]PCAttrib{"exact", "kernel", "kernel-ambiguous", "kernel-multidevice", "graph-refused"},
 		PCAttribs())
 
 	PCAttribs()[0] = "mutated"
@@ -631,7 +635,7 @@ func TestPCAttribRefusesValuesNobodyDecided(t *testing.T) {
 	}
 	for _, bad := range []PCAttrib{"", "kernel-probably", "heuristic"} {
 		_, err := json.Marshal(bad)
-		assert.Error(t, err, "gpu_pc_attrib %q is not one of the four and must not serialize", bad)
+		assert.Error(t, err, "gpu_pc_attrib %q is not one of the five and must not serialize", bad)
 	}
 
 	// omitempty is what keeps a view with no PC samples off that path.

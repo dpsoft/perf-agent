@@ -2,7 +2,6 @@ package gpu
 
 import (
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -143,8 +142,8 @@ func TestPhase6Gate(t *testing.T) {
 		TestProjectionCapSuppressesGpuPCAndOnlyGpuPC)
 	t.Run("assertion-09-suppression-is-surfaced", TestProjectionCapIsSurfacedInJoinHealth)
 
-	// 10b. Out-of-scope conditions refuse rather than guess. The graph clause
-	//      is asserted at the level the product implements it - see the test.
+	// 10b. Out-of-scope conditions refuse rather than guess: two devices, an
+	//      open window, and a CUDA graph.
 	t.Run("assertion-10b-two-devices-are-marked", TestTierBMultiDeviceProcessIsMarked)
 	t.Run("assertion-10b-multidevice-outranks-ambiguity", TestMultiDeviceOutranksAmbiguity)
 	t.Run("assertion-10b-open-window-is-unknown-never-false",
@@ -152,11 +151,11 @@ func TestPhase6Gate(t *testing.T) {
 	t.Run("assertion-10b-tier-a-refusal-names-cuda-graphs",
 		TestSerializedIsRefusedWithoutAnExplicitAcknowledgement)
 	// The first clause of 10b - "a graph execution makes Tier A refuse to
-	// start" - is NOT implemented by the product. This pins that, and fails
-	// when it becomes implementable so the gate is updated rather than left
-	// claiming an assertion it never made.
-	t.Run("assertion-10b-graph-refusal-is-outstanding",
-		TestGateGraphExecutionRefusalIsNotAssertableYet)
+	// start". Asserted for real since issue #94; it used to be PINNED here as
+	// an outstanding gap by TestGateGraphExecutionRefusalIsNotAssertableYet,
+	// which failed by name the moment the product grew the refusal.
+	t.Run("assertion-10b-graph-execution-makes-tier-a-refuse",
+		TestGateGraphExecutionRefusalIsReal)
 }
 
 // gateCubinCRCs are the CRCs this file stores its fixtures under. The values
@@ -352,86 +351,70 @@ func TestGateResolvedAndNoLineinfoAggregateAtTheSameKernel(t *testing.T) {
 	assert.Equal(t, []string{"main", FrameLaunch, "[gpu:kernel:addOne]"}, frameNames(samples[0].Stack))
 }
 
-// TestGateGraphExecutionRefusalIsNotAssertableYet is gate assertion 10b's
-// FIRST clause - "a graph execution makes Tier A refuse to start" - pinned as
-// an outstanding gap rather than asserted, because the product does not
-// implement it.
+// TestGateGraphExecutionRefusalIsReal is gate assertion 10b's FIRST clause:
+// "a graph execution makes Tier A refuse to start".
 //
-// # What exists and what does not
+// It replaces TestGateGraphExecutionRefusalIsNotAssertableYet, which pinned
+// this as an outstanding gap because the product did not implement it — the
+// #44 idiom, a passing test that fails when the gap closes. Issue #94 closed
+// it, that test failed by name in this file exactly as its doc comment said it
+// would, and this is the real assertion it demanded.
 //
-// The wire signal exists: the plan's Task 6 gave the adapter a
-// classGraphExec drop class, `internal/gpuabi.DropClassGraphExec` decodes it
-// and spells it "graph-exec", and the stub emits one such record so the class
-// is reachable from a test. The operator warning names CUDA graphs, and the
-// Tier A acknowledgement refusal names them too.
+// # What the clause is about
 //
-// What does not exist is the REFUSAL the plan specifies:
+// A CUDA graph launch fires ONE runtime callback for N kernels, and
+// gpu_exec_v1 carries no graph id, so all N executions arrive under one
+// correlation. Tier A's ENTIRE claim is exact launch attribution, so in such a
+// process that claim is false — and false in the worst available way, because
+// nothing about it looks wrong: gpu_join reads "exact", gpu_pc_attrib reads
+// "exact", every join counter reads green, and N kernels' time and samples are
+// billed to a single CPU call site. The plan requires the refusal be "loud and
+// counted, not a silent downgrade to Tier B", precisely because a downgrade is
+// indistinguishable from working.
 //
-//	Tier A refuses to start in a process where graph executions have been
-//	observed, because Tier A's whole claim is exact launch attribution and a
-//	graph makes that claim false. The refusal is loud and counted, not a
-//	silent downgrade to Tier B.
+// # What is asserted, and where
 //
-// Nothing in gpu/, gpuprobe/ or cmd/ consumes DropClassGraphExec. The
-// consumer decodes gpu_dropped_v1 into batch.Drops and stops there (see
-// Stats.Undecoded's own comment, which says normalizing a drop class is the
-// task after Task 7). So there is no counter for graph executions, nothing on
-// the Snapshot that names them, no joinhealth anomaly, and no input by which
-// PCSamplingRequest could be told about them. Tier A therefore starts happily
-// in a graph-using process and produces confident, exact-LOOKING attribution
-// of N kernels to one call site - which is finding 4 of the plan, and the
-// condition it says must be visible rather than merely out of scope.
+// Both halves of the refusal, because a process's first graph launch can be
+// minutes into a run that started legitimately:
 //
-// # Why this is a passing test rather than a failing one
+//   - it never STARTS — PCSamplingRequest.Select refuses "serialized" outright,
+//     resolving to OFF rather than to "continuous", and no acknowledgement flag
+//     buys past it. Refusing to start is what stops the producer's burst
+//     controller ever being built: the tier reaches the producer through
+//     PCSamplingEnvVar, and an OFF tier makes no PC-sampling call at all;
+//   - it is WITHDRAWN mid-run — Timeline marks every execution of that process,
+//     turns gpu_pc_attrib from "exact" to "graph-refused", counts both, and
+//     JoinHealth raises a standing anomaly.
 //
-// It is the shape issue #44 used and #45 inverted: an assertion that pins the
-// CURRENT state, with the note that fixing the defect must fail it. Writing
-// the real assertion now would leave the gate red on a branch that is not
-// allowed to change product behaviour; leaving nothing at all would let the
-// gate ship claiming twelve assertions while one of them was never written.
+// Plus the two things the refusal must not do: weaken Tier B, which joins
+// through the module rather than through the launch and is genuinely
+// unaffected; and discard the measurements it refuses to attribute.
 //
-// When Task 10's refusal lands, this test fails - by name, in the gate's own
-// file - and the person landing it replaces it with the real assertion:
-// a stub reporting a graph execution makes Tier A refuse to start, loudly and
-// counted.
-func TestGateGraphExecutionRefusalIsNotAssertableYet(t *testing.T) {
-	mentionsGraph := func(v any) []string {
-		var out []string
-		typ := reflect.TypeOf(v)
-		for i := range typ.NumField() {
-			if name := typ.Field(i).Name; strings.Contains(strings.ToLower(name), "graph") {
-				out = append(out, name)
-			}
-		}
-		return out
-	}
-	for _, tc := range []struct {
-		name string
-		v    any
-	}{
-		{"Snapshot", Snapshot{}},
-		{"TimelineDropStats", TimelineDropStats{}},
-		{"PCJoinStats", PCJoinStats{}},
-		{"TimelineConfig", TimelineConfig{}},
-		{"PCSamplingRequest", PCSamplingRequest{}},
-	} {
-		assert.Empty(t, mentionsGraph(tc.v),
-			"%s now names graph executions (%v). Gate assertion 10b's first clause has become "+
-				"assertable: replace this test with the real one - a stub reporting a graph "+
-				"execution makes Tier A refuse to start, loudly and counted.",
-			tc.name, mentionsGraph(tc.v))
-	}
+// Composed rather than restated, like every other assertion in this gate: the
+// tests live in gpu/graphrefusal_test.go beside the behaviour, and deleting or
+// weakening any of them now fails THE GATE, by assertion number.
+func TestGateGraphExecutionRefusalIsReal(t *testing.T) {
+	t.Run("refuses-to-start", TestGraphExecutionsMakeTierARefuseToStart)
+	t.Run("no-acknowledgement-buys-past-it", TestTheGraphRefusalIsNotOverridableByTheAcknowledgement)
+	t.Run("withdraws-exact-mid-run", TestGraphExecutionWithdrawsTierAExactAttribution)
+	t.Run("is-loud-and-counted", TestGraphRefusalIsLoudInJoinHealth)
+	t.Run("counters-are-zero-when-healthy", TestGraphCountersAreZeroOnAHealthyRunAndNonZeroImmediately)
+	t.Run("keeps-the-measurements", TestGraphRefusalKeepsTheMeasurementsItRefusesToAttribute)
+	t.Run("does-not-weaken-tier-b", TestGraphExecutionsDoNotWeakenTierB)
+	t.Run("does-not-touch-module-keyed-attribution", TestGraphRefusalDoesNotTouchModuleKeyedAttribution)
+	t.Run("does-not-touch-module-keyed-attribution-through-the-join",
+		TestGraphRefusalLeavesModuleKeyedAttributionAloneThroughTheJoin)
 
-	// The half that IS true today, so this test is not purely negative: the
-	// operator is told, in the refusal they must read before Tier A can run at
-	// all, that the tier is unavailable where graphs are in use.
+	// The half that was always true, kept: the operator is told about CUDA
+	// graphs in the acknowledgement refusal they must read before Tier A can
+	// run at all, and in the standing warning that stands for the whole run.
+	// Those are the only places the limitation reaches an operator who never
+	// hits the condition.
 	_, err := PCSamplingRequest{Flag: "serialized"}.Select()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CUDA graphs",
-		"the only place the graph limitation is stated to an operator is the Tier A acknowledgement refusal; if that text loses it, nothing anywhere names the condition")
+		"the acknowledgement refusal must keep naming the graph limitation")
 	warning := strings.Join(PCSamplingStandingWarning(PCSamplingSerialized), "\n")
 	assert.Contains(t, warning, "CUDA GRAPHS",
 		"the standing warning must keep naming the third perturbation")
-	t.Log("gate assertion 10b, first clause: OUTSTANDING - see this test's doc comment and " +
-		".superpowers/sdd/task-13-gate-report.md")
 }

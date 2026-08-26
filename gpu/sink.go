@@ -415,6 +415,37 @@ func (s *CountingSink) EmitSamplingWindow(w GPUSamplingWindow) error {
 	return nil
 }
 
+// EmitGraphExecutions is admitted UNCONDITIONALLY: no capacity check, no
+// token bucket, no clock-domain check, and no path on which it can be
+// refused by this sink.
+//
+// That is a deliberate exception to the rule every other method here follows,
+// and the reason is what the record carries. Every other event is a
+// measurement, and dropping one under pressure costs a slice of the profile
+// — which is why they are counted and bounded. This one is a REFUSAL: it says
+// Tier A's exact-launch attribution is false in a process. Dropping it does
+// not cost a slice of the profile, it restores the entire defect the refusal
+// exists to prevent — N kernels attributed to one call site with
+// gpu_pc_attrib="exact" and every counter green — and it would do so
+// precisely under the load that makes a token bucket bite. A bounded refusal
+// is not a refusal.
+//
+// It is also cheap enough that the bound buys nothing: the producer reports
+// only the DELTA since its last report, at most once per drain tick
+// (shim/nvidia/cupti_adapter.cc, g_graph_exec_reported), so the volume is a
+// handful of records per second per process regardless of how many graph
+// kernels ran.
+//
+// There is consequently no SinkStats entry for it. A per-kind EventKindStats
+// whose DroppedFull, DroppedInvalid and DroppedDownstream can never move is a
+// row of zeros that trains the reader to skip the table; the arrival count
+// lives on the producer side, in gpuprobe.Stats.GraphExecutions, where it can
+// be compared against Snapshot.GraphExecutions to size any loss upstream of
+// here.
+func (s *CountingSink) EmitGraphExecutions(g GPUGraphExecutions) error {
+	return s.inner.EmitGraphExecutions(g)
+}
+
 // SnapshotWith calls tl.Snapshot() and embeds s's own SinkStats into the
 // result - review Important 2: Timeline has no reference to the
 // CountingSink wrapping it (EventSink is the only contract between them),

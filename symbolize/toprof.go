@@ -30,6 +30,21 @@ func ToProfFrames(frames []Frame) []pprof.Frame {
 			File:    f.File,
 			Line:    uint32(f.Line),
 			Address: f.Address,
+			// Carried, not re-derived. The mapping was read while the
+			// target process was alive; the pprof builder runs later - for
+			// the GPU tools, after the workload has exited - and its own
+			// Resolver would find nothing left in /proc to look at.
+			BuildID:  f.BuildID,
+			MapStart: f.MapStart,
+			MapLimit: f.MapLimit,
+			MapOff:   f.MapOff,
+			// The one bit pprof.Frame cannot recover for itself. After this
+			// conversion an address-shaped Name is indistinguishable from a
+			// function genuinely called "0x4017c2", so the failure has to be
+			// carried explicitly rather than sniffed out of the string.
+			// Inlined frames are never marked: an inline chain only exists
+			// where resolution succeeded.
+			Unresolved: f.Reason != FailureNone,
 		})
 	}
 	return out

@@ -33,6 +33,8 @@ import (
 	"strings"
 
 	"github.com/google/pprof/profile"
+
+	"github.com/dpsoft/perf-agent/internal/framename"
 )
 
 // StackOrder describes how a profile stores frames within Sample.Location.
@@ -415,34 +417,46 @@ func lineName(loc *profile.Location, ln profile.Line) string {
 	return addressName(loc)
 }
 
+// addressName names a Location that has no usable Function. The mapping form
+// is preferred over the bare address: Location.Address is already relative to
+// the mapping, so "libcuda.so.1+0x1b71c6" is the same number with the file it
+// belongs to attached, and it survives ASLR where the bare form does not.
+//
+// (The bare form was previously unreachable-first here: the Address!=0 test
+// came before the mapping test, so a location with both always printed the
+// address alone.)
 func addressName(loc *profile.Location) string {
-	if loc != nil && loc.Address != 0 {
-		return fmt.Sprintf("0x%x", loc.Address)
+	if loc == nil {
+		return UnknownFrame
 	}
-	if loc != nil && loc.Mapping != nil && loc.Mapping.File != "" {
-		return fmt.Sprintf("%s+0x%x", loc.Mapping.File, loc.Address)
+	if loc.Mapping != nil {
+		if n := framename.Format(loc.Mapping.File, loc.Address); n != "" {
+			return n
+		}
+	}
+	if loc.Address != 0 {
+		return fmt.Sprintf("0x%x", loc.Address)
 	}
 	return UnknownFrame
 }
 
 // isAddressOnly reports whether a frame name carries no symbol. perf-agent's
-// symbolizer already formats unresolved PCs as "0x7f2c945ace62" and missing
-// frames as "[unknown]", so a name-shaped test is the only way to count them
-// once the profile is written; there is no separate "unsymbolized" bit in
-// pprof to consult.
+// symbolizer formats an unresolved PC as "0x7f2c945ace62" when nothing is
+// known about it, as "libcuda.so.1+0x1b71c6" when the module is known but the
+// symbol is not, and missing frames as "[unknown]"; a name-shaped test is the
+// only way to count them once the profile is written, because there is no
+// separate "unsymbolized" bit in pprof to consult.
+//
+// The module-relative form counts here too. Naming the library is a real
+// improvement, but it is not a symbol, and AddressOnlyFrames is the number
+// the warning banner reports as the profile's symbolization gap. Excluding
+// it would have made that gap read 0% on exactly the runs where it is
+// largest.
 func isAddressOnly(name string) bool {
 	if name == UnknownFrame || name == "" {
 		return true
 	}
-	if !strings.HasPrefix(name, "0x") || len(name) < 3 {
-		return false
-	}
-	for _, r := range name[2:] {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
+	return framename.IsAddressOnly(name)
 }
 
 func matchesInexact(labels map[string][]string, rules []InexactRule) bool {

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
+	"github.com/dpsoft/perf-agent/internal/framename"
 )
 
 // Domain is what a frame *is*, not how deep it sits or what its name hashes
@@ -41,6 +42,9 @@ import (
 //   - DomainUnsymbolized. These frames were unwound correctly; no symbol
 //     table could name them. That is a symbolization gap, not a hole in the
 //     stack, and the reader must be able to tell the difference at a glance.
+//     Two grades of it share the domain and are told apart by the label:
+//     "libcuda.so.1+0x1b71c6" means the module is known and only the symbol
+//     is missing, "0x7f2c945b2c2b" means not even the module is.
 //     They keep the CPU band's warm hue drained to a pale sand, and keep the
 //     hatch: the layer is known, the name is not. Warm-but-colourless, so it
 //     never reads as one of the named CPU layers and never steals the pure
@@ -114,7 +118,7 @@ var domainInfo = [numDomains]DomainInfo{
 	},
 	DomainUnsymbolized: {
 		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)", Overlay: "var(--hatch-gap)",
-		Desc: "Unwound correctly; no symbol table could name it. The depth is real, the names are missing — usually a stripped vendor library with no exported symbols. The CPU band's hue, drained: right layer, no name.",
+		Desc: "Unwound correctly; no symbol table could name it. The depth is real, the names are missing — usually a stripped vendor library with no exported symbols. Labelled module+offset (libcuda.so.1+0x1b71c6) where the profile knows which file the address fell in, and as a bare address where it does not. The CPU band's hue, drained: right layer, no name.",
 	},
 	DomainProfilerShim: {
 		Key: "shim", Label: "perf-agent", Fill: "var(--fill-shim)", Stroke: "var(--edge-shim)",
@@ -163,6 +167,21 @@ func Classify(name, module string) Domain {
 	// --- module-derived, i.e. taken from the profile rather than guessed ---
 	case module == "[kernel]":
 		return DomainKernel
+
+	// --- no symbol, whether or not the module is known ---
+	//
+	// This sits ABOVE the remaining module rules on purpose. Once frames
+	// carry their mapping, an unnamed frame inside libcuda.so.1 matches
+	// isVendorModule, and colouring it as ordinary vendor code would erase
+	// the only signal saying no symbol table could name it - which is what
+	// DomainUnsymbolized exists to show ("vendor, no symbols"). Its label
+	// now carries the module too ("libcuda.so.1+0x1b71c6"), so the layer is
+	// still legible; the hatch is what says the name is not.
+	//
+	// Kernel stays above this, so a hex-named kernel frame is still orange.
+	case isUnsymbolized(name):
+		return DomainUnsymbolized
+
 	case isShimModule(module):
 		return DomainProfilerShim
 	case isVendorModule(module):
@@ -171,8 +190,6 @@ func Classify(name, module string) Domain {
 		return DomainSystem
 
 	// --- name-derived ---
-	case isUnsymbolized(name):
-		return DomainUnsymbolized
 	case isShimSymbol(name):
 		return DomainProfilerShim
 	case isVendorSymbol(name):
@@ -280,19 +297,8 @@ func isSystemSymbol(name string) bool {
 }
 
 // isUnsymbolized reports whether a frame name carries no symbol: a bare
-// address, or the placeholder the folder writes for a location with neither.
+// address, the module-relative "libcuda.so.1+0x1b71c6" form, or the
+// placeholder the folder writes for a location with neither.
 func isUnsymbolized(name string) bool {
-	return name == foldedstacks.UnknownFrame || (strings.HasPrefix(name, "0x") && isHex(name[2:]))
-}
-
-func isHex(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
+	return name == foldedstacks.UnknownFrame || framename.IsAddressOnly(name)
 }

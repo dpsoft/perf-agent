@@ -87,3 +87,30 @@ func TestBoundaryAndUnattributedBoundaryLookDifferent(t *testing.T) {
 	assert.Empty(t, a.Overlay)
 	assert.NotEmpty(t, b.Overlay, "unattributed GPU time must be hatched")
 }
+
+// Once frames carry their mapping, an unnamed frame inside libcuda matches
+// isVendorModule. It must still read as unsymbolized: the module is a fact the
+// profile now supplies, but no symbol table named this address, and the hatch
+// is the only thing on the page that says so.
+func TestUnsymbolizedWinsOverModule(t *testing.T) {
+	const mod = "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+	assert.Equal(t, DomainUnsymbolized, Classify("libcuda.so.1+0x1b71c6", mod))
+	assert.Equal(t, DomainUnsymbolized, Classify("0x7f2c945b2c2b", mod))
+	// The resolved frame in the same library is unaffected.
+	assert.Equal(t, DomainVendorRuntime, Classify("cuLaunchKernel", mod))
+}
+
+// The bare form and the module form share a domain on purpose - both are
+// "unwound, unnamed" - and are told apart by their label, which is the only
+// place the difference belongs.
+func TestBothUnresolvedFormsShareTheDomainButNotTheLabel(t *testing.T) {
+	assert.Equal(t, DomainUnsymbolized, Classify("libcupti.so.12+0x0", "/usr/lib/libcupti.so.12"))
+	assert.Equal(t, DomainUnsymbolized, Classify("0xdeadbeef", ""))
+	assert.NotEqual(t, "libcupti.so.12+0x0", "0xdeadbeef")
+}
+
+// Kernel classification is checked before the unsymbolized rule, so a raw
+// kernel address is still drawn as kernel.
+func TestKernelStillBeatsUnsymbolized(t *testing.T) {
+	assert.Equal(t, DomainKernel, Classify("0xffffffffc0201234", "[kernel]"))
+}

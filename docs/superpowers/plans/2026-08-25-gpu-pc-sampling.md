@@ -547,6 +547,18 @@ Because Tier A perturbs the workload, `serialized` must also be refused unless e
 
 Record the numbers in this file when they exist. A threshold decided after seeing the data is not a threshold.
 
+**The harness exists; the numbers do not.** `bench/cmd/scenario --scenario gpu-pc-overhead` implements everything above — the five arms, the interleaving, the medians, the ratio and the four clauses — and prints the verdict as a stable identifier rather than as prose. The workload is `shim/nvidia/testdata/cuda_concurrent.cu` (see `.superpowers/sdd/task-12-overhead-report.md` for why it is a second workload and not a change to `cuda_workload.cu`). On the RTX 3090:
+
+```bash
+make -C shim nvidia nvidia-concurrent && make bench-build
+sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep ./bench/cmd/scenario/scenario
+make bench-gpu-pc-overhead
+```
+
+**Nothing here has been measured.** The arm table above is still expectations, not results, and the tier decision is not yet made.
+
+One finding from building it, which is a property of the thresholds rather than of the hardware: `cost ÷ duty > 2` is the same statement as `cost > 200 × duty` percent, so at **2.5% duty it is exactly `cost > 5%`** — the wall-clock bar. On the three duties above, the third clause therefore strictly implies the fourth and *"ships only as a deliberate deep-dive mode"* is unreachable; the unshippable verdict always outranks it. The two clauses separate only below 2.5% duty. The harness reports this whenever both fire rather than letting a reader conclude the deep-dive branch was considered and rejected. Adding a 1%-duty arm would make the distinction real; that is a decision for whoever runs it.
+
 **Verification without a GPU or capabilities — partial.** The scenario harness builds and reports `BENCH_SKIPPED` without caps or GPU, in the shape `bench/cmd/scenario/main.go` already uses. That is all that can be proven offline.
 
 **Must be measured on the RTX 3090 afterwards:** every number above. **This task cannot be completed without hardware, and no part of the tier decision may be made without it.**

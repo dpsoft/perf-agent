@@ -4,6 +4,8 @@
 #   test-tsan   the concurrency case under ThreadSanitizer (clang++ only)
 #   nvidia      libperfagent-gpu-nvidia.so, the CUPTI adapter (needs the CUDA toolkit)
 #   nvidia-workload  the CUDA test workload the adapter is proven against
+#   nvidia-concurrent the CONCURRENT CUDA workload the PC-sampling overhead
+#                   benchmark is measured against (bench/ scenario gpu-pc-overhead)
 #   clean
 CXX ?= c++
 CC ?= cc
@@ -24,7 +26,7 @@ CUDA_ARCH ?= sm_86
 CORE_SRC := core/batch.cc core/clock.cc core/cubin.cc core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc
 CORE_OBJ := $(CORE_SRC:.cc=.o)
 
-.PHONY: all test test-tsan check-cubin-defer nvidia nvidia-workload clean
+.PHONY: all test test-tsan check-cubin-defer nvidia nvidia-workload nvidia-concurrent clean
 all: libperfagent-gpu-core.a
 
 libperfagent-gpu-core.a: $(CORE_OBJ)
@@ -177,6 +179,21 @@ nvidia/testdata/cuda_workload: nvidia/testdata/cuda_workload.cu
 	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
 		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
 
+# The concurrent workload the PC-sampling overhead benchmark measures against.
+# Same flags as cuda_workload for the same reasons (-lineinfo so a PC sample
+# taken during a burst resolves to a line of it; -g and -rdynamic so a sampled
+# launch's CPU stack names the submitting function; not stripped).
+#
+# It is a SECOND workload rather than a change to cuda_workload.cu because the
+# two answer different questions: cuda_workload is the serial fixture the
+# adapter, the join and the source resolution are proven against and the
+# hardware gate asserts against ITS source lines, while a serialization
+# measurement needs concurrency to destroy. See the header of the .cu.
+nvidia-concurrent: nvidia/testdata/cuda_concurrent
+nvidia/testdata/cuda_concurrent: nvidia/testdata/cuda_concurrent.cu
+	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
+		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
+
 # Task 5's structural assertion, run as a BUILD step rather than asserted in a
 # comment: the copy of a cubin must happen inside the vendor callback, so no
 # deferral may sit between callback entry and the memcpy. core/cubinqueue.h
@@ -278,4 +295,5 @@ clean:
 		perfagent-gpu-dlopen-host libperfagent-gpu-fpless.so \
 		stub/so_fpless_bridge.o stub/so_fpless_stub.o \
 		perfagent-gpu-fpless stub/fpless_bridge.o stub/fpless_main.o stub/fpless_stub.o \
-		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload
+		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload \
+		nvidia/testdata/cuda_concurrent

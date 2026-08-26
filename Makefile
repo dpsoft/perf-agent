@@ -121,3 +121,27 @@ bench-self: bench-build test-workloads
 		--cpu-budget 1.5 --resolution-budget 0.5 \
 		--out bench-self.json
 	@echo "self-profile bench written to bench-self.json"
+
+# GPU PC-sampling overhead (plan Task 12): the marginal cost of Tier B and of
+# Tier A at three duty fractions, against the shipping Phase 4 configuration
+# with PC sampling off. Needs an NVIDIA GPU, the CUPTI adapter and the
+# concurrent CUDA workload; reports BENCH_SKIPPED and exits 0 without any of
+# them.
+#
+# The capability set is gpuprobe's own and is SMALLER than the one
+# bench-scenarios needs. cap_sys_admin is deliberately not in it.
+#
+# Exit codes: 0 when the measurement completed (whatever the verdict — an
+# honest TIER_A_UNSHIPPABLE is a successful run of this benchmark), 3 when an
+# arm could not prove it ran in the mode it claims, in which case the numbers
+# are not a tier decision and must not be recorded as one.
+.PHONY: bench-gpu-pc-overhead
+bench-gpu-pc-overhead: bench-build
+	@$(MAKE) -C shim nvidia nvidia-concurrent
+	@if ! getcap ./bench/cmd/scenario/scenario | grep -q cap_bpf; then \
+		echo "*** scenario binary missing caps; run: sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep ./bench/cmd/scenario/scenario"; \
+		exit 1; \
+	fi
+	./bench/cmd/scenario/scenario --scenario gpu-pc-overhead --runs 5 \
+		--out bench-gpu-pc-overhead.json
+	@echo "gpu pc-sampling overhead written to bench-gpu-pc-overhead.json"

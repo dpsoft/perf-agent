@@ -90,6 +90,9 @@ shim/perfagent-gpu-fpless
 # `make -C shim nvidia-workload`, needs the CUDA toolkit, and has no extension
 # for the *.so / *.o rules above to catch.
 shim/nvidia/testdata/cuda_workload
+# The CONCURRENT CUDA workload the PC-sampling overhead benchmark is measured
+# against: built by `make -C shim nvidia-concurrent`, same story.
+shim/nvidia/testdata/cuda_concurrent
 bench/cmd/scenario/scenario
 bench/cmd/report/report
 

@@ -55,9 +55,17 @@ func main() {
 		// tunes only --gpu-rounds and --gpu-iters, and only if the
 		// calibration pass says the fixed work is mis-sized for the
 		// device in front of it.
-		gpuShim        = flag.String("gpu-shim", "", "gpu-pc-overhead: the CUPTI adapter .so (default ./shim/libperfagent-gpu-nvidia.so)")
-		gpuWorkload    = flag.String("gpu-workload", "", "gpu-pc-overhead: the concurrent CUDA workload (default ./shim/nvidia/testdata/cuda_concurrent)")
-		gpuIters       = flag.Int("gpu-iters", 20000, "gpu-pc-overhead: timed iterations; each launches --gpu-streams kernels")
+		gpuShim     = flag.String("gpu-shim", "", "gpu-pc-overhead: the CUPTI adapter .so (default ./shim/libperfagent-gpu-nvidia.so)")
+		gpuWorkload = flag.String("gpu-workload", "", "gpu-pc-overhead: the concurrent CUDA workload (default ./shim/nvidia/testdata/cuda_concurrent)")
+		// 30000 rather than 20000 because the 1%-duty arm's burst+gap
+		// cycle is 5 s and it must open --gpu-min-bursts of them: the
+		// fixed work therefore has a DERIVED floor of ~25 s (see
+		// gpuPCMinFixedWorkSec), and 20000 iterations was estimated at
+		// ~20-30 s, straddling it. Both figures are estimates from a
+		// dependency-chain latency guess, not measurements; the
+		// calibration pass is what turns a wrong guess into a named
+		// retuning instruction instead of a meaningless arm.
+		gpuIters       = flag.Int("gpu-iters", 30000, "gpu-pc-overhead: timed iterations; each launches --gpu-streams kernels")
 		gpuWarmup      = flag.Int("gpu-warmup", 64, "gpu-pc-overhead: untimed warm-up iterations before the clock starts")
 		gpuStreams     = flag.Int("gpu-streams", 4, "gpu-pc-overhead: concurrent CUDA streams — the concurrency Tier A destroys")
 		gpuRounds      = flag.Int("gpu-rounds", 64000, "gpu-pc-overhead: FMA rounds per direction; this is what sets kernel duration")
@@ -67,7 +75,7 @@ func main() {
 		gpuMinConc     = flag.Float64("gpu-min-concurrency", 1.5, "gpu-pc-overhead: minimum kernel concurrency the BASELINE arm must show, or the run fails as a microbenchmark")
 		gpuMinKernelUs = flag.Float64("gpu-min-kernel-us", 50, "gpu-pc-overhead: minimum mean kernel duration the BASELINE arm must show, in microseconds")
 		gpuMinBursts   = flag.Uint64("gpu-min-bursts", 4, "gpu-pc-overhead: minimum bursts every Tier A arm must open for its duty to mean anything")
-		gpuMinCalSec   = flag.Float64("gpu-min-calibration-sec", 10, "gpu-pc-overhead: shortest acceptable uninjected fixed-work time")
+		gpuMinCalSec   = flag.Float64("gpu-min-calibration-sec", 10, "gpu-pc-overhead: shortest acceptable uninjected fixed-work time; RAISED to the floor derived from the lowest-duty arm's cycle x --gpu-min-bursts, never lowered below it")
 		gpuMaxCalSec   = flag.Float64("gpu-max-calibration-sec", 120, "gpu-pc-overhead: longest acceptable uninjected fixed-work time")
 	)
 	flag.Parse()

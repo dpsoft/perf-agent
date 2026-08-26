@@ -56,10 +56,25 @@ func armsWith(tierBCost float64, duties, costs []float64) []schema.GPUPCArm {
 	return arms
 }
 
-// planDuties is the plan's own arm table: 10%, 5%, 2.5%.
+// planDuties is the plan's ORIGINAL arm table: 10%, 5%, 2.5%. It is kept as a
+// fixture because the arithmetic finding below is a property of exactly those
+// three duties, and a test that quietly moved to the new table would stop
+// pinning the reason the 1% arm exists.
 var planDuties = []float64{0.10, 0.05, 0.025}
 
-// armsFor is armsWith over the plan's three duties.
+// benchDuties is what the harness actually runs, and it must stay derived from
+// gpuPCArms rather than written down twice.
+func benchDuties() []float64 {
+	var out []float64
+	for _, a := range gpuPCArms {
+		if d := a.dutyConfigured(); d > 0 {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// armsFor is armsWith over the plan's original three duties.
 func armsFor(tierBCost float64, tierACosts [3]float64) []schema.GPUPCArm {
 	return armsWith(tierBCost, planDuties, tierACosts[:])
 }
@@ -202,12 +217,18 @@ func TestTierAWithNothingQualifyingAnywhereIsIndeterminateNotAPass(t *testing.T)
 	assert.Contains(t, strings.Join(d.Lines, "\n"), "do not read this as a pass")
 }
 
-// The counterpart, and the reassuring half: on the PLAN's own duties the
-// decision is total. At 2.5% duty "within the wall bar" and "within the ratio
-// bar" are the same condition, so the lowest-duty arm either qualifies for
-// both — giving opt-in or a smaller duty — or fails both, giving unshippable.
-// Indeterminate is unreachable there, which is why it exists as a guard for
-// other duty tables rather than as an expected outcome.
+// The counterpart, and the reassuring half: on the plan's ORIGINAL three
+// duties the decision is total. At 2.5% duty "within the wall bar" and "within
+// the ratio bar" are the same condition, so the lowest-duty arm either
+// qualifies for both — giving opt-in or a smaller duty — or fails both, giving
+// unshippable. Indeterminate is unreachable there.
+//
+// That totality is exactly what made deep-dive unreachable, and it does NOT
+// survive the 1% arm: see
+// TestOnTheHarnessDutiesIndeterminateIsReachableAndIsNotAPass. Trading it for
+// a reachable deep-dive verdict is the whole point of the new arm, and it is
+// why INDETERMINATE is a named verdict rather than a fallthrough to the
+// friendliest neighbouring answer.
 func TestOnThePlansDutiesTheDecisionIsTotal(t *testing.T) {
 	for _, costs := range [][3]float64{
 		{1, 0.5, 0.25}, {4, 2, 1}, {8, 4, 2}, {12, 7, 4},
@@ -388,6 +409,7 @@ func TestTheGoodArmsPass(t *testing.T) {
 	cfg := testCfg()
 	require.NoError(t, assertArmRanInItsMode(cfg, gpuPCArms[0], goodOffRun()))
 	require.NoError(t, assertArmRanInItsMode(cfg, gpuPCArms[2], goodTierARun()))
+	require.NoError(t, assertArmRanInItsMode(cfg, onePercentArm(), goodOnePercentRun()))
 }
 
 // The single most important negative: an arm that ran nothing at all. It
@@ -534,7 +556,7 @@ func TestThreeTierAArmsWithTheSameBurstCountFail(t *testing.T) {
 	}
 	err := assertDutyKnobDidSomething(arms)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "one arm under three names")
+	assert.Contains(t, err.Error(), "one arm under different names")
 }
 
 func TestDecreasingBurstCountsAcrossDutiesPass(t *testing.T) {
@@ -563,14 +585,18 @@ func runsWithBursts(v ...uint64) []schema.GPUPCRun {
 // The arm table itself, and the environment it produces.
 // ---------------------------------------------------------------------------
 
-// The three Tier A gaps are not free numbers: they are exactly what the
+// The four Tier A gaps are not free numbers: they are exactly what the
 // adapter's own duty ceiling produces for a 50 ms burst, which is why setting
 // the ceiling pins the gap. If either side ever changes, this fails.
+//
+// The 1% arm is held to the identical rule: 50 ms / 4950 ms is what
+// burst * (1/0.01 - 1) gives, so it cannot drift to a duty nobody configured
+// any more than the other three can.
 func TestTheArmTableIsThePlansAndItsDutiesAreExact(t *testing.T) {
-	require.Len(t, gpuPCArms, 5)
+	require.Len(t, gpuPCArms, 6)
 	assert.Equal(t, gpu.PCSamplingOff, gpuPCArms[0].Tier)
 	assert.Equal(t, gpu.PCSamplingContinuous, gpuPCArms[1].Tier)
-	for i, want := range []float64{0.10, 0.05, 0.025} {
+	for i, want := range []float64{0.10, 0.05, 0.025, 0.01} {
 		a := gpuPCArms[2+i]
 		assert.Equal(t, gpu.PCSamplingSerialized, a.Tier)
 		assert.Equal(t, 50, a.BurstMs, "the plan's burst length")
@@ -603,7 +629,7 @@ func TestEveryArmWritesItsTierExplicitly(t *testing.T) {
 // loop lengthen the gap and the arm would run at a duty nobody asked for.
 func TestTierAArmsPinTheGapFromBothSides(t *testing.T) {
 	cfg := gpuPCConfig{ShimPath: "x"}
-	for i, permille := range []int{100, 50, 25} {
+	for i, permille := range []int{100, 50, 25, 10} {
 		env := gpuPCArmEnv(cfg, gpuPCArms[2+i])
 		joined := strings.Join(env, " ")
 		assert.Contains(t, joined, "PERFAGENT_GPU_PC_BURST_MS=50")
@@ -717,4 +743,307 @@ func TestSkipReasonsAreReachableAndOrdered(t *testing.T) {
 	assert.Empty(t, gpuPCSkipReasonWith(true, true, full),
 		"with caps, a GPU and both binaries present, nothing may skip — otherwise the "+
 			"scenario would skip on the one machine it exists to run on")
+}
+
+// ---------------------------------------------------------------------------
+// The 1%-duty arm: why it exists, what it costs, and what it still has to
+// prove.
+//
+// It exists because "cost/duty > 2" is the same statement as
+// "cost% > 200 x duty", so at 2.5% duty it IS the 5% wall bar and
+// TIER_A_DEEP_DIVE_ONLY could not fire without TIER_A_UNSHIPPABLE outranking
+// it. The thresholds are unchanged; the input space is now wide enough for the
+// four clauses to be told apart.
+// ---------------------------------------------------------------------------
+
+// onePercentArm is the arm under test, found by its duty rather than by its
+// index, so a reordering of the table cannot make this test silently examine a
+// different arm.
+func onePercentArm() gpuPCArmSpec {
+	for _, a := range gpuPCArms {
+		if d := a.dutyConfigured(); d > 0 && d < 0.02 {
+			return a
+		}
+	}
+	panic("no sub-2% duty arm in gpuPCArms")
+}
+
+func TestTheOnePercentArmIsFiftyOverFourNineFiveZero(t *testing.T) {
+	a := onePercentArm()
+	assert.Equal(t, 50, a.BurstMs)
+	assert.Equal(t, 4950, a.GapMs)
+	assert.InDelta(t, 0.01, a.dutyConfigured(), 1e-12)
+	assert.InDelta(t, 0.01, lowestConfiguredDuty(), 1e-12)
+}
+
+// THE TEST THIS CHANGE EXISTS FOR. On the harness's own four duties, a Tier A
+// that is consistently inefficient (ratio above 2 everywhere) but genuinely
+// cheap at the lowest duty must reach TIER_A_DEEP_DIVE_ONLY — and must NOT
+// reach TIER_A_UNSHIPPABLE, which on the plan's original three duties it
+// always did.
+//
+// 22% / 11% / 5.5% / 3% at 10% / 5% / 2.5% / 1%: ratios 2.2, 2.2, 2.2, 3.0 —
+// every one above the bar — while the lowest duty costs 3%, inside the 5%
+// wall bar. Before the 1% arm the lowest duty was 2.5%, where 5.5% is over
+// that bar, and the harsher verdict took it.
+func TestTheOnePercentArmMakesDeepDiveOnlyReachable(t *testing.T) {
+	d := decide(armsWith(1.0, benchDuties(), []float64{22.0, 11.0, 5.5, 3.0}))
+
+	assert.Equal(t, verdictTierADeepDiveOnly, d.TierA,
+		"ratio above 2 at every duty with the lowest duty inside the wall bar is "+
+			"deep-dive-only; before the 1%% arm this verdict was unreachable")
+	assert.Contains(t, d.Fired, clauseTierARatioOverAtAll)
+	assert.NotContains(t, d.Fired, clauseTierASmallestOverBud)
+	joined := strings.Join(d.Lines, "\n")
+	assert.Contains(t, joined, "deliberate deep-dive mode")
+
+	// And the same table on the plan's original three duties still lands on
+	// unshippable, which is the finding this arm answers rather than hides.
+	before := decide(armsFor(1.0, [3]float64{22.0, 11.0, 5.5}))
+	assert.Equal(t, verdictTierAUnshippable, before.TierA)
+}
+
+// The loosening is disclosed. Evaluating the plan's fourth clause at the
+// lowest duty TESTED rather than at the 2.5% it names in prose can only make
+// it harder to fire, and on the table above the 2.5% arm really is over the
+// wall bar. A verdict that got friendlier because the table grew a lower arm
+// must not read as a verdict the numbers earned.
+func TestThePlansLiteralFourthClauseIsReportedWhenItWouldHaveFired(t *testing.T) {
+	d := decide(armsWith(1.0, benchDuties(), []float64{22.0, 11.0, 5.5, 3.0}))
+	joined := strings.Join(d.Lines, "\n")
+	assert.Contains(t, joined, "the plan words its fourth clause")
+	assert.Contains(t, joined, "DOES cost +5.50%")
+	assert.Contains(t, joined, "NOT as \"2.5% duty is within budget\"")
+}
+
+// The mirror: when the plan's literal wording agrees with the evaluated
+// clause, there is nothing to disclose and the note must not appear. A note
+// that fires unconditionally is a note nobody reads.
+func TestNoLiteralClauseNoteWhenThe25PercentArmIsWithinTheBar(t *testing.T) {
+	d := decide(armsWith(1.0, benchDuties(), []float64{4.0, 2.0, 1.0, 0.5}))
+	assert.Equal(t, verdictTierAOptIn, d.TierA)
+	assert.NotContains(t, strings.Join(d.Lines, "\n"), "the plan words its fourth clause")
+}
+
+// The coincidence note now has to say which of the two things happened. Below
+// 2.5% duty the harsh clauses are DIFFERENT conditions, so both firing means
+// the lowest duty is over the wall bar on its own merits — not that the
+// deep-dive branch was never available.
+func TestTheCoincidenceNoteSaysTheClausesSeparateBelowTwoAndAHalfPercent(t *testing.T) {
+	d := decide(armsWith(1.0, benchDuties(), []float64{30.0, 18.0, 9.0, 6.0}))
+	assert.Equal(t, verdictTierAUnshippable, d.TierA)
+	assert.Contains(t, d.Fired, clauseTierARatioOverAtAll)
+	assert.Contains(t, d.Fired, clauseTierASmallestOverBud)
+	joined := strings.Join(d.Lines, "\n")
+	assert.Contains(t, joined, "are DIFFERENT conditions")
+	assert.Contains(t, joined, "was reachable and was not reached")
+	assert.NotContains(t, joined, "the SAME condition",
+		"the old note claimed this table could not reach deep-dive; it can")
+}
+
+// All four pre-committed clauses, and all four Tier A verdicts, reachable on
+// the duties the harness actually runs. This is the property the 1% arm was
+// added for, asserted as a property rather than inferred from the one table
+// above.
+func TestAllFourClausesAndAllFourTierAVerdictsAreReachable(t *testing.T) {
+	duties := benchDuties()
+	require.Len(t, duties, 4)
+
+	optIn := decide(armsWith(7.5, duties, []float64{4.0, 2.0, 1.0, 0.5}))
+	smaller := decide(armsWith(1.0, duties, []float64{8.0, 4.0, 2.0, 1.0}))
+	deepDive := decide(armsWith(1.0, duties, []float64{22.0, 11.0, 5.5, 3.0}))
+	unship := decide(armsWith(1.0, duties, []float64{30.0, 18.0, 9.0, 6.0}))
+
+	fired := map[string]bool{}
+	for _, d := range []schema.GPUPCDecision{optIn, smaller, deepDive, unship} {
+		for _, c := range d.Fired {
+			fired[c] = true
+		}
+	}
+	for _, c := range []string{
+		clauseTierBOverBudget, clauseTierAHeadlineWithin,
+		clauseTierARatioOverAtAll, clauseTierASmallestOverBud,
+	} {
+		assert.True(t, fired[c], "clause %q must be reachable on the harness's own duties", c)
+	}
+
+	assert.Equal(t, verdictTierBExplicitOnly, optIn.TierB)
+	assert.Equal(t, verdictTierBAlwaysOnCandidate, smaller.TierB)
+	assert.Equal(t, verdictTierAOptIn, optIn.TierA)
+	assert.Equal(t, verdictTierASmallerDuty, smaller.TierA)
+	assert.Equal(t, verdictTierADeepDiveOnly, deepDive.TierA)
+	assert.Equal(t, verdictTierAUnshippable, unship.TierA)
+}
+
+// The price of the new arm, stated rather than discovered. On the plan's three
+// duties the decision was total because 2.5% was the coincidence point; below
+// it the two bars separate, so a table can now fail both without either harsh
+// clause firing. That is not a pass and does not become one — it means cost
+// did not fall with duty the way serialization says it must.
+//
+// 8% / 6% / 6% / 3%: at 1% duty 3% is inside the wall bar but its ratio is 3.0,
+// so nothing qualifies anywhere; the 5% arm's ratio is 1.2, so the every-duty
+// clause does not fire; and the lowest duty is inside the wall bar, so the
+// lowest-duty clause does not fire either.
+func TestOnTheHarnessDutiesIndeterminateIsReachableAndIsNotAPass(t *testing.T) {
+	d := decide(armsWith(1.0, benchDuties(), []float64{8.0, 6.0, 6.0, 3.0}))
+	assert.Empty(t, d.Fired, "no Tier A clause fires on this table")
+	assert.Equal(t, verdictTierAIndeterminate, d.TierA)
+	assert.Contains(t, strings.Join(d.Lines, "\n"), "do not read this as a pass")
+}
+
+// ---------------------------------------------------------------------------
+// What the 1% arm costs: run length, derived from the table and announced
+// before the GPU time is spent.
+// ---------------------------------------------------------------------------
+
+// A burst opens once per burst+gap cycle, so the arm with the longest cycle
+// sets the floor on how long the fixed work must take. At 1% duty the cycle is
+// 5 s and four bursts need 20 s, against the 8 s the 2.5% arm needed. The
+// floor is DERIVED from the table so that trimming or adding an arm cannot
+// leave it stale, and it carries one extra cycle because the count is of
+// completed cycles and the first burst does not open at t=0.
+func TestTheFixedWorkFloorIsDerivedFromTheLowestDutyArm(t *testing.T) {
+	assert.Equal(t, 5000, gpuPCLongestTierACycleMs(), "the 1% arm's 50 ms + 4950 ms")
+	assert.InDelta(t, 25.0, gpuPCMinFixedWorkSec(4), 1e-9, "(4+1) bursts x 5 s")
+	assert.InDelta(t, 10.0, gpuPCMinFixedWorkSec(1), 1e-9)
+
+	// Strictly more than the 8 s the plan's old lowest arm needed, which is
+	// the whole cost of the change and must not be silently absorbed.
+	assert.Greater(t, gpuPCMinFixedWorkSec(4), 5*2.0,
+		"the 1% arm demands a longer run than the 2.5% arm did")
+}
+
+// ---------------------------------------------------------------------------
+// The 1% arm proves its own mode on exactly the same terms as every other arm.
+// An arm that cannot prove its mode is this project's standing defect wearing
+// a stopwatch.
+// ---------------------------------------------------------------------------
+
+// A 25 s run at a 5 s cycle opens about five bursts, so this is the shape a
+// passing 1% arm really has: few bursts, ten windows, a duty just over 0.01,
+// and at least one execution actually marked serialized.
+func goodOnePercentRun() schema.GPUPCRun {
+	return schema.GPUPCRun{Evidence: schema.GPUPCEvidence{
+		ProducerTier: gpu.PCSamplingNameSerialized, ProducerPCRecords: 210,
+		ProducerBursts: 5, ProducerWindows: 10, ProducerDuty: 0.0104,
+		PCSamplesDecoded: 210, SamplingWindowsDecoded: 10,
+		SamplingWindowsReceived: 10, ExecutionsSeen: 4000,
+		ExecutionsSerialized: 41, ExecutionsNotSerialized: 3959,
+		SnapshotTier: gpu.PCSamplingNameSerialized,
+	}}
+}
+
+func TestTheOnePercentArmMustOpenItsBursts(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ProducerBursts, r.Evidence.ProducerWindows = 3, 6
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "want at least 4")
+}
+
+func TestTheOnePercentArmMustSerializeSomething(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ExecutionsSerialized = 0
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not measure serialization")
+}
+
+// The achieved-duty bound is derived per arm, not shared: at a 50 ms burst
+// with a 10 ms tick the ceiling is (50+20)/(50+20+4950) = 1.39%, so an arm
+// that actually ran at the 2.5% arm's duty is caught rather than averaged in.
+func TestTheOnePercentArmMustRunAtOnePercent(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ProducerDuty = 0.025
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "achieved duty 0.0250")
+
+	// The burst timer's granularity legitimately overshoots; that must pass.
+	r.Evidence.ProducerDuty = 0.0135
+	require.NoError(t, assertArmRanInItsMode(testCfg(), onePercentArm(), r))
+
+	// And a duty far BELOW the configured one is a failure too: it would
+	// mean bursts were being skipped, and the ratio's denominator would be
+	// a duty that never happened.
+	r.Evidence.ProducerDuty = 0.002
+	require.Error(t, assertArmRanInItsMode(testCfg(), onePercentArm(), r))
+}
+
+func TestTheOnePercentArmMustReconcileItsWindows(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ProducerWindows = 7 // neither 10 nor 9
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "want 2N or 2N-1")
+}
+
+func TestTheOnePercentArmMustNotRunInAGraphProcess(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ProducerGraphRefuse = 1
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CUDA graph executions observed")
+}
+
+func TestTheOnePercentArmMustNotFailToStartOrStop(t *testing.T) {
+	r := goodOnePercentRun()
+	r.Evidence.ProducerStartFailed = 1
+	err := assertArmRanInItsMode(testCfg(), onePercentArm(), r)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cuptiPCSamplingStart failed")
+}
+
+// The cross-arm proof extends to four arms: 1% must open strictly fewer bursts
+// than 2.5%. If it did not, the duty environment did not take on the new arm
+// and its ratio — the one that makes deep-dive reachable — is fiction.
+func TestFourDecreasingBurstCountsPass(t *testing.T) {
+	require.NoError(t, assertDutyKnobDidSomething(fourArmBursts(
+		[]uint64{48, 49, 48}, []uint64{24, 25, 24},
+		[]uint64{12, 12, 13}, []uint64{5, 5, 6})))
+}
+
+func TestTheOnePercentArmOpeningAsManyBurstsAsTheTwoAndAHalfFails(t *testing.T) {
+	err := assertDutyKnobDidSomething(fourArmBursts(
+		[]uint64{48, 49, 48}, []uint64{24, 25, 24},
+		[]uint64{12, 12, 13}, []uint64{12, 13, 12}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one arm under different names")
+	assert.Contains(t, err.Error(), "1% duty")
+}
+
+func fourArmBursts(ten, five, twoFive, one []uint64) []schema.GPUPCArm {
+	arms := []schema.GPUPCArm{{Name: "baseline", Tier: gpu.PCSamplingNameOff}}
+	for i, duty := range benchDuties() {
+		arms = append(arms, schema.GPUPCArm{
+			Name:           fmt.Sprintf("tier A %g%% duty", duty*100),
+			Tier:           gpu.PCSamplingNameSerialized,
+			DutyConfigured: duty,
+			Runs:           runsWithBursts([][]uint64{ten, five, twoFive, one}[i]...),
+		})
+	}
+	return arms
+}
+
+// The floor is announced and enforced BEFORE any GPU time is spent, and a
+// configuration no sizing can satisfy is refused rather than discovered
+// twenty minutes in. The workload path here does not exist, so reaching the
+// calibration run at all would produce a different message.
+func TestAnImpossibleFixedWorkWindowIsRefusedBeforeAnythingRuns(t *testing.T) {
+	var out strings.Builder
+	doc := &schema.Document{}
+	ok := runGPUPCOverhead(doc, gpuPCConfig{
+		WorkloadPath: "/nonexistent/cuda_concurrent", Runs: 5, MinBursts: 4,
+		MinCalibrationSec: 10, MaxCalibrationSec: 20,
+	}, &out)
+
+	assert.False(t, ok)
+	s := out.String()
+	assert.Contains(t, s, "6 arms x 5 interleaved runs + 1 calibration = 31 fixed-work runs")
+	assert.Contains(t, s, "the fixed work must take 25-20 s")
+	assert.Contains(t, s, "No sizing can satisfy both")
+	assert.NotContains(t, s, "calibration run failed",
+		"the guard must fire before the calibration run, not after it")
+	assert.Zero(t, doc.GPUPC.Decision.TierA, "no verdict may be recorded")
 }

@@ -535,6 +535,19 @@ Because Tier A perturbs the workload, `serialized` must also be refused unless e
 | Tier A, 50 ms burst / 450 ms gap (10% duty) | the headline number |
 | Tier A, 50 ms / 950 ms (5%) | |
 | Tier A, 50 ms / 1950 ms (2.5%) | |
+| Tier A, 50 ms / 4950 ms (1%) | added after the finding below; the duty at which the third and fourth clauses stop being the same condition |
+
+The 1% arm is not a sixth row for its own sake. Without a duty **below 2.5%** the third
+clause cannot fire without the fourth firing too, and *"ships only as a deliberate deep-dive
+mode"* is unreachable whatever the numbers are — see the finding at the end of this task. The
+thresholds are unchanged; the arm table is what widened.
+
+**It costs run length, and that is worth knowing before starting.** A 1% duty at a 50 ms burst is
+a 4950 ms gap, so one burst opens every 5 s. Every Tier A arm must open at least four of them for
+its duty fraction to mean anything, so the fixed work must take **at least ~25 s** — against the
+~8 s the 2.5% arm needed. The harness derives that floor from the arm table, announces it before
+running anything, and refuses a configuration no sizing can satisfy. Together with the extra five
+runs this takes the benchmark from ~26 runs / 15–25 minutes to **31 runs / 25–40 minutes**.
 
 **The number that matters is cost ÷ duty fraction, not cost alone.** Serialization's damage does not stop when the burst does — concurrency has to refill afterwards — so if the ratio is near 1, duty-cycling works and the tier is tunable to any budget. If the ratio is much greater than 1, duty-cycling is not buying what it appears to and a smaller duty will not rescue it.
 
@@ -543,11 +556,11 @@ Because Tier A perturbs the workload, `serialized` must also be refused unless e
 - **Tier B > 5% wall-clock on a realistic workload → Tier B does not ship as always-on**; it becomes an explicitly-enabled mode like Tier A.
 - **Tier A at 10% duty ≤ 5% wall-clock, and cost ÷ duty ≤ 2 → ships as an opt-in tier**, as planned.
 - **cost ÷ duty > 2 at every duty tested → Tier A ships only as a deliberate deep-dive mode**, with the operator warning of Task 11 and no suggestion that it is suitable for continuous use.
-- **Tier A at 2.5% duty > 5% wall-clock → Tier A is unshippable in this phase.** Serialization would then be costing more than the sampling window can explain, and duty-cycling has no remaining lever.
+- **Tier A at 2.5% duty > 5% wall-clock → Tier A is unshippable in this phase.** Serialization would then be costing more than the sampling window can explain, and duty-cycling has no remaining lever. **The lever this clause names is the lowest duty on the table**, so with the 1% arm added the harness evaluates it there — which makes it strictly weaker than its literal 2.5% wording. That is a real loosening and it is what makes the third clause reachable; the harness therefore names the clause `tier-a-lowest-duty-cost-over-5pct` and prints the 2.5% arm's cost in as many words whenever the difference changes the answer.
 
 Record the numbers in this file when they exist. A threshold decided after seeing the data is not a threshold.
 
-**The harness exists; the numbers do not.** `bench/cmd/scenario --scenario gpu-pc-overhead` implements everything above — the five arms, the interleaving, the medians, the ratio and the four clauses — and prints the verdict as a stable identifier rather than as prose. The workload is `shim/nvidia/testdata/cuda_concurrent.cu` (see `.superpowers/sdd/task-12-overhead-report.md` for why it is a second workload and not a change to `cuda_workload.cu`). On the RTX 3090:
+**The harness exists; the numbers do not.** `bench/cmd/scenario --scenario gpu-pc-overhead` implements everything above — the six arms, the interleaving, the medians, the ratio and the four clauses — and prints the verdict as a stable identifier rather than as prose. The workload is `shim/nvidia/testdata/cuda_concurrent.cu` (see `.superpowers/sdd/task-12-overhead-report.md` for why it is a second workload and not a change to `cuda_workload.cu`). On the RTX 3090:
 
 ```bash
 make -C shim nvidia nvidia-concurrent && make bench-build
@@ -555,9 +568,13 @@ sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep ./bench/cmd/scenario/s
 make bench-gpu-pc-overhead
 ```
 
-**Nothing here has been measured.** The arm table above is still expectations, not results, and the tier decision is not yet made.
+**Nothing here has been measured.** The arm table above is still expectations, not results, and the tier decision is not yet made. The 1% arm has never executed either: adding it made a verdict *reachable*, not measured.
 
-One finding from building it, which is a property of the thresholds rather than of the hardware: `cost ÷ duty > 2` is the same statement as `cost > 200 × duty` percent, so at **2.5% duty it is exactly `cost > 5%`** — the wall-clock bar. On the three duties above, the third clause therefore strictly implies the fourth and *"ships only as a deliberate deep-dive mode"* is unreachable; the unshippable verdict always outranks it. The two clauses separate only below 2.5% duty. The harness reports this whenever both fire rather than letting a reader conclude the deep-dive branch was considered and rejected. Adding a 1%-duty arm would make the distinction real; that is a decision for whoever runs it.
+One finding from building it, which is a property of the thresholds rather than of the hardware: `cost ÷ duty > 2` is the same statement as `cost > 200 × duty` percent, so at **2.5% duty it is exactly `cost > 5%`** — the wall-clock bar. On the plan's original three duties the third clause therefore strictly implied the fourth and *"ships only as a deliberate deep-dive mode"* was unreachable; the unshippable verdict always outranked it. The two clauses separate only below 2.5% duty.
+
+**That is why the 1% arm is in the table above.** At 1% duty `ratio > 2` means `cost > 2%`, comfortably inside the 5% bar, so a tier that is consistently inefficient but genuinely cheap at low duty lands in deep-dive rather than being killed. Worked example, pinned by `TestTheOnePercentArmMakesDeepDiveOnlyReachable`: costs of 22% / 11% / 5.5% / 3% at 10% / 5% / 2.5% / 1% give ratios 2.2 / 2.2 / 2.2 / 3.0 — all above the bar, so the third clause fires — while the lowest duty costs 3%, inside the wall bar, so the fourth does not. Verdict: `TIER_A_DEEP_DIVE_ONLY`.
+
+The trade, stated rather than absorbed: on three duties the decision was *total* (2.5% was the coincidence point, so the lowest arm either passed both bars or failed both). Below that point the bars separate, so `TIER_A_INDETERMINATE` — *"cost did not fall with duty the way serialization says it must; do not read this as a pass"* — becomes reachable. That is the correct thing to say about such a table, and it is a named verdict rather than a fallthrough to the friendliest neighbouring answer. The harness still reports the coincidence if the table is ever trimmed back to 2.5%.
 
 **Verification without a GPU or capabilities — partial.** The scenario harness builds and reports `BENCH_SKIPPED` without caps or GPU, in the shape `bench/cmd/scenario/main.go` already uses. That is all that can be proven offline.
 

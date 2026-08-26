@@ -23,7 +23,7 @@ type Document struct {
 
 	// GPUPC holds the gpu-pc-overhead scenario's whole result. It hangs
 	// off Document rather than off Run because that scenario's unit of
-	// result is the ARM (five of them, five interleaved runs each), not
+	// result is the ARM (six of them, five interleaved runs each), not
 	// the run. Nil, and absent from the JSON, for every other scenario.
 	GPUPC *GPUPCOverhead `json:"gpu_pc_overhead,omitempty"`
 }
@@ -155,7 +155,7 @@ type GPUPCOverhead struct {
 	// clocks before the first arm.
 	Calibration GPUPCArm `json:"calibration,omitzero"`
 
-	// Arms are the five arms in the order they were run, baseline first.
+	// Arms are the six arms in the order they were run, baseline first.
 	Arms []GPUPCArm `json:"arms"`
 
 	// Decision is what the thresholds say. See GPUPCDecision.
@@ -188,7 +188,7 @@ type GPUPCArm struct {
 	BurstMs int `json:"burst_ms,omitzero"`
 	GapMs   int `json:"gap_ms,omitzero"`
 	// DutyConfigured is burst/(burst+gap) as configured: 0.10, 0.05,
-	// 0.025. It is the denominator the pre-committed thresholds name
+	// 0.025, 0.01. It is the denominator the pre-committed thresholds name
 	// ("Tier A at 10% duty"), so it is what the ratio is computed
 	// against. DutyAchieved is what the producer reported it actually
 	// did, and the two disagreeing by more than the tolerance FAILS the

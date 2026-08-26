@@ -37,7 +37,7 @@ func modeFromFlag(s string) dwarfagent.Mode {
 
 func main() {
 	var (
-		scenario     = flag.String("scenario", "", "pid-large | system-wide-mixed | self (required)")
+		scenario    = flag.String("scenario", "", "pid-large | system-wide-mixed | self | gpu-pc-overhead (required)")
 		processes   = flag.Int("processes", 30, "fleet size for system-wide-mixed")
 		runs        = flag.Int("runs", 5, "iterations per scenario")
 		dropCache   = flag.Bool("drop-cache", false, "drop page cache between runs (root-only)")
@@ -49,12 +49,58 @@ func main() {
 		selfDuration     = flag.Duration("self-duration", 10*time.Second, "capture window for each perf-agent in the self scenario")
 		cpuBudget        = flag.Float64("cpu-budget", 0, "self scenario: max allowed CPU overhead ratio (agent samples / workload samples); 0 disables the gate")
 		resolutionBudget = flag.Float64("resolution-budget", 0, "self scenario: min allowed kernel-symbol resolution rate; 0 disables the gate")
+
+		// gpu-pc-overhead specific flags. Defaults are the plan's arms
+		// and the workload sizing the report calibrates; the controller
+		// tunes only --gpu-rounds and --gpu-iters, and only if the
+		// calibration pass says the fixed work is mis-sized for the
+		// device in front of it.
+		gpuShim        = flag.String("gpu-shim", "", "gpu-pc-overhead: the CUPTI adapter .so (default ./shim/libperfagent-gpu-nvidia.so)")
+		gpuWorkload    = flag.String("gpu-workload", "", "gpu-pc-overhead: the concurrent CUDA workload (default ./shim/nvidia/testdata/cuda_concurrent)")
+		gpuIters       = flag.Int("gpu-iters", 20000, "gpu-pc-overhead: timed iterations; each launches --gpu-streams kernels")
+		gpuWarmup      = flag.Int("gpu-warmup", 64, "gpu-pc-overhead: untimed warm-up iterations before the clock starts")
+		gpuStreams     = flag.Int("gpu-streams", 4, "gpu-pc-overhead: concurrent CUDA streams — the concurrency Tier A destroys")
+		gpuRounds      = flag.Int("gpu-rounds", 64000, "gpu-pc-overhead: FMA rounds per direction; this is what sets kernel duration")
+		gpuBlocks      = flag.Int("gpu-blocks", 16, "gpu-pc-overhead: blocks per kernel; deliberately a fraction of the device so kernels co-reside")
+		gpuThreads     = flag.Int("gpu-threads", 256, "gpu-pc-overhead: threads per block")
+		gpuSyncEvery   = flag.Int("gpu-sync-every", 4, "gpu-pc-overhead: device sync every N iterations; bounds queue depth and forces concurrency to refill")
+		gpuMinConc     = flag.Float64("gpu-min-concurrency", 1.5, "gpu-pc-overhead: minimum kernel concurrency the BASELINE arm must show, or the run fails as a microbenchmark")
+		gpuMinKernelUs = flag.Float64("gpu-min-kernel-us", 50, "gpu-pc-overhead: minimum mean kernel duration the BASELINE arm must show, in microseconds")
+		gpuMinBursts   = flag.Uint64("gpu-min-bursts", 4, "gpu-pc-overhead: minimum bursts every Tier A arm must open for its duty to mean anything")
+		gpuMinCalSec   = flag.Float64("gpu-min-calibration-sec", 10, "gpu-pc-overhead: shortest acceptable uninjected fixed-work time")
+		gpuMaxCalSec   = flag.Float64("gpu-max-calibration-sec", 120, "gpu-pc-overhead: longest acceptable uninjected fixed-work time")
 	)
 	flag.Parse()
 
 	if *scenario == "" {
 		_, _ = fmt.Fprintln(os.Stderr, "--scenario is required")
 		os.Exit(2)
+	}
+
+	// gpu-pc-overhead is handled first and entirely on its own. It needs
+	// gpuprobe's capability set and NOT the larger one below (checking for
+	// CAP_SYS_ADMIN would skip on a correctly-capped machine, and a skip
+	// for the wrong reason is indistinguishable from a skip for the right
+	// one), it needs a GPU, and it uses none of test/workloads/ — so the
+	// auto-detect below must not be allowed to exit(2) before its own skip
+	// path has had a chance to speak.
+	if *scenario == "gpu-pc-overhead" {
+		gcfg := gpuPCConfig{
+			ShimPath: *gpuShim, WorkloadPath: *gpuWorkload, Runs: *runs,
+			Iters: *gpuIters, Warmup: *gpuWarmup, Streams: *gpuStreams,
+			Rounds: *gpuRounds, Blocks: *gpuBlocks, Threads: *gpuThreads,
+			SyncEvery: *gpuSyncEvery, MinConcurrency: *gpuMinConc,
+			MinKernelUs: *gpuMinKernelUs, MinBursts: *gpuMinBursts,
+			MinCalibrationSec: *gpuMinCalSec, MaxCalibrationSec: *gpuMaxCalSec,
+		}
+		if gcfg.ShimPath == "" {
+			gcfg.ShimPath = defaultShimPath()
+		}
+		if gcfg.WorkloadPath == "" {
+			gcfg.WorkloadPath = defaultConcurrentWorkload()
+		}
+		runGPUPCScenario(gcfg, *outPath)
+		return
 	}
 
 	// The "self" scenario is pure orchestration — it spawns

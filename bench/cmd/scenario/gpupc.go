@@ -103,13 +103,35 @@ const (
 
 // The threshold clause identifiers, in the plan's own order.
 const (
-	clauseTierBOverBudget      = "tier-b-cost-over-5pct"
-	clauseTierAHeadlineWithin  = "tier-a-10pct-duty-within-5pct-and-ratio-within-2"
-	clauseTierARatioOverAtAll  = "tier-a-cost-over-duty-above-2-at-every-duty"
-	clauseTierASmallestOverBud = "tier-a-2.5pct-duty-cost-over-5pct"
+	clauseTierBOverBudget     = "tier-b-cost-over-5pct"
+	clauseTierAHeadlineWithin = "tier-a-10pct-duty-within-5pct-and-ratio-within-2"
+	clauseTierARatioOverAtAll = "tier-a-cost-over-duty-above-2-at-every-duty"
+	// The plan spells its fourth clause "Tier A at 2.5% duty > 5%
+	// wall-clock" because 2.5% was the lowest duty its arm table tested,
+	// and the reason it gives is that "duty-cycling has no remaining
+	// lever". The lever the clause names is the lowest duty on the table.
+	// With a 1% arm on the table that is no longer 2.5%, so the clause is
+	// evaluated at the lowest duty tested and the identifier says so
+	// rather than naming a duty that is not the one being tested.
+	//
+	// This makes the clause STRICTLY WEAKER than its literal 2.5%
+	// wording: a table where the 2.5% arm is over the bar and the 1% arm
+	// is not now escapes the unshippable verdict, where before it could
+	// not. That is precisely what makes TIER_A_DEEP_DIVE_ONLY reachable,
+	// and it is exactly the sort of loosening that must not happen
+	// quietly — so decideGPUPC prints a NOTE naming the 2.5% arm's cost
+	// whenever the plan's literal wording would have fired and the
+	// evaluated clause did not.
+	clauseTierASmallestOverBud = "tier-a-lowest-duty-cost-over-5pct"
 )
 
-// gpuPCArmSpec is one arm's configuration. The three Tier A arms differ only
+// gpuPCPlanNamedLowestDuty is the duty the plan's fourth clause names in
+// prose. It is not a threshold and nothing is decided from it; it exists so
+// the harness can tell the reader when the clause's evaluation point has moved
+// below the duty the plan wrote down.
+const gpuPCPlanNamedLowestDuty = 0.025
+
+// gpuPCArmSpec is one arm's configuration. The four Tier A arms differ only
 // in their gap, which is what makes the duty the single moving variable.
 type gpuPCArmSpec struct {
 	Name    string
@@ -118,21 +140,92 @@ type gpuPCArmSpec struct {
 	GapMs   int
 }
 
-// gpuPCArms is the arm table from the plan, in the order it runs them:
-// baseline first (everything else is measured against it), then Tier B, then
-// Tier A at decreasing duty.
+// gpuPCArms is the arm table, in the order it runs them: baseline first
+// (everything else is measured against it), then Tier B, then Tier A at
+// decreasing duty.
 //
 // The Tier A gaps are not free parameters. The adapter derives its minimum gap
 // from the duty ceiling -- min_gap = burst * (1/max_duty - 1) -- so 450 / 950
-// / 1950 ms after a 50 ms burst ARE 10% / 5% / 2.5%, and setting the maximum
-// gap to the same value pins the burst controller's closed loop to exactly
-// that gap instead of letting it tune. See gpuPCArmEnv.
+// / 1950 / 4950 ms after a 50 ms burst ARE 10% / 5% / 2.5% / 1%, and setting
+// the maximum gap to the same value pins the burst controller's closed loop to
+// exactly that gap instead of letting it tune. See gpuPCArmEnv.
+//
+// WHY THERE IS A 1% ARM, which the plan's original table did not have.
+//
+// "cost / duty > 2" is the same statement as "cost% > 200 x duty". At 2.5%
+// duty that is exactly "cost% > 5%", which is the wall-clock bar. So on the
+// plan's original three duties the every-duty ratio clause STRICTLY IMPLIES
+// the lowest-duty wall clause, the harsher verdict outranks it, and
+// TIER_A_DEEP_DIVE_ONLY could not be reached whatever the numbers were. The
+// two clauses separate only BELOW 2.5% duty.
+//
+// That mattered because the two verdicts mean materially different things.
+// "The tier does not ship" and "the tier works, but only as a deliberate
+// deep-dive tool" are different answers, and a harness that can only ever
+// produce the first is not applying four clauses, it is applying three.
+//
+// At 1% duty "ratio > 2" means "cost > 2%", comfortably inside the 5% bar, so
+// a tier that is consistently inefficient but genuinely cheap at low duty
+// lands in deep-dive instead of being killed. The thresholds are untouched;
+// only the input space is now wide enough for all four clauses to be told
+// apart. The cost is run length -- see gpuPCMinFixedWorkSec.
 var gpuPCArms = []gpuPCArmSpec{
 	{Name: "baseline (pc sampling off)", Tier: gpu.PCSamplingOff},
 	{Name: "tier B continuous", Tier: gpu.PCSamplingContinuous},
 	{Name: "tier A 50ms/450ms (10% duty)", Tier: gpu.PCSamplingSerialized, BurstMs: 50, GapMs: 450},
 	{Name: "tier A 50ms/950ms (5% duty)", Tier: gpu.PCSamplingSerialized, BurstMs: 50, GapMs: 950},
 	{Name: "tier A 50ms/1950ms (2.5% duty)", Tier: gpu.PCSamplingSerialized, BurstMs: 50, GapMs: 1950},
+	{Name: "tier A 50ms/4950ms (1% duty)", Tier: gpu.PCSamplingSerialized, BurstMs: 50, GapMs: 4950},
+}
+
+// gpuPCLongestTierACycleMs is the longest burst+gap cycle in the arm table:
+// the 1%-duty arm's 5 s. Derived from the table rather than written down, so
+// adding or removing an arm cannot leave it stale.
+func gpuPCLongestTierACycleMs() int {
+	longest := 0
+	for _, a := range gpuPCArms {
+		if a.Tier != gpu.PCSamplingSerialized {
+			continue
+		}
+		if c := a.BurstMs + a.GapMs; c > longest {
+			longest = c
+		}
+	}
+	return longest
+}
+
+// lowestConfiguredDuty is the smallest duty the arm table asks for, which is
+// the arm the fixed-work floor and the plan's fourth clause both key on.
+func lowestConfiguredDuty() float64 {
+	lowest := 0.0
+	for _, a := range gpuPCArms {
+		if d := a.dutyConfigured(); d > 0 && (lowest == 0 || d < lowest) {
+			lowest = d
+		}
+	}
+	return lowest
+}
+
+// gpuPCMinFixedWorkSec is the shortest fixed work that lets EVERY Tier A arm
+// clear its own "bursts >= MinBursts" floor. It is what the 1% arm costs: not
+// five more runs, but a longer run.
+//
+// One burst opens per burst+gap cycle, so an arm whose cycle is C seconds
+// opens roughly T/C bursts over T seconds of work. At 2.5% duty C is 2 s and
+// the default floor of four bursts needs 8 s; at 1% duty C is 5 s and the same
+// four bursts need 20 s. The extra cycle of slack is not a fudge factor: the
+// count is of COMPLETED cycles, the first burst does not open at t=0, and a
+// floor met only exactly would turn ordinary jitter into a failed run of the
+// entire benchmark after twenty minutes of GPU time.
+//
+// Two things make this conservative in the right direction rather than the
+// flattering one. It is checked against the UNINJECTED calibration run, which
+// is the fastest run the benchmark takes -- every arm is slower and therefore
+// opens MORE bursts. And it is checked against the workload's fixed-work
+// elapsed_ms, while the adapter's burst timer runs for the whole process
+// including CUDA init, warm-up and teardown.
+func gpuPCMinFixedWorkSec(minBursts uint64) float64 {
+	return float64(minBursts+1) * float64(gpuPCLongestTierACycleMs()) / 1000
 }
 
 // dutyConfigured is burst/(burst+gap): the fraction of wall-clock the arm asks
@@ -262,7 +355,7 @@ func hasNVIDIADevice() bool {
 // Running the arms.
 // ---------------------------------------------------------------------------
 
-// runGPUPCOverhead runs the calibration pass and then the five arms,
+// runGPUPCOverhead runs the calibration pass and then the six arms,
 // interleaved, five runs each, and fills doc.GPUPC. It returns false when any
 // assertion failed; main exits non-zero on that, because a benchmark that
 // could not prove what it measured must not look like one that did.
@@ -277,6 +370,30 @@ func runGPUPCOverhead(doc *schema.Document, cfg gpuPCConfig, out io.Writer) bool
 	}
 	doc.GPUPC = res
 	doc.Config.Runs = cfg.Runs
+
+	// How long the fixed work must take for the LOWEST-duty arm to clear
+	// its own bursts floor. Derived from the arm table, announced before
+	// anything runs, and checked before the twenty minutes of GPU time
+	// rather than after them.
+	minSec := cfg.MinCalibrationSec
+	derived := gpuPCMinFixedWorkSec(cfg.MinBursts)
+	if derived > minSec {
+		minSec = derived
+	}
+	_, _ = fmt.Fprintf(out, "gpu-pc-overhead: %d arms x %d interleaved runs + 1 calibration = "+
+		"%d fixed-work runs; the fixed work must take %.0f-%.0f s (the %.0f s floor is "+
+		"derived: the lowest-duty arm's %.1f s cycle x %d bursts + one cycle of slack)\n",
+		len(gpuPCArms), cfg.Runs, len(gpuPCArms)*cfg.Runs+1, minSec, cfg.MaxCalibrationSec,
+		derived, float64(gpuPCLongestTierACycleMs())/1000, cfg.MinBursts)
+	if minSec > cfg.MaxCalibrationSec {
+		_, _ = fmt.Fprintf(out, "gpu-pc-overhead: FAILED: the lowest-duty arm needs at least "+
+			"%.0f s of fixed work to open %d bursts, but --gpu-max-calibration-sec is "+
+			"%.0f s. No sizing can satisfy both, so this configuration could only ever "+
+			"produce a Tier A arm whose duty means nothing. Raise "+
+			"--gpu-max-calibration-sec, or lower --gpu-min-bursts and accept a coarser "+
+			"duty measurement.\n", derived, cfg.MinBursts, cfg.MaxCalibrationSec)
+		return false
+	}
 
 	// The calibration pass: the same fixed work with NO adapter injected.
 	// It warms the device clocks before the first arm and it proves the
@@ -295,13 +412,17 @@ func runGPUPCOverhead(doc *schema.Document, cfg gpuPCConfig, out io.Writer) bool
 	}
 	_, _ = fmt.Fprintf(out, "gpu-pc-overhead: calibration (uninjected, not an arm): "+
 		"%.1f ms for %d kernels, %.0f kernels/s\n", calRun.WallMs, kernels, calRun.KernelsPerS)
-	if sec := calRun.WallMs / 1000; sec < cfg.MinCalibrationSec || sec > cfg.MaxCalibrationSec {
+	if sec := calRun.WallMs / 1000; sec < minSec || sec > cfg.MaxCalibrationSec {
+		want := minSec * 1.2
 		_, _ = fmt.Fprintf(out, "gpu-pc-overhead: FAILED: the fixed work takes %.1f s uninjected, "+
-			"outside the sane window [%.0f s, %.0f s]. Retune with --gpu-rounds (kernel "+
-			"duration) and --gpu-iters (how many), then re-run. Too short and the 2.5%%-duty "+
-			"arm cannot open enough bursts for its duty to mean anything; too long and the "+
-			"five interleaved runs take longer than the operator will wait.\n",
-			sec, cfg.MinCalibrationSec, cfg.MaxCalibrationSec)
+			"outside the sane window [%.0f s, %.0f s]. Retune with --gpu-iters (how many "+
+			"kernels) or --gpu-rounds (how long each one takes), then re-run. Too short "+
+			"and the %.0f%%-duty arm cannot open %d bursts for its duty to mean anything; "+
+			"too long and the %d interleaved runs take longer than the operator will "+
+			"wait. At this sizing, --gpu-iters %d would land near %.0f s.\n",
+			sec, minSec, cfg.MaxCalibrationSec,
+			lowestConfiguredDuty()*100, cfg.MinBursts, len(gpuPCArms)*cfg.Runs+1,
+			int(float64(cfg.Iters)*want/max(sec, 0.001)), want)
 		return false
 	}
 
@@ -316,7 +437,7 @@ func runGPUPCOverhead(doc *schema.Document, cfg gpuPCConfig, out io.Writer) bool
 
 	// INTERLEAVED, per §9.1's method: every arm once per round, rather
 	// than five of one arm then five of the next. Thermal drift, clock
-	// boost state and any other slow drift then fall on all five arms
+	// boost state and any other slow drift then fall on all six arms
 	// alike instead of on whichever ran last.
 	ok := true
 	for run := 1; run <= cfg.Runs; run++ {
@@ -825,14 +946,16 @@ func assertBaselineIsRealistic(cfg gpuPCConfig, base schema.GPUPCArm) error {
 	return nil
 }
 
-// assertDutyKnobDidSomething is the cross-arm proof that the three Tier A arms
-// are three arms and not the same arm three times.
+// assertDutyKnobDidSomething is the cross-arm proof that the Tier A arms are
+// as many arms as they claim to be and not one arm under several names.
 //
 // Burst count over a fixed run length is inversely proportional to burst+gap,
 // so 10% duty must open strictly more bursts than 5%, which must open strictly
-// more than 2.5%. If the three came out equal, the duty environment did not
-// take and all three "duties" are one duty — from which a cost-over-duty ratio
-// would be pure fiction.
+// more than 2.5%, which must open strictly more than 1%. The check walks the
+// whole table in descending duty, so the 1% arm is held to it on exactly the
+// same terms as the others. If two came out equal the duty environment did not
+// take, those "duties" are one duty, and a cost-over-duty ratio computed from
+// them would be pure fiction.
 func assertDutyKnobDidSomething(arms []schema.GPUPCArm) error {
 	var a []schema.GPUPCArm
 	for _, arm := range arms {
@@ -851,9 +974,9 @@ func assertDutyKnobDidSomething(arms []schema.GPUPCArm) error {
 			return fmt.Errorf(
 				"arm %q opened a median of %d bursts and the lower-duty arm %q opened %d: "+
 					"a lower duty must open strictly fewer bursts over the same fixed "+
-					"work. The duty environment did not take, so the three Tier A arms "+
-					"are one arm under three names and their cost-over-duty ratios are "+
-					"meaningless",
+					"work. The duty environment did not take, so these Tier A arms "+
+					"are one arm under different names and their cost-over-duty ratios "+
+					"are meaningless",
 				a[i-1].Name, hi, a[i].Name, lo)
 		}
 	}
@@ -1037,28 +1160,66 @@ func decideGPUPC(arms []schema.GPUPCArm, maxWallPercent, maxCostOverDuty float64
 			"THRESHOLD FIRED %s: the lowest duty tested (%s) still costs %+.2f%%, above the %.1f%% bar",
 			clauseTierASmallestOverBud, smallest.Name, smallest.CostPercent, maxWallPercent))
 	}
-	// The two harshest clauses can coincide arithmetically, and when they do
-	// the reader is told rather than left to notice.
+	// The two harshest clauses can coincide arithmetically, and whether
+	// they did on THIS table is stated rather than left to be noticed.
 	//
-	// cost/duty > R is the same statement as cost% > 100*R*duty. At
-	// duty = R*... — concretely, with the plan's bars (R = 2, W = 5%) the
-	// two coincide EXACTLY at duty = W/(100*R) = 2.5%, which is the lowest
-	// duty the plan's arm table tests. So on that table "ratio above 2 at
-	// every duty" strictly IMPLIES "the lowest duty is over the wall bar",
-	// and the deep-dive-only verdict is unreachable: the unshippable one
-	// always outranks it. That is a property of the thresholds, not of the
-	// hardware, and it is stated here so a controller reading a result does
-	// not conclude that the deep-dive branch was considered and rejected.
+	// cost/duty > R is the same statement as cost% > 100*R*duty, so the
+	// two clauses are the identical condition at exactly
+	// duty = W/(100*R) -- with the plan's bars (R = 2, W = 5%), 2.5%.
+	// At or above that duty the every-duty ratio clause strictly IMPLIES
+	// the lowest-duty wall clause and TIER_A_DEEP_DIVE_ONLY is
+	// unreachable, because the unshippable verdict outranks it. Below it
+	// the two separate and the deep-dive verdict becomes a real outcome.
+	//
+	// The arm table now goes down to 1%, so the separating case is the
+	// normal one; the coinciding case remains reachable if the table is
+	// ever trimmed back, and is still reported rather than assumed away.
+	coincideAtDuty := maxWallPercent / (100 * maxCostOverDuty)
 	if ratioOverEverywhere && smallestOverBudget {
+		if smallest.DutyConfigured >= coincideAtDuty-1e-12 {
+			d.Lines = append(d.Lines, fmt.Sprintf(
+				"NOTE both harsh clauses fired, and at the lowest duty tested (%.2f%%) they "+
+					"are the SAME condition: cost/duty > %.1f means cost > %.2f%%, and "+
+					"the wall bar is %.1f%%. They separate only below %.2f%% duty, "+
+					"which this table does not test — so %s could not have been "+
+					"reached here whatever the numbers. Add a lower-duty arm if that "+
+					"distinction is wanted.",
+				smallest.DutyConfigured*100, maxCostOverDuty,
+				maxCostOverDuty*smallest.DutyConfigured*100, maxWallPercent,
+				coincideAtDuty*100, verdictTierADeepDiveOnly))
+		} else {
+			d.Lines = append(d.Lines, fmt.Sprintf(
+				"NOTE both harsh clauses fired and at the lowest duty tested (%.2f%%) they "+
+					"are DIFFERENT conditions — cost/duty > %.1f means cost > %.2f%% "+
+					"there, well inside the %.1f%% wall bar. This table separates them "+
+					"below %.2f%% duty, so %s was reachable and was not reached: the "+
+					"lowest duty is over the wall bar on its own.",
+				smallest.DutyConfigured*100, maxCostOverDuty,
+				maxCostOverDuty*smallest.DutyConfigured*100, maxWallPercent,
+				coincideAtDuty*100, verdictTierADeepDiveOnly))
+		}
+	}
+
+	// The plan's fourth clause is worded "Tier A at 2.5% duty > 5%
+	// wall-clock". Evaluating it at the lowest duty tested is what its own
+	// reason ("duty-cycling has no remaining lever") asks for, but with a
+	// 1% arm on the table that evaluation point is BELOW the duty the plan
+	// wrote down, and the clause is therefore harder to fire than its
+	// literal wording. When that difference changes the answer, the reader
+	// is told in as many words — a verdict that got friendlier because the
+	// table grew a lower arm must not read as a verdict the numbers earned.
+	if planArm, ok := armAtDuty(tierA, gpuPCPlanNamedLowestDuty); ok &&
+		!smallestOverBudget && planArm.CostPercent > maxWallPercent {
 		d.Lines = append(d.Lines, fmt.Sprintf(
-			"NOTE both harsh clauses fired, and at the lowest duty tested (%.2f%%) they are "+
-				"the SAME condition: cost/duty > %.1f means cost > %.2f%%, and the "+
-				"wall bar is %.1f%%. They separate only below %.2f%% duty, which this "+
-				"table does not test — so %s could not have been reached here whatever "+
-				"the numbers. Add a lower-duty arm if that distinction is wanted.",
-			smallest.DutyConfigured*100, maxCostOverDuty,
-			maxCostOverDuty*smallest.DutyConfigured*100, maxWallPercent,
-			maxWallPercent/(100*maxCostOverDuty)*100, verdictTierADeepDiveOnly))
+			"NOTE the plan words its fourth clause as \"Tier A at %.1f%% duty > %.1f%%\", and "+
+				"the %s arm DOES cost %+.2f%%. It is evaluated at the lowest duty "+
+				"tested (%s, %+.2f%%) because the clause's own reason is that "+
+				"duty-cycling has no remaining lever, and %.1f%% duty is a remaining "+
+				"lever. Read this result as \"unshippable does not fire at %.1f%% "+
+				"duty\", NOT as \"%.1f%% duty is within budget\".",
+			gpuPCPlanNamedLowestDuty*100, maxWallPercent, planArm.Name, planArm.CostPercent,
+			smallest.Name, smallest.CostPercent, smallest.DutyConfigured*100,
+			smallest.DutyConfigured*100, gpuPCPlanNamedLowestDuty*100))
 	}
 
 	switch {
@@ -1097,6 +1258,17 @@ func decideGPUPC(arms []schema.GPUPCArm, maxWallPercent, maxCostOverDuty float64
 		}
 	}
 	return d
+}
+
+// armAtDuty finds the arm configured at a particular duty, if the table has
+// one. Used only for reporting, never for deciding.
+func armAtDuty(tierA []schema.GPUPCArm, duty float64) (schema.GPUPCArm, bool) {
+	for _, a := range tierA {
+		if math.Abs(a.DutyConfigured-duty) < 1e-9 {
+			return a, true
+		}
+	}
+	return schema.GPUPCArm{}, false
 }
 
 // largestQualifyingDuty returns the highest-duty arm that is within BOTH bars.

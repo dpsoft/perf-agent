@@ -22,9 +22,18 @@ func plural(n uint64, one, many string) string {
 }
 
 // JoinHealth renders a Snapshot's join and loss counters as operator-facing
-// lines: element 0 is always a one-line summary, and every element after it
-// is one anomaly that the summary's trailing count agrees with. Callers log
-// them one per line (see cmd/gpu-stub-profile, cmd/gpu-cuda-profile).
+// lines: element 0 is always a one-line summary, then any STANDING WARNINGS
+// (see PCSamplingStandingWarning — Tier A's whole-run perturbation notice),
+// then one line per anomaly. The summary's trailing counts agree with both
+// groups, so len(lines)-1 is always warnings+anomalies. Callers log them one
+// per line (see cmd/gpu-stub-profile, cmd/gpu-cuda-profile).
+//
+// A standing warning is not an anomaly and is kept apart from them on
+// purpose: an anomaly is something that went wrong, while a warning is a
+// consequence of what the operator deliberately asked for. Both are printed
+// on every render — the warning especially, because a perturbation notice
+// shown once at startup has scrolled away long before the profile it applies
+// to is read.
 //
 // The shape is deliberate. Printing the whole counter set on every run - the
 // obvious `%+v` - is what makes a rising UnmatchedExecutionCount invisible:
@@ -75,8 +84,18 @@ func JoinHealth(snap Snapshot) []string {
 // ProjectExecutionsWith reports no suppression - correctly, since without that
 // call nothing suppressed anything.
 func JoinHealthWith(snap Snapshot, proj ProjectionStats) []string {
+	// Warnings BEFORE anomalies, for the same reason the serialization
+	// anomaly is raised before the join ones: they qualify the numbers
+	// themselves rather than what those numbers were attributed to. A
+	// perturbed measurement joined perfectly is still a perturbed
+	// measurement, and a reader who stops after the first two lines must have
+	// been told that.
+	warnings := PCSamplingStandingWarning(snap.PCSampling)
 	anomalies := joinAnomalies(snap, proj)
-	return append([]string{joinSummary(snap, len(anomalies))}, anomalies...)
+	out := make([]string, 0, 1+len(warnings)+len(anomalies))
+	out = append(out, joinSummary(snap, len(warnings), len(anomalies)))
+	out = append(out, warnings...)
+	return append(out, anomalies...)
 }
 
 // joinSummary is the always-printed line. len(snap.Executions), not a
@@ -85,7 +104,7 @@ func JoinHealthWith(snap Snapshot, proj ProjectionStats) []string {
 // parenthesised breakdown checkable against a figure that does not come
 // from the same counters it is auditing. joinAnomalies performs that check
 // rather than leaving it to the reader's arithmetic.
-func joinSummary(snap Snapshot, anomalies int) string {
+func joinSummary(snap Snapshot, warnings, anomalies int) string {
 	js := snap.JoinStats
 	execs := uint64(len(snap.Executions))
 
@@ -147,6 +166,15 @@ func joinSummary(snap Snapshot, anomalies int) string {
 			plural(uint64(snap.PendingModuleGroups), "kernel group", "kernel groups"))
 	}
 
+	// Which tier this run selected, and only when one was. "off" is the
+	// default and printing it on every run is the zero-valued noise this
+	// format exists to avoid; "continuous" and "serialized" are both facts a
+	// reader needs before they read anything else, because they decide what a
+	// PC sample can be attributed to and whether the durations are perturbed.
+	if snap.PCSampling != PCSamplingOff {
+		fmt.Fprintf(&b, "; pc sampling %s", snap.PCSampling)
+	}
+
 	// The serialization disclosure, and only when there is one to make. With
 	// PC sampling off or in continuous collection every execution is "false"
 	// and nothing was ever serialized, so a permanent "0 serialized" clause
@@ -157,6 +185,20 @@ func joinSummary(snap Snapshot, anomalies int) string {
 			snap.ExecutionsSerialized, snap.ExecutionsNotSerialized,
 			snap.ExecutionsSerializationUnknown,
 			plural(uint64(snap.SamplingWindowsHeld), "burst", "bursts"))
+	}
+
+	// Counted, and counted in LINES, so that the trailing figures still add
+	// up to exactly what follows the summary: len(lines)-1 == warnings +
+	// anomalies. A standing warning is not an anomaly — nothing went wrong,
+	// the operator asked for it — but it is not free either, and a summary
+	// that said "no anomalies" while four lines of perturbation warning
+	// followed it would be the reassuring half of a contradiction.
+	switch warnings {
+	case 0:
+	case 1:
+		b.WriteString("; 1 standing warning line")
+	default:
+		fmt.Fprintf(&b, "; %d standing warning lines", warnings)
 	}
 
 	switch anomalies {
@@ -231,12 +273,23 @@ func joinAnomalies(snap Snapshot, proj ProjectionStats) []string {
 			"distorted too and carry no marking at all",
 			snap.ExecutionsSerialized, execs)
 	}
-	if snap.ExecutionsSerializationUnknown > 0 && snap.SamplingWindowsReceived > 0 {
+	// No `&& SamplingWindowsReceived > 0` guard. Unknown executions are
+	// reachable only under Tier A (the other two tiers answer "false"
+	// unconditionally and never consult the store), and the case the guard
+	// would suppress — Tier A selected, not one window record arrived, so
+	// EVERY execution is "unknown" — is the worst one available, not the
+	// uninteresting one. The clause names whether any window arrived instead
+	// of hiding the line when none did.
+	if snap.ExecutionsSerializationUnknown > 0 {
+		cause := "a dropped batch, a late attach, a sequence gap, or a burst that never closed"
+		if snap.SamplingWindowsReceived == 0 {
+			cause = "NOT ONE window record reached the agent, though Tier A was selected — the " +
+				"producer never bursted, the probe never attached, or every batch was lost"
+		}
 		add("%d of %d executions cannot be said to have run unperturbed — no sampling window "+
-			"covers them (a dropped batch, a late attach, a sequence gap, or a burst that "+
-			"never closed). They are marked gpu_serialized=\"unknown\" and MUST NOT be read "+
+			"covers them (%s). They are marked gpu_serialized=\"unknown\" and MUST NOT be read "+
 			"as \"false\"",
-			snap.ExecutionsSerializationUnknown, execs)
+			snap.ExecutionsSerializationUnknown, execs, cause)
 	}
 	if snap.SamplingWindowsOpen > 0 {
 		add("%s still open — the producer stopped reporting mid-burst (a hard exit), so the "+

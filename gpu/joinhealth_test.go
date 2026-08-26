@@ -67,6 +67,14 @@ func anomalousSnapshot() Snapshot {
 		// Tier A gone wrong in all three ways at once: bursts perturbed some
 		// executions, an unbroken history proved others were untouched, and a
 		// window that never closed leaves the rest unplaceable.
+		//
+		// The tier is set, and it has to be: the three counters below are
+		// reachable ONLY under PCSamplingSerialized (the other two tiers
+		// answer "false" unconditionally and never consult the window store),
+		// so a fixture that carried them with the tier off would be a run that
+		// cannot happen — and would quietly stop exercising the standing
+		// warning that a real one carries.
+		PCSampling:                     PCSamplingSerialized,
 		SamplingWindowsReceived:        41,
 		SamplingWindowsHeld:            21,
 		SamplingWindowsOpen:            1,
@@ -89,10 +97,17 @@ func TestJoinHealthAnomaliesEachGetTheirOwnLine(t *testing.T) {
 	lines := JoinHealth(anomalousSnapshot())
 
 	require.Greater(t, len(lines), 1)
+	warnings := 0
 	for _, l := range lines[1:] {
+		if strings.HasPrefix(l, PCSamplingWarningPrefix+": ") {
+			warnings++
+			continue
+		}
 		assert.True(t, strings.HasPrefix(l, joinAnomalyPrefix+": "), "line %q", l)
 		assert.Contains(t, l, " — ", "every anomaly says what the number means when it is bad")
 	}
+	assert.Equal(t, len(PCSamplingStandingWarning(PCSamplingSerialized)), warnings,
+		"a Tier A snapshot carries its whole standing warning, every render")
 
 	joined := strings.Join(lines, "\n")
 	for _, want := range []string{
@@ -118,26 +133,105 @@ func TestJoinHealthAnomaliesEachGetTheirOwnLine(t *testing.T) {
 	}
 }
 
-// The summary's anomaly count is the one derived figure here; it must never
-// read green when things are worst.
+// The summary's trailing counts are the only derived figures here; they must
+// never read green when things are worst, and together they must account for
+// EVERY line below the summary. A standing warning line that no count covered
+// would be a line the summary implicitly denies exists.
 func TestJoinHealthSummaryCountMatchesTheLinesBelowIt(t *testing.T) {
+	tierA := healthySnapshot()
+	tierA.PCSampling = PCSamplingSerialized
 	for name, snap := range map[string]Snapshot{
-		"healthy":   healthySnapshot(),
-		"anomalous": anomalousSnapshot(),
-		"empty":     {},
+		"healthy":          healthySnapshot(),
+		"anomalous":        anomalousSnapshot(),
+		"empty":            {},
+		"tier A, no fault": tierA,
 	} {
 		t.Run(name, func(t *testing.T) {
 			lines := JoinHealth(snap)
-			switch n := len(lines) - 1; n {
+
+			warnings := 0
+			for _, l := range lines[1:] {
+				if strings.HasPrefix(l, PCSamplingWarningPrefix+": ") {
+					warnings++
+				}
+			}
+			anomalies := len(lines) - 1 - warnings
+
+			switch warnings {
+			case 0:
+				assert.NotContains(t, lines[0], "standing warning")
+			case 1:
+				assert.Contains(t, lines[0], "; 1 standing warning line")
+			default:
+				assert.Contains(t, lines[0], "; "+strconv.Itoa(warnings)+" standing warning lines")
+			}
+
+			switch anomalies {
 			case 0:
 				assert.Contains(t, lines[0], "; no anomalies")
 			case 1:
 				assert.Contains(t, lines[0], "; 1 anomaly")
 			default:
-				assert.Contains(t, lines[0], "; "+strconv.Itoa(n)+" anomalies")
+				assert.Contains(t, lines[0], "; "+strconv.Itoa(anomalies)+" anomalies")
 			}
 		})
 	}
+}
+
+// The warning STANDS. It is rendered on a Tier A run in which nothing at all
+// went wrong — no perturbed execution yet, no unknown, no window even — and
+// that is the case it exists for: a burst-free interval, a graph refusal that
+// stopped bursts, or simply the first snapshot of a run. A disclosure that
+// appeared only once some counter moved would be absent from exactly the
+// profiles whose readers had no other way to learn the tier was on.
+func TestTheTierAWarningStandsOnAnOtherwisePerfectRun(t *testing.T) {
+	snap := healthySnapshot()
+	snap.PCSampling = PCSamplingSerialized
+	// Nothing is amiss: every join exact, no window, no serialized execution.
+	snap.ExecutionsNotSerialized = uint64(len(snap.Executions))
+
+	lines := JoinHealth(snap)
+	joined := strings.Join(lines, "\n")
+	assert.Contains(t, lines[0], "; pc sampling serialized")
+	assert.Contains(t, lines[0], "; no anomalies")
+	assert.Contains(t, joined, "CARRY NO MARKING AT ALL")
+	assert.Contains(t, joined, "CUDA GRAPHS")
+	assert.Equal(t, PCSamplingStandingWarning(PCSamplingSerialized), lines[1:],
+		"the warning is the whole warning, in order, immediately under the summary")
+}
+
+// And it is absent for the two tiers that do not perturb anything. A warning
+// on every run is a warning readers learn to skip.
+func TestNoStandingWarningWhenNothingIsPerturbed(t *testing.T) {
+	for _, tier := range []PCSamplingTier{PCSamplingOff, PCSamplingContinuous} {
+		t.Run(tier.String(), func(t *testing.T) {
+			snap := healthySnapshot()
+			snap.PCSampling = tier
+			lines := JoinHealth(snap)
+			require.Len(t, lines, 1)
+			assert.NotContains(t, lines[0], "standing warning")
+			if tier == PCSamplingOff {
+				assert.NotContains(t, lines[0], "pc sampling")
+			} else {
+				assert.Contains(t, lines[0], "; pc sampling continuous")
+			}
+		})
+	}
+}
+
+// Tier A selected and NOT ONE window record received: every execution is
+// "unknown", and that is the worst available state of the disclosure rather
+// than a quiet one. It must be raised, and the line must say that no window
+// arrived at all rather than offering the ordinary lossy-transport causes.
+func TestJoinHealthRaisesTierAWithNoWindowAtAll(t *testing.T) {
+	snap := healthySnapshot()
+	snap.PCSampling = PCSamplingSerialized
+	snap.ExecutionsSerializationUnknown = uint64(len(snap.Executions))
+	snap.ExecutionsNotSerialized = 0
+
+	joined := strings.Join(JoinHealth(snap), "\n")
+	assert.Contains(t, joined, "NOT ONE window record reached the agent")
+	assert.Contains(t, joined, "MUST NOT be read")
 }
 
 // A snapshot with nothing in it is the degenerate worst case: every ratio a
@@ -258,6 +352,12 @@ func TestJoinHealthRenderedOutput(t *testing.T) {
 		{"healthy", healthySnapshot()},
 		{"anomalous", anomalousSnapshot()},
 		{"empty", Snapshot{}},
+		{"tier A, nothing wrong", func() Snapshot {
+			s := healthySnapshot()
+			s.PCSampling = PCSamplingSerialized
+			s.ExecutionsNotSerialized = uint64(len(s.Executions))
+			return s
+		}()},
 	} {
 		t.Log(c.name + ":\n" + strings.Join(JoinHealth(c.snap), "\n"))
 	}

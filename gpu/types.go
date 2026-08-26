@@ -429,6 +429,50 @@ type GPUSamplingWindow struct {
 // serialized".
 func (w GPUSamplingWindow) Open() bool { return w.EndNs == 0 }
 
+// GPUGraphExecutions is the producer's report that kernel executions in a
+// process were launched from a CUDA graph.
+//
+// It is the agent's side of GPU_DROP_CLASS_GRAPH_EXEC (internal/gpuabi's
+// DropClassGraphExec), and it exists because a CUDA graph breaks the ONE thing
+// Tier A claims: exact launch attribution.
+//
+// A graph launch fires ONE runtime callback for N kernels. gpu_exec_v1 has no
+// field for graphId, so all N executions arrive carrying the SAME correlation
+// value — and the exact-correlation join, which is vendor-provided truth
+// everywhere else, quietly becomes one launch to many executions. Nothing
+// downstream can tell that apart from a correct exact join: gpu_join reads
+// "exact", gpu_pc_attrib reads "exact", every join counter reads green, and N
+// kernels' samples land on one call site. That is attribution which is
+// exact-LOOKING and many-to-one, and it is the reason this record is a first-
+// class event rather than a number in a drop table nobody reads.
+//
+// TIER B IS UNAFFECTED, and the asymmetry is deliberate rather than lucky:
+// Tier B joins a PC sample through the MODULE (cubin CRC and function index)
+// to a kernel name, never through the launch, so a graph-launched kernel
+// resolves to its own kernel exactly as any other does. Only Tier A's claim is
+// false. Timeline therefore withdraws Tier A's claim and leaves Tier B's
+// alone; see Timeline.isGraphRefusedLocked.
+//
+// Count is a DELTA, not a running total: the producer reports only what it has
+// not reported before (shim/nvidia/cupti_adapter.cc keeps g_graph_exec_reported
+// for exactly this), so a consumer accumulates rather than replaces.
+type GPUGraphExecutions struct {
+	Backend GPUBackendID `json:"backend"`
+	// PID is the process whose executions came from a graph. It is the whole
+	// of the refusal's scope: PC-sampling collection mode is per-process (the
+	// producer's burst controller lives in the profiled process), so one
+	// graph-using process must not withdraw another process's exact
+	// attribution in a system-wide profile.
+	//
+	// Zero means the producer named no process. That cannot be scoped, so it
+	// is treated as "every process" rather than as "no process" — the safe
+	// direction, and it is counted; see Timeline.EmitGraphExecutions.
+	PID uint32 `json:"pid,omitempty"`
+	// Count is how many graph-launched executions this report adds. A report
+	// carrying zero is not evidence of anything and does not arm the refusal.
+	Count uint64 `json:"count"`
+}
+
 // SerializationState is the gpu_serialized disclosure: whether an execution's
 // measured duration was perturbed by kernel serialization.
 //
@@ -610,6 +654,14 @@ type EventSink interface {
 	// is marked perturbed from these intervals, and a window that failed to
 	// be recognised would silently downgrade "unknown" to "false".
 	EmitSamplingWindow(GPUSamplingWindow) error
+	// EmitGraphExecutions delivers the producer's report that N executions in
+	// a process were launched from a CUDA graph. Like EmitSamplingWindow it is
+	// a method of its own rather than a GPUTimelineEvent with attributes, and
+	// for a stronger version of the same reason: what rides on it is not a
+	// measurement but a REFUSAL — Tier A's exact-launch attribution is false
+	// in that process — and a refusal that depended on string parsing would
+	// fail silently into the confident answer it exists to prevent.
+	EmitGraphExecutions(GPUGraphExecutions) error
 }
 
 // Backend produces normalized GPU events into an EventSink.

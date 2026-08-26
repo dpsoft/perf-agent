@@ -18,6 +18,10 @@ type recordingSink struct {
 	modules   int
 	events    int
 	windows   int
+	// graphReports counts EmitGraphExecutions calls. It exists so the
+	// unconditional-admission property of that method is assertable: the call
+	// must reach the inner sink even when every bucket is empty.
+	graphReports int
 }
 
 func (r *recordingSink) EmitLaunch(GPUKernelLaunch) error { r.launches++; return nil }
@@ -30,18 +34,24 @@ func (r *recordingSink) EmitSamplingWindow(GPUSamplingWindow) error {
 	return nil
 }
 
+func (r *recordingSink) EmitGraphExecutions(GPUGraphExecutions) error {
+	r.graphReports++
+	return nil
+}
+
 // erroringSink lets a test control exactly what the downstream sink returns,
 // to exercise the reserve/delegate/settle path when delivery fails.
 type erroringSink struct {
 	err error
 }
 
-func (e *erroringSink) EmitLaunch(GPUKernelLaunch) error           { return e.err }
-func (e *erroringSink) EmitExec(GPUKernelExec) error               { return e.err }
-func (e *erroringSink) EmitPCSample(GPUPCSample) error             { return e.err }
-func (e *erroringSink) EmitModule(GPUModule) error                 { return e.err }
-func (e *erroringSink) EmitEvent(GPUTimelineEvent) error           { return e.err }
-func (e *erroringSink) EmitSamplingWindow(GPUSamplingWindow) error { return e.err }
+func (e *erroringSink) EmitLaunch(GPUKernelLaunch) error             { return e.err }
+func (e *erroringSink) EmitExec(GPUKernelExec) error                 { return e.err }
+func (e *erroringSink) EmitPCSample(GPUPCSample) error               { return e.err }
+func (e *erroringSink) EmitModule(GPUModule) error                   { return e.err }
+func (e *erroringSink) EmitEvent(GPUTimelineEvent) error             { return e.err }
+func (e *erroringSink) EmitSamplingWindow(GPUSamplingWindow) error   { return e.err }
+func (e *erroringSink) EmitGraphExecutions(GPUGraphExecutions) error { return e.err }
 
 // atomicSink is a genuinely concurrency-safe EventSink, used only by the
 // concurrent-access test so a data race in the test double itself can never
@@ -50,12 +60,13 @@ type atomicSink struct {
 	launches atomic.Int64
 }
 
-func (a *atomicSink) EmitLaunch(GPUKernelLaunch) error           { a.launches.Add(1); return nil }
-func (a *atomicSink) EmitExec(GPUKernelExec) error               { return nil }
-func (a *atomicSink) EmitPCSample(GPUPCSample) error             { return nil }
-func (a *atomicSink) EmitModule(GPUModule) error                 { return nil }
-func (a *atomicSink) EmitEvent(GPUTimelineEvent) error           { return nil }
-func (a *atomicSink) EmitSamplingWindow(GPUSamplingWindow) error { return nil }
+func (a *atomicSink) EmitLaunch(GPUKernelLaunch) error             { a.launches.Add(1); return nil }
+func (a *atomicSink) EmitExec(GPUKernelExec) error                 { return nil }
+func (a *atomicSink) EmitPCSample(GPUPCSample) error               { return nil }
+func (a *atomicSink) EmitModule(GPUModule) error                   { return nil }
+func (a *atomicSink) EmitEvent(GPUTimelineEvent) error             { return nil }
+func (a *atomicSink) EmitSamplingWindow(GPUSamplingWindow) error   { return nil }
+func (a *atomicSink) EmitGraphExecutions(GPUGraphExecutions) error { return nil }
 
 // fakeClock is an injectable, manually-advanced clock so the token-bucket
 // refill can be tested deterministically instead of racing the wall clock.
@@ -242,6 +253,37 @@ func TestCountingSinkEmitModuleForwardsCountsAndEnforcesCapacity(t *testing.T) {
 // busy workload could starve the disclosure out of the sink — turning every
 // execution in the run gpu_serialized="unknown" while the profile still looked
 // full.
+// TestCountingSinkNeverRefusesAGraphReport pins the one method here that has no
+// admission control, against a sink whose every budget is exhausted.
+//
+// Every other event is a measurement, and dropping one under pressure costs a
+// slice of the profile. This one is a REFUSAL - Tier A's exact-launch
+// attribution is false in that process - and dropping it does not cost a slice
+// of the profile, it restores the entire defect the refusal exists to prevent,
+// precisely under the load that makes a token bucket bite.
+//
+// Mutation this catches: routing EmitGraphExecutions through admitCapacity for
+// consistency with its neighbours.
+func TestCountingSinkNeverRefusesAGraphReport(t *testing.T) {
+	inner := &recordingSink{}
+	s := NewCountingSink(inner, 1)
+
+	// Exhaust both budgets: the anchor class and the data class.
+	require.NoError(t, s.EmitLaunch(GPUKernelLaunch{
+		Correlation: CorrelationID{Backend: BackendCUPTI, Value: "1"},
+		ClockDomain: ClockDomainCPUMonotonic,
+	}))
+	require.Error(t, s.EmitSamplingWindow(GPUSamplingWindow{Backend: BackendCUPTI, StartNs: 1, EndNs: 2}),
+		"the anchor budget must actually be full, or this test proves nothing")
+
+	for range 100 {
+		require.NoError(t, s.EmitGraphExecutions(GPUGraphExecutions{
+			Backend: BackendCUPTI, PID: 7, Count: 1,
+		}), "a graph report must never be refused; a bounded refusal is not a refusal")
+	}
+	assert.Equal(t, 100, inner.graphReports)
+}
+
 func TestCountingSinkEmitSamplingWindowDrawsOnTheAnchorBudget(t *testing.T) {
 	inner := &recordingSink{}
 	s := NewCountingSink(inner, 2)

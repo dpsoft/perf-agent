@@ -66,7 +66,8 @@ const (
 //	gpu_stall       the instruction's stall reason, when the producer named one
 //	gpu_pc          the instruction's offset within its module, subject to the
 //	                cardinality budget - see pcLabelBudget
-//	gpu_pc_attrib   how the sample reached this execution - unconditional
+//	gpu_pc_attrib   how the sample reached this execution - unconditional,
+//	                and "graph-refused" where a CUDA graph made "exact" false
 //	gpu_src_status  why the sample does or does not have a source location -
 //	                unconditional
 //	gpu_src_file    the source file's BASENAME, only under "resolved"
@@ -622,6 +623,32 @@ func projectionLabels(view ExecutionView) map[string]string {
 	}
 	if view.Ambiguous {
 		labels["gpu_ambiguous"] = "true"
+	}
+	// gpu_graph_refused is the CUDA-graph refusal, and it rides on EVERY
+	// execution of an affected process rather than only on the PC-bearing
+	// ones — the same scope gpu_join has, because it says the same kind of
+	// thing about the same join. One graph launch fires one runtime callback
+	// for N kernels, so gpu_join="exact" on those executions is exact-looking
+	// and many-to-one: N kernels' time and N kernels' samples are billed to
+	// one CPU call site. gpu_pc_attrib="graph-refused" says it for the sampled
+	// subset; this says it for all of them.
+	//
+	// It is deleted before it is set, which the other conditional labels here
+	// are not, because it is the only one whose ABSENCE is what a reader acts
+	// on: a producer-supplied tag literally named "gpu_graph_refused" would
+	// otherwise survive on an execution this package did not refuse, and a
+	// forged refusal is a way to make a healthy Tier A profile look
+	// untrustworthy. It is set only when true because "no graph was reported"
+	// is the ordinary state of every profile; the loud, counted, unconditional
+	// form of this fact is the joinhealth anomaly and
+	// Snapshot.ExecutionsGraphRefused, not a label on every sample ever
+	// projected.
+	//
+	// It is never set in Tier B or with sampling off, however many graph
+	// executions were reported — see ExecutionView.GraphRefused.
+	delete(labels, "gpu_graph_refused")
+	if view.GraphRefused {
+		labels["gpu_graph_refused"] = "true"
 	}
 	// gpu_serialized is set UNCONDITIONALLY on every execution, exactly as
 	// gpu_join is and for exactly the same reason: an absent label would read

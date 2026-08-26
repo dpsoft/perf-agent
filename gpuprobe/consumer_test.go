@@ -52,13 +52,14 @@ func newTestConsumer(sink gpu.EventSink) *Consumer {
 // reject so the SinkRejected accounting is exercised. It is mutex-guarded
 // because the lifecycle tests below drive it from Run's goroutine.
 type recordingSink struct {
-	mu        sync.Mutex
-	launches  []gpu.GPUKernelLaunch
-	execs     []gpu.GPUKernelExec
-	pcSamples []gpu.GPUPCSample
-	modules   []gpu.GPUModule
-	windows   []gpu.GPUSamplingWindow
-	err       error
+	mu         sync.Mutex
+	launches   []gpu.GPUKernelLaunch
+	execs      []gpu.GPUKernelExec
+	pcSamples  []gpu.GPUPCSample
+	modules    []gpu.GPUModule
+	windows    []gpu.GPUSamplingWindow
+	graphExecs []gpu.GPUGraphExecutions
+	err        error
 	// onEmit, if set, is called after each accepted event. The lifecycle
 	// tests use it to know Run has completed a loop iteration.
 	onEmit func()
@@ -123,6 +124,17 @@ func (s *recordingSink) EmitSamplingWindow(w gpu.GPUSamplingWindow) error {
 		return s.err
 	}
 	s.windows = append(s.windows, w)
+	s.note()
+	return nil
+}
+
+func (s *recordingSink) EmitGraphExecutions(g gpu.GPUGraphExecutions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.graphExecs = append(s.graphExecs, g)
 	s.note()
 	return nil
 }
@@ -221,13 +233,13 @@ func TestProbeKindCookiesMatchTheBPFProgram(t *testing.T) {
 	assert.Equal(t, uint64(0), cookieFor("gpu_unknown_v9"), "unknown probes are not attached")
 }
 
-// Stats.Undecoded is the "carried but not interpreted" counter. Every kind
-// the ABI defines has an applyBatch arm except kindDropped, which is decoded
-// and carried while its normalization waits for the consumer task that
-// follows this one. The kind used below is neither - it is a kind neither
-// side of the wire knows, which is the ABI having drifted, and which must
-// still be counted rather than dropped quietly (§6.1 admits no silent loss
-// anywhere).
+// Stats.Undecoded is the "carried but not interpreted" counter. Every kind the
+// ABI defines has an applyBatch arm, including kindDropped since issue #94
+// gave the CUDA-graph refusal something to consume; a drop CLASS this side
+// decodes but does not yet act on is counted in DropsUnconsumed instead. The
+// kind used below is neither - it is a kind neither side of the wire knows,
+// which is the ABI having drifted, and which must still be counted rather than
+// dropped quietly (§6.1 admits no silent loss anywhere).
 func TestUndecodedKindsAreCountedNotDropped(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
 	buf := make([]byte, batchHdrSize+40)
@@ -2844,6 +2856,10 @@ func TestTheFivePCSamplingKindsAreDecodedNotCountedUndecoded(t *testing.T) {
 		kind uint32
 		size int
 	}{
+		// kindDropped is not in this table. It is a PC-sampling kind and it
+		// does have an arm (issue #94), but a zero-filled record decodes as
+		// DropClassInvalid, which lands in DropsUnconsumed - a different
+		// assertion, made in TestEveryDropRecordIsActedOnOrCountedUnconsumed.
 		{"module", kindModule, gpuabi.SizeModuleLoad},
 		{"pc", kindPC, gpuabi.SizePCSample},
 		{"stallmap", kindStallMap, gpuabi.SizeStallReason},
@@ -3451,6 +3467,14 @@ func TestHealthyTierBRunLeavesEveryNewLossCounterAtZero(t *testing.T) {
 	assert.Zero(t, st.ConfigsDisagreed)
 	assert.Zero(t, st.PendingStallSamples)
 	assert.Zero(t, st.ZeroCorrelationExecs)
+	// The CUDA-graph refusal's counters, zero because this workload launches
+	// no graph. They are asserted here rather than only in their own tests
+	// because the property that matters is exactly this one: green on a
+	// healthy run, and non-zero the instant a graph execution is reported.
+	assert.Zero(t, st.GraphExecutions)
+	assert.Zero(t, st.GraphExecReports)
+	assert.Zero(t, st.DropsDecoded)
+	assert.Zero(t, st.DropsUnconsumed)
 	// The one new counter that is NOT zero on a healthy Tier B run, and the
 	// reason it is its own counter rather than a share of ZeroCorrelation.
 	assert.Equal(t, uint64(2), st.PCSamplesWithoutCorrelation)
@@ -3521,4 +3545,129 @@ func TestDecodeBatchRejectsAnOverlongDroppedBatch(t *testing.T) {
 
 	_, err := decodeBatch(buf)
 	assert.ErrorIs(t, err, gpuabi.ErrShortRecord)
+}
+
+// --- The CUDA-graph refusal, issue #94 ---
+
+// droppedBatch builds one gpu_dropped_v1 batch from (count, class) pairs.
+func droppedBatch(pid uint32, seq uint64, drops ...gpuabi.Dropped) []byte {
+	buf := make([]byte, batchHdrSize+len(drops)*gpuabi.SizeDropped)
+	putU32(buf[0:], kindDropped)
+	putU32(buf[4:], uint32(len(drops)))
+	putU64(buf[8:], seq)
+	putU32(buf[16:], pid)
+	putU64(buf[24:], uint64(len(drops)*gpuabi.SizeDropped))
+	for i, d := range drops {
+		off := batchHdrSize + i*gpuabi.SizeDropped
+		putU64(buf[off:], d.Count)
+		buf[off+8] = d.Class
+	}
+	return buf
+}
+
+// TestGraphExecDropClassReachesTheSink is the wire half of issue #94: the drop
+// class the shim has been emitting since Task 6 is now CONSUMED rather than
+// counted as Undecoded and forgotten.
+//
+// A CUDA graph launch fires ONE runtime callback for N kernels and gpu_exec_v1
+// carries no graph id, so those N executions share one correlation — and Tier
+// A's entire claim is exact launch attribution. Until this arm existed the
+// class arrived, landed in applyBatch's default: case, and nothing anywhere
+// acted on it: Tier A ran happily in a graph-using process and produced
+// attribution that was exact-LOOKING and many-to-one.
+//
+// The pid comes off the BATCH HEADER, which is what scopes the refusal: a
+// graph-using process in a system-wide profile must not withdraw the exact
+// attribution of every other process being profiled beside it.
+func TestGraphExecDropClassReachesTheSink(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, droppedBatch(4242, 1, gpuabi.Dropped{Count: 6, Class: gpuabi.DropClassGraphExec}))
+
+	require.Len(t, sink.graphExecs, 1)
+	assert.Equal(t, uint32(4242), sink.graphExecs[0].PID,
+		"the refusal is scoped by the process that fired the probe")
+	assert.Equal(t, uint64(6), sink.graphExecs[0].Count)
+
+	st := c.Stats()
+	assert.Equal(t, uint64(6), st.GraphExecutions)
+	assert.Equal(t, uint64(1), st.GraphExecReports)
+	assert.Equal(t, uint64(1), st.DropsDecoded)
+	assert.Zero(t, st.DropsUnconsumed)
+	assert.Equal(t, uint64(1), st.Records)
+	assert.Zero(t, st.Undecoded,
+		"gpu_dropped_v1 has an applyBatch arm now; Undecoded reading non-zero means it fell "+
+			"through to default: and the refusal never fired")
+	assert.Zero(t, st.SinkRejected)
+}
+
+// The three Tier B loss classes are decoded and COUNTED, not acted on and not
+// silently discarded. Turning each into an operator-visible number is a
+// separate task; DropsUnconsumed is what keeps them from being silent until it
+// lands, exactly as Undecoded did before this kind had an arm at all.
+func TestTierBDropClassesAreCountedUnconsumed(t *testing.T) {
+	sink := &recordingSink{}
+	c := newTestConsumer(sink)
+
+	apply(t, c, droppedBatch(4242, 1,
+		gpuabi.Dropped{Count: 3, Class: gpuabi.DropClassPCDroppedHW},
+		gpuabi.Dropped{Count: 1, Class: gpuabi.DropClassPCBufferFull},
+		gpuabi.Dropped{Count: 17, Class: gpuabi.DropClassPCNonUserKernel},
+	))
+
+	st := c.Stats()
+	assert.Empty(t, sink.graphExecs, "only the graph class is forwarded")
+	assert.Zero(t, st.GraphExecutions, "a Tier B loss class must not arm Tier A's refusal")
+	assert.Zero(t, st.GraphExecReports)
+	assert.Equal(t, uint64(3), st.DropsDecoded)
+	assert.Equal(t, uint64(3), st.DropsUnconsumed,
+		"DropsUnconsumed counts RECORDS, not the losses they describe: three statements about "+
+			"loss arrived and nothing on this side read them")
+	assert.Equal(t, uint64(3), st.Records)
+	assert.Zero(t, st.Undecoded)
+}
+
+// The identity that makes the drop counters checkable rather than merely
+// reported: every decoded record is either acted on or counted unconsumed, and
+// there is no third outcome in which one vanishes.
+func TestEveryDropRecordIsActedOnOrCountedUnconsumed(t *testing.T) {
+	c := newTestConsumer(&recordingSink{})
+	// One record per class the ABI defines, exactly as shim/stub/stub.cc
+	// emits, plus a class from a producer newer than this consumer.
+	for i, class := range []uint8{
+		gpuabi.DropClassPCDroppedHW,
+		gpuabi.DropClassPCBufferFull,
+		gpuabi.DropClassPCNonUserKernel,
+		gpuabi.DropClassGraphExec,
+		gpuabi.DropClassGraphExec + 1,
+	} {
+		apply(t, c, droppedBatch(4242, uint64(i+1), gpuabi.Dropped{Count: 1, Class: class}))
+	}
+
+	st := c.Stats()
+	assert.Equal(t, uint64(5), st.DropsDecoded)
+	assert.Equal(t, st.DropsDecoded, st.GraphExecReports+st.DropsUnconsumed,
+		"every decoded drop record must be acted on or counted unconsumed: %+v", st)
+	assert.Equal(t, uint64(1), st.GraphExecReports)
+	assert.Equal(t, uint64(4), st.DropsUnconsumed,
+		"a class this consumer does not know is counted unconsumed, not dropped and not "+
+			"mistaken for the graph class")
+	assert.Zero(t, st.Undecoded)
+	assert.Zero(t, st.SequenceGaps)
+}
+
+// A graph report the sink refuses is counted, like every other refused event.
+// It is the only path on which one can be lost between the wire and the
+// Timeline, which is why gpuprobe.Stats.GraphExecutions and
+// gpu.Snapshot.GraphExecutions are separate numbers that can be compared.
+func TestARefusedGraphReportIsCounted(t *testing.T) {
+	c := newTestConsumer(&recordingSink{err: gpu.ErrSinkFull})
+	apply(t, c, droppedBatch(4242, 1, gpuabi.Dropped{Count: 2, Class: gpuabi.DropClassGraphExec}))
+
+	st := c.Stats()
+	assert.Equal(t, uint64(1), st.SinkRejected)
+	assert.Equal(t, uint64(2), st.GraphExecutions,
+		"the arrival is counted whether or not the sink took it; otherwise a full sink would "+
+			"make the condition invisible on both sides at once")
 }

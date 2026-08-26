@@ -114,6 +114,20 @@ var (
 	// destructive flag in the ordinary sense -- it changes the thing being
 	// measured -- so it takes the same shape as one.
 	ErrPCSamplingNotAcknowledged = errors.New("GPU PC-sampling tier \"serialized\" perturbs the workload and was not acknowledged")
+
+	// ErrPCSamplingGraphExecutions: "serialized" was selected for a process
+	// already known to launch kernels from CUDA graphs.
+	//
+	// This is the refusal, and it is a REFUSAL rather than a downgrade to
+	// "continuous" on purpose. Tier A's entire claim is exact launch
+	// attribution; a graph launch fires one runtime callback for N kernels, so
+	// in such a process that claim is false while every counter reads green
+	// and every label reads "exact". Silently running Tier B instead would be
+	// indistinguishable from Tier A working — the operator asked for exact
+	// attribution, would be handed inferred attribution, and nothing in the
+	// profile or the logs would say which they got. So the run refuses to
+	// start in that tier and the operator picks the next one deliberately.
+	ErrPCSamplingGraphExecutions = errors.New("GPU PC-sampling tier \"serialized\" cannot attribute CUDA graph launches and graph executions were observed")
 )
 
 // String renders the tier as the value an operator types. An out-of-range
@@ -256,16 +270,48 @@ type PCSamplingRequest struct {
 	// that Tier A perturbs the workload it measures. It gates nothing else:
 	// off and continuous do not need it and are not affected by it.
 	AcknowledgePerturbation bool
+
+	// GraphExecutionsObserved says that kernel executions launched from a
+	// CUDA graph have already been seen in the process this run will profile.
+	// It makes Select refuse "serialized" with ErrPCSamplingGraphExecutions —
+	// Tier A never starts, so the producer's burst controller is never built,
+	// no burst is ever opened and no kernel is ever serialized.
+	//
+	// This is the START half of the refusal. The MID-RUN half cannot live
+	// here and does not: a process's first graph launch may be minutes into a
+	// run that began legitimately, long after this decision was taken. Two
+	// mechanisms cover that, and neither is this one:
+	//
+	//   - the producer stops bursting. BurstController::poll latches its
+	//     refusal on the first graph execution it sees, returns kStop so an
+	//     open burst closes honestly rather than being abandoned, and never
+	//     returns kStart again (shim/core/burst.h). It does not know how to
+	//     become Tier B, which is the point;
+	//   - the agent withdraws the claim. Timeline marks every execution of
+	//     that process GraphRefused, turns gpu_pc_attrib="exact" into
+	//     "graph-refused", counts both, and JoinHealth raises a standing
+	//     anomaly (Snapshot.GraphExecutions, ExecutionsGraphRefused,
+	//     PCJoinStats.GraphRefusedAttributions).
+	//
+	// What feeds this field is a caller that already knows: a driver
+	// re-selecting the tier for a second profiling round over the same
+	// process, or one attaching to a process a previous round found using
+	// graphs. Snapshot.GraphExecutions > 0 is the value to pass. There is no
+	// way for the FIRST round against an unknown process to know, and that
+	// gap is real and stated rather than papered over — see
+	// .superpowers/sdd/issue-94-graph-refusal-report.md.
+	GraphExecutionsObserved bool
 }
 
 // Select resolves the request to a tier, or refuses.
 //
-// It refuses in exactly three ways, and every one of them is a startup error
+// It refuses in exactly four ways, and every one of them is a startup error
 // rather than a downgrade:
 //
 //   - an unknown value in either source;
 //   - both sources naming different tiers, or one source naming two;
-//   - "serialized" without AcknowledgePerturbation.
+//   - "serialized" without AcknowledgePerturbation;
+//   - "serialized" with GraphExecutionsObserved.
 //
 // On any error the returned tier is PCSamplingOff, so a caller that logs and
 // exits and a caller that logs and continues both end up not sampling, rather
@@ -290,6 +336,23 @@ func (r PCSamplingRequest) Select() (PCSamplingTier, error) {
 			ErrPCSamplingTiersExclusive, fromFlag, PCSamplingEnvVar, fromEnv)
 	case r.Flag != "":
 		tier = fromFlag
+	}
+
+	// Before the acknowledgement, because it is not overridable by one. An
+	// operator who acknowledges the perturbation has agreed to pay a cost for
+	// exact attribution; in a graph-using process they would pay the cost and
+	// receive attribution that is exact-looking and many-to-one, which is not
+	// the trade they agreed to. There is no flag that turns this off.
+	if tier == PCSamplingSerialized && r.GraphExecutionsObserved {
+		return PCSamplingOff, fmt.Errorf("%w. A CUDA graph launch fires ONE runtime callback "+
+			"for N kernels and gpu_exec_v1 carries no graph id, so all N executions share one "+
+			"correlation: Tier A would report gpu_join=\"exact\" and gpu_pc_attrib=\"exact\" "+
+			"while billing N kernels' time and samples to a single call site, with every join "+
+			"counter reading green. This refuses rather than downgrading to \"continuous\", "+
+			"because a silent downgrade is indistinguishable from Tier A working. Use "+
+			"--gpu-pc-sampling=continuous, which joins through the module rather than through "+
+			"the launch and is unaffected by graphs",
+			ErrPCSamplingGraphExecutions)
 	}
 
 	if tier == PCSamplingSerialized && !r.AcknowledgePerturbation {
@@ -347,8 +410,11 @@ func PCSamplingStandingWarning(tier PCSamplingTier) []string {
 			"it is, with nothing in that profile saying why.",
 		p + "(3) TIER A IS UNAVAILABLE WHERE CUDA GRAPHS ARE IN USE. A graph launch fires one " +
 			"runtime callback for N kernels, so Tier A's exact-launch attribution would be false " +
-			"while still looking exact; the producer refuses to open bursts in such a process " +
-			"rather than downgrading silently to Tier B, and this profile then carries no Tier A " +
-			"PC samples at all.",
+			"while still looking exact. Both ends refuse rather than downgrading silently to " +
+			"Tier B: the producer stops opening bursts in such a process, so the profile carries " +
+			"no further Tier A PC samples, and this agent withdraws the claim on what did " +
+			"arrive — those executions are marked gpu_graph_refused=\"true\" and their " +
+			"gpu_pc_attrib becomes \"graph-refused\" rather than \"exact\". If that happens " +
+			"you will see it as an anomaly below, not as a quiet absence.",
 	}
 }

@@ -166,6 +166,22 @@ func joinSummary(snap Snapshot, warnings, anomalies int) string {
 			plural(uint64(snap.PendingModuleGroups), "kernel group", "kernel groups"))
 	}
 
+	// The CUDA-graph refusal, in the summary as well as in the anomaly,
+	// because it changes what every other figure on this line means. Printed
+	// whenever any graph execution was reported — including in Tier B, where
+	// it is not an anomaly and the clause says so, since an operator reading
+	// "Tier B is unaffected" once is how they learn not to look for the
+	// refusal on the next run.
+	if snap.GraphExecutions > 0 {
+		if snap.TierAGraphRefused() {
+			fmt.Fprintf(&b, "; %s from CUDA graphs — TIER A EXACT ATTRIBUTION WITHDRAWN on %d executions",
+				plural(snap.GraphExecutions, "execution", "executions"), snap.ExecutionsGraphRefused)
+		} else {
+			fmt.Fprintf(&b, "; %s from CUDA graphs (this tier joins through the module, not the launch, and is unaffected)",
+				plural(snap.GraphExecutions, "execution", "executions"))
+		}
+	}
+
 	// Which tier this run selected, and only when one was. "off" is the
 	// default and printing it on every run is the zero-valued noise this
 	// format exists to avoid; "continuous" and "serialized" are both facts a
@@ -290,6 +306,62 @@ func joinAnomalies(snap Snapshot, proj ProjectionStats) []string {
 			"covers them (%s). They are marked gpu_serialized=\"unknown\" and MUST NOT be read "+
 			"as \"false\"",
 			snap.ExecutionsSerializationUnknown, execs, cause)
+	}
+	// THE CUDA-GRAPH REFUSAL. Raised immediately after the serialization
+	// identity and before every other attribution clause, because it is the
+	// one condition on this list that makes the counters BELOW it read green
+	// while being wrong: a graph-using process joins exactly, attributes
+	// exactly, evicts nothing, and bills N kernels to one call site.
+	//
+	// Only under Tier A. Tier B reaches a PC sample's kernel through the
+	// cubin and the function index, never through the launch, so a
+	// graph-launched kernel resolves to its own kernel exactly as any other
+	// does and nothing about that tier is false in a graph-using process.
+	// Raising it there would be a false alarm on a healthy run, which is how
+	// the word "anomaly" stops being read. The count still rides on the
+	// Snapshot (GraphExecutions) where a reader can find it.
+	if snap.TierAGraphRefused() {
+		add("%s launched from CUDA GRAPHS in %s, and Tier A (\"serialized\") PC sampling was "+
+			"selected — ONE graph launch fires ONE runtime callback for N kernels and "+
+			"gpu_exec_v1 carries no graph id, so those executions share one correlation and one "+
+			"CPU stack. Tier A's exact-launch attribution is FALSE here while still looking "+
+			"exact. It is withdrawn rather than downgraded: %d of %d executions in this "+
+			"snapshot carry gpu_graph_refused=\"true\", and %s had gpu_pc_attrib turned from "+
+			"\"exact\" to %q. Their durations and sample weights are real measurements and are "+
+			"kept; only the attribution claim is gone. The producer has also stopped opening "+
+			"bursts in that process. Re-run with --gpu-pc-sampling=continuous, which joins "+
+			"through the module rather than through the launch and is unaffected by graphs",
+			plural(snap.GraphExecutions, "kernel execution", "kernel executions"),
+			plural(snap.GraphExecProcesses, "process", "processes"),
+			snap.ExecutionsGraphRefused, execs,
+			plural(snap.PCJoin.GraphRefusedAttributions, "execution", "executions"),
+			PCAttribGraphRefused)
+		// The pre-refusal window, reported rather than left to be inferred.
+		// g_exec_from_graph is set from CUpti_ActivityKernel12.graphId on the
+		// ACTIVITY path, which arrives on the producer's drain tick — up to
+		// 100 ms, and one or two bursts, after the first graph kernel actually
+		// ran. Executions from that window are in this snapshot and ARE marked
+		// (the mark is a property of the process and applies to everything the
+		// Timeline holds for it, retroactively), so a caller that snapshots
+		// once at the end of a run loses nothing. A caller that snapshots
+		// PERIODICALLY has already emitted the earlier snapshots, and those
+		// executions left carrying gpu_pc_attrib="exact".
+		if snap.ExecutionsGraphRefused > 0 {
+			add("the graph refusal is RETROACTIVE within a snapshot but not across one — the " +
+				"producer learns an execution came from a graph on its activity drain, up to a " +
+				"drain interval after the kernel ran, so every execution this Timeline still " +
+				"held is marked above, but any snapshot already EMITTED before the first graph " +
+				"report arrived carries executions labelled gpu_pc_attrib=\"exact\" that this " +
+				"one would have refused. A run that snapshots once, at the end, has no such " +
+				"executions")
+		}
+	}
+	if snap.GraphExecUnscoped > 0 || snap.GraphExecTrackingCapped > 0 {
+		add("the CUDA-graph refusal lost its per-process scope (%d executions reported with no "+
+			"pid, %d processes past the tracker's bound) and now applies to EVERY execution in "+
+			"this snapshot — the safe direction, and a wider mark than the evidence supports; "+
+			"have the producer set the pid on gpu_dropped_v1, or profile fewer processes at once",
+			snap.GraphExecUnscoped, snap.GraphExecTrackingCapped)
 	}
 	if snap.SamplingWindowsOpen > 0 {
 		add("%s still open — the producer stopped reporting mid-burst (a hard exit), so the "+

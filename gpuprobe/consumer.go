@@ -438,20 +438,23 @@ type Stats struct {
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
-	// does not yet normalize. Launches, executions, sampled launches, kernel
-	// names, module loads, PC samples, the stall-reason map, sampling windows
-	// and the config record all have an applyBatch arm. gpu_dropped_v1
-	// (kindDropped) is the one kind the ABI defines that is still in the
-	// original class: it is decoded into batch.Drops and carried, and
-	// normalizing a drop class into an operator-visible number is the
-	// consumer task that follows this one. Everything else that reaches here
-	// is a kind the producer invented, or a KIND_* added on one side of the
-	// wire and not the other - both of which are silent loss unless counted.
+	// does not decode at all. EVERY kind the ABI defines now has an applyBatch
+	// arm: launches, executions, sampled launches, kernel names, module loads,
+	// PC samples, the stall-reason map, sampling windows, the config record
+	// and - since issue #94 gave the CUDA-graph refusal something to consume -
+	// gpu_dropped_v1. So anything that reaches here is a kind the producer
+	// invented, or a KIND_* added on one side of the wire and not the other,
+	// both of which are silent loss unless counted.
 	//
-	// Healthy: zero, and gate_test.go asserts it - the gate runs the stub
-	// without PERFAGENT_STUB_PC_SAMPLES, so no dropped batch is fired.
-	// Worst: equal to the record count of every batch of some kind the
-	// consumer cannot read, which is the ABI having drifted.
+	// The successor for the one kind that used to land here is
+	// DropsUnconsumed: a drop class this side decodes but does not yet act on
+	// is counted there rather than left to look like an unknown kind, because
+	// the two call for completely different responses.
+	//
+	// Healthy: zero, in every tier and on every producer, and gate_test.go
+	// asserts it as an equality. Worst: equal to the record count of every
+	// batch of some kind the consumer cannot read, which is the ABI having
+	// drifted.
 	Undecoded uint64
 	// Malformed counts ringbuf samples that did not decode: a short header,
 	// a payload shorter than the header claims, or a truncated record.
@@ -1200,6 +1203,56 @@ type Stats struct {
 	ConfigSamplingFactor uint32
 	ConfigSMCount        uint32
 	ConfigClockHz        uint64
+	// DropsDecoded counts gpu_dropped_v1 records read off the wire, of every
+	// class. It is the denominator for the two counters below: they partition
+	// it, so DropsDecoded == GraphExecReports + DropsUnconsumed exactly, and a
+	// class that reached the decoder and then vanished shows up as a
+	// shortfall rather than as nothing at all.
+	DropsDecoded uint64
+	// GraphExecReports counts gpu_dropped_v1 records carrying
+	// GPU_DROP_CLASS_GRAPH_EXEC, and GraphExecutions sums their counts: how
+	// many kernel executions the producer has reported as launched from a
+	// CUDA graph.
+	//
+	// GraphExecutions is the one to read, and it is the counter that makes
+	// Tier A's refusal auditable. A CUDA graph launch fires ONE runtime
+	// callback for N kernels and gpu_exec_v1 carries no graph id, so those N
+	// executions share one correlation — and Tier A's entire claim is exact
+	// launch attribution. Left unconsumed (which it was, until issue #94) the
+	// result is attribution that is exact-LOOKING and many-to-one, with every
+	// counter on this struct reading green.
+	//
+	// Healthy: EXACTLY ZERO, on any run of a workload that launches no CUDA
+	// graph. Non-zero the instant one is reported, which is the property that
+	// makes it assertable in both directions. Both counters are cumulative and
+	// neither is ever reset: the condition is a property of the process and
+	// does not stop holding.
+	//
+	// The records are also forwarded to the sink as gpu.GPUGraphExecutions,
+	// where Timeline withdraws Tier A's exact attribution for that process.
+	// Counting without forwarding would be a number in a struct nobody reads;
+	// forwarding without counting would make loss between here and the
+	// Timeline invisible. Both, so the two can be compared.
+	GraphExecReports uint64
+	GraphExecutions  uint64
+	// DropsUnconsumed counts gpu_dropped_v1 records whose drop class this
+	// phase decodes but does not yet act on: pc-dropped-hw, pc-buffer-full and
+	// pc-non-user-kernel (see internal/gpuabi's DropClass* and
+	// DropClassName). They are Tier B completeness and loss figures, and
+	// turning them into operator-visible numbers is a separate task; this
+	// counter is what keeps them from being silent in the meantime, exactly
+	// as Undecoded did before gpu_dropped_v1 had an applyBatch arm at all.
+	//
+	// It counts RECORDS, not the losses they describe. A record saying
+	// "17 samples were dropped" adds one here, not seventeen: the sum of the
+	// counts is a per-class figure and belongs with the per-class consumers
+	// that do not exist yet, while what this says is "three statements about
+	// loss arrived and nothing on this side read them".
+	//
+	// Healthy: zero from the CUPTI adapter on a clean run. Non-zero from the
+	// stub, which emits one record per class so that every class is reachable
+	// from a test.
+	DropsUnconsumed uint64
 	// PendingStallSamples and KnownStallNames are gauges: what the two
 	// stall-reason side tables hold right now. PendingStallSamples is also
 	// how many PC samples the consumer is currently holding back - see
@@ -1670,13 +1723,11 @@ type batch struct {
 	StallReasons    []gpuabi.StallReason
 	SamplingWindows []gpuabi.SamplingWindow
 	Configs         []gpuabi.Config
-	// Drops are decoded here and normalized in a later phase. The wire path
-	// had to exist before the shim could emit a drop class at all -- without
-	// it every class Tier B defines would be a counter that could not go
-	// non-zero -- but turning a class into an operator-visible number is the
-	// consumer task, not the producer one. Until that arm exists a dropped
-	// batch lands in applyBatch's default: case and is counted as
-	// Stats.Undecoded, so nothing about it is silent in the meantime.
+	// Drops are decoded here and dispatched by class in noteDropLocked.
+	// GPU_DROP_CLASS_GRAPH_EXEC is acted on - it arms Tier A's CUDA-graph
+	// refusal, issue #94 - and the three Tier B loss classes are counted in
+	// Stats.DropsUnconsumed until the task that turns each into an
+	// operator-visible number lands. Nothing here is silent either way.
 	Drops []gpuabi.Dropped
 }
 
@@ -2066,11 +2117,16 @@ func (c *Consumer) applyBatch(b batch) {
 			c.stats.Records++
 			c.noteConfigLocked(cfg)
 		}
+	case kindDropped:
+		for _, d := range b.Drops {
+			c.stats.Records++
+			c.noteDropLocked(b.PID, d)
+		}
 	default:
-		// Carried on the wire, not normalized. Counted, never silent.
-		// kindDropped is the only kind the ABI defines that still reaches
-		// here; see Stats.Undecoded for that, and for what it means when
-		// any other kind does.
+		// A kind neither side of the wire defines: carried, not normalized,
+		// counted, never silent. Every kind the ABI DOES define has an arm
+		// above, so reaching here is the ABI having drifted. See
+		// Stats.Undecoded.
 		c.stats.Undecoded += uint64(b.RawCount)
 	}
 }
@@ -2268,6 +2324,48 @@ func (c *Consumer) noteSamplingWindowLocked(pid uint32, w gpuabi.SamplingWindow,
 		Lost:        lost,
 	}
 	if err := c.cfg.Sink.EmitSamplingWindow(ev); err != nil {
+		c.stats.SinkRejected++
+	}
+}
+
+// noteDropLocked dispatches one gpu_dropped_v1 record by its class. Caller
+// holds mu.
+//
+// One class is ACTED ON here and the rest are counted: GPU_DROP_CLASS_GRAPH_EXEC
+// arms Tier A's CUDA-graph refusal (issue #94) and is forwarded to the sink,
+// while the three Tier B loss classes land in Stats.DropsUnconsumed until the
+// task that gives each an operator-visible number lands.
+//
+// That asymmetry is not arbitrary. The other three describe LOSS - samples the
+// hardware discarded, a buffer that filled, device time this mechanism
+// structurally cannot see - and loss under-reports a profile, which is bad and
+// is visible as a shortfall. The graph class describes something worse and
+// entirely different: a claim that is FALSE while looking like the strongest
+// answer the pipeline can give. A graph launch fires one runtime callback for
+// N kernels and gpu_exec_v1 carries no graph id, so N executions share one
+// correlation and Tier A bills N kernels to one call site with
+// gpu_join="exact", gpu_pc_attrib="exact" and every counter green. It cannot
+// wait for the general treatment of drop classes, because the whole point of
+// the class is to stop a tier from running.
+//
+// pid is the batch header's - the process that fired the probe - which is what
+// scopes the refusal. A graph-using process in a system-wide profile must not
+// withdraw the exact attribution of every other process being profiled beside
+// it.
+func (c *Consumer) noteDropLocked(pid uint32, d gpuabi.Dropped) {
+	c.stats.DropsDecoded++
+	if d.Class != gpuabi.DropClassGraphExec {
+		c.stats.DropsUnconsumed++
+		return
+	}
+	c.stats.GraphExecReports++
+	c.stats.GraphExecutions += d.Count
+	ev := gpu.GPUGraphExecutions{
+		Backend: c.cfg.Backend,
+		PID:     pid,
+		Count:   d.Count,
+	}
+	if err := c.cfg.Sink.EmitGraphExecutions(ev); err != nil {
 		c.stats.SinkRejected++
 	}
 }

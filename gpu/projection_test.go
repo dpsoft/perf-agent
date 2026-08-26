@@ -661,12 +661,12 @@ func TestSrcFileBaseRejectsWhatIsNotAName(t *testing.T) {
 	}
 }
 
-// TestProjectionEmitsAllFourPCAttribValues walks the enum itself rather than a
-// hand-copied list, so a fifth value added to PCAttribs() without a projection
-// case fails here rather than shipping as a label nobody rendered.
-func TestProjectionEmitsAllFourPCAttribValues(t *testing.T) {
+// TestProjectionEmitsEveryPCAttribValue walks the enum itself rather than a
+// hand-copied list, so a value added to PCAttribs() without a projection case
+// fails here rather than shipping as a label nobody rendered.
+func TestProjectionEmitsEveryPCAttribValue(t *testing.T) {
 	attribs := PCAttribs()
-	require.Len(t, attribs, 4)
+	require.Len(t, attribs, 5)
 
 	views := make([]ExecutionView, 0, len(attribs))
 	for _, a := range attribs {
@@ -686,7 +686,7 @@ func TestProjectionEmitsAllFourPCAttribValues(t *testing.T) {
 // TestProjectionPCAttribIsNeverSilentlyAbsent is the honesty half of the
 // label. A view carrying PC samples with no attribution is a join bug; the
 // projection must make that visible rather than omit the label, because an
-// absent gpu_pc_attrib is readable as "exact" - the only one of the four that
+// absent gpu_pc_attrib is readable as "exact" - the only one of the five that
 // claims vendor-provided truth - by a consumer who does not know to check.
 //
 // Mutation this catches: `if view.PCAttrib != "" { labels[...] = ... }`.

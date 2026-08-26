@@ -55,6 +55,29 @@ type ExecutionView struct {
 	// unconditional label exists to prevent. The type's zero value is
 	// "unknown" for the same reason (see SerializationState).
 	Serialized SerializationState `json:"serialized"`
+
+	// GraphRefused is the CUDA-graph refusal: this execution came from a
+	// process the producer reported launching kernels from a CUDA graph, and
+	// Tier A ("serialized") PC sampling was selected for the run. Tier A's
+	// whole claim is exact launch attribution, and one graph launch fires one
+	// runtime callback for N kernels, so that claim is false here — while
+	// looking exactly like the strongest answer the pipeline can give.
+	//
+	// It is FALSE in Tier B and with PC sampling off, always, however many
+	// graph executions were reported. Tier B joins through the module and not
+	// through the launch, so nothing about it is false in a graph-using
+	// process; marking it would be a false alarm that devalues the real one.
+	// See Timeline.isGraphRefusedLocked.
+	//
+	// It is `omitempty` where Serialized deliberately is not, and the
+	// difference is which way absence reads. An absent gpu_serialized would
+	// read as "not perturbed", a positive claim nobody made. An absent
+	// GraphRefused reads as "no graph was reported", which is the ordinary and
+	// overwhelmingly common state and is what the field's zero value means.
+	// The loudness lives where it can be counted rather than inferred:
+	// Snapshot.ExecutionsGraphRefused, PCJoinStats.GraphRefusedAttributions
+	// and the standing joinhealth anomaly.
+	GraphRefused bool `json:"graph_refused,omitempty"`
 }
 
 // TimelineDropStats counts what Timeline's own bounded storage evicted.
@@ -207,6 +230,68 @@ type Snapshot struct {
 	ExecutionsSerialized           uint64 `json:"executions_serialized,omitempty"`
 	ExecutionsNotSerialized        uint64 `json:"executions_not_serialized,omitempty"`
 	ExecutionsSerializationUnknown uint64 `json:"executions_serialization_unknown,omitempty"`
+
+	// ---- The CUDA-graph refusal (Tier A).
+
+	// GraphExecutions is the CUMULATIVE number of kernel executions the
+	// producer has reported as launched from a CUDA graph — the agent's side
+	// of GPU_DROP_CLASS_GRAPH_EXEC. See GPUGraphExecutions for why one graph
+	// launch makes Tier A's exact attribution false for N kernels at once.
+	//
+	// It is populated in EVERY tier, and it is only an ANOMALY under Tier A.
+	// On a Tier B run it is information: Tier B joins through the module
+	// rather than through the launch and is unaffected, so a non-zero value
+	// there says the workload uses graphs and nothing more. joinhealth raises
+	// it only when the tier makes it matter, which is what keeps the word
+	// "anomaly" worth reading.
+	//
+	// ZERO on any run of a process that launches no CUDA graph. Non-zero the
+	// moment one is reported. TierAGraphRefused() is the derived question.
+	GraphExecutions uint64 `json:"graph_executions,omitempty"`
+
+	// GraphExecProcesses counts distinct processes that reported any. It is
+	// the denominator an operator needs before deciding whether the refusal is
+	// about the workload they care about or about a neighbour in a
+	// system-wide profile.
+	GraphExecProcesses uint64 `json:"graph_exec_processes,omitempty"`
+
+	// GraphExecUnscoped and GraphExecTrackingCapped are the two ways the
+	// refusal loses its per-process scope and widens to every execution the
+	// Timeline holds: a report that named no process (PID 0), and the
+	// per-process tracker being full.
+	//
+	// Both widen rather than narrow, which is the opposite of how the
+	// multi-device tracker resolves its own cap and is deliberate: there,
+	// absence of evidence for a second device is not evidence of one; here the
+	// evidence already exists and only its scope is missing, so discarding it
+	// would throw away a proven refusal. They are counted because an operator
+	// looking at a profile where every process is marked graph-refused needs
+	// to be able to tell "they all used graphs" from "we stopped being able to
+	// say which one did". Zero on any ordinary run.
+	GraphExecUnscoped       uint64 `json:"graph_exec_unscoped,omitempty"`
+	GraphExecTrackingCapped uint64 `json:"graph_exec_tracking_capped,omitempty"`
+
+	// ExecutionsGraphRefused counts executions in THIS snapshot whose
+	// ExecutionView.GraphRefused is set — every execution of a graph-affected
+	// process, PC-bearing or not, because one graph launch damages the launch
+	// attribution of N kernels whether or not any of them was sampled.
+	//
+	// It is zero in Tier B and with sampling off however large GraphExecutions
+	// is. PCJoinStats.GraphRefusedAttributions is the strictly smaller subset
+	// whose gpu_pc_attrib was withdrawn from "exact".
+	ExecutionsGraphRefused uint64 `json:"executions_graph_refused,omitempty"`
+}
+
+// TierAGraphRefused reports whether Tier A's exact-launch attribution has been
+// withdrawn for this run: the "serialized" tier was selected AND at least one
+// CUDA-graph execution was reported.
+//
+// It is a method rather than a field so it cannot disagree with the two facts
+// it is derived from — a stored bool that a copy, a hand-built Snapshot or a
+// forgotten assignment could leave false while GraphExecutions was non-zero
+// would be a silent downgrade wearing the shape of the refusal.
+func (s Snapshot) TierAGraphRefused() bool {
+	return s.PCSampling == PCSamplingSerialized && s.GraphExecutions > 0
 }
 
 // TimelineConfig configures Timeline's storage bounds.
@@ -537,6 +622,42 @@ type Timeline struct {
 	windows    *windowStore
 	pcSampling PCSamplingTier
 
+	// ---- The CUDA-graph refusal (Tier A).
+	//
+	// graphExecsByPID records, per process, how many kernel executions the
+	// producer has reported as launched from a CUDA graph (GPUGraphExecutions,
+	// the agent's side of GPU_DROP_CLASS_GRAPH_EXEC). A process with a
+	// non-zero entry has had Tier A's exact-launch claim WITHDRAWN: see
+	// isGraphRefusedLocked.
+	//
+	// Per process, and cumulative, for the same two reasons devicesByPID is
+	// both. Per process because PC-sampling collection mode is a property of
+	// the profiled process — one graph-using process in a system-wide profile
+	// must not withdraw the exact attribution of every other one. Cumulative
+	// because the condition is a property of the process and does not stop
+	// holding: a process that ran a graph in an earlier snapshot has not
+	// un-run it, and a per-snapshot latch would clear the mark on exactly the
+	// snapshots where no graph report happened to arrive, which is the
+	// reading-green-when-worst failure this project keeps hitting.
+	//
+	// graphExecAllPIDs is the overflow and the unattributable case, and it
+	// resolves in the OPPOSITE direction to the device tracker's cap. There,
+	// an untracked process is treated as single-device, because absence of
+	// evidence for a second device is not evidence of one. Here, evidence
+	// exists and only its scope is unknown, so treating it as "no process"
+	// would discard a refusal that has already been proven — the one outcome
+	// that must never be reachable. It is set when a report names no process
+	// (PID 0) and when the map is full, and it makes every execution in the
+	// Timeline graph-refused under Tier A. Both causes are counted, in
+	// graphExecUnscoped and graphExecTrackingCapped, so an operator reading a
+	// profile where everything is marked can tell which happened.
+	graphExecsByPID         map[uint32]uint64
+	graphExecTotal          uint64
+	graphExecProcesses      uint64
+	graphExecUnscoped       uint64
+	graphExecTrackingCapped uint64
+	graphExecAllPIDs        bool
+
 	dropped TimelineDropStats
 }
 
@@ -678,6 +799,8 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 
 		windows:    newWindowStore(cfg.MaxSamplingWindowsPerPID, cfg.MaxSamplingWindowPIDs),
 		pcSampling: cfg.PCSampling,
+
+		graphExecsByPID: make(map[uint32]uint64),
 	}
 }
 
@@ -696,6 +819,78 @@ func (t *Timeline) EmitSamplingWindow(w GPUSamplingWindow) error {
 	t.dropped.EvictedSamplingWindows += t.windows.evicted - before
 	return nil
 }
+
+// EmitGraphExecutions records the producer's report that N executions in a
+// process were launched from a CUDA graph — the event that arms Tier A's
+// refusal.
+//
+// Accepted in EVERY tier, exactly as EmitSamplingWindow is, and for the same
+// reason: a producer that is reporting graph executions is reporting a fact
+// about the workload, and dropping the evidence because this agent's own
+// configuration disagrees would leave the two ends silently out of step. What
+// TimelineConfig.PCSampling gates is the CONSEQUENCE — only Tier A's claim is
+// false — not the ingest. So Snapshot.GraphExecutions is populated on a Tier B
+// run too, where it is information and not an anomaly.
+//
+// A report carrying Count == 0 arms nothing. The producer emits deltas and a
+// zero delta is not evidence; latching on the record's mere arrival would make
+// a producer that says "no graphs yet" indistinguishable from one that says
+// "graphs".
+func (t *Timeline) EmitGraphExecutions(g GPUGraphExecutions) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if g.Count == 0 {
+		return nil
+	}
+	t.graphExecTotal += g.Count
+
+	// PID 0: the producer saw graph executions but could not say whose. The
+	// evidence is real and only its scope is missing, so it widens to every
+	// process rather than being discarded. See the graphExecAllPIDs comment.
+	if g.PID == 0 {
+		t.graphExecUnscoped += g.Count
+		t.graphExecAllPIDs = true
+		return nil
+	}
+	if _, ok := t.graphExecsByPID[g.PID]; !ok {
+		if len(t.graphExecsByPID) >= maxTrackedGraphProcesses {
+			t.graphExecTrackingCapped++
+			t.graphExecAllPIDs = true
+			return nil
+		}
+		t.graphExecProcesses++
+	}
+	t.graphExecsByPID[g.PID] += g.Count
+	return nil
+}
+
+// isGraphRefusedLocked reports whether Tier A's exact-launch attribution must
+// be withdrawn for this process's executions.
+//
+// The tier check is the whole of the Tier A / Tier B asymmetry and it belongs
+// here rather than at the call sites, so that a future caller cannot forget
+// it. Tier B (PCSamplingContinuous) joins a PC sample through the module —
+// cubin CRC and function index to a device function name — and never through
+// the launch, so a graph-launched kernel resolves to its own kernel exactly as
+// any other does. Nothing about Tier B is false in a graph-using process, and
+// marking it would be a false alarm that devalues the real one. With PC
+// sampling off there is no attribution claim to withdraw at all.
+//
+// Caller holds t.mu.
+func (t *Timeline) isGraphRefusedLocked(pid uint32) bool {
+	if t.pcSampling != PCSamplingSerialized {
+		return false
+	}
+	return t.graphExecAllPIDs || t.graphExecsByPID[pid] > 0
+}
+
+// maxTrackedGraphProcesses bounds Timeline.graphExecsByPID. It is the same
+// number as maxTrackedDeviceProcesses and for the same reason (a system-wide
+// profile has no a-priori bound on distinct pids), but it is its own constant
+// because the two maps overflow in OPPOSITE directions — see the
+// graphExecAllPIDs comment — and a shared constant would invite a reader to
+// assume shared behaviour.
+const maxTrackedGraphProcesses = 4096
 
 // isPendingLiveLocked answers orderedFIFO's isLive callback for pendingOrder:
 // a position is live only if t.pending still holds an entry for id stamped
@@ -1141,7 +1336,11 @@ func (t *Timeline) joinPendingModuleLocked(execs []GPUKernelExec, execSamples []
 			res.stats.AmbiguousAttributions++
 		case PCAttribKernelMultiDevice:
 			res.stats.MultiDeviceAttributions++
-		case PCAttribExact, PCAttribKernel:
+		// PCAttribGraphRefused cannot appear here and must not be produced
+		// here. This is the module-keyed join, which is exactly the path a
+		// CUDA graph does not damage; the refusal replaces PCAttribExact in
+		// Snapshot, over the correlation-keyed population only.
+		case PCAttribExact, PCAttribKernel, PCAttribGraphRefused:
 		}
 	}
 	res.stats.AttributedKernel = res.samples
@@ -1302,6 +1501,25 @@ func (t *Timeline) Snapshot() Snapshot {
 	windowsReceived := t.windows.received
 	windowsHeld, windowsOpen := t.windows.windows()
 	pcSampling := t.pcSampling
+
+	// The CUDA-graph refusal, classified under the same lock and by the same
+	// rule as the serialization disclosure above: a per-execution answer, read
+	// from cumulative per-process evidence, taken once here so the join loop
+	// below cannot forget to ask.
+	//
+	// isGraphRefusedLocked returns false for every execution in Tier B and
+	// with sampling off, so this slice is all-false there and nothing
+	// downstream is marked. That is the asymmetry, not an optimisation: Tier B
+	// attributes through the module rather than through the launch and is
+	// genuinely unaffected by graphs.
+	graphRefused := make([]bool, len(execs))
+	for i, exec := range execs {
+		graphRefused[i] = t.isGraphRefusedLocked(exec.Correlation.PID)
+	}
+	graphExecTotal := t.graphExecTotal
+	graphExecProcesses := t.graphExecProcesses
+	graphExecUnscoped := t.graphExecUnscoped
+	graphExecTrackingCapped := t.graphExecTrackingCapped
 	t.mu.Unlock()
 
 	// The heuristic's candidate set is built lazily - only once the loop
@@ -1360,8 +1578,21 @@ func (t *Timeline) Snapshot() Snapshot {
 	// identity (the three equal len(Executions)) hold by construction rather
 	// than by remembering to count in each branch.
 	var serializedCount, notSerializedCount, serializationUnknownCount uint64
+	// executionsGraphRefused is counted over EVERY execution of a
+	// graph-affected process, PC-bearing or not — the same scope gpu_join and
+	// gpu_serialized ride on. PCJoinStats.GraphRefusedAttributions is the
+	// strictly smaller subset whose gpu_pc_attrib was withdrawn from "exact".
+	// One graph launch damages the launch attribution of N kernels whether or
+	// not any of them happened to be sampled, so a count restricted to the
+	// sampled ones would understate the condition by the sampling factor.
+	var executionsGraphRefused uint64
 	for i, exec := range execs {
-		view := ExecutionView{Exec: exec, PCSamples: execSamples[i], Serialized: serialization[i]}
+		view := ExecutionView{
+			Exec:         exec,
+			PCSamples:    execSamples[i],
+			Serialized:   serialization[i],
+			GraphRefused: graphRefused[i],
+		}
 		// gpu_pc_attrib, decided entirely by which index served this
 		// execution. It is set independently of view.Join and view.Ambiguous
 		// below and never reads or writes either: an execution can be joined
@@ -1373,6 +1604,36 @@ func (t *Timeline) Snapshot() Snapshot {
 			view.PCAttrib = PCAttribExact
 		case len(view.PCSamples) > 0:
 			view.PCAttrib = pcJoin.attribAt(i)
+		}
+		// The CUDA-graph refusal, applied to gpu_pc_attrib. It replaces
+		// PCAttribExact and ONLY PCAttribExact.
+		//
+		// "exact" means the sample carried a vendor correlation and joined
+		// through it — one launch, one execution, vendor-provided truth. A
+		// graph launch fires one callback for N kernels, so in a graph-using
+		// process that correlation is shared by N executions and the word is
+		// false while still looking like the strongest answer available. It is
+		// withdrawn.
+		//
+		// The module-keyed values (kernel, kernel-ambiguous,
+		// kernel-multidevice) are left exactly as they are, which is the Tier
+		// B asymmetry made concrete at the label: those samples reached this
+		// execution through the cubin and the function index, never through
+		// the launch, so a graph changed nothing about how much they can be
+		// trusted. Downgrading them would weaken Tier B for a condition that
+		// does not affect it — and would bury the executions where the claim
+		// really did become false among ones where it did not.
+		//
+		// This is not worsePCAttrib's rank order. Rank exists to reconcile two
+		// pending groups of differing quality landing on one execution; this
+		// is a targeted replacement of one specific claim, which is why
+		// PCAttribGraphRefused is never reached by ranking.
+		if view.GraphRefused && view.PCAttrib == PCAttribExact {
+			view.PCAttrib = PCAttribGraphRefused
+			pcJoin.stats.GraphRefusedAttributions++
+		}
+		if view.GraphRefused {
+			executionsGraphRefused++
 		}
 		switch view.Serialized {
 		case SerializationSerialized:
@@ -1500,6 +1761,12 @@ func (t *Timeline) Snapshot() Snapshot {
 		ExecutionsSerialized:           serializedCount,
 		ExecutionsNotSerialized:        notSerializedCount,
 		ExecutionsSerializationUnknown: serializationUnknownCount,
+
+		GraphExecutions:         graphExecTotal,
+		GraphExecProcesses:      graphExecProcesses,
+		GraphExecUnscoped:       graphExecUnscoped,
+		GraphExecTrackingCapped: graphExecTrackingCapped,
+		ExecutionsGraphRefused:  executionsGraphRefused,
 	}
 }
 

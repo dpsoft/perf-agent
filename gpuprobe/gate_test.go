@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,9 @@ import (
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
+	"github.com/dpsoft/perf-agent/internal/cubin"
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/ehcompile"
 )
@@ -1237,4 +1241,803 @@ func TestADlopenedProducerEnrollsBeforeItsFirstLaunch(t *testing.T) {
 	// it. Asserting an underived number is how a gate goes green while
 	// proving nothing, which is the failure this whole test exists to
 	// correct; the DWARF assertion above is the derived one.
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: the PC-sampling gate
+// ---------------------------------------------------------------------------
+
+// gateCRCAbsent is a CRC no cubin is ever stored under, so a PC sample
+// carrying it must read gpu_src_status="no-module". The two REAL fixture CRCs
+// are not constants here: they are read out of the producer's own report and
+// cross-checked against the bytes, so the number the store keys on is the
+// number the producer put on the wire rather than one this test invented. See
+// gateModuleCRCs.
+const gateCRCAbsent uint64 = 0x6A7E0003
+
+// TestStubDrivesPCSamplingToPprofWithoutAGPU is the end-to-end half of the
+// Phase 6 phase gate (Task 13, assertions 1-5, 8, 9 and 12), driven by the
+// same GPU-free producer TestStubDrivesThePipelineToPprofWithoutAGPU uses.
+//
+// It is a SECOND test rather than an extension of that one, deliberately. That
+// test asserts an exact sampled count, reached-root == dwarf, zero abandoned,
+// NoTables == 0 and a dozen other equalities that describe a run with PC
+// sampling OFF - `require.Len(samples, len(snap.Executions))` among them, which
+// is true precisely because the stub emits no PC samples there. Turning PC
+// sampling on inside it would have meant weakening those. So the baseline stays
+// exactly as it was and this runs the same producer in the PC-sampling
+// configuration beside it.
+//
+// # What comes off the wire, and what does not
+//
+// Off the wire, from a real producer through a real uprobe_multi link:
+//
+//   - 500 launches and 500 executions, 58 of the launches carrying a CPU stack
+//     walked through two -fomit-frame-pointer frames using this consumer's own
+//     compiled CFI, symbolized against the live process;
+//   - two real checked-in cubins, over the cubin channel, as sealed memfds
+//     passed by SCM_RIGHTS;
+//   - 64 PC-sample records, a stall-reason map, a config record and Tier A
+//     sampling windows.
+//
+// NOT off the wire, and this is a finding rather than a shortcut - see
+// .superpowers/sdd/task-13-gate-report.md:
+//
+//	The stub's PC records cannot be attributed to anything. Their cubin_crc is
+//	a pair of synthetic constants (shim/stub/stub.cc kStubCubinCRC =
+//	{0xC0FFEE01, 0xC0FFEE02}) unrelated to the cubins the same run delivers
+//	over the cubin channel, and their correlation is 0 in every tier. Tier B
+//	attribution runs crc -> module -> function name -> the execution's
+//	KernelName, and the stub's kernel names are "kernel_1111"/"kernel_2222"
+//	while the fixtures' only functions are the CUDA kernels they were compiled
+//	from. So neither join path can fire: every one of those 64 records is
+//	correctly counted as pending, and the gate asserts that exactly.
+//
+// Assertions 2, 3, 4 and 9 need a PC sample that DOES reach an execution, so
+// the gate supplies those itself at Timeline.EmitPCSample - the same entry
+// point the consumer calls - on correlations that a real, wire-delivered,
+// stack-carrying launch is known to occupy. Everything downstream of that entry
+// point is product code: the join, the module store's four-valued resolution,
+// the projection's label set, the cardinality budget. What the injection skips
+// is the consumer's decode arm for KIND_PC, and that is asserted separately and
+// exactly by the 64 records above.
+//
+// # Assertion 11 is not here
+//
+// getcap on the gate binary is asserted in gate_compose_test.go, where it runs
+// without capabilities. Asserting "this pipeline needs no cap_sys_admin" only
+// on machines that hold enough privilege to run this test would be asserting it
+// in the one place it cannot be checked usefully.
+func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
+	if !hasGateCaps() {
+		t.Skip("needs CAP_BPF, CAP_PERFMON and CAP_CHECKPOINT_RESTORE " +
+			"(the last so blazesym can follow /proc/<pid>/map_files/); " +
+			"sudo setcap cap_bpf,cap_perfmon,cap_checkpoint_restore+ep <test binary>. " +
+			"gpu/gate_test.go and gpuprobe/gate_compose_test.go assert the same twelve " +
+			"points without privilege; this adds the end-to-end run")
+	}
+	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
+	requireBuilt(t, built)
+	requireFPLess(t, built)
+	stub := privateStubCopy(t, built)
+
+	// The module store. It is built HERE, and filled after the run from the
+	// CRCs the PRODUCER declared, rather than by the consumer - and that is
+	// the second finding this gate records rather than papers over:
+	//
+	//	The cubin listener's sink is gpuprobe's own bounded memCubinStore
+	//	(gpuprobe/cubin.go). Nothing in gpuprobe, in gpu, or in
+	//	cmd/gpu-cuda-profile ever hands a gpu.ModuleStore to gpuprobe.Config
+	//	or to gpu.ProjectionConfig. The bytes cross the socket, are sealed,
+	//	verified and stored - and stop there. As shipped, every PC sample in a
+	//	real profile therefore reads gpu_src_status="no-module".
+	//
+	// CubinsReceived and snap.Modules are asserted below so the transport half
+	// is still proven end to end on this run, and the missing hop is one named
+	// gap rather than an invisible one.
+	lineInfo := readFixture(t, "single_lineinfo.cubin")
+	noLineInfo := readFixture(t, "single_nolineinfo.cubin")
+	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
+	lineIdx := fixtureSymIndex(t, lineInfo, "addOne")
+	noLineIdx := fixtureSymIndex(t, noLineInfo, "addOne")
+
+	sym, err := symbolize.NewLocalSymbolizer()
+	require.NoError(t, err)
+	defer func() { _ = sym.Close() }()
+
+	// PCSamplingSerialized, not the zero value: the tier is what decides
+	// whether an execution with no covering window reads "unknown" or "false",
+	// and a Timeline told nothing would answer "false" for every execution in
+	// this run - correctly, since nothing would then have been serialized, and
+	// uselessly, since the producer IS emitting windows.
+	timeline := gpu.NewTimeline(gpu.TimelineConfig{
+		PCSampling: gpu.PCSamplingSerialized,
+		Modules:    store,
+	})
+	c, err := gpuprobe.Attach(gpuprobe.Config{
+		ShimPath:   stub,
+		Backend:    gpu.GPUBackendID("stub"),
+		Sink:       timeline,
+		Symbolizer: sym,
+	})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	require.True(t, c.Stats().CubinsListening,
+		"the cubin channel did not bind, so no module can arrive and every source label would read no-module for a reason that has nothing to do with this phase: %q",
+		c.Stats().CubinsLastError)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	const (
+		wantSampled  = 58 // gpuabi.SampleSchedule(500, 8, DefaultSampleSeed)
+		wantPC       = 64
+		wantWindows  = 4
+		wantCubins   = 2
+		wantDropRecs = 4 // one gpu_dropped_v1 per drop class, from the stub
+	)
+	cmd := exec.Command(stub, "500", "1000", "8", "10000")
+	cmd.Env = append(os.Environ(),
+		// The tier is the OUTER gate in the stub exactly as in the CUPTI
+		// adapter (shim/core/pctier.h): with it off, none of the four
+		// PC-sampling probes fires whatever the knobs below say.
+		"PERFAGENT_GPU_PC_SAMPLING=serialized",
+		"PERFAGENT_STUB_PC_SAMPLES="+strconv.Itoa(wantPC),
+		"PERFAGENT_STUB_SAMPLING_WINDOWS="+strconv.Itoa(wantWindows),
+		"PERFAGENT_STUB_CUBINS="+
+			mustAbs(t, fixturePath("single_lineinfo.cubin"))+":"+
+			mustAbs(t, fixturePath("single_nolineinfo.cubin")),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	release, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	defer func() { _ = release.Close() }()
+
+	// Hold the producer open until every sampled stack has been symbolized
+	// against its still-live /proc/<pid>/maps, exactly as the baseline gate
+	// does. The cubins are waited for too: the stub offers them from its drain
+	// thread before its first launch, so they are the earliest thing to
+	// arrive, and a run that started asserting before they landed would report
+	// "no-module" for a scheduling reason.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		st := c.Stats()
+		if st.SampledLaunches >= wantSampled && st.CubinsReceived >= wantCubins {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = release.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			cancel()
+			<-done
+			t.Fatalf("timed out: sampled=%d/%d cubins=%d/%d. stats: %+v stderr: %s",
+				st.SampledLaunches, wantSampled, st.CubinsReceived, wantCubins, st, stderr.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stubPID := cmd.Process.Pid
+	require.NoError(t, release.Close())
+	require.NoError(t, cmd.Wait(), "stdout: %s stderr: %s", stdout.String(), stderr.String())
+	stubErr := stderr.String()
+
+	// The CRC the producer declared for each fixture, from its own report, and
+	// the store keyed on those rather than on numbers this test chose.
+	//
+	// This is the offline half of hardware assertion 13 ("cuptiGetCubinCrc()
+	// over the received copy equals the PC records' cubinCrc"). The stub's
+	// crc is FNV-1a rather than CUPTI's unpublished polynomial, but the
+	// property under test is the same one and it is the one the join needs:
+	// ONE number identifies one set of bytes, and the same number reaches both
+	// ends. Recomputing it here over the checked-in fixture proves the number
+	// is a function of the bytes and not of the load order, the module id or
+	// the path.
+	crcs := gateModuleCRCs(t, stubErr)
+	require.Len(t, crcs, 2, "the producer reported %d captured modules, not 2: %s", len(crcs), stubErr)
+	gateCRCLineInfo, gateCRCNoLineInfo := crcs[0], crcs[1]
+	assert.Equal(t, stubCubinCRC(lineInfo), gateCRCLineInfo,
+		"the CRC the producer declared for single_lineinfo.cubin is not a content hash of those bytes, so it cannot identify them on the wire")
+	assert.Equal(t, stubCubinCRC(noLineInfo), gateCRCNoLineInfo,
+		"same, for single_nolineinfo.cubin")
+	assert.NotEqual(t, gateCRCLineInfo, gateCRCNoLineInfo,
+		"two different cubins collided on one CRC, which would make them indistinguishable to the store")
+	require.NoError(t, store.Put(gateCRCLineInfo, lineInfo))
+	require.NoError(t, store.Put(gateCRCNoLineInfo, noLineInfo))
+
+	// The tail: PC batches, the stall map, the config record, the windows and
+	// the drop records are all flushed after the last launch, so they are the
+	// last things on the wire.
+	waitFor(t, 10*time.Second, func() bool {
+		st := c.Stats()
+		return st.PCSamplesDecoded >= wantPC &&
+			st.SamplingWindowsDecoded > 0 &&
+			st.ConfigsDecoded > 0 &&
+			st.PendingStallSamples == 0
+	}, func() string {
+		st := c.Stats()
+		return fmt.Sprintf("pc=%d/%d windows=%d configs=%d pending-stall=%d stderr: %s",
+			st.PCSamplesDecoded, wantPC, st.SamplingWindowsDecoded, st.ConfigsDecoded,
+			st.PendingStallSamples, stubErr)
+	})
+	cancel()
+	<-done
+
+	stats := c.Stats()
+	t.Logf("stub stderr:\n%s", stubErr)
+	t.Logf("pc sampling: pc=%d modules=%d stall-names=%d windows=%d(open=%d) configs=%d cubins=%d/%dB undecoded=%d",
+		stats.PCSamplesDecoded, stats.ModulesDecoded, stats.StallNamesLearned,
+		stats.SamplingWindowsDecoded, stats.SamplingWindowsOpen, stats.ConfigsDecoded,
+		stats.CubinsReceived, stats.CubinBytesReceived, stats.Undecoded)
+
+	// ---- the transport, and the producer's own account of it --------------
+	assert.Contains(t, stubErr, "pc_sampling=serialized",
+		"the producer did not take the tier it was handed, so nothing below describes Tier A")
+	assert.Contains(t, stubErr, "launch_dropped=0")
+	assert.Contains(t, stubErr, "exec_dropped=0")
+	assert.Zero(t, stats.SequenceGaps, "no batch may be lost silently")
+	assert.Zero(t, stats.Malformed, "reasons: %v", stats.DecodeFailures)
+	assert.Zero(t, stats.KernelDropped)
+	assert.Zero(t, stats.SinkRejected)
+
+	// Assertion 12. Undecoded is zero for every kind THIS PHASE DECODES, and
+	// gpu_dropped_v1 is not one of them: it is decoded into batch.Drops and
+	// carried, and normalizing a drop class into an operator-visible number is
+	// the consumer task after this one (see Stats.Undecoded's own comment). The
+	// stub emits exactly one record per drop class when PC sampling is on, so
+	// this is an equality rather than a tolerance - a sixth undecoded record
+	// would mean a kind arrived that nothing on this side knows about, which is
+	// silent loss.
+	assert.Equal(t, uint64(wantDropRecs), stats.Undecoded,
+		"the only undecoded records in a PC-sampling stub run are the four gpu_dropped_v1 class records; anything else is a KIND_* added on one side of the wire and not the other")
+	assert.Equal(t, uint64(wantPC), stats.PCSamplesDecoded,
+		"every PC record the stub emitted must have been decoded, not carried")
+	assert.Equal(t, uint64(wantCubins), stats.CubinsReceived,
+		"both checked-in cubins must have crossed the cubin channel: err=%q", stats.CubinsLastError)
+	assert.Equal(t, uint64(2), stats.ModulesDecoded,
+		"gpu_module_load_v1 announces the load; the bytes travel separately, and both must arrive")
+	assert.Zero(t, stats.CubinsRejectedUnsealed, "a sealed memfd was refused: %q", stats.CubinsLastError)
+	assert.Zero(t, stats.CubinsRejectedTooLarge)
+	assert.Zero(t, stats.CubinsRejectedMalformed)
+	assert.Zero(t, stats.CubinsRejectedUnauthorized)
+	assert.Zero(t, stats.CubinsThrottled, "two offers cannot exhaust the cubin bucket")
+	// The isolation property, on a live run rather than in the unit test that
+	// proves it structurally (gate_compose_test.go assertion 10): real cubin
+	// traffic crossed while a real enrolment happened, and the enrolment's own
+	// counters are untouched.
+	assert.Zero(t, stats.UnwindEnrollThrottled,
+		"cubin traffic spent an enrolment admission token: %q", stats.UnwindEnrollLastError)
+	assert.Equal(t, uint64(1), stats.UnwindEnrollConfirmed)
+	assert.Zero(t, stats.StacksWalkedNoTables,
+		"a capture was walked with no CFI tables: enroll requests=%d confirmed=%d err=%q",
+		stats.UnwindEnrollRequests, stats.UnwindEnrollConfirmed, stats.UnwindEnrollLastError)
+
+	// Stall names: the stub emits the map AFTER the batches on purpose, so
+	// these two zeros are the assertion that the consumer held the samples
+	// rather than rendering "stall#17" or dropping them.
+	assert.Zero(t, stats.StallNamesMissing,
+		"a PC sample carried a stall index the map never named; the label would then be empty")
+	assert.Zero(t, stats.PendingStallSamples,
+		"PC samples are still parked waiting for a stall name that has arrived")
+	// The gauge, not the counter: the stall map replays on the attach edge
+	// (spec §6.1's replay contract), so StallNamesLearned counts RECORDS and a
+	// replayed map legitimately doubles it. What must be exactly 8 is the
+	// number of distinct indexes the table ends up holding.
+	assert.Equal(t, 8, stats.KnownStallNames,
+		"the stub's synthetic GA102 table has 8 entries; a shortfall means a name was evicted or never interned")
+	assert.GreaterOrEqual(t, stats.StallNamesLearned, uint64(8))
+	assert.Zero(t, stats.StallNamesEvicted,
+		"an 8-entry table cannot overflow the default bound; an eviction here costs PC samples their stall label")
+
+	// Tier B's own signature, kept apart from the aggregate: every PC record
+	// in CONTINUOUS collection has correlation 0, so ZeroCorrelation stops
+	// being an anomaly signal for that population and this counter is what
+	// carries it instead.
+	assert.Equal(t, uint64(wantPC), stats.PCSamplesWithoutCorrelation,
+		"the stub emits correlation 0 on every PC record, in both tiers")
+
+	// ---- the injected samples ---------------------------------------------
+	//
+	// See the doc comment: the stub cannot produce a PC record that attributes
+	// to anything, so assertions 2, 3, 4 and 9 are driven from records the gate
+	// emits into the same Timeline the consumer emits into, on correlations
+	// that a wire-delivered, stack-carrying launch occupies.
+	//
+	// SampleSchedule replays the shim's own sampler exactly (it is pinned
+	// against it by TestTheGoReplicaMatchesTheShimSampler), so these
+	// correlations are not guesses: launch ordinal N carries correlation N+1
+	// and, if N is in the schedule, a CPU stack.
+	sched := gpuabi.SampleSchedule(500, 8, gpuabi.DefaultSampleSeed)
+	require.Equal(t, wantSampled, len(sched))
+	corrOf := func(i int) gpu.CorrelationID {
+		return gpu.CorrelationID{
+			Backend: gpu.GPUBackendID("stub"),
+			PID:     uint32(stubPID),
+			Value:   strconv.FormatUint(sched[i]+1, 10),
+		}
+	}
+	inject := func(corr gpu.CorrelationID, crc uint64, fnIndex uint32, pcOffset uint64) {
+		t.Helper()
+		require.NoError(t, timeline.EmitPCSample(gpu.GPUPCSample{
+			Correlation:   corr,
+			Module:        gpu.ModuleRef{Backend: gpu.GPUBackendID("stub"), CRC: crc},
+			FunctionIndex: fnIndex,
+			TimeNs:        1,
+			PCOffset:      pcOffset,
+			StallReason:   "long_scoreboard",
+			Count:         1,
+		}))
+	}
+	// One per gpu_src_status, each on its own stack-carrying execution.
+	inject(corrOf(0), gateCRCLineInfo, lineIdx, 0x10)    // resolved
+	inject(corrOf(1), gateCRCNoLineInfo, noLineIdx, 0x10) // no-lineinfo
+	inject(corrOf(2), gateCRCAbsent, 0, 0x10)             // no-module
+	inject(corrOf(3), gateCRCLineInfo, lineIdx, 0x180)    // unmapped: past the function
+	// And a spray of distinct offsets for the cardinality cap.
+	const capSpray = 40
+	for i := range capSpray {
+		inject(corrOf(4), gateCRCLineInfo, lineIdx, 0x1000+uint64(i)*16)
+	}
+	injected := 4 + capSpray
+
+	snap := timeline.Snapshot()
+	require.Len(t, snap.Executions, 500, "500 launches + 500 execs, exactly, none lost")
+
+	// The wire's own account of the same two modules: gpu_module_load_v1
+	// announces THAT a module loaded, with its CRC and size, while the bytes
+	// travel the cubin channel. Both must name the same modules, or the
+	// announcement and the payload describe different things and the CRC join
+	// is meaningless.
+	gotCRCs := map[uint64]uint64{}
+	for _, m := range snap.Modules {
+		gotCRCs[m.Ref.CRC] = m.SizeBytes
+	}
+	assert.Equal(t, map[uint64]uint64{
+		gateCRCLineInfo:   uint64(len(lineInfo)),
+		gateCRCNoLineInfo: uint64(len(noLineInfo)),
+	}, gotCRCs,
+		"the decoded gpu_module_load_v1 records do not name the same (crc, size) pairs the producer reported for the bytes it sent")
+
+	// ---- assertion 5: reconciliation --------------------------------------
+	//
+	// Every PC record that reached the sink lands in exactly one of
+	// attributed-exact, attributed-kernel, still-pending (in either store) or
+	// evicted (from either store). The two pending stores are separate on
+	// purpose - a Tier B eviction storm must be distinguishable from a Tier A
+	// one - so both terms are in the identity.
+	accepted := uint64(wantPC) + uint64(injected)
+	assert.Equal(t, accepted,
+		snap.AttributedPCSamples+
+			uint64(snap.PendingSamples)+snap.Dropped.EvictedPendingSamples+
+			uint64(snap.PendingModuleSamples)+snap.Dropped.EvictedPendingModuleSamples,
+		"a PC sample went unaccounted for: attributed=%d pending=%d evicted=%d pending-module=%d evicted-module=%d of %d accepted",
+		snap.AttributedPCSamples, snap.PendingSamples, snap.Dropped.EvictedPendingSamples,
+		snap.PendingModuleSamples, snap.Dropped.EvictedPendingModuleSamples, accepted)
+	assert.Equal(t, snap.AttributedPCSamples, snap.PCJoin.AttributedTotal(),
+		"AttributedExact + AttributedKernel must account for every attributed sample: %+v", snap.PCJoin)
+	assert.Equal(t, uint64(injected), snap.PCJoin.AttributedExact,
+		"every injected sample carries a correlation a wire-delivered execution occupies, so all of them take the exact path")
+	// And the stub's own 64, which can attribute to nothing - see the doc
+	// comment. Asserted as an equality rather than tolerated as a shortfall:
+	// if the stub is ever given real CRCs and real kernel names this number
+	// changes, and the gate should say so rather than quietly pass.
+	assert.Equal(t, wantPC, snap.PendingModuleSamples,
+		"the stub's PC records carry synthetic CRCs and kernel names that no cubin can name, so every one of them must remain pending and counted - never attached to a plausible neighbour")
+	assert.Positive(t, snap.PCJoin.GroupsUnresolvedName,
+		"a group whose (crc, functionIndex) names nothing must be counted as such, not silently skipped")
+	assert.Equal(t, snap.PCJoin.GroupsExamined(),
+		snap.PCJoin.GroupsJoined+uint64(snap.PendingModuleGroups),
+		"every pending group must be joined or left pending for exactly one counted reason: %+v", snap.PCJoin)
+
+	// ---- assertion 8: Tier A disclosure -----------------------------------
+	assert.Equal(t, uint64(len(snap.Executions)),
+		snap.ExecutionsSerialized+snap.ExecutionsNotSerialized+snap.ExecutionsSerializationUnknown,
+		"the three gpu_serialized outcomes must partition the executions exactly")
+	assert.Positive(t, snap.SamplingWindowsReceived,
+		"Tier A was selected and the producer said it emitted windows, but none reached the disclosure store")
+	assert.Positive(t, snap.ExecutionsSerialized,
+		"the stub's bursts bracket about half its executions; not one was marked perturbed")
+	assert.Positive(t, snap.ExecutionsNotSerialized,
+		"not one execution fell in a proven gap between bursts, so \"false\" is unreachable on this run and the three-way split is not being exercised")
+	t.Logf("serialization: true=%d false=%d unknown=%d over %d windows (held=%d open=%d)",
+		snap.ExecutionsSerialized, snap.ExecutionsNotSerialized, snap.ExecutionsSerializationUnknown,
+		snap.SamplingWindowsReceived, snap.SamplingWindowsHeld, snap.SamplingWindowsOpen)
+
+	// The second half of assertion 8, and the half that matters: Tier A
+	// selected with NO window arriving must read "unknown" on every execution
+	// and "false" on none. Driven off this run's own executions rather than
+	// off synthetic ones, so the population is identical and only the evidence
+	// differs.
+	t.Run("tier A with no windows is unknown, never false", func(t *testing.T) {
+		blind := gpu.NewTimeline(gpu.TimelineConfig{PCSampling: gpu.PCSamplingSerialized})
+		for _, v := range snap.Executions {
+			require.NoError(t, blind.EmitExec(v.Exec))
+		}
+		bs := blind.Snapshot()
+		require.Len(t, bs.Executions, len(snap.Executions))
+		assert.Equal(t, uint64(len(bs.Executions)), bs.ExecutionsSerializationUnknown,
+			"Tier A ran and no window arrived, so nothing can be shown unperturbed")
+		assert.Zero(t, bs.ExecutionsNotSerialized,
+			"\"not perturbed\" when the truth is \"cannot tell\" is the one answer that must never be reachable by accident")
+		assert.Zero(t, bs.ExecutionsSerialized)
+	})
+
+	// Assertion 10b's third clause, on the same population: a window with
+	// end_ns == 0 is OPEN, not zero-length. Treating it as zero-length would
+	// mark a whole perturbed tail "false".
+	t.Run("an open window is unknown from its start, never false", func(t *testing.T) {
+		open := gpu.NewTimeline(gpu.TimelineConfig{PCSampling: gpu.PCSamplingSerialized})
+		var first, last uint64
+		for i, v := range snap.Executions {
+			if i == 0 || v.Exec.StartNs < first {
+				first = v.Exec.StartNs
+			}
+			if v.Exec.EndNs > last {
+				last = v.Exec.EndNs
+			}
+		}
+		require.Greater(t, last, first)
+		require.NoError(t, open.EmitSamplingWindow(gpu.GPUSamplingWindow{
+			Backend: gpu.GPUBackendID("stub"),
+			PID:     uint32(stubPID),
+			StartNs: first,
+			EndNs:   0, // the hard-exit shape: cuptiPCSamplingStop never ran
+			Mode:    gpu.SamplingModeKernelSerialized,
+		}))
+		for _, v := range snap.Executions {
+			require.NoError(t, open.EmitExec(v.Exec))
+		}
+		ws := open.Snapshot()
+		assert.Zero(t, ws.ExecutionsNotSerialized,
+			"an unterminated window read as zero-length would mark the whole perturbed tail \"false\"")
+		assert.Equal(t, uint64(len(ws.Executions)),
+			ws.ExecutionsSerialized+ws.ExecutionsSerializationUnknown,
+			"every execution at or after an open window's start is either perturbed or unknown, and nothing else")
+	})
+
+	// ---- the projection ---------------------------------------------------
+	//
+	// Projected TWICE over the SAME snapshot: once with the default budget, for
+	// the label assertions, and once with a small ceiling for assertion 9.
+	// Snapshot() is consuming, so the snapshot value is reused rather than
+	// retaken.
+	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
+	require.NotEmpty(t, samples, "the gate is pprof samples, not counters")
+	assert.Zero(t, projStats.PCLabelsSuppressed,
+		"the default ceiling is nowhere near %d distinct offsets; a suppression here means the budget shrank",
+		projStats.DistinctPCLabels)
+
+	// The walk over every projected sample: assertions 1, 2, 3 and 4, on real
+	// output rather than on a hand-built ExecutionView.
+	byStatus := map[string]int{}
+	byAttrib := map[string]int{}
+	var pcDerived, resolvedWithStack int
+	si := 0
+	for _, view := range snap.Executions {
+		// ProjectExecutionsWith emits one sample per PC sample, or one for
+		// the execution itself when it carries none, in snapshot order.
+		n := max(1, len(view.PCSamples))
+		for range n {
+			require.Less(t, si, len(samples))
+			s := samples[si]
+			si++
+
+			// Assertion 1, in its exact form: the frames are the launch's own
+			// CPU stack, then the boundary marker, then the kernel - compared
+			// as a whole slice rather than scanned for forbidden substrings.
+			// Whole-slice comparison is strictly stronger (nothing may be
+			// inserted anywhere, not merely appended) and it has no false
+			// positives, which a substring scan would: several of the stub's
+			// stall reasons are spelt "wait", "barrier" and "membar", and libc
+			// frame names contain all three.
+			require.NotEmpty(t, view.Exec.KernelName,
+				"every execution carries an interned kernel name, so the kernel frame is never omitted")
+			var want []string
+			if view.Launch != nil && len(view.Launch.Launch.CPUStack) > 0 {
+				for _, f := range view.Launch.Launch.CPUStack {
+					want = append(want, f.Name)
+				}
+				want = append(want, gpu.FrameLaunch)
+			} else {
+				want = append(want, gpu.FrameLaunchUnsampled)
+			}
+			want = append(want, "[gpu:kernel:"+view.Exec.KernelName+"]")
+			require.Equal(t, want, frameNamesOf(s.Stack),
+				"frames are exhaustively the CPU stack, the boundary marker and the kernel; this sample's differ")
+			// The two frames this package synthesizes are the only ones it
+			// could smuggle per-sample detail into, so they take the substring
+			// scan the CPU frames cannot safely take.
+			for _, name := range want[len(want)-2:] {
+				for _, bad := range []string{"gpu:pc", "gpu:src", "gpu:stall", "long_scoreboard", "resolved", "0x"} {
+					assert.NotContains(t, name, bad,
+						"per-sample detail was promoted to a frame: %q", name)
+				}
+			}
+
+			if len(view.PCSamples) == 0 {
+				assert.NotContains(t, s.Labels, "gpu_src_status",
+					"an execution with no PC samples has nothing to say about a source location")
+				continue
+			}
+			pcDerived++
+			status := s.Labels["gpu_src_status"]
+			require.NotEmpty(t, status,
+				"gpu_src_status is unconditional on every PC-derived sample: an absent label reads as \"not sampled\"")
+			byStatus[status]++
+			byAttrib[s.Labels["gpu_pc_attrib"]]++
+			require.NotEmpty(t, s.Labels["gpu_pc_attrib"], "gpu_pc_attrib is unconditional too")
+			require.Contains(t, s.Labels, "gpu_serialized",
+				"gpu_serialized rides on every execution, PC-bearing or not")
+
+			switch status {
+			case "resolved":
+				// Assertion 2: a source line reached from a CPU stack.
+				assert.Equal(t, "single.cu", s.Labels["gpu_src_file"], "the basename, never the build-host path")
+				assert.Equal(t, "addOne", s.Labels["gpu_src_func"])
+				require.Contains(t, s.Labels, "gpu_src_line")
+				if view.Launch != nil && len(view.Launch.Launch.CPUStack) > 0 {
+					resolvedWithStack++
+					if resolvedWithStack == 1 {
+						t.Logf("assertion 2: %v -> %s:%s (%s, attrib=%s)",
+							frameNamesOf(s.Stack), s.Labels["gpu_src_file"], s.Labels["gpu_src_line"],
+							s.Labels["gpu_stall"], s.Labels["gpu_pc_attrib"])
+					}
+				}
+			default:
+				// Assertion 3, generalized to all three unresolvable statuses:
+				// no location is ever invented.
+				assert.NotContains(t, s.Labels, "gpu_src_file", "status=%s invented a file", status)
+				assert.NotContains(t, s.Labels, "gpu_src_line", "status=%s invented a line", status)
+				assert.NotContains(t, s.Labels, "gpu_src_func", "status=%s invented a function", status)
+			}
+		}
+	}
+	require.Equal(t, len(samples), si, "every projected sample must belong to an execution")
+	t.Logf("pc-derived samples: %d  by status: %v  by attrib: %v", pcDerived, byStatus, byAttrib)
+
+	// Assertion 2, stated as a number rather than left implicit in the loop.
+	assert.Positive(t, resolvedWithStack,
+		"no sample carries BOTH a real CPU stack and gpu_src_status=resolved; that conjunction is the Phase 6 exit condition, and either half alone is not it")
+
+	// Assertion 4: all four values reachable, each by the fixture that should
+	// produce it.
+	for _, want := range []string{"resolved", "no-lineinfo", "no-module", "unmapped"} {
+		assert.Positive(t, byStatus[want],
+			"gpu_src_status=%q is not reachable from this run: %v", want, byStatus)
+	}
+	// Assertion 3's own arithmetic: the -lineinfo fixture produced the
+	// resolved population, the no-lineinfo fixture produced exactly one
+	// no-lineinfo sample, and neither borrowed from the other.
+	assert.Equal(t, 1, byStatus["no-lineinfo"],
+		"exactly one sample was injected against the no-lineinfo fixture")
+	// One, not 65: the stub's own 64 records never reach an execution at all
+	// (see the doc comment), so they never project and never carry a label.
+	// The single no-module sample here is the injected one whose CRC no cubin
+	// was ever stored for - which is exactly the fixture that should produce
+	// that status.
+	assert.Equal(t, 1, byStatus["no-module"],
+		"only the injected absent-CRC sample can read no-module; the stub's records are pending and unprojected")
+	assert.Equal(t, 1, byStatus["resolved"])
+	assert.Equal(t, 1+capSpray, byStatus["unmapped"],
+		"the injected past-the-function offset plus the %d cardinality-spray offsets, all past the line table's last address", capSpray)
+	assert.Equal(t, injected, pcDerived,
+		"every projected PC-derived sample must be one of the injected ones")
+
+	// ---- assertion 9: the cardinality cap ---------------------------------
+	//
+	// Past the ceiling gpu_pc is dropped and counted, while gpu_stall and
+	// gpu_src_* survive untouched: they are coarser and more actionable, so the
+	// label that gives way is the numerous one rather than the useful one.
+	const ceiling = 8
+	capped, capStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{
+		Modules:             store,
+		MaxDistinctPCLabels: ceiling,
+	})
+	require.Len(t, capped, len(samples), "the cap changes labels, never the sample population")
+	distinct := map[string]bool{}
+	var suppressed uint64
+	for i, s := range capped {
+		if _, isPC := s.Labels["gpu_src_status"]; !isPC {
+			continue
+		}
+		if pc, ok := s.Labels["gpu_pc"]; ok {
+			distinct[pc] = true
+			continue
+		}
+		suppressed++
+		// Everything else must have survived. This is the half that a cap
+		// which simply stopped emitting labels would fail.
+		assert.NotEmpty(t, s.Labels["gpu_stall"],
+			"the cap dropped gpu_stall, which it must never touch (sample %d)", i)
+		assert.NotEmpty(t, s.Labels["gpu_src_status"],
+			"the cap dropped gpu_src_status, which is unconditional (sample %d)", i)
+		assert.NotEmpty(t, s.Labels["gpu_pc_attrib"], "the cap dropped gpu_pc_attrib (sample %d)", i)
+		assert.Equal(t, samples[i].Value, s.Value,
+			"a suppressed sample still carries its full share of the execution's duration")
+	}
+	assert.Positive(t, suppressed,
+		"a ceiling of %d over %d distinct injected offsets suppressed nothing, so this proves nothing",
+		ceiling, capSpray)
+	assert.Equal(t, suppressed, capStats.PCLabelsSuppressed,
+		"ProjectionPCLabelsSuppressed must equal the suppressions actually visible in the output, or the counter is decoration")
+	assert.Equal(t, uint64(len(distinct)), capStats.DistinctPCLabels)
+	assert.LessOrEqual(t, len(distinct), ceiling, "more distinct gpu_pc values were emitted than the ceiling allows")
+	assert.Equal(t, uint64(ceiling), capStats.PCLabelCap)
+	// And it is visible to the operator: a profile that silently lost its PC
+	// labels looks identical to one that never had any.
+	health := strings.Join(gpu.JoinHealthWith(snap, capStats), "\n")
+	assert.Contains(t, health, "gpu_pc",
+		"the suppression is not surfaced in joinhealth output:\n%s", health)
+	t.Logf("cardinality cap: distinct=%d cap=%d suppressed=%d", capStats.DistinctPCLabels, capStats.PCLabelCap, capStats.PCLabelsSuppressed)
+}
+
+// waitFor polls until cond holds or the deadline passes, failing with what
+// describe() reports rather than with a bare timeout. A producer that never
+// emitted and a consumer that never drained look identical from a timeout.
+func waitFor(t *testing.T, within time.Duration, cond func() bool, describe func() string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s: %s", within, describe())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func frameNamesOf(frames []pp.Frame) []string {
+	out := make([]string, 0, len(frames))
+	for _, f := range frames {
+		out = append(out, f.Name)
+	}
+	return out
+}
+
+func fixturePath(name string) string {
+	return filepath.Join("..", "internal", "cubin", "testdata", name)
+}
+
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(fixturePath(name))
+	require.NoError(t, err, "cubin fixture %s", name)
+	require.NotEmpty(t, b)
+	return b
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	require.NoError(t, err)
+	return abs
+}
+
+// fixtureSymIndex reads the .symtab index the module store keys its
+// functionIndex table on out of the fixture itself. Whether CUPTI's
+// functionIndex IS that index is the design's premise and is measured on
+// hardware (Task 6); nothing here depends on the answer, only on the store and
+// the sample agreeing.
+func fixtureSymIndex(t *testing.T, b []byte, fn string) uint32 {
+	t.Helper()
+	c, err := cubin.Parse(b)
+	require.NoError(t, err)
+	for _, f := range c.Functions() {
+		if f.Name == fn {
+			require.GreaterOrEqual(t, f.SymIndex, 0)
+			return uint32(f.SymIndex)
+		}
+	}
+	t.Fatalf("fixture has no function %q", fn)
+	return 0
+}
+
+// gateModuleCRCs pulls the CRC the producer declared for each captured module
+// out of its own stderr, in capture order.
+//
+// From the producer rather than from a constant, so that the number the module
+// store is keyed on is the number that was actually put on the wire. A
+// constant would keep this gate green through a change to how the producer
+// derives a CRC - which is exactly the change that would break the join on
+// hardware.
+func gateModuleCRCs(t *testing.T, stubErr string) []uint64 {
+	t.Helper()
+	re := regexp.MustCompile(`stub: module id=\d+ path=\S+ size=\d+ crc=0x([0-9a-f]{16}) captured=yes`)
+	var out []uint64
+	for _, m := range re.FindAllStringSubmatch(stubErr, -1) {
+		v, err := strconv.ParseUint(m[1], 16, 64)
+		require.NoError(t, err)
+		out = append(out, v)
+	}
+	return out
+}
+
+// stubCubinCRC is the Go replica of shim/stub/stub.cc's stub_cubin_crc: FNV-1a
+// over the module bytes, with zero coerced to one because zero is the ABI's
+// "no module".
+//
+// It exists so the CRC can be recomputed from the checked-in fixture rather
+// than read back from the producer that produced it. Reading it back would
+// assert only that the producer is self-consistent; recomputing it asserts
+// that the identity the join runs on is a function of the BYTES, which is the
+// property the whole content-addressed scheme rests on.
+func stubCubinCRC(b []byte) uint64 {
+	h := uint64(1469598103934665603)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	if h == 0 {
+		return 1
+	}
+	return h
+}
+
+// TestGateTheStubsPCRecordsCannotAttributeToAnything pins the second reason
+// TestStubDrivesPCSamplingToPprofWithoutAGPU injects PC samples of its own
+// instead of using the producer's, and it runs WITHOUT capabilities so the
+// reason is checkable on any machine.
+//
+// # The gap
+//
+// The stub emits real module loads carrying real checked-in cubins, and real
+// PC-sample records. They are unrelated to each other:
+//
+//   - the PC records' cubin_crc is one of two compile-time constants,
+//     kStubCubinCRC = {0xC0FFEE01, 0xC0FFEE02}, while the modules the same run
+//     delivers are keyed by a content hash of the fixture bytes (FNV-1a over
+//     the file, measured: 0x9d57accad01046eb for single_lineinfo.cubin). No
+//     cubin is ever stored under a 0xC0FFEE0n key, so every one of those
+//     records resolves as "no-module";
+//   - their correlation is 0 in every tier, by design and correctly - that is
+//     what CONTINUOUS collection produces - so the exact-correlation path is
+//     unavailable to them;
+//   - Tier B attribution therefore runs crc -> module -> function name ->
+//     the execution's KernelName, and the stub's kernel names are
+//     "kernel_1111"/"kernel_2222" while the fixtures' only function is the
+//     CUDA kernel they were compiled from ("addOne"). No name can match.
+//
+// So neither join path can fire for a stub PC record, in either tier. That is
+// not a bug in the pipeline - the pipeline correctly counts every one of them
+// as pending, which the end-to-end gate asserts as an exact equality - but it
+// does mean the producer cannot drive gate assertions 2, 3, 4 or 9, all of
+// which need a PC sample that reaches an execution.
+//
+// Closing it is a small change to shim/stub/stub.cc: record the CRC each
+// capture computed and use it on the PC records, and name the kernels after
+// the fixtures' own functions. This branch is a test task and may not change
+// the shim, so it is pinned here instead.
+//
+// # Why a passing test
+//
+// Same shape as the other two outstanding pins: when the stub is fixed, this
+// fails by name and the person fixing it drops the injection from the
+// end-to-end gate and asserts the real thing.
+func TestGateTheStubsPCRecordsCannotAttributeToAnything(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "shim", "stub", "stub.cc"))
+	require.NoError(t, err, "the producer's source must be readable; this test is about what it emits")
+	body := string(src)
+
+	assert.Contains(t, body, "static const uint64_t kStubCubinCRC[] = {0xC0FFEE01ull, 0xC0FFEE02ull};",
+		"the stub's synthetic PC-record CRCs changed. If they now come from the CRC each capture "+
+			"computed, gate assertions 2/3/4/9 may be drivable from the producer: drop the PC-sample "+
+			"injection from TestStubDrivesPCSamplingToPprofWithoutAGPU and assert them off the wire.")
+	assert.Contains(t, body, "r.cubin_crc = kStubCubinCRC[i % 2];",
+		"the stub no longer keys its PC records on the synthetic constants - see above")
+	assert.Contains(t, body, `snprintf(namebuf, sizeof(namebuf), "kernel_%llx", (unsigned long long)kernel_id);`,
+		"the stub's kernel names changed. If they now name functions the checked-in cubins "+
+			"actually contain, the Tier B module join can fire for its own records - see above.")
+
+	// And the fixtures really do carry a different name, so the mismatch above
+	// is a fact about both ends rather than an assumption about one.
+	c, err := cubin.Parse(readFixture(t, "single_lineinfo.cubin"))
+	require.NoError(t, err)
+	for _, fn := range c.Functions() {
+		assert.NotContains(t, fn.Name, "kernel_",
+			"a fixture function is now named like a stub kernel; the join might match by accident, which is worse than not matching at all")
+	}
+	t.Log("stub PC records -> a cubin the agent holds: OUTSTANDING - synthetic CRCs and synthetic " +
+		"kernel names; see .superpowers/sdd/task-13-gate-report.md")
 }

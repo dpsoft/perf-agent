@@ -2,6 +2,8 @@
 #   all         libperfagent-gpu-core.a
 #   test        fast unit tests: batch, clock, drain, and the C11 ABI header
 #   test-tsan   the concurrency case under ThreadSanitizer (clang++ only)
+#   check-cupti-guard  issue #99: proves an unguarded CUPTI call site does not
+#                   compile (needs the CUDA toolkit; a prerequisite of `nvidia`)
 #   nvidia      libperfagent-gpu-nvidia.so, the CUPTI adapter (needs the CUDA toolkit)
 #   nvidia-workload  the CUDA test workload the adapter is proven against
 #   nvidia-concurrent the CONCURRENT CUDA workload the PC-sampling overhead
@@ -26,7 +28,7 @@ CUDA_ARCH ?= sm_86
 CORE_SRC := core/batch.cc core/clock.cc core/cubin.cc core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc
 CORE_OBJ := $(CORE_SRC:.cc=.o)
 
-.PHONY: all test test-tsan check-cubin-defer nvidia nvidia-workload nvidia-concurrent clean
+.PHONY: all test test-tsan check-cubin-defer check-cupti-guard nvidia nvidia-workload nvidia-concurrent clean
 all: libperfagent-gpu-core.a
 
 libperfagent-gpu-core.a: $(CORE_OBJ)
@@ -164,7 +166,7 @@ libperfagent-gpu-stub.so: CXXFLAGS += -g -fno-omit-frame-pointer -fasynchronous-
 # -fvisibility=hidden comes from CXXFLAGS and is what keeps core/ from leaking
 # symbols into somebody else's address space; InitializeInjection carries an
 # explicit default-visibility attribute to survive it (see cupti_adapter.cc).
-nvidia: libperfagent-gpu-nvidia.so
+nvidia: check-cupti-guard libperfagent-gpu-nvidia.so
 libperfagent-gpu-nvidia.so: nvidia/cupti_adapter.cc nvidia/export.map $(CORE_SRC)
 	$(CXX) $(CXXFLAGS) -pthread -I core -I $(CUDA_INC) -shared -o $@ \
 		nvidia/cupti_adapter.cc $(CORE_SRC) \
@@ -230,6 +232,41 @@ check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
 	[ $$rc -eq 0 ] && echo "check-cubin-defer: OK - the compliant capture compiles, all 5 deferrals do not"; \
 	exit $$rc
 
+# Issue #99's structural assertion, run as a BUILD step for the same reason
+# check-cubin-defer is: the fix's claim is that a CUPTI call site which skips
+# the one guard CANNOT BE WRITTEN in the adapter, and a guarantee nobody has
+# tried to violate is a claim. nvidia/cupti_guard.h defines a guarded wrapper
+# for every CUPTI entry point and then #defines the raw names to identifiers
+# that exist nowhere; this target tries five ways round it and requires every
+# one to be rejected by the compiler.
+#
+# It needs the CUDA headers, so it hangs off `nvidia` rather than off `test` --
+# `test` runs on machines with no toolkit. Mode 0 is the control and it MUST
+# compile: without it the check would pass just as happily on a file that fails
+# to build for an unrelated reason, which is the exact shape of the defects
+# this project has shipped reading green at the worst possible moment.
+#
+# 2>/dev/null on the negative arms: the compiler errors ARE the pass.
+check-cupti-guard: nvidia/cupti_guard_test.cc nvidia/cupti_guard.h core/callguard.h
+	@$(CXX) -std=c++17 -Wall -Werror -I core -I $(CUDA_INC) -fsyntax-only \
+		-DPERFAGENT_CUPTI_UNGUARDED=0 nvidia/cupti_guard_test.cc || { \
+	  echo "check-cupti-guard: the COMPLIANT call does not compile; this check would"; \
+	  echo "                   otherwise pass for the wrong reason. Fix nvidia/cupti_guard.h."; \
+	  exit 1; }
+	@rc=0; for m in 1 2 3 4 5; do \
+	  if $(CXX) -std=c++17 -Wall -Werror -I core -I $(CUDA_INC) -fsyntax-only \
+		-DPERFAGENT_CUPTI_UNGUARDED=$$m nvidia/cupti_guard_test.cc 2>/dev/null; then \
+	    echo "check-cupti-guard: unguarded mode $$m COMPILED. A CUPTI call site can reach"; \
+	    echo "                   the vendor without perfagent::cupti::guard(), which is"; \
+	    echo "                   exactly what issue #99 was: two of our threads inside"; \
+	    echo "                   CUPTI at once deadlocked the profiled application"; \
+	    echo "                   permanently. See nvidia/cupti_guard_test.cc mode $$m."; \
+	    rc=1; \
+	  fi; \
+	done; \
+	[ $$rc -eq 0 ] && echo "check-cupti-guard: OK - the guarded call compiles, all 5 unguarded do not"; \
+	exit $$rc
+
 # stub/pc_tier_test.cc is the "off means off" assertion, and it is built the
 # same way probe_order_test is and for the same reason: it drives the real
 # producer (stub/stub.cc with PERFAGENT_STUB_NO_MAIN) and reads its probe fires
@@ -253,12 +290,14 @@ check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/pctier_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC)
+test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/callguard_test.cc core/tickplan_test.cc core/pctier_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/pcdrain_test core/pcdrain_test.cc && /tmp/pcdrain_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/burst_test core/burst_test.cc && /tmp/burst_test
+	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/callguard_test core/callguard_test.cc && /tmp/callguard_test
+	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/tickplan_test core/tickplan_test.cc && /tmp/tickplan_test
 	$(CXX) -std=c++17 -Wall -Werror -I core -o /tmp/pctier_test core/pctier_test.cc && /tmp/pctier_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/enroll_test core/enroll_test.cc core/enroll.cc && /tmp/enroll_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubin_test core/cubin_test.cc core/cubin.cc core/enroll.cc && /tmp/cubin_test
@@ -282,13 +321,19 @@ test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc
 # design turns on drain() not holding the mutex across an offer. A test that
 # only checks the counters passes with the lock held the wrong way round; only
 # TSan sees the unsynchronized access if one is ever introduced.
-test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc core/sampler.cc core/sampler.h core/cubinqueue_test.cc core/cubinqueue.cc core/cubinqueue.h
+# callguard_test is here for a fourth reason: its mutual-exclusion case
+# increments a plain `long` under the guard, which comes out right on most runs
+# even with the exclusion removed. Only the sanitizer proves the guard actually
+# excludes -- and the guard is the whole of issue #99's fix.
+test-tsan: core/batch_test.cc core/batch.cc core/batch.h core/sampler_test.cc core/sampler.cc core/sampler.h core/cubinqueue_test.cc core/cubinqueue.cc core/cubinqueue.h core/callguard_test.cc core/callguard.h
 	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
 		-o /tmp/batch_test_tsan core/batch_test.cc core/batch.cc && /tmp/batch_test_tsan
 	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
 		-o /tmp/sampler_test_tsan core/sampler_test.cc core/sampler.cc && /tmp/sampler_test_tsan
 	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
 		-o /tmp/cubinqueue_test_tsan core/cubinqueue_test.cc core/cubinqueue.cc && /tmp/cubinqueue_test_tsan
+	$(TSAN_CXX) -std=c++17 -g -O1 -fsanitize=thread -pthread -I core \
+		-o /tmp/callguard_test_tsan core/callguard_test.cc && /tmp/callguard_test_tsan
 
 clean:
 	rm -f $(CORE_OBJ) libperfagent-gpu-core.a perfagent-gpu-stub libperfagent-gpu-stub.so \

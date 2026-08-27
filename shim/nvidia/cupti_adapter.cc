@@ -20,6 +20,7 @@
 #include "pcdrain.h"
 #include "pctier.h"
 #include "sampler.h"
+#include "tickplan.h"
 #include "usdt_abi.h"
 #include "usdt_probe.h"
 
@@ -27,6 +28,13 @@
 // cuptiGetCubinCrc lives here, not in cupti.h -- so this header is needed by
 // the module-capture path as well as by the whole PC-sampling block below.
 #include <cupti_pcsampling.h>
+
+// MUST come after the CUPTI headers and before everything else in this file.
+// It defines a guarded wrapper for every CUPTI entry point this adapter uses
+// and then POISONS the raw names, so from this line down a call site that
+// reaches CUPTI without the one lock is a compile error rather than a hang in
+// somebody else's process. That is issue #99's fix; read that header first.
+#include "cupti_guard.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -120,7 +128,7 @@ std::mutex g_clock_mu;
 
 void resample_clock() {
     uint64_t vendor = 0;
-    if (cuptiGetTimestamp(&vendor) != CUPTI_SUCCESS) return;
+    if (perfagent::cupti::GetTimestamp(&vendor) != CUPTI_SUCCESS) return;
     const uint64_t mono = mono_ns();
     std::lock_guard<std::mutex> g(g_clock_mu);
     g_clock.resample(vendor, mono);
@@ -211,7 +219,13 @@ perfagent::Batch<gpu_launch_v1, 32> *g_lb = nullptr;
 perfagent::Batch<gpu_exec_v1, 32> *g_eb = nullptr;
 perfagent::Sampler *g_sampler = nullptr;
 perfagent::KernelNameTable *g_names = nullptr;
-perfagent::Drainer *g_drainer = nullptr;
+// THE timer. Singular, and that is the structural half of issue #99's fix: the
+// adapter has exactly one thread of its own from which it ever calls CUPTI, so
+// "two of our threads inside CUPTI at once" is not a state this process can
+// reach. g_tick_plan rate-limits the 100 ms activity drain on top of the
+// shorter burst tick; see core/tickplan.h.
+perfagent::Drainer *g_timer = nullptr;
+perfagent::TickPlan *g_tick_plan = nullptr;
 perfagent::CubinQueue *g_cubins = nullptr;
 CUpti_SubscriberHandle g_subscriber = nullptr;
 
@@ -288,7 +302,11 @@ uint64_t cupti_cubin_crc(const void *bytes, size_t len) {
     p.size = CUpti_GetCubinCrcParamsSize;
     p.cubinSize = len;
     p.cubin = bytes;
-    if (cuptiGetCubinCrc(&p) != CUPTI_SUCCESS) return 0;
+    // Takes the CUPTI guard, like every other call this adapter initiates.
+    // It runs on the APPLICATION's cuModuleLoad path, so it can now wait
+    // behind one of the timer thread's CUPTI calls -- see issue-99's report
+    // for the size of that and why it is the right trade.
+    if (perfagent::cupti::GetCubinCrc(&p) != CUPTI_SUCCESS) return 0;
     return p.cubinCrc;
 }
 
@@ -484,14 +502,25 @@ struct PCContext {
     bool enabled = false;
 };
 
-// One mutex over the map AND the per-context buffers. It is held across
-// cuptiPCSamplingGetData, which is what makes the module-unload drain safe:
-// that callback runs on the application's thread while the drain timer runs on
-// ours, and CUPTI's buffer is a single-writer structure. The unload path
-// BLOCKS on this rather than trying the lock, because a skipped unload flush
-// is exactly the silent PC-identity corruption this whole path exists to
-// avoid.
-std::mutex g_pc_mu;
+// The per-context map and buffers are covered by the SAME lock every CUPTI
+// call in this adapter takes: perfagent::cupti::guard(), declared in
+// nvidia/cupti_guard.h.
+//
+// It used to be a mutex of its own, g_pc_mu, and that is what issue #99 was.
+// It serialised the PC-sampling family against itself and nothing else, so the
+// 100 ms drain timer's cuptiActivityFlushAll -- which took no lock at all --
+// ran concurrently with the burst timer's cuptiPCSamplingStop. Two of our
+// threads inside CUPTI, in different CUPTI subsystems, with the application in
+// a launch callback: the profiled process deadlocked, permanently, on the
+// first Tier A burst.
+//
+// One lock over the whole vendor surface, rather than one per subsystem, is
+// what removes the ordering question between our own locks entirely. Holding
+// it across cuptiPCSamplingGetData is still what makes the module-unload drain
+// safe: that callback runs on the application's thread while the timer runs on
+// ours, and CUPTI's buffer is a single-writer structure. The unload path still
+// BLOCKS rather than trying the lock, because a skipped unload flush is
+// exactly the silent PC-identity corruption this whole path exists to avoid.
 std::vector<PCContext *> g_pc_ctxs;       // leaked with everything else; see below
 
 perfagent::PCDrainSchedule *g_pc_schedule = nullptr;
@@ -506,17 +535,23 @@ std::atomic<unsigned long> g_window_seq{0};
 
 // ------------------------------------------------------ Tier A duty cycle
 //
-// The burst controller and its own timer. It is a SECOND timer, not the drain
-// tick, and that is a deliberate deviation from the plan's "the existing drain
-// timer is its natural home": the drain tick is 100 ms and a 50 ms burst
-// cannot be expressed on it. Quantizing the burst to the drain period would
-// silently double the burst length and therefore the duty fraction --- the one
-// number this tier exists to bound --- so the burst rides a tick of its own
-// whose period is a fraction of the burst length. The flush that CUPTI
-// requires after every range end runs on the stop, immediately, and marks the
-// SHARED PCDrainSchedule so the 100 ms tick coalesces instead of repeating it.
+// The burst controller. It used to have a timer thread of its own, and issue
+// #99 is why it no longer does: two timer threads meant two of our threads
+// could be inside CUPTI at once, which deadlocked the profiled application.
+//
+// The burst cycle still cannot be expressed on a 100 ms drain tick -- a 50 ms
+// burst quantized to 100 ms silently doubles the burst length and therefore
+// the duty fraction, the one number this tier exists to bound. So the SINGLE
+// timer runs at the burst tick (a fifth of the burst length) and the activity
+// drain is rate-limited on top of it by core/tickplan.h. The burst poll keeps
+// its granularity exactly; what it loses is isolation from a slow flush, which
+// is measured in `duty=` rather than assumed away.
+//
+// The flush CUPTI requires after every range end still runs on the stop,
+// immediately, inside the same critical section as the stop, and marks the
+// SHARED PCDrainSchedule so the periodic drain coalesces instead of repeating
+// it.
 perfagent::BurstController *g_burst = nullptr;
-perfagent::Drainer *g_burst_timer = nullptr;
 unsigned g_burst_tick_ms = 10;
 
 // Bursts and their total open time. The pair is what bounds the perturbation:
@@ -622,7 +657,8 @@ void emit_dropped(uint64_t count, uint8_t klass) {
 }
 
 // Queries the device's stall-reason table and puts it on the wire. Called once
-// per process, under g_pc_mu, from the first context that enables sampling.
+// per process, under the CUPTI guard, from the first context that enables
+// sampling.
 //
 // The table is also handed to the ReplayLog: the query happens at context
 // creation, which on a CUDA process is before a consumer can realistically
@@ -637,7 +673,8 @@ bool pc_query_stall_reasons(CUcontext ctx) {
     np.size = CUpti_PCSamplingGetNumStallReasonsParamsSize;
     np.ctx = ctx;
     np.numStallReasons = &num;
-    if (!check(cuptiPCSamplingGetNumStallReasons(&np), "cuptiPCSamplingGetNumStallReasons"))
+    if (!check(perfagent::cupti::PCSamplingGetNumStallReasons(&np),
+               "cuptiPCSamplingGetNumStallReasons"))
         return false;
     if (!num) {
         logf("perfagent-cupti: PC sampling reports zero stall reasons; not enabling\n");
@@ -657,7 +694,7 @@ bool pc_query_stall_reasons(CUcontext ctx) {
     sp.numStallReasons = num;
     sp.stallReasonIndex = indices.data();
     sp.stallReasons = names.data();
-    if (!check(cuptiPCSamplingGetStallReasons(&sp), "cuptiPCSamplingGetStallReasons"))
+    if (!check(perfagent::cupti::PCSamplingGetStallReasons(&sp), "cuptiPCSamplingGetStallReasons"))
         return false;
 
     g_stall_indices = indices;
@@ -703,12 +740,14 @@ void pc_disable_ctx(PCContext *c, const char *why) {
     CUpti_PCSamplingDisableParams dp{};
     dp.size = CUpti_PCSamplingDisableParamsSize;
     dp.ctx = c->ctx;
-    if (!check(cuptiPCSamplingDisable(&dp), why))
+    if (!check(perfagent::cupti::PCSamplingDisable(&dp), why))
         g_ctx_disable_failed.fetch_add(1, std::memory_order_relaxed);
     c->enabled = false;
 }
 
-// Enables and configures PC sampling on one context. Caller holds g_pc_mu.
+// Enables and configures PC sampling on one context. Caller holds the CUPTI
+// guard (perfagent::cupti::guard()); the wrappers below take it again, which
+// is free because it is re-entrant on the owning thread.
 //
 // Enable first, then configure: cuptiPCSamplingGetNumStallReasons and the
 // configuration attributes are all keyed on a context CUPTI already knows is
@@ -736,7 +775,7 @@ void pc_enable_ctx(CUcontext ctx) {
     CUpti_PCSamplingEnableParams en{};
     en.size = CUpti_PCSamplingEnableParamsSize;
     en.ctx = ctx;
-    if (!check(cuptiPCSamplingEnable(&en), "cuptiPCSamplingEnable")) {
+    if (!check(perfagent::cupti::PCSamplingEnable(&en), "cuptiPCSamplingEnable")) {
         g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -802,7 +841,7 @@ void pc_enable_ctx(CUcontext ctx) {
     cp.ctx = ctx;
     cp.numAttributes = n;
     cp.pPCSamplingConfigurationInfo = info;
-    if (!check(cuptiPCSamplingSetConfigurationAttribute(&cp),
+    if (!check(perfagent::cupti::PCSamplingSetConfigurationAttribute(&cp),
                "cuptiPCSamplingSetConfigurationAttribute")) {
         pc_disable_ctx(c, "cuptiPCSamplingDisable (configure failed)");
         g_ctx_enable_failed.fetch_add(1, std::memory_order_relaxed);
@@ -816,7 +855,7 @@ void pc_enable_ctx(CUcontext ctx) {
     for (size_t i = 0; i < n; i++) {
         if (info[i].attributeStatus != CUPTI_SUCCESS) {
             const char *msg = "?";
-            cuptiGetResultString(info[i].attributeStatus, &msg);
+            perfagent::cupti::GetResultString(info[i].attributeStatus, &msg);
             logf("perfagent-cupti: pc sampling attribute %d refused: %s\n",
                  (int)info[i].attributeType, msg);
             pc_disable_ctx(c, "cuptiPCSamplingDisable (attribute refused)");
@@ -836,7 +875,7 @@ void pc_enable_ctx(CUcontext ctx) {
         qp.ctx = ctx;
         qp.numAttributes = 1;
         qp.pPCSamplingConfigurationInfo = &q;
-        if (cuptiPCSamplingGetConfigurationAttribute(&qp) == CUPTI_SUCCESS &&
+        if (perfagent::cupti::PCSamplingGetConfigurationAttribute(&qp) == CUPTI_SUCCESS &&
             q.attributeStatus == CUPTI_SUCCESS)
             g_pc_period = q.attributeData.samplingPeriodData.samplingPeriod;
     }
@@ -851,7 +890,7 @@ void pc_enable_ctx(CUcontext ctx) {
 }
 
 // Pulls whatever CUPTI has for one context and turns it into wire records.
-// Caller holds g_pc_mu.
+// Caller holds the CUPTI guard.
 //
 // ONE RECORD PER (PC, stall reason) PAIR. That is the price of the ABI's
 // fixed-size record rule (spec §6.3): CUpti_PCSamplingPCData carries a
@@ -874,7 +913,7 @@ void pc_drain_ctx_locked(PCContext *c) {
         gp.ctx = c->ctx;
         gp.pcSamplingData = &c->data;
         g_pc_getdata_calls.fetch_add(1, std::memory_order_relaxed);
-        const CUptiResult st = cuptiPCSamplingGetData(&gp);
+        const CUptiResult st = perfagent::cupti::PCSamplingGetData(&gp);
         if (st == CUPTI_ERROR_OUT_OF_MEMORY) {
             // The documented "hardware buffer is full" return. The PC data for
             // this window is gone; the fact that it is gone is not.
@@ -947,7 +986,7 @@ void pc_drain_ctx_locked(PCContext *c) {
 }
 
 void pc_drain_all(perfagent::PCDrainReason reason) {
-    std::lock_guard<std::mutex> g(g_pc_mu);
+    perfagent::cupti::CallScope hold;
     for (PCContext *c : g_pc_ctxs) pc_drain_ctx_locked(c);
     if (reason != perfagent::PCDrainReason::kPeriodic && g_pcb) g_pcb->flush();
 }
@@ -989,7 +1028,7 @@ void pc_start_ctxs_locked() {
         CUpti_PCSamplingStartParams sp{};
         sp.size = CUpti_PCSamplingStartParamsSize;
         sp.ctx = c->ctx;
-        if (!check(cuptiPCSamplingStart(&sp), "cuptiPCSamplingStart"))
+        if (!check(perfagent::cupti::PCSamplingStart(&sp), "cuptiPCSamplingStart"))
             g_burst_start_failed.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -1000,27 +1039,38 @@ void pc_stop_ctxs_locked() {
         CUpti_PCSamplingStopParams sp{};
         sp.size = CUpti_PCSamplingStopParamsSize;
         sp.ctx = c->ctx;
-        if (!check(cuptiPCSamplingStop(&sp), "cuptiPCSamplingStop"))
+        if (!check(perfagent::cupti::PCSamplingStop(&sp), "cuptiPCSamplingStop"))
             g_burst_stop_failed.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 // Closes an open burst: stop every context, drain (CUPTI requires the flush
 // after every range end), close the window, and hand the yield to the loop.
-// Caller must NOT hold g_pc_mu.
+//
+// The stop and its mandatory flush are ONE critical section, which they were
+// not before issue #99: the old code released the PC mutex between them, so
+// another thread's CUPTI call could land in the gap between a range ending and
+// the flush the header requires after it. pc_drain_all takes the guard again
+// inside this scope, which costs a depth increment and no lock -- that is what
+// the re-entrancy in core/callguard.h buys, spent on making a two-call
+// sequence atomic rather than on convenience.
+//
+// The guard is released before the window is emitted and before the controller
+// is told, so a USDT fire and the controller's own mutex are never taken with
+// the whole vendor surface locked.
 void burst_close(uint64_t now_ns, uint64_t start_ns) {
     {
-        std::lock_guard<std::mutex> g(g_pc_mu);
+        perfagent::cupti::CallScope hold;
         pc_stop_ctxs_locked();
+        // The range-end flush. cupti_pcsampling.h: "If configuration option
+        // ENABLE_START_STOP_CONTROL is enabled, then after every range end
+        // i.e. cuptiPCSamplingStop()". Missing it does not lose data --- it
+        // makes two instructions share a PC identity, silently. force() also
+        // moves the shared schedule's phase so the periodic drain coalesces
+        // rather than repeating the pull microseconds later.
+        if (g_pc_schedule) g_pc_schedule->force(now_ns, perfagent::PCDrainReason::kRangeEnd);
+        pc_drain_all(perfagent::PCDrainReason::kRangeEnd);
     }
-    // The range-end flush. cupti_pcsampling.h: "If configuration option
-    // ENABLE_START_STOP_CONTROL is enabled, then after every range end i.e.
-    // cuptiPCSamplingStop()". Missing it does not lose data --- it makes two
-    // instructions share a PC identity, silently. force() also moves the
-    // shared schedule's phase so the 100 ms tick coalesces rather than
-    // repeating the pull microseconds later.
-    if (g_pc_schedule) g_pc_schedule->force(now_ns, perfagent::PCDrainReason::kRangeEnd);
-    pc_drain_all(perfagent::PCDrainReason::kRangeEnd);
     emit_window(start_ns, now_ns);
     g_sampling_burst_ns.fetch_add(now_ns > start_ns ? now_ns - start_ns : 0,
                                   std::memory_order_relaxed);
@@ -1032,7 +1082,8 @@ void burst_close(uint64_t now_ns, uint64_t start_ns) {
     if (g_burst) g_burst->closed(g_pc_records.load(std::memory_order_relaxed));
 }
 
-// The burst timer's tick. Runs on its own thread; see the note on g_burst.
+// The burst half of the single timer's tick. Called from on_timer_tick, on the
+// one thread this adapter runs; see the note on g_burst.
 void on_burst_tick() {
     if (!g_pc_tier_a || !g_burst) return;
     // No enabled context means nothing can be serialized, so there is no
@@ -1055,7 +1106,7 @@ void on_burst_tick() {
     switch (g_burst->poll(now, graphs)) {
         case perfagent::BurstAction::kStart: {
             {
-                std::lock_guard<std::mutex> g(g_pc_mu);
+                perfagent::cupti::CallScope hold;
                 pc_start_ctxs_locked();
             }
             g_sampling_bursts.fetch_add(1, std::memory_order_relaxed);
@@ -1137,9 +1188,9 @@ void on_finalize(const char *why) {
 
     // Tier A: stop the duty cycle before anything else, so no burst can open
     // against contexts this function is about to disable. Only the
-    // controller's own mutex is taken here --- deliberately NOT g_pc_mu, which
-    // this function may fail to acquire below and which the fatal-error
-    // callback can already be holding.
+    // controller's own mutex is taken here --- deliberately NOT the CUPTI
+    // guard, which this function may fail to acquire below and which the
+    // fatal-error callback can already be holding.
     //
     // On the fatal-error path an open window is left OPEN on the wire. That is
     // correct and it is the point: a CUPTI fatal error IS the hard case, and
@@ -1149,18 +1200,28 @@ void on_finalize(const char *why) {
     // mean the hard case specifically.
     if (g_burst) g_burst->shutdown(mono_ns());
 
-    // try_lock, not lock, and this is the one place that is right.
+    // A try, not a blocking acquire, and this is the one place that is right.
     //
     // The fatal-error callback can arrive on the very thread that is inside a
-    // CUPTI call this adapter made while holding g_pc_mu --- a drain, say ---
+    // CUPTI call this adapter made while holding the guard --- a drain, say ---
     // and a blocking acquire there would deadlock somebody else's process at
     // the worst possible moment. Skipping the teardown loses the tail of the
     // profile; deadlocking loses the application. The skip is counted so it is
     // a known outcome rather than an invisible one.
-    std::unique_lock<std::mutex> g(g_pc_mu, std::try_to_lock);
-    if (!g.owns_lock()) {
+    //
+    // TryCallScope, not std::unique_lock(mu, std::try_to_lock), and the
+    // difference is not cosmetic. The guard is re-entrant, so a plain try from
+    // a thread that already holds it would SUCCEED, and this function would
+    // then disable PC sampling out from under the CUPTI call the outer frame
+    // is standing in. TryCallScope refuses when the guard is held by anybody,
+    // this thread included. (std::mutex could not express that at all:
+    // try_lock() on a mutex the calling thread owns is undefined behaviour,
+    // which is what the line this replaces did on exactly that path.)
+    perfagent::cupti::TryCallScope g;
+    if (!g.owns()) {
         g_finalize_contended.fetch_add(1, std::memory_order_relaxed);
-        logf("perfagent-cupti: finalize (%s): pc sampling lock held; teardown skipped\n", why);
+        logf("perfagent-cupti: finalize (%s): the CUPTI guard is held (a call is in "
+             "flight); teardown skipped rather than deadlocking the host\n", why);
         return;
     }
     logf("perfagent-cupti: finalize (%s): disabling pc sampling on %zu context(s)\n",
@@ -1283,13 +1344,13 @@ void on_resource(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
     switch (cbid) {
         case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
             g_ctx_seen.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> g(g_pc_mu);
+            perfagent::cupti::CallScope hold;
             pc_enable_ctx(rd->context);
             break;
         }
         case CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING: {
             g_ctx_destroyed.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> g(g_pc_mu);
+            perfagent::cupti::CallScope hold;
             for (size_t i = 0; i < g_pc_ctxs.size(); i++) {
                 if (g_pc_ctxs[i]->ctx != rd->context) continue;
                 PCContext *c = g_pc_ctxs[i];
@@ -1312,8 +1373,11 @@ void on_resource(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
             // unique. Missing it does not lose data -- it makes two different
             // instructions share a PC identity, silently, which is the worst
             // failure available here. So this drains before returning, and it
-            // BLOCKS on g_pc_mu rather than trying the lock: a skipped flush
-            // is exactly what must not happen.
+            // BLOCKS on the CUPTI guard rather than trying it: a skipped flush
+            // is exactly what must not happen. Since #99 the guard covers every
+            // CUPTI call the adapter makes rather than only the PC-sampling
+            // family, so this now waits for an activity flush as well -- one
+            // CUPTI call's duration, on the application's cuModuleUnload path.
             g_module_unload_drains.fetch_add(1, std::memory_order_relaxed);
             if (g_pc_schedule)
                 g_pc_schedule->force(mono_ns(), perfagent::PCDrainReason::kModuleUnload);
@@ -1426,13 +1490,34 @@ void handle_kernel(const CUpti_ActivityKernel12 *k) {
     g_eb->add(e);
 }
 
+// CUPTI's buffer-completed callback, and the ONE place in this adapter that
+// reaches CUPTI without taking the guard.
+//
+// It is an exemption with a reason rather than an oversight.
+// cuptiActivityFlushAll is documented as "a blocking call" that hands buffers
+// back "using the callback registered in cuptiActivityRegisterCallbacks". If
+// CUPTI delivers them on a worker thread while our timer thread holds the
+// guard across that flush, a guarded callback would block the worker on a lock
+// the flusher is waiting for it to release -- issue #99's deadlock, rebuilt
+// inside its own fix.
+//
+// The boundary: the guard covers calls this adapter initiates on a thread of
+// its own choosing. It does not cover the documented way to consume a buffer
+// CUPTI has just handed us and, in its own words, "relinquished ownership of".
+// The two entry points used here carry that in their names, and they COUNT a
+// call made outside this scope rather than trusting the name -- see
+// perfagent::cupti::misplaced_callback_calls(), reported as
+// cupti_calls_misplaced and required to be 0.
 void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t *buffer, size_t,
                                size_t valid_size) {
+    const perfagent::cupti::BufferCompletedScope in_callback;
     g_buffers.fetch_add(1, std::memory_order_relaxed);
     if (buffer && valid_size) {
         CUpti_Activity *record = nullptr;
         for (;;) {
-            const CUptiResult st = cuptiActivityGetNextRecord(buffer, valid_size, &record);
+            const CUptiResult st =
+                perfagent::cupti::ActivityGetNextRecord_InBufferCompletedOnly(
+                    buffer, valid_size, &record);
             if (st == CUPTI_ERROR_MAX_LIMIT_REACHED) break;
             if (st != CUPTI_SUCCESS) break;
             if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
@@ -1454,7 +1539,9 @@ void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t *buffer, size_t,
     }
     // CUPTI's own overflow. Counted, never silent.
     size_t dropped = 0;
-    if (cuptiActivityGetNumDroppedRecords(nullptr, 0, &dropped) == CUPTI_SUCCESS && dropped)
+    if (perfagent::cupti::ActivityGetNumDroppedRecords_InBufferCompletedOnly(
+            nullptr, 0, &dropped) == CUPTI_SUCCESS &&
+        dropped)
         g_cupti_dropped.fetch_add(dropped, std::memory_order_relaxed);
     free(buffer);   // free(nullptr) is a no-op, and a declined request lands here too
 }
@@ -1522,6 +1609,52 @@ void report(const char *why) {
     logf("perfagent-cupti: graph_execs=%llu multi_device=%llu devices=%zu\n",
          (unsigned long long)g_exec_from_graph.load(),
          (unsigned long long)g_multi_device.load(), g_devices_seen.size());
+    // The CUPTI call guard (issue #99). Every one of these is assertable:
+    //
+    //   cupti_calls        acquisitions; must move on any run that touched CUPTI
+    //   cupti_reentrant    acquisitions by a thread already inside one. NOT
+    //                      expected to be zero: nearly every wrapper call is
+    //                      made inside an outer CallScope, and burst_close
+    //                      nests two deep on purpose. cupti_max_depth is the
+    //                      counter that discriminates -- see below.
+    //   cupti_max_depth    the deepest nesting reached. 3 on a healthy Tier A
+    //                      run (burst_close -> pc_drain_all -> the GetData
+    //                      wrapper), 2 in Tier B and on the context callbacks,
+    //                      1 with PC sampling off. ANYTHING ABOVE 3 means CUPTI
+    //                      re-entered us through a callback while we were
+    //                      inside one of its calls -- the hazard the Task 6
+    //                      report (item 13) and the Task 10 report (item 11)
+    //                      both listed as unverified. This is the answer to
+    //                      them, and before this guard existed that same
+    //                      condition was a self-deadlock rather than a number.
+    //   cupti_waits        acquisitions that had to block. Non-zero is healthy:
+    //                      it is the application's callbacks meeting the timer.
+    //                      Zero on a Tier A run would mean the guard is never
+    //                      contended and therefore proving nothing.
+    //   cupti_try_failed_* the fatal-error teardown finding the guard held, by
+    //                      another thread or by its own. MUST be 0 on a healthy
+    //                      run; they are the two halves of finalize_contended.
+    //   cupti_calls_misplaced  a buffer-completed-only entry point called from
+    //                      outside that callback. MUST be 0: it is the one
+    //                      unguarded hole in the adapter and this is what says
+    //                      nobody widened it.
+    //   timer_ticks/drains/skipped  the merged timer. drains must be about
+    //                      ticks * tick_ms / drain_ms; a drains of 0 with ticks
+    //                      moving is a drain that silently stopped.
+    logf("perfagent-cupti: cupti_calls=%llu cupti_reentrant=%llu cupti_waits=%llu "
+         "cupti_try_failed_self=%llu cupti_try_failed_other=%llu cupti_max_depth=%u "
+         "cupti_calls_misplaced=%llu "
+         "timer_ticks=%llu timer_drains=%llu timer_skipped=%llu\n",
+         (unsigned long long)perfagent::cupti::guard().entries(),
+         (unsigned long long)perfagent::cupti::guard().reentries(),
+         (unsigned long long)perfagent::cupti::guard().waits(),
+         (unsigned long long)perfagent::cupti::guard().try_failed_self(),
+         (unsigned long long)perfagent::cupti::guard().try_failed_other(),
+         perfagent::cupti::guard().max_depth(),
+         (unsigned long long)perfagent::cupti::misplaced_callback_calls().load(),
+         (unsigned long long)(g_tick_plan ? g_tick_plan->ticks() : 0),
+         (unsigned long long)(g_tick_plan ? g_tick_plan->drains() : 0),
+         (unsigned long long)(g_tick_plan ? g_tick_plan->skipped() : 0));
     if (!g_pc_enabled) {
         logf("perfagent-cupti: pc_sampling=off tier_refused=%llu "
              "(set PERFAGENT_GPU_PC_SAMPLING=continuous or =serialized)\n",
@@ -1626,7 +1759,10 @@ void on_tick() {
     // Resample first, so the conversion the flush is about to feed through
     // ClockFit is the freshest offset available.
     resample_clock();
-    cuptiActivityFlushAll(0);
+    // THE call site issue #99 was. It took no lock; it now goes through the
+    // guard like every other, and it cannot be written any other way -- the
+    // raw name does not compile below nvidia/cupti_guard.h.
+    perfagent::cupti::ActivityFlushAll(0);
     g_lb->flush();
     g_eb->flush();
 
@@ -1693,16 +1829,45 @@ void on_tick() {
     g_replay->replay_if_newly_attached(gpu_stall_reason_map_v1_enabled());
 }
 
+// THE tick. One timer thread, and therefore one thread of ours that can ever
+// be inside CUPTI --- which is the structural half of issue #99's fix: it does
+// not exclude the bad state, it makes it unrepresentable. There is no second
+// timer to race with, whatever a future call site does.
+//
+// Order matters. The burst poll runs FIRST, because a burst transition is
+// timestamped by on_burst_tick itself and Tier A's duty fraction is measured
+// from those timestamps: a stop deferred behind a flush lengthens the burst
+// that actually happened. Running it first means a transition waits for at
+// most the PREVIOUS tick's drain, never for this one's.
+//
+// The activity drain is rate-limited on top of the shorter tick by
+// core/tickplan.h, so its period is what it always was (100 ms by default) and
+// the burst poll keeps its own granularity. What the merge costs is stated at
+// tick_period_ns: a slow flush delays the next burst poll by its own duration,
+// and that shows up in `duty=` in the report, which is measured rather than
+// assumed.
+void on_timer_tick() {
+    on_burst_tick();   // a no-op unless Tier A is on; see its head
+    if (!g_tick_plan || g_tick_plan->drain_due(mono_ns())) on_tick();
+}
+
 // The documented CUPTI shutdown hook. Without it the records still sitting in
 // a partly filled CUPTI buffer at exit are lost, and so is whatever is in the
 // batches.
 void at_exit_handler() {
-    // Tier A's duty cycle first of all. The timer thread is stopped before the
-    // controller is asked to close, so no tick can open a burst against
-    // contexts the finalize below is about to disable -- and the open window
-    // is closed with the exit timestamp, which is precisely what makes
-    // end_ns == 0 on the wire mean a HARD exit and nothing else.
-    if (g_burst_timer) g_burst_timer->stop();
+    // The timer thread first of all, and this is a fix in its own right: the
+    // old handler stopped the burst timer and left the DRAIN timer running, so
+    // its cuptiActivityFlushAll ran concurrently with on_finalize's
+    // cuptiPCSamplingDisable below -- the same two-threads-in-CUPTI shape as
+    // issue #99, on the exit path. There is one timer now and it is stopped
+    // and JOINED here, so from this line on the only thread of ours that can
+    // reach CUPTI is this one.
+    //
+    // Stopping before burst_shutdown also means no tick can open a burst
+    // against contexts the finalize below is about to disable, and the open
+    // window is closed with the exit timestamp -- which is precisely what
+    // makes end_ns == 0 on the wire mean a HARD exit and nothing else.
+    if (g_timer) g_timer->stop();
     burst_shutdown();
     // PC sampling next, and specifically before cuptiActivityFlushAll: the
     // finalize handler drains and then disables each context, and
@@ -1711,7 +1876,7 @@ void at_exit_handler() {
     // flush for no reason, and doing it not at all is the undefined state this
     // handler exists to remove.
     on_finalize("exit");
-    cuptiActivityFlushAll(1);
+    perfagent::cupti::ActivityFlushAll(1);
     if (g_lb) g_lb->flush();
     if (g_eb) g_eb->flush();
     if (g_pcb) g_pcb->flush();
@@ -1750,7 +1915,7 @@ uint64_t env_u64(const char *name, uint64_t dflt) {
 bool check(CUptiResult r, const char *what) {
     if (r == CUPTI_SUCCESS) return true;
     const char *msg = "?";
-    cuptiGetResultString(r, &msg);
+    perfagent::cupti::GetResultString(r, &msg);
     logf("perfagent-cupti: %s failed: %s\n", what, msg);
     return false;
 }
@@ -1833,7 +1998,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                                       env_u64("PERFAGENT_GPU_SAMPLE_SEED",
                                               perfagent::Sampler::kDefaultSeed));
     g_names = new perfagent::KernelNameTable();
-    g_drainer = new perfagent::Drainer();
+    g_timer = new perfagent::Drainer();
     // Leaked with the rest, and for the same reason: a CUPTI worker thread
     // can still be inside a RESOURCE callback during teardown, and a
     // destroyed queue under it is a use-after-free in somebody else's
@@ -1925,15 +2090,15 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
         bc.max_duty = (double)env_uint("PERFAGENT_GPU_PC_MAX_DUTY_PERMILLE", 100) / 1000.0;
         bc.max_gap_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_MAX_GAP_MS", 10000) * 1000000ull;
         g_burst = new perfagent::BurstController(bc);
-        // The burst timer's period. A fifth of the burst length by default, so
+        // The burst poll's period. A fifth of the burst length by default, so
         // a "50 ms" burst is 50..60 ms rather than 50..150 ms on the 100 ms
-        // drain tick. It costs one wakeup per period doing an atomic load and
-        // a compare when no transition is due.
+        // drain tick. Since issue #99 this is the period of the ONE timer
+        // thread rather than of a second one; the drain is rate-limited on top
+        // of it. It costs one wakeup per period doing an atomic load and a
+        // compare when no transition is due.
         unsigned burst_tick_ms = env_uint("PERFAGENT_GPU_PC_BURST_TICK_MS",
                                           (unsigned)(bc.burst_ns / 5000000ull));
         if (!burst_tick_ms) burst_tick_ms = 1;
-        g_burst_timer = new perfagent::Drainer();
-        g_burst_timer->on_tick(on_burst_tick);
         logf("perfagent-cupti: tier A duty cycle burst_ms=%llu target_rate=%.0f/s "
              "max_duty=%.3f min_gap_ms=%llu max_gap_ms=%llu tick_ms=%u\n",
              (unsigned long long)(bc.burst_ns / 1000000ull), bc.target_rate, bc.max_duty,
@@ -1942,49 +2107,61 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
         g_burst_tick_ms = burst_tick_ms;
     }
 
-    if (!check(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback, nullptr),
+    if (!check(perfagent::cupti::Subscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback,
+                                          nullptr),
                "cuptiSubscribe"))
         return 0;
     // RUNTIME_API and RESOURCE only. Adding DRIVER_API more than doubled
     // correlation-id consumption in the spike (2.242 vs 1.004 ids per launch),
     // which halves the time to a uint32 wrap, and buys this ABI nothing.
-    check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API),
+    check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API),
           "enable RUNTIME_API");
-    check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE),
+    check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE),
           "enable RESOURCE");
     if (g_pc_enabled) {
         // The only notification that CUPTI is about to finalize itself. Not
         // subscribed when Tier B is off: with no PC sampling enabled there is
         // nothing for the handler to tear down, and the subscription is not
         // free.
-        check(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_STATE),
+        check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_STATE),
               "enable STATE");
     }
 
-    check(cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed),
+    check(perfagent::cupti::ActivityRegisterCallbacks(buffer_requested, buffer_completed),
           "cuptiActivityRegisterCallbacks");
-    check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL),
+    check(perfagent::cupti::ActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL),
           "enable CONCURRENT_KERNEL");
     if (g_pc_enabled) {
         // sm_count and clock_hz for gpu_config_v1 have no other source: CUPTI
         // has no device attribute for either and this adapter does not link
         // libcuda. One record per device, delivered once.
-        check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DEVICE), "enable DEVICE");
+        check(perfagent::cupti::ActivityEnable(CUPTI_ACTIVITY_KIND_DEVICE), "enable DEVICE");
     }
 
     // Seed the fit before any activity record can be converted.
     resample_clock();
 
     const unsigned drain_ms = env_uint("PERFAGENT_GPU_DRAIN_MS", 100);
-    g_drainer->on_tick(on_tick);
-    g_drainer->start(drain_ms);
+    // ONE timer, at the shorter of the two periods, with the drain rate-limited
+    // on top of it. Two timer threads is what issue #99 was; see on_timer_tick
+    // and core/tickplan.h.
+    const uint64_t tick_ns = perfagent::tick_period_ns(
+        (uint64_t)drain_ms * 1000000ull, (uint64_t)g_burst_tick_ms * 1000000ull, g_pc_tier_a);
+    // drain_limit_ns, not the drain period: with Tier A off the timer already
+    // runs at the drain period and a rate limit on top of it would skip any
+    // tick that arrived a hair early. See core/tickplan.h.
+    g_tick_plan = new perfagent::TickPlan(
+        perfagent::drain_limit_ns((uint64_t)drain_ms * 1000000ull, tick_ns));
 
-    // Started AFTER the drain timer and after atexit is armed: a burst that
-    // opened before the exit handler existed could not be closed by it, and
-    // an unclosed window would report a hard exit that did not happen.
-    if (g_burst_timer) g_burst_timer->start(g_burst_tick_ms);
-
+    // ARMED BEFORE THE TIMER STARTS, which the two-timer version got by
+    // accident from its ordering and this one has to get on purpose: a burst
+    // that opened before the exit handler existed could not be closed by it,
+    // and an unclosed window would report a hard exit that did not happen.
     atexit(at_exit_handler);
+
+    g_tick_plan->start(mono_ns());
+    g_timer->on_tick(on_timer_tick);
+    g_timer->start((unsigned)(tick_ns / 1000000ull));
 
     // The seed is logged because it IS the schedule: with it and the period,
     // the exact set of sampled launch ordinals is replayable offline

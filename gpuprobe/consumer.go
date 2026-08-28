@@ -2322,6 +2322,10 @@ func (c *Consumer) noteSamplingWindowLocked(pid uint32, w gpuabi.SamplingWindow,
 		EndNs:       w.EndNs,
 		Mode:        gpu.SamplingMode(w.Mode),
 		Lost:        lost,
+		// Carried through verbatim. DecodeSamplingWindow has already zeroed it
+		// on an open window, so it cannot arrive claiming a quiet interval
+		// after a burst whose end is unknown.
+		NextStartDeltaMs: w.NextStartDeltaMs,
 	}
 	if err := c.cfg.Sink.EmitSamplingWindow(ev); err != nil {
 		c.stats.SinkRejected++

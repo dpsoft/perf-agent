@@ -486,6 +486,30 @@ constexpr uint32_t kPCPeriodMax = 31;
 // this bounds one call's allocation, not the run's data.
 constexpr size_t kPCDefaultCollectNumPcs = 64;
 
+// How often CUPTI's own worker threads wake to move PC data out of the
+// hardware buffer. CUPTI's default is 100 ms, and that is far too slow for
+// this sampling rate: the hardware buffer fills between wakeups, GetData then
+// returns CUPTI_ERROR_OUT_OF_MEMORY, and the data that would have been in it
+// is gone. Issue #106.
+//
+// It was losing an order of magnitude. Tier B, 4000 iterations of
+// cuda_concurrent on a 3090 / CUDA 13.3:
+//
+//   sleep span    OOM polls    PCs     counts    kernels/s
+//     100 ms         48         195     247M      2072.4     <- CUPTI default
+//      25 ms          0        1051     773M      2071.6
+//      10 ms          0        2012     792M      2070.1     <- here
+//       5 ms          0        2124     801M      2070.1
+//
+// Ten times the PCs and no OOM at all, for no measurable GPU throughput cost.
+// Raising the HARDWARE_BUFFER_SIZE to 1 GiB also removes the OOM but recovers
+// far less (361 PCs) and costs a gigabyte, so this is the better of the two
+// mitigations the header lists.
+//
+// 10 ms rather than 5: the same order of magnitude recovered, half the worker
+// wakeups. Below 10 the curve has flattened.
+constexpr unsigned kPCDefaultWorkerSleepMs = 10;
+
 // The bound on that loop. CUPTI hands back remainingNumPcs and we keep
 // pulling, but an unbounded loop inside a drain tick is a hang in somebody
 // else's process; hitting the bound is counted rather than retried forever.
@@ -505,7 +529,8 @@ std::atomic<uint64_t> g_pc_tier_refused{0};
 uint32_t g_pc_period = 0;                 // the exponent actually in force
 size_t g_pc_collect_num_pcs = kPCDefaultCollectNumPcs;
 size_t g_pc_scratch_bytes = 0;            // 0 = CUPTI's default
-size_t g_pc_hw_buffer_bytes = 0;          // 0 = CUPTI's default
+size_t g_pc_hw_buffer_bytes = 0;
+unsigned g_pc_worker_sleep_ms = kPCDefaultWorkerSleepMs;          // 0 = CUPTI's default
 
 // The device's stall-reason table. Queried once, from the first context that
 // enables sampling: the indices are the device's own and are not stable across
@@ -863,7 +888,7 @@ void pc_enable_ctx(CUcontext ctx) {
     }
     pc_setup_buffer(c);
 
-    CUpti_PCSamplingConfigurationInfo info[8]{};
+    CUpti_PCSamplingConfigurationInfo info[10]{};
     size_t n = 0;
     info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
     info[n++].attributeData.collectionModeData.collectionMode =
@@ -901,6 +926,12 @@ void pc_enable_ctx(CUcontext ctx) {
     if (g_pc_hw_buffer_bytes) {
         info[n].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE;
         info[n++].attributeData.hardwareBufferSizeData.hardwareBufferSize = g_pc_hw_buffer_bytes;
+    }
+    if (g_pc_worker_sleep_ms) {
+        info[n].attributeType =
+            CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_WORKER_THREAD_PERIODIC_SLEEP_SPAN;
+        info[n++].attributeData.workerThreadPeriodicSleepSpanData.workerThreadPeriodicSleepSpan =
+            g_pc_worker_sleep_ms;
     }
     // In Tier B, ENABLE_START_STOP_CONTROL is deliberately left off: turning
     // it on in CONTINUOUS mode would change when a flush is required
@@ -988,6 +1019,18 @@ void pc_drain_ctx_locked(PCContext *c) {
         if (st == CUPTI_ERROR_OUT_OF_MEMORY) {
             // The documented "hardware buffer is full" return. The PC data for
             // this window is gone; the fact that it is gone is not.
+            //
+            // The 1 is an OCCURRENCE, not a sample count, and the two are not
+            // close: measured on a 3090, a run taking 48 of these returned 195
+            // PCs where the same run taking none returned 2012. CUPTI does not
+            // say how much was lost --- droppedSamples stays 0 through all of
+            // it, because these samples never reached the counter that feeds
+            // it. So the count here cannot be made honest, and the number that
+            // matters is how OFTEN this fires, not what it sums to. Nothing
+            // downstream should read this class as "N samples lost".
+            //
+            // With kPCDefaultWorkerSleepMs it should fire zero times. See the
+            // exit warning, which names the remedy.
             g_pc_buffer_full.fetch_add(1, std::memory_order_relaxed);
             emit_dropped(1, GPU_DROP_CLASS_PC_BUFFER_FULL);
             return;
@@ -1079,12 +1122,13 @@ void pc_drain_all(perfagent::PCDrainReason reason) {
 // start_ns, and supersedes the open one in the consumer's store. A closed
 // record never loses to an open one there, so the two orderings a lossy
 // transport can produce both end up correct.
-void emit_window(uint64_t start_ns, uint64_t end_ns) {
+void emit_window(uint64_t start_ns, uint64_t end_ns, uint32_t next_start_delta_ms) {
     if (!gpu_sampling_window_v1_enabled()) return;
     gpu_sampling_window_v1 w{};
     w.start_ns = start_ns;
     w.end_ns = end_ns;
     w.mode = GPU_SAMPLING_MODE_KERNEL_SERIALIZED;
+    w.next_start_delta_ms = next_start_delta_ms;
     // UNBATCHED, like gpu_dropped_v1 and for the same reason: two records per
     // burst at a few bursts per second is not volume, and a window still
     // sitting in a partly filled batch when the process dies is a window that
@@ -1197,6 +1241,34 @@ void pc_stop_ctxs_locked() {
     }
 }
 
+// How long the controller guarantees no further burst can open, as
+// milliseconds after now_ns, for gpu_sampling_window_v1.next_start_delta_ms.
+//
+// This is a GUARANTEE rather than a plan: BurstController::poll_open refuses
+// to start before next_start_ns(), so a consumer can treat the interval as
+// proven quiet and answer "not serialized" over it instead of "cannot tell".
+// Read after closed(), which is what finishes moving the gap.
+//
+// 0 means "not stated" and is the safe answer: it is what a consumer that has
+// never heard of this field infers, and it costs only certainty. Anything that
+// cannot be expressed exactly lands there rather than on a guess.
+constexpr uint32_t kWindowQuietNever = 0xFFFFFFFFu;
+
+uint32_t burst_quiet_ms(uint64_t now_ns) {
+    if (!g_burst) return 0;
+    // Refused means no burst opens again for the life of the process ---
+    // teardown, or the CUDA-graph refusal. That is the strongest statement
+    // available and it is exactly what covers the tail of an ordinary run.
+    if (g_burst->refused()) return kWindowQuietNever;
+    const uint64_t next = g_burst->next_start_ns();
+    if (next <= now_ns) return 0;
+    const uint64_t ms = (next - now_ns) / 1000000ull;
+    // Clamp below the sentinel: a gap long enough to collide with it would be
+    // 49 days, but "impossible" is not a thing this pipeline asserts.
+    if (ms >= (uint64_t)kWindowQuietNever) return kWindowQuietNever - 1;
+    return (uint32_t)ms;
+}
+
 // Closes an open burst: stop every context, drain (CUPTI requires the flush
 // after every range end), close the window, and hand the yield to the loop.
 //
@@ -1229,7 +1301,6 @@ void burst_close(uint64_t now_ns, uint64_t start_ns) {
     // only arrive on the post-stop flush are counted where they belong.
     if (g_pc_pcs.load(std::memory_order_relaxed) == pcs_at_open)
         g_bursts_empty.fetch_add(1, std::memory_order_relaxed);
-    emit_window(start_ns, now_ns);
     g_sampling_burst_ns.fetch_add(now_ns > start_ns ? now_ns - start_ns : 0,
                                   std::memory_order_relaxed);
     // AFTER the drain, which is the whole reason BurstController::closed is a
@@ -1238,6 +1309,11 @@ void burst_close(uint64_t now_ns, uint64_t start_ns) {
     // time would measure every burst as having yielded nothing and would sit
     // at the duty floor for the entire run.
     if (g_burst) g_burst->closed(g_pc_records.load(std::memory_order_relaxed));
+    // AFTER closed(), and that ordering is the whole point of emitting here
+    // rather than above: closed() is what finishes moving the gap, so a record
+    // written before it would promise a quiet interval the controller had not
+    // yet committed to --- and could then shorten. Issue #105.
+    emit_window(start_ns, now_ns, burst_quiet_ms(now_ns));
 }
 
 // Tier A's two transitions, taken on the APPLICATION's thread at a kernel-launch
@@ -1327,7 +1403,7 @@ void burst_open_at_launch(uint64_t now) {
         // "true" that were not perturbed, which is the SAFE direction: the
         // answer that must never be reachable by accident is "false", and no
         // path here can produce it.
-        emit_window(now, 0);   // open; closed by the EXIT below
+        emit_window(now, 0, 0);   // open; closed by the EXIT below
     }
     note_graph_refusal(was_refused, graphs);
 }
@@ -2004,6 +2080,22 @@ void report(const char *why) {
     // so this is an inequality, not an equation, and it is stated here rather
     // than claimed anywhere as a check. Closing it would need a
     // gpu_config_v2 field, which is not worth a version bump for a diagnostic.
+    // Issue #106. Zero on a healthy run, and if it is not zero the run lost PC
+    // data it cannot quantify --- so this names the knob rather than leaving
+    // the operator to find it. Loud because the old behaviour was to lose an
+    // order of magnitude of samples in silence, with every other counter on
+    // the path reading clean (dropped_hw=0 in particular, which looks like
+    // proof that nothing was lost and is not).
+    if (g_pc_buffer_full.load()) {
+        logf("perfagent-cupti: WARNING cuptiPCSamplingGetData returned "
+             "CUPTI_ERROR_OUT_OF_MEMORY %llu time(s): CUPTI's hardware buffer filled and the "
+             "PC data in it was DISCARDED. How much is unknowable --- droppedSamples does not "
+             "count it. PERFAGENT_GPU_PC_WORKER_SLEEP_MS is %u; lowering it drains the buffer "
+             "more often and is the cheap fix (100ms->10ms took this from 48 occurrences to 0 "
+             "and 195 PCs to 2012 on GA102). PERFAGENT_GPU_PC_HW_BUFFER_MB and a longer "
+             "PERFAGENT_GPU_PC_PERIOD also work. See issue #106.\n",
+             (unsigned long long)g_pc_buffer_full.load(), g_pc_worker_sleep_ms);
+    }
     logf("perfagent-cupti: pc identity (log only, not a check): "
          "emitted_counts + dropped_hw + non_user = %llu <= total_samples = %llu; "
          "the gap is instructions with all selected stall counts zero, which "
@@ -2333,6 +2425,8 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                                         (unsigned)kPCDefaultCollectNumPcs);
         g_pc_scratch_bytes = (size_t)env_uint("PERFAGENT_GPU_PC_SCRATCH_MB", 0) << 20;
         g_pc_hw_buffer_bytes = (size_t)env_uint("PERFAGENT_GPU_PC_HW_BUFFER_MB", 0) << 20;
+        g_pc_worker_sleep_ms =
+            env_uint("PERFAGENT_GPU_PC_WORKER_SLEEP_MS", kPCDefaultWorkerSleepMs);
         g_pcb = new perfagent::Batch<gpu_pc_sample_batch_v1, 32>(
             gpu_pc_sample_batch_v1_emit, gpu_pc_sample_batch_v1_enabled);
         // The PC drain rides the drain timer, so its period is the drain

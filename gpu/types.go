@@ -422,6 +422,13 @@ type GPUSamplingWindow struct {
 	// rather than spanning across the hole and reporting an unknown interval
 	// as a proven one.
 	Lost uint64 `json:"lost,omitempty"`
+
+	// NextStartDeltaMs, on a closed window, is the producer's guarantee that
+	// no further burst opens before EndNs + this. Zero means it did not say;
+	// gpuabi.QuietNever means never again. It is what lets the interval after
+	// the last known burst be answered "not serialized" instead of being
+	// conceded as unknown — see the windowStore's coverage logic and #105.
+	NextStartDeltaMs uint32 `json:"next_start_delta_ms,omitempty"`
 }
 
 // Open reports whether this window never closed. See the EndNs doc comment:

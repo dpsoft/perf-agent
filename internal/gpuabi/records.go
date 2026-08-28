@@ -238,7 +238,22 @@ type SamplingWindow struct {
 	StartNs uint64
 	EndNs   uint64
 	Mode    uint8
+
+	// NextStartDeltaMs, on a closed window, is how long after EndNs the
+	// producer guarantees no further burst can open. Zero means the producer
+	// did not say — which is what an older producer's zero padding decodes to,
+	// so it is also the safe reading. QuietNever means never again.
+	//
+	// It is what lets the tail of a run be answered "not serialized" rather
+	// than "unknown": without it a missing open record and a genuine gap are
+	// indistinguishable, so everything after the last known burst has to be
+	// conceded. See the windowStore's coverage logic.
+	NextStartDeltaMs uint32
 }
+
+// QuietNever is NextStartDeltaMs meaning the producer has refused all further
+// bursts for the life of the process — teardown, or the CUDA-graph refusal.
+const QuietNever uint32 = 0xFFFFFFFF
 
 // Open reports whether the window never closed. An execution at or after an
 // open window's StartNs is "unknown", never "not serialized": the producer
@@ -297,6 +312,15 @@ func DecodeSamplingWindow(b []byte) (SamplingWindow, error) {
 		StartNs: le.Uint64(b[0:]),
 		EndNs:   le.Uint64(b[8:]),
 		Mode:    b[16],
+		// b[17:20] is padding. The field rides in the tail of the record's
+		// existing 7 padding bytes, so the wire size is unchanged at 24 and
+		// REC_SAMPLING_WINDOW in the BPF side needs no version bump.
+		NextStartDeltaMs: le.Uint32(b[20:]),
+	}
+	// Meaningless on an open window, and a producer that sets it there is
+	// confused rather than informative. Dropped rather than trusted.
+	if out.EndNs == 0 {
+		out.NextStartDeltaMs = 0
 	}
 	// EndNs == 0 is the encoded "still open" case, not an inversion.
 	if out.EndNs != 0 && out.EndNs < out.StartNs {

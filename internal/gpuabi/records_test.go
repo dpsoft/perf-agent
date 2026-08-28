@@ -336,3 +336,47 @@ func TestDropClassesAreDistinctAndNonZero(t *testing.T) {
 	// still render as losses rather than vanish or be guessed at.
 	assert.Equal(t, "unknown-class-200", DropClassName(200))
 }
+
+// A quiet promise is meaningless on an open window — nobody knows when the
+// burst ended, so "nothing started for N ms after it" says nothing. It is
+// dropped here, at the wire, rather than relied on being ignored downstream.
+//
+// This is tested at this level deliberately: gpu.samplingWindow.provenQuietUntil
+// also refuses open windows, so a test that goes through the store cannot tell
+// the two guards apart and passes with either one removed.
+func TestAQuietPromiseIsDroppedFromAnOpenWindowAtTheWire(t *testing.T) {
+	b := make([]byte, SizeSamplingWindow)
+	binary.LittleEndian.PutUint64(b[0:], 1000)
+	binary.LittleEndian.PutUint64(b[8:], 0) // open
+	b[16] = SamplingModeKernelSerialized
+	binary.LittleEndian.PutUint32(b[20:], QuietNever)
+
+	w, err := DecodeSamplingWindow(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !w.Open() {
+		t.Fatal("window should be open")
+	}
+	if w.NextStartDeltaMs != 0 {
+		t.Fatalf("quiet promise survived on an open window: got %d, want 0", w.NextStartDeltaMs)
+	}
+}
+
+// The closed case, so the test above is not passing merely because the field
+// never decodes at all.
+func TestAQuietPromiseSurvivesOnAClosedWindow(t *testing.T) {
+	b := make([]byte, SizeSamplingWindow)
+	binary.LittleEndian.PutUint64(b[0:], 1000)
+	binary.LittleEndian.PutUint64(b[8:], 2000)
+	b[16] = SamplingModeKernelSerialized
+	binary.LittleEndian.PutUint32(b[20:], 950)
+
+	w, err := DecodeSamplingWindow(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if w.NextStartDeltaMs != 950 {
+		t.Fatalf("quiet promise lost: got %d, want 950", w.NextStartDeltaMs)
+	}
+}

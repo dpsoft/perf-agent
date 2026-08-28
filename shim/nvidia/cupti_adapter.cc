@@ -2357,7 +2357,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
         bc.target_rate = (double)env_uint("PERFAGENT_GPU_PC_TARGET_RATE", 100);
         // Per-mille, so a ceiling can be expressed without a float in the
         // environment. 100 = 10%.
-        bc.max_duty = (double)env_uint("PERFAGENT_GPU_PC_MAX_DUTY_PERMILLE", 100) / 1000.0;
+        bc.max_duty = (double)env_uint("PERFAGENT_GPU_PC_MAX_DUTY_PERMILLE", 50) / 1000.0;
         bc.max_gap_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_MAX_GAP_MS", 10000) * 1000000ull;
         g_burst = new perfagent::BurstController(bc);
         // No burst tick, and no PERFAGENT_GPU_PC_BURST_TICK_MS: issue #101

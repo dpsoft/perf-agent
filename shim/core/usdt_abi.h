@@ -184,11 +184,28 @@ struct gpu_stall_reason_map_v1 {
 // "unknown", never "not serialized". The ordinary teardown path closes the
 // window with the exit timestamp, so a zero here is specifically the hard
 // case.
+// next_start_delta_ms, on a CLOSED record, is how long after end_ns the
+// producer guarantees no further burst can OPEN. It is what lets a consumer
+// say "not serialized" about the interval after the last burst it heard about,
+// instead of "cannot tell": without it, the tail of every run is unknown,
+// because a missing open record and a genuine gap look identical.
+//
+//   0            not stated. Means exactly what the absence of the field meant
+//                before it existed, so an old producer's zero-filled padding
+//                decodes as today's behaviour and nothing has to be versioned.
+//   0xFFFFFFFF   never. The producer has refused further bursts for the rest
+//                of the process --- teardown, or the CUDA-graph refusal.
+//   otherwise    milliseconds. No burst opens before end_ns + this.
+//
+// It occupies padding, so the record is still 24 bytes and REC_SAMPLING_WINDOW
+// in bpf/gpu_usdt.bpf.c is unchanged. It is meaningless on an OPEN record
+// (end_ns == 0) and is written zero there.
 struct gpu_sampling_window_v1 {
     uint64_t start_ns;
     uint64_t end_ns;
     uint8_t  mode;
-    uint8_t  _pad[7];
+    uint8_t  _pad[3];
+    uint32_t next_start_delta_ms;
 };
 
 GPU_STATIC_ASSERT(sizeof(struct gpu_launch_v1) == 48, "gpu_launch_v1 layout");

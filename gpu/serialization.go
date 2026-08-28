@@ -1,6 +1,11 @@
 package gpu
 
-import "sort"
+import (
+	"math"
+	"sort"
+
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
+)
 
 // The serialization disclosure: which executions ran while GPU kernels were
 // being serialized by the profiler, which provably did not, and which cannot
@@ -50,6 +55,32 @@ type samplingWindow struct {
 	startNs uint64
 	endNs   uint64 // 0 = still open when the producer stopped reporting
 	mode    SamplingMode
+	// quietMs is the producer's guarantee that no further burst opens before
+	// endNs + quietMs. Zero means it did not say. gpuabi.QuietNever means
+	// never again. See provenQuietUntil.
+	quietMs uint32
+}
+
+// provenQuietUntil is the last instant this window proves nothing further had
+// started, and the second return says whether it proves anything at all.
+//
+// This is the ONLY thing that lets the interval after the last known burst be
+// answered. Without it a genuine gap and an open record that was simply lost
+// look the same from here, so the tail of every run has to be conceded as
+// unknown — and the longer the duty cycle's gap, the more of the run that is.
+// At a 1% duty that was ~12% of executions (issue #105).
+func (w samplingWindow) provenQuietUntil() (uint64, bool) {
+	if w.open() || w.quietMs == 0 {
+		return 0, false
+	}
+	if w.quietMs == gpuabi.QuietNever {
+		return math.MaxUint64, true
+	}
+	end := w.endNs + uint64(w.quietMs)*1e6
+	if end < w.endNs { // overflow; the producer said something absurd
+		return 0, false
+	}
+	return end, true
 }
 
 func (w samplingWindow) open() bool { return w.endNs == 0 }
@@ -166,7 +197,7 @@ func (s *windowStore) add(w GPUSamplingWindow) {
 		set.haveCoverage = true
 	}
 
-	nw := samplingWindow{startNs: w.StartNs, endNs: w.EndNs, mode: w.Mode}
+	nw := samplingWindow{startNs: w.StartNs, endNs: w.EndNs, mode: w.Mode, quietMs: w.NextStartDeltaMs}
 	// Windows arrive in start order from one producer, so the common case is
 	// an append or a match against the tail. The scan is backwards for that
 	// reason and is bounded by maxPerPID in the worst case.
@@ -200,9 +231,21 @@ func (s *windowStore) add(w GPUSamplingWindow) {
 //
 // An OPEN window ends coverage at its own start: the burst was running from
 // there and nothing says when — or whether — it stopped. Otherwise coverage
-// runs to the end of the last closed burst. It deliberately does NOT extend
-// past that: the next burst's open record may simply not have been drained
-// yet, so the interval after the last known window is not a proven gap.
+// runs to the end of the last closed burst, PLUS whatever quiet interval that
+// burst's record promised.
+//
+// Without such a promise it must not extend past the last window at all: the
+// next burst's open record may simply not have been drained yet, so the
+// interval after it is not a proven gap. That conservatism was correct and it
+// was expensive — the whole tail of every run read "unknown", and the longer
+// the duty cycle's gap the more of the run that was (issue #105). The promise
+// removes the ambiguity at its source: the producer's controller refuses to
+// open a burst before a known instant, so it can simply say so, and a gap is
+// then distinguishable from a lost record.
+//
+// An open window still caps everything, promise or no promise: it is evidence
+// that a burst WAS running, which outranks an earlier record's claim about
+// when the next one could start.
 func (set *windowSet) coverageEndNs() (uint64, bool) {
 	if !set.haveCoverage || len(set.wins) == 0 {
 		return 0, false
@@ -216,10 +259,23 @@ func (set *windowSet) coverageEndNs() (uint64, bool) {
 		if w.open() {
 			// The earliest open window at or after the coverage start caps
 			// everything. wins is start-ordered, so this is the answer.
+			//
+			// Redundant with classify's intersects scan, which reaches any
+			// execution at or after this start anyway because an open window
+			// is [startNs, +inf) — removing this line does not change a single
+			// answer, and no test here can tell. It stays because the cap it
+			// expresses is a property of COVERAGE, and a future caller of
+			// coverageEndNs that is not classify would need it and would have
+			// no reason to suspect it was missing.
 			return w.startNs, true
 		}
+		// The window's own end is always proven. Its promised quiet interval
+		// extends that, when the producer made one.
 		if !have || w.endNs > end {
 			end, have = w.endNs, true
+		}
+		if q, ok := w.provenQuietUntil(); ok && q > end {
+			end = q
 		}
 	}
 	return end, have

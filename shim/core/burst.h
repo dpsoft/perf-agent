@@ -318,6 +318,12 @@ public:
     }
 
     bool sampling() const { std::lock_guard<std::mutex> g(mu_); return sampling_; }
+    // The earliest instant a further burst may open. poll_open refuses until
+    // then, so this is a GUARANTEE and not an intention --- which is what lets
+    // the adapter put it on the wire for a consumer to reason with. Only
+    // meaningful once a burst has closed; read it after closed() so the
+    // controller has finished moving the gap.
+    uint64_t next_start_ns() const { std::lock_guard<std::mutex> g(mu_); return next_start_ns_; }
     bool refused() const { std::lock_guard<std::mutex> g(mu_); return refused_; }
     // The start timestamp of the burst that is currently open. Zero when none
     // is; the caller checks sampling() rather than testing this for zero.

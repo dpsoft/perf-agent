@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dpsoft/perf-agent/internal/gpuabi"
 )
 
 // The serialization disclosure, end to end through Timeline.
@@ -540,4 +542,100 @@ func TestSerializationFalseIsOnlyEverReachedFromPositiveEvidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// burstQuiet is a closed burst that also carries the producer's guarantee that
+// nothing further starts for quietMs after it ends.
+func burstQuiet(pid uint32, startNs, endNs uint64, quietMs uint32) GPUSamplingWindow {
+	w := burst(pid, startNs, endNs)
+	w.NextStartDeltaMs = quietMs
+	return w
+}
+
+// Issue #105. The interval after the last burst a consumer heard about used to
+// be conceded as "unknown", because a genuine gap and a lost open record look
+// identical from here. It cost more the lower the duty cycle went — at a 1%
+// duty, ~12% of executions in a real benchmark run.
+//
+// The producer's controller refuses to open a burst before a known instant, so
+// it now says so, and the two cases become distinguishable.
+func TestAQuietIntervalPromiseAnswersTheTailInsteadOfConcedingIt(t *testing.T) {
+	tl := tierATimeline()
+	// One burst over [100ms, 150ms], then a promised 950ms of quiet.
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 100e6, 0)))
+	require.NoError(t, tl.EmitSamplingWindow(burstQuiet(tierAPID, 100e6, 150e6, 950)))
+
+	// Inside the burst; well inside the promised quiet; at its very end; and
+	// one nanosecond past it.
+	require.NoError(t, tl.EmitExec(serializedExec("in", 120e6, 130e6)))
+	require.NoError(t, tl.EmitExec(serializedExec("quiet", 400e6, 500e6)))
+	require.NoError(t, tl.EmitExec(serializedExec("edge", 1000e6, 1100e6)))
+	require.NoError(t, tl.EmitExec(serializedExec("past", 1100e6, 1100e6+1)))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, []string{"true", "false", "false", "unknown"}, states(snap),
+		"the promised interval is answerable; the instant past it is not")
+	assertSumIdentity(t, snap)
+}
+
+// The promise is opt-in on the wire. A producer that does not make one — an
+// older shim, whose padding decodes as zero — must get exactly the old
+// answer, because that is the whole reason the field could ride in padding
+// without a version bump.
+func TestWithoutAQuietPromiseTheTailIsStillUnknown(t *testing.T) {
+	tl := tierATimeline()
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 100e6, 0)))
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 100e6, 150e6))) // quietMs 0
+	require.NoError(t, tl.EmitExec(serializedExec("after", 400e6, 500e6)))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, []string{"unknown"}, states(snap))
+	assertSumIdentity(t, snap)
+}
+
+// QuietNever is the teardown and graph-refusal case: no burst opens again for
+// the life of the process, so the whole remainder of the run is answerable.
+func TestQuietNeverAnswersTheWholeRemainderOfTheRun(t *testing.T) {
+	tl := tierATimeline()
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 100e6, 0)))
+	require.NoError(t, tl.EmitSamplingWindow(burstQuiet(tierAPID, 100e6, 150e6, gpuabi.QuietNever)))
+	require.NoError(t, tl.EmitExec(serializedExec("far", 1e15, 1e15+1e6)))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, []string{"false"}, states(snap))
+	assertSumIdentity(t, snap)
+}
+
+// A promise must never outrank evidence. An OPEN window says a burst WAS
+// running; an earlier record's claim about when the next one could start
+// cannot talk over it, whatever it promised — otherwise a lost close record
+// would turn a perturbed tail into a confident "false", which is the one
+// answer that must never be reachable by accident.
+func TestAnOpenWindowBeatsAnEarlierQuietPromise(t *testing.T) {
+	tl := tierATimeline()
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 100e6, 0)))
+	require.NoError(t, tl.EmitSamplingWindow(burstQuiet(tierAPID, 100e6, 150e6, gpuabi.QuietNever)))
+	// A later burst that never closed, inside the "never" the first promised.
+	require.NoError(t, tl.EmitSamplingWindow(burst(tierAPID, 600e6, 0)))
+	require.NoError(t, tl.EmitExec(serializedExec("before", 300e6, 400e6)))
+	require.NoError(t, tl.EmitExec(serializedExec("after", 700e6, 800e6)))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, []string{"false", "unknown"}, states(snap),
+		"coverage still stops dead at the open window despite the never-promise")
+	assertSumIdentity(t, snap)
+}
+
+// A promise on an OPEN record is meaningless and is dropped at the wire, so it
+// cannot extend coverage past a burst whose end nobody knows.
+func TestAQuietPromiseOnAnOpenRecordIsIgnored(t *testing.T) {
+	w := burstQuiet(tierAPID, 100e6, 0, gpuabi.QuietNever)
+	assert.Equal(t, uint64(0), w.EndNs)
+	tl := tierATimeline()
+	require.NoError(t, tl.EmitSamplingWindow(w))
+	require.NoError(t, tl.EmitExec(serializedExec("after", 400e6, 500e6)))
+
+	snap := tl.Snapshot()
+	assert.Equal(t, []string{"unknown"}, states(snap))
+	assertSumIdentity(t, snap)
 }

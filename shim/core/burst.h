@@ -69,9 +69,28 @@ struct BurstConfig {
     // The (PC, stall) pairs per second the loop holds. Parca's default.
     double target_rate = 100.0;
 
-    // The hard ceiling on burst/(burst+gap). 0.1 means at most a tenth of
+    // The hard ceiling on burst/(burst+gap). 0.05 means at most a twentieth of
     // wall-clock time may run serialized. Clamped into (0, 1] on use.
-    double max_duty = 0.1;
+    //
+    // 0.05 and not the 0.1 this shipped with, because 0.1 was measured over
+    // budget. `make bench-gpu-pc-overhead` on a 3090 / CUDA 13.3, 120000
+    // kernels of fixed work per run, 5 interleaved runs per arm:
+    //
+    //   duty    wall ms    cost     cost/duty
+    //    10%    63459.2   +8.93%      0.89
+    //     5%    60766.2   +4.31%      0.86      <- ships here
+    //   2.5%    59446.4   +2.04%      0.82
+    //     1%    58704.6   +0.77%      0.77
+    //
+    // (baseline 58256.2 ms; Tier B -0.03%.) The 10% arm exceeds the overhead
+    // bar, the 5% arm is inside it on both, and the benchmark's own verdict was
+    // TIER_A_SHIPS_AT_A_SMALLER_DUTY. Cost is slightly SUB-linear in duty ---
+    // cost/duty falls from 0.89 to 0.77 --- so halving the ceiling buys back
+    // slightly more than half the cost.
+    //
+    // With the 50 ms burst this pairs with a 950 ms minimum gap, which is
+    // exactly the arm that was measured.
+    double max_duty = 0.05;
 
     // The longest the loop may space bursts out. Without it a workload that
     // produces a huge pair count in one burst would push the next burst out

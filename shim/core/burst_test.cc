@@ -70,9 +70,14 @@ static SimResult simulate(BurstConfig cfg, uint64_t pairs_per_burst, unsigned cy
 int main() {
     // ---- The duty ceiling, derived rather than asserted by eye.
     {
-        BurstConfig cfg;  // 50 ms burst, 10% ceiling
+        BurstConfig cfg;  // 50 ms burst, 5% ceiling
         const uint64_t lo = burst_min_gap_ns(cfg);
-        assert(lo == 450 * kMs);
+        // gap >= burst * (1/max_duty - 1) = 50ms * 19 = 950ms. The literal is
+        // kept alongside the derivation on purpose: it is what catches the
+        // default moving without anyone noticing, and it moved once already
+        // when the measured overhead at a 10% ceiling came in over budget.
+        assert(lo == 950 * kMs);
+        assert(lo == (uint64_t)((double)cfg.burst_ns * (1.0 / cfg.max_duty - 1.0)));
         const double duty = (double)cfg.burst_ns / (double)(cfg.burst_ns + lo);
         assert(duty <= cfg.max_duty + 1e-12);
     }

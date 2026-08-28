@@ -85,20 +85,35 @@ struct BurstConfig {
     double gain = 0.5;
 };
 
-// The smallest gap the duty ceiling permits after a burst of cfg.burst_ns.
+// The smallest gap the duty ceiling permits after a burst that ACTUALLY ran for
+// dur_ns.
 //
 // duty = burst / (burst + gap) <= max_duty  <=>  gap >= burst * (1/max_duty - 1)
 //
 // max_duty is clamped into (0, 1] first: a zero or negative ceiling would ask
 // for an infinite gap and a ceiling above 1 is not a ceiling at all.
-inline uint64_t burst_min_gap_ns(const BurstConfig &cfg) {
+//
+// dur_ns is a parameter rather than cfg.burst_ns because since issue #101 a
+// burst does not end when it wants to: both transitions happen on the
+// application's launch callbacks, so a burst closes at the first launch AFTER
+// its length elapses and overruns by however long the application took to get
+// there. On a workload that synchronises between launch groups that was
+// measured at 50 ms configured -> 104 ms actual, which drove the ACHIEVED duty
+// to 0.17 against a ceiling of 0.10. Charging the gap for the burst that
+// happened instead of the one that was asked for is what keeps the ceiling a
+// hard bound rather than an aspiration.
+inline uint64_t burst_min_gap_for_ns(const BurstConfig &cfg, uint64_t dur_ns) {
     double duty = cfg.max_duty;
     if (!(duty > 0.0)) duty = 0.001;  // also catches NaN
     if (duty > 1.0) duty = 1.0;
-    const double g = (double)cfg.burst_ns * (1.0 / duty - 1.0);
+    const double g = (double)dur_ns * (1.0 / duty - 1.0);
     if (!(g > 0.0)) return 0;
     if (g >= (double)cfg.max_gap_ns) return cfg.max_gap_ns;
     return (uint64_t)g;
+}
+
+inline uint64_t burst_min_gap_ns(const BurstConfig &cfg) {
+    return burst_min_gap_for_ns(cfg, cfg.burst_ns);
 }
 
 // THE LOOP, as a pure function of (target rate, observed rate, elapsed).
@@ -199,25 +214,47 @@ public:
     // shape this API offers.
     BurstAction poll(uint64_t now_ns, bool graphs_observed) {
         std::lock_guard<std::mutex> g(mu_);
-        if (graphs_observed && !refused_) {
-            refused_ = true;
-            graph_refusals_++;
-        }
-        if (sampling_) {
-            if (refused_) return stop_locked(now_ns, BurstStopReason::kGraph);
-            if (now_ns - burst_start_ns_ < cfg_.burst_ns) return BurstAction::kNone;
-            return stop_locked(now_ns, BurstStopReason::kDutyCycle);
-        }
-        if (refused_) return BurstAction::kNone;
-        if (started_ && now_ns < next_start_ns_) return BurstAction::kNone;
-        sampling_ = true;
-        if (!started_) {
-            started_ = true;
-            first_start_ns_ = now_ns;
-        }
-        burst_start_ns_ = now_ns;
-        bursts_++;
-        return BurstAction::kStart;
+        note_graphs_locked(graphs_observed);
+        if (sampling_) return close_locked(now_ns);
+        return open_locked(now_ns);
+    }
+
+    // The two HALVES of poll(), for a caller that can only act on one of them
+    // at this instant.
+    //
+    // Issue #101: the CUPTI calls this class schedules cannot be made from a
+    // thread of our own --- cuptiPCSamplingStop taken on a timer deadlocks
+    // against the application's own launch path inside CUPTI. They have to run
+    // on the application's thread, from inside the launch callback, which
+    // means the START fires at a launch ENTER and the STOP at a launch EXIT.
+    // Those are two different call sites and each can act on exactly one of
+    // the two transitions.
+    //
+    // Splitting is not optional and a `sampling()` test at the call site does
+    // NOT stand in for it. poll() is side-effecting: it COMMITS the transition
+    // it returns. A launch EXIT that called poll() and got kStart --- which it
+    // can, if the burst it meant to close was already closed by another thread
+    // and the gap has since elapsed --- would have opened a burst in the
+    // controller that the call site is not able to act on, leaving CUPTI
+    // stopped while this class believes it is sampling. That is the failure
+    // this pair makes unrepresentable rather than unlikely: poll_open never
+    // returns kStop and poll_close never returns kStart, whatever the state
+    // and whatever raced.
+    //
+    // Both halves still observe the graph refusal, because either call site
+    // may be the first to see a graph launch.
+    BurstAction poll_open(uint64_t now_ns, bool graphs_observed) {
+        std::lock_guard<std::mutex> g(mu_);
+        note_graphs_locked(graphs_observed);
+        if (sampling_) return BurstAction::kNone;
+        return open_locked(now_ns);
+    }
+
+    BurstAction poll_close(uint64_t now_ns, bool graphs_observed) {
+        std::lock_guard<std::mutex> g(mu_);
+        note_graphs_locked(graphs_observed);
+        if (!sampling_) return BurstAction::kNone;
+        return close_locked(now_ns);
     }
 
     // Called after the range-end flush, with the process-wide RUNNING TOTAL of
@@ -243,6 +280,10 @@ public:
         pairs_ += pairs;
         const uint64_t elapsed = last_burst_dur_ + gap_ns_;
         gap_ns_ = burst_next_gap_ns(cfg_, gap_ns_, pairs, elapsed);
+        // The loop clamps to the floor for a NOMINAL burst; this raises it to
+        // the floor for the one that ran. Without it an overrunning burst
+        // breaks the duty ceiling, which is documented as a hard bound.
+        gap_ns_ = gap_for_duration_locked(last_burst_dur_);
         next_start_ns_ = last_burst_end_ns_ + gap_ns_;
     }
 
@@ -280,6 +321,15 @@ public:
     // The duty fraction actually achieved so far, over the interval since the
     // first burst opened. Reported rather than assumed: max_duty bounds what
     // the loop may ASK for, and this is what the process actually did.
+    //
+    // It OVER-reports by up to one gap, and that is arithmetic rather than a
+    // fault: the interval ends wherever the caller asks, which at process exit
+    // is typically just after a burst closed and long before the gap that
+    // burst is owed has elapsed. The numerator has the whole burst, the
+    // denominator has none of its gap. A run reporting duty=0.125 against a
+    // ceiling of 0.10 at exit is the expected shape of a bound that holds over
+    // complete cycles, not evidence that it was breached; core/burst_test.cc
+    // asserts the bound at a cycle boundary for exactly this reason.
     double duty(uint64_t now_ns) const {
         std::lock_guard<std::mutex> g(mu_);
         if (!started_ || now_ns <= first_start_ns_) return 0.0;
@@ -287,6 +337,42 @@ public:
     }
 
 private:
+    // gap_ns_ raised to whatever the duty ceiling demands after a burst of
+    // dur_ns. Never lowers it: the controller owns the gap upward, this only
+    // enforces the bound.
+    uint64_t gap_for_duration_locked(uint64_t dur_ns) const {
+        const uint64_t floor = burst_min_gap_for_ns(cfg_, dur_ns);
+        return gap_ns_ > floor ? gap_ns_ : floor;
+    }
+
+    void note_graphs_locked(bool graphs_observed) {
+        if (graphs_observed && !refused_) {
+            refused_ = true;
+            graph_refusals_++;
+        }
+    }
+
+    // Precondition: !sampling_. Returns kStart or kNone, never kStop.
+    BurstAction open_locked(uint64_t now_ns) {
+        if (refused_) return BurstAction::kNone;
+        if (started_ && now_ns < next_start_ns_) return BurstAction::kNone;
+        sampling_ = true;
+        if (!started_) {
+            started_ = true;
+            first_start_ns_ = now_ns;
+        }
+        burst_start_ns_ = now_ns;
+        bursts_++;
+        return BurstAction::kStart;
+    }
+
+    // Precondition: sampling_. Returns kStop or kNone, never kStart.
+    BurstAction close_locked(uint64_t now_ns) {
+        if (refused_) return stop_locked(now_ns, BurstStopReason::kGraph);
+        if (now_ns - burst_start_ns_ < cfg_.burst_ns) return BurstAction::kNone;
+        return stop_locked(now_ns, BurstStopReason::kDutyCycle);
+    }
+
     BurstAction stop_locked(uint64_t now_ns, BurstStopReason why) {
         sampling_ = false;
         last_stop_ = why;
@@ -298,6 +384,12 @@ private:
         // Provisional: the next burst is scheduled at the gap already in
         // force, so a caller that never calls closed() keeps duty-cycling
         // instead of either stalling or free-running.
+        //
+        // Raised to the ceiling's floor for the burst that ACTUALLY ran, which
+        // is what holds the duty bound when a burst overruns its configured
+        // length. Applied here as well as in closed() because closed() is the
+        // call a caller may legitimately never make.
+        gap_ns_ = gap_for_duration_locked(dur);
         next_start_ns_ = now_ns + gap_ns_;
         return BurstAction::kStop;
     }

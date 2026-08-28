@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <dlfcn.h>
 #include <mutex>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -552,8 +553,6 @@ std::atomic<unsigned long> g_window_seq{0};
 // SHARED PCDrainSchedule so the periodic drain coalesces instead of repeating
 // it.
 perfagent::BurstController *g_burst = nullptr;
-unsigned g_burst_tick_ms = 10;
-
 // Bursts and their total open time. The pair is what bounds the perturbation:
 // burst_ns / wall_ns is the fraction of the run that ran serialized, and it is
 // REPORTED rather than assumed to equal the configured ceiling.
@@ -572,6 +571,50 @@ std::atomic<uint64_t> g_burst_stop_failed{0};
 // exact launch attribution had become false. It is never zero-and-silent: the
 // same condition also rides gpu_dropped_v1 under GPU_DROP_CLASS_GRAPH_EXEC.
 std::atomic<uint64_t> g_tier_a_graph_refused{0};
+
+// Issue #101. Tier A's cuptiPCSamplingStart/Stop run on the APPLICATION's
+// thread, from inside the launch callback; a timer of ours must never make
+// them. This is the counter that says so, and it is the reason the timer's tid
+// is recorded at all: taking a PC start or stop on the timer thread is exactly
+// the deadlock this design exists to remove, so it is worth a number rather
+// than a comment. MUST be 0 on every run, healthy or not.
+std::atomic<uint64_t> g_timer_tid{0};
+std::atomic<uint64_t> g_burst_calls_on_timer{0};
+// The pre-start device sync. cuCtxSynchronize is resolved at runtime rather
+// than linked: this adapter deliberately does not link libcuda, and libcuda is
+// unconditionally present by the time a launch callback runs. missing MUST be
+// 0 on any run that opened a burst --- a non-zero value means bursts started
+// against a busy GPU, which is the condition parcagpu's comment says CUPTI
+// does not want.
+std::atomic<uint64_t> g_burst_sync_missing{0};
+std::atomic<uint64_t> g_burst_sync_failed{0};
+// Launch boundaries the burst path actually saw. Both must move on a Tier A
+// run: zero opens with a non-zero launch count would mean the transitions are
+// no longer reachable at all, which is what a return-early bug looks like from
+// the outside and is otherwise indistinguishable from an idle GPU.
+std::atomic<uint64_t> g_burst_enter_polls{0};
+std::atomic<uint64_t> g_burst_exit_polls{0};
+// Bursts that closed having pulled NOT ONE PC from CUPTI.
+//
+// Measured on a 3090, CUDA 13.3: cuptiPCSamplingStart has a dead time of
+// roughly 400 ms before the hardware delivers anything. Below it a burst
+// serializes every kernel it covers --- the throughput cost is real and
+// measurable --- and yields nothing at all. At the 50 ms default EVERY burst
+// is empty, and every other counter on this path still reads healthy:
+// bursts=17, duty=0.49, start_failed=0, stop_failed=0, getdata_failed=0.
+//
+// That is the exact shape this pipeline treats as a defect rather than a
+// tuning matter: a profiler paying the full price of its perturbation and
+// silently collecting none of the data it perturbed the workload to get. So it
+// is counted, and an all-empty run says so in as many words at exit.
+std::atomic<uint64_t> g_bursts_empty{0};
+// g_pc_pcs as it stood when the open burst started. Sampled at OPEN and not
+// merely around the range-end drain: the periodic drain runs on the timer and
+// will already have pulled most of a long burst's PCs by the time it closes,
+// so a before/after around the range end alone reports a productive burst as
+// empty --- which it did, on the first hardware run of this counter. One
+// global is enough because BurstController never has two bursts open.
+std::atomic<uint64_t> g_pc_pcs_at_open{0};
 
 // Every one of these is assertable at a known value on a healthy run, which is
 // the whole point: a context that failed to enable is otherwise a silent hole
@@ -1022,7 +1065,88 @@ void emit_window(uint64_t start_ns, uint64_t end_ns) {
     g_windows_emitted.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Issue #101's standing check, on the two calls that caused it.
+//
+// The deadlock was not a race we lost occasionally: cuptiPCSamplingStop taken
+// on a thread of ours blocks in pthread_rwlock_wrlock against the CUDA
+// runtime's own launch path, and the application blocks behind it forever. The
+// fix is that these two calls only ever run on the application's thread, from
+// inside the launch callback. That is a property of the CALL SITES, which is
+// exactly the kind of property that quietly stops holding when somebody adds a
+// third one. So it is checked here, at the calls themselves, where a new call
+// site inherits the check whether or not its author knew about it.
+void note_burst_thread() {
+    const uint64_t timer = g_timer_tid.load(std::memory_order_relaxed);
+    if (timer != 0 && (uint64_t)current_tid() == timer)
+        g_burst_calls_on_timer.fetch_add(1, std::memory_order_relaxed);
+}
+
+// cuCtxSynchronize, resolved at runtime.
+//
+// parcagpu quiesces the GPU before every cuptiPCSamplingStart --- "CUPTI
+// requires the GPU to be idle before starting PC sampling". That requirement
+// is NOT in cupti_pcsampling.h; it is their empirical finding, and it is
+// carried here because theirs is the configuration known to work rather than
+// because the header asks for it. Being at a launch ENTER does not make the
+// GPU idle: kernels issued earlier on other streams are very likely still
+// running.
+//
+// dlsym rather than a link: this adapter does not link libcuda (see the note
+// at ActivityEnable(DEVICE)), and it does not need to --- nothing can reach a
+// launch callback in a process where libcuda is absent.
+//
+// RTLD_DEFAULT is NOT enough and that was measured, not assumed: the first
+// version of this looked there and reported sync_missing=7 out of 7 bursts on
+// the 3090. The CUDA runtime dlopens libcuda into a LOCAL scope, so its
+// symbols never enter the global one and RTLD_DEFAULT cannot see them. The
+// handle has to be asked for by name.
+//
+// RTLD_NOLOAD: find the copy this process already has, or nothing. Loading a
+// second libcuda from a profiler would be a far worse bug than not quiescing.
+using CuCtxSynchronizeFn = int (*)(void);
+CuCtxSynchronizeFn g_cu_ctx_sync = nullptr;
+
+// Resolved on FIRST USE, not at injection time. InitializeInjection can run
+// before the CUDA runtime has finished bringing libcuda up; the first launch
+// callback cannot. Doing it here removes a startup ordering question that has
+// no other reason to exist.
+//
+// Called only from the burst-open path, which is single-threaded per burst by
+// BurstController's own mutex... except that it is NOT: two application
+// threads can be inside burst_open_at_launch at once, and only one of them
+// gets kStart. The resolve therefore has to tolerate a race. It does: both
+// racers compute the same pointer and store it, so the write is idempotent and
+// a torn read is impossible for a pointer-sized relaxed atomic.
+std::atomic<bool> g_cu_ctx_sync_tried{false};
+
+void pc_resolve_ctx_sync() {
+    // The global scope first: cheap, and correct for an application that links
+    // libcuda directly rather than going through the runtime.
+    CuCtxSynchronizeFn f = (CuCtxSynchronizeFn)dlsym(RTLD_DEFAULT, "cuCtxSynchronize");
+    if (!f) {
+        if (void *h = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_LAZY))
+            f = (CuCtxSynchronizeFn)dlsym(h, "cuCtxSynchronize");
+    }
+    g_cu_ctx_sync = f;
+    g_cu_ctx_sync_tried.store(true, std::memory_order_relaxed);
+}
+
+// Deliberately OUTSIDE the CUPTI guard: this is not a CUPTI call, and holding
+// the guard across a full device synchronise would park the drain timer for
+// however long the GPU takes to go idle --- which on a saturated device is the
+// longest lock hold in the adapter, taken for no reason.
+void pc_sync_before_start() {
+    if (!g_cu_ctx_sync_tried.load(std::memory_order_relaxed)) pc_resolve_ctx_sync();
+    if (!g_cu_ctx_sync) {
+        g_burst_sync_missing.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (g_cu_ctx_sync() != 0)  // CUDA_SUCCESS
+        g_burst_sync_failed.fetch_add(1, std::memory_order_relaxed);
+}
+
 void pc_start_ctxs_locked() {
+    note_burst_thread();
     for (PCContext *c : g_pc_ctxs) {
         if (!c->enabled) continue;
         CUpti_PCSamplingStartParams sp{};
@@ -1034,6 +1158,7 @@ void pc_start_ctxs_locked() {
 }
 
 void pc_stop_ctxs_locked() {
+    note_burst_thread();
     for (PCContext *c : g_pc_ctxs) {
         if (!c->enabled) continue;
         CUpti_PCSamplingStopParams sp{};
@@ -1059,6 +1184,7 @@ void pc_stop_ctxs_locked() {
 // is told, so a USDT fire and the controller's own mutex are never taken with
 // the whole vendor surface locked.
 void burst_close(uint64_t now_ns, uint64_t start_ns) {
+    const uint64_t pcs_at_open = g_pc_pcs_at_open.load(std::memory_order_relaxed);
     {
         perfagent::cupti::CallScope hold;
         pc_stop_ctxs_locked();
@@ -1071,6 +1197,10 @@ void burst_close(uint64_t now_ns, uint64_t start_ns) {
         if (g_pc_schedule) g_pc_schedule->force(now_ns, perfagent::PCDrainReason::kRangeEnd);
         pc_drain_all(perfagent::PCDrainReason::kRangeEnd);
     }
+    // AFTER the range-end drain above, so the PCs this burst produced but that
+    // only arrive on the post-stop flush are counted where they belong.
+    if (g_pc_pcs.load(std::memory_order_relaxed) == pcs_at_open)
+        g_bursts_empty.fetch_add(1, std::memory_order_relaxed);
     emit_window(start_ns, now_ns);
     g_sampling_burst_ns.fetch_add(now_ns > start_ns ? now_ns - start_ns : 0,
                                   std::memory_order_relaxed);
@@ -1082,58 +1212,110 @@ void burst_close(uint64_t now_ns, uint64_t start_ns) {
     if (g_burst) g_burst->closed(g_pc_records.load(std::memory_order_relaxed));
 }
 
-// The burst half of the single timer's tick. Called from on_timer_tick, on the
-// one thread this adapter runs; see the note on g_burst.
-void on_burst_tick() {
+// Tier A's two transitions, taken on the APPLICATION's thread at a kernel-launch
+// boundary: START on a launch ENTER, STOP on a launch EXIT.
+//
+// Issue #101, and this is the shape of the fix rather than a detail of it.
+//
+// These used to be one function called from the drain timer. That deadlocks,
+// and not rarely: cuptiPCSamplingStop taken on any thread of ours blocks in
+// pthread_rwlock_wrlock inside CUPTI while the application sits in
+// __cudaLaunchKernel_helper holding the other side, and neither ever moves. It
+// survived issue #99 --- which was real, and which did collapse our two timer
+// threads into one --- because the surviving conflict is not between two
+// threads of OURS. It is between our thread and the application's, and no
+// amount of self-serialization reaches it. Only not having a thread does.
+//
+// parcagpu (parca-dev/parcagpu, src/cupti.cpp:591) does not have one: it
+// creates no threads at all, and every PC-sampling start and stop runs on the
+// application's own thread from inside a CUPTI callback. Their comment states
+// the rule --- "PC sampling windows are aligned to kernel-launch boundaries:
+// start on a launch ENTER, stop on a launch EXIT" --- and their configuration
+// is otherwise identical to ours: ENABLE_START_STOP_CONTROL, KERNEL_SERIALIZED,
+// Enable/Disable per context rather than per burst. The calling thread is the
+// only difference between a design that works and one that hangs.
+//
+// One deliberate divergence: parcagpu takes the DRIVER_API launch callbacks and
+// this takes the RUNTIME_API ones it already subscribes to. That is not a
+// compromise, it is strictly the safer position --- a runtime cudaLaunchKernel
+// ENTER fires BEFORE the runtime enters the driver, and its EXIT after the
+// driver has returned, so these calls are made from further outside CUPTI's
+// launch path than parcagpu's are. It also avoids the correlation-id cost that
+// adding DRIVER_API was measured to have (2.242 vs 1.004 ids per launch; see
+// the note at EnableDomain).
+//
+// What this gives up, stated rather than discovered later: a burst can only
+// open or close when the application launches a kernel. An application that
+// opens a burst and then stops launching for a second leaves the window open
+// for that second, and the duty figure counts it as perturbed. That
+// OVER-states the perturbation, which is the safe direction and the same
+// direction every other approximation on this path leans --- no kernel is
+// launching, so nothing is in fact being serialized. The exit path still
+// closes the window with a real timestamp (burst_shutdown), so end_ns == 0 on
+// the wire continues to mean a hard exit and nothing else.
+
+// The refusal log, on whichever of the two boundaries first observes a graph.
+void note_graph_refusal(bool was_refused, bool graphs) {
+    if (was_refused || !g_burst->refused() || !graphs) return;
+    g_tier_a_graph_refused.fetch_add(1, std::memory_order_relaxed);
+    logf("perfagent-cupti: REFUSING Tier A: %llu CUDA-graph execution(s) observed "
+         "mid-run. N executions share one correlation, so exact launch "
+         "attribution is false while still looking exact. Bursts have STOPPED "
+         "permanently; this is not a downgrade to Tier B. Executions already "
+         "inside a window stay marked serialized.\n",
+         (unsigned long long)g_exec_from_graph.load(std::memory_order_relaxed));
+}
+
+// Launch ENTER. Opens a burst if the duty cycle is due for one; can never
+// close one --- see BurstController::poll_open for why that is enforced there
+// rather than by testing sampling() here.
+void burst_open_at_launch(uint64_t now) {
     if (!g_pc_tier_a || !g_burst) return;
-    // No enabled context means nothing can be serialized, so there is no
-    // burst to open and no window to announce. This timer starts at the end
-    // of InitializeInjection, which is before the first CONTEXT_CREATED
-    // callback can have fired, so without this the first burst would announce
-    // a window covering executions that were never perturbed. Over-stating
-    // perturbation is the safe direction and would not be a defect --- but it
-    // would be a lie about an interval nothing was sampling, and there is no
-    // reason to tell it.
-    if (!g_ctx_enabled.load(std::memory_order_relaxed) && !g_burst->sampling()) return;
-    const uint64_t now = mono_ns();
-    // The graph refusal, re-checked on every tick and not only at enable
+    // No enabled context means nothing can be serialized, so there is no burst
+    // to open and no window to announce. A launch can reach this before the
+    // first CONTEXT_CREATED callback has been processed, and without this the
+    // first window would cover executions that were never perturbed.
+    if (!g_ctx_enabled.load(std::memory_order_relaxed)) return;
+    g_burst_enter_polls.fetch_add(1, std::memory_order_relaxed);
+    // The graph refusal, re-checked at every boundary and not only at enable
     // time: a process can run for minutes before its first graph launch, and
-    // the moment one arrives Tier A's exactness claim stops being true. The
-    // controller closes any open burst and never starts another.
+    // the moment one arrives Tier A's exactness claim stops being true.
     const bool graphs = g_exec_from_graph.load(std::memory_order_relaxed) != 0;
     const bool was_refused = g_burst->refused();
-    const uint64_t start_ns = g_burst->burst_start_ns();
-    switch (g_burst->poll(now, graphs)) {
-        case perfagent::BurstAction::kStart: {
-            {
-                perfagent::cupti::CallScope hold;
-                pc_start_ctxs_locked();
-            }
-            g_sampling_bursts.fetch_add(1, std::memory_order_relaxed);
-            // The window is announced even if some or all contexts refused to
-            // start (g_burst_start_failed counts that, and must be 0 on a
-            // healthy run). Over-stating the perturbation for one burst marks
-            // executions "true" that were not perturbed, which is the SAFE
-            // direction: the answer that must never be reachable by accident
-            // is "false", and no path here can produce it.
-            emit_window(now, 0);   // open; closed by the kStop below
-            break;
+    if (g_burst->poll_open(now, graphs) == perfagent::BurstAction::kStart) {
+        // Before the guard is taken, and before the start: quiescing the
+        // device is not a CUPTI call and must not hold the CUPTI guard.
+        pc_sync_before_start();
+        {
+            perfagent::cupti::CallScope hold;
+            pc_start_ctxs_locked();
         }
-        case perfagent::BurstAction::kStop:
-            burst_close(now, start_ns);
-            break;
-        case perfagent::BurstAction::kNone:
-            break;
+        g_pc_pcs_at_open.store(g_pc_pcs.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        g_sampling_bursts.fetch_add(1, std::memory_order_relaxed);
+        // The window is announced even if some or all contexts refused to
+        // start (g_burst_start_failed counts that, and must be 0 on a healthy
+        // run). Over-stating the perturbation for one burst marks executions
+        // "true" that were not perturbed, which is the SAFE direction: the
+        // answer that must never be reachable by accident is "false", and no
+        // path here can produce it.
+        emit_window(now, 0);   // open; closed by the EXIT below
     }
-    if (!was_refused && g_burst->refused() && graphs) {
-        g_tier_a_graph_refused.fetch_add(1, std::memory_order_relaxed);
-        logf("perfagent-cupti: REFUSING Tier A: %llu CUDA-graph execution(s) observed "
-             "mid-run. N executions share one correlation, so exact launch "
-             "attribution is false while still looking exact. Bursts have STOPPED "
-             "permanently; this is not a downgrade to Tier B. Executions already "
-             "inside a window stay marked serialized.\n",
-             (unsigned long long)g_exec_from_graph.load(std::memory_order_relaxed));
-    }
+    note_graph_refusal(was_refused, graphs);
+}
+
+// Launch EXIT. Closes an open burst once it has run its length, or immediately
+// if a graph launch has been observed. Can never open one.
+void burst_close_at_launch(uint64_t now) {
+    if (!g_pc_tier_a || !g_burst) return;
+    g_burst_exit_polls.fetch_add(1, std::memory_order_relaxed);
+    const bool graphs = g_exec_from_graph.load(std::memory_order_relaxed) != 0;
+    const bool was_refused = g_burst->refused();
+    // Read BEFORE the poll: the poll is what clears it.
+    const uint64_t start_ns = g_burst->burst_start_ns();
+    if (g_burst->poll_close(now, graphs) == perfagent::BurstAction::kStop)
+        burst_close(now, start_ns);
+    note_graph_refusal(was_refused, graphs);
 }
 
 // Teardown for the duty cycle. Closes an open burst with a real end timestamp,
@@ -1419,9 +1601,21 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
     }
     if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) return;
     const CUpti_CallbackData *cb = (const CUpti_CallbackData *)cbdata;
-    if (cb->callbackSite != CUPTI_API_ENTER) return;
+    // Launch cbids only, on BOTH sites now. The EXIT half is new with issue
+    // #101 and it is the only reason this function looks at EXIT at all: it
+    // carries no record and does no work of its own, it exists so that Tier A
+    // has a place to call cuptiPCSamplingStop from the application's thread.
     if (!is_launch_cbid(cbid)) return;
-    on_launch(cb);
+    if (cb->callbackSite == CUPTI_API_ENTER) {
+        // The burst opens BEFORE the launch it is about to serialize, which is
+        // the whole point of taking the ENTER: a window opened after the
+        // launch had been issued would not cover it, and the execution would
+        // be reported unperturbed while running inside a serialized burst.
+        burst_open_at_launch(mono_ns());
+        on_launch(cb);
+        return;
+    }
+    if (cb->callbackSite == CUPTI_API_EXIT) burst_close_at_launch(mono_ns());
 }
 
 // -------------------------------------------------------------- exec path
@@ -1686,6 +1880,44 @@ void report(const char *why) {
              (unsigned long long)g_burst_stop_failed.load(),
              (unsigned long long)g_tier_a_graph_refused.load(),
              g_burst && g_burst->sampling() ? 1 : 0);
+        // Issue #101's evidence, and every one of these is assertable:
+        //
+        //   on_timer   PC starts/stops taken on the timer thread. MUST be 0.
+        //              This is the deadlock itself, counted. It is not a
+        //              proxy for the bug -- a non-zero value IS the condition
+        //              that hung the 3090, observed rather than inferred.
+        //   enter/exit launch boundaries the burst path saw. BOTH must move on
+        //              any Tier A run that launched a kernel. Zero with a
+        //              non-zero launch count means the transitions became
+        //              unreachable, which from the outside is indistinguishable
+        //              from an idle GPU and is what a stray early return looks
+        //              like. exit is expected to be within one of enter.
+        //   sync_*     the pre-start quiesce. missing MUST be 0 once a burst
+        //              has opened: it means cuCtxSynchronize was not found and
+        //              bursts started against a possibly busy GPU. failed
+        //              counts a non-zero CUDA return from it.
+        logf("perfagent-cupti: tier A boundaries enter=%llu exit=%llu on_timer=%llu "
+             "sync_missing=%llu sync_failed=%llu empty_bursts=%llu\n",
+             (unsigned long long)g_burst_enter_polls.load(),
+             (unsigned long long)g_burst_exit_polls.load(),
+             (unsigned long long)g_burst_calls_on_timer.load(),
+             (unsigned long long)g_burst_sync_missing.load(),
+             (unsigned long long)g_burst_sync_failed.load(),
+             (unsigned long long)g_bursts_empty.load());
+        // The one condition on this path that is otherwise invisible: the run
+        // paid for its perturbation and got nothing back. Loud, because every
+        // other counter reads healthy while it holds.
+        const uint64_t closed = g_bursts_empty.load();
+        const uint64_t total = g_sampling_bursts.load();
+        if (total && closed == total) {
+            logf("perfagent-cupti: WARNING every one of the %llu Tier A burst(s) in this run "
+                 "pulled ZERO PCs. Kernels were serialized and the throughput cost was paid "
+                 "in full, for no data. cuptiPCSamplingStart has a start-up dead time "
+                 "(~400ms measured on GA102/CUDA 13.3) and PERFAGENT_GPU_PC_BURST_MS=%llu is "
+                 "inside it. Raise it well past that or turn Tier A off; see issue #102.\n",
+                 (unsigned long long)total,
+                 (unsigned long long)(g_burst ? g_burst->config().burst_ns / 1000000ull : 0));
+        }
     }
     logf("perfagent-cupti: pc %s tier=%s period=%u(=%u cycles) stall_reasons=%zu "
          "ctx_seen=%llu ctx_enabled=%llu ctx_enable_failed=%llu "
@@ -1834,20 +2066,26 @@ void on_tick() {
 // not exclude the bad state, it makes it unrepresentable. There is no second
 // timer to race with, whatever a future call site does.
 //
-// Order matters. The burst poll runs FIRST, because a burst transition is
-// timestamped by on_burst_tick itself and Tier A's duty fraction is measured
-// from those timestamps: a stop deferred behind a flush lengthens the burst
-// that actually happened. Running it first means a transition waits for at
-// most the PREVIOUS tick's drain, never for this one's.
+// It no longer polls the burst. Issue #101: PC-sampling start and stop cannot
+// be taken from a thread of ours at all, whether or not that thread is alone,
+// because the conflict is with the APPLICATION's thread inside CUPTI's launch
+// path. Those two transitions now happen at launch boundaries on the
+// application's own thread (burst_open_at_launch / burst_close_at_launch), and
+// what is left here is the activity drain, which has run from this timer since
+// before Tier A existed and is measured at -0.006% / +0.017% over two hardware
+// runs.
 //
-// The activity drain is rate-limited on top of the shorter tick by
-// core/tickplan.h, so its period is what it always was (100 ms by default) and
-// the burst poll keeps its own granularity. What the merge costs is stated at
-// tick_period_ns: a slow flush delays the next burst poll by its own duration,
-// and that shows up in `duty=` in the report, which is measured rather than
-// assumed.
+// The drain is still rate-limited on top of the tick by core/tickplan.h. With
+// the burst poll gone the tick no longer needs the shorter of the two periods
+// on a Tier A run --- but tick_period_ns keeps deciding that, because
+// PERFAGENT_GPU_DRAIN_MS is the only knob an operator has and a Tier A run
+// still wants its PC data pulled promptly after each burst.
 void on_timer_tick() {
-    on_burst_tick();   // a no-op unless Tier A is on; see its head
+    // Recorded here rather than at timer start because THIS is the thread that
+    // matters: the one note_burst_thread() must never find inside a PC start
+    // or stop. Idempotent and relaxed --- it is written every tick with the
+    // same value, and read only by a counter that must stay 0.
+    g_timer_tid.store(current_tid(), std::memory_order_relaxed);
     if (!g_tick_plan || g_tick_plan->drain_due(mono_ns())) on_tick();
 }
 
@@ -2090,21 +2328,23 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
         bc.max_duty = (double)env_uint("PERFAGENT_GPU_PC_MAX_DUTY_PERMILLE", 100) / 1000.0;
         bc.max_gap_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_MAX_GAP_MS", 10000) * 1000000ull;
         g_burst = new perfagent::BurstController(bc);
-        // The burst poll's period. A fifth of the burst length by default, so
-        // a "50 ms" burst is 50..60 ms rather than 50..150 ms on the 100 ms
-        // drain tick. Since issue #99 this is the period of the ONE timer
-        // thread rather than of a second one; the drain is rate-limited on top
-        // of it. It costs one wakeup per period doing an atomic load and a
-        // compare when no transition is due.
-        unsigned burst_tick_ms = env_uint("PERFAGENT_GPU_PC_BURST_TICK_MS",
-                                          (unsigned)(bc.burst_ns / 5000000ull));
-        if (!burst_tick_ms) burst_tick_ms = 1;
+        // No burst tick, and no PERFAGENT_GPU_PC_BURST_TICK_MS: issue #101
+        // moved both transitions onto the application's launch callbacks, so
+        // the duty cycle's granularity is now the launch rate, not a period of
+        // ours. A knob that no longer reaches anything is worse than no knob,
+        // so it is gone rather than accepted-and-ignored.
+        //
+        // What this changes in practice: a burst is 50 ms PLUS however long
+        // the application takes to make its next launch after the 50 ms
+        // elapses. On any workload Tier A is worth running on that is
+        // microseconds. On one that stops launching entirely it is unbounded,
+        // and the window stays open --- which over-states the perturbation and
+        // is the safe direction. See burst_open_at_launch.
         logf("perfagent-cupti: tier A duty cycle burst_ms=%llu target_rate=%.0f/s "
-             "max_duty=%.3f min_gap_ms=%llu max_gap_ms=%llu tick_ms=%u\n",
+             "max_duty=%.3f min_gap_ms=%llu max_gap_ms=%llu boundary=launch\n",
              (unsigned long long)(bc.burst_ns / 1000000ull), bc.target_rate, bc.max_duty,
              (unsigned long long)(perfagent::burst_min_gap_ns(bc) / 1000000ull),
-             (unsigned long long)(bc.max_gap_ns / 1000000ull), burst_tick_ms);
-        g_burst_tick_ms = burst_tick_ms;
+             (unsigned long long)(bc.max_gap_ns / 1000000ull));
     }
 
     if (!check(perfagent::cupti::Subscribe(&g_subscriber, (CUpti_CallbackFunc)on_callback,
@@ -2142,11 +2382,14 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     resample_clock();
 
     const unsigned drain_ms = env_uint("PERFAGENT_GPU_DRAIN_MS", 100);
-    // ONE timer, at the shorter of the two periods, with the drain rate-limited
-    // on top of it. Two timer threads is what issue #99 was; see on_timer_tick
-    // and core/tickplan.h.
+    // ONE timer, serving ONE job: the activity drain. Two timer threads was
+    // issue #99; a timer that touched PC sampling at all was issue #101, and
+    // that half is now on the application's launch callbacks. The burst-tick
+    // arguments are passed as "no burst poll" because there is none --- the
+    // shorter-tick case in tick_period_ns is retained for a future second job
+    // on this timer, not exercised by this one.
     const uint64_t tick_ns = perfagent::tick_period_ns(
-        (uint64_t)drain_ms * 1000000ull, (uint64_t)g_burst_tick_ms * 1000000ull, g_pc_tier_a);
+        (uint64_t)drain_ms * 1000000ull, /*burst_tick_ns=*/0, /*tier_a=*/false);
     // drain_limit_ns, not the drain period: with Tier A off the timer already
     // runs at the drain period and a rate limit on top of it would skip any
     // tick that arrived a hair early. See core/tickplan.h.

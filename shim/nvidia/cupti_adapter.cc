@@ -452,12 +452,39 @@ unsigned env_uint(const char *name, unsigned dflt);
 constexpr uint32_t kPCPeriodMin = 5;
 constexpr uint32_t kPCPeriodMax = 31;
 
-// How many distinct PCs one GetData call may return. The Phase 3 spike saw
-// 352 PC records in CONTINUOUS mode for ~103k samples, so this is roughly six
-// times the measured need and still under a megabyte with 38 stall reasons.
+// How many distinct PCs one GetData call may return.
+//
+// cupti_pcsampling.h documents collectNumPcs purely as a CAPACITY --- "Number
+// of PCs to be collected", sizing the buffer the caller hands over. It is not
+// only that. CUPTI also WITHHOLDS data until it can nearly fill the number
+// asked for, which makes this value decide how often any data arrives at all.
+// That behaviour is undocumented and it was measured (issue #102), on a 3090 /
+// CUDA 13.3, at the 50 ms Tier A burst length:
+//
+//   collectNumPcs    bursts yielding nothing        PCs
+//         32            1 / 124   (  0%)           2553
+//         64            1 / 125   (  0%)           2484
+//        128            1 / 125   (  0%)           2308
+//        256           93 / 124   ( 75%)            150
+//        512          124 / 124   (100%)              0
+//       2048          124 / 124   (100%)              0
+//
+// The old default was 2048, chosen as "six times the measured need" from the
+// Phase 3 spike's 352 records in CONTINUOUS mode. In CONTINUOUS that reasoning
+// held, because nothing there depends on when a buffer fills. For Tier A it
+// meant every burst serialized its kernels, paid the throughput cost in full,
+// and collected NOTHING --- while bursts, duty, start_failed, stop_failed and
+// getdata_failed all read healthy.
+//
+// 64 rather than 32: the same yield, with headroom. And well below 256 rather
+// than just below it, because where the cliff sits depends on how fast the
+// workload produces PCs --- a quieter GPU fills any given buffer more slowly,
+// so the safe direction is smaller. g_bursts_empty is what says the cliff has
+// moved on some other device instead of leaving it silent.
+//
 // The drain loop below keeps calling while remainingNumPcs is non-zero, so
 // this bounds one call's allocation, not the run's data.
-constexpr size_t kPCDefaultCollectNumPcs = 2048;
+constexpr size_t kPCDefaultCollectNumPcs = 64;
 
 // The bound on that loop. CUPTI hands back remainingNumPcs and we keep
 // pulling, but an unbounded loop inside a drain tick is a hang in somebody
@@ -596,12 +623,13 @@ std::atomic<uint64_t> g_burst_enter_polls{0};
 std::atomic<uint64_t> g_burst_exit_polls{0};
 // Bursts that closed having pulled NOT ONE PC from CUPTI.
 //
-// Measured on a 3090, CUDA 13.3: cuptiPCSamplingStart has a dead time of
-// roughly 400 ms before the hardware delivers anything. Below it a burst
-// serializes every kernel it covers --- the throughput cost is real and
-// measurable --- and yields nothing at all. At the 50 ms default EVERY burst
-// is empty, and every other counter on this path still reads healthy:
-// bursts=17, duty=0.49, start_failed=0, stop_failed=0, getdata_failed=0.
+// This found a real one (issue #102). CUPTI withholds PC data until it can
+// nearly fill collectNumPcs, which the header documents only as a buffer
+// capacity. At the old default of 2048 EVERY 50 ms burst came back empty ---
+// 124 of 124 --- while every other counter on this path read healthy:
+// bursts=124, duty within its ceiling, start_failed=0, stop_failed=0,
+// getdata_failed=0, dropped_hw=0. Nothing reported a fault, because there was
+// none: the calls all succeeded and CUPTI was simply still buffering.
 //
 // That is the exact shape this pipeline treats as a defect rather than a
 // tuning matter: a profiler paying the full price of its perturbation and
@@ -1912,10 +1940,14 @@ void report(const char *why) {
         if (total && closed == total) {
             logf("perfagent-cupti: WARNING every one of the %llu Tier A burst(s) in this run "
                  "pulled ZERO PCs. Kernels were serialized and the throughput cost was paid "
-                 "in full, for no data. cuptiPCSamplingStart has a start-up dead time "
-                 "(~400ms measured on GA102/CUDA 13.3) and PERFAGENT_GPU_PC_BURST_MS=%llu is "
-                 "inside it. Raise it well past that or turn Tier A off; see issue #102.\n",
+                 "in full, for no data. The usual cause is PERFAGENT_GPU_PC_MAX_PCS being too "
+                 "large: CUPTI withholds PC data until it can nearly fill collectNumPcs, so a "
+                 "high value means nothing is delivered inside a burst. It is %llu here and "
+                 "the burst is %llums; on GA102/CUDA 13.3 at a 50ms burst, 64 yielded on every "
+                 "burst and 512 on none. Lower it, lengthen the burst, or turn Tier A off. "
+                 "See issue #102.\n",
                  (unsigned long long)total,
+                 (unsigned long long)g_pc_collect_num_pcs,
                  (unsigned long long)(g_burst ? g_burst->config().burst_ns / 1000000ull : 0));
         }
     }

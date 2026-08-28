@@ -44,6 +44,16 @@ namespace perfagent {
 // Tier A off: the drain period, unchanged -- there is no burst poll to serve.
 // Tier A on:  the shorter of the two, so NEITHER job's cadence is lengthened
 //             by the merge. Never zero: a zero-period timer is a spin.
+//
+// NOTE (issue #101): the CUPTI adapter no longer has a burst poll in EITHER
+// tier. PC-sampling start and stop cannot be taken from a thread of ours at
+// all -- they deadlock against the application's own launch path inside CUPTI
+// -- so both transitions moved onto the application's launch callbacks and the
+// adapter now passes tier_a=false unconditionally. The tier_a branch below is
+// kept, and kept tested, because it is the correct answer for any FUTURE
+// second job on this timer; it is not currently reached from production code.
+// A reader chasing why a Tier A run ticks at the drain period should stop
+// here rather than concluding the merge broke.
 inline uint64_t tick_period_ns(uint64_t drain_ns, uint64_t burst_tick_ns, bool tier_a) {
     uint64_t t = drain_ns;
     if (tier_a && burst_tick_ns && burst_tick_ns < t) t = burst_tick_ns;

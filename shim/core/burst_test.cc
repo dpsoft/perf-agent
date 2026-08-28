@@ -298,6 +298,171 @@ int main() {
         assert(c.burst_ns() == 0);
     }
 
+    // ---- Issue #101: the split halves, and the state that makes the split
+    // load-bearing rather than tidy.
+    //
+    // A launch EXIT may only ever CLOSE. The dangerous instant is the one
+    // where the controller would happily start: no burst open, and the gap
+    // already elapsed. A plain poll() there returns kStart and COMMITS it ---
+    // which at an EXIT call site means the controller believes it is sampling
+    // while CUPTI is stopped, and every execution until the next transition is
+    // labelled serialized when it was not. poll_close must decline, and must
+    // leave no trace that it was asked.
+    {
+        BurstConfig cfg;
+        BurstController c(cfg);
+        // Reach the dangerous state: open, close, let the gap run out.
+        assert(c.poll_open(0, false) == BurstAction::kStart);
+        assert(c.poll_close(cfg.burst_ns, false) == BurstAction::kStop);
+        c.closed(0);
+        assert(!c.sampling());
+        const uint64_t after_gap = cfg.burst_ns + c.gap_ns() + kSec;
+        // The control: poll() WOULD start here. This is what makes the
+        // assertion below a real one rather than a restatement of kNone.
+        {
+            BurstController probe(cfg);
+            assert(probe.poll_open(0, false) == BurstAction::kStart);
+            assert(probe.poll_close(cfg.burst_ns, false) == BurstAction::kStop);
+            probe.closed(0);
+            assert(probe.poll(after_gap, false) == BurstAction::kStart);
+        }
+        const uint64_t bursts_before = c.bursts();
+        assert(c.poll_close(after_gap, false) == BurstAction::kNone);
+        assert(!c.sampling());                    // did not open
+        assert(c.bursts() == bursts_before);      // and did not count one
+    }
+
+    // ---- The mirror: a launch ENTER may only ever OPEN. With a burst open
+    // and past its length, poll() would return kStop; poll_open must decline
+    // and must leave the burst OPEN, because the ENTER site cannot stop CUPTI.
+    {
+        BurstConfig cfg;
+        BurstController c(cfg);
+        assert(c.poll_open(0, false) == BurstAction::kStart);
+        const uint64_t past = cfg.burst_ns + kSec;
+        {
+            BurstController probe(cfg);
+            assert(probe.poll_open(0, false) == BurstAction::kStart);
+            assert(probe.poll(past, false) == BurstAction::kStop);   // the control
+        }
+        assert(c.poll_open(past, false) == BurstAction::kNone);
+        assert(c.sampling());                     // still open, as CUPTI is
+        assert(c.burst_start_ns() == 0);          // and it is the SAME burst
+        assert(c.poll_close(past, false) == BurstAction::kStop);
+    }
+
+    // ---- Swept: over a full duty cycle driven at launch boundaries, neither
+    // half ever returns the other's action. This is the invariant the call
+    // sites rely on, asserted across the whole state space the cycle visits
+    // rather than at the two points above.
+    {
+        BurstConfig cfg;
+        BurstController c(cfg);
+        uint64_t now = 0, pairs = 0, opens = 0, closes = 0;
+        for (unsigned i = 0; i < 20000; i++) {
+            const BurstAction o = c.poll_open(now, false);
+            assert(o != BurstAction::kStop);      // ENTER never stops
+            if (o == BurstAction::kStart) opens++;
+            now += kMs;
+            const BurstAction cl = c.poll_close(now, false);
+            assert(cl != BurstAction::kStart);    // EXIT never starts
+            if (cl == BurstAction::kStop) {
+                closes++;
+                pairs += 100;
+                c.closed(pairs);
+            }
+            now += kMs;
+        }
+        // The cycle actually ran -- otherwise the two assertions above hold
+        // vacuously, which is the failure mode this project keeps finding.
+        assert(opens > 5);
+        // Open and close stay paired: at most one burst outstanding, ever.
+        assert(opens - closes <= 1);
+        assert(c.duty(now) <= cfg.max_duty * 1.05);
+    }
+
+    // ---- Both halves observe the graph refusal, because either call site may
+    // be the first to see a graph launch. Refused at an ENTER, the open burst
+    // still closes with kGraph at the next EXIT rather than being abandoned.
+    {
+        BurstConfig cfg;
+        BurstController c(cfg);
+        assert(c.poll_open(0, false) == BurstAction::kStart);
+        assert(c.poll_open(kMs, true) == BurstAction::kNone);   // notices, cannot act
+        assert(c.refused());
+        assert(c.sampling());                                   // still open
+        assert(c.poll_close(2 * kMs, false) == BurstAction::kStop);
+        assert(c.last_stop_reason() == BurstStopReason::kGraph);
+        assert(c.graph_refusals() == 1);
+        // Never reopens.
+        assert(c.poll_open(10 * kSec, false) == BurstAction::kNone);
+    }
+
+    // ---- A graph seen first at an EXIT refuses there too.
+    {
+        BurstConfig cfg;
+        BurstController c(cfg);
+        assert(c.poll_open(0, false) == BurstAction::kStart);
+        assert(c.poll_close(kMs, true) == BurstAction::kStop);
+        assert(c.last_stop_reason() == BurstStopReason::kGraph);
+        assert(c.graph_refusals() == 1);
+    }
+
+    // ---- Issue #101: a burst that OVERRUNS its configured length must not
+    // break the duty ceiling. Since the transitions moved onto launch
+    // boundaries a burst ends at the first launch after its length elapses,
+    // which on a synchronising workload was measured at 50 ms configured ->
+    // 104 ms actual. Charging the next gap for the nominal 50 ms would let the
+    // achieved duty run to 0.17 against a ceiling of 0.10.
+    {
+        BurstConfig cfg;
+        cfg.burst_ns = 50 * kMs;
+        cfg.max_duty = 0.1;
+        BurstController c(cfg);
+        uint64_t now = 0;
+        const uint64_t overrun = 2;   // every burst runs twice its length
+        unsigned bursts = 0;
+        uint64_t first_open = 0;
+        // A workload that yields NOTHING, which is what pins the ceiling
+        // rather than the loop. With pairs coming in at the target rate the
+        // controller holds the gap far above either floor and the floor is
+        // never the binding constraint -- a version of this test that fed it
+        // 100 pairs per burst passed against the unfixed code, which is why it
+        // does not do that. At zero yield the loop walks the gap DOWN to the
+        // floor, so the floor is the only thing holding the bound.
+        for (unsigned i = 0; i < 200000 && bursts < 12; i++) {
+            if (c.poll_open(now, false) == BurstAction::kStart) {
+                if (!bursts) first_open = now;
+                // Closed only after `overrun` x the configured length.
+                now += overrun * cfg.burst_ns;
+                const BurstAction a = c.poll_close(now, false);
+                assert(a == BurstAction::kStop);
+                bursts++;
+                c.closed(0);
+            }
+            now += kMs;
+        }
+        assert(bursts == 12);
+        // The gap must have been charged for the burst that HAPPENED: a
+        // 100 ms burst at a 0.1 ceiling needs 900 ms, not the 450 ms a 50 ms
+        // burst needs.
+        assert(c.gap_ns() >= burst_min_gap_ns(cfg) * overrun);
+        // And the achieved duty must be under the ceiling. Measured, not
+        // reasoned about -- this is the number the ceiling is a claim about.
+        //
+        // Measured at the end of the last COMPLETE cycle, not at the last
+        // close: duty() over an interval that ends mid-gap counts the burst
+        // but not the gap it is owed, which over-states it by one gap and
+        // would fail here for a reason that has nothing to do with the bound.
+        now += c.gap_ns();
+        const double d = c.duty(now);
+        printf("burst_test: overrun x%llu duty=%.4f (ceiling %.2f) gap=%llums\n",
+               (unsigned long long)overrun, d, cfg.max_duty,
+               (unsigned long long)(c.gap_ns() / kMs));
+        assert(d <= cfg.max_duty);
+        (void)first_open;
+    }
+
     printf("burst_test: OK\n");
     return 0;
 }

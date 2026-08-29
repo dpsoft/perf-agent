@@ -389,3 +389,75 @@ func TestMappingOpenablePath(t *testing.T) {
 		})
 	}
 }
+
+// Issue #56. The resolver populates lazily, on the first Lookup for a PID —
+// and in the profilers that first Lookup happens at COLLECT time, after the
+// whole capture window has closed. A process sampled during the window but
+// gone by the end therefore has no /proc/<pid>/maps left to read, and every
+// frame it contributed resolves to nothing.
+//
+// System-wide is where this bites: short-lived processes are exactly what a
+// `-a` capture exists to catch, and they are exactly the ones guaranteed to be
+// gone by the time anything tries to resolve them. On a busy machine an entire
+// capture can come back with real_mappings=0, which is the shape #56 was
+// filed for.
+func TestAPIDThatExitsBeforeItIsResolvedHasNoMappings(t *testing.T) {
+	tmp := t.TempDir()
+	pidDir := filepath.Join(tmp, "4321")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mapsPath := filepath.Join(pidDir, "maps")
+	const maps = "00400000-00401000 r-xp 00000000 fd:01 111 /usr/bin/shortlived\n"
+	if err := os.WriteFile(mapsPath, []byte(maps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver(WithProcRoot(tmp))
+	defer r.Close()
+
+	// The process exits before anything asks about it — /proc/<pid> goes away.
+	if err := os.RemoveAll(pidDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := r.Lookup(4321, 0x400500); ok {
+		t.Fatal("expected no mapping for a PID that is already gone")
+	}
+}
+
+// The fix: populate while the process is still alive. The cache then survives
+// the process, and a frame sampled from it still names its binary.
+func TestWarmingBeforeExitKeepsTheMappingsResolvable(t *testing.T) {
+	tmp := t.TempDir()
+	pidDir := filepath.Join(tmp, "4321")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mapsPath := filepath.Join(tmp, "4321", "maps")
+	const maps = "00400000-00401000 r-xp 00000000 fd:01 111 /usr/bin/shortlived\n"
+	if err := os.WriteFile(mapsPath, []byte(maps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver(WithProcRoot(tmp))
+	defer r.Close()
+
+	// Warmed while alive.
+	if n := r.Warm(4321); n != 1 {
+		t.Fatalf("Warm: got %d mappings, want 1", n)
+	}
+
+	// Now it exits.
+	if err := os.RemoveAll(pidDir); err != nil {
+		t.Fatal(err)
+	}
+
+	m, ok := r.Lookup(4321, 0x400500)
+	if !ok {
+		t.Fatal("a warmed PID must stay resolvable after it exits")
+	}
+	if m.Path != "/usr/bin/shortlived" {
+		t.Fatalf("got %q, want /usr/bin/shortlived", m.Path)
+	}
+}

@@ -23,6 +23,7 @@ type Profiler struct {
 	symbolizer       symbolize.Symbolizer
 	kernelSymbolizer symbolize.KernelSymbolizer
 	resolver         *procmap.Resolver
+	warmer           *procmap.Warmer
 	perfSet          *perfevent.Set
 	tags             []string
 	sampleRate       int
@@ -102,22 +103,43 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 		return nil, err
 	}
 
-	return &Profiler{
+	resolver := procmap.NewResolver()
+	pr := &Profiler{
 		objs:             objs,
 		symbolizer:       sym,
 		kernelSymbolizer: kernelSym,
-		resolver:         procmap.NewResolver(),
+		resolver:         resolver,
 		perfSet:          perfSet,
 		tags:             tags,
 		sampleRate:       sampleRate,
 		labels:           labels,
 		perfData:         perfData,
-	}, nil
+	}
+
+	// Mappings are read at COLLECT time, which is after the capture window has
+	// closed — so without this, every process that exited during the window
+	// resolves to nothing and its frames land on the default anonymous
+	// mapping. Issue #56.
+	//
+	// System-wide only sweeps all of /proc. A per-PID capture warms exactly
+	// its target: the same protection where it matters, without reading the
+	// maps of every process on the machine for a profile that can never
+	// contain them.
+	if systemWide {
+		pr.warmer = procmap.NewWarmer(resolver, 0)
+		pr.warmer.Start()
+	} else if pid > 0 {
+		resolver.Warm(uint32(pid))
+	}
+	return pr, nil
 }
 
 // Close releases all resources associated with the profiler.
 // The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
+	if pr.warmer != nil {
+		pr.warmer.Stop()
+	}
 	pr.resolver.Close()
 	_ = pr.perfSet.Close()
 	_ = pr.objs.Close()
@@ -159,12 +181,28 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		Labels:        pr.labels,
 	})
 
+	// PIDs already refreshed in this collect pass. A busy system-wide capture
+	// has many samples per process and re-reading /proc/<pid>/maps for each
+	// would be the most expensive thing in this loop.
+	refreshed := make(map[uint32]struct{}, n)
+
 	for i := range n {
 		key := keys[i]
 		value := values[i]
 
 		// Use PID from sample key for symbolization
 		samplePid := key.Pid
+		// Re-read this PID's mappings if it is still alive, so a process that
+		// loaded a library after the warmer last saw it still resolves. When
+		// it is gone, Refresh keeps whatever was warmed rather than dropping
+		// it — which is the whole reason this is not Invalidate. Issue #56.
+		//
+		// Once per PID per collect, not once per sample: refreshed tracks what
+		// has already been done in this pass.
+		if _, done := refreshed[samplePid]; !done {
+			refreshed[samplePid] = struct{}{}
+			pr.resolver.Refresh(samplePid)
+		}
 
 		// Kernel stack lookup — only when BPF gated a valid stack ID.
 		var kernelIPs []uint64
@@ -288,5 +326,3 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 		Value:       value,
 	}
 }
-
-

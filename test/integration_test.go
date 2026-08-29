@@ -2992,3 +2992,81 @@ func findLibcWithLocalDebuginfo(t *testing.T) (string, string) {
 	t.Skip("no libc.so.6 with local /usr/lib/debug/.build-id debuginfo found — install glibc-debuginfo")
 	return "", ""
 }
+
+// TestSystemWideResolvesAProcessThatExitsDuringTheCapture is issue #56.
+//
+// The profilers resolve mappings at COLLECT time, which is after the capture
+// window closes. A process sampled during the window but gone by the end has
+// no /proc/<pid>/maps left to read, so every frame it contributed used to land
+// on the default anonymous mapping. System-wide is where it bites: short-lived
+// processes are exactly what `-a` exists to catch, and exactly the ones certain
+// to be gone when anything asks.
+//
+// The timing is chosen so neither half of the test is a coin flip. The
+// workload burns CPU on every core for most of the window, so it is certain to
+// be sampled; and it exits with seconds to spare, so it is certain to be gone
+// before the agent resolves anything. An earlier version ran it for 2s of a 6s
+// window and failed for the uninteresting reason that it was never sampled at
+// all.
+func TestSystemWideResolvesAProcessThatExitsDuringTheCapture(t *testing.T) {
+	requireBPFRunnable(t, getAgentPath(t))
+
+	agentPath := getAgentPath(t)
+	binPath := "./workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	absBin, err := filepath.Abs(binPath)
+	require.NoError(t, err)
+
+	outputFile := "profile-shortlived-sys.pb.gz"
+	defer os.Remove(outputFile)
+
+	// Frame pointers rather than DWARF: the defect is in the shared
+	// procmap.Resolver, so either unwinder exercises it, and fp keeps the
+	// agent's shutdown short on machines with large Go binaries running (whose
+	// .eh_frame compilation can take minutes and has nothing to do with this).
+	const window = 10 * time.Second
+	agent := exec.Command(agentPath,
+		"--profile",
+		"--profile-output", outputFile,
+		"--unwind", "fp",
+		"-a",
+		"--duration", window.String(),
+	)
+	require.NoError(t, agent.Start())
+
+	// Let the agent attach and take its first warming sweep.
+	time.Sleep(1 * time.Second)
+
+	// Dominant CPU consumer for 6 of the remaining 9 seconds, then gone.
+	short := exec.Command(absBin, "6")
+	require.NoError(t, short.Start())
+	shortPID := short.Process.Pid
+	require.NoError(t, short.Wait())
+
+	require.NoDirExists(t, fmt.Sprintf("/proc/%d", shortPID),
+		"the workload must be gone before the agent collects, or this test "+
+			"passes for the wrong reason")
+	t.Logf("workload pid=%d exited with ~%v of capture left", shortPID, window-7*time.Second)
+
+	require.NoError(t, agent.Wait(), "perf-agent failed")
+
+	prof, err := readProfile(outputFile)
+	require.NoError(t, err)
+	require.NotEmpty(t, prof.Sample, "no samples: %s", describeProfile(prof))
+
+	assert.True(t, mappingNamed(prof, "rust-workload"),
+		"a process that exited during the capture must still resolve to its "+
+			"binary; %s mappings=%s", describeProfile(prof), describeMappings(prof))
+}
+
+// mappingNamed reports whether any mapping's file path contains want.
+func mappingNamed(p *profile.Profile, want string) bool {
+	for _, m := range p.Mapping {
+		if strings.Contains(m.File, want) {
+			return true
+		}
+	}
+	return false
+}

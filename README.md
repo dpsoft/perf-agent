@@ -425,6 +425,17 @@ Sample addresses resolve through `procmap.Resolver` (lazy `/proc/<pid>/maps` + b
 
 Requires Go 1.26+, Clang/LLVM, Linux headers, and [blazesym](https://github.com/libbpf/blazesym) (Rust C library for symbolization).
 
+**Regenerating the eBPF objects needs Clang 18 specifically.** The `*_bpfel.o`
+files are committed build artifacts, so their bytes depend on the exact
+compiler that produced them — a different Clang rewrites objects in packages
+you did not touch, and the resulting diff is noise that will drift straight
+back for the next person. CI pins Clang 18 (Ubuntu 24.04's default) and fails
+if regeneration changes a committed object; `make generate-check` runs the same
+check locally and prints your Clang version when it disagrees.
+
+You only need this to run `make generate`. Building and testing use the
+committed objects and work with any toolchain.
+
 ```bash
 make build
 ```

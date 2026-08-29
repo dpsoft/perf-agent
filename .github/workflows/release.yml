@@ -37,11 +37,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            llvm \
+            clang-18 \
+            llvm-18 \
             libelf-dev \
             linux-headers-$(uname -r) \
             libbpf-dev
+
+          # bpf2go invokes `clang` and `llvm-strip` by bare name, and the
+          # versioned packages do not provide them. Pinning the version is
+          # only half the job — these symlinks are what make the pin take
+          # effect. Issue #87.
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
+          clang --version | head -1
           
           # Ensure bpf headers are available
           if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then

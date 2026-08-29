@@ -77,7 +77,15 @@ test-workloads:
 	chmod +x test/workloads/python/*.py
 
 .PHONY: test-unit
-test-unit: generate
+# Deliberately NOT depending on `generate`. Issue #87.
+#
+# It used to, which meant running the unit tests silently rewrote the committed
+# eBPF objects with whatever clang happened to be installed — so drift entered
+# the tree without anyone running `make generate` on purpose, and the person
+# who introduced it had no reason to look. Tests now run against the committed
+# objects, which is what `go build` and every user get. `make generate-check`
+# is what says those objects are current.
+test-unit:
 	LD_LIBRARY_PATH="$(abspath $(LIBBLAZESYM_SRC)/target/release):$$LD_LIBRARY_PATH" \
 	CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" \
 	CGO_LDFLAGS="-L$(abspath $(LIBBLAZESYM_SRC)/target/release) -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \

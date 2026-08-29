@@ -1,10 +1,8 @@
 package debuginfod
 
 import (
-	"context"
 	"errors"
 	"io"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,29 +16,20 @@ func (countingStore) WriteAtomic(string, cache.Kind, io.Reader) (string, error) 
 }
 func (countingStore) Evict() error { return nil }
 
-// A fetcher whose upstream always fails, counting how often it is actually
-// reached.
-type failingUpstream struct{ calls atomic.Uint64 }
-
-func (f *failingUpstream) fetch(_ context.Context, _, _ string) (io.ReadCloser, error) {
-	f.calls.Add(1)
-	return nil, ErrNotFound
-}
-
 // Issue #109. singleflight collapses concurrent fetches and does nothing for
 // sequential ones. Symbolization runs once per SAMPLE, so a build-id no server
 // can serve was re-attempted on every sample — and when the server hangs
 // instead of answering, each attempt costs the whole fetch timeout. Measured:
 // one call in a real capture took 30.022s, exactly the default timeout.
 func TestAFailedFetchIsNotRetriedWithinItsTTL(t *testing.T) {
-	up := &failingUpstream{}
+	// The memo is driven directly rather than through fetchAndStore: upstream
+	// is a concrete *fetcher with no interface to substitute, and the memo is
+	// what this test is about. The wiring that calls noteFailure on a failed
+	// fetch is one line in fetchAndStore.
 	sf := &singleflightFetcher{
-		upstream: nil,
-		cache:    countingStore{},
-		failed:   make(map[string]fetchFailure),
+		cache:  countingStore{},
+		failed: make(map[string]fetchFailure),
 	}
-	// Drive the memo directly: the upstream field is a concrete *fetcher and
-	// cannot be stubbed, but the memo is what this test is about.
 	key := "debuginfo:deadbeef"
 	if _, ok := sf.recentFailure(key); ok {
 		t.Fatal("nothing should be remembered yet")
@@ -54,7 +43,6 @@ func TestAFailedFetchIsNotRetriedWithinItsTTL(t *testing.T) {
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("remembered error = %v, want ErrNotFound", err)
 	}
-	_ = up
 }
 
 // The memo expires, so a transient outage does not poison symbolization for

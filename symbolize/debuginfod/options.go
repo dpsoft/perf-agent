@@ -43,7 +43,22 @@ func (o *Options) validate() error {
 		o.CacheMaxBytes = 2 << 30 // 2 GiB
 	}
 	if o.FetchTimeout == 0 {
-		o.FetchTimeout = 30 * time.Second
+		// 5s, not 30s, because this bounds a SYNCHRONOUS stall on the
+		// symbolization path rather than a background download.
+		//
+		// Every distinct build-id the servers cannot serve costs this once —
+		// negFetch stops it recurring, but the first attempt is paid in full,
+		// while the profile waits. Measured on a workstation with ~16 large
+		// Go binaries mapped: a 5s system-wide capture spent 1m12s in
+		// symbolization, the slowest single call taking 31.937s, which is the
+		// old default plus scheduling. Two or three such misses accounted for
+		// the whole of it. Issue #109.
+		//
+		// The cost of being wrong in each direction is asymmetric: too short
+		// and a slow server yields a profile with less source detail, which
+		// degrades gracefully; too long and the profile does not arrive.
+		// A capture is a foreground operation with someone waiting on it.
+		o.FetchTimeout = 5 * time.Second
 	}
 	if o.HTTPClient == nil {
 		o.HTTPClient = &http.Client{Timeout: o.FetchTimeout}

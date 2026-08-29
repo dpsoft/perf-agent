@@ -424,6 +424,8 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 		}
 		builders.AddSample(&sample)
 	}
+	symbolize.LogSymbolizationCost(s.symbolizer, "dwarfagent")
+
 	for _, b := range builders.Builders {
 		if _, err := b.Write(w); err != nil {
 			return fmt.Errorf("write profile: %w", err)

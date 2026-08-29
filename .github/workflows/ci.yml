@@ -77,7 +77,35 @@ jobs:
 
     - name: Run go generate
       run: go generate ./...
-    
+
+    # Regeneration must not change the committed objects. Issue #87.
+    #
+    # `go generate` already ran above and its output was never checked, so a
+    # committed object could disagree with what the toolchain produces and
+    # nothing said so. Two tasks in the GPU phase hit exactly that, reverted
+    # the files by hand to keep their commits scoped, and could only confirm
+    # "generate is idempotent" with a standing exception for three packages —
+    # which is the kind of exception that hides a real regeneration bug later.
+    #
+    # A failure here means one of two things, and the diff says which:
+    #   - a source change was made without committing the regenerated object
+    #   - this runner's clang produces different bytes from the one that
+    #     produced the committed objects, in which case the toolchain needs
+    #     pinning rather than the objects re-committing
+    - name: Verify generated objects are up to date
+      run: |
+        if ! git diff --quiet -- '*_bpfel.go' '*_bpfel.o'; then
+          echo "::error::go generate changed committed files; see the diff below"
+          git diff --stat -- '*_bpfel.go' '*_bpfel.o'
+          echo "--- per-file byte sizes (same size + differing bytes usually means BTF ordering) ---"
+          git diff --name-only -- '*_bpfel.go' '*_bpfel.o' | while read -r f; do
+            printf '%s committed=%s regenerated=%s\n' "$f" \
+              "$(git show HEAD:"$f" | wc -c)" "$(wc -c < "$f")"
+          done
+          exit 1
+        fi
+        echo "✓ generated objects match the committed ones"
+
     - name: Build perf-agent
       run: go build -v .
     

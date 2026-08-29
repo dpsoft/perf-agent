@@ -33,6 +33,37 @@ build: blazesym-check $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
 generate:
 	go generate ./...
 
+# The committed bpf2go outputs. Scoped deliberately: the check must fire on a
+# stale generated object and stay silent on whatever else is dirty in a
+# contributor's tree, or it becomes the kind of check people learn to ignore.
+GENERATED_GLOBS := '*_bpfel.go' '*_bpfel.o'
+
+# Regeneration must not change the committed objects. Issue #87.
+#
+# The .o files are committed build artifacts, so their bytes depend on the
+# exact clang/LLVM that produced them. Running `make generate` on a different
+# toolchain rewrites packages you did not touch, and the only ways out are to
+# commit the noise or revert it by hand — which only works if you notice.
+#
+# This is the same check CI runs. A failure names the files and prints their
+# sizes: same size with differing bytes is usually BTF type-ordering rather
+# than a real code change, which is the distinction that decides whether the
+# diff is worth committing or the toolchain is worth pinning.
+.PHONY: generate-check
+generate-check: generate
+	@if git diff --quiet -- $(GENERATED_GLOBS); then \
+		echo "✓ generated objects match the committed ones"; \
+	else \
+		echo "*** go generate changed committed files:"; \
+		git diff --stat -- $(GENERATED_GLOBS); \
+		git diff --name-only -- $(GENERATED_GLOBS) | while read -r f; do \
+			printf '    %s committed=%s regenerated=%s\n' "$$f" \
+				"$$(git show HEAD:"$$f" | wc -c)" "$$(wc -c < "$$f")"; \
+		done; \
+		echo "*** clang: $$(clang --version | head -1)"; \
+		exit 1; \
+	fi
+
 .PHONY: test-workloads
 test-workloads:
 	cd test/workloads/go && go build -o cpu_bound cpu_bound.go

@@ -22,6 +22,7 @@ type Profiler struct {
 	symbolizer       symbolize.Symbolizer
 	kernelSymbolizer symbolize.KernelSymbolizer
 	resolver         *procmap.Resolver
+	warmer           *procmap.Warmer
 	link             link.Link
 	tags             []string
 	labels           map[string]string
@@ -82,20 +83,37 @@ func NewProfiler(pid int, systemWide bool, tags []string, labels map[string]stri
 		return nil, fmt.Errorf("attach tp_btf sched_switch: %w", err)
 	}
 
-	return &Profiler{
+	resolver := procmap.NewResolver()
+	pr := &Profiler{
 		objs:             objs,
 		symbolizer:       sym,
 		kernelSymbolizer: kernelSym,
-		resolver:         procmap.NewResolver(),
+		resolver:         resolver,
 		link:             tp,
 		tags:             tags,
 		labels:           labels,
-	}, nil
+	}
+
+	// See the same block in profile/profiler.go: mappings are read at collect
+	// time, so a process that exited during the capture resolves to nothing
+	// unless it was read while alive. Issue #56. Off-CPU is if anything more
+	// exposed — a process that blocked and then exited is precisely the thing
+	// this profiler exists to show.
+	if systemWide {
+		pr.warmer = procmap.NewWarmer(resolver, 0)
+		pr.warmer.Start()
+	} else if pid > 0 {
+		resolver.Warm(uint32(pid))
+	}
+	return pr, nil
 }
 
 // Close releases all resources associated with the profiler.
 // The symbolizer is owned by the Agent; we do not close it here.
 func (pr *Profiler) Close() {
+	if pr.warmer != nil {
+		pr.warmer.Stop()
+	}
 	pr.resolver.Close()
 	_ = pr.link.Close()
 	_ = pr.objs.Close()
@@ -137,12 +155,22 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		Labels:        pr.labels,
 	})
 
+	// PIDs already refreshed in this collect pass; see profile/profiler.go.
+	refreshed := make(map[uint32]struct{}, n)
+
 	for i := 0; i < n; i++ {
 		key := keys[i]
 		value := values[i]
 
 		// Use PID from a sample key for symbolization
 		samplePid := key.Pid
+		// Fresh mappings for a live process, the warmed snapshot for one that
+		// is gone. Refresh rather than Invalidate so the second case keeps
+		// what it has. Issue #56.
+		if _, done := refreshed[samplePid]; !done {
+			refreshed[samplePid] = struct{}{}
+			pr.resolver.Refresh(samplePid)
+		}
 
 		// Kernel stack lookup — only when BPF gated a valid stack ID.
 		var kernelIPs []uint64

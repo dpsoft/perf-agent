@@ -83,6 +83,56 @@ func (r *Resolver) Mappings(pid uint32) ([]Mapping, error) {
 	return entry.mappings, nil
 }
 
+// Warm populates pid's cache now, while the process is presumably still
+// alive, and reports how many executable mappings it holds afterwards.
+//
+// This exists because of WHEN the profilers resolve. Lookup populates lazily,
+// and in the profilers the first Lookup for a PID happens at collect time —
+// after the whole capture window has closed. A process sampled during the
+// window but gone by the end has no /proc/<pid>/maps left to read, so every
+// frame it contributed resolves to nothing. System-wide is where that bites:
+// short-lived processes are exactly what a `-a` capture exists to catch, and
+// exactly the ones guaranteed to be gone by the time anything asks. Issue #56.
+//
+// Idempotent and cheap to repeat: the per-PID sync.Once means a second call
+// for the same PID costs a map lookup and nothing else, which is what lets a
+// sweep run on a timer without re-reading /proc for every process each time.
+//
+// It deliberately does NOT freeze the answer. A process still alive at collect
+// time is Refreshed there, so warming only ever supplies a fallback for
+// processes that are gone — it never makes a live process's mappings staler
+// than they would have been.
+func (r *Resolver) Warm(pid uint32) int {
+	m, err := r.Mappings(pid)
+	if err != nil {
+		return 0
+	}
+	return len(m)
+}
+
+// Refresh re-reads pid's mappings, KEEPING the existing cache entry if the
+// re-read yields nothing.
+//
+// That fallback is the whole point, and it is why this is not Invalidate
+// followed by Lookup. Invalidate drops the entry unconditionally, so a process
+// that exits between the drop and the re-read loses mappings that had been
+// warmed while it was alive — turning the fix for #56 back into the bug, in a
+// window narrow enough to be rare and therefore to be mistaken for something
+// else. Here the old entry survives any failure.
+//
+// Returns true when fresh mappings replaced the cached ones.
+func (r *Resolver) Refresh(pid uint32) bool {
+	fresh := &pidEntry{}
+	fresh.once.Do(func() { r.populate(fresh, pid) })
+	if fresh.err != nil || len(fresh.mappings) == 0 {
+		return false // process gone or unreadable; keep whatever we warmed
+	}
+	r.mu.Lock()
+	r.cache[pid] = fresh
+	r.mu.Unlock()
+	return true
+}
+
 // Invalidate drops any cached state for pid. The next Lookup
 // re-parses /proc/<pid>/maps. Call on process exit or when the
 // agent learns of whole-process churn (e.g., exec).
@@ -110,6 +160,16 @@ func (r *Resolver) Close() {
 	r.mu.Lock()
 	r.cache = map[uint32]*pidEntry{}
 	r.mu.Unlock()
+}
+
+// isCached reports whether pid has an entry already, without creating one.
+// The Warmer uses it to count first reads separately from repeats; creating an
+// entry here would make every sweep look like a first read.
+func (r *Resolver) isCached(pid uint32) bool {
+	r.mu.RLock()
+	_, ok := r.cache[pid]
+	r.mu.RUnlock()
+	return ok
 }
 
 // entryFor returns the per-PID entry, creating it under the write

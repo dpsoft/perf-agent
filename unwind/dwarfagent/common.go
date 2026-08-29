@@ -67,6 +67,7 @@ type session struct {
 	symbolizer       symbolize.Symbolizer
 	kernelSymbolizer symbolize.KernelSymbolizer
 	resolver         *procmap.Resolver
+	warmer           *procmap.Warmer
 
 	stop      chan struct{}
 	trackerWG sync.WaitGroup
@@ -212,7 +213,8 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		}
 	}
 
-	return &session{
+	resolver := procmap.NewResolver()
+	sess := &session{
 		pid:              pid,
 		tags:             tags,
 		labels:           labels,
@@ -224,12 +226,29 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		missReader:       missReader,
 		symbolizer:       sym,
 		kernelSymbolizer: kernelSym,
-		resolver:         procmap.NewResolver(),
+		resolver:         resolver,
 		stop:             make(chan struct{}),
 		samples:          map[sampleKey]uint64{},
 		attachStats:      stats,
 		perfData:         perfData,
-	}, nil
+	}
+
+	// Issue #56, and this is the path it was reported on. The unwinder already
+	// tracks mappings live — that is what AttachAllProcesses and the mmap
+	// watcher above are for — but the pprof resolver is a SEPARATE cache that
+	// populates lazily, and its first read happens at collect time. So the
+	// tables needed to walk a short-lived process's stack were installed while
+	// it lived, and then every frame that walk produced resolved to nothing.
+	//
+	// The observed failure was a system-wide capture in which every sampled
+	// frame landed on the default anonymous mapping.
+	if systemWide {
+		sess.warmer = procmap.NewWarmer(resolver, 0)
+		sess.warmer.Start()
+	} else if pid > 0 {
+		resolver.Warm(uint32(pid))
+	}
+	return sess, nil
 }
 
 // runTracker starts the background goroutine that consumes mmap events
@@ -386,7 +405,15 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 		Resolver:      s.resolver,
 		Labels:        s.labels,
 	})
+	// PIDs already refreshed in this collect pass. Fresh mappings for a live
+	// process, the warmed snapshot for one that is gone. Issue #56.
+	refreshed := make(map[uint32]struct{}, len(samples))
+
 	for key, val := range samples {
+		if _, done := refreshed[key.pid]; !done {
+			refreshed[key.pid] = struct{}{}
+			s.resolver.Refresh(key.pid)
+		}
 		frames := symbolizePIDWithKernel(s.symbolizer, s.kernelSymbolizer, key.pid, stacks[key], kernStacks[key])
 		sample := pprof.ProfileSample{
 			Pid:         key.pid,
@@ -415,6 +442,13 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 // Idempotent at the stop-channel level. Returns the first non-nil error
 // encountered; subsequent close calls still execute.
 func (s *session) close() error {
+	// Before the stop channel: the warmer owns a goroutine of its own and
+	// Stop joins it, so doing this first keeps the teardown order the same
+	// shape as everything else here — signal and join each thing in turn,
+	// rather than leaving one running across the rest of the teardown.
+	if s.warmer != nil {
+		s.warmer.Stop()
+	}
 	select {
 	case <-s.stop:
 	default:

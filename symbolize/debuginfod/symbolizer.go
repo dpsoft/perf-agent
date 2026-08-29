@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
@@ -128,6 +129,23 @@ func (s *Symbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fra
 		return nil, nil
 	}
 
+	callStart := time.Now()
+	defer func() {
+		d := time.Since(callStart)
+		ns := uint64(d.Nanoseconds())
+		s.stats.calls.Add(1)
+		s.stats.totalNs.Add(ns)
+		if d > 50*time.Millisecond {
+			s.stats.callsOver50ms.Add(1)
+		}
+		for {
+			prev := s.stats.slowestNs.Load()
+			if ns <= prev || s.stats.slowestNs.CompareAndSwap(prev, ns) {
+				break
+			}
+		}
+	}()
+
 	ctx := context.Background()
 	if s.opts.FetchTimeout > 0 {
 		var cancel context.CancelFunc
@@ -140,6 +158,8 @@ func (s *Symbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fra
 	// handles on-demand fetches for build-id-only mappings.
 	if s.resolver == nil {
 		s.stats.classifyProcessMode.Add(uint64(len(ips)))
+		t := time.Now()
+		defer func() { s.stats.symbolizeNs.Add(uint64(time.Since(t).Nanoseconds())) }()
 		return s.cgo.symbolizeProcess(pid, ips)
 	}
 
@@ -150,14 +170,19 @@ func (s *Symbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fra
 	// after the first call would leave new mappings invisible, causing IPs
 	// in those regions to fall through findMapping with no hit and be
 	// silently misrouted to process-mode against the wrong (or no) mapping.
+	mapStart := time.Now()
 	s.resolver.Invalidate(pid)
 	mappings, err := s.resolver.Mappings(pid)
+	s.stats.mappingsNs.Add(uint64(time.Since(mapStart).Nanoseconds()))
 	if err != nil || len(mappings) == 0 {
 		s.stats.classifyProcessMode.Add(uint64(len(ips)))
 		return s.cgo.symbolizeProcess(pid, ips)
 	}
 
-	return s.routeAndSymbolize(ctx, pid, ips, mappings)
+	symStart := time.Now()
+	frames, rerr := s.routeAndSymbolize(ctx, pid, ips, mappings)
+	s.stats.symbolizeNs.Add(uint64(time.Since(symStart).Nanoseconds()))
+	return frames, rerr
 }
 
 // routeAndSymbolize is the core per-mapping router. Split out from
@@ -167,11 +192,34 @@ func (s *Symbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Fra
 func (s *Symbolizer) routeAndSymbolize(
 	ctx context.Context, pid uint32, ips []uint64, mappings []procmap.Mapping,
 ) ([]symbolize.Frame, error) {
-	// Classify each mapping once. Keyed by mapping.Start because that's
-	// unique within a single /proc/<pid>/maps snapshot.
-	routesByMapping := make(map[uint64]classifyResult, len(mappings))
-	for _, m := range mappings {
-		routesByMapping[m.Start] = s.classifier.classify(ctx, m)
+	// Classify LAZILY: only the mappings an address actually falls into.
+	//
+	// This used to classify every mapping in the process, up front, on every
+	// call — and classify is not cheap. It opens the ELF to test for DWARF,
+	// searches for a debug link, and reads the build-id, so its cost is
+	// per-mapping file I/O. A process maps hundreds of objects while a stack
+	// touches a handful, and SymbolizeProcess runs once per SAMPLE, so the
+	// work was O(samples x mappings) to serve O(samples x stack depth).
+	//
+	// Measured on a workstation before this change: a 5s system-wide capture
+	// spent 1m9.88s in symbolization over 178 calls, of which 1m9.67s was
+	// here — against 996ms for the same capture through the local symbolizer.
+	// Two network requests were made in that time, both 404, zero bytes: the
+	// cost was never the fetching. Issue #109.
+	//
+	// Keyed by mapping.Start, which is unique within one /proc/<pid>/maps
+	// snapshot, and memoized for this call only — classification depends on
+	// the debuginfod cache's contents, which a fetch during this same call
+	// can change, so it must not be carried across calls without splitting
+	// the immutable ELF inspection from the mutable cache lookup.
+	routesByMapping := make(map[uint64]classifyResult, 8)
+	classifyFor := func(m procmap.Mapping) classifyResult {
+		if r, ok := routesByMapping[m.Start]; ok {
+			return r
+		}
+		r := s.classifier.classify(ctx, m)
+		routesByMapping[m.Start] = r
+		return r
 	}
 
 	type fileBucket struct {
@@ -199,7 +247,7 @@ func (s *Symbolizer) routeAndSymbolize(
 			processBatch.indices = append(processBatch.indices, i)
 			continue
 		}
-		r := routesByMapping[m.Start]
+		r := classifyFor(m)
 		switch r.route {
 		case routeSkip:
 			s.stats.classifySkipped.Add(1)

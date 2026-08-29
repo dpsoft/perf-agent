@@ -244,6 +244,8 @@ func (pr *Profiler) Collect(w io.Writer) error {
 	}
 
 	// Write profile directly to the provided writer
+	symbolize.LogSymbolizationCost(pr.symbolizer, "offcpu")
+
 	for _, builder := range builders.Builders {
 		_, err = builder.Write(w)
 		if err != nil {

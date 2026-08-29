@@ -10,6 +10,7 @@ import (
 	"log"
 	"log/slog"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,12 +193,38 @@ func (a *Agent) pidLogStr(hostPID int) string {
 // chooseSymbolizer constructs the agent-owned symbolizer. If DebuginfodURLs
 // is non-empty (or the DEBUGINFOD_URLS env var is set), a Debuginfod
 // symbolizer is returned; otherwise the local blazesym symbolizer is used.
+// debuginfodURLsFromEnv extracts the server URLs from a DEBUGINFOD_URLS value.
+//
+// The variable is whitespace-separated, but it is NOT only URLs. elfutils'
+// debuginfod-client also accepts policy tokens in the same list, and Fedora
+// ships exactly that by default:
+//
+//	DEBUGINFOD_URLS="ima:enforcing https://debuginfod.fedoraproject.org/ ima:ignore"
+//
+// Taking every field as a server, which is what this did, hands two
+// non-servers to the fetcher and asks it to resolve build-ids against them.
+// Only http and https are servers here; anything else is a token this agent
+// does not implement and must ignore rather than dial. Issue #109.
+func debuginfodURLsFromEnv(env string) []string {
+	var urls []string
+	for f := range strings.FieldsSeq(env) {
+		u, err := url.Parse(f)
+		if err != nil {
+			continue
+		}
+		// Scheme AND host: "https://" alone parses cleanly and is not a
+		// server, and a bare path picks up no scheme at all.
+		if (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+			urls = append(urls, f)
+		}
+	}
+	return urls
+}
+
 func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (symbolize.Symbolizer, error) {
 	urls := cfg.DebuginfodURLs
 	if len(urls) == 0 {
-		for u := range strings.FieldsSeq(os.Getenv("DEBUGINFOD_URLS")) {
-			urls = append(urls, u)
-		}
+		urls = debuginfodURLsFromEnv(os.Getenv("DEBUGINFOD_URLS"))
 	}
 	if len(urls) == 0 {
 		// res names the module behind an address blazesym could not resolve
@@ -214,9 +241,24 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 		// the same kind of cache - but it does not narrow it either.
 		return symbolize.NewLocalSymbolizer(symbolize.WithModuleIndex(res))
 	}
+	// Announced, because it is the single biggest thing that can change how
+	// long a capture takes and it was previously silent. Measured on a
+	// workstation: the same 5s system-wide capture took 6.4s with the local
+	// symbolizer and 87s with debuginfod reachable, with nothing in the
+	// output to say why (issue #109). DEBUGINFOD_URLS is set by default on
+	// several distributions, so this is on for many users who never asked.
+	log.Printf("perf-agent: debuginfod symbolization ENABLED (%d server(s): %s). "+
+		"Debug info is fetched over the network on first contact with each "+
+		"unknown build-id, which can take far longer than the capture itself; "+
+		"unset DEBUGINFOD_URLS or pass --debuginfod-urls='' to use local "+
+		"symbols only",
+		len(urls), strings.Join(urls, " "))
 	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
 	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))
-	timeout := cmp.Or(cfg.SymbolFetchTimeout, 30*time.Second)
+	// Left to the package default (5s) unless configured; see its rationale
+	// in debuginfod.Options.validate. Raising it trades capture latency for
+	// source detail on slow servers.
+	timeout := cfg.SymbolFetchTimeout
 	return debuginfod.New(debuginfod.Options{
 		URLs:          urls,
 		CacheDir:      cacheDir,
@@ -700,8 +742,38 @@ func (a *Agent) Close() error {
 	return nil
 }
 
+// logDebuginfodStats prints the fetch counters when debuginfod symbolization
+// was in use.
+//
+// The counters already existed; nothing printed them, which is why a run that
+// spent 82 of its 87 seconds fetching produced six lines of output and no clue
+// (issue #109). Fetch counts and bytes are what distinguish "the network was
+// slow" from "this build-id is not on any server and we asked 199 times".
+func (a *Agent) logDebuginfodStats() {
+	d, ok := a.symbolizer.(*debuginfod.Symbolizer)
+	if !ok {
+		return
+	}
+	st := d.Stats()
+	log.Printf("perf-agent: debuginfod: symbolization took %v over %d call(s) "+
+		"[maps %v, symbolize %v; slowest call %v, %d call(s) over 50ms]; "+
+		"fetches ok=%d 404=%d err=%d bytes=%dMB; "+
+		"cache hits=%d misses=%d evictions=%d; dispatcher calls=%d skipped_local=%d; "+
+		"file_mode addrs=%d fetch_fails=%d local_hits=%d parse_fails=%d",
+		time.Duration(st.TotalNs).Round(time.Millisecond), st.Calls,
+		time.Duration(st.MappingsNs).Round(time.Millisecond),
+		time.Duration(st.SymbolizeNs).Round(time.Millisecond),
+		time.Duration(st.SlowestNs).Round(time.Millisecond), st.CallsOver50ms,
+		st.FetchSuccessDebuginfo+st.FetchSuccessExecutable,
+		st.Fetch404s, st.FetchErrors, st.FetchBytesTotal/(1<<20),
+		st.CacheHits, st.CacheMisses, st.CacheEvictions,
+		st.DispatcherCalls, st.DispatcherSkippedLocal,
+		st.FileModeAddrs, st.FileModeFetchFails, st.FileModeLocalHits, st.FileModeParseFails)
+}
+
 // cleanup releases profiler resources.
 func (a *Agent) cleanup() {
+	a.logDebuginfodStats()
 	if a.cpuProfiler != nil {
 		a.cpuProfiler.Close()
 		a.cpuProfiler = nil

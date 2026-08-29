@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	blazesym "github.com/libbpf/blazesym/go"
 )
@@ -58,6 +60,20 @@ type localCounters struct {
 	rawAddrBatches  atomic.Uint64
 	modulesAttached atomic.Uint64
 	modulesBare     atomic.Uint64
+
+	// How much wall time symbolization actually cost, and over how many
+	// calls. A profiler that takes two minutes to write a five-second capture
+	// is a real failure mode (issue #109) and it was not attributable from
+	// anything the agent printed: every other counter looked healthy while the
+	// process sat in blazesym. These make the collect path's cost a number.
+	calls   atomic.Uint64
+	totalNs atomic.Uint64
+	// The single most expensive call, with the PID that caused it. A mean
+	// hides the case this is usually about --- one enormous binary parsed
+	// once --- so the maximum is kept alongside the total rather than instead
+	// of it.
+	slowestNs  atomic.Uint64
+	slowestPID atomic.Uint32
 }
 
 // LocalStats is a point-in-time view of what SymbolizeProcess could not
@@ -79,6 +95,40 @@ type LocalStats struct {
 	// a run where it never happens must not look like one where it always
 	// did.
 	ModulesBare uint64
+
+	// Calls is how many times SymbolizeProcess ran, and TotalNs the wall time
+	// inside it. Calls far exceeding the number of distinct processes means
+	// the caller is symbolizing per sample rather than per process.
+	Calls   uint64
+	TotalNs uint64
+	// SlowestNs is the most expensive single call and SlowestPID the process
+	// it was for. First contact with a large binary is normally the whole of
+	// it: blazesym caches parsed sources, so the second call for the same
+	// process costs almost nothing.
+	SlowestNs  uint64
+	SlowestPID uint32
+}
+
+// noteCall records one SymbolizeProcess call's cost. Racy for slowestPID
+// against slowestNs under concurrent callers --- two calls can interleave and
+// leave the PID of one with the duration of another. That is accepted: this is
+// a diagnostic pointing at which process is expensive, not a measurement
+// anything decides on, and paying a mutex per symbolization to tighten it
+// would be spending the very thing being measured.
+func (s *LocalSymbolizer) noteCall(pid uint32, d time.Duration) {
+	ns := uint64(d.Nanoseconds())
+	s.stats.calls.Add(1)
+	s.stats.totalNs.Add(ns)
+	for {
+		prev := s.stats.slowestNs.Load()
+		if ns <= prev {
+			return
+		}
+		if s.stats.slowestNs.CompareAndSwap(prev, ns) {
+			s.stats.slowestPID.Store(pid)
+			return
+		}
+	}
 }
 
 // Stats returns the current process-side symbolization counters.
@@ -87,6 +137,10 @@ func (s *LocalSymbolizer) Stats() LocalStats {
 		RawAddrBatches:  s.stats.rawAddrBatches.Load(),
 		ModulesAttached: s.stats.modulesAttached.Load(),
 		ModulesBare:     s.stats.modulesBare.Load(),
+		Calls:           s.stats.calls.Load(),
+		TotalNs:         s.stats.totalNs.Load(),
+		SlowestNs:       s.stats.slowestNs.Load(),
+		SlowestPID:      s.stats.slowestPID.Load(),
 	}
 }
 
@@ -212,10 +266,12 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	if len(ips) == 0 {
 		return nil, nil
 	}
+	start := time.Now()
 	syms, err := s.bz.SymbolizeProcessAbsAddrs(ips, pid,
 		blazesym.ProcessSourceWithPerfMap(true),
 		blazesym.ProcessSourceWithDebugSyms(true),
 	)
+	s.noteCall(pid, time.Since(start))
 	if err != nil {
 		s.stats.rawAddrBatches.Add(1)
 		return s.withModules(pid, rawUserAddrFrames(ips)), nil
@@ -298,4 +354,32 @@ func fromBlazesymSym(s blazesym.Sym, addr uint64) Frame {
 		f.Inlined = append(f.Inlined, inFrame)
 	}
 	return f
+}
+
+// LogSymbolizationCost prints what symbolization cost this collect, when the
+// symbolizer in use keeps that figure.
+//
+// It exists because the cost is invisible otherwise. A capture whose window
+// was five seconds can spend two minutes here (issue #109), and until this
+// there was nothing in the agent's output to say so: the sample count, the
+// mapping count and every drop counter all read healthy while the process sat
+// inside blazesym. Printed unconditionally rather than behind a threshold,
+// because "symbolization took 40ms" is the line that makes "symbolization took
+// 107s" legible when someone eventually sees it.
+//
+// prefix names the profiler, since a combined run has more than one.
+func LogSymbolizationCost(sym Symbolizer, prefix string) {
+	st, ok := sym.(interface{ Stats() LocalStats })
+	if !ok {
+		return
+	}
+	s := st.Stats()
+	if s.Calls == 0 {
+		return
+	}
+	log.Printf("%s: symbolization took %v over %d call(s); slowest single call %v (pid %d); "+
+		"raw_addr_batches=%d modules_attached=%d modules_bare=%d",
+		prefix, time.Duration(s.TotalNs).Round(time.Millisecond), s.Calls,
+		time.Duration(s.SlowestNs).Round(time.Millisecond), s.SlowestPID,
+		s.RawAddrBatches, s.ModulesAttached, s.ModulesBare)
 }

@@ -299,6 +299,17 @@ type cubinSink interface {
 	HasCubin(crc uint64) bool
 	// PutCubin takes ownership of bytes.
 	PutCubin(crc uint64, bytes []byte) error
+	// ResidentBytes reports how many bytes the sink currently HOLDS, not how
+	// many have ever passed through it.
+	//
+	// The distinction is the whole of issue #96. The total ceiling used to be
+	// charged against a cumulative tally, while the bytes themselves live in a
+	// bounded store that evicts. The tally therefore climbed forever and
+	// resident usage stayed flat, so a process loading more than the ceiling
+	// in DISTINCT cubins over its lifetime started refusing offers while the
+	// agent held a fraction of it. Asking the sink means the transport's bound
+	// and the store's bound describe the same quantity.
+	ResidentBytes() int64
 }
 
 // moduleStoreSink is the one hop between the cubin transport and the store
@@ -345,6 +356,11 @@ func (m moduleStoreSink) PutCubin(crc uint64, b []byte) error {
 	return nil
 }
 
+// ResidentBytes is the store's own gauge, which is the number its MaxBytes
+// eviction already acts on. Reading it here rather than keeping a second tally
+// is what stops the two bounds from describing different quantities.
+func (m moduleStoreSink) ResidentBytes() int64 { return m.store.Stats().LiveBytes }
+
 // cubinSinkFor picks the sink for a consumer's configuration. A store supplied
 // by the caller is the sink; nothing is constructed here when one is missing,
 // because a store this package owned would be one the projection cannot read.
@@ -360,9 +376,10 @@ func cubinSinkFor(cfg Config) cubinSink {
 // gpu_src_status="no-module", which is the truth for them - there is no store
 // to resolve against. See Config.Modules.
 type memCubinStore struct {
-	mu   sync.Mutex
-	cap  int
-	seen map[uint64][]byte
+	mu    sync.Mutex
+	cap   int
+	seen  map[uint64][]byte
+	bytes int64
 }
 
 func newMemCubinStore(capacity int) *memCubinStore {
@@ -389,7 +406,18 @@ func (s *memCubinStore) PutCubin(crc uint64, b []byte) error {
 		return fmt.Errorf("cubin store full at %d modules", s.cap)
 	}
 	s.seen[crc] = b
+	s.bytes += int64(len(b))
 	return nil
+}
+
+// ResidentBytes is exact here because this store never evicts: it refuses at
+// its module cap instead. Held and lifetime bytes are therefore the same
+// number, which is precisely why this implementation cannot demonstrate the
+// bug the interface exists to fix -- gpu.ModuleStore is the one that evicts.
+func (s *memCubinStore) ResidentBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bytes
 }
 
 func (s *memCubinStore) get(crc uint64) ([]byte, bool) {
@@ -626,9 +654,12 @@ func (l *cubinListener) handle(conn *net.UnixConn) {
 	// kept", and the reason string says which ceiling it was. What must never
 	// happen for either is a truncated store - a truncated cubin parses into
 	// a WRONG line table, which is the one failure worse than no line table.
-	l.mu.Lock()
-	held := l.stats.bytes
-	l.mu.Unlock()
+	// Resident, not cumulative: what the agent is HOLDING is what the ceiling
+	// is a bound on. Charging it against the lifetime tally (l.stats.bytes)
+	// meant the limit tightened forever while actual usage stayed flat, so a
+	// long-running process with heavy JIT or template instantiation refused
+	// offers with most of the store empty. Issue #96.
+	held := uint64(max(l.sink.ResidentBytes(), 0))
 	if held+hdr.size > l.totalBytes {
 		l.reject(conn, &l.stats.tooLarge,
 			fmt.Sprintf("pid %d crc %#x: %d bytes would pass the total ceiling of %d (%d held)",

@@ -133,6 +133,13 @@ type recordingCubinSink struct {
 	gate    chan struct{}
 	entered chan struct{}
 	once    sync.Once
+
+	// resident models a store that EVICTS: it is what the sink says it holds,
+	// which a test can hold flat while lifetime bytes climb. That divergence
+	// is issue #96 and it cannot be shown with a sink whose two numbers are
+	// always equal.
+	resident int64
+	evicting bool
 }
 
 func newRecordingCubinSink() *recordingCubinSink {
@@ -158,7 +165,17 @@ func (s *recordingCubinSink) PutCubin(crc uint64, b []byte) error {
 		return s.err
 	}
 	s.have[crc] = b
+	if !s.evicting {
+		s.resident += int64(len(b))
+	}
 	return nil
+}
+
+// ResidentBytes is what the listener charges its total ceiling against.
+func (s *recordingCubinSink) ResidentBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resident
 }
 
 func (s *recordingCubinSink) get(crc uint64) ([]byte, bool) {
@@ -1352,4 +1369,69 @@ func TestAStubRunWithNoModulesTouchesTheCubinChannelAtAll(t *testing.T) {
 	assert.Zero(t, st.bytes)
 	assert.Zero(t, st.mapped)
 	assertNoCubinRejections(t, st)
+}
+
+// Issue #96. The total ceiling used to be charged against a cumulative tally of
+// every byte ever accepted, while the bytes themselves live in a store bounded
+// by MaxBytes with LRU eviction. The tally climbed forever and resident usage
+// stayed flat, so a process loading more than the ceiling in DISTINCT cubins
+// over its lifetime began refusing offers while the agent held almost nothing.
+//
+// The sink here models exactly that: it accepts everything and reports a
+// resident size that never grows, which is what an evicting store looks like
+// from the transport's side.
+func TestTheTotalCeilingIsChargedAgainstResidentNotLifetimeBytes(t *testing.T) {
+	shim := selfExe(t)
+	sink := newRecordingCubinSink()
+	sink.evicting = true // everything stored is immediately evicted
+	const each = 32 * 1024
+	l := testCubinListener(t, Config{ShimPath: shim, CubinTotalBytes: 3 * each}, sink)
+
+	// Ten distinct cubins, together well past the three-cubin ceiling. Every
+	// one must be accepted, because the store is holding none of them.
+	for i := range 10 {
+		body := cubinFixture(each)
+		body[8] = byte(i)
+		crc := crc64.Checksum(body, cubinCRCTable)
+		fd := sealedCubinFD(t, body, cubinRequiredSeals)
+		require.Equal(t, byte(cubinReplyOK), offerCubin(t, l.address(), offerHeader(each, crc), fd),
+			"offer %d: the store holds nothing, so the ceiling cannot be reached", i)
+	}
+
+	st := l.snapshot()
+	assert.Equal(t, uint64(10), st.received)
+	assert.Zero(t, st.tooLarge, "no offer may be refused while the store is empty")
+	// The lifetime counter still climbs — it is a useful figure and stays a
+	// counter. It is simply no longer the bound.
+	assert.Equal(t, uint64(10*each), st.bytes,
+		"CubinBytesReceived remains cumulative; only its use as a limit changed")
+}
+
+// The other half: when the store really is holding the bytes, the ceiling
+// still bites. Without this the test above would pass against a build that
+// removed the ceiling altogether.
+func TestTheTotalCeilingStillRefusesWhenTheStoreIsActuallyFull(t *testing.T) {
+	shim := selfExe(t)
+	sink := newRecordingCubinSink() // evicting=false: resident == lifetime
+	const each = 32 * 1024
+	l := testCubinListener(t, Config{ShimPath: shim, CubinTotalBytes: 2 * each}, sink)
+
+	for i := range 2 {
+		body := cubinFixture(each)
+		body[8] = byte(i)
+		crc := crc64.Checksum(body, cubinCRCTable)
+		fd := sealedCubinFD(t, body, cubinRequiredSeals)
+		require.Equal(t, byte(cubinReplyOK), offerCubin(t, l.address(), offerHeader(each, crc), fd))
+	}
+
+	over := cubinFixture(each)
+	over[8] = 0xFE
+	overCRC := crc64.Checksum(over, cubinCRCTable)
+	overFD := sealedCubinFD(t, over, cubinRequiredSeals)
+	assert.Equal(t, byte(cubinReplyRefused),
+		offerCubin(t, l.address(), offerHeader(each, overCRC), overFD))
+
+	st := l.snapshot()
+	assert.Equal(t, uint64(1), st.tooLarge)
+	assert.Contains(t, st.lastErr, "total ceiling")
 }

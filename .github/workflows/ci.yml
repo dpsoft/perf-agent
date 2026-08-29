@@ -100,6 +100,16 @@ jobs:
     #   - this runner's clang produces different bytes from the one that
     #     produced the committed objects, in which case the toolchain needs
     #     pinning rather than the objects re-committing
+    # TEMPORARY (removed before merge): publish what this runner generated so
+    # the committed objects can be made byte-identical to CI's own output.
+    - name: Upload regenerated objects
+      uses: actions/upload-artifact@v4
+      with:
+        name: regenerated-objects-${{ matrix.arch }}
+        path: |
+          **/*_bpfel.o
+          **/*_bpfel.go
+
     - name: Verify generated objects are up to date
       run: |
         if ! git diff --quiet -- '*_bpfel.go' '*_bpfel.o'; then

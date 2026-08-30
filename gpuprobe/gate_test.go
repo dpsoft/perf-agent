@@ -990,7 +990,13 @@ func TestWalkStepStepsPastTheFramePointerRoot(t *testing.T) {
 	require.Positive(t, strings.Index(arm, "WALKER_FLAG_FP_NONMONOTONIC"),
 		"a frame pointer that does not increase is still an unflagged bare `return 1`")
 	nonmono := arm[strings.Index(arm, "WALKER_FLAG_FP_NONMONOTONIC"):]
-	require.Positive(t, strings.Index(nonmono, "ctx->rec->pcs[ctx->n_pcs++] = ret_addr;"),
+	// Recorded via frame_push_native (issue #83) rather than a raw
+	// `ctx->rec->pcs[ctx->n_pcs++] = ret_addr;` write, so this slot's
+	// tags[] byte is set too instead of carrying forward whatever a
+	// previous sample left in the reused per-CPU scratch buffer. The
+	// property this test names — the return address is recorded, not
+	// discarded — still holds; only the how changed.
+	require.Positive(t, strings.Index(nonmono, "frame_push_native(ctx, ret_addr)"),
 		"the non-monotonic arm still discards the return address it already read")
 }
 

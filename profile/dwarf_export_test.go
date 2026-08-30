@@ -75,7 +75,12 @@ func TestTaggedFramesDecodeTruncatedPythonPair(t *testing.T) {
 	rec.Pcs[rec.NPcs] = 0xc0de
 	rec.NPcs++
 
+	before := FrameDecodeCounters().TruncatedPythonPairs
 	pcs, py := decodeFrames(rec)
 	require.Equal(t, []uint64{0x1000}, pcs)
 	require.Empty(t, py, "truncated python pair must be dropped, not half-read")
+
+	after := FrameDecodeCounters().TruncatedPythonPairs
+	require.Equal(t, before+1, after,
+		"a dropped truncated pair must increment TruncatedPythonPairs, never be silent")
 }

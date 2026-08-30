@@ -842,19 +842,14 @@ static long walk_step(__u32 idx, void *arg) {
         // out of is already suspect, so record the one value that is still
         // meaningful and stop rather than classify a PC on its say-so.
         //
-        // NOT routed through frame_push_native — left as the direct write
-        // TestWalkStepStepsPastTheFramePointerRoot pins textually — so the
-        // slot's tags[] byte is never explicitly set here. Harmless while
-        // FRAME_TAG_NATIVE is 0 and walker_scratch is bpf_map lookup-zeroed
-        // on first use, but walker_scratch is a REUSED per-CPU buffer: once
-        // something calls frame_push_python, a slot this arm writes without
-        // tagging can carry forward a stale FRAME_TAG_PYTHON left by an
-        // earlier sample on this CPU. Whoever wires frame_push_python in
-        // must either route this write through frame_push_native too (and
-        // update the pinned test) or otherwise re-zero tags[ctx->n_pcs].
-        if (ret_addr != 0 && ctx->n_pcs < MAX_FRAMES) {
-            ctx->rec->pcs[ctx->n_pcs++] = ret_addr;
-        }
+        // Routed through frame_push_native (rather than a bare bounds
+        // check + direct write) so this slot's tags[] byte is set too.
+        // walker_scratch is a REUSED per-CPU buffer: an untagged slot here
+        // would carry forward whatever FRAME_TAG_* byte a previous sample
+        // on this CPU last left in it, and once frame_push_python has a
+        // caller that stale byte can read back as FRAME_TAG_PYTHON — a
+        // native frame silently decoding as half of a Python pair.
+        if (ret_addr != 0) frame_push_native(ctx, ret_addr);
         return 1;
     }
 

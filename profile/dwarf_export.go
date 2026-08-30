@@ -2,6 +2,7 @@ package profile
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -169,9 +170,26 @@ type sampleRecord struct {
 	Tags [127]uint8
 }
 
+// FrameDecodeStats summarizes decodeFrames' lifetime activity across every
+// call in this process. Exported for tests; mirrors the atomic-counter +
+// snapshot-struct idiom unwind/dwarfagent/miss_drainer.go uses for
+// MissStats, adapted to a package-level counter because decodeFrames is a
+// stateless function with no session to hang counters on.
+type FrameDecodeStats struct {
+	TruncatedPythonPairs uint64 // trailing FRAME_TAG_PYTHON slot with no partner word; dropped, not half-read
+}
+
+var truncatedPythonPairs atomic.Uint64
+
+// FrameDecodeCounters returns a snapshot of decodeFrames' counters.
+func FrameDecodeCounters() FrameDecodeStats {
+	return FrameDecodeStats{TruncatedPythonPairs: truncatedPythonPairs.Load()}
+}
+
 // decodeFrames splits a record's tagged slots into native PCs and Python
 // frame pairs. Python frames occupy two consecutive slots; a trailing
-// half-pair is dropped and counted rather than half-read.
+// half-pair is dropped and counted (TruncatedPythonPairs) rather than
+// half-read — MAX_FRAMES truncating mid-pair must never be silent.
 func decodeFrames(rec *sampleRecord) (pcs []uint64, py []PythonFrame) {
 	for i := 0; i < int(rec.NPcs); i++ {
 		switch rec.Tags[i] {
@@ -179,6 +197,7 @@ func decodeFrames(rec *sampleRecord) (pcs []uint64, py []PythonFrame) {
 			pcs = append(pcs, rec.Pcs[i])
 		case frameTagPython:
 			if i+1 >= int(rec.NPcs) {
+				truncatedPythonPairs.Add(1)
 				return pcs, py // truncated pair
 			}
 			py = append(py, PythonFrame{CodeObject: rec.Pcs[i], Encoded: rec.Pcs[i+1]})

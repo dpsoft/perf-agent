@@ -65,6 +65,7 @@ type gpuusdtPidMapping struct {
 
 type gpuusdtPyProcInfo struct {
 	_                        structs.HostLayout
+	NoneAddr                 uint64
 	TssKey                   uint32
 	PthreadSpecific1stblock  uint32
 	PthreadKeyDataSize       uint32
@@ -84,7 +85,7 @@ type gpuusdtPyProcInfo struct {
 	FrameExecutableTagged    uint8
 	ThreadstateFrameIndirect uint8
 	Enabled                  uint8
-	Pad                      [1]uint8
+	Pad                      [5]uint8
 }
 
 type gpuusdtSampleRecord struct {

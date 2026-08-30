@@ -39,8 +39,10 @@
 //      fields as pyunwind.Offsets (pyunwind/offsets.go), at the SAME
 //      WIDTHS, mapped by NAME, not by position. The declaration order
 //      below is deliberately NOT pyunwind.Offsets's order: fields are
-//      regrouped by width (u32 block, then u16 block, then u8 block) so
-//      the struct packs to 44 bytes with zero implicit padding -- see the
+//      regrouped by width (u64 block, then u32 block, then u16 block,
+//      then u8 block) so the struct packs to 56 bytes with zero implicit
+//      padding beyond the one trailing block that rounds the struct up to
+//      its own 8-byte alignment (forced by none_addr below) -- see the
 //      _Static_assert below. Do not "restore" positional order to match
 //      the Go side; that would reintroduce padding and trip the assert.
 //      A mismatch in the SET or a WIDTH between this struct and its Go
@@ -57,6 +59,18 @@
 // one supported version. The walker that consumes these two fields owns the
 // stop-condition logic; this header only transports the per-version facts.
 struct py_proc_info {
+    // ----- CPython 3.13+ sentinel. Needs 8-byte alignment, so it gets its
+    // own block ahead of the u32 block (the same "regroup by width, widest
+    // first" rule the rest of this struct already follows).
+    //
+    // From 3.13 onward the top C-entered frame's f_executable is Py_None
+    // rather than a code object, so the walker must recognise it and stop
+    // there instead of masking/dereferencing it as a code pointer. This is
+    // the absolute address of that process's _Py_NoneStruct, resolved from
+    // its dynsym entry at attach. Zero on 3.12, where it is not needed and
+    // never read.
+    __u64 none_addr;
+
     // ----- pthread TSD lookup (py_tss_get). Filled once at attach, from
     // the target's own libc.
     __u32 tss_key;                    // value read from the target at attach
@@ -97,14 +111,18 @@ struct py_proc_info {
                                        // itself (3.13+)
 
     __u8  enabled;                    // 0 until validation passed
-    __u8  _pad[1];
+    __u8  _pad[5];                    // explicit trailing padding: none_addr's
+                                       // u64 alignment forces sizeof() up to a
+                                       // multiple of 8; spelled out rather than
+                                       // left to the compiler, same as every
+                                       // other byte in this struct.
 };
 
 // Pinned so a change to either side of the Go/C mirror (see the struct
 // comment above) fails the build loudly instead of writing offsets at the
 // wrong byte position. Update alongside pyProcInfo in the Go pyunwind
 // package -- keep both edits in the same commit.
-_Static_assert(sizeof(struct py_proc_info) == 44,
+_Static_assert(sizeof(struct py_proc_info) == 56,
                "py_proc_info must mirror pyProcInfo in the Go pyunwind package field-for-field; update both together");
 
 struct {

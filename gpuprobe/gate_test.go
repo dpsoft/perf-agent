@@ -971,6 +971,67 @@ func TestFramePushRefusalRaisesAFlag(t *testing.T) {
 	t.Run("frame_push_python", func(t *testing.T) { checkRefusalRaisesFlag(t, "frame_push_python") })
 }
 
+// A bounds check that adds to the value it is checking is not a bounds
+// check. frame_push_python used to guard its two-slot write with
+// `if (i + 2 > MAX_FRAMES)`, where i is __u32: the addition wraps, so at
+// i == 0xFFFFFFFE the expression is 0, the guard passes, and both stores run
+// with a wild index. The verifier refused to derive i <= 125 from
+// i + 2 <= 127 and rejected perf_dwarf and offcpu_dwarf outright
+// ("R1 unbounded memory access" at the tags[] store).
+//
+// The property is structural, so it is checked structurally: neither pusher's
+// guard may contain arithmetic on the checked local. The comparison must be
+// against a constant the compiler folds, which is the only form the verifier
+// can carry from the branch to the store.
+//
+// Source inspection, like its neighbours: the refusal path is only reachable
+// inside the verifier, and no test on this machine can load a program.
+func TestTheFramePushBoundsDoNoArithmeticOnTheCheckedValue(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_common.h")
+	require.NoError(t, err)
+	body := string(src)
+
+	guardOf := func(t *testing.T, fn string) string {
+		t.Helper()
+		start := strings.Index(body, "static __always_inline int "+fn+"(")
+		require.Positive(t, start, "%s not found in the shared header", fn)
+		rest := body[start:]
+		end := strings.Index(rest, "\n}\n")
+		require.Positive(t, end, "%s body not closed", fn)
+		fnBody := rest[:end]
+
+		open := strings.Index(fnBody, "if (")
+		require.Positive(t, open, "%s has no bounds guard at all", fn)
+		close := strings.Index(fnBody[open:], ") {")
+		require.Positive(t, close, "%s's guard is not closed", fn)
+		return fnBody[open+len("if (") : open+close]
+	}
+
+	for _, fn := range []string{"frame_push_native", "frame_push_python"} {
+		t.Run(fn, func(t *testing.T) {
+			guard := guardOf(t, fn)
+			require.Contains(t, guard, "MAX_FRAMES",
+				"%s's guard must be expressed against MAX_FRAMES", fn)
+			require.NotContains(t, strings.ReplaceAll(guard, " ", ""), "i+",
+				"%s adds to the checked value; __u32 arithmetic wraps and the verifier cannot carry the bound to the store", fn)
+		})
+	}
+
+	// The exact boundary, pinned. frame_push_python writes slots i and i+1,
+	// so both must be < MAX_FRAMES and the accept set is i <= MAX_FRAMES-2.
+	// One off in either direction is silent: too tight drops the last valid
+	// pair on a deep stack, too loose writes one slot past the array.
+	require.Contains(t, body, "if (i > MAX_FRAMES - 2) {",
+		"frame_push_python's two-slot bound moved; the accept set must stay i <= MAX_FRAMES-2")
+	require.Contains(t, body, "if (i >= MAX_FRAMES) {",
+		"frame_push_native's one-slot bound moved; the accept set must stay i <= MAX_FRAMES-1")
+
+	// And the subtraction itself must be safe: at MAX_FRAMES < 2 the constant
+	// underflows to a huge unsigned and the guard accepts everything.
+	require.Contains(t, body, "_Static_assert(MAX_FRAMES >= 2,",
+		"nothing stops MAX_FRAMES - 2 underflowing if MAX_FRAMES is ever made tiny")
+}
+
 // The walker half of the derivation above, read out of the shared header so
 // it needs no capability either.
 //

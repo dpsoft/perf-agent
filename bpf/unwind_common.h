@@ -265,6 +265,21 @@ struct walk_ctx {
     __u64 fp;
     __u64 sp;
     __u32 pid;
+    // n_pcs is __u32 while sample_header.n_pcs is __u8, and that is
+    // deliberate: this is the walker's live cursor, read into a register and
+    // compared against MAX_FRAMES in the two hottest helpers in the program,
+    // where a narrower field only buys the compiler a mask on every load and
+    // store. The narrowing to __u8 happens once, in each driver, after the
+    // walk (`rec->hdr.n_pcs = (__u8)(walker.n_pcs > MAX_FRAMES ? ...)`), and
+    // the _Static_assert on MAX_FRAMES <= 255 near frame_push_python is what
+    // proves that cast cannot truncate.
+    //
+    // The width is NOT what makes a bounds check safe here. The wrap bug CI
+    // caught (see frame_push_python) came from doing arithmetic on the
+    // checked value; a __u8 field would have hidden that one instance behind
+    // integer promotion while leaving the pattern in place to bite the next
+    // helper that needs a two-slot bound. Check against a compile-time
+    // constant instead.
     __u32 n_pcs;
     struct sample_record *rec;
     __u64 py_frame;      // next _PyInterpreterFrame to push, 0 if none
@@ -644,15 +659,41 @@ static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
 // a refusal raises WALKER_FLAG_FRAME_PUSH_REFUSED rather than dropping the
 // frame silently.
 //
-// The check is against `i + 2 > MAX_FRAMES`, one comparison covering both
-// slots, and both slots are written from that same local `i` — the
-// two-slot push is atomic (refuse before writing either, never write one
-// and fail the second) and, per frame_push_native's comment above, keeps
-// the verifier's proof of both `i` and `i + 1` in bounds tied to the one
-// checked register instead of re-reading ctx->n_pcs from memory.
+// The check does NO ARITHMETIC ON THE CHECKED VALUE. It used to read
+// `if (i + 2 > MAX_FRAMES)`, which looks like one comparison covering both
+// slots and is in fact a wrap: `i` is __u32, `i + 2` is u32 arithmetic, and
+// at i == 0xFFFFFFFE it evaluates to 0, which is not > 127. The check passes
+// and both stores run with a wild index. The verifier is right to refuse to
+// derive `i <= 125` from `i + 2 <= 127`, and it did — CI rejected both
+// perf_dwarf and offcpu_dwarf with
+//
+//   (73) *(u8 *)(r1 +1056) = r0: R1 unbounded memory access
+//
+// at the tags[] store (1056 == offsetof(struct sample_record, tags)).
+// frame_push_native was accepted through all of this because `i >= MAX_FRAMES`
+// does no arithmetic and cannot wrap; that asymmetry was the tell.
+//
+// The bound is therefore expressed as a comparison against a COMPILE-TIME
+// CONSTANT: this push writes slots `i` and `i + 1`, both of which must be
+// < MAX_FRAMES, so the accept set is exactly i <= MAX_FRAMES - 2 (125 at
+// MAX_FRAMES 127) and the refusal is `i > MAX_FRAMES - 2`. `MAX_FRAMES - 2`
+// folds at compile time, so nothing the verifier has to track is ever added
+// to. The _Static_assert below keeps that subtraction from underflowing into
+// a huge unsigned bound if MAX_FRAMES is ever made tiny.
+//
+// Both slots are still written from that same checked local `i`, so the
+// two-slot push stays atomic (refuse before writing either, never write one
+// and fail the second) and, per frame_push_native's comment above, the
+// verifier's proof for both `i` and `i + 1` stays tied to the one checked
+// register instead of a re-read of ctx->n_pcs.
+_Static_assert(MAX_FRAMES >= 2,
+               "frame_push_python's bound is MAX_FRAMES - 2; below 2 that underflows to a huge unsigned and accepts everything");
+_Static_assert(MAX_FRAMES <= 255,
+               "walk_ctx.n_pcs is __u32 but narrows to sample_header.n_pcs (__u8) in every driver; MAX_FRAMES must fit");
+
 static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
     __u32 i = ctx->n_pcs;
-    if (i + 2 > MAX_FRAMES) {
+    if (i > MAX_FRAMES - 2) {
         ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
         return 1;
     }

@@ -77,7 +77,9 @@ type offcpu_dwarfSampleRecord struct {
 		Pad2        uint32
 		KernStack   int64
 	}
-	Pcs [127]uint64
+	Pcs  [127]uint64
+	Tags [127]uint8
+	_    [1]byte
 }
 
 // loadOffcpu_dwarf returns the embedded CollectionSpec for offcpu_dwarf.

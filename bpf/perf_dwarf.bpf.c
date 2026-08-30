@@ -57,7 +57,7 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
         if (!bpf_map_lookup_elem(&pids, &tgid)) return 0;
     }
 
-    // Grab the per-CPU scratch slot. A sample_record is 1032 bytes — far
+    // Grab the per-CPU scratch slot. A sample_record is 1184 bytes — far
     // past the 512-byte BPF stack limit — so we build it here and copy to
     // the ringbuf at the end.
     __u32 zero = 0;

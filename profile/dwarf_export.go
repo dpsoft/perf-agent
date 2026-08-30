@@ -139,3 +139,51 @@ func (p *PerfDwarf) CFIMissRingbuf() *ebpf.Map {
 func (p *PerfDwarf) CFIMissRatelimitMap() *ebpf.Map {
 	return p.objs.CfiMissRatelimit
 }
+
+// Frame tags, matching FRAME_TAG_* in bpf/unwind_common.h. pcs[] is no
+// longer a flat PC array: a Python frame occupies two slots, so each
+// entry carries its kind. Issue #83.
+const (
+	frameTagNative = 0
+	frameTagPython = 1
+)
+
+// PythonFrame is an unresolved Python frame: the code object's address in
+// the target and the encoded (fingerprint, f_lasti) word. Symbolization is
+// slice 3; until then these render as addresses.
+type PythonFrame struct {
+	CodeObject uint64
+	Encoded    uint64
+}
+
+// sampleRecord mirrors the Go-visible slice of bpf/unwind_common.h's
+// struct sample_record that decodeFrames cares about: the valid-slot
+// count plus the parallel pcs[]/tags[] arrays. It intentionally omits
+// sample_header's other fields (pid, time_ns, ...) — nothing here reads
+// them. Not yet wired to the ringbuf consumer (unwind/dwarfagent/sample.go
+// parses those bytes directly); this is the decode logic later tasks wire
+// in once frame_push_python has a caller.
+type sampleRecord struct {
+	NPcs uint8
+	Pcs  [127]uint64
+	Tags [127]uint8
+}
+
+// decodeFrames splits a record's tagged slots into native PCs and Python
+// frame pairs. Python frames occupy two consecutive slots; a trailing
+// half-pair is dropped and counted rather than half-read.
+func decodeFrames(rec *sampleRecord) (pcs []uint64, py []PythonFrame) {
+	for i := 0; i < int(rec.NPcs); i++ {
+		switch rec.Tags[i] {
+		case frameTagNative:
+			pcs = append(pcs, rec.Pcs[i])
+		case frameTagPython:
+			if i+1 >= int(rec.NPcs) {
+				return pcs, py // truncated pair
+			}
+			py = append(py, PythonFrame{CodeObject: rec.Pcs[i], Encoded: rec.Pcs[i+1]})
+			i++
+		}
+	}
+	return pcs, py
+}

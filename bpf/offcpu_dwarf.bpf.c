@@ -124,7 +124,7 @@ static __always_inline void handle_switch_out(void *ctx, struct task_struct *pre
 
     struct offcpu_start_key k = { .pid = pid, .tgid = tgid };
     // Pass the per-CPU scratch pointer to avoid a 1KB stack-local copy
-    // (BPF stack is 512 bytes; sample_record is 1032).
+    // (BPF stack is 512 bytes; sample_record is 1184).
     bpf_map_update_elem(&offcpu_start, &k, rec, BPF_ANY);
 }
 

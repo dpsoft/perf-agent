@@ -100,38 +100,55 @@ struct pid_mapping {
 
 // ----- Sample record emitted via ringbuf per sample.
 //
-// Fixed-size layout (~1 KB): header + MAX_FRAMES u64 PCs, with n_pcs
-// telling consumers how many slots are valid. A variable-length layout
-// would save bandwidth but fights the verifier; we pay the constant-size
-// cost and optimize later if needed.
+// Fixed-size layout (~1.15 KB): header + MAX_FRAMES u64 PCs + MAX_FRAMES u8
+// tags, with n_pcs telling consumers how many pcs[]/tags[] slots are valid.
+// A variable-length layout would save bandwidth but fights the verifier; we
+// pay the constant-size cost and optimize later if needed.
 // sample_header is 40 bytes; explicit tail padding makes the `pcs` array
 // that follows it naturally 8-byte aligned on both archs. kern_stack carries
 // the BPF stack-ID produced by bpf_get_stackid on kern_stackmap (or -1 when
 // kernel-stack capture is disabled). Userspace reads it to look the kernel
 // IPs back out of kern_stackmap, symbolizes via the kernel symbolizer, and
 // merges leaf-first with user frames.
+//
+// pcs[] is no longer a flat, uniformly-native PC array: a Python frame
+// occupies two consecutive slots (code object address, then an encoded
+// fingerprint/f_lasti word), so tags[] carries one FRAME_TAG_* byte per
+// pcs[] slot telling consumers how to read it. Issue #83. tags[] trails
+// pcs[] (rather than interleaving) so the existing fixed pcs[] offset is
+// unchanged for readers that only care about native frames.
 struct sample_header {
     __u32 pid;
     __u32 tid;
     __u64 time_ns;
     __u64 value;       // sample weight: 1 for CPU, blocking-ns for off-CPU
     __u8  mode;        // dominant classification for the sample (telemetry)
-    __u8  n_pcs;       // number of valid PCs in the pcs[] array
+    __u8  n_pcs;       // number of valid slots in the pcs[]/tags[] arrays
     __u8  walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
     __u8  _pad;
     __u32 _pad2;
     __s64 kern_stack;  // bpf_get_stackid(&kern_stackmap,…) result, or -1 if disabled
 };
 
+// Frame tags. Each pcs[] slot carries its kind. FRAME_TAG_NATIVE is a single
+// slot holding one PC; FRAME_TAG_PYTHON is the first of a pair of slots
+// (code object, then encoded fingerprint/f_lasti) — see frame_push_python.
+#define FRAME_TAG_NATIVE 0
+#define FRAME_TAG_PYTHON 1
+
 struct sample_record {
     struct sample_header hdr;
     __u64 pcs[MAX_FRAMES];
+    // One tag per pcs[] slot. A u8 array rather than bits packed into the PC
+    // because a PC is a full 64 bits and stealing from it would break the
+    // day someone maps something high.
+    __u8 tags[MAX_FRAMES];
 };
 
 // ----- Per-CPU scratch map.
 //
 // Used to build the sample_record before copying into the ringbuf slot.
-// 1032 bytes per record exceeds the 512-byte BPF stack limit, so staging
+// 1184 bytes per record exceeds the 512-byte BPF stack limit, so staging
 // through a per-CPU map is mandatory.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -240,6 +257,33 @@ struct walk_ctx {
     __u32 n_pcs;
     struct sample_record *rec;
 };
+
+// frame_push_native appends one native-PC slot, tagging it FRAME_TAG_NATIVE.
+// Returns 0 on success, 1 if the record is already full (MAX_FRAMES
+// reached) — the caller must stop walking in that case.
+static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
+    if (ctx->n_pcs >= MAX_FRAMES) return 1;
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_NATIVE;
+    ctx->rec->pcs[ctx->n_pcs++] = pc;
+    return 0;
+}
+
+// frame_push_python appends a two-slot Python frame (code object address,
+// then an encoded fingerprint/f_lasti word), both tagged FRAME_TAG_PYTHON.
+// Returns 0 on success, 1 if fewer than two slots remain — the caller must
+// stop walking in that case rather than push a half-pair. Nothing calls
+// this yet; a later task drives it from the CPython frame-chain walker.
+// Keeping the MAX_FRAMES bounds check here, alongside frame_push_native's,
+// means every place this record can overflow is checked in exactly one
+// spot rather than re-derived at each call site.
+static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
+    if (ctx->n_pcs + 2 > MAX_FRAMES) return 1;
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[ctx->n_pcs++] = code;
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[ctx->n_pcs++] = instr;
+    return 0;
+}
 
 // ----- Lazy CFI: miss emit helper.
 //
@@ -586,9 +630,7 @@ static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
 // state. Returns 0 to continue, 1 to stop.
 static long walk_step(__u32 idx, void *arg) {
     struct walk_ctx *ctx = (struct walk_ctx *)arg;
-    if (ctx->n_pcs >= MAX_FRAMES) return 1;
-
-    ctx->rec->pcs[ctx->n_pcs++] = ctx->pc;
+    if (frame_push_native(ctx, ctx->pc)) return 1;
 
     // Per-frame classification. Miss = treat as FP_SAFE (spec: FALLBACK
     // behaves the same as FP_SAFE at runtime).
@@ -799,6 +841,17 @@ static long walk_step(__u32 idx, void *arg) {
         // Not carried forward the way the zero case is: the frame this came
         // out of is already suspect, so record the one value that is still
         // meaningful and stop rather than classify a PC on its say-so.
+        //
+        // NOT routed through frame_push_native — left as the direct write
+        // TestWalkStepStepsPastTheFramePointerRoot pins textually — so the
+        // slot's tags[] byte is never explicitly set here. Harmless while
+        // FRAME_TAG_NATIVE is 0 and walker_scratch is bpf_map lookup-zeroed
+        // on first use, but walker_scratch is a REUSED per-CPU buffer: once
+        // something calls frame_push_python, a slot this arm writes without
+        // tagging can carry forward a stale FRAME_TAG_PYTHON left by an
+        // earlier sample on this CPU. Whoever wires frame_push_python in
+        // must either route this write through frame_push_native too (and
+        // update the pinned test) or otherwise re-zero tags[ctx->n_pcs].
         if (ret_addr != 0 && ctx->n_pcs < MAX_FRAMES) {
             ctx->rec->pcs[ctx->n_pcs++] = ret_addr;
         }

@@ -83,6 +83,42 @@ jobs:
         go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
         cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+    - name: "Fingerprint the BPF toolchain (issue #87)"
+      # Diagnostic only. Never fails the job.
+      #
+      # Two machines with the same clang (18.1.3) and byte-identical libbpf
+      # headers (libbpf-dev 1:1.3.0-2build2, verified against the noble archive
+      # .deb) have produced different .BTF type orderings for the same source --
+      # six bytes, two transpositions, every other section identical. Every
+      # candidate visible from a container has been eliminated: regen
+      # determinism, clang version (changes the SIZE), llvm-strip version (no
+      # effect), libbpf header version, the blazesym module replace, and the
+      # go generate invocation style.
+      #
+      # What is left is something in the runner environment that no workflow
+      # script mentions. CPATH and its relatives inject include directories
+      # invisibly, and `clang -H` is the only way to learn which bpf_helpers.h is
+      # actually OPENED rather than which directories are merely searched.
+      #
+      # Printed unconditionally, on green runs too: a fingerprint that appears
+      # only on failure cannot establish what a passing run looked like, and
+      # comparing green against red is how an intermittent mismatch gets settled.
+      continue-on-error: true
+      run: |
+        clang --version | head -1
+        go version
+        go list -m github.com/cilium/ebpf || true
+        dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true
+        echo "--- /usr/local/include (anything named bpf here shadows /usr/include/bpf) ---"
+        ls -la /usr/local/include/ || true
+        echo "--- which bpf_helpers.h clang actually opens ---"
+        echo '#include <bpf/bpf_helpers.h>' | clang -H -E -x c - 2>&1 | grep -m5 bpf_helpers.h || true
+        echo "--- header hashes ---"
+        sha256sum /usr/include/bpf/*.h 2>/dev/null || true
+        sha256sum /usr/local/include/bpf/*.h 2>/dev/null || echo "no /usr/local/include/bpf (expected)"
+        echo "--- include-injecting environment ---"
+        env | grep -Ei '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|CFLAGS|CC|CXX|BPF2GO)=' || echo "none set"
+
     - name: Run go generate
       run: go generate ./...
 
@@ -100,6 +136,21 @@ jobs:
     #   - this runner's clang produces different bytes from the one that
     #     produced the committed objects, in which case the toolchain needs
     #     pinning rather than the objects re-committing
+
+    - name: "Record regenerated object fingerprints (issue #87)"
+      # What THIS runner's toolchain produced, recorded on every run including
+      # green ones, so a future mismatch is a two-line diff rather than another
+      # investigation. Diagnostic only; never fails the job.
+      continue-on-error: true
+      run: |
+        for f in $(git ls-files '*_bpfel.o'); do
+          printf '%s regenerated=%s sha256=%s committed=%s\n' \
+            "$f" "$(wc -c < "$f")" "$(sha256sum "$f" | cut -d" " -f1)" \
+            "$(git show HEAD:"$f" | wc -c)"
+        done
+        echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
+        git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
+
     - name: Verify generated objects are up to date
       run: |
         if ! git diff --quiet -- '*_bpfel.go' '*_bpfel.o'; then
@@ -113,6 +164,24 @@ jobs:
           exit 1
         fi
         echo "✓ generated objects match the committed ones"
+
+    - name: "Upload regenerated objects for byte comparison (issue #87)"
+      # The capability this investigation lacked for four rounds. Every earlier
+      # round had to infer CI's object from a byte count in a log; the moment two
+      # real files could be diffed, "same size, different bytes" became "six
+      # bytes, two transpositions, .BTF type section". A regeneration mismatch
+      # should never have to be debugged blind again.
+      #
+      # if: failure() so a green run costs nothing. Deliberately placed AFTER the
+      # verify step, whose failure is what makes these objects worth having.
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: regenerated-objects-${{ matrix.arch }}
+        path: |
+          **/*_bpfel.o
+          **/*_bpfel.go
+        if-no-files-found: warn
 
     - name: Build perf-agent
       run: go build -v .

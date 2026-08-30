@@ -150,6 +150,7 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 		return refuseWith(v, err), nil
 	}
 
+	totalThreads := len(tids)
 	if len(tids) > maxValidationThreads {
 		tids = tids[:maxValidationThreads]
 	}
@@ -179,11 +180,11 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, fmt.Errorf("%w: pid %d has no threads to validate against", ErrOffsetsUnreadable, pid)), nil
 	}
-	if len(tids) == maxValidationThreads {
+	if totalThreads > maxValidationThreads {
 		// Say that the search was cut short, rather than reporting the last
-		// thread's refusal as though it were the whole story.
-		last.Refused = fmt.Sprintf("%s (gave up after %d of pid %d's threads; none held a PyThreadState)",
-			last.Refused, maxValidationThreads, pid)
+		// thread tried as though it were the last thread there is.
+		last.Refused = fmt.Sprintf("%s (tried %d of pid %d's %d threads; none held a PyThreadState)",
+			last.Refused, maxValidationThreads, pid, totalThreads)
 	}
 	return last, nil
 }

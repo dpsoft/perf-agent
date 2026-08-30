@@ -3,6 +3,7 @@ package pyunwind
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -171,12 +172,12 @@ func TestTSDLookupFindsEachThreadsOwnThreadState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GILStateCode(%s): %v", libPath, err)
 	}
-	keyOff, err := ParseAutoTSSKeyOffset(code)
+	keyRef, err := ParseAutoTSSKeyRef(code)
 	if err != nil {
-		t.Fatalf("ParseAutoTSSKeyOffset(%s, %d-byte body): %v", libPath, len(code), err)
+		t.Fatalf("ParseAutoTSSKeyRef(%s, %d-byte body): %v", libPath, len(code), err)
 	}
-	t.Logf("interpreter: %s (CPython %s); PyGILState_GetThisThreadState: %d bytes, autoTSSkey at %#x",
-		libPath, version, len(code), keyOff)
+	t.Logf("interpreter: %s (CPython %s); PyGILState_GetThisThreadState: %d bytes, autoTSSkey ref %#x (absolute=%v)",
+		libPath, version, len(code), keyRef.Value, keyRef.Absolute)
 
 	tsd, err := glibcTSDOffsets(runtime.GOARCH)
 	if err != nil {
@@ -337,7 +338,7 @@ func TestPrepareInfoAgainstLiveInterpreter(t *testing.T) {
 // same way prepareInfo does (see the comment there on why the key is the
 // HIGH half of the 8-byte read).
 func liveTSSKey(pid uint32, libPath string, code []byte) (uint32, error) {
-	keyOff, err := ParseAutoTSSKeyOffset(code)
+	keyRef, err := ParseAutoTSSKeyRef(code)
 	if err != nil {
 		return 0, err
 	}
@@ -345,13 +346,20 @@ func liveTSSKey(pid uint32, libPath string, code []byte) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	addr, err := resolver.addr("_PyRuntime")
+	rt, err := resolver.sym("_PyRuntime")
 	if err != nil {
 		return 0, err
 	}
-	raw, err := NewProcReader(int(pid), int(pid)).ReadU64(addr + uint64(keyOff))
+	keyAddr, err := keyRef.Resolve(rt.Value, rt.Size, resolver.bias)
 	if err != nil {
 		return 0, err
+	}
+	raw, err := NewProcReader(int(pid), int(pid)).ReadU64(keyAddr)
+	if err != nil {
+		return 0, err
+	}
+	if init := uint32(raw); init != 1 {
+		return 0, fmt.Errorf("autoTSSkey at %#x reads _is_initialized=%#x, want 1", keyAddr, init)
 	}
 	return uint32(raw >> 32), nil
 }

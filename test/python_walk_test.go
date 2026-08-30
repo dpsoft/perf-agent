@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,9 +78,19 @@ var framesPushedRe = regexp.MustCompile(`python walk: frames_pushed=(\d+)`)
 // process plus the code-object address of each named function.
 func startPythonFixture(t *testing.T, seconds int) (*exec.Cmd, map[string]uint64) {
 	t.Helper()
-	py, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skipf("no python3 on PATH: %v", err)
+	// PYUNWIND_TEST_PYTHON picks the interpreter, exactly as pyunwind's
+	// live tests do. A machine usually has several -- the distro's, a
+	// tool-cache one, a container's -- and they are DIFFERENT BUILDS with
+	// different prologues and different eval-loop layouts, so which one ran
+	// is part of the result. Without the override, reproducing a run means
+	// undocumented PATH surgery.
+	py := os.Getenv("PYUNWIND_TEST_PYTHON")
+	if py == "" {
+		var err error
+		py, err = exec.LookPath("python3")
+		if err != nil {
+			declinePythonGate(t, "no python3 on PATH and %s is unset: %v", "PYUNWIND_TEST_PYTHON", err)
+		}
 	}
 	cmd := exec.Command(py, "workloads/python/interleaved_threads.py", strconv.Itoa(seconds))
 	cmd.Stderr = os.Stderr
@@ -131,39 +143,112 @@ func startPythonFixture(t *testing.T, seconds int) (*exec.Cmd, map[string]uint64
 	return nil, nil
 }
 
-// requireWalkableInterpreter skips -- with the reason attached -- when the
-// interpreter this machine runs is one the walker declines by design, and
-// returns otherwise. Every other outcome downstream is a failure.
+// ---- The gate must not be able to stop gating.
 //
-// The three skips are the three NAMED refusals: an architecture with no
-// measured glibc TSD offsets, a CPython outside 3.12-3.14, and a binary
-// whose eval loop or PyGILState_GetThisThreadState cannot be read (a
-// stripped PGO-partitioned build, or a toolchain shape the parser has never
-// seen). They are checked against the live process rather than guessed at
-// from the environment.
+// On the first CI run this test SKIPPED, and the job went green, because
+// Ubuntu's own /usr/bin/python3.12 has a PyGILState_GetThisThreadState
+// shape the parser had never seen and an unrecognised shape was classified
+// as an environment refusal. The branch's only end-to-end evidence
+// disappeared and reported success. Two things guard against that now.
+//
+// FIRST, the taxonomy. A refusal is a property of the ENVIRONMENT only when
+// we never claimed to handle it: another architecture, a CPython outside
+// 3.12-3.14, a musl libc, or a stripped PGO build whose eval loop has no
+// symbol. An interpreter that is amd64 + glibc + CPython 3.12-3.14 +
+// locatable eval loop is one we CLAIM TO SUPPORT, and every refusal on it
+// -- an unrecognised prologue above all -- is OUR defect and fails.
+//
+// SECOND, PERF_AGENT_REQUIRE_PYTHON_WALK. CI sets it on the amd64
+// integration runner, where we know what the interpreter is, and it turns
+// every remaining skip into a failure. That moves the decision "may this
+// machine skip" out of the code under test -- which decides it by calling
+// the very functions the gate exists to check -- and into CI configuration.
+// A regression in EvalRangeForFile or GILStateCode that made every build
+// look unsupported would otherwise silently disarm the gate everywhere.
+//
+// THIRD, the audit in TestMain below: if this test neither ran its
+// assertions nor recorded a decline reason, the run fails. That covers the
+// test being renamed, removed, or skipped by a path nobody thought to
+// classify.
+
+// pythonGateOutcome is "ran", "declined: <reason>", or absent. Package
+// level and written once, read by TestMain after the run.
+var pythonGateOutcome atomic.Value
+
+const requireWalkEnv = "PERF_AGENT_REQUIRE_PYTHON_WALK"
+
+// declinePythonGate records why the gate is not running and skips -- or
+// fails, when this machine was declared one that must walk Python.
+func declinePythonGate(t *testing.T, format string, args ...any) {
+	t.Helper()
+	reason := fmt.Sprintf(format, args...)
+	if os.Getenv(requireWalkEnv) != "" {
+		t.Fatalf("%s is set, so this machine must walk Python frames, but: %s", requireWalkEnv, reason)
+	}
+	pythonGateOutcome.Store("declined: " + reason)
+	t.Skip(reason)
+}
+
+// TestMain fails a run in which the gate silently stopped gating.
+//
+// It deliberately does nothing when -run is narrowing the selection: a
+// developer running one unrelated test has not disarmed anything.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 && pythonGateOutcome.Load() == nil && !testRunFilterActive() {
+		fmt.Fprintf(os.Stderr,
+			"\nFAIL: %s neither ran nor recorded why it declined.\n"+
+				"The Python end-to-end gate is the only test that observes a Python frame produced by a real\n"+
+				"interpreter; a run in which it silently does not execute must not be green.\n",
+			"TestPythonFramesInterleavedWithNative")
+		code = 1
+	}
+	os.Exit(code)
+}
+
+func testRunFilterActive() bool {
+	f := flag.Lookup("test.run")
+	return f != nil && f.Value.String() != ""
+}
+
+// requireWalkableInterpreter classifies this machine's interpreter and
+// either returns (the gate must run and must pass) or declines with the
+// reason attached. See the taxonomy note above.
 func requireWalkableInterpreter(t *testing.T, pid uint32) {
 	t.Helper()
 	if runtime.GOARCH != "amd64" {
-		t.Skipf("the CPython walker is amd64-only: %s has no measured glibc TSD offsets (pyunwind.ErrUnsupportedArch)", runtime.GOARCH)
+		declinePythonGate(t, "the CPython walker is amd64-only: %s has no measured glibc TSD offsets (pyunwind.ErrUnsupportedArch)", runtime.GOARCH)
 	}
 	libPath, version, err := pyunwind.FindInterpreter(pid)
 	require.NoError(t, err, "the workload is a python process; its interpreter must be findable")
 	if !version.Supported() {
-		t.Skipf("%s is CPython %s; this build walks 3.12 through 3.14 only", libPath, version)
+		declinePythonGate(t, "%s is CPython %s; this build walks 3.12 through 3.14 only", libPath, version)
 	}
+	if err := pyunwind.RequireGlibc(pid); err != nil {
+		declinePythonGate(t, "%v", err)
+	}
+
+	// From here on the interpreter is one we claim to support, and every
+	// refusal is a defect of ours -- with one exception, called out by its
+	// own sentinel: a build whose dispatch loop has no symbol at all.
 	if _, err := pyunwind.EvalRangeForFile(libPath); err != nil {
 		if errors.Is(err, pyunwind.ErrEvalLoopNotLocatable) {
-			t.Skipf("%s: %v", libPath, err)
+			declinePythonGate(t, "%s: %v", libPath, err)
 		}
 		t.Fatalf("EvalRangeForFile(%s): %v", libPath, err)
 	}
 	code, err := pyunwind.GILStateCode(libPath)
-	require.NoError(t, err)
-	if _, err := pyunwind.ParseAutoTSSKeyOffset(code); err != nil {
-		if errors.Is(err, pyunwind.ErrTSSPatternUnrecognised) {
-			t.Skipf("%s: %v (a toolchain shape this build has not measured)", libPath, err)
-		}
-		t.Fatalf("ParseAutoTSSKeyOffset(%s): %v", libPath, err)
+	require.NoErrorf(t, err, "reading PyGILState_GetThisThreadState out of %s", libPath)
+	if _, err := pyunwind.ParseAutoTSSKeyRef(code); err != nil {
+		// NOT a skip. This is the failure the first CI run turned into a
+		// green build: /usr/bin/python3.12 on Ubuntu noble is squarely an
+		// interpreter we claim to support, and our inability to decode its
+		// prologue is our defect, not a property of the machine. Measure
+		// the body, add the shape to pyunwind/tssparse.go.
+		t.Fatalf("%s (CPython %s): %v\n"+
+			"This is a supported interpreter whose prologue this build cannot decode. Disassemble the %d-byte "+
+			"PyGILState_GetThisThreadState body and add its shape; do not make this a skip.",
+			libPath, version, err, len(code))
 	}
 	t.Logf("interpreter under test: %s (CPython %s)", libPath, version)
 }
@@ -174,7 +259,9 @@ func requireWalkableInterpreter(t *testing.T, pid uint32) {
 // interleaved with the native frames they ran under.
 func TestPythonFramesInterleavedWithNative(t *testing.T) {
 	agentPath := getAgentPath(t)
-	requireBPFRunnable(t, agentPath)
+	if !bpfRunnable(agentPath) {
+		declinePythonGate(t, "requires root, CAP_BPF in the test process, or a setcap'd perf-agent")
+	}
 
 	workload, codes := startPythonFixture(t, 40)
 	pid := uint32(workload.Process.Pid)
@@ -246,26 +333,39 @@ func TestPythonFramesInterleavedWithNative(t *testing.T) {
 	require.NoError(t, err)
 	require.Positivef(t, pushed, "py_walk_counters reports 0 frames pushed while the profile shows %d; one of the two is lying", pythonFrames)
 
-	// ---- 3. The interleaving: one sample carrying both segments, in
-	// order, with native frames between them and none of the Python frames
-	// repeated.
-	var best *profile.Sample
-	var bestNames []string
+	// ---- 3. The interleaving, across EVERY sample that carries both
+	// segments -- not the first one found.
+	//
+	// The selector's predicate (the two segments in order) is one a
+	// defective-but-plausible stack satisfies: the Task 7 duplication bug
+	// produces stacks that pass it. Checking only the first match lets an
+	// intermittent defect be cherry-picked away by whichever sample the map
+	// iteration happened to yield first. The union of defects over all
+	// matching samples cannot be.
+	var matching []*profile.Sample
+	defects := map[string]*profile.Sample{}
 	for _, s := range prof.Sample {
 		names := sampleFrameNames(s)
-		if _, ok := pythonOrderIn(names, codes); ok {
-			best, bestNames = s, names
-			break
+		if _, ok := pythonOrderIn(names, codes); !ok {
+			continue
+		}
+		matching = append(matching, s)
+		for _, d := range pythonSampleDefects(names, codes) {
+			if _, seen := defects[d]; !seen {
+				defects[d] = s
+			}
 		}
 	}
-	require.NotNilf(t, best,
+	require.NotEmptyf(t, matching,
 		"no sample carried the full interleaved sequence %v -> <native> -> %v.\nOne sample rendered:\n%s\nagent log:\n%s",
 		pythonInnerSegment, pythonOuterSegment, renderSample(prof.Sample[0]), agentLog.String())
 
-	for _, defect := range pythonSampleDefects(bestNames, codes) {
-		t.Errorf("%s\n%s", defect, renderSample(best))
+	for d, sample := range defects {
+		t.Errorf("%s\n%s", d, renderSample(sample))
 	}
-	t.Logf("interleaved sample:\n%s", renderSample(best))
+	t.Logf("%d of %d samples carried both Python segments; one of them:\n%s",
+		len(matching), len(prof.Sample), renderSample(matching[0]))
+	pythonGateOutcome.Store("ran")
 }
 
 // pythonSampleDefects reports everything wrong with one walked stack,

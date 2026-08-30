@@ -3,9 +3,13 @@ package dwarfagent
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"testing"
+	"unsafe"
 
+	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // ----- Issue #83 / ruling T7-R5 on the DWARF path.
@@ -369,5 +373,59 @@ func TestHashStackIsAPureFunctionOfItsInput(t *testing.T) {
 	}
 	if hashStack(pcs, nil) != hashStack(samePCs, nil) {
 		t.Error("equal chains with no tags hashed differently")
+	}
+}
+
+// TestPythonFrameNameSurvivesTheProfileBuilder pins the rendering the whole
+// end-to-end gate matches on -- "python:0x<code object>" -- through the
+// pprof builder, with a real procmap.Resolver wired in, using an address
+// inside THIS process's own heap.
+//
+// Why it needs pinning. A Python frame reaches the builder marked
+// Unresolved (nothing named it) and carrying a code-object address as
+// Frame.Address. pprof's addLocation asks the Resolver to attribute that
+// address to a mapping, and any frame that both is Unresolved AND lands in
+// a mapping gets RENAMED to "<file>+0x<offset>". The name survives today
+// only because a heap address misses procmap.Resolver, which indexes
+// file-backed executable mappings -- a negative property of an unrelated
+// component that nothing else pins.
+//
+// A heap address is used deliberately: it is what a real code object is, so
+// if the resolver ever starts attributing anonymous memory, this test goes
+// red and names the coupling instead of the end-to-end test mysteriously
+// finding no Python frames.
+func TestPythonFrameNameSurvivesTheProfileBuilder(t *testing.T) {
+	// A genuine heap address in this process, the same kind of value the
+	// walker reads out of _PyInterpreterFrame.f_executable.
+	heap := make([]byte, 64)
+	codeObject := uint64(uintptr(unsafe.Pointer(&heap[0])))
+
+	resolver := procmap.NewResolver()
+	defer resolver.Close()
+	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		SampleRate: 99,
+		Resolver:   resolver,
+	})
+	frames := symbolize.ToProfFrames([]symbolize.Frame{
+		pythonSymbolizeFrame(frameSlot{python: true, pc: codeObject, instr: 0x1234}),
+	})
+	builders.AddSample(&pprof.ProfileSample{
+		Pid:         uint32(os.Getpid()),
+		SampleType:  pprof.SampleTypeCpu,
+		Aggregation: pprof.SampleAggregated,
+		Stack:       frames,
+		Value:       1,
+	})
+
+	want := pythonFrameName(codeObject)
+	var got []string
+	for _, b := range builders.Builders {
+		for _, fn := range b.Profile.Function {
+			got = append(got, fn.Name)
+		}
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("profile function names = %v, want exactly [%q]; a Python frame that acquires a mapping is renamed by the builder, "+
+			"and every assertion in the end-to-end gate matches on this string", got, want)
 	}
 }

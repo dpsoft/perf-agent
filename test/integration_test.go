@@ -386,22 +386,34 @@ func getAgentPath(t *testing.T) string {
 // the test process itself, not on the agent binary.
 func requireBPFRunnable(t *testing.T, agentPath string) {
 	t.Helper()
-	if os.Getuid() == 0 {
+	if bpfRunnable(agentPath) {
 		return
+	}
+	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
+}
+
+// bpfRunnable is requireBPFRunnable's decision as a predicate, so a caller
+// that must account for WHY it declined to run can ask without being
+// skipped out from under it. See python_walk_test.go, where every reason
+// the Python gate does not run has to be recorded rather than merely
+// skipped.
+func bpfRunnable(agentPath string) bool {
+	if os.Getuid() == 0 {
+		return true
 	}
 	if procCaps := cap.GetProc(); procCaps != nil {
 		if have, err := procCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-			return
+			return true
 		}
 	}
 	if agentPath != "" {
 		if fileCaps, err := cap.GetFile(agentPath); err == nil && fileCaps != nil {
 			if have, err := fileCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-				return
+				return true
 			}
 		}
 	}
-	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
+	return false
 }
 
 // isJitOnlyProfile returns true if the profile's only non-empty,

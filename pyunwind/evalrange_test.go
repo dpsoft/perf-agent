@@ -136,7 +136,7 @@ func TestEvalRangeIsHalfOpenAroundTheFragment(t *testing.T) {
 	}
 	// 0x1969a9 is a real eval-loop return address measured in a profile of
 	// that binary; 0x25f1c0 is its exported entry stub, which is outside.
-	if !(r.Lo <= 0x1969a9 && 0x1969a9 < r.Hi) {
+	if r.Lo > 0x1969a9 || 0x1969a9 >= r.Hi {
 		t.Errorf("a measured eval-loop PC (%#x) falls outside the installed range", 0x1969a9)
 	}
 	if r.Lo <= 0x25f1c0 && 0x25f1c0 < r.Hi {

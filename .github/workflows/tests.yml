@@ -269,10 +269,25 @@ jobs:
           echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
           git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
 
+      # PERF_AGENT_REQUIRE_PYTHON_WALK turns every remaining skip in the
+      # Python end-to-end gate into a failure. It is set here, on amd64
+      # only, because THIS runner is a machine we know: Ubuntu noble,
+      # glibc, CPython 3.12, not stripped. Whether the gate may skip is
+      # therefore a decision recorded in CI configuration rather than one
+      # the code under test makes about itself by calling the very
+      # functions the gate exists to check.
+      #
+      # It is deliberately absent on arm64, where the walker is a named
+      # refusal (no measured glibc TSD offsets) and the gate must skip.
+      #
+      # The first CI run of this branch went green with that gate skipped,
+      # because an interpreter prologue we could not parse was classified
+      # as an environment limitation. This is what stops that recurring.
       - name: Run integration tests
         run: |
           cd test
           sudo env LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+            PERF_AGENT_REQUIRE_PYTHON_WALK="${{ matrix.arch == 'amd64' && '1' || '' }}" \
             $(which go) test -v -timeout 15m ./...
 
   lint:

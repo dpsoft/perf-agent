@@ -21,11 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **What it does not do yet.** Python frames are **not symbolized**: each renders
   as `python:0x<code object address>` until the fingerprint/name recovery slice
-  lands. It is **amd64 only** (the glibc pthread-TSD offsets it needs have been
-  measured there and nowhere else), covers **CPython 3.12, 3.13 and 3.14** GIL
-  builds (a free-threaded `Py_GIL_DISABLED` build is refused by name), and is
-  wired for **`--pid` captures only** — system-wide (`-a`) still produces
-  native-only stacks and says so in the log. An interpreter that cannot be
+  lands. It is **amd64 + glibc only** (the pthread-TSD offsets it needs have been
+  measured there and nowhere else; a musl target is refused by name), covers
+  **CPython 3.12, 3.13 and 3.14** GIL builds (a free-threaded `Py_GIL_DISABLED`
+  build is refused by name), and is wired for **`--pid` captures only** —
+  system-wide (`-a`) still produces native-only stacks and says so in the log.
+  The GPU launch path (`gpuprobe`) enrols interpreters the same way and inherits
+  the same walker, but **that combination has not been validated on hardware**:
+  no CI machine has a GPU. An interpreter that cannot be
   walked is always refused with a reason on stderr, never walked with guessed
   offsets; `py_walk_counters` is reported at shutdown so a run that walked
   nothing is distinguishable from a run with no Python in it.

@@ -1,22 +1,17 @@
 package dwarfagent
 
 import (
-	"errors"
-	"fmt"
 	"log"
 
 	"github.com/cilium/ebpf"
 
 	"github.com/dpsoft/perf-agent/pyunwind"
-	"github.com/dpsoft/perf-agent/unwind/ehmaps"
-	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // pythonMaps is the slice of the BPF handle the CPython walker needs. Only
 // profile.PerfDwarf implements it today; profile.OffCPUDwarf does not
-// expose the maps even though its program carries them, so the off-CPU
-// session takes the "no accessor" path below and says so once rather than
-// silently skipping.
+// expose the maps even though its program carries them, so an off-CPU
+// session over a Python target says so once rather than skipping silently.
 type pythonMaps interface {
 	PyProcsMap() *ebpf.Map
 	PyEvalRangesMap() *ebpf.Map
@@ -46,82 +41,41 @@ type pythonMaps interface {
 // difference between "refused" and "attached and walked nothing", which is
 // exactly the reading an operator needs.
 func enrollPython(objs sessionObjs, pid uint32, logPrefix string) bool {
-	// Interpreter lookup FIRST, map capability second. The other order
-	// prints "this profiler cannot do Python frames" for every off-CPU
-	// capture of every non-Python process on the box, which is noise about
-	// something nobody asked for; this way the line only appears when there
-	// really is an interpreter that could have been walked.
-	libPath, version, err := pyunwind.FindInterpreter(pid)
-	if err != nil {
-		if errors.Is(err, pyunwind.ErrNoInterpreterMapped) {
-			// The overwhelmingly common case: not a Python process.
-			return false
-		}
-		log.Printf("%s: python frames: pid %d: %v", logPrefix, pid, err)
-		return false
-	}
-
 	maps, ok := objs.(pythonMaps)
 	if !ok {
-		log.Printf("%s: python frames: pid %d maps %s, but this profiler does not expose py_procs; stacks stay native-only",
-			logPrefix, pid, libPath)
+		// The interpreter lookup runs first even here: checking the map
+		// capability before it would print "no Python frames on this
+		// profiler" for every off-CPU capture of every non-Python process
+		// on the box, which is noise about something nobody asked for.
+		if _, _, err := pyunwind.FindInterpreter(pid); err != nil {
+			return false
+		}
+		log.Printf("%s: python frames: pid %d maps a CPython image, but this profiler does not expose py_procs; stacks stay native-only",
+			logPrefix, pid)
 		return false
 	}
 
-	tableID, err := tableIDForPath(pid, libPath)
-	if err != nil {
-		log.Printf("%s: python frames: pid %d: %s: %v", logPrefix, pid, libPath, err)
-		return true
-	}
-
-	res, err := pyunwind.AttachProcess(pid, libPath, tableID, &pyunwind.BPFMaps{
+	libPath, found, res, err := pyunwind.EnrollTarget(pid, &pyunwind.BPFMaps{
 		PyProcs:    maps.PyProcsMap(),
 		EvalRanges: maps.PyEvalRangesMap(),
 	})
 	switch {
+	case !found && err == nil:
+		// The overwhelmingly common case: not a Python process. No line.
+		return false
 	case err != nil:
-		log.Printf("%s: python frames: pid %d: installing maps for %s: %v", logPrefix, pid, libPath, err)
+		// Worded as a REFUSAL, like every other outcome that leaves the arm
+		// uninstalled: a log line naming a pid and no refusal reads as
+		// success to anything checking for one.
+		log.Printf("%s: python frames: pid %d: REFUSED %s: %v", logPrefix, pid, libPath, err)
 	case res.Refused != "":
 		log.Printf("%s: python frames: pid %d: REFUSED %s (CPython %s): %s",
 			logPrefix, pid, libPath, res.Version, res.Refused)
 	default:
-		log.Printf("%s: python frames: pid %d: attached %s (CPython %s), table %#x",
-			logPrefix, pid, libPath, version, tableID)
+		log.Printf("%s: python frames: pid %d: attached %s (CPython %s)",
+			logPrefix, pid, libPath, res.Version)
 	}
 	return true
-}
-
-// tableIDForPath computes the same FNV-1a-of-build-id key the CFI tables
-// use for a binary, so the eval range lands under the key walk_step already
-// holds when it reaches the interpreter arm.
-//
-// It reads the build-id through the mapping's openable path rather than the
-// symbolic one, for the reason ehmaps documents at length: a
-// deleted-but-mapped binary, or one in another mount namespace, is
-// reachable only through /proc/<pid>/map_files. A table_id derived from a
-// DIFFERENT file than the one the tracker enrolled would key the eval range
-// to a binary that no PC ever resolves to -- the arm would be on and never
-// fire.
-func tableIDForPath(pid uint32, libPath string) (uint64, error) {
-	mappings, err := procmap.NewResolver().Mappings(pid)
-	if err != nil {
-		return 0, fmt.Errorf("read mappings: %w", err)
-	}
-	for _, m := range mappings {
-		if m.Path != libPath {
-			continue
-		}
-		openPath := m.OpenablePath()
-		if openPath == "" {
-			continue
-		}
-		buildID, err := ehmaps.ReadBuildID(openPath)
-		if err != nil {
-			return 0, fmt.Errorf("build-id: %w", err)
-		}
-		return ehmaps.TableIDForBuildID(buildID), nil
-	}
-	return 0, fmt.Errorf("no readable mapping for %s", libPath)
 }
 
 // logPythonWalkCounters prints py_walk_counters once, at shutdown.

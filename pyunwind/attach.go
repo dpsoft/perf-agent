@@ -398,12 +398,26 @@ func newSymbolResolver(mr *procmap.Resolver, pid uint32, libPath string) (*symbo
 
 // addr returns the absolute runtime address of a dynamic symbol.
 func (s *symbolResolver) addr(name string) (uint64, error) {
+	sym, err := s.sym(name)
+	if err != nil {
+		return 0, err
+	}
+	return s.bias + sym.Value, nil
+}
+
+// sym returns a dynamic symbol whole -- link-time Value and Size, unbiased.
+//
+// Callers that only want an address use addr. This exists for the one
+// caller that needs the SIZE too: AutoTSSKeyRef.Resolve bounds-checks the
+// autoTSSkey reference against _PyRuntime's extent, which is the only
+// independent check there is on a number decoded out of machine code.
+func (s *symbolResolver) sym(name string) (elf.Symbol, error) {
 	for _, sym := range s.syms {
 		if sym.Name == name {
-			return s.bias + sym.Value, nil
+			return sym, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: %s in %s", ErrSymbolNotFound, name, s.path)
+	return elf.Symbol{}, fmt.Errorf("%w: %s in %s", ErrSymbolNotFound, name, s.path)
 }
 
 // Attach discovers a process's interpreter, validates the offsets against
@@ -462,7 +476,7 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 		return pyProcInfo{}, refuseWith(res.Version, ErrTLSBaseUnavailable)
 	}
 
-	keyOff, err := ParseAutoTSSKeyOffset(code)
+	keyRef, err := ParseAutoTSSKeyRef(code)
 	if err != nil {
 		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate autoTSSkey: %w", err))
 	}
@@ -472,7 +486,7 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot resolve symbols in %s: %w", libPath, err))
 	}
 
-	pyRuntimeAddr, err := resolver.addr("_PyRuntime")
+	pyRuntime, err := resolver.sym("_PyRuntime")
 	if err != nil {
 		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate _PyRuntime: %w", err))
 	}
@@ -485,24 +499,46 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 		}
 	}
 
+	// Where the Py_tss_t actually is. Resolve is what turns the number the
+	// instruction stream carried -- an offset from _PyRuntime on a PIC
+	// build, the address itself on a non-PIE one -- into an address in this
+	// process, and refuses if it does not land inside _PyRuntime.
+	keyAddr, err := keyRef.Resolve(pyRuntime.Value, pyRuntime.Size, resolver.bias)
+	if err != nil {
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate autoTSSkey: %w", err))
+	}
+
 	// _PyRuntime.autoTSSkey is a Py_tss_t: `{ int _is_initialized;
-	// pthread_key_t _key; }`. ParseAutoTSSKeyOffset's doc explains why
-	// keyOff is the offset of that STRUCT, not of _key directly: the
-	// parser requires the cmpl's and lea's offsets to agree, and both
-	// instructions address the struct base (cmpl tests _is_initialized at
-	// +0; lea computes &_key at +0 to pass to PyThread_tss_get, which
-	// itself is `pthread_key_t *`-typed and reads _key). On a
-	// little-endian target the raw 8-byte read below therefore packs
-	// _is_initialized into the LOW 32 bits and _key into the HIGH 32
-	// bits: reading uint32(rawKey) yields the init flag, not the key. A
-	// live measurement caught this: on this reviewer's process,
+	// pthread_key_t _key; }`. Every shape the parser knows names the base
+	// of that STRUCT, not of _key directly -- the inlined-cmpl shapes test
+	// _is_initialized at +0 and compute &_key at +0 of the same struct; the
+	// call shapes pass the struct pointer to PyThread_tss_is_created and
+	// PyThread_tss_get. On a little-endian target the raw 8-byte read below
+	// therefore packs _is_initialized into the LOW 32 bits and _key into
+	// the HIGH 32 bits: reading uint32(rawKey) yields the init flag, not
+	// the key. A live measurement caught this: on this reviewer's process,
 	// autoTSSkey read as 0x0000000100000001 (is_initialized=1, key=1) --
 	// key and flag coincidentally equal 1, which is exactly why a
-	// same-value bug like this survives on one host and corrupts frames
-	// on any host where CPython's key is 0, 2, 3, ...
-	rawKey, err := r.ReadU64(pyRuntimeAddr + uint64(keyOff))
+	// same-value bug like this survives on one host and corrupts frames on
+	// any host where CPython's key is 0, 2, 3, ... (measured: it is 0 on
+	// actions/setup-python's 3.12.14 and 1 on Fedora's 3.14.3).
+	rawKey, err := r.ReadU64(keyAddr)
 	if err != nil {
 		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: read autoTSSkey value: %v", ErrOffsetsUnreadable, err))
+	}
+	// The low half is PyThread_tss_create's `_is_initialized`, which is 1
+	// on any interpreter that has reached the point of having thread
+	// states. Checking it is the cheap end of the same argument Resolve
+	// makes: an address that came out of a decoded instruction stream
+	// should be validated against what the struct there must contain, not
+	// trusted because the decode did not error. Anything else means the
+	// address is not autoTSSkey -- or, far more rarely, that the
+	// interpreter has not initialised it yet, which is equally a reason not
+	// to install a record built on it.
+	if init := uint32(rawKey); init != 1 {
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf(
+			"%w: autoTSSkey at %#x reads _is_initialized=%#x (want 1); that address is not an initialised Py_tss_t",
+			ErrOffsetsImplausible, keyAddr, init))
 	}
 	tssKey := uint32(rawKey >> 32)
 

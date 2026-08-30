@@ -3,8 +3,10 @@ package gpuprobe
 import (
 	"container/list"
 	"errors"
+	"log"
 	"sync"
 
+	"github.com/dpsoft/perf-agent/pyunwind"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 )
 
@@ -59,6 +61,13 @@ type pidRegistrar interface {
 // unwind/ehcompile, over this program's own copies of the walker's maps.
 type ehmapsRegistrar struct {
 	tracker *ehmaps.PIDTracker
+	// python is gpu_usdt's copy of py_procs and py_eval_ranges. The
+	// interpreter arm lives in walk_step, which this program shares with
+	// perf_dwarf and offcpu_dwarf, so a CUDA launch made from Python
+	// carries Python frames here for free -- but only once these two maps
+	// are populated for the producing process. Nothing else populates them
+	// on this path.
+	python *pyunwind.BPFMaps
 }
 
 // newEhmapsRegistrar wires a registrar around a loaded gpu_usdt object. The
@@ -73,11 +82,59 @@ func newEhmapsRegistrar(objs *gpuusdtObjects) *ehmapsRegistrar {
 	)
 	return &ehmapsRegistrar{
 		tracker: ehmaps.NewPIDTracker(store, objs.PidMappings, objs.PidMappingLengths),
+		python:  &pyunwind.BPFMaps{PyProcs: objs.PyProcs, EvalRanges: objs.PyEvalRanges},
 	}
 }
 
 func (r *ehmapsRegistrar) Register(pid uint32) (int, error) {
-	return ehmaps.AttachAllMappings(r.tracker, pid)
+	n, err := ehmaps.AttachAllMappings(r.tracker, pid)
+	if err != nil {
+		return n, err
+	}
+	// CPython frames at the launch site. This is the case the whole design
+	// exists for -- a torch/numpy program whose cudaLaunchKernel is reached
+	// from Python -- and it gets them from the same walk_step arm the CPU
+	// profilers use, so all that is needed here is the per-process record
+	// and the eval range.
+	//
+	// AFTER AttachAllMappings, never before: the eval range is keyed by
+	// table_id, and a table_id only resolves to a PC once that binary has a
+	// pid_mappings row.
+	//
+	// Best-effort and never fatal to CFI registration: a producer whose
+	// interpreter cannot be walked must still get native GPU stacks. Every
+	// outcome is logged, including the refusals, because "not a Python
+	// process" and "Python we decline to walk" are different answers to the
+	// only question a user with no Python frames has.
+	r.enrollPython(pid)
+	return n, nil
+}
+
+// enrollPython installs the CPython walker's per-process state for a GPU
+// producer. Mirrors dwarfagent.enrollPython; both are thin wrappers over
+// pyunwind.EnrollTarget so the two paths cannot drift into enrolling
+// different sets of processes.
+//
+// UNVALIDATED ON HARDWARE. The wiring is symmetric with the DWARF path and
+// the BPF side is literally the same code, but no machine in CI has a GPU,
+// so no test anywhere has yet seen a Python frame on a gpu_launch_sampled
+// stack. See the task report; this needs a run on the 3090.
+func (r *ehmapsRegistrar) enrollPython(pid uint32) {
+	if r.python == nil || r.python.PyProcs == nil || r.python.EvalRanges == nil {
+		return
+	}
+	libPath, found, res, err := pyunwind.EnrollTarget(pid, r.python)
+	switch {
+	case !found && err == nil:
+		return
+	case err != nil:
+		log.Printf("gpuprobe: python frames: pid %d: REFUSED %s: %v", pid, libPath, err)
+	case res.Refused != "":
+		log.Printf("gpuprobe: python frames: pid %d: REFUSED %s (CPython %s): %s",
+			pid, libPath, res.Version, res.Refused)
+	default:
+		log.Printf("gpuprobe: python frames: pid %d: attached %s (CPython %s)", pid, libPath, res.Version)
+	}
 }
 
 func (r *ehmapsRegistrar) Unregister(pid uint32) error {

@@ -126,8 +126,14 @@ jobs:
           echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
           git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
 
+      # ./pyunwind/... is here because it was in NO CI job before: the whole
+      # CPython walker's correctness argument -- the per-version offset
+      # tables, the autoTSSkey parser, the counter slot mapping, and the
+      # live-interpreter attach tests -- was running only on developer
+      # machines. The live tests attach to a python3 they spawn themselves
+      # and need no capabilities; on arm64 they skip by name.
       - name: Run unit tests
-        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/...
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/...
 
       - name: Upload coverage
         uses: codecov/codecov-action@v3

@@ -186,8 +186,10 @@ jobs:
     - name: Build perf-agent
       run: go build -v .
     
+    # ./pyunwind/... is here because it was in no CI job before; see the
+    # same step in tests.yml.
     - name: Run unit tests
-      run: go test -v ./cpu/... ./profile/... ./offcpu/...
+      run: go test -v ./cpu/... ./profile/... ./offcpu/... ./pyunwind/...
     
     - name: Build test workloads
       run: |

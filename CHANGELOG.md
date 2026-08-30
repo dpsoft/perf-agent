@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **CPython frames on the per-PID DWARF path** ([#83](https://github.com/dpsoft/perf-agent/issues/83)).
+  `--profile --pid <n> --unwind dwarf` now walks the interpreter's own
+  `_PyInterpreterFrame` chain from BPF and splices the Python frames into the
+  native stack at the position of the `_PyEval_EvalFrameDefault` frame they were
+  running in, so a Python -> C extension -> Python stack comes back interleaved
+  rather than as C frames alone. Nothing is injected into the target and no new
+  capability is required, though enrolling a process briefly ptrace-stops one of
+  its threads to read the TLS base the interpreter's thread-state lookup needs
+  (once, at attach; the sampling path itself reads it from the kernel).
+
+  **What it does not do yet.** Python frames are **not symbolized**: each renders
+  as `python:0x<code object address>` until the fingerprint/name recovery slice
+  lands. It is **amd64 only** (the glibc pthread-TSD offsets it needs have been
+  measured there and nowhere else), covers **CPython 3.12, 3.13 and 3.14** GIL
+  builds (a free-threaded `Py_GIL_DISABLED` build is refused by name), and is
+  wired for **`--pid` captures only** — system-wide (`-a`) still produces
+  native-only stacks and says so in the log. An interpreter that cannot be
+  walked is always refused with a reason on stderr, never walked with guessed
+  offsets; `py_walk_counters` is reported at shutdown so a run that walked
+  nothing is distinguishable from a run with no Python in it.
+
 ### Removed
 
 - **The Python perf-trampoline injector (`--inject-python`) and the `inject/`
@@ -21,8 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produces **no Python-level frames of its own** — Python processes still
   profile, but with C interpreter frames (`_PyEval_EvalFrameDefault`, …) rather
   than Python qualnames. #83 replaces the injector by walking the interpreter's
-  frame chain from BPF (no injection, CPython 3.6+, no new capability); it is
-  queued behind the GPU PC-sampling phase and is not built yet.
+  frame chain from BPF (no injection, CPython 3.6+, no new capability). Its first
+  slice is now in this release -- see **Added** above -- with Python frames
+  correctly placed but rendered as addresses rather than qualnames.
 
   Unaffected: if the interpreter is started with `python -X perf` (3.12+) by
   whoever launches it, CPython writes `/tmp/perf-<pid>.map` itself and

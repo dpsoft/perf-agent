@@ -603,13 +603,24 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 // reached) — the caller must stop walking in that case. The refusal itself
 // is never silent: WALKER_FLAG_FRAME_PUSH_REFUSED says a frame was dropped
 // for lack of room, distinct from every other reason a walk can stop short.
+//
+// The bound is re-asserted into a local (`i`) immediately before the
+// stores, rather than checked on ctx->n_pcs and indexed with ctx->n_pcs
+// again: the verifier tracks a register's proven range across a branch,
+// not a struct field re-read through a pointer, so `if (ctx->n_pcs >=
+// MAX_FRAMES) ... ctx->rec->pcs[ctx->n_pcs++]` verified the check but not
+// the store, rejecting perf_dwarf and offcpu_dwarf as an unbounded R4
+// access at the pcs[] write. Binding `i` once and using it for both the
+// check and every array access keeps the proof in one register.
 static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
-    if (ctx->n_pcs >= MAX_FRAMES) {
+    __u32 i = ctx->n_pcs;
+    if (i >= MAX_FRAMES) {
         ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
         return 1;
     }
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_NATIVE;
-    ctx->rec->pcs[ctx->n_pcs++] = pc;
+    ctx->rec->tags[i] = FRAME_TAG_NATIVE;
+    ctx->rec->pcs[i] = pc;
+    ctx->n_pcs = i + 1;
     return 0;
 }
 
@@ -623,15 +634,24 @@ static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
 // spot rather than re-derived at each call site. Like frame_push_native,
 // a refusal raises WALKER_FLAG_FRAME_PUSH_REFUSED rather than dropping the
 // frame silently.
+//
+// The check is against `i + 2 > MAX_FRAMES`, one comparison covering both
+// slots, and both slots are written from that same local `i` — the
+// two-slot push is atomic (refuse before writing either, never write one
+// and fail the second) and, per frame_push_native's comment above, keeps
+// the verifier's proof of both `i` and `i + 1` in bounds tied to the one
+// checked register instead of re-reading ctx->n_pcs from memory.
 static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
-    if (ctx->n_pcs + 2 > MAX_FRAMES) {
+    __u32 i = ctx->n_pcs;
+    if (i + 2 > MAX_FRAMES) {
         ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
         return 1;
     }
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[ctx->n_pcs++] = code;
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[ctx->n_pcs++] = instr;
+    ctx->rec->tags[i] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[i] = code;
+    ctx->rec->tags[i + 1] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[i + 1] = instr;
+    ctx->n_pcs = i + 2;
     return 0;
 }
 

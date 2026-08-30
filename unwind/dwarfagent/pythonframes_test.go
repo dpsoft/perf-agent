@@ -344,7 +344,30 @@ func TestHashStackSeparatesStacksThatDifferOnlyInTags(t *testing.T) {
 	if a == b {
 		t.Error("hashStack ignores the tags; two different call paths would share one sample key")
 	}
-	if hashStack(pcs, nil) != hashStack(pcs, nil) {
-		t.Error("hashStack is not stable")
+}
+
+// hashStack must be a pure function of its input: two walks that produced
+// equal words and equal tags have to land on the same sample key, or the same
+// stack is symbolized and reported several times over.
+//
+// The two operands are DISTINCT expressions over equal-but-separate data, not
+// the same call twice. `f(x) != f(x)` has identical operands, so the compiler
+// is free to fold it and the assertion can never fail -- this branch's
+// recurring defect in yet another costume, and what staticcheck SA4000
+// correctly refuses. Copying the inputs makes the comparison real: it fails
+// for a hash that iterates a map, mixes in a per-call seed, or depends on the
+// backing array rather than the values.
+func TestHashStackIsAPureFunctionOfItsInput(t *testing.T) {
+	pcs := []uint64{0x401000, 0xc0de0000, 0x5a5a5a5a}
+	tags := []uint8{frameTagNative, frameTagPython, frameTagPython}
+
+	samePCs := append([]uint64(nil), pcs...)
+	sameTags := append([]uint8(nil), tags...)
+
+	if hashStack(pcs, tags) != hashStack(samePCs, sameTags) {
+		t.Error("equal chains hashed differently: hashStack is not a pure function of its input")
+	}
+	if hashStack(pcs, nil) != hashStack(samePCs, nil) {
+		t.Error("equal chains with no tags hashed differently")
 	}
 }

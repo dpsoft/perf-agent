@@ -130,3 +130,140 @@ func TestParseAutoTSSKeyOffsetRefusesWrongLength(t *testing.T) {
 		}
 	})
 }
+
+// The two shapes the spike never saw, both measured from real shipped
+// libpythons of the SAME CPython version (3.12) as the 35-byte fixture
+// above. Their existence is the point: the 35-byte body is a property of a
+// toolchain, not of CPython, and the 44-byte one is what CI's interpreter
+// (actions/setup-python 3.12.14 for ubuntu-24.04) actually ships. Before it
+// was handled, Attach refused every interpreter on the integration runners.
+//
+// Both must decode to 0x608 -- the same autoTSSkey offset the 35-byte
+// Debian 3.12 body yields, because it is the same struct in the same
+// version. That agreement across three independently compiled bodies is
+// what says the parser read the offset rather than some other u32.
+func TestParseAutoTSSKeyOffsetAcceptsOtherToolchainShapes(t *testing.T) {
+	cases := []struct {
+		file    string
+		wantLen int
+		want    uint32
+	}{
+		{"testdata/gilstate_312_gcc13_pgo.bin", 44, 0x608},
+		{"testdata/gilstate_312_ubuntu_fp.bin", 64, 0x608},
+	}
+	for _, tc := range cases {
+		code, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.file, err)
+		}
+		if len(code) != tc.wantLen {
+			t.Fatalf("%s: fixture is %d bytes, expected the measured %d", tc.file, len(code), tc.wantLen)
+		}
+		got, err := ParseAutoTSSKeyOffset(code)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.file, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: offset = %#x, want %#x", tc.file, got, tc.want)
+		}
+	}
+}
+
+// The 35-byte fixture and the two new ones are three separate compilations
+// of CPython 3.12's PyGILState_GetThisThreadState. A parser that read the
+// wrong u32 out of any one of them would disagree with the other two, so
+// pinning the agreement is a stronger statement than pinning each literal
+// on its own.
+func TestAutoTSSKeyOffsetAgreesAcrossToolchainsForOneVersion(t *testing.T) {
+	files := []string{
+		"testdata/gilstate_312.bin",
+		"testdata/gilstate_312_gcc13_pgo.bin",
+		"testdata/gilstate_312_ubuntu_fp.bin",
+	}
+	var first uint32
+	for i, f := range files {
+		code, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		got, err := ParseAutoTSSKeyOffset(code)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		if got != first {
+			t.Fatalf("%s: offset %#x disagrees with %s's %#x; three builds of one CPython version must report one struct offset",
+				f, got, files[0], first)
+		}
+	}
+}
+
+// Every byte of a shape that is not a per-binary displacement must be
+// load-bearing. This flips each byte of each real body in turn and requires
+// the parser to refuse -- EXCEPT at the positions the disassembly says
+// carry a displacement or the offset itself. Those positions are listed
+// here from the objdump output in tssparse.go's shape comments, not read
+// back out of the shape table, so a table whose fixed runs quietly stopped
+// covering an opcode fails here instead of agreeing with itself.
+//
+//	35-byte: the mov's disp32 at [7:11] and the jmp's rel32 at [28:32].
+//	         Its TWO off32 fields are NOT in the list: corrupting either
+//	         makes them disagree, which the parser refuses.
+//	44-byte: the mov's disp32 at [7:11], the lone off32 at [15:19] (no
+//	         second copy to disagree with, so a corruption there is
+//	         accepted and simply reports a different offset), and the
+//	         call/jmp rel32s at [23:27] and [36:40].
+//	64-byte: the mov's disp32 at [16:20], the lone off32 at [23:27], and
+//	         the call/jmp rel32s at [31:35] and [48:52].
+func TestParseAutoTSSKeyOffsetRefusesEverySingleByteCorruption(t *testing.T) {
+	span := func(lo, hi int) []int {
+		var out []int
+		for i := lo; i < hi; i++ {
+			out = append(out, i)
+		}
+		return out
+	}
+	join := func(runs ...[]int) map[int]bool {
+		m := map[int]bool{}
+		for _, r := range runs {
+			for _, i := range r {
+				m[i] = true
+			}
+		}
+		return m
+	}
+	cases := []struct {
+		file      string
+		unchecked map[int]bool
+	}{
+		{"testdata/gilstate_312.bin", join(span(7, 11), span(28, 32))},
+		{"testdata/gilstate_312_gcc13_pgo.bin", join(span(7, 11), span(15, 19), span(23, 27), span(36, 40))},
+		{"testdata/gilstate_312_ubuntu_fp.bin", join(span(16, 20), span(23, 27), span(31, 35), span(48, 52))},
+	}
+	for _, tc := range cases {
+		good, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.file, err)
+		}
+		if _, err := ParseAutoTSSKeyOffset(good); err != nil {
+			t.Fatalf("%s: fixture must parse before corruption: %v", tc.file, err)
+		}
+		for i := range good {
+			mutant := append([]byte{}, good...)
+			mutant[i] ^= 0xff
+			_, err := ParseAutoTSSKeyOffset(mutant)
+			if tc.unchecked[i] {
+				if err != nil {
+					t.Errorf("%s: byte %d is a displacement the shape does not check, but flipping it was refused: %v", tc.file, i, err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Errorf("%s: flipping byte %d was accepted; that byte carries no weight in the shape", tc.file, i)
+			}
+		}
+	}
+}

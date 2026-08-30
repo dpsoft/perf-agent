@@ -1139,6 +1139,9 @@ type fakeSymbolizer struct {
 	// target process - the shape that made the Phase 4a gate look like a
 	// success while resolving nothing.
 	unresolved func(ip uint64) bool
+	// dropLast returns one fewer Frame than IPs, violating the one-Frame-per-IP
+	// contract the splice indexes on.
+	dropLast bool
 }
 
 func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize.Frame, error) {
@@ -1158,6 +1161,9 @@ func (s *fakeSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbolize
 			continue
 		}
 		out = append(out, symbolize.Frame{Address: ip, Name: fmt.Sprintf("fn_%x", ip)})
+	}
+	if s.dropLast && len(out) > 0 {
+		out = out[:len(out)-1]
 	}
 	return out, nil
 }
@@ -3798,4 +3804,20 @@ func TestTagsPastNPcsAreNotRead(t *testing.T) {
 	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0])
 	assert.Zero(t, c.Stats().StackPythonFrames)
 	assert.Zero(t, c.Stats().StackPythonPairsTruncated)
+}
+
+// symbolize/local.go documents one Frame per IP, and the splice indexes
+// positionally against the native list on that promise. A short return would
+// drop the tail natives from the call path -- frames left in order, but a
+// stack shorter than the walk that produced it, with nothing saying so.
+// Refuse and count instead.
+func TestAShortSymbolizerReturnIsRefusedNotSpliced(t *testing.T) {
+	sym := &fakeSymbolizer{dropLast: true}
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{Symbolizer: sym})
+	stacks.put(69, 0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100)
+	stacks.tags[69] = []uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative}
+
+	_, ok := c.resolveStackForTest(69, 4242)
+	assert.False(t, ok, "a call path that cannot be spliced faithfully is not shipped")
+	assert.Equal(t, uint64(1), c.Stats().SymbolizeFailed)
 }

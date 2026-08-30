@@ -75,7 +75,7 @@ type session struct {
 
 	mu         sync.Mutex
 	samples    map[sampleKey]uint64
-	stacks     map[sampleKey][]uint64
+	stacks     map[sampleKey][]frameSlot
 	kernStacks map[sampleKey][]uint64 // kernel IPs per sample key; nil when kernel-stacks disabled
 
 	attachStats attachStats
@@ -341,14 +341,19 @@ func (s *session) consumeRingbuf(agg aggregator) {
 	}
 }
 
-// stashStack stores the PC chain for key if not already stashed.
+// stashStack stores the decoded frame chain for key if not already stashed.
+//
+// Decoded, not raw: the pcs[]/tags[] pair is folded into frameSlots once, in
+// the aggregator, so collect() cannot symbolize a Python frame's words as
+// instruction pointers by forgetting to consult the tags (issue #83). There
+// is exactly one place that can make that mistake, and it no longer exists.
 // Must be called under s.mu.
-func (s *session) stashStack(key sampleKey, pcs []uint64) {
+func (s *session) stashStack(key sampleKey, slots []frameSlot) {
 	if s.stacks == nil {
-		s.stacks = map[sampleKey][]uint64{}
+		s.stacks = map[sampleKey][]frameSlot{}
 	}
 	if _, have := s.stacks[key]; !have {
-		s.stacks[key] = append([]uint64(nil), pcs...)
+		s.stacks[key] = append([]frameSlot(nil), slots...)
 	}
 }
 
@@ -380,7 +385,7 @@ func (s *session) stashKernelStack(key sampleKey, kernelIPs []uint64) {
 func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate int) error {
 	s.mu.Lock()
 	samples := make(map[sampleKey]uint64, len(s.samples))
-	stacks := make(map[sampleKey][]uint64, len(s.stacks))
+	stacks := make(map[sampleKey][]frameSlot, len(s.stacks))
 	kernStacks := make(map[sampleKey][]uint64, len(s.kernStacks))
 	for k, v := range s.samples {
 		samples[k] = v
@@ -469,6 +474,25 @@ func (s *session) close() error {
 	}
 	// Symbolizer is owned by the Agent; do not close it here.
 	return s.objs.Close()
+}
+
+// hashStack is hashPCs with the FRAME_TAG_* bytes folded in (issue #83).
+//
+// The tags are part of what makes a stack a stack: the same 64-bit word is a
+// return address in one slot and a code-object pointer in another, and two
+// walks whose words agree but whose tags do not are different call paths that
+// must not be deduped onto one another. That collision needs a heap address
+// to equal a text address to be reachable at all, so this is cheap insurance
+// rather than an observed problem — but it is three lines, and the
+// alternative is a reader having to reconstruct that argument.
+func hashStack(pcs []uint64, tags []uint8) uint64 {
+	h := hashPCs(pcs)
+	const prime uint64 = 0x100000001b3
+	for _, t := range tags {
+		h ^= uint64(t)
+		h *= prime
+	}
+	return h
 }
 
 // hashPCs is a stable, fast, collision-rare hash over a PC chain —

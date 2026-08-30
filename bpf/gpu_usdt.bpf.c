@@ -252,8 +252,10 @@ struct {
     __type(value, struct gpu_stack);
 } gpu_stacks SEC(".maps");
 
-// Staging buffer for one gpu_stack. The value is 1024 bytes and the BPF
-// stack is 512, so the copy from walker_scratch has to land in a map.
+// Staging buffer for one gpu_stack. The value is 1152 bytes (see the
+// _Static_assert above; it was 1024 before tags[] was added for issue #83)
+// and the BPF stack is 512, so the copy from walker_scratch has to land in a
+// map.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);

@@ -140,22 +140,39 @@ func NewProfiler(pid int, systemWide bool, cpus []uint, tags []string, sampleRat
 // the same sampleKey so collect() can symbolize it leaf-side with the
 // user frames.
 func aggregateCPUSample(s *session, sample Sample, kernelIPs []uint64) {
-	key := sampleKey{pid: sample.PID, hash: hashPCs(sample.PCs)}
+	// Decode the tagged slots ONCE, here, where every sample passes exactly
+	// once: the counters below are per-sample, and both the perf.data export
+	// and the stashed stack want the same decoding (issue #83).
+	slots, truncatedPair := splitFrameSlots(sample.PCs, sample.Tags)
+	countPythonSlots(slots, truncatedPair)
+
+	key := sampleKey{pid: sample.PID, hash: hashStack(sample.PCs, sample.Tags)}
 	s.mu.Lock()
 	s.samples[key]++
-	s.stashStack(key, sample.PCs)
+	s.stashStack(key, slots)
 	s.stashKernelStack(key, kernelIPs)
 	s.mu.Unlock()
-	if s.perfData != nil && len(sample.PCs) > 0 {
-		s.perfData.AddSample(perfdata.SampleRecord{
-			IP:        sample.PCs[0],
-			Pid:       sample.PID,
-			Tid:       sample.TID,
-			Time:      sample.TimeNs,
-			Period:    1,
-			UserIPs:   sample.PCs,
-			KernelIPs: kernelIPs,
-		})
+	// perf.data's user-IP callchain is a list of INSTRUCTION POINTERS by
+	// definition — every consumer of the file (perf report, pprof converters,
+	// FlameScope) resolves them against the process's mappings. A Python
+	// frame's two slots are a code-object address and an encoded instruction
+	// word, so shipping them here would put two addresses that are not code
+	// into the callchain of a format that has no way to say otherwise. This
+	// slice has no representation for a Python frame, so the honest export is
+	// the native subset; the Python frames are in the pprof output, which
+	// does. Issue #83.
+	if s.perfData != nil {
+		if ips := nativeIPs(slots); len(ips) > 0 {
+			s.perfData.AddSample(perfdata.SampleRecord{
+				IP:        ips[0],
+				Pid:       sample.PID,
+				Tid:       sample.TID,
+				Time:      sample.TimeNs,
+				Period:    1,
+				UserIPs:   ips,
+				KernelIPs: kernelIPs,
+			})
+		}
 	}
 }
 

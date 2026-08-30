@@ -7,25 +7,82 @@ import (
 	"github.com/dpsoft/perf-agent/symbolize"
 )
 
-// symbolizePID resolves ips for pid and returns pprof frames in the same
-// order as ips. Failed IPs contribute a single synthetic "[unknown]"
-// frame carrying the original PC as Address.
-func symbolizePID(sym symbolize.Symbolizer, pid uint32, ips []uint64) []pprof.Frame {
-	if len(ips) == 0 {
+// symbolizePID resolves one walk's slot words for pid and returns pprof
+// frames in the same order. Failed IPs contribute a single synthetic
+// "[unknown]" frame carrying the original PC as Address.
+//
+// slots is the walk decoded by splitFrameSlots (issue #83), NOT a flat list of
+// instruction pointers: a Python frame occupies two consecutive pcs[] slots
+// holding a code-object address and an encoded instruction word, folded into
+// one slot here, and handing either word to blazesym asks it to name an
+// address that is not code — it will place it in whatever mapping it falls in
+// and hand back a frame, so the stack gains two plausible, wrong native
+// frames and nothing says so. Only native slots reach the symbolizer; Python
+// slots are spliced back at their own position, rendered as addresses until
+// slice 3 can read a code object.
+//
+// The splice happens at the symbolize.Frame level, where the correspondence
+// with the native list is still one-to-one. After ToProfFrames it is not:
+// that call expands inline chains, so there is no index left to splice
+// against.
+func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []frameSlot) []pprof.Frame {
+	if len(slots) == 0 {
 		return nil
 	}
-	frames, err := sym.SymbolizeProcess(pid, ips)
-	if err != nil || len(frames) == 0 {
+	native := nativeIPs(slots)
+
+	var frames []symbolize.Frame
+	// placeholders is carried explicitly rather than inferred later from an
+	// empty Name: "the symbolizer gave us nothing usable" and "the symbolizer
+	// named this frame with an empty string" are different facts, and a
+	// sentinel that conflates them is how an unresolved frame starts reading
+	// as a resolved one.
+	placeholders := false
+	if len(native) > 0 {
+		var err error
+		frames, err = sym.SymbolizeProcess(pid, native)
 		if err != nil {
 			log.Printf("dwarfagent: symbolize: %v", err)
 		}
-		out := make([]pprof.Frame, len(ips))
-		for i := range out {
-			out[i] = pprof.Frame{Name: "[unknown]", Address: ips[i]}
+		// symbolize/local.go documents one Frame per IP, and the splice below
+		// indexes positionally against `native` on that promise. A count that
+		// disagrees is not something to splice around: it would drop the tail
+		// natives from the call path, leaving a short stack in the right order
+		// with nothing saying it is short. The condition is a superset of the
+		// one this function used before it learned about tags (err != nil ||
+		// len(frames) == 0), so the pre-existing failure rendering is
+		// unchanged; only the genuinely new case is counted.
+		if err != nil || len(frames) != len(native) {
+			if err == nil && len(frames) != 0 {
+				pythonSymbolizerCountMM.Add(1)
+			}
+			placeholders = true
 		}
-		return out
 	}
-	return symbolize.ToProfFrames(frames)
+
+	out := make([]pprof.Frame, 0, len(slots))
+	next := 0
+	for _, sl := range slots {
+		if sl.python {
+			// Not counted here: PythonFrameStats.Frames is a per-SAMPLE
+			// number and collect() runs once per unique stack. The
+			// aggregators count, via countPythonSlots.
+			out = append(out, symbolize.ToProfFrames(
+				[]symbolize.Frame{pythonSymbolizeFrame(sl)})...)
+			continue
+		}
+		if placeholders {
+			out = append(out, pprof.Frame{Name: "[unknown]", Address: sl.pc})
+			continue
+		}
+		// ToProfFrames one frame at a time: it is a pure per-frame flattening
+		// (symbolize/toprof.go), so this is identical to calling it on the
+		// whole slice, and it is what keeps each expanded inline chain
+		// anchored to the slot it came from.
+		out = append(out, symbolize.ToProfFrames([]symbolize.Frame{frames[next]})...)
+		next++
+	}
+	return out
 }
 
 // symbolizePIDWithKernel resolves both user-mode and kernel-mode IPs for a
@@ -37,8 +94,8 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, ips []uint64) []pprof.Fr
 // stale BPF stack-IDs), behaves identically to symbolizePID. When user-mode
 // symbolization fails we still emit synthetic "[unknown]" placeholders so
 // the kernel frames don't appear hanging off an unrelated stack.
-func symbolizePIDWithKernel(sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, pid uint32, userIPs, kernelIPs []uint64) []pprof.Frame {
-	userFrames := symbolizePID(sym, pid, userIPs)
+func symbolizePIDWithKernel(sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, pid uint32, userSlots []frameSlot, kernelIPs []uint64) []pprof.Frame {
+	userFrames := symbolizePID(sym, pid, userSlots)
 	if len(kernelIPs) == 0 {
 		return userFrames
 	}

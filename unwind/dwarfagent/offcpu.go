@@ -85,10 +85,15 @@ func aggregateOffCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	if sample.Value == 0 {
 		return
 	}
-	key := sampleKey{pid: sample.PID, hash: hashPCs(sample.PCs)}
+	// See aggregateCPUSample: decode the tagged slots once, here, where every
+	// sample passes exactly once, and count per sample (issue #83).
+	slots, truncatedPair := splitFrameSlots(sample.PCs, sample.Tags)
+	countPythonSlots(slots, truncatedPair)
+
+	key := sampleKey{pid: sample.PID, hash: hashStack(sample.PCs, sample.Tags)}
 	s.mu.Lock()
 	s.samples[key] += sample.Value
-	s.stashStack(key, sample.PCs)
+	s.stashStack(key, slots)
 	s.stashKernelStack(key, kernelIPs)
 	s.mu.Unlock()
 }

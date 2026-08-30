@@ -226,6 +226,16 @@ func FrameDecodeCounters() FrameDecodeStats {
 // frame pairs. Python frames occupy two consecutive slots; a trailing
 // half-pair is dropped and counted (TruncatedPythonPairs) rather than
 // half-read — MAX_FRAMES truncating mid-pair must never be silent.
+//
+// IT SEPARATES BY KIND AND THEREFORE LOSES THE INTERLEAVING, so it must not
+// be used to build a call path. Two lists cannot say which native frame each
+// Python frame sat above, and a stack whose Python frames are all piled at
+// one end is a plausible call path that never happened. The two decoders that
+// DO build call paths keep one ordered list with the pairs folded in place —
+// dwarfagent.splitFrameSlots (unwind/dwarfagent/pythonframes.go) for the
+// ringbuf path and gpuprobe's splitGPUStackSlots for the GPU path. Use one of
+// those. This one survives as the counted-decode unit test fixture it was
+// written as in Task 1; it has no production caller.
 func decodeFrames(rec *sampleRecord) (pcs []uint64, py []PythonFrame) {
 	for i := 0; i < int(rec.NPcs); i++ {
 		switch rec.Tags[i] {

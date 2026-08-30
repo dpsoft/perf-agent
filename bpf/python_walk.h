@@ -213,6 +213,25 @@ struct {
 // up when something breaks cannot distinguish "the arm never fired" from
 // "the arm fired and worked", and that is the reading an operator needs
 // first.
+//
+// UNITS -- these are not all the same thing, and mixing them silently is its
+// own trap:
+//
+//   slot 0 (FRAMES_PUSHED)  counts FRAMES. One per Python frame that reached
+//                           the record, so it grows with stack depth.
+//   slots 1..8 (everything  count SAMPLES. Each is bumped at most once per
+//   else)                   sample, and that is a structural property, not a
+//                           convention: every one of those paths leaves
+//                           walk_ctx.py_state == PY_CHAIN_DONE, and both
+//                           py_push_frames and walk_step's interpreter arm
+//                           do nothing at all once it is DONE. So a deep
+//                           native stack that lands on the eval loop twenty
+//                           times still contributes at most one.
+//
+// The useful ratios therefore read: FRAMES_PUSHED / (samples with Python) is
+// mean Python depth, and every other slot over the sample count is a rate of
+// occurrence. Reading slot 0 against the others as if they shared a unit
+// would make a deep stack look like a failure storm.
 #define PY_CNT_FRAMES_PUSHED     0  // one Python frame pair reached the record
 #define PY_CNT_TSS_MISS          1  // the TSD slot held no PyThreadState
 #define PY_CNT_NO_PROC_INFO      2  // an eval-loop PC in a process with no
@@ -427,14 +446,27 @@ static __always_inline void py_push_frames(struct walk_ctx *ctx, struct py_proc_
         }
         if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;
 
-        // CPython >= 3.13 puts Py_None in the top C-entered frame's
-        // f_executable rather than a code object (none_addr is the target's
-        // own _Py_NoneStruct, resolved at attach; zero on 3.12, where the
-        // second test is dead). A NULL executable is the same stop for the
-        // same reason -- it is what
-        // Modules/_remote_debugging_module.c:2142-2144 (is_frame_valid)
-        // refuses. Emitting either as a code object would put one garbage
-        // frame on every Python stack.
+        // A TORN-READ BACKSTOP, not the mechanism for the C-entered frame.
+        //
+        // CPython >= 3.13 does put Py_None in f_executable rather than a code
+        // object, but only on the ENTRY frame -- 3.13.15 ceval.c:716 and
+        // 3.14.3 ceval.c:1159 set it on the same frame whose owner they set
+        // to the boundary value -- and the owner test twenty lines above has
+        // already returned by then. So this can only fire on a frame with
+        // owner < boundary whose executable is nonetheless NULL or None: a
+        // read torn by a chain being mutated underneath us, or offsets that
+        // are wrong in a way the owner screen did not catch.
+        //
+        // It is kept because that is exactly the screen CPython's own
+        // out-of-process reader applies
+        // (Modules/_remote_debugging_module.c:2142-2144, is_frame_valid,
+        // which refuses a NULL code object before reading anything else) and
+        // because emitting either value as a code object puts one garbage
+        // frame on the stack. EXPECT PY_CNT_NONE_EXECUTABLE TO READ ZERO in
+        // production: a zero here means the screen never had to fire, not
+        // that it is missing. (none_addr is the target's own _Py_NoneStruct,
+        // resolved at attach; it is zero on 3.12, where the second test is
+        // dead.)
         if (exec == 0 || (pi->none_addr != 0 && exec == pi->none_addr)) {
             py_count(PY_CNT_NONE_EXECUTABLE);
             return;

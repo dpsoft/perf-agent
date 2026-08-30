@@ -2876,6 +2876,17 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	// resolved/moduleOnly loop above so an unsymbolized Python frame does
 	// not inflate StackFramesUnresolved, which measures the NATIVE
 	// symbolizer's reach.
+	// symbolize.LocalSymbolizer documents one Frame per IP (symbolize/local.go),
+	// and the splice below relies on it: `frames` is indexed positionally
+	// against the native slots. A shorter return would silently drop the tail
+	// natives from the call path -- placed frames would stay in order, but the
+	// stack would be short with nothing saying so. Refuse rather than emit a
+	// truncated call path, and count it as the symbolization failure it is.
+	if len(frames) != len(native) {
+		c.stats.SymbolizeFailed++
+		return nil, false
+	}
+
 	merged := frames
 	if len(native) != len(slots) {
 		merged = make([]symbolize.Frame, 0, len(slots))
@@ -2893,9 +2904,7 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 				})
 				continue
 			}
-			if next < len(frames) {
-				merged = append(merged, frames[next])
-			}
+			merged = append(merged, frames[next])
 			next++
 		}
 	}

@@ -173,8 +173,66 @@ func TestTheChainIsResumedNotRestarted(t *testing.T) {
 	// Budget exhaustion must NOT leave the cursor live: resuming a
 	// half-walked segment at the next eval-loop PC would file the rest of it
 	// under a different native frame.
-	tail := body[strings.LastIndex(body, "py_count(PY_CNT_CHAIN_TRUNCATED)"):]
+	//
+	// The region examined is everything AFTER the chain loop's closing brace.
+	// This assertion previously sliced from the LAST occurrence of
+	// py_count(PY_CNT_CHAIN_TRUNCATED), which is the final statement of the
+	// function -- so the slice was that one 33-character call and could not
+	// contain PY_CHAIN_ACTIVE under any mutation. It passed against the very
+	// defect it names. Slice from the loop instead, and assert the region is
+	// the one intended (it must still contain the counter) so a future
+	// reshape cannot silently empty it again.
+	tail := pyPushFramesAfterChainLoop(t)
+	if !strings.Contains(tail, "py_count(PY_CNT_CHAIN_TRUNCATED)") {
+		t.Fatal("the post-loop region does not contain the truncation counter; the slice is looking at the wrong text")
+	}
 	if strings.Contains(tail, "PY_CHAIN_ACTIVE") {
 		t.Error("a truncated segment leaves the cursor live and will be resumed at the wrong native frame")
 	}
+}
+
+// pyPushFramesAfterChainLoop returns the text of py_push_frames that follows
+// the #pragma unroll chain loop's CLOSING BRACE -- i.e. the path taken only
+// when the loop ran out of budget without reaching the interpreter boundary.
+//
+// Brace-matched from the loop's opening brace rather than found by searching
+// for a landmark string, because every landmark inside this function is one
+// edit away from moving. Line comments are skipped so a brace in prose cannot
+// throw the depth count off.
+func pyPushFramesAfterChainLoop(t *testing.T) string {
+	t.Helper()
+	body := pyPushFramesBody(t)
+
+	pragma := strings.Index(body, "#pragma unroll")
+	if pragma < 0 {
+		t.Fatal("py_push_frames no longer has a #pragma unroll chain loop")
+	}
+	open := strings.Index(body[pragma:], "{")
+	if open < 0 {
+		t.Fatal("no opening brace after #pragma unroll")
+	}
+	open += pragma
+
+	depth := 0
+	for i := open; i < len(body); i++ {
+		if body[i] == '/' && i+1 < len(body) && body[i+1] == '/' {
+			nl := strings.IndexByte(body[i:], '\n')
+			if nl < 0 {
+				break
+			}
+			i += nl
+			continue
+		}
+		switch body[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return body[i+1:]
+			}
+		}
+	}
+	t.Fatal("the chain loop's closing brace was never reached; braces are unbalanced or the loop was reshaped")
+	return ""
 }

@@ -766,7 +766,14 @@ static long walk_step(__u32 idx, void *arg) {
         // returns void and counts, and control falls through to the
         // classification below exactly as it did before.
         struct py_eval_range *er = bpf_map_lookup_elem(&py_eval_ranges, &m.table_id);
-        if (er && m.rel_pc >= er->lo && m.rel_pc < er->hi) {
+        // ctx->py_state == PY_CHAIN_DONE means this sample is finished with
+        // Python -- the chain ran out, or something refused and was counted.
+        // Skipping the py_procs hash in that case is the same economy
+        // py_push_frames applies to the TSS lookup: a deep native stack can
+        // land on the eval loop many times per sample, and none of those
+        // repeats can learn anything new.
+        if (er && ctx->py_state != PY_CHAIN_DONE &&
+            m.rel_pc >= er->lo && m.rel_pc < er->hi) {
             __u32 py_pid = ctx->pid;
             struct py_proc_info *pi = bpf_map_lookup_elem(&py_procs, &py_pid);
             if (pi && pi->enabled) {
@@ -777,7 +784,19 @@ static long walk_step(__u32 idx, void *arg) {
                 // offsets). Named rather than silent -- this is the counter
                 // that separates "no Python frames because attach refused"
                 // from "no Python frames because the walk failed".
-                py_count(PY_CNT_NO_PROC_INFO);
+                //
+                // Counted on the FIRST such frame only, then the sample is
+                // marked done. Without the gate this bumps once per
+                // eval-loop native frame per sample, forever, for every
+                // refused interpreter on the box -- which makes the number
+                // scale with stack depth rather than with occurrences and
+                // breaks the unit rule the whole counter set is read under
+                // (see PY_CNT_* in python_walk.h: slot 0 counts frames,
+                // every other slot counts samples).
+                if (ctx->py_state == PY_CHAIN_UNSTARTED) {
+                    py_count(PY_CNT_NO_PROC_INFO);
+                }
+                ctx->py_state = PY_CHAIN_DONE;
             }
         }
 

@@ -173,11 +173,19 @@ type pyProcInfo struct {
 	_       [4]byte // mirrors the C side's explicit _pad[4]; keeps sizeof() at 56.
 }
 
-// BPFMaps is the set of map handles Attach needs. PyProcs is
-// bpf/python_walk.h's py_procs: a BPF_MAP_TYPE_HASH keyed by pid, holding
-// one pyProcInfo.
+// BPFMaps is the set of map handles the attach path needs.
+//
+// PyProcs is bpf/python_walk.h's py_procs: a BPF_MAP_TYPE_HASH keyed by
+// pid, holding one pyProcInfo. Attach writes it.
+//
+// EvalRanges is py_eval_ranges, keyed by table_id. AttachProcess writes it
+// AFTER a successful Attach and nothing else does, because it is the
+// interpreter arm's on-switch (see InstallEvalRange). Attach itself never
+// touches it, so a caller that only wants the per-PID record may leave it
+// nil.
 type BPFMaps struct {
-	PyProcs *ebpf.Map
+	PyProcs    *ebpf.Map
+	EvalRanges *ebpf.Map
 }
 
 // EvalRange is one interpreter's eval-loop text range, in the same space

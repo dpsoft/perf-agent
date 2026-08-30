@@ -35,13 +35,20 @@
 //   1. What py_tss_get needs to turn a TSS key into a PyThreadState*
 //      (tss_key and the four pthread_* glibc offsets).
 //   2. The _PyInterpreterFrame / PyThreadState / PyCodeObject layout for
-//      this process's CPython minor version -- mirrors pyunwind.Offsets
-//      (pyunwind/offsets.go) field-for-field, same order, same widths. A
-//      mismatch between this struct and its Go counterpart writes garbage
-//      offsets into the map, which produces a plausible-looking stack of
-//      wrong frames rather than a loud failure -- the exact failure this
-//      whole design exists to prevent. If a field is added on one side, it
-//      must be added on the other side in the same position.
+//      this process's CPython minor version -- carries the SAME SET of
+//      fields as pyunwind.Offsets (pyunwind/offsets.go), at the SAME
+//      WIDTHS, mapped by NAME, not by position. The declaration order
+//      below is deliberately NOT pyunwind.Offsets's order: fields are
+//      regrouped by width (u32 block, then u16 block, then u8 block) so
+//      the struct packs to 44 bytes with zero implicit padding -- see the
+//      _Static_assert below. Do not "restore" positional order to match
+//      the Go side; that would reintroduce padding and trip the assert.
+//      A mismatch in the SET or a WIDTH between this struct and its Go
+//      counterpart writes garbage offsets into the map, which produces a
+//      plausible-looking stack of wrong frames rather than a loud failure
+//      -- the exact failure this whole design exists to prevent. If a
+//      field is added on one side, add the same-named, same-width field
+//      on the other side (position is free; grouped by width here).
 //
 // frame_owner_max and frame_owner_cstack are carried, not interpreted,
 // here: the _frameowner enum is renumbered in 3.14 (it inserts
@@ -116,6 +123,12 @@ struct {
 // pi. Returns 0 (NULL) on any failure to read or on an out-of-range key --
 // never a garbage pointer.
 static __always_inline __u64 py_tss_get(__u32 key, struct py_proc_info *pi) {
+    // pi is normally a bpf_map_lookup_elem result; the verifier requires
+    // that be checked before any dereference (pthread_size, ->
+    // pthread_specific1stblock, etc. below all go through it), so this
+    // helper checks it itself rather than trusting every future caller to.
+    if (!pi) return 0;
+
     // Only the first TSD block is supported. glibc's specific_1stblock holds
     // 32 keys and CPython's autoTSSkey is in practice 0; a key past the block
     // would need the second-level array walk. Counted, not guessed at.

@@ -32,23 +32,99 @@ build: blazesym-check $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
 .PHONY: generate
 generate:
 	go generate ./...
+	@$(MAKE) --no-print-directory generate-guard
 
 # The committed bpf2go outputs. Scoped deliberately: the check must fire on a
 # stale generated object and stay silent on whatever else is dirty in a
 # contributor's tree, or it becomes the kind of check people learn to ignore.
 GENERATED_GLOBS := '*_bpfel.go' '*_bpfel.o'
 
+# generate-guard: a local regeneration must never SILENTLY replace a committed
+# object. Issue #117.
+#
+# The committed .o files are the ones CI produced, not the ones this machine
+# produces. Measured on 2026-08-30 against CI's own regenerated-objects
+# artifact: this toolchain and the GitHub runner emit BTF types in a different
+# ORDER for 5 of the 12 objects (offcpu_{x86,arm64}, perf_{x86,arm64},
+# perf_dwarf_x86). The delta is `.BTF`-only, identical in size, with identical
+# section tables, symbol tables and relocations — for perf_dwarf_x86 it was
+# proven to be exactly a relabelling of two type IDs (forward declarations of
+# `cfs_rq` and `rq` swapping slots, with both references updated), such that
+# applying the permutation to our object reproduces CI's byte for byte. The
+# programs are identical; only the numbering differs. Both sides run clang
+# 18.1.3 with byte-identical libbpf 1.3.0 headers, and the cause is still
+# unknown — see #117.
+#
+# The consequence is what matters here: a local regen CANNOT produce a
+# committable object set, even when your source change is perfectly correct.
+# So this guard fails loudly rather than leaving a diff for a human to notice.
+#
+# There used to be a documented habit of reverting the unwanted files by hand
+# to keep a commit scoped. That is deliberately gone. It matched CI by luck on
+# four files, it hid this divergence for four review rounds, and it only works
+# if you remember — which is the definition of the failure mode it caused. Use
+# `make adopt-ci-objects` instead.
+.PHONY: generate-guard
+generate-guard:
+	@changed=$$(git diff HEAD --name-only -- $(GENERATED_GLOBS)); \
+	if [ -n "$$changed" ]; then \
+		echo "*** local regeneration produced different bytes than the committed objects."; \
+		echo "***"; \
+		git diff HEAD --name-only -- $(GENERATED_GLOBS) | while read -r f; do \
+			printf '***   %s committed=%s regenerated=%s\n' "$$f" \
+				"$$(git show HEAD:"$$f" | wc -c)" "$$(wc -c < "$$f")"; \
+		done; \
+		echo "***"; \
+		echo "*** The committed objects are CI's, not this machine's (issue #117), so a"; \
+		echo "*** local regen cannot produce a committable object set even when your"; \
+		echo "*** source change is correct. Do NOT commit these bytes and do NOT revert"; \
+		echo "*** them by hand — hand-reverting is what hid this for four rounds."; \
+		echo "***"; \
+		echo "*** Instead:"; \
+		echo "***   1. commit your bpf/*.c / bpf/*.h source change on its own"; \
+		echo "***   2. push; CI regenerates and uploads regenerated-objects-<arch>"; \
+		echo "***   3. make adopt-ci-objects RUN=<github-run-id>"; \
+		echo "***   4. commit the objects CI produced"; \
+		echo "***"; \
+		echo "*** clang here: $$(clang --version 2>/dev/null | head -1)"; \
+		echo "***"; \
+		echo "*** To discard what this machine just produced:"; \
+		echo "***   git checkout HEAD -- $(GENERATED_GLOBS)"; \
+		echo "*** Deliberately NOT done for you: an automatic revert is the same"; \
+		echo "*** silent hand-revert in a different costume, and it would destroy a"; \
+		echo "*** set of objects you may have just adopted from CI."; \
+		exit 1; \
+	fi
+
+# adopt-ci-objects: replace the committed generated files with the ones CI
+# produced, from the artifact the Build job uploads on failure. Issue #117.
+#
+# This exists so the correct path is a command rather than a chore. A chore is
+# what decays into a hand-revert.
+.PHONY: adopt-ci-objects
+adopt-ci-objects:
+	@test -n "$(RUN)" || { echo "usage: make adopt-ci-objects RUN=<github-run-id>"; exit 1; }
+	@tmp=$$(mktemp -d); \
+	if ! gh run download $(RUN) -n regenerated-objects-amd64 -D "$$tmp"; then \
+		echo "*** could not download regenerated-objects-amd64 from run $(RUN)"; \
+		echo "*** the artifact is uploaded by the Build job's if: failure() step"; \
+		rm -rf "$$tmp"; exit 1; \
+	fi; \
+	n=0; \
+	for f in $$(git ls-files $(GENERATED_GLOBS)); do \
+		if [ -f "$$tmp/$$f" ] && ! cmp -s "$$tmp/$$f" "$$f"; then \
+			cp "$$tmp/$$f" "$$f"; echo "  adopted $$f"; n=$$((n+1)); \
+		fi; \
+	done; \
+	rm -rf "$$tmp"; \
+	echo "*** adopted $$n object(s) from run $(RUN); review with git diff --stat before committing"
+
 # Regeneration must not change the committed objects. Issue #87.
 #
-# The .o files are committed build artifacts, so their bytes depend on the
-# exact clang/LLVM that produced them. Running `make generate` on a different
-# toolchain rewrites packages you did not touch, and the only ways out are to
-# commit the noise or revert it by hand — which only works if you notice.
-#
-# This is the same check CI runs. A failure names the files and prints their
-# sizes: same size with differing bytes is usually BTF type-ordering rather
-# than a real code change, which is the distinction that decides whether the
-# diff is worth committing or the toolchain is worth pinning.
+# This is the same check CI runs, kept here so it can be run locally. A failure
+# names the files and prints their sizes: same size with differing bytes is
+# BTF type-ordering rather than a real code change, which is the distinction
+# that decides whether the diff is a genuine regeneration or issue #117.
 .PHONY: generate-check
 generate-check: generate
 	@if git diff --quiet -- $(GENERATED_GLOBS); then \

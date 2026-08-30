@@ -60,11 +60,28 @@ var ErrTLSBaseUnavailable = errors.New("pyunwind: FrameReader cannot report the 
 // with \b so an unrelated "t" elsewhere in the path cannot trigger it.
 var freeThreadedSonameRe = regexp.MustCompile(`(?:libpython|python)\d+\.\d+t\b`)
 
-// Result reports what Attach decided for a process. Refused is empty on
-// success and carries an operator-readable reason otherwise.
+// Result reports what Attach decided for a process.
 type Result struct {
 	Version Version
+	// Refused is empty on success and carries an operator-readable reason
+	// otherwise -- for logs and humans.
 	Refused string
+	// Reason is nil on success and, otherwise, one of this package's nine
+	// sentinel errors (possibly wrapped with extra context via %w):
+	// ErrNotAnInterpreter, ErrFreeThreaded, ErrUnsupportedVersion,
+	// ErrUnsupportedArch, ErrTLSBaseUnavailable, ErrTSSPatternUnrecognised,
+	// ErrSymbolNotFound, ErrOffsetsUnreadable, ErrOffsetsImplausible.
+	// Callers -- Task 7's counters in particular -- must use errors.Is
+	// against Reason, not strings.Contains/parsing against Refused: Refused
+	// is prose for a human, Reason is the machine-checkable classification.
+	Reason error
+}
+
+// refuseWith builds a Result from a single error so Refused and Reason can
+// never drift apart: Refused is err's message, Reason is err itself (still
+// unwrappable via errors.Is/errors.As to whichever sentinel it wraps).
+func refuseWith(v Version, err error) Result {
+	return Result{Version: v, Refused: err.Error(), Reason: err}
 }
 
 // classify decides from a mapped path alone, before any target memory is
@@ -78,33 +95,50 @@ type Result struct {
 func classify(path string) Result {
 	v, ok := DetectFromSoname(path)
 	if !ok {
-		return Result{Refused: fmt.Sprintf("%s: no CPython version in the mapped path %q", ErrNotAnInterpreter, path)}
+		return refuseWith(v, fmt.Errorf("%w: no CPython version in the mapped path %q", ErrNotAnInterpreter, path))
 	}
 	if freeThreadedSonameRe.MatchString(path) {
-		return Result{Version: v, Refused: fmt.Sprintf(
-			"%s: %q is a free-threaded build; this build's offsets assume the GIL build and are wrong for it", ErrFreeThreaded, path)}
+		return refuseWith(v, fmt.Errorf(
+			"%w: %q is a free-threaded build; this build's offsets assume the GIL build and are wrong for it", ErrFreeThreaded, path))
 	}
 	if !v.Supported() {
-		return Result{Version: v, Refused: fmt.Sprintf(
-			"%s: CPython %s; this build walks 3.12 through 3.14 only", ErrUnsupportedVersion, v)}
+		return refuseWith(v, fmt.Errorf(
+			"%w: CPython %s; this build walks 3.12 through 3.14 only", ErrUnsupportedVersion, v))
 	}
 	return Result{Version: v}
 }
 
-// pyProcInfo mirrors bpf/python_walk.h's struct py_proc_info field-for-field:
-// the same set of fields, at the same widths, matched by NAME rather than
-// position -- see that header's struct comment for why a drift here is
-// silent and dangerous rather than a compile error. Field names follow
-// bpf2go's plain per-underscore-segment title-casing of the C name (e.g.
-// CodeArgcount, ThreadstateFrame, FrameOwnerCstack) rather than
-// pyunwind.Offsets's camelCase (CodeArgCount, ThreadStateFrame,
-// FrameOwnerCStack), so this type reads as a transliteration of the C
-// struct and not as a rename of Offsets -- 6 of its 13 shared fields
-// differ in capitalisation between the two, and a mechanical name mapping
-// between them would silently mismatch on exactly those six.
+// pyProcInfo mirrors bpf/python_walk.h's struct py_proc_info. Two DIFFERENT
+// mappings are in play here and they have opposite rules:
 //
-// TestPyProcInfoSizeMirrorsC pins unsafe.Sizeof(pyProcInfo{}) against the
-// C side's _Static_assert; keep both edits in the same commit.
+//  1. Offsets (pyunwind/offsets.go) <-> pyProcInfo, in prepareInfo below,
+//     is genuinely by NAME: it is one Go struct literal assigning named
+//     fields to named fields, so the two types' field ORDER is free to
+//     differ (and does: pyProcInfo is regrouped by width, Offsets is not).
+//     Field names follow bpf2go's plain per-underscore-segment
+//     title-casing of the C name (e.g. CodeArgcount, ThreadstateFrame,
+//     FrameOwnerCstack) rather than Offsets's camelCase (CodeArgCount,
+//     ThreadStateFrame, FrameOwnerCStack) -- 6 of 13 shared fields differ
+//     in capitalisation, and a mechanical name-based mapping between the
+//     two types would silently mismatch on exactly those six, which is
+//     why prepareInfo assigns every field explicitly instead.
+//
+//  2. pyProcInfo <-> struct py_proc_info, on the wire, is the OPPOSITE:
+//     cilium/ebpf marshals a map value as this struct's raw backing
+//     memory (sysenc.Marshal -> unsafeBackingMemory), so THIS struct's Go
+//     DECLARATION ORDER *is* the byte layout the kernel reads. Reordering
+//     two same-width fields here keeps unsafe.Sizeof() at 56 and keeps
+//     the C side's _Static_assert happy -- neither notices -- while
+//     silently swapping two byte offsets in the map. Do not reorder these
+//     fields for readability or to match Offsets. Order must instead
+//     match python_walk.h's declared order (name is checked too, but
+//     order is what actually matters here).
+//
+// TestPyProcInfoSizeMirrorsC pins the size; TestPyProcInfoFieldOrderMatchesGenerated
+// pins the order and names against the real bpf2go-generated struct, since
+// a size check alone cannot see a reorder. Keep all three edits (this
+// struct, the C struct, and updating the two tests if a field count
+// changes) in the same commit.
 type pyProcInfo struct {
 	// CPython 3.13+ sentinel. Own block ahead of the u32 block: it needs
 	// 8-byte alignment, so putting it first (widest field, front-loaded)
@@ -208,9 +242,9 @@ func glibcTSDOffsets(goarch string) (tsdOffsets, error) {
 
 // pyTSSKeysPerBlock mirrors PY_TSS_KEYS_PER_BLOCK in bpf/python_walk.h.
 // Only the first TSD block is supported, on both sides, for the same
-// reason: CPython's autoTSSkey is in practice 0, and a key past the first
-// block would need the second-level array walk that neither this host-side
-// replica nor py_tss_get implements.
+// reason: CPython's autoTSSkey is in practice 0 or a small integer, and a
+// key past the first block would need the second-level array walk that
+// neither this host-side replica nor py_tss_get implements.
 const pyTSSKeysPerBlock = 32
 
 // hostTSSGet is a host-side replica of bpf/python_walk.h's py_tss_get: it
@@ -338,9 +372,10 @@ func (s *symbolResolver) addr(name string) (uint64, error) {
 
 // Attach discovers a process's interpreter, validates the offsets against
 // it, and installs py_procs. Every failure path returns a named
-// Result.Refused; only a failure Attach itself cannot recover from -- the
-// final map write -- returns a non-nil error. Neither path ever leaves a
-// half-installed, walkable entry: see the Enabled comment on prepareInfo.
+// Result.Refused/Reason; only a failure Attach itself cannot recover
+// from -- the final map write -- returns a non-nil error. Neither path
+// ever leaves a half-installed, walkable entry: see the Enabled comment on
+// prepareInfo.
 //
 // The discovery/validation work is factored into prepareInfo so it can be
 // unit-tested up to (but not through) the real kernel map write, which
@@ -378,81 +413,83 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 
 	off, err := TableFor(res.Version)
 	if err != nil {
-		res.Refused = err.Error()
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, err)
 	}
 
 	tsd, err := glibcTSDOffsets(runtime.GOARCH)
 	if err != nil {
-		res.Refused = err.Error()
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, err)
 	}
 
 	tlsReader, ok := r.(TLSBaseReader)
 	if !ok {
-		res.Refused = ErrTLSBaseUnavailable.Error()
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, ErrTLSBaseUnavailable)
 	}
 
 	keyOff, err := ParseAutoTSSKeyOffset(code)
 	if err != nil {
-		res.Refused = fmt.Sprintf("cannot locate autoTSSkey: %v", err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate autoTSSkey: %w", err))
 	}
 
 	resolver, err := newSymbolResolver(procmap.NewResolver(), pid, libPath)
 	if err != nil {
-		res.Refused = fmt.Sprintf("cannot resolve symbols in %s: %v", libPath, err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot resolve symbols in %s: %w", libPath, err))
 	}
 
 	pyRuntimeAddr, err := resolver.addr("_PyRuntime")
 	if err != nil {
-		res.Refused = fmt.Sprintf("cannot locate _PyRuntime: %v", err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate _PyRuntime: %w", err))
 	}
 
 	var noneAddr uint64
 	if res.Version.Minor >= 13 {
 		noneAddr, err = resolver.addr("_Py_NoneStruct")
 		if err != nil {
-			res.Refused = fmt.Sprintf("cannot locate _Py_NoneStruct: %v", err)
-			return pyProcInfo{}, res
+			return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate _Py_NoneStruct: %w", err))
 		}
 	}
 
+	// _PyRuntime.autoTSSkey is a Py_tss_t: `{ int _is_initialized;
+	// pthread_key_t _key; }`. ParseAutoTSSKeyOffset's doc explains why
+	// keyOff is the offset of that STRUCT, not of _key directly: the
+	// parser requires the cmpl's and lea's offsets to agree, and both
+	// instructions address the struct base (cmpl tests _is_initialized at
+	// +0; lea computes &_key at +0 to pass to PyThread_tss_get, which
+	// itself is `pthread_key_t *`-typed and reads _key). On a
+	// little-endian target the raw 8-byte read below therefore packs
+	// _is_initialized into the LOW 32 bits and _key into the HIGH 32
+	// bits: reading uint32(rawKey) yields the init flag, not the key. A
+	// live measurement caught this: on this reviewer's process,
+	// autoTSSkey read as 0x0000000100000001 (is_initialized=1, key=1) --
+	// key and flag coincidentally equal 1, which is exactly why a
+	// same-value bug like this survives on one host and corrupts frames
+	// on any host where CPython's key is 0, 2, 3, ...
 	rawKey, err := r.ReadU64(pyRuntimeAddr + uint64(keyOff))
 	if err != nil {
-		res.Refused = fmt.Sprintf("%s: read autoTSSkey value: %v", ErrOffsetsUnreadable, err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: read autoTSSkey value: %v", ErrOffsetsUnreadable, err))
 	}
-	tssKey := uint32(rawKey)
+	tssKey := uint32(rawKey >> 32)
 
 	tlsBase, err := tlsReader.TLSBase()
 	if err != nil {
-		res.Refused = fmt.Sprintf("%s: read target TLS base: %v", ErrOffsetsUnreadable, err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: read target TLS base: %v", ErrOffsetsUnreadable, err))
 	}
 
 	tstate, err := hostTSSGet(r, tlsBase, tsd, tssKey)
 	if err != nil {
-		res.Refused = fmt.Sprintf("%s: current thread's PyThreadState via TSS key: %v", ErrOffsetsUnreadable, err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: current thread's PyThreadState via TSS key: %v", ErrOffsetsUnreadable, err))
 	}
 	if tstate == 0 {
-		res.Refused = fmt.Sprintf("%s: TSS key %d holds no PyThreadState for the current thread", ErrOffsetsUnreadable, tssKey)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: TSS key %d holds no PyThreadState for the current thread", ErrOffsetsUnreadable, tssKey))
 	}
 
 	frame, err := resolveCurrentFrame(r, off, tstate)
 	if err != nil {
-		res.Refused = fmt.Sprintf("%s: %v", ErrOffsetsUnreadable, err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("%w: %v", ErrOffsetsUnreadable, err))
 	}
 
 	if err := off.Validate(r, frame); err != nil {
-		res.Refused = fmt.Sprintf("offset validation failed: %v", err)
-		return pyProcInfo{}, res
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("offset validation failed: %w", err))
 	}
 
 	info := pyProcInfo{

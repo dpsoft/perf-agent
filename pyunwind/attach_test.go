@@ -4,8 +4,14 @@ package pyunwind
 import (
 	"debug/elf"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"unsafe"
@@ -18,17 +24,21 @@ import (
 // A refusal must name its reason. An operator whose Python frames are
 // missing needs to distinguish "we found 3.11 and declined" from "we could
 // not read the interpreter" from "this is not a Python process" from "this
-// is a free-threaded build we don't support".
+// is a free-threaded build we don't support". Refused (a string, for
+// humans) and Reason (an error, for errors.Is -- see the sentinels this
+// package exports) must both name it: a caller like Task 7's counters
+// cannot bucket refusals by parsing English out of Refused.
 func TestAttachRefusalsAreNamed(t *testing.T) {
 	cases := []struct {
-		name   string
-		path   string
-		expect string
+		name       string
+		path       string
+		expect     string
+		wantReason error
 	}{
-		{"unsupported version", "/usr/lib/libpython3.11.so.1.0", "unsupported"},
-		{"not python", "/usr/bin/nginx", "not an interpreter"},
-		{"free-threaded 3.13", "/usr/lib/libpython3.13t.so.1.0", "free-threaded"},
-		{"free-threaded 3.14", "/usr/lib/x86_64-linux-gnu/libpython3.14t.so.1.0", "free-threaded"},
+		{"unsupported version", "/usr/lib/libpython3.11.so.1.0", "unsupported", ErrUnsupportedVersion},
+		{"not python", "/usr/bin/nginx", "not an interpreter", ErrNotAnInterpreter},
+		{"free-threaded 3.13", "/usr/lib/libpython3.13t.so.1.0", "free-threaded", ErrFreeThreaded},
+		{"free-threaded 3.14", "/usr/lib/x86_64-linux-gnu/libpython3.14t.so.1.0", "free-threaded", ErrFreeThreaded},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -36,8 +46,40 @@ func TestAttachRefusalsAreNamed(t *testing.T) {
 			if !strings.Contains(res.Refused, tc.expect) {
 				t.Fatalf("reason %q does not mention %q", res.Refused, tc.expect)
 			}
+			if !errors.Is(res.Reason, tc.wantReason) {
+				t.Fatalf("Reason = %v, want errors.Is(..., %v)", res.Reason, tc.wantReason)
+			}
 		})
 	}
+}
+
+// TestPrepareInfoReasonsAreErrorsIsable extends the same guarantee to
+// prepareInfo's own refusal points, not just classify's: every one of them
+// must set Reason to something errors.Is-able against one of this
+// package's sentinels, not just a Refused string a human can read.
+func TestPrepareInfoReasonsAreErrorsIsable(t *testing.T) {
+	t.Run("no TLSBaseReader", func(t *testing.T) {
+		_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
+		if !errors.Is(res.Reason, ErrTLSBaseUnavailable) {
+			t.Fatalf("Reason = %v, want errors.Is(..., ErrTLSBaseUnavailable)", res.Reason)
+		}
+	})
+	t.Run("unrecognised TSS code", func(t *testing.T) {
+		garbage := []byte{0xf3, 0x0f, 0x1e, 0xfa, 0xc3}
+		_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", garbage, fakeAttachReader{})
+		if !errors.Is(res.Reason, ErrTSSPatternUnrecognised) {
+			t.Fatalf("Reason = %v, want errors.Is(..., ErrTSSPatternUnrecognised)", res.Reason)
+		}
+	})
+	t.Run("pid does not map library", func(t *testing.T) {
+		path := findSystemLibpython(t)
+		unmapped := "/nonexistent-for-pyunwind-tests/" + filepath.Base(path)
+		code := readGilstateCode(t, gilstateFixtures[0])
+		_, res := prepareInfo(uint32(os.Getpid()), unmapped, code, fakeAttachReader{})
+		if !errors.Is(res.Reason, ErrSymbolNotFound) {
+			t.Fatalf("Reason = %v, want errors.Is(..., ErrSymbolNotFound)", res.Reason)
+		}
+	})
 }
 
 // A supported, non-free-threaded soname must classify cleanly with no
@@ -473,7 +515,16 @@ func TestPrepareInfoInstallsAFullyValidatedRecord(t *testing.T) {
 	pyRuntimeAddr := mmapAddr + pyRuntimeVal
 	noneAddr := mmapAddr + noneVal
 
-	const tssKey = 0
+	// tssKey is deliberately NOT 0 or 1: 1 would be indistinguishable from
+	// Py_tss_t._is_initialized if the low/high-half read were still wrong
+	// (the bug a live measurement caught -- see prepareInfo's comment at
+	// the autoTSSkey read), and 0 is Py_tss_NEEDS_INIT's key value, which a
+	// real interpreter never has once initialised. rawKeyWord encodes the
+	// real on-the-wire Py_tss_t{_is_initialized: 1, _key: tssKey} as a
+	// little-endian u64: _is_initialized in the low 32 bits, _key in the
+	// high 32 bits.
+	const tssKey = 7
+	const rawKeyWord = uint64(tssKey)<<32 | 1
 	const tlsBase = 0x7f0000000000
 	tsd, err := glibcTSDOffsets("amd64")
 	if err != nil {
@@ -489,7 +540,7 @@ func TestPrepareInfoInstallsAFullyValidatedRecord(t *testing.T) {
 	const frame = 0x7f0000200000
 
 	u64 := map[uint64]uint64{
-		pyRuntimeAddr + fx.keyOff:             tssKey,
+		pyRuntimeAddr + fx.keyOff:             rawKeyWord,
 		slot:                                  tstate,
 		tstate + uint64(off.ThreadStateFrame): frame,
 		frame + uint64(off.FramePrevious):     0,
@@ -512,6 +563,9 @@ func TestPrepareInfoInstallsAFullyValidatedRecord(t *testing.T) {
 	info, res := prepareInfo(uint32(os.Getpid()), path, code, r)
 	if res.Refused != "" {
 		t.Fatalf("unexpected refusal: %s", res.Refused)
+	}
+	if res.Reason != nil {
+		t.Fatalf("Reason must be nil on success, got %v", res.Reason)
 	}
 	if res.Version.Minor != fx.minor {
 		t.Fatalf("classified minor = %d, want %d", res.Version.Minor, fx.minor)
@@ -580,10 +634,11 @@ func TestPrepareInfoRefusesOnValidationFailure(t *testing.T) {
 	}
 	pyRuntimeAddr := mmapAddr + pyRuntimeVal
 
-	const tssKey = 0
+	const tssKey = 7
+	const rawKeyWord = uint64(tssKey)<<32 | 1
 	const tlsBase = 0x7f0000000000
 	tsd, _ := glibcTSDOffsets("amd64")
-	slot := tlsBase + uint64(tsd.Specific1stBlock) + uint64(tsd.KeyDataOff)
+	slot := tlsBase + uint64(tsd.Specific1stBlock) + uint64(tssKey)*uint64(tsd.KeyDataSize) + uint64(tsd.KeyDataOff)
 
 	off, err := TableFor(Version{3, fx.minor, 0})
 	if err != nil {
@@ -594,7 +649,7 @@ func TestPrepareInfoRefusesOnValidationFailure(t *testing.T) {
 	const frame = 0x7f0000200000
 
 	u64 := map[uint64]uint64{
-		pyRuntimeAddr + fx.keyOff:         tssKey,
+		pyRuntimeAddr + fx.keyOff:         rawKeyWord,
 		slot:                              tstate,
 		frame + uint64(off.FramePrevious): 0,
 	}
@@ -617,5 +672,167 @@ func TestPrepareInfoRefusesOnValidationFailure(t *testing.T) {
 	_, res := prepareInfo(uint32(os.Getpid()), path, code, r)
 	if !strings.Contains(res.Refused, "offset validation failed") {
 		t.Fatalf("expected an offset-validation refusal, got %q", res.Refused)
+	}
+	if !errors.Is(res.Reason, ErrOffsetsImplausible) {
+		t.Fatalf("Reason = %v, want errors.Is(..., ErrOffsetsImplausible)", res.Reason)
+	}
+}
+
+// --- pyProcInfo wire-order check ---------------------------------------
+
+// fieldSpec is one field of a parsed Go struct: its name and its width in
+// bytes on the wire.
+type fieldSpec struct {
+	name string
+	size int
+}
+
+// arrayTypeRe matches a fixed-size array type expression like "[5]uint8".
+var arrayTypeRe = regexp.MustCompile(`^\[(\d+)\](\w+)$`)
+
+// primitiveSize returns the byte width of a Go primitive integer type or a
+// fixed-size array of one, or (0, false) for anything else (notably
+// structs.HostLayout, bpf2go's zero-size compile-time layout marker).
+func primitiveSize(typeStr string) (int, bool) {
+	switch typeStr {
+	case "uint8", "int8":
+		return 1, true
+	case "uint16", "int16":
+		return 2, true
+	case "uint32", "int32":
+		return 4, true
+	case "uint64", "int64":
+		return 8, true
+	}
+	if m := arrayTypeRe.FindStringSubmatch(typeStr); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return 0, false
+		}
+		elemSize, ok := primitiveSize(m[2])
+		if !ok {
+			return 0, false
+		}
+		return n * elemSize, true
+	}
+	return 0, false
+}
+
+// exprString renders the small subset of Go type expressions this parser
+// needs back into source text: bare identifiers (uint64), fixed-size
+// arrays ([5]uint8), and qualified identifiers (structs.HostLayout).
+func exprString(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.ArrayType:
+		n := ""
+		if lit, ok := t.Len.(*ast.BasicLit); ok {
+			n = lit.Value
+		}
+		return "[" + n + "]" + exprString(t.Elt)
+	case *ast.SelectorExpr:
+		return exprString(t.X) + "." + t.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// generatedStructFields parses typeName out of the Go source file at path
+// and returns its fields (name, byte width) in DECLARED order -- the order
+// that actually matters, since cilium/ebpf marshals a map value as this
+// struct's raw backing memory. Zero-width fields (structs.HostLayout, the
+// bpf2go compile-time layout-lock marker) are dropped since they occupy no
+// bytes and were never candidates for the reorder bug this test exists to
+// catch.
+//
+// This reads the CURRENT, checked-in bpf2go output from disk -- not a
+// hand-copied snapshot of it -- so a future regen that reorders
+// python_walk.h's fields (accidentally or not) changes what this function
+// returns and fails the comparison in TestPyProcInfoFieldOrderMatchesGenerated,
+// the same day it happens.
+func generatedStructFields(t *testing.T, path, typeName string) []fieldSpec {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var out []fieldSpec
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != typeName {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		found = true
+		for _, field := range st.Fields.List {
+			size, known := primitiveSize(exprString(field.Type))
+			if !known {
+				continue // e.g. the structs.HostLayout marker: zero bytes, not a real field
+			}
+			names := field.Names
+			if len(names) == 0 {
+				names = []*ast.Ident{{Name: "_"}}
+			}
+			for _, id := range names {
+				out = append(out, fieldSpec{name: id.Name, size: size})
+			}
+		}
+		return false
+	})
+	if !found {
+		t.Fatalf("%s: type %s not found", path, typeName)
+	}
+	return out
+}
+
+// TestPyProcInfoFieldOrderMatchesGenerated is the order-aware check
+// TestPyProcInfoSizeMirrorsC cannot be: cilium/ebpf marshals pyProcInfo as
+// raw backing memory in Go DECLARATION order (sysenc.Marshal ->
+// unsafeBackingMemory), so swapping two same-width fields keeps
+// unsafe.Sizeof() at 56 and keeps bpf/python_walk.h's _Static_assert
+// happy while silently swapping two byte offsets in the map. This compares
+// pyProcInfo's actual reflect-derived (name, offset) sequence against the
+// real, currently-checked-in bpf2go-generated gpuusdtPyProcInfo -- name and
+// offset, in order -- not against a hand-maintained expectation that could
+// itself drift out of sync with a real regen.
+func TestPyProcInfoFieldOrderMatchesGenerated(t *testing.T) {
+	genPath := filepath.Join("..", "gpuprobe", "gpuusdt_x86_bpfel.go")
+	if _, err := os.Stat(genPath); err != nil {
+		t.Skipf("generated file not found: %v", err)
+	}
+	want := generatedStructFields(t, genPath, "gpuusdtPyProcInfo")
+
+	rt := reflect.TypeOf(pyProcInfo{})
+	if rt.NumField() != len(want) {
+		t.Fatalf("pyProcInfo has %d fields, %s has %d:\npyProcInfo: %+v\ngenerated:  %+v",
+			rt.NumField(), genPath, len(want), rt, want)
+	}
+
+	offset := uintptr(0)
+	for i, w := range want {
+		got := rt.Field(i)
+		if got.Offset != offset {
+			t.Fatalf("field %d (%s): pyProcInfo offset %d, want %d (from %s's declared order) -- "+
+				"a field has been reordered relative to the generated struct",
+				i, got.Name, got.Offset, offset, genPath)
+		}
+		// bpf2go names its zero-value-name padding field "Pad"; the Go
+		// struct literal in pyProcInfo spells the same slot as the blank
+		// identifier "_". Both are "no real name, just padding" -- compare
+		// names everywhere else, but not there.
+		if got.Name != "_" && w.name != "_" && got.Name != w.name {
+			t.Fatalf("field %d: pyProcInfo name %q, generated struct name %q -- order or naming has drifted",
+				i, got.Name, w.name)
+		}
+		offset += uintptr(w.size)
+	}
+	if offset != pyProcInfoSize {
+		t.Fatalf("%s's fields sum to %d bytes, pyProcInfo is %d", genPath, offset, pyProcInfoSize)
 	}
 }

@@ -14,10 +14,14 @@ this project already has the GPU half of.
 
 ## Non-goals
 
-- **Any CPython below 3.11.** Nothing older is detected, walked or guessed at.
+- **Any CPython below 3.12.** Nothing older is detected, walked or guessed at.
   3.11 introduced `_PyInterpreterFrame` and the `owner` field this design
-  depends on; the pre-3.11 `PyFrameObject` chain is a different traversal, not
-  different offsets, and supporting it is a separate decision.
+  depends on, so it is structurally in range — but it is excluded because it is
+  the odd one out for thread-state discovery (measured below): it has no
+  `_PyThreadState_GetCurrent` at all, and its `PyGILState_GetThisThreadState`
+  passes the TSS key *value* to `pthread_getspecific@plt` rather than a pointer
+  to `PyThread_tss_get`. Supporting 3.11 means a second parser for a second
+  instruction shape; 3.12+ needs exactly one.
 - **Profiling an interpreter we have no offset table for.** Refuse and count.
 - **PyPy, MicroPython, or CPython embedded in a differently-named binary.**
 - **Removing `CAP_SYS_PTRACE` from the symbolization path.** See "Capabilities",
@@ -116,18 +120,47 @@ runtime-global thread list yields *a* thread, not the one that was sampled.
 
 Both reference implementations instead read the current thread's
 `PyThreadState` out of thread-local storage, and both end up at pthread TSD.
-They differ only in how the offsets are found:
+They differ in how the offsets are found, and **a spike settled which mechanism
+we use**.
 
-- **OTel** disassembles `_PyThreadState_GetCurrent` (3.13+) or
-  `PyGILState_GetThisThreadState` (≤3.12) to recover a TLS/TSD offset.
-- **Pyroscope** reads the TSS *key* from `_PyRuntime` at attach and reimplements
-  `pthread_getspecific` in BPF against hardcoded glibc/musl struct offsets
-  (`bpf/pthread_amd64.h:21`), reading the TLS base from
-  `task_struct.thread.fsbase`.
+- **OTel** disassembles `_PyThreadState_GetCurrent` to recover a TLS offset.
+- **Pyroscope** recovers the TSS *key* and reimplements `pthread_getspecific` in
+  BPF against glibc/musl struct offsets (`bpf/pthread_amd64.h:21`), reading the
+  TLS base from `task_struct.thread.fsbase`.
 
-This is the largest implementation risk in the design and the reason for the
-staging below. Our chosen range needs both halves: 3.11–3.12 and 3.13–3.14 do
-not share a mechanism.
+**We take Pyroscope's, on measured evidence.** Disassembling four real builds:
+
+| build | `_PyThreadState_GetCurrent` | TLS model |
+|---|---|---|
+| 3.11 Debian | absent | — |
+| 3.12 Debian | `call __tls_get_addr@plt` | general dynamic |
+| 3.13 Debian | `call __tls_get_addr@plt` | general dynamic |
+| 3.14 Fedora | `call *(%rax)`; `mov %fs:(%rax)` | TLSDESC |
+
+**No shared-library build in the range carries a static fs-relative TLS offset
+to extract.** The offset is produced by a runtime call on every one of them.
+Distro and container images all ship shared libpython, so this is the common
+case, not the exotic one. (This is not a claim that OTel is broken — they may
+decode the `__tls_get_addr` argument pattern — only that the simple offset
+extraction is not available here.)
+
+The TSS-key route, by contrast, is trivially extractable and **identical in
+shape across the whole supported range**:
+
+```
+3.12:  mov 0x34e1fc(%rip),%rax ; cmpl $0x0,0x608(%rax) ; lea 0x608(%rax),%rdi ; jmp PyThread_tss_get
+3.13:  mov 0x349c12(%rip),%rax ; cmpl $0x0,0x870(%rax) ; lea 0x870(%rax),%rdi ; jmp PyThread_tss_get
+3.14:  mov 0x4714e3(%rip),%rax ; cmpl $0x0,0x920(%rax) ; lea 0x920(%rax),%rdi ; jmp PyThread_tss_get
+```
+
+Same 35-byte function, same eight instructions, same encodings. Only the
+displacement and the `autoTSSkey` offset move. That offset is therefore
+**parsed from the binary, not tabled** — one parser, no per-version entry, and
+it survives distro patching for free.
+
+This remains the design's largest implementation risk, but the spike has moved
+it from "unknown mechanism" to "known mechanism, unknown edge cases" — musl and
+statically linked CPython are both untested.
 
 ### Frame records
 
@@ -186,7 +219,7 @@ Consequences that must be built, not assumed:
 
 ## Offsets and versions
 
-**Hand-maintained tables in Go**, one per 3.11 / 3.12 / 3.13 / 3.14, written
+**Hand-maintained tables in Go**, one per 3.12 / 3.13 / 3.14, written
 into a per-PID BPF hash at attach — the same delivery both references use. The
 `pids` map in `unwind_common.h:224` is already a per-PID hash written from Go at
 attach; its `pid_config` value is three bytes today and grows, or gains a
@@ -206,7 +239,8 @@ Two things adopted from the references:
 **Version detection**: the `libpython3.X` soname, falling back to the
 `Py_Version` hex constant read from the ELF. An interpreter whose version is
 undetected, or detected but untabled, is **refused loudly and counted** — never
-walked with the nearest table. `_Py_DebugOffsets` (3.12+) is a documented
+walked with the nearest table. Note the `autoTSSkey` offset is deliberately NOT
+in these tables: it is parsed per binary (see thread state, above). `_Py_DebugOffsets` (3.12+) is a documented
 alternative source rejected for now to keep one mechanism; if the tables become
 a burden it is the first thing to revisit.
 
@@ -254,8 +288,10 @@ spike against a real interpreter before the plan for that slice is written.
 ## Open risks
 
 - **TLS/TSD extraction is instruction-pattern matching against compiler output**
-  and needs two mechanisms for our four versions. Both references do it; neither
-  makes it look pleasant. Highest risk item.
+  and the spike settled the mechanism (TSS key, one shape for 3.12+) but not its
+  edges: **musl and statically linked CPython are untested**, and the BPF-side
+  `pthread_getspecific` reimplementation depends on glibc struct offsets that
+  Pyroscope carried per-libc-version. Still the highest risk item.
 - **The fingerprint is a hope, not an identity** (above).
 - **`MAX_FRAMES` is 127 and Python frames cost two words.** A deep Python stack
   now consumes the budget twice as fast. Whether 127 stays adequate is a

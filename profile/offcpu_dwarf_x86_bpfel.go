@@ -62,6 +62,12 @@ type offcpu_dwarfPidMapping struct {
 	TableId  uint64
 }
 
+type offcpu_dwarfPyEvalRange struct {
+	_  structs.HostLayout
+	Lo uint64
+	Hi uint64
+}
+
 type offcpu_dwarfPyProcInfo struct {
 	_                        structs.HostLayout
 	NoneAddr                 uint64
@@ -81,10 +87,11 @@ type offcpu_dwarfPyProcInfo struct {
 	CodeFirstlineno          uint16
 	FrameOwnerMax            uint8
 	FrameOwnerCstack         uint8
+	FrameOwnerBoundary       uint8
 	FrameExecutableTagged    uint8
 	ThreadstateFrameIndirect uint8
 	Enabled                  uint8
-	Pad                      [5]uint8
+	Pad                      [4]uint8
 }
 
 type offcpu_dwarfSampleRecord struct {
@@ -167,7 +174,9 @@ type offcpu_dwarfMapSpecs struct {
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
 	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
+	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
 	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
@@ -215,7 +224,9 @@ type offcpu_dwarfMaps struct {
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
+	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
 	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
+	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.Map `ebpf:"stack_events"`
 	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
@@ -233,7 +244,9 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
+		m.PyEvalRanges,
 		m.PyProcs,
+		m.PyWalkCounters,
 		m.StackEvents,
 		m.WalkerScratch,
 	)

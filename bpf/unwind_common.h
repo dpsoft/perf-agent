@@ -249,6 +249,17 @@ struct {
 
 // walk_ctx holds per-sample unwinder state. Lives on the BPF entry
 // function's stack; the pcs array lives in walker_scratch.
+//
+// py_frame/py_state are the CPython chain walk's resume cursor, zero for a
+// process with no interpreter and untouched by every native path. They live
+// here, not in a map, because they are per-SAMPLE state and this struct is
+// the only per-sample thing the walker has: _PyInterpreterFrame.previous
+// links run through the interpreter's C boundary frames, so a native stack
+// that crosses the eval loop twice must RESUME the one chain rather than
+// restart it. See PY_CHAIN_* and py_push_frames in python_walk.h.
+//
+// The three drivers build this on the BPF stack with designated
+// initialisers, so the two added fields cost them nothing but zeroes.
 struct walk_ctx {
     __u64 pc;
     __u64 fp;
@@ -256,6 +267,9 @@ struct walk_ctx {
     __u32 pid;
     __u32 n_pcs;
     struct sample_record *rec;
+    __u64 py_frame;      // next _PyInterpreterFrame to push, 0 if none
+    __u8  py_state;      // PY_CHAIN_UNSTARTED / _ACTIVE / _DONE
+    __u8  _pad[7];
 };
 
 // ----- Lazy CFI: miss emit helper.
@@ -375,11 +389,6 @@ struct {
     __type(key, __u32);
     __type(value, __u32);
 } pid_mapping_lengths SEC(".maps");
-
-// ----- Python frame walking. See python_walk.h: py_proc_info, py_procs and
-// py_tss_get, the pthread-TSD reimplementation that reaches a target
-// thread's PyThreadState. Nothing here calls py_tss_get yet.
-#include "python_walk.h"
 
 // ----- Lookup helpers.
 //
@@ -655,6 +664,18 @@ static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, _
     return 0;
 }
 
+// ----- Python frame walking.
+//
+// Included HERE, below frame_push_python and above walk_step, because
+// py_push_frames consumes both struct walk_ctx (declared far above) and
+// frame_push_python (just above): a C macro or function is not visible
+// before its definition, so the include cannot sit with the other maps the
+// way it used to. python_walk.h supplies py_proc_info/py_procs, the
+// pthread-TSD reimplementation that reaches a target thread's
+// PyThreadState, the eval-loop text ranges walk_step switches on, and the
+// per-CPU counters that make every Python-side refusal visible.
+#include "python_walk.h"
+
 // fp_chain_ended reports whether this walk has already stepped PAST the end
 // of the frame-pointer chain: it left a frame whose saved-FP slot held zero,
 // carried that frame's return address forward, and is now standing on the
@@ -663,9 +684,9 @@ static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, _
 // It reads the reported bit rather than carrying separate state because
 // WALKER_FLAG_FP_TERMINATED is set at exactly one site in walk_step — the
 // saved_fp == 0 arm — and that site is the only one that continues with a
-// zeroed frame pointer. Keeping it out of struct walk_ctx also keeps the
-// struct at 40 bytes, so the three drivers' entry code (which builds one on
-// the stack) is untouched by this change.
+// zeroed frame pointer. Keeping it out of struct walk_ctx also keeps that
+// struct as small as it can be, so the three drivers' entry code (which
+// builds one on the BPF stack) is untouched by this change.
 //
 // Every arm that can be reached with it set stops the walk, so the step past
 // the root is bounded to exactly one.
@@ -685,6 +706,40 @@ static long walk_step(__u32 idx, void *arg) {
     struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
     __u8 mode = MODE_FP_SAFE;
     if (m.found) {
+        // ----- The interpreter arm.
+        //
+        // The switch is a text-range test on the frame we are already
+        // standing on: if this PC is inside the eval loop of a libpython we
+        // know, the native frame just pushed is _PyEval_EvalFrameDefault and
+        // the Python frames it is running live in the interpreter's own
+        // chain, not on this stack. Keyed by table_id, which mapping_for_pc
+        // has already computed, so a non-Python process pays one hash on a
+        // value it holds and nothing else.
+        //
+        // It lives INSIDE walk_step rather than beside it so perf_dwarf,
+        // offcpu_dwarf and gpu_usdt all inherit it from the bpf_loop they
+        // already share -- the CUDA launch probe gets Python frames with no
+        // second integration.
+        //
+        // A Python failure never stops the native walk: py_push_frames
+        // returns void and counts, and control falls through to the
+        // classification below exactly as it did before.
+        struct py_eval_range *er = bpf_map_lookup_elem(&py_eval_ranges, &m.table_id);
+        if (er && m.rel_pc >= er->lo && m.rel_pc < er->hi) {
+            __u32 py_pid = ctx->pid;
+            struct py_proc_info *pi = bpf_map_lookup_elem(&py_procs, &py_pid);
+            if (pi && pi->enabled) {
+                py_push_frames(ctx, pi);
+            } else {
+                // An eval-loop PC in a process userspace never validated (or
+                // refused: wrong version, free-threaded build, unreadable
+                // offsets). Named rather than silent -- this is the counter
+                // that separates "no Python frames because attach refused"
+                // from "no Python frames because the walk failed".
+                py_count(PY_CNT_NO_PROC_INFO);
+            }
+        }
+
         // Lazy mode (Option A2): pid_mappings is populated but
         // cfi_classification may not be. Detect by probing
         // cfi_classification_lengths[table_id]. If missing, the binary

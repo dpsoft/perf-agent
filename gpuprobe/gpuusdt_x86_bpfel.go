@@ -46,6 +46,8 @@ type gpuusdtGpuStack struct {
 	N_pcs       uint32
 	WalkerFlags uint32
 	Pcs         [127]uint64
+	Tags        [127]uint8
+	_           [1]byte
 }
 
 type gpuusdtPidConfig struct {
@@ -61,6 +63,12 @@ type gpuusdtPidMapping struct {
 	VmaEnd   uint64
 	LoadBias uint64
 	TableId  uint64
+}
+
+type gpuusdtPyEvalRange struct {
+	_  structs.HostLayout
+	Lo uint64
+	Hi uint64
 }
 
 type gpuusdtPyProcInfo struct {
@@ -82,10 +90,11 @@ type gpuusdtPyProcInfo struct {
 	CodeFirstlineno          uint16
 	FrameOwnerMax            uint8
 	FrameOwnerCstack         uint8
+	FrameOwnerBoundary       uint8
 	FrameExecutableTagged    uint8
 	ThreadstateFrameIndirect uint8
 	Enabled                  uint8
-	Pad                      [5]uint8
+	Pad                      [4]uint8
 }
 
 type gpuusdtSampleRecord struct {
@@ -170,7 +179,9 @@ type gpuusdtMapSpecs struct {
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
 	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
+	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
@@ -219,7 +230,9 @@ type gpuusdtMaps struct {
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
+	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
 	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
+	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
@@ -241,7 +254,9 @@ func (m *gpuusdtMaps) Close() error {
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
+		m.PyEvalRanges,
 		m.PyProcs,
+		m.PyWalkCounters,
 		m.StackIdSeq,
 		m.StacksMissing,
 		m.WalkErrors,

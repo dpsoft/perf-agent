@@ -210,9 +210,9 @@ struct {
 // mints itself. gpuprobe.Consumer.resolveStackLocked reads the entry and
 // deletes it; nothing else reclaims a slot.
 //
-// One value is 4 + 4 + 127*8 = 1024 bytes, so GPU_STACKS_SIZE entries
-// preallocate 4 MB — the same order as the `events` ringbuf above, and
-// deliberately so: occupancy is proportional to how many captures are in
+// One value is 4 + 4 + 127*8 + 127 (+1 pad) = 1152 bytes, so GPU_STACKS_SIZE
+// entries preallocate 4.5 MB — the same order as the `events` ringbuf above,
+// and deliberately so: occupancy is proportional to how many captures are in
 // flight between the probe and the consumer's drain, not to the length of
 // the run. 4096 is roughly two full ringbufs' worth of sampled launches, so
 // the map cannot fill before the ringbuf does unless the consumer has
@@ -228,10 +228,22 @@ struct gpu_stack {
     // lookup cut the walk short — and re-deriving that later is impossible.
     __u32 walker_flags;
     __u64 pcs[MAX_FRAMES];
+    // One FRAME_TAG_* byte per pcs[] slot, mirroring struct sample_record's
+    // tags[] (bpf/unwind_common.h) and laid out the same way: trailing
+    // pcs[], not interleaved, so pcs[]'s byte offset is unchanged.
+    //
+    // Issue #83: without this, a Python frame — two consecutive slots
+    // holding a code-object address and an encoded instruction word —
+    // arrives here indistinguishable from two native PCs, and the consumer
+    // symbolizes both against the process's mappings. That produces two
+    // plausible, wrong native frames on the ONE path this whole feature
+    // exists to serve, and nothing downstream could tell. The 128 bytes are
+    // the price of that not happening.
+    __u8 tags[MAX_FRAMES];
 };
 
-_Static_assert(sizeof(struct gpu_stack) == 1024,
-               "gpu_stack must stay 1024 bytes; see gpuStackSize in gpuprobe/consumer.go");
+_Static_assert(sizeof(struct gpu_stack) == 1152,
+               "gpu_stack must stay 1152 bytes; see gpuStackSize in gpuprobe/consumer.go");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -508,15 +520,13 @@ static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
     // for a zero terminator, precisely because this scratch is per-CPU and
     // its tail still holds the previous capture's PCs.
     //
-    // TODO(#83, Task 7): this copies pcs[] WITHOUT rec->tags[] — struct
-    // gpu_stack has no tags[] array (_Static_assert below pins it at 1024
-    // bytes, matched against gpuStackSize in gpuprobe/consumer.go). Once
-    // frame_push_python has a caller, any Python frame reaching this path
-    // renders as two bogus native PCs, silently, on the one path this whole
-    // feature exists to serve. Do not widen gpu_stack piecemeal here — it is
-    // its own blast radius (the _Static_assert, gpuStackSize, and every
-    // reader of gpu_stacks) and belongs to Task 7.
+    //
+    // tags[] rides along for the same reason and under the same rule: it is
+    // one byte per pcs[] slot and the consumer reads only the first n_pcs of
+    // them. Without it a Python frame's two slots would reach userspace
+    // looking exactly like two native PCs (issue #83).
     __builtin_memcpy(out->pcs, rec->pcs, sizeof(out->pcs));
+    __builtin_memcpy(out->tags, rec->tags, sizeof(out->tags));
 
     // BPF_NOEXIST, never BPF_ANY. If this id is somehow still live — a
     // per-CPU sequence that wrapped past an entry the consumer never read —

@@ -67,6 +67,12 @@ int main(void) {
         printf("FrameOwnerMax=%d\n", max);
     }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    /* The entry frame's owner, read from the enumerator ceval.c actually
+       assigns to it on THIS version -- FRAME_OWNED_BY_CSTACK here, and
+       FRAME_OWNED_BY_INTERPRETER on 3.14. Printed from the enumerator, not
+       as a literal 3, so a future renumbering shows up as a measurement
+       disagreeing with the table rather than as two 3s agreeing. */
+    printf("FrameOwnerBoundary=%d\n", (int)FRAME_OWNED_BY_CSTACK);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, cframe));
     printf("CFrameCurrentFrame=%zu\n", offsetof(_PyCFrame, current_frame));
     printf("CodeArgCount=%zu\n", offsetof(PyCodeObject, co_argcount));
@@ -99,6 +105,9 @@ int main(void) {
         printf("FrameOwnerMax=%d\n", max);
     }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    /* See probe312: the entry frame's owner, from the enumerator this
+       version assigns to it. */
+    printf("FrameOwnerBoundary=%d\n", (int)FRAME_OWNED_BY_CSTACK);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, current_frame));
     printf("CodeArgCount=%zu\n", offsetof(PyCodeObject, co_argcount));
     printf("CodeKwOnlyArgCount=%zu\n", offsetof(PyCodeObject, co_kwonlyargcount));
@@ -132,6 +141,12 @@ int main(void) {
         printf("FrameOwnerMax=%d\n", max);
     }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    /* 3.14 moved the entry frame onto FRAME_OWNED_BY_INTERPRETER (ceval.c
+       :1162) at the same time as it pushed CSTACK to 4, so the boundary is
+       measured from a DIFFERENT enumerator here than on 3.12/3.13 and still
+       comes out 3. A probe that printed FRAME_OWNED_BY_CSTACK here would
+       measure 4 and fail against the table, which is the point. */
+    printf("FrameOwnerBoundary=%d\n", (int)FRAME_OWNED_BY_INTERPRETER);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, current_frame));
     printf("CodeArgCount=%zu\n", offsetof(PyCodeObject, co_argcount));
     printf("CodeKwOnlyArgCount=%zu\n", offsetof(PyCodeObject, co_kwonlyargcount));
@@ -184,6 +199,7 @@ func TestOffsetsMatchRealInterpreters(t *testing.T) {
 			check("FrameOwner", uint64(want.FrameOwner))
 			check("FrameOwnerMax", uint64(want.FrameOwnerMax))
 			check("FrameOwnerCStack", uint64(want.FrameOwnerCStack))
+			check("FrameOwnerBoundary", uint64(want.FrameOwnerBoundary))
 			check("CodeArgCount", uint64(want.CodeArgCount))
 			check("CodeKwOnlyArgCount", uint64(want.CodeKwOnlyArgCount))
 			check("CodeFlags", uint64(want.CodeFlags))

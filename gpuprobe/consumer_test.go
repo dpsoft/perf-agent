@@ -23,6 +23,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	pp "github.com/dpsoft/perf-agent/pprof"
+	"github.com/dpsoft/perf-agent/pyunwind"
 	"github.com/dpsoft/perf-agent/symbolize"
 )
 
@@ -904,7 +905,7 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 		"a hand-rolled walk cannot populate a kernel BPF_MAP_TYPE_STACK_TRACE")
 	assert.Equal(t, uint32(4), spec.Maps["gpu_stacks"].KeySize, "a u32 handle")
 	assert.Equal(t, uint32(gpuStackSize), spec.Maps["gpu_stacks"].ValueSize,
-		"n_pcs, walker_flags, then MAX_FRAMES u64 PCs")
+		"n_pcs, walker_flags, MAX_FRAMES u64 PCs, then MAX_FRAMES tag bytes (issue #83)")
 	assert.Equal(t, uint32(gpuStackCapacity), spec.Maps["gpu_stacks"].MaxEntries)
 
 	assert.NotContains(t, spec.Maps, "stackmap",
@@ -921,6 +922,24 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 		"pids", "pid_mappings", "cfi_rules", "cfi_classification", "cfi_miss_events"} {
 		assert.Contains(t, spec.Maps, name)
 	}
+
+	// Issue #83: the interpreter arm rides into this program on the shared
+	// walk_step, so its three maps must have come along with the header. The
+	// counters in particular are the only way a Python-side refusal is
+	// visible at all - walker_flags has no bits left.
+	require.Contains(t, spec.Maps, "py_walk_counters")
+	assert.Equal(t, ebpf.PerCPUArray, spec.Maps["py_walk_counters"].Type,
+		"per-CPU so the BPF-side increment needs no atomic")
+	assert.Equal(t, uint32(pyunwind.PyCntMax), spec.Maps["py_walk_counters"].MaxEntries,
+		"one slot per named way the Python walk can succeed or fail")
+	assert.Equal(t, uint32(8), spec.Maps["py_walk_counters"].ValueSize)
+
+	require.Contains(t, spec.Maps, "py_eval_ranges")
+	assert.Equal(t, uint32(8), spec.Maps["py_eval_ranges"].KeySize, "keyed by table_id, not pid")
+	assert.Equal(t, uint32(16), spec.Maps["py_eval_ranges"].ValueSize, "lo, hi")
+
+	require.Contains(t, spec.Maps, "py_procs")
+	assert.Equal(t, uint32(4), spec.Maps["py_procs"].KeySize, "keyed by pid")
 
 	require.Contains(t, spec.Maps, "stacks_missing")
 	assert.Equal(t, ebpf.Array, spec.Maps["stacks_missing"].Type)
@@ -1008,6 +1027,8 @@ func TestAStackFailureIsCountedOncePerBatch(t *testing.T) {
 type fakeStackStore struct {
 	entries map[uint32][]uint64
 	flags   map[uint32]uint32
+	// tags is the per-id FRAME_TAG_* array; absent means all-native.
+	tags map[uint32][]uint8
 	// raw overrides the encoding for one id, so a test can hand the decoder
 	// a value the encoder would never produce.
 	raw       map[uint32][]byte
@@ -1018,7 +1039,7 @@ type fakeStackStore struct {
 }
 
 func newFakeStackStore() *fakeStackStore {
-	return &fakeStackStore{entries: map[uint32][]uint64{}, flags: map[uint32]uint32{}}
+	return &fakeStackStore{entries: map[uint32][]uint64{}, flags: map[uint32]uint32{}, tags: map[uint32][]uint8{}}
 }
 
 // encodeGPUStack lays out a struct gpu_stack the way the BPF program does:
@@ -1028,15 +1049,30 @@ func newFakeStackStore() *fakeStackStore {
 // scans for a zero terminator instead of honouring n_pcs must fail loudly
 // here rather than in production.
 func encodeGPUStack(pcs []uint64, flags uint32) []byte {
+	return encodeGPUStackTagged(pcs, nil, flags)
+}
+
+// encodeGPUStackTagged is encodeGPUStack with the tags[] array set: nil means
+// every slot is native. Tags past len(tags) are frameTagNative, matching the
+// PC poison's spirit - a plausible value, not an impossible one, so a decoder
+// that over-reads produces a wrong answer rather than an obviously broken
+// one. (TestTagsPastNPcsAreNotRead poisons the tail with frameTagPython by
+// hand, which is the shape that actually corrupts a call path.)
+func encodeGPUStackTagged(pcs []uint64, tags []uint8, flags uint32) []byte {
 	buf := make([]byte, gpuStackSize)
 	putU32(buf[0:], uint32(len(pcs)))
 	putU32(buf[4:], flags)
 	for i := 0; i < maxWalkFrames; i++ {
 		if i < len(pcs) {
 			putU64(buf[gpuStackHdrSize+i*8:], pcs[i])
-			continue
+		} else {
+			putU64(buf[gpuStackHdrSize+i*8:], 0xdeadbeefdeadbeef)
 		}
-		putU64(buf[gpuStackHdrSize+i*8:], 0xdeadbeefdeadbeef)
+		if i < len(tags) {
+			buf[gpuStackTagsOff+i] = tags[i]
+		} else {
+			buf[gpuStackTagsOff+i] = frameTagNative
+		}
 	}
 	return buf
 }
@@ -1059,7 +1095,7 @@ func (f *fakeStackStore) LookupBytes(key any) ([]byte, error) {
 	if !ok {
 		return nil, ebpf.ErrKeyNotExist
 	}
-	return encodeGPUStack(pcs, f.flags[id]), nil
+	return encodeGPUStackTagged(pcs, f.tags[id], f.flags[id]), nil
 }
 
 func (f *fakeStackStore) Delete(key any) error {
@@ -1255,9 +1291,11 @@ func TestResolveHonoursNPcsRatherThanScanningForAZero(t *testing.T) {
 // yet - Task 2 does - and re-deriving it after the fact is impossible, which
 // is why it is in the map value from the start rather than added later.
 func TestDecodeGPUStackCarriesTheWalkersFlags(t *testing.T) {
-	pcs, flags, ok := decodeGPUStack(encodeGPUStack([]uint64{0x401000, 0x401100}, 0x06))
+	pcs, tags, flags, ok := decodeGPUStack(encodeGPUStack([]uint64{0x401000, 0x401100}, 0x06))
 	require.True(t, ok)
 	assert.Equal(t, []uint64{0x401000, 0x401100}, pcs)
+	assert.Equal(t, []uint8{frameTagNative, frameTagNative}, tags,
+		"an untagged walk decodes as all-native, and only n_pcs tags are read")
 	assert.Equal(t, uint32(0x06), flags, "WALKER_FLAG_DWARF_USED | WALKER_FLAG_CFI_MISS")
 }
 
@@ -3671,4 +3709,93 @@ func TestARefusedGraphReportIsCounted(t *testing.T) {
 	assert.Equal(t, uint64(2), st.GraphExecutions,
 		"the arrival is counted whether or not the sink took it; otherwise a full sink would "+
 			"make the condition invisible on both sides at once")
+}
+
+// ----- Issue #83: Python frames on the GPU-attributed path.
+//
+// The walker pushes a Python frame as TWO consecutive pcs[] slots (a code
+// object's address, then an encoded instruction word), tagged
+// FRAME_TAG_PYTHON. Before struct gpu_stack carried tags[], those two slots
+// arrived here indistinguishable from two native PCs and were handed to
+// blazesym, which placed them in whatever mapping they happened to fall in:
+// two plausible, wrong native frames, silently, on the exact path the Python
+// walker exists to serve.
+
+// The code object's address must never reach the native symbolizer, and the
+// frame must land at its own position in the call path rather than at one
+// end of it.
+func TestPythonFramesAreNotSymbolizedAsNativePCs(t *testing.T) {
+	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
+	// leaf-first: a native leaf, one Python frame, then a native caller.
+	stacks.put(61, 0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100)
+	stacks.tags[61] = []uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative}
+
+	frames, ok := c.resolveStackForTest(61, 4242)
+	require.True(t, ok)
+
+	require.Len(t, sym.ips, 1)
+	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0],
+		"the code object and its instruction word must not be handed to the native symbolizer")
+
+	// resolveStackLocked reverses to root-first before returning.
+	require.Len(t, frames, 3)
+	assert.Equal(t, pythonFrameName(0xc0de0000), frames[1].Name,
+		"the Python frame belongs between its native caller and its native callee, not at either end")
+	assert.True(t, frames[1].Unresolved,
+		"an unsymbolized Python frame must not read as a function genuinely named python:0x...")
+	assert.Equal(t, uint64(1), c.Stats().StackPythonFrames)
+}
+
+// The frame counts that measure the NATIVE symbolizer's reach must not move
+// because a Python frame went unnamed: slice 3 has not taught the symbolizer
+// to read a code object yet, and counting that as a symbolization failure
+// would make the ratio these counters exist for unreadable.
+func TestPythonFramesDoNotInflateTheUnresolvedCounters(t *testing.T) {
+	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(63, 0x401000, 0xc0de0000, 0x5a5a5a5a)
+	stacks.tags[63] = []uint8{frameTagNative, frameTagPython, frameTagPython}
+
+	_, ok := c.resolveStackForTest(63, 4242)
+	require.True(t, ok)
+	assert.Zero(t, c.Stats().StackFramesUnresolved)
+	assert.Zero(t, c.Stats().StacksUnresolved)
+	assert.Equal(t, uint64(1), c.Stats().StackPythonFrames)
+}
+
+// MAX_FRAMES can land between the two slots of a Python frame. The code
+// object alone is not a frame - its instruction word would be whatever the
+// per-CPU scratch last held there - so it is dropped, and the drop is
+// counted rather than silent.
+func TestATruncatedPythonPairIsDroppedAndCounted(t *testing.T) {
+	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
+	stacks.put(65, 0x401000, 0xc0de0000)
+	stacks.tags[65] = []uint8{frameTagNative, frameTagPython}
+
+	frames, ok := c.resolveStackForTest(65, 4242)
+	require.True(t, ok)
+	require.Len(t, frames, 1, "the half pair is dropped, not half-read")
+	assert.Equal(t, []uint64{0x401000}, sym.ips[0])
+	assert.Equal(t, uint64(1), c.Stats().StackPythonPairsTruncated)
+	assert.Zero(t, c.Stats().StackPythonFrames)
+}
+
+// The tags array is fixed-size and copied whole out of a reused per-CPU
+// scratch buffer, so the bytes past n_pcs belong to an earlier capture.
+// Reading one would fold two real native frames into an invented Python one.
+func TestTagsPastNPcsAreNotRead(t *testing.T) {
+	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
+	raw := encodeGPUStack([]uint64{0x401000, 0x401100}, 0)
+	// Everything past the two real slots is what a previous capture left:
+	// PCs already poisoned by the encoder, tags poisoned here.
+	for i := 2; i < maxWalkFrames; i++ {
+		raw[gpuStackTagsOff+i] = frameTagPython
+	}
+	stacks.raw = map[uint32][]byte{67: raw}
+
+	frames, ok := c.resolveStackForTest(67, 4242)
+	require.True(t, ok)
+	assert.Len(t, frames, 2)
+	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0])
+	assert.Zero(t, c.Stats().StackPythonFrames)
+	assert.Zero(t, c.Stats().StackPythonPairsTruncated)
 }

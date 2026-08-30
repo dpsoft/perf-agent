@@ -109,6 +109,31 @@ func (p *PerfDwarf) Close() error {
 	return p.objs.Close()
 }
 
+// PyProcsMap returns py_procs: the per-PID CPython layout record
+// pyunwind.Attach installs after validating a target's interpreter. Without
+// an entry here walk_step's interpreter arm counts PY_CNT_NO_PROC_INFO and
+// pushes nothing.
+func (p *PerfDwarf) PyProcsMap() *ebpf.Map {
+	return p.objs.PyProcs
+}
+
+// PyEvalRangesMap returns py_eval_ranges: one eval-loop text range per
+// libpython, keyed by table_id. This map is the interpreter arm's on-switch —
+// until a range is installed, no PC ever falls inside one and the Python walk
+// never runs. See pyunwind.InstallEvalRange.
+func (p *PerfDwarf) PyEvalRangesMap() *ebpf.Map {
+	return p.objs.PyEvalRanges
+}
+
+// PyWalkCountersMap returns py_walk_counters, the per-CPU array in which the
+// Python walk records every frame it pushed and every way it refused. Read it
+// with pyunwind.ReadWalkCounters: sample_header.walker_flags has no bits left
+// for the Python path, so these counters are the only place a Python-side
+// refusal is visible at all.
+func (p *PerfDwarf) PyWalkCountersMap() *ebpf.Map {
+	return p.objs.PyWalkCounters
+}
+
 // CFIRulesMap returns the cfi_rules HASH_OF_MAPS outer map.
 func (p *PerfDwarf) CFIRulesMap() *ebpf.Map {
 	return p.objs.CfiRules

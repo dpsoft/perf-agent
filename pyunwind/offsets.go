@@ -31,17 +31,20 @@ var ErrOffsetsUnreadable = errors.New("pyunwind: could not read memory to valida
 // 3.14.3 source), so CSTACK moves from 3 to 4 and the enum's ceiling moves
 // from 3 to 4 with it. That is not a cosmetic renumbering: on 3.14 an owner
 // byte of 3 is a live, legitimate value (FRAME_OWNED_BY_INTERPRETER), not an
-// out-of-range one, and the CSTACK sentinel the walker stops at is 4, not 3.
-// A single package-wide ceiling shared across versions would either reject
-// real 3.14 CSTACK frames or misidentify an INTERPRETER frame as CSTACK.
-// That per-version truth is carried on Offsets (FrameOwnerMax,
-// FrameOwnerCStack), not in these constants -- these constants are only
-// valid for 3.12 and 3.13, and Validate never uses them directly.
+// out-of-range one. A single package-wide ceiling shared across versions
+// would reject real 3.14 frames. That per-version truth is carried on
+// Offsets (FrameOwnerMax, FrameOwnerCStack, FrameOwnerBoundary), not in
+// these constants -- these constants are only valid for 3.12 and 3.13, and
+// Validate never uses them directly.
 //
-// FRAME_OWNED_BY_CSTACK is the entry frame: the walk stops there and hands
-// back to native unwinding rather than running the chain to NULL, which
-// would consume the whole Python stack in one go and terminate the trace
-// with no native frames beneath it.
+// The frame the walk stops at is the interpreter's entry frame: it executes
+// no Python code and hands back to native unwinding, rather than running the
+// chain to NULL, which would consume the whole Python stack in one go and
+// terminate the trace with no native frames beneath it. Which owner value
+// marks it moved with the renumbering -- CSTACK (3) on 3.12/3.13,
+// INTERPRETER (3) on 3.14 -- so the stop condition is
+// FrameOwnerBoundary, not equality with FrameOwnerCStack. See
+// Offsets.FrameOwnerBoundary.
 const (
 	FrameOwnedByThread      uint8 = 0
 	FrameOwnedByGenerator   uint8 = 1
@@ -74,12 +77,27 @@ type Offsets struct {
 
 	// FrameExecutableTagged is true when the value at FrameExecutable is a
 	// tagged _PyStackRef (3.14) rather than a plain PyObject* (3.12, 3.13).
-	// CPython 3.14 introduced _PyStackRef (internal/pycore_structs.h); on a
-	// normal, non free-threaded build (Py_GIL_DISABLED undefined) the low
-	// bit is Py_TAG_REFCNT = 1 (internal/pycore_stackref.h), which must be
-	// masked off (value &^ 1) before the result is a valid PyObject*. A
-	// reader that treats this field as a plain pointer on 3.14 will hold an
-	// odd address one byte into the code object.
+	// CPython 3.14 introduced _PyStackRef (internal/pycore_structs.h) and the
+	// TWO low bits carry the tag on an ordinary GIL build: Py_TAG_BITS is 3
+	// there (Include/internal/pycore_stackref.h:446, in the `#else //
+	// Py_GIL_DISABLED / With GIL` arm, read out of python:3.14.3-slim), made
+	// of Py_TAG_REFCNT = 1 for a deferred/immortal reference and Py_INT_TAG =
+	// 3 for a tagged int.
+	//
+	// The mask to apply is therefore &^ 3, and the authority for that is
+	// CPython's own out-of-process reader rather than either bit's
+	// definition: Modules/_remote_debugging_module.c:45 defines
+	// CLEAR_PTR_TAG(ptr) as ((uintptr_t)(ptr) & ~Py_TAG_BITS) and line 2186
+	// reads interpreter_frame.executable through it. bpf/python_walk.h's
+	// PY_STACKREF_TAG_BITS is the same 3, cited the same way. (&^ 1 happens
+	// to give the same pointer for a REFCNT-tagged code object, since
+	// pointers are 8-aligned, which is exactly why picking the wrong mask is
+	// invisible until it is not.)
+	//
+	// A reader that treats this field as a plain pointer on 3.14 holds an odd
+	// address one byte into the code object. The free-threaded build's
+	// Py_TAG_BITS is 1, not 3 -- irrelevant here, because such a build is
+	// refused outright at attach (ErrFreeThreaded).
 	FrameExecutableTagged bool
 
 	// FrameInstrPtr is the offset of the currently-executing bytecode unit:
@@ -95,9 +113,40 @@ type Offsets struct {
 	// it is 3 on 3.12/3.13 and 4 on 3.14.
 	FrameOwnerMax uint8
 
-	// FrameOwnerCStack is this version's FRAME_OWNED_BY_CSTACK value -- the
-	// entry-frame sentinel the walker stops at. 3 on 3.12/3.13, 4 on 3.14.
+	// FrameOwnerCStack is this version's FRAME_OWNED_BY_CSTACK value. 3 on
+	// 3.12/3.13, 4 on 3.14. It is NOT the walker's stop condition -- see
+	// FrameOwnerBoundary, which is.
 	FrameOwnerCStack uint8
+
+	// FrameOwnerBoundary is the lowest owner value that means "this frame is
+	// the interpreter's boundary with C, not Python code". The walker stops
+	// at owner >= FrameOwnerBoundary and hands back to native unwinding.
+	//
+	// It is 3 on all three supported versions, and that is a coincidence of
+	// two changes cancelling, not a constant: 3.14 inserts
+	// FRAME_OWNED_BY_INTERPRETER at 3 (pushing FRAME_OWNED_BY_CSTACK to 4)
+	// AND moves the entry frame onto the new enumerator, so the value stays
+	// 3 while the enumerator it is measured from changes.
+	//
+	//	3.12.14  Python/ceval.c:702   entry_frame.owner = FRAME_OWNED_BY_CSTACK      (3)
+	//	3.13.15  Python/ceval.c:719   entry_frame.owner = FRAME_OWNED_BY_CSTACK      (3)
+	//	3.14.3   Python/ceval.c:1162  entry.frame.owner = FRAME_OWNED_BY_INTERPRETER (3)
+	//
+	// FRAME_OWNED_BY_CSTACK == 4 is assigned nowhere in the 3.14 tree, so a
+	// walker testing owner == FrameOwnerCStack walks straight past the
+	// boundary on 3.14 and consumes the native stack beneath the
+	// interpreter. CPython's own readers test the range instead --
+	// Python/ceval.c:260 (owner >= FRAME_OWNED_BY_INTERPRETER) and
+	// Modules/_remote_debugging_module.c:2148-2149 (== CSTACK || ==
+	// INTERPRETER) -- and so does bpf/python_walk.h's py_push_frames, which
+	// this field feeds via py_proc_info.frame_owner_boundary.
+	//
+	// Carried per version rather than hardcoded as 3 in the walker for the
+	// same reason every other number in this table is: the next renumbering
+	// is a table edit re-measured against a real interpreter
+	// (offsets_fixture_test.go measures this field too), not a hunt through
+	// BPF C for a literal.
+	FrameOwnerBoundary uint8
 
 	// PyThreadState
 
@@ -162,6 +211,7 @@ func TableFor(v Version) (Offsets, error) {
 			FrameOwner:               70,
 			FrameOwnerMax:            3,
 			FrameOwnerCStack:         3,
+			FrameOwnerBoundary:       3,  // FRAME_OWNED_BY_CSTACK
 			ThreadStateFrame:         56, // offset of `cframe`, not of a frame pointer
 			ThreadStateFrameIndirect: true,
 			CodeArgCount:             52,
@@ -183,6 +233,7 @@ func TableFor(v Version) (Offsets, error) {
 			FrameOwner:               70,
 			FrameOwnerMax:            3,
 			FrameOwnerCStack:         3,
+			FrameOwnerBoundary:       3, // FRAME_OWNED_BY_CSTACK
 			ThreadStateFrame:         72,
 			ThreadStateFrameIndirect: false,
 			CodeArgCount:             52,
@@ -198,8 +249,11 @@ func TableFor(v Version) (Offsets, error) {
 		// was replaced by `_PyStackRef *stackpointer`, which pushes owner
 		// from offset 70 to 74. The _frameowner enum gained
 		// FRAME_OWNED_BY_INTERPRETER=3, pushing FRAME_OWNED_BY_CSTACK from
-		// 3 to 4 (see FrameOwnerMax/FrameOwnerCStack). PyThreadState kept
-		// current_frame directly, at the same offset as 3.13.
+		// 3 to 4 (see FrameOwnerMax/FrameOwnerCStack) -- and ceval.c:1162
+		// moved the entry frame onto FRAME_OWNED_BY_INTERPRETER at the same
+		// time, which is why FrameOwnerBoundary is still 3 here while
+		// FrameOwnerCStack is 4. PyThreadState kept current_frame directly,
+		// at the same offset as 3.13.
 		return Offsets{
 			FramePrevious:            8,
 			FrameExecutable:          0,
@@ -208,6 +262,7 @@ func TableFor(v Version) (Offsets, error) {
 			FrameOwner:               74,
 			FrameOwnerMax:            4,
 			FrameOwnerCStack:         4,
+			FrameOwnerBoundary:       3, // FRAME_OWNED_BY_INTERPRETER, not CSTACK (4)
 			ThreadStateFrame:         72,
 			ThreadStateFrameIndirect: false,
 			CodeArgCount:             52,

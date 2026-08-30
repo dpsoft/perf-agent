@@ -165,11 +165,12 @@ type pyProcInfo struct {
 
 	FrameOwnerMax            uint8
 	FrameOwnerCstack         uint8
+	FrameOwnerBoundary       uint8
 	FrameExecutableTagged    uint8
 	ThreadstateFrameIndirect uint8
 
 	Enabled uint8
-	_       [5]byte // mirrors the C side's explicit _pad[5]; keeps sizeof() at 56.
+	_       [4]byte // mirrors the C side's explicit _pad[4]; keeps sizeof() at 56.
 }
 
 // BPFMaps is the set of map handles Attach needs. PyProcs is
@@ -177,6 +178,33 @@ type pyProcInfo struct {
 // one pyProcInfo.
 type BPFMaps struct {
 	PyProcs *ebpf.Map
+}
+
+// EvalRange is one interpreter's eval-loop text range, in the same space
+// bpf/unwind_common.h's mapping_for_pc reports rel_pc in: RELATIVE to the
+// mapping's load bias, so one entry serves every process running that
+// libpython. Mirrors struct py_eval_range in bpf/python_walk.h; Hi is
+// exclusive.
+type EvalRange struct {
+	Lo uint64
+	Hi uint64
+}
+
+// InstallEvalRange publishes one libpython's eval-loop range under its
+// table_id -- the same FNV-1a-of-build-id key the CFI tables use, which is
+// what walk_step already holds by the time it reaches the Python arm.
+//
+// Until a range is installed for a binary, walk_step's interpreter arm never
+// fires for any PC in it: the range map is the on-switch, and py_procs alone
+// is not enough.
+func InstallEvalRange(m *ebpf.Map, tableID uint64, r EvalRange) error {
+	if r.Hi <= r.Lo {
+		return fmt.Errorf("pyunwind: eval range [%#x,%#x) for table %#x is empty or inverted", r.Lo, r.Hi, tableID)
+	}
+	if err := m.Update(&tableID, &r, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("pyunwind: install eval range for table %#x: %w", tableID, err)
+	}
+	return nil
 }
 
 // TLSBaseReader is implemented by a FrameReader that can also report the
@@ -514,6 +542,7 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 
 		FrameOwnerMax:            off.FrameOwnerMax,
 		FrameOwnerCstack:         off.FrameOwnerCStack,
+		FrameOwnerBoundary:       off.FrameOwnerBoundary,
 		FrameExecutableTagged:    boolToU8(off.FrameExecutableTagged),
 		ThreadstateFrameIndirect: boolToU8(off.ThreadStateFrameIndirect),
 	}

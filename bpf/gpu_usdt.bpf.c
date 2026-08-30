@@ -507,6 +507,15 @@ static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
     // n_pcs are never read — the consumer honours n_pcs rather than scanning
     // for a zero terminator, precisely because this scratch is per-CPU and
     // its tail still holds the previous capture's PCs.
+    //
+    // TODO(#83, Task 7): this copies pcs[] WITHOUT rec->tags[] — struct
+    // gpu_stack has no tags[] array (_Static_assert below pins it at 1024
+    // bytes, matched against gpuStackSize in gpuprobe/consumer.go). Once
+    // frame_push_python has a caller, any Python frame reaching this path
+    // renders as two bogus native PCs, silently, on the one path this whole
+    // feature exists to serve. Do not widen gpu_stack piecemeal here — it is
+    // its own blast radius (the _Static_assert, gpuStackSize, and every
+    // reader of gpu_stacks) and belongs to Task 7.
     __builtin_memcpy(out->pcs, rec->pcs, sizeof(out->pcs));
 
     // BPF_NOEXIST, never BPF_ANY. If this id is somehow still live — a

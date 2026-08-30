@@ -1335,13 +1335,14 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 		got[m[1]] = uint32(v)
 	}
 	assert.Equal(t, map[string]uint32{
-		"WALKER_FLAG_FP_TERMINATED":     walkerFlagFPTerminated,
-		"WALKER_FLAG_DWARF_USED":        walkerFlagDWARFUsed,
-		"WALKER_FLAG_CFI_MISS":          walkerFlagCFIMiss,
-		"WALKER_FLAG_RA_UNDEFINED":      walkerFlagRAUndefined,
-		"WALKER_FLAG_FP_EXHAUSTED":      walkerFlagFPExhausted,
-		"WALKER_FLAG_FP_NONMONOTONIC":   walkerFlagFPNonMonotonic,
-		"WALKER_FLAG_ROOT_DISAGREEMENT": walkerFlagRootDisagreement,
+		"WALKER_FLAG_FP_TERMINATED":      walkerFlagFPTerminated,
+		"WALKER_FLAG_DWARF_USED":         walkerFlagDWARFUsed,
+		"WALKER_FLAG_CFI_MISS":           walkerFlagCFIMiss,
+		"WALKER_FLAG_RA_UNDEFINED":       walkerFlagRAUndefined,
+		"WALKER_FLAG_FP_EXHAUSTED":       walkerFlagFPExhausted,
+		"WALKER_FLAG_FP_NONMONOTONIC":    walkerFlagFPNonMonotonic,
+		"WALKER_FLAG_ROOT_DISAGREEMENT":  walkerFlagRootDisagreement,
+		"WALKER_FLAG_FRAME_PUSH_REFUSED": walkerFlagFramePushRefused,
 	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
 }
 

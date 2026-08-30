@@ -258,33 +258,6 @@ struct walk_ctx {
     struct sample_record *rec;
 };
 
-// frame_push_native appends one native-PC slot, tagging it FRAME_TAG_NATIVE.
-// Returns 0 on success, 1 if the record is already full (MAX_FRAMES
-// reached) — the caller must stop walking in that case.
-static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
-    if (ctx->n_pcs >= MAX_FRAMES) return 1;
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_NATIVE;
-    ctx->rec->pcs[ctx->n_pcs++] = pc;
-    return 0;
-}
-
-// frame_push_python appends a two-slot Python frame (code object address,
-// then an encoded fingerprint/f_lasti word), both tagged FRAME_TAG_PYTHON.
-// Returns 0 on success, 1 if fewer than two slots remain — the caller must
-// stop walking in that case rather than push a half-pair. Nothing calls
-// this yet; a later task drives it from the CPython frame-chain walker.
-// Keeping the MAX_FRAMES bounds check here, alongside frame_push_native's,
-// means every place this record can overflow is checked in exactly one
-// spot rather than re-derived at each call site.
-static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
-    if (ctx->n_pcs + 2 > MAX_FRAMES) return 1;
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[ctx->n_pcs++] = code;
-    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[ctx->n_pcs++] = instr;
-    return 0;
-}
-
 // ----- Lazy CFI: miss emit helper.
 //
 // Called from walk_step when MODE_FP_LESS + cfi_lookup miss occur.
@@ -560,6 +533,18 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 //           accompanied by bit 0, never by bit 3, and it is what keeps that
 //           pair from reading as an unqualified success: consumers must
 //           treat a walk carrying it as one whose ending is UNCONFIRMED.
+//   bit 7 — frame_push_native or frame_push_python refused to write because
+//           too few pcs[]/tags[] slots remained (MAX_FRAMES for a native
+//           push, fewer than 2 remaining for a Python pair). The record
+//           itself is not corrupted - the refused frame simply never
+//           landed - but the walk is one frame shorter than it otherwise
+//           would be. Reachable today only from the FP-nonmonotonic arm's
+//           second push in the same iteration as the one that fills the
+//           record (see frame_push_native's call there); it will fire far
+//           more often once frame_push_python has a caller, since a
+//           two-slot push can be refused with only one slot free.
+//           Distinct from bit 2 (a CFI table gap): this is the record
+//           running out of room, not a classification failure.
 //
 // Bits 3 and 4 were one bit (WALKER_FLAG_UNWIND_TERMINATED) until issue #44.
 // Merging them was wrong, and wrong in the direction that reads green: on the
@@ -606,6 +591,44 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 #define WALKER_FLAG_FP_EXHAUSTED     0x10
 #define WALKER_FLAG_FP_NONMONOTONIC  0x20
 #define WALKER_FLAG_ROOT_DISAGREEMENT 0x40
+#define WALKER_FLAG_FRAME_PUSH_REFUSED 0x80
+
+// frame_push_native appends one native-PC slot, tagging it FRAME_TAG_NATIVE.
+// Returns 0 on success, 1 if the record is already full (MAX_FRAMES
+// reached) — the caller must stop walking in that case. The refusal itself
+// is never silent: WALKER_FLAG_FRAME_PUSH_REFUSED says a frame was dropped
+// for lack of room, distinct from every other reason a walk can stop short.
+static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
+    if (ctx->n_pcs >= MAX_FRAMES) {
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
+        return 1;
+    }
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_NATIVE;
+    ctx->rec->pcs[ctx->n_pcs++] = pc;
+    return 0;
+}
+
+// frame_push_python appends a two-slot Python frame (code object address,
+// then an encoded fingerprint/f_lasti word), both tagged FRAME_TAG_PYTHON.
+// Returns 0 on success, 1 if fewer than two slots remain — the caller must
+// stop walking in that case rather than push a half-pair. Nothing calls
+// this yet; a later task drives it from the CPython frame-chain walker.
+// Keeping the MAX_FRAMES bounds check here, alongside frame_push_native's,
+// means every place this record can overflow is checked in exactly one
+// spot rather than re-derived at each call site. Like frame_push_native,
+// a refusal raises WALKER_FLAG_FRAME_PUSH_REFUSED rather than dropping the
+// frame silently.
+static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
+    if (ctx->n_pcs + 2 > MAX_FRAMES) {
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
+        return 1;
+    }
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[ctx->n_pcs++] = code;
+    ctx->rec->tags[ctx->n_pcs] = FRAME_TAG_PYTHON;
+    ctx->rec->pcs[ctx->n_pcs++] = instr;
+    return 0;
+}
 
 // fp_chain_ended reports whether this walk has already stepped PAST the end
 // of the frame-pointer chain: it left a frame whose saved-FP slot held zero,

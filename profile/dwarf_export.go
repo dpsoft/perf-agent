@@ -3,6 +3,7 @@ package profile
 import (
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -14,6 +15,16 @@ import (
 type PerfDwarf struct {
 	objs perf_dwarfObjects
 }
+
+// PerfDwarfSampleRecordSize is the real, compiler-computed size of the
+// generated perf_dwarfSampleRecord — bpf2go's Go mirror of
+// bpf/unwind_common.h's struct sample_record, alignment padding included.
+// Exported so unwind/dwarfagent can pin its own SampleRecordBytes constant
+// against the actual generated struct rather than a hand-derived formula
+// that can silently drift from it (issue #83's SampleRecordBytes review
+// finding: the hand-derived formula omitted the struct's trailing
+// alignment pad and nothing caught it).
+const PerfDwarfSampleRecordSize = unsafe.Sizeof(perf_dwarfSampleRecord{})
 
 // LoadPerfDwarf loads the BPF program and returns a handle. Caller must
 // Close(). The program isn't attached to any perf event yet — the caller

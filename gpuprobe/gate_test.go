@@ -936,6 +936,41 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	t.Logf("prediction: reached-root == dwarf, fp-exhausted == abandoned == 0")
 }
 
+// TestFramePushRefusalRaisesAFlag pins that both frame_push_native (at
+// MAX_FRAMES) and frame_push_python (fewer than two slots left) raise
+// WALKER_FLAG_FRAME_PUSH_REFUSED on their refusal path, before returning 1
+// — issue #83's constraint that a dropped frame is never silent. Checked by
+// source inspection, like TestWalkStepStepsPastTheFramePointerRoot below,
+// because the refusal itself is only reachable inside the BPF verifier.
+func TestFramePushRefusalRaisesAFlag(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_common.h")
+	require.NoError(t, err)
+	body := string(src)
+
+	require.Contains(t, body, "#define WALKER_FLAG_FRAME_PUSH_REFUSED 0x80",
+		"the refusal flag is gone, renamed, or its value changed")
+
+	checkRefusalRaisesFlag := func(t *testing.T, fn string) {
+		t.Helper()
+		start := strings.Index(body, "static __always_inline int "+fn+"(")
+		require.Positive(t, start, "%s not found in the shared header", fn)
+		rest := body[start:]
+		end := strings.Index(rest, "\n}\n")
+		require.Positive(t, end, "%s body not closed", fn)
+		fnBody := rest[:end]
+
+		refusal := strings.Index(fnBody, "return 1;")
+		require.Positive(t, refusal, "%s has no refusal path", fn)
+		flag := strings.Index(fnBody, "WALKER_FLAG_FRAME_PUSH_REFUSED")
+		require.Positive(t, flag, "%s's refusal drops the frame without raising a flag", fn)
+		require.Less(t, flag, refusal,
+			"%s must raise WALKER_FLAG_FRAME_PUSH_REFUSED before returning 1, not after", fn)
+	}
+
+	t.Run("frame_push_native", func(t *testing.T) { checkRefusalRaisesFlag(t, "frame_push_native") })
+	t.Run("frame_push_python", func(t *testing.T) { checkRefusalRaisesFlag(t, "frame_push_python") })
+}
+
 // The walker half of the derivation above, read out of the shared header so
 // it needs no capability either.
 //

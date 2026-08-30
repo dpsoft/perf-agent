@@ -159,6 +159,16 @@ const (
 	walkerFlagFPExhausted      = 0x10
 	walkerFlagFPNonMonotonic   = 0x20
 	walkerFlagRootDisagreement = 0x40
+	// walkerFlagFramePushRefused mirrors WALKER_FLAG_FRAME_PUSH_REFUSED
+	// (issue #83): frame_push_native or frame_push_python ran out of
+	// pcs[]/tags[] room and dropped a frame rather than write it. Not yet
+	// folded into the classification switch below or given its own Stats
+	// counter — gpu_stack (bpf/gpu_usdt.bpf.c) does not carry tags[] at
+	// all yet, so this consumer cannot attribute the bit to a Python vs.
+	// native cause until Task 7 widens it. Kept here only so
+	// TestWalkerFlagsMirrorTheBPFHeader stays a complete mirror of the
+	// header's bits.
+	walkerFlagFramePushRefused = 0x80
 
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
 	// the end of the chain". Neither StackWalkTruncated nor

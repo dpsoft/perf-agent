@@ -3,7 +3,27 @@ package dwarfagent
 import (
 	"encoding/binary"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/profile"
 )
+
+// TestSampleRecordBytesMatchesGeneratedStruct pins SampleRecordBytes
+// against the actual, compiler-computed size of the generated
+// perf_dwarfSampleRecord (bpf2go's Go mirror of bpf/unwind_common.h's
+// struct sample_record). SampleRecordBytes is a hand-derived formula and
+// nothing in the build makes it agree with the real struct layout — it
+// silently disagreed by one byte (1183 vs the true 1184, missing the
+// struct's trailing alignment pad) until this test was added. Nothing
+// references SampleRecordBytes yet, which is exactly why the drift was
+// latent: this test is the thing that would have caught it, and its
+// absence is why the next layout change would slip too.
+func TestSampleRecordBytesMatchesGeneratedStruct(t *testing.T) {
+	want := int(profile.PerfDwarfSampleRecordSize)
+	if SampleRecordBytes != want {
+		t.Errorf("SampleRecordBytes = %d, want %d (sizeof generated perf_dwarfSampleRecord)",
+			SampleRecordBytes, want)
+	}
+}
 
 func TestParseSampleHeader(t *testing.T) {
 	const sampleSize = 40 + 127*8

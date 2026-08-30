@@ -53,20 +53,41 @@ func TestAttachRefusalsAreNamed(t *testing.T) {
 	}
 }
 
+// WHY THESE TESTS PIN THE ARCHITECTURE.
+//
+// Every refusal below the architecture gate is architecture-independent --
+// the TLSBaseReader capability check, the autoTSSkey parse, symbol
+// resolution, Validate -- but the gate is not, and it fires first. Run on
+// arm64, which has no measured glibc TSD offsets and is refused by name,
+// every one of these tests collapsed into a single assertion about the
+// architecture; the specific refusal each is named for was never reached.
+// That is what CI reported the first time this package ran on an arm64
+// runner (it had never been in the unit-test invocation before).
+//
+// So they pass "amd64" explicitly, via prepareInfoForArch. Not to pretend
+// the host is amd64: the numbers glibcTSDOffsets returns for it are
+// measured, and the plumbing under test does not depend on them being the
+// host's. The alternative -- skipping on arm64 -- would keep the arm64 job
+// green while testing nothing, and this branch has spent two rounds on what
+// silent declines cost.
+//
+// The gate itself is pinned separately, and now on every architecture, by
+// TestPrepareInfoRefusesAnUnmeasuredArch below.
+
 // TestPrepareInfoReasonsAreErrorsIsable extends the same guarantee to
 // prepareInfo's own refusal points, not just classify's: every one of them
 // must set Reason to something errors.Is-able against one of this
 // package's sentinels, not just a Refused string a human can read.
 func TestPrepareInfoReasonsAreErrorsIsable(t *testing.T) {
 	t.Run("no TLSBaseReader", func(t *testing.T) {
-		_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
+		_, res := prepareInfoForArch("amd64", 1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
 		if !errors.Is(res.Reason, ErrTLSBaseUnavailable) {
 			t.Fatalf("Reason = %v, want errors.Is(..., ErrTLSBaseUnavailable)", res.Reason)
 		}
 	})
 	t.Run("unrecognised TSS code", func(t *testing.T) {
 		garbage := []byte{0xf3, 0x0f, 0x1e, 0xfa, 0xc3}
-		_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", garbage, fakeAttachReader{})
+		_, res := prepareInfoForArch("amd64", 1, "/usr/lib64/libpython3.12.so.1.0", garbage, fakeAttachReader{})
 		if !errors.Is(res.Reason, ErrTSSPatternUnrecognised) {
 			t.Fatalf("Reason = %v, want errors.Is(..., ErrTSSPatternUnrecognised)", res.Reason)
 		}
@@ -75,7 +96,7 @@ func TestPrepareInfoReasonsAreErrorsIsable(t *testing.T) {
 		path := findSystemLibpython(t)
 		unmapped := "/nonexistent-for-pyunwind-tests/" + filepath.Base(path)
 		code := readGilstateCode(t, gilstateFixtures[0])
-		_, res := prepareInfo(uint32(os.Getpid()), unmapped, code, fakeAttachReader{})
+		_, res := prepareInfoForArch("amd64", uint32(os.Getpid()), unmapped, code, fakeAttachReader{})
 		if !errors.Is(res.Reason, ErrSymbolNotFound) {
 			t.Fatalf("Reason = %v, want errors.Is(..., ErrSymbolNotFound)", res.Reason)
 		}
@@ -429,9 +450,42 @@ func fixtureForPath(t *testing.T, path string) gilstateFixture {
 // process I/O -- so a bare fakeReader with no filesystem behind it is
 // enough to prove it.
 func TestPrepareInfoRefusesWithoutTLSBaseReader(t *testing.T) {
-	_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
+	_, res := prepareInfoForArch("amd64", 1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
 	if !strings.Contains(res.Refused, "TLS base") {
 		t.Fatalf("expected a TLS-base refusal, got %q", res.Refused)
+	}
+}
+
+// TestPrepareInfoRefusesAnUnmeasuredArch pins the gate the tests above step
+// around, and pins it from EVERY host: before prepareInfoForArch existed,
+// this refusal could only be observed by running the suite on the
+// architecture in question, which is to say it was covered nowhere and
+// discovered by a CI failure.
+//
+// Two claims, and the second is the one that matters. The refusal is named
+// (ErrUnsupportedArch, not a bare string). And it fires BEFORE the
+// TLSBaseReader check: the reader passed here cannot report a TLS base, so
+// a gate that had drifted below that check would return
+// ErrTLSBaseUnavailable instead -- a plausible refusal for the wrong
+// reason, on a build where every later step would have been wrong.
+func TestPrepareInfoRefusesAnUnmeasuredArch(t *testing.T) {
+	for _, goarch := range []string{"arm64", "riscv64", "386"} {
+		t.Run(goarch, func(t *testing.T) {
+			_, res := prepareInfoForArch(goarch, 1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
+			if !errors.Is(res.Reason, ErrUnsupportedArch) {
+				t.Fatalf("Reason = %v, want errors.Is(..., ErrUnsupportedArch)", res.Reason)
+			}
+			if !strings.Contains(res.Refused, goarch) {
+				t.Fatalf("Refused = %q, want it to name %s", res.Refused, goarch)
+			}
+		})
+	}
+	// The control: with a measured architecture the same call gets past the
+	// gate and refuses for the reason the reader actually earns. Without
+	// this, a gate that refused everything would pass the loop above.
+	_, res := prepareInfoForArch("amd64", 1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
+	if !errors.Is(res.Reason, ErrTLSBaseUnavailable) {
+		t.Fatalf("amd64: Reason = %v, want the TLS-base refusal that comes after the arch gate", res.Reason)
 	}
 }
 
@@ -442,7 +496,7 @@ func TestPrepareInfoRefusesWithoutTLSBaseReader(t *testing.T) {
 // error.
 func TestPrepareInfoRefusesUnrecognisedTSSCode(t *testing.T) {
 	garbage := []byte{0xf3, 0x0f, 0x1e, 0xfa, 0xc3}
-	_, res := prepareInfo(1, "/usr/lib64/libpython3.12.so.1.0", garbage, fakeAttachReader{})
+	_, res := prepareInfoForArch("amd64", 1, "/usr/lib64/libpython3.12.so.1.0", garbage, fakeAttachReader{})
 	if !strings.Contains(res.Refused, "autoTSSkey") {
 		t.Fatalf("expected an autoTSSkey refusal, got %q", res.Refused)
 	}
@@ -466,7 +520,7 @@ func TestPrepareInfoRefusesWhenPidDoesNotMapLibrary(t *testing.T) {
 	unmapped := "/nonexistent-for-pyunwind-tests/" + filepath.Base(path)
 
 	code := readGilstateCode(t, gilstateFixtures[0])
-	_, res := prepareInfo(uint32(os.Getpid()), unmapped, code, fakeAttachReader{})
+	_, res := prepareInfoForArch("amd64", uint32(os.Getpid()), unmapped, code, fakeAttachReader{})
 	if !strings.Contains(res.Refused, "cannot resolve symbols") {
 		t.Fatalf("expected a symbol-resolution refusal naming the unmapped library, got %q", res.Refused)
 	}
@@ -560,7 +614,7 @@ func TestPrepareInfoInstallsAFullyValidatedRecord(t *testing.T) {
 		tlsBase:    tlsBase,
 	}
 
-	info, res := prepareInfo(uint32(os.Getpid()), path, code, r)
+	info, res := prepareInfoForArch("amd64", uint32(os.Getpid()), path, code, r)
 	if res.Refused != "" {
 		t.Fatalf("unexpected refusal: %s", res.Refused)
 	}
@@ -669,7 +723,7 @@ func TestPrepareInfoRefusesOnValidationFailure(t *testing.T) {
 		tlsBase: tlsBase,
 	}
 
-	_, res := prepareInfo(uint32(os.Getpid()), path, code, r)
+	_, res := prepareInfoForArch("amd64", uint32(os.Getpid()), path, code, r)
 	if !strings.Contains(res.Refused, "offset validation failed") {
 		t.Fatalf("expected an offset-validation refusal, got %q", res.Refused)
 	}
@@ -801,6 +855,13 @@ func generatedStructFields(t *testing.T, path, typeName string) []fieldSpec {
 // real, currently-checked-in bpf2go-generated gpuusdtPyProcInfo -- name and
 // offset, in order -- not against a hand-maintained expectation that could
 // itself drift out of sync with a real regen.
+//
+// The x86 generated file is read on every host, arm64 included, and that is
+// correct rather than an oversight: both generated files are checked in,
+// and bpf2go emits a byte-identical gpuusdtPyProcInfo declaration for both
+// architectures (the struct has no pointer-width members). Reading one of
+// them is reading the mirror; reading the host's would only make the test
+// harder to reason about.
 func TestPyProcInfoFieldOrderMatchesGenerated(t *testing.T) {
 	genPath := filepath.Join("..", "gpuprobe", "gpuusdt_x86_bpfel.go")
 	if _, err := os.Stat(genPath); err != nil {

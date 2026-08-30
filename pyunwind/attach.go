@@ -456,6 +456,30 @@ func Attach(pid uint32, libPath string, code []byte, m *BPFMaps, r FrameReader) 
 // and only last the reads that touch the target's own memory: the live
 // autoTSSkey value, the TSS lookup itself, and Validate.
 func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProcInfo, Result) {
+	return prepareInfoForArch(runtime.GOARCH, pid, libPath, code, r)
+}
+
+// prepareInfoForArch is prepareInfo with the architecture named rather than
+// taken from the running binary. Production has exactly one caller, and it
+// passes runtime.GOARCH.
+//
+// The parameter exists because everything below the architecture gate --
+// the TLSBaseReader capability check, the autoTSSkey parse, symbol
+// resolution, the live key read, the TSD lookup, Validate, and the record
+// literal itself -- is architecture-INDEPENDENT, while the gate is not. With
+// the architecture baked in, none of that plumbing is reachable on arm64:
+// glibcTSDOffsets refuses first and every test of it collapses into one
+// assertion about the arch. That is exactly what CI reported the first time
+// this package's tests ran on an arm64 runner, and it is a gap in the tests,
+// not in the gate -- arm64 genuinely has no measured offsets, and the gate
+// firing first is correct.
+//
+// So the tests pass "amd64" to exercise the plumbing on every architecture,
+// with the real measured amd64 numbers rather than invented ones, and pass
+// "arm64" to pin the arch refusal itself -- which was previously unreachable
+// from an amd64 host. The gate is not moved, weakened, or bypassed: it still
+// runs here, before any read of the target, on every path.
+func prepareInfoForArch(goarch string, pid uint32, libPath string, code []byte, r FrameReader) (pyProcInfo, Result) {
 	res := classify(libPath)
 	if res.Refused != "" {
 		return pyProcInfo{}, res
@@ -466,7 +490,7 @@ func prepareInfo(pid uint32, libPath string, code []byte, r FrameReader) (pyProc
 		return pyProcInfo{}, refuseWith(res.Version, err)
 	}
 
-	tsd, err := glibcTSDOffsets(runtime.GOARCH)
+	tsd, err := glibcTSDOffsets(goarch)
 	if err != nil {
 		return pyProcInfo{}, refuseWith(res.Version, err)
 	}

@@ -189,7 +189,7 @@ jobs:
     # ./pyunwind/... is here because it was in no CI job before; see the
     # same step in tests.yml.
     - name: Run unit tests
-      run: go test -v ./cpu/... ./profile/... ./offcpu/... ./pyunwind/...
+      run: go test -v ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
     
     - name: Build test workloads
       run: |

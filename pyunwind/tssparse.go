@@ -87,6 +87,13 @@ type tssShape struct {
 // binary) and then how the 37-byte one was found (by CI failing on the
 // interpreter the tests actually reach).
 //
+// EVERY SHAPE HERE IS x86-64, and the fixtures the tests parse are x86-64
+// machine code on whatever host runs them. That is not an arm64 gap: this
+// parser decodes the TARGET's prologue, the walker is refused outright on a
+// non-amd64 target (ErrUnsupportedArch, before any of this runs), and byte
+// matching is host-independent. An arm64 shape becomes worth measuring on
+// the day glibc's TSD layout is measured for arm64, and not before.
+//
 // A body that matches none of these is REFUSED, which is the designed
 // behaviour: a new toolchain shape shows up as a named refusal
 // (ErrTSSPatternUnrecognised, carried on Result.Reason) with the body's

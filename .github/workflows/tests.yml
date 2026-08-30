@@ -132,8 +132,13 @@ jobs:
       # live-interpreter attach tests -- was running only on developer
       # machines. The live tests attach to a python3 they spawn themselves
       # and need no capabilities; on arm64 they skip by name.
+      #
+      # ./unwind/dwarfagent/... joins it for the same reason: the tagged-slot
+      # decoder and the Python frame rendering the end-to-end gate matches on
+      # are pinned there, and nothing was running those either. They are
+      # ordinary in-process tests -- no BPF, no capabilities.
       - name: Run unit tests
-        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/...
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
 
       - name: Upload coverage
         uses: codecov/codecov-action@v3

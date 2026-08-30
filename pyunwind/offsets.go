@@ -7,6 +7,22 @@ import (
 
 var errBadRead = errors.New("pyunwind: unreadable address")
 
+// ErrOffsetsImplausible means Validate read the frame successfully but what
+// came back cannot come from a live CPython frame -- an owner byte outside
+// the _frameowner enum, or a previous pointer that is neither NULL nor a
+// plausible userspace address. It is the "this table is wrong for this
+// build" signal, distinct from ErrOffsetsUnreadable: the read worked, the
+// content didn't.
+var ErrOffsetsImplausible = errors.New("pyunwind: offsets are implausible for this build")
+
+// ErrOffsetsUnreadable wraps a FrameReader failure encountered while
+// validating: an address could not be read at all, so Validate learned
+// nothing about whether the table is right or wrong. Callers that need to
+// tell "the table is wrong" (ErrOffsetsImplausible) apart from "the read
+// failed" (this) can use errors.Is against either sentinel; the concrete
+// error from the FrameReader is still available via further unwrapping.
+var ErrOffsetsUnreadable = errors.New("pyunwind: could not read memory to validate offsets")
+
 // _frameowner values from CPython's internal/pycore_frame.h, in the
 // numbering used by 3.12 and 3.13.
 //
@@ -221,17 +237,17 @@ type FrameReader interface {
 func (o Offsets) Validate(r FrameReader, frame uint64) error {
 	owner, err := r.ReadU8(frame + uint64(o.FrameOwner))
 	if err != nil {
-		return fmt.Errorf("pyunwind: validate: owner: %w", err)
+		return fmt.Errorf("pyunwind: validate: owner: %w: %w", ErrOffsetsUnreadable, err)
 	}
 	if owner > o.FrameOwnerMax {
-		return fmt.Errorf("pyunwind: validate: owner byte %#x is outside the _frameowner enum (max %d for this version); offsets are wrong for this build", owner, o.FrameOwnerMax)
+		return fmt.Errorf("pyunwind: validate: owner byte %#x is outside the _frameowner enum (max %d for this version); offsets are wrong for this build: %w", owner, o.FrameOwnerMax, ErrOffsetsImplausible)
 	}
 	prev, err := r.ReadU64(frame + uint64(o.FramePrevious))
 	if err != nil {
-		return fmt.Errorf("pyunwind: validate: previous: %w", err)
+		return fmt.Errorf("pyunwind: validate: previous: %w: %w", ErrOffsetsUnreadable, err)
 	}
 	if prev != 0 && prev < 0x1000 {
-		return fmt.Errorf("pyunwind: validate: previous %#x is neither NULL nor a plausible pointer", prev)
+		return fmt.Errorf("pyunwind: validate: previous %#x is neither NULL nor a plausible pointer: %w", prev, ErrOffsetsImplausible)
 	}
 	return nil
 }

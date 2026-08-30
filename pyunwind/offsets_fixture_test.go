@@ -50,7 +50,22 @@ int main(void) {
     printf("FrameExecutable=%zu\n", offsetof(struct _PyInterpreterFrame, f_code));
     printf("FrameInstrPtr=%zu\n", offsetof(struct _PyInterpreterFrame, prev_instr));
     printf("FrameOwner=%zu\n", offsetof(struct _PyInterpreterFrame, owner));
-    printf("FrameOwnerMax=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    {
+        /* Computed independently of FrameOwnerCStack below: the max of
+           every named _frameowner enumerator this version has, not a
+           second print of the same constant. If a future header adds an
+           enumerator this probe doesn't know about, this max silently
+           stops being the true ceiling -- same caveat as offsets.go
+           itself, which is exactly why this fixture test exists to be
+           re-run against new interpreters. */
+        int values[] = { FRAME_OWNED_BY_THREAD, FRAME_OWNED_BY_GENERATOR,
+                          FRAME_OWNED_BY_FRAME_OBJECT, FRAME_OWNED_BY_CSTACK };
+        int max = values[0];
+        for (size_t i = 1; i < sizeof(values)/sizeof(values[0]); i++) {
+            if (values[i] > max) max = values[i];
+        }
+        printf("FrameOwnerMax=%d\n", max);
+    }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, cframe));
     printf("CFrameCurrentFrame=%zu\n", offsetof(_PyCFrame, current_frame));
@@ -74,7 +89,15 @@ int main(void) {
     printf("FrameExecutable=%zu\n", offsetof(struct _PyInterpreterFrame, f_executable));
     printf("FrameInstrPtr=%zu\n", offsetof(struct _PyInterpreterFrame, instr_ptr));
     printf("FrameOwner=%zu\n", offsetof(struct _PyInterpreterFrame, owner));
-    printf("FrameOwnerMax=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    {
+        int values[] = { FRAME_OWNED_BY_THREAD, FRAME_OWNED_BY_GENERATOR,
+                          FRAME_OWNED_BY_FRAME_OBJECT, FRAME_OWNED_BY_CSTACK };
+        int max = values[0];
+        for (size_t i = 1; i < sizeof(values)/sizeof(values[0]); i++) {
+            if (values[i] > max) max = values[i];
+        }
+        printf("FrameOwnerMax=%d\n", max);
+    }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, current_frame));
     printf("CodeArgCount=%zu\n", offsetof(PyCodeObject, co_argcount));
@@ -98,7 +121,16 @@ int main(void) {
     printf("FrameExecutable=%zu\n", offsetof(struct _PyInterpreterFrame, f_executable));
     printf("FrameInstrPtr=%zu\n", offsetof(struct _PyInterpreterFrame, instr_ptr));
     printf("FrameOwner=%zu\n", offsetof(struct _PyInterpreterFrame, owner));
-    printf("FrameOwnerMax=%d\n", (int)FRAME_OWNED_BY_CSTACK);
+    {
+        int values[] = { FRAME_OWNED_BY_THREAD, FRAME_OWNED_BY_GENERATOR,
+                          FRAME_OWNED_BY_FRAME_OBJECT, FRAME_OWNED_BY_INTERPRETER,
+                          FRAME_OWNED_BY_CSTACK };
+        int max = values[0];
+        for (size_t i = 1; i < sizeof(values)/sizeof(values[0]); i++) {
+            if (values[i] > max) max = values[i];
+        }
+        printf("FrameOwnerMax=%d\n", max);
+    }
     printf("FrameOwnerCStack=%d\n", (int)FRAME_OWNED_BY_CSTACK);
     printf("ThreadStateFrame=%zu\n", offsetof(PyThreadState, current_frame));
     printf("CodeArgCount=%zu\n", offsetof(PyCodeObject, co_argcount));
@@ -128,31 +160,46 @@ func TestOffsetsMatchRealInterpreters(t *testing.T) {
 				t.Fatalf("TableFor(%v): %v", tc.version, err)
 			}
 
-			check := func(field string, got, wantVal uint64) {
+			// check requires the field to actually be present in the
+			// probe's output. Without this, a field the probe silently
+			// failed to print (a typo, a removed printf, a compile error
+			// masked by shell scripting) reads as the zero value from an
+			// absent map entry -- which, for FrameExecutable, is also its
+			// correct value on every supported version, so a missing
+			// measurement could pass by coincidence rather than fail.
+			check := func(field string, wantVal uint64) {
 				t.Helper()
+				got, ok := measured[field]
+				if !ok {
+					t.Errorf("%s: probe printed no measurement for this field (missing key)", field)
+					return
+				}
 				if got != wantVal {
 					t.Errorf("%s: measured %d, table has %d", field, got, wantVal)
 				}
 			}
-			check("FramePrevious", measured["FramePrevious"], uint64(want.FramePrevious))
-			check("FrameExecutable", measured["FrameExecutable"], uint64(want.FrameExecutable))
-			check("FrameInstrPtr", measured["FrameInstrPtr"], uint64(want.FrameInstrPtr))
-			check("FrameOwner", measured["FrameOwner"], uint64(want.FrameOwner))
-			check("FrameOwnerMax", measured["FrameOwnerMax"], uint64(want.FrameOwnerMax))
-			check("FrameOwnerCStack", measured["FrameOwnerCStack"], uint64(want.FrameOwnerCStack))
-			check("CodeArgCount", measured["CodeArgCount"], uint64(want.CodeArgCount))
-			check("CodeKwOnlyArgCount", measured["CodeKwOnlyArgCount"], uint64(want.CodeKwOnlyArgCount))
-			check("CodeFlags", measured["CodeFlags"], uint64(want.CodeFlags))
-			check("CodeFirstLineNo", measured["CodeFirstLineNo"], uint64(want.CodeFirstLineNo))
+			check("FramePrevious", uint64(want.FramePrevious))
+			check("FrameExecutable", uint64(want.FrameExecutable))
+			check("FrameInstrPtr", uint64(want.FrameInstrPtr))
+			check("FrameOwner", uint64(want.FrameOwner))
+			check("FrameOwnerMax", uint64(want.FrameOwnerMax))
+			check("FrameOwnerCStack", uint64(want.FrameOwnerCStack))
+			check("CodeArgCount", uint64(want.CodeArgCount))
+			check("CodeKwOnlyArgCount", uint64(want.CodeKwOnlyArgCount))
+			check("CodeFlags", uint64(want.CodeFlags))
+			check("CodeFirstLineNo", uint64(want.CodeFirstLineNo))
 
 			// ThreadStateFrame: on 3.12 the probe measures the offset of
 			// `cframe` (the indirect case); on 3.13/3.14 it measures
 			// current_frame directly. Both compare against
 			// want.ThreadStateFrame, since that's what TableFor stores
 			// either way -- see ThreadStateFrameIndirect.
-			check("ThreadStateFrame", measured["ThreadStateFrame"], uint64(want.ThreadStateFrame))
+			check("ThreadStateFrame", uint64(want.ThreadStateFrame))
 			if tc.version.Minor == 12 {
-				if got := measured["CFrameCurrentFrame"]; got != 0 {
+				got, ok := measured["CFrameCurrentFrame"]
+				if !ok {
+					t.Error("3.12: probe printed no measurement for CFrameCurrentFrame (missing key)")
+				} else if got != 0 {
 					t.Errorf("3.12: _PyCFrame.current_frame must be at offset 0 (first field), got %d", got)
 				}
 				if !want.ThreadStateFrameIndirect {

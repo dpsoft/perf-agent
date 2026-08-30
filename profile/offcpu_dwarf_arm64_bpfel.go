@@ -62,6 +62,30 @@ type offcpu_dwarfPidMapping struct {
 	TableId  uint64
 }
 
+type offcpu_dwarfPyProcInfo struct {
+	_                        structs.HostLayout
+	TssKey                   uint32
+	PthreadSpecific1stblock  uint32
+	PthreadKeyDataSize       uint32
+	PthreadKeyDataOff        uint32
+	PthreadSize              uint32
+	FramePrevious            uint16
+	FrameExecutable          uint16
+	FrameInstrPtr            uint16
+	FrameOwner               uint16
+	ThreadstateFrame         uint16
+	CodeArgcount             uint16
+	CodeKwonlyargcount       uint16
+	CodeFlags                uint16
+	CodeFirstlineno          uint16
+	FrameOwnerMax            uint8
+	FrameOwnerCstack         uint8
+	FrameExecutableTagged    uint8
+	ThreadstateFrameIndirect uint8
+	Enabled                  uint8
+	Pad                      [1]uint8
+}
+
 type offcpu_dwarfSampleRecord struct {
 	_   structs.HostLayout
 	Hdr struct {
@@ -142,6 +166,7 @@ type offcpu_dwarfMapSpecs struct {
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
 	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
 	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
@@ -189,6 +214,7 @@ type offcpu_dwarfMaps struct {
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
+	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
 	StackEvents              *ebpf.Map `ebpf:"stack_events"`
 	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
@@ -206,6 +232,7 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
+		m.PyProcs,
 		m.StackEvents,
 		m.WalkerScratch,
 	)

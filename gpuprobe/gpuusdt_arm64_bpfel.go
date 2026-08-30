@@ -63,6 +63,30 @@ type gpuusdtPidMapping struct {
 	TableId  uint64
 }
 
+type gpuusdtPyProcInfo struct {
+	_                        structs.HostLayout
+	TssKey                   uint32
+	PthreadSpecific1stblock  uint32
+	PthreadKeyDataSize       uint32
+	PthreadKeyDataOff        uint32
+	PthreadSize              uint32
+	FramePrevious            uint16
+	FrameExecutable          uint16
+	FrameInstrPtr            uint16
+	FrameOwner               uint16
+	ThreadstateFrame         uint16
+	CodeArgcount             uint16
+	CodeKwonlyargcount       uint16
+	CodeFlags                uint16
+	CodeFirstlineno          uint16
+	FrameOwnerMax            uint8
+	FrameOwnerCstack         uint8
+	FrameExecutableTagged    uint8
+	ThreadstateFrameIndirect uint8
+	Enabled                  uint8
+	Pad                      [1]uint8
+}
+
 type gpuusdtSampleRecord struct {
 	_   structs.HostLayout
 	Hdr struct {
@@ -145,6 +169,7 @@ type gpuusdtMapSpecs struct {
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
+	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
 	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
@@ -193,6 +218,7 @@ type gpuusdtMaps struct {
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
+	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
 	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
@@ -214,6 +240,7 @@ func (m *gpuusdtMaps) Close() error {
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
+		m.PyProcs,
 		m.StackIdSeq,
 		m.StacksMissing,
 		m.WalkErrors,

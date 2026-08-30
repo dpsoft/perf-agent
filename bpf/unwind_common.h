@@ -376,6 +376,11 @@ struct {
     __type(value, __u32);
 } pid_mapping_lengths SEC(".maps");
 
+// ----- Python frame walking. See python_walk.h: py_proc_info, py_procs and
+// py_tss_get, the pthread-TSD reimplementation that reaches a target
+// thread's PyThreadState. Nothing here calls py_tss_get yet.
+#include "python_walk.h"
+
 // ----- Lookup helpers.
 //
 // These helpers are called per-frame by the hybrid walker. They

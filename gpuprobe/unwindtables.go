@@ -138,6 +138,19 @@ func (r *ehmapsRegistrar) enrollPython(pid uint32) {
 }
 
 func (r *ehmapsRegistrar) Unregister(pid uint32) error {
+	// The Python record goes with the CFI tables. py_procs is keyed by pid
+	// and walk_step trusts any enabled entry, so leaving one behind means a
+	// recycled pid whose new occupant is a different CPython build gets
+	// walked with the previous process's offsets -- plausible frames,
+	// wrong process. This consumer is long-lived, which is exactly the
+	// setting where pids come round again.
+	//
+	// Done before the CFI detach and reported separately: a failure here
+	// must not swallow the tracker's own error, and it is not a reason to
+	// skip releasing the tables.
+	if err := pyunwind.DetachProcess(pid, r.python); err != nil {
+		log.Printf("gpuprobe: python frames: pid %d: %v", pid, err)
+	}
 	return r.tracker.Detach(pid)
 }
 

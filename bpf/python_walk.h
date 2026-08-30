@@ -189,8 +189,8 @@ static __always_inline __u64 py_tss_get(__u32 key, struct py_proc_info *pi) {
 // bias, the same space mapping_for_pc reports rel_pc in.
 //
 // Nothing in this header populates it; userspace does, once per libpython it
-// recognises. Until it does, py_push_frames has no caller at runtime -- the
-// arm is present and verified, and simply never taken.
+// recognises (pyunwind.InstallEvalRange, from AttachProcess). Until a range
+// is installed for a binary, the arm is verified but never taken for it.
 struct py_eval_range { __u64 lo, hi; };
 
 struct {

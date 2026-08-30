@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cilium/ebpf"
+
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
@@ -59,7 +61,7 @@ func RequireGlibc(pid uint32) error {
 }
 
 // FindInterpreter picks the CPython image to walk out of a process's
-// executable mappings.
+// executable mappings, and reports the version it MEASURED from that image.
 //
 // Two shapes qualify and they are tried in that order:
 //
@@ -73,6 +75,20 @@ func RequireGlibc(pid uint32) error {
 // neither the eval loop nor _PyRuntime. Ordering by "libpython first"
 // rather than by whichever mapping /proc happens to list first is what
 // keeps that from being a coin flip.
+//
+// TWO PASSES, and the second one is why an unversioned interpreter is not
+// invisible. The first pass matches on the PATH, which is free and covers
+// every ordinary install. The second pass, taken only when the first
+// matched nothing, reads Py_Version out of each mapped file -- because
+// /usr/local/bin/python, a pyenv shim, a conda environment and an embedder
+// that dlopens a non-versioned libpython all carry no version in any name,
+// and before this they came back as "not a Python process": a silent
+// refusal, in a package where every other refusal is named, and the one a
+// real user is most likely to hit.
+//
+// The second pass costs one ELF open per distinct mapped file. That is a
+// one-time cost per target at attach, not a per-sample one, and it is paid
+// only by processes that mapped nothing version-named.
 func FindInterpreter(pid uint32) (path string, v Version, err error) {
 	mappings, err := procmap.NewResolver().Mappings(pid)
 	if err != nil {
@@ -84,9 +100,6 @@ func FindInterpreter(pid uint32) (path string, v Version, err error) {
 		if m.Path == "" || !m.IsExec || seen[m.Path] {
 			continue
 		}
-		if _, ok := DetectFromSoname(m.Path); !ok {
-			continue
-		}
 		seen[m.Path] = true
 		if strings.HasPrefix(filepath.Base(m.Path), "lib") {
 			libs = append(libs, m.Path)
@@ -96,10 +109,30 @@ func FindInterpreter(pid uint32) (path string, v Version, err error) {
 	}
 	sort.Strings(libs)
 	sort.Strings(exes)
-	for _, p := range append(libs, exes...) {
-		if ver, ok := DetectFromSoname(p); ok {
-			return p, ver, nil
+	candidates := append(append([]string{}, libs...), exes...)
+
+	// Pass 1: the path says which version it is. Refine the micro version
+	// from the file itself, so what gets logged is measured rather than
+	// inferred from a filename -- but keep the soname's answer if the file
+	// cannot be read, rather than losing a working detection to it.
+	for _, p := range candidates {
+		ver, ok := DetectFromSoname(p)
+		if !ok {
+			continue
 		}
+		if measured, err := VersionFromELF(p); err == nil {
+			ver = measured
+		}
+		return p, ver, nil
+	}
+
+	// Pass 2: the file says which version it is.
+	for _, p := range candidates {
+		measured, err := VersionFromELF(p)
+		if err != nil {
+			continue
+		}
+		return p, measured, nil
 	}
 	return "", Version{}, fmt.Errorf("%w: pid %d", ErrNoInterpreterMapped, pid)
 }
@@ -229,6 +262,37 @@ func EnrollTarget(pid uint32, m *BPFMaps) (libPath string, found bool, res Resul
 	res, err = AttachProcess(pid, libPath, tableID, m)
 	return libPath, true, res, err
 }
+
+// DetachProcess removes a process's py_procs record.
+//
+// PID REUSE IS THE REASON THIS EXISTS. py_procs is keyed by pid and
+// walk_step trusts any entry whose `enabled` byte is set -- it has no way to
+// tell that the pid it is walking belongs to a different process than the
+// one userspace validated. On a long-lived agent (the GPU path enrols
+// producers for as long as the daemon runs) a recycled pid whose new
+// occupant is a DIFFERENT CPython build would be walked with the previous
+// process's offsets: a plausible stack of wrong frames, which is the single
+// failure mode this whole package refuses everywhere else.
+//
+// A missing key is success, not an error: the common case is a process that
+// was never a Python target at all.
+func DetachProcess(pid uint32, m *BPFMaps) error {
+	if m == nil || m.PyProcs == nil {
+		return nil
+	}
+	if err := m.PyProcs.Delete(&pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("pyunwind: delete py_procs[%d]: %w", pid, err)
+	}
+	return nil
+}
+
+// The eval RANGE is deliberately NOT removed here. It is keyed by table_id
+// (a binary), not by pid, so it stays correct for every other process
+// running that same libpython, and re-deriving which ranges are still in
+// use would duplicate the refcounting the CFI TableStore already does for
+// the same binaries. A stale range costs one hash lookup per eval-loop
+// frame in a process with no py_procs entry, which walk_step already counts
+// as PY_CNT_NO_PROC_INFO and handles by marking the sample done.
 
 // TableIDForMapping computes the same FNV-1a-of-build-id key the CFI tables
 // use for a binary, so an eval range lands under the key walk_step already

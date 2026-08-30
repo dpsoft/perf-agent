@@ -24,11 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lands. It is **amd64 + glibc only** (the pthread-TSD offsets it needs have been
   measured there and nowhere else; a musl target is refused by name), covers
   **CPython 3.12, 3.13 and 3.14** GIL builds (a free-threaded `Py_GIL_DISABLED`
-  build is refused by name), and is wired for **`--pid` captures only** —
-  system-wide (`-a`) still produces native-only stacks and says so in the log.
-  The GPU launch path (`gpuprobe`) enrols interpreters the same way and inherits
-  the same walker, but **that combination has not been validated on hardware**:
-  no CI machine has a GPU. An interpreter that cannot be
+  build is refused by name), and is wired for **`--pid` on-CPU captures only** —
+  system-wide (`-a`) still produces native-only stacks and says so in the log,
+  and the off-CPU profiler exposes no Python maps at all, so `--offcpu` stacks
+  stay native. The GPU launch path (`gpuprobe`) enrols interpreters the same way
+  and inherits the same walker, but **that combination has not been validated on
+  hardware**: no CI machine has a GPU.
+
+  Two narrower limits, recorded because their failure mode is a wrong frame
+  rather than a missing one. A free-threaded build is recognised by the `t` ABI
+  flag in its soname or versioned executable name, which every ordinary install
+  carries; a **statically linked free-threaded interpreter installed under a name
+  with neither a version nor the `t` flag** would not be recognised, and nothing
+  measurable in the ELF distinguishes the two ABIs (`Py_Version` is identical).
+  And the glibc pthread-TSD offsets were measured once, on Fedora glibc 2.43,
+  and are applied to **every glibc with no version gate** — long-stable values,
+  checked at attach by reading a real frame, but not checked against the libc. An interpreter that cannot be
   walked is always refused with a reason on stderr, never walked with guessed
   offsets; `py_walk_counters` is reported at shutdown so a run that walked
   nothing is distinguishable from a run with no Python in it.

@@ -38,7 +38,7 @@ type frameSlot struct {
 
 // PythonFrameStats summarizes what the tagged-slot decoder has seen across
 // this process. Package-level rather than per-session because the decoder is
-// a stateless function, mirroring profile.FrameDecodeCounters.
+// a stateless function with no session to hang counters on.
 type PythonFrameStats struct {
 	// Frames is the number of Python frames seen, counted once per SAMPLE
 	// (in the ringbuf aggregator, where each sample is decoded exactly once)

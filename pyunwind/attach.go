@@ -66,11 +66,12 @@ type Result struct {
 	// Refused is empty on success and carries an operator-readable reason
 	// otherwise -- for logs and humans.
 	Refused string
-	// Reason is nil on success and, otherwise, one of this package's nine
+	// Reason is nil on success and, otherwise, one of this package's
 	// sentinel errors (possibly wrapped with extra context via %w):
 	// ErrNotAnInterpreter, ErrFreeThreaded, ErrUnsupportedVersion,
-	// ErrUnsupportedArch, ErrTLSBaseUnavailable, ErrTSSPatternUnrecognised,
-	// ErrSymbolNotFound, ErrOffsetsUnreadable, ErrOffsetsImplausible.
+	// ErrVersionMismatch, ErrUnsupportedArch, ErrUnsupportedLibc,
+	// ErrTLSBaseUnavailable, ErrTSSPatternUnrecognised, ErrSymbolNotFound,
+	// ErrOffsetsUnreadable, ErrOffsetsImplausible, ErrEvalLoopNotLocatable.
 	// Callers -- Task 7's counters in particular -- must use errors.Is
 	// against Reason, not strings.Contains/parsing against Refused: Refused
 	// is prose for a human, Reason is the machine-checkable classification.
@@ -84,8 +85,9 @@ func refuseWith(v Version, err error) Result {
 	return Result{Version: v, Refused: err.Error(), Reason: err}
 }
 
-// classify decides from a mapped path alone, before any target memory is
-// read. Split out so the decision is testable without a live process.
+// classify decides what a mapped image is, before any of the TARGET's
+// memory is read. It reads the image FILE (see the version reconciliation
+// below); it does not touch the process.
 //
 // Order: free-threaded is checked before Supported(), because a
 // free-threaded 3.13 or 3.14 build numerically passes Supported() -- it is
@@ -95,8 +97,43 @@ func refuseWith(v Version, err error) Result {
 func classify(path string) Result {
 	v, ok := DetectFromSoname(path)
 	if !ok {
-		return refuseWith(v, fmt.Errorf("%w: no CPython version in the mapped path %q", ErrNotAnInterpreter, path))
+		// The path says nothing about the version. Ask the binary, because
+		// an interpreter whose path carries no version is ordinary --
+		// /usr/local/bin/python, a pyenv shim, a conda environment, an
+		// embedder that dlopens an unversioned libpython -- and refusing it
+		// on the strength of its filename was this package's one SILENT
+		// refusal: indistinguishable, from outside, from "not a Python
+		// process at all".
+		measured, err := VersionFromELF(path)
+		if err != nil {
+			return refuseWith(v, fmt.Errorf(
+				"%w: no CPython version in the mapped path %q, and no readable Py_Version in the file either (%v)",
+				ErrNotAnInterpreter, path, err))
+		}
+		v = measured
+	} else if measured, err := VersionFromELF(path); err == nil {
+		// The path DOES say a version, and so does the binary. They must
+		// agree on major.minor, because the offset table is chosen by minor
+		// version: a libpython3.12.so.1.0 that is really 3.13 would be
+		// walked with 3.12's _PyInterpreterFrame layout, which produces a
+		// plausible stack of wrong frames rather than a failure.
+		if measured.Major != v.Major || measured.Minor != v.Minor {
+			return refuseWith(measured, fmt.Errorf(
+				"%w: %s is named for CPython %v but its Py_Version reads %v",
+				ErrVersionMismatch, path, v, measured))
+		}
+		// Same version, plus the micro the soname could not carry. What
+		// gets logged is then what was measured.
+		v = measured
 	}
+	// A free-threaded build is refused by NAME, and that check is what the
+	// pass-2 path above cannot do for itself: PEP 703 puts the "t" ABI flag
+	// in the soname and in the versioned executable name, so every ordinary
+	// free-threaded install is caught here -- but a STATICALLY linked
+	// free-threaded interpreter installed under a name carrying neither a
+	// version nor the "t" flag would reach the walker. Nothing measurable
+	// in the ELF distinguishes the two ABIs (Py_Version is identical), and
+	// guessing is worse than the narrow gap. Recorded in the CHANGELOG.
 	if freeThreadedSonameRe.MatchString(path) {
 		return refuseWith(v, fmt.Errorf(
 			"%w: %q is a free-threaded build; this build's offsets assume the GIL build and are wrong for it", ErrFreeThreaded, path))

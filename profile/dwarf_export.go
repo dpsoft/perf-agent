@@ -2,7 +2,6 @@ package profile
 
 import (
 	"fmt"
-	"sync/atomic"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -175,80 +174,4 @@ func (p *PerfDwarf) CFIMissRingbuf() *ebpf.Map {
 // needed by the production path.
 func (p *PerfDwarf) CFIMissRatelimitMap() *ebpf.Map {
 	return p.objs.CfiMissRatelimit
-}
-
-// Frame tags, matching FRAME_TAG_* in bpf/unwind_common.h. pcs[] is no
-// longer a flat PC array: a Python frame occupies two slots, so each
-// entry carries its kind. Issue #83.
-const (
-	frameTagNative = 0
-	frameTagPython = 1
-)
-
-// PythonFrame is an unresolved Python frame: the code object's address in
-// the target and the encoded (fingerprint, f_lasti) word. Symbolization is
-// slice 3; until then these render as addresses.
-type PythonFrame struct {
-	CodeObject uint64
-	Encoded    uint64
-}
-
-// sampleRecord mirrors the Go-visible slice of bpf/unwind_common.h's
-// struct sample_record that decodeFrames cares about: the valid-slot
-// count plus the parallel pcs[]/tags[] arrays. It intentionally omits
-// sample_header's other fields (pid, time_ns, ...) — nothing here reads
-// them. Not yet wired to the ringbuf consumer (unwind/dwarfagent/sample.go
-// parses those bytes directly); this is the decode logic later tasks wire
-// in once frame_push_python has a caller.
-type sampleRecord struct {
-	NPcs uint8
-	Pcs  [127]uint64
-	Tags [127]uint8
-}
-
-// FrameDecodeStats summarizes decodeFrames' lifetime activity across every
-// call in this process. Exported for tests; mirrors the atomic-counter +
-// snapshot-struct idiom unwind/dwarfagent/miss_drainer.go uses for
-// MissStats, adapted to a package-level counter because decodeFrames is a
-// stateless function with no session to hang counters on.
-type FrameDecodeStats struct {
-	TruncatedPythonPairs uint64 // trailing FRAME_TAG_PYTHON slot with no partner word; dropped, not half-read
-}
-
-var truncatedPythonPairs atomic.Uint64
-
-// FrameDecodeCounters returns a snapshot of decodeFrames' counters.
-func FrameDecodeCounters() FrameDecodeStats {
-	return FrameDecodeStats{TruncatedPythonPairs: truncatedPythonPairs.Load()}
-}
-
-// decodeFrames splits a record's tagged slots into native PCs and Python
-// frame pairs. Python frames occupy two consecutive slots; a trailing
-// half-pair is dropped and counted (TruncatedPythonPairs) rather than
-// half-read — MAX_FRAMES truncating mid-pair must never be silent.
-//
-// IT SEPARATES BY KIND AND THEREFORE LOSES THE INTERLEAVING, so it must not
-// be used to build a call path. Two lists cannot say which native frame each
-// Python frame sat above, and a stack whose Python frames are all piled at
-// one end is a plausible call path that never happened. The two decoders that
-// DO build call paths keep one ordered list with the pairs folded in place —
-// dwarfagent.splitFrameSlots (unwind/dwarfagent/pythonframes.go) for the
-// ringbuf path and gpuprobe's splitGPUStackSlots for the GPU path. Use one of
-// those. This one survives as the counted-decode unit test fixture it was
-// written as in Task 1; it has no production caller.
-func decodeFrames(rec *sampleRecord) (pcs []uint64, py []PythonFrame) {
-	for i := 0; i < int(rec.NPcs); i++ {
-		switch rec.Tags[i] {
-		case frameTagNative:
-			pcs = append(pcs, rec.Pcs[i])
-		case frameTagPython:
-			if i+1 >= int(rec.NPcs) {
-				truncatedPythonPairs.Add(1)
-				return pcs, py // truncated pair
-			}
-			py = append(py, PythonFrame{CodeObject: rec.Pcs[i], Encoded: rec.Pcs[i+1]})
-			i++
-		}
-	}
-	return pcs, py
 }

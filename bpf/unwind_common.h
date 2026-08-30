@@ -567,11 +567,11 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 //           push, fewer than 2 remaining for a Python pair). The record
 //           itself is not corrupted - the refused frame simply never
 //           landed - but the walk is one frame shorter than it otherwise
-//           would be. Reachable today only from the FP-nonmonotonic arm's
-//           second push in the same iteration as the one that fills the
-//           record (see frame_push_native's call there); it will fire far
-//           more often once frame_push_python has a caller, since a
-//           two-slot push can be refused with only one slot free.
+//           would be. Reached from the FP-nonmonotonic arm's second push
+//           in the same iteration as the one that fills the record (see
+//           frame_push_native's call there), and from frame_push_python,
+//           whose two-slot push can be refused with one slot still free --
+//           so it fires on shallower stacks than a native push alone would.
 //           Distinct from bit 2 (a CFI table gap): this is the record
 //           running out of room, not a classification failure.
 //
@@ -651,8 +651,8 @@ static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
 // frame_push_python appends a two-slot Python frame (code object address,
 // then an encoded fingerprint/f_lasti word), both tagged FRAME_TAG_PYTHON.
 // Returns 0 on success, 1 if fewer than two slots remain — the caller must
-// stop walking in that case rather than push a half-pair. Nothing calls
-// this yet; a later task drives it from the CPython frame-chain walker.
+// stop walking in that case rather than push a half-pair. Its caller is
+// py_push_frames, below, which drives the CPython frame-chain walk.
 // Keeping the MAX_FRAMES bounds check here, alongside frame_push_native's,
 // means every place this record can overflow is checked in exactly one
 // spot rather than re-derived at each call site. Like frame_push_native,

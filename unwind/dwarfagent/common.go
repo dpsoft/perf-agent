@@ -58,6 +58,14 @@ type session struct {
 	pid    int
 	tags   []string
 	labels map[string]string
+	// logPrefix names this session in log lines ("dwarfagent",
+	// "dwarfagent-offcpu"); newSession already takes it, and close() needs
+	// it to attribute the Python walk counters to the right profiler.
+	logPrefix string
+	// pythonEnrolled records whether newSession found a CPython image in
+	// the target at all, so close() can decide whether the Python walk
+	// counters are news or noise.
+	pythonEnrolled bool
 
 	objs             sessionObjs
 	store            *ehmaps.TableStore
@@ -170,6 +178,25 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		}
 	}
 
+	// CPython frames, per target PID.
+	//
+	// It runs AFTER the mapping enrolment above and not before: the eval
+	// range enrollPython installs is keyed by table_id, and a table_id only
+	// resolves to a PC once that binary has a pid_mappings row. Installed
+	// the other way round, the arm would be on for a binary walk_step
+	// cannot yet attribute a PC to.
+	//
+	// System-wide is deliberately not covered yet: enrolling every python
+	// process on a box means one ptrace stop per process at startup, which
+	// wants its own measurement. Named here rather than left as silence --
+	// see the log line.
+	var pythonEnrolled bool
+	if systemWide {
+		log.Printf("%s: python frames: not enrolled in system-wide mode (per-PID only for now); stacks stay native-only", logPrefix)
+	} else if pid > 0 {
+		pythonEnrolled = enrollPython(objs, uint32(pid), logPrefix)
+	}
+
 	var watcher mmapEventSourceCloser
 	if systemWide {
 		cpuInts := make([]int, 0, len(cpus))
@@ -216,6 +243,8 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	resolver := procmap.NewResolver()
 	sess := &session{
 		pid:              pid,
+		logPrefix:        logPrefix,
+		pythonEnrolled:   pythonEnrolled,
 		tags:             tags,
 		labels:           labels,
 		objs:             objs,
@@ -472,6 +501,10 @@ func (s *session) close() error {
 	if s.resolver != nil {
 		s.resolver.Close()
 	}
+	// One last reading of the Python walk before the maps go away with the
+	// BPF handle: after objs.Close() the counters are gone, and a run that
+	// walked nothing is exactly the run whose counters need reporting.
+	logPythonWalkCounters(s.objs, s.logPrefix, s.pythonEnrolled)
 	// Symbolizer is owned by the Agent; do not close it here.
 	return s.objs.Close()
 }

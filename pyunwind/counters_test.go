@@ -48,6 +48,7 @@ func TestReadWalkCountersSumsAcrossCPUsIntoNamedFields(t *testing.T) {
 		PyCntChainTruncated:   {5},
 		PyCntPushRefused:      {9, 1},
 		PyCntNoneExecutable:   {6},
+		PyCntChainAbandoned:   {11, 4},
 	}}
 
 	got, err := ReadWalkCounters(m)
@@ -64,6 +65,7 @@ func TestReadWalkCountersSumsAcrossCPUsIntoNamedFields(t *testing.T) {
 		ChainTruncated:   5,
 		PushRefused:      10,
 		NoneExecutable:   6,
+		ChainAbandoned:   15,
 	}
 	if got != want {
 		t.Fatalf("counters decoded to the wrong fields:\n got %+v\nwant %+v", got, want)
@@ -128,6 +130,7 @@ func TestWalkCounterSlotsMirrorTheBPFHeader(t *testing.T) {
 		{"PY_CNT_CHAIN_TRUNCATED", PyCntChainTruncated},
 		{"PY_CNT_PUSH_REFUSED", PyCntPushRefused},
 		{"PY_CNT_NONE_EXECUTABLE", PyCntNoneExecutable},
+		{"PY_CNT_CHAIN_ABANDONED", PyCntChainAbandoned},
 		{"PY_CNT_MAX", PyCntMax},
 	} {
 		want := fmt.Sprintf("#define %s ", tc.macro)

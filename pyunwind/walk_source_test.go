@@ -2,6 +2,7 @@ package pyunwind
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -235,4 +236,118 @@ func pyPushFramesAfterChainLoop(t *testing.T) string {
 	}
 	t.Fatal("the chain loop's closing brace was never reached; braces are unbalanced or the loop was reshaped")
 	return ""
+}
+
+// PY_CNT_CHAIN_ABANDONED is the one counter neither py_push_frames nor
+// walk_step can bump: a live cursor only becomes a LOST Python segment once
+// the native walk is over, and nothing inside the bpf_loop callback knows it
+// is running for the last time. Each driver has to ask after bpf_loop returns,
+// which means the property lives in three files and can be half-applied --
+// exactly the shape that leaves one profiler silently short.
+//
+// Global Constraint: every refusal, miss or truncation increments a named
+// counter. This is the last place on the Python path where that did not hold.
+func TestEveryDriverCountsAnAbandonedPythonChain(t *testing.T) {
+	for _, driver := range []string{
+		"../bpf/perf_dwarf.bpf.c",
+		"../bpf/offcpu_dwarf.bpf.c",
+		"../bpf/gpu_usdt.bpf.c",
+	} {
+		t.Run(filepath.Base(driver), func(t *testing.T) {
+			src, err := os.ReadFile(driver)
+			if err != nil {
+				t.Fatalf("read %s: %v", driver, err)
+			}
+			body := string(src)
+
+			loop := strings.Index(body, "bpf_loop(MAX_FRAMES, walk_step, &walker, 0);")
+			if loop < 0 {
+				t.Fatalf("%s does not drive the shared walker; the Python arm cannot reach it", driver)
+			}
+			// Everything the driver does AFTER the walk. Asking before it
+			// would read a cursor that is still being written.
+			after := body[loop+len("bpf_loop(MAX_FRAMES, walk_step, &walker, 0);"):]
+
+			// Comments are stripped before anything is matched: these
+			// drivers carry a prose reference to PY_CNT_CHAIN_ABANDONED
+			// above the call, and a naive search finds the mention rather
+			// than the code. That is how a source-inspection test ends up
+			// asserting against its own documentation.
+			code := stripLineComments(after)
+
+			call := strings.Index(code, "py_count(PY_CNT_CHAIN_ABANDONED)")
+			if call < 0 {
+				t.Errorf("%s never counts an abandoned Python chain: a native walk that stops early "+
+					"drops the outer Python segment and no counter moves", driver)
+				return
+			}
+			// The nearest `if (` before the call must be the cursor test.
+			// Anchoring on "nearest" rather than "anywhere in the function"
+			// is what makes this fail when the guard is dropped: some other
+			// condition then becomes the nearest one.
+			prefix := code[:call]
+			lastIf := strings.LastIndex(prefix, "if (")
+			if lastIf < 0 || !strings.Contains(prefix[lastIf:], "walker.py_state == PY_CHAIN_ACTIVE") {
+				t.Errorf("%s bumps PY_CNT_CHAIN_ABANDONED without testing that the cursor was live; "+
+					"it would count every sample, including the ones that lost nothing", driver)
+			}
+		})
+	}
+}
+
+// A native-walk outcome, not a Python failure -- and the walker_flags join is
+// the only way a reader can tell "the unwinder gave out" from
+// "py_eval_ranges is missing an entry". Both readings must be written down
+// where the counter is defined, or the number is unactionable.
+func TestTheAbandonedChainCounterDocumentsItsFlagJoin(t *testing.T) {
+	src, err := os.ReadFile("../bpf/python_walk.h")
+	if err != nil {
+		t.Fatalf("read python_walk.h: %v", err)
+	}
+	body := string(src)
+	start := strings.Index(body, "PY_CNT_CHAIN_ABANDONED is a NATIVE-WALK")
+	if start < 0 {
+		t.Fatal("PY_CNT_CHAIN_ABANDONED has no doc block naming it a native-walk outcome")
+	}
+	// Bounded to the comment block itself, not sliced to end of file. A slice
+	// that runs to EOF passes on any landmark that happens to appear later in
+	// the header, which is the same shape as the assertion that could not
+	// fail (see TestTheChainIsResumedNotRestarted).
+	var doc strings.Builder
+	for line := range strings.SplitSeq(body[start:], "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "//") && doc.Len() > 0 {
+			break
+		}
+		doc.WriteString(line)
+		doc.WriteByte('\n')
+	}
+	for _, flag := range []string{
+		"WALKER_FLAG_FP_EXHAUSTED",
+		"WALKER_FLAG_FP_NONMONOTONIC",
+		"WALKER_FLAG_CFI_MISS",
+		"WALKER_FLAG_FRAME_PUSH_REFUSED",
+		"WALKER_FLAG_FP_TERMINATED",
+		"WALKER_FLAG_RA_UNDEFINED",
+		"py_eval_ranges",
+	} {
+		if !strings.Contains(doc.String(), flag) {
+			t.Errorf("the doc block does not name %s; a reader cannot reconstruct the join alone", flag)
+		}
+	}
+}
+
+// stripLineComments blanks // comments so a landmark quoted in prose cannot be
+// mistaken for the code that does the thing. Newlines are preserved so line
+// structure survives.
+func stripLineComments(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	for line := range strings.SplitSeq(src, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

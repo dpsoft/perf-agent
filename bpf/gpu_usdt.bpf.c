@@ -500,6 +500,15 @@ static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
     rec->hdr.walker_flags = 0;
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
 
+    // A live Python cursor here means py_push_frames reached an interpreter
+    // entry frame with an outer segment behind it and the native walk ended
+    // before landing on that segment's eval-loop PC. Asked once, here, because
+    // this is the only point that knows the walk is over. See
+    // PY_CNT_CHAIN_ABANDONED in python_walk.h for the walker_flags join that
+    // separates "the native unwinder gave out" from "py_eval_ranges is
+    // missing an entry".
+    if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
+
     n = walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs;
     if (n == 0) {
         // Not even the probe's own PC came back. Nothing to attribute, and

@@ -220,13 +220,16 @@ struct {
 //   slot 0 (FRAMES_PUSHED)  counts FRAMES. One per Python frame that reached
 //                           the record, so it grows with stack depth.
 //   slots 1..8 (everything  count SAMPLES. Each is bumped at most once per
-//   else)                   sample, and that is a structural property, not a
+//   except 9)               sample, and that is a structural property, not a
 //                           convention: every one of those paths leaves
 //                           walk_ctx.py_state == PY_CHAIN_DONE, and both
 //                           py_push_frames and walk_step's interpreter arm
 //                           do nothing at all once it is DONE. So a deep
 //                           native stack that lands on the eval loop twenty
 //                           times still contributes at most one.
+//   slot 9 (CHAIN_          counts SAMPLES too, by a different mechanism: the
+//   ABANDONED)              drivers ask the question exactly once, after
+//                           bpf_loop returns.
 //
 // The useful ratios therefore read: FRAMES_PUSHED / (samples with Python) is
 // mean Python depth, and every other slot over the sample count is a rate of
@@ -243,10 +246,49 @@ struct {
 #define PY_CNT_CHAIN_TRUNCATED   6  // PY_MAX_FRAMES_PER_ENTRY ran out before
                                     // the chain reached its C boundary
 #define PY_CNT_PUSH_REFUSED      7  // frame_push_python had no room left
-#define PY_CNT_NONE_EXECUTABLE   8  // f_executable was NULL or Py_None: the
-                                    // top C-entered frame on 3.13+, a normal
-                                    // stop rather than a failure
-#define PY_CNT_MAX               9
+#define PY_CNT_NONE_EXECUTABLE   8  // f_executable was NULL or Py_None on a
+                                    // frame the owner test did not already
+                                    // stop at: a torn-read backstop, expected
+                                    // to read zero (see py_push_frames)
+#define PY_CNT_CHAIN_ABANDONED   9  // the NATIVE walk stopped while a Python
+                                    // cursor was still live; see below
+#define PY_CNT_MAX               10
+
+// PY_CNT_CHAIN_ABANDONED is a NATIVE-WALK OUTCOME WITH A PYTHON COST, not a
+// Python-side failure. Nothing in the Python walk went wrong; the walk simply
+// never got another turn.
+//
+// The cursor goes live when py_push_frames reaches an interpreter entry frame
+// whose `previous` is non-NULL -- meaning there is an OUTER Python segment
+// waiting below the C code -- and it is consumed the next time the native walk
+// lands on an eval-loop PC. If the native walk ends first, that segment is
+// absent from the sample and every other counter here reads clean.
+//
+// It cannot be bumped from py_push_frames or from walk_step: neither knows it
+// is running for the last time. The drivers bump it after bpf_loop returns,
+// which is the only place the question can be asked.
+//
+// THE JOIN A READER NEEDS. This never arrives alone -- the record's
+// walker_flags always say why the native walk stopped, and the flags separate
+// two quite different causes:
+//
+//   * With an early-stop bit -- WALKER_FLAG_FP_EXHAUSTED (0x10),
+//     WALKER_FLAG_FP_NONMONOTONIC (0x20), WALKER_FLAG_CFI_MISS (0x04) or
+//     WALKER_FLAG_FRAME_PUSH_REFUSED (0x80) -- the native unwinder gave out
+//     or ran out of room. The Python frames are collateral damage and the fix
+//     is on the native side (unwind tables, MAX_FRAMES).
+//
+//   * With a clean ending instead -- WALKER_FLAG_FP_TERMINATED (0x01) and/or
+//     WALKER_FLAG_RA_UNDEFINED (0x08), no early-stop bit -- the native walk
+//     reached the root and simply never recognised the outer segment's
+//     eval-loop PC. That points at py_eval_ranges: a libpython whose range was
+//     never installed, or an eval loop entered through a PC outside the
+//     installed range. This is the reading that matters, because everything
+//     else about such a sample looks perfect.
+//
+// Being a native outcome, it is expected to be non-zero on any real workload
+// with deep stacks. It is a cost, not an error rate: read it against
+// PY_CNT_FRAMES_PUSHED to see what fraction of the Python stack is being lost.
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);

@@ -104,6 +104,15 @@ static __always_inline void handle_switch_out(void *ctx, struct task_struct *pre
     rec->hdr.walker_flags = 0;
     bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
 
+    // A live Python cursor here means py_push_frames reached an interpreter
+    // entry frame with an outer segment behind it and the native walk ended
+    // before landing on that segment's eval-loop PC. Asked once, here, because
+    // this is the only point that knows the walk is over. See
+    // PY_CNT_CHAIN_ABANDONED in python_walk.h for the walker_flags join that
+    // separates "the native unwinder gave out" from "py_eval_ranges is
+    // missing an entry".
+    if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
+
     // Kernel-stack capture for prev. At sched_switch, prev is still
     // "current" so bpf_get_stackid(ctx, …) records prev's kernel stack.
     // Default -1 so userspace can skip the lookup without branching on

@@ -50,6 +50,14 @@ type gpuusdtGpuStack struct {
 	_           [1]byte
 }
 
+type gpuusdtHandoffRange struct {
+	_          structs.HostLayout
+	Lo         uint64
+	Hi         uint64
+	UnwinderId uint32
+	Pad        uint32
+}
+
 type gpuusdtPidConfig struct {
 	_             structs.HostLayout
 	Type          uint8
@@ -122,6 +130,23 @@ type gpuusdtSampleRecord struct {
 	_    [1]byte
 }
 
+type gpuusdtWalkPersist struct {
+	_               structs.HostLayout
+	Pc              uint64
+	Fp              uint64
+	Sp              uint64
+	PyFrame         uint64
+	PyIter          uint64
+	Pid             uint32
+	N_pcs           uint32
+	PendingUnwinder uint32
+	TailCalls       uint32
+	PyState         uint8
+	SkipPush        uint8
+	Resuming        uint8
+	Pad             [5]uint8
+}
+
 // loadGpuusdt returns the embedded CollectionSpec for gpuusdt.
 func loadGpuusdt() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_GpuusdtBytes)
@@ -181,6 +206,7 @@ type gpuusdtMapSpecs struct {
 	Events                   *ebpf.MapSpec `ebpf:"events"`
 	GpuStackScratch          *ebpf.MapSpec `ebpf:"gpu_stack_scratch"`
 	GpuStacks                *ebpf.MapSpec `ebpf:"gpu_stacks"`
+	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
@@ -191,6 +217,7 @@ type gpuusdtMapSpecs struct {
 	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
+	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
@@ -201,6 +228,7 @@ type gpuusdtVariableSpecs struct {
 	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
 	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 }
 
@@ -234,6 +262,7 @@ type gpuusdtMaps struct {
 	Events                   *ebpf.Map `ebpf:"events"`
 	GpuStackScratch          *ebpf.Map `ebpf:"gpu_stack_scratch"`
 	GpuStacks                *ebpf.Map `ebpf:"gpu_stacks"`
+	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
@@ -244,6 +273,7 @@ type gpuusdtMaps struct {
 	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
+	WalkStates               *ebpf.Map `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
 
@@ -259,6 +289,7 @@ func (m *gpuusdtMaps) Close() error {
 		m.Events,
 		m.GpuStackScratch,
 		m.GpuStacks,
+		m.HandoffRanges,
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
@@ -269,6 +300,7 @@ func (m *gpuusdtMaps) Close() error {
 		m.StackIdSeq,
 		m.StacksMissing,
 		m.WalkErrors,
+		m.WalkStates,
 		m.WalkerScratch,
 	)
 }
@@ -280,6 +312,7 @@ type gpuusdtVariables struct {
 	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
 	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 }
 

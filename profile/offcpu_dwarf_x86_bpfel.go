@@ -41,6 +41,14 @@ type offcpu_dwarfClassification struct {
 	Pad        [3]uint8
 }
 
+type offcpu_dwarfHandoffRange struct {
+	_          structs.HostLayout
+	Lo         uint64
+	Hi         uint64
+	UnwinderId uint32
+	Pad        uint32
+}
+
 type offcpu_dwarfOffcpuStartKey struct {
 	_    structs.HostLayout
 	Pid  uint32
@@ -119,6 +127,23 @@ type offcpu_dwarfSampleRecord struct {
 	_    [1]byte
 }
 
+type offcpu_dwarfWalkPersist struct {
+	_               structs.HostLayout
+	Pc              uint64
+	Fp              uint64
+	Sp              uint64
+	PyFrame         uint64
+	PyIter          uint64
+	Pid             uint32
+	N_pcs           uint32
+	PendingUnwinder uint32
+	TailCalls       uint32
+	PyState         uint8
+	SkipPush        uint8
+	Resuming        uint8
+	Pad             [5]uint8
+}
+
 // loadOffcpu_dwarf returns the embedded CollectionSpec for offcpu_dwarf.
 func loadOffcpu_dwarf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_Offcpu_dwarfBytes)
@@ -174,6 +199,7 @@ type offcpu_dwarfMapSpecs struct {
 	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
+	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
 	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
@@ -184,6 +210,7 @@ type offcpu_dwarfMapSpecs struct {
 	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
+	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
@@ -195,6 +222,7 @@ type offcpu_dwarfVariableSpecs struct {
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.VariableSpec `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
 	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
 	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
@@ -226,6 +254,7 @@ type offcpu_dwarfMaps struct {
 	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
 	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
+	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
 	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
@@ -236,6 +265,7 @@ type offcpu_dwarfMaps struct {
 	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.Map `ebpf:"stack_events"`
+	WalkStates               *ebpf.Map `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
 }
 
@@ -247,6 +277,7 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
 		m.CfiRules,
+		m.HandoffRanges,
 		m.KernStackmap,
 		m.OffcpuStart,
 		m.PidMappingLengths,
@@ -257,6 +288,7 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.PyProcs,
 		m.PyWalkCounters,
 		m.StackEvents,
+		m.WalkStates,
 		m.WalkerScratch,
 	)
 }
@@ -269,6 +301,7 @@ type offcpu_dwarfVariables struct {
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.Variable `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
 	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
 	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.Variable `ebpf:"system_wide"`

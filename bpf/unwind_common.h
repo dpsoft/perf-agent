@@ -313,6 +313,13 @@ struct walk_ctx {
     // callback that stops on its last permitted iteration returns the same
     // count as one that never stopped at all.
     __u8  py_iter_stopped;
+    // Set by walk_step when another unwinder claims the frame it stopped on;
+    // read by the driver after bpf_loop returns. UNWINDER_NATIVE means the
+    // walk ended for one of the ordinary reasons.
+    __u32 pending_unwinder;
+    // Set with pending_unwinder; consumed by the first iteration after the
+    // walk resumes. See walk_step.
+    __u8  skip_push;
     __u8  _pad[6];
 };
 
@@ -817,11 +824,147 @@ static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
 #endif
 const volatile bool python_walk_enabled = PYTHON_WALK_DEFAULT;
 
+// ----- Handing a frame to another unwinder.
+//
+// The core walks native frames. When a PC belongs to something that needs its
+// own walker -- a language runtime whose frames are not on the machine stack --
+// the walk stops there and hands off. This is the ONLY thing the core knows
+// about that: a range of text, and an opaque id saying who claims it.
+//
+// Keyed by table_id, which mapping_for_pc has already computed, so a process
+// with no registered unwinder pays one hash on a value it is holding anyway.
+// lo/hi are in the same load-bias-relative space mapping_for_pc reports
+// rel_pc in.
+#define UNWINDER_NATIVE 0
+
+struct handoff_range {
+    __u64 lo, hi;
+    __u32 unwinder_id;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);              // table_id
+    __type(value, struct handoff_range);
+    __uint(max_entries, 64);
+} handoff_ranges SEC(".maps");
+
+// interp_enabled gates the handoff at LOAD time, and its placement is part of
+// the design rather than a wrapper around it.
+//
+// The question it answers is not "can we turn Python off" but "what does a
+// deployment with no interpreters pay". Asking it costs 2.4x the native
+// walker's verifier states (339,443 against 144,319 -- see rd-report.md), and
+// that is a cost every user would carry, including those who never profile a
+// runtime. A `const volatile` is a constant to the verifier, so with this
+// false the lookup, the comparisons AND the early-return branch are pruned
+// before verification and the program is exactly the native walker again.
+//
+// Default true; userspace turns it off on a kernel that refuses the program
+// (profile.loadWithPythonGate) or when nothing has registered an unwinder.
+#ifndef INTERP_DEFAULT
+#define INTERP_DEFAULT true
+#endif
+const volatile bool interp_enabled = INTERP_DEFAULT;
+
+// next_unwinder answers "does something other than the native walker claim
+// this PC". UNWINDER_NATIVE means carry on.
+static __always_inline __u32 next_unwinder(__u64 table_id, __u64 rel_pc) {
+    struct handoff_range *h = bpf_map_lookup_elem(&handoff_ranges, &table_id);
+    if (!h) return UNWINDER_NATIVE;
+    if (rel_pc < h->lo || rel_pc >= h->hi) return UNWINDER_NATIVE;
+    return h->unwinder_id;
+}
+
+// walk_persist is the part of a walk that has to survive a tail call.
+//
+// It is deliberately NOT struct walk_ctx. A tail call replaces the running
+// program, so the driver's stack is gone and the cursor has to live in a map
+// -- and a map value may not contain pointers. bpf2go refuses outright:
+//
+//   generating perf_dwarfWalkState: Struct:"walk_state": field 0:
+//   Struct:"walk_ctx": field 5: type *btf.Pointer: not supported
+//
+// which is the tool telling us something the verifier would have told us
+// later: a pointer stored in a map value comes back as a plain scalar, so
+// `rec` could not be trusted across the boundary anyway. It is re-derived
+// from walker_scratch on every entry, and py_pi is re-looked-up by the
+// unwinder that needs it. So walk_ctx keeps its pointers and stays on the
+// stack -- which also keeps bpf_loop's callback context a stack pointer, the
+// shape this program already verifies -- and only the scalars persist.
+struct walk_persist {
+    __u64 pc;
+    __u64 fp;
+    __u64 sp;
+    __u64 py_frame;
+    __u64 py_iter;
+    __u32 pid;
+    __u32 n_pcs;
+    __u32 pending_unwinder;
+    // tail_calls bounds the native<->interpreter round trips in one sample,
+    // well under the kernel's MAX_TAIL_CALL_CNT of 33 so the driver always has
+    // budget left to finish and submit the record.
+    __u32 tail_calls;
+    __u8  py_state;
+    __u8  skip_push;
+    // resuming tells a re-entered driver that this is the same sample coming
+    // back from an interpreter, not a fresh one to initialise.
+    __u8  resuming;
+    __u8  _pad[5];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct walk_persist);
+} walk_states SEC(".maps");
+
+static __always_inline struct walk_persist *walk_state_get(void) {
+    __u32 zero = 0;
+    return bpf_map_lookup_elem(&walk_states, &zero);
+}
+
+// walk_load rebuilds a stack walk_ctx from the persisted scalars, pointing it
+// at this entry's freshly looked-up record.
+static __always_inline void walk_load(struct walk_ctx *w, struct walk_persist *st,
+                                      struct sample_record *rec) {
+    w->pc = st->pc;
+    w->fp = st->fp;
+    w->sp = st->sp;
+    w->pid = st->pid;
+    w->n_pcs = st->n_pcs;
+    w->rec = rec;
+    w->py_frame = st->py_frame;
+    w->py_iter = st->py_iter;
+    w->py_state = st->py_state;
+    w->py_pi = 0;
+    w->py_iter_stopped = 0;
+    w->pending_unwinder = st->pending_unwinder;
+    w->skip_push = st->skip_push;
+}
+
+// walk_save writes back everything a resumed walk needs.
+static __always_inline void walk_save(struct walk_persist *st, struct walk_ctx *w) {
+    st->pc = w->pc;
+    st->fp = w->fp;
+    st->sp = w->sp;
+    st->pid = w->pid;
+    st->n_pcs = w->n_pcs;
+    st->py_frame = w->py_frame;
+    st->py_iter = w->py_iter;
+    st->py_state = w->py_state;
+    st->pending_unwinder = w->pending_unwinder;
+    st->skip_push = w->skip_push;
+}
+
 // walk_step is the per-frame bpf_loop callback for the hybrid walker.
 // Classifies ctx->pc, picks FP or DWARF path, and advances the walk
 // state. Returns 0 to continue, 1 to stop.
 static long walk_step(__u32 idx, void *arg) {
     struct walk_ctx *ctx = (struct walk_ctx *)arg;
+
 
     // ----- A live Python segment spends this iteration.
     //
@@ -909,6 +1052,34 @@ static long walk_step(__u32 idx, void *arg) {
                     py_count(PY_CNT_NO_PROC_INFO);
                 }
                 ctx->py_state = PY_CHAIN_DONE;
+            }
+        }
+
+        // ----- The handoff.
+        //
+        // walk_step DECIDES; the driver dispatches. A bpf_tail_call from
+        // inside a bpf_loop callback does not load (measured: "bad address"),
+        // so this records who claims the frame and stops the loop HERE, with
+        // the cursor intact. The driver acts on it after bpf_loop returns, and
+        // because the walk stopped AT this frame with nothing pushed since,
+        // the frames that unwinder appends land immediately after it -- the
+        // ordering ruling T7-R7 asks for, kept in the kernel, with no anchor
+        // and no userspace splice.
+        if (interp_enabled) {
+            // Recorded, not acted on: this iteration still finishes its own
+            // unwind step so the cursor advances past the claimed frame. The
+            // stop happens at the top of the next iteration.
+            __u32 u = next_unwinder(m.table_id, m.rel_pc);
+            if (u != UNWINDER_NATIVE) {
+                // Stop AT this frame, already pushed, cursor unchanged. The
+                // driver hands off; whatever that unwinder appends lands
+                // immediately after this frame with nothing in between --
+                // ruling T7-R7, kept in the kernel rather than reconstructed
+                // in userspace -- and the resumed walk unwinds past it
+                // without pushing it again.
+                ctx->pending_unwinder = u;
+                ctx->skip_push = 1;
+                return 1;
             }
         }
 

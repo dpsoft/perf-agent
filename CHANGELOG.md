@@ -31,15 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and inherits the same walker, but **that combination has not been validated on
   hardware**: no CI machine has a GPU.
 
-  Two narrower limits, recorded because their failure mode is a wrong frame
-  rather than a missing one. A free-threaded build is recognised by the `t` ABI
-  flag in its soname or versioned executable name, which every ordinary install
-  carries; a **statically linked free-threaded interpreter installed under a name
-  with neither a version nor the `t` flag** would not be recognised, and nothing
-  measurable in the ELF distinguishes the two ABIs (`Py_Version` is identical).
-  And the glibc pthread-TSD offsets were measured once, on Fedora glibc 2.43,
-  and are applied to **every glibc with no version gate** — long-stable values,
-  checked at attach by reading a real frame, but not checked against the libc. An interpreter that cannot be
+  A free-threaded build is refused two ways: by the `t` ABI flag in its soname
+  or versioned executable name, and — for one whose name admits nothing, which
+  an interpreter found by its `Py_Version` may not — by the free-threaded
+  extension-module suffix (`.cpython-313t-…`) its own image embeds. The second
+  screen's provenance is asymmetric and stated as such in the code: the suffix's
+  GIL form was measured present, and its free-threaded form absent, in seven real
+  GIL builds, while presence in an actual free-threaded build is inferred from the
+  same table supplying both and is **not** confirmed (no free-threaded build was
+  available to test against). If that inference is wrong the screen does nothing;
+  it cannot refuse a GIL build.
+
+  One limit remains recorded because its failure mode is a wrong frame rather
+  than a missing one: the glibc pthread-TSD offsets were measured once, on Fedora
+  glibc 2.43, and are applied to **every glibc with no version gate** —
+  long-stable values, checked at attach by reading a real frame, but not checked
+  against the libc. An interpreter that cannot be
   walked is always refused with a reason on stderr, never walked with guessed
   offsets; `py_walk_counters` is reported at shutdown so a run that walked
   nothing is distinguishable from a run with no Python in it.

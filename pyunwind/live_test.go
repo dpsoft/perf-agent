@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +169,95 @@ func TestClassifyIdentifiesAnUnversionedInterpreter(t *testing.T) {
 	}
 	if res.Version != v {
 		t.Fatalf("classified as %v, the file says %v", res.Version, v)
+	}
+}
+
+// TestExtensionSuffixScreenAgainstThisMachinesInterpreter is the control
+// that keeps the free-threaded ELF screen from being a scan that finds
+// nothing and reports agreement.
+//
+// It asserts BOTH directions against a real interpreter: the GIL-form
+// extension suffix IS found (so the scanner, the section choice and the
+// regexp shape all work), and the free-threaded form is NOT (so the screen
+// does not refuse an ordinary build). Without the first assertion, a
+// scanner that silently matched nothing -- wrong section, wrong regexp,
+// unreadable file -- would look exactly like a clean pass.
+//
+// What it cannot assert is the positive case: no free-threaded build is
+// available anywhere this runs. See the provenance note on
+// freeThreadedExtSuffixRe.
+func TestExtensionSuffixScreenAgainstThisMachinesInterpreter(t *testing.T) {
+	path := findSystemLibpython(t)
+
+	gil, err := scanRodataFor(path, gilExtSuffixRe)
+	if err != nil {
+		t.Fatalf("scan %s: %v", path, err)
+	}
+	if !gil {
+		t.Fatalf("%s embeds no .cpython-3XX-<arch>-linux-<abi>.so suffix; the screen below would be scanning for "+
+			"something that is not there in the first place", path)
+	}
+	ft, err := scanRodataFor(path, freeThreadedExtSuffixRe)
+	if err != nil {
+		t.Fatalf("scan %s: %v", path, err)
+	}
+	if ft {
+		t.Fatalf("%s, a GIL build, matched the free-threaded suffix; the screen would refuse it", path)
+	}
+	if res := classify(path); res.Refused != "" {
+		t.Fatalf("%s was refused: %s", path, res.Refused)
+	}
+}
+
+// TestFreeThreadedScreenRefusesAMatchingImage drives the screen's refusal
+// path with an image that carries the free-threaded suffix, since no real
+// one is available.
+//
+// The fixture is a real interpreter with its OWN suffix string rewritten in
+// place to the free-threaded form -- same length, so every offset in the
+// file stays valid and the ELF still parses. That is as close to the real
+// article as this can get without a free-threaded build, and it exercises
+// the refusal end to end: scan, match, ErrFreeThreaded, named path.
+func TestFreeThreadedScreenRefusesAMatchingImage(t *testing.T) {
+	path := findSystemLibpython(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("cannot read %s: %v", path, err)
+	}
+	loc := gilExtSuffixRe.FindIndex(raw)
+	if loc == nil {
+		t.Fatalf("%s carries no GIL extension suffix to rewrite", path)
+	}
+	// ".cpython-314-x86_64-linux-gnu.so" -> ".cpython-31t-x86_64-linux-gnu.so":
+	// replacing the minor version's last digit with "t" keeps the length
+	// identical, so nothing in the ELF shifts.
+	suffix := string(raw[loc[0]:loc[1]])
+	dash := strings.Index(suffix[len(".cpython-3"):], "-") + len(".cpython-3")
+	mutant := append([]byte{}, raw...)
+	mutant[loc[0]+dash-1] = 't'
+	if !freeThreadedExtSuffixRe.Match(mutant[loc[0]:loc[1]]) {
+		t.Fatalf("the rewritten suffix %q does not match the screen's pattern", string(mutant[loc[0]:loc[1]]))
+	}
+
+	out := filepath.Join(t.TempDir(), filepath.Base(path))
+	if err := os.WriteFile(out, mutant, 0o644); err != nil {
+		t.Fatalf("write %s: %v", out, err)
+	}
+	res := classify(out)
+	if res.Refused == "" {
+		t.Fatalf("%s carries a free-threaded extension suffix and was accepted", out)
+	}
+	if !errors.Is(res.Reason, ErrFreeThreaded) {
+		t.Fatalf("Reason = %v, want errors.Is(..., ErrFreeThreaded)", res.Reason)
+	}
+
+	// Control: the same bytes WITHOUT the rewrite must classify clean, so
+	// the refusal is about the suffix and not about the copy.
+	honest := filepath.Join(t.TempDir(), filepath.Base(path))
+	if err := os.WriteFile(honest, raw, 0o644); err != nil {
+		t.Fatalf("write %s: %v", honest, err)
+	}
+	if res := classify(honest); res.Refused != "" {
+		t.Fatalf("the unmodified copy was refused: %s", res.Refused)
 	}
 }

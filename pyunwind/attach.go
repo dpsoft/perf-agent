@@ -60,6 +60,63 @@ var ErrTLSBaseUnavailable = errors.New("pyunwind: FrameReader cannot report the 
 // with \b so an unrelated "t" elsewhere in the path cannot trigger it.
 var freeThreadedSonameRe = regexp.MustCompile(`(?:libpython|python)\d+\.\d+t\b`)
 
+// The extension-module suffix an interpreter embeds for its own ABI --
+// ".cpython-313-x86_64-linux-gnu.so" on a GIL build, ".cpython-313t-..." on
+// a free-threaded one. It comes from configure's EXT_SUFFIX by way of
+// _PyImport_DynLoadFiletab (Python/dynload_shlib.c), which is compiled into
+// libpython (or into the executable, for a statically linked interpreter),
+// and it has to be there for the interpreter to import a single C extension.
+//
+// WHAT WAS MEASURED, AND WHAT WAS NOT. Across seven real GIL builds --
+// Fedora 44's libpython3.14, python:3.12.14/3.13.15/3.14.3-slim,
+// actions/setup-python 3.12.14, Ubuntu 24.04's libpython3.12.so.1.0 and its
+// statically linked /usr/bin/python3.12 -- the GIL form is present in every
+// one (in .rodata) and the "t" form is present in NONE. That is the
+// direction that can be measured here; there is no free-threaded build
+// available to confirm the other one (Docker Hub publishes no 3.13t/3.14t
+// image, and this project has no way to build one). Presence in a
+// free-threaded build is a mechanical inference from the same table
+// supplying both, not an observation.
+//
+// The asymmetry is why the screen is worth having anyway. If the inference
+// is wrong the screen silently never fires, which is exactly today's
+// behaviour; if it is right it converts a plausible stack of wrong frames
+// into a named refusal. It cannot produce a false refusal on any GIL build
+// measured above.
+//
+// _Py_brc_* and _Py_qsbr_* (Python/brc.c, Python/qsbr.c, compiled only under
+// Py_GIL_DISABLED) were the first candidates and were rejected: they are
+// absent from all seven builds too, but a symbol a free-threaded build might
+// not EXPORT would make the screen inert while reading as protection. The
+// suffix string cannot be absent from a working interpreter.
+var (
+	gilExtSuffixRe          = regexp.MustCompile(`\.cpython-3[0-9]+-[A-Za-z0-9_]+-linux-[A-Za-z0-9_]+\.so`)
+	freeThreadedExtSuffixRe = regexp.MustCompile(`\.cpython-3[0-9]+t-[A-Za-z0-9_]+-linux-[A-Za-z0-9_]+\.so`)
+)
+
+// scanRodataFor reports whether a binary's .rodata matches re.
+//
+// .rodata only, not the whole file: it is where the suffix lives on every
+// build measured, it is a fraction of the image (1-3 MB against 6-20), and
+// bounding the scan to one section keeps this cheap enough to run on the
+// accept path.
+func scanRodataFor(path string, re *regexp.Regexp) (bool, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("pyunwind: open %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	sec := f.Section(".rodata")
+	if sec == nil {
+		return false, fmt.Errorf("pyunwind: %s has no .rodata", path)
+	}
+	data, err := sec.Data()
+	if err != nil {
+		return false, fmt.Errorf("pyunwind: read .rodata of %s: %w", path, err)
+	}
+	return re.Match(data), nil
+}
+
 // Result reports what Attach decided for a process.
 type Result struct {
 	Version Version
@@ -137,6 +194,18 @@ func classify(path string) Result {
 	if freeThreadedSonameRe.MatchString(path) {
 		return refuseWith(v, fmt.Errorf(
 			"%w: %q is a free-threaded build; this build's offsets assume the GIL build and are wrong for it", ErrFreeThreaded, path))
+	}
+	// The same refusal, for a build whose NAME does not admit it. An
+	// interpreter reached through the Py_Version pass carries no "t" in any
+	// filename to test, and a renamed one carries a misleading name; both
+	// still embed their own ABI's extension suffix. An unreadable image is
+	// not a refusal here -- the screen adds coverage and must never remove
+	// any.
+	if ft, err := scanRodataFor(path, freeThreadedExtSuffixRe); err == nil && ft {
+		return refuseWith(v, fmt.Errorf(
+			"%w: %s embeds a free-threaded extension suffix (.cpython-%d%dt-...), whatever its name says; "+
+				"this build's offsets assume the GIL build and are wrong for it",
+			ErrFreeThreaded, path, v.Major, v.Minor))
 	}
 	if !v.Supported() {
 		return refuseWith(v, fmt.Errorf(

@@ -364,15 +364,23 @@ func liveTSSKey(pid uint32, libPath string, code []byte) (uint32, error) {
 	return uint32(raw >> 32), nil
 }
 
-// TestLiveInterpreterEvalRangeCoversTheEvalLoop pins the range that is the
-// interpreter arm's on-switch against the interpreter installed on this
-// machine.
+// TestLiveInterpreterEvalRangeIsLocatableAndWellFormed pins the range that
+// is the interpreter arm's on-switch against the interpreter installed on
+// this machine.
+//
+// The name is deliberate about what it does NOT do: it does not check that
+// the range covers the eval loop, which would need sampled PCs from a
+// running interpreter (the end-to-end test in test/ is where that is
+// established). What it proves is that this machine's interpreter has a
+// locatable dispatch loop and that the range derived from it is well-formed
+// -- which is the precondition everything downstream rests on, and is worth
+// having on its own.
 //
 // It is allowed to SKIP on a build whose dispatch loop has no symbol
 // (stripped and PGO-partitioned, e.g. Fedora 44's libpython3.14) because
 // that is a documented, named refusal -- but it must skip with that reason
 // attached, not by quietly finding nothing.
-func TestLiveInterpreterEvalRangeCoversTheEvalLoop(t *testing.T) {
+func TestLiveInterpreterEvalRangeIsLocatableAndWellFormed(t *testing.T) {
 	cmd, _ := startLiveInterpreter(t)
 	pid := uint32(cmd.Process.Pid)
 	libPath, version, err := FindInterpreter(pid)

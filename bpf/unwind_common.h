@@ -651,6 +651,33 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 #define WALKER_FLAG_ROOT_DISAGREEMENT 0x40
 #define WALKER_FLAG_FRAME_PUSH_REFUSED 0x80
 
+// A TRAP THAT HAS NOW BITTEN TWICE, WRITTEN DOWN WHERE IT BITES.
+//
+// A bound the verifier proved about a value is attached to the REGISTER it
+// proved it about, not to the memory the value came from. So this is rejected:
+//
+//     if (pi->frame_owner > LIMIT) return;      // proves a bound on a load
+//     x = buf[pi->frame_owner];                 // a SECOND load: no bound
+//
+//   invalid access to map value, value_size=96 off=65535 size=1
+//   R2 max value is outside of the allowed memory range
+//
+// 65535 is the full __u16 range -- the bound from three lines earlier, gone.
+// It is not the verifier being obtuse: pi points into a map value, and another
+// CPU may write it between the two loads, so the second load genuinely has no
+// bound. Bind the value ONCE and use that binding for both the check and the
+// access:
+//
+//     __u16 off = pi->frame_owner;
+//     if (off > LIMIT) return;
+//     x = buf[off];
+//
+// The same class of defect, in the other direction, produced the earlier
+// wrap bug: `if (i + 2 > MAX_FRAMES)` did arithmetic ON the checked value, so
+// the check and the store disagreed about what had been proved. Both rules are
+// one rule -- check and use the same register, and do nothing to it in
+// between -- and both were found by CI rather than by review.
+//
 // frame_push_native appends one native-PC slot, tagging it FRAME_TAG_NATIVE.
 // Returns 0 on success, 1 if the record is already full (MAX_FRAMES
 // reached) — the caller must stop walking in that case. The refusal itself

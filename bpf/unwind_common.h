@@ -32,7 +32,13 @@
 
 // MAX_FRAMES: the unwind walker's per-sample loop bound. Matches the
 // BPF_MAP_TYPE_STACK_TRACE convention; deeper stacks truncate.
+#ifndef MAX_FRAMES
+// Overridable with -D only so a verifier experiment can measure how the cost
+// scales with the outer loop's bound (see verifier-plan.md's ladder); the
+// build never sets it, and changing it changes struct sample_record, which
+// unwind/dwarfagent parses by byte offset.
 #define MAX_FRAMES 127
+#endif
 
 // RINGBUF_BYTES: size of the stack_events ringbuf. Must be a power of two
 // and >= PAGE_SIZE. 256 KB absorbs bursts at 99 Hz × 16 CPUs; higher

@@ -3,6 +3,8 @@ package pyunwind
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -381,4 +383,48 @@ func stripLineComments(src string) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// TestFrameWindowCoversEveryTable pins bpf/python_walk.h's PY_FRAME_WINDOW
+// against the offsets this package actually installs.
+//
+// The walk reads one fixed-size prefix of _PyInterpreterFrame and then takes
+// every field out of it by offset, so a version whose fields sit past the
+// window would be refused at run time by a guard nobody would think to look
+// for. Reading the constant out of the header and comparing it against the
+// tables makes that a build-time failure in the package that owns the
+// numbers, which is where a new version's offsets get added.
+func TestFrameWindowCoversEveryTable(t *testing.T) {
+	src, err := os.ReadFile("../bpf/python_walk.h")
+	if err != nil {
+		t.Fatalf("read python_walk.h: %v", err)
+	}
+	m := regexp.MustCompile(`#define PY_FRAME_WINDOW (\d+)`).FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatal("PY_FRAME_WINDOW is not defined in bpf/python_walk.h")
+	}
+	window, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("PY_FRAME_WINDOW is not a number: %v", err)
+	}
+
+	for _, v := range []Version{{3, 12, 14}, {3, 13, 15}, {3, 14, 3}} {
+		off, err := TableFor(v)
+		if err != nil {
+			t.Fatalf("TableFor(%v): %v", v, err)
+		}
+		// owner is one byte; the other three are 8-byte fields.
+		if int(off.FrameOwner) > window-1 {
+			t.Errorf("%v: FrameOwner at %d does not fit a %d-byte window", v, off.FrameOwner, window)
+		}
+		for name, o := range map[string]uint16{
+			"FramePrevious":   off.FramePrevious,
+			"FrameExecutable": off.FrameExecutable,
+			"FrameInstrPtr":   off.FrameInstrPtr,
+		} {
+			if int(o) > window-8 {
+				t.Errorf("%v: %s at %d does not fit a %d-byte window (needs 8 bytes)", v, name, o, window)
+			}
+		}
+	}
 }

@@ -308,6 +308,41 @@ static __always_inline void py_count(__u32 slot) {
     if (d) *d += 1;
 }
 
+// ----- One read per frame, not four.
+//
+// PY_FRAME_WINDOW is the prefix of _PyInterpreterFrame that carries every
+// field this walk reads. The largest offset in any supported version is
+// FrameOwner at 74 (3.14; it is 70 on 3.12/3.13) and the widest field is an
+// 8-byte pointer at 56 (instr_ptr), so 96 covers all three with room, and
+// TestFrameWindowCoversEveryTable pins that against the Go tables rather
+// than leaving it to a comment.
+//
+// WHY ONE READ. Each bpf_probe_read_user is a helper call with an error
+// branch, and every branch inside walk_step forks the verifier's exploration
+// -- which is then re-run for each of the outer bpf_loop's 127 iterations and
+// each state of the mapping scan nested inside it. Four reads meant four
+// forks per Python frame. Measured: with the interpreter arm present the
+// program peaked at 116,553 verifier states against 16,462 without it, and
+// removing a nested bpf_loop changed that by exactly zero -- the forks in the
+// body were the cost, not the loop structure. This is the technique OTel uses
+// for the same reason (python_tracer.ebpf.c:60-76): one bulk read into a
+// fixed-size buffer, one bounds guard hoisted out of the field accesses, then
+// plain offset arithmetic.
+//
+// The buffer lives in a per-CPU map rather than on the BPF stack: a
+// variable-offset read from a map value is what the verifier handles best,
+// and walk_step's frame is already carrying the walk's own state.
+#define PY_FRAME_WINDOW 96
+
+struct py_frame_window { __u8 b[PY_FRAME_WINDOW]; };
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct py_frame_window);
+} py_frame_scratch SEC(".maps");
+
 // ----- The frame chain.
 
 // There is no per-segment frame bound any more. The chain is walked one
@@ -449,12 +484,57 @@ static __always_inline int py_step_one(struct walk_ctx *ctx) {
         return 0;
     }
 
-    __u8 owner = 0;
-    if (bpf_probe_read_user(&owner, sizeof(owner), (void *)(frame + pi->frame_owner))) {
+    // One guard for every field, then one read. See PY_FRAME_WINDOW.
+    //
+    // The guard is on the OFFSETS, which come from the per-version table, so
+    // it fires only for a table that does not fit the window -- never for a
+    // frame. It is expressed against compile-time constants rather than by
+    // adding to the checked value, for the reason frame_push_python's bound
+    // documents: arithmetic on a checked value is how the earlier wrap bug
+    // got past both the author and the verifier.
+    // The offsets are read into REGISTERS first, and the bounds check and the
+    // indexing both use those registers. Checking pi->frame_owner and then
+    // indexing with pi->frame_owner is two separate loads from a map value,
+    // and the verifier will not carry a bound from one to the other --
+    // another CPU could write the map between them. It says so plainly:
+    //
+    //   invalid access to map value, value_size=96 off=65535 size=1
+    //   R2 max value is outside of the allowed memory range
+    //
+    // 65535 is the full __u16 range, i.e. the bound the guard proved was
+    // discarded at the second load. This is the same discipline
+    // frame_push_native documents for MAX_FRAMES: bind the value once, then
+    // check and use that binding.
+    __u16 off_owner = pi->frame_owner;
+    __u16 off_prev = pi->frame_previous;
+    __u16 off_exec = pi->frame_executable;
+    __u16 off_instr = pi->frame_instr_ptr;
+    if (off_owner > PY_FRAME_WINDOW - 1 ||
+        off_prev > PY_FRAME_WINDOW - 8 ||
+        off_exec > PY_FRAME_WINDOW - 8 ||
+        off_instr > PY_FRAME_WINDOW - 8) {
         py_count(PY_CNT_FRAME_READ_FAIL);
         ctx->py_state = PY_CHAIN_DONE;
         return 0;
     }
+    __u32 wkey = 0;
+    struct py_frame_window *w = bpf_map_lookup_elem(&py_frame_scratch, &wkey);
+    if (!w) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
+    }
+    // All-or-nothing, and that is the honest shape: bpf_probe_read_user
+    // either copies the whole window or copies nothing and returns an error.
+    // A partial read cannot leave a zeroed owner byte looking like a valid
+    // frame, which is what per-field reads made possible.
+    if (bpf_probe_read_user(w->b, sizeof(w->b), (void *)frame)) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
+    }
+
+    __u8 owner = w->b[off_owner];
     // The same plausibility screen pyunwind.Offsets.Validate applies at
     // attach, re-applied per frame: an owner byte outside this version's enum
     // means the offsets are being read against a layout they do not describe,
@@ -465,12 +545,7 @@ static __always_inline int py_step_one(struct walk_ctx *ctx) {
         return 0;
     }
 
-    __u64 prev = 0;
-    if (bpf_probe_read_user(&prev, sizeof(prev), (void *)(frame + pi->frame_previous))) {
-        py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_state = PY_CHAIN_DONE;
-        return 0;
-    }
+    __u64 prev = *(__u64 *)&w->b[off_prev];
 
     if (owner >= pi->frame_owner_boundary) {
         // The interpreter's own entry frame: it executes no Python code, so
@@ -486,17 +561,8 @@ static __always_inline int py_step_one(struct walk_ctx *ctx) {
         return 0;
     }
 
-    __u64 exec = 0, instr = 0;
-    if (bpf_probe_read_user(&exec, sizeof(exec), (void *)(frame + pi->frame_executable))) {
-        py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_state = PY_CHAIN_DONE;
-        return 0;
-    }
-    if (bpf_probe_read_user(&instr, sizeof(instr), (void *)(frame + pi->frame_instr_ptr))) {
-        py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_state = PY_CHAIN_DONE;
-        return 0;
-    }
+    __u64 exec = *(__u64 *)&w->b[off_exec];
+    __u64 instr = *(__u64 *)&w->b[off_instr];
     if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;
 
     // A TORN-READ BACKSTOP, not the mechanism for the C-entered frame.

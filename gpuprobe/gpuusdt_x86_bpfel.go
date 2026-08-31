@@ -71,6 +71,11 @@ type gpuusdtPyEvalRange struct {
 	Hi uint64
 }
 
+type gpuusdtPyFrameWindow struct {
+	_ structs.HostLayout
+	B [96]uint8
+}
+
 type gpuusdtPyProcInfo struct {
 	_                        structs.HostLayout
 	NoneAddr                 uint64
@@ -180,6 +185,7 @@ type gpuusdtMapSpecs struct {
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
 	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
+	PyFrameScratch           *ebpf.MapSpec `ebpf:"py_frame_scratch"`
 	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
@@ -232,6 +238,7 @@ type gpuusdtMaps struct {
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
 	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
+	PyFrameScratch           *ebpf.Map `ebpf:"py_frame_scratch"`
 	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
@@ -256,6 +263,7 @@ func (m *gpuusdtMaps) Close() error {
 		m.PidMappings,
 		m.Pids,
 		m.PyEvalRanges,
+		m.PyFrameScratch,
 		m.PyProcs,
 		m.PyWalkCounters,
 		m.StackIdSeq,

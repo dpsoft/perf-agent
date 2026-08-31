@@ -62,6 +62,11 @@ type perf_dwarfPyEvalRange struct {
 	Hi uint64
 }
 
+type perf_dwarfPyFrameWindow struct {
+	_ structs.HostLayout
+	B [96]uint8
+}
+
 type perf_dwarfPyProcInfo struct {
 	_                        structs.HostLayout
 	NoneAddr                 uint64
@@ -168,6 +173,7 @@ type perf_dwarfMapSpecs struct {
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
 	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
+	PyFrameScratch           *ebpf.MapSpec `ebpf:"py_frame_scratch"`
 	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
@@ -217,6 +223,7 @@ type perf_dwarfMaps struct {
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
 	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
+	PyFrameScratch           *ebpf.Map `ebpf:"py_frame_scratch"`
 	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
 	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.Map `ebpf:"stack_events"`
@@ -236,6 +243,7 @@ func (m *perf_dwarfMaps) Close() error {
 		m.PidMappings,
 		m.Pids,
 		m.PyEvalRanges,
+		m.PyFrameScratch,
 		m.PyProcs,
 		m.PyWalkCounters,
 		m.StackEvents,

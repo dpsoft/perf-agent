@@ -302,17 +302,20 @@ type pyProcInfo struct {
 
 // BPFMaps is the set of map handles the attach path needs.
 //
-// PyProcs is bpf/python_walk.h's py_procs: a BPF_MAP_TYPE_HASH keyed by
-// pid, holding one pyProcInfo. Attach writes it.
+// PyProcs is this module's py_procs: a BPF_MAP_TYPE_HASH keyed by pid, holding
+// one pyProcInfo. Attach writes it, and it is the only map this package owns.
 //
-// EvalRanges is py_eval_ranges, keyed by table_id. AttachProcess writes it
-// AFTER a successful Attach and nothing else does, because it is the
-// interpreter arm's on-switch (see InstallEvalRange). Attach itself never
-// touches it, so a caller that only wants the per-PID record may leave it
-// nil.
+// THE EVAL RANGE IS NOT HERE ANY MORE. It used to be a second field, and
+// AttachProcess wrote it, because py_eval_ranges was the walker's own
+// on-switch. The range now goes into the CORE's handoff_ranges, keyed by
+// table_id and carrying this module's unwinder id, and unwind/interp installs
+// it after AttachProcess returns -- so the order that mattered is unchanged
+// (py_procs first, the on-switch last) and the map that the core consults is
+// not one this package can name. Keeping a nil-able field for it was how a
+// caller that had correctly stopped supplying it got a nil-map dereference
+// instead of a compile error.
 type BPFMaps struct {
-	PyProcs    *ebpf.Map
-	EvalRanges *ebpf.Map
+	PyProcs *ebpf.Map
 }
 
 // EvalRange is one interpreter's eval-loop text range, in the same space
@@ -323,23 +326,6 @@ type BPFMaps struct {
 type EvalRange struct {
 	Lo uint64
 	Hi uint64
-}
-
-// InstallEvalRange publishes one libpython's eval-loop range under its
-// table_id -- the same FNV-1a-of-build-id key the CFI tables use, which is
-// what walk_step already holds by the time it reaches the Python arm.
-//
-// Until a range is installed for a binary, walk_step's interpreter arm never
-// fires for any PC in it: the range map is the on-switch, and py_procs alone
-// is not enough.
-func InstallEvalRange(m *ebpf.Map, tableID uint64, r EvalRange) error {
-	if r.Hi <= r.Lo {
-		return fmt.Errorf("pyunwind: eval range [%#x,%#x) for table %#x is empty or inverted", r.Lo, r.Hi, tableID)
-	}
-	if err := m.Update(&tableID, &r, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("pyunwind: install eval range for table %#x: %w", tableID, err)
-	}
-	return nil
 }
 
 // TLSBaseReader is implemented by a FrameReader that can also report the

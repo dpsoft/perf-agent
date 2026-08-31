@@ -261,3 +261,186 @@ func TestFreeThreadedScreenRefusesAMatchingImage(t *testing.T) {
 		t.Fatalf("the unmodified copy was refused: %s", res.Refused)
 	}
 }
+
+// ----- The virtualenv defect, and the shape that got past every other test.
+//
+// In a venv EVERY shared object lives under `.venv/lib/python3.12/
+// site-packages/`, so the DIRECTORY carries a Python version and the old
+// path-matching rule accepted the first `.so` it sorted to. On the PyTorch
+// target this branch exists to serve that was
+// `numpy.libs/libgfortran-83c28eba-468e71e5.so.5.0.0`, which refused for want
+// of PyGILState_GetThisThreadState -- terminally, so the real interpreter (uv's
+// statically linked python3.12, in a directory whose name matches nothing) was
+// never reached, and the process was reported as having no walkable Python.
+//
+// CI never saw it because CI profiles the system /usr/bin/python3.12 with no
+// venv, which is the least representative Python deployment there is.
+//
+// These tests are the fixture that would have caught it: a candidate list with
+// venv-shaped paths ahead of the real interpreter, asserted at both levels --
+// the ranking that decides what is tried first, and the symbol check that
+// decides what is accepted at all.
+
+// venvCandidates is the ordering problem in miniature: five site-packages
+// libraries whose paths all contain "python3.12", and one real interpreter
+// whose path contains no version at all.
+var venvCandidates = []string{
+	"/home/u/proj/.venv/lib/python3.12/site-packages/markupsafe/_speedups.cpython-312-x86_64-linux-gnu.so",
+	"/home/u/proj/.venv/lib/python3.12/site-packages/numpy.libs/libgfortran-83c28eba-468e71e5.so.5.0.0",
+	"/home/u/proj/.venv/lib/python3.12/site-packages/numpy.libs/libquadmath-2284e583-a9307bba.so.0.0.0",
+	"/home/u/proj/.venv/lib/python3.12/site-packages/torch/_C.cpython-312-x86_64-linux-gnu.so",
+	"/home/u/proj/.venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so",
+	"/home/u/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/bin/python3.12",
+}
+
+// TestVenvSitePackagesRankBelowTheInterpreter pins the ORDERING half: no
+// site-packages library may be tried before the interpreter executable.
+//
+// Ordering is an optimisation and not the correctness fix -- the symbol check
+// below is -- but it is what keeps the common case to one or two ELF opens
+// instead of the 123 shared objects that PyTorch venv maps.
+func TestVenvSitePackagesRankBelowTheInterpreter(t *testing.T) {
+	type ranked struct {
+		path string
+		rank int
+	}
+	var got []ranked
+	for _, p := range venvCandidates {
+		isLib := strings.HasPrefix(filepath.Base(p), "lib")
+		got = append(got, ranked{p, candidateRank(p, isLib)})
+	}
+
+	interp := got[len(got)-1]
+	if !strings.HasSuffix(interp.path, "/python3.12") {
+		t.Fatalf("fixture drift: last candidate is %s, expected the interpreter", interp.path)
+	}
+	for _, g := range got[:len(got)-1] {
+		if g.rank <= interp.rank {
+			t.Errorf("%s ranks %d, at or above the interpreter's %d: a site-packages library "+
+				"would be opened first, which is how libgfortran was selected as the CPython image",
+				g.path, g.rank, interp.rank)
+		}
+	}
+
+	// And the ranking must not have achieved that by demoting every library:
+	// a shared libpython is the BEST candidate there is, because a process
+	// running a shared build maps both it and an executable stub that carries
+	// none of the symbols.
+	lib := candidateRank("/usr/lib64/libpython3.12.so.1.0", true)
+	if lib >= interp.rank {
+		t.Errorf("libpython ranks %d, not above the executable's %d: on a shared build the "+
+			"stub would be tried first and it carries neither the eval loop nor _PyRuntime",
+			lib, interp.rank)
+	}
+}
+
+// TestOnlyDefinedInterpreterSymbolsAdmitACandidate pins the CORRECTNESS half,
+// and it is a property of the FILE, not of its name.
+//
+// Run against this machine's own executable mappings rather than a synthetic
+// ELF: every process maps libc, the loader and the test binary, none of which
+// is CPython, and none of which may be accepted. If a real interpreter is
+// mapped -- the test binary is not one, but a CI runner's may map one -- it
+// must be accepted, and by its symbols.
+func TestOnlyDefinedInterpreterSymbolsAdmitACandidate(t *testing.T) {
+	candidates, err := interpreterCandidates(uint32(os.Getpid()))
+	if err != nil {
+		t.Fatalf("interpreterCandidates: %v", err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("this process maps no executable files, which cannot be")
+	}
+	for _, p := range candidates {
+		ok, _ := definesInterpreterSymbols(p)
+		if ok {
+			t.Errorf("%s was accepted as a CPython image; this test binary maps none", p)
+		}
+	}
+}
+
+// A C extension module IMPORTS PyGILState_GetThisThreadState -- that is what
+// linking against the interpreter looks like -- so accepting an undefined
+// symbol as evidence would put every one of site-packages' extension modules
+// back in the candidate set, and reintroduce the bug in a form that reads as
+// its fix.
+//
+// Asserted against real files when this machine has them, skipped when it does
+// not, because a synthetic ELF would only prove the test's own construction.
+func TestAnUndefinedSymbolIsNotEvidence(t *testing.T) {
+	var ext string
+	for _, glob := range []string{
+		"/home/*/*/.venv/lib/python3.*/site-packages/*/*.cpython-*.so",
+		"/usr/lib64/python3.*/lib-dynload/*.cpython-*.so",
+	} {
+		if m, _ := filepath.Glob(glob); len(m) > 0 {
+			ext = m[0]
+			break
+		}
+	}
+	if ext == "" {
+		t.Skip("no CPython extension module on this machine to test against")
+	}
+	ok, err := definesInterpreterSymbols(ext)
+	if err != nil {
+		t.Fatalf("definesInterpreterSymbols(%s): %v", ext, err)
+	}
+	if ok {
+		t.Errorf("%s was accepted as an interpreter; it imports the CPython API, it does not define it", ext)
+	}
+}
+
+// The real interpreter on this machine must be accepted, whichever shape it
+// has -- a shared libpython or a statically linked executable. Without this
+// the two tests above are satisfied by a function that accepts nothing.
+func TestARealInterpreterIsAccepted(t *testing.T) {
+	var found []string
+	for _, glob := range []string{
+		"/usr/lib64/libpython3.*.so*",
+		"/usr/lib/x86_64-linux-gnu/libpython3.*.so*",
+		"/home/*/.local/share/uv/python/cpython-3.*/bin/python3.*",
+	} {
+		m, _ := filepath.Glob(glob)
+		found = append(found, m...)
+	}
+	var tested int
+	for _, p := range found {
+		if fi, err := os.Stat(p); err != nil || fi.IsDir() || strings.HasSuffix(p, "-config") {
+			continue
+		}
+		ok, err := definesInterpreterSymbols(p)
+		if err != nil {
+			continue // not an ELF, or unreadable: not what this test is about
+		}
+		tested++
+		if !ok {
+			t.Errorf("%s is a CPython image and was NOT accepted; the symbol check is too strict "+
+				"and this target would silently produce no Python frames", p)
+		}
+	}
+	if tested == 0 {
+		t.Skip("no CPython image on this machine to test against")
+	}
+}
+
+// TestThePathRuleWouldHaveAcceptedLibgfortran is the assertion that proves the
+// three above can fail: it shows the OLD rule accepting the exact file that
+// broke, so "the new rule rejects it" is a change and not a tautology.
+//
+// DetectFromSoname is still used -- to REPORT a version when the file carries
+// no Py_Version, and to rank candidates -- so it still answers true here. What
+// changed is that its answer no longer admits anything.
+func TestThePathRuleWouldHaveAcceptedLibgfortran(t *testing.T) {
+	const libgfortran = "/home/u/proj/.venv/lib/python3.12/site-packages/" +
+		"numpy.libs/libgfortran-83c28eba-468e71e5.so.5.0.0"
+
+	v, ok := DetectFromSoname(libgfortran)
+	if !ok {
+		t.Fatalf("fixture drift: the path rule no longer matches %s, so this test no longer "+
+			"demonstrates anything", libgfortran)
+	}
+	if v.Minor != 12 {
+		t.Errorf("the path rule read version %s out of a Fortran runtime's directory", v)
+	}
+	// That is the whole defect in one line: a Fortran runtime, reported as
+	// CPython 3.12, because the directory it sits in is called python3.12.
+}

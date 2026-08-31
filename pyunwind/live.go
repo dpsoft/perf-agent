@@ -1,6 +1,7 @@
 package pyunwind
 
 import (
+	"debug/elf"
 	"errors"
 	"fmt"
 	"os"
@@ -60,81 +61,220 @@ func RequireGlibc(pid uint32) error {
 	return nil
 }
 
-// FindInterpreter picks the CPython image to walk out of a process's
-// executable mappings, and reports the version it MEASURED from that image.
+// interpreterSymbols are the symbols a mapped file must DEFINE before this
+// package will treat it as a CPython image.
 //
-// Two shapes qualify and they are tried in that order:
+// THE PATH IS A HINT FOR ORDERING, NEVER A DECISION, and that distinction is
+// the whole of the fix here. Before it, a candidate was accepted because its
+// PATH matched a Python version, and in a virtualenv every shared object lives
+// under `.venv/lib/python3.12/site-packages/`, so the DIRECTORY matched and
+// every `.so` in site-packages looked like an interpreter. The first one
+// alphabetically won. Measured on the PyTorch target this branch exists to
+// serve: 123 shared objects in that venv, all of them matching the path rule,
+// and `libgfortran-83c28eba-468e71e5.so.5.0.0` was selected as the CPython
+// image. It refused for want of PyGILState_GetThisThreadState, terminally, and
+// the real interpreter -- uv's statically linked python3.12, in a directory
+// whose name matches nothing -- was never reached.
 //
-//  1. A shared libpython ("libpython3.12.so.1.0"), which is what every
-//     distro, container image and CI toolchain build ships.
-//  2. The python executable itself ("/usr/bin/python3.12"), for a
-//     statically linked interpreter -- the same symbols live there instead.
+//	$ scan the same 123 objects for a DEFINITION of either symbol below
+//	0 of 123
 //
-// The preference matters: a process running a shared build maps BOTH (the
-// executable is a stub that links the library), and the stub carries
-// neither the eval loop nor _PyRuntime. Ordering by "libpython first"
-// rather than by whichever mapping /proc happens to list first is what
-// keeps that from being a coin flip.
+// So the rule is evidence, not resemblance: 123 candidates go to zero, and the
+// only file in that process carrying the symbols is the one that is actually
+// the interpreter. It also fixes the CLASS rather than the instance -- a
+// library called libpython-anything, anywhere, would have failed identically.
 //
-// TWO PASSES, and the second one is why an unversioned interpreter is not
-// invisible. The first pass matches on the PATH, which is free and covers
-// every ordinary install. The second pass, taken only when the first
-// matched nothing, reads Py_Version out of each mapped file -- because
-// /usr/local/bin/python, a pyenv shim, a conda environment and an embedder
-// that dlopens a non-versioned libpython all carry no version in any name,
-// and before this they came back as "not a Python process": a silent
-// refusal, in a package where every other refusal is named, and the one a
-// real user is most likely to hit.
+// WHY THESE TWO. PyGILState_GetThisThreadState is not a proxy for "is this
+// CPython", it is the exact precondition for what happens next: GILStateCode
+// disassembles its body to recover the TSS key, and without it attach cannot
+// proceed at all. _PyRuntime corroborates it as an interpreter rather than
+// something that re-exports one function. Both are exported from the shared
+// libpython and from a statically linked python executable (which must export
+// the C API for extension modules to link against), measured on this host:
 //
-// The second pass costs one ELF open per distinct mapped file. That is a
-// one-time cost per target at attach, not a per-sample one, and it is paid
-// only by processes that mapped nothing version-named.
-func FindInterpreter(pid uint32) (path string, v Version, err error) {
+//	libpython3.14.so.1.0                  both present
+//	/usr/bin/python3.14  (stub)           NEITHER -- correctly rejected, and
+//	                                      the shared library beside it wins
+//	uv cpython-3.12.14 python3.12 (static) both present
+//
+// A candidate that defines these and then refuses for some other reason -- a
+// version this build declines, a free-threaded build -- no longer ends the
+// search either. See FindInterpreters.
+const (
+	runtimeSymbol = "_PyRuntime"
+)
+
+// definesInterpreterSymbols reports whether path DEFINES every symbol in
+// interpreterSymbols.
+//
+// DEFINES, not merely mentions. Every CPython extension module in
+// site-packages -- torch/_C, numpy's, markupsafe's -- carries
+// PyGILState_GetThisThreadState in its .dynsym as an UNDEFINED import, which is
+// what linking against the interpreter looks like. Accepting an undefined
+// symbol as evidence would put every extension module back in the candidate
+// set and reintroduce this bug in a form that reads as a fix.
+//
+// A file that cannot be opened or parsed is not an interpreter for this
+// purpose: the error is returned so a caller can say how many candidates were
+// examined, but it never stops the search.
+func definesInterpreterSymbols(path string) (bool, error) {
+	osf, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("pyunwind: open %s: %w", path, err)
+	}
+	defer func() { _ = osf.Close() }()
+	f, err := elf.NewFile(osf)
+	if err != nil {
+		return false, fmt.Errorf("pyunwind: parse %s: %w", path, err)
+	}
+
+	want := map[string]bool{gilStateSymbol: false, runtimeSymbol: false}
+	// .dynsym first: on a stripped distro build it is the only symbol table
+	// there is, and the interpreter's API is exported there by construction.
+	// elf.ErrNoSymbols from either is not an error here.
+	for _, get := range []func() ([]elf.Symbol, error){f.DynamicSymbols, f.Symbols} {
+		syms, err := get()
+		if err != nil {
+			continue
+		}
+		for _, sym := range syms {
+			if sym.Section == elf.SHN_UNDEF {
+				continue
+			}
+			if _, ok := want[sym.Name]; ok {
+				want[sym.Name] = true
+			}
+		}
+	}
+	for _, have := range want {
+		if !have {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// candidateRank orders the files worth trying, best first. It is an
+// OPTIMISATION and nothing rests on it: definesInterpreterSymbols decides, and
+// a perfectly-ordered list and a shuffled one select the same file. What the
+// ranking buys is that the common case opens one or two ELF files instead of
+// every executable mapping in the process.
+//
+// A shared libpython first, because a process running a shared build maps BOTH
+// it and the executable stub that links it, and only the library carries the
+// symbols. Then the interpreter executable, for a statically linked build.
+// Then everything else, with site-packages last -- it is the largest group by
+// far and the least likely to hold anything.
+func candidateRank(path string, isLib bool) int {
+	base := filepath.Base(path)
+	switch {
+	case strings.HasPrefix(base, "libpython"):
+		return 0
+	case !isLib && strings.HasPrefix(base, "python"):
+		return 1
+	case strings.Contains(path, "/site-packages/"):
+		return 4
+	case isLib:
+		return 3
+	default:
+		return 2
+	}
+}
+
+// interpreterCandidates returns a process's distinct executable mappings,
+// ordered by candidateRank and then by path so the answer is reproducible.
+func interpreterCandidates(pid uint32) ([]string, error) {
 	mappings, err := procmap.NewResolver().Mappings(pid)
 	if err != nil {
-		return "", Version{}, fmt.Errorf("pyunwind: read pid %d mappings: %w", pid, err)
+		return nil, fmt.Errorf("pyunwind: read pid %d mappings: %w", pid, err)
 	}
-	var libs, exes []string
+	type cand struct {
+		path string
+		rank int
+	}
+	var cands []cand
 	seen := map[string]bool{}
 	for _, m := range mappings {
 		if m.Path == "" || !m.IsExec || seen[m.Path] {
 			continue
 		}
 		seen[m.Path] = true
-		if strings.HasPrefix(filepath.Base(m.Path), "lib") {
-			libs = append(libs, m.Path)
-		} else {
-			exes = append(exes, m.Path)
-		}
+		isLib := strings.HasPrefix(filepath.Base(m.Path), "lib")
+		cands = append(cands, cand{path: m.Path, rank: candidateRank(m.Path, isLib)})
 	}
-	sort.Strings(libs)
-	sort.Strings(exes)
-	candidates := append(append([]string{}, libs...), exes...)
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].rank != cands[j].rank {
+			return cands[i].rank < cands[j].rank
+		}
+		return cands[i].path < cands[j].path
+	})
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.path)
+	}
+	return out, nil
+}
 
-	// Pass 1: the path says which version it is. Refine the micro version
-	// from the file itself, so what gets logged is measured rather than
-	// inferred from a filename -- but keep the soname's answer if the file
-	// cannot be read, rather than losing a working detection to it.
+// Interpreter is one CPython image found in a process, with the version
+// MEASURED from the file rather than inferred from its name.
+type Interpreter struct {
+	Path    string
+	Version Version
+}
+
+// FindInterpreters returns every CPython image in a process's executable
+// mappings, best candidate first.
+//
+// It returns a LIST because a refused candidate must not end the search. A
+// process can map more than one interpreter image -- an embedder that dlopens
+// a libpython beside a statically linked host, a venv whose base interpreter is
+// also mapped -- and refusing the process because the first one was, say, a
+// free-threaded build hides an interpreter that would have walked fine. Only
+// when every candidate has been tried is the process itself refused, and the
+// error says how many were examined so "no interpreter here" and "the
+// interpreter refused" cannot read the same.
+//
+// The version is read from the file (Py_Version in .rodata), falling back to
+// the soname when the file carries no such symbol. Both are measurements of
+// the accepted image, made only after its symbols have already proved it is
+// an interpreter -- the name is never what admitted it.
+func FindInterpreters(pid uint32) ([]Interpreter, error) {
+	candidates, err := interpreterCandidates(pid)
+	if err != nil {
+		return nil, err
+	}
+	var found []Interpreter
 	for _, p := range candidates {
-		ver, ok := DetectFromSoname(p)
-		if !ok {
+		ok, err := definesInterpreterSymbols(p)
+		if err != nil || !ok {
 			continue
 		}
-		if measured, err := VersionFromELF(p); err == nil {
-			ver = measured
+		v, verr := VersionFromELF(p)
+		if verr != nil {
+			// The symbols say interpreter; only the version is unreadable.
+			// The soname is the fallback, and an unknown version is still
+			// reported -- AttachProcess refuses an unsupported one by name,
+			// which is a better answer than pretending nothing was found.
+			v, _ = DetectFromSoname(p)
 		}
-		return p, ver, nil
+		found = append(found, Interpreter{Path: p, Version: v})
 	}
+	if len(found) == 0 {
+		return nil, fmt.Errorf("%w: pid %d, %d executable mappings examined",
+			ErrNoInterpreterMapped, pid, len(candidates))
+	}
+	return found, nil
+}
 
-	// Pass 2: the file says which version it is.
-	for _, p := range candidates {
-		measured, err := VersionFromELF(p)
-		if err != nil {
-			continue
-		}
-		return p, measured, nil
+// FindInterpreter returns the best CPython image in a process, which is the
+// first one FindInterpreters ranked. Kept for callers that want one answer;
+// enrolment uses FindInterpreters so a refusal can fall through to the next.
+func FindInterpreter(pid uint32) (path string, v Version, err error) {
+	found, err := FindInterpreters(pid)
+	if err != nil {
+		return "", Version{}, err
 	}
-	return "", Version{}, fmt.Errorf("%w: pid %d", ErrNoInterpreterMapped, pid)
+	return found[0].Path, found[0].Version, nil
 }
 
 // AttachProcess is the whole per-process enrolment: locate the interpreter
@@ -171,8 +311,14 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, err), nil
 	}
-	evalRange, err := EvalRangeForFile(libPath)
-	if err != nil {
+	// Located, not installed. The eval-loop range is the ON-SWITCH and it is
+	// no longer this package's to write: it goes into the core's
+	// handoff_ranges under this module's unwinder id, and unwind/interp
+	// installs it AFTER this function returns successfully. Locating it here
+	// anyway is what keeps a target whose eval loop cannot be found from
+	// attaching and then producing nothing -- a refusal with a reason beats a
+	// py_procs entry no PC ever reaches.
+	if _, err := EvalRangeForFile(libPath); err != nil {
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, err), nil
 	}
@@ -194,9 +340,6 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 			return res, err
 		}
 		if res.Refused == "" {
-			if err := InstallEvalRange(m.EvalRanges, tableID, evalRange); err != nil {
-				return res, err
-			}
 			return res, nil
 		}
 		last = res
@@ -239,28 +382,63 @@ const maxValidationThreads = 16
 // other binary, validate, and install.
 //
 // It exists so the DWARF profilers and the GPU probe enrol Python the SAME
-// way. They load different BPF programs, but the interpreter arm lives in
-// walk_step, which all of them share -- so a target enrolled for one and not
-// the other produces Python frames on some of its stacks and not others,
-// for no reason a user could deduce. One function, two thin callers.
+// way. They load different BPF programs, but the handoff is in the walk all of
+// them share -- so a target enrolled for one and not the other produces Python
+// frames on some of its stacks and not others, for no reason a user could
+// deduce. One function, two thin callers.
+//
+// A REFUSED CANDIDATE DOES NOT END THE SEARCH. Every image FindInterpreters
+// returned is tried in order, and the process is refused only when all of them
+// have been. Before this, the first candidate's refusal was terminal: on a
+// PyTorch venv that meant one library's missing symbol stood in for "this
+// process has no Python in it", which is a different fact and was reported as
+// the same one.
+//
+// The refusal that comes back is the LAST one, not the first, and both are
+// arbitrary -- what matters is that it is a refusal from something that
+// carried the interpreter's symbols. The log line names the path, so which
+// image refused is never guesswork.
 //
 // Returns found == false, with no error, for a process that maps no CPython
 // image at all -- which is nearly every process on a machine, and is not
 // worth an error value.
 func EnrollTarget(pid uint32, m *BPFMaps) (libPath string, found bool, res Result, err error) {
-	libPath, _, ferr := FindInterpreter(pid)
+	interps, ferr := FindInterpreters(pid)
 	if ferr != nil {
 		if errors.Is(ferr, ErrNoInterpreterMapped) {
 			return "", false, Result{}, nil
 		}
 		return "", false, Result{}, ferr
 	}
-	tableID, terr := TableIDForMapping(pid, libPath)
-	if terr != nil {
-		return libPath, true, Result{}, terr
+
+	var lastRes Result
+	var lastPath string
+	for _, in := range interps {
+		tableID, terr := TableIDForMapping(pid, in.Path)
+		if terr != nil {
+			// This image cannot be keyed the way the CFI tables key it, so a
+			// range installed for it would sit under a table_id no PC
+			// resolves to. Try the next rather than refuse the process.
+			lastPath, lastRes = in.Path, refuseWith(in.Version, terr)
+			continue
+		}
+		r, aerr := AttachProcess(pid, in.Path, tableID, m)
+		if aerr != nil {
+			lastPath, lastRes = in.Path, r
+			continue
+		}
+		if r.Refused == "" {
+			return in.Path, true, r, nil
+		}
+		lastPath, lastRes = in.Path, r
 	}
-	res, err = AttachProcess(pid, libPath, tableID, m)
-	return libPath, true, res, err
+	if len(interps) > 1 && lastRes.Refused != "" {
+		// Say that more than one image was tried, so a reader does not take
+		// the last one's reason as the only one there was.
+		lastRes.Refused = fmt.Sprintf("%s (tried %d CPython images in pid %d; all refused)",
+			lastRes.Refused, len(interps), pid)
+	}
+	return lastPath, true, lastRes, nil
 }
 
 // DetachProcess removes a process's py_procs record.

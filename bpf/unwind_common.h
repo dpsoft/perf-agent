@@ -758,12 +758,63 @@ static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
     return (ctx->rec->hdr.walker_flags & WALKER_FLAG_FP_TERMINATED) != 0;
 }
 
+// python_walk_enabled gates the interpreter arm at LOAD time, not at run
+// time, and that distinction is the whole point: a `const volatile` global is
+// a known constant to the verifier, so with it false the entire arm below --
+// two map lookups, the eval-range test and the chain walk -- is pruned before
+// verification, and the program is the shape it had before the CPython walker
+// existed.
+//
+// It exists because that shape is the difference between loading and not
+// loading. On Linux 6.19.4+ the arm's presence pushes perf_dwarf,
+// offcpu_dwarf and gpu_usdt past the verifier's 1M processed-instruction
+// ceiling (see the SCC/backedge change f597664454bd), which took out
+// --unwind auto, the DEFAULT profiling mode, on those kernels. Userspace
+// loads with this true, and on a complexity rejection reloads with it false
+// rather than leaving the profiler dead -- see profile.loadWithPythonGate.
+//
+// Default true: a build that silently shipped with Python frames off would be
+// the failure this whole branch exists to refuse.
+#ifndef PYTHON_WALK_DEFAULT
+// Default true: a build that silently shipped with Python frames off would be
+// the failure this whole branch exists to refuse. Overridable with -D only so
+// a verifier experiment can compile the arm out and measure the difference
+// (see the ladder in verifier-plan.md); nothing in the build does that.
+#define PYTHON_WALK_DEFAULT true
+#endif
+const volatile bool python_walk_enabled = PYTHON_WALK_DEFAULT;
+
 // walk_step is the per-frame bpf_loop callback for the hybrid walker.
 // Classifies ctx->pc, picks FP or DWARF path, and advances the walk
 // state. Returns 0 to continue, 1 to stop.
 static long walk_step(__u32 idx, void *arg) {
     struct walk_ctx *ctx = (struct walk_ctx *)arg;
-    if (frame_push_native(ctx, ctx->pc)) return 1;
+
+    // ----- A live Python segment spends this iteration.
+    //
+    // The chain has no loop of its own: this one is the iteration engine for
+    // both frame kinds, exactly as OTel's unwinder switches between "step a
+    // Python frame" and "step a native frame" inside one loop. A second
+    // nested bpf_loop is what stopped all three programs loading on 6.19.4+
+    // (see py_step_one), and a per-segment bound is what used to truncate
+    // deep Python stacks; neither exists now.
+    //
+    // The native frame this segment hangs from was pushed on the iteration
+    // that armed the cursor, and ctx->pc has NOT been advanced since -- so
+    // when the segment ends we fall through and continue the native walk for
+    // the frame we are still standing on, in this same iteration. `resumed`
+    // records that, because the interpreter arm below must not re-fire for a
+    // frame whose segment has just finished: re-arming there would walk the
+    // OUTER segment at the INNER one's native position, which is the
+    // duplicated-frames failure the entry-frame stop exists to prevent.
+    bool resumed = false;
+    if (python_walk_enabled && ctx->py_state == PY_CHAIN_WALKING) {
+        if (py_step_one(ctx)) return 1;
+        if (ctx->py_state == PY_CHAIN_WALKING) return 0;
+        resumed = true;
+    } else if (frame_push_native(ctx, ctx->pc)) {
+        return 1;
+    }
 
     // Per-frame classification. Miss = treat as FP_SAFE (spec: FALLBACK
     // behaves the same as FP_SAFE at runtime).
@@ -785,22 +836,27 @@ static long walk_step(__u32 idx, void *arg) {
         // already share -- the CUDA launch probe gets Python frames with no
         // second integration.
         //
-        // A Python failure never stops the native walk: py_push_frames
+        // A Python failure never stops the native walk: py_begin_chain
         // returns void and counts, and control falls through to the
         // classification below exactly as it did before.
-        struct py_eval_range *er = bpf_map_lookup_elem(&py_eval_ranges, &m.table_id);
+        struct py_eval_range *er = python_walk_enabled
+                                       ? bpf_map_lookup_elem(&py_eval_ranges, &m.table_id)
+                                       : NULL;
         // ctx->py_state == PY_CHAIN_DONE means this sample is finished with
         // Python -- the chain ran out, or something refused and was counted.
         // Skipping the py_procs hash in that case is the same economy
         // py_push_frames applies to the TSS lookup: a deep native stack can
         // land on the eval loop many times per sample, and none of those
         // repeats can learn anything new.
-        if (er && ctx->py_state != PY_CHAIN_DONE &&
+        if (er && !resumed && ctx->py_state != PY_CHAIN_DONE &&
             m.rel_pc >= er->lo && m.rel_pc < er->hi) {
             __u32 py_pid = ctx->pid;
             struct py_proc_info *pi = bpf_map_lookup_elem(&py_procs, &py_pid);
             if (pi && pi->enabled) {
-                py_push_frames(ctx, pi);
+                // Arms the cursor and returns; the frames themselves are
+                // pushed by the following iterations of this loop.
+                py_begin_chain(ctx, pi);
+                if (ctx->py_state == PY_CHAIN_WALKING) return 0;
             } else {
                 // An eval-loop PC in a process userspace never validated (or
                 // refused: wrong version, free-threaded build, unreadable

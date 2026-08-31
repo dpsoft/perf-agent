@@ -195,6 +195,7 @@ type gpuusdtVariableSpecs struct {
 	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 }
 
 // gpuusdtObjects contains all objects after they have been loaded into the kernel.
@@ -271,6 +272,7 @@ type gpuusdtVariables struct {
 	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 }
 
 // gpuusdtPrograms contains all programs after they have been loaded into the kernel.

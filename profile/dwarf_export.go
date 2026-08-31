@@ -51,18 +51,23 @@ func LoadPerfDwarf(systemWide, kernelStacks bool) (*PerfDwarf, error) {
 		return nil, fmt.Errorf("remove memlock: %w", err)
 	}
 
-	spec, err := loadPerf_dwarf()
-	if err != nil {
-		return nil, fmt.Errorf("load perf_dwarf spec: %w", err)
-	}
-	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
-		return nil, fmt.Errorf("set system_wide: %w", err)
-	}
-	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
-		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
+	newSpec := func() (*ebpf.CollectionSpec, error) {
+		spec, err := loadPerf_dwarf()
+		if err != nil {
+			return nil, fmt.Errorf("load perf_dwarf spec: %w", err)
+		}
+		if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
+			return nil, fmt.Errorf("set system_wide: %w", err)
+		}
+		if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+			return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
+		}
+		return spec, nil
 	}
 	p := &PerfDwarf{}
-	if err := spec.LoadAndAssign(&p.objs, nil); err != nil {
+	if err := loadWithPythonGate("perf_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
+		return spec.LoadAndAssign(&p.objs, nil)
+	}); err != nil {
 		return nil, fmt.Errorf("load and assign: %w", err)
 	}
 	return p, nil

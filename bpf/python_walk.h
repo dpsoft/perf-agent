@@ -243,8 +243,9 @@ struct {
                                     // could not be read
 #define PY_CNT_FRAME_READ_FAIL   4  // an _PyInterpreterFrame field faulted
 #define PY_CNT_OWNER_IMPLAUSIBLE 5  // owner byte above this version's enum
-#define PY_CNT_CHAIN_TRUNCATED   6  // PY_MAX_FRAMES_PER_ENTRY ran out before
-                                    // the chain reached its C boundary
+#define PY_CNT_CHAIN_TRUNCATED   6  // the OUTER walk's iteration budget ran
+                                    // out with a segment still in progress:
+                                    // the record filled up mid-chain
 #define PY_CNT_PUSH_REFUSED      7  // frame_push_python had no room left
 #define PY_CNT_NONE_EXECUTABLE   8  // f_executable was NULL or Py_None on a
                                     // frame the owner test did not already
@@ -309,14 +310,10 @@ static __always_inline void py_count(__u32 slot) {
 
 // ----- The frame chain.
 
-// PY_MAX_FRAMES_PER_ENTRY bounds one call into py_push_frames. It is not the
-// depth of the Python stack a sample can carry -- the chain is resumed at the
-// next eval-loop PC the native walk lands on (see py_state below) -- it is
-// how far one call will run before giving the rest of the walk a turn.
-//
-// 32 pairs is already 64 of MAX_FRAMES' 127 slots, so this bound is reached
-// long after frame_push_python starts refusing on a realistic stack.
-#define PY_MAX_FRAMES_PER_ENTRY 32
+// There is no per-segment frame bound any more. The chain is walked one
+// frame per walk_step iteration, so it shares the record's MAX_FRAMES budget
+// with the native frames instead of carrying a second, independent one --
+// see py_step_one for why the loop that bound used to govern had to go.
 
 // walk_ctx.py_state: where this sample's Python chain walk stands.
 //
@@ -330,8 +327,13 @@ static __always_inline void py_count(__u32 slot) {
 // tstate->current_frame the second time would push the innermost segment a
 // second time and claim it belonged to the outer one.
 #define PY_CHAIN_UNSTARTED 0  // no TSS lookup done for this sample yet
-#define PY_CHAIN_ACTIVE    1  // walk_ctx.py_frame names where to resume
+#define PY_CHAIN_ACTIVE    1  // walk_ctx.py_frame names where to resume, at
+                              // the next eval-loop PC the native walk lands on
 #define PY_CHAIN_DONE      2  // chain exhausted, or refused; do not retry
+#define PY_CHAIN_WALKING   3  // a segment is in progress: walk_ctx.py_iter
+                              // names the next frame, and walk_step spends
+                              // its own loop iterations on it rather than
+                              // advancing the native walk. See py_step_one.
 
 // CPython 3.14 makes _PyInterpreterFrame.f_executable a tagged _PyStackRef
 // rather than a plain PyObject*, so the low bits must be cleared before the
@@ -394,72 +396,80 @@ static __always_inline void py_count(__u32 slot) {
 // Every refusal, fault and truncation bumps a named py_walk_counters slot.
 // Returns nothing: a Python failure never stops the NATIVE walk, which is
 // the walk that must survive.
-// py_frame_step is the bpf_loop callback that walks ONE link of the
-// _PyInterpreterFrame chain: read this frame's owner, stop at the
-// interpreter's C boundary, otherwise push it and advance to `previous`.
+// py_step_one advances the chain by ONE _PyInterpreterFrame: read this
+// frame's owner, stop at the interpreter's C boundary, otherwise push it and
+// move the cursor to `previous`.
 //
-// WHY A CALLBACK AND NOT AN UNROLLED LOOP. This body used to be a
-// `#pragma unroll` over PY_MAX_FRAMES_PER_ENTRY, which is 32 copies of it
-// inlined into walk_step -- which is itself a bpf_loop callback the verifier
-// explores per native frame. Static size was never the problem (3.8k
-// instructions against a 1M ceiling); the verifier's PATH exploration was.
-// On Linux 6.19 the three programs that share walk_step all failed to load
-// with "BPF program is too large. Processed 1000001 insn" -- perf_dwarf,
-// offcpu_dwarf and gpu_usdt alike, which is to say --unwind dwarf, the
-// default, did not run at all on that kernel. As a bpf_loop callback the
-// verifier walks this body ONCE instead of 32 inlined times.
+// WHY THERE IS NO LOOP HERE AT ALL. This started as a `#pragma unroll` over
+// 32 frames, became a bpf_loop callback, and neither loaded on Linux 6.19:
+// both were rejected with "BPF program is too large. Processed 1000001 insn",
+// the verifier's PATH-EXPLORATION ceiling rather than its size limit -- 3826
+// instructions failed and so did 870.
 //
-// It is also the idiom already in this walker: mapping_for_pc drives
-// mapping_scan_step the same way, from inside walk_step, so a bpf_loop
-// nested in a bpf_loop callback is a shape this program already verifies.
+// The measurement that explains it: the PRE-BRANCH program carries a nested
+// bpf_loop (mapping_scan_step) with a bound of 256 inside the same
+// 127-iteration outer walk, and it verifies on that exact kernel. What broke
+// it was adding a SECOND nested fixpoint-iterated callback site, not the
+// bound (32 < 256) and not the body. Each bpf_loop call site is a
+// push_stack() fork the verifier re-enters until it converges, and
+// func_states_equal() refuses to prune across differing callback_depth, so
+// the levels multiply (kernel/bpf/verifier.c, 6.19: :10719, :11671, :11129,
+// :19456; 6.19.4 backported f597664454bd, which makes every bpf_loop site an
+// SCC so precision marks propagate over its implicit backedge).
 //
-// The context is struct walk_ctx itself rather than a struct of its own.
-// walk_step already receives that pointer and dereferences ctx->rec through
-// it, so passing the same pointer one level down introduces no new pointer
-// kind for the verifier to track.
+// So the chain does not get a loop of its own. walk_step is already driven by
+// a bpf_loop over MAX_FRAMES, and a live Python segment now consumes those
+// iterations one frame at a time -- the same shape OTel converged on, whose
+// unwinder runs one loop with a switch over "step a Python frame" and "step a
+// native frame" rather than a loop per language.
 //
-// Returns 1 to stop the loop, 0 to continue -- and every stopping path sets
-// ctx->py_iter_stopped, because "stopped for a reason" and "ran out of
-// budget" are different outcomes and only the second is
-// PY_CNT_CHAIN_TRUNCATED.
-static long py_frame_step(__u32 idx, void *arg) {
-    struct walk_ctx *ctx = (struct walk_ctx *)arg;
+// Two things fall out of that, both improvements:
+//   * There is no PY_MAX_FRAMES_PER_ENTRY any more. Python and native frames
+//     share the record's MAX_FRAMES budget, which is the honest resource; a
+//     40-frame Python segment completes as long as there is room, where the
+//     per-segment bound used to truncate it at 32.
+//   * The walk is bounded by the outer loop, so nothing here can run away.
+//
+// Returns 1 only when the record is full -- the caller stops the whole walk,
+// as it would for a native push refusal. Otherwise 0, with ctx->py_state
+// saying whether the segment continues (PY_CHAIN_WALKING) or has ended.
+static __always_inline int py_step_one(struct walk_ctx *ctx) {
     struct py_proc_info *pi = ctx->py_pi;
-    // Defensive: py_push_frames sets this immediately before the loop, and
-    // the verifier requires the null test to be reachable from every
+    // Defensive: py_begin_chain sets this before entering PY_CHAIN_WALKING,
+    // and the verifier requires the null test to be reachable from every
     // dereference below regardless.
     if (!pi) {
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
 
     __u64 frame = ctx->py_iter;
     if (frame == 0) {
-        ctx->py_iter_stopped = 1;  // the chain ran out; not a failure
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;  // the chain ran out; not a failure
+        return 0;
     }
 
     __u8 owner = 0;
     if (bpf_probe_read_user(&owner, sizeof(owner), (void *)(frame + pi->frame_owner))) {
         py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
     // The same plausibility screen pyunwind.Offsets.Validate applies at
-    // attach, re-applied per frame: an owner byte outside this version's
-    // enum means the offsets are being read against a layout they do not
-    // describe, and every frame after it would be invented.
+    // attach, re-applied per frame: an owner byte outside this version's enum
+    // means the offsets are being read against a layout they do not describe,
+    // and every frame after it would be invented.
     if (owner > pi->frame_owner_max) {
         py_count(PY_CNT_OWNER_IMPLAUSIBLE);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
 
     __u64 prev = 0;
     if (bpf_probe_read_user(&prev, sizeof(prev), (void *)(frame + pi->frame_previous))) {
         py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
 
     if (owner >= pi->frame_owner_boundary) {
@@ -470,21 +480,22 @@ static long py_frame_step(__u32 idx, void *arg) {
         if (prev != 0) {
             ctx->py_frame = prev;
             ctx->py_state = PY_CHAIN_ACTIVE;
+        } else {
+            ctx->py_state = PY_CHAIN_DONE;
         }
-        ctx->py_iter_stopped = 1;
-        return 1;
+        return 0;
     }
 
     __u64 exec = 0, instr = 0;
     if (bpf_probe_read_user(&exec, sizeof(exec), (void *)(frame + pi->frame_executable))) {
         py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
     if (bpf_probe_read_user(&instr, sizeof(instr), (void *)(frame + pi->frame_instr_ptr))) {
         py_count(PY_CNT_FRAME_READ_FAIL);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
     if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;
 
@@ -504,40 +515,30 @@ static long py_frame_step(__u32 idx, void *arg) {
     // 2142-2144, is_frame_valid, which refuses a NULL code object before
     // reading anything else) and because emitting either value as a code
     // object puts one garbage frame on the stack. EXPECT
-    // PY_CNT_NONE_EXECUTABLE TO READ ZERO in production: a zero here means
-    // the screen never had to fire, not that it is missing. (none_addr is
-    // the target's own _Py_NoneStruct, resolved at attach; it is zero on
-    // 3.12, where the second test is dead.)
+    // PY_CNT_NONE_EXECUTABLE TO READ ZERO in production.
     if (exec == 0 || (pi->none_addr != 0 && exec == pi->none_addr)) {
         py_count(PY_CNT_NONE_EXECUTABLE);
-        ctx->py_iter_stopped = 1;
-        return 1;
+        ctx->py_state = PY_CHAIN_DONE;
+        return 0;
     }
 
     if (frame_push_python(ctx, exec, instr)) {
         // The record is full. frame_push_python has already raised
         // WALKER_FLAG_FRAME_PUSH_REFUSED; this says which of the two pushers
-        // it was.
+        // it was. The whole walk stops: a native push would refuse too.
         py_count(PY_CNT_PUSH_REFUSED);
-        ctx->py_iter_stopped = 1;
+        ctx->py_state = PY_CHAIN_DONE;
         return 1;
     }
     py_count(PY_CNT_FRAMES_PUSHED);
 
     ctx->py_iter = prev;
-    return 0;
+    return 0;  // still PY_CHAIN_WALKING: the next outer iteration continues
 }
 
-// py_push_frames walks _PyInterpreterFrame.previous from where this sample
-// left off, pushing one two-slot Python frame per Python-executing frame,
-// and stops at the interpreter's C boundary so native unwinding can carry on
-// beneath it. The per-link work is py_frame_step, above.
-//
-// Stopping at the boundary is not an optimisation. Running the chain to NULL
-// consumes the entire Python stack in one go and then terminates the trace,
-// losing every native frame beneath the interpreter -- which is exactly what
-// the reference implementation's pre-3.11 path does, and its own fixtures
-// show the native stack simply missing.
+// py_begin_chain arms the cursor for a segment, doing the one-time work of
+// finding this thread's PyThreadState and its current frame. The stepping is
+// py_step_one, above, driven by walk_step's own loop.
 //
 // WHERE THE BOUNDARY IS is per-version and is NOT "owner == CSTACK". The
 // _frameowner enum is renumbered in 3.14: FRAME_OWNED_BY_INTERPRETER is
@@ -559,22 +560,22 @@ static long py_frame_step(__u32 idx, void *arg) {
 //                                                 owner == FRAME_OWNED_BY_CSTACK ||
 //                                                 owner == FRAME_OWNED_BY_INTERPRETER
 //
-// -- and so does this walk, against pi->frame_owner_boundary, which
+// -- and so does py_step_one, against pi->frame_owner_boundary, which
 // pyunwind's per-version table measures from FRAME_OWNED_BY_CSTACK on
 // 3.12/3.13 and from FRAME_OWNED_BY_INTERPRETER on 3.14. The literal 3 lives
 // in that table, next to every other per-version fact, and not here.
 //
-// Every refusal, fault and truncation bumps a named py_walk_counters slot.
-// Returns nothing: a Python failure never stops the NATIVE walk, which is
-// the walk that must survive.
-static __always_inline void py_push_frames(struct walk_ctx *ctx, struct py_proc_info *pi) {
+// Every refusal and fault bumps a named py_walk_counters slot. Returns
+// nothing: a Python failure never stops the NATIVE walk, which is the walk
+// that must survive.
+static __always_inline void py_begin_chain(struct walk_ctx *ctx, struct py_proc_info *pi) {
     // Defensive only: walk_step checks pi and owns PY_CNT_NO_PROC_INFO, so
     // this arm counts nothing (counting here too would attribute one miss
     // twice). It stays because pi is a map-lookup result and the verifier
     // requires the null test to be reachable from every dereference below,
     // not just from the caller.
     if (!pi) return;
-    if (ctx->py_state == PY_CHAIN_DONE) return;
+    if (ctx->py_state == PY_CHAIN_DONE || ctx->py_state == PY_CHAIN_WALKING) return;
 
     __u64 frame = ctx->py_frame;
     if (ctx->py_state == PY_CHAIN_UNSTARTED) {
@@ -606,25 +607,13 @@ static __always_inline void py_push_frames(struct walk_ctx *ctx, struct py_proc_
         frame = p;
     }
 
-    // From here the walk either reaches a boundary with more chain behind it
-    // -- the one case that leaves the cursor live, and py_frame_step is what
-    // sets it -- or it is finished with Python for this sample. Setting that
-    // first means no exit path has to remember to.
-    ctx->py_state = PY_CHAIN_DONE;
+    // The resume cursor is consumed: from here the segment is live and
+    // ctx->py_iter carries it. py_step_one re-arms py_frame if it reaches
+    // another boundary with chain still behind it.
     ctx->py_frame = 0;
-
     ctx->py_pi = pi;
     ctx->py_iter = frame;
-    ctx->py_iter_stopped = 0;
-    bpf_loop(PY_MAX_FRAMES_PER_ENTRY, py_frame_step, ctx, 0);
-
-    // Fell out of the loop without stopping: PY_MAX_FRAMES_PER_ENTRY frames
-    // pushed and the boundary still not reached. The cursor is deliberately
-    // NOT left live -- py_frame_step only arms it at the boundary -- because
-    // resuming a half-walked segment at the next eval-loop PC would file the
-    // rest of THIS segment under the position of a different one, which
-    // reads as a plausible stack rather than a short one.
-    if (!ctx->py_iter_stopped) py_count(PY_CNT_CHAIN_TRUNCATED);
+    ctx->py_state = PY_CHAIN_WALKING;
 }
 
 #endif // PERF_AGENT_PYTHON_WALK_H

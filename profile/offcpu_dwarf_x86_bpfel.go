@@ -190,6 +190,7 @@ type offcpu_dwarfVariableSpecs struct {
 	BtfAnchorOffcpuStartKey *ebpf.VariableSpec `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
 	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
+	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
@@ -261,6 +262,7 @@ type offcpu_dwarfVariables struct {
 	BtfAnchorOffcpuStartKey *ebpf.Variable `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
 	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
+	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 

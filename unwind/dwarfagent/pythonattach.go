@@ -5,6 +5,7 @@ import (
 
 	"github.com/cilium/ebpf"
 
+	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/pyunwind"
 )
 
@@ -55,6 +56,16 @@ func enrollPython(objs sessionObjs, pid uint32, logPrefix string) bool {
 		return false
 	}
 
+	// Nothing to enrol against if the arm was compiled out: py_procs and the
+	// eval range would be written and never read. Reported here rather than
+	// silently skipped, because "we found your interpreter" followed by no
+	// frames is the shape this branch keeps refusing.
+	if attempted, enabled, reason := profile.PythonWalkState(); attempted && !enabled {
+		log.Printf("%s: python frames: pid %d: NOT ENROLLED -- the interpreter arm is not in the loaded "+
+			"program (verifier: %s)", logPrefix, pid, reason)
+		return false
+	}
+
 	libPath, found, res, err := pyunwind.EnrollTarget(pid, &pyunwind.BPFMaps{
 		PyProcs:    maps.PyProcsMap(),
 		EvalRanges: maps.PyEvalRangesMap(),
@@ -96,6 +107,17 @@ func enrollPython(objs sessionObjs, pid uint32, logPrefix string) bool {
 func logPythonWalkCounters(objs sessionObjs, logPrefix string, hadInterpreter bool) {
 	maps, ok := objs.(pythonMaps)
 	if !ok || maps.PyWalkCountersMap() == nil {
+		return
+	}
+	// DISABLED is a state, not a row of zeros. If the verifier refused the
+	// program with the interpreter arm compiled in, userspace reloaded it
+	// without the arm (profile.loadWithPythonGate) -- and ten zeroed counters
+	// read exactly like "this workload ran no Python", which is the
+	// ambiguity this counter set exists to remove. Say which it was.
+	if attempted, enabled, reason := profile.PythonWalkState(); attempted && !enabled {
+		log.Printf("%s: python walk: DISABLED (the verifier rejected the interpreter arm on this kernel, "+
+			"so the program was loaded without it; every counter below would read zero and mean nothing). "+
+			"Verifier said: %s", logPrefix, reason)
 		return
 	}
 	c, err := pyunwind.ReadWalkCounters(maps.PyWalkCountersMap())

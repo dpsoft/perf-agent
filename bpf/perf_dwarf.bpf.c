@@ -94,7 +94,15 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     // PY_CNT_CHAIN_ABANDONED in python_walk.h for the walker_flags join that
     // separates "the native unwinder gave out" from "py_eval_ranges is
     // missing an entry".
-    if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
+    if (python_walk_enabled) {
+        // Two different losses, asked once each, in the only place that knows
+        // the walk is over. WALKING means the record filled up while a
+        // segment was still being stepped; ACTIVE means a segment ended at
+        // its boundary and the native walk never reached the outer segment's
+        // eval-loop PC.
+        if (walker.py_state == PY_CHAIN_WALKING) py_count(PY_CNT_CHAIN_TRUNCATED);
+        else if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
+    }
 
     // Kernel-stack capture. Default to -1 so userspace can cheaply detect
     // "no kernel stack" without branching on the gate. bpf_get_stackid is

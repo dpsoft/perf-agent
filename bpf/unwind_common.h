@@ -260,6 +260,11 @@ struct {
 //
 // The three drivers build this on the BPF stack with designated
 // initialisers, so the two added fields cost them nothing but zeroes.
+// Forward declaration: struct walk_ctx carries a pointer to one, and
+// python_walk.h (which defines it) is included further down, after the
+// helpers it needs exist.
+struct py_proc_info;
+
 struct walk_ctx {
     __u64 pc;
     __u64 fp;
@@ -283,8 +288,26 @@ struct walk_ctx {
     __u32 n_pcs;
     struct sample_record *rec;
     __u64 py_frame;      // next _PyInterpreterFrame to push, 0 if none
+    // The chain walk's per-CALL state, distinct from the resume cursor
+    // above. py_push_frames drives its loop through bpf_loop rather than an
+    // unrolled body (see python_walk.h for why), and a bpf_loop callback
+    // takes exactly one context pointer -- so the callback's inputs live
+    // here, where the callback already has them, instead of in a second
+    // struct whose pointer would have to be carried through the callback
+    // boundary as well.
+    //
+    // py_pi is a py_procs map value, the same kind of pointer `rec` above
+    // already is, and is null-checked in the callback like any other.
+    struct py_proc_info *py_pi;
+    __u64 py_iter;       // the _PyInterpreterFrame this iteration stands on
     __u8  py_state;      // PY_CHAIN_UNSTARTED / _ACTIVE / _DONE
-    __u8  _pad[7];
+    // py_iter_stopped distinguishes "the walk ended for a reason" from "the
+    // per-entry budget ran out", which is the difference between silence and
+    // PY_CNT_CHAIN_TRUNCATED. bpf_loop's return value cannot answer it: a
+    // callback that stops on its last permitted iteration returns the same
+    // count as one that never stopped at all.
+    __u8  py_iter_stopped;
+    __u8  _pad[6];
 };
 
 // ----- Lazy CFI: miss emit helper.

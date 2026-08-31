@@ -18,19 +18,45 @@ import (
 // produces a plausible stack, not a failure.
 func pyPushFramesBody(t *testing.T) string {
 	t.Helper()
+	return pyFuncBody(t, "static __always_inline void py_push_frames(")
+}
+
+// pyFrameStepBody returns the source text of py_frame_step, the bpf_loop
+// callback that walks one link of the chain.
+//
+// The walk used to be a #pragma unroll INSIDE py_push_frames; it is a
+// callback now because the unrolled copies pushed all three programs past
+// the verifier's 1M-processed-instruction ceiling on Linux 6.19. The
+// decisions these tests pin did not move -- they are in the callback -- so
+// the tests follow them there rather than being relaxed.
+func pyFrameStepBody(t *testing.T) string {
+	t.Helper()
+	return pyFuncBody(t, "static long py_frame_step(")
+}
+
+// pyChainWalkBody is both halves together, for assertions about the walk as
+// a whole (which counters it bumps, say) rather than about where a
+// particular decision lives.
+func pyChainWalkBody(t *testing.T) string {
+	t.Helper()
+	return pyPushFramesBody(t) + "\n" + pyFrameStepBody(t)
+}
+
+func pyFuncBody(t *testing.T, signature string) string {
+	t.Helper()
 	src, err := os.ReadFile("../bpf/python_walk.h")
 	if err != nil {
 		t.Fatalf("read python_walk.h: %v", err)
 	}
 	body := string(src)
-	start := strings.Index(body, "static __always_inline void py_push_frames(")
+	start := strings.Index(body, signature)
 	if start < 0 {
-		t.Fatal("py_push_frames not found in bpf/python_walk.h")
+		t.Fatalf("%q not found in bpf/python_walk.h", signature)
 	}
 	rest := body[start:]
 	end := strings.Index(rest, "\n}\n")
 	if end < 0 {
-		t.Fatal("py_push_frames body not closed")
+		t.Fatalf("%q body not closed", signature)
 	}
 	return rest[:end]
 }
@@ -44,18 +70,18 @@ func pyPushFramesBody(t *testing.T) string {
 // interpreter, which reads as a deep, complete Python trace rather than as a
 // bug. The stop must be the range test CPython's own readers use.
 func TestTheWalkStopsAtTheBoundaryNotAtCStack(t *testing.T) {
-	body := pyPushFramesBody(t)
+	body := pyChainWalkBody(t)
 
 	if !strings.Contains(body, "owner >= pi->frame_owner_boundary") {
-		t.Error("py_push_frames does not stop at owner >= pi->frame_owner_boundary")
+		t.Error("the chain walk does not stop at owner >= pi->frame_owner_boundary")
 	}
 	if strings.Contains(body, "frame_owner_cstack") {
-		t.Error("py_push_frames tests frame_owner_cstack; that value is 4 on 3.14 and is assigned to no frame there")
+		t.Error("the chain walk tests frame_owner_cstack; that value is 4 on 3.14 and is assigned to no frame there")
 	}
 	// The plausibility screen is a separate, weaker check and must stay:
 	// owner_max is the enum ceiling, boundary is the C frame.
 	if !strings.Contains(body, "owner > pi->frame_owner_max") {
-		t.Error("py_push_frames no longer screens the owner byte against this version's enum ceiling")
+		t.Error("the chain walk no longer screens the owner byte against this version's enum ceiling")
 	}
 }
 
@@ -105,7 +131,7 @@ func TestTheStackRefMaskIsCPythonsOwn(t *testing.T) {
 		t.Error("the mask no longer cites CPython's own out-of-process reader as its authority")
 	}
 
-	fn := pyPushFramesBody(t)
+	fn := pyFrameStepBody(t)
 	if !strings.Contains(fn, "if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;") {
 		t.Error("the tag is not cleared, or is cleared unconditionally; 3.12 and 3.13 hold a plain PyObject* there")
 	}
@@ -124,9 +150,9 @@ func TestTheWalkKeepsThe312CFrameIndirection(t *testing.T) {
 // CPython >= 3.13 puts Py_None in the top C-entered frame's f_executable.
 // Treating it as a code object puts one garbage frame on every Python stack.
 func TestTheWalkRecognisesPyNoneAsAStop(t *testing.T) {
-	body := pyPushFramesBody(t)
+	body := pyFrameStepBody(t)
 	if !strings.Contains(body, "pi->none_addr") {
-		t.Error("py_push_frames does not recognise Py_None in f_executable (3.13+)")
+		t.Error("the chain walk does not recognise Py_None in f_executable (3.13+)")
 	}
 	if !strings.Contains(body, "PY_CNT_NONE_EXECUTABLE") {
 		t.Error("the Py_None stop is silent")
@@ -137,7 +163,7 @@ func TestTheWalkRecognisesPyNoneAsAStop(t *testing.T) {
 // has no bits left, so an uncounted refusal is invisible: the profile simply
 // has no Python frames and nothing anywhere says why.
 func TestEveryPythonRefusalIsCounted(t *testing.T) {
-	body := pyPushFramesBody(t)
+	body := pyChainWalkBody(t)
 	for _, slot := range []string{
 		"PY_CNT_TSS_MISS",
 		"PY_CNT_TSTATE_READ_FAIL",
@@ -148,7 +174,7 @@ func TestEveryPythonRefusalIsCounted(t *testing.T) {
 		"PY_CNT_FRAMES_PUSHED",
 	} {
 		if !strings.Contains(body, "py_count("+slot+")") {
-			t.Errorf("%s is never bumped in py_push_frames", slot)
+			t.Errorf("%s is never bumped anywhere in the chain walk", slot)
 		}
 	}
 }
@@ -161,22 +187,30 @@ func TestEveryPythonRefusalIsCounted(t *testing.T) {
 // one's position. Duplicated frames in a plausible order — the failure mode
 // this whole design keeps refusing.
 func TestTheChainIsResumedNotRestarted(t *testing.T) {
-	body := pyPushFramesBody(t)
-	if !strings.Contains(body, "if (ctx->py_state == PY_CHAIN_DONE) return;") {
+	entry := pyPushFramesBody(t)
+	if !strings.Contains(entry, "if (ctx->py_state == PY_CHAIN_DONE) return;") {
 		t.Error("py_push_frames re-runs after the chain is finished")
 	}
-	if !strings.Contains(body, "ctx->py_state = PY_CHAIN_ACTIVE;") {
+	if !strings.Contains(entry, "if (ctx->py_state == PY_CHAIN_UNSTARTED)") {
+		t.Error("the TSS lookup is not gated on the chain being unstarted")
+	}
+	// Arming the cursor is the callback's job now: it is the half that knows
+	// it has reached the boundary. Asserted THERE rather than over the
+	// combined text, so moving it back into the entry function -- where it
+	// would run on every call rather than at the boundary -- fails here.
+	step := pyFrameStepBody(t)
+	if !strings.Contains(step, "ctx->py_state = PY_CHAIN_ACTIVE;") {
 		t.Error("the cursor is never armed, so a second eval-loop frame restarts the chain from the top")
 	}
-	if !strings.Contains(body, "if (ctx->py_state == PY_CHAIN_UNSTARTED)") {
-		t.Error("the TSS lookup is not gated on the chain being unstarted")
+	if strings.Contains(entry, "PY_CHAIN_ACTIVE") {
+		t.Error("py_push_frames arms the cursor outside the boundary check, so a chain that never reached the boundary would be resumed")
 	}
 	// Budget exhaustion must NOT leave the cursor live: resuming a
 	// half-walked segment at the next eval-loop PC would file the rest of it
 	// under a different native frame.
 	//
-	// The region examined is everything AFTER the chain loop's closing brace.
-	// This assertion previously sliced from the LAST occurrence of
+	// The region examined is everything AFTER the bpf_loop call. This
+	// assertion once sliced from the LAST occurrence of
 	// py_count(PY_CNT_CHAIN_TRUNCATED), which is the final statement of the
 	// function -- so the slice was that one 33-character call and could not
 	// contain PY_CHAIN_ACTIVE under any mutation. It passed against the very
@@ -192,50 +226,52 @@ func TestTheChainIsResumedNotRestarted(t *testing.T) {
 	}
 }
 
-// pyPushFramesAfterChainLoop returns the text of py_push_frames that follows
-// the #pragma unroll chain loop's CLOSING BRACE -- i.e. the path taken only
-// when the loop ran out of budget without reaching the interpreter boundary.
+// Budget exhaustion has to be told apart from a walk that stopped for a
+// reason, and bpf_loop's return value cannot do it: a callback that stops on
+// its last permitted iteration returns the same count as one that never
+// stopped. Every path in the callback that returns 1 must therefore set the
+// flag, or a perfectly ordinary stop is counted as a truncation.
 //
-// Brace-matched from the loop's opening brace rather than found by searching
-// for a landmark string, because every landmark inside this function is one
-// edit away from moving. Line comments are skipped so a brace in prose cannot
-// throw the depth count off.
+// Counted rather than merely present: the callback has one `return 0`
+// (continue) and the rest are stops, so the number of stop-returns and the
+// number of flag assignments must match exactly.
+func TestEveryStoppingPathMarksTheWalkStopped(t *testing.T) {
+	step := pyFrameStepBody(t)
+	stops := strings.Count(step, "return 1;")
+	marks := strings.Count(step, "ctx->py_iter_stopped = 1;")
+	if stops == 0 {
+		t.Fatal("py_frame_step has no stopping path at all; the slice is looking at the wrong text")
+	}
+	if marks != stops {
+		t.Errorf("py_frame_step has %d stopping paths but marks the walk stopped %d times; "+
+			"an unmarked stop is counted as PY_CNT_CHAIN_TRUNCATED", stops, marks)
+	}
+	if strings.Count(step, "return 0;") != 1 {
+		t.Error("py_frame_step should continue on exactly one path -- after a frame was pushed")
+	}
+}
+
+// pyPushFramesAfterChainLoop returns the text of py_push_frames that follows
+// the bpf_loop call -- i.e. the path taken only when the loop ran out of
+// budget without reaching the interpreter boundary.
+//
+// Simpler than it was: when the walk was a #pragma unroll this had to
+// brace-match the loop body, because the region of interest was inside the
+// same function. The body is a separate callback now, so the region is
+// everything after one call.
 func pyPushFramesAfterChainLoop(t *testing.T) string {
 	t.Helper()
 	body := pyPushFramesBody(t)
 
-	pragma := strings.Index(body, "#pragma unroll")
-	if pragma < 0 {
-		t.Fatal("py_push_frames no longer has a #pragma unroll chain loop")
+	call := strings.Index(body, "bpf_loop(PY_MAX_FRAMES_PER_ENTRY, py_frame_step")
+	if call < 0 {
+		t.Fatal("py_push_frames no longer drives py_frame_step through bpf_loop")
 	}
-	open := strings.Index(body[pragma:], "{")
-	if open < 0 {
-		t.Fatal("no opening brace after #pragma unroll")
+	end := strings.IndexByte(body[call:], '\n')
+	if end < 0 {
+		t.Fatal("the bpf_loop call is not followed by anything")
 	}
-	open += pragma
-
-	depth := 0
-	for i := open; i < len(body); i++ {
-		if body[i] == '/' && i+1 < len(body) && body[i+1] == '/' {
-			nl := strings.IndexByte(body[i:], '\n')
-			if nl < 0 {
-				break
-			}
-			i += nl
-			continue
-		}
-		switch body[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return body[i+1:]
-			}
-		}
-	}
-	t.Fatal("the chain loop's closing brace was never reached; braces are unbalanced or the loop was reshaped")
-	return ""
+	return body[call+end:]
 }
 
 // PY_CNT_CHAIN_ABANDONED is the one counter neither py_push_frames nor

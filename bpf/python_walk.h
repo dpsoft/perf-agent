@@ -394,6 +394,179 @@ static __always_inline void py_count(__u32 slot) {
 // Every refusal, fault and truncation bumps a named py_walk_counters slot.
 // Returns nothing: a Python failure never stops the NATIVE walk, which is
 // the walk that must survive.
+// py_frame_step is the bpf_loop callback that walks ONE link of the
+// _PyInterpreterFrame chain: read this frame's owner, stop at the
+// interpreter's C boundary, otherwise push it and advance to `previous`.
+//
+// WHY A CALLBACK AND NOT AN UNROLLED LOOP. This body used to be a
+// `#pragma unroll` over PY_MAX_FRAMES_PER_ENTRY, which is 32 copies of it
+// inlined into walk_step -- which is itself a bpf_loop callback the verifier
+// explores per native frame. Static size was never the problem (3.8k
+// instructions against a 1M ceiling); the verifier's PATH exploration was.
+// On Linux 6.19 the three programs that share walk_step all failed to load
+// with "BPF program is too large. Processed 1000001 insn" -- perf_dwarf,
+// offcpu_dwarf and gpu_usdt alike, which is to say --unwind dwarf, the
+// default, did not run at all on that kernel. As a bpf_loop callback the
+// verifier walks this body ONCE instead of 32 inlined times.
+//
+// It is also the idiom already in this walker: mapping_for_pc drives
+// mapping_scan_step the same way, from inside walk_step, so a bpf_loop
+// nested in a bpf_loop callback is a shape this program already verifies.
+//
+// The context is struct walk_ctx itself rather than a struct of its own.
+// walk_step already receives that pointer and dereferences ctx->rec through
+// it, so passing the same pointer one level down introduces no new pointer
+// kind for the verifier to track.
+//
+// Returns 1 to stop the loop, 0 to continue -- and every stopping path sets
+// ctx->py_iter_stopped, because "stopped for a reason" and "ran out of
+// budget" are different outcomes and only the second is
+// PY_CNT_CHAIN_TRUNCATED.
+static long py_frame_step(__u32 idx, void *arg) {
+    struct walk_ctx *ctx = (struct walk_ctx *)arg;
+    struct py_proc_info *pi = ctx->py_pi;
+    // Defensive: py_push_frames sets this immediately before the loop, and
+    // the verifier requires the null test to be reachable from every
+    // dereference below regardless.
+    if (!pi) {
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+
+    __u64 frame = ctx->py_iter;
+    if (frame == 0) {
+        ctx->py_iter_stopped = 1;  // the chain ran out; not a failure
+        return 1;
+    }
+
+    __u8 owner = 0;
+    if (bpf_probe_read_user(&owner, sizeof(owner), (void *)(frame + pi->frame_owner))) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+    // The same plausibility screen pyunwind.Offsets.Validate applies at
+    // attach, re-applied per frame: an owner byte outside this version's
+    // enum means the offsets are being read against a layout they do not
+    // describe, and every frame after it would be invented.
+    if (owner > pi->frame_owner_max) {
+        py_count(PY_CNT_OWNER_IMPLAUSIBLE);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+
+    __u64 prev = 0;
+    if (bpf_probe_read_user(&prev, sizeof(prev), (void *)(frame + pi->frame_previous))) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+
+    if (owner >= pi->frame_owner_boundary) {
+        // The interpreter's own entry frame: it executes no Python code, so
+        // it is not pushed. Hand back to native unwinding, and leave the
+        // cursor on what lies beyond it so the next eval-loop PC the native
+        // walk lands on resumes the same chain instead of restarting it.
+        if (prev != 0) {
+            ctx->py_frame = prev;
+            ctx->py_state = PY_CHAIN_ACTIVE;
+        }
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+
+    __u64 exec = 0, instr = 0;
+    if (bpf_probe_read_user(&exec, sizeof(exec), (void *)(frame + pi->frame_executable))) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+    if (bpf_probe_read_user(&instr, sizeof(instr), (void *)(frame + pi->frame_instr_ptr))) {
+        py_count(PY_CNT_FRAME_READ_FAIL);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+    if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;
+
+    // A TORN-READ BACKSTOP, not the mechanism for the C-entered frame.
+    //
+    // CPython >= 3.13 does put Py_None in f_executable rather than a code
+    // object, but only on the ENTRY frame -- 3.13.15 ceval.c:716 and 3.14.3
+    // ceval.c:1159 set it on the same frame whose owner they set to the
+    // boundary value -- and the owner test above has already returned by
+    // then. So this can only fire on a frame with owner < boundary whose
+    // executable is nonetheless NULL or None: a read torn by a chain being
+    // mutated underneath us, or offsets that are wrong in a way the owner
+    // screen did not catch.
+    //
+    // It is kept because that is exactly the screen CPython's own
+    // out-of-process reader applies (Modules/_remote_debugging_module.c:
+    // 2142-2144, is_frame_valid, which refuses a NULL code object before
+    // reading anything else) and because emitting either value as a code
+    // object puts one garbage frame on the stack. EXPECT
+    // PY_CNT_NONE_EXECUTABLE TO READ ZERO in production: a zero here means
+    // the screen never had to fire, not that it is missing. (none_addr is
+    // the target's own _Py_NoneStruct, resolved at attach; it is zero on
+    // 3.12, where the second test is dead.)
+    if (exec == 0 || (pi->none_addr != 0 && exec == pi->none_addr)) {
+        py_count(PY_CNT_NONE_EXECUTABLE);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+
+    if (frame_push_python(ctx, exec, instr)) {
+        // The record is full. frame_push_python has already raised
+        // WALKER_FLAG_FRAME_PUSH_REFUSED; this says which of the two pushers
+        // it was.
+        py_count(PY_CNT_PUSH_REFUSED);
+        ctx->py_iter_stopped = 1;
+        return 1;
+    }
+    py_count(PY_CNT_FRAMES_PUSHED);
+
+    ctx->py_iter = prev;
+    return 0;
+}
+
+// py_push_frames walks _PyInterpreterFrame.previous from where this sample
+// left off, pushing one two-slot Python frame per Python-executing frame,
+// and stops at the interpreter's C boundary so native unwinding can carry on
+// beneath it. The per-link work is py_frame_step, above.
+//
+// Stopping at the boundary is not an optimisation. Running the chain to NULL
+// consumes the entire Python stack in one go and then terminates the trace,
+// losing every native frame beneath the interpreter -- which is exactly what
+// the reference implementation's pre-3.11 path does, and its own fixtures
+// show the native stack simply missing.
+//
+// WHERE THE BOUNDARY IS is per-version and is NOT "owner == CSTACK". The
+// _frameowner enum is renumbered in 3.14: FRAME_OWNED_BY_INTERPRETER is
+// inserted at 3, pushing FRAME_OWNED_BY_CSTACK to 4 -- and CPython moved the
+// C-boundary frame onto the new enumerator at the same time, so the value
+// that marks the boundary is 3 on every supported version:
+//
+//   3.12.14 Python/ceval.c:702   entry_frame.owner = FRAME_OWNED_BY_CSTACK;      (3)
+//   3.13.15 Python/ceval.c:719   entry_frame.owner = FRAME_OWNED_BY_CSTACK;      (3)
+//   3.14.3  Python/ceval.c:1162  entry.frame.owner = FRAME_OWNED_BY_INTERPRETER; (3)
+//
+// FRAME_OWNED_BY_CSTACK == 4 is assigned nowhere in the 3.14 tree, so testing
+// equality with frame_owner_cstack would walk straight past the boundary
+// there and consume the native stack. CPython's own readers test the
+// half-open range instead --
+//
+//   3.14.3 Python/ceval.c:260                     frame->owner >= FRAME_OWNED_BY_INTERPRETER
+//   3.14.3 Modules/_remote_debugging_module.c:2148-2149
+//                                                 owner == FRAME_OWNED_BY_CSTACK ||
+//                                                 owner == FRAME_OWNED_BY_INTERPRETER
+//
+// -- and so does this walk, against pi->frame_owner_boundary, which
+// pyunwind's per-version table measures from FRAME_OWNED_BY_CSTACK on
+// 3.12/3.13 and from FRAME_OWNED_BY_INTERPRETER on 3.14. The literal 3 lives
+// in that table, next to every other per-version fact, and not here.
+//
+// Every refusal, fault and truncation bumps a named py_walk_counters slot.
+// Returns nothing: a Python failure never stops the NATIVE walk, which is
+// the walk that must survive.
 static __always_inline void py_push_frames(struct walk_ctx *ctx, struct py_proc_info *pi) {
     // Defensive only: walk_step checks pi and owns PY_CNT_NO_PROC_INFO, so
     // this arm counts nothing (counting here too would attribute one miss
@@ -434,104 +607,24 @@ static __always_inline void py_push_frames(struct walk_ctx *ctx, struct py_proc_
     }
 
     // From here the walk either reaches a boundary with more chain behind it
-    // -- the one case that leaves the cursor live -- or it is finished with
-    // Python for this sample. Setting that first means no exit path below
-    // has to remember to.
+    // -- the one case that leaves the cursor live, and py_frame_step is what
+    // sets it -- or it is finished with Python for this sample. Setting that
+    // first means no exit path has to remember to.
     ctx->py_state = PY_CHAIN_DONE;
     ctx->py_frame = 0;
 
-    #pragma unroll
-    for (int i = 0; i < PY_MAX_FRAMES_PER_ENTRY; i++) {
-        if (frame == 0) return;  // the chain ran out; not a failure
+    ctx->py_pi = pi;
+    ctx->py_iter = frame;
+    ctx->py_iter_stopped = 0;
+    bpf_loop(PY_MAX_FRAMES_PER_ENTRY, py_frame_step, ctx, 0);
 
-        __u8 owner = 0;
-        if (bpf_probe_read_user(&owner, sizeof(owner), (void *)(frame + pi->frame_owner))) {
-            py_count(PY_CNT_FRAME_READ_FAIL);
-            return;
-        }
-        // The same plausibility screen pyunwind.Offsets.Validate applies at
-        // attach, re-applied per frame: an owner byte outside this version's
-        // enum means the offsets are being read against a layout they do not
-        // describe, and every frame after it would be invented.
-        if (owner > pi->frame_owner_max) {
-            py_count(PY_CNT_OWNER_IMPLAUSIBLE);
-            return;
-        }
-
-        __u64 prev = 0;
-        if (bpf_probe_read_user(&prev, sizeof(prev), (void *)(frame + pi->frame_previous))) {
-            py_count(PY_CNT_FRAME_READ_FAIL);
-            return;
-        }
-
-        if (owner >= pi->frame_owner_boundary) {
-            // The interpreter's own entry frame: it executes no Python code,
-            // so it is not pushed. Hand back to native unwinding, and leave
-            // the cursor on what lies beyond it so the next eval-loop PC the
-            // native walk lands on resumes the same chain instead of
-            // restarting it.
-            if (prev != 0) {
-                ctx->py_frame = prev;
-                ctx->py_state = PY_CHAIN_ACTIVE;
-            }
-            return;
-        }
-
-        __u64 exec = 0, instr = 0;
-        if (bpf_probe_read_user(&exec, sizeof(exec), (void *)(frame + pi->frame_executable))) {
-            py_count(PY_CNT_FRAME_READ_FAIL);
-            return;
-        }
-        if (bpf_probe_read_user(&instr, sizeof(instr), (void *)(frame + pi->frame_instr_ptr))) {
-            py_count(PY_CNT_FRAME_READ_FAIL);
-            return;
-        }
-        if (pi->frame_executable_tagged) exec &= ~PY_STACKREF_TAG_BITS;
-
-        // A TORN-READ BACKSTOP, not the mechanism for the C-entered frame.
-        //
-        // CPython >= 3.13 does put Py_None in f_executable rather than a code
-        // object, but only on the ENTRY frame -- 3.13.15 ceval.c:716 and
-        // 3.14.3 ceval.c:1159 set it on the same frame whose owner they set
-        // to the boundary value -- and the owner test twenty lines above has
-        // already returned by then. So this can only fire on a frame with
-        // owner < boundary whose executable is nonetheless NULL or None: a
-        // read torn by a chain being mutated underneath us, or offsets that
-        // are wrong in a way the owner screen did not catch.
-        //
-        // It is kept because that is exactly the screen CPython's own
-        // out-of-process reader applies
-        // (Modules/_remote_debugging_module.c:2142-2144, is_frame_valid,
-        // which refuses a NULL code object before reading anything else) and
-        // because emitting either value as a code object puts one garbage
-        // frame on the stack. EXPECT PY_CNT_NONE_EXECUTABLE TO READ ZERO in
-        // production: a zero here means the screen never had to fire, not
-        // that it is missing. (none_addr is the target's own _Py_NoneStruct,
-        // resolved at attach; it is zero on 3.12, where the second test is
-        // dead.)
-        if (exec == 0 || (pi->none_addr != 0 && exec == pi->none_addr)) {
-            py_count(PY_CNT_NONE_EXECUTABLE);
-            return;
-        }
-
-        if (frame_push_python(ctx, exec, instr)) {
-            // The record is full. frame_push_python has already raised
-            // WALKER_FLAG_FRAME_PUSH_REFUSED; this says which of the two
-            // pushers it was.
-            py_count(PY_CNT_PUSH_REFUSED);
-            return;
-        }
-        py_count(PY_CNT_FRAMES_PUSHED);
-
-        frame = prev;
-    }
-
-    // Fell out of the loop: PY_MAX_FRAMES_PER_ENTRY frames pushed and the
-    // boundary still not reached. The cursor is deliberately NOT left live --
+    // Fell out of the loop without stopping: PY_MAX_FRAMES_PER_ENTRY frames
+    // pushed and the boundary still not reached. The cursor is deliberately
+    // NOT left live -- py_frame_step only arms it at the boundary -- because
     // resuming a half-walked segment at the next eval-loop PC would file the
-    // rest of THIS segment under the position of a different one, which reads
-    // as a plausible stack rather than a short one.
-    py_count(PY_CNT_CHAIN_TRUNCATED);
+    // rest of THIS segment under the position of a different one, which
+    // reads as a plausible stack rather than a short one.
+    if (!ctx->py_iter_stopped) py_count(PY_CNT_CHAIN_TRUNCATED);
 }
 
 #endif // PERF_AGENT_PYTHON_WALK_H

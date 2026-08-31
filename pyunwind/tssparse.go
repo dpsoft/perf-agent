@@ -48,11 +48,23 @@ type fixedRun struct {
 type tssShape struct {
 	// name says which build this shape was measured from, so a future
 	// mismatch can be reproduced rather than guessed at.
-	name     string
-	size     int
-	fixed    []fixedRun
-	keyAt    []int
-	absolute bool
+	name  string
+	size  int
+	fixed []fixedRun
+	// keyAt lists the positions of the u32 fields carrying the reference.
+	// For a RIP-relative shape each is a displacement measured from the END
+	// of its own instruction, so ripEnd carries that end position (offset
+	// within the body) for each entry -- the two are read together.
+	keyAt  []int
+	ripEnd []int
+	// keyDelta is what the SECOND field is expected to encode relative to
+	// the first, once both are resolved. Zero for the shapes whose two
+	// fields address the same struct base; 4 for the Clang shape, whose
+	// second field addresses Py_tss_t._key while the first addresses
+	// _is_initialized -- which turns the cross-check into a statement about
+	// the struct's layout rather than a repetition.
+	keyDelta int64
+	kind     AutoTSSKeyRefKind
 }
 
 // The shapes, in the order they are tried (which is irrelevant: sizes are
@@ -263,10 +275,10 @@ var tssShapes = []tssShape{
 		// This shape is why the live-interpreter tests are worth running in
 		// CI: it was found by them failing on a runner's own
 		// /usr/bin/python3.12, an interpreter no machine here has.
-		name:     "37-byte non-PIE absolute-immediate (Ubuntu 24.04 /usr/bin/python3.12)",
-		size:     37,
-		keyAt:    []int{6, 27},
-		absolute: true,
+		name:  "37-byte non-PIE absolute-immediate (Ubuntu 24.04 /usr/bin/python3.12)",
+		size:  37,
+		keyAt: []int{6, 27},
+		kind:  KeyRefAbsoluteAddress,
 		fixed: []fixedRun{
 			{0, []byte{0xf3, 0x0f, 0x1e, 0xfa}}, // endbr64
 			{4, []byte{0x55}},                   // push %rbp
@@ -278,6 +290,63 @@ var tssShapes = []tssShape{
 			{26, []byte{0xbf}},                  // mov $imm32,%edi
 			{31, []byte{0x5d}},                  // pop %rbp
 			{32, []byte{0xe9}},                  // jmp PyThread_tss_get
+		},
+	},
+	{
+		// 29 bytes, measured from python-build-standalone's
+		// cpython-3.12.14+20260825-x86_64-unknown-linux-gnu at 0x4846f0 --
+		// the distribution uv, Rye and a great deal of CI install, built
+		// with CLANG (22.1.3) rather than GCC, statically linked, and
+		// BOLT-processed. It is the first shape from a second compiler, and
+		// it differs from the four GCC ones on three axes at once:
+		//
+		//	[0]      55                push %rbp          (no endbr64: no -fcf-protection)
+		//	[1:4]    48 89 e5          mov  %rsp,%rbp
+		//	[4:6]    83 3d <disp32> 00 cmpl $0x0,disp32(%rip)   disp32 at [6:10]
+		//	[11:13]  74 0c             je   +0x0c
+		//	[13:15]  8b 3d <disp32>    mov  disp32(%rip),%edi   disp32 at [15:19]
+		//	[19]     5d                pop  %rbp
+		//	[20]     e9 <rel32>        jmp  pthread_getspecific rel32 at [21:25]
+		//	[25:27]  31 c0             xor  %eax,%eax
+		//	[27]     5d                pop  %rbp
+		//	[28]     c3                ret
+		//
+		// THE ADDRESSING IS THE INTERESTING PART. Clang reaches the field
+		// RIP-relatively instead of loading &_PyRuntime and adding to it,
+		// so neither disp32 is an offset from _PyRuntime OR an absolute
+		// address: each is measured from the end of its own instruction.
+		// Resolving them needs the address the body was linked at, which is
+		// what KeyRefBodyRelative and SymbolPlacement.BodyVaddr exist for.
+		//
+		// And it tail-calls pthread_getspecific with the KEY VALUE, the
+		// shape this parser's doc says belongs to 3.11 -- because Clang
+		// inlined PyThread_tss_get. So "3.11 does it differently" was a
+		// statement about a compiler's inlining decision, not about a
+		// CPython version. This is 3.12.14.
+		//
+		// The two disp32s deliberately do NOT agree: the cmpl addresses
+		// Py_tss_t._is_initialized and the mov addresses ._key, four bytes
+		// later. keyDelta pins that, which makes the cross-check a
+		// statement about the struct layout the raw 8-byte read downstream
+		// depends on -- stronger than the equality the other shapes use.
+		name:     "29-byte Clang RIP-relative (python-build-standalone / uv)",
+		size:     29,
+		keyAt:    []int{6, 15},
+		ripEnd:   []int{11, 19},
+		keyDelta: 4,
+		kind:     KeyRefBodyRelative,
+		fixed: []fixedRun{
+			{0, []byte{0x55}},             // push %rbp
+			{1, []byte{0x48, 0x89, 0xe5}}, // mov %rsp,%rbp
+			{4, []byte{0x83, 0x3d}},       // cmpl $0x0,disp32(%rip)
+			{10, []byte{0x00}},            //   ... its immediate
+			{11, []byte{0x74, 0x0c}},      // je +0x0c
+			{13, []byte{0x8b, 0x3d}},      // mov disp32(%rip),%edi
+			{19, []byte{0x5d}},            // pop %rbp
+			{20, []byte{0xe9}},            // jmp pthread_getspecific
+			{25, []byte{0x31, 0xc0}},      // xor %eax,%eax
+			{27, []byte{0x5d}},            // pop %rbp
+			{28, []byte{0xc3}},            // ret
 		},
 	},
 }
@@ -296,13 +365,57 @@ var tssShapes = []tssShape{
 //
 // Resolve turns either into an address in the target.
 type AutoTSSKeyRef struct {
-	Value    uint64
-	Absolute bool
+	Value uint64
+	Kind  AutoTSSKeyRefKind
+}
+
+// AutoTSSKeyRefKind says how to read AutoTSSKeyRef.Value. Three codegen
+// strategies are in the wild and they encode three different numbers; a
+// caller that reads one as another follows a wild pointer rather than
+// failing, which is why this is a kind and not a bool.
+type AutoTSSKeyRefKind uint8
+
+const (
+	// KeyRefRuntimeOffset: Value is a byte OFFSET from &_PyRuntime (0x608
+	// on every 3.12 build measured). PIC builds, which load &_PyRuntime
+	// through the GOT and add a displacement.
+	KeyRefRuntimeOffset AutoTSSKeyRefKind = iota
+	// KeyRefAbsoluteAddress: Value is the LINK-TIME ADDRESS of the Py_tss_t
+	// (0xb379c8 on Ubuntu's non-PIE python3.12). Non-PIE builds, which can
+	// name the address outright.
+	KeyRefAbsoluteAddress
+	// KeyRefBodyRelative: Value is an offset from the START of
+	// PyGILState_GetThisThreadState's own body -- a RIP-relative
+	// displacement already folded together with the position of the
+	// instruction that carried it. Clang builds, which address the field
+	// directly rather than through _PyRuntime's base.
+	//
+	// This is the one form the bytes alone cannot resolve: it needs the
+	// address the body was linked at. See SymbolPlacement.
+	KeyRefBodyRelative
+)
+
+// SymbolPlacement is where the symbols a reference resolves against were
+// linked, plus the load bias of the mapping they were found in. Every field
+// comes from the target's own ELF, so the caller reads them once and the
+// arithmetic below is the same for every shape.
+type SymbolPlacement struct {
+	// RuntimeVaddr and RuntimeSize describe _PyRuntime as the ELF declares
+	// it. The size is the bounds check; see Resolve.
+	RuntimeVaddr uint64
+	RuntimeSize  uint64
+	// BodyVaddr is PyGILState_GetThisThreadState's own link-time address.
+	// Only KeyRefBodyRelative needs it -- a RIP-relative displacement is
+	// meaningless without knowing where the instruction that carried it
+	// was -- and Resolve refuses that kind when it is zero rather than
+	// resolving against a base of nothing.
+	BodyVaddr uint64
+	// Bias is the mapping's load bias in the live process.
+	Bias uint64
 }
 
 // Resolve returns the address of the Py_tss_t in the TARGET's address
-// space, given _PyRuntime as the target's own ELF declares it (link-time
-// address and size) plus that mapping's load bias.
+// space, given where the target's own ELF put the symbols involved.
 //
 // The size is not decoration. It is the one independent check available on
 // a number that came out of an instruction stream: autoTSSkey is a field of
@@ -311,27 +424,40 @@ type AutoTSSKeyRef struct {
 // lands far outside and is refused here instead of being read as somebody
 // else's memory. It is also what catches an absolute reference resolved
 // against the wrong binary.
-func (r AutoTSSKeyRef) Resolve(runtimeVaddr, runtimeSize, bias uint64) (uint64, error) {
+func (r AutoTSSKeyRef) Resolve(p SymbolPlacement) (uint64, error) {
 	const tssSize = 8 // sizeof(Py_tss_t): int _is_initialized; pthread_key_t _key
-	if runtimeSize == 0 {
+	if p.RuntimeSize == 0 {
 		return 0, fmt.Errorf("%w: _PyRuntime has no size in the target's symbol table, so an autoTSSkey reference cannot be bounds-checked",
 			ErrOffsetsImplausible)
 	}
-	var off uint64
-	if r.Absolute {
-		if r.Value < runtimeVaddr {
-			return 0, fmt.Errorf("%w: autoTSSkey address %#x is below _PyRuntime at %#x",
-				ErrOffsetsImplausible, r.Value, runtimeVaddr)
+	var addr uint64
+	switch r.Kind {
+	case KeyRefRuntimeOffset:
+		addr = p.RuntimeVaddr + r.Value
+	case KeyRefAbsoluteAddress:
+		addr = r.Value
+	case KeyRefBodyRelative:
+		if p.BodyVaddr == 0 {
+			return 0, fmt.Errorf("%w: a RIP-relative autoTSSkey reference cannot be resolved without the address PyGILState_GetThisThreadState was linked at",
+				ErrOffsetsImplausible)
 		}
-		off = r.Value - runtimeVaddr
-	} else {
-		off = r.Value
+		// Wrapping addition on purpose: the displacement folded into Value
+		// is signed, and a field below the referring instruction is an
+		// ordinary case.
+		addr = p.BodyVaddr + r.Value
+	default:
+		return 0, fmt.Errorf("%w: unknown autoTSSkey reference kind %d", ErrOffsetsImplausible, r.Kind)
 	}
-	if off+tssSize > runtimeSize {
+	if addr < p.RuntimeVaddr {
+		return 0, fmt.Errorf("%w: autoTSSkey address %#x is below _PyRuntime at %#x",
+			ErrOffsetsImplausible, addr, p.RuntimeVaddr)
+	}
+	off := addr - p.RuntimeVaddr
+	if off+tssSize > p.RuntimeSize {
 		return 0, fmt.Errorf("%w: autoTSSkey at offset %#x is outside _PyRuntime (%#x bytes)",
-			ErrOffsetsImplausible, off, runtimeSize)
+			ErrOffsetsImplausible, off, p.RuntimeSize)
 	}
-	return runtimeVaddr + bias + off, nil
+	return addr + p.Bias, nil
 }
 
 // ParseAutoTSSKeyRef recovers _PyRuntime's autoTSSkey reference from the
@@ -373,15 +499,28 @@ func (s tssShape) decode(code []byte) (AutoTSSKeyRef, error) {
 				ErrTSSPatternUnrecognised, s.name, f.at, f.bytes, got)
 		}
 	}
-	first := binary.LittleEndian.Uint32(code[s.keyAt[0] : s.keyAt[0]+4])
-	for _, at := range s.keyAt[1:] {
-		other := binary.LittleEndian.Uint32(code[at : at+4])
-		if other != first {
-			return AutoTSSKeyRef{}, fmt.Errorf("%w: %s: value at byte %d (%#x) disagrees with value at byte %d (%#x)",
-				ErrTSSPatternUnrecognised, s.name, s.keyAt[0], first, at, other)
+	// Each field is folded into one number in the shape's own space: for a
+	// RIP-relative shape that is the displacement plus the end of the
+	// instruction carrying it (so the result is an offset from the body's
+	// start); for the others the field is already what it means.
+	fold := func(i int) uint64 {
+		v := uint64(int64(int32(binary.LittleEndian.Uint32(code[s.keyAt[i] : s.keyAt[i]+4]))))
+		if s.ripEnd != nil {
+			v += uint64(s.ripEnd[i])
+		}
+		return v
+	}
+	first := fold(0)
+	for i := 1; i < len(s.keyAt); i++ {
+		other := fold(i)
+		want := first + uint64(s.keyDelta)
+		if other != want {
+			return AutoTSSKeyRef{}, fmt.Errorf(
+				"%w: %s: the reference at byte %d resolves %d bytes from the one at byte %d, expected %d",
+				ErrTSSPatternUnrecognised, s.name, s.keyAt[i], int64(other-first), s.keyAt[0], s.keyDelta)
 		}
 	}
-	return AutoTSSKeyRef{Value: uint64(first), Absolute: s.absolute}, nil
+	return AutoTSSKeyRef{Value: first, Kind: s.kind}, nil
 }
 
 // shapeSizes renders the accepted body lengths for the refusal message, so

@@ -176,8 +176,8 @@ func TestTSDLookupFindsEachThreadsOwnThreadState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseAutoTSSKeyRef(%s, %d-byte body): %v", libPath, len(code), err)
 	}
-	t.Logf("interpreter: %s (CPython %s); PyGILState_GetThisThreadState: %d bytes, autoTSSkey ref %#x (absolute=%v)",
-		libPath, version, len(code), keyRef.Value, keyRef.Absolute)
+	t.Logf("interpreter: %s (CPython %s); PyGILState_GetThisThreadState: %d bytes, autoTSSkey ref %#x (kind %d)",
+		libPath, version, len(code), keyRef.Value, keyRef.Kind)
 
 	tsd, err := glibcTSDOffsets(runtime.GOARCH)
 	if err != nil {
@@ -350,7 +350,13 @@ func liveTSSKey(pid uint32, libPath string, code []byte) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	keyAddr, err := keyRef.Resolve(rt.Value, rt.Size, resolver.bias)
+	body, err := resolver.sym(gilStateSymbol)
+	if err != nil {
+		return 0, err
+	}
+	keyAddr, err := keyRef.Resolve(SymbolPlacement{
+		RuntimeVaddr: rt.Value, RuntimeSize: rt.Size, BodyVaddr: body.Value, Bias: resolver.bias,
+	})
 	if err != nil {
 		return 0, err
 	}

@@ -27,8 +27,8 @@ func TestParseAutoTSSKeyRef(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.file, err)
 		}
-		if got.Absolute {
-			t.Fatalf("%s: decoded as an absolute address; these three shapes encode an offset from _PyRuntime", tc.file)
+		if got.Kind != KeyRefRuntimeOffset {
+			t.Fatalf("%s: decoded as kind %d; these shapes encode an offset from _PyRuntime", tc.file, got.Kind)
 		}
 		if got.Value != uint64(tc.want) {
 			t.Fatalf("%s: offset = %#x, want %#x", tc.file, got.Value, tc.want)
@@ -149,14 +149,19 @@ func TestParseAutoTSSKeyRefRefusesWrongLength(t *testing.T) {
 // failing on a runner.
 func TestParseAutoTSSKeyRefAcceptsOtherToolchainShapes(t *testing.T) {
 	cases := []struct {
-		file     string
-		wantLen  int
-		absolute bool
-		want     uint64
+		file    string
+		wantLen int
+		kind    AutoTSSKeyRefKind
+		want    uint64
 	}{
-		{"testdata/gilstate_312_gcc13_pgo.bin", 44, false, 0x608},
-		{"testdata/gilstate_312_ubuntu_fp.bin", 64, false, 0x608},
-		{"testdata/gilstate_312_ubuntu_nonpie.bin", 37, true, 0xb379c8},
+		{"testdata/gilstate_312_gcc13_pgo.bin", 44, KeyRefRuntimeOffset, 0x608},
+		{"testdata/gilstate_312_ubuntu_fp.bin", 64, KeyRefRuntimeOffset, 0x608},
+		{"testdata/gilstate_312_ubuntu_nonpie.bin", 37, KeyRefAbsoluteAddress, 0xb379c8},
+		// Clang: the value is an offset from the body's own start, so it
+		// means nothing until Resolve is given where the body was linked.
+		// 0x10c3c08 = the cmpl's displacement (0x10c3bfd) plus the 11 bytes
+		// from the body's start to the end of that instruction.
+		{"testdata/gilstate_312_clang_pbs.bin", 29, KeyRefBodyRelative, 0x10c3c08},
 	}
 	for _, tc := range cases {
 		code, err := os.ReadFile(tc.file)
@@ -170,9 +175,9 @@ func TestParseAutoTSSKeyRefAcceptsOtherToolchainShapes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.file, err)
 		}
-		if got.Absolute != tc.absolute {
-			t.Fatalf("%s: Absolute = %v, want %v -- an address read as an offset (or the reverse) is a wild read, not a wrong number",
-				tc.file, got.Absolute, tc.absolute)
+		if got.Kind != tc.kind {
+			t.Fatalf("%s: Kind = %d, want %d -- an address read as an offset (or the reverse) is a wild read, not a wrong number",
+				tc.file, got.Kind, tc.kind)
 		}
 		if got.Value != tc.want {
 			t.Fatalf("%s: value = %#x, want %#x", tc.file, got.Value, tc.want)
@@ -180,32 +185,35 @@ func TestParseAutoTSSKeyRefAcceptsOtherToolchainShapes(t *testing.T) {
 	}
 }
 
-// FOUR separate compilations of CPython 3.12's
+// FIVE separate compilations of CPython 3.12's
 // PyGILState_GetThisThreadState, from four different builds, must all say
 // autoTSSkey is at offset 0x608 of _PyRuntime -- because it is the same
 // struct in the same version. Three encode that offset directly; the
-// non-PIE one encodes an absolute address that only becomes 0x608 once
-// resolved against its own _PyRuntime.
+// non-PIE one encodes an absolute address, and the Clang one a displacement
+// from its own instruction stream, both of which only become 0x608 once
+// resolved against that binary's own symbols.
 //
 // This is a stronger statement than four separately pinned literals: a
-// parser reading the wrong u32 out of any one body, or resolving an
-// absolute reference against the wrong base, disagrees with the other
-// three. The _PyRuntime coordinates below are read with `readelf -sW` from
+// parser reading the wrong u32 out of any one body, or resolving a
+// reference against the wrong base, disagrees with the other four. The _PyRuntime coordinates below are read with `readelf -sW` from
 // the same binaries the fixtures came from.
 func TestAutoTSSKeyOffsetAgreesAcrossToolchainsForOneVersion(t *testing.T) {
 	const wantOffset = 0x608
 	cases := []struct {
 		file string
-		// _PyRuntime as that binary's own ELF declares it. Only the
-		// non-PIE fixture needs them to reach an offset at all; supplying
-		// them everywhere means Resolve's bounds check runs on every case.
+		// _PyRuntime and PyGILState_GetThisThreadState as that binary's own
+		// ELF declares them. The non-PIE fixture needs the first to reach
+		// an offset at all and the Clang one needs the second; supplying
+		// both everywhere means Resolve's bounds check runs on every case.
 		runtimeVaddr uint64
 		runtimeSize  uint64
+		bodyVaddr    uint64
 	}{
-		{"testdata/gilstate_312.bin", 0x5e42a0, 0x70210},               // python:3.12.14-slim libpython3.12.so.1.0
-		{"testdata/gilstate_312_gcc13_pgo.bin", 0x61c600, 0x70210},     // actions/setup-python 3.12.14 libpython3.12.so.1.0
-		{"testdata/gilstate_312_ubuntu_fp.bin", 0x8342e0, 0x704a8},     // Ubuntu 24.04 libpython3.12.so.1.0
-		{"testdata/gilstate_312_ubuntu_nonpie.bin", 0xb373c0, 0x704a8}, // Ubuntu 24.04 /usr/bin/python3.12
+		{"testdata/gilstate_312.bin", 0x5e42a0, 0x70210, 0x197b39},               // python:3.12.14-slim libpython3.12.so.1.0
+		{"testdata/gilstate_312_gcc13_pgo.bin", 0x61c600, 0x70210, 0x1b831e},     // actions/setup-python 3.12.14 libpython3.12.so.1.0
+		{"testdata/gilstate_312_ubuntu_fp.bin", 0x8342e0, 0x704a8, 0x2f9580},     // Ubuntu 24.04 libpython3.12.so.1.0
+		{"testdata/gilstate_312_ubuntu_nonpie.bin", 0xb373c0, 0x704a8, 0x608550}, // Ubuntu 24.04 /usr/bin/python3.12
+		{"testdata/gilstate_312_clang_pbs.bin", 0x1547cf0, 0x70210, 0x4846f0},    // python-build-standalone 3.12.14 (Clang)
 	}
 	for _, tc := range cases {
 		code, err := os.ReadFile(tc.file)
@@ -218,7 +226,9 @@ func TestAutoTSSKeyOffsetAgreesAcrossToolchainsForOneVersion(t *testing.T) {
 		}
 		// bias 0: these are link-time coordinates, and Resolve adds the
 		// bias its caller measured from the live mapping.
-		addr, err := ref.Resolve(tc.runtimeVaddr, tc.runtimeSize, 0)
+		addr, err := ref.Resolve(SymbolPlacement{
+			RuntimeVaddr: tc.runtimeVaddr, RuntimeSize: tc.runtimeSize, BodyVaddr: tc.bodyVaddr,
+		})
 		if err != nil {
 			t.Fatalf("%s: Resolve: %v", tc.file, err)
 		}
@@ -243,12 +253,12 @@ func TestAutoTSSKeyRefResolveRefusesImplausibleReferences(t *testing.T) {
 			// A rel32 misread as an immediate: the classic way a wrong
 			// positional decode produces a number at all.
 			name: "absolute address below _PyRuntime",
-			ref:  AutoTSSKeyRef{Value: 0x4b2592, Absolute: true},
+			ref:  AutoTSSKeyRef{Value: 0x4b2592, Kind: KeyRefAbsoluteAddress},
 			size: rtSize,
 		},
 		{
 			name: "absolute address past the end of _PyRuntime",
-			ref:  AutoTSSKeyRef{Value: rtVaddr + rtSize, Absolute: true},
+			ref:  AutoTSSKeyRef{Value: rtVaddr + rtSize, Kind: KeyRefAbsoluteAddress},
 			size: rtSize,
 		},
 		{
@@ -271,7 +281,7 @@ func TestAutoTSSKeyRefResolveRefusesImplausibleReferences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			addr, err := tc.ref.Resolve(rtVaddr, tc.size, 0)
+			addr, err := tc.ref.Resolve(SymbolPlacement{RuntimeVaddr: rtVaddr, RuntimeSize: tc.size})
 			if err == nil {
 				t.Fatalf("resolved to %#x; expected a refusal", addr)
 			}
@@ -282,7 +292,7 @@ func TestAutoTSSKeyRefResolveRefusesImplausibleReferences(t *testing.T) {
 	}
 	// The boundary case that must be ACCEPTED, so the check above is not
 	// simply refusing everything: a Py_tss_t in the last 8 bytes.
-	if _, err := (AutoTSSKeyRef{Value: rtSize - 8}).Resolve(rtVaddr, rtSize, 0); err != nil {
+	if _, err := (AutoTSSKeyRef{Value: rtSize - 8}).Resolve(SymbolPlacement{RuntimeVaddr: rtVaddr, RuntimeSize: rtSize}); err != nil {
 		t.Fatalf("a Py_tss_t in the final 8 bytes of _PyRuntime must resolve: %v", err)
 	}
 }
@@ -307,6 +317,9 @@ func TestAutoTSSKeyRefResolveRefusesImplausibleReferences(t *testing.T) {
 //	37-byte: the call/je/jmp rel32s at [14:18], [22:26] and [33:37]. Its
 //	         TWO imm32 copies are NOT in the list, for the same reason as
 //	         the 35-byte shape's: corrupting either makes them disagree.
+//	29-byte: only the jmp's rel32 at [21:25]. Both of its disp32 fields are
+//	         cross-checked against each other (they must resolve exactly 4
+//	         bytes apart), so corrupting either is refused.
 func TestParseAutoTSSKeyRefRefusesEverySingleByteCorruption(t *testing.T) {
 	span := func(lo, hi int) []int {
 		var out []int
@@ -332,6 +345,7 @@ func TestParseAutoTSSKeyRefRefusesEverySingleByteCorruption(t *testing.T) {
 		{"testdata/gilstate_312_gcc13_pgo.bin", join(span(7, 11), span(15, 19), span(23, 27), span(36, 40))},
 		{"testdata/gilstate_312_ubuntu_fp.bin", join(span(16, 20), span(23, 27), span(31, 35), span(48, 52))},
 		{"testdata/gilstate_312_ubuntu_nonpie.bin", join(span(14, 18), span(22, 26), span(33, 37))},
+		{"testdata/gilstate_312_clang_pbs.bin", join(span(21, 25))},
 	}
 	for _, tc := range cases {
 		good, err := os.ReadFile(tc.file)

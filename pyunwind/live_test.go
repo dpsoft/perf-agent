@@ -189,7 +189,7 @@ func TestClassifyIdentifiesAnUnversionedInterpreter(t *testing.T) {
 func TestExtensionSuffixScreenAgainstThisMachinesInterpreter(t *testing.T) {
 	path := findSystemLibpython(t)
 
-	gil, err := scanRodataFor(path, gilExtSuffixRe)
+	gil, err := scanReadOnlyDataFor(path, gilExtSuffixRe)
 	if err != nil {
 		t.Fatalf("scan %s: %v", path, err)
 	}
@@ -197,7 +197,7 @@ func TestExtensionSuffixScreenAgainstThisMachinesInterpreter(t *testing.T) {
 		t.Fatalf("%s embeds no .cpython-3XX-<arch>-linux-<abi>.so suffix; the screen below would be scanning for "+
 			"something that is not there in the first place", path)
 	}
-	ft, err := scanRodataFor(path, freeThreadedExtSuffixRe)
+	ft, err := scanReadOnlyDataFor(path, freeThreadedExtSuffixRe)
 	if err != nil {
 		t.Fatalf("scan %s: %v", path, err)
 	}

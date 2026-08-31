@@ -94,27 +94,48 @@ var (
 	freeThreadedExtSuffixRe = regexp.MustCompile(`\.cpython-3[0-9]+t-[A-Za-z0-9_]+-linux-[A-Za-z0-9_]+\.so`)
 )
 
-// scanRodataFor reports whether a binary's .rodata matches re.
+// scanReadOnlyDataFor reports whether any of a binary's allocated,
+// non-executable PROGBITS sections matches re.
 //
-// .rodata only, not the whole file: it is where the suffix lives on every
-// build measured, it is a fraction of the image (1-3 MB against 6-20), and
-// bounding the scan to one section keeps this cheap enough to run on the
+// EVERY such section, not `.rodata` by name. This started as a lookup of
+// `.rodata` alone, which is where the suffix sits in all seven GCC builds
+// measured -- and then python-build-standalone, which BOLT-processes its
+// interpreter, turned out to keep it in `.bolt.org.rodata` while shipping a
+// much smaller `.rodata` beside it. A name-based lookup finds nothing there
+// and reports no match, which is indistinguishable from a clean pass: the
+// screen would have been silently inert on one of the most widely deployed
+// CPython distributions. Selecting by section TYPE and FLAGS cannot be
+// out-argued by a linker's or a post-processor's naming.
+//
+// Still bounded to read-only data rather than the whole file: it is a
+// fraction of the image, and it keeps this cheap enough to run on the
 // accept path.
-func scanRodataFor(path string, re *regexp.Regexp) (bool, error) {
+func scanReadOnlyDataFor(path string, re *regexp.Regexp) (bool, error) {
 	f, err := elf.Open(path)
 	if err != nil {
 		return false, fmt.Errorf("pyunwind: open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	sec := f.Section(".rodata")
-	if sec == nil {
-		return false, fmt.Errorf("pyunwind: %s has no .rodata", path)
+	scanned := 0
+	for _, sec := range f.Sections {
+		if sec.Type != elf.SHT_PROGBITS ||
+			sec.Flags&elf.SHF_ALLOC == 0 ||
+			sec.Flags&elf.SHF_EXECINSTR != 0 {
+			continue
+		}
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		scanned++
+		if re.Match(data) {
+			return true, nil
+		}
 	}
-	data, err := sec.Data()
-	if err != nil {
-		return false, fmt.Errorf("pyunwind: read .rodata of %s: %w", path, err)
+	if scanned == 0 {
+		return false, fmt.Errorf("pyunwind: %s has no readable read-only data section to scan", path)
 	}
-	return re.Match(data), nil
+	return false, nil
 }
 
 // Result reports what Attach decided for a process.
@@ -201,7 +222,7 @@ func classify(path string) Result {
 	// still embed their own ABI's extension suffix. An unreadable image is
 	// not a refusal here -- the screen adds coverage and must never remove
 	// any.
-	if ft, err := scanRodataFor(path, freeThreadedExtSuffixRe); err == nil && ft {
+	if ft, err := scanReadOnlyDataFor(path, freeThreadedExtSuffixRe); err == nil && ft {
 		return refuseWith(v, fmt.Errorf(
 			"%w: %s embeds a free-threaded extension suffix (.cpython-%d%dt-...), whatever its name says; "+
 				"this build's offsets assume the GIL build and are wrong for it",
@@ -629,11 +650,28 @@ func prepareInfoForArch(goarch string, pid uint32, libPath string, code []byte, 
 		}
 	}
 
+	// PyGILState_GetThisThreadState's own link-time address, which the
+	// RIP-relative (Clang) shape needs and the others ignore: a
+	// displacement measured from an instruction is meaningless without
+	// knowing where that instruction was linked. Looked up here rather than
+	// threaded in from GILStateCode so the bytes and the address come from
+	// the same ELF by construction.
+	gilBody, err := resolver.sym(gilStateSymbol)
+	if err != nil {
+		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate %s: %w", gilStateSymbol, err))
+	}
+
 	// Where the Py_tss_t actually is. Resolve is what turns the number the
 	// instruction stream carried -- an offset from _PyRuntime on a PIC
-	// build, the address itself on a non-PIE one -- into an address in this
+	// build, the address itself on a non-PIE one, a displacement from the
+	// referring instruction on a Clang one -- into an address in this
 	// process, and refuses if it does not land inside _PyRuntime.
-	keyAddr, err := keyRef.Resolve(pyRuntime.Value, pyRuntime.Size, resolver.bias)
+	keyAddr, err := keyRef.Resolve(SymbolPlacement{
+		RuntimeVaddr: pyRuntime.Value,
+		RuntimeSize:  pyRuntime.Size,
+		BodyVaddr:    gilBody.Value,
+		Bias:         resolver.bias,
+	})
 	if err != nil {
 		return pyProcInfo{}, refuseWith(res.Version, fmt.Errorf("cannot locate autoTSSkey: %w", err))
 	}

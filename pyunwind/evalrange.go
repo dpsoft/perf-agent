@@ -137,8 +137,14 @@ func allFuncSymbols(f *elf.File) []elf.Symbol {
 	return out
 }
 
+// gilStateSymbol is the function whose prologue carries the autoTSSkey
+// reference. Named once: the bytes are read from it here and its link-time
+// address is looked up again in prepareInfo, for the RIP-relative shape,
+// and the two must be the same symbol.
+const gilStateSymbol = "PyGILState_GetThisThreadState"
+
 // GILStateCode reads the machine-code body of PyGILState_GetThisThreadState
-// out of a libpython, for ParseAutoTSSKeyOffset.
+// out of a libpython, for ParseAutoTSSKeyRef.
 //
 // The bytes come from the FILE, not from the running process: the function
 // is in a read-only text mapping, so the two are identical, and reading the
@@ -156,26 +162,25 @@ func GILStateCode(path string) ([]byte, error) {
 		return nil, fmt.Errorf("pyunwind: parse %s: %w", path, err)
 	}
 
-	const want = "PyGILState_GetThisThreadState"
 	var sym elf.Symbol
 	var found bool
 	for _, s := range allFuncSymbols(f) {
-		if s.Name == want && s.Size > 0 {
+		if s.Name == gilStateSymbol && s.Size > 0 {
 			sym, found = s, true
 			break
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("%w: %s in %s", ErrSymbolNotFound, want, path)
+		return nil, fmt.Errorf("%w: %s in %s", ErrSymbolNotFound, gilStateSymbol, path)
 	}
 
 	off, err := fileOffsetFor(f, sym.Value)
 	if err != nil {
-		return nil, fmt.Errorf("pyunwind: %s in %s: %w", want, path, err)
+		return nil, fmt.Errorf("pyunwind: %s in %s: %w", gilStateSymbol, path, err)
 	}
 	buf := make([]byte, sym.Size)
 	if _, err := osf.ReadAt(buf, int64(off)); err != nil {
-		return nil, fmt.Errorf("pyunwind: read %s body from %s: %w", want, path, err)
+		return nil, fmt.Errorf("pyunwind: read %s body from %s: %w", gilStateSymbol, path, err)
 	}
 	return buf, nil
 }

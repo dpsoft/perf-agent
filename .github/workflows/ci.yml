@@ -52,6 +52,7 @@ jobs:
         sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
         sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
         clang --version | head -1
+        uname -r   # the verifier is a property of THIS kernel; see the fingerprint step
         
         # Ensure bpf headers are available
         if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
@@ -106,6 +107,16 @@ jobs:
       continue-on-error: true
       run: |
         clang --version | head -1
+        # The kernel is part of the toolchain fingerprint. Whether a BPF program
+        # VERIFIES is a property of the running kernel's verifier, not only of
+        # the object: perf_dwarf and offcpu_dwarf load here and are rejected on
+        # a 6.19.10 host with "Processed 1000001 insn", because 6.19.4
+        # backported f597664454bd (bpf_scc_visit accumulation for bpf_loop) and
+        # 6.18 replaced the pruning-liveness machinery wholesale. Neither is
+        # visible from a clang version, and CI's kernel appeared nowhere in its
+        # logs until now.
+        uname -r
+        uname -a
         go version
         go list -m github.com/cilium/ebpf || true
         dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true

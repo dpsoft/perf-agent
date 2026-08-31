@@ -120,7 +120,7 @@ func TestClassifyAcceptsSupportedVersions(t *testing.T) {
 }
 
 // TestPyProcInfoSizeMirrorsC pins pyProcInfo's size against
-// bpf/python_walk.h's _Static_assert(sizeof(struct py_proc_info) == 56, ...).
+// bpf/interp/python/python_walk.h's _Static_assert(sizeof(struct py_proc_info) == 56, ...).
 // A field added on only one side does not fail to compile -- it silently
 // writes offsets at the wrong byte position -- so this arithmetic check is
 // the only thing standing between a one-sided edit and garbage frames.
@@ -849,25 +849,30 @@ func generatedStructFields(t *testing.T, path, typeName string) []fieldSpec {
 // TestPyProcInfoSizeMirrorsC cannot be: cilium/ebpf marshals pyProcInfo as
 // raw backing memory in Go DECLARATION order (sysenc.Marshal ->
 // unsafeBackingMemory), so swapping two same-width fields keeps
-// unsafe.Sizeof() at 56 and keeps bpf/python_walk.h's _Static_assert
+// unsafe.Sizeof() at 56 and keeps the module header's _Static_assert
 // happy while silently swapping two byte offsets in the map. This compares
 // pyProcInfo's actual reflect-derived (name, offset) sequence against the
-// real, currently-checked-in bpf2go-generated gpuusdtPyProcInfo -- name and
+// real, currently-checked-in bpf2go-generated pywalkPyProcInfo -- name and
 // offset, in order -- not against a hand-maintained expectation that could
 // itself drift out of sync with a real regen.
 //
+// The mirror is read out of THIS package's own generated file now. Before
+// T12-R6 it came from gpuprobe's, because the walker was compiled into every
+// driver's object; it no longer is, and the fact that a driver's generated
+// bindings carry no py_proc_info at all is the separation working.
+//
 // The x86 generated file is read on every host, arm64 included, and that is
 // correct rather than an oversight: both generated files are checked in,
-// and bpf2go emits a byte-identical gpuusdtPyProcInfo declaration for both
+// and bpf2go emits a byte-identical pywalkPyProcInfo declaration for both
 // architectures (the struct has no pointer-width members). Reading one of
 // them is reading the mirror; reading the host's would only make the test
 // harder to reason about.
 func TestPyProcInfoFieldOrderMatchesGenerated(t *testing.T) {
-	genPath := filepath.Join("..", "gpuprobe", "gpuusdt_x86_bpfel.go")
+	genPath := filepath.Join("pywalk_x86_bpfel.go")
 	if _, err := os.Stat(genPath); err != nil {
 		t.Skipf("generated file not found: %v", err)
 	}
-	want := generatedStructFields(t, genPath, "gpuusdtPyProcInfo")
+	want := generatedStructFields(t, genPath, "pywalkPyProcInfo")
 
 	rt := reflect.TypeOf(pyProcInfo{})
 	if rt.NumField() != len(want) {

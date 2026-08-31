@@ -23,9 +23,17 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	pp "github.com/dpsoft/perf-agent/pprof"
-	"github.com/dpsoft/perf-agent/pyunwind"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
+
+// frameTagInterp is an interpreter unwinder's id as it appears in tags[].
+//
+// The tests below care that a NON-NATIVE tag makes a two-slot frame which
+// never reaches the symbolizer as an address; WHICH language wrote it is the
+// module's business, not this consumer's. 1 is CPython's (pyunwind.UnwinderID)
+// and is used here only so the fixtures resemble a real record.
+const frameTagInterp = 1
 
 // frameNames renders a frame slice as its symbol names, so a test can pin
 // both the frames and their order in one assertion.
@@ -923,23 +931,34 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 		assert.Contains(t, spec.Maps, name)
 	}
 
-	// Issue #83: the interpreter arm rides into this program on the shared
-	// walk_step, so its three maps must have come along with the header. The
-	// counters in particular are the only way a Python-side refusal is
-	// visible at all - walker_flags has no bits left.
-	require.Contains(t, spec.Maps, "py_walk_counters")
-	assert.Equal(t, ebpf.PerCPUArray, spec.Maps["py_walk_counters"].Type,
-		"per-CPU so the BPF-side increment needs no atomic")
-	assert.Equal(t, uint32(pyunwind.PyCntMax), spec.Maps["py_walk_counters"].MaxEntries,
-		"one slot per named way the Python walk can succeed or fail")
-	assert.Equal(t, uint32(8), spec.Maps["py_walk_counters"].ValueSize)
+	// Issue #83 / T12-R6: the interpreter HANDOFF rides into this program on
+	// the shared walker, so the generic seam must have come along with the
+	// header -- and nothing language-specific may have. A module supplies its
+	// own object and its own maps; this program supplies a claim table, a
+	// tail-call table and somewhere to keep the cursor.
+	require.Contains(t, spec.Maps, "handoff_ranges")
+	assert.Equal(t, uint32(8), spec.Maps["handoff_ranges"].KeySize, "keyed by table_id, not pid")
+	assert.Equal(t, uint32(24), spec.Maps["handoff_ranges"].ValueSize, "lo, hi, unwinder id, pad")
 
-	require.Contains(t, spec.Maps, "py_eval_ranges")
-	assert.Equal(t, uint32(8), spec.Maps["py_eval_ranges"].KeySize, "keyed by table_id, not pid")
-	assert.Equal(t, uint32(16), spec.Maps["py_eval_ranges"].ValueSize, "lo, hi")
+	require.Contains(t, spec.Maps, "interp_progs")
+	assert.Equal(t, ebpf.ProgramArray, spec.Maps["interp_progs"].Type)
 
-	require.Contains(t, spec.Maps, "py_procs")
-	assert.Equal(t, uint32(4), spec.Maps["py_procs"].KeySize, "keyed by pid")
+	require.Contains(t, spec.Maps, "walk_states")
+	assert.Equal(t, ebpf.PerCPUArray, spec.Maps["walk_states"].Type,
+		"the walk cursor has to survive a tail call, so it cannot be on the stack")
+
+	// The two programs a module hands control back through. Without them a
+	// dispatched sample would lose its whole native tail.
+	require.Contains(t, spec.Programs, "interp_resume_step")
+	require.Contains(t, spec.Programs, "interp_resume_walk")
+
+	// And the negative, which is the point of the whole separation: no map in
+	// this object belongs to any language. A module that needed one compiled
+	// into here would be a module the core had to know about.
+	for name := range spec.Maps {
+		assert.NotContains(t, name, "py_",
+			"gpu_usdt must carry no language-specific map; %s came from an interpreter module", name)
+	}
 
 	require.Contains(t, spec.Maps, "stacks_missing")
 	assert.Equal(t, ebpf.Array, spec.Maps["stacks_missing"].Type)
@@ -1056,7 +1075,7 @@ func encodeGPUStack(pcs []uint64, flags uint32) []byte {
 // every slot is native. Tags past len(tags) are frameTagNative, matching the
 // PC poison's spirit - a plausible value, not an impossible one, so a decoder
 // that over-reads produces a wrong answer rather than an obviously broken
-// one. (TestTagsPastNPcsAreNotRead poisons the tail with frameTagPython by
+// one. (TestTagsPastNPcsAreNotRead poisons the tail with frameTagInterp by
 // hand, which is the shape that actually corrupts a call path.)
 func encodeGPUStackTagged(pcs []uint64, tags []uint8, flags uint32) []byte {
 	buf := make([]byte, gpuStackSize)
@@ -1368,8 +1387,15 @@ func TestACompleteShortWalkIsNeitherTruncatedNorAbandoned(t *testing.T) {
 // walk, which is exactly the class of defect this file is full of tests
 // about. So read the header and check.
 func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
+	// Two headers: seven bits are the walker's own, and
+	// WALKER_FLAG_FRAME_PUSH_REFUSED lives with the two pushers that raise it
+	// in bpf/unwind_record.h, so a language module compiled against that file
+	// alone still has the name.
 	src, err := os.ReadFile("../bpf/unwind_common.h")
 	require.NoError(t, err)
+	rec, err := os.ReadFile("../bpf/unwind_record.h")
+	require.NoError(t, err)
+	src = append(src, rec...)
 
 	re := regexp.MustCompile(`(?m)^#define\s+(WALKER_FLAG_\w+)\s+(0x[0-9a-fA-F]+)`)
 	got := map[string]uint32{}
@@ -1387,7 +1413,7 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 		"WALKER_FLAG_FP_NONMONOTONIC":    walkerFlagFPNonMonotonic,
 		"WALKER_FLAG_ROOT_DISAGREEMENT":  walkerFlagRootDisagreement,
 		"WALKER_FLAG_FRAME_PUSH_REFUSED": walkerFlagFramePushRefused,
-	}, got, "bpf/unwind_common.h and consumer.go disagree about the walker's flag bits")
+	}, got, "the BPF headers and consumer.go disagree about the walker's flag bits")
 }
 
 // The defect this test exists for, measured on the Phase 4b gate:
@@ -1638,8 +1664,8 @@ func TestTheTwoTerminationArmsSetDifferentFlagsInWalkStep(t *testing.T) {
 	src, err := os.ReadFile("../bpf/unwind_common.h")
 	require.NoError(t, err)
 	body := string(src)
-	step := body[strings.Index(body, "static long walk_step("):]
-	require.NotEmpty(t, step, "walk_step not found in the shared header")
+	step := body[strings.Index(body, "static __always_inline long unwind_frame("):]
+	require.NotEmpty(t, step, "unwind_frame not found in the shared header")
 
 	// The RA-undefined arm: inside the DWARF path, guarded by the CFI's own
 	// ra_type. The FP-exhausted arm: inside the FP path, guarded by ctx->fp.
@@ -3734,7 +3760,7 @@ func TestPythonFramesAreNotSymbolizedAsNativePCs(t *testing.T) {
 	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
 	// leaf-first: a native leaf, one Python frame, then a native caller.
 	stacks.put(61, 0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100)
-	stacks.tags[61] = []uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative}
+	stacks.tags[61] = []uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative}
 
 	frames, ok := c.resolveStackForTest(61, 4242)
 	require.True(t, ok)
@@ -3745,11 +3771,11 @@ func TestPythonFramesAreNotSymbolizedAsNativePCs(t *testing.T) {
 
 	// resolveStackLocked reverses to root-first before returning.
 	require.Len(t, frames, 3)
-	assert.Equal(t, pythonFrameName(0xc0de0000), frames[1].Name,
+	assert.Equal(t, interp.FrameName(frameTagInterp, 0xc0de0000, 0), frames[1].Name,
 		"the Python frame belongs between its native caller and its native callee, not at either end")
 	assert.True(t, frames[1].Unresolved,
-		"an unsymbolized Python frame must not read as a function genuinely named python:0x...")
-	assert.Equal(t, uint64(1), c.Stats().StackPythonFrames)
+		"an unsymbolized interpreter frame must not read as a function genuinely named interp1:0x...")
+	assert.Equal(t, uint64(1), c.Stats().StackInterpFrames)
 }
 
 // The frame counts that measure the NATIVE symbolizer's reach must not move
@@ -3759,13 +3785,13 @@ func TestPythonFramesAreNotSymbolizedAsNativePCs(t *testing.T) {
 func TestPythonFramesDoNotInflateTheUnresolvedCounters(t *testing.T) {
 	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{})
 	stacks.put(63, 0x401000, 0xc0de0000, 0x5a5a5a5a)
-	stacks.tags[63] = []uint8{frameTagNative, frameTagPython, frameTagPython}
+	stacks.tags[63] = []uint8{frameTagNative, frameTagInterp, frameTagInterp}
 
 	_, ok := c.resolveStackForTest(63, 4242)
 	require.True(t, ok)
 	assert.Zero(t, c.Stats().StackFramesUnresolved)
 	assert.Zero(t, c.Stats().StacksUnresolved)
-	assert.Equal(t, uint64(1), c.Stats().StackPythonFrames)
+	assert.Equal(t, uint64(1), c.Stats().StackInterpFrames)
 }
 
 // MAX_FRAMES can land between the two slots of a Python frame. The code
@@ -3775,14 +3801,14 @@ func TestPythonFramesDoNotInflateTheUnresolvedCounters(t *testing.T) {
 func TestATruncatedPythonPairIsDroppedAndCounted(t *testing.T) {
 	c, stacks, sym := stackConsumer(t, &recordingSink{}, Config{})
 	stacks.put(65, 0x401000, 0xc0de0000)
-	stacks.tags[65] = []uint8{frameTagNative, frameTagPython}
+	stacks.tags[65] = []uint8{frameTagNative, frameTagInterp}
 
 	frames, ok := c.resolveStackForTest(65, 4242)
 	require.True(t, ok)
 	require.Len(t, frames, 1, "the half pair is dropped, not half-read")
 	assert.Equal(t, []uint64{0x401000}, sym.ips[0])
-	assert.Equal(t, uint64(1), c.Stats().StackPythonPairsTruncated)
-	assert.Zero(t, c.Stats().StackPythonFrames)
+	assert.Equal(t, uint64(1), c.Stats().StackInterpPairsTruncated)
+	assert.Zero(t, c.Stats().StackInterpFrames)
 }
 
 // The tags array is fixed-size and copied whole out of a reused per-CPU
@@ -3794,7 +3820,7 @@ func TestTagsPastNPcsAreNotRead(t *testing.T) {
 	// Everything past the two real slots is what a previous capture left:
 	// PCs already poisoned by the encoder, tags poisoned here.
 	for i := 2; i < maxWalkFrames; i++ {
-		raw[gpuStackTagsOff+i] = frameTagPython
+		raw[gpuStackTagsOff+i] = frameTagInterp
 	}
 	stacks.raw = map[uint32][]byte{67: raw}
 
@@ -3802,8 +3828,8 @@ func TestTagsPastNPcsAreNotRead(t *testing.T) {
 	require.True(t, ok)
 	assert.Len(t, frames, 2)
 	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0])
-	assert.Zero(t, c.Stats().StackPythonFrames)
-	assert.Zero(t, c.Stats().StackPythonPairsTruncated)
+	assert.Zero(t, c.Stats().StackInterpFrames)
+	assert.Zero(t, c.Stats().StackInterpPairsTruncated)
 }
 
 // symbolize/local.go documents one Frame per IP, and the splice indexes
@@ -3815,7 +3841,7 @@ func TestAShortSymbolizerReturnIsRefusedNotSpliced(t *testing.T) {
 	sym := &fakeSymbolizer{dropLast: true}
 	c, stacks, _ := stackConsumer(t, &recordingSink{}, Config{Symbolizer: sym})
 	stacks.put(69, 0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100)
-	stacks.tags[69] = []uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative}
+	stacks.tags[69] = []uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative}
 
 	_, ok := c.resolveStackForTest(69, 4242)
 	assert.False(t, ok, "a call path that cannot be spliced faithfully is not shipped")

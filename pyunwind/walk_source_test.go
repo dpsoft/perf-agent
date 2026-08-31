@@ -18,25 +18,25 @@ import (
 // that are wrong in a way no test on a Python-less machine could ever
 // notice — a walk that reads the right memory with the wrong stop condition
 // produces a plausible stack, not a failure.
-// pyPushFramesBody returns py_begin_chain: the entry half, which finds the
-// thread state and arms the cursor.
+// pyPushFramesBody returns py_walk_segment: the entry half, which finds the
+// thread state, arms the cursor and drives the segment loop.
 func pyPushFramesBody(t *testing.T) string {
 	t.Helper()
-	return pyFuncBody(t, "static __always_inline void py_begin_chain(")
+	return pyFuncBody(t, "static __always_inline void py_walk_segment(")
 }
 
 // pyFrameStepBody returns the source text of py_step_one, which advances the
 // chain by one frame.
 //
-// The walk has been three shapes: a #pragma unroll inside py_push_frames, a
-// bpf_loop callback, and now a plain step called once per walk_step
-// iteration -- because each nested bpf_loop call site multiplies verifier
-// state, and two of them stopped all three programs loading on 6.19.4+. The
-// decisions these tests pin did not move with it, so the tests follow them
-// rather than being relaxed.
+// The walk has been four shapes: a #pragma unroll, a bpf_loop callback, a
+// plain step called once per walk_step iteration, and now a bpf_loop callback
+// again -- but this time inside the module's OWN program, where the nesting
+// that stopped all three drivers loading on 6.19.4+ does not exist. The
+// decisions these tests pin did not move with any of it, so the tests follow
+// the code rather than being relaxed.
 func pyFrameStepBody(t *testing.T) string {
 	t.Helper()
-	return pyFuncBody(t, "static __always_inline int py_step_one(")
+	return pyFuncBody(t, "static long py_seg_step(")
 }
 
 // pyChainWalkBody is both halves together, for assertions about the walk as
@@ -49,14 +49,14 @@ func pyChainWalkBody(t *testing.T) string {
 
 func pyFuncBody(t *testing.T, signature string) string {
 	t.Helper()
-	src, err := os.ReadFile("../bpf/python_walk.h")
+	src, err := os.ReadFile("../bpf/interp/python/python_walk.h")
 	if err != nil {
-		t.Fatalf("read python_walk.h: %v", err)
+		t.Fatalf("read bpf/interp/python/python_walk.h: %v", err)
 	}
 	body := string(src)
 	start := strings.Index(body, signature)
 	if start < 0 {
-		t.Fatalf("%q not found in bpf/python_walk.h", signature)
+		t.Fatalf("%q not found in bpf/interp/python/python_walk.h", signature)
 	}
 	rest := body[start:]
 	end := strings.Index(rest, "\n}\n")
@@ -124,9 +124,9 @@ func TestFrameOwnerBoundaryIsCarriedPerVersion(t *testing.T) {
 // which is why the wrong mask survives every test that does not read the
 // definition.
 func TestTheStackRefMaskIsCPythonsOwn(t *testing.T) {
-	src, err := os.ReadFile("../bpf/python_walk.h")
+	src, err := os.ReadFile("../bpf/interp/python/python_walk.h")
 	if err != nil {
-		t.Fatalf("read python_walk.h: %v", err)
+		t.Fatalf("read bpf/interp/python/python_walk.h: %v", err)
 	}
 	body := string(src)
 	if !strings.Contains(body, "#define PY_STACKREF_TAG_BITS 3ULL") {
@@ -196,32 +196,35 @@ func TestEveryPythonRefusalIsCounted(t *testing.T) {
 // this whole design keeps refusing.
 func TestTheChainIsResumedNotRestarted(t *testing.T) {
 	entry := pyPushFramesBody(t)
-	if !strings.Contains(entry, "if (ctx->py_state == PY_CHAIN_DONE || ctx->py_state == PY_CHAIN_WALKING) return;") {
-		t.Error("py_begin_chain re-arms a chain that is finished, or restarts one already being walked")
+	if !strings.Contains(entry, "if (state == PY_CHAIN_DONE) {") {
+		t.Error("py_walk_segment re-enters a chain that is finished")
 	}
-	if !strings.Contains(entry, "if (ctx->py_state == PY_CHAIN_UNSTARTED)") {
+	if !strings.Contains(entry, "if (state == PY_CHAIN_UNSTARTED) {") {
 		t.Error("the TSS lookup is not gated on the chain being unstarted")
 	}
-	// Arming the cursor is the callback's job now: it is the half that knows
-	// it has reached the boundary. Asserted THERE rather than over the
-	// combined text, so moving it back into the entry function -- where it
-	// would run on every call rather than at the boundary -- fails here.
+	if !strings.Contains(entry, "frame = st->interp_scratch[PY_SCRATCH_FRAME];") {
+		t.Error("a second dispatch does not read the resume cursor; it would restart from tstate->current_frame")
+	}
+	// Arming the cursor is the segment callback's job: it is the half that
+	// knows it has reached the interpreter's C boundary. Asserted THERE
+	// rather than over the combined text, so moving it into the entry
+	// function -- where it would run on every dispatch rather than at the
+	// boundary -- fails here.
 	step := pyFrameStepBody(t)
-	if !strings.Contains(step, "ctx->py_state = PY_CHAIN_ACTIVE;") {
+	if !strings.Contains(step, "s->state = PY_CHAIN_ACTIVE;") {
 		t.Error("the cursor is never armed, so a second eval-loop frame restarts the chain from the top")
 	}
-	if strings.Contains(entry, "PY_CHAIN_ACTIVE") {
-		t.Error("py_push_frames arms the cursor outside the boundary check, so a chain that never reached the boundary would be resumed")
+	// The entry writes back whatever the segment DECIDED
+	// (st->interp_scratch[PY_SCRATCH_STATE] = seg.state), and must never
+	// assign PY_CHAIN_ACTIVE itself: doing so would arm the cursor on a chain
+	// that never reached the interpreter's C boundary, and the next dispatch
+	// would resume a segment that has more frames of its own still to push.
+	if !strings.Contains(entry, "st->interp_scratch[PY_SCRATCH_STATE] = seg.state;") {
+		t.Error("py_walk_segment does not write back the state the segment decided")
 	}
-	// Budget exhaustion must NOT leave the cursor live: resuming a
-	// half-walked segment at the next eval-loop PC would file the rest of it
-	// under a different native frame.
-	//
-	// With no per-segment loop there is no "budget ran out" path inside the
-	// walk at all: the outer loop's budget is the record's, and the drivers
-	// ask about a segment left mid-flight after it returns. What must still
-	// hold here is that the cursor is armed ONLY at the boundary, which the
-	// two assertions above pin from both sides.
+	if regexp.MustCompile(`[^=!<>]=\s*PY_CHAIN_ACTIVE`).MatchString(stripLineComments(entry)) {
+		t.Error("py_walk_segment arms the cursor outside the boundary check, so a chain that never reached the boundary would be resumed")
+	}
 }
 
 // Budget exhaustion has to be told apart from a walk that stopped for a
@@ -235,11 +238,13 @@ func TestTheChainIsResumedNotRestarted(t *testing.T) {
 // number of flag assignments must match exactly.
 func TestEveryStoppingPathMarksTheWalkStopped(t *testing.T) {
 	step := pyFrameStepBody(t)
-	// Every return except the last must first say what the segment's state
-	// now is. A path that returns without setting py_state leaves the segment
-	// PY_CHAIN_WALKING with an unchanged cursor, and walk_step would spend
-	// every remaining iteration of the outer loop re-reading the same frame --
-	// a stack that silently ends at the Python segment.
+	// Every return that ENDS the segment must first say two things: what the
+	// segment's state now is, and that it stopped for a REASON rather than
+	// because the loop bound ran out. Without the first, a resumed dispatch
+	// would restart from the top; without the second, an ordinary stop is
+	// counted as a truncation, because bpf_loop's return value cannot tell
+	// them apart -- a callback that stops on its last permitted iteration
+	// returns the same count as one that never stopped at all.
 	idxs := []int{}
 	for i := 0; i+len("return") < len(step); i++ {
 		if strings.HasPrefix(step[i:], "return 0;") || strings.HasPrefix(step[i:], "return 1;") {
@@ -247,95 +252,130 @@ func TestEveryStoppingPathMarksTheWalkStopped(t *testing.T) {
 		}
 	}
 	if len(idxs) < 3 {
-		t.Fatalf("py_step_one has only %d returns; the slice is looking at the wrong text", len(idxs))
+		t.Fatalf("py_seg_step has only %d returns; the slice is looking at the wrong text", len(idxs))
 	}
 	for _, i := range idxs[:len(idxs)-1] {
-		lo := i - 260
+		lo := i - 300
 		if lo < 0 {
 			lo = 0
 		}
-		if !strings.Contains(step[lo:i], "ctx->py_state =") {
-			t.Errorf("a return at byte %d in py_step_one does not first set ctx->py_state; "+
-				"the segment would stay PY_CHAIN_WALKING and re-read the same frame forever", i)
+		if !strings.Contains(step[lo:i], "s->state =") {
+			t.Errorf("a return at byte %d in py_seg_step does not first set s->state; "+
+				"a later dispatch in the same sample would restart the chain from the top", i)
+		}
+		if !strings.Contains(step[lo:i], "s->stopped = 1;") {
+			t.Errorf("a return at byte %d in py_seg_step does not mark the segment stopped; "+
+				"an ordinary stop would be counted as PY_CNT_CHAIN_TRUNCATED", i)
 		}
 	}
 	// The final return is the one that continues the walk: it advances the
-	// cursor and deliberately leaves the state alone.
-	tail := step[idxs[len(idxs)-1]:]
-	if !strings.Contains(step[idxs[len(idxs)-1]-200:idxs[len(idxs)-1]], "ctx->py_iter = prev;") {
-		t.Error("py_step_one's continuing path does not advance the cursor")
+	// cursor and deliberately leaves both fields alone.
+	last := idxs[len(idxs)-1]
+	if !strings.Contains(step[last-200:last], "s->frame = prev;") {
+		t.Error("py_seg_step's continuing path does not advance the cursor")
 	}
-	_ = tail
 }
 
-// PY_CNT_CHAIN_ABANDONED is the one counter neither py_push_frames nor
-// walk_step can bump: a live cursor only becomes a LOST Python segment once
-// the native walk is over, and nothing inside the bpf_loop callback knows it
-// is running for the last time. Each driver has to ask after bpf_loop returns,
-// which means the property lives in three files and can be half-applied --
-// exactly the shape that leaves one profiler silently short.
+// PY_CNT_CHAIN_ABANDONED is the one counter nothing in this module can
+// observe directly: a live cursor only becomes a LOST Python segment once the
+// NATIVE walk is over, and this module is a tail-call target that appends a
+// segment and hands control straight back. It never learns that the walk
+// ended.
+//
+// It used to be asked by each of the three drivers after bpf_loop returned,
+// which put a Python-shaped question in three files that must not know Python
+// exists (T12-R6). It is now counted PROVISIONALLY -- incremented where the
+// cursor is left live, withdrawn where a later dispatch consumes it -- so what
+// remains at read time is exactly the number of samples whose outer segment
+// was never reached, and the drivers know nothing.
 //
 // Global Constraint: every refusal, miss or truncation increments a named
-// counter. This is the last place on the Python path where that did not hold.
-func TestEveryDriverCountsAnAbandonedPythonChain(t *testing.T) {
+// counter. This test is what keeps that true across the move.
+func TestTheAbandonedChainCounterIsProvisionalAndWithdrawn(t *testing.T) {
+	entry := stripLineComments(pyPushFramesBody(t))
+
+	inc := strings.Index(entry, "py_count(PY_CNT_CHAIN_ABANDONED)")
+	if inc < 0 {
+		t.Fatal("py_walk_segment never counts an abandoned chain: a native walk that stops early " +
+			"drops the outer Python segment and no counter moves")
+	}
+	// The nearest `if (` before the increment must be the cursor test.
+	// Anchoring on "nearest" rather than "anywhere in the function" is what
+	// makes this fail when the guard is dropped: some other condition then
+	// becomes the nearest one.
+	if lastIf := strings.LastIndex(entry[:inc], "if ("); lastIf < 0 ||
+		!strings.Contains(entry[lastIf:inc], "seg.state == PY_CHAIN_ACTIVE") {
+		t.Error("PY_CNT_CHAIN_ABANDONED is bumped without testing that the cursor was left live; " +
+			"it would count every sample, including the ones that lost nothing")
+	}
+
+	dec := strings.Index(entry, "py_count_undo(PY_CNT_CHAIN_ABANDONED)")
+	if dec < 0 {
+		t.Fatal("the provisional count is never withdrawn: every resumed segment would be reported lost")
+	}
+	// The withdrawal belongs on the RESUME branch and nowhere else. Anchored
+	// on the `else` that opens it: inside the unstarted branch it would cancel
+	// a count no one made, and before the branch it would cancel one made for
+	// a different sample.
+	unstarted := strings.Index(entry, "if (state == PY_CHAIN_UNSTARTED) {")
+	resumeBranch := strings.Index(entry[unstarted:], "} else {")
+	if unstarted < 0 || resumeBranch < 0 || dec < unstarted+resumeBranch {
+		t.Error("the withdrawal is not on the resume branch; it would cancel counts that were never made")
+	}
+
+	// The other half of the pair: a segment cut short because the record
+	// filled up is a truncation, not an abandonment, and is counted where the
+	// push is refused.
+	step := stripLineComments(pyFrameStepBody(t))
+	if !strings.Contains(step, "py_count(PY_CNT_CHAIN_TRUNCATED)") {
+		t.Error("py_seg_step does not count a segment left mid-chain when the record filled up")
+	}
+	if !strings.Contains(step, "py_count(PY_CNT_PUSH_REFUSED)") {
+		t.Error("py_seg_step does not count the refused push itself")
+	}
+}
+
+// NO DRIVER MAY NAME THIS MODULE. The walker moved out of the shared
+// bpf_loop callback and into its own object precisely so perf_dwarf,
+// offcpu_dwarf and gpu_usdt carry no Python-shaped code, and a source test is
+// the only thing that keeps it that way -- the drivers still compile whether
+// or not someone puts a py_count() back.
+func TestNoDriverNamesThisModule(t *testing.T) {
 	for _, driver := range []string{
 		"../bpf/perf_dwarf.bpf.c",
 		"../bpf/offcpu_dwarf.bpf.c",
 		"../bpf/gpu_usdt.bpf.c",
+		"../bpf/unwind_common.h",
+		"../bpf/unwind_record.h",
 	} {
 		t.Run(filepath.Base(driver), func(t *testing.T) {
 			src, err := os.ReadFile(driver)
 			if err != nil {
 				t.Fatalf("read %s: %v", driver, err)
 			}
-			body := string(src)
-
-			loop := strings.Index(body, "bpf_loop(MAX_FRAMES, walk_step, &walker, 0);")
-			if loop < 0 {
-				t.Fatalf("%s does not drive the shared walker; the Python arm cannot reach it", driver)
-			}
-			// Everything the driver does AFTER the walk. Asking before it
-			// would read a cursor that is still being written.
-			after := body[loop+len("bpf_loop(MAX_FRAMES, walk_step, &walker, 0);"):]
-
-			// Comments are stripped before anything is matched: these
-			// drivers carry a prose reference to PY_CNT_CHAIN_ABANDONED
-			// above the call, and a naive search finds the mention rather
-			// than the code. That is how a source-inspection test ends up
-			// asserting against its own documentation.
-			code := stripLineComments(after)
-
-			call := strings.Index(code, "py_count(PY_CNT_CHAIN_ABANDONED)")
-			if call < 0 {
-				t.Errorf("%s never counts an abandoned Python chain: a native walk that stops early "+
-					"drops the outer Python segment and no counter moves", driver)
-				return
-			}
-			// The nearest `if (` before the call must be the cursor test.
-			// Anchoring on "nearest" rather than "anywhere in the function"
-			// is what makes this fail when the guard is dropped: some other
-			// condition then becomes the nearest one.
-			prefix := code[:call]
-			lastIf := strings.LastIndex(prefix, "if (")
-			if !strings.Contains(string(src), "walker.py_state == PY_CHAIN_WALKING) py_count(PY_CNT_CHAIN_TRUNCATED)") {
-				t.Errorf("%s does not count a segment left mid-walk when the record filled up", driver)
-			}
-			if lastIf < 0 || !strings.Contains(prefix[lastIf:], "walker.py_state == PY_CHAIN_ACTIVE") {
-				t.Errorf("%s bumps PY_CNT_CHAIN_ABANDONED without testing that the cursor was live; "+
-					"it would count every sample, including the ones that lost nothing", driver)
+			// Comments are stripped: one naming Python as an illustrative
+			// example ("fewer than two slots remaining for a Python pair")
+			// explains why a generic mechanism exists and is not coupling.
+			// Code that names Python is.
+			code := stripLineComments(string(src))
+			for _, token := range []string{"py_", "PY_", "python", "Python", "CPython"} {
+				if strings.Contains(code, token) {
+					t.Errorf("%s names %q in CODE; the core must know a text range and an opaque id, "+
+						"and nothing else about any language", driver, token)
+				}
 			}
 		})
 	}
 }
 
 // A native-walk outcome, not a Python failure -- and the walker_flags join is
-// the only way a reader can tell "the unwinder gave out" from
-// "py_eval_ranges is missing an entry". Both readings must be written down
-// where the counter is defined, or the number is unactionable.
+// the only way a reader can tell "the unwinder gave out" from "the handoff
+// range is missing an entry". Both readings must be written down where the
+// counter is defined, or the number is unactionable.
 func TestTheAbandonedChainCounterDocumentsItsFlagJoin(t *testing.T) {
-	src, err := os.ReadFile("../bpf/python_walk.h")
+	src, err := os.ReadFile("../bpf/interp/python/python_walk.h")
 	if err != nil {
-		t.Fatalf("read python_walk.h: %v", err)
+		t.Fatalf("read bpf/interp/python/python_walk.h: %v", err)
 	}
 	body := string(src)
 	start := strings.Index(body, "PY_CNT_CHAIN_ABANDONED is a NATIVE-WALK")
@@ -361,7 +401,7 @@ func TestTheAbandonedChainCounterDocumentsItsFlagJoin(t *testing.T) {
 		"WALKER_FLAG_FRAME_PUSH_REFUSED",
 		"WALKER_FLAG_FP_TERMINATED",
 		"WALKER_FLAG_RA_UNDEFINED",
-		"py_eval_ranges",
+		"handoff range",
 	} {
 		if !strings.Contains(doc.String(), flag) {
 			t.Errorf("the doc block does not name %s; a reader cannot reconstruct the join alone", flag)
@@ -385,7 +425,7 @@ func stripLineComments(src string) string {
 	return b.String()
 }
 
-// TestFrameWindowCoversEveryTable pins bpf/python_walk.h's PY_FRAME_WINDOW
+// TestFrameWindowCoversEveryTable pins the module header's PY_FRAME_WINDOW
 // against the offsets this package actually installs.
 //
 // The walk reads one fixed-size prefix of _PyInterpreterFrame and then takes
@@ -395,13 +435,13 @@ func stripLineComments(src string) string {
 // tables makes that a build-time failure in the package that owns the
 // numbers, which is where a new version's offsets get added.
 func TestFrameWindowCoversEveryTable(t *testing.T) {
-	src, err := os.ReadFile("../bpf/python_walk.h")
+	src, err := os.ReadFile("../bpf/interp/python/python_walk.h")
 	if err != nil {
-		t.Fatalf("read python_walk.h: %v", err)
+		t.Fatalf("read bpf/interp/python/python_walk.h: %v", err)
 	}
 	m := regexp.MustCompile(`#define PY_FRAME_WINDOW (\d+)`).FindStringSubmatch(string(src))
 	if m == nil {
-		t.Fatal("PY_FRAME_WINDOW is not defined in bpf/python_walk.h")
+		t.Fatal("PY_FRAME_WINDOW is not defined in bpf/interp/python/python_walk.h")
 	}
 	window, err := strconv.Atoi(m[1])
 	if err != nil {

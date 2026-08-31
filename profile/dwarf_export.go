@@ -6,6 +6,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
@@ -65,7 +66,7 @@ func LoadPerfDwarf(systemWide, kernelStacks bool) (*PerfDwarf, error) {
 		return spec, nil
 	}
 	p := &PerfDwarf{}
-	if err := loadWithPythonGate("perf_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
+	if err := loadWithInterpGate("perf_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
 		return spec.LoadAndAssign(&p.objs, nil)
 	}); err != nil {
 		return nil, fmt.Errorf("load and assign: %w", err)
@@ -113,29 +114,58 @@ func (p *PerfDwarf) Close() error {
 	return p.objs.Close()
 }
 
-// PyProcsMap returns py_procs: the per-PID CPython layout record
-// pyunwind.Attach installs after validating a target's interpreter. Without
-// an entry here walk_step's interpreter arm counts PY_CNT_NO_PROC_INFO and
-// pushes nothing.
-func (p *PerfDwarf) PyProcsMap() *ebpf.Map {
-	return p.objs.PyProcs
-}
+// PerfDwarf is an interp.Driver. Asserted at compile time rather than left to
+// the one type assertion in dwarfagent, where a missing method would silently
+// become "this profiler carries no interpreters".
+var _ interp.Driver = (*PerfDwarf)(nil)
 
-// PyEvalRangesMap returns py_eval_ranges: one eval-loop text range per
-// libpython, keyed by table_id. This map is the interpreter arm's on-switch —
-// until a range is installed, no PC ever falls inside one and the Python walk
-// never runs. See pyunwind.InstallEvalRange.
-func (p *PerfDwarf) PyEvalRangesMap() *ebpf.Map {
-	return p.objs.PyEvalRanges
-}
+// ----- The interpreter seam (unwind/interp.Driver).
+//
+// Five maps and two programs, every one of them declared in
+// bpf/unwind_record.h or bpf/unwind_common.h. None of them names a language,
+// and none of them changes when one is added: a module supplies its own BPF
+// object and its own maps, and shares only these.
 
-// PyWalkCountersMap returns py_walk_counters, the per-CPU array in which the
-// Python walk records every frame it pushed and every way it refused. Read it
-// with pyunwind.ReadWalkCounters: sample_header.walker_flags has no bits left
-// for the Python path, so these counters are the only place a Python-side
-// refusal is visible at all.
-func (p *PerfDwarf) PyWalkCountersMap() *ebpf.Map {
-	return p.objs.PyWalkCounters
+// Flavour is this program's BPF program type. It decides which of a module's
+// programs may sit in this driver's interp_progs table -- every entry of a
+// prog array must share the type of whatever tail-calls into it.
+func (p *PerfDwarf) Flavour() interp.Flavour { return interp.FlavourPerfEvent }
+
+// WalkerScratchMap returns the per-CPU sample_record the walk is built in. An
+// interpreter module appends its frames to this SAME record, at the cursor the
+// native walk stopped at, which is what makes the interleave a kernel
+// guarantee rather than a userspace reconstruction.
+func (p *PerfDwarf) WalkerScratchMap() *ebpf.Map { return p.objs.WalkerScratch }
+
+// WalkStatesMap returns the per-CPU walk cursor. It is a map and not a stack
+// local because a tail call to an interpreter replaces the running program.
+func (p *PerfDwarf) WalkStatesMap() *ebpf.Map { return p.objs.WalkStates }
+
+// InterpProgsMap returns the tail-call table: slots 0 and 1 are this program's
+// own resume programs, slot interp.SlotForID(id) an unwinder.
+func (p *PerfDwarf) InterpProgsMap() *ebpf.Map { return p.objs.InterpProgs }
+
+// HandoffRangesMap returns the table walk_step consults per frame: a range of
+// some binary's text and an opaque id saying who claims it. THIS MAP IS THE
+// ON-SWITCH -- until an entry is installed, no PC ever falls inside one and no
+// handoff ever happens.
+func (p *PerfDwarf) HandoffRangesMap() *ebpf.Map { return p.objs.HandoffRanges }
+
+// ResumeStepProgram takes the one frame a resumed walk begins on past its
+// caller. See INTERP_DEFINE_PROGRAMS in bpf/unwind_common.h for why it is a
+// program of its own and not a branch.
+func (p *PerfDwarf) ResumeStepProgram() *ebpf.Program { return p.objs.InterpResumeStep }
+
+// ResumeWalkProgram carries a resumed sample the rest of the way and emits it.
+func (p *PerfDwarf) ResumeWalkProgram() *ebpf.Program { return p.objs.InterpResumeWalk }
+
+// InterpEnabled reports whether the loaded program carries the handoff at all.
+// False means the verifier refused it on this kernel and userspace reloaded
+// without it (see loadWithInterpGate); installing a module then would write
+// maps nothing reads.
+func (p *PerfDwarf) InterpEnabled() bool {
+	_, enabled, _ := InterpState()
+	return enabled
 }
 
 // CFIRulesMap returns the cfi_rules HASH_OF_MAPS outer map.

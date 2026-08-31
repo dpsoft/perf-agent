@@ -9,15 +9,34 @@ import (
 
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
+
+const (
+	frameTagNative = interp.FrameTagNative
+	// frameTagInterp is an interpreter unwinder's id as it appears in tags[].
+	//
+	// These tests care that a NON-NATIVE tag makes a two-slot frame which
+	// never reaches the symbolizer as an address; WHICH language wrote it is
+	// the module's business, not this agent's. 1 is CPython's
+	// (pyunwind.UnwinderID) and is used here only so the fixtures resemble a
+	// real record.
+	frameTagInterp = 1
+)
+
+// interpFrameName is what an unnamed interpreter frame renders as in a build
+// with no module registered for that id. These tests link no module -- that is
+// the point of the seam -- so this is the string they assert on, and it is
+// produced by exactly the code the agent calls.
+func interpFrameName(pc uint64) string { return interp.FrameName(frameTagInterp, pc, 0) }
 
 // ----- Issue #83 / ruling T7-R5 on the DWARF path.
 //
 // walk_step's interpreter arm is shared by perf_dwarf, offcpu_dwarf and
 // gpu_usdt, so a Python frame reaches this consumer exactly as it reaches
 // gpuprobe's: two consecutive pcs[] slots holding a code-object address and
-// an encoded instruction word, both tagged frameTagPython. Neither is an
+// an encoded instruction word, both tagged frameTagInterp. Neither is an
 // instruction pointer.
 
 // encodeSample lays out a struct sample_record the way the BPF program does,
@@ -46,7 +65,7 @@ func encodeSample(pcs []uint64, tags []uint8) []byte {
 func TestParseSampleDecodesTags(t *testing.T) {
 	s, err := parseSample(encodeSample(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp},
 	))
 	if err != nil {
 		t.Fatalf("parseSample: %v", err)
@@ -54,7 +73,7 @@ func TestParseSampleDecodesTags(t *testing.T) {
 	if len(s.Tags) != len(s.PCs) {
 		t.Fatalf("len(Tags) = %d, len(PCs) = %d: they must be parallel", len(s.Tags), len(s.PCs))
 	}
-	want := []uint8{frameTagNative, frameTagPython, frameTagPython}
+	want := []uint8{frameTagNative, frameTagInterp, frameTagInterp}
 	for i := range want {
 		if s.Tags[i] != want[i] {
 			t.Errorf("Tags[%d] = %d, want %d", i, s.Tags[i], want[i])
@@ -68,7 +87,7 @@ func TestParseSampleDecodesTags(t *testing.T) {
 func TestParseSampleDoesNotReadTagsPastNPcs(t *testing.T) {
 	buf := encodeSample([]uint64{0x401000, 0x401100}, nil)
 	for i := 2; i < MaxFrames; i++ {
-		buf[SampleHeaderBytes+MaxFrames*8+i] = frameTagPython
+		buf[SampleHeaderBytes+MaxFrames*8+i] = frameTagInterp
 	}
 	s, err := parseSample(buf)
 	if err != nil {
@@ -77,11 +96,11 @@ func TestParseSampleDoesNotReadTagsPastNPcs(t *testing.T) {
 	if len(s.Tags) != 2 {
 		t.Fatalf("len(Tags) = %d, want 2 (only n_pcs tags are meaningful)", len(s.Tags))
 	}
-	slots, truncated := splitFrameSlots(s.PCs, s.Tags)
+	slots, truncated := interp.SplitSlots(s.PCs, s.Tags)
 	if truncated {
 		t.Error("a stale tag was read and turned the last native frame into half a Python pair")
 	}
-	if len(slots) != 2 || slots[0].python || slots[1].python {
+	if len(slots) != 2 || slots[0].IsInterp() || slots[1].IsInterp() {
 		t.Errorf("stale tags leaked into the decode: %+v", slots)
 	}
 }
@@ -91,7 +110,7 @@ func TestParseSampleDoesNotReadTagsPastNPcs(t *testing.T) {
 // under-reporting Python frames loses information, inventing one corrupts a
 // call path.
 func TestMissingTagsReadAsNative(t *testing.T) {
-	slots, truncated := splitFrameSlots([]uint64{1, 2, 3}, nil)
+	slots, truncated := interp.SplitSlots([]uint64{1, 2, 3}, nil)
 	if truncated {
 		t.Error("no tags at all must not read as a truncated pair")
 	}
@@ -99,16 +118,16 @@ func TestMissingTagsReadAsNative(t *testing.T) {
 		t.Fatalf("len(slots) = %d, want 3", len(slots))
 	}
 	for i, sl := range slots {
-		if sl.python {
+		if sl.IsInterp() {
 			t.Errorf("slot %d decoded as Python with no tags present", i)
 		}
 	}
 }
 
 func TestSplitFrameSlotsFoldsPairsAndKeepsOrder(t *testing.T) {
-	slots, truncated := splitFrameSlots(
+	slots, truncated := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative},
 	)
 	if truncated {
 		t.Fatal("a complete pair reported as truncated")
@@ -116,18 +135,18 @@ func TestSplitFrameSlotsFoldsPairsAndKeepsOrder(t *testing.T) {
 	if len(slots) != 3 {
 		t.Fatalf("len(slots) = %d, want 3 (two slots fold into one frame)", len(slots))
 	}
-	if slots[0].python || slots[2].python {
+	if slots[0].IsInterp() || slots[2].IsInterp() {
 		t.Error("native slots decoded as Python")
 	}
-	if !slots[1].python || slots[1].pc != 0xc0de0000 || slots[1].instr != 0x5a5a5a5a {
+	if !slots[1].IsInterp() || slots[1].PC != 0xc0de0000 || slots[1].Extra != 0x5a5a5a5a {
 		t.Errorf("Python frame decoded wrong: %+v", slots[1])
 	}
 }
 
 func TestSplitFrameSlotsDropsATruncatedPair(t *testing.T) {
-	slots, truncated := splitFrameSlots(
+	slots, truncated := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000},
-		[]uint8{frameTagNative, frameTagPython},
+		[]uint8{frameTagNative, frameTagInterp},
 	)
 	if !truncated {
 		t.Error("a code object with no instruction word must be reported, not swallowed")
@@ -137,15 +156,15 @@ func TestSplitFrameSlotsDropsATruncatedPair(t *testing.T) {
 	}
 }
 
-// splitFrameSlots is called from more than one place per sample. A counter
+// interp.SplitSlots is called from more than one place per sample. A counter
 // inside it would report a number that depends on how many callers exist.
 func TestSplitFrameSlotsIsPure(t *testing.T) {
-	before := PythonFrameCounters()
+	before := InterpFrameCounters()
 	for range 5 {
-		splitFrameSlots([]uint64{0x401000, 0xc0de0000}, []uint8{frameTagNative, frameTagPython})
+		interp.SplitSlots([]uint64{0x401000, 0xc0de0000}, []uint8{frameTagNative, frameTagInterp})
 	}
-	if after := PythonFrameCounters(); after != before {
-		t.Errorf("splitFrameSlots moved a counter: before %+v after %+v", before, after)
+	if after := InterpFrameCounters(); after != before {
+		t.Errorf("interp.SplitSlots moved a counter: before %+v after %+v", before, after)
 	}
 }
 
@@ -183,9 +202,9 @@ func (c *countingSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]symbo
 // plausible, wrong native frames and nothing says so.
 func TestPythonSlotsNeverReachTheSymbolizer(t *testing.T) {
 	sym := &countingSymbolizer{}
-	slots, _ := splitFrameSlots(
+	slots, _ := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative},
 	)
 
 	frames := symbolizePID(sym, 4242, slots)
@@ -207,11 +226,11 @@ func TestPythonSlotsNeverReachTheSymbolizer(t *testing.T) {
 	if len(frames) != 3 {
 		t.Fatalf("len(frames) = %d, want 3", len(frames))
 	}
-	if frames[1].Name != pythonFrameName(0xc0de0000) {
+	if frames[1].Name != interpFrameName(0xc0de0000) {
 		t.Errorf("frames[1].Name = %q, want the Python frame between its native caller and callee", frames[1].Name)
 	}
 	if !frames[1].Unresolved {
-		t.Error("an unsymbolized Python frame must not read as a function genuinely named python:0x...")
+		t.Error("an unsymbolized interpreter frame must not read as a function genuinely named interp1:0x...")
 	}
 	if frames[0].Name != "fn_401000" || frames[2].Name != "fn_401100" {
 		t.Errorf("native frames moved or were renamed: %q, %q", frames[0].Name, frames[2].Name)
@@ -223,9 +242,9 @@ func TestPythonSlotsNeverReachTheSymbolizer(t *testing.T) {
 // native slot, in order.
 func TestSymbolizerFailureStillPlacesEveryFrame(t *testing.T) {
 	sym := &countingSymbolizer{err: fmt.Errorf("no such process")}
-	slots, _ := splitFrameSlots(
+	slots, _ := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp},
 	)
 
 	frames := symbolizePID(sym, 4242, slots)
@@ -235,7 +254,7 @@ func TestSymbolizerFailureStillPlacesEveryFrame(t *testing.T) {
 	if frames[0].Name != "[unknown]" || frames[0].Address != 0x401000 {
 		t.Errorf("native placeholder wrong: %+v", frames[0])
 	}
-	if frames[1].Name != pythonFrameName(0xc0de0000) {
+	if frames[1].Name != interpFrameName(0xc0de0000) {
 		t.Error("a failed native symbolization must not take the Python frame down with it")
 	}
 }
@@ -243,9 +262,9 @@ func TestSymbolizerFailureStillPlacesEveryFrame(t *testing.T) {
 // symbolize/local.go promises one Frame per IP and the splice indexes on that
 // promise. A short return must not silently drop the tail natives.
 func TestAShortSymbolizerReturnIsCountedNotSpliced(t *testing.T) {
-	before := PythonFrameCounters().SymbolizerCountMismatch
+	before := InterpFrameCounters().SymbolizerCountMismatch
 	sym := &countingSymbolizer{short: true}
-	slots, _ := splitFrameSlots([]uint64{0x401000, 0x401100, 0x401200}, nil)
+	slots, _ := interp.SplitSlots([]uint64{0x401000, 0x401100, 0x401200}, nil)
 
 	frames := symbolizePID(sym, 4242, slots)
 	if len(frames) != 3 {
@@ -256,7 +275,7 @@ func TestAShortSymbolizerReturnIsCountedNotSpliced(t *testing.T) {
 			t.Errorf("frames[%d].Name = %q, want the placeholder rendering", i, f.Name)
 		}
 	}
-	if got := PythonFrameCounters().SymbolizerCountMismatch; got != before+1 {
+	if got := InterpFrameCounters().SymbolizerCountMismatch; got != before+1 {
 		t.Errorf("SymbolizerCountMismatch = %d, want %d: a short return must not be silent", got, before+1)
 	}
 }
@@ -272,9 +291,9 @@ func TestPythonFramesSurviveInlineExpansion(t *testing.T) {
 			Inlined: []symbolize.Frame{{Name: fmt.Sprintf("inl_%x", ip)}},
 		}
 	}}
-	slots, _ := splitFrameSlots(
+	slots, _ := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative},
 	)
 
 	frames := symbolizePID(sym, 4242, slots)
@@ -282,7 +301,7 @@ func TestPythonFramesSurviveInlineExpansion(t *testing.T) {
 	for i, f := range frames {
 		names[i] = f.Name
 	}
-	want := []string{"inl_401000", "fn_401000", pythonFrameName(0xc0de0000), "inl_401100", "fn_401100"}
+	want := []string{"inl_401000", "fn_401000", interpFrameName(0xc0de0000), "inl_401100", "fn_401100"}
 	if len(names) != len(want) {
 		t.Fatalf("frames = %v, want %v", names, want)
 	}
@@ -296,18 +315,18 @@ func TestPythonFramesSurviveInlineExpansion(t *testing.T) {
 // The kernel-side merge must not disturb the user-side splice.
 func TestKernelFramesStayLeafSideOfPythonFrames(t *testing.T) {
 	sym := &countingSymbolizer{}
-	slots, _ := splitFrameSlots(
+	slots, _ := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp},
 	)
 	frames := symbolizePIDWithKernel(sym, fakeKernelSymbolizer{}, 4242, slots, []uint64{0xffff0000})
 	if len(frames) != 3 {
-		t.Fatalf("len(frames) = %d, want 3 (kernel, native, python)", len(frames))
+		t.Fatalf("len(frames) = %d, want 3 (kernel, native, interpreter)", len(frames))
 	}
 	if !frames[0].IsKernel {
 		t.Error("kernel frames must stay leaf-side")
 	}
-	if frames[2].Name != pythonFrameName(0xc0de0000) {
+	if frames[2].Name != interpFrameName(0xc0de0000) {
 		t.Errorf("the Python frame moved: %v", frames[2].Name)
 	}
 }
@@ -329,11 +348,11 @@ func (fakeKernelSymbolizer) SymbolizeKernel(ips []uint64) ([]symbolize.Frame, er
 // A code object in that list is an address that is not code, in a format with
 // no way to say so.
 func TestPerfDataExportCarriesOnlyNativeIPs(t *testing.T) {
-	slots, _ := splitFrameSlots(
+	slots, _ := interp.SplitSlots(
 		[]uint64{0x401000, 0xc0de0000, 0x5a5a5a5a, 0x401100},
-		[]uint8{frameTagNative, frameTagPython, frameTagPython, frameTagNative},
+		[]uint8{frameTagNative, frameTagInterp, frameTagInterp, frameTagNative},
 	)
-	ips := nativeIPs(slots)
+	ips := interp.NativeIPs(slots)
 	if len(ips) != 2 || ips[0] != 0x401000 || ips[1] != 0x401100 {
 		t.Errorf("nativeIPs = %#x, want [0x401000 0x401100]", ips)
 	}
@@ -344,7 +363,7 @@ func TestPerfDataExportCarriesOnlyNativeIPs(t *testing.T) {
 func TestHashStackSeparatesStacksThatDifferOnlyInTags(t *testing.T) {
 	pcs := []uint64{0x401000, 0x401100}
 	a := hashStack(pcs, []uint8{frameTagNative, frameTagNative})
-	b := hashStack(pcs, []uint8{frameTagPython, frameTagPython})
+	b := hashStack(pcs, []uint8{frameTagInterp, frameTagInterp})
 	if a == b {
 		t.Error("hashStack ignores the tags; two different call paths would share one sample key")
 	}
@@ -363,7 +382,7 @@ func TestHashStackSeparatesStacksThatDifferOnlyInTags(t *testing.T) {
 // backing array rather than the values.
 func TestHashStackIsAPureFunctionOfItsInput(t *testing.T) {
 	pcs := []uint64{0x401000, 0xc0de0000, 0x5a5a5a5a}
-	tags := []uint8{frameTagNative, frameTagPython, frameTagPython}
+	tags := []uint8{frameTagNative, frameTagInterp, frameTagInterp}
 
 	samePCs := append([]uint64(nil), pcs...)
 	sameTags := append([]uint8(nil), tags...)
@@ -407,7 +426,7 @@ func TestPythonFrameNameSurvivesTheProfileBuilder(t *testing.T) {
 		Resolver:   resolver,
 	})
 	frames := symbolize.ToProfFrames([]symbolize.Frame{
-		pythonSymbolizeFrame(frameSlot{python: true, pc: codeObject, instr: 0x1234}),
+		interpSymbolizeFrame(interp.Slot{Unwinder: frameTagInterp, PC: codeObject, Extra: 0x1234}),
 	})
 	builders.AddSample(&pprof.ProfileSample{
 		Pid:         uint32(os.Getpid()),
@@ -417,7 +436,7 @@ func TestPythonFrameNameSurvivesTheProfileBuilder(t *testing.T) {
 		Value:       1,
 	})
 
-	want := pythonFrameName(codeObject)
+	want := interpFrameName(codeObject)
 	var got []string
 	for _, b := range builders.Builders {
 		for _, fn := range b.Profile.Function {

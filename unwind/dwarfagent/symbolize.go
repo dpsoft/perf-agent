@@ -5,13 +5,14 @@ import (
 
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 // symbolizePID resolves one walk's slot words for pid and returns pprof
 // frames in the same order. Failed IPs contribute a single synthetic
 // "[unknown]" frame carrying the original PC as Address.
 //
-// slots is the walk decoded by splitFrameSlots (issue #83), NOT a flat list of
+// slots is the walk decoded by interp.SplitSlots (issue #83), NOT a flat list of
 // instruction pointers: a Python frame occupies two consecutive pcs[] slots
 // holding a code-object address and an encoded instruction word, folded into
 // one slot here, and handing either word to blazesym asks it to name an
@@ -25,11 +26,11 @@ import (
 // with the native list is still one-to-one. After ToProfFrames it is not:
 // that call expands inline chains, so there is no index left to splice
 // against.
-func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []frameSlot) []pprof.Frame {
+func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []interp.Slot) []pprof.Frame {
 	if len(slots) == 0 {
 		return nil
 	}
-	native := nativeIPs(slots)
+	native := interp.NativeIPs(slots)
 
 	var frames []symbolize.Frame
 	// placeholders is carried explicitly rather than inferred later from an
@@ -54,7 +55,7 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []frameSlot) []ppr
 		// unchanged; only the genuinely new case is counted.
 		if err != nil || len(frames) != len(native) {
 			if err == nil && len(frames) != 0 {
-				pythonSymbolizerCountMM.Add(1)
+				interpSymbolizerCountMM.Add(1)
 			}
 			placeholders = true
 		}
@@ -63,16 +64,16 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []frameSlot) []ppr
 	out := make([]pprof.Frame, 0, len(slots))
 	next := 0
 	for _, sl := range slots {
-		if sl.python {
+		if sl.IsInterp() {
 			// Not counted here: PythonFrameStats.Frames is a per-SAMPLE
 			// number and collect() runs once per unique stack. The
-			// aggregators count, via countPythonSlots.
+			// aggregators count, via countInterpSlots.
 			out = append(out, symbolize.ToProfFrames(
-				[]symbolize.Frame{pythonSymbolizeFrame(sl)})...)
+				[]symbolize.Frame{interpSymbolizeFrame(sl)})...)
 			continue
 		}
 		if placeholders {
-			out = append(out, pprof.Frame{Name: "[unknown]", Address: sl.pc})
+			out = append(out, pprof.Frame{Name: "[unknown]", Address: sl.PC})
 			continue
 		}
 		// ToProfFrames one frame at a time: it is a pure per-frame flattening
@@ -94,7 +95,7 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []frameSlot) []ppr
 // stale BPF stack-IDs), behaves identically to symbolizePID. When user-mode
 // symbolization fails we still emit synthetic "[unknown]" placeholders so
 // the kernel frames don't appear hanging off an unrelated stack.
-func symbolizePIDWithKernel(sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, pid uint32, userSlots []frameSlot, kernelIPs []uint64) []pprof.Frame {
+func symbolizePIDWithKernel(sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer, pid uint32, userSlots []interp.Slot, kernelIPs []uint64) []pprof.Frame {
 	userFrames := symbolizePID(sym, pid, userSlots)
 	if len(kernelIPs) == 0 {
 		return userFrames

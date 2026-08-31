@@ -70,43 +70,6 @@ type offcpu_dwarfPidMapping struct {
 	TableId  uint64
 }
 
-type offcpu_dwarfPyEvalRange struct {
-	_  structs.HostLayout
-	Lo uint64
-	Hi uint64
-}
-
-type offcpu_dwarfPyFrameWindow struct {
-	_ structs.HostLayout
-	B [96]uint8
-}
-
-type offcpu_dwarfPyProcInfo struct {
-	_                        structs.HostLayout
-	NoneAddr                 uint64
-	TssKey                   uint32
-	PthreadSpecific1stblock  uint32
-	PthreadKeyDataSize       uint32
-	PthreadKeyDataOff        uint32
-	PthreadSize              uint32
-	FramePrevious            uint16
-	FrameExecutable          uint16
-	FrameInstrPtr            uint16
-	FrameOwner               uint16
-	ThreadstateFrame         uint16
-	CodeArgcount             uint16
-	CodeKwonlyargcount       uint16
-	CodeFlags                uint16
-	CodeFirstlineno          uint16
-	FrameOwnerMax            uint8
-	FrameOwnerCstack         uint8
-	FrameOwnerBoundary       uint8
-	FrameExecutableTagged    uint8
-	ThreadstateFrameIndirect uint8
-	Enabled                  uint8
-	Pad                      [4]uint8
-}
-
 type offcpu_dwarfSampleRecord struct {
 	_   structs.HostLayout
 	Hdr struct {
@@ -132,16 +95,16 @@ type offcpu_dwarfWalkPersist struct {
 	Pc              uint64
 	Fp              uint64
 	Sp              uint64
-	PyFrame         uint64
-	PyIter          uint64
+	InterpScratch   [4]uint64
 	Pid             uint32
+	Tid             uint32
 	N_pcs           uint32
 	PendingUnwinder uint32
+	InterpDone      uint32
+	Stopped         uint8
+	Pad2            [3]uint8
 	TailCalls       uint32
-	PyState         uint8
-	SkipPush        uint8
-	Resuming        uint8
-	Pad             [5]uint8
+	Pad             uint32
 }
 
 // loadOffcpu_dwarf returns the embedded CollectionSpec for offcpu_dwarf.
@@ -186,6 +149,8 @@ type offcpu_dwarfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type offcpu_dwarfProgramSpecs struct {
+	InterpResumeStep       *ebpf.ProgramSpec `ebpf:"interp_resume_step"`
+	InterpResumeWalk       *ebpf.ProgramSpec `ebpf:"interp_resume_walk"`
 	OffcpuDwarfSchedSwitch *ebpf.ProgramSpec `ebpf:"offcpu_dwarf_sched_switch"`
 }
 
@@ -200,15 +165,12 @@ type offcpu_dwarfMapSpecs struct {
 	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
 	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
+	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
 	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
-	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
-	PyFrameScratch           *ebpf.MapSpec `ebpf:"py_frame_scratch"`
-	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
-	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
 	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
@@ -224,7 +186,6 @@ type offcpu_dwarfVariableSpecs struct {
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
 	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
-	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
@@ -255,15 +216,12 @@ type offcpu_dwarfMaps struct {
 	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
 	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
+	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
 	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
-	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
-	PyFrameScratch           *ebpf.Map `ebpf:"py_frame_scratch"`
-	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
-	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackEvents              *ebpf.Map `ebpf:"stack_events"`
 	WalkStates               *ebpf.Map `ebpf:"walk_states"`
 	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
@@ -278,15 +236,12 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.CfiMissRatelimit,
 		m.CfiRules,
 		m.HandoffRanges,
+		m.InterpProgs,
 		m.KernStackmap,
 		m.OffcpuStart,
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
-		m.PyEvalRanges,
-		m.PyFrameScratch,
-		m.PyProcs,
-		m.PyWalkCounters,
 		m.StackEvents,
 		m.WalkStates,
 		m.WalkerScratch,
@@ -303,7 +258,6 @@ type offcpu_dwarfVariables struct {
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
 	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
-	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
 }
 
@@ -311,11 +265,15 @@ type offcpu_dwarfVariables struct {
 //
 // It can be passed to loadOffcpu_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type offcpu_dwarfPrograms struct {
+	InterpResumeStep       *ebpf.Program `ebpf:"interp_resume_step"`
+	InterpResumeWalk       *ebpf.Program `ebpf:"interp_resume_walk"`
 	OffcpuDwarfSchedSwitch *ebpf.Program `ebpf:"offcpu_dwarf_sched_switch"`
 }
 
 func (p *offcpu_dwarfPrograms) Close() error {
 	return _Offcpu_dwarfClose(
+		p.InterpResumeStep,
+		p.InterpResumeWalk,
 		p.OffcpuDwarfSchedSwitch,
 	)
 }

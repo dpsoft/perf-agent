@@ -10,6 +10,7 @@ import (
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 // OffCPUProfiler is the DWARF-capable off-CPU profiler. Same public
@@ -87,8 +88,8 @@ func aggregateOffCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	}
 	// See aggregateCPUSample: decode the tagged slots once, here, where every
 	// sample passes exactly once, and count per sample (issue #83).
-	slots, truncatedPair := splitFrameSlots(sample.PCs, sample.Tags)
-	countPythonSlots(slots, truncatedPair)
+	slots, truncatedPair := interp.SplitSlots(sample.PCs, sample.Tags)
+	countInterpSlots(slots, truncatedPair)
 
 	key := sampleKey{pid: sample.PID, hash: hashStack(sample.PCs, sample.Tags)}
 	s.mu.Lock()

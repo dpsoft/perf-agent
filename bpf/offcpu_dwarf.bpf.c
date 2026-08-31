@@ -70,56 +70,27 @@ struct {
 
 BTF_MATERIALIZE(offcpu_start_key)
 
-static __always_inline void handle_switch_out(void *ctx, struct task_struct *prev) {
-    __u32 pid = BPF_CORE_READ(prev, pid);
-    __u32 tgid = BPF_CORE_READ(prev, tgid);
-    if (pid == 0 || tgid == 0) return;
-    if (BPF_CORE_READ(prev, flags) & PF_KTHREAD) return;
+// offcpu_dwarf_walk walks (or resumes the walk of) prev's user stack and
+// stashes the sample for switch-IN to emit.
+//
+// Two programs call it: handle_switch_out below, once it has initialised the
+// state, and interp_resume_walk, once an interpreter module has appended its
+// frames and tail-called back.
+//
+// IT LOOKS THE TWO PER-CPU MAPS UP ITSELF rather than taking them as
+// arguments, and that is measured, not incidental: holding those map-value
+// pointers live across unwind_walk costs the verifier 146,027 processed
+// instructions (333,403 against 187,376 on perf_dwarf, same shape), because
+// both are then part of the state at every point inside the walk loop.
+static __always_inline void offcpu_dwarf_walk(void *ctx, bool resumed) {
+    struct walk_persist *st = walk_state_get();
+    struct sample_record *rec = walk_record_get();
+    if (!st || !rec) return;
 
-    // PID filter (skipped in system-wide mode).
-    if (!system_wide) {
-        if (!bpf_map_lookup_elem(&pids, &tgid)) return;
-    }
-
-    // Grab per-CPU scratch to build the sample_record.
-    __u32 zero = 0;
-    struct sample_record *rec = bpf_map_lookup_elem(&walker_scratch, &zero);
-    if (!rec) return;
-
-    // User-space registers of prev.
-    struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(prev);
-    if (!regs) return;
-    __u64 ip = (__u64)PT_REGS_IP(regs);
-    __u64 fp = (__u64)PT_REGS_FP(regs);
-    __u64 sp = (__u64)PT_REGS_SP(regs);
-
-    struct walk_ctx walker = {
-        .pc    = ip,
-        .fp    = fp,
-        .sp    = sp,
-        .pid   = tgid,
-        .n_pcs = 0,
-        .rec   = rec,
-    };
-    rec->hdr.walker_flags = 0;
-    bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
-
-    // A live Python cursor here means py_push_frames reached an interpreter
-    // entry frame with an outer segment behind it and the native walk ended
-    // before landing on that segment's eval-loop PC. Asked once, here, because
-    // this is the only point that knows the walk is over. See
-    // PY_CNT_CHAIN_ABANDONED in python_walk.h for the walker_flags join that
-    // separates "the native unwinder gave out" from "py_eval_ranges is
-    // missing an entry".
-    if (python_walk_enabled) {
-        // Two different losses, asked once each, in the only place that knows
-        // the walk is over. WALKING means the record filled up while a
-        // segment was still being stepped; ACTIVE means a segment ended at
-        // its boundary and the native walk never reached the outer segment's
-        // eval-loop PC.
-        if (walker.py_state == PY_CHAIN_WALKING) py_count(PY_CNT_CHAIN_TRUNCATED);
-        else if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
-    }
+    // MAY NOT RETURN: when the walk stops on a frame another unwinder claims,
+    // unwind_walk tail-calls that unwinder and this program ceases to exist.
+    // The resume programs come back here to finish the sample.
+    __u32 n_pcs = unwind_walk(ctx, st, rec, resumed);
 
     // Kernel-stack capture for prev. At sched_switch, prev is still
     // "current" so bpf_get_stackid(ctx, …) records prev's kernel stack.
@@ -131,18 +102,47 @@ static __always_inline void handle_switch_out(void *ctx, struct task_struct *pre
     }
 
     __u64 now = bpf_ktime_get_ns();
-    rec->hdr.pid     = tgid;
-    rec->hdr.tid     = pid;
+    rec->hdr.pid     = st->pid;
+    rec->hdr.tid     = st->tid;
     rec->hdr.time_ns = now;
     rec->hdr.value   = now; // stash timestamp here; overwritten on switch-IN
-    rec->hdr.n_pcs   = (__u8)(walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs);
+    rec->hdr.n_pcs   = (__u8)n_pcs;
     rec->hdr.mode    = (rec->hdr.walker_flags & WALKER_FLAG_DWARF_USED)
         ? MODE_FP_LESS : MODE_FP_SAFE;
 
-    struct offcpu_start_key k = { .pid = pid, .tgid = tgid };
+    struct offcpu_start_key k = { .pid = st->tid, .tgid = st->pid };
     // Pass the per-CPU scratch pointer to avoid a 1KB stack-local copy
     // (BPF stack is 512 bytes; sample_record is 1184).
     bpf_map_update_elem(&offcpu_start, &k, rec, BPF_ANY);
+}
+
+INTERP_DEFINE_PROGRAMS("tp_btf/sched_switch", offcpu_dwarf_walk)
+
+static __always_inline void handle_switch_out(void *ctx, struct task_struct *prev) {
+    __u32 pid = BPF_CORE_READ(prev, pid);
+    __u32 tgid = BPF_CORE_READ(prev, tgid);
+    if (pid == 0 || tgid == 0) return;
+    if (BPF_CORE_READ(prev, flags) & PF_KTHREAD) return;
+
+    // PID filter (skipped in system-wide mode).
+    if (!system_wide) {
+        if (!bpf_map_lookup_elem(&pids, &tgid)) return;
+    }
+
+    struct sample_record *rec = walk_record_get();
+    struct walk_persist *st = walk_state_get();
+    if (!rec || !st) return;
+
+    // User-space registers of prev.
+    struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(prev);
+    if (!regs) return;
+
+    unwind_walk_begin(st, rec, tgid, pid,
+                      (__u64)PT_REGS_IP(regs),
+                      (__u64)PT_REGS_FP(regs),
+                      (__u64)PT_REGS_SP(regs));
+
+    offcpu_dwarf_walk(ctx, false);
 }
 
 static __always_inline void handle_switch_in(struct task_struct *next) {
@@ -165,8 +165,15 @@ static __always_inline void handle_switch_in(struct task_struct *next) {
 SEC("tp_btf/sched_switch")
 int BPF_PROG(offcpu_dwarf_sched_switch, bool preempt,
              struct task_struct *prev, struct task_struct *next) {
-    handle_switch_out(ctx, prev);
+    // SWITCH-IN FIRST, and the order is load-bearing. handle_switch_out ends
+    // in a walk that may TAIL-CALL an interpreter, and a tail call replaces
+    // the running program: anything after it in this function would never run,
+    // so every off-CPU interval of a Python target would be started and never
+    // emitted. The two halves are independent -- switch-in reads
+    // offcpu_start[next], switch-out writes offcpu_start[prev], and prev is
+    // never next -- so running them the other way round changes nothing else.
     handle_switch_in(next);
+    handle_switch_out(ctx, prev);
     return 0;
 }
 

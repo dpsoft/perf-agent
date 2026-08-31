@@ -42,6 +42,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/usdt"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 const (
@@ -85,16 +86,14 @@ const (
 	// deep, not a truncated one.
 	maxWalkFrames = 127
 
-	// frameTagNative and frameTagPython mirror FRAME_TAG_* in
-	// bpf/unwind_common.h: the kind of each pcs[] slot. A native slot holds
-	// one instruction pointer; a Python frame occupies TWO consecutive
-	// slots, the first holding the code object's address in the target and
-	// the second an encoded instruction word, and both carry
-	// frameTagPython. Symbolizing either as a native PC invents a frame, so
-	// resolveStackLocked splits them out before the symbolizer ever sees
-	// the addresses.
-	frameTagNative = 0
-	frameTagPython = 1
+	// frameTagNative mirrors FRAME_TAG_NATIVE in bpf/unwind_record.h: the
+	// kind of each pcs[] slot. A native slot holds one instruction pointer;
+	// any other tag value is an UNWINDER ID and marks the first of TWO
+	// consecutive slots written by that unwinder, neither of which is an
+	// instruction pointer. Symbolizing either as a native PC invents a frame,
+	// so resolveStackLocked folds them out (interp.SplitSlots) before the
+	// symbolizer ever sees the addresses.
+	frameTagNative = interp.FrameTagNative
 
 	// The walkerFlag* constants mirror WALKER_FLAG_* in
 	// bpf/unwind_common.h. They ride in struct gpu_stack's walker_flags and
@@ -176,8 +175,8 @@ const (
 	// Deliberately NOT folded into the classification switch below: the
 	// switch partitions how a walk ENDED, and a refused push is a frame
 	// missing from the middle of a walk that ended some other way. Which
-	// pusher hit it is recorded on the BPF side instead, in
-	// py_walk_counters' PY_CNT_PUSH_REFUSED slot (see pyunwind.WalkCounters).
+	// pusher hit it is recorded on the BPF side instead, by whichever
+	// unwinder was pushing, in its own counters.
 	walkerFlagFramePushRefused = 0x80
 
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
@@ -207,8 +206,9 @@ const (
 	// on either side fails a unit test rather than decoding garbage.
 	//
 	// tags[] arrived with issue #83: one FRAME_TAG_* byte per pcs[] slot,
-	// because a Python frame occupies two consecutive slots and, without the
-	// tag, reaches this consumer indistinguishable from two native PCs.
+	// because an interpreter frame occupies two consecutive slots and,
+	// without the tag, reaches this consumer indistinguishable from two
+	// native PCs.
 	// gpuStackPadBytes is the compiler's own alignment pad after the u8
 	// array - spelled out rather than folded into a magic number, the same
 	// way unwind/dwarfagent's SampleRecordBytes had to be after getting this
@@ -1018,21 +1018,26 @@ type Stats struct {
 	// filling, so a rising count here is the early warning for capture
 	// failures (StacksMissing) that follow.
 	StackDeleteFailed uint64
-	// StackPythonFrames counts CPython frames spliced into resolved launch
-	// stacks - one per two pcs[] slots the walker tagged FRAME_TAG_PYTHON
-	// (bpf/unwind_common.h). They are placed at their own position in the
-	// call path and rendered as "python:0x..." until slice 3 teaches the
-	// symbolizer to read a code object; what this counter answers is whether
-	// the interpreter arm is reaching the GPU path at all, which no other
-	// number here can say.
-	StackPythonFrames uint64
-	// StackPythonPairsTruncated counts walks that ended between the two
-	// slots of a Python frame - MAX_FRAMES landed mid-pair, so the code
-	// object arrived and its instruction word did not. The half frame is
-	// dropped rather than half-read, and this is the counter that stops that
-	// drop being silent. Expect it to be small and to move together with
+	// StackInterpFrames counts interpreter frames spliced into resolved
+	// launch stacks - one per two pcs[] slots the walker tagged with an
+	// unwinder id rather than FRAME_TAG_NATIVE (bpf/unwind_record.h). They
+	// are placed at their own position in the call path and named by the
+	// unwinder that wrote them (for CPython, "python:0x..."); what this
+	// counter answers is whether the handoff is reaching the GPU path at all,
+	// which no other number here can say.
+	//
+	// One counter across every language, deliberately. It answers a question
+	// about the HANDOFF, which is one mechanism; per-language totals belong to
+	// the module's own counters, where the units and the failure modes are
+	// the module's to define.
+	StackInterpFrames uint64
+	// StackInterpPairsTruncated counts walks that ended between the two slots
+	// of an interpreter frame - MAX_FRAMES landed mid-pair, so the first word
+	// arrived and its partner did not. The half frame is dropped rather than
+	// half-read, and this is the counter that stops that drop being silent.
+	// Expect it to be small and to move together with
 	// walkerFlagFramePushRefused.
-	StackPythonPairsTruncated uint64
+	StackInterpPairsTruncated uint64
 	// StacksUncorrelated counts captures whose sampled launch carried a
 	// wire correlation of zero. The stack is real, but the ABI's "no
 	// correlation" leaves nothing to pair it with: the batched twin cannot
@@ -2585,56 +2590,6 @@ func decodeGPUStack(raw []byte) (pcs []uint64, tags []uint8, flags uint32, ok bo
 	return pcs, tags, flags, true
 }
 
-// gpuStackSlot is one decoded pcs[]/tags[] position. A native slot carries
-// one instruction pointer; a Python slot carries the code object's address in
-// the target and the encoded instruction word that followed it, folded back
-// into the single frame the two slots describe.
-type gpuStackSlot struct {
-	python bool
-	pc     uint64 // native PC, or the Python code object's address
-	instr  uint64 // Python only: the encoded instruction word
-}
-
-// splitGPUStackSlots folds the parallel pcs[]/tags[] arrays into one ordered
-// list of frames, ONE entry per frame rather than per slot.
-//
-// Order is preserved and that is the whole point: a caller that separated
-// native from Python into two lists would lose which native frame each Python
-// frame sat above, and a GPU launch stack whose Python frames are all piled
-// at one end is a plausible call path that never happened.
-//
-// truncatedPair reports a trailing frameTagPython slot whose partner word
-// fell off the end of the walk (MAX_FRAMES landing between the two). The half
-// frame is dropped rather than half-read - a code object with a garbage
-// instruction word is worse than no frame - and the caller counts it.
-func splitGPUStackSlots(pcs []uint64, tags []uint8) (slots []gpuStackSlot, truncatedPair bool) {
-	slots = make([]gpuStackSlot, 0, len(pcs))
-	for i := 0; i < len(pcs) && i < len(tags); i++ {
-		if tags[i] != frameTagPython {
-			slots = append(slots, gpuStackSlot{pc: pcs[i]})
-			continue
-		}
-		if i+1 >= len(pcs) {
-			return slots, true
-		}
-		slots = append(slots, gpuStackSlot{python: true, pc: pcs[i], instr: pcs[i+1]})
-		i++
-	}
-	return slots, false
-}
-
-// pythonFrameName renders an unsymbolized Python frame. Symbolization -
-// turning the code object into a file, a function and a line - is slice 3;
-// until then these carry the address, exactly as an unresolved native frame
-// does, and are marked Unresolved so nothing downstream reads the text as a
-// function name.
-//
-// The prefix is what makes the frame legible as Python rather than as a
-// stray pointer, and it is the label the end-to-end test asserts on.
-func pythonFrameName(codeObject uint64) string {
-	return fmt.Sprintf("python:%#x", codeObject)
-}
-
 // resolveStackLocked turns a gpu_stacks handle into symbolized frames: read
 // the entry, take the PCs the walk actually produced, symbolize them against
 // the launching process, flatten to pprof frames. Caller holds mu.
@@ -2816,22 +2771,21 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	// that snapshot rather than against /proc — which is Phase 4b work, not
 	// this phase's. Until then the degradation is at least COUNTED, which is
 	// the part that was missing.
-	// Split the tagged slots before anything is symbolized. A Python frame
-	// occupies two consecutive slots holding a code-object address and an
-	// encoded instruction word; handing either to the symbolizer asks it to
-	// name an address that is not code, and blazesym will happily place it
-	// in whatever mapping it falls in. Two plausible, wrong native frames on
-	// the one path this whole feature exists to serve - issue #83.
-	slots, truncatedPair := splitGPUStackSlots(ips, tags)
+	// Split the tagged slots before anything is symbolized. An interpreter
+	// frame occupies two consecutive slots holding whatever pair of words its
+	// unwinder chose; handing either to the symbolizer asks it to name an
+	// address that is not code, and blazesym will happily place it in
+	// whatever mapping it falls in. Two plausible, wrong native frames on the
+	// one path this whole feature exists to serve - issue #83.
+	//
+	// The fold lives in unwind/interp, shared with the DWARF profilers'
+	// consumer: one implementation of "which words are instruction pointers"
+	// rather than two that can drift.
+	slots, truncatedPair := interp.SplitSlots(ips, tags)
 	if truncatedPair {
-		c.stats.StackPythonPairsTruncated++
+		c.stats.StackInterpPairsTruncated++
 	}
-	native := make([]uint64, 0, len(slots))
-	for _, sl := range slots {
-		if !sl.python {
-			native = append(native, sl.pc)
-		}
-	}
+	native := interp.NativeIPs(slots)
 
 	var frames []symbolize.Frame
 	if len(native) > 0 {
@@ -2869,11 +2823,11 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	if resolved == 0 && len(frames) > 0 {
 		c.stats.StacksUnresolved++
 	}
-	// Splice the Python frames back in at their own positions, at the
+	// Splice the interpreter frames back in at their own positions, at the
 	// symbolize.Frame level where the correspondence with `native` is still
 	// one-to-one: ToProfFrames expands inline chains, so after it runs there
 	// is no index to splice against any more. Counted after the
-	// resolved/moduleOnly loop above so an unsymbolized Python frame does
+	// resolved/moduleOnly loop above so an unsymbolized interpreter frame does
 	// not inflate StackFramesUnresolved, which measures the NATIVE
 	// symbolizer's reach.
 	// symbolize.LocalSymbolizer documents one Frame per IP (symbolize/local.go),
@@ -2892,11 +2846,11 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		merged = make([]symbolize.Frame, 0, len(slots))
 		next := 0
 		for _, sl := range slots {
-			if sl.python {
-				c.stats.StackPythonFrames++
+			if sl.IsInterp() {
+				c.stats.StackInterpFrames++
 				merged = append(merged, symbolize.Frame{
-					Address: sl.pc,
-					Name:    pythonFrameName(sl.pc),
+					Address: sl.PC,
+					Name:    sl.Name(),
 					// Not FailureNone: the frame is placed correctly and its
 					// address is real, but nothing named it, and pprof has no
 					// unsymbolized bit of its own to infer that from later.

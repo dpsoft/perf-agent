@@ -25,6 +25,13 @@ import (
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+
+	// Registering the interpreter unwinders is a BINARY's decision, not a
+	// library's: which languages this build can walk is a property of what was
+	// linked, and a library that registered them behind the caller's back would
+	// make that invisible. unwind/interp/modules is the single place that names
+	// any of them; see unwind/interp for where a new one goes.
+	_ "github.com/dpsoft/perf-agent/unwind/interp/modules"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 

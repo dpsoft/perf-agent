@@ -111,7 +111,7 @@ func TestReadWalkCountersReportsLookupFailure(t *testing.T) {
 // forever. Read out of the header text because this package cannot load the
 // object.
 func TestWalkCounterSlotsMirrorTheBPFHeader(t *testing.T) {
-	src, err := os.ReadFile("../bpf/python_walk.h")
+	src, err := os.ReadFile("../bpf/interp/python/python_walk.h")
 	if err != nil {
 		t.Fatalf("read python_walk.h: %v", err)
 	}

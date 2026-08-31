@@ -42,6 +42,59 @@ const volatile bool system_wide = false;
 // at load time without another bpf2go regeneration.
 const volatile bool kernel_stacks_enabled = false;
 
+// perf_dwarf_walk walks (or resumes the walk of) one sample and emits it.
+//
+// Two programs call it: the perf_event entry point below, once it has
+// initialised the state, and interp_resume, once an interpreter module has
+// appended its frames and tail-called back. A sample that went through an
+// interpreter is emitted exactly like one that did not, so both share this.
+//
+// IT LOOKS THE TWO PER-CPU MAPS UP ITSELF rather than taking them as
+// arguments, and that is a measured decision, not an oversight: holding those
+// two map-value pointers live across unwind_walk costs the verifier 146,027
+// processed instructions on this kernel (333,403 against 187,376), because
+// both are then part of the state at every point inside the walk loop and
+// pruning gets worse. The entry point below looks them up again for its own
+// initialisation; two lookups of a per-CPU array are cheaper at runtime than
+// one of them is to verify.
+static __always_inline void perf_dwarf_walk(void *ctx, bool resumed) {
+    struct walk_persist *st = walk_state_get();
+    struct sample_record *rec = walk_record_get();
+    if (!st || !rec) return;
+
+    // MAY NOT RETURN: when the walk stops on a frame another unwinder claims,
+    // unwind_walk tail-calls that unwinder and this program ceases to exist.
+    // interp_resume comes back here to finish the sample.
+    __u32 n_pcs = unwind_walk(ctx, st, rec, resumed);
+
+    // Kernel-stack capture. Default to -1 so userspace can cheaply detect
+    // "no kernel stack" without branching on the gate. bpf_get_stackid is
+    // the kernel-side counterpart of the FP-walk path's stackmap insert in
+    // perf.bpf.c — see internal/bpfstack.ExtractIPs for the userspace decode.
+    rec->hdr.kern_stack = -1;
+    if (kernel_stacks_enabled) {
+        rec->hdr.kern_stack = bpf_get_stackid(ctx, &kern_stackmap, KERN_STACKID_FLAGS);
+    }
+
+    // Fill the header AFTER the walk so we know n_pcs.
+    rec->hdr.pid          = st->pid;
+    rec->hdr.tid          = st->tid;
+    rec->hdr.time_ns      = bpf_ktime_get_ns();
+    rec->hdr.value        = 1; // CPU sample count; weight is applied at sampling rate
+    rec->hdr.n_pcs        = (__u8)n_pcs;
+    // Dominant mode for telemetry: FP_LESS if DWARF fired at least once,
+    // else FP_SAFE. walker_flags carries the per-bit breakdown.
+    rec->hdr.mode = (rec->hdr.walker_flags & WALKER_FLAG_DWARF_USED)
+        ? MODE_FP_LESS : MODE_FP_SAFE;
+    // walker_flags already populated by the walk — do not reset here.
+
+    // Copy the full fixed-size record into the ringbuf. The wasted bytes
+    // past n_pcs are acceptable; see unwind_common.h for the design note.
+    bpf_ringbuf_output(&stack_events, rec, sizeof(*rec), 0);
+}
+
+INTERP_DEFINE_PROGRAMS("perf_event", perf_dwarf_walk)
+
 SEC("perf_event")
 int perf_dwarf(struct bpf_perf_event_data *ctx) {
     __u64 tgid_tid = bpf_get_current_pid_tgid();
@@ -57,77 +110,22 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
         if (!bpf_map_lookup_elem(&pids, &tgid)) return 0;
     }
 
-    // Grab the per-CPU scratch slot. A sample_record is 1184 bytes — far
-    // past the 512-byte BPF stack limit — so we build it here and copy to
-    // the ringbuf at the end.
-    __u32 zero = 0;
-    struct sample_record *rec = bpf_map_lookup_elem(&walker_scratch, &zero);
-    if (!rec) return 0;
+    // The record is 1184 bytes and the BPF stack is 512, so it is built in a
+    // per-CPU map. The walk cursor lives in a second per-CPU map for a
+    // different reason: a tail call to an interpreter would take this
+    // program's stack with it.
+    struct sample_record *rec = walk_record_get();
+    struct walk_persist *st = walk_state_get();
+    if (!rec || !st) return 0;
 
     // User registers. PT_REGS_* macros handle the arch-specific field names;
     // &ctx->regs points at bpf_user_pt_regs_t, which the macros cast and read.
-    __u64 ip = (__u64)PT_REGS_IP(&ctx->regs);
-    __u64 fp = (__u64)PT_REGS_FP(&ctx->regs);
-    __u64 sp = (__u64)PT_REGS_SP(&ctx->regs);
+    unwind_walk_begin(st, rec, tgid, tid,
+                      (__u64)PT_REGS_IP(&ctx->regs),
+                      (__u64)PT_REGS_FP(&ctx->regs),
+                      (__u64)PT_REGS_SP(&ctx->regs));
 
-    struct walk_ctx walker = {
-        .pc    = ip,
-        .fp    = fp,
-        .sp    = sp,
-        .pid   = tgid,
-        .n_pcs = 0,
-        .rec   = rec,
-    };
-
-    // Zero walker_flags BEFORE bpf_loop so walk_step can OR bits in as it
-    // classifies / switches modes / hits terminators.
-    rec->hdr.walker_flags = 0;
-
-    // Walk at most MAX_FRAMES frames. walk_step breaks early on read
-    // failure or natural terminator (saved_fp == 0, saved_fp <= fp).
-    bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
-
-    // A live Python cursor here means py_push_frames reached an interpreter
-    // entry frame with an outer segment behind it and the native walk ended
-    // before landing on that segment's eval-loop PC. Asked once, here, because
-    // this is the only point that knows the walk is over. See
-    // PY_CNT_CHAIN_ABANDONED in python_walk.h for the walker_flags join that
-    // separates "the native unwinder gave out" from "py_eval_ranges is
-    // missing an entry".
-    if (python_walk_enabled) {
-        // Two different losses, asked once each, in the only place that knows
-        // the walk is over. WALKING means the record filled up while a
-        // segment was still being stepped; ACTIVE means a segment ended at
-        // its boundary and the native walk never reached the outer segment's
-        // eval-loop PC.
-        if (walker.py_state == PY_CHAIN_WALKING) py_count(PY_CNT_CHAIN_TRUNCATED);
-        else if (walker.py_state == PY_CHAIN_ACTIVE) py_count(PY_CNT_CHAIN_ABANDONED);
-    }
-
-    // Kernel-stack capture. Default to -1 so userspace can cheaply detect
-    // "no kernel stack" without branching on the gate. bpf_get_stackid is
-    // the kernel-side counterpart of the FP-walk path's stackmap insert in
-    // perf.bpf.c — see internal/bpfstack.ExtractIPs for the userspace decode.
-    rec->hdr.kern_stack = -1;
-    if (kernel_stacks_enabled) {
-        rec->hdr.kern_stack = bpf_get_stackid(ctx, &kern_stackmap, KERN_STACKID_FLAGS);
-    }
-
-    // Fill the header AFTER the walk so we know n_pcs.
-    rec->hdr.pid          = tgid;
-    rec->hdr.tid          = tid;
-    rec->hdr.time_ns      = bpf_ktime_get_ns();
-    rec->hdr.value        = 1; // CPU sample count; weight is applied at sampling rate
-    rec->hdr.n_pcs        = (__u8)(walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs);
-    // Dominant mode for telemetry: FP_LESS if DWARF fired at least once,
-    // else FP_SAFE. walker_flags carries the per-bit breakdown.
-    rec->hdr.mode = (rec->hdr.walker_flags & WALKER_FLAG_DWARF_USED)
-        ? MODE_FP_LESS : MODE_FP_SAFE;
-    // walker_flags already populated by walk_step during the walk — do not reset here.
-
-    // Copy the full fixed-size record into the ringbuf. The wasted bytes
-    // past n_pcs are acceptable; see unwind_common.h for the design note.
-    bpf_ringbuf_output(&stack_events, rec, sizeof(*rec), 0);
+    perf_dwarf_walk(ctx, false);
     return 0;
 }
 

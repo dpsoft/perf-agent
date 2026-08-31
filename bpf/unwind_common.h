@@ -30,15 +30,11 @@
 #endif
 #include <bpf/bpf_helpers.h>
 
-// MAX_FRAMES: the unwind walker's per-sample loop bound. Matches the
-// BPF_MAP_TYPE_STACK_TRACE convention; deeper stacks truncate.
-#ifndef MAX_FRAMES
-// Overridable with -D only so a verifier experiment can measure how the cost
-// scales with the outer loop's bound (see verifier-plan.md's ladder); the
-// build never sets it, and changing it changes struct sample_record, which
-// unwind/dwarfagent parses by byte offset.
-#define MAX_FRAMES 127
-#endif
+// The record, the persisted walk state, the three maps both sides of the
+// handoff touch, and the two frame pushers. That header is the ENTIRE
+// contract between this walker and an unwinder for a language whose frames
+// are not on the machine stack -- see bpf/interp/ for what one looks like.
+#include "unwind_record.h"
 
 // RINGBUF_BYTES: size of the stack_events ringbuf. Must be a power of two
 // and >= PAGE_SIZE. 256 KB absorbs bursts at 99 Hz × 16 CPUs; higher
@@ -103,65 +99,6 @@ struct pid_mapping {
     __u64 load_bias;
     __u64 table_id;
 };
-
-// ----- Sample record emitted via ringbuf per sample.
-//
-// Fixed-size layout (~1.15 KB): header + MAX_FRAMES u64 PCs + MAX_FRAMES u8
-// tags, with n_pcs telling consumers how many pcs[]/tags[] slots are valid.
-// A variable-length layout would save bandwidth but fights the verifier; we
-// pay the constant-size cost and optimize later if needed.
-// sample_header is 40 bytes; explicit tail padding makes the `pcs` array
-// that follows it naturally 8-byte aligned on both archs. kern_stack carries
-// the BPF stack-ID produced by bpf_get_stackid on kern_stackmap (or -1 when
-// kernel-stack capture is disabled). Userspace reads it to look the kernel
-// IPs back out of kern_stackmap, symbolizes via the kernel symbolizer, and
-// merges leaf-first with user frames.
-//
-// pcs[] is no longer a flat, uniformly-native PC array: a Python frame
-// occupies two consecutive slots (code object address, then an encoded
-// fingerprint/f_lasti word), so tags[] carries one FRAME_TAG_* byte per
-// pcs[] slot telling consumers how to read it. Issue #83. tags[] trails
-// pcs[] (rather than interleaving) so the existing fixed pcs[] offset is
-// unchanged for readers that only care about native frames.
-struct sample_header {
-    __u32 pid;
-    __u32 tid;
-    __u64 time_ns;
-    __u64 value;       // sample weight: 1 for CPU, blocking-ns for off-CPU
-    __u8  mode;        // dominant classification for the sample (telemetry)
-    __u8  n_pcs;       // number of valid slots in the pcs[]/tags[] arrays
-    __u8  walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
-    __u8  _pad;
-    __u32 _pad2;
-    __s64 kern_stack;  // bpf_get_stackid(&kern_stackmap,…) result, or -1 if disabled
-};
-
-// Frame tags. Each pcs[] slot carries its kind. FRAME_TAG_NATIVE is a single
-// slot holding one PC; FRAME_TAG_PYTHON is the first of a pair of slots
-// (code object, then encoded fingerprint/f_lasti) — see frame_push_python.
-#define FRAME_TAG_NATIVE 0
-#define FRAME_TAG_PYTHON 1
-
-struct sample_record {
-    struct sample_header hdr;
-    __u64 pcs[MAX_FRAMES];
-    // One tag per pcs[] slot. A u8 array rather than bits packed into the PC
-    // because a PC is a full 64 bits and stealing from it would break the
-    // day someone maps something high.
-    __u8 tags[MAX_FRAMES];
-};
-
-// ----- Per-CPU scratch map.
-//
-// Used to build the sample_record before copying into the ringbuf slot.
-// 1184 bytes per record exceeds the 512-byte BPF stack limit, so staging
-// through a per-CPU map is mandatory.
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, __u32);
-    __type(value, struct sample_record);
-    __uint(max_entries, 1);
-} walker_scratch SEC(".maps");
 
 // ----- Ringbuf for emitted sample records.
 //
@@ -253,24 +190,14 @@ struct {
 
 // ----- Walker helpers.
 
-// walk_ctx holds per-sample unwinder state. Lives on the BPF entry
-// function's stack; the pcs array lives in walker_scratch.
+// walk_ctx holds the per-ENTRY state of one native walk: the registers the
+// walk is standing on, the cursor into the record, and the record itself.
+// Lives on the BPF entry function's stack, which is where bpf_loop wants its
+// callback context.
 //
-// py_frame/py_state are the CPython chain walk's resume cursor, zero for a
-// process with no interpreter and untouched by every native path. They live
-// here, not in a map, because they are per-SAMPLE state and this struct is
-// the only per-sample thing the walker has: _PyInterpreterFrame.previous
-// links run through the interpreter's C boundary frames, so a native stack
-// that crosses the eval loop twice must RESUME the one chain rather than
-// restart it. See PY_CHAIN_* and py_push_frames in python_walk.h.
-//
-// The three drivers build this on the BPF stack with designated
-// initialisers, so the two added fields cost them nothing but zeroes.
-// Forward declaration: struct walk_ctx carries a pointer to one, and
-// python_walk.h (which defines it) is included further down, after the
-// helpers it needs exist.
-struct py_proc_info;
-
+// Everything that must survive a tail call lives in struct walk_persist
+// instead (unwind_record.h); walk_load/walk_save below move between the two.
+// The split is forced: a map value may not hold a pointer, and `rec` is one.
 struct walk_ctx {
     __u64 pc;
     __u64 fp;
@@ -282,45 +209,25 @@ struct walk_ctx {
     // where a narrower field only buys the compiler a mask on every load and
     // store. The narrowing to __u8 happens once, in each driver, after the
     // walk (`rec->hdr.n_pcs = (__u8)(walker.n_pcs > MAX_FRAMES ? ...)`), and
-    // the _Static_assert on MAX_FRAMES <= 255 near frame_push_python is what
+    // the _Static_assert on MAX_FRAMES <= 255 in unwind_record.h is what
     // proves that cast cannot truncate.
     //
     // The width is NOT what makes a bounds check safe here. The wrap bug CI
-    // caught (see frame_push_python) came from doing arithmetic on the
+    // caught (see record_push_interp) came from doing arithmetic on the
     // checked value; a __u8 field would have hidden that one instance behind
     // integer promotion while leaving the pattern in place to bite the next
     // helper that needs a two-slot bound. Check against a compile-time
     // constant instead.
     __u32 n_pcs;
     struct sample_record *rec;
-    __u64 py_frame;      // next _PyInterpreterFrame to push, 0 if none
-    // The chain walk's per-CALL state, distinct from the resume cursor
-    // above. py_push_frames drives its loop through bpf_loop rather than an
-    // unrolled body (see python_walk.h for why), and a bpf_loop callback
-    // takes exactly one context pointer -- so the callback's inputs live
-    // here, where the callback already has them, instead of in a second
-    // struct whose pointer would have to be carried through the callback
-    // boundary as well.
-    //
-    // py_pi is a py_procs map value, the same kind of pointer `rec` above
-    // already is, and is null-checked in the callback like any other.
-    struct py_proc_info *py_pi;
-    __u64 py_iter;       // the _PyInterpreterFrame this iteration stands on
-    __u8  py_state;      // PY_CHAIN_UNSTARTED / _ACTIVE / _DONE
-    // py_iter_stopped distinguishes "the walk ended for a reason" from "the
-    // per-entry budget ran out", which is the difference between silence and
-    // PY_CNT_CHAIN_TRUNCATED. bpf_loop's return value cannot answer it: a
-    // callback that stops on its last permitted iteration returns the same
-    // count as one that never stopped at all.
-    __u8  py_iter_stopped;
     // Set by walk_step when another unwinder claims the frame it stopped on;
     // read by the driver after bpf_loop returns. UNWINDER_NATIVE means the
     // walk ended for one of the ordinary reasons.
     __u32 pending_unwinder;
-    // Set with pending_unwinder; consumed by the first iteration after the
-    // walk resumes. See walk_step.
-    __u8  skip_push;
-    __u8  _pad[6];
+    // One bit per unwinder id, mirroring walk_persist.interp_done: an
+    // unwinder that has declared itself finished with this sample is not
+    // offered another frame. Read by walk_step, written only by a module.
+    __u32 interp_done;
 };
 
 // ----- Lazy CFI: miss emit helper.
@@ -656,129 +563,23 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 #define WALKER_FLAG_FP_EXHAUSTED     0x10
 #define WALKER_FLAG_FP_NONMONOTONIC  0x20
 #define WALKER_FLAG_ROOT_DISAGREEMENT 0x40
-#define WALKER_FLAG_FRAME_PUSH_REFUSED 0x80
+// WALKER_FLAG_FRAME_PUSH_REFUSED (0x80) is defined in unwind_record.h, beside
+// the two pushers that raise it, so an interpreter module compiled against
+// that header alone still has the name.
 
-// A TRAP THAT HAS NOW BITTEN TWICE, WRITTEN DOWN WHERE IT BITES.
+// frame_push_native appends one native-PC slot to the record this walk is
+// building. Returns 0 on success, 1 if the record is full -- the caller must
+// stop walking in that case.
 //
-// A bound the verifier proved about a value is attached to the REGISTER it
-// proved it about, not to the memory the value came from. So this is rejected:
-//
-//     if (pi->frame_owner > LIMIT) return;      // proves a bound on a load
-//     x = buf[pi->frame_owner];                 // a SECOND load: no bound
-//
-//   invalid access to map value, value_size=96 off=65535 size=1
-//   R2 max value is outside of the allowed memory range
-//
-// 65535 is the full __u16 range -- the bound from three lines earlier, gone.
-// It is not the verifier being obtuse: pi points into a map value, and another
-// CPU may write it between the two loads, so the second load genuinely has no
-// bound. Bind the value ONCE and use that binding for both the check and the
-// access:
-//
-//     __u16 off = pi->frame_owner;
-//     if (off > LIMIT) return;
-//     x = buf[off];
-//
-// The same class of defect, in the other direction, produced the earlier
-// wrap bug: `if (i + 2 > MAX_FRAMES)` did arithmetic ON the checked value, so
-// the check and the store disagreed about what had been proved. Both rules are
-// one rule -- check and use the same register, and do nothing to it in
-// between -- and both were found by CI rather than by review.
-//
-// frame_push_native appends one native-PC slot, tagging it FRAME_TAG_NATIVE.
-// Returns 0 on success, 1 if the record is already full (MAX_FRAMES
-// reached) — the caller must stop walking in that case. The refusal itself
-// is never silent: WALKER_FLAG_FRAME_PUSH_REFUSED says a frame was dropped
-// for lack of room, distinct from every other reason a walk can stop short.
-//
-// The bound is re-asserted into a local (`i`) immediately before the
-// stores, rather than checked on ctx->n_pcs and indexed with ctx->n_pcs
-// again: the verifier tracks a register's proven range across a branch,
-// not a struct field re-read through a pointer, so `if (ctx->n_pcs >=
-// MAX_FRAMES) ... ctx->rec->pcs[ctx->n_pcs++]` verified the check but not
-// the store, rejecting perf_dwarf and offcpu_dwarf as an unbounded R4
-// access at the pcs[] write. Binding `i` once and using it for both the
-// check and every array access keeps the proof in one register.
+// The bounds discipline that makes this safe, and the two CI rejections that
+// taught it, are documented once at record_push_native in unwind_record.h,
+// where the check actually lives. It lives THERE and not here because an
+// interpreter module -- compiled into its own object, sharing only that
+// header -- appends to the same record, and a second copy of a bounds check
+// is how the two drift.
 static __always_inline int frame_push_native(struct walk_ctx *ctx, __u64 pc) {
-    __u32 i = ctx->n_pcs;
-    if (i >= MAX_FRAMES) {
-        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
-        return 1;
-    }
-    ctx->rec->tags[i] = FRAME_TAG_NATIVE;
-    ctx->rec->pcs[i] = pc;
-    ctx->n_pcs = i + 1;
-    return 0;
+    return record_push_native(ctx->rec, &ctx->n_pcs, pc);
 }
-
-// frame_push_python appends a two-slot Python frame (code object address,
-// then an encoded fingerprint/f_lasti word), both tagged FRAME_TAG_PYTHON.
-// Returns 0 on success, 1 if fewer than two slots remain — the caller must
-// stop walking in that case rather than push a half-pair. Its caller is
-// py_push_frames, below, which drives the CPython frame-chain walk.
-// Keeping the MAX_FRAMES bounds check here, alongside frame_push_native's,
-// means every place this record can overflow is checked in exactly one
-// spot rather than re-derived at each call site. Like frame_push_native,
-// a refusal raises WALKER_FLAG_FRAME_PUSH_REFUSED rather than dropping the
-// frame silently.
-//
-// The check does NO ARITHMETIC ON THE CHECKED VALUE. It used to read
-// `if (i + 2 > MAX_FRAMES)`, which looks like one comparison covering both
-// slots and is in fact a wrap: `i` is __u32, `i + 2` is u32 arithmetic, and
-// at i == 0xFFFFFFFE it evaluates to 0, which is not > 127. The check passes
-// and both stores run with a wild index. The verifier is right to refuse to
-// derive `i <= 125` from `i + 2 <= 127`, and it did — CI rejected both
-// perf_dwarf and offcpu_dwarf with
-//
-//   (73) *(u8 *)(r1 +1056) = r0: R1 unbounded memory access
-//
-// at the tags[] store (1056 == offsetof(struct sample_record, tags)).
-// frame_push_native was accepted through all of this because `i >= MAX_FRAMES`
-// does no arithmetic and cannot wrap; that asymmetry was the tell.
-//
-// The bound is therefore expressed as a comparison against a COMPILE-TIME
-// CONSTANT: this push writes slots `i` and `i + 1`, both of which must be
-// < MAX_FRAMES, so the accept set is exactly i <= MAX_FRAMES - 2 (125 at
-// MAX_FRAMES 127) and the refusal is `i > MAX_FRAMES - 2`. `MAX_FRAMES - 2`
-// folds at compile time, so nothing the verifier has to track is ever added
-// to. The _Static_assert below keeps that subtraction from underflowing into
-// a huge unsigned bound if MAX_FRAMES is ever made tiny.
-//
-// Both slots are still written from that same checked local `i`, so the
-// two-slot push stays atomic (refuse before writing either, never write one
-// and fail the second) and, per frame_push_native's comment above, the
-// verifier's proof for both `i` and `i + 1` stays tied to the one checked
-// register instead of a re-read of ctx->n_pcs.
-_Static_assert(MAX_FRAMES >= 2,
-               "frame_push_python's bound is MAX_FRAMES - 2; below 2 that underflows to a huge unsigned and accepts everything");
-_Static_assert(MAX_FRAMES <= 255,
-               "walk_ctx.n_pcs is __u32 but narrows to sample_header.n_pcs (__u8) in every driver; MAX_FRAMES must fit");
-
-static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, __u64 instr) {
-    __u32 i = ctx->n_pcs;
-    if (i > MAX_FRAMES - 2) {
-        ctx->rec->hdr.walker_flags |= WALKER_FLAG_FRAME_PUSH_REFUSED;
-        return 1;
-    }
-    ctx->rec->tags[i] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[i] = code;
-    ctx->rec->tags[i + 1] = FRAME_TAG_PYTHON;
-    ctx->rec->pcs[i + 1] = instr;
-    ctx->n_pcs = i + 2;
-    return 0;
-}
-
-// ----- Python frame walking.
-//
-// Included HERE, below frame_push_python and above walk_step, because
-// py_push_frames consumes both struct walk_ctx (declared far above) and
-// frame_push_python (just above): a C macro or function is not visible
-// before its definition, so the include cannot sit with the other maps the
-// way it used to. python_walk.h supplies py_proc_info/py_procs, the
-// pthread-TSD reimplementation that reaches a target thread's
-// PyThreadState, the eval-loop text ranges walk_step switches on, and the
-// per-CPU counters that make every Python-side refusal visible.
-#include "python_walk.h"
 
 // fp_chain_ended reports whether this walk has already stepped PAST the end
 // of the frame-pointer chain: it left a frame whose saved-FP slot held zero,
@@ -797,32 +598,6 @@ static __always_inline int frame_push_python(struct walk_ctx *ctx, __u64 code, _
 static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
     return (ctx->rec->hdr.walker_flags & WALKER_FLAG_FP_TERMINATED) != 0;
 }
-
-// python_walk_enabled gates the interpreter arm at LOAD time, not at run
-// time, and that distinction is the whole point: a `const volatile` global is
-// a known constant to the verifier, so with it false the entire arm below --
-// two map lookups, the eval-range test and the chain walk -- is pruned before
-// verification, and the program is the shape it had before the CPython walker
-// existed.
-//
-// It exists because that shape is the difference between loading and not
-// loading. On Linux 6.19.4+ the arm's presence pushes perf_dwarf,
-// offcpu_dwarf and gpu_usdt past the verifier's 1M processed-instruction
-// ceiling (see the SCC/backedge change f597664454bd), which took out
-// --unwind auto, the DEFAULT profiling mode, on those kernels. Userspace
-// loads with this true, and on a complexity rejection reloads with it false
-// rather than leaving the profiler dead -- see profile.loadWithPythonGate.
-//
-// Default true: a build that silently shipped with Python frames off would be
-// the failure this whole branch exists to refuse.
-#ifndef PYTHON_WALK_DEFAULT
-// Default true: a build that silently shipped with Python frames off would be
-// the failure this whole branch exists to refuse. Overridable with -D only so
-// a verifier experiment can compile the arm out and measure the difference
-// (see the ladder in verifier-plan.md); nothing in the build does that.
-#define PYTHON_WALK_DEFAULT true
-#endif
-const volatile bool python_walk_enabled = PYTHON_WALK_DEFAULT;
 
 // ----- Handing a frame to another unwinder.
 //
@@ -869,65 +644,32 @@ struct {
 const volatile bool interp_enabled = INTERP_DEFAULT;
 
 // next_unwinder answers "does something other than the native walker claim
-// this PC". UNWINDER_NATIVE means carry on.
-static __always_inline __u32 next_unwinder(__u64 table_id, __u64 rel_pc) {
+// this PC, and is it still interested". UNWINDER_NATIVE means carry on.
+//
+// `done` is walk_ctx.interp_done: one bit per unwinder id, set by a module
+// that has finished with this sample. Honouring it here rather than in the
+// module is what keeps a deep stack cheap -- a Python process's native walk
+// can cross the eval loop a dozen times in one sample, and without this every
+// crossing after the first costs two tail calls to be told nothing and eats
+// the round-trip budget a genuinely deep chain needs.
+static __always_inline __u32 next_unwinder(__u64 table_id, __u64 rel_pc, __u32 done) {
     struct handoff_range *h = bpf_map_lookup_elem(&handoff_ranges, &table_id);
     if (!h) return UNWINDER_NATIVE;
     if (rel_pc < h->lo || rel_pc >= h->hi) return UNWINDER_NATIVE;
-    return h->unwinder_id;
-}
-
-// walk_persist is the part of a walk that has to survive a tail call.
-//
-// It is deliberately NOT struct walk_ctx. A tail call replaces the running
-// program, so the driver's stack is gone and the cursor has to live in a map
-// -- and a map value may not contain pointers. bpf2go refuses outright:
-//
-//   generating perf_dwarfWalkState: Struct:"walk_state": field 0:
-//   Struct:"walk_ctx": field 5: type *btf.Pointer: not supported
-//
-// which is the tool telling us something the verifier would have told us
-// later: a pointer stored in a map value comes back as a plain scalar, so
-// `rec` could not be trusted across the boundary anyway. It is re-derived
-// from walker_scratch on every entry, and py_pi is re-looked-up by the
-// unwinder that needs it. So walk_ctx keeps its pointers and stays on the
-// stack -- which also keeps bpf_loop's callback context a stack pointer, the
-// shape this program already verifies -- and only the scalars persist.
-struct walk_persist {
-    __u64 pc;
-    __u64 fp;
-    __u64 sp;
-    __u64 py_frame;
-    __u64 py_iter;
-    __u32 pid;
-    __u32 n_pcs;
-    __u32 pending_unwinder;
-    // tail_calls bounds the native<->interpreter round trips in one sample,
-    // well under the kernel's MAX_TAIL_CALL_CNT of 33 so the driver always has
-    // budget left to finish and submit the record.
-    __u32 tail_calls;
-    __u8  py_state;
-    __u8  skip_push;
-    // resuming tells a re-entered driver that this is the same sample coming
-    // back from an interpreter, not a fresh one to initialise.
-    __u8  resuming;
-    __u8  _pad[5];
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct walk_persist);
-} walk_states SEC(".maps");
-
-static __always_inline struct walk_persist *walk_state_get(void) {
-    __u32 zero = 0;
-    return bpf_map_lookup_elem(&walk_states, &zero);
+    __u32 id = h->unwinder_id;
+    // The mask is on the id read out of the map value, not on a re-read: see
+    // the bounds discipline at record_push_native. 31 rather than
+    // INTERP_MAX_UNWINDERS-1 so a shift is always defined even if a map entry
+    // carries an id this build has no slot for; such an id simply finds an
+    // empty interp_progs slot and the tail call fails, which is the same
+    // degradation as a module that was never loaded.
+    if (done & (1u << (id & 31))) return UNWINDER_NATIVE;
+    return id;
 }
 
 // walk_load rebuilds a stack walk_ctx from the persisted scalars, pointing it
-// at this entry's freshly looked-up record.
+// at this entry's freshly looked-up record. See struct walk_persist in
+// unwind_record.h for why the two structs are not one.
 static __always_inline void walk_load(struct walk_ctx *w, struct walk_persist *st,
                                       struct sample_record *rec) {
     w->pc = st->pc;
@@ -936,13 +678,8 @@ static __always_inline void walk_load(struct walk_ctx *w, struct walk_persist *s
     w->pid = st->pid;
     w->n_pcs = st->n_pcs;
     w->rec = rec;
-    w->py_frame = st->py_frame;
-    w->py_iter = st->py_iter;
-    w->py_state = st->py_state;
-    w->py_pi = 0;
-    w->py_iter_stopped = 0;
     w->pending_unwinder = st->pending_unwinder;
-    w->skip_push = st->skip_push;
+    w->interp_done = st->interp_done;
 }
 
 // walk_save writes back everything a resumed walk needs.
@@ -952,109 +689,41 @@ static __always_inline void walk_save(struct walk_persist *st, struct walk_ctx *
     st->sp = w->sp;
     st->pid = w->pid;
     st->n_pcs = w->n_pcs;
-    st->py_frame = w->py_frame;
-    st->py_iter = w->py_iter;
-    st->py_state = w->py_state;
     st->pending_unwinder = w->pending_unwinder;
-    st->skip_push = w->skip_push;
+    st->interp_done = w->interp_done;
 }
 
-// walk_step is the per-frame bpf_loop callback for the hybrid walker.
-// Classifies ctx->pc, picks FP or DWARF path, and advances the walk
-// state. Returns 0 to continue, 1 to stop.
-static long walk_step(__u32 idx, void *arg) {
-    struct walk_ctx *ctx = (struct walk_ctx *)arg;
+// unwind_frame does ONE frame: record it, offer it to another unwinder, then
+// advance pc/fp/sp to its caller. Returns 0 to continue, 1 to stop.
+//
+// `lead` is a COMPILE-TIME constant at both call sites and that is the whole
+// point of it being a parameter.
+//
+//   true  — the ordinary case. The frame has not been seen: push it, and ask
+//           whether something else claims it.
+//   false — the ONE frame a resumed walk starts on. It was pushed before the
+//           handoff and the unwinder that claimed it has already appended its
+//           frames after it; all that is left is to unwind past it. Asking
+//           again would hand the same PC to the same unwinder forever.
+//
+// WHY A CONSTANT AND NOT A FLAG IN walk_ctx. Measured, on this kernel with
+// this walker: reading the "am I resuming" bit out of walk_ctx inside the
+// bpf_loop callback took perf_dwarf from 187,342 processed instructions to
+// 519,965 — a 2.8x tax on every sample to describe a condition that holds for
+// at most one frame of one sample. The bit makes the two paths differ in
+// n_pcs, so the verifier explores the entire body twice from the top and
+// keeps both states alive to the end. As a constant, each expansion has one
+// path: the loop callback below never carries the resume case at all, and the
+// resume case is one straight-line inlining in the driver's resume program.
+static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
 
-
-    // ----- A live Python segment spends this iteration.
-    //
-    // The chain has no loop of its own: this one is the iteration engine for
-    // both frame kinds, exactly as OTel's unwinder switches between "step a
-    // Python frame" and "step a native frame" inside one loop. A second
-    // nested bpf_loop is what stopped all three programs loading on 6.19.4+
-    // (see py_step_one), and a per-segment bound is what used to truncate
-    // deep Python stacks; neither exists now.
-    //
-    // The native frame this segment hangs from was pushed on the iteration
-    // that armed the cursor, and ctx->pc has NOT been advanced since -- so
-    // when the segment ends we fall through and continue the native walk for
-    // the frame we are still standing on, in this same iteration. `resumed`
-    // records that, because the interpreter arm below must not re-fire for a
-    // frame whose segment has just finished: re-arming there would walk the
-    // OUTER segment at the INNER one's native position, which is the
-    // duplicated-frames failure the entry-frame stop exists to prevent.
-    bool resumed = false;
-    if (python_walk_enabled && ctx->py_state == PY_CHAIN_WALKING) {
-        if (py_step_one(ctx)) return 1;
-        if (ctx->py_state == PY_CHAIN_WALKING) return 0;
-        resumed = true;
-    } else if (frame_push_native(ctx, ctx->pc)) {
-        return 1;
-    }
+    if (lead && frame_push_native(ctx, ctx->pc)) goto stop;
 
     // Per-frame classification. Miss = treat as FP_SAFE (spec: FALLBACK
     // behaves the same as FP_SAFE at runtime).
     struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
     __u8 mode = MODE_FP_SAFE;
     if (m.found) {
-        // ----- The interpreter arm.
-        //
-        // The switch is a text-range test on the frame we are already
-        // standing on: if this PC is inside the eval loop of a libpython we
-        // know, the native frame just pushed is _PyEval_EvalFrameDefault and
-        // the Python frames it is running live in the interpreter's own
-        // chain, not on this stack. Keyed by table_id, which mapping_for_pc
-        // has already computed, so a non-Python process pays one hash on a
-        // value it holds and nothing else.
-        //
-        // It lives INSIDE walk_step rather than beside it so perf_dwarf,
-        // offcpu_dwarf and gpu_usdt all inherit it from the bpf_loop they
-        // already share -- the CUDA launch probe gets Python frames with no
-        // second integration.
-        //
-        // A Python failure never stops the native walk: py_begin_chain
-        // returns void and counts, and control falls through to the
-        // classification below exactly as it did before.
-        struct py_eval_range *er = python_walk_enabled
-                                       ? bpf_map_lookup_elem(&py_eval_ranges, &m.table_id)
-                                       : NULL;
-        // ctx->py_state == PY_CHAIN_DONE means this sample is finished with
-        // Python -- the chain ran out, or something refused and was counted.
-        // Skipping the py_procs hash in that case is the same economy
-        // py_push_frames applies to the TSS lookup: a deep native stack can
-        // land on the eval loop many times per sample, and none of those
-        // repeats can learn anything new.
-        if (er && !resumed && ctx->py_state != PY_CHAIN_DONE &&
-            m.rel_pc >= er->lo && m.rel_pc < er->hi) {
-            __u32 py_pid = ctx->pid;
-            struct py_proc_info *pi = bpf_map_lookup_elem(&py_procs, &py_pid);
-            if (pi && pi->enabled) {
-                // Arms the cursor and returns; the frames themselves are
-                // pushed by the following iterations of this loop.
-                py_begin_chain(ctx, pi);
-                if (ctx->py_state == PY_CHAIN_WALKING) return 0;
-            } else {
-                // An eval-loop PC in a process userspace never validated (or
-                // refused: wrong version, free-threaded build, unreadable
-                // offsets). Named rather than silent -- this is the counter
-                // that separates "no Python frames because attach refused"
-                // from "no Python frames because the walk failed".
-                //
-                // Counted on the FIRST such frame only, then the sample is
-                // marked done. Without the gate this bumps once per
-                // eval-loop native frame per sample, forever, for every
-                // refused interpreter on the box -- which makes the number
-                // scale with stack depth rather than with occurrences and
-                // breaks the unit rule the whole counter set is read under
-                // (see PY_CNT_* in python_walk.h: slot 0 counts frames,
-                // every other slot counts samples).
-                if (ctx->py_state == PY_CHAIN_UNSTARTED) {
-                    py_count(PY_CNT_NO_PROC_INFO);
-                }
-                ctx->py_state = PY_CHAIN_DONE;
-            }
-        }
-
         // ----- The handoff.
         //
         // walk_step DECIDES; the driver dispatches. A bpf_tail_call from
@@ -1065,20 +734,10 @@ static long walk_step(__u32 idx, void *arg) {
         // the frames that unwinder appends land immediately after it -- the
         // ordering ruling T7-R7 asks for, kept in the kernel, with no anchor
         // and no userspace splice.
-        if (interp_enabled) {
-            // Recorded, not acted on: this iteration still finishes its own
-            // unwind step so the cursor advances past the claimed frame. The
-            // stop happens at the top of the next iteration.
-            __u32 u = next_unwinder(m.table_id, m.rel_pc);
+        if (interp_enabled && lead) {
+            __u32 u = next_unwinder(m.table_id, m.rel_pc, ctx->interp_done);
             if (u != UNWINDER_NATIVE) {
-                // Stop AT this frame, already pushed, cursor unchanged. The
-                // driver hands off; whatever that unwinder appends lands
-                // immediately after this frame with nothing in between --
-                // ruling T7-R7, kept in the kernel rather than reconstructed
-                // in userspace -- and the resumed walk unwinds past it
-                // without pushing it again.
                 ctx->pending_unwinder = u;
-                ctx->skip_push = 1;
                 return 1;
             }
         }
@@ -1104,7 +763,7 @@ static long walk_step(__u32 idx, void *arg) {
         if (!ep) {
             ctx->rec->hdr.walker_flags |= WALKER_FLAG_CFI_MISS;
             emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
-            return 1;
+            goto stop;
         }
         // Copy out of the inner map immediately — the pointer's lifetime
         // is bounded by the next BPF helper call. Defensive-copying keeps
@@ -1134,27 +793,27 @@ static long walk_step(__u32 idx, void *arg) {
                 // that may well be a failure, which is precisely the defect
                 // issue #44 exists to remove. Flag it.
                 ctx->rec->hdr.walker_flags |= WALKER_FLAG_ROOT_DISAGREEMENT;
-                return 1;
+                goto stop;
             }
             if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
-                                    (void *)(cfa + (__s64)e.ra_offset)) != 0) return 1;
+                                    (void *)(cfa + (__s64)e.ra_offset)) != 0) goto stop;
         } else if (e.ra_type == RA_TYPE_UNDEFINED) {
             // The CFI says this frame has no return address: it is the
             // outermost frame of the chain (glibc marks _start and thread
             // entry points this way). The walk is COMPLETE, not stuck.
             ctx->rec->hdr.walker_flags |= WALKER_FLAG_RA_UNDEFINED;
-            return 1;
+            goto stop;
         } else {
             // SAME_VALUE (leaf on arm64) or REGISTER — the return address
             // lives in a register we do not track, so we cannot proceed
             // even though a caller exists. A genuine stop, left unflagged.
-            return 1;
+            goto stop;
         }
 
         __u64 new_fp = ctx->fp;
         if (e.fp_type == FP_TYPE_OFFSET_CFA) {
             if (bpf_probe_read_user(&new_fp, sizeof(new_fp),
-                                    (void *)(cfa + (__s64)e.fp_offset)) != 0) return 1;
+                                    (void *)(cfa + (__s64)e.fp_offset)) != 0) goto stop;
         } else if (e.fp_type == FP_TYPE_SAME_VALUE) {
             // The callee-saved register was never touched in this frame, so
             // the caller's value is still live in it: new_fp unchanged.
@@ -1217,7 +876,7 @@ static long walk_step(__u32 idx, void *arg) {
             // FINISHED, it did not fail, and bit 0 already says so. Falling
             // into the WALKER_FLAG_FP_EXHAUSTED arm below would relabel
             // every complete frame-pointer walk a failure.
-            return 1;
+            goto stop;
         }
         // No caller frame pointer to follow, so this walk stops HERE — and
         // this is a FAILURE, not an end of chain. Nothing in the unwind
@@ -1244,11 +903,11 @@ static long walk_step(__u32 idx, void *arg) {
         // a bare `return 1`. The distinction it now carries is which KIND of
         // stop it was, and this one belongs with the failures.
         ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_EXHAUSTED;
-        return 1;
+        goto stop;
     }
     __u64 saved_fp = 0, ret_addr = 0;
-    if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) return 1;
-    if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) return 1;
+    if (bpf_probe_read_user(&saved_fp, sizeof(saved_fp), (void *)ctx->fp) != 0) goto stop;
+    if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr), (void *)(ctx->fp + 8)) != 0) goto stop;
     if (saved_fp <= ctx->fp) {
         // The saved-FP slot does not name a caller frame. Two causes, and
         // they are reported apart because they mean different things:
@@ -1270,7 +929,7 @@ static long walk_step(__u32 idx, void *arg) {
         // produced — `_start` on a main-thread stack (issue #45).
         if (saved_fp == 0) {
             ctx->rec->hdr.walker_flags |= WALKER_FLAG_FP_TERMINATED;
-            if (ret_addr == 0) return 1;
+            if (ret_addr == 0) goto stop;
             // Hand the caller's PC to the next iteration rather than
             // appending it here: the loop head records it and then lets the
             // unwind tables classify it, which is the only way the walk can
@@ -1296,7 +955,7 @@ static long walk_step(__u32 idx, void *arg) {
         // caller that stale byte can read back as FRAME_TAG_PYTHON — a
         // native frame silently decoding as half of a Python pair.
         if (ret_addr != 0) frame_push_native(ctx, ret_addr);
-        return 1;
+        goto stop;
     }
 
     // Caller's resume SP: after a standard prologue (push FP; move FP=SP
@@ -1307,6 +966,162 @@ static long walk_step(__u32 idx, void *arg) {
     ctx->pc = ret_addr;
     ctx->fp = saved_fp;
     return 0;
+
+stop:
+    return 1;
 }
+
+// walk_step is the bpf_loop callback: one leading frame per iteration.
+//
+// NOTHING RESUME-SHAPED MAY BE READ IN HERE. Measured on this kernel: adding a
+// single "am I resuming" bit read out of the callback context took perf_dwarf
+// from 187,918 processed instructions to 519,965, and a stop-only bit read
+// here took it to 374,355. A bit read inside a bpf_loop callback is paid at
+// every state of the walk, which is why the whole resume protocol lives
+// outside the loop -- in a program of its own (INTERP_DEFINE_PROGRAMS) and in
+// one compile-time-constant branch in unwind_walk.
+static long walk_step(__u32 idx, void *arg) {
+    return unwind_frame((struct walk_ctx *)arg, true);
+}
+
+// ----- Driving the walk, and handing off in the middle of it.
+//
+// INTERP_TAIL_CALL_BUDGET bounds the native<->interpreter round trips in one
+// sample, and the number is arithmetic against the kernel's own ceiling
+// rather than a taste.
+//
+// ONE ROUND TRIP IS THREE TAIL CALLS: out to the unwinder, from there to the
+// driver's resume-step program, and from there to its resume-walk program.
+// The kernel's MAX_TAIL_CALL_CNT is 33 and is enforced silently -- the 34th
+// bpf_tail_call simply returns, which here would end the walk mid-stack with
+// the record still holding everything collected so far. That is a truncated
+// sample rather than a wrong one, but it is a truncation nothing counts, so
+// the budget is set to stop first, where the stop is deliberate.
+//
+// 10 round trips is 30 tail calls, three under the ceiling. A stack that
+// crosses an interpreter's text more than ten times in one sample is deeper
+// than MAX_FRAMES can hold anyway.
+#define INTERP_TAIL_CALL_BUDGET 10
+
+// unwind_walk_begin initialises the persisted state for a FRESH sample. Every
+// driver calls it once, before the first unwind_walk; the resume program does
+// not, which is the whole difference between the two entry points.
+static __always_inline void unwind_walk_begin(struct walk_persist *st,
+                                              struct sample_record *rec,
+                                              __u32 pid, __u32 tid,
+                                              __u64 pc, __u64 fp, __u64 sp) {
+    st->pc = pc;
+    st->fp = fp;
+    st->sp = sp;
+    st->pid = pid;
+    st->tid = tid;
+    st->n_pcs = 0;
+    st->pending_unwinder = UNWINDER_NATIVE;
+    st->interp_done = 0;
+    st->tail_calls = 0;
+    st->stopped = 0;
+    // The opaque save area belongs to whichever unwinder claims a frame in
+    // this sample; zeroing it here is how a module knows it is starting a
+    // fresh chain rather than resuming the previous sample's. Four stores in
+    // the driver body, which the anchor measurement (rd-report.md) showed
+    // costs the verifier nothing.
+    st->interp_scratch[0] = 0;
+    st->interp_scratch[1] = 0;
+    st->interp_scratch[2] = 0;
+    st->interp_scratch[3] = 0;
+    rec->hdr.walker_flags = 0;
+}
+
+// unwind_walk runs the native walk to its end, dispatching to interpreter
+// unwinders as it goes, and returns the number of pcs[] slots written.
+//
+// IT MAY NOT RETURN AT ALL. When walk_step stops on a frame another unwinder
+// claims, this tail-calls that unwinder -- which replaces the running program.
+// The module appends its frames and tail-calls the driver's resume program
+// (INTERP_DEFINE_PROGRAMS), which calls this again and finishes the sample.
+// A driver therefore may not hold anything that must be released -- a reserved
+// ringbuf record above all -- across this call.
+//
+// The failure path is deliberately quiet: if nothing is installed in the
+// requested slot, or the kernel's tail-call limit is reached, bpf_tail_call
+// returns and the walk ends here with the record as far as it got. That is a
+// SHORT sample, not a wrong one; the frames already in it are in the right
+// order and the missing ones are simply absent.
+static __always_inline __u32 unwind_walk(void *ctx, struct walk_persist *st,
+                                         struct sample_record *rec, bool resumed) {
+    struct walk_ctx w;
+    walk_load(&w, st, rec);
+
+    // `resumed` is a compile-time constant at both call sites, so the entry
+    // program does not carry this test at all. On the resume side, stopped
+    // means the one step the resume-step program took could not unwind past
+    // the frame it was given: the cursor never moved, and running the loop
+    // would push that frame a second time.
+    if (!resumed || !st->stopped) {
+        // Walk at most MAX_FRAMES frames. walk_step breaks early on read
+        // failure, on a natural terminator (saved_fp == 0, saved_fp <= fp), or
+        // on a frame another unwinder claims.
+        bpf_loop(MAX_FRAMES, walk_step, &w, 0);
+
+        if (interp_enabled && w.pending_unwinder != UNWINDER_NATIVE &&
+            st->tail_calls < INTERP_TAIL_CALL_BUDGET) {
+            __u32 slot = w.pending_unwinder;
+            // Cleared before the save so the module and the resumed walk both
+            // see a walk with no pending handoff; walk_step sets it again if
+            // the resumed walk lands on another claimed frame.
+            w.pending_unwinder = UNWINDER_NATIVE;
+            walk_save(st, &w);
+            st->tail_calls += 1;
+            bpf_tail_call(ctx, &interp_progs, INTERP_SLOT_UNWINDER(slot));
+            // Reached only when the tail call did not happen.
+        }
+    }
+
+    walk_save(st, &w);
+    return w.n_pcs > MAX_FRAMES ? MAX_FRAMES : w.n_pcs;
+}
+
+// INTERP_DEFINE_PROGRAMS is the ONE interpreter-shaped line in a driver, and
+// it names no interpreter.
+//
+// It defines the TWO programs an interpreter module hands control back
+// through, both with the driver's own section string because every entry of a
+// prog array must share the type of the program that tail-calls into it.
+// `walk_fn` is the driver's own walk-and-emit function -- the same one its
+// entry program calls once the state is initialised -- because resuming a
+// sample means finishing it, and only the driver knows how it emits.
+//
+// WHY TWO AND NOT ONE. A resumed walk begins on the frame the handoff stopped
+// at: already pushed, already served, and still needing to be unwound past.
+// That one step is a whole frame's worth of code including the mapping scan's
+// own bpf_loop, and putting it in the same program as the main walk gives that
+// program two bpf_loop call sites -- which the verifier refuses outright, at
+// the 1,000,001 ceiling, measured. Sequential sites are no better than nested
+// ones here. So the step gets a program of its own, and tail-calls the walk.
+//
+// The cost is one more tail call per handoff, against a budget of
+// INTERP_TAIL_CALL_BUDGET. If the step cannot unwind past its frame the walk
+// is over -- the cursor never moved, and re-entering the loop would push the
+// same frame again -- so it says so through walk_persist.stopped, which
+// walk_step reads at the top and nowhere else.
+//
+// A driver expands this once, at file scope, after including unwind_common.h.
+#define INTERP_DEFINE_PROGRAMS(sec, walk_fn)                                   \
+    SEC(sec) int interp_resume_step(void *ctx) {                                \
+        struct walk_persist *st = walk_state_get();                             \
+        struct sample_record *rec = walk_record_get();                          \
+        if (st && rec) {                                                        \
+            struct walk_ctx w;                                                  \
+            walk_load(&w, st, rec);                                             \
+            if (unwind_frame(&w, false)) st->stopped = 1;                       \
+            walk_save(st, &w);                                                  \
+        }                                                                       \
+        bpf_tail_call(ctx, &interp_progs, INTERP_SLOT_RESUME_WALK);             \
+        return 0;                                                               \
+    }                                                                           \
+    SEC(sec) int interp_resume_walk(void *ctx) {                                \
+        walk_fn(ctx, true);                                                     \
+        return 0;                                                               \
+    }
 
 #endif // PERF_AGENT_UNWIND_COMMON_H

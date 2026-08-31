@@ -936,14 +936,19 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	t.Logf("prediction: reached-root == dwarf, fp-exhausted == abandoned == 0")
 }
 
-// TestFramePushRefusalRaisesAFlag pins that both frame_push_native (at
-// MAX_FRAMES) and frame_push_python (fewer than two slots left) raise
+// TestFramePushRefusalRaisesAFlag pins that both record_push_native (at
+// MAX_FRAMES) and record_push_interp (fewer than two slots left) raise
 // WALKER_FLAG_FRAME_PUSH_REFUSED on their refusal path, before returning 1
 // — issue #83's constraint that a dropped frame is never silent. Checked by
 // source inspection, like TestWalkStepStepsPastTheFramePointerRoot below,
 // because the refusal itself is only reachable inside the BPF verifier.
+//
+// Both pushers live in bpf/unwind_record.h now rather than in the walker's
+// own header, because a language module -- compiled into its own object,
+// sharing only that file -- appends to the same record and must not carry a
+// second copy of a bounds check.
 func TestFramePushRefusalRaisesAFlag(t *testing.T) {
-	src, err := os.ReadFile("../bpf/unwind_common.h")
+	src, err := os.ReadFile("../bpf/unwind_record.h")
 	require.NoError(t, err)
 	body := string(src)
 
@@ -967,12 +972,12 @@ func TestFramePushRefusalRaisesAFlag(t *testing.T) {
 			"%s must raise WALKER_FLAG_FRAME_PUSH_REFUSED before returning 1, not after", fn)
 	}
 
-	t.Run("frame_push_native", func(t *testing.T) { checkRefusalRaisesFlag(t, "frame_push_native") })
-	t.Run("frame_push_python", func(t *testing.T) { checkRefusalRaisesFlag(t, "frame_push_python") })
+	t.Run("record_push_native", func(t *testing.T) { checkRefusalRaisesFlag(t, "record_push_native") })
+	t.Run("record_push_interp", func(t *testing.T) { checkRefusalRaisesFlag(t, "record_push_interp") })
 }
 
 // A bounds check that adds to the value it is checking is not a bounds
-// check. frame_push_python used to guard its two-slot write with
+// check. The two-slot pusher used to guard its write with
 // `if (i + 2 > MAX_FRAMES)`, where i is __u32: the addition wraps, so at
 // i == 0xFFFFFFFE the expression is 0, the guard passes, and both stores run
 // with a wild index. The verifier refused to derive i <= 125 from
@@ -987,7 +992,7 @@ func TestFramePushRefusalRaisesAFlag(t *testing.T) {
 // Source inspection, like its neighbours: the refusal path is only reachable
 // inside the verifier, and no test on this machine can load a program.
 func TestTheFramePushBoundsDoNoArithmeticOnTheCheckedValue(t *testing.T) {
-	src, err := os.ReadFile("../bpf/unwind_common.h")
+	src, err := os.ReadFile("../bpf/unwind_record.h")
 	require.NoError(t, err)
 	body := string(src)
 
@@ -1007,7 +1012,7 @@ func TestTheFramePushBoundsDoNoArithmeticOnTheCheckedValue(t *testing.T) {
 		return fnBody[open+len("if (") : open+close]
 	}
 
-	for _, fn := range []string{"frame_push_native", "frame_push_python"} {
+	for _, fn := range []string{"record_push_native", "record_push_interp"} {
 		t.Run(fn, func(t *testing.T) {
 			guard := guardOf(t, fn)
 			require.Contains(t, guard, "MAX_FRAMES",
@@ -1048,8 +1053,8 @@ func TestWalkStepStepsPastTheFramePointerRoot(t *testing.T) {
 	src, err := os.ReadFile("../bpf/unwind_common.h")
 	require.NoError(t, err)
 	body := string(src)
-	step := body[strings.Index(body, "static long walk_step("):]
-	require.NotEmpty(t, step, "walk_step not found in the shared header")
+	step := body[strings.Index(body, "static __always_inline long unwind_frame("):]
+	require.NotEmpty(t, step, "unwind_frame not found in the shared header")
 
 	guard := strings.Index(step, "if (saved_fp <= ctx->fp) {")
 	require.Positive(t, guard,

@@ -54,11 +54,11 @@ type Sample struct {
 	// PCs holds the walk's slot words, leaf first — NOT a flat list of
 	// instruction pointers. A Python frame occupies two consecutive slots
 	// (issue #83), so Tags must be consulted before any of these reaches a
-	// symbolizer or a perf.data user-IP stream. splitFrameSlots does that.
+	// symbolizer or a perf.data user-IP stream. interp.SplitSlots does that.
 	PCs []uint64
 	// Tags is one FRAME_TAG_* byte per PCs slot, same length as PCs. Empty
 	// only for a record short enough that the tags array was truncated,
-	// which splitFrameSlots reads as all-native.
+	// which interp.SplitSlots reads as all-native.
 	Tags []uint8
 }
 
@@ -119,7 +119,7 @@ func parseSample(buf []byte) (Sample, error) {
 
 	// Tags, clamped the same way the PC array is: a buffer truncated before
 	// or inside the tags region yields fewer tags than PCs, and
-	// splitFrameSlots treats a missing tag as native — the pre-#83 reading,
+	// interp.SplitSlots treats a missing tag as native — the pre-#83 reading,
 	// which is the safe direction. It can only under-report Python frames,
 	// never invent one.
 	tagsOff := SampleHeaderBytes + MaxFrames*8

@@ -11,6 +11,7 @@ import (
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 // mmapEventSourceCloser is the local-to-dwarfagent interface that both
@@ -143,8 +144,8 @@ func aggregateCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	// Decode the tagged slots ONCE, here, where every sample passes exactly
 	// once: the counters below are per-sample, and both the perf.data export
 	// and the stashed stack want the same decoding (issue #83).
-	slots, truncatedPair := splitFrameSlots(sample.PCs, sample.Tags)
-	countPythonSlots(slots, truncatedPair)
+	slots, truncatedPair := interp.SplitSlots(sample.PCs, sample.Tags)
+	countInterpSlots(slots, truncatedPair)
 
 	key := sampleKey{pid: sample.PID, hash: hashStack(sample.PCs, sample.Tags)}
 	s.mu.Lock()
@@ -162,7 +163,7 @@ func aggregateCPUSample(s *session, sample Sample, kernelIPs []uint64) {
 	// the native subset; the Python frames are in the pprof output, which
 	// does. Issue #83.
 	if s.perfData != nil {
-		if ips := nativeIPs(slots); len(ips) > 0 {
+		if ips := interp.NativeIPs(slots); len(ips) > 0 {
 			s.perfData.AddSample(perfdata.SampleRecord{
 				IP:        ips[0],
 				Pid:       sample.PID,

@@ -5,6 +5,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
@@ -47,7 +48,7 @@ func LoadOffCPUDwarf(systemWide, kernelStacks bool) (*OffCPUDwarf, error) {
 		return spec, nil
 	}
 	p := &OffCPUDwarf{}
-	if err := loadWithPythonGate("offcpu_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
+	if err := loadWithInterpGate("offcpu_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
 		return spec.LoadAndAssign(&p.objs, nil)
 	}); err != nil {
 		return nil, fmt.Errorf("load and assign: %w", err)
@@ -88,6 +89,25 @@ func (p *OffCPUDwarf) AddPID(pid uint32) error {
 // Close releases all BPF objects.
 func (p *OffCPUDwarf) Close() error {
 	return p.objs.Close()
+}
+
+var _ interp.Driver = (*OffCPUDwarf)(nil)
+
+// ----- The interpreter seam (unwind/interp.Driver). See PerfDwarf's copy for
+// what each of these is; the only difference here is the flavour, because a
+// tp_btf program can only tail-call another tp_btf program attached to the
+// SAME tracepoint.
+func (p *OffCPUDwarf) Flavour() interp.Flavour          { return interp.FlavourSchedSwitch }
+func (p *OffCPUDwarf) WalkerScratchMap() *ebpf.Map      { return p.objs.WalkerScratch }
+func (p *OffCPUDwarf) WalkStatesMap() *ebpf.Map         { return p.objs.WalkStates }
+func (p *OffCPUDwarf) InterpProgsMap() *ebpf.Map        { return p.objs.InterpProgs }
+func (p *OffCPUDwarf) HandoffRangesMap() *ebpf.Map      { return p.objs.HandoffRanges }
+func (p *OffCPUDwarf) ResumeStepProgram() *ebpf.Program { return p.objs.InterpResumeStep }
+func (p *OffCPUDwarf) ResumeWalkProgram() *ebpf.Program { return p.objs.InterpResumeWalk }
+
+func (p *OffCPUDwarf) InterpEnabled() bool {
+	_, enabled, _ := InterpState()
+	return enabled
 }
 
 // CFIRulesMap returns the cfi_rules HASH_OF_MAPS outer map.

@@ -41,6 +41,16 @@ type gpuusdtClassification struct {
 	Pad        [3]uint8
 }
 
+type gpuusdtGpuPending struct {
+	_     structs.HostLayout
+	Ptr   uint64
+	Seq   uint64
+	Count uint32
+	Kind  uint32
+	Bytes uint32
+	Pad   uint32
+}
+
 type gpuusdtGpuStack struct {
 	_           structs.HostLayout
 	N_pcs       uint32
@@ -73,43 +83,6 @@ type gpuusdtPidMapping struct {
 	TableId  uint64
 }
 
-type gpuusdtPyEvalRange struct {
-	_  structs.HostLayout
-	Lo uint64
-	Hi uint64
-}
-
-type gpuusdtPyFrameWindow struct {
-	_ structs.HostLayout
-	B [96]uint8
-}
-
-type gpuusdtPyProcInfo struct {
-	_                        structs.HostLayout
-	NoneAddr                 uint64
-	TssKey                   uint32
-	PthreadSpecific1stblock  uint32
-	PthreadKeyDataSize       uint32
-	PthreadKeyDataOff        uint32
-	PthreadSize              uint32
-	FramePrevious            uint16
-	FrameExecutable          uint16
-	FrameInstrPtr            uint16
-	FrameOwner               uint16
-	ThreadstateFrame         uint16
-	CodeArgcount             uint16
-	CodeKwonlyargcount       uint16
-	CodeFlags                uint16
-	CodeFirstlineno          uint16
-	FrameOwnerMax            uint8
-	FrameOwnerCstack         uint8
-	FrameOwnerBoundary       uint8
-	FrameExecutableTagged    uint8
-	ThreadstateFrameIndirect uint8
-	Enabled                  uint8
-	Pad                      [4]uint8
-}
-
 type gpuusdtSampleRecord struct {
 	_   structs.HostLayout
 	Hdr struct {
@@ -135,16 +108,16 @@ type gpuusdtWalkPersist struct {
 	Pc              uint64
 	Fp              uint64
 	Sp              uint64
-	PyFrame         uint64
-	PyIter          uint64
+	InterpScratch   [4]uint64
 	Pid             uint32
+	Tid             uint32
 	N_pcs           uint32
 	PendingUnwinder uint32
+	InterpDone      uint32
+	Stopped         uint8
+	Pad2            [3]uint8
 	TailCalls       uint32
-	PyState         uint8
-	SkipPush        uint8
-	Resuming        uint8
-	Pad             [5]uint8
+	Pad             uint32
 }
 
 // loadGpuusdt returns the embedded CollectionSpec for gpuusdt.
@@ -189,7 +162,9 @@ type gpuusdtSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtProgramSpecs struct {
-	GpuUsdtBatch *ebpf.ProgramSpec `ebpf:"gpu_usdt_batch"`
+	GpuUsdtBatch     *ebpf.ProgramSpec `ebpf:"gpu_usdt_batch"`
+	InterpResumeStep *ebpf.ProgramSpec `ebpf:"interp_resume_step"`
+	InterpResumeWalk *ebpf.ProgramSpec `ebpf:"interp_resume_walk"`
 }
 
 // gpuusdtMapSpecs contains maps before they are loaded into the kernel.
@@ -204,16 +179,14 @@ type gpuusdtMapSpecs struct {
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
 	Dropped                  *ebpf.MapSpec `ebpf:"dropped"`
 	Events                   *ebpf.MapSpec `ebpf:"events"`
+	GpuPendingBatch          *ebpf.MapSpec `ebpf:"gpu_pending_batch"`
 	GpuStackScratch          *ebpf.MapSpec `ebpf:"gpu_stack_scratch"`
 	GpuStacks                *ebpf.MapSpec `ebpf:"gpu_stacks"`
 	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
+	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
-	PyEvalRanges             *ebpf.MapSpec `ebpf:"py_eval_ranges"`
-	PyFrameScratch           *ebpf.MapSpec `ebpf:"py_frame_scratch"`
-	PyProcs                  *ebpf.MapSpec `ebpf:"py_procs"`
-	PyWalkCounters           *ebpf.MapSpec `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
@@ -229,7 +202,6 @@ type gpuusdtVariableSpecs struct {
 	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
-	PythonWalkEnabled       *ebpf.VariableSpec `ebpf:"python_walk_enabled"`
 }
 
 // gpuusdtObjects contains all objects after they have been loaded into the kernel.
@@ -260,16 +232,14 @@ type gpuusdtMaps struct {
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
 	Dropped                  *ebpf.Map `ebpf:"dropped"`
 	Events                   *ebpf.Map `ebpf:"events"`
+	GpuPendingBatch          *ebpf.Map `ebpf:"gpu_pending_batch"`
 	GpuStackScratch          *ebpf.Map `ebpf:"gpu_stack_scratch"`
 	GpuStacks                *ebpf.Map `ebpf:"gpu_stacks"`
 	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
+	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
-	PyEvalRanges             *ebpf.Map `ebpf:"py_eval_ranges"`
-	PyFrameScratch           *ebpf.Map `ebpf:"py_frame_scratch"`
-	PyProcs                  *ebpf.Map `ebpf:"py_procs"`
-	PyWalkCounters           *ebpf.Map `ebpf:"py_walk_counters"`
 	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
 	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
 	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
@@ -287,16 +257,14 @@ func (m *gpuusdtMaps) Close() error {
 		m.CfiRules,
 		m.Dropped,
 		m.Events,
+		m.GpuPendingBatch,
 		m.GpuStackScratch,
 		m.GpuStacks,
 		m.HandoffRanges,
+		m.InterpProgs,
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,
-		m.PyEvalRanges,
-		m.PyFrameScratch,
-		m.PyProcs,
-		m.PyWalkCounters,
 		m.StackIdSeq,
 		m.StacksMissing,
 		m.WalkErrors,
@@ -313,19 +281,22 @@ type gpuusdtVariables struct {
 	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
-	PythonWalkEnabled       *ebpf.Variable `ebpf:"python_walk_enabled"`
 }
 
 // gpuusdtPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtPrograms struct {
-	GpuUsdtBatch *ebpf.Program `ebpf:"gpu_usdt_batch"`
+	GpuUsdtBatch     *ebpf.Program `ebpf:"gpu_usdt_batch"`
+	InterpResumeStep *ebpf.Program `ebpf:"interp_resume_step"`
+	InterpResumeWalk *ebpf.Program `ebpf:"interp_resume_walk"`
 }
 
 func (p *gpuusdtPrograms) Close() error {
 	return _GpuusdtClose(
 		p.GpuUsdtBatch,
+		p.InterpResumeStep,
+		p.InterpResumeWalk,
 	)
 }
 

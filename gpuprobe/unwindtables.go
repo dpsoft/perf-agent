@@ -6,8 +6,10 @@ import (
 	"log"
 	"sync"
 
-	"github.com/dpsoft/perf-agent/pyunwind"
+	"github.com/cilium/ebpf"
+
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 // The walker needs tables before it can walk, and nothing else installs them.
@@ -61,13 +63,16 @@ type pidRegistrar interface {
 // unwind/ehcompile, over this program's own copies of the walker's maps.
 type ehmapsRegistrar struct {
 	tracker *ehmaps.PIDTracker
-	// python is gpu_usdt's copy of py_procs and py_eval_ranges. The
-	// interpreter arm lives in walk_step, which this program shares with
-	// perf_dwarf and offcpu_dwarf, so a CUDA launch made from Python
-	// carries Python frames here for free -- but only once these two maps
-	// are populated for the producing process. Nothing else populates them
-	// on this path.
-	python *pyunwind.BPFMaps
+	// interp are the language unwinders attached to gpu_usdt's own walk. A
+	// CUDA launch made from Python carries Python frames here because the
+	// handoff lives in the walk this program shares with perf_dwarf and
+	// offcpu_dwarf -- but only once a module has claimed the producing
+	// process. Nothing else populates it on this path.
+	//
+	// Nil is usable: every method on a nil *interp.Set is a no-op, so a build
+	// with no modules registered, or a kernel that refused the handoff, needs
+	// no branch here.
+	interp *interp.Set
 }
 
 // newEhmapsRegistrar wires a registrar around a loaded gpu_usdt object. The
@@ -80,77 +85,93 @@ func newEhmapsRegistrar(objs *gpuusdtObjects) *ehmapsRegistrar {
 		objs.CfiRules, objs.CfiLengths,
 		objs.CfiClassification, objs.CfiClassificationLengths,
 	)
+	set, err := interp.Attach(&gpuDriver{objs: objs})
+	if err != nil {
+		// One language's frames, not the GPU capture. Logged and dropped.
+		log.Printf("gpuprobe: interpreter frames: %v", err)
+	}
 	return &ehmapsRegistrar{
 		tracker: ehmaps.NewPIDTracker(store, objs.PidMappings, objs.PidMappingLengths),
-		python:  &pyunwind.BPFMaps{PyProcs: objs.PyProcs, EvalRanges: objs.PyEvalRanges},
+		interp:  set,
 	}
 }
+
+// gpuDriver adapts the loaded gpu_usdt object to unwind/interp.Driver.
+//
+// Seven accessors, every one of them a map or a program declared in
+// bpf/unwind_record.h or bpf/unwind_common.h. None names a language, and none
+// changes when one is added.
+type gpuDriver struct{ objs *gpuusdtObjects }
+
+var _ interp.Driver = (*gpuDriver)(nil)
+
+// Flavour is uprobe.multi because that is what gpu_usdt_batch is, and every
+// entry of a prog array must share the program type of whatever tail-calls
+// into it.
+func (d *gpuDriver) Flavour() interp.Flavour          { return interp.FlavourUprobeMulti }
+func (d *gpuDriver) WalkerScratchMap() *ebpf.Map      { return d.objs.WalkerScratch }
+func (d *gpuDriver) WalkStatesMap() *ebpf.Map         { return d.objs.WalkStates }
+func (d *gpuDriver) InterpProgsMap() *ebpf.Map        { return d.objs.InterpProgs }
+func (d *gpuDriver) HandoffRangesMap() *ebpf.Map      { return d.objs.HandoffRanges }
+func (d *gpuDriver) ResumeStepProgram() *ebpf.Program { return d.objs.InterpResumeStep }
+func (d *gpuDriver) ResumeWalkProgram() *ebpf.Program { return d.objs.InterpResumeWalk }
+
+// InterpEnabled is true unconditionally here, unlike the DWARF profilers'.
+// gpu_usdt is loaded once, without the verifier-rejection retry those two use
+// (profile.loadWithInterpGate): the GPU path has no --unwind auto to fall back
+// to, so a program the verifier refuses is a hard failure that surfaces at
+// load rather than a degraded mode.
+func (d *gpuDriver) InterpEnabled() bool { return true }
 
 func (r *ehmapsRegistrar) Register(pid uint32) (int, error) {
 	n, err := ehmaps.AttachAllMappings(r.tracker, pid)
 	if err != nil {
 		return n, err
 	}
-	// CPython frames at the launch site. This is the case the whole design
-	// exists for -- a torch/numpy program whose cudaLaunchKernel is reached
-	// from Python -- and it gets them from the same walk_step arm the CPU
-	// profilers use, so all that is needed here is the per-process record
-	// and the eval range.
+	// Interpreter frames at the launch site. This is the case the whole
+	// design exists for -- a torch/numpy program whose cudaLaunchKernel is
+	// reached from Python -- and it gets them from the same handoff the CPU
+	// profilers use, so all that is needed here is to offer the process to
+	// every registered module.
 	//
-	// AFTER AttachAllMappings, never before: the eval range is keyed by
+	// AFTER AttachAllMappings, never before: a handoff range is keyed by
 	// table_id, and a table_id only resolves to a PC once that binary has a
 	// pid_mappings row.
 	//
 	// Best-effort and never fatal to CFI registration: a producer whose
 	// interpreter cannot be walked must still get native GPU stacks. Every
-	// outcome is logged, including the refusals, because "not a Python
-	// process" and "Python we decline to walk" are different answers to the
-	// only question a user with no Python frames has.
-	r.enrollPython(pid)
+	// outcome is logged, including the refusals, because "not an interpreted
+	// process" and "an interpreter we decline to walk" are different answers
+	// to the only question a user with no interpreter frames has.
+	r.interp.Enroll(pid, func(format string, args ...any) {
+		log.Printf("gpuprobe: "+format, args...)
+	})
 	return n, nil
 }
 
-// enrollPython installs the CPython walker's per-process state for a GPU
-// producer. Mirrors dwarfagent.enrollPython; both are thin wrappers over
-// pyunwind.EnrollTarget so the two paths cannot drift into enrolling
-// different sets of processes.
-//
-// UNVALIDATED ON HARDWARE. The wiring is symmetric with the DWARF path and
-// the BPF side is literally the same code, but no machine in CI has a GPU,
-// so no test anywhere has yet seen a Python frame on a gpu_launch_sampled
-// stack. See the task report; this needs a run on the 3090.
-func (r *ehmapsRegistrar) enrollPython(pid uint32) {
-	if r.python == nil || r.python.PyProcs == nil || r.python.EvalRanges == nil {
-		return
-	}
-	libPath, found, res, err := pyunwind.EnrollTarget(pid, r.python)
-	switch {
-	case !found && err == nil:
-		return
-	case err != nil:
-		log.Printf("gpuprobe: python frames: pid %d: REFUSED %s: %v", pid, libPath, err)
-	case res.Refused != "":
-		log.Printf("gpuprobe: python frames: pid %d: REFUSED %s (CPython %s): %s",
-			pid, libPath, res.Version, res.Refused)
-	default:
-		log.Printf("gpuprobe: python frames: pid %d: attached %s (CPython %s)", pid, libPath, res.Version)
-	}
+// Close releases the interpreter modules attached to this program. Their BPF
+// objects are separate collections held open for the consumer's lifetime; the
+// programs they installed stay live in interp_progs until that map itself goes
+// with the consumer's own objects, which is what keeps a walk in flight from
+// tail-calling into a closed program.
+func (r *ehmapsRegistrar) Close() error {
+	return r.interp.Close()
 }
 
 func (r *ehmapsRegistrar) Unregister(pid uint32) error {
-	// The Python record goes with the CFI tables. py_procs is keyed by pid
-	// and walk_step trusts any enabled entry, so leaving one behind means a
-	// recycled pid whose new occupant is a different CPython build gets
-	// walked with the previous process's offsets -- plausible frames,
+	// A module's per-PID record goes with the CFI tables. Those records are
+	// keyed by pid and the walk trusts any enabled entry, so leaving one
+	// behind means a recycled pid whose new occupant is a different build
+	// gets walked with the previous process's offsets -- plausible frames,
 	// wrong process. This consumer is long-lived, which is exactly the
 	// setting where pids come round again.
 	//
-	// Done before the CFI detach and reported separately: a failure here
-	// must not swallow the tracker's own error, and it is not a reason to
-	// skip releasing the tables.
-	if err := pyunwind.DetachProcess(pid, r.python); err != nil {
-		log.Printf("gpuprobe: python frames: pid %d: %v", pid, err)
-	}
+	// Done before the CFI detach and reported separately: a failure here must
+	// not swallow the tracker's own error, and it is not a reason to skip
+	// releasing the tables.
+	r.interp.Detach(pid, func(format string, args ...any) {
+		log.Printf("gpuprobe: "+format, args...)
+	})
 	return r.tracker.Detach(pid)
 }
 
@@ -715,4 +736,9 @@ func (r *pidRegistry) close() {
 	close(r.work)
 	r.mu.Unlock()
 	r.wg.Wait()
+	// Optional so the test fake needs no method it has no use for: the only
+	// registrar with anything to release is the real one.
+	if c, ok := r.reg.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
 }

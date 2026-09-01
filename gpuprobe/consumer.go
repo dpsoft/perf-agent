@@ -35,10 +35,10 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/kernelver"
 	"github.com/dpsoft/perf-agent/internal/usdt"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
@@ -274,31 +274,6 @@ func cookieFor(probeName string) uint64 {
 		return kindDropped
 	}
 	return 0
-}
-
-// kernelVersionCode supplies what BPF_PROG_TYPE_KPROBE requires. cilium/ebpf
-// would otherwise read the vDSO through /proc/self/mem, which a setcap'd
-// binary cannot do because file capabilities make the process non-dumpable —
-// and it fails with an error that names neither capabilities nor uprobes.
-func kernelVersionCode() uint32 {
-	var u unix.Utsname
-	if err := unix.Uname(&u); err != nil {
-		return 0
-	}
-	release := unix.ByteSliceToString(u.Release[:])
-	var a, b, c uint32
-	// A release like "6.19.10-300.fc44.x86_64" parses as 6.19.10; a two-part
-	// release like "6.19" leaves c at zero, which is what LINUX_VERSION_CODE
-	// would say too.
-	if _, err := fmt.Sscanf(release, "%d.%d.%d", &a, &b, &c); err != nil {
-		if _, err := fmt.Sscanf(release, "%d.%d", &a, &b); err != nil {
-			return 0
-		}
-	}
-	if c > 255 {
-		c = 255
-	}
-	return a<<16 | b<<8 | c
 }
 
 // Config describes what to attach to and where the normalized events go.
@@ -1621,12 +1596,9 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	if err != nil {
 		return nil, err
 	}
-	// See kernelVersionCode: without this cilium/ebpf discovers the version
-	// through the vDSO, which a setcap'd (non-dumpable) process cannot read.
-	kv := kernelVersionCode()
-	for _, p := range spec.Programs {
-		p.KernelVersion = kv
-	}
+	// Without this cilium/ebpf discovers the version through the vDSO, which a
+	// setcap'd (non-dumpable) process cannot read. See internal/kernelver.
+	kernelver.Apply(spec)
 
 	c = newConsumer(cfg)
 	// Every failure below this point must leave through a *bare* return that

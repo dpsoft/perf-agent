@@ -22,6 +22,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/kernelver"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/interp"
@@ -464,15 +465,20 @@ func TestStatsWithoutBPFObjectsReportsZeroKernelDrops(t *testing.T) {
 	assert.Zero(t, c.Stats().KernelDropped)
 }
 
-// The KernelVersion the loader is given must be a plausible LINUX_VERSION_CODE
-// for the running kernel: uprobe_multi needs 6.6+, and a zero here would send
-// cilium/ebpf back to the vDSO probe that a setcap'd binary cannot do.
-func TestKernelVersionCodeIsPlausible(t *testing.T) {
-	kv := kernelVersionCode()
-	require.NotZero(t, kv)
-	major := kv >> 16
-	assert.GreaterOrEqual(t, major, uint32(4), "major version parsed from uname")
-	assert.Less(t, major, uint32(100))
+// Every program in this object must leave the loader carrying a kernel
+// version. gpu_usdt_batch is BPF_PROG_TYPE_KPROBE, and a zero here sends
+// cilium/ebpf to the vDSO probe that a setcap'd (non-dumpable) binary cannot
+// do -- which fails with a message naming neither capabilities nor uprobes.
+// Asserted on the real spec rather than on the helper, because the defect this
+// prevents is forgetting to CALL it.
+func TestTheLoadedSpecCarriesAKernelVersion(t *testing.T) {
+	spec, err := loadGpuusdt()
+	require.NoError(t, err)
+	kernelver.Apply(spec)
+	for name, p := range spec.Programs {
+		assert.NotZerof(t, p.KernelVersion,
+			"%s would send cilium/ebpf to the vDSO probe a setcap'd process cannot do", name)
+	}
 }
 
 // The uprobe_multi BPF link is the whole point of this attach path: the

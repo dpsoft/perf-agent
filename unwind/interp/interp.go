@@ -27,6 +27,8 @@ import (
 	"sync"
 
 	"github.com/cilium/ebpf"
+
+	"github.com/dpsoft/perf-agent/internal/kernelver"
 )
 
 // Flavour is a driver's BPF program type. It matters because every entry of a
@@ -205,6 +207,12 @@ func Registered() int {
 type Set struct {
 	driver  Driver
 	entries []*entry
+	// failed records modules whose BPF object would not load, by name and
+	// reason. Kept rather than only logged at attach: a module that failed to
+	// load produces exactly the same evidence as a process with none of that
+	// language in it -- no frames, every counter zero -- and one line at
+	// startup is easy to miss in a run that prints a summary at the end.
+	failed []string
 }
 
 type entry struct {
@@ -259,6 +267,7 @@ func Attach(d Driver) (*Set, error) {
 		coll, err := loadModule(m, d)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", m.Name(), err))
+			s.failed = append(s.failed, fmt.Sprintf("%s (%v)", m.Name(), err))
 			continue
 		}
 		s.entries = append(s.entries, &entry{mod: m, coll: coll})
@@ -278,6 +287,13 @@ func loadModule(m Module, d Driver) (*ebpf.Collection, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A module supplies one program per driver program type, and the
+	// uprobe-typed one is BPF_PROG_TYPE_KPROBE -- which cilium/ebpf will not
+	// load without a kernel version, and cannot discover one for in a setcap'd
+	// process. Without this the GPU driver's module fails to load with an
+	// error naming neither capabilities nor uprobes, while the two perf_event
+	// drivers are unaffected. See internal/kernelver.
+	kernelver.Apply(spec)
 
 	// The module's object declares walker_scratch, walk_states and
 	// interp_progs so it can be compiled on its own; here they are replaced by
@@ -443,6 +459,17 @@ func (s *Set) LogCounters(enrolled bool, logf func(format string, args ...any)) 
 	if s == nil {
 		return
 	}
+	// A module that never loaded, said as plainly as the counters are. Its
+	// absence is indistinguishable from "this workload runs no such language"
+	// -- no frames, every counter zero -- so it has to be stated rather than
+	// inferred, and stated HERE rather than only at startup, where a run that
+	// ends in a summary will have scrolled past it.
+	for _, f := range s.failed {
+		logf("interpreter frames: %s NEVER LOADED: no frames from that runtime were possible "+
+			"in this run, and its counters below are zero for that reason and not because "+
+			"the workload had none", f)
+	}
+
 	// The CORE's account first, and unconditionally, because ZERO IS THE
 	// SIGNAL here. A module reporting all-zero counters has two completely
 	// different causes -- it ran and refused, or it was never reached -- and

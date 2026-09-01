@@ -20,6 +20,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -40,6 +41,25 @@ func main() {
 			fmt.Printf("%s: SPEC ERROR: %v\n", path, err)
 			bad++
 			continue
+		}
+		// kprobe/uprobe-typed programs make cilium/ebpf probe the running
+		// kernel version, which reads /proc/self/mem -- and that read is
+		// refused for a process running with file capabilities. The failure
+		// surfaces as "REJECTED ... detecting kernel version", which reads
+		// exactly like a verifier verdict and is not one. Supplying the
+		// version from uname skips the probe, so a rejection here always
+		// means the verifier.
+		var uts unix.Utsname
+		if err := unix.Uname(&uts); err == nil {
+			var maj, min, patch int
+			if n, _ := fmt.Sscanf(unix.ByteSliceToString(uts.Release[:]), "%d.%d.%d", &maj, &min, &patch); n >= 2 {
+				kv := uint32(maj<<16 | min<<8 | patch)
+				for _, ps := range spec.Programs {
+					if ps.KernelVersion == 0 {
+						ps.KernelVersion = kv
+					}
+				}
+			}
 		}
 		fmt.Printf("=== %s ===\n", path)
 		for name, ps := range spec.Programs {

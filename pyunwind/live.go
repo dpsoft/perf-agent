@@ -323,7 +323,10 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 		return refuseWith(v, err), nil
 	}
 
-	tids, err := ThreadIDs(pid)
+	// ptraceCandidates, not ThreadIDs: the thread-group leader of a process
+	// WE launched must not be stopped, because its stop is reported to us as
+	// the parent and destroys os/exec's bookkeeping. See ErrTraceeIsOwnChild.
+	tids, err := ptraceCandidates(pid)
 	if err != nil {
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, err), nil
@@ -526,4 +529,89 @@ func ThreadIDs(pid uint32) ([]int, error) {
 	}
 	sort.Ints(rest)
 	return append([]int{int(pid)}, rest...), nil
+}
+
+// ----- Which threads this process may ptrace, and the one it must not.
+
+// ErrTraceeIsOwnChild means the only thread available to stop is the
+// thread-group leader of a process this profiler launched itself.
+//
+// Stopping it is not merely rude, it CORRUPTS THE PARENT'S OWN BOOKKEEPING.
+// A ptrace stop of a child is reported to that child's parent by wait(2), and
+// when the profiler is the parent, os/exec is the thing waiting: Go's
+// os.Process.wait does a single wait4 and does not loop past a stopped status,
+// so it returns a ProcessState that says "stopped" and Cmd.Wait reports the
+// workload as finished when it is very much not. Observed on the GPU path,
+// where the workload is a child of gpu-cuda-profile:
+//
+//	workload: stop signal: trace/breakpoint trap (trap 128)
+//
+// trap 128 is PTRACE_EVENT_STOP -- our own PTRACE_INTERRUPT, surfacing through
+// the launcher's Cmd.Wait. The workload is then never reaped and never
+// released, and both processes sit forever.
+//
+// Only the LEADER is affected: wait4(pid) matches that pid alone, so a stop of
+// any other thread in the group is invisible to the parent's wait. That is why
+// this is a filter and not a refusal to walk our own children at all.
+var ErrTraceeIsOwnChild = errors.New("pyunwind: the only stoppable thread is the leader of a process we launched")
+
+// isOwnChild reports whether pid's parent is this process.
+//
+// Read from /proc/<pid>/stat, parsed AFTER the last ')' because the comm field
+// is parenthesised and may itself contain spaces and parentheses -- splitting
+// the whole line on spaces gets the wrong field for a process called
+// "(my prog) x". ppid is the first number after the state character.
+//
+// A pid that cannot be read is not our child for this purpose: the caller then
+// keeps the leader as a candidate, which is the behaviour every non-child
+// target already has.
+func isOwnChild(pid uint32) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	i := strings.LastIndexByte(string(data), ')')
+	if i < 0 {
+		return false
+	}
+	fields := strings.Fields(string(data)[i+1:])
+	// fields[0] is the state character; fields[1] is ppid.
+	if len(fields) < 2 {
+		return false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return false
+	}
+	return ppid == os.Getpid()
+}
+
+// ptraceCandidates returns the threads AttachProcess may stop, in preference
+// order, with the leader removed when this process launched the target.
+//
+// The leader is normally tried FIRST -- a process that runs any Python at all
+// runs its top level there, so it is the thread most likely to hold a
+// PyThreadState, and trying it first costs one ptrace stop rather than one per
+// thread. Dropping it costs that optimisation and nothing else: validation
+// needs SOME thread with a live PyThreadState, not that one, and a target
+// worth profiling for GPU work has plenty (CUDA alone creates several).
+func ptraceCandidates(pid uint32) ([]int, error) {
+	tids, err := ThreadIDs(pid)
+	if err != nil {
+		return nil, err
+	}
+	if !isOwnChild(pid) {
+		return tids, nil
+	}
+	out := make([]int, 0, len(tids))
+	for _, tid := range tids {
+		if tid == int(pid) {
+			continue
+		}
+		out = append(out, tid)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: pid %d is single-threaded", ErrTraceeIsOwnChild, pid)
+	}
+	return out, nil
 }

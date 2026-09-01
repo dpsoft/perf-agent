@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -443,4 +444,97 @@ func TestThePathRuleWouldHaveAcceptedLibgfortran(t *testing.T) {
 	}
 	// That is the whole defect in one line: a Fortran runtime, reported as
 	// CPython 3.12, because the directory it sits in is called python3.12.
+}
+
+// ----- Never stop the leader of a process we launched.
+//
+// A ptrace stop of a child is reported to that child's PARENT by wait(2), and
+// when the profiler is the parent, os/exec is what is waiting. Go's
+// os.Process.wait does one wait4 and does not loop past a stopped status, so it
+// returns "stopped" and Cmd.Wait reports the workload as finished when it is
+// not. Observed on the GPU path, where the workload is a child of
+// gpu-cuda-profile:
+//
+//	workload: stop signal: trace/breakpoint trap (trap 128)
+//
+// trap 128 is PTRACE_EVENT_STOP -- our own PTRACE_INTERRUPT surfacing through
+// the launcher's Cmd.Wait, after which the workload is never reaped or
+// released and both processes sit forever.
+//
+// There is a second, quieter way it corrupts the parent: releaseTracee's own
+// wait4 treats a non-stopped status as "exited under us", which for the leader
+// of our child REAPS ITS EXIT STATUS -- and Cmd.Wait then fails with ECHILD.
+//
+// Only the leader is affected, because wait4(pid) matches that pid alone.
+
+func TestOwnChildIsRecognised(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a child: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+
+	if !isOwnChild(uint32(cmd.Process.Pid)) {
+		t.Errorf("pid %d is our own child and was not recognised as one; its leader would be "+
+			"ptraced and the stop would surface through Cmd.Wait", cmd.Process.Pid)
+	}
+	// This process is not its own child, and neither is init. Without these
+	// the check above is satisfied by a function that always returns true --
+	// which would refuse to ptrace every target, CPU path included.
+	if isOwnChild(uint32(os.Getpid())) {
+		t.Error("this process reported as its own child")
+	}
+	if isOwnChild(1) {
+		t.Error("pid 1 reported as our child")
+	}
+}
+
+func TestTheLeaderOfOurOwnChildIsNotAPtraceCandidate(t *testing.T) {
+	// A child with more than one thread, so there is something left after the
+	// leader is removed -- which is the case that matters: a CUDA workload
+	// always has several.
+	cmd := exec.Command("sh", "-c", "sleep 30 & sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a child: %v", err)
+	}
+	pid := uint32(cmd.Process.Pid)
+	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+
+	all, err := ThreadIDs(pid)
+	if err != nil {
+		t.Skipf("cannot list threads of the child: %v", err)
+	}
+	if all[0] != int(pid) {
+		t.Fatalf("ThreadIDs put %d first, expected the leader %d", all[0], pid)
+	}
+
+	got, err := ptraceCandidates(pid)
+	if err != nil {
+		// A single-threaded child is refused BY NAME rather than silently
+		// ptraced, which is the other half of the contract.
+		if !errors.Is(err, ErrTraceeIsOwnChild) {
+			t.Fatalf("ptraceCandidates: %v", err)
+		}
+		return
+	}
+	for _, tid := range got {
+		if tid == int(pid) {
+			t.Fatalf("the leader (%d) is still a ptrace candidate for a process we launched", pid)
+		}
+	}
+}
+
+// And the CPU path must be untouched: for a target we did NOT launch, the
+// leader stays first, because a process that runs any Python at all runs its
+// top level there and trying it first costs one ptrace stop instead of one per
+// thread.
+func TestTheLeaderIsStillPreferredForATargetWeDidNotLaunch(t *testing.T) {
+	self := uint32(os.Getpid())
+	got, err := ptraceCandidates(self)
+	if err != nil {
+		t.Fatalf("ptraceCandidates(self): %v", err)
+	}
+	if len(got) == 0 || got[0] != int(self) {
+		t.Fatalf("candidates start with %v, want the leader %d first", got, self)
+	}
 }

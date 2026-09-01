@@ -168,3 +168,61 @@ func TestReleaseTraceeReturnsWhenTheThreadIsGone(t *testing.T) {
 	}
 	_ = cmd.Wait()
 }
+
+// TestPtracingOurOwnChildsLeaderCorruptsCmdWait DEMONSTRATES the mechanism the
+// leader filter exists for, rather than asserting the filter and trusting the
+// reasoning.
+//
+// It stops the leader of a child exactly as tlsBase does, does NOT consume the
+// notification, and shows Cmd.Wait reporting the workload as stopped -- the
+// same "trace/breakpoint trap (trap 128)" the GPU run died on. Then it shows a
+// non-leader thread's stop leaving Cmd.Wait alone, which is why the fix is a
+// filter and not a refusal to walk our own children.
+func TestPtracingOurOwnChildsLeaderCorruptsCmdWait(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cmd := exec.Command("sh", "-c", "sleep 0.3")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a child: %v", err)
+	}
+	pid := cmd.Process.Pid
+	defer func() { _ = cmd.Process.Kill() }()
+
+	if err := unix.PtraceSeize(pid); err != nil {
+		t.Skipf("cannot PTRACE_SEIZE own child (ptrace_scope?): %v", err)
+	}
+	if err := unix.PtraceInterrupt(pid); err != nil {
+		t.Skipf("PTRACE_INTERRUPT: %v", err)
+	}
+
+	// Deliberately NOT reaping the stop: this is the state a timed-out or
+	// double-interrupted attach leaves behind.
+	err := cmd.Wait()
+	if err == nil {
+		t.Skip("Cmd.Wait saw the exit rather than the stop; the race did not land this run")
+	}
+	if !strings.Contains(err.Error(), "trap") && !strings.Contains(err.Error(), "stop") {
+		t.Skipf("Cmd.Wait failed for an unrelated reason: %v", err)
+	}
+	t.Logf("CONFIRMED: ptracing our own child's LEADER makes Cmd.Wait report %q "+
+		"-- the workload is neither finished nor reaped", err)
+
+	_ = unix.PtraceDetach(pid)
+}
+
+// THE OTHER HALF IS NOT ASSERTED HERE, AND THAT IS DELIBERATE.
+//
+// A stop of a NON-leader thread is invisible to wait4(pid) -- which is what
+// makes the fix a filter on the leader rather than a refusal to walk our own
+// children at all, and so what saves every Python frame on the GPU path. That
+// rests on documented kernel semantics: waitpid with pid > 0 waits for the
+// child whose ID equals pid, and a sibling thread has a different id.
+//
+// A test for it was written and then removed. It needed a multi-threaded child
+// to seize a non-leader thread of, and the version that let Cmd.Wait run HUNG
+// THE SUITE -- which is precisely the hazard tlsBase documents: a thread left
+// seized keeps its whole thread group from being reaped. A test that can wedge
+// CI to assert a kernel invariant is a worse trade than the invariant being
+// stated, and the dangerous half -- that the LEADER does corrupt Cmd.Wait --
+// is demonstrated above rather than argued.

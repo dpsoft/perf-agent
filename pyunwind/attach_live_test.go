@@ -393,18 +393,22 @@ func TestLiveInterpreterEvalRangeIsLocatableAndWellFormed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindInterpreter: %v", err)
 	}
-	r, err := EvalRangeForFile(libPath)
+	rs, err := EvalRangesForFile(libPath)
 	if err != nil {
 		if errors.Is(err, ErrEvalLoopNotLocatable) {
 			t.Skipf("%s (CPython %s): %v", libPath, version, err)
 		}
-		t.Fatalf("EvalRangeForFile(%s): %v", libPath, err)
+		t.Fatalf("EvalRangesForFile(%s): %v", libPath, err)
 	}
-	if r.Hi <= r.Lo {
-		t.Fatalf("empty range [%#x,%#x)", r.Lo, r.Hi)
+	var total uint64
+	for i, r := range rs {
+		if r.Hi <= r.Lo {
+			t.Fatalf("fragment %d is empty: [%#x,%#x)", i, r.Lo, r.Hi)
+		}
+		total += r.Hi - r.Lo
 	}
-	if size := r.Hi - r.Lo; size < minEvalLoopBytes {
-		t.Fatalf("range is %d bytes, below the floor the picker enforces", size)
+	if total < minEvalLoopBytes {
+		t.Fatalf("the eval loop totals %d bytes across %d fragments, below the floor", total, len(rs))
 	}
-	t.Logf("%s: eval range [%#x,%#x), %d bytes", libPath, r.Lo, r.Hi, r.Hi-r.Lo)
+	t.Logf("%s: eval loop in %d fragment(s), %d bytes total: %v", libPath, len(rs), total, rs)
 }

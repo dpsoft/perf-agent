@@ -612,8 +612,55 @@ static __always_inline int fp_chain_ended(struct walk_ctx *ctx) {
 // rel_pc in.
 #define UNWINDER_NATIVE 0
 
+// HANDOFF_MAX_RANGES is how many disjoint text spans one claim may cover.
+//
+// IT IS NOT ONE, AND THAT COST US A DAY. A compiler is free to split a
+// function across several partitions, and CPython's eval loop is exactly the
+// function it does that to. Measured on uv's cpython-3.12.14, the build a
+// PyTorch venv actually runs:
+//
+//   _PyEval_EvalFrameDefault        66,065 bytes   <- the hot dispatch loop
+//   _PyEval_EvalFrameDefault.warm   28,019
+//   _PyEval_EvalFrameDefault.cold  135,934        <- the LARGEST, and cold
+//   _PyEval_EvalFrameDefault.org.0       5
+//
+// With one span per binary the installer had to choose, chose the largest, and
+// therefore claimed the partition the compiler had marked RARELY EXECUTED.
+// Samples land in the first two; none ever fell inside the claim; the handoff
+// never fired on a workload where 86% of samples were sitting in the eval
+// loop. Every counter read zero because nothing had gone wrong -- nothing had
+// happened.
+//
+// Spanning min..max instead would have been worse than the bug: those
+// fragments are 3 MB apart, so the claim would swallow unrelated CPython
+// functions and hang a Python stack off a native frame that is not the eval
+// loop at all. That is the plausible-stack-that-never-happened failure this
+// design refuses everywhere else. The union has to be the actual union.
+//
+// THREE IS A MEASURED CEILING, not a guess. The scan is unrolled into the
+// walk callback, which the verifier re-explores per frame, and the cost is a
+// cliff rather than a slope. perf_dwarf, processed instructions:
+//
+//   1 span  176,701      2 spans 158,942      3 spans 160,530
+//   4 spans 468,718      8 spans REJECTED at the 1,000,001 ceiling
+//
+// (Two and three come out BELOW one because the value is copied out of the
+// map once instead of being dereferenced twice; see next_unwinder.)
+//
+// Three covers uv's three real fragments exactly and every other build
+// surveyed with room. A binary with more gets its SMALLEST fragments dropped
+// by the installer, which says so in the log rather than silently covering
+// less than it claims.
+#define HANDOFF_MAX_RANGES 3
+
+struct handoff_span { __u64 lo, hi; };
+
 struct handoff_range {
-    __u64 lo, hi;
+    // Unused spans are zeroed, and zero never matches: `rel_pc >= 0 &&
+    // rel_pc < 0` is false for every rel_pc. So the scan below needs no
+    // count, no bound check and no early exit -- which is the whole reason it
+    // is affordable in the loop callback.
+    struct handoff_span spans[HANDOFF_MAX_RANGES];
     __u32 unwinder_id;
     __u32 _pad;
 };
@@ -628,16 +675,15 @@ struct {
 // interp_enabled gates the handoff at LOAD time, and its placement is part of
 // the design rather than a wrapper around it.
 //
-// The question it answers is not "can we turn Python off" but "what does a
-// deployment with no interpreters pay". Asking it costs 2.4x the native
-// walker's verifier states (339,443 against 144,319 -- see rd-report.md), and
-// that is a cost every user would carry, including those who never profile a
-// runtime. A `const volatile` is a constant to the verifier, so with this
-// false the lookup, the comparisons AND the early-return branch are pruned
+// The question it answers is not "can we turn one language off" but "what does
+// a deployment with no interpreters pay". Asking it costs real verifier
+// budget, and that is a cost every user would carry, including those who never
+// profile a runtime. A `const volatile` is a constant to the verifier, so with
+// this false the lookup, the span scan AND the early-return branch are pruned
 // before verification and the program is exactly the native walker again.
 //
 // Default true; userspace turns it off on a kernel that refuses the program
-// (profile.loadWithPythonGate) or when nothing has registered an unwinder.
+// (profile.loadWithInterpGate).
 #ifndef INTERP_DEFAULT
 #define INTERP_DEFAULT true
 #endif
@@ -646,23 +692,57 @@ const volatile bool interp_enabled = INTERP_DEFAULT;
 // next_unwinder answers "does something other than the native walker claim
 // this PC, and is it still interested". UNWINDER_NATIVE means carry on.
 //
+// The span scan is UNROLLED WITH NO EARLY EXIT, deliberately. Every measured
+// regression in this walker came from adding a branch that leaves the body:
+// the comparisons below all merge into one boolean and there is exactly one
+// exit, so the verifier explores the body once. Breaking out of the loop on a
+// hit would be the cheap-looking version that costs.
+//
 // `done` is walk_ctx.interp_done: one bit per unwinder id, set by a module
 // that has finished with this sample. Honouring it here rather than in the
 // module is what keeps a deep stack cheap -- a Python process's native walk
 // can cross the eval loop a dozen times in one sample, and without this every
-// crossing after the first costs two tail calls to be told nothing and eats
-// the round-trip budget a genuinely deep chain needs.
+// crossing after the first costs a full round trip to be told nothing.
 static __always_inline __u32 next_unwinder(__u64 table_id, __u64 rel_pc, __u32 done) {
     struct handoff_range *h = bpf_map_lookup_elem(&handoff_ranges, &table_id);
     if (!h) return UNWINDER_NATIVE;
-    if (rel_pc < h->lo || rel_pc >= h->hi) return UNWINDER_NATIVE;
-    __u32 id = h->unwinder_id;
+    interp_count(INTERP_STAT_RANGE_HIT);
+
+    // BRANCHLESS ON PURPOSE, and this is the difference between the scan
+    // fitting and not fitting. BPF has no conditional move, so every `<`
+    // compiles to a jump; written the obvious way as
+    // `inside |= (rel_pc >= lo && rel_pc < hi)`, eight spans are sixteen
+    // jumps whose paths multiply inside a callback the verifier already
+    // re-explores per frame. Measured on perf_dwarf, processed instructions:
+    //
+    //   1 span   176,701      2 spans  177,281      (a branch pair is nearly free)
+    //   4 spans  497,588      8 spans  REJECTED at 1,000,001
+    //
+    // The sign-bit form below has no jumps at all: eight spans cost eight
+    // times a handful of ALU ops and the verifier walks one path.
+    //
+    // It is exact rather than clever. Every address here is a link-time
+    // vaddr well under 2^63, so `(__s64)rel_pc - (__s64)lo` cannot overflow,
+    // and its sign bit IS the predicate: clear means rel_pc >= lo, set means
+    // rel_pc < hi for the second term. An unused span is zeroed, and for
+    // lo == hi == 0 both sign bits come out clear, so it contributes nothing
+    // -- which is why the scan needs no count and no bound check.
+    struct handoff_range hr = *h;
+    __u32 inside = 0;
+#pragma unroll
+    for (int i = 0; i < HANDOFF_MAX_RANGES; i++) {
+        if (rel_pc >= hr.spans[i].lo && rel_pc < hr.spans[i].hi) inside = 1;
+    }
+    if (!inside) return UNWINDER_NATIVE;
+    interp_count(INTERP_STAT_IN_RANGE);
+
+    __u32 id = hr.unwinder_id;
     // The mask is on the id read out of the map value, not on a re-read: see
     // the bounds discipline at record_push_native. 31 rather than
     // INTERP_MAX_UNWINDERS-1 so a shift is always defined even if a map entry
     // carries an id this build has no slot for; such an id simply finds an
-    // empty interp_progs slot and the tail call fails, which is the same
-    // degradation as a module that was never loaded.
+    // empty interp_progs slot and the tail call fails, which the dispatch
+    // counters now name.
     if (done & (1u << (id & 31))) return UNWINDER_NATIVE;
     return id;
 }
@@ -737,6 +817,7 @@ static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
         if (interp_enabled && lead) {
             __u32 u = next_unwinder(m.table_id, m.rel_pc, ctx->interp_done);
             if (u != UNWINDER_NATIVE) {
+                interp_count(INTERP_STAT_CLAIMED);
                 ctx->pending_unwinder = u;
                 return 1;
             }
@@ -1063,6 +1144,14 @@ static __always_inline __u32 unwind_walk(void *ctx, struct walk_persist *st,
         // on a frame another unwinder claims.
         bpf_loop(MAX_FRAMES, walk_step, &w, 0);
 
+            if (interp_enabled && w.pending_unwinder != UNWINDER_NATIVE &&
+            st->tail_calls >= INTERP_TAIL_CALL_BUDGET) {
+            // Claimed, and refused for want of round trips. Counted here
+            // rather than left as a silent truncation: it is the one ending
+            // that looks exactly like a stack that simply had no more
+            // interpreter frames in it.
+            interp_count(INTERP_STAT_BUDGET);
+        }
         if (interp_enabled && w.pending_unwinder != UNWINDER_NATIVE &&
             st->tail_calls < INTERP_TAIL_CALL_BUDGET) {
             __u32 slot = w.pending_unwinder;
@@ -1072,8 +1161,14 @@ static __always_inline __u32 unwind_walk(void *ctx, struct walk_persist *st,
             w.pending_unwinder = UNWINDER_NATIVE;
             walk_save(st, &w);
             st->tail_calls += 1;
+            interp_count(INTERP_STAT_DISPATCHED);
             bpf_tail_call(ctx, &interp_progs, INTERP_SLOT_UNWINDER(slot));
-            // Reached only when the tail call did not happen.
+            // REACHED ONLY WHEN THE TAIL CALL DID NOT HAPPEN -- nothing is
+            // installed in that slot, or the kernel's own limit was reached.
+            // The walk ends here with the record as far as it got, which is a
+            // short sample rather than a wrong one, and this is the counter
+            // that stops it being a silent one.
+            interp_count(INTERP_STAT_TAILCALL_FAILED);
         }
     }
 
@@ -1112,6 +1207,7 @@ static __always_inline __u32 unwind_walk(void *ctx, struct walk_persist *st,
         struct sample_record *rec = walk_record_get();                          \
         if (st && rec) {                                                        \
             struct walk_ctx w;                                                  \
+            interp_count(INTERP_STAT_RESUMED);                                  \
             walk_load(&w, st, rec);                                             \
             if (unwind_frame(&w, false)) st->stopped = 1;                       \
             walk_save(st, &w);                                                  \

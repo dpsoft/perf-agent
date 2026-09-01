@@ -42,9 +42,12 @@ type offcpu_dwarfClassification struct {
 }
 
 type offcpu_dwarfHandoffRange struct {
-	_          structs.HostLayout
-	Lo         uint64
-	Hi         uint64
+	_     structs.HostLayout
+	Spans [3]struct {
+		_  structs.HostLayout
+		Lo uint64
+		Hi uint64
+	}
 	UnwinderId uint32
 	Pad        uint32
 }
@@ -166,6 +169,7 @@ type offcpu_dwarfMapSpecs struct {
 	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
 	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
 	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats              *ebpf.MapSpec `ebpf:"interp_stats"`
 	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
@@ -217,6 +221,7 @@ type offcpu_dwarfMaps struct {
 	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
 	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
 	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats              *ebpf.Map `ebpf:"interp_stats"`
 	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
 	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
@@ -237,6 +242,7 @@ func (m *offcpu_dwarfMaps) Close() error {
 		m.CfiRules,
 		m.HandoffRanges,
 		m.InterpProgs,
+		m.InterpStats,
 		m.KernStackmap,
 		m.OffcpuStart,
 		m.PidMappingLengths,

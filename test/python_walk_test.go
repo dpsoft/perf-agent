@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dpsoft/perf-agent/pyunwind"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 // This file is the first place on this branch where a Python frame produced
@@ -231,11 +232,22 @@ func requireWalkableInterpreter(t *testing.T, pid uint32) {
 	// From here on the interpreter is one we claim to support, and every
 	// refusal is a defect of ours -- with one exception, called out by its
 	// own sentinel: a build whose dispatch loop has no symbol at all.
-	if _, err := pyunwind.EvalRangeForFile(libPath); err != nil {
+	frags, err := pyunwind.EvalRangesForFile(libPath)
+	if err != nil {
 		if errors.Is(err, pyunwind.ErrEvalLoopNotLocatable) {
 			declinePythonGate(t, "%s: %v", libPath, err)
 		}
-		t.Fatalf("EvalRangeForFile(%s): %v", libPath, err)
+		t.Fatalf("EvalRangesForFile(%s): %v", libPath, err)
+	}
+	// A build whose eval loop is split into more fragments than the walker
+	// can scan is walkable, but only partly: samples in the fragments that
+	// were dropped carry no Python frames. Logged rather than skipped,
+	// because it is the shape that made the handoff look completely dead on
+	// uv's cpython-3.12.14 and it should be visible in the CI output the day
+	// CI's interpreter grows a third partition.
+	if len(frags) > interp.MaxSpans {
+		t.Logf("NOTE: %s has %d eval-loop fragments; the walker claims the largest %d, "+
+			"so some eval-loop samples will carry no Python frames", libPath, len(frags), interp.MaxSpans)
 	}
 	code, err := pyunwind.GILStateCode(libPath)
 	require.NoErrorf(t, err, "reading PyGILState_GetThisThreadState out of %s", libPath)

@@ -138,6 +138,66 @@ struct {
     __uint(max_entries, INTERP_MAX_UNWINDERS);
 } interp_progs SEC(".maps");
 
+// ----- Why a handoff did or did not happen.
+//
+// A per-CPU counter array, generic, owned by the core: it counts the CORE's
+// decisions about dispatching, not anything a module does. A module's own
+// refusals are its own counters' business.
+//
+// IT EXISTS BECAUSE A FAILED HANDOFF WAS INVISIBLE. Every counter on the
+// module side reading zero has two completely different causes -- "the
+// unwinder ran and refused" and "the unwinder was never reached" -- and from
+// outside the kernel they looked identical. An hour was spent unable to tell
+// them apart on a target where the native walk was landing on the eval loop in
+// 86% of samples. These six slots make the difference readable, and read
+// together they name WHICH step failed:
+//
+//   RANGE_HIT 0                 handoff_ranges has no entry under the
+//                               table_id the walker computes: either nothing
+//                               was installed, or the install and the lookup
+//                               disagree about the key.
+//   RANGE_HIT > 0, IN_RANGE 0   the entry is found and the PC never falls
+//                               inside it: the install and the lookup
+//                               disagree about the ADDRESS SPACE (a range in
+//                               file offsets against a load-bias-relative pc,
+//                               say).
+//   IN_RANGE > 0, CLAIMED 0     the unwinder had already declared itself
+//                               finished for that sample. Not a fault.
+//   CLAIMED > 0, DISPATCHED 0   walk_step claimed and the driver did not act,
+//                               which can only be the budget: see BUDGET.
+//   DISPATCHED > 0, FAILED > 0  the tail call did not happen. The slot is
+//                               empty, or the kernel's own tail-call limit
+//                               was reached. This is the one that used to be
+//                               completely silent.
+//   RESUMED < DISPATCHED        the module was entered and did not hand
+//                               control back.
+//
+// All six are cheap enough to leave in unconditionally: measured at 25% of the
+// verifier budget before they were added and 25% after (see the commit).
+#define INTERP_STAT_RANGE_HIT   0  // a claim exists for this frame's binary
+#define INTERP_STAT_IN_RANGE    1  // and this frame's PC falls inside it
+#define INTERP_STAT_CLAIMED     2  // and the unwinder still wants frames
+#define INTERP_STAT_DISPATCHED  3  // the driver tail-called the unwinder
+#define INTERP_STAT_TAILCALL_FAILED 4  // and the tail call did not happen
+#define INTERP_STAT_BUDGET      5  // a claim was dropped: round-trip budget
+#define INTERP_STAT_RESUMED     6  // an unwinder handed control back
+#define INTERP_STAT_MAX         7
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, INTERP_STAT_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} interp_stats SEC(".maps");
+
+// interp_count bumps one named slot. Per-CPU, so the increment needs no
+// atomic; userspace sums across CPUs.
+static __always_inline void interp_count(__u32 slot) {
+    if (slot >= INTERP_STAT_MAX) return;
+    __u64 *d = bpf_map_lookup_elem(&interp_stats, &slot);
+    if (d) *d += 1;
+}
+
 // ----- The walk state that survives a tail call.
 //
 // It is deliberately NOT struct walk_ctx. A tail call replaces the running

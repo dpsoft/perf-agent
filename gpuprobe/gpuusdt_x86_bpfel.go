@@ -61,9 +61,12 @@ type gpuusdtGpuStack struct {
 }
 
 type gpuusdtHandoffRange struct {
-	_          structs.HostLayout
-	Lo         uint64
-	Hi         uint64
+	_     structs.HostLayout
+	Spans [3]struct {
+		_  structs.HostLayout
+		Lo uint64
+		Hi uint64
+	}
 	UnwinderId uint32
 	Pad        uint32
 }
@@ -184,6 +187,7 @@ type gpuusdtMapSpecs struct {
 	GpuStacks                *ebpf.MapSpec `ebpf:"gpu_stacks"`
 	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
 	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats              *ebpf.MapSpec `ebpf:"interp_stats"`
 	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
 	Pids                     *ebpf.MapSpec `ebpf:"pids"`
@@ -237,6 +241,7 @@ type gpuusdtMaps struct {
 	GpuStacks                *ebpf.Map `ebpf:"gpu_stacks"`
 	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
 	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats              *ebpf.Map `ebpf:"interp_stats"`
 	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
 	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
 	Pids                     *ebpf.Map `ebpf:"pids"`
@@ -262,6 +267,7 @@ func (m *gpuusdtMaps) Close() error {
 		m.GpuStacks,
 		m.HandoffRanges,
 		m.InterpProgs,
+		m.InterpStats,
 		m.PidMappingLengths,
 		m.PidMappings,
 		m.Pids,

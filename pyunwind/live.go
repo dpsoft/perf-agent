@@ -318,7 +318,7 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 	// anyway is what keeps a target whose eval loop cannot be found from
 	// attaching and then producing nothing -- a refusal with a reason beats a
 	// py_procs entry no PC ever reaches.
-	if _, err := EvalRangeForFile(libPath); err != nil {
+	if _, err := EvalRangesForFile(libPath); err != nil {
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, err), nil
 	}

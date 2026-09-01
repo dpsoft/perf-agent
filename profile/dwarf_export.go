@@ -159,6 +159,10 @@ func (p *PerfDwarf) ResumeStepProgram() *ebpf.Program { return p.objs.InterpResu
 // ResumeWalkProgram carries a resumed sample the rest of the way and emits it.
 func (p *PerfDwarf) ResumeWalkProgram() *ebpf.Program { return p.objs.InterpResumeWalk }
 
+// InterpStatsMap returns the core's per-CPU record of why a handoff did or
+// did not happen. Read at shutdown; zero is a signal, not an absence.
+func (p *PerfDwarf) InterpStatsMap() *ebpf.Map { return p.objs.InterpStats }
+
 // InterpEnabled reports whether the loaded program carries the handoff at all.
 // False means the verifier refused it on this kernel and userspace reloaded
 // without it (see loadWithInterpGate); installing a module then would write

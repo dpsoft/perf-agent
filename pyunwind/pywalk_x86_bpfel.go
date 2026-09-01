@@ -133,6 +133,7 @@ type pywalkProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type pywalkMapSpecs struct {
 	InterpProgs    *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats    *ebpf.MapSpec `ebpf:"interp_stats"`
 	PyFrameScratch *ebpf.MapSpec `ebpf:"py_frame_scratch"`
 	PyProcs        *ebpf.MapSpec `ebpf:"py_procs"`
 	PyWalkCounters *ebpf.MapSpec `ebpf:"py_walk_counters"`
@@ -167,6 +168,7 @@ func (o *pywalkObjects) Close() error {
 // It can be passed to loadPywalkObjects or ebpf.CollectionSpec.LoadAndAssign.
 type pywalkMaps struct {
 	InterpProgs    *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats    *ebpf.Map `ebpf:"interp_stats"`
 	PyFrameScratch *ebpf.Map `ebpf:"py_frame_scratch"`
 	PyProcs        *ebpf.Map `ebpf:"py_procs"`
 	PyWalkCounters *ebpf.Map `ebpf:"py_walk_counters"`
@@ -177,6 +179,7 @@ type pywalkMaps struct {
 func (m *pywalkMaps) Close() error {
 	return _PywalkClose(
 		m.InterpProgs,
+		m.InterpStats,
 		m.PyFrameScratch,
 		m.PyProcs,
 		m.PyWalkCounters,

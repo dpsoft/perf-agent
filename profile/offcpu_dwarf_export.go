@@ -105,6 +105,10 @@ func (p *OffCPUDwarf) HandoffRangesMap() *ebpf.Map      { return p.objs.HandoffR
 func (p *OffCPUDwarf) ResumeStepProgram() *ebpf.Program { return p.objs.InterpResumeStep }
 func (p *OffCPUDwarf) ResumeWalkProgram() *ebpf.Program { return p.objs.InterpResumeWalk }
 
+// InterpStatsMap returns the core's per-CPU record of why a handoff did or
+// did not happen. Read at shutdown; zero is a signal, not an absence.
+func (p *OffCPUDwarf) InterpStatsMap() *ebpf.Map { return p.objs.InterpStats }
+
 func (p *OffCPUDwarf) InterpEnabled() bool {
 	_, enabled, _ := InterpState()
 	return enabled

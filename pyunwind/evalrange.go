@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -53,66 +54,113 @@ const evalLoopSymbol = "_PyEval_EvalFrameDefault"
 // without something having changed fundamentally.
 const minEvalLoopBytes = 8 * 1024
 
-// EvalRangeForFile returns the eval-loop text range of a libpython (or a
-// statically linked python executable), in the load-bias-relative space
-// bpf/unwind_common.h's mapping_for_pc reports rel_pc in -- which is the
-// ELF's own virtual-address space, since rel_pc is pc - load_bias.
+// EvalRangesForFile returns EVERY text fragment of the interpreter's eval loop
+// in a libpython (or a statically linked python executable), largest first, in
+// the load-bias-relative space bpf/unwind_common.h's mapping_for_pc reports
+// rel_pc in -- which is the ELF's own virtual-address space, since rel_pc is
+// pc - load_bias.
 //
-// WHY THE LARGEST FRAGMENT, not the exported symbol. GCC's PGO builds
-// partition _PyEval_EvalFrameDefault: the exported symbol keeps the entry
-// block and the dispatch loop moves to a local `.cold` (or `.part`,
-// `.constprop`) sibling. On actions/setup-python's 3.12.14 -- the
-// interpreter this project's CI runs -- the exported symbol is 350 bytes
-// and _PyEval_EvalFrameDefault.cold is 51431, and a profile of that build
-// shows every eval-loop return address landing inside the .cold fragment
-// and none inside the exported one. Taking the exported symbol's range
-// there installs a range no sample ever falls in: the arm is on, and
-// nothing happens.
+// ALL OF THEM, AND THAT IS THE WHOLE POINT OF THIS FUNCTION. It used to return
+// one range, the largest fragment, and that cost a day of debugging on the
+// first real target. GCC and Clang partition _PyEval_EvalFrameDefault under
+// PGO, and which partition is largest is not which partition runs. Measured on
+// uv's cpython-3.12.14, the interpreter a PyTorch venv actually uses:
 //
-// Only ONE range is installed per binary because py_eval_ranges holds one
-// per table_id. Where the loop is split across several fragments this
-// covers the largest; samples landing in a smaller sibling are missed, and
-// that shows up as PyCntChainAbandoned rather than as a wrong stack.
-func EvalRangeForFile(path string) (EvalRange, error) {
+//	_PyEval_EvalFrameDefault         66,065 bytes   <- the hot dispatch loop
+//	_PyEval_EvalFrameDefault.warm    28,019
+//	_PyEval_EvalFrameDefault.cold   135,934         <- the LARGEST, and cold
+//	_PyEval_EvalFrameDefault.org.0        5
+//
+// "Largest" therefore selected the partition the compiler had marked rarely
+// executed. On a workload with 86% of samples sitting in the eval loop, not
+// one of them fell inside the installed range: the handoff never fired, and
+// because nothing had gone wrong, every counter read zero.
+//
+// The heuristic was not arbitrary -- it was measured, on actions/setup-python
+// 3.12.14, where the exported symbol is a 350-byte stub and the loop really is
+// in .cold. Both builds exist. Only the union satisfies both.
+//
+// NOT the min-to-max span, which would be worse than the bug: those fragments
+// are 3 MB apart, so a single covering range swallows unrelated CPython
+// functions and would hang a Python stack off a native frame that is not the
+// eval loop. That is the plausible-stack-that-never-happened failure this
+// package refuses everywhere else.
+//
+// Sorted largest first so a caller that can carry fewer spans than there are
+// fragments drops the ones fewest samples land in -- and interp.MaxSpans is a
+// measured verifier ceiling, so that caller exists.
+//
+// The SIZE FLOOR applies to the total, not to each fragment: a 5-byte
+// trampoline is a real part of the function and costs nothing to include, but
+// a binary whose only match is a 994-byte stub carries no dispatch loop and
+// must still be refused (ErrEvalLoopNotLocatable).
+func EvalRangesForFile(path string) ([]EvalRange, error) {
 	f, err := elf.Open(path)
 	if err != nil {
-		return EvalRange{}, fmt.Errorf("pyunwind: open %s: %w", path, err)
+		return nil, fmt.Errorf("pyunwind: open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
-	best, err := pickEvalFragment(allFuncSymbols(f))
-	if err != nil {
-		return EvalRange{}, fmt.Errorf("%w in %s", err, path)
-	}
-	return EvalRange{Lo: best.Value, Hi: best.Value + best.Size}, nil
+	return evalFragments(allFuncSymbols(f), path)
 }
 
-// pickEvalFragment chooses the eval-loop fragment from a symbol list. Split
-// out from EvalRangeForFile so the choice can be tested without an ELF.
-func pickEvalFragment(syms []elf.Symbol) (elf.Symbol, error) {
-	var best elf.Symbol
-	var found bool
-	var names []string
+// evalFragments is EvalRangesForFile's decision, separated from the file I/O
+// so every property it has can be pinned against a symbol table written by
+// hand -- including the builds this machine does not have.
+func evalFragments(syms []elf.Symbol, path string) ([]EvalRange, error) {
+	// DEDUPED BY (address, size). allFuncSymbols reads .symtab AND .dynsym,
+	// and an exported fragment appears in both -- so without this the hot
+	// dispatch loop is counted twice and, since the walker can only scan
+	// interp.MaxSpans of them, its duplicate evicts a REAL fragment. Measured
+	// on uv's cpython-3.12.14: the top three came back as
+	// {.cold, main, main} and .warm was dropped, which is the original bug
+	// wearing the fix's clothes.
+	seen := map[[2]uint64]bool{}
+	var frags []elf.Symbol
 	for _, s := range syms {
-		if s.Name != evalLoopSymbol && !strings.HasPrefix(s.Name, evalLoopSymbol+".") {
+		if s.Size == 0 || !isEvalFragment(s.Name) {
 			continue
 		}
-		names = append(names, fmt.Sprintf("%s (%d bytes)", s.Name, s.Size))
-		if !found || s.Size > best.Size {
-			best, found = s, true
+		k := [2]uint64{s.Value, s.Size}
+		if seen[k] {
+			continue
 		}
+		seen[k] = true
+		frags = append(frags, s)
 	}
-	if !found {
-		return elf.Symbol{}, fmt.Errorf("%w: no %s symbol", ErrEvalLoopNotLocatable, evalLoopSymbol)
+	if len(frags) == 0 {
+		return nil, fmt.Errorf("%w: no %s symbol in %s", ErrEvalLoopNotLocatable, evalLoopSymbol, path)
 	}
-	if best.Size < minEvalLoopBytes {
-		return elf.Symbol{}, fmt.Errorf(
-			"%w: the largest %s fragment is only %d bytes, below the %d-byte floor for a bytecode dispatch loop; "+
-				"this looks like a stripped, PGO-partitioned build whose loop has no symbol in .dynsym (candidates: %s). "+
-				"Installing the debug symbols for this interpreter makes the fragment visible",
-			ErrEvalLoopNotLocatable, evalLoopSymbol, best.Size, minEvalLoopBytes, strings.Join(names, ", "))
+	sort.Slice(frags, func(i, j int) bool {
+		if frags[i].Size != frags[j].Size {
+			return frags[i].Size > frags[j].Size
+		}
+		return frags[i].Value < frags[j].Value
+	})
+
+	var total uint64
+	out := make([]EvalRange, 0, len(frags))
+	for _, s := range frags {
+		total += s.Size
+		out = append(out, EvalRange{Lo: s.Value, Hi: s.Value + s.Size})
 	}
-	return best, nil
+	if total < minEvalLoopBytes {
+		return nil, fmt.Errorf(
+			"%w: %s in %s totals %d bytes across %d fragments, below the %d-byte floor for a dispatch loop",
+			ErrEvalLoopNotLocatable, evalLoopSymbol, path, total, len(frags), minEvalLoopBytes)
+	}
+	return out, nil
+}
+
+// isEvalFragment reports whether a symbol name is the eval loop or one of the
+// partitions a compiler split it into.
+//
+// Matched as "the name, or the name followed by a '.' suffix" rather than by a
+// bare prefix: a bare prefix would also swallow a hypothetical
+// _PyEval_EvalFrameDefaultSomethingElse, and claiming a function that is not
+// the eval loop puts the Python stack under the wrong native frame.
+func isEvalFragment(name string) bool {
+	return name == evalLoopSymbol || strings.HasPrefix(name, evalLoopSymbol+".")
 }
 
 // allFuncSymbols returns every STT_FUNC symbol in both symbol tables.

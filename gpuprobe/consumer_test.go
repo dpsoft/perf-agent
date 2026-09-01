@@ -938,7 +938,13 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 	// tail-call table and somewhere to keep the cursor.
 	require.Contains(t, spec.Maps, "handoff_ranges")
 	assert.Equal(t, uint32(8), spec.Maps["handoff_ranges"].KeySize, "keyed by table_id, not pid")
-	assert.Equal(t, uint32(24), spec.Maps["handoff_ranges"].ValueSize, "lo, hi, unwinder id, pad")
+	// MaxSpans spans of (lo, hi), then the unwinder id and its pad. It is a
+	// SET of spans because a compiler may split the claimed function across
+	// partitions -- CPython's eval loop is split three ways on uv's build --
+	// and claiming only one of them is indistinguishable from the runtime not
+	// being there at all.
+	assert.Equal(t, uint32(interp.MaxSpans*16+8), spec.Maps["handoff_ranges"].ValueSize,
+		"MaxSpans x (lo, hi), then unwinder id + pad")
 
 	require.Contains(t, spec.Maps, "interp_progs")
 	assert.Equal(t, ebpf.ProgramArray, spec.Maps["interp_progs"].Type)

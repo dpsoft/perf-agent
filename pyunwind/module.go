@@ -117,12 +117,28 @@ func (m *module) Enroll(pid uint32) (interp.Range, bool, error) {
 	if err != nil {
 		return interp.Range{}, true, err
 	}
-	r, err := EvalRangeForFile(libPath)
+	frags, err := EvalRangesForFile(libPath)
 	if err != nil {
 		return interp.Range{}, true, fmt.Errorf("%s: %w", libPath, err)
 	}
+	// The walker scans a fixed, measured number of spans per binary. When a
+	// build has more fragments than that, the SMALLEST are dropped -- they are
+	// sorted largest first -- and the drop is named. Covering less than the
+	// claim says, silently, is the failure mode this whole path exists to
+	// refuse; a line saying "3 of 4" lets an operator see it in the log rather
+	// than infer it from missing frames.
+	spans := make([]interp.Span, 0, interp.MaxSpans)
+	for _, f := range frags {
+		if len(spans) == interp.MaxSpans {
+			log.Printf("python frames: pid %d: %s: eval loop is in %d fragments, claiming the "+
+				"largest %d; samples in the rest will carry no Python frames",
+				pid, libPath, len(frags), interp.MaxSpans)
+			break
+		}
+		spans = append(spans, interp.Span{Lo: f.Lo, Hi: f.Hi})
+	}
 	log.Printf("python frames: pid %d: attached %s (CPython %s)", pid, libPath, res.Version)
-	return interp.Range{TableID: tableID, Lo: r.Lo, Hi: r.Hi}, true, nil
+	return interp.Range{TableID: tableID, Spans: spans}, true, nil
 }
 
 func (m *module) Detach(pid uint32) error { return DetachProcess(pid, m.maps) }

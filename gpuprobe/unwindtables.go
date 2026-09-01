@@ -116,6 +116,10 @@ func (d *gpuDriver) HandoffRangesMap() *ebpf.Map      { return d.objs.HandoffRan
 func (d *gpuDriver) ResumeStepProgram() *ebpf.Program { return d.objs.InterpResumeStep }
 func (d *gpuDriver) ResumeWalkProgram() *ebpf.Program { return d.objs.InterpResumeWalk }
 
+// InterpStatsMap returns the core's per-CPU record of why a handoff did or
+// did not happen. Read at shutdown; zero is a signal, not an absence.
+func (d *gpuDriver) InterpStatsMap() *ebpf.Map { return d.objs.InterpStats }
+
 // InterpEnabled is true unconditionally here, unlike the DWARF profilers'.
 // gpu_usdt is loaded once, without the verifier-rejection retry those two use
 // (profile.loadWithInterpGate): the GPU path has no --unwind auto to fall back

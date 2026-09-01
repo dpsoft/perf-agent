@@ -23,6 +23,7 @@ package interp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -63,22 +64,44 @@ const (
 // Mirrors INTERP_SLOT_UNWINDER in bpf/unwind_record.h.
 func SlotForID(id uint32) uint32 { return id + 1 }
 
-// Range is one claim on a binary's text: while the native walk is inside
-// [Lo, Hi) of the binary keyed by TableID, the unwinder that installed it
-// takes over.
+// MaxSpans is how many disjoint text spans one claim may cover. A module that
+// finds more must drop its smallest and say so: covering less than you claim,
+// silently, is the failure this whole seam is built to refuse.
 //
-// Lo/Hi are RELATIVE to the mapping's load bias -- the same space
-// mapping_for_pc reports rel_pc in -- so one entry serves every process
-// running that binary. TableID is the FNV-1a-of-build-id key the CFI tables
-// already use, which is the value walk_step is holding by the time it asks.
-type Range struct {
-	TableID uint64
-	Lo, Hi  uint64
+// The number is a MEASURED verifier ceiling, not a design preference -- the
+// scan is unrolled into the walk callback and four spans cost 2.9x what three
+// do. See HANDOFF_MAX_RANGES in bpf/unwind_common.h for the table.
+const MaxSpans = 3
+
+// Span is one contiguous claim on a binary's text, RELATIVE to the mapping's
+// load bias -- the same space mapping_for_pc reports rel_pc in -- so one entry
+// serves every process running that binary. Hi is exclusive.
+type Span struct {
+	Lo, Hi uint64
 }
 
-// handoffRange mirrors struct handoff_range in bpf/unwind_common.h.
+// Range is one unwinder's claim on a binary: while the native walk is inside
+// ANY of these spans of the binary keyed by TableID, that unwinder takes over.
+//
+// IT IS A SET OF SPANS AND NOT ONE SPAN because a compiler may split the
+// function that matters across several partitions, and CPython's eval loop is
+// exactly the function it does that to -- uv's cpython-3.12.14 has three, and
+// the largest of them is the one marked cold. A single span forced the
+// installer to choose, and choosing wrong is indistinguishable from the
+// runtime not being there at all. See HANDOFF_MAX_RANGES.
+//
+// TableID is the FNV-1a-of-build-id key the CFI tables already use, which is
+// the value walk_step is holding by the time it asks.
+type Range struct {
+	TableID uint64
+	Spans   []Span
+}
+
+// handoffRange mirrors struct handoff_range in bpf/unwind_common.h. Unused
+// spans stay zeroed, and zero matches no address, which is what lets the BPF
+// side scan without a count.
 type handoffRange struct {
-	Lo, Hi     uint64
+	Spans      [MaxSpans]Span
 	UnwinderID uint32
 	_          uint32
 }
@@ -103,6 +126,9 @@ type Driver interface {
 	// The driver's own two resume programs, which go in slots 0 and 1.
 	ResumeStepProgram() *ebpf.Program
 	ResumeWalkProgram() *ebpf.Program
+	// InterpStatsMap is the core's per-CPU record of why a handoff did or did
+	// not happen. See DispatchStats.
+	InterpStatsMap() *ebpf.Map
 	// InterpEnabled reports whether the loaded program carries the handoff at
 	// all. It is a load-time `const volatile` gate: on a kernel that refuses
 	// the program with the handoff compiled in, userspace reloads without it
@@ -327,13 +353,23 @@ func (s *Set) Enroll(pid uint32, logf func(format string, args ...any)) bool {
 			continue
 		}
 		found = true
-		if r.Hi <= r.Lo {
+		if len(r.Spans) == 0 {
 			// Recognised but not claimed: the module reported why itself.
 			continue
 		}
 		if err := s.installRange(e.mod.ID(), r); err != nil {
 			logf("%s frames: pid %d: REFUSED: %v", e.mod.Name(), pid, err)
+			continue
 		}
+		// Said out loud, because every other way of learning it needs
+		// capabilities: this is the claim the walker will look up, under the
+		// key it will compute, in the address space it reports rel_pc in.
+		var spans []string
+		for _, sp := range r.Spans {
+			spans = append(spans, fmt.Sprintf("[%#x,%#x)", sp.Lo, sp.Hi))
+		}
+		logf("%s frames: pid %d: handoff installed, table %#x unwinder %d spans %s",
+			e.mod.Name(), pid, r.TableID, e.mod.ID(), strings.Join(spans, " "))
 	}
 	return found
 }
@@ -351,12 +387,36 @@ func (s *Set) installRange(id uint32, r Range) error {
 	if m == nil {
 		return errors.New("driver exposes no handoff_ranges map")
 	}
-	if r.Hi <= r.Lo {
-		return fmt.Errorf("range [%#x,%#x) for table %#x is empty or inverted", r.Lo, r.Hi, r.TableID)
+	if len(r.Spans) == 0 {
+		return fmt.Errorf("claim for table %#x covers no text", r.TableID)
 	}
-	v := handoffRange{Lo: r.Lo, Hi: r.Hi, UnwinderID: id}
+	if len(r.Spans) > MaxSpans {
+		return fmt.Errorf("claim for table %#x has %d spans, the walker scans %d",
+			r.TableID, len(r.Spans), MaxSpans)
+	}
+	v := handoffRange{UnwinderID: id}
+	for i, sp := range r.Spans {
+		if sp.Hi <= sp.Lo {
+			return fmt.Errorf("span %d [%#x,%#x) for table %#x is empty or inverted",
+				i, sp.Lo, sp.Hi, r.TableID)
+		}
+		v.Spans[i] = sp
+	}
 	if err := m.Update(&r.TableID, &v, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("install handoff range for table %#x: %w", r.TableID, err)
+	}
+	// READ IT BACK. A claim that was not installed, or was installed under a
+	// key the walker does not compute, is indistinguishable from a walk that
+	// never reached the runtime -- both are silence plus a row of zeroed
+	// counters, and telling them apart from outside the kernel cost an hour
+	// once. One extra syscall per process at attach turns that into a fact in
+	// the log.
+	var back handoffRange
+	if err := m.Lookup(&r.TableID, &back); err != nil {
+		return fmt.Errorf("handoff range for table %#x did not read back: %w", r.TableID, err)
+	}
+	if back != v {
+		return fmt.Errorf("handoff range for table %#x read back as %+v, wrote %+v", r.TableID, back, v)
 	}
 	return nil
 }
@@ -383,11 +443,86 @@ func (s *Set) LogCounters(enrolled bool, logf func(format string, args ...any)) 
 	if s == nil {
 		return
 	}
+	// The CORE's account first, and unconditionally, because ZERO IS THE
+	// SIGNAL here. A module reporting all-zero counters has two completely
+	// different causes -- it ran and refused, or it was never reached -- and
+	// only these numbers separate them.
+	if m := s.driver.InterpStatsMap(); m != nil {
+		st, err := readDispatchStats(m)
+		if err != nil {
+			logf("interpreter handoff: counters unreadable: %v", err)
+		} else {
+			logf("interpreter handoff: range_hit=%d in_range=%d claimed=%d dispatched=%d "+
+				"tail_call_failed=%d budget_exhausted=%d resumed=%d -- %s",
+				st.RangeHit, st.InRange, st.Claimed, st.Dispatched,
+				st.TailCallFailed, st.Budget, st.Resumed, st.Diagnose())
+		}
+	}
 	for _, e := range s.entries {
 		if line := e.mod.Counters(enrolled); line != "" {
 			logf("%s", line)
 		}
 	}
+}
+
+// DispatchStats is the core's own account of why a handoff did or did not
+// happen, summed across CPUs. Mirrors INTERP_STAT_* in bpf/unwind_record.h.
+type DispatchStats struct {
+	RangeHit       uint64
+	InRange        uint64
+	Claimed        uint64
+	Dispatched     uint64
+	TailCallFailed uint64
+	Budget         uint64
+	Resumed        uint64
+}
+
+// Diagnose turns the counters into the one sentence a reader actually wants:
+// which step of the handoff broke, or that none did.
+//
+// It exists because the raw numbers are only legible to someone holding the
+// dispatch path in their head, and the person reading this log line at 2am is
+// not that person.
+func (d DispatchStats) Diagnose() string {
+	switch {
+	case d.RangeHit == 0:
+		return "NO CLAIM WAS EVER MATCHED: either nothing installed a handoff range, " +
+			"or the range was keyed by a table_id the walker does not compute for those frames. " +
+			"Check the 'handoff installed' line against the binary the samples land in"
+	case d.InRange == 0:
+		return "A CLAIM WAS FOUND BUT NO PC EVER FELL INSIDE IT: the installer and the walker " +
+			"disagree about the address space (a range in file offsets against a load-bias-relative pc, say)"
+	case d.Claimed == 0:
+		return "every matching frame belonged to an unwinder that had already finished with that sample"
+	case d.Dispatched == 0:
+		return "frames were claimed and none was dispatched; the round-trip budget is the only thing that does that"
+	case d.TailCallFailed > 0:
+		return "SOME TAIL CALLS DID NOT HAPPEN: the program array slot is empty, or the kernel's " +
+			"tail-call limit was reached. Those samples stop at the claimed frame"
+	case d.Resumed < d.Dispatched:
+		return "an unwinder was entered and did not hand control back"
+	default:
+		return "handoff healthy"
+	}
+}
+
+// readDispatchStats sums the per-CPU counters.
+func readDispatchStats(m *ebpf.Map) (DispatchStats, error) {
+	var out DispatchStats
+	slots := []*uint64{
+		&out.RangeHit, &out.InRange, &out.Claimed, &out.Dispatched,
+		&out.TailCallFailed, &out.Budget, &out.Resumed,
+	}
+	for i, dst := range slots {
+		var percpu []uint64
+		if err := m.Lookup(uint32(i), &percpu); err != nil {
+			return out, fmt.Errorf("read interp_stats[%d]: %w", i, err)
+		}
+		for _, v := range percpu {
+			*dst += v
+		}
+	}
+	return out, nil
 }
 
 // Close releases every attached module.

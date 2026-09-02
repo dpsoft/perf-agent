@@ -55,6 +55,13 @@ const (
 	mapWalkerScratch = "walker_scratch"
 	mapWalkStates    = "walk_states"
 	mapInterpProgs   = "interp_progs"
+	// Shared too, but OPTIONALLY: a module that never counts a dispatch works
+	// perfectly well against its own copy, and failing a module's load because
+	// a driver does not expose a diagnostic map would trade frames for
+	// telemetry. Bound when the driver has it so a module that DOES count
+	// lands in the same place the core does, rather than in a private map
+	// nothing reads.
+	mapInterpStats = "interp_stats"
 )
 
 // Prog-array slots, from bpf/unwind_record.h. Slots 0 and 1 are the driver's
@@ -355,6 +362,11 @@ func loadModule(m Module, d Driver) (*ebpf.Collection, error) {
 	for name, mp := range repl {
 		if mp == nil {
 			return nil, fmt.Errorf("driver exposes no %s map", name)
+		}
+	}
+	if st := d.InterpStatsMap(); st != nil {
+		if _, declared := spec.Maps[mapInterpStats]; declared {
+			repl[mapInterpStats] = st
 		}
 	}
 

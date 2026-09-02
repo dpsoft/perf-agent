@@ -1542,6 +1542,50 @@ bool is_launch_cbid(CUpti_CallbackId cbid) {
     }
 }
 
+// is_driver_launch_cbid names the DRIVER-API entry points that launch a kernel.
+//
+// The modern six only. cuLaunchGrid/cuLaunch are the pre-CUDA-4 APIs and
+// carry no grid dimensions; cuLaunchHostFunc enqueues a host callback, not a
+// kernel; cuLaunchCooperativeKernelMultiDevice spans devices and has no single
+// launch to attribute. Including any of them would put records on the wire for
+// things that are not one kernel launch on one device.
+bool is_driver_launch_cbid(CUpti_CallbackId cbid) {
+    switch (cbid) {
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel:
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz:
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx:
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz:
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel:
+        case CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel_ptsz:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// g_rt_launch_depth is how a driver-API launch callback tells "this is the
+// same launch the runtime layer just reported" from "this is a launch the
+// runtime layer will never see".
+//
+// EVERY cudaLaunchKernel CALLS cuLaunchKernel, so with both domains enabled
+// CUPTI delivers two callbacks for one launch. Measured on this host, they
+// carry the SAME correlation id:
+//
+//	PROBE RT   cbid=211 corr=122 sym=_Z8rs_scalePffi
+//	PROBE DRV  cbid=307 corr=122 sym=_Z8rs_scalePffi
+//
+// which is the good news and the trap in one. Good, because the join is
+// unaffected -- there is only one id per launch, so the kernel activity record
+// cannot start pointing somewhere else. A trap, because two launch records
+// with the same correlation would be an exact duplicate: the executions/launch
+// ratio would go from 1.372 to about 0.7, every sampling decision would be
+// consumed twice, and it would look like it worked.
+//
+// Thread-local because the nested call is synchronous on the launching thread.
+// A counter rather than a flag so a future nested launch path cannot clear it
+// early.
+thread_local int g_rt_launch_depth = 0;
+
 void emit_name_if_new(uint64_t kernel_id, const char *name) {
     if (!gpu_kernel_name_v1_enabled()) return;
     gpu_kernel_name_v1 rec{};
@@ -1703,6 +1747,23 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
         if (cbid == CUPTI_CBID_STATE_FATAL_ERROR) on_finalize("cupti fatal error");
         return;
     }
+    if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+        // A kernel launch the runtime layer never sees. cuBLAS, cuDNN and any
+        // application using the driver API directly (Rust's cust and cudarc,
+        // among others) launch this way, and before this arm existed those
+        // launches produced no record at all -- their executions arrived with
+        // nothing to join to. Issue #118.
+        if (!is_driver_launch_cbid(cbid)) return;
+        if (g_rt_launch_depth > 0) return;  // the runtime layer already has it
+        const CUpti_CallbackData *d = (const CUpti_CallbackData *)cbdata;
+        if (d->callbackSite == CUPTI_API_ENTER) {
+            burst_open_at_launch(mono_ns());
+            on_launch(d);
+            return;
+        }
+        if (d->callbackSite == CUPTI_API_EXIT) burst_close_at_launch(mono_ns());
+        return;
+    }
     if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) return;
     const CUpti_CallbackData *cb = (const CUpti_CallbackData *)cbdata;
     // Launch cbids only, on BOTH sites now. The EXIT half is new with issue
@@ -1711,6 +1772,11 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
     // has a place to call cuptiPCSamplingStop from the application's thread.
     if (!is_launch_cbid(cbid)) return;
     if (cb->callbackSite == CUPTI_API_ENTER) {
+        // Raised BEFORE anything else, and unconditionally: the nested
+        // cuLaunchKernel callback fires between this and the EXIT below, and
+        // it has to see the depth even on the paths where on_launch returns
+        // early. Missing it would double-count every runtime launch.
+        g_rt_launch_depth++;
         // The burst opens BEFORE the launch it is about to serialize, which is
         // the whole point of taking the ENTER: a window opened after the
         // launch had been issued would not cover it, and the execution would
@@ -1719,7 +1785,10 @@ void CUPTIAPI on_callback(void *, CUpti_CallbackDomain domain, CUpti_CallbackId 
         on_launch(cb);
         return;
     }
-    if (cb->callbackSite == CUPTI_API_EXIT) burst_close_at_launch(mono_ns());
+    if (cb->callbackSite == CUPTI_API_EXIT) {
+        burst_close_at_launch(mono_ns());
+        if (g_rt_launch_depth > 0) g_rt_launch_depth--;
+    }
 }
 
 // -------------------------------------------------------------- exec path
@@ -2477,13 +2546,32 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                                           nullptr),
                "cuptiSubscribe"))
         return 0;
-    // RUNTIME_API and RESOURCE only. Adding DRIVER_API more than doubled
-    // correlation-id consumption in the spike (2.242 vs 1.004 ids per launch),
-    // which halves the time to a uint32 wrap, and buys this ABI nothing.
     check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API),
           "enable RUNTIME_API");
     check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE),
           "enable RESOURCE");
+    // DRIVER_API, for the launches the runtime layer never sees.
+    //
+    // This used to be off, on the reasoning that it "more than doubled
+    // correlation-id consumption in the spike (2.242 vs 1.004 ids per launch),
+    // which halves the time to a uint32 wrap, and buys this ABI nothing". The
+    // first half is still true and is the price; the second half was wrong.
+    // Measured on a PyTorch workload, 27% of kernel EXECUTIONS -- about 89% of
+    // GPU time -- arrived with no launch record to join to, because cuBLAS and
+    // cuDNN launch through the driver API and the runtime callback never
+    // fires. An application written against the driver API directly (Rust's
+    // cust and cudarc) produced no launch records at all. Issue #118.
+    //
+    // The id consumption is real and is accepted rather than dismissed: the
+    // wrap interval halves, from about 2.2 hours at 542k launches/s to about
+    // 1.1. correlate_launch/correlate_activity already extend the id with an
+    // epoch precisely so a wrap is survivable, so this shortens an interval
+    // that is already handled rather than introducing a new failure.
+    //
+    // Double-counting is prevented by g_rt_launch_depth, not by hoping the two
+    // domains do not overlap -- they do, on every single runtime launch.
+    check(perfagent::cupti::EnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API),
+          "enable DRIVER_API");
     if (g_pc_enabled) {
         // The only notification that CUPTI is about to finalize itself. Not
         // subscribed when Tier B is off: with no PC sampling enabled there is

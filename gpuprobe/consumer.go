@@ -35,13 +35,14 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/kernelver"
 	"github.com/dpsoft/perf-agent/internal/usdt"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 )
 
 const (
@@ -84,6 +85,15 @@ const (
 	// bound and also terminated happens to be a complete stack exactly this
 	// deep, not a truncated one.
 	maxWalkFrames = 127
+
+	// frameTagNative mirrors FRAME_TAG_NATIVE in bpf/unwind_record.h: the
+	// kind of each pcs[] slot. A native slot holds one instruction pointer;
+	// any other tag value is an UNWINDER ID and marks the first of TWO
+	// consecutive slots written by that unwinder, neither of which is an
+	// instruction pointer. Symbolizing either as a native PC invents a frame,
+	// so resolveStackLocked folds them out (interp.SplitSlots) before the
+	// symbolizer ever sees the addresses.
+	frameTagNative = interp.FrameTagNative
 
 	// The walkerFlag* constants mirror WALKER_FLAG_* in
 	// bpf/unwind_common.h. They ride in struct gpu_stack's walker_flags and
@@ -159,6 +169,15 @@ const (
 	walkerFlagFPExhausted      = 0x10
 	walkerFlagFPNonMonotonic   = 0x20
 	walkerFlagRootDisagreement = 0x40
+	// walkerFlagFramePushRefused mirrors WALKER_FLAG_FRAME_PUSH_REFUSED
+	// (issue #83): frame_push_native or frame_push_python ran out of
+	// pcs[]/tags[] room and dropped a frame rather than write it.
+	// Deliberately NOT folded into the classification switch below: the
+	// switch partitions how a walk ENDED, and a refused push is a frame
+	// missing from the middle of a walk that ended some other way. Which
+	// pusher hit it is recorded on the BPF side instead, by whichever
+	// unwinder was pushing, in its own counters.
+	walkerFlagFramePushRefused = 0x80
 
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
 	// the end of the chain". Neither StackWalkTruncated nor
@@ -176,17 +195,28 @@ const (
 	// See the classification switch, which tests it first.
 	walkerFlagsTerminated = walkerFlagFPTerminated | walkerFlagRAUndefined
 
-	// gpuStackHdrSize and gpuStackSize mirror struct gpu_stack in
-	// bpf/gpu_usdt.bpf.c:
+	// gpuStackHdrSize, gpuStackTagsOff and gpuStackSize mirror struct
+	// gpu_stack in bpf/gpu_usdt.bpf.c:
 	//
-	//	0 n_pcs  4 walker_flags  8 pcs[MAX_FRAMES]
+	//	0 n_pcs  4 walker_flags  8 pcs[MAX_FRAMES]  1024 tags[MAX_FRAMES]  1151 pad
 	//
 	// The value is fixed-size because a BPF map value is; n_pcs says how
 	// much of it is real. TestEmbeddedProgramCarriesTheStackMap pins
 	// gpuStackSize against the embedded object's own value size, so a change
 	// on either side fails a unit test rather than decoding garbage.
-	gpuStackHdrSize = 8
-	gpuStackSize    = gpuStackHdrSize + maxWalkFrames*8
+	//
+	// tags[] arrived with issue #83: one FRAME_TAG_* byte per pcs[] slot,
+	// because an interpreter frame occupies two consecutive slots and,
+	// without the tag, reaches this consumer indistinguishable from two
+	// native PCs.
+	// gpuStackPadBytes is the compiler's own alignment pad after the u8
+	// array - spelled out rather than folded into a magic number, the same
+	// way unwind/dwarfagent's SampleRecordBytes had to be after getting this
+	// exact arithmetic wrong once.
+	gpuStackHdrSize  = 8
+	gpuStackTagsOff  = gpuStackHdrSize + maxWalkFrames*8
+	gpuStackPadBytes = 1
+	gpuStackSize     = gpuStackTagsOff + maxWalkFrames + gpuStackPadBytes
 
 	// gpuStackCapacity mirrors GPU_STACKS_SIZE: how many captures gpu_stacks
 	// can hold at once, i.e. how many may be in flight between the probe and
@@ -244,31 +274,6 @@ func cookieFor(probeName string) uint64 {
 		return kindDropped
 	}
 	return 0
-}
-
-// kernelVersionCode supplies what BPF_PROG_TYPE_KPROBE requires. cilium/ebpf
-// would otherwise read the vDSO through /proc/self/mem, which a setcap'd
-// binary cannot do because file capabilities make the process non-dumpable —
-// and it fails with an error that names neither capabilities nor uprobes.
-func kernelVersionCode() uint32 {
-	var u unix.Utsname
-	if err := unix.Uname(&u); err != nil {
-		return 0
-	}
-	release := unix.ByteSliceToString(u.Release[:])
-	var a, b, c uint32
-	// A release like "6.19.10-300.fc44.x86_64" parses as 6.19.10; a two-part
-	// release like "6.19" leaves c at zero, which is what LINUX_VERSION_CODE
-	// would say too.
-	if _, err := fmt.Sscanf(release, "%d.%d.%d", &a, &b, &c); err != nil {
-		if _, err := fmt.Sscanf(release, "%d.%d", &a, &b); err != nil {
-			return 0
-		}
-	}
-	if c > 255 {
-		c = 255
-	}
-	return a<<16 | b<<8 | c
 }
 
 // Config describes what to attach to and where the normalized events go.
@@ -988,6 +993,26 @@ type Stats struct {
 	// filling, so a rising count here is the early warning for capture
 	// failures (StacksMissing) that follow.
 	StackDeleteFailed uint64
+	// StackInterpFrames counts interpreter frames spliced into resolved
+	// launch stacks - one per two pcs[] slots the walker tagged with an
+	// unwinder id rather than FRAME_TAG_NATIVE (bpf/unwind_record.h). They
+	// are placed at their own position in the call path and named by the
+	// unwinder that wrote them (for CPython, "python:0x..."); what this
+	// counter answers is whether the handoff is reaching the GPU path at all,
+	// which no other number here can say.
+	//
+	// One counter across every language, deliberately. It answers a question
+	// about the HANDOFF, which is one mechanism; per-language totals belong to
+	// the module's own counters, where the units and the failure modes are
+	// the module's to define.
+	StackInterpFrames uint64
+	// StackInterpPairsTruncated counts walks that ended between the two slots
+	// of an interpreter frame - MAX_FRAMES landed mid-pair, so the first word
+	// arrived and its partner did not. The half frame is dropped rather than
+	// half-read, and this is the counter that stops that drop being silent.
+	// Expect it to be small and to move together with
+	// walkerFlagFramePushRefused.
+	StackInterpPairsTruncated uint64
 	// StacksUncorrelated counts captures whose sampled launch carried a
 	// wire correlation of zero. The stack is real, but the ABI's "no
 	// correlation" leaves nothing to pair it with: the batched twin cannot
@@ -1571,12 +1596,9 @@ func Attach(cfg Config) (c *Consumer, err error) {
 	if err != nil {
 		return nil, err
 	}
-	// See kernelVersionCode: without this cilium/ebpf discovers the version
-	// through the vDSO, which a setcap'd (non-dumpable) process cannot read.
-	kv := kernelVersionCode()
-	for _, p := range spec.Programs {
-		p.KernelVersion = kv
-	}
+	// Without this cilium/ebpf discovers the version through the vDSO, which a
+	// setcap'd (non-dumpable) process cannot read. See internal/kernelver.
+	kernelver.Apply(spec)
 
 	c = newConsumer(cfg)
 	// Every failure below this point must leave through a *bare* return that
@@ -2517,9 +2539,9 @@ func (c *Consumer) attachLocked(ev *gpu.GPUKernelLaunch, frames []pp.Frame, peri
 // indistinguishable from a complete one once the length is thrown away.
 //
 // n_pcs comes off the wire, so it is clamped rather than trusted.
-func decodeGPUStack(raw []byte) (pcs []uint64, flags uint32, ok bool) {
+func decodeGPUStack(raw []byte) (pcs []uint64, tags []uint8, flags uint32, ok bool) {
 	if len(raw) < gpuStackSize {
-		return nil, 0, false
+		return nil, nil, 0, false
 	}
 	le := binary.LittleEndian
 	n := int(le.Uint32(raw[0:]))
@@ -2528,10 +2550,16 @@ func decodeGPUStack(raw []byte) (pcs []uint64, flags uint32, ok bool) {
 		n = maxWalkFrames
 	}
 	pcs = make([]uint64, n)
+	tags = make([]uint8, n)
 	for i := range pcs {
 		pcs[i] = le.Uint64(raw[gpuStackHdrSize+i*8:])
+		// Only the first n tags are read, for the same reason only the first
+		// n PCs are: the BPF side copies both arrays whole out of a per-CPU
+		// scratch buffer, so the slots past n_pcs still hold the previous
+		// capture's bytes.
+		tags[i] = raw[gpuStackTagsOff+i]
 	}
-	return pcs, flags, true
+	return pcs, tags, flags, true
 }
 
 // resolveStackLocked turns a gpu_stacks handle into symbolized frames: read
@@ -2567,7 +2595,7 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		}
 		return nil, false
 	}
-	ips, flags, ok := decodeGPUStack(raw)
+	ips, tags, flags, ok := decodeGPUStack(raw)
 	// Free the slot as soon as its contents are in hand, before anything
 	// that can fail: the entry is useless to us from here on either way.
 	c.freeStackLocked(stackID)
@@ -2715,10 +2743,30 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	// that snapshot rather than against /proc — which is Phase 4b work, not
 	// this phase's. Until then the degradation is at least COUNTED, which is
 	// the part that was missing.
-	frames, err := c.cfg.Symbolizer.SymbolizeProcess(pid, ips)
-	if err != nil {
-		c.stats.SymbolizeFailed++
-		return nil, false
+	// Split the tagged slots before anything is symbolized. An interpreter
+	// frame occupies two consecutive slots holding whatever pair of words its
+	// unwinder chose; handing either to the symbolizer asks it to name an
+	// address that is not code, and blazesym will happily place it in
+	// whatever mapping it falls in. Two plausible, wrong native frames on the
+	// one path this whole feature exists to serve - issue #83.
+	//
+	// The fold lives in unwind/interp, shared with the DWARF profilers'
+	// consumer: one implementation of "which words are instruction pointers"
+	// rather than two that can drift.
+	slots, truncatedPair := interp.SplitSlots(ips, tags)
+	if truncatedPair {
+		c.stats.StackInterpPairsTruncated++
+	}
+	native := interp.NativeIPs(slots)
+
+	var frames []symbolize.Frame
+	if len(native) > 0 {
+		var err error
+		frames, err = c.cfg.Symbolizer.SymbolizeProcess(pid, native)
+		if err != nil {
+			c.stats.SymbolizeFailed++
+			return nil, false
+		}
 	}
 	// Symbolization that returns a frame per IP and resolves not one name is
 	// not success. Counted here, before ToProfFrames flattens the inline
@@ -2747,7 +2795,47 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 	if resolved == 0 && len(frames) > 0 {
 		c.stats.StacksUnresolved++
 	}
-	out := symbolize.ToProfFrames(frames)
+	// Splice the interpreter frames back in at their own positions, at the
+	// symbolize.Frame level where the correspondence with `native` is still
+	// one-to-one: ToProfFrames expands inline chains, so after it runs there
+	// is no index to splice against any more. Counted after the
+	// resolved/moduleOnly loop above so an unsymbolized interpreter frame does
+	// not inflate StackFramesUnresolved, which measures the NATIVE
+	// symbolizer's reach.
+	// symbolize.LocalSymbolizer documents one Frame per IP (symbolize/local.go),
+	// and the splice below relies on it: `frames` is indexed positionally
+	// against the native slots. A shorter return would silently drop the tail
+	// natives from the call path -- placed frames would stay in order, but the
+	// stack would be short with nothing saying so. Refuse rather than emit a
+	// truncated call path, and count it as the symbolization failure it is.
+	if len(frames) != len(native) {
+		c.stats.SymbolizeFailed++
+		return nil, false
+	}
+
+	merged := frames
+	if len(native) != len(slots) {
+		merged = make([]symbolize.Frame, 0, len(slots))
+		next := 0
+		for _, sl := range slots {
+			if sl.IsInterp() {
+				c.stats.StackInterpFrames++
+				merged = append(merged, symbolize.Frame{
+					Address: sl.PC,
+					Name:    sl.Name(),
+					// Not FailureNone: the frame is placed correctly and its
+					// address is real, but nothing named it, and pprof has no
+					// unsymbolized bit of its own to infer that from later.
+					Reason: symbolize.FailureMissingSymbols,
+				})
+				continue
+			}
+			merged = append(merged, frames[next])
+			next++
+		}
+	}
+
+	out := symbolize.ToProfFrames(merged)
 	if len(out) == 0 {
 		c.stats.SymbolizeFailed++
 		return nil, false

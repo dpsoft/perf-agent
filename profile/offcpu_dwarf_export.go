@@ -5,6 +5,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
@@ -33,18 +34,23 @@ func LoadOffCPUDwarf(systemWide, kernelStacks bool) (*OffCPUDwarf, error) {
 		return nil, fmt.Errorf("remove memlock: %w", err)
 	}
 
-	spec, err := loadOffcpu_dwarf()
-	if err != nil {
-		return nil, fmt.Errorf("load offcpu_dwarf spec: %w", err)
-	}
-	if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
-		return nil, fmt.Errorf("set system_wide: %w", err)
-	}
-	if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
-		return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
+	newSpec := func() (*ebpf.CollectionSpec, error) {
+		spec, err := loadOffcpu_dwarf()
+		if err != nil {
+			return nil, fmt.Errorf("load offcpu_dwarf spec: %w", err)
+		}
+		if err := spec.Variables["system_wide"].Set(systemWide); err != nil {
+			return nil, fmt.Errorf("set system_wide: %w", err)
+		}
+		if err := spec.Variables["kernel_stacks_enabled"].Set(kernelStacks); err != nil {
+			return nil, fmt.Errorf("set kernel_stacks_enabled: %w", err)
+		}
+		return spec, nil
 	}
 	p := &OffCPUDwarf{}
-	if err := spec.LoadAndAssign(&p.objs, nil); err != nil {
+	if err := loadWithInterpGate("offcpu_dwarf", newSpec, func(spec *ebpf.CollectionSpec) error {
+		return spec.LoadAndAssign(&p.objs, nil)
+	}); err != nil {
 		return nil, fmt.Errorf("load and assign: %w", err)
 	}
 	return p, nil
@@ -85,6 +91,29 @@ func (p *OffCPUDwarf) Close() error {
 	return p.objs.Close()
 }
 
+var _ interp.Driver = (*OffCPUDwarf)(nil)
+
+// ----- The interpreter seam (unwind/interp.Driver). See PerfDwarf's copy for
+// what each of these is; the only difference here is the flavour, because a
+// tp_btf program can only tail-call another tp_btf program attached to the
+// SAME tracepoint.
+func (p *OffCPUDwarf) Flavour() interp.Flavour          { return interp.FlavourSchedSwitch }
+func (p *OffCPUDwarf) WalkerScratchMap() *ebpf.Map      { return p.objs.WalkerScratch }
+func (p *OffCPUDwarf) WalkStatesMap() *ebpf.Map         { return p.objs.WalkStates }
+func (p *OffCPUDwarf) InterpProgsMap() *ebpf.Map        { return p.objs.InterpProgs }
+func (p *OffCPUDwarf) HandoffRangesMap() *ebpf.Map      { return p.objs.HandoffRanges }
+func (p *OffCPUDwarf) ResumeStepProgram() *ebpf.Program { return p.objs.InterpResumeStep }
+func (p *OffCPUDwarf) ResumeWalkProgram() *ebpf.Program { return p.objs.InterpResumeWalk }
+
+// InterpStatsMap returns the core's per-CPU record of why a handoff did or
+// did not happen. Read at shutdown; zero is a signal, not an absence.
+func (p *OffCPUDwarf) InterpStatsMap() *ebpf.Map { return p.objs.InterpStats }
+
+func (p *OffCPUDwarf) InterpEnabled() bool {
+	_, enabled, _ := InterpState()
+	return enabled
+}
+
 // CFIRulesMap returns the cfi_rules HASH_OF_MAPS outer map.
 func (p *OffCPUDwarf) CFIRulesMap() *ebpf.Map {
 	return p.objs.CfiRules
@@ -93,16 +122,6 @@ func (p *OffCPUDwarf) CFIRulesMap() *ebpf.Map {
 // CFILengthsMap returns the cfi_lengths HASH keyed by table_id → u32 length.
 func (p *OffCPUDwarf) CFILengthsMap() *ebpf.Map {
 	return p.objs.CfiLengths
-}
-
-// CFIClassificationMap returns the cfi_classification HASH_OF_MAPS outer map.
-func (p *OffCPUDwarf) CFIClassificationMap() *ebpf.Map {
-	return p.objs.CfiClassification
-}
-
-// CFIClassificationLengthsMap returns the cfi_classification_lengths HASH.
-func (p *OffCPUDwarf) CFIClassificationLengthsMap() *ebpf.Map {
-	return p.objs.CfiClassificationLengths
 }
 
 // PIDMappingsMap returns the pid_mappings HASH_OF_MAPS outer map.

@@ -210,9 +210,9 @@ struct {
 // mints itself. gpuprobe.Consumer.resolveStackLocked reads the entry and
 // deletes it; nothing else reclaims a slot.
 //
-// One value is 4 + 4 + 127*8 = 1024 bytes, so GPU_STACKS_SIZE entries
-// preallocate 4 MB — the same order as the `events` ringbuf above, and
-// deliberately so: occupancy is proportional to how many captures are in
+// One value is 4 + 4 + 127*8 + 127 (+1 pad) = 1152 bytes, so GPU_STACKS_SIZE
+// entries preallocate 4.5 MB — the same order as the `events` ringbuf above,
+// and deliberately so: occupancy is proportional to how many captures are in
 // flight between the probe and the consumer's drain, not to the length of
 // the run. 4096 is roughly two full ringbufs' worth of sampled launches, so
 // the map cannot fill before the ringbuf does unless the consumer has
@@ -228,10 +228,22 @@ struct gpu_stack {
     // lookup cut the walk short — and re-deriving that later is impossible.
     __u32 walker_flags;
     __u64 pcs[MAX_FRAMES];
+    // One FRAME_TAG_* byte per pcs[] slot, mirroring struct sample_record's
+    // tags[] (bpf/unwind_common.h) and laid out the same way: trailing
+    // pcs[], not interleaved, so pcs[]'s byte offset is unchanged.
+    //
+    // Issue #83: without this, a Python frame — two consecutive slots
+    // holding a code-object address and an encoded instruction word —
+    // arrives here indistinguishable from two native PCs, and the consumer
+    // symbolizes both against the process's mappings. That produces two
+    // plausible, wrong native frames on the ONE path this whole feature
+    // exists to serve, and nothing downstream could tell. The 128 bytes are
+    // the price of that not happening.
+    __u8 tags[MAX_FRAMES];
 };
 
-_Static_assert(sizeof(struct gpu_stack) == 1024,
-               "gpu_stack must stay 1024 bytes; see gpuStackSize in gpuprobe/consumer.go");
+_Static_assert(sizeof(struct gpu_stack) == 1152,
+               "gpu_stack must stay 1152 bytes; see gpuStackSize in gpuprobe/consumer.go");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -240,8 +252,10 @@ struct {
     __type(value, struct gpu_stack);
 } gpu_stacks SEC(".maps");
 
-// Staging buffer for one gpu_stack. The value is 1024 bytes and the BPF
-// stack is 512, so the copy from walker_scratch has to land in a map.
+// Staging buffer for one gpu_stack. The value is 1152 bytes (see the
+// _Static_assert above; it was 1024 before tags[] was added for issue #83)
+// and the BPF stack is 512, so the copy from walker_scratch has to land in a
+// map.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -446,51 +460,63 @@ static __always_inline __s32 next_stack_id(void)
     return (__s32)((cpu << GPU_STACK_SEQ_BITS) | (n & GPU_STACK_SEQ_MASK));
 }
 
-// capture_stack walks the launching thread's user stack with the hybrid
-// DWARF/FP walker and parks the result in gpu_stacks. Returns the handle, or
-// -1 if there is nothing to hand the consumer. Every -1 is counted twice: in
-// walk_errors (why) and, by the caller, in stacks_missing (that it happened).
+// ----- The sampled-launch path, in two halves.
 //
-// The walk is driven exactly as perf_dwarf.bpf.c and offcpu_dwarf.bpf.c
-// drive it — walker_flags zeroed BEFORE bpf_loop, because walk_step ORs bits
-// into it as it classifies frames.
-static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
+// A launch whose stack we capture cannot be emitted the way the other kinds
+// are, and the reason is structural rather than stylistic: the walk may
+// TAIL-CALL an interpreter unwinder, which replaces the running program. A
+// reserved ringbuf record cannot be held across that -- the verifier refuses a
+// tail call while a reference is unreleased, and were it not for that the
+// record would simply be leaked. So the walk runs with nothing held, and
+// everything the emit needs is parked here while it runs.
+//
+// THIS IS THE ONE DRIVER WHOSE SHAPE HAD TO CHANGE, and it is worth saying
+// why rather than pretending the three are symmetric. perf_dwarf and
+// offcpu_dwarf hand the finished sample_record straight to a ringbuf or a
+// hash; this one has to reserve its ringbuf record FIRST (the batch payload is
+// read into it) and mint a stack handle to put in that record's header. The
+// walk therefore sits between two halves of one emit, where for the other two
+// it sits before a single one.
+//
+// The ORDER within the emit is unchanged from before the split, deliberately:
+// reserve, read the payload, then mint an id and publish the stack. A batch
+// that will never be submitted still consumes no gpu_stacks slot.
+struct gpu_pending {
+    __u64 ptr;      // the producer's record array, in its own address space
+    __u64 seq;
+    __u32 count;    // records, already clamped to this kind's cap
+    __u32 kind;
+    __u32 bytes;    // count * record_size(kind), already clamped to the payload
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct gpu_pending);
+} gpu_pending_batch SEC(".maps");
+
+// gpu_publish_stack copies the completed walk out of walker_scratch into
+// gpu_stacks under a freshly minted handle. Returns the handle, or -1 if there
+// is nothing to hand the consumer; every -1 is counted twice, in walk_errors
+// (why) and, by the caller, in stacks_missing (that it happened).
+static __always_inline __s32 gpu_publish_stack(struct sample_record *rec, __u32 n)
 {
     __u32 zero = 0;
-    __u32 n;
     __s32 id;
     long ret;
 
-    struct sample_record *rec = bpf_map_lookup_elem(&walker_scratch, &zero);
-    if (!rec) {
-        count_walk_error(WALK_ERR_NO_SCRATCH);
-        return -1;
-    }
-    struct gpu_stack *out = bpf_map_lookup_elem(&gpu_stack_scratch, &zero);
-    if (!out) {
-        count_walk_error(WALK_ERR_NO_SCRATCH);
-        return -1;
-    }
-
-    // At a USDT probe the register file is the application's own: ip is the
-    // probe site, fp/sp the launching thread's frame. PT_REGS_* expand to
-    // ip/bp/sp on x86_64 and pc/regs[29]/sp on arm64.
-    struct walk_ctx walker = {
-        .pc    = (__u64)PT_REGS_IP(ctx),
-        .fp    = (__u64)PT_REGS_FP(ctx),
-        .sp    = (__u64)PT_REGS_SP(ctx),
-        .pid   = tgid,
-        .n_pcs = 0,
-        .rec   = rec,
-    };
-    rec->hdr.walker_flags = 0;
-    bpf_loop(MAX_FRAMES, walk_step, &walker, 0);
-
-    n = walker.n_pcs > MAX_FRAMES ? MAX_FRAMES : walker.n_pcs;
     if (n == 0) {
         // Not even the probe's own PC came back. Nothing to attribute, and
         // an entry holding zero frames would only be refused on read.
         count_walk_error(WALK_ERR_EMPTY);
+        return -1;
+    }
+
+    struct gpu_stack *out = bpf_map_lookup_elem(&gpu_stack_scratch, &zero);
+    if (!out) {
+        count_walk_error(WALK_ERR_NO_SCRATCH);
         return -1;
     }
 
@@ -507,7 +533,13 @@ static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
     // n_pcs are never read — the consumer honours n_pcs rather than scanning
     // for a zero terminator, precisely because this scratch is per-CPU and
     // its tail still holds the previous capture's PCs.
+    //
+    // tags[] rides along for the same reason and under the same rule: it is
+    // one byte per pcs[] slot and the consumer reads only the first n_pcs of
+    // them. Without it an interpreter frame's two slots would reach userspace
+    // looking exactly like two native PCs (issue #83).
     __builtin_memcpy(out->pcs, rec->pcs, sizeof(out->pcs));
+    __builtin_memcpy(out->tags, rec->tags, sizeof(out->tags));
 
     // BPF_NOEXIST, never BPF_ANY. If this id is somehow still live — a
     // per-CPU sequence that wrapped past an entry the consumer never read —
@@ -522,6 +554,110 @@ static __always_inline __s32 capture_stack(struct pt_regs *ctx, __u32 tgid)
     return id;
 }
 
+// gpu_sampled_walk walks (or resumes the walk of) the launching thread's user
+// stack, then emits the batch that has been waiting on it.
+//
+// Two programs call it: gpu_usdt_batch below, once it has parked the batch and
+// initialised the walk state, and interp_resume_walk, once an interpreter
+// module has appended its frames and handed control back.
+//
+// IT LOOKS THE TWO PER-CPU WALK MAPS UP ITSELF rather than taking them as
+// arguments, and that is measured, not incidental: holding those map-value
+// pointers live across unwind_walk costs the verifier 146,027 processed
+// instructions (333,403 against 187,376 on perf_dwarf, same shape), because
+// both are then part of the state at every point inside the walk loop.
+static __always_inline void gpu_sampled_walk(void *ctx, bool resumed)
+{
+    __u32 zero = 0;
+    struct walk_persist *st = walk_state_get();
+    struct sample_record *rec = walk_record_get();
+    if (!st || !rec) return;
+
+    // MAY NOT RETURN: on a handoff this tail-calls the claiming unwinder and
+    // this program ceases to exist. Nothing is held across it.
+    __u32 n_pcs = unwind_walk(ctx, st, rec, resumed);
+
+    struct gpu_pending *p = bpf_map_lookup_elem(&gpu_pending_batch, &zero);
+    if (!p) {
+        count_drop(KIND_LAUNCH_SAMPLED, 1);
+        return;
+    }
+    __u32 kind = p->kind;
+    __u32 count = p->count;
+    __u32 bytes = p->bytes;
+    __u64 ptr = p->ptr;
+    __u64 seq = p->seq;
+    // The clamp is re-asserted on the value read back out of the map. A bound
+    // proved before the walk was a bound on a register that no longer exists,
+    // and the verifier will not carry one across a map value it cannot see
+    // into -- the same discipline record_push_native documents, for the same
+    // reason.
+    if (bytes > PAYLOAD_BYTES) bytes = PAYLOAD_BYTES;
+
+    struct batch_msg *msg = bpf_ringbuf_reserve(&events, sizeof(*msg), 0);
+    if (!msg) {
+        count_drop(kind, count);
+        return;
+    }
+    if (bpf_probe_read_user(msg->payload, bytes, (const void *)ptr) != 0) {
+        bpf_ringbuf_discard(msg, 0);
+        count_drop(kind, count);
+        return;
+    }
+
+    // Published only now that the reservation has succeeded, so a batch that
+    // will never be submitted does not consume a gpu_stacks slot.
+    //
+    // A negative return is a real outcome — an empty walk, a full map, a
+    // refused insert — not an error to bail on. It is counted, and the record
+    // still flows with a negative stack_id, so a launch is never lost merely
+    // because its stack was.
+    __s32 stack_id = gpu_publish_stack(rec, n_pcs);
+    if (stack_id < 0) count_stack_missing(KIND_LAUNCH_SAMPLED);
+
+    __u64 id = bpf_get_current_pid_tgid();
+    msg->hdr.kind = kind;
+    msg->hdr.count = count;
+    msg->hdr.seq = seq;
+    msg->hdr.pid = (__u32)(id >> 32);
+    msg->hdr.tid = (__u32)id;
+    msg->hdr.bytes = bytes;
+    msg->hdr.stack_id = stack_id;
+    msg->hdr._pad = 0;
+    bpf_ringbuf_submit(msg, 0);
+}
+
+INTERP_DEFINE_PROGRAMS("uprobe.multi", gpu_sampled_walk)
+
+// gpu_emit_plain submits a batch that carries no stack: reserve, copy, submit,
+// with nothing to walk and nothing to park. Every kind but KIND_LAUNCH_SAMPLED
+// takes this path, which is the path all of them took before the walk had to
+// be able to tail-call.
+static __always_inline void gpu_emit_plain(__u32 kind, __u32 count, __u64 seq,
+                                           __u32 bytes, __u64 ptr)
+{
+    struct batch_msg *msg = bpf_ringbuf_reserve(&events, sizeof(*msg), 0);
+    if (!msg) {
+        count_drop(kind, count);
+        return;
+    }
+    if (bpf_probe_read_user(msg->payload, bytes, (const void *)ptr) != 0) {
+        bpf_ringbuf_discard(msg, 0);
+        count_drop(kind, count);
+        return;
+    }
+    __u64 id = bpf_get_current_pid_tgid();
+    msg->hdr.kind = kind;
+    msg->hdr.count = count;
+    msg->hdr.seq = seq;
+    msg->hdr.pid = (__u32)(id >> 32);
+    msg->hdr.tid = (__u32)id;
+    msg->hdr.bytes = bytes;
+    msg->hdr.stack_id = -1;
+    msg->hdr._pad = 0;
+    bpf_ringbuf_submit(msg, 0);
+}
+
 SEC("uprobe.multi")
 int gpu_usdt_batch(struct pt_regs *ctx)
 {
@@ -533,10 +669,8 @@ int gpu_usdt_batch(struct pt_regs *ctx)
     __u32 kind = (__u32)bpf_get_attach_cookie(ctx);
     __u32 rsz = record_size(kind);
     __u32 cap = max_records(kind);
-    __s32 stack_id = -1;
+    __u32 zero = 0;
     __u32 bytes;
-    __u64 id;
-    struct batch_msg *msg;
 
     if (rsz == 0) {
         // An attach cookie this program cannot size. Unreachable while Go
@@ -566,44 +700,42 @@ int gpu_usdt_batch(struct pt_regs *ctx)
     if (bytes > PAYLOAD_BYTES)
         bytes = PAYLOAD_BYTES;
 
-    msg = bpf_ringbuf_reserve(&events, sizeof(*msg), 0);
-    if (!msg) {
-        count_drop(kind, count);
-        return 0;
-    }
-
-    if (bpf_probe_read_user(msg->payload, bytes, (const void *)ptr) != 0) {
-        bpf_ringbuf_discard(msg, 0);
-        count_drop(kind, count);
-        return 0;
-    }
-
-    id = bpf_get_current_pid_tgid();
-
     // Only the sampled-launch probe carries a stack: it is the only one that
-    // fires on the launching thread, once per launch, unbatched. Captured
-    // after the reservation succeeded so a batch that will never be
-    // submitted does not consume a gpu_stacks slot.
-    //
-    // A negative return is a real outcome — an empty walk, a full map, a
-    // refused insert — not an error to bail on. It is counted, and the
-    // record still flows with a negative stack_id, so a launch is never lost
-    // merely because its stack was.
-    if (kind == KIND_LAUNCH_SAMPLED) {
-        stack_id = capture_stack(ctx, (__u32)(id >> 32));
-        if (stack_id < 0)
-            count_stack_missing(KIND_LAUNCH_SAMPLED);
+    // fires on the launching thread, once per launch, unbatched. Every other
+    // kind is emitted here and now, on exactly the path it always took.
+    if (kind != KIND_LAUNCH_SAMPLED) {
+        gpu_emit_plain(kind, (__u32)count, seq, bytes, ptr);
+        return 0;
     }
 
-    msg->hdr.kind = kind;
-    msg->hdr.count = (__u32)count;
-    msg->hdr.seq = seq;
-    msg->hdr.pid = (__u32)(id >> 32);
-    msg->hdr.tid = (__u32)id;
-    msg->hdr.bytes = bytes;
-    msg->hdr.stack_id = stack_id;
-    msg->hdr._pad = 0;
+    struct walk_persist *st = walk_state_get();
+    struct sample_record *rec = walk_record_get();
+    struct gpu_pending *p = bpf_map_lookup_elem(&gpu_pending_batch, &zero);
+    if (!st || !rec || !p) {
+        // No walk possible, but the batch is still real: emit it without a
+        // stack rather than lose a launch because its stack could not be
+        // staged.
+        count_walk_error(WALK_ERR_NO_SCRATCH);
+        count_stack_missing(KIND_LAUNCH_SAMPLED);
+        gpu_emit_plain(kind, (__u32)count, seq, bytes, ptr);
+        return 0;
+    }
+    p->ptr = ptr;
+    p->seq = seq;
+    p->count = (__u32)count;
+    p->kind = kind;
+    p->bytes = bytes;
+    p->_pad = 0;
 
-    bpf_ringbuf_submit(msg, 0);
+    // At a USDT probe the register file is the application's own: ip is the
+    // probe site, fp/sp the launching thread's frame. PT_REGS_* expand to
+    // ip/bp/sp on x86_64 and pc/regs[29]/sp on arm64.
+    __u64 tgid_tid = bpf_get_current_pid_tgid();
+    unwind_walk_begin(st, rec, (__u32)(tgid_tid >> 32), (__u32)tgid_tid,
+                      (__u64)PT_REGS_IP(ctx),
+                      (__u64)PT_REGS_FP(ctx),
+                      (__u64)PT_REGS_SP(ctx));
+
+    gpu_sampled_walk(ctx, false);
     return 0;
 }

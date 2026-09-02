@@ -825,7 +825,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
 
-	entries, classes, _, err := ehcompile.Compile(built)
+	entries, _, err := ehcompile.Compile(built)
 	require.NoError(t, err)
 
 	ef, err := elf.Open(built)
@@ -845,14 +845,18 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 		t.Fatalf("symbol %s not found in %s", name, built)
 		return 0
 	}
-	modeOf := func(cls []ehcompile.Classification, pc uint64) ehcompile.Mode {
-		for _, c := range cls {
-			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
-				return c.Mode
+	// The CFA's base register, which is what the classification row used to
+	// report: SP-rooted was MODE_FP_LESS, FP-rooted was MODE_FP_SAFE. An
+	// uncovered PC has no row, which is walk_step's cue to frame-pointer walk
+	// -- reported here as CFATypeUndefined so an assertion cannot pass by
+	// accident on a range the compiler declined.
+	cfaBaseOf := func(ents []ehcompile.CFIEntry, pc uint64) ehcompile.CFAType {
+		for _, e := range ents {
+			if pc >= e.PCStart && pc < e.PCStart+uint64(e.PCEndDelta) {
+				return e.CFAType
 			}
 		}
-		// walk_step's own default for an uncovered PC.
-		return ehcompile.ModeFPSafe
+		return ehcompile.CFATypeUndefined
 	}
 	cfiOf := func(ents []ehcompile.CFIEntry, pc uint64) *ehcompile.CFIEntry {
 		for i := range ents {
@@ -873,7 +877,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	// and SAME_VALUE is the one fp_type that leaves ctx->fp alone.
 	for _, fn := range []string{"perfagent_fpless_bridge", "perfagent_fpless_caller"} {
 		pc := pcOf(fn)
-		require.Equal(t, ehcompile.ModeFPLess, modeOf(classes, pc),
+		require.Equal(t, ehcompile.CFATypeSP, cfaBaseOf(entries, pc),
 			"%s is not FP-less, so walk_step would never take the DWARF path here", fn)
 		row := cfiOf(entries, pc)
 		require.NotNil(t, row, "no CFI row covers %s", fn)
@@ -886,7 +890,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 
 	// --- main, reached with a LIVE frame pointer, so the FP path works.
 	mainPC := pcOf("main")
-	require.Equal(t, ehcompile.ModeFPSafe, modeOf(classes, mainPC),
+	require.Equal(t, ehcompile.CFATypeFP, cfaBaseOf(entries, mainPC),
 		"main is not FP_SAFE, so the walk would not take the frame-pointer path out of it")
 	mainCFI := cfiOf(entries, mainPC)
 	require.NotNil(t, mainCFI)
@@ -907,7 +911,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	// beside it - which IS _start's PC.
 	// TestWalkStepStepsPastTheFramePointerRoot pins the walker half.
 	startPC := pcOf("_start")
-	require.Equal(t, ehcompile.ModeFPLess, modeOf(classes, startPC),
+	require.Equal(t, ehcompile.CFATypeSP, cfaBaseOf(entries, startPC),
 		"_start is not FP-less, so the walk would take the FP path and never read its ra_type")
 	startCFI := cfiOf(entries, startPC)
 	require.NotNil(t, startCFI, "no CFI row covers _start")
@@ -936,6 +940,107 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	t.Logf("prediction: reached-root == dwarf, fp-exhausted == abandoned == 0")
 }
 
+// TestFramePushRefusalRaisesAFlag pins that both record_push_native (at
+// MAX_FRAMES) and record_push_interp (fewer than two slots left) raise
+// WALKER_FLAG_FRAME_PUSH_REFUSED on their refusal path, before returning 1
+// — issue #83's constraint that a dropped frame is never silent. Checked by
+// source inspection, like TestWalkStepStepsPastTheFramePointerRoot below,
+// because the refusal itself is only reachable inside the BPF verifier.
+//
+// Both pushers live in bpf/unwind_record.h now rather than in the walker's
+// own header, because a language module -- compiled into its own object,
+// sharing only that file -- appends to the same record and must not carry a
+// second copy of a bounds check.
+func TestFramePushRefusalRaisesAFlag(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_record.h")
+	require.NoError(t, err)
+	body := string(src)
+
+	require.Contains(t, body, "#define WALKER_FLAG_FRAME_PUSH_REFUSED 0x80",
+		"the refusal flag is gone, renamed, or its value changed")
+
+	checkRefusalRaisesFlag := func(t *testing.T, fn string) {
+		t.Helper()
+		start := strings.Index(body, "static __always_inline int "+fn+"(")
+		require.Positive(t, start, "%s not found in the shared header", fn)
+		rest := body[start:]
+		end := strings.Index(rest, "\n}\n")
+		require.Positive(t, end, "%s body not closed", fn)
+		fnBody := rest[:end]
+
+		refusal := strings.Index(fnBody, "return 1;")
+		require.Positive(t, refusal, "%s has no refusal path", fn)
+		flag := strings.Index(fnBody, "WALKER_FLAG_FRAME_PUSH_REFUSED")
+		require.Positive(t, flag, "%s's refusal drops the frame without raising a flag", fn)
+		require.Less(t, flag, refusal,
+			"%s must raise WALKER_FLAG_FRAME_PUSH_REFUSED before returning 1, not after", fn)
+	}
+
+	t.Run("record_push_native", func(t *testing.T) { checkRefusalRaisesFlag(t, "record_push_native") })
+	t.Run("record_push_interp", func(t *testing.T) { checkRefusalRaisesFlag(t, "record_push_interp") })
+}
+
+// A bounds check that adds to the value it is checking is not a bounds
+// check. The two-slot pusher used to guard its write with
+// `if (i + 2 > MAX_FRAMES)`, where i is __u32: the addition wraps, so at
+// i == 0xFFFFFFFE the expression is 0, the guard passes, and both stores run
+// with a wild index. The verifier refused to derive i <= 125 from
+// i + 2 <= 127 and rejected perf_dwarf and offcpu_dwarf outright
+// ("R1 unbounded memory access" at the tags[] store).
+//
+// The property is structural, so it is checked structurally: neither pusher's
+// guard may contain arithmetic on the checked local. The comparison must be
+// against a constant the compiler folds, which is the only form the verifier
+// can carry from the branch to the store.
+//
+// Source inspection, like its neighbours: the refusal path is only reachable
+// inside the verifier, and no test on this machine can load a program.
+func TestTheFramePushBoundsDoNoArithmeticOnTheCheckedValue(t *testing.T) {
+	src, err := os.ReadFile("../bpf/unwind_record.h")
+	require.NoError(t, err)
+	body := string(src)
+
+	guardOf := func(t *testing.T, fn string) string {
+		t.Helper()
+		start := strings.Index(body, "static __always_inline int "+fn+"(")
+		require.Positive(t, start, "%s not found in the shared header", fn)
+		rest := body[start:]
+		end := strings.Index(rest, "\n}\n")
+		require.Positive(t, end, "%s body not closed", fn)
+		fnBody := rest[:end]
+
+		open := strings.Index(fnBody, "if (")
+		require.Positive(t, open, "%s has no bounds guard at all", fn)
+		close := strings.Index(fnBody[open:], ") {")
+		require.Positive(t, close, "%s's guard is not closed", fn)
+		return fnBody[open+len("if (") : open+close]
+	}
+
+	for _, fn := range []string{"record_push_native", "record_push_interp"} {
+		t.Run(fn, func(t *testing.T) {
+			guard := guardOf(t, fn)
+			require.Contains(t, guard, "MAX_FRAMES",
+				"%s's guard must be expressed against MAX_FRAMES", fn)
+			require.NotContains(t, strings.ReplaceAll(guard, " ", ""), "i+",
+				"%s adds to the checked value; __u32 arithmetic wraps and the verifier cannot carry the bound to the store", fn)
+		})
+	}
+
+	// The exact boundary, pinned. frame_push_python writes slots i and i+1,
+	// so both must be < MAX_FRAMES and the accept set is i <= MAX_FRAMES-2.
+	// One off in either direction is silent: too tight drops the last valid
+	// pair on a deep stack, too loose writes one slot past the array.
+	require.Contains(t, body, "if (i > MAX_FRAMES - 2) {",
+		"frame_push_python's two-slot bound moved; the accept set must stay i <= MAX_FRAMES-2")
+	require.Contains(t, body, "if (i >= MAX_FRAMES) {",
+		"frame_push_native's one-slot bound moved; the accept set must stay i <= MAX_FRAMES-1")
+
+	// And the subtraction itself must be safe: at MAX_FRAMES < 2 the constant
+	// underflows to a huge unsigned and the guard accepts everything.
+	require.Contains(t, body, "_Static_assert(MAX_FRAMES >= 2,",
+		"nothing stops MAX_FRAMES - 2 underflowing if MAX_FRAMES is ever made tiny")
+}
+
 // The walker half of the derivation above, read out of the shared header so
 // it needs no capability either.
 //
@@ -952,8 +1057,8 @@ func TestWalkStepStepsPastTheFramePointerRoot(t *testing.T) {
 	src, err := os.ReadFile("../bpf/unwind_common.h")
 	require.NoError(t, err)
 	body := string(src)
-	step := body[strings.Index(body, "static long walk_step("):]
-	require.NotEmpty(t, step, "walk_step not found in the shared header")
+	step := body[strings.Index(body, "static __always_inline long unwind_frame("):]
+	require.NotEmpty(t, step, "unwind_frame not found in the shared header")
 
 	guard := strings.Index(step, "if (saved_fp <= ctx->fp) {")
 	require.Positive(t, guard,
@@ -990,7 +1095,13 @@ func TestWalkStepStepsPastTheFramePointerRoot(t *testing.T) {
 	require.Positive(t, strings.Index(arm, "WALKER_FLAG_FP_NONMONOTONIC"),
 		"a frame pointer that does not increase is still an unflagged bare `return 1`")
 	nonmono := arm[strings.Index(arm, "WALKER_FLAG_FP_NONMONOTONIC"):]
-	require.Positive(t, strings.Index(nonmono, "ctx->rec->pcs[ctx->n_pcs++] = ret_addr;"),
+	// Recorded via frame_push_native (issue #83) rather than a raw
+	// `ctx->rec->pcs[ctx->n_pcs++] = ret_addr;` write, so this slot's
+	// tags[] byte is set too instead of carrying forward whatever a
+	// previous sample left in the reused per-CPU scratch buffer. The
+	// property this test names — the return address is recorded, not
+	// discarded — still holds; only the how changed.
+	require.Positive(t, strings.Index(nonmono, "frame_push_native(ctx, ret_addr)"),
 		"the non-monotonic arm still discards the return address it already read")
 }
 
@@ -998,7 +1109,7 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
 
-	_, classes, ehBytes, err := ehcompile.Compile(built)
+	entries, ehBytes, err := ehcompile.Compile(built)
 	require.NoError(t, err, "the producer's .eh_frame must compile: it is the only way the walker can cross an FP-less frame")
 	require.Positive(t, ehBytes, "no .eh_frame bytes: the DWARF walker would have nothing to read")
 
@@ -1013,7 +1124,12 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	// - the prologue has not run yet - so classifying on the entry PC would
 	// call every function FP-less and the test would pass for the wrong
 	// reason.
-	classify := func(t *testing.T, name string) ehcompile.Mode {
+	// The CFA's base register, which is what the classification row used to
+	// report: SP-rooted was MODE_FP_LESS, FP-rooted was MODE_FP_SAFE, and no
+	// row at all was MODE_FALLBACK. The second table is gone -- the walker
+	// takes the DWARF path whenever a ROW EXISTS -- so the property is read
+	// off the row itself.
+	cfaBase := func(t *testing.T, name string) ehcompile.CFAType {
 		t.Helper()
 		var sym *elf.Symbol
 		for i := range syms {
@@ -1025,20 +1141,20 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 		require.NotNilf(t, sym, "symbol %s not found in %s", name, built)
 		require.Positivef(t, sym.Size, "symbol %s has no size; cannot pick a PC inside it", name)
 		pc := sym.Value + sym.Size/2
-		for _, c := range classes {
-			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
-				return c.Mode
+		for _, e := range entries {
+			if pc >= e.PCStart && pc < e.PCStart+uint64(e.PCEndDelta) {
+				return e.CFAType
 			}
 		}
-		t.Fatalf("no classification row covers %#x, the midpoint of %s: the walker would treat it as FP_SAFE and never take the DWARF path", pc, name)
+		t.Fatalf("no CFI row covers %#x, the midpoint of %s: the walker would fall back to the frame pointer and never take the DWARF path", pc, name)
 		return 0
 	}
 
-	// The two frames between the probe and main. MODE_FP_LESS is exactly
-	// what makes walk_step read cfi_rules and set WALKER_FLAG_DWARF_USED.
+	// The two frames between the probe and main: SP-rooted, i.e. no frame
+	// pointer to walk, so only the unwind tables can cross them.
 	for _, name := range []string{"perfagent_fpless_bridge", "perfagent_fpless_caller"} {
-		assert.Equalf(t, ehcompile.ModeFPLess, classify(t, name),
-			"%s classifies as something other than FP_LESS, so walk_step would take the frame-pointer path through it and the gate's StacksWalkedDWARF assertion could not be satisfied by this producer", name)
+		assert.Equalf(t, ehcompile.CFATypeSP, cfaBase(t, name),
+			"%s has an FP-rooted CFA, so it is not frame-pointer-less and the gate's StacksWalkedDWARF assertion could not be satisfied by this producer", name)
 	}
 
 	// The other half of the hybrid, and not a formality: the walk's FIRST
@@ -1047,8 +1163,8 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	// would still work but would no longer exercise the FP -> DWARF -> FP
 	// handoff this producer exists to reproduce.
 	for _, name := range []string{"perfagent_stub_run", "main"} {
-		assert.Equalf(t, ehcompile.ModeFPSafe, classify(t, name),
-			"%s is not FP_SAFE, so the walk would not cross an FP/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
+		assert.Equalf(t, ehcompile.CFATypeFP, cfaBase(t, name),
+			"%s has an SP-rooted CFA, so the walk would not cross a frame-pointer/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
 	}
 }
 

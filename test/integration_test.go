@@ -386,22 +386,34 @@ func getAgentPath(t *testing.T) string {
 // the test process itself, not on the agent binary.
 func requireBPFRunnable(t *testing.T, agentPath string) {
 	t.Helper()
-	if os.Getuid() == 0 {
+	if bpfRunnable(agentPath) {
 		return
+	}
+	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
+}
+
+// bpfRunnable is requireBPFRunnable's decision as a predicate, so a caller
+// that must account for WHY it declined to run can ask without being
+// skipped out from under it. See python_walk_test.go, where every reason
+// the Python gate does not run has to be recorded rather than merely
+// skipped.
+func bpfRunnable(agentPath string) bool {
+	if os.Getuid() == 0 {
+		return true
 	}
 	if procCaps := cap.GetProc(); procCaps != nil {
 		if have, err := procCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-			return
+			return true
 		}
 	}
 	if agentPath != "" {
 		if fileCaps, err := cap.GetFile(agentPath); err == nil && fileCaps != nil {
 			if have, err := fileCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-				return
+				return true
 			}
 		}
 	}
-	t.Skip("requires root, CAP_BPF in test process, or setcap'd perf-agent")
+	return false
 }
 
 // isJitOnlyProfile returns true if the profile's only non-empty,
@@ -1298,7 +1310,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
 
 	// Compile CFI from the Rust binary.
-	entries, classifications, _, err := ehcompile.Compile(binPath)
+	entries, _, err := ehcompile.Compile(binPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, entries, "ehcompile produced no CFI entries")
 
@@ -1310,10 +1322,6 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, ehmaps.PopulateCFI(ehmaps.PopulateCFIArgs{
 		TableID: tableID, Entries: entries,
 		OuterMap: objs.CFIRulesMap(), LengthMap: objs.CFILengthsMap(),
-	}))
-	require.NoError(t, ehmaps.PopulateClassification(ehmaps.PopulateClassificationArgs{
-		TableID: tableID, Entries: classifications,
-		OuterMap: objs.CFIClassificationMap(), LengthMap: objs.CFIClassificationLengthsMap(),
 	}))
 
 	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, "", tableID)
@@ -1604,9 +1612,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 	defer objs.Close()
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
 
-	store := ehmaps.NewTableStore(
-		objs.CFIRulesMap(), objs.CFILengthsMap(),
-		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap())
+	store := ehmaps.NewTableStore(objs.CFIRulesMap(), objs.CFILengthsMap())
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath, ""))
 

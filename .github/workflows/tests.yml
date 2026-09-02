@@ -47,6 +47,7 @@ jobs:
           sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
           sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
           clang --version | head -1
+          uname -r   # the verifier is a property of THIS kernel; see the fingerprint step
           
           # Ensure bpf headers are available
           if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
@@ -73,11 +74,82 @@ jobs:
           go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
           cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+      - name: "Fingerprint the BPF toolchain (issue #87)"
+        # Diagnostic only. Never fails the job.
+        #
+        # Two machines with the same clang (18.1.3) and byte-identical libbpf
+        # headers (libbpf-dev 1:1.3.0-2build2, verified against the noble archive
+        # .deb) have produced different .BTF type orderings for the same source --
+        # six bytes, two transpositions, every other section identical. Every
+        # candidate visible from a container has been eliminated: regen
+        # determinism, clang version (changes the SIZE), llvm-strip version (no
+        # effect), libbpf header version, the blazesym module replace, and the
+        # go generate invocation style.
+        #
+        # What is left is something in the runner environment that no workflow
+        # script mentions. CPATH and its relatives inject include directories
+        # invisibly, and `clang -H` is the only way to learn which bpf_helpers.h is
+        # actually OPENED rather than which directories are merely searched.
+        #
+        # Printed unconditionally, on green runs too: a fingerprint that appears
+        # only on failure cannot establish what a passing run looked like, and
+        # comparing green against red is how an intermittent mismatch gets settled.
+        continue-on-error: true
+        run: |
+          clang --version | head -1
+          # The kernel is part of the toolchain fingerprint. Whether a BPF program
+          # VERIFIES is a property of the running kernel's verifier, not only of
+          # the object: perf_dwarf and offcpu_dwarf load here and are rejected on
+          # a 6.19.10 host with "Processed 1000001 insn", because 6.19.4
+          # backported f597664454bd (bpf_scc_visit accumulation for bpf_loop) and
+          # 6.18 replaced the pruning-liveness machinery wholesale. Neither is
+          # visible from a clang version, and CI's kernel appeared nowhere in its
+          # logs until now.
+          uname -r
+          uname -a
+          go version
+          go list -m github.com/cilium/ebpf || true
+          dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true
+          echo "--- /usr/local/include (anything named bpf here shadows /usr/include/bpf) ---"
+          ls -la /usr/local/include/ || true
+          echo "--- which bpf_helpers.h clang actually opens ---"
+          echo '#include <bpf/bpf_helpers.h>' | clang -H -E -x c - 2>&1 | grep -m5 bpf_helpers.h || true
+          echo "--- header hashes ---"
+          sha256sum /usr/include/bpf/*.h 2>/dev/null || true
+          sha256sum /usr/local/include/bpf/*.h 2>/dev/null || echo "no /usr/local/include/bpf (expected)"
+          echo "--- include-injecting environment ---"
+          env | grep -Ei '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|CFLAGS|CC|CXX|BPF2GO)=' || echo "none set"
+
       - name: Generate eBPF code
         run: go generate ./...
 
+      - name: "Record regenerated object fingerprints (issue #87)"
+        # What THIS runner's toolchain produced, recorded on every run including
+        # green ones, so a future mismatch is a two-line diff rather than another
+        # investigation. Diagnostic only; never fails the job.
+        continue-on-error: true
+        run: |
+          for f in $(git ls-files '*_bpfel.o'); do
+            printf '%s regenerated=%s sha256=%s committed=%s\n' \
+              "$f" "$(wc -c < "$f")" "$(sha256sum "$f" | cut -d" " -f1)" \
+              "$(git show HEAD:"$f" | wc -c)"
+          done
+          echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
+          git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
+
+      # ./pyunwind/... is here because it was in NO CI job before: the whole
+      # CPython walker's correctness argument -- the per-version offset
+      # tables, the autoTSSkey parser, the counter slot mapping, and the
+      # live-interpreter attach tests -- was running only on developer
+      # machines. The live tests attach to a python3 they spawn themselves
+      # and need no capabilities; on arm64 they skip by name.
+      #
+      # ./unwind/dwarfagent/... joins it for the same reason: the tagged-slot
+      # decoder and the Python frame rendering the end-to-end gate matches on
+      # are pinned there, and nothing was running those either. They are
+      # ordinary in-process tests -- no BPF, no capabilities.
       - name: Run unit tests
-        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/...
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
 
       - name: Upload coverage
         uses: codecov/codecov-action@v3
@@ -130,6 +202,7 @@ jobs:
           sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
           sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
           clang --version | head -1
+          uname -r   # the verifier is a property of THIS kernel; see the fingerprint step
           
           # Ensure bpf headers are available
           if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
@@ -158,15 +231,90 @@ jobs:
       - name: Build test workloads
         run: make test-workloads
 
+      - name: "Fingerprint the BPF toolchain (issue #87)"
+        # Diagnostic only. Never fails the job.
+        #
+        # Two machines with the same clang (18.1.3) and byte-identical libbpf
+        # headers (libbpf-dev 1:1.3.0-2build2, verified against the noble archive
+        # .deb) have produced different .BTF type orderings for the same source --
+        # six bytes, two transpositions, every other section identical. Every
+        # candidate visible from a container has been eliminated: regen
+        # determinism, clang version (changes the SIZE), llvm-strip version (no
+        # effect), libbpf header version, the blazesym module replace, and the
+        # go generate invocation style.
+        #
+        # What is left is something in the runner environment that no workflow
+        # script mentions. CPATH and its relatives inject include directories
+        # invisibly, and `clang -H` is the only way to learn which bpf_helpers.h is
+        # actually OPENED rather than which directories are merely searched.
+        #
+        # Printed unconditionally, on green runs too: a fingerprint that appears
+        # only on failure cannot establish what a passing run looked like, and
+        # comparing green against red is how an intermittent mismatch gets settled.
+        continue-on-error: true
+        run: |
+          clang --version | head -1
+          # The kernel is part of the toolchain fingerprint. Whether a BPF program
+          # VERIFIES is a property of the running kernel's verifier, not only of
+          # the object: perf_dwarf and offcpu_dwarf load here and are rejected on
+          # a 6.19.10 host with "Processed 1000001 insn", because 6.19.4
+          # backported f597664454bd (bpf_scc_visit accumulation for bpf_loop) and
+          # 6.18 replaced the pruning-liveness machinery wholesale. Neither is
+          # visible from a clang version, and CI's kernel appeared nowhere in its
+          # logs until now.
+          uname -r
+          uname -a
+          go version
+          go list -m github.com/cilium/ebpf || true
+          dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true
+          echo "--- /usr/local/include (anything named bpf here shadows /usr/include/bpf) ---"
+          ls -la /usr/local/include/ || true
+          echo "--- which bpf_helpers.h clang actually opens ---"
+          echo '#include <bpf/bpf_helpers.h>' | clang -H -E -x c - 2>&1 | grep -m5 bpf_helpers.h || true
+          echo "--- header hashes ---"
+          sha256sum /usr/include/bpf/*.h 2>/dev/null || true
+          sha256sum /usr/local/include/bpf/*.h 2>/dev/null || echo "no /usr/local/include/bpf (expected)"
+          echo "--- include-injecting environment ---"
+          env | grep -Ei '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|CFLAGS|CC|CXX|BPF2GO)=' || echo "none set"
+
       - name: Generate and build perf-agent
         run: |
           go generate ./...
           go build -o perf-agent
 
+      - name: "Record regenerated object fingerprints (issue #87)"
+        # What THIS runner's toolchain produced, recorded on every run including
+        # green ones, so a future mismatch is a two-line diff rather than another
+        # investigation. Diagnostic only; never fails the job.
+        continue-on-error: true
+        run: |
+          for f in $(git ls-files '*_bpfel.o'); do
+            printf '%s regenerated=%s sha256=%s committed=%s\n' \
+              "$f" "$(wc -c < "$f")" "$(sha256sum "$f" | cut -d" " -f1)" \
+              "$(git show HEAD:"$f" | wc -c)"
+          done
+          echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
+          git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
+
+      # PERF_AGENT_REQUIRE_PYTHON_WALK turns every remaining skip in the
+      # Python end-to-end gate into a failure. It is set here, on amd64
+      # only, because THIS runner is a machine we know: Ubuntu noble,
+      # glibc, CPython 3.12, not stripped. Whether the gate may skip is
+      # therefore a decision recorded in CI configuration rather than one
+      # the code under test makes about itself by calling the very
+      # functions the gate exists to check.
+      #
+      # It is deliberately absent on arm64, where the walker is a named
+      # refusal (no measured glibc TSD offsets) and the gate must skip.
+      #
+      # The first CI run of this branch went green with that gate skipped,
+      # because an interpreter prologue we could not parse was classified
+      # as an environment limitation. This is what stops that recurring.
       - name: Run integration tests
         run: |
           cd test
           sudo env LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+            PERF_AGENT_REQUIRE_PYTHON_WALK="${{ matrix.arch == 'amd64' && '1' || '' }}" \
             $(which go) test -v -timeout 15m ./...
 
   lint:
@@ -201,6 +349,7 @@ jobs:
           sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
           sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
           clang --version | head -1
+          uname -r   # the verifier is a property of THIS kernel; see the fingerprint step
           
           # Ensure bpf headers are available
           if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
@@ -227,8 +376,68 @@ jobs:
           go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
           cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+      - name: "Fingerprint the BPF toolchain (issue #87)"
+        # Diagnostic only. Never fails the job.
+        #
+        # Two machines with the same clang (18.1.3) and byte-identical libbpf
+        # headers (libbpf-dev 1:1.3.0-2build2, verified against the noble archive
+        # .deb) have produced different .BTF type orderings for the same source --
+        # six bytes, two transpositions, every other section identical. Every
+        # candidate visible from a container has been eliminated: regen
+        # determinism, clang version (changes the SIZE), llvm-strip version (no
+        # effect), libbpf header version, the blazesym module replace, and the
+        # go generate invocation style.
+        #
+        # What is left is something in the runner environment that no workflow
+        # script mentions. CPATH and its relatives inject include directories
+        # invisibly, and `clang -H` is the only way to learn which bpf_helpers.h is
+        # actually OPENED rather than which directories are merely searched.
+        #
+        # Printed unconditionally, on green runs too: a fingerprint that appears
+        # only on failure cannot establish what a passing run looked like, and
+        # comparing green against red is how an intermittent mismatch gets settled.
+        continue-on-error: true
+        run: |
+          clang --version | head -1
+          # The kernel is part of the toolchain fingerprint. Whether a BPF program
+          # VERIFIES is a property of the running kernel's verifier, not only of
+          # the object: perf_dwarf and offcpu_dwarf load here and are rejected on
+          # a 6.19.10 host with "Processed 1000001 insn", because 6.19.4
+          # backported f597664454bd (bpf_scc_visit accumulation for bpf_loop) and
+          # 6.18 replaced the pruning-liveness machinery wholesale. Neither is
+          # visible from a clang version, and CI's kernel appeared nowhere in its
+          # logs until now.
+          uname -r
+          uname -a
+          go version
+          go list -m github.com/cilium/ebpf || true
+          dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true
+          echo "--- /usr/local/include (anything named bpf here shadows /usr/include/bpf) ---"
+          ls -la /usr/local/include/ || true
+          echo "--- which bpf_helpers.h clang actually opens ---"
+          echo '#include <bpf/bpf_helpers.h>' | clang -H -E -x c - 2>&1 | grep -m5 bpf_helpers.h || true
+          echo "--- header hashes ---"
+          sha256sum /usr/include/bpf/*.h 2>/dev/null || true
+          sha256sum /usr/local/include/bpf/*.h 2>/dev/null || echo "no /usr/local/include/bpf (expected)"
+          echo "--- include-injecting environment ---"
+          env | grep -Ei '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|CFLAGS|CC|CXX|BPF2GO)=' || echo "none set"
+
       - name: Generate eBPF code
         run: go generate ./...
+
+      - name: "Record regenerated object fingerprints (issue #87)"
+        # What THIS runner's toolchain produced, recorded on every run including
+        # green ones, so a future mismatch is a two-line diff rather than another
+        # investigation. Diagnostic only; never fails the job.
+        continue-on-error: true
+        run: |
+          for f in $(git ls-files '*_bpfel.o'); do
+            printf '%s regenerated=%s sha256=%s committed=%s\n' \
+              "$f" "$(wc -c < "$f")" "$(sha256sum "$f" | cut -d" " -f1)" \
+              "$(git show HEAD:"$f" | wc -c)"
+          done
+          echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
+          git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
@@ -278,6 +487,7 @@ jobs:
           sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
           sudo ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip
           clang --version | head -1
+          uname -r   # the verifier is a property of THIS kernel; see the fingerprint step
           
           # Ensure bpf headers are available
           if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
@@ -304,8 +514,68 @@ jobs:
           go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
           cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+      - name: "Fingerprint the BPF toolchain (issue #87)"
+        # Diagnostic only. Never fails the job.
+        #
+        # Two machines with the same clang (18.1.3) and byte-identical libbpf
+        # headers (libbpf-dev 1:1.3.0-2build2, verified against the noble archive
+        # .deb) have produced different .BTF type orderings for the same source --
+        # six bytes, two transpositions, every other section identical. Every
+        # candidate visible from a container has been eliminated: regen
+        # determinism, clang version (changes the SIZE), llvm-strip version (no
+        # effect), libbpf header version, the blazesym module replace, and the
+        # go generate invocation style.
+        #
+        # What is left is something in the runner environment that no workflow
+        # script mentions. CPATH and its relatives inject include directories
+        # invisibly, and `clang -H` is the only way to learn which bpf_helpers.h is
+        # actually OPENED rather than which directories are merely searched.
+        #
+        # Printed unconditionally, on green runs too: a fingerprint that appears
+        # only on failure cannot establish what a passing run looked like, and
+        # comparing green against red is how an intermittent mismatch gets settled.
+        continue-on-error: true
+        run: |
+          clang --version | head -1
+          # The kernel is part of the toolchain fingerprint. Whether a BPF program
+          # VERIFIES is a property of the running kernel's verifier, not only of
+          # the object: perf_dwarf and offcpu_dwarf load here and are rejected on
+          # a 6.19.10 host with "Processed 1000001 insn", because 6.19.4
+          # backported f597664454bd (bpf_scc_visit accumulation for bpf_loop) and
+          # 6.18 replaced the pruning-liveness machinery wholesale. Neither is
+          # visible from a clang version, and CI's kernel appeared nowhere in its
+          # logs until now.
+          uname -r
+          uname -a
+          go version
+          go list -m github.com/cilium/ebpf || true
+          dpkg-query -W -f='libbpf-dev %{Version}\n' libbpf-dev || true
+          echo "--- /usr/local/include (anything named bpf here shadows /usr/include/bpf) ---"
+          ls -la /usr/local/include/ || true
+          echo "--- which bpf_helpers.h clang actually opens ---"
+          echo '#include <bpf/bpf_helpers.h>' | clang -H -E -x c - 2>&1 | grep -m5 bpf_helpers.h || true
+          echo "--- header hashes ---"
+          sha256sum /usr/include/bpf/*.h 2>/dev/null || true
+          sha256sum /usr/local/include/bpf/*.h 2>/dev/null || echo "no /usr/local/include/bpf (expected)"
+          echo "--- include-injecting environment ---"
+          env | grep -Ei '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|CFLAGS|CC|CXX|BPF2GO)=' || echo "none set"
+
       - name: Generate eBPF code
         run: go generate ./...
+
+      - name: "Record regenerated object fingerprints (issue #87)"
+        # What THIS runner's toolchain produced, recorded on every run including
+        # green ones, so a future mismatch is a two-line diff rather than another
+        # investigation. Diagnostic only; never fails the job.
+        continue-on-error: true
+        run: |
+          for f in $(git ls-files '*_bpfel.o'); do
+            printf '%s regenerated=%s sha256=%s committed=%s\n' \
+              "$f" "$(wc -c < "$f")" "$(sha256sum "$f" | cut -d" " -f1)" \
+              "$(git show HEAD:"$f" | wc -c)"
+          done
+          echo "--- objects differing from HEAD (empty means this runner reproduces them) ---"
+          git diff --name-only -- '*_bpfel.go' '*_bpfel.o' || true
 
       - name: Build
         env:

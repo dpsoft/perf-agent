@@ -14,10 +14,17 @@ var ErrNoEHFrame = errors.New("ehcompile: no .eh_frame section")
 // x86_64 or arm64. Other architectures can be added later.
 var ErrUnsupportedArch = errors.New("ehcompile: unsupported ELF machine type")
 
-// Compile reads the ELF at elfPath and produces flat CFI + Classification
-// tables, plus the size in bytes of the ELF's .eh_frame section. Both
-// slices are sorted by PCStart. Adjacent rows with identical rules are
-// coalesced at emission time.
+// Compile reads the ELF at elfPath and produces the flat CFI table, plus the
+// size in bytes of the ELF's .eh_frame section. Entries are sorted by PCStart
+// and adjacent rows with identical rules are coalesced at emission time.
+//
+// It used to return a parallel Classification table tagging each PC range
+// FP_SAFE / FP_LESS / FALLBACK, which the walker searched to choose between
+// the frame-pointer path and the DWARF path. The walker now makes that choice
+// from whether a CFI ROW EXISTS, so the second table was computed on every
+// enrol, uploaded, and never read -- 38 MB for libtorch_cpu alone. The pass is
+// gone rather than discarded at the end: a range with no row IS the FALLBACK
+// answer.
 //
 // ehFrameBytes is the raw .eh_frame section size before parsing — useful
 // for cost analysis (per-byte compile rate) and observability hooks. It
@@ -28,31 +35,30 @@ var ErrUnsupportedArch = errors.New("ehcompile: unsupported ELF machine type")
 // appropriate archInfo is used for register-number translation.
 //
 // Not safe for concurrent calls per instance; callers should serialize.
-func Compile(elfPath string) (entries []CFIEntry, classifications []Classification, ehFrameBytes int, err error) {
+func Compile(elfPath string) (entries []CFIEntry, ehFrameBytes int, err error) {
 	f, err := elf.Open(elfPath)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("open elf: %w", err)
+		return nil, 0, fmt.Errorf("open elf: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	arch, err := archFromELFMachine(f.Machine)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, 0, err
 	}
 
 	sec := f.Section(".eh_frame")
 	if sec == nil {
-		return nil, nil, 0, ErrNoEHFrame
+		return nil, 0, ErrNoEHFrame
 	}
 	data, err := sec.Data()
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("read .eh_frame: %w", err)
+		return nil, 0, fmt.Errorf("read .eh_frame: %w", err)
 	}
 	ehFrameBytes = len(data)
 	sectionPos := sec.Addr
 
 	var allEntries []CFIEntry
-	var allClasses []Classification
 
 	err = walkEHFrame(data, sectionPos, func(off uint64, c *cie, fd *fde) error {
 		if fd == nil {
@@ -75,15 +81,13 @@ func Compile(elfPath string) (entries []CFIEntry, classifications []Classificati
 			return fmt.Errorf("FDE at PC 0x%x: %w", fd.initialLocation, err)
 		}
 		allEntries = append(allEntries, interp.entries...)
-		allClasses = append(allClasses, interp.classifications...)
 		return nil
 	})
 	if err != nil {
-		return nil, nil, ehFrameBytes, err
+		return nil, ehFrameBytes, err
 	}
 
 	sort.Slice(allEntries, func(i, j int) bool { return allEntries[i].PCStart < allEntries[j].PCStart })
-	sort.Slice(allClasses, func(i, j int) bool { return allClasses[i].PCStart < allClasses[j].PCStart })
 
-	return allEntries, allClasses, ehFrameBytes, nil
+	return allEntries, ehFrameBytes, nil
 }

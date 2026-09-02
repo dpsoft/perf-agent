@@ -62,13 +62,11 @@ func (r *RefcountTable) Release(tableID uint64, pid uint32) int {
 }
 
 // TableStore owns the BPF-side cfi_* outer maps and composes refcount
-// tracking with actual map population. Wraps Populate{CFI,Classification} with refcounting so callers don't
-// hand-manage table lifetimes.
+// tracking with actual map population. Wraps PopulateCFI with refcounting so
+// callers don't hand-manage table lifetimes.
 type TableStore struct {
-	CFIRules          *ebpf.Map
-	CFILengths        *ebpf.Map
-	CFIClassification *ebpf.Map
-	CFIClassLengths   *ebpf.Map
+	CFIRules   *ebpf.Map
+	CFILengths *ebpf.Map
 
 	rc *RefcountTable
 
@@ -111,15 +109,13 @@ type TableStore struct {
 // NewTableStore wires up a TableStore around already-loaded BPF maps
 // (typically from the agent's perf_dwarf program load). The caller owns
 // the maps; TableStore does not close them.
-func NewTableStore(cfi, cfiLen, cls, clsLen *ebpf.Map) *TableStore {
+func NewTableStore(cfi, cfiLen *ebpf.Map) *TableStore {
 	s := &TableStore{
-		CFIRules:          cfi,
-		CFILengths:        cfiLen,
-		CFIClassification: cls,
-		CFIClassLengths:   clsLen,
-		rc:                NewRefcountTable(),
-		installed:         map[uint64]struct{}{},
-		inflight:          map[uint64]struct{}{},
+		CFIRules:   cfi,
+		CFILengths: cfiLen,
+		rc:         NewRefcountTable(),
+		installed:  map[uint64]struct{}{},
+		inflight:   map[uint64]struct{}{},
 	}
 	s.instCond = sync.NewCond(&s.instMu)
 	return s
@@ -232,7 +228,7 @@ func (s *TableStore) AcquireBinary(binPath, openPath string, pid uint32) (tableI
 
 	// First reference for this tableID — compile + install.
 	t0 := time.Now()
-	entries, classifications, ehFrameBytes, err := ehcompile.Compile(openPath)
+	entries, ehFrameBytes, err := ehcompile.Compile(openPath)
 	compileDur := time.Since(t0)
 	if err != nil {
 		s.rc.Release(tableID, pid)
@@ -247,13 +243,6 @@ func (s *TableStore) AcquireBinary(binPath, openPath string, pid uint32) (tableI
 	}); err != nil {
 		s.rc.Release(tableID, pid)
 		return 0, false, fmt.Errorf("populate cfi: %w", err)
-	}
-	if err := PopulateClassification(PopulateClassificationArgs{
-		TableID: tableID, Entries: classifications,
-		OuterMap: s.CFIClassification, LengthMap: s.CFIClassLengths,
-	}); err != nil {
-		s.rc.Release(tableID, pid)
-		return 0, false, fmt.Errorf("populate classification: %w", err)
 	}
 	installOK = true
 	return tableID, true, nil
@@ -287,12 +276,6 @@ func (s *TableStore) ReleaseBinary(tableID uint64, pid uint32) error {
 	}
 	if err := s.CFILengths.Delete(tableID); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("evict cfi_lengths[%#x]: %w", tableID, err)
-	}
-	if err := s.CFIClassification.Delete(tableID); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("evict cfi_classification[%#x]: %w", tableID, err)
-	}
-	if err := s.CFIClassLengths.Delete(tableID); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("evict cfi_classification_lengths[%#x]: %w", tableID, err)
 	}
 	return firstErr
 }

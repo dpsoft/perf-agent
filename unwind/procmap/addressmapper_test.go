@@ -25,9 +25,9 @@ func writeMinimalELF(t *testing.T, dir string, off, vaddr, filesz uint64) string
 
 	var eh [ehSize]byte
 	copy(eh[:4], []byte{0x7f, 'E', 'L', 'F'})
-	eh[4] = 2 // ELFCLASS64
-	eh[5] = 1 // ELFDATA2LSB
-	eh[6] = 1 // EV_CURRENT
+	eh[4] = 2                                      // ELFCLASS64
+	eh[5] = 1                                      // ELFDATA2LSB
+	eh[6] = 1                                      // EV_CURRENT
 	binary.LittleEndian.PutUint16(eh[16:], 2)      // e_type = ET_EXEC
 	binary.LittleEndian.PutUint16(eh[18:], 62)     // e_machine = EM_X86_64
 	binary.LittleEndian.PutUint32(eh[20:], 1)      // e_version
@@ -346,4 +346,3 @@ func writeMinimalELFType(t *testing.T, dir string, etype elf.Type, off, vaddr, f
 	}
 	return path
 }
-

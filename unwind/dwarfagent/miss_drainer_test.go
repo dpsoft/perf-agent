@@ -9,7 +9,7 @@ import (
 
 func TestParseMissEvent_Roundtrip(t *testing.T) {
 	raw := make([]byte, cfiMissEventSize)
-	binary.LittleEndian.PutUint32(raw[0:4], 0x1234)         // pid
+	binary.LittleEndian.PutUint32(raw[0:4], 0x1234) // pid
 	// 4-7 padding (already zero from make)
 	binary.LittleEndian.PutUint64(raw[8:16], 0xDEADBEEFCAFE) // table_id
 	binary.LittleEndian.PutUint64(raw[16:24], 0xABCD)        // rel_pc

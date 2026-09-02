@@ -28,7 +28,7 @@ func TestInterpret_AdvanceLocOnly(t *testing.T) {
 	err := s.run(0x1000, 0x100F, program)
 	require.NoError(t, err)
 	assert.Empty(t, s.entries)
-	assert.Empty(t, s.classifications)
+
 }
 
 func TestInterpret_DefCFAEmitsRow(t *testing.T) {
@@ -141,9 +141,10 @@ func TestInterpret_ExpressionProducesFallback(t *testing.T) {
 	s := newInterpreter(c, archX86_64())
 	err := s.run(0x6000, 0x6010, program)
 	require.NoError(t, err)
+	// A CFA expression emits NO row, which is exactly how the walker learns to
+	// frame-pointer walk that range. It used to also emit a FALLBACK
+	// classification row saying the same thing in a second table.
 	assert.Empty(t, s.entries)
-	require.Len(t, s.classifications, 1)
-	assert.Equal(t, ModeFallback, s.classifications[0].Mode)
 }
 
 func TestInterpret_GnuArgsSizeIsNoop(t *testing.T) {
@@ -249,9 +250,10 @@ func TestInterpret_NonSPNonFPCFARegisterFallback(t *testing.T) {
 	s := newInterpreter(c, archX86_64())
 	err := s.run(0x1000, 0x1004, program)
 	require.NoError(t, err)
+	// A CFA expression emits NO row, which is exactly how the walker learns to
+	// frame-pointer walk that range. It used to also emit a FALLBACK
+	// classification row saying the same thing in a second table.
 	assert.Empty(t, s.entries)
-	require.Len(t, s.classifications, 1)
-	assert.Equal(t, ModeFallback, s.classifications[0].Mode)
 }
 
 func TestInterpret_RememberStateOverflow(t *testing.T) {
@@ -477,9 +479,9 @@ func TestInterpret_ValOffsetProducesFallback(t *testing.T) {
 	s := newInterpreter(c, archX86_64())
 	err := s.run(0x1000, 0x1004, program)
 	require.NoError(t, err)
-	// After val_offset the state is in ruleExpression → classification fallback.
-	require.Len(t, s.classifications, 1)
-	assert.Equal(t, ModeFallback, s.classifications[0].Mode)
+	// After val_offset the state is in ruleExpression, so no row is emitted
+	// and the walker frame-pointer walks that range.
+	assert.Empty(t, s.entries)
 }
 
 func TestInterpret_AdvanceLocTruncated(t *testing.T) {

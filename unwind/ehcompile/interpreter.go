@@ -53,8 +53,7 @@ type interpreter struct {
 	lastState     emittedState
 
 	// Output.
-	entries         []CFIEntry
-	classifications []Classification
+	entries []CFIEntry
 
 	// State stack for DW_CFA_remember_state/restore_state. 16 deep is more
 	// than enough (real code rarely exceeds 2).
@@ -406,46 +405,34 @@ func (s *interpreter) snapshot(newPC uint64) {
 	}
 	delta := uint32(newPC - s.lastEmittedPC)
 
-	// Coalesce: if the last emitted row matches current state, extend it.
-	if s.cfaRule != ruleExpression && len(s.entries) > 0 && cur == s.lastState {
-		s.entries[len(s.entries)-1].PCEndDelta += delta
-		s.classifications[len(s.classifications)-1].PCEndDelta += delta
-		s.lastEmittedPC = newPC
-		return
-	}
-	if s.cfaRule == ruleExpression && len(s.classifications) > 0 && cur == s.lastState {
-		s.classifications[len(s.classifications)-1].PCEndDelta += delta
+	// A CFA the compiler declines to evaluate -- DW_CFA_def_cfa_expression and
+	// friends -- emits NO ROW AT ALL, which is what makes the walker fall back
+	// to the frame pointer over that range. It used to emit a FALLBACK
+	// classification row saying the same thing in a second table; the walker
+	// now reads "no row" directly and the table is gone.
+	if s.cfaRule == ruleExpression {
+		s.lastState = cur
 		s.lastEmittedPC = newPC
 		return
 	}
 
-	if s.cfaRule == ruleExpression {
-		s.classifications = append(s.classifications, Classification{
-			PCStart:    s.lastEmittedPC,
-			PCEndDelta: delta,
-			Mode:       ModeFallback,
-		})
-	} else {
-		s.entries = append(s.entries, CFIEntry{
-			PCStart:    s.lastEmittedPC,
-			PCEndDelta: delta,
-			CFAType:    s.cfaType,
-			FPType:     fpRuleToType(s.fpRule),
-			CFAOffset:  int16(s.cfaOffset),
-			FPOffset:   int16(s.fpRule.offset),
-			RAType:     raRuleToType(s.raRule),
-			RAOffset:   int16(s.raRule.offset),
-		})
-		mode := ModeFPLess
-		if s.cfaType == CFATypeFP {
-			mode = ModeFPSafe
-		}
-		s.classifications = append(s.classifications, Classification{
-			PCStart:    s.lastEmittedPC,
-			PCEndDelta: delta,
-			Mode:       mode,
-		})
+	// Coalesce: if the last emitted row matches current state, extend it.
+	if len(s.entries) > 0 && cur == s.lastState {
+		s.entries[len(s.entries)-1].PCEndDelta += delta
+		s.lastEmittedPC = newPC
+		return
 	}
+
+	s.entries = append(s.entries, CFIEntry{
+		PCStart:    s.lastEmittedPC,
+		PCEndDelta: delta,
+		CFAType:    s.cfaType,
+		FPType:     fpRuleToType(s.fpRule),
+		CFAOffset:  int16(s.cfaOffset),
+		FPOffset:   int16(s.fpRule.offset),
+		RAType:     raRuleToType(s.raRule),
+		RAOffset:   int16(s.raRule.offset),
+	})
 	s.lastState = cur
 	s.lastEmittedPC = newPC
 }

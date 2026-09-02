@@ -22,7 +22,7 @@ import (
 // the ordering, not the compile.
 
 func TestASecondInstallerWaitsForTheFirstInsteadOfAssumingItFinished(t *testing.T) {
-	s := NewTableStore(nil, nil, nil, nil)
+	s := NewTableStore(nil, nil)
 	const tid uint64 = 0x1234
 
 	if !s.beginInstall(tid) {
@@ -51,7 +51,7 @@ func TestASecondInstallerWaitsForTheFirstInsteadOfAssumingItFinished(t *testing.
 }
 
 func TestAFailedInstallLetsTheNextCallerTryAgain(t *testing.T) {
-	s := NewTableStore(nil, nil, nil, nil)
+	s := NewTableStore(nil, nil)
 	const tid uint64 = 0x1234
 
 	if !s.beginInstall(tid) {
@@ -67,7 +67,7 @@ func TestAFailedInstallLetsTheNextCallerTryAgain(t *testing.T) {
 }
 
 func TestAnEvictedTableIsNoLongerConsideredInstalled(t *testing.T) {
-	s := NewTableStore(nil, nil, nil, nil)
+	s := NewTableStore(nil, nil)
 	const tid uint64 = 0x1234
 
 	if !s.beginInstall(tid) {
@@ -88,7 +88,7 @@ func TestAnEvictedTableIsNoLongerConsideredInstalled(t *testing.T) {
 // Distinct tables never block each other: the barrier is per-table, so one
 // slow libcuda compile must not serialize every other binary in the process.
 func TestInstallsOfDifferentTablesDoNotBlockEachOther(t *testing.T) {
-	s := NewTableStore(nil, nil, nil, nil)
+	s := NewTableStore(nil, nil)
 	if !s.beginInstall(1) {
 		t.Fatal("table 1")
 	}
@@ -110,7 +110,7 @@ func TestInstallsOfDifferentTablesDoNotBlockEachOther(t *testing.T) {
 
 // Under contention exactly one caller compiles, and nobody proceeds early.
 func TestExactlyOneCallerInstallsUnderContention(t *testing.T) {
-	s := NewTableStore(nil, nil, nil, nil)
+	s := NewTableStore(nil, nil)
 	const tid uint64 = 0x1234
 	const n = 16
 
@@ -180,7 +180,7 @@ func TestASecondAcquireAfterAFailedInstallDoesNotWedge(t *testing.T) {
 		{name: "populate fails after a good compile", path: "../ehcompile/testdata/hello"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewTableStore(nil, nil, nil, nil)
+			s := NewTableStore(nil, nil)
 
 			if _, _, err := s.AcquireBinary(tc.path, "", 1); err == nil {
 				t.Fatalf("expected the first acquire to fail; the test proves nothing otherwise")

@@ -18,6 +18,7 @@ import (
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/ehmaps"
+	"github.com/dpsoft/perf-agent/unwind/interp"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
@@ -39,8 +40,6 @@ type sessionObjs interface {
 	KernStackmap() *ebpf.Map
 	CFIRulesMap() *ebpf.Map
 	CFILengthsMap() *ebpf.Map
-	CFIClassificationMap() *ebpf.Map
-	CFIClassificationLengthsMap() *ebpf.Map
 	PIDMappingsMap() *ebpf.Map
 	PIDMappingLengthsMap() *ebpf.Map
 }
@@ -58,6 +57,18 @@ type session struct {
 	pid    int
 	tags   []string
 	labels map[string]string
+	// logPrefix names this session in log lines ("dwarfagent",
+	// "dwarfagent-offcpu"); newSession already takes it, and close() needs
+	// it to attribute an interpreter module's counters to the right profiler.
+	logPrefix string
+	// interpModules are the language unwinders attached to this session's BPF
+	// program, if any. Nil when none is registered, when the verifier refused
+	// the handoff, or in system-wide mode; every method on a nil *Set is a
+	// no-op, so nothing downstream branches on it.
+	interpModules *interp.Set
+	// interpEnrolled records whether any module recognised the target at all,
+	// so close() can decide whether its counters are news or noise.
+	interpEnrolled bool
 
 	objs             sessionObjs
 	store            *ehmaps.TableStore
@@ -75,7 +86,7 @@ type session struct {
 
 	mu         sync.Mutex
 	samples    map[sampleKey]uint64
-	stacks     map[sampleKey][]uint64
+	stacks     map[sampleKey][]interp.Slot
 	kernStacks map[sampleKey][]uint64 // kernel IPs per sample key; nil when kernel-stacks disabled
 
 	attachStats attachStats
@@ -118,7 +129,6 @@ type attachStats struct {
 func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
-		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
 	)
 	if hooks != nil && hooks.OnCompile != nil {
 		store.SetOnCompile(hooks.onCompileFunc())
@@ -170,6 +180,40 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		}
 	}
 
+	// Interpreter frames, per target PID.
+	//
+	// This runs AFTER the mapping enrolment above and not before: the handoff
+	// range a module installs is keyed by table_id, and a table_id only
+	// resolves to a PC once that binary has a pid_mappings row. Installed the
+	// other way round, the claim would be live for a binary walk_step cannot
+	// yet attribute a PC to.
+	//
+	// Failures here are logged and dropped. An interpreter module that will
+	// not attach costs that language's frames; the native walk is untouched,
+	// which is the invariant the whole handoff is built around.
+	var interpSet *interp.Set
+	var interpEnrolled bool
+	if d, ok := objs.(interp.Driver); ok {
+		set, err := interp.Attach(d)
+		if err != nil {
+			log.Printf("%s: interpreter frames: %v", logPrefix, err)
+		}
+		interpSet = set
+		// System-wide is deliberately not covered yet: enrolling every
+		// interpreter process on a box means one ptrace stop per process at
+		// startup, which wants its own measurement. Named here rather than
+		// left as silence -- see the log line.
+		if systemWide {
+			if interp.Registered() > 0 {
+				log.Printf("%s: interpreter frames: not enrolled in system-wide mode (per-PID only for now); stacks stay native-only", logPrefix)
+			}
+		} else if pid > 0 {
+			interpEnrolled = interpSet.Enroll(uint32(pid), func(format string, args ...any) {
+				log.Printf("%s: "+format, append([]any{logPrefix}, args...)...)
+			})
+		}
+	}
+
 	var watcher mmapEventSourceCloser
 	if systemWide {
 		cpuInts := make([]int, 0, len(cpus))
@@ -216,6 +260,9 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	resolver := procmap.NewResolver()
 	sess := &session{
 		pid:              pid,
+		logPrefix:        logPrefix,
+		interpModules:    interpSet,
+		interpEnrolled:   interpEnrolled,
 		tags:             tags,
 		labels:           labels,
 		objs:             objs,
@@ -341,14 +388,19 @@ func (s *session) consumeRingbuf(agg aggregator) {
 	}
 }
 
-// stashStack stores the PC chain for key if not already stashed.
+// stashStack stores the decoded frame chain for key if not already stashed.
+//
+// Decoded, not raw: the pcs[]/tags[] pair is folded into slots once, in the
+// aggregator, so collect() cannot symbolize an interpreter frame's words as
+// instruction pointers by forgetting to consult the tags (issue #83). There is
+// exactly one place that can make that mistake, and it no longer exists.
 // Must be called under s.mu.
-func (s *session) stashStack(key sampleKey, pcs []uint64) {
+func (s *session) stashStack(key sampleKey, slots []interp.Slot) {
 	if s.stacks == nil {
-		s.stacks = map[sampleKey][]uint64{}
+		s.stacks = map[sampleKey][]interp.Slot{}
 	}
 	if _, have := s.stacks[key]; !have {
-		s.stacks[key] = append([]uint64(nil), pcs...)
+		s.stacks[key] = append([]interp.Slot(nil), slots...)
 	}
 }
 
@@ -380,7 +432,7 @@ func (s *session) stashKernelStack(key sampleKey, kernelIPs []uint64) {
 func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate int) error {
 	s.mu.Lock()
 	samples := make(map[sampleKey]uint64, len(s.samples))
-	stacks := make(map[sampleKey][]uint64, len(s.stacks))
+	stacks := make(map[sampleKey][]interp.Slot, len(s.stacks))
 	kernStacks := make(map[sampleKey][]uint64, len(s.kernStacks))
 	for k, v := range s.samples {
 		samples[k] = v
@@ -467,8 +519,34 @@ func (s *session) close() error {
 	if s.resolver != nil {
 		s.resolver.Close()
 	}
+	// One last reading of every attached module's counters before the maps go
+	// away with the BPF handle: after objs.Close() they are gone, and a run
+	// that walked nothing is exactly the run whose counters need reporting.
+	s.interpModules.LogCounters(s.interpEnrolled, func(format string, args ...any) {
+		log.Printf("%s: "+format, append([]any{s.logPrefix}, args...)...)
+	})
+	_ = s.interpModules.Close()
 	// Symbolizer is owned by the Agent; do not close it here.
 	return s.objs.Close()
+}
+
+// hashStack is hashPCs with the FRAME_TAG_* bytes folded in (issue #83).
+//
+// The tags are part of what makes a stack a stack: the same 64-bit word is a
+// return address in one slot and a code-object pointer in another, and two
+// walks whose words agree but whose tags do not are different call paths that
+// must not be deduped onto one another. That collision needs a heap address
+// to equal a text address to be reachable at all, so this is cheap insurance
+// rather than an observed problem — but it is three lines, and the
+// alternative is a reader having to reconstruct that argument.
+func hashStack(pcs []uint64, tags []uint8) uint64 {
+	h := hashPCs(pcs)
+	const prime uint64 = 0x100000001b3
+	for _, t := range tags {
+		h ^= uint64(t)
+		h *= prime
+	}
+	return h
 }
 
 // hashPCs is a stable, fast, collision-rare hash over a PC chain —

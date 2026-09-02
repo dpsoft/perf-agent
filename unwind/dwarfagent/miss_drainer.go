@@ -22,11 +22,11 @@ import (
 // cfiMissEvent mirrors the BPF struct cfi_miss_event in
 // bpf/unwind_common.h. Layout (with padding for u64 alignment):
 //
-//   offset 0:  u32 pid
-//   offset 4:  4 bytes pad (BPF compiler aligns u64 to 8)
-//   offset 8:  u64 table_id
-//   offset 16: u64 rel_pc
-//   offset 24: u64 ktime_ns
+//	offset 0:  u32 pid
+//	offset 4:  4 bytes pad (BPF compiler aligns u64 to 8)
+//	offset 8:  u64 table_id
+//	offset 16: u64 rel_pc
+//	offset 24: u64 ktime_ns
 //
 // Total 32 bytes.
 type cfiMissEvent struct {
@@ -45,7 +45,7 @@ func parseMissEvent(raw []byte) (*cfiMissEvent, error) {
 		return nil, fmt.Errorf("miss event too short: %d bytes (want %d)", len(raw), cfiMissEventSize)
 	}
 	return &cfiMissEvent{
-		PID:     binary.LittleEndian.Uint32(raw[0:4]),
+		PID: binary.LittleEndian.Uint32(raw[0:4]),
 		// bytes 4-7 are alignment padding before the u64 table_id
 		TableID: binary.LittleEndian.Uint64(raw[8:16]),
 		RelPC:   binary.LittleEndian.Uint64(raw[16:24]),
@@ -62,14 +62,14 @@ var (
 // MissStats summarises the lazy-CFI drainer's lifetime activity.
 // Returned by (*Profiler).MissStats() for tests and the bench harness.
 type MissStats struct {
-	Received           uint64 // ringbuf reads succeeded
-	Deduped            uint64 // (pid, table_id) already in flight
-	Resolved           uint64 // tracker.AttachCompileOnly succeeded
-	DroppedPIDGone     uint64 // /proc/<pid>/maps disappeared
-	DroppedNotMapped   uint64 // table_id not in any mapping
-	DroppedAttach      uint64 // AttachCompileOnly errored
-	PoisonedKeys       uint64 // (pid, table_id) marked permanently failed
-	LastLatencyNs      uint64 // BPF emit → userspace receipt
+	Received         uint64 // ringbuf reads succeeded
+	Deduped          uint64 // (pid, table_id) already in flight
+	Resolved         uint64 // tracker.AttachCompileOnly succeeded
+	DroppedPIDGone   uint64 // /proc/<pid>/maps disappeared
+	DroppedNotMapped uint64 // table_id not in any mapping
+	DroppedAttach    uint64 // AttachCompileOnly errored
+	PoisonedKeys     uint64 // (pid, table_id) marked permanently failed
+	LastLatencyNs    uint64 // BPF emit → userspace receipt
 }
 
 // missCounters is the writable shape used internally; MissStats is the

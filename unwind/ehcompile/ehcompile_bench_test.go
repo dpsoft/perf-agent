@@ -13,7 +13,7 @@ func BenchmarkCompile_Glibc(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _, err := Compile(path)
+		_, _, err := Compile(path)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -26,7 +26,7 @@ func BenchmarkCompile_HelloX86(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _, err := Compile("testdata/hello")
+		_, _, err := Compile("testdata/hello")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -39,7 +39,7 @@ func BenchmarkCompile_HelloArm64(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _, err := Compile("testdata/hello_arm64.o")
+		_, _, err := Compile("testdata/hello_arm64.o")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -68,7 +68,7 @@ func BenchmarkCompile_LargeRustRelease(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var err error
-		entries, _, ehFrameBytes, err = Compile(path)
+		entries, ehFrameBytes, err = Compile(path)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -112,7 +112,7 @@ func BenchmarkCompile_LibPython(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var err error
-		entries, _, ehFrameBytes, err = Compile(path)
+		entries, ehFrameBytes, err = Compile(path)
 		if err != nil {
 			b.Fatal(err)
 		}

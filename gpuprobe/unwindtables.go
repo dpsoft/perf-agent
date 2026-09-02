@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 
@@ -73,6 +74,11 @@ type ehmapsRegistrar struct {
 	// with no modules registered, or a kernel that refused the handoff, needs
 	// no branch here.
 	interp *interp.Set
+	// interpEnrolled records whether any module ever recognised a producer, so
+	// Close can tell "this workload had no interpreter in it" from "it had one
+	// and the walk found nothing" -- which are the same row of zeroes
+	// otherwise.
+	interpEnrolled atomic.Bool
 }
 
 // newEhmapsRegistrar wires a registrar around a loaded gpu_usdt object. The
@@ -147,18 +153,36 @@ func (r *ehmapsRegistrar) Register(pid uint32) (int, error) {
 	// outcome is logged, including the refusals, because "not an interpreted
 	// process" and "an interpreter we decline to walk" are different answers
 	// to the only question a user with no interpreter frames has.
-	r.interp.Enroll(pid, func(format string, args ...any) {
+	if r.interp.Enroll(pid, func(format string, args ...any) {
 		log.Printf("gpuprobe: "+format, args...)
-	})
+	}) {
+		r.interpEnrolled.Store(true)
+	}
 	return n, nil
 }
 
-// Close releases the interpreter modules attached to this program. Their BPF
-// objects are separate collections held open for the consumer's lifetime; the
-// programs they installed stay live in interp_progs until that map itself goes
-// with the consumer's own objects, which is what keeps a walk in flight from
-// tail-calling into a closed program.
+// Close reports the handoff counters and then releases the interpreter
+// modules.
+//
+// THE COUNTER LINE IS THE POINT OF THIS BEING HERE. StackInterpFrames == 0 has
+// at least three causes on this path -- the handoff never consulted, the tail
+// call failing into an empty program-array slot, or the frames lost between
+// gpu_stack and the consumer -- and they are three different bugs with three
+// different fixes. The six counters separate them in one run; without them
+// this path was the only one that could walk an interpreter and say nothing
+// about why it did not.
+//
+// It runs before the modules are released and, crucially, while the maps are
+// still open: Consumer.Close brings the registry down before c.objs.
+//
+// Their BPF objects are separate collections held open for the consumer's
+// lifetime; the programs they installed stay live in interp_progs until that
+// map goes with the consumer's own objects, which is what keeps a walk in
+// flight from tail-calling into a closed program.
 func (r *ehmapsRegistrar) Close() error {
+	r.interp.LogCounters(r.interpEnrolled.Load(), func(format string, args ...any) {
+		log.Printf("gpuprobe: "+format, args...)
+	})
 	return r.interp.Close()
 }
 

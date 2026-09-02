@@ -23,6 +23,7 @@ package interp
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -244,6 +245,16 @@ type Set struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 	retries  sync.WaitGroup
+	// label names this Set in the fallback counter line, so a reader can tell
+	// which driver's handoff the numbers belong to when two profilers run.
+	label string
+	// logged records that the counters have been rendered, so Close does not
+	// repeat a line a caller already placed better. See Close.
+	logMu  sync.Mutex
+	logged bool
+	// logSink is where Close's fallback line goes. nil means log.Printf; a
+	// test replaces it to observe the guarantee rather than the log package.
+	logSink func(format string, args ...any)
 	// failed records modules whose BPF object would not load, by name and
 	// reason. Kept rather than only logged at attach: a module that failed to
 	// load produces exactly the same evidence as a process with none of that
@@ -297,7 +308,7 @@ func Attach(d Driver) (*Set, error) {
 		}
 	}
 
-	s := &Set{driver: d, stop: make(chan struct{})}
+	s := &Set{driver: d, stop: make(chan struct{}), label: string(d.Flavour())}
 	var errs []error
 	for _, f := range fs {
 		m := f()
@@ -556,6 +567,9 @@ func (s *Set) LogCounters(enrolled bool, logf func(format string, args ...any)) 
 	if s == nil {
 		return
 	}
+	s.logMu.Lock()
+	s.logged = true
+	s.logMu.Unlock()
 	// A module that never loaded, said as plainly as the counters are. Its
 	// absence is indistinguishable from "this workload runs no such language"
 	// -- no frames, every counter zero -- so it has to be stated rather than
@@ -571,17 +585,21 @@ func (s *Set) LogCounters(enrolled bool, logf func(format string, args ...any)) 
 	// SIGNAL here. A module reporting all-zero counters has two completely
 	// different causes -- it ran and refused, or it was never reached -- and
 	// only these numbers separate them.
-	if m := s.statsMap(); m != nil {
-		st, err := readDispatchStats(m)
-		if err != nil {
-			logf("interpreter handoff: counters unreadable: %v", err)
-		} else {
-			logf("interpreter handoff: range_hit=%d in_range=%d claimed=%d dispatched=%d "+
-				"tail_call_failed=%d budget_exhausted=%d resumed=%d -- %s",
-				st.RangeHit, st.InRange, st.Claimed, st.Dispatched,
-				st.TailCallFailed, st.Budget, st.Resumed, st.Diagnose())
-		}
+	// ALWAYS A LINE. If the map is unreachable that is itself the answer, and
+	// printing nothing is the same silence this whole guarantee exists to
+	// remove -- a run with no interpreter frames and no statement about why.
+	if m := s.statsMap(); m == nil {
+		logf("interpreter handoff: counters unavailable (no driver exposes interp_stats); " +
+			"whether the handoff fired cannot be determined for this run")
+	} else if st, err := readDispatchStats(m); err != nil {
+		logf("interpreter handoff: counters unreadable: %v", err)
+	} else {
+		logf("interpreter handoff: range_hit=%d in_range=%d claimed=%d dispatched=%d "+
+			"tail_call_failed=%d budget_exhausted=%d resumed=%d -- %s",
+			st.RangeHit, st.InRange, st.Claimed, st.Dispatched,
+			st.TailCallFailed, st.Budget, st.Resumed, st.Diagnose())
 	}
+
 	for _, e := range s.entries {
 		if line := e.mod.Counters(enrolled); line != "" {
 			logf("%s", line)
@@ -663,6 +681,31 @@ func (s *Set) statsMap() *ebpf.Map {
 func (s *Set) Close() error {
 	if s == nil {
 		return nil
+	}
+	// COUNTERS BEFORE ANYTHING ELSE, AND UNCONDITIONALLY IF NOBODY ELSE HAS.
+	//
+	// This is a structural guarantee, not a convenience. Four times on this
+	// branch the difference between a minute and a day was whether these
+	// numbers were rendered, and three of those were a path that HAD them and
+	// never printed them -- most recently the GPU driver, which held a Set,
+	// filled its counters, and closed it in silence while a run produced no
+	// interpreter frames and no way to tell why.
+	//
+	// A caller that renders them itself gets a better line (it knows its own
+	// prefix and whether the target was enrolled) and marks them logged. Any
+	// caller that forgets gets them anyway. There is no longer a way to have
+	// a Set and not see its counters.
+	s.logMu.Lock()
+	unrendered := !s.logged
+	s.logMu.Unlock()
+	if unrendered {
+		sink := s.logSink
+		if sink == nil {
+			sink = func(format string, args ...any) {
+				log.Printf("interp[%s]: "+format, append([]any{s.label}, args...)...)
+			}
+		}
+		s.LogCounters(false, sink)
 	}
 	// Stop retries and WAIT for them: they write into the driver's maps, which
 	// the caller closes immediately after this returns.

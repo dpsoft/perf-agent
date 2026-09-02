@@ -100,3 +100,44 @@ func TestCloseStopsRetriesPromptly(t *testing.T) {
 		t.Fatal("Close did not return: a retry sleeping on the schedule blocks shutdown")
 	}
 }
+
+// A Set closed WITHOUT anyone rendering its counters must render them anyway.
+//
+// This is the structural half of a lesson that cost four debugging sessions on
+// this branch: three of them were a path that HAD the counters and never
+// printed them. Most recently the GPU driver held a Set, filled its counters,
+// and closed it in silence while the run produced no interpreter frames --
+// leaving three different bugs indistinguishable. Remembering to call
+// LogCounters on every path is not a mechanism; this is.
+func TestCloseRendersCountersNobodyElseDid(t *testing.T) {
+	var lines []string
+	s := &Set{stop: make(chan struct{})}
+	s.logSink = func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(lines) == 0 {
+		t.Fatal("Close rendered nothing: a driver can hold a Set, fill its counters, and say nothing")
+	}
+}
+
+// And a caller that renders them itself is not doubled up on: its line is
+// better (it knows its own prefix and whether the target was enrolled).
+func TestCloseDoesNotRepeatCountersACallerAlreadyRendered(t *testing.T) {
+	var closeLines, callerLines int
+	s := &Set{stop: make(chan struct{})}
+	s.logSink = func(string, ...any) { closeLines++ }
+
+	s.LogCounters(true, func(string, ...any) { callerLines++ })
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if callerLines == 0 {
+		t.Fatal("the caller's own LogCounters rendered nothing")
+	}
+	if closeLines != 0 {
+		t.Errorf("Close rendered %d more lines after the caller had already done it", closeLines)
+	}
+}

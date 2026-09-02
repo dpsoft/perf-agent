@@ -34,6 +34,86 @@ generate:
 	go generate ./...
 	@$(MAKE) --no-print-directory generate-guard
 
+# Where CI checks the repo out. bpf2go passes clang an ABSOLUTE source path and
+# runs it with the package directory as cwd, and clang's BTF forward-declaration
+# ordering depends on both -- see generate-container. Must track the
+# actions/checkout working directory, which is /home/runner/work/<repo>/<repo>.
+CI_BUILD_PATH ?= /home/runner/work/perf-agent/perf-agent
+CI_IMAGE      ?= ubuntu:24.04
+CI_GO_VERSION ?= 1.26.0
+
+# generate-container: regenerate the BPF objects so they match CI's byte for
+# byte, with no CI round trip. Issues #114, #117.
+#
+# WHY THE BYTES MOVED, at last.
+#
+# The trailing BTF_KIND_FWD block of every object comes from one loop in
+# llvm/lib/Target/BPF/BTFDebug.cpp (BTFDebug::endModule), over
+#
+#     std::map<const DICompositeType *, std::vector<...>> FixupDerivedTypes;
+#
+# -- a std::map keyed by a POINTER, so it iterates in malloc-address order of
+# clang's debug-info metadata nodes, and the forward declarations get their BTF
+# type IDs in that order. (Still pointer-keyed on llvm-project main.) Anything
+# that shifts clang's allocation pattern permutes a few of them; every reference
+# is renumbered to match. What comes out is an object of exactly the same size
+# whose .BTF differs in a few hundred bytes, with identical section tables,
+# symbol tables and relocations. That is the whole of issue #117.
+#
+# Measured 2026-09-02, same source, same clang 18.1.3, same flags, same
+# container image:
+#
+#   built at /work                 5 objects differ from the committed set --
+#                                  exactly offcpu_{x86,arm64}, perf_{x86,arm64},
+#                                  perf_dwarf_x86, the set recorded above
+#   built at /a/b                  the same 5
+#   built at $(CI_BUILD_PATH)      0 differ; all 14 reproduce, repeatably
+#
+# The build directory string is the entire difference. So is the -o filename,
+# and so is the length of a -D value: shortening -D__BPF_TARGET_MISSING alone
+# moved perf_x86 from 39 to 63 differing bytes. cpu/'s custom -cflags perturb
+# the same lottery rather than escaping it -- with them, perf_x86 differs from
+# CI by 116 bytes instead of 39 -- so issue #114's "cpu/ compiles differently"
+# is a coincidence of that package's allocation pattern, not a cause and not a
+# fix. (-Werror there does not even survive vmlinux_arm64.h.)
+#
+# Run this instead of `make generate` when you have touched bpf/*.c or *.h.
+.PHONY: generate-container
+generate-container:
+	@command -v podman >/dev/null 2>&1 || { echo "*** generate-container needs podman"; exit 1; }
+	@tmp=$$(mktemp -d) && mkdir -p "$$tmp/out" && \
+	tar -C . --exclude=./.git --exclude=./test --exclude='./bin-*' \
+		--exclude='./perf-agent*' --exclude='./run-*' \
+		--exclude='./integration.test' --exclude='./.worktrees' \
+		-cf "$$tmp/src.tar" . && \
+	gomod=$$(go env GOMODCACHE 2>/dev/null); \
+	podman run --rm \
+		-v "$$tmp/src.tar":/src.tar:Z,ro \
+		-v "$$tmp/out":/out:Z \
+		$$( [ -d "$$gomod" ] && echo -v "$$gomod":/gomod:Z,ro ) \
+		$(CI_IMAGE) bash -c '\
+		set -e; \
+		apt-get update -qq && apt-get install -y -qq clang-18 llvm-18 libelf-dev libbpf-dev curl ca-certificates >/dev/null; \
+		ln -sf /usr/bin/clang-18 /usr/local/bin/clang; \
+		ln -sf /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip; \
+		curl -sSL https://go.dev/dl/go$(CI_GO_VERSION).linux-amd64.tar.gz -o /tmp/go.tgz; \
+		tar -C /usr/local -xzf /tmp/go.tgz; \
+		export PATH=/usr/local/go/bin:/usr/local/bin:$$PATH; \
+		export GOCACHE=/tmp/gocache GOTOOLCHAIN=local; \
+		if [ -d /gomod ]; then export GOMODCACHE=/gomod GOFLAGS=-mod=mod GOPROXY=off; fi; \
+		mkdir -p $(CI_BUILD_PATH); \
+		tar -C $(CI_BUILD_PATH) -xf /src.tar; \
+		cd $(CI_BUILD_PATH); \
+		clang --version | head -1; \
+		go generate ./...; \
+		for f in $$(find . -name "*_bpfel.o" -o -name "*_bpfel.go"); do cp --parents "$$f" /out/; done' && \
+	cp -a "$$tmp/out/." . && rm -rf "$$tmp"
+	@echo "*** regenerated at $(CI_BUILD_PATH); diff against the committed objects:"
+	@git diff --stat -- $(GENERATED_GLOBS) || true
+	@git diff --quiet -- $(GENERATED_GLOBS) \
+		&& echo "✓ byte-identical to the committed objects (which are CI's)" \
+		|| echo "*** differs: a real source change (commit it), or -- if only .BTF moved -- CI_BUILD_PATH no longer matches CI's checkout directory"
+
 # The committed bpf2go outputs. Scoped deliberately: the check must fire on a
 # stale generated object and stay silent on whatever else is dirty in a
 # contributor's tree, or it becomes the kind of check people learn to ignore.
@@ -52,12 +132,16 @@ GENERATED_GLOBS := '*_bpfel.go' '*_bpfel.o'
 # `cfs_rq` and `rq` swapping slots, with both references updated), such that
 # applying the permutation to our object reproduces CI's byte for byte. The
 # programs are identical; only the numbering differs. Both sides run clang
-# 18.1.3 with byte-identical libbpf 1.3.0 headers, and the cause is still
-# unknown — see #117.
+# 18.1.3 with byte-identical libbpf 1.3.0 headers.
 #
-# The consequence is what matters here: a local regen CANNOT produce a
-# committable object set, even when your source change is perfectly correct.
-# So this guard fails loudly rather than leaving a diff for a human to notice.
+# The cause is now known: clang orders those forward declarations by the malloc
+# address of its debug-info metadata nodes, so the build DIRECTORY decides the
+# numbering. See generate-container above, which reproduces CI's bytes exactly
+# by building at CI's path.
+#
+# The consequence is what matters here: a plain local regen still CANNOT produce
+# a committable object set, because your checkout is not at CI's path. So this
+# guard fails loudly rather than leaving a diff for a human to notice.
 #
 # There used to be a documented habit of reverting the unwanted files by hand
 # to keep a commit scoped. That is deliberately gone. It matched CI by luck on
@@ -80,7 +164,10 @@ generate-guard:
 		echo "*** source change is correct. Do NOT commit these bytes and do NOT revert"; \
 		echo "*** them by hand — hand-reverting is what hid this for four rounds."; \
 		echo "***"; \
-		echo "*** Instead:"; \
+		echo "*** Instead, either:"; \
+		echo "***   make generate-container   # regenerates at CI's path; matches byte for byte"; \
+		echo "***"; \
+		echo "*** or, if podman is unavailable, take the round trip:"; \
 		echo "***   1. commit your bpf/*.c / bpf/*.h source change on its own"; \
 		echo "***   2. push; CI regenerates and uploads regenerated-objects-<arch>"; \
 		echo "***   3. make adopt-ci-objects RUN=<github-run-id>"; \

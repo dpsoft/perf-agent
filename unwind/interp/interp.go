@@ -640,9 +640,18 @@ type DispatchStats struct {
 func (d DispatchStats) Diagnose() string {
 	switch {
 	case d.RangeHit == 0:
-		return "NO CLAIM WAS EVER MATCHED: either nothing installed a handoff range, " +
-			"or the range was keyed by a table_id the walker does not compute for those frames. " +
-			"Check the 'handoff installed' line against the binary the samples land in"
+		// THREE CAUSES, AND THE ORDER MATTERS. This message used to name only
+		// the last two, and on the GPU path that sent a reader hunting a
+		// key-derivation bug that did not exist: the real answer was that the
+		// native walk stopped in the CUDA libraries and never stood on a frame
+		// in the interpreter's binary at all. A diagnosis that omits the most
+		// likely cause is worse than none, because it is believed.
+		return "NO CLAIM WAS EVER MATCHED. In order of likelihood: (a) the native walk never " +
+			"reached a frame in the claimed binary -- check the walk-ending stats " +
+			"(reached-root vs abandoned/fp-exhausted) and whether the profile's mappings even " +
+			"include that binary; (b) nothing installed a handoff range -- check for a " +
+			"'handoff installed' line; (c) the range is keyed by a table_id the walker does not " +
+			"compute for those frames"
 	case d.InRange == 0:
 		return "A CLAIM WAS FOUND BUT NO PC EVER FELL INSIDE IT: the installer and the walker " +
 			"disagree about the address space (a range in file offsets against a load-bias-relative pc, say)"

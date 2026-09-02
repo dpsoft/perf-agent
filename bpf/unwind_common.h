@@ -403,10 +403,41 @@ static __always_inline struct mapping_lookup_result mapping_for_pc(__u32 pid, __
     return ctx.out;
 }
 
-// BINARY_SEARCH_MAX_ITERS bounds binary search over CFI / classification
-// tables. log2(1_000_000) ≈ 20, so 20 iters suffices for any realistically
-// sized binary.
-#define BINARY_SEARCH_MAX_ITERS 20
+// BINARY_SEARCH_MAX_ITERS bounds the binary search over the CFI and
+// classification tables. A search over n sorted rows needs ceil(log2(n))
+// halvings, so this bound is a CEILING ON HOW BIG A BINARY CAN BE UNWOUND --
+// and when a binary exceeds it the failure is silent and total.
+//
+// It was 20, on the reasoning that log2(1,000,000) is about 20 and that
+// "suffices for any realistically sized binary". PyTorch is a realistically
+// sized binary and it does not:
+//
+//	libtorch_cpu.so    2,359,137 CFI rows   needs 22   HAD 20
+//	libtorch_cuda.so     947,971            needs 20   had 20  (exactly at it)
+//	libtorch_python.so   283,904            needs 19
+//	libcuda.so           135,805            needs 18
+//	libcupti.so           46,422            needs 16
+//
+// With 20 iterations a 2.36M-row table narrows to a range of two or three and
+// then the loop ends, so the lookup fails for almost every PC. BOTH failure
+// paths then lie: cfi_lookup returns NULL, which walk_step reads as a CFI miss
+// and STOPS the walk; classify_rel_pc returns MODE_FP_SAFE, which sends a
+// frame-pointer-less frame down the frame-pointer path. Measured on a real
+// GPU + PyTorch capture: 4,299 launch stacks, every one abandoned, none
+// reaching root, all of them stopping inside libtorch's dispatcher
+// (at::_ops::mm::redispatch, structured_clamp_min_out::impl, add_kernel) --
+// the first library on the way up whose table is too big to search.
+//
+// 24 covers 16.7M rows, a little over 7x the largest table anyone has put in
+// front of this walker. The cost is linear and was measured rather than
+// assumed, on perf_dwarf: 20 -> 160,530 processed, 22 -> 186,978,
+// 24 -> 206,062, 26 -> 223,810. About 9,600 per iteration, two searches per
+// frame, inside the loop callback where everything is expensive.
+//
+// ehmaps refuses to install a table this search cannot reach, and says so:
+// silently installing one is indistinguishable from having none, except that
+// it also stops the walk. See ehmaps.MaxSearchableRows.
+#define BINARY_SEARCH_MAX_ITERS 24
 
 // classify_rel_pc returns MODE_FP_SAFE / MODE_FP_LESS / MODE_FALLBACK for the
 // given (table_id, rel_pc). If the table is absent or no row covers rel_pc,

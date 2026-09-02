@@ -9,6 +9,7 @@ package ehmaps
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/cilium/ebpf"
@@ -100,6 +101,46 @@ const BPF_F_INNER_MAP = 0x1000
 // for the walker's bpf_loop bound to hold.
 const MaxPIDMappings = 256
 
+// binarySearchMaxIters mirrors bpf/unwind_common.h's BINARY_SEARCH_MAX_ITERS.
+// Keep in lockstep; TestSearchBoundMirrorsTheBPFHeader reads the header.
+const binarySearchMaxIters = 24
+
+// MaxSearchableRows is the largest table the BPF walker's binary search can
+// reach: a search over n sorted rows needs ceil(log2(n)) halvings, and the
+// walker is bounded to binarySearchMaxIters of them.
+//
+// A TABLE BIGGER THAN THIS IS WORSE THAN NO TABLE, which is why it is refused
+// rather than installed with a warning. The search narrows to a range of two
+// or three and then ends, so the lookup fails for almost every PC -- and both
+// failure paths in the walker LIE about it. cfi_lookup returns NULL, which
+// walk_step reads as a CFI miss and stops the walk. classify_rel_pc returns
+// MODE_FP_SAFE, which sends a frame-pointer-less frame down the
+// frame-pointer path. Having no table at all produces the second of those and
+// not the first, so an unsearchable table costs the walk more than omitting it
+// does.
+//
+// This existed silently before: at 20 iterations libtorch_cpu.so's 2,359,137
+// rows needed 22, and every GPU launch stack in a PyTorch capture abandoned
+// inside libtorch's dispatcher -- 4,299 of them, none reaching root -- with
+// nothing anywhere saying why.
+const MaxSearchableRows = 1 << binarySearchMaxIters
+
+// ErrTableTooLarge is returned when a binary's compiled tables are larger than
+// the walker's binary search can reach. Named rather than silent: the caller
+// logs it and the binary is unwound by frame pointer, which is a degradation
+// an operator can see rather than one they cannot.
+var ErrTableTooLarge = errors.New("ehmaps: table larger than the walker's binary search can reach")
+
+// bitsNeeded is ceil(log2(n)): how many halvings a binary search over n rows
+// needs in the worst case.
+func bitsNeeded(n int) int {
+	b := 0
+	for v := n - 1; v > 0; v >>= 1 {
+		b++
+	}
+	return b
+}
+
 // PopulateCFIArgs bundles what the caller already has in memory — an already-
 // compiled set of rules plus the outer and length maps from the loaded BPF
 // program.
@@ -117,6 +158,11 @@ type PopulateCFIArgs struct {
 func PopulateCFI(args PopulateCFIArgs) error {
 	if len(args.Entries) == 0 {
 		return fmt.Errorf("ehmaps: PopulateCFI: no entries")
+	}
+	if len(args.Entries) > MaxSearchableRows {
+		return fmt.Errorf("%w: %d CFI rows for table %#x needs %d search iterations, the walker has %d",
+			ErrTableTooLarge, len(args.Entries), args.TableID,
+			bitsNeeded(len(args.Entries)), binarySearchMaxIters)
 	}
 	spec := &ebpf.MapSpec{
 		Type:       ebpf.Array,
@@ -160,6 +206,11 @@ type PopulateClassificationArgs struct {
 func PopulateClassification(args PopulateClassificationArgs) error {
 	if len(args.Entries) == 0 {
 		return fmt.Errorf("ehmaps: PopulateClassification: no entries")
+	}
+	if len(args.Entries) > MaxSearchableRows {
+		return fmt.Errorf("%w: %d classification rows for table %#x needs %d search iterations, the walker has %d",
+			ErrTableTooLarge, len(args.Entries), args.TableID,
+			bitsNeeded(len(args.Entries)), binarySearchMaxIters)
 	}
 	spec := &ebpf.MapSpec{
 		Type:       ebpf.Array,

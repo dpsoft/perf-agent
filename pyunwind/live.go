@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cilium/ebpf"
 
@@ -336,8 +337,17 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 	if len(tids) > maxValidationThreads {
 		tids = tids[:maxValidationThreads]
 	}
+	deadline := time.Now().Add(validationBudget)
 	var last Result
+	tried := 0
 	for _, tid := range tids {
+		// Checked before the attempt but never on the first one: a budget
+		// that can expire before a single thread is tried would turn a busy
+		// machine into a silent refusal.
+		if tried > 0 && time.Now().After(deadline) {
+			break
+		}
+		tried++
 		res, err := Attach(pid, libPath, code, m, NewProcReader(int(pid), tid))
 		if err != nil {
 			return res, err
@@ -359,26 +369,49 @@ func AttachProcess(pid uint32, libPath string, tableID uint64, m *BPFMaps) (Resu
 		v, _ := DetectFromSoname(libPath)
 		return refuseWith(v, fmt.Errorf("%w: pid %d has no threads to validate against", ErrOffsetsUnreadable, pid)), nil
 	}
-	if totalThreads > maxValidationThreads {
+	if tried < totalThreads {
 		// Say that the search was cut short, rather than reporting the last
 		// thread tried as though it were the last thread there is.
 		last.Refused = fmt.Sprintf("%s (tried %d of pid %d's %d threads; none held a PyThreadState)",
-			last.Refused, maxValidationThreads, pid, totalThreads)
+			last.Refused, tried, pid, totalThreads)
+	}
+	// Every thread we were allowed to stop came back empty. That is a
+	// statement about WHEN we looked -- see ErrNoThreadHasState -- so the
+	// reason is replaced with the retryable one, which is what lets a caller
+	// look again instead of writing the process off.
+	if errors.Is(last.Reason, ErrOffsetsUnreadable) {
+		last.Reason = fmt.Errorf("%w: %w", ErrNoThreadHasState, last.Reason)
 	}
 	return last, nil
 }
 
-// maxValidationThreads bounds how many threads AttachProcess will try
-// before giving up.
+// maxValidationThreads and validationBudget bound the search for a thread
+// holding a PyThreadState. Each attempt ptrace-stops one thread for the length
+// of one GETREGS.
 //
-// Each attempt ptrace-stops one thread for the length of a GETREGS. That is
-// cheap once and not cheap 200 times: a process that maps libpython but has
-// never run Python -- an embedder that loaded it and never called in, a
-// thread pool started before the interpreter -- refuses on every thread,
-// and without a bound the attach path walks the whole pool to learn one
-// thing. 16 is well past the number of threads a process is likely to have
-// created before running its first Python code, and far short of a pool.
-const maxValidationThreads = 16
+// THE BOUND IS TIME; THE COUNT IS ONLY A BACKSTOP. It used to be a flat
+// "first 16", which is an arbitrary slice of a set with no useful order -- and
+// measured on a live PyTorch process, it is exactly the wrong 16:
+//
+//	29 threads, 2 holding a PyThreadState
+//	  index  0   the leader
+//	  index 28   the application's Python worker
+//	  the other 27 are CUDA and OpenMP helpers that have never run Python
+//
+// The one non-leader candidate sits at the very end, because helper threads
+// are created during library init and application threads after it, so the
+// qualifying thread has the HIGHEST tid. A count of 16 cannot reach it, and no
+// reordering makes "first N" reliable for the general case.
+//
+// A deadline bounds the real cost -- a process that refuses on every thread
+// pays a fixed slice of wall time instead of one ptrace stop per thread --
+// while letting a 29-thread process be searched exhaustively, which takes far
+// less than the budget. The count cap stays so a pathological thread count
+// cannot be walked in full even if every attempt is instant.
+const (
+	maxValidationThreads = 256
+	validationBudget     = 500 * time.Millisecond
+)
 
 // EnrollTarget is the whole per-process enrolment as a caller with BPF maps
 // wants it: find the interpreter, key it the way the unwinder keys every
@@ -554,6 +587,23 @@ func ThreadIDs(pid uint32) ([]int, error) {
 // any other thread in the group is invisible to the parent's wait. That is why
 // this is a filter and not a refusal to walk our own children at all.
 var ErrTraceeIsOwnChild = errors.New("pyunwind: the only stoppable thread is the leader of a process we launched")
+
+// ErrNoThreadHasState means no thread this profiler was allowed to stop held a
+// PyThreadState -- which is a statement about WHEN we looked, not about the
+// process.
+//
+// Measured on a live PyTorch process: during startup the leader is the only
+// thread with one, and the application's own Python worker does not exist yet.
+// Once it does, it qualifies. On the launch-and-enrol path (the GPU probe
+// starts the workload and enrols it during cuInit) the first look is therefore
+// always the worst possible moment, and the leader -- which would have
+// answered -- is excluded there because stopping it corrupts our own
+// Cmd.Wait. See ErrTraceeIsOwnChild.
+//
+// So this refusal is RETRYABLE, and saying so is the whole reason it has its
+// own sentinel: a caller that looks again a second later succeeds where the
+// first look could not have.
+var ErrNoThreadHasState = errors.New("pyunwind: no thread we may stop holds a PyThreadState yet")
 
 // isOwnChild reports whether pid's parent is this process.
 //

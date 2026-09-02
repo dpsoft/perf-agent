@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
 
@@ -80,6 +81,37 @@ const MaxSpans = 3
 // serves every process running that binary. Hi is exclusive.
 type Span struct {
 	Lo, Hi uint64
+}
+
+// ErrRetryable marks a refusal that is a statement about WHEN a module was
+// asked, not about the process. A module returns it from Enroll when looking
+// again later could succeed.
+//
+// It exists for one measured case and is worth the mechanism because of how
+// invisible that case is. The GPU probe LAUNCHES its workload and enrols it
+// during CUDA init, which for CPython is the one moment when the application's
+// own Python threads do not exist yet -- and the main thread, which would have
+// answered, cannot be stopped there because it is our own child's leader and
+// stopping it corrupts os/exec's bookkeeping. The first look is therefore
+// guaranteed to fail on exactly the path that most needs it to succeed, and
+// the failure is indistinguishable from "this process runs no Python".
+var ErrRetryable = errors.New("interp: not yet; ask again")
+
+// retrySchedule is when a retryable enrolment is tried again, measured from
+// the first attempt.
+//
+// Front-loaded and then sparse: a Python worker usually exists within a second
+// of startup, and a target that has not produced one after half a minute is
+// one that never will. Bounded on purpose -- an unbounded retry against a
+// process that simply has no Python in it is a ptrace stop every few seconds
+// for the life of the profiler.
+var retrySchedule = []time.Duration{
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
 }
 
 // Range is one unwinder's claim on a binary: while the native walk is inside
@@ -207,6 +239,11 @@ func Registered() int {
 type Set struct {
 	driver  Driver
 	entries []*entry
+	// stop closes when the Set does, so a retry in flight does not outlive
+	// the maps it would write into.
+	stop     chan struct{}
+	stopOnce sync.Once
+	retries  sync.WaitGroup
 	// failed records modules whose BPF object would not load, by name and
 	// reason. Kept rather than only logged at attach: a module that failed to
 	// load produces exactly the same evidence as a process with none of that
@@ -260,7 +297,7 @@ func Attach(d Driver) (*Set, error) {
 		}
 	}
 
-	s := &Set{driver: d}
+	s := &Set{driver: d, stop: make(chan struct{})}
 	var errs []error
 	for _, f := range fs {
 		m := f()
@@ -361,6 +398,11 @@ func (s *Set) Enroll(pid uint32, logf func(format string, args ...any)) bool {
 	for _, e := range s.entries {
 		r, ok, err := e.mod.Enroll(pid)
 		if err != nil {
+			if errors.Is(err, ErrRetryable) {
+				found = true
+				s.scheduleRetry(e, pid, logf)
+				continue
+			}
 			logf("%s frames: pid %d: REFUSED: %v", e.mod.Name(), pid, err)
 			found = true
 			continue
@@ -380,14 +422,51 @@ func (s *Set) Enroll(pid uint32, logf func(format string, args ...any)) bool {
 		// Said out loud, because every other way of learning it needs
 		// capabilities: this is the claim the walker will look up, under the
 		// key it will compute, in the address space it reports rel_pc in.
-		var spans []string
-		for _, sp := range r.Spans {
-			spans = append(spans, fmt.Sprintf("[%#x,%#x)", sp.Lo, sp.Hi))
-		}
-		logf("%s frames: pid %d: handoff installed, table %#x unwinder %d spans %s",
-			e.mod.Name(), pid, r.TableID, e.mod.ID(), strings.Join(spans, " "))
+		s.logInstalled(e, pid, r, logf)
 	}
 	return found
+}
+
+// scheduleRetry asks one module again, later, on retrySchedule.
+//
+// One goroutine per (module, pid), which is bounded by how many processes a
+// profiler enrols and ends at the first success, at the end of the schedule, or
+// when the Set closes -- whichever comes first. It writes only through the same
+// installRange the first attempt would have used.
+func (s *Set) scheduleRetry(e *entry, pid uint32, logf func(string, ...any)) {
+	logf("%s frames: pid %d: no thread holds interpreter state yet (it is still starting up); "+
+		"retrying for %s", e.mod.Name(), pid, retrySchedule[len(retrySchedule)-1])
+	s.retries.Add(1)
+	go func() {
+		defer s.retries.Done()
+		start := time.Now()
+		for _, at := range retrySchedule {
+			select {
+			case <-s.stop:
+				return
+			case <-time.After(time.Until(start.Add(at))):
+			}
+			r, ok, err := e.mod.Enroll(pid)
+			if err != nil {
+				if errors.Is(err, ErrRetryable) {
+					continue
+				}
+				logf("%s frames: pid %d: REFUSED: %v", e.mod.Name(), pid, err)
+				return
+			}
+			if !ok || len(r.Spans) == 0 {
+				return
+			}
+			if err := s.installRange(e.mod.ID(), r); err != nil {
+				logf("%s frames: pid %d: REFUSED: %v", e.mod.Name(), pid, err)
+				return
+			}
+			s.logInstalled(e, pid, r, logf)
+			return
+		}
+		logf("%s frames: pid %d: gave up after %s: no thread ever held interpreter state. "+
+			"Stacks stay native-only", e.mod.Name(), pid, retrySchedule[len(retrySchedule)-1])
+	}()
 }
 
 // installRange publishes one claim under its binary's table_id.
@@ -399,6 +478,13 @@ func (s *Set) Enroll(pid uint32, logf func(format string, args ...any)) bool {
 // one dispatch per sample in a process with no per-PID record, which the
 // module answers by marking itself done for that sample.
 func (s *Set) installRange(id uint32, r Range) error {
+	// Guarded rather than assumed: this runs from a retry goroutine as well as
+	// from Enroll, and a Set built without a driver would otherwise panic
+	// inside that goroutine -- taking the whole profiler down to report a
+	// claim it could not install.
+	if s.driver == nil {
+		return errors.New("no driver to install a claim into")
+	}
 	m := s.driver.HandoffRangesMap()
 	if m == nil {
 		return errors.New("driver exposes no handoff_ranges map")
@@ -435,6 +521,17 @@ func (s *Set) installRange(id uint32, r Range) error {
 		return fmt.Errorf("handoff range for table %#x read back as %+v, wrote %+v", r.TableID, back, v)
 	}
 	return nil
+}
+
+// logInstalled says what the walker will look up, under which key, covering
+// what. Every other way of learning it needs capabilities.
+func (s *Set) logInstalled(e *entry, pid uint32, r Range, logf func(string, ...any)) {
+	spans := make([]string, 0, len(r.Spans))
+	for _, sp := range r.Spans {
+		spans = append(spans, fmt.Sprintf("[%#x,%#x)", sp.Lo, sp.Hi))
+	}
+	logf("%s frames: pid %d: handoff installed, table %#x unwinder %d spans %s",
+		e.mod.Name(), pid, r.TableID, e.mod.ID(), strings.Join(spans, " "))
 }
 
 // Detach drops a process from every attached module.
@@ -474,7 +571,7 @@ func (s *Set) LogCounters(enrolled bool, logf func(format string, args ...any)) 
 	// SIGNAL here. A module reporting all-zero counters has two completely
 	// different causes -- it ran and refused, or it was never reached -- and
 	// only these numbers separate them.
-	if m := s.driver.InterpStatsMap(); m != nil {
+	if m := s.statsMap(); m != nil {
 		st, err := readDispatchStats(m)
 		if err != nil {
 			logf("interpreter handoff: counters unreadable: %v", err)
@@ -552,15 +649,35 @@ func readDispatchStats(m *ebpf.Map) (DispatchStats, error) {
 	return out, nil
 }
 
+// statsMap is the driver's interp_stats, or nil when there is no driver --
+// which only a test builds, but a nil dereference in the shutdown path would
+// turn a missing counter into a crash.
+func (s *Set) statsMap() *ebpf.Map {
+	if s.driver == nil {
+		return nil
+	}
+	return s.driver.InterpStatsMap()
+}
+
 // Close releases every attached module.
 func (s *Set) Close() error {
 	if s == nil {
 		return nil
 	}
+	// Stop retries and WAIT for them: they write into the driver's maps, which
+	// the caller closes immediately after this returns.
+	s.stopOnce.Do(func() { close(s.stop) })
+	s.retries.Wait()
 	var errs []error
 	for _, e := range s.entries {
 		errs = append(errs, e.mod.Close())
-		e.coll.Close()
+		// Guarded: Close is a teardown path and must not panic. An entry with
+		// no collection cannot occur in production -- Attach drops a module
+		// whose object would not load -- but a crash while shutting down would
+		// lose the counters that say why a run produced nothing.
+		if e.coll != nil {
+			e.coll.Close()
+		}
 	}
 	s.entries = nil
 	return errors.Join(errs...)

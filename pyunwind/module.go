@@ -1,6 +1,7 @@
 package pyunwind
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -108,6 +109,13 @@ func (m *module) Enroll(pid uint32) (interp.Range, bool, error) {
 	case err != nil:
 		return interp.Range{}, true, fmt.Errorf("%s: %w", libPath, err)
 	case res.Refused != "":
+		if errors.Is(res.Reason, ErrNoThreadHasState) {
+			// Not a verdict on the process, a verdict on the moment: no
+			// thread we may stop holds a PyThreadState YET. The caller
+			// retries; see ErrNoThreadHasState for the measurement behind
+			// this being worth retrying at all.
+			return interp.Range{}, true, fmt.Errorf("%w: %s", interp.ErrRetryable, res.Refused)
+		}
 		log.Printf("python frames: pid %d: REFUSED %s (CPython %s): %s",
 			pid, libPath, res.Version, res.Refused)
 		return interp.Range{}, true, nil

@@ -830,10 +830,9 @@ static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
 
     if (lead && frame_push_native(ctx, ctx->pc)) goto stop;
 
-    // Per-frame classification. Miss = treat as FP_SAFE (spec: FALLBACK
-    // behaves the same as FP_SAFE at runtime).
+    // Per-frame mapping lookup: which binary this PC is in, and where in it.
     struct mapping_lookup_result m = mapping_for_pc(ctx->pid, ctx->pc);
-    __u8 mode = MODE_FP_SAFE;
+    __u8 have_tables = 0;
     if (m.found) {
         // ----- The handoff.
         //
@@ -854,29 +853,67 @@ static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
             }
         }
 
-        // Lazy mode (Option A2): pid_mappings is populated but
-        // cfi_classification may not be. Detect by probing
-        // cfi_classification_lengths[table_id]. If missing, the binary
-        // was enrolled but not yet compiled — emit a miss event so the
-        // userspace drainer compiles on demand. Fall through to FP path
-        // for this sample; the next sample after compile completes will
-        // classify and unwind normally.
-        __u32 *cls_len = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id);
-        if (!cls_len) {
+        // Lazy mode (Option A2): pid_mappings is populated but the CFI may
+        // not be compiled yet. Detect by probing cfi_classification_lengths;
+        // if missing, the binary was enrolled but not yet compiled -- emit a
+        // miss event so the userspace drainer compiles on demand. This frame
+        // takes the frame-pointer path; the next sample after the compile
+        // completes unwinds properly.
+        //
+        // A single hash lookup, NOT a binary search: what used to sit here was
+        // classify_rel_pc, a second 24-iteration search over the
+        // classification table for every frame. Its answer chose between the
+        // DWARF path and the frame-pointer path, and that choice is now made
+        // by whether a CFI ROW EXISTS -- which the DWARF path has to look up
+        // anyway. Removing it paid for using the tables on every frame: two
+        // searches per frame cost 580,876 processed instructions, one costs
+        // less than the single search did before.
+        have_tables = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id) != NULL;
+        if (!have_tables) {
             emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
-            // mode stays MODE_FP_SAFE (default); continue via FP path.
-        } else {
-            mode = classify_rel_pc(m.table_id, m.rel_pc);
         }
     }
 
-    if (mode == MODE_FP_LESS) {
-        struct cfi_entry *ep = cfi_lookup(m.table_id, m.rel_pc);
-        if (!ep) {
-            ctx->rec->hdr.walker_flags |= WALKER_FLAG_CFI_MISS;
-            emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
-            goto stop;
-        }
+    // ----- The unwind tables are used WHENEVER THEY EXIST, not only for
+    // frames whose CFA is SP-based.
+    //
+    // This used to read `if (mode == MODE_FP_LESS)`, so a frame classified
+    // FP_SAFE was walked by following the frame-pointer chain even though a
+    // CFI row for it was sitting in the map. That is correct only while the
+    // WHOLE chain has frame pointers, and it is not a shortcut that fails
+    // safely: the FP step reads the saved-FP slot and refuses a value that
+    // does not look like a frame pointer (WALKER_FLAG_FP_NONMONOTONIC), so
+    // the walk STOPS at the first frame whose caller was compiled without
+    // one -- which is all of Rust, all of CUDA, and most optimised C++.
+    //
+    // MEASURED, replaying this walker in userspace against a live
+    // rust_cuda_rt at a kernel launch (unwind/ehcompile's walk replica):
+    //
+    //   frame 13  __device_stub__Z8rs_scalePffi   FP_SAFE
+    //     the CFI says      cfa = fp+16, ra = 0x56021ae2b621   <- correct
+    //     the FP step reads saved_fp = [fp] = 0x2c1332         <- not a pointer
+    //     -> FP NON-MONOTONIC, walk abandoned at 14 frames
+    //
+    // The return address was in the SAME SLOT both ways; only the saved-FP
+    // sanity check differed, and it rejected a frame the tables could
+    // describe perfectly. Preferring the tables takes that walk from 14
+    // frames to 22 and ends it at _start with RA_UNDEFINED -- a walk that
+    // reaches the root instead of one that is abandoned.
+    //
+    // The frame-pointer path is what it always should have been: the fallback
+    // for a frame with NO row, which is the FALLBACK classification (a CFI
+    // expression this compiler declines) and the gaps between FDEs.
+    struct cfi_entry *ep = m.found ? cfi_lookup(m.table_id, m.rel_pc) : NULL;
+    if (!ep && have_tables) {
+        // The binary's tables are compiled and no row covers this PC: a
+        // genuine gap in the unwind information, not a binary we have yet to
+        // compile. Flagged, but the walk CONTINUES down the frame-pointer
+        // path -- a gap is exactly the case that path exists for, and
+        // stopping here would lose every frame beneath a single uncovered
+        // one.
+        ctx->rec->hdr.walker_flags |= WALKER_FLAG_CFI_MISS;
+    }
+    if (ep) {
         // Copy out of the inner map immediately — the pointer's lifetime
         // is bounded by the next BPF helper call. Defensive-copying keeps
         // reasoning simple and avoids any verifier fuss.

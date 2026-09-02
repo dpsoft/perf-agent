@@ -6,7 +6,7 @@
 // userspace to load these new programs instead.
 //
 // Scope: the sample-record shape, per-CPU walker scratch, ringbuf for
-// emitted samples, PID filter, CFI tables, and per-instruction classification
+// emitted samples, PID filter, CFI tables, and the
 // + pid_mappings HASH_OF_MAPS tables that the hybrid walker consults
 // per frame. The walker itself — walk_step, the bpf_loop callback — lives
 // HERE, in this header; the drivers only fill a walk_ctx and call bpf_loop.
@@ -86,12 +86,6 @@ struct cfi_entry {
     __u8  _pad[5];
 };
 
-struct classification {
-    __u64 pc_start;
-    __u32 pc_end_delta;
-    __u8  mode;
-    __u8  _pad[3];
-};
 
 struct pid_mapping {
     __u64 vma_start;
@@ -260,8 +254,6 @@ static __always_inline void emit_cfi_miss(__u32 pid, __u64 table_id, __u64 rel_p
 // cfi_lengths holds the valid length of each inner array (BPF can't read
 // inner max_entries at runtime).
 //
-// cfi_classification mirrors the structure for classification rows.
-//
 // pid_mappings: outer key is pid, inner is a fixed-size ARRAY of pid_mapping
 // entries (most processes need < 256 mappings). pid_mapping_lengths holds
 // the valid length per pid.
@@ -276,7 +268,6 @@ static __always_inline void emit_cfi_miss(__u32 pid, __u64 table_id, __u64 rel_p
 // global so clang emits BTF_KIND_STRUCT with complete field info.
 #define BTF_MATERIALIZE(T) struct T _btf_anchor_##T __attribute__((unused));
 BTF_MATERIALIZE(cfi_entry)
-BTF_MATERIALIZE(classification)
 BTF_MATERIALIZE(pid_mapping)
 
 // Named inner-map types for HASH_OF_MAPS.
@@ -288,13 +279,6 @@ struct cfi_inner {
     __type(value, struct cfi_entry);
 };
 
-struct classification_inner {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1); // template only; actual inner maps are sized per binary at populate time
-    __uint(map_flags, BPF_F_INNER_MAP);
-    __type(key, __u32);
-    __type(value, struct classification);
-};
 
 struct pid_mapping_inner {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -319,20 +303,6 @@ struct {
     __type(key, __u64);
     __type(value, __u32);
 } cfi_lengths SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 1024);
-    __type(key, __u64);
-    __array(values, struct classification_inner);
-} cfi_classification SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u64);
-    __type(value, __u32);
-} cfi_classification_lengths SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
@@ -404,7 +374,7 @@ static __always_inline struct mapping_lookup_result mapping_for_pc(__u32 pid, __
 }
 
 // BINARY_SEARCH_MAX_ITERS bounds the binary search over the CFI and
-// classification tables. A search over n sorted rows needs ceil(log2(n))
+// tables. A search over n sorted rows needs ceil(log2(n))
 // halvings, so this bound is a CEILING ON HOW BIG A BINARY CAN BE UNWOUND --
 // and when a binary exceeds it the failure is silent and total.
 //
@@ -421,7 +391,7 @@ static __always_inline struct mapping_lookup_result mapping_for_pc(__u32 pid, __
 // With 20 iterations a 2.36M-row table narrows to a range of two or three and
 // then the loop ends, so the lookup fails for almost every PC. BOTH failure
 // paths then lie: cfi_lookup returns NULL, which walk_step reads as a CFI miss
-// and STOPS the walk; classify_rel_pc returns MODE_FP_SAFE, which sends a
+// and STOPS the walk; the classification search returned MODE_FP_SAFE, sending a
 // frame-pointer-less frame down the frame-pointer path. Measured on a real
 // GPU + PyTorch capture: 4,299 launch stacks, every one abandoned, none
 // reaching root, all of them stopping inside libtorch's dispatcher
@@ -438,32 +408,6 @@ static __always_inline struct mapping_lookup_result mapping_for_pc(__u32 pid, __
 // silently installing one is indistinguishable from having none, except that
 // it also stops the walk. See ehmaps.MaxSearchableRows.
 #define BINARY_SEARCH_MAX_ITERS 24
-
-// classify_rel_pc returns MODE_FP_SAFE / MODE_FP_LESS / MODE_FALLBACK for the
-// given (table_id, rel_pc). If the table is absent or no row covers rel_pc,
-// returns MODE_FP_SAFE — the walker treats FP-safe and "unknown" identically
-// (spec: "FALLBACK behaves exactly like FP_SAFE").
-static __always_inline __u8 classify_rel_pc(__u64 table_id, __u64 rel_pc) {
-    void *inner = bpf_map_lookup_elem(&cfi_classification, &table_id);
-    if (!inner) return MODE_FP_SAFE;
-    __u32 *lenp = bpf_map_lookup_elem(&cfi_classification_lengths, &table_id);
-    if (!lenp || *lenp == 0) return MODE_FP_SAFE;
-    __u32 lo = 0, hi = *lenp;
-    for (int i = 0; i < BINARY_SEARCH_MAX_ITERS; i++) {
-        if (lo >= hi) break;
-        __u32 mid = lo + (hi - lo) / 2;
-        struct classification *c = bpf_map_lookup_elem(inner, &mid);
-        if (!c) break;
-        if (rel_pc < c->pc_start) {
-            hi = mid;
-        } else if (rel_pc >= c->pc_start + (__u64)c->pc_end_delta) {
-            lo = mid + 1;
-        } else {
-            return c->mode;
-        }
-    }
-    return MODE_FP_SAFE;
-}
 
 // cfi_lookup returns a pointer to the cfi_entry whose PC range contains
 // rel_pc, or NULL if not found. Pointer is into the inner map — safe to
@@ -854,21 +798,22 @@ static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
         }
 
         // Lazy mode (Option A2): pid_mappings is populated but the CFI may
-        // not be compiled yet. Detect by probing cfi_classification_lengths;
+        // not be compiled yet. Detect by probing cfi_lengths;
         // if missing, the binary was enrolled but not yet compiled -- emit a
         // miss event so the userspace drainer compiles on demand. This frame
         // takes the frame-pointer path; the next sample after the compile
         // completes unwinds properly.
         //
         // A single hash lookup, NOT a binary search: what used to sit here was
-        // classify_rel_pc, a second 24-iteration search over the
-        // classification table for every frame. Its answer chose between the
-        // DWARF path and the frame-pointer path, and that choice is now made
-        // by whether a CFI ROW EXISTS -- which the DWARF path has to look up
-        // anyway. Removing it paid for using the tables on every frame: two
-        // searches per frame cost 580,876 processed instructions, one costs
-        // less than the single search did before.
-        have_tables = bpf_map_lookup_elem(&cfi_classification_lengths, &m.table_id) != NULL;
+        // classify_rel_pc, a second 24-iteration search over a whole second
+        // table for every frame. Its answer chose between the DWARF path and
+        // the frame-pointer path, and that choice is now made by whether a CFI
+        // ROW EXISTS -- which the DWARF path has to look up anyway. Removing
+        // it paid for using the tables on every frame: two searches per frame
+        // cost 580,876 processed instructions, one costs less than the single
+        // search did before. The classification tables are gone entirely; this
+        // probe asks cfi_lengths, which is written by the same populate call.
+        have_tables = bpf_map_lookup_elem(&cfi_lengths, &m.table_id) != NULL;
         if (!have_tables) {
             emit_cfi_miss(ctx->pid, m.table_id, m.rel_pc);
         }

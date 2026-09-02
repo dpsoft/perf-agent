@@ -89,7 +89,6 @@ type ehmapsRegistrar struct {
 func newEhmapsRegistrar(objs *gpuusdtObjects) *ehmapsRegistrar {
 	store := ehmaps.NewTableStore(
 		objs.CfiRules, objs.CfiLengths,
-		objs.CfiClassification, objs.CfiClassificationLengths,
 	)
 	set, err := interp.Attach(&gpuDriver{objs: objs})
 	if err != nil {

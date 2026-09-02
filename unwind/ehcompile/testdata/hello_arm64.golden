@@ -60,37 +60,5 @@
       "RAOffset": 0,
       "RAType": 0
     }
-  ],
-  "classifications": [
-    {
-      "PCStart": 28,
-      "PCEndDelta": 8,
-      "Mode": 1
-    },
-    {
-      "PCStart": 36,
-      "PCEndDelta": 20,
-      "Mode": 1
-    },
-    {
-      "PCStart": 52,
-      "PCEndDelta": 8,
-      "Mode": 1
-    },
-    {
-      "PCStart": 56,
-      "PCEndDelta": 4,
-      "Mode": 1
-    },
-    {
-      "PCStart": 60,
-      "PCEndDelta": 24,
-      "Mode": 1
-    },
-    {
-      "PCStart": 84,
-      "PCEndDelta": 8,
-      "Mode": 1
-    }
   ]
 }

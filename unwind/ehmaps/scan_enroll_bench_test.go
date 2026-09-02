@@ -13,7 +13,7 @@ import (
 // caps build-id reads at K regardless of N.
 func BenchmarkScanAndEnroll_BuildIDCacheHit(b *testing.B) {
 	procRoot := buildSyntheticProcTree(b, 100, 5)
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
 	var lastTables int

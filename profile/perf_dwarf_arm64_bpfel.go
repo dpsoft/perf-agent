@@ -33,14 +33,6 @@ type perf_dwarfCfiMissRatelimitKey struct {
 	TableId uint64
 }
 
-type perf_dwarfClassification struct {
-	_          structs.HostLayout
-	PcStart    uint64
-	PcEndDelta uint32
-	Mode       uint8
-	Pad        [3]uint8
-}
-
 type perf_dwarfHandoffRange struct {
 	_     structs.HostLayout
 	Spans [3]struct {
@@ -155,34 +147,31 @@ type perf_dwarfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type perf_dwarfMapSpecs struct {
-	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
-	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
-	InterpStats              *ebpf.MapSpec `ebpf:"interp_stats"`
-	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
-	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
-	Pids                     *ebpf.MapSpec `ebpf:"pids"`
-	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
-	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.MapSpec `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.MapSpec `ebpf:"cfi_rules"`
+	HandoffRanges     *ebpf.MapSpec `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats       *ebpf.MapSpec `ebpf:"interp_stats"`
+	KernStackmap      *ebpf.MapSpec `ebpf:"kern_stackmap"`
+	PidMappingLengths *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.MapSpec `ebpf:"pid_mappings"`
+	Pids              *ebpf.MapSpec `ebpf:"pids"`
+	StackEvents       *ebpf.MapSpec `ebpf:"stack_events"`
+	WalkStates        *ebpf.MapSpec `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
 // perf_dwarfVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type perf_dwarfVariableSpecs struct {
-	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
-	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
-	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
-	KernelStacksEnabled     *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
-	SystemWide              *ebpf.VariableSpec `ebpf:"system_wide"`
+	BtfAnchorCfiEntry   *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorPidMapping *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled       *ebpf.VariableSpec `ebpf:"interp_enabled"`
+	KernelStacksEnabled *ebpf.VariableSpec `ebpf:"kernel_stacks_enabled"`
+	SystemWide          *ebpf.VariableSpec `ebpf:"system_wide"`
 }
 
 // perf_dwarfObjects contains all objects after they have been loaded into the kernel.
@@ -205,28 +194,24 @@ func (o *perf_dwarfObjects) Close() error {
 //
 // It can be passed to loadPerf_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type perf_dwarfMaps struct {
-	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
-	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
-	InterpStats              *ebpf.Map `ebpf:"interp_stats"`
-	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
-	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
-	Pids                     *ebpf.Map `ebpf:"pids"`
-	StackEvents              *ebpf.Map `ebpf:"stack_events"`
-	WalkStates               *ebpf.Map `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.Map `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.Map `ebpf:"cfi_rules"`
+	HandoffRanges     *ebpf.Map `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats       *ebpf.Map `ebpf:"interp_stats"`
+	KernStackmap      *ebpf.Map `ebpf:"kern_stackmap"`
+	PidMappingLengths *ebpf.Map `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.Map `ebpf:"pid_mappings"`
+	Pids              *ebpf.Map `ebpf:"pids"`
+	StackEvents       *ebpf.Map `ebpf:"stack_events"`
+	WalkStates        *ebpf.Map `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.Map `ebpf:"walker_scratch"`
 }
 
 func (m *perf_dwarfMaps) Close() error {
 	return _Perf_dwarfClose(
-		m.CfiClassification,
-		m.CfiClassificationLengths,
 		m.CfiLengths,
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
@@ -248,12 +233,11 @@ func (m *perf_dwarfMaps) Close() error {
 //
 // It can be passed to loadPerf_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type perf_dwarfVariables struct {
-	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
-	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
-	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
-	KernelStacksEnabled     *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
-	SystemWide              *ebpf.Variable `ebpf:"system_wide"`
+	BtfAnchorCfiEntry   *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorPidMapping *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled       *ebpf.Variable `ebpf:"interp_enabled"`
+	KernelStacksEnabled *ebpf.Variable `ebpf:"kernel_stacks_enabled"`
+	SystemWide          *ebpf.Variable `ebpf:"system_wide"`
 }
 
 // perf_dwarfPrograms contains all programs after they have been loaded into the kernel.

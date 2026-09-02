@@ -33,14 +33,6 @@ type offcpu_dwarfCfiMissRatelimitKey struct {
 	TableId uint64
 }
 
-type offcpu_dwarfClassification struct {
-	_          structs.HostLayout
-	PcStart    uint64
-	PcEndDelta uint32
-	Mode       uint8
-	Pad        [3]uint8
-}
-
 type offcpu_dwarfHandoffRange struct {
 	_     structs.HostLayout
 	Spans [3]struct {
@@ -161,23 +153,21 @@ type offcpu_dwarfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type offcpu_dwarfMapSpecs struct {
-	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
-	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
-	InterpStats              *ebpf.MapSpec `ebpf:"interp_stats"`
-	KernStackmap             *ebpf.MapSpec `ebpf:"kern_stackmap"`
-	OffcpuStart              *ebpf.MapSpec `ebpf:"offcpu_start"`
-	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
-	Pids                     *ebpf.MapSpec `ebpf:"pids"`
-	StackEvents              *ebpf.MapSpec `ebpf:"stack_events"`
-	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.MapSpec `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.MapSpec `ebpf:"cfi_rules"`
+	HandoffRanges     *ebpf.MapSpec `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats       *ebpf.MapSpec `ebpf:"interp_stats"`
+	KernStackmap      *ebpf.MapSpec `ebpf:"kern_stackmap"`
+	OffcpuStart       *ebpf.MapSpec `ebpf:"offcpu_start"`
+	PidMappingLengths *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.MapSpec `ebpf:"pid_mappings"`
+	Pids              *ebpf.MapSpec `ebpf:"pids"`
+	StackEvents       *ebpf.MapSpec `ebpf:"stack_events"`
+	WalkStates        *ebpf.MapSpec `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
 // offcpu_dwarfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -185,7 +175,6 @@ type offcpu_dwarfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type offcpu_dwarfVariableSpecs struct {
 	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.VariableSpec `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
@@ -213,29 +202,25 @@ func (o *offcpu_dwarfObjects) Close() error {
 //
 // It can be passed to loadOffcpu_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type offcpu_dwarfMaps struct {
-	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
-	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
-	InterpStats              *ebpf.Map `ebpf:"interp_stats"`
-	KernStackmap             *ebpf.Map `ebpf:"kern_stackmap"`
-	OffcpuStart              *ebpf.Map `ebpf:"offcpu_start"`
-	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
-	Pids                     *ebpf.Map `ebpf:"pids"`
-	StackEvents              *ebpf.Map `ebpf:"stack_events"`
-	WalkStates               *ebpf.Map `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.Map `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.Map `ebpf:"cfi_rules"`
+	HandoffRanges     *ebpf.Map `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats       *ebpf.Map `ebpf:"interp_stats"`
+	KernStackmap      *ebpf.Map `ebpf:"kern_stackmap"`
+	OffcpuStart       *ebpf.Map `ebpf:"offcpu_start"`
+	PidMappingLengths *ebpf.Map `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.Map `ebpf:"pid_mappings"`
+	Pids              *ebpf.Map `ebpf:"pids"`
+	StackEvents       *ebpf.Map `ebpf:"stack_events"`
+	WalkStates        *ebpf.Map `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.Map `ebpf:"walker_scratch"`
 }
 
 func (m *offcpu_dwarfMaps) Close() error {
 	return _Offcpu_dwarfClose(
-		m.CfiClassification,
-		m.CfiClassificationLengths,
 		m.CfiLengths,
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
@@ -259,7 +244,6 @@ func (m *offcpu_dwarfMaps) Close() error {
 // It can be passed to loadOffcpu_dwarfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type offcpu_dwarfVariables struct {
 	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
 	BtfAnchorOffcpuStartKey *ebpf.Variable `ebpf:"_btf_anchor_offcpu_start_key"`
 	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
 	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`

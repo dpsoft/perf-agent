@@ -1,4 +1,4 @@
-// Package ehmaps populates the BPF-side CFI / classification / pid-mappings
+// Package ehmaps populates the BPF-side CFI and pid-mappings
 // maps from unwind/ehcompile output. Handles population plus lifecycle
 // management via the refcounting layer in this package.
 //
@@ -18,7 +18,7 @@ import (
 )
 
 // TableIDForBuildID hashes a build-id (raw bytes, typically 20) to the u64
-// key used across cfi_rules, cfi_classification, and pid_mapping.table_id.
+// key used across cfi_rules and pid_mapping.table_id.
 // Empty input returns the FNV-1a offset basis, which is fine — the caller
 // should validate that a missing build-id doesn't collide with a real one.
 func TableIDForBuildID(buildID []byte) uint64 {
@@ -38,10 +38,6 @@ func TableIDForBuildID(buildID []byte) uint64 {
 // after u64 alignment padding; the active data fills offsets 0..25 and the
 // remaining 6 bytes are tail padding the BPF struct expects).
 const CFIEntryByteSize = 32
-
-// ClassificationByteSize matches bpf/unwind_common.h `struct classification`
-// (16 bytes).
-const ClassificationByteSize = 16
 
 // PIDMappingByteSize matches bpf/unwind_common.h `struct pid_mapping`
 // (32 bytes).
@@ -68,15 +64,6 @@ func MarshalCFIEntry(e ehcompile.CFIEntry) []byte {
 	binary.LittleEndian.PutUint16(out[16:18], uint16(e.FPOffset))
 	binary.LittleEndian.PutUint16(out[18:20], uint16(e.RAOffset))
 	out[20] = uint8(e.RAType)
-	return out
-}
-
-// MarshalClassification writes one ehcompile.Classification in BPF layout.
-func MarshalClassification(c ehcompile.Classification) []byte {
-	out := make([]byte, ClassificationByteSize)
-	binary.LittleEndian.PutUint64(out[0:8], c.PCStart)
-	binary.LittleEndian.PutUint32(out[8:12], c.PCEndDelta)
-	out[12] = uint8(c.Mode)
 	return out
 }
 
@@ -191,54 +178,6 @@ func PopulateCFI(args PopulateCFIArgs) error {
 	length := uint32(len(args.Entries))
 	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("ehmaps: write cfi length: %w", err)
-	}
-	return nil
-}
-
-// PopulateClassificationArgs mirrors PopulateCFIArgs but for classification.
-type PopulateClassificationArgs struct {
-	TableID   uint64
-	Entries   []ehcompile.Classification
-	OuterMap  *ebpf.Map // cfi_classification
-	LengthMap *ebpf.Map // cfi_classification_lengths
-}
-
-func PopulateClassification(args PopulateClassificationArgs) error {
-	if len(args.Entries) == 0 {
-		return fmt.Errorf("ehmaps: PopulateClassification: no entries")
-	}
-	if len(args.Entries) > MaxSearchableRows {
-		return fmt.Errorf("%w: %d classification rows for table %#x needs %d search iterations, the walker has %d",
-			ErrTableTooLarge, len(args.Entries), args.TableID,
-			bitsNeeded(len(args.Entries)), binarySearchMaxIters)
-	}
-	spec := &ebpf.MapSpec{
-		Type:       ebpf.Array,
-		KeySize:    4,
-		ValueSize:  ClassificationByteSize,
-		MaxEntries: uint32(len(args.Entries)),
-		Flags:      BPF_F_INNER_MAP,
-	}
-	inner, err := ebpf.NewMap(spec)
-	if err != nil {
-		return fmt.Errorf("ehmaps: create inner classification map: %w", err)
-	}
-	for i, c := range args.Entries {
-		key := uint32(i)
-		if err := inner.Update(key, MarshalClassification(c), ebpf.UpdateAny); err != nil {
-			_ = inner.Close()
-			return fmt.Errorf("ehmaps: write classification[%d]: %w", i, err)
-		}
-	}
-	if err := args.OuterMap.Update(args.TableID, uint32(inner.FD()), ebpf.UpdateAny); err != nil {
-		_ = inner.Close()
-		return fmt.Errorf("ehmaps: install inner classification map: %w", err)
-	}
-	_ = inner.Close()
-
-	length := uint32(len(args.Entries))
-	if err := args.LengthMap.Update(args.TableID, length, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("ehmaps: write classification length: %w", err)
 	}
 	return nil
 }

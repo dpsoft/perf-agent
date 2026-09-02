@@ -933,8 +933,19 @@ func TestEmbeddedProgramCarriesTheStackMap(t *testing.T) {
 	// The walker's own tables must have come along with the header, or the
 	// walk degrades to the frame-pointer path this phase exists to replace.
 	for _, name := range []string{"walker_scratch", "gpu_stack_scratch", "stack_id_seq",
-		"pids", "pid_mappings", "cfi_rules", "cfi_classification", "cfi_miss_events"} {
+		"pids", "pid_mappings", "cfi_rules", "cfi_lengths", "cfi_miss_events"} {
 		assert.Contains(t, spec.Maps, name)
+	}
+
+	// And the classification tables must NOT be here. They were a second
+	// sorted table, searched per frame, whose only job was choosing between
+	// the DWARF path and the frame-pointer path -- a choice now made by
+	// whether a CFI row exists. They were populated on every enrol and never
+	// read: 38 MB for libtorch_cpu alone. Asserted rather than assumed,
+	// because "compiled, uploaded, never read" is invisible from the outside.
+	for _, name := range []string{"cfi_classification", "cfi_classification_lengths"} {
+		assert.NotContains(t, spec.Maps, name,
+			"%s is back: a second per-frame search that nothing reads", name)
 	}
 
 	// Issue #83 / T12-R6: the interpreter HANDOFF rides into this program on

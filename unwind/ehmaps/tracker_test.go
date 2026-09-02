@@ -23,10 +23,10 @@ func TestTrackerAttachSelf(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("rlimit: %v", err)
 	}
-	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
-	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+	cfi, cfiLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, pidMaps, pidMapLen)
 
-	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	store := NewTableStore(cfi, cfiLen)
 	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
 
 	self, err := os.Executable()
@@ -54,7 +54,7 @@ func TestTrackerAttachSelf(t *testing.T) {
 }
 
 // newTestMaps creates BPF maps shaped like bpf2go's output.
-func newTestMaps(t *testing.T) (cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen *ebpf.Map) {
+func newTestMaps(t *testing.T) (cfi, cfiLen, pidMaps, pidMapLen *ebpf.Map) {
 	t.Helper()
 	const innerFlag = 0x1000 // BPF_F_INNER_MAP
 	mk := func(spec *ebpf.MapSpec) *ebpf.Map {
@@ -69,11 +69,6 @@ func newTestMaps(t *testing.T) (cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen *eb
 		InnerMap: &ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: CFIEntryByteSize, MaxEntries: 1, Flags: innerFlag},
 	})
 	cfiLen = mk(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 8, ValueSize: 4, MaxEntries: 4})
-	cls = mk(&ebpf.MapSpec{
-		Type: ebpf.HashOfMaps, KeySize: 8, ValueSize: 4, MaxEntries: 4,
-		InnerMap: &ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: ClassificationByteSize, MaxEntries: 1, Flags: innerFlag},
-	})
-	clsLen = mk(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 8, ValueSize: 4, MaxEntries: 4})
 	pidMaps = mk(&ebpf.MapSpec{
 		Type: ebpf.HashOfMaps, KeySize: 4, ValueSize: 4, MaxEntries: 4,
 		InnerMap: &ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: PIDMappingByteSize, MaxEntries: MaxPIDMappings, Flags: innerFlag},
@@ -101,10 +96,10 @@ func TestTrackerAutoAttachOnMmap(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("rlimit: %v", err)
 	}
-	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
-	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+	cfi, cfiLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, pidMaps, pidMapLen)
 
-	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	store := NewTableStore(cfi, cfiLen)
 	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
 
 	// The inner `exec` runs inside the already-tracked PID after a
@@ -154,10 +149,10 @@ func TestAttachAllMappings(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("rlimit: %v", err)
 	}
-	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
-	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+	cfi, cfiLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, pidMaps, pidMapLen)
 
-	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	store := NewTableStore(cfi, cfiLen)
 	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
 
 	n, err := AttachAllMappings(tracker, uint32(os.Getpid()))
@@ -189,10 +184,10 @@ func TestAttachAllProcesses(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("rlimit: %v", err)
 	}
-	cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen := newTestMaps(t)
-	defer closeAll(cfi, cfiLen, cls, clsLen, pidMaps, pidMapLen)
+	cfi, cfiLen, pidMaps, pidMapLen := newTestMaps(t)
+	defer closeAll(cfi, cfiLen, pidMaps, pidMapLen)
 
-	store := NewTableStore(cfi, cfiLen, cls, clsLen)
+	store := NewTableStore(cfi, cfiLen)
 	tracker := NewPIDTracker(store, pidMaps, pidMapLen)
 
 	nPIDs, nTables, err := AttachAllProcesses(tracker)
@@ -258,7 +253,7 @@ func TestEnrollWithoutCompile_PopulatesPIDMappingsOnly(t *testing.T) {
 	// because t.pidMappings is nil. The IMPORTANT assertions are:
 	//   1. ReadBuildID was called (cache populated)
 	//   2. No refcount taken (compile never happened)
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
 	cache := map[string][]byte{}
@@ -290,7 +285,7 @@ func TestEnrollWithoutCompile_BuildIDCacheHit(t *testing.T) {
 		t.Skipf("test fixture missing: %v", err)
 	}
 
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
 	// Pre-seed cache with a deliberate non-real value.
@@ -323,7 +318,7 @@ func TestAttachCompileOnly_AcquireRefcountWithoutPIDMappings(t *testing.T) {
 		t.Skipf("test fixture missing: %v", err)
 	}
 
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
 	err := tracker.AttachCompileOnly(uint32(os.Getpid()), binPath, "")

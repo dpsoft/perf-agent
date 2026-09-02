@@ -14,10 +14,11 @@ import (
 // of unwind/ehcompile/testdata/hello so ReadBuildID succeeds.
 //
 // Layout:
-//   <root>/
-//     bins/bin0, bin1, ..., bin{K-1}    (real ELFs)
-//     proc/
-//       1/maps, 2/maps, ..., N/maps          (textual /proc/<pid>/maps)
+//
+//	<root>/
+//	  bins/bin0, bin1, ..., bin{K-1}    (real ELFs)
+//	  proc/
+//	    1/maps, 2/maps, ..., N/maps          (textual /proc/<pid>/maps)
 //
 // Each PID's maps file references all K binaries (so build-id cache hit
 // rate is K reads regardless of N).
@@ -71,7 +72,7 @@ func buildSyntheticProcTree(t testing.TB, numPIDs, numDistinctBinaries int) (pro
 
 func TestScanAndEnrollFromTree_BuildIDCachePopulated(t *testing.T) {
 	procRoot := buildSyntheticProcTree(t, 5, 3)
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 
 	pids, tables, err := ScanAndEnrollFromTree(procRoot, tracker)
@@ -101,7 +102,7 @@ func TestScanAndEnrollFromTree_SkipsKernelThreads(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(procRoot, "0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	store := NewTableStore(nil, nil, nil, nil)
+	store := NewTableStore(nil, nil)
 	tracker := NewPIDTracker(store, nil, nil)
 	pids, _, err := ScanAndEnrollFromTree(procRoot, tracker)
 	_ = err

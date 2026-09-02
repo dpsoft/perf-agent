@@ -825,7 +825,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
 
-	entries, classes, _, err := ehcompile.Compile(built)
+	entries, _, err := ehcompile.Compile(built)
 	require.NoError(t, err)
 
 	ef, err := elf.Open(built)
@@ -845,14 +845,18 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 		t.Fatalf("symbol %s not found in %s", name, built)
 		return 0
 	}
-	modeOf := func(cls []ehcompile.Classification, pc uint64) ehcompile.Mode {
-		for _, c := range cls {
-			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
-				return c.Mode
+	// The CFA's base register, which is what the classification row used to
+	// report: SP-rooted was MODE_FP_LESS, FP-rooted was MODE_FP_SAFE. An
+	// uncovered PC has no row, which is walk_step's cue to frame-pointer walk
+	// -- reported here as CFATypeUndefined so an assertion cannot pass by
+	// accident on a range the compiler declined.
+	cfaBaseOf := func(ents []ehcompile.CFIEntry, pc uint64) ehcompile.CFAType {
+		for _, e := range ents {
+			if pc >= e.PCStart && pc < e.PCStart+uint64(e.PCEndDelta) {
+				return e.CFAType
 			}
 		}
-		// walk_step's own default for an uncovered PC.
-		return ehcompile.ModeFPSafe
+		return ehcompile.CFATypeUndefined
 	}
 	cfiOf := func(ents []ehcompile.CFIEntry, pc uint64) *ehcompile.CFIEntry {
 		for i := range ents {
@@ -873,7 +877,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	// and SAME_VALUE is the one fp_type that leaves ctx->fp alone.
 	for _, fn := range []string{"perfagent_fpless_bridge", "perfagent_fpless_caller"} {
 		pc := pcOf(fn)
-		require.Equal(t, ehcompile.ModeFPLess, modeOf(classes, pc),
+		require.Equal(t, ehcompile.CFATypeSP, cfaBaseOf(entries, pc),
 			"%s is not FP-less, so walk_step would never take the DWARF path here", fn)
 		row := cfiOf(entries, pc)
 		require.NotNil(t, row, "no CFI row covers %s", fn)
@@ -886,7 +890,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 
 	// --- main, reached with a LIVE frame pointer, so the FP path works.
 	mainPC := pcOf("main")
-	require.Equal(t, ehcompile.ModeFPSafe, modeOf(classes, mainPC),
+	require.Equal(t, ehcompile.CFATypeFP, cfaBaseOf(entries, mainPC),
 		"main is not FP_SAFE, so the walk would not take the frame-pointer path out of it")
 	mainCFI := cfiOf(entries, mainPC)
 	require.NotNil(t, mainCFI)
@@ -907,7 +911,7 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	// beside it - which IS _start's PC.
 	// TestWalkStepStepsPastTheFramePointerRoot pins the walker half.
 	startPC := pcOf("_start")
-	require.Equal(t, ehcompile.ModeFPLess, modeOf(classes, startPC),
+	require.Equal(t, ehcompile.CFATypeSP, cfaBaseOf(entries, startPC),
 		"_start is not FP-less, so the walk would take the FP path and never read its ra_type")
 	startCFI := cfiOf(entries, startPC)
 	require.NotNil(t, startCFI, "no CFI row covers _start")
@@ -1105,7 +1109,7 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
 
-	_, classes, ehBytes, err := ehcompile.Compile(built)
+	entries, ehBytes, err := ehcompile.Compile(built)
 	require.NoError(t, err, "the producer's .eh_frame must compile: it is the only way the walker can cross an FP-less frame")
 	require.Positive(t, ehBytes, "no .eh_frame bytes: the DWARF walker would have nothing to read")
 
@@ -1120,7 +1124,12 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	// - the prologue has not run yet - so classifying on the entry PC would
 	// call every function FP-less and the test would pass for the wrong
 	// reason.
-	classify := func(t *testing.T, name string) ehcompile.Mode {
+	// The CFA's base register, which is what the classification row used to
+	// report: SP-rooted was MODE_FP_LESS, FP-rooted was MODE_FP_SAFE, and no
+	// row at all was MODE_FALLBACK. The second table is gone -- the walker
+	// takes the DWARF path whenever a ROW EXISTS -- so the property is read
+	// off the row itself.
+	cfaBase := func(t *testing.T, name string) ehcompile.CFAType {
 		t.Helper()
 		var sym *elf.Symbol
 		for i := range syms {
@@ -1132,20 +1141,20 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 		require.NotNilf(t, sym, "symbol %s not found in %s", name, built)
 		require.Positivef(t, sym.Size, "symbol %s has no size; cannot pick a PC inside it", name)
 		pc := sym.Value + sym.Size/2
-		for _, c := range classes {
-			if pc >= c.PCStart && pc < c.PCStart+uint64(c.PCEndDelta) {
-				return c.Mode
+		for _, e := range entries {
+			if pc >= e.PCStart && pc < e.PCStart+uint64(e.PCEndDelta) {
+				return e.CFAType
 			}
 		}
-		t.Fatalf("no classification row covers %#x, the midpoint of %s: the walker would treat it as FP_SAFE and never take the DWARF path", pc, name)
+		t.Fatalf("no CFI row covers %#x, the midpoint of %s: the walker would fall back to the frame pointer and never take the DWARF path", pc, name)
 		return 0
 	}
 
-	// The two frames between the probe and main. MODE_FP_LESS is exactly
-	// what makes walk_step read cfi_rules and set WALKER_FLAG_DWARF_USED.
+	// The two frames between the probe and main: SP-rooted, i.e. no frame
+	// pointer to walk, so only the unwind tables can cross them.
 	for _, name := range []string{"perfagent_fpless_bridge", "perfagent_fpless_caller"} {
-		assert.Equalf(t, ehcompile.ModeFPLess, classify(t, name),
-			"%s classifies as something other than FP_LESS, so walk_step would take the frame-pointer path through it and the gate's StacksWalkedDWARF assertion could not be satisfied by this producer", name)
+		assert.Equalf(t, ehcompile.CFATypeSP, cfaBase(t, name),
+			"%s has an FP-rooted CFA, so it is not frame-pointer-less and the gate's StacksWalkedDWARF assertion could not be satisfied by this producer", name)
 	}
 
 	// The other half of the hybrid, and not a formality: the walk's FIRST
@@ -1154,8 +1163,8 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	// would still work but would no longer exercise the FP -> DWARF -> FP
 	// handoff this producer exists to reproduce.
 	for _, name := range []string{"perfagent_stub_run", "main"} {
-		assert.Equalf(t, ehcompile.ModeFPSafe, classify(t, name),
-			"%s is not FP_SAFE, so the walk would not cross an FP/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
+		assert.Equalf(t, ehcompile.CFATypeFP, cfaBase(t, name),
+			"%s has an SP-rooted CFA, so the walk would not cross a frame-pointer/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
 	}
 }
 

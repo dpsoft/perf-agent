@@ -182,16 +182,6 @@ func (p *PerfDwarf) CFILengthsMap() *ebpf.Map {
 	return p.objs.CfiLengths
 }
 
-// CFIClassificationMap returns the cfi_classification HASH_OF_MAPS outer map.
-func (p *PerfDwarf) CFIClassificationMap() *ebpf.Map {
-	return p.objs.CfiClassification
-}
-
-// CFIClassificationLengthsMap returns the cfi_classification_lengths HASH.
-func (p *PerfDwarf) CFIClassificationLengthsMap() *ebpf.Map {
-	return p.objs.CfiClassificationLengths
-}
-
 // PIDMappingsMap returns the pid_mappings HASH_OF_MAPS outer map.
 func (p *PerfDwarf) PIDMappingsMap() *ebpf.Map {
 	return p.objs.PidMappings

@@ -6,9 +6,6 @@
 //   - entries []CFIEntry: "for PC in [PCStart, PCStart+PCEndDelta),
 //     CFA = <CFAType> + CFAOffset; FP saved per FPType/FPOffset;
 //     RA saved per RAType/RAOffset."
-//   - classifications []Classification: parallel rows tagging each PC
-//     range as FP_SAFE (FP-based CFA), FP_LESS (SP-based CFA), or
-//     FALLBACK (complex expression rule — BPF falls back to FP walking).
 //
 // Architectures (auto-detected from ELF machine type):
 //
@@ -20,7 +17,8 @@
 //
 //   - Simple CFA rules: def_cfa / def_cfa_register / def_cfa_offset /
 //     def_cfa_offset_sf / def_cfa_sf. Only SP and FP (per-arch) produce
-//     CFIEntry rows; other registers → FALLBACK classification.
+//     CFIEntry rows; other registers emit NO row, which is how the walker
+//     learns to fall back to the frame pointer for that range.
 //   - Register saves: offset / offset_extended / offset_extended_sf /
 //     restore / restore_extended / same_value / undefined / register.
 //     Only FP and RA are tracked; other register saves are ignored.
@@ -33,7 +31,8 @@
 //     producers use for an outermost frame).
 //   - State stack: remember_state / restore_state (16 deep).
 //   - Expressions: def_cfa_expression / expression / val_expression
-//     → FALLBACK for the covered PC range, no CFIEntry.
+//     → NO CFIEntry for the covered PC range, so the walker frame-pointer
+//     walks it.
 //   - PC advance: advance_loc (compressed), advance_loc1/2/4, set_loc.
 //   - GNU extensions: GNU_args_size (consumed, no effect).
 //   - arm64: DW_CFA_AArch64_negate_ra_state (no operand, no effect).
@@ -113,21 +112,4 @@ type CFIEntry struct {
 	RAOffset   int16 // valid only when RAType == RATypeOffsetCFA
 	RAType     RAType
 	_          [5]uint8 // pad to 32 bytes
-}
-
-// Mode classifies a PC range for the hybrid unwinder.
-type Mode uint8
-
-const (
-	ModeFPSafe   Mode = 0 // FP walk is expected to succeed; BPF prefers FP.
-	ModeFPLess   Mode = 1 // FPs are not preserved here; BPF must use DWARF.
-	ModeFallback Mode = 2 // Complex CFI; BPF falls back to FP (accept whatever it produces).
-)
-
-// Classification pairs a PC range with its hybrid-walker mode.
-type Classification struct {
-	PCStart    uint64
-	PCEndDelta uint32
-	Mode       Mode
-	_          [3]uint8
 }

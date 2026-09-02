@@ -40,8 +40,6 @@ type sessionObjs interface {
 	KernStackmap() *ebpf.Map
 	CFIRulesMap() *ebpf.Map
 	CFILengthsMap() *ebpf.Map
-	CFIClassificationMap() *ebpf.Map
-	CFIClassificationLengthsMap() *ebpf.Map
 	PIDMappingsMap() *ebpf.Map
 	PIDMappingLengthsMap() *ebpf.Map
 }
@@ -131,7 +129,6 @@ type attachStats struct {
 func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []string, logPrefix string, hooks *Hooks, mode Mode, labels map[string]string, perfData *perfdata.Writer, sym symbolize.Symbolizer, kernelSym symbolize.KernelSymbolizer) (*session, error) {
 	store := ehmaps.NewTableStore(
 		objs.CFIRulesMap(), objs.CFILengthsMap(),
-		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap(),
 	)
 	if hooks != nil && hooks.OnCompile != nil {
 		store.SetOnCompile(hooks.onCompileFunc())

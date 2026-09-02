@@ -33,14 +33,6 @@ type gpuusdtCfiMissRatelimitKey struct {
 	TableId uint64
 }
 
-type gpuusdtClassification struct {
-	_          structs.HostLayout
-	PcStart    uint64
-	PcEndDelta uint32
-	Mode       uint8
-	Pad        [3]uint8
-}
-
 type gpuusdtGpuPending struct {
 	_     structs.HostLayout
 	Ptr   uint64
@@ -174,38 +166,35 @@ type gpuusdtProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtMapSpecs struct {
-	CfiClassification        *ebpf.MapSpec `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.MapSpec `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.MapSpec `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.MapSpec `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.MapSpec `ebpf:"cfi_rules"`
-	Dropped                  *ebpf.MapSpec `ebpf:"dropped"`
-	Events                   *ebpf.MapSpec `ebpf:"events"`
-	GpuPendingBatch          *ebpf.MapSpec `ebpf:"gpu_pending_batch"`
-	GpuStackScratch          *ebpf.MapSpec `ebpf:"gpu_stack_scratch"`
-	GpuStacks                *ebpf.MapSpec `ebpf:"gpu_stacks"`
-	HandoffRanges            *ebpf.MapSpec `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.MapSpec `ebpf:"interp_progs"`
-	InterpStats              *ebpf.MapSpec `ebpf:"interp_stats"`
-	PidMappingLengths        *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.MapSpec `ebpf:"pid_mappings"`
-	Pids                     *ebpf.MapSpec `ebpf:"pids"`
-	StackIdSeq               *ebpf.MapSpec `ebpf:"stack_id_seq"`
-	StacksMissing            *ebpf.MapSpec `ebpf:"stacks_missing"`
-	WalkErrors               *ebpf.MapSpec `ebpf:"walk_errors"`
-	WalkStates               *ebpf.MapSpec `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.MapSpec `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.MapSpec `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.MapSpec `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.MapSpec `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.MapSpec `ebpf:"cfi_rules"`
+	Dropped           *ebpf.MapSpec `ebpf:"dropped"`
+	Events            *ebpf.MapSpec `ebpf:"events"`
+	GpuPendingBatch   *ebpf.MapSpec `ebpf:"gpu_pending_batch"`
+	GpuStackScratch   *ebpf.MapSpec `ebpf:"gpu_stack_scratch"`
+	GpuStacks         *ebpf.MapSpec `ebpf:"gpu_stacks"`
+	HandoffRanges     *ebpf.MapSpec `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.MapSpec `ebpf:"interp_progs"`
+	InterpStats       *ebpf.MapSpec `ebpf:"interp_stats"`
+	PidMappingLengths *ebpf.MapSpec `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.MapSpec `ebpf:"pid_mappings"`
+	Pids              *ebpf.MapSpec `ebpf:"pids"`
+	StackIdSeq        *ebpf.MapSpec `ebpf:"stack_id_seq"`
+	StacksMissing     *ebpf.MapSpec `ebpf:"stacks_missing"`
+	WalkErrors        *ebpf.MapSpec `ebpf:"walk_errors"`
+	WalkStates        *ebpf.MapSpec `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.MapSpec `ebpf:"walker_scratch"`
 }
 
 // gpuusdtVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type gpuusdtVariableSpecs struct {
-	BtfAnchorCfiEntry       *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.VariableSpec `ebpf:"_btf_anchor_classification"`
-	BtfAnchorPidMapping     *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
-	InterpEnabled           *ebpf.VariableSpec `ebpf:"interp_enabled"`
+	BtfAnchorCfiEntry   *ebpf.VariableSpec `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorPidMapping *ebpf.VariableSpec `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled       *ebpf.VariableSpec `ebpf:"interp_enabled"`
 }
 
 // gpuusdtObjects contains all objects after they have been loaded into the kernel.
@@ -228,34 +217,30 @@ func (o *gpuusdtObjects) Close() error {
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtMaps struct {
-	CfiClassification        *ebpf.Map `ebpf:"cfi_classification"`
-	CfiClassificationLengths *ebpf.Map `ebpf:"cfi_classification_lengths"`
-	CfiLengths               *ebpf.Map `ebpf:"cfi_lengths"`
-	CfiMissEvents            *ebpf.Map `ebpf:"cfi_miss_events"`
-	CfiMissRatelimit         *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
-	CfiRules                 *ebpf.Map `ebpf:"cfi_rules"`
-	Dropped                  *ebpf.Map `ebpf:"dropped"`
-	Events                   *ebpf.Map `ebpf:"events"`
-	GpuPendingBatch          *ebpf.Map `ebpf:"gpu_pending_batch"`
-	GpuStackScratch          *ebpf.Map `ebpf:"gpu_stack_scratch"`
-	GpuStacks                *ebpf.Map `ebpf:"gpu_stacks"`
-	HandoffRanges            *ebpf.Map `ebpf:"handoff_ranges"`
-	InterpProgs              *ebpf.Map `ebpf:"interp_progs"`
-	InterpStats              *ebpf.Map `ebpf:"interp_stats"`
-	PidMappingLengths        *ebpf.Map `ebpf:"pid_mapping_lengths"`
-	PidMappings              *ebpf.Map `ebpf:"pid_mappings"`
-	Pids                     *ebpf.Map `ebpf:"pids"`
-	StackIdSeq               *ebpf.Map `ebpf:"stack_id_seq"`
-	StacksMissing            *ebpf.Map `ebpf:"stacks_missing"`
-	WalkErrors               *ebpf.Map `ebpf:"walk_errors"`
-	WalkStates               *ebpf.Map `ebpf:"walk_states"`
-	WalkerScratch            *ebpf.Map `ebpf:"walker_scratch"`
+	CfiLengths        *ebpf.Map `ebpf:"cfi_lengths"`
+	CfiMissEvents     *ebpf.Map `ebpf:"cfi_miss_events"`
+	CfiMissRatelimit  *ebpf.Map `ebpf:"cfi_miss_ratelimit"`
+	CfiRules          *ebpf.Map `ebpf:"cfi_rules"`
+	Dropped           *ebpf.Map `ebpf:"dropped"`
+	Events            *ebpf.Map `ebpf:"events"`
+	GpuPendingBatch   *ebpf.Map `ebpf:"gpu_pending_batch"`
+	GpuStackScratch   *ebpf.Map `ebpf:"gpu_stack_scratch"`
+	GpuStacks         *ebpf.Map `ebpf:"gpu_stacks"`
+	HandoffRanges     *ebpf.Map `ebpf:"handoff_ranges"`
+	InterpProgs       *ebpf.Map `ebpf:"interp_progs"`
+	InterpStats       *ebpf.Map `ebpf:"interp_stats"`
+	PidMappingLengths *ebpf.Map `ebpf:"pid_mapping_lengths"`
+	PidMappings       *ebpf.Map `ebpf:"pid_mappings"`
+	Pids              *ebpf.Map `ebpf:"pids"`
+	StackIdSeq        *ebpf.Map `ebpf:"stack_id_seq"`
+	StacksMissing     *ebpf.Map `ebpf:"stacks_missing"`
+	WalkErrors        *ebpf.Map `ebpf:"walk_errors"`
+	WalkStates        *ebpf.Map `ebpf:"walk_states"`
+	WalkerScratch     *ebpf.Map `ebpf:"walker_scratch"`
 }
 
 func (m *gpuusdtMaps) Close() error {
 	return _GpuusdtClose(
-		m.CfiClassification,
-		m.CfiClassificationLengths,
 		m.CfiLengths,
 		m.CfiMissEvents,
 		m.CfiMissRatelimit,
@@ -283,10 +268,9 @@ func (m *gpuusdtMaps) Close() error {
 //
 // It can be passed to loadGpuusdtObjects or ebpf.CollectionSpec.LoadAndAssign.
 type gpuusdtVariables struct {
-	BtfAnchorCfiEntry       *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
-	BtfAnchorClassification *ebpf.Variable `ebpf:"_btf_anchor_classification"`
-	BtfAnchorPidMapping     *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
-	InterpEnabled           *ebpf.Variable `ebpf:"interp_enabled"`
+	BtfAnchorCfiEntry   *ebpf.Variable `ebpf:"_btf_anchor_cfi_entry"`
+	BtfAnchorPidMapping *ebpf.Variable `ebpf:"_btf_anchor_pid_mapping"`
+	InterpEnabled       *ebpf.Variable `ebpf:"interp_enabled"`
 }
 
 // gpuusdtPrograms contains all programs after they have been loaded into the kernel.

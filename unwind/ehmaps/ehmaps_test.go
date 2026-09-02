@@ -71,22 +71,6 @@ func TestMarshalCFIEntryMatchesBPFLayout(t *testing.T) {
 	}
 }
 
-func TestMarshalClassificationMatchesBPFLayout(t *testing.T) {
-	c := ehcompile.Classification{
-		PCStart:    0xdeadbeef_cafef00d,
-		PCEndDelta: 42,
-		Mode:       ehcompile.ModeFPLess,
-	}
-	got := MarshalClassification(c)
-	want := make([]byte, 16)
-	binary.LittleEndian.PutUint64(want[0:8], 0xdeadbeef_cafef00d)
-	binary.LittleEndian.PutUint32(want[8:12], 42)
-	want[12] = 1 // mode = FPLess
-	if !bytes.Equal(got, want) {
-		t.Fatalf("MarshalClassification:\n got %x\nwant %x", got, want)
-	}
-}
-
 func TestMarshalPIDMapping(t *testing.T) {
 	m := PIDMapping{VMAStart: 0x400000, VMAEnd: 0x500000, LoadBias: 0x400000, TableID: 0x12345}
 	got := MarshalPIDMapping(m)
@@ -149,12 +133,5 @@ func TestAnUnsearchableTableIsRefused(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTableTooLarge) {
 		t.Fatalf("err = %v, want ErrTableTooLarge", err)
-	}
-	err = PopulateClassification(PopulateClassificationArgs{
-		TableID: 0x1234,
-		Entries: make([]ehcompile.Classification, MaxSearchableRows+1),
-	})
-	if !errors.Is(err, ErrTableTooLarge) {
-		t.Fatalf("classification: err = %v, want ErrTableTooLarge", err)
 	}
 }

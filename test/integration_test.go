@@ -1310,7 +1310,7 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
 
 	// Compile CFI from the Rust binary.
-	entries, classifications, _, err := ehcompile.Compile(binPath)
+	entries, _, err := ehcompile.Compile(binPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, entries, "ehcompile produced no CFI entries")
 
@@ -1322,10 +1322,6 @@ func TestPerfDwarfWalker(t *testing.T) {
 	require.NoError(t, ehmaps.PopulateCFI(ehmaps.PopulateCFIArgs{
 		TableID: tableID, Entries: entries,
 		OuterMap: objs.CFIRulesMap(), LengthMap: objs.CFILengthsMap(),
-	}))
-	require.NoError(t, ehmaps.PopulateClassification(ehmaps.PopulateClassificationArgs{
-		TableID: tableID, Entries: classifications,
-		OuterMap: objs.CFIClassificationMap(), LengthMap: objs.CFIClassificationLengthsMap(),
 	}))
 
 	mappings, err := ehmaps.LoadProcessMappings(workload.Process.Pid, binPath, "", tableID)
@@ -1616,9 +1612,7 @@ func TestPerfDwarfMmap2Tracking(t *testing.T) {
 	defer objs.Close()
 	require.NoError(t, objs.AddPID(uint32(workload.Process.Pid)))
 
-	store := ehmaps.NewTableStore(
-		objs.CFIRulesMap(), objs.CFILengthsMap(),
-		objs.CFIClassificationMap(), objs.CFIClassificationLengthsMap())
+	store := ehmaps.NewTableStore(objs.CFIRulesMap(), objs.CFILengthsMap())
 	tracker := ehmaps.NewPIDTracker(store, objs.PIDMappingsMap(), objs.PIDMappingLengthsMap())
 	require.NoError(t, tracker.Attach(uint32(workload.Process.Pid), binPath, ""))
 

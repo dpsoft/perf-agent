@@ -25,6 +25,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
+	"github.com/dpsoft/perf-agent/symbolize/nvsym"
 
 	// Registering the interpreter unwinders is a BINARY's decision, not a
 	// library's: which languages this build can walk is a property of what was
@@ -37,13 +38,18 @@ import (
 
 func main() {
 	var (
-		shim     = flag.String("shim", "./shim/libperfagent-gpu-nvidia.so", "the CUPTI adapter .so carrying the perfagent USDT probes")
-		workload = flag.String("workload", "./shim/nvidia/testdata/cuda_workload", "CUDA program to run under the adapter")
-		iters    = flag.Int("iters", 2000, "workload iterations; it launches two kernels per iteration")
-		sleepUs  = flag.Int("sleep-us", 200, "workload sleep between iterations, in microseconds")
-		period   = flag.Int("period", 8, "one-in-N launch sampling period (PERFAGENT_GPU_SAMPLE_PERIOD)")
-		linger   = flag.Int("linger-ms", 30000, "how long the workload may wait to be released after it finishes")
-		out      = flag.String("out", "gpu-cuda.pb.gz", "output pprof profile")
+		shim      = flag.String("shim", "./shim/libperfagent-gpu-nvidia.so", "the CUPTI adapter .so carrying the perfagent USDT probes")
+		workload  = flag.String("workload", "./shim/nvidia/testdata/cuda_workload", "CUDA program to run under the adapter")
+		iters     = flag.Int("iters", 2000, "workload iterations; it launches two kernels per iteration")
+		sleepUs   = flag.Int("sleep-us", 200, "workload sleep between iterations, in microseconds")
+		period    = flag.Int("period", 8, "one-in-N launch sampling period (PERFAGENT_GPU_SAMPLE_PERIOD)")
+		linger    = flag.Int("linger-ms", 30000, "how long the workload may wait to be released after it finishes")
+		out       = flag.String("out", "gpu-cuda.pb.gz", "output pprof profile")
+		nvSymbols = flag.String("nvidia-symbols", "",
+			"cache directory for NVIDIA's CUDA Toolkit Symbol Server; enables fetching "+
+				"symbols for libcuda/libcupti/libcuBLAS, which ship stripped. Off unless set: "+
+				"it reaches the network and discloses the build-ids of the CUDA libraries the "+
+				"target has mapped.")
 
 		// One setting, three values, and no way to ask for two. The default
 		// is the empty string rather than "off" so that an unspecified flag
@@ -137,7 +143,17 @@ func main() {
 	// internals) renders as a bare ASLR'd address.
 	modules := procmap.NewResolver()
 	defer modules.Close()
-	sym, err := symbolize.NewLocalSymbolizer(symbolize.WithModuleIndex(modules))
+	symOpts := []symbolize.LocalOption{symbolize.WithModuleIndex(modules)}
+	if *nvSymbols != "" {
+		// Last resort only, after the library's own file has failed. NVIDIA
+		// exports 0.16%-3.2% of .text in these libraries, so almost every
+		// address in them is unnameable locally; the server has a
+		// symbols-only ELF per build-id that named 13 of 13 such frames in a
+		// real capture.
+		symOpts = append(symOpts, symbolize.WithNVIDIASymbols(&nvsym.Store{Dir: *nvSymbols}))
+		log.Printf("nvidia symbols: enabled, cache %s", *nvSymbols)
+	}
+	sym, err := symbolize.NewLocalSymbolizer(symOpts...)
 	if err != nil {
 		log.Fatalf("symbolizer: %v", err)
 	}

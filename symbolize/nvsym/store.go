@@ -41,6 +41,10 @@ type Store struct {
 	// not become a 200 within one capture.
 	negative sync.Map
 
+	// prefetching records build-ids a background fill has been started for,
+	// so a miss on every stack does not spawn a goroutine per stack.
+	prefetching sync.Map
+
 	// inflight collapses concurrent requests for one build-id: a PyTorch
 	// capture symbolizes many stacks at once and they hit the same handful of
 	// libraries, so without this the first miss becomes N identical downloads.
@@ -69,7 +73,55 @@ func (s *Store) pathFor(buildID string) string {
 	return filepath.Join(s.Dir, ".build-id", buildID[:2], buildID[2:]+".debug")
 }
 
+// Cached returns a symbols file for the module ONLY if it is already on disk,
+// and never touches the network.
+//
+// This is what a caller on a latency-sensitive path must use. The GPU consumer
+// symbolizes DURING the capture, on the goroutine draining the USDT ring
+// buffer, so a blocking HTTP request there stalls the drain and executions are
+// lost: measured, the same Rust CUDA workload recorded 32,000 executions all
+// matched with the network path disabled, and 11,920 with 1,095 unmatched with
+// it enabled -- two thirds of the GPU work simply missing from the profile.
+//
+// A miss schedules a background fetch, so the cache is warm for the next run
+// and the cost is paid once, off the hot path, by nobody who is waiting.
+func (s *Store) Cached(modulePath, buildID string) (string, bool) {
+	if s == nil || s.Dir == "" || !IsNVIDIAModule(modulePath) {
+		return "", false
+	}
+	dst := s.pathFor(buildID)
+	if dst == "" {
+		return "", false
+	}
+	if _, err := os.Stat(dst); err == nil {
+		s.stats.Hits.Add(1)
+		return dst, true
+	}
+	s.prefetch(modulePath, buildID)
+	return "", false
+}
+
+// prefetch fills the cache in the background, at most once per build-id per
+// process. Errors are silent by design: nothing is waiting on the result, and
+// a miss simply means this run renders module+offset as it did before.
+func (s *Store) prefetch(modulePath, buildID string) {
+	if _, refused := s.negative.Load(buildID); refused {
+		return
+	}
+	if _, started := s.prefetching.LoadOrStore(buildID, struct{}{}); started {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		_, _ = s.Path(ctx, modulePath, buildID)
+	}()
+}
+
 // Path returns a local symbols file for the module, fetching it if needed.
+//
+// BLOCKING. Callers on a capture path must use Cached instead; see its comment
+// for what a blocking fetch there costs.
 //
 // Returns ErrNotFound when the server has nothing, which is expected and not
 // an error condition for the caller. Never returns a path that does not exist.

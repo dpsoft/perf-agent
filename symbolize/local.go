@@ -2,7 +2,6 @@ package symbolize
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -480,10 +479,11 @@ func (s *LocalSymbolizer) retryAgainstSymbolServer(frames []Frame, mod string, i
 	if buildID == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	path, err := s.symbols.Path(ctx, mod, buildID)
-	if err != nil {
+	// Cache-only: this runs on the GPU consumer's capture path, and a
+	// blocking fetch here loses GPU executions rather than merely delaying
+	// them. A miss warms the cache in the background for the next run.
+	path, ok := s.symbols.Cached(mod, buildID)
+	if !ok {
 		return
 	}
 	syms, err := s.bz.SymbolizeElfVirtOffsets(offs, path, blazesym.ElfSourceWithDebugSyms(true))

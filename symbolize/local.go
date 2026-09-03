@@ -7,10 +7,13 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	blazesym "github.com/libbpf/blazesym/go"
+
+	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
 // ErrClosed is returned from operations on a closed Symbolizer.
@@ -27,8 +30,10 @@ var ErrMapFilesUnavailable = errors.New("symbolize: cannot follow /proc/<pid>/ma
 type LocalSymbolizer struct {
 	bz      *blazesym.Symbolizer
 	modules ModuleIndex
-	closed  atomic.Bool
-	stats   localCounters
+	// batchErrs deduplicates the batch-failure log by message.
+	batchErrs sync.Map
+	closed    atomic.Bool
+	stats     localCounters
 }
 
 // LocalOption configures a LocalSymbolizer.
@@ -60,6 +65,13 @@ type localCounters struct {
 	rawAddrBatches  atomic.Uint64
 	modulesAttached atomic.Uint64
 	modulesBare     atomic.Uint64
+
+	// The module-file retry. Named counts frames the process source could not
+	// name and the file source could: a disagreement between two views of one
+	// address, so zero is the healthy value and non-zero is the size of what
+	// the process source was dropping.
+	fileRetryNamed  atomic.Uint64
+	fileRetryFailed atomic.Uint64
 
 	// How much wall time symbolization actually cost, and over how many
 	// calls. A profiler that takes two minutes to write a five-second capture
@@ -95,6 +107,14 @@ type LocalStats struct {
 	// a run where it never happens must not look like one where it always
 	// did.
 	ModulesBare uint64
+
+	// FileRetryNamed counts frames the process source could not name and the
+	// file source then could, for the same address. Zero is the healthy value.
+	FileRetryNamed uint64
+	// FileRetryFailed counts modules the retry could not ask about at all.
+	// Kept apart from Named so "recovered nothing" and "could not look" stay
+	// different facts.
+	FileRetryFailed uint64
 
 	// Calls is how many times SymbolizeProcess ran, and TotalNs the wall time
 	// inside it. Calls far exceeding the number of distinct processes means
@@ -137,6 +157,8 @@ func (s *LocalSymbolizer) Stats() LocalStats {
 		RawAddrBatches:  s.stats.rawAddrBatches.Load(),
 		ModulesAttached: s.stats.modulesAttached.Load(),
 		ModulesBare:     s.stats.modulesBare.Load(),
+		FileRetryNamed:  s.stats.fileRetryNamed.Load(),
+		FileRetryFailed: s.stats.fileRetryFailed.Load(),
 		Calls:           s.stats.calls.Load(),
 		TotalNs:         s.stats.totalNs.Load(),
 		SlowestNs:       s.stats.slowestNs.Load(),
@@ -273,8 +295,21 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	)
 	s.noteCall(pid, time.Since(start))
 	if err != nil {
+		// The whole batch failed. Every frame becomes a raw address, and
+		// withModules then places each one in a file -- so the module and the
+		// mapping ARE known here even though no name is.
+		//
+		// That is exactly the input the file-source retry needs, and this is
+		// where it matters most: measured on a PyTorch capture, a single
+		// failed batch turned 35 of 35 frames into module+offset, 17 of them
+		// in libtorch, whose symbols are present on disk and recoverable.
+		// Before this, the retry ran only on the success path, so the frames
+		// that needed it most were the only ones it never saw.
 		s.stats.rawAddrBatches.Add(1)
-		return s.withModules(pid, rawUserAddrFrames(ips)), nil
+		frames := s.withModules(pid, rawUserAddrFrames(ips))
+		s.retryAgainstModuleFiles(frames)
+		s.noteBatchFailure(pid, err)
+		return frames, nil
 	}
 	out := make([]Frame, 0, len(syms))
 	for i, sym := range syms {
@@ -284,7 +319,111 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 		}
 		out = append(out, fromBlazesymSym(sym, addr))
 	}
-	return s.withModules(pid, out), nil
+	frames := s.withModules(pid, out)
+	s.retryAgainstModuleFiles(frames)
+	return frames, nil
+}
+
+// noteBatchFailure records why a batch failed, once per distinct message.
+//
+// The batch-failure path used to be silent apart from a counter nothing
+// printed, and its doc comment asserted the realistic cause was the process
+// having exited. That assertion went unchecked for as long as the counter went
+// unread: in the capture that motivated this, batches failed while the target
+// was demonstrably alive and still launching kernels. Keeping the reason makes
+// the next such claim falsifiable.
+func (s *LocalSymbolizer) noteBatchFailure(pid uint32, err error) {
+	msg := err.Error()
+	if _, seen := s.batchErrs.LoadOrStore(msg, struct{}{}); seen {
+		return
+	}
+	log.Printf("symbolize: batch failed for pid %d: %v (frames fall back to module+offset; "+
+		"names recovered from module files where possible)", pid, msg)
+}
+
+// retryAgainstModuleFiles re-asks blazesym for the frames the PROCESS source
+// could not name, this time against the module file at a file offset.
+//
+// The two sources disagree, and the file source is the one that is right.
+// Measured, for addresses the process source returned missing_symbols for:
+//
+//	0x28f4874 -> at::_ops::add_Tensor::redispatch(...)
+//	0x5119b46 -> torch::autograd::VariableType::(anonymous namespace)::add_Tensor(...)
+//
+// Same library, same addresses, same instant. The second is a .symtab-only
+// symbol which a dynamic-symbol view cannot see; the first is inside an
+// exported .dynsym symbol and should have resolved either way, so "the process
+// source only reads .dynsym" does not fully explain it and is not claimed
+// here. What is established is the disagreement and its direction.
+//
+// Only frames that already carry a module AND a mapping are retried:
+// MapStart/MapOff are what make a file offset computable, and a bare address
+// has nothing to ask about. Frames are grouped by module, so a stack N frames
+// deep into one library costs one call rather than N -- symbolization cost is
+// not a free variable here (issue #109).
+//
+// Failure is not an error: a frame neither source can name keeps the
+// module+offset rendering it already had. This can only add names.
+func (s *LocalSymbolizer) retryAgainstModuleFiles(frames []Frame) {
+	var byModule map[string][]int
+	for i := range frames {
+		f := &frames[i]
+		if f.Reason == FailureNone || f.Module == "" || f.MapStart == 0 {
+			continue
+		}
+		if strings.HasPrefix(f.Module, "[") {
+			continue // [kernel], [jit] and friends are not files
+		}
+		if byModule == nil {
+			byModule = make(map[string][]int, 4)
+		}
+		byModule[f.Module] = append(byModule[f.Module], i)
+	}
+	for mod, idxs := range byModule {
+		// Address - MapStart + MapOff is a FILE offset; blazesym wants a
+		// VIRTUAL one. The two coincide only when a segment's p_vaddr equals
+		// its p_offset -- true of the CUDA and libtorch shared objects, and
+		// false of, say, a non-PIE executable, where the difference is the
+		// whole load address. Getting this wrong does not fail loudly: it
+		// asks about a valid-looking offset and returns a confidently wrong
+		// name. procmap.AddressMapper reads the program headers and does the
+		// conversion properly; symbolize/debuginfod already relies on it.
+		mapper, merr := procmap.NewAddressMapper(mod)
+		if merr != nil {
+			s.stats.fileRetryFailed.Add(1)
+			continue
+		}
+		offs := make([]uint64, 0, len(idxs))
+		keep := make([]int, 0, len(idxs))
+		for _, i := range idxs {
+			fileOff := frames[i].Address - frames[i].MapStart + frames[i].MapOff
+			va, ok := mapper.FileOffsetToVirtualAddress(fileOff)
+			if !ok {
+				continue
+			}
+			offs = append(offs, va)
+			keep = append(keep, i)
+		}
+		if len(offs) == 0 {
+			continue
+		}
+		idxs = keep
+		syms, err := s.bz.SymbolizeElfVirtOffsets(offs, mod, blazesym.ElfSourceWithDebugSyms(true))
+		if err != nil || len(syms) != len(idxs) {
+			s.stats.fileRetryFailed.Add(1)
+			continue
+		}
+		for j, i := range idxs {
+			if syms[j].Name == "" {
+				continue
+			}
+			f := &frames[i]
+			f.Name = syms[j].Name
+			f.Offset = offs[j]
+			f.Reason = FailureNone
+			s.stats.fileRetryNamed.Add(1)
+		}
+	}
 }
 
 // withModules names the module behind every frame blazesym left unresolved,

@@ -97,7 +97,16 @@ func init() {
 	// Register --debuginfod-url flag for debuginfod server URLs
 	flag.Var(&flagDebuginfodURLs, "debuginfod-url",
 		"Add a debuginfod server URL (repeatable). Falls back to DEBUGINFOD_URLS env var.")
+	// The way to decline network symbolization on a machine whose distribution
+	// sets DEBUGINFOD_URLS for you (Fedora does). It is a separate flag rather
+	// than --debuginfod-url='' because an empty value stays an ERROR: a script
+	// writing --debuginfod-url="$URL" with URL unset should be told, not
+	// silently downgraded to local symbols. Issue #111.
+	flag.BoolVar(&flagNoDebuginfod, "no-debuginfod", false,
+		"Ignore DEBUGINFOD_URLS and any --debuginfod-url; symbolize from local files only.")
 }
+
+var flagNoDebuginfod bool
 
 var pmuFile *os.File
 
@@ -252,9 +261,23 @@ func buildOptions() []perfagent.Option {
 		opts = append(opts, perfagent.WithTags(flagTags...))
 	}
 
-	// Debuginfod / symbol-cache options
-	for _, u := range flagDebuginfodURLs {
-		opts = append(opts, perfagent.WithDebuginfodURL(u))
+	// Debuginfod / symbol-cache options.
+	//
+	// --no-debuginfod wins over both --debuginfod-url and DEBUGINFOD_URLS: it
+	// exists precisely for the machine whose distribution set the variable, so
+	// deferring to the environment would defeat it. Passing both is a
+	// contradiction the user should hear about rather than have resolved
+	// silently in either direction.
+	switch {
+	case flagNoDebuginfod && len(flagDebuginfodURLs) > 0:
+		fmt.Fprintln(os.Stderr, "perf-agent: --no-debuginfod and --debuginfod-url are contradictory; pick one")
+		os.Exit(2)
+	case flagNoDebuginfod:
+		opts = append(opts, perfagent.WithoutDebuginfod())
+	default:
+		for _, u := range flagDebuginfodURLs {
+			opts = append(opts, perfagent.WithDebuginfodURL(u))
+		}
 	}
 	if *flagSymbolCacheDir != "" {
 		opts = append(opts, perfagent.WithSymbolCacheDir(*flagSymbolCacheDir))

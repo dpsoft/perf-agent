@@ -113,6 +113,18 @@ type Config struct {
 	// also empty), the agent uses the local symbolizer.
 	DebuginfodURLs []string
 
+	// DisableDebuginfod suppresses network symbolization even when
+	// DEBUGINFOD_URLS is set in the environment.
+	//
+	// It exists because several distributions set that variable for you --
+	// Fedora ships DEBUGINFOD_URLS pointing at its own server -- so on those
+	// machines a capture fetches debug info over the network without anyone
+	// having asked. Honouring the variable is the right default (gdb, perf,
+	// elfutils and delve all read it, and it is what a user who set it
+	// deliberately expects), but declining has to be possible without
+	// editing the environment. Issue #111.
+	DisableDebuginfod bool
+
 	// SymbolCacheDir overrides the debuginfod cache directory.
 	// Default: /tmp/perf-agent-debuginfod.
 	SymbolCacheDir string
@@ -324,6 +336,16 @@ func WithDebuginfodURL(url string) Option {
 	return func(c *Config) {
 		c.DebuginfodURLs = append(c.DebuginfodURLs, url)
 	}
+}
+
+// WithoutDebuginfod symbolizes from local files only, ignoring both
+// WithDebuginfodURL and the DEBUGINFOD_URLS environment variable.
+//
+// The environment is what makes this necessary rather than merely
+// convenient: on a distribution that sets DEBUGINFOD_URLS for you, there is
+// otherwise no way to decline from the command line. Issue #111.
+func WithoutDebuginfod() Option {
+	return func(c *Config) { c.DisableDebuginfod = true }
 }
 
 // WithSymbolCacheDir overrides the debuginfod cache directory.

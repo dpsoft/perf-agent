@@ -114,3 +114,45 @@ func TestBothUnresolvedFormsShareTheDomainButNotTheLabel(t *testing.T) {
 func TestKernelStillBeatsUnsymbolized(t *testing.T) {
 	assert.Equal(t, DomainKernel, Classify("0xffffffffc0201234", "[kernel]"))
 }
+
+// cuBLAS is NVIDIA runtime and reads as application code today. Two separate
+// rules both miss it, which is why the frames survived review: the module is
+// absent from vendorModulePrefixes, and the symbol heuristic for the driver
+// API ("cu" + an uppercase letter) does not fire on "cublas" because the third
+// character is lowercase. A symbolized cuBLAS frame therefore falls all the way
+// through to DomainApplication and is coloured as the user's own code.
+//
+// Measured in a PyTorch capture: libcublasLt.so.13 (84 frames) and
+// libcublas.so.13 (56) were the only NVIDIA modules on the stack that no rule
+// classified.
+func TestCuBLASIsVendorRuntimeNotApplicationCode(t *testing.T) {
+	const lt = "/usr/lib/python3/site-packages/nvidia/cublas/lib/libcublasLt.so.13"
+	const bl = "/usr/lib/python3/site-packages/nvidia/cublas/lib/libcublas.so.13"
+
+	// The case that motivated this: an address that IS inside an exported
+	// symbol, so it arrives named rather than as module+offset.
+	assert.Equal(t, DomainVendorRuntime, Classify("cublasLtSSSMatmul", lt))
+	assert.Equal(t, DomainVendorRuntime, Classify("cublasSgemm_v2", bl))
+
+	// And an internal name we cannot recognise, carried by the module alone.
+	assert.Equal(t, DomainVendorRuntime, Classify("someInternalGemmKernel", lt))
+
+	// Unsymbolized still wins over the module, exactly as for libcuda: the
+	// hatch is the only thing that says no symbol table named this address.
+	assert.Equal(t, DomainUnsymbolized, Classify("libcublasLt.so.13+0xf9e678", lt))
+
+	// The case that actually reaches the page. GPU profiles carry EMPTY
+	// mappings (see isShimSymbol), so every frame in one arrives with
+	// module == "" and only the name rules run. A module-only fix would pass
+	// the assertions above and change nothing about a real GPU flame graph.
+	assert.Equal(t, DomainVendorRuntime, Classify("cublasLtSSSMatmul", ""))
+	assert.Equal(t, DomainVendorRuntime, Classify("cublasSgemm_v2", ""))
+	assert.Equal(t, DomainUnsymbolized, Classify("libcublasLt.so.13+0xf9e678", ""))
+
+	// PyTorch's own wrapper around cuBLAS, present in the same capture. It
+	// contains "cublas" and is emphatically NOT vendor code -- it is the
+	// caller we most want to see. The rules match on PREFIX for exactly this
+	// reason; a Contains would bill this frame to NVIDIA.
+	assert.Equal(t, DomainApplication, Classify(
+		"void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long)", ""))
+}

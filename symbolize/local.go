@@ -2,6 +2,7 @@ package symbolize
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 
 	blazesym "github.com/libbpf/blazesym/go"
 
+	"github.com/dpsoft/perf-agent/symbolize/nvsym"
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
 
@@ -32,12 +34,27 @@ type LocalSymbolizer struct {
 	modules ModuleIndex
 	// batchErrs deduplicates the batch-failure log by message.
 	batchErrs sync.Map
-	closed    atomic.Bool
-	stats     localCounters
+	// symbols, when configured, supplies symbol-only ELFs for NVIDIA
+	// libraries that ship stripped. Nil means the feature is off, which is
+	// the default: it reaches the network and discloses build-ids.
+	symbols *nvsym.Store
+	closed  atomic.Bool
+	stats   localCounters
 }
 
 // LocalOption configures a LocalSymbolizer.
 type LocalOption func(*LocalSymbolizer)
+
+// WithNVIDIASymbols enables the CUDA Toolkit Symbol Server as a last resort
+// for frames in NVIDIA libraries that no local file can name.
+//
+// Off unless supplied. It reaches the network and it discloses the build-ids
+// of the CUDA libraries the target has mapped, which is a decision for the
+// operator rather than a default -- the same reasoning that gave debuginfod a
+// way to be declined (issue #111).
+func WithNVIDIASymbols(store *nvsym.Store) LocalOption {
+	return func(s *LocalSymbolizer) { s.symbols = store }
+}
 
 // WithModuleIndex supplies the /proc/<pid>/maps index used to name the module
 // behind an address blazesym could not resolve to a symbol. Without it, an
@@ -72,6 +89,10 @@ type localCounters struct {
 	// the process source was dropping.
 	fileRetryNamed  atomic.Uint64
 	fileRetryFailed atomic.Uint64
+	// Frames named only because the symbol server had what no local file
+	// did. Counted apart from fileRetryNamed so the value of reaching the
+	// network is a number rather than an assumption.
+	serverRetryNamed atomic.Uint64
 
 	// How much wall time symbolization actually cost, and over how many
 	// calls. A profiler that takes two minutes to write a five-second capture
@@ -111,6 +132,10 @@ type LocalStats struct {
 	// FileRetryNamed counts frames the process source could not name and the
 	// file source then could, for the same address. Zero is the healthy value.
 	FileRetryNamed uint64
+	// ServerRetryNamed counts frames named only by NVIDIA's symbol server,
+	// after every local file had failed. It is the measured value of enabling
+	// the network path.
+	ServerRetryNamed uint64
 	// FileRetryFailed counts modules the retry could not ask about at all.
 	// Kept apart from Named so "recovered nothing" and "could not look" stay
 	// different facts.
@@ -154,15 +179,16 @@ func (s *LocalSymbolizer) noteCall(pid uint32, d time.Duration) {
 // Stats returns the current process-side symbolization counters.
 func (s *LocalSymbolizer) Stats() LocalStats {
 	return LocalStats{
-		RawAddrBatches:  s.stats.rawAddrBatches.Load(),
-		ModulesAttached: s.stats.modulesAttached.Load(),
-		ModulesBare:     s.stats.modulesBare.Load(),
-		FileRetryNamed:  s.stats.fileRetryNamed.Load(),
-		FileRetryFailed: s.stats.fileRetryFailed.Load(),
-		Calls:           s.stats.calls.Load(),
-		TotalNs:         s.stats.totalNs.Load(),
-		SlowestNs:       s.stats.slowestNs.Load(),
-		SlowestPID:      s.stats.slowestPID.Load(),
+		RawAddrBatches:   s.stats.rawAddrBatches.Load(),
+		ModulesAttached:  s.stats.modulesAttached.Load(),
+		ModulesBare:      s.stats.modulesBare.Load(),
+		FileRetryNamed:   s.stats.fileRetryNamed.Load(),
+		ServerRetryNamed: s.stats.serverRetryNamed.Load(),
+		FileRetryFailed:  s.stats.fileRetryFailed.Load(),
+		Calls:            s.stats.calls.Load(),
+		TotalNs:          s.stats.totalNs.Load(),
+		SlowestNs:        s.stats.slowestNs.Load(),
+		SlowestPID:       s.stats.slowestPID.Load(),
 	}
 }
 
@@ -413,8 +439,12 @@ func (s *LocalSymbolizer) retryAgainstModuleFiles(frames []Frame) {
 			s.stats.fileRetryFailed.Add(1)
 			continue
 		}
+		var stillUnnamed []int
+		var stillOffs []uint64
 		for j, i := range idxs {
 			if syms[j].Name == "" {
+				stillUnnamed = append(stillUnnamed, i)
+				stillOffs = append(stillOffs, offs[j])
 				continue
 			}
 			f := &frames[i]
@@ -423,6 +453,53 @@ func (s *LocalSymbolizer) retryAgainstModuleFiles(frames []Frame) {
 			f.Reason = FailureNone
 			s.stats.fileRetryNamed.Add(1)
 		}
+		s.retryAgainstSymbolServer(frames, mod, stillUnnamed, stillOffs)
+	}
+}
+
+// retryAgainstSymbolServer is the last resort: frames in an NVIDIA library
+// that the library's own file cannot name.
+//
+// It is last for a reason. Coverage of the exported symbols in these libraries
+// is 0.16%-3.2% of .text, so the file source legitimately fails on almost
+// every address -- and NVIDIA's symbol server has a symbols-only ELF for the
+// same build-id that resolved 13 of 13 such frames in a real capture.
+//
+// The addresses need no adjustment: the served file is built from the same
+// object, so its virtual addresses are the ones already computed.
+//
+// Silent on failure by design. The server has no symbols for many build-ids
+// (measured: a pip-wheel cuBLASLt returns 200 while the toolkit build of the
+// same library returns 403), and a frame it cannot name keeps the
+// module+offset rendering it already had.
+func (s *LocalSymbolizer) retryAgainstSymbolServer(frames []Frame, mod string, idxs []int, offs []uint64) {
+	if s.symbols == nil || len(idxs) == 0 {
+		return
+	}
+	buildID := frames[idxs[0]].BuildID
+	if buildID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path, err := s.symbols.Path(ctx, mod, buildID)
+	if err != nil {
+		return
+	}
+	syms, err := s.bz.SymbolizeElfVirtOffsets(offs, path, blazesym.ElfSourceWithDebugSyms(true))
+	if err != nil || len(syms) != len(idxs) {
+		s.stats.fileRetryFailed.Add(1)
+		return
+	}
+	for j, i := range idxs {
+		if syms[j].Name == "" {
+			continue
+		}
+		f := &frames[i]
+		f.Name = syms[j].Name
+		f.Offset = offs[j]
+		f.Reason = FailureNone
+		s.stats.serverRetryNamed.Add(1)
 	}
 }
 

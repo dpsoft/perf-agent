@@ -286,3 +286,65 @@ func TestStoreRefusesANonELFBody(t *testing.T) {
 		t.Fatal("a non-ELF body was cached")
 	}
 }
+
+// The hot-path contract: Cached must never block on the network. The GPU
+// consumer calls it on the goroutine draining the USDT ring buffer, and a
+// blocking fetch there does not merely delay the profile, it loses GPU
+// executions -- measured, 32,000 all-matched became 11,920 with 1,095
+// unmatched when the fetch was synchronous.
+func TestCachedNeverBlocksOnTheNetwork(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	s, _, _ := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		<-block // a server that never answers
+	})
+	const id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if p, ok := s.Cached("/x/libcupti.so.13", id); ok {
+			t.Errorf("Cached reported a hit for an unfetched build-id: %q", p)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cached blocked on the network; it must return immediately")
+	}
+}
+
+// A miss must warm the cache for next time, exactly once per build-id however
+// many stacks miss on it.
+func TestCachedPrefetchesOncePerBuildID(t *testing.T) {
+	var served int32
+	s, _, _ := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&served, 1)
+		if strings.HasSuffix(r.URL.Path, "/index.html") {
+			_, _ = w.Write([]byte(listingBody))
+			return
+		}
+		_, _ = w.Write(elfBody)
+	})
+	const id = "ffffffffffffffffffffffffffffffffffffffff"
+
+	for range 50 {
+		if _, ok := s.Cached("/usr/lib64/libcuda.so.1", id); ok {
+			t.Fatal("first lookups must miss")
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := s.Cached("/usr/lib64/libcuda.so.1", id); ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok := s.Cached("/usr/lib64/libcuda.so.1", id); !ok {
+		t.Fatal("background prefetch never populated the cache")
+	}
+	// listing + file, once -- not once per missing stack.
+	if got := atomic.LoadInt32(&served); got != 2 {
+		t.Fatalf("server served %d requests, want 2 (one prefetch)", got)
+	}
+}

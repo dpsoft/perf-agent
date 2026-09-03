@@ -226,6 +226,14 @@ func isShimSymbol(name string) bool {
 
 var vendorModulePrefixes = []string{
 	"libcuda", "libcudart", "libcupti", "libnvidia", "libnvperf",
+	// The CUDA math and communication libraries. cuBLAS is the measured
+	// case -- libcublasLt.so.13 and libcublas.so.13 were the only NVIDIA
+	// modules on a PyTorch stack that no rule here classified, so their
+	// frames were coloured as the user's own application code. The rest of
+	// this line is the same family and is listed to stop the identical
+	// one-word omission recurring per library.
+	"libcublas", "libcudnn", "libcufft", "libcurand", "libcusparse",
+	"libcusolver", "libnccl", "libnvjitlink", "libnvrtc", "libnvToolsExt",
 	"libamdhip", "libhsa-runtime", "librocprofiler", "libroctracer", "libhsakmt",
 }
 
@@ -245,6 +253,18 @@ func isVendorModule(module string) bool {
 var vendorSymbolPrefixes = []string{
 	"cuda", "cuda_", "cuLaunch", "cuMem", "cuStream", "cuModule", "cuCtx", "cuDevice",
 	"cupti", "cuptiActivity", "nvidia", "nvrtc",
+	// The math/comm libraries by SYMBOL as well as by module, and this half
+	// is the one that reaches a GPU flame graph: the GPU builder writes
+	// profiles with empty mappings, so module is "" for every frame in one
+	// and only the name rules run. Adding these to vendorModulePrefixes
+	// alone would fix CPU profiles and change nothing on the page these
+	// frames were reported from.
+	//
+	// They need naming explicitly because the driver-API heuristic below is
+	// "cu" + an UPPERCASE letter, which "cublas", "cufft" and "cusparse" all
+	// fail on their third character.
+	"cublas", "cudnn", "cufft", "curand", "cusparse", "cusolver",
+	"nccl", "ncclComm", "nvjitlink",
 	"hip", "hsa_", "roctracer", "rocprofiler", "amd_",
 }
 

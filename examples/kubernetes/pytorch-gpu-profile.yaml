@@ -1,0 +1,137 @@
+# examples/kubernetes/pytorch-gpu-profile.yaml
+#
+# Profile an unmodified PyTorch CUDA pod with perf-agent as a SIDECAR.
+#
+# Read examples/kubernetes/README.md before applying this. It does not work
+# yet: the shim's glibc floor (issue #121) exceeds what this image provides,
+# and the sidecar's cross-mount-namespace inode open is untested. This file is
+# the target shape, kept next to the constraints it has to satisfy.
+#
+# Three containers share one emptyDir:
+#
+#   shim-installer (init)  copies libperfagent-gpu-nvidia.so onto the volume
+#   pytorch (app)          loads it via CUDA_INJECTION64_PATH, unmodified
+#   perf-agent (sidecar)   opens THE SAME FILE and attaches USDT probes to it
+#
+# The third container is why the volume exists. uprobe attachment keys on
+# (dev, ino) -- see gpuprobe enrolment -- so the agent must open the identical
+# inode, not a copy of the same bytes. Anything that duplicates the file
+# (go:embed extraction, a per-container copy, a second initContainer) produces
+# zero probe fires and no error.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pytorch-gpu-profile
+  labels:
+    app: pytorch-gpu-profile
+spec:
+  restartPolicy: Never
+
+  # The sidecar reads /proc/<pid>/maps, /proc/<pid>/map_files and
+  # /proc/<pid>/comm of the application process to unwind and symbolize.
+  # This is required by perf-agent's EXISTING function, not by the GPU path.
+  # It is the narrow alternative to hostPID: the sidecar sees the pod's
+  # processes and nothing else on the node.
+  shareProcessNamespace: true
+
+  volumes:
+    # The shim. Written once by the init container, read by both others.
+    - name: perfagent-shim
+      emptyDir: {}
+    # Where the sidecar writes profiles. Swap for a PVC or an object-store
+    # uploader in a real deployment; emptyDir dies with the pod.
+    - name: profiles
+      emptyDir: {}
+
+  initContainers:
+    - name: shim-installer
+      # Ships ONLY the shim. Built against an old-glibc baseline so it can
+      # load into whatever the application image happens to be -- see #121.
+      image: ghcr.io/dpsoft/perf-agent-shim:latest
+      command: ["sh", "-c"]
+      args:
+        - cp /usr/local/lib/libperfagent-gpu-nvidia.so /var/lib/perf-agent/gpu/
+      volumeMounts:
+        - name: perfagent-shim
+          mountPath: /var/lib/perf-agent/gpu
+
+  containers:
+    # ---------------------------------------------------------------- app --
+    - name: pytorch
+      image: pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
+      command: ["python", "-c"]
+      args:
+        - |
+          import torch, time
+          x = torch.randn(4096, 4096, device="cuda")
+          for _ in range(2000):
+              x = (x @ x).relu() * 0.001
+          torch.cuda.synchronize()
+          print("done", flush=True)
+          time.sleep(30)   # keep the process alive so the sidecar can finish
+      env:
+        # The whole injection mechanism. CUDA's loader dlopens this and calls
+        # InitializeInjection. The application is not modified or rebuilt.
+        - name: CUDA_INJECTION64_PATH
+          value: /var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
+        # CUPTI ships with the CUDA TOOLKIT, not the driver, and
+        # nvidia-container-toolkit never injects it. This image carries the
+        # pip CUPTI that PyTorch pulls in; a slimmer image may not, and the
+        # shim will then fail to resolve it.
+        - name: LD_LIBRARY_PATH
+          value: /opt/conda/lib/python3.11/site-packages/nvidia/cuda_cupti/lib
+      volumeMounts:
+        - name: perfagent-shim
+          mountPath: /var/lib/perf-agent/gpu
+          readOnly: true
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+
+    # ------------------------------------------------------------ sidecar --
+    - name: perf-agent
+      image: ghcr.io/dpsoft/perf-agent:latest
+      args:
+        - --gpu
+        - --pid=1                       # PID 1 in the shared namespace
+        - --duration=60s
+        - --gpu-shim=/var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
+        - --gpu-output=/profiles/gpu.pb.gz
+      securityContext:
+        # NOT privileged. Four narrow capabilities, deliberately.
+        #
+        # CAP_SYS_ADMIN is absent and must stay absent -- it is near-root and
+        # is what gets a per-pod agent rejected by admission policy. Keeping
+        # it out is why the USDT consumer attaches through the uprobe_multi
+        # BPF link rather than the perf_uprobe PMU: measured on hardware, the
+        # PMU path fails EACCES under CAP_BPF+CAP_PERFMON and needs
+        # CAP_SYS_ADMIN, while uprobe_multi succeeds without it. That is a
+        # correctness requirement of this securityContext, not a style choice.
+        # It costs a Linux 6.6 floor on the NODE.
+        capabilities:
+          drop: ["ALL"]
+          add:
+            - BPF                  # load programs, create maps and links
+            - PERFMON              # perf_event_open, including system-wide
+            - SYS_PTRACE           # read another process's memory
+            - CHECKPOINT_RESTORE   # /proc/<pid>/map_files
+            # - SYSLOG             # add only for kernel stacks: without it
+            #                      # /proc/kallsyms reads zeros and kernel
+            #                      # symbolization is silently skipped
+        privileged: false
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+      volumeMounts:
+        - name: perfagent-shim
+          # SAME PATH as the app container, on purpose. The requirement is the
+          # same inode; the same path is what makes that auditable by reading
+          # this file.
+          mountPath: /var/lib/perf-agent/gpu
+          readOnly: true
+        - name: profiles
+          mountPath: /profiles
+
+  # The uprobe_multi link requires Linux >= 6.6 on the node. Scheduling on an
+  # older kernel fails at attach with a message about links, not kernels.
+  nodeSelector:
+    nvidia.com/gpu.present: "true"

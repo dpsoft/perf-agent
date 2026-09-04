@@ -156,3 +156,36 @@ func TestCuBLASIsVendorRuntimeNotApplicationCode(t *testing.T) {
 	assert.Equal(t, DomainApplication, Classify(
 		"void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long)", ""))
 }
+
+// perf-agent's own injected callback was being billed to the profiled program.
+//
+// isShimSymbol matched on "on_callback", but the CUPTI adapter's symbol is
+// on_launch (shim/nvidia/cupti_adapter.cc). A frame carrying the shim's module
+// was still caught by isShimModule, so the bug only showed where the module is
+// absent -- which is every frame of a GPU profile, because the GPU builder
+// writes profiles with empty mappings. Measured on a PyTorch MNIST capture:
+// the same function landed in two domains, 45 frames as shim and 60 as app.
+//
+// That is exactly what this file's header says must not happen: "Colouring it
+// as ordinary CPU work would bill the profiler's overhead to the program being
+// profiled."
+func TestOurOwnCallbackIsNeverBilledToTheApplication(t *testing.T) {
+	// The real symbol, as it appears in a GPU profile: no module.
+	assert.Equal(t, DomainProfilerShim,
+		Classify("(anonymous namespace)::on_launch(CUpti_CallbackData const*)", ""))
+	// The AMD counterpart, same shape.
+	assert.Equal(t, DomainProfilerShim,
+		Classify("(anonymous namespace)::on_launch(rocprofiler_callback_tracing_record_t)", ""))
+	// And with a module, which already worked.
+	assert.Equal(t, DomainProfilerShim,
+		Classify("(anonymous namespace)::on_launch(CUpti_CallbackData const*)",
+			"/opt/libperfagent-gpu-nvidia.so"))
+}
+
+// The guard that keeps the fix honest: "on_launch" is a name any program may
+// use, so the vendor callback signature must still be required. A launch
+// handler in the profiled application is the application's own work.
+func TestAnApplicationsOwnOnLaunchIsNotTheProfiler(t *testing.T) {
+	assert.Equal(t, DomainApplication, Classify("myapp::on_launch(int)", ""))
+	assert.Equal(t, DomainApplication, Classify("Renderer::on_launch()", ""))
+}

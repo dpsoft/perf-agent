@@ -319,12 +319,12 @@ func TestPythonFramesInterleavedWithNative(t *testing.T) {
 	pythonFrames := 0
 	for _, s := range prof.Sample {
 		for _, name := range sampleFrameNames(s) {
-			addr, ok := parsePythonFrameName(name)
+			fn, ok := pythonFuncName(name, want)
 			if !ok {
 				continue
 			}
 			pythonFrames++
-			if fn, ok := want[addr]; ok {
+			if fn != "" {
 				seenFuncs[fn]++
 			}
 		}
@@ -488,7 +488,7 @@ func pythonOrderIn(names []string, codes map[string]uint64) (map[string]int, boo
 }
 
 // parsePythonFrameName decodes the "python:0x…" rendering the profiler
-// gives an unsymbolized Python frame (dwarfagent.pythonFrameName).
+// gives an UNRESOLVED Python frame (pyunwind.FrameName).
 func parsePythonFrameName(name string) (uint64, bool) {
 	const prefix = "python:"
 	if !strings.HasPrefix(name, prefix) {
@@ -499,6 +499,47 @@ func parsePythonFrameName(name string) (uint64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// resolvedPythonFrame matches the RESOLVED rendering, "qualname (file.py:12)",
+// and returns the qualname.
+//
+// Both forms have to be recognised, and which one appears is a property of the
+// interpreter rather than of the walk: pyunwind resolves a frame by reading
+// co_qualname out of the live process, and it only has measured code-object
+// offsets for some CPython versions. On an interpreter it has not been
+// measured against, the walk works exactly as well and the frames stay
+// addresses. A test that understood only one form would report a walker
+// failure ("only 0 Python frames") for a naming difference.
+var resolvedPythonFrame = regexp.MustCompile(`^(\S+) \([^()]*\.py:\d+\)$`)
+
+func parseResolvedPythonFrame(name string) (string, bool) {
+	m := resolvedPythonFrame.FindStringSubmatch(name)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// pythonFuncName reduces either rendering to the function this test knows by
+// name. byAddr maps a code-object address to the function defined at it.
+//
+// A resolved frame gives the QUALIFIED name -- "Widget.method_here" -- so the
+// bare function name is the part after the last dot.
+func pythonFuncName(name string, byAddr map[uint64]string) (string, bool) {
+	if addr, ok := parsePythonFrameName(name); ok {
+		// A Python frame either way. byAddr names the ones this workload
+		// defined; an address it does not know is still a Python frame and
+		// still counts toward the lower bound, it just names no function.
+		return byAddr[addr], true
+	}
+	if q, ok := parseResolvedPythonFrame(name); ok {
+		if i := strings.LastIndex(q, "."); i >= 0 {
+			q = q[i+1:]
+		}
+		return q, true
+	}
+	return "", false
 }
 
 // sampleFrameNames renders a sample's frames leaf-first, one entry per

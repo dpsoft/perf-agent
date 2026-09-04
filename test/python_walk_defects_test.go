@@ -178,3 +178,50 @@ func TestParsePythonFrameNameRejectsNativeNames(t *testing.T) {
 		}
 	}
 }
+
+// Both renderings must be understood, and which one a run produces is a
+// property of the interpreter, not of the walk: pyunwind resolves a frame by
+// reading co_qualname out of the live process and only has measured
+// code-object offsets for some CPython versions. On one it has not been
+// measured against, the walk works exactly as well and the frames stay
+// addresses.
+//
+// This exists because the opposite happened: naming the frames turned
+// "python:0x7f…" into "outer_function (target.py:2)", and an assertion that
+// understood only the address form reported "only 0 Python frames in 478
+// samples" -- a walker failure -- for what was a naming improvement.
+func TestPythonFrameNamesAreRecognisedInBothRenderings(t *testing.T) {
+	byAddr := map[uint64]string{0x7f1234567890: "leaf"}
+
+	// Unresolved: named through the address map.
+	if fn, ok := pythonFuncName("python:0x7f1234567890", byAddr); !ok || fn != "leaf" {
+		t.Errorf("unresolved form: got (%q, %v), want (leaf, true)", fn, ok)
+	}
+	// Unresolved and unknown: still a Python frame, just unnamed.
+	if fn, ok := pythonFuncName("python:0xdead", byAddr); !ok || fn != "" {
+		t.Errorf("unknown address: got (%q, %v), want (\"\", true)", fn, ok)
+	}
+	// Resolved: the qualified name reduces to the bare function.
+	for in, want := range map[string]string{
+		"leaf (workload.py:12)":                    "leaf",
+		"Widget.method_here (target.py:4)":         "method_here",
+		"Module._wrapped_call_impl (module.py:17)": "_wrapped_call_impl",
+	} {
+		if fn, ok := pythonFuncName(in, byAddr); !ok || fn != want {
+			t.Errorf("resolved form %q: got (%q, %v), want (%q, true)", in, fn, ok, want)
+		}
+	}
+	// Native frames must not be mistaken for Python ones, or the lower bound
+	// this feeds would pass on a run with no Python frames at all.
+	for _, in := range []string{
+		"at::native::add_kernel(at::TensorIteratorBase&)",
+		"libcuda.so.1+0x4b71c6",
+		"main",
+		"0x7f2c945b2c2b",
+		"some_helper (thing.cc:12)",
+	} {
+		if fn, ok := pythonFuncName(in, byAddr); ok {
+			t.Errorf("native frame %q was read as Python (%q)", in, fn)
+		}
+	}
+}

@@ -26,6 +26,9 @@ import (
 var (
 	renderMu  sync.RWMutex
 	renderers = map[uint32]func(a, b uint64) string{}
+	// namers resolve a frame against the live process it came from. See
+	// RegisterNamer for why this is separate from renderers.
+	namers = map[uint32]func(pid uint32, a, b uint64) (string, bool){}
 )
 
 // RegisterRenderer records how to name one unwinder's frames. Call it from a
@@ -46,6 +49,43 @@ func RegisterRenderer(id uint32, render func(a, b uint64) string) {
 // position in the call path, and this binary cannot name it. Dropping it
 // instead would silently shorten the stack, and symbolizing it as native would
 // invent one.
+// RegisterNamer records how to name one unwinder's frames FOR A GIVEN PROCESS.
+//
+// Separate from RegisterRenderer because naming an interpreter frame properly
+// means reading the target's memory -- a Python code object only says
+// "Widget.method_here" if something reads the PyCodeObject out of the process
+// -- and that needs a pid, which the renderer signature has no room for and
+// should not: a renderer must keep working on a saved profile converted on a
+// laptop, where there is no process to read.
+//
+// A namer returns false when it cannot answer, and the caller then falls back
+// to the renderer's address form. Both are registered: the namer is used
+// during a capture, the renderer for everything after it.
+func RegisterNamer(id uint32, namer func(pid uint32, a, b uint64) (string, bool)) {
+	renderMu.Lock()
+	defer renderMu.Unlock()
+	namers[id] = namer
+}
+
+// FrameNameFor names one interpreter frame in the context of the process it
+// came from, falling back to FrameName when no namer can answer.
+//
+// Call this from a capture path, where the target is still alive. After it
+// exits only FrameName's address form is honest, and a namer that cached what
+// it read during the capture will still answer -- which is how a resolved name
+// outlives the process that explained it.
+func FrameNameFor(pid uint32, id uint32, a, b uint64) string {
+	renderMu.RLock()
+	n := namers[id]
+	renderMu.RUnlock()
+	if n != nil {
+		if s, ok := n(pid, a, b); ok {
+			return s
+		}
+	}
+	return FrameName(id, a, b)
+}
+
 func FrameName(id uint32, a, b uint64) string {
 	renderMu.RLock()
 	f := renderers[id]
@@ -82,6 +122,10 @@ func (s Slot) IsInterp() bool { return s.Unwinder != FrameTagNative }
 
 // Name renders an interpreter slot. Only meaningful when IsInterp.
 func (s Slot) Name() string { return FrameName(s.Unwinder, s.PC, s.Extra) }
+
+// NameFor is Name with the process in hand, so an interpreter frame can be
+// resolved from the live target rather than rendered as an address.
+func (s Slot) NameFor(pid uint32) string { return FrameNameFor(pid, s.Unwinder, s.PC, s.Extra) }
 
 // SplitSlots folds the parallel pcs[]/tags[] arrays into one ordered list of
 // frames -- ONE entry per frame, not per slot.

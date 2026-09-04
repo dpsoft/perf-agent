@@ -2822,7 +2822,12 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 				c.stats.StackInterpFrames++
 				merged = append(merged, symbolize.Frame{
 					Address: sl.PC,
-					Name:    sl.Name(),
+					// NameFor, not Name: this runs during the capture,
+					// while the target is alive, which is the only moment a
+					// Python code object can be read into
+					// "Widget.method_here (train.py:42)". After it exits only
+					// the address form is honest.
+					Name: sl.NameFor(pid),
 					// Not FailureNone: the frame is placed correctly and its
 					// address is real, but nothing named it, and pprof has no
 					// unsymbolized bit of its own to infer that from later.

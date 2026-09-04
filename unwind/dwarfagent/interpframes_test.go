@@ -426,7 +426,7 @@ func TestPythonFrameNameSurvivesTheProfileBuilder(t *testing.T) {
 		Resolver:   resolver,
 	})
 	frames := symbolize.ToProfFrames([]symbolize.Frame{
-		interpSymbolizeFrame(interp.Slot{Unwinder: frameTagInterp, PC: codeObject, Extra: 0x1234}),
+		interpSymbolizeFrame(0, interp.Slot{Unwinder: frameTagInterp, PC: codeObject, Extra: 0x1234}),
 	})
 	builders.AddSample(&pprof.ProfileSample{
 		Pid:         uint32(os.Getpid()),

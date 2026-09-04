@@ -69,7 +69,7 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []interp.Slot) []p
 			// number and collect() runs once per unique stack. The
 			// aggregators count, via countInterpSlots.
 			out = append(out, symbolize.ToProfFrames(
-				[]symbolize.Frame{interpSymbolizeFrame(sl)})...)
+				[]symbolize.Frame{interpSymbolizeFrame(pid, sl)})...)
 			continue
 		}
 		if placeholders {

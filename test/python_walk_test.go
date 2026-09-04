@@ -411,7 +411,7 @@ func pythonSampleDefects(names []string, codes map[string]uint64) []string {
 	outerStart := positions[pythonOuterSegment[0]]
 	natives := 0
 	for i := innerEnd + 1; i < outerStart; i++ {
-		if _, isPython := parsePythonFrameName(names[i]); !isPython {
+		if !isPythonFrame(names[i]) {
 			natives++
 		}
 	}
@@ -422,17 +422,21 @@ func pythonSampleDefects(names []string, codes map[string]uint64) []string {
 	// Every code object at most once. Duplication is the exact failure the
 	// entry-frame stop and the resume cursor prevent, and it renders as a
 	// perfectly plausible stack.
-	counts := map[uint64]int{}
+	// Keyed by an identity that exists in BOTH renderings. Keying by the
+	// code-object address alone counted nothing once the frames were named,
+	// which does not fail the test -- it silently switches this check off,
+	// and a duplication defect would have sailed through looking healthy.
+	counts := map[string]int{}
 	for _, name := range names {
-		if addr, ok := parsePythonFrameName(name); ok {
-			counts[addr]++
+		if key, ok := pythonFrameKey(name); ok {
+			counts[key]++
 		}
 	}
-	for addr, n := range counts {
+	for key, n := range counts {
 		if n > 1 {
 			defects = append(defects, fmt.Sprintf(
-				"code object %#x (%s) appears %d times: the inner segment was re-pushed beneath the outer one",
-				addr, byAddr[addr], n))
+				"Python frame %s appears %d times: the inner segment was re-pushed beneath the outer one",
+				key, n))
 		}
 	}
 
@@ -447,7 +451,7 @@ func pythonSampleDefects(names []string, codes map[string]uint64) []string {
 	// chain to NULL would consume them.
 	nativeTotal := 0
 	for _, name := range names {
-		if _, isPython := parsePythonFrameName(name); !isPython {
+		if !isPythonFrame(name) {
 			nativeTotal++
 		}
 	}
@@ -472,8 +476,13 @@ func pythonOrderIn(names []string, codes map[string]uint64) (map[string]int, boo
 	for _, fn := range want {
 		found := -1
 		for i := at + 1; i < len(names); i++ {
-			addr, ok := parsePythonFrameName(names[i])
-			if ok && addr == codes[fn] {
+			// Either rendering. Matching only the address form made this
+			// report "no sample carried the full interleaved sequence" on a
+			// run whose sequence was entirely present and merely named --
+			// the frames say "leaf (workload.py:12)" once pyunwind can read
+			// the interpreter's code objects.
+			got, ok := pythonFuncName(names[i], byAddrName(codes))
+			if ok && got == fn {
 				found = i
 				break
 			}
@@ -485,6 +494,39 @@ func pythonOrderIn(names []string, codes map[string]uint64) (map[string]int, boo
 		at = found
 	}
 	return positions, true
+}
+
+// isPythonFrame reports whether a frame is a Python one in either rendering.
+func isPythonFrame(name string) bool {
+	if _, ok := parsePythonFrameName(name); ok {
+		return true
+	}
+	_, ok := parseResolvedPythonFrame(name)
+	return ok
+}
+
+// pythonFrameKey identifies a Python frame in a way that survives both
+// renderings: the code object's address when unresolved, its qualified name
+// when resolved. One code object yields one key either way, which is what the
+// duplication check needs.
+func pythonFrameKey(name string) (string, bool) {
+	if addr, ok := parsePythonFrameName(name); ok {
+		return fmt.Sprintf("%#x", addr), true
+	}
+	if q, ok := parseResolvedPythonFrame(name); ok {
+		return q, true
+	}
+	return "", false
+}
+
+// byAddrName inverts the workload's name->code-object map into the
+// address->name form pythonFuncName wants.
+func byAddrName(codes map[string]uint64) map[uint64]string {
+	out := make(map[uint64]string, len(codes))
+	for name, addr := range codes {
+		out[addr] = name
+	}
+	return out
 }
 
 // parsePythonFrameName decodes the "python:0x…" rendering the profiler
@@ -574,7 +616,7 @@ func renderSample(s *profile.Sample) string {
 	for i, loc := range s.Location {
 		name := locationName(loc)
 		kind := "native"
-		if _, ok := parsePythonFrameName(name); ok {
+		if isPythonFrame(name) {
 			kind = "PYTHON"
 		}
 		fmt.Fprintf(&b, "  #%02d %-6s %s\n", i, kind, name)

@@ -33,6 +33,14 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 	`--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232`
 
 // styleSheet is the page chrome — the title line, the two icon buttons, the
+// widthMeaning (in the script below) says what a frame's width measures, and
+// only where that is NOT the obvious thing, so it stays a warning rather than
+// a caption. On a GPU profile every CPU frame is as wide as the DEVICE time
+// launched from it, not the CPU time spent in it; a reader fluent in flame
+// graphs assumes the opposite and the page carries no other signal to correct
+// them (issue #123). It decides from the axis label, so a CPU profile says
+// nothing.
+//
 // one-line note, the fixed status bar, the cursor tooltip and the info panel
 // — plus the frame box itself.
 //
@@ -368,6 +376,15 @@ func rowCSS(maxDepth int) string {
 // swallows N) zooms the flame view to the match or reveals it in the tree.
 // A match outside the tree's current root has no row to scroll to, so the
 // tree drops back to the whole profile rather than doing nothing.
+// widthMeaning, in the script below, says what a frame's width measures — and
+// only where that is NOT the obvious thing, so it stays a warning rather than
+// a caption.
+//
+// On a GPU profile every CPU frame is as wide as the DEVICE time launched from
+// that call path, not the CPU time spent in the frame. A reader fluent in
+// flame graphs assumes the opposite, because that is what the shape means
+// everywhere else, and the page carries no other signal to correct them
+// (issue #123). It decides from the axis label, so a CPU profile says nothing.
 const script = `
 (function(){
 "use strict";
@@ -446,14 +463,6 @@ function detail(it){
   if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
   return s;
 }
-// What this frame's width actually measures.
-//
-// Only said where it is NOT the obvious thing, so it stays a warning rather
-// than a caption. In a GPU profile every CPU frame is as wide as the device
-// time launched from it, not the CPU time spent in it -- a reader who knows
-// flame graphs will assume the opposite, and the profile carries no other
-// signal that would correct them. That semantic was documented only in prose
-// on a page most viewers never open (issue #123).
 function widthMeaning(it,d){
   if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
   switch(d.domain){

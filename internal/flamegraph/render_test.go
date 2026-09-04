@@ -957,3 +957,51 @@ func TestCPUProfilesDoNotExplainWidth(t *testing.T) {
 		t.Error("a CPU page must be identifiable as such from its axis")
 	}
 }
+
+// The shipped script must at least be structurally intact.
+//
+// Nothing in the Go suite parses JavaScript, so a broken script ships and
+// fails only in a browser. That is not hypothetical: removing a prose comment
+// from the asset took the `function widthMeaning(it,d){` line with it, leaving
+// a bare function body, and every Go test still passed.
+//
+// A brace/paren balance is not a parser, but it catches the class of damage a
+// text edit to a template literal actually causes.
+func TestTheShippedScriptIsStructurallyBalanced(t *testing.T) {
+	balance := func(s string, open, close rune) int {
+		depth, inStr, esc := 0, rune(0), false
+		for _, ch := range s {
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case inStr != 0:
+				if ch == inStr {
+					inStr = 0
+				}
+			case ch == '"' || ch == '\'':
+				inStr = ch
+			case ch == open:
+				depth++
+			case ch == close:
+				depth--
+			}
+		}
+		return depth
+	}
+	for name, asset := range map[string]string{"script": script} {
+		if got := balance(asset, '{', '}'); got != 0 {
+			t.Errorf("%s: braces are unbalanced by %d", name, got)
+		}
+		if got := balance(asset, '(', ')'); got != 0 {
+			t.Errorf("%s: parens are unbalanced by %d", name, got)
+		}
+	}
+	// Every function the tooltip path calls must actually be declared.
+	for _, fn := range []string{"function detail(", "function widthMeaning(", "function moduleOf("} {
+		if !strings.Contains(script, fn) {
+			t.Errorf("the script calls but does not declare %q", fn)
+		}
+	}
+}

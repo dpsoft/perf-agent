@@ -89,13 +89,25 @@ func countInterpSlots(slots []interp.Slot, truncatedPair bool) {
 
 // interpSymbolizeFrame is the symbolize.Frame an interpreter slot becomes.
 //
-// Reason is deliberately not FailureNone: the frame is placed correctly and
-// its address is real, but nothing named it, and pprof has no unsymbolized bit
-// of its own to infer that from after the conversion.
-func interpSymbolizeFrame(sl interp.Slot) symbolize.Frame {
+// NameFor rather than Name: naming a Python frame means reading the code
+// object out of the live process, and this runs during collect while the
+// target may still be there. What it reads is cached, so the name survives the
+// process; what it cannot read stays the address form.
+//
+// Reason follows what actually happened. A frame the resolver named IS
+// resolved, and marking it FailureMissingSymbols anyway would render
+// "Widget.method_here (train.py:42)" hatched as unsymbolized -- and, worse,
+// let pprof's builder overwrite the name with module+offset, since that path
+// fires on the unresolved bit alone.
+func interpSymbolizeFrame(pid uint32, sl interp.Slot) symbolize.Frame {
+	name := sl.NameFor(pid)
+	reason := symbolize.FailureMissingSymbols
+	if name != sl.Name() {
+		reason = symbolize.FailureNone
+	}
 	return symbolize.Frame{
 		Address: sl.PC,
-		Name:    sl.Name(),
-		Reason:  symbolize.FailureMissingSymbols,
+		Name:    name,
+		Reason:  reason,
 	}
 }

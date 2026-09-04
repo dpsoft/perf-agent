@@ -68,6 +68,11 @@ const (
 // ParseAutoTSSKeyOffset, so it needs no table entry and survives distro
 // patching. See the spec.
 type Offsets struct {
+	// Code locates the PyCodeObject fields that name a frame. Zero for a
+	// version this build has not been measured against, which makes the
+	// resolver decline and the frame render python:0x… exactly as before.
+	Code CodeOffsets
+
 	// _PyInterpreterFrame
 	FramePrevious uint16 // struct _PyInterpreterFrame *previous
 
@@ -204,6 +209,14 @@ func TableFor(v Version) (Offsets, error) {
 		// at offset 56, and _PyCFrame's own current_frame is its first
 		// field (offset 0).
 		return Offsets{
+			// Measured with offsetof against CPython 3.12.14's own
+			// headers (see offsets_fixture_test.go for the mechanism):
+			// co_filename=112, co_name=120, co_qualname=128,
+			// co_firstlineno=68. co_qualname rather than co_name, because
+			// it is the qualified form -- "Widget.method_here" rather than
+			// "method_here" -- which is what makes a flame graph row
+			// identifiable without its parents.
+			Code:                     CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68},
 			FramePrevious:            8,
 			FrameExecutable:          0,
 			FrameExecutableTagged:    false,

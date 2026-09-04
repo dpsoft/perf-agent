@@ -27,6 +27,23 @@ func init() {
 	interp.RegisterRenderer(UnwinderID, func(codeObject, _ uint64) string {
 		return FrameName(codeObject)
 	})
+	// And the live form. Registered beside the renderer rather than instead
+	// of it: this one needs the process, the other one must keep working when
+	// there is no process left.
+	interp.RegisterNamer(UnwinderID, func(pid uint32, codeObject, _ uint64) (string, bool) {
+		r := resolverFor(pid)
+		if r == nil {
+			return "", false
+		}
+		info, ok := r.Resolve(codeObject)
+		if !ok || info.Qualname == "" {
+			return "", false
+		}
+		if info.Filename == "" {
+			return info.Qualname, true
+		}
+		return fmt.Sprintf("%s (%s:%d)", info.Qualname, baseName(info.Filename), info.FirstLine), true
+	})
 }
 
 // FrameName renders an unsymbolized Python frame. Turning the code object into
@@ -145,11 +162,31 @@ func (m *module) Enroll(pid uint32) (interp.Range, bool, error) {
 		}
 		spans = append(spans, interp.Span{Lo: f.Lo, Hi: f.Hi})
 	}
+	// Install the code-object resolver for this process, now that its
+	// interpreter version -- and therefore whether this build has measured
+	// code offsets for it at all -- is known.
+	//
+	// Here rather than at collect time, because resolution reads the target's
+	// memory and the target is alive exactly now. Names read during the
+	// capture are cached and outlive it; a name first asked for afterwards
+	// cannot be read at all.
+	if off, terr := TableFor(res.Version); terr == nil {
+		if r := NewResolver(int(pid), off.Code); r != nil {
+			InstallResolver(pid, r)
+		} else {
+			log.Printf("python frames: pid %d: CPython %s has no measured code-object "+
+				"offsets in this build; frames stay python:0x…", pid, res.Version)
+		}
+	}
+
 	log.Printf("python frames: pid %d: attached %s (CPython %s)", pid, libPath, res.Version)
 	return interp.Range{TableID: tableID, Spans: spans}, true, nil
 }
 
-func (m *module) Detach(pid uint32) error { return DetachProcess(pid, m.maps) }
+func (m *module) Detach(pid uint32) error {
+	RemoveResolver(pid)
+	return DetachProcess(pid, m.maps)
+}
 
 // Counters renders py_walk_counters as one line.
 //

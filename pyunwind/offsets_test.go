@@ -272,3 +272,38 @@ func TestFrameExecutableTaggedOnlyOn314(t *testing.T) {
 		t.Fatal("3.14: f_executable is a tagged _PyStackRef")
 	}
 }
+
+// Every supported interpreter must be able to name a Python frame.
+//
+// Before this, only 3.12 had measured code-object offsets, so 3.13 and 3.14
+// silently rendered python:0x… -- and Fedora's system interpreter is 3.14, so
+// the default Python on a common distribution got nothing.
+//
+// The three tables carry the SAME values, which is exactly why this asserts
+// per version rather than once: identical values mean a bug returning 3.12's
+// table for everything would be invisible. Each was measured against its own
+// headers and verified against a live interpreter of that version.
+func TestEverySupportedVersionCanNameFrames(t *testing.T) {
+	for _, minor := range []int{12, 13, 14} {
+		off, err := TableFor(Version{Major: 3, Minor: minor})
+		if err != nil {
+			t.Fatalf("3.%d: TableFor: %v", minor, err)
+		}
+		if !off.Code.Measured() {
+			t.Errorf("3.%d: code offsets not measured; its Python frames would stay python:0x…", minor)
+		}
+		if off.Code.Qualname == 0 || off.Code.Filename == 0 {
+			t.Errorf("3.%d: Code = %+v, want non-zero qualname and filename", minor, off.Code)
+		}
+	}
+}
+
+// An unsupported version must decline rather than borrow a neighbour's table.
+// Reading co_qualname at the wrong offset yields a pointer to something that
+// is not a string, and the frame would be named from whatever it happened to
+// find.
+func TestAnUnsupportedVersionHasNoCodeOffsets(t *testing.T) {
+	if _, err := TableFor(Version{Major: 3, Minor: 11}); err == nil {
+		t.Error("3.11 must be refused, not given another version's offsets")
+	}
+}

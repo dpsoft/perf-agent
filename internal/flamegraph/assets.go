@@ -379,6 +379,9 @@ var st=doc.getElementById("st"),mc=doc.getElementById("mc");
 var q=doc.getElementById("q"),tip=doc.getElementById("tip");
 var tree=doc.getElementById("tree");
 var unit=chart.dataset.unit||"",total=+chart.dataset.total||0;
+var mods=(function(){var e=doc.getElementById("modules");if(!e){return [];}
+ try{return JSON.parse(e.textContent)||[];}catch(_){return [];}})();
+function moduleOf(d){var i=d.m;return i===undefined?"":(mods[+i]||"");}
 var idle=st.textContent,zoomTarget=null;
 var axis=chart.getAttribute("aria-label");
 var inverted=false,treeOn=false,treeRoot=null;
@@ -434,12 +437,31 @@ function place(it,x,w,vis){
 }
 function line(it){return it.name+"  ·  "+fmt(it.value)+"  ·  "+pct(it.value)+" of total";}
 function detail(it){
-  var s=line(it),d=it.el.dataset;
+  var s=line(it),d=it.el.dataset,m=moduleOf(d);
   if(it.kids.length&&it.self>0){s+="\nself: "+fmt(it.self);}
-  if(d.module){s+="\nmodule: "+d.module;}
+  if(m){s+="\nmodule: "+m;}
+  var w=widthMeaning(it,d);
+  if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
   if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
   return s;
+}
+// What this frame's width actually measures.
+//
+// Only said where it is NOT the obvious thing, so it stays a warning rather
+// than a caption. In a GPU profile every CPU frame is as wide as the device
+// time launched from it, not the CPU time spent in it -- a reader who knows
+// flame graphs will assume the opposite, and the profile carries no other
+// signal that would correct them. That semantic was documented only in prose
+// on a page most viewers never open (issue #123).
+function widthMeaning(it,d){
+  if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
+  switch(d.domain){
+  case "gpu-kernel": return "width: measured time this kernel ran on the device";
+  case "boundary": return "width: device time launched from this path, sampled one launch in N";
+  case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
+  default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
+  }
 }
 function status(it){st.textContent=it?line(it):(zoomTarget?line(zoomTarget):idle);}
 function showTip(evt,it){

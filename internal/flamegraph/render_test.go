@@ -879,3 +879,81 @@ func TestAModulePathCannotBreakOutOfTheScriptElement(t *testing.T) {
 		t.Errorf("the table is HTML-escaped; JSON.parse cannot read it: %q", table)
 	}
 }
+
+// The module line must survive interning.
+//
+// This regressed once already: detail() reads it as d.module where
+// d = it.el.dataset, and a grep for "dataset.module" misses that alias -- so
+// the interning change looked safe and silently emptied the tooltip's module
+// line. The page must carry a reader for the table, not just the table.
+func TestThePageCanReadItsOwnModuleTable(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{
+			Frames: []string{"main", "work"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 1,
+		}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if !strings.Contains(page, "function moduleOf(") {
+		t.Error("the page has no reader for its module table")
+	}
+	if strings.Contains(page, "d.module") {
+		t.Error("the script still reads the removed data-module attribute")
+	}
+	if !strings.Contains(page, `JSON.parse(e.textContent)`) {
+		t.Error("the table is not parsed from the script element")
+	}
+}
+
+// A GPU profile must say what a frame's width measures, because it is not
+// what a flame graph reader assumes.
+//
+// Under [gpu:launch] a CPU frame is as wide as the device time launched from
+// it, not the CPU time spent in it. Someone fluent in flame graphs will read
+// it the other way and the profile carries no other signal to correct them --
+// this was documented only in prose on an index page (issue #123).
+func TestGPUProfilesExplainWhatWidthMeans(t *testing.T) {
+	var buf bytes.Buffer
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "[gpu:launch]"}, Value: 1}},
+	}
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if !strings.Contains(page, "not CPU time spent here") {
+		t.Error("a GPU page does not tell the reader that width is device time")
+	}
+	for _, want := range []string{
+		"measured time this kernel ran on the device",
+		"whose launch was not stack-sampled",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("missing width explanation: %q", want)
+		}
+	}
+}
+
+// And it must NOT say it on a CPU profile, where width is the obvious thing.
+// A caption on every frame is noise; the line earns its place by appearing
+// only where a reader would otherwise be wrong.
+func TestCPUProfilesDoNotExplainWidth(t *testing.T) {
+	var buf bytes.Buffer
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	// The function is always present (one script for every page); what must
+	// differ is whether it fires, which it decides from the axis label.
+	if !strings.Contains(buf.String(), `aria-label="Flame graph, cpu/nanoseconds"`) {
+		t.Error("a CPU page must be identifiable as such from its axis")
+	}
+}

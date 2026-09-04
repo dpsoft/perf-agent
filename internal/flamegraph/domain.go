@@ -215,13 +215,29 @@ func isShimModule(module string) bool {
 }
 
 // isShimSymbol is the fallback for a shim frame in a profile whose mappings
-// are empty, which is every profile the GPU builder writes today. The CUPTI
-// and rocprofiler callback entry points are the only shim symbols that can
-// appear on a target's stack; requiring both halves keeps an application
-// function innocently named on_callback from being billed to the profiler.
+// are empty, which is every profile the GPU builder writes today.
+//
+// BOTH entry points, not just one. The adapter registers on_callback with
+// CUPTI (shim/nvidia/cupti_adapter.cc:1722) and that dispatches to on_launch
+// (:1598), so both appear on a sampled launch's stack. Matching only
+// on_callback billed the other to the profiled program: measured on a PyTorch
+// MNIST capture, the same on_launch function landed in two domains, 45 frames
+// as shim where a module happened to be known and 60 as APPLICATION where it
+// was not. The file header above says exactly why that is wrong -- "colouring
+// it as ordinary CPU work would bill the profiler's overhead to the program
+// being profiled".
+//
+// The vendor callback signature is still required on both. "on_launch" and
+// "on_callback" are names any program may use; a launch handler in the
+// profiled application is the application's own work, and only the parameter
+// types say whose function this is.
 func isShimSymbol(name string) bool {
-	return strings.Contains(name, "on_callback") &&
-		(strings.Contains(name, "CallbackDomain") || strings.Contains(name, "rocprofiler"))
+	if !strings.Contains(name, "on_callback") && !strings.Contains(name, "on_launch") {
+		return false
+	}
+	return strings.Contains(name, "CallbackDomain") ||
+		strings.Contains(name, "CUpti_CallbackData") ||
+		strings.Contains(name, "rocprofiler")
 }
 
 var vendorModulePrefixes = []string{

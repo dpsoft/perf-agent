@@ -4,31 +4,52 @@ import (
 	"bufio"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// pythonFor returns an interpreter this test can measure against, or skips.
-// The child-process relationship matters: reading /proc/<pid>/mem of a
-// non-child of the same user is refused under the default yama ptrace_scope=1,
-// and the profiler holds CAP_SYS_PTRACE where this test does not.
-func pythonFor(t *testing.T) string {
+// interpretersUnderTest returns every CPython this machine has that the
+// offsets table claims to support, so the live checks run against each rather
+// than against whichever one happens to be first.
+//
+// This matters more than it looks: 3.12, 3.13 and 3.14 carry the SAME
+// code-object offsets, so a test that exercised only one would pass just as
+// happily if the table returned that one's values for every version.
+func interpretersUnderTest(t *testing.T) map[string]string {
 	t.Helper()
-	for _, p := range []string{
+	found := map[string]string{}
+	candidates := []string{
 		"/home/diego/pytorch-profile-test/.venv/bin/python",
-		"python3.12",
-	} {
-		if path, err := exec.LookPath(p); err == nil {
-			out, err := exec.Command(path, "-V").Output()
-			if err == nil && strings.Contains(string(out), "3.12") {
-				return path
-			}
+		"python3.12", "python3.13", "python3.14",
+	}
+	for _, home := range []string{os.Getenv("HOME")} {
+		if home == "" {
+			continue
+		}
+		matches, _ := filepath.Glob(home + "/.local/share/uv/python/cpython-3.1[234].*-linux-x86_64-gnu/bin/python3.1[234]")
+		candidates = append(candidates, matches...)
+	}
+	for _, c := range candidates {
+		path, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(path, "-c", "import sys;print(f\"{sys.version_info.major}.{sys.version_info.minor}\")").Output()
+		if err != nil {
+			continue
+		}
+		v := strings.TrimSpace(string(out))
+		if _, seen := found[v]; !seen {
+			found[v] = path
 		}
 	}
-	t.Skip("no CPython 3.12 available; code offsets are only measured for 3.12")
-	return ""
+	if len(found) == 0 {
+		t.Skip("no supported CPython on this machine")
+	}
+	return found
 }
 
 const namingTarget = `
@@ -45,9 +66,8 @@ time.sleep(60)
 // startNamedTarget runs an interpreter that prints the addresses of code
 // objects whose names the test already knows, so resolution is checked against
 // ground truth rather than against "it returned something".
-func startNamedTarget(t *testing.T) (*exec.Cmd, map[string]uint64) {
+func startNamedTarget(t *testing.T, py string) (*exec.Cmd, map[string]uint64) {
 	t.Helper()
-	py := pythonFor(t)
 	script := t.TempDir() + "/target.py"
 	if err := os.WriteFile(script, []byte(namingTarget), 0o600); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -91,34 +111,42 @@ func startNamedTarget(t *testing.T) (*exec.Cmd, map[string]uint64) {
 	return cmd, addrs
 }
 
-// The whole point: a code object becomes a name a person recognises.
+// The whole point: a code object becomes a name a person recognises, on every
+// interpreter this build claims to support.
 func TestResolvesCodeObjectsToQualifiedNames(t *testing.T) {
-	cmd, addrs := startNamedTarget(t)
-	off := CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68}
-	r := NewResolver(cmd.Process.Pid, off)
-	if r == nil {
-		t.Fatal("resolver declined despite measured offsets")
-	}
+	for version, py := range interpretersUnderTest(t) {
+		t.Run(version, func(t *testing.T) {
+			cmd, addrs := startNamedTarget(t, py)
+			minor, _ := strconv.Atoi(strings.TrimPrefix(version, "3."))
+			off, err := TableFor(Version{Major: 3, Minor: minor})
+			if err != nil {
+				t.Skipf("no offsets table for %s: %v", version, err)
+			}
+			r := NewResolver(cmd.Process.Pid, off.Code)
+			if r == nil {
+				t.Fatalf("%s: resolver declined despite a measured table", version)
+			}
 
-	// co_qualname, not co_name: a method must carry its class, or a flame
-	// graph row reading "method_here" is unidentifiable among the dozens of
-	// classes that have one.
-	info, ok := r.Resolve(addrs["method_here"])
-	if !ok {
-		t.Fatalf("could not resolve the method's code object")
-	}
-	if info.Qualname != "Widget.method_here" {
-		t.Errorf("Qualname = %q, want %q (qualified, not bare co_name)", info.Qualname, "Widget.method_here")
-	}
-	if !strings.HasSuffix(info.Filename, "target.py") {
-		t.Errorf("Filename = %q, want it to end in target.py", info.Filename)
-	}
-	if info.FirstLine == 0 {
-		t.Errorf("FirstLine = 0, want the def's line")
-	}
-
-	if got := r.Name(addrs["outer_function"]); !strings.HasPrefix(got, "outer_function (target.py:") {
-		t.Errorf("Name = %q, want it to start with outer_function (target.py:", got)
+			// co_qualname, not co_name: a method must carry its class, or a
+			// flame graph row reading "method_here" is unidentifiable among
+			// the dozens of classes that have one.
+			info, ok := r.Resolve(addrs["method_here"])
+			if !ok {
+				t.Fatalf("%s: could not resolve the method's code object", version)
+			}
+			if info.Qualname != "Widget.method_here" {
+				t.Errorf("%s: Qualname = %q, want %q", version, info.Qualname, "Widget.method_here")
+			}
+			if !strings.HasSuffix(info.Filename, "target.py") {
+				t.Errorf("%s: Filename = %q, want it to end in target.py", version, info.Filename)
+			}
+			if info.FirstLine == 0 {
+				t.Errorf("%s: FirstLine = 0, want the def's line", version)
+			}
+			if got := r.Name(addrs["outer_function"]); !strings.HasPrefix(got, "outer_function (target.py:") {
+				t.Errorf("%s: Name = %q", version, got)
+			}
+		})
 	}
 }
 
@@ -126,7 +154,7 @@ func TestResolvesCodeObjectsToQualifiedNames(t *testing.T) {
 // per sample would both cost a syscall per frame and stop working the moment
 // the target exits -- which is exactly when a profiler builds its output.
 func TestResolutionIsCachedPerCodeObject(t *testing.T) {
-	cmd, addrs := startNamedTarget(t)
+	cmd, addrs := startNamedTarget(t, anyInterpreter(t))
 	r := NewResolver(cmd.Process.Pid, CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68})
 
 	for range 50 {
@@ -146,7 +174,7 @@ func TestResolutionIsCachedPerCodeObject(t *testing.T) {
 // A name read after the target exits would be a name read from nothing. The
 // cache must answer anyway -- that is what it is for.
 func TestCachedNamesSurviveTheProcess(t *testing.T) {
-	cmd, addrs := startNamedTarget(t)
+	cmd, addrs := startNamedTarget(t, anyInterpreter(t))
 	r := NewResolver(cmd.Process.Pid, CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68})
 	want, ok := r.Resolve(addrs["method_here"])
 	if !ok {
@@ -179,4 +207,14 @@ func TestUnmeasuredInterpreterDeclines(t *testing.T) {
 	if got := nilResolver.Name(0x1234); got != "python:0x1234" {
 		t.Errorf("Name = %q, want the unresolved form python:0x1234", got)
 	}
+}
+
+// anyInterpreter returns one supported CPython, for the checks that are about
+// the resolver's behaviour rather than about a version's layout.
+func anyInterpreter(t *testing.T) string {
+	t.Helper()
+	for _, py := range interpretersUnderTest(t) {
+		return py
+	}
+	return ""
 }

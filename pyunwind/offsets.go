@@ -239,6 +239,18 @@ func TableFor(v Version) (Offsets, error) {
 		// int stacktop; uint16_t return_offset; char owner; ... }.
 		// _PyCFrame is gone; PyThreadState has current_frame directly.
 		return Offsets{
+			// Measured with offsetof against CPython 3.13.15's own headers:
+			// co_filename=112, co_name=120, co_qualname=128,
+			// co_firstlineno=68 -- the SAME values as 3.12 and 3.13.
+			//
+			// Identical values are a hazard as well as a convenience: a bug
+			// that returned 3.12's table for every version would be invisible
+			// here. Each was measured separately against its own headers, and
+			// each was then verified end to end by resolving known functions
+			// out of a live interpreter of that version -- including Fedora's
+			// system 3.14.3, which is a different build from the 3.14.7 the
+			// offsets were taken from.
+			Code:                     CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68},
 			FramePrevious:            8,
 			FrameExecutable:          0,
 			FrameExecutableTagged:    false,
@@ -268,6 +280,18 @@ func TableFor(v Version) (Offsets, error) {
 		// FrameOwnerCStack is 4. PyThreadState kept current_frame directly,
 		// at the same offset as 3.13.
 		return Offsets{
+			// Measured with offsetof against CPython 3.14.7's own headers:
+			// co_filename=112, co_name=120, co_qualname=128,
+			// co_firstlineno=68 -- the SAME values as 3.12 and 3.13.
+			//
+			// Identical values are a hazard as well as a convenience: a bug
+			// that returned 3.12's table for every version would be invisible
+			// here. Each was measured separately against its own headers, and
+			// each was then verified end to end by resolving known functions
+			// out of a live interpreter of that version -- including Fedora's
+			// system 3.14.3, which is a different build from the 3.14.7 the
+			// offsets were taken from.
+			Code:                     CodeOffsets{Qualname: 128, Filename: 112, FirstLine: 68},
 			FramePrevious:            8,
 			FrameExecutable:          0,
 			FrameExecutableTagged:    true,

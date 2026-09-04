@@ -1,6 +1,7 @@
 package flamegraph
 
 import (
+	"bytes"
 	"fmt"
 	"html"
 	"regexp"
@@ -754,5 +755,127 @@ func TestTheShippedAssetsCarryNoProseComments(t *testing.T) {
 			assert.False(t, strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*"),
 				"%s line %d is a comment shipped to every reader; explain it in a Go comment instead: %s", name, i+1, line)
 		}
+	}
+}
+
+// Modules are declared once and referenced by index.
+//
+// Measured before this: data-module was 566,966 bytes of a 3,165,745-byte page
+// -- 18% -- for THIRTEEN distinct values totalling about a kilobyte, and
+// nothing read it. Repeating a handful of strings across tens of thousands of
+// frames is page weight, not information, and the renderer already applies the
+// same rule to colour: a domain carries a class, not an inline fill.
+func TestModulesAreDeclaredOnceAndReferencedByIndex(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"main", "work"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 1},
+			{Frames: []string{"main", "more"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 2},
+		},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	page := buf.String()
+
+	// The paths appear in the table...
+	if !strings.Contains(page, `id="modules"`) {
+		t.Fatal("no module table emitted")
+	}
+	for _, m := range []string{"/usr/bin/app", "/lib/libc.so.6"} {
+		if strings.Count(page, m) != 1 {
+			t.Errorf("module %q appears %d times; it must be declared exactly once",
+				m, strings.Count(page, m))
+		}
+	}
+	// ...and the frames reference it by index rather than repeating it.
+	if strings.Contains(page, "data-module=") {
+		t.Error("frames still carry the full module path")
+	}
+	if !strings.Contains(page, "data-m=") {
+		t.Error("frames carry no module reference at all")
+	}
+}
+
+// A profile with no mappings must not pay for a table it would never
+// reference. GPU profiles are written with empty mappings, so this is the
+// common case rather than a corner.
+func TestNoModuleTableWhenThereAreNoModules(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(buf.String(), `id="modules"`) {
+		t.Error("emitted a module table for a profile with no modules")
+	}
+}
+
+// The same profile must render byte-identical every time. An
+// insertion-ordered table would make the page depend on tree-walk order and
+// turn any future reordering into a spurious diff.
+func TestModuleTableIsDeterministic(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"a", "b"}, Modules: []string{"/z/last.so", "/a/first.so"}, Value: 1},
+			{Frames: []string{"a", "c"}, Modules: []string{"/z/last.so", "/m/mid.so"}, Value: 2},
+		},
+	}
+	var first string
+	for i := range 5 {
+		var buf bytes.Buffer
+		if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if i == 0 {
+			first = buf.String()
+			continue
+		}
+		if buf.String() != first {
+			t.Fatal("render is not byte-identical across runs")
+		}
+	}
+	// Sorted, so the index of a path does not depend on where it was found.
+	if !strings.Contains(first, `["/a/first.so","/m/mid.so","/z/last.so"]`) {
+		t.Errorf("module table is not sorted: %s", first[strings.Index(first, `id="modules"`):strings.Index(first, `id="modules"`)+140])
+	}
+}
+
+// A module path cannot close the script element early.
+//
+// The table is JSON inside <script>, where HTML entities are NOT decoded --
+// so it must not be HTML-escaped, and the protection has to come from the JSON
+// encoding instead. json.Marshal writes < > & as \u003c \u003e \u0026, which
+// makes "</script>" unrepresentable. Asserted, because escaping this context
+// wrongly fails only in a browser, long after every Go test has passed.
+func TestAModulePathCannotBreakOutOfTheScriptElement(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{
+			Frames:  []string{"a", "b"},
+			Modules: []string{"/x/ok.so", `/evil/</script><img src=x onerror=alert(1)>.so`},
+			Value:   1,
+		}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	start := strings.Index(page, `id="modules"`)
+	end := strings.Index(page[start:], "</script>") + start
+	table := page[start:end]
+
+	if strings.Contains(table, "</script") || strings.Contains(table, "<img") {
+		t.Errorf("the module table can be broken out of: %q", table)
+	}
+	// And it must still be valid JSON, not HTML-escaped mush.
+	if strings.Contains(table, "&#34;") || strings.Contains(table, "&amp;") {
+		t.Errorf("the table is HTML-escaped; JSON.parse cannot read it: %q", table)
 	}
 }

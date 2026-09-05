@@ -434,6 +434,11 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 		cls, pct(n.x), pct(n.width),
 		html.EscapeString(accessibleName(n, unit, total)),
 		html.EscapeString(n.domain.Info().Key), n.value)
+	// Resolution is emitted alongside the domain, not folded into it: they
+	// answer different questions and a reader needs both. See resolution.go.
+	if r := ResolutionOf(n.name); r != ResolutionResolved {
+		ew.f(` data-resolution="%s"`, r.Info().Key)
+	}
 	if n.module != "" {
 		// An index into the page's module table, not the string. See
 		// writeChart.

@@ -460,8 +460,19 @@ function detail(it){
   var w=widthMeaning(it,d);
   if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
-  if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
+  var r=resolutionNote(d);
+  if(r){s+="\n"+r;}
   return s;
+}
+function resolutionNote(d){
+  switch(d.resolution){
+  case "module-offset": return "no symbol here, but the module is known \u2014 this offset is stable across ASLR and can be matched against symbol data for the same build";
+  case "bare-address": return "no symbol and no module: the frame's position is real, nothing else about it is known";
+  case "obfuscated": return "symbolized by NVIDIA's symbol server \u2014 a stable identifier for an internal function, not a human-readable name. Not a symbolization failure";
+  case "interpreter": return "interpreter frame placed correctly; its code object could not be read";
+  }
+  if(d.domain==="unsym"){return "no symbol: the unwind found this frame, nothing could name it";}
+  return "";
 }
 function widthMeaning(it,d){
   if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}

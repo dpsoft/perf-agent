@@ -1,6 +1,7 @@
 package flamegraph
 
 import (
+	"bytes"
 	"fmt"
 	"html"
 	"regexp"
@@ -753,6 +754,254 @@ func TestTheShippedAssetsCarryNoProseComments(t *testing.T) {
 			line := strings.TrimSpace(l)
 			assert.False(t, strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*"),
 				"%s line %d is a comment shipped to every reader; explain it in a Go comment instead: %s", name, i+1, line)
+		}
+	}
+}
+
+// Modules are declared once and referenced by index.
+//
+// Measured before this: data-module was 566,966 bytes of a 3,165,745-byte page
+// -- 18% -- for THIRTEEN distinct values totalling about a kilobyte, and
+// nothing read it. Repeating a handful of strings across tens of thousands of
+// frames is page weight, not information, and the renderer already applies the
+// same rule to colour: a domain carries a class, not an inline fill.
+func TestModulesAreDeclaredOnceAndReferencedByIndex(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"main", "work"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 1},
+			{Frames: []string{"main", "more"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 2},
+		},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	page := buf.String()
+
+	// The paths appear in the table...
+	if !strings.Contains(page, `id="modules"`) {
+		t.Fatal("no module table emitted")
+	}
+	for _, m := range []string{"/usr/bin/app", "/lib/libc.so.6"} {
+		if strings.Count(page, m) != 1 {
+			t.Errorf("module %q appears %d times; it must be declared exactly once",
+				m, strings.Count(page, m))
+		}
+	}
+	// ...and the frames reference it by index rather than repeating it.
+	if strings.Contains(page, "data-module=") {
+		t.Error("frames still carry the full module path")
+	}
+	if !strings.Contains(page, "data-m=") {
+		t.Error("frames carry no module reference at all")
+	}
+}
+
+// A profile with no mappings must not pay for a table it would never
+// reference. GPU profiles are written with empty mappings, so this is the
+// common case rather than a corner.
+func TestNoModuleTableWhenThereAreNoModules(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(buf.String(), `id="modules"`) {
+		t.Error("emitted a module table for a profile with no modules")
+	}
+}
+
+// The same profile must render byte-identical every time. An
+// insertion-ordered table would make the page depend on tree-walk order and
+// turn any future reordering into a spurious diff.
+func TestModuleTableIsDeterministic(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"a", "b"}, Modules: []string{"/z/last.so", "/a/first.so"}, Value: 1},
+			{Frames: []string{"a", "c"}, Modules: []string{"/z/last.so", "/m/mid.so"}, Value: 2},
+		},
+	}
+	var first string
+	for i := range 5 {
+		var buf bytes.Buffer
+		if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if i == 0 {
+			first = buf.String()
+			continue
+		}
+		if buf.String() != first {
+			t.Fatal("render is not byte-identical across runs")
+		}
+	}
+	// Sorted, so the index of a path does not depend on where it was found.
+	if !strings.Contains(first, `["/a/first.so","/m/mid.so","/z/last.so"]`) {
+		t.Errorf("module table is not sorted: %s", first[strings.Index(first, `id="modules"`):strings.Index(first, `id="modules"`)+140])
+	}
+}
+
+// A module path cannot close the script element early.
+//
+// The table is JSON inside <script>, where HTML entities are NOT decoded --
+// so it must not be HTML-escaped, and the protection has to come from the JSON
+// encoding instead. json.Marshal writes < > & as \u003c \u003e \u0026, which
+// makes "</script>" unrepresentable. Asserted, because escaping this context
+// wrongly fails only in a browser, long after every Go test has passed.
+func TestAModulePathCannotBreakOutOfTheScriptElement(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{
+			Frames:  []string{"a", "b"},
+			Modules: []string{"/x/ok.so", `/evil/</script><img src=x onerror=alert(1)>.so`},
+			Value:   1,
+		}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	start := strings.Index(page, `id="modules"`)
+	end := strings.Index(page[start:], "</script>") + start
+	table := page[start:end]
+
+	if strings.Contains(table, "</script") || strings.Contains(table, "<img") {
+		t.Errorf("the module table can be broken out of: %q", table)
+	}
+	// And it must still be valid JSON, not HTML-escaped mush.
+	if strings.Contains(table, "&#34;") || strings.Contains(table, "&amp;") {
+		t.Errorf("the table is HTML-escaped; JSON.parse cannot read it: %q", table)
+	}
+}
+
+// The module line must survive interning.
+//
+// This regressed once already: detail() reads it as d.module where
+// d = it.el.dataset, and a grep for "dataset.module" misses that alias -- so
+// the interning change looked safe and silently emptied the tooltip's module
+// line. The page must carry a reader for the table, not just the table.
+func TestThePageCanReadItsOwnModuleTable(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{
+			Frames: []string{"main", "work"}, Modules: []string{"/usr/bin/app", "/lib/libc.so.6"}, Value: 1,
+		}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if !strings.Contains(page, "function moduleOf(") {
+		t.Error("the page has no reader for its module table")
+	}
+	if strings.Contains(page, "d.module") {
+		t.Error("the script still reads the removed data-module attribute")
+	}
+	if !strings.Contains(page, `JSON.parse(e.textContent)`) {
+		t.Error("the table is not parsed from the script element")
+	}
+}
+
+// A GPU profile must say what a frame's width measures, because it is not
+// what a flame graph reader assumes.
+//
+// Under [gpu:launch] a CPU frame is as wide as the device time launched from
+// it, not the CPU time spent in it. Someone fluent in flame graphs will read
+// it the other way and the profile carries no other signal to correct them --
+// this was documented only in prose on an index page (issue #123).
+func TestGPUProfilesExplainWhatWidthMeans(t *testing.T) {
+	var buf bytes.Buffer
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "[gpu:launch]"}, Value: 1}},
+	}
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if !strings.Contains(page, "not CPU time spent here") {
+		t.Error("a GPU page does not tell the reader that width is device time")
+	}
+	for _, want := range []string{
+		"measured time this kernel ran on the device",
+		"whose launch was not stack-sampled",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("missing width explanation: %q", want)
+		}
+	}
+}
+
+// And it must NOT say it on a CPU profile, where width is the obvious thing.
+// A caption on every frame is noise; the line earns its place by appearing
+// only where a reader would otherwise be wrong.
+func TestCPUProfilesDoNotExplainWidth(t *testing.T) {
+	var buf bytes.Buffer
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	// The function is always present (one script for every page); what must
+	// differ is whether it fires, which it decides from the axis label.
+	if !strings.Contains(buf.String(), `aria-label="Flame graph, cpu/nanoseconds"`) {
+		t.Error("a CPU page must be identifiable as such from its axis")
+	}
+}
+
+// The shipped script must at least be structurally intact.
+//
+// Nothing in the Go suite parses JavaScript, so a broken script ships and
+// fails only in a browser. That is not hypothetical: removing a prose comment
+// from the asset took the `function widthMeaning(it,d){` line with it, leaving
+// a bare function body, and every Go test still passed.
+//
+// A brace/paren balance is not a parser, but it catches the class of damage a
+// text edit to a template literal actually causes.
+func TestTheShippedScriptIsStructurallyBalanced(t *testing.T) {
+	balance := func(s string, open, close rune) int {
+		depth, inStr, esc := 0, rune(0), false
+		for _, ch := range s {
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case inStr != 0:
+				if ch == inStr {
+					inStr = 0
+				}
+			case ch == '"' || ch == '\'':
+				inStr = ch
+			case ch == open:
+				depth++
+			case ch == close:
+				depth--
+			}
+		}
+		return depth
+	}
+	for name, asset := range map[string]string{"script": script} {
+		if got := balance(asset, '{', '}'); got != 0 {
+			t.Errorf("%s: braces are unbalanced by %d", name, got)
+		}
+		if got := balance(asset, '(', ')'); got != 0 {
+			t.Errorf("%s: parens are unbalanced by %d", name, got)
+		}
+	}
+	// Every function the tooltip path calls must actually be declared.
+	for _, fn := range []string{"function detail(", "function widthMeaning(", "function moduleOf("} {
+		if !strings.Contains(script, fn) {
+			t.Errorf("the script calls but does not declare %q", fn)
 		}
 	}
 }

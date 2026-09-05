@@ -33,6 +33,14 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 	`--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232`
 
 // styleSheet is the page chrome — the title line, the two icon buttons, the
+// widthMeaning (in the script below) says what a frame's width measures, and
+// only where that is NOT the obvious thing, so it stays a warning rather than
+// a caption. On a GPU profile every CPU frame is as wide as the DEVICE time
+// launched from it, not the CPU time spent in it; a reader fluent in flame
+// graphs assumes the opposite and the page carries no other signal to correct
+// them (issue #123). It decides from the axis label, so a CPU profile says
+// nothing.
+//
 // one-line note, the fixed status bar, the cursor tooltip and the info panel
 // — plus the frame box itself.
 //
@@ -368,6 +376,15 @@ func rowCSS(maxDepth int) string {
 // swallows N) zooms the flame view to the match or reveals it in the tree.
 // A match outside the tree's current root has no row to scroll to, so the
 // tree drops back to the whole profile rather than doing nothing.
+// widthMeaning, in the script below, says what a frame's width measures — and
+// only where that is NOT the obvious thing, so it stays a warning rather than
+// a caption.
+//
+// On a GPU profile every CPU frame is as wide as the DEVICE time launched from
+// that call path, not the CPU time spent in the frame. A reader fluent in
+// flame graphs assumes the opposite, because that is what the shape means
+// everywhere else, and the page carries no other signal to correct them
+// (issue #123). It decides from the axis label, so a CPU profile says nothing.
 const script = `
 (function(){
 "use strict";
@@ -379,6 +396,9 @@ var st=doc.getElementById("st"),mc=doc.getElementById("mc");
 var q=doc.getElementById("q"),tip=doc.getElementById("tip");
 var tree=doc.getElementById("tree");
 var unit=chart.dataset.unit||"",total=+chart.dataset.total||0;
+var mods=(function(){var e=doc.getElementById("modules");if(!e){return [];}
+ try{return JSON.parse(e.textContent)||[];}catch(_){return [];}})();
+function moduleOf(d){var i=d.m;return i===undefined?"":(mods[+i]||"");}
 var idle=st.textContent,zoomTarget=null;
 var axis=chart.getAttribute("aria-label");
 var inverted=false,treeOn=false,treeRoot=null;
@@ -434,12 +454,23 @@ function place(it,x,w,vis){
 }
 function line(it){return it.name+"  ·  "+fmt(it.value)+"  ·  "+pct(it.value)+" of total";}
 function detail(it){
-  var s=line(it),d=it.el.dataset;
+  var s=line(it),d=it.el.dataset,m=moduleOf(d);
   if(it.kids.length&&it.self>0){s+="\nself: "+fmt(it.self);}
-  if(d.module){s+="\nmodule: "+d.module;}
+  if(m){s+="\nmodule: "+m;}
+  var w=widthMeaning(it,d);
+  if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
   if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
   return s;
+}
+function widthMeaning(it,d){
+  if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
+  switch(d.domain){
+  case "gpu-kernel": return "width: measured time this kernel ran on the device";
+  case "boundary": return "width: device time launched from this path, sampled one launch in N";
+  case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
+  default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
+  }
 }
 function status(it){st.textContent=it?line(it):(zoomTarget?line(zoomTarget):idle);}
 function showTip(evt,it){

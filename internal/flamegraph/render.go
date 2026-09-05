@@ -376,10 +376,17 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 	}
 	layout(root, 0, 100/float64(root.value))
 
+	// Modules are declared once for the page and referenced by index, for the
+	// same reason colour is: a handful of distinct values repeated across
+	// every frame is page weight, not information. Measured on a PyTorch CPU
+	// capture, data-module was 566,966 bytes of a 3,165,745-byte page -- 18%
+	// -- for THIRTEEN distinct values totalling about a kilobyte.
+	mods := internModules(root)
 	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s">`+"\n",
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
-	writeNode(ew, root, res.Unit, root.value)
+	writeModuleTable(ew, mods)
+	writeNode(ew, root, res.Unit, root.value, mods)
 	ew.s("</div>\n")
 	return ew.err
 }
@@ -411,7 +418,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 // The label is deliberately terse — name, value, share. Domain, module and
 // the inference note stay in the visual tooltip; a screen reader user
 // scanning twenty frames does not want three sentences on each.
-func writeNode(ew *errWriter, n *node, unit string, total int64) {
+func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable) {
 	cls := fmt.Sprintf("frame d%d", n.depth)
 	if n.inexact > 0 {
 		cls += " inexact"
@@ -428,7 +435,9 @@ func writeNode(ew *errWriter, n *node, unit string, total int64) {
 		html.EscapeString(accessibleName(n, unit, total)),
 		html.EscapeString(n.domain.Info().Key), n.value)
 	if n.module != "" {
-		ew.f(` data-module="%s"`, html.EscapeString(n.module))
+		// An index into the page's module table, not the string. See
+		// writeChart.
+		ew.f(` data-m="%d"`, mods.index[n.module])
 	}
 	if n.inexact > 0 {
 		ew.f(` data-inexact="%d"`, n.inexact)
@@ -440,7 +449,7 @@ func writeNode(ew *errWriter, n *node, unit string, total int64) {
 	ew.s("</div>\n")
 
 	for _, c := range n.children {
-		writeNode(ew, c, unit, total)
+		writeNode(ew, c, unit, total, mods)
 	}
 }
 

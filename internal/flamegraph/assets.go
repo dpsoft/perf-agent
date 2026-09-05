@@ -232,6 +232,9 @@ const paletteCSS = `
 
   --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
   --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
 
   --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
   --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
@@ -262,13 +265,21 @@ const paletteCSS = `
 [data-domain="system"]{--fill-x:var(--fill-system)}
 [data-domain="kernel"]{--fill-x:var(--fill-kernel)}
 [data-domain="vendor"]{--fill-x:var(--fill-vendor)}
-[data-domain="unsym"]{--fill-x:var(--fill-unsym);background-image:var(--hatch-gap)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
 [data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
 [data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
 [data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
 [data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
 .frame.inexact{background-image:var(--hatch-inf)}
-.frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
 
 .frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
 .frame.match{background-color:var(--fill-match)}

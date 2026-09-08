@@ -166,6 +166,56 @@ libperfagent-gpu-stub.so: CXXFLAGS += -g -fno-omit-frame-pointer -fasynchronous-
 # -fvisibility=hidden comes from CXXFLAGS and is what keeps core/ from leaking
 # symbols into somebody else's address space; InitializeInjection carries an
 # explicit default-visibility attribute to survive it (see cupti_adapter.cc).
+# The portable build: what a release ships.
+#
+# The ordinary `nvidia' target builds against whatever toolchain this machine
+# has, which is correct for local work and wrong for anything injected into
+# someone else's process. Measured, the local build required glibc 2.42 and
+# failed to dlopen on Ubuntu 22.04, 24.04 and 25.04 -- essentially every
+# PyTorch image -- while loading perfectly here, which is why nothing caught
+# it. See issue #121.
+#
+# Built in a container with an old glibc, because the floor is set by the
+# oldest symbol the linker is willing to reference and there is no flag that
+# lowers it after the fact: __isoc23_* comes from g++ predefining _GNU_SOURCE
+# unconditionally, reproduced across every C++ std mode, so the baseline has
+# to BE old. ubuntu:22.04 gives glibc 2.35 and takes the requirement to 2.34.
+#
+# -mtls-dialect=gnu removes GLIBC_ABI_GNU2_TLS, which is a marker rather than
+# a version: it is satisfied only by glibc 2.42 however low the numeric
+# requirements are, and it was the actual cause of the load failures. It is
+# not a GCC default; it is a distro configure choice that Fedora makes.
+#
+# -static-libstdc++ -static-libgcc make the shim immune to the TARGET's C++
+# runtime, which matters because conda and PyTorch ship their own, older one.
+# Safe only alongside the visibility discipline already in CXXFLAGS and
+# nvidia/export.map: without those, static linking leaks ~200 std:: symbols
+# into the dynamic table where they are preemptible against the host's.
+PORTABLE_IMAGE ?= ubuntu:22.04
+PORTABLE_GLIBC ?= 2.34
+
+nvidia-portable: check-cupti-guard
+	podman run --rm --security-opt label=disable \
+		-v $(CURDIR)/..:/src:ro -v $(CUDA_HOME):/cuda:ro -v $(CURDIR):/out \
+		$(PORTABLE_IMAGE) sh -c '\
+		  export DEBIAN_FRONTEND=noninteractive; \
+		  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq g++ >/dev/null 2>&1; \
+		  cd /src/shim && \
+		  g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
+		      -mtls-dialect=gnu -pthread -I core -I /cuda/targets/x86_64-linux/include \
+		      -shared -o /out/libperfagent-gpu-nvidia.portable.so \
+		      nvidia/cupti_adapter.cc $(CORE_SRC) \
+		      -Wl,--version-script=nvidia/export.map \
+		      -Wl,-soname,libperfagent-gpu-nvidia.so.1 \
+		      -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL \
+		      -L /cuda/targets/x86_64-linux/lib -lcupti'
+	@echo "checking the portable shim:"
+	@./elfgate.sh libperfagent-gpu-nvidia.portable.so $(PORTABLE_GLIBC)
+
+# The gate on its own, for the shim built however the caller built it.
+elfgate: libperfagent-gpu-nvidia.so
+	@./elfgate.sh $< $(PORTABLE_GLIBC)
+
 nvidia: check-cupti-guard libperfagent-gpu-nvidia.so
 libperfagent-gpu-nvidia.so: nvidia/cupti_adapter.cc nvidia/export.map $(CORE_SRC)
 	$(CXX) $(CXXFLAGS) -pthread -I core -I $(CUDA_INC) -shared -o $@ \

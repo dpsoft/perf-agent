@@ -92,11 +92,25 @@ spec:
     - name: perf-agent
       image: ghcr.io/dpsoft/perf-agent:latest
       args:
-        - --gpu
-        - --pid=1                       # PID 1 in the shared namespace
-        - --duration=60s
-        - --gpu-shim=/var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
-        - --gpu-output=/profiles/gpu.pb.gz
+        # -discover, NOT a pid.
+        #
+        # Nothing in this container knows the application's pid. The kubelet
+        # started it, this container is not its parent, and no field of the
+        # downward API carries it. An earlier draft of this file guessed
+        # `--pid=1  # PID 1 in the shared namespace`, and that is WRONG:
+        # under shareProcessNamespace pid 1 is the PAUSE container, so the
+        # agent would have attached to pause, found no shim, and profiled
+        # nothing for the whole duration.
+        #
+        # -discover scans /proc for processes mapping the shim below, which is
+        # exactly the set that was started with CUDA_INJECTION64_PATH pointing
+        # at it -- i.e. the ones this pod opted in. It cannot find anything
+        # else: a process that never mapped this file can never fire a probe
+        # attached to it.
+        - -discover
+        - -duration=60s
+        - -shim=/var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
+        - -out=/profiles/gpu.pb.gz
       securityContext:
         # NOT privileged. Four narrow capabilities, deliberately.
         #

@@ -5,24 +5,46 @@ Profile a PyTorch CUDA workload running in Kubernetes, without rebuilding it,
 relinking it, or changing a line of its code — then render the result as a
 flame graph.
 
-> **Status: not runnable yet. This is a target shape, not a demonstration.**
+> **Status: not runnable yet — but for one reason now, not four.**
 >
-> Every other directory under `examples/` runs end-to-end today. This one does
-> not, and the README says so rather than letting you discover it at `kubectl
-> apply`. Two things block it:
+> Every other directory under `examples/` runs end-to-end today. This one still
+> does not, and the README says so rather than letting you discover it at
+> `kubectl apply`. What has changed is that the *design* questions are answered
+> and only packaging is left.
 >
-> 1. **[#121] The shim cannot load into these images.** It is built against
->    glibc 2.42 with a hardcoded `RUNPATH` to the build machine's CUDA 13.3,
->    and measurably fails to load on Ubuntu 22.04, 24.04 and 25.04 — which is
->    what essentially every PyTorch image is. There is also no published shim
->    image; `ghcr.io/dpsoft/perf-agent-shim` does not exist yet.
-> 2. **The sidecar's cross-namespace inode open is untested.** Injection is
->    confirmed on hardware; the agent opening *the same inode* from a
->    *different mount namespace* is the one part of the design nothing has
->    exercised.
+> **Solved since this file was written:**
 >
-> The manifest is here because it is the thing #121 has to make work. It
-> encodes the constraints, so the build fix has a target to satisfy.
+> - **[#121] The shim could not load into these images.** It was built against
+>   glibc 2.42 with a hardcoded `RUNPATH` to the build machine's CUDA 13.3, and
+>   failed to load on Ubuntu 22.04, 24.04 and 25.04 — essentially every PyTorch
+>   image. `make -C shim nvidia-portable` now builds one that loads on all
+>   three, CI gates it, and CUPTI is resolved with `dlopen` at runtime.
+> - **[#124] The agent could not attach to a process it did not start.** It
+>   launched its own workload and took no `-pid`. A sidecar must attach to a
+>   container the kubelet started; that is now `-pid`, and modules loaded
+>   before the attach survive it.
+> - **The sidecar had no way to learn the application's pid.** This manifest
+>   used to guess `--pid=1`, which is the *pause* container under
+>   `shareProcessNamespace`. `-discover` finds targets by the shim's inode
+>   instead, so nothing has to know a pid.
+>
+> **What actually blocks it:**
+>
+> 1. **No published images.** `ghcr.io/dpsoft/perf-agent-shim` and
+>    `ghcr.io/dpsoft/perf-agent` do not exist, and there is no Dockerfile in
+>    the repo to build them from. CI uploads the portable shim as a build
+>    artifact and nothing turns it into an image. This is the whole of what is
+>    missing.
+> 2. **The cross-namespace inode open is still untested.** Injection is
+>    confirmed on hardware and so is attach; the agent opening *the same inode*
+>    from a *different mount namespace* is the one part of the design nothing
+>    has exercised. It is expected to work — the `emptyDir` is mounted into both
+>    containers, so both see the same file — but "expected to" is not
+>    "measured", and this README will not claim otherwise.
+>
+> One caveat on the manifest below: the agent args are `gpu-cuda-profile`'s.
+> There is no unified `perf-agent --gpu` entrypoint yet, so whatever image is
+> published has to run that binary.
 
 ## Why a sidecar, when Parca uses a DaemonSet
 

@@ -611,7 +611,50 @@ func writeLegendBar(ew *errWriter, root *node) {
 		ew.f("<span class=\"c\"><i style=\"%s\"></i>%s</span>",
 			html.EscapeString(style), html.EscapeString(shortLegendLabel(in.Label)))
 	}
+	writeResolutionChips(ew, root)
 	ew.s("\n</div>\n")
+}
+
+// writeResolutionChips is the legend's SECOND axis, in the same bar.
+//
+// Colour says what kind of code a frame is; texture says how well it is
+// named. One channel carrying both facts is what the old legend had to
+// apologise for, and the mock draws the two rows together.
+//
+// "resolved" is deliberately absent: it is the default, every frame that is
+// not marked has it, and a chip for it would be a key to the absence of a
+// mark. Only the resolutions this profile actually contains appear, for the
+// same reason the domain chips work that way.
+func writeResolutionChips(ew *errWriter, root *node) {
+	present := map[Resolution]bool{}
+	var walk func(*node)
+	walk = func(n *node) {
+		// Derived from the name, exactly as writeNode derives it for the
+		// frame's own data-resolution: one function decides, so the key and
+		// the frames it keys can never disagree.
+		if r := ResolutionOf(n.name); n.depth > 0 && r != ResolutionResolved {
+			present[r] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(root)
+	if len(present) == 0 {
+		return
+	}
+	ew.s("<span class=\"sep\"></span>")
+	for _, r := range []Resolution{
+		ResolutionModuleOffset, ResolutionObfuscated,
+		ResolutionInterpreter, ResolutionBareAddress,
+	} {
+		if !present[r] {
+			continue
+		}
+		in := r.Info()
+		ew.f("<span class=\"c\"><i class=\"res\" data-resolution=\"%s\"></i>%s</span>",
+			html.EscapeString(in.Key), html.EscapeString(in.Label))
+	}
 }
 
 // domainsPresent is the set of domains this profile actually contains. The

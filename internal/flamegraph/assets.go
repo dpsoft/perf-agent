@@ -87,6 +87,7 @@ h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width
 .legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block;background-repeat:repeat}
 .legend .sep{width:1px;height:14px;background:var(--line)}
+.legend i.res{background-color:var(--fill-root)}
 #fd{position:fixed;z-index:7;top:96px;right:14px;bottom:44px;width:378px;max-width:calc(100vw - 28px);display:flex;flex-direction:column;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 10px 36px rgb(0 0 0/.16);overflow:hidden}
 #fd[hidden]{display:none}
 body.pinned .canvas,body.pinned .note{margin-right:406px}

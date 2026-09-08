@@ -282,6 +282,29 @@ type Config struct {
 	ShimPath string
 	// PID restricts the attachment to one process; zero is system-wide.
 	PID int
+
+	// EagerPIDs are processes ALREADY RUNNING that map ShimPath, whose CFI
+	// tables must be compiled before the uprobe link exists.
+	//
+	// It is the multi-target form of what a non-zero PID does, and it exists
+	// because the two ways a target can reach this consumer need opposite
+	// treatment. A process that starts LATER is served by the startup
+	// rendezvous: it blocks in its own cuInit until its tables are in, which
+	// is earlier than any poll could manage. A process already past cuInit
+	// can never use that path -- it went through it before this consumer
+	// existed -- so unless its tables are installed here, its first stacks are
+	// walked without them (issue #49 measured that loss at ~38%).
+	//
+	// Left empty for a system-wide attach that is not discovering anything, so
+	// the ordinary launch path is unchanged: there is nothing running to
+	// register, which is exactly why the rendezvous exists.
+	//
+	// Registration is best-effort per pid and never fails the attach, for the
+	// same reason the single-PID path is: a consumer with no CFI tables still
+	// profiles with frame-pointer stacks and says so in
+	// Stats.StacksWalkedNoTables. Refusing to attach would turn a degraded
+	// profile into no profile.
+	EagerPIDs []int
 	// Backend labels the correlation IDs the consumer produces.
 	Backend gpu.GPUBackendID
 	// Sink receives the normalized events.
@@ -1641,6 +1664,16 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		// This is what unwind/dwarfagent does for a per-PID profiler, where
 		// ModeLazy is forced back to ModeEager for the same reason.
 		_, _ = c.unwind.registerNow(uint32(cfg.PID))
+	}
+	// The same thing for a discovered SET of already-running targets. A
+	// system-wide attach that found its targets by scanning still has to
+	// install their tables here: none of them can use the rendezvous, because
+	// all of them are already past the point where it would have caught them.
+	for _, p := range cfg.EagerPIDs {
+		if p <= 0 || p == cfg.PID {
+			continue
+		}
+		_, _ = c.unwind.registerNow(uint32(p)) //nolint:gosec // bounds-checked above
 	}
 	// For a system-wide attach (cfg.PID == 0) there is nothing to register
 	// yet — the target may not even be running, which is exactly the gate's

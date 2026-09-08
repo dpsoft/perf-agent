@@ -44,6 +44,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -72,20 +73,22 @@ import (
 // exists to prevent; a test enumerates the registered set and fails until
 // every name is on one side or the other.
 type options struct {
-	shim        *string
-	workload    *string
-	iters       *int
-	sleepUs     *int
-	period      *int
-	linger      *int
-	out         *string
-	pid         *int
-	duration    *time.Duration
-	drainEvery  *time.Duration
-	waitForShim *time.Duration
-	nvSymbols   *string
-	pcSampling  *string
-	pcAck       *bool
+	shim            *string
+	workload        *string
+	iters           *int
+	sleepUs         *int
+	period          *int
+	linger          *int
+	out             *string
+	pid             *int
+	discover        *bool
+	rediscoverEvery *time.Duration
+	duration        *time.Duration
+	drainEvery      *time.Duration
+	waitForShim     *time.Duration
+	nvSymbols       *string
+	pcSampling      *string
+	pcAck           *bool
 }
 
 func defineFlags(fs *flag.FlagSet) *options {
@@ -107,6 +110,16 @@ func defineFlags(fs *flag.FlagSet) *options {
 			"profile this already-running process instead of launching a workload. It must "+
 				"have been started with CUDA_INJECTION64_PATH pointing at -shim; injection "+
 				"happens during cuInit and cannot be added to a live process"),
+		discover: fs.Bool("discover", false,
+			"profile EVERY process that maps -shim, found by scanning /proc, instead of "+
+				"being handed one with -pid. This is the shape a sidecar and a node "+
+				"collector need: neither is the application's parent and neither is told "+
+				"its pid"),
+		rediscoverEvery: fs.Duration("rediscover-every", 5*time.Second,
+			"in -discover mode, how often to rescan for targets that appeared or left. "+
+				"Processes that start normally enrol themselves during cuInit and do not "+
+				"need this; the rescan is for ones already past that point, and for "+
+				"noticing when every target has gone"),
 		duration: fs.Duration("duration", 30*time.Second,
 			"how long to profile in -pid mode. The run also ends early on SIGINT or when the "+
 				"target exits"),
@@ -180,13 +193,15 @@ var launchOnlyInAttachMode = map[string]string{
 // configure THIS process -- where the shim is, where the profile goes, how
 // long to run, how symbols are resolved -- rather than the profiled one.
 var attachSafeFlags = map[string]bool{
-	"shim":           true,
-	"out":            true,
-	"nvidia-symbols": true,
-	"pid":            true,
-	"duration":       true,
-	"wait-for-shim":  true,
-	"drain-every":    true,
+	"shim":             true,
+	"out":              true,
+	"nvidia-symbols":   true,
+	"pid":              true,
+	"duration":         true,
+	"wait-for-shim":    true,
+	"drain-every":      true,
+	"discover":         true,
+	"rediscover-every": true,
 }
 
 // refusedLaunchFlags reports the launch-only flags the operator actually set,
@@ -207,6 +222,17 @@ func refusedLaunchFlags(fs *flag.FlagSet) []string {
 // in it, so "evicted 10198 launches" and "evicted 20824 launches" are
 // recognised as one ongoing condition rather than two events.
 var anomalyDigits = regexp.MustCompile(`[0-9]+`)
+
+// describeTargets names what a run covered, in the singular or the plural as
+// the run actually was. "pid 1234" and "3 pids [12 34 56]" are different
+// facts, and a message that said "pid 12" for a three-process collector would
+// misreport the scope of everything else on the line.
+func describeTargets(targets []int) string {
+	if len(targets) == 1 {
+		return fmt.Sprintf("pid %d", targets[0])
+	}
+	return fmt.Sprintf("%d pids %v", len(targets), targets)
+}
 
 func main() {
 	opt := defineFlags(flag.CommandLine)
@@ -229,7 +255,12 @@ func main() {
 	// applied. The profile would then be interpreted at a sampling rate it
 	// was not taken at. Every flag below has that shape: it configures a
 	// process this mode does not create.
-	attach := *opt.pid != 0
+	attach := *opt.pid != 0 || *opt.discover
+	if *opt.pid != 0 && *opt.discover {
+		log.Fatalf("-pid and -discover both name what to profile and disagree about how: " +
+			"-pid is one process you already know, -discover is every process that maps " +
+			"the shim. Pick one")
+	}
 	if attach {
 		if refused := refusedLaunchFlags(flag.CommandLine); len(refused) > 0 {
 			log.Fatalf("-pid was given, so these flags cannot take effect and are refused "+
@@ -322,10 +353,20 @@ func main() {
 	// The wait is for one case only: a process attached to in the seconds
 	// after it started, which has not reached cuInit yet. It is not a retry
 	// loop for a target that will never load the shim.
-	if attach {
+	var targets []int
+	switch {
+	case *opt.discover:
+		var derr error
+		targets, derr = waitForTargets(shimPath, *opt.waitForShim)
+		if derr != nil {
+			log.Fatalf("discover targets: %v", derr)
+		}
+		log.Printf("discovered %d process(es) mapping %s: %v", len(targets), shimPath, targets)
+	case *opt.pid != 0:
 		if err := waitForShimIn(*opt.pid, shimPath, *opt.waitForShim); err != nil {
 			log.Fatalf("attach to pid %d: %v", *opt.pid, err)
 		}
+		targets = []int{*opt.pid}
 		log.Printf("pid %d maps %s; attaching", *opt.pid, shimPath)
 	}
 
@@ -414,7 +455,20 @@ func main() {
 		// tables, which is exactly the ~38% loss issue #49 measured. Here
 		// the window is not merely narrowed but absent: the tables are in
 		// before the first probe exists.
-		PID:        *opt.pid,
+		//
+		// Discovery leaves this ZERO on purpose. PID 0 is not a weaker
+		// attachment than a specific pid, it is the broader one: the
+		// uprobe_multi link then fires in EVERY process mapping the file,
+		// which is precisely the set discovery just enumerated -- and it
+		// keeps covering processes that map it later, which a pid filter
+		// fixed at startup could never do. The narrowing that a pid does buy
+		// is not wanted here; what a specific pid ALSO does -- eager CFI
+		// registration -- is, and that is what EagerPIDs carries.
+		PID: *opt.pid,
+		// Every already-running target, whose tables must exist before the
+		// link does. None of them can use the startup rendezvous: all of them
+		// went past cuInit before this process started.
+		EagerPIDs:  targets,
 		Backend:    gpu.BackendCUPTI,
 		Sink:       timeline,
 		Symbolizer: sym,
@@ -514,7 +568,12 @@ func main() {
 	// it is doing.
 	var launches, wantSampled int
 	if attach {
-		profileAttached(c, *opt.pid, *opt.duration, *opt.drainEvery, collect)
+		targets = profileAttached(c, targets, attachConfig{
+			duration:   *opt.duration,
+			drainEvery: *opt.drainEvery,
+			rediscover: rediscoverInterval(*opt.discover, *opt.rediscoverEvery),
+			shimPath:   shimPath,
+		}, collect)
 	} else {
 		// The sampler jitters each gap around the period so it cannot lock phase
 		// against the workload's alternating axpy/scale pair (issue #50), but the
@@ -609,10 +668,11 @@ func main() {
 		// often a fact about the target -- a process that was idle for the
 		// whole window launches nothing, and there is no defect to report.
 		if attach {
-			log.Fatalf("no samples projected: pid %d launched no kernels in %s. The shim is "+
-				"mapped (checked at startup), so the probes were live; the target was "+
-				"idle, or its CUDA work happens in a different process. stats=%+v",
-				*opt.pid, *opt.duration, c.Stats())
+			log.Fatalf("no samples projected: %v launched no kernels in %s. The shim is "+
+				"mapped (checked at startup), so the probes were live; the targets were "+
+				"idle, or the CUDA work happens in a process that does not map this shim. "+
+				"stats=%+v",
+				describeTargets(targets), *opt.duration, c.Stats())
 		}
 		log.Fatal("no samples projected; the pipeline produced nothing")
 	}
@@ -638,8 +698,8 @@ func main() {
 	// expected_sampled=0 beside a healthy attached run would read as a
 	// shortfall rather than as an inapplicable number.
 	if attach {
-		log.Printf("wrote %s: %d samples from pid %d over %d drain intervals, stats=%+v",
-			*opt.out, totalSamples, *opt.pid, snapshots, st)
+		log.Printf("wrote %s: %d samples from %v over %d drain intervals, stats=%+v",
+			*opt.out, totalSamples, describeTargets(targets), snapshots, st)
 	} else {
 		log.Printf("wrote %s: %d samples, launches=%d expected_sampled=%d stats=%+v",
 			*opt.out, totalSamples, launches, wantSampled, st)
@@ -787,88 +847,128 @@ func waitForShimIn(pid int, shimPath string, within time.Duration) error {
 	}
 }
 
+// attachConfig is how an attached run is bounded and, in discovery mode, kept
+// current. Grouped rather than passed as five positional arguments, because
+// four of them are durations and a transposition would compile.
+type attachConfig struct {
+	duration   time.Duration
+	drainEvery time.Duration
+	// rediscover is zero when there is nothing to rediscover: a -pid run
+	// profiles the one process it was given, and rescanning /proc for it would
+	// be work in service of an answer that cannot change.
+	rediscover time.Duration
+	shimPath   string
+}
+
+// rediscoverInterval is zero unless discovery is actually in use.
+func rediscoverInterval(discover bool, every time.Duration) time.Duration {
+	if !discover || every <= 0 {
+		return 0
+	}
+	return every
+}
+
+// waitForTargets is discovery's precondition, and it is the same refusal
+// waitForShimIn makes, asked of a set rather than of one process.
+//
+// Bounded and then an error, for the same reason: a collector that attaches to
+// nothing and says nothing spends its whole -duration producing an empty
+// profile, which is indistinguishable from a workload that launched no
+// kernels. The wait covers the one legitimate case -- starting alongside an
+// application that has not reached cuInit yet, which is the NORMAL case for a
+// sidecar, since both containers start together.
+func waitForTargets(shimPath string, within time.Duration) ([]int, error) {
+	deadline := time.Now().Add(within)
+	for {
+		found, err := gpuprobe.ProcessesMappingShim(shimPath)
+		if err != nil {
+			return nil, err
+		}
+		if len(found) > 0 {
+			return found, nil
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf(
+				"no process on this host maps %s after %s. The CUDA driver loads the shim "+
+					"during cuInit, from CUDA_INJECTION64_PATH in each process's own "+
+					"environment, so a process not started with it pointing at THIS FILE "+
+					"can never be a target -- and a copy of the shim at another path is a "+
+					"different file to a uprobe, however identical its bytes. Check that "+
+					"the application was started with CUDA_INJECTION64_PATH=%s, that it "+
+					"has reached cuInit, and that this process can see it (a sidecar needs "+
+					"shareProcessNamespace, a node agent needs hostPID)",
+				shimPath, within, shimPath)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // profileAttached bounds a run this command did not start.
 //
-// Three things can end it, and the third is the one that matters for
-// correctness rather than convenience. The duration is the operator's budget.
-// SIGINT is the operator changing their mind, and it must produce the profile
-// collected so far rather than discarding it -- a collector killed at the end
-// of a scrape window that wrote nothing would be worse than useless.
+// Four things can end it, and the last is the one that matters for correctness
+// rather than convenience. The duration is the operator's budget. SIGINT is
+// the operator changing their mind, and it must produce the profile collected
+// so far rather than discarding it -- a collector killed at the end of a
+// scrape window that wrote nothing would be worse than useless.
 //
-// The target exiting ends the run IMMEDIATELY, and not as a courtesy: a
-// sampled launch's stack is symbolized against /proc/<pid>/maps, which the
-// kernel destroys the instant the process leaves. Every second spent
-// collecting after that point produces records whose stacks can no longer be
-// resolved. Launch mode solves this by holding the workload's stdin open;
-// attach mode has no such handle on a process it did not create, so the best
-// it can do is notice and stop.
+// Every target exiting ends the run, and not as a courtesy: a sampled launch's
+// stack is symbolized against /proc/<pid>/maps, which the kernel destroys the
+// instant the process leaves. Every second spent collecting after the last one
+// has gone produces records whose stacks can no longer be resolved. Launch
+// mode solves this by holding the workload's stdin open; attach mode has no
+// such handle on processes it did not create, so the best it can do is notice.
 //
-// A pidfd rather than polling /proc/<pid>: the pid is not ours, so it can be
-// reaped and reused by an unrelated process while we watch. A pidfd is bound
-// to the process, not to the number, and it becomes readable exactly once,
-// when that process dies.
-func profileAttached(c *gpuprobe.Consumer, pid int, d, drainEvery time.Duration, collect func()) {
+// EVERY target, not any: with several processes under one attachment, one
+// exiting is an ordinary event -- pods restart -- and ending the run there
+// would throw away the profiling of everything still running.
+//
+// A pidfd per target rather than polling /proc/<pid>: the pids are not ours,
+// so they can be reaped and reused by unrelated processes while we watch. A
+// pidfd is bound to the process, not to the number.
+func profileAttached(c *gpuprobe.Consumer, targets []int, cfg attachConfig, collect func()) []int {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 
-	gone := make(chan struct{})
-	if fd, err := unix.PidfdOpen(pid, 0); err == nil {
-		go func() {
-			defer func() { _ = unix.Close(fd) }()
-			defer close(gone)
-			fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // a pidfd is well inside int32
-			for {
-				n, err := unix.Poll(fds, -1)
-				// Poll is interruptible by any signal the runtime delivers,
-				// and the Go runtime delivers plenty. EINTR here means
-				// "nothing happened yet", not "the process is gone", and
-				// treating it as the latter would end every attached run at
-				// the first GC-related signal.
-				if errors.Is(err, unix.EINTR) {
-					continue
-				}
-				if n > 0 || err != nil {
-					return
-				}
-			}
-		}()
-	} else {
-		// No pidfd (pre-5.3, or the process left between the mapping check
-		// and here). The run still works; it just cannot shorten itself when
-		// the target exits, so stacks arriving after that point fail to
-		// symbolize and are counted as such.
-		log.Printf("cannot watch pid %d for exit (%v); the run will not end early if it exits, "+
-			"and stacks captured after that point cannot be symbolized", pid, err)
-	}
+	live := newLiveSet(targets)
+	defer live.close()
+	// Every return below reports what was ACTUALLY covered, which under
+	// rediscovery is not what the run started with.
+	covered := func() []int { return live.all() }
 
-	log.Printf("profiling pid %d for %s (ctrl-c to stop early)", pid, d)
-	// A progress line, because the alternative is an operator watching an
-	// idle terminal for the length of the budget with no way to tell a
-	// working attach from a dead one. Coarse on purpose: it is a sign of
-	// life, not a metric.
+	log.Printf("profiling %d process(es) for %s (ctrl-c to stop early)", len(targets), cfg.duration)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	// The drain is what keeps the timeline's rings holding an interval rather
 	// than a run. It is deliberately separate from the progress ticker above:
 	// one is for the operator watching, the other is load-bearing.
-	drain := time.NewTicker(drainEvery)
+	drain := time.NewTicker(cfg.drainEvery)
 	defer drain.Stop()
-	deadline := time.After(d)
+
+	// A ticker that never fires when rediscovery is off, so the select below
+	// does not need a second shape for the -pid case.
+	rescan := make(<-chan time.Time)
+	if cfg.rediscover > 0 {
+		t := time.NewTicker(cfg.rediscover)
+		defer t.Stop()
+		rescan = t.C
+	}
+
+	deadline := time.After(cfg.duration)
 	for {
 		select {
 		case <-deadline:
 			log.Printf("-duration elapsed")
-			return
+			return covered()
 		case s := <-sig:
 			log.Printf("%s: stopping early and writing what was collected", s)
-			return
-		case <-gone:
+			return covered()
+		case <-live.allGone:
 			st := c.Stats()
-			log.Printf("pid %d exited after %d sampled launches; stopping now, because its "+
-				"/proc maps are gone and any stack arriving from here on cannot be "+
-				"symbolized", pid, st.SampledLaunches)
-			return
+			log.Printf("every target has exited after %d sampled launches; stopping now, "+
+				"because their /proc maps are gone and any stack arriving from here on "+
+				"cannot be symbolized", st.SampledLaunches)
+			return covered()
 		case <-drain.C:
 			// Deliberately NOT c.Flush() here, though the end-of-run path
 			// does exactly that. Flush releases every launch being held for a
@@ -881,9 +981,165 @@ func profileAttached(c *gpuprobe.Consumer, pid int, d, drainEvery time.Duration,
 			// in the NEXT snapshot. Only the last one, where nothing more is
 			// coming, has to force the issue.
 			collect()
+		case <-rescan:
+			found, err := gpuprobe.ProcessesMappingShim(cfg.shimPath)
+			if err != nil {
+				// Not fatal: the run in progress is unaffected by a failed
+				// rescan, and ending it would throw away a working profile
+				// over a transient /proc read.
+				log.Printf("rediscovery failed (continuing with the targets already found): %v", err)
+				continue
+			}
+			for _, pid := range found {
+				if !live.add(pid) {
+					continue
+				}
+				// New target, and it is here rather than in the rendezvous
+				// because the rendezvous already had its chance: a process
+				// that could use it never reaches this line.
+				n, rerr := c.RegisterTarget(pid)
+				log.Printf("new target pid %d (%d binaries registered, err=%v)", pid, n, rerr)
+			}
 		case <-ticker.C:
 			st := c.Stats()
-			log.Printf("... sampled_launches=%d batches=%d", st.SampledLaunches, st.Batches)
+			log.Printf("... targets=%d sampled_launches=%d batches=%d",
+				live.count(), st.SampledLaunches, st.Batches)
 		}
 	}
+}
+
+// liveSet watches a set of processes and closes allGone when the last one
+// leaves.
+//
+// The edge is ALL-GONE rather than any-gone, and that distinction is the whole
+// reason this is a type instead of a channel. Under discovery a run covers
+// several processes; one of them exiting is an ordinary event -- pods restart,
+// jobs finish -- and treating it as the end of the run would discard the
+// profiling of everything still running. Under -pid the set has one member and
+// all-gone is any-gone, so the single-target case falls out rather than being
+// special-cased.
+//
+// A pidfd per target rather than polling /proc/<pid>: these pids belong to
+// other people, so the kernel may reap and reuse the number while we watch. A
+// pidfd is bound to the process itself and becomes readable exactly once, when
+// that process dies. A pid that cannot be opened is treated as ALREADY GONE
+// rather than as live-forever: it exited between the scan and here, or we may
+// not see it, and either way waiting for it to die would hold the run open on
+// something we can never observe.
+type liveSet struct {
+	allGone chan struct{}
+
+	mu      sync.Mutex
+	watched map[int]bool
+	alive   int
+	closed  bool
+	fds     []int
+}
+
+func newLiveSet(pids []int) *liveSet {
+	// alive starts at 1 for a CONSTRUCTION TOKEN, released once every member
+	// has been added. Without it the set can report all-gone before it is
+	// fully built: the first target's watcher goroutine is running the moment
+	// add returns, so a process that exits during construction takes alive
+	// from 1 to 0 and closes allGone while the remaining pids have not been
+	// added yet. The run would end immediately, having profiled nothing,
+	// on a set where all but one process was perfectly healthy.
+	l := &liveSet{allGone: make(chan struct{}), watched: map[int]bool{}, alive: 1}
+	for _, p := range pids {
+		l.add(p)
+	}
+	// Releasing the token is itself a death for counting purposes, which
+	// gives the degenerate cases the right answer for free: a set where every
+	// pidfd failed to open drops straight to zero and reports all-gone, rather
+	// than holding the run open on processes nothing can observe.
+	l.died()
+	return l
+}
+
+// add starts watching pid and reports whether it was new to this set.
+func (l *liveSet) add(pid int) bool {
+	l.mu.Lock()
+	if l.closed || l.watched[pid] {
+		l.mu.Unlock()
+		return false
+	}
+	l.watched[pid] = true
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		// Not watchable: gone already, or invisible to us. Recorded as seen so
+		// rediscovery does not retry it every interval, but never counted as
+		// alive -- a target we cannot observe dying must not be able to hold
+		// the run open forever.
+		l.mu.Unlock()
+		return true
+	}
+	l.alive++
+	l.fds = append(l.fds, fd)
+	l.mu.Unlock()
+
+	go func() {
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // a pidfd is well inside int32
+		for {
+			n, err := unix.Poll(fds, -1)
+			// Poll is interruptible by any signal the runtime delivers, and
+			// the Go runtime delivers plenty. EINTR means "nothing happened
+			// yet", not "the process is gone", and treating it as the latter
+			// would end every attached run at the first GC-related signal.
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if n > 0 || err != nil {
+				break
+			}
+		}
+		l.died()
+	}()
+	return true
+}
+
+func (l *liveSet) died() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	l.alive--
+	if l.alive <= 0 {
+		l.closed = true
+		close(l.allGone)
+	}
+}
+
+// all returns every pid this set ever watched, including ones that have since
+// exited and ones found by rediscovery.
+//
+// It is what the end-of-run summary must report, and NOT the set discovery
+// started with. Under -discover the covered set grows during the run, so a
+// summary built from the startup list understates what is in the profile --
+// it would name two processes for a profile containing four, which is a
+// false statement about the scope of every other number on the line.
+func (l *liveSet) all() []int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]int, 0, len(l.watched))
+	for pid := range l.watched {
+		out = append(out, pid)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func (l *liveSet) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.alive
+}
+
+func (l *liveSet) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, fd := range l.fds {
+		_ = unix.Close(fd)
+	}
+	l.fds = nil
 }

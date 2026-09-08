@@ -80,6 +80,7 @@ type options struct {
 	out         *string
 	pid         *int
 	duration    *time.Duration
+	drainEvery  *time.Duration
 	waitForShim *time.Duration
 	nvSymbols   *string
 	pcSampling  *string
@@ -108,6 +109,11 @@ func defineFlags(fs *flag.FlagSet) *options {
 		duration: fs.Duration("duration", 30*time.Second,
 			"how long to profile in -pid mode. The run also ends early on SIGINT or when the "+
 				"target exits"),
+		drainEvery: fs.Duration("drain-every", 2*time.Second,
+			"in -pid mode, how often to drain the timeline into the profile. The "+
+				"timeline's rings hold ONE interval, not the whole run: a long attach to a "+
+				"busy process overruns them and loses GPU time outright. Larger intervals "+
+				"cost memory; smaller ones cost a little CPU"),
 		waitForShim: fs.Duration("wait-for-shim", 5*time.Second,
 			"in -pid mode, how long to wait for the shim to appear in the target's mappings "+
 				"before giving up. Non-zero because a process attached to moments after it "+
@@ -179,6 +185,7 @@ var attachSafeFlags = map[string]bool{
 	"pid":            true,
 	"duration":       true,
 	"wait-for-shim":  true,
+	"drain-every":    true,
 }
 
 // refusedLaunchFlags reports the launch-only flags the operator actually set,
@@ -424,6 +431,56 @@ func main() {
 		}
 	}()
 
+	// The profile accumulates ACROSS snapshots, which is what lets an
+	// attached run drain the timeline while it is still collecting.
+	//
+	// Timeline.Snapshot drains: it swaps in fresh rings and leaves anything
+	// it could not join eligible for a later call. It was built to be called
+	// repeatedly. Launch mode calls it once because it can -- it profiles a
+	// bounded workload and then stops -- and that simplification is exactly
+	// what breaks under a long attach. Measured on an RTX 3090: a 20 s attach
+	// to a workload issuing ~5,500 launches/s filled the 65,536-entry
+	// execution ring at about twelve seconds, and from there on every
+	// snapshot-less second evicted both executions and the launches waiting
+	// to join them -- 45,032 executions and 45,315 launches gone, GPU time
+	// missing from the profile entirely. The bound is not the problem;
+	// holding a whole run inside it is. Raising it only moves the cliff and
+	// makes the agent's memory grow with the length of the run, which for a
+	// collector is unbounded by construction.
+	//
+	// So the ring holds a drain interval rather than a run, and the profile
+	// -- not the timeline -- is what accumulates.
+	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1})
+	totalSamples := 0
+	var lastSnap gpu.Snapshot
+	var lastProj gpu.ProjectionStats
+	snapshots := 0
+	collect := func() {
+		snap := timeline.Snapshot()
+		// ProjectExecutionsWith rather than ProjectExecutions so the
+		// projection's own losses reach the operator: gpu_pc labels dropped
+		// at the cardinality ceiling are invisible in the profile itself, and
+		// JoinHealthWith is the only place they are reported.
+		samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
+		for i := range samples {
+			builders.AddSample(&samples[i])
+		}
+		totalSamples += len(samples)
+		snapshots++
+		lastSnap, lastProj = snap, projStats
+		// Health is per-snapshot, and printing all of it would put one clean
+		// line per interval into a collector's log forever. JoinHealthWith
+		// returns exactly one summary line when there is nothing wrong, so
+		// anything past the first is a warning or an anomaly -- which is
+		// precisely what must not wait for the end of the run to be seen.
+		// The final snapshot prints in full below either way.
+		if lines := gpu.JoinHealthWith(snap, projStats); len(lines) > 1 {
+			for _, line := range lines[1:] {
+				log.Printf("snapshot %d: %s", snapshots, line)
+			}
+		}
+	}
+
 	// The two shapes diverge here and nowhere else. Everything above --
 	// the store, the timeline, the symbolizer, the attach -- is identical,
 	// and everything below (snapshot, projection, profile, health) is too.
@@ -433,7 +490,7 @@ func main() {
 	// it is doing.
 	var launches, wantSampled int
 	if attach {
-		profileAttached(c, *opt.pid, *opt.duration)
+		profileAttached(c, *opt.pid, *opt.duration, *opt.drainEvery, collect)
 	} else {
 		// The sampler jitters each gap around the period so it cannot lock phase
 		// against the workload's alternating axpy/scale pair (issue #50), but the
@@ -520,13 +577,9 @@ func main() {
 	// Release any launch still held for a sampled twin before the snapshot.
 	c.Flush()
 
-	snap := timeline.Snapshot()
-	// ProjectExecutionsWith rather than ProjectExecutions so the projection's
-	// own losses reach the operator: gpu_pc labels dropped at the cardinality
-	// ceiling are invisible in the profile itself, and JoinHealthWith below is
-	// the only place they are reported.
-	samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
-	if len(samples) == 0 {
+	// The last drain interval, and in launch mode the only one.
+	collect()
+	if totalSamples == 0 {
 		// In launch mode an empty pipeline is a bug: this command started a
 		// workload it knows launches kernels. In attach mode it is most
 		// often a fact about the target -- a process that was idle for the
@@ -538,11 +591,6 @@ func main() {
 				*opt.pid, *opt.duration, c.Stats())
 		}
 		log.Fatal("no samples projected; the pipeline produced nothing")
-	}
-
-	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1})
-	for i := range samples {
-		builders.AddSample(&samples[i])
 	}
 
 	f, err := os.Create(*opt.out)
@@ -566,17 +614,18 @@ func main() {
 	// expected_sampled=0 beside a healthy attached run would read as a
 	// shortfall rather than as an inapplicable number.
 	if attach {
-		log.Printf("wrote %s: %d samples from pid %d, stats=%+v", *opt.out, len(samples), *opt.pid, st)
+		log.Printf("wrote %s: %d samples from pid %d over %d drain intervals, stats=%+v",
+			*opt.out, totalSamples, *opt.pid, snapshots, st)
 	} else {
 		log.Printf("wrote %s: %d samples, launches=%d expected_sampled=%d stats=%+v",
-			*opt.out, len(samples), launches, wantSampled, st)
+			*opt.out, totalSamples, launches, wantSampled, st)
 	}
 	// c.Stats() above is ingestion: what arrived off the ringbuf. This is
 	// attribution: what the timeline could join it to, and what it evicted
 	// trying. A run can be perfect on the first and quietly useless on the
 	// second, so both are printed - one line when the join is clean, one
 	// extra line per anomaly when it is not (see gpu.JoinHealthWith).
-	for _, line := range gpu.JoinHealthWith(snap, projStats) {
+	for _, line := range gpu.JoinHealthWith(lastSnap, lastProj) {
 		log.Print(line)
 	}
 	// And the store's own account, which is neither of the above: what
@@ -734,7 +783,7 @@ func waitForShimIn(pid int, shimPath string, within time.Duration) error {
 // reaped and reused by an unrelated process while we watch. A pidfd is bound
 // to the process, not to the number, and it becomes readable exactly once,
 // when that process dies.
-func profileAttached(c *gpuprobe.Consumer, pid int, d time.Duration) {
+func profileAttached(c *gpuprobe.Consumer, pid int, d, drainEvery time.Duration, collect func()) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
@@ -776,6 +825,11 @@ func profileAttached(c *gpuprobe.Consumer, pid int, d time.Duration) {
 	// life, not a metric.
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	// The drain is what keeps the timeline's rings holding an interval rather
+	// than a run. It is deliberately separate from the progress ticker above:
+	// one is for the operator watching, the other is load-bearing.
+	drain := time.NewTicker(drainEvery)
+	defer drain.Stop()
 	deadline := time.After(d)
 	for {
 		select {
@@ -791,6 +845,18 @@ func profileAttached(c *gpuprobe.Consumer, pid int, d time.Duration) {
 				"/proc maps are gone and any stack arriving from here on cannot be "+
 				"symbolized", pid, st.SampledLaunches)
 			return
+		case <-drain.C:
+			// Deliberately NOT c.Flush() here, though the end-of-run path
+			// does exactly that. Flush releases every launch being held for a
+			// sampled twin that has not arrived yet, and mid-run most of
+			// those twins are simply still in flight -- a batch or two away.
+			// Flushing on a timer would release them stackless, converting
+			// launches that were about to be attributed into
+			// [gpu:launch unsampled]. Held launches are not lost by being
+			// skipped: they reach the sink when their twin arrives and land
+			// in the NEXT snapshot. Only the last one, where nothing more is
+			// coming, has to force the issue.
+			collect()
 		case <-ticker.C:
 			st := c.Stats()
 			log.Printf("... sampled_launches=%d batches=%d", st.SampledLaunches, st.Batches)

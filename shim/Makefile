@@ -207,8 +207,7 @@ nvidia-portable: check-cupti-guard
 		      nvidia/cupti_adapter.cc $(CORE_SRC) \
 		      -Wl,--version-script=nvidia/export.map \
 		      -Wl,-soname,libperfagent-gpu-nvidia.so.1 \
-		      -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL \
-		      -L /cuda/targets/x86_64-linux/lib -lcupti'
+		      -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL'
 	@echo "checking the portable shim:"
 	@./elfgate.sh libperfagent-gpu-nvidia.portable.so $(PORTABLE_GLIBC)
 
@@ -220,8 +219,11 @@ nvidia: check-cupti-guard libperfagent-gpu-nvidia.so
 libperfagent-gpu-nvidia.so: nvidia/cupti_adapter.cc nvidia/export.map $(CORE_SRC)
 	$(CXX) $(CXXFLAGS) -pthread -I core -I $(CUDA_INC) -shared -o $@ \
 		nvidia/cupti_adapter.cc $(CORE_SRC) \
-		-Wl,--version-script=nvidia/export.map \
-		-L $(CUDA_LIB) -lcupti -Wl,-rpath,$(CUDA_LIB)
+		-Wl,--version-script=nvidia/export.map
+	@# No -lcupti: cupti_dyn.h resolves it at runtime, so only the HEADERS
+	@# are needed to build. That is what lets CI build the shim at all --
+	@# the runners have no CUDA toolkit library, and without this there was
+	@# no way to gate or ship it (issue #121).
 
 # Not stripped, and built with -g: a sampled launch's CPU stack is symbolized
 # against this binary's own symbols, so a stripped workload would prove the

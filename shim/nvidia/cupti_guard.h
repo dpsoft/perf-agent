@@ -75,6 +75,8 @@
 #include <cupti.h>
 #include <cupti_pcsampling.h>
 
+#include "cupti_dyn.h"
+
 #include "callguard.h"
 
 #include <atomic>
@@ -143,7 +145,7 @@ public:
 
 inline CUptiResult GetTimestamp(uint64_t *ts) {
     CallScope s;
-    return cuptiGetTimestamp(ts);
+    return dyn::table().GetTimestamp(ts);
 }
 
 inline CUptiResult GetResultString(CUptiResult r, const char **msg) {
@@ -151,87 +153,87 @@ inline CUptiResult GetResultString(CUptiResult r, const char **msg) {
     // guarded anyway. The exemption list is a liability and one documented
     // exception does not earn a second; this call happens on error paths only.
     CallScope s;
-    return cuptiGetResultString(r, msg);
+    return dyn::table().GetResultString(r, msg);
 }
 
 inline CUptiResult GetCubinCrc(CUpti_GetCubinCrcParams *p) {
     CallScope s;
-    return cuptiGetCubinCrc(p);
+    return dyn::table().GetCubinCrc(p);
 }
 
 inline CUptiResult Subscribe(CUpti_SubscriberHandle *sub, CUpti_CallbackFunc cb, void *ud) {
     CallScope s;
-    return cuptiSubscribe(sub, cb, ud);
+    return dyn::table().Subscribe(sub, cb, ud);
 }
 
 inline CUptiResult EnableDomain(uint32_t enable, CUpti_SubscriberHandle sub,
                                 CUpti_CallbackDomain domain) {
     CallScope s;
-    return cuptiEnableDomain(enable, sub, domain);
+    return dyn::table().EnableDomain(enable, sub, domain);
 }
 
 inline CUptiResult ActivityRegisterCallbacks(CUpti_BuffersCallbackRequestFunc req,
                                              CUpti_BuffersCallbackCompleteFunc done) {
     CallScope s;
-    return cuptiActivityRegisterCallbacks(req, done);
+    return dyn::table().ActivityRegisterCallbacks(req, done);
 }
 
 inline CUptiResult ActivityEnable(CUpti_ActivityKind kind) {
     CallScope s;
-    return cuptiActivityEnable(kind);
+    return dyn::table().ActivityEnable(kind);
 }
 
 inline CUptiResult ActivityFlushAll(uint32_t flag) {
     CallScope s;
-    return cuptiActivityFlushAll(flag);
+    return dyn::table().ActivityFlushAll(flag);
 }
 
 inline CUptiResult PCSamplingEnable(CUpti_PCSamplingEnableParams *p) {
     CallScope s;
-    return cuptiPCSamplingEnable(p);
+    return dyn::table().PCSamplingEnable(p);
 }
 
 inline CUptiResult PCSamplingDisable(CUpti_PCSamplingDisableParams *p) {
     CallScope s;
-    return cuptiPCSamplingDisable(p);
+    return dyn::table().PCSamplingDisable(p);
 }
 
 inline CUptiResult PCSamplingStart(CUpti_PCSamplingStartParams *p) {
     CallScope s;
-    return cuptiPCSamplingStart(p);
+    return dyn::table().PCSamplingStart(p);
 }
 
 inline CUptiResult PCSamplingStop(CUpti_PCSamplingStopParams *p) {
     CallScope s;
-    return cuptiPCSamplingStop(p);
+    return dyn::table().PCSamplingStop(p);
 }
 
 inline CUptiResult PCSamplingGetData(CUpti_PCSamplingGetDataParams *p) {
     CallScope s;
-    return cuptiPCSamplingGetData(p);
+    return dyn::table().PCSamplingGetData(p);
 }
 
 inline CUptiResult PCSamplingSetConfigurationAttribute(
     CUpti_PCSamplingConfigurationInfoParams *p) {
     CallScope s;
-    return cuptiPCSamplingSetConfigurationAttribute(p);
+    return dyn::table().PCSamplingSetConfigurationAttribute(p);
 }
 
 inline CUptiResult PCSamplingGetConfigurationAttribute(
     CUpti_PCSamplingConfigurationInfoParams *p) {
     CallScope s;
-    return cuptiPCSamplingGetConfigurationAttribute(p);
+    return dyn::table().PCSamplingGetConfigurationAttribute(p);
 }
 
 inline CUptiResult PCSamplingGetNumStallReasons(
     CUpti_PCSamplingGetNumStallReasonsParams *p) {
     CallScope s;
-    return cuptiPCSamplingGetNumStallReasons(p);
+    return dyn::table().PCSamplingGetNumStallReasons(p);
 }
 
 inline CUptiResult PCSamplingGetStallReasons(CUpti_PCSamplingGetStallReasonsParams *p) {
     CallScope s;
-    return cuptiPCSamplingGetStallReasons(p);
+    return dyn::table().PCSamplingGetStallReasons(p);
 }
 
 // ------------------------------------------- the two unguarded exemptions
@@ -244,14 +246,14 @@ inline CUptiResult ActivityGetNextRecord_InBufferCompletedOnly(uint8_t *buffer,
                                                                size_t valid_size,
                                                                CUpti_Activity **record) {
     if (!in_buffer_completed()) misplaced_callback_calls().fetch_add(1, std::memory_order_relaxed);
-    return cuptiActivityGetNextRecord(buffer, valid_size, record);
+    return dyn::table().ActivityGetNextRecord(buffer, valid_size, record);
 }
 
 inline CUptiResult ActivityGetNumDroppedRecords_InBufferCompletedOnly(CUcontext ctx,
                                                                       uint32_t stream_id,
                                                                       size_t *dropped) {
     if (!in_buffer_completed()) misplaced_callback_calls().fetch_add(1, std::memory_order_relaxed);
-    return cuptiActivityGetNumDroppedRecords(ctx, stream_id, dropped);
+    return dyn::table().ActivityGetNumDroppedRecords(ctx, stream_id, dropped);
 }
 
 }  // namespace cupti

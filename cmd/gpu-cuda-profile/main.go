@@ -780,7 +780,7 @@ func waitForShimIn(pid int, shimPath string, within time.Duration) error {
 					"uprobe), and that it loads in the target's environment "+
 					"(`make -C shim nvidia-portable` builds one that does). If the target "+
 					"is a wrapper script, the CUDA process is a child of it and has a "+
-					"different pid.",
+					"different pid",
 				shimPath, pid, within, shimPath, pid)
 		}
 		time.Sleep(50 * time.Millisecond)

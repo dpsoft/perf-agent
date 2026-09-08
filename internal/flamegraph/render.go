@@ -152,6 +152,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	}
 	writeTreeContainer(ew, res)
 	writeStatusBar(ew, res)
+	writeFrameDetails(ew)
 	ew.s("<div id=\"tip\" hidden></div>\n")
 
 	ew.s("<script>\n")
@@ -679,6 +680,34 @@ func samplePeriod(res *foldedstacks.Result) (string, bool) {
 func writeTreeContainer(ew *errWriter, res *foldedstacks.Result) {
 	ew.f("<div id=\"tree\" role=\"group\" aria-label=\"Call tree, %s\" hidden></div>\n",
 		html.EscapeString(res.SampleTypeName+"/"+res.Unit))
+}
+
+// writeFrameDetails emits the docked panel the script fills on pin.
+//
+// Empty and hidden in the markup: everything in it is derived from the frame
+// the reader pinned, and the page has no pinned frame until they pin one.
+// Emitting a skeleton rather than building the nodes in script keeps the
+// structure in the same file as the rest of the page's HTML, where the
+// balance test can see it.
+//
+// It is a PANEL, not a dialog: it does not trap focus and the graph stays
+// live behind it, because the reader's next action after pinning a frame is
+// usually to look at its neighbours. Escape closes it, which is the one
+// dialog behaviour worth keeping.
+func writeFrameDetails(ew *errWriter) {
+	ew.s("<div id=\"fd\" hidden aria-label=\"Frame details\">\n")
+	ew.s("<div class=\"fh\"><b>Frame Details</b>")
+	ew.s("<button id=\"fd-copy\" type=\"button\" title=\"Copy the frame name\" aria-label=\"Copy the frame name\">&#10697;</button>")
+	ew.s("<button id=\"fd-close\" type=\"button\" title=\"Close (Esc)\" aria-label=\"Close\">&#10005;</button>")
+	ew.s("</div>\n")
+	ew.s("<div class=\"fn\" id=\"fd-name\"></div>\n")
+	ew.s("<div class=\"tabs\" role=\"tablist\">")
+	ew.s("<button role=\"tab\" id=\"tab-sum\" aria-selected=\"true\">Summary</button>")
+	ew.s("<button role=\"tab\" id=\"tab-stack\" aria-selected=\"false\">Stack</button>")
+	ew.s("<button role=\"tab\" id=\"tab-all\" aria-selected=\"false\">Across graph</button>")
+	ew.s("</div>\n")
+	ew.s("<div class=\"body\" id=\"fd-body\"></div>\n")
+	ew.s("</div>\n")
 }
 
 // writeStatusBar emits the single permanent line of text on the page. Its

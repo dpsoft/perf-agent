@@ -87,6 +87,27 @@ h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width
 .legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block;background-repeat:repeat}
 .legend .sep{width:1px;height:14px;background:var(--line)}
+#fd{position:fixed;z-index:7;top:96px;right:14px;bottom:44px;width:378px;max-width:calc(100vw - 28px);display:flex;flex-direction:column;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 10px 36px rgb(0 0 0/.16);overflow:hidden}
+#fd[hidden]{display:none}
+#fd .fh{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid var(--line)}
+#fd .fh b{flex:1;font-size:12.5px;font-weight:600}
+#fd .fh button{cursor:pointer;color:var(--muted);background:none;border:0;font-size:14px;padding:2px 4px;border-radius:6px}
+#fd .fh button:hover{color:var(--accent);background:var(--bg)}
+#fd .fn{padding:9px 12px;border-bottom:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.45;word-break:break-word;max-height:5.4em;overflow:auto}
+#fd .tabs{display:flex;gap:2px;padding:7px 9px 0;border-bottom:1px solid var(--line)}
+#fd .tabs button{cursor:pointer;border:0;background:none;color:var(--muted);font:inherit;font-size:12px;padding:5px 10px;border-radius:7px 7px 0 0}
+#fd .tabs button[aria-selected="true"]{color:var(--ink);background:var(--bg);font-weight:600}
+#fd .body{flex:1;overflow:auto;padding:11px 12px 14px}
+#fd .rows{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:12px;align-items:baseline}
+#fd .rows .k{color:var(--muted);white-space:nowrap}
+#fd .rows .v{text-align:right;font-variant-numeric:tabular-nums}
+#fd .rows .v.l{text-align:left}
+#fd .callout{margin:11px 0;padding:8px 10px;border:1px solid var(--line);border-left-width:3px;border-radius:7px;background:var(--bg);font-size:11.5px;line-height:1.45}
+#fd .callout b{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:2px}
+#fd h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:14px 0 6px}
+#fd .path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.6;white-space:pre;overflow:auto;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+#fd .dot{display:inline-block;width:9px;height:9px;border-radius:50%;border:1px solid rgb(0 0 0/.25);margin-right:5px;vertical-align:-1px}
+.frame.pinned{outline:2px solid var(--accent);outline-offset:-2px}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
 .note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
 .canvas{margin:10px 16px 0;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
@@ -653,8 +674,102 @@ function revealInTree(it){
   if(it.head){it.head.scrollIntoView({block:"center"});}
 }
 
+var fd=doc.getElementById("fd"),fdName=doc.getElementById("fd-name"),fdBody=doc.getElementById("fd-body");
+var pinned=null,fdTab="sum",hover=null;
+function esc(t){var d=doc.createElement("div");d.textContent=t;return d.innerHTML;}
+function rows(pairs){
+  var h='<div class="rows">';
+  pairs.forEach(function(p){
+    if(p[1]===null||p[1]===undefined||p[1]==="")return;
+    h+='<span class="k">'+esc(p[0])+'</span><span class="v'+(p[2]?" l":"")+'">'+p[1]+'</span>';
+  });
+  return h+'</div>';
+}
+function domainDot(d){
+  var e=doc.createElement("span");e.className="frame";e.setAttribute("data-domain",d||"app");
+  doc.body.appendChild(e);var bg=getComputedStyle(e).backgroundColor;e.remove();
+  return '<span class="dot" style="background:'+bg+'"></span>';
+}
+function pathToRoot(it){
+  var chain=[],o=it;
+  while(o){chain.push(o);o=o.up;}
+  chain.reverse();
+  return chain.map(function(o,i){
+    var pad=i?" ".repeat((i-1)*2)+"\u2514 ":"";
+    return esc(pad+o.name);
+  }).join("\n");
+}
+function acrossGraph(it){
+  var n=0,total=0;
+  items.forEach(function(o){if(o.name===it.name){n++;total+=o.value;}});
+  return {n:n,total:total};
+}
+function fdSummary(it){
+  var d=it.el.dataset,m=moduleOf(d),w=widthMeaning(it,d),r=resolutionNote(d);
+  var h=rows([
+    ["Cumulative",fmt(it.value)+' <span class="muted">'+pct(it.value)+"</span>"],
+    ["Self",fmt(it.self)+' <span class="muted">'+pct(it.self)+"</span>"],
+    ["Depth",it.d],
+    ["Children",it.kids.length]
+  ]);
+  if(w){h+='<div class="callout"><b>Width means</b>'+esc(w.replace(/^width: /,""))+"</div>";}
+  h+=rows([
+    ["Domain",domainDot(d.domain)+esc(d.domain||"application"),true],
+    ["Resolution",r?esc(r.replace(/^[a-z ]+: /,"")):"fully resolved",true],
+    ["Module",m?esc(m):'<span class="muted">unknown</span>',true]
+  ]);
+  if(it.inexact>0){h+='<div class="callout"><b>Attributed by inference</b>'+fmt(it.inexact)+" of this frame names a plausible caller, not an observed one.</div>";}
+  if(d.collapsed){h+='<div class="callout"><b>Merged</b>Consecutive frames in this library whose names carry no information are drawn as one. The profile still holds every frame.</div>';}
+  h+="<h3>Path to root</h3>"+'<div class="path">'+pathToRoot(it)+"</div>";
+  return h;
+}
+function fdStack(it){
+  return "<h3>Call path</h3>"+'<div class="path">'+pathToRoot(it)+"</div>";
+}
+function fdAll(it){
+  var a=acrossGraph(it);
+  return rows([
+    ["Instances",a.n],
+    ["Combined",fmt(a.total)+' <span class="muted">'+pct(a.total)+"</span>"],
+    ["This one",fmt(it.value)+' <span class="muted">'+pct(it.value)+"</span>"]
+  ])+'<div class="callout"><b>Across graph</b>The same symbol reached by different call paths is a different frame in a flame graph. These are all of them, summed.</div>';
+}
+function fdRender(){
+  if(!pinned)return;
+  fdName.textContent=pinned.name;
+  fdBody.innerHTML=fdTab==="sum"?fdSummary(pinned):fdTab==="stack"?fdStack(pinned):fdAll(pinned);
+}
+function setTab(t){
+  fdTab=t;
+  [["sum","tab-sum"],["stack","tab-stack"],["all","tab-all"]].forEach(function(p){
+    doc.getElementById(p[1]).setAttribute("aria-selected",p[0]===t?"true":"false");
+  });
+  fdRender();
+}
+function pin(it){
+  if(!it){return;}
+  if(pinned===it){unpin();return;}
+  if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
+  pinned=it;it.el.classList.add("pinned");
+  fd.hidden=false;fdRender();
+}
+function unpin(){
+  if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
+  pinned=null;fd.hidden=true;
+}
+doc.getElementById("fd-close").addEventListener("click",unpin);
+doc.getElementById("fd-copy").addEventListener("click",function(){
+  if(pinned&&navigator.clipboard){navigator.clipboard.writeText(pinned.name);}
+});
+doc.getElementById("tab-sum").addEventListener("click",function(){setTab("sum");});
+doc.getElementById("tab-stack").addEventListener("click",function(){setTab("stack");});
+doc.getElementById("tab-all").addEventListener("click",function(){setTab("all");});
+
 items.forEach(function(it){
   it.el.addEventListener("click",function(e){e.stopPropagation();zoom(it);});
+  it.el.addEventListener("click",function(e){if(e.shiftKey){e.stopPropagation();e.preventDefault();pin(it);}},true);
+  it.el.addEventListener("mouseenter",function(){hover=it;});
+  it.el.addEventListener("mouseleave",function(){if(hover===it){hover=null;}});
   it.el.addEventListener("mouseenter",function(){status(it);});
   it.el.addEventListener("mousemove",function(e){showTip(e,it);});
   it.el.addEventListener("mouseleave",function(){tip.hidden=true;status(null);});
@@ -670,6 +785,7 @@ doc.addEventListener("click",function(e){
 });
 doc.addEventListener("keydown",function(e){
   if((e.ctrlKey||e.metaKey)&&(e.key==="f"||e.key==="F")){e.preventDefault();openSearch();return;}
+  if(e.key==="Escape"&&pinned){unpin();return;}
   if(e.key==="Escape"){
     if(info.open){info.open=false;}
     else if(!q.hidden){closeSearch();}
@@ -685,6 +801,7 @@ doc.addEventListener("keydown",function(e){
   else if(e.key==="d"||e.key==="D"){toggleTheme();}
   else if(e.key==="i"||e.key==="I"){toggleInvert();}
   else if(e.key==="t"||e.key==="T"){toggleTree();}
+  else if(e.key==="p"||e.key==="P"){pin(hover||pinned);}
   else if(e.key==="n"){stepMatch(1);}
   else if(e.key==="N"){stepMatch(-1);}
   else if(e.key==="?"){toggleInfo();}

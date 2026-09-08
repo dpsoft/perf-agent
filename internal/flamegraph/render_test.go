@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1050,4 +1054,73 @@ func TestACollapsedFrameIsMarkedAndTheScriptExplainsIt(t *testing.T) {
 	// function, so it is asserted there -- see
 	// TestFoldSaysWhenItMergedVendorRuns. Asserting it here against a
 	// hand-built Result would only prove that the fixture set the field.
+}
+
+// The shipped script must PARSE, not merely balance its braces.
+//
+// The balance check below this one exists because a comment-stripping edit
+// once deleted a whole function header and left the page with syntactically
+// broken JavaScript that every Go test still passed. Balance caught that
+// particular shape; it cannot catch a stray token, a missing comma in an
+// object literal, or a reserved word used as an identifier. A real parser
+// can, and one is usually already on a developer's machine.
+//
+// It SKIPS with a named reason when no engine is present rather than passing
+// quietly: a guard that reports success on a machine where it never ran is
+// worse than no guard, because it is the one you stop checking. The brace
+// balance test remains the portable floor.
+//
+// Parsed through `new Function(src)` rather than executed: the script touches
+// document, window and the page's own elements, none of which exist in a bare
+// engine, so running it would fail for reasons that say nothing about whether
+// it is well formed.
+func TestTheShippedScriptParses(t *testing.T) {
+	engine, args := findJSEngine(t)
+	if engine == "" {
+		t.Skip("no JavaScript engine found (node, gjs, deno or qjs); brace balance is still checked")
+	}
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "page.js")
+	if err := os.WriteFile(src, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var cmd *exec.Cmd
+	switch engine {
+	case "gjs":
+		check := filepath.Join(dir, "check.js")
+		prog := "const GLib = imports.gi.GLib;\n" +
+			"let [ok, bytes] = GLib.file_get_contents(" + strconv.Quote(src) + ");\n" +
+			"let s = new TextDecoder().decode(bytes);\n" +
+			"try { new Function(s); } catch (e) { print('SYNTAX: ' + e.message); imports.system.exit(1); }\n"
+		if err := os.WriteFile(check, []byte(prog), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd = exec.Command(engine, check)
+	default:
+		cmd = exec.Command(engine, append(args, src)...)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("the script shipped to every reader does not parse (%s): %v\n%s",
+			engine, err, out)
+	}
+}
+
+func findJSEngine(t *testing.T) (string, []string) {
+	t.Helper()
+	for _, c := range []struct {
+		name string
+		args []string
+	}{
+		{"node", []string{"--check"}},
+		{"deno", []string{"check"}},
+		{"qjs", []string{"--check"}},
+		{"gjs", nil},
+	} {
+		if _, err := exec.LookPath(c.name); err == nil {
+			return c.name, c.args
+		}
+	}
+	return "", nil
 }

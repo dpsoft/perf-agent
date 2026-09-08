@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -201,6 +202,11 @@ func refusedLaunchFlags(fs *flag.FlagSet) []string {
 	sort.Strings(refused)
 	return refused
 }
+
+// anomalyDigits collapses a health line to its KIND by removing the numbers
+// in it, so "evicted 10198 launches" and "evicted 20824 launches" are
+// recognised as one ongoing condition rather than two events.
+var anomalyDigits = regexp.MustCompile(`[0-9]+`)
 
 func main() {
 	opt := defineFlags(flag.CommandLine)
@@ -455,6 +461,7 @@ func main() {
 	var lastSnap gpu.Snapshot
 	var lastProj gpu.ProjectionStats
 	snapshots := 0
+	seenAnomaly := map[string]bool{}
 	collect := func() {
 		snap := timeline.Snapshot()
 		// ProjectExecutionsWith rather than ProjectExecutions so the
@@ -472,10 +479,27 @@ func main() {
 		// line per interval into a collector's log forever. JoinHealthWith
 		// returns exactly one summary line when there is nothing wrong, so
 		// anything past the first is a warning or an anomaly -- which is
-		// precisely what must not wait for the end of the run to be seen.
+		// precisely what must not wait for the end of a long run to be seen.
 		// The final snapshot prints in full below either way.
+		//
+		// Reported ONCE PER KIND, because not every counter behind these
+		// lines is per-snapshot. Snapshot drains the rings but not the launch
+		// cache, so LaunchCacheStats is cumulative for the life of the run:
+		// its eviction total is re-reported, larger, in every subsequent
+		// snapshot. Printed naively that is one ongoing condition wearing the
+		// costume of a fresh anomaly every interval -- and an operator who
+		// sees the same alarm ten times learns to skip it, which is the exact
+		// harm the anomaly exists to prevent. The kind is the line with its
+		// numbers removed, so a condition that persists is announced when it
+		// starts and then stays quiet; the final health block below carries
+		// the totals.
 		if lines := gpu.JoinHealthWith(snap, projStats); len(lines) > 1 {
 			for _, line := range lines[1:] {
+				kind := anomalyDigits.ReplaceAllString(line, "#")
+				if seenAnomaly[kind] {
+					continue
+				}
+				seenAnomaly[kind] = true
 				log.Printf("snapshot %d: %s", snapshots, line)
 			}
 		}

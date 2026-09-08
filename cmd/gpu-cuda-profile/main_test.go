@@ -156,3 +156,28 @@ func findMappedLibrary(t *testing.T) string {
 	t.Skip("this binary maps no shared library to test against")
 	return ""
 }
+
+// The launch cache's counters are cumulative for the life of the run --
+// Snapshot drains the timeline's rings but not the cache -- so an eviction
+// total is re-reported, larger, in every subsequent snapshot. Collapsing a
+// line to its kind is what stops one ongoing condition from being announced
+// as a fresh anomaly on every drain interval.
+func TestAnOngoingConditionIsOneAnomalyAndNotOnePerInterval(t *testing.T) {
+	kind := func(s string) string { return anomalyDigits.ReplaceAllString(s, "#") }
+
+	// The exact lines a 20s attach produced on the 3090, four intervals apart.
+	a := "gpu join ANOMALY: launch cache evicted 10198 launches at capacity (65536 live) — too small for the launch rate"
+	b := "gpu join ANOMALY: launch cache evicted 45034 launches at capacity (65536 live) — too small for the launch rate"
+	if kind(a) != kind(b) {
+		t.Errorf("the same growing condition reads as two different anomalies:\n  %q\n  %q",
+			kind(a), kind(b))
+	}
+
+	// And it must not over-collapse: two genuinely different findings that
+	// happen to differ only in their numbers are still different findings,
+	// but two different SENTENCES must stay apart.
+	c := "gpu join ANOMALY: 353 of 65536 executions unmatched — GPU time arrived with no launch"
+	if kind(a) == kind(c) {
+		t.Errorf("two unrelated anomalies collapsed to one kind: %q", kind(a))
+	}
+}

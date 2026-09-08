@@ -82,6 +82,18 @@ type Options struct {
 	// MaxLabelValues caps how many distinct values are retained per label
 	// key in the summary. Zero means DefaultMaxLabelValues.
 	MaxLabelValues int
+
+	// CollapseVendorRuns merges each run of consecutive frames from one
+	// vendor library whose names say nothing -- pprof's `module+0xHEX`, or
+	// the CUDA symbol server's obfuscated `libfoo_<40 hex>` -- into a single
+	// frame named after the module. See vendorruns.go.
+	//
+	// OFF by default, and the default is the conservative one on purpose:
+	// folding is also how `flamegraph -folded` produces text other tools
+	// consume, and silently changing what those stacks contain would alter
+	// somebody else's pipeline. The renderer opts in; a caller who wants the
+	// raw stacks gets them by doing nothing.
+	CollapseVendorRuns bool
 }
 
 // InexactRule flags samples whose stack is attributed by inference.
@@ -132,6 +144,16 @@ type Stack struct {
 	// name. Consumers must tolerate "" everywhere: the GPU builder emits
 	// a single empty mapping for every location.
 	Modules []string
+	// Collapsed is parallel to Frames: true where the frame stands for a run
+	// of consecutive frames that CollapseVendorRuns merged. Nil when nothing
+	// was collapsed, so a consumer that does not care pays nothing.
+	//
+	// Carried explicitly rather than re-derived by the renderer from "the name
+	// equals the module's basename". That test would be a guess: a library
+	// really can export a symbol spelled like its own file, and a frame is
+	// either the product of a merge or it is not -- which is a fact the fold
+	// knows and nothing downstream can recover.
+	Collapsed []bool
 	// Value is the summed value at the chosen sample index.
 	Value int64
 	// Inexact is the part of Value contributed by samples matched by
@@ -198,6 +220,11 @@ type Result struct {
 	EmptyStackSamples int
 	// Frames is the number of frame slots emitted across all folded stacks.
 	Frames int
+	// VendorFramesCollapsed counts frames merged away by
+	// Options.CollapseVendorRuns. Reported rather than silent: a reader
+	// comparing a rendered page against the profile it came from must be able
+	// to see that the two do not have the same number of frames, and why.
+	VendorFramesCollapsed int
 	// AddressOnlyFrames is how many of those carry no symbol — a bare
 	// address, or UnknownFrame. A flame graph that quietly dropped these
 	// would look cleaner precisely when symbolization worked worst.
@@ -303,10 +330,23 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 			res.MaxDepth = len(frames)
 		}
 
+		// BEFORE the aggregation key, which is the whole mechanism: two
+		// stacks that differ only in how many uninformative vendor frames
+		// they contain must collapse to the SAME key so they merge into one
+		// node. Collapsing after the key was computed would leave them as
+		// separate nodes wearing the same label, which looks identical in a
+		// list and is wrong in a flame graph.
+		var collapsed []bool
+		if opts.CollapseVendorRuns {
+			var dropped int
+			frames, mods, collapsed, dropped = collapseVendorRuns(frames, mods)
+			res.VendorFramesCollapsed += dropped
+		}
+
 		key := strings.Join(frames, "\x00")
 		st := agg[key]
 		if st == nil {
-			st = &Stack{Frames: frames, Modules: mods}
+			st = &Stack{Frames: frames, Modules: mods, Collapsed: collapsed}
 			agg[key] = st
 			order = append(order, key)
 		}
@@ -544,6 +584,23 @@ func buildWarnings(res *Result, p *profile.Profile) []string {
 	if res.AddressOnlyFrames > 0 {
 		w = append(w, fmt.Sprintf("%d of %d frame slots (%.1f%%) have no symbol and are drawn as a raw address or %s.",
 			res.AddressOnlyFrames, res.Frames, pct(int64(res.AddressOnlyFrames), int64(res.Frames)), UnknownFrame))
+	}
+	// TOP LEVEL, not nested under AddressOnlyFrames. The collapse can remove
+	// every address-only frame there was -- that is what it is for -- and
+	// nesting this inside that branch would silence the note in exactly the
+	// case where the picture diverged from the profile the most.
+	//
+	// Said at all because the picture and the profile no longer have the same
+	// number of frames, and a reader comparing them is entitled to know why.
+	// It is not a warning about the data: nothing was lost, the pprof file
+	// still holds every frame. It is a warning about the PICTURE.
+	if res.VendorFramesCollapsed > 0 {
+		w = append(w, fmt.Sprintf(
+			"%d frame slots were merged: runs of consecutive frames from one vendor library "+
+				"whose names say nothing (an address, or the CUDA symbol server's obfuscated "+
+				"libfoo_<hex>) are drawn as a single frame named after the library. The "+
+				"profile itself is unchanged.",
+			res.VendorFramesCollapsed))
 	}
 	if res.InexactTotal > 0 {
 		w = append(w, fmt.Sprintf("%.1f%% of the total is attributed to its CPU call path by inference, not measurement (gpu_join is heuristic or unmatched, or the join was ambiguous). Those frames name a plausible caller, not an observed one.",

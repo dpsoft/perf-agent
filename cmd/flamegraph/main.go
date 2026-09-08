@@ -31,6 +31,11 @@ func main() {
 		folded     = flag.Bool("folded", false, "write folded stacks to stdout instead of HTML")
 		sampleIdx  = flag.Int("sample-index", -1, "which sample type to fold; -1 chooses automatically")
 		stackOrder = flag.String("stack-order", "root-first", "how the profile stores Sample.Location: root-first (perf-agent) | leaf-first (pprof proto)")
+		rawVendor  = flag.Bool("raw-vendor-frames", false,
+			"draw every vendor frame separately instead of merging runs whose names say "+
+				"nothing (an address, or the CUDA symbol server's obfuscated libfoo_<hex>). "+
+				"The profile always contains them either way; this decides what the PICTURE "+
+				"shows")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <profile.pb.gz>\n\n", os.Args[0])
@@ -63,7 +68,8 @@ func main() {
 		dst = in + ".html"
 	}
 	res, err := flamegraph.FromProfileFile(in, dst, flamegraph.Options{
-		Title: *title,
+		Title:           *title,
+		RawVendorFrames: *rawVendor,
 	})
 	if err != nil {
 		fatalf("%v", err)

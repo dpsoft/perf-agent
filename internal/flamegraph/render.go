@@ -78,6 +78,10 @@ type Options struct {
 	Subtitle string
 	// Meta are extra provenance items, listed in the info panel.
 	Meta []MetaItem
+	// RawVendorFrames draws every vendor frame separately instead of merging
+	// runs whose names say nothing. The profile contains them either way --
+	// this only decides what the picture shows. See foldedstacks.
+	RawVendorFrames bool
 }
 
 // MetaItem is one provenance item.
@@ -87,12 +91,16 @@ type MetaItem struct {
 }
 
 type node struct {
-	name    string
-	module  string
-	modSet  bool
-	domain  Domain
-	value   int64
-	inexact int64
+	name   string
+	module string
+	modSet bool
+	// collapsed marks a frame that stands for a run of merged frames. It is
+	// carried from the fold rather than inferred here; see
+	// foldedstacks.Stack.Collapsed.
+	collapsed bool
+	domain    Domain
+	value     int64
+	inexact   int64
 	// jitter is this frame's step on the shade ladder — see assignJitter.
 	jitter int
 
@@ -227,11 +235,12 @@ func buildTree(res *foldedstacks.Result) (*node, int) {
 			child := cur.index[frame]
 			if child == nil {
 				child = &node{
-					name:   frame,
-					module: mod,
-					modSet: true,
-					index:  map[string]*node{},
-					depth:  cur.depth + 1,
+					name:      frame,
+					module:    mod,
+					modSet:    true,
+					collapsed: i < len(st.Collapsed) && st.Collapsed[i],
+					index:     map[string]*node{},
+					depth:     cur.depth + 1,
 				}
 				cur.index[frame] = child
 				cur.children = append(cur.children, child)
@@ -441,6 +450,12 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	}
 	if n.inexact > 0 {
 		ew.f(` data-inexact="%d"`, n.inexact)
+	}
+	// Read by detail() in the page script, which is what makes this attribute
+	// worth emitting at all. A data attribute nothing reads is dead weight
+	// that looks like a feature.
+	if n.collapsed {
+		ew.s(` data-collapsed="1"`)
 	}
 	ew.s(">")
 	// No whitespace around the name: the script reads this back as the

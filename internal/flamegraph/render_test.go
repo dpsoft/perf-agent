@@ -1005,3 +1005,49 @@ func TestTheShippedScriptIsStructurallyBalanced(t *testing.T) {
 		}
 	}
 }
+
+// A collapsed frame must both BE marked and be EXPLAINED.
+//
+// Two halves, and shipping either alone is the failure this pins. An attribute
+// nothing reads is dead weight that looks like a feature; a tooltip branch with
+// no attribute to trigger it is a comment. The module-table regression above is
+// the same shape and is why this is asserted rather than assumed: the reader
+// side is d.collapsed via the `d = it.el.dataset` alias, which a grep for
+// "dataset.collapsed" would miss entirely.
+func TestACollapsedFrameIsMarkedAndTheScriptExplainsIt(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 1,
+		VendorFramesCollapsed: 3,
+		Stacks: []foldedstacks.Stack{{
+			Frames:    []string{"main", "libcublasLt.so.13", "cuLaunchKernel"},
+			Modules:   []string{"/usr/bin/app", "/lib/libcublasLt.so.13", "/lib/libcuda.so.610"},
+			Collapsed: []bool{false, true, false},
+			Value:     1,
+		}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+
+	if !strings.Contains(page, `data-collapsed="1"`) {
+		t.Error("the collapsed frame carries no marking, so the page cannot tell a merged " +
+			"frame from a library that really exports a symbol named after itself")
+	}
+	if strings.Count(page, `data-collapsed="1"`) != 1 {
+		t.Errorf("want exactly one marked frame, got %d",
+			strings.Count(page, `data-collapsed="1"`))
+	}
+	if !strings.Contains(page, "d.collapsed") {
+		t.Error("the script never reads data-collapsed: the attribute is shipped to every " +
+			"reader of every page and does nothing")
+	}
+	if !strings.Contains(page, "-raw-vendor-frames") {
+		t.Error("the explanation does not say how to see the merged frames")
+	}
+	// The banner that carries the count is produced by Fold, not by this
+	// function, so it is asserted there -- see
+	// TestFoldSaysWhenItMergedVendorRuns. Asserting it here against a
+	// hand-built Result would only prove that the fixture set the field.
+}

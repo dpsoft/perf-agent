@@ -144,6 +144,16 @@ type Stack struct {
 	// name. Consumers must tolerate "" everywhere: the GPU builder emits
 	// a single empty mapping for every location.
 	Modules []string
+	// Collapsed is parallel to Frames: true where the frame stands for a run
+	// of consecutive frames that CollapseVendorRuns merged. Nil when nothing
+	// was collapsed, so a consumer that does not care pays nothing.
+	//
+	// Carried explicitly rather than re-derived by the renderer from "the name
+	// equals the module's basename". That test would be a guess: a library
+	// really can export a symbol spelled like its own file, and a frame is
+	// either the product of a merge or it is not -- which is a fact the fold
+	// knows and nothing downstream can recover.
+	Collapsed []bool
 	// Value is the summed value at the chosen sample index.
 	Value int64
 	// Inexact is the part of Value contributed by samples matched by
@@ -326,16 +336,17 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 		// node. Collapsing after the key was computed would leave them as
 		// separate nodes wearing the same label, which looks identical in a
 		// list and is wrong in a flame graph.
+		var collapsed []bool
 		if opts.CollapseVendorRuns {
 			var dropped int
-			frames, mods, dropped = collapseVendorRuns(frames, mods)
+			frames, mods, collapsed, dropped = collapseVendorRuns(frames, mods)
 			res.VendorFramesCollapsed += dropped
 		}
 
 		key := strings.Join(frames, "\x00")
 		st := agg[key]
 		if st == nil {
-			st = &Stack{Frames: frames, Modules: mods}
+			st = &Stack{Frames: frames, Modules: mods, Collapsed: collapsed}
 			agg[key] = st
 			order = append(order, key)
 		}

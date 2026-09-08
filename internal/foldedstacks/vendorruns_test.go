@@ -1,7 +1,10 @@
 package foldedstacks
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/google/pprof/profile"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,7 +26,7 @@ func TestARunOfAddressOnlyVendorFramesBecomesTheModule(t *testing.T) {
 	}
 	mods := []string{"/usr/lib/libtorch_cuda.so", lt, lt, lt, "/usr/lib/libcuda.so.610"}
 
-	gotF, gotM, removed := collapseVendorRuns(frames, mods)
+	gotF, gotM, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, []string{
 		"torch::autograd::Engine::execute",
@@ -47,7 +50,7 @@ func TestObfuscatedSymbolServerNamesAreCollapsedToo(t *testing.T) {
 	}
 	mods := []string{"/app/main", lt, lt, "/usr/lib/libcuda.so.610"}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, []string{"main", "libcublasLt.so.13", "cuLaunchKernel"}, gotF)
 	assert.Equal(t, 1, removed)
@@ -65,7 +68,7 @@ func TestNamedFramesFromOneLibraryAreNeverMerged(t *testing.T) {
 	}
 	mods := []string{torch, torch, torch, torch}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, frames, gotF, "four things a reader can look up must stay four")
 	assert.Zero(t, removed)
@@ -82,7 +85,7 @@ func TestAdjacentDifferentModulesDoNotMerge(t *testing.T) {
 	}
 	mods := []string{bl, bl, lt, lt}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, []string{"libcublas.so.13", "libcublasLt.so.13"}, gotF)
 	assert.Equal(t, 2, removed)
@@ -95,7 +98,7 @@ func TestALoneUninformativeFrameKeepsItsAddress(t *testing.T) {
 	frames := []string{"main", "libcublasLt.so.13+0xf8e200", "cuLaunchKernel"}
 	mods := []string{"/app/main", lt, "/usr/lib/libcuda.so.610"}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, frames, gotF)
 	assert.Zero(t, removed)
@@ -107,7 +110,7 @@ func TestASymbolContainingPlus0xIsNotAnAddress(t *testing.T) {
 	mods := []string{lt, lt}
 	frames := []string{"operator+0x_helper", "another+0x_helper"}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, frames, gotF, "these are names, however unusual")
 	assert.Zero(t, removed)
@@ -117,7 +120,7 @@ func TestAFrameWithNoModuleIsNeverCollapsed(t *testing.T) {
 	frames := []string{"libcublasLt.so.13+0xf8e200", "libcublasLt.so.13+0xe2b573"}
 	mods := []string{"", ""}
 
-	gotF, _, removed := collapseVendorRuns(frames, mods)
+	gotF, _, _, removed := collapseVendorRuns(frames, mods)
 
 	assert.Equal(t, frames, gotF, "with no module there is nothing to name the merge after")
 	assert.Zero(t, removed)
@@ -136,11 +139,60 @@ func TestRunsOfDifferentLengthCollapseToTheSameFrame(t *testing.T) {
 	mods4 := []string{"/app/main", lt, lt, lt, lt, "/usr/lib/libcuda.so.610"}
 	mods6 := []string{"/app/main", lt, lt, lt, lt, lt, lt, "/usr/lib/libcuda.so.610"}
 
-	got4, _, _ := collapseVendorRuns(four, mods4)
-	got6, _, _ := collapseVendorRuns(six, mods6)
+	got4, _, _, _ := collapseVendorRuns(four, mods4)
+	got6, _, _, _ := collapseVendorRuns(six, mods6)
 
 	require.Equal(t, got4, got6,
 		"a run of 4 and a run of 6 must fold to the identical stack, or they stay two "+
 			"nodes and the collapse has achieved nothing")
 	assert.Equal(t, []string{"main", "libcublasLt.so.13", "cuLaunchKernel"}, got4)
+}
+
+// The count must reach the page, not only the tooltip. A reader who never
+// hovers anything still has to be able to see that the picture and the profile
+// do not have the same number of frames.
+func TestFoldSaysWhenItMergedVendorRuns(t *testing.T) {
+	p := profileWithVendorRun(t)
+
+	on, err := Fold(p, Options{SampleIndex: -1, StackOrder: RootFirst, CollapseVendorRuns: true})
+	require.NoError(t, err)
+	require.Positive(t, on.VendorFramesCollapsed, "the fixture must actually collapse something")
+	require.Contains(t, joined(on.Warnings), "frame slots were merged")
+	assert.Contains(t, joined(on.Warnings), "profile itself is unchanged",
+		"the note must say the data is intact, or it reads as a loss")
+
+	off, err := Fold(p, Options{SampleIndex: -1, StackOrder: RootFirst})
+	require.NoError(t, err)
+	assert.Zero(t, off.VendorFramesCollapsed)
+	assert.NotContains(t, joined(off.Warnings), "frame slots were merged",
+		"nothing was merged, so nothing may be claimed")
+}
+
+func joined(w []string) string { return strings.Join(w, "\n") }
+
+// A profile whose stack carries a run of three address-only frames from one
+// vendor library, which is the measured shape this collapse exists for.
+func profileWithVendorRun(t *testing.T) *profile.Profile {
+	t.Helper()
+	m := &profile.Mapping{ID: 1, File: lt}
+	at := func(name string, mapping *profile.Mapping) *profile.Location {
+		l := &profile.Location{Address: 1, Mapping: mapping}
+		l.Line = append(l.Line, profile.Line{Function: &profile.Function{Name: name}})
+		return l
+	}
+	app := &profile.Mapping{ID: 2, File: "/usr/bin/app"}
+	return &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "gpu", Unit: "nanoseconds"}},
+		Mapping:    []*profile.Mapping{m, app},
+		Sample: []*profile.Sample{{
+			Value: []int64{5},
+			Location: []*profile.Location{
+				at("main", app),
+				at("libcublasLt.so.13+0xf8e200", m),
+				at("libcublasLt.so.13+0xe2b573", m),
+				at("libcublasLt.so.13+0x1df0eb0", m),
+				at("cuLaunchKernel", app),
+			},
+		}},
+	}
 }

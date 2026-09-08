@@ -43,7 +43,7 @@ func FromProfileFile(profilePath, htmlPath string, opts Options) (*foldedstacks.
 		// changing what those stacks contain would alter somebody else's
 		// pipeline. A picture is the one consumer that is read by a person,
 		// and the one where three unreadable rows cost more than they carry.
-		CollapseVendorRuns: true,
+		CollapseVendorRuns: !opts.RawVendorFrames,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fold %s: %w", profilePath, err)

@@ -106,12 +106,13 @@ func isHex(s string) bool {
 //
 // Same module, because two adjacent vendor libraries are two different places
 // and merging them would invent a call path through neither.
-func collapseVendorRuns(frames, modules []string) ([]string, []string, int) {
+func collapseVendorRuns(frames, modules []string) ([]string, []string, []bool, int) {
 	if len(frames) == 0 {
-		return frames, modules, 0
+		return frames, modules, nil, 0
 	}
 	outF := make([]string, 0, len(frames))
 	outM := make([]string, 0, len(frames))
+	outC := make([]bool, 0, len(frames))
 	removed := 0
 	for i := 0; i < len(frames); {
 		m := ""
@@ -121,6 +122,7 @@ func collapseVendorRuns(frames, modules []string) ([]string, []string, int) {
 		if !uninformative(frames[i], m) {
 			outF = append(outF, frames[i])
 			outM = append(outM, m)
+			outC = append(outC, false)
 			i++
 			continue
 		}
@@ -135,13 +137,20 @@ func collapseVendorRuns(frames, modules []string) ([]string, []string, int) {
 		if j-i == 1 {
 			outF = append(outF, frames[i])
 			outM = append(outM, m)
+			outC = append(outC, false)
 			i++
 			continue
 		}
 		outF = append(outF, filepath.Base(m))
 		outM = append(outM, m)
+		outC = append(outC, true)
 		removed += j - i - 1
 		i = j
 	}
-	return outF, outM, removed
+	if removed == 0 {
+		// Nothing merged: hand back nil rather than a slice of falses, so a
+		// consumer can test the field itself instead of scanning it.
+		return outF, outM, nil, 0
+	}
+	return outF, outM, outC, removed
 }

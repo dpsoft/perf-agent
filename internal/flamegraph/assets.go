@@ -461,6 +461,7 @@ function detail(it){
   if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
   if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
+  if(d.collapsed){s+="\nmerged: consecutive frames in this library whose names carry no information (an address, or an obfuscated vendor symbol) are drawn as one. The profile still holds every frame; re-render with -raw-vendor-frames to see them.";}
   return s;
 }
 function widthMeaning(it,d){

@@ -89,6 +89,8 @@ h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width
 .legend .sep{width:1px;height:14px;background:var(--line)}
 #fd{position:fixed;z-index:7;top:96px;right:14px;bottom:44px;width:378px;max-width:calc(100vw - 28px);display:flex;flex-direction:column;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 10px 36px rgb(0 0 0/.16);overflow:hidden}
 #fd[hidden]{display:none}
+body.pinned .canvas,body.pinned .note{margin-right:406px}
+@media (max-width:900px){body.pinned .canvas,body.pinned .note{margin-right:16px}#fd{top:auto;height:46vh}}
 #fd .fh{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid var(--line)}
 #fd .fh b{flex:1;font-size:12.5px;font-weight:600}
 #fd .fh button{cursor:pointer;color:var(--muted);background:none;border:0;font-size:14px;padding:2px 4px;border-radius:6px}
@@ -105,12 +107,18 @@ h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width
 #fd .callout{margin:11px 0;padding:8px 10px;border:1px solid var(--line);border-left-width:3px;border-radius:7px;background:var(--bg);font-size:11.5px;line-height:1.45}
 #fd .callout b{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:2px}
 #fd h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:14px 0 6px}
-#fd .path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.6;white-space:pre;overflow:auto;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+#fd .path{border:1px solid var(--line);border-radius:8px;background:var(--bg);padding:4px 0;max-height:46vh;overflow:auto}
+#fd .path div{position:relative;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;line-height:1.45;padding:2px 9px 2px 22px;word-break:break-word}
+#fd .path div::before{content:"";position:absolute;left:11px;top:0;bottom:0;width:1px;background:var(--line)}
+#fd .path div:first-child::before{top:9px}
+#fd .path div:last-child::before{bottom:auto;height:9px}
+#fd .path div::after{content:"";position:absolute;left:11px;top:9px;width:6px;height:1px;background:var(--line)}
+#fd .path div.here{background:var(--warn-bg);font-weight:600}
 #fd .dot{display:inline-block;width:9px;height:9px;border-radius:50%;border:1px solid rgb(0 0 0/.25);margin-right:5px;vertical-align:-1px}
 .frame.pinned{outline:2px solid var(--accent);outline-offset:-2px}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
 .note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
-.canvas{margin:10px 16px 0;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+.canvas{margin:10px 16px 0;transition:margin-right .12s ease;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
 .chart{position:relative;margin:0}
 .frame{position:absolute;height:17px;padding:0 4px;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px;cursor:pointer}
 .frame.dim{opacity:.15}
@@ -676,6 +684,10 @@ function revealInTree(it){
 
 var fd=doc.getElementById("fd"),fdName=doc.getElementById("fd-name"),fdBody=doc.getElementById("fd-body");
 var pinned=null,fdTab="sum",hover=null;
+var domLabels=(function(){var e=doc.getElementById("domain-labels");
+  try{return e?JSON.parse(e.textContent):{};}catch(x){return {};}})();
+function domLabel(k){return domLabels[k]||k||"application";}
+function baseName(p){var i=p.lastIndexOf("/");return i<0?p:p.slice(i+1);}
 function esc(t){var d=doc.createElement("div");d.textContent=t;return d.innerHTML;}
 function rows(pairs){
   var h='<div class="rows">';
@@ -694,10 +706,9 @@ function pathToRoot(it){
   var chain=[],o=it;
   while(o){chain.push(o);o=o.up;}
   chain.reverse();
-  return chain.map(function(o,i){
-    var pad=i?" ".repeat((i-1)*2)+"\u2514 ":"";
-    return esc(pad+o.name);
-  }).join("\n");
+  return chain.map(function(o){
+    return '<div'+(o===it?' class="here"':'')+'>'+esc(o.name)+"</div>";
+  }).join("");
 }
 function acrossGraph(it){
   var n=0,total=0;
@@ -705,7 +716,7 @@ function acrossGraph(it){
   return {n:n,total:total};
 }
 function fdSummary(it){
-  var d=it.el.dataset,m=moduleOf(d),w=widthMeaning(it,d),r=resolutionNote(d);
+  var d=it.el.dataset,m=moduleOf(d),w=widthMeaning(it,d);
   var h=rows([
     ["Cumulative",fmt(it.value)+' <span class="muted">'+pct(it.value)+"</span>"],
     ["Self",fmt(it.self)+' <span class="muted">'+pct(it.self)+"</span>"],
@@ -714,9 +725,9 @@ function fdSummary(it){
   ]);
   if(w){h+='<div class="callout"><b>Width means</b>'+esc(w.replace(/^width: /,""))+"</div>";}
   h+=rows([
-    ["Domain",domainDot(d.domain)+esc(d.domain||"application"),true],
-    ["Resolution",r?esc(r.replace(/^[a-z ]+: /,"")):"fully resolved",true],
-    ["Module",m?esc(m):'<span class="muted">unknown</span>',true]
+    ["Domain",domainDot(d.domain)+esc(domLabel(d.domain)),true],
+    ["Resolution",d.domain==="unsym"?"no symbol":"fully resolved",true],
+    ["Module",m?'<span title="'+esc(m)+'">'+esc(baseName(m))+"</span>":'<span class="muted">unknown</span>',true]
   ]);
   if(it.inexact>0){h+='<div class="callout"><b>Attributed by inference</b>'+fmt(it.inexact)+" of this frame names a plausible caller, not an observed one.</div>";}
   if(d.collapsed){h+='<div class="callout"><b>Merged</b>Consecutive frames in this library whose names carry no information are drawn as one. The profile still holds every frame.</div>';}
@@ -751,11 +762,11 @@ function pin(it){
   if(pinned===it){unpin();return;}
   if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
   pinned=it;it.el.classList.add("pinned");
-  fd.hidden=false;fdRender();
+  fd.hidden=false;doc.body.classList.add("pinned");fdRender();
 }
 function unpin(){
   if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
-  pinned=null;fd.hidden=true;
+  pinned=null;fd.hidden=true;doc.body.classList.remove("pinned");
 }
 doc.getElementById("fd-close").addEventListener("click",unpin);
 doc.getElementById("fd-copy").addEventListener("click",function(){

@@ -96,9 +96,18 @@ func TestRenderHTMLEscapesHostileSymbolNames(t *testing.T) {
 	assert.Contains(t, got, "&lt;/title&gt;&lt;script&gt;")
 	assert.Contains(t, got, "std::vector&lt;Foo&amp;Bar&gt;")
 
-	// Exactly the two <script> elements this renderer emits: none injected.
-	assert.Equal(t, 1, strings.Count(got, "<script>"))
-	assert.Equal(t, 1, strings.Count(got, "</script>"))
+	// Every script element on the page is accounted for and none was
+	// injected. Counted as a relation rather than a magic number: the page
+	// emits exactly one EXECUTABLE script plus zero or more
+	// application/json data tables (the module paths, the domain labels),
+	// and the closers must add up to those. A bare literal here broke the
+	// moment a legitimate data table was added, which taught nothing about
+	// escaping -- the thing this test exists to check.
+	exec := strings.Count(got, "<script>")
+	data := strings.Count(got, `<script type="application/json"`)
+	assert.Equal(t, 1, exec, "exactly one executable script")
+	assert.Equal(t, exec+data, strings.Count(got, "</script>"),
+		"a closer with no opener means a symbol name broke out of a script element")
 	assert.Equal(t, 1, strings.Count(got, "<style>"))
 }
 

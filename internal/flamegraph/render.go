@@ -152,6 +152,7 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	}
 	writeTreeContainer(ew, res)
 	writeStatusBar(ew, res)
+	writeDomainLabels(ew, domainsPresent(root))
 	writeFrameDetails(ew)
 	ew.s("<div id=\"tip\" hidden></div>\n")
 
@@ -584,17 +585,7 @@ func writeTopBar(ew *errWriter, opts Options, res *foldedstacks.Result, root *no
 // "vendor", not "CPU: GPU runtime and driver" -- because a bar is scanned and
 // the panel is read; the full description is still one click away.
 func writeLegendBar(ew *errWriter, root *node) {
-	present := map[Domain]bool{}
-	var walk func(*node)
-	walk = func(n *node) {
-		if n.depth > 0 {
-			present[n.domain] = true
-		}
-		for _, c := range n.children {
-			walk(c)
-		}
-	}
-	walk(root)
+	present := domainsPresent(root)
 	if len(present) == 0 {
 		return
 	}
@@ -616,6 +607,24 @@ func writeLegendBar(ew *errWriter, root *node) {
 			html.EscapeString(style), html.EscapeString(shortLegendLabel(in.Label)))
 	}
 	ew.s("\n</div>\n")
+}
+
+// domainsPresent is the set of domains this profile actually contains. The
+// legend and the details panel's label table both take their contents from
+// it, so neither can name a domain the other does not.
+func domainsPresent(root *node) map[Domain]bool {
+	present := map[Domain]bool{}
+	var walk func(*node)
+	walk = func(n *node) {
+		if n.depth > 0 {
+			present[n.domain] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(root)
+	return present
 }
 
 // legendOrder is the CPU-to-GPU reading order, not the declaration order of

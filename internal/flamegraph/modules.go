@@ -76,3 +76,36 @@ func writeModuleTable(ew *errWriter, t moduleTable) {
 	// element early.
 	ew.f("<script type=\"application/json\" id=\"modules\">%s</script>\n", b)
 }
+
+// writeDomainLabels emits the key -> human label map the details panel reads.
+//
+// The frames carry data-domain="app", which is an identifier chosen for CSS
+// selectors, not a word to show a reader. The panel used to print it raw, so a
+// frame's domain read "app" and "unsym" instead of "application" and "vendor,
+// no symbols". The labels live in Go, in domainInfo, and this is the one hop
+// that gets them to the page.
+//
+// Same escaping reasoning as writeModuleTable above: json.Marshal, not
+// html.EscapeString, because entities are not decoded inside a script element.
+func writeDomainLabels(ew *errWriter, present map[Domain]bool) {
+	// Only the domains this profile actually contains, which is the same rule
+	// the legend follows and for the same reason: naming a domain that is not
+	// on screen sends the reader looking for it. It is also what
+	// TestRenderHTMLLegendOnlyNamesDomainsThatAreActuallyPresent checks, and
+	// emitting the whole table quietly broke it.
+	m := make(map[string]string, len(present))
+	for d := range present {
+		in := d.Info()
+		if in.Key != "" {
+			m[in.Key] = in.Label
+		}
+	}
+	if len(m) == 0 {
+		return
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	ew.f("<script type=\"application/json\" id=\"domain-labels\">%s</script>\n", b)
+}

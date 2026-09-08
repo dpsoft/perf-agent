@@ -146,13 +146,57 @@ because the `perf_uprobe` PMU path requires `CAP_SYS_ADMIN` and that is what
 gets a per-pod agent rejected by admission policy. It costs a **Linux 6.6**
 floor.
 
+## Profiling a process that is already running
+
+A sidecar or a node collector cannot launch what it profiles: the kubelet
+started it. `-pid` attaches to a process that is already running.
+
+```
+gpu-cuda-profile -pid 12345 -duration 60s -out gpu.pb.gz
+```
+
+The target must have been started with `CUDA_INJECTION64_PATH` already in its
+environment — the driver loads the shim during `cuInit` and never again, and
+nothing (not `-pid`, not `ptrace`) can add it to a live process afterwards.
+That is why the init container sets the variable on the *application* pod
+rather than on the profiler. If the shim is not in the target's mappings the
+command refuses at startup and says so, rather than collecting nothing for a
+full `-duration`.
+
+Three things behave differently from a launched run, and all three are
+consequences of not being the parent:
+
+- **Flags that configure the target are refused, not ignored.** `-period` and
+  `-gpu-pc-sampling` are read by the adapter out of the target's environment at
+  `cuInit`. Accepting them here would change nothing while making the profile
+  look as though it had been taken at a rate it was not.
+- **The run ends when the target exits.** A sampled launch's stack is
+  symbolized against `/proc/<pid>/maps`, which the kernel destroys the instant
+  the process leaves; anything collected past that point has stacks that can
+  never be resolved.
+- **The timeline is drained on an interval** (`-drain-every`, default 2s)
+  rather than once at the end. Its rings hold one interval, not a whole run —
+  a 20 s attach to a process issuing ~5,500 launches/s overruns a run-length
+  ring and loses GPU time outright.
+
+Capabilities are the same set as a launched run; no `privileged`, no
+`CAP_SYS_ADMIN`. A node collector additionally needs `hostPID: true` to see
+the pids it is attaching to, which is a genuine privilege increase over the
+sidecar and should be stated in a pod spec rather than absorbed quietly.
+
 ## What this does not yet cover
 
 - **No published container image** for the init-container pattern. CI uploads
   the portable shim as a build artifact; there is no registry image to name in
   a pod spec yet.
-- **The agent cannot attach to an already-running process** on the GPU path:
-  `cmd/gpu-cuda-profile` launches the workload itself. A Kubernetes sidecar has
-  to attach to a container the kubelet started, so the sidecar shape in
-  `examples/kubernetes/` cannot run end to end until that exists. Tracked in
-  issue #124.
+- **Modules that loaded before the attach are missed entirely.** The adapter
+  captures a module's bytes only while a consumer is present
+  (`capture_enabled()` in `shim/nvidia/cupti_adapter.cc`), and a CUDA process
+  loads essentially all of its modules during startup. Measured loss on a late
+  attach is 100%: every PC sample reads `gpu_src_status="no-module"` and
+  carries no source line. Launches, stacks, kernel names and timings are
+  unaffected. A run that hits this says so. Tracked in issue #124.
+- **The collector (DaemonSet) shape is not built yet** — `-pid` is its
+  prerequisite, not the whole of it. One profile per pod versus one profile
+  labelled by pod, attaching to pods that start later, and whether the shim is
+  one inode per node or one per pod are all open. Tracked in issue #124.

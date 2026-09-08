@@ -116,7 +116,22 @@ typedef CubinOfferResult (*CubinOfferFn)(const void *bytes, size_t len, uint64_t
 // Config.CubinMaxBytes default so a cubin this end copies is not one the
 // other end was always going to refuse.
 struct CubinQueueLimits {
-    size_t max_entries = 32;                     // queued offers
+    // Sized for RETENTION, not for a 100 ms hop.
+    //
+    // These bounds used to describe a queue that was drained every drain
+    // tick, so 32 entries was generous: nothing could accumulate. Since the
+    // adapter retains captures while no consumer is attached (a late attach
+    // would otherwise find every module already gone -- measured 100% loss),
+    // the queue holds a process's modules for as long as nobody has arrived,
+    // and 32 is not a process's worth of modules.
+    //
+    // 512 and 64 MiB are the CONSUMER's ModuleStore defaults, taken
+    // deliberately rather than invented: there is no value in retaining more
+    // modules than the store on the other end can hold, and no reason to
+    // retain fewer. max_queued_bytes is the real bound -- it is the memory an
+    // opted-in process can be made to hold -- and max_entries is the count
+    // guard beside it.
+    size_t max_entries = 512;                    // queued offers
     size_t max_queued_bytes = 64u * 1024 * 1024; // their total
     size_t max_cubin_bytes = 8u * 1024 * 1024;   // one module, the memcpy bound
     size_t max_interned = 4096;                  // distinct CRCs remembered

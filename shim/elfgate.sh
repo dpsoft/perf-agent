@@ -18,6 +18,13 @@ set -eu
 
 so=${1:?usage: elfgate.sh <shim.so> [max-glibc] [max-glibcxx]}
 max_glibc=${2:-2.34}
+# "none" (default): must not require libstdc++ at all, which is what a shipped
+# artifact has to promise -- conda and PyTorch ship their own, older one, and a
+# dynamic dependency binds theirs to ours.
+# "any": permitted. For the ordinary local build, which is not the artifact and
+# does not claim to be. The distinction matters: running the full gate against
+# a build that never promised portability fails for a reason that is not a
+# defect, and a gate that cries wolf gets switched off.
 max_glibcxx=${3:-none}
 
 fail=0
@@ -47,7 +54,9 @@ else
 fi
 
 x=$(maxver GLIBCXX)
-if [ "$max_glibcxx" = none ]; then
+if [ "$max_glibcxx" = any ]; then
+    say "libstdc++" "requires ${x:-none} (permitted for this build)"
+elif [ "$max_glibcxx" = none ]; then
     if [ -n "$x" ]; then
         bad "libstdc++" "requires GLIBCXX_$x; link with -static-libstdc++"
     else

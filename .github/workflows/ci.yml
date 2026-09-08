@@ -251,10 +251,13 @@ jobs:
           make -C shim nvidia \
             CUDA_HOME=/usr/local/cuda-13.3 \
             CUDA_INC=/usr/local/cuda-13.3/targets/x86_64-linux/include
-          # The runner's own glibc is 2.39, so this checks everything the gate
-          # knows about EXCEPT the floor, which only the portable build can
-          # meet. The floor is enforced where it is produced, in release.yml.
-          ./shim/elfgate.sh shim/libperfagent-gpu-nvidia.so 2.39
+          # The ORDINARY build, which is for local work and does not claim to
+          # be shippable: the runner's glibc is 2.39, and this target links
+          # libstdc++ dynamically on purpose. So the floor and the libstdc++
+          # rule are relaxed here and enforced on the portable artifact below,
+          # where they are actually promised. A gate that fails a build for a
+          # property that build never claimed is a gate people switch off.
+          ./shim/elfgate.sh shim/libperfagent-gpu-nvidia.so 2.39 any
 
       # The artifact a release actually ships, built against an old glibc so it
       # can load into the images it is injected into. Measured: the ordinary

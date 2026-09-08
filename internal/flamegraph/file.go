@@ -38,6 +38,12 @@ func FromProfileFile(profilePath, htmlPath string, opts Options) (*foldedstacks.
 	res, err := foldedstacks.Fold(p, foldedstacks.Options{
 		SampleIndex: -1,
 		StackOrder:  foldedstacks.RootFirst,
+		// The RENDERER opts in, and only the renderer. Folding is also how
+		// `flamegraph -folded` produces text for other tools, and quietly
+		// changing what those stacks contain would alter somebody else's
+		// pipeline. A picture is the one consumer that is read by a person,
+		// and the one where three unreadable rows cost more than they carry.
+		CollapseVendorRuns: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fold %s: %w", profilePath, err)

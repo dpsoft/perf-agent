@@ -236,6 +236,16 @@ func main() {
 		log.Fatalf("workload: %v", err)
 	}
 
+	// Did the injection actually happen?
+	//
+	// CUDA_INJECTION64_PATH fails OPEN and SILENT: a driver that cannot load
+	// the library carries on as though the variable were unset, so a broken
+	// shim and a workload that launched no kernels produce identical output --
+	// an empty profile and no error. The mapping is the one observable that
+	// separates them. Watched here, while the workload is alive, because
+	// /proc/<pid>/maps is gone the moment it is not.
+	injected := waitForInjection(cmd.Process.Pid, shimPath, 10*time.Second)
+
 	deadline := time.Now().Add(time.Duration(*linger) * time.Millisecond)
 	for c.Stats().SampledLaunches < uint64(wantSampled) {
 		if time.Now().After(deadline) {
@@ -246,6 +256,7 @@ func main() {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	reportInjection(injected, shimPath, cmd.Process.Pid, c.Stats().SampledLaunches)
 	if err := release.Close(); err != nil {
 		log.Fatalf("release workload: %v", err)
 	}
@@ -310,4 +321,47 @@ func main() {
 	// (the CRCs the PC records join on are not the CRCs the cubins arrived
 	// under, which is hardware assertion 13).
 	log.Printf("module store: %+v", store.Stats())
+}
+
+// waitForInjection watches for the shim appearing in the workload's mappings.
+//
+// Bounded, and a miss is not an error: the driver loads the library during
+// cuInit, which a workload may not reach for some time, and a workload started
+// through a wrapper script does its CUDA work in a CHILD whose mappings this
+// does not inspect. The answer feeds a diagnostic, never a failure.
+func waitForInjection(pid int, shimPath string, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if ok, err := gpuprobe.ShimIsMappedIn(pid, shimPath); err == nil && ok {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+// reportInjection turns "an empty profile" into a statement about which of the
+// two possible causes it was.
+//
+// Says nothing when there is nothing to say: a run that sampled launches
+// plainly injected, whatever the mapping check saw, and a line confirming the
+// obvious on every successful run is noise that trains people to skip the
+// output.
+func reportInjection(mapped bool, shimPath string, pid int, sampled uint64) {
+	if sampled > 0 {
+		return
+	}
+	if mapped {
+		log.Printf("no launches were sampled, but the shim IS mapped into the workload: " +
+			"injection worked and the adapter did not report launches. Look at the " +
+			"perfagent-cupti lines above for why -- a missing CUPTI is reported there.")
+		return
+	}
+	log.Printf("no launches were sampled and %s is NOT mapped into pid %d. "+
+		"CUDA_INJECTION64_PATH fails open and silent, so this is exactly what a shim the "+
+		"driver could not load looks like: check that the workload is a CUDA program that "+
+		"reached cuInit, and that the shim loads in ITS environment "+
+		"(`make -C shim nvidia-portable` builds one that does). If the workload is a wrapper "+
+		"script the CUDA process is a child, and this check does not see it.",
+		shimPath, pid)
 }

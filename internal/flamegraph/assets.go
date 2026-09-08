@@ -275,6 +275,9 @@ const paletteCSS = `
 
   --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
   --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
 
   --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
   --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
@@ -305,18 +308,30 @@ const paletteCSS = `
 [data-domain="system"]{--fill-x:var(--fill-system)}
 [data-domain="kernel"]{--fill-x:var(--fill-kernel)}
 [data-domain="vendor"]{--fill-x:var(--fill-vendor)}
-[data-domain="unsym"]{--fill-x:var(--fill-unsym);background-image:var(--hatch-gap)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
 [data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
 [data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
 [data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
 [data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
 .frame.inexact{background-image:var(--hatch-inf)}
-.frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
 
 .frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
 .frame.match{background-color:var(--fill-match)}
 .frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
 .sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
 `
 
 // The jitter ladder. jitterSteps shades per domain, evenly spaced from 0 to
@@ -503,9 +518,20 @@ function detail(it){
   var w=widthMeaning(it,d);
   if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
-  if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
+  var r=resolutionNote(d);
+  if(r){s+="\n"+r;}
   if(d.collapsed){s+="\nmerged: consecutive frames in this library whose names carry no information (an address, or an obfuscated vendor symbol) are drawn as one. The profile still holds every frame; re-render with -raw-vendor-frames to see them.";}
   return s;
+}
+function resolutionNote(d){
+  switch(d.resolution){
+  case "module-offset": return "no symbol here, but the module is known \u2014 this offset is stable across ASLR and can be matched against symbol data for the same build";
+  case "bare-address": return "no symbol and no module: the frame's position is real, nothing else about it is known";
+  case "obfuscated": return "symbolized by NVIDIA's symbol server \u2014 a stable identifier for an internal function, not a human-readable name. Not a symbolization failure";
+  case "interpreter": return "interpreter frame placed correctly; its code object could not be read";
+  }
+  if(d.domain==="unsym"){return "no symbol: the unwind found this frame, nothing could name it";}
+  return "";
 }
 function widthMeaning(it,d){
   if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
@@ -687,6 +713,11 @@ var pinned=null,fdTab="sum",hover=null;
 var domLabels=(function(){var e=doc.getElementById("domain-labels");
   try{return e?JSON.parse(e.textContent):{};}catch(x){return {};}})();
 function domLabel(k){return domLabels[k]||k||"application";}
+function resLabel(d){
+  if(d.collapsed){return "merged run \u2014 no usable name";}
+  var r=resolutionNote(d);
+  return r?esc(r.replace(/^[^:]*: /,"")):"fully resolved";
+}
 function baseName(p){var i=p.lastIndexOf("/");return i<0?p:p.slice(i+1);}
 function esc(t){var d=doc.createElement("div");d.textContent=t;return d.innerHTML;}
 function rows(pairs){
@@ -726,7 +757,7 @@ function fdSummary(it){
   if(w){h+='<div class="callout"><b>Width means</b>'+esc(w.replace(/^width: /,""))+"</div>";}
   h+=rows([
     ["Domain",domainDot(d.domain)+esc(domLabel(d.domain)),true],
-    ["Resolution",d.domain==="unsym"?"no symbol":"fully resolved",true],
+    ["Resolution",resLabel(d),true],
     ["Module",m?'<span title="'+esc(m)+'">'+esc(baseName(m))+"</span>":'<span class="muted">unknown</span>',true]
   ]);
   if(it.inexact>0){h+='<div class="callout"><b>Attributed by inference</b>'+fmt(it.inexact)+" of this frame names a plausible caller, not an observed one.</div>";}

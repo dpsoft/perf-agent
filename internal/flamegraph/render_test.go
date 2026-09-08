@@ -103,10 +103,10 @@ func TestRenderHTMLEscapesHostileSymbolNames(t *testing.T) {
 	// and the closers must add up to those. A bare literal here broke the
 	// moment a legitimate data table was added, which taught nothing about
 	// escaping -- the thing this test exists to check.
-	exec := strings.Count(got, "<script>")
-	data := strings.Count(got, `<script type="application/json"`)
-	assert.Equal(t, 1, exec, "exactly one executable script")
-	assert.Equal(t, exec+data, strings.Count(got, "</script>"),
+	execScripts := strings.Count(got, "<script>")
+	dataScripts := strings.Count(got, `<script type="application/json"`)
+	assert.Equal(t, 1, execScripts, "exactly one executable script")
+	assert.Equal(t, execScripts+dataScripts, strings.Count(got, "</script>"),
 		"a closer with no opener means a symbol name broke out of a script element")
 	assert.Equal(t, 1, strings.Count(got, "<style>"))
 }
@@ -1015,6 +1015,71 @@ func TestTheShippedScriptIsStructurallyBalanced(t *testing.T) {
 	for _, fn := range []string{"function detail(", "function widthMeaning(", "function moduleOf("} {
 		if !strings.Contains(script, fn) {
 			t.Errorf("the script calls but does not declare %q", fn)
+		}
+	}
+}
+
+// The legend must describe both axes, and only what the profile contains.
+//
+// Before this the legend said "diagonal hatching — either the frame has no
+// symbol, or its CPU attribution was inferred rather than measured. Hover the
+// frame for which." That is the legend admitting it cannot tell the reader
+// what they are looking at, because one channel was carrying two facts.
+func TestTheLegendExplainsTextureSeparatelyFromColour(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 4,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"main", "at::native::conv"}, Value: 1},
+			{Frames: []string{"main", "libcudnn.so.9+0x824fbd"}, Value: 1},
+			{Frames: []string{"main", "libcupti_afe8ffb67fac57d8829b1194a93b8ec676e80f7d"}, Value: 1},
+			{Frames: []string{"main", "0x7f2c945b2c2b"}, Value: 1},
+		},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+
+	if !strings.Contains(page, "Texture means how well it is named") {
+		t.Error("the legend has no section for the texture axis")
+	}
+	for _, want := range []string{"module + offset", "obfuscated symbol", "address only"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("legend is missing the %q row for a resolution the profile contains", want)
+		}
+	}
+	// The old conflated sentence must be gone: it is the thing this replaces.
+	if strings.Contains(page, "Either the frame has no symbol, or its CPU attribution") {
+		t.Error("the legend still conflates missing symbols with inferred attribution")
+	}
+	// And a swatch must actually carry the texture it names, or the legend
+	// row and the graph disagree.
+	for _, key := range []string{"res-module-offset", "res-obfuscated", "res-bare-address"} {
+		if !strings.Contains(page, key) {
+			t.Errorf("no swatch renders the %q texture", key)
+		}
+	}
+}
+
+// Never advertise a state the profile does not contain — the same rule the
+// domain legend already follows.
+func TestTheLegendOmitsResolutionsTheProfileDoesNotHave(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if strings.Contains(page, "Texture means how well it is named") {
+		t.Error("a fully resolved profile advertises a texture legend it never uses")
+	}
+	for _, unwanted := range []string{"obfuscated symbol", "module + offset", "address only"} {
+		if strings.Contains(page, unwanted) {
+			t.Errorf("legend advertises %q on a profile with no such frames", unwanted)
 		}
 	}
 }

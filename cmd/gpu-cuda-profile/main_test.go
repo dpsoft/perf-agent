@@ -4,6 +4,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -179,5 +180,178 @@ func TestAnOngoingConditionIsOneAnomalyAndNotOnePerInterval(t *testing.T) {
 	c := "gpu join ANOMALY: 353 of 65536 executions unmatched — GPU time arrived with no launch"
 	if kind(a) == kind(c) {
 		t.Errorf("two unrelated anomalies collapsed to one kind: %q", kind(a))
+	}
+}
+
+// The edge is ALL-gone, not ANY-gone. Under discovery a run covers several
+// processes and one exiting is ordinary -- pods restart, jobs finish -- so
+// ending the run there would discard the profiling of everything still alive.
+func TestTheRunEndsWhenTheLASTTargetExitsAndNotTheFirst(t *testing.T) {
+	a, b := startSleeper(t), startSleeper(t)
+	live := newLiveSet([]int{a.Pid, b.Pid})
+	defer live.close()
+
+	if got := live.count(); got != 2 {
+		t.Fatalf("want 2 live targets, got %d", got)
+	}
+	_ = a.Kill()
+	_, _ = a.Wait()
+
+	select {
+	case <-live.allGone:
+		t.Fatal("one of two targets exited and the run was told every target had gone")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	_ = b.Kill()
+	_, _ = b.Wait()
+	select {
+	case <-live.allGone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("both targets exited and the run was never told")
+	}
+}
+
+// The construction race, which is why alive starts at 1.
+//
+// The hazard: a target's watcher goroutine is running the moment add returns,
+// so a process that exits while the set is STILL BEING BUILT can take alive
+// from 1 to 0 and close allGone before the remaining pids have been added. A
+// run covering many healthy processes would end immediately, having profiled
+// nothing.
+//
+// Driven through the token directly rather than through newLiveSet, because
+// the natural-looking version of this test does not reproduce it: a process
+// that has already been reaped cannot be pidfd-opened at all, so it spawns no
+// watcher and there is nothing to race. Reproducing it by timing would be
+// flaky in the direction that matters least -- passing when the bug is
+// present. So the invariant is exercised where it actually lives: while the
+// token is held, deaths must not close the channel.
+func TestADeathWhileTheSetIsBeingBuiltDoesNotEndTheRun(t *testing.T) {
+	doomed, survivor := startSleeper(t), startSleeper(t)
+
+	// Mid-construction: the token is held and nothing has been released.
+	l := &liveSet{allGone: make(chan struct{}), watched: map[int]bool{}, alive: 1}
+	defer l.close()
+
+	if !l.add(doomed.Pid) {
+		t.Fatal("the first target was not added")
+	}
+	_ = doomed.Kill()
+	_, _ = doomed.Wait()
+
+	// Its watcher fires here. Without the token alive is now 0 and allGone is
+	// closed -- with the survivor not yet added, and the run over.
+	deadline := time.After(3 * time.Second)
+	for l.count() > 1 {
+		select {
+		case <-deadline:
+			t.Fatal("the killed target's watcher never fired")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	select {
+	case <-l.allGone:
+		t.Fatal("a death during construction ended the run before the set was built")
+	default:
+	}
+
+	l.add(survivor.Pid)
+	l.died() // construction complete: release the token
+
+	select {
+	case <-l.allGone:
+		t.Fatal("the run ended with a healthy target still in the set")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A set nothing could be watched in must not hold the run open forever waiting
+// for deaths it can never observe.
+func TestASetWithNothingWatchableReportsAllGone(t *testing.T) {
+	live := newLiveSet([]int{1 << 21}) // no such process
+	defer live.close()
+	select {
+	case <-live.allGone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no target could be watched, so no death can ever be observed; the run " +
+			"must not wait for one")
+	}
+}
+
+func TestATargetIsOnlyAddedOnce(t *testing.T) {
+	p := startSleeper(t)
+	defer func() { _ = p.Kill(); _, _ = p.Wait() }()
+	live := newLiveSet([]int{p.Pid})
+	defer live.close()
+
+	if live.add(p.Pid) {
+		t.Error("rediscovery re-adding a known target must report it as not new, or every " +
+			"rescan would re-register and re-log every process")
+	}
+	if got := live.count(); got != 1 {
+		t.Errorf("a duplicate add changed the live count to %d", got)
+	}
+}
+
+func TestDescribeTargetsSaysSingularOrPluralAsTheRunActuallyWas(t *testing.T) {
+	if got := describeTargets([]int{1234}); got != "pid 1234" {
+		t.Errorf("one target: got %q", got)
+	}
+	got := describeTargets([]int{12, 34, 56})
+	if !strings.Contains(got, "3 pids") {
+		t.Errorf("three targets must not be reported as one: got %q", got)
+	}
+}
+
+func startSleeper(t *testing.T) *os.Process {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a helper process: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	return cmd.Process
+}
+
+// The end-of-run summary must name what was actually covered, and under
+// rediscovery that is not the set the run started with.
+//
+// The bug this pins: a 25s discovery run on the 3090 started with 2 targets,
+// picked up 2 more, profiled all of them -- and reported "276042 samples from
+// 2 pids [...]". The sample count was right and the scope was a false
+// statement about it. Exited targets must stay in the answer too: their
+// samples are in the profile, so a summary that dropped them would understate
+// the scope just as badly in the other direction.
+func TestTheSummaryNamesEveryTargetEverCoveredNotJustTheFirstOnes(t *testing.T) {
+	first, second := startSleeper(t), startSleeper(t)
+	live := newLiveSet([]int{first.Pid})
+	defer live.close()
+
+	if got := live.all(); len(got) != 1 || got[0] != first.Pid {
+		t.Fatalf("the initial target is missing from the covered set: %v", got)
+	}
+
+	// Rediscovery finds another one mid-run.
+	live.add(second.Pid)
+	got := live.all()
+	if len(got) != 2 {
+		t.Fatalf("a rediscovered target is not in the covered set: %v", got)
+	}
+
+	// And one of them exits. Its GPU time is already in the profile, so it
+	// must not vanish from the run's description of itself.
+	_ = first.Kill()
+	_, _ = first.Wait()
+	deadline := time.After(3 * time.Second)
+	for live.count() > 1 {
+		select {
+		case <-deadline:
+			t.Fatal("the killed target's watcher never fired")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if got := live.all(); len(got) != 2 {
+		t.Errorf("an exited target was dropped from the covered set: %v", got)
 	}
 }

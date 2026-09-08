@@ -1,0 +1,133 @@
+# The GPU profiler: the consumer half, which attaches to processes the shim was
+# injected into.
+#
+# Separate from Dockerfile.shim, and the split is not tidiness. The shim is
+# dlopened into the APPLICATION's process and must satisfy its loader, so it is
+# built against an old-glibc baseline and carries no dependencies. This binary
+# runs in its OWN container, where the base is ours to choose. Merging them
+# would force the shim's constraints onto the agent or the agent's onto the
+# shim, and the shim's are the ones that cannot bend.
+FROM ubuntu:24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GO_VERSION=1.26.0
+
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      ca-certificates wget git build-essential libelf-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN wget -qO /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+ && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:/root/.cargo/bin:$PATH
+
+# blazesym does the symbolization. Built here rather than vendored because it
+# is Rust and the Go binding links its C API.
+RUN wget -qO /tmp/rust.sh https://sh.rustup.rs \
+ && sh /tmp/rust.sh -y --profile minimal --default-toolchain stable \
+ && rm /tmp/rust.sh
+RUN git clone --depth 1 https://github.com/libbpf/blazesym.git /blazesym \
+ && cd /blazesym && cargo build --release --package blazesym-c
+
+# STATIC blazesym, in a directory holding ONLY the archive.
+#
+# Both halves matter. A binary that loads libblazesym_c.so at runtime cannot be
+# given file capabilities: secure-execution mode ignores LD_LIBRARY_PATH, so
+# the loader will not find it and the process dies before main. And -Bstatic
+# alone is not enough -- with the .so beside the .a in the same -L directory
+# the link still records a NEEDED entry for it. Isolating the archive is what
+# actually produces a self-contained binary.
+RUN mkdir -p /blazeonly && cp /blazesym/target/release/libblazesym_c.a /blazeonly/
+
+WORKDIR /src
+COPY go.mod go.sum ./
+
+# The committed go.mod carries an ABSOLUTE-PATH replace for the blazesym Go
+# binding, pointing at a checkout on a developer's machine. Nothing outside
+# that machine can resolve it -- CI rewrites it with the same `go mod edit`
+# before every build, and this image has to as well. Repointing it at the
+# checkout above is what makes this Dockerfile buildable by anyone.
+RUN go mod edit -replace github.com/libbpf/blazesym/go=/blazesym/go \
+ && go mod download
+
+COPY . .
+# COPY brought the committed go.mod back with its unusable absolute path, so
+# the rewrite has to happen again. Cheap, and the alternative -- excluding
+# go.mod from the copy -- silently diverges the build from the source tree.
+RUN go mod edit -replace github.com/libbpf/blazesym/go=/blazesym/go
+
+# No clang and no `go generate`: the BPF objects are committed and embedded
+# with //go:embed, so this image does not need the eBPF toolchain to exist.
+# Regenerating them here would also make the image's behaviour depend on a
+# clang version nothing in the manifest pins -- see issue #117 on why those
+# objects are not reproducible across machines that agree on every visible
+# input.
+RUN CGO_CFLAGS="-I /blazesym/capi/include" \
+    CGO_LDFLAGS="-L /blazeonly -lblazesym_c" \
+    go build -trimpath -o /gpu-cuda-profile ./cmd/gpu-cuda-profile
+
+# Proof, in the build, that the static link actually took. The failure it
+# prevents is a container that starts, is granted its capabilities, and then
+# cannot exec -- which reads as a Kubernetes problem rather than a link
+# problem.
+RUN ! ldd /gpu-cuda-profile | grep -q blazesym \
+    || (echo "blazesym linked dynamically: file capabilities will not survive exec" && exit 1)
+
+FROM ubuntu:24.04
+
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends libcap2-bin ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /gpu-cuda-profile /usr/local/bin/gpu-cuda-profile
+COPY build/agent-entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# FILE CAPABILITIES, so the container does not have to run as root.
+#
+# securityContext.capabilities.add puts capabilities in the container's
+# BOUNDING set. A root process gets them in its effective set from there; a
+# non-root process does NOT -- it needs them on the file. Setting them here is
+# what makes runAsNonRoot possible, and a pod that runs as root gets the same
+# capabilities either way, so this is strictly the safer default.
+#
+# The four, and why each: CAP_BPF loads programs and creates maps and links;
+# CAP_PERFMON opens perf events; CAP_SYS_PTRACE reads another process's memory;
+# CAP_CHECKPOINT_RESTORE dereferences /proc/<pid>/map_files, without which
+# every user-space frame resolves to a bare hex address.
+#
+# CAP_SYSLOG IS DELIBERATELY NOT AMONG THEM, and this is a trade-off rather
+# than an oversight. It would buy kernel-frame symbolization: without it
+# /proc/kallsyms reads zeros and kernel symbolization is silently skipped. But
+# the kernel refuses to exec a file whose file capabilities are not a SUBSET of
+# the bounding set, so a binary carrying five would fail to start -- with a
+# bare EPERM -- in the four-capability deployment this project documents and
+# examples/kubernetes ships. Measured, not reasoned about: granting exactly
+# BPF, PERFMON, SYS_PTRACE and CHECKPOINT_RESTORE to a five-capability binary
+# fails at exec.
+#
+# So the image is built for the deployment that exists, and kernel frames are
+# unavailable in it. Adding SYSLOG to a securityContext will NOT enable them
+# either: for a non-root process the permitted set comes from the file
+# capabilities, so a capability the binary does not carry cannot be gained by
+# granting it. Kernel stacks need a build that setcaps five and a manifest that
+# grants five, together.
+#
+# CAP_SYS_ADMIN is deliberately ABSENT. It is near-root and is what gets a
+# per-pod agent rejected by admission policy. Staying without it is why the
+# USDT consumer attaches through the uprobe_multi BPF link rather than the
+# perf_uprobe PMU, and it costs a Linux 6.6 floor on the NODE.
+RUN setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep \
+      /usr/local/bin/gpu-cuda-profile \
+ && getcap /usr/local/bin/gpu-cuda-profile
+
+# An unprivileged uid, which the capabilities above are what make workable.
+RUN useradd --uid 65532 --no-create-home --shell /usr/sbin/nologin perfagent
+USER 65532
+
+LABEL org.opencontainers.image.title="perf-agent GPU profiler" \
+      org.opencontainers.image.description="Attaches to CUDA processes carrying the perf-agent CUPTI shim" \
+      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent"
+
+# Not the binary directly: see build/agent-entrypoint.sh for why an
+# unexplained EPERM at exec is the failure this wrapper exists to prevent.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

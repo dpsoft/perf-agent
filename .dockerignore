@@ -1,0 +1,9 @@
+# Local build outputs. Copying these into the build context is slow (hundreds
+# of MB of binaries) and pointless: the image builds its own.
+bin-*
+gpu-cuda-profile
+perf-agent
+*.pb.gz
+*.so
+.git
+.worktrees

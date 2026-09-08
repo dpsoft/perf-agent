@@ -240,7 +240,7 @@ std::atomic<uint64_t> g_launch_ordinal{0};
 // The offer budget, read once at init so the drain thread does not re-parse
 // an environment variable every 100ms. Zero disables offers outright.
 unsigned g_cubin_timeout_ms = 0;
-// True when the startup rendezvous confirmed a consumer. See capture_enabled.
+// True when the startup rendezvous confirmed a consumer. See consumer_attached.
 bool g_consumer_enrolled = false;
 
 // Every discard has a counter. Nothing here is allowed to be silent (§6.1).
@@ -262,12 +262,21 @@ std::atomic<uint64_t> g_buffers{0};
 // declined request is not documented, so whatever it does with the records
 // for that window, the refusal itself is on the record here.
 std::atomic<uint64_t> g_buffer_alloc_failed{0};
-// A MODULE_LOADED callback we declined to copy because no consumer was
-// believed present, and one whose descriptor carried no bytes at all. Both
-// are modules that will read gpu_src_status "no-module" later, so both are
-// counted here rather than being invisible.
-std::atomic<uint64_t> g_module_unattached{0};
+// A module copied while no consumer was attached -- retained against the
+// queue's bounds until one arrives, not declined. It is a gauge of how much
+// this process is holding on a profiler's behalf, and the number that says
+// whether a late attach found anything to work with.
+std::atomic<uint64_t> g_module_retained{0};
+// A MODULE_LOADED callback whose descriptor carried no bytes at all. These
+// WILL read gpu_src_status "no-module" later -- nothing can be captured from
+// a descriptor with nothing in it -- so they are counted rather than being
+// invisible.
 std::atomic<uint64_t> g_module_no_bytes{0};
+
+// Declared here rather than with the rest of the process setup because
+// on_cubin_captured below is what fills it: a module load that arrives before
+// any consumer is logged for replay instead of being emitted.
+perfagent::ReplayLog *g_replay = nullptr;
 
 bool g_names_was_attached = false;
 
@@ -289,7 +298,7 @@ bool g_names_was_attached = false;
 // semaphore: the rendezvous CONNECT succeeded, which the consumer performs
 // before it creates the uprobe link, or the semaphore has since armed. In an
 // unprofiled process both read false and no module is ever copied.
-bool capture_enabled() {
+bool consumer_attached() {
     return g_consumer_enrolled || gpu_module_load_v1_enabled();
 }
 
@@ -324,14 +333,21 @@ uint64_t cupti_cubin_crc(const void *bytes, size_t len) {
 // (core/cubin.h); this record announces THAT a module loaded, with its CRC
 // and size.
 void on_cubin_captured(void *ctx, uint64_t crc, const void *bytes, size_t len) {
-    if (!gpu_module_load_v1_enabled()) return;
     gpu_module_load_v1 r{};
     r.cubin_crc = crc;
     r.module_id = (uint64_t)(uintptr_t)ctx;
     r.size_bytes = (uint64_t)len;
     r.load_ns = mono_ns();
     r.bytes_ptr = (uint64_t)(uintptr_t)bytes;
-    gpu_module_load_v1_emit(&r, 1, g_module_seq.fetch_add(1, std::memory_order_relaxed));
+    // Live, or logged for replay -- never both, and that is what keeps a
+    // launched run from receiving every module twice. The log holds exactly
+    // the records nobody was there to hear, so the replay on the attach edge
+    // emits exactly the ones that were missed.
+    if (gpu_module_load_v1_enabled()) {
+        gpu_module_load_v1_emit(&r, 1, g_module_seq.fetch_add(1, std::memory_order_relaxed));
+        return;
+    }
+    g_replay->record_module(r);
 }
 
 // CUPTI_CBID_RESOURCE_MODULE_LOADED.
@@ -359,10 +375,28 @@ void on_module_loaded(const CUpti_ResourceData *rd) {
     // g_cubins is constructed before cuptiSubscribe, so a callback cannot
     // arrive ahead of it -- but a null here would be a segfault in somebody
     // else's process, which is not a way to find that out.
-    if (!capture_enabled() || !g_cubins) {
-        g_module_unattached.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
+    if (!g_cubins) return;
+    // Captured whether or not anyone is listening yet, which is the whole of
+    // the late-attach fix.
+    //
+    // This used to be gated on a consumer already being present, and the
+    // gate was measured: a consumer attaching to a running process found
+    // ZERO modules -- not most, all of them -- because a CUDA process loads
+    // essentially every module it will ever use during startup, and the bytes
+    // are only offered by the vendor once, inside this callback, with a
+    // buffer that is reused afterwards. There is no second chance at them and
+    // no API to re-enumerate what is loaded, so a module not copied here is
+    // gone for the life of the process, and every PC sample that lands in it
+    // reads gpu_src_status="no-module" forever after.
+    //
+    // The cost is bounded and it is the queue's bounds that bound it: 512
+    // entries and 64 MiB, the consumer's own ModuleStore limits. Past them
+    // capture() drops the offer and counts it, so a process that is never
+    // profiled holds at most that and no more. The shim's PRESENCE is the
+    // operator's opt-in -- a process without CUDA_INJECTION64_PATH never maps
+    // it at all -- so the memory is only ever held by a process somebody
+    // asked to be able to profile.
+    if (!consumer_attached()) g_module_retained.fetch_add(1, std::memory_order_relaxed);
     const perfagent::CubinView view(m->pCubin, m->cubinSize);
     // moduleId travels as the context, not as a captured pointer: nothing
     // about this call may outlive the callback except the owned copy.
@@ -580,7 +614,6 @@ std::vector<PCContext *> g_pc_ctxs;       // leaked with everything else; see be
 
 perfagent::PCDrainSchedule *g_pc_schedule = nullptr;
 perfagent::Batch<gpu_pc_sample_batch_v1, 32> *g_pcb = nullptr;
-perfagent::ReplayLog *g_replay = nullptr;
 
 std::atomic<unsigned long> g_pc_seq{0};
 std::atomic<unsigned long> g_stall_seq{0};
@@ -1923,7 +1956,7 @@ void report(const char *why) {
          "activity_kernels=%llu activity_other=%llu buffers=%llu buffer_alloc_failed=%llu "
          "exec_unattached=%llu exec_batch_dropped=%llu exec_no_clock=%llu "
          "exec_no_time=%llu cupti_dropped=%llu names=%zu "
-         "modules_captured=%llu module_reload_skipped=%llu module_unattached=%llu "
+         "modules_captured=%llu module_reload_skipped=%llu module_retained_unattached=%llu "
          "module_no_bytes=%llu cubin_too_large=%llu cubin_crc_failed=%llu "
          "cubin_alloc_failed=%llu cubin_queue_full=%llu cubin_queue_depth=%zu "
          "cubins_sent=%llu cubin_send_failed=%llu "
@@ -1952,7 +1985,7 @@ void report(const char *why) {
          // this process could not explain.
          (unsigned long long)(g_cubins ? g_cubins->modules_captured() : 0),
          (unsigned long long)(g_cubins ? g_cubins->module_reload_skipped() : 0),
-         (unsigned long long)g_module_unattached.load(),
+         (unsigned long long)g_module_retained.load(),
          (unsigned long long)g_module_no_bytes.load(),
          (unsigned long long)(g_cubins ? g_cubins->cubin_too_large() : 0),
          (unsigned long long)(g_cubins ? g_cubins->cubin_crc_failed() : 0),
@@ -2216,7 +2249,30 @@ void on_tick() {
     // after `if (!g_pc_enabled) return;` would silence the offer half of every
     // module capture in the DEFAULT configuration -- with modules_captured
     // still counting up and cubins_sent stuck at zero.
-    if (g_cubins) g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
+    //
+    // The replay runs BEFORE the drain, and the order is load-bearing twice
+    // over. gpu_module_load_v1 carries bytes_ptr into the adapter's own copy,
+    // and the drain frees that copy the moment it has offered it -- replaying
+    // afterwards would announce modules by a pointer that had just become
+    // dangling. And a consumer that received bytes for a module it had never
+    // been told about would have to hold them speculatively.
+    //
+    // It also sits here, above the Tier B gate, for the reason the drain
+    // does: module capture is not part of PC sampling. Left at the end of
+    // this function it would never run at all in the default configuration,
+    // because `if (!g_pc_enabled) return` is between the two. Stall maps and
+    // config replay on the same edge and are harmless to move -- their
+    // callbacks are only registered when PC sampling is on, so with it off
+    // this call is three no-ops and an edge flip.
+    g_replay->replay_if_newly_attached(consumer_attached());
+
+    // Drained only when somebody is there to receive it. While unattached the
+    // entries STAY QUEUED: drain() pops and frees whatever it takes,
+    // regardless of whether the offer landed, so draining into a socket
+    // nobody is listening on is indistinguishable from deleting the modules.
+    // That is precisely how a late attach came to find nothing.
+    if (g_cubins && consumer_attached())
+        g_cubins->drain(perfagent::cubin_offer_to_consumer, g_cubin_timeout_ms);
 
     // Graph-launched executions: counted continuously, put on the wire as a
     // delta whenever it moves. Deliberately BEFORE the Tier B gate --- the
@@ -2250,10 +2306,6 @@ void on_tick() {
         pc_drain_all(perfagent::PCDrainReason::kPeriodic);
     g_pcb->flush();
 
-    // The stall map and the config record are one-shot and are queried at
-    // context creation, long before a consumer can attach. ReplayLog replays
-    // both on the unattached -> attached edge.
-    g_replay->replay_if_newly_attached(gpu_stall_reason_map_v1_enabled());
 }
 
 // THE tick. One timer thread, and therefore one thread of ours that can ever
@@ -2431,7 +2483,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
         snprintf(cubin_name, sizeof(cubin_name), "<no-address>");
     perfagent::EnrollResult enrolled =
         perfagent::enroll_with_consumer(perfagent::enroll_timeout_ms(2000));
-    // The gate for cubin capture -- see capture_enabled(). A confirmed
+    // The gate for OFFERING captures -- see consumer_attached(). A confirmed
     // rendezvous is a positive statement that a consumer is attached, made
     // at a moment when the probe semaphore may still read zero.
     g_consumer_enrolled = (enrolled == perfagent::kEnrollConfirmed);
@@ -2530,6 +2582,15 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                 gpu_config_v1_emit(&r, 1, g_config_seq.fetch_add(1, std::memory_order_relaxed));
         });
     }
+    // Registered UNCONDITIONALLY, unlike the two above. Those describe PC
+    // sampling and are meaningless with it off; module loads are not part of
+    // PC sampling and happen in every configuration, so putting this inside
+    // the PC block would leave the default build retaining every module and
+    // then never announcing one.
+    g_replay->on_replay_module([](const gpu_module_load_v1 &r) {
+        if (gpu_module_load_v1_enabled())
+            gpu_module_load_v1_emit(&r, 1, g_module_seq.fetch_add(1, std::memory_order_relaxed));
+    });
     if (g_pc_tier_a) {
         perfagent::BurstConfig bc;
         bc.burst_ns = (uint64_t)env_uint("PERFAGENT_GPU_PC_BURST_MS", 50) * 1000000ull;

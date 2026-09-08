@@ -138,9 +138,11 @@ size_t CubinQueue::drain(CubinOfferFn offer, unsigned timeout_ms) {
         } else {
             // Broader than cubin.cc's cubins_send_failed(), on purpose: that
             // counter excludes "nobody was listening", because an unprofiled
-            // process must not accumulate failures. Here the queue only ever
-            // holds bytes when a consumer was believed present, so a
-            // no-listener result IS a module the consumer will not have.
+            // process must not accumulate failures. Here the caller only
+            // drains when it believes a consumer is present -- the adapter
+            // retains rather than drains while unattached, precisely so an
+            // offer is never made into the void -- so a no-listener result IS
+            // a module the consumer will not have.
             send_failed_.fetch_add(1, std::memory_order_relaxed);
         }
     }

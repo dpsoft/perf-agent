@@ -397,6 +397,52 @@ void test_destruction_releases_undrained_copies() {
     printf("  destroying a non-empty queue releases its copies\n");
 }
 
+// Retention: a queue nobody drains must HOLD, and hold the bytes intact.
+//
+// This is the property the adapter's late-attach fix rests on. It retains
+// captures while no consumer is attached and drains only once one arrives,
+// because drain() pops and frees whatever it takes regardless of whether the
+// offer landed -- so draining into a socket nobody is listening on is
+// indistinguishable from deleting the modules, which is exactly how a late
+// attach came to find zero of them.
+//
+// The failure this guards against is a plausible "optimisation": making the
+// queue self-trim, or drop its oldest entry on a timer, on the reasoning that
+// a queue is a transient thing. It is not one any more.
+void test_an_undrained_queue_retains_everything_intact() {
+    reset_offers();
+    reset_captured();
+    CubinQueue q;
+    const char *payloads[] = {"module-alpha", "module-bravo", "module-charlie"};
+    for (int i = 0; i < 3; i++) {
+        const CubinView v(payloads[i], strlen(payloads[i]));
+        assert(q.capture(v, fnv1a, nullptr, nullptr));
+    }
+    // Many ticks' worth of doing nothing. Nothing may age out on its own:
+    // there is no deadline in this policy, only the bounds.
+    assert(q.depth() == 3);
+    assert(q.modules_captured() == 3);
+    assert(q.cubin_queue_full() == 0);
+    assert(g_offers.empty());
+
+    // And when a consumer finally arrives, every one of them is offered --
+    // with its BYTES, not just its CRC. A retention scheme that kept the
+    // entries but lost the contents would satisfy every counter above and
+    // still deliver nothing a consumer could parse.
+    assert(q.drain(record_offer, 0) == 3);
+    assert(g_offers.size() == 3);
+    for (int i = 0; i < 3; i++) assert(g_offers[i].bytes == payloads[i]);
+    assert(q.depth() == 0);
+    printf("  an undrained queue retains every capture, bytes intact\n");
+}
+
+void test_the_retention_bounds_are_the_consumers_store_bounds() {
+    const CubinQueueLimits d;
+    assert(d.max_entries == 512);                     // gpu.ModuleStoreConfig.Capacity
+    assert(d.max_queued_bytes == 64u * 1024 * 1024);  // gpu.ModuleStoreConfig.MaxBytes
+    printf("  the retention bounds are the consumer's module-store bounds\n");
+}
+
 }  // namespace
 
 int main() {
@@ -413,6 +459,8 @@ int main() {
     test_a_slow_offer_does_not_block_a_capture();
     test_a_healthy_run_reads_zero_on_every_drop_counter();
     test_destruction_releases_undrained_copies();
+    test_an_undrained_queue_retains_everything_intact();
+    test_the_retention_bounds_are_the_consumers_store_bounds();
     printf("cubinqueue_test: OK\n");
     return 0;
 }

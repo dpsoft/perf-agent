@@ -189,13 +189,13 @@ sidecar and should be stated in a pod spec rather than absorbed quietly.
 - **No published container image** for the init-container pattern. CI uploads
   the portable shim as a build artifact; there is no registry image to name in
   a pod spec yet.
-- **Modules that loaded before the attach are missed entirely.** The adapter
-  captures a module's bytes only while a consumer is present
-  (`capture_enabled()` in `shim/nvidia/cupti_adapter.cc`), and a CUDA process
-  loads essentially all of its modules during startup. Measured loss on a late
-  attach is 100%: every PC sample reads `gpu_src_status="no-module"` and
-  carries no source line. Launches, stacks, kernel names and timings are
-  unaffected. A run that hits this says so. Tracked in issue #124.
+- **Retention costs the target memory.** The shim captures every module's
+  bytes whether or not a consumer has attached, because the driver offers them
+  exactly once and there is no way to ask again — so a process that is never
+  profiled can hold up to 512 modules or 64 MiB (the consumer's own module
+  store bounds) on a profiler's behalf. Past those bounds captures are dropped
+  and counted; nothing grows without limit. `module_retained_unattached` in the
+  adapter's exit report is what it is currently holding.
 - **The collector (DaemonSet) shape is not built yet** — `-pid` is its
   prerequisite, not the whole of it. One profile per pod versus one profile
   labelled by pod, attaching to pods that start later, and whether the shim is

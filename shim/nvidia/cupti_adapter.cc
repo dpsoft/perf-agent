@@ -29,6 +29,8 @@
 // the module-capture path as well as by the whole PC-sampling block below.
 #include <cupti_pcsampling.h>
 
+#include "cupti_dyn.h"
+
 // MUST come after the CUPTI headers and before everything else in this file.
 // It defines a guarded wrapper for every CUPTI entry point this adapter uses
 // and then POISONS the raw names, so from this line down a call site that
@@ -2364,6 +2366,20 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
     if (!done.compare_exchange_strong(expected, true)) return 1;
 
     open_log();
+
+    // CUPTI is resolved at runtime, not linked (see cupti_dyn.h). Do it here,
+    // before anything can call through the table, and DECLINE rather than
+    // crash: this runs inside a process that did not ask to be profiled, and
+    // taking it down because the operator has no CUDA toolkit installed would
+    // be an unacceptable way to report that.
+    //
+    // Returning 1 is the driver's "injection handled" answer. There is no way
+    // to tell it we did nothing, which is the same reason the adapter reports
+    // its own state on stderr instead of relying on the return.
+    if (!perfagent::cupti::dyn::load()) {
+        fprintf(stderr, "perfagent-cupti: not attaching; the process runs unprofiled\n");
+        return 1;
+    }
 
     // The #49 startup rendezvous, and this is the one place in a CUDA process
     // where it can be done: the driver dlopened us during cuInit, so libcuda,

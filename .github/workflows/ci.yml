@@ -219,6 +219,106 @@ jobs:
 
   # Integration tests require root and are harder to run in CI
   # They can be run manually or in a different environment
+  shim:
+    name: GPU shim (portability gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # CUPTI HEADERS ONLY. No CUDA runtime, no toolkit, no GPU.
+      #
+      # This job exists because it could not: until the adapter resolved CUPTI
+      # with dlopen, building it needed libcupti to link against, so CI could
+      # not build the shim, so nothing gated it and no release shipped it. GPU
+      # mode had no artifact at all (issue #121).
+      #
+      # cuda-crt and cuda-cudart-dev come along because CUPTI's headers include
+      # crt/host_defines.h, which the CUPTI package itself does not carry.
+      #
+      # 13-3 and not 13-0: the adapter uses CUpti_ActivityKernel12, which does
+      # not exist in CUDA 13.0's CUPTI. That is a real minimum and this is the
+      # only place it is stated.
+      - name: Install CUPTI headers
+        run: |
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-cupti-dev-13-3 cuda-crt-13-3 cuda-cudart-dev-13-3
+
+      - name: Build the shim and gate it
+        run: |
+          make -C shim nvidia \
+            CUDA_HOME=/usr/local/cuda-13.3 \
+            CUDA_INC=/usr/local/cuda-13.3/targets/x86_64-linux/include
+          # The ORDINARY build, which is for local work and does not claim to
+          # be shippable: the runner's glibc is 2.39, and this target links
+          # libstdc++ dynamically on purpose. So the floor and the libstdc++
+          # rule are relaxed here and enforced on the portable artifact below,
+          # where they are actually promised. A gate that fails a build for a
+          # property that build never claimed is a gate people switch off.
+          ./shim/elfgate.sh shim/libperfagent-gpu-nvidia.so 2.39 any
+
+      # The artifact a release actually ships, built against an old glibc so it
+      # can load into the images it is injected into. Measured: the ordinary
+      # build fails to dlopen on Ubuntu 22.04, 24.04 and 25.04.
+      - name: Build the portable shim and gate it at the real floor
+        run: |
+          docker run --rm \
+            -v "$PWD":/src:ro -v /usr/local/cuda-13.3:/cuda:ro -v "$PWD":/out \
+            ubuntu:22.04 sh -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq >/dev/null 2>&1
+              apt-get install -y -qq g++ >/dev/null 2>&1
+              cd /src/shim
+              g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
+                  -mtls-dialect=gnu -pthread -I core -I /cuda/targets/x86_64-linux/include \
+                  -shared -o /out/libperfagent-gpu-nvidia.portable.so \
+                  nvidia/cupti_adapter.cc core/batch.cc core/clock.cc core/cubin.cc \
+                  core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc \
+                  -Wl,--version-script=nvidia/export.map \
+                  -Wl,-soname,libperfagent-gpu-nvidia.so.1 \
+                  -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL'
+          ./shim/elfgate.sh libperfagent-gpu-nvidia.portable.so 2.34
+
+      # Loading is the claim; assert it rather than infer it from the ELF.
+      # Loading is the claim; assert it rather than infer it from the ELF.
+      # The version headers said the old shim was fine too -- only dlopen
+      # disagreed.
+      - name: Prove it loads on the images it targets
+        run: |
+          # Into the workspace, not /tmp: mounting the host's /tmp over the
+          # container's makes it read-only, and apt-get then cannot install
+          # the compiler. The container writes only to its own /tmp.
+          cat > tryload.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+              void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+              if (!h) { printf("FAILS: %s\n", dlerror()); return 1; }
+              printf("LOADS\n");
+              return dlsym(h, "InitializeInjection") ? 0 : 1;
+          }
+          EOF
+          for img in ubuntu:22.04 ubuntu:24.04 ubuntu:25.04; do
+            echo "== $img"
+            docker run --rm -v "$PWD":/w:ro "$img" sh -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq >/dev/null
+              apt-get install -y -qq gcc >/dev/null
+              gcc -o /tmp/t /w/tryload.c
+              /tmp/t /w/libperfagent-gpu-nvidia.portable.so' || exit 1
+          done
+          rm -f tryload.c
+
+      - name: Upload the portable shim
+        uses: actions/upload-artifact@v4
+        with:
+          name: libperfagent-gpu-nvidia.so
+          path: libperfagent-gpu-nvidia.portable.so
+          retention-days: 30
+
   integration-tests:
     name: Integration Tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

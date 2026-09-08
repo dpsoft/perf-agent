@@ -285,6 +285,10 @@ const paletteCSS = `
 .frame.match{background-color:var(--fill-match)}
 .frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
 .sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
 `
 
 // The jitter ladder. jitterSteps shades per domain, evenly spaced from 0 to

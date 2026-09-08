@@ -651,10 +651,12 @@ func writeInfoPanel(ew *errWriter, root *node, res *foldedstacks.Result, opts Op
 // legend never advertises a layer the profile does not contain.
 func writeLegend(ew *errWriter, root *node) {
 	present := make([]bool, numDomains)
+	presentRes := map[Resolution]bool{}
 	var walk func(*node)
 	walk = func(n *node) {
 		if n.depth > 0 {
 			present[n.domain] = true
+			presentRes[ResolutionOf(n.name)] = true
 		}
 		for _, c := range n.children {
 			walk(c)
@@ -672,7 +674,10 @@ func writeLegend(ew *errWriter, root *node) {
 		cls := "sw"
 		if info.Overlay != "" {
 			// The swatch is hatched exactly when the frames are, so the
-			// legend row and the graph read as the same thing.
+			// legend row and the graph read as the same thing. Only domains
+			// still own a texture; the rest moved to the resolution legend
+			// below, and a swatch here that hatched without a matching frame
+			// rule would be the legend contradicting the graph.
 			cls += " hatched"
 		}
 		ew.f("<li><span class=\"%s\" style=\"background-color:%s\"", cls, info.Fill)
@@ -685,8 +690,9 @@ func writeLegend(ew *errWriter, root *node) {
 		ew.esc(info.Desc)
 		ew.s("</li>\n")
 	}
+	writeResolutionLegend(ew, presentRes)
 	if root.inexact > 0 {
-		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching</b> Either the frame has no symbol, or its CPU attribution was inferred rather than measured. Hover the frame for which.</li>\n")
+		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching, the other way</b> This frame&rsquo;s CPU attribution was inferred rather than measured. A frame can carry this and a texture above at the same time.</li>\n")
 	} else {
 		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching</b> The frame has no symbol, or no CPU stack stands behind it. Hover the frame for which.</li>\n")
 	}
@@ -901,4 +907,44 @@ func (e *errWriter) f(format string, args ...any) {
 		return
 	}
 	_, e.err = fmt.Fprintf(e.w, format, args...)
+}
+
+// writeResolutionLegend explains the textures.
+//
+// A second axis, because the first one could not carry it: colour says what
+// kind of code a frame is, texture says how well it could be named, and until
+// these were separated the legend had to fall back on "either the frame has no
+// symbol, or its attribution was inferred — hover the frame for which", which
+// is the legend admitting it cannot tell the reader what they are looking at.
+//
+// Only the resolutions actually present are listed, on the same principle as
+// the domain legend: never advertise a state the profile does not contain.
+func writeResolutionLegend(ew *errWriter, present map[Resolution]bool) {
+	order := []Resolution{
+		ResolutionModuleOffset, ResolutionObfuscated,
+		ResolutionBareAddress, ResolutionInterpreter,
+	}
+	any := false
+	for _, r := range order {
+		if present[r] {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+	ew.s("</ul>\n<h2>Texture means how well it is named</h2>\n")
+	ew.s("<p class=\"muted\">Independent of the colour: a frame can be vendor code that is fully named, or application code with no symbol at all. A frame with no texture was named by a symbol table.</p>\n<ul class=\"legend-list\">\n")
+	for _, r := range order {
+		if !present[r] {
+			continue
+		}
+		info := r.Info()
+		ew.f("<li><span class=\"sw res-%s\"></span><b>", info.Key)
+		ew.esc(info.Label)
+		ew.s("</b> ")
+		ew.esc(info.Desc)
+		ew.s("</li>\n")
+	}
 }

@@ -218,3 +218,70 @@ func TestLaunchCacheEntriesIsACopyNotAView(t *testing.T) {
 	assert.Equal(t, "k_a", got.KernelName, "mutating the returned slice must not affect the cache's stored value")
 	assert.Equal(t, 1, c.Len(), "appending to the returned slice must not grow the cache")
 }
+
+// Issue #137: an eviction only costs an attribution if nothing had joined the
+// entry yet, and the cache is the only thing that can tell the two apart.
+func TestEvictingAJoinedLaunchIsNotCountedAsALoss(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 2})
+
+	put := func(id string, ns uint64) CorrelationID {
+		corr := CorrelationID{Backend: BackendCUPTI, PID: 7, Value: id}
+		c.Put(GPUKernelLaunch{Correlation: corr, TimeNs: ns})
+		return corr
+	}
+	a := put("a", 1000)
+	b := put("b", 2000)
+
+	// Its execution arrives and joins. From here on the entry has done its
+	// job and its eviction costs nothing.
+	if _, ok := c.Get(a); !ok {
+		t.Fatal("the launch should be live")
+	}
+
+	// Two more launches push both originals out at capacity.
+	put("c", 3000)
+	put("d", 4000)
+
+	st := c.Stats()
+	if st.EvictedCapacity != 2 {
+		t.Fatalf("want 2 capacity evictions, got %d", st.EvictedCapacity)
+	}
+	if st.EvictedCapacityUnjoined != 1 {
+		t.Errorf("only the launch that never joined lost an attribution: want 1 unjoined "+
+			"eviction, got %d", st.EvictedCapacityUnjoined)
+	}
+	_ = b
+}
+
+// The heuristic join does not go through Get, so without MarkJoined every
+// heuristically-joined launch would look unused and its eviction would be
+// reported as a lost attribution that had in fact been attributed.
+func TestAHeuristicallyJoinedLaunchIsAlsoNotALoss(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 1})
+	corr := CorrelationID{Backend: BackendCUPTI, PID: 7, Value: "a"}
+	c.Put(GPUKernelLaunch{Correlation: corr, TimeNs: 1000})
+
+	c.MarkJoined(corr)
+
+	c.Put(GPUKernelLaunch{Correlation: CorrelationID{Backend: BackendCUPTI, PID: 7, Value: "b"}, TimeNs: 2000})
+
+	st := c.Stats()
+	if st.EvictedCapacity != 1 {
+		t.Fatalf("want 1 capacity eviction, got %d", st.EvictedCapacity)
+	}
+	if st.EvictedCapacityUnjoined != 0 {
+		t.Errorf("a launch the heuristic path joined must not be counted as lost: got %d",
+			st.EvictedCapacityUnjoined)
+	}
+}
+
+// A correlation the cache no longer holds is not an error: the entry may have
+// been evicted between the heuristic scan and the mark, and the join still
+// happened against the copy Entries returned.
+func TestMarkingAnEvictedLaunchIsHarmless(t *testing.T) {
+	c := NewLaunchCache(LaunchCacheConfig{Capacity: 4})
+	c.MarkJoined(CorrelationID{Backend: BackendCUPTI, PID: 7, Value: "absent"})
+	if st := c.Stats(); st.EvictedCapacity != 0 || st.EvictedCapacityUnjoined != 0 {
+		t.Errorf("marking an absent correlation changed the counters: %+v", st)
+	}
+}

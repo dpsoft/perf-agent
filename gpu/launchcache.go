@@ -36,8 +36,20 @@ type LaunchCacheConfig struct {
 // eviction path is counted: a cache that loses attributions silently is
 // indistinguishable from a correlation bug.
 type LaunchCacheStats struct {
-	Live               int    `json:"live"`
-	EvictedCapacity    uint64 `json:"evicted_capacity,omitempty"`
+	Live int `json:"live"`
+
+	// EvictedCapacity is every eviction at the capacity bound, and on a long
+	// run it is mostly a NON-EVENT: a bounded LRU reaching its bound is what
+	// the bound is for, and an entry evicted after its execution already
+	// joined cost nothing at all.
+	//
+	// EvictedCapacityUnjoined is the subset that actually lost an
+	// attribution -- launches evicted before any execution found them. It is
+	// always <= EvictedCapacity, and it is the one worth raising an anomaly
+	// about. Their executions reach the profile as unmatched GPU time with no
+	// CPU stack.
+	EvictedCapacity         uint64 `json:"evicted_capacity,omitempty"`
+	EvictedCapacityUnjoined uint64 `json:"evicted_capacity_unjoined,omitempty"`
 	EvictedHorizon     uint64 `json:"evicted_horizon,omitempty"`
 	Replaced           uint64 `json:"replaced,omitempty"`
 	AnomalousTimestamp uint64 `json:"anomalous_timestamp,omitempty"`
@@ -61,6 +73,22 @@ const defaultMaxAdvanceNs = 60 * 1e9 // 60s
 type cacheEntry struct {
 	launch GPUKernelLaunch
 	seq    uint64
+	// joined records that an execution has already found this launch.
+	//
+	// It exists to make eviction legible. Get does not delete -- the cache
+	// serves repeated correlations -- so a launch stays live long after it has
+	// done its job, and capacity eviction reaches it eventually on any run
+	// with more than Capacity launches. Without this flag the two eviction
+	// outcomes are indistinguishable:
+	//
+	//	evicted AFTER joining   free. The entry had already been used.
+	//	evicted BEFORE joining  a lost attribution: its execution can no
+	//	                        longer find it, and that GPU time reaches the
+	//	                        profile with no CPU stack.
+	//
+	// Reporting the first as the second is what made the capacity anomaly fire
+	// on healthy runs (issue #137).
+	joined bool
 }
 
 // LaunchCache is a bounded FIFO of recent launches indexed by correlation ID.
@@ -154,7 +182,36 @@ func (c *LaunchCache) Get(id CorrelationID) (GPUKernelLaunch, bool) {
 	if !ok {
 		return GPUKernelLaunch{}, false
 	}
+	// A successful Get IS the join: this is the exact-correlation path, and
+	// the caller uses what it returns. Marking here rather than asking the
+	// caller to call back keeps the flag true by construction -- a join that
+	// forgot to report itself would make its own eviction look like a loss.
+	if !e.joined {
+		e.joined = true
+		c.byCorr[id] = e
+	}
 	return e.launch, true
+}
+
+// MarkJoined records that a launch was joined through a path that does not go
+// through Get.
+//
+// The heuristic join is that path: it scans Entries() for a candidate rather
+// than looking one up by correlation, so nothing tells the cache which entry
+// it settled on. Without this call every heuristic join would leave its launch
+// looking unjoined, and its eventual eviction would be counted as a lost
+// attribution that had in fact been attributed.
+//
+// A correlation the cache no longer holds is not an error: the entry may have
+// been evicted between the scan and here, and the join still happened -- it
+// used the copy Entries returned.
+func (c *LaunchCache) MarkJoined(id CorrelationID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byCorr[id]; ok && !e.joined {
+		e.joined = true
+		c.byCorr[id] = e
+	}
 }
 
 // Entries returns a snapshot of the launches currently live in the cache, in
@@ -210,6 +267,11 @@ func (c *LaunchCache) evictLocked() {
 		id, ok := c.order.evictOldestLive(c.isLiveLocked)
 		if !ok {
 			break
+		}
+		// Read BEFORE the delete: the entry is what says whether this
+		// eviction cost anything.
+		if e, present := c.byCorr[id]; present && !e.joined {
+			c.stats.EvictedCapacityUnjoined++
 		}
 		delete(c.byCorr, id)
 		c.stats.EvictedCapacity++

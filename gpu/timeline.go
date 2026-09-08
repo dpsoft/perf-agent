@@ -1710,6 +1710,11 @@ func (t *Timeline) Snapshot() Snapshot {
 			view.Heuristic = true
 			view.Ambiguous = match.ambiguous
 			stats.HeuristicExecutionJoinCount++
+			// The heuristic path found its launch by scanning rather than by
+			// lookup, so the cache does not otherwise learn that this entry
+			// was used -- and an entry that looks unused is counted as a lost
+			// attribution when it is eventually evicted (issue #137).
+			t.cache.MarkJoined(match.launch.Correlation)
 			if match.ambiguous {
 				stats.AmbiguousHeuristicMatchCount++
 			}

@@ -590,3 +590,38 @@ func TestJoinHealthSurfacesTheHeuristicProcessGuard(t *testing.T) {
 	require.Len(t, cleanLines, 1, "a healthy snapshot must stay one line: %v", cleanLines)
 	assert.Contains(t, cleanLines[0], "no anomalies")
 }
+
+// The heuristic join must tell the CACHE it used the launch, not just the
+// snapshot.
+//
+// The join happens by scanning Entries() rather than by looking a correlation
+// up, so nothing informs the cache which entry was chosen. Without that,
+// every heuristically-joined launch looks unused for the rest of its life and
+// its eventual capacity eviction is counted as a lost attribution — the exact
+// false alarm issue #137 is about, reintroduced through the one join path that
+// does not go through Get.
+//
+// Driven through Timeline rather than by calling MarkJoined directly: the
+// method working is not the property at risk, the CALL SITE existing is.
+func TestAHeuristicJoinMarksTheLaunchAsUsedInTheCache(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 1}})
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "7", 10, "a_work", "pod-a")))
+	require.NoError(t, tl.EmitExec(heurExecIn(4242, 20, 30)))
+
+	snap := tl.Snapshot()
+	require.Len(t, snap.Executions, 1)
+	require.Equal(t, JoinHeuristic, snap.Executions[0].Join,
+		"the fixture must actually take the heuristic path or this test proves nothing")
+
+	// A second launch evicts the first at capacity 1. Because the first was
+	// joined — heuristically — that eviction cost nothing and must not be
+	// counted as a loss.
+	require.NoError(t, tl.EmitLaunch(taggedLaunchIn(4242, "8", 40, "b_work", "pod-a")))
+
+	lc := tl.Snapshot().LaunchCache
+	require.Equal(t, uint64(1), lc.EvictedCapacity,
+		"the fixture must actually evict, or the assertion below is vacuous")
+	assert.Zero(t, lc.EvictedCapacityUnjoined,
+		"the evicted launch had already been joined heuristically, so its eviction lost "+
+			"nothing — counting it would put a permanent false anomaly on every long run")
+}

@@ -415,10 +415,34 @@ func joinAnomalies(snap Snapshot, proj ProjectionStats) []string {
 			"LaunchEventJoinWindowNs — widen that window or snapshot more often",
 			js.OutOfWindowDropCount)
 	}
-	if lc.EvictedCapacity > 0 {
-		add("launch cache evicted %s at capacity (%d live) — too small for the launch rate, "+
-			"so their executions cannot join; raise TimelineConfig.LaunchCache.Capacity",
-			plural(lc.EvictedCapacity, "launch", "launches"), lc.Live)
+	// The capacity anomaly fires on the LOSS, not on the bound being reached.
+	//
+	// It used to fire on EvictedCapacity alone and assert "their executions
+	// cannot join", which is untrue of most of them: LaunchCache.Get does not
+	// delete, so a launch stays live long after its execution has joined, and
+	// capacity eviction reaches it eventually on any run with more than
+	// Capacity launches. Measured on an RTX 3090: a 20 s attach reported
+	// 45,172 such evictions while projecting 111,056 samples from ~110,851
+	// launches and joining every execution in its final snapshot exactly. The
+	// alarm was describing a bounded LRU doing its job.
+	//
+	// That mattered more than noise. Attach mode has no natural end, so the
+	// line fired on every long run forever, and an operator who sees the same
+	// alarm every interval learns to skip it — along with the next one, which
+	// is real. The advice was also actively wrong: raising Capacity moves the
+	// cliff and makes resident memory grow with the length of the run, which
+	// for a collector is unbounded by construction.
+	//
+	// EvictedCapacityUnjoined counts only launches evicted before any
+	// execution found them, which is the population that genuinely reaches the
+	// profile as GPU time with no CPU stack.
+	if lc.EvictedCapacityUnjoined > 0 {
+		add("launch cache evicted %s at capacity BEFORE their execution arrived (%d live, "+
+			"%d evicted in total) — that GPU time is in the profile with no CPU stack. The "+
+			"cache is too small for the launch-to-execution latency at this rate: raise "+
+			"TimelineConfig.LaunchCache.Capacity, or snapshot more often so executions "+
+			"join sooner",
+			plural(lc.EvictedCapacityUnjoined, "launch", "launches"), lc.Live, lc.EvictedCapacity)
 	}
 	if lc.EvictedHorizon > 0 {
 		add("launch cache evicted %s past HorizonNs — they aged out before their execution "+

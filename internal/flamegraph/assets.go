@@ -65,28 +65,41 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // about 14 px they draw a lone ellipsis. Both are the browser applying the
 // rule, not a threshold anyone chose.
 const styleSheet = `
-:root{--bg:#fbf9f6;--panel:#fffefc;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--fatal-bg:#fdecec;--fatal-line:#e0a3a3}
+:root{--tip-bg:#1f1d24;--tip-ink:#f2eff7;--tip-line:#3a3543;--bg:#f7f6f9;--panel:#ffffff;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--fatal-bg:#fdecec;--fatal-line:#e0a3a3}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){` + darkChrome + `}}
 :root[data-theme="dark"]{` + darkChrome + `}
 *{box-sizing:border-box}
-body{margin:0;padding:8px 12px 30px;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5}
+body{margin:0;padding:0 0 34px;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5}
 code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
 .muted{color:var(--muted)}
-.top{display:flex;align-items:baseline;gap:8px}
-h1{font-size:13px;font-weight:600;margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.top button,.top summary{cursor:pointer;color:var(--muted);background:none;border:0;padding:0 2px;font-size:15px;line-height:1;list-style:none}
+.top{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:baseline;gap:9px;flex:0 0 auto}
+.brand b{font-size:16px;font-weight:700;letter-spacing:-.015em}
+.brand i{font-style:italic;color:var(--muted);font-size:12.5px}
+h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+.readout{display:flex;gap:6px;flex:0 0 auto}
+.readout span{padding:3px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);font-size:12px;white-space:nowrap}
+.readout b{font-weight:600}
+.top button,.top summary{cursor:pointer;color:var(--muted);background:none;border:0;padding:2px 4px;font-size:15px;line-height:1;list-style:none;border-radius:6px}
 .top summary::-webkit-details-marker{display:none}
-.top button:hover,.top summary:hover{color:var(--accent)}
+.top button:hover,.top summary:hover{color:var(--accent);background:var(--bg)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
+.legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block}
+.legend .sep{width:1px;height:14px;background:var(--line)}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
-.note{margin:6px 0 0;padding:3px 9px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:5px;background:var(--warn-bg);font-size:12px}
-.chart{position:relative;margin:8px 0 0}
+.note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
+.chart{position:relative;margin:10px 16px 0;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
 .frame{position:absolute;height:17px;padding:0 4px;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px;cursor:pointer}
 .frame.dim{opacity:.15}
-#status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:12px;align-items:center;padding:2px 12px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}
+#status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:14px;align-items:center;padding:5px 16px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}
+#status b{font-weight:600}
+#status .k{color:var(--muted)}
+#brandf{color:var(--muted);font-style:italic;white-space:nowrap}
 #st{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #mc{color:var(--muted);white-space:nowrap}
 #q{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px;width:15em}
-#tip{position:fixed;z-index:8;left:0;top:0;max-width:46em;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 2px 10px rgb(0 0 0/.2);font-size:12px;line-height:1.45;white-space:pre-line;word-break:break-all;pointer-events:none}
+#tip{position:fixed;z-index:8;left:0;top:0;max-width:44em;padding:11px 14px;border:1px solid var(--tip-line);border-radius:10px;background:var(--tip-bg);color:var(--tip-ink);box-shadow:0 8px 28px rgb(0 0 0/.28);font-size:12.5px;line-height:1.5;white-space:pre-line;word-break:break-word;pointer-events:none}
 #panel{position:fixed;z-index:9;top:32px;left:50%;transform:translateX(-50%);width:min(1000px,calc(100% - 24px));max-height:calc(100vh - 72px);overflow:auto;padding:12px 16px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 8px 34px rgb(0 0 0/.25);cursor:auto;text-align:left}
 #panel h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:14px 0 6px}
 #panel h2:first-of-type{margin-top:0}

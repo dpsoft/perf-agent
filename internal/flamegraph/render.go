@@ -541,14 +541,82 @@ func group(v int64) string {
 // the panel one of them opens. The info button grows a dot when the profile
 // carries notes, so a page with caveats never looks like a page without.
 func writeTopBar(ew *errWriter, opts Options, res *foldedstacks.Result, root *node) {
-	ew.s("<div class=\"top\">\n<h1>")
+	ew.s("<div class=\"top\">\n")
+	// The wordmark, which is the product rather than the file. The profile's
+	// own name moves to the middle of the bar and to the status line: a page
+	// with no identity of its own reads as a debug artefact, and this one is
+	// meant to be shared.
+	ew.s("<span class=\"brand\"><b>perf-agent</b><i>Enjoy the Flames.</i></span>\n")
+	ew.s("<h1>")
 	ew.esc(opts.Title)
 	ew.s("</h1>\n")
+	// Metric and unit as READOUTS, not controls. The mock draws them as
+	// dropdowns; a dropdown that cannot switch anything is a lie about what
+	// the page can do, and this page renders exactly one sample type. They
+	// say what is on screen and nothing more.
+	ew.s("<span class=\"readout\">")
+	ew.f("<span>Metric <b>%s</b></span>", html.EscapeString(res.SampleTypeName))
+	ew.f("<span>Unit <b>%s</b></span>", html.EscapeString(res.Unit))
+	ew.s("</span>\n")
 	writeInfoPanel(ew, root, res, opts)
 	ew.s("<button id=\"inv-btn\" type=\"button\" title=\"Invert: root at top (I)\" aria-label=\"Invert the graph\">&#8645;</button>\n")
 	ew.s("<button id=\"tree-btn\" type=\"button\" title=\"Tree view (T)\" aria-label=\"Toggle the tree view\">&#9776;</button>\n")
 	ew.s("<button id=\"theme-btn\" type=\"button\" title=\"Light / dark (D)\" aria-label=\"Toggle light or dark\">&#9680;</button>\n")
 	ew.s("</div>\n")
+	writeLegendBar(ew, root)
+}
+
+// writeLegendBar puts the colour key ON the page instead of inside a panel
+// nobody opens.
+//
+// It lists only the domains this profile actually contains, for the same
+// reason the info panel's legend does: a key naming colours that are not on
+// screen sends the reader looking for them. The labels are the short form --
+// "vendor", not "CPU: GPU runtime and driver" -- because a bar is scanned and
+// the panel is read; the full description is still one click away.
+func writeLegendBar(ew *errWriter, root *node) {
+	present := map[Domain]bool{}
+	var walk func(*node)
+	walk = func(n *node) {
+		if n.depth > 0 {
+			present[n.domain] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(root)
+	if len(present) == 0 {
+		return
+	}
+	ew.s("<div class=\"legend\" aria-label=\"Colour key\">\n")
+	for _, d := range legendOrder {
+		if !present[d] {
+			continue
+		}
+		in := d.Info()
+		ew.f("<span class=\"c\"><i style=\"background:%s\"></i>%s</span>",
+			html.EscapeString(in.Fill), html.EscapeString(shortLegendLabel(in.Label)))
+	}
+	ew.s("\n</div>\n")
+}
+
+// legendOrder is the CPU-to-GPU reading order, not the declaration order of
+// the Domain constants: a key is a sentence about the path a launch takes.
+var legendOrder = []Domain{
+	DomainApplication, DomainSystem, DomainVendorRuntime, DomainUnsymbolized,
+	DomainKernel, DomainProfilerShim, DomainBoundary, DomainBoundaryUnattributed,
+	DomainGPUKernel, DomainRoot,
+}
+
+// shortLegendLabel trims the panel's descriptive label to a bar-sized one.
+// The long form explains; the short form identifies, and only the second fits
+// on one line beside eight others.
+func shortLegendLabel(label string) string {
+	if i := strings.Index(label, ": "); i >= 0 {
+		return label[i+2:]
+	}
+	return label
 }
 
 // writeSamplePeriodNote is the one note that stays on the page.
@@ -602,15 +670,18 @@ func writeTreeContainer(ew *errWriter, res *foldedstacks.Result) {
 // used to hold — and the script replaces it with the hovered frame.
 func writeStatusBar(ew *errWriter, res *foldedstacks.Result) {
 	ew.s("<div id=\"status\">\n<span id=\"st\">")
-	ew.esc(FormatValue(res.Total, res.Unit))
-	ew.s(" total")
-	ew.f(" &middot; %s samples", group(int64(res.Samples)))
-	ew.f(" &middot; %s stacks", group(int64(len(res.Stacks))))
-	ew.s(" &middot; ")
-	ew.esc(res.SampleTypeName + "/" + res.Unit)
+	// Labelled figures rather than a run-on sentence: the mock's status line
+	// is scanned for one number at a time, and "15.049 s total" reads as prose
+	// while "Total 15.049 s" reads as a field.
+	ew.f("<span class=\"k\">Total</span> <b>%s</b>", html.EscapeString(FormatValue(res.Total, res.Unit)))
+	ew.f(" &nbsp;<span class=\"k\">Samples</span> <b>%s</b>", group(int64(res.Samples)))
+	ew.f(" &nbsp;<span class=\"k\">Stacks</span> <b>%s</b>", group(int64(len(res.Stacks))))
+	ew.f(" &nbsp;<span class=\"k\">Metric</span> <b>%s</b>", html.EscapeString(res.SampleTypeName))
+	ew.f(" &nbsp;<span class=\"k\">Unit</span> <b>%s</b>", html.EscapeString(res.Unit))
 	ew.s("</span>\n")
 	ew.s("<input id=\"q\" type=\"search\" hidden placeholder=\"search frames\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"Search frames\">\n")
-	ew.s("<span id=\"mc\"></span>\n</div>\n")
+	ew.s("<span id=\"mc\"></span>\n")
+	ew.s("<span id=\"brandf\">Enjoy the Flames.</span>\n</div>\n")
 }
 
 // writeInfoPanel is everything that used to be permanently on screen.

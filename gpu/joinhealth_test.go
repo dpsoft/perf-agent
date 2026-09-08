@@ -45,11 +45,15 @@ func anomalousSnapshot() Snapshot {
 			OutOfWindowDropCount:         7,
 		},
 		LaunchCache: LaunchCacheStats{
-			Live:               250,
-			EvictedCapacity:    47,
-			EvictedHorizon:     3,
-			Replaced:           2,
-			AnomalousTimestamp: 1,
+			Live:            250,
+			EvictedCapacity: 47,
+			// The subset that actually lost an attribution. Set here so the
+			// many-anomalies fixture still exercises the capacity line: it now
+			// fires on the loss rather than on the eviction total (#137).
+			EvictedCapacityUnjoined: 47,
+			EvictedHorizon:          3,
+			Replaced:                2,
+			AnomalousTimestamp:      1,
 		},
 		Dropped: TimelineDropStats{
 			EvictedExecutions:     9,
@@ -115,7 +119,7 @@ func TestJoinHealthAnomaliesEachGetTheirOwnLine(t *testing.T) {
 		"22 of 512 executions joined heuristically",
 		"4 heuristic joins flagged ambiguous",
 		"7 of the unmatched executions had a candidate launch",
-		"launch cache evicted 47 launches at capacity",
+		"launch cache evicted 47 launches at capacity BEFORE",
 		"launch cache evicted 3 launches past HorizonNs",
 		"launch cache replaced 2 live entries",
 		"1 launch carried an out-of-range timestamp",
@@ -249,17 +253,72 @@ func TestJoinHealthEmptySnapshotIsAnAnomalyNotAllExact(t *testing.T) {
 // A run whose executions all joined but whose cache was thrashing is the
 // case the summary line alone would call fine; the eviction lines are what
 // make it visible.
-func TestJoinHealthEvictionsAreRaisedEvenWhenEveryJoinWasExact(t *testing.T) {
+// A LOST launch is raised even when every join in this snapshot was exact.
+//
+// The original point of this test stands and is the reason it is not simply
+// deleted: eviction health must not be inferred from the join outcomes of the
+// snapshot in front of us. A launch evicted before its execution arrived is a
+// loss whether or not the executions that DID arrive all joined perfectly --
+// the execution that lost its launch is in a later snapshot, or was never
+// counted here at all.
+//
+// What changed is which counter carries that meaning. It is now a property of
+// the evicted ENTRIES (were they ever joined?) rather than the raw eviction
+// total, which on any long run is dominated by entries that had already done
+// their job. See TestABoundedCacheReachingItsBoundIsNotAnAnomaly.
+func TestJoinHealthLostLaunchesAreRaisedEvenWhenEveryJoinWasExact(t *testing.T) {
 	snap := healthySnapshot()
 	snap.LaunchCache.EvictedCapacity = 47
+	snap.LaunchCache.EvictedCapacityUnjoined = 47
+	snap.LaunchCache.EvictedCapacityUnjoined = 47
 
 	lines := JoinHealth(snap)
 
 	require.Len(t, lines, 2)
 	assert.Contains(t, lines[0], "512 executions, all exact")
 	assert.Contains(t, lines[0], "; 1 anomaly")
-	assert.Contains(t, lines[1], "launch cache evicted 47 launches at capacity")
+	assert.Contains(t, lines[1], "launch cache evicted 47 launches at capacity BEFORE")
 	assert.Contains(t, lines[1], "TimelineConfig.LaunchCache.Capacity")
+}
+
+// The regression this pins (issue #137): a bounded LRU reaching its bound is
+// what the bound is FOR, and is not by itself a defect.
+//
+// LaunchCache.Get does not delete -- the cache serves repeated correlations --
+// so a launch stays live long after its execution has joined, and capacity
+// eviction reaches it eventually on any run with more than Capacity launches.
+// Firing on the raw total made the alarm permanent on long runs: measured on
+// an RTX 3090, a 20 s attach reported 45,172 capacity evictions while
+// projecting 111,056 samples from ~110,851 launches and joining every
+// execution in its final snapshot exactly.
+//
+// A permanent alarm is worse than a missing one. An operator who sees the same
+// line every interval learns to skip it, and skips the next one with it.
+func TestABoundedCacheReachingItsBoundIsNotAnAnomaly(t *testing.T) {
+	snap := healthySnapshot()
+	snap.LaunchCache.EvictedCapacity = 45172 // every one of them already joined
+	snap.LaunchCache.EvictedCapacityUnjoined = 0
+
+	lines := JoinHealth(snap)
+
+	require.Len(t, lines, 1, "a healthy run must produce the summary line and nothing else")
+	assert.Contains(t, lines[0], "no anomalies")
+}
+
+// And the total is still reported when there IS a loss, because the ratio is
+// what tells an operator whether the cache is marginally or wildly too small.
+func TestTheLossIsReportedAgainstTheTotalItCameFrom(t *testing.T) {
+	snap := healthySnapshot()
+	snap.LaunchCache.EvictedCapacity = 45172
+	snap.LaunchCache.EvictedCapacityUnjoined = 12
+
+	lines := JoinHealth(snap)
+
+	require.Len(t, lines, 2)
+	assert.Contains(t, lines[1], "12 launches")
+	assert.Contains(t, lines[1], "45172 evicted in total",
+		"without the denominator, 12 lost launches reads the same whether the cache "+
+			"missed by a hair or by an order of magnitude")
 }
 
 // The summary line quotes len(snap.Executions) as its denominator so the

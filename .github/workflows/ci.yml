@@ -219,6 +219,55 @@ jobs:
 
   # Integration tests require root and are harder to run in CI
   # They can be run manually or in a different environment
+  images:
+    name: Container images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Built, not just linted. The failures these images have are BUILD-time
+      # failures -- an unshippable shim, a dynamically linked blazesym that
+      # kills file capabilities -- and both are caught by gates inside the
+      # Dockerfiles. A workflow that only ran hadolint would pass while
+      # shipping neither.
+      - name: Build the shim image
+        run: docker build -f Dockerfile.shim -t perf-agent-shim:ci .
+
+      - name: The shim image carries a loadable shim
+        # elfgate already ran inside the build; this checks the FILE made it
+        # into the final stage, which a bad COPY would silently skip.
+        run: |
+          docker run --rm --entrypoint sh perf-agent-shim:ci -c \
+            'test -s /usr/local/lib/libperfagent-gpu-nvidia.so && echo present'
+
+      - name: Build the agent image
+        run: docker build -f Dockerfile.agent -t perf-agent:ci .
+
+      - name: The agent refuses without capabilities, and says which
+        # The bare failure here is an EPERM at exec that names nothing. If the
+        # entrypoint check regresses, this catches it.
+        run: |
+          out=$(docker run --rm perf-agent:ci -discover 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q CAP_BPF \
+            || (echo "the capability refusal no longer names what is missing" && exit 1)
+
+      - name: The agent starts with the four documented capabilities
+        # The regression this pins: setcap'ing a capability onto the binary
+        # that the documented deployment does not grant makes the image fail
+        # to exec, because file capabilities must be a subset of the bounding
+        # set. It is invisible until someone deploys it.
+        run: |
+          out=$(docker run --rm \
+            --cap-add=BPF --cap-add=PERFMON --cap-add=SYS_PTRACE --cap-add=CHECKPOINT_RESTORE \
+            perf-agent:ci -discover -wait-for-shim 200ms -shim /nonexistent.so 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "Operation not permitted" \
+            && (echo "the image cannot exec under the capabilities it documents" && exit 1)
+          echo "$out" | grep -q "adapter /nonexistent.so" \
+            || (echo "the agent did not reach its own argument handling" && exit 1)
+
   shim:
     name: GPU shim (portability gate)
     runs-on: ubuntu-24.04

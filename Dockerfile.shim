@@ -1,0 +1,80 @@
+# The CUPTI adapter, and nothing else.
+#
+# This image exists to be an INIT CONTAINER: it starts, copies one .so onto a
+# shared volume, and exits. The application container then loads that file
+# through CUDA_INJECTION64_PATH. Nothing in this image ever runs alongside the
+# workload, which is why it carries no agent, no Go binary and no CUDA runtime.
+#
+# WHY THE BUILD BASE IS OLD ON PURPOSE
+# ------------------------------------
+# The shim is dlopened by the CUDA driver into somebody else's process, so it
+# has to satisfy THEIR loader, not ours. Built on a current distro it acquires
+# a GLIBC_ABI_GNU2_TLS marker (glibc 2.42) and __isoc23_* symbols (glibc 2.38)
+# and then fails to load into every mainstream PyTorch image -- silently, since
+# CUDA_INJECTION64_PATH fails open. Ubuntu 22.04 is the baseline that clears
+# Ubuntu 22.04, 24.04 and 25.04, which is essentially the whole PyTorch fleet.
+#
+# -mtls-dialect=gnu is not optional: GCC on some distros defaults to gnu2,
+# which is what emits the 2.42 marker. It is set here rather than inherited.
+FROM ubuntu:22.04 AS build
+
+ARG CUDA_MAJOR_MINOR=13-3
+ARG DEBIAN_FRONTEND=noninteractive
+
+# CUPTI HEADERS ONLY. The shim does not link against libcupti and must not:
+# libcupti ships with the CUDA TOOLKIT, not the driver, and an image that
+# linked it would refuse to load in any container that has only the runtime.
+# The adapter resolves every CUPTI entry point with dlopen/dlsym at
+# InitializeInjection and reports its absence instead of dying.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends g++ ca-certificates wget \
+ && wget -qO /tmp/keyring.deb \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+ && dpkg -i /tmp/keyring.deb \
+ && apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      cuda-cupti-dev-${CUDA_MAJOR_MINOR} \
+      cuda-crt-${CUDA_MAJOR_MINOR} \
+      cuda-cudart-dev-${CUDA_MAJOR_MINOR} \
+ && rm -rf /var/lib/apt/lists/* /tmp/keyring.deb
+
+WORKDIR /src
+COPY shim/ /src/shim/
+
+# The same command line as `make -C shim nvidia-portable`, deliberately spelled
+# out rather than invoking make: this image must not depend on the host's
+# CUDA_HOME, which that target bind-mounts.
+RUN cd /src/shim \
+ && CUDA_INC=$(ls -d /usr/local/cuda-*/targets/x86_64-linux/include | head -1) \
+ && g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
+      -mtls-dialect=gnu -pthread -I core -I "$CUDA_INC" \
+      -shared -o /libperfagent-gpu-nvidia.so \
+      nvidia/cupti_adapter.cc core/batch.cc core/clock.cc core/cubin.cc \
+      core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc \
+      -Wl,--version-script=nvidia/export.map \
+      -Wl,-soname,libperfagent-gpu-nvidia.so.1 \
+      -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL
+
+# THE GATE RUNS IN THE BUILD, so an unshippable shim cannot become an image.
+#
+# This is the whole point of publishing rather than hand-copying: the failure
+# it catches is invisible at runtime. A shim that requires a glibc the target
+# does not have produces an empty profile and no error anywhere, so "it built"
+# is not evidence of anything. Failing here is the only place the mistake is
+# cheap.
+RUN cd /src/shim && ./elfgate.sh /libperfagent-gpu-nvidia.so 2.34
+
+# busybox for `cp`: the init container's whole job is one copy, and the
+# manifest invokes it through `sh -c`. Nothing here is ever executed in the
+# same process as the workload.
+FROM busybox:stable
+COPY --from=build /libperfagent-gpu-nvidia.so /usr/local/lib/libperfagent-gpu-nvidia.so
+
+LABEL org.opencontainers.image.title="perf-agent CUDA shim" \
+      org.opencontainers.image.description="CUPTI adapter for CUDA_INJECTION64_PATH; init-container payload" \
+      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent"
+
+# Not an entrypoint that runs the shim -- it is a library and cannot be run.
+# The default command states what the image is FOR, so `docker run` on it
+# produces an explanation rather than a crash.
+CMD ["sh", "-c", "echo 'This image carries /usr/local/lib/libperfagent-gpu-nvidia.so for an init container to copy onto a shared volume. It is a library; there is nothing here to execute.'; exit 1"]

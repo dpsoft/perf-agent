@@ -1069,6 +1069,18 @@ type Stats struct {
 	// where the shim IS the program and there is no boundary to cross. See
 	// shimScope for how the two deployment shapes are told apart.
 	StacksProfilerOnly uint64
+
+	// StackFramesElided counts frames removed as the profiler's own delivery
+	// path, and StacksWithInstrumentationBand the stacks that had one.
+	//
+	// Both are reported because they answer different questions. The first is
+	// how much of the profile was the measurement apparatus -- ~19% of all
+	// frames in a measured PyTorch capture. The second is how many stacks were
+	// touched at all: if it is near zero on a CUDA run something has changed
+	// about where CUPTI delivers callbacks, and the elision is quietly doing
+	// nothing.
+	StackFramesElided             uint64
+	StacksWithInstrumentationBand uint64
 	// StacksProfilerOnlyUncertain is the SUBSET of StacksProfilerOnly
 	// rejected without proof: no frame was provably outside the shim, but at
 	// least one frame's module was unknown (the symbolizer named the frame
@@ -1540,6 +1552,10 @@ type Consumer struct {
 	// and which module paths are the shim's own. Immutable after
 	// newConsumer; see shimScope.
 	shim shimScope
+	// instr collapses the profiler's own delivery path out of a stack. It
+	// shares shimScope's classification because the shim's frames are the
+	// innermost end of every such band.
+	instr instrumentationBand
 
 	// sawKernelName records whether this producer emits kernel names at
 	// all. Holding an event for a name that is never coming would delay
@@ -1560,6 +1576,7 @@ func newConsumer(cfg Config) *Consumer {
 	return &Consumer{
 		cfg:         cfg,
 		shim:        newShimScope(cfg.ShimPath),
+		instr:       newInstrumentationBand(newShimScope(cfg.ShimPath)),
 		seqByStream: map[seqKey]uint64{},
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
@@ -2527,6 +2544,17 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 		c.stats.StacksProfilerOnly++
 		return
 	case stackAttributable:
+	}
+
+	// The profiler's own delivery path is not the workload's call path.
+	// Measured at ~7 frames in every stack -- 19% of all frames -- of CUPTI
+	// callback machinery between the application's cuLaunchKernel and our own
+	// callback. Collapsed to one marker rather than deleted, so the profile
+	// still says a band was there. See instrumentationBand.
+	if collapsed, removed := c.instr.collapse(frames); removed > 0 {
+		frames = collapsed
+		c.stats.StackFramesElided += uint64(removed) //nolint:gosec // a frame count
+		c.stats.StacksWithInstrumentationBand++
 	}
 
 	// Built through the same correlationOf as the batched twin's, from the

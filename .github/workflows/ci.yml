@@ -282,9 +282,15 @@ jobs:
           ./shim/elfgate.sh libperfagent-gpu-nvidia.portable.so 2.34
 
       # Loading is the claim; assert it rather than infer it from the ELF.
+      # Loading is the claim; assert it rather than infer it from the ELF.
+      # The version headers said the old shim was fine too -- only dlopen
+      # disagreed.
       - name: Prove it loads on the images it targets
         run: |
-          cat > /tmp/tryload.c <<'EOF'
+          # Into the workspace, not /tmp: mounting the host's /tmp over the
+          # container's makes it read-only, and apt-get then cannot install
+          # the compiler. The container writes only to its own /tmp.
+          cat > tryload.c <<'EOF'
           #include <dlfcn.h>
           #include <stdio.h>
           int main(int argc, char **argv) {
@@ -296,13 +302,15 @@ jobs:
           EOF
           for img in ubuntu:22.04 ubuntu:24.04 ubuntu:25.04; do
             echo "== $img"
-            docker run --rm -v "$PWD":/w:ro -v /tmp:/tmp:ro "$img" sh -c '
+            docker run --rm -v "$PWD":/w:ro "$img" sh -c '
+              set -e
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq >/dev/null 2>&1
-              apt-get install -y -qq gcc >/dev/null 2>&1
-              gcc -o /tmp/t /tmp/tryload.c
+              apt-get update -qq >/dev/null
+              apt-get install -y -qq gcc >/dev/null
+              gcc -o /tmp/t /w/tryload.c
               /tmp/t /w/libperfagent-gpu-nvidia.portable.so' || exit 1
           done
+          rm -f tryload.c
 
       - name: Upload the portable shim
         uses: actions/upload-artifact@v4

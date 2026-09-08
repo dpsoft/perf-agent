@@ -391,11 +391,19 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 	// capture, data-module was 566,966 bytes of a 3,165,745-byte page -- 18%
 	// -- for THIRTEEN distinct values totalling about a kilobyte.
 	mods := internModules(root)
+	// The card is a WRAPPER, not the chart itself. .chart's geometry is the
+	// layout engine -- an inline pixel height with absolutely positioned
+	// children whose vertical position is bottom:calc(var(--d)*18px) -- and
+	// putting a border and padding on it makes the border box disagree with
+	// that height. The card gets its own element so the graph's arithmetic is
+	// untouched.
+	ew.s("<div class=\"canvas\">\n")
 	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s">`+"\n",
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
 	writeModuleTable(ew, mods)
 	writeNode(ew, root, res.Unit, root.value, mods)
+	ew.s("</div>\n")
 	ew.s("</div>\n")
 	return ew.err
 }
@@ -595,8 +603,16 @@ func writeLegendBar(ew *errWriter, root *node) {
 			continue
 		}
 		in := d.Info()
-		ew.f("<span class=\"c\"><i style=\"background:%s\"></i>%s</span>",
-			html.EscapeString(in.Fill), html.EscapeString(shortLegendLabel(in.Label)))
+		// The swatch carries the OVERLAY as well as the fill. Three of these
+		// domains are near-identical greys and are told apart in the graph by
+		// hatching alone; a flat chip for a hatched frame is a key that does
+		// not match the thing it is keying.
+		style := "background:" + in.Fill
+		if in.Overlay != "" {
+			style = "background-image:" + in.Overlay + ";background-color:" + in.Fill
+		}
+		ew.f("<span class=\"c\"><i style=\"%s\"></i>%s</span>",
+			html.EscapeString(style), html.EscapeString(shortLegendLabel(in.Label)))
 	}
 	ew.s("\n</div>\n")
 }

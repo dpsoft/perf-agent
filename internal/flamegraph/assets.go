@@ -85,11 +85,12 @@ h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width
 .top button:hover,.top summary:hover{color:var(--accent);background:var(--bg)}
 .legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
 .legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
-.legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block}
+.legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block;background-repeat:repeat}
 .legend .sep{width:1px;height:14px;background:var(--line)}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
 .note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
-.chart{position:relative;margin:10px 16px 0;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.canvas{margin:10px 16px 0;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+.chart{position:relative;margin:0}
 .frame{position:absolute;height:17px;padding:0 4px;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px;cursor:pointer}
 .frame.dim{opacity:.15}
 #status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:14px;align-items:center;padding:5px 16px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}

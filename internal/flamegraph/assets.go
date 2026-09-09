@@ -62,8 +62,10 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // things a Go function measuring characters against a nominal 6.4 px advance
 // could only guess at. Frames narrower than the 14 px of horizontal padding
 // have a zero-width content box and draw no text at all; between there and
-// about 14 px they draw a lone ellipsis. Both are the browser applying the
-// rule, not a threshold anyone chose.
+// about 21 px they draw a lone ellipsis. Both are the browser applying the
+// rule, not a threshold anyone chose. (Both numbers moved with the padding
+// when the bars took the mock's shape: they were 8 px and 14 px at 4 px of
+// padding, and they are not independent of it.)
 const styleSheet = `
 :root{--tip-bg:#1f1d24;--tip-ink:#f2eff7;--tip-line:#3a3543;--bg:#f7f6f9;--panel:#ffffff;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--fatal-bg:#fdecec;--fatal-line:#e0a3a3}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){` + darkChrome + `}}

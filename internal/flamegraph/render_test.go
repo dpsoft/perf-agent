@@ -478,7 +478,12 @@ func TestEveryFrameCarriesAnAccessibleName(t *testing.T) {
 
 	// The chart names itself, but as a group: role="img" there would make
 	// the whole subtree presentational and silence all four frames.
-	assert.Contains(t, got, `class="chart" style="height:53px" role="group" aria-label="Flame graph, gpu/nanoseconds"`)
+	// Height computed from frameHeight, not written out: it is rows times
+	// pitch, so a literal here is the same fact stated twice and the second
+	// copy goes stale the moment the row pitch is tuned.
+	assert.Contains(t, got, fmt.Sprintf(
+		`class="chart" style="height:%dpx" role="group" aria-label="Flame graph, gpu/nanoseconds"`,
+		3*frameHeight-1))
 
 	// Exactly one <title> in the document — the one in <head>. A per-frame
 	// <title> would be an accessible name AND a native browser tooltip, and
@@ -561,9 +566,26 @@ func TestTypographyAndRowPitchAreFixedPixelsAtEveryWindowWidth(t *testing.T) {
 		foldedstacks.Stack{Frames: []string{"a", "b", "c"}, Value: 10},
 	), Options{})
 
-	assert.Contains(t, styleSheet, "font-size:11px")
-	assert.Contains(t, styleSheet, "height:17px")
-	assert.Contains(t, styleSheet, "line-height:17px")
+	// The PROPERTY, not the numbers: these must be absolute px so that a
+	// frame is the same size at every window width. Asserting the literals
+	// meant every style change failed a test about relative units while
+	// teaching nothing -- and the numbers are tuned against how deep a real
+	// profile is, which is a design decision, not an invariant.
+	frameRule := regexp.MustCompile(`\.frame\{[^}]*\}`).FindString(styleSheet)
+	require.NotEmpty(t, frameRule, "no .frame rule in the stylesheet")
+	for _, prop := range []string{"height", "line-height", "font-size"} {
+		m := regexp.MustCompile(prop + `:([0-9.]+)(px|em|rem|%|vw|vh)`).FindStringSubmatch(frameRule)
+		require.Len(t, m, 3, "%s is not set on .frame", prop)
+		assert.Equal(t, "px", m[2],
+			"%s is %s%s: a relative unit makes the graph zoom with the window instead of filling it",
+			prop, m[1], m[2])
+	}
+	height := regexp.MustCompile(`[^-]height:([0-9.]+)px`).FindStringSubmatch(frameRule)
+	lineHeight := regexp.MustCompile(`line-height:([0-9.]+)px`).FindStringSubmatch(frameRule)
+	require.Len(t, height, 2)
+	require.Len(t, lineHeight, 2)
+	assert.Equal(t, height[1], lineHeight[1],
+		"line-height must equal height or the label sits off-centre in the bar")
 	// One rule per depth, and one rule that turns a depth into an offset
 	// from the floor: a depth is the same number of pixels up whatever the
 	// profile and whatever the window. The pitch is a px literal in a
@@ -689,8 +711,8 @@ func TestInvertIsAVisualFlipAndMergesNothing(t *testing.T) {
 	assert.NotContains(t, script, "it.w=")
 	assert.NotContains(t, script, "it.value=")
 	// The row ladder does the flip, and it is the same ladder both ways.
-	assert.Contains(t, rowCSS(4), ".frame{bottom:calc(var(--d)*18px)}")
-	assert.Contains(t, rowCSS(4), ".inv .frame{bottom:auto;top:calc(var(--d)*18px)}")
+	assert.Contains(t, rowCSS(4), fmt.Sprintf(".frame{bottom:calc(var(--d)*%dpx)}", frameHeight))
+	assert.Contains(t, rowCSS(4), fmt.Sprintf(".inv .frame{bottom:auto;top:calc(var(--d)*%dpx)}", frameHeight))
 }
 
 // The tree is the same data, so it is built from the frames rather than

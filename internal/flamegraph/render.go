@@ -59,12 +59,22 @@ import (
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
 )
 
-// frameHeight is the row pitch in CSS pixels: a 17px frame and a 1px gap.
+// frameHeight is the row pitch in CSS pixels: a 19px frame and a 2px gap.
+//
+// Chosen against the deepest real profile rather than for looks. The mock's
+// bars are roughly 28px pitch, which is handsome and does not fit: the
+// measured PyTorch capture is 42 levels, and 42 rows at 28px is 1176px --
+// past any laptop viewport, so the reader scrolls to see a stack that used
+// to fit. At 21px the same 42 rows are 882px and still fit, while the frame
+// gains 2px of height, a wider radius and real horizontal padding. Deep
+// stacks are the normal case here, not the exception: Python plus torch plus
+// cuBLAS plus the launch boundary is forty frames before anything unusual
+// happens.
 // It is the only fixed dimension the geometry has. Horizontal position and
 // width are percentages, so they are the window's business, not ours — see
 // styleSheet in assets.go for why that is the whole fix for a graph that
 // used to be 1280px wide on a 1990px screen.
-const frameHeight = 18
+const frameHeight = 21
 
 // Options configures a render.
 //

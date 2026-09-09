@@ -60,7 +60,7 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // text-overflow:ellipsis cuts the label to whatever the frame can hold, at
 // the reader's actual window width, in the reader's actual font — three
 // things a Go function measuring characters against a nominal 6.4 px advance
-// could only guess at. Frames narrower than the 8 px of horizontal padding
+// could only guess at. Frames narrower than the 14 px of horizontal padding
 // have a zero-width content box and draw no text at all; between there and
 // about 14 px they draw a lone ellipsis. Both are the browser applying the
 // rule, not a threshold anyone chose.
@@ -121,7 +121,7 @@ body.pinned .canvas,body.pinned .note{margin-right:406px}
 .note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
 .canvas{margin:10px 16px 0;transition:margin-right .12s ease;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
 .chart{position:relative;margin:0}
-.frame{position:absolute;height:17px;padding:0 4px;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px;cursor:pointer}
+.frame{position:absolute;height:19px;padding:0 7px;border-radius:5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:19px;cursor:pointer}
 .frame.dim{opacity:.15}
 #status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:14px;align-items:center;padding:5px 16px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}
 #status b{font-weight:600}

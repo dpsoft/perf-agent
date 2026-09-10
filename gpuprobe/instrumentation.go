@@ -29,9 +29,12 @@ import (
 //	  ... four more ...                ┘
 //	  (anonymous namespace)::on_launch <- the shim
 //
-// Across the whole capture, libcupti accounts for 5.98 frames per stack and
+// Across a PyTorch capture, libcupti accounts for 5.98 frames per stack and
 // the driver's dispatch frame for 1.00 -- 69% of all unnamed vendor frames,
-// about 19% of EVERY frame in EVERY stack. None of it is the application. It
+// about 19% of EVERY frame in EVERY stack. The 7 frames are the stable part:
+// the depth is CUPTI's. The 19% is not, since it also counts the stacks that
+// carry no CPU caller at all -- the same band is 23.5% of the microbenchmark
+// under shim/nvidia/testdata. None of it is the application. It
 // exists because we subscribed a callback, and it would not be in the profile
 // if the profiler were not there.
 //

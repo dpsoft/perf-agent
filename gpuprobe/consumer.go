@@ -287,9 +287,12 @@ type Config struct {
 	// every sampled stack instead of collapsing it to one marker.
 	//
 	// OFF by default, and the default is the right one: measured on an RTX
-	// 3090, CUPTI's callback machinery is ~7 frames in every stack and 19% of
-	// every frame in the profile, none of it the application's call path --
-	// it is there because we subscribed a callback. See instrumentationBand.
+	// 3090, CUPTI's callback machinery is 7 frames in every sampled stack and
+	// a fifth to a quarter of every frame in the profile (19% under PyTorch,
+	// 23.5% under the shim's own microbenchmark -- the share moves with how
+	// many stacks are sampled, the frame count does not), none of it the
+	// application's call path -- it is there because we subscribed a
+	// callback. See instrumentationBand.
 	//
 	// It exists because this elision is IRREVERSIBLE in a way the flame
 	// graph's vendor-run collapse is not: it happens before the profile is
@@ -2562,7 +2565,8 @@ func (c *Consumer) attachSampledStackLocked(pid uint32, stackID int32, sl gpuabi
 	}
 
 	// The profiler's own delivery path is not the workload's call path.
-	// Measured at ~7 frames in every stack -- 19% of all frames -- of CUPTI
+	// Measured at 7 frames in every sampled stack -- a fifth or so of all
+	// frames, though that share moves with the workload -- of CUPTI
 	// callback machinery between the application's cuLaunchKernel and our own
 	// callback. Collapsed to one marker rather than deleted, so the profile
 	// still says a band was there. See instrumentationBand.

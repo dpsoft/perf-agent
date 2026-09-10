@@ -136,11 +136,17 @@ func defineFlags(fs *flag.FlagSet) *options {
 		keepInstrumentation: fs.Bool("keep-instrumentation-frames", false,
 			"leave the profiler's own delivery path in every sampled stack instead of "+
 				"collapsing it to one ["+gpuprobe.InstrumentationFrameName[5:len(gpuprobe.InstrumentationFrameName)-1]+
-				"] marker. Measured at ~7 frames per stack and 19% of every frame in the "+
-				"profile, all of it CUPTI's callback machinery rather than the workload. "+
-				"Set it to profile perf-agent itself: the elision happens BEFORE the "+
-				"profile is written, so a capture taken without this flag cannot get "+
-				"them back"),
+				"] marker. The path is 7 frames of CUPTI's callback machinery rather than "+
+				"the workload, and it is reliably 7: that depth is CUPTI's, not the "+
+				"workload's. What it costs as a SHARE of the profile is not fixed -- 19% "+
+				"of every frame in a PyTorch capture, 23.5% in the microbenchmark under "+
+				"shim/nvidia/testdata -- because the share depends on how many of the "+
+				"stacks are sampled ones, which -period and the workload decide between "+
+				"them. Set it to profile perf-agent itself: the elision happens BEFORE "+
+				"the profile is written, so a capture taken without this flag cannot get "+
+				"them back. Note that cmd/flamegraph merges runs of unnamed vendor frames "+
+				"by default, redrawing these 7 as 2; pass -raw-vendor-frames there to see "+
+				"the path this flag kept"),
 		nvSymbols: fs.String("nvidia-symbols", "",
 			"cache directory for NVIDIA's CUDA Toolkit Symbol Server; enables fetching "+
 				"symbols for libcuda/libcupti/libcuBLAS, which ship stripped. Off unless set: "+

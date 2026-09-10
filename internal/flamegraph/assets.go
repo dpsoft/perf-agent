@@ -117,8 +117,20 @@ body.pinned .canvas,body.pinned .note{margin-right:406px}
 #fd .path div:last-child::before{bottom:auto;height:9px}
 #fd .path div::after{content:"";position:absolute;left:11px;top:9px;width:6px;height:1px;background:var(--line)}
 #fd .path div.here{background:var(--warn-bg);font-weight:600}
+#menu{position:fixed;z-index:9;min-width:212px;padding:5px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 10px 30px rgb(0 0 0/.22);font-size:12.5px}
+#menu[hidden]{display:none}
+#menu button{display:block;width:100%;text-align:left;cursor:pointer;border:0;background:none;color:var(--ink);font:inherit;padding:6px 10px;border-radius:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#menu button:hover:not(:disabled){background:var(--accent);color:var(--panel)}
+#menu button:disabled{color:var(--muted);cursor:default}
+#menu hr{border:0;border-top:1px solid var(--line);margin:4px 6px}
+#hidden-note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--line);border-radius:7px;background:var(--panel);font-size:12px;display:flex;gap:10px;align-items:center}
+#hidden-note[hidden]{display:none}
+#hidden-note b{font-weight:600}
+#hidden-note button{cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;font-size:11.5px;padding:2px 9px;border-radius:6px}
+#hidden-note button:hover{border-color:var(--accent);color:var(--accent)}
 #fd .dot{display:inline-block;width:9px;height:9px;border-radius:50%;border:1px solid rgb(0 0 0/.25);margin-right:5px;vertical-align:-1px}
 .frame.pinned{outline:2px solid var(--accent);outline-offset:-2px}
+.frame.gone{display:none!important}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
 .note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
 .canvas{margin:10px 16px 0;transition:margin-right .12s ease;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
@@ -523,6 +535,7 @@ function detail(it){
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
   var r=resolutionNote(d);
   if(r){s+="\n"+r;}
+  s+="\n\u21e7-click or P to pin \u00b7 right-click for more";
   if(d.collapsed){s+="\nmerged: consecutive frames in this library whose names carry no information (an address, or an obfuscated vendor symbol) are drawn as one. The profile still holds every frame; re-render with -raw-vendor-frames to see them.";}
   return s;
 }
@@ -802,6 +815,65 @@ function unpin(){
   if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
   pinned=null;fd.hidden=true;doc.body.classList.remove("pinned");
 }
+var menu=doc.getElementById("menu"),hnote=doc.getElementById("hidden-note");
+var hidden={};
+function hiddenCount(){var n=0;for(var k in hidden){if(hidden[k]){n++;}}return n;}
+function hiddenNames(){var a=[];for(var k in hidden){if(hidden[k]){a.push(baseName(k));}}return a.sort();}
+function applyHidden(){
+  var n=hiddenCount();
+  items.forEach(function(it){
+    var m=moduleOf(it.el.dataset),drop=0,o=it.up,self=n&&m&&hidden[m];
+    while(o){var om=moduleOf(o.el.dataset);if(om&&hidden[om]){drop++;}o=o.up;}
+    it.el.classList.toggle("gone",!!self);
+    it.el.style.setProperty("--d",it.d-drop);
+  });
+  if(n){
+    hnote.innerHTML='<b>'+n+(n===1?" binary":" binaries")+' hidden</b><span class="muted">'+
+      esc(hiddenNames().join(", "))+'</span>';
+    var b=doc.createElement("button");
+    b.type="button";b.textContent="Show all";
+    b.addEventListener("click",function(){hidden={};applyHidden();});
+    hnote.appendChild(b);
+  }
+  hnote.hidden=!n;
+}
+function hideModule(m){if(m){hidden[m]=true;applyHidden();}}
+function closeMenu(){menu.hidden=true;menu.innerHTML="";}
+function menuItem(label,fn,enabled){
+  var b=doc.createElement("button");
+  b.type="button";b.textContent=label;b.disabled=enabled===false;
+  if(enabled!==false){b.addEventListener("click",function(){closeMenu();fn();});}
+  menu.appendChild(b);
+  return b;
+}
+function copyText(t){if(navigator.clipboard){navigator.clipboard.writeText(t);}}
+function openMenu(evt,it){
+  evt.preventDefault();
+  closeMenu();
+  var m=moduleOf(it.el.dataset);
+  menuItem("Pin details",function(){pin(it);});
+  menuItem("Zoom to this frame",function(){zoom(it);});
+  menuItem(m?"Hide binary ("+baseName(m)+")":"Hide binary",function(){hideModule(m);},!!m);
+  menuItem("Show all binaries",function(){hidden={};applyHidden();},hiddenCount()>0);
+  menu.appendChild(doc.createElement("hr"));
+  menuItem("Copy frame name",function(){copyText(it.name);});
+  menuItem("Copy path to root",function(){
+    var c=[],o=it;while(o){c.push(o.name);o=o.up;}
+    copyText(c.reverse().join("\n"));
+  });
+  menuItem("Copy module",function(){copyText(m);},!!m);
+  menu.appendChild(doc.createElement("hr"));
+  menuItem("Reset graph",function(){hidden={};applyHidden();reset();});
+  menu.hidden=false;
+  var box=menu.getBoundingClientRect(),pad=8;
+  var x=Math.min(evt.clientX,innerWidth-box.width-pad);
+  var y=Math.min(evt.clientY,innerHeight-box.height-pad);
+  menu.style.left=Math.max(pad,x)+"px";
+  menu.style.top=Math.max(pad,y)+"px";
+}
+doc.addEventListener("click",function(e){if(!menu.hidden&&!menu.contains(e.target)){closeMenu();}});
+addEventListener("blur",closeMenu);
+
 doc.getElementById("fd-close").addEventListener("click",unpin);
 doc.getElementById("fd-copy").addEventListener("click",function(){
   if(pinned&&navigator.clipboard){navigator.clipboard.writeText(pinned.name);}
@@ -815,6 +887,7 @@ items.forEach(function(it){
   it.el.addEventListener("click",function(e){if(e.shiftKey){e.stopPropagation();e.preventDefault();pin(it);}},true);
   it.el.addEventListener("mouseenter",function(){hover=it;});
   it.el.addEventListener("mouseleave",function(){if(hover===it){hover=null;}});
+  it.el.addEventListener("contextmenu",function(e){e.stopPropagation();openMenu(e,it);});
   it.el.addEventListener("mouseenter",function(){status(it);});
   it.el.addEventListener("mousemove",function(e){showTip(e,it);});
   it.el.addEventListener("mouseleave",function(){tip.hidden=true;status(null);});
@@ -830,6 +903,7 @@ doc.addEventListener("click",function(e){
 });
 doc.addEventListener("keydown",function(e){
   if((e.ctrlKey||e.metaKey)&&(e.key==="f"||e.key==="F")){e.preventDefault();openSearch();return;}
+  if(e.key==="Escape"&&!menu.hidden){closeMenu();return;}
   if(e.key==="Escape"&&pinned){unpin();return;}
   if(e.key==="Escape"){
     if(info.open){info.open=false;}

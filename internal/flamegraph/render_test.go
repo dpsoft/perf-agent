@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -92,9 +96,18 @@ func TestRenderHTMLEscapesHostileSymbolNames(t *testing.T) {
 	assert.Contains(t, got, "&lt;/title&gt;&lt;script&gt;")
 	assert.Contains(t, got, "std::vector&lt;Foo&amp;Bar&gt;")
 
-	// Exactly the two <script> elements this renderer emits: none injected.
-	assert.Equal(t, 1, strings.Count(got, "<script>"))
-	assert.Equal(t, 1, strings.Count(got, "</script>"))
+	// Every script element on the page is accounted for and none was
+	// injected. Counted as a relation rather than a magic number: the page
+	// emits exactly one EXECUTABLE script plus zero or more
+	// application/json data tables (the module paths, the domain labels),
+	// and the closers must add up to those. A bare literal here broke the
+	// moment a legitimate data table was added, which taught nothing about
+	// escaping -- the thing this test exists to check.
+	execScripts := strings.Count(got, "<script>")
+	dataScripts := strings.Count(got, `<script type="application/json"`)
+	assert.Equal(t, 1, execScripts, "exactly one executable script")
+	assert.Equal(t, execScripts+dataScripts, strings.Count(got, "</script>"),
+		"a closer with no opener means a symbol name broke out of a script element")
 	assert.Equal(t, 1, strings.Count(got, "<style>"))
 }
 
@@ -465,7 +478,12 @@ func TestEveryFrameCarriesAnAccessibleName(t *testing.T) {
 
 	// The chart names itself, but as a group: role="img" there would make
 	// the whole subtree presentational and silence all four frames.
-	assert.Contains(t, got, `class="chart" style="height:53px" role="group" aria-label="Flame graph, gpu/nanoseconds"`)
+	// Height computed from frameHeight, not written out: it is rows times
+	// pitch, so a literal here is the same fact stated twice and the second
+	// copy goes stale the moment the row pitch is tuned.
+	assert.Contains(t, got, fmt.Sprintf(
+		`class="chart" style="height:%dpx" role="group" aria-label="Flame graph, gpu/nanoseconds"`,
+		3*frameHeight-1))
 
 	// Exactly one <title> in the document — the one in <head>. A per-frame
 	// <title> would be an accessible name AND a native browser tooltip, and
@@ -548,9 +566,26 @@ func TestTypographyAndRowPitchAreFixedPixelsAtEveryWindowWidth(t *testing.T) {
 		foldedstacks.Stack{Frames: []string{"a", "b", "c"}, Value: 10},
 	), Options{})
 
-	assert.Contains(t, styleSheet, "font-size:11px")
-	assert.Contains(t, styleSheet, "height:17px")
-	assert.Contains(t, styleSheet, "line-height:17px")
+	// The PROPERTY, not the numbers: these must be absolute px so that a
+	// frame is the same size at every window width. Asserting the literals
+	// meant every style change failed a test about relative units while
+	// teaching nothing -- and the numbers are tuned against how deep a real
+	// profile is, which is a design decision, not an invariant.
+	frameRule := regexp.MustCompile(`\.frame\{[^}]*\}`).FindString(styleSheet)
+	require.NotEmpty(t, frameRule, "no .frame rule in the stylesheet")
+	for _, prop := range []string{"height", "line-height", "font-size"} {
+		m := regexp.MustCompile(prop + `:([0-9.]+)(px|em|rem|%|vw|vh)`).FindStringSubmatch(frameRule)
+		require.Len(t, m, 3, "%s is not set on .frame", prop)
+		assert.Equal(t, "px", m[2],
+			"%s is %s%s: a relative unit makes the graph zoom with the window instead of filling it",
+			prop, m[1], m[2])
+	}
+	height := regexp.MustCompile(`[^-]height:([0-9.]+)px`).FindStringSubmatch(frameRule)
+	lineHeight := regexp.MustCompile(`line-height:([0-9.]+)px`).FindStringSubmatch(frameRule)
+	require.Len(t, height, 2)
+	require.Len(t, lineHeight, 2)
+	assert.Equal(t, height[1], lineHeight[1],
+		"line-height must equal height or the label sits off-centre in the bar")
 	// One rule per depth, and one rule that turns a depth into an offset
 	// from the floor: a depth is the same number of pixels up whatever the
 	// profile and whatever the window. The pitch is a px literal in a
@@ -676,8 +711,8 @@ func TestInvertIsAVisualFlipAndMergesNothing(t *testing.T) {
 	assert.NotContains(t, script, "it.w=")
 	assert.NotContains(t, script, "it.value=")
 	// The row ladder does the flip, and it is the same ladder both ways.
-	assert.Contains(t, rowCSS(4), ".frame{bottom:calc(var(--d)*18px)}")
-	assert.Contains(t, rowCSS(4), ".inv .frame{bottom:auto;top:calc(var(--d)*18px)}")
+	assert.Contains(t, rowCSS(4), fmt.Sprintf(".frame{bottom:calc(var(--d)*%dpx)}", frameHeight))
+	assert.Contains(t, rowCSS(4), fmt.Sprintf(".inv .frame{bottom:auto;top:calc(var(--d)*%dpx)}", frameHeight))
 }
 
 // The tree is the same data, so it is built from the frames rather than
@@ -1006,6 +1041,71 @@ func TestTheShippedScriptIsStructurallyBalanced(t *testing.T) {
 	}
 }
 
+// The legend must describe both axes, and only what the profile contains.
+//
+// Before this the legend said "diagonal hatching — either the frame has no
+// symbol, or its CPU attribution was inferred rather than measured. Hover the
+// frame for which." That is the legend admitting it cannot tell the reader
+// what they are looking at, because one channel was carrying two facts.
+func TestTheLegendExplainsTextureSeparatelyFromColour(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 4,
+		Stacks: []foldedstacks.Stack{
+			{Frames: []string{"main", "at::native::conv"}, Value: 1},
+			{Frames: []string{"main", "libcudnn.so.9+0x824fbd"}, Value: 1},
+			{Frames: []string{"main", "libcupti_afe8ffb67fac57d8829b1194a93b8ec676e80f7d"}, Value: 1},
+			{Frames: []string{"main", "0x7f2c945b2c2b"}, Value: 1},
+		},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+
+	if !strings.Contains(page, "Texture means how well it is named") {
+		t.Error("the legend has no section for the texture axis")
+	}
+	for _, want := range []string{"module + offset", "obfuscated symbol", "address only"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("legend is missing the %q row for a resolution the profile contains", want)
+		}
+	}
+	// The old conflated sentence must be gone: it is the thing this replaces.
+	if strings.Contains(page, "Either the frame has no symbol, or its CPU attribution") {
+		t.Error("the legend still conflates missing symbols with inferred attribution")
+	}
+	// And a swatch must actually carry the texture it names, or the legend
+	// row and the graph disagree.
+	for _, key := range []string{"res-module-offset", "res-obfuscated", "res-bare-address"} {
+		if !strings.Contains(page, key) {
+			t.Errorf("no swatch renders the %q texture", key)
+		}
+	}
+}
+
+// Never advertise a state the profile does not contain — the same rule the
+// domain legend already follows.
+func TestTheLegendOmitsResolutionsTheProfileDoesNotHave(t *testing.T) {
+	res := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 1}},
+	}
+	var buf bytes.Buffer
+	if err := RenderHTML(&buf, res, Options{Title: "t"}); err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	page := buf.String()
+	if strings.Contains(page, "Texture means how well it is named") {
+		t.Error("a fully resolved profile advertises a texture legend it never uses")
+	}
+	for _, unwanted := range []string{"obfuscated symbol", "module + offset", "address only"} {
+		if strings.Contains(page, unwanted) {
+			t.Errorf("legend advertises %q on a profile with no such frames", unwanted)
+		}
+	}
+}
+
 // A collapsed frame must both BE marked and be EXPLAINED.
 //
 // Two halves, and shipping either alone is the failure this pins. An attribute
@@ -1050,4 +1150,73 @@ func TestACollapsedFrameIsMarkedAndTheScriptExplainsIt(t *testing.T) {
 	// function, so it is asserted there -- see
 	// TestFoldSaysWhenItMergedVendorRuns. Asserting it here against a
 	// hand-built Result would only prove that the fixture set the field.
+}
+
+// The shipped script must PARSE, not merely balance its braces.
+//
+// The balance check below this one exists because a comment-stripping edit
+// once deleted a whole function header and left the page with syntactically
+// broken JavaScript that every Go test still passed. Balance caught that
+// particular shape; it cannot catch a stray token, a missing comma in an
+// object literal, or a reserved word used as an identifier. A real parser
+// can, and one is usually already on a developer's machine.
+//
+// It SKIPS with a named reason when no engine is present rather than passing
+// quietly: a guard that reports success on a machine where it never ran is
+// worse than no guard, because it is the one you stop checking. The brace
+// balance test remains the portable floor.
+//
+// Parsed through `new Function(src)` rather than executed: the script touches
+// document, window and the page's own elements, none of which exist in a bare
+// engine, so running it would fail for reasons that say nothing about whether
+// it is well formed.
+func TestTheShippedScriptParses(t *testing.T) {
+	engine, args := findJSEngine(t)
+	if engine == "" {
+		t.Skip("no JavaScript engine found (node, gjs, deno or qjs); brace balance is still checked")
+	}
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "page.js")
+	if err := os.WriteFile(src, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var cmd *exec.Cmd
+	switch engine {
+	case "gjs":
+		check := filepath.Join(dir, "check.js")
+		prog := "const GLib = imports.gi.GLib;\n" +
+			"let [ok, bytes] = GLib.file_get_contents(" + strconv.Quote(src) + ");\n" +
+			"let s = new TextDecoder().decode(bytes);\n" +
+			"try { new Function(s); } catch (e) { print('SYNTAX: ' + e.message); imports.system.exit(1); }\n"
+		if err := os.WriteFile(check, []byte(prog), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd = exec.Command(engine, check)
+	default:
+		cmd = exec.Command(engine, append(args, src)...)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("the script shipped to every reader does not parse (%s): %v\n%s",
+			engine, err, out)
+	}
+}
+
+func findJSEngine(t *testing.T) (string, []string) {
+	t.Helper()
+	for _, c := range []struct {
+		name string
+		args []string
+	}{
+		{"node", []string{"--check"}},
+		{"deno", []string{"check"}},
+		{"qjs", []string{"--check"}},
+		{"gjs", nil},
+	} {
+		if _, err := exec.LookPath(c.name); err == nil {
+			return c.name, c.args
+		}
+	}
+	return "", nil
 }

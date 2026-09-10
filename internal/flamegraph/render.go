@@ -59,12 +59,22 @@ import (
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
 )
 
-// frameHeight is the row pitch in CSS pixels: a 17px frame and a 1px gap.
+// frameHeight is the row pitch in CSS pixels: a 19px frame and a 2px gap.
+//
+// Chosen against the deepest real profile rather than for looks. The mock's
+// bars are roughly 28px pitch, which is handsome and does not fit: the
+// measured PyTorch capture is 42 levels, and 42 rows at 28px is 1176px --
+// past any laptop viewport, so the reader scrolls to see a stack that used
+// to fit. At 21px the same 42 rows are 882px and still fit, while the frame
+// gains 2px of height, a wider radius and real horizontal padding. Deep
+// stacks are the normal case here, not the exception: Python plus torch plus
+// cuBLAS plus the launch boundary is forty frames before anything unusual
+// happens.
 // It is the only fixed dimension the geometry has. Horizontal position and
 // width are percentages, so they are the window's business, not ours — see
 // styleSheet in assets.go for why that is the whole fix for a graph that
 // used to be 1280px wide on a 1990px screen.
-const frameHeight = 18
+const frameHeight = 21
 
 // Options configures a render.
 //
@@ -152,6 +162,8 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	}
 	writeTreeContainer(ew, res)
 	writeStatusBar(ew, res)
+	writeDomainLabels(ew, domainsPresent(root))
+	writeFrameDetails(ew)
 	ew.s("<div id=\"tip\" hidden></div>\n")
 
 	ew.s("<script>\n")
@@ -391,11 +403,19 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 	// capture, data-module was 566,966 bytes of a 3,165,745-byte page -- 18%
 	// -- for THIRTEEN distinct values totalling about a kilobyte.
 	mods := internModules(root)
+	// The card is a WRAPPER, not the chart itself. .chart's geometry is the
+	// layout engine -- an inline pixel height with absolutely positioned
+	// children whose vertical position is bottom:calc(var(--d)*18px) -- and
+	// putting a border and padding on it makes the border box disagree with
+	// that height. The card gets its own element so the graph's arithmetic is
+	// untouched.
+	ew.s("<div class=\"canvas\">\n")
 	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s">`+"\n",
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
 	writeModuleTable(ew, mods)
 	writeNode(ew, root, res.Unit, root.value, mods)
+	ew.s("</div>\n")
 	ew.s("</div>\n")
 	return ew.err
 }
@@ -443,6 +463,11 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 		cls, pct(n.x), pct(n.width),
 		html.EscapeString(accessibleName(n, unit, total)),
 		html.EscapeString(n.domain.Info().Key), n.value)
+	// Resolution is emitted alongside the domain, not folded into it: they
+	// answer different questions and a reader needs both. See resolution.go.
+	if r := ResolutionOf(n.name); r != ResolutionResolved {
+		ew.f(` data-resolution="%s"`, r.Info().Key)
+	}
 	if n.module != "" {
 		// An index into the page's module table, not the string. See
 		// writeChart.
@@ -541,14 +566,141 @@ func group(v int64) string {
 // the panel one of them opens. The info button grows a dot when the profile
 // carries notes, so a page with caveats never looks like a page without.
 func writeTopBar(ew *errWriter, opts Options, res *foldedstacks.Result, root *node) {
-	ew.s("<div class=\"top\">\n<h1>")
+	ew.s("<div class=\"top\">\n")
+	// The wordmark, which is the product rather than the file. The profile's
+	// own name moves to the middle of the bar and to the status line: a page
+	// with no identity of its own reads as a debug artefact, and this one is
+	// meant to be shared.
+	ew.s("<span class=\"brand\"><b>perf-agent</b><i>Enjoy the Flames.</i></span>\n")
+	ew.s("<h1>")
 	ew.esc(opts.Title)
 	ew.s("</h1>\n")
+	// Metric and unit as READOUTS, not controls. The mock draws them as
+	// dropdowns; a dropdown that cannot switch anything is a lie about what
+	// the page can do, and this page renders exactly one sample type. They
+	// say what is on screen and nothing more.
+	ew.s("<span class=\"readout\">")
+	ew.f("<span>Metric <b>%s</b></span>", html.EscapeString(res.SampleTypeName))
+	ew.f("<span>Unit <b>%s</b></span>", html.EscapeString(res.Unit))
+	ew.s("</span>\n")
 	writeInfoPanel(ew, root, res, opts)
 	ew.s("<button id=\"inv-btn\" type=\"button\" title=\"Invert: root at top (I)\" aria-label=\"Invert the graph\">&#8645;</button>\n")
 	ew.s("<button id=\"tree-btn\" type=\"button\" title=\"Tree view (T)\" aria-label=\"Toggle the tree view\">&#9776;</button>\n")
 	ew.s("<button id=\"theme-btn\" type=\"button\" title=\"Light / dark (D)\" aria-label=\"Toggle light or dark\">&#9680;</button>\n")
 	ew.s("</div>\n")
+	writeLegendBar(ew, root)
+}
+
+// writeLegendBar puts the colour key ON the page instead of inside a panel
+// nobody opens.
+//
+// It lists only the domains this profile actually contains, for the same
+// reason the info panel's legend does: a key naming colours that are not on
+// screen sends the reader looking for them. The labels are the short form --
+// "vendor", not "CPU: GPU runtime and driver" -- because a bar is scanned and
+// the panel is read; the full description is still one click away.
+func writeLegendBar(ew *errWriter, root *node) {
+	present := domainsPresent(root)
+	if len(present) == 0 {
+		return
+	}
+	ew.s("<div class=\"legend\" aria-label=\"Colour key\">\n")
+	for _, d := range legendOrder {
+		if !present[d] {
+			continue
+		}
+		in := d.Info()
+		// The swatch carries the OVERLAY as well as the fill. Three of these
+		// domains are near-identical greys and are told apart in the graph by
+		// hatching alone; a flat chip for a hatched frame is a key that does
+		// not match the thing it is keying.
+		style := "background:" + in.Fill
+		if in.Overlay != "" {
+			style = "background-image:" + in.Overlay + ";background-color:" + in.Fill
+		}
+		ew.f("<span class=\"c\"><i style=\"%s\"></i>%s</span>",
+			html.EscapeString(style), html.EscapeString(shortLegendLabel(in.Label)))
+	}
+	writeResolutionChips(ew, root)
+	ew.s("\n</div>\n")
+}
+
+// writeResolutionChips is the legend's SECOND axis, in the same bar.
+//
+// Colour says what kind of code a frame is; texture says how well it is
+// named. One channel carrying both facts is what the old legend had to
+// apologise for, and the mock draws the two rows together.
+//
+// "resolved" is deliberately absent: it is the default, every frame that is
+// not marked has it, and a chip for it would be a key to the absence of a
+// mark. Only the resolutions this profile actually contains appear, for the
+// same reason the domain chips work that way.
+func writeResolutionChips(ew *errWriter, root *node) {
+	present := map[Resolution]bool{}
+	var walk func(*node)
+	walk = func(n *node) {
+		// Derived from the name, exactly as writeNode derives it for the
+		// frame's own data-resolution: one function decides, so the key and
+		// the frames it keys can never disagree.
+		if r := ResolutionOf(n.name); n.depth > 0 && r != ResolutionResolved {
+			present[r] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(root)
+	if len(present) == 0 {
+		return
+	}
+	ew.s("<span class=\"sep\"></span>")
+	for _, r := range []Resolution{
+		ResolutionModuleOffset, ResolutionObfuscated,
+		ResolutionInterpreter, ResolutionBareAddress,
+	} {
+		if !present[r] {
+			continue
+		}
+		in := r.Info()
+		ew.f("<span class=\"c\"><i class=\"res\" data-resolution=\"%s\"></i>%s</span>",
+			html.EscapeString(in.Key), html.EscapeString(in.Label))
+	}
+}
+
+// domainsPresent is the set of domains this profile actually contains. The
+// legend and the details panel's label table both take their contents from
+// it, so neither can name a domain the other does not.
+func domainsPresent(root *node) map[Domain]bool {
+	present := map[Domain]bool{}
+	var walk func(*node)
+	walk = func(n *node) {
+		if n.depth > 0 {
+			present[n.domain] = true
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	walk(root)
+	return present
+}
+
+// legendOrder is the CPU-to-GPU reading order, not the declaration order of
+// the Domain constants: a key is a sentence about the path a launch takes.
+var legendOrder = []Domain{
+	DomainApplication, DomainSystem, DomainVendorRuntime, DomainUnsymbolized,
+	DomainKernel, DomainProfilerShim, DomainBoundary, DomainBoundaryUnattributed,
+	DomainGPUKernel, DomainRoot,
+}
+
+// shortLegendLabel trims the panel's descriptive label to a bar-sized one.
+// The long form explains; the short form identifies, and only the second fits
+// on one line beside eight others.
+func shortLegendLabel(label string) string {
+	if i := strings.Index(label, ": "); i >= 0 {
+		return label[i+2:]
+	}
+	return label
 }
 
 // writeSamplePeriodNote is the one note that stays on the page.
@@ -597,20 +749,51 @@ func writeTreeContainer(ew *errWriter, res *foldedstacks.Result) {
 		html.EscapeString(res.SampleTypeName+"/"+res.Unit))
 }
 
+// writeFrameDetails emits the docked panel the script fills on pin.
+//
+// Empty and hidden in the markup: everything in it is derived from the frame
+// the reader pinned, and the page has no pinned frame until they pin one.
+// Emitting a skeleton rather than building the nodes in script keeps the
+// structure in the same file as the rest of the page's HTML, where the
+// balance test can see it.
+//
+// It is a PANEL, not a dialog: it does not trap focus and the graph stays
+// live behind it, because the reader's next action after pinning a frame is
+// usually to look at its neighbours. Escape closes it, which is the one
+// dialog behaviour worth keeping.
+func writeFrameDetails(ew *errWriter) {
+	ew.s("<div id=\"fd\" hidden aria-label=\"Frame details\">\n")
+	ew.s("<div class=\"fh\"><b>Frame Details</b>")
+	ew.s("<button id=\"fd-copy\" type=\"button\" title=\"Copy the frame name\" aria-label=\"Copy the frame name\">&#10697;</button>")
+	ew.s("<button id=\"fd-close\" type=\"button\" title=\"Close (Esc)\" aria-label=\"Close\">&#10005;</button>")
+	ew.s("</div>\n")
+	ew.s("<div class=\"fn\" id=\"fd-name\"></div>\n")
+	ew.s("<div class=\"tabs\" role=\"tablist\">")
+	ew.s("<button role=\"tab\" id=\"tab-sum\" aria-selected=\"true\">Summary</button>")
+	ew.s("<button role=\"tab\" id=\"tab-stack\" aria-selected=\"false\">Stack</button>")
+	ew.s("<button role=\"tab\" id=\"tab-all\" aria-selected=\"false\">Across graph</button>")
+	ew.s("</div>\n")
+	ew.s("<div class=\"body\" id=\"fd-body\"></div>\n")
+	ew.s("</div>\n")
+}
+
 // writeStatusBar emits the single permanent line of text on the page. Its
 // resting content is the profile's own summary — the numbers the chip row
 // used to hold — and the script replaces it with the hovered frame.
 func writeStatusBar(ew *errWriter, res *foldedstacks.Result) {
 	ew.s("<div id=\"status\">\n<span id=\"st\">")
-	ew.esc(FormatValue(res.Total, res.Unit))
-	ew.s(" total")
-	ew.f(" &middot; %s samples", group(int64(res.Samples)))
-	ew.f(" &middot; %s stacks", group(int64(len(res.Stacks))))
-	ew.s(" &middot; ")
-	ew.esc(res.SampleTypeName + "/" + res.Unit)
+	// Labelled figures rather than a run-on sentence: the mock's status line
+	// is scanned for one number at a time, and "15.049 s total" reads as prose
+	// while "Total 15.049 s" reads as a field.
+	ew.f("<span class=\"k\">Total</span> <b>%s</b>", html.EscapeString(FormatValue(res.Total, res.Unit)))
+	ew.f(" &nbsp;<span class=\"k\">Samples</span> <b>%s</b>", group(int64(res.Samples)))
+	ew.f(" &nbsp;<span class=\"k\">Stacks</span> <b>%s</b>", group(int64(len(res.Stacks))))
+	ew.f(" &nbsp;<span class=\"k\">Metric</span> <b>%s</b>", html.EscapeString(res.SampleTypeName))
+	ew.f(" &nbsp;<span class=\"k\">Unit</span> <b>%s</b>", html.EscapeString(res.Unit))
 	ew.s("</span>\n")
 	ew.s("<input id=\"q\" type=\"search\" hidden placeholder=\"search frames\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"Search frames\">\n")
-	ew.s("<span id=\"mc\"></span>\n</div>\n")
+	ew.s("<span id=\"mc\"></span>\n")
+	ew.s("<span id=\"brandf\">Enjoy the Flames.</span>\n</div>\n")
 }
 
 // writeInfoPanel is everything that used to be permanently on screen.
@@ -661,10 +844,12 @@ func writeInfoPanel(ew *errWriter, root *node, res *foldedstacks.Result, opts Op
 // legend never advertises a layer the profile does not contain.
 func writeLegend(ew *errWriter, root *node) {
 	present := make([]bool, numDomains)
+	presentRes := map[Resolution]bool{}
 	var walk func(*node)
 	walk = func(n *node) {
 		if n.depth > 0 {
 			present[n.domain] = true
+			presentRes[ResolutionOf(n.name)] = true
 		}
 		for _, c := range n.children {
 			walk(c)
@@ -682,7 +867,10 @@ func writeLegend(ew *errWriter, root *node) {
 		cls := "sw"
 		if info.Overlay != "" {
 			// The swatch is hatched exactly when the frames are, so the
-			// legend row and the graph read as the same thing.
+			// legend row and the graph read as the same thing. Only domains
+			// still own a texture; the rest moved to the resolution legend
+			// below, and a swatch here that hatched without a matching frame
+			// rule would be the legend contradicting the graph.
 			cls += " hatched"
 		}
 		ew.f("<li><span class=\"%s\" style=\"background-color:%s\"", cls, info.Fill)
@@ -695,8 +883,9 @@ func writeLegend(ew *errWriter, root *node) {
 		ew.esc(info.Desc)
 		ew.s("</li>\n")
 	}
+	writeResolutionLegend(ew, presentRes)
 	if root.inexact > 0 {
-		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching</b> Either the frame has no symbol, or its CPU attribution was inferred rather than measured. Hover the frame for which.</li>\n")
+		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching, the other way</b> This frame&rsquo;s CPU attribution was inferred rather than measured. A frame can carry this and a texture above at the same time.</li>\n")
 	} else {
 		ew.s("<li><span class=\"sw hatch\"></span><b>diagonal hatching</b> The frame has no symbol, or no CPU stack stands behind it. Hover the frame for which.</li>\n")
 	}
@@ -911,4 +1100,44 @@ func (e *errWriter) f(format string, args ...any) {
 		return
 	}
 	_, e.err = fmt.Fprintf(e.w, format, args...)
+}
+
+// writeResolutionLegend explains the textures.
+//
+// A second axis, because the first one could not carry it: colour says what
+// kind of code a frame is, texture says how well it could be named, and until
+// these were separated the legend had to fall back on "either the frame has no
+// symbol, or its attribution was inferred — hover the frame for which", which
+// is the legend admitting it cannot tell the reader what they are looking at.
+//
+// Only the resolutions actually present are listed, on the same principle as
+// the domain legend: never advertise a state the profile does not contain.
+func writeResolutionLegend(ew *errWriter, present map[Resolution]bool) {
+	order := []Resolution{
+		ResolutionModuleOffset, ResolutionObfuscated,
+		ResolutionBareAddress, ResolutionInterpreter,
+	}
+	any := false
+	for _, r := range order {
+		if present[r] {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+	ew.s("</ul>\n<h2>Texture means how well it is named</h2>\n")
+	ew.s("<p class=\"muted\">Independent of the colour: a frame can be vendor code that is fully named, or application code with no symbol at all. A frame with no texture was named by a symbol table.</p>\n<ul class=\"legend-list\">\n")
+	for _, r := range order {
+		if !present[r] {
+			continue
+		}
+		info := r.Info()
+		ew.f("<li><span class=\"sw res-%s\"></span><b>", info.Key)
+		ew.esc(info.Label)
+		ew.s("</b> ")
+		ew.esc(info.Desc)
+		ew.s("</li>\n")
+	}
 }

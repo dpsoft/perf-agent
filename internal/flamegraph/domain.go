@@ -117,7 +117,10 @@ var domainInfo = [numDomains]DomainInfo{
 		Desc: "CUDA/HIP/HSA runtime and driver frames: the CPU path that initiates GPU work. Yellow, Gregg's C++ layer.",
 	},
 	DomainUnsymbolized: {
-		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)", Overlay: "var(--hatch-gap)",
+		// No Overlay: the hatch moved to the RESOLUTION axis, which says why
+		// a frame is unnamed (module+offset, bare address, obfuscated) where
+		// the domain only said that it is. See resolution.go.
+		Key: "unsym", Label: "vendor, no symbols", Fill: "var(--fill-unsym)",
 		Desc: "Unwound correctly; no symbol table could name it. The depth is real, the names are missing — usually a stripped vendor library with no exported symbols. Labelled module+offset (libcuda.so.1+0x1b71c6) where the profile knows which file the address fell in, and as a bare address where it does not. The CPU band's hue, drained: right layer, no name.",
 	},
 	DomainProfilerShim: {

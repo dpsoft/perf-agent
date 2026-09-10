@@ -60,33 +60,79 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // text-overflow:ellipsis cuts the label to whatever the frame can hold, at
 // the reader's actual window width, in the reader's actual font — three
 // things a Go function measuring characters against a nominal 6.4 px advance
-// could only guess at. Frames narrower than the 8 px of horizontal padding
+// could only guess at. Frames narrower than the 14 px of horizontal padding
 // have a zero-width content box and draw no text at all; between there and
-// about 14 px they draw a lone ellipsis. Both are the browser applying the
-// rule, not a threshold anyone chose.
+// about 21 px they draw a lone ellipsis. Both are the browser applying the
+// rule, not a threshold anyone chose. (Both numbers moved with the padding
+// when the bars took the mock's shape: they were 8 px and 14 px at 4 px of
+// padding, and they are not independent of it.)
 const styleSheet = `
-:root{--bg:#fbf9f6;--panel:#fffefc;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--fatal-bg:#fdecec;--fatal-line:#e0a3a3}
+:root{--tip-bg:#1f1d24;--tip-ink:#f2eff7;--tip-line:#3a3543;--bg:#f7f6f9;--panel:#ffffff;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--fatal-bg:#fdecec;--fatal-line:#e0a3a3}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){` + darkChrome + `}}
 :root[data-theme="dark"]{` + darkChrome + `}
 *{box-sizing:border-box}
-body{margin:0;padding:8px 12px 30px;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5}
+body{margin:0;padding:0 0 34px;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5}
 code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
 .muted{color:var(--muted)}
-.top{display:flex;align-items:baseline;gap:8px}
-h1{font-size:13px;font-weight:600;margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.top button,.top summary{cursor:pointer;color:var(--muted);background:none;border:0;padding:0 2px;font-size:15px;line-height:1;list-style:none}
+.top{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:baseline;gap:9px;flex:0 0 auto}
+.brand b{font-size:16px;font-weight:700;letter-spacing:-.015em}
+.brand i{font-style:italic;color:var(--muted);font-size:12.5px}
+h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+.readout{display:flex;gap:6px;flex:0 0 auto}
+.readout span{padding:3px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);font-size:12px;white-space:nowrap}
+.readout b{font-weight:600}
+.top button,.top summary{cursor:pointer;color:var(--muted);background:none;border:0;padding:2px 4px;font-size:15px;line-height:1;list-style:none;border-radius:6px}
 .top summary::-webkit-details-marker{display:none}
-.top button:hover,.top summary:hover{color:var(--accent)}
+.top button:hover,.top summary:hover{color:var(--accent);background:var(--bg)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
+.legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.legend .c i{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block;background-repeat:repeat}
+.legend .sep{width:1px;height:14px;background:var(--line)}
+.legend i.res{background-color:var(--fill-root)}
+#fd{position:fixed;z-index:7;top:96px;right:14px;bottom:44px;width:378px;max-width:calc(100vw - 28px);display:flex;flex-direction:column;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:0 10px 36px rgb(0 0 0/.16);overflow:hidden}
+#fd[hidden]{display:none}
+body.pinned .canvas,body.pinned .note{margin-right:406px}
+@media (max-width:900px){body.pinned .canvas,body.pinned .note{margin-right:16px}#fd{top:auto;height:46vh}}
+#fd .fh{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid var(--line)}
+#fd .fh b{flex:1;font-size:12.5px;font-weight:600}
+#fd .fh button{cursor:pointer;color:var(--muted);background:none;border:0;font-size:14px;padding:2px 4px;border-radius:6px}
+#fd .fh button:hover{color:var(--accent);background:var(--bg)}
+#fd .fn{padding:9px 12px;border-bottom:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.45;word-break:break-word;max-height:5.4em;overflow:auto}
+#fd .tabs{display:flex;gap:2px;padding:7px 9px 0;border-bottom:1px solid var(--line)}
+#fd .tabs button{cursor:pointer;border:0;background:none;color:var(--muted);font:inherit;font-size:12px;padding:5px 10px;border-radius:7px 7px 0 0}
+#fd .tabs button[aria-selected="true"]{color:var(--ink);background:var(--bg);font-weight:600}
+#fd .body{flex:1;overflow:auto;padding:11px 12px 14px}
+#fd .rows{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:12px;align-items:baseline}
+#fd .rows .k{color:var(--muted);white-space:nowrap}
+#fd .rows .v{text-align:right;font-variant-numeric:tabular-nums}
+#fd .rows .v.l{text-align:left}
+#fd .callout{margin:11px 0;padding:8px 10px;border:1px solid var(--line);border-left-width:3px;border-radius:7px;background:var(--bg);font-size:11.5px;line-height:1.45}
+#fd .callout b{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:2px}
+#fd h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:14px 0 6px}
+#fd .path{border:1px solid var(--line);border-radius:8px;background:var(--bg);padding:4px 0;max-height:46vh;overflow:auto}
+#fd .path div{position:relative;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;line-height:1.45;padding:2px 9px 2px 22px;word-break:break-word}
+#fd .path div::before{content:"";position:absolute;left:11px;top:0;bottom:0;width:1px;background:var(--line)}
+#fd .path div:first-child::before{top:9px}
+#fd .path div:last-child::before{bottom:auto;height:9px}
+#fd .path div::after{content:"";position:absolute;left:11px;top:9px;width:6px;height:1px;background:var(--line)}
+#fd .path div.here{background:var(--warn-bg);font-weight:600}
+#fd .dot{display:inline-block;width:9px;height:9px;border-radius:50%;border:1px solid rgb(0 0 0/.25);margin-right:5px;vertical-align:-1px}
+.frame.pinned{outline:2px solid var(--accent);outline-offset:-2px}
 #info-btn.notes::after{content:"\2022";color:var(--accent);vertical-align:super;font-size:11px}
-.note{margin:6px 0 0;padding:3px 9px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:5px;background:var(--warn-bg);font-size:12px}
-.chart{position:relative;margin:8px 0 0}
-.frame{position:absolute;height:17px;padding:0 4px;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px;cursor:pointer}
+.note{margin:8px 16px 0;padding:5px 11px;border:1px solid var(--warn-line);border-left-width:3px;border-radius:7px;background:var(--warn-bg);font-size:12px}
+.canvas{margin:10px 16px 0;transition:margin-right .12s ease;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+.chart{position:relative;margin:0}
+.frame{position:absolute;height:19px;padding:0 7px;border-radius:5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:19px;cursor:pointer}
 .frame.dim{opacity:.15}
-#status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:12px;align-items:center;padding:2px 12px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}
+#status{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;gap:14px;align-items:center;padding:5px 16px;background:var(--panel);border-top:1px solid var(--line);font-size:12px}
+#status b{font-weight:600}
+#status .k{color:var(--muted)}
+#brandf{color:var(--muted);font-style:italic;white-space:nowrap}
 #st{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #mc{color:var(--muted);white-space:nowrap}
 #q{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px;width:15em}
-#tip{position:fixed;z-index:8;left:0;top:0;max-width:46em;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 2px 10px rgb(0 0 0/.2);font-size:12px;line-height:1.45;white-space:pre-line;word-break:break-all;pointer-events:none}
+#tip{position:fixed;z-index:8;left:0;top:0;max-width:44em;padding:11px 14px;border:1px solid var(--tip-line);border-radius:10px;background:var(--tip-bg);color:var(--tip-ink);box-shadow:0 8px 28px rgb(0 0 0/.28);font-size:12.5px;line-height:1.5;white-space:pre-line;word-break:break-word;pointer-events:none}
 #panel{position:fixed;z-index:9;top:32px;left:50%;transform:translateX(-50%);width:min(1000px,calc(100% - 24px));max-height:calc(100vh - 72px);overflow:auto;padding:12px 16px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 8px 34px rgb(0 0 0/.25);cursor:auto;text-align:left}
 #panel h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:14px 0 6px}
 #panel h2:first-of-type{margin-top:0}
@@ -232,6 +278,9 @@ const paletteCSS = `
 
   --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
   --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
 
   --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
   --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
@@ -262,18 +311,30 @@ const paletteCSS = `
 [data-domain="system"]{--fill-x:var(--fill-system)}
 [data-domain="kernel"]{--fill-x:var(--fill-kernel)}
 [data-domain="vendor"]{--fill-x:var(--fill-vendor)}
-[data-domain="unsym"]{--fill-x:var(--fill-unsym);background-image:var(--hatch-gap)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
 [data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
 [data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
 [data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
 [data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
 .frame.inexact{background-image:var(--hatch-inf)}
-.frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
 
 .frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
 .frame.match{background-color:var(--fill-match)}
 .frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
 .sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
 `
 
 // The jitter ladder. jitterSteps shades per domain, evenly spaced from 0 to
@@ -460,9 +521,20 @@ function detail(it){
   var w=widthMeaning(it,d);
   if(w){s+="\n"+w;}
   if(it.inexact>0){s+="\n"+fmt(it.inexact)+" of this is attributed by inference, not measurement";}
-  if(d.domain==="unsym"){s+="\nno symbol: the unwind found this frame, nothing could name it";}
+  var r=resolutionNote(d);
+  if(r){s+="\n"+r;}
   if(d.collapsed){s+="\nmerged: consecutive frames in this library whose names carry no information (an address, or an obfuscated vendor symbol) are drawn as one. The profile still holds every frame; re-render with -raw-vendor-frames to see them.";}
   return s;
+}
+function resolutionNote(d){
+  switch(d.resolution){
+  case "module-offset": return "no symbol here, but the module is known \u2014 this offset is stable across ASLR and can be matched against symbol data for the same build";
+  case "bare-address": return "no symbol and no module: the frame's position is real, nothing else about it is known";
+  case "obfuscated": return "symbolized by NVIDIA's symbol server \u2014 a stable identifier for an internal function, not a human-readable name. Not a symbolization failure";
+  case "interpreter": return "interpreter frame placed correctly; its code object could not be read";
+  }
+  if(d.domain==="unsym"){return "no symbol: the unwind found this frame, nothing could name it";}
+  return "";
 }
 function widthMeaning(it,d){
   if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
@@ -639,8 +711,110 @@ function revealInTree(it){
   if(it.head){it.head.scrollIntoView({block:"center"});}
 }
 
+var fd=doc.getElementById("fd"),fdName=doc.getElementById("fd-name"),fdBody=doc.getElementById("fd-body");
+var pinned=null,fdTab="sum",hover=null;
+var domLabels=(function(){var e=doc.getElementById("domain-labels");
+  try{return e?JSON.parse(e.textContent):{};}catch(x){return {};}})();
+function domLabel(k){return domLabels[k]||k||"application";}
+function resLabel(d){
+  if(d.collapsed){return "merged run \u2014 no usable name";}
+  var r=resolutionNote(d);
+  return r?esc(r.replace(/^[^:]*: /,"")):"fully resolved";
+}
+function baseName(p){var i=p.lastIndexOf("/");return i<0?p:p.slice(i+1);}
+function esc(t){var d=doc.createElement("div");d.textContent=t;return d.innerHTML;}
+function rows(pairs){
+  var h='<div class="rows">';
+  pairs.forEach(function(p){
+    if(p[1]===null||p[1]===undefined||p[1]==="")return;
+    h+='<span class="k">'+esc(p[0])+'</span><span class="v'+(p[2]?" l":"")+'">'+p[1]+'</span>';
+  });
+  return h+'</div>';
+}
+function domainDot(d){
+  var e=doc.createElement("span");e.className="frame";e.setAttribute("data-domain",d||"app");
+  doc.body.appendChild(e);var bg=getComputedStyle(e).backgroundColor;e.remove();
+  return '<span class="dot" style="background:'+bg+'"></span>';
+}
+function pathToRoot(it){
+  var chain=[],o=it;
+  while(o){chain.push(o);o=o.up;}
+  chain.reverse();
+  return chain.map(function(o){
+    return '<div'+(o===it?' class="here"':'')+'>'+esc(o.name)+"</div>";
+  }).join("");
+}
+function acrossGraph(it){
+  var n=0,total=0;
+  items.forEach(function(o){if(o.name===it.name){n++;total+=o.value;}});
+  return {n:n,total:total};
+}
+function fdSummary(it){
+  var d=it.el.dataset,m=moduleOf(d),w=widthMeaning(it,d);
+  var h=rows([
+    ["Cumulative",fmt(it.value)+' <span class="muted">'+pct(it.value)+"</span>"],
+    ["Self",fmt(it.self)+' <span class="muted">'+pct(it.self)+"</span>"],
+    ["Depth",it.d],
+    ["Children",it.kids.length]
+  ]);
+  if(w){h+='<div class="callout"><b>Width means</b>'+esc(w.replace(/^width: /,""))+"</div>";}
+  h+=rows([
+    ["Domain",domainDot(d.domain)+esc(domLabel(d.domain)),true],
+    ["Resolution",resLabel(d),true],
+    ["Module",m?'<span title="'+esc(m)+'">'+esc(baseName(m))+"</span>":'<span class="muted">unknown</span>',true]
+  ]);
+  if(it.inexact>0){h+='<div class="callout"><b>Attributed by inference</b>'+fmt(it.inexact)+" of this frame names a plausible caller, not an observed one.</div>";}
+  if(d.collapsed){h+='<div class="callout"><b>Merged</b>Consecutive frames in this library whose names carry no information are drawn as one. The profile still holds every frame.</div>';}
+  h+="<h3>Path to root</h3>"+'<div class="path">'+pathToRoot(it)+"</div>";
+  return h;
+}
+function fdStack(it){
+  return "<h3>Call path</h3>"+'<div class="path">'+pathToRoot(it)+"</div>";
+}
+function fdAll(it){
+  var a=acrossGraph(it);
+  return rows([
+    ["Instances",a.n],
+    ["Combined",fmt(a.total)+' <span class="muted">'+pct(a.total)+"</span>"],
+    ["This one",fmt(it.value)+' <span class="muted">'+pct(it.value)+"</span>"]
+  ])+'<div class="callout"><b>Across graph</b>The same symbol reached by different call paths is a different frame in a flame graph. These are all of them, summed.</div>';
+}
+function fdRender(){
+  if(!pinned)return;
+  fdName.textContent=pinned.name;
+  fdBody.innerHTML=fdTab==="sum"?fdSummary(pinned):fdTab==="stack"?fdStack(pinned):fdAll(pinned);
+}
+function setTab(t){
+  fdTab=t;
+  [["sum","tab-sum"],["stack","tab-stack"],["all","tab-all"]].forEach(function(p){
+    doc.getElementById(p[1]).setAttribute("aria-selected",p[0]===t?"true":"false");
+  });
+  fdRender();
+}
+function pin(it){
+  if(!it){return;}
+  if(pinned===it){unpin();return;}
+  if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
+  pinned=it;it.el.classList.add("pinned");
+  fd.hidden=false;doc.body.classList.add("pinned");fdRender();
+}
+function unpin(){
+  if(pinned&&pinned.el){pinned.el.classList.remove("pinned");}
+  pinned=null;fd.hidden=true;doc.body.classList.remove("pinned");
+}
+doc.getElementById("fd-close").addEventListener("click",unpin);
+doc.getElementById("fd-copy").addEventListener("click",function(){
+  if(pinned&&navigator.clipboard){navigator.clipboard.writeText(pinned.name);}
+});
+doc.getElementById("tab-sum").addEventListener("click",function(){setTab("sum");});
+doc.getElementById("tab-stack").addEventListener("click",function(){setTab("stack");});
+doc.getElementById("tab-all").addEventListener("click",function(){setTab("all");});
+
 items.forEach(function(it){
   it.el.addEventListener("click",function(e){e.stopPropagation();zoom(it);});
+  it.el.addEventListener("click",function(e){if(e.shiftKey){e.stopPropagation();e.preventDefault();pin(it);}},true);
+  it.el.addEventListener("mouseenter",function(){hover=it;});
+  it.el.addEventListener("mouseleave",function(){if(hover===it){hover=null;}});
   it.el.addEventListener("mouseenter",function(){status(it);});
   it.el.addEventListener("mousemove",function(e){showTip(e,it);});
   it.el.addEventListener("mouseleave",function(){tip.hidden=true;status(null);});
@@ -656,6 +830,7 @@ doc.addEventListener("click",function(e){
 });
 doc.addEventListener("keydown",function(e){
   if((e.ctrlKey||e.metaKey)&&(e.key==="f"||e.key==="F")){e.preventDefault();openSearch();return;}
+  if(e.key==="Escape"&&pinned){unpin();return;}
   if(e.key==="Escape"){
     if(info.open){info.open=false;}
     else if(!q.hidden){closeSearch();}
@@ -671,6 +846,7 @@ doc.addEventListener("keydown",function(e){
   else if(e.key==="d"||e.key==="D"){toggleTheme();}
   else if(e.key==="i"||e.key==="I"){toggleInvert();}
   else if(e.key==="t"||e.key==="T"){toggleTree();}
+  else if(e.key==="p"||e.key==="P"){pin(hover||pinned);}
   else if(e.key==="n"){stepMatch(1);}
   else if(e.key==="N"){stepMatch(-1);}
   else if(e.key==="?"){toggleInfo();}

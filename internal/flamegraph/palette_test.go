@@ -376,11 +376,56 @@ func TestEveryHatchedDomainIsActuallyHatchedByARule(t *testing.T) {
 		assert.Contains(t, paletteCSS, strings.TrimSuffix(strings.TrimPrefix(info.Overlay, "var("), ")")+":",
 			"domain %q names a hatch token the stylesheet does not declare", info.Key)
 	}
-	// A frame can be both unnamed and inferred; it must then show both
-	// hatches rather than silently losing one to the cascade.
-	assert.Contains(t, paletteCSS, `.frame.inexact[data-domain="unsym"],.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}`)
-	// The two hatches run opposite ways, so which uncertainty a frame
-	// carries is visible without hovering it.
+}
+
+// Texture belongs to the RESOLUTION, colour to the domain.
+//
+// They answer different questions -- what kind of code this is, and how well
+// we could name it -- and folding both into the domain meant a reader could
+// not ask the second one. Every resolution that is not plain "resolved" must
+// therefore paint something, and each must paint something DIFFERENT, or the
+// axis is decorative.
+func TestEveryUnresolvedResolutionHasItsOwnTexture(t *testing.T) {
+	seen := map[string]string{}
+	for _, r := range []Resolution{
+		ResolutionModuleOffset, ResolutionBareAddress,
+		ResolutionObfuscated, ResolutionInterpreter,
+	} {
+		key := r.Info().Key
+		rule := fmt.Sprintf(`[data-resolution="%s"]{background-image:`, key)
+		assert.Contains(t, paletteCSS, rule, "resolution %q paints nothing", key)
+
+		i := strings.Index(paletteCSS, rule)
+		tok := paletteCSS[i+len(rule):]
+		tok = tok[:strings.Index(tok, "}")]
+		assert.Contains(t, paletteCSS, strings.TrimSuffix(strings.TrimPrefix(tok, "var("), ")")+":",
+			"resolution %q names a texture token the stylesheet does not declare", key)
+		if prev, dup := seen[tok]; dup {
+			t.Errorf("resolutions %q and %q share the texture %s; they must be told apart", prev, key, tok)
+		}
+		seen[tok] = key
+	}
+	// A resolved frame must carry no texture at all: the plain case has to
+	// look plain, or every frame reads as uncertain.
+	assert.NotContains(t, paletteCSS, `[data-resolution="resolved"]`)
+}
+
+// A frame can be both unnamed AND inferred. It must show both textures rather
+// than silently losing one to the cascade -- background-image does not
+// accumulate, so each combination needs its own rule.
+func TestInferredCombinesWithEveryTexture(t *testing.T) {
+	for _, r := range []Resolution{
+		ResolutionModuleOffset, ResolutionBareAddress,
+		ResolutionObfuscated, ResolutionInterpreter,
+	} {
+		key := r.Info().Key
+		assert.Contains(t, paletteCSS,
+			fmt.Sprintf(`.frame.inexact[data-resolution="%s"]{background-image:`, key),
+			"an inferred %q frame would lose one of its two textures", key)
+	}
+	assert.Contains(t, paletteCSS, `.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}`)
+	// The two uncertainties run opposite ways, so which one a frame carries
+	// is visible without hovering it.
 	assert.Contains(t, paletteCSS, "--hatch-gap: repeating-linear-gradient(45deg,")
 	assert.Contains(t, paletteCSS, "--hatch-inf: repeating-linear-gradient(-45deg,")
 }

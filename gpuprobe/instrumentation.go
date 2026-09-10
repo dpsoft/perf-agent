@@ -77,8 +77,20 @@ type instrumentationBand struct {
 	enabled bool
 }
 
-func newInstrumentationBand(s shimScope) instrumentationBand {
-	return instrumentationBand{shim: s, enabled: s.guarded}
+// newInstrumentationBand builds the collapser. keep=true disables it, leaving
+// every delivery-path frame in the profile.
+//
+// The elision happens BEFORE the profile is written, so unlike the flame
+// graph's vendor-run collapse there is no way to get these frames back from a
+// pb.gz that was captured without them -- the only recourse is another
+// capture. That asymmetry is why the switch exists at all: eliding by default
+// is right, because the frames are the measurement apparatus rather than the
+// workload, but "not the workload's call path" is not the same as "nobody may
+// ever want them". Anyone measuring the profiler's own overhead wants exactly
+// these frames, and the default made that impossible rather than merely
+// inconvenient.
+func newInstrumentationBand(s shimScope, keep bool) instrumentationBand {
+	return instrumentationBand{shim: s, enabled: s.guarded && !keep}
 }
 
 // InstrumentationFrameName is the marker left in place of an elided band.

@@ -283,6 +283,21 @@ type Config struct {
 	// PID restricts the attachment to one process; zero is system-wide.
 	PID int
 
+	// KeepInstrumentationFrames leaves the profiler's own delivery path in
+	// every sampled stack instead of collapsing it to one marker.
+	//
+	// OFF by default, and the default is the right one: measured on an RTX
+	// 3090, CUPTI's callback machinery is ~7 frames in every stack and 19% of
+	// every frame in the profile, none of it the application's call path --
+	// it is there because we subscribed a callback. See instrumentationBand.
+	//
+	// It exists because this elision is IRREVERSIBLE in a way the flame
+	// graph's vendor-run collapse is not: it happens before the profile is
+	// written, so the frames are absent from the pb.gz and no rendering
+	// option can bring them back. Profiling the profiler is a real task, and
+	// without this switch it needed a source change.
+	KeepInstrumentationFrames bool
+
 	// EagerPIDs are processes ALREADY RUNNING that map ShimPath, whose CFI
 	// tables must be compiled before the uprobe link exists.
 	//
@@ -1576,7 +1591,7 @@ func newConsumer(cfg Config) *Consumer {
 	return &Consumer{
 		cfg:         cfg,
 		shim:        newShimScope(cfg.ShimPath),
-		instr:       newInstrumentationBand(newShimScope(cfg.ShimPath)),
+		instr:       newInstrumentationBand(newShimScope(cfg.ShimPath), cfg.KeepInstrumentationFrames),
 		seqByStream: map[seqKey]uint64{},
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),

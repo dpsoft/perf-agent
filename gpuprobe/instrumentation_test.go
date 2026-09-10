@@ -17,7 +17,7 @@ func testBand(t *testing.T) instrumentationBand {
 		guarded: true,
 		paths:   map[string]struct{}{testShimPath: {}},
 		base:    "libperfagent-gpu-nvidia.so",
-	})
+	}, false)
 }
 
 func named(name, module string) pp.Frame {
@@ -142,7 +142,7 @@ func TestAStackThatIsAllInstrumentationIsLeftAlone(t *testing.T) {
 // Without a shim there is no anchor, and matching libcupti on its own would be
 // a guess about somebody else's process rather than a fact about ours.
 func TestWithNoShimNothingIsElided(t *testing.T) {
-	b := newInstrumentationBand(shimScope{})
+	b := newInstrumentationBand(shimScope{}, false)
 	frames := []pp.Frame{
 		raw("/usr/lib/libcupti.so.13"),
 		named("app_main", "/opt/app"),
@@ -203,4 +203,42 @@ func TestTheBandIsTheSameFromEitherEndOfTheStack(t *testing.T) {
 	assert.Equal(t, removedInner, removedOuter,
 		"the same stack read from the other end must lose the same frames")
 	assert.Equal(t, 2, removedInner)
+}
+
+// The switch that makes the elision a default rather than a decision taken
+// for the reader.
+//
+// This collapse runs BEFORE the profile is written, so the frames it removes
+// are absent from the pb.gz and no rendering option can recover them -- unlike
+// the flame graph's vendor-run collapse, which is a view over a complete
+// profile. Profiling the profiler's own overhead needs exactly these frames,
+// and without a switch that required editing the source.
+func TestKeepingInstrumentationLeavesEveryFrameInPlace(t *testing.T) {
+	frames := []pp.Frame{
+		named("(anonymous namespace)::on_launch(CUpti_CallbackData const*)", testShimPath),
+		raw("/usr/lib/libcupti.so.13"),
+		raw("/usr/lib/libcupti.so.13"),
+		raw("/usr/lib/libcuda.so.610.57.04"),
+		named("cuLaunchKernel", "/usr/lib/libcuda.so.610.57.04"),
+		named("app_main", "/opt/app"),
+	}
+
+	kept := newInstrumentationBand(shimScope{
+		guarded: true,
+		paths:   map[string]struct{}{testShimPath: {}},
+		base:    "libperfagent-gpu-nvidia.so",
+	}, true)
+	got, removed := kept.collapse(append([]pp.Frame(nil), frames...))
+	assert.Equal(t, len(frames), len(got), "keeping instrumentation must remove nothing")
+	assert.Zero(t, removed)
+	assert.NotContains(t, names(got), InstrumentationFrameName,
+		"no marker either: the point is to see the real frames, not a stand-in")
+
+	// And the same fixture through the default collapser, so this test proves
+	// the flag is what made the difference rather than the fixture being
+	// uncollapsible in the first place.
+	def := testBand(t)
+	gotDefault, removedDefault := def.collapse(append([]pp.Frame(nil), frames...))
+	assert.Less(t, len(gotDefault), len(frames))
+	assert.Positive(t, removedDefault)
 }

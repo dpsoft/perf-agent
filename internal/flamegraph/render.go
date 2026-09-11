@@ -157,11 +157,16 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 
 	writeTopBar(ew, opts, res, root)
 	writeSamplePeriodNote(ew, res)
+	// Above the chart, beside the sample-period note, because it is the same
+	// kind of statement: a fact about what this picture is not showing. The
+	// script fills it; it is empty and hidden until something is hidden.
+	ew.s("<div id=\"hidden-note\" hidden></div>\n")
 	if err := writeChart(ew, root, maxDepth, res); err != nil {
 		return err
 	}
 	writeTreeContainer(ew, res)
 	writeStatusBar(ew, res)
+	ew.s("<div id=\"menu\" hidden role=\"menu\"></div>\n")
 	writeDomainLabels(ew, domainsPresent(root))
 	writeFrameDetails(ew)
 	ew.s("<div id=\"tip\" hidden></div>\n")

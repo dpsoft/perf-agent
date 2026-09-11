@@ -29,9 +29,12 @@ import (
 //	  ... four more ...                ┘
 //	  (anonymous namespace)::on_launch <- the shim
 //
-// Across the whole capture, libcupti accounts for 5.98 frames per stack and
+// Across a PyTorch capture, libcupti accounts for 5.98 frames per stack and
 // the driver's dispatch frame for 1.00 -- 69% of all unnamed vendor frames,
-// about 19% of EVERY frame in EVERY stack. None of it is the application. It
+// about 19% of EVERY frame in EVERY stack. The 7 frames are the stable part:
+// the depth is CUPTI's. The 19% is not, since it also counts the stacks that
+// carry no CPU caller at all -- the same band is 23.5% of the microbenchmark
+// under shim/nvidia/testdata. None of it is the application. It
 // exists because we subscribed a callback, and it would not be in the profile
 // if the profiler were not there.
 //
@@ -77,8 +80,20 @@ type instrumentationBand struct {
 	enabled bool
 }
 
-func newInstrumentationBand(s shimScope) instrumentationBand {
-	return instrumentationBand{shim: s, enabled: s.guarded}
+// newInstrumentationBand builds the collapser. keep=true disables it, leaving
+// every delivery-path frame in the profile.
+//
+// The elision happens BEFORE the profile is written, so unlike the flame
+// graph's vendor-run collapse there is no way to get these frames back from a
+// pb.gz that was captured without them -- the only recourse is another
+// capture. That asymmetry is why the switch exists at all: eliding by default
+// is right, because the frames are the measurement apparatus rather than the
+// workload, but "not the workload's call path" is not the same as "nobody may
+// ever want them". Anyone measuring the profiler's own overhead wants exactly
+// these frames, and the default made that impossible rather than merely
+// inconvenient.
+func newInstrumentationBand(s shimScope, keep bool) instrumentationBand {
+	return instrumentationBand{shim: s, enabled: s.guarded && !keep}
 }
 
 // InstrumentationFrameName is the marker left in place of an elided band.

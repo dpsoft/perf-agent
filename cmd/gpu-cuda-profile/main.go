@@ -73,22 +73,23 @@ import (
 // exists to prevent; a test enumerates the registered set and fails until
 // every name is on one side or the other.
 type options struct {
-	shim            *string
-	workload        *string
-	iters           *int
-	sleepUs         *int
-	period          *int
-	linger          *int
-	out             *string
-	pid             *int
-	discover        *bool
-	rediscoverEvery *time.Duration
-	duration        *time.Duration
-	drainEvery      *time.Duration
-	waitForShim     *time.Duration
-	nvSymbols       *string
-	pcSampling      *string
-	pcAck           *bool
+	shim                *string
+	workload            *string
+	iters               *int
+	sleepUs             *int
+	period              *int
+	linger              *int
+	out                 *string
+	pid                 *int
+	discover            *bool
+	rediscoverEvery     *time.Duration
+	duration            *time.Duration
+	drainEvery          *time.Duration
+	waitForShim         *time.Duration
+	keepInstrumentation *bool
+	nvSymbols           *string
+	pcSampling          *string
+	pcAck               *bool
 }
 
 func defineFlags(fs *flag.FlagSet) *options {
@@ -132,6 +133,20 @@ func defineFlags(fs *flag.FlagSet) *options {
 			"in -pid mode, how long to wait for the shim to appear in the target's mappings "+
 				"before giving up. Non-zero because a process attached to moments after it "+
 				"started may not have reached cuInit yet"),
+		keepInstrumentation: fs.Bool("keep-instrumentation-frames", false,
+			"leave the profiler's own delivery path in every sampled stack instead of "+
+				"collapsing it to one ["+gpuprobe.InstrumentationFrameName[5:len(gpuprobe.InstrumentationFrameName)-1]+
+				"] marker. The path is 7 frames of CUPTI's callback machinery rather than "+
+				"the workload, and it is reliably 7: that depth is CUPTI's, not the "+
+				"workload's. What it costs as a SHARE of the profile is not fixed -- 19% "+
+				"of every frame in a PyTorch capture, 23.5% in the microbenchmark under "+
+				"shim/nvidia/testdata -- because the share depends on how many of the "+
+				"stacks are sampled ones, which -period and the workload decide between "+
+				"them. Set it to profile perf-agent itself: the elision happens BEFORE "+
+				"the profile is written, so a capture taken without this flag cannot get "+
+				"them back. Note that cmd/flamegraph merges runs of unnamed vendor frames "+
+				"by default, redrawing these 7 as 2; pass -raw-vendor-frames there to see "+
+				"the path this flag kept"),
 		nvSymbols: fs.String("nvidia-symbols", "",
 			"cache directory for NVIDIA's CUDA Toolkit Symbol Server; enables fetching "+
 				"symbols for libcuda/libcupti/libcuBLAS, which ship stripped. Off unless set: "+
@@ -193,15 +208,16 @@ var launchOnlyInAttachMode = map[string]string{
 // configure THIS process -- where the shim is, where the profile goes, how
 // long to run, how symbols are resolved -- rather than the profiled one.
 var attachSafeFlags = map[string]bool{
-	"shim":             true,
-	"out":              true,
-	"nvidia-symbols":   true,
-	"pid":              true,
-	"duration":         true,
-	"wait-for-shim":    true,
-	"drain-every":      true,
-	"discover":         true,
-	"rediscover-every": true,
+	"shim":                        true,
+	"out":                         true,
+	"nvidia-symbols":              true,
+	"keep-instrumentation-frames": true,
+	"pid":                         true,
+	"duration":                    true,
+	"wait-for-shim":               true,
+	"drain-every":                 true,
+	"discover":                    true,
+	"rediscover-every":            true,
 }
 
 // refusedLaunchFlags reports the launch-only flags the operator actually set,
@@ -476,6 +492,8 @@ func main() {
 		// are sealed, verified and stored where nothing reads them, and
 		// every PC sample in this profile says gpu_src_status="no-module".
 		Modules: store,
+		// The reader's call, not ours. See gpuprobe.Config.
+		KeepInstrumentationFrames: *opt.keepInstrumentation,
 	})
 	if err != nil {
 		log.Fatalf("attach: %v", err)

@@ -140,6 +140,69 @@ existing mechanism, the storage side already groups by them, and N output
 streams would need a lifecycle, a naming scheme and a flush policy that
 nothing currently asks for.
 
+## Installation: the agent carries the shim and copies it on start
+
+The agent image ships `libperfagent-gpu-nvidia.so` and writes it to the
+`hostPath` directory at startup. No separate init container, no
+out-of-band node provisioning step.
+
+The reason to prefer it over node provisioning is version coupling: the
+shim and the consumer that decodes its USDT payload are one artifact, so
+they cannot drift. Record layouts are frozen per version (see the GPU V2
+Phase 3 work); a node-provisioned shim that is older or newer than the
+agent is a decode failure waiting to happen, and nothing in the pod spec
+would reveal it.
+
+The directory is therefore mounted **read-write** for the agent and
+**read-only** for application pods.
+
+### Replace atomically, and only when it changed
+
+Write to a temporary file in the same directory and `rename(2)` over the
+target. `rename` within one filesystem is atomic, so the path a pod
+resolves at `cuInit` is never a partially written file. Never write in
+place: the file is mapped executable by live processes, and truncating it
+under them is a crash, not a version skew.
+
+Compare build-ids first and skip the write when they match. A restarting
+agent on an unchanged node should cost nothing, and — more importantly —
+should not create a new inode (below).
+
+### An upgrade leaves two live inodes, briefly
+
+This is the consequence of `rename` and it has to be designed for, because
+it partially reintroduces the problem `hostPath` was chosen to remove.
+
+After a replace, processes that already mapped the old file keep **the old
+inode** — that is what makes the replace safe. New processes map the new
+one. So a node mid-upgrade has two shim inodes with live mappers, and a
+single `UprobeMulti` on the new path would silently stop covering every
+workload that was already running.
+
+The rule: **attach to the current file, plus one link per distinct older
+inode that still has a mapper.** That set is discovered the way targets
+already are — `/proc/*/maps` — and is bounded by the number of live shim
+versions, normally one and transiently two, rather than by the number of
+pods. Drop a link when its inode has no mappers left.
+
+Note this does not resurrect the `cuInit` race: each link is created
+before the version it covers can be mapped by anything new, because the
+new inode does not exist until the agent creates it.
+
+### The ordering hazard, stated
+
+A GPU pod that starts before the agent has written the file resolves
+`CUDA_INJECTION64_PATH` to a missing path. **CUDA injection fails open and
+silent** (`docs/gpu-injection.md`), so that workload runs unprofiled with
+no error anywhere — the same shape as every other silent failure this
+project has hit.
+
+No layout removes this entirely; node provisioning only moves it earlier.
+What the agent can do is report it: on startup, count GPU processes
+already running that have **not** mapped any shim inode, and say so. That
+number is also the answer to "pods that never opted in", so one diagnostic
+covers both.
+
 ## The pod-spec contract
 
 What an application pod must declare to be profilable by the collector.
@@ -170,10 +233,8 @@ identical, which is the failure mode this project keeps meeting.
 
 Deliberately not settled here; they need answers before the plan:
 
-1. **Does the collector own shim installation?** A DaemonSet init
-   container writing the shim to the `hostPath` is the obvious shape, but
-   it means the collector writes to the node filesystem. The alternative
-   is that node provisioning places it and the collector only reads.
+1. ~~Does the collector own shim installation?~~ **Settled: the agent
+   image carries the shim and copies it on start.** See Installation.
 2. ~~Pods that do not mount the shim.~~ **Settled above:** they are not
    profiled, and the collector reports how many GPU processes it saw that
    never mapped the shim. Silence there would make "not opted in" and
@@ -217,6 +278,10 @@ Deliberately not settled here; they need answers before the plan:
   warns about produces no error, so only an assertion catches it.
 - **`hostPID` refusal.** Run the collector without it and assert it names
   the requirement instead of emitting an empty profile.
+- **The upgrade case needs its own test, and it is the one most likely to
+  be skipped.** Start a workload, replace the shim, start a second
+  workload, and assert BOTH are still sampled. A test that replaces the
+  file with nothing running passes while covering none of the risk.
 - Rootful podman with GPU passthrough remains the harness
   (`run-nspid-task9.sh` is the starting point); two concurrent containers
   stand in for two pods.

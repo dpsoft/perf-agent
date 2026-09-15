@@ -1,6 +1,14 @@
-// Attaches to the NVIDIA CUPTI adapter and writes gpu-cuda.pb.gz through the
-// existing pprof builder. This is cmd/gpu-stub-profile with the synthetic
-// producer replaced by an actual GPU.
+// Command gpu-cuda-profile is perf-agent's GPU profiler: it attaches to the
+// NVIDIA CUPTI adapter carried by the injected shim and writes a pprof
+// profile joining CUDA kernels to the CPU stacks that launched them.
+//
+// This is the binary ghcr.io/dpsoft/perf-agent runs -- Dockerfile.agent
+// builds it to /usr/local/bin/gpu-cuda-profile with file capabilities, and
+// build/agent-entrypoint.sh execs it -- and the one both manifests under
+// examples/kubernetes pass flags to. It began as cmd/gpu-stub-profile with
+// the synthetic producer swapped for a real GPU; it is no longer that, and
+// the flags below are a deployment interface rather than a development
+// convenience.
 //
 // The adapter is never executed. It is a shared object the CUDA driver loads
 // into a process through CUDA_INJECTION64_PATH, so this command attaches its

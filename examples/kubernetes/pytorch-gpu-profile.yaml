@@ -91,12 +91,15 @@ spec:
     # ------------------------------------------------------------ sidecar --
     - name: perf-agent
       image: ghcr.io/dpsoft/perf-agent:latest
+      # This image's entrypoint execs gpu-cuda-profile, so these are ITS
+      # flags. An earlier version passed --gpu, --gpu-shim and --gpu-output,
+      # none of which exist anywhere -- the pod would have died at flag
+      # parsing. A test now checks every flag here against defineFlags.
       args:
-        - --gpu
-        - --pid=1                       # PID 1 in the shared namespace
-        - --duration=60s
-        - --gpu-shim=/var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
-        - --gpu-output=/profiles/gpu.pb.gz
+        - -pid=1                        # PID 1 in the shared namespace
+        - -duration=60s
+        - -shim=/var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
+        - -out=/profiles/gpu.pb.gz
       securityContext:
         # NOT privileged. Four narrow capabilities, deliberately.
         #

@@ -138,11 +138,31 @@ jobs:
           CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
         run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
 
+      # The GPU profiler is a second binary, not a mode of the first. The
+      # agent image already ships it (Dockerfile.agent), but that left no way
+      # to obtain it except building from source with the blazesym toolchain
+      # -- while docs/gpu-injection.md documents running it on bare metal.
+      - name: Build GPU profiler
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CGO_CFLAGS: -I/usr/local/include
+          CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
+        run: go build -v -o gpu-cuda-profile-linux-${{ matrix.goarch }} ./cmd/gpu-cuda-profile
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: perf-agent-linux-${{ matrix.goarch }}
           path: perf-agent-linux-${{ matrix.goarch }}
+          retention-days: 30
+
+      - name: Upload GPU profiler artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-cuda-profile-linux-${{ matrix.goarch }}
+          path: gpu-cuda-profile-linux-${{ matrix.goarch }}
           retention-days: 30
 
   release:
@@ -186,5 +206,7 @@ jobs:
           files: |
             artifacts/perf-agent-linux-amd64/perf-agent-linux-amd64
             artifacts/perf-agent-linux-arm64/perf-agent-linux-arm64
+            artifacts/gpu-cuda-profile-linux-amd64/gpu-cuda-profile-linux-amd64
+            artifacts/gpu-cuda-profile-linux-arm64/gpu-cuda-profile-linux-arm64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -373,7 +373,7 @@ func main() {
 	switch {
 	case *opt.discover:
 		var derr error
-		targets, derr = waitForTargets(shimPath, *opt.waitForShim)
+		targets, derr = findTargets(shimPath, *opt.waitForShim, true)
 		if derr != nil {
 			log.Fatalf("discover targets: %v", derr)
 		}
@@ -895,7 +895,15 @@ func rediscoverInterval(discover bool, every time.Duration) time.Duration {
 // kernels. The wait covers the one legitimate case -- starting alongside an
 // application that has not reached cuInit yet, which is the NORMAL case for a
 // sidecar, since both containers start together.
-func waitForTargets(shimPath string, within time.Duration) ([]int, error) {
+// findTargets waits for processes mapping shimPath.
+//
+// requireOne distinguishes two callers with opposite needs. A launch or
+// -pid run that finds nothing is misconfigured and should say so. A
+// collector that finds nothing has simply started before the workloads,
+// which is the normal case on a freshly booted node -- and refusing there
+// would make the agent unable to be the first thing up, which is exactly
+// when it is most useful.
+func findTargets(shimPath string, within time.Duration, requireOne bool) ([]int, error) {
 	deadline := time.Now().Add(within)
 	for {
 		found, err := gpuprobe.ProcessesMappingShim(shimPath)
@@ -906,6 +914,9 @@ func waitForTargets(shimPath string, within time.Duration) ([]int, error) {
 			return found, nil
 		}
 		if !time.Now().Before(deadline) {
+			if !requireOne {
+				return nil, nil
+			}
 			return nil, fmt.Errorf(
 				"no process on this host maps %s after %s. The CUDA driver loads the shim "+
 					"during cuInit, from CUDA_INJECTION64_PATH in each process's own "+

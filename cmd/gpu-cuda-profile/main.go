@@ -413,6 +413,11 @@ func main() {
 	// Collector mode never launches: it attaches to whatever maps the shim
 	// it installed, which is the same shape as -discover.
 	attach := *opt.pid != 0 || *opt.discover || *opt.mode == "collector"
+	// Collector mode IS discovery: it profiles whatever maps the shim it
+	// just installed, rather than a pid somebody named.
+	if *opt.mode == "collector" {
+		*opt.discover = true
+	}
 	if *opt.pid != 0 && *opt.discover {
 		log.Fatalf("-pid and -discover both name what to profile and disagree about how: " +
 			"-pid is one process you already know, -discover is every process that maps " +
@@ -485,6 +490,22 @@ func main() {
 		log.Fatalf("adapter %s: %v (build it with: make -C shim nvidia)", shimPath, err)
 	}
 
+	// Collector mode installs the shim it carries before anything looks for
+	// targets, because the file targets load must exist before they start.
+	// -shim names the CARRIED copy here (in the published image, the one
+	// baked into it); -shim-dir is where it goes and what gets attached.
+	var shimFiles []gpuprobe.ShimFile
+	if *opt.mode == "collector" {
+		shimFiles, err = collectorShimFiles(shimPath, *opt.shimDir, "/proc")
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		// Everything downstream -- discovery, EagerPIDs, the injection
+		// check -- is about the file targets actually load, which is the
+		// installed one and not the carried one.
+		shimPath = shimFiles[0].Path
+	}
+
 	// Attach mode's one hard precondition, and it is checked FIRST -- before
 	// the module store, the symbolizer, the BPF objects, or anything that
 	// needs a capability.
@@ -514,11 +535,25 @@ func main() {
 	switch {
 	case *opt.discover:
 		var derr error
-		targets, derr = findTargets(shimPath, *opt.waitForShim, true)
+		// A collector that finds nothing has started before the workloads,
+		// which is the normal case on a freshly booted node. A -discover
+		// run in agent mode that finds nothing is misconfigured.
+		targets, derr = findTargets(shimPath, *opt.waitForShim, *opt.mode != "collector")
 		if derr != nil {
 			log.Fatalf("discover targets: %v", derr)
 		}
 		log.Printf("discovered %d process(es) mapping %s: %v", len(targets), shimPath, targets)
+		if *opt.mode == "collector" {
+			// Injection fails open and silent, so a node full of workloads
+			// nobody opted in produces exactly the same empty profile as an
+			// idle node. This count is the only thing separating them.
+			if n, uerr := unprofiledGPUProcesses("/proc", *opt.shimDir); uerr == nil && n > 0 {
+				log.Printf("gpu collector: %d GPU process(es) map libcuda but no shim from %s "+
+					"and are NOT being profiled. Either their pods do not declare the volume "+
+					"and CUDA_INJECTION64_PATH, or they reached cuInit before this agent "+
+					"installed the shim", n, *opt.shimDir)
+			}
+		}
 	case *opt.pid != 0:
 		if err := waitForShimIn(*opt.pid, shimPath, *opt.waitForShim); err != nil {
 			log.Fatalf("attach to pid %d: %v", *opt.pid, err)
@@ -583,7 +618,8 @@ func main() {
 	defer func() { _ = sym.Close() }()
 
 	c, err := gpuprobe.Attach(gpuprobe.Config{
-		ShimPath: shimPath,
+		ShimPath:  shimPath,
+		ShimFiles: shimFiles,
 		// Launch mode passes 0 and attach mode passes the target.
 		//
 		// Zero is system-wide, and it is what the launch path needs: the

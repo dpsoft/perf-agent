@@ -90,6 +90,8 @@ type options struct {
 	nvSymbols           *string
 	pcSampling          *string
 	pcAck               *bool
+	mode                *string
+	shimDir             *string
 }
 
 func defineFlags(fs *flag.FlagSet) *options {
@@ -147,6 +149,19 @@ func defineFlags(fs *flag.FlagSet) *options {
 				"them back. Note that cmd/flamegraph merges runs of unnamed vendor frames "+
 				"by default, redrawing these 7 as 2; pass -raw-vendor-frames there to see "+
 				"the path this flag kept"),
+		mode: fs.String("mode", "agent",
+			"agent | collector. agent profiles ONE workload, launched or attached, and is "+
+				"the historical behaviour. collector runs one per NODE: it installs the "+
+				"shim it carries into -shim-dir, attaches once to that inode with PID 0, "+
+				"and profiles every process that maps it -- including processes that start "+
+				"later, which is measured rather than assumed. collector requires the init "+
+				"PID namespace (hostPID: true), because BPF reports init-namespace pids and "+
+				"/proc cannot translate them from inside a namespace"),
+		shimDir: fs.String("shim-dir", "",
+			"collector mode: the directory to install the carried shim into and attach to. "+
+				"Mounted read-write by the agent and read-only by the pods that load it. "+
+				"Required in collector mode, refused in agent mode, where -shim names the "+
+				"file directly and nothing is installed"),
 		nvSymbols: fs.String("nvidia-symbols", "",
 			"cache directory for NVIDIA's CUDA Toolkit Symbol Server; enables fetching "+
 				"symbols for libcuda/libcupti/libcuBLAS, which ship stripped. Off unless set: "+
@@ -218,6 +233,38 @@ var attachSafeFlags = map[string]bool{
 	"drain-every":                 true,
 	"discover":                    true,
 	"rediscover-every":            true,
+	"mode":                        true,
+	"shim-dir":                    true,
+}
+
+// validateMode refuses combinations rather than ignoring them.
+//
+// Same discipline as refusedLaunchFlags and for the same reason: a flag
+// accepted here and quietly ignored would have the profile interpreted
+// under a configuration it was not taken with. A refusal costs one
+// restart; a silently-ignored flag costs a wrong conclusion.
+func validateMode(fs *flag.FlagSet, opt *options) error {
+	switch *opt.mode {
+	case "agent":
+		if *opt.shimDir != "" {
+			return errors.New("-shim-dir is collector-only: agent mode installs nothing " +
+				"and names the file it attaches to with -shim")
+		}
+		return nil
+	case "collector":
+		if *opt.shimDir == "" {
+			return errors.New("collector mode requires -shim-dir: the directory it " +
+				"installs the carried shim into and attaches to")
+		}
+		if refused := refusedLaunchFlags(fs); len(refused) > 0 {
+			return fmt.Errorf("collector mode never starts a workload, so these flags "+
+				"cannot take effect and are refused rather than ignored:\n  %s",
+				strings.Join(refused, "\n  "))
+		}
+		return nil
+	default:
+		return fmt.Errorf("-mode %q: want agent or collector", *opt.mode)
+	}
 }
 
 // refusedLaunchFlags reports the launch-only flags the operator actually set,
@@ -271,7 +318,12 @@ func main() {
 	// applied. The profile would then be interpreted at a sampling rate it
 	// was not taken at. Every flag below has that shape: it configures a
 	// process this mode does not create.
-	attach := *opt.pid != 0 || *opt.discover
+	if err := validateMode(flag.CommandLine, opt); err != nil {
+		log.Fatalf("%v", err)
+	}
+	// Collector mode never launches: it attaches to whatever maps the shim
+	// it installed, which is the same shape as -discover.
+	attach := *opt.pid != 0 || *opt.discover || *opt.mode == "collector"
 	if *opt.pid != 0 && *opt.discover {
 		log.Fatalf("-pid and -discover both name what to profile and disagree about how: " +
 			"-pid is one process you already know, -discover is every process that maps " +

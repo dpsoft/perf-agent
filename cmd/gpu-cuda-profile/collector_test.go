@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,5 +37,72 @@ func TestFindTargetsStillFailsWhenOneIsRequired(t *testing.T) {
 
 	if _, err := findTargets(shim, 200*time.Millisecond, true); err == nil {
 		t.Fatal("findTargets(requireOne=true) returned nil error with no targets")
+	}
+}
+
+func TestCollectorModeRefusesLaunchFlags(t *testing.T) {
+	// Collector mode never starts the workload, so every flag that
+	// configures a child is meaningless and must be refused rather than
+	// ignored -- a silently-ignored -period would have the profile read at
+	// a sampling rate it was not taken at.
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opt := defineFlags(fs)
+	if err := fs.Parse([]string{"-mode=collector", "-shim-dir=/tmp/x", "-period=4"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMode(fs, opt); err == nil {
+		t.Fatal("collector mode accepted -period; launch-only flags must be refused")
+	}
+}
+
+func TestCollectorModeRequiresAShimDir(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opt := defineFlags(fs)
+	if err := fs.Parse([]string{"-mode=collector"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMode(fs, opt); err == nil {
+		t.Fatal("collector mode accepted an empty -shim-dir")
+	}
+}
+
+func TestAgentModeRejectsShimDir(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opt := defineFlags(fs)
+	if err := fs.Parse([]string{"-shim-dir=/tmp/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMode(fs, opt); err == nil {
+		t.Fatal("agent mode accepted -shim-dir; it installs nothing and -shim names the file")
+	}
+}
+
+func TestAgentModeIsTheDefaultAndUnchanged(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opt := defineFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if *opt.mode != "agent" {
+		t.Errorf("default mode = %q, want agent", *opt.mode)
+	}
+	if err := validateMode(fs, opt); err != nil {
+		t.Errorf("default invocation rejected: %v", err)
+	}
+}
+
+func TestUnknownModeIsRefused(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opt := defineFlags(fs)
+	if err := fs.Parse([]string{"-mode=daemonset"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMode(fs, opt); err == nil {
+		t.Fatal("an unknown -mode was accepted")
 	}
 }

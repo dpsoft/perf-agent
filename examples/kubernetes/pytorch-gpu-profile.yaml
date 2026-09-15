@@ -100,14 +100,24 @@ spec:
       securityContext:
         # NOT privileged. Four narrow capabilities, deliberately.
         #
-        # CAP_SYS_ADMIN is absent and must stay absent -- it is near-root and
-        # is what gets a per-pod agent rejected by admission policy. Keeping
-        # it out is why the USDT consumer attaches through the uprobe_multi
-        # BPF link rather than the perf_uprobe PMU: measured on hardware, the
-        # PMU path fails EACCES under CAP_BPF+CAP_PERFMON and needs
-        # CAP_SYS_ADMIN, while uprobe_multi succeeds without it. That is a
-        # correctness requirement of this securityContext, not a style choice.
-        # It costs a Linux 6.6 floor on the NODE.
+        # That is the part worth defending. parca-agent's released DaemonSet
+        # runs privileged: true, adds SYS_ADMIN on top, and labels its
+        # namespace Pod-Security "privileged". Running without any of that is
+        # the differentiator; it is not a style choice.
+        #
+        # CAP_SYS_ADMIN is absent here by PREFERENCE, not by prohibition.
+        # Measured on hardware: the perf_uprobe PMU path fails EACCES under
+        # CAP_BPF+CAP_PERFMON and needs CAP_SYS_ADMIN, while the uprobe_multi
+        # BPF link succeeds without it. So uprobe_multi is preferred wherever
+        # it exists -- one link for N probes, and a smaller capability set --
+        # and it costs a Linux 6.6 floor on the NODE, because that is where
+        # the multi link landed.
+        #
+        # Below 6.6, attaching through the PMU and adding SYS_ADMIN is a
+        # legitimate fallback rather than a defeat. An earlier version of this
+        # comment said CAP_SYS_ADMIN "must stay absent"; that absolute and the
+        # 6.6 floor were the same decision stated twice, and relaxing the
+        # first is what lets the project floor sit at 6.2.
         capabilities:
           drop: ["ALL"]
           add:
@@ -131,7 +141,9 @@ spec:
         - name: profiles
           mountPath: /profiles
 
-  # The uprobe_multi link requires Linux >= 6.6 on the node. Scheduling on an
-  # older kernel fails at attach with a message about links, not kernels.
+  # This manifest asks for the uprobe_multi link, which requires Linux >= 6.6
+  # on the node. Scheduling on an older kernel fails at attach with a message
+  # about links, not kernels -- so on 6.2-6.5 add SYS_ADMIN above and let the
+  # agent fall back to the perf_uprobe PMU.
   nodeSelector:
     nvidia.com/gpu.present: "true"

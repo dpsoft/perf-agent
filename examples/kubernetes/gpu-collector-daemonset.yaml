@@ -1,0 +1,156 @@
+# One agent per NODE. Contrast pytorch-gpu-profile.yaml, which puts one agent
+# in every profiled POD.
+#
+# Status: the agent side of this is implemented (-mode=collector); the image
+# below is not published yet, same blocker as the sidecar example (#139).
+#
+# ---------------------------------------------------------------- the idea --
+#
+# The shim lives ONCE on the node, so every GPU pod maps the SAME INODE and the
+# agent attaches once with PID: 0. uprobe attachment keys on (dev, ino), and a
+# probe on the inode is armed before any pod exists -- so pods scheduled later
+# are covered with no pod watch, no link per pod, and no race against cuInit.
+#
+# That is measured, not assumed. On an RTX 3090, 2026-09-15: a workload started
+# AFTER the link was created, never discovered and with rediscovery disabled,
+# contributed 120,000 samples. A decoy loading a byte-identical copy at another
+# path contributed none.
+#
+# The sidecar's emptyDir gives each pod its own copy and therefore its own
+# inode. That is right for an agent sitting inside the pod and wrong for one
+# that is not: a collector reaching per-pod copies would need a link per pod, a
+# watch for pods coming and going, and would lose the modules of every pod that
+# reached cuInit before it noticed them.
+#
+# ------------------------------------------------------- what this is NOT --
+#
+# This is not zero-touch. The application pod still declares a mount and
+# CUDA_INJECTION64_PATH (see the bottom of this file). A hostPath shim changes
+# which inode that variable names; it does not remove the variable. Parca is in
+# the same position -- their CPU profiling is zero-instrumentation, their GPU
+# profiling is not.
+#
+# Injecting those two lines without editing the pod needs a mutating admission
+# webhook or a hook in the NVIDIA GPU operator. Deferred, not rejected: both
+# get easier once this exists, because the injector then adds a mount and a
+# variable rather than a whole init container.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: perf-agent-gpu-collector
+  labels:
+    app: perf-agent-gpu-collector
+spec:
+  selector:
+    matchLabels:
+      app: perf-agent-gpu-collector
+  template:
+    metadata:
+      labels:
+        app: perf-agent-gpu-collector
+    spec:
+      # BPF reports init-namespace pids, and /proc cannot translate them from
+      # inside a namespace: NSpid only shows the multi-column form when read
+      # DOWNWARD, so a nested agent cannot see host pids at all. Measured, and
+      # it is why the agent must BE in the init namespace rather than
+      # translate. See docs/superpowers/specs/2026-09-10-pid-namespace-*.md.
+      #
+      # Parca and the OTel profiler both take hostPID too. Unlike them, we do
+      # not also take privileged.
+      hostPID: true
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: perf-agent
+          # Carries the shim and installs it: the shim and the consumer that
+          # decodes its USDT payload ship as ONE artifact, so they cannot
+          # drift. Record layouts are frozen per version, and a shim placed
+          # out of band has nothing in the pod spec to reveal a mismatch.
+          image: ghcr.io/dpsoft/perf-agent:latest
+          args:
+            - -mode=collector
+            - -shim-dir=/var/lib/perf-agent/gpu
+            - -out=/profiles/gpu.pb.gz
+            - -duration=60s
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add:
+                - BPF                  # load programs, create maps and links
+                - PERFMON              # perf_event_open, including system-wide
+                - SYS_PTRACE           # read another process's memory
+                - CHECKPOINT_RESTORE   # /proc/<pid>/map_files
+                # - SYSLOG             # add for kernel stacks: without it
+                #                      # /proc/kallsyms reads zeros and kernel
+                #                      # symbolization is silently skipped
+                # - SYS_ADMIN          # add on kernels 6.2-6.5, where
+                #                      # uprobe_multi does not exist and the
+                #                      # perf_uprobe PMU path needs it. A
+                #                      # preference, not a prohibition: what
+                #                      # matters is not being privileged.
+          volumeMounts:
+            # READ-WRITE, and the only mount here that is: the agent installs
+            # the shim it carries. Replacement is a temp file plus rename(2),
+            # never a write in place -- the file is mapped executable by live
+            # processes and truncating it under them is a crash.
+            - name: shim
+              mountPath: /var/lib/perf-agent/gpu
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+            - name: profiles
+              mountPath: /profiles
+      volumes:
+        - name: shim
+          hostPath:
+            path: /var/lib/perf-agent/gpu
+            type: DirectoryOrCreate
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+        - name: profiles
+          # Swap for a PVC or an object-store uploader in a real deployment;
+          # emptyDir dies with the pod, same caveat as the sidecar example.
+          emptyDir: {}
+---
+# ------------------------------------------ what an application pod adds --
+#
+# Two things, no containers. Contrast the sidecar, which also needs an init
+# container and an agent container in every profiled pod.
+#
+# A pod that omits this is simply not profiled, and NOTHING FAILS: CUDA
+# injection fails open and silent. The collector logs how many GPU processes
+# map libcuda but no shim, which is the only way to tell that apart from a node
+# with no GPU work on it.
+#
+#     spec:
+#       containers:
+#         - name: your-cuda-app
+#           env:
+#             - name: CUDA_INJECTION64_PATH
+#               value: /var/lib/perf-agent/gpu/libperfagent-gpu-nvidia.so
+#           volumeMounts:
+#             - name: perfagent-shim
+#               mountPath: /var/lib/perf-agent/gpu
+#               readOnly: true          # only the agent writes here
+#       volumes:
+#         - name: perfagent-shim
+#           hostPath:
+#             path: /var/lib/perf-agent/gpu
+#             type: Directory
+#
+# Ordering: a pod that starts before the DaemonSet has written the file
+# resolves CUDA_INJECTION64_PATH to nothing and runs unprofiled, silently. No
+# layout removes this -- node provisioning only moves it earlier -- which is
+# why the agent reports the count rather than pretending it cannot happen.
+#
+# CUPTI is still yours to supply: it ships with the CUDA toolkit, not the
+# driver, and nvidia-container-toolkit never injects it. PyTorch images
+# usually carry the pip one; a slim inference image may not.

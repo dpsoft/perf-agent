@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/shiminstall"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/symbolize/nvsym"
@@ -90,6 +92,8 @@ type options struct {
 	nvSymbols           *string
 	pcSampling          *string
 	pcAck               *bool
+	mode                *string
+	shimDir             *string
 }
 
 func defineFlags(fs *flag.FlagSet) *options {
@@ -147,6 +151,19 @@ func defineFlags(fs *flag.FlagSet) *options {
 				"them back. Note that cmd/flamegraph merges runs of unnamed vendor frames "+
 				"by default, redrawing these 7 as 2; pass -raw-vendor-frames there to see "+
 				"the path this flag kept"),
+		mode: fs.String("mode", "agent",
+			"agent | collector. agent profiles ONE workload, launched or attached, and is "+
+				"the historical behaviour. collector runs one per NODE: it installs the "+
+				"shim it carries into -shim-dir, attaches once to that inode with PID 0, "+
+				"and profiles every process that maps it -- including processes that start "+
+				"later, which is measured rather than assumed. collector requires the init "+
+				"PID namespace (hostPID: true), because BPF reports init-namespace pids and "+
+				"/proc cannot translate them from inside a namespace"),
+		shimDir: fs.String("shim-dir", "",
+			"collector mode: the directory to install the carried shim into and attach to. "+
+				"Mounted read-write by the agent and read-only by the pods that load it. "+
+				"Required in collector mode, refused in agent mode, where -shim names the "+
+				"file directly and nothing is installed"),
 		nvSymbols: fs.String("nvidia-symbols", "",
 			"cache directory for NVIDIA's CUDA Toolkit Symbol Server; enables fetching "+
 				"symbols for libcuda/libcupti/libcuBLAS, which ship stripped. Off unless set: "+
@@ -218,6 +235,125 @@ var attachSafeFlags = map[string]bool{
 	"drain-every":                 true,
 	"discover":                    true,
 	"rediscover-every":            true,
+	"mode":                        true,
+	"shim-dir":                    true,
+}
+
+// collectorShimFiles installs the carried shim and returns every inode the
+// agent must attach to: the one just installed, plus any older shim in the
+// same directory that still has a live mapper.
+//
+// The second half is not defensive. Replacement is rename(2), so processes
+// that mapped the previous file keep it -- that survival is what makes the
+// replace safe -- and attaching only to the current path would silently
+// stop covering every workload that was already running. There is no error
+// in that failure, only a thinner profile.
+func collectorShimFiles(carried, dir, procRoot string) ([]gpuprobe.ShimFile, error) {
+	dest, replaced, err := shiminstall.Install(carried, dir)
+	if err != nil {
+		return nil, err
+	}
+	state := "already current"
+	if replaced {
+		state = "installed"
+	}
+	log.Printf("gpu collector: shim %s (%s)", dest, state)
+
+	dev, ino, err := gpuprobe.ShimIdentity(dest)
+	if err != nil {
+		return nil, fmt.Errorf("identify installed shim: %w", err)
+	}
+	files := []gpuprobe.ShimFile{{Path: dest, Dev: dev, Ino: ino}}
+
+	inUse, err := gpuprobe.ShimInodesInUseIn(procRoot, dir)
+	if err != nil {
+		return nil, err
+	}
+	for f, pids := range inUse {
+		if f.Ino == ino && f.Dev == dev {
+			continue // already have it
+		}
+		log.Printf("gpu collector: also attaching to %s (inode %d), mapped by %d process(es) "+
+			"from a previous shim version", f.Path, f.Ino, len(pids))
+		files = append(files, f)
+	}
+	return files, nil
+}
+
+// unprofiledGPUProcesses counts processes that have libcuda mapped but no
+// shim from shimDir.
+//
+// Each one is a workload running unprofiled, for one of two reasons that
+// are indistinguishable from here: its pod never declared the mount and
+// CUDA_INJECTION64_PATH, or it reached cuInit before this agent installed
+// the shim. Both are silent, because CUDA injection fails open -- so this
+// count is the only thing separating "nobody opted in" from "the node is
+// idle", and a node full of unprofiled GPU work otherwise produces exactly
+// the same empty profile as a node with no GPU work at all.
+func unprofiledGPUProcesses(procRoot, shimDir string) (int, error) {
+	inUse, err := gpuprobe.ShimInodesInUseIn(procRoot, shimDir)
+	if err != nil {
+		return 0, err
+	}
+	profiled := map[int]struct{}{}
+	for _, pids := range inUse {
+		for _, p := range pids {
+			profiled[p] = struct{}{}
+		}
+	}
+
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", procRoot, err)
+	}
+	n := 0
+	for _, e := range entries {
+		pid, perr := strconv.Atoi(e.Name())
+		if perr != nil {
+			continue // not a pid directory
+		}
+		if _, ok := profiled[pid]; ok {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(procRoot, e.Name(), "maps"))
+		if rerr != nil {
+			continue // exited, or not ours to read; says nothing either way
+		}
+		if strings.Contains(string(body), "libcuda.so") {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// validateMode refuses combinations rather than ignoring them.
+//
+// Same discipline as refusedLaunchFlags and for the same reason: a flag
+// accepted here and quietly ignored would have the profile interpreted
+// under a configuration it was not taken with. A refusal costs one
+// restart; a silently-ignored flag costs a wrong conclusion.
+func validateMode(fs *flag.FlagSet, opt *options) error {
+	switch *opt.mode {
+	case "agent":
+		if *opt.shimDir != "" {
+			return errors.New("-shim-dir is collector-only: agent mode installs nothing " +
+				"and names the file it attaches to with -shim")
+		}
+		return nil
+	case "collector":
+		if *opt.shimDir == "" {
+			return errors.New("collector mode requires -shim-dir: the directory it " +
+				"installs the carried shim into and attaches to")
+		}
+		if refused := refusedLaunchFlags(fs); len(refused) > 0 {
+			return fmt.Errorf("collector mode never starts a workload, so these flags "+
+				"cannot take effect and are refused rather than ignored:\n  %s",
+				strings.Join(refused, "\n  "))
+		}
+		return nil
+	default:
+		return fmt.Errorf("-mode %q: want agent or collector", *opt.mode)
+	}
 }
 
 // refusedLaunchFlags reports the launch-only flags the operator actually set,
@@ -271,7 +407,17 @@ func main() {
 	// applied. The profile would then be interpreted at a sampling rate it
 	// was not taken at. Every flag below has that shape: it configures a
 	// process this mode does not create.
-	attach := *opt.pid != 0 || *opt.discover
+	if err := validateMode(flag.CommandLine, opt); err != nil {
+		log.Fatalf("%v", err)
+	}
+	// Collector mode never launches: it attaches to whatever maps the shim
+	// it installed, which is the same shape as -discover.
+	attach := *opt.pid != 0 || *opt.discover || *opt.mode == "collector"
+	// Collector mode IS discovery: it profiles whatever maps the shim it
+	// just installed, rather than a pid somebody named.
+	if *opt.mode == "collector" {
+		*opt.discover = true
+	}
 	if *opt.pid != 0 && *opt.discover {
 		log.Fatalf("-pid and -discover both name what to profile and disagree about how: " +
 			"-pid is one process you already know, -discover is every process that maps " +
@@ -344,6 +490,22 @@ func main() {
 		log.Fatalf("adapter %s: %v (build it with: make -C shim nvidia)", shimPath, err)
 	}
 
+	// Collector mode installs the shim it carries before anything looks for
+	// targets, because the file targets load must exist before they start.
+	// -shim names the CARRIED copy here (in the published image, the one
+	// baked into it); -shim-dir is where it goes and what gets attached.
+	var shimFiles []gpuprobe.ShimFile
+	if *opt.mode == "collector" {
+		shimFiles, err = collectorShimFiles(shimPath, *opt.shimDir, "/proc")
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		// Everything downstream -- discovery, EagerPIDs, the injection
+		// check -- is about the file targets actually load, which is the
+		// installed one and not the carried one.
+		shimPath = shimFiles[0].Path
+	}
+
 	// Attach mode's one hard precondition, and it is checked FIRST -- before
 	// the module store, the symbolizer, the BPF objects, or anything that
 	// needs a capability.
@@ -373,11 +535,25 @@ func main() {
 	switch {
 	case *opt.discover:
 		var derr error
-		targets, derr = waitForTargets(shimPath, *opt.waitForShim)
+		// A collector that finds nothing has started before the workloads,
+		// which is the normal case on a freshly booted node. A -discover
+		// run in agent mode that finds nothing is misconfigured.
+		targets, derr = findTargets(shimPath, *opt.waitForShim, *opt.mode != "collector")
 		if derr != nil {
 			log.Fatalf("discover targets: %v", derr)
 		}
 		log.Printf("discovered %d process(es) mapping %s: %v", len(targets), shimPath, targets)
+		if *opt.mode == "collector" {
+			// Injection fails open and silent, so a node full of workloads
+			// nobody opted in produces exactly the same empty profile as an
+			// idle node. This count is the only thing separating them.
+			if n, uerr := unprofiledGPUProcesses("/proc", *opt.shimDir); uerr == nil && n > 0 {
+				log.Printf("gpu collector: %d GPU process(es) map libcuda but no shim from %s "+
+					"and are NOT being profiled. Either their pods do not declare the volume "+
+					"and CUDA_INJECTION64_PATH, or they reached cuInit before this agent "+
+					"installed the shim", n, *opt.shimDir)
+			}
+		}
 	case *opt.pid != 0:
 		if err := waitForShimIn(*opt.pid, shimPath, *opt.waitForShim); err != nil {
 			log.Fatalf("attach to pid %d: %v", *opt.pid, err)
@@ -442,7 +618,8 @@ func main() {
 	defer func() { _ = sym.Close() }()
 
 	c, err := gpuprobe.Attach(gpuprobe.Config{
-		ShimPath: shimPath,
+		ShimPath:  shimPath,
+		ShimFiles: shimFiles,
 		// Launch mode passes 0 and attach mode passes the target.
 		//
 		// Zero is system-wide, and it is what the launch path needs: the
@@ -895,7 +1072,15 @@ func rediscoverInterval(discover bool, every time.Duration) time.Duration {
 // kernels. The wait covers the one legitimate case -- starting alongside an
 // application that has not reached cuInit yet, which is the NORMAL case for a
 // sidecar, since both containers start together.
-func waitForTargets(shimPath string, within time.Duration) ([]int, error) {
+// findTargets waits for processes mapping shimPath.
+//
+// requireOne distinguishes two callers with opposite needs. A launch or
+// -pid run that finds nothing is misconfigured and should say so. A
+// collector that finds nothing has simply started before the workloads,
+// which is the normal case on a freshly booted node -- and refusing there
+// would make the agent unable to be the first thing up, which is exactly
+// when it is most useful.
+func findTargets(shimPath string, within time.Duration, requireOne bool) ([]int, error) {
 	deadline := time.Now().Add(within)
 	for {
 		found, err := gpuprobe.ProcessesMappingShim(shimPath)
@@ -906,6 +1091,9 @@ func waitForTargets(shimPath string, within time.Duration) ([]int, error) {
 			return found, nil
 		}
 		if !time.Now().Before(deadline) {
+			if !requireOne {
+				return nil, nil
+			}
 			return nil, fmt.Errorf(
 				"no process on this host maps %s after %s. The CUDA driver loads the shim "+
 					"during cuInit, from CUDA_INJECTION64_PATH in each process's own "+

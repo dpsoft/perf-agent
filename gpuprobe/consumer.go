@@ -283,6 +283,17 @@ type Config struct {
 	// PID restricts the attachment to one process; zero is system-wide.
 	PID int
 
+	// ShimFiles is the set of shim inodes to attach to. When non-empty it
+	// supersedes ShimPath.
+	//
+	// More than one entry is the upgrade case and nothing else. Replacing
+	// the shim is a rename(2), which leaves the previous inode alive for
+	// every process that already mapped it -- that survival is what makes
+	// the replace safe -- so covering those processes needs a link per
+	// inode. Bounded by live shim versions, normally one and transiently
+	// two, not by the number of targets.
+	ShimFiles []ShimFile
+
 	// KeepInstrumentationFrames leaves the profiler's own delivery path in
 	// every sampled stack instead of collapsing it to one marker.
 	//
@@ -1748,22 +1759,32 @@ func Attach(cfg Config) (c *Consumer, err error) {
 		c.cubin = cl
 	}
 
-	var ex *link.Executable
-	if ex, err = link.OpenExecutable(cfg.ShimPath); err != nil {
-		return
+	// One link per shim inode. A uprobe keys on (dev, ino), so two files
+	// holding identical bytes are two attach targets and a single link on
+	// the current path would not cover processes still mapping a previous
+	// one.
+	attachTo := cfg.ShimFiles
+	if len(attachTo) == 0 {
+		attachTo = []ShimFile{{Path: cfg.ShimPath}}
 	}
-	var l link.Link
-	l, err = ex.UprobeMulti(nil, c.objs.GpuUsdtBatch, &link.UprobeMultiOptions{
-		Addresses:     addrs,
-		RefCtrOffsets: refCtrs,
-		Cookies:       cookies,
-		PID:           uint32(cfg.PID),
-	})
-	if err != nil {
-		err = fmt.Errorf("uprobe_multi attach (needs Linux 6.6+): %w", err)
-		return
+	for _, sf := range attachTo {
+		var ex *link.Executable
+		if ex, err = link.OpenExecutable(sf.Path); err != nil {
+			return
+		}
+		var l link.Link
+		l, err = ex.UprobeMulti(nil, c.objs.GpuUsdtBatch, &link.UprobeMultiOptions{
+			Addresses:     addrs,
+			RefCtrOffsets: refCtrs,
+			Cookies:       cookies,
+			PID:           uint32(cfg.PID),
+		})
+		if err != nil {
+			err = fmt.Errorf("uprobe_multi attach to %s (needs Linux 6.6+): %w", sf.Path, err)
+			return
+		}
+		c.links = append(c.links, l)
 	}
-	c.links = append(c.links, l)
 
 	// gpu_stacks is read (and each resolved entry deleted) by the sampled
 	// stack path; see Consumer.resolveStackLocked.

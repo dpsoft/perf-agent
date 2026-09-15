@@ -24,10 +24,15 @@
 - **Silence is the defect.** Every "not profiled" path must be counted and reported. CUDA injection fails open and silent, so an unprofiled workload is otherwise indistinguishable from one that ran nothing.
 - **Build/test flags** (blazesym is required for `gpuprobe`):
   ```
+  LD_LIBRARY_PATH="/home/diego/github/blazesym/target/release:$LD_LIBRARY_PATH" \
   CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I /home/diego/github/blazesym/capi/include" \
   CGO_LDFLAGS="-L/home/diego/github/blazesym/target/release -Wl,-Bstatic -lblazesym_c -Wl,-Bdynamic" \
   go test ./...
   ```
+  LD_LIBRARY_PATH is required and was missing from the first draft of this
+  block: -Wl,-Bstatic does not fully static-link blazesym here, so the test
+  binary needs the .so at RUN time. `make test-unit` sets it; a bare run
+  fails with "libblazesym_c.so: cannot open shared object file".
 
 ## File Structure
 

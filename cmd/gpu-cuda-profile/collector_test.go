@@ -187,3 +187,65 @@ func TestCollectorAttachSetIsJustTheCurrentShimOnAQuietNode(t *testing.T) {
 		t.Fatalf("got %d, want exactly 1 on a node with nothing running", len(files))
 	}
 }
+
+// stageCUDAProcessWithoutShim writes a maps file that maps libcuda but no
+// shim: a GPU workload nobody opted in.
+func stageCUDAProcessWithoutShim(t *testing.T, procRoot string, pid uint32) {
+	t.Helper()
+	dir := filepath.Join(procRoot, strconv.FormatUint(uint64(pid), 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	maps := "7f0000000000-7f0000001000 r-xp 00000000 fd:01 999 /usr/lib64/libcuda.so.610.57.04\n"
+	if err := os.WriteFile(filepath.Join(dir, "maps"), []byte(maps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnprofiledGPUProcessesCountsThoseMappingNoShim(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, shiminstall.Name)
+	if err := os.WriteFile(shim, []byte("shim"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	procRoot := t.TempDir()
+	stageShimMapping(t, procRoot, 10, shim)      // profiled
+	stageCUDAProcessWithoutShim(t, procRoot, 20) // NOT profiled
+	stageCUDAProcessWithoutShim(t, procRoot, 30) // NOT profiled
+
+	n, err := unprofiledGPUProcesses(procRoot, dir)
+	if err != nil {
+		t.Fatalf("unprofiledGPUProcesses: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("got %d, want 2 -- a GPU process mapping no shim is unprofiled and "+
+			"looks exactly like an idle node unless it is counted", n)
+	}
+}
+
+func TestUnprofiledGPUProcessesIgnoresNonGPUProcesses(t *testing.T) {
+	// Every other process on the node maps neither libcuda nor the shim.
+	// Counting those would make the number meaningless.
+	dir := t.TempDir()
+	shim := filepath.Join(dir, shiminstall.Name)
+	if err := os.WriteFile(shim, []byte("shim"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	procRoot := t.TempDir()
+	plain := filepath.Join(procRoot, "77")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plain, "maps"),
+		[]byte("55f000000000-55f000001000 r-xp 00000000 fd:01 1 /usr/bin/bash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := unprofiledGPUProcesses(procRoot, dir)
+	if err != nil {
+		t.Fatalf("unprofiledGPUProcesses: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("got %d, want 0; a process with no CUDA is not an unprofiled GPU workload", n)
+	}
+}

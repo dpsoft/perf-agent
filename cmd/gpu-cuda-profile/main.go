@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -277,6 +278,52 @@ func collectorShimFiles(carried, dir, procRoot string) ([]gpuprobe.ShimFile, err
 		files = append(files, f)
 	}
 	return files, nil
+}
+
+// unprofiledGPUProcesses counts processes that have libcuda mapped but no
+// shim from shimDir.
+//
+// Each one is a workload running unprofiled, for one of two reasons that
+// are indistinguishable from here: its pod never declared the mount and
+// CUDA_INJECTION64_PATH, or it reached cuInit before this agent installed
+// the shim. Both are silent, because CUDA injection fails open -- so this
+// count is the only thing separating "nobody opted in" from "the node is
+// idle", and a node full of unprofiled GPU work otherwise produces exactly
+// the same empty profile as a node with no GPU work at all.
+func unprofiledGPUProcesses(procRoot, shimDir string) (int, error) {
+	inUse, err := gpuprobe.ShimInodesInUseIn(procRoot, shimDir)
+	if err != nil {
+		return 0, err
+	}
+	profiled := map[int]struct{}{}
+	for _, pids := range inUse {
+		for _, p := range pids {
+			profiled[p] = struct{}{}
+		}
+	}
+
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", procRoot, err)
+	}
+	n := 0
+	for _, e := range entries {
+		pid, perr := strconv.Atoi(e.Name())
+		if perr != nil {
+			continue // not a pid directory
+		}
+		if _, ok := profiled[pid]; ok {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(procRoot, e.Name(), "maps"))
+		if rerr != nil {
+			continue // exited, or not ours to read; says nothing either way
+		}
+		if strings.Contains(string(body), "libcuda.so") {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // validateMode refuses combinations rather than ignoring them.

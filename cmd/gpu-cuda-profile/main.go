@@ -53,6 +53,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/shiminstall"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/symbolize/nvsym"
@@ -235,6 +236,47 @@ var attachSafeFlags = map[string]bool{
 	"rediscover-every":            true,
 	"mode":                        true,
 	"shim-dir":                    true,
+}
+
+// collectorShimFiles installs the carried shim and returns every inode the
+// agent must attach to: the one just installed, plus any older shim in the
+// same directory that still has a live mapper.
+//
+// The second half is not defensive. Replacement is rename(2), so processes
+// that mapped the previous file keep it -- that survival is what makes the
+// replace safe -- and attaching only to the current path would silently
+// stop covering every workload that was already running. There is no error
+// in that failure, only a thinner profile.
+func collectorShimFiles(carried, dir, procRoot string) ([]gpuprobe.ShimFile, error) {
+	dest, replaced, err := shiminstall.Install(carried, dir)
+	if err != nil {
+		return nil, err
+	}
+	state := "already current"
+	if replaced {
+		state = "installed"
+	}
+	log.Printf("gpu collector: shim %s (%s)", dest, state)
+
+	dev, ino, err := gpuprobe.ShimIdentity(dest)
+	if err != nil {
+		return nil, fmt.Errorf("identify installed shim: %w", err)
+	}
+	files := []gpuprobe.ShimFile{{Path: dest, Dev: dev, Ino: ino}}
+
+	inUse, err := gpuprobe.ShimInodesInUseIn(procRoot, dir)
+	if err != nil {
+		return nil, err
+	}
+	for f, pids := range inUse {
+		if f.Ino == ino && f.Dev == dev {
+			continue // already have it
+		}
+		log.Printf("gpu collector: also attaching to %s (inode %d), mapped by %d process(es) "+
+			"from a previous shim version", f.Path, f.Ino, len(pids))
+		files = append(files, f)
+	}
+	return files, nil
 }
 
 // validateMode refuses combinations rather than ignoring them.

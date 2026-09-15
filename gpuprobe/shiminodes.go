@@ -32,7 +32,13 @@ func ShimIdentity(path string) (dev, ino uint64, err error) { return enrollShimI
 // is bounded by live shim versions, normally one and transiently two, not
 // by the number of targets.
 func ShimInodesInUse(dir string) (map[ShimFile][]int, error) {
-	return shimInodesInUseIn("/proc", dir)
+	return ShimInodesInUseIn("/proc", dir)
+}
+
+// ShimInodesInUseIn is ShimInodesInUse against an arbitrary proc tree, so a
+// caller outside this package can be tested against a synthetic one.
+func ShimInodesInUseIn(procRoot, dir string) (map[ShimFile][]int, error) {
+	return shimInodesInUseIn(procRoot, dir)
 }
 
 func shimInodesInUseIn(procRoot, dir string) (map[ShimFile][]int, error) {

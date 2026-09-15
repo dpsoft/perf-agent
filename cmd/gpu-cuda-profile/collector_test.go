@@ -2,11 +2,16 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dpsoft/perf-agent/internal/shiminstall"
 )
 
 func TestFindTargetsAllowsAnEmptyNodeWhenNotRequiringOne(t *testing.T) {
@@ -104,5 +109,81 @@ func TestUnknownModeIsRefused(t *testing.T) {
 	}
 	if err := validateMode(fs, opt); err == nil {
 		t.Fatal("an unknown -mode was accepted")
+	}
+}
+
+// stageShimMapping writes procRoot/<pid>/maps naming shimPath with the
+// device and inode a uprobe keys on.
+func stageShimMapping(t *testing.T, procRoot string, pid uint32, shimPath string) {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Stat(shimPath, &st); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(procRoot, strconv.FormatUint(uint64(pid), 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	maps := fmt.Sprintf("7f0000000000-7f0000001000 r-xp 00000000 %02x:%02x %d %s\n",
+		(st.Dev>>8)&0xfff, st.Dev&0xff, st.Ino, shimPath)
+	if err := os.WriteFile(filepath.Join(dir, "maps"), []byte(maps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollectorInstallsThenAttachesToEveryMappedInode(t *testing.T) {
+	// The upgrade case, which is the one most likely to be skipped: an
+	// older shim still has a mapper, so a collector that attached only to
+	// the current file would stop covering it -- with no error, just a
+	// thinner profile.
+	dir := t.TempDir()
+	src := filepath.Join(t.TempDir(), shiminstall.Name)
+	if err := os.WriteFile(src, []byte("shim-v2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, shiminstall.Name+".v1")
+	if err := os.WriteFile(old, []byte("shim-v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	procRoot := t.TempDir()
+	stageShimMapping(t, procRoot, 42, old)
+
+	files, err := collectorShimFiles(src, dir, procRoot)
+	if err != nil {
+		t.Fatalf("collectorShimFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("got %d shim files, want 2 (installed current + mapped old)", len(files))
+	}
+	var sawCurrent, sawOld bool
+	for _, f := range files {
+		if f.Path == filepath.Join(dir, shiminstall.Name) {
+			sawCurrent = true
+		}
+		if f.Path == old {
+			sawOld = true
+		}
+	}
+	if !sawCurrent {
+		t.Error("the installed shim is not in the attach set")
+	}
+	if !sawOld {
+		t.Error("an older shim with a live mapper is not in the attach set; every " +
+			"workload already running would stop being covered")
+	}
+}
+
+func TestCollectorAttachSetIsJustTheCurrentShimOnAQuietNode(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(t.TempDir(), shiminstall.Name)
+	if err := os.WriteFile(src, []byte("shim-v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files, err := collectorShimFiles(src, dir, t.TempDir())
+	if err != nil {
+		t.Fatalf("collectorShimFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("got %d, want exactly 1 on a node with nothing running", len(files))
 	}
 }

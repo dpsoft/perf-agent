@@ -92,6 +92,42 @@ the restriction (`gpuprobe/consumer.go:1760`). The probe lives on the
 inode, not on a process, so it is armed **before any pod exists** and the
 `cuInit` race cannot occur. Attachment needs no pod lifecycle at all.
 
+### Verified on hardware, 2026-09-15
+
+This is the load-bearing claim of the whole design, so it was measured
+before the plan was written rather than after. Two processes on one host
+stand in for two pods; RTX 3090, rescans disabled for the run
+(`-rediscover-every 1h`) so that a rescan cannot be mistaken for the
+uprobe.
+
+| process | agent discovered it | samples in profile |
+|---|---|---|
+| A, started **before** attach | yes (`173742`) | 296,364 |
+| B, started **after** attach | **no** | **120,000** |
+
+B was never discovered and never rescanned for, and its launches are in
+the profile. `PID: 0` covers processes that did not exist when the link
+was created.
+
+**The negative control, which is what makes that interpretable.** Two
+files, identical bytes (`md5` equal), different inodes. The agent attached
+to `shimcopy` (inode 5960732); a decoy loaded `shimdir` (inode 5960731):
+
+| process | inode | samples in profile |
+|---|---|---|
+| C, on the attached inode | 5960732 | 298,844 |
+| D, identical bytes, other inode | 5960731 | **none** |
+
+D is absent entirely, so the test was capable of failing and the
+`(dev, ino)` rule holds as the layout assumes.
+
+A second signal agrees without being designed for: the shim's own
+rendezvous reports `enroll=confirmed` for B and `enroll=no-listener` for
+D. Two independent mechanisms, same answer.
+
+Reproduction: `~/perf-agent-spike/spike-positive.sh` and
+`spike-negative.sh` — throwaway, not part of the tree.
+
 Cost, stated rather than designed around: one shim version per node, so no
 per-workload canary; and a node running both deployments has two shim
 versions live. Neither is worth a link-per-pod to avoid.
@@ -239,12 +275,19 @@ Deliberately not settled here; they need answers before the plan:
    profiled, and the collector reports how many GPU processes it saw that
    never mapped the shim. Silence there would make "not opted in" and
    "nothing ran" identical.
-3. **Eviction.** `pidRegistry` evicts on process exit; whether a pod
+3. **`-discover` cannot attach with zero targets.** `waitForTargets`
+   fatals after `-wait-for-shim` when nothing maps the shim, so today's
+   CLI cannot start before the workloads it will profile. A collector
+   always starts first. This is a required change, not a question: attach
+   with `PID: 0` and wait, treating an empty node as normal rather than
+   fatal. Found while setting up the spike above, which had to start a
+   workload first to work around it.
+4. **Eviction.** `pidRegistry` evicts on process exit; whether a pod
    ending should also drop its cached labels and module bytes is
    unexamined.
-4. **`examples/kubernetes/`**: a sibling `collector-daemonset.yaml`
+5. **`examples/kubernetes/`**: a sibling `collector-daemonset.yaml`
    alongside the sidecar example, or its own directory.
-5. **Spec §11** is written sidecar-first ("perf-agent runs per-pod rather
+6. **Spec §11** is written sidecar-first ("perf-agent runs per-pod rather
    than as a DaemonSet"). Amend in place or add a collector section.
 
 
@@ -268,14 +311,14 @@ Deliberately not settled here; they need answers before the plan:
 
 ## Testing
 
-- **The single-link claim is the thing to prove, and it must be proven
-  with two pods.** One `UprobeMulti` with `PID: 0` against a shared
-  `hostPath` inode, with a second GPU workload started **after** attach,
-  asserting the second one's launches are sampled. A test with one pod
-  cannot distinguish `PID: 0` from a lucky single-target attach.
-- **The inode rule needs a negative test.** Point the collector at a
-  *copy* of the shim and assert zero probe fires — the failure the example
-  warns about produces no error, so only an assertion catches it.
+- **The single-link claim is proven (above) and now needs a regression
+  test**, not an investigation. Two workloads, the second started after
+  attach, rescans disabled, asserting both appear. A test with one
+  workload cannot distinguish `PID: 0` from a lucky single-target attach,
+  and a test with rescans on cannot distinguish it from rediscovery.
+- **The inode rule needs its negative test in the tree.** Point the agent
+  at a *copy* of the shim and assert zero probe fires — the failure
+  produces no error, so only an assertion catches it.
 - **`hostPID` refusal.** Run the collector without it and assert it names
   the requirement instead of emitting an empty profile.
 - **The upgrade case needs its own test, and it is the one most likely to

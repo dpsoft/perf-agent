@@ -28,6 +28,7 @@
 #include "usdt_probe.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -218,12 +219,33 @@ int main() {
     sigemptyset(&sa.sa_mask);
     assert(sigaction(SIGTRAP, &sa, nullptr) == 0);
 
-    // Become the uprobe: replace the one-byte nop with int3. The mapping is
+    // Become the uprobe: replace the nop with a breakpoint. The mapping is
     // private, so this is a copy-on-write of our own text and affects nothing
     // else on the system.
+    //
+    // Protect exactly the pages the instruction spans -- normally one, two
+    // only if it straddles a boundary. An earlier version took two pages
+    // unconditionally, which works until the probe sits near the end of its
+    // text mapping and the second page is not mapped at all: mprotect then
+    // fails ENOMEM. That is layout-dependent rather than arch-dependent, and
+    // aarch64 is simply where this repo's layout hit it first.
     const long pagesize = sysconf(_SC_PAGESIZE);
-    void *page = (void *)(probe & ~(uintptr_t)(pagesize - 1));
-    assert(mprotect(page, (size_t)pagesize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0);
+    const uintptr_t lo = probe & ~(uintptr_t)(pagesize - 1);
+    const uintptr_t hi = ((probe + sizeof(probe_insn_t) - 1) &
+                          ~(uintptr_t)(pagesize - 1)) + (uintptr_t)pagesize;
+    void *page = (void *)lo;
+    const size_t protlen = (size_t)(hi - lo);
+    if (mprotect(page, protlen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        // errno, because a bare assert here says only that something went
+        // wrong with memory protection -- ENOMEM (range not mapped) and
+        // EACCES (kernel refuses W|X) want completely different fixes.
+        fprintf(stderr,
+                "probe_args_test: mprotect(%p, %zu, RWX) failed: %s\n"
+                "  probe=%#lx pagesize=%ld insn=%zu\n",
+                page, protlen, strerror(errno),
+                (unsigned long)probe, pagesize, sizeof(probe_insn_t));
+        return 1;
+    }
     assert(*(volatile probe_insn_t *)probe == kProbeNop &&
            "probe site is not the expected nop");
     *(volatile probe_insn_t *)probe = kProbeTrap;
@@ -231,7 +253,7 @@ int main() {
     // cache holding the old one. x86-64 keeps them coherent; aarch64 does
     // not, and without this the trap simply never fires.
     __builtin___clear_cache((char *)probe, (char *)probe + sizeof(probe_insn_t));
-    assert(mprotect(page, (size_t)pagesize * 2, PROT_READ | PROT_EXEC) == 0);
+    assert(mprotect(page, protlen, PROT_READ | PROT_EXEC) == 0);
 
     // A watchdog, because the interesting failure here does not return.
     // If advance_pc is wrong on this architecture the handler re-traps on the

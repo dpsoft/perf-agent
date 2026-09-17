@@ -164,14 +164,16 @@ generate-guard:
 		echo "*** source change is correct. Do NOT commit these bytes and do NOT revert"; \
 		echo "*** them by hand — hand-reverting is what hid this for four rounds."; \
 		echo "***"; \
-		echo "*** Instead, either:"; \
-		echo "***   make generate-container   # regenerates at CI's path; matches byte for byte"; \
-		echo "***"; \
-		echo "*** or, if podman is unavailable, take the round trip:"; \
+		echo "*** CI is the producer. Take its objects:"; \
 		echo "***   1. commit your bpf/*.c / bpf/*.h source change on its own"; \
 		echo "***   2. push; CI regenerates and uploads regenerated-objects-<arch>"; \
-		echo "***   3. make adopt-ci-objects RUN=<github-run-id>"; \
+		echo "***   3. make adopt-ci-objects        # no RUN= needed; finds the run"; \
 		echo "***   4. commit the objects CI produced"; \
+		echo "***"; \
+		echo "*** make generate-container previews what CI will produce, without the"; \
+		echo "*** push. Useful, and not authoritative: it reproduces CI only for the"; \
+		echo "*** command lines committed today, so treat a match as encouraging and"; \
+		echo "*** a mismatch as inconclusive rather than as breakage."; \
 		echo "***"; \
 		echo "*** clang here: $$(clang --version 2>/dev/null | head -1)"; \
 		echo "***"; \
@@ -190,10 +192,24 @@ generate-guard:
 # what decays into a hand-revert.
 .PHONY: adopt-ci-objects
 adopt-ci-objects:
-	@test -n "$(RUN)" || { echo "usage: make adopt-ci-objects RUN=<github-run-id>"; exit 1; }
-	@tmp=$$(mktemp -d); \
-	if ! gh run download $(RUN) -n regenerated-objects-amd64 -D "$$tmp"; then \
-		echo "*** could not download regenerated-objects-amd64 from run $(RUN)"; \
+	@run="$(RUN)"; \
+	if [ -z "$$run" ]; then \
+		branch=$$(git rev-parse --abbrev-ref HEAD); \
+		run=$$(gh run list --branch "$$branch" --limit 10 \
+			--json databaseId,conclusion \
+			--jq '[.[] | select(.conclusion=="failure")][0].databaseId' 2>/dev/null); \
+		if [ -z "$$run" ] || [ "$$run" = "null" ]; then \
+			echo "*** no failed run found on branch $$branch."; \
+			echo "*** The objects are uploaded by the Build job's if: failure() step, so"; \
+			echo "*** there is nothing to adopt until a run has failed the verify step."; \
+			echo "*** Push the source change first, or pass RUN=<id> explicitly."; \
+			exit 1; \
+		fi; \
+		echo "*** adopting from the most recent failed run on $$branch: $$run"; \
+	fi; \
+	tmp=$$(mktemp -d); \
+	if ! gh run download "$$run" -n regenerated-objects-amd64 -D "$$tmp"; then \
+		echo "*** could not download regenerated-objects-amd64 from run $$run"; \
 		echo "*** the artifact is uploaded by the Build job's if: failure() step"; \
 		rm -rf "$$tmp"; exit 1; \
 	fi; \
@@ -204,7 +220,7 @@ adopt-ci-objects:
 		fi; \
 	done; \
 	rm -rf "$$tmp"; \
-	echo "*** adopted $$n object(s) from run $(RUN); review with git diff --stat before committing"
+	echo "*** adopted $$n object(s) from run $$run; review with git diff --stat before committing"
 
 # Regeneration must not change the committed objects. Issue #87.
 #

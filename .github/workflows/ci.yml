@@ -172,6 +172,17 @@ jobs:
             printf '%s committed=%s regenerated=%s\n' "$f" \
               "$(git show HEAD:"$f" | wc -c)" "$(wc -c < "$f")"
           done
+          echo "---"
+          echo "Same size with differing bytes is BTF type ordering (issue #117), not a"
+          echo "code change: BTF forward declarations take their IDs from a pointer-keyed"
+          echo "map in clang, so they follow malloc addresses and the build directory."
+          echo ""
+          echo "This job is the producer of the committed objects. To take them:"
+          echo "  make adopt-ci-objects        # downloads this run's artifact"
+          echo "  git commit -- '*_bpfel.o' '*_bpfel.go'"
+          echo ""
+          echo "Do NOT regenerate locally and commit that; and do NOT hand-revert these"
+          echo "files, which is what hid this problem for four rounds."
           exit 1
         fi
         echo "✓ generated objects match the committed ones"

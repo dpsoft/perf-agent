@@ -25,7 +25,37 @@ Thanks for your interest. perf-agent is an eBPF-based Linux profiler — a small
    golangci-lint run --timeout=5m
    ```
    CI runs this and it must pass before merge.
-4. **Cross-arch:** the project supports `amd64` and `arm64`. For BPF-touching changes, regenerate bytecode with `make generate` and verify both architectures still build.
+4. **Cross-arch:** the project supports `amd64` and `arm64`. For BPF-touching changes, verify both architectures still build — but see below before regenerating anything.
+
+## BPF objects are CI's artifacts, not your machine's
+
+The committed `*_bpfel.o` files are produced by CI. **A local `make generate` will
+produce different bytes, and that is expected rather than a bug.**
+
+Clang assigns BTF type IDs to forward declarations by iterating a pointer-keyed
+`std::map`, so they follow malloc addresses — which depend on the build directory
+string, among other things. Same source, same compiler version, different
+directory, different bytes. Identical size, a few hundred bytes moved inside
+`.BTF`. Issue #117 has the measurements.
+
+So the workflow for a change that touches `bpf/*.c` or `bpf/*.h` is:
+
+1. Commit the **source** change on its own.
+2. Push. CI regenerates, the verify step fails, and it uploads the objects it built.
+3. `make adopt-ci-objects` — no run id needed, it finds the failed run for your branch.
+4. Commit the objects CI produced.
+
+Two things not to do, both of which have cost real time here:
+
+- **Do not commit a local regeneration.** It will not match what CI builds, and the
+  next contributor inherits the mismatch.
+- **Do not hand-revert the changed objects** with `git checkout`. That is what hid
+  this problem for four rounds: it silently waives the check per file, so a genuine
+  source change that *should* have regenerated an object looks identical to noise.
+
+`make generate-container` previews what CI will produce without the push. It is a
+convenience, not the source of truth — it reproduces CI for the command lines
+committed today, so a match is encouraging and a mismatch is inconclusive.
 
 ## Commit & PR conventions
 

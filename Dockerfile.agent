@@ -17,7 +17,15 @@ RUN apt-get update -qq \
       ca-certificates wget git build-essential libelf-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
-RUN wget -qO /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+# The Go tarball is per-architecture and the names differ from uname's:
+# x86_64 -> amd64, aarch64 -> arm64. Hardcoding amd64 here is why this image
+# could only ever have been built on one architecture.
+RUN case "$(uname -m)" in \
+      x86_64)  GO_ARCH=amd64 ;; \
+      aarch64) GO_ARCH=arm64 ;; \
+      *) echo "no Go toolchain mapping for $(uname -m)" >&2; exit 1 ;; \
+    esac \
+ && wget -qO /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" \
  && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
 ENV PATH=/usr/local/go/bin:/root/.cargo/bin:$PATH
 

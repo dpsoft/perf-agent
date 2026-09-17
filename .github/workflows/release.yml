@@ -201,7 +201,13 @@ jobs:
       # Built natively per architecture rather than under QEMU. The shim
       # build installs the CUDA toolkit and compiles C++; emulating that is
       # slow and is not the thing we want to have tested.
+      # amd64 only, and deliberately: the shim binds its USDT probe arguments
+      # to x86-64 registers by name and does not compile on aarch64. Shipping
+      # an arm64 shim before the port would be worse than shipping none --
+      # CUDA injection fails open and silent, so a wrong one yields an empty
+      # profile and no error.
       - name: Build and push the shim image
+        if: matrix.arch == 'amd64'
         run: |
           img=ghcr.io/${{ github.repository_owner }}/perf-agent-shim
           docker build -f Dockerfile.shim \
@@ -235,14 +241,22 @@ jobs:
 
       - name: Assemble multi-arch manifests
         run: |
-          for name in perf-agent perf-agent-shim; do
-            img=ghcr.io/${{ github.repository_owner }}/$name
-            for tag in "${{ github.ref_name }}" latest; do
-              docker manifest create "$img:$tag" \
-                --amend "$img:${{ github.ref_name }}-amd64" \
-                --amend "$img:${{ github.ref_name }}-arm64"
-              docker manifest push "$img:$tag"
-            done
+          # The agent is multi-arch. The shim is amd64 only until its USDT
+          # probes are ported, so it gets single-arch tags rather than a
+          # manifest list naming an arm64 image that was never built.
+          agent=ghcr.io/${{ github.repository_owner }}/perf-agent
+          for tag in "${{ github.ref_name }}" latest; do
+            docker manifest create "$agent:$tag" \
+              --amend "$agent:${{ github.ref_name }}-amd64" \
+              --amend "$agent:${{ github.ref_name }}-arm64"
+            docker manifest push "$agent:$tag"
+          done
+
+          shim=ghcr.io/${{ github.repository_owner }}/perf-agent-shim
+          docker pull "$shim:${{ github.ref_name }}-amd64"
+          for tag in "${{ github.ref_name }}" latest; do
+            docker tag "$shim:${{ github.ref_name }}-amd64" "$shim:$tag"
+            docker push "$shim:$tag"
           done
 
   release:

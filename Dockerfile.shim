@@ -28,8 +28,13 @@ ARG DEBIAN_FRONTEND=noninteractive
 # InitializeInjection and reports its absence instead of dying.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends g++ ca-certificates wget \
+ && case "$(uname -m)" in \
+      x86_64)  CUDA_REPO_ARCH=x86_64 ;; \
+      aarch64) CUDA_REPO_ARCH=sbsa   ;; \
+      *) echo "unsupported architecture $(uname -m) for the CUDA toolkit repo" >&2; exit 1 ;; \
+    esac \
  && wget -qO /tmp/keyring.deb \
-      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+      "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/cuda-keyring_1.1-1_all.deb" \
  && dpkg -i /tmp/keyring.deb \
  && apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
@@ -45,7 +50,8 @@ COPY shim/ /src/shim/
 # out rather than invoking make: this image must not depend on the host's
 # CUDA_HOME, which that target bind-mounts.
 RUN cd /src/shim \
- && CUDA_INC=$(ls -d /usr/local/cuda-*/targets/x86_64-linux/include | head -1) \
+ && CUDA_INC=$(ls -d /usr/local/cuda-*/targets/*-linux/include | head -1) \
+ && test -n "$CUDA_INC" || { echo "no CUDA include dir under /usr/local/cuda-*/targets/" >&2; exit 1; } \
  && g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
       -mtls-dialect=gnu -pthread -I core -I "$CUDA_INC" \
       -shared -o /libperfagent-gpu-nvidia.so \

@@ -231,8 +231,16 @@ jobs:
   # Integration tests require root and are harder to run in CI
   # They can be run manually or in a different environment
   images:
-    name: Container images
-    runs-on: ubuntu-24.04
+    name: Container images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

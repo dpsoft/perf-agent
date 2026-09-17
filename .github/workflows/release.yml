@@ -165,6 +165,100 @@ jobs:
           path: gpu-cuda-profile-linux-${{ matrix.goarch }}
           retention-days: 30
 
+  # Both images carry the SAME tag as the binaries, and that is the point
+  # rather than tidiness: the shim's USDT record layouts are frozen per
+  # version and the consumer decodes them, so a shim from one release paired
+  # with an agent from another is a decode failure with nothing in the pod
+  # spec to reveal it. One tag, both images, or the pairing is guesswork.
+  #
+  # Note this is a convention, not an enforced guarantee -- nothing at
+  # runtime refuses a mismatched pair today. Issue #139.
+  images:
+    name: Publish images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Built natively per architecture rather than under QEMU. The shim
+      # build installs the CUDA toolkit and compiles C++; emulating that is
+      # slow and is not the thing we want to have tested.
+      # amd64 only, and deliberately: the shim binds its USDT probe arguments
+      # to x86-64 registers by name and does not compile on aarch64. Shipping
+      # an arm64 shim before the port would be worse than shipping none --
+      # CUDA injection fails open and silent, so a wrong one yields an empty
+      # profile and no error.
+      - name: Build and push the shim image
+        if: matrix.arch == 'amd64'
+        run: |
+          img=ghcr.io/${{ github.repository_owner }}/perf-agent-shim
+          docker build -f Dockerfile.shim \
+            -t "$img:${{ github.ref_name }}-${{ matrix.arch }}" .
+          docker push "$img:${{ github.ref_name }}-${{ matrix.arch }}"
+
+      - name: Build and push the agent image
+        run: |
+          img=ghcr.io/${{ github.repository_owner }}/perf-agent
+          docker build -f Dockerfile.agent \
+            -t "$img:${{ github.ref_name }}-${{ matrix.arch }}" .
+          docker push "$img:${{ github.ref_name }}-${{ matrix.arch }}"
+
+  # One manifest list per image so `:<tag>` and `:latest` resolve on either
+  # architecture. Separate job because it can only run once BOTH arches have
+  # pushed -- a manifest naming a tag that does not exist yet fails at create.
+  image-manifests:
+    name: Publish image manifests
+    needs: images
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble multi-arch manifests
+        run: |
+          # The agent is multi-arch. The shim is amd64 only until its USDT
+          # probes are ported, so it gets single-arch tags rather than a
+          # manifest list naming an arm64 image that was never built.
+          agent=ghcr.io/${{ github.repository_owner }}/perf-agent
+          for tag in "${{ github.ref_name }}" latest; do
+            docker manifest create "$agent:$tag" \
+              --amend "$agent:${{ github.ref_name }}-amd64" \
+              --amend "$agent:${{ github.ref_name }}-arm64"
+            docker manifest push "$agent:$tag"
+          done
+
+          shim=ghcr.io/${{ github.repository_owner }}/perf-agent-shim
+          docker pull "$shim:${{ github.ref_name }}-amd64"
+          for tag in "${{ github.ref_name }}" latest; do
+            docker tag "$shim:${{ github.ref_name }}-amd64" "$shim:$tag"
+            docker push "$shim:$tag"
+          done
+
   release:
     name: Create Release
     needs: build

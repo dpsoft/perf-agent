@@ -28,8 +28,13 @@ ARG DEBIAN_FRONTEND=noninteractive
 # InitializeInjection and reports its absence instead of dying.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends g++ ca-certificates wget \
+ && case "$(uname -m)" in \
+      x86_64)  CUDA_REPO_ARCH=x86_64 ;; \
+      aarch64) CUDA_REPO_ARCH=sbsa   ;; \
+      *) echo "unsupported architecture $(uname -m) for the CUDA toolkit repo" >&2; exit 1 ;; \
+    esac \
  && wget -qO /tmp/keyring.deb \
-      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+      "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${CUDA_REPO_ARCH}/cuda-keyring_1.1-1_all.deb" \
  && dpkg -i /tmp/keyring.deb \
  && apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
@@ -44,10 +49,22 @@ COPY shim/ /src/shim/
 # The same command line as `make -C shim nvidia-portable`, deliberately spelled
 # out rather than invoking make: this image must not depend on the host's
 # CUDA_HOME, which that target bind-mounts.
+# -mtls-dialect selects TRADITIONAL TLS over TLS-descriptors, which is what
+# keeps GLIBC_ABI_GNU2_TLS out of the object (#121). The spelling is
+# per-architecture and the values are NOT interchangeable: x86-64 calls the
+# two dialects gnu/gnu2, aarch64 calls them trad/desc. Passing the x86 value
+# on aarch64 is not a silently-ignored no-op -- g++ rejects it outright, which
+# is how the arm64 image build failed the first time it ever ran.
 RUN cd /src/shim \
- && CUDA_INC=$(ls -d /usr/local/cuda-*/targets/x86_64-linux/include | head -1) \
+ && CUDA_INC=$(ls -d /usr/local/cuda-*/targets/*-linux/include | head -1) \
+ && test -n "$CUDA_INC" || { echo "no CUDA include dir under /usr/local/cuda-*/targets/" >&2; exit 1; } \
+ && case "$(uname -m)" in \
+      x86_64)  TLS_DIALECT=gnu  ;; \
+      aarch64) TLS_DIALECT=trad ;; \
+      *) echo "no known traditional -mtls-dialect value for $(uname -m)" >&2; exit 1 ;; \
+    esac \
  && g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
-      -mtls-dialect=gnu -pthread -I core -I "$CUDA_INC" \
+      -mtls-dialect=${TLS_DIALECT} -pthread -I core -I "$CUDA_INC" \
       -shared -o /libperfagent-gpu-nvidia.so \
       nvidia/cupti_adapter.cc core/batch.cc core/clock.cc core/cubin.cc \
       core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc \

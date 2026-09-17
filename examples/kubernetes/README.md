@@ -5,16 +5,34 @@ Profile a PyTorch CUDA workload running in Kubernetes, without rebuilding it,
 relinking it, or changing a line of its code — then render the result as a
 flame graph.
 
-> **Status: one blocker left — the shim image is not published.**
+> **Status: runnable from the first release tag onward.**
 >
 > Every other directory under `examples/` runs end-to-end today. This one is
 > close, and the README says where it stops rather than letting you discover
 > it at `kubectl apply`.
 >
-> **Still blocking: `ghcr.io/dpsoft/perf-agent-shim` does not exist** (#139).
-> `Dockerfile.shim` builds it and the ELF gate runs inside that build, but
-> nothing pushes it, so the `shim-installer` init container has no image to
-> pull. Registry is decided; trigger, tagging and arch are not.
+> **`ghcr.io/dpsoft/perf-agent-shim` does not exist until a `v*` tag is
+> pushed** (#139). `release.yml` now builds both images natively on each
+> architecture, pushes them tagged with the release version, and assembles
+> multi-arch manifests for `:<version>` and `:latest`. Nothing is published
+> before then, so `kubectl apply` on these manifests will fail to pull until
+> the first tag is cut.
+>
+> **The shim is published for amd64 only.** `shim/core/usdt_probe.h` binds its
+> probe arguments to `rdi`/`rsi`/`rdx` by name, so it does not compile on
+> aarch64 — a source portability gap, not a packaging one. GPU profiling is
+> therefore x86-64 only today, on a Grace-Hopper or other ARM GPU node
+> included. The agent image itself is multi-arch.
+>
+> This matters more than an unsupported-platform note usually would: CUDA
+> injection **fails open and silent**, so an arm64 shim that compiled but bound
+> the wrong registers would produce an empty profile and no error anywhere.
+> Not shipping one is deliberate.
+>
+> Both images carry the same tag deliberately: the shim's USDT record layouts
+> are frozen per version and the agent decodes them, so a mismatched pair is a
+> decode failure with nothing in the pod spec to reveal it. Note that this is a
+> convention — nothing at runtime refuses a mismatched pair today.
 >
 > **Cleared since this was written:**
 >

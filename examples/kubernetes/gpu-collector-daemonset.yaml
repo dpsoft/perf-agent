@@ -1,8 +1,9 @@
 # One agent per NODE. Contrast pytorch-gpu-profile.yaml, which puts one agent
 # in every profiled POD.
 #
-# Status: the agent side of this is implemented (-mode=collector); the image
-# below is not published yet, same blocker as the sidecar example (#139).
+# Status: implemented (-mode=collector), and release.yml now publishes both
+# images on a v* tag. Until a tag is cut, ghcr.io/dpsoft/perf-agent:latest
+# does not exist yet and this will not pull (#139).
 #
 # ---------------------------------------------------------------- the idea --
 #

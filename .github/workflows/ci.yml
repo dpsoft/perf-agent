@@ -231,8 +231,16 @@ jobs:
   # Integration tests require root and are harder to run in CI
   # They can be run manually or in a different environment
   images:
-    name: Container images
-    runs-on: ubuntu-24.04
+    name: Container images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -242,10 +250,19 @@ jobs:
       # kills file capabilities -- and both are caught by gates inside the
       # Dockerfiles. A workflow that only ran hadolint would pass while
       # shipping neither.
+      # amd64 only: shim/core/usdt_probe.h binds the probe arguments to
+      # rdi/rsi/rdx by name, so the shim does not compile on aarch64 at all.
+      # That is a source portability gap, not a packaging one -- the arm64
+      # image build is what surfaced it. Tracked for the port; until then an
+      # arm64 shim must not be built OR published, because CUDA injection
+      # fails open and silent and an untested one would produce empty
+      # profiles with no error anywhere.
       - name: Build the shim image
+        if: matrix.arch == 'amd64'
         run: docker build -f Dockerfile.shim -t perf-agent-shim:ci .
 
       - name: The shim image carries a loadable shim
+        if: matrix.arch == 'amd64'
         # elfgate already ran inside the build; this checks the FILE made it
         # into the final stage, which a bad COPY would silently skip.
         run: |

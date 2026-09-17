@@ -250,13 +250,12 @@ jobs:
       # kills file capabilities -- and both are caught by gates inside the
       # Dockerfiles. A workflow that only ran hadolint would pass while
       # shipping neither.
-      # amd64 only: shim/core/usdt_probe.h binds the probe arguments to
-      # rdi/rsi/rdx by name, so the shim does not compile on aarch64 at all.
-      # That is a source portability gap, not a packaging one -- the arm64
-      # image build is what surfaced it. Tracked for the port; until then an
-      # arm64 shim must not be built OR published, because CUDA injection
-      # fails open and silent and an untested one would produce empty
-      # profiles with no error anywhere.
+      # amd64 only, still, but no longer because the source cannot build:
+      # usdt_probe.h is now arch-guarded and the shim-tests job above proves
+      # the aarch64 argument binding on a native runner. What remains is this
+      # job's own x86_64 hardcoding -- the CUDA keyring URL and include path --
+      # which is a packaging change and belongs in its own diff rather than
+      # riding along with an assembly port.
       - name: Build the shim image
         if: matrix.arch == 'amd64'
         run: docker build -f Dockerfile.shim -t perf-agent-shim:ci .
@@ -295,6 +294,39 @@ jobs:
             && (echo "the image cannot exec under the capabilities it documents" && exit 1)
           echo "$out" | grep -q "adapter /nonexistent.so" \
             || (echo "the agent did not reach its own argument handling" && exit 1)
+
+  # The shim's USDT probes bind their arguments to the first three
+  # integer-argument registers of the platform ABI, and this is what proves
+  # the binding is right rather than merely compiling.
+  #
+  # probe_args_test patches its own probe site to a breakpoint, fires the
+  # probe, and reads the argument registers out of the trapped context. A
+  # wrong register name, a wrong .note.stapsdt descriptor, or a missing
+  # instruction-cache flush all FAIL here; none of them fail a build.
+  #
+  # Needs no CUDA, no CUPTI and no GPU -- just g++ -- which is what makes it
+  # runnable on a native arm64 runner and therefore what makes the aarch64
+  # port verifiable at all.
+  shim-tests:
+    name: Shim tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install a compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++ make
+
+      - name: Run the shim test suite
+        run: make -C shim test
 
   shim:
     name: GPU shim (portability gate)

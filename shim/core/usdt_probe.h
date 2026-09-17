@@ -15,6 +15,35 @@
 #ifndef PERFAGENT_USDT_PROBE_H
 #define PERFAGENT_USDT_PROBE_H
 
+// The probe binds its three arguments to the first three integer-argument
+// registers of the platform ABI, and names them in the .note.stapsdt argument
+// descriptor so a consumer can find them.
+//
+// Only the register NAMES differ between architectures; the contract does
+// not. That is what lets bpf/gpu_usdt.bpf.c read them with PT_REGS_PARM1..3
+// and need no port at all.
+//
+// The note-emitting assembly below stays in ONE copy on purpose. Duplicating
+// it per architecture would put two .note.stapsdt generators in the file, and
+// a divergence between them is invisible until a consumer reads a probe whose
+// descriptor does not match where the arguments actually are.
+//
+// x86-64 writes registers in the descriptor with a % sigil, doubled here
+// because the string is an inline-asm template. AArch64 writes them bare.
+#if defined(__x86_64__)
+#  define PERFAGENT_USDT_R0 "rdi"
+#  define PERFAGENT_USDT_R1 "rsi"
+#  define PERFAGENT_USDT_R2 "rdx"
+#  define PERFAGENT_USDT_ARGSPEC "8@%%rdi 8@%%rsi 8@%%rdx"
+#elif defined(__aarch64__)
+#  define PERFAGENT_USDT_R0 "x0"
+#  define PERFAGENT_USDT_R1 "x1"
+#  define PERFAGENT_USDT_R2 "x2"
+#  define PERFAGENT_USDT_ARGSPEC "8@x0 8@x1 8@x2"
+#else
+#  error "perfagent USDT probes: no argument-register binding for this architecture"
+#endif
+
 #define PERFAGENT_USDT_BASE                                                 \
     ".ifndef _.stapsdt.base\n"                                              \
     ".pushsection .stapsdt.base,\"aG\",\"progbits\",.stapsdt.base,comdat\n" \
@@ -69,9 +98,12 @@
 // is paid only on the path where the semaphore is already armed.
 #define PERFAGENT_USDT_PROBE3(name, ptr, count, seq)                        \
   do {                                                                      \
-    register unsigned long _a0 __asm__("rdi") = (unsigned long)(ptr);       \
-    register unsigned long _a1 __asm__("rsi") = (unsigned long)(count);     \
-    register unsigned long _a2 __asm__("rdx") = (unsigned long)(seq);       \
+    register unsigned long _a0 __asm__(PERFAGENT_USDT_R0) =                 \
+        (unsigned long)(ptr);                                               \
+    register unsigned long _a1 __asm__(PERFAGENT_USDT_R1) =                 \
+        (unsigned long)(count);                                             \
+    register unsigned long _a2 __asm__(PERFAGENT_USDT_R2) =                 \
+        (unsigned long)(seq);                                               \
     __asm__ __volatile__ (                                                  \
       "990: nop\n"                                                          \
       PERFAGENT_USDT_BASE                                                   \
@@ -85,7 +117,7 @@
       ".8byte perfagent_" #name "_semaphore\n"                              \
       ".asciz \"perfagent\"\n"                                              \
       ".asciz \"" #name "\"\n"                                              \
-      ".asciz \"8@%%rdi 8@%%rsi 8@%%rdx\"\n"                                \
+      ".asciz \"" PERFAGENT_USDT_ARGSPEC "\"\n"                              \
       "994: .balign 4\n"                                                    \
       ".popsection\n"                                                       \
       :: "r"(_a0), "r"(_a1), "r"(_a2) : "memory");                          \

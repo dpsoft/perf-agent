@@ -28,6 +28,7 @@
 #include "usdt_probe.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,11 +41,11 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#if !defined(__x86_64__)
+#if !defined(__x86_64__) && !defined(__aarch64__)
 int main() {
-    // The probe macro binds rdi/rsi/rdx by name, so this test is as
+    // This test checks where the probe's arguments actually land, so it is as
     // architecture-specific as the ABI it checks.
-    fprintf(stderr, "probe_args_test: skipped, not x86-64\n");
+    fprintf(stderr, "probe_args_test: skipped, unsupported architecture\n");
     return 0;
 }
 #else
@@ -54,6 +55,51 @@ int main() {
 #endif
 
 #include <ucontext.h>
+
+// The probe site is a single nop that this test patches into a breakpoint, so
+// it can read the argument registers out of the trapped context and compare
+// them against what it passed. That is the whole point: it checks where the
+// arguments ACTUALLY are, not merely that the file compiled.
+//
+// Two things differ per architecture and the second one bites.
+//
+//   - The encodings. x86-64's int3 is one byte; aarch64's BRK #0 is a
+//     four-byte instruction and the nop it replaces is four bytes too.
+//   - Where the trap leaves the program counter. int3 leaves %rip AFTER the
+//     patched byte, which is exactly where the nop would have left it, so
+//     returning from the handler resumes correctly with nothing to fix up.
+//     BRK leaves PC ON the instruction, so a handler that returns without
+//     advancing it re-traps forever. See advance_pc below -- getting this
+//     wrong hangs rather than fails, which is why main() arms an alarm.
+#if defined(__x86_64__)
+typedef uint8_t probe_insn_t;
+static const probe_insn_t kProbeNop = 0x90;        // nop
+static const probe_insn_t kProbeTrap = 0xCC;       // int3
+static inline unsigned long trap_arg0(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.gregs[REG_RDI];
+}
+static inline unsigned long trap_arg1(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.gregs[REG_RSI];
+}
+static inline unsigned long trap_arg2(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.gregs[REG_RDX];
+}
+static inline void advance_pc(ucontext_t *) { /* int3 already did */ }
+#else
+typedef uint32_t probe_insn_t;
+static const probe_insn_t kProbeNop = 0xD503201Fu;  // nop
+static const probe_insn_t kProbeTrap = 0xD4200000u; // brk #0
+static inline unsigned long trap_arg0(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.regs[0];
+}
+static inline unsigned long trap_arg1(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.regs[1];
+}
+static inline unsigned long trap_arg2(ucontext_t *uc) {
+    return (unsigned long)uc->uc_mcontext.regs[2];
+}
+static inline void advance_pc(ucontext_t *uc) { uc->uc_mcontext.pc += 4; }
+#endif
 
 PERFAGENT_USDT_EMITTER(gpu_launch_sampled_v1, 56);
 
@@ -70,12 +116,10 @@ static unsigned long g_count, g_seq;
 
 static void on_trap(int, siginfo_t *, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    // int3 leaves %rip after the patched byte, which is where the nop would
-    // have left it, so returning from the handler resumes correctly with no
-    // single-stepping and no need to restore the original byte.
-    const void *ptr = (const void *)uc->uc_mcontext.gregs[REG_RDI];
-    g_count = (unsigned long)uc->uc_mcontext.gregs[REG_RSI];
-    g_seq = (unsigned long)uc->uc_mcontext.gregs[REG_RDX];
+    const void *ptr = (const void *)trap_arg0(uc);
+    g_count = trap_arg1(uc);
+    g_seq = trap_arg2(uc);
+    advance_pc(uc);
     memcpy(&g_seen, ptr, sizeof(g_seen));
     g_fired = 1;
 }
@@ -175,15 +219,47 @@ int main() {
     sigemptyset(&sa.sa_mask);
     assert(sigaction(SIGTRAP, &sa, nullptr) == 0);
 
-    // Become the uprobe: replace the one-byte nop with int3. The mapping is
+    // Become the uprobe: replace the nop with a breakpoint. The mapping is
     // private, so this is a copy-on-write of our own text and affects nothing
     // else on the system.
+    //
+    // Protect exactly the pages the instruction spans -- normally one, two
+    // only if it straddles a boundary. An earlier version took two pages
+    // unconditionally, which works until the probe sits near the end of its
+    // text mapping and the second page is not mapped at all: mprotect then
+    // fails ENOMEM. That is layout-dependent rather than arch-dependent, and
+    // aarch64 is simply where this repo's layout hit it first.
     const long pagesize = sysconf(_SC_PAGESIZE);
-    void *page = (void *)(probe & ~(uintptr_t)(pagesize - 1));
-    assert(mprotect(page, (size_t)pagesize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0);
-    assert(*(volatile uint8_t *)probe == 0x90 && "probe site is not the expected nop");
-    *(volatile uint8_t *)probe = 0xCC;
-    assert(mprotect(page, (size_t)pagesize * 2, PROT_READ | PROT_EXEC) == 0);
+    const uintptr_t lo = probe & ~(uintptr_t)(pagesize - 1);
+    const uintptr_t hi = ((probe + sizeof(probe_insn_t) - 1) &
+                          ~(uintptr_t)(pagesize - 1)) + (uintptr_t)pagesize;
+    void *page = (void *)lo;
+    const size_t protlen = (size_t)(hi - lo);
+    if (mprotect(page, protlen, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        // errno, because a bare assert here says only that something went
+        // wrong with memory protection -- ENOMEM (range not mapped) and
+        // EACCES (kernel refuses W|X) want completely different fixes.
+        fprintf(stderr,
+                "probe_args_test: mprotect(%p, %zu, RWX) failed: %s\n"
+                "  probe=%#lx pagesize=%ld insn=%zu\n",
+                page, protlen, strerror(errno),
+                (unsigned long)probe, pagesize, sizeof(probe_insn_t));
+        return 1;
+    }
+    assert(*(volatile probe_insn_t *)probe == kProbeNop &&
+           "probe site is not the expected nop");
+    *(volatile probe_insn_t *)probe = kProbeTrap;
+    // Writing an instruction through the data path leaves the instruction
+    // cache holding the old one. x86-64 keeps them coherent; aarch64 does
+    // not, and without this the trap simply never fires.
+    __builtin___clear_cache((char *)probe, (char *)probe + sizeof(probe_insn_t));
+    assert(mprotect(page, protlen, PROT_READ | PROT_EXEC) == 0);
+
+    // A watchdog, because the interesting failure here does not return.
+    // If advance_pc is wrong on this architecture the handler re-traps on the
+    // same instruction forever, and a hung CI job says far less than a failed
+    // assertion does.
+    alarm(10);
 
     // Arm the semaphore, the way an attaching consumer does.
     perfagent_gpu_launch_sampled_v1_semaphore = 1;
@@ -191,8 +267,8 @@ int main() {
     const uint32_t tid = fill_and_fire();
 
     assert(g_fired && "the probe never fired");
-    assert(g_count == 1 && "the probe's count argument (%rsi) did not arrive");
-    assert(g_seq == 7 && "the probe's seq argument (%rdx) did not arrive");
+    assert(g_count == 1 && "the probe's count argument (2nd register) did not arrive");
+    assert(g_seq == 7 && "the probe's seq argument (3rd register) did not arrive");
 
     // Every field, because a partial store elision is as wrong as a total
     // one and the failing one was the second to last.

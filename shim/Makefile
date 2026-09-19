@@ -14,7 +14,34 @@ CC ?= cc
 # GCC's TSan runtime is not installed on the reference machine; clang++ is the
 # one that links -fsanitize=thread here.
 TSAN_CXX ?= clang++
-# -mtls-dialect=gnu on EVERY build, not only the portable one.
+# The two values that differ per architecture, defined ONCE.
+#
+# They were previously spelled out in four places -- CXXFLAGS here,
+# nvidia-portable below, and twice inline in .github/workflows/ci.yml -- each
+# hardcoding x86. Divergence between those copies is invisible until a shim is
+# built with the wrong TLS dialect and fails to dlopen, which is exactly the
+# failure #121 was: an unloadable artifact that passed every check.
+#
+# TLS_DIALECT selects TRADITIONAL TLS over TLS-descriptors. The two
+# architectures name the same choice differently and the values are not
+# interchangeable -- g++ rejects the other one outright, which is how the
+# arm64 image build failed the first time it ran.
+#
+# CUDA_TARGET is NVIDIA's own directory name, which matches neither uname nor
+# Debian's arch: x86_64-linux, and sbsa-linux for server-class ARM (the
+# Grace/Graviton tree, not Jetson's aarch64-linux).
+BUILD_ARCH := $(shell uname -m)
+ifeq ($(BUILD_ARCH),x86_64)
+  TLS_DIALECT ?= gnu
+  CUDA_TARGET ?= x86_64-linux
+else ifeq ($(BUILD_ARCH),aarch64)
+  TLS_DIALECT ?= trad
+  CUDA_TARGET ?= sbsa-linux
+else
+  $(error no TLS dialect or CUDA target directory known for $(BUILD_ARCH))
+endif
+
+# -mtls-dialect on EVERY build, not only the portable one.
 #
 # It removes GLIBC_ABI_GNU2_TLS, a marker satisfied only by glibc 2.42 however
 # low the numeric requirements are. It is not a GCC default -- it is a distro
@@ -26,13 +53,13 @@ TSAN_CXX ?= clang++
 # the local build now carries the same TLS dialect as the artifact, so a
 # developer's shim behaves like the shipped one instead of differing in the one
 # property that made the shipped one fail.
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden -mtls-dialect=gnu -I core
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden -mtls-dialect=$(TLS_DIALECT) -I core
 
 # The CUDA toolkit is not a build dependency of perf-agent: only the `nvidia`
 # targets need it, and they are not reachable from `all` or `test`.
 CUDA_HOME ?= /usr/local/cuda-13.3
-CUDA_INC := $(CUDA_HOME)/targets/x86_64-linux/include
-CUDA_LIB := $(CUDA_HOME)/targets/x86_64-linux/lib
+CUDA_INC := $(CUDA_HOME)/targets/$(CUDA_TARGET)/include
+CUDA_LIB := $(CUDA_HOME)/targets/$(CUDA_TARGET)/lib
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 # sm_86 is the RTX 3090 this adapter was proven on.
 CUDA_ARCH ?= sm_86
@@ -206,15 +233,21 @@ libperfagent-gpu-stub.so: CXXFLAGS += -g -fno-omit-frame-pointer -fasynchronous-
 PORTABLE_IMAGE ?= ubuntu:22.04
 PORTABLE_GLIBC ?= 2.34
 
+# CONTAINER, because CI has docker and a workstation has podman, and the one
+# thing that must NOT differ between them is the compile command below. Before
+# this, CI carried its own copy of that command -- which is how it came to
+# hardcode a TLS dialect that does not exist on aarch64.
+CONTAINER ?= podman
+
 nvidia-portable: check-cupti-guard
-	podman run --rm --security-opt label=disable \
+	$(CONTAINER) run --rm --security-opt label=disable \
 		-v $(CURDIR)/..:/src:ro -v $(CUDA_HOME):/cuda:ro -v $(CURDIR):/out \
 		$(PORTABLE_IMAGE) sh -c '\
 		  export DEBIAN_FRONTEND=noninteractive; \
 		  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq g++ >/dev/null 2>&1; \
 		  cd /src/shim && \
 		  g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
-		      -mtls-dialect=gnu -pthread -I core -I /cuda/targets/x86_64-linux/include \
+		      -mtls-dialect=$(TLS_DIALECT) -pthread -I core -I /cuda/targets/$(CUDA_TARGET)/include \
 		      -shared -o /out/libperfagent-gpu-nvidia.portable.so \
 		      nvidia/cupti_adapter.cc $(CORE_SRC) \
 		      -Wl,--version-script=nvidia/export.map \

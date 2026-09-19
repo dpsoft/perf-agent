@@ -40,11 +40,26 @@ maxver() {
 # GLIBC_ABI_GNU2_TLS is not a version, it is a marker, and it is the one that
 # actually broke us: it is satisfied only by glibc 2.42+ regardless of every
 # numeric requirement being far lower.
-if readelf -VW "$so" 2>/dev/null | grep -q 'GLIBC_ABI_GNU2_TLS'; then
-    bad "GLIBC_ABI_GNU2_TLS" "present — needs glibc 2.42+; build with -mtls-dialect=gnu"
-else
-    say "GLIBC_ABI_GNU2_TLS" "absent"
-fi
+#
+# It is an x86-64 marker. On any other architecture this grep finds nothing
+# because the string is never emitted there -- not because the object is
+# sound -- so reporting "absent" on aarch64 would be a check that cannot
+# fail, dressed as a check that passed. It says n/a instead, and the numeric
+# floor below carries the weight there: that check IS architecture-neutral,
+# and a TLS dialect that raised the requirement would show up in it.
+so_arch=$(readelf -hW "$so" 2>/dev/null | awk -F: '/Machine:/{print $2}' | tr -d ' ')
+case "$so_arch" in
+    *X86-64*|*x86-64*)
+        if readelf -VW "$so" 2>/dev/null | grep -q 'GLIBC_ABI_GNU2_TLS'; then
+            bad "GLIBC_ABI_GNU2_TLS" "present — needs glibc 2.42+; build with -mtls-dialect=gnu"
+        else
+            say "GLIBC_ABI_GNU2_TLS" "absent"
+        fi
+        ;;
+    *)
+        say "GLIBC_ABI_GNU2_TLS" "n/a (x86-64 marker; this object is $so_arch)"
+        ;;
+esac
 
 g=$(maxver GLIBC)
 if [ -n "$g" ] && [ "$(printf '%s\n%s\n' "$g" "$max_glibc" | sort -V | tail -1)" != "$max_glibc" ]; then

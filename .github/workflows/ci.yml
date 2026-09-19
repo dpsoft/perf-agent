@@ -410,15 +410,15 @@ jobs:
               apt-get update -qq >/dev/null
               apt-get install -y -qq gcc >/dev/null
               gcc -o /tmp/t /w/tryload.c
-              /tmp/t /w/libperfagent-gpu-nvidia.portable.so' || exit 1
+              /tmp/t /w/shim/libperfagent-gpu-nvidia.portable.so' || exit 1
           done
           rm -f tryload.c
 
       - name: Upload the portable shim
         uses: actions/upload-artifact@v4
         with:
-          name: libperfagent-gpu-nvidia.so
-          path: libperfagent-gpu-nvidia.portable.so
+          name: libperfagent-gpu-nvidia.so-${{ matrix.arch }}
+          path: shim/libperfagent-gpu-nvidia.portable.so
           retention-days: 30
 
   integration-tests:

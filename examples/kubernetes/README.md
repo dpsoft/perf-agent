@@ -18,16 +18,15 @@ flame graph.
 > before then, so `kubectl apply` on these manifests will fail to pull until
 > the first tag is cut.
 >
-> **The shim is published for amd64 only.** `shim/core/usdt_probe.h` binds its
-> probe arguments to `rdi`/`rsi`/`rdx` by name, so it does not compile on
-> aarch64 — a source portability gap, not a packaging one. GPU profiling is
-> therefore x86-64 only today, on a Grace-Hopper or other ARM GPU node
-> included. The agent image itself is multi-arch.
+> **Both images are multi-arch.** The shim's USDT probes bind to the first
+> three integer-argument registers of the platform ABI, arch-guarded since
+> #152, and `probe_args_test` proves that binding on a native arm64 runner by
+> trapping its own probe and reading the registers back — so aarch64 support
+> is measured rather than assumed.
 >
-> This matters more than an unsupported-platform note usually would: CUDA
-> injection **fails open and silent**, so an arm64 shim that compiled but bound
-> the wrong registers would produce an empty profile and no error anywhere.
-> Not shipping one is deliberate.
+> Still untested on ARM: the CUPTI integration itself, for want of an arm64
+> GPU node. That part is arch-independent C++ calling CUPTI APIs, not
+> register-level, but it has not been run.
 >
 > Both images carry the same tag deliberately: the shim's USDT record layouts
 > are frozen per version and the agent decodes them, so a mismatched pair is a

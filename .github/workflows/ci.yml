@@ -250,18 +250,10 @@ jobs:
       # kills file capabilities -- and both are caught by gates inside the
       # Dockerfiles. A workflow that only ran hadolint would pass while
       # shipping neither.
-      # amd64 only, still, but no longer because the source cannot build:
-      # usdt_probe.h is now arch-guarded and the shim-tests job above proves
-      # the aarch64 argument binding on a native runner. What remains is this
-      # job's own x86_64 hardcoding -- the CUDA keyring URL and include path --
-      # which is a packaging change and belongs in its own diff rather than
-      # riding along with an assembly port.
       - name: Build the shim image
-        if: matrix.arch == 'amd64'
         run: docker build -f Dockerfile.shim -t perf-agent-shim:ci .
 
       - name: The shim image carries a loadable shim
-        if: matrix.arch == 'amd64'
         # elfgate already ran inside the build; this checks the FILE made it
         # into the final stage, which a bad COPY would silently skip.
         run: |
@@ -329,8 +321,18 @@ jobs:
         run: make -C shim test
 
   shim:
-    name: GPU shim (portability gate)
-    runs-on: ubuntu-24.04
+    name: GPU shim (portability gate, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            cuda_repo: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            cuda_repo: sbsa
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -350,16 +352,18 @@ jobs:
       # only place it is stated.
       - name: Install CUPTI headers
         run: |
-          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -qO /tmp/keyring.deb \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i /tmp/keyring.deb
           sudo apt-get update -qq
           sudo apt-get install -y -qq cuda-cupti-dev-13-3 cuda-crt-13-3 cuda-cudart-dev-13-3
 
       - name: Build the shim and gate it
         run: |
-          make -C shim nvidia \
-            CUDA_HOME=/usr/local/cuda-13.3 \
-            CUDA_INC=/usr/local/cuda-13.3/targets/x86_64-linux/include
+          # CUDA_INC is NOT passed: the Makefile derives it from CUDA_HOME and
+          # the architecture, and passing it here is what let this job and the
+          # Makefile disagree about which target directory to use.
+          make -C shim nvidia CUDA_HOME=/usr/local/cuda-13.3
           # The ORDINARY build, which is for local work and does not claim to
           # be shippable: the runner's glibc is 2.39, and this target links
           # libstdc++ dynamically on purpose. So the floor and the libstdc++
@@ -373,22 +377,11 @@ jobs:
       # build fails to dlopen on Ubuntu 22.04, 24.04 and 25.04.
       - name: Build the portable shim and gate it at the real floor
         run: |
-          docker run --rm \
-            -v "$PWD":/src:ro -v /usr/local/cuda-13.3:/cuda:ro -v "$PWD":/out \
-            ubuntu:22.04 sh -c '
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq >/dev/null 2>&1
-              apt-get install -y -qq g++ >/dev/null 2>&1
-              cd /src/shim
-              g++ -std=c++17 -O2 -Wall -Wextra -fPIC -fvisibility=hidden \
-                  -mtls-dialect=gnu -pthread -I core -I /cuda/targets/x86_64-linux/include \
-                  -shared -o /out/libperfagent-gpu-nvidia.portable.so \
-                  nvidia/cupti_adapter.cc core/batch.cc core/clock.cc core/cubin.cc \
-                  core/cubinqueue.cc core/drain.cc core/enroll.cc core/sampler.cc \
-                  -Wl,--version-script=nvidia/export.map \
-                  -Wl,-soname,libperfagent-gpu-nvidia.so.1 \
-                  -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL'
-          ./shim/elfgate.sh libperfagent-gpu-nvidia.portable.so 2.34
+          # The Makefile target, not a copy of it. This job used to inline the
+          # compile command, which is how it came to hardcode a TLS dialect
+          # that does not exist on aarch64 while the Makefile said something
+          # else. One command, one place; CONTAINER because CI has docker.
+          make -C shim nvidia-portable CONTAINER=docker CUDA_HOME=/usr/local/cuda-13.3
 
       # Loading is the claim; assert it rather than infer it from the ELF.
       # Loading is the claim; assert it rather than infer it from the ELF.

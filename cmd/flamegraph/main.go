@@ -8,6 +8,15 @@
 //	flamegraph -o out.html profile.pb.gz
 //	flamegraph -folded profile.pb.gz          # the a;b;c 123 text form
 //
+// Two collectors, one picture:
+//
+//	flamegraph -fuse -o both.html \
+//	  -in 'cpu.pb.gz;leaf-first;[cpu] perf-agent 99 Hz' \
+//	  -in 'gpu.pb.gz;root-first;[gpu] per sampled launch'
+//
+// Each -in hangs under its own labelled root. The order is per-file
+// because the inputs need not agree -- see issue #155.
+//
 // Foreign profiles: perf-agent writes Sample.Location root-first, which is
 // the reverse of what the pprof proto specifies. -stack-order exists for
 // profiles from other producers; getting it wrong draws a plausible flame
@@ -18,6 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
@@ -36,13 +46,30 @@ func main() {
 				"nothing (an address, or the CUDA symbol server's obfuscated libfoo_<hex>). "+
 				"The profile always contains them either way; this decides what the PICTURE "+
 				"shows")
+		fuse = flag.Bool("fuse", false,
+			"draw several profiles as one graph, each under its own labelled root; "+
+				"repeat -in once per profile")
+		inputs fuseInputs
 	)
+	flag.Var(&inputs, "in",
+		"a profile to fuse, as path[;stack-order[;label]] (repeatable). "+
+			"stack-order defaults to root-first, label to the file's base name")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <profile.pb.gz>\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
+	if *fuse {
+		if flag.NArg() != 0 {
+			fatalf("-fuse takes its profiles via -in, not as positional arguments")
+		}
+		runFuse(inputs, *out, *title, *rawVendor)
+		return
+	}
+	if len(inputs) > 0 {
+		fatalf("-in is only meaningful with -fuse")
+	}
 	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(2)
@@ -70,6 +97,7 @@ func main() {
 	res, err := flamegraph.FromProfileFile(in, dst, flamegraph.Options{
 		Title:           *title,
 		RawVendorFrames: *rawVendor,
+		StackOrder:      order,
 	})
 	if err != nil {
 		fatalf("%v", err)
@@ -123,4 +151,52 @@ func report(dst string, res *foldedstacks.Result) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// fuseInputs collects repeated -in flags.
+//
+// The separator is ';' rather than ',' or ':' because a frame name may not
+// contain ';' -- the folded format has no escape for it, which is exactly
+// why foldedstacks substitutes it -- so a label can never be ambiguous.
+type fuseInputs []flamegraph.FuseFile
+
+func (f *fuseInputs) String() string { return fmt.Sprintf("%d profile(s)", len(*f)) }
+
+func (f *fuseInputs) Set(v string) error {
+	path, rest, _ := strings.Cut(v, ";")
+	if path == "" {
+		return fmt.Errorf("empty path in %q", v)
+	}
+	in := flamegraph.FuseFile{Path: path}
+
+	ord, label, _ := strings.Cut(rest, ";")
+	switch ord {
+	case "", "root-first":
+	case "leaf-first":
+		in.StackOrder = foldedstacks.LeafFirst
+	default:
+		return fmt.Errorf("unknown stack order %q: want root-first or leaf-first", ord)
+	}
+	in.Label = label
+
+	*f = append(*f, in)
+	return nil
+}
+
+func runFuse(inputs fuseInputs, out, title string, rawVendor bool) {
+	if len(inputs) < 2 {
+		fatalf("-fuse needs at least 2 profiles; pass -in once per profile (got %d)", len(inputs))
+	}
+	dst := out
+	if dst == "" {
+		dst = "fused.html"
+	}
+	res, err := flamegraph.FuseProfileFiles(inputs, dst, flamegraph.Options{
+		Title:           title,
+		RawVendorFrames: rawVendor,
+	})
+	if err != nil {
+		fatalf("%v", err)
+	}
+	report(dst, res)
 }

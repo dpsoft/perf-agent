@@ -101,7 +101,12 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     __u32 tgid = tgid_tid >> 32;
     __u32 tid  = (__u32)tgid_tid;
 
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // _btf, not bpf_get_current_task(): the latter returns an integer, and
+    // bpf_task_pt_regs() below takes ARG_PTR_TO_BTF_ID, which the verifier
+    // will not accept a scalar for. offcpu_dwarf.bpf.c gets its trusted
+    // task pointer from the tp_btf context; a perf_event program has to ask
+    // for one.
+    struct task_struct *task = bpf_get_current_task_btf();
     if (tgid == 0 || task == 0) return 0;
     if (BPF_CORE_READ(task, flags) & PF_KTHREAD) return 0;
 
@@ -118,12 +123,27 @@ int perf_dwarf(struct bpf_perf_event_data *ctx) {
     struct walk_persist *st = walk_state_get();
     if (!rec || !st) return 0;
 
-    // User registers. PT_REGS_* macros handle the arch-specific field names;
-    // &ctx->regs points at bpf_user_pt_regs_t, which the macros cast and read.
+    // User-space registers of the sampled task.
+    //
+    // NOT &ctx->regs. A perf_event program's ctx carries the registers at
+    // the instant the counter overflowed, and that instant is in the KERNEL
+    // whenever the task was inside a syscall -- so on a syscall-bound
+    // workload the "user" IP is a kernel address, the DWARF walk finds no
+    // user mapping to unwind through, and the whole user half of the stack
+    // is lost while the kernel half still symbolizes perfectly. Issue #156
+    // measured 1 of 51 on-CPU samples reaching userspace against 5 of 5 for
+    // the FP unwinder on the same workload.
+    //
+    // bpf_task_pt_regs() returns the task's user-mode pt_regs regardless of
+    // the mode the sample landed in, which is what offcpu_dwarf.bpf.c has
+    // always used -- and why off-CPU never had this bug.
+    struct pt_regs *uregs = (struct pt_regs *)bpf_task_pt_regs(task);  // trusted: see above
+    if (!uregs) return 0;
+
     unwind_walk_begin(st, rec, tgid, tid,
-                      (__u64)PT_REGS_IP(&ctx->regs),
-                      (__u64)PT_REGS_FP(&ctx->regs),
-                      (__u64)PT_REGS_SP(&ctx->regs));
+                      (__u64)PT_REGS_IP(uregs),
+                      (__u64)PT_REGS_FP(uregs),
+                      (__u64)PT_REGS_SP(uregs));
 
     perf_dwarf_walk(ctx, false);
     return 0;

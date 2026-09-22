@@ -212,7 +212,45 @@ jobs:
     # same step in tests.yml.
     - name: Run unit tests
       run: go test -v ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
-    
+
+    # gpuprobe was in no CI job at all, on either architecture, so
+    # TestStubDrivesThePipelineToPprofWithoutAGPU had never run here -- and
+    # it is the one test that drives the WHOLE GPU path without a GPU:
+    # probe fire, uprobe attach, BPF decode, join, pprof samples. A synthetic
+    # producer stands in for CUDA, so everything except CUPTI itself is
+    # exercised, on both architectures.
+    #
+    # sudo because the gate needs CAP_BPF, CAP_PERFMON and
+    # CAP_CHECKPOINT_RESTORE and skips without them -- which is exactly how
+    # it stayed invisible: a skip reads the same as a pass in a green run.
+    #
+    # It also covers the aarch64 DWARF walker. The gate deliberately drives
+    # the frame-pointer-LESS producer, whose bridge frames a saved-RBP walk
+    # provably cannot reach, so the unwinder has something real to bite on
+    # rather than a stack it could have guessed.
+    - name: "Run the GPU pipeline gate (no GPU required)"
+      run: |
+        # sudo because the gate needs CAP_BPF, CAP_PERFMON and
+        # CAP_CHECKPOINT_RESTORE. PATH is preserved so sudo finds the Go that
+        # actions/setup-go installed; blazesym is already in /usr/local, which
+        # is why no CGO_* flags are needed here any more than in the step above.
+        sudo env PATH="$PATH" LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+          "$(command -v go)" test -v -timeout 10m ./gpuprobe/... 2>&1 | tee /tmp/gpuprobe.log
+        # The pipe means $? is tee's, so ask the test's own status.
+        test "${PIPESTATUS[0]}" -eq 0 || exit 1
+
+        # A skip and a pass are the same colour in a green run, and this gate
+        # spent its entire life skipping: gpuprobe was in no CI job at all, so
+        # nobody saw it. Assert it actually ran.
+        if grep -q '^--- SKIP: TestStubDrivesThePipelineToPprofWithoutAGPU' /tmp/gpuprobe.log; then
+          echo "::error::the GPU pipeline gate SKIPPED; it is covering nothing"
+          grep -A3 'SKIP: TestStubDrives' /tmp/gpuprobe.log
+          exit 1
+        fi
+        grep -q '^--- PASS: TestStubDrivesThePipelineToPprofWithoutAGPU' /tmp/gpuprobe.log \
+          || { echo "::error::the gate neither passed nor skipped -- did it get renamed?"; exit 1; }
+        echo "the GPU pipeline gate ran and passed"
+
     - name: Build test workloads
       run: |
         cd test/workloads/go

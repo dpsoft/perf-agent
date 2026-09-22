@@ -12,6 +12,11 @@ import (
 	"github.com/google/pprof/profile"
 )
 
+// kernelMapping is the sentinel mapping perf-agent routes kernel frames
+// through. It is the only channel that identifies a kernel frame from the
+// profile itself rather than by guessing at a symbol name.
+const kernelMapping = "[kernel]"
+
 // sampleReachesUserspace reports whether a sample has at least one frame
 // from a user mapping. A kernel address is not userspace however well it
 // symbolizes, which is the whole point of issue #156.
@@ -117,8 +122,21 @@ func TestDwarfKeepsUserspaceOnSyscallBoundWorkload(t *testing.T) {
 // Nothing compared the two, so the divergence was invisible: each profile is
 // internally consistent and only a cross-check can see it.
 //
-// The assertion is on the OUTERMOST frame, because that is what an order
-// mistake moves. Both unwinders must place a process entry point there.
+// The assertion is that no sample's OUTERMOST frame lies in the kernel. A
+// user task's stack cannot BEGIN in the kernel -- userspace calls in, never
+// the reverse -- so a kernel-mapped root is proof the stack is stored the
+// wrong way round. perf-agent routes kernel frames through a "[kernel]"
+// sentinel mapping, so this reads the mapping rather than guessing from
+// symbol names.
+//
+// Earlier drafts of this test asserted that a majority of samples root at a
+// known entry point, which was both too weak and too brittle: too weak
+// because "at least one" passes on a wholly reversed profile, and too
+// brittle because the set of legitimate Go roots is open-ended --
+// runtime.goexit, runtime.mcall, runtime.systemstack and runtime.morestack
+// all switch stacks, and a walk cannot cross a stack switch. Chasing that
+// list failed on arm64 CI against the FP unwinder, which was never wrong.
+// The kernel-root invariant needs no such list and admits no threshold.
 func TestUnwindersAgreeOnStackOrder(t *testing.T) {
 	requireBPFRunnable(t, getAgentPath(t))
 
@@ -126,72 +144,40 @@ func TestUnwindersAgreeOnStackOrder(t *testing.T) {
 	defer cleanup()
 
 	const window = 5 * time.Second
-	outermost := func(p *profile.Profile) map[string]int {
-		got := map[string]int{}
+	for _, unwind := range []string{"fp", "dwarf"} {
+		p := captureCPU(t, cmd.Process.Pid, unwind, window)
+		if len(p.Sample) == 0 {
+			t.Skipf("--unwind %s: no samples; nothing to assert", unwind)
+		}
+
+		roots := map[string]int{}
+		var kernelRooted int
+		var example *profile.Sample
 		for _, s := range p.Sample {
 			if len(s.Location) == 0 {
 				continue
 			}
-			// Root-first is this repo's convention: Location[0] is outermost.
-			loc := s.Location[0]
-			if len(loc.Line) == 0 || loc.Line[0].Function == nil {
-				got["<unsymbolized>"]++
-				continue
+			file := "<no mapping>"
+			if m := s.Location[0].Mapping; m != nil {
+				file = m.File
 			}
-			got[loc.Line[0].Function.Name]++
+			roots[file]++
+			if file == kernelMapping {
+				kernelRooted++
+				if example == nil {
+					example = s
+				}
+			}
 		}
-		return got
-	}
-	// Strictly the frames a thread can actually START at. An earlier version
-	// of this test accepted any "runtime." prefix, which a Go workload also
-	// has at its LEAVES (runtime.epollwait, runtime.futex...) -- so
-	// leaf-first stacks scored hits and the test passed on a binary with
-	// issue #155 still in it.
-	isEntryPoint := func(n string) bool {
-		switch n {
-		// Thread and goroutine roots.
-		case "_start", "runtime.goexit", "runtime.mstart", "runtime.rt0_go", "main":
-			return true
-		// g0-stack roots. runtime.mcall and runtime.systemstack switch stacks,
-		// and no unwinder can walk across the switch -- so when a sample lands
-		// on the g0 stack these ARE the outermost visible frame, not evidence
-		// of a reversed profile. Measured on arm64 CI: goexit 7, systemstack 5,
-		// mcall 3 out of 15 samples, all three correct.
-		case "runtime.mcall", "runtime.systemstack":
-			return true
-		}
-		return strings.HasPrefix(n, "__libc_start")
-	}
 
-	for _, unwind := range []string{"fp", "dwarf"} {
-		p := captureCPU(t, cmd.Process.Pid, unwind, window)
-		roots := outermost(p)
-		if len(roots) == 0 {
-			t.Skipf("no samples from --unwind %s; nothing to assert", unwind)
+		if kernelRooted > 0 {
+			t.Errorf("--unwind %s: %d of %d samples have a KERNEL frame as their outermost "+
+				"location, which a user task's stack can never have -- the profile is stored "+
+				"leaf-first while this repo's consumers read root-first (issue #155).\n"+
+				"  root mappings: %v\n  one such stack, as stored:\n%s",
+				unwind, kernelRooted, len(p.Sample), roots, renderSample(example))
+			continue
 		}
-		var entry, other int
-		for n, c := range roots {
-			if isEntryPoint(n) {
-				entry += c
-			} else {
-				other += c
-			}
-		}
-		// A PROPORTION, not "at least one". An existence check is what let
-		// TestKernelStackResolution sit green through issue #156 for as long
-		// as it did: a handful of samples can root correctly by accident
-		// while the profile as a whole is stored the wrong way round.
-		const floor = 0.5
-		total := entry + other
-		if total == 0 {
-			t.Skipf("--unwind %s: no usable samples; nothing to assert", unwind)
-		}
-		if got := float64(entry) / float64(total); got < floor {
-			t.Fatalf("--unwind %s: only %d of %d samples (%.0f%%) have a process entry point as "+
-				"their OUTERMOST frame, want >= %.0f%%; the profile is stored leaf-first while "+
-				"this repo's consumers read root-first (issue #155). outermost frames seen: %v",
-				unwind, entry, total, got*100, floor*100, roots)
-		}
-		t.Logf("%s: %d of %d samples root at an entry point", unwind, entry, total)
+		t.Logf("%s: %d samples, every one rooted in a user mapping %v", unwind, len(p.Sample), roots)
 	}
 }

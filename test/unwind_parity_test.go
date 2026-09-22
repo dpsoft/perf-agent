@@ -12,6 +12,42 @@ import (
 	"github.com/google/pprof/profile"
 )
 
+// sampleReachesUserspace reports whether a sample has at least one frame
+// from a user mapping. A kernel address is not userspace however well it
+// symbolizes, which is the whole point of issue #156.
+func sampleReachesUserspace(s *profile.Sample) bool {
+	for _, loc := range s.Location {
+		for _, ln := range loc.Line {
+			if ln.Function == nil {
+				continue
+			}
+			n := ln.Function.Name
+			if strings.HasPrefix(n, "main.") || strings.HasPrefix(n, "runtime.") ||
+				n == "main" || n == "_start" || strings.HasPrefix(n, "__libc_start") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// userspaceReach is the fraction of samples whose stack reaches userspace.
+//
+// A fraction, not a boolean. The pre-existing TestKernelStackResolution
+// asserts only that SOME user frame exists anywhere in the profile, and
+// retries until it finds one -- so it passed throughout issue #156, when
+// measurement showed 1 sample in 51 reaching userspace. An assertion that
+// cannot fail is not covering anything.
+func userspaceReach(p *profile.Profile) (reached, total int) {
+	for _, s := range p.Sample {
+		total++
+		if sampleReachesUserspace(s) {
+			reached++
+		}
+	}
+	return reached, total
+}
+
 func captureCPU(t *testing.T, pid int, unwind string, window time.Duration) *profile.Profile {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "cpu-"+unwind+".pb.gz")
@@ -32,6 +68,45 @@ func captureCPU(t *testing.T, pid int, unwind string, window time.Duration) *pro
 		t.Fatalf("read %s profile: %v", unwind, err)
 	}
 	return p
+}
+
+// TestDwarfKeepsUserspaceOnSyscallBoundWorkload is the regression test for
+// issue #156.
+//
+// A perf_event program's ctx holds the registers at the instant the counter
+// overflowed. On a syscall-bound workload that instant is usually inside the
+// kernel, so unwinding the "user" stack from ctx->regs starts at a kernel IP,
+// finds no user mapping, and yields nothing -- while the kernel half still
+// symbolizes perfectly, which is what made the profile look healthy.
+// bpf_task_pt_regs() returns the task's user-mode registers whatever mode the
+// sample landed in.
+//
+// The workload is deliberately I/O bound: a CPU-bound one samples in user
+// mode almost every time and cannot distinguish the two register sources.
+func TestDwarfKeepsUserspaceOnSyscallBoundWorkload(t *testing.T) {
+	requireBPFRunnable(t, getAgentPath(t))
+
+	cmd, cleanup := spawnIoBoundWorkload(t)
+	defer cleanup()
+
+	const window = 5 * time.Second
+	p := captureCPU(t, cmd.Process.Pid, "dwarf", window)
+
+	reached, total := userspaceReach(p)
+	if total == 0 {
+		t.Skipf("no samples in %s; nothing to assert", window)
+	}
+	// Some samples legitimately have no user half -- a task can be sampled
+	// deep in kernel work with no user frame worth naming. The defect was a
+	// near-total loss, so the bar is a clear majority rather than perfection.
+	const floor = 0.5
+	if got := float64(reached) / float64(total); got < floor {
+		t.Fatalf("only %d of %d DWARF samples (%.0f%%) reach userspace, want >= %.0f%%; "+
+			"issue #156: the user walk is starting from kernel registers. %s",
+			reached, total, got*100, floor*100, describeProfile(p))
+	}
+	t.Logf("dwarf: %d of %d samples (%.0f%%) reach userspace", reached, total,
+		float64(reached)/float64(total)*100)
 }
 
 // TestUnwindersAgreeOnStackOrder is the regression test for issue #155.

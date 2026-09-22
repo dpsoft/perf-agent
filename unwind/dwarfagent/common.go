@@ -428,7 +428,7 @@ func (s *session) stashKernelStack(key sampleKey, kernelIPs []uint64) {
 // Kernel frames (if --kernel-stacks is on and the stack-ID was valid
 // when consumeRingbuf ran) are symbolized via s.kernelSymbolizer and
 // merged leaf-first with the user frames — matching the FP profiler's
-// shape so pprof Reverse() yields root→kernel→user.
+// shape, so the pprof.Reverse() below yields root→kernel→user.
 func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate int) error {
 	s.mu.Lock()
 	samples := make(map[sampleKey]uint64, len(s.samples))
@@ -467,6 +467,14 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 			s.resolver.Refresh(key.pid)
 		}
 		frames := symbolizePIDWithKernel(s.symbolizer, s.kernelSymbolizer, key.pid, stacks[key], kernStacks[key])
+		// Leaf-first up to here, like the FP profiler's builder. Reverse to
+		// outermost-first, which is what every other producer in this repo
+		// writes and what internal/foldedstacks assumes. Issue #155: this
+		// call was described in the comment above and in symbolize.go but
+		// never made, so the default unwinder wrote profiles in the opposite
+		// order to the FP, off-CPU-FP and GPU builders -- and a flame graph
+		// drawn from one came out upside down without any error.
+		pprof.Reverse(frames)
 		sample := pprof.ProfileSample{
 			Pid:         key.pid,
 			SampleType:  sampleType,

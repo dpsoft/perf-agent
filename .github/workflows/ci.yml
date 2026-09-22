@@ -210,8 +210,17 @@ jobs:
     
     # ./pyunwind/... is here because it was in no CI job before; see the
     # same step in tests.yml.
+      # ./... and not a list. An enumerated list silently excludes every
+      # package added after it was written, and it had: 28 packages with
+      # tests -- internal/flamegraph, symbolize, pprof, perfagent, most of
+      # unwind/, gpuprobe -- were in no CI job at all, so their tests had
+      # never run here. The whole main-module suite is 10s; there was never a
+      # cost reason for the list.
+      #
+      # The integration job's `cd test && go test ./...` does NOT cover these:
+      # test/ is a separate module.
     - name: Run unit tests
-      run: go test -v ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
+      run: go test -v ./...
 
     # gpuprobe was in no CI job at all, on either architecture, so
     # TestStubDrivesThePipelineToPprofWithoutAGPU had never run here -- and

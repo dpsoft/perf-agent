@@ -149,7 +149,15 @@ func TestUnwindersAgreeOnStackOrder(t *testing.T) {
 	// issue #155 still in it.
 	isEntryPoint := func(n string) bool {
 		switch n {
+		// Thread and goroutine roots.
 		case "_start", "runtime.goexit", "runtime.mstart", "runtime.rt0_go", "main":
+			return true
+		// g0-stack roots. runtime.mcall and runtime.systemstack switch stacks,
+		// and no unwinder can walk across the switch -- so when a sample lands
+		// on the g0 stack these ARE the outermost visible frame, not evidence
+		// of a reversed profile. Measured on arm64 CI: goexit 7, systemstack 5,
+		// mcall 3 out of 15 samples, all three correct.
+		case "runtime.mcall", "runtime.systemstack":
 			return true
 		}
 		return strings.HasPrefix(n, "__libc_start")

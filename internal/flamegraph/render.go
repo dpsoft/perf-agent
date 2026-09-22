@@ -92,6 +92,13 @@ type Options struct {
 	// runs whose names say nothing. The profile contains them either way --
 	// this only decides what the picture shows. See foldedstacks.
 	RawVendorFrames bool
+	// StackOrder is how the profile stores Sample.Location. The zero value
+	// is RootFirst, which is what this repo's FP, off-CPU and GPU builders
+	// write. It is an option rather than an assumption because getting it
+	// wrong does not fail -- it draws a plausible flame graph upside down
+	// (issue #155), and because foreign profiles follow the pprof proto and
+	// are leaf-first.
+	StackOrder foldedstacks.StackOrder
 }
 
 // MetaItem is one provenance item.

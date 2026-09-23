@@ -1889,7 +1889,6 @@ func TestPerfDataOutput(t *testing.T) {
 //   - at least one user-side function (main.* or runtime.*) appears in the pprof
 //   - when kptr_restrict=0, at least one resolved kernel symbol also appears
 func TestKernelStackResolution(t *testing.T) {
-	t.Helper()
 	requireBPFRunnable(t, getAgentPath(t))
 
 	bin := getAgentPath(t)
@@ -1900,33 +1899,20 @@ func TestKernelStackResolution(t *testing.T) {
 
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 
-	// The io_bound workload is only on-CPU in user space in short
-	// bursts between blocking I/O, so a single fixed 3s window at 99 Hz
-	// can legitimately capture zero samples, or samples whose every
-	// frame is kernel-side. Issue #42 saw both, on the same commit.
-	// Collect until the profile is one the assertions below can speak
-	// to, with a deadline; a profiler that has genuinely stopped
-	// producing user frames still fails, at the deadline, with the
-	// frame split printed.
-	kernelRe := regexp.MustCompile(`^(do_sys_|ksys_|__x64_sys_|vfs_|__schedule|read_|sock_|tcp_)`)
-	hasUserFn := func(p *profile.Profile) bool {
-		return hasFunctionContaining(p, "main.", "runtime.")
-	}
-	hasKernelFn := func(p *profile.Profile) bool {
-		for _, fn := range p.Function {
-			if kernelRe.MatchString(fn.Name) {
-				return true
-			}
-		}
-		return false
-	}
-
-	what := "a kernel-stacks profile containing at least one user-side (main.*/runtime.*) frame"
-	if kptrZero {
-		what += " and at least one resolved kernel symbol"
-	}
-
+	// The io_bound workload is only on-CPU in user space in short bursts
+	// between blocking I/O, so a single fixed 3s window at 99 Hz can
+	// legitimately capture zero samples. Issue #42. Collect until there is
+	// enough DATA to judge, with a deadline.
+	//
+	// The loop condition is a data-sufficiency precondition, NOT the
+	// assertion: it waits for samples and for kernel frames to exist, then
+	// the assertions below run once and are allowed to fail. Retrying until
+	// the assertion itself passes is what made the previous version of this
+	// test unfalsifiable -- it asked only whether SOME user-side function
+	// appeared anywhere in the profile, which one sample in fifty satisfies,
+	// and so it stayed green through the whole life of issue #156.
 	const window = 3 * time.Second
+	what := "a kernel-stacks profile with samples and at least one kernel frame"
 	p, collected, report := collectProfileUntil(t, what, window,
 		func(int) (*profile.Profile, error) {
 			requireWorkloadAlive(t, cmd, "go/io_bound")
@@ -1945,34 +1931,45 @@ func TestKernelStackResolution(t *testing.T) {
 			return readProfile(out)
 		},
 		func(p *profile.Profile) bool {
-			return len(p.Sample) > 0 && hasUserFn(p) && (!kptrZero || hasKernelFn(p))
+			_, kernelFrames := kernelFrameResolution(p)
+			return len(p.Sample) > 0 && kernelFrames > 0
 		})
 
-	got := map[string]bool{}
-	if p != nil {
-		for _, fn := range p.Function {
-			got[fn.Name] = true
-		}
-	}
 	if !collected {
-		t.Fatalf("%s\n  functions in the last capture: %v", report, sortedKeys(got))
+		t.Fatalf("%s\n  last capture: %s", report, describeProfile(p))
 	}
 
-	// Always assert at least one user-side function from io_bound appears.
-	if !hasUserFn(p) {
-		t.Fatalf("no user-side function in profile; %s; got: %v", describeProfile(p), sortedKeys(got))
+	// 1. The user half must survive. A kernel stack detached from its user
+	//    caller is issue #156's signature, and it is invisible to an
+	//    existence check because a handful of samples always get through.
+	reached, total := samplesReachingUserspace(p)
+	const userFloor = 0.5
+	if got := float64(reached) / float64(total); got < userFloor {
+		t.Errorf("only %d of %d samples (%.0f%%) have a frame in a real mapping, want >= %.0f%%; "+
+			"the kernel half is being captured without its user caller. %s",
+			reached, total, got*100, userFloor*100, describeProfile(p))
 	}
 
-	if kptrZero {
-		// Expect at least one resolved kernel symbol.
-		if !hasKernelFn(p) {
-			t.Fatalf("no resolved kernel symbol matched expected regex; %s; got: %v", describeProfile(p), sortedKeys(got))
-		}
-	} else {
-		// kptr_restrict != 0 → kernel frames may appear as raw 0xffff… names
-		// or may be absent entirely. Either is acceptable.
-		t.Logf("kptr_restrict != 0; not asserting kernel symbol resolution")
+	// 2. Kernel frames must actually resolve, not come back as bare
+	//    addresses. Only assertable when the addresses are visible at all.
+	resolved, kernelFrames := kernelFrameResolution(p)
+	if !kptrZero {
+		t.Logf("kptr_restrict != 0; kernel frames may be raw addresses (%d of %d resolved), not asserting",
+			resolved, kernelFrames)
+		return
 	}
+	// Bimodal: kallsyms readable resolves nearly everything, unreadable
+	// resolves nearly nothing. A few stay unresolved either way -- BPF
+	// programs and out-of-tree modules are not in kallsyms -- so the bar
+	// sits in the valley between the two modes.
+	const kernelFloor = 0.5
+	if got := float64(resolved) / float64(kernelFrames); got < kernelFloor {
+		t.Errorf("only %d of %d kernel frames (%.0f%%) carry a symbol, want >= %.0f%%; "+
+			"kallsyms is likely unreadable (needs CAP_SYSLOG) and is returning zeros. %s",
+			resolved, kernelFrames, got*100, kernelFloor*100, describeProfile(p))
+	}
+	t.Logf("%d of %d samples reach userspace; %d of %d kernel frames resolved",
+		reached, total, resolved, kernelFrames)
 }
 
 // TestPerfDataKernelMmap2 verifies the --perf-data-output path for kernel

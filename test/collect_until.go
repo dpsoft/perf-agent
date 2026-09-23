@@ -609,3 +609,62 @@ func profileTotalValue(p *profile.Profile) int64 {
 	}
 	return total
 }
+
+// kernelFrameResolution counts kernel-mapped frames and how many of them
+// carry a real symbol rather than a bare address.
+//
+// Kernel frames are identified by the "[kernel]" sentinel mapping, not by
+// guessing at symbol names: a name-shaped guess cannot tell an unresolved
+// kernel frame from an unresolved user one, and the difference is the whole
+// question when kallsyms is unreadable.
+//
+// The failure this measures is bimodal. When /proc/kallsyms is readable
+// essentially every kernel frame resolves; when it is not — no CAP_SYSLOG,
+// or kptr_restrict hiding the addresses — it reads as zeros and essentially
+// none do. A handful legitimately stay unresolved either way (BPF programs
+// and out-of-tree modules are not in kallsyms), so the useful assertion is
+// a proportion sitting in the wide valley between those two modes, not
+// perfection and not mere existence.
+func kernelFrameResolution(p *profile.Profile) (resolved, total int) {
+	if p == nil {
+		return 0, 0
+	}
+	for _, loc := range p.Location {
+		if loc.Mapping == nil || loc.Mapping.File != kernelMappingFile {
+			continue
+		}
+		total++
+		for _, ln := range loc.Line {
+			if ln.Function != nil && ln.Function.Name != "" &&
+				!strings.HasPrefix(ln.Function.Name, "0x") {
+				resolved++
+				break
+			}
+		}
+	}
+	return resolved, total
+}
+
+// samplesReachingUserspace counts samples with at least one frame in a real
+// (non-kernel, non-JIT) mapping, and the total considered.
+//
+// Per SAMPLE, deliberately. Asking whether a user function appears anywhere
+// in the profile is the question hasFunctionContaining answers, and it is
+// nearly unfalsifiable: one lucky sample out of hundreds satisfies it. Issue
+// #156 shipped for as long as it did because the only test in this area
+// asked that weaker question and retried until the answer was yes.
+func samplesReachingUserspace(p *profile.Profile) (reached, total int) {
+	if p == nil {
+		return 0, 0
+	}
+	for _, s := range p.Sample {
+		total++
+		for _, loc := range s.Location {
+			if loc.Mapping != nil && mappingClass(loc.Mapping) == "real" {
+				reached++
+				break
+			}
+		}
+	}
+	return reached, total
+}

@@ -12,11 +12,6 @@ import (
 	"github.com/google/pprof/profile"
 )
 
-// kernelMapping is the sentinel mapping perf-agent routes kernel frames
-// through. It is the only channel that identifies a kernel frame from the
-// profile itself rather than by guessing at a symbol name.
-const kernelMapping = "[kernel]"
-
 // sampleReachesUserspace reports whether a sample has at least one frame
 // from a user mapping. A kernel address is not userspace however well it
 // symbolizes, which is the whole point of issue #156.
@@ -162,7 +157,7 @@ func TestUnwindersAgreeOnStackOrder(t *testing.T) {
 				file = m.File
 			}
 			roots[file]++
-			if file == kernelMapping {
+			if file == kernelMappingFile {
 				kernelRooted++
 				if example == nil {
 					example = s

@@ -4,13 +4,51 @@ import "io"
 
 // PERF_RECORD_* constants (uapi/linux/perf_event.h).
 const (
-	recordMmap          = 1
-	recordComm          = 3
-	recordExit          = 4
-	recordSample        = 9
-	recordMmap2         = 10
-	recordFinishedRound = 12
+	recordMmap   = 1
+	recordComm   = 3
+	recordExit   = 4
+	recordSample = 9
+	recordMmap2  = 10
+	// recordFinishedRound is NOT a uapi type. perf's own user-space range
+	// starts at PERF_RECORD_USER_TYPE_START = 64 and FINISHED_ROUND is 68
+	// (tools/lib/perf/include/perf/event.h). This used to say 12, which is
+	// PERF_RECORD_ITRACE_START -- a kernel record whose payload is pid+tid
+	// plus a sample_id trailer, so a conforming reader handed an 8-byte
+	// "ITRACE_START" reads straight past the end of it.
+	recordFinishedRound = 68
 )
+
+// sampleIDSize is the size of the sample_id trailer that sample_id_all
+// appends to every KERNEL-generated non-SAMPLE record.
+//
+// The trailer carries the subset of sample_type that the ABI defines for
+// it -- TID, TIME, ID, STREAM_ID, CPU, IDENTIFIER, in that order -- and
+// nothing else. IP, PERIOD and CALLCHAIN are sample-only and never appear
+// here. For the sample_type this package writes
+// (IP|TID|TIME|CPU|PERIOD|CALLCHAIN) the trailer is therefore:
+//
+//	u32 pid, u32 tid   // PERF_SAMPLE_TID
+//	u64 time           // PERF_SAMPLE_TIME
+//	u32 cpu, u32 res   // PERF_SAMPLE_CPU
+//
+// Records in perf's own user-space range (>= 64: FINISHED_ROUND,
+// HEADER_BUILD_ID, ...) get no trailer, because the kernel never made them.
+const sampleIDSize = 8 + 8 + 8
+
+// writeSampleID emits the trailer described by sampleIDSize.
+//
+// Omitting it while the attr advertises sample_id_all is not a smaller file,
+// it is a corrupt one: a reader sizes each record from its header and then
+// takes the trailer off the tail, so with nothing there it consumes the next
+// record's bytes and desynchronises. That is what made create_llvm_prof
+// reject every profile this package wrote (#161).
+func writeSampleID(w io.Writer, pid, tid, cpu uint32, timeNs uint64) {
+	writeUint32LE(w, pid)
+	writeUint32LE(w, tid)
+	writeUint64LE(w, timeNs)
+	writeUint32LE(w, cpu)
+	writeUint32LE(w, 0) // res
+}
 
 // PERF_CONTEXT_* sentinel IPs used to separate kernel and user portions of a
 // callchain in PERF_RECORD_SAMPLE. Values match uapi/linux/perf_event.h.
@@ -28,6 +66,10 @@ type CommRecord struct {
 	Pid  uint32
 	Tid  uint32
 	Comm string
+	// Time and Cpu populate the sample_id trailer. Zero is what perf itself
+	// writes for records it synthesizes for state that predates the capture.
+	Time uint64
+	Cpu  uint32
 }
 
 // encodeComm writes a PERF_RECORD_COMM record (type 3). Layout:
@@ -38,13 +80,14 @@ type CommRecord struct {
 //	char comm[];                       // NUL-terminated, 8-byte padded
 func encodeComm(w io.Writer, r CommRecord) {
 	commBytes := align8(len(r.Comm) + 1) // NUL + padding
-	size := recordHeaderSize + 4 + 4 + commBytes
+	size := recordHeaderSize + 4 + 4 + commBytes + sampleIDSize
 	writeUint32LE(w, recordComm)
 	writeUint16LE(w, 0) // misc
 	writeUint16LE(w, uint16(size))
 	writeUint32LE(w, r.Pid)
 	writeUint32LE(w, r.Tid)
 	writeCStringPadded8(w, r.Comm)
+	writeSampleID(w, r.Pid, r.Tid, r.Cpu, r.Time)
 }
 
 // encodeFinishedRound writes a PERF_RECORD_FINISHED_ROUND record (type 12).
@@ -64,9 +107,12 @@ const miscMmapBuildID = 1 << 14
 // otherwise the maj/min/ino path is used (and all four fields stay zero).
 type Mmap2Record struct {
 	Pid, Tid uint32
-	Addr     uint64
-	Len      uint64
-	Pgoff    uint64
+	// Time and Cpu populate the sample_id trailer; see writeSampleID.
+	Time  uint64
+	Cpu   uint32
+	Addr  uint64
+	Len   uint64
+	Pgoff uint64
 
 	// union: build-id flavour
 	HasBuildID  bool
@@ -98,7 +144,7 @@ type Mmap2Record struct {
 //	char filename[];                  // NUL-terminated, 8-byte padded
 func encodeMmap2(w io.Writer, r Mmap2Record) {
 	filenameBytes := align8(len(r.Filename) + 1)
-	bodySize := 4 + 4 + 8 + 8 + 8 + 24 + 4 + 4 + filenameBytes
+	bodySize := 4 + 4 + 8 + 8 + 8 + 24 + 4 + 4 + filenameBytes + sampleIDSize
 	size := recordHeaderSize + bodySize
 	misc := uint16(0)
 	if r.HasBuildID {
@@ -127,6 +173,7 @@ func encodeMmap2(w io.Writer, r Mmap2Record) {
 	writeUint32LE(w, r.Prot)
 	writeUint32LE(w, r.Flags)
 	writeCStringPadded8(w, r.Filename)
+	writeSampleID(w, r.Pid, r.Tid, r.Cpu, r.Time)
 }
 
 // SampleRecord is the in-memory image of a PERF_RECORD_SAMPLE payload, for

@@ -7,18 +7,26 @@ import (
 
 func TestEncodeComm(t *testing.T) {
 	var buf bytes.Buffer
-	// pid=42, tid=42, comm="ls", no sample_id_all suffix
-	encodeComm(&buf, CommRecord{Pid: 42, Tid: 42, Comm: "ls"})
+	// pid=42, tid=42, comm="ls", plus the sample_id trailer that
+	// sample_id_all obliges every kernel-generated record to carry (#161).
+	encodeComm(&buf, CommRecord{Pid: 42, Tid: 42, Comm: "ls", Time: 0x1122, Cpu: 3})
 
 	got := buf.Bytes()
-	// Header: type=PERF_RECORD_COMM=3 (u32), misc=0 (u16), size = 8 + 4 + 4 + 8 = 24 (u16)
+	// size = 8 header + 4 pid + 4 tid + 8 comm + 24 sample_id = 48
 	want := []byte{
 		3, 0, 0, 0, // type = 3
-		0, 0,        // misc = 0
-		24, 0,       // size = 24
+		0, 0, // misc = 0
+		48, 0, // size = 48
 		42, 0, 0, 0, // pid
 		42, 0, 0, 0, // tid
 		'l', 's', 0, 0, 0, 0, 0, 0, // comm "ls" + NUL + padding to 8
+		// sample_id trailer: TID, TIME, CPU -- the subset of sample_type the
+		// ABI defines for it, in ABI order.
+		42, 0, 0, 0, // pid
+		42, 0, 0, 0, // tid
+		0x22, 0x11, 0, 0, 0, 0, 0, 0, // time
+		3, 0, 0, 0, // cpu
+		0, 0, 0, 0, // res
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("COMM bytes mismatch:\n got: % x\nwant: % x", got, want)
@@ -30,9 +38,13 @@ func TestEncodeFinishedRound(t *testing.T) {
 	encodeFinishedRound(&buf)
 
 	want := []byte{
-		12, 0, 0, 0, // type = PERF_RECORD_FINISHED_ROUND = 12
-		0, 0,        // misc
-		8, 0,        // size = 8 (header only, no payload)
+		// PERF_RECORD_FINISHED_ROUND = 68, not 12. 12 is ITRACE_START, a
+		// kernel record with a pid+tid payload and a sample_id trailer; a
+		// reader handed an 8-byte one reads past its end. FINISHED_ROUND is
+		// in perf's user-space range (>= 64) and correctly has no trailer.
+		68, 0, 0, 0, // type = PERF_RECORD_FINISHED_ROUND
+		0, 0, // misc
+		8, 0, // size = 8 (header only, no payload)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("FINISHED_ROUND bytes mismatch:\n got: % x\nwant: % x", buf.Bytes(), want)
@@ -55,17 +67,18 @@ func TestEncodeMmap2_NoBuildID(t *testing.T) {
 	// Expected total size:
 	//   header(8) + pid(4) + tid(4) + addr(8) + len(8) + pgoff(8) +
 	//   union(24: maj+min+ino+ino_gen) + prot(4) + flags(4) +
-	//   filename "/usr/bin/ls" (12 chars+NUL=13, padded to 16) = 88 bytes
-	if len(got) != 88 {
-		t.Fatalf("MMAP2 size = %d, want 88; bytes: % x", len(got), got)
+	//   filename "/usr/bin/ls" (12 chars+NUL=13, padded to 16) = 88 bytes,
+	//   plus the 24-byte sample_id trailer (#161) = 112
+	if len(got) != 112 {
+		t.Fatalf("MMAP2 size = %d, want 112; bytes: % x", len(got), got)
 	}
 	// header.type at offset 0 = PERF_RECORD_MMAP2 = 10
 	if got[0] != 10 || got[1] != 0 {
 		t.Errorf("type = % x, want 0a 00", got[0:2])
 	}
-	// header.size at offset 6 = 88 (u16 LE)
-	if got[6] != 88 || got[7] != 0 {
-		t.Errorf("size = % x, want 58 00", got[6:8])
+	// header.size at offset 6 = 112 (u16 LE): 88 body + 24 sample_id (#161)
+	if got[6] != 112 || got[7] != 0 {
+		t.Errorf("size = % x, want 70 00", got[6:8])
 	}
 }
 

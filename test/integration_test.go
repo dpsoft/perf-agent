@@ -397,23 +397,60 @@ func requireBPFRunnable(t *testing.T, agentPath string) {
 // skipped out from under it. See python_walk_test.go, where every reason
 // the Python gate does not run has to be recorded rather than merely
 // skipped.
-func bpfRunnable(agentPath string) bool {
-	if os.Getuid() == 0 {
+// bpfEvidence is what bpfRunnable knows about the environment. Split out
+// from the syscalls so the decision itself can be tested: the bug this
+// replaced could not be caught by any test, because reproducing it needed a
+// capped test process AND an uncapped target binary, which is exactly the
+// combination no CI job has.
+type bpfEvidence struct {
+	root bool
+	// procHasBPF: this test process holds CAP_BPF.
+	procHasBPF bool
+	// execsBinary: the test EXECs a separate binary rather than loading BPF
+	// in-process.
+	execsBinary bool
+	// targetHasBPF: that binary has CAP_BPF in its file capabilities.
+	targetHasBPF bool
+}
+
+// canRunBPF decides whether BPF programs can actually be loaded.
+//
+// The rule that matters: when the test EXECs a binary, this process's
+// capabilities are NOT evidence, because a child does not inherit them. Only
+// file capabilities on the binary being exec'd are.
+//
+// Getting that backwards made the gate report "runnable" for a binary that
+// demonstrably could not run. Capping the test binary turned three
+// GPU-collector tests from a correct skip into a failure whose real cause
+// was an uncapped gpu-cuda-profile several directories away.
+func canRunBPF(e bpfEvidence) bool {
+	if e.root {
 		return true
 	}
+	if e.execsBinary {
+		return e.targetHasBPF
+	}
+	return e.procHasBPF
+}
+
+func bpfRunnable(agentPath string) bool {
+	e := bpfEvidence{
+		root:        os.Getuid() == 0,
+		execsBinary: agentPath != "",
+	}
 	if procCaps := cap.GetProc(); procCaps != nil {
-		if have, err := procCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-			return true
+		if have, err := procCaps.GetFlag(cap.Permitted, cap.BPF); err == nil {
+			e.procHasBPF = have
 		}
 	}
-	if agentPath != "" {
+	if e.execsBinary {
 		if fileCaps, err := cap.GetFile(agentPath); err == nil && fileCaps != nil {
-			if have, err := fileCaps.GetFlag(cap.Permitted, cap.BPF); err == nil && have {
-				return true
+			if have, err := fileCaps.GetFlag(cap.Permitted, cap.BPF); err == nil {
+				e.targetHasBPF = have
 			}
 		}
 	}
-	return false
+	return canRunBPF(e)
 }
 
 // isJitOnlyProfile returns true if the profile's only non-empty,

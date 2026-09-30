@@ -93,11 +93,10 @@ type Options struct {
 	// this only decides what the picture shows. See foldedstacks.
 	RawVendorFrames bool
 	// StackOrder is how the profile stores Sample.Location. The zero value
-	// is RootFirst, which is what this repo's FP, off-CPU and GPU builders
-	// write. It is an option rather than an assumption because getting it
+	// is LeafFirst: the pprof proto specifies it and perf-agent writes it
+	// (#163). It is an option rather than an assumption because getting it
 	// wrong does not fail -- it draws a plausible flame graph upside down
-	// (issue #155), and because foreign profiles follow the pprof proto and
-	// are leaf-first.
+	// (#155) -- and because foreign profiles may still be root-first.
 	StackOrder foldedstacks.StackOrder
 }
 

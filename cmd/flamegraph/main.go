@@ -11,16 +11,16 @@
 // Two collectors, one picture:
 //
 //	flamegraph -fuse -o both.html \
-//	  -in 'cpu.pb.gz;leaf-first;[cpu] perf-agent 99 Hz' \
-//	  -in 'gpu.pb.gz;root-first;[gpu] per sampled launch'
+//	  -in 'cpu.pb.gz;;[cpu] perf-agent 99 Hz' \
+//	  -in 'gpu.pb.gz;;[gpu] per sampled launch'
 //
 // Each -in hangs under its own labelled root. The order is per-file
-// because the inputs need not agree -- see issue #155.
+// because foreign inputs need not agree; it defaults to leaf-first.
 //
-// Foreign profiles: perf-agent writes Sample.Location root-first, which is
-// the reverse of what the pprof proto specifies. -stack-order exists for
-// profiles from other producers; getting it wrong draws a plausible flame
-// graph upside down, so the page always states which order it assumed.
+// Foreign profiles: perf-agent writes Sample.Location leaf-first, as the
+// pprof proto specifies. -stack-order exists for profiles from producers
+// that deviate; getting it wrong draws a plausible flame graph upside down,
+// so the page always states which order it assumed.
 package main
 
 import (
@@ -40,8 +40,11 @@ func main() {
 		title      = flag.String("title", "", "page title (default: the input file name)")
 		folded     = flag.Bool("folded", false, "write folded stacks to stdout instead of HTML")
 		sampleIdx  = flag.Int("sample-index", -1, "which sample type to fold; -1 chooses automatically")
-		stackOrder = flag.String("stack-order", "root-first", "how the profile stores Sample.Location: root-first (perf-agent) | leaf-first (pprof proto)")
-		rawVendor  = flag.Bool("raw-vendor-frames", false,
+		stackOrder = flag.String("stack-order", "leaf-first",
+			"how the profile stores Sample.Location: leaf-first (the pprof proto, "+
+				"and what perf-agent writes) | root-first (foreign profiles from "+
+				"producers that deviate)")
+		rawVendor = flag.Bool("raw-vendor-frames", false,
 			"draw every vendor frame separately instead of merging runs whose names say "+
 				"nothing (an address, or the CUDA symbol server's obfuscated libfoo_<hex>). "+
 				"The profile always contains them either way; this decides what the PICTURE "+
@@ -53,7 +56,7 @@ func main() {
 	)
 	flag.Var(&inputs, "in",
 		"a profile to fuse, as path[;stack-order[;label]] (repeatable). "+
-			"stack-order defaults to root-first, label to the file's base name")
+			"stack-order defaults to leaf-first, label to the file's base name")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <profile.pb.gz>\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -76,11 +79,11 @@ func main() {
 	}
 	in := flag.Arg(0)
 
-	order := foldedstacks.RootFirst
+	order := foldedstacks.LeafFirst
 	switch *stackOrder {
-	case "root-first":
 	case "leaf-first":
-		order = foldedstacks.LeafFirst
+	case "root-first":
+		order = foldedstacks.RootFirst
 	default:
 		fatalf("unknown -stack-order %q: want root-first or leaf-first", *stackOrder)
 	}
@@ -171,9 +174,9 @@ func (f *fuseInputs) Set(v string) error {
 
 	ord, label, _ := strings.Cut(rest, ";")
 	switch ord {
-	case "", "root-first":
-	case "leaf-first":
-		in.StackOrder = foldedstacks.LeafFirst
+	case "", "leaf-first":
+	case "root-first":
+		in.StackOrder = foldedstacks.RootFirst
 	default:
 		return fmt.Errorf("unknown stack order %q: want root-first or leaf-first", ord)
 	}

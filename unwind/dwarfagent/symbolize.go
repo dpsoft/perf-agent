@@ -89,7 +89,8 @@ func symbolizePID(sym symbolize.Symbolizer, pid uint32, slots []interp.Slot) []p
 // symbolizePIDWithKernel resolves both user-mode and kernel-mode IPs for a
 // single sample. Kernel frames are leaf-side and are prepended to the user
 // frames so the resulting chain is leaf-first (kernel → user-leaf → … →
-// user-root). pprof.Reverse() later flips this to outermost-first.
+// user-root), which is the order the pprof proto specifies for
+// Sample.Location. Nothing flips it afterwards; see #163.
 //
 // When kernelIPs is empty (the typical case with --kernel-stacks off or
 // stale BPF stack-IDs), behaves identically to symbolizePID. When user-mode

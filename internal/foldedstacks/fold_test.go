@@ -19,7 +19,26 @@ func loc(addr uint64, names ...string) *profile.Location {
 	return l
 }
 
-func sample(v int64, labels map[string][]string, locs ...*profile.Location) *profile.Sample {
+// sample builds a sample from locations given ROOT-FIRST, which is how a
+// call stack reads to a person, and stores them leaf-first, which is what
+// the pprof proto specifies and what perf-agent writes (#163).
+//
+// Keeping the fixtures readable root-first while the storage is leaf-first
+// is deliberate: it stops the fixtures from quietly encoding whatever
+// convention the code happens to use, which is precisely how the old
+// default survived -- every fixture was written to match it, so every test
+// passed while go tool pprof read the profiles inside out.
+func sample(v int64, labels map[string][]string, rootFirst ...*profile.Location) *profile.Sample {
+	locs := make([]*profile.Location, len(rootFirst))
+	for i, l := range rootFirst {
+		locs[len(rootFirst)-1-i] = l
+	}
+	return &profile.Sample{Location: locs, Value: []int64{v}, Label: labels}
+}
+
+// rawSample stores locations exactly as given, for the tests that are ABOUT
+// storage order and must not have it chosen for them.
+func rawSample(v int64, labels map[string][]string, locs ...*profile.Location) *profile.Sample {
 	return &profile.Sample{Location: locs, Value: []int64{v}, Label: labels}
 }
 
@@ -30,29 +49,39 @@ func oneType(samples ...*profile.Sample) *profile.Profile {
 	}
 }
 
-func TestFoldRootFirstIsTheDefaultBecauseThatIsWhatPerfAgentWrites(t *testing.T) {
-	// perf-agent calls pprof.Reverse before building, so Location[0] is the
-	// root. Folding leaf-first would draw a correct-looking graph upside
-	// down, which is why this has its own test rather than an assumption.
-	p := oneType(sample(7, nil, loc(1, "root"), loc(2, "mid"), loc(3, "leaf")))
+func TestFoldLeafFirstIsTheDefaultBecauseThatIsWhatTheProtoSays(t *testing.T) {
+	// The pprof proto specifies Sample.Location[0] is the LEAF, and every
+	// profile perf-agent writes follows that (#163). Folding root-first
+	// would draw a correct-looking graph upside down, which is why this has
+	// its own test rather than an assumption.
+	//
+	// This test previously asserted the opposite, under the name
+	// "...RootFirstIsTheDefaultBecauseThatIsWhatPerfAgentWrites". It was a
+	// fixture written to match the code, so it proved only that the code
+	// matched the fixture -- while go tool pprof put 99.29% of flat time on
+	// runtime.goexit and none on the hot leaf.
+	p := oneType(rawSample(7, nil, loc(1, "leaf"), loc(2, "mid"), loc(3, "root")))
 
 	res, err := Fold(p, Options{SampleIndex: -1})
 	require.NoError(t, err)
 	require.Len(t, res.Stacks, 1)
+	// Stack.Frames is always root-first regardless of how the file stored it.
 	assert.Equal(t, []string{"root", "mid", "leaf"}, res.Stacks[0].Frames)
 	assert.Equal(t, int64(7), res.Total)
-	assert.Equal(t, RootFirst, res.StackOrder)
-	assert.Equal(t, "root-first", res.StackOrder.String())
+	assert.Equal(t, LeafFirst, res.StackOrder)
+	assert.Equal(t, "leaf-first", res.StackOrder.String())
 }
 
-func TestFoldLeafFirstReversesTheStack(t *testing.T) {
-	p := oneType(sample(7, nil, loc(1, "leaf"), loc(2, "mid"), loc(3, "root")))
+func TestFoldRootFirstIsStillAvailableForForeignProfiles(t *testing.T) {
+	// Producers that deviate from the proto still exist; -stack-order is for
+	// them.
+	p := oneType(rawSample(7, nil, loc(1, "root"), loc(2, "mid"), loc(3, "leaf")))
 
-	res, err := Fold(p, Options{SampleIndex: -1, StackOrder: LeafFirst})
+	res, err := Fold(p, Options{SampleIndex: -1, StackOrder: RootFirst})
 	require.NoError(t, err)
 	require.Len(t, res.Stacks, 1)
 	assert.Equal(t, []string{"root", "mid", "leaf"}, res.Stacks[0].Frames)
-	assert.Equal(t, "leaf-first", res.StackOrder.String())
+	assert.Equal(t, "root-first", res.StackOrder.String())
 }
 
 func TestFoldExpandsInlinedFramesCallerFirst(t *testing.T) {

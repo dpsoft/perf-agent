@@ -2,6 +2,7 @@ package foldedstacks_test
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
@@ -146,11 +147,18 @@ func buildProfile(t *testing.T, idx symbolize.ModuleIndex) *gprofile.Profile {
 		}
 	}
 
+	// Assembled root-first because that is how the stack reads to a person:
+	// CPU caller chain, then the launch boundary, then the kernel at the
+	// leaf. Stored reversed, because the pprof proto puts the leaf at
+	// Location[0] and that is what the GPU builder now writes (#163). The
+	// index-based assertions below are against Stack.Frames, which Fold
+	// always normalizes back to root-first, so they are unaffected.
 	stack := symbolize.ToProfFrames(frames)
 	stack = append(stack,
 		pp.FrameFromName("[gpu:launch]"),
 		pp.FrameFromName("[gpu:kernel:_Z14perfagent_axpyfPKfPfi]"),
 	)
+	slices.Reverse(stack)
 
 	bs := pp.NewProfileBuilders(pp.BuildersOptions{SampleRate: 1})
 	bs.AddSample(&pp.ProfileSample{
@@ -168,6 +176,13 @@ func buildProfile(t *testing.T, idx symbolize.ModuleIndex) *gprofile.Profile {
 	return p
 }
 
+// names returns the sample's frames ROOT-FIRST, which is how a call stack
+// reads to a person and how the assertions below are written.
+//
+// The profile itself stores them leaf-first, as the pprof proto specifies
+// (#163), so this reverses. Asserting on storage order directly would make
+// the expectations a transcription of the encoder rather than a statement
+// about the stack.
 func names(p *gprofile.Profile) []string {
 	var out []string
 	for _, loc := range p.Sample[0].Location {
@@ -175,6 +190,7 @@ func names(p *gprofile.Profile) []string {
 			out = append(out, ln.Function.Name)
 		}
 	}
+	slices.Reverse(out)
 	return out
 }
 

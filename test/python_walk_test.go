@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -589,15 +588,17 @@ func pythonFuncName(name string, byAddr map[uint64]string) (string, bool) {
 // location, using the function name where there is one and the mapping plus
 // address where there is not.
 //
-// The profile stores Location root-first -- every producer in this repo does
-// since issue #155 -- so this walks it backwards. The order matters to every
-// caller: pythonOrderIn and pythonSampleDefects both read the interleaving of
-// Python and native frames, and reversing it turns a correct walk into a
-// reported defect.
+// The profile stores Location leaf-first, as the pprof proto specifies
+// (#163), which is already the order this returns -- so it walks forward.
+//
+// This reversed between #155 and #163, tracking what the producers wrote.
+// The order matters to every caller: pythonOrderIn and pythonSampleDefects
+// both read the interleaving of Python and native frames, and getting it
+// backwards turns a correct walk into a reported defect.
 func sampleFrameNames(s *profile.Sample) []string {
 	out := make([]string, 0, len(s.Location))
-	for i := len(s.Location) - 1; i >= 0; i-- {
-		out = append(out, locationName(s.Location[i]))
+	for _, loc := range s.Location {
+		out = append(out, locationName(loc))
 	}
 	return out
 }
@@ -620,15 +621,15 @@ func locationName(loc *profile.Location) string {
 // asking the reader to reconstruct it.
 func renderSample(s *profile.Sample) string {
 	var b strings.Builder
-	// Leaf-first, like sampleFrameNames: the profile is root-first (#155).
-	// Numbered from the leaf so #00 is where execution actually was.
-	for i, loc := range slices.Backward(s.Location) {
+	// Leaf-first, like sampleFrameNames: the profile is stored leaf-first
+	// (#163), so #00 is the leaf -- where execution actually was.
+	for i, loc := range s.Location {
 		name := locationName(loc)
 		kind := "native"
 		if isPythonFrame(name) {
 			kind = "PYTHON"
 		}
-		fmt.Fprintf(&b, "  #%02d %-6s %s\n", len(s.Location)-1-i, kind, name)
+		fmt.Fprintf(&b, "  #%02d %-6s %s\n", i, kind, name)
 	}
 	return b.String()
 }

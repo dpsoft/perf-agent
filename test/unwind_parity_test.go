@@ -119,10 +119,14 @@ func TestDwarfKeepsUserspaceOnSyscallBoundWorkload(t *testing.T) {
 //
 // The assertion is that no sample's OUTERMOST frame lies in the kernel. A
 // user task's stack cannot BEGIN in the kernel -- userspace calls in, never
-// the reverse -- so a kernel-mapped root is proof the stack is stored the
-// wrong way round. perf-agent routes kernel frames through a "[kernel]"
-// sentinel mapping, so this reads the mapping rather than guessing from
-// symbol names.
+// the reverse -- so a kernel-mapped outermost frame is proof the stack is
+// stored the wrong way round. perf-agent routes kernel frames through a
+// "[kernel]" sentinel mapping, so this reads the mapping rather than
+// guessing from symbol names.
+//
+// Since #163 the outermost frame is the LAST location, not the first: the
+// proto puts the leaf at index 0, and the leaf is very often a kernel frame
+// on a syscall-bound workload.
 //
 // Earlier drafts of this test asserted that a majority of samples root at a
 // known entry point, which was both too weak and too brittle: too weak
@@ -152,8 +156,14 @@ func TestUnwindersAgreeOnStackOrder(t *testing.T) {
 			if len(s.Location) == 0 {
 				continue
 			}
+			// The OUTERMOST frame is the LAST location: profiles are stored
+			// leaf-first, as the pprof proto specifies (#163). Reading
+			// Location[0] here would read the leaf, which legitimately IS a
+			// kernel frame whenever a sample lands in the kernel -- the
+			// assertion would then fire on correct profiles.
+			outer := s.Location[len(s.Location)-1]
 			file := "<no mapping>"
-			if m := s.Location[0].Mapping; m != nil {
+			if m := outer.Mapping; m != nil {
 				file = m.File
 			}
 			roots[file]++

@@ -277,8 +277,9 @@ func TestInjectedShimStackThatReachesTheApplicationIsKept(t *testing.T) {
 	c.Flush()
 
 	require.Len(t, sink.launches, 1)
-	assert.Equal(t, []string{"fn_1000", "fn_2000"}, frameNames(sink.launches[0].Launch.CPUStack),
-		"one frame outside the shim is proof the walk reached the application")
+	assert.Equal(t, []string{"fn_2000", "fn_1000"}, frameNames(sink.launches[0].Launch.CPUStack),
+		"one frame outside the shim is proof the walk reached the application "+
+			"(leaf-first, as the pprof proto specifies -- #163)")
 	assert.Equal(t, uint32(8), sink.launches[0].Launch.SamplePeriod)
 	assert.Zero(t, c.Stats().StacksProfilerOnly)
 	assert.Equal(t, uint64(1), c.Stats().StacksAttached)
@@ -301,8 +302,9 @@ func TestSelfContainedShimStackIsAnAttribution(t *testing.T) {
 	c.Flush()
 
 	require.Len(t, sink.launches, 1)
-	assert.Equal(t, []string{"fn_1000", "fn_2000"}, frameNames(sink.launches[0].Launch.CPUStack),
-		"main -> perfagent_stub_run is entirely inside the shim and is still the application's own call path")
+	assert.Equal(t, []string{"fn_2000", "fn_1000"}, frameNames(sink.launches[0].Launch.CPUStack),
+		"main -> perfagent_stub_run is entirely inside the shim and is still the "+
+			"application's own call path (leaf-first -- #163)")
 	assert.Zero(t, c.Stats().StacksProfilerOnly,
 		"zero by construction for a self-contained producer: there is no boundary to fail to cross")
 	assert.Equal(t, uint64(1), c.Stats().StacksAttached)

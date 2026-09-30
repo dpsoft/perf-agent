@@ -8,15 +8,19 @@
 //
 // Two things in here are deliberate and easy to get wrong:
 //
-// Stack order. The pprof proto says Sample.Location[0] is the leaf.
-// perf-agent does not follow that: profile/profiler.go and
-// offcpu/profiler.go both call pprof.Reverse before handing the stack to
-// the builder, and gpu/projection.go builds its frames root-first, so in
-// every profile this repo writes Location[0] is the ROOT. Folding with the
-// wrong assumption does not fail — it draws a perfectly plausible flame
-// graph upside down. So the order is an explicit option, defaulting to
-// what this repo writes, and Result.StackOrder records the choice so the
-// renderer can state it on the page instead of leaving the reader to guess.
+// Stack order. The pprof proto says Sample.Location[0] is the leaf, and
+// every profile this repo writes follows that. It did not always: three
+// producers called pprof.Reverse and the GPU builder emitted root-first,
+// so profiles were stored inside out and go tool pprof attributed all flat
+// time to the outermost frame — 99.29% on runtime.goexit, zero on the hot
+// leaf. Issue #163 removed the reversal rather than teaching more readers
+// about it.
+//
+// Folding with the wrong assumption does not fail — it draws a perfectly
+// plausible flame graph upside down — so the order stays an explicit
+// option for FOREIGN profiles that really are root-first, and
+// Result.StackOrder records the choice so the renderer can state it on the
+// page instead of leaving the reader to guess.
 //
 // Degeneracy. A profile with no samples, or whose samples all carry zero
 // at the chosen value index, folds to nothing. Fold returns that as a
@@ -41,13 +45,15 @@ import (
 type StackOrder int
 
 const (
-	// RootFirst means Location[0] is the outermost frame. Every profile
-	// perf-agent writes is RootFirst; see the package comment.
-	RootFirst StackOrder = iota
-	// LeafFirst means Location[0] is the innermost frame, which is what the
-	// pprof proto specifies and what foreign profiles (Go runtime, perf)
-	// use.
-	LeafFirst
+	// LeafFirst means Location[0] is the innermost frame. This is what the
+	// pprof proto specifies, what the Go runtime and perf emit, and what
+	// perf-agent writes. It is the zero value because it is the default a
+	// caller should get when it does not say.
+	LeafFirst StackOrder = iota
+	// RootFirst means Location[0] is the outermost frame. Foreign profiles
+	// from producers that deviate from the proto use it; perf-agent did too
+	// until #163.
+	RootFirst
 )
 
 func (o StackOrder) String() string {
@@ -68,7 +74,7 @@ type Options struct {
 	SampleIndex int
 
 	// StackOrder is how the profile stores Sample.Location. Defaults to
-	// RootFirst, which is what perf-agent writes.
+	// LeafFirst, which the pprof proto specifies and perf-agent writes.
 	StackOrder StackOrder
 
 	// InexactLabels marks samples whose stack attribution is not a

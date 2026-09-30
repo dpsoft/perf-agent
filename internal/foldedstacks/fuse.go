@@ -64,9 +64,12 @@ func Fuse(inputs []FuseInput) (*Result, error) {
 
 	out := &Result{
 		Unit: unit,
-		// Root-first by construction: every Stack.Frames Fold produces is
-		// root-first, and the label goes in front of it.
-		StackOrder: RootFirst,
+		// Fold has already normalized every input's Stack.Frames to
+		// root-first, whatever each file stored, so the fused tree needs no
+		// further orientation. StackOrder here records what the renderer
+		// should SAY it read; the inputs are perf-agent profiles in the
+		// normal case, which are leaf-first on disk (#163).
+		StackOrder: LeafFirst,
 	}
 
 	var names []string

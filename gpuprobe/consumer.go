@@ -2946,7 +2946,9 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		c.stats.SymbolizeFailed++
 		return nil, false
 	}
-	pp.Reverse(out)
+	// Leaf-first: [gpu:kernel] innermost, then [gpu:launch], then the CPU
+	// caller chain outward. That is what the pprof proto specifies for
+	// Sample.Location, so it is handed over as built. See #163.
 	return out, true
 }
 

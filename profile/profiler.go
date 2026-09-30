@@ -223,7 +223,6 @@ func (pr *Profiler) Collect(w io.Writer) error {
 		}
 
 		sb := new(stackBuilder)
-		begin := len(sb.stack)
 
 		// Extract all non-zero IPs first, then batch-symbolize in a
 		// single call through the symbolize.Symbolizer interface. Per-call
@@ -259,9 +258,11 @@ func (pr *Profiler) Collect(w io.Writer) error {
 					log.Printf("Failed to symbolize kernel: %v", err)
 				}
 			}
-			// Kernel frames are leaf-side: they go first so that after
-			// Reverse() the call chain reads root→kernel→user (outermost
-			// first), which matches pprof convention.
+			// Kernel frames are leaf-side, so they go first: the pprof proto
+			// specifies Sample.Location[0] is the LEAF, and this builder
+			// hands the stack over in exactly that order. See #163 -- this
+			// used to be reversed to root-first, which inverted every
+			// profile for go tool pprof.
 			for _, f := range symbolize.ToProfFramesKernel(kernelFrames) {
 				sb.append(f)
 			}
@@ -269,9 +270,6 @@ func (pr *Profiler) Collect(w io.Writer) error {
 				sb.append(f)
 			}
 		}
-
-		end := len(sb.stack)
-		pprof.Reverse(sb.stack[begin:end])
 
 		sample := pr.createSample(sb, value, int(samplePid))
 		builders.AddSample(&sample)

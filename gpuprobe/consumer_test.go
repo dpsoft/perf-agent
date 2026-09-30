@@ -1765,10 +1765,12 @@ func TestAnOverlongNPcsIsClampedNotTrusted(t *testing.T) {
 // ringbuf well before the batched record for that same launch. The resolved
 // stack waits for its twin and rides out on it.
 //
-// The frames must come out root-first (main, then the launch site), because
-// the gpu projection nests [gpu:launch] and the kernel frame underneath
-// them. ToProfFrames returns leaf-first, so a missing reverse would invert
-// every GPU flame graph - visible here as fn_2000 leading.
+// The frames come out leaf-first (the launch site, then main), which is the
+// order the pprof proto specifies for Sample.Location and what every
+// producer in this repo now writes (#163). This used to be reversed to
+// root-first to match a convention the rest of the tree also had wrong; go
+// tool pprof read the result inside out and put all flat time on the
+// outermost frame.
 func TestSampledStackArrivingFirstAttachesToTheBatchedLaunch(t *testing.T) {
 	sink := &recordingSink{}
 	c, sm, sym := stackConsumer(t, sink, Config{})
@@ -1782,8 +1784,8 @@ func TestSampledStackArrivingFirstAttachesToTheBatchedLaunch(t *testing.T) {
 
 	require.Len(t, sink.launches, 1, "one launch in, one launch out - the sampled twin is not a second launch")
 	got := sink.launches[0]
-	assert.Equal(t, []string{"fn_1000", "fn_2000"}, frameNames(got.Launch.CPUStack),
-		"frames must be root-first; leaf-first would invert every GPU flame graph")
+	assert.Equal(t, []string{"fn_2000", "fn_1000"}, frameNames(got.Launch.CPUStack),
+		"frames must be leaf-first, as the pprof proto specifies (#163)")
 	assert.Equal(t, uint32(8), got.Launch.SamplePeriod,
 		"the period travels with the stack, so a consumer never has to reconstruct it")
 	assert.Equal(t, []uint32{4242}, sym.pids, "symbolization is against the launching process")
@@ -2268,7 +2270,8 @@ func TestSymbolizationThatResolvesNoNameIsCountedNotSilent(t *testing.T) {
 	// and operators can still decode it with addr2line.
 	assert.Equal(t, uint64(1), st.StacksResolved)
 	require.Len(t, sink.launches, 1)
-	assert.Equal(t, []string{"0x2000", "0x1000"}, frameNames(sink.launches[0].Launch.CPUStack))
+	// Leaf-first (#163): 0x1000 is the outer frame, so it comes last.
+	assert.Equal(t, []string{"0x1000", "0x2000"}, frameNames(sink.launches[0].Launch.CPUStack))
 }
 
 // One unresolvable frame in an otherwise readable stack is a normal event -
@@ -3792,7 +3795,10 @@ func TestPythonFramesAreNotSymbolizedAsNativePCs(t *testing.T) {
 	assert.Equal(t, []uint64{0x401000, 0x401100}, sym.ips[0],
 		"the code object and its instruction word must not be handed to the native symbolizer")
 
-	// resolveStackLocked reverses to root-first before returning.
+	// resolveStackLocked returns leaf-first (#163); the assertion below is
+	// on the MIDDLE frame, so it holds either way -- which is the point:
+	// the Python frame's position in the chain is what matters, not which
+	// end the chain starts at.
 	require.Len(t, frames, 3)
 	assert.Equal(t, interp.FrameName(frameTagInterp, 0xc0de0000, 0), frames[1].Name,
 		"the Python frame belongs between its native caller and its native callee, not at either end")

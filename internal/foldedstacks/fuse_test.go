@@ -80,16 +80,20 @@ func TestFuseRefusesToAddDifferentUnits(t *testing.T) {
 	assert.Contains(t, err.Error(), "unit")
 }
 
-func TestFuseResultIsRootFirstWhateverTheInputsWere(t *testing.T) {
-	// Fold already normalizes Frames to root-first, so the fused result is
-	// root-first by construction. Recording it stops the renderer from
-	// having to guess -- the failure mode of issue #155.
+func TestFuseOrientsFramesTheSameWhateverTheInputsWere(t *testing.T) {
+	// Fold has already normalized every input's Frames to root-first, so the
+	// fused tree needs no further orientation whatever the inputs were.
+	// StackOrder on the result records what the renderer should SAY it read,
+	// and the normal case is a perf-agent profile, which is leaf-first on
+	// disk (#163).
 	cpu := foldOne(t, "cpu", stackSpec{value: 1, frames: []string{"a"}})
-	cpu.StackOrder = LeafFirst // as read from a leaf-first file
+	cpu.StackOrder = RootFirst // as read from a foreign root-first file
 
 	out, err := Fuse([]FuseInput{{Result: cpu, Label: "[cpu]"}})
 	require.NoError(t, err)
-	assert.Equal(t, RootFirst, out.StackOrder)
+	assert.Equal(t, LeafFirst, out.StackOrder)
+	// The orientation that actually matters is the frames', and it is fixed.
+	assert.Equal(t, []string{"[cpu]", "a"}, out.Stacks[0].Frames)
 }
 
 func TestFuseSumsCountersAndDeepensMaxDepthByTheRoot(t *testing.T) {

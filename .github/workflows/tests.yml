@@ -182,21 +182,8 @@ jobs:
 
       - name: Run unit tests (privileged, for the BPF-gated ones)
         run: |
-          # TestLazyMode_FiresAndCompilesOnMiss passes on amd64 and fails on
-          # arm64 -- no CFI miss events fire there at all. That difference is
-          # NOT caused by this step; the test has been skipping on both
-          # arches for as long as the unit job has been unprivileged, so the
-          # arm64 behaviour had simply never been observed. Issue #179.
-          #
-          # Excluded here rather than with a t.Skip in the test, so the
-          # exclusion is visible to anyone reading this workflow and
-          # disappears the moment #179 is resolved.
-          SKIP_RE=''
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            SKIP_RE='-skip=TestLazyMode_FiresAndCompilesOnMiss'
-          fi
           sudo env PATH="$PATH" LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
-            "$(which go)" test -v -timeout 15m $SKIP_RE \
+            "$(which go)" test -v -timeout 15m \
             ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/... \
             2>&1 | tee /tmp/privileged-unit.log
           test "${PIPESTATUS[0]}" -eq 0 || exit 1

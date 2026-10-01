@@ -22,6 +22,7 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/gpuprofile"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
 	"github.com/dpsoft/perf-agent/internal/nspid"
@@ -79,6 +80,7 @@ type Agent struct {
 
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
+	gpuProfiler    *gpuprofile.Profiler
 	pmuMonitor     *cpu.PMUMonitor
 	perfDataWriter *perfdata.Writer // nil when --perf-data-output not set
 
@@ -117,8 +119,22 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 func (c *Config) validate() error {
-	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnablePMU {
-		return errors.New("at least one of CPU profile, off-CPU profile, or PMU must be enabled")
+	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnableGPU && !c.EnablePMU {
+		return errors.New("at least one of CPU profile, off-CPU profile, GPU profile, or PMU must be enabled")
+	}
+
+	if c.EnableGPU {
+		if c.GPUShimPath == "" {
+			return errors.New("GPU profiling needs the adapter path the target loaded through CUDA_INJECTION64_PATH")
+		}
+		if c.SystemWide {
+			// PID 0 IS what the node collector uses, and it is the right
+			// shape there -- but it needs hostPID and the shim-inode
+			// machinery that gpu-cuda-profile's collector mode carries.
+			// Accepting it here would attach, find nothing, and report
+			// success. See issue #124.
+			return errors.New("GPU profiling is per-process; use gpu-cuda-profile -mode collector for a node-wide attach")
+		}
 	}
 
 	if c.PID != 0 && c.SystemWide {
@@ -435,11 +451,10 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	// Serialized because sharing is only safe one caller at a time: blazesym
 	// holds its caches in RefCell and a concurrent borrow aborts the process
-	// from inside Rust. The collectors here symbolize in batches from the
-	// collect path, one after another, so they have never collided -- but
-	// nothing enforces that, and the next collector that resolves stacks
-	// while a capture is running takes the whole process down with it.
-	// See symbolize.Serialized.
+	// from inside Rust. The batch collectors never collided -- they
+	// symbolize one after another from the collect path -- but the GPU
+	// collector resolves sampled stacks CONTINUOUSLY from its own goroutine
+	// while a capture is still running. See symbolize.Serialized.
 	//
 	// Assigned through a nil check rather than directly: NewSerialized
 	// returns a typed nil for a nil input, and a typed nil in an interface
@@ -594,6 +609,28 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	// Start PMU monitor if enabled
+	if a.config.EnableGPU {
+		// Fails loudly rather than degrading. The CUPTI adapter's own
+		// failure mode is to fail open and silent, which is right for an
+		// adapter the driver loads into every CUDA process -- and wrong for
+		// a flag the operator passed on purpose. Inheriting it would make
+		// "this run measured no GPU" indistinguishable from "this workload
+		// used no GPU".
+		p, err := gpuprofile.New(gpuprofile.Config{
+			ShimPath:                  a.config.GPUShimPath,
+			PID:                       int(hostPID),
+			Symbolizer:                a.symbolizer,
+			PCSampling:                a.config.GPUPCSampling,
+			KeepInstrumentationFrames: a.config.GPUKeepInstrumentationFrames,
+		})
+		if err != nil {
+			a.cleanup()
+			return fmt.Errorf("enable GPU profiling: %w", err)
+		}
+		a.gpuProfiler = p
+		log.Printf("GPU profiler enabled (PID: %s, shim: %s)", a.pidLogStr(hostPID), a.config.GPUShimPath)
+	}
+
 	if a.config.EnablePMU {
 		monitor, err := cpu.NewPMUMonitor(
 			hostPID,
@@ -655,6 +692,35 @@ func (a *Agent) Stop(ctx context.Context) error {
 			} else if err := a.writeFlamegraph(a.config.CPUProfilePath, a.config.CPUFlamegraphPath, "on-CPU"); err != nil {
 				log.Printf("Failed to write CPU flame graph: %v", err)
 				lastErr = err
+			}
+		}
+	}
+
+	// Write GPU profile
+	if a.gpuProfiler != nil {
+		// A run that attached but saw no GPU work writes nothing and says
+		// so. That is not an error -- a CUDA process can legitimately be
+		// idle for the window -- but it must not look like a successful
+		// capture of an empty profile either.
+		if n := a.gpuProfiler.Samples(); n == 0 {
+			log.Printf("GPU profile: no GPU activity was observed in this window; " +
+				"check the target reached cuInit with CUDA_INJECTION64_PATH set to the same file as --gpu-shim")
+		} else if a.config.GPUProfileWriter != nil {
+			if err := a.gpuProfiler.Collect(a.config.GPUProfileWriter); err != nil {
+				log.Printf("Failed to write GPU profile: %v", err)
+				lastErr = err
+			}
+			a.warnFlamegraphNeedsPath(a.config.GPUFlamegraphPath, "GPU")
+		} else {
+			if err := a.gpuProfiler.CollectAndWrite(a.config.GPUProfilePath); err != nil {
+				log.Printf("Failed to write GPU profile: %v", err)
+				lastErr = err
+			} else {
+				log.Printf("GPU profile written to %s (%d samples)", a.config.GPUProfilePath, n)
+				if err := a.writeFlamegraph(a.config.GPUProfilePath, a.config.GPUFlamegraphPath, "gpu"); err != nil {
+					log.Printf("Failed to write GPU flame graph: %v", err)
+					lastErr = err
+				}
 			}
 		}
 	}
@@ -810,6 +876,10 @@ func (a *Agent) cleanup() {
 	if a.offcpuProfiler != nil {
 		a.offcpuProfiler.Close()
 		a.offcpuProfiler = nil
+	}
+	if a.gpuProfiler != nil {
+		a.gpuProfiler.Close()
+		a.gpuProfiler = nil
 	}
 	if a.pmuMonitor != nil {
 		a.pmuMonitor.Close()

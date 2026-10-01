@@ -171,6 +171,15 @@ jobs:
       #
       # No -race and no coverage here: the first pass owns both, and this one
       # exists to execute the gated tests, not to measure them again.
+      # TestProfilerEndToEnd and TestOffCPUProfilerEndToEnd profile the rust
+      # workload and skip without it. The integration job builds the workloads;
+      # this one never did, so running the gated tests needs it here too.
+      # Found by the skip-detector below on the first run of this step: sudo
+      # alone was not enough, and without the detector the step would have
+      # reported green while two of its three tests skipped.
+      - name: Build the rust workload (for the end-to-end unit tests)
+        run: cargo build --release --manifest-path test/workloads/rust/Cargo.toml
+
       - name: Run unit tests (privileged, for the BPF-gated ones)
         run: |
           sudo env PATH="$PATH" LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \

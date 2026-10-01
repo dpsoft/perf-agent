@@ -151,6 +151,50 @@ jobs:
       - name: Run unit tests
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
 
+      # A second, PRIVILEGED pass over the same packages.
+      #
+      # The run above is unprivileged, which is the right default -- most of
+      # these tests must keep working without capabilities, and losing that
+      # signal would hide a regression that makes them require root. But every
+      # BPF-requiring test in these packages gates on requireBPFRunnable, so
+      # the unprivileged run SKIPS them, and the job still reports green:
+      #
+      #     TestProfilerEndToEnd        SKIP   (unwind/dwarfagent)
+      #     TestOffCPUProfilerEndToEnd  SKIP   (unwind/dwarfagent)
+      #     TestPerfDwarfLoads          SKIP   (profile)
+      #
+      # TestPerfDwarfLoads is the one that matters most: it LOADS the DWARF
+      # BPF program, which is the object #156 and #164 both changed, and it
+      # had never been exercised by CI at all. A verifier rejection there
+      # surfaces at load time, not compile time, so nothing else would catch
+      # it. Issue #169.
+      #
+      # No -race and no coverage here: the first pass owns both, and this one
+      # exists to execute the gated tests, not to measure them again.
+      # TestProfilerEndToEnd and TestOffCPUProfilerEndToEnd profile the rust
+      # workload and skip without it. The integration job builds the workloads;
+      # this one never did, so running the gated tests needs it here too.
+      # Found by the skip-detector below on the first run of this step: sudo
+      # alone was not enough, and without the detector the step would have
+      # reported green while two of its three tests skipped.
+      - name: Build the rust workload (for the end-to-end unit tests)
+        run: cargo build --release --manifest-path test/workloads/rust/Cargo.toml
+
+      - name: Run unit tests (privileged, for the BPF-gated ones)
+        run: |
+          sudo env PATH="$PATH" LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" \
+            "$(which go)" test -v -timeout 15m \
+            ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/... \
+            2>&1 | tee /tmp/privileged-unit.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit 1
+          # A pass that skipped the very tests it exists to run is not a pass.
+          for t in TestPerfDwarfLoads TestProfilerEndToEnd TestOffCPUProfilerEndToEnd; do
+            if grep -q "^--- SKIP: $t" /tmp/privileged-unit.log; then
+              echo "::error::$t SKIPPED in the privileged pass; it is covering nothing"
+              exit 1
+            fi
+          done
+
       - name: Upload coverage
         uses: codecov/codecov-action@v3
         with:

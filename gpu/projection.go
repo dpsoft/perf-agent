@@ -31,7 +31,9 @@ const (
 // The split between frames and labels is deliberate: frames are stack
 // identity, so only what should nest in a flame graph goes there - the
 // launch's real CPU stack, the [gpu:launch] boundary marker, then
-// [gpu:kernel:<name>]. Everything that would otherwise fragment that
+// [gpu:kernel:<name>] -- that is the ROOT-TO-LEAF reading; the frames are
+// stored leaf-first, as the proto specifies. Everything that would
+// otherwise fragment that
 // identity (the per-sample PC, stall reason, queue/device/correlation, the
 // producing process, and the launch's tags) goes into per-sample labels
 // instead. Two PC samples
@@ -430,16 +432,28 @@ func sampledStack(view ExecutionView) ([]pp.Frame, bool) {
 // population's call paths belong to the specific launches that were
 // sampled, and lending one to a sibling would put measured GPU time under a
 // call path that provably did not produce it.
+// Assembled LEAF-FIRST: the kernel is the innermost frame, then the launch
+// boundary, then the launching CPU call path outward. That is the order the
+// pprof proto specifies for Sample.Location (#163) and the order
+// gpuprobe hands the CPU stack over in.
+//
+// It read the other way round until #164 removed the reversal in
+// gpuprobe/consumer.go without changing this function, which left the
+// result half leaf-first and half root-first: the CPU frames ran
+// leaf-to-root and then [gpu:launch] and the kernel were appended BEYOND
+// the root. Folded leaf-first, that drew the GPU kernel as the root of the
+// stack and main as its leaf.
 func projectionFrames(view ExecutionView) []pp.Frame {
 	var frames []pp.Frame
-	if stack, ok := sampledStack(view); ok {
-		frames = append(frames, stack...)
-		frames = append(frames, pp.FrameFromName(FrameLaunch))
-	} else {
-		frames = append(frames, pp.FrameFromName(FrameLaunchUnsampled))
-	}
 	if view.Exec.KernelName != "" {
 		frames = append(frames, pp.FrameFromName(fmt.Sprintf("[gpu:kernel:%s]", view.Exec.KernelName)))
+	}
+	if stack, ok := sampledStack(view); ok {
+		frames = append(frames, pp.FrameFromName(FrameLaunch))
+		// Already leaf-first; see gpuprobe's resolveStack.
+		frames = append(frames, stack...)
+	} else {
+		frames = append(frames, pp.FrameFromName(FrameLaunchUnsampled))
 	}
 	return frames
 }

@@ -140,9 +140,10 @@ func TestACubinOfferedOverTheChannelBecomesASourceLine(t *testing.T) {
 		KernelName:  "addOne",
 		TimeNs:      10,
 		Launch: gpu.LaunchContext{
-			PID:          pid,
-			TimeNs:       10,
-			CPUStack:     pp.FramesFromNames([]string{"main", "run_training_step", "cudaLaunchKernel"}),
+			PID:    pid,
+			TimeNs: 10,
+			// Leaf-first, as gpuprobe hands it over since #163/#164.
+			CPUStack:     pp.FramesFromNames([]string{"cudaLaunchKernel", "run_training_step", "main"}),
 			SamplePeriod: 8,
 		},
 	}))
@@ -178,8 +179,9 @@ func TestACubinOfferedOverTheChannelBecomesASourceLine(t *testing.T) {
 		names = append(names, f.Name)
 	}
 	assert.Equal(t,
-		[]string{"main", "run_training_step", "cudaLaunchKernel", gpu.FrameLaunch, "[gpu:kernel:addOne]"},
-		names, "the frames must still be the launching CPU call path, the boundary marker and the kernel")
+		[]string{"[gpu:kernel:addOne]", gpu.FrameLaunch, "cudaLaunchKernel", "run_training_step", "main"},
+		names, "the frames must still be the kernel, the boundary marker and the launching CPU call "+
+			"path -- stored leaf-first, which reads root-to-leaf as main -> ... -> [gpu:kernel]")
 
 	require.Equal(t, "resolved", s.Labels["gpu_src_status"],
 		"the cubin crossed the transport and the store still cannot resolve against it")

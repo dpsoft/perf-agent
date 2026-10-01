@@ -30,6 +30,18 @@ echo "==> 3. Capture profile via perf-agent"
 ./workload-baseline "$ITER" &
 WL_PID=$!
 sleep 1
+# The workload must outlive the capture window, and on fast hardware the
+# default ITER does not: 200M iterations finishes in well under a second
+# here, so the agent attached to a pid that was already gone and failed
+# with "read /proc/<pid>/status: no such file or directory", which reads
+# like a permissions or namespace problem rather than "raise ITER" (#167).
+if ! kill -0 "$WL_PID" 2>/dev/null; then
+    echo "ERROR: the workload finished before the profiler could attach." >&2
+    echo "  ITER=$ITER is too small for this machine. Raise it until the" >&2
+    echo "  baseline run above takes comfortably longer than DURATION=$DURATION," >&2
+    echo "  e.g. ITER=\$(( $ITER * 100 ))." >&2
+    exit 1
+fi
 "$AGENT" --profile --pid "$WL_PID" --duration "$DURATION" \
          --perf-data-output train.perf.data
 wait "$WL_PID" || true

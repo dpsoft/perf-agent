@@ -2306,9 +2306,19 @@ func TestStrippedRustOffBoxSymbolization(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "profile.pb.gz")
 	cacheDir := filepath.Join(t.TempDir(), "symbol-cache")
 
+	// Symbols the WORKLOAD owns, not stdlib internals.
+	//
+	// This used to also require core::num::<impl u64>::wrapping_add, which
+	// rustc 1.97.1 inlines away entirely -- `nm -C` finds zero occurrences
+	// in the built binary -- so the test failed on a toolchain decision
+	// rather than on anything about symbolization (#166). What it is
+	// actually testing is that a STRIPPED binary's symbols come back from
+	// debuginfod, and the workload's own functions prove that: their
+	// presence requires the off-box lookup to have worked, and the
+	// workload's source controls whether they survive optimisation.
 	want := []string{
 		"rust_workload::cpu_intensive_work",
-		"core::num::<impl u64>::wrapping_add",
+		"rust_workload::main",
 	}
 
 	// Collect until the off-box symbols land, with a deadline: a window
@@ -2709,15 +2719,36 @@ func cachedDebugPath(cacheDir, buildID string) string {
 }
 
 // countDebuginfodHits returns the number of `GET /buildid/<buildID>/debuginfo`
-// log lines emitted by the debuginfod container so far. Best-effort —
-// returns 0 if `docker logs` fails (we surface that as 0 delta upstream).
+// log lines emitted by the debuginfod container so far.
+//
+// It SKIPS rather than returning zero when the log cannot be read (#165).
+// The caller asserts that a cached lookup produces no new hits, and zero
+// hits satisfies that trivially -- so a best-effort zero turned the whole
+// test into one that passes while verifying nothing, on every machine
+// without `docker`. That includes every podman host.
+//
+// Tries podman too, since this repo's own container instructions work with
+// either and the two are compatible for `logs <name>`.
 func countDebuginfodHits(t *testing.T, buildID string) int {
 	t.Helper()
-	cmd := exec.Command("docker", "logs", "debuginfod")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Logf("docker logs debuginfod: %v (proceeding with 0 hits)", err)
-		return 0
+	var out []byte
+	var err error
+	var tried []string
+	for _, engine := range []string{"docker", "podman"} {
+		if _, lookErr := exec.LookPath(engine); lookErr != nil {
+			tried = append(tried, engine+": not on PATH")
+			continue
+		}
+		out, err = exec.Command(engine, "logs", "debuginfod").CombinedOutput()
+		if err == nil {
+			break
+		}
+		tried = append(tried, engine+": "+err.Error())
+	}
+	if out == nil || err != nil {
+		t.Skipf("cannot read the debuginfod container's log, so a cache hit cannot be "+
+			"distinguished from a refetch and this test would pass without checking "+
+			"anything (#165). Tried %v", tried)
 	}
 	needle := "GET /buildid/" + buildID + "/debuginfo"
 	count := 0

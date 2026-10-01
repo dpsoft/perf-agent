@@ -34,12 +34,21 @@ var (
 	flagSampleRate    = flag.Int("sample-rate", 99, "CPU profiling sample rate in Hz")
 	flagProfileOutput = flag.String("profile-output", "", "Output path for CPU profile (default: auto-generated)")
 	flagOffcpuOutput  = flag.String("offcpu-output", "", "Output path for off-CPU profile (default: auto-generated)")
-	flagPMUOutput     = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
-	flagFlamegraph    = flag.String("flamegraph-output", "",
+	flagGPU           = flag.Bool("gpu", false,
+		"Enable GPU profiling alongside --profile/--offcpu. The target must ALREADY have loaded "+
+			"the CUPTI adapter through CUDA_INJECTION64_PATH: injection happens during cuInit and "+
+			"cannot be added to a live process, so set that variable before starting the workload "+
+			"(this is what Parca and OpenTelemetry's profilers require too). Needs --gpu-shim")
+	flagGPUShim = flag.String("gpu-shim", "",
+		"The CUPTI adapter the target loaded. Must be the SAME FILE it mapped: the uprobe attaches "+
+			"by inode, so identical bytes at another path is a different target and nothing is captured")
+	flagGPUOutput  = flag.String("gpu-output", "", "Output path for GPU profile (default: auto-generated)")
+	flagPMUOutput  = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
+	flagFlamegraph = flag.String("flamegraph-output", "",
 		"Also write a self-contained interactive HTML flame graph of the profile. "+
 			"Pass a path, or 'auto' to name it like the other outputs "+
 			"({process}-{timestamp}-{on-cpu|off-cpu}.html). With both --profile and "+
-			"--offcpu, only 'auto' is accepted: one path cannot name two graphs.")
+			"--offcpu or --gpu, only 'auto' is accepted: one path cannot name several graphs.")
 	flagPerfDataOutput = flag.String("perf-data-output", "",
 		"Write a kernel-format perf.data file alongside the pprof output. "+
 			"Consumable by perf script, perf report, create_llvm_prof (AutoFDO PGO), "+
@@ -180,19 +189,36 @@ func buildOptions() []perfagent.Option {
 	}
 
 	// Profiling modes
-	if !*flagProfile && !*flagPMU && !*flagOffCpu {
-		log.Fatal("At least one of --profile, --offcpu, or --pmu must be specified")
+	if !*flagProfile && !*flagPMU && !*flagOffCpu && !*flagGPU {
+		log.Fatal("At least one of --profile, --offcpu, --gpu, or --pmu must be specified")
+	}
+
+	// Caught here rather than at attach time so the message names the flag
+	// the operator forgot, not an empty path deep in the GPU pipeline.
+	if *flagGPU && *flagGPUShim == "" {
+		log.Fatal("--gpu requires --gpu-shim: it names the adapter the target loaded through " +
+			"CUDA_INJECTION64_PATH, and the uprobe attaches to that file's inode")
+	}
+	if *flagGPUShim != "" && !*flagGPU {
+		log.Fatal("--gpu-shim is only meaningful with --gpu")
 	}
 
 	// --flamegraph-output names at most one file, so with both stack
 	// profiling modes on it can only be "auto". Silently rendering one mode
 	// and dropping the other would leave a plausible-looking graph that is
 	// missing half the run.
-	if *flagFlamegraph != "" && *flagFlamegraph != "auto" && *flagProfile && *flagOffCpu {
-		log.Fatal("--flamegraph-output with an explicit path cannot serve both --profile and --offcpu; use --flamegraph-output auto, or run one mode at a time")
+	stackModes := 0
+	for _, on := range []bool{*flagProfile, *flagOffCpu, *flagGPU} {
+		if on {
+			stackModes++
+		}
 	}
-	if *flagFlamegraph != "" && !*flagProfile && !*flagOffCpu {
-		log.Fatal("--flamegraph-output requires --profile or --offcpu; there is no stack profile to render")
+	if *flagFlamegraph != "" && *flagFlamegraph != "auto" && stackModes > 1 {
+		log.Fatal("--flamegraph-output with an explicit path cannot serve more than one of " +
+			"--profile, --offcpu and --gpu; use --flamegraph-output auto, or run one mode at a time")
+	}
+	if *flagFlamegraph != "" && stackModes == 0 {
+		log.Fatal("--flamegraph-output requires --profile, --offcpu or --gpu; there is no stack profile to render")
 	}
 
 	if *flagProfile {
@@ -220,6 +246,21 @@ func buildOptions() []perfagent.Option {
 
 		if path := flamegraphPath(*flagFlamegraph, "off-cpu"); path != "" {
 			opts = append(opts, perfagent.WithOffCPUFlamegraph(path))
+		}
+	}
+
+	if *flagGPU {
+		outputPath := *flagGPUOutput
+		if outputPath == "" {
+			outputPath = generateOutputName(*flagPID, *flagAll, "gpu", "pb.gz")
+		}
+		opts = append(opts,
+			perfagent.WithGPU(*flagGPUShim),
+			perfagent.WithGPUProfilePath(outputPath),
+		)
+
+		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {
+			opts = append(opts, perfagent.WithGPUFlamegraph(path))
 		}
 	}
 

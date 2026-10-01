@@ -228,7 +228,7 @@ func TestGateASourceLineIsReachedFromACPUStack(t *testing.T) {
 		Launch: LaunchContext{
 			PID:          pid,
 			TimeNs:       10,
-			CPUStack:     pp.FramesFromNames([]string{"main", "run_training_step", "cudaLaunchKernel"}),
+			CPUStack:     pp.FramesFromNames([]string{"cudaLaunchKernel", "run_training_step", "main"}),
 			SamplePeriod: 8,
 		},
 	}))
@@ -265,7 +265,7 @@ func TestGateASourceLineIsReachedFromACPUStack(t *testing.T) {
 	// --- the CPU stack half.
 	names := frameNames(s.Stack)
 	assert.Equal(t,
-		[]string{"main", "run_training_step", "cudaLaunchKernel", FrameLaunch, "[gpu:kernel:addOne]"},
+		[]string{"[gpu:kernel:addOne]", FrameLaunch, "cudaLaunchKernel", "run_training_step", "main"},
 		names,
 		"the sample's frames must be the launching CPU call path, the boundary marker and the kernel - nothing more and nothing less")
 
@@ -348,7 +348,7 @@ func TestGateResolvedAndNoLineinfoAggregateAtTheSameKernel(t *testing.T) {
 
 	assert.Equal(t, frameNames(samples[0].Stack), frameNames(samples[1].Stack),
 		"the resolvable and unresolvable populations must aggregate at the same kernel; a frame that varies with gpu_src_status splits the kernel's own block in two")
-	assert.Equal(t, []string{"main", FrameLaunch, "[gpu:kernel:addOne]"}, frameNames(samples[0].Stack))
+	assert.Equal(t, []string{"[gpu:kernel:addOne]", FrameLaunch, "main"}, frameNames(samples[0].Stack))
 }
 
 // TestGateGraphExecutionRefusalIsReal is gate assertion 10b's FIRST clause:

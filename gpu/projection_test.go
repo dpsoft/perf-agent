@@ -23,7 +23,7 @@ func frameNames(frames []pp.Frame) []string {
 func TestProjectionPutsStackInFramesAndDetailInLabels(t *testing.T) {
 	tl := NewTimeline(TimelineConfig{})
 	l := launch("a", 10)
-	l.Launch.CPUStack = pp.FramesFromNames([]string{"train_step", "cudaLaunchKernel"})
+	l.Launch.CPUStack = pp.FramesFromNames([]string{"cudaLaunchKernel", "train_step"})
 	l.Launch.Tags = map[string]string{"pod_uid": "pod-a"}
 	require.NoError(t, tl.EmitLaunch(l))
 	require.NoError(t, tl.EmitExec(execFor("a", 20, 30)))
@@ -36,7 +36,7 @@ func TestProjectionPutsStackInFramesAndDetailInLabels(t *testing.T) {
 	require.Len(t, samples, 1)
 
 	assert.Equal(t,
-		[]string{"train_step", "cudaLaunchKernel", "[gpu:launch]", "[gpu:kernel:k_a]"},
+		[]string{"[gpu:kernel:k_a]", "[gpu:launch]", "cudaLaunchKernel", "train_step"},
 		frameNames(samples[0].Stack),
 		"frames carry the CPU stack, the boundary marker and the kernel - nothing else")
 
@@ -309,7 +309,7 @@ func TestProjectionHandlesUnmatchedExecution(t *testing.T) {
 
 	samples := ProjectExecutions(tl.Snapshot())
 	require.Len(t, samples, 1)
-	assert.Equal(t, []string{"[gpu:launch unsampled]", "[gpu:kernel:k_ghost]"}, frameNames(samples[0].Stack),
+	assert.Equal(t, []string{"[gpu:kernel:k_ghost]", "[gpu:launch unsampled]"}, frameNames(samples[0].Stack),
 		"an execution with no launch still projects, without a fabricated CPU stack - and under the "+
 			"unsampled marker, because no CPU call path is being claimed for its time")
 	assert.Equal(t, uint32(0), samples[0].Pid,
@@ -403,15 +403,15 @@ func TestSampledAndUnsampledPopulationsHaveDifferentShapes(t *testing.T) {
 	snap := Snapshot{Executions: []ExecutionView{
 		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"},
 			Launch: &GPUKernelLaunch{Launch: LaunchContext{
-				CPUStack: pp.FramesFromNames([]string{"main", "train_step"}), SamplePeriod: 4}}},
+				CPUStack: pp.FramesFromNames([]string{"train_step", "main"}), SamplePeriod: 4}}},
 		{Exec: GPUKernelExec{StartNs: 0, EndNs: 10, KernelName: "kAdd"}},
 	}}
 
 	samples := ProjectExecutions(snap)
 	require.Len(t, samples, 2)
-	assert.Equal(t, []string{"main", "train_step", FrameLaunch, "[gpu:kernel:kAdd]"},
+	assert.Equal(t, []string{"[gpu:kernel:kAdd]", FrameLaunch, "train_step", "main"},
 		frameNames(samples[0].Stack))
-	assert.Equal(t, []string{FrameLaunchUnsampled, "[gpu:kernel:kAdd]"},
+	assert.Equal(t, []string{"[gpu:kernel:kAdd]", FrameLaunchUnsampled},
 		frameNames(samples[1].Stack))
 }
 
@@ -428,7 +428,7 @@ func TestSamplePeriodLabelOnlyRidesWithARealStack(t *testing.T) {
 
 	samples := ProjectExecutions(snap)
 	require.Len(t, samples, 1)
-	assert.Equal(t, []string{FrameLaunchUnsampled, "[gpu:kernel:kAdd]"}, frameNames(samples[0].Stack))
+	assert.Equal(t, []string{"[gpu:kernel:kAdd]", FrameLaunchUnsampled}, frameNames(samples[0].Stack))
 	assert.NotContains(t, samples[0].Labels, "gpu_sample_period",
 		"a period with no stack attributes nothing; advertising it invites a scale of zero data")
 }
@@ -862,7 +862,7 @@ func TestProjectionAddsNoFrames(t *testing.T) {
 	}
 	for _, s := range samples {
 		names := frameNames(s.Stack)
-		assert.Equal(t, []string{"main", FrameLaunch, "[gpu:kernel:addOne]"}, names)
+		assert.Equal(t, []string{"[gpu:kernel:addOne]", FrameLaunch, "main"}, names)
 		for _, name := range names {
 			for _, bad := range forbidden {
 				assert.NotContains(t, name, bad, "frame %q must not carry per-sample detail", name)

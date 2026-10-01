@@ -9,7 +9,7 @@ with PGO and a stripped final binary, measure the speedup.
 
 - Rust toolchain (`cargo --version` ≥ 1.70).
 - `perf-agent` built and on PATH (or pass `AGENT=/path/to/perf-agent`).
-  Required caps: `setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`.
+  Required caps: `setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep`.
 - `create_llvm_prof` from <https://github.com/google/autofdo>. Build:
   ```bash
   git clone https://github.com/google/autofdo
@@ -50,13 +50,25 @@ duration with `DURATION=60s` (default 30s).
    option directly.
 6. Benchmarks the optimised binary, prints the speedup.
 
-Typical result on this synthetic via the rustc LLVM-args path: 1–3%
-improvement. The companion [C++ demo](../cpp-pgo/) on the same shape of
-workload reaches ~30% — clang's `-fprofile-sample-use` integrates the
-profile into the full optimisation pipeline (inlining, branch layout,
-register allocation), whereas rustc only feeds it to LLVM at the
-codegen pass. Real production workloads vary; the numbers are
-illustrative.
+**Measured on rustc 1.97.1: no improvement.** Two runs on an otherwise
+idle machine gave 1.00x (-0.0% and -0.4%), which is noise. The pipeline
+itself is healthy — `create_llvm_prof` converts the profile, every sample
+maps, the `.prof` carries real line-level counts, and LLVM raises no
+`-pgo-warn-missing-function` warning — so the profile is being applied
+and simply does not move this workload.
+
+The companion [C++ demo](../cpp-pgo/) on the same shape of workload
+reaches **1.23x (19%)**, measured the same way. clang's
+`-fprofile-sample-use` integrates the profile into the full optimisation
+pipeline (inlining, branch layout, register allocation), whereas rustc
+only feeds it to LLVM at the codegen pass, and on stable there is no
+high-level AutoFDO flag at all.
+
+So treat this example as a demonstration that perf-agent's output drives
+the AutoFDO toolchain for Rust, not as a benchmark showing Rust gains
+from it. Whether a workload gains is a property of the workload and the
+rustc version; see
+[#168](https://github.com/dpsoft/perf-agent/issues/168).
 
 ## Why this works
 

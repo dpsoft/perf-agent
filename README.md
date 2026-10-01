@@ -37,7 +37,7 @@ One binary, runs locally, no backend or telemetry.
 make build
 
 # Grant capabilities once so subsequent runs don't need sudo
-sudo setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent
+sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
 
 # Capture a 30-second CPU profile of one process — output is pprof
 ./perf-agent --profile --pid <PID> --duration 30s
@@ -45,6 +45,12 @@ sudo setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_rest
 # Inspect
 go tool pprof <output>.pb.gz
 ```
+
+`cap_syslog` is what makes `/proc/kallsyms` return real addresses. Without it
+the file reads as zeros and kernel frames stay unsymbolized with no error —
+`--kernel-stacks` simply produces bare `0xffffffff…` names. On kernels older
+than 5.9, add `cap_sys_admin`: `CAP_CHECKPOINT_RESTORE` (5.9) is what covers
+`/proc/<pid>/map_files` for symbolization, and it does not exist there.
 
 ---
 
@@ -113,7 +119,14 @@ see [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
 
 ### 🧪 PGO and flame graphs
 
-High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof -diff_base` and Go's native `-pgo=...` flag.
+High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof` and `-diff_base`.
+
+> Go's native `-pgo=` flag does **not** accept these profiles yet. It requires
+> `Function.start_line`, which perf-agent does not populate, and rejects the
+> file outright: `preprofile: error parsing profile: profile missing
+> Function.start_line data`. Tracked in
+> [#171](https://github.com/dpsoft/perf-agent/issues/171). The AutoFDO path
+> below is unaffected and works today.
 
 For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` alongside the pprof output. Same capture, two formats:
 
@@ -146,7 +159,7 @@ The page also states what it is *not* showing: the count of frames with no symbo
 ## Requirements
 
 - Linux kernel 5.8+ (BTF + CO-RE).
-- Root, OR `setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent`.
+- Root, OR `setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent`.
 
 <details>
 <summary>What each capability is for, and when <code>cap_sys_admin</code> can be dropped</summary>
@@ -182,7 +195,7 @@ still the default.
 On **kernel 5.9 or newer** the minimal set is:
 
 ```bash
-sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent
+sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
 ```
 
 If you run 6.x — as most deployments now do — this is the set to use. It matters
@@ -453,7 +466,7 @@ Unit tests run without root; integration tests require root or a setcap'd binary
 ```bash
 # Build + cap the binary once, then run tests as a normal user
 make build
-sudo setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep ./perf-agent
+sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
 
 # Unit tests (no root)
 make test-unit

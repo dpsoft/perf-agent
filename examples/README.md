@@ -13,7 +13,7 @@ own README, source workload, and driver script.
 | [`kubernetes/`](kubernetes/) | Profile an unmodified PyTorch CUDA pod in k8s via CUPTI injection, as a sidecar. **Not runnable yet — see #121.** |
 
 The first three depend on `perf-agent` being built and on PATH with the standard
-capability set (`setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`).
+capability set (`setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep`).
 
 ## One exception to "runnable"
 

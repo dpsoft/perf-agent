@@ -8,7 +8,7 @@ flame-graph tooling unchanged.
 ## Prerequisites
 
 - `perf-agent` built and on PATH, with caps set
-  (`setcap cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore+ep`).
+  (`setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep`).
 - `perf` binary on PATH (for `perf script`). Most distributions ship it
   in the `linux-tools` / `perf` / `linux-perf` package.
 - Brendan Gregg's FlameGraph scripts:

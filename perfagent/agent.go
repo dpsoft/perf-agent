@@ -433,7 +433,20 @@ func (a *Agent) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("symbolizer: %w", err)
 	}
-	a.symbolizer = sym
+	// Serialized because sharing is only safe one caller at a time: blazesym
+	// holds its caches in RefCell and a concurrent borrow aborts the process
+	// from inside Rust. The collectors here symbolize in batches from the
+	// collect path, one after another, so they have never collided -- but
+	// nothing enforces that, and the next collector that resolves stacks
+	// while a capture is running takes the whole process down with it.
+	// See symbolize.Serialized.
+	//
+	// Assigned through a nil check rather than directly: NewSerialized
+	// returns a typed nil for a nil input, and a typed nil in an interface
+	// field is not nil, which would defeat every `a.symbolizer != nil` below.
+	if ser := symbolize.NewSerialized(sym); ser != nil {
+		a.symbolizer = ser
+	}
 	a.kernelSymbolizer = chooseKernelSymbolizer(a.config, slog.Default())
 
 	// Optional /metrics + /debug/pprof endpoint. Started after the
@@ -750,7 +763,15 @@ func (a *Agent) Close() error {
 // (issue #109). Fetch counts and bytes are what distinguish "the network was
 // slow" from "this build-id is not on any server and we asked 199 times".
 func (a *Agent) logDebuginfodStats() {
-	d, ok := a.symbolizer.(*debuginfod.Symbolizer)
+	// Through the serializing wrapper first: the agent's symbolizer is
+	// wrapped in Start(), and a type assertion straight at it would miss,
+	// silently returning this function to the state issue #109 describes --
+	// the counters existing and nothing printing them.
+	inner := a.symbolizer
+	if ser, ok := inner.(*symbolize.Serialized); ok {
+		inner = ser.Unwrap()
+	}
+	d, ok := inner.(*debuginfod.Symbolizer)
 	if !ok {
 		return
 	}

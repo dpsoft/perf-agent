@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/metrics"
 )
 
@@ -54,6 +55,37 @@ type Config struct {
 	// OffCPUFlamegraphPath is the same for the off-CPU profile. Set via
 	// WithOffCPUFlamegraph.
 	OffCPUFlamegraphPath string
+
+	// EnableGPU enables GPU profiling alongside the CPU and off-CPU
+	// collectors. The target must already have loaded the CUPTI adapter
+	// through CUDA_INJECTION64_PATH: injection happens during cuInit and
+	// cannot be added to a live process, so the agent attaches rather than
+	// launching. See issue #154 and package gpuprofile.
+	EnableGPU bool
+
+	// GPUShimPath is the adapter the target loaded. The uprobe attaches to
+	// this file's INODE, so it must be the same file the target mapped --
+	// identical bytes at another path is a different target.
+	GPUShimPath string
+
+	// GPUProfilePath is the output path for the GPU profile.
+	GPUProfilePath string
+
+	// GPUProfileWriter is an optional writer for GPU profile output.
+	// If set, profile data is written here instead of to GPUProfilePath.
+	GPUProfileWriter io.Writer
+
+	// GPUFlamegraphPath is the same as CPUFlamegraphPath for the GPU
+	// profile. Set via WithGPUFlamegraph.
+	GPUFlamegraphPath string
+
+	// GPUPCSampling selects the GPU PC-sampling tier.
+	GPUPCSampling gpu.PCSamplingTier
+
+	// GPUKeepInstrumentationFrames leaves the profiler's own delivery path
+	// in every sampled GPU stack. The elision is irreversible once the
+	// profile is written, so this has to be set at capture time.
+	GPUKeepInstrumentationFrames bool
 
 	// EnablePMU enables PMU hardware counter monitoring.
 	EnablePMU bool
@@ -165,6 +197,7 @@ func DefaultConfig() *Config {
 		SampleRate:        99,
 		CPUProfilePath:    "profile.pb.gz",
 		OffCPUProfilePath: "offcpu.pb.gz",
+		GPUProfilePath:    "gpu.pb.gz",
 	}
 }
 
@@ -327,6 +360,46 @@ func WithCPUFlamegraph(path string) Option {
 }
 
 // WithOffCPUFlamegraph is WithCPUFlamegraph for the off-CPU profile.
+// WithGPU enables the GPU collector against the adapter the target already
+// loaded through CUDA_INJECTION64_PATH.
+//
+// shimPath must be the SAME FILE the target mapped. The uprobe attaches by
+// inode, so a rebuilt or copied adapter with identical bytes is a different
+// target and the attach will find nothing.
+func WithGPU(shimPath string) Option {
+	return func(c *Config) {
+		c.EnableGPU = true
+		c.GPUShimPath = shimPath
+	}
+}
+
+// WithGPUProfilePath sets where the GPU profile is written.
+func WithGPUProfilePath(path string) Option {
+	return func(c *Config) { c.GPUProfilePath = path }
+}
+
+// WithGPUProfileWriter sends the GPU profile to w instead of a path.
+func WithGPUProfileWriter(w io.Writer) Option {
+	return func(c *Config) { c.GPUProfileWriter = w }
+}
+
+// WithGPUFlamegraph renders an HTML flame graph from the GPU profile.
+func WithGPUFlamegraph(path string) Option {
+	return func(c *Config) { c.GPUFlamegraphPath = path }
+}
+
+// WithGPUPCSampling selects the GPU PC-sampling tier.
+func WithGPUPCSampling(t gpu.PCSamplingTier) Option {
+	return func(c *Config) { c.GPUPCSampling = t }
+}
+
+// WithGPUKeepInstrumentationFrames keeps the profiler's own delivery path in
+// every sampled GPU stack. Set at capture time or not at all: the elision
+// happens before the profile is written.
+func WithGPUKeepInstrumentationFrames() Option {
+	return func(c *Config) { c.GPUKeepInstrumentationFrames = true }
+}
+
 func WithOffCPUFlamegraph(path string) Option {
 	return func(c *Config) { c.OffCPUFlamegraphPath = path }
 }

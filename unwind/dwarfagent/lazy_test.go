@@ -1,7 +1,6 @@
 package dwarfagent_test
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -29,29 +28,18 @@ func TestLazyMode_FiresAndCompilesOnMiss(t *testing.T) {
 		}
 	}
 
-	// Spawn a workload to ensure /proc has at least one non-self PID
-	// visible during the lazy scan. Even though we're going system-wide,
-	// some test environments may have minimal /proc; spawning ensures
-	// there's at least one binary to enroll + compile.
-	sleepPath := "/usr/bin/sleep"
-	if _, err := os.Stat(sleepPath); err != nil {
-		sleepPath = "/bin/sleep"
-	}
-	cmd := exec.Command(sleepPath, "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("spawn sleep: %v", err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
-
-	// Wait for /proc visibility.
-	pid := cmd.Process.Pid
-	for range 50 {
-		if _, err := os.Stat(fmt.Sprintf("/proc/%d/maps", pid)); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
+	// The workload is spawned AFTER the profiler below, not here, and it
+	// burns CPU rather than sleeping. Both of those are the fix for #179.
+	//
+	// This used to spawn `sleep 30`, with the comment that it was there "to
+	// ensure /proc has at least one non-self PID visible during the lazy
+	// scan" -- enrollment. But a sleeping process is never ON CPU, so it is
+	// never sampled, so no PC ever lands in its mapping and it can never
+	// produce a CFI miss. Every miss this test observed came incidentally
+	// from whatever else happened to be running on the machine, which on a
+	// quiet CI runner is nothing. That is why it passed on amd64 and failed
+	// on arm64 in the same commit, and then passed on arm64 in the next
+	// run: the arch was never the variable, machine activity was.
 	// Construct system-wide lazy profiler. Per-PID lazy falls back to
 	// eager inside NewProfilerWithMode, so we use systemWide=true.
 	cpus := make([]uint, runtime.NumCPU())
@@ -63,9 +51,34 @@ func TestLazyMode_FiresAndCompilesOnMiss(t *testing.T) {
 		t.Fatalf("NewProfilerWithMode: %v", err)
 	}
 
-	// Attach window: 5 seconds. Walker fires repeatedly; each FP_LESS+miss
-	// emits a rate-limited ringbuf event; drainer resolves and compiles.
-	time.Sleep(5 * time.Second)
+	// NOW spawn the workload, so its binary is enrolled LAZILY -- the case
+	// this mode exists for -- rather than during the profiler's startup
+	// scan. rust-workload is CPU-bound and carries .eh_frame, so it is both
+	// sampled and in need of CFI, and it is not already running on the
+	// machine, so its tables cannot have been compiled beforehand.
+	binPath := "../../test/workloads/rust/target/release/rust-workload"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Skipf("rust workload not built: %v", err)
+	}
+	workload := exec.Command(binPath, "20", "2")
+	if err := workload.Start(); err != nil {
+		t.Fatalf("start rust workload: %v", err)
+	}
+	t.Cleanup(func() { _ = workload.Process.Kill(); _ = workload.Wait() })
+
+	// Poll rather than sleep a fixed window. The miss is a race by nature --
+	// it exists only between a binary being enrolled and its CFI being
+	// compiled -- so a fixed sleep either wastes time or lands outside the
+	// window. Waiting for the condition with a deadline does neither, and a
+	// profiler that genuinely never fires one still fails, at the deadline,
+	// with the counters printed.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := prof.MissStats(); st.Received > 0 && st.Resolved > 0 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 
 	// Enrollment counts, snapshotted with the miss stats.
 	//

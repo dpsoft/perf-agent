@@ -36,6 +36,18 @@ echo "==> 3. Capture profile via perf-agent"
 ./target/release/rust-pgo-example "$ITER" &
 WL_PID=$!
 sleep 1   # workload warmup
+# The workload must outlive the capture window, and on fast hardware the
+# default ITER does not, leaving the agent to attach to a pid that is
+# already gone and fail with "read /proc/<pid>/status: no such file or
+# directory" -- which reads like a permissions problem rather than "raise
+# ITER" (#167).
+if ! kill -0 "$WL_PID" 2>/dev/null; then
+    echo "ERROR: the workload finished before the profiler could attach." >&2
+    echo "  ITER=$ITER is too small for this machine. Raise it until the" >&2
+    echo "  baseline run above takes comfortably longer than DURATION=$DURATION," >&2
+    echo "  e.g. ITER=\$(( $ITER * 100 ))." >&2
+    exit 1
+fi
 "$AGENT" --profile --pid "$WL_PID" --duration "$DURATION" \
          --perf-data-output train.perf.data
 wait "$WL_PID" || true

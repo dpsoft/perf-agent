@@ -39,6 +39,8 @@ type LocalSymbolizer struct {
 	symbols *nvsym.Store
 	closed  atomic.Bool
 	stats   localCounters
+	// startLines caches each function's declaration line; see startline.go.
+	startLines *startLineCache
 }
 
 // LocalOption configures a LocalSymbolizer.
@@ -285,7 +287,7 @@ func NewLocalSymbolizer(opts ...LocalOption) (*LocalSymbolizer, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &LocalSymbolizer{bz: bz}
+	s := &LocalSymbolizer{bz: bz, startLines: newStartLineCache()}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -346,6 +348,10 @@ func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, e
 	}
 	frames := s.withModules(pid, out)
 	s.retryAgainstModuleFiles(frames)
+	// After withModules, so MapStart is populated: the cache key is the
+	// module-relative symbol start, which needs it to survive ASLR. After
+	// the retry, so frames recovered from module files get start lines too.
+	s.fillStartLines(pid, frames)
 	return frames, nil
 }
 

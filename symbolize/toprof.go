@@ -17,19 +17,21 @@ func ToProfFrames(frames []Frame) []pprof.Frame {
 		for i := len(f.Inlined) - 1; i >= 0; i-- {
 			in := f.Inlined[i]
 			out = append(out, pprof.Frame{
-				Name:    in.Name,
-				Module:  f.Module,
-				File:    in.File,
-				Line:    uint32(in.Line),
-				Address: f.Address,
+				Name:      in.Name,
+				Module:    f.Module,
+				File:      in.File,
+				Line:      uint32(in.Line),
+				StartLine: uint32(in.StartLine),
+				Address:   f.Address,
 			})
 		}
 		out = append(out, pprof.Frame{
-			Name:    f.Name,
-			Module:  f.Module,
-			File:    f.File,
-			Line:    uint32(f.Line),
-			Address: f.Address,
+			Name:      f.Name,
+			Module:    f.Module,
+			File:      f.File,
+			Line:      uint32(f.Line),
+			StartLine: uint32(f.StartLine),
+			Address:   f.Address,
 			// Carried, not re-derived. The mapping was read while the
 			// target process was alive; the pprof builder runs later - for
 			// the GPU tools, after the workload has exited - and its own

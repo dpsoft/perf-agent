@@ -65,10 +65,13 @@ type SamplesCollector interface {
 // the BPF stack so Locations stay distinguishable across samples
 // that symbolize to the same (file,line,func).
 type Frame struct {
-	Name   string
-	File   string
-	Line   uint32
-	Module string
+	Name string
+	File string
+	Line uint32
+	// StartLine is the function's declaration line; see symbolize.Frame.
+	// It lands in profile.Function.StartLine, which Go's PGO requires.
+	StartLine uint32
+	Module    string
 
 	Address  uint64
 	BuildID  string
@@ -519,9 +522,10 @@ func (p *ProfileBuilder) addFunction(frame Frame, mappingID uint64) *profile.Fun
 	}
 	id := uint64(len(p.Profile.Function) + 1)
 	f := &profile.Function{
-		ID:       id,
-		Name:     frame.Name,
-		Filename: frame.File,
+		ID:        id,
+		Name:      frame.Name,
+		Filename:  frame.File,
+		StartLine: int64(frame.StartLine),
 	}
 	p.Profile.Function = append(p.Profile.Function, f)
 	p.functions[key] = f

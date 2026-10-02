@@ -21,9 +21,20 @@ type Frame struct {
 	File    string
 	Line    int
 	Column  int
-	Offset  uint64
-	Inlined []Frame
-	Reason  FailureReason
+	// StartLine is the line on which the FUNCTION is declared, as distinct
+	// from Line, which is the line of this particular address.
+	//
+	// Go's PGO requires it: cmd/compile matches profile functions on
+	// (name, start_line) and refuses a profile without it outright --
+	// "profile missing Function.start_line data" -- so a pprof that omits
+	// it cannot drive `go build -pgo=` at all. See issue #171.
+	//
+	// Zero means unknown, which is what a frame that could not be named
+	// carries and what a symbolizer that does not supply it leaves behind.
+	StartLine int
+	Offset    uint64
+	Inlined   []Frame
+	Reason    FailureReason
 
 	// MapStart, MapLimit and MapOff describe the mapping Address fell in,
 	// when one is known: the mapping's start and (exclusive) end virtual

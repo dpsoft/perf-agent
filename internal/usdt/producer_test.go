@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -38,11 +39,25 @@ func TestShimProbeMacrosProduceAParsableNoteWithPinnedRegisters(t *testing.T) {
 	// composed two probes for the first time.
 	require.Len(t, probes, 2)
 
+	// The property is that the macro NAMES its argument registers rather than
+	// leaving the choice to the compiler. The names themselves are the ABI's,
+	// and the two ABIs do not agree: SysV x86-64 passes the first three
+	// integer arguments in rdi/rsi/rdx, AAPCS64 in x0/x1/x2. Hard-coding the
+	// x86-64 spelling made this test an architecture check wearing an ABI
+	// check's clothes -- it failed on arm64 the first time any job ran it.
+	wantArgs := map[string]string{
+		"amd64": "8@%rdi 8@%rsi 8@%rdx",
+		"arm64": "8@x0 8@x1 8@x2",
+	}[runtime.GOARCH]
+	require.NotEmpty(t, wantArgs,
+		"no pinned argument registers recorded for GOARCH %s; add them rather than "+
+			"letting this assertion pass vacuously on a new architecture", runtime.GOARCH)
+
 	names := make(map[string]bool)
 	for _, p := range probes {
 		assert.Equal(t, "perfagent", p.Provider)
 		assert.True(t, p.HasSemaphore, "the shim must be able to skip work when nobody listens")
-		assert.Equal(t, "8@%rdi 8@%rsi 8@%rdx", p.Args,
+		assert.Equal(t, wantArgs, p.Args,
 			"the ABI pins its argument registers; an unpinned macro lets the compiler choose")
 		names[p.Name] = true
 	}

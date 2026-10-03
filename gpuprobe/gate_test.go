@@ -889,13 +889,30 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	}
 
 	// --- main, reached with a LIVE frame pointer, so the FP path works.
+	//
+	// The property is FPType, not CFAType. "Has a frame pointer the walk can
+	// step out through" means the caller's FP is SAVED at a known slot, which
+	// is FPTypeOffsetCFA; whether the CFA is then expressed off that register
+	// or off SP is the compiler's business and varies independently:
+	//
+	//   gcc    x86-64   CFA FP-rooted   (def_cfa_register %rbp; measured -16)
+	//   gcc    aarch64  CFA SP-rooted   (SP is constant through the body)
+	//   clang  aarch64  CFA FP-rooted   (def_cfa_register x29)
+	//
+	// All three save the frame pointer, so all three are walkable, and all
+	// three report FPTypeOffsetCFA. Asserting CFATypeFP here pinned the first
+	// row of that table and nothing else -- it failed on arm64 the first time
+	// any job ran this test, and would have failed again on a clang build of
+	// the same architecture it passed on. walk_step reads the saved-FP slot;
+	// it does not care what the CFA is rooted at.
 	mainPC := pcOf("main")
-	require.Equal(t, ehcompile.CFATypeFP, cfaBaseOf(entries, mainPC),
-		"main is not FP_SAFE, so the walk would not take the frame-pointer path out of it")
 	mainCFI := cfiOf(entries, mainPC)
-	require.NotNil(t, mainCFI)
-	assert.Equal(t, ehcompile.CFATypeFP, mainCFI.CFAType,
-		"main's CFA is not FP-rooted, so its saved-FP slot is not where the walk expects")
+	require.NotNil(t, mainCFI, "no CFI row covers main")
+	require.Equal(t, ehcompile.FPTypeOffsetCFA, mainCFI.FPType,
+		"main does not save the caller's frame pointer, so the walk has no FP slot "+
+			"to step out through and would not take the frame-pointer path out of it")
+	require.NotZero(t, mainCFI.FPOffset,
+		"main's saved-FP slot is at CFA+0, which no prologue produces; the rule was misread")
 	assert.NotEqual(t, ehcompile.RATypeUndefined, mainCFI.RAType,
 		"main marks itself outermost, which would end the walk before libc")
 
@@ -1149,6 +1166,22 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 		t.Fatalf("no CFI row covers %#x, the midpoint of %s: the walker would fall back to the frame pointer and never take the DWARF path", pc, name)
 		return 0
 	}
+	fpRule := func(t *testing.T, name string) ehcompile.FPType {
+		t.Helper()
+		for i := range syms {
+			if syms[i].Name != name {
+				continue
+			}
+			pc := syms[i].Value + syms[i].Size/2
+			for _, e := range entries {
+				if pc >= e.PCStart && pc < e.PCStart+uint64(e.PCEndDelta) {
+					return e.FPType
+				}
+			}
+		}
+		t.Fatalf("no CFI row covers the midpoint of %s", name)
+		return 0
+	}
 
 	// The two frames between the probe and main: SP-rooted, i.e. no frame
 	// pointer to walk, so only the unwind tables can cross them.
@@ -1162,9 +1195,13 @@ func TestTheProducersBridgeFramesAreFPLessInTheCFI(t *testing.T) {
 	// frame it has to land on afterwards. If either were FP-less the walk
 	// would still work but would no longer exercise the FP -> DWARF -> FP
 	// handoff this producer exists to reproduce.
+	// Read as FPType for the reason spelt out in
+	// TestTheCFIForcesTheWalkToReachTheRoot: a saved frame pointer is what the
+	// walk steps through, and the CFA's base register is a compiler choice
+	// that differs between gcc and clang on the SAME architecture.
 	for _, name := range []string{"perfagent_stub_run", "main"} {
-		assert.Equalf(t, ehcompile.CFATypeFP, cfaBase(t, name),
-			"%s has an SP-rooted CFA, so the walk would not cross a frame-pointer/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
+		assert.Equalf(t, ehcompile.FPTypeOffsetCFA, fpRule(t, name),
+			"%s does not save the caller's frame pointer, so the walk would not cross a frame-pointer/DWARF boundary and the producer would not reproduce the CUDA stack shape", name)
 	}
 }
 

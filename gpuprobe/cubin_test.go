@@ -67,6 +67,53 @@ func sealedCubinFD(t *testing.T, body []byte, seals int) int {
 	return fd
 }
 
+// unsealedTmpfsFD is the dangerous half of the unsealed case: a descriptor on
+// a filesystem that IS shmem, and so IS sealable, holding body under
+// F_SEAL_SEAL alone - no write protection at all. It answers F_GET_SEALS like
+// a real sealed object while the peer can still write through it.
+//
+// It has to be a genuine tmpfs file, and t.TempDir() is not one: that follows
+// TMPDIR, which on a GitHub runner points at ext4, where F_GET_SEALS answers
+// EINVAL and this case collapses into the pipe case above - the same code path
+// under a different name, and nothing testing the dangerous one. So find a
+// directory statfs actually calls tmpfs, and pin the seal set here, where a
+// wrong precondition says so, instead of leaving it to an assertion further
+// down that only happens to notice.
+func unsealedTmpfsFD(t *testing.T, body []byte) int {
+	t.Helper()
+
+	candidates := []string{"/dev/shm", t.TempDir(), fmt.Sprintf("/run/user/%d", os.Getuid())}
+	for _, dir := range candidates {
+		var st unix.Statfs_t
+		if err := unix.Statfs(dir, &st); err != nil || uint64(st.Type) != uint64(unix.TMPFS_MAGIC) {
+			continue
+		}
+
+		w, err := os.CreateTemp(dir, "perfagent-not-a-memfd-")
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { _ = os.Remove(w.Name()) })
+		_, err = w.Write(body)
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+
+		f, err := os.Open(w.Name())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = f.Close() })
+
+		seals, serr := unix.FcntlInt(f.Fd(), unix.F_GET_SEALS, 0)
+		require.NoError(t, serr, "%s is tmpfs, but F_GET_SEALS refused a file on it", dir)
+		require.Equal(t, unix.F_SEAL_SEAL, seals,
+			"%s answered with seals 0x%x; this case is about F_SEAL_SEAL alone", dir, seals)
+		return int(f.Fd())
+	}
+
+	t.Fatalf("no tmpfs directory among %v, so there is nothing to build a "+
+		"sealable-but-unsealed object on", candidates)
+	return -1
+}
+
 // offerHeader is a well-formed header for `size` bytes under `crc`.
 func offerHeader(size, crc uint64) cubinHeader {
 	return cubinHeader{magic: cubinHeaderMagic, version: cubinHeaderVersion, size: size, crc: crc}
@@ -496,14 +543,10 @@ func TestADescriptorThatIsNotASealedMemfdIsRefused(t *testing.T) {
 		l := testCubinListener(t, Config{ShimPath: shim}, sink)
 
 		body := cubinFixture(1024)
-		path := filepath.Join(t.TempDir(), "not-a-memfd")
-		require.NoError(t, os.WriteFile(path, body, 0o600))
-		f, err := os.Open(path)
-		require.NoError(t, err)
-		defer func() { _ = f.Close() }()
+		fd := unsealedTmpfsFD(t, body)
 
 		require.Equal(t, byte(cubinReplyRefused),
-			offerCubin(t, l.address(), offerHeader(uint64(len(body)), 9), int(f.Fd())))
+			offerCubin(t, l.address(), offerHeader(uint64(len(body)), 9), fd))
 
 		st := l.snapshot()
 		assert.Equal(t, uint64(1), st.unsealed)

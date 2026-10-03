@@ -10,5 +10,5 @@ package pyunwind
 // the driver's own (cilium/ebpf MapReplacements) and installs the program
 // whose type matches the driver into the driver's interp_progs table.
 //
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -go-package=pyunwind pywalk ../bpf/interp/python/python_walk.bpf.c -- -I../bpf
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target arm64 -go-package=pyunwind pywalk ../bpf/interp/python/python_walk.bpf.c -- -I../bpf
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -go-package=pyunwind pywalk ../bpf/interp/python/python_walk.bpf.c -- -I../bpf/libbpf -I../bpf
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target arm64 -go-package=pyunwind pywalk ../bpf/interp/python/python_walk.bpf.c -- -I../bpf/libbpf -I../bpf

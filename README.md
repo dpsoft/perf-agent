@@ -119,14 +119,18 @@ see [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
 
 ### 🧪 PGO and flame graphs
 
-High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof` and `-diff_base`.
+High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof`, `-diff_base`, and Go's native `-pgo=` flag.
 
-> Go's native `-pgo=` flag does **not** accept these profiles yet. It requires
-> `Function.start_line`, which perf-agent does not populate, and rejects the
-> file outright: `preprofile: error parsing profile: profile missing
-> Function.start_line data`. Tracked in
-> [#171](https://github.com/dpsoft/perf-agent/issues/171). The AutoFDO path
-> below is unaffected and works today.
+```bash
+perf-agent --profile --pid <PID> --duration 30s --profile-output cpu.pb.gz
+go build -pgo=cpu.pb.gz -o app .
+```
+
+`Function.start_line` is populated, which is what Go's PGO matches on
+alongside the function name; a profile without it is refused outright.
+Inlined frames are the exception and carry no start line — Go keys its hot
+nodes on out-of-line functions, so it accepts and applies the profile
+regardless.
 
 For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` alongside the pprof output. Same capture, two formats:
 

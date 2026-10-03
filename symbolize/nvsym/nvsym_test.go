@@ -328,10 +328,25 @@ func TestCachedPrefetchesOncePerBuildID(t *testing.T) {
 	})
 	const id = "ffffffffffffffffffffffffffffffffffffffff"
 
-	for range 50 {
-		if _, ok := s.Cached("/usr/lib64/libcuda.so.1", id); ok {
-			t.Fatal("first lookups must miss")
-		}
+	// The first lookup is the deterministic one: the cache directory is empty,
+	// so it must miss and must be what schedules the prefetch.
+	if _, ok := s.Cached("/usr/lib64/libcuda.so.1", id); ok {
+		t.Fatal("the first lookup hit on an empty cache directory")
+	}
+	// The remaining lookups stand in for the many stacks that miss on the same
+	// build-id, and deliberately do NOT assert a miss. Requiring all 50 to miss
+	// asserted that the background prefetch had not finished yet, which is a
+	// race rather than an invariant: Cached is an os.Stat, so it starts
+	// returning hits the moment the prefetched file lands. Measured on this
+	// machine, the prefetch completes at loop iteration 189-733 - a margin of
+	// only 4-15x over the 50 iterations below, which a contended CI runner
+	// crosses. It did, on amd64, the first time ./... ran this package (#183).
+	//
+	// What must hold regardless of who wins that race is the request count
+	// asserted at the end: one prefetch per build-id, not one per missing
+	// stack.
+	for range 49 {
+		s.Cached("/usr/lib64/libcuda.so.1", id)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

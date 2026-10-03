@@ -149,7 +149,10 @@ jobs:
       # are pinned there, and nothing was running those either. They are
       # ordinary in-process tests -- no BPF, no capabilities.
       - name: Run unit tests
-        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./cpu/... ./profile/... ./offcpu/... ./pyunwind/... ./unwind/dwarfagent/...
+        # ./... and not a list: coverage measured over five hand-listed
+        # packages is a number about those five, not about the project, and
+        # 28 packages with tests were outside it.
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
       # A second, PRIVILEGED pass over the same packages.
       #

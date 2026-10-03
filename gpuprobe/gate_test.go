@@ -1820,8 +1820,31 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 	// changes, and the gate should say so rather than quietly pass.
 	assert.Equal(t, wantPC, snap.PendingModuleSamples,
 		"the stub's PC records carry synthetic CRCs and kernel names that no cubin can name, so every one of them must remain pending and counted - never attached to a plausible neighbour")
-	assert.Positive(t, snap.PCJoin.GroupsUnresolvedName,
-		"a group whose (crc, functionIndex) names nothing must be counted as such, not silently skipped")
+	// Counted at a dead end, not silently skipped - which is the property
+	// here. The gate it stops at is the PROCESS gate, not the name gate: the
+	// stub sets r.correlation = 0 on every PC record, deliberately, because
+	// CONTINUOUS collection supplies no correlation and a stub that invented
+	// one would hide the join the consumer must actually make (stub.cc, spec
+	// §6.3 finding 3). pendingModuleKeyFor reads the PID off that
+	// correlation, so key.PID is 0 and Timeline stops the group one step
+	// before ever looking up (crc, functionIndex).
+	//
+	// This was pinned as Positive(GroupsUnresolvedName), which this producer
+	// cannot reach by construction. It asserted an unreachable counter and
+	// nothing noticed, because the test needs CAP_BPF and no job had it for
+	// this package. Measured here: GroupsNoProcess=4, GroupsUnresolvedName=0,
+	// pending-module-groups=4.
+	assert.Positive(t, snap.PendingModuleGroups,
+		"no pending module groups at all, so nothing below says anything")
+	assert.Equal(t, uint64(snap.PendingModuleGroups), snap.PCJoin.GroupsNoProcess,
+		"every pending group must be counted at the gate it actually stopped at: %+v, pending-module-groups=%d",
+		snap.PCJoin, snap.PendingModuleGroups)
+	// Same idiom as TestGateTheStubsPCRecordsCannotAttributeToAnything: when
+	// the stub is given correlations this fails by name, and the person
+	// fixing it moves the assertion to the gate the groups then reach.
+	assert.Zero(t, snap.PCJoin.GroupsUnresolvedName,
+		"a group reached the name lookup, which this producer's correlation-less PC records "+
+			"cannot do: the stub now supplies correlations, so assert the name gate here instead")
 	assert.Equal(t, snap.PCJoin.GroupsExamined(),
 		snap.PCJoin.GroupsJoined+uint64(snap.PendingModuleGroups),
 		"every pending group must be joined or left pending for exactly one counted reason: %+v", snap.PCJoin)
@@ -1957,32 +1980,41 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 			s := samples[si]
 			si++
 
-			// Assertion 1, in its exact form: the frames are the launch's own
-			// CPU stack, then the boundary marker, then the kernel - compared
-			// as a whole slice rather than scanned for forbidden substrings.
-			// Whole-slice comparison is strictly stronger (nothing may be
-			// inserted anywhere, not merely appended) and it has no false
-			// positives, which a substring scan would: several of the stub's
-			// stall reasons are spelt "wait", "barrier" and "membar", and libc
-			// frame names contain all three.
+			// Assertion 1, in its exact form: the frames are the kernel, then
+			// the boundary marker, then the launch's own CPU stack outward -
+			// compared as a whole slice rather than scanned for forbidden
+			// substrings. Whole-slice comparison is strictly stronger (nothing
+			// may be inserted anywhere, not merely appended) and it has no
+			// false positives, which a substring scan would: several of the
+			// stub's stall reasons are spelt "wait", "barrier" and "membar",
+			// and libc frame names contain all three.
+			//
+			// LEAF-FIRST, matching gpu.projectionFrames. Sample.Location[0] is
+			// the leaf (issue #163), and the GPU kernel is the deepest frame,
+			// so the kernel leads and the CPU path runs outward to _start.
+			// This expectation was built the other way round and was never
+			// re-run when #172 fixed the projection to assemble leaf-first:
+			// the test needs CAP_BPF, and no job had it for this package until
+			// the GPU pipeline gate step started running it. It asserted the
+			// bug #172 removed.
 			require.NotEmpty(t, view.Exec.KernelName,
 				"every execution carries an interned kernel name, so the kernel frame is never omitted")
-			var want []string
+			want := []string{"[gpu:kernel:" + view.Exec.KernelName + "]"}
 			if view.Launch != nil && len(view.Launch.Launch.CPUStack) > 0 {
+				want = append(want, gpu.FrameLaunch)
 				for _, f := range view.Launch.Launch.CPUStack {
 					want = append(want, f.Name)
 				}
-				want = append(want, gpu.FrameLaunch)
 			} else {
 				want = append(want, gpu.FrameLaunchUnsampled)
 			}
-			want = append(want, "[gpu:kernel:"+view.Exec.KernelName+"]")
 			require.Equal(t, want, frameNamesOf(s.Stack),
-				"frames are exhaustively the CPU stack, the boundary marker and the kernel; this sample's differ")
+				"frames are exhaustively the kernel, the boundary marker and the CPU stack outward; this sample's differ")
 			// The two frames this package synthesizes are the only ones it
 			// could smuggle per-sample detail into, so they take the substring
-			// scan the CPU frames cannot safely take.
-			for _, name := range want[len(want)-2:] {
+			// scan the CPU frames cannot safely take. They lead the slice now
+			// rather than trailing it.
+			for _, name := range want[:2] {
 				for _, bad := range []string{"gpu:pc", "gpu:src", "gpu:stall", "long_scoreboard", "resolved", "0x"} {
 					assert.NotContains(t, name, bad,
 						"per-sample detail was promoted to a frame: %q", name)

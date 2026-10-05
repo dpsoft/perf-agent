@@ -74,14 +74,26 @@ enum classification_mode {
     MODE_FALLBACK = 2,
 };
 
+// The three offsets are __s32, not __s16, and that width is load-bearing:
+// AAPCS64 keeps the CFA SP-rooted while the frame grows, so a function with a
+// 72032-byte frame (perfagent_stub_run, which allocates its record batches on
+// the stack) carries DW_CFA_def_cfa_offset 72032. At __s16 that wrapped to
+// 6496, the walker read the return address 65536 bytes below the real slot,
+// found zero, and pushed 0x0 as a frame -- issue #185, which cost every arm64
+// walk its first step. x86-64 was spared only because gcc there emits
+// DW_CFA_def_cfa_register %rbp, so the offset stays 16 however big the frame.
+//
+// The fields are ordered offsets-then-types so the struct still totals 32
+// bytes with no interior padding; unwind/ehmaps.MarshalCFIEntry writes exactly
+// this layout and TestMarshalCFIEntryMatchesBPFLayout pins it.
 struct cfi_entry {
     __u64 pc_start;
     __u32 pc_end_delta;
+    __s32 cfa_offset;
+    __s32 fp_offset;
+    __s32 ra_offset;
     __u8  cfa_type;
     __u8  fp_type;
-    __s16 cfa_offset;
-    __s16 fp_offset;
-    __s16 ra_offset;
     __u8  ra_type;
     __u8  _pad[5];
 };

@@ -428,10 +428,10 @@ func (s *interpreter) snapshot(newPC uint64) {
 		PCEndDelta: delta,
 		CFAType:    s.cfaType,
 		FPType:     fpRuleToType(s.fpRule),
-		CFAOffset:  int16(s.cfaOffset),
-		FPOffset:   int16(s.fpRule.offset),
+		CFAOffset:  int32(s.cfaOffset),
+		FPOffset:   int32(s.fpRule.offset),
 		RAType:     raRuleToType(s.raRule),
-		RAOffset:   int16(s.raRule.offset),
+		RAOffset:   int32(s.raRule.offset),
 	})
 	s.lastState = cur
 	s.lastEmittedPC = newPC

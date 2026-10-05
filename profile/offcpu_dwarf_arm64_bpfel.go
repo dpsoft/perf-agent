@@ -17,14 +17,13 @@ type offcpu_dwarfCfiEntry struct {
 	_          structs.HostLayout
 	PcStart    uint64
 	PcEndDelta uint32
+	CfaOffset  int32
+	FpOffset   int32
+	RaOffset   int32
 	CfaType    uint8
 	FpType     uint8
-	CfaOffset  int16
-	FpOffset   int16
-	RaOffset   int16
 	RaType     uint8
 	Pad        [5]uint8
-	_          [6]byte
 }
 
 type offcpu_dwarfCfiMissRatelimitKey struct {

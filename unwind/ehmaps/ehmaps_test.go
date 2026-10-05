@@ -56,16 +56,14 @@ func TestMarshalCFIEntryMatchesBPFLayout(t *testing.T) {
 	want := make([]byte, 32)
 	binary.LittleEndian.PutUint64(want[0:8], 0x1234_5678_9abc_def0)
 	binary.LittleEndian.PutUint32(want[8:12], 0x0102_0304)
-	want[12] = 1 // cfa_type = SP
-	want[13] = 1 // fp_type = OffsetCFA
-	cfa := int16(-16)
-	binary.LittleEndian.PutUint16(want[14:16], uint16(cfa))
-	fp := int16(-32)
-	binary.LittleEndian.PutUint16(want[16:18], uint16(fp))
-	ra := int16(-8)
-	binary.LittleEndian.PutUint16(want[18:20], uint16(ra))
-	want[20] = 1 // ra_type = OffsetCFA
-	// want[21:32] is tail padding (already zeroed by make)
+	cfa, fp, ra := int32(-16), int32(-32), int32(-8)
+	binary.LittleEndian.PutUint32(want[12:16], uint32(cfa))
+	binary.LittleEndian.PutUint32(want[16:20], uint32(fp))
+	binary.LittleEndian.PutUint32(want[20:24], uint32(ra))
+	want[24] = 1 // cfa_type = SP
+	want[25] = 1 // fp_type = OffsetCFA
+	want[26] = 1 // ra_type = OffsetCFA
+	// want[27:32] is tail padding (already zeroed by make)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("MarshalCFIEntry:\n got %x\nwant %x", got, want)
 	}
@@ -133,5 +131,32 @@ func TestAnUnsearchableTableIsRefused(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTableTooLarge) {
 		t.Fatalf("err = %v, want ErrTableTooLarge", err)
+	}
+}
+
+// A CFA offset larger than an int16 must survive marshalling, because arm64
+// routinely produces them: AAPCS64 keeps the CFA SP-rooted while the frame
+// grows, so perfagent_stub_run's 72032-byte frame carries
+// DW_CFA_def_cfa_offset 72032. At int16 that wrapped to 6496 and the walker
+// read the return address 65536 bytes below the real slot (#185).
+func TestMarshalCFIEntryCarriesOffsetsTooBigForAnInt16(t *testing.T) {
+	const bigFrame = 72032 // perfagent_stub_run on aarch64, measured
+	e := ehcompile.CFIEntry{
+		CFAType:   ehcompile.CFATypeSP,
+		FPType:    ehcompile.FPTypeOffsetCFA,
+		RAType:    ehcompile.RATypeOffsetCFA,
+		CFAOffset: bigFrame,
+		FPOffset:  -112,
+		RAOffset:  -104,
+	}
+	got := MarshalCFIEntry(e)
+	if v := int32(binary.LittleEndian.Uint32(got[12:16])); v != bigFrame {
+		t.Fatalf("cfa_offset round-tripped as %d, want %d (int16 truncation is #185)", v, bigFrame)
+	}
+	if v := int32(binary.LittleEndian.Uint32(got[16:20])); v != -112 {
+		t.Fatalf("fp_offset round-tripped as %d, want -112", v)
+	}
+	if v := int32(binary.LittleEndian.Uint32(got[20:24])); v != -104 {
+		t.Fatalf("ra_offset round-tripped as %d, want -104", v)
 	}
 }

@@ -531,10 +531,11 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	assert.Equal(t, stats.StacksWalkedDWARF, stats.StackWalkReachedRoot,
 		"a DWARF walk on this producer can only end at _start's RA_UNDEFINED - every frame between the probe and it is derived in TestTheCFIForcesTheWalkToReachTheRoot. A shortfall means some walk found a different ending and that derivation no longer describes the producer: dwarf=%d reached-root=%d fp-exhausted=%d",
 		stats.StacksWalkedDWARF, stats.StackWalkReachedRoot, stats.StackWalkFPExhausted)
-	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d fp-exhausted=%d nonmonotonic=%d root-disagree=%d reached-root=%d registered=%d binaries=%d",
+	t.Logf("walk shape: dwarf=%d fp-only=%d no-tables=%d cfi-miss=%d truncated=%d abandoned=%d fp-exhausted=%d nonmonotonic=%d root-disagree=%d ra-zero=%d reached-root=%d registered=%d binaries=%d",
 		stats.StacksWalkedDWARF, stats.StacksWalkedFPOnly, stats.StacksWalkedNoTables,
 		stats.StacksWalkedCFIMiss, stats.StackWalkTruncated, stats.StackWalkAbandoned,
 		stats.StackWalkFPExhausted, stats.StackWalkFPNonMonotonic, stats.StackWalkRootDisagreement,
+		stats.StackWalkRAZero,
 		stats.StackWalkReachedRoot, stats.UnwindPIDsRegistered, stats.UnwindBinariesAttached)
 
 	snap := timeline.Snapshot()

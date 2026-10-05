@@ -70,8 +70,14 @@ struct sample_header {
     __u64 value;       // sample weight: 1 for CPU, blocking-ns for off-CPU
     __u8  mode;        // dominant classification for the sample (telemetry)
     __u8  n_pcs;       // number of valid slots in the pcs[]/tags[] arrays
-    __u8  walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
-    __u8  _pad;
+    // walker_flags is __u16, not __u8: the eight bits of the original were
+    // all assigned (FP_TERMINATED through FRAME_PUSH_REFUSED) and
+    // WALKER_FLAG_RA_ZERO needed a ninth (issue #187). Widening it consumed
+    // the _pad byte that already sat here, so NOTHING else moved: _pad2 and
+    // kern_stack keep their offsets, the struct keeps its size, and on
+    // little-endian a reader of the old single byte still sees the low eight
+    // bits unchanged.
+    __u16 walker_flags; // bitmask of WALKER_FLAG_* (defined near walk_step)
     __u32 _pad2;
     __s64 kern_stack;  // bpf_get_stackid(&kern_stackmap,…) result, or -1 if disabled
 };

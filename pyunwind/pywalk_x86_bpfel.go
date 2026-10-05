@@ -54,8 +54,7 @@ type pywalkSampleRecord struct {
 		Value       uint64
 		Mode        uint8
 		N_pcs       uint8
-		WalkerFlags uint8
-		Pad         uint8
+		WalkerFlags uint16
 		Pad2        uint32
 		KernStack   int64
 	}

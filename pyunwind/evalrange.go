@@ -9,6 +9,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/ulikunitz/xz"
 )
@@ -105,7 +107,7 @@ func EvalRangesForFile(path string) ([]EvalRange, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	return evalFragments(allFuncSymbols(f), path)
+	return evalFragments(allFuncSymbols(f, path), path)
 }
 
 // evalFragments is EvalRangesForFile's decision, separated from the file I/O
@@ -190,7 +192,7 @@ func isEvalFragment(name string) bool {
 // two fragments total 81779, which the existing multi-fragment path already
 // handles -- isEvalFragment matches the ".cold" suffix and EvalRangesForFile
 // returns one EvalRange per fragment. This function was the only gap.
-func allFuncSymbols(f *elf.File) []elf.Symbol {
+func allFuncSymbols(f *elf.File, path string) []elf.Symbol {
 	var out []elf.Symbol
 	for _, get := range []func() ([]elf.Symbol, error){f.Symbols, f.DynamicSymbols} {
 		syms, err := get()
@@ -203,7 +205,7 @@ func allFuncSymbols(f *elf.File) []elf.Symbol {
 			}
 		}
 	}
-	out = append(out, miniDebugFuncSymbols(f)...)
+	out = append(out, miniDebugFuncSymbols(f, path)...)
 	return out
 }
 
@@ -216,10 +218,45 @@ func allFuncSymbols(f *elf.File) []elf.Symbol {
 // whatever .dynsym and .symtab gave it, and decides on the total. Turning a
 // malformed or absent section into a hard error would refuse interpreters
 // that are currently walked fine.
-func miniDebugFuncSymbols(f *elf.File) []elf.Symbol {
+// miniDebugCache memoises the decompressed symbol list per file identity.
+//
+// Decompressing .gnu_debugdata is EXPENSIVE and the input never changes within
+// a run. Measured on Fedora 44's libpython3.14.so.1.0, whose image is 604KB
+// out of a 118KB xz payload:
+//
+//	with .gnu_debugdata      21.3ms per EvalRangesForFile call
+//	section removed           289us per call
+//
+// a 74x difference, all of it pure-Go xz. EvalRangesForFile is called TWICE per
+// enrolment -- once by AttachProcess to validate, once by module.Enroll to
+// install -- so an uncached interpreter cost ~42ms of decompression, and N
+// processes sharing one libpython paid it 2N times. That is ~4s of startup for
+// a hundred interpreters, which is the sort of number #194 has to weigh when
+// it decides whether system-wide enrolment is affordable. Introduced by #190;
+// this is the fix.
+//
+// Keyed on (dev, ino, size, mtime) rather than path: a path can be rebound by
+// a package upgrade mid-run, and returning the previous build's symbol
+// addresses would put the eval-loop range over the wrong text -- the
+// plausible-stack-that-never-happened failure this package refuses everywhere.
+// Any stat failure skips the cache rather than guessing.
+type miniDebugKey struct {
+	dev, ino, size uint64
+	mtimeNsec      int64
+}
+
+var miniDebugCache sync.Map // miniDebugKey -> []elf.Symbol
+
+func miniDebugFuncSymbols(f *elf.File, path string) []elf.Symbol {
 	sec := f.Section(".gnu_debugdata")
 	if sec == nil {
 		return nil
+	}
+	key, keyed := miniDebugKeyFor(path)
+	if keyed {
+		if v, ok := miniDebugCache.Load(key); ok {
+			return v.([]elf.Symbol)
+		}
 	}
 	raw, err := sec.Data()
 	if err != nil {
@@ -254,7 +291,36 @@ func miniDebugFuncSymbols(f *elf.File) []elf.Symbol {
 			out = append(out, s)
 		}
 	}
+	if keyed {
+		// LoadOrStore, not Store: two enrolments racing on the same libpython
+		// both decompress, and the loser's slice is discarded rather than
+		// replacing an identical one. The returned value is never mutated --
+		// allFuncSymbols appends it to a fresh slice of its own -- so sharing
+		// one backing array between callers is safe.
+		v, _ := miniDebugCache.LoadOrStore(key, out)
+		return v.([]elf.Symbol)
+	}
 	return out
+}
+
+// miniDebugKeyFor identifies the file by inode identity and content stamp.
+// Reports false when it cannot be stat'd, in which case the caller decompresses
+// and does not cache -- a miss costs time, a wrong hit costs correctness.
+func miniDebugKeyFor(path string) (miniDebugKey, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return miniDebugKey{}, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return miniDebugKey{}, false
+	}
+	return miniDebugKey{
+		dev:       uint64(st.Dev),
+		ino:       uint64(st.Ino),
+		size:      uint64(fi.Size()),
+		mtimeNsec: fi.ModTime().UnixNano(),
+	}, true
 }
 
 // gilStateSymbol is the function whose prologue carries the autoTSSkey
@@ -284,7 +350,7 @@ func GILStateCode(path string) ([]byte, error) {
 
 	var sym elf.Symbol
 	var found bool
-	for _, s := range allFuncSymbols(f) {
+	for _, s := range allFuncSymbols(f, path) {
 		if s.Name == gilStateSymbol && s.Size > 0 {
 			sym, found = s, true
 			break

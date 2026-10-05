@@ -2,7 +2,9 @@ package pyunwind
 
 import (
 	"debug/elf"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,6 +75,78 @@ func TestMiniDebugInfoAbsentIsNotAnError(t *testing.T) {
 	if f.Section(".gnu_debugdata") != nil {
 		t.Skip("this test binary happens to carry MiniDebugInfo; nothing to assert")
 	}
-	assert.Empty(t, miniDebugFuncSymbols(f),
+	assert.Empty(t, miniDebugFuncSymbols(f, "/proc/self/exe"),
 		"a binary without the section must yield no symbols and no panic")
+}
+
+// The decompression must happen ONCE per file identity. Asserted by slice
+// identity rather than by timing: the cached call returns the very slice the
+// first call stored, so the data pointers match. A timing assertion would be
+// flaky and would not actually prove the decompressor was skipped.
+//
+// Why this matters: .gnu_debugdata on Fedora's libpython3.14 is a 604KB image
+// out of a 118KB xz payload, and decompressing it costs 21.3ms against 289us
+// for the same file with the section removed -- 74x, all pure-Go xz.
+// EvalRangesForFile is called twice per enrolment (AttachProcess validates,
+// module.Enroll installs), so without the cache every interpreter paid ~42ms
+// and N processes sharing one libpython paid it 2N times.
+func TestMiniDebugSymbolsAreDecompressedOncePerFile(t *testing.T) {
+	path := filepath.Join("testdata", "minidebug.so")
+	f, err := elf.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	first := miniDebugFuncSymbols(f, path)
+	require.NotEmpty(t, first, "the fixture carries MiniDebugInfo symbols; see gen-minidebug.sh")
+	second := miniDebugFuncSymbols(f, path)
+	require.Equal(t, len(first), len(second))
+
+	p1 := reflect.ValueOf(first).Pointer()
+	p2 := reflect.ValueOf(second).Pointer()
+	assert.Equal(t, p1, p2,
+		"the second call re-decompressed instead of reading the cache (#190's 21ms per call)")
+}
+
+// And the cache must not serve one file's symbols for another. Keyed on
+// (dev, ino, size, mtime), so two distinct files never collide however similar
+// their paths -- a package upgrade that rebinds a path mid-run must not hand
+// back the previous build's symbol addresses, which would put the eval-loop
+// range over the wrong text.
+func TestMiniDebugCacheDoesNotServeOneFileForAnother(t *testing.T) {
+	src := filepath.Join("testdata", "minidebug.so")
+	body, err := os.ReadFile(src)
+	require.NoError(t, err)
+
+	// A byte-identical copy at a different inode: same size, same content,
+	// different identity. Its symbols must be computed, not borrowed.
+	copyPath := filepath.Join(t.TempDir(), "minidebug-copy.so")
+	require.NoError(t, os.WriteFile(copyPath, body, 0o644))
+
+	fa, err := elf.Open(src)
+	require.NoError(t, err)
+	defer func() { _ = fa.Close() }()
+	fb, err := elf.Open(copyPath)
+	require.NoError(t, err)
+	defer func() { _ = fb.Close() }()
+
+	a := miniDebugFuncSymbols(fa, src)
+	b := miniDebugFuncSymbols(fb, copyPath)
+	require.NotEmpty(t, a)
+	require.Equal(t, len(a), len(b), "the copy must yield the same symbols")
+
+	assert.NotEqual(t, reflect.ValueOf(a).Pointer(), reflect.ValueOf(b).Pointer(),
+		"a different inode was served the first file's cached slice; the key is not distinguishing them")
+
+	ka, okA := miniDebugKeyFor(src)
+	kb, okB := miniDebugKeyFor(copyPath)
+	require.True(t, okA)
+	require.True(t, okB)
+	assert.NotEqual(t, ka, kb, "two distinct files produced the same cache key")
+}
+
+// A path that cannot be stat'd must decompress and NOT cache: a miss costs
+// time, a wrong hit costs correctness.
+func TestMiniDebugKeyRefusesWhatItCannotStat(t *testing.T) {
+	_, ok := miniDebugKeyFor(filepath.Join(t.TempDir(), "does-not-exist"))
+	assert.False(t, ok, "an unstattable path produced a cache key, which could alias another file")
 }

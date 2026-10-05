@@ -553,6 +553,22 @@ static __always_inline struct cfi_entry *cfi_lookup(__u64 table_id, __u64 rel_pc
 // WALKER_FLAG_FRAME_PUSH_REFUSED (0x80) is defined in unwind_record.h, beside
 // the two pushers that raise it, so an interpreter module compiled against
 // that header alone still has the name.
+//
+// WALKER_FLAG_RA_ZERO: the CFI gave a return-address slot, the read of it
+// SUCCEEDED, and the value was zero. Issue #187.
+//
+// A zero is never a return address. It means the walk read a slot that does
+// not hold one -- a CFA computed from a wrong rule, a frame the tables
+// misdescribe, a clobbered slot -- so the honest outcome is "stopped here,
+// for this reason". Before this flag existed the zero was assigned to ctx->pc
+// and PUSHED as a frame, which is how issue #185 presented: every arm64 walk
+// came back three frames deep with 0x0 on top, and the walk was filed as
+// `abandoned` with no counter naming a cause. The zero was visible only
+// because a per-frame dump was added to the gate to chase it.
+//
+// This is the ninth bit, which is why walker_flags is a __u16 -- see
+// struct sample_header in unwind_record.h for why that cost nothing.
+#define WALKER_FLAG_RA_ZERO          0x100
 
 // frame_push_native appends one native-PC slot to the record this walk is
 // building. Returns 0 on success, 1 if the record is full -- the caller must
@@ -903,6 +919,14 @@ static __always_inline long unwind_frame(struct walk_ctx *ctx, bool lead) {
             }
             if (bpf_probe_read_user(&ret_addr, sizeof(ret_addr),
                                     (void *)(cfa + (__s64)e.ra_offset)) != 0) goto stop;
+            // Read fine, and it is zero. Not a frame: stop, and SAY SO -- the
+            // flag is what keeps this out of the unflagged `abandoned` bucket
+            // that hid issue #185. Set before the stop, so a walk that ends
+            // here can never be read as a clean one.
+            if (ret_addr == 0) {
+                ctx->rec->hdr.walker_flags |= WALKER_FLAG_RA_ZERO;
+                goto stop;
+            }
         } else if (e.ra_type == RA_TYPE_UNDEFINED) {
             // The CFI says this frame has no return address: it is the
             // outermost frame of the chain (glibc marks _start and thread

@@ -1410,10 +1410,15 @@ func TestACompleteShortWalkIsNeitherTruncatedNorAbandoned(t *testing.T) {
 // walk, which is exactly the class of defect this file is full of tests
 // about. So read the header and check.
 func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
-	// Two headers: seven bits are the walker's own, and
+	// Two headers: eight bits are the walker's own, and
 	// WALKER_FLAG_FRAME_PUSH_REFUSED lives with the two pushers that raise it
 	// in bpf/unwind_record.h, so a language module compiled against that file
 	// alone still has the name.
+	//
+	// This test is why adding WALKER_FLAG_RA_ZERO (#187) could not go
+	// half-done: scraping every #define and comparing the WHOLE map means a
+	// new bit in the header with no Go constant fails here, rather than
+	// silently never being counted.
 	src, err := os.ReadFile("../bpf/unwind_common.h")
 	require.NoError(t, err)
 	rec, err := os.ReadFile("../bpf/unwind_record.h")
@@ -1436,6 +1441,7 @@ func TestWalkerFlagsMirrorTheBPFHeader(t *testing.T) {
 		"WALKER_FLAG_FP_NONMONOTONIC":    walkerFlagFPNonMonotonic,
 		"WALKER_FLAG_ROOT_DISAGREEMENT":  walkerFlagRootDisagreement,
 		"WALKER_FLAG_FRAME_PUSH_REFUSED": walkerFlagFramePushRefused,
+		"WALKER_FLAG_RA_ZERO":            walkerFlagRAZero,
 	}, got, "the BPF headers and consumer.go disagree about the walker's flag bits")
 }
 

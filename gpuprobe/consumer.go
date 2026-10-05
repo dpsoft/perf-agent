@@ -179,6 +179,13 @@ const (
 	// unwinder was pushing, in its own counters.
 	walkerFlagFramePushRefused = 0x80
 
+	// walkerFlagRAZero: the CFI named a return-address slot, the read of it
+	// succeeded, and the value was zero. A FAILURE, and the named-cause
+	// subset of StackWalkAbandoned that issue #185 did not have: there, every
+	// arm64 walk ended three frames deep with 0x0 pushed as a frame, counted
+	// as `abandoned` with nothing saying why. Issue #187.
+	walkerFlagRAZero = 0x100
+
 	// walkerFlagsTerminated is the set of bits that mean "the walk reached
 	// the end of the chain". Neither StackWalkTruncated nor
 	// StackWalkAbandoned may count a capture with any of them set.
@@ -749,6 +756,18 @@ type Stats struct {
 	// frame. That address is now recorded before the walk stops, so the
 	// outermost frame survives, and the stop is counted here.
 	StackWalkFPNonMonotonic uint64
+
+	// StackWalkRAZero counts walks that stopped because a return-address slot
+	// the CFI pointed at read back as zero. The read SUCCEEDED; the value is
+	// simply not a return address, which means the CFA it was computed from is
+	// wrong or the frame is misdescribed by its own tables.
+	//
+	// A named-cause subset of StackWalkAbandoned, like the two above. It
+	// exists because issue #185 did not have it: an int16 truncation put the
+	// CFA 65536 bytes below the real one on arm64, every walk read a zero
+	// there, and the only visible symptom was `abandoned` with no cause and a
+	// 0x0 frame on top of every stack.
+	StackWalkRAZero uint64
 	// StackWalkRootDisagreement counts walks whose two sources disagreed
 	// about where the stack ends (walkerFlagRootDisagreement): the
 	// frame-pointer chain reached the psABI's outermost-frame marker, the
@@ -2771,6 +2790,12 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 		// Stats.StackWalkRootDisagreement. Also a named-cause subset of
 		// StackWalkAbandoned.
 		c.stats.StackWalkRootDisagreement++
+	}
+	if flags&walkerFlagRAZero != 0 {
+		// A return-address slot that read as zero - see Stats.StackWalkRAZero.
+		// Also a named-cause subset of StackWalkAbandoned, and the one whose
+		// absence made issue #185 a three-round investigation.
+		c.stats.StackWalkRAZero++
 	}
 	switch {
 	case flags&walkerFlagRootDisagreement != 0:

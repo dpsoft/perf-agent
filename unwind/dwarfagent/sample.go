@@ -48,7 +48,7 @@ type Sample struct {
 	TimeNs      uint64
 	Value       uint64
 	Mode        uint8
-	WalkerFlags uint8
+	WalkerFlags uint16
 	KernStack   int64
 
 	// PCs holds the walk's slot words, leaf first — NOT a flat list of
@@ -77,8 +77,8 @@ type Sample struct {
 //	[16:24] Value
 //	[24]    Mode
 //	[25]    N_pcs
-//	[26]    WalkerFlags
-//	[27]    _pad
+//	[26:28] WalkerFlags (u16 since #187; the old u8 plus the pad byte that
+//	        followed it, so every later offset is unchanged)
 //	[28:32] _pad2
 //	[32:40] KernStack (int64)
 //	[40:1056]   PCs (MaxFrames × u64)
@@ -100,7 +100,7 @@ func parseSample(buf []byte) (Sample, error) {
 		TimeNs:      binary.LittleEndian.Uint64(buf[8:16]),
 		Value:       binary.LittleEndian.Uint64(buf[16:24]),
 		Mode:        buf[24],
-		WalkerFlags: buf[26],
+		WalkerFlags: binary.LittleEndian.Uint16(buf[26:28]),
 		KernStack:   int64(binary.LittleEndian.Uint64(buf[32:40])),
 	}
 	nPCs := int(buf[25])

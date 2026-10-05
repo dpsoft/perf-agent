@@ -53,7 +53,7 @@ import (
 //
 // Assertions 10, 10a, 11 and 12 are consumer-side and live in
 // gpuprobe/gate_compose_test.go. Assertions 13-16 need an RTX 3090 and are
-// stated as outstanding in .superpowers/sdd/task-13-gate-report.md.
+// stated as outstanding when this gate was written.
 func TestPhase6Gate(t *testing.T) {
 	// 1. Frames stop at the kernel. The §8 pin, and first for a reason: at PC
 	//    sampling rates one frame per PC destroys aggregation and fragments the

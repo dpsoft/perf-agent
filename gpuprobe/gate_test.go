@@ -882,7 +882,7 @@ func requireFPLess(t *testing.T, built string) {
 //	StackWalkFPExhausted == StackWalkAbandoned == 0.
 //
 // Cross-checked against gdb on this exact binary, which reports the same
-// seven frames (see .superpowers/sdd/issue-45-report.md).
+// seven frames, cross-checked against gdb on this exact binary when #45 was fixed.
 func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	built := filepath.Join("..", "shim", "perfagent-gpu-fpless")
 	requireBuilt(t, built)
@@ -1587,7 +1587,7 @@ const gateCRCAbsent uint64 = 0x6A7E0003
 //     sampling windows.
 //
 // NOT off the wire, and this is a finding rather than a shortcut - see
-// .superpowers/sdd/task-13-gate-report.md:
+// Recorded when this gate was written:
 //
 //	The stub's PC records cannot be attributed to anything. Their cubin_crc is
 //	a pair of synthetic constants (shim/stub/stub.cc kStubCubinCRC =
@@ -2476,5 +2476,5 @@ func TestGateTheStubsPCRecordsCannotAttributeToAnything(t *testing.T) {
 			"a fixture function is now named like a stub kernel; the join might match by accident, which is worse than not matching at all")
 	}
 	t.Log("stub PC records -> a cubin the agent holds: OUTSTANDING - synthetic CRCs and synthetic " +
-		"kernel names; see .superpowers/sdd/task-13-gate-report.md")
+		"kernel names")
 }

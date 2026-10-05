@@ -15,7 +15,7 @@
 // them across the tail call.
 //
 // CPython stores the PyThreadState in a pthread TSD slot, not in a global.
-// The spike (see docs/superpowers/plans/2026-08-29-python-walker-slice1-2.md)
+// The spike (recorded in the git history, not kept in-tree)
 // found no shared-library CPython build in the supported range carries a
 // static TLS offset that can be recovered by disassembly -- 3.12 and 3.13
 // call __tls_get_addr, 3.14 uses TLSDESC -- so there is nothing to extract

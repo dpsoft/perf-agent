@@ -299,7 +299,7 @@ type PCSamplingRequest struct {
 	// graphs. Snapshot.GraphExecutions > 0 is the value to pass. There is no
 	// way for the FIRST round against an unknown process to know, and that
 	// gap is real and stated rather than papered over — see
-	// .superpowers/sdd/issue-94-graph-refusal-report.md.
+	// the measurements recorded on #94.
 	GraphExecutionsObserved bool
 }
 

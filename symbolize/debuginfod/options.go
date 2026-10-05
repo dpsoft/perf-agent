@@ -2,11 +2,54 @@ package debuginfod
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/dpsoft/perf-agent/unwind/procmap"
 )
+
+// DialTimeout bounds establishing the TCP connection, as distinct from
+// FetchTimeout which bounds the whole request.
+//
+// The two measure different things and only one of them is about an air-gapped
+// host. Measured at the fetch layer against the default 5s FetchTimeout:
+//
+//	blackhole (SYN dropped)   5.004s   the full timeout
+//	connection refused            0s
+//	unresolvable host           2ms
+//
+// Only the first stalls, and it is the shape the environments that matter
+// actually produce: a Kubernetes pod with no egress route, or a host firewall
+// set to DROP rather than REJECT, silently discards the SYN. Without a dial
+// bound that costs FetchTimeout per distinct build-id with no local
+// debuginfo -- up to ~80s on the first capture of a 16-binary host -- while
+// the profile waits. Issue #111.
+//
+// Shortening FetchTimeout instead would be the wrong lever: it exists to bound
+// the TRANSFER, so lowering it trades away real fetches from a slow-but-working
+// server to fix a case that is not about throughput at all. Bounding the dial
+// separately collapses the blackhole row into the fast-fail rows and leaves a
+// reachable server its full budget.
+//
+// 300ms: a TCP handshake to a reachable server is one round trip, so this is
+// generous for anything on a LAN or in the same region, and still two orders of
+// magnitude below the fetch budget. A debuginfod server more than 300ms away by
+// RTT alone would be a poor choice for a synchronous symbolization path anyway.
+const DialTimeout = 300 * time.Millisecond
+
+// defaultTransport clones http.DefaultTransport with DialTimeout applied.
+// Cloned rather than constructed from scratch so proxy settings, HTTP/2 and the
+// connection-pool defaults keep behaving as the standard library intends -- the
+// only deliberate difference is the dial bound.
+func defaultTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{
+		Timeout:   DialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return t
+}
 
 // Options configures a Symbolizer. Zero value is invalid; at minimum URLs
 // must be set.
@@ -61,7 +104,10 @@ func (o *Options) validate() error {
 		o.FetchTimeout = 5 * time.Second
 	}
 	if o.HTTPClient == nil {
-		o.HTTPClient = &http.Client{Timeout: o.FetchTimeout}
+		o.HTTPClient = &http.Client{
+			Timeout:   o.FetchTimeout,
+			Transport: defaultTransport(),
+		}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.NewTextHandler(devNull{}, nil))

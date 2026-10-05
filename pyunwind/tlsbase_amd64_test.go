@@ -226,3 +226,92 @@ func TestPtracingOurOwnChildsLeaderCorruptsCmdWait(t *testing.T) {
 // CI to assert a kernel invariant is a worse trade than the invariant being
 // stated, and the dangerous half -- that the LEADER does corrupt Cmd.Wait --
 // is demonstrated above rather than argued.
+
+// The stop must be seen without sleeping through it.
+//
+// PTRACE_INTERRUPT on a runnable thread lands in tens of microseconds, but the
+// loop used to sleep a flat millisecond between looks, so a miss on the first
+// non-blocking Wait4 cost 1ms. Measured over 20 idle interpreters: median
+// 1.088ms with the sleep, 26us without it. That millisecond is paid per
+// enrolled process, and it is time the TARGET spends frozen -- which is what
+// makes it worth removing rather than tolerating (#194).
+//
+// Asserted on the BEST of several attempts, not on one.
+//
+// A single attempt is a flaky test and was observed failing roughly one run in
+// twenty on an otherwise idle machine: the stop is normally 25-130us but a
+// scheduling outlier reaches ~450us, and a contended CI runner will do worse.
+// The minimum is the right statistic and still proves the point, because the
+// old implementation could not produce a fast best case -- one sleep was its
+// floor, so EVERY attempt cost >=1ms. A revert therefore fails this no matter
+// how many attempts it gets, while one unlucky outlier cannot fail it.
+func TestWaitForTraceStopDoesNotSleepThroughTheStop(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a child to trace: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := unix.PtraceSeize(pid); err != nil {
+		t.Skipf("cannot PTRACE_SEIZE own child (ptrace_scope?): %v", err)
+	}
+	stopped := false
+	defer func() { _ = releaseTracee(pid, &stopped, tlsReleaseTimeout) }()
+
+	const attempts = 5
+	best := time.Duration(1 << 62)
+	for range attempts {
+		if err := unix.PtraceInterrupt(pid); err != nil {
+			t.Fatalf("interrupt: %v", err)
+		}
+		start := time.Now()
+		if err := waitForTraceStop(pid, tlsStopTimeout); err != nil {
+			t.Fatalf("wait for stop: %v", err)
+		}
+		if d := time.Since(start); d < best {
+			best = d
+		}
+		stopped = true
+		// Resume, so the next interrupt has a running thread to stop rather
+		// than finding one already in a ptrace-stop and returning instantly.
+		if err := unix.PtraceCont(pid, 0); err != nil {
+			t.Fatalf("cont: %v", err)
+		}
+		stopped = false
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	t.Logf("best of %d: %s (spin window %s, fallback poll %s)",
+		attempts, best.Round(time.Microsecond), tlsSpinWindow, tlsPollMax)
+	if best >= 900*time.Microsecond {
+		t.Errorf("the fastest of %d stops took %s; one sleep was the old implementation's floor, "+
+			"so a best case this slow means the sleep is back on the first-miss path",
+			attempts, best.Round(time.Microsecond))
+	}
+}
+
+// The spin must be BOUNDED: a thread that never stops has to fall back to the
+// sleep, or the loop burns a core for the whole tlsStopTimeout. Pinned as a
+// relationship between the constants rather than by timing a hung thread,
+// which cannot be arranged reliably.
+func TestTheSpinWindowIsBoundedAndWellUnderTheTimeout(t *testing.T) {
+	if tlsSpinWindow <= 0 {
+		t.Fatal("tlsSpinWindow must be positive, or the fast path is gone")
+	}
+	if tlsSpinWindow >= tlsPollMax {
+		t.Errorf("tlsSpinWindow (%s) is not shorter than the fallback poll (%s), so the spin "+
+			"is not a fast path, it is the whole loop", tlsSpinWindow, tlsPollMax)
+	}
+	if tlsSpinWindow > tlsStopTimeout/100 {
+		t.Errorf("tlsSpinWindow (%s) is a large fraction of tlsStopTimeout (%s); a thread in "+
+			"uninterruptible sleep would spin instead of sleeping", tlsSpinWindow, tlsStopTimeout)
+	}
+}

@@ -72,6 +72,20 @@ func (t *PIDTracker) SetOnNewExec(fn func(pid uint32)) {
 // through /proc/<pid>/map_files. The pid_mappings table itself does
 // not need either path — it only stores va ranges keyed by tableID.
 func (t *PIDTracker) Attach(pid uint32, binPath, openPath string) error {
+	// A tracker with no TableStore cannot attach anything, and this is where
+	// that becomes visible rather than fatal. Run reaches here from its own
+	// goroutine, via AttachAllMappings, so a nil dereference takes the whole
+	// process down instead of failing one mapping -- which is what happened
+	// in #191: a test built a tracker with a nil store because it only wanted
+	// the OnNewExec hook, and the panic surfaced only on a machine where the
+	// synthetic pid it used happened to exist.
+	//
+	// Returned rather than refused in NewPIDTracker: two tests legitimately
+	// construct a store-less tracker to exercise Run's hook and observer
+	// dispatch, which touch no table at all.
+	if t.store == nil {
+		return fmt.Errorf("attach %s pid=%d: tracker has no table store", binPath, pid)
+	}
 	if openPath == "" {
 		openPath = binPath
 	}

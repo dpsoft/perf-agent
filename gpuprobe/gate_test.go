@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/internal/cubin"
 	"github.com/dpsoft/perf-agent/internal/gpuabi"
+	"github.com/dpsoft/perf-agent/internal/usdt"
 	pp "github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/unwind/ehcompile"
@@ -951,10 +953,101 @@ func TestTheCFIForcesTheWalkToReachTheRoot(t *testing.T) {
 	assert.Equal(t, ehcompile.RATypeUndefined, lastRow.RAType,
 		"the row covering the return address into _start does not mark it outermost")
 
-	t.Logf("perfagent_fpless_{bridge,caller}: mode=FP_LESS fp_type=SAME_VALUE -> ctx->fp survives")
-	t.Logf("main: mode=FP_SAFE, reached WITH a frame pointer -> FP path continues into libc")
-	t.Logf("_start: mode=FP_LESS ra_type=UNDEFINED -> WALKER_FLAG_RA_UNDEFINED, reached-root")
-	t.Logf("prediction: reached-root == dwarf, fp-exhausted == abandoned == 0")
+	// MEASURED, not predicted.
+	//
+	// These four lines used to be hardcoded prose: they printed the same text
+	// whatever the rows actually said. On arm64 that meant the log claimed
+	// "main: mode=FP_SAFE" while main's CFA there is SP-rooted, and claimed
+	// the walk would reach root on a run where all 58 walks were abandoned
+	// (#185). A log that cannot disagree with the code is the same defect
+	// this gate exists to remove, one level down.
+	//
+	// The list deliberately starts at the frame the walk STARTS in. The
+	// assertions above derive every frame BETWEEN the probe and _start, which
+	// left the probe's own frame - where PT_REGS_IP points when the USDT
+	// fires - as the one link in the chain nothing measured.
+	cfaNames := map[ehcompile.CFAType]string{0: "UNDEF", 1: "SP", 2: "FP"}
+	fpNames := map[ehcompile.FPType]string{0: "UNDEF", 1: "OFFSET_CFA", 2: "SAME_VALUE", 3: "REGISTER"}
+	raNames := map[ehcompile.RAType]string{0: "UNDEF", 1: "OFFSET_CFA", 2: "SAME_VALUE", 3: "REGISTER"}
+	t.Logf("GOARCH=%s, the chain leaf-first, as the tables actually read:", runtime.GOARCH)
+	for _, fn := range []string{
+		"gpu_launch_sampled_v1_emit",
+		"perfagent_stub_run",
+		"perfagent_fpless_bridge",
+		"perfagent_fpless_caller",
+		"main",
+		"_start",
+	} {
+		var sym *elf.Symbol
+		for i := range syms {
+			if syms[i].Name == fn && syms[i].Size > 0 {
+				sym = &syms[i]
+				break
+			}
+		}
+		if sym == nil {
+			t.Logf("  %-28s no sized symbol in this binary", fn)
+			continue
+		}
+		pc := sym.Value + sym.Size/2
+		row := cfiOf(entries, pc)
+		if row == nil {
+			t.Logf("  %-28s pc=%#x NO CFI ROW -- walk_step would frame-pointer walk here", fn, pc)
+			continue
+		}
+		// ra=SAME_VALUE or REGISTER is the unflagged `goto stop` in
+		// unwind_common.h: the return address is in a register the walker
+		// does not track (x30/LR on arm64), so the walk ends there with no
+		// counter naming a cause. That is the shape #185 is hunting.
+		note := ""
+		if row.RAType == ehcompile.RATypeSameValue || row.RAType == ehcompile.RATypeRegister {
+			note = "  <-- walk STOPS here, unflagged (#185)"
+		}
+		t.Logf("  %-28s cfa=%s%+d fp=%s%+d ra=%s%+d%s",
+			fn, cfaNames[row.CFAType], row.CFAOffset,
+			fpNames[row.FPType], row.FPOffset,
+			raNames[row.RAType], row.RAOffset, note)
+	}
+
+	// And the row that actually governs the walk's FIRST step: the one
+	// covering the USDT probe site itself.
+	//
+	// gpu_launch_sampled_v1_emit has no ELF symbol - the probe macro is
+	// inlined into perfagent_stub_run, which is why it appears in a sampled
+	// stack only through DWARF inline info. So the midpoint of stub_run above
+	// is NOT where the walk begins, and a prologue or a cold region at the
+	// real probe PC can carry a different rule. Read it off the notes.
+	probes, perr := usdt.ParseFile(built)
+	require.NoError(t, perr, "the producer must carry readable USDT notes")
+	for _, pr := range probes {
+		// Probe.Offset is a FILE offset; ehcompile rows are vaddrs.
+		var pc uint64
+		for _, ph := range ef.Progs {
+			if ph.Type == elf.PT_LOAD && pr.Offset >= ph.Off && pr.Offset < ph.Off+ph.Filesz {
+				pc = pr.Offset - ph.Off + ph.Vaddr
+				break
+			}
+		}
+		if pc == 0 {
+			t.Logf("  probe %s/%s: file offset %#x is in no PT_LOAD", pr.Provider, pr.Name, pr.Offset)
+			continue
+		}
+		row := cfiOf(entries, pc)
+		if row == nil {
+			t.Logf("  probe %s/%s pc=%#x NO CFI ROW -- the walk cannot take the DWARF path from its own frame",
+				pr.Provider, pr.Name, pc)
+			continue
+		}
+		note := ""
+		if row.RAType == ehcompile.RATypeSameValue || row.RAType == ehcompile.RATypeRegister {
+			note = "  <-- walk STOPS at frame 0, unflagged (#185)"
+		}
+		t.Logf("  probe %-22s pc=%#x cfa=%s%+d fp=%s%+d ra=%s%+d%s",
+			pr.Provider+"/"+pr.Name, pc,
+			cfaNames[row.CFAType], row.CFAOffset,
+			fpNames[row.FPType], row.FPOffset,
+			raNames[row.RAType], row.RAOffset, note)
+	}
 }
 
 // TestFramePushRefusalRaisesAFlag pins that both record_push_native (at

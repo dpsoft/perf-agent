@@ -2057,15 +2057,45 @@ func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) uint64 {
 // string "0" would produce a perfectly valid-looking ID that every
 // uncorrelated record in one process shares, collapsing them into one
 // exact-join bucket and yielding confident, wrong joins with nothing counted.
-// The whole zero value is returned rather than one carrying only the pid, so
-// that the older `== gpu.CorrelationID{}` reading and the Present() reading
-// agree on these records.
+//
+// It carries the PID, and that is a REVERSAL: this used to return the whole
+// zero value "so that the older `== gpu.CorrelationID{}` reading and the
+// Present() reading agree on these records". That defence is obsolete -- no
+// code in the tree compares a CorrelationID against the zero struct any more,
+// and CorrelationID.Present() documents the comparison as wrong precisely
+// because PID and Backend are context the producer knows regardless.
+//
+// The defence also had a price, which is #184: Timeline.pendingModuleKeyFor
+// reads the PID off the Correlation ("which carries it even when Value is
+// empty", says its comment), so zeroing it keyed every CONTINUOUS Tier B
+// group on PID 0 and stopped it at the no-process gate -- one step before the
+// (crc, functionIndex) lookup it was headed for. GroupsUnresolvedName,
+// GroupsNoExecution and GroupsJoined were all unreachable for the entire
+// population that CONTINUOUS collection produces.
 //
 // Caller holds mu: the zero case bumps a counter so the demotion is visible.
 func (c *Consumer) correlationOf(pid uint32, v uint64) gpu.CorrelationID {
 	if v == 0 {
 		c.stats.ZeroCorrelation++
-		return gpu.CorrelationID{}
+		// Backend and PID are KEPT. A zero correlation means the producer
+		// supplied no vendor id; it does not mean the record came from no
+		// process. The pid arrives from the BPF side -- the probe fired inside
+		// the producer -- so it is known either way, and CorrelationID is
+		// designed for exactly this split: Present() is `Value != ""`, and its
+		// doc says PID and Backend "are context the producer knows regardless,
+		// so a record that carries no vendor correlation may still arrive with
+		// both filled in".
+		//
+		// Returning the zero struct discarded a pid this function was handed,
+		// and Timeline.pendingModuleKeyFor reads the PID off the Correlation
+		// -- its comment says "which carries it even when Value is empty".
+		// With it zeroed, every CONTINUOUS Tier B group keyed on PID 0 and
+		// Timeline stopped it at the no-process gate, one step before the
+		// (crc, functionIndex) name lookup it was headed for. That is #184:
+		// GroupsUnresolvedName, GroupsNoExecution and GroupsJoined were all
+		// unreachable for correlation-less PC samples, which is the whole
+		// population CONTINUOUS collection produces.
+		return gpu.CorrelationID{Backend: c.cfg.Backend, PID: pid}
 	}
 	return gpu.CorrelationID{Backend: c.cfg.Backend, PID: pid, Value: strconv.FormatUint(v, 10)}
 }

@@ -1974,30 +1974,35 @@ func TestStubDrivesPCSamplingToPprofWithoutAGPU(t *testing.T) {
 	assert.Equal(t, wantPC, snap.PendingModuleSamples,
 		"the stub's PC records carry synthetic CRCs and kernel names that no cubin can name, so every one of them must remain pending and counted - never attached to a plausible neighbour")
 	// Counted at a dead end, not silently skipped - which is the property
-	// here. The gate it stops at is the PROCESS gate, not the name gate: the
-	// stub sets r.correlation = 0 on every PC record, deliberately, because
-	// CONTINUOUS collection supplies no correlation and a stub that invented
-	// one would hide the join the consumer must actually make (stub.cc, spec
-	// §6.3 finding 3). pendingModuleKeyFor reads the PID off that
-	// correlation, so key.PID is 0 and Timeline stops the group one step
-	// before ever looking up (crc, functionIndex).
+	// here. The gate it stops at is the NAME gate: the stub's PC records carry
+	// synthetic CRCs (0xC0FFEE01/02) that name no cubin the agent holds, so
+	// modstore.FunctionName finds nothing and the group stays pending with a
+	// counted reason.
 	//
-	// This was pinned as Positive(GroupsUnresolvedName), which this producer
-	// cannot reach by construction. It asserted an unreachable counter and
-	// nothing noticed, because the test needs CAP_BPF and no job had it for
-	// this package. Measured here: GroupsNoProcess=4, GroupsUnresolvedName=0,
-	// pending-module-groups=4.
+	// It used to stop one gate earlier, at the PROCESS gate, and that was
+	// #184. The stub sets r.correlation = 0 deliberately -- CONTINUOUS
+	// collection supplies no correlation -- and the consumer was returning the
+	// whole zero CorrelationID for a wire zero, discarding the pid it had been
+	// handed. Timeline.pendingModuleKeyFor reads the PID off the Correlation,
+	// so every group keyed on process 0 and never reached the name lookup.
+	// Preserving the pid (it is context the producer knows regardless, and
+	// Present() is Value != "") moved the whole population one gate along.
+	//
+	// The zero-pin below is the one written in #183 for exactly this moment,
+	// and it fired as intended -- though on the consumer being fixed rather
+	// than the stub gaining correlations, which is what it predicted.
 	assert.Positive(t, snap.PendingModuleGroups,
 		"no pending module groups at all, so nothing below says anything")
-	assert.Equal(t, uint64(snap.PendingModuleGroups), snap.PCJoin.GroupsNoProcess,
+	assert.Equal(t, uint64(snap.PendingModuleGroups), snap.PCJoin.GroupsUnresolvedName,
 		"every pending group must be counted at the gate it actually stopped at: %+v, pending-module-groups=%d",
 		snap.PCJoin, snap.PendingModuleGroups)
 	// Same idiom as TestGateTheStubsPCRecordsCannotAttributeToAnything: when
-	// the stub is given correlations this fails by name, and the person
-	// fixing it moves the assertion to the gate the groups then reach.
-	assert.Zero(t, snap.PCJoin.GroupsUnresolvedName,
-		"a group reached the name lookup, which this producer's correlation-less PC records "+
-			"cannot do: the stub now supplies correlations, so assert the name gate here instead")
+	// the stub is given CRCs that name a cubin the agent holds, these groups
+	// reach the execution search and this fails by name, so the person fixing
+	// it moves the assertion to the gate they then reach.
+	assert.Zero(t, snap.PCJoin.GroupsNoProcess,
+		"a group was stopped at the process gate; PC samples now carry the producing pid even "+
+			"without a correlation, so reaching this gate means the pid was lost again (#184)")
 	assert.Equal(t, snap.PCJoin.GroupsExamined(),
 		snap.PCJoin.GroupsJoined+uint64(snap.PendingModuleGroups),
 		"every pending group must be joined or left pending for exactly one counted reason: %+v", snap.PCJoin)

@@ -663,8 +663,17 @@ func TestZeroWireCorrelationBecomesTheZeroCorrelationID(t *testing.T) {
 	c.Flush()
 
 	require.Len(t, sink.launches, 2)
-	assert.Equal(t, gpu.CorrelationID{}, sink.launches[0].Correlation,
-		"wire zero means no correlation; the timeline's heuristic path keys off the zero value")
+	// Not Present, so the timeline routes it to the heuristic join -- that is
+	// what gpu/timeline.go actually tests (`exec.Correlation.Present()`); no
+	// code in the tree compares a CorrelationID against the zero struct. The
+	// pid and backend ride along as the type intends, which is what #184
+	// needed.
+	assert.False(t, sink.launches[0].Correlation.Present(),
+		"wire zero must not produce a joinable correlation")
+	assert.Empty(t, sink.launches[0].Correlation.Value,
+		"Present() is Value != \"\"; that is the whole of the no-correlation answer")
+	assert.Equal(t, gpu.BackendCUPTI, sink.launches[0].Correlation.Backend,
+		"the backend is context the producer knows regardless of correlation")
 	assert.Equal(t, gpu.CorrelationID{Backend: gpu.BackendCUPTI, Value: "9"}, sink.launches[1].Correlation,
 		"a non-zero correlation is unaffected")
 
@@ -691,7 +700,10 @@ func TestZeroWireCorrelationOnExecs(t *testing.T) {
 	c.applyBatch(b)
 
 	require.Len(t, sink.execs, 1)
-	assert.Equal(t, gpu.CorrelationID{}, sink.execs[0].Correlation)
+	assert.False(t, sink.execs[0].Correlation.Present(),
+		"wire zero must demote to the heuristic join")
+	assert.Empty(t, sink.execs[0].Correlation.Value,
+		"Present() is Value != \"\"; that is the whole of the no-correlation answer")
 	st := c.Stats()
 	assert.Equal(t, uint64(1), st.ZeroCorrelation)
 	assert.Equal(t, uint64(1), st.ZeroCorrelationExecs,
@@ -3329,9 +3341,25 @@ func TestTierBZeroCorrelationIsCountedApartFromTheAggregate(t *testing.T) {
 
 	require.Len(t, sink.pcSamples, 3)
 	for _, s := range sink.pcSamples {
+		// NOT Present: this is the invariant that matters, and the one
+		// gpu/timeline.go tests to route a record to the heuristic join.
+		// Formatting the wire zero as "0" would make every uncorrelated record
+		// in a process share one valid-looking id and collapse them into a
+		// single exact-join bucket.
 		assert.False(t, s.Correlation.Present(),
-			"a wire zero must yield the zero CorrelationID, not one carrying only a pid")
-		assert.Equal(t, gpu.CorrelationID{}, s.Correlation)
+			"a wire zero must not produce a joinable correlation")
+		// But the PID IS carried. This assertion used to demand the whole zero
+		// struct, "not one carrying only a pid" -- a defence for an
+		// `== gpu.CorrelationID{}` reading that no longer exists anywhere in
+		// the tree, and the direct cause of #184: with PID zeroed, every
+		// CONTINUOUS Tier B group keyed on process 0 and Timeline stopped it
+		// at the no-process gate before the name lookup.
+		assert.Equal(t, uint32(4242), s.Correlation.PID,
+			"the pid the probe fired in was discarded; Timeline keys pending module groups on it (#184)")
+		assert.Equal(t, gpu.BackendCUPTI, s.Correlation.Backend,
+			"the backend is context the producer knows regardless of correlation")
+		assert.Empty(t, s.Correlation.Value,
+			"a wire zero must leave Value empty; that is what Present() reads")
 	}
 }
 

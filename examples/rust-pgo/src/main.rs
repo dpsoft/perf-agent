@@ -1,7 +1,7 @@
 // CPU-bound demonstrator: 99% of dispatched ops are `Add`, the other 1%
 // are spread across the rare arms. AutoFDO will move the Add arm to the
 // hot fall-through and shrink the prologue's branch overhead. Real-world
-// workloads see 5-15% speedup; this synthetic one tends to land near 8%.
+// workloads see 5-15% speedup; this synthetic one measures 33% (see README).
 //
 // Run: `./rust-pgo-example <iterations>` (default 200_000_000).
 

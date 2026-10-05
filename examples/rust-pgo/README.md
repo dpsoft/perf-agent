@@ -43,32 +43,55 @@ duration with `DURATION=60s` (default 30s).
    required because perf-agent samples cycles without branch records;
    without the flag, AutoFDO produces an empty profile.
 5. `cargo build --release` with
-   `-Cllvm-args=-sample-profile-file=train.prof -C strip=symbols` —
+   `-Zprofile-sample-use=train.prof -C strip=symbols` —
    PGO build, final binary stripped. Stable rustc has no high-level
    AutoFDO flag (`-C profile-use` is for *instrumented* PGO and rejects
-   sample profiles with "bad magic"), so we drop to the underlying LLVM
-   option directly.
+   sample profiles with "bad magic"), so this uses `-Z profile-sample-use`,
+   which needs nightly (or `RUSTC_BOOTSTRAP=1` on stable).
 6. Benchmarks the optimised binary, prints the speedup.
 
-**Measured on rustc 1.97.1: no improvement.** Two runs on an otherwise
-idle machine gave 1.00x (-0.0% and -0.4%), which is noise. The pipeline
-itself is healthy — `create_llvm_prof` converts the profile, every sample
-maps, the `.prof` carries real line-level counts, and LLVM raises no
-`-pgo-warn-missing-function` warning — so the profile is being applied
-and simply does not move this workload.
+**Measured on rustc 1.97.1: 1.50x (33%).**
 
-The companion [C++ demo](../cpp-pgo/) on the same shape of workload
-reaches **1.23x (19%)**, measured the same way. clang's
-`-fprofile-sample-use` integrates the profile into the full optimisation
-pipeline (inlining, branch layout, register allocation), whereas rustc
-only feeds it to LLVM at the codegen pass, and on stable there is no
-high-level AutoFDO flag at all.
+```
+baseline  33.60s   (33.60 / 33.70 / 33.70)
+pgo       22.42s   (22.42 / 22.66 / 23.01)
+          1.50x faster (33.3% improvement)
+```
 
-So treat this example as a demonstration that perf-agent's output drives
-the AutoFDO toolchain for Rust, not as a benchmark showing Rust gains
-from it. Whether a workload gains is a property of the workload and the
-rustc version; see
-[#168](https://github.com/dpsoft/perf-agent/issues/168).
+ITER=20000000000, three runs each, minimum reported.
+
+This README previously said "no improvement", on the strength of two runs
+that gave 1.00x. That number was real and the explanation was wrong: the
+script passed `-Cllvm-args=-sample-profile-file`, reaching for LLVM's raw
+`cl::opt`, and rustc builds its sample-profile pipeline from its own
+`PGOOptions` — so the option was parsed and then ignored. No profile was
+ever applied.
+
+The old text reasoned that LLVM raised no `-pgo-warn-missing-function`
+warning, *therefore* the profile was being applied. That inference is
+backwards. A nonexistent profile path produces no warning either, and
+exits 0:
+
+```
+real profile      -> 296d0c258183ec74
+bogus path        -> 296d0c258183ec74
+no profile at all -> 296d0c258183ec74
+```
+
+Three byte-identical binaries. With `-Zprofile-sample-use` the same
+`train.prof` gives a different binary, reproducibly, and the 33% above.
+
+Step 5 now fails the cycle if the control and PGO builds come out
+identical, so a silently-ignored flag cannot be reported as a 0% PGO
+result again.
+
+The companion [C++ demo](../cpp-pgo/) reaches **1.23x (19%)** on the same
+shape of workload. The Rust number being *higher* is not a claim about
+rustc beating clang — the two examples' workloads and iteration counts
+differ, and neither is a benchmark. Both exist to show that perf-agent's
+output drives the AutoFDO toolchain.
+
+See [#168](https://github.com/dpsoft/perf-agent/issues/168).
 
 ## Why this works
 

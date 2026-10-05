@@ -21,7 +21,20 @@ bench() {
             "$bin $ITER" >"${label}.txt" 2>&1
         awk -F'"mean": ' '/mean/{print $2+0}' "${label}.json" | head -1
     else
-        /usr/bin/time -p "$bin" "$ITER" 2>&1 | awk '/real/ {print $2}'
+        # Three runs, report the MINIMUM. The fallback used to time a single
+        # run with no warmup, which cannot resolve the few percent this example
+        # used to claim: the first run pays page-cache and CPU-frequency
+        # warm-up, and the minimum is the statistic least contaminated by
+        # whatever else the machine is doing.
+        local best=""
+        for _ in 1 2 3; do
+            local t
+            t=$(/usr/bin/time -p "$bin" "$ITER" 2>&1 >/dev/null | awk '/real/ {print $2}')
+            if [ -z "$best" ] || awk -v a="$t" -v b="$best" 'BEGIN{exit !(a<b)}'; then
+                best=$t
+            fi
+        done
+        echo "$best"
     fi
 }
 
@@ -60,14 +73,60 @@ create_llvm_prof \
     --use_lbr=false
 
 echo "==> 5. PGO build (uses train.prof; strips symbols on the final artefact)"
-# Stable rustc doesn't expose a high-level AutoFDO flag — `-C profile-use`
-# is for instrumented PGO and rejects sample profiles with "bad magic".
-# Drop to the underlying LLVM option via -Cllvm-args=-sample-profile-file.
-# -pgo-warn-missing-function surfaces functions present in the profile
-# but not in the binary (a sign the binary was rebuilt between training
-# and use, breaking the build-id join).
-RUSTFLAGS="-Cllvm-args=-sample-profile-file=$WORKDIR/train.prof -Cllvm-args=-pgo-warn-missing-function -C strip=symbols" \
-    cargo build --release --quiet
+# -Z profile-sample-use is rustc's AutoFDO flag. This script used to pass
+# -Cllvm-args=-sample-profile-file instead, reaching for LLVM's raw cl::opt --
+# but rustc builds its sample-profile pipeline from its own PGOOptions, so that
+# option was parsed and then ignored. The effect was total: a real profile, a
+# nonexistent profile and no profile at all produced byte-identical binaries,
+# the build exited 0 either way, and the measured speedup was -0.0% (#168).
+#
+# It is a -Z flag, so it needs nightly. RUSTC_BOOTSTRAP=1 unlocks it on a
+# stable toolchain; that is an unsupported escape hatch rather than a promise,
+# so prefer a real nightly when one is installed.
+if cargo +nightly --version >/dev/null 2>&1; then
+    PGO_CARGO=(cargo +nightly)
+    PGO_ENV=()
+    echo "    using nightly for -Z profile-sample-use"
+else
+    PGO_CARGO=(cargo)
+    PGO_ENV=(RUSTC_BOOTSTRAP=1)
+    echo "    no nightly toolchain; using RUSTC_BOOTSTRAP=1 to unlock -Z on stable"
+fi
+
+# Two builds with IDENTICAL flags but for the profile, so the comparison below
+# isolates the profile and nothing else. Neither is stripped: -C strip=symbols
+# is applied to the final artefact afterwards, and stripping here would make
+# the two binaries differ for a reason that has nothing to do with PGO.
+COMMON="-Cdebuginfo=2"
+touch src/main.rs
+env "${PGO_ENV[@]}" RUSTFLAGS="$COMMON" "${PGO_CARGO[@]}" build --release --quiet
+CONTROL_HASH=$(sha256sum ./target/release/rust-pgo-example | cut -d" " -f1)
+
+touch src/main.rs
+env "${PGO_ENV[@]}" \
+    RUSTFLAGS="-Zprofile-sample-use=$WORKDIR/train.prof $COMMON" \
+    "${PGO_CARGO[@]}" build --release --quiet
+PGO_HASH=$(sha256sum ./target/release/rust-pgo-example | cut -d" " -f1)
+
+# The gate the old invocation would have failed. A profile that changes nothing
+# leaves the two builds identical, and the benchmark below would then be
+# measuring one binary against itself and reporting it as a PGO outcome --
+# which is exactly what #168 recorded as "0.0% improvement".
+if [ "$CONTROL_HASH" = "$PGO_HASH" ]; then
+    echo "ERROR: the sample profile changed nothing - control and PGO builds are byte-identical." >&2
+    echo "  $CONTROL_HASH" >&2
+    echo "  The profile was not applied, so there is no PGO result to measure." >&2
+    echo "  Check that train.prof is non-empty and that -Z profile-sample-use is accepted" >&2
+    echo "  by this toolchain (rustc --version; cargo +nightly --version)." >&2
+    exit 1
+fi
+echo "    profile applied: control ${CONTROL_HASH:0:16} -> pgo ${PGO_HASH:0:16}"
+
+# Strip only now, for the final artefact the user inspects at the end.
+touch src/main.rs
+env "${PGO_ENV[@]}" \
+    RUSTFLAGS="-Zprofile-sample-use=$WORKDIR/train.prof -C strip=symbols" \
+    "${PGO_CARGO[@]}" build --release --quiet
 
 echo "==> 6. PGO-optimised benchmark"
 OPT=$(bench optimized ./target/release/rust-pgo-example)

@@ -3,7 +3,7 @@
 
 /* A USDT probe with no systemtap dependency: the .note.stapsdt note is just
    an ELF note with a documented layout. This is the inline-asm route
-   docs/superpowers/specs/2026-08-16-gpu-profiling-v2-design.md §6 flags as
+   the GPU profiling v2 design, §6, flags as
    the alternative to systemtap-sdt-devel.
 
    Note: nothing stops the compiler from duplicating this call site when it

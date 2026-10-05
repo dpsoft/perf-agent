@@ -1,7 +1,7 @@
 # perf-agent benchmark suite
 
 Two-layer benchmark for `--unwind dwarf` startup cost. Companion to
-`docs/superpowers/specs/2026-04-25-unwind-auto-benchmark-design.md`.
+the unwind auto-benchmark design (no longer kept in-tree; see the git history).
 
 ## Layers
 

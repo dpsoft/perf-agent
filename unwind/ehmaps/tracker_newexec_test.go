@@ -43,8 +43,8 @@ func TestNewExec_NoSubscribersZeroDispatch(t *testing.T) {
 }
 
 // TestNewExec_HookFires registers an OnNewExec hook via SetOnNewExec, drives
-// a synthetic group-leader ForkEvent for pid=12345, and asserts the hook
-// received pid=12345.
+// a synthetic group-leader ForkEvent for a pid with no /proc entry, and
+// asserts the hook received it.
 func TestNewExec_HookFires(t *testing.T) {
 	w := &fakeMmapWatcher{ch: make(chan MmapEventRecord, 4)}
 	tracker := NewPIDTracker(nil, nil, nil)
@@ -61,8 +61,19 @@ func TestNewExec_HookFires(t *testing.T) {
 		close(done)
 	}()
 
-	// Send a group-leader ForkEvent for pid=12345.
-	const wantPID uint32 = 12345
+	// A pid with no /proc entry, confirmed at test time rather than assumed.
+	//
+	// This was the literal 12345, and that is #191: Run handles a fork by
+	// calling AttachAllMappings, which reads /proc/<pid>/maps and returns
+	// early when it cannot. So the nil store above was only ever reached on a
+	// machine where pid 12345 EXISTED -- and on a CI runner with a few
+	// thousand pids it eventually did, at which point the mapping scan found
+	// real executable mappings and AcquireBinary dereferenced nil.
+	//
+	// Same shape as the pid-1234 assertion fixed in #183, which needed pid
+	// 1234 to be dead and met dockerd on the arm64 runner. A test that
+	// depends on a pid's absence has to establish it.
+	wantPID := absentPID(t)
 	w.ch <- MmapEventRecord{Kind: ForkEvent, PID: wantPID, TID: wantPID}
 
 	// Wait for the hook to fire (Run dispatches synchronously; 200ms is generous).

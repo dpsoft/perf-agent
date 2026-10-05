@@ -129,6 +129,30 @@ perfagent-gpu-fpless: stub/fpless_bridge.cc stub/fpless_main.cc stub/stub.cc $(C
 #      DWARF path.
 #   3. perfagent_stub_run must KEEP its frame pointer, since the walk's first
 #      step is an FP step out of its frame.
+# The prologue check-fpless looks for is architecture-specific: x86-64
+# establishes a frame pointer with `mov %rsp,%rbp`, AAPCS64 with `mov x29, sp`
+# after `stp x29, x30, [sp, #-N]!`.
+#
+# Hard-coding the x86-64 spelling made checks 1 and 2 pass VACUOUSLY on
+# aarch64 - they look for the ABSENCE of an x86 pattern, which is always
+# absent there - while check 3 failed on a function that does have a frame
+# pointer. Nothing noticed, because no CI job ran the GPU pipeline gate on
+# either architecture until #183 added the step.
+#
+# uname -m rather than the ELF header: the shim is built natively per
+# architecture (under QEMU for the container images, where uname still reports
+# the emulated arch), so the host and the artifact always agree here.
+FPLESS_ARCH := $(shell uname -m)
+ifeq ($(FPLESS_ARCH),aarch64)
+  FP_ESTABLISH := mov[[:space:]]+x29,[[:space:]]*sp|stp[[:space:]]+x29,[[:space:]]*x30
+  FP_TOUCH     := x29
+  FP_REGNAME   := x29
+else
+  FP_ESTABLISH := mov[[:space:]]+%rsp,%rbp
+  FP_TOUCH     := ,%rbp|%rbp,|pop[[:space:]]+%rbp|push[[:space:]]+%rbp
+  FP_REGNAME   := %rbp
+endif
+
 .PHONY: check-fpless
 check-fpless: perfagent-gpu-fpless libperfagent-gpu-fpless.so
 	@rc=0; for img in perfagent-gpu-fpless libperfagent-gpu-fpless.so; do \
@@ -137,16 +161,16 @@ check-fpless: perfagent-gpu-fpless libperfagent-gpu-fpless.so
 	  objdump -d --no-show-raw-insn $$img \
 	    | awk -v f="<$$fn>:" 'index($$0,f){g=1;next} g&&/^$$/{exit} g' > /tmp/fpless_$$fn.asm; \
 	  if [ ! -s /tmp/fpless_$$fn.asm ]; then echo "$$img: $$fn: not found in the binary"; rc=1; continue; fi; \
-	  if grep -q 'mov  *%rsp,%rbp' /tmp/fpless_$$fn.asm; then \
+	  if grep -qE '$(FP_ESTABLISH)' /tmp/fpless_$$fn.asm; then \
 	    echo "$$fn: establishes a frame pointer; -fomit-frame-pointer did not take"; rc=1; fi; \
-	  if grep -qE ',%rbp|%rbp,|pop  *%rbp|push  *%rbp' /tmp/fpless_$$fn.asm; then \
-	    echo "$$fn: touches %rbp; the FP chain into perfagent_stub_run would be poisoned"; \
-	    grep -nE ',%rbp|%rbp,|%rbp' /tmp/fpless_$$fn.asm; rc=1; fi; \
-	  echo "$$img: $$fn: no frame pointer, %rbp untouched"; \
+	  if grep -qE '$(FP_TOUCH)' /tmp/fpless_$$fn.asm; then \
+	    echo "$$fn: touches $(FP_REGNAME); the FP chain into perfagent_stub_run would be poisoned"; \
+	    grep -nE '$(FP_TOUCH)' /tmp/fpless_$$fn.asm; rc=1; fi; \
+	  echo "$$img: $$fn: no frame pointer, $(FP_REGNAME) untouched"; \
 	 done; \
 	 objdump -d --no-show-raw-insn $$img \
-	   | awk 'index($$0,"<perfagent_stub_run>:"){g=1;next} g&&/^$$/{exit} g' | head -4 > /tmp/fpless_stubrun.asm; \
-	 grep -q 'mov  *%rsp,%rbp' /tmp/fpless_stubrun.asm || { \
+	   | awk 'index($$0,"<perfagent_stub_run>:"){g=1;next} g&&/^$$/{exit} g' | head -10 > /tmp/fpless_stubrun.asm; \
+	 grep -qE '$(FP_ESTABLISH)' /tmp/fpless_stubrun.asm || { \
 	   echo "$$img: perfagent_stub_run: no frame pointer; the walk's first FP step would fail"; rc=1; }; \
 	 readelf -S $$img | grep -q '\.eh_frame' || { \
 	   echo "$$img: no .eh_frame: the DWARF walker has nothing to read"; rc=1; }; \

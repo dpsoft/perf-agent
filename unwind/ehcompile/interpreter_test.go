@@ -48,12 +48,12 @@ func TestInterpret_DefCFAEmitsRow(t *testing.T) {
 	assert.Equal(t, uint64(0x1000), s.entries[0].PCStart)
 	assert.Equal(t, uint32(4), s.entries[0].PCEndDelta)
 	assert.Equal(t, CFATypeSP, s.entries[0].CFAType)
-	assert.Equal(t, int16(8), s.entries[0].CFAOffset)
+	assert.Equal(t, int32(8), s.entries[0].CFAOffset)
 
 	assert.Equal(t, uint64(0x1004), s.entries[1].PCStart)
 	assert.Equal(t, uint32(8), s.entries[1].PCEndDelta)
 	assert.Equal(t, CFATypeSP, s.entries[1].CFAType)
-	assert.Equal(t, int16(16), s.entries[1].CFAOffset)
+	assert.Equal(t, int32(16), s.entries[1].CFAOffset)
 }
 
 func TestInterpret_DefCFAWithFPOnARM64(t *testing.T) {
@@ -68,7 +68,7 @@ func TestInterpret_DefCFAWithFPOnARM64(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, s.entries, 1)
 	assert.Equal(t, CFATypeFP, s.entries[0].CFAType)
-	assert.Equal(t, int16(16), s.entries[0].CFAOffset)
+	assert.Equal(t, int32(16), s.entries[0].CFAOffset)
 }
 
 func TestInterpret_OffsetFPAndRA_x86(t *testing.T) {
@@ -87,11 +87,11 @@ func TestInterpret_OffsetFPAndRA_x86(t *testing.T) {
 	require.Len(t, s.entries, 1)
 	e := s.entries[0]
 	assert.Equal(t, CFATypeSP, e.CFAType)
-	assert.Equal(t, int16(16), e.CFAOffset)
+	assert.Equal(t, int32(16), e.CFAOffset)
 	assert.Equal(t, FPTypeOffsetCFA, e.FPType)
-	assert.Equal(t, int16(-16), e.FPOffset)
+	assert.Equal(t, int32(-16), e.FPOffset)
 	assert.Equal(t, RATypeOffsetCFA, e.RAType)
-	assert.Equal(t, int16(-8), e.RAOffset)
+	assert.Equal(t, int32(-8), e.RAOffset)
 }
 
 func TestInterpret_OffsetFPAndRA_arm64(t *testing.T) {
@@ -108,8 +108,8 @@ func TestInterpret_OffsetFPAndRA_arm64(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, s.entries, 1)
 	e := s.entries[0]
-	assert.Equal(t, int16(-16), e.FPOffset)
-	assert.Equal(t, int16(-8), e.RAOffset)
+	assert.Equal(t, int32(-16), e.FPOffset)
+	assert.Equal(t, int32(-8), e.RAOffset)
 }
 
 func TestInterpret_RememberRestoreState(t *testing.T) {
@@ -127,9 +127,9 @@ func TestInterpret_RememberRestoreState(t *testing.T) {
 	err := s.run(0x5000, 0x500A, program)
 	require.NoError(t, err)
 	require.Len(t, s.entries, 3)
-	assert.Equal(t, int16(8), s.entries[0].CFAOffset)
-	assert.Equal(t, int16(64), s.entries[1].CFAOffset)
-	assert.Equal(t, int16(8), s.entries[2].CFAOffset)
+	assert.Equal(t, int32(8), s.entries[0].CFAOffset)
+	assert.Equal(t, int32(64), s.entries[1].CFAOffset)
+	assert.Equal(t, int32(8), s.entries[2].CFAOffset)
 }
 
 func TestInterpret_ExpressionProducesFallback(t *testing.T) {
@@ -194,9 +194,9 @@ func TestInterpret_ARM64_TypicalPrologue(t *testing.T) {
 		if e.CFAType == CFATypeFP && e.CFAOffset == 16 {
 			found = true
 			assert.Equal(t, FPTypeOffsetCFA, e.FPType)
-			assert.Equal(t, int16(-16), e.FPOffset)
+			assert.Equal(t, int32(-16), e.FPOffset)
 			assert.Equal(t, RATypeOffsetCFA, e.RAType)
-			assert.Equal(t, int16(-8), e.RAOffset)
+			assert.Equal(t, int32(-8), e.RAOffset)
 		}
 	}
 	assert.True(t, found, "expected a row with CFA=FP+16")
@@ -300,7 +300,7 @@ func TestInterpret_DefCFASF_Scaled(t *testing.T) {
 	err := s.run(0x1000, 0x1004, program)
 	require.NoError(t, err)
 	require.Len(t, s.entries, 1)
-	assert.Equal(t, int16(16), s.entries[0].CFAOffset)
+	assert.Equal(t, int32(16), s.entries[0].CFAOffset)
 }
 
 func TestInterpret_DefCFAOffsetSF(t *testing.T) {
@@ -315,7 +315,7 @@ func TestInterpret_DefCFAOffsetSF(t *testing.T) {
 	err := s.run(0x1000, 0x1004, program)
 	require.NoError(t, err)
 	require.Len(t, s.entries, 1)
-	assert.Equal(t, int16(16), s.entries[0].CFAOffset)
+	assert.Equal(t, int32(16), s.entries[0].CFAOffset)
 }
 
 func TestInterpret_RegisterOpcode(t *testing.T) {
@@ -407,7 +407,7 @@ func TestInterpret_RestoreRevertsToTheCIERuleNotTheArchDefault(t *testing.T) {
 	assert.Equal(t, FPTypeSameValue, s.entries[0].FPType)
 	assert.Equal(t, FPTypeOffsetCFA, s.entries[1].FPType,
 		"restore must give back the CIE's offset rule, not the architectural default")
-	assert.Equal(t, int16(-16), s.entries[1].FPOffset)
+	assert.Equal(t, int32(-16), s.entries[1].FPOffset)
 }
 
 // The same defect on the return-address column, which is where it bites
@@ -443,7 +443,7 @@ func TestInterpret_RestoreOfTheRAColumnRevertsToTheCIERule(t *testing.T) {
 	assert.Equal(t, RATypeUndefined, s.entries[0].RAType)
 	assert.Equal(t, RATypeOffsetCFA, s.entries[1].RAType,
 		"restore must give back the CIE's DW_CFA_offset r16, -8, not undefined")
-	assert.Equal(t, int16(-8), s.entries[1].RAOffset)
+	assert.Equal(t, int32(-8), s.entries[1].RAOffset)
 }
 
 // The architectural defaults, stated as a test rather than as a comment:

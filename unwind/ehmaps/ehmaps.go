@@ -34,9 +34,11 @@ func TableIDForBuildID(buildID []byte) uint64 {
 	return h
 }
 
-// CFIEntryByteSize matches bpf/unwind_common.h `struct cfi_entry` (32 bytes
-// after u64 alignment padding; the active data fills offsets 0..25 and the
-// remaining 6 bytes are tail padding the BPF struct expects).
+// CFIEntryByteSize matches bpf/unwind_common.h `struct cfi_entry` (32 bytes;
+// the active data fills offsets 0..26 and the remaining 5 bytes are tail
+// padding the BPF struct expects). Unchanged by #185's widening of the three
+// offsets to __s32: the fields were reordered offsets-then-types so the extra
+// 6 bytes came out of the old interior padding.
 const CFIEntryByteSize = 32
 
 // PIDMappingByteSize matches bpf/unwind_common.h `struct pid_mapping`
@@ -58,12 +60,12 @@ func MarshalCFIEntry(e ehcompile.CFIEntry) []byte {
 	out := make([]byte, CFIEntryByteSize)
 	binary.LittleEndian.PutUint64(out[0:8], e.PCStart)
 	binary.LittleEndian.PutUint32(out[8:12], e.PCEndDelta)
-	out[12] = uint8(e.CFAType)
-	out[13] = uint8(e.FPType)
-	binary.LittleEndian.PutUint16(out[14:16], uint16(e.CFAOffset))
-	binary.LittleEndian.PutUint16(out[16:18], uint16(e.FPOffset))
-	binary.LittleEndian.PutUint16(out[18:20], uint16(e.RAOffset))
-	out[20] = uint8(e.RAType)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(e.CFAOffset))
+	binary.LittleEndian.PutUint32(out[16:20], uint32(e.FPOffset))
+	binary.LittleEndian.PutUint32(out[20:24], uint32(e.RAOffset))
+	out[24] = uint8(e.CFAType)
+	out[25] = uint8(e.FPType)
+	out[26] = uint8(e.RAType)
 	return out
 }
 

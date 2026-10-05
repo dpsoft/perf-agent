@@ -107,9 +107,13 @@ type CFIEntry struct {
 	PCEndDelta uint32  // PCEnd - PCStart
 	CFAType    CFAType // SP or FP
 	FPType     FPType
-	CFAOffset  int16
-	FPOffset   int16 // valid only when FPType == FPTypeOffsetCFA
-	RAOffset   int16 // valid only when RAType == RATypeOffsetCFA
-	RAType     RAType
-	_          [5]uint8 // pad to 32 bytes
+	// int32, not int16. A 72032-byte frame -- AAPCS64 keeps the CFA
+	// SP-rooted as the frame grows -- wrapped to 6496 at int16 and cost every
+	// arm64 walk its first step (#185). See struct cfi_entry in
+	// bpf/unwind_common.h.
+	CFAOffset int32
+	FPOffset  int32 // valid only when FPType == FPTypeOffsetCFA
+	RAOffset  int32 // valid only when RAType == RATypeOffsetCFA
+	RAType    RAType
+	_         [5]uint8 // pad to 32 bytes
 }

@@ -198,9 +198,32 @@ jobs:
             fi
           done
 
+      # v3's Node uploader stopped being able to reach codecov at all: every
+      # upload on every branch began failing with
+      #
+      #   Error: write EPROTO ... ssl3_read_bytes:ssl/tls alert handshake failure
+      #
+      # between 2026-10-03T21:48Z (last success) and 2026-10-05T00:30Z. It was
+      # service-side, not a repo change -- it hit a branch whose diff was only
+      # examples/*.{md,sh,rs}, and a branch that had uploaded fine earlier the
+      # same evening with the identical coverage config. v4 replaced that
+      # uploader with the codecov CLI, so v5 is the fix as well as the
+      # supported version; v3 is long past deprecation.
+      #
+      # token is optional on a public repo (v5 falls back to tokenless OSS
+      # upload) and the secret may not exist, in which case this expands to an
+      # empty string and is ignored. Adding CODECOV_TOKEN later needs no
+      # workflow change.
       - name: Upload coverage
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
+        # Coverage is a REPORT, not a gate, and this step must never be the
+        # reason a merge is blocked -- which is what it became for two days.
+        # Note this is not the "check that cannot fail" antipattern: the tests
+        # are the gate and they already failed this job above if they broke.
+        # What is being made non-blocking is a third party's availability.
+        continue-on-error: true
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.txt
           flags: unittests
 

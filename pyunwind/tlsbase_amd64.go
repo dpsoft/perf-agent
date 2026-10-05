@@ -31,6 +31,40 @@ const tlsStopTimeout = 2 * time.Second
 // path that has already gone wrong.
 const tlsReleaseTimeout = 10 * time.Second
 
+// tlsSpinWindow is how long waitForTraceStop looks for the stop WITHOUT
+// sleeping, before falling back to the 1ms poll it always used.
+//
+// PTRACE_INTERRUPT on a runnable thread lands in tens of microseconds, and the
+// old loop slept a flat millisecond between looks, so nearly every enrolment
+// that missed on its first non-blocking look paid 1ms to learn something that
+// had been true for ~974us. Measured over 20 idle interpreters:
+//
+//	sleep 1ms (before)   stop med=1.088ms
+//	no sleep at all      stop med=26us     (min 15us)
+//
+// So the stop costs ~26us and the millisecond was ours.
+//
+// A SHORTER SLEEP DOES NOT WORK, which is worth recording because it is the
+// obvious fix and measures identically to doing nothing: time.Sleep(20us)
+// still parks for about a millisecond, since Go's timer granularity on Linux
+// is ~1ms once the P has nothing else to run. An exponential backoff from 20us
+// measured 1.089ms median -- indistinguishable from the flat millisecond it
+// replaced. The sleep has to be SKIPPED, not shortened.
+//
+// So: spin for tlsSpinWindow, yielding between looks so a single-P runtime
+// still makes progress, then sleep as before. The window is ~8x the measured
+// median, covering the tail (1.772ms observed once) without burning CPU on a
+// thread that is genuinely not going to stop -- Wait4 with WNOHANG is a cheap
+// syscall, and past the window the cost per iteration is exactly what it was.
+//
+// Not a blocking Wait4: dropping WNOHANG would make the loop unbounded, and
+// tlsStopTimeout exists precisely because a thread mid-IO may never reach its
+// stop. A profiler that hangs at startup is worse than one that declines.
+const (
+	tlsSpinWindow = 200 * time.Microsecond
+	tlsPollMax    = time.Millisecond
+)
+
 // releaseTracee undoes a PTRACE_SEIZE, and does not return until it has --
 // or until the thread is gone, or the deadline passes.
 //
@@ -93,6 +127,7 @@ func threadExists(tid int) bool {
 // it does not report clone-children that do not deliver SIGCHLD.
 func waitForTraceStop(tid int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	spinUntil := time.Now().Add(tlsSpinWindow)
 	for {
 		var ws unix.WaitStatus
 		wpid, err := unix.Wait4(tid, &ws, unix.WALL|unix.WNOHANG, nil)
@@ -108,7 +143,13 @@ func waitForTraceStop(tid int, timeout time.Duration) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("pyunwind: tid %d did not reach a ptrace stop within %s (uninterruptible sleep?)", tid, timeout)
 		}
-		time.Sleep(time.Millisecond)
+		if time.Now().Before(spinUntil) {
+			// Yield rather than sleep: the stop is usually already queued and
+			// one more Wait4 will see it.
+			runtime.Gosched()
+			continue
+		}
+		time.Sleep(tlsPollMax)
 	}
 }
 

@@ -1,12 +1,16 @@
 package pyunwind
 
 import (
+	"bytes"
 	"debug/elf"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/ulikunitz/xz"
 )
 
 // ErrEvalLoopNotLocatable means the interpreter's bytecode dispatch loop
@@ -163,12 +167,29 @@ func isEvalFragment(name string) bool {
 	return name == evalLoopSymbol || strings.HasPrefix(name, evalLoopSymbol+".")
 }
 
-// allFuncSymbols returns every STT_FUNC symbol in both symbol tables.
+// allFuncSymbols returns every STT_FUNC symbol in both symbol tables, plus
+// those in the MiniDebugInfo image if the binary carries one.
+//
 // .symtab is where a PGO-partitioned build's local `.cold` fragment lives,
 // so reading only .dynsym would miss exactly the case EvalRangeForFile
 // exists to handle. A binary with no .symtab (the common stripped case)
 // yields elf.ErrNoSymbols, which is not an error here -- .dynsym alone is
 // what such a binary has.
+//
+// .gnu_debugdata is how a distro ships that .symtab anyway after stripping,
+// and on Fedora it is the difference between walking the stock interpreter
+// and declining it. Measured on Fedora 44's libpython3.14.so.1.0 (#170):
+//
+//	.dynsym       _PyEval_EvalFrameDefault                        994 bytes
+//	MiniDebugInfo _PyEval_EvalFrameDefault.localalias.lto_priv.0   994 bytes
+//	MiniDebugInfo _PyEval_EvalFrameDefault.cold                  80785 bytes
+//
+// The LTO build splits the loop and leaves the BULK in the .cold fragment,
+// ~1.5MB away from the hot part, so .dynsym alone shows 994 bytes against
+// the 8192-byte floor and the interpreter is refused. With MiniDebugInfo the
+// two fragments total 81779, which the existing multi-fragment path already
+// handles -- isEvalFragment matches the ".cold" suffix and EvalRangesForFile
+// returns one EvalRange per fragment. This function was the only gap.
 func allFuncSymbols(f *elf.File) []elf.Symbol {
 	var out []elf.Symbol
 	for _, get := range []func() ([]elf.Symbol, error){f.Symbols, f.DynamicSymbols} {
@@ -180,6 +201,57 @@ func allFuncSymbols(f *elf.File) []elf.Symbol {
 			if elf.ST_TYPE(s.Info) == elf.STT_FUNC {
 				out = append(out, s)
 			}
+		}
+	}
+	out = append(out, miniDebugFuncSymbols(f)...)
+	return out
+}
+
+// miniDebugFuncSymbols returns the STT_FUNC symbols inside a .gnu_debugdata
+// section, or nothing at all.
+//
+// Errors are deliberately swallowed rather than returned. Every one of them
+// means "this binary has no usable MiniDebugInfo", which is the normal case
+// for most binaries and is not a failure of anything: the caller then has
+// whatever .dynsym and .symtab gave it, and decides on the total. Turning a
+// malformed or absent section into a hard error would refuse interpreters
+// that are currently walked fine.
+func miniDebugFuncSymbols(f *elf.File) []elf.Symbol {
+	sec := f.Section(".gnu_debugdata")
+	if sec == nil {
+		return nil
+	}
+	raw, err := sec.Data()
+	if err != nil {
+		return nil
+	}
+	r, err := xz.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil
+	}
+	// Bounded: a MiniDebugInfo image is a symbols-only ELF, tens to a few
+	// hundred KB (604KB for Fedora's libpython3.14, the largest measured).
+	// The cap is four orders of magnitude of headroom over that and exists
+	// so a corrupt or hostile xz stream cannot be a memory-exhaustion lever
+	// -- this parses a file path the agent was pointed at, and a decompressor
+	// with no output bound is the classic shape of that bug.
+	const maxMiniDebugBytes = 64 << 20
+	img, err := io.ReadAll(io.LimitReader(r, maxMiniDebugBytes+1))
+	if err != nil || len(img) > maxMiniDebugBytes {
+		return nil
+	}
+	df, err := elf.NewFile(bytes.NewReader(img))
+	if err != nil {
+		return nil
+	}
+	syms, err := df.Symbols()
+	if err != nil {
+		return nil
+	}
+	var out []elf.Symbol
+	for _, s := range syms {
+		if elf.ST_TYPE(s.Info) == elf.STT_FUNC {
+			out = append(out, s)
 		}
 	}
 	return out

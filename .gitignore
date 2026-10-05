@@ -22,6 +22,11 @@
 !*_bpfeb.o
 # Committed test fixtures (cross-compiled arm64 object file for CFI tests)
 !unwind/ehcompile/testdata/*.o
+# Committed test fixture: a distro-stripped shared object whose eval-loop
+# symbols survive only inside .gnu_debugdata, the shape Fedora ships (#170).
+# Built by pyunwind/testdata/gen-minidebug.sh. The negation has to come after
+# the *.so rule above, which it does.
+!pyunwind/testdata/minidebug.so
 *.a
 
 # Go generated folders

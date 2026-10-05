@@ -597,6 +597,8 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	// come from anywhere, this name could not.
 	var sampledLaunches, sawFPLessCaller int
 	stackedKernels := map[string]int{}
+	depths := map[int]int{}
+	var firstStack []pp.Frame
 	for _, view := range snap.Executions {
 		require.NotNil(t, view.Launch,
 			"every execution joined its launch exactly (asserted above), so Launch must never be nil here")
@@ -620,6 +622,22 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 		if sawCaller {
 			sawFPLessCaller++
 		}
+		depths[len(view.Launch.Launch.CPUStack)]++
+		if firstStack == nil {
+			firstStack = view.Launch.Launch.CPUStack
+		}
+	}
+
+	// WHERE the walk stopped, not just that it did. #185: on arm64 every walk
+	// was abandoned with reached-root=0 while StacksUnresolved was 0 and the
+	// stub frame was present, i.e. the walk produced named frames and then
+	// stopped early. Aggregate counters cannot say at which frame, and that
+	// is the one thing needed to tell a faulting read apart from a rule the
+	// walker does not handle. Logged on every arch so the healthy shape is
+	// the comparison.
+	t.Logf("stack depth histogram: %v", depths)
+	for i, f := range firstStack {
+		t.Logf("  frame %d: %#x %s", i, f.Address, f.Name)
 	}
 	assert.Equal(t, wantSampled, sampledLaunches,
 		"exactly %d launches on the timeline must carry a non-empty CPUStack, matching Stats.SampledLaunches",

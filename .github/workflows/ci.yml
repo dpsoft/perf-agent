@@ -237,20 +237,11 @@ jobs:
     # frames a saved-RBP walk provably cannot reach, so the unwinder has
     # something real to bite on rather than a stack it could have guessed.
     #
-    # amd64 ONLY, and not because arm64 is uninteresting -- it is the more
-    # interesting one. Running it on arm64 is what found #185: there, all 58
-    # walks take the DWARF path and all 58 are abandoned, reached-root=0
-    # against 58/58 on amd64, with CFI present and chosen (no-tables=0,
-    # cfi-miss=0). That is a real unwinder defect, not a test problem, and it
-    # needs arm64 hardware to iterate on.
-    #
-    # So this gate guards amd64 starting now rather than waiting for #185,
-    # and the arm64 arm turns on by deleting the `if` below -- which is the
-    # acceptance criterion for closing #185. The unprivileged ./... run above
-    # still covers this package on BOTH architectures; what is amd64-only is
-    # the privileged end-to-end walk.
+    # BOTH architectures. Running it on arm64 is what found #185 -- there,
+    # every walk was abandoned with reached-root=0 against 58/58 on amd64 --
+    # and the arm64 arm stays on while that is chased, because a gate switched
+    # off is a gate that cannot tell anyone when the bug comes back.
     - name: "Run the GPU pipeline gate (no GPU required)"
-      if: matrix.arch == 'amd64'   # arm64 blocked on #185
       run: |
         # sudo because the gate needs CAP_BPF, CAP_PERFMON and
         # CAP_CHECKPOINT_RESTORE. PATH is preserved so sudo finds the Go that

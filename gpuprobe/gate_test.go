@@ -639,6 +639,47 @@ func TestStubDrivesThePipelineToPprofWithoutAGPU(t *testing.T) {
 	for i, f := range firstStack {
 		t.Logf("  frame %d: %#x %s", i, f.Address, f.Name)
 	}
+	// When the walk came up short, dump the prologue of the frame it failed
+	// to leave beside the CFI that describes it. #185: on arm64 the first
+	// DWARF step reads a return address of ZERO from cfa-104 (cfa = sp+6496)
+	// and the walk ends there. Only two things can produce that - the CFI
+	// disagrees with the code about where x30 is stored, or ctx->sp is not
+	// what the row assumes - and putting the two side by side is what tells
+	// them apart. Bounded output, and only on the failing path.
+	if len(firstStack) < 4 {
+		for _, cmd := range [][]string{
+			{"objdump", "-d", "--no-show-raw-insn", "--disassemble=perfagent_stub_run", built},
+			{"readelf", "--debug-dump=frames", built},
+		} {
+			out, derr := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
+			if derr != nil {
+				t.Logf("%s: %v", cmd[0], derr)
+				continue
+			}
+			lines := strings.Split(string(out), "\n")
+			// The FDE for stub_run is what matters, not the whole section.
+			if cmd[0] == "readelf" {
+				var keep []string
+				for i, ln := range lines {
+					if !strings.Contains(ln, "FDE") {
+						continue
+					}
+					// stub_run's FDE is the one whose pc range contains the
+					// probe; print the few FDEs with large def_cfa_offsets,
+					// which is the shape of a 6496-byte frame.
+					end := min(i+14, len(lines))
+					blk := strings.Join(lines[i:end], "\n")
+					if strings.Contains(blk, "def_cfa_offset: 6") || strings.Contains(blk, "def_cfa_offset: 5") {
+						keep = append(keep, blk)
+					}
+				}
+				lines = keep
+			} else if len(lines) > 30 {
+				lines = lines[:30]
+			}
+			t.Logf("%s:\n%s", cmd[0], strings.Join(lines, "\n"))
+		}
+	}
 	assert.Equal(t, wantSampled, sampledLaunches,
 		"exactly %d launches on the timeline must carry a non-empty CPUStack, matching Stats.SampledLaunches",
 		wantSampled)

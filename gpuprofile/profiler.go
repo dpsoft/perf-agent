@@ -71,6 +71,10 @@ type Config struct {
 	// to a busy process overruns them and loses GPU time outright. Zero means
 	// DefaultDrainEvery.
 	DrainEvery time.Duration
+
+	// EventRingBytes sizes the BPF event ringbuf. Zero keeps the
+	// compiled-in default, which is sized for a default-period capture.
+	EventRingBytes int
 }
 
 // DefaultDrainEvery matches cmd/gpu-cuda-profile's default.
@@ -136,6 +140,7 @@ func New(cfg Config) (*Profiler, error) {
 		Symbolizer:                cfg.Symbolizer,
 		Modules:                   store,
 		KeepInstrumentationFrames: cfg.KeepInstrumentationFrames,
+		EventRingBytes:            cfg.EventRingBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gpuprofile: attach to %s: %w", cfg.ShimPath, err)
@@ -239,6 +244,15 @@ func (p *Profiler) Samples() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.samples
+}
+
+// Stats reports the consumer's ingestion counters: what arrived off the
+// ringbuf and what was lost on the way. The profile alone cannot show this --
+// a capture that dropped most of its launches still writes a well-formed
+// profile, just a smaller one -- so the caller needs the counters to tell a
+// quiet GPU from a lossy capture.
+func (p *Profiler) Stats() gpuprobe.Stats {
+	return p.consumer.Stats()
 }
 
 // stop cancels the run loop once and waits for the final drain.

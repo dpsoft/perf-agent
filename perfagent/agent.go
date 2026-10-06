@@ -622,6 +622,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			Symbolizer:                a.symbolizer,
 			PCSampling:                a.config.GPUPCSampling,
 			KeepInstrumentationFrames: a.config.GPUKeepInstrumentationFrames,
+			EventRingBytes:            a.config.GPUEventRingBytes,
 		})
 		if err != nil {
 			a.cleanup()
@@ -858,9 +859,43 @@ func (a *Agent) logDebuginfodStats() {
 		st.FileModeAddrs, st.FileModeFetchFails, st.FileModeLocalHits, st.FileModeParseFails)
 }
 
+// logGPUStats prints the GPU consumer's ingestion counters.
+//
+// Same shape as issue #109: the counters existed in gpuprobe.Stats and
+// nothing printed them, so a capture that lost most of its GPU work still
+// reported only "GPU profile written to ... (N samples)" and looked like a
+// success. N alone cannot distinguish a quiet GPU from a lossy capture.
+//
+// The loss counters are called out separately from the volume ones because
+// a non-zero value in any of them means the profile under-reports: samples
+// the kernel could not deliver, and stacks evicted from the side table
+// before their kernel record arrived, are both GPU work that happened and
+// is not in the file.
+func (a *Agent) logGPUStats() {
+	if a.gpuProfiler == nil {
+		return
+	}
+	st := a.gpuProfiler.Stats()
+	log.Printf("perf-agent: gpu: batches=%d records=%d sampled_launches=%d "+
+		"stacks_resolved=%d stacks_attached=%d",
+		st.Batches, st.Records, st.SampledLaunches,
+		st.StacksResolved, st.StacksAttached)
+	if lost := st.KernelDropped + st.StacksEvicted + st.SequenceGaps +
+		st.StacksMissing + st.SinkRejected; lost > 0 {
+		log.Printf("perf-agent: gpu: LOST %d record(s): kernel_dropped=%d "+
+			"stacks_evicted=%d sequence_gaps=%d stacks_missing=%d sink_rejected=%d "+
+			"-- the profile under-reports GPU work. A smaller "+
+			"PERFAGENT_GPU_SAMPLE_PERIOD raises the event rate and makes this "+
+			"worse; raise the period or shorten the capture",
+			lost, st.KernelDropped, st.StacksEvicted, st.SequenceGaps,
+			st.StacksMissing, st.SinkRejected)
+	}
+}
+
 // cleanup releases profiler resources.
 func (a *Agent) cleanup() {
 	a.logDebuginfodStats()
+	a.logGPUStats()
 	if a.cpuProfiler != nil {
 		a.cpuProfiler.Close()
 		a.cpuProfiler = nil

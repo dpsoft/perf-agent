@@ -437,6 +437,12 @@ type Config struct {
 	// an offer that would pass it is refused and counted, again in
 	// CubinsRejectedTooLarge.
 	CubinTotalBytes int64
+
+	// EventRingBytes sizes the BPF event ringbuf. Zero keeps the
+	// compiled-in 4 MB. Must be a power of two and a multiple of the page
+	// size -- the kernel rejects anything else, so it is rounded up and
+	// validated here rather than failing deep in the verifier.
+	EventRingBytes int
 }
 
 const (
@@ -1702,6 +1708,28 @@ func Attach(cfg Config) (c *Consumer, err error) {
 			c = nil
 		}
 	}()
+
+	// Size the event ringbuf before load. The compiled-in 4 MB holds a
+	// default-period capture comfortably, but the event rate scales with
+	// 1/PERFAGENT_GPU_SAMPLE_PERIOD: at period=1 a PyTorch step rate that
+	// loses ~5% of records at the default loses ~90%, nearly all of it
+	// kernel_dropped -- batches the ringbuf had no room for. Those carry the
+	// kernel activity records that ARE the GPU time, so the profile shrinks
+	// rather than merely losing attribution. Raising the buffer is what lets
+	// a low period mean "more attribution" instead of "less profile".
+	if c.cfg.EventRingBytes > 0 {
+		m, ok := spec.Maps["events"]
+		if !ok {
+			err = fmt.Errorf("event ringbuf map %q not in spec", "events")
+			return
+		}
+		size, rerr := roundRingBytes(c.cfg.EventRingBytes)
+		if rerr != nil {
+			err = rerr
+			return
+		}
+		m.MaxEntries = size
+	}
 
 	if err = spec.LoadAndAssign(&c.objs, nil); err != nil {
 		err = fmt.Errorf("load gpu usdt objects: %w", err)
@@ -3375,4 +3403,24 @@ func (c *Consumer) Close() error {
 	c.links = nil
 	errs = append(errs, c.objs.Close())
 	return errors.Join(errs...)
+}
+
+// roundRingBytes rounds n up to a power of two that is also a multiple of the
+// page size, which is what BPF_MAP_TYPE_RINGBUF requires of max_entries. The
+// kernel rejects a bad size at load time with a bare EINVAL, far from the
+// knob that caused it, so the rounding and the bound both happen here.
+func roundRingBytes(n int) (uint32, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("event ringbuf size must be positive, got %d", n)
+	}
+	const maxRingBytes = 1 << 30 // 1 GiB of locked memory is already absurd
+	if n > maxRingBytes {
+		return 0, fmt.Errorf("event ringbuf size %d exceeds the %d-byte cap", n, maxRingBytes)
+	}
+	page := os.Getpagesize()
+	size := page
+	for size < n {
+		size <<= 1
+	}
+	return uint32(size), nil
 }

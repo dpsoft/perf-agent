@@ -68,6 +68,10 @@ type Config struct {
 	// identical bytes at another path is a different target.
 	GPUShimPath string
 
+	// GPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.
+	// Zero keeps the compiled-in default. See WithGPUEventRingBytes.
+	GPUEventRingBytes int
+
 	// GPUProfilePath is the output path for the GPU profile.
 	GPUProfilePath string
 
@@ -370,6 +374,19 @@ func WithGPU(shimPath string) Option {
 	return func(c *Config) {
 		c.EnableGPU = true
 		c.GPUShimPath = shimPath
+	}
+}
+
+// WithGPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.
+//
+// The default is sized for a capture at the shim's default sampling period.
+// Lowering PERFAGENT_GPU_SAMPLE_PERIOD in the target multiplies the event
+// rate, and the records that overflow are the kernel activity records that
+// carry GPU time -- so an undersized buffer shrinks the profile rather than
+// just coarsening it. Zero keeps the default.
+func WithGPUEventRingBytes(n int) Option {
+	return func(c *Config) {
+		c.GPUEventRingBytes = n
 	}
 }
 

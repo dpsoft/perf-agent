@@ -42,7 +42,13 @@ var (
 	flagGPUShim = flag.String("gpu-shim", "",
 		"The CUPTI adapter the target loaded. Must be the SAME FILE it mapped: the uprobe attaches "+
 			"by inode, so identical bytes at another path is a different target and nothing is captured")
-	flagGPUOutput  = flag.String("gpu-output", "", "Output path for GPU profile (default: auto-generated)")
+	flagGPUOutput    = flag.String("gpu-output", "", "Output path for GPU profile (default: auto-generated)")
+	flagGPURingBytes = flag.Int("gpu-ring-bytes", 0,
+		"Size of the BPF event ringbuf for --gpu, in bytes (rounded up to a "+
+			"power-of-two page multiple; 0 keeps the 4MB default). Lowering "+
+			"PERFAGENT_GPU_SAMPLE_PERIOD in the target multiplies the event rate, "+
+			"and the records that overflow carry the GPU time itself, so an "+
+			"undersized buffer SHRINKS the profile. Check the 'gpu: LOST' line")
 	flagPMUOutput  = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagFlamegraph = flag.String("flamegraph-output", "",
 		"Also write a self-contained interactive HTML flame graph of the profile. "+
@@ -258,6 +264,9 @@ func buildOptions() []perfagent.Option {
 			perfagent.WithGPU(*flagGPUShim),
 			perfagent.WithGPUProfilePath(outputPath),
 		)
+		if *flagGPURingBytes > 0 {
+			opts = append(opts, perfagent.WithGPUEventRingBytes(*flagGPURingBytes))
+		}
 
 		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {
 			opts = append(opts, perfagent.WithGPUFlamegraph(path))

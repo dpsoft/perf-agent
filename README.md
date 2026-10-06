@@ -54,21 +54,13 @@ than 5.9, add `cap_sys_admin`: `CAP_CHECKPOINT_RESTORE` (5.9) is what covers
 
 ---
 
-![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](docs/flamegraph-pytorch-gpu.png)
-
-*One capture of a live PyTorch run: `pa_train_step (torch_workload.py:76)` under
-`Thread.run (threading.py:1001)`, down through `torch::autograd` and
-`cublasSgemm_v2`, across the `[gpu:launch]` boundary into the CUDA kernel —
-Python, C++ and GPU in one tree.
-[Interactive version](docs/flamegraph-pytorch-gpu.html).*
-
 ## What you can do with perf-agent
 
 ### 🎮 GPU kernels under the stack that launched them
 
 CUDA kernels land under the code that queued them, joined on CUPTI's correlation
 id — so a slow kernel points at the call path responsible, Python frames
-included, not just at itself. The capture above is one of these.
+included, not just at itself.
 
 ```bash
 # The workload must already have loaded the adapter:
@@ -76,11 +68,19 @@ included, not just at itself. The capture above is one of these.
 ./perf-agent --profile --offcpu --gpu \
     --gpu-shim /path/to/libperfagent-gpu-nvidia.so --pid <PID>
 
-# One profile per collector; fuse them into the picture above
+# One profile per collector; fuse them into the picture below
 go run ./cmd/flamegraph -fuse -o fused.html \
     -in 'cpu.pb.gz;;[cpu] perf-agent 99 Hz' \
     -in 'gpu.pb.gz;;[gpu] per sampled launch'
 ```
+
+![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](docs/flamegraph-pytorch-gpu.png)
+
+*The flame graph those two commands produce: `pa_train_step
+(torch_workload.py:76)` under `Thread.run (threading.py:1001)`, down through
+`torch::autograd` and `cublasSgemm_v2`, across the `[gpu:launch]` boundary into
+the CUDA kernel — Python, C++ and GPU in one tree.
+[Interactive version](docs/flamegraph-pytorch-gpu.html).*
 
 Injection happens during `cuInit` and cannot be added to a live process, so
 `CUDA_INJECTION64_PATH` must be set before the workload starts — Parca and
@@ -386,80 +386,94 @@ See the [`perfagent` package docs](perfagent/) for in-memory output, custom labe
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                            USER SPACE (Go)                               │
+│          TARGET PROCESS — perf-agent never writes to it                  │
 │                                                                          │
-│                            ┌──────────┐                                  │
-│                            │ main.go  │                                  │
-│                            └────┬─────┘                                  │
-│                                 ▼                                        │
-│                       ┌──────────────────┐                               │
-│                       │ perfagent.Agent  │  lifecycle + --unwind dispatch│
-│                       └─────┬────────────┘                               │
-│       ┌─────────────────────┼─────────────────────────┐                  │
-│       ▼                     ▼                         ▼                  │
-│ ┌───────────────┐  ┌──────────────────────┐  ┌──────────────┐            │
-│ │  CPU Profiler │  │  DWARF CPU/Off-CPU   │  │ PMU Monitor  │            │
-│ │   (FP path)   │  │      Profiler        │  │              │            │
-│ │   profile/    │  │  unwind/dwarfagent/  │  │   cpu/       │            │
-│ │   offcpu/     │  │   (hybrid walker)    │  │              │            │
-│ └───────┬───────┘  └──────────┬───────────┘  └──────┬───────┘            │
-│         │                     │                     │                    │
-│         │     ┌───────────────┴───────────────┐     │                    │
-│         │     ▼                               ▼     │                    │
-│         │   ┌─────────────────┐    ┌──────────────────────┐              │
-│         │   │ unwind/ehcompile│    │  unwind/ehmaps       │              │
-│         │   │ .eh_frame → CFI │    │  per-PID map lifecyle│              │
-│         │   └─────────────────┘    │  + MMAP2 watcher     │              │
-│         │                          └──────────┬───────────┘              │
-│         │                                     │                          │
-│         ▼                                     ▼                          │
+│   Python frames        C/C++/Rust frames        CUDA launches            │
+│   (CPython 3.12-3.14)  (FP or .eh_frame)              │                  │
+│                                                       ▼                  │
+│                                   libperfagent-gpu-nvidia.so (the shim)  │
+│                                   loaded at cuInit via                   │
+│                                   CUDA_INJECTION64_PATH. Samples 1 launch│
+│                                   in N, emits a USDT probe + CUPTI       │
+│                                   kernel activity records                │
+└──────────┬──────────────────────────────────────────────┬────────────────┘
+           │ perf_event / sched_switch                    │ USDT (uprobe)
+═══════════╪══════════════════════════════════════════════╪════════════════
+           ▼                 KERNEL SPACE (eBPF)          ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ┌────────────┐ ┌──────────────┐ ┌─────────────┐ ┌────────┐ ┌──────────┐ │
+│  │ perf.bpf.c │ │perf_dwarf.bpf│ │ offcpu.bpf  │ │cpu.bpf │ │gpu_usdt  │ │
+│  │ (FP only)  │ │ hybrid: FP   │ │ +offcpu_    │ │HW ctrs │ │.bpf.c    │ │
+│  │ aggregated │ │ fast path,   │ │ dwarf       │ │rq lat  │ │walks the │ │
+│  │ counts     │ │ DWARF for    │ │sched_switch │ │ctx swch│ │LAUNCHING │ │
+│  │            │ │ FP-less PCs  │ │blocking-ns  │ │        │ │stack     │ │
+│  └─────┬──────┘ └──────┬───────┘ └──────┬──────┘ └───┬────┘ └────┬─────┘ │
+│        │               │                │            │           │       │
+│        │               └────────┬───────┴────────────┘           │       │
+│        │                        │ tail call, when the PC is in   │       │
+│        │                        │ the interpreter's eval loop    │       │
+│        │                        ▼                                │       │
+│        │            ┌──────────────────────────┐                 │       │
+│        │            │   pywalk_probe.bpf.c     │◄────────────────┘       │
+│        │            │ walks CPython's own frame│                         │
+│        │            │ chain — no injection,    │                         │
+│        │            │ no ptrace, nothing mutated                         │
+│        │            └────────────┬─────────────┘                         │
+│        │                         │                                       │
+│        │   CFI tables + pid_mappings via HASH_OF_MAPS keyed by build-id  │
+│        └──────────┬──────────────┴───────────────────────┬───────────────┘
+│                   ▼                                      ▼               │
+│            ┌──────────────┐                    ┌──────────────────┐      │
+│            │ stack ringbuf│                    │ aggregated maps  │      │
+│            └──────────────┘                    │ (FP path)        │      │
+│                                                └──────────────────┘      │
+└──────────┬───────────────────────────────────────────────┬───────────────┘
+           │                                               │
+═══════════╪═══════════════════════════════════════════════╪════════════════
+           ▼              USER SPACE (Go)                   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│   ┌──────────────────┐                      ┌─────────────────────────┐  │
+│   │ perfagent.Agent  │ lifecycle +          │  gpuprobe.Consumer      │  │
+│   │                  │ --unwind dispatch    │  ringbuf → records      │  │
+│   └───┬─────────┬────┘                      └───────────┬─────────────┘  │
+│       ▼         ▼                                       ▼                │
+│  ┌─────────┐ ┌──────────────────┐          ┌─────────────────────────┐   │
+│  │   CPU   │ │ DWARF CPU/Off-CPU│          │ gpu.Timeline            │   │
+│  │ Profiler│ │ unwind/dwarfagent│          │ joins kernel ⇄ launching│   │
+│  │ profile/│ │  (hybrid walker) │          │ stack on CUPTI's        │   │
+│  │ offcpu/ │ │                  │          │ correlation id          │   │
+│  └────┬────┘ └────────┬─────────┘          │ + gpu.ModuleStore       │   │
+│       │               │                    └───────────┬─────────────┘   │
+│       │     ┌─────────┴────────┐                       │                 │
+│       │     ▼                  ▼                       │                 │
+│       │ ┌────────────────┐ ┌──────────────────┐        │                 │
+│       │ │unwind/ehcompile│ │ unwind/ehmaps    │        │                 │
+│       │ │.eh_frame → CFI │ │ per-PID lifecycle│        │                 │
+│       │ └────────────────┘ │ + MMAP2 watcher  │        │                 │
+│       │                    └────────┬─────────┘        │                 │
+│       ▼                             ▼                  │                 │
+│   ┌──────────────────────────────────────────────┐     │                 │
+│   │        unwind/procmap (Resolver)             │     │                 │
+│   │  /proc/<pid>/maps + build-id, lazy per-PID   │     │                 │
+│   └────────────────────┬─────────────────────────┘     │                 │
+│                        ▼                               ▼                 │
 │   ┌──────────────────────────────────────────────────────────────┐       │
-│   │              unwind/procmap (Resolver)                       │       │
-│   │   /proc/<pid>/maps + .note.gnu.build-id, lazy per-PID cache  │       │
-│   └────────────────────┬─────────────────────────────────────────┘       │
-│                        ▼                                                 │
-│   ┌──────────────────────────────────────────────────────────────┐       │
-│   │            pprof/ ProfileBuilder                             │       │
+│   │                  pprof/ ProfileBuilder                       │       │
 │   │  address-keyed Locations + per-binary Mapping (build-id,     │       │
-│   │  file offsets) + kernel/[jit] sentinels + name-based         │       │
-│   │  fallback when resolver misses                               │       │
+│   │  file offsets) + kernel/[jit] sentinels                      │       │
 │   └──────────────────────────────────────────────────────────────┘       │
 │                                                                          │
-│   Symbolization: blazesym (DWARF + ELF + perf-maps for JIT runtimes)     │
-└─────────────┬──────────────────┬──────────────────┬──────────────────────┘
-              │                  │                  │
-══════════════╪══════════════════╪══════════════════╪═══════════════════════
-              │  eBPF load       │                  │
-              ▼                  ▼                  ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          KERNEL SPACE (eBPF)                             │
-│                                                                          │
-│  ┌──────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────┐  │
-│  │ perf.bpf.c   │  │ perf_dwarf.bpf │  │ offcpu.bpf.c   │  │ cpu.bpf.c│  │
-│  │ (FP only)    │  │ (hybrid: FP    │  │ + offcpu_dwarf │  │ HW ctrs  │  │
-│  │ stackmap     │  │  fast path,    │  │ sched_switch   │  │ rq lat   │  │
-│  │ aggregated   │  │  DWARF for     │  │ blocking-ns    │  │ ctx swch │  │
-│  │ counts       │  │  FP-less PCs)  │  │                │  │          │  │
-│  └──────┬───────┘  └────────┬───────┘  └────────┬───────┘  └────┬─────┘  │
-│         │                   │                   │               │        │
-│         │             CFI tables, classification, pid_mappings  │        │
-│         │             via HASH_OF_MAPS keyed by build-id        │        │
-│         │                   │                                   │        │
-│         └────────┬──────────┴──────────────┬────────────────────┘        │
-│                  ▼                         ▼                             │
-│           ┌─────────────┐          ┌─────────────────┐                   │
-│           │ stack ringbuf│         │ aggregated maps │                   │
-│           │ (DWARF path) │         │ (FP path)       │                   │
-│           └─────────────┘          └─────────────────┘                   │
-└──────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-                    ┌──────────────────────────────────────┐
-                    │              OUTPUT                  │
-                    │                                      │
-                    │  *-on-cpu.pb.gz   *-off-cpu.pb.gz    │
-                    │  PMU: console / file                 │
-                    └──────────────────────────────────────┘
+│   Symbolization: blazesym (DWARF + ELF + .gnu_debugdata + perf-maps),    │
+│   optional debuginfod for stripped binaries                              │
+└──────────────────────────────┬───────────────────────────────────────────┘
+                               ▼
+         ┌──────────────────────────────────────────────────┐
+         │                     OUTPUT                       │
+         │  *-on-cpu.pb.gz   *-off-cpu.pb.gz   *-gpu.pb.gz  │
+         │  PMU: console / file                             │
+         │  cmd/flamegraph: self-contained HTML,            │
+         │                  -fuse for CPU+GPU in one tree   │
+         └──────────────────────────────────────────────────┘
 ```
 
 Two stack-walker paths: **`--unwind fp`** (cheap, kernel-side aggregation; truncates on FP-less code) and **`--unwind dwarf`** / **`auto`** (default — FP fast path with `.eh_frame`-derived CFI fallback for release C++/Rust without frame pointers).

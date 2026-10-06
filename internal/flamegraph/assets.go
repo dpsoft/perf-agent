@@ -25,6 +25,19 @@ import (
 // one line of warning. The legend, the keyboard map, the notes and the label
 // table are all one keypress (or one icon) away.
 
+// faviconHRef is the perf-agent mark, inlined as a data: URI so the page
+// keeps its one-file contract -- a <link rel="icon" href="brand/..."> would
+// render a broken tab icon from file:// and leak a request everywhere else.
+//
+// It is the 16px mark from docs/brand/perf-agent-favicon.svg, which is drawn
+// for this size rather than scaled down from the full one: the full mark
+// loses its top rows below about 24px and reads as a smudge in a tab strip.
+//
+// Base64 rather than percent-encoding because the markup contains #, < and
+// " -- the three characters that make a raw SVG data: URI fragile inside an
+// HTML attribute.
+const faviconHRef = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHJlY3QgeD0iMSIgeT0iMTEiIHdpZHRoPSIxNCIgaGVpZ2h0PSI0IiByeD0iMS4zIiBmaWxsPSIjZDE0OTdmIi8+PHJlY3QgeD0iMSIgeT0iNiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEuMyIgZmlsbD0iI2U4ODczYSIvPjxyZWN0IHg9IjgiIHk9IjYiIHdpZHRoPSI3IiBoZWlnaHQ9IjQiIHJ4PSIxLjMiIGZpbGw9IiMzZmEwYWIiLz48cmVjdCB4PSI5IiB5PSIxIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMS4zIiBmaWxsPSIjNDRhODVlIi8+PC9zdmc+"
+
 // darkChrome is the page chrome's dark theme, written once and emitted
 // twice: once behind prefers-color-scheme for readers who never touch the
 // D key, once behind [data-theme="dark"] for readers who do. Two copies of

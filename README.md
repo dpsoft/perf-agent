@@ -1,6 +1,4 @@
-<img src="docs/brand/perf-agent-mark.svg" alt="" width="72">
-
-# perf-agent
+<img src="docs/brand/perf-agent-lockup.svg" alt="perf-agent" width="290">
 
 *eBPF-based Linux profiler — CPU, GPU and off-CPU in one flame graph, with CUDA kernels correlated to the launching stack. System-wide or per-PID, pprof output.*
 

@@ -141,7 +141,8 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	degenerate := res.Degenerate()
 
 	ew.s("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")
-	ew.s("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>")
+	ew.s("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n")
+	ew.s("<link rel=\"icon\" href=\"" + faviconHRef + "\">\n<title>")
 	ew.esc(opts.Title)
 	ew.s("</title>\n<style>\n")
 	ew.s(styleSheet)

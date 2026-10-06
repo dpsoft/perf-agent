@@ -70,11 +70,25 @@ func TestRenderHTMLFetchesNothing(t *testing.T) {
 	), Options{})
 
 	for _, forbidden := range []string{
-		"<script src", "<link ", "@import", "url(http", "url('http", "url(\"http",
+		"<script src", "@import", "url(http", "url('http", "url(\"http",
 		"fonts.googleapis.com", "fonts.gstatic.com", "cdn.", "fetch(", "XMLHttpRequest",
 		"<img", "<iframe",
 	} {
 		assert.NotContains(t, got, forbidden, "the page must load nothing from the network")
+	}
+
+	// <link> is allowed only when it fetches nothing. The favicon is one, and
+	// it is inlined as a data: URI; a stylesheet or an icon by path would
+	// both be a network request from anywhere but the directory it was
+	// written in, which is the whole point of the one-file contract. So the
+	// rule is not "no <link>" but "no <link> that resolves off-page".
+	links := regexp.MustCompile(`<link\b[^>]*>`).FindAllString(got, -1)
+	for _, link := range links {
+		href := regexp.MustCompile(`href="([^"]*)"`).FindStringSubmatch(link)
+		if assert.Len(t, href, 2, "every <link> must carry an href: %s", link) {
+			assert.True(t, strings.HasPrefix(href[1], "data:"),
+				"a <link> must resolve to a data: URI, got %q", href[1])
+		}
 	}
 	// Not one URL of any kind is left in the document. There used to be
 	// exactly one — the SVG XML namespace, an identifier rather than a fetch

@@ -1,6 +1,6 @@
-# perf-agent
+<img src="docs/brand/perf-agent-lockup.svg" alt="perf-agent" width="290">
 
-*eBPF-based Linux profiler — CPU, off-CPU, and PMU, system-wide or per-PID, pprof output.*
+*eBPF-based Linux profiler — CPU, GPU and off-CPU in one flame graph, with CUDA kernels correlated to the launching stack. System-wide or per-PID, pprof output.*
 
 [![CI](https://github.com/dpsoft/perf-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/dpsoft/perf-agent/actions/workflows/ci.yml)
 [![Tests](https://github.com/dpsoft/perf-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/dpsoft/perf-agent/actions/workflows/tests.yml)
@@ -8,495 +8,80 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/dpsoft/perf-agent)](go.mod)
 [![License](https://img.shields.io/github/license/dpsoft/perf-agent)](LICENSE)
 
-One binary, runs locally, no backend or telemetry.
+---
+
+![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](docs/flamegraph-pytorch-gpu.png)
+
+*One capture of a live PyTorch step: `pa_train_step (torch_workload.py:76)` under
+`Thread.run`, down through `torch::autograd` and `cublasSgemm_v2`, across the
+`[gpu:launch]` boundary into the CUDA kernel — Python, C++ and GPU in one tree.
+[Interactive version](docs/flamegraph-pytorch-gpu.html).*
 
 ---
 
-## Contents
+## What it does
 
-- [Quickstart](#quickstart)
-- [What you can do with perf-agent](#what-you-can-do-with-perf-agent)
-- [Requirements](#requirements)
-- [Usage](#usage)
-- [Flags](#flags)
-- [Output](#output)
-- [Library usage](#library-usage)
-- [Architecture](#architecture)
-- [Building](#building)
-- [Testing](#testing)
-- [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+- **CUDA kernels under the stack that launched them**, joined on CUPTI's
+  correlation id — a slow kernel points at the call path responsible, Python
+  frames included. [How the adapter is loaded →](docs/gpu-injection.md)
+- **Python frames walked from BPF**, out of the interpreter's own frame chain.
+  No injection into the target, no `CAP_SYS_PTRACE`, nothing mutated. CPython
+  3.12–3.14. [How the walk works →](docs/cpython-frame-walking.md)
+- **Off-CPU stalls**: `--offcpu` hooks `sched_switch` and accumulates blocking
+  time per call site — lock waits, syscall blocks, mutex contention.
+- **Release C++/Rust without frame pointers**, via a hybrid FP + `.eh_frame`
+  CFI walker. Node.js, Go and any runtime writing `/tmp/perf-<pid>.map` too.
+- **Stripped production binaries**, symbolized from `.gnu_debugdata` or fetched
+  off-box. [debuginfod setup →](docs/debuginfod-symbolization.md)
+- **Hardware counters and Kubernetes labels**, for PMU investigations and
+  per-pod attribution.
 
----
+Hot-attach to a running process — no restart, no preinstalled agent. The agent
+never writes to the process it measures.
 
 ## Quickstart
 
 ```bash
-# Build (one-time, see BUILDING.md for full toolchain setup)
+# Build (one-time; see BUILDING.md for the toolchain)
 make build
 
-# Grant capabilities once so subsequent runs don't need sudo
+# Grant capabilities once so later runs don't need sudo
 sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
 
-# Capture a 30-second CPU profile of one process — output is pprof
+# Capture a 30-second CPU profile of one process
 ./perf-agent --profile --pid <PID> --duration 30s
 
 # Inspect
 go tool pprof <output>.pb.gz
 ```
 
-`cap_syslog` is what makes `/proc/kallsyms` return real addresses. Without it
-the file reads as zeros and kernel frames stay unsymbolized with no error —
-`--kernel-stacks` simply produces bare `0xffffffff…` names. On kernels older
-than 5.9, add `cap_sys_admin`: `CAP_CHECKPOINT_RESTORE` (5.9) is what covers
-`/proc/<pid>/map_files` for symbolization, and it does not exist there.
+`cap_syslog` is what makes `/proc/kallsyms` return real addresses; without it
+kernel frames stay unsymbolized with no error. On kernels older than 5.9, add
+`cap_sys_admin`.
 
----
+For CPU + GPU in one tree, see [Usage](docs/usage.md#gpu).
 
-## What you can do with perf-agent
+## Documentation
 
-### 🔥 On-demand production profiling
-
-Hot-attach to a running process — no restart, no preinstalled agent. The agent never modifies the process it measures.
-
-### 💤 Off-CPU stalls and blocking analysis
-
-Find why a service is "slow but not CPU-busy." `--offcpu` hooks `sched_switch` and accumulates blocking time per call site — lock waits, syscall blocks, channel reads, mutex contention.
-
-### 🐍 Cross-language flame graphs
-
-One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Node.js (`--perf-basic-prof`), Go, and any runtime that writes a `/tmp/perf-<pid>.map`. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
-
-> **Python frames: not currently supported.** The `--inject-python` flag and its
-> perf-trampoline injector have been **removed**. It mutated the process it
-> measured, required CPython 3.12+, and required `CAP_SYS_PTRACE` to ptrace into
-> the target. Its replacement — walking the interpreter's frame chain from BPF,
-> which needs no injection and covers CPython 3.6+ — is tracked in
-> [#83](https://github.com/dpsoft/perf-agent/issues/83) and is **not built yet**.
->
-> Until #83 lands, perf-agent has **no Python-level frames of its own**. Python
-> processes still profile fine, but the stacks show C interpreter frames
-> (`_PyEval_EvalFrameDefault`, …) instead of Python qualnames. If you control how
-> the interpreter starts, launching it yourself with `python -X perf` (3.12+)
-> makes CPython write `/tmp/perf-<pid>.map`, and perf-agent will read and decode
-> those entries — that path is unchanged.
-
-### 📊 Hardware-counter performance investigations
-
-`--pmu` summarizes IPC, cache miss rate, runqueue latency (P50/P99), and context-switch reasons (preempted vs voluntary vs I/O wait). Combine with `--per-pid` in system-wide mode to see which processes dominate the node's wait time.
-
-### 🐳 Kubernetes-aware profile labels
-
-Run as a **DaemonSet on the host PID namespace** (recommended): perf-agent
-sees every node process and tags each sample with `pod_uid`,
-`container_id`, and `cgroup_path` parsed from `/proc/<pid>/cgroup` — no
-kubelet API, no client-go.
-
-For single-tenant pods, sidecar mode also works with
-`shareProcessNamespace: true` (which exposes every container's processes
-to every other container — fine when the agent and target are co-deployed
-by the same operator, a security regression otherwise). Downward-API
-env vars then add `pod_name` / `namespace` / `container_name` labels.
-
-`--pid <N>` accepts in-pod PIDs and translates them to host PIDs automatically.
-
-### 🔍 Stripped production binaries via off-box symbols
-
-Production builds usually strip debug info. Point perf-agent at a
-`debuginfod`-protocol server with `--debuginfod-url=URL`. A per-mapping
-classifier routes each binary in the target:
-
-- Has local DWARF or resolvable `.gnu_debuglink` → blazesym's process-mode
-  (system libs from distro debuginfo land here for free).
-- Stripped, build-id only (Rust/Go release builds) → file-mode against the
-  cached `.debug`, fetched on demand and content-addressed by build-id.
-- Deleted-but-still-mapped binary (sidecar / mount-namespace case) →
-  same flow, opened via `/proc/<pid>/map_files`.
-
-Cache layout, dispatcher details, and the address-normalization math:
-see [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
-
-### 🧪 PGO and flame graphs
-
-High-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is address-stable across runs. Feeds `go tool pprof`, `-diff_base`, and Go's native `-pgo=` flag.
-
-```bash
-perf-agent --profile --pid <PID> --duration 30s --profile-output cpu.pb.gz
-go build -pgo=cpu.pb.gz -o app .
-```
-
-`Function.start_line` is populated, which is what Go's PGO matches on
-alongside the function name; a profile without it is refused outright.
-Inlined frames are the exception and carry no start line — Go keys its hot
-nodes on out-of-line functions, so it accepts and applies the profile
-regardless.
-
-For toolchains that don't speak pprof, add `--perf-data-output app.perf.data` to emit a kernel-format `perf.data` alongside the pprof output. Same capture, two formats:
-
-- **AutoFDO PGO** for Rust (`rustc -Cllvm-args=-sample-profile-file=...`) and C++ (`clang -fprofile-sample-use=...`) via Google's [`create_llvm_prof`](https://github.com/google/autofdo). End-to-end demo: [`examples/rust-pgo`](examples/rust-pgo/), [`examples/cpp-pgo`](examples/cpp-pgo/).
-- **[FlameGraph](https://github.com/brendangregg/FlameGraph)** — `perf script | stackcollapse-perf.pl | flamegraph.pl` produces an SVG. Demo: [`examples/flamegraph`](examples/flamegraph/).
-
-See [`docs/perf-data-output.md`](docs/perf-data-output.md) for the per-tool walkthrough.
-
-#### Built-in HTML flame graph
-
-`--flamegraph-output auto` writes an interactive flame graph beside the pprof file — one HTML file, no server, no CDN, no external script or font, correct opened straight off disk. Click a frame to zoom, `/` to search, `Esc` to clear then reset.
-
-```bash
-sudo ./perf-agent --pid 1234 --profile --flamegraph-output auto --duration 30s
-```
-
-To render a profile written earlier, or one from any other pprof producer:
-
-```bash
-go run ./cmd/flamegraph -o profile.html profile.pb.gz
-go run ./cmd/flamegraph -folded profile.pb.gz     # the a;b;c 123 text form
-```
-
-Colour encodes **domain** — application, libc/startup, GPU runtime, unsymbolized, perf-agent's own shim, the `[gpu:launch]` CPU→GPU boundary, GPU kernel — not a hash of the frame name, and the page carries a legend saying so.
-
-The page also states what it is *not* showing: the count of frames with no symbol, the share of GPU time sitting under `[gpu:launch unsampled]` with no CPU caller, the launch sampling period and what it does to the widths, and every per-sample label that is deliberately kept out of the tree. A profile with no samples renders a page that says so rather than an empty rectangle.
-
----
-
-## Requirements
-
-- Linux kernel 5.8+ (BTF + CO-RE).
-- Root, OR `setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent`.
-
-<details>
-<summary>What each capability is for, and when <code>cap_sys_admin</code> can be dropped</summary>
-
-| Capability | Why it is needed |
+| | |
 |---|---|
-| `cap_bpf` | Load eBPF programs and create maps |
-| `cap_perfmon` | `perf_event_open`, stack traces, tracing attachment |
-| `cap_sys_ptrace` | Read `/proc/<pid>/maps` and `/proc/<pid>/mem` of the target |
-| `cap_checkpoint_restore` | Follow `/proc/<pid>/map_files/` symlinks during symbolization |
-| `cap_sys_admin` | Only on kernels older than 5.8/5.9 — see below |
+| [Usage and flags](docs/usage.md) | every flag, with the examples |
+| [Requirements](docs/requirements.md) | kernel, capabilities, distro notes |
+| [Architecture](docs/architecture.md) | how a sample becomes a profile |
+| [Output](docs/output.md) | file naming, pprof fidelity, PMU format |
+| [What you can do](docs/use-cases.md) | the capabilities above, in full |
+| [Library usage](docs/library-usage.md) | embedding the agent in Go |
+| [Building](BUILDING.md) · [Testing](TESTING.md) | toolchain and test gates |
+| [Releases](RELEASES.md) · [Changelog](CHANGELOG.md) | what shipped when |
 
-`cap_checkpoint_restore` (or `cap_sys_admin`) is **required, not optional**.
-blazesym reaches the file behind every mapping through
-`/proc/<pid>/map_files/`, and the kernel refuses to follow those magic
-symlinks without one of the two — so without it every user-space frame in a
-profile is a bare hex address. perf-agent checks this at startup and refuses
-to run rather than write a profile that looks like a result and is not.
-
-`cap_sys_admin` is kept for backward compatibility. Two capabilities were added
-to the kernel to carve out the roles perf-agent used it for — but they did not
-arrive in the same release:
-
-- **`CAP_PERFMON` (kernel 5.8)** covers `perf_event_open`, including `pid=-1`
-  for system-wide profiling.
-- **`CAP_CHECKPOINT_RESTORE` (kernel 5.9)** covers `/proc/<pid>/map_files`.
-
-perf-agent's documented floor is kernel 5.8, and on exactly 5.8
-`cap_checkpoint_restore` does not exist — so dropping `cap_sys_admin` there would
-break symbolization. That single kernel minor version is why the full set is
-still the default.
-
-On **kernel 5.9 or newer** the minimal set is:
-
-```bash
-sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
-```
-
-If you run 6.x — as most deployments now do — this is the set to use. It matters
-most for per-pod and sidecar deployments, where `cap_sys_admin` is the near-root
-capability that gets a workload rejected by admission policy.
-
-</details>
+Deeper notes: [GPU injection](docs/gpu-injection.md) ·
+[CPython frame walking](docs/cpython-frame-walking.md) ·
+[debuginfod symbolization](docs/debuginfod-symbolization.md) ·
+[perf.data output](docs/perf-data-output.md)
 
 ---
 
-## Usage
-
-```bash
-# CPU profiling — DWARF/hybrid walker is the default
-./perf-agent --profile --pid <PID>
-
-# Force frame-pointer-only walker (cheaper startup, may truncate on FP-less binaries)
-./perf-agent --profile --unwind fp --pid <PID>
-
-# Force DWARF walker (eager CFI compile + per-frame hybrid)
-./perf-agent --profile --unwind dwarf --pid <PID>
-
-# Off-CPU profiling
-./perf-agent --offcpu --pid <PID>
-
-# Combined on-CPU + off-CPU
-./perf-agent --profile --offcpu --pid <PID>
-
-# PMU only (hardware counters)
-./perf-agent --pmu --pid <PID>
-
-# System-wide
-./perf-agent --profile -a --duration 30s
-
-# All features with metadata tags
-./perf-agent --profile --offcpu --pmu --pid <PID> --duration 30s \
-    --tag env=production \
-    --tag version=1.2.3 \
-    --tag service=api
-```
-
-Profiling a Python workload? See the note under [Cross-language flame
-graphs](#-cross-language-flame-graphs) — Python-level frames are unavailable
-until [#83](https://github.com/dpsoft/perf-agent/issues/83) lands.
-
----
-
-## Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--profile` | Enable CPU profiling with stack traces | `false` |
-| `--offcpu` | Enable off-CPU profiling with stack traces | `false` |
-| `--pmu` | Enable PMU hardware counters | `false` |
-| `--pid <PID>` | Target process ID | - |
-| `-a, --all` | System-wide (all processes) | `false` |
-| `--per-pid` | Per-PID breakdown (only with `-a --pmu`) | `false` |
-| `--duration` | Collection duration | `10s` |
-| `--sample-rate` | CPU profile sample rate (Hz) | `99` |
-| `--unwind` | Stack unwinding strategy: `fp` \| `dwarf` \| `auto` (auto routes to dwarf; the hybrid walker covers FP-safe code via the FP path) | `auto` |
-| `--profile-output` | Output path for CPU profile | auto-named |
-| `--offcpu-output` | Output path for off-CPU profile | auto-named |
-| `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
-| `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile` or `--offcpu`. | - |
-| `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
-| `--tag key=value` | Add tag to profile (repeatable) | - |
-| `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable). Falls back to `DEBUGINFOD_URLS` env. Unset → off. | - |
-| `--symbol-cache-dir=DIR` | Local directory for fetched artifacts. | `/tmp/perf-agent-debuginfod` |
-| `--symbol-cache-max=BYTES` | LRU cap for the symbol cache. | `2147483648` (2 GiB) |
-| `--symbol-fetch-timeout=DUR` | Per-artifact HTTP fetch timeout. | `30s` |
-| `--symbol-fail-closed` | (M2 stub) Refuse to symbolize a mapping whose fetch failed. | `false` |
-
-Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
-
----
-
-## Output
-
-### Output file naming
-
-Output files are auto-named by process name + timestamp + profile type:
-
-| Mode | Per-PID example | System-wide example |
-|------|----------------|---------------------|
-| `--profile` | `myapp-202604021430-on-cpu.pb.gz` | `202604021430-on-cpu.pb.gz` |
-| `--offcpu` | `myapp-202604021430-off-cpu.pb.gz` | `202604021430-off-cpu.pb.gz` |
-| `--pmu-output auto` | `myapp-202604021430-pmu.txt` | `202604021430-pmu.txt` |
-| `--flamegraph-output auto` | `myapp-202604021430-on-cpu.html` | `202604021430-on-cpu.html` |
-
-Process name comes from `/proc/<pid>/comm`. Override with `--profile-output` / `--offcpu-output`.
-
-### pprof fidelity
-
-CPU and off-CPU profiles are full-fidelity pprof: every `Mapping` carries the absolute path, GNU build-id, and file offsets; every `Location` is keyed by file offset (not symbol name) so cross-run diffing and sample-PGO converters work. `[kernel]` and `[jit]` sentinels handle the special cases. Tags from `--tag key=value` land as profile-level comments; k8s identity labels (when running in a pod) attach per-sample.
-
-```bash
-go tool pprof myapp-202604021430-on-cpu.pb.gz
-```
-
-With `--debuginfod-url` configured, pprof comes back fully symbolized —
-function names + source `:line` — even when debug info isn't present
-locally. See [docs/debuginfod-symbolization.md](docs/debuginfod-symbolization.md).
-
-### PMU output
-
-On-CPU time, runqueue latency, context-switch reasons, hardware counters (cycles, instructions, cache misses), and derived metrics (IPC, cache miss rate).
-
-Example:
-```
-=== PMU Metrics (PID: 84228) ===
-Samples: 26358
-
-On-CPU Time (time slice per context switch):
-  Min:    0.003 ms
-  P50:    0.071 ms
-  P99:    9.183 ms
-
-Runqueue Latency (time waiting for CPU):
-  Min:    0.001 ms
-  P50:    0.012 ms
-  P99:    0.850 ms
-
-Context Switch Reasons:
-  Preempted (running):     45.2%  (11912 times)
-  Voluntary (sleep/mutex): 42.1%  (11095 times)
-  I/O Wait (D state):      12.7%  (3351 times)
-
-Hardware Counters:
-  IPC (Instr/Cycle):  2.342
-  Cache Misses/1K:    0.022
-```
-
----
-
-## Library usage
-
-`perf-agent` is also a Go library via the `perfagent` package:
-
-```go
-agent, _ := perfagent.New(
-    perfagent.WithPID(12345),
-    perfagent.WithCPUProfile("profile.pb.gz"),
-    perfagent.WithPMU(),
-)
-defer agent.Close()
-agent.Start(ctx); time.Sleep(10*time.Second); agent.Stop(ctx)
-```
-
-See the [`perfagent` package docs](perfagent/) for in-memory output, custom label enrichers, and metrics exporters.
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                            USER SPACE (Go)                               │
-│                                                                          │
-│                            ┌──────────┐                                  │
-│                            │ main.go  │                                  │
-│                            └────┬─────┘                                  │
-│                                 ▼                                        │
-│                       ┌──────────────────┐                               │
-│                       │ perfagent.Agent  │  lifecycle + --unwind dispatch│
-│                       └─────┬────────────┘                               │
-│       ┌─────────────────────┼─────────────────────────┐                  │
-│       ▼                     ▼                         ▼                  │
-│ ┌───────────────┐  ┌──────────────────────┐  ┌──────────────┐            │
-│ │  CPU Profiler │  │  DWARF CPU/Off-CPU   │  │ PMU Monitor  │            │
-│ │   (FP path)   │  │      Profiler        │  │              │            │
-│ │   profile/    │  │  unwind/dwarfagent/  │  │   cpu/       │            │
-│ │   offcpu/     │  │   (hybrid walker)    │  │              │            │
-│ └───────┬───────┘  └──────────┬───────────┘  └──────┬───────┘            │
-│         │                     │                     │                    │
-│         │     ┌───────────────┴───────────────┐     │                    │
-│         │     ▼                               ▼     │                    │
-│         │   ┌─────────────────┐    ┌──────────────────────┐              │
-│         │   │ unwind/ehcompile│    │  unwind/ehmaps       │              │
-│         │   │ .eh_frame → CFI │    │  per-PID map lifecyle│              │
-│         │   └─────────────────┘    │  + MMAP2 watcher     │              │
-│         │                          └──────────┬───────────┘              │
-│         │                                     │                          │
-│         ▼                                     ▼                          │
-│   ┌──────────────────────────────────────────────────────────────┐       │
-│   │              unwind/procmap (Resolver)                       │       │
-│   │   /proc/<pid>/maps + .note.gnu.build-id, lazy per-PID cache  │       │
-│   └────────────────────┬─────────────────────────────────────────┘       │
-│                        ▼                                                 │
-│   ┌──────────────────────────────────────────────────────────────┐       │
-│   │            pprof/ ProfileBuilder                             │       │
-│   │  address-keyed Locations + per-binary Mapping (build-id,     │       │
-│   │  file offsets) + kernel/[jit] sentinels + name-based         │       │
-│   │  fallback when resolver misses                               │       │
-│   └──────────────────────────────────────────────────────────────┘       │
-│                                                                          │
-│   Symbolization: blazesym (DWARF + ELF + perf-maps for JIT runtimes)     │
-└─────────────┬──────────────────┬──────────────────┬──────────────────────┘
-              │                  │                  │
-══════════════╪══════════════════╪══════════════════╪═══════════════════════
-              │  eBPF load       │                  │
-              ▼                  ▼                  ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          KERNEL SPACE (eBPF)                             │
-│                                                                          │
-│  ┌──────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────┐  │
-│  │ perf.bpf.c   │  │ perf_dwarf.bpf │  │ offcpu.bpf.c   │  │ cpu.bpf.c│  │
-│  │ (FP only)    │  │ (hybrid: FP    │  │ + offcpu_dwarf │  │ HW ctrs  │  │
-│  │ stackmap     │  │  fast path,    │  │ sched_switch   │  │ rq lat   │  │
-│  │ aggregated   │  │  DWARF for     │  │ blocking-ns    │  │ ctx swch │  │
-│  │ counts       │  │  FP-less PCs)  │  │                │  │          │  │
-│  └──────┬───────┘  └────────┬───────┘  └────────┬───────┘  └────┬─────┘  │
-│         │                   │                   │               │        │
-│         │             CFI tables, classification, pid_mappings  │        │
-│         │             via HASH_OF_MAPS keyed by build-id        │        │
-│         │                   │                                   │        │
-│         └────────┬──────────┴──────────────┬────────────────────┘        │
-│                  ▼                         ▼                             │
-│           ┌─────────────┐          ┌─────────────────┐                   │
-│           │ stack ringbuf│         │ aggregated maps │                   │
-│           │ (DWARF path) │         │ (FP path)       │                   │
-│           └─────────────┘          └─────────────────┘                   │
-└──────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-                    ┌──────────────────────────────────────┐
-                    │              OUTPUT                  │
-                    │                                      │
-                    │  *-on-cpu.pb.gz   *-off-cpu.pb.gz    │
-                    │  PMU: console / file                 │
-                    └──────────────────────────────────────┘
-```
-
-Two stack-walker paths: **`--unwind fp`** (cheap, kernel-side aggregation; truncates on FP-less code) and **`--unwind dwarf`** / **`auto`** (default — FP fast path with `.eh_frame`-derived CFI fallback for release C++/Rust without frame pointers).
-
-Sample addresses resolve through `procmap.Resolver` (lazy `/proc/<pid>/maps` + build-id), so each pprof `Mapping` carries real per-binary identity and each `Location` is keyed by `(mapping_id, file_offset)` — what `go tool pprof -diff_base` and sample-based PGO converters need to round-trip.
-
----
-
-## Building
-
-Requires Go 1.26+, Clang/LLVM, Linux headers, and [blazesym](https://github.com/libbpf/blazesym) (Rust C library for symbolization).
-
-**Regenerating the eBPF objects needs Clang 18 specifically.** The `*_bpfel.o`
-files are committed build artifacts, so their bytes depend on the exact
-compiler that produced them — a different Clang rewrites objects in packages
-you did not touch, and the resulting diff is noise that will drift straight
-back for the next person. CI pins Clang 18 (Ubuntu 24.04's default) and fails
-if regeneration changes a committed object; `make generate-check` runs the same
-check locally and prints your Clang version when it disagrees.
-
-You only need this to run `make generate`. Building and testing use the
-committed objects and work with any toolchain.
-
-```bash
-make build
-```
-
-The Makefile defaults to `GOTOOLCHAIN=auto`, so Go fetches the pinned toolchain automatically if your system Go is older. Override with `GOTOOLCHAIN=local make build` to enforce the locally-installed toolchain.
-
-See [BUILDING.md](BUILDING.md) for the full toolchain setup.
-
----
-
-## Testing
-
-Unit tests run without root; integration tests require root or a setcap'd binary.
-
-```bash
-# Build + cap the binary once, then run tests as a normal user
-make build
-sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep ./perf-agent
-
-# Unit tests (no root)
-make test-unit
-
-# Integration tests — auto-skip when neither root nor caps are available
-make test-integration
-```
-
-Test gates honor file capabilities on the `perf-agent` binary: a setcap'd `perf-agent` lets the test runner exec it without sudo. For tests that load BPF in-process (library tests), the test binary itself needs caps — `setcap` it after `go test -c`.
-
-For detailed testing documentation see [TESTING.md](TESTING.md).
-
----
-
-## Contributing
-
-PRs welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening one — it covers build/test conventions, the commit-message style, and what's in-scope vs. deferred. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
-
----
-
-## Security
-
-If you find a security issue, please do **not** open a public issue. See [SECURITY.md](SECURITY.md) for the reporting channel and threat model. perf-agent runs with elevated kernel capabilities; we take privilege-escalation and kernel-DoS reports seriously.
-
----
-
-## License
-
-Apache License 2.0 — see [LICENSE](LICENSE).
+[Contributing](CONTRIBUTING.md) ·
+[Code of conduct](CODE_OF_CONDUCT.md) ·
+[Security](SECURITY.md) ·
+[License](LICENSE) (Apache-2.0)

@@ -1,6 +1,6 @@
 # perf-agent
 
-*eBPF-based Linux profiler — CPU, off-CPU, and PMU, system-wide or per-PID, pprof output.*
+*eBPF-based Linux profiler — CPU, GPU and off-CPU in one flame graph, with CUDA kernels correlated to the launching stack. System-wide or per-PID, pprof output.*
 
 [![CI](https://github.com/dpsoft/perf-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/dpsoft/perf-agent/actions/workflows/ci.yml)
 [![Tests](https://github.com/dpsoft/perf-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/dpsoft/perf-agent/actions/workflows/tests.yml)
@@ -54,7 +54,39 @@ than 5.9, add `cap_sys_admin`: `CAP_CHECKPOINT_RESTORE` (5.9) is what covers
 
 ---
 
+![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](docs/flamegraph-pytorch-gpu.png)
+
+*One capture of a live PyTorch run: `pa_train_step (torch_workload.py:76)` under
+`Thread.run (threading.py:1001)`, down through `torch::autograd` and
+`cublasSgemm_v2`, across the `[gpu:launch]` boundary into the CUDA kernel —
+Python, C++ and GPU in one tree.
+[Interactive version](docs/flamegraph-pytorch-gpu.html).*
+
 ## What you can do with perf-agent
+
+### 🎮 GPU kernels under the stack that launched them
+
+CUDA kernels land under the code that queued them, joined on CUPTI's correlation
+id — so a slow kernel points at the call path responsible, Python frames
+included, not just at itself. The capture above is one of these.
+
+```bash
+# The workload must already have loaded the adapter:
+#   CUDA_INJECTION64_PATH=/path/to/libperfagent-gpu-nvidia.so python train.py
+./perf-agent --profile --offcpu --gpu \
+    --gpu-shim /path/to/libperfagent-gpu-nvidia.so --pid <PID>
+
+# One profile per collector; fuse them into the picture above
+go run ./cmd/flamegraph -fuse -o fused.html \
+    -in 'cpu.pb.gz;;[cpu] perf-agent 99 Hz' \
+    -in 'gpu.pb.gz;;[gpu] per sampled launch'
+```
+
+Injection happens during `cuInit` and cannot be added to a live process, so
+`CUDA_INJECTION64_PATH` must be set before the workload starts — Parca and
+OpenTelemetry's profilers require the same. `--gpu-shim` must be the *same file*
+the target mapped: the uprobe attaches by inode, so identical bytes at another
+path capture nothing.
 
 ### 🔥 On-demand production profiling
 
@@ -68,19 +100,14 @@ Find why a service is "slow but not CPU-busy." `--offcpu` hooks `sched_switch` a
 
 One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Node.js (`--perf-basic-prof`), Go, and any runtime that writes a `/tmp/perf-<pid>.map`. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
 
-> **Python frames: not currently supported.** The `--inject-python` flag and its
-> perf-trampoline injector have been **removed**. It mutated the process it
-> measured, required CPython 3.12+, and required `CAP_SYS_PTRACE` to ptrace into
-> the target. Its replacement — walking the interpreter's frame chain from BPF,
-> which needs no injection and covers CPython 3.6+ — is tracked in
-> [#83](https://github.com/dpsoft/perf-agent/issues/83) and is **not built yet**.
->
-> Until #83 lands, perf-agent has **no Python-level frames of its own**. Python
-> processes still profile fine, but the stacks show C interpreter frames
-> (`_PyEval_EvalFrameDefault`, …) instead of Python qualnames. If you control how
-> the interpreter starts, launching it yourself with `python -X perf` (3.12+)
-> makes CPython write `/tmp/perf-<pid>.map`, and perf-agent will read and decode
-> those entries — that path is unchanged.
+**Python frames come from the interpreter's own frame chain**, walked in BPF — no
+injection into the target, no `CAP_SYS_PTRACE`, nothing mutated. Measured on
+CPython 3.12–3.14, including distro builds whose eval loop is split by LTO and
+reachable only through `.gnu_debugdata`. An interpreter it cannot walk is refused
+by name in the log rather than quietly yielding C frames.
+
+> Enrolment is per-PID today: a `--pid` capture walks Python, a system-wide `-a`
+> one does not and says so ([#194](https://github.com/dpsoft/perf-agent/issues/194)).
 
 ### 📊 Hardware-counter performance investigations
 
@@ -231,6 +258,9 @@ capability that gets a workload rejected by admission policy.
 # PMU only (hardware counters)
 ./perf-agent --pmu --pid <PID>
 
+# CPU + off-CPU + GPU (target must have loaded the CUPTI adapter; see GPU above)
+./perf-agent --profile --offcpu --gpu --gpu-shim <adapter.so> --pid <PID>
+
 # System-wide
 ./perf-agent --profile -a --duration 30s
 
@@ -241,9 +271,9 @@ capability that gets a workload rejected by admission policy.
     --tag service=api
 ```
 
-Profiling a Python workload? See the note under [Cross-language flame
-graphs](#-cross-language-flame-graphs) — Python-level frames are unavailable
-until [#83](https://github.com/dpsoft/perf-agent/issues/83) lands.
+Python frames need no extra flag — a `--pid` capture walks the interpreter's
+frame chain on CPython 3.12-3.14. For GPU, see [GPU kernels under the stack that
+launched them](#-gpu-kernels-under-the-stack-that-launched-them).
 
 ---
 

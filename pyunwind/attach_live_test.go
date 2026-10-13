@@ -154,10 +154,27 @@ func startLiveInterpreter(t *testing.T) (*exec.Cmd, map[int]uint64) {
 //
 // Needs no BPF and no capabilities: process_vm_readv and ptrace against
 // one's own child are allowed under every ptrace_scope setting.
-func TestTSDLookupFindsEachThreadsOwnThreadState(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skipf("pyunwind has measured glibc TSD offsets for amd64 only; %s is a named refusal (ErrUnsupportedArch)", runtime.GOARCH)
+// requireMeasuredArch skips when this architecture has no measured glibc
+// TSD offsets, because the walk is then a named refusal and there is
+// nothing to assert against a live interpreter.
+//
+// It asks glibcTSDOffsets rather than naming an architecture. These gates
+// used to read `runtime.GOARCH != "amd64"` with the reason "arm64 is a
+// named refusal", and that reason stopped being true the moment #206
+// measured arm64 -- but the gates did not, so the end-to-end path stayed
+// unexercised on a platform that supported it. Asking the table means a
+// future architecture starts being tested by adding its row, which is the
+// same act that makes the claim true.
+func requireMeasuredArch(t *testing.T) {
+	t.Helper()
+	if _, err := glibcTSDOffsets(runtime.GOARCH); err != nil {
+		t.Skipf("no measured glibc TSD offsets for %s; the walk is a named refusal here: %v",
+			runtime.GOARCH, err)
 	}
+}
+
+func TestTSDLookupFindsEachThreadsOwnThreadState(t *testing.T) {
+	requireMeasuredArch(t)
 	cmd, want := startLiveInterpreter(t)
 	pid := uint32(cmd.Process.Pid)
 
@@ -232,9 +249,7 @@ func TestTSDLookupFindsEachThreadsOwnThreadState(t *testing.T) {
 // holds something Offsets.Validate accepts, which is exactly why the test
 // above compares pointers instead.
 func TestNoOtherTSDKeyHoldsAThreadState(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skipf("amd64 only; %s is a named refusal", runtime.GOARCH)
-	}
+	requireMeasuredArch(t)
 	cmd, want := startLiveInterpreter(t)
 	pid := uint32(cmd.Process.Pid)
 
@@ -291,9 +306,7 @@ func TestNoOtherTSDKeyHoldsAThreadState(t *testing.T) {
 // way to the record that gets written into py_procs: through the frame
 // chain and Offsets.Validate, on every thread.
 func TestPrepareInfoAgainstLiveInterpreter(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skipf("amd64 only; %s is a named refusal", runtime.GOARCH)
-	}
+	requireMeasuredArch(t)
 	cmd, want := startLiveInterpreter(t)
 	pid := uint32(cmd.Process.Pid)
 

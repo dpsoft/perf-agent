@@ -85,6 +85,12 @@ type tssShape struct {
 	// leave it zero (encRIPDisp32); aarch64 needs its own because the
 	// reference is not a displacement sitting whole in four bytes.
 	enc fieldEnc
+	// adrpAt, when non-zero, is the offset of an ADRP whose page the ADD
+	// immediates are relative to. It turns the decoded value into a
+	// KeyRefA64PageRelative rather than an offset from _PyRuntime: the
+	// build names the field's address directly instead of reaching it
+	// through the runtime struct's base.
+	adrpAt int
 	// keyDelta is what the SECOND field is expected to encode relative to
 	// the first, once both are resolved. Zero for the shapes whose two
 	// fields address the same struct base; 4 for the Clang shape, whose
@@ -141,6 +147,73 @@ type tssShape struct {
 // data change plus a testdata body measured from the binary that motivated
 // it.
 var tssShapes = []tssShape{
+	{
+		// 72 bytes, eighteen instructions. aarch64, measured from Ubuntu
+		// 24.04's /usr/bin/python3.12 (3.12.3-1ubuntu0.17, arm64) -- the
+		// EXECUTABLE, which carries its own copy of libpython rather than
+		// linking the shared one, and is the interpreter CI actually
+		// reaches.
+		//
+		// It differs from the 76-byte shared-library shape by one
+		// instruction, and that one instruction changes what the number
+		// MEANS:
+		//
+		//	lib: adrp x19, page ; ldr x19, [x19, #slot] ; add x0, x19, #0x608
+		//	exe: adrp x19, page ;                         add x0, x19, #0xab8
+		//
+		// The library loads &_PyRuntime out of the GOT, so its immediate
+		// is an offset INSIDE that struct. The executable has no GOT hop:
+		// x19 is a page and the immediate is the low 12 bits of the
+		// field's own address. Decoding this one as a runtime offset
+		// would produce 0xab8, a plausible number pointing nowhere.
+		//
+		//	[ 0: 4]  d503233f  paciasp
+		//	[ 4: 8]  a9be7bfd  stp  x29, x30, [sp, #-0x20]!
+		//	[ 8:12]  910003fd  mov  x29, sp
+		//	[12:16]  f9000bf3  str  x19, [sp, #0x10]
+		//	[16:20]  f0002bf3  adrp x19, <page of autoTSSkey>
+		//	[20:24]  912ae260  add  x0, x19, #0xab8     <- the reference
+		//	[24:28]  9400298a  bl   PyThread_tss_is_created
+		//	[28:32]  340000c0  cbz  w0, +0x18
+		//	[32:36]  912ae260  add  x0, x19, #0xab8     <- and again
+		//	[36:40]  f9400bf3  ldr  x19, [sp, #0x10]
+		//	[40:44]  a8c27bfd  ldp  x29, x30, [sp], #0x20
+		//	[44:48]  d50323bf  autiasp
+		//	[48:52]  1400298c  b    PyThread_tss_get
+		//	[52:56]  f9400bf3  ldr  x19, [sp, #0x10]
+		//	[56:60]  d2800000  mov  x0, #0
+		//	[60:64]  a8c27bfd  ldp  x29, x30, [sp], #0x20
+		//	[64:68]  d50323bf  autiasp
+		//	[68:72]  d65f03c0  ret
+		name:   "aarch64 non-PIC executable (Ubuntu 24.04 /usr/bin/python3.12)",
+		size:   72,
+		adrpAt: 16,
+		fixed: []fixedRun{
+			{at: 0, bytes: []byte{0x3f, 0x23, 0x03, 0xd5}},
+			{at: 4, bytes: []byte{0xfd, 0x7b, 0xbe, 0xa9}},
+			{at: 8, bytes: []byte{0xfd, 0x03, 0x00, 0x91}},
+			{at: 12, bytes: []byte{0xf3, 0x0b, 0x00, 0xf9}},
+			{at: 28, bytes: []byte{0xc0, 0x00, 0x00, 0x34}}, // cbz w0, +0x18
+			{at: 36, bytes: []byte{0xf3, 0x0b, 0x40, 0xf9}},
+			{at: 40, bytes: []byte{0xfd, 0x7b, 0xc2, 0xa8}},
+			{at: 44, bytes: []byte{0xbf, 0x23, 0x03, 0xd5}},
+			{at: 52, bytes: []byte{0xf3, 0x0b, 0x40, 0xf9}},
+			{at: 56, bytes: []byte{0x00, 0x00, 0x80, 0xd2}},
+			{at: 60, bytes: []byte{0xfd, 0x7b, 0xc2, 0xa8}},
+			{at: 64, bytes: []byte{0xbf, 0x23, 0x03, 0xd5}},
+			{at: 68, bytes: []byte{0xc0, 0x03, 0x5f, 0xd6}},
+			// Same rule as the shared-library shape: the ADD immediates
+			// stay free, their registers and opcode do not.
+			{at: 20, bytes: []byte{0x60}},
+			{at: 23, bytes: []byte{0x91}},
+			{at: 32, bytes: []byte{0x60}},
+			{at: 35, bytes: []byte{0x91}},
+		},
+		keyAt:    []int{20, 32},
+		enc:      encA64AddImm12,
+		keyDelta: 0,
+		kind:     KeyRefA64PageRelative,
+	},
 	{
 		// 76 bytes, nineteen instructions. aarch64, measured from Ubuntu
 		// 24.04's libpython3.12.so.1.0 (3.12.3-1ubuntu0.17, arm64):
@@ -465,6 +538,9 @@ var tssShapes = []tssShape{
 type AutoTSSKeyRef struct {
 	Value uint64
 	Kind  AutoTSSKeyRefKind
+	// AdrpAt is the offset, within the body, of the ADRP whose page Value
+	// is measured from. Only KeyRefA64PageRelative reads it.
+	AdrpAt uint64
 }
 
 // AutoTSSKeyRefKind says how to read AutoTSSKeyRef.Value. Three codegen
@@ -491,6 +567,15 @@ const (
 	// This is the one form the bytes alone cannot resolve: it needs the
 	// address the body was linked at. See SymbolPlacement.
 	KeyRefBodyRelative
+	// KeyRefA64PageRelative: Value is (ADRP page delta + ADD immediate) and
+	// AdrpAt says where in the body that ADRP sits. aarch64 builds that
+	// name the field directly rather than through _PyRuntime's base.
+	//
+	// It cannot collapse into KeyRefBodyRelative, which is "BodyVaddr plus
+	// a constant". ADRP is relative to the 4 KB PAGE its own instruction
+	// is in, so the answer depends on BodyVaddr's low bits as well as its
+	// value, and no constant folded at parse time can express that.
+	KeyRefA64PageRelative
 )
 
 // SymbolPlacement is where the symbols a reference resolves against were
@@ -543,6 +628,15 @@ func (r AutoTSSKeyRef) Resolve(p SymbolPlacement) (uint64, error) {
 		// is signed, and a field below the referring instruction is an
 		// ordinary case.
 		addr = p.BodyVaddr + r.Value
+	case KeyRefA64PageRelative:
+		if p.BodyVaddr == 0 {
+			return 0, fmt.Errorf("%w: an aarch64 page-relative autoTSSkey reference cannot be resolved without the address PyGILState_GetThisThreadState was linked at",
+				ErrOffsetsImplausible)
+		}
+		// ADRP computes the page of its OWN instruction, not of the body,
+		// so the alignment is applied after adding AdrpAt. Wrapping
+		// addition on purpose: a negative page delta is ordinary.
+		addr = ((p.BodyVaddr + r.AdrpAt) &^ 0xFFF) + r.Value
 	default:
 		return 0, fmt.Errorf("%w: unknown autoTSSkey reference kind %d", ErrOffsetsImplausible, r.Kind)
 	}
@@ -633,7 +727,42 @@ func (s tssShape) decode(code []byte) (AutoTSSKeyRef, error) {
 				ErrTSSPatternUnrecognised, s.name, s.keyAt[i], int64(other-first), s.keyAt[0], s.keyDelta)
 		}
 	}
+	if s.adrpAt != 0 {
+		page, err := a64AdrpPageDelta(code, s.adrpAt)
+		if err != nil {
+			return AutoTSSKeyRef{}, fmt.Errorf("%w: %s: %v", ErrTSSPatternUnrecognised, s.name, err)
+		}
+		return AutoTSSKeyRef{
+			Value:  page + first,
+			Kind:   s.kind,
+			AdrpAt: uint64(s.adrpAt),
+		}, nil
+	}
 	return AutoTSSKeyRef{Value: first, Kind: s.kind}, nil
+}
+
+// a64AdrpPageDelta reads the page displacement out of an ADRP at off.
+//
+// The immediate is 21 bits split in two: immlo at bits 30:29 and immhi at
+// bits 23:5, low part first. It is SIGNED -- the target page can be below
+// the instruction -- and scaled by 4096, so it is sign-extended from 21
+// bits before shifting.
+func a64AdrpPageDelta(code []byte, off int) (uint64, error) {
+	if off+4 > len(code) {
+		return 0, fmt.Errorf("ADRP at byte %d is past the end of a %d-byte body", off, len(code))
+	}
+	w := binary.LittleEndian.Uint32(code[off : off+4])
+	// ADRP is 1 op(2) 10000 immhi(19) Rd(5); op==10000 with bit 31 set.
+	if w&0x9F000000 != 0x90000000 {
+		return 0, fmt.Errorf("byte %d is not an ADRP (word %#08x)", off, w)
+	}
+	imm := (w>>29)&0x3 | ((w>>5)&0x7FFFF)<<2 // immlo | immhi<<2
+	const signBit = 1 << 20
+	v := int64(imm)
+	if imm&signBit != 0 {
+		v -= 1 << 21
+	}
+	return uint64(v << 12), nil
 }
 
 // shapeSizes renders the accepted body lengths for the refusal message, so

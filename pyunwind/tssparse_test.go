@@ -17,6 +17,14 @@ func TestParseAutoTSSKeyRef(t *testing.T) {
 		{"testdata/gilstate_312.bin", 0x608},
 		{"testdata/gilstate_313.bin", 0x870},
 		{"testdata/gilstate_314.bin", 0x920},
+		// aarch64, from Ubuntu 24.04's libpython3.12.so.1.0
+		// (3.12.3-1ubuntu0.17, arm64). It decodes to the SAME 0x608 as the
+		// x86-64 3.12 body above, which is the useful part: autoTSSkey's
+		// position inside _PyRuntime is a struct layout fact, so the same
+		// CPython version must give the same offset on both LP64 targets.
+		// A new decoder that produced a plausible but different number
+		// would be caught by that agreement, not by this file alone.
+		{"testdata/gilstate_312_arm64_ubuntu.bin", 0x608},
 	}
 	for _, tc := range cases {
 		code, err := os.ReadFile(tc.file)
@@ -346,6 +354,18 @@ func TestParseAutoTSSKeyRefRefusesEverySingleByteCorruption(t *testing.T) {
 		{"testdata/gilstate_312_ubuntu_fp.bin", join(span(16, 20), span(23, 27), span(31, 35), span(48, 52))},
 		{"testdata/gilstate_312_ubuntu_nonpie.bin", join(span(14, 18), span(22, 26), span(33, 37))},
 		{"testdata/gilstate_312_clang_pbs.bin", join(span(21, 25))},
+		// aarch64. Unchecked are exactly the four instructions whose
+		// immediates are link-time values: the ADRP page, the LDR's GOT
+		// slot, and the two 26-bit branch targets.
+		//
+		// The ADD immediates are NOT in that list, which is the point.
+		// A single-byte flip can only corrupt one of the two ADDs, and
+		// the cross-check then sees them disagree and refuses -- so the
+		// bytes carrying the reference are covered without being pinned
+		// to one CPython version. The two bytes per ADD that are not the
+		// immediate are pinned outright.
+		{"testdata/gilstate_312_arm64_ubuntu.bin",
+			join(span(16, 20), span(20, 24), span(28, 32), span(52, 56))},
 	}
 	for _, tc := range cases {
 		good, err := os.ReadFile(tc.file)

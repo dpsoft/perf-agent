@@ -45,6 +45,30 @@ type fixedRun struct {
 // so the field is the LINK-TIME ADDRESS of the Py_tss_t. Reading one as the
 // other yields either a wild address or an offset of several megabytes; see
 // AutoTSSKeyRef, which keeps the distinction all the way to the read.
+// fieldEnc says how a shape's key field is encoded inside the u32 at its
+// keyAt position.
+//
+// It exists because aarch64 cannot be expressed the way x86-64 is. There is
+// no PC-relative displacement sitting whole in four little-endian bytes: a
+// page-relative reference is ADRP plus ADD, and the part this parser wants
+// is a 12-bit immediate inside the ADD, at bits 21:10 of the instruction
+// word. Reading those four bytes as an int32 would yield the whole encoded
+// instruction, not the offset.
+type fieldEnc uint8
+
+const (
+	// encRIPDisp32 is the x86-64 form: a signed 32-bit displacement, whole
+	// in the four bytes at keyAt, measured from the end of its instruction
+	// (hence ripEnd).
+	encRIPDisp32 fieldEnc = iota
+	// encA64AddImm12 is the aarch64 form: the unsigned 12-bit immediate of
+	// an ADD (immediate), at bits 21:10. Bit 22 is the shift flag; when set
+	// the immediate is scaled by 4096. ripEnd is not used -- the value is
+	// an offset into the struct the base register already points at, not a
+	// distance from the instruction.
+	encA64AddImm12
+)
+
 type tssShape struct {
 	// name says which build this shape was measured from, so a future
 	// mismatch can be reproduced rather than guessed at.
@@ -57,6 +81,10 @@ type tssShape struct {
 	// within the body) for each entry -- the two are read together.
 	keyAt  []int
 	ripEnd []int
+	// enc says how to read the u32 at each keyAt position. x86-64 shapes
+	// leave it zero (encRIPDisp32); aarch64 needs its own because the
+	// reference is not a displacement sitting whole in four bytes.
+	enc fieldEnc
 	// keyDelta is what the SECOND field is expected to encode relative to
 	// the first, once both are resolved. Zero for the shapes whose two
 	// fields address the same struct base; 4 for the Clang shape, whose
@@ -113,6 +141,76 @@ type tssShape struct {
 // data change plus a testdata body measured from the binary that motivated
 // it.
 var tssShapes = []tssShape{
+	{
+		// 76 bytes, nineteen instructions. aarch64, measured from Ubuntu
+		// 24.04's libpython3.12.so.1.0 (3.12.3-1ubuntu0.17, arm64):
+		//
+		//	[ 0: 4]  d503233f  paciasp
+		//	[ 4: 8]  a9be7bfd  stp  x29, x30, [sp, #-0x20]!
+		//	[ 8:12]  910003fd  mov  x29, sp
+		//	[12:16]  f9000bf3  str  x19, [sp, #0x10]
+		//	[16:20]  d00022d3  adrp x19, <page of the GOT slot>
+		//	[20:24]  f9460673  ldr  x19, [x19, #<slot>]      -> &_PyRuntime
+		//	[24:28]  91182260  add  x0, x19, #0x608          <- the reference
+		//	[28:32]  94005b61  bl   PyThread_tss_is_created
+		//	[32:36]  340000c0  cbz  w0, +0x18
+		//	[36:40]  91182260  add  x0, x19, #0x608          <- and again
+		//	[40:44]  f9400bf3  ldr  x19, [sp, #0x10]
+		//	[44:48]  a8c27bfd  ldp  x29, x30, [sp], #0x20
+		//	[48:52]  d50323bf  autiasp
+		//	[52:56]  14005adf  b    PyThread_tss_get
+		//	[56:60]  f9400bf3  ldr  x19, [sp, #0x10]
+		//	[60:64]  d2800000  mov  x0, #0
+		//	[64:68]  a8c27bfd  ldp  x29, x30, [sp], #0x20
+		//	[68:72]  d50323bf  autiasp
+		//	[72:76]  d65f03c0  ret
+		//
+		// FOUR INSTRUCTIONS ARE DELIBERATELY NOT PINNED, because their
+		// immediates are link-time values that differ per build: the ADRP
+		// page, the GOT slot in the LDR, and the two 26-bit branch targets
+		// (BL to PyThread_tss_is_created, B to PyThread_tss_get). Pinning
+		// them would make this shape match exactly one build of one distro.
+		// The CBZ at [32:36] IS pinned: its target is inside this body, so
+		// it is a property of the shape rather than of the link.
+		//
+		// The reference appears twice as the same ADD immediate, which is
+		// what makes the cross-check meaningful here: two independent
+		// fields that must agree, with keyDelta 0 because both address the
+		// same Py_tss_t. The x86-64 Clang shape uses 4 instead, because its
+		// two fields address different members of that struct.
+		name: "aarch64-gcc-ubuntu-24.04",
+		size: 76,
+		fixed: []fixedRun{
+			{at: 0, bytes: []byte{0x3f, 0x23, 0x03, 0xd5}},  // paciasp
+			{at: 4, bytes: []byte{0xfd, 0x7b, 0xbe, 0xa9}},  // stp x29, x30, [sp, #-0x20]!
+			{at: 8, bytes: []byte{0xfd, 0x03, 0x00, 0x91}},  // mov x29, sp
+			{at: 12, bytes: []byte{0xf3, 0x0b, 0x00, 0xf9}}, // str x19, [sp, #0x10]
+			{at: 32, bytes: []byte{0xc0, 0x00, 0x00, 0x34}}, // cbz w0, +0x18
+			// The two ADDs carry the reference in bits 21:10, so their
+			// immediate must stay free -- it is what differs between
+			// CPython versions (0x608 on 3.12, 0x870 on 3.13). Their
+			// OTHER bits do not vary: byte 0 holds Rd=x0 with the low
+			// bits of Rn=x19, byte 3 the opcode. Pinning just those two
+			// bytes of each is what stops some other instruction being
+			// read as an ADD and its bits 21:10 reported as an offset.
+			{at: 24, bytes: []byte{0x60}},
+			{at: 27, bytes: []byte{0x91}},
+			{at: 36, bytes: []byte{0x60}},
+			{at: 39, bytes: []byte{0x91}},
+			{at: 40, bytes: []byte{0xf3, 0x0b, 0x40, 0xf9}}, // ldr x19, [sp, #0x10]
+			{at: 44, bytes: []byte{0xfd, 0x7b, 0xc2, 0xa8}}, // ldp x29, x30, [sp], #0x20
+			{at: 48, bytes: []byte{0xbf, 0x23, 0x03, 0xd5}}, // autiasp
+			{at: 56, bytes: []byte{0xf3, 0x0b, 0x40, 0xf9}}, // ldr x19, [sp, #0x10]
+			{at: 60, bytes: []byte{0x00, 0x00, 0x80, 0xd2}}, // mov x0, #0
+			{at: 64, bytes: []byte{0xfd, 0x7b, 0xc2, 0xa8}}, // ldp x29, x30, [sp], #0x20
+			{at: 68, bytes: []byte{0xbf, 0x23, 0x03, 0xd5}}, // autiasp
+			{at: 72, bytes: []byte{0xc0, 0x03, 0x5f, 0xd6}}, // ret
+		},
+		keyAt:    []int{24, 36},
+		enc:      encA64AddImm12,
+		keyDelta: 0,
+		kind:     KeyRefRuntimeOffset,
+	},
 	{
 		// 35 bytes, eight instructions:
 		//
@@ -504,7 +602,15 @@ func (s tssShape) decode(code []byte) (AutoTSSKeyRef, error) {
 	// instruction carrying it (so the result is an offset from the body's
 	// start); for the others the field is already what it means.
 	fold := func(i int) uint64 {
-		v := uint64(int64(int32(binary.LittleEndian.Uint32(code[s.keyAt[i] : s.keyAt[i]+4]))))
+		w := binary.LittleEndian.Uint32(code[s.keyAt[i] : s.keyAt[i]+4])
+		if s.enc == encA64AddImm12 {
+			v := uint64((w >> 10) & 0xFFF)
+			if w&(1<<22) != 0 {
+				v <<= 12
+			}
+			return v
+		}
+		v := uint64(int64(int32(w)))
 		if s.ripEnd != nil {
 			v += uint64(s.ripEnd[i])
 		}

@@ -603,18 +603,25 @@ func (s tssShape) decode(code []byte) (AutoTSSKeyRef, error) {
 	// start); for the others the field is already what it means.
 	fold := func(i int) uint64 {
 		w := binary.LittleEndian.Uint32(code[s.keyAt[i] : s.keyAt[i]+4])
-		if s.enc == encA64AddImm12 {
+		switch s.enc {
+		case encA64AddImm12:
 			v := uint64((w >> 10) & 0xFFF)
-			if w&(1<<22) != 0 {
+			if w&(1<<22) != 0 { // sh: the immediate is scaled by 4096
 				v <<= 12
 			}
 			return v
+		case encRIPDisp32:
+			v := uint64(int64(int32(w)))
+			if s.ripEnd != nil {
+				v += uint64(s.ripEnd[i])
+			}
+			return v
+		default:
+			// Unreachable while fieldEnc has two values, and a compile-time
+			// reminder to extend this when it gains a third rather than
+			// silently falling through to the x86 reading.
+			panic(fmt.Sprintf("pyunwind: shape %q has an unknown field encoding %d", s.name, s.enc))
 		}
-		v := uint64(int64(int32(w)))
-		if s.ripEnd != nil {
-			v += uint64(s.ripEnd[i])
-		}
-		return v
 	}
 	first := fold(0)
 	for i := 1; i < len(s.keyAt); i++ {

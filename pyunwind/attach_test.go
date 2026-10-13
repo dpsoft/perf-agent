@@ -384,14 +384,33 @@ func TestGlibcTSDOffsetsKnowsAmd64(t *testing.T) {
 	}
 }
 
-// arm64 is a deliberate, named refusal, not a guess: this package has no
-// measured glibc TSD offsets for it (see glibcTSDOffsets's doc comment).
+// An architecture with no measured glibc TSD offsets is a deliberate, named
+// refusal rather than a guess (see glibcTSDOffsets's doc comment).
+//
+// arm64 used to be listed here and no longer is: #206 measured it on an
+// aarch64 runner, so it is now a supported row and asserting its refusal
+// would pin the opposite of the truth. The architectures below are the ones
+// that remain genuinely unmeasured.
 func TestGlibcTSDOffsetsRefusesUnmeasuredArch(t *testing.T) {
-	if _, err := glibcTSDOffsets("arm64"); !errors.Is(err, ErrUnsupportedArch) {
-		t.Fatalf("expected ErrUnsupportedArch for arm64, got %v", err)
+	for _, goarch := range []string{"riscv64", "386", "ppc64le", "s390x"} {
+		if _, err := glibcTSDOffsets(goarch); !errors.Is(err, ErrUnsupportedArch) {
+			t.Errorf("expected ErrUnsupportedArch for %s, got %v", goarch, err)
+		}
 	}
-	if _, err := glibcTSDOffsets("riscv64"); !errors.Is(err, ErrUnsupportedArch) {
-		t.Fatalf("expected ErrUnsupportedArch for riscv64, got %v", err)
+}
+
+// TestGlibcTSDOffsetsServesMeasuredArches is the other half: every
+// architecture the agent ships on must HAVE a row, or Python frames are
+// silently unavailable there with nothing failing to say so.
+func TestGlibcTSDOffsetsServesMeasuredArches(t *testing.T) {
+	for _, goarch := range []string{"amd64", "arm64"} {
+		off, err := glibcTSDOffsets(goarch)
+		if err != nil {
+			t.Fatalf("%s is a shipped architecture and must have measured offsets: %v", goarch, err)
+		}
+		if off.Specific1stBlock == 0 || off.KeyDataSize == 0 {
+			t.Errorf("%s: suspiciously zeroed offsets: %+v", goarch, off)
+		}
 	}
 }
 
@@ -469,7 +488,7 @@ func TestPrepareInfoRefusesWithoutTLSBaseReader(t *testing.T) {
 // ErrTLSBaseUnavailable instead -- a plausible refusal for the wrong
 // reason, on a build where every later step would have been wrong.
 func TestPrepareInfoRefusesAnUnmeasuredArch(t *testing.T) {
-	for _, goarch := range []string{"arm64", "riscv64", "386"} {
+	for _, goarch := range []string{"riscv64", "386", "ppc64le"} {
 		t.Run(goarch, func(t *testing.T) {
 			_, res := prepareInfoForArch(goarch, 1, "/usr/lib64/libpython3.12.so.1.0", nil, fakeReader{})
 			if !errors.Is(res.Reason, ErrUnsupportedArch) {

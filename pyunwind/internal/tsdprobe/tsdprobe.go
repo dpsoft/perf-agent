@@ -34,11 +34,20 @@ typedef struct {
 	uint64_t key_data_off;      // offsetof(struct pthread_key_data, data)
 } tsd_probe_t;
 
-// Scan window, in bytes, from the start of `struct pthread`. glibc's
-// specific_1stblock sits well inside the first kilobyte on both supported
-// architectures; a bounded scan keeps a wrong libc from walking off into
-// unmapped memory.
-#define PROBE_SCAN_BYTES 4096
+// Scan window, in bytes, from the start of `struct pthread`.
+//
+// This MUST stay inside the struct. 4096 did not: on x86-64 `struct pthread`
+// is roughly 2.3 KB and the static TLS block sits at NEGATIVE offsets from
+// the thread pointer, so scanning forward past the struct walked into
+// unmapped memory and took the test binary down with SIGSEGV. It survived a
+// single-test run and only crashed under the full suite, which is the worst
+// way for a bounds bug to behave.
+//
+// 1536 is inside the struct on both targets -- aarch64's is 1856 bytes
+// (the measured PthreadSize) and x86-64's is larger -- and comfortably past
+// the furthest slot the scan needs: specific_1stblock at 0x310 plus a
+// double-digit key index times the 16-byte stride is still under 1200.
+#define PROBE_SCAN_BYTES 1536
 
 static tsd_probe_t pa_probe_tsd(void) {
 	tsd_probe_t out = {0};
@@ -70,11 +79,12 @@ static tsd_probe_t pa_probe_tsd(void) {
 	// Find each marker's address relative to `struct pthread`.
 	uintptr_t at[3] = {0, 0, 0};
 	unsigned char *base = (unsigned char *)self;
-	for (size_t off = 0; off + sizeof(uintptr_t) <= PROBE_SCAN_BYTES; off += sizeof(uintptr_t)) {
+	int found = 0;
+	for (size_t off = 0; off + sizeof(uintptr_t) <= PROBE_SCAN_BYTES && found < 3; off += sizeof(uintptr_t)) {
 		uintptr_t v;
 		__builtin_memcpy(&v, base + off, sizeof(v));
 		for (int i = 0; i < 3; i++) {
-			if (v == marker[i] && at[i] == 0) at[i] = off;
+			if (v == marker[i] && at[i] == 0) { at[i] = off; found++; }
 		}
 	}
 	for (int i = 0; i < 3; i++) {

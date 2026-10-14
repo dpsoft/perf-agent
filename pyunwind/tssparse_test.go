@@ -17,6 +17,14 @@ func TestParseAutoTSSKeyRef(t *testing.T) {
 		{"testdata/gilstate_312.bin", 0x608},
 		{"testdata/gilstate_313.bin", 0x870},
 		{"testdata/gilstate_314.bin", 0x920},
+		// aarch64, from Ubuntu 24.04's libpython3.12.so.1.0
+		// (3.12.3-1ubuntu0.17, arm64). It decodes to the SAME 0x608 as the
+		// x86-64 3.12 body above, which is the useful part: autoTSSkey's
+		// position inside _PyRuntime is a struct layout fact, so the same
+		// CPython version must give the same offset on both LP64 targets.
+		// A new decoder that produced a plausible but different number
+		// would be caught by that agreement, not by this file alone.
+		{"testdata/gilstate_312_arm64_ubuntu.bin", 0x608},
 	}
 	for _, tc := range cases {
 		code, err := os.ReadFile(tc.file)
@@ -346,6 +354,18 @@ func TestParseAutoTSSKeyRefRefusesEverySingleByteCorruption(t *testing.T) {
 		{"testdata/gilstate_312_ubuntu_fp.bin", join(span(16, 20), span(23, 27), span(31, 35), span(48, 52))},
 		{"testdata/gilstate_312_ubuntu_nonpie.bin", join(span(14, 18), span(22, 26), span(33, 37))},
 		{"testdata/gilstate_312_clang_pbs.bin", join(span(21, 25))},
+		// aarch64. Unchecked are exactly the four instructions whose
+		// immediates are link-time values: the ADRP page, the LDR's GOT
+		// slot, and the two 26-bit branch targets.
+		//
+		// The ADD immediates are NOT in that list, which is the point.
+		// A single-byte flip can only corrupt one of the two ADDs, and
+		// the cross-check then sees them disagree and refuses -- so the
+		// bytes carrying the reference are covered without being pinned
+		// to one CPython version. The two bytes per ADD that are not the
+		// immediate are pinned outright.
+		{"testdata/gilstate_312_arm64_ubuntu.bin",
+			join(span(16, 20), span(20, 24), span(28, 32), span(52, 56))},
 	}
 	for _, tc := range cases {
 		good, err := os.ReadFile(tc.file)
@@ -369,5 +389,147 @@ func TestParseAutoTSSKeyRefRefusesEverySingleByteCorruption(t *testing.T) {
 				t.Errorf("%s: flipping byte %d was accepted; that byte carries no weight in the shape", tc.file, i)
 			}
 		}
+	}
+}
+
+// TestA64PageRelativeResolvesToTheSameFieldEveryBuildHas checks the aarch64
+// non-PIC shape end to end: decode the ADRP+ADD pair, resolve it against
+// the addresses the ELF declares, and land on autoTSSkey.
+//
+// The assertion is not the address. It is that the address sits 0x608 into
+// _PyRuntime -- the same offset the x86-64 and aarch64 shared-library
+// fixtures decode directly. autoTSSkey's position in that struct is a
+// CPython layout fact, so three builds across two architectures and two
+// linkage models must agree on it. That agreement is what would catch a
+// sign-extension or page-alignment error in the ADRP decode, neither of
+// which byte matching can see: a wrong page gives a plausible address that
+// is simply somewhere else.
+func TestA64PageRelativeResolvesToTheSameFieldEveryBuildHas(t *testing.T) {
+	// Measured from Ubuntu 24.04's /usr/bin/python3.12 (arm64):
+	// PyGILState_GetThisThreadState at 0x59b100, _PyRuntime at 0xb1a4b0
+	// with size 0x704b8.
+	const (
+		bodyVaddr    = 0x59b100
+		runtimeVaddr = 0xb1a4b0
+		runtimeSize  = 0x704b8
+		wantOffset   = 0x608
+	)
+	code, err := os.ReadFile("testdata/gilstate_312_arm64_ubuntu_exe.bin")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	ref, err := ParseAutoTSSKeyRef(code)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if ref.Kind != KeyRefA64PageRelative {
+		t.Fatalf("kind = %d, want KeyRefA64PageRelative: a non-PIC aarch64 build names the "+
+			"address, it does not offset from _PyRuntime", ref.Kind)
+	}
+	addr, err := ref.Resolve(SymbolPlacement{
+		RuntimeVaddr: runtimeVaddr,
+		RuntimeSize:  runtimeSize,
+		BodyVaddr:    bodyVaddr,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := addr - runtimeVaddr; got != wantOffset {
+		t.Errorf("autoTSSkey resolved to %#x, which is %#x into _PyRuntime; every 3.12 build "+
+			"measured so far puts it at %#x", addr, got, wantOffset)
+	}
+}
+
+// A page-relative reference is meaningless without the body's link address,
+// and resolving it against zero would silently produce an address in the
+// first page rather than refusing.
+func TestA64PageRelativeRefusesWithoutABodyAddress(t *testing.T) {
+	code, err := os.ReadFile("testdata/gilstate_312_arm64_ubuntu_exe.bin")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	ref, err := ParseAutoTSSKeyRef(code)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := ref.Resolve(SymbolPlacement{RuntimeVaddr: 0xb1a4b0, RuntimeSize: 0x704b8}); err == nil {
+		t.Fatal("resolved with BodyVaddr unset; want a refusal")
+	}
+}
+
+// TestA64AdrpPageDeltaSignExtends covers the arm of a64AdrpPageDelta that
+// the real fixtures cannot reach.
+//
+// Every aarch64 body measured so far happens to address a page ABOVE its
+// own, so the sign-extension branch never runs against them: removing it
+// entirely leaves TestA64PageRelativeResolves... passing. ADRP's immediate
+// is signed, a target below the instruction is ordinary in a differently
+// laid out binary, and getting it wrong would place autoTSSkey 4 GB away
+// -- plausible-looking and completely wrong.
+//
+// The words are built here rather than copied from a disassembly, and the
+// construction is validated by the first case, which is the exact
+// instruction in testdata/gilstate_312_arm64_ubuntu_exe.bin.
+func TestA64AdrpPageDeltaSignExtends(t *testing.T) {
+	const mostNegAdrp int32 = -(1 << 20)
+	adrp := func(rd uint32, imm21 int32) []byte {
+		imm := uint32(imm21) & 0x1FFFFF
+		w := uint32(0x90000000) | (imm&3)<<29 | ((imm>>2)&0x7FFFF)<<5 | rd
+		return []byte{byte(w), byte(w >> 8), byte(w >> 16), byte(w >> 24)}
+	}
+	// Negative deltas are written as the wrapped u64 they must come back
+	// as, rather than as uint64(int64(...) << 12), which Go folds at
+	// compile time and rejects as an overflowing constant.
+	for _, tc := range []struct {
+		name  string
+		imm21 int32
+		want  uint64
+	}{
+		{"the real instruction in the exe fixture", 1407, 0x57f000},
+		{"zero", 0, 0},
+		{"one page below", -1, 0xFFFFFFFFFFFFF000},
+		{"well below", -2048, 0xFFFFFFFFFF800000},
+		{"largest positive", 1<<20 - 1, 0xFFFFF000},
+		{"most negative", mostNegAdrp, 0xFFFFFFFF00000000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := a64AdrpPageDelta(adrp(19, tc.imm21), 0)
+			if err != nil {
+				t.Fatalf("imm21=%d: %v", tc.imm21, err)
+			}
+			if got != tc.want {
+				t.Errorf("imm21=%d: delta = %#x, want %#x", tc.imm21, got, tc.want)
+			}
+		})
+	}
+	// The first case above must match the byte-for-byte instruction from
+	// the fixture, or the encoder used to build the others is wrong and
+	// every synthetic case tests nothing.
+	if got, want := adrp(19, 1407), []byte{0xf3, 0x2b, 0x00, 0xf0}; !bytes.Equal(got, want) {
+		t.Fatalf("the test's own ADRP encoder produced % x, but the fixture's instruction is % x", got, want)
+	}
+}
+
+// A word that is not an ADRP must be refused, not read as one: the shape's
+// fixed runs do not cover the ADRP (its immediate is a link-time value), so
+// this is the only thing standing between a mis-measured shape and four
+// bytes of something else being decoded as a page.
+func TestA64AdrpPageDeltaRefusesNonAdrp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		word []byte
+	}{
+		{"an ADD", []byte{0x60, 0xe2, 0x2a, 0x91}},
+		{"a RET", []byte{0xc0, 0x03, 0x5f, 0xd6}},
+		{"an ADR (bit 31 clear)", []byte{0x13, 0x00, 0x00, 0x10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := a64AdrpPageDelta(tc.word, 0); err == nil {
+				t.Errorf("%s was accepted as an ADRP", tc.name)
+			}
+		})
+	}
+	if _, err := a64AdrpPageDelta([]byte{0x00, 0x01}, 0); err == nil {
+		t.Error("a truncated body was accepted")
 	}
 }

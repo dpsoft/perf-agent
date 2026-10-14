@@ -368,13 +368,34 @@ type tsdOffsets struct {
 // documented for glibc's `struct pthread` on x86-64 and has not moved in
 // years, but it is recorded here as directly measured, not copied.
 //
-// arm64 is deliberately NOT included: this package has no equivalent
-// measurement for it, and the design's own "Open risks" section already
-// flags glibc struct offsets as carried per-libc-version and untested
-// beyond the reference implementation this design took the mechanism
-// from. Guessing a value here would be exactly the silent-wrong-offset
-// failure mode this whole package exists to refuse. musl is out of scope
-// for the same reason and is not attempted either.
+// arm64 values were measured the same way, by the same probe, on an
+// aarch64 runner (Ubuntu 24.04 arm64, image 20261002.596): a marker stored
+// through pthread_setspecific landed such that specific_1stblock is at
+// 0x110, with the same 16-byte stride and 8-byte data offset as amd64 --
+// pthread_key_data is identical on both LP64 targets, which is a useful
+// consistency check on the measurement rather than an assumption.
+//
+// PthreadSize is 1856 (0x740) there and 0 on amd64 because the two use
+// different TLS variants. x86-64 is variant II: the thread pointer IS the
+// address `struct pthread` starts at. aarch64 is variant I: the struct
+// sits BEFORE the thread pointer, and glibc's own THREAD_SELF is
+// `__builtin_thread_pointer() - TLS_PRE_TCB_SIZE`. 1856 is that distance,
+// obtained without a second method because on glibc pthread_self() IS the
+// struct pthread *, so the probe reads it as the gap between the two.
+//
+// Both rows are guarded by TestGlibcTSDOffsetsMatchThisMachine, which
+// re-measures on whichever runner it is on and fails on disagreement. That
+// matters more here than the numbers do: a wrong offset does not error, it
+// returns a plausible wrong PyThreadState, so the table needs a
+// measurement standing over it rather than a comment asserting it.
+//
+// Single-version caveat, recorded rather than smoothed over: amd64 was
+// measured on Fedora glibc 2.43 and arm64 on Ubuntu 24.04's glibc, each
+// once. Neither is gated on a libc version. The guard test is what would
+// catch a layout that moved.
+//
+// musl remains out of scope: no measurement, and guessing would be exactly
+// the silent-wrong-offset failure this package exists to refuse.
 func glibcTSDOffsets(goarch string) (tsdOffsets, error) {
 	switch goarch {
 	case "amd64":
@@ -383,6 +404,13 @@ func glibcTSDOffsets(goarch string) (tsdOffsets, error) {
 			KeyDataSize:      16,
 			KeyDataOff:       8,
 			PthreadSize:      0,
+		}, nil
+	case "arm64":
+		return tsdOffsets{
+			Specific1stBlock: 0x110,
+			KeyDataSize:      16,
+			KeyDataOff:       8,
+			PthreadSize:      1856,
 		}, nil
 	default:
 		return tsdOffsets{}, fmt.Errorf("%w: %s", ErrUnsupportedArch, goarch)

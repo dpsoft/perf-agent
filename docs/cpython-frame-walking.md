@@ -7,7 +7,11 @@ written down because most of it is not in any CPython document, and three
 of the items below contradict what the widely-copied out-of-process
 profilers do.
 
-Supported range is CPython 3.12, 3.13 and 3.14, amd64 only.
+Supported range is CPython 3.12, 3.13 and 3.14, on amd64 and arm64, glibc
+only. Each architecture carries its own measured glibc pthread-TSD offsets
+and its own machine-code shapes for the `autoTSSkey` reference; an
+architecture with neither is refused by name rather than walked with
+guessed values ([#206](https://github.com/dpsoft/perf-agent/issues/206)).
 
 ---
 
@@ -161,8 +165,8 @@ typedef struct {
 ```
 
 Both members are 4 bytes and `pthread_key_t` is `unsigned int`, so on
-amd64 the struct is 8 bytes with the *flag* in the low half and the
-*key* in the high half. Reading the 8-byte word and truncating to 32 bits
+either supported architecture the struct is 8 bytes with the *flag* in the
+low half and the *key* in the high half. Reading the 8-byte word and truncating to 32 bits
 yields `_is_initialized`, not the key.
 
 This bug is nearly invisible in testing. An initialized key has

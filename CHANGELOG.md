@@ -52,7 +52,7 @@ interpreter — neither of which modifies the application being measured.
   reads it from the kernel). An interpreter that cannot be walked is refused by
   name on stderr, never walked with guessed offsets.
 
-  Covers **CPython 3.12–3.14** GIL builds on **amd64 + glibc**, including
+  Covers **CPython 3.12–3.14** GIL builds on **amd64 and arm64**, glibc only, including
   distro interpreters whose eval loop is split by LTO and reachable only
   through `.gnu_debugdata` ([#170](https://github.com/dpsoft/perf-agent/issues/170), [#190](https://github.com/dpsoft/perf-agent/issues/190)). Limits are
   listed under **Known limitations** below.
@@ -229,11 +229,26 @@ interpreter — neither of which modifies the application being measured.
   interpreter (~627 ms for 100), so the cost is affordable; what is undecided
   is the trigger ([#194](https://github.com/dpsoft/perf-agent/issues/194)).
 
-- **Python frames are amd64 + glibc only.** The pthread-TSD offsets the walk
-  needs were measured on Fedora glibc 2.43 and are applied to every glibc with
-  no version gate — long-stable values, checked at attach by reading a real
-  frame, but not checked against the libc. A musl target is refused by name,
-  as is a free-threaded (`Py_GIL_DISABLED`) build.
+- **Python frames are glibc only, on amd64 and arm64**
+  ([#206](https://github.com/dpsoft/perf-agent/issues/206)). Both
+  architectures have measured pthread-TSD offsets, and on both the attach
+  path is checked against a live interpreter in CI: the TSD lookup is
+  required to return the same `PyThreadState` the interpreter itself
+  reports. A musl target is refused by name, as is a free-threaded
+  (`Py_GIL_DISABLED`) build, and so is any architecture with no measured
+  row — the walk declines rather than guessing an offset, because a wrong
+  one returns a plausible wrong thread state rather than an error.
+
+  The offsets are measured per architecture but not gated on a libc
+  version (amd64 on Fedora glibc 2.43, arm64 on Ubuntu 24.04's). A probe
+  re-measures them on whichever runner CI is on and fails on disagreement,
+  which is what would catch a layout that moved.
+
+  **Not covered on arm64:** CI validates the attach path there, not the BPF
+  walker emitting Python frames into a profile. The walker object is built
+  for aarch64 and shares the offsets, but no test on an arm64 runner
+  observes frames coming out of it, so that half is reasoned rather than
+  measured.
 
 - **Off-CPU stacks stay native.** The off-CPU profiler exposes no Python maps,
   so `--offcpu` carries no Python frames.

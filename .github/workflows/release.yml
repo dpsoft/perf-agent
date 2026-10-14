@@ -250,7 +250,15 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    # Also waits on image-manifests, not just build. The release is published
+    # straight away (draft: false) and both the release notes and
+    # examples/kubernetes name ghcr.io images, so creating it while the image
+    # push had failed would publish a release promising artifacts that do not
+    # exist. Waiting makes a tag all-or-nothing: either the binaries and the
+    # images are both up, or there is no release to correct.
+    #
+    # image-manifests already waits on images, so naming it here covers both.
+    needs: [build, image-manifests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

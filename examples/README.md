@@ -15,12 +15,14 @@ own README, source workload, and driver script.
 The first three depend on `perf-agent` being built and on PATH with the standard
 capability set (`setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog+ep`).
 
-## One exception to "runnable"
+## All of these run today
 
-`kubernetes/` is a target shape, not a demonstration: the GPU shim cannot yet
-load into the images it would be injected into (#121), and no shim image is
-published. It states this at the top of its own README rather than failing at
-`kubectl apply`. Everything else here runs today.
+`kubernetes/` used to be the exception, because the shim could not load into
+the images it would be injected into (#121) and nothing was published to name
+in a pod spec (#139). Both are closed, and v1.3.0 publishes
+`ghcr.io/dpsoft/perf-agent` and `ghcr.io/dpsoft/perf-agent-shim` as multi-arch
+images, so the manifests there pull. What it still needs from you is a
+cluster with an NVIDIA GPU node.
 
 ## Why these are here
 

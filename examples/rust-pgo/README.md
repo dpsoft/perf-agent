@@ -91,8 +91,6 @@ rustc beating clang — the two examples' workloads and iteration counts
 differ, and neither is a benchmark. Both exist to show that perf-agent's
 output drives the AutoFDO toolchain.
 
-See [#168](https://github.com/dpsoft/perf-agent/issues/168).
-
 ## Why this works
 
 The dispatch loop hits the `Add` arm 99% of the time. Without PGO, the

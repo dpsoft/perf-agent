@@ -127,7 +127,7 @@ a populated cache from a previous run, even if the SQLite index was lost.
 | `--symbol-cache-dir=DIR` | — | `/tmp/perf-agent-debuginfod` | |
 | `--symbol-cache-max=BYTES` | — | `2147483648` (2 GiB) | LRU eviction cap. |
 | `--symbol-fetch-timeout=DUR` | — | `30s` | Per-artifact HTTP timeout. |
-| `--symbol-fail-closed` | — | `false` | Reserved for M2; flag exists, semantics not yet wired. |
+| `--symbol-fail-closed` | — | `false` | Reserved for M2. The flag is parsed and reaches the symbolizer as `Options.FailClosed`, but nothing reads that field yet. |
 
 When `--debuginfod-url` is unset and `DEBUGINFOD_URLS` is empty, the agent
 uses the local blazesym resolution path (no HTTP, no cache).
@@ -213,7 +213,8 @@ fetch. M2 will add an explicit cache-invalidation flag.
 
 - **Metrics exporter integration.** Counters exist internally (see
   `symbolize/debuginfod/stats.go`) and are accessible via the `Stats()`
-  method, but the snapshot is not yet wired through the `metrics.Exporter`
+  method and the agent prints them at shutdown (#109), but the snapshot is
+  still not wired through the `metrics.Exporter`
   interface. Prometheus/OpenTelemetry export of cache hit rate, fetch
   latency, and error counts is deferred to M2.
 

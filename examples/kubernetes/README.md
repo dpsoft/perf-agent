@@ -5,49 +5,21 @@ Profile a PyTorch CUDA workload running in Kubernetes, without rebuilding it,
 relinking it, or changing a line of its code — then render the result as a
 flame graph.
 
-> **Status: runnable from the first release tag onward.**
+> **Status: runnable.** v1.3.0 publishes both images, so these manifests
+> pull. What you still need is a cluster with an NVIDIA GPU node.
 >
-> Every other directory under `examples/` runs end-to-end today. This one is
-> close, and the README says where it stops rather than letting you discover
-> it at `kubectl apply`.
+> ```
+> ghcr.io/dpsoft/perf-agent:v1.3.0        # the profiler
+> ghcr.io/dpsoft/perf-agent-shim:v1.3.0   # the CUPTI adapter, as a carrier image
+> ```
 >
-> **`ghcr.io/dpsoft/perf-agent-shim` does not exist until a `v*` tag is
-> pushed** (#139). `release.yml` now builds both images natively on each
-> architecture, pushes them tagged with the release version, and assembles
-> multi-arch manifests for `:<version>` and `:latest`. Nothing is published
-> before then, so `kubectl apply` on these manifests will fail to pull until
-> the first tag is cut.
+> The manifests here name `:latest`. Pin the version in anything you keep:
+> the shim's USDT record layouts are frozen per release and the agent decodes
+> them, so the pair is meant to match, and nothing at runtime refuses a
+> mismatched one.
 >
-> **Both images are multi-arch.** The shim's USDT probes bind to the first
-> three integer-argument registers of the platform ABI, arch-guarded since
-> #152, and `probe_args_test` proves that binding on a native arm64 runner by
-> trapping its own probe and reading the registers back — so aarch64 support
-> is measured rather than assumed.
->
-> Still untested on ARM: the CUPTI integration itself, for want of an arm64
-> GPU node. That part is arch-independent C++ calling CUPTI APIs, not
-> register-level, but it has not been run.
->
-> Both images carry the same tag deliberately: the shim's USDT record layouts
-> are frozen per version and the agent decodes them, so a mismatched pair is a
-> decode failure with nothing in the pod spec to reveal it. Note that this is a
-> convention — nothing at runtime refuses a mismatched pair today.
->
-> **Cleared since this was written:**
->
-> - **[#121] The shim now loads into these images.** It is built on an
->   old-glibc baseline with `-mtls-dialect=gnu`, static libstdc++/libgcc and
->   no `RUNPATH`, and CUPTI is resolved by `dlopen` rather than `DT_NEEDED`.
->   Verified loading on Ubuntu 22.04, 24.04 and 25.04 (#134).
-> - **The cross-namespace inode open is confirmed.** A containerized run read
->   the same on-disk inode from a different mount namespace, and injection
->   reported `enroll=confirmed` with every launch sampled.
->
-> Both manifests here name `ghcr.io/dpsoft/perf-agent`, whose entrypoint
-> execs `gpu-cuda-profile`; the flags they pass are its flags, and a test
-> (`cmd/gpu-cuda-profile/manifest_flags_test.go`) checks every one of them
-> against the real flag set. It exists because this file previously passed
-> three flags that did not exist anywhere.
+> **Both images are multi-arch** (amd64 and arm64), built natively on each
+> architecture rather than under emulation.
 
 ## Two deployments: sidecar and collector
 

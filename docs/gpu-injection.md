@@ -85,14 +85,25 @@ CUDA_INJECTION64_PATH=/opt/perf-agent/libperfagent-gpu-nvidia.so ./your-app
 
 ### A container
 
-The library must be inside the container and readable by the process:
+The library must be inside the container and readable by the process. The
+published image carries it, so there is nothing to build:
 
 ```bash
+# Take the shim out of the image that ships it. The image is a carrier, not
+# a program -- running it prints that and exits non-zero.
+id=$(podman create ghcr.io/dpsoft/perf-agent-shim:v1.3.0)
+podman cp "$id":/usr/local/lib/libperfagent-gpu-nvidia.so ./shim.so
+podman rm "$id"
+
 podman run --rm \
-  -v /opt/perf-agent/libperfagent-gpu-nvidia.so:/opt/pa/shim.so:ro \
+  -v "$PWD/shim.so":/opt/pa/shim.so:ro \
   -e CUDA_INJECTION64_PATH=/opt/pa/shim.so \
   your-cuda-image
 ```
+
+Pin the version rather than using `:latest`. The shim's USDT record layouts
+are frozen per release and the agent decodes them, so the two are meant to
+match; nothing at runtime refuses a mismatched pair.
 
 ### Kubernetes
 
@@ -186,9 +197,6 @@ sidecar and should be stated in a pod spec rather than absorbed quietly.
 
 ## What this does not yet cover
 
-- **No published container image** for the init-container pattern. CI uploads
-  the portable shim as a build artifact; there is no registry image to name in
-  a pod spec yet.
 - **Retention costs the target memory.** The shim captures every module's
   bytes whether or not a consumer has attached, because the driver offers them
   exactly once and there is no way to ask again — so a process that is never
@@ -196,7 +204,10 @@ sidecar and should be stated in a pod spec rather than absorbed quietly.
   store bounds) on a profiler's behalf. Past those bounds captures are dropped
   and counted; nothing grows without limit. `module_retained_unattached` in the
   adapter's exit report is what it is currently holding.
-- **The collector (DaemonSet) shape is not built yet** — `-pid` is its
-  prerequisite, not the whole of it. One profile per pod versus one profile
-  labelled by pod, attaching to pods that start later, and whether the shim is
-  one inode per node or one per pod are all open. Tracked in issue #124.
+- **The collector still needs the application pod to opt in.** `-mode=collector`
+  installs the carried shim into a `hostPath` directory and attaches to every
+  process that maps that inode, including ones that start later — but the
+  application pod still declares the volume mount and `CUDA_INJECTION64_PATH`.
+  A `hostPath` shim changes which inode that variable names; it does not
+  remove the variable. Injecting it without editing the pod needs a mutating
+  admission webhook, which is not built.

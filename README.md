@@ -71,6 +71,7 @@ For CPU + GPU in one tree, see [Usage](docs/usage.md#gpu).
 | [Output](docs/output.md) | file naming, pprof fidelity, PMU format |
 | [What you can do](docs/use-cases.md) | the capabilities above, in full |
 | [Library usage](docs/library-usage.md) | embedding the agent in Go |
+| [Container images](docs/container-images.md) | the published images, and what they need |
 | [Building](BUILDING.md) · [Testing](TESTING.md) | toolchain and test gates |
 | [Releases](RELEASES.md) · [Changelog](CHANGELOG.md) | what shipped when |
 

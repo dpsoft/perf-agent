@@ -213,7 +213,7 @@ fetch. M2 will add an explicit cache-invalidation flag.
 
 - **Metrics exporter integration.** Counters exist internally (see
   `symbolize/debuginfod/stats.go`) and are accessible via the `Stats()`
-  method and the agent prints them at shutdown (#109), but the snapshot is
+  method and the agent prints them at shutdown, but the snapshot is
   still not wired through the `metrics.Exporter`
   interface. Prometheus/OpenTelemetry export of cache hit rate, fetch
   latency, and error counts is deferred to M2.

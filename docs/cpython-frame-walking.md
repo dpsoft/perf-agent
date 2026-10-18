@@ -1,6 +1,6 @@
 # Reading CPython's frame chain from outside the process
 
-Notes gathered while building the BPF-side Python unwinder (issue #83).
+Notes gathered while building the BPF-side Python unwinder.
 Everything here was checked against CPython source and, where a number is
 quoted, measured against real interpreter binaries on this host. It is
 written down because most of it is not in any CPython document, and three
@@ -11,7 +11,7 @@ Supported range is CPython 3.12, 3.13 and 3.14, on amd64 and arm64, glibc
 only. Each architecture carries its own measured glibc pthread-TSD offsets
 and its own machine-code shapes for the `autoTSSkey` reference; an
 architecture with neither is refused by name rather than walked with
-guessed values ([#206](https://github.com/dpsoft/perf-agent/issues/206)).
+guessed values.
 
 ---
 

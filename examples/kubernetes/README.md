@@ -21,12 +21,16 @@ flame graph.
 > **Both images are multi-arch** (amd64 and arm64), built natively on each
 > architecture rather than under emulation.
 
-## Two deployments: sidecar and collector
+## Prior art
 
-[Polar Signals' `parcagpu`][ps] established the injection pattern both of ours
-follow: an init container drops a CUPTI-based `.so` onto a shared volume, and
-the application container loads it via `CUDA_INJECTION64_PATH`. That part we
-take directly.
+The injection pattern here is not ours. [Polar Signals' `parcagpu`][ps]
+established it: an init container drops a CUPTI-based `.so` onto a shared
+volume, and the application container loads it through
+`CUDA_INJECTION64_PATH`. We took that directly, and the rest of this document
+is what we do inside it rather than a claim to have invented it. Where the
+two differ is privilege, compared below.
+
+## Two deployments: sidecar and collector
 
 There are two manifests here, and the difference is **where the agent runs**,
 which decides **how many shim inodes exist**:
@@ -48,7 +52,10 @@ we noticed it. One inode per node removes all three — measured on an RTX 3090,
 with rediscovery disabled, was sampled anyway; a byte-identical copy at another
 path was not.
 
-Against parcagpu, the difference that survives is privilege, not topology:
+### What differs from parcagpu
+
+Topology aside, one difference is worth stating because it is the reason to
+prefer this shape:
 
 | | parcagpu | perf-agent collector |
 |---|---|---|
@@ -121,7 +128,7 @@ Brendan Gregg toolchain path.
 ### Reading the result without being misled
 
 A GPU flame graph is not a CPU flame graph with extra frames, and three of its
-properties will mislead a reader who assumes otherwise (issue #123):
+properties will mislead a reader who assumes otherwise:
 
 - **A CPU frame under `[gpu:launch]` is as wide as the GPU time launched *from*
   it** — not the CPU time spent in it. The Python and C++ frames you recognize

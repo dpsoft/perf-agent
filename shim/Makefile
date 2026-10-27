@@ -420,7 +420,7 @@ check-cupti-guard: nvidia/cupti_guard_test.cc nvidia/cupti_guard.h core/callguar
 # _Static_asserts are the test. Compiling it only as C++ leaves the C11 spelling
 # unguarded -- which is how the header's validity broke earlier in this branch,
 # when a C++ translation unit included it for the first time.
-test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/callguard_test.cc core/tickplan_test.cc core/pctier_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC)
+test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc core/cubinqueue_test.cc core/drain_test.cc core/pcdrain_test.cc core/burst_test.cc core/callguard_test.cc core/tickplan_test.cc core/pctier_test.cc core/nvperfpin_test.cc core/enroll_test.cc core/usdt_abi_test.c core/sampler_test.cc core/probe_args_test.cc stub/probe_order_test.cc stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC)
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/batch_test core/batch_test.cc core/batch.cc && /tmp/batch_test
 	$(CXX) -std=c++17 -I core -o /tmp/clock_test core/clock_test.cc core/clock.cc && /tmp/clock_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/drain_test core/drain_test.cc core/drain.cc && /tmp/drain_test
@@ -429,6 +429,7 @@ test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/callguard_test core/callguard_test.cc && /tmp/callguard_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/tickplan_test core/tickplan_test.cc && /tmp/tickplan_test
 	$(CXX) -std=c++17 -Wall -Werror -I core -o /tmp/pctier_test core/pctier_test.cc && /tmp/pctier_test
+	$(CXX) -std=c++17 -Wall -Werror -I core -o /tmp/nvperfpin_test core/nvperfpin_test.cc && /tmp/nvperfpin_test
 	$(CXX) -std=c++17 -pthread -I core -o /tmp/enroll_test core/enroll_test.cc core/enroll.cc && /tmp/enroll_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubin_test core/cubin_test.cc core/cubin.cc core/enroll.cc && /tmp/cubin_test
 	$(CXX) -std=c++17 -Wall -Werror -pthread -I core -o /tmp/cubinqueue_test core/cubinqueue_test.cc core/cubinqueue.cc && /tmp/cubinqueue_test

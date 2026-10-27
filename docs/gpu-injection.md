@@ -75,6 +75,17 @@ In a PyTorch image the pip-installed CUPTI is usually already present, under
 `site-packages/nvidia/*/lib`. Put that directory on `LD_LIBRARY_PATH` if the
 loader does not find it.
 
+PC sampling also needs `libnvperf_host.so` from the **same** CUDA release as
+CUPTI. CUPTI loads it by name, so with a pip-installed CUPTI on a host that
+also has a CUDA toolkit, the loader would find the toolkit's copy, and the
+mismatched pair crashes the process. With PC sampling on, the shim therefore
+loads the `libnvperf_host.so` that sits next to the `libcupti` it resolved
+before CUPTI looks for one. If a different copy is already loaded, the shim
+turns PC sampling off for that process and logs both paths. The exit report
+shows the outcome as `nvperf=pinned`, `matched`, `mismatched` or
+`no-sibling` (`pin-failed` and `no-cupti-path` also exist, for the rare cases
+where the shim cannot check).
+
 ## Delivering it
 
 ### Bare metal

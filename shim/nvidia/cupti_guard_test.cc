@@ -17,7 +17,10 @@
 //      pass just as happily on a file that fails to compile for some unrelated
 //      reason -- a typo, a missing include, a CUDA version bump -- and would
 //      then be proving nothing at all.
-//   1  the exact shape of the bug: cuptiActivityFlushAll from a timer
+//   1  the exact shape of the bug: cuptiActivityFlushAll from a timer.
+//      Since #214 the flush's wrapper does not take the guard either, but
+//      the raw name still must not compile: the wrapper is what counts a
+//      flush made under the guard.
 //   2  the other half of the deadlock: cuptiPCSamplingStop
 //   3  a drain that skips the guard: cuptiPCSamplingGetData
 //   4  "I'll take the address and call it later" -- the wrapper dodged by
@@ -33,15 +36,23 @@
 
 // The compliant shape. Two CUPTI calls that must not interleave with another
 // thread's, made atomic by one outer scope; the wrappers take the re-entrant
-// guard again inside, which costs a depth increment and no lock.
+// guard again inside, which costs a depth increment and no lock. The activity
+// flush comes AFTER the scope closes: it is the one call that must never be
+// made under the guard (issue #214, "The flush" in cupti_guard.h).
 CUptiResult compliant(CUcontext ctx) {
-    perfagent::cupti::CallScope hold;
-    CUpti_PCSamplingStopParams sp{};
-    sp.size = CUpti_PCSamplingStopParamsSize;
-    sp.ctx = ctx;
-    const CUptiResult st = perfagent::cupti::PCSamplingStop(&sp);
-    if (st != CUPTI_SUCCESS) return st;
-    return perfagent::cupti::ActivityFlushAll(0);
+    {
+        perfagent::cupti::CallScope hold;
+        CUpti_PCSamplingStopParams sp{};
+        sp.size = CUpti_PCSamplingStopParamsSize;
+        sp.ctx = ctx;
+        CUpti_PCSamplingGetDataParams gp{};
+        gp.size = CUpti_PCSamplingGetDataParamsSize;
+        gp.ctx = ctx;
+        const CUptiResult st = perfagent::cupti::PCSamplingStop(&sp);
+        if (st != CUPTI_SUCCESS) return st;
+        (void)perfagent::cupti::PCSamplingGetData(&gp);
+    }
+    return perfagent::cupti::ActivityFlushAll_NeverUnderGuard(0);
 }
 
 #elif PERFAGENT_CUPTI_UNGUARDED == 1

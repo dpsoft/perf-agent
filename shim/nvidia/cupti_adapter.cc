@@ -314,30 +314,41 @@ uint64_t cupti_cubin_crc(const void *bytes, size_t len) {
     p.size = CUpti_GetCubinCrcParamsSize;
     p.cubinSize = len;
     p.cubin = bytes;
-    // Takes the CUPTI guard, like every other call this adapter initiates.
-    // It runs on the APPLICATION's cuModuleLoad path, so it can now wait
-    // behind one of the timer thread's CUPTI calls -- see issue-99's report
-    // for the size of that and why it is the right trade.
+    // Takes the CUPTI guard, like every other call this adapter initiates,
+    // and for that reason runs ONLY on the timer thread, from
+    // CubinQueue::settle -- never in the MODULE_LOADED callback.
+    //
+    // It used to run in the callback, on the application's thread, on the
+    // reasoning that waiting behind one of the timer's CUPTI calls was a
+    // bounded cost. It was not bounded (issue #211): under lazy loading the
+    // callback fires from inside cuLaunchKernel, with the application thread
+    // holding a driver lock, while the timer held the guard across
+    // cuptiActivityFlushAll waiting for a CUPTI worker that needed that same
+    // driver lock. Three threads, a permanent deadlock of the profiled
+    // process, 1 run in 8 on a PyTorch workload with nobody attached.
     if (perfagent::cupti::GetCubinCrc(&p) != CUPTI_SUCCESS) return 0;
     return p.cubinCrc;
 }
 
-// Fired by CubinQueue::capture, on the application's thread, at the one
-// instant the copy is owned by nobody else: the CRC is computed and the entry
-// has not been pushed, so the drain thread cannot yet have offered and freed
-// it. That is what keeps bytes_ptr accurate.
+// Fired by CubinQueue::settle, on the timer thread, at the one instant the
+// copy is owned by nobody else: the CRC is computed and the entry has not
+// been handed to drain(), so nothing can yet have offered and freed it. That
+// is what keeps bytes_ptr accurate. module_id and load_ns are the callback's,
+// carried through the pending list, so the record still says when the module
+// loaded rather than when the timer got to it.
 //
 // bytes_ptr stays in the ABI and stays true, and it is still NOT a transport:
 // it points into this process's address space and the consumer would need
 // CAP_SYS_PTRACE to read it. The bytes travel over the cubin channel
 // (core/cubin.h); this record announces THAT a module loaded, with its CRC
 // and size.
-void on_cubin_captured(void *ctx, uint64_t crc, const void *bytes, size_t len) {
+void on_cubin_captured(void *, uint64_t module_id, uint64_t load_ns, uint64_t crc,
+                       const void *bytes, size_t len) {
     gpu_module_load_v1 r{};
     r.cubin_crc = crc;
-    r.module_id = (uint64_t)(uintptr_t)ctx;
+    r.module_id = module_id;
     r.size_bytes = (uint64_t)len;
-    r.load_ns = mono_ns();
+    r.load_ns = load_ns;
     r.bytes_ptr = (uint64_t)(uintptr_t)bytes;
     // Live, or logged for replay -- never both, and that is what keeps a
     // launched run from receiving every module twice. The log holds exactly
@@ -398,10 +409,10 @@ void on_module_loaded(const CUpti_ResourceData *rd) {
     // asked to be able to profile.
     if (!consumer_attached()) g_module_retained.fetch_add(1, std::memory_order_relaxed);
     const perfagent::CubinView view(m->pCubin, m->cubinSize);
-    // moduleId travels as the context, not as a captured pointer: nothing
-    // about this call may outlive the callback except the owned copy.
-    g_cubins->capture(view, cupti_cubin_crc, on_cubin_captured,
-                      (void *)(uintptr_t)m->moduleId);
+    // The copy and nothing else. No CRC here: it is a guarded CUPTI call and
+    // this thread may be inside cuLaunchKernel holding a driver lock (issue
+    // #211). capture() takes no CRC function, so it cannot be put back.
+    g_cubins->capture(view, m->moduleId, mono_ns());
 }
 
 // Defined further down with the rest of the process setup; declared here
@@ -1959,6 +1970,7 @@ void report(const char *why) {
          "modules_captured=%llu module_reload_skipped=%llu module_retained_unattached=%llu "
          "module_no_bytes=%llu cubin_too_large=%llu cubin_crc_failed=%llu "
          "cubin_alloc_failed=%llu cubin_queue_full=%llu cubin_queue_depth=%zu "
+         "cubin_pending_full=%llu cubin_pending_depth=%zu "
          "cubins_sent=%llu cubin_send_failed=%llu "
          "cubins_offered=%llu cubin_transport_send_failed=%llu "
          "clock_steps=%llu clock_offset_ns=%lld sem_at_exit=%u\n",
@@ -1992,6 +2004,11 @@ void report(const char *why) {
          (unsigned long long)(g_cubins ? g_cubins->cubin_alloc_failed() : 0),
          (unsigned long long)(g_cubins ? g_cubins->cubin_queue_full() : 0),
          g_cubins ? g_cubins->depth() : (size_t)0,
+         // Copied in a callback, not yet settled on the timer thread (issue
+         // #211). A non-zero pending_full is modules lost whole: no record,
+         // because their CRC was never computed.
+         (unsigned long long)(g_cubins ? g_cubins->cubin_pending_full() : 0),
+         g_cubins ? g_cubins->pending() : (size_t)0,
          (unsigned long long)(g_cubins ? g_cubins->cubins_sent() : 0),
          (unsigned long long)(g_cubins ? g_cubins->cubin_send_failed() : 0),
          (unsigned long long)perfagent::cubins_offered(),
@@ -2238,6 +2255,17 @@ void on_tick() {
     }
     g_names_was_attached = now_attached;
 
+    // The SETTLE half of a cubin capture: the CRC, the de-duplication and
+    // gpu_module_load_v1, for every module copied since the last tick. It
+    // runs here, on the timer thread, attached or not -- an unattached
+    // process still needs its modules' records in the replay log -- because
+    // the CRC is a guarded CUPTI call and the MODULE_LOADED callback is the
+    // one place it must never be made (issue #211). It runs before the
+    // replay so a module copied in the tick a consumer attaches is announced
+    // exactly once: live if the consumer is already there, from the log if
+    // not.
+    if (g_cubins) g_cubins->settle(cupti_cubin_crc, on_cubin_captured, nullptr);
+
     // The SEND half of a cubin capture, and the whole reason this is here and
     // not in the MODULE_LOADED callback: a connect() plus an up-to-8 MiB
     // handover on the application's cuModuleLoad path would stall the
@@ -2365,8 +2393,11 @@ void at_exit_handler() {
     if (g_lb) g_lb->flush();
     if (g_eb) g_eb->flush();
     if (g_pcb) g_pcb->flush();
-    // One last offer pass, for modules captured inside the final drain
-    // interval. Bounded: drain() offers at most the entries present when it
+    // One last settle and offer pass, for modules captured inside the final
+    // drain interval. The timer is joined above, so this thread is the only
+    // settler -- which settle() requires.
+    if (g_cubins) g_cubins->settle(cupti_cubin_crc, on_cubin_captured, nullptr);
+    // The offer pass. Bounded: drain() offers at most the entries present when it
     // was entered, the queue holds at most CubinQueueLimits::max_entries, and
     // an offer to an absent listener refuses immediately -- so this cannot
     // turn process exit into a multi-second wait.

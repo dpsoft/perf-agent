@@ -3,8 +3,9 @@
 //
 // What this proves without a GPU: that the copy is taken inside capture()
 // and is a real copy (mutating the source afterwards does not change what is
-// offered); that the CRC is computed over the copy; that gpu_module_load_v1's
-// moment is inside capture() while the bytes are exclusively ours; that a
+// offered); that capture() computes no CRC and fires no record, and settle()
+// does both over the copy (issue #211); that gpu_module_load_v1's moment is
+// inside settle() while the bytes are exclusively ours; that a
 // re-load of the same CRC is skipped and counted; that every bound drops the
 // OFFER and counts it rather than dropping the copy or blocking; and that
 // drain() does not hold the mutex across an offer, which is the property that
@@ -78,8 +79,17 @@ struct Captured {
 
 Captured g_captured;
 
-void record_capture(void *ctx, uint64_t crc, const void *bytes, size_t len) {
+struct CapturedIds {
+    uint64_t module_id;
+    uint64_t load_ns;
+};
+CapturedIds g_captured_ids;
+
+void record_capture(void *ctx, uint64_t module_id, uint64_t load_ns, uint64_t crc,
+                    const void *bytes, size_t len) {
     (void)ctx;
+    g_captured_ids.module_id = module_id;
+    g_captured_ids.load_ns = load_ns;
     g_captured.crc = crc;
     g_captured.bytes.assign((const char *)bytes, len);
     g_captured.len = len;
@@ -87,6 +97,18 @@ void record_capture(void *ctx, uint64_t crc, const void *bytes, size_t len) {
 }
 
 void reset_captured() { g_captured = Captured{0, std::string(), 0, 0}; }
+
+// The two halves as the adapter runs them on a quiet process: the callback
+// captures, the next tick settles. Returns what the old one-step capture
+// returned -- whether the module reached the offer queue -- so the tests that
+// are about bounds and offers read exactly as they did.
+bool capture_and_settle(CubinQueue &q, const CubinView &v, perfagent::CubinCrcFn crc,
+                        perfagent::CubinCapturedFn on_captured) {
+    const uint64_t before = q.modules_captured();
+    if (!q.capture(v, 0, 0)) return false;
+    q.settle(crc, on_captured, nullptr);
+    return q.modules_captured() > before;
+}
 
 std::string body(size_t n, char seed) {
     std::string s(n, '\0');
@@ -110,7 +132,7 @@ void test_the_copy_is_taken_inside_the_callback() {
 
     {
         const CubinView view(vendor.data(), vendor.size());
-        assert(q.capture(view, fnv1a, record_capture, nullptr));
+        assert(capture_and_settle(q, view, fnv1a, record_capture));
     }
 
     // The vendor's buffer now holds something else entirely, exactly as it
@@ -131,13 +153,13 @@ void test_the_copy_is_taken_inside_the_callback() {
 // gpu_module_load_v1 must be fired while the copy is exclusively ours, and
 // its bytes_ptr must name that copy - which is only checkable by asserting
 // the pointer handed to on_captured holds the right bytes at that instant.
-void test_the_record_fires_inside_capture_over_live_bytes() {
+void test_the_record_fires_inside_settle_over_live_bytes() {
     reset_offers();
     reset_captured();
     CubinQueue q;
     const std::string vendor = body(1024, 'B');
     const CubinView view(vendor.data(), vendor.size());
-    assert(q.capture(view, fnv1a, record_capture, nullptr));
+    assert(capture_and_settle(q, view, fnv1a, record_capture));
 
     assert(g_captured.calls == 1);
     assert(g_captured.len == vendor.size());
@@ -146,7 +168,7 @@ void test_the_record_fires_inside_capture_over_live_bytes() {
     // ...and it fired BEFORE anything could have been offered, which is what
     // makes bytes_ptr valid at the moment the probe reads it.
     assert(g_offers.empty());
-    printf("  gpu_module_load_v1 fires inside capture, over the owned copy\n");
+    printf("  gpu_module_load_v1 fires inside settle, over the owned copy\n");
 }
 
 // The CRC comes from the copy. A crc function that is handed the vendor's
@@ -166,10 +188,17 @@ void test_the_crc_runs_over_the_copy() {
     g_crc_saw.clear();
     CubinQueue q;
     std::string vendor = body(2048, 'C');
-    const CubinView view(vendor.data(), vendor.size());
-    assert(q.capture(view, recording_crc, record_capture, nullptr));
+    {
+        const CubinView view(vendor.data(), vendor.size());
+        assert(q.capture(view, 0, 0));
+    }
+    // Between the callback and the settle tick the vendor reuses its buffer.
+    // The CRC is computed after this, so it is only right if it is computed
+    // over the copy.
     memset(&vendor[0], 0, vendor.size());
+    assert(q.settle(recording_crc, record_capture, nullptr) == 1);
     assert(q.drain(record_offer, 1000) == 1);
+    assert(g_offers[0].crc == fnv1a(body(2048, 'C').data(), 2048));
     assert(g_crc_saw_len == 2048);
     assert(g_crc_saw == g_offers[0].bytes);
     printf("  the CRC is computed over the copy, not over the borrowed buffer\n");
@@ -185,7 +214,7 @@ void test_a_crc_of_zero_is_counted_and_never_sent() {
     CubinQueue q;
     const std::string vendor = body(64, 'D');
     const CubinView view(vendor.data(), vendor.size());
-    assert(!q.capture(view, zero_crc, record_capture, nullptr));
+    assert(!capture_and_settle(q, view, zero_crc, record_capture));
     assert(q.cubin_crc_failed() == 1);
     assert(q.modules_captured() == 0);
     assert(g_captured.calls == 0);
@@ -201,7 +230,7 @@ void test_a_reload_of_the_same_crc_is_skipped_and_counted() {
     const std::string vendor = body(512, 'E');
     {
         const CubinView v(vendor.data(), vendor.size());
-        assert(q.capture(v, fnv1a, record_capture, nullptr));
+        assert(capture_and_settle(q, v, fnv1a, record_capture));
     }
     // The same module loaded again - CUDA's lazy loading does this - from a
     // different buffer with identical contents, which is what a content
@@ -209,7 +238,7 @@ void test_a_reload_of_the_same_crc_is_skipped_and_counted() {
     const std::string again = body(512, 'E');
     {
         const CubinView v(again.data(), again.size());
-        assert(!q.capture(v, fnv1a, record_capture, nullptr));
+        assert(!capture_and_settle(q, v, fnv1a, record_capture));
     }
     assert(q.modules_captured() == 1);
     assert(q.module_reload_skipped() == 1);
@@ -230,7 +259,7 @@ void test_a_full_queue_drops_the_offer_and_counts_it() {
     for (int i = 0; i < 5; i++) {
         const std::string vendor = body(128, (char)('a' + i));
         const CubinView v(vendor.data(), vendor.size());
-        q.capture(v, fnv1a, record_capture, nullptr);
+        capture_and_settle(q, v, fnv1a, record_capture);
     }
     assert(q.modules_captured() == 2);
     assert(q.cubin_queue_full() == 3);
@@ -254,7 +283,7 @@ void test_the_byte_ceiling_is_a_second_full_condition() {
     for (int i = 0; i < 4; i++) {
         const std::string vendor = body(128, (char)('m' + i));
         const CubinView v(vendor.data(), vendor.size());
-        q.capture(v, fnv1a, record_capture, nullptr);
+        capture_and_settle(q, v, fnv1a, record_capture);
     }
     assert(q.modules_captured() == 2);   // 128 + 128 = 256; a third would pass 300
     assert(q.cubin_queue_full() == 2);
@@ -271,7 +300,7 @@ void test_an_oversized_cubin_is_never_copied() {
     CubinQueue q(lim);
     const std::string vendor = body(1025, 'F');
     const CubinView v(vendor.data(), vendor.size());
-    assert(!q.capture(v, fnv1a, record_capture, nullptr));
+    assert(!capture_and_settle(q, v, fnv1a, record_capture));
     assert(q.cubin_too_large() == 1);
     assert(q.modules_captured() == 0);
     assert(g_captured.calls == 0);
@@ -281,7 +310,7 @@ void test_an_oversized_cubin_is_never_copied() {
     // policy rather than an off-by-one.
     const std::string ok = body(1024, 'F');
     const CubinView v2(ok.data(), ok.size());
-    assert(q.capture(v2, fnv1a, record_capture, nullptr));
+    assert(capture_and_settle(q, v2, fnv1a, record_capture));
     assert(q.cubin_too_large() == 1);
     printf("  a cubin over the per-cubin ceiling is refused before the memcpy\n");
 }
@@ -292,7 +321,7 @@ void test_a_refused_offer_is_counted_as_a_send_failure() {
     CubinQueue q;
     const std::string vendor = body(256, 'G');
     const CubinView v(vendor.data(), vendor.size());
-    assert(q.capture(v, fnv1a, record_capture, nullptr));
+    assert(capture_and_settle(q, v, fnv1a, record_capture));
     g_offer_result = kCubinOfferRefused;
     assert(q.drain(record_offer, 1000) == 1);
     assert(q.cubin_send_failed() == 1);
@@ -308,7 +337,7 @@ void test_drain_bounds_itself_and_empties() {
     for (int i = 0; i < 8; i++) {
         const std::string vendor = body(64, (char)('0' + i));
         const CubinView v(vendor.data(), vendor.size());
-        assert(q.capture(v, fnv1a, record_capture, nullptr));
+        assert(capture_and_settle(q, v, fnv1a, record_capture));
     }
     assert(q.depth() == 8);
     assert(q.drain(record_offer, 250) == 8);
@@ -343,14 +372,14 @@ void test_a_slow_offer_does_not_block_a_capture() {
     const std::string first = body(64, 'H');
     {
         const CubinView v(first.data(), first.size());
-        assert(q.capture(v, fnv1a, record_capture, nullptr));
+        assert(capture_and_settle(q, v, fnv1a, record_capture));
     }
     std::thread drainer([&] { q.drain(slow_offer, 1000); });
     while (!g_slow_offer_entered.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     const std::string second = body(64, 'I');
     const CubinView v(second.data(), second.size());
-    assert(q.capture(v, fnv1a, record_capture, nullptr));
+    assert(capture_and_settle(q, v, fnv1a, record_capture));
     g_capture_finished.store(true);
     drainer.join();
     assert(q.modules_captured() == 2);
@@ -366,7 +395,7 @@ void test_a_healthy_run_reads_zero_on_every_drop_counter() {
     for (int i = 0; i < 4; i++) {
         const std::string vendor = body(1000 + i, (char)('p' + i));
         const CubinView v(vendor.data(), vendor.size());
-        assert(q.capture(v, fnv1a, record_capture, nullptr));
+        assert(capture_and_settle(q, v, fnv1a, record_capture));
     }
     assert(q.drain(record_offer, 1000) == 4);
     assert(q.modules_captured() == 4);
@@ -390,7 +419,7 @@ void test_destruction_releases_undrained_copies() {
         for (int i = 0; i < 3; i++) {
             const std::string vendor = body(256, (char)('x' + i));
             const CubinView v(vendor.data(), vendor.size());
-            assert(q.capture(v, fnv1a, record_capture, nullptr));
+            assert(capture_and_settle(q, v, fnv1a, record_capture));
         }
         assert(q.depth() == 3);
     }
@@ -416,7 +445,7 @@ void test_an_undrained_queue_retains_everything_intact() {
     const char *payloads[] = {"module-alpha", "module-bravo", "module-charlie"};
     for (int i = 0; i < 3; i++) {
         const CubinView v(payloads[i], strlen(payloads[i]));
-        assert(q.capture(v, fnv1a, nullptr, nullptr));
+        assert(capture_and_settle(q, v, fnv1a, nullptr));
     }
     // Many ticks' worth of doing nothing. Nothing may age out on its own:
     // there is no deadline in this policy, only the bounds.
@@ -443,11 +472,200 @@ void test_the_retention_bounds_are_the_consumers_store_bounds() {
     printf("  the retention bounds are the consumer's module-store bounds\n");
 }
 
+// ---------------------------------------------------------- issue #211
+//
+// The deadlock: the CRC used to be computed inside capture(), on the
+// application's thread, and on the vendor side the CRC takes the CUPTI guard.
+// The callback can fire from inside cuLaunchKernel holding a driver lock, and
+// the guard's holder (the timer, inside cuptiActivityFlushAll) was waiting on
+// a CUPTI worker that needed that lock. These tests pin the two properties
+// that break the cycle.
+
+int g_crc_calls = 0;
+uint64_t counting_crc(const void *bytes, size_t len) {
+    g_crc_calls++;
+    return fnv1a(bytes, len);
+}
+
+// capture() calls no CRC and fires no record. It has no parameter through
+// which it could, so this is as much a check that settle() is where both
+// happen as that capture() does not do them.
+void test_capture_computes_no_crc_and_fires_no_record() {
+    reset_offers();
+    reset_captured();
+    g_crc_calls = 0;
+    CubinQueue q;
+    const std::string vendor = body(512, 'J');
+    {
+        const CubinView v(vendor.data(), vendor.size());
+        assert(q.capture(v, 7, 1234));
+    }
+    assert(g_crc_calls == 0);
+    assert(g_captured.calls == 0);
+    assert(q.pending() == 1);
+    assert(q.depth() == 0);
+    assert(q.modules_captured() == 0);
+    // Nothing is offerable before it is settled: a drain here offers nothing,
+    // because an offer without a CRC would join to nothing.
+    assert(q.drain(record_offer, 1000) == 0);
+
+    assert(q.settle(counting_crc, record_capture, nullptr) == 1);
+    assert(g_crc_calls == 1);
+    assert(g_captured.calls == 1);
+    assert(q.pending() == 0);
+    assert(q.depth() == 1);
+    assert(q.modules_captured() == 1);
+    printf("  capture computes no CRC and fires no record; settle does both\n");
+}
+
+// The record's module_id and load_ns are the callback's, not the settle
+// tick's: moving the CRC off the application's thread must not move the
+// timestamp the consumer orders module loads by.
+void test_the_record_carries_the_callbacks_module_id_and_load_ns() {
+    reset_offers();
+    reset_captured();
+    CubinQueue q;
+    const std::string vendor = body(256, 'K');
+    {
+        const CubinView v(vendor.data(), vendor.size());
+        assert(q.capture(v, 42, 987654321));
+    }
+    assert(q.settle(fnv1a, record_capture, nullptr) == 1);
+    assert(g_captured_ids.module_id == 42);
+    assert(g_captured_ids.load_ns == 987654321);
+    printf("  the record carries the callback's module_id and load_ns\n");
+}
+
+// The cycle itself, at the queue's level. The CRC function blocks the way
+// the vendor's does when the guard is held, and while it is blocked a
+// capture() must still complete. If settle() held mu_ across the CRC, the
+// capture would wait on mu_ behind it -- an application thread waiting, one
+// lock further down, on the very call #211 moved off its thread.
+std::atomic<bool> g_crc_entered{false};
+std::atomic<bool> g_blocked_capture_finished{false};
+
+uint64_t blocking_crc(const void *bytes, size_t len) {
+    g_crc_entered.store(true);
+    for (int i = 0; i < 2000 && !g_blocked_capture_finished.load(); i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return fnv1a(bytes, len);
+}
+
+void test_a_capture_completes_while_settle_is_inside_the_crc() {
+    reset_offers();
+    reset_captured();
+    CubinQueue q;
+    const std::string first = body(64, 'L');
+    {
+        const CubinView v(first.data(), first.size());
+        assert(q.capture(v, 1, 1));
+    }
+    std::thread settler([&] { q.settle(blocking_crc, nullptr, nullptr); });
+    while (!g_crc_entered.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string second = body(64, 'M');
+    {
+        const CubinView v(second.data(), second.size());
+        assert(q.capture(v, 2, 2));
+    }
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    g_blocked_capture_finished.store(true);
+    settler.join();
+    // The crc gives up after ~2 s on its own, so a capture that waited for it
+    // would still finish -- the assertion is that it did not wait.
+    assert(waited < std::chrono::milliseconds(500));
+    // settle() took only what was present on entry; the second capture waits
+    // for the next tick rather than extending this one.
+    assert(q.modules_captured() == 1);
+    assert(q.pending() == 1);
+    printf("  a capture completes while settle is inside the CRC (no lock held across it)\n");
+}
+
+// Two loads of one module inside one tick are both pending when settle runs;
+// the second is a reload of the first, not a second module.
+void test_two_pending_loads_of_one_crc_settle_once() {
+    reset_offers();
+    reset_captured();
+    CubinQueue q;
+    const std::string a = body(300, 'N');
+    const std::string b = body(300, 'N');
+    {
+        const CubinView v(a.data(), a.size());
+        assert(q.capture(v, 1, 1));
+    }
+    {
+        const CubinView v(b.data(), b.size());
+        assert(q.capture(v, 2, 2));
+    }
+    assert(q.settle(fnv1a, record_capture, nullptr) == 2);
+    assert(q.modules_captured() == 1);
+    assert(q.module_reload_skipped() == 1);
+    assert(g_captured.calls == 1);
+    assert(q.depth() == 1);
+    printf("  two pending loads of one CRC settle as one module and one reload\n");
+}
+
+// The pending bounds, and their own counter: past them the module is lost
+// whole -- no record, because its CRC is never computed.
+void test_a_full_pending_list_is_counted_separately() {
+    reset_offers();
+    reset_captured();
+    CubinQueueLimits lim;
+    lim.max_pending_entries = 2;
+    CubinQueue q(lim);
+    for (int i = 0; i < 4; i++) {
+        const std::string vendor = body(128, (char)('q' + i));
+        const CubinView v(vendor.data(), vendor.size());
+        q.capture(v, (uint64_t)i, 0);
+    }
+    assert(q.pending() == 2);
+    assert(q.cubin_pending_full() == 2);
+    assert(q.cubin_queue_full() == 0);
+    assert(q.settle(fnv1a, record_capture, nullptr) == 2);
+    assert(g_captured.calls == 2);
+    printf("  a full pending list drops 2 and counts them as pending_full, not queue_full\n");
+}
+
+// The point of bounding pending separately: a RETAINED queue that is full
+// must not stop a new module's record, because the record is what tells the
+// consumer the module exists.
+void test_a_full_offer_queue_does_not_stop_capture_or_the_record() {
+    reset_offers();
+    reset_captured();
+    CubinQueueLimits lim;
+    lim.max_entries = 1;
+    CubinQueue q(lim);
+    for (int i = 0; i < 3; i++) {
+        const std::string vendor = body(128, (char)('u' + i));
+        const CubinView v(vendor.data(), vendor.size());
+        assert(q.capture(v, (uint64_t)i, 0));
+        q.settle(fnv1a, record_capture, nullptr);
+    }
+    assert(q.cubin_pending_full() == 0);
+    assert(q.cubin_queue_full() == 2);
+    assert(g_captured.calls == 3);
+    printf("  a full offer queue still lets every module reach settle and its record\n");
+}
+
+// Destruction frees pending copies as well as settled ones.
+void test_destruction_releases_pending_copies() {
+    {
+        CubinQueue q;
+        const std::string vendor = body(256, 'Z');
+        const CubinView v(vendor.data(), vendor.size());
+        assert(q.capture(v, 1, 1));
+        assert(q.pending() == 1);
+    }
+    printf("  destroying a queue with pending copies releases them\n");
+}
+
 }  // namespace
 
 int main() {
     test_the_copy_is_taken_inside_the_callback();
-    test_the_record_fires_inside_capture_over_live_bytes();
+    test_the_record_fires_inside_settle_over_live_bytes();
     test_the_crc_runs_over_the_copy();
     test_a_crc_of_zero_is_counted_and_never_sent();
     test_a_reload_of_the_same_crc_is_skipped_and_counted();
@@ -461,6 +679,13 @@ int main() {
     test_destruction_releases_undrained_copies();
     test_an_undrained_queue_retains_everything_intact();
     test_the_retention_bounds_are_the_consumers_store_bounds();
+    test_capture_computes_no_crc_and_fires_no_record();
+    test_the_record_carries_the_callbacks_module_id_and_load_ns();
+    test_a_capture_completes_while_settle_is_inside_the_crc();
+    test_two_pending_loads_of_one_crc_settle_once();
+    test_a_full_pending_list_is_counted_separately();
+    test_a_full_offer_queue_does_not_stop_capture_or_the_record();
+    test_destruction_releases_pending_copies();
     printf("cubinqueue_test: OK\n");
     return 0;
 }

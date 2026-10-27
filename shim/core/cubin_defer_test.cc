@@ -17,10 +17,18 @@
 //   3  move the view into a container
 //   4  read the borrowed pointer straight out of the view
 //   5  assign one view over another
+//   6  compute the CRC inside capture (issue #211)
 //
 // Each of 1-5 is a real thing an implementer would reach for while "just
 // deferring the copy to the drain thread"; each is a compile error, and the
 // Makefile prints which.
+//
+// Mode 6 is the opposite temptation: doing MORE in the callback. The CRC is
+// a vendor call behind the CUPTI guard, and the callback can run on an
+// application thread inside cuLaunchKernel, holding a driver lock that the
+// guard's holder is waiting for. capture() therefore takes no CRC function,
+// and putting one back is a compile error rather than a deadlock found a
+// release later.
 #include "cubinqueue.h"
 
 #include <cstdint>
@@ -34,12 +42,14 @@
 
 namespace {
 
+#if PERFAGENT_CUBIN_DEFER == 6
 uint64_t fake_crc(const void *bytes, size_t len) {
     (void)bytes;
     return len ? 0x1234u : 0u;
 }
 
-void fake_captured(void *, uint64_t, const void *, size_t) {}
+void fake_captured(void *, uint64_t, uint64_t, uint64_t, const void *, size_t) {}
+#endif
 
 }  // namespace
 
@@ -49,7 +59,7 @@ void fake_captured(void *, uint64_t, const void *, size_t) {}
 // capture, and dies there. The copy is taken before the function returns.
 bool compliant(perfagent::CubinQueue &q, const void *vendor_bytes, size_t len) {
     const perfagent::CubinView view(vendor_bytes, len);
-    return q.capture(view, fake_crc, fake_captured, nullptr);
+    return q.capture(view, /*module_id=*/1, /*load_ns=*/0);
 }
 
 #elif PERFAGENT_CUBIN_DEFER == 1
@@ -100,6 +110,15 @@ void defer_by_reassigning(perfagent::CubinView &slot, const void *vendor_bytes, 
     slot = perfagent::CubinView(vendor_bytes, len);
 }
 
+#elif PERFAGENT_CUBIN_DEFER == 6
+
+// "The CRC is cheap, take it with the copy like it used to be." It is a
+// vendor call behind the CUPTI guard, and that is issue #211.
+bool crc_in_the_callback(perfagent::CubinQueue &q, const void *vendor_bytes, size_t len) {
+    const perfagent::CubinView view(vendor_bytes, len);
+    return q.capture(view, fake_crc, fake_captured, nullptr);
+}
+
 #else
-#error "PERFAGENT_CUBIN_DEFER must be 0..5"
+#error "PERFAGENT_CUBIN_DEFER must be 0..6"
 #endif

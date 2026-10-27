@@ -47,6 +47,21 @@
 // The CRC runs over the COPY, never over the view, for the same reason: the
 // crc function is handed the owned bytes, so a CRC and the bytes it names can
 // never come from two different reads of a buffer that changed in between.
+//
+// # Three steps, not two: the CRC is not computed in the callback
+//
+// capture() copies and returns. settle() -- on the adapter's own thread --
+// computes the CRC, de-duplicates, fires gpu_module_load_v1 and hands the
+// entry to drain(). The CRC used to be taken inside capture(), and that
+// deadlocked the profiled process (issue #211): on the vendor side the CRC is
+// cuptiGetCubinCrc, which takes the adapter's one CUPTI guard, and the
+// callback can fire from inside cuLaunchKernel (lazy module loading) on an
+// application thread that holds a driver lock. The timer thread, holding the
+// guard across cuptiActivityFlushAll, waited for a CUPTI worker that waited
+// for that driver lock. An application thread inside a vendor callback must
+// never wait for the guard, and the way to make that structural rather than
+// a rule is for the callback half to take no CRC function at all: capture()
+// has no parameter through which one could be passed.
 #ifndef PERFAGENT_CUBINQUEUE_H
 #define PERFAGENT_CUBINQUEUE_H
 
@@ -99,11 +114,18 @@ private:
 // to nothing and would be an unresolvable module with every counter green.
 typedef uint64_t (*CubinCrcFn)(const void *bytes, size_t len);
 
-// Called once per captured module, on the callback's thread, while the copy
-// is owned by nobody else. This is where gpu_module_load_v1 is fired, and it
-// is the only moment at which the record's bytes_ptr provably points at live
-// adapter-owned bytes. It must not call back into the queue.
-typedef void (*CubinCapturedFn)(void *ctx, uint64_t crc, const void *bytes, size_t len);
+// Called once per settled module, on settle()'s thread, while the copy is
+// owned by nobody else: it has left the pending list and has not yet been
+// handed to drain(), so nothing can have offered and freed it. This is where
+// gpu_module_load_v1 is fired, and it is the only moment at which the
+// record's bytes_ptr provably points at live adapter-owned bytes. It must not
+// call back into the queue.
+//
+// module_id and load_ns are what capture() was given, carried through
+// unchanged: the record's load time is the callback's, not the settle tick's,
+// so moving the CRC off the application's thread does not move the timestamp.
+typedef void (*CubinCapturedFn)(void *ctx, uint64_t module_id, uint64_t load_ns, uint64_t crc,
+                                const void *bytes, size_t len);
 
 // The send. Signature-compatible with cubin_offer_to_consumer by design, so
 // the production wiring is a name and the tests are a substitute.
@@ -135,6 +157,17 @@ struct CubinQueueLimits {
     size_t max_queued_bytes = 64u * 1024 * 1024; // their total
     size_t max_cubin_bytes = 8u * 1024 * 1024;   // one module, the memcpy bound
     size_t max_interned = 4096;                  // distinct CRCs remembered
+
+    // The pending list: copies taken in the callback and not yet settled.
+    // It is emptied every settle tick, so it only fills when more than
+    // max_entries modules (or max_queued_bytes of them) load inside ONE
+    // tick. It is bounded separately from the offer queue on purpose: a
+    // retained queue that is full must still let a new module reach settle(),
+    // because settle() is where its gpu_module_load_v1 fires, and the
+    // consumer learning THAT a module loaded is worth more than its bytes.
+    // The price is that the worst case briefly holds both bounds' worth.
+    size_t max_pending_entries = 512;
+    size_t max_pending_bytes = 64u * 1024 * 1024;
 };
 
 // Bounded, mutex-guarded, and drained by somebody else's thread.
@@ -146,13 +179,25 @@ public:
     CubinQueue(const CubinQueue &) = delete;
     CubinQueue &operator=(const CubinQueue &) = delete;
 
-    // The callback half. Copies view NOW, computes the CRC over the copy,
-    // calls on_captured while the copy is still exclusively ours, and pushes.
-    // Returns true only when the copy was made AND enqueued for offer.
+    // The callback half. Copies view NOW and parks the copy as pending.
+    // Calls nothing it was not built with -- no CRC, no record, no vendor
+    // API -- so an application thread inside a vendor callback waits on at
+    // most this queue's own leaf mutex. Returns true when the copy was made
+    // and parked.
     //
     // Every early return has a counter; none is silent.
-    bool capture(const CubinView &view, CubinCrcFn crc, CubinCapturedFn on_captured,
-                 void *ctx);
+    bool capture(const CubinView &view, uint64_t module_id, uint64_t load_ns);
+
+    // The settle half, on the adapter's own thread and never on an
+    // application's: for each pending copy, computes the CRC over it, skips a
+    // CRC already seen, fires on_captured, and enqueues the copy for drain().
+    // Settles at most the entries present on entry, and holds the mutex
+    // across neither crc nor on_captured -- crc is a vendor call that takes
+    // the CUPTI guard, and a capture() waiting on our mutex behind it would
+    // rebuild issue #211 one lock further down. Returns how many it settled.
+    //
+    // Must be called from one thread at a time: the intern set is its alone.
+    size_t settle(CubinCrcFn crc, CubinCapturedFn on_captured, void *ctx);
 
     // The drain-thread half. Offers at most the entries present on entry, so
     // a producer that keeps capturing cannot pin this thread here, and never
@@ -170,16 +215,22 @@ public:
     uint64_t cubin_too_large() const { return too_large_.load(std::memory_order_relaxed); }
     uint64_t cubin_crc_failed() const { return crc_failed_.load(std::memory_order_relaxed); }
     uint64_t cubin_alloc_failed() const { return alloc_failed_.load(std::memory_order_relaxed); }
+    uint64_t cubin_pending_full() const { return pending_full_.load(std::memory_order_relaxed); }
     uint64_t cubins_sent() const { return sent_.load(std::memory_order_relaxed); }
 
-    // Queued-but-not-yet-offered. A producer waiting for its offers to land
-    // polls this; an operator reads it as the size of what a hard exit would
-    // take with it.
+    // Settled-but-not-yet-offered. A producer waiting for its offers to land
+    // polls this.
     size_t depth() const;
+
+    // Captured-but-not-yet-settled. depth() + pending() is the size of what
+    // a hard exit would take with it.
+    size_t pending() const;
 
 private:
     struct Entry {
-        uint64_t crc;
+        uint64_t crc;   // 0 while pending: the CRC is settle()'s to compute
+        uint64_t module_id;
+        uint64_t load_ns;
         void *bytes;
         size_t len;
     };
@@ -187,8 +238,11 @@ private:
     const CubinQueueLimits limits_;
 
     mutable std::mutex mu_;
+    std::deque<Entry> pending_;
+    size_t pending_bytes_ = 0;
     std::deque<Entry> q_;
     size_t queued_bytes_ = 0;
+    // settle()'s alone, so it is not under mu_.
     std::unordered_set<uint64_t> interned_;
 
     std::atomic<uint64_t> captured_{0};
@@ -198,6 +252,7 @@ private:
     std::atomic<uint64_t> too_large_{0};
     std::atomic<uint64_t> crc_failed_{0};
     std::atomic<uint64_t> alloc_failed_{0};
+    std::atomic<uint64_t> pending_full_{0};
     std::atomic<uint64_t> sent_{0};
 };
 

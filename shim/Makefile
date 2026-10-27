@@ -329,6 +329,10 @@ nvidia/testdata/cuda_concurrent: nvidia/testdata/cuda_concurrent.cu
 # that the enforcement works, by trying to violate it five ways and requiring
 # every one to be rejected by the compiler.
 #
+# Mode 6 guards the opposite direction (issue #211): capture() takes no CRC
+# function, because the CRC is a guarded CUPTI call and the callback can run
+# on an application thread holding a driver lock the guard's holder needs.
+#
 # Mode 0 is the control and it MUST compile. Without it the whole check would
 # pass just as happily on a file that fails to build for an unrelated reason -
 # a typo, a renamed header - and would then be proving nothing, which is the
@@ -344,17 +348,18 @@ check-cubin-defer: core/cubin_defer_test.cc core/cubinqueue.h
 	  echo "check-cubin-defer: the COMPLIANT capture does not compile; this check would"; \
 	  echo "                   otherwise pass for the wrong reason. Fix core/cubinqueue.h."; \
 	  exit 1; }
-	@rc=0; for m in 1 2 3 4 5; do \
+	@rc=0; for m in 1 2 3 4 5 6; do \
 	  if $(CXX) -std=c++17 -Wall -Werror -I core -fsyntax-only \
 		-DPERFAGENT_CUBIN_DEFER=$$m core/cubin_defer_test.cc 2>/dev/null; then \
-	    echo "check-cubin-defer: deferral mode $$m COMPILED. The vendor's pointer can escape"; \
+	    echo "check-cubin-defer: mode $$m COMPILED. Modes 1-5: the vendor's pointer can escape"; \
 	    echo "                   the callback, so the copy can be deferred past the buffer's"; \
 	    echo "                   lifetime and a late reader gets silently WRONG bytes (spec"; \
-	    echo "                   6.3 finding 2). See core/cubin_defer_test.cc mode $$m."; \
+	    echo "                   6.3 finding 2). Mode 6: the callback can take the CRC, a guarded"; \
+	    echo "                   CUPTI call, which deadlocks (issue #211). See mode $$m."; \
 	    rc=1; \
 	  fi; \
 	done; \
-	[ $$rc -eq 0 ] && echo "check-cubin-defer: OK - the compliant capture compiles, all 5 deferrals do not"; \
+	[ $$rc -eq 0 ] && echo "check-cubin-defer: OK - the compliant capture compiles, all 6 violations do not"; \
 	exit $$rc
 
 # Issue #99's structural assertion, run as a BUILD step for the same reason

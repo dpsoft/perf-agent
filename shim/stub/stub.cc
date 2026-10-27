@@ -95,8 +95,8 @@ static uint64_t mono_ns() {
 //
 // A GPU-free MODULE_LOADED. It reads a checked-in cubin from disk, runs it
 // through the SAME CubinQueue the CUPTI adapter uses -- same capture, same
-// CubinView, same crc-over-the-copy, same drain-thread offer -- and fires
-// gpu_module_load_v1 from inside capture(). That drives the cubin transport
+// CubinView, same crc-over-the-copy, same drain-thread settle and offer --
+// and fires gpu_module_load_v1 from inside settle(). That drives the cubin transport
 // (Task 3), the module store (Task 4), the consumer's decode (Task 7) and the
 // projection's source labels (Task 9) end to end on a machine with no GPU,
 // which is what the phase gate needs.
@@ -133,17 +133,18 @@ static uint64_t stub_cubin_crc(const void *bytes, size_t len) {
 
 static unsigned long g_stub_module_seq = 0;
 
-// Fired by CubinQueue::capture, before the copy is visible to any drain, so
+// Fired by CubinQueue::settle, before the copy is visible to any drain, so
 // bytes_ptr names live adapter-owned bytes at the moment the probe reads it.
 // It is still not a transport: the consumer cannot read another process's
 // address space without CAP_SYS_PTRACE. The bytes go over the cubin channel.
-static void stub_on_cubin_captured(void *ctx, uint64_t crc, const void *bytes, size_t len) {
+static void stub_on_cubin_captured(void *, uint64_t module_id, uint64_t load_ns, uint64_t crc,
+                                   const void *bytes, size_t len) {
     if (!gpu_module_load_v1_enabled()) return;
     gpu_module_load_v1 r{};
     r.cubin_crc = crc;
-    r.module_id = (uint64_t)(uintptr_t)ctx;
+    r.module_id = module_id;
     r.size_bytes = (uint64_t)len;
-    r.load_ns = mono_ns();
+    r.load_ns = load_ns;
     r.bytes_ptr = (uint64_t)(uintptr_t)bytes;
     gpu_module_load_v1_emit(&r, 1, g_stub_module_seq++);
 }
@@ -186,8 +187,7 @@ static unsigned stub_capture_modules(perfagent::CubinQueue &q) {
         }
         const uint64_t crc = stub_cubin_crc(bytes.data(), bytes.size());
         const perfagent::CubinView view(bytes.data(), bytes.size());
-        const bool ok = q.capture(view, stub_cubin_crc, stub_on_cubin_captured,
-                                  (void *)(uintptr_t)(n + 1));
+        const bool ok = q.capture(view, n + 1, mono_ns());
         fprintf(stderr, "stub: module id=%u path=%s size=%zu crc=0x%016llx captured=%s\n",
                 n + 1, path.c_str(), bytes.size(), (unsigned long long)crc,
                 ok ? "yes" : "no");
@@ -281,7 +281,7 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     uint64_t first_exec_ns = 0, last_exec_ns = 0;
 
     // The same queue the CUPTI adapter runs, wired the same way: capture on
-    // the caller's thread, offer on the drain thread.
+    // the caller's thread, settle and offer on the drain thread.
     perfagent::CubinQueue cubins;
     const unsigned cubin_timeout_ms = perfagent::cubin_timeout_ms(2000);
 
@@ -311,9 +311,11 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     drainer.on_tick([&] {
         lb.flush();
         eb.flush();
-        // The offer, on the drain thread and nowhere else. In an application
-        // this is what keeps a connect() and a multi-megabyte handover off
-        // the cuModuleLoad path; here it is what proves that wiring works.
+        // The CRC and the module record, then the offer, on the drain thread
+        // and nowhere else. In an application this is what keeps a guarded
+        // CUPTI call (issue #211), a connect() and a multi-megabyte handover
+        // off the cuModuleLoad path; here it is what proves that wiring works.
+        cubins.settle(stub_cubin_crc, stub_on_cubin_captured, nullptr);
         cubins.drain(perfagent::cubin_offer_to_consumer, cubin_timeout_ms);
         // Late-attach replay: only on the unattached -> attached transition,
         // so an already-attached consumer does not get names re-sent every
@@ -334,13 +336,13 @@ perfagent_stub_run(unsigned launches, unsigned period_us, unsigned sample_period
     drainer.start(100);
 
     // Modules load before kernels run, as they do in a CUDA process. The
-    // capture is synchronous; the offers are not, so wait -- bounded -- for
+    // copy is synchronous; the settle and the offer are not, so wait -- bounded -- for
     // the drain thread to have emptied the queue before the launches start,
     // so a gate can assert on a module the consumer provably already holds.
     const unsigned modules = stub_capture_modules(cubins);
     if (modules) {
         const uint64_t wait_until = mono_ns() + 5000000000ULL;
-        while (cubins.depth() && mono_ns() < wait_until) {
+        while ((cubins.pending() || cubins.depth()) && mono_ns() < wait_until) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }

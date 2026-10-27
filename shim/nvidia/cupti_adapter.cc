@@ -17,6 +17,7 @@
 #include "drain.h"
 #include "enroll.h"
 #include "kernelnames.h"
+#include "nvperfpin.h"
 #include "pcdrain.h"
 #include "pctier.h"
 #include "sampler.h"
@@ -45,6 +46,7 @@
 #include <cstring>
 #include <ctime>
 #include <dlfcn.h>
+#include <link.h>
 #include <mutex>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -568,11 +570,106 @@ constexpr unsigned kPCMaxDrainRounds = 64;
 perfagent::PCSamplingTier g_pc_tier = perfagent::PCSamplingTier::kOff;
 bool g_pc_enabled = false;                // g_pc_tier != kOff
 bool g_pc_tier_a = false;                 // g_pc_tier == kSerialized
-// A setting that named no tier we know, or named two. Counted rather than only
+// A setting that named no tier we know, or named two, or a tier refused
+// because CUPTI's libnvperf_host does not match it (issue #215; the exit
+// report's nvperf= says which). Counted rather than only
 // logged: a startup log line in somebody else's process is routinely swallowed
 // by whatever captures its stderr, and "PC sampling produced nothing" and "PC
 // sampling was refused at startup" must not look the same in the report.
 std::atomic<uint64_t> g_pc_tier_refused{0};
+// What pin_nvperf_host() found (issue #215), for the exit report. It runs
+// only when a tier was selected, so "unchecked" with PC sampling off is normal.
+const char *g_nvperf_pin = "unchecked";
+
+// Make CUPTI's PC sampling call the libnvperf_host that belongs to it.
+//
+// cuptiPCSamplingEnable dlopens "libnvperf_host.so" by name. The CUPTI in the
+// PyTorch wheels has no RUNPATH, so that search ends wherever LD_LIBRARY_PATH
+// or the ldconfig cache points, which on a host with a CUDA toolkit installed
+// is the TOOLKIT's copy. CUPTI 13.0 calling a 13.3 libnvperf_host segfaulted
+// in NVPW_CUDA_LoadDriver, killing the profiled process on every run.
+//
+// A by-name dlopen returns an object already mapped under that soname, so
+// loading the sibling of the libcupti we resolved, now, decides what CUPTI's
+// later dlopen gets. The handle is never closed.
+//
+// Returns false when PC sampling must not run: a different libnvperf_host is
+// already mapped, and nothing can take it back out. Runs at injection time,
+// from InitializeInjection, never from inside a CUPTI callback.
+bool pin_nvperf_host() {
+    static const char kName[] = "libnvperf_host.so";
+    Dl_info info{};
+    if (!dladdr((void *)perfagent::cupti::dyn::table().PCSamplingEnable, &info) ||
+        !info.dli_fname) {
+        g_nvperf_pin = "no-cupti-path";
+        logf("perfagent-cupti: cannot tell where libcupti was loaded from, so %s is not "
+             "checked; CUPTI loads whichever one the loader finds (issue #215)\n", kName);
+        return true;
+    }
+    // The directory libcupti was opened from, then the one it resolves to: a
+    // symlink farm that links libcupti alone still finds the real sibling.
+    char sibling[4096];
+    bool have = perfagent::nvperf_sibling_path(info.dli_fname, kName, sibling, sizeof(sibling)) &&
+                perfagent::NvperfFile::of(sibling).present;
+    if (!have) {
+        if (char *real = realpath(info.dli_fname, nullptr)) {
+            have = perfagent::nvperf_sibling_path(real, kName, sibling, sizeof(sibling)) &&
+                   perfagent::NvperfFile::of(sibling).present;
+            free(real);
+        }
+    }
+    const perfagent::NvperfFile sib =
+        have ? perfagent::NvperfFile::of(sibling) : perfagent::NvperfFile{};
+
+    char loaded_path[4096] = "";
+    perfagent::NvperfFile loaded;
+    if (void *h = dlopen(kName, RTLD_LAZY | RTLD_NOLOAD)) {
+        struct link_map *lm = nullptr;
+        if (dlinfo(h, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name) {
+            snprintf(loaded_path, sizeof(loaded_path), "%s", lm->l_name);
+            loaded = perfagent::NvperfFile::of(loaded_path);
+        }
+        dlclose(h);   // drops only the reference RTLD_NOLOAD took
+        if (!loaded.present) {
+            // Mapped, but not identifiable: treated as foreign, because the
+            // one thing known about it is that we did not choose it.
+            loaded.present = true;
+        }
+    }
+
+    const perfagent::NvperfPin pin = perfagent::nvperf_pin_decide(sib, loaded);
+    g_nvperf_pin = perfagent::nvperf_pin_name(pin);
+    switch (pin) {
+    case perfagent::NvperfPin::kPinSibling:
+        if (!dlopen(sibling, RTLD_LAZY | RTLD_LOCAL)) {
+            const char *why = dlerror();
+            g_nvperf_pin = "pin-failed";
+            logf("perfagent-cupti: cannot load %s (%s). PC SAMPLING IS OFF for this "
+                 "process: CUPTI would load whichever %s the loader finds, and a "
+                 "mismatched one crashes the process (issue #215)\n",
+                 sibling, why ? why : "unknown error", kName);
+            return false;
+        }
+        logf("perfagent-cupti: %s pinned to %s, next to %s\n", kName, sibling, info.dli_fname);
+        return true;
+    case perfagent::NvperfPin::kAlreadyMatched:
+        return true;
+    case perfagent::NvperfPin::kMismatched:
+        logf("perfagent-cupti: %s is already loaded from %s, but the libcupti in use is %s, "
+             "whose own copy is %s. CUPTI's PC sampling calls into the loaded one, and a "
+             "mismatched pair segfaults the process. PC SAMPLING IS OFF for this process. "
+             "To profile it, make the two agree, e.g. LD_PRELOAD=%s (issue #215)\n",
+             kName, loaded_path[0] ? loaded_path : "<unknown>", info.dli_fname, sibling,
+             sibling);
+        return false;
+    case perfagent::NvperfPin::kNoSibling:
+        logf("perfagent-cupti: no %s next to %s, so it is not checked; CUPTI loads "
+             "whichever one the loader finds, and if it comes from another CUDA release, "
+             "PC sampling can crash the process (issue #215)\n", kName, info.dli_fname);
+        return true;
+    }
+    return true;
+}
 uint32_t g_pc_period = 0;                 // the exponent actually in force
 size_t g_pc_collect_num_pcs = kPCDefaultCollectNumPcs;
 size_t g_pc_scratch_bytes = 0;            // 0 = CUPTI's default
@@ -2075,9 +2172,9 @@ void report(const char *why) {
          (unsigned long long)(g_tick_plan ? g_tick_plan->drains() : 0),
          (unsigned long long)(g_tick_plan ? g_tick_plan->skipped() : 0));
     if (!g_pc_enabled) {
-        logf("perfagent-cupti: pc_sampling=off tier_refused=%llu "
+        logf("perfagent-cupti: pc_sampling=off tier_refused=%llu nvperf=%s "
              "(set PERFAGENT_GPU_PC_SAMPLING=continuous or =serialized)\n",
-             (unsigned long long)g_pc_tier_refused.load());
+             (unsigned long long)g_pc_tier_refused.load(), g_nvperf_pin);
         return;
     }
     // Every drop class and every context-enable failure has a counter here,
@@ -2148,7 +2245,7 @@ void report(const char *why) {
                  (unsigned long long)(g_burst ? g_burst->config().burst_ns / 1000000ull : 0));
         }
     }
-    logf("perfagent-cupti: pc %s tier=%s period=%u(=%u cycles) stall_reasons=%zu "
+    logf("perfagent-cupti: pc %s tier=%s nvperf=%s period=%u(=%u cycles) stall_reasons=%zu "
          "ctx_seen=%llu ctx_enabled=%llu ctx_enable_failed=%llu "
          "ctx_destroyed=%llu ctx_disable_failed=%llu "
          "pc_records=%llu pcs=%llu pc_batch_dropped=%llu pc_unattached=%llu "
@@ -2161,7 +2258,7 @@ void report(const char *why) {
          "graph_execs=%llu multi_device=%llu finalize_seen=%llu "
          "finalize_contended=%llu "
          "config_emitted=%llu config_no_device=%llu sm_count=%u clock_hz=%llu\n",
-         why, perfagent::pc_tier_name(g_pc_tier), g_pc_period,
+         why, perfagent::pc_tier_name(g_pc_tier), g_nvperf_pin, g_pc_period,
          (g_pc_period >= kPCPeriodMin && g_pc_period <= kPCPeriodMax) ? (1u << g_pc_period) : 0u,
          g_num_stall_reasons,
          (unsigned long long)g_ctx_seen.load(),
@@ -2574,6 +2671,12 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection(void) 
                  "process; name exactly one of off, continuous, serialized.\n", bad);
             break;
         }
+    }
+    // Before anything reads the tier: a refusal here has to leave PC sampling
+    // as OFF as a refused setting does, not half-configured.
+    if (g_pc_tier != perfagent::PCSamplingTier::kOff && !pin_nvperf_host()) {
+        g_pc_tier = perfagent::PCSamplingTier::kOff;
+        g_pc_tier_refused.fetch_add(1, std::memory_order_relaxed);
     }
     g_pc_enabled = g_pc_tier != perfagent::PCSamplingTier::kOff;
     g_pc_tier_a = g_pc_tier == perfagent::PCSamplingTier::kSerialized;

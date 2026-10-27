@@ -28,7 +28,8 @@
 // The discipline, in one sentence
 // -------------------------------
 // EVERY CUPTI call the adapter initiates goes through a wrapper below, and
-// every wrapper takes the one guard. There is no other way to reach CUPTI from
+// every wrapper but one takes the one guard. The one is the activity flush,
+// which must never be made UNDER the guard; see "The flush" below. There is no other way to reach CUPTI from
 // this adapter: the raw entry points are #defined to identifiers that do not
 // exist, at the bottom of this header, so a call site that skips the guard
 // FAILS TO COMPILE with a message naming the wrapper it should have used.
@@ -50,8 +51,40 @@
 // that is a requirement and not a convenience, and note that every re-entrant
 // acquisition is counted.
 //
-// The one exemption, and its boundary
-// -----------------------------------
+// The flush: the one call that must never be made under the guard (#214)
+// ---------------------------------------------------------------------
+// cuptiActivityFlushAll waits for CUPTI's own pool threads, and those threads
+// take the DRIVER's locks. Meanwhile an application thread can arrive at the
+// guard from inside a CUPTI callback that the driver fires with one of those
+// locks held -- MODULE_UNLOAD_STARTING, whose PC drain may not be skipped, is
+// the one that was measured. Holding the guard across the flush closes the
+// cycle:
+//
+//   application  cuModuleUnload (holds driver rwlock) -> callback -> guard
+//   timer        guard held -> cuptiActivityFlushAll -> waits on CUPTI pool
+//   CUPTI pool   -> driver rwlock
+//
+// It hung 15 of 15 runs of two threads loading and unloading modules under
+// continuous PC sampling. Taking only the flush out from under the guard ran
+// the same program clean 10 of 10, with every unload drained.
+//
+// So the guard's rule is not "every call" but "no thread of ours holds it
+// across a call that waits on CUPTI's workers". The other guarded calls do not
+// wait on them: cupti_pcsampling.h says cuptiPCSamplingGetData "never does
+// device synchronization", and the timer's periodic PC drain under the guard
+// did not hang once in the same runs. The flush is the one that does.
+//
+// The flush therefore runs CONCURRENTLY with an application thread's guarded
+// PC-sampling call. CUPTI does not document that pairing either way; the
+// alternative is a measured permanent hang, and in hindsight #99's trace was
+// this same shape (one of our locks held across a call that needed the driver
+// lock), with the flush as its third party rather than its cause. The wrapper
+// carries the rule in its name and COUNTS a call made while this thread holds
+// the guard, so a future caller that wraps it in a CallScope shows up in the
+// exit report rather than as a hang.
+//
+// The buffer-completed exemption, and its boundary
+// ------------------------------------------------
 // cuptiActivityGetNextRecord and cuptiActivityGetNumDroppedRecords, called
 // from inside CUPTI's own buffer-completed callback, are NOT guarded, and that
 // is deliberate rather than an oversight:
@@ -183,8 +216,16 @@ inline CUptiResult ActivityEnable(CUpti_ActivityKind kind) {
     return dyn::table().ActivityEnable(kind);
 }
 
-inline CUptiResult ActivityFlushAll(uint32_t flag) {
-    CallScope s;
+// NOT guarded, and refused nothing: see "The flush" above. Calling it while
+// this thread holds the guard rebuilds issue #214's deadlock, so that is
+// counted, and the exit report prints the count (which must stay 0).
+inline std::atomic<uint64_t> &flush_under_guard() {
+    static std::atomic<uint64_t> *n = new std::atomic<uint64_t>(0);
+    return *n;
+}
+
+inline CUptiResult ActivityFlushAll_NeverUnderGuard(uint32_t flag) {
+    if (guard().held_by_this_thread()) flush_under_guard().fetch_add(1, std::memory_order_relaxed);
     return dyn::table().ActivityFlushAll(flag);
 }
 
@@ -236,11 +277,12 @@ inline CUptiResult PCSamplingGetStallReasons(CUpti_PCSamplingGetStallReasonsPara
     return dyn::table().PCSamplingGetStallReasons(p);
 }
 
-// ------------------------------------------- the two unguarded exemptions
+// ------------------------------------------- the buffer-completed exemptions
 //
-// Long names on purpose: these are the only two ways into CUPTI in this
-// adapter that do not take the guard, and the name is the warning. See the
-// header comment for why guarding them would rebuild the deadlock.
+// Long names on purpose: these two and ActivityFlushAll_NeverUnderGuard above
+// are the only ways into CUPTI in this adapter that do not take the guard, and
+// the name is the warning. See the header comment for why guarding any of
+// them would rebuild a deadlock.
 
 inline CUptiResult ActivityGetNextRecord_InBufferCompletedOnly(uint8_t *buffer,
                                                                size_t valid_size,
@@ -281,7 +323,7 @@ inline CUptiResult ActivityGetNumDroppedRecords_InBufferCompletedOnly(CUcontext 
 #define cuptiEnableDomain                        PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_EnableDomain
 #define cuptiActivityRegisterCallbacks           PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityRegisterCallbacks
 #define cuptiActivityEnable                      PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityEnable
-#define cuptiActivityFlushAll                    PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityFlushAll
+#define cuptiActivityFlushAll                    PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityFlushAll_NeverUnderGuard
 #define cuptiActivityGetNextRecord               PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityGetNextRecord_InBufferCompletedOnly
 #define cuptiActivityGetNumDroppedRecords        PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_ActivityGetNumDroppedRecords_InBufferCompletedOnly
 #define cuptiPCSamplingEnable                    PERFAGENT_UNGUARDED_CUPTI_CALL_use_perfagent_cupti_PCSamplingEnable

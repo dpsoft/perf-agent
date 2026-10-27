@@ -718,6 +718,11 @@ struct PCContext {
 // ours, and CUPTI's buffer is a single-writer structure. The unload path still
 // BLOCKS rather than trying the lock, because a skipped unload flush is
 // exactly the silent PC-identity corruption this whole path exists to avoid.
+//
+// Blocking there is safe only because the timer never holds the guard across
+// a call that waits on the driver. The unload callback runs with a driver lock
+// held; the activity flush waits on CUPTI threads that need that lock, which
+// is why the flush is the one call made outside the guard (issue #214).
 std::vector<PCContext *> g_pc_ctxs;       // leaked with everything else; see below
 
 perfagent::PCDrainSchedule *g_pc_schedule = nullptr;
@@ -1847,10 +1852,11 @@ void on_resource(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
             // instructions share a PC identity, silently, which is the worst
             // failure available here. So this drains before returning, and it
             // BLOCKS on the CUPTI guard rather than trying it: a skipped flush
-            // is exactly what must not happen. Since #99 the guard covers every
-            // CUPTI call the adapter makes rather than only the PC-sampling
-            // family, so this now waits for an activity flush as well -- one
-            // CUPTI call's duration, on the application's cuModuleUnload path.
+            // is exactly what must not happen. Since #99 the guard covers the
+            // timer's CUPTI calls as well as the PC-sampling family, so this can
+            // wait for one of them -- a GetData or a CRC, never the activity
+            // flush, which would need the driver lock this thread is holding
+            // and is therefore made outside the guard (issue #214).
             g_module_unload_drains.fetch_add(1, std::memory_order_relaxed);
             if (g_pc_schedule)
                 g_pc_schedule->force(mono_ns(), perfagent::PCDrainReason::kModuleUnload);
@@ -2151,15 +2157,18 @@ void report(const char *why) {
     //                      another thread or by its own. MUST be 0 on a healthy
     //                      run; they are the two halves of finalize_contended.
     //   cupti_calls_misplaced  a buffer-completed-only entry point called from
-    //                      outside that callback. MUST be 0: it is the one
-    //                      unguarded hole in the adapter and this is what says
-    //                      nobody widened it.
+    //                      outside that callback. MUST be 0: it is one of the
+    //                      two unguarded holes in the adapter and this is what
+    //                      says nobody widened it.
+    //   cupti_flush_under_guard  the activity flush made while this thread held
+    //                      the guard. MUST be 0: that is issue #214's deadlock,
+    //                      and the other unguarded hole.
     //   timer_ticks/drains/skipped  the merged timer. drains must be about
     //                      ticks * tick_ms / drain_ms; a drains of 0 with ticks
     //                      moving is a drain that silently stopped.
     logf("perfagent-cupti: cupti_calls=%llu cupti_reentrant=%llu cupti_waits=%llu "
          "cupti_try_failed_self=%llu cupti_try_failed_other=%llu cupti_max_depth=%u "
-         "cupti_calls_misplaced=%llu "
+         "cupti_calls_misplaced=%llu cupti_flush_under_guard=%llu "
          "timer_ticks=%llu timer_drains=%llu timer_skipped=%llu\n",
          (unsigned long long)perfagent::cupti::guard().entries(),
          (unsigned long long)perfagent::cupti::guard().reentries(),
@@ -2168,6 +2177,7 @@ void report(const char *why) {
          (unsigned long long)perfagent::cupti::guard().try_failed_other(),
          perfagent::cupti::guard().max_depth(),
          (unsigned long long)perfagent::cupti::misplaced_callback_calls().load(),
+         (unsigned long long)perfagent::cupti::flush_under_guard().load(),
          (unsigned long long)(g_tick_plan ? g_tick_plan->ticks() : 0),
          (unsigned long long)(g_tick_plan ? g_tick_plan->drains() : 0),
          (unsigned long long)(g_tick_plan ? g_tick_plan->skipped() : 0));
@@ -2333,10 +2343,13 @@ void on_tick() {
     // Resample first, so the conversion the flush is about to feed through
     // ClockFit is the freshest offset available.
     resample_clock();
-    // THE call site issue #99 was. It took no lock; it now goes through the
-    // guard like every other, and it cannot be written any other way -- the
-    // raw name does not compile below nvidia/cupti_guard.h.
-    perfagent::cupti::ActivityFlushAll(0);
+    // THE call site issue #99 was, and then issue #214. It must NOT hold the
+    // guard: the flush waits on CUPTI's pool threads, they take driver locks,
+    // and an application thread inside cuModuleUnload holds one of those
+    // while its PC-drain callback waits for the guard. Under the guard this
+    // hung every run of a load/unload loop. See "The flush" in
+    // nvidia/cupti_guard.h; the wrapper counts any call made under the guard.
+    perfagent::cupti::ActivityFlushAll_NeverUnderGuard(0);
     g_lb->flush();
     g_eb->flush();
 
@@ -2486,7 +2499,7 @@ void at_exit_handler() {
     // flush for no reason, and doing it not at all is the undefined state this
     // handler exists to remove.
     on_finalize("exit");
-    perfagent::cupti::ActivityFlushAll(1);
+    perfagent::cupti::ActivityFlushAll_NeverUnderGuard(1);
     if (g_lb) g_lb->flush();
     if (g_eb) g_eb->flush();
     if (g_pcb) g_pcb->flush();

@@ -99,6 +99,10 @@ shim/nvidia/testdata/cuda_workload
 # The CONCURRENT CUDA workload the PC-sampling overhead benchmark is measured
 # against: built by `make -C shim nvidia-concurrent`, same story.
 shim/nvidia/testdata/cuda_concurrent
+# Issue #214's load/unload reproducer and its kernel: built by
+# `make -C shim nvidia-unload`, same story.
+shim/nvidia/testdata/cuda_unload
+shim/nvidia/testdata/cuda_unload_kernel.cubin
 bench/cmd/scenario/scenario
 bench/cmd/report/report
 

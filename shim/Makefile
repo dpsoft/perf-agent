@@ -321,6 +321,48 @@ nvidia/testdata/cuda_concurrent: nvidia/testdata/cuda_concurrent.cu
 	$(NVCC) -O2 -g -lineinfo -arch=$(CUDA_ARCH) \
 		-Xcompiler -fno-omit-frame-pointer -Xcompiler -rdynamic -o $@ $<
 
+# Issue #214's reproducer: two threads loading, launching and unloading a
+# module in a loop. The kernel is a cubin of its own so the host program can
+# load it as often as it likes. -lcuda because it is a driver-API program.
+nvidia-unload: nvidia/testdata/cuda_unload nvidia/testdata/cuda_unload_kernel.cubin
+nvidia/testdata/cuda_unload: nvidia/testdata/cuda_unload.cu
+	$(NVCC) -O2 -g -arch=$(CUDA_ARCH) -o $@ $< -lcuda
+nvidia/testdata/cuda_unload_kernel.cubin: nvidia/testdata/cuda_unload_kernel.cu
+	$(NVCC) -cubin -arch=$(CUDA_ARCH) -o $@ $<
+
+# Hardware only: needs a GPU and CUPTI, so it is not part of `test` or CI.
+#
+# Runs the reproducer under the adapter in both PC tiers, three times each,
+# and fails on a hang (timeout), on a failed exit, on any unload that was not
+# drained, and on any activity flush made under the CUPTI guard. Before the
+# fix, continuous hung every run. SIGTERM only: a CUDA process is never sent
+# SIGKILL from here, because that can leave the GPU needing a reset.
+UNLOAD_ITERS ?= 500
+UNLOAD_RUNS ?= 3
+UNLOAD_TIMEOUT ?= 60
+.PHONY: check-nvidia-unload
+check-nvidia-unload: libperfagent-gpu-nvidia.so nvidia-unload
+	@set -e; log=$$(mktemp /tmp/perfagent-unload.XXXXXX); \
+	want=$$(( 2 * $(UNLOAD_ITERS) )); \
+	for tier in continuous serialized; do \
+	  for run in $$(seq 1 $(UNLOAD_RUNS)); do \
+	    : > $$log; \
+	    if ! CUDA_INJECTION64_PATH=$(CURDIR)/libperfagent-gpu-nvidia.so \
+	        PERFAGENT_GPU_PC_SAMPLING=$$tier PERFAGENT_GPU_LOG=$$log \
+	        timeout -s TERM $(UNLOAD_TIMEOUT) nvidia/testdata/cuda_unload \
+	        nvidia/testdata/cuda_unload_kernel.cubin $(UNLOAD_ITERS) >/dev/null; then \
+	      echo "check-nvidia-unload: FAIL $$tier run $$run: hung or failed (issue #214)"; \
+	      grep -h 'cupti_\|drains_unload' $$log || true; exit 1; \
+	    fi; \
+	    grep -q ' cupti_flush_under_guard=0 ' $$log || { \
+	      echo "check-nvidia-unload: FAIL $$tier run $$run: activity flush made under the guard"; exit 1; }; \
+	    grep -q " module_unload_drains=$$want " $$log || { \
+	      echo "check-nvidia-unload: FAIL $$tier run $$run: want module_unload_drains=$$want"; \
+	      grep -ho 'module_unload_drains=[0-9]*' $$log; exit 1; }; \
+	    echo "check-nvidia-unload: $$tier run $$run ok"; \
+	  done; \
+	done; rm -f $$log
+
 # Task 5's structural assertion, run as a BUILD step rather than asserted in a
 # comment: the copy of a cubin must happen inside the vendor callback, so no
 # deferral may sit between callback entry and the memcpy. core/cubinqueue.h
@@ -472,4 +514,5 @@ clean:
 		stub/so_fpless_bridge.o stub/so_fpless_stub.o \
 		perfagent-gpu-fpless stub/fpless_bridge.o stub/fpless_main.o stub/fpless_stub.o \
 		libperfagent-gpu-nvidia.so nvidia/testdata/cuda_workload \
-		nvidia/testdata/cuda_concurrent
+		nvidia/testdata/cuda_concurrent nvidia/testdata/cuda_unload \
+		nvidia/testdata/cuda_unload_kernel.cubin

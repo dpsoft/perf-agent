@@ -484,7 +484,7 @@ test: check-cubin-defer core/batch_test.cc core/clock_test.cc core/cubin_test.cc
 		-o /tmp/pc_tier_test stub/pc_tier_test.cc stub/stub.cc $(CORE_SRC) && /tmp/pc_tier_test
 
 # Not a prerequisite of `test`: a TSan build is ~10x slower and `test` is the
-# fast path. batch_test.cc's concurrent case asserts emitted + dropped == kAdds,
+# fast path. CI runs it as its own step of the shim-tests job. batch_test.cc's concurrent case asserts emitted + dropped == kAdds,
 # which passes on most runs even with Batch's mutex deleted -- only the
 # sanitizer actually proves the absence of the race. sampler_test.cc's
 # concurrent case is the same shape, for Sampler's atomics.

@@ -50,8 +50,8 @@ CPython 3.12–3.14, including distro builds whose eval loop is split by LTO and
 reachable only through `.gnu_debugdata`. An interpreter it cannot walk is refused
 by name in the log rather than quietly yielding C frames.
 
-> Enrolment is per-PID today: a `--pid` capture walks Python, a system-wide `-a`
-> one does not and says so ([#194](https://github.com/dpsoft/perf-agent/issues/194)).
+> Works with `--pid` and system-wide. In an `-a` capture each Python process is
+> enrolled the first time it is sampled, so its first few samples are native-only.
 
 ## 📊 Hardware-counter performance investigations
 

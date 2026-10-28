@@ -62,13 +62,17 @@ type session struct {
 	// it to attribute an interpreter module's counters to the right profiler.
 	logPrefix string
 	// interpModules are the language unwinders attached to this session's BPF
-	// program, if any. Nil when none is registered, when the verifier refused
-	// the handoff, or in system-wide mode; every method on a nil *Set is a
-	// no-op, so nothing downstream branches on it.
+	// program, if any. Nil when none is registered or when the verifier
+	// refused the handoff; every method on a nil *Set is a no-op, so nothing
+	// downstream branches on it.
 	interpModules *interp.Set
 	// interpEnrolled records whether any module recognised the target at all,
 	// so close() can decide whether its counters are news or noise.
 	interpEnrolled bool
+	// interpLazy enrols interpreter processes as they are first sampled, in
+	// system-wide mode only (issue #194). Nil otherwise; its methods are
+	// no-ops on nil.
+	interpLazy *lazyInterp
 
 	objs             sessionObjs
 	store            *ehmaps.TableStore
@@ -193,24 +197,24 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 	// which is the invariant the whole handoff is built around.
 	var interpSet *interp.Set
 	var interpEnrolled bool
+	var interpLazy *lazyInterp
 	if d, ok := objs.(interp.Driver); ok {
 		set, err := interp.Attach(d)
 		if err != nil {
 			log.Printf("%s: interpreter frames: %v", logPrefix, err)
 		}
 		interpSet = set
-		// System-wide is deliberately not covered yet: enrolling every
-		// interpreter process on a box means one ptrace stop per process at
-		// startup, which wants its own measurement. Named here rather than
-		// left as silence -- see the log line.
-		if systemWide {
-			if interp.Registered() > 0 {
-				log.Printf("%s: interpreter frames: not enrolled in system-wide mode (per-PID only for now); stacks stay native-only", logPrefix)
-			}
-		} else if pid > 0 {
-			interpEnrolled = interpSet.Enroll(uint32(pid), func(format string, args ...any) {
-				log.Printf("%s: "+format, append([]any{logPrefix}, args...)...)
-			})
+		logf := func(format string, args ...any) {
+			log.Printf("%s: "+format, append([]any{logPrefix}, args...)...)
+		}
+		// System-wide enrols each process on its first sample rather than
+		// every process here at startup: see lazyInterp for why, and #194 for
+		// the measurement that made it affordable at all.
+		switch {
+		case systemWide && interpSet != nil:
+			interpLazy = newLazyInterp(interpSet, logf)
+		case !systemWide && pid > 0:
+			interpEnrolled = interpSet.Enroll(uint32(pid), logf)
 		}
 	}
 
@@ -263,6 +267,7 @@ func newSession(objs sessionObjs, pid int, systemWide bool, cpus []uint, tags []
 		logPrefix:        logPrefix,
 		interpModules:    interpSet,
 		interpEnrolled:   interpEnrolled,
+		interpLazy:       interpLazy,
 		tags:             tags,
 		labels:           labels,
 		objs:             objs,
@@ -321,6 +326,7 @@ func (s *session) runTracker() {
 					s.resolver.Invalidate(ev.PID)
 				}
 			}
+			s.interpLazy.observe(ev)
 		}
 		s.tracker.Run(ctx, s.watcher, observer)
 	}()
@@ -373,6 +379,7 @@ func (s *session) consumeRingbuf(agg aggregator) {
 		if len(sample.PCs) == 0 {
 			continue
 		}
+		s.interpLazy.sampled(sample.PID)
 		// Kernel-stack lookup gated on the BPF-set stack-ID. The
 		// kern_stackmap is shared across all CPUs / samples; the
 		// stack-ID identifies a unique IP chain inside the kernel
@@ -522,7 +529,10 @@ func (s *session) close() error {
 	// One last reading of every attached module's counters before the maps go
 	// away with the BPF handle: after objs.Close() they are gone, and a run
 	// that walked nothing is exactly the run whose counters need reporting.
-	s.interpModules.LogCounters(s.interpEnrolled, func(format string, args ...any) {
+	// The lazy enroller first: an enrolment in flight writes into the
+	// module's maps, which Close below releases.
+	s.interpLazy.close()
+	s.interpModules.LogCounters(s.interpEnrolled || s.interpLazy.recognisedAny(), func(format string, args ...any) {
 		log.Printf("%s: "+format, append([]any{s.logPrefix}, args...)...)
 	})
 	_ = s.interpModules.Close()

@@ -380,6 +380,90 @@ func TestPythonFramesInterleavedWithNative(t *testing.T) {
 	pythonGateOutcome.Store("ran")
 }
 
+// TestPythonFramesSystemWide is the same workload under a system-wide `-a`
+// capture, which used to enrol no interpreter at all (#194). There the agent
+// is not told which process is Python: it has to find this one among
+// everything on the box, on its first sample, and then walk it.
+//
+// The frames are matched by this workload's code-object addresses, so another
+// Python process on the machine cannot satisfy it.
+func TestPythonFramesSystemWide(t *testing.T) {
+	agentPath := getAgentPath(t)
+	if !bpfRunnable(agentPath) {
+		if os.Getenv(requireWalkEnv) != "" {
+			t.Fatalf("%s is set, but BPF is not runnable here", requireWalkEnv)
+		}
+		t.Skip("requires root, CAP_BPF in the test process, or a setcap'd perf-agent")
+	}
+
+	workload, codes := startPythonFixture(t, 40)
+	pid := uint32(workload.Process.Pid)
+	requireWalkableInterpreter(t, pid)
+
+	out := filepath.Join(t.TempDir(), "python-walk-a.pb.gz")
+	agent := exec.Command(agentPath,
+		"--profile", "--unwind", "dwarf", "-a",
+		"--duration", "10s",
+		"--sample-rate", "199",
+		"--profile-output", out)
+	var agentLog bytes.Buffer
+	agent.Stdout = &agentLog
+	agent.Stderr = &agentLog
+	require.NoError(t, agent.Run(), "agent run failed:\n%s", agentLog.String())
+	logText := agentLog.String()
+
+	attached := fmt.Sprintf("python frames: pid %d: attached", pid)
+	require.Containsf(t, logText, attached,
+		"the system-wide capture never enrolled the workload (pid %d):\n%s", pid, logText)
+	require.NotContainsf(t, logText, fmt.Sprintf("pid %d: REFUSED", pid),
+		"the agent refused this interpreter after requireWalkableInterpreter found it walkable:\n%s", logText)
+	require.Contains(t, logText, "interpreter frames (system-wide): looked at",
+		"no system-wide enrolment summary line")
+
+	prof := parseProfile(t, out)
+	want := map[uint64]string{}
+	for name, addr := range codes {
+		want[addr] = name
+	}
+	seenFuncs := map[string]int{}
+	pythonFrames := 0
+	var matching []*profile.Sample
+	defects := map[string]*profile.Sample{}
+	for _, s := range prof.Sample {
+		names := sampleFrameNames(s)
+		for _, name := range names {
+			if fn, ok := pythonFuncName(name, want); ok && fn != "" {
+				pythonFrames++
+				seenFuncs[fn]++
+			}
+		}
+		if _, ok := pythonOrderIn(names, codes); !ok {
+			continue
+		}
+		matching = append(matching, s)
+		for _, d := range pythonSampleDefects(names, codes) {
+			if _, seen := defects[d]; !seen {
+				defects[d] = s
+			}
+		}
+	}
+	// The first samples of the workload precede its enrolment and are
+	// native-only by design; the bound is on the rest of the window.
+	require.Greaterf(t, pythonFrames, 20,
+		"only %d of this workload's Python frames in a system-wide capture.\nagent log:\n%s", pythonFrames, logText)
+	for _, name := range append(append([]string{}, pythonInnerSegment...), pythonOuterSegment...) {
+		require.Containsf(t, seenFuncs, name, "no frame carried %s's code object (%#x); frames seen: %v",
+			name, codes[name], seenFuncs)
+	}
+	require.NotEmptyf(t, matching, "no sample carried the full interleaved sequence %v -> <native> -> %v",
+		pythonInnerSegment, pythonOuterSegment)
+	for d, sample := range defects {
+		t.Errorf("%s\n%s", d, renderSample(sample))
+	}
+	t.Logf("system-wide: %d of this workload's Python frames, %d samples with both segments",
+		pythonFrames, len(matching))
+}
+
 // pythonSampleDefects reports everything wrong with one walked stack,
 // leaf-first, given the workload's code-object addresses. An empty result
 // means the stack is the one the design promises.

@@ -32,10 +32,11 @@
     --tag service=api
 ```
 
-Python frames need no extra flag — a `--pid` capture walks the interpreter's
-frame chain on CPython 3.12-3.14. Enrolment is per-PID today: a system-wide `-a`
-capture does not walk Python, and says so
-([#194](https://github.com/dpsoft/perf-agent/issues/194)).
+Python frames need no extra flag — a capture walks the interpreter's frame
+chain on CPython 3.12-3.14, with `--pid` or system-wide. A system-wide `-a`
+capture enrols each Python process the first time it samples it, so that
+process's first samples are native-only and the rest carry Python frames.
+Processes that are never sampled are never stopped.
 
 ## GPU
 

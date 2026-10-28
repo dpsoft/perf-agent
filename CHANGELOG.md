@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Python frames in system-wide captures** ([#194](https://github.com/dpsoft/perf-agent/issues/194)).
+  An `-a` capture used to enrol no interpreter, so every Python process in it
+  had native-only stacks. It now enrols each CPython process the first time it
+  is sampled, on a background goroutine off the sample path. A process that is
+  never sampled is never stopped, and one sampled before it execs into Python
+  is looked at again after the exec. Its first samples, taken before
+  enrolment, stay native-only. A shutdown line reports how many sampled
+  processes were looked at and how many a module recognised.
+
 ## [1.3.0] - 2026-10-09
 
 The GPU and Python release. perf-agent can now attribute CUDA kernel time to the

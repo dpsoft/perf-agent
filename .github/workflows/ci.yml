@@ -347,9 +347,9 @@ jobs:
   # wrong register name, a wrong .note.stapsdt descriptor, or a missing
   # instruction-cache flush all FAIL here; none of them fail a build.
   #
-  # Needs no CUDA, no CUPTI and no GPU -- just g++ -- which is what makes it
-  # runnable on a native arm64 runner and therefore what makes the aarch64
-  # port verifiable at all.
+  # Needs no CUDA, no CUPTI and no GPU -- just g++ and clang -- which is what
+  # makes it runnable on a native arm64 runner and therefore what makes the
+  # aarch64 port verifiable at all.
   shim-tests:
     name: Shim tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -365,11 +365,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # clang for test-tsan: GCC's TSan runtime is a separate package, while
+      # Ubuntu's clang pulls its own (libclang-rt-18-dev) in as a dependency.
       - name: Install a compiler
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++ make
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq g++ clang make
 
       - name: Run the shim test suite
         run: make -C shim test
+
+      # The concurrency tests under ThreadSanitizer. For these the sanitizer IS
+      # the assertion: batch_test's concurrent case prints OK with Batch's
+      # mutex deleted, and only TSan's report fails it. A report makes the
+      # test binary exit non-zero, which fails make and this step.
+      - name: Run the shim concurrency tests under ThreadSanitizer
+        run: make -C shim test-tsan
 
   shim:
     name: GPU shim (portability gate, ${{ matrix.arch }})

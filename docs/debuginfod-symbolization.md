@@ -2,11 +2,18 @@
 
 `perf-agent` integrates with the [debuginfod](https://sourceware.org/elfutils/Debuginfod.html)
 protocol to resolve symbols from stripped production binaries. Pass
-`--debuginfod-url=URL` (or set `DEBUGINFOD_URLS`) and the agent fetches
-DWARF debug info and/or ELF executables on demand, keyed by GNU build-id,
-and caches them on disk beside the local blazesym resolution path.
-Without `--debuginfod-url` the feature is entirely off — no HTTP, no
-cache, no change to existing behavior.
+`--debuginfod-url=URL`, or `--debuginfod` to use the servers in
+`DEBUGINFOD_URLS`, and the agent fetches DWARF debug info and/or ELF
+executables on demand, keyed by GNU build-id, and caches them on disk beside
+the local blazesym resolution path. Without one of those flags the feature is
+entirely off — no HTTP, no cache.
+
+**`DEBUGINFOD_URLS` alone does not turn it on.** Distributions set that
+variable for you (Fedora does), and fetching during a capture is paid for in
+the foreground: measured against `debuginfod.fedoraproject.org`, 6–15 s
+system-wide captures spent 13–33 s symbolizing, most of it on debuginfo too
+large to arrive within the fetch timeout (167 MB for Mesa's `libgallium`). When
+the variable is set and ignored, the agent says so in one line at startup.
 
 ---
 
@@ -51,8 +58,8 @@ perf-agent --profile --pid <PID> --duration 10s \
 
 The agent fetches DWARF or the full ELF on the first collection cycle and
 caches the result. Subsequent runs reuse the cached artifact (Case 1 in the
-dispatcher). With no `--debuginfod-url` and no `DEBUGINFOD_URLS` env var,
-the agent uses the local blazesym path unchanged.
+dispatcher). With neither `--debuginfod-url` nor `--debuginfod`, the agent
+uses the local blazesym path unchanged.
 
 ---
 
@@ -121,16 +128,18 @@ a populated cache from a previous run, even if the SQLite index was lost.
 
 ## Configuration
 
-| Flag | Env var fallback | Default | Notes |
+| Flag | Env var | Default | Notes |
 |---|---|---|---|
-| `--debuginfod-url=URL` | `DEBUGINFOD_URLS` (space-separated) | unset (feature off) | Repeatable; ordered list, first 200 wins, 404 falls through to next. |
+| `--debuginfod-url=URL` | — | unset (feature off) | Repeatable; ordered list, first 200 wins, 404 falls through to next. Takes precedence over `--debuginfod`. |
+| `--debuginfod` | `DEBUGINFOD_URLS` (space-separated; non-URL tokens such as `ima:enforcing` are skipped) | `false` | Use the servers the variable names. Without this flag the variable is ignored. |
+| `--no-debuginfod` | — | `false` | Never fetch. Combining it with `--debuginfod` or `--debuginfod-url` is an error. |
 | `--symbol-cache-dir=DIR` | — | `/tmp/perf-agent-debuginfod` | |
 | `--symbol-cache-max=BYTES` | — | `2147483648` (2 GiB) | LRU eviction cap. |
-| `--symbol-fetch-timeout=DUR` | — | `30s` | Per-artifact HTTP timeout. |
+| `--symbol-fetch-timeout=DUR` | — | `5s` | Per-artifact HTTP timeout, transfer included. Connecting is bounded separately at 1.5 s. |
 | `--symbol-fail-closed` | — | `false` | Reserved for M2. The flag is parsed and reaches the symbolizer as `Options.FailClosed`, but nothing reads that field yet. |
 
-When `--debuginfod-url` is unset and `DEBUGINFOD_URLS` is empty, the agent
-uses the local blazesym resolution path (no HTTP, no cache).
+When neither `--debuginfod-url` nor `--debuginfod` is given, the agent uses
+the local blazesym resolution path (no HTTP, no cache).
 
 ---
 
@@ -165,7 +174,7 @@ The source endpoint (`GET /buildid/<hex>/source/<path>`) is not used.
 ## Public debuginfod servers
 
 Several distributions run public debuginfod servers you can point at
-directly via `--debuginfod-url` or `DEBUGINFOD_URLS`:
+directly via `--debuginfod-url`, or via `DEBUGINFOD_URLS` with `--debuginfod`:
 
 - **`https://debuginfod.elfutils.org/`** — the upstream federation hub
   maintained by the elfutils project. Federates to distro servers and is

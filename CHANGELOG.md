@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrolment, stay native-only. A shutdown line reports how many sampled
   processes were looked at and how many a module recognised.
 
+### Changed
+
+- **`DEBUGINFOD_URLS` no longer turns on network symbolization by itself**
+  ([#111](https://github.com/dpsoft/perf-agent/issues/111)). Pass `--debuginfod` to fetch from the servers it names,
+  or `--debuginfod-url=URL` as before. Distributions set the variable for users
+  who never asked a capture to wait on downloads (Fedora ships it), and the
+  wait is real: 6–15 s system-wide captures spent 13–33 s symbolizing against
+  `debuginfod.fedoraproject.org`. When the variable is set and ignored, a
+  startup line says so. Library callers: `WithDebuginfodFromEnv()` is the
+  equivalent option.
+
+  **If you relied on the variable alone, add `--debuginfod`.**
+
 ### Fixed
 
 - **Symbolization on distributions that ship MiniDebugInfo** ([#220](https://github.com/dpsoft/perf-agent/issues/220)).
@@ -45,8 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a 404 is logged once per build-id with the binary's path. A timeout gets a
     hint: a large debuginfo file (Mesa's `libgallium`, 167 MB) cannot arrive
     within the 5 s default on a slow link, and is cut off on every capture.
-  - The startup notice suggested `--debuginfod-urls=''`, which does not exist;
-    it now names `--no-debuginfod`.
+- **`--no-debuginfod` did nothing** ([#111](https://github.com/dpsoft/perf-agent/issues/111)).
+  It set an option that nothing read, so a capture with it still fetched from
+  `DEBUGINFOD_URLS`. It now always wins, and combining it with `--debuginfod`
+  or `--debuginfod-url` is an error.
 
 ## [1.3.0] - 2026-10-09
 

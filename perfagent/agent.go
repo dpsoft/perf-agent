@@ -206,9 +206,6 @@ func (a *Agent) pidLogStr(hostPID int) string {
 	return fmt.Sprintf("%d (host: %d)", a.config.PID, hostPID)
 }
 
-// chooseSymbolizer constructs the agent-owned symbolizer. If DebuginfodURLs
-// is non-empty (or the DEBUGINFOD_URLS env var is set), a Debuginfod
-// symbolizer is returned; otherwise the local blazesym symbolizer is used.
 // debuginfodURLsFromEnv extracts the server URLs from a DEBUGINFOD_URLS value.
 //
 // The variable is whitespace-separated, but it is NOT only URLs. elfutils'
@@ -237,10 +234,46 @@ func debuginfodURLsFromEnv(env string) []string {
 	return urls
 }
 
+// debuginfodServers decides which debuginfod servers a capture fetches from,
+// given the value of DEBUGINFOD_URLS. ignored is what the environment named
+// but the capture will not use, so the caller can say so.
+//
+// Network symbolization is opt-in (issue #111). DEBUGINFOD_URLS alone does not
+// turn it on, because the variable is usually set by the distribution rather
+// than the user -- Fedora ships it -- and a capture that fetches pays for it in
+// the foreground: measured against debuginfod.fedoraproject.org, 6-15s
+// system-wide captures spent 13-33s symbolizing, most of it on debuginfo too
+// large to arrive within the fetch timeout (167MB for Mesa's libgallium),
+// which is therefore cut off and refetched on every capture. Other profiling
+// agents do not fetch at capture time at all: Parca's and OpenTelemetry's
+// leave symbolization to their server, and perf reads debuginfod at report
+// time, not while recording.
+//
+// So: --no-debuginfod beats everything, explicit URLs come next, and the
+// environment is consulted only when the caller asked for it.
+func debuginfodServers(cfg *Config, env string) (use, ignored []string) {
+	switch {
+	case cfg.DisableDebuginfod:
+		return nil, nil
+	case len(cfg.DebuginfodURLs) > 0:
+		return cfg.DebuginfodURLs, nil
+	case cfg.DebuginfodFromEnv:
+		return debuginfodURLsFromEnv(env), nil
+	default:
+		return nil, debuginfodURLsFromEnv(env)
+	}
+}
+
 func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (symbolize.Symbolizer, error) {
-	urls := cfg.DebuginfodURLs
-	if len(urls) == 0 {
-		urls = debuginfodURLsFromEnv(os.Getenv("DEBUGINFOD_URLS"))
+	urls, ignored := debuginfodServers(cfg, os.Getenv("DEBUGINFOD_URLS"))
+	switch {
+	case len(ignored) > 0:
+		log.Printf("perf-agent: DEBUGINFOD_URLS names %s, not used: symbolizing from "+
+			"local files. Pass --debuginfod to fetch debug info from it, which can "+
+			"take far longer than the capture itself", strings.Join(ignored, " "))
+	case len(urls) == 0 && cfg.DebuginfodFromEnv && !cfg.DisableDebuginfod:
+		log.Printf("perf-agent: --debuginfod was given but DEBUGINFOD_URLS names no " +
+			"http(s) server; symbolizing from local files")
 	}
 	if len(urls) == 0 {
 		// res names the module behind an address blazesym could not resolve
@@ -261,13 +294,10 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 	// long a capture takes and it was previously silent. Measured on a
 	// workstation: the same 5s system-wide capture took 6.4s with the local
 	// symbolizer and 87s with debuginfod reachable, with nothing in the
-	// output to say why (issue #109). DEBUGINFOD_URLS is set by default on
-	// several distributions, so this is on for many users who never asked.
+	// output to say why (issue #109).
 	log.Printf("perf-agent: debuginfod symbolization ENABLED (%d server(s): %s). "+
 		"Debug info is fetched over the network on first contact with each "+
-		"unknown build-id, which can take far longer than the capture itself; "+
-		"pass --no-debuginfod (or unset DEBUGINFOD_URLS) to use local "+
-		"symbols only",
+		"unknown build-id, which can take far longer than the capture itself",
 		len(urls), strings.Join(urls, " "))
 	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
 	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))

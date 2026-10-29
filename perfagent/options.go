@@ -145,20 +145,20 @@ type Config struct {
 	LabelEnricherSet bool
 
 	// DebuginfodURLs is the ordered list of debuginfod servers to consult for
-	// off-box DWARF/executable fetching. If empty (and DEBUGINFOD_URLS env is
-	// also empty), the agent uses the local symbolizer.
+	// off-box DWARF/executable fetching. Setting it turns network
+	// symbolization on; see DebuginfodFromEnv for the environment.
 	DebuginfodURLs []string
 
-	// DisableDebuginfod suppresses network symbolization even when
-	// DEBUGINFOD_URLS is set in the environment.
+	// DebuginfodFromEnv fetches from the servers DEBUGINFOD_URLS names, when
+	// DebuginfodURLs is empty.
 	//
-	// It exists because several distributions set that variable for you --
-	// Fedora ships DEBUGINFOD_URLS pointing at its own server -- so on those
-	// machines a capture fetches debug info over the network without anyone
-	// having asked. Honouring the variable is the right default (gdb, perf,
-	// elfutils and delve all read it, and it is what a user who set it
-	// deliberately expects), but declining has to be possible without
-	// editing the environment. Issue #111.
+	// Off by default: the variable is usually set by the distribution, not the
+	// user (Fedora ships it), and fetching during a capture costs foreground
+	// latency the user never chose. See debuginfodServers. Issue #111.
+	DebuginfodFromEnv bool
+
+	// DisableDebuginfod suppresses network symbolization entirely, beating
+	// both DebuginfodURLs and DebuginfodFromEnv.
 	DisableDebuginfod bool
 
 	// SymbolCacheDir overrides the debuginfod cache directory.
@@ -168,7 +168,7 @@ type Config struct {
 	// SymbolCacheMaxBytes overrides the debuginfod cache size cap. Default: 2 GiB.
 	SymbolCacheMaxBytes int64
 
-	// SymbolFetchTimeout overrides per-artifact fetch timeout. Default: 30s.
+	// SymbolFetchTimeout overrides per-artifact fetch timeout. Default: 5s.
 	SymbolFetchTimeout time.Duration
 
 	// SymbolFailClosed makes the agent refuse to symbolize a mapping whose
@@ -428,12 +428,15 @@ func WithDebuginfodURL(url string) Option {
 	}
 }
 
-// WithoutDebuginfod symbolizes from local files only, ignoring both
-// WithDebuginfodURL and the DEBUGINFOD_URLS environment variable.
-//
-// The environment is what makes this necessary rather than merely
-// convenient: on a distribution that sets DEBUGINFOD_URLS for you, there is
-// otherwise no way to decline from the command line. Issue #111.
+// WithDebuginfodFromEnv fetches debug info from the servers named by the
+// DEBUGINFOD_URLS environment variable, which is otherwise ignored.
+// WithDebuginfodURL, if also given, takes precedence. Issue #111.
+func WithDebuginfodFromEnv() Option {
+	return func(c *Config) { c.DebuginfodFromEnv = true }
+}
+
+// WithoutDebuginfod symbolizes from local files only, ignoring
+// WithDebuginfodURL and WithDebuginfodFromEnv.
 func WithoutDebuginfod() Option {
 	return func(c *Config) { c.DisableDebuginfod = true }
 }

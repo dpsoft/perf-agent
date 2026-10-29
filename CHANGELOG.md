@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by another user need `cap_dac_read_search` (or root) to open
   `/proc/<pid>/map_files`; the log line says so, and
   [requirements](docs/requirements.md) documents the capability as optional.
+- **debuginfod: a distant server is no longer refused as unreachable, and
+  failed fetches are visible** ([#111](https://github.com/dpsoft/perf-agent/issues/111)).
+  - The connect bound added in 1.3.0 was 300 ms, which is less than one TCP
+    SYN retransmit (1 s). It refused debuginfod.fedoraproject.org, which
+    connected in 180–360 ms from the workstation measured. It is now 1.5 s, so a
+    blackholed network still fails in 1.5 s rather than the 5 s fetch timeout.
+  - The summary line always printed `fetches ok=0 404=0 err=0 bytes=0MB` for
+    debuginfo, because the code path that fetches it never updated those
+    counters. It now does, and each fetch that fails for a reason other than
+    a 404 is logged once per build-id with the binary's path. A timeout gets a
+    hint: a large debuginfo file (Mesa's `libgallium`, 167 MB) cannot arrive
+    within the 5 s default on a slow link, and is cut off on every capture.
+  - The startup notice suggested `--debuginfod-urls=''`, which does not exist;
+    it now names `--no-debuginfod`.
 
 ## [1.3.0] - 2026-10-09
 

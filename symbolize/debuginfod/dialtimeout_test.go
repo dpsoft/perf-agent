@@ -12,15 +12,16 @@ import (
 // but slow has to keep the whole FetchTimeout to answer in.
 //
 // This is the regression that would make the fix a net loss. Bounding the dial
-// at 300ms is only defensible because it bounds reachability and nothing else;
-// if it also capped the transfer, every debuginfo file that takes longer than
-// 300ms to arrive -- which is most of them, they are tens of megabytes -- would
-// start failing, and the profile would lose source detail it used to have.
+// separately is only defensible because it bounds reachability and nothing
+// else; if it also capped the transfer, every debuginfo file that takes longer
+// than DialTimeout to arrive -- which is most of them, they are tens of
+// megabytes -- would start failing, and the profile would lose source detail it
+// used to have.
 //
 // Local and deterministic, unlike the unreachable case: see the note on
 // TestDialTimeoutIsShorterThanTheFetchBudget.
 func TestASlowButReachableServerKeepsTheFullFetchBudget(t *testing.T) {
-	const serverDelay = 4 * DialTimeout // comfortably past the dial bound
+	const serverDelay = DialTimeout + time.Second // past the dial bound, inside the fetch budget
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(serverDelay)
@@ -71,7 +72,7 @@ func TestAUserSuppliedClientIsNotOverridden(t *testing.T) {
 // The default client must carry a transport with a dial bound at all, and the
 // bound must be well under the fetch budget or it is not a separate limit.
 //
-// The behaviour this exists for -- an unreachable server failing at ~300ms
+// The behaviour this exists for -- an unreachable server failing at DialTimeout
 // instead of stalling for the full 5s -- is deliberately NOT tested here.
 // Arranging it needs an address whose SYN is silently dropped, which is a
 // property of the network the test runs on rather than of this code: on a
@@ -80,7 +81,7 @@ func TestAUserSuppliedClientIsNotOverridden(t *testing.T) {
 // against http://192.0.2.1 (TEST-NET-1):
 //
 //	before   5.004s   (context deadline exceeded, the full FetchTimeout)
-//	after      301ms  (dial timeout)
+//	after      301ms  (dial timeout, when DialTimeout was 300ms)
 func TestDialTimeoutIsShorterThanTheFetchBudget(t *testing.T) {
 	opts := Options{URLs: []string{"http://example.invalid"}, CacheDir: t.TempDir()}
 	if err := opts.validate(); err != nil {
@@ -100,7 +101,10 @@ func TestDialTimeoutIsShorterThanTheFetchBudget(t *testing.T) {
 		t.Errorf("DialTimeout (%s) is not shorter than FetchTimeout (%s), so it is not a separate bound",
 			DialTimeout, opts.FetchTimeout)
 	}
-	if DialTimeout <= 0 {
-		t.Errorf("DialTimeout is %s; a non-positive dial bound fails every connection", DialTimeout)
+	// The initial TCP retransmission timeout is 1s (RFC 6298). A dial bound at
+	// or under it refuses any server whose first SYN is lost, which is how the
+	// original 300ms bound refused a reachable debuginfod.fedoraproject.org.
+	if DialTimeout <= time.Second {
+		t.Errorf("DialTimeout is %s; it cannot outlast a single SYN retransmit (1s initial RTO)", DialTimeout)
 	}
 }

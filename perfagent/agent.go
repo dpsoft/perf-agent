@@ -266,7 +266,7 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 	log.Printf("perf-agent: debuginfod symbolization ENABLED (%d server(s): %s). "+
 		"Debug info is fetched over the network on first contact with each "+
 		"unknown build-id, which can take far longer than the capture itself; "+
-		"unset DEBUGINFOD_URLS or pass --debuginfod-urls='' to use local "+
+		"pass --no-debuginfod (or unset DEBUGINFOD_URLS) to use local "+
 		"symbols only",
 		len(urls), strings.Join(urls, " "))
 	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")

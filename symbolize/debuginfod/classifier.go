@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -175,8 +177,14 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		c.markNegFetch(buildID)
 		if c.stats != nil {
 			c.stats.fileModeFetchFails.Add(1)
+			c.stats.noteFetchErr(err)
 		}
+		noteFetchFailure(m.Path, buildID, err)
 		return classifyResult{route: routeProcessMode}
+	}
+	if c.stats != nil {
+		c.stats.fetchSuccessDebuginfo.Add(1)
+		c.stats.noteFetched(abs)
 	}
 
 	// Newly fetched. Check badDebug in case the same signature was
@@ -313,6 +321,34 @@ func (c *classifier) isBadDebug(sig pathSig) bool {
 		return false
 	}
 	return true
+}
+
+// noteFetchFailure logs a debuginfo fetch that failed for a reason other
+// than the server not having it.
+//
+// It used to be silent, and the summary line could not show it either: this
+// path never touched the fetch counters, so a capture that lost five 5s
+// fetches printed "fetches ok=0 404=0 err=0". Measured against
+// debuginfod.fedoraproject.org, the failure is not the server: a 21MB
+// libpython or 33MB libgtk debuginfo takes 2-5s or more to TRANSFER, and the
+// fetch timeout cuts it off part-way, discards what arrived, and leaves the
+// build-id to fail the same way on the next capture. Issue #111.
+//
+// Once per build-id per negFetchTTL, because markNegFetch already stops the
+// retry for that long. A 404 is not logged: it is the expected answer for
+// any binary the distribution did not build, and it is counted.
+func noteFetchFailure(path, buildID string, err error) {
+	if errors.Is(err, ErrNotFound) {
+		return
+	}
+	hint := ""
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+		hint = "; a larger --symbol-fetch-timeout lets it finish"
+	}
+	log.Printf("debuginfod: fetching debuginfo for %s (build-id %s) failed: %v; "+
+		"symbolizing it from the binary alone, not retried for %v%s",
+		path, buildID, err, negFetchTTL, hint)
 }
 
 func (c *classifier) markNegFetch(buildID string) {

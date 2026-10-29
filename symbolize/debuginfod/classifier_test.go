@@ -1,10 +1,12 @@
 package debuginfod
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/dpsoft/perf-agent/symbolize/debuginfod/cache"
@@ -330,4 +332,52 @@ func writeStrippedELFWithBuildID(t *testing.T, path, buildIDHex string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// A debuginfo fetch from the classifier must reach the fetch counters.
+//
+// It did not: the classifier is the only path that fetches debuginfo, and it
+// touched fileModeFetchFails alone, so the summary line printed
+// "fetches ok=0 404=0 err=0 bytes=0MB" while 225MB sat in the cache and five
+// fetches per capture timed out. Issue #111.
+func TestClassifierFetchesReachTheFetchCounters(t *testing.T) {
+	const payload = 4096
+	fetched := filepath.Join(t.TempDir(), "fetched.debug")
+	if err := os.WriteFile(fetched, make([]byte, payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name                      string
+		err                       error
+		wantOK, want404, wantErr  uint64
+		wantBytes, wantFetchFails uint64
+	}{
+		{name: "fetched", wantOK: 1, wantBytes: payload},
+		{name: "not on the server", err: ErrNotFound, want404: 1, wantFetchFails: 1},
+		{name: "timed out", err: context.DeadlineExceeded, wantErr: 1, wantFetchFails: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			binPath := writeStrippedELFWithBuildID(t, filepath.Join(t.TempDir(), "exe"), strings.Repeat("d", 40))
+			st := &atomicStats{}
+			f := &fakesfFetcher{fetch: func(context.Context, string, string) (string, error) {
+				if tc.err != nil {
+					return "", tc.err
+				}
+				return fetched, nil
+			}}
+			c := newClassifier(nil, f, st)
+			c.systemDebugRoot = t.TempDir() // no local debuginfo, so it fetches
+			c.classify(t.Context(), procmap.Mapping{Path: binPath})
+
+			got := st.snapshot()
+			if got.FetchSuccessDebuginfo != tc.wantOK || got.Fetch404s != tc.want404 ||
+				got.FetchErrors != tc.wantErr || got.FetchBytesTotal != tc.wantBytes ||
+				got.FileModeFetchFails != tc.wantFetchFails {
+				t.Errorf("ok=%d 404=%d err=%d bytes=%d fetch_fails=%d, want ok=%d 404=%d err=%d bytes=%d fetch_fails=%d",
+					got.FetchSuccessDebuginfo, got.Fetch404s, got.FetchErrors, got.FetchBytesTotal, got.FileModeFetchFails,
+					tc.wantOK, tc.want404, tc.wantErr, tc.wantBytes, tc.wantFetchFails)
+			}
+		})
+	}
 }

@@ -101,7 +101,6 @@ import "C"
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime/cgo"
 	"sync/atomic"
@@ -242,10 +241,11 @@ func (s *Symbolizer) dispatchWithBuildID(ctx context.Context, symbolicPath, buil
 	s.stats.cacheMisses.Add(1)
 	abs, err := s.sf.fetchAndStore(ctx, "executable", buildID)
 	if err != nil {
-		s.recordFetchErr(err)
+		s.stats.noteFetchErr(err)
 		return ""
 	}
 	s.stats.fetchSuccessExecutable.Add(1)
+	s.stats.noteFetched(abs)
 	return abs
 }
 
@@ -260,17 +260,6 @@ func (s *Symbolizer) localResolutionPossible(path, buildID string) bool {
 		return true
 	}
 	return false
-}
-
-func (s *Symbolizer) recordFetchErr(err error) {
-	if err == nil {
-		return
-	}
-	if errors.Is(err, ErrNotFound) {
-		s.stats.fetch404s.Add(1)
-		return
-	}
-	s.stats.fetchErrors.Add(1)
 }
 
 // cgoState bundles the C-side handles whose lifetimes track the Symbolizer.

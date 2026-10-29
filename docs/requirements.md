@@ -13,6 +13,7 @@
 | `cap_sys_ptrace` | Read `/proc/<pid>/maps` and `/proc/<pid>/mem` of the target |
 | `cap_checkpoint_restore` | Follow `/proc/<pid>/map_files/` symlinks during symbolization |
 | `cap_sys_admin` | Only on kernels older than 5.8/5.9 — see below |
+| `cap_dac_read_search` | Optional: symbolize processes owned by **other users** — see below |
 
 `cap_checkpoint_restore` (or `cap_sys_admin`) is **required, not optional**.
 blazesym reaches the file behind every mapping through
@@ -20,6 +21,19 @@ blazesym reaches the file behind every mapping through
 symlinks without one of the two — so without it every user-space frame in a
 profile is a bare hex address. perf-agent checks this at startup and refuses
 to run rather than write a profile that looks like a result and is not.
+
+`cap_dac_read_search` matters for system-wide (`-a`) captures and for `--pid`
+on another user's process. `/proc/<pid>/map_files/` is mode `0500` and owned by
+the target's uid, so a non-root agent cannot even enter it for a process it
+does not own; `cap_checkpoint_restore` lets it follow the links, not search the
+directory. Without it, such processes log
+`symbolize: batch failed for pid N: permission denied`, and their names come
+from re-reading the module files instead, which works only where a module
+file can be found and read. Root, or adding the capability, avoids that:
+
+```bash
+sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore,cap_syslog,cap_dac_read_search+ep ./perf-agent
+```
 
 `cap_sys_admin` is kept for backward compatibility. Two capabilities were added
 to the kernel to carve out the roles perf-agent used it for — but they did not

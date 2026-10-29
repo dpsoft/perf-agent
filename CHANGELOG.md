@@ -18,6 +18,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrolment, stay native-only. A shutdown line reports how many sampled
   processes were looked at and how many a module recognised.
 
+### Fixed
+
+- **Symbolization on distributions that ship MiniDebugInfo** ([#220](https://github.com/dpsoft/perf-agent/issues/220)).
+  Fedora and RHEL strip binaries down to an xz-compressed symbol table in
+  `.gnu_debugdata`. libblazesym_c was built without its `xz` feature, so every
+  batch touching such a file (python3, libpython, libm on Fedora) failed with
+  `unsupported` and its frames came out as module+offset. Every build site,
+  the container image included, now builds it with `--features blazesym/xz`
+  and `LZMA_API_STATIC=1`, which bundles liblzma into the static archive so the
+  agent gains no runtime dependency. If you build libblazesym_c yourself, see
+  BUILDING.md.
+- **A `permission denied` batch failure now names its fix.** Processes owned
+  by another user need `cap_dac_read_search` (or root) to open
+  `/proc/<pid>/map_files`; the log line says so, and
+  [requirements](docs/requirements.md) documents the capability as optional.
+
 ## [1.3.0] - 2026-10-09
 
 The GPU and Python release. perf-agent can now attribute CUDA kernel time to the

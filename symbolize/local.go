@@ -297,17 +297,22 @@ func NewLocalSymbolizer(opts ...LocalOption) (*LocalSymbolizer, error) {
 // SymbolizeProcess returns one Frame per IP. blazesym's Inlined chain is
 // expanded into the Frame.Inlined slice in caller-most-to-callee order.
 //
-// If blazesym fails the batch — with the capability check in
-// NewLocalSymbolizer standing, the realistic reason is that the process
-// exited and /proc/<pid>/maps is gone, "entity not found" — returns raw
-// hex-named Frames instead of dropping the batch. That preserves stack shape
-// and addresses so operators can decode with addr2line and the pprof's user
-// mapping still has somewhere to attach. Those frames carry Reason ==
+// If blazesym fails the batch, returns raw hex-named Frames instead of
+// dropping it. That preserves stack shape and addresses so operators can
+// decode with addr2line and the pprof's user mapping still has somewhere to
+// attach. Those frames carry Reason ==
 // FailureMissingSymbols; callers that need to know symbolization resolved
 // nothing must inspect Frame.Reason, because err is nil on this path (see
 // gpuprobe.Stats.StacksUnresolved for a consumer that does). The batch is
 // counted in LocalStats.RawAddrBatches: a per-process failure is real signal
 // about that process and must not be silent.
+//
+// Three causes have been seen with the capability check in NewLocalSymbolizer
+// passing (issue #220): the process exited ("entity not found"); it belongs to
+// another user and the agent lacks cap_dac_read_search ("permission denied");
+// and a mapped file carries MiniDebugInfo that a libblazesym_c built without
+// its xz feature cannot read ("unsupported"). One bad file fails the batch, so
+// the last took out every frame of gnome-shell or a Fedora python3.
 func (s *LocalSymbolizer) SymbolizeProcess(pid uint32, ips []uint64) ([]Frame, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -369,7 +374,23 @@ func (s *LocalSymbolizer) noteBatchFailure(pid uint32, err error) {
 		return
 	}
 	log.Printf("symbolize: batch failed for pid %d: %v (frames fall back to module+offset; "+
-		"names recovered from module files where possible)", pid, msg)
+		"names recovered from module files where possible)%s", pid, msg, batchFailureHint(msg))
+}
+
+// batchFailureHint names the fix for the one batch failure that is a
+// deployment choice rather than a property of the target.
+//
+// /proc/<pid>/map_files is mode 0500 and owned by the target's uid, so a
+// non-root agent cannot even enter it for another user's process:
+// cap_checkpoint_restore lets it follow the links, not search the directory.
+// checkMapFilesAccess cannot catch this, since /proc/self is always ours.
+// The binding returns blazesym's error string with no kind attached, hence
+// the match on text; a miss only loses the hint.
+func batchFailureHint(msg string) string {
+	if !strings.Contains(msg, "permission denied") {
+		return ""
+	}
+	return "; processes owned by other users need cap_dac_read_search (or root) to open /proc/<pid>/map_files"
 }
 
 // retryAgainstModuleFiles re-asks blazesym for the frames the PROCESS source

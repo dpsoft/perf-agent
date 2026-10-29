@@ -35,7 +35,7 @@ RUN wget -qO /tmp/rust.sh https://sh.rustup.rs \
  && sh /tmp/rust.sh -y --profile minimal --default-toolchain stable \
  && rm /tmp/rust.sh
 RUN git clone --depth 1 https://github.com/libbpf/blazesym.git /blazesym \
- && cd /blazesym && cargo build --release --package blazesym-c
+ && cd /blazesym && LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
 
 # STATIC blazesym, in a directory holding ONLY the archive.
 #

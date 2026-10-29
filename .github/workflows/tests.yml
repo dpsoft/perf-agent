@@ -62,7 +62,7 @@ jobs:
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
-          cargo build --release --package blazesym-c
+          LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp capi/include/blazesym.h /usr/local/include/
@@ -287,7 +287,7 @@ jobs:
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
-          cargo build --release --package blazesym-c
+          LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp capi/include/blazesym.h /usr/local/include/
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
@@ -434,7 +434,7 @@ jobs:
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
-          cargo build --release --package blazesym-c
+          LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp capi/include/blazesym.h /usr/local/include/
@@ -572,7 +572,7 @@ jobs:
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
-          cargo build --release --package blazesym-c
+          LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp capi/include/blazesym.h /usr/local/include/

@@ -32,11 +32,15 @@ import (
 // separately collapses the blackhole row into the fast-fail rows and leaves a
 // reachable server its full budget.
 //
-// 300ms: a TCP handshake to a reachable server is one round trip, so this is
-// generous for anything on a LAN or in the same region, and still two orders of
-// magnitude below the fetch budget. A debuginfod server more than 300ms away by
-// RTT alone would be a poor choice for a synchronous symbolization path anyway.
-const DialTimeout = 300 * time.Millisecond
+// 1.5s, and not the 300ms this started at. 300ms assumed a nearby server, but
+// the server most users reach is the one their distribution names, which can be
+// a continent away: debuginfod.fedoraproject.org measured at 180-360ms to
+// connect from one workstation, and the 300ms bound refused it outright
+// ("dial tcp [...]:443: i/o timeout") in a real capture. A bound that short
+// also cannot survive ONE lost SYN, since the first retransmit waits the 1s
+// initial RTO (RFC 6298). 1.5s covers one retransmit to a server ~200ms away,
+// and still turns the blackhole case from 5s into 1.5s per build-id.
+const DialTimeout = 1500 * time.Millisecond
 
 // defaultTransport clones http.DefaultTransport with DialTimeout applied.
 // Cloned rather than constructed from scratch so proxy settings, HTTP/2 and the

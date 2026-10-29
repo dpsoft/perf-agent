@@ -1,27 +1,53 @@
 package perfagent
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
-// The flag exists for one situation: a machine whose distribution sets
-// DEBUGINFOD_URLS for you. So the property worth pinning is not "the field
-// can be set" but "setting it beats the environment" -- an implementation
-// that checked the environment first would pass a weaker test and fail every
-// user it was written for.
-func TestWithoutDebuginfodBeatsTheEnvironment(t *testing.T) {
-	t.Setenv("DEBUGINFOD_URLS", "https://debuginfod.fedoraproject.org/")
-
-	var on Config
-	if got := debuginfodURLsFromEnv("https://debuginfod.fedoraproject.org/"); len(got) != 1 {
-		t.Fatalf("precondition: env parse returned %v, want one URL -- the test would pass vacuously", got)
+// Which servers a capture fetches from, for every way of asking. Issue #111.
+//
+// This drives debuginfodServers, the function chooseSymbolizer calls, rather
+// than checking that an option sets a field. The test it replaces did only
+// that, and passed for as long as --no-debuginfod was a no-op: the field was
+// set, and nothing ever read it.
+func TestDebuginfodServers(t *testing.T) {
+	const fedora = "ima:enforcing https://debuginfod.fedoraproject.org/ ima:ignore"
+	envURL := []string{"https://debuginfod.fedoraproject.org/"}
+	mine := []string{"http://localhost:8002"}
+	if got := debuginfodURLsFromEnv(fedora); !slices.Equal(got, envURL) {
+		t.Fatalf("precondition: env parse returned %v, want %v -- cases below would pass vacuously", got, envURL)
 	}
-	if on.DisableDebuginfod {
-		t.Fatal("zero Config should leave debuginfod enabled; honouring the env var is the default")
-	}
 
-	var off Config
-	WithoutDebuginfod()(&off)
-	if !off.DisableDebuginfod {
-		t.Fatal("WithoutDebuginfod did not set DisableDebuginfod")
+	cases := []struct {
+		name        string
+		opts        []Option
+		env         string
+		use, ignore []string
+	}{
+		{name: "environment alone is not enough", env: fedora, ignore: envURL},
+		{name: "--debuginfod uses the environment", env: fedora, opts: []Option{WithDebuginfodFromEnv()}, use: envURL},
+		{name: "--debuginfod-url needs no environment", opts: []Option{WithDebuginfodURL(mine[0])}, use: mine},
+		{name: "--debuginfod-url beats the environment", env: fedora,
+			opts: []Option{WithDebuginfodFromEnv(), WithDebuginfodURL(mine[0])}, use: mine},
+		{name: "--no-debuginfod beats the environment", env: fedora,
+			opts: []Option{WithDebuginfodFromEnv(), WithoutDebuginfod()}},
+		{name: "--no-debuginfod beats --debuginfod-url",
+			opts: []Option{WithDebuginfodURL(mine[0]), WithoutDebuginfod()}},
+		{name: "--debuginfod with nothing in the environment", opts: []Option{WithDebuginfodFromEnv()}},
+		{name: "nothing at all"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c Config
+			for _, o := range tc.opts {
+				o(&c)
+			}
+			use, ignore := debuginfodServers(&c, tc.env)
+			if !slices.Equal(use, tc.use) || !slices.Equal(ignore, tc.ignore) {
+				t.Errorf("use=%v ignore=%v, want use=%v ignore=%v", use, ignore, tc.use, tc.ignore)
+			}
+		})
 	}
 }
 

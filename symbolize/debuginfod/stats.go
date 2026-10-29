@@ -1,6 +1,10 @@
 package debuginfod
 
-import "sync/atomic"
+import (
+	"errors"
+	"os"
+	"sync/atomic"
+)
 
 // Stats reports operational counters for a Symbolizer. Read via Stats().
 type Stats struct {
@@ -64,6 +68,24 @@ type atomicStats struct {
 	fileModeFetchFails, fileModeLocalHits atomic.Uint64
 	// AddressMapper miss for an individual IP.
 	normalizationFails atomic.Uint64
+}
+
+// noteFetchErr counts a failed fetch as a 404 or as an error.
+func (a *atomicStats) noteFetchErr(err error) {
+	if errors.Is(err, ErrNotFound) {
+		a.fetch404s.Add(1)
+		return
+	}
+	a.fetchErrors.Add(1)
+}
+
+// noteFetched counts the size of a file a fetch just wrote into the cache.
+// Read back from disk rather than from the transfer because the transfer
+// happens inside singleflightFetcher, which keeps no stats of its own.
+func (a *atomicStats) noteFetched(path string) {
+	if fi, err := os.Stat(path); err == nil {
+		a.fetchBytesTotal.Add(uint64(fi.Size()))
+	}
 }
 
 func (a *atomicStats) snapshot() Stats {

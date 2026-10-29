@@ -67,7 +67,7 @@ var (
 	flagSymbolCacheMax = flag.Int64("symbol-cache-max", 0,
 		"Maximum size of the debuginfod cache in bytes. Default: 2 GiB.")
 	flagSymbolFetchTimeout = flag.Duration("symbol-fetch-timeout", 0,
-		"Per-artifact debuginfod fetch timeout. Default: 30s.")
+		"Per-artifact debuginfod fetch timeout. Default: 5s.")
 	flagSymbolFailClosed = flag.Bool("symbol-fail-closed", false,
 		"Refuse to symbolize a mapping whose debuginfod fetch failed (no fallback to local).")
 	flagKernelStacks = flag.Bool("kernel-stacks", false,
@@ -111,17 +111,23 @@ func init() {
 	flag.Var(&flagTags, "tag", "Add tag to profile (repeatable, format: key=value)")
 	// Register --debuginfod-url flag for debuginfod server URLs
 	flag.Var(&flagDebuginfodURLs, "debuginfod-url",
-		"Add a debuginfod server URL (repeatable). Falls back to DEBUGINFOD_URLS env var.")
-	// The way to decline network symbolization on a machine whose distribution
-	// sets DEBUGINFOD_URLS for you (Fedora does). It is a separate flag rather
-	// than --debuginfod-url='' because an empty value stays an ERROR: a script
+		"Add a debuginfod server URL (repeatable); turns on network symbolization.")
+	// Network symbolization is opt-in: DEBUGINFOD_URLS alone does not turn it
+	// on, because distributions set it for users who never asked for a
+	// capture to wait on downloads. Issue #111.
+	flag.BoolVar(&flagDebuginfod, "debuginfod", false,
+		"Fetch debug info from the servers in DEBUGINFOD_URLS during symbolization.")
+	// Declines network symbolization outright, beating --debuginfod and
+	// --debuginfod-url: for a wrapper script that adds those and a caller who
+	// must not reach the network. A separate flag rather than
+	// --debuginfod-url='' because an empty value stays an ERROR: a script
 	// writing --debuginfod-url="$URL" with URL unset should be told, not
-	// silently downgraded to local symbols. Issue #111.
+	// silently downgraded to local symbols.
 	flag.BoolVar(&flagNoDebuginfod, "no-debuginfod", false,
-		"Ignore DEBUGINFOD_URLS and any --debuginfod-url; symbolize from local files only.")
+		"Never fetch debug info over the network, whatever else is given.")
 }
 
-var flagNoDebuginfod bool
+var flagNoDebuginfod, flagDebuginfod bool
 
 var pmuFile *os.File
 
@@ -313,18 +319,19 @@ func buildOptions() []perfagent.Option {
 
 	// Debuginfod / symbol-cache options.
 	//
-	// --no-debuginfod wins over both --debuginfod-url and DEBUGINFOD_URLS: it
-	// exists precisely for the machine whose distribution set the variable, so
-	// deferring to the environment would defeat it. Passing both is a
+	// Passing --no-debuginfod with either way of turning it on is a
 	// contradiction the user should hear about rather than have resolved
 	// silently in either direction.
 	switch {
-	case flagNoDebuginfod && len(flagDebuginfodURLs) > 0:
-		fmt.Fprintln(os.Stderr, "perf-agent: --no-debuginfod and --debuginfod-url are contradictory; pick one")
+	case flagNoDebuginfod && (flagDebuginfod || len(flagDebuginfodURLs) > 0):
+		fmt.Fprintln(os.Stderr, "perf-agent: --no-debuginfod contradicts --debuginfod and --debuginfod-url; pick one")
 		os.Exit(2)
 	case flagNoDebuginfod:
 		opts = append(opts, perfagent.WithoutDebuginfod())
 	default:
+		if flagDebuginfod {
+			opts = append(opts, perfagent.WithDebuginfodFromEnv())
+		}
 		for _, u := range flagDebuginfodURLs {
 			opts = append(opts, perfagent.WithDebuginfodURL(u))
 		}

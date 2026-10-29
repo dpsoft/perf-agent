@@ -87,10 +87,12 @@ CPU stack. Lowering it raises the event rate; see
 | `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile` or `--offcpu`. | - |
 | `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
-| `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable). Falls back to `DEBUGINFOD_URLS` env. Unset → off. | - |
+| `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable); turns network symbolization on. | - |
+| `--debuginfod` | Fetch from the servers in `DEBUGINFOD_URLS`, which is otherwise ignored. | `false` |
+| `--no-debuginfod` | Never fetch debug info over the network; an error alongside the two above. | `false` |
 | `--symbol-cache-dir=DIR` | Local directory for fetched artifacts. | `/tmp/perf-agent-debuginfod` |
 | `--symbol-cache-max=BYTES` | LRU cap for the symbol cache. | `2147483648` (2 GiB) |
-| `--symbol-fetch-timeout=DUR` | Per-artifact HTTP fetch timeout. | `30s` |
+| `--symbol-fetch-timeout=DUR` | Per-artifact HTTP fetch timeout, transfer included. | `5s` |
 | `--symbol-fail-closed` | (M2 stub) Refuse to symbolize a mapping whose fetch failed. | `false` |
 
 Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.

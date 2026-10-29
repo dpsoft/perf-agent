@@ -68,7 +68,7 @@ jobs:
         git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
         cd /tmp/blazesym
         echo "Building blazesym C bindings package..."
-        cargo build --release --package blazesym-c
+        LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
         echo "Built files:"
         ls -lh target/release/libblazesym* || echo "No libblazesym files"
         echo ""

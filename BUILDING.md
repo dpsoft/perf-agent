@@ -33,7 +33,7 @@ git clone https://github.com/libbpf/blazesym.git
 cd blazesym
 
 # Build the C library
-cargo build --release --package blazesym-c
+LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
 
 # The library will be at: target/release/libblazesym_c.a
 ```
@@ -51,7 +51,7 @@ go build .
 # Clone and build
 git clone https://github.com/libbpf/blazesym.git
 cd blazesym
-cargo build --release --package blazesym-c
+LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
 
 # Install system-wide
 sudo mkdir -p /usr/local/lib /usr/local/include
@@ -197,7 +197,7 @@ cd perf-agent
 # 2. Build blazesym (one-time setup)
 git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
 cd /tmp/blazesym
-cargo build --release --package blazesym-c
+LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
 cd -
 
 # 3. Build perf-agent

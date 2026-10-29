@@ -64,7 +64,7 @@ jobs:
         run: |
           git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
-          cargo build --release --package blazesym-c
+          LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp capi/include/blazesym.h /usr/local/include/

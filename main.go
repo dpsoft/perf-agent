@@ -123,16 +123,25 @@ func init() {
 	// --debuginfod-url='' because an empty value stays an ERROR: a script
 	// writing --debuginfod-url="$URL" with URL unset should be told, not
 	// silently downgraded to local symbols.
+	// Fills the symbol cache for --pid or -a with no capture waiting on it,
+	// then exits: for debuginfo too large to arrive within a capture's fetch
+	// budget, which a capture skips. Issue #224.
+	flag.BoolVar(&flagDebuginfodPrefetch, "debuginfod-prefetch", false,
+		"Download debuginfo for --pid or -a into the symbol cache, without a time budget, then exit. Needs --debuginfod or --debuginfod-url.")
 	flag.BoolVar(&flagNoDebuginfod, "no-debuginfod", false,
 		"Never fetch debug info over the network, whatever else is given.")
 }
 
-var flagNoDebuginfod, flagDebuginfod bool
+var flagNoDebuginfod, flagDebuginfod, flagDebuginfodPrefetch bool
 
 var pmuFile *os.File
 
 func main() {
 	flag.Parse()
+
+	if flagDebuginfodPrefetch {
+		os.Exit(runPrefetch())
+	}
 
 	// Build options from flags
 	opts := buildOptions()
@@ -181,6 +190,59 @@ func main() {
 	}
 
 	fmt.Println("Exiting program.")
+}
+
+// runPrefetch is the --debuginfod-prefetch mode: no BPF, no profile, just the
+// downloads a capture of the same target would have skipped.
+func runPrefetch() int {
+	if *flagPID != 0 && *flagAll {
+		fmt.Fprintln(os.Stderr, "perf-agent: --pid and -a/--all are mutually exclusive")
+		return 2
+	}
+	var opts []perfagent.Option
+	switch {
+	case *flagAll:
+		opts = append(opts, perfagent.WithSystemWide())
+	case *flagPID != 0:
+		opts = append(opts, perfagent.WithPID(*flagPID))
+	default:
+		fmt.Fprintln(os.Stderr, "perf-agent: --debuginfod-prefetch needs --pid or -a/--all")
+		return 2
+	}
+	if flagNoDebuginfod {
+		fmt.Fprintln(os.Stderr, "perf-agent: --debuginfod-prefetch with --no-debuginfod has nothing to do")
+		return 2
+	}
+	if flagDebuginfod {
+		opts = append(opts, perfagent.WithDebuginfodFromEnv())
+	}
+	for _, u := range flagDebuginfodURLs {
+		opts = append(opts, perfagent.WithDebuginfodURL(u))
+	}
+	if *flagSymbolCacheDir != "" {
+		opts = append(opts, perfagent.WithSymbolCacheDir(*flagSymbolCacheDir))
+	}
+	if *flagSymbolCacheMax > 0 {
+		opts = append(opts, perfagent.WithSymbolCacheMaxBytes(*flagSymbolCacheMax))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	start := time.Now()
+	res, err := perfagent.PrefetchDebuginfo(ctx, opts...)
+	if err != nil && res.Processes == 0 {
+		fmt.Fprintf(os.Stderr, "perf-agent: %v\n", err)
+		return 1
+	}
+	fmt.Printf("prefetch: %d process(es) read (%d unreadable); %d binaries already had debug info; "+
+		"fetched %d (%.1fMB), %d not on the server, %d failed, in %v\n",
+		res.Processes, res.Unreadable, res.AlreadyLocal,
+		res.Fetched, float64(res.Bytes)/1e6, res.NotFound, res.Failed, time.Since(start).Round(time.Second))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "perf-agent: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func buildOptions() []perfagent.Option {

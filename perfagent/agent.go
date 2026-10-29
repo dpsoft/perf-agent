@@ -264,6 +264,60 @@ func debuginfodServers(cfg *Config, env string) (use, ignored []string) {
 	}
 }
 
+// symbolCache returns the debuginfod cache directory and size cap, defaults
+// applied. Shared by captures and PrefetchDebuginfo, which must fill the
+// cache the captures read.
+func symbolCache(cfg *Config) (string, int64) {
+	return cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod"),
+		cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))
+}
+
+// PrefetchDebuginfo downloads into the symbol cache the debuginfo that
+// symbolizing the configured target (WithPID, or WithSystemWide for every
+// process) would fetch, with no capture waiting on it.
+//
+// For files too large to arrive within a capture's fetch budget, which a
+// capture otherwise skips (issue #224). It fetches from the same servers a
+// capture would -- WithDebuginfodURL, or DEBUGINFOD_URLS with
+// WithDebuginfodFromEnv -- and refuses when that is none. Profiling options
+// are ignored.
+func PrefetchDebuginfo(ctx context.Context, opts ...Option) (debuginfod.PrefetchResult, error) {
+	cfg := DefaultConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.PID != 0 && cfg.SystemWide {
+		return debuginfod.PrefetchResult{}, errors.New("PID and system-wide are mutually exclusive")
+	}
+	if cfg.PID == 0 && !cfg.SystemWide {
+		return debuginfod.PrefetchResult{}, errors.New("a PID or system-wide is required")
+	}
+	urls, ignored := debuginfodServers(cfg, os.Getenv("DEBUGINFOD_URLS"))
+	if len(urls) == 0 {
+		msg := "no debuginfod server to prefetch from: pass --debuginfod-url, or --debuginfod to use DEBUGINFOD_URLS"
+		if cfg.DisableDebuginfod {
+			msg = "prefetch with --no-debuginfod has nothing to do"
+		} else if len(ignored) > 0 {
+			msg = fmt.Sprintf("DEBUGINFOD_URLS names %s; pass --debuginfod to prefetch from it", strings.Join(ignored, " "))
+		}
+		return debuginfod.PrefetchResult{}, errors.New(msg)
+	}
+	var pids []uint32
+	if !cfg.SystemWide {
+		pids = []uint32{uint32(cfg.PID)}
+	}
+	dir, cacheMax := symbolCache(cfg)
+	return debuginfod.Prefetch(ctx, debuginfod.PrefetchOptions{
+		URLs:          urls,
+		CacheDir:      dir,
+		CacheMaxBytes: cacheMax,
+		PIDs:          pids,
+		// Not SymbolFetchTimeout: that is the capture's budget, the very
+		// limit prefetch exists to get out from under. Its own default.
+		Logf: log.Printf,
+	})
+}
+
 func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (symbolize.Symbolizer, error) {
 	urls, ignored := debuginfodServers(cfg, os.Getenv("DEBUGINFOD_URLS"))
 	switch {
@@ -299,8 +353,7 @@ func chooseSymbolizer(cfg *Config, res *procmap.Resolver, logger *slog.Logger) (
 		"Debug info is fetched over the network on first contact with each "+
 		"unknown build-id, which can take far longer than the capture itself",
 		len(urls), strings.Join(urls, " "))
-	cacheDir := cmp.Or(cfg.SymbolCacheDir, "/tmp/perf-agent-debuginfod")
-	cacheMax := cmp.Or(cfg.SymbolCacheMaxBytes, int64(2<<30))
+	cacheDir, cacheMax := symbolCache(cfg)
 	// Left to the package default (5s) unless configured; see its rationale
 	// in debuginfod.Options.validate. Raising it trades capture latency for
 	// source detail on slow servers.
@@ -875,7 +928,7 @@ func (a *Agent) logDebuginfodStats() {
 	st := d.Stats()
 	log.Printf("perf-agent: debuginfod: symbolization took %v over %d call(s) "+
 		"[maps %v, symbolize %v; slowest call %v, %d call(s) over 50ms]; "+
-		"fetches ok=%d 404=%d err=%d bytes=%dMB; "+
+		"fetches ok=%d 404=%d err=%d too_slow=%d bytes=%dMB; "+
 		"cache hits=%d misses=%d evictions=%d; dispatcher calls=%d skipped_local=%d; "+
 		"file_mode addrs=%d fetch_fails=%d local_hits=%d parse_fails=%d",
 		time.Duration(st.TotalNs).Round(time.Millisecond), st.Calls,
@@ -883,7 +936,7 @@ func (a *Agent) logDebuginfodStats() {
 		time.Duration(st.SymbolizeNs).Round(time.Millisecond),
 		time.Duration(st.SlowestNs).Round(time.Millisecond), st.CallsOver50ms,
 		st.FetchSuccessDebuginfo+st.FetchSuccessExecutable,
-		st.Fetch404s, st.FetchErrors, st.FetchBytesTotal/(1<<20),
+		st.Fetch404s, st.FetchErrors, st.FetchTooSlow, st.FetchBytesTotal/(1<<20),
 		st.CacheHits, st.CacheMisses, st.CacheEvictions,
 		st.DispatcherCalls, st.DispatcherSkippedLocal,
 		st.FileModeAddrs, st.FileModeFetchFails, st.FileModeLocalHits, st.FileModeParseFails)

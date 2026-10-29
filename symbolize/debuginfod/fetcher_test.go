@@ -29,7 +29,7 @@ func TestFetchOnce200(t *testing.T) {
 		_, _ = w.Write([]byte("hello"))
 	})
 	f := newFetcher([]string{url}, http.DefaultClient)
-	body, err := f.fetchURL(t.Context(), url+"/buildid/aabb/debuginfo")
+	body, _, err := f.fetchURL(t.Context(), url+"/buildid/aabb/debuginfo")
 	if err != nil {
 		t.Fatalf("fetchURL: %v", err)
 	}

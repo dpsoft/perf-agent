@@ -59,6 +59,15 @@ type singleflightFetcher struct {
 	cache    storer
 	sf       singleflight.Group
 
+	// budget is the capture's fetch budget. When positive, a download that
+	// cannot finish within it is stopped early and, if it could not fit even
+	// the whole budget, marked in markerDir so later captures skip it. Zero
+	// means no budget: prefetch, which has the time and ignores markers.
+	// See slow.go. Issue #224.
+	budget    time.Duration
+	markerDir string
+	now       func() time.Time
+
 	failedMu sync.Mutex
 	failed   map[string]fetchFailure
 }
@@ -73,7 +82,14 @@ func newSingleflightFetcher(upstream *fetcher, store storer) *singleflightFetche
 		upstream: upstream,
 		cache:    store,
 		failed:   make(map[string]fetchFailure),
+		now:      time.Now,
 	}
+}
+
+// withBudget enables early stopping and on-disk skip markers.
+func (s *singleflightFetcher) withBudget(budget time.Duration, markerDir string) *singleflightFetcher {
+	s.budget, s.markerDir = budget, markerDir
+	return s
 }
 
 // recentFailure reports a remembered failure for key, if one is still within
@@ -90,6 +106,14 @@ func (s *singleflightFetcher) recentFailure(key string) (error, bool) {
 		return nil, false
 	}
 	return f.err, true
+}
+
+// forgetFailure drops a remembered failure, so the next fetchAndStore for
+// (kind, buildID) goes to the network. For a caller that retries on purpose.
+func (s *singleflightFetcher) forgetFailure(kindStr, buildID string) {
+	s.failedMu.Lock()
+	defer s.failedMu.Unlock()
+	delete(s.failed, kindStr+":"+buildID)
 }
 
 // noteFailure remembers that key could not be fetched.
@@ -120,12 +144,26 @@ func (s *singleflightFetcher) fetchAndStore(ctx context.Context, kindStr, buildI
 	if err, ok := s.recentFailure(key); ok {
 		return "", err
 	}
+	// A file an earlier capture found too slow for this budget is skipped
+	// without connecting. Judged against the budget in force, not a stored
+	// verdict, so a larger --symbol-fetch-timeout retries it.
+	if s.budget > 0 && s.markerDir != "" {
+		if m, ok := readSlowMarker(s.markerDir, kindStr, buildID); ok && m.needs() > s.budget {
+			err := &errTooSlow{marker: m, budget: s.budget, skipped: true}
+			s.noteFailure(key, err)
+			return "", err
+		}
+	}
 	res, err, _ := s.sf.Do(key, func() (any, error) {
-		body, err := s.upstream.fetch(ctx, kindStr, buildID)
+		raw, size, err := s.upstream.fetchSized(ctx, kindStr, buildID)
 		if err != nil {
 			return "", err
 		}
-		defer func() { _ = body.Close() }()
+		defer func() { _ = raw.Close() }()
+		var body io.Reader = raw
+		if deadline, ok := ctx.Deadline(); ok && s.budget > 0 && size > 0 {
+			body = &budgetReader{r: raw, size: size, start: s.now(), deadline: deadline, budget: s.budget, now: s.now}
+		}
 		var k cache.Kind
 		switch kindStr {
 		case "debuginfo":
@@ -135,7 +173,18 @@ func (s *singleflightFetcher) fetchAndStore(ctx context.Context, kindStr, buildI
 		}
 		abs, werr := s.cache.WriteAtomic(buildID, k, body)
 		if werr != nil {
+			if ts, ok := asTooSlow(werr); ok {
+				// Marked only if it could not fit even a whole budget. One
+				// that merely did not fit what was left of this call's
+				// budget may well fit the next.
+				if ts.marker.needs() > s.budget && s.markerDir != "" {
+					writeSlowMarker(s.markerDir, kindStr, buildID, ts.marker)
+				}
+			}
 			return "", werr
+		}
+		if s.markerDir != "" {
+			removeSlowMarker(s.markerDir, kindStr, buildID)
 		}
 		// Best-effort eviction. Errors are surfaced via the cache's own counters
 		// in M2; for now we just suppress so a fetch that succeeded isn't

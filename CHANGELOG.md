@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrolment, stay native-only. A shutdown line reports how many sampled
   processes were looked at and how many a module recognised.
 
+- **`--debuginfod-prefetch`, for debuginfo too large to fetch during a
+  capture** ([#224](https://github.com/dpsoft/perf-agent/issues/224)). It fills the symbol cache for `--pid` or `-a`
+  with no time budget, then exits. A capture now stops a download about a
+  second in if it cannot finish within `--symbol-fetch-timeout`. When the file
+  could not fit even a whole budget, later captures skip it for 24 hours instead
+  of paying the budget again. Before, Mesa's 233 MB `libgallium` debuginfo cost
+  5 s on every capture and was never cached. The summary line gains
+  `too_slow=`.
+
 ### Changed
 
 - **`DEBUGINFOD_URLS` no longer turns on network symbolization by itself**

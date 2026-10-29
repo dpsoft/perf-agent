@@ -85,7 +85,7 @@
 <rect class="b pyw" x="300" y="312" width="440" height="56" rx="7"/>
 <text class="tm" x="312" y="330" text-anchor="start">pywalk_probe.bpf.c</text>
 <text class="s" x="312" y="345" text-anchor="start">walks CPython's own frame chain — no injection into the target,</text>
-<text class="s" x="312" y="358" text-anchor="start">no CAP_SYS_PTRACE, nothing mutated</text>
+<text class="s" x="312" y="358" text-anchor="start">nothing mutated; one brief ptrace stop at enrolment</text>
 <path class="a" d="M313,270 L313,296 L430,296 L430,308" marker-end="url(#ah)"/>
 <path class="a" d="M514,270 L514,296 L520,296 L520,308" marker-end="url(#ah)"/>
 <path class="a" d="M917,270 L917,296 L700,296 L700,308" marker-end="url(#ah)"/>

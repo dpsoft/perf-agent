@@ -45,7 +45,9 @@ Find why a service is "slow but not CPU-busy." `--offcpu` hooks `sched_switch` a
 One profile, multiple runtimes. Native (DWARF + ELF) symbolizes alongside Node.js (`--perf-basic-prof`), Go, and any runtime that writes a `/tmp/perf-<pid>.map`. The hybrid FP+DWARF unwinder handles release-built C++/Rust without `-fno-omit-frame-pointer`.
 
 **Python frames come from the interpreter's own frame chain**, walked in BPF — no
-injection into the target, no `CAP_SYS_PTRACE`, nothing mutated. Measured on
+injection into the target, nothing mutated. Enrolling a process briefly ptrace-stops
+a thread (one stop of tens of microseconds, in the common case) to read the TLS
+base that locates its thread state, so it uses the `cap_sys_ptrace` the agent already needs. Measured on
 CPython 3.12–3.14, including distro builds whose eval loop is split by LTO and
 reachable only through `.gnu_debugdata`. An interpreter it cannot walk is refused
 by name in the log rather than quietly yielding C frames.

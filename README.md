@@ -25,8 +25,9 @@
   correlation id — a slow kernel points at the call path responsible, Python
   frames included. [How the adapter is loaded →](docs/gpu-injection.md)
 - **Python frames walked from BPF**, out of the interpreter's own frame chain.
-  No injection into the target, no `CAP_SYS_PTRACE`, nothing mutated. CPython
-  3.12–3.14. [How the walk works →](docs/cpython-frame-walking.md)
+  No injection into the target and nothing mutated; enrolling a process
+  briefly ptrace-stops a thread (one stop of tens of microseconds, in the
+  common case) to find its thread state. CPython 3.12–3.14. [How the walk works →](docs/cpython-frame-walking.md)
 - **Off-CPU stalls**: `--offcpu` hooks `sched_switch` and accumulates blocking
   time per call site — lock waits, syscall blocks, mutex contention.
 - **Release C++/Rust without frame pointers**, via a hybrid FP + `.eh_frame`

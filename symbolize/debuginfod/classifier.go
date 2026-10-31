@@ -110,9 +110,22 @@ func newClassifier(c *cache.Cache, f sfFetcher, st *atomicStats) *classifier {
 
 // classify returns the route for one mapping.
 func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyResult {
+	res, buildID, fetch := c.localRoute(m)
+	if !fetch {
+		return res
+	}
+	return c.fetchRoute(ctx, m.Path, buildID)
+}
+
+// localRoute is classify without the network: tiers 1 to 3a. fetch reports
+// that nothing local can serve the mapping and buildID is worth fetching;
+// res is meaningful only when fetch is false. Split out so Prefetch asks the
+// same question symbolization will, and fetches exactly what a capture would
+// otherwise have tried to.
+func (c *classifier) localRoute(m procmap.Mapping) (res classifyResult, buildID string, fetch bool) {
 	// Tier 1: inherent non-symbolizable.
 	if slices.Contains(nonSymbolizablePaths, m.Path) {
-		return classifyResult{route: routeSkip}
+		return classifyResult{route: routeSkip}, "", false
 	}
 
 	// Tier 2: try to read the ELF; on any failure fall through to
@@ -122,22 +135,22 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		// Unreachable from agent namespace. Process-mode is defensive —
 		// blazesym will emit [binary]:offset which still preserves
 		// stack shape vs skipping (which would drop frames).
-		return classifyResult{route: routeProcessMode}
+		return classifyResult{route: routeProcessMode}, "", false
 	}
 	if hasDwarf(openPath) {
-		return classifyResult{route: routeProcessMode}
+		return classifyResult{route: routeProcessMode}, "", false
 	}
 	// Debug-link search is filesystem-relative; only meaningful with the
 	// symbolic path. Skip if it isn't readable.
 	if m.Path != "" && hasResolvableDebuglink(m.Path, nil) {
-		return classifyResult{route: routeProcessMode}
+		return classifyResult{route: routeProcessMode}, "", false
 	}
 
 	// Tier 3: file-mode routing. Read build-id; without one we can't
 	// look up any debug file remotely, so fall through to process-mode.
-	buildID := readBuildID(m.MapFiles, m.Path)
+	buildID = readBuildID(m.MapFiles, m.Path)
 	if buildID == "" {
-		return classifyResult{route: routeProcessMode}
+		return classifyResult{route: routeProcessMode}, "", false
 	}
 
 	// 3a: collect local candidate paths (no network).
@@ -163,9 +176,14 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 		if c.stats != nil {
 			c.stats.fileModeLocalHits.Add(1)
 		}
-		return classifyResult{route: routeFileMode, debugPath: p}
+		return classifyResult{route: routeFileMode, debugPath: p}, buildID, false
 	}
 
+	return classifyResult{}, buildID, true
+}
+
+// fetchRoute is tier 3b: nothing local can serve buildID, so fetch it.
+func (c *classifier) fetchRoute(ctx context.Context, path, buildID string) classifyResult {
 	// 3b: local candidates exhausted (or all bad). Try remote fetch unless
 	// a recent fetch failed or there is no fetcher.
 	if c.isNegFetch(buildID) || c.fetcher == nil {
@@ -179,7 +197,7 @@ func (c *classifier) classify(ctx context.Context, m procmap.Mapping) classifyRe
 			c.stats.fileModeFetchFails.Add(1)
 			c.stats.noteFetchErr(err)
 		}
-		noteFetchFailure(m.Path, buildID, err)
+		noteFetchFailure(path, buildID, err)
 		return classifyResult{route: routeProcessMode}
 	}
 	if c.stats != nil {
@@ -343,7 +361,9 @@ func noteFetchFailure(path, buildID string, err error) {
 	}
 	hint := ""
 	var ne net.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+	if _, ok := asTooSlow(err); ok {
+		hint = "; run perf-agent --debuginfod-prefetch once to cache it, or raise --symbol-fetch-timeout"
+	} else if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
 		hint = "; a larger --symbol-fetch-timeout lets it finish"
 	}
 	log.Printf("debuginfod: fetching debuginfo for %s (build-id %s) failed: %v; "+

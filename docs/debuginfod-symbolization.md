@@ -87,6 +87,49 @@ silently.
 
 ---
 
+## Large debuginfo, and `--debuginfod-prefetch`
+
+A capture waits at most `--symbol-fetch-timeout` (5 s) per file, and the
+server cannot resume a partial download (elfutils `debuginfod` ignores HTTP
+`Range`). A file that cannot arrive within that budget therefore never reaches
+the cache from a capture. Measured against `debuginfod.fedoraproject.org` at
+~1.2 MB/s: Mesa's `libgallium` debuginfo is 233 MB, about three minutes.
+
+So a capture does not try to finish it. About a second into a download it
+projects the finish time from the measured rate, and stops if the download
+will not make it. If the file could not arrive even within a whole budget, the
+capture writes a marker under `<cache-dir>/slow/`. For 24 hours, later
+captures skip that file without connecting. The marker records the size and
+rate rather than a verdict, so raising `--symbol-fetch-timeout` far enough
+retries the file. The log names each such file once. From two captures of
+`gnome-shell` in a row, build-ids shortened:
+
+```
+debuginfod: fetching debuginfo for /usr/lib64/libgallium-26.0.3.so (build-id d9590d44…) failed: copy: stopped: 233MB at 1.7MB/s needs ~2m15s, more than the 5s fetch budget; … run perf-agent --debuginfod-prefetch once to cache it, or raise --symbol-fetch-timeout
+debuginfod: fetching debuginfo for /usr/lib64/libgallium-26.0.3.so (build-id d9590d44…) failed: skipped: 233MB at 1.7MB/s needs ~2m15s, more than the 5s fetch budget; …
+```
+
+A file stopped because the call had already spent most of its budget on other
+files says so ("more than the 1.5s left of the 5s fetch budget") and gets no
+marker: the next capture may fit it. The summary line counts both kinds as
+`too_slow=`.
+
+To get those files, fill the cache once with no capture waiting:
+
+```bash
+./perf-agent --debuginfod-prefetch --debuginfod --pid <PID>   # or -a
+```
+
+It reads the target's mappings and fetches the debuginfo a capture of the
+same target would try to. It skips anything that already has DWARF, a
+resolvable debug link, a `/usr/lib/debug` copy or a cached copy. It runs two
+downloads at a time, each bounded at 30 minutes, ignores the too-slow markers,
+and clears the marker of each file it fetches. It loads no BPF program. Like a
+capture, it needs `cap_sys_ptrace` to read another user's
+`/proc/<pid>/maps`. Pass the same `--symbol-cache-dir` the captures use.
+
+---
+
 ## Cache layout & tuning
 
 The on-disk layout mirrors the standard `.build-id` directory structure
@@ -133,6 +176,7 @@ a populated cache from a previous run, even if the SQLite index was lost.
 | `--debuginfod-url=URL` | — | unset (feature off) | Repeatable; ordered list, first 200 wins, 404 falls through to next. Takes precedence over `--debuginfod`. |
 | `--debuginfod` | `DEBUGINFOD_URLS` (space-separated; non-URL tokens such as `ima:enforcing` are skipped) | `false` | Use the servers the variable names. Without this flag the variable is ignored. |
 | `--no-debuginfod` | — | `false` | Never fetch. Combining it with `--debuginfod` or `--debuginfod-url` is an error. |
+| `--debuginfod-prefetch` | — | `false` | Fill the cache for `--pid` or `-a` with no time budget, then exit. See above. |
 | `--symbol-cache-dir=DIR` | — | `/tmp/perf-agent-debuginfod` | |
 | `--symbol-cache-max=BYTES` | — | `2147483648` (2 GiB) | LRU eviction cap. |
 | `--symbol-fetch-timeout=DUR` | — | `5s` | Per-artifact HTTP timeout, transfer included. Connecting is bounded separately at 1.5 s. |

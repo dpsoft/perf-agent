@@ -36,25 +36,12 @@ func New(opts Options) (*Symbolizer, error) {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(opts.CacheDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create cache dir: %w", err)
-	}
-
-	idx, err := openIndex(filepath.Join(opts.CacheDir, indexFilename))
+	c, err := openCache(opts)
 	if err != nil {
 		return nil, err
 	}
-	c := &cache.Cache{
-		Dir:      opts.CacheDir,
-		Index:    idx,
-		MaxBytes: opts.CacheMaxBytes,
-	}
-	if err := c.Prewarm(); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
 	f := newFetcher(opts.URLs, opts.HTTPClient)
-	sfConcrete := newSingleflightFetcher(f, c)
+	sfConcrete := newSingleflightFetcher(f, c).withBudget(opts.FetchTimeout, opts.CacheDir)
 
 	s := &Symbolizer{
 		opts:     opts,
@@ -454,6 +441,28 @@ func (s *Symbolizer) Close() error {
 func (s *Symbolizer) Stats() Stats { return s.stats.snapshot() }
 
 const indexFilename = "index.db"
+
+// openCache creates the cache directory, opens its index and records what is
+// already on disk. Shared by New and Prefetch, which must agree on the layout.
+func openCache(opts Options) (*cache.Cache, error) {
+	if err := os.MkdirAll(opts.CacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create cache dir: %w", err)
+	}
+	idx, err := openIndex(filepath.Join(opts.CacheDir, indexFilename))
+	if err != nil {
+		return nil, err
+	}
+	c := &cache.Cache{
+		Dir:      opts.CacheDir,
+		Index:    idx,
+		MaxBytes: opts.CacheMaxBytes,
+	}
+	if err := c.Prewarm(); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
 
 // openIndex opens the cache's SQLite index. The indirection is kept so
 // future tests can inject a fake Index without changing this site, but

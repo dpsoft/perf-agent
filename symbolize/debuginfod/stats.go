@@ -11,10 +11,13 @@ type Stats struct {
 	CacheHits, CacheMisses, CacheEvictions        uint64
 	FetchSuccessDebuginfo, FetchSuccessExecutable uint64
 	Fetch404s, FetchErrors                        uint64
-	FetchBytesTotal                               uint64
-	InFlightFetches                               int64
-	DispatcherCalls, DispatcherSkippedLocal       uint64
-	DispatcherPanics                              uint64
+	// FetchTooSlow counts downloads stopped or skipped because they could not
+	// finish within the fetch budget (slow.go). Not counted in FetchErrors.
+	FetchTooSlow                            uint64
+	FetchBytesTotal                         uint64
+	InFlightFetches                         int64
+	DispatcherCalls, DispatcherSkippedLocal uint64
+	DispatcherPanics                        uint64
 	// Per-mapping routing (Symbolize-time).
 	ClassifyProcessMode, ClassifyFileMode, ClassifySkipped uint64
 	// File-mode outcomes.
@@ -55,6 +58,7 @@ type atomicStats struct {
 	cacheHits, cacheMisses, cacheEvictions        atomic.Uint64
 	fetchSuccessDebuginfo, fetchSuccessExecutable atomic.Uint64
 	fetch404s, fetchErrors                        atomic.Uint64
+	fetchTooSlow                                  atomic.Uint64
 	fetchBytesTotal                               atomic.Uint64
 	inFlightFetches                               atomic.Int64
 	dispatcherCalls, dispatcherSkippedLocal       atomic.Uint64
@@ -74,6 +78,10 @@ type atomicStats struct {
 func (a *atomicStats) noteFetchErr(err error) {
 	if errors.Is(err, ErrNotFound) {
 		a.fetch404s.Add(1)
+		return
+	}
+	if _, ok := asTooSlow(err); ok {
+		a.fetchTooSlow.Add(1)
 		return
 	}
 	a.fetchErrors.Add(1)
@@ -103,6 +111,7 @@ func (a *atomicStats) snapshot() Stats {
 		FetchSuccessExecutable: a.fetchSuccessExecutable.Load(),
 		Fetch404s:              a.fetch404s.Load(),
 		FetchErrors:            a.fetchErrors.Load(),
+		FetchTooSlow:           a.fetchTooSlow.Load(),
 		FetchBytesTotal:        a.fetchBytesTotal.Load(),
 		InFlightFetches:        a.inFlightFetches.Load(),
 		DispatcherCalls:        a.dispatcherCalls.Load(),

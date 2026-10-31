@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-31
+
+A fixes release for the GPU adapter and for symbolization. Three ways the CUDA
+adapter could hang or crash the profiled process are gone, and debuginfod is now
+opt-in: **if you relied on `DEBUGINFOD_URLS` alone, add `--debuginfod`.**
+
 ### Added
 
 - **Python frames in system-wide captures** ([#194](https://github.com/dpsoft/perf-agent/issues/194)).
@@ -42,6 +48,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The CUDA adapter could deadlock the application at module load**
+  ([#211](https://github.com/dpsoft/perf-agent/issues/211)). Under lazy module loading, the adapter computed the cubin CRC on
+  the application's thread, inside `cuLaunchKernel`, while its timer held the
+  CUPTI guard across an activity flush. A PyTorch workload hung in 1 of 8
+  runs with only the shim injected, and 4 of 7 captures with the agent came
+  back empty. The application thread now only copies the cubin; the CRC and
+  the `gpu_module_load_v1` record are computed on the adapter's timer. On an
+  RTX 3090: 30 of 30 runs completed. The exit report gains
+  `cubin_pending_full` and `cubin_pending_depth`.
+- **PC sampling crashed PyTorch on hosts with a CUDA toolkit installed**
+  ([#215](https://github.com/dpsoft/perf-agent/issues/215)). CUPTI loads `libnvperf_host.so` by name, so the CUDA 13 wheels'
+  CUPTI picked up the toolkit's copy and segfaulted at context creation, 20 of
+  20 runs. With a PC tier selected, the adapter now loads the copy next to the
+  `libcupti` in use first. If a different copy is already mapped, PC sampling
+  is turned off for that process and the log names both paths, instead of the
+  process crashing. The exit report gains `nvperf=`.
+- **Continuous PC sampling deadlocked processes that unload modules from
+  several threads** ([#214](https://github.com/dpsoft/perf-agent/issues/214)), 15 of 15 runs. The adapter's timer held the
+  CUPTI guard across `cuptiActivityFlushAll`, which waits on a CUPTI worker
+  that needs the driver lock the unloading thread holds. The flush now runs
+  outside the guard; the exit report's `cupti_flush_under_guard` must read 0.
+  `make -C shim check-nvidia-unload` reproduces the case on a GPU.
 - **Symbolization on distributions that ship MiniDebugInfo** ([#220](https://github.com/dpsoft/perf-agent/issues/220)).
   Fedora and RHEL strip binaries down to an xz-compressed symbol table in
   `.gnu_debugdata`. libblazesym_c was built without its `xz` feature, so every
@@ -64,15 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The summary line always printed `fetches ok=0 404=0 err=0 bytes=0MB` for
     debuginfo, because the code path that fetches it never updated those
     counters. It now does, and each fetch that fails for a reason other than
-    a 404 is logged once per build-id with the binary's path. A timeout gets a
-    hint: a large debuginfo file (Mesa's `libgallium`, 167 MB) cannot arrive
-    within the 5 s default on a slow link, and is cut off on every capture.
+    a 404 is logged once per build-id with the binary's path. A file too
+    large for the budget is now stopped early instead (see
+    `--debuginfod-prefetch` above).
 - **`--no-debuginfod` did nothing** ([#111](https://github.com/dpsoft/perf-agent/issues/111)).
   It set an option that nothing read, so a capture with it still fetched from
   `DEBUGINFOD_URLS`. It now always wins, and combining it with `--debuginfod`
   or `--debuginfod-url` is an error.
 
-## [1.3.0] - 2026-10-09
+### Internal
+
+- CI runs the shim's ThreadSanitizer tests on amd64 and arm64 ([#213](https://github.com/dpsoft/perf-agent/issues/213)).
+
+## [1.3.0] - 2026-10-15
 
 The GPU and Python release. perf-agent can now attribute CUDA kernel time to the
 CPU stacks that launched it, and name Python frames walked out of the live
@@ -375,7 +407,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/dpsoft/perf-agent/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/dpsoft/perf-agent/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/dpsoft/perf-agent/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/dpsoft/perf-agent/compare/v1.1.0...v1.2.0

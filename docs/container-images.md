@@ -1,11 +1,11 @@
 # Container images
 
-v1.3.0 publishes two images, multi-arch (amd64 and arm64), built natively on
-each architecture rather than under emulation:
+Every release since v1.3.0 publishes two images, multi-arch (amd64 and
+arm64), built natively on each architecture rather than under emulation:
 
 ```
-ghcr.io/dpsoft/perf-agent:v1.3.0        # the profiler
-ghcr.io/dpsoft/perf-agent-shim:v1.3.0   # the CUPTI adapter, as a carrier image
+ghcr.io/dpsoft/perf-agent:v1.4.0        # the profiler
+ghcr.io/dpsoft/perf-agent-shim:v1.4.0   # the CUPTI adapter, as a carrier image
 ```
 
 Both carry the same tag on purpose. The shim's USDT record layouts are frozen
@@ -31,7 +31,7 @@ container also mounts. That is what `examples/kubernetes/` does.
 **By taking the file out**, for anything that is not Kubernetes:
 
 ```bash
-id=$(podman create ghcr.io/dpsoft/perf-agent-shim:v1.3.0)
+id=$(podman create ghcr.io/dpsoft/perf-agent-shim:v1.4.0)
 podman cp "$id":/usr/local/lib/libperfagent-gpu-nvidia.so ./shim.so
 podman rm "$id"
 ```
@@ -79,7 +79,7 @@ podman run --rm \
   --cap-add=SYS_PTRACE --cap-add=CHECKPOINT_RESTORE \
   -v /sys/kernel/btf:/sys/kernel/btf:ro \
   -v "$PWD":/profiles \
-  ghcr.io/dpsoft/perf-agent:v1.3.0 \
+  ghcr.io/dpsoft/perf-agent:v1.4.0 \
     -pid <PID> -out /profiles/gpu.pb.gz -duration 60s
 ```
 

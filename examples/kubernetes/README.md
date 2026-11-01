@@ -5,12 +5,12 @@ Profile a PyTorch CUDA workload running in Kubernetes, without rebuilding it,
 relinking it, or changing a line of its code — then render the result as a
 flame graph.
 
-> **Status: runnable.** v1.3.0 publishes both images, so these manifests
+> **Status: runnable.** Releases since v1.3.0 publish both images, so these manifests
 > pull. What you still need is a cluster with an NVIDIA GPU node.
 >
 > ```
-> ghcr.io/dpsoft/perf-agent:v1.3.0        # the profiler
-> ghcr.io/dpsoft/perf-agent-shim:v1.3.0   # the CUPTI adapter, as a carrier image
+> ghcr.io/dpsoft/perf-agent:v1.4.0        # the profiler
+> ghcr.io/dpsoft/perf-agent-shim:v1.4.0   # the CUPTI adapter, as a carrier image
 > ```
 >
 > The manifests here name `:latest`. Pin the version in anything you keep:

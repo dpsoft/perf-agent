@@ -272,7 +272,16 @@ jobs:
         id: tag_message
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG_NAME" 2>/dev/null | head -n -1 || echo "")
+          # actions/checkout re-fetches the pushed tag as
+          # +<commit>:refs/tags/<tag>, which replaces the annotated tag with a
+          # lightweight one. %(contents) then reads the commit's message, and
+          # v1.3.0 and v1.4.0 were both published with it. Fetch the tag object
+          # back, and take a message only from a tag object: never a commit's.
+          git fetch --no-tags --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TAG_MESSAGE=""
+          if [ "$(git cat-file -t "refs/tags/$TAG_NAME")" = tag ]; then
+            TAG_MESSAGE=$(git for-each-ref --format='%(contents)' "refs/tags/$TAG_NAME")
+          fi
           if [ -z "$TAG_MESSAGE" ] || [ "$TAG_MESSAGE" = "$TAG_NAME" ]; then
             TAG_MESSAGE="Release $TAG_NAME"
           fi

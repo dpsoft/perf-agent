@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-10-31
+## [1.4.0] - 2026-11-01
 
 A fixes release for the GPU adapter and for symbolization. Three ways the CUDA
 adapter could hang or crash the profiled process are gone, and debuginfod is now

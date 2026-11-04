@@ -193,3 +193,19 @@ func FuzzRead(f *testing.F) {
 		_, _, _ = Read(bytes.NewReader(b), nil)
 	})
 }
+
+// BenchmarkWriterAdd is the per-row cost the GPU drain pays while it holds
+// the profile lock; it has to stay small next to projecting the sample.
+func BenchmarkWriterAdd(b *testing.B) {
+	w, err := Create(filepath.Join(b.TempDir(), "bench.exec"), hdr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer w.Abort()
+	b.ReportAllocs()
+	var i uint64
+	for b.Loop() {
+		w.Add(Row{Sample: uint32(i % 8), Execution: i, HasCorrelation: true, Correlation: 4294967296 + i, Value: 1200 + i%300})
+		i++
+	}
+}

@@ -91,6 +91,10 @@ type Writer struct {
 	crc       hash.Hash32
 	err       error
 
+	// row is reused to encode one row, so Add makes one buffered write and
+	// no allocations: it runs once per projected GPU sample.
+	row []byte
+
 	rows, executions uint64
 	nextOrdinal      uint64 // previous ordinal + 1; 0 before the first row
 	prevCorrelation  uint64
@@ -153,19 +157,21 @@ func (w *Writer) Add(r Row) {
 	}
 	// nextOrdinal starts at 0, so the first row's delta is ordinal+1 >= 1.
 	delta := r.Execution + 1 - w.nextOrdinal
-	w.writeRaw([]byte{tagRow})
-	w.uvarint(uint64(r.Sample))
-	w.uvarint(delta)
 	var flags byte
 	if r.HasCorrelation {
 		flags |= flagCorrelation
 	}
-	w.writeRaw([]byte{flags})
+	b := append(w.row[:0], tagRow)
+	b = binary.AppendUvarint(b, uint64(r.Sample))
+	b = binary.AppendUvarint(b, delta)
+	b = append(b, flags)
 	if r.HasCorrelation {
-		w.uvarint(zigzag(r.Correlation - w.prevCorrelation))
+		b = binary.AppendUvarint(b, zigzag(r.Correlation-w.prevCorrelation))
 		w.prevCorrelation = r.Correlation
 	}
-	w.uvarint(r.Value)
+	b = binary.AppendUvarint(b, r.Value)
+	w.row = b
+	w.writeRaw(b)
 	if delta > 0 {
 		w.executions++
 	}

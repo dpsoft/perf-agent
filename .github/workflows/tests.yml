@@ -515,6 +515,12 @@ jobs:
         with:
           version: v2.11.4
           args: --timeout=5m
+          # The action's analysis cache made staticcheck report false SA5011
+          # (a nil dereference after t.Fatal) in unchanged tests: a cache
+          # saved by a passing run on main failed every PR run that restored
+          # it, and the same code passed with the entry deleted (#234). The
+          # result must depend on the code, not on which cache was restored.
+          skip-cache: true
 
   build:
     name: Build (${{ matrix.arch }})

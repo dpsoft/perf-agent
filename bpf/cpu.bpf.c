@@ -226,8 +226,11 @@ int BPF_PROG(handle_switch, bool preempt, struct task_struct *prev, struct task_
         cache_miss = read_counter_delta(&cache_misses_reader, &prev_cache_misses, cpu);
     }
 
+    // last_seen is a PERCPU_ARRAY: every slot exists from load time, holding
+    // 0, so the lookup never returns NULL. 0 means no switch has been seen on
+    // this CPU yet, and now - 0 would be the time since boot (#236).
     u64 *last_ts = bpf_map_lookup_elem(&last_seen, &cpu);
-    u64 delta = last_ts ? now - *last_ts : 0;
+    u64 delta = (last_ts && *last_ts) ? now - *last_ts : 0;
 
     // --- Handle NEXT task coming ON-CPU ---
     // Calculate runqueue latency (time from wakeup to now)

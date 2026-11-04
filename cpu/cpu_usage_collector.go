@@ -94,47 +94,7 @@ func (c *CPUUsageCollector) ReadCPUUsage() error {
 
 		switch size {
 		case int(unsafe.Sizeof(PidStat{})):
-			ps := (*PidStat)(unsafe.Pointer(&rec.RawSample[0]))
-
-			// Get or create metrics for this PID
-			m, exists := c.metrics[ps.TGID]
-			if !exists {
-				m = &PidMetrics{
-					OnCPUHist:       hdrhistogram.New(0, 1000000000000000, 3), // 0-1 hour in ns
-					RunqLatencyHist: hdrhistogram.New(0, 1000000000000, 3),    // 0-1000 seconds in ns
-				}
-				c.metrics[ps.TGID] = m
-			}
-
-			// Record on-CPU time
-			if err := m.OnCPUHist.RecordValue(int64(ps.DeltaNs)); err != nil {
-				log.Printf("[PID %d] Error recording on-CPU time: %v (value=%d ns = %.0f sec)",
-					ps.TGID, err, ps.DeltaNs, float64(ps.DeltaNs)/1e9)
-			}
-
-			// Record runqueue latency (if available)
-			if ps.RunqLatencyNs > 0 {
-				if err := m.RunqLatencyHist.RecordValue(int64(ps.RunqLatencyNs)); err != nil {
-					log.Printf("[PID %d] Error recording runq latency: %v (value=%d ns = %.3f ms)",
-						ps.TGID, err, ps.RunqLatencyNs, float64(ps.RunqLatencyNs)/1e6)
-				}
-			}
-
-			// Accumulate hardware counter values
-			m.TotalCycles += ps.Cycles
-			m.TotalInstructions += ps.Instructions
-			m.TotalCacheMisses += ps.CacheMisses
-			m.SampleCount++
-
-			// Track task state when switched out
-			switch ps.PrevState {
-			case StateRunning:
-				m.PreemptedCount++
-			case StateInterruptible:
-				m.VoluntaryCount++
-			case StateUninterruptible:
-				m.IOWaitCount++
-			}
+			c.recordPidStat((*PidStat)(unsafe.Pointer(&rec.RawSample[0])))
 
 		case int(unsafe.Sizeof(CpuStat{})):
 			cs := (*CpuStat)(unsafe.Pointer(&rec.RawSample[0]))
@@ -150,6 +110,52 @@ func (c *CPUUsageCollector) ReadCPUUsage() error {
 			log.Printf("Unexpected ringbuf size: %d bytes (PidStat=%d, CpuStat=%d)",
 				size, unsafe.Sizeof(PidStat{}), unsafe.Sizeof(CpuStat{}))
 		}
+	}
+}
+
+// recordPidStat folds one switch-out event into its process's metrics.
+func (c *CPUUsageCollector) recordPidStat(ps *PidStat) {
+	// Get or create metrics for this PID
+	m, exists := c.metrics[ps.TGID]
+	if !exists {
+		m = &PidMetrics{
+			OnCPUHist:       hdrhistogram.New(0, 1000000000000000, 3), // 0-1 hour in ns
+			RunqLatencyHist: hdrhistogram.New(0, 1000000000000, 3),    // 0-1000 seconds in ns
+		}
+		c.metrics[ps.TGID] = m
+	}
+
+	// Record on-CPU time. 0 means the BPF side had no earlier switch on that
+	// CPU to measure from, the first event per CPU, not a zero-length run (#236).
+	if ps.DeltaNs > 0 {
+		if err := m.OnCPUHist.RecordValue(int64(ps.DeltaNs)); err != nil {
+			log.Printf("[PID %d] Error recording on-CPU time: %v (value=%d ns = %.0f sec)",
+				ps.TGID, err, ps.DeltaNs, float64(ps.DeltaNs)/1e9)
+		}
+	}
+
+	// Record runqueue latency (if available)
+	if ps.RunqLatencyNs > 0 {
+		if err := m.RunqLatencyHist.RecordValue(int64(ps.RunqLatencyNs)); err != nil {
+			log.Printf("[PID %d] Error recording runq latency: %v (value=%d ns = %.3f ms)",
+				ps.TGID, err, ps.RunqLatencyNs, float64(ps.RunqLatencyNs)/1e6)
+		}
+	}
+
+	// Accumulate hardware counter values
+	m.TotalCycles += ps.Cycles
+	m.TotalInstructions += ps.Instructions
+	m.TotalCacheMisses += ps.CacheMisses
+	m.SampleCount++
+
+	// Track task state when switched out
+	switch ps.PrevState {
+	case StateRunning:
+		m.PreemptedCount++
+	case StateInterruptible:
+		m.VoluntaryCount++
+	case StateUninterruptible:
+		m.IOWaitCount++
 	}
 }
 

@@ -118,11 +118,16 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 	}
 	budget := newPCLabelBudget(cfg.MaxDistinctPCLabels)
 
+	var memo *projectionMemo
+	if cfg.OmitCorrelationLabel {
+		memo = newProjectionMemo()
+	}
+
 	samples := make([]pp.ProfileSample, 0, len(snap.Executions))
 	for viewIndex, view := range snap.Executions {
-		frames := projectionFrames(view)
+		frames := memo.frames(view)
 		pid := projectionPID(view)
-		common := projectionLabels(view, cfg.OmitCorrelationLabel)
+		common := memo.labels(view, cfg.OmitCorrelationLabel)
 
 		if len(view.PCSamples) == 0 {
 			samples = append(samples, pp.ProfileSample{
@@ -614,6 +619,75 @@ func labelPID(view ExecutionView) uint32 {
 // loses to the file the module store resolved, which is the only ordering
 // under which a producer-controlled string cannot claim to be a source
 // location this package derived.
+// projectionMemo shares the frames and the label map between executions that
+// would get identical ones, within one projection. Without gpu_correlation
+// most executions of a drain differ only in timing, so building a fresh
+// slice and map for each was most of the projection's allocation, and the
+// caller merges them into an existing sample straight away. Samples may
+// therefore share Stack and Labels: they are read-only. A nil memo builds
+// everything per execution.
+type projectionMemo struct {
+	frameMemo map[string][]pp.Frame
+	labelMemo map[labelKey]map[string]string
+}
+
+// labelKey is every input projectionLabels reads when the launch carries no
+// tags of its own and gpu_correlation is omitted.
+type labelKey struct {
+	pid          uint32
+	queue        string
+	device       string
+	join         JoinKind
+	ambiguous    bool
+	graphRefused bool
+	serialized   SerializationState
+	samplePeriod uint32 // 0 unless the launch has a sampled stack
+}
+
+func newProjectionMemo() *projectionMemo {
+	return &projectionMemo{frameMemo: make(map[string][]pp.Frame), labelMemo: make(map[labelKey]map[string]string)}
+}
+
+// frames is projectionFrames, shared per kernel name for executions with no
+// sampled CPU stack. A sampled stack is per launch, so those are built.
+func (m *projectionMemo) frames(view ExecutionView) []pp.Frame {
+	if _, sampled := sampledStack(view); m == nil || sampled {
+		return projectionFrames(view)
+	}
+	f, ok := m.frameMemo[view.Exec.KernelName]
+	if !ok {
+		f = projectionFrames(view)
+		m.frameMemo[view.Exec.KernelName] = f
+	}
+	return f
+}
+
+// labels is projectionLabels, shared per labelKey. Launch tags are arbitrary,
+// so a launch that has any is built on its own.
+func (m *projectionMemo) labels(view ExecutionView, omitCorrelation bool) map[string]string {
+	if m == nil || !omitCorrelation || (view.Launch != nil && len(view.Launch.Launch.Tags) > 0) {
+		return projectionLabels(view, omitCorrelation)
+	}
+	k := labelKey{
+		pid:          labelPID(view),
+		queue:        view.Exec.Queue.QueueID,
+		device:       view.Exec.Queue.Device.DeviceID,
+		join:         view.Join,
+		ambiguous:    view.Ambiguous,
+		graphRefused: view.GraphRefused,
+		serialized:   view.Serialized,
+	}
+	if _, sampled := sampledStack(view); sampled {
+		k.samplePeriod = view.Launch.Launch.SamplePeriod
+	}
+	l, ok := m.labelMemo[k]
+	if !ok {
+		l = projectionLabels(view, omitCorrelation)
+		m.labelMemo[k] = l
+	}
+	return l
+}
+
 func projectionLabels(view ExecutionView, omitCorrelation bool) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {

@@ -1039,6 +1039,8 @@ func BenchmarkProjectDrain(b *testing.B) {
 			for i := range views {
 				e := execFor(strconv.Itoa(4294967296+i), uint64(i)*10, uint64(i)*10+5)
 				e.Correlation.PID = 1234
+				// A real drain repeats a handful of kernels, not one name each.
+				e.KernelName = []string{"axpy", "scale", "gemm", "softmax"}[i%4]
 				views[i] = ExecutionView{Exec: e}
 			}
 			snap := Snapshot{Executions: views}
@@ -1059,4 +1061,40 @@ func TestOmitCorrelationLabelRemovesOnlyThatLabel(t *testing.T) {
 	require.Contains(t, with[0].Labels, "gpu_correlation")
 	delete(with[0].Labels, "gpu_correlation")
 	assert.Equal(t, with[0].Labels, without[0].Labels)
+}
+
+// The memo used when gpu_correlation is omitted must project exactly what
+// building every frame slice and label map would, for every input the
+// labels and frames depend on.
+func TestProjectionMemoMatchesBuildingEverySample(t *testing.T) {
+	stack := []pp.Frame{{Name: "launch_site"}, {Name: "main"}}
+	var views []ExecutionView
+	for i := range 64 {
+		e := execFor(strconv.Itoa(1000+i), uint64(i)*10, uint64(i)*10+5)
+		e.KernelName = []string{"k1", "k2", "k3"}[i%3]
+		e.Correlation.PID = uint32(100 + i%2)
+		e.Queue.QueueID = strconv.Itoa(i % 2)
+		e.Queue.Device.DeviceID = strconv.Itoa(i % 3)
+		v := ExecutionView{Exec: e, Join: []JoinKind{JoinExact, JoinHeuristic, ""}[i%3], Ambiguous: i%5 == 0, GraphRefused: i%7 == 0, Serialized: SerializationState(i % 3)}
+		switch i % 4 {
+		case 1: // sampled stack
+			v.Launch = &GPUKernelLaunch{Launch: LaunchContext{PID: e.Correlation.PID, CPUStack: stack, SamplePeriod: 64}}
+		case 2: // launch tags of its own
+			v.Launch = &GPUKernelLaunch{Launch: LaunchContext{PID: e.Correlation.PID, Tags: map[string]string{"pod_uid": "p" + strconv.Itoa(i)}}}
+		case 3: // PC samples
+			v.PCSamples = []GPUPCSample{{PCOffset: 0x10, Count: 1}, {PCOffset: uint64(i), Count: 2}}
+		}
+		views = append(views, v)
+	}
+	snap := Snapshot{Executions: views}
+	fresh, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
+	memo, _ := ProjectExecutionsWith(snap, ProjectionConfig{OmitCorrelationLabel: true})
+	require.Len(t, memo, len(fresh))
+	for i := range fresh {
+		delete(fresh[i].Labels, "gpu_correlation")
+		assert.Equal(t, fresh[i].Labels, memo[i].Labels, "sample %d labels", i)
+		assert.Equal(t, fresh[i].Stack, memo[i].Stack, "sample %d stack", i)
+		assert.Equal(t, fresh[i].Value, memo[i].Value, "sample %d value", i)
+		assert.Equal(t, fresh[i].Pid, memo[i].Pid, "sample %d pid", i)
+	}
 }

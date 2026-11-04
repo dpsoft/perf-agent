@@ -66,6 +66,30 @@ another path capture nothing.
 CPU stack. Lowering it raises the event rate; see
 [GPU injection](gpu-injection.md) for what that costs.
 
+At shutdown, GPU diagnostics distinguish several kinds of incomplete data:
+
+- `kernel_dropped` counts **wire records** lost in BPF transport, broken down
+  by kind. `exec` records carry measured GPU durations; `launch` and
+  `sampled_launch` records carry CPU attribution. The total is not a count of
+  missing kernels. Unreadable BPF counter slots are reported explicitly.
+- `sequence_gaps` counts **batches**, whose record counts are unknown. These
+  gaps can overlap the BPF losses and must not be added to them.
+- `CPU attribution incomplete` describes missing, evicted or unresolved CPU
+  stacks. GPU executions may still be present with measured durations and no
+  caller attribution; this is not evidence of missing GPU time by itself.
+- `sink_rejected` counts events rejected after transport. Timeline eviction
+  has a separate message for executions, events and modules evicted before
+  profile projection.
+
+`--gpu-ring-bytes` can absorb larger bursts, at the cost of memory, but cannot
+make a continuously overloaded consumer keep up. Increasing the target's
+`PERFAGENT_GPU_SAMPLE_PERIOD` reduces CPU stack sampling and attribution detail;
+it does not intentionally sample GPU execution records. The setting must be
+present when the target starts. Sampled launches use a compact BPF message, but
+symbolization still runs in the consumer and high event rates can exceed its
+throughput. Do not infer complete execution capture solely from a nonempty
+profile or from a missing attribution warning.
+
 ## GPU device telemetry
 
 Collect hardware sensors without starting a profiler:

@@ -616,6 +616,13 @@ type Stats struct {
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
 	// map on each Stats call.
 	KernelDropped uint64
+	// KernelDroppedByKind partitions KernelDropped by wire record kind. A
+	// launch, an execution and its sampled stack are different records; only
+	// lost execution records directly quantify missing measured GPU work.
+	KernelDroppedByKind RecordKindCounts
+	// KernelDropReadErrors counts slots that could not be read in this
+	// snapshot. The reported drop counts are incomplete when it is nonzero.
+	KernelDropReadErrors uint64
 	// SampledLaunches counts gpu_launch_sampled_v1 records decoded. It is the
 	// denominator the sampling period is checked against: the producer prints
 	// how many launches it sampled, and the two must agree.
@@ -3250,7 +3257,8 @@ func (c *Consumer) Stats() Stats {
 	out := c.stats
 	out.DecodeFailures = c.decodeFailures.snapshot()
 	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
-	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
+	out.KernelDroppedByKind, out.KernelDropReadErrors = readKindCounts(c.objs.Dropped)
+	out.KernelDropped = out.KernelDroppedByKind.Total()
 	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
 	// Why each of those captures failed. StackWalkEmpty already carries the
 	// consumer-side count; the BPF side's is added to it rather than kept

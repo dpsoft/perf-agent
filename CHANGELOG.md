@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-04
+
+A patch release for `--gpu`, which could write a profile missing GPU work
+without saying so. On a BF16 LoRA fine-tuning run on an RTX 3090, a 64-step
+window kept 131,072 of 243,387 kernels with v1.4.0 and keeps all 243,387 now;
+windows under 2 s, which v1.4.0 reported as "no GPU activity", are written
+whole.
+
 ### Fixed
 
 - **`--gpu` no longer drops GPU work past 65,536 executions per interval, and
@@ -420,7 +428,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/dpsoft/perf-agent/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/dpsoft/perf-agent/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/dpsoft/perf-agent/compare/v1.2.0...v1.2.1

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional finite GPU device telemetry through NVML: temperature, power, memory,
+  utilization, clocks and clock-event reasons, with console summaries and JSONL
+  readings. Runs alone without a PID or BPF, or alongside a profile. `/metrics`
+  remains internal diagnostics; unsupported readings are explicit, not zeros.
+
+### Changed
+
+- `make build` keeps system libraries dynamic for NVML loading and links the
+  blazesym archive explicitly, without requiring its shared library at runtime.
+
 ### Fixed
 
 - **`--gpu` no longer drops GPU work past 65,536 executions per interval, and

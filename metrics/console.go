@@ -28,6 +28,14 @@ func (e *ConsoleExporter) Name() string {
 
 // Export outputs the metrics snapshot to the console.
 func (e *ConsoleExporter) Export(ctx context.Context, snapshot *MetricsSnapshot) error {
+	if snapshot.GPU != nil {
+		if err := writeGPUConsole(e.Writer, snapshot.GPU); err != nil {
+			return err
+		}
+		if len(snapshot.Processes) == 0 {
+			return nil
+		}
+	}
 	if len(snapshot.Processes) == 0 {
 		_, _ = fmt.Fprintln(e.Writer, "\nNo PMU metrics collected")
 		return nil

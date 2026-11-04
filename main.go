@@ -138,11 +138,25 @@ var pmuFile *os.File
 
 func main() {
 	flag.Parse()
-
 	if flagDebuginfodPrefetch {
+		if gpuTelemetryEnabled() {
+			fmt.Fprintln(os.Stderr, "perf-agent: GPU telemetry cannot be combined with --debuginfod-prefetch")
+			os.Exit(2)
+		}
 		os.Exit(runPrefetch())
 	}
+	profiling := *flagProfile || *flagOffCpu || *flagGPU || *flagPMU
+	if err := validateTelemetryFlags(profiling); err != nil {
+		fmt.Fprintln(os.Stderr, "perf-agent:", err)
+		os.Exit(2)
+	}
+	if gpuTelemetryEnabled() {
+		os.Exit(runCapture())
+	}
+	runLegacyCapture()
+}
 
+func runLegacyCapture() {
 	// Build options from flags
 	opts := buildOptions()
 

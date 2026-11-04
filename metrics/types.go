@@ -5,6 +5,8 @@ import "time"
 
 // MetricsSnapshot represents a point-in-time capture of performance metrics.
 type MetricsSnapshot struct {
+	GPU *GPUMetrics
+
 	Timestamp  time.Time
 	SystemWide bool
 	Processes  map[uint32]*ProcessMetrics
@@ -34,9 +36,9 @@ type LatencyStats struct {
 
 // ContextSwitchStats tracks reasons for context switches.
 type ContextSwitchStats struct {
-	PreemptedCount  uint64 // Switched out while running (preempted)
-	VoluntaryCount  uint64 // Voluntary sleep (interruptible)
-	IOWaitCount     uint64 // I/O wait (uninterruptible/D state)
+	PreemptedCount uint64 // Switched out while running (preempted)
+	VoluntaryCount uint64 // Voluntary sleep (interruptible)
+	IOWaitCount    uint64 // I/O wait (uninterruptible/D state)
 }
 
 // HardwareCounterStats contains hardware PMU counter values.

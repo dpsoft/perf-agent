@@ -152,7 +152,7 @@ func main() {
 		}
 		os.Exit(runPrefetch())
 	}
-	if err := errors.Join(validateGPUSampleFlags(), validateGPUExecutionsAgainstPMU()); err != nil {
+	if err := validateGPUSampleFlags(); err != nil {
 		fmt.Fprintln(os.Stderr, "perf-agent:", err)
 		os.Exit(2)
 	}
@@ -249,16 +249,29 @@ func validateGPUSampleFlags() error {
 	return nil
 }
 
-// validateGPUExecutionsAgainstPMU rejects a GPU executions log at the PMU
-// output's path. It runs before anything is opened, since the PMU output is
-// created, and truncated, while the options are built, before the agent
-// validates its own outputs. An automatic PMU name is new and cannot match.
-func validateGPUExecutionsAgainstPMU() error {
-	exec, pmu := *flagGPUExecutionsOutput, *flagPMUOutput
-	if !*flagGPU || exec == "" || !*flagPMU || pmu == "" || pmu == "auto" {
+// pmuOutputPath is the file PMU metrics are written to, with an automatic
+// name resolved, or "" when they go to stdout or PMU is off.
+func pmuOutputPath() string {
+	if !*flagPMU || *flagPMUOutput == "" {
+		return ""
+	}
+	if *flagPMUOutput == "auto" {
+		// Process and minute only: it can name a file that already exists.
+		return generateOutputName(*flagPID, *flagAll, "pmu", "txt")
+	}
+	return *flagPMUOutput
+}
+
+// checkExecutionsOffPMU rejects a GPU executions log at pmuPath, the PMU
+// output as it will be created. It must run before that file is created:
+// the agent validates its outputs only later, after the PMU file has
+// already been truncated.
+func checkExecutionsOffPMU(pmuPath string) error {
+	exec := *flagGPUExecutionsOutput
+	if !*flagGPU || exec == "" || pmuPath == "" {
 		return nil
 	}
-	if execlog.SameDestination(exec, pmu) {
+	if execlog.SameDestination(exec, pmuPath) {
 		return fmt.Errorf("--gpu-executions-output %s is also the PMU output", exec)
 	}
 	return nil
@@ -395,11 +408,12 @@ func buildOptions() []perfagent.Option {
 		}
 	}
 
-	// Resolved once: an automatic name carries a timestamp, and the GPU
-	// executions log must be kept off the exact file that gets written.
-	pmuPath := *flagPMUOutput
-	if *flagPMU && pmuPath == "auto" {
-		pmuPath = generateOutputName(*flagPID, *flagAll, "pmu", "txt")
+	// Resolved once, so the GPU executions log is checked against, and kept
+	// off, the exact file that gets written. Checked here, before the PMU
+	// output is created and truncated below.
+	pmuPath := pmuOutputPath()
+	if err := checkExecutionsOffPMU(pmuPath); err != nil {
+		log.Fatal(err)
 	}
 
 	if *flagGPU {

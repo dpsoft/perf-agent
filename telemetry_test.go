@@ -231,13 +231,15 @@ func TestCaptureOutputsAreComparedThroughAliases(t *testing.T) {
 }
 
 // A GPU executions log at the PMU output's path is rejected before the PMU
-// file is created and truncated.
+// file is created and truncated, also when the PMU name is automatic and
+// matches a file that already exists.
 func TestGPUExecutionsAtThePMUOutputIsRejectedFirst(t *testing.T) {
 	defer func(pmu bool, pmuOut string, gpu bool, execOut string) {
 		*flagPMU, *flagPMUOutput, *flagGPU, *flagGPUExecutionsOutput = pmu, pmuOut, gpu, execOut
 	}(*flagPMU, *flagPMUOutput, *flagGPU, *flagGPUExecutionsOutput)
 
 	dir := t.TempDir()
+	t.Chdir(dir)
 	realDir := filepath.Join(dir, "real")
 	if err := os.Mkdir(realDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -247,16 +249,31 @@ func TestGPUExecutionsAtThePMUOutputIsRejectedFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	*flagGPU, *flagPMU = true, true
+
 	*flagPMUOutput, *flagGPUExecutionsOutput = filepath.Join(realDir, "pmu.txt"), filepath.Join(alias, "pmu.txt")
-	if validateGPUExecutionsAgainstPMU() == nil {
+	if checkExecutionsOffPMU(pmuOutputPath()) == nil {
 		t.Error("executions log accepted at the PMU output's path")
 	}
+
+	*flagPMUOutput = "auto"
+	auto := pmuOutputPath()
+	if auto == "" || auto == "auto" {
+		t.Fatalf("automatic PMU name not resolved: %q", auto)
+	}
+	if err := os.WriteFile(auto, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	*flagGPUExecutionsOutput = auto
+	if checkExecutionsOffPMU(auto) == nil {
+		t.Error("executions log accepted at the resolved automatic PMU name")
+	}
+
 	*flagGPUExecutionsOutput = filepath.Join(realDir, "gpu.exec")
-	if err := validateGPUExecutionsAgainstPMU(); err != nil {
+	if err := checkExecutionsOffPMU(auto); err != nil {
 		t.Errorf("distinct paths: %v", err)
 	}
-	*flagPMUOutput = "auto"
-	if err := validateGPUExecutionsAgainstPMU(); err != nil {
-		t.Errorf("automatic PMU name: %v", err)
+	*flagPMU = false
+	if got := pmuOutputPath(); got != "" {
+		t.Errorf("PMU off: pmuOutputPath() = %q", got)
 	}
 }

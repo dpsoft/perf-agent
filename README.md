@@ -89,3 +89,7 @@ Deeper notes: [GPU injection](docs/gpu-injection.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) ·
 [Security](SECURITY.md) ·
 [License](LICENSE) (Apache-2.0)
+
+GPU device telemetry also supports continuous collection and optional OTLP/HTTP
+metrics export. See [continuous telemetry](docs/usage.md#continuous-gpu-telemetry-and-otlp)
+for lifecycle, retention, delivery and writer ownership behavior.

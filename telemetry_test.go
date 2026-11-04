@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/stretchr/testify/require"
 )
 
@@ -97,4 +98,81 @@ func TestExplicitDefaultIntervalNeedsTelemetry(t *testing.T) {
 	flag.CommandLine.Duration("gpu-telemetry-interval", time.Second, "")
 	require.NoError(t, flag.CommandLine.Parse([]string{"--gpu-telemetry-interval=1s"}))
 	require.ErrorContains(t, validateTelemetryFlags(true), "require --gpu-telemetry")
+}
+
+func TestContinuousProfileWindowDoesNotStopTelemetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	profileCtx, endProfile := context.WithCancel(t.Context())
+	defer endProfile()
+	results := make(chan error, 1)
+	stopped := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- waitForContinuous(ctx, profileCtx, results, func() error { close(stopped); return nil })
+	}()
+	endProfile()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("profile did not stop")
+	}
+	select {
+	case <-done:
+		t.Fatal("telemetry stopped with finite profile")
+	default:
+	}
+	cancel()
+	results <- nil
+	require.NoError(t, <-done)
+}
+func TestContinuousLocalFailureStopsProfileImmediately(t *testing.T) {
+	results := make(chan error, 1)
+	results <- errors.New("disk full")
+	stopped := false
+	err := waitForContinuous(t.Context(), t.Context(), results, func() error { stopped = true; return nil })
+	require.True(t, stopped)
+	require.ErrorContains(t, err, "disk full")
+}
+func TestOTLPEnvironmentDoesNotEnableTelemetry(t *testing.T) {
+	oldEnable, oldOutput, oldOTLP := *flagGPUTelemetry, *flagGPUTelemetryOutput, *flagOTLP
+	t.Cleanup(func() { *flagGPUTelemetry, *flagGPUTelemetryOutput, *flagOTLP = oldEnable, oldOutput, oldOTLP })
+	*flagGPUTelemetry, *flagGPUTelemetryOutput, *flagOTLP = false, "", false
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+	require.False(t, gpuTelemetryEnabled())
+}
+
+type failingProfile struct{ steps []string }
+
+func (p *failingProfile) Stop(context.Context) error {
+	p.steps = append(p.steps, "stop")
+	return errors.New("profile write failed")
+}
+func (p *failingProfile) Close() error { p.steps = append(p.steps, "close"); return nil }
+func TestProfileWindowReleasesResourcesEvenIfWritingFails(t *testing.T) {
+	p := &failingProfile{}
+	require.ErrorContains(t, stopAndCloseProfile(t.Context(), p), "write failed")
+	require.Equal(t, []string{"stop", "close"}, p.steps)
+}
+
+type consoleRecorder struct{ errors int }
+
+func (*consoleRecorder) Name() string { return "console-test" }
+func (e *consoleRecorder) Export(_ context.Context, s *metrics.MetricsSnapshot) error {
+	if s.GPU.Kind == "unavailable" {
+		e.errors++
+	}
+	return nil
+}
+func TestContinuousConsoleReportsOnlyErrorTransitions(t *testing.T) {
+	sink := &consoleRecorder{}
+	e := &transitionConsole{Exporter: sink}
+	failed := &metrics.MetricsSnapshot{GPU: &metrics.GPUMetrics{Kind: "unavailable", Error: "same failure"}}
+	for range 4 {
+		require.NoError(t, e.Export(t.Context(), failed))
+	}
+	require.Equal(t, 1, sink.errors)
+	require.NoError(t, e.Export(t.Context(), &metrics.MetricsSnapshot{GPU: &metrics.GPUMetrics{Kind: "initial"}}))
+	require.NoError(t, e.Export(t.Context(), failed))
+	require.Equal(t, 2, sink.errors)
 }

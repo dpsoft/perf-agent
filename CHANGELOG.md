@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Continuous GPU telemetry with bounded JSONL rotation, per-window summaries,
+  NVML rediscovery/recovery, and finite profiles that release resources while
+  telemetry continues. Explicit `--otlp` exports timestamped sensor gauges over
+  OTLP/HTTP with bounded buffering, timeouts and cooperative writer ownership.
+
 - Optional finite GPU device telemetry through NVML: temperature, power, memory,
   utilization, clocks and clock-event reasons, with console summaries and JSONL
   readings. Runs alone without a PID or BPF, or alongside a profile. `/metrics`

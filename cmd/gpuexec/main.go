@@ -9,9 +9,13 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
+	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 
 	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/google/pprof/profile"
@@ -32,7 +36,7 @@ func main() {
 	}
 }
 
-func run(profilePath, execPath string, asCSV bool) error {
+func run(profilePath, execPath string, asCSV bool) (err error) {
 	raw, err := os.ReadFile(profilePath)
 	if err != nil {
 		return err
@@ -41,49 +45,54 @@ func run(profilePath, execPath string, asCSV bool) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", profilePath, err)
 	}
-	// First pass: verify the whole log without keeping rows, so a corrupt
-	// file prints nothing but the error and memory stays O(1).
-	h, tr, err := readLog(execPath, nil)
+	// One descriptor for both passes: the file verified is the file printed,
+	// even if something replaces the path in between.
+	f, err := os.Open(execPath)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	// First pass: verify the whole log without keeping rows, so a corrupt
+	// file prints nothing but the error and memory stays O(1).
+	h, tr, err := execlog.Read(f, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", execPath, err)
 	}
 	if err := tr.Verify(raw, len(prof.Sample)); err != nil {
 		return err
 	}
 	if !asCSV {
-		fmt.Printf("capture %s, backend %s, %s\n", cmp.Or(h.CaptureID, "(none)"), h.Backend, h.SampleType)
-		fmt.Printf("%d rows from %d executions over %d aggregated samples; verified against %s\n",
+		_, err := fmt.Printf("capture %s, backend %s, %s\n%d rows from %d executions over %d aggregated samples; verified against %s\n",
+			cmp.Or(h.CaptureID, "(none)"), h.Backend, h.SampleType,
 			tr.Rows, tr.Executions, tr.AggregatedSamples, profilePath)
-		return nil
-	}
-	// Second pass: stream the verified rows.
-	w := bufio.NewWriter(os.Stdout)
-	defer func() { _ = w.Flush() }()
-	if _, err := fmt.Fprintln(w, "sample,leaf,execution,correlation,value"); err != nil {
 		return err
 	}
-	_, _, err = readLog(execPath, func(r execlog.Row) error {
+
+	// Second pass: stream the verified rows.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(os.Stdout)
+	out := csv.NewWriter(bw)
+	if err := out.Write([]string{"sample", "leaf", "execution", "correlation", "value"}); err != nil {
+		return err
+	}
+	_, _, err = execlog.Read(f, func(r execlog.Row) error {
+		if int(r.Sample) >= len(prof.Sample) {
+			return fmt.Errorf("row names sample %d of %d", r.Sample, len(prof.Sample))
+		}
 		corr := ""
 		if r.HasCorrelation {
-			corr = fmt.Sprintf("%s:%d", h.Backend, r.Correlation)
+			corr = h.Backend + ":" + strconv.FormatUint(r.Correlation, 10)
 		}
-		_, err := fmt.Fprintf(w, "%d,%q,%d,%s,%d\n", r.Sample, leaf(prof.Sample[r.Sample]), r.Execution, corr, r.Value)
-		return err
+		return out.Write([]string{
+			strconv.FormatUint(uint64(r.Sample), 10), leaf(prof.Sample[r.Sample]),
+			strconv.FormatUint(r.Execution, 10), corr, strconv.FormatUint(r.Value, 10),
+		})
 	})
-	return err
-}
-
-func readLog(path string, fn func(execlog.Row) error) (execlog.Header, execlog.Trailer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return execlog.Header{}, execlog.Trailer{}, err
-	}
-	defer func() { _ = f.Close() }()
-	h, tr, err := execlog.Read(f, fn)
-	if err != nil {
-		err = fmt.Errorf("%s: %w", path, err)
-	}
-	return h, tr, err
+	out.Flush()
+	return errors.Join(err, out.Error(), bw.Flush())
 }
 
 // leaf names a sample's innermost frame.

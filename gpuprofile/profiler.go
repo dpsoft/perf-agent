@@ -96,6 +96,10 @@ type Config struct {
 
 	// CaptureID identifies the capture in the executions log header.
 	CaptureID string
+
+	// ProtectedPaths are the capture's other outputs. The executions log is
+	// never published over any of them.
+	ProtectedPaths []string
 }
 
 // DefaultDrainEvery matches cmd/gpu-cuda-profile's default.
@@ -180,6 +184,7 @@ func New(cfg Config) (*Profiler, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gpuprofile: executions log: %w", err)
 		}
+		w.Protect(cfg.ProtectedPaths...)
 		execLog = w
 	}
 

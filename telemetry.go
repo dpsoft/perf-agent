@@ -93,6 +93,7 @@ func validateTelemetryOutput() error {
 		{*flagPMU, *flagPMUOutput}, {*flagProfile, *flagProfileOutput},
 		{*flagOffCpu, *flagOffcpuOutput}, {*flagGPU, *flagGPUOutput},
 		{*flagProfile, *flagPerfDataOutput}, {true, *flagFlamegraph},
+		{*flagGPU, *flagGPUExecutionsOutput},
 	}
 	paths := []string{*flagGPUTelemetryOutput}
 	if *flagContinuous {

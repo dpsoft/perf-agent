@@ -24,6 +24,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/cpu"
 	"github.com/dpsoft/perf-agent/gpuprobe"
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/gpuprofile"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
@@ -126,8 +127,8 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 // validateGPUExecutions checks the executions-log options: the log describes
-// the aggregated GPU profile, needs GPU profiling, and must not be the GPU
-// profile's own file.
+// the aggregated GPU profile, needs GPU profiling, and must not be any other
+// output of the capture, through a symlink either.
 func (c *Config) validateGPUExecutions() error {
 	if c.GPUExecutionsPath == "" {
 		return nil
@@ -138,23 +139,32 @@ func (c *Config) validateGPUExecutions() error {
 	if c.GPUPerExecutionSamples {
 		return errors.New("a GPU executions log describes the aggregated GPU profile; it cannot be combined with per-execution GPU samples")
 	}
-	if c.GPUProfilePath == "" {
-		return nil
-	}
-	exec, err1 := filepath.Abs(c.GPUExecutionsPath)
-	prof, err2 := filepath.Abs(c.GPUProfilePath)
-	if err := errors.Join(err1, err2); err != nil {
-		return err
-	}
-	if exec == prof {
-		return errors.New("the GPU executions log must not be the GPU profile's own path")
-	}
-	if a, err := os.Stat(exec); err == nil {
-		if b, err := os.Stat(prof); err == nil && os.SameFile(a, b) {
-			return errors.New("the GPU executions log must not be the GPU profile's own file")
+	for _, out := range c.outputPaths() {
+		if execlog.SameDestination(c.GPUExecutionsPath, out) {
+			return fmt.Errorf("the GPU executions log %s is also an output of this capture (%s)", c.GPUExecutionsPath, out)
 		}
 	}
 	return nil
+}
+
+// outputPaths are the files this capture writes, other than the GPU
+// executions log. Automatic flame graph names are chosen at write time and
+// are not known here.
+func (c *Config) outputPaths() []string {
+	var paths []string
+	add := func(enabled bool, p string) {
+		if enabled && p != "" && p != "auto" {
+			paths = append(paths, p)
+		}
+	}
+	add(c.EnableCPUProfile, c.CPUProfilePath)
+	add(c.EnableOffCPUProfile, c.OffCPUProfilePath)
+	add(c.EnableGPU, c.GPUProfilePath)
+	add(true, c.PerfDataOutput)
+	add(true, c.CPUFlamegraphPath)
+	add(true, c.OffCPUFlamegraphPath)
+	add(true, c.GPUFlamegraphPath)
+	return paths
 }
 
 func (c *Config) validate() error {
@@ -764,6 +774,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			PerExecutionSamples:       a.config.GPUPerExecutionSamples,
 			ExecutionsPath:            a.config.GPUExecutionsPath,
 			CaptureID:                 a.capture.ID,
+			ProtectedPaths:            a.config.outputPaths(),
 		})
 		if err != nil {
 			a.cleanup()

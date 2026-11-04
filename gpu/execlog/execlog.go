@@ -86,6 +86,7 @@ type Trailer struct {
 // Finish removes the temporary file, never a file already at path.
 type Writer struct {
 	path, tmp string
+	protected []string
 	f         *os.File
 	bw        *bufio.Writer
 	crc       hash.Hash32
@@ -179,6 +180,49 @@ func (w *Writer) Add(r Row) {
 	w.rows++
 }
 
+// Protect names files the log must never be published over: the other
+// outputs of the same capture. Finish re-checks them immediately before the
+// rename, so an alias created after validation is caught too.
+func (w *Writer) Protect(paths ...string) {
+	for _, p := range paths {
+		if p != "" {
+			w.protected = append(w.protected, p)
+		}
+	}
+}
+
+// SameDestination reports whether a and b name the same file, or would once
+// created: symlinks in the existing part of each path are resolved, so an
+// aliased directory or a link to a file not yet written still compares equal.
+func SameDestination(a, b string) bool {
+	ca, cb := canonical(a), canonical(b)
+	if ca == cb {
+		return true
+	}
+	ia, errA := os.Stat(a)
+	ib, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(ia, ib)
+}
+
+// canonical resolves p's symlinks as far as p exists and appends the rest.
+func canonical(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	rest := ""
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return abs
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+	}
+}
+
 // Err reports the first error, if any.
 func (w *Writer) Err() error { return w.err }
 
@@ -207,6 +251,11 @@ func (w *Writer) Finish(aggregatedSamples uint64, profileSHA256 [32]byte) error 
 	}
 	if cerr := w.f.Close(); w.err == nil {
 		w.err = cerr
+	}
+	for _, p := range w.protected {
+		if w.err == nil && SameDestination(w.path, p) {
+			w.err = fmt.Errorf("execlog: refusing to publish over %s, another output of this capture", p)
+		}
 	}
 	if w.err == nil {
 		w.err = os.Rename(w.tmp, w.path)

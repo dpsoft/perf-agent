@@ -209,3 +209,50 @@ func BenchmarkWriterAdd(b *testing.B) {
 		i++
 	}
 }
+
+// An aliased directory names the same destination as its target, also for a
+// file that does not exist yet.
+func TestSameDestinationResolvesAliasedParents(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+	if !SameDestination(filepath.Join(alias, "gpu.pb.gz"), filepath.Join(real, "gpu.pb.gz")) {
+		t.Error("an aliased parent of a not-yet-written file was not recognised")
+	}
+	if SameDestination(filepath.Join(real, "gpu.exec"), filepath.Join(real, "gpu.pb.gz")) {
+		t.Error("different files compared equal")
+	}
+}
+
+// Finish re-checks the protected outputs just before publishing: a link
+// pointing the log's path at another output, created after validation, must
+// not make the log replace that output.
+func TestFinishRefusesToPublishOverAProtectedOutput(t *testing.T) {
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "gpu.pb.gz")
+	logPath := filepath.Join(dir, "gpu.exec")
+	w, err := Create(logPath, hdr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Protect(profile)
+	w.Add(Row{Execution: 0, Value: 1})
+	if err := os.WriteFile(profile, []byte("the profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(profile, logPath); err != nil { // the alias appears late
+		t.Fatal(err)
+	}
+	if err := w.Finish(1, ProfileSHA256([]byte("the profile"))); err == nil {
+		t.Fatal("published over a protected output")
+	}
+	if b, _ := os.ReadFile(profile); string(b) != "the profile" {
+		t.Fatalf("protected output changed: %q", b)
+	}
+}

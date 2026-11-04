@@ -176,3 +176,23 @@ func TestContinuousConsoleReportsOnlyErrorTransitions(t *testing.T) {
 	require.NoError(t, e.Export(t.Context(), failed))
 	require.Equal(t, 2, sink.errors)
 }
+
+// The GPU sample-shape flags need --gpu; without it they used to be ignored.
+func TestGPUSampleFlagsRequireGPU(t *testing.T) {
+	defer func(g bool, e string, p bool) {
+		*flagGPU, *flagGPUExecutionsOutput, *flagGPUPerExecSamples = g, e, p
+	}(*flagGPU, *flagGPUExecutionsOutput, *flagGPUPerExecSamples)
+
+	*flagGPU, *flagGPUExecutionsOutput, *flagGPUPerExecSamples = false, "gpu.exec", false
+	if validateGPUSampleFlags() == nil {
+		t.Error("--gpu-executions-output accepted without --gpu")
+	}
+	*flagGPUExecutionsOutput, *flagGPUPerExecSamples = "", true
+	if validateGPUSampleFlags() == nil {
+		t.Error("--gpu-per-execution-samples accepted without --gpu")
+	}
+	*flagGPU = true
+	if err := validateGPUSampleFlags(); err != nil {
+		t.Errorf("with --gpu: %v", err)
+	}
+}

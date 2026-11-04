@@ -718,7 +718,11 @@ func projectionLabels(view ExecutionView, omitCorrelation bool) map[string]strin
 	if view.Exec.Queue.Device.DeviceID != "" {
 		labels["gpu_device"] = view.Exec.Queue.Device.DeviceID
 	}
-	if !omitCorrelation && view.Exec.Correlation.Present() {
+	if omitCorrelation {
+		// Also when it came in through the launch's own tags: a correlation
+		// label from anywhere would split samples that should merge.
+		delete(labels, "gpu_correlation")
+	} else if view.Exec.Correlation.Present() {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
 	}
 	switch view.Join {

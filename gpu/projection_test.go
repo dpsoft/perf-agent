@@ -1098,3 +1098,15 @@ func TestProjectionMemoMatchesBuildingEverySample(t *testing.T) {
 		assert.Equal(t, fresh[i].Pid, memo[i].Pid, "sample %d pid", i)
 	}
 }
+
+// With gpu_correlation omitted it cannot come back through the launch's own
+// tags either: that would split samples that should merge.
+func TestOmittedCorrelationDoesNotReturnThroughLaunchTags(t *testing.T) {
+	v := ExecutionView{Exec: execFor("123", 10, 20), Launch: &GPUKernelLaunch{
+		Launch: LaunchContext{Tags: map[string]string{"gpu_correlation": "caller-controlled", "pod_uid": "p"}},
+	}}
+	samples, _ := ProjectExecutionsWith(Snapshot{Executions: []ExecutionView{v}}, ProjectionConfig{OmitCorrelationLabel: true})
+	require.Len(t, samples, 1)
+	assert.NotContains(t, samples[0].Labels, "gpu_correlation")
+	assert.Equal(t, "p", samples[0].Labels["pod_uid"], "other tags are kept")
+}

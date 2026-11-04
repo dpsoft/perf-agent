@@ -151,6 +151,10 @@ func main() {
 		}
 		os.Exit(runPrefetch())
 	}
+	if err := validateGPUSampleFlags(); err != nil {
+		fmt.Fprintln(os.Stderr, "perf-agent:", err)
+		os.Exit(2)
+	}
 	profiling := *flagProfile || *flagOffCpu || *flagGPU || *flagPMU
 	if err := validateTelemetryFlags(profiling); err != nil {
 		fmt.Fprintln(os.Stderr, "perf-agent:", err)
@@ -210,6 +214,21 @@ func runLegacyCapture() {
 	}
 
 	fmt.Println("Exiting program.")
+}
+
+// validateGPUSampleFlags rejects the GPU sample-shape flags without --gpu,
+// where they would otherwise be silently ignored.
+func validateGPUSampleFlags() error {
+	if *flagGPU {
+		return nil
+	}
+	if *flagGPUExecutionsOutput != "" {
+		return errors.New("--gpu-executions-output requires --gpu")
+	}
+	if *flagGPUPerExecSamples {
+		return errors.New("--gpu-per-execution-samples requires --gpu")
+	}
+	return nil
 }
 
 // runPrefetch is the --debuginfod-prefetch mode: no BPF, no profile, just the

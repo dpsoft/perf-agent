@@ -148,7 +148,7 @@ For an existing CUDA process launched with the profiling adapter:
 
 ```bash
 # Use the same adapter file as the target's CUDA_INJECTION64_PATH.
-./perf-agent --pid <PID> --profile --gpu --gpu-shim /absolute/path/libperf_agent_cuda.so \
+./perf-agent --pid <PID> --profile --gpu --gpu-shim /absolute/path/libperfagent-gpu-nvidia.so \
     --duration 30s --profile-output cpu.pb.gz --gpu-output gpu.pb.gz \
     --gpu-telemetry-output gpu.jsonl --flamegraph-output auto
 ```

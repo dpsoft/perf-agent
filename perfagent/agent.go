@@ -782,6 +782,10 @@ func (a *Agent) Stop(ctx context.Context) error {
 
 	// Write GPU profile
 	if a.gpuProfiler != nil {
+		// Stop first: the final drain is what projects the last interval, so
+		// counting samples before it reported a capture shorter than one
+		// drain interval (2s) as "no GPU activity" and wrote nothing.
+		a.gpuProfiler.Stop()
 		// A run that attached but saw no GPU work writes nothing and says
 		// so. That is not an error -- a CUDA process can legitimately be
 		// idle for the window -- but it must not look like a successful
@@ -958,6 +962,8 @@ func (a *Agent) logGPUStats() {
 	if a.gpuProfiler == nil {
 		return
 	}
+	// The final drain settles Dropped; cleanup can reach here without Stop.
+	a.gpuProfiler.Stop()
 	st := a.gpuProfiler.Stats()
 	log.Printf("perf-agent: gpu: batches=%d records=%d sampled_launches=%d "+
 		"stacks_resolved=%d stacks_attached=%d",
@@ -972,6 +978,15 @@ func (a *Agent) logGPUStats() {
 			"worse; raise the period or shorten the capture",
 			lost, st.KernelDropped, st.StacksEvicted, st.SequenceGaps,
 			st.StacksMissing, st.SinkRejected)
+	}
+	// Lost after ingestion, so not in the line above: the timeline ring
+	// evicted them before a drain reached them.
+	if d := a.gpuProfiler.Dropped(); d.EvictedExecutions+d.EvictedEvents+d.EvictedModules > 0 {
+		log.Printf("perf-agent: gpu: LOST %d execution(s), %d event(s), %d module(s) "+
+			"evicted from the timeline before a drain reached them -- the profile "+
+			"under-reports GPU work. Kernels completed faster than the profiler "+
+			"could drain them",
+			d.EvictedExecutions, d.EvictedEvents, d.EvictedModules)
 	}
 }
 

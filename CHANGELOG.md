@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--gpu` no longer drops GPU work past 65,536 executions per interval, and
+  says so if it ever does** ([#228](https://github.com/dpsoft/perf-agent/issues/228)). The GPU profiler drained its timeline only
+  every 2 s, and the timeline holds 65,536 executions, so a workload completing
+  more than ~33k kernels/s lost the oldest with no message. On an RTX 3090,
+  a 4 s capture of 120k–350k kernels/s produced exactly 65,536 samples; it now
+  produces 400,426. The profiler also drains whenever the timeline passes half
+  full, and anything still evicted gets its own `LOST` line.
+- **A `--gpu` capture shorter than 2 s is no longer reported as empty.** The
+  agent counted GPU samples before the final drain, so it logged "no GPU
+  activity was observed" and wrote no profile.
+
 ## [1.4.0] - 2026-11-01
 
 A fixes release for the GPU adapter and for symbolization. Three ways the CUDA

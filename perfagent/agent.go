@@ -148,12 +148,12 @@ func (c *Config) validateGPUExecutions() error {
 }
 
 // outputPaths are the files this capture writes, its caller's included,
-// other than the GPU executions log. Automatic flame graph names are chosen at write time and
-// are not known here.
+// other than the GPU executions log. Paths are concrete here: the CLI
+// resolves "auto" names before building the options.
 func (c *Config) outputPaths() []string {
 	var paths []string
 	add := func(enabled bool, p string) {
-		if enabled && p != "" && p != "auto" {
+		if enabled && p != "" {
 			paths = append(paths, p)
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/perfagent"
 
@@ -151,7 +152,7 @@ func main() {
 		}
 		os.Exit(runPrefetch())
 	}
-	if err := validateGPUSampleFlags(); err != nil {
+	if err := errors.Join(validateGPUSampleFlags(), validateGPUExecutionsAgainstPMU()); err != nil {
 		fmt.Fprintln(os.Stderr, "perf-agent:", err)
 		os.Exit(2)
 	}
@@ -217,11 +218,12 @@ func runLegacyCapture() {
 }
 
 // externalOutputs are the files main writes itself during a capture: PMU
-// metrics and GPU telemetry, with its continuous-mode rotations.
-func externalOutputs() []string {
+// metrics at pmuPath, already resolved, and GPU telemetry with its
+// continuous-mode rotations.
+func externalOutputs(pmuPath string) []string {
 	var paths []string
-	if *flagPMU && *flagPMUOutput != "" {
-		paths = append(paths, *flagPMUOutput)
+	if *flagPMU && pmuPath != "" {
+		paths = append(paths, pmuPath)
 	}
 	if t := *flagGPUTelemetryOutput; t != "" {
 		paths = append(paths, t)
@@ -243,6 +245,21 @@ func validateGPUSampleFlags() error {
 	}
 	if *flagGPUPerExecSamples {
 		return errors.New("--gpu-per-execution-samples requires --gpu")
+	}
+	return nil
+}
+
+// validateGPUExecutionsAgainstPMU rejects a GPU executions log at the PMU
+// output's path. It runs before anything is opened, since the PMU output is
+// created, and truncated, while the options are built, before the agent
+// validates its own outputs. An automatic PMU name is new and cannot match.
+func validateGPUExecutionsAgainstPMU() error {
+	exec, pmu := *flagGPUExecutionsOutput, *flagPMUOutput
+	if !*flagGPU || exec == "" || !*flagPMU || pmu == "" || pmu == "auto" {
+		return nil
+	}
+	if execlog.SameDestination(exec, pmu) {
+		return fmt.Errorf("--gpu-executions-output %s is also the PMU output", exec)
 	}
 	return nil
 }
@@ -378,6 +395,13 @@ func buildOptions() []perfagent.Option {
 		}
 	}
 
+	// Resolved once: an automatic name carries a timestamp, and the GPU
+	// executions log must be kept off the exact file that gets written.
+	pmuPath := *flagPMUOutput
+	if *flagPMU && pmuPath == "auto" {
+		pmuPath = generateOutputName(*flagPID, *flagAll, "pmu", "txt")
+	}
+
 	if *flagGPU {
 		outputPath := *flagGPUOutput
 		if outputPath == "" {
@@ -395,7 +419,7 @@ func buildOptions() []perfagent.Option {
 		}
 		if *flagGPUExecutionsOutput != "" {
 			opts = append(opts, perfagent.WithGPUExecutionsOutput(*flagGPUExecutionsOutput),
-				perfagent.WithExternalOutputs(externalOutputs()...))
+				perfagent.WithExternalOutputs(externalOutputs(pmuPath)...))
 		}
 
 		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {
@@ -406,11 +430,7 @@ func buildOptions() []perfagent.Option {
 	if *flagPMU {
 		opts = append(opts, perfagent.WithPMU())
 		exporter := metrics.NewConsoleExporter(*flagPerPID)
-		if *flagPMUOutput != "" {
-			pmuPath := *flagPMUOutput
-			if pmuPath == "auto" {
-				pmuPath = generateOutputName(*flagPID, *flagAll, "pmu", "txt")
-			}
+		if pmuPath != "" {
 			f, err := os.Create(pmuPath)
 			if err != nil {
 				log.Fatalf("Failed to create PMU output file: %v", err)

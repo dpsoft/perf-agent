@@ -218,7 +218,7 @@ func TestCaptureOutputsAreComparedThroughAliases(t *testing.T) {
 	*flagPMU, *flagPMUOutput = true, filepath.Join(dir, "pmu.txt")
 	*flagGPUTelemetryOutput, *flagContinuous = filepath.Join(dir, "tel.jsonl"), true
 	want := []string{*flagPMUOutput, *flagGPUTelemetryOutput, *flagGPUTelemetryOutput + ".1", *flagGPUTelemetryOutput + ".2"}
-	if got := externalOutputs(); !slices.Equal(got, want) {
+	if got := externalOutputs(*flagPMUOutput); !slices.Equal(got, want) {
 		t.Errorf("externalOutputs() = %q, want %q", got, want)
 	}
 
@@ -227,5 +227,36 @@ func TestCaptureOutputsAreComparedThroughAliases(t *testing.T) {
 	*flagGPUTelemetryOutput = filepath.Join(alias, "same")
 	if validateTelemetryOutput() == nil {
 		t.Error("telemetry output accepted over the executions log through an aliased directory")
+	}
+}
+
+// A GPU executions log at the PMU output's path is rejected before the PMU
+// file is created and truncated.
+func TestGPUExecutionsAtThePMUOutputIsRejectedFirst(t *testing.T) {
+	defer func(pmu bool, pmuOut string, gpu bool, execOut string) {
+		*flagPMU, *flagPMUOutput, *flagGPU, *flagGPUExecutionsOutput = pmu, pmuOut, gpu, execOut
+	}(*flagPMU, *flagPMUOutput, *flagGPU, *flagGPUExecutionsOutput)
+
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	*flagGPU, *flagPMU = true, true
+	*flagPMUOutput, *flagGPUExecutionsOutput = filepath.Join(realDir, "pmu.txt"), filepath.Join(alias, "pmu.txt")
+	if validateGPUExecutionsAgainstPMU() == nil {
+		t.Error("executions log accepted at the PMU output's path")
+	}
+	*flagGPUExecutionsOutput = filepath.Join(realDir, "gpu.exec")
+	if err := validateGPUExecutionsAgainstPMU(); err != nil {
+		t.Errorf("distinct paths: %v", err)
+	}
+	*flagPMUOutput = "auto"
+	if err := validateGPUExecutionsAgainstPMU(); err != nil {
+		t.Errorf("automatic PMU name: %v", err)
 	}
 }

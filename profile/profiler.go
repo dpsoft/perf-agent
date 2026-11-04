@@ -19,6 +19,7 @@ import (
 
 // Profiler handles CPU profiling with stack traces
 type Profiler struct {
+	capture          *pprof.CaptureWindow
 	objs             *perfObjects
 	symbolizer       symbolize.Symbolizer
 	kernelSymbolizer symbolize.KernelSymbolizer
@@ -174,6 +175,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		Capture:       pr.capture,
 		SampleRate:    int64(pr.sampleRate),
 		PerPIDProfile: false,
 		Comments:      pr.tags,
@@ -326,3 +328,6 @@ func (pr *Profiler) createSample(sb *stackBuilder, value uint64, pid int) pprof.
 		Value:       value,
 	}
 }
+
+// SetCapture supplies metadata for the next collection; call before Collect.
+func (pr *Profiler) SetCapture(c pprof.CaptureWindow) { pr.capture = &c }

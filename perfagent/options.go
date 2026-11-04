@@ -11,6 +11,12 @@ import (
 
 // Config holds the configuration for the performance agent.
 type Config struct {
+	// CaptureID links profiles and device telemetry from this agent run.
+	CaptureID string
+	// GPUTelemetryReport is an optional bounded consumer, frozen before the
+	// agent records its capture end. Continuous exporters have separate lifetimes.
+	GPUTelemetryReport *metrics.GPUReportCollector
+
 	// PID is the target process ID to monitor (0 for system-wide).
 	PID int
 
@@ -465,4 +471,13 @@ func WithSymbolFailClosed() Option {
 // Default: off.
 func WithKernelStacks() Option {
 	return func(c *Config) { c.KernelStacks = true }
+}
+
+// WithCaptureID supplies a shared identity for this run's profile artifacts.
+func WithCaptureID(id string) Option { return func(c *Config) { c.CaptureID = id } }
+
+// WithGPUTelemetryReport includes device aggregates in requested flamegraphs.
+// Only this consumer is frozen at Stop; other exporters can continue running.
+func WithGPUTelemetryReport(report *metrics.GPUReportCollector) Option {
+	return func(c *Config) { c.GPUTelemetryReport = report }
 }

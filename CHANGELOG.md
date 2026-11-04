@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Offline GPU telemetry in HTML profiles: a collapsible summary and a dedicated
+  comparison tab, with per-field valid counts, missing-value reasons and explicit
+  physical-device scope. The offline renderer accepts a matching JSONL sidecar.
+  Profiles and telemetry share a capture identity and observed lifecycle window;
+  continuous telemetry can keep running after the finite report is frozen.
+
 - Continuous GPU telemetry with bounded JSONL rotation, per-window summaries,
   NVML rediscovery/recovery, and finite profiles that release resources while
   telemetry continues. Explicit `--otlp` exports timestamped sensor gauges over

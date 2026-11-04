@@ -22,6 +22,7 @@ type Source interface {
 }
 
 type Collector struct {
+	CaptureID string
 	Source    Source
 	UUIDs     []string
 	Interval  time.Duration
@@ -45,6 +46,7 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 	stopCancellationClock := context.AfterFunc(ctx, func() { cancelledAt <- time.Now() })
 	defer stopCancellationClock()
 	publish := func(gpu *metrics.GPUMetrics) error {
+		gpu.CaptureID, gpu.Interval = c.CaptureID, c.Interval
 		var errs []error
 		for _, exporter := range c.Exporters {
 			// The capture context is cancelled at the duration boundary. Final

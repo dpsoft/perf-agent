@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -137,10 +138,17 @@ func runCapture() (code int) {
 		fmt.Fprintln(os.Stderr, "perf-agent:", err)
 		return 2
 	}
+	captureID := rand.Text()
+	var reportCollector *metrics.GPUReportCollector
 	var agent *perfagent.Agent
 	if profiling {
 		var err error
-		agent, err = perfagent.New(buildOptions()...)
+		options := append(buildOptions(), perfagent.WithCaptureID(captureID))
+		if *flagFlamegraph != "" {
+			reportCollector = metrics.NewGPUReportCollector(captureID, time.Time{}, time.Time{})
+			options = append(options, perfagent.WithGPUTelemetryReport(reportCollector))
+		}
+		agent, err = perfagent.New(options...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Failed to create agent:", err)
 			return 1
@@ -233,7 +241,7 @@ func runCapture() (code int) {
 			}
 		}()
 	}
-	collector := &gputelemetry.Collector{Source: gputelemetry.NewNVML(), UUIDs: telemetryUUIDs(), Interval: *flagGPUTelemetryInterval, Exporters: exporters}
+	collector := &gputelemetry.Collector{CaptureID: captureID, Source: gputelemetry.NewNVML(), UUIDs: telemetryUUIDs(), Interval: *flagGPUTelemetryInterval, Exporters: exporters}
 	// Keep the profiler context alive through its final collection.
 	profileCtx, cancelProfile := context.WithCancel(context.Background())
 	defer cancelProfile()
@@ -242,6 +250,9 @@ func runCapture() (code int) {
 			fmt.Fprintln(os.Stderr, "Failed to start agent:", err)
 			return 1
 		}
+	}
+	if agent != nil && *flagFlamegraph != "" {
+		collector.Exporters = append([]metrics.Exporter{reportCollector.LiveExporter()}, collector.Exporters...)
 	}
 	captureCtx, cancel := context.WithTimeout(ctx, *flagDuration)
 	defer cancel()

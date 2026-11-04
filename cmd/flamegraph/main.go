@@ -36,6 +36,7 @@ import (
 
 func main() {
 	var (
+		telemetry  = flag.String("gpu-telemetry", "", "NVML JSONL sidecar with matching capture_id; aggregate only observations in the profile window")
 		out        = flag.String("o", "", "HTML output path (default: <input>.html)")
 		title      = flag.String("title", "", "page title (default: the input file name)")
 		folded     = flag.Bool("folded", false, "write folded stacks to stdout instead of HTML")
@@ -67,7 +68,7 @@ func main() {
 		if flag.NArg() != 0 {
 			fatalf("-fuse takes its profiles via -in, not as positional arguments")
 		}
-		runFuse(inputs, *out, *title, *rawVendor)
+		runFuse(inputs, *out, *title, *rawVendor, *telemetry)
 		return
 	}
 	if len(inputs) > 0 {
@@ -89,6 +90,9 @@ func main() {
 	}
 
 	if *folded {
+		if *telemetry != "" {
+			fatalf("-gpu-telemetry requires HTML output")
+		}
 		writeFolded(in, *sampleIdx, order)
 		return
 	}
@@ -98,9 +102,10 @@ func main() {
 		dst = in + ".html"
 	}
 	res, err := flamegraph.FromProfileFile(in, dst, flamegraph.Options{
-		Title:           *title,
-		RawVendorFrames: *rawVendor,
-		StackOrder:      order,
+		Title:            *title,
+		GPUTelemetryPath: *telemetry,
+		RawVendorFrames:  *rawVendor,
+		StackOrder:       order,
 	})
 	if err != nil {
 		fatalf("%v", err)
@@ -186,7 +191,7 @@ func (f *fuseInputs) Set(v string) error {
 	return nil
 }
 
-func runFuse(inputs fuseInputs, out, title string, rawVendor bool) {
+func runFuse(inputs fuseInputs, out, title string, rawVendor bool, telemetry string) {
 	if len(inputs) < 2 {
 		fatalf("-fuse needs at least 2 profiles; pass -in once per profile (got %d)", len(inputs))
 	}
@@ -195,8 +200,9 @@ func runFuse(inputs fuseInputs, out, title string, rawVendor bool) {
 		dst = "fused.html"
 	}
 	res, err := flamegraph.FuseProfileFiles(inputs, dst, flamegraph.Options{
-		Title:           title,
-		RawVendorFrames: rawVendor,
+		Title:            title,
+		GPUTelemetryPath: telemetry,
+		RawVendorFrames:  rawVendor,
 	})
 	if err != nil {
 		fatalf("%v", err)

@@ -57,6 +57,7 @@ import (
 	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
+	"github.com/dpsoft/perf-agent/metrics"
 )
 
 // frameHeight is the row pitch in CSS pixels: a 19px frame and a 2px gap.
@@ -82,6 +83,11 @@ const frameHeight = 21
 // which is as wide as the window, so the page has no width to be told: it
 // fills whatever it is opened in and reflows when that changes.
 type Options struct {
+	// GPUTelemetryPath is an explicit NVML JSONL sidecar; matching capture_id and
+	// profile window are required. GPUTelemetry is the in-process alternative.
+	GPUTelemetryPath string
+	GPUTelemetry     *metrics.GPUReport
+
 	// Title names the page. Defaults to "Flame Graph".
 	Title string
 	// Subtitle is a one-line provenance string (source file, mode, host).
@@ -146,6 +152,9 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	ew.esc(opts.Title)
 	ew.s("</title>\n<style>\n")
 	ew.s(styleSheet)
+	if opts.GPUTelemetry != nil {
+		ew.s(gpuCSS)
+	}
 	if degenerate {
 		ew.s(reportCSS)
 	} else {
@@ -157,12 +166,24 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 	ew.s("</style>\n</head>\n<body>\n")
 
 	if degenerate {
+		writeGPUView(ew, opts)
+		if opts.GPUTelemetry != nil {
+			ew.s("<div id=\"profile-view\" role=\"tabpanel\" aria-labelledby=\"gpu-tab-flame\">\n")
+		}
 		writeReport(ew, res, opts)
+		if opts.GPUTelemetry != nil {
+			ew.s("</div>\n")
+			writeGPUScript(ew, opts)
+		}
 		ew.s("</body>\n</html>\n")
 		return ew.err
 	}
 
 	writeTopBar(ew, opts, res, root)
+	writeGPUView(ew, opts)
+	if opts.GPUTelemetry != nil {
+		ew.s("<div id=\"profile-view\" role=\"tabpanel\" aria-labelledby=\"gpu-tab-flame\">\n")
+	}
 	writeSamplePeriodNote(ew, res)
 	// Above the chart, beside the sample-period note, because it is the same
 	// kind of statement: a fact about what this picture is not showing. The
@@ -172,6 +193,9 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 		return err
 	}
 	writeTreeContainer(ew, res)
+	if opts.GPUTelemetry != nil {
+		ew.s("</div>\n")
+	}
 	writeStatusBar(ew, res)
 	ew.s("<div id=\"menu\" hidden role=\"menu\"></div>\n")
 	writeDomainLabels(ew, domainsPresent(root))
@@ -180,7 +204,9 @@ func RenderHTML(w io.Writer, res *foldedstacks.Result, opts Options) error {
 
 	ew.s("<script>\n")
 	ew.s(script)
-	ew.s("</script>\n</body>\n</html>\n")
+	ew.s("</script>\n")
+	writeGPUScript(ew, opts)
+	ew.s("</body>\n</html>\n")
 	return ew.err
 }
 

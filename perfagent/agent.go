@@ -3,6 +3,7 @@ package perfagent
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/perfevent"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/offcpu"
+	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/profile"
 	"github.com/dpsoft/perf-agent/symbolize"
 	"github.com/dpsoft/perf-agent/symbolize/debuginfod"
@@ -40,6 +42,7 @@ import (
 // cpuProfiler is the narrow shape both profile.Profiler and
 // dwarfagent.Profiler satisfy, letting Agent dispatch on --unwind.
 type cpuProfiler interface {
+	SetCapture(pprof.CaptureWindow)
 	Collect(w io.Writer) error
 	CollectAndWrite(path string) error
 	Close()
@@ -59,6 +62,7 @@ func (a dwarfProfilerAdapter) Close() {
 // dwarfagent.OffCPUProfiler satisfy, letting Agent dispatch on --unwind
 // for the off-CPU path.
 type offcpuProfiler interface {
+	SetCapture(pprof.CaptureWindow)
 	Collect(w io.Writer) error
 	CollectAndWrite(path string) error
 	Close()
@@ -76,7 +80,9 @@ func (a dwarfOffCPUProfilerAdapter) Close() {
 
 // Agent is the main performance monitoring agent.
 type Agent struct {
-	config *Config
+	config    *Config
+	capture   pprof.CaptureWindow
+	gpuReport *metrics.GPUReport
 
 	cpuProfiler    cpuProfiler
 	offcpuProfiler offcpuProfiler
@@ -119,6 +125,10 @@ func New(opts ...Option) (*Agent, error) {
 
 // validate checks the configuration for errors.
 func (c *Config) validate() error {
+	if len(c.CaptureID) > 256 || strings.ContainsAny(c.CaptureID, "\r\n") {
+		return errors.New("capture ID must be at most 256 characters without line breaks")
+	}
+
 	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnableGPU && !c.EnablePMU {
 		return errors.New("at least one of CPU profile, off-CPU profile, GPU profile, or PMU must be enabled")
 	}
@@ -400,6 +410,14 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	if a.started {
 		return errors.New("agent already started")
+	}
+
+	// The capture envelope includes attachment/setup, not just enabled perf events.
+	a.capture = pprof.CaptureWindow{ID: cmp.Or(a.config.CaptureID, rand.Text()), StartedAt: time.Now()}
+	if a.config.GPUTelemetryReport != nil {
+		if err := a.config.GPUTelemetryReport.Begin(a.capture.ID, a.capture.StartedAt); err != nil {
+			return err
+		}
 	}
 
 	// Capabilities raised to Effective. The set is deliberately the historical
@@ -748,6 +766,38 @@ func (a *Agent) Stop(ctx context.Context) error {
 
 	var lastErr error
 
+	// Stop GPU collection before slow CPU symbolization and artifact rendering.
+	if a.gpuProfiler != nil {
+		a.gpuProfiler.Stop()
+	}
+	if a.config.GPUTelemetryReport != nil {
+		a.config.GPUTelemetryReport.Stop()
+	}
+	a.capture.EndedAt = time.Now()
+	if a.config.GPUTelemetryReport != nil {
+		var err error
+		a.gpuReport, err = a.config.GPUTelemetryReport.FinishAt(a.capture.EndedAt)
+		if err != nil {
+			log.Printf("GPU report: %v", err)
+			lastErr = err
+		}
+	}
+
+	if err := a.capture.Validate(); err != nil {
+		log.Printf("Capture metadata unavailable: %v; GPU report omitted", err)
+		a.gpuReport = nil
+	}
+	// CPU/off-CPU drain their maps at Collect; the lifecycle envelope includes
+	// setup and can differ slightly from the precise enabled-event interval.
+	if a.cpuProfiler != nil {
+		a.cpuProfiler.SetCapture(a.capture)
+	}
+	if a.offcpuProfiler != nil {
+		a.offcpuProfiler.SetCapture(a.capture)
+	}
+	if a.gpuProfiler != nil {
+		a.gpuProfiler.SetCapture(a.capture)
+	}
 	// Export PMU metrics
 	if a.pmuMonitor != nil {
 		if len(a.config.MetricsExporters) > 0 {
@@ -847,7 +897,8 @@ func (a *Agent) writeFlamegraph(profilePath, htmlPath, mode string) error {
 		return nil
 	}
 	res, err := flamegraph.FromProfileFile(profilePath, htmlPath, flamegraph.Options{
-		Title: fmt.Sprintf("%s flame graph - %s", mode, filepath.Base(profilePath)),
+		Title:        fmt.Sprintf("%s flame graph - %s", mode, filepath.Base(profilePath)),
+		GPUTelemetry: a.gpuReport,
 		Meta: []flamegraph.MetaItem{
 			{Label: "mode", Value: mode},
 			{Label: "target", Value: a.targetDescription()},

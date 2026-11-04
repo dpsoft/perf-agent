@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -121,6 +122,7 @@ type ProfileSample struct {
 }
 
 type BuildersOptions struct {
+	Capture       *CaptureWindow
 	SampleRate    int64
 	PerPIDProfile bool
 	Comments      []string          // Profile-level comments/tags
@@ -533,13 +535,39 @@ func (p *ProfileBuilder) addFunction(frame Frame, mappingID uint64) *profile.Fun
 }
 
 func (p *ProfileBuilder) Write(dst io.Writer) (int64, error) {
+	output := p.Profile
+	if c := p.opt.Capture; c != nil {
+		// Do not copy Profile's encoding mutex; share only immutable profile data.
+		original := p.Profile
+		header := profile.Profile{
+			SampleType: original.SampleType, DefaultSampleType: original.DefaultSampleType,
+			Sample: original.Sample, Mapping: original.Mapping, Location: original.Location,
+			Function: original.Function, DocURL: original.DocURL, DropFrames: original.DropFrames,
+			KeepFrames: original.KeepFrames, PeriodType: original.PeriodType, Period: original.Period,
+		}
+		for _, comment := range p.Profile.Comments {
+			if !strings.HasPrefix(comment, CaptureIDComment) {
+				header.Comments = append(header.Comments, comment)
+			}
+		}
+		if err := c.Validate(); err != nil {
+			log.Printf("Capture window invalid (clock moved?): %v; writing profile without telemetry linkage", err)
+			header.TimeNanos = original.TimeNanos
+			header.Comments = append(header.Comments, "perf-agent.capture_warning=invalid capture window; telemetry linkage omitted")
+		} else {
+			header.Comments = append(header.Comments, CaptureIDComment+c.ID)
+			header.TimeNanos, header.DurationNanos = c.StartedAt.UnixNano(), c.EndedAt.UnixNano()-c.StartedAt.UnixNano()
+		}
+		output = &header
+	}
+
 	gzipWriter := gzipWriterPool.Get().(*gzip.Writer)
 	gzipWriter.Reset(dst)
 	defer func() {
 		gzipWriter.Reset(io.Discard)
 		gzipWriterPool.Put(gzipWriter)
 	}()
-	err := p.Profile.WriteUncompressed(gzipWriter)
+	err := output.WriteUncompressed(gzipWriter)
 	if err != nil {
 		return 0, fmt.Errorf("ebpf profile encode %w", err)
 	}

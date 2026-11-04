@@ -303,3 +303,10 @@ func (p *Profiler) Close() {
 		logf("gpuprofile: close consumer: %v", err)
 	}
 }
+
+// SetCapture supplies the capture lifecycle metadata for serialization.
+func (p *Profiler) SetCapture(c pprof.CaptureWindow) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.builders.SetCapture(c)
+}

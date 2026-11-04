@@ -18,6 +18,7 @@ import (
 
 // Profiler handles off-CPU profiling with stack traces
 type Profiler struct {
+	capture          *pprof.CaptureWindow
 	objs             *offcpuObjects
 	symbolizer       symbolize.Symbolizer
 	kernelSymbolizer symbolize.KernelSymbolizer
@@ -148,6 +149,7 @@ func (pr *Profiler) Collect(w io.Writer) error {
 	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		Capture:       pr.capture,
 		SampleRate:    1, // Not used for off-CPU but needed for builder
 		PerPIDProfile: false,
 		Comments:      pr.tags,
@@ -268,3 +270,6 @@ func (pr *Profiler) CollectAndWrite(outputPath string) error {
 	log.Printf("Off-CPU profile written to %s", outputPath)
 	return nil
 }
+
+// SetCapture supplies metadata for the next collection; call before Collect.
+func (pr *Profiler) SetCapture(c pprof.CaptureWindow) { pr.capture = &c }

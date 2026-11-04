@@ -4,6 +4,8 @@ import "time"
 
 // GPUMetrics is independent of the CPU process scope of MetricsSnapshot.
 type GPUMetrics struct {
+	CaptureID   string             `json:"capture_id,omitempty"`
+	Interval    time.Duration      `json:"interval_ns,omitzero"`
 	Kind        string             `json:"kind"`
 	StartedAt   time.Time          `json:"started_at"`
 	EndedAt     time.Time          `json:"ended_at,omitzero"`

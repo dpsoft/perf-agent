@@ -56,7 +56,10 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 		return errors.Join(errs...)
 	}
 	unavailable := func(cause error) error {
-		return errors.Join(cause, publish(&metrics.GPUMetrics{Kind: "unavailable", StartedAt: started, Error: cause.Error()}))
+		if err := publish(&metrics.GPUMetrics{Kind: "unavailable", StartedAt: started, Error: cause.Error()}); err != nil {
+			return errors.Join(cause, err)
+		}
+		return &SourceUnavailableError{Err: cause}
 	}
 	devices, err := c.Source.Open()
 	if err != nil {

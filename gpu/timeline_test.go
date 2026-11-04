@@ -1057,3 +1057,120 @@ func TestTimelinePressureSignalsAtHalfCapacity(t *testing.T) {
 	require.NoError(t, tl.EmitExec(execFor("x", 10, 20)))
 	assert.False(t, pressured(), "a drained ring is not under pressure")
 }
+
+// BenchmarkTimelineDrainCycle is one pressure-driven drain at the default
+// capacity: half a ring of executions in, one Snapshot out. Before the spare
+// rings, every Snapshot allocated three fresh full-capacity rings; at a high
+// launch rate #229's pressure drain made that the dominant allocation.
+func BenchmarkTimelineDrainCycle(b *testing.B) {
+	tl := NewTimeline(TimelineConfig{})
+	half := defaultLaunchCacheCapacity / 2
+	b.ReportAllocs()
+	for b.Loop() {
+		for i := range half {
+			_ = tl.EmitExec(execFor(strconv.Itoa(i), uint64(i)*10, uint64(i)*10+5))
+		}
+		tl.Snapshot()
+	}
+}
+
+// A snapshot the caller keeps must not change when the drained ring is reused
+// as the next interval's storage. gpu-cuda-profile keeps its last snapshot
+// for the end-of-run join health report.
+func TestTimelineRetainedSnapshotSurvivesRingReuse(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 8}})
+	for i := range 5 {
+		require.NoError(t, tl.EmitExec(execFor("first-"+strconv.Itoa(i), uint64(i)*10, uint64(i)*10+5)))
+	}
+	require.NoError(t, tl.EmitEvent(GPUTimelineEvent{Name: "first-event", Attributes: map[string]string{"k": "v1"}}))
+	first := tl.Snapshot()
+
+	// Two more drain cycles: the first ring becomes a spare, then current again.
+	for cycle := range 2 {
+		for i := range 7 {
+			require.NoError(t, tl.EmitExec(execFor("later-"+strconv.Itoa(cycle*10+i), 1000+uint64(i), 1005+uint64(i))))
+		}
+		require.NoError(t, tl.EmitEvent(GPUTimelineEvent{Name: "later-event", Attributes: map[string]string{"k": "v2"}}))
+		tl.Snapshot()
+	}
+
+	require.Len(t, first.Executions, 5)
+	for i, v := range first.Executions {
+		assert.Equal(t, "k_first-"+strconv.Itoa(i), v.Exec.KernelName)
+	}
+	require.Len(t, first.Events, 1)
+	assert.Equal(t, "first-event", first.Events[0].Name)
+	assert.Equal(t, "v1", first.Events[0].Attributes["k"])
+}
+
+// A drained ring kept as a spare holds no references to what it held.
+func TestTimelineSpareRingIsCleared(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 8}})
+	for i := range 8 {
+		require.NoError(t, tl.EmitExec(execFor(strconv.Itoa(i), uint64(i), uint64(i)+1)))
+	}
+	require.NoError(t, tl.EmitExec(execFor("wrap", 100, 101))) // wraps the ring
+	tl.Snapshot()
+
+	tl.snapMu.Lock()
+	defer tl.snapMu.Unlock()
+	require.NotNil(t, tl.spareExecs)
+	assert.Zero(t, tl.spareExecs.count)
+	for i, e := range tl.spareExecs.buf {
+		assert.Equal(t, GPUKernelExec{}, e, "spare slot %d still holds an execution", i)
+	}
+}
+
+// Snapshots and emits may run concurrently; spares are only reused once a
+// Snapshot has finished reading them. Run with -race.
+func TestTimelineConcurrentSnapshotsKeepEveryExecutionOnce(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 1 << 16}})
+	const producers, perProducer = 4, 5000
+	var wg sync.WaitGroup
+	for p := range producers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perProducer {
+				_ = tl.EmitExec(execFor(strconv.Itoa(p*perProducer+i), uint64(i), uint64(i)+1))
+			}
+		}()
+	}
+	var mu sync.Mutex
+	seen := make(map[string]int)
+	collect := func() {
+		s := tl.Snapshot()
+		mu.Lock()
+		for _, v := range s.Executions {
+			seen[v.Exec.Correlation.Value]++
+		}
+		mu.Unlock()
+	}
+	done := make(chan struct{})
+	var drainers sync.WaitGroup
+	for range 2 {
+		drainers.Add(1)
+		go func() {
+			defer drainers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					collect()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(done)
+	drainers.Wait()
+	collect()
+
+	assert.Len(t, seen, producers*perProducer)
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("execution %s seen %d times", id, n)
+		}
+	}
+}

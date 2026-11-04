@@ -663,6 +663,18 @@ type Timeline struct {
 	// pressure is signalled when a ring passes half its capacity. See
 	// Pressure.
 	pressure chan struct{}
+
+	// snapMu serializes Snapshot, which is what makes the spare rings safe:
+	// a spare is only handed back to t.execs/events/modules by the Snapshot
+	// that already finished reading it. The spares hold the rings the
+	// previous Snapshot drained, cleared, so a drain swaps in an existing
+	// ring instead of allocating three full-capacity ones. Before this,
+	// #229's pressure-driven drains made those allocations the largest
+	// share of the agent's allocation rate at high launch rates.
+	snapMu       sync.Mutex
+	spareExecs   *ring[GPUKernelExec]
+	spareEvents  *ring[GPUTimelineEvent]
+	spareModules *ring[GPUModule]
 }
 
 // processDevices is one process's entry in Timeline.devicesByPID: the first
@@ -1464,13 +1476,12 @@ func cloneTimelineEvent(in GPUTimelineEvent) GPUTimelineEvent {
 // for a future one, so that pass takes a second, much shorter lock
 // (O(len(execs)) map operations, not O(capacity)).
 func (t *Timeline) Snapshot() Snapshot {
+	t.snapMu.Lock()
+	defer t.snapMu.Unlock()
 	t.mu.Lock()
-	oldExecs := t.execs
-	t.execs = newRing[GPUKernelExec](len(oldExecs.buf))
-	oldEvents := t.events
-	t.events = newRing[GPUTimelineEvent](len(oldEvents.buf))
-	oldModules := t.modules
-	t.modules = newRing[GPUModule](len(oldModules.buf))
+	oldExecs := swapRing(&t.execs, &t.spareExecs)
+	oldEvents := swapRing(&t.events, &t.spareEvents)
+	oldModules := swapRing(&t.modules, &t.spareModules)
 	launchCount := t.launchesSinceSnapshot
 	t.launchesSinceSnapshot = 0
 	dropped := t.dropped
@@ -1479,6 +1490,13 @@ func (t *Timeline) Snapshot() Snapshot {
 	execs := oldExecs.items()
 	events := oldEvents.items()
 	modules := oldModules.items()
+	// items() copied everything out; the drained rings become the spares.
+	// Clearing drops their references to strings and maps the snapshot
+	// owns now, so a spare never keeps a past interval alive.
+	oldExecs.reset()
+	oldEvents.reset()
+	oldModules.reset()
+	t.spareExecs, t.spareEvents, t.spareModules = oldExecs, oldEvents, oldModules
 
 	// Only pop the pending samples the executions in this snapshot can
 	// actually use, rather than copying the whole map: a correlation with
@@ -2043,6 +2061,33 @@ func (r *ring[T]) push(v T) (evicted bool) {
 	r.buf[r.start] = v
 	r.start = (r.start + 1) % capacity
 	return true
+}
+
+// swapRing installs *spare (or a fresh ring of the same capacity if there is
+// none) as *cur and returns the ring it replaced. The caller holds t.mu for
+// *cur and snapMu for *spare.
+func swapRing[T any](cur, spare **ring[T]) *ring[T] {
+	old := *cur
+	next := *spare
+	if next == nil || len(next.buf) != len(old.buf) {
+		next = newRing[T](len(old.buf))
+	}
+	*spare = nil
+	*cur = next
+	return old
+}
+
+// reset empties the ring and zeroes the slots it used, so it holds no
+// references once its contents have been copied out.
+func (r *ring[T]) reset() {
+	capacity := len(r.buf)
+	if end := r.start + r.count; end <= capacity {
+		clear(r.buf[r.start:end])
+	} else {
+		clear(r.buf[r.start:])
+		clear(r.buf[:end-capacity])
+	}
+	r.start, r.count = 0, 0
 }
 
 // halfFull reports whether the ring holds at least half its capacity.

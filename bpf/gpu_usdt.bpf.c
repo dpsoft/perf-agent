@@ -107,10 +107,10 @@ char LICENSE[] SEC("license") = "GPL";
 // truncated silently.
 #define MAX_BATCHED_RECORD_BYTES 48
 
-// The ringbuf reservation is fixed-size: bpf_ringbuf_reserve takes a
-// constant, so every batch costs the worst case (64 records * 48 bytes)
-// regardless of how many records it actually carries. Userspace reads the
-// real length from batch_hdr.bytes.
+// Batched records use a fixed-size reservation: bpf_ringbuf_reserve takes a
+// constant. Sampled launches have a separate, smaller constant reservation
+// below because they always carry exactly one record. Userspace reads the
+// real length from batch_hdr.bytes in either case.
 //
 // Kinds whose record is larger than MAX_BATCHED_RECORD_BYTES are not
 // unbounded here: BATCH_CAP gives each kind its own record cap, so the bytes
@@ -162,6 +162,18 @@ struct batch_msg {
     struct batch_hdr hdr;
     __u8 payload[PAYLOAD_BYTES];
 };
+
+// A sampled launch is never batched: one CPU stack belongs to one launch.
+// Reserving a full batch for its 56 bytes consumes 3120 ring bytes (including
+// the ring's 8-byte header) instead of 104. At high launch rates this padding
+// competes with execution records, which carry measured GPU durations.
+struct sampled_batch_msg {
+    struct batch_hdr hdr;
+    __u8 payload[REC_LAUNCH_SAMPLED];
+};
+
+_Static_assert(sizeof(struct sampled_batch_msg) == 96,
+               "sampled launch reservation must contain only its header and record");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -587,14 +599,15 @@ static __always_inline void gpu_sampled_walk(void *ctx, bool resumed)
     __u32 bytes = p->bytes;
     __u64 ptr = p->ptr;
     __u64 seq = p->seq;
-    // The clamp is re-asserted on the value read back out of the map. A bound
-    // proved before the walk was a bound on a register that no longer exists,
-    // and the verifier will not carry one across a map value it cannot see
-    // into -- the same discipline record_push_native documents, for the same
-    // reason.
-    if (bytes > PAYLOAD_BYTES) bytes = PAYLOAD_BYTES;
+    // Re-establish the one-record contract after reading the pending map:
+    // bounds proved before a tail call are not bounds on these registers.
+    // Reject inconsistent metadata rather than silently truncate a record.
+    if (kind != KIND_LAUNCH_SAMPLED || count != 1 || bytes != REC_LAUNCH_SAMPLED) {
+        count_drop(kind, count);
+        return;
+    }
 
-    struct batch_msg *msg = bpf_ringbuf_reserve(&events, sizeof(*msg), 0);
+    struct sampled_batch_msg *msg = bpf_ringbuf_reserve(&events, sizeof(*msg), 0);
     if (!msg) {
         count_drop(kind, count);
         return;

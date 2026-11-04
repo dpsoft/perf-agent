@@ -23,6 +23,7 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/gpuprofile"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
@@ -1004,11 +1005,8 @@ func (a *Agent) logDebuginfodStats() {
 // reported only "GPU profile written to ... (N samples)" and looked like a
 // success. N alone cannot distinguish a quiet GPU from a lossy capture.
 //
-// The loss counters are called out separately from the volume ones because
-// a non-zero value in any of them means the profile under-reports: samples
-// the kernel could not deliver, and stacks evicted from the side table
-// before their kernel record arrived, are both GPU work that happened and
-// is not in the file.
+// Record loss, batch sequence gaps and missing CPU attribution have different
+// units and can describe the same failure. Never add them into one loss total.
 func (a *Agent) logGPUStats() {
 	if a.gpuProfiler == nil {
 		return
@@ -1016,21 +1014,8 @@ func (a *Agent) logGPUStats() {
 	// The final drain settles Dropped; cleanup can reach here without Stop.
 	a.gpuProfiler.Stop()
 	st := a.gpuProfiler.Stats()
-	log.Printf("perf-agent: gpu: batches=%d records=%d sampled_launches=%d "+
-		"stacks_resolved=%d stacks_attached=%d",
-		st.Batches, st.Records, st.SampledLaunches,
-		st.StacksResolved, st.StacksAttached)
-	if lost := st.KernelDropped + st.StacksEvicted + st.SequenceGaps +
-		st.StacksMissing + st.SinkRejected; lost > 0 {
-		log.Printf("perf-agent: gpu: LOST %d record(s): kernel_dropped=%d "+
-			"stacks_evicted=%d sequence_gaps=%d stacks_missing=%d sink_rejected=%d "+
-			"-- the profile under-reports GPU work. A smaller "+
-			"PERFAGENT_GPU_SAMPLE_PERIOD raises the event rate and makes this "+
-			"worse; raise the period or shorten the capture",
-			lost, st.KernelDropped, st.StacksEvicted, st.SequenceGaps,
-			st.StacksMissing, st.SinkRejected)
-	}
-	// Lost after ingestion, so not in the line above: the timeline ring
+	logGPUIngestionStats(st)
+	// Lost after ingestion, so not in the transport counters: the timeline
 	// evicted them before a drain reached them.
 	if d := a.gpuProfiler.Dropped(); d.EvictedExecutions+d.EvictedEvents+d.EvictedModules > 0 {
 		log.Printf("perf-agent: gpu: LOST %d execution(s), %d event(s), %d module(s) "+
@@ -1038,6 +1023,41 @@ func (a *Agent) logGPUStats() {
 			"under-reports GPU work. Kernels completed faster than the profiler "+
 			"could drain them",
 			d.EvictedExecutions, d.EvictedEvents, d.EvictedModules)
+	}
+}
+
+func logGPUIngestionStats(st gpuprobe.Stats) {
+	log.Printf("perf-agent: gpu: batches=%d records=%d sampled_launches=%d "+
+		"stacks_resolved=%d stacks_attached=%d",
+		st.Batches, st.Records, st.SampledLaunches,
+		st.StacksResolved, st.StacksAttached)
+	if st.KernelDropped > 0 {
+		log.Printf("perf-agent: gpu: LOST in BPF transport: kernel_dropped=%d record(s) (%s) -- "+
+			"exec records carry measured GPU time; launch and sampled_launch records carry attribution",
+			st.KernelDropped, st.KernelDroppedByKind)
+		if st.KernelDroppedByKind.Executions() > 0 {
+			log.Printf("perf-agent: gpu: execution records were lost: increase --gpu-ring-bytes for bursts; " +
+				"for sustained pressure reduce the launch rate or raise the target's " +
+				"PERFAGENT_GPU_SAMPLE_PERIOD (less CPU attribution). A larger ring cannot fix sustained overload")
+		}
+	}
+	if st.KernelDropReadErrors > 0 {
+		log.Printf("perf-agent: gpu: drop accounting incomplete: %d BPF counter slot(s) unreadable", st.KernelDropReadErrors)
+	}
+	if st.SequenceGaps > 0 {
+		log.Printf("perf-agent: gpu: sequence_gaps=%d forward batch-sequence gap(s) observed -- "+
+			"may reflect reordering across threads; record count unknown; "+
+			"may overlap BPF transport losses; not an additional record count", st.SequenceGaps)
+	}
+	if st.SinkRejected > 0 {
+		log.Printf("perf-agent: gpu: sink_rejected=%d event(s) after transport", st.SinkRejected)
+	}
+	if st.StacksEvicted+st.StacksMissing+st.StackLookupFailed+st.SymbolizeFailed+st.StacksUncorrelated+st.StacksProfilerOnly > 0 {
+		log.Printf("perf-agent: gpu: CPU attribution incomplete: stacks_evicted=%d stacks_missing=%d "+
+			"stack_lookup_failed=%d symbolize_failed=%d stacks_uncorrelated=%d stacks_profiler_only=%d -- "+
+			"these counters do not count lost GPU executions",
+			st.StacksEvicted, st.StacksMissing, st.StackLookupFailed, st.SymbolizeFailed,
+			st.StacksUncorrelated, st.StacksProfilerOnly)
 	}
 }
 

@@ -27,8 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- GPU sampled-launch messages reserve 96 bytes instead of a full 3,112-byte
+  batch in the BPF transport, reducing buffer pressure without changing the
+  record format or sampling policy.
+
 - `make build` keeps system libraries dynamic for NVML loading and links the
   blazesym archive explicitly, without requiring its shared library at runtime.
+
+### Fixed
+
+- GPU shutdown diagnostics no longer add record loss, batch sequence gaps and
+  missing CPU stacks into a misleading `LOST` total. BPF record drops are
+  reported by kind; missing attribution and timeline evictions stay separate.
 
 ## [1.4.1] - 2026-11-04
 

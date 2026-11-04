@@ -498,12 +498,12 @@ type Stats struct {
 	// Batches and Records count what arrived and was normalized.
 	Batches uint64
 	Records uint64
-	// SequenceGaps counts *batches* the consumer never saw, implied by a jump
-	// in a probe's monotonic sequence number. The shim increments seq_ once
-	// per batch (shim/core/batch.h), so one gap is one whole batch of up to
-	// MAX_RECORDS_PER_BATCH records, not one record. It is therefore not
-	// additive with KernelDropped or Records, which are both in records:
-	// a gap is loss the consumer cannot size, only detect.
+	// SequenceGaps counts forward gaps observed in a probe's batch sequence.
+	// The shim increments seq_ once per batch, not per record. Across producer
+	// threads, sequence allocation and arrival order can differ, so a gap
+	// may reflect reordering rather than a missing batch. These observations
+	// are neither a count of distinct lost batches nor additive with
+	// KernelDropped or Records. They cannot quantify missing GPU executions.
 	SequenceGaps uint64
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
@@ -616,6 +616,13 @@ type Stats struct {
 	// faulting read of the producer's buffer. Read from the BPF `dropped`
 	// map on each Stats call.
 	KernelDropped uint64
+	// KernelDroppedByKind partitions KernelDropped by wire record kind. A
+	// launch, an execution and its sampled stack are different records; only
+	// lost execution records directly quantify missing measured GPU work.
+	KernelDroppedByKind RecordKindCounts
+	// KernelDropReadErrors counts slots that could not be read in this
+	// snapshot. The reported drop counts are incomplete when it is nonzero.
+	KernelDropReadErrors uint64
 	// SampledLaunches counts gpu_launch_sampled_v1 records decoded. It is the
 	// denominator the sampling period is checked against: the producer prints
 	// how many launches it sampled, and the two must agree.
@@ -2041,12 +2048,10 @@ func decodeBatch(b []byte) (batch, error) {
 	return out, nil
 }
 
-// noteSeq counts batches lost between the ones that arrived. A gap is loss
-// the consumer did not observe and must never be silent (spec §6.1). The
-// stream is identified by (kind, pid): see seqKey. Caller holds mu.
-// noteSeq records a batch's producer sequence number and returns how many
-// records of this kind, from this process, are known to have been lost since
-// the previous one.
+// noteSeq records a forward gap between consecutive arrivals in a (kind, pid)
+// stream. The return value counts skipped batch-sequence positions, not records
+// or confirmed loss: concurrently emitted batches can arrive out of order.
+// Caller holds mu.
 //
 // The return value is not decoration. The serialization disclosure below needs
 // it: a hole in the sampling-window history means the intervals either side of
@@ -2289,8 +2294,8 @@ func (c *Consumer) applyBatch(b batch) {
 	case kindSamplingWindow:
 		for i, w := range b.SamplingWindows {
 			c.stats.Records++
-			// The loss is attributed to the FIRST window in the batch and to
-			// no other: `lost` counts records missing before this batch, so
+			// The gap is attributed to the FIRST window in the batch and to
+			// no other: `lost` counts sequence positions skipped before it, so
 			// charging it to every record in it would restart the store's
 			// coverage once per window and throw away the rest of the batch's
 			// evidence.
@@ -3250,7 +3255,8 @@ func (c *Consumer) Stats() Stats {
 	out := c.stats
 	out.DecodeFailures = c.decodeFailures.snapshot()
 	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
-	out.KernelDropped = c.sumPerKind(c.objs.Dropped)
+	out.KernelDroppedByKind, out.KernelDropReadErrors = readKindCounts(c.objs.Dropped)
+	out.KernelDropped = out.KernelDroppedByKind.Total()
 	out.KernelStacksMissing = c.sumPerKind(c.objs.StacksMissing)
 	// Why each of those captures failed. StackWalkEmpty already carries the
 	// consumer-side count; the BPF side's is added to it rather than kept

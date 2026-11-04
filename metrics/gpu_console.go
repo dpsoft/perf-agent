@@ -28,6 +28,11 @@ func writeGPUConsole(w io.Writer, gpu *GPUMetrics) error {
 				return err
 			}
 		}
+		for _, name := range slices.Sorted(maps.Keys(d.Unsupported)) {
+			if _, err := fmt.Fprintf(w, "  %s: unsupported (%s)\n", name, d.Unsupported[name]); err != nil {
+				return err
+			}
+		}
 		for _, name := range slices.Sorted(maps.Keys(d.FailedReadings)) {
 			if _, err := fmt.Fprintf(w, "  %s: unavailable readings=%d (last error: %s)\n", name, d.FailedReadings[name], d.Unavailable[name]); err != nil {
 				return err

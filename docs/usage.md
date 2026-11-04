@@ -118,8 +118,9 @@ bandwidth. Memory fields are preserved exactly as reported, without deriving
 `used = total - free` or adjusting for reserved memory. Memory-info v1 is not
 substituted when v2 is unavailable.
 
-Unavailable fields are absent from `values` and have a reason in `unavailable`;
-a real zero stays present. The summary reports min/max/last and the arithmetic
+Unsupported fields are absent from `values` and listed once per device in
+`unsupported`; transient read errors have a reason in `unavailable`.
+A real zero stays present. The summary reports min/max/last and the arithmetic
 mean of **successful samples**, plus counts of successful and failed readings.
 It does not estimate energy or interpolate missing samples. Sampling and export
 are serial with bounded memory. A driver call or local writer must return before

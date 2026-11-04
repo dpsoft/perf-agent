@@ -92,6 +92,7 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 				s.Values = nil
 				s.Summary = make(map[string]metrics.GaugeSummary)
 				s.Unavailable = make(map[string]string)
+				s.Unsupported = make(map[string]string)
 				s.FailedReadings = make(map[string]uint64)
 			}
 			s.Timestamp = d.Timestamp
@@ -100,6 +101,9 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 				g := s.Summary[name]
 				g.Observe(value)
 				s.Summary[name] = g
+			}
+			for name, why := range d.Unsupported {
+				s.Unsupported[name] = why
 			}
 			for name, why := range d.Unavailable {
 				s.FailedReadings[name]++

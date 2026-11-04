@@ -92,6 +92,11 @@ builds and unit tests need no NVIDIA driver or CUDA toolkit. The driver library
 system libraries dynamic, matching the release's dynamic-loader requirement.
 The archive-only directory prevents an adjacent `libblazesym_c.so` from becoming
 a runtime dependency. Fully static builds are not supported for NVML telemetry.
+The Makefile and CI check dynamic imports because the NVML binding relaxes
+link-time symbol checking. Strong unresolved symbols outside NVML and versioned
+system libraries fail that check. When building manually, run
+`sh scripts/check-dynamic-symbols.sh ./perf-agent` after linking.
+
 Build blazesym with `--features blazesym/xz` as above so `.gnu_debugdata`
 symbolization remains available.
 

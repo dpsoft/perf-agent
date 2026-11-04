@@ -136,7 +136,9 @@ jobs:
           CGO_ENABLED: 1
           CGO_CFLAGS: -I/usr/local/include
           CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
-        run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
+        run: |
+          go build -v -o perf-agent-linux-${{ matrix.goarch }}
+          sh scripts/check-dynamic-symbols.sh perf-agent-linux-${{ matrix.goarch }}
 
       # The GPU profiler is a second binary, not a mode of the first. The
       # agent image already ships it (Dockerfile.agent), but that left no way
@@ -149,7 +151,9 @@ jobs:
           CGO_ENABLED: 1
           CGO_CFLAGS: -I/usr/local/include
           CGO_LDFLAGS: -L/usr/local/lib -lblazesym_c
-        run: go build -v -o gpu-cuda-profile-linux-${{ matrix.goarch }} ./cmd/gpu-cuda-profile
+        run: |
+          go build -v -o gpu-cuda-profile-linux-${{ matrix.goarch }} ./cmd/gpu-cuda-profile
+          sh scripts/check-dynamic-symbols.sh gpu-cuda-profile-linux-${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

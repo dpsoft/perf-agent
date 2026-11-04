@@ -42,7 +42,7 @@ func TestFinalSampleAndSummaryAfterCancellation(t *testing.T) {
 		require.Equal(t, "GPU-b", d.UUID)
 		calls++
 		cancel()
-		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": float64(calls-1) * 10}, Unavailable: map[string]string{"temperature": "NOT_SUPPORTED"}}
+		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": float64(calls-1) * 10}, Unsupported: map[string]string{"temperature": "NOT_SUPPORTED"}, Unavailable: map[string]string{"clock": "GPU_IS_LOST"}}
 	}
 	e := &recordingExporter{}
 	c := Collector{Source: source, UUIDs: []string{"GPU-b", "GPU-b"}, Interval: time.Second, Exporters: []metrics.Exporter{e}}
@@ -56,7 +56,9 @@ func TestFinalSampleAndSummaryAfterCancellation(t *testing.T) {
 	require.Equal(t, "summary", s.Kind)
 	require.False(t, s.EndedAt.Before(s.StartedAt))
 	require.Equal(t, metrics.GaugeSummary{Count: 2, Min: 0, Max: 10, Mean: 5, Last: 10}, s.Devices[0].Summary["power"])
-	require.Equal(t, uint64(2), s.Devices[0].FailedReadings["temperature"])
+	require.Equal(t, uint64(2), s.Devices[0].FailedReadings["clock"])
+	require.NotContains(t, s.Devices[0].FailedReadings, "temperature")
+	require.Equal(t, "NOT_SUPPORTED", s.Devices[0].Unsupported["temperature"])
 	require.NotContains(t, s.Devices[0].Summary, "temperature")
 	require.NotEmpty(t, e.snapshots[0].GPU.Devices[0].Values, "summary must not mutate previously exported readings")
 }

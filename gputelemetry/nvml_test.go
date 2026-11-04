@@ -56,6 +56,7 @@ func (l *fakeNVMLLibrary) LookupSymbol(symbol string) error {
 func TestNVMLUnitsRawMemoryAndIdle(t *testing.T) {
 	h := &fakeNVMLDevice{}
 	s := NVML{lib: &fakeNVMLLibrary{}, handles: map[string]nvml.Device{"GPU-a": h}}
+	s.loadSymbols()
 	d := s.Read(Device{UUID: "GPU-a", DriverVersion: "610"})
 	require.Equal(t, 35.196, d.Values["gpu.power_watts"])
 	require.Equal(t, 370.0, d.Values["gpu.power_limit_watts"])
@@ -68,7 +69,7 @@ func TestNVMLUnitsRawMemoryAndIdle(t *testing.T) {
 	require.Equal(t, 1.0, d.Values["gpu.clock_event_active.idle"])
 	require.Equal(t, 0.0, d.Values["gpu.clock_event_active.software_thermal"])
 	require.NotContains(t, d.Values, "gpu.clock_event_active.board_limit")
-	require.Contains(t, d.Unavailable, "gpu.clock_event_active.board_limit")
+	require.Contains(t, d.Unsupported, "gpu.clock_event_active.board_limit")
 	require.NotZero(t, d.Timestamp)
 	require.Positive(t, d.ReadDuration)
 }
@@ -78,10 +79,15 @@ func TestNVMLMissingFieldsNeverBecomeZero(t *testing.T) {
 		t.Run(map[bool]string{false: "unsupported", true: "missing_symbol"}[missingSymbol], func(t *testing.T) {
 			h := &fakeNVMLDevice{memoryStatus: nvml.ERROR_NOT_SUPPORTED, temperatureStatus: nvml.ERROR_GPU_IS_LOST}
 			s := NVML{lib: &fakeNVMLLibrary{missingMemory: missingSymbol}, handles: map[string]nvml.Device{"GPU-a": h}}
+			s.loadSymbols()
 			d := s.Read(Device{UUID: "GPU-a"})
 			for _, field := range []string{"gpu.temperature_celsius", "gpu.memory.total_bytes", "gpu.memory.used_bytes", "gpu.memory.free_bytes", "gpu.memory.reserved_bytes"} {
 				require.NotContains(t, d.Values, field)
-				require.NotEmpty(t, d.Unavailable[field])
+				if field == "gpu.temperature_celsius" {
+					require.NotEmpty(t, d.Unavailable[field])
+				} else {
+					require.NotEmpty(t, d.Unsupported[field])
+				}
 			}
 			require.Contains(t, d.Values, "gpu.power_watts")
 			if missingSymbol {

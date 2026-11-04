@@ -36,6 +36,7 @@ blazesym-link: $(LIBBLAZESYM_OBJ)
 
 build: blazesym-check blazesym-link
 	CGO_LDFLAGS="-L $(LIBBLAZESYM_LINK_DIR)" CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" go build .
+	sh scripts/check-dynamic-symbols.sh perf-agent
 
 .PHONY: generate
 generate:

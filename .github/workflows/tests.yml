@@ -351,6 +351,7 @@ jobs:
         run: |
           go generate ./...
           go build -o perf-agent
+          sh scripts/check-dynamic-symbols.sh perf-agent
 
       - name: "Record regenerated object fingerprints (issue #87)"
         # What THIS runner's toolchain produced, recorded on every run including
@@ -651,7 +652,9 @@ jobs:
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-        run: go build -v -o perf-agent-linux-${{ matrix.goarch }}
+        run: |
+          go build -v -o perf-agent-linux-${{ matrix.goarch }}
+          sh scripts/check-dynamic-symbols.sh perf-agent-linux-${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,4 +83,18 @@ func TestTelemetryFailureDoesNotEndCombinedCaptureEarly(t *testing.T) {
 	cancel()
 	require.ErrorContains(t, <-done, "source unavailable")
 	<-stopped
+}
+
+func TestExplicitDefaultIntervalNeedsTelemetry(t *testing.T) {
+	oldFlags := flag.CommandLine
+	oldEnabled, oldOutput := *flagGPUTelemetry, *flagGPUTelemetryOutput
+	t.Cleanup(func() {
+		flag.CommandLine = oldFlags
+		*flagGPUTelemetry, *flagGPUTelemetryOutput = oldEnabled, oldOutput
+	})
+	*flagGPUTelemetry, *flagGPUTelemetryOutput = false, ""
+	flag.CommandLine = flag.NewFlagSet("telemetry", flag.ContinueOnError)
+	flag.CommandLine.Duration("gpu-telemetry-interval", time.Second, "")
+	require.NoError(t, flag.CommandLine.Parse([]string{"--gpu-telemetry-interval=1s"}))
+	require.ErrorContains(t, validateTelemetryFlags(true), "require --gpu-telemetry")
 }

@@ -20,6 +20,7 @@ type GPUDeviceMetrics struct {
 	Timestamp        time.Time               `json:"timestamp"`
 	ReadDuration     time.Duration           `json:"read_duration_ns"`
 	Values           map[string]float64      `json:"values,omitempty"`
+	Unsupported      map[string]string       `json:"unsupported,omitempty"`
 	Unavailable      map[string]string       `json:"unavailable,omitempty"`
 	Summary          map[string]GaugeSummary `json:"summary,omitempty"`
 	FailedReadings   map[string]uint64       `json:"failed_readings,omitempty"`

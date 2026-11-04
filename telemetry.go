@@ -28,7 +28,7 @@ func gpuTelemetryEnabled() bool { return *flagGPUTelemetry || *flagGPUTelemetryO
 
 func validateTelemetryFlags(profiling bool) error {
 	if !gpuTelemetryEnabled() {
-		if *flagGPUTelemetryDevices != "" || *flagGPUTelemetryInterval != time.Second {
+		if flagWasSet("gpu-telemetry-devices") || flagWasSet("gpu-telemetry-interval") || *flagGPUTelemetryDevices != "" || *flagGPUTelemetryInterval != time.Second {
 			return errors.New("GPU telemetry settings require --gpu-telemetry or --gpu-telemetry-output")
 		}
 		return nil
@@ -103,7 +103,7 @@ func runCapture() (code int) {
 		return 2
 	}
 	var agent *perfagent.Agent
-	if profiling || !gpuTelemetryEnabled() {
+	if profiling {
 		var err error
 		agent, err = perfagent.New(buildOptions()...)
 		if err != nil {
@@ -195,4 +195,14 @@ func waitForCapture(ctx context.Context, result <-chan error, stopProfiler func(
 		telemetryErr = <-result
 	}
 	return errors.Join(profileErr, telemetryErr)
+}
+
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

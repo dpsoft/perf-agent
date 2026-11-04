@@ -12,6 +12,7 @@ import (
 type NVML struct {
 	lib     nvml.Interface
 	handles map[string]nvml.Device
+	symbols map[string]bool
 }
 
 func NewNVML() *NVML { return &NVML{lib: nvml.New()} }
@@ -25,6 +26,7 @@ func (s *NVML) Open() (devices []Device, err error) {
 			err = errors.Join(err, s.Close())
 		}
 	}()
+	s.loadSymbols()
 	driver, ret := s.lib.SystemGetDriverVersion()
 	if ret != nvml.SUCCESS {
 		return nil, fmt.Errorf("NVML driver version: %s", nvml.ErrorString(ret))
@@ -82,10 +84,14 @@ func (s *NVML) Read(device Device) metrics.GPUDeviceMetrics {
 	d := metrics.GPUDeviceMetrics{
 		UUID: device.UUID, Name: device.Name, DriverVersion: device.DriverVersion,
 		MemoryAPIVersion: "nvmlDeviceGetMemoryInfo_v2", Timestamp: started,
-		Values: make(map[string]float64), Unavailable: make(map[string]string),
+		Values: make(map[string]float64), Unavailable: make(map[string]string), Unsupported: make(map[string]string),
 	}
 	h := s.handles[device.UUID]
 	put := func(name string, value float64, ret nvml.Return) {
+		if ret == nvml.ERROR_NOT_SUPPORTED || ret == nvml.ERROR_FUNCTION_NOT_FOUND {
+			d.Unsupported[name] = nvml.ErrorString(ret)
+			return
+		}
 		if ret != nvml.SUCCESS {
 			d.Unavailable[name] = nvml.ErrorString(ret)
 			return
@@ -132,7 +138,18 @@ func (s *NVML) Read(device Device) metrics.GPUDeviceMetrics {
 	return d
 }
 
-func (s *NVML) has(symbol string) bool { return s.lib.Extensions().LookupSymbol(symbol) == nil }
+func (s *NVML) has(symbol string) bool { return s.symbols[symbol] }
+
+func (s *NVML) loadSymbols() {
+	s.symbols = make(map[string]bool)
+	for _, symbol := range []string{
+		"nvmlDeviceGetMemoryInfo_v2", "nvmlDeviceGetSupportedClocksEventReasons",
+		"nvmlDeviceGetSupportedClocksThrottleReasons", "nvmlDeviceGetCurrentClocksEventReasons",
+		"nvmlDeviceGetCurrentClocksThrottleReasons",
+	} {
+		s.symbols[symbol] = s.lib.Extensions().LookupSymbol(symbol) == nil
+	}
+}
 
 func (s *NVML) clockEvents(h nvml.Device) (uint64, uint64, nvml.Return) {
 	var supported, active uint64

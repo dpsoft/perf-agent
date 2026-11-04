@@ -1,6 +1,7 @@
 package pprof
 
 import (
+	"strconv"
 	"bytes"
 	"path/filepath"
 	"testing"
@@ -782,5 +783,38 @@ func TestAddSampleIndexedMatchesTheSerializedOrder(t *testing.T) {
 		if p.Sample[i].Value[0] != wantV {
 			t.Errorf("written sample %d value %d, want %d", i, p.Sample[i].Value[0], wantV)
 		}
+	}
+}
+
+func gpuBenchSample(i int) *ProfileSample {
+	stack := make([]Frame, 10)
+	for f := range stack {
+		stack[f] = Frame{Name: "frame" + strconv.Itoa(f), File: "f.cu", Line: uint32(f)}
+	}
+	return &ProfileSample{SampleType: SampleTypeGpu, Stack: stack, Value: 1000,
+		Labels: map[string]string{"gpu_pid": "1234", "gpu_join": "exact", "gpu_serialized": "false",
+			"gpu_sample_period": "64", "gpu_device": "0", "gpu_queue": strconv.Itoa(i % 4)}}
+}
+
+// The per-sample cost of the two ways the GPU profiler adds samples: one
+// sample per execution (append), and merging by stack and labels.
+func BenchmarkGPUAddPerExecution(b *testing.B) {
+	pb := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	s := gpuBenchSample(0)
+	s.Aggregation = SampleAggregated
+	b.ReportAllocs()
+	for b.Loop() {
+		pb.AddSample(s)
+	}
+}
+
+func BenchmarkGPUAddMerged(b *testing.B) {
+	pb := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	samples := []*ProfileSample{gpuBenchSample(0), gpuBenchSample(1), gpuBenchSample(2), gpuBenchSample(3)}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		pb.AddSampleIndexed(samples[i%4])
+		i++
 	}
 }

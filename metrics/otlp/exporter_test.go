@@ -363,3 +363,22 @@ func TestCompetingExportersCountContentionWithoutSending(t *testing.T) {
 	require.Zero(t, b.Stats().Requests)
 	require.Equal(t, int64(1), requests.Load())
 }
+
+func TestReceiverRejectionIsNotCountedAsSuccessfulDelivery(t *testing.T) {
+	cleanEnv(t)
+	body, err := proto.Marshal(&collector.ExportMetricsServiceResponse{PartialSuccess: &collector.ExportMetricsPartialSuccess{RejectedDataPoints: 100, ErrorMessage: "rejected by receiver"}})
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	e, err := New(t.Context(), Options{Endpoint: server.URL, LockDir: filepath.Join(t.TempDir(), "locks")})
+	require.NoError(t, err)
+	require.NoError(t, e.Export(t.Context(), sample(1, time.Now())))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.NoError(t, e.Shutdown(ctx))
+	require.Zero(t, e.Stats().SentSensorPoints)
+	require.Equal(t, uint64(1), e.Stats().FailedRequests)
+}

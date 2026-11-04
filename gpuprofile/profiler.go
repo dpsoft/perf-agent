@@ -25,7 +25,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -271,6 +270,7 @@ func (p *Profiler) drain() {
 	var execOf []int
 	if !p.cfg.PerExecutionSamples {
 		pcfg.SampleExecutions = &execOf
+		pcfg.OmitCorrelationLabel = true
 	}
 	samples, _ := gpu.ProjectExecutionsWith(snap, pcfg)
 	p.mu.Lock()
@@ -289,17 +289,17 @@ func (p *Profiler) drain() {
 	}
 	for i := range samples {
 		s := &samples[i]
-		// The one label unique per execution: dropping it lets samples with
-		// the same stack and remaining labels merge. Every other GPU label is
-		// bounded per drain. Not per capture: gpu_pc's label budget restarts on
-		// every drain and src_* follow the PCs, so with PC sampling the number
-		// of aggregated samples still grows with the distinct PCs seen.
-		corr, hasCorr := s.Labels["gpu_correlation"]
-		delete(s.Labels, "gpu_correlation")
+		// gpu_correlation, the one label unique per execution, was left off
+		// (OmitCorrelationLabel), so samples with the same stack and remaining
+		// labels merge. Every other GPU label is bounded per drain. Not per
+		// capture: gpu_pc's label budget restarts on every drain and src_*
+		// follow the PCs, so with PC sampling the number of aggregated
+		// samples still grows with the distinct PCs seen.
 		s.Aggregation = pprof.SampleAggregation(false)
 		idx := p.builders.AddSampleIndexed(s)
 		if p.execLog != nil {
-			p.logRowLocked(idx, base+uint64(execOf[i]), corr, hasCorr, s.Value)
+			corr := snap.Executions[execOf[i]].Exec.Correlation
+			p.logRowLocked(idx, base+uint64(execOf[i]), corr, s.Value)
 		}
 	}
 }
@@ -307,18 +307,17 @@ func (p *Profiler) drain() {
 // logRowLocked appends one row to the executions log, or abandons the log
 // with a reason if the row cannot be represented exactly. The caller holds
 // p.mu.
-func (p *Profiler) logRowLocked(sample int, execution uint64, corr string, hasCorr bool, value uint64) {
+func (p *Profiler) logRowLocked(sample int, execution uint64, corr gpu.CorrelationID, value uint64) {
 	row := execlog.Row{Execution: execution, Value: value}
 	if sample < 0 || uint64(sample) > uint64(^uint32(0)) {
 		p.abandonExecLogLocked(fmt.Errorf("aggregated sample index %d out of range", sample))
 		return
 	}
 	row.Sample = uint32(sample)
-	if hasCorr {
-		backend, digits, ok := strings.Cut(corr, ":")
-		v, err := strconv.ParseUint(digits, 10, 64)
-		if !ok || backend != string(gpu.BackendCUPTI) || err != nil {
-			p.abandonExecLogLocked(fmt.Errorf("correlation %q is not a %s:<uint64> id", corr, gpu.BackendCUPTI))
+	if corr.Present() {
+		v, err := strconv.ParseUint(corr.Value, 10, 64)
+		if corr.Backend != gpu.BackendCUPTI || err != nil {
+			p.abandonExecLogLocked(fmt.Errorf("correlation %s:%s is not a %s:<uint64> id", corr.Backend, corr.Value, gpu.BackendCUPTI))
 			return
 		}
 		row.HasCorrelation, row.Correlation = true, v

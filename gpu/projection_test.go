@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"strconv"
 	"fmt"
 	"slices"
 	"strings"
@@ -1027,4 +1028,35 @@ func TestProjectionReportsTheExecutionOfEverySample(t *testing.T) {
 
 	plain, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
 	assert.Equal(t, plain, samples, "SampleExecutions must not change the projection")
+}
+
+// BenchmarkProjectDrain projects one pressure-sized drain (32768 executions
+// without PC samples), the work the GPU profiler does per drain.
+func BenchmarkProjectDrain(b *testing.B) {
+	for _, omit := range []bool{false, true} {
+		b.Run(map[bool]string{false: "with-correlation", true: "omit-correlation"}[omit], func(b *testing.B) {
+			views := make([]ExecutionView, 32768)
+			for i := range views {
+				e := execFor(strconv.Itoa(4294967296+i), uint64(i)*10, uint64(i)*10+5)
+				e.Correlation.PID = 1234
+				views[i] = ExecutionView{Exec: e}
+			}
+			snap := Snapshot{Executions: views}
+			b.ReportAllocs()
+			for b.Loop() {
+				var execOf []int
+				_, _ = ProjectExecutionsWith(snap, ProjectionConfig{SampleExecutions: &execOf, OmitCorrelationLabel: omit})
+			}
+		})
+	}
+}
+
+// OmitCorrelationLabel removes only gpu_correlation.
+func TestOmitCorrelationLabelRemovesOnlyThatLabel(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{{Exec: execFor("a", 10, 20)}}}
+	with, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
+	without, _ := ProjectExecutionsWith(snap, ProjectionConfig{OmitCorrelationLabel: true})
+	require.Contains(t, with[0].Labels, "gpu_correlation")
+	delete(with[0].Labels, "gpu_correlation")
+	assert.Equal(t, with[0].Labels, without[0].Labels)
 }

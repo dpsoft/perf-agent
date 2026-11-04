@@ -122,7 +122,7 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 	for viewIndex, view := range snap.Executions {
 		frames := projectionFrames(view)
 		pid := projectionPID(view)
-		common := projectionLabels(view)
+		common := projectionLabels(view, cfg.OmitCorrelationLabel)
 
 		if len(view.PCSamples) == 0 {
 			samples = append(samples, pp.ProfileSample{
@@ -210,6 +210,12 @@ type ProjectionConfig struct {
 	// can repeat (CUDA graphs, several processes) and sample counts depend on
 	// PC sampling. Nil leaves the projection unchanged.
 	SampleExecutions *[]int
+
+	// OmitCorrelationLabel leaves gpu_correlation off the samples. A caller
+	// that merges samples by labels has to drop it anyway, since it is unique
+	// per execution, and building it costs one string per execution; with
+	// SampleExecutions the caller reads the correlation from the execution.
+	OmitCorrelationLabel bool
 }
 
 // ProjectionStats is what one ProjectExecutionsWith call did to the labels it
@@ -608,7 +614,7 @@ func labelPID(view ExecutionView) uint32 {
 // loses to the file the module store resolved, which is the only ordering
 // under which a producer-controlled string cannot claim to be a source
 // location this package derived.
-func projectionLabels(view ExecutionView) map[string]string {
+func projectionLabels(view ExecutionView, omitCorrelation bool) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {
 		maps.Copy(labels, view.Launch.Launch.Tags)
@@ -638,7 +644,7 @@ func projectionLabels(view ExecutionView) map[string]string {
 	if view.Exec.Queue.Device.DeviceID != "" {
 		labels["gpu_device"] = view.Exec.Queue.Device.DeviceID
 	}
-	if view.Exec.Correlation.Present() {
+	if !omitCorrelation && view.Exec.Correlation.Present() {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
 	}
 	switch view.Join {

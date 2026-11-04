@@ -138,58 +138,14 @@ var pmuFile *os.File
 
 func main() {
 	flag.Parse()
-
 	if flagDebuginfodPrefetch {
+		if gpuTelemetryEnabled() {
+			fmt.Fprintln(os.Stderr, "perf-agent: GPU telemetry cannot be combined with --debuginfod-prefetch")
+			os.Exit(2)
+		}
 		os.Exit(runPrefetch())
 	}
-
-	// Build options from flags
-	opts := buildOptions()
-
-	// Create agent
-	agent, err := perfagent.New(opts...)
-	if err != nil {
-		log.Fatalf("Failed to create agent: %v", err)
-	}
-	defer func() {
-		if err := agent.Close(); err != nil {
-			log.Printf("Error closing agent: %v", err)
-		}
-	}()
-
-	// Setup context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start the agent
-	if err := agent.Start(ctx); err != nil {
-		log.Fatalf("Failed to start agent: %v", err)
-	}
-
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for duration or signal
-	fmt.Printf("Collecting data for %v (Ctrl+C to stop early)...\n", *flagDuration)
-
-	select {
-	case <-time.After(*flagDuration):
-		fmt.Println("Collection duration completed")
-	case sig := <-sigChan:
-		fmt.Printf("\nReceived signal: %s\n", sig)
-	}
-
-	// Stop and collect results
-	if err := agent.Stop(ctx); err != nil {
-		log.Printf("Error stopping agent: %v", err)
-	}
-
-	if pmuFile != nil {
-		_ = pmuFile.Close()
-	}
-
-	fmt.Println("Exiting program.")
+	os.Exit(runCapture())
 }
 
 // runPrefetch is the --debuginfod-prefetch mode: no BPF, no profile, just the

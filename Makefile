@@ -10,6 +10,7 @@ export GOTOOLCHAIN ?= auto
 LIBBLAZESYM_SRC := $(abspath /home/diego/github/blazesym/)
 LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a)
+LIBBLAZESYM_LINK_DIR := $(abspath .build/blazesym)
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 .PHONY: blazesym-check
@@ -26,8 +27,15 @@ blazesym-check:
 		exit 1; \
 	fi
 
-build: blazesym-check $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a
-	CGO_LDFLAGS=" -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release) -lblazesym_c -static " CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC) -L /usr/lib -L $(abspath $(LIBBLAZESYM_SRC)/target/release)" go build .
+# Keep blazesym static even when its build directory also contains a .so.
+# The process itself must remain dynamically linked so NVML can use dlopen.
+.PHONY: blazesym-link
+blazesym-link: $(LIBBLAZESYM_OBJ)
+	mkdir -p $(LIBBLAZESYM_LINK_DIR)
+	ln -sf $(LIBBLAZESYM_OBJ) $(LIBBLAZESYM_LINK_DIR)/libblazesym_c.a
+
+build: blazesym-check blazesym-link
+	CGO_LDFLAGS="-L $(LIBBLAZESYM_LINK_DIR)" CGO_CFLAGS="-I /usr/include/bpf -I /usr/include/pcap -I $(LIBBLAZESYM_INC)" go build .
 
 .PHONY: generate
 generate:

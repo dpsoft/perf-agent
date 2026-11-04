@@ -66,6 +66,74 @@ another path capture nothing.
 CPU stack. Lowering it raises the event rate; see
 [GPU injection](gpu-injection.md) for what that costs.
 
+## GPU device telemetry
+
+Collect hardware sensors without starting a profiler:
+
+```bash
+./perf-agent --gpu-telemetry --duration 30s
+./perf-agent --gpu-telemetry-output gpu.jsonl --duration 30s \
+    --gpu-telemetry-interval 1s --gpu-telemetry-devices GPU-<uuid>
+```
+
+Or collect sensors alongside a profile:
+
+```bash
+./perf-agent --profile --pid <PID> --duration 30s \
+    --gpu-telemetry-output gpu.jsonl
+```
+
+Telemetry reads NVML directly. It needs the NVIDIA driver, device access and
+`libnvidia-ml.so.1`, but no CUDA injection, application changes, PID or BPF
+capabilities when used alone. Physical GPU UUIDs select devices; the default is
+all visible physical GPUs. Even alongside a per-PID profile, sensors describe the
+**whole device**, including other workloads. MIG instance metrics are not collected.
+
+An initial reading, periodic readings and a final reading are followed by a
+console summary. `--gpu-telemetry-output` also enables collection and writes one
+JSON object per device per reading, plus one summary record per device. Each
+record has `schema_version: 1`, `source: "nvml"`, `scope: "device"`, and a `kind`
+of `initial`, `sample`, `final`, `summary` or `unavailable`. Device records include
+UUID, driver version, memory API, actual read timestamp, read duration and values.
+The configured interval is a polling interval, not the sensor's internal refresh
+period. `missed_ticks` counts periodic polls skipped when reads or output are slow.
+
+| Value key | Unit and meaning |
+|---|---|
+| `gpu.temperature_celsius` | GPU core temperature, °C |
+| `gpu.power_watts` | Driver-reported power, W; may average an internal window |
+| `gpu.power_limit_watts` | Configured power limit, W |
+| `gpu.memory.{total,used,free,reserved}_bytes` | Raw memory-info v2 fields, bytes |
+| `gpu.utilization_ratio` | Fraction of the driver's sample period with kernels executing, 0–1 |
+| `gpu.memory_activity_ratio` | Fraction with device memory reads/writes, 0–1 |
+| `gpu.sm_clock_hertz` | SM clock frequency, Hz |
+| `gpu.memory_clock_hertz` | Memory clock frequency, Hz |
+| `gpu.clock_event_active.<reason>` | Supported clock-event state, 0 or 1 |
+
+Clock reasons are `idle`, `application_clocks`, `power_cap`, `hardware_slowdown`,
+`sync_boost`, `software_thermal`, `hardware_thermal`, `hardware_power_brake`,
+`display_clock`, `board_limit`, and `reliability`. Idle is not thermal throttling.
+Utilization is not SM occupancy; memory activity is neither occupied capacity nor
+bandwidth. Memory fields are preserved exactly as reported, without deriving
+`used = total - free` or adjusting for reserved memory. Memory-info v1 is not
+substituted when v2 is unavailable.
+
+Unavailable fields are absent from `values` and have a reason in `unavailable`;
+a real zero stays present. The summary reports min/max/last and the arithmetic
+mean of **successful samples**, plus counts of successful and failed readings.
+It does not estimate energy or interpolate missing samples. Sampling and export
+are serial with bounded memory. A driver call or local writer must return before
+telemetry can finish; profiling stops independently at its duration boundary.
+A source initialization or output failure is reported and produces a nonzero exit
+status. In a combined capture, the profile still completes if telemetry fails.
+
+`/metrics` remains internal agent diagnostics. These measurements go through the
+metrics exporter interface; they are not re-exported through HTTP. There is no
+vLLM dependency or OTLP exporter. With file capabilities (`setcap`), NVML must be
+resolvable through standard loader paths or `ld.so.cache`; `LD_LIBRARY_PATH` is
+ignored by secure execution. In containers, expose the NVIDIA devices and driver
+libraries with NVIDIA Container Toolkit.
+
 ---
 
 # Flags
@@ -79,6 +147,10 @@ CPU stack. Lowering it raises the event rate; see
 | `-a, --all` | System-wide (all processes) | `false` |
 | `--per-pid` | Per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
+| `--gpu-telemetry` | Collect NVIDIA device sensors, also usable alone | `false` |
+| `--gpu-telemetry-output` | Write timestamped GPU readings and summary to JSONL; enables telemetry | - |
+| `--gpu-telemetry-interval` | Sensor polling interval | `1s` |
+| `--gpu-telemetry-devices` | Comma-separated physical GPU UUIDs | all visible GPUs |
 | `--sample-rate` | CPU profile sample rate (Hz) | `99` |
 | `--unwind` | Stack unwinding strategy: `fp` \| `dwarf` \| `auto` (auto routes to dwarf; the hybrid walker covers FP-safe code via the FP path) | `auto` |
 | `--profile-output` | Output path for CPU profile | auto-named |
@@ -96,6 +168,6 @@ CPU stack. Lowering it raises the event rate; see
 | `--symbol-fetch-timeout=DUR` | Per-artifact HTTP fetch timeout, transfer included. | `5s` |
 | `--symbol-fail-closed` | (M2 stub) Refuse to symbolize a mapping whose fetch failed. | `false` |
 
-Either `--pid` or `-a/--all` is required. At least one of `--profile`, `--offcpu`, or `--pmu` must be specified.
+Profiling requires `--pid` or `-a/--all` and at least one profiling mode (`--profile`, `--offcpu`, `--gpu`, `--pmu`). GPU telemetry alone requires neither; duration and polling interval must be positive.
 
 ---

@@ -61,6 +61,8 @@ kernel frames stay unsymbolized with no error. On kernels older than 5.9, add
 `cap_sys_admin`.
 
 For CPU + GPU in one tree, see [Usage](docs/usage.md#gpu).
+For temperature, power, memory and clocks during a finite capture, see
+[GPU device telemetry](docs/usage.md#gpu-device-telemetry).
 
 ## Documentation
 

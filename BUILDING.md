@@ -82,6 +82,19 @@ go build -o perf-agent
 go test -v ./cpu/... ./profile/... ./offcpu/...
 ```
 
+### NVML telemetry
+
+The official `github.com/NVIDIA/go-nvml` binding uses cgo and ships its headers;
+builds and unit tests need no NVIDIA driver or CUDA toolkit. The driver library
+`libnvidia-ml.so.1` is loaded at runtime only when GPU telemetry is requested.
+
+`make build` links blazesym's archive from `.build/blazesym` while keeping the
+system libraries dynamic, matching the release's dynamic-loader requirement.
+The archive-only directory prevents an adjacent `libblazesym_c.so` from becoming
+a runtime dependency. Fully static builds are not supported for NVML telemetry.
+Build blazesym with `--features blazesym/xz` as above so `.gnu_debugdata`
+symbolization remains available.
+
 ## Building Test Workloads
 
 ```bash

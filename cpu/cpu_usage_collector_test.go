@@ -304,3 +304,25 @@ func TestMetricsAccumulation(t *testing.T) {
 	t.Logf("On-CPU P50: %.3f ms", float64(m.OnCPUHist.ValueAtQuantile(50.0))/1e6)
 	t.Logf("Runqueue P50: %.3f µs", float64(m.RunqLatencyHist.ValueAtQuantile(50.0))/1e3)
 }
+
+// A switch-out with no earlier switch on its CPU to measure from arrives with
+// DeltaNs 0. It still counts as a switch, with its state, runqueue latency
+// and counters, but adds no on-CPU sample: a 0 there is "unmeasured", not a
+// zero-length run. Before #236 the BPF side sent the time since boot instead,
+// which the histogram rejected with a logged error on every run.
+func TestAnUnmeasuredSwitchAddsNoOnCPUSample(t *testing.T) {
+	c := &CPUUsageCollector{metrics: make(map[uint32]*PidMetrics)}
+
+	c.recordPidStat(&PidStat{TGID: 7, DeltaNs: 0, RunqLatencyNs: 500, Cycles: 10, PrevState: StateRunning})
+	c.recordPidStat(&PidStat{TGID: 7, DeltaNs: 2_000_000, PrevState: StateInterruptible})
+
+	m := c.GetMetrics(7)
+	require.NotNil(t, m)
+	assert.Equal(t, int64(1), m.OnCPUHist.TotalCount(), "only the measured switch is an on-CPU sample")
+	assert.InDelta(t, 2_000_000, m.OnCPUHist.Max(), 2_000_000*0.001)
+	assert.Equal(t, uint64(2), m.SampleCount, "both switches count")
+	assert.Equal(t, int64(1), m.RunqLatencyHist.TotalCount())
+	assert.Equal(t, uint64(10), m.TotalCycles)
+	assert.Equal(t, uint64(1), m.PreemptedCount)
+	assert.Equal(t, uint64(1), m.VoluntaryCount)
+}

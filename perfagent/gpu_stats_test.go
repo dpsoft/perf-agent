@@ -20,7 +20,8 @@ func TestGPUStatsDoNotAddRecordsBatchesAndStacks(t *testing.T) {
 	s := buf.String()
 	require.Contains(t, s, "kernel_dropped=100 record(s) (launch=40 exec=60)")
 	require.Contains(t, s, "increase --gpu-ring-bytes for bursts")
-	require.Contains(t, s, "sequence_gaps=3 batch(es), record count unknown")
+	require.Contains(t, s, "sequence_gaps=3 forward batch-sequence gap(s) observed")
+	require.Contains(t, s, "may reflect reordering across threads; record count unknown")
 	require.Contains(t, s, "may overlap BPF transport losses")
 	require.Contains(t, s, "sink_rejected=2 event(s) after transport")
 	require.Contains(t, s, "CPU attribution incomplete: stacks_evicted=7 stacks_missing=11")
@@ -53,7 +54,8 @@ func TestUnreadableGPUDropCountersDoNotLookHealthy(t *testing.T) {
 func TestGPUSequenceGapDoesNotClaimKnownRecordCount(t *testing.T) {
 	buf := captureLog(t)
 	logGPUIngestionStats(gpuprobe.Stats{SequenceGaps: 1})
-	require.Contains(t, buf.String(), "sequence_gaps=1 batch(es), record count unknown")
+	require.Contains(t, buf.String(), "sequence_gaps=1 forward batch-sequence gap(s) observed")
+	require.Contains(t, buf.String(), "may reflect reordering across threads; record count unknown")
 	require.NotContains(t, buf.String(), "LOST")
 	require.NotContains(t, buf.String(), "kernel_dropped=")
 }

@@ -72,8 +72,10 @@ At shutdown, GPU diagnostics distinguish several kinds of incomplete data:
   by kind. `exec` records carry measured GPU durations; `launch` and
   `sampled_launch` records carry CPU attribution. The total is not a count of
   missing kernels. Unreadable BPF counter slots are reported explicitly.
-- `sequence_gaps` counts **batches**, whose record counts are unknown. These
-  gaps can overlap the BPF losses and must not be added to them.
+- `sequence_gaps` counts observed **forward batch-sequence gaps**, whose record
+  counts are unknown. Concurrent producer threads can deliver batches out of
+  order, so these gaps do not prove that a batch was lost. They can also overlap
+  the BPF losses and must not be added to them.
 - `CPU attribution incomplete` describes missing, evicted or unresolved CPU
   stacks. GPU executions may still be present with measured durations and no
   caller attribution; this is not evidence of missing GPU time by itself.

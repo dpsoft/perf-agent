@@ -74,6 +74,15 @@ type Config struct {
 	// identical bytes at another path is a different target.
 	GPUShimPath string
 
+	// GPUPerExecutionSamples keeps one GPU sample per kernel execution, each
+	// with its gpu_correlation label, instead of merging executions by stack
+	// and labels. Memory then grows with the number of kernels.
+	GPUPerExecutionSamples bool
+
+	// GPUExecutionsPath, if set, streams the per-execution detail of the
+	// aggregated GPU profile to this file. See gpu/execlog.
+	GPUExecutionsPath string
+
 	// GPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.
 	// Zero keeps the compiled-in default. See WithGPUEventRingBytes.
 	GPUEventRingBytes int
@@ -381,6 +390,20 @@ func WithGPU(shimPath string) Option {
 		c.EnableGPU = true
 		c.GPUShimPath = shimPath
 	}
+}
+
+// WithGPUPerExecutionSamples keeps one GPU pprof sample per kernel execution
+// with its gpu_correlation label, so a profile can be filtered to one kernel
+// execution. Memory grows with the number of kernels.
+func WithGPUPerExecutionSamples() Option {
+	return func(c *Config) { c.GPUPerExecutionSamples = true }
+}
+
+// WithGPUExecutionsOutput streams the per-execution detail of the aggregated
+// GPU profile (aggregated sample, correlation, value) to path. Written
+// incrementally; it costs no memory per execution.
+func WithGPUExecutionsOutput(path string) Option {
+	return func(c *Config) { c.GPUExecutionsPath = path }
 }
 
 // WithGPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.

@@ -126,7 +126,7 @@ func (c *CPUUsageCollector) recordPidStat(ps *PidStat) {
 	}
 
 	// Record on-CPU time. 0 means the BPF side had no earlier switch on that
-	// CPU to measure from, the first event per CPU, not a zero-length run (#236).
+	// CPU to measure from (the first event per CPU), not a zero-length run.
 	if ps.DeltaNs > 0 {
 		if err := m.OnCPUHist.RecordValue(int64(ps.DeltaNs)); err != nil {
 			log.Printf("[PID %d] Error recording on-CPU time: %v (value=%d ns = %.0f sec)",

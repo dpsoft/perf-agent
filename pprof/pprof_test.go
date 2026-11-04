@@ -745,3 +745,42 @@ func TestLabelHashIsOrderIndependent(t *testing.T) {
 	b := hashLabels(1234, map[string]string{"y": "2", "x": "1"})
 	assert.Equal(t, a, b, "label hash must not depend on map iteration order")
 }
+
+// AddSampleIndexed returns each sample's position in the WRITTEN profile, and
+// repeated stack+labels merge into the same index.
+func TestAddSampleIndexedMatchesTheSerializedOrder(t *testing.T) {
+	b := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	mk := func(name, label string, v uint64) *ProfileSample {
+		return &ProfileSample{SampleType: SampleTypeGpu, Aggregation: SampleAggregation(false),
+			Stack: []Frame{{Name: name}}, Value: v, Labels: map[string]string{"gpu_join": label}}
+	}
+	inputs := []*ProfileSample{mk("a", "exact", 1), mk("b", "exact", 2), mk("a", "exact", 4), mk("a", "heuristic", 8), mk("b", "exact", 16)}
+	var got []int
+	for _, s := range inputs {
+		got = append(got, b.AddSampleIndexed(s))
+	}
+	want := []int{0, 1, 0, 2, 1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("indices %v, want %v", got, want)
+		}
+	}
+	var buf bytes.Buffer
+	for _, pb := range b.Builders {
+		if _, err := pb.Write(&buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := profile.Parse(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Sample) != 3 {
+		t.Fatalf("%d samples written, want 3", len(p.Sample))
+	}
+	for i, wantV := range []int64{1 + 4, 2 + 16, 8} {
+		if p.Sample[i].Value[0] != wantV {
+			t.Errorf("written sample %d value %d, want %d", i, p.Sample[i].Value[0], wantV)
+		}
+	}
+}

@@ -49,6 +49,12 @@ var (
 			"PERFAGENT_GPU_SAMPLE_PERIOD in the target multiplies the event rate, "+
 			"and the records that overflow carry the GPU time itself, so an "+
 			"undersized buffer SHRINKS the profile. Check the 'gpu: LOST' line")
+	flagGPUPerExecSamples = flag.Bool("gpu-per-execution-samples", false,
+		"Keep one GPU pprof sample per kernel execution, each labelled gpu_correlation, as before "+
+			"the GPU profile was aggregated by default. Memory then grows with the number of kernels")
+	flagGPUExecutionsOutput = flag.String("gpu-executions-output", "",
+		"With --gpu, also write the per-execution detail of the aggregated GPU profile "+
+			"(aggregated sample, correlation id, value) to this file; written incrementally")
 	flagPMUOutput  = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagFlamegraph = flag.String("flamegraph-output", "",
 		"Also write a self-contained interactive HTML flame graph of the profile. "+
@@ -348,6 +354,12 @@ func buildOptions() []perfagent.Option {
 		)
 		if *flagGPURingBytes > 0 {
 			opts = append(opts, perfagent.WithGPUEventRingBytes(*flagGPURingBytes))
+		}
+		if *flagGPUPerExecSamples {
+			opts = append(opts, perfagent.WithGPUPerExecutionSamples())
+		}
+		if *flagGPUExecutionsOutput != "" {
+			opts = append(opts, perfagent.WithGPUExecutionsOutput(*flagGPUExecutionsOutput))
 		}
 
 		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {

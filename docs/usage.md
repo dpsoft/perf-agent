@@ -92,6 +92,46 @@ symbolization still runs in the consumer and high event rates can exceed its
 throughput. Do not infer complete execution capture solely from a nonempty
 profile or from a missing attribution warning.
 
+### Aggregated GPU samples and the executions log
+
+The GPU profile merges kernel executions that share a stack and labels into
+one sample, summing their durations. Totals, flame graphs and the share of GPU
+time per call path are the same as with one sample per execution. What changes
+is memory: the agent keeps one sample per distinct stack and label set instead
+of one per kernel. A fine-tuning capture of 243,387 kernels over 247 stacks
+held 150 MB of samples per execution; aggregated, it holds about 3 MB. The
+`GPU profile written` line reports both numbers, aggregated samples and
+executions, plus the projected rows (more than executions when PC sampling
+splits one execution across several program counters).
+
+Labels that vary per program counter (`gpu_pc`, `gpu_stall`, `gpu_src_*`) stay
+on the samples, so with PC sampling the number of samples still grows with the
+distinct PCs seen. Without PC sampling it is bounded by stacks and labels.
+
+To keep the per-execution detail without paying memory for it, add
+`--gpu-executions-output`:
+
+```bash
+./perf-agent --pid <PID> --profile --gpu --gpu-shim /path/libperfagent-gpu-nvidia.so \
+    --gpu-output gpu.pb.gz --gpu-executions-output gpu.exec
+go run ./cmd/gpuexec -profile gpu.pb.gz -executions gpu.exec        # summary, verified
+go run ./cmd/gpuexec -profile gpu.pb.gz -executions gpu.exec -csv   # one row per sample
+```
+
+The file is written to disk as the capture runs, so it costs a few bytes per
+execution on disk and nothing per execution in memory. Each row names the
+aggregated sample it was summed into, the execution it came from (rows of one
+execution share an ordinal), its CUPTI correlation id and its value. The file
+is bound to the exact bytes of the GPU profile it was written with: `gpuexec`
+rejects it against any other profile, and rejects a truncated or corrupt file.
+It does not record per-execution timestamps.
+
+`--gpu-per-execution-samples` restores one sample per execution, each labelled
+`gpu_correlation`, for workflows that filter a profile to a single kernel
+execution (`pprof -tagfocus gpu_correlation=cupti:<id>`). Memory then grows
+with the number of kernels. It cannot be combined with
+`--gpu-executions-output`, which describes the aggregated profile.
+
 ## GPU device telemetry
 
 Collect hardware sensors without starting a profiler:

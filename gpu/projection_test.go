@@ -1011,3 +1011,20 @@ func TestSerializedLabelBeatsAForgedTag(t *testing.T) {
 	assert.Equal(t, "true", samples[0].Labels["gpu_serialized"],
 		"a tag named gpu_serialized must never override the derived disclosure")
 }
+
+// SampleExecutions maps every projected sample back to its execution, also
+// when an execution with PC samples yields several samples.
+func TestProjectionReportsTheExecutionOfEverySample(t *testing.T) {
+	snap := Snapshot{Executions: []ExecutionView{
+		{Exec: execFor("a", 10, 20)},
+		{Exec: execFor("b", 30, 60), PCSamples: []GPUPCSample{{PCOffset: 0x10, Count: 1}, {PCOffset: 0x20, Count: 2}, {PCOffset: 0x30, Count: 0}}},
+		{Exec: execFor("c", 70, 80)},
+	}}
+	var execOf []int
+	samples, _ := ProjectExecutionsWith(snap, ProjectionConfig{SampleExecutions: &execOf})
+	require.Len(t, execOf, len(samples))
+	assert.Equal(t, []int{0, 1, 1, 1, 2}, execOf)
+
+	plain, _ := ProjectExecutionsWith(snap, ProjectionConfig{})
+	assert.Equal(t, plain, samples, "SampleExecutions must not change the projection")
+}

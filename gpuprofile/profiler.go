@@ -19,14 +19,18 @@ package gpuprofile
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/pprof"
 	"github.com/dpsoft/perf-agent/symbolize"
@@ -75,6 +79,24 @@ type Config struct {
 	// EventRingBytes sizes the BPF event ringbuf. Zero keeps the
 	// compiled-in default, which is sized for a default-period capture.
 	EventRingBytes int
+
+	// PerExecutionSamples keeps one pprof sample per projected execution,
+	// each labelled with its gpu_correlation, so a profile can be filtered to
+	// a single kernel execution (pprof -tagfocus). It costs memory per kernel.
+	// By default samples with the same stack and labels are merged instead,
+	// so memory grows with distinct stacks; ExecutionsPath keeps the
+	// per-execution detail outside the profile.
+	PerExecutionSamples bool
+
+	// ExecutionsPath, when set, streams the per-execution detail of the
+	// aggregated profile to this file (see gpu/execlog): which aggregated
+	// sample each execution was summed into, its correlation id and value.
+	// It is written incrementally, so it costs no memory per execution.
+	// Incompatible with PerExecutionSamples.
+	ExecutionsPath string
+
+	// CaptureID identifies the capture in the executions log header.
+	CaptureID string
 }
 
 // DefaultDrainEvery matches cmd/gpu-cuda-profile's default.
@@ -98,6 +120,16 @@ type Profiler struct {
 	mu      sync.Mutex
 	samples int
 	stopped bool
+	// executions counts the executions the timeline handed over, before
+	// projection; samples counts projected rows. With PC sampling one
+	// execution projects to several rows, and by default rows are merged into
+	// fewer aggregated samples, so the three numbers differ.
+	executions uint64
+	execLog    *execlog.Writer
+	// execLogErr is why the executions log was abandoned, if it was. The
+	// profile itself is unaffected.
+	execLogErr error
+
 	// dropped is the timeline's loss record as of the latest drain. The
 	// timeline's counters are cumulative, so this is replaced, never summed.
 	dropped gpu.TimelineDropStats
@@ -134,6 +166,24 @@ func New(cfg Config) (*Profiler, error) {
 		eager = []int{cfg.PID}
 	}
 
+	if cfg.PerExecutionSamples && cfg.ExecutionsPath != "" {
+		return nil, errors.New("gpuprofile: an executions log describes an aggregated profile; it cannot be combined with per-execution samples")
+	}
+	// Created before attaching: a requested log that cannot be written should
+	// fail the capture up front, not lose its detail at the end.
+	var execLog *execlog.Writer
+	if cfg.ExecutionsPath != "" {
+		w, err := execlog.Create(cfg.ExecutionsPath, execlog.Header{
+			CaptureID:  cfg.CaptureID,
+			Backend:    string(gpu.BackendCUPTI),
+			SampleType: "gpu/nanoseconds",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("gpuprofile: executions log: %w", err)
+		}
+		execLog = w
+	}
+
 	consumer, err := gpuprobe.Attach(gpuprobe.Config{
 		ShimPath:                  cfg.ShimPath,
 		PID:                       cfg.PID,
@@ -146,6 +196,9 @@ func New(cfg Config) (*Profiler, error) {
 		EventRingBytes:            cfg.EventRingBytes,
 	})
 	if err != nil {
+		if execLog != nil {
+			execLog.Abort()
+		}
 		return nil, fmt.Errorf("gpuprofile: attach to %s: %w", cfg.ShimPath, err)
 	}
 
@@ -158,6 +211,7 @@ func New(cfg Config) (*Profiler, error) {
 		// must not be scaled by a CPU sampling period.
 		builders: pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1}),
 		done:     make(chan struct{}),
+		execLog:  execLog,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,14 +267,73 @@ func (p *Profiler) drainLoop(ctx context.Context, consumerDone <-chan struct{}) 
 
 func (p *Profiler) drain() {
 	snap := p.timeline.Snapshot()
-	samples, _ := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: p.store})
+	pcfg := gpu.ProjectionConfig{Modules: p.store}
+	var execOf []int
+	if !p.cfg.PerExecutionSamples {
+		pcfg.SampleExecutions = &execOf
+	}
+	samples, _ := gpu.ProjectExecutionsWith(snap, pcfg)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.dropped = snap.Dropped
-	for i := range samples {
-		p.builders.AddSample(&samples[i])
-	}
+	// Ordinals continue across drains: this snapshot's executions are
+	// numbered from the count already seen.
+	base := p.executions
+	p.executions += uint64(len(snap.Executions))
 	p.samples += len(samples)
+	if p.cfg.PerExecutionSamples {
+		for i := range samples {
+			p.builders.AddSample(&samples[i])
+		}
+		return
+	}
+	for i := range samples {
+		s := &samples[i]
+		// The one label unique per execution: dropping it lets samples with
+		// the same stack and remaining labels merge. Every other GPU label is
+		// bounded per drain. Not per capture: gpu_pc's label budget restarts on
+		// every drain and src_* follow the PCs, so with PC sampling the number
+		// of aggregated samples still grows with the distinct PCs seen.
+		corr, hasCorr := s.Labels["gpu_correlation"]
+		delete(s.Labels, "gpu_correlation")
+		s.Aggregation = pprof.SampleAggregation(false)
+		idx := p.builders.AddSampleIndexed(s)
+		if p.execLog != nil {
+			p.logRowLocked(idx, base+uint64(execOf[i]), corr, hasCorr, s.Value)
+		}
+	}
+}
+
+// logRowLocked appends one row to the executions log, or abandons the log
+// with a reason if the row cannot be represented exactly. The caller holds
+// p.mu.
+func (p *Profiler) logRowLocked(sample int, execution uint64, corr string, hasCorr bool, value uint64) {
+	row := execlog.Row{Execution: execution, Value: value}
+	if sample < 0 || uint64(sample) > uint64(^uint32(0)) {
+		p.abandonExecLogLocked(fmt.Errorf("aggregated sample index %d out of range", sample))
+		return
+	}
+	row.Sample = uint32(sample)
+	if hasCorr {
+		backend, digits, ok := strings.Cut(corr, ":")
+		v, err := strconv.ParseUint(digits, 10, 64)
+		if !ok || backend != string(gpu.BackendCUPTI) || err != nil {
+			p.abandonExecLogLocked(fmt.Errorf("correlation %q is not a %s:<uint64> id", corr, gpu.BackendCUPTI))
+			return
+		}
+		row.HasCorrelation, row.Correlation = true, v
+	}
+	p.execLog.Add(row)
+	if err := p.execLog.Err(); err != nil {
+		p.abandonExecLogLocked(err)
+	}
+}
+
+func (p *Profiler) abandonExecLogLocked(err error) {
+	logf("gpuprofile: executions log abandoned, the profile is unaffected: %v", err)
+	p.execLog.Abort()
+	p.execLog = nil
+	p.execLogErr = err
 }
 
 // Collect stops the pipeline and writes the accumulated profile.
@@ -229,11 +342,28 @@ func (p *Profiler) Collect(w io.Writer) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, b := range p.builders.Builders {
-		if _, err := b.Write(w); err != nil {
+		// The executions log binds to these exact bytes.
+		digest := sha256.New()
+		if _, err := b.Write(io.MultiWriter(w, digest)); err != nil {
+			if p.execLog != nil {
+				p.abandonExecLogLocked(fmt.Errorf("profile write failed: %w", err))
+			}
 			return fmt.Errorf("gpuprofile: write profile: %w", err)
+		}
+		if p.execLog != nil {
+			var sum [32]byte
+			copy(sum[:], digest.Sum(nil))
+			if err := p.execLog.Finish(uint64(len(b.Profile.Sample)), sum); err != nil {
+				logf("gpuprofile: executions log not written, the profile is unaffected: %v", err)
+				p.execLogErr = err
+			}
+			p.execLog = nil
 		}
 		// One builder: the GPU pipeline does not split per-PID profiles.
 		return nil
+	}
+	if p.execLog != nil {
+		p.abandonExecLogLocked(errors.New("no GPU samples were collected"))
 	}
 	return errors.New("gpuprofile: no GPU samples were collected")
 }
@@ -252,6 +382,28 @@ func (p *Profiler) CollectAndWrite(path string) error {
 		return fmt.Errorf("gpuprofile: close %s: %w", path, err)
 	}
 	return nil
+}
+
+// Counts are the three numbers a GPU profile's size has to be read against:
+// executions the timeline handed over, rows they projected to (more than
+// executions with PC sampling), and aggregated samples in the profile.
+type Counts struct {
+	Executions        uint64
+	ProjectedRows     uint64
+	AggregatedSamples uint64
+	// ExecutionsLogErr is why a requested executions log was not written.
+	ExecutionsLogErr error
+}
+
+// Counts reports Counts; final after Stop.
+func (p *Profiler) Counts() Counts {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c := Counts{Executions: p.executions, ProjectedRows: uint64(p.samples), ExecutionsLogErr: p.execLogErr}
+	for _, b := range p.builders.Builders {
+		c.AggregatedSamples += uint64(len(b.Profile.Sample))
+	}
+	return c
 }
 
 // Samples reports how many GPU samples have been projected so far.
@@ -299,6 +451,13 @@ func (p *Profiler) stop() {
 // Close stops the pipeline and releases the BPF resources.
 func (p *Profiler) Close() {
 	p.stop()
+	p.mu.Lock()
+	if p.execLog != nil {
+		// Never collected: nothing to bind the log to.
+		p.execLog.Abort()
+		p.execLog = nil
+	}
+	p.mu.Unlock()
 	if err := p.consumer.Close(); err != nil {
 		logf("gpuprofile: close consumer: %v", err)
 	}

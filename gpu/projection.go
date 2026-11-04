@@ -119,7 +119,7 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 	budget := newPCLabelBudget(cfg.MaxDistinctPCLabels)
 
 	samples := make([]pp.ProfileSample, 0, len(snap.Executions))
-	for _, view := range snap.Executions {
+	for viewIndex, view := range snap.Executions {
 		frames := projectionFrames(view)
 		pid := projectionPID(view)
 		common := projectionLabels(view)
@@ -133,6 +133,9 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 				Value:       executionWeight(view.Exec),
 				Labels:      common,
 			})
+			if cfg.SampleExecutions != nil {
+				*cfg.SampleExecutions = append(*cfg.SampleExecutions, viewIndex)
+			}
 			continue
 		}
 
@@ -171,6 +174,9 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 				Value:       weights[i],
 				Labels:      labels,
 			})
+			if cfg.SampleExecutions != nil {
+				*cfg.SampleExecutions = append(*cfg.SampleExecutions, viewIndex)
+			}
 		}
 	}
 	return samples, budget.stats()
@@ -196,6 +202,14 @@ type ProjectionConfig struct {
 	// defaultMaxDistinctPCLabels. See pcLabelBudget for what happens past
 	// the cap and why gpu_pc is the label that gives way.
 	MaxDistinctPCLabels int
+
+	// SampleExecutions, when non-nil, receives one entry per returned sample:
+	// the index into snap.Executions of the execution that sample came from.
+	// An execution with PC samples yields several samples, so this is the
+	// only reliable way back from a sample to its execution; correlation ids
+	// can repeat (CUDA graphs, several processes) and sample counts depend on
+	// PC sampling. Nil leaves the projection unchanged.
+	SampleExecutions *[]int
 }
 
 // ProjectionStats is what one ProjectExecutionsWith call did to the labels it

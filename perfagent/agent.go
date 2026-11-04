@@ -125,9 +125,45 @@ func New(opts ...Option) (*Agent, error) {
 }
 
 // validate checks the configuration for errors.
+// validateGPUExecutions checks the executions-log options: the log describes
+// the aggregated GPU profile, needs GPU profiling, and must not be the GPU
+// profile's own file.
+func (c *Config) validateGPUExecutions() error {
+	if c.GPUExecutionsPath == "" {
+		return nil
+	}
+	if !c.EnableGPU {
+		return errors.New("a GPU executions log requires GPU profiling")
+	}
+	if c.GPUPerExecutionSamples {
+		return errors.New("a GPU executions log describes the aggregated GPU profile; it cannot be combined with per-execution GPU samples")
+	}
+	if c.GPUProfilePath == "" {
+		return nil
+	}
+	exec, err1 := filepath.Abs(c.GPUExecutionsPath)
+	prof, err2 := filepath.Abs(c.GPUProfilePath)
+	if err := errors.Join(err1, err2); err != nil {
+		return err
+	}
+	if exec == prof {
+		return errors.New("the GPU executions log must not be the GPU profile's own path")
+	}
+	if a, err := os.Stat(exec); err == nil {
+		if b, err := os.Stat(prof); err == nil && os.SameFile(a, b) {
+			return errors.New("the GPU executions log must not be the GPU profile's own file")
+		}
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	if len(c.CaptureID) > 256 || strings.ContainsAny(c.CaptureID, "\r\n") {
 		return errors.New("capture ID must be at most 256 characters without line breaks")
+	}
+
+	if err := c.validateGPUExecutions(); err != nil {
+		return err
 	}
 
 	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnableGPU && !c.EnablePMU {
@@ -725,6 +761,9 @@ func (a *Agent) Start(ctx context.Context) error {
 			PCSampling:                a.config.GPUPCSampling,
 			KeepInstrumentationFrames: a.config.GPUKeepInstrumentationFrames,
 			EventRingBytes:            a.config.GPUEventRingBytes,
+			PerExecutionSamples:       a.config.GPUPerExecutionSamples,
+			ExecutionsPath:            a.config.GPUExecutionsPath,
+			CaptureID:                 a.capture.ID,
 		})
 		if err != nil {
 			a.cleanup()
@@ -855,7 +894,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 				log.Printf("Failed to write GPU profile: %v", err)
 				lastErr = err
 			} else {
-				log.Printf("GPU profile written to %s (%d samples)", a.config.GPUProfilePath, n)
+				c := a.gpuProfiler.Counts()
+				log.Printf("GPU profile written to %s (%d aggregated samples from %d executions, %d projected rows)",
+					a.config.GPUProfilePath, c.AggregatedSamples, c.Executions, c.ProjectedRows)
+				if a.config.GPUExecutionsPath != "" && c.ExecutionsLogErr == nil {
+					log.Printf("GPU executions log written to %s", a.config.GPUExecutionsPath)
+				}
 				if err := a.writeFlamegraph(a.config.GPUProfilePath, a.config.GPUFlamegraphPath, "gpu"); err != nil {
 					log.Printf("Failed to write GPU flame graph: %v", err)
 					lastErr = err

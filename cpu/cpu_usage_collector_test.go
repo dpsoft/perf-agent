@@ -308,8 +308,8 @@ func TestMetricsAccumulation(t *testing.T) {
 // A switch-out with no earlier switch on its CPU to measure from arrives with
 // DeltaNs 0. It still counts as a switch, with its state, runqueue latency
 // and counters, but adds no on-CPU sample: a 0 there is "unmeasured", not a
-// zero-length run. Before #236 the BPF side sent the time since boot instead,
-// which the histogram rejected with a logged error on every run.
+// zero-length run. Recording it would put time since boot into the on-CPU
+// histogram, which rejects such values with a logged error.
 func TestAnUnmeasuredSwitchAddsNoOnCPUSample(t *testing.T) {
 	c := &CPUUsageCollector{metrics: make(map[uint32]*PidMetrics)}
 

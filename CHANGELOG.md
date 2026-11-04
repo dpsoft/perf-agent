@@ -25,7 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readings. Runs alone without a PID or BPF, or alongside a profile. `/metrics`
   remains internal diagnostics; unsupported readings are explicit, not zeros.
 
+- **`--gpu-executions-output` and `cmd/gpuexec`**: the per-execution detail of
+  the aggregated GPU profile (aggregated sample, execution, correlation id,
+  value), streamed to disk during the capture and bound to the profile it was
+  written with ([#245](https://github.com/dpsoft/perf-agent/issues/245)).
+
 ### Changed
+
+- **The GPU profile aggregates executions by stack and labels by default**
+  ([#245](https://github.com/dpsoft/perf-agent/issues/245)). It used to hold one
+  sample per kernel execution, so the agent's memory grew with the number of
+  kernels: about 640 bytes each, 150 MB for a 243,387-kernel fine-tuning capture.
+  Aggregated, the same capture holds about 3 MB, with identical totals and flame
+  graphs. Samples no longer carry `gpu_correlation`; pass
+  `--gpu-per-execution-samples` for the previous shape. Tools that counted pprof
+  samples as executions must use the `GPU profile written` line or the
+  executions log instead.
 
 - GPU sampled-launch messages reserve 96 bytes instead of a full 3,112-byte
   batch in the BPF transport, reducing buffer pressure without changing the

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/pprof/profile"
 
+	"github.com/dpsoft/perf-agent/internal/capturemeta"
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
 )
 
@@ -34,6 +35,10 @@ func FromProfileFile(profilePath, htmlPath string, opts Options) (*foldedstacks.
 	p, err := profile.Parse(f)
 	if err != nil {
 		return nil, fmt.Errorf("parse profile %s: %w", profilePath, err)
+	}
+
+	if err := attachTelemetry(&opts, p); err != nil {
+		return nil, fmt.Errorf("GPU telemetry: %w", err)
 	}
 
 	res, err := foldedstacks.Fold(p, foldedstacks.Options{
@@ -115,6 +120,7 @@ func FuseProfileFiles(inputs []FuseFile, htmlPath string, opts Options) (*folded
 		return nil, fmt.Errorf("flamegraph: fusing needs at least 2 profiles, got %d", len(inputs))
 	}
 
+	var telemetryProfile *profile.Profile
 	folded := make([]foldedstacks.FuseInput, 0, len(inputs))
 	for _, in := range inputs {
 		f, err := os.Open(in.Path)
@@ -127,6 +133,17 @@ func FuseProfileFiles(inputs []FuseFile, htmlPath string, opts Options) (*folded
 			return nil, fmt.Errorf("parse profile %s: %w", in.Path, err)
 		}
 
+		if opts.GPUTelemetryPath != "" || opts.GPUTelemetry != nil {
+			if telemetryProfile == nil {
+				telemetryProfile = p
+			} else {
+				left, e1 := capturemeta.FromProfile(telemetryProfile)
+				right, e2 := capturemeta.FromProfile(p)
+				if e1 != nil || e2 != nil || left.ID != right.ID || !left.StartedAt.Equal(right.StartedAt) || !left.EndedAt.Equal(right.EndedAt) {
+					return nil, fmt.Errorf("fused profiles must share capture identity and window for GPU telemetry")
+				}
+			}
+		}
 		res, err := foldedstacks.Fold(p, foldedstacks.Options{
 			SampleIndex:        -1,
 			StackOrder:         in.StackOrder,
@@ -143,6 +160,11 @@ func FuseProfileFiles(inputs []FuseFile, htmlPath string, opts Options) (*folded
 		folded = append(folded, foldedstacks.FuseInput{Result: res, Label: label})
 	}
 
+	if telemetryProfile != nil {
+		if err := attachTelemetry(&opts, telemetryProfile); err != nil {
+			return nil, err
+		}
+	}
 	fused, err := foldedstacks.Fuse(folded)
 	if err != nil {
 		return nil, err

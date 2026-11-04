@@ -127,6 +127,10 @@ go run ./cmd/flamegraph -o profile.html profile.pb.gz
 go run ./cmd/flamegraph -folded profile.pb.gz     # the a;b;c 123 text form
 ```
 
+Add `--gpu-telemetry-output gpu.jsonl` to the capture for a collapsible GPU sensor
+summary and comparison tab in its HTML. See [GPU telemetry in HTML](usage.md#gpu-telemetry-in-the-html-profile)
+for CPU+GPU capture and offline sidecar/fused rendering commands.
+
 Colour encodes **domain** — application, libc/startup, GPU runtime, unsymbolized, perf-agent's own shim, the `[gpu:launch]` CPU→GPU boundary, GPU kernel — not a hash of the frame name, and the page carries a legend saying so.
 
 The page also states what it is *not* showing: the count of frames with no symbol, the share of GPU time sitting under `[gpu:launch unsampled]` with no CPU caller, the launch sampling period and what it does to the widths, and every per-sample label that is deliberately kept out of the tree. A profile with no samples renders a page that says so rather than an empty rectangle.

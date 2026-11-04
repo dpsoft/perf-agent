@@ -54,9 +54,10 @@ type sessionObjs interface {
 // off-CPU) plus a consume-callback that controls how Sample.Value
 // aggregates (count++ vs sum+=).
 type session struct {
-	pid    int
-	tags   []string
-	labels map[string]string
+	capture *pprof.CaptureWindow
+	pid     int
+	tags    []string
+	labels  map[string]string
 	// logPrefix names this session in log lines ("dwarfagent",
 	// "dwarfagent-offcpu"); newSession already takes it, and close() needs
 	// it to attribute an interpreter module's counters to the right profiler.
@@ -458,6 +459,7 @@ func (s *session) collect(w io.Writer, sampleType pprof.SampleType, sampleRate i
 	}
 
 	builders := pprof.NewProfileBuilders(pprof.BuildersOptions{
+		Capture:       s.capture,
 		SampleRate:    int64(sampleRate),
 		PerPIDProfile: false,
 		Comments:      s.tags,
@@ -577,3 +579,6 @@ func hashPCs(pcs []uint64) uint64 {
 	}
 	return h
 }
+
+// SetCapture supplies metadata for the next collection; call before Collect.
+func (s *session) SetCapture(c pprof.CaptureWindow) { s.capture = &c }

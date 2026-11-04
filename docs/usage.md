@@ -137,6 +137,81 @@ libraries with NVIDIA Container Toolkit.
 
 ---
 
+## GPU telemetry in the HTML profile
+
+Add `--flamegraph-output auto` to a capture with GPU telemetry. Each generated
+HTML contains a collapsible device summary and a **Compare GPUs** tab. Selecting
+**Use in summary** in that tab returns to the flamegraph with the chosen physical
+GPU. Zoom and the collapsed state are preserved while switching views.
+
+For an existing CUDA process launched with the profiling adapter:
+
+```bash
+# Use the same adapter file as the target's CUDA_INJECTION64_PATH.
+./perf-agent --pid <PID> --profile --gpu --gpu-shim /absolute/path/libperf_agent_cuda.so \
+    --duration 30s --profile-output cpu.pb.gz --gpu-output gpu.pb.gz \
+    --gpu-telemetry-output gpu.jsonl --flamegraph-output auto
+```
+
+The command prints the generated HTML paths (one per profile mode). It collects
+NVML sensors and renders the views in the same run; no telemetry server or OTel
+collector is needed for the HTML. `--gpu-telemetry` also works without a JSONL
+output when only the automatic HTML is wanted. Profiling retains its existing
+BPF/perf permission requirements; NVML-only collection does not require them.
+
+Render the same capture offline, or combine its CPU and GPU profiles:
+
+```bash
+go run ./cmd/flamegraph -gpu-telemetry gpu.jsonl -o gpu.html gpu.pb.gz
+
+go run ./cmd/flamegraph -fuse -gpu-telemetry gpu.jsonl -o combined.html \
+    -in 'cpu.pb.gz;leaf-first;CPU' -in 'gpu.pb.gz;leaf-first;GPU'
+```
+
+For continuous JSONL rotation, preserve the relevant `gpu.jsonl.2`,
+`gpu.jsonl.1` and `gpu.jsonl` files. The offline command reads the supplied file
+only; concatenate retained segments oldest first into a separate input when the
+profile spans a rotation. Missing earlier segments can only produce a partial
+report, with an explicit observation-range warning; they cannot be reconstructed
+from a later summary.
+
+The JSONL carries `capture_id` and `interval_ns`. All pprof files from the same
+agent run carry `perf-agent.capture_id=<id>` in their comments, `TimeNanos` and
+`DurationNanos`. Offline rendering requires the same identity and a valid window;
+fused inputs must share both. Legacy/unrelated files are rejected rather than
+paired by their names or approximate timestamps. Rendering without a telemetry
+sidecar continues to accept ordinary pprof files. If a wall-clock change makes
+the capture window invalid, profiles are still written with a warning, without
+telemetry linkage; the automatic HTML omits the sensor panel.
+
+The window describes the **capture lifecycle, including attachment/setup**; it
+is not the exact interval with every perf event enabled. GPU collection stops
+before CPU symbolization, and CPU/off-CPU can still drain briefly at the boundary.
+The renderer includes only device readings whose timestamps lie inside that
+window. It recalculates aggregates from raw readings and never substitutes a
+continuous summary that covers a longer period. With no matching observations,
+the page says so. In continuous mode the automatic report is frozen at profile
+completion while JSONL/OTLP collection continues; the HTML is not live.
+
+The summary shows temperature, power, used/total memory, GPU utilization, SM
+clock and memory activity. Details include min/mean/max/last valid/count for each
+metric, clocks and clock-event observations, read errors, unsupported reasons,
+and the actual first/last reading times. Means use successful observations, not
+time weighting. Reading counts do not claim uninterrupted coverage. Idle is
+separate from thermal limits; a missing value is never converted to zero.
+Sensors cover the whole physical GPU, including other processes, and do not
+change with frame zoom. GiB and MHz are display conversions of the original
+bytes and hertz; utilization/activity ratios display as percentages.
+
+To verify a capture, check its matching capture IDs, UTC window, physical UUIDs
+and first/last observation times in the HTML. Compare the per-field valid counts
+and missing-value reasons with the JSONL. The in-memory report is bounded to 64
+GPUs and 128 fields per GPU, and reports truncation; offline input is limited to
+256 MiB and 1 MiB per JSONL record. No new series or capture ID labels are added
+to OTLP, and the internal `/metrics` endpoint is unchanged.
+
+---
+
 ## Continuous GPU telemetry and OTLP
 
 Run telemetry until SIGINT/SIGTERM, with optional OTLP/HTTP protobuf delivery:
@@ -267,7 +342,7 @@ for concurrent writers with separate lock directories.
 | `--profile-output` | Output path for CPU profile | auto-named |
 | `--offcpu-output` | Output path for off-CPU profile | auto-named |
 | `--pmu-output` | Output path for PMU metrics (`auto` for auto-named) | stdout |
-| `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile` or `--offcpu`. | - |
+| `--flamegraph-output` | Also write a self-contained interactive HTML flame graph of the profile (`auto` for auto-named). Requires `--profile`, `--offcpu` or `--gpu`. | - |
 | `--perf-data-output` | Also emit a Linux kernel-format `perf.data` (consumable by `perf script`, FlameGraph, hotspot, AutoFDO `create_llvm_prof`, …). Requires `--profile`. | - |
 | `--tag key=value` | Add tag to profile (repeatable) | - |
 | `--debuginfod-url=URL` | Add a `debuginfod`-protocol server (repeatable); turns network symbolization on. | - |

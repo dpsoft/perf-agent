@@ -659,6 +659,10 @@ type Timeline struct {
 	graphExecAllPIDs        bool
 
 	dropped TimelineDropStats
+
+	// pressure is signalled when a ring passes half its capacity. See
+	// Pressure.
+	pressure chan struct{}
 }
 
 // processDevices is one process's entry in Timeline.devicesByPID: the first
@@ -778,6 +782,7 @@ func NewTimeline(cfg TimelineConfig) *Timeline {
 	return &Timeline{
 		cache:            cache,
 		joinWindowNs:     cfg.LaunchEventJoinWindowNs,
+		pressure:         make(chan struct{}, 1),
 		execs:            newRing[GPUKernelExec](capacity),
 		events:           newRing[GPUTimelineEvent](eventCapacity),
 		modules:          newRing[GPUModule](capacity),
@@ -924,7 +929,31 @@ func (t *Timeline) EmitExec(e GPUKernelExec) error {
 	if t.execs.push(e) {
 		t.dropped.EvictedExecutions++
 	}
+	t.notePressure(t.execs.halfFull())
 	return nil
+}
+
+// Pressure receives when the execution, event or module ring has filled past
+// half its capacity since the last Snapshot, so a caller can drain before the
+// ring starts evicting rather than on a fixed interval it cannot size. One
+// pending signal is held; more coalesce into it.
+//
+// A fixed drain interval loses executions whenever the launch rate exceeds
+// capacity/interval: 65536 per 2s is ~33k kernels/s, and a fine-tuning loop
+// of small kernels runs faster than that. Draining on this signal adapts the
+// interval to the rate. Evictions still count in TimelineDropStats when the
+// drainer cannot keep up.
+func (t *Timeline) Pressure() <-chan struct{} { return t.pressure }
+
+// notePressure signals Pressure without blocking. The caller holds t.mu.
+func (t *Timeline) notePressure(halfFull bool) {
+	if !halfFull {
+		return
+	}
+	select {
+	case t.pressure <- struct{}{}:
+	default:
+	}
 }
 
 // execDeviceID is the device an execution ran on. GPUExecutionRef is the
@@ -1369,6 +1398,7 @@ func (t *Timeline) EmitModule(m GPUModule) error {
 	if t.modules.push(m) {
 		t.dropped.EvictedModules++
 	}
+	t.notePressure(t.modules.halfFull())
 	return nil
 }
 
@@ -1378,6 +1408,7 @@ func (t *Timeline) EmitEvent(e GPUTimelineEvent) error {
 	if t.events.push(cloneTimelineEvent(e)) {
 		t.dropped.EvictedEvents++
 	}
+	t.notePressure(t.events.halfFull())
 	return nil
 }
 
@@ -2013,6 +2044,9 @@ func (r *ring[T]) push(v T) (evicted bool) {
 	r.start = (r.start + 1) % capacity
 	return true
 }
+
+// halfFull reports whether the ring holds at least half its capacity.
+func (r *ring[T]) halfFull() bool { return r.count*2 >= len(r.buf) }
 
 // items returns the stored entries in insertion (oldest-first) order, as a
 // fresh slice safe for the caller to retain past the next push.

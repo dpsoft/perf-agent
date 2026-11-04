@@ -98,6 +98,9 @@ type Profiler struct {
 	mu      sync.Mutex
 	samples int
 	stopped bool
+	// dropped is the timeline's loss record as of the latest drain. The
+	// timeline's counters are cumulative, so this is replaced, never summed.
+	dropped gpu.TimelineDropStats
 }
 
 // New attaches the GPU pipeline to a target and starts draining it.
@@ -174,10 +177,22 @@ func (p *Profiler) run(ctx context.Context) {
 			logf("gpuprofile: consumer: %v", err)
 		}
 	}()
+	p.drainLoop(ctx, consumerDone)
+}
 
+// drainLoop drains the timeline until ctx ends, then waits for the consumer
+// and drains once more. Split from run so a test can drive it with no BPF
+// consumer behind the timeline.
+func (p *Profiler) drainLoop(ctx context.Context, consumerDone <-chan struct{}) {
 	// The profile accumulates ACROSS drains, which is what lets an attached
 	// run empty the timeline while it is still collecting. Snapshot drains:
 	// it swaps in fresh rings and leaves anything already projected behind.
+	//
+	// It drains on the ticker and whenever a ring passes half full. The
+	// ticker alone lost every execution past 65536 per interval -- about 33k
+	// kernels/s at the 2s default, which a fine-tuning loop of small kernels
+	// exceeds -- and said nothing about it.
+	pressure := p.timeline.Pressure()
 	ticker := time.NewTicker(p.cfg.DrainEvery)
 	defer ticker.Stop()
 	for {
@@ -190,6 +205,8 @@ func (p *Profiler) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			p.drain()
+		case <-pressure:
+			p.drain()
 		}
 	}
 }
@@ -197,11 +214,9 @@ func (p *Profiler) run(ctx context.Context) {
 func (p *Profiler) drain() {
 	snap := p.timeline.Snapshot()
 	samples, _ := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: p.store})
-	if len(samples) == 0 {
-		return
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.dropped = snap.Dropped
 	for i := range samples {
 		p.builders.AddSample(&samples[i])
 	}
@@ -245,6 +260,19 @@ func (p *Profiler) Samples() int {
 	defer p.mu.Unlock()
 	return p.samples
 }
+
+// Dropped reports what the timeline evicted before a drain reached it: GPU
+// work that arrived and is not in the profile. Stats does not include it; the
+// two are lost at different stages. Final only after Stop.
+func (p *Profiler) Dropped() gpu.TimelineDropStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dropped
+}
+
+// Stop ends collection and runs the final drain, so Samples and Dropped
+// cover the whole capture. Collect and Close call it too; it runs once.
+func (p *Profiler) Stop() { p.stop() }
 
 // Stats reports the consumer's ingestion counters: what arrived off the
 // ringbuf and what was lost on the way. The profile alone cannot show this --

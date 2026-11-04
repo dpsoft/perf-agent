@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -1025,4 +1026,34 @@ func TestCountingSinkSnapshotWithEmbedsSinkStats(t *testing.T) {
 	assert.Equal(t, uint64(1), snap.SinkStats.Launches.DroppedFull,
 		"admission-side losses must be reachable from the Snapshot returned by SnapshotWith")
 	assert.Equal(t, uint64(1), snap.JoinStats.LaunchCount, "the Timeline's own accounting must still be present")
+}
+
+// Pressure fires once a ring is half full and not before, coalesces while
+// unread, and rearms after a Snapshot empties the ring. Issue: perf-agent
+// --gpu drained only on a 2s ticker, so a launch rate above capacity/2s lost
+// executions silently.
+func TestTimelinePressureSignalsAtHalfCapacity(t *testing.T) {
+	tl := NewTimeline(TimelineConfig{LaunchCache: LaunchCacheConfig{Capacity: 8}})
+	pressured := func() bool {
+		select {
+		case <-tl.Pressure():
+			return true
+		default:
+			return false
+		}
+	}
+	for i := range 3 {
+		require.NoError(t, tl.EmitExec(execFor(fmt.Sprint(i), 10, 20)))
+	}
+	assert.False(t, pressured(), "3 of 8 is under half")
+
+	for i := 3; i < 7; i++ {
+		require.NoError(t, tl.EmitExec(execFor(fmt.Sprint(i), 10, 20)))
+	}
+	assert.True(t, pressured(), "4 of 8 is half")
+	assert.False(t, pressured(), "further executions coalesce into the one signal")
+
+	tl.Snapshot()
+	require.NoError(t, tl.EmitExec(execFor("x", 10, 20)))
+	assert.False(t, pressured(), "a drained ring is not under pressure")
 }

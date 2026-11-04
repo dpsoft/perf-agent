@@ -6,6 +6,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -194,5 +195,37 @@ func TestGPUSampleFlagsRequireGPU(t *testing.T) {
 	*flagGPU = true
 	if err := validateGPUSampleFlags(); err != nil {
 		t.Errorf("with --gpu: %v", err)
+	}
+}
+
+// The GPU executions log is told about the files main writes itself, and the
+// telemetry output is compared through symlinked directories.
+func TestCaptureOutputsAreComparedThroughAliases(t *testing.T) {
+	defer func(pmu bool, pmuOut, tel string, cont bool, gpu bool, execOut string) {
+		*flagPMU, *flagPMUOutput, *flagGPUTelemetryOutput, *flagContinuous, *flagGPU, *flagGPUExecutionsOutput = pmu, pmuOut, tel, cont, gpu, execOut
+	}(*flagPMU, *flagPMUOutput, *flagGPUTelemetryOutput, *flagContinuous, *flagGPU, *flagGPUExecutionsOutput)
+
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	*flagPMU, *flagPMUOutput = true, filepath.Join(dir, "pmu.txt")
+	*flagGPUTelemetryOutput, *flagContinuous = filepath.Join(dir, "tel.jsonl"), true
+	want := []string{*flagPMUOutput, *flagGPUTelemetryOutput, *flagGPUTelemetryOutput + ".1", *flagGPUTelemetryOutput + ".2"}
+	if got := externalOutputs(); !slices.Equal(got, want) {
+		t.Errorf("externalOutputs() = %q, want %q", got, want)
+	}
+
+	*flagPMU, *flagContinuous = false, false
+	*flagGPU, *flagGPUExecutionsOutput = true, filepath.Join(realDir, "same")
+	*flagGPUTelemetryOutput = filepath.Join(alias, "same")
+	if validateTelemetryOutput() == nil {
+		t.Error("telemetry output accepted over the executions log through an aliased directory")
 	}
 }

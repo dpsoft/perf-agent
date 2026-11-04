@@ -216,6 +216,22 @@ func runLegacyCapture() {
 	fmt.Println("Exiting program.")
 }
 
+// externalOutputs are the files main writes itself during a capture: PMU
+// metrics and GPU telemetry, with its continuous-mode rotations.
+func externalOutputs() []string {
+	var paths []string
+	if *flagPMU && *flagPMUOutput != "" {
+		paths = append(paths, *flagPMUOutput)
+	}
+	if t := *flagGPUTelemetryOutput; t != "" {
+		paths = append(paths, t)
+		if *flagContinuous {
+			paths = append(paths, t+".1", t+".2")
+		}
+	}
+	return paths
+}
+
 // validateGPUSampleFlags rejects the GPU sample-shape flags without --gpu,
 // where they would otherwise be silently ignored.
 func validateGPUSampleFlags() error {
@@ -378,7 +394,8 @@ func buildOptions() []perfagent.Option {
 			opts = append(opts, perfagent.WithGPUPerExecutionSamples())
 		}
 		if *flagGPUExecutionsOutput != "" {
-			opts = append(opts, perfagent.WithGPUExecutionsOutput(*flagGPUExecutionsOutput))
+			opts = append(opts, perfagent.WithGPUExecutionsOutput(*flagGPUExecutionsOutput),
+				perfagent.WithExternalOutputs(externalOutputs()...))
 		}
 
 		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {

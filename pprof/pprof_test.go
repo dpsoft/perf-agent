@@ -1,9 +1,9 @@
 package pprof
 
 import (
-	"strconv"
 	"bytes"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/google/pprof/profile"

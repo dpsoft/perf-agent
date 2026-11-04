@@ -23,8 +23,8 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
-	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/gpuprofile"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/k8slabels"
@@ -147,8 +147,8 @@ func (c *Config) validateGPUExecutions() error {
 	return nil
 }
 
-// outputPaths are the files this capture writes, other than the GPU
-// executions log. Automatic flame graph names are chosen at write time and
+// outputPaths are the files this capture writes, its caller's included,
+// other than the GPU executions log. Automatic flame graph names are chosen at write time and
 // are not known here.
 func (c *Config) outputPaths() []string {
 	var paths []string
@@ -164,6 +164,9 @@ func (c *Config) outputPaths() []string {
 	add(true, c.CPUFlamegraphPath)
 	add(true, c.OffCPUFlamegraphPath)
 	add(true, c.GPUFlamegraphPath)
+	for _, p := range c.ExternalOutputPaths {
+		add(true, p)
+	}
 	return paths
 }
 

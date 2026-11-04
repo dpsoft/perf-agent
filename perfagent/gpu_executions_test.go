@@ -56,6 +56,10 @@ func TestGPUExecutionsLogOptionsAreValidated(t *testing.T) {
 			c.PerfDataOutput = filepath.Join(dir, "perf.data")
 			c.GPUExecutionsPath = c.PerfDataOutput
 		}, "also an output"},
+		{"an output written by the caller", func(c *Config) {
+			c.ExternalOutputPaths = []string{filepath.Join(realDir, "pmu.txt")}
+			c.GPUExecutionsPath = filepath.Join(aliasDir, "pmu.txt")
+		}, "also an output"},
 		{"a flame graph", func(c *Config) {
 			c.GPUFlamegraphPath = filepath.Join(dir, "gpu.html")
 			c.GPUExecutionsPath = c.GPUFlamegraphPath

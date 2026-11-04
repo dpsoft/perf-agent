@@ -1,9 +1,9 @@
 package gpu
 
 import (
-	"strconv"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 

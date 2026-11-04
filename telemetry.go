@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/dpsoft/perf-agent/gpu/execlog"
+
 	"context"
 	"crypto/rand"
 	"errors"
@@ -9,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -100,21 +101,11 @@ func validateTelemetryOutput() error {
 		paths = append(paths, *flagGPUTelemetryOutput+".1", *flagGPUTelemetryOutput+".2")
 	}
 	for _, path := range paths {
-		telemetryPath, err := filepath.Abs(path)
-		if err != nil {
-			return err
-		}
-		telemetryInfo, _ := os.Stat(telemetryPath)
 		for _, output := range outputs {
 			if !output.enabled || output.path == "" || output.path == "auto" {
 				continue
 			}
-			other, err := filepath.Abs(output.path)
-			if err != nil {
-				return err
-			}
-			info, _ := os.Stat(other)
-			if other == telemetryPath || (info != nil && telemetryInfo != nil && os.SameFile(info, telemetryInfo)) {
+			if execlog.SameDestination(path, output.path) {
 				return fmt.Errorf("GPU telemetry output must differ from other capture outputs: %s", output.path)
 			}
 		}

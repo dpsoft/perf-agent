@@ -83,6 +83,11 @@ type Config struct {
 	// aggregated GPU profile to this file. See gpu/execlog.
 	GPUExecutionsPath string
 
+	// ExternalOutputPaths are files the caller writes during the same
+	// capture, outside the agent (PMU metrics, GPU telemetry). The GPU
+	// executions log must not be any of them.
+	ExternalOutputPaths []string
+
 	// GPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.
 	// Zero keeps the compiled-in default. See WithGPUEventRingBytes.
 	GPUEventRingBytes int
@@ -404,6 +409,12 @@ func WithGPUPerExecutionSamples() Option {
 // incrementally; it costs no memory per execution.
 func WithGPUExecutionsOutput(path string) Option {
 	return func(c *Config) { c.GPUExecutionsPath = path }
+}
+
+// WithExternalOutputs declares files the caller writes during the capture
+// itself, so the agent's own outputs never replace them.
+func WithExternalOutputs(paths ...string) Option {
+	return func(c *Config) { c.ExternalOutputPaths = append(c.ExternalOutputPaths, paths...) }
 }
 
 // WithGPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.

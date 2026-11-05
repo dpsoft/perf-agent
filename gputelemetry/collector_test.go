@@ -208,3 +208,10 @@ func TestStartAfterHoldsTheFirstReading(t *testing.T) {
 	require.NoError(t, c2.Run(ctx2))
 	require.Zero(t, idle.closed, "the source was opened while waiting for the window")
 }
+
+// FinalSampled belongs to one finite Run; continuous telemetry runs one Run
+// per window, which would close the channel again and panic.
+func TestRunContinuousRejectsFinalSampled(t *testing.T) {
+	c := Collector{Source: &fakeSource{}, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, FinalSampled: make(chan struct{})}
+	require.ErrorContains(t, c.RunContinuous(t.Context(), time.Minute), "FinalSampled")
+}

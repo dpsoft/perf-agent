@@ -250,19 +250,12 @@ func runCapture() (code int) {
 	// The telemetry runs while the agent attaches. A finite capture's
 	// deadline is still counted from the end of Start, as before; the
 	// telemetry is cancelled at that same deadline.
-	telemetryCtx, cancelTelemetry := context.WithCancel(ctx)
-	defer cancelTelemetry()
+	run := collector.Run
 	if *flagContinuous {
-		telemetryCtx = ctx
+		run = func(ctx context.Context) error { return collector.RunContinuous(ctx, *flagTelemetryWindow) }
 	}
-	result := make(chan error, 1)
-	go func() {
-		if *flagContinuous {
-			result <- collector.RunContinuous(telemetryCtx, *flagTelemetryWindow)
-		} else {
-			result <- collector.Run(telemetryCtx)
-		}
-	}()
+	cancelTelemetry, result := startTelemetry(ctx, run)
+	defer cancelTelemetry()
 	// Keep the profiler context alive through its final collection.
 	profileCtx, cancelProfile := context.WithCancel(context.Background())
 	defer cancelProfile()
@@ -310,6 +303,16 @@ func runCapture() (code int) {
 	}
 
 	return code
+}
+
+// startTelemetry runs the collector in the background on a context of its
+// own, derived from ctx, in finite and continuous mode alike: cancelling it
+// must stop the collector, which is how a failed agent start is unwound.
+func startTelemetry(ctx context.Context, run func(context.Context) error) (cancel context.CancelFunc, result <-chan error) {
+	telemetryCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- run(telemetryCtx) }()
+	return cancel, done
 }
 
 // finalSampleGrace bounds how long the end of a finite capture waits for the

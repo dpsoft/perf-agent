@@ -26,6 +26,11 @@ func (c *Collector) runContinuous(ctx context.Context, window, retry, maxRetry t
 	if window <= 0 {
 		return errors.New("continuous telemetry window must be positive")
 	}
+	if c.FinalSampled != nil {
+		// Each window is a Run with a final sample of its own, so the one
+		// channel would be closed once per window.
+		return errors.New("FinalSampled marks the end of a finite capture; continuous telemetry has no single final sample")
+	}
 	backoff := retry
 	for ctx.Err() == nil {
 		windowCtx, cancel := context.WithTimeout(ctx, window)

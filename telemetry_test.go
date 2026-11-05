@@ -327,3 +327,23 @@ func TestAStalledFinalSampleDelaysTheProfileByTheGraceOnly(t *testing.T) {
 	result <- nil
 	require.NoError(t, <-done)
 }
+
+// A failed agent start cancels the telemetry and waits for it. That has to
+// work in continuous mode too, where the collector would otherwise run until
+// a signal: the cancel must reach the context the collector runs on.
+func TestCancellingStartedTelemetryStopsEvenAContinuousCollector(t *testing.T) {
+	running := make(chan struct{})
+	cancel, result := startTelemetry(t.Context(), func(ctx context.Context) error {
+		close(running) // a continuous collector: returns only when ctx ends
+		<-ctx.Done()
+		return nil
+	})
+	<-running
+	cancel()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the telemetry kept running after its cancel: a failed start would hang")
+	}
+}

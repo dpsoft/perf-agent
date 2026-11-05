@@ -9,8 +9,8 @@ flame graph.
 > pull. What you still need is a cluster with an NVIDIA GPU node.
 >
 > ```
-> ghcr.io/dpsoft/perf-agent:v1.4.0        # the profiler
-> ghcr.io/dpsoft/perf-agent-shim:v1.4.0   # the CUPTI adapter, as a carrier image
+> ghcr.io/dpsoft/perf-agent:v1.5.0        # the profiler
+> ghcr.io/dpsoft/perf-agent-shim:v1.5.0   # the CUPTI adapter, as a carrier image
 > ```
 >
 > The manifests here name `:latest`. Pin the version in anything you keep:

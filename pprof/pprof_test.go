@@ -818,3 +818,31 @@ func BenchmarkGPUAddMerged(b *testing.B) {
 		i++
 	}
 }
+
+// hashLabels depends on the label set only, not on map order or on whether
+// the set fits its stack buffer, and adding a label set to a merged sample
+// does not allocate.
+func TestHashLabelsIsOrderFreeAndSizeFree(t *testing.T) {
+	for _, n := range []int{0, 1, 10, 16, 17, 40} {
+		a, b := map[string]string{}, map[string]string{}
+		for i := range n {
+			a["k"+strconv.Itoa(i)] = "v" + strconv.Itoa(i)
+		}
+		for i := n - 1; i >= 0; i-- {
+			b["k"+strconv.Itoa(i)] = "v" + strconv.Itoa(i)
+		}
+		if hashLabels(7, a) != hashLabels(7, b) {
+			t.Errorf("%d labels: hash depends on insertion order", n)
+		}
+		if n > 0 {
+			b["k0"] = "other"
+			if hashLabels(7, a) == hashLabels(7, b) {
+				t.Errorf("%d labels: a changed value hashes the same", n)
+			}
+		}
+	}
+	labels := gpuBenchSample(0).Labels
+	if allocs := testing.AllocsPerRun(100, func() { _ = hashLabels(1, labels) }); allocs != 0 {
+		t.Errorf("hashLabels allocates %.0f times per call for %d labels", allocs, len(labels))
+	}
+}

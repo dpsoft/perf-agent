@@ -129,3 +129,46 @@ func TestMissedTicksIncludeReadThatCrossesDeadline(t *testing.T) {
 	require.LessOrEqual(t, last.MissedTicks, uint64(10))
 	require.Less(t, last.EndedAt.Sub(last.StartedAt), 15*time.Millisecond, "final read must not extend capture window")
 }
+
+// FinalSampled is closed right after the final sample is exported: not before
+// it reaches the exporters, and not after the summary or the source's Close.
+func TestFinalSampledClosesOnceTheFinalSampleIsOut(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	final := make(chan struct{})
+	source := &fakeSource{devices: []Device{{UUID: "GPU-a"}}}
+	source.read = func(d Device) metrics.GPUDeviceMetrics {
+		cancel()
+		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": 1}}
+	}
+	var kindsAtClose []string
+	e := &recordingExporter{}
+	probe := exporterFunc(func(s *metrics.MetricsSnapshot) {
+		select {
+		case <-final:
+			if kindsAtClose == nil {
+				for _, r := range e.snapshots {
+					kindsAtClose = append(kindsAtClose, r.GPU.Kind)
+				}
+			}
+		default:
+		}
+	})
+	c := Collector{Source: source, Interval: time.Second, Exporters: []metrics.Exporter{e, probe}, FinalSampled: final}
+	require.NoError(t, c.Run(ctx))
+	select {
+	case <-final:
+	default:
+		t.Fatal("FinalSampled was never closed")
+	}
+	require.Equal(t, []string{"initial", "final", "summary"}, kindsAtClose,
+		"closed after the final sample and before the summary was exported")
+}
+
+type exporterFunc func(*metrics.MetricsSnapshot)
+
+func (exporterFunc) Name() string { return "probe" }
+func (f exporterFunc) Export(_ context.Context, s *metrics.MetricsSnapshot) error {
+	f(s)
+	return nil
+}

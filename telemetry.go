@@ -233,7 +233,13 @@ func runCapture() (code int) {
 			}
 		}()
 	}
+	finalSampled := make(chan struct{})
 	collector := &gputelemetry.Collector{CaptureID: captureID, Source: gputelemetry.NewNVML(), UUIDs: telemetryUUIDs(), Interval: *flagGPUTelemetryInterval, Exporters: exporters}
+	if !*flagContinuous {
+		// Continuous telemetry outlives the profile; its final sample is not
+		// the profile's.
+		collector.FinalSampled = finalSampled
+	}
 	// Keep the profiler context alive through its final collection.
 	profileCtx, cancelProfile := context.WithCancel(context.Background())
 	defer cancelProfile()
@@ -282,7 +288,7 @@ func runCapture() (code int) {
 	if *flagContinuous {
 		err = waitForContinuous(ctx, captureCtx, result, stopProfiler)
 	} else {
-		err = waitForCapture(captureCtx, result, stopProfiler)
+		err = waitForCapture(captureCtx, result, finalSampled, finalSampleGrace, stopProfiler)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Capture:", err)
@@ -292,10 +298,30 @@ func runCapture() (code int) {
 	return code
 }
 
-func waitForCapture(ctx context.Context, result <-chan error, stopProfiler func() error) error {
+// finalSampleGrace bounds how long the end of a finite capture waits for the
+// telemetry's final sample before stopping the profile. That sample is taken
+// at the same deadline and normally lands within milliseconds; a stalled
+// driver must not hold the profile open.
+const finalSampleGrace = 500 * time.Millisecond
+
+// waitForCapture ends a finite capture: at the deadline it gives the
+// telemetry up to grace to publish its final sample (finalSampled), so the
+// profile's report holds the same observations as the telemetry output, then
+// stops the profile and waits for the telemetry to finish.
+func waitForCapture(ctx context.Context, result <-chan error, finalSampled <-chan struct{}, grace time.Duration, stopProfiler func() error) error {
 	var telemetryErr error
 	select {
 	case <-ctx.Done():
+		if stopProfiler != nil {
+			timer := time.NewTimer(grace)
+			select {
+			case <-finalSampled:
+			case telemetryErr = <-result:
+				result = nil
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
 	case telemetryErr = <-result:
 		result = nil
 		if stopProfiler != nil {

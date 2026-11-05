@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,7 +60,9 @@ func TestSlowTelemetryDoesNotDelayProfilerStop(t *testing.T) {
 	result := make(chan error)
 	stopped := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- waitForCapture(ctx, result, func() error { close(stopped); return nil }) }()
+	go func() {
+		done <- waitForCapture(ctx, result, nil, finalSampleGrace, func() error { close(stopped); return nil })
+	}()
 	select {
 	case <-stopped:
 	case <-time.After(time.Second):
@@ -75,7 +78,9 @@ func TestTelemetryFailureDoesNotEndCombinedCaptureEarly(t *testing.T) {
 	result := make(chan error)
 	stopped := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- waitForCapture(ctx, result, func() error { close(stopped); return nil }) }()
+	go func() {
+		done <- waitForCapture(ctx, result, nil, finalSampleGrace, func() error { close(stopped); return nil })
+	}()
 	result <- errors.New("source unavailable")
 	select {
 	case <-stopped:
@@ -276,4 +281,49 @@ func TestGPUExecutionsAtThePMUOutputIsRejectedFirst(t *testing.T) {
 	if got := pmuOutputPath(); got != "" {
 		t.Errorf("PMU off: pmuOutputPath() = %q", got)
 	}
+}
+
+// At the deadline the profile is stopped only after the telemetry's final
+// sample is published, so the HTML report and the JSONL hold the same
+// samples. Before, both happened at once and the report often missed it.
+func TestTheFinalTelemetrySampleIsPublishedBeforeTheProfileStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result := make(chan error, 1)
+	final := make(chan struct{})
+	var order []string
+	var mu sync.Mutex
+	note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	go func() {
+		time.Sleep(50 * time.Millisecond) // the final NVML read
+		note("final sample")
+		close(final)
+		result <- nil
+	}()
+	err := waitForCapture(ctx, result, final, 5*time.Second, func() error { note("profile stopped"); return nil })
+	require.NoError(t, err)
+	require.Equal(t, []string{"final sample", "profile stopped"}, order)
+}
+
+// A final sample that never comes delays the profile's stop by the grace
+// period at most.
+func TestAStalledFinalSampleDelaysTheProfileByTheGraceOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result := make(chan error)
+	stopped := make(chan time.Time, 1)
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- waitForCapture(ctx, result, make(chan struct{}), 100*time.Millisecond, func() error { stopped <- time.Now(); return nil })
+	}()
+	select {
+	case at := <-stopped:
+		require.Less(t, at.Sub(start), time.Second)
+		require.GreaterOrEqual(t, at.Sub(start), 100*time.Millisecond)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the profile waited for the stalled telemetry past its grace")
+	}
+	result <- nil
+	require.NoError(t, <-done)
 }

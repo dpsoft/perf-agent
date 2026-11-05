@@ -27,6 +27,13 @@ type Collector struct {
 	UUIDs     []string
 	Interval  time.Duration
 	Exporters []metrics.Exporter
+
+	// FinalSampled, if set, is closed once the final sample has been
+	// published, before the summary and before the source is closed. A
+	// caller ending a profile at the same moment waits on it so that sample,
+	// taken inside the profile's window, reaches the profile's report too.
+	// Not closed when Run fails before that point.
+	FinalSampled chan<- struct{}
 }
 
 // Run collects an initial sample, periodic samples, and a final sample when ctx
@@ -138,6 +145,9 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 			}
 			if err := sample("final"); err != nil {
 				return err
+			}
+			if c.FinalSampled != nil {
+				close(c.FinalSampled)
 			}
 			return publish(&metrics.GPUMetrics{Kind: "summary", StartedAt: started, EndedAt: ended, MissedTicks: missed, Devices: summaries})
 		}

@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The HTML report of a finite GPU-telemetry capture could miss the final NVML
+  sample that the JSONL output has. Both were produced at the capture deadline,
+  and the report was often frozen first. The profile now stops after that sample
+  is published, waiting at most 500 ms, so a stalled driver cannot hold it open.
+
 - GPU shutdown diagnostics no longer add record loss, batch sequence gaps and
   missing CPU stacks into a misleading `LOST` total. BPF record drops are
   reported by kind; missing attribution and timeline evictions stay separate.

@@ -67,7 +67,7 @@ const (
 //
 //	gpu_stall       the instruction's stall reason, when the producer named one
 //	gpu_pc          the instruction's offset within its module, subject to the
-//	                cardinality budget - see pcLabelBudget
+//	                cardinality budget - see PCLabelBudget
 //	gpu_pc_attrib   how the sample reached this execution - unconditional,
 //	                and "graph-refused" where a CUDA graph made "exact" false
 //	gpu_src_status  why the sample does or does not have a source location -
@@ -100,7 +100,9 @@ func ProjectExecutions(snap Snapshot) []pp.ProfileSample {
 // are RETURNED rather than accumulated on a field somewhere, because they
 // describe one projection of one snapshot - a second call over the same
 // snapshot suppresses the same labels again, and a running total of that would
-// count the same loss twice.
+// count the same loss twice. That holds with a shared ProjectionConfig.PCLabels
+// too: PCLabelsSuppressed is still this call's, and only DistinctPCLabels is
+// the shared budget's running count.
 //
 // See ProjectionConfig for why a nil Modules is a supported, accounted-for
 // state rather than a skipped one.
@@ -116,7 +118,11 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 	if modules == nil {
 		modules = NewModuleStore(ModuleStoreConfig{})
 	}
-	budget := newPCLabelBudget(cfg.MaxDistinctPCLabels)
+	budget := cfg.PCLabels
+	if budget == nil {
+		budget = NewPCLabelBudget(cfg.MaxDistinctPCLabels)
+	}
+	suppressedBefore := budget.suppressed
 
 	var memo *projectionMemo
 	if cfg.OmitCorrelationLabel {
@@ -184,7 +190,9 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 			}
 		}
 	}
-	return samples, budget.stats()
+	stats := budget.stats()
+	stats.PCLabelsSuppressed -= suppressedBefore
+	return samples, stats
 }
 
 // ProjectionConfig configures ProjectExecutionsWith.
@@ -204,9 +212,16 @@ type ProjectionConfig struct {
 
 	// MaxDistinctPCLabels caps how many DISTINCT gpu_pc values one
 	// projection may emit. Zero (and anything negative) means
-	// defaultMaxDistinctPCLabels. See pcLabelBudget for what happens past
+	// defaultMaxDistinctPCLabels. See PCLabelBudget for what happens past
 	// the cap and why gpu_pc is the label that gives way.
 	MaxDistinctPCLabels int
+
+	// PCLabels, when non-nil, is the budget this projection draws on instead
+	// of a fresh one, so the cap holds over every projection that shares it:
+	// a profile accumulated from many snapshots stays within one ceiling of
+	// distinct gpu_pc values rather than one per snapshot. MaxDistinctPCLabels
+	// is then ignored; the budget's own ceiling applies.
+	PCLabels *PCLabelBudget
 
 	// SampleExecutions, when non-nil, receives one entry per returned sample:
 	// the index into snap.Executions of the execution that sample came from.
@@ -226,15 +241,16 @@ type ProjectionConfig struct {
 // ProjectionStats is what one ProjectExecutionsWith call did to the labels it
 // was asked to emit. It is per-call, not cumulative - see ProjectExecutionsWith.
 type ProjectionStats struct {
-	// DistinctPCLabels is how many distinct gpu_pc values this projection
-	// emitted, and PCLabelCap the ceiling it was allowed. Both are reported
+	// DistinctPCLabels is how many distinct gpu_pc values the budget has
+	// admitted - this projection's, or with a shared budget everything
+	// admitted so far - and PCLabelCap the ceiling it was allowed. Both are reported
 	// so that "we were nowhere near the cap" and "we sat exactly on it" are
 	// distinguishable without recomputing anything from the profile.
 	DistinctPCLabels uint64 `json:"distinct_pc_labels,omitempty"`
 	PCLabelCap       uint64 `json:"pc_label_cap,omitempty"`
 
 	// PCLabelsSuppressed is the design's ProjectionPCLabelsSuppressed: PC
-	// samples that were projected WITHOUT a gpu_pc label because admitting
+	// samples that this projection, and only this one, emitted WITHOUT a gpu_pc label because admitting
 	// their offset would have pushed the profile past PCLabelCap distinct
 	// values. Every one of those samples still carries its gpu_stall,
 	// gpu_pc_attrib and gpu_src_* labels and still carries its full share of
@@ -263,7 +279,9 @@ type ProjectionStats struct {
 // table, not its length.
 const defaultMaxDistinctPCLabels = 20_000
 
-// pcLabelBudget bounds the distinct gpu_pc values one projection emits.
+// PCLabelBudget bounds the distinct gpu_pc values a profile carries: one
+// projection's, or, shared through ProjectionConfig.PCLabels, those of every
+// projection accumulated into the same profile.
 //
 // # Why gpu_pc is the label that gives way
 //
@@ -285,23 +303,23 @@ const defaultMaxDistinctPCLabels = 20_000
 // would throw away strictly more of the profile for no saving. Suppression is
 // counted per SAMPLE, not per distinct offset, because the sample is the thing
 // that went out incomplete.
-type pcLabelBudget struct {
+type PCLabelBudget struct {
 	seen       map[uint64]struct{}
 	ceiling    int
 	suppressed uint64
 }
 
-func newPCLabelBudget(max int) *pcLabelBudget {
+func NewPCLabelBudget(max int) *PCLabelBudget {
 	if max <= 0 {
 		max = defaultMaxDistinctPCLabels
 	}
-	return &pcLabelBudget{seen: make(map[uint64]struct{}), ceiling: max}
+	return &PCLabelBudget{seen: make(map[uint64]struct{}), ceiling: max}
 }
 
 // admit reports whether this PC sample may carry a gpu_pc label, counting the
 // refusal when it may not. %#x is injective over uint64, so the set of
 // admitted offsets is exactly the set of distinct label values.
-func (b *pcLabelBudget) admit(pcOffset uint64) bool {
+func (b *PCLabelBudget) admit(pcOffset uint64) bool {
 	if _, ok := b.seen[pcOffset]; ok {
 		return true
 	}
@@ -313,10 +331,10 @@ func (b *pcLabelBudget) admit(pcOffset uint64) bool {
 	return true
 }
 
-func (b *pcLabelBudget) stats() ProjectionStats {
+func (b *PCLabelBudget) stats() ProjectionStats {
 	return ProjectionStats{
 		DistinctPCLabels:   uint64(len(b.seen)),
-		PCLabelCap:         uint64(b.ceiling), //nolint:gosec // newPCLabelBudget forces a positive ceiling.
+		PCLabelCap:         uint64(b.ceiling), //nolint:gosec // NewPCLabelBudget forces a positive ceiling.
 		PCLabelsSuppressed: b.suppressed,
 	}
 }

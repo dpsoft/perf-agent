@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/dpsoft/perf-agent/gpu"
 	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/google/pprof/profile"
 )
@@ -127,5 +128,55 @@ func TestAnEmptyCaptureLeavesNoExecutionsLog(t *testing.T) {
 	ents, _ := os.ReadDir(dir)
 	if len(ents) != 0 {
 		t.Fatalf("files left: %v", ents)
+	}
+}
+
+// The gpu_pc cap holds for the whole capture, not per drain: the profile
+// accumulates across drains, so a budget that restarted on each one would let
+// it carry one ceiling of distinct values per drain. Samples past the cap keep
+// their time and other labels, lose only gpu_pc, and are counted.
+func TestThePCLabelCapHoldsAcrossDrains(t *testing.T) {
+	const ceiling = 3
+	p, tl := drainOnlyWith(t, 64, Config{MaxDistinctPCLabels: ceiling})
+
+	emit := func(corr string, start uint64, pcs ...uint64) {
+		t.Helper()
+		c := gpu.CorrelationID{Backend: gpu.BackendCUPTI, Value: corr}
+		for _, pc := range pcs {
+			if err := tl.EmitPCSample(gpu.GPUPCSample{Correlation: c, TimeNs: start + 1, PCOffset: pc, StallReason: "long_scoreboard", Count: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tl.EmitExec(gpu.GPUKernelExec{Correlation: c, KernelName: "k", StartNs: start, EndNs: start + 100}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	emit("pc-1", 1000, 0x10, 0x20)
+	p.drain()
+	emit("pc-2", 2000, 0x30, 0x40, 0x50)
+	p.drain()
+	p.Stop()
+
+	c := p.Counts()
+	if c.ProjectedRows != 5 {
+		t.Fatalf("%d projected rows, want one per PC sample: 5", c.ProjectedRows)
+	}
+	if c.DistinctPCLabels != ceiling || c.PCLabelCap != ceiling || c.PCLabelsSuppressed != 2 {
+		t.Errorf("distinct %d / cap %d / suppressed %d, want %d / %d / 2",
+			c.DistinctPCLabels, c.PCLabelCap, c.PCLabelsSuppressed, ceiling, ceiling)
+	}
+
+	_, pr := collect(t, p)
+	distinct := map[string]bool{}
+	for _, s := range pr.Sample {
+		for _, v := range s.Label["gpu_pc"] {
+			distinct[v] = true
+		}
+	}
+	if len(distinct) != ceiling {
+		t.Errorf("profile carries %d distinct gpu_pc values, want %d: %v", len(distinct), ceiling, distinct)
+	}
+	if got := sumValues(pr); got != 200 {
+		t.Errorf("total %d ns, want 200: suppressing gpu_pc must not drop time", got)
 	}
 }

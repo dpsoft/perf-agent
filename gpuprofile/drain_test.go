@@ -42,6 +42,7 @@ func drainOnlyWith(t *testing.T, capacity int, cfg Config) (*Profiler, *gpu.Time
 		timeline: tl,
 		builders: pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1}),
 		done:     make(chan struct{}),
+		pcLabels: gpu.NewPCLabelBudget(cfg.MaxDistinctPCLabels),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel

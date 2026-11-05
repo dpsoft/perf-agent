@@ -127,7 +127,10 @@ func TestWaitForShimInSeparatesNotMappedFromCannotLook(t *testing.T) {
 	})
 
 	t.Run("a pid that cannot be read", func(t *testing.T) {
-		err := waitForShimIn(1<<21, "/bin/true", 50*time.Millisecond)
+		// PID_MAX_LIMIT on 64-bit: pid_max can be at most 1<<22 and pids are
+		// below it, so this pid never exists. A smaller constant does exist
+		// once a busy host's pid counter passes it.
+		err := waitForShimIn(1<<22, "/bin/true", 50*time.Millisecond)
 		if err == nil {
 			t.Fatal("want an error for a pid that does not exist")
 		}

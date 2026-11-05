@@ -239,7 +239,9 @@ type ProjectionConfig struct {
 }
 
 // ProjectionStats is what one ProjectExecutionsWith call did to the labels it
-// was asked to emit. It is per-call, not cumulative - see ProjectExecutionsWith.
+// was asked to emit. PCLabelsSuppressed is that call's alone; with a budget
+// shared through ProjectionConfig.PCLabels, DistinctPCLabels is the budget's
+// running count. See ProjectExecutionsWith.
 type ProjectionStats struct {
 	// DistinctPCLabels is how many distinct gpu_pc values the budget has
 	// admitted - this projection's, or with a shared budget everything
@@ -283,6 +285,10 @@ const defaultMaxDistinctPCLabels = 20_000
 // projection's, or, shared through ProjectionConfig.PCLabels, those of every
 // projection accumulated into the same profile.
 //
+// Create it with NewPCLabelBudget. It is not safe for concurrent use: a
+// shared budget must be used by one projection at a time, as a profiler's
+// drain loop does.
+//
 // # Why gpu_pc is the label that gives way
 //
 // gpu_pc is the most numerous label in the set (one value per distinct sampled
@@ -309,6 +315,8 @@ type PCLabelBudget struct {
 	suppressed uint64
 }
 
+// NewPCLabelBudget returns a budget of max distinct gpu_pc values, or of
+// defaultMaxDistinctPCLabels when max is zero or negative.
 func NewPCLabelBudget(max int) *PCLabelBudget {
 	if max <= 0 {
 		max = defaultMaxDistinctPCLabels

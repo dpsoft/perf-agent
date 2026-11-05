@@ -129,3 +129,89 @@ func TestMissedTicksIncludeReadThatCrossesDeadline(t *testing.T) {
 	require.LessOrEqual(t, last.MissedTicks, uint64(10))
 	require.Less(t, last.EndedAt.Sub(last.StartedAt), 15*time.Millisecond, "final read must not extend capture window")
 }
+
+// FinalSampled is closed right after the final sample is exported: not before
+// it reaches the exporters, and not after the summary or the source's Close.
+func TestFinalSampledClosesOnceTheFinalSampleIsOut(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	final := make(chan struct{})
+	source := &fakeSource{devices: []Device{{UUID: "GPU-a"}}}
+	source.read = func(d Device) metrics.GPUDeviceMetrics {
+		cancel()
+		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": 1}}
+	}
+	var kindsAtClose []string
+	e := &recordingExporter{}
+	probe := exporterFunc(func(s *metrics.MetricsSnapshot) {
+		select {
+		case <-final:
+			if kindsAtClose == nil {
+				for _, r := range e.snapshots {
+					kindsAtClose = append(kindsAtClose, r.GPU.Kind)
+				}
+			}
+		default:
+		}
+	})
+	c := Collector{Source: source, Interval: time.Second, Exporters: []metrics.Exporter{e, probe}, FinalSampled: final}
+	require.NoError(t, c.Run(ctx))
+	select {
+	case <-final:
+	default:
+		t.Fatal("FinalSampled was never closed")
+	}
+	require.Equal(t, []string{"initial", "final", "summary"}, kindsAtClose,
+		"closed after the final sample and before the summary was exported")
+}
+
+type exporterFunc func(*metrics.MetricsSnapshot)
+
+func (exporterFunc) Name() string { return "probe" }
+func (f exporterFunc) Export(_ context.Context, s *metrics.MetricsSnapshot) error {
+	f(s)
+	return nil
+}
+
+// With StartAfter, Run takes no reading until it is closed, so a sampler
+// started before a profile's setup still begins inside the profile's window;
+// and it returns without reading if ctx ends first.
+func TestStartAfterHoldsTheFirstReading(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	gate := make(chan struct{})
+	var firstAt time.Time
+	source := &fakeSource{devices: []Device{{UUID: "GPU-a"}}}
+	source.read = func(d Device) metrics.GPUDeviceMetrics {
+		if firstAt.IsZero() {
+			firstAt = time.Now()
+		}
+		cancel()
+		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": 1}}
+	}
+	c := Collector{Source: source, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, StartAfter: gate}
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	opened := time.Now()
+	close(gate)
+	require.NoError(t, <-done)
+	require.False(t, firstAt.Before(opened), "a reading was taken before StartAfter was closed")
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	cancel2()
+	idle := &fakeSource{devices: []Device{{UUID: "GPU-a"}}, read: func(Device) metrics.GPUDeviceMetrics {
+		t.Fatal("read while StartAfter was never closed")
+		return metrics.GPUDeviceMetrics{}
+	}}
+	c2 := Collector{Source: idle, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, StartAfter: make(chan struct{})}
+	require.NoError(t, c2.Run(ctx2))
+	require.Zero(t, idle.closed, "the source was opened while waiting for the window")
+}
+
+// FinalSampled belongs to one finite Run; continuous telemetry runs one Run
+// per window, which would close the channel again and panic.
+func TestRunContinuousRejectsFinalSampled(t *testing.T) {
+	c := Collector{Source: &fakeSource{}, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, FinalSampled: make(chan struct{})}
+	require.ErrorContains(t, c.RunContinuous(t.Context(), time.Minute), "FinalSampled")
+}

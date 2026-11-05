@@ -233,33 +233,46 @@ func runCapture() (code int) {
 			}
 		}()
 	}
+	finalSampled := make(chan struct{})
 	collector := &gputelemetry.Collector{CaptureID: captureID, Source: gputelemetry.NewNVML(), UUIDs: telemetryUUIDs(), Interval: *flagGPUTelemetryInterval, Exporters: exporters}
+	if !*flagContinuous {
+		// Continuous telemetry outlives the profile; its final sample is not
+		// the profile's.
+		collector.FinalSampled = finalSampled
+	}
+	if agent != nil && *flagFlamegraph != "" {
+		collector.Exporters = append([]metrics.Exporter{reportCollector.LiveExporter()}, collector.Exporters...)
+		// The profile's window opens when the agent starts, before attaching,
+		// which can take seconds (a Python process). Sampling starts with it,
+		// not after, so the report covers the whole window.
+		collector.StartAfter = reportCollector.Begun()
+	}
+	// The telemetry runs while the agent attaches. A finite capture's
+	// deadline is still counted from the end of Start, as before; the
+	// telemetry is cancelled at that same deadline.
+	run := collector.Run
+	if *flagContinuous {
+		run = func(ctx context.Context) error { return collector.RunContinuous(ctx, *flagTelemetryWindow) }
+	}
+	cancelTelemetry, result := startTelemetry(ctx, run)
+	defer cancelTelemetry()
 	// Keep the profiler context alive through its final collection.
 	profileCtx, cancelProfile := context.WithCancel(context.Background())
 	defer cancelProfile()
 	if agent != nil {
 		if err := agent.Start(profileCtx); err != nil {
 			fmt.Fprintln(os.Stderr, "Failed to start agent:", err)
+			cancelTelemetry()
+			<-result
 			return 1
 		}
 	}
-	if agent != nil && *flagFlamegraph != "" {
-		collector.Exporters = append([]metrics.Exporter{reportCollector.LiveExporter()}, collector.Exporters...)
-	}
 	captureCtx, cancel := context.WithTimeout(ctx, *flagDuration)
 	defer cancel()
-	telemetryCtx := captureCtx
-	if *flagContinuous {
-		telemetryCtx = ctx
+	if !*flagContinuous {
+		stopTelemetry := context.AfterFunc(captureCtx, cancelTelemetry)
+		defer stopTelemetry()
 	}
-	result := make(chan error, 1)
-	go func() {
-		if *flagContinuous {
-			result <- collector.RunContinuous(telemetryCtx, *flagTelemetryWindow)
-		} else {
-			result <- collector.Run(telemetryCtx)
-		}
-	}()
 	if *flagContinuous {
 		fmt.Println("Collecting GPU telemetry until SIGINT/SIGTERM...")
 	} else {
@@ -282,7 +295,7 @@ func runCapture() (code int) {
 	if *flagContinuous {
 		err = waitForContinuous(ctx, captureCtx, result, stopProfiler)
 	} else {
-		err = waitForCapture(captureCtx, result, stopProfiler)
+		err = waitForCapture(captureCtx, result, finalSampled, finalSampleGrace, stopProfiler)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Capture:", err)
@@ -292,10 +305,40 @@ func runCapture() (code int) {
 	return code
 }
 
-func waitForCapture(ctx context.Context, result <-chan error, stopProfiler func() error) error {
+// startTelemetry runs the collector in the background on a context of its
+// own, derived from ctx, in finite and continuous mode alike: cancelling it
+// must stop the collector, which is how a failed agent start is unwound.
+func startTelemetry(ctx context.Context, run func(context.Context) error) (cancel context.CancelFunc, result <-chan error) {
+	telemetryCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- run(telemetryCtx) }()
+	return cancel, done
+}
+
+// finalSampleGrace bounds how long the end of a finite capture waits for the
+// telemetry's final sample before stopping the profile. That sample is taken
+// at the same deadline and normally lands within milliseconds; a stalled
+// driver must not hold the profile open.
+const finalSampleGrace = 500 * time.Millisecond
+
+// waitForCapture ends a finite capture: at the deadline it gives the
+// telemetry up to grace to publish its final sample (finalSampled), so the
+// profile's report holds the same observations as the telemetry output, then
+// stops the profile and waits for the telemetry to finish.
+func waitForCapture(ctx context.Context, result <-chan error, finalSampled <-chan struct{}, grace time.Duration, stopProfiler func() error) error {
 	var telemetryErr error
 	select {
 	case <-ctx.Done():
+		if stopProfiler != nil {
+			timer := time.NewTimer(grace)
+			select {
+			case <-finalSampled:
+			case telemetryErr = <-result:
+				result = nil
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
 	case telemetryErr = <-result:
 		result = nil
 		if stopProfiler != nil {

@@ -101,3 +101,23 @@ func TestLiveGPUReportValidationDoesNotStopOtherExporters(t *testing.T) {
 	require.Equal(t, uint64(1), report.Devices[0].Readings)
 	require.Contains(t, strings.Join(report.Errors, " "), "omitted")
 }
+
+// Begun closes when Begin binds the report to its capture, and a repeated
+// Begin does not close it twice.
+func TestBegunClosesOnBegin(t *testing.T) {
+	c := NewGPUReportCollector("cap", time.Time{}, time.Time{})
+	select {
+	case <-c.Begun():
+		t.Fatal("Begun closed before Begin")
+	default:
+	}
+	if err := c.Begin("cap", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.Begun():
+	default:
+		t.Fatal("Begun still open after Begin")
+	}
+	_ = c.Begin("cap", time.Now()) // must not panic
+}

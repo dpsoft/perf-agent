@@ -163,7 +163,7 @@ func TestTierBAmbiguityIsMarkedWithoutTouchingAmbiguous(t *testing.T) {
 
 	var carrying int
 	for _, view := range snap.Executions {
-		labels := projectionLabels(view)
+		labels := projectionLabels(view, false)
 		_, hasAmbiguous := labels["gpu_ambiguous"]
 		assert.False(t, hasAmbiguous,
 			"gpu_ambiguous means a heuristic LAUNCH join chose between candidate launches; "+

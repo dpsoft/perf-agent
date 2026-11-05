@@ -23,6 +23,7 @@ import (
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 
 	"github.com/dpsoft/perf-agent/cpu"
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/gpuprobe"
 	"github.com/dpsoft/perf-agent/gpuprofile"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
@@ -125,9 +126,57 @@ func New(opts ...Option) (*Agent, error) {
 }
 
 // validate checks the configuration for errors.
+// validateGPUExecutions checks the executions-log options: the log describes
+// the aggregated GPU profile, needs GPU profiling, and must not be any other
+// output of the capture, through a symlink either.
+func (c *Config) validateGPUExecutions() error {
+	if c.GPUExecutionsPath == "" {
+		return nil
+	}
+	if !c.EnableGPU {
+		return errors.New("a GPU executions log requires GPU profiling")
+	}
+	if c.GPUPerExecutionSamples {
+		return errors.New("a GPU executions log describes the aggregated GPU profile; it cannot be combined with per-execution GPU samples")
+	}
+	for _, out := range c.outputPaths() {
+		if execlog.SameDestination(c.GPUExecutionsPath, out) {
+			return fmt.Errorf("the GPU executions log %s is also an output of this capture (%s)", c.GPUExecutionsPath, out)
+		}
+	}
+	return nil
+}
+
+// outputPaths are the files this capture writes, its caller's included,
+// other than the GPU executions log. Paths are concrete here: the CLI
+// resolves "auto" names before building the options.
+func (c *Config) outputPaths() []string {
+	var paths []string
+	add := func(enabled bool, p string) {
+		if enabled && p != "" {
+			paths = append(paths, p)
+		}
+	}
+	add(c.EnableCPUProfile, c.CPUProfilePath)
+	add(c.EnableOffCPUProfile, c.OffCPUProfilePath)
+	add(c.EnableGPU, c.GPUProfilePath)
+	add(true, c.PerfDataOutput)
+	add(true, c.CPUFlamegraphPath)
+	add(true, c.OffCPUFlamegraphPath)
+	add(true, c.GPUFlamegraphPath)
+	for _, p := range c.ExternalOutputPaths {
+		add(true, p)
+	}
+	return paths
+}
+
 func (c *Config) validate() error {
 	if len(c.CaptureID) > 256 || strings.ContainsAny(c.CaptureID, "\r\n") {
 		return errors.New("capture ID must be at most 256 characters without line breaks")
+	}
+
+	if err := c.validateGPUExecutions(); err != nil {
+		return err
 	}
 
 	if !c.EnableCPUProfile && !c.EnableOffCPUProfile && !c.EnableGPU && !c.EnablePMU {
@@ -725,6 +774,10 @@ func (a *Agent) Start(ctx context.Context) error {
 			PCSampling:                a.config.GPUPCSampling,
 			KeepInstrumentationFrames: a.config.GPUKeepInstrumentationFrames,
 			EventRingBytes:            a.config.GPUEventRingBytes,
+			PerExecutionSamples:       a.config.GPUPerExecutionSamples,
+			ExecutionsPath:            a.config.GPUExecutionsPath,
+			CaptureID:                 a.capture.ID,
+			ProtectedPaths:            a.config.outputPaths(),
 		})
 		if err != nil {
 			a.cleanup()
@@ -855,7 +908,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 				log.Printf("Failed to write GPU profile: %v", err)
 				lastErr = err
 			} else {
-				log.Printf("GPU profile written to %s (%d samples)", a.config.GPUProfilePath, n)
+				c := a.gpuProfiler.Counts()
+				log.Printf("GPU profile written to %s (%d aggregated samples from %d executions, %d projected rows)",
+					a.config.GPUProfilePath, c.AggregatedSamples, c.Executions, c.ProjectedRows)
+				if a.config.GPUExecutionsPath != "" && c.ExecutionsLogErr == nil {
+					log.Printf("GPU executions log written to %s", a.config.GPUExecutionsPath)
+				}
 				if err := a.writeFlamegraph(a.config.GPUProfilePath, a.config.GPUFlamegraphPath, "gpu"); err != nil {
 					log.Printf("Failed to write GPU flame graph: %v", err)
 					lastErr = err

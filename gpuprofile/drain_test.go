@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dpsoft/perf-agent/gpu"
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/pprof"
 )
 
@@ -15,13 +16,28 @@ import (
 // from the timeline's pressure signal.
 func drainOnly(t *testing.T, capacity int) (*Profiler, *gpu.Timeline) {
 	t.Helper()
+	return drainOnlyWith(t, capacity, Config{})
+}
+
+func drainOnlyWith(t *testing.T, capacity int, cfg Config) (*Profiler, *gpu.Timeline) {
+	t.Helper()
+	cfg.DrainEvery = time.Hour
 	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
 	tl := gpu.NewTimeline(gpu.TimelineConfig{
 		LaunchCache: gpu.LaunchCacheConfig{Capacity: capacity},
 		Modules:     store,
 	})
+	var execLog *execlog.Writer
+	if cfg.ExecutionsPath != "" {
+		w, err := execlog.Create(cfg.ExecutionsPath, execlog.Header{CaptureID: cfg.CaptureID, Backend: "cupti", SampleType: "gpu/nanoseconds"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		execLog = w
+	}
 	p := &Profiler{
-		cfg:      Config{DrainEvery: time.Hour},
+		cfg:      cfg,
+		execLog:  execLog,
 		store:    store,
 		timeline: tl,
 		builders: pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1}),
@@ -77,17 +93,19 @@ func TestAFillingTimelineIsDrainedBeforeItEvicts(t *testing.T) {
 
 	// Five ring-fulls, each paused at just past half so the drainer can run;
 	// with only the hour-long ticker, the first wait times out.
+	// execSeq is shared by every test in the package; count this test's own.
+	start := execSeq
 	for range 10 {
 		emitExecs(t, tl, capacity/2)
-		waitSamples(t, p, execSeq)
+		waitSamples(t, p, execSeq-start)
 	}
 	p.Stop()
 
 	if d := p.Dropped(); d.EvictedExecutions != 0 {
 		t.Errorf("%d executions evicted, want 0", d.EvictedExecutions)
 	}
-	if got := p.Samples(); got != execSeq {
-		t.Errorf("%d samples, want one per execution: %d", got, execSeq)
+	if got := p.Samples(); got != execSeq-start {
+		t.Errorf("%d samples, want one per execution: %d", got, execSeq-start)
 	}
 }
 

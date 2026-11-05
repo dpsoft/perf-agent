@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/metrics"
 	"github.com/dpsoft/perf-agent/perfagent"
 
@@ -49,6 +50,12 @@ var (
 			"PERFAGENT_GPU_SAMPLE_PERIOD in the target multiplies the event rate, "+
 			"and the records that overflow carry the GPU time itself, so an "+
 			"undersized buffer SHRINKS the profile. Check the 'gpu: LOST' line")
+	flagGPUPerExecSamples = flag.Bool("gpu-per-execution-samples", false,
+		"Keep one GPU pprof sample per kernel execution, each labelled gpu_correlation, as before "+
+			"the GPU profile was aggregated by default. Memory then grows with the number of kernels")
+	flagGPUExecutionsOutput = flag.String("gpu-executions-output", "",
+		"With --gpu, also write the per-execution detail of the aggregated GPU profile "+
+			"(aggregated sample, correlation id, value) to this file; written incrementally")
 	flagPMUOutput  = flag.String("pmu-output", "", "Output path for PMU metrics (default: stdout)")
 	flagFlamegraph = flag.String("flamegraph-output", "",
 		"Also write a self-contained interactive HTML flame graph of the profile. "+
@@ -145,6 +152,10 @@ func main() {
 		}
 		os.Exit(runPrefetch())
 	}
+	if err := validateGPUSampleFlags(); err != nil {
+		fmt.Fprintln(os.Stderr, "perf-agent:", err)
+		os.Exit(2)
+	}
 	profiling := *flagProfile || *flagOffCpu || *flagGPU || *flagPMU
 	if err := validateTelemetryFlags(profiling); err != nil {
 		fmt.Fprintln(os.Stderr, "perf-agent:", err)
@@ -204,6 +215,66 @@ func runLegacyCapture() {
 	}
 
 	fmt.Println("Exiting program.")
+}
+
+// externalOutputs are the files main writes itself during a capture: PMU
+// metrics at pmuPath, already resolved, and GPU telemetry with its
+// continuous-mode rotations.
+func externalOutputs(pmuPath string) []string {
+	var paths []string
+	if *flagPMU && pmuPath != "" {
+		paths = append(paths, pmuPath)
+	}
+	if t := *flagGPUTelemetryOutput; t != "" {
+		paths = append(paths, t)
+		if *flagContinuous {
+			paths = append(paths, t+".1", t+".2")
+		}
+	}
+	return paths
+}
+
+// validateGPUSampleFlags rejects the GPU sample-shape flags without --gpu,
+// where they would otherwise be silently ignored.
+func validateGPUSampleFlags() error {
+	if *flagGPU {
+		return nil
+	}
+	if *flagGPUExecutionsOutput != "" {
+		return errors.New("--gpu-executions-output requires --gpu")
+	}
+	if *flagGPUPerExecSamples {
+		return errors.New("--gpu-per-execution-samples requires --gpu")
+	}
+	return nil
+}
+
+// pmuOutputPath is the file PMU metrics are written to, with an automatic
+// name resolved, or "" when they go to stdout or PMU is off.
+func pmuOutputPath() string {
+	if !*flagPMU || *flagPMUOutput == "" {
+		return ""
+	}
+	if *flagPMUOutput == "auto" {
+		// Process and minute only: it can name a file that already exists.
+		return generateOutputName(*flagPID, *flagAll, "pmu", "txt")
+	}
+	return *flagPMUOutput
+}
+
+// checkExecutionsOffPMU rejects a GPU executions log at pmuPath, the PMU
+// output as it will be created. It must run before that file is created:
+// the agent validates its outputs only later, after the PMU file has
+// already been truncated.
+func checkExecutionsOffPMU(pmuPath string) error {
+	exec := *flagGPUExecutionsOutput
+	if !*flagGPU || exec == "" || pmuPath == "" {
+		return nil
+	}
+	if execlog.SameDestination(exec, pmuPath) {
+		return fmt.Errorf("--gpu-executions-output %s is also the PMU output", exec)
+	}
+	return nil
 }
 
 // runPrefetch is the --debuginfod-prefetch mode: no BPF, no profile, just the
@@ -337,6 +408,14 @@ func buildOptions() []perfagent.Option {
 		}
 	}
 
+	// Resolved once, so the GPU executions log is checked against, and kept
+	// off, the exact file that gets written. Checked here, before the PMU
+	// output is created and truncated below.
+	pmuPath := pmuOutputPath()
+	if err := checkExecutionsOffPMU(pmuPath); err != nil {
+		log.Fatal(err)
+	}
+
 	if *flagGPU {
 		outputPath := *flagGPUOutput
 		if outputPath == "" {
@@ -349,6 +428,13 @@ func buildOptions() []perfagent.Option {
 		if *flagGPURingBytes > 0 {
 			opts = append(opts, perfagent.WithGPUEventRingBytes(*flagGPURingBytes))
 		}
+		if *flagGPUPerExecSamples {
+			opts = append(opts, perfagent.WithGPUPerExecutionSamples())
+		}
+		if *flagGPUExecutionsOutput != "" {
+			opts = append(opts, perfagent.WithGPUExecutionsOutput(*flagGPUExecutionsOutput),
+				perfagent.WithExternalOutputs(externalOutputs(pmuPath)...))
+		}
 
 		if path := flamegraphPath(*flagFlamegraph, "gpu"); path != "" {
 			opts = append(opts, perfagent.WithGPUFlamegraph(path))
@@ -358,11 +444,7 @@ func buildOptions() []perfagent.Option {
 	if *flagPMU {
 		opts = append(opts, perfagent.WithPMU())
 		exporter := metrics.NewConsoleExporter(*flagPerPID)
-		if *flagPMUOutput != "" {
-			pmuPath := *flagPMUOutput
-			if pmuPath == "auto" {
-				pmuPath = generateOutputName(*flagPID, *flagAll, "pmu", "txt")
-			}
+		if pmuPath != "" {
 			f, err := os.Create(pmuPath)
 			if err != nil {
 				log.Fatalf("Failed to create PMU output file: %v", err)

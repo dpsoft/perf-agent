@@ -3,6 +3,7 @@ package pprof
 import (
 	"bytes"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/google/pprof/profile"
@@ -744,4 +745,76 @@ func TestLabelHashIsOrderIndependent(t *testing.T) {
 	a := hashLabels(1234, map[string]string{"x": "1", "y": "2"})
 	b := hashLabels(1234, map[string]string{"y": "2", "x": "1"})
 	assert.Equal(t, a, b, "label hash must not depend on map iteration order")
+}
+
+// AddSampleIndexed returns each sample's position in the WRITTEN profile, and
+// repeated stack+labels merge into the same index.
+func TestAddSampleIndexedMatchesTheSerializedOrder(t *testing.T) {
+	b := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	mk := func(name, label string, v uint64) *ProfileSample {
+		return &ProfileSample{SampleType: SampleTypeGpu, Aggregation: SampleAggregation(false),
+			Stack: []Frame{{Name: name}}, Value: v, Labels: map[string]string{"gpu_join": label}}
+	}
+	inputs := []*ProfileSample{mk("a", "exact", 1), mk("b", "exact", 2), mk("a", "exact", 4), mk("a", "heuristic", 8), mk("b", "exact", 16)}
+	var got []int
+	for _, s := range inputs {
+		got = append(got, b.AddSampleIndexed(s))
+	}
+	want := []int{0, 1, 0, 2, 1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("indices %v, want %v", got, want)
+		}
+	}
+	var buf bytes.Buffer
+	for _, pb := range b.Builders {
+		if _, err := pb.Write(&buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := profile.Parse(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Sample) != 3 {
+		t.Fatalf("%d samples written, want 3", len(p.Sample))
+	}
+	for i, wantV := range []int64{1 + 4, 2 + 16, 8} {
+		if p.Sample[i].Value[0] != wantV {
+			t.Errorf("written sample %d value %d, want %d", i, p.Sample[i].Value[0], wantV)
+		}
+	}
+}
+
+func gpuBenchSample(i int) *ProfileSample {
+	stack := make([]Frame, 10)
+	for f := range stack {
+		stack[f] = Frame{Name: "frame" + strconv.Itoa(f), File: "f.cu", Line: uint32(f)}
+	}
+	return &ProfileSample{SampleType: SampleTypeGpu, Stack: stack, Value: 1000,
+		Labels: map[string]string{"gpu_pid": "1234", "gpu_join": "exact", "gpu_serialized": "false",
+			"gpu_sample_period": "64", "gpu_device": "0", "gpu_queue": strconv.Itoa(i % 4)}}
+}
+
+// The per-sample cost of the two ways the GPU profiler adds samples: one
+// sample per execution (append), and merging by stack and labels.
+func BenchmarkGPUAddPerExecution(b *testing.B) {
+	pb := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	s := gpuBenchSample(0)
+	s.Aggregation = SampleAggregated
+	b.ReportAllocs()
+	for b.Loop() {
+		pb.AddSample(s)
+	}
+}
+
+func BenchmarkGPUAddMerged(b *testing.B) {
+	pb := NewProfileBuilders(BuildersOptions{SampleRate: 1})
+	samples := []*ProfileSample{gpuBenchSample(0), gpuBenchSample(1), gpuBenchSample(2), gpuBenchSample(3)}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		pb.AddSampleIndexed(samples[i%4])
+		i++
+	}
 }

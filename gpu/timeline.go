@@ -668,9 +668,9 @@ type Timeline struct {
 	// a spare is only handed back to t.execs/events/modules by the Snapshot
 	// that already finished reading it. The spares hold the rings the
 	// previous Snapshot drained, cleared, so a drain swaps in an existing
-	// ring instead of allocating three full-capacity ones. Before this,
-	// #229's pressure-driven drains made those allocations the largest
-	// share of the agent's allocation rate at high launch rates.
+	// ring instead of allocating three full-capacity ones. At high launch
+	// rates the profiler drains on ring pressure, often, and allocating per
+	// drain made these rings the largest share of the agent's allocations.
 	snapMu       sync.Mutex
 	spareExecs   *ring[GPUKernelExec]
 	spareEvents  *ring[GPUTimelineEvent]

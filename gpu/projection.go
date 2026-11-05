@@ -118,11 +118,16 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 	}
 	budget := newPCLabelBudget(cfg.MaxDistinctPCLabels)
 
+	var memo *projectionMemo
+	if cfg.OmitCorrelationLabel {
+		memo = newProjectionMemo()
+	}
+
 	samples := make([]pp.ProfileSample, 0, len(snap.Executions))
-	for _, view := range snap.Executions {
-		frames := projectionFrames(view)
+	for viewIndex, view := range snap.Executions {
+		frames := memo.frames(view)
 		pid := projectionPID(view)
-		common := projectionLabels(view)
+		common := memo.labels(view, cfg.OmitCorrelationLabel)
 
 		if len(view.PCSamples) == 0 {
 			samples = append(samples, pp.ProfileSample{
@@ -133,6 +138,9 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 				Value:       executionWeight(view.Exec),
 				Labels:      common,
 			})
+			if cfg.SampleExecutions != nil {
+				*cfg.SampleExecutions = append(*cfg.SampleExecutions, viewIndex)
+			}
 			continue
 		}
 
@@ -171,6 +179,9 @@ func ProjectExecutionsWith(snap Snapshot, cfg ProjectionConfig) ([]pp.ProfileSam
 				Value:       weights[i],
 				Labels:      labels,
 			})
+			if cfg.SampleExecutions != nil {
+				*cfg.SampleExecutions = append(*cfg.SampleExecutions, viewIndex)
+			}
 		}
 	}
 	return samples, budget.stats()
@@ -196,6 +207,20 @@ type ProjectionConfig struct {
 	// defaultMaxDistinctPCLabels. See pcLabelBudget for what happens past
 	// the cap and why gpu_pc is the label that gives way.
 	MaxDistinctPCLabels int
+
+	// SampleExecutions, when non-nil, receives one entry per returned sample:
+	// the index into snap.Executions of the execution that sample came from.
+	// An execution with PC samples yields several samples, so this is the
+	// only reliable way back from a sample to its execution; correlation ids
+	// can repeat (CUDA graphs, several processes) and sample counts depend on
+	// PC sampling. Nil leaves the projection unchanged.
+	SampleExecutions *[]int
+
+	// OmitCorrelationLabel leaves gpu_correlation off the samples. A caller
+	// that merges samples by labels has to drop it anyway, since it is unique
+	// per execution, and building it costs one string per execution; with
+	// SampleExecutions the caller reads the correlation from the execution.
+	OmitCorrelationLabel bool
 }
 
 // ProjectionStats is what one ProjectExecutionsWith call did to the labels it
@@ -594,7 +619,76 @@ func labelPID(view ExecutionView) uint32 {
 // loses to the file the module store resolved, which is the only ordering
 // under which a producer-controlled string cannot claim to be a source
 // location this package derived.
-func projectionLabels(view ExecutionView) map[string]string {
+// projectionMemo shares the frames and the label map between executions that
+// would get identical ones, within one projection. Without gpu_correlation
+// most executions of a drain differ only in timing, so building a fresh
+// slice and map for each was most of the projection's allocation, and the
+// caller merges them into an existing sample straight away. Samples may
+// therefore share Stack and Labels: they are read-only. A nil memo builds
+// everything per execution.
+type projectionMemo struct {
+	frameMemo map[string][]pp.Frame
+	labelMemo map[labelKey]map[string]string
+}
+
+// labelKey is every input projectionLabels reads when the launch carries no
+// tags of its own and gpu_correlation is omitted.
+type labelKey struct {
+	pid          uint32
+	queue        string
+	device       string
+	join         JoinKind
+	ambiguous    bool
+	graphRefused bool
+	serialized   SerializationState
+	samplePeriod uint32 // 0 unless the launch has a sampled stack
+}
+
+func newProjectionMemo() *projectionMemo {
+	return &projectionMemo{frameMemo: make(map[string][]pp.Frame), labelMemo: make(map[labelKey]map[string]string)}
+}
+
+// frames is projectionFrames, shared per kernel name for executions with no
+// sampled CPU stack. A sampled stack is per launch, so those are built.
+func (m *projectionMemo) frames(view ExecutionView) []pp.Frame {
+	if _, sampled := sampledStack(view); m == nil || sampled {
+		return projectionFrames(view)
+	}
+	f, ok := m.frameMemo[view.Exec.KernelName]
+	if !ok {
+		f = projectionFrames(view)
+		m.frameMemo[view.Exec.KernelName] = f
+	}
+	return f
+}
+
+// labels is projectionLabels, shared per labelKey. Launch tags are arbitrary,
+// so a launch that has any is built on its own.
+func (m *projectionMemo) labels(view ExecutionView, omitCorrelation bool) map[string]string {
+	if m == nil || !omitCorrelation || (view.Launch != nil && len(view.Launch.Launch.Tags) > 0) {
+		return projectionLabels(view, omitCorrelation)
+	}
+	k := labelKey{
+		pid:          labelPID(view),
+		queue:        view.Exec.Queue.QueueID,
+		device:       view.Exec.Queue.Device.DeviceID,
+		join:         view.Join,
+		ambiguous:    view.Ambiguous,
+		graphRefused: view.GraphRefused,
+		serialized:   view.Serialized,
+	}
+	if _, sampled := sampledStack(view); sampled {
+		k.samplePeriod = view.Launch.Launch.SamplePeriod
+	}
+	l, ok := m.labelMemo[k]
+	if !ok {
+		l = projectionLabels(view, omitCorrelation)
+		m.labelMemo[k] = l
+	}
+	return l
+}
+
+func projectionLabels(view ExecutionView, omitCorrelation bool) map[string]string {
 	labels := make(map[string]string)
 	if view.Launch != nil {
 		maps.Copy(labels, view.Launch.Launch.Tags)
@@ -624,7 +718,11 @@ func projectionLabels(view ExecutionView) map[string]string {
 	if view.Exec.Queue.Device.DeviceID != "" {
 		labels["gpu_device"] = view.Exec.Queue.Device.DeviceID
 	}
-	if view.Exec.Correlation.Present() {
+	if omitCorrelation {
+		// Also when it came in through the launch's own tags: a correlation
+		// label from anywhere would split samples that should merge.
+		delete(labels, "gpu_correlation")
+	} else if view.Exec.Correlation.Present() {
 		labels["gpu_correlation"] = fmt.Sprintf("%s:%s", view.Exec.Correlation.Backend, view.Exec.Correlation.Value)
 	}
 	switch view.Join {

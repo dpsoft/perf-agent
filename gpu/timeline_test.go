@@ -1059,9 +1059,9 @@ func TestTimelinePressureSignalsAtHalfCapacity(t *testing.T) {
 }
 
 // BenchmarkTimelineDrainCycle is one pressure-driven drain at the default
-// capacity: half a ring of executions in, one Snapshot out. Before the spare
-// rings, every Snapshot allocated three fresh full-capacity rings; at a high
-// launch rate #229's pressure drain made that the dominant allocation.
+// capacity: half a ring of executions in, one Snapshot out. Without the spare
+// rings every Snapshot would allocate three full-capacity rings, which at a
+// high launch rate, with drains on ring pressure, dominates allocation.
 func BenchmarkTimelineDrainCycle(b *testing.B) {
 	tl := NewTimeline(TimelineConfig{})
 	half := defaultLaunchCacheCapacity / 2
@@ -1128,13 +1128,11 @@ func TestTimelineConcurrentSnapshotsKeepEveryExecutionOnce(t *testing.T) {
 	const producers, perProducer = 4, 5000
 	var wg sync.WaitGroup
 	for p := range producers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range perProducer {
 				_ = tl.EmitExec(execFor(strconv.Itoa(p*perProducer+i), uint64(i), uint64(i)+1))
 			}
-		}()
+		})
 	}
 	var mu sync.Mutex
 	seen := make(map[string]int)
@@ -1149,9 +1147,7 @@ func TestTimelineConcurrentSnapshotsKeepEveryExecutionOnce(t *testing.T) {
 	done := make(chan struct{})
 	var drainers sync.WaitGroup
 	for range 2 {
-		drainers.Add(1)
-		go func() {
-			defer drainers.Done()
+		drainers.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -1160,7 +1156,7 @@ func TestTimelineConcurrentSnapshotsKeepEveryExecutionOnce(t *testing.T) {
 					collect()
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(done)

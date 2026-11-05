@@ -150,6 +150,18 @@ func Collect(builders *ProfileBuilders, collector SamplesCollector) error {
 	})
 }
 
+// AddSampleIndexed is AddSample that also returns the index the sample was
+// stored at, or merged into, in its builder's Profile.Sample - which is its
+// position in the written profile.
+func (b *ProfileBuilders) AddSampleIndexed(sample *ProfileSample) int {
+	bb := b.BuilderForSample(sample)
+	if sample.Aggregation == SampleAggregated {
+		bb.CreateSample(sample)
+		return len(bb.Profile.Sample) - 1
+	}
+	return bb.createSampleOrAddValue(sample)
+}
+
 func (b *ProfileBuilders) AddSample(sample *ProfileSample) {
 	bb := b.BuilderForSample(sample)
 	if sample.Aggregation == SampleAggregated {
@@ -196,7 +208,7 @@ func (b *ProfileBuilders) BuilderForSample(sample *ProfileSample) *ProfileBuilde
 		mappings:           make(map[mappingKey]*profile.Mapping),
 		locations:          make(map[any]*profile.Location),
 		functions:          make(map[any]*profile.Function),
-		sampleHashToSample: make(map[uint64]*profile.Sample),
+		sampleHashToSample: make(map[uint64]sampleRef),
 		Profile: &profile.Profile{
 			Mapping: []*profile.Mapping{
 				{
@@ -280,7 +292,7 @@ type ProfileBuilder struct {
 	mappings           map[mappingKey]*profile.Mapping
 	locations          map[any]*profile.Location
 	functions          map[any]*profile.Function
-	sampleHashToSample map[uint64]*profile.Sample
+	sampleHashToSample map[uint64]sampleRef
 	Profile            *profile.Profile
 	tmpLocations       []*profile.Location
 	tmpLocationIDs     []uint64
@@ -295,7 +307,20 @@ func (p *ProfileBuilder) CreateSample(inputSample *ProfileSample) {
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
 
+// sampleRef is a merged sample and its position in Profile.Sample, which is
+// its position in the serialized profile: samples are only ever appended.
+type sampleRef struct {
+	sample *profile.Sample
+	index  int
+}
+
 func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
+	p.createSampleOrAddValue(inputSample)
+}
+
+// createSampleOrAddValue merges inputSample into the sample with the same
+// stack and labels, creating it if needed, and returns that sample's index.
+func (p *ProfileBuilder) createSampleOrAddValue(inputSample *ProfileSample) int {
 	p.tmpLocations = p.tmpLocations[:0]
 	p.tmpLocationIDs = p.tmpLocationIDs[:0]
 	for _, f := range inputSample.Stack {
@@ -307,16 +332,16 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(inputSample *ProfileSample) {
 	if len(inputSample.Labels) > 0 {
 		h = hashLabels(h, inputSample.Labels)
 	}
-	sample := p.sampleHashToSample[h]
-	if sample != nil {
-		p.addValue(inputSample, sample)
-		return
+	if ref, ok := p.sampleHashToSample[h]; ok {
+		p.addValue(inputSample, ref.sample)
+		return ref.index
 	}
-	sample = p.newSample(inputSample)
+	sample := p.newSample(inputSample)
 	p.addValue(inputSample, sample)
 	copy(sample.Location, p.tmpLocations)
-	p.sampleHashToSample[h] = sample
+	p.sampleHashToSample[h] = sampleRef{sample: sample, index: len(p.Profile.Sample)}
 	p.Profile.Sample = append(p.Profile.Sample, sample)
+	return len(p.Profile.Sample) - 1
 }
 
 // hashLabels folds per-sample labels into the sample dedup hash so that two

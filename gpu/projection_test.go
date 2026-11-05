@@ -1110,3 +1110,28 @@ func TestOmittedCorrelationDoesNotReturnThroughLaunchTags(t *testing.T) {
 	assert.NotContains(t, samples[0].Labels, "gpu_correlation")
 	assert.Equal(t, "p", samples[0].Labels["pod_uid"], "other tags are kept")
 }
+
+// A budget shared between projections caps the distinct gpu_pc values over
+// all of them. Each call still reports only its own suppressions, so summing
+// the calls' PCLabelsSuppressed counts every suppressed sample once.
+func TestASharedPCLabelBudgetCapsEveryProjection(t *testing.T) {
+	withPCs := func(corr string, pcs ...uint64) Snapshot {
+		v := ExecutionView{Exec: execFor(corr, 10, 110)}
+		for _, pc := range pcs {
+			v.PCSamples = append(v.PCSamples, GPUPCSample{PCOffset: pc, Count: 1})
+		}
+		return Snapshot{Executions: []ExecutionView{v}}
+	}
+	budget := NewPCLabelBudget(3)
+	_, first := ProjectExecutionsWith(withPCs("1", 0x10, 0x20), ProjectionConfig{PCLabels: budget})
+	samples, second := ProjectExecutionsWith(withPCs("2", 0x10, 0x30, 0x40, 0x50), ProjectionConfig{PCLabels: budget, MaxDistinctPCLabels: 100})
+
+	assert.Equal(t, ProjectionStats{DistinctPCLabels: 2, PCLabelCap: 3}, first)
+	assert.Equal(t, ProjectionStats{DistinctPCLabels: 3, PCLabelCap: 3, PCLabelsSuppressed: 2}, second,
+		"the shared budget's ceiling applies, not MaxDistinctPCLabels")
+	var got []string
+	for _, s := range samples {
+		got = append(got, s.Labels["gpu_pc"])
+	}
+	assert.Equal(t, []string{"0x10", "0x30", "", ""}, got, "a value already admitted is always kept")
+}

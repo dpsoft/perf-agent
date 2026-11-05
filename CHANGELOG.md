@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   samples as executions must use the `GPU profile written` line or the
   executions log instead.
 
+- The cap of 20,000 distinct `gpu_pc` values now holds for the whole GPU
+  capture instead of restarting on every drain, so a long PC-sampled capture
+  stays bounded. Samples past it lose only `gpu_pc`, and `perf-agent` now logs
+  how many did; it used to drop the count.
+
 - GPU sampled-launch messages reserve 96 bytes instead of a full 3,112-byte
   batch in the BPF transport, reducing buffer pressure without changing the
   record format or sampling policy.

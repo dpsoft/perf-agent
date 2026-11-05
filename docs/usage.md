@@ -105,8 +105,13 @@ executions, plus the projected rows (more than executions when PC sampling
 splits one execution across several program counters).
 
 Labels that vary per program counter (`gpu_pc`, `gpu_stall`, `gpu_src_*`) stay
-on the samples, so with PC sampling the number of samples still grows with the
-distinct PCs seen. Without PC sampling it is bounded by stacks and labels.
+on the samples, so with PC sampling the number of samples grows with the
+distinct PCs seen, up to a cap: at most 20,000 distinct `gpu_pc` values for the
+whole capture. Past it, new program counters are written without `gpu_pc`.
+Their time, `gpu_stall` and `gpu_src_*` source location are kept, and the
+agent logs how many samples lost the label. `gpu_src_*` are bounded by the
+device code's source lines. Without PC sampling the number of samples is
+bounded by stacks and labels.
 
 To keep the per-execution detail without paying memory for it, add
 `--gpu-executions-output`:

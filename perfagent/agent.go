@@ -914,6 +914,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 				if a.config.GPUExecutionsPath != "" && c.ExecutionsLogErr == nil {
 					log.Printf("GPU executions log written to %s", a.config.GPUExecutionsPath)
 				}
+				if c.PCLabelsSuppressed > 0 {
+					// Not silent: a profile that lost gpu_pc on some samples
+					// looks just like one that never had PC sampling there.
+					log.Printf("GPU profile: %d PC samples written without gpu_pc after %d distinct values (the cap); their time, gpu_stall and gpu_src_* are kept",
+						c.PCLabelsSuppressed, c.DistinctPCLabels)
+				}
 				if err := a.writeFlamegraph(a.config.GPUProfilePath, a.config.GPUFlamegraphPath, "gpu"); err != nil {
 					log.Printf("Failed to write GPU flame graph: %v", err)
 					lastErr = err

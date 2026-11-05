@@ -719,13 +719,17 @@ func main() {
 	var lastProj gpu.ProjectionStats
 	snapshots := 0
 	seenAnomaly := map[string]bool{}
+	// One gpu_pc budget for the run: the profile accumulates across
+	// snapshots, so a budget per snapshot would allow one ceiling of
+	// distinct values per snapshot.
+	pcLabels := gpu.NewPCLabelBudget(0)
 	collect := func() {
 		snap := timeline.Snapshot()
 		// ProjectExecutionsWith rather than ProjectExecutions so the
 		// projection's own losses reach the operator: gpu_pc labels dropped
 		// at the cardinality ceiling are invisible in the profile itself, and
 		// JoinHealthWith is the only place they are reported.
-		samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store})
+		samples, projStats := gpu.ProjectExecutionsWith(snap, gpu.ProjectionConfig{Modules: store, PCLabels: pcLabels})
 		for i := range samples {
 			builders.AddSample(&samples[i])
 		}

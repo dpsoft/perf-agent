@@ -349,13 +349,18 @@ func (p *ProfileBuilder) createSampleOrAddValue(inputSample *ProfileSample) int 
 // than silently merged. Keys are sorted, so the result does not depend on Go's
 // randomized map iteration order.
 func hashLabels(seed uint64, labels map[string]string) uint64 {
-	keys := make([]string, 0, len(labels))
+	// Runs once per sample added. A label set fits the array in practice
+	// (the GPU projection sets about ten), so the keys stay off the heap;
+	// a larger set spills, which is only slower.
+	var buf [16]string
+	keys := buf[:0]
 	for k := range labels {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
 
-	d := xxhash.New()
+	var d xxhash.Digest
+	d.Reset()
 	var seedBuf [8]byte
 	binary.LittleEndian.PutUint64(seedBuf[:], seed)
 	_, _ = d.Write(seedBuf[:])

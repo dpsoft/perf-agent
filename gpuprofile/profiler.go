@@ -97,6 +97,11 @@ type Config struct {
 	// CaptureID identifies the capture in the executions log header.
 	CaptureID string
 
+	// MaxDistinctPCLabels caps the distinct gpu_pc values in the whole
+	// profile; zero keeps the gpu package's default. PC samples past it are
+	// kept without gpu_pc and counted in Counts.
+	MaxDistinctPCLabels int
+
 	// ProtectedPaths are the capture's other outputs. The executions log is
 	// never published over any of them.
 	ProtectedPaths []string
@@ -132,6 +137,16 @@ type Profiler struct {
 	// execLogErr is why the executions log was abandoned, if it was. The
 	// profile itself is unaffected.
 	execLogErr error
+
+	// pcLabels is the gpu_pc budget for the whole capture: the profile
+	// accumulates across drains, so a budget per drain would let it carry
+	// one ceiling of distinct gpu_pc values per drain.
+	pcLabels *gpu.PCLabelBudget
+	// pcSuppressed counts PC samples written without gpu_pc because the
+	// budget was full. Their time and other labels are kept.
+	pcSuppressed uint64
+	distinctPCs  uint64
+	pcLabelCap   uint64
 
 	// dropped is the timeline's loss record as of the latest drain. The
 	// timeline's counters are cumulative, so this is replaced, never summed.
@@ -216,6 +231,7 @@ func New(cfg Config) (*Profiler, error) {
 		builders: pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: 1}),
 		done:     make(chan struct{}),
 		execLog:  execLog,
+		pcLabels: gpu.NewPCLabelBudget(cfg.MaxDistinctPCLabels),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -271,15 +287,17 @@ func (p *Profiler) drainLoop(ctx context.Context, consumerDone <-chan struct{}) 
 
 func (p *Profiler) drain() {
 	snap := p.timeline.Snapshot()
-	pcfg := gpu.ProjectionConfig{Modules: p.store}
+	pcfg := gpu.ProjectionConfig{Modules: p.store, PCLabels: p.pcLabels}
 	var execOf []int
 	if !p.cfg.PerExecutionSamples {
 		pcfg.SampleExecutions = &execOf
 		pcfg.OmitCorrelationLabel = true
 	}
-	samples, _ := gpu.ProjectExecutionsWith(snap, pcfg)
+	samples, stats := gpu.ProjectExecutionsWith(snap, pcfg)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.pcSuppressed += stats.PCLabelsSuppressed
+	p.distinctPCs, p.pcLabelCap = stats.DistinctPCLabels, stats.PCLabelCap
 	p.dropped = snap.Dropped
 	// Ordinals continue across drains: this snapshot's executions are
 	// numbered from the count already seen.
@@ -296,10 +314,9 @@ func (p *Profiler) drain() {
 		s := &samples[i]
 		// gpu_correlation, the one label unique per execution, was left off
 		// (OmitCorrelationLabel), so samples with the same stack and remaining
-		// labels merge. Every other GPU label is bounded per drain. Not per
-		// capture: gpu_pc's label budget restarts on every drain and src_*
-		// follow the PCs, so with PC sampling the number of aggregated
-		// samples still grows with the distinct PCs seen.
+		// labels merge. With PC sampling, gpu_pc is capped for the whole
+		// capture by p.pcLabels; gpu_src_* follow the PCs and are bounded by
+		// the device code's source lines, not by that cap.
 		s.Aggregation = pprof.SampleAggregation(false)
 		idx := p.builders.AddSampleIndexed(s)
 		if p.execLog != nil {
@@ -395,6 +412,12 @@ type Counts struct {
 	Executions        uint64
 	ProjectedRows     uint64
 	AggregatedSamples uint64
+	// DistinctPCLabels is how many distinct gpu_pc values the profile
+	// carries, against PCLabelCap; PCLabelsSuppressed counts PC samples
+	// written without one because the cap was reached.
+	DistinctPCLabels   uint64
+	PCLabelCap         uint64
+	PCLabelsSuppressed uint64
 	// ExecutionsLogErr is why a requested executions log was not written.
 	ExecutionsLogErr error
 }
@@ -403,7 +426,10 @@ type Counts struct {
 func (p *Profiler) Counts() Counts {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	c := Counts{Executions: p.executions, ProjectedRows: uint64(p.samples), ExecutionsLogErr: p.execLogErr}
+	c := Counts{
+		Executions: p.executions, ProjectedRows: uint64(p.samples), ExecutionsLogErr: p.execLogErr,
+		DistinctPCLabels: p.distinctPCs, PCLabelCap: p.pcLabelCap, PCLabelsSuppressed: p.pcSuppressed,
+	}
 	for _, b := range p.builders.Builders {
 		c.AggregatedSamples += uint64(len(b.Profile.Sample))
 	}

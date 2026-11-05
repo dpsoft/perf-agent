@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-05
+
+A GPU release. NVIDIA device telemetry joins the GPU profile: temperature,
+power, memory, utilization and clocks, in the console, as JSONL, over OTLP, and
+in the HTML report next to the flame graph. The GPU profile is now aggregated,
+so the agent's memory follows distinct stacks and labels instead of the number
+of kernels: on an RTX 3090 capturing about 3 million kernels in 15 s, peak RSS
+went from about 7 GB to about 0.9 GB.
+**If you count pprof samples as GPU executions, read the `GPU profile written`
+line or `--gpu-executions-output` instead** (see Changed).
+
 ### Added
 
 - Offline GPU telemetry in HTML profiles: a collapsible summary and a dedicated
@@ -44,8 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The cap of 20,000 distinct `gpu_pc` values now holds for the whole GPU
   capture instead of restarting on every drain, so a long PC-sampled capture
-  stays bounded. Samples past it lose only `gpu_pc`, and `perf-agent` now logs
+  stays within it. It bounds that label's cardinality, not the profile's
+  memory as a whole. Samples past it lose only `gpu_pc`, and `perf-agent` now logs
   how many did; it used to drop the count.
+
+- GPU timeline snapshots reuse the drained rings instead of allocating new
+  ones. In the benchmark that measured it, bytes allocated fell 59% in
+  `Timeline.Snapshot` and about 30% overall
+  ([#243](https://github.com/dpsoft/perf-agent/pull/243)).
 
 - GPU sampled-launch messages reserve 96 bytes instead of a full 3,112-byte
   batch in the BPF transport, reducing buffer pressure without changing the
@@ -70,6 +87,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GPU shutdown diagnostics no longer add record loss, batch sequence gaps and
   missing CPU stacks into a misleading `LOST` total. BPF record drops are
   reported by kind; missing attribution and timeline evictions stay separate.
+
+- `--pmu` no longer reports the time since boot as the first on-CPU interval
+  of each CPU, which every run rejected with a histogram error and a short
+  uptime would have accepted as a huge outlier
+  ([#236](https://github.com/dpsoft/perf-agent/issues/236)).
+
+### Known issues
+
+- A CUDA process profiled with `--profile` can occasionally stop in
+  `cuCtxSynchronize` with the GPU idle, or fail with `unspecified launch
+  failure` and an NVRM Xid 13 or 31, around the moment the profiler attaches
+  or detaches ([#240](https://github.com/dpsoft/perf-agent/issues/240)). On an
+  RTX 3090 with Linux 6.19 and the NVIDIA 610 driver it happened about once
+  in a hundred attach cycles. It predates this release and is being
+  investigated.
+
+### Internal
+
+- CI lints without golangci-lint's analysis cache, which had let stale
+  results pass ([#234](https://github.com/dpsoft/perf-agent/issues/234)).
 
 ## [1.4.1] - 2026-11-04
 
@@ -492,7 +529,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/dpsoft/perf-agent/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/dpsoft/perf-agent/compare/v1.2.1...v1.3.0

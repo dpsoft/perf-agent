@@ -34,6 +34,11 @@ type Collector struct {
 	// taken inside the profile's window, reaches the profile's report too.
 	// Not closed when Run fails before that point.
 	FinalSampled chan<- struct{}
+
+	// StartAfter, if set, holds Run's first reading until it is closed (or
+	// ctx ends). It lets the sampler be started before a profile's setup and
+	// still take its first reading only once the profile's window is open.
+	StartAfter <-chan struct{}
 }
 
 // Run collects an initial sample, periodic samples, and a final sample when ctx
@@ -46,6 +51,13 @@ func (c *Collector) Run(ctx context.Context) (err error) {
 	for _, exporter := range c.Exporters {
 		if exporter == nil {
 			return errors.New("GPU telemetry exporter is nil")
+		}
+	}
+	if c.StartAfter != nil {
+		select {
+		case <-c.StartAfter:
+		case <-ctx.Done():
+			return nil
 		}
 	}
 	started := time.Now()

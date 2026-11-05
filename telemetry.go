@@ -240,21 +240,18 @@ func runCapture() (code int) {
 		// the profile's.
 		collector.FinalSampled = finalSampled
 	}
-	// Keep the profiler context alive through its final collection.
-	profileCtx, cancelProfile := context.WithCancel(context.Background())
-	defer cancelProfile()
-	if agent != nil {
-		if err := agent.Start(profileCtx); err != nil {
-			fmt.Fprintln(os.Stderr, "Failed to start agent:", err)
-			return 1
-		}
-	}
 	if agent != nil && *flagFlamegraph != "" {
 		collector.Exporters = append([]metrics.Exporter{reportCollector.LiveExporter()}, collector.Exporters...)
+		// The profile's window opens when the agent starts, before attaching,
+		// which can take seconds (a Python process). Sampling starts with it,
+		// not after, so the report covers the whole window.
+		collector.StartAfter = reportCollector.Begun()
 	}
-	captureCtx, cancel := context.WithTimeout(ctx, *flagDuration)
-	defer cancel()
-	telemetryCtx := captureCtx
+	// The telemetry runs while the agent attaches. A finite capture's
+	// deadline is still counted from the end of Start, as before; the
+	// telemetry is cancelled at that same deadline.
+	telemetryCtx, cancelTelemetry := context.WithCancel(ctx)
+	defer cancelTelemetry()
 	if *flagContinuous {
 		telemetryCtx = ctx
 	}
@@ -266,6 +263,23 @@ func runCapture() (code int) {
 			result <- collector.Run(telemetryCtx)
 		}
 	}()
+	// Keep the profiler context alive through its final collection.
+	profileCtx, cancelProfile := context.WithCancel(context.Background())
+	defer cancelProfile()
+	if agent != nil {
+		if err := agent.Start(profileCtx); err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to start agent:", err)
+			cancelTelemetry()
+			<-result
+			return 1
+		}
+	}
+	captureCtx, cancel := context.WithTimeout(ctx, *flagDuration)
+	defer cancel()
+	if !*flagContinuous {
+		stopTelemetry := context.AfterFunc(captureCtx, cancelTelemetry)
+		defer stopTelemetry()
+	}
 	if *flagContinuous {
 		fmt.Println("Collecting GPU telemetry until SIGINT/SIGTERM...")
 	} else {

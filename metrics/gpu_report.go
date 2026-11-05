@@ -49,11 +49,17 @@ type GPUReportCollector struct {
 	report  GPUReport
 	devices map[string]*GPUReportDevice
 	closed  bool
+	begun   chan struct{}
 }
 
 func NewGPUReportCollector(id string, start, end time.Time) *GPUReportCollector {
-	return &GPUReportCollector{report: GPUReport{CaptureID: id, StartedAt: start, EndedAt: end}, devices: make(map[string]*GPUReportDevice)}
+	return &GPUReportCollector{report: GPUReport{CaptureID: id, StartedAt: start, EndedAt: end}, devices: make(map[string]*GPUReportDevice), begun: make(chan struct{})}
 }
+
+// Begun is closed once Begin has bound the report to its capture's start, so
+// a sampler can take its first reading inside the window rather than after
+// whatever setup follows the start.
+func (c *GPUReportCollector) Begun() <-chan struct{} { return c.begun }
 
 func (c *GPUReportCollector) Name() string { return "gpu-report" }
 
@@ -212,6 +218,11 @@ func (c *GPUReportCollector) Begin(id string, start time.Time) error {
 		return fmt.Errorf("GPU report cannot begin with this capture")
 	}
 	c.report.StartedAt = start
+	select {
+	case <-c.begun:
+	default:
+		close(c.begun)
+	}
 	return nil
 }
 

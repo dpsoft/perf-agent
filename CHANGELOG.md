@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the report was often frozen first. The profile now stops after that sample
   is published, waiting at most 500 ms, so a stalled driver cannot hold it open.
 
+- GPU telemetry in a profiled capture now starts with the profile's window,
+  not after the agent has attached, which can take seconds for a Python
+  process. The HTML report covered only the end of the window and flagged
+  it: on a fine-tuning capture, the first NVML reading came 10 s after a
+  16.5 s window opened.
+
 - GPU shutdown diagnostics no longer add record loss, batch sequence gaps and
   missing CPU stacks into a misleading `LOST` total. BPF record drops are
   reported by kind; missing attribution and timeline evictions stay separate.

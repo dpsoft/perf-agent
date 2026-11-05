@@ -172,3 +172,39 @@ func (f exporterFunc) Export(_ context.Context, s *metrics.MetricsSnapshot) erro
 	f(s)
 	return nil
 }
+
+// With StartAfter, Run takes no reading until it is closed, so a sampler
+// started before a profile's setup still begins inside the profile's window;
+// and it returns without reading if ctx ends first.
+func TestStartAfterHoldsTheFirstReading(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	gate := make(chan struct{})
+	var firstAt time.Time
+	source := &fakeSource{devices: []Device{{UUID: "GPU-a"}}}
+	source.read = func(d Device) metrics.GPUDeviceMetrics {
+		if firstAt.IsZero() {
+			firstAt = time.Now()
+		}
+		cancel()
+		return metrics.GPUDeviceMetrics{UUID: d.UUID, Timestamp: time.Now(), Values: map[string]float64{"power": 1}}
+	}
+	c := Collector{Source: source, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, StartAfter: gate}
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	opened := time.Now()
+	close(gate)
+	require.NoError(t, <-done)
+	require.False(t, firstAt.Before(opened), "a reading was taken before StartAfter was closed")
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	cancel2()
+	idle := &fakeSource{devices: []Device{{UUID: "GPU-a"}}, read: func(Device) metrics.GPUDeviceMetrics {
+		t.Fatal("read while StartAfter was never closed")
+		return metrics.GPUDeviceMetrics{}
+	}}
+	c2 := Collector{Source: idle, Interval: time.Second, Exporters: []metrics.Exporter{&recordingExporter{}}, StartAfter: make(chan struct{})}
+	require.NoError(t, c2.Run(ctx2))
+	require.Zero(t, idle.closed, "the source was opened while waiting for the window")
+}

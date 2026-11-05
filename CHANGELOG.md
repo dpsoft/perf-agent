@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 A GPU release. NVIDIA device telemetry joins the GPU profile: temperature,
 power, memory, utilization and clocks, in the console, as JSONL, over OTLP, and
-in the HTML report next to the flame graph. The GPU profile is now aggregated:
-an agent profiling millions of kernels holds about 0.9 GB instead of about 7 GB.
+in the HTML report next to the flame graph. The GPU profile is now aggregated,
+so the agent's memory follows distinct stacks and labels instead of the number
+of kernels: on an RTX 3090 capturing about 3 million kernels in 15 s, peak RSS
+went from about 7 GB to about 0.9 GB.
 **If you count pprof samples as GPU executions, read the `GPU profile written`
 line or `--gpu-executions-output` instead** (see Changed).
 
@@ -53,11 +55,13 @@ line or `--gpu-executions-output` instead** (see Changed).
 
 - The cap of 20,000 distinct `gpu_pc` values now holds for the whole GPU
   capture instead of restarting on every drain, so a long PC-sampled capture
-  stays bounded. Samples past it lose only `gpu_pc`, and `perf-agent` now logs
+  stays within it. It bounds that label's cardinality, not the profile's
+  memory as a whole. Samples past it lose only `gpu_pc`, and `perf-agent` now logs
   how many did; it used to drop the count.
 
 - GPU timeline snapshots reuse the drained rings instead of allocating new
-  ones: 59% fewer bytes allocated per snapshot, about 30% overall
+  ones. In the benchmark that measured it, bytes allocated fell 59% in
+  `Timeline.Snapshot` and about 30% overall
   ([#243](https://github.com/dpsoft/perf-agent/pull/243)).
 
 - GPU sampled-launch messages reserve 96 bytes instead of a full 3,112-byte

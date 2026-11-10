@@ -498,13 +498,25 @@ type Stats struct {
 	// Batches and Records count what arrived and was normalized.
 	Batches uint64
 	Records uint64
-	// SequenceGaps counts forward gaps observed in a probe's batch sequence.
-	// The shim increments seq_ once per batch, not per record. Across producer
-	// threads, sequence allocation and arrival order can differ, so a gap
-	// may reflect reordering rather than a missing batch. These observations
-	// are neither a count of distinct lost batches nor additive with
-	// KernelDropped or Records. They cannot quantify missing GPU executions.
+	// SequenceGaps counts batch-sequence positions that never arrived, per
+	// (kind, pid) stream. Producer threads take sequence numbers before they
+	// emit, so batches arrive out of order; a position is counted only once a
+	// bounded reorder window has moved past it unfilled, or while it is still
+	// an open hole when Stats is read. A final read after the drain is
+	// therefore exact up to SequenceStale; a read while the producer runs may
+	// include batches still in flight. Positions before the first batch seen
+	// in a stream are never counted. It counts batches, not records, overlaps
+	// KernelDropped and is not additive with it or with Records. It cannot
+	// quantify missing GPU executions.
 	SequenceGaps uint64
+	// SequenceReordered counts batches that arrived behind a later-numbered
+	// one of the same stream. They are not loss.
+	SequenceReordered uint64
+	// SequenceStale counts batches for a position already seen, or already
+	// given up on because it was later than the reorder window. Bounded state
+	// cannot tell the two apart, so SequenceGaps can overstate real loss by at
+	// most this many.
+	SequenceStale uint64
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
@@ -1593,7 +1605,7 @@ type Consumer struct {
 	cubinErr string
 
 	mu          sync.Mutex
-	seqByStream map[seqKey]uint64
+	seqByStream map[seqKey]*seqStream
 	pending     *pendingStacks
 	deferred    *deferredLaunches
 	names       *kernelNameTable
@@ -1638,7 +1650,7 @@ func newConsumer(cfg Config) *Consumer {
 		cfg:         cfg,
 		shim:        newShimScope(cfg.ShimPath),
 		instr:       newInstrumentationBand(newShimScope(cfg.ShimPath), cfg.KeepInstrumentationFrames),
-		seqByStream: map[seqKey]uint64{},
+		seqByStream: map[seqKey]*seqStream{},
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
 		names:       newKernelNameTable(cfg.KernelNameCapacity),
@@ -2048,10 +2060,10 @@ func decodeBatch(b []byte) (batch, error) {
 	return out, nil
 }
 
-// noteSeq records a forward gap between consecutive arrivals in a (kind, pid)
-// stream. The return value counts skipped batch-sequence positions, not records
-// or confirmed loss: concurrently emitted batches can arrive out of order.
-// Caller holds mu.
+// noteSeq records one batch in its (kind, pid) stream; see seqStream for how
+// reordering is told from loss. The return value is the forward jump past the
+// highest position seen: skipped batch positions, not records and not
+// confirmed loss, since the skipped batches may only be late. Caller holds mu.
 //
 // The return value is not decoration. The serialization disclosure below needs
 // it: a hole in the sampling-window history means the intervals either side of
@@ -2062,14 +2074,22 @@ func decodeBatch(b []byte) (batch, error) {
 // keep.
 func (c *Consumer) noteSeq(kind, pid uint32, seq uint64) uint64 {
 	key := seqKey{kind: kind, pid: pid}
-	prev, seen := c.seqByStream[key]
-	var lost uint64
-	if seen && seq > prev+1 {
-		lost = seq - prev - 1
-		c.stats.SequenceGaps += lost
+	s := c.seqByStream[key]
+	if s == nil {
+		s = &seqStream{}
+		c.seqByStream[key] = s
 	}
-	c.seqByStream[key] = seq
-	return lost
+	return s.arrive(seq)
+}
+
+// seqStatsLocked folds the per-stream sequence accounting into out. Caller
+// holds mu.
+func (c *Consumer) seqStatsLocked(out *Stats) {
+	for _, s := range c.seqByStream {
+		out.SequenceGaps += s.gaps + s.unresolved()
+		out.SequenceReordered += s.reordered
+		out.SequenceStale += s.stale
+	}
 }
 
 // correlationOf converts a wire correlation into the core's CorrelationID.
@@ -3253,6 +3273,7 @@ func (c *Consumer) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.stats
+	c.seqStatsLocked(&out)
 	out.DecodeFailures = c.decodeFailures.snapshot()
 	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
 	out.KernelDroppedByKind, out.KernelDropReadErrors = readKindCounts(c.objs.Dropped)

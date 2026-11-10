@@ -91,6 +91,19 @@ At shutdown, GPU diagnostics distinguish several kinds of incomplete data:
   profile. Anything the drain could not reach in time is reported here, and it
   is in no drop counter.
 
+- `why stacks were missing` follows `stacks_missing` and says what the BPF side
+  ran into. `stack_map_full` means the consumer was not freeing `gpu_stacks`
+  entries fast enough; the other reasons are walk failures.
+
+Symbolizing a sampled launch's CPU stack is the consumer's most expensive step.
+A launch whose call path was symbolized in the last 2 s reuses that result
+(`stack memo: hits=... misses=...` at shutdown). GPU workloads launch from a
+few call paths millions of times, so the memo takes symbolization almost
+entirely off the drain path. `--gpu-stack-memo N` sets how many call paths it
+holds (default 4096); `--gpu-stack-memo -1` turns it off. If a library is
+unloaded and another mapped at the same address, a stack can carry the old
+names for up to 2 s.
+
 `--gpu-ring-bytes` can absorb larger bursts, at the cost of memory, but cannot
 make a continuously overloaded consumer keep up. Increasing the target's
 `PERFAGENT_GPU_SAMPLE_PERIOD` reduces CPU stack sampling and attribution detail;
@@ -405,6 +418,7 @@ for concurrent writers with separate lock directories.
 | `-a, --all` | System-wide (all processes) | `false` |
 | `--per-pid` | Per-PID breakdown (only with `-a --pmu`) | `false` |
 | `--duration` | Collection duration | `10s` |
+| `--gpu-stack-memo` | Symbolized GPU launch stacks to remember for 2 s; `-1` disables | `4096` |
 | `--gpu-telemetry` | Collect NVIDIA device sensors, also usable alone | `false` |
 | `--gpu-telemetry-output` | Write timestamped GPU readings and summary to JSONL; enables telemetry | - |
 | `--gpu-telemetry-interval` | Sensor polling interval | `1s` |

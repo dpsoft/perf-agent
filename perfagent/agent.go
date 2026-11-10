@@ -774,6 +774,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			PCSampling:                a.config.GPUPCSampling,
 			KeepInstrumentationFrames: a.config.GPUKeepInstrumentationFrames,
 			EventRingBytes:            a.config.GPUEventRingBytes,
+			StackMemoEntries:          a.config.GPUStackMemoEntries,
 			PerExecutionSamples:       a.config.GPUPerExecutionSamples,
 			ExecutionsPath:            a.config.GPUExecutionsPath,
 			CaptureID:                 a.capture.ID,
@@ -1131,6 +1132,16 @@ func logGPUIngestionStats(st gpuprobe.Stats) {
 			"these counters do not count lost GPU executions",
 			st.StacksEvicted, st.StacksMissing, st.StackLookupFailed, st.SymbolizeFailed,
 			st.StacksUncorrelated, st.StacksProfilerOnly)
+	}
+	if st.StacksMissing > 0 {
+		log.Printf("perf-agent: gpu: why stacks were missing: stack_map_full=%d stack_walk_empty=%d "+
+			"stack_map_update_failed=%d stack_walk_scratch_failed=%d (bpf side counted %d)",
+			st.StackMapFull, st.StackWalkEmpty, st.StackMapUpdateFailed, st.StackWalkScratchFailed,
+			st.KernelStacksMissing)
+	}
+	if st.StackMemoHits+st.StackMemoMisses > 0 {
+		log.Printf("perf-agent: gpu: stack memo: hits=%d misses=%d expired=%d clears=%d",
+			st.StackMemoHits, st.StackMemoMisses, st.StackMemoExpired, st.StackMemoClears)
 	}
 }
 

@@ -44,6 +44,9 @@ var (
 		"The CUPTI adapter the target loaded. Must be the SAME FILE it mapped: the uprobe attaches "+
 			"by inode, so identical bytes at another path is a different target and nothing is captured")
 	flagGPUOutput    = flag.String("gpu-output", "", "Output path for GPU profile (default: auto-generated)")
+	flagGPUStackMemo = flag.Int("gpu-stack-memo", 0,
+		"Entries in the memo of symbolized GPU launch stacks (0 keeps the default of 4096; "+
+			"-1 disables it and symbolizes every sampled launch). A memoized stack is trusted for 2s")
 	flagGPURingBytes = flag.Int("gpu-ring-bytes", 0,
 		"Size of the BPF event ringbuf for --gpu, in bytes (rounded up to a "+
 			"power-of-two page multiple; 0 keeps the 4MB default). Lowering "+
@@ -427,6 +430,9 @@ func buildOptions() []perfagent.Option {
 		)
 		if *flagGPURingBytes > 0 {
 			opts = append(opts, perfagent.WithGPUEventRingBytes(*flagGPURingBytes))
+		}
+		if *flagGPUStackMemo != 0 {
+			opts = append(opts, perfagent.WithGPUStackMemoEntries(*flagGPUStackMemo))
 		}
 		if *flagGPUPerExecSamples {
 			opts = append(opts, perfagent.WithGPUPerExecutionSamples())

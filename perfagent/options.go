@@ -91,6 +91,10 @@ type Config struct {
 	// GPUEventRingBytes sizes the BPF event ringbuf for the GPU pipeline.
 	// Zero keeps the compiled-in default. See WithGPUEventRingBytes.
 	GPUEventRingBytes int
+	// GPUStackMemoEntries bounds the memo of symbolized GPU launch stacks.
+	// Zero keeps the default; negative disables it. See
+	// WithGPUStackMemoEntries.
+	GPUStackMemoEntries int
 
 	// GPUProfilePath is the output path for the GPU profile.
 	GPUProfilePath string
@@ -427,6 +431,16 @@ func WithExternalOutputs(paths ...string) Option {
 func WithGPUEventRingBytes(n int) Option {
 	return func(c *Config) {
 		c.GPUEventRingBytes = n
+	}
+}
+
+// WithGPUStackMemoEntries bounds the memo of symbolized GPU launch stacks:
+// a sampled launch whose call path was symbolized in the last two seconds
+// reuses that result instead of calling the symbolizer again. Zero keeps the
+// default (4096); a negative value disables the memo.
+func WithGPUStackMemoEntries(n int) Option {
+	return func(c *Config) {
+		c.GPUStackMemoEntries = n
 	}
 }
 

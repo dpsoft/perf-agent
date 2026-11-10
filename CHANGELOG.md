@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Known issues of 1.5.0 and 1.5.1 blamed `--profile` for a CUDA process
+  stopping in `cuCtxSynchronize` or failing with Xid 13/31
+  ([#240](https://github.com/dpsoft/perf-agent/issues/240)). It is triggered by
+  WiFi receive traffic through a MediaTek MT7925 adapter on the host, with or
+  without perf-agent, and both entries now say so.
+
 ### Internal
 
 - blazesym is pinned to the release in `.blazesym-ref` (`capi-v0.1.11`, on
@@ -62,6 +70,11 @@ about 14%, with the agent using about 170% CPU instead of about 200%.
   around the moment the profiler attaches or detaches
   ([#240](https://github.com/dpsoft/perf-agent/issues/240)). This release does
   not change it.
+  **Corrected after release:** perf-agent does not cause this. The same
+  failure happens with no perf-agent and no perf event at all, while the host
+  receives WiFi traffic through a MediaTek MT7925 adapter (`mt7925e`). On the
+  affected host, CPU, NVMe and loopback network load did not trigger it. Avoid
+  WiFi downloads during CUDA work on such hosts, or use a wired NIC; see #240.
 
 ## [1.5.0] - 2026-11-05
 
@@ -158,6 +171,11 @@ line or `--gpu-executions-output` instead** (see Changed).
   RTX 3090 with Linux 6.19 and the NVIDIA 610 driver it happened about once
   in a hundred attach cycles. It predates this release and is being
   investigated.
+  **Corrected after release:** perf-agent does not cause this. The same
+  failure happens with no perf-agent and no perf event at all, while the host
+  receives WiFi traffic through a MediaTek MT7925 adapter (`mt7925e`). On the
+  affected host, CPU, NVMe and loopback network load did not trigger it. Avoid
+  WiFi downloads during CUDA work on such hosts, or use a wired NIC; see #240.
 
 ### Internal
 

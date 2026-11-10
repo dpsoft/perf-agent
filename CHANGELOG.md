@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- blazesym is pinned to the release in `.blazesym-ref` (`capi-v0.1.11`, on
+  blazesym 0.2.7) for CI, release binaries and container images, which used to
+  build whatever its main branch held. `make build` warns when the local
+  checkout is at another ref or was built without xz.
+
 ## [1.5.1] - 2026-11-10
 
 A patch release for `--gpu` under a heavy launch rate. Batches that arrived out

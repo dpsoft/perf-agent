@@ -1117,6 +1117,10 @@ func logGPUIngestionStats(st gpuprobe.Stats) {
 	if st.SinkRejected > 0 {
 		log.Printf("perf-agent: gpu: sink_rejected=%d event(s) after transport", st.SinkRejected)
 	}
+	if st.StopDrainedBatches > 0 {
+		log.Printf("perf-agent: gpu: final drain delivered %d batch(es) the probes wrote before the stop",
+			st.StopDrainedBatches)
+	}
 	if st.StopUnreadBytes > 0 {
 		log.Printf("perf-agent: gpu: stop_unread_bytes=%d ring byte(s) of records accepted before the stop "+
 			"were left unread when the final drain timed out; they are in no drop counter", st.StopUnreadBytes)

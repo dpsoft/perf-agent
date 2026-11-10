@@ -138,6 +138,45 @@ func TestSymbolizationFailureIsNotMemoized(t *testing.T) {
 	assert.Equal(t, uint64(2), c.Stats().SymbolizeFailed)
 }
 
+// A symbolization that resolved no frame is not remembered either, though it
+// returns no error: the symbolizer reports a failed batch as address-only
+// frames, and a later call may resolve them.
+func TestUnresolvedSymbolizationIsNotMemoized(t *testing.T) {
+	sink := &recordingSink{}
+	sym := &fakeSymbolizer{unresolved: func(uint64) bool { return true }}
+	c, sm, _ := stackConsumer(t, sink, Config{Symbolizer: sym})
+	sm.put(1, 0x1000, 0x2000)
+	sm.put(2, 0x1000, 0x2000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	apply(t, c, sampledBatchWith(4242, 8, 2, 8))
+	apply(t, c, launchBatchWith(4242, 8))
+	c.Flush()
+
+	assert.Len(t, sym.ips, 2, "the second capture goes back to the symbolizer")
+	assert.Zero(t, c.Stats().StackMemoHits)
+}
+
+// A partly resolved stack is remembered: a library without symbols would
+// otherwise keep every call path through it out of the memo.
+func TestPartlyResolvedSymbolizationIsMemoized(t *testing.T) {
+	sink := &recordingSink{}
+	sym := &fakeSymbolizer{unresolved: func(ip uint64) bool { return ip == 0x2000 }}
+	c, sm, _ := stackConsumer(t, sink, Config{Symbolizer: sym})
+	sm.put(1, 0x1000, 0x2000)
+	sm.put(2, 0x1000, 0x2000)
+
+	apply(t, c, sampledBatchWith(4242, 7, 1, 8))
+	apply(t, c, launchBatchWith(4242, 7))
+	apply(t, c, sampledBatchWith(4242, 8, 2, 8))
+	apply(t, c, launchBatchWith(4242, 8))
+	c.Flush()
+
+	assert.Len(t, sym.ips, 1)
+	assert.Equal(t, uint64(1), c.Stats().StackMemoHits)
+}
+
 func TestStackMemoCanBeDisabled(t *testing.T) {
 	sink := &recordingSink{}
 	c, sm, sym := stackConsumer(t, sink, Config{StackMemoEntries: -1})

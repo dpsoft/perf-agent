@@ -30,7 +30,9 @@ const (
 // the same address in the same process can come to mean something else: a
 // library unloaded and another mapped in its place, or a JIT rewriting a
 // perf map. Within ttl a stale name is possible after such a remap; past it,
-// never. Failed symbolizations are not remembered.
+// never. Failed symbolizations are not remembered, and neither is one that
+// resolved no frame: the symbolizer reports a failed batch that way, with no
+// error. A partly resolved stack is remembered for ttl.
 //
 // The memo is bounded by entries. When full it is cleared rather than
 // evicting one entry at a time: a working set larger than the bound gains
@@ -133,3 +135,6 @@ func (s *stackMemo) drop(k uint64, i int) {
 	}
 	s.n--
 }
+
+// frameResolved reports whether the symbolizer named f.
+func frameResolved(f symbolize.Frame) bool { return f.Reason == symbolize.FailureNone }

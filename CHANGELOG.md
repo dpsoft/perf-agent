@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#240](https://github.com/dpsoft/perf-agent/issues/240)). It is triggered by
   WiFi receive traffic through a MediaTek MT7925 adapter on the host, with or
   without perf-agent, and both entries now say so.
+- The GPU stack memo no longer remembers a launch stack that symbolization
+  resolved no frame of. The symbolizer reports a failed batch as address-only
+  frames with no error, so one transient failure could serve unnamed frames
+  for that call path for up to 2 s. A partly resolved stack is still
+  remembered.
 
 ### Internal
 

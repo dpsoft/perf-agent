@@ -102,7 +102,8 @@ few call paths millions of times, so the memo takes symbolization almost
 entirely off the drain path. `--gpu-stack-memo N` sets how many call paths it
 holds (default 4096); `--gpu-stack-memo -1` turns it off. If a library is
 unloaded and another mapped at the same address, a stack can carry the old
-names for up to 2 s.
+names for up to 2 s. A stack with no frame resolved is not reused, so the next
+launch from that call path is symbolized again.
 
 `--gpu-ring-bytes` can absorb larger bursts, at the cost of memory, but cannot
 make a continuously overloaded consumer keep up. Increasing the target's

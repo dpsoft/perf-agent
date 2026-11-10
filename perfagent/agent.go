@@ -1117,6 +1117,10 @@ func logGPUIngestionStats(st gpuprobe.Stats) {
 	if st.SinkRejected > 0 {
 		log.Printf("perf-agent: gpu: sink_rejected=%d event(s) after transport", st.SinkRejected)
 	}
+	if st.StopUnreadBytes > 0 {
+		log.Printf("perf-agent: gpu: stop_unread_bytes=%d ring byte(s) of records accepted before the stop "+
+			"were left unread when the final drain timed out; they are in no drop counter", st.StopUnreadBytes)
+	}
 	if st.StacksEvicted+st.StacksMissing+st.StackLookupFailed+st.SymbolizeFailed+st.StacksUncorrelated+st.StacksProfilerOnly > 0 {
 		log.Printf("perf-agent: gpu: CPU attribution incomplete: stacks_evicted=%d stacks_missing=%d "+
 			"stack_lookup_failed=%d symbolize_failed=%d stacks_uncorrelated=%d stacks_profiler_only=%d -- "+

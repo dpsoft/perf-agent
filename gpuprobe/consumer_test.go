@@ -179,10 +179,45 @@ type scriptedReader struct {
 	done chan struct{}
 	once sync.Once
 	err  atomic.Value
+	// flushed is closed by Flush. Like the real reader, a flushed Read still
+	// returns every queued record before it reports ringbuf.ErrFlushed.
+	flushed   chan struct{}
+	flushOnce sync.Once
+	flushes   atomic.Int32
+	deadlines atomic.Int32
+	// queuedBytes backs AvailableBytes for records queued with push, in ring
+	// bytes as the real reader reports them.
+	queuedBytes atomic.Int64
+	// onFlush, if set, runs inside Flush, before the wake-up.
+	onFlush func()
+	// cap0 is the queued byte count a test started with.
+	cap0 int
 }
 
 func newScriptedReader(n int) *scriptedReader {
-	return &scriptedReader{recs: make(chan []byte, n), done: make(chan struct{})}
+	return &scriptedReader{recs: make(chan []byte, n), done: make(chan struct{}), flushed: make(chan struct{})}
+}
+
+// push queues a record and accounts its bytes for AvailableBytes.
+func (r *scriptedReader) push(b []byte) {
+	r.queuedBytes.Add(int64(ringRecordBytes(len(b))))
+	r.recs <- b
+}
+
+func (r *scriptedReader) Flush() error {
+	r.flushes.Add(1)
+	if r.onFlush != nil {
+		r.onFlush()
+	}
+	r.flushOnce.Do(func() { close(r.flushed) })
+	return nil
+}
+
+func (r *scriptedReader) AvailableBytes() int { return int(r.queuedBytes.Load()) }
+
+func (r *scriptedReader) take(b []byte) ringbuf.Record {
+	r.queuedBytes.Add(-int64(ringRecordBytes(len(b))))
+	return ringbuf.Record{RawSample: b}
 }
 
 func (r *scriptedReader) stop(err error) {
@@ -197,17 +232,36 @@ func (r *scriptedReader) Read() (ringbuf.Record, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	select {
-	case b := <-r.recs:
-		return ringbuf.Record{RawSample: b}, nil
 	case <-r.done:
 		err, _ := r.err.Load().(error)
 		return ringbuf.Record{}, err
+	default:
+	}
+	select {
+	case b := <-r.recs:
+		return r.take(b), nil
+	default:
+	}
+	select {
+	case b := <-r.recs:
+		return r.take(b), nil
+	case <-r.done:
+		err, _ := r.err.Load().(error)
+		return ringbuf.Record{}, err
+	case <-r.flushed:
+		select {
+		case b := <-r.recs:
+			return r.take(b), nil
+		default:
+			return ringbuf.Record{}, ringbuf.ErrFlushed
+		}
 	}
 }
 
 // SetDeadline blocks behind a read in progress, as the real one does. Calling
 // it to cancel a blocked Run is the deadlock this models.
 func (r *scriptedReader) SetDeadline(time.Time) {
+	r.deadlines.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stop(os.ErrDeadlineExceeded)

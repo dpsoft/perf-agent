@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -443,7 +444,18 @@ type Config struct {
 	// size -- the kernel rejects anything else, so it is rounded up and
 	// validated here rather than failing deep in the verifier.
 	EventRingBytes int
+
+	// StopDrainTimeout bounds how long Run keeps reading, once its context
+	// ends, to deliver records the probes had already written. Zero means
+	// defaultStopDrainTimeout. What is still unread when it expires is
+	// counted in Stats.StopUnreadBytes, not dropped silently.
+	StopDrainTimeout time.Duration
 }
+
+// defaultStopDrainTimeout is long enough to drain a full 64 MB ring at the
+// consumer's measured rate under symbolization pressure, and short enough
+// that a wedged consumer cannot hold shutdown for long.
+const defaultStopDrainTimeout = 5 * time.Second
 
 const (
 	// defaultSampledStackCapacity bounds the parked-stack side table. A
@@ -519,6 +531,16 @@ type Stats struct {
 	SequenceStale uint64
 	// SinkRejected counts events the sink refused (full, or invalid).
 	SinkRejected uint64
+	// StopDrainedBatches counts batches read after the capture boundary:
+	// written by a probe before Run's context ended, delivered by the final
+	// drain. They are part of the capture, not extra.
+	StopDrainedBatches uint64
+	// StopUnreadBytes is what the ring still held, in bytes of ring records,
+	// when the final drain hit Config.StopDrainTimeout. Those records were
+	// accepted by BPF, so they are in no drop counter; this is the only place
+	// they are counted. Bytes, not records or executions: the ring is not
+	// parsed to count them.
+	StopUnreadBytes uint64
 	// Undecoded counts records of a kind this phase carries on the wire but
 	// does not decode at all. EVERY kind the ABI defines now has an applyBatch
 	// arm: launches, executions, sampled launches, kernel names, module loads,
@@ -1554,6 +1576,13 @@ type batchReader interface {
 	Read() (ringbuf.Record, error)
 	SetDeadline(t time.Time)
 	Close() error
+	// Flush wakes a blocked Read without taking the reader's mutex; Read then
+	// returns every record already in the ring, followed by
+	// ringbuf.ErrFlushed.
+	Flush() error
+	// AvailableBytes is how much the ring holds unread. Safe concurrently
+	// with Read; not after Close.
+	AvailableBytes() int
 }
 
 // stackStore is the slice of *ebpf.Map that sampled-stack resolution uses:
@@ -1569,10 +1598,18 @@ type stackStore interface {
 // Consumer owns the loaded BPF objects, the uprobe_multi link and the
 // ringbuf reader for one shim.
 type Consumer struct {
-	cfg    Config
-	objs   gpuusdtObjects
-	links  []link.Link
-	reader batchReader
+	cfg  Config
+	objs gpuusdtObjects
+	// links is guarded by linksMu, not mu: the stop detaches the probes
+	// while Run may hold mu applying a batch, and the boundary must not wait
+	// for that batch's symbolization.
+	linksMu sync.Mutex
+	links   []link.Link
+	reader  batchReader
+	// stopDeadline is zero while the capture runs. Once Run's context ends
+	// it holds the UnixNano by which the final drain must finish; see
+	// beginStop.
+	stopDeadline atomic.Int64
 	// stacks is c.objs.GpuStacks behind the stackStore seam. Nil when no BPF
 	// objects were loaded (every unit test), which makes every resolution
 	// count as StackLookupFailed rather than panic.
@@ -2156,18 +2193,20 @@ func (c *Consumer) correlationOf(pid uint32, v uint64) gpu.CorrelationID {
 // Run reads batches until the context is cancelled or the consumer is
 // closed. It is not safe to call Run more than once concurrently.
 func (c *Consumer) Run(ctx context.Context) error {
-	// Cancellation closes the reader. It cannot use SetDeadline:
-	// ringbuf.(*Reader).ReadInto takes the reader's own mutex and holds it
-	// for the entire blocking loop, epoll wait included, while SetDeadline
-	// wants that same mutex — so a deadline set on a *blocked* reader parks
-	// forever behind the read it was supposed to interrupt, and nothing is
-	// ever woken. Close is the documented interrupt ("It interrupts calls to
-	// Read"), and it works precisely because it closes the poller BEFORE
-	// acquiring the mutex. It is also idempotent: once the poller is closed a
-	// second Close returns nil, so Consumer.Close remains safe afterwards.
-	// The read then fails with ringbuf.ErrClosed, which the loop below treats
-	// as a clean exit.
-	stop := context.AfterFunc(ctx, func() { _ = c.reader.Close() })
+	// Cancellation is the capture boundary. beginStop detaches the probes so
+	// nothing more is produced, then wakes the reader with Flush, and the
+	// loop below keeps reading until the ring is empty (ringbuf.ErrFlushed)
+	// or the drain deadline passes.
+	//
+	// It cannot use SetDeadline: ringbuf.(*Reader).ReadInto takes the
+	// reader's own mutex and holds it for the entire blocking loop, epoll
+	// wait included, while SetDeadline wants that same mutex — so a deadline
+	// set on a *blocked* reader parks forever behind the read it was supposed
+	// to interrupt, and nothing is ever woken. Flush, like Close, signals the
+	// poller without taking that mutex, so it wakes a blocked read too.
+	// Consumer.Close still closes the reader directly; the read then fails
+	// with ringbuf.ErrClosed, which the loop treats as a clean exit.
+	stop := context.AfterFunc(ctx, c.beginStop)
 	defer stop()
 	// Nothing more will arrive once this loop ends, so no held launch can
 	// still gain a stack. Releasing here (and not only in Close) is what
@@ -2178,10 +2217,20 @@ func (c *Consumer) Run(ctx context.Context) error {
 	for {
 		rec, err := c.reader.Read()
 		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil {
+			if errors.Is(err, ringbuf.ErrFlushed) || errors.Is(err, ringbuf.ErrClosed) ||
+				errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil {
 				return nil
 			}
 			return err
+		}
+		if d := c.stopDeadline.Load(); d != 0 {
+			if time.Now().UnixNano() > d {
+				c.abandonDrain(len(rec.RawSample))
+				return nil
+			}
+			c.mu.Lock()
+			c.stats.StopDrainedBatches++
+			c.mu.Unlock()
 		}
 		b, err := decodeBatch(rec.RawSample)
 		if err != nil {
@@ -3375,6 +3424,70 @@ func (c *Consumer) sumPerKind(m *ebpf.Map) uint64 {
 // Close releases the ringbuf reader, the links and the BPF objects. It is
 // safe to call on a partially constructed Consumer, on a nil one, and more
 // than once.
+// beginStop marks the capture boundary: once it returns, no probe will write
+// another record. It runs once, on Run's context ending.
+//
+// The links go first. Closing a uprobe_multi link unregisters its probes and
+// waits for handlers already running, so every record accepted before the
+// boundary is in the ring, every drop the BPF side will ever count has been
+// counted, and the `dropped` and `stacks_missing` maps read the same however
+// much later Stats is called. Leaving the probes attached until Close let a
+// target that kept running fill an unread ring, and charged those drops to
+// the capture.
+//
+// Then Flush wakes the reader, which returns what the ring holds and then
+// ringbuf.ErrFlushed. If Flush fails the reader is closed instead, so
+// shutdown never waits on a read that nothing will wake.
+func (c *Consumer) beginStop() {
+	c.stopDeadline.Store(time.Now().Add(c.stopDrainTimeout()).UnixNano())
+	_ = c.detach()
+	if err := c.reader.Flush(); err != nil {
+		c.abandonDrain(0)
+	}
+}
+
+func (c *Consumer) stopDrainTimeout() time.Duration {
+	if c.cfg.StopDrainTimeout > 0 {
+		return c.cfg.StopDrainTimeout
+	}
+	return defaultStopDrainTimeout
+}
+
+// detach closes the probe links. Idempotent and safe concurrently with
+// itself.
+func (c *Consumer) detach() error {
+	c.linksMu.Lock()
+	defer c.linksMu.Unlock()
+	var errs []error
+	for _, l := range c.links {
+		errs = append(errs, l.Close())
+	}
+	c.links = nil
+	return errors.Join(errs...)
+}
+
+// ringRecordBytes is the ring space one record of n payload bytes occupies:
+// the kernel's 8-byte record header plus the payload rounded up to 8. It
+// puts a record already read in the same unit as Reader.AvailableBytes.
+func ringRecordBytes(n int) int {
+	const hdr = 8
+	return hdr + (n+7)&^7
+}
+
+// abandonDrain gives up on the final drain: what the ring still holds, plus
+// the record in hand that will not be applied, is counted in bytes, and the
+// reader is closed so Run returns.
+func (c *Consumer) abandonDrain(inHand int) {
+	unread := c.reader.AvailableBytes()
+	if inHand > 0 {
+		unread += ringRecordBytes(inHand)
+	}
+	c.mu.Lock()
+	c.stats.StopUnreadBytes += uint64(unread)
+	c.mu.Unlock()
+	_ = c.reader.Close()
+}
+
 func (c *Consumer) Close() error {
 	// Nil-receiver safe: Attach's cleanup defer runs on whatever the named
 	// result holds, and a caller that kept a nil *Consumer from a failed
@@ -3424,10 +3537,7 @@ func (c *Consumer) Close() error {
 	// `dropped` map, cannot be looking at c.objs while it is being closed.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, l := range c.links {
-		errs = append(errs, l.Close())
-	}
-	c.links = nil
+	errs = append(errs, c.detach())
 	errs = append(errs, c.objs.Close())
 	return errors.Join(errs...)
 }

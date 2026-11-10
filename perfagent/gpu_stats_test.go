@@ -51,6 +51,14 @@ func TestUnreadableGPUDropCountersDoNotLookHealthy(t *testing.T) {
 	require.Contains(t, buf.String(), "drop accounting incomplete: 2 BPF counter slot(s) unreadable")
 }
 
+func TestGPUStopUnreadBytesAreReportedInBytes(t *testing.T) {
+	buf := captureLog(t)
+	logGPUIngestionStats(gpuprobe.Stats{StopUnreadBytes: 4096})
+	require.Contains(t, buf.String(), "stop_unread_bytes=4096 ring byte(s)")
+	require.Contains(t, buf.String(), "in no drop counter")
+	require.NotContains(t, buf.String(), "kernel_dropped=")
+}
+
 func TestGPUSequenceGapDoesNotClaimKnownRecordCount(t *testing.T) {
 	buf := captureLog(t)
 	logGPUIngestionStats(gpuprobe.Stats{SequenceGaps: 1, SequenceReordered: 4, SequenceStale: 2})

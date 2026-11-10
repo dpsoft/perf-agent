@@ -3,6 +3,7 @@ package gpuprofile
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,15 @@ func drainOnly(t *testing.T, capacity int) (*Profiler, *gpu.Timeline) {
 }
 
 func drainOnlyWith(t *testing.T, capacity int, cfg Config) (*Profiler, *gpu.Timeline) {
+	t.Helper()
+	consumerDone := make(chan struct{})
+	close(consumerDone) // no consumer to wait for
+	return drainBehind(t, capacity, cfg, consumerDone)
+}
+
+// drainBehind starts the drain loop behind a consumer that is done when the
+// test closes consumerDone.
+func drainBehind(t *testing.T, capacity int, cfg Config, consumerDone <-chan struct{}) (*Profiler, *gpu.Timeline) {
 	t.Helper()
 	cfg.DrainEvery = time.Hour
 	store := gpu.NewModuleStore(gpu.ModuleStoreConfig{})
@@ -46,8 +56,6 @@ func drainOnlyWith(t *testing.T, capacity int, cfg Config) (*Profiler, *gpu.Time
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
-	consumerDone := make(chan struct{})
-	close(consumerDone) // no consumer to wait for
 	go func() {
 		defer close(p.done)
 		p.drainLoop(ctx, consumerDone)
@@ -144,5 +152,33 @@ func TestStopProjectsACaptureShorterThanOneInterval(t *testing.T) {
 	p.Stop()
 	if got := p.Samples(); got != 3 {
 		t.Errorf("%d samples after Stop, want 3", got)
+	}
+}
+
+// Executions the consumer delivers after the stop -- its final drain of the
+// ring -- are drained as the timeline fills, not evicted. The drain loop used
+// to wait for the consumer without draining, so a final drain larger than the
+// timeline lost everything past its capacity.
+func TestTheFinalConsumerDrainIsDrainedBeforeItEvicts(t *testing.T) {
+	const capacity = 64
+	consumerDone := make(chan struct{})
+	p, tl := drainBehind(t, capacity, Config{}, consumerDone)
+	finish := sync.OnceFunc(func() { close(consumerDone) })
+	t.Cleanup(finish) // runs before drainBehind's Stop, even on t.Fatal
+
+	p.cancel() // the capture boundary; the consumer is still draining its ring
+	start := execSeq
+	for range 10 {
+		emitExecs(t, tl, capacity/2)
+		waitSamples(t, p, execSeq-start)
+	}
+	finish()
+	p.Stop()
+
+	if d := p.Dropped(); d.EvictedExecutions != 0 {
+		t.Errorf("%d executions evicted, want 0", d.EvictedExecutions)
+	}
+	if got := p.Samples(); got != execSeq-start {
+		t.Errorf("%d samples, want one per execution: %d", got, execSeq-start)
 	}
 }

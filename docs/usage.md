@@ -84,6 +84,12 @@ At shutdown, GPU diagnostics distinguish several kinds of incomplete data:
 - `sink_rejected` counts events rejected after transport. Timeline eviction
   has a separate message for executions, events and modules evicted before
   profile projection.
+- `stop_unread_bytes` counts **ring bytes** that were still unread when the
+  final drain timed out (5 s). The capture ends when the profiler stops: the
+  GPU probes are detached at that moment, so these counters do not change
+  afterwards. Records that BPF had already accepted are then drained into the
+  profile. Anything the drain could not reach in time is reported here, and it
+  is in no drop counter.
 
 `--gpu-ring-bytes` can absorb larger bursts, at the cost of memory, but cannot
 make a continuously overloaded consumer keep up. Increasing the target's

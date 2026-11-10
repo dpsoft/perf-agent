@@ -272,11 +272,21 @@ func (p *Profiler) drainLoop(ctx context.Context, consumerDone <-chan struct{}) 
 	for {
 		select {
 		case <-ctx.Done():
-			<-consumerDone
-			// One last drain after the consumer has stopped, so GPU time
-			// that arrived inside the final interval is not discarded.
-			p.drain()
-			return
+			// The consumer is still delivering what the probes wrote before
+			// the stop, which can be more than the timeline holds, so the
+			// pressure drains continue until it is done.
+			for {
+				select {
+				case <-consumerDone:
+					// One last drain after the consumer has stopped, so GPU
+					// time that arrived inside the final interval is not
+					// discarded.
+					p.drain()
+					return
+				case <-pressure:
+					p.drain()
+				}
+			}
 		case <-ticker.C:
 			p.drain()
 		case <-pressure:

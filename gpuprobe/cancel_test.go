@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -99,4 +100,107 @@ func TestCancelInterruptsARealBlockedRingbufRead(t *testing.T) {
 	// maps an already-closed poller to nil.
 	assert.NoError(t, c.Close())
 	assert.NoError(t, c.Close(), "Close is idempotent")
+}
+
+// ringbufWriter loads a socket filter whose only job is bpf_ringbuf_output of
+// a zeroed 32-byte record into m. Test-running it n times fills the ring as a
+// probe would, with no uprobe and no target process.
+func ringbufWriter(t *testing.T, m *ebpf.Map) *ebpf.Program {
+	t.Helper()
+	const size = 32
+	// asm has no 64-bit store-immediate, so zero a register and store it.
+	insns := asm.Instructions{asm.Mov.Imm(asm.R0, 0)}
+	for off := int16(-size); off < 0; off += 8 {
+		insns = append(insns, asm.StoreMem(asm.R10, off, asm.R0, asm.DWord))
+	}
+	insns = append(insns,
+		asm.LoadMapPtr(asm.R1, m.FD()),
+		asm.Mov.Reg(asm.R2, asm.R10),
+		asm.Add.Imm(asm.R2, -size),
+		asm.Mov.Imm(asm.R3, size),
+		asm.Mov.Imm(asm.R4, 0),
+		asm.FnRingbufOutput.Call(),
+		asm.Mov.Imm(asm.R0, 0),
+		asm.Return(),
+	)
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type:         ebpf.SocketFilter,
+		Instructions: insns,
+		License:      "GPL",
+	})
+	require.NoError(t, err, "load ringbuf writer")
+	t.Cleanup(func() { _ = prog.Close() })
+	return prog
+}
+
+func fillRing(t *testing.T, prog *ebpf.Program, n int) {
+	t.Helper()
+	_, err := prog.Run(&ebpf.RunOptions{Data: make([]byte, 14), Repeat: uint32(n)})
+	require.NoError(t, err, "test-run ringbuf writer")
+}
+
+// The stop against the real reader: records already in the ring when Run's
+// context ends are delivered (Flush, then ErrFlushed once empty), not
+// discarded by a Close. Each zeroed record fails to decode and is counted
+// Malformed, which is enough to count what was read.
+func TestStopDrainsARealBackloggedRing(t *testing.T) {
+	if !hasBPFCaps() {
+		t.Skip("needs CAP_BPF to create a ringbuf and load a program; setcap the test binary")
+	}
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Name: "stop_test", Type: ebpf.RingBuf, MaxEntries: 1 << 20})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	const n = 10_000
+	fillRing(t, ringbufWriter(t, m), n)
+
+	rd, err := ringbuf.NewReader(m)
+	require.NoError(t, err)
+	require.Equal(t, n*ringRecordBytes(32), rd.AvailableBytes(), "ring bytes per record")
+	c := newTestConsumer(&recordingSink{})
+	c.reader = rd
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not finish the drain")
+	}
+
+	st := c.Stats()
+	assert.Equal(t, uint64(n), st.Batches+st.Malformed, "every record in the ring was read")
+	assert.Zero(t, st.StopUnreadBytes)
+	assert.NoError(t, c.Close())
+}
+
+// A drain cut short by its timeout counts exactly what it left in the ring,
+// in the reader's own unit.
+func TestStopTimeoutCountsTheRealRingRemainder(t *testing.T) {
+	if !hasBPFCaps() {
+		t.Skip("needs CAP_BPF to create a ringbuf and load a program; setcap the test binary")
+	}
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Name: "stop_test", Type: ebpf.RingBuf, MaxEntries: 1 << 20})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	const n = 10_000
+	fillRing(t, ringbufWriter(t, m), n)
+
+	rd, err := ringbuf.NewReader(m)
+	require.NoError(t, err)
+	c := newConsumer(Config{Sink: &recordingSink{}, StopDrainTimeout: time.Nanosecond})
+	c.reader = rd
+
+	// The deadline is set before Run reads anything, so it is already past
+	// when the first record arrives.
+	c.stopDeadline.Store(time.Now().UnixNano())
+	require.NoError(t, c.Run(context.Background()))
+
+	st := c.Stats()
+	read := st.Batches + st.Malformed
+	assert.Equal(t, uint64(n*ringRecordBytes(32)), read*uint64(ringRecordBytes(32))+st.StopUnreadBytes)
+	assert.Less(t, read, uint64(n))
+	assert.NoError(t, c.Close())
 }

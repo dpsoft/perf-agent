@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#241](https://github.com/dpsoft/perf-agent/issues/241)). A batch is a gap
   only when it never arrives within a bounded reorder window. The shutdown line
   also reports `reordered` and `stale`.
+- Stopping a GPU capture now ends it at the stop
+  ([#242](https://github.com/dpsoft/perf-agent/issues/242)). The probes are
+  detached immediately, instead of at final cleanup after the profile is
+  written. Records already in the ring are drained into the profile, instead
+  of being discarded by closing the reader. The drain is bounded, and anything
+  it leaves behind is reported as `stop_unread_bytes`. Drop counters read
+  after the stop no longer include activity from after the capture.
 
 ## [1.5.0] - 2026-11-05
 

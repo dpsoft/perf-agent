@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being discarded by closing the reader. The drain is bounded, and anything
   it leaves behind is reported as `stop_unread_bytes`. Drop counters read
   after the stop no longer include activity from after the capture.
+- Most sampled GPU launches arrived without a CPU stack under a heavy launch
+  rate ([#244](https://github.com/dpsoft/perf-agent/issues/244)). The consumer
+  spent most of its time symbolizing one stack per sampled launch, and
+  `gpu_stacks` filled while entries waited to be freed. A launch whose call
+  path was symbolized in the last 2 s now reuses that result. On an RTX 3090
+  at about 280k sampled launches per 4 s, stacks attached went from 19% to
+  100%, and the consumer's CPU dropped from 3.9 s to 1.7 s per 4 s window.
+  `--gpu-stack-memo` sizes or disables it, and the shutdown log now says why
+  stacks were missing.
 
 ## [1.5.0] - 2026-11-05
 

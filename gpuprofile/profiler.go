@@ -79,6 +79,9 @@ type Config struct {
 	// compiled-in default, which is sized for a default-period capture.
 	EventRingBytes int
 
+	// StackMemoEntries is gpuprobe.Config.StackMemoEntries.
+	StackMemoEntries int
+
 	// PerExecutionSamples keeps one pprof sample per projected execution,
 	// each labelled with its gpu_correlation, so a profile can be filtered to
 	// a single kernel execution (pprof -tagfocus). It costs memory per kernel.
@@ -213,6 +216,7 @@ func New(cfg Config) (*Profiler, error) {
 		Modules:                   store,
 		KeepInstrumentationFrames: cfg.KeepInstrumentationFrames,
 		EventRingBytes:            cfg.EventRingBytes,
+		StackMemoEntries:          cfg.StackMemoEntries,
 	})
 	if err != nil {
 		if execLog != nil {

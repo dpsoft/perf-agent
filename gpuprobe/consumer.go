@@ -450,6 +450,14 @@ type Config struct {
 	// defaultStopDrainTimeout. What is still unread when it expires is
 	// counted in Stats.StopUnreadBytes, not dropped silently.
 	StopDrainTimeout time.Duration
+
+	// StackMemoEntries bounds the memo of symbolized sampled-launch stacks
+	// (see stackMemo). Zero means defaultStackMemoEntries; negative disables
+	// it, so every capture goes to the symbolizer.
+	StackMemoEntries int
+	// StackMemoTTL is how long a memoized stack is trusted. Zero means
+	// defaultStackMemoTTL.
+	StackMemoTTL time.Duration
 }
 
 // defaultStopDrainTimeout is long enough to drain a full 64 MB ring at the
@@ -1085,6 +1093,15 @@ type Stats struct {
 	//     fallback (see symbolize.LocalSymbolizer.SymbolizeProcess).
 	//   - The binary genuinely has no symbol table.
 	StacksUnresolved uint64
+	// StackMemoHits and StackMemoMisses count sampled-launch stacks served
+	// from the symbolized-stack memo and stacks that had to be symbolized.
+	// StackMemoExpired counts entries found past their TTL (a subset of the
+	// misses), and StackMemoClears how many times the memo filled and was
+	// emptied. See stackMemo.
+	StackMemoHits    uint64
+	StackMemoMisses  uint64
+	StackMemoExpired uint64
+	StackMemoClears  uint64
 	// StackFramesUnresolved counts individual frames — one per captured
 	// instruction pointer — that came back named after their own address.
 	// Unlike StacksUnresolved this is expected to be non-zero in normal
@@ -1643,10 +1660,12 @@ type Consumer struct {
 
 	mu          sync.Mutex
 	seqByStream map[seqKey]*seqStream
-	pending     *pendingStacks
-	deferred    *deferredLaunches
-	names       *kernelNameTable
-	unnamed     *pendingNames
+	// memo is the symbolized-stack memo. Nil when disabled.
+	memo     *stackMemo
+	pending  *pendingStacks
+	deferred *deferredLaunches
+	names    *kernelNameTable
+	unnamed  *pendingNames
 	// stalls and unresolvedStalls are the stall-reason twins of names and
 	// unnamed: the bounded stall_index -> name table, and the bounded FIFO
 	// of PC samples held until their index resolves. See stallnames.go.
@@ -1688,6 +1707,7 @@ func newConsumer(cfg Config) *Consumer {
 		shim:        newShimScope(cfg.ShimPath),
 		instr:       newInstrumentationBand(newShimScope(cfg.ShimPath), cfg.KeepInstrumentationFrames),
 		seqByStream: map[seqKey]*seqStream{},
+		memo:        newStackMemo(cfg.StackMemoEntries, cfg.StackMemoTTL),
 		pending:     newPendingStacks(cfg.SampledStackCapacity),
 		deferred:    newDeferredLaunches(cfg.DeferredLaunchCapacity),
 		names:       newKernelNameTable(cfg.KernelNameCapacity),
@@ -3019,11 +3039,20 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 
 	var frames []symbolize.Frame
 	if len(native) > 0 {
-		var err error
-		frames, err = c.cfg.Symbolizer.SymbolizeProcess(pid, native)
-		if err != nil {
-			c.stats.SymbolizeFailed++
-			return nil, false
+		now := time.Now().UnixNano()
+		var hit bool
+		// A memoized slice is shared: everything below only reads frames,
+		// and ToProfFrames copies them out.
+		if frames, hit = c.memo.get(pid, native, now); !hit {
+			var err error
+			frames, err = c.cfg.Symbolizer.SymbolizeProcess(pid, native)
+			if err != nil {
+				c.stats.SymbolizeFailed++
+				return nil, false
+			}
+			if len(frames) == len(native) {
+				c.memo.put(pid, native, frames, now)
+			}
 		}
 	}
 	// Symbolization that returns a frame per IP and resolves not one name is
@@ -3323,6 +3352,10 @@ func (c *Consumer) Stats() Stats {
 	defer c.mu.Unlock()
 	out := c.stats
 	c.seqStatsLocked(&out)
+	if c.memo != nil {
+		out.StackMemoHits, out.StackMemoMisses = c.memo.hits, c.memo.misses
+		out.StackMemoExpired, out.StackMemoClears = c.memo.expired, c.memo.clears
+	}
 	out.DecodeFailures = c.decodeFailures.snapshot()
 	out.DecodeReasonsUnrecorded = c.decodeFailures.unrecorded
 	out.KernelDroppedByKind, out.KernelDropReadErrors = readKindCounts(c.objs.Dropped)

@@ -26,6 +26,14 @@ blazesym-check:
 		echo "*** pull blazesym to a commit ≥ 29a609f"; \
 		exit 1; \
 	fi
+	@want=$$(cat .blazesym-ref); have=$$(git -C $(LIBBLAZESYM_SRC) describe --tags --exact-match 2>/dev/null); \
+	if [ "$$have" != "$$want" ]; then \
+		echo "*** warning: blazesym at $(LIBBLAZESYM_SRC) is $${have:-not at a tag}; CI and release build $$want (.blazesym-ref)"; \
+	fi
+	@if [ -f $(LIBBLAZESYM_OBJ) ] && ! grep -qa lzma_auto_decoder $(LIBBLAZESYM_OBJ); then \
+		echo "*** warning: $(LIBBLAZESYM_OBJ) was built without xz, so MiniDebugInfo is unreadable;"; \
+		echo "*** rebuild with: LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz"; \
+	fi
 
 # Keep blazesym static even when its build directory also contains a .so.
 # The process itself must remain dynamically linked so NVML can use dlopen.

@@ -65,7 +65,7 @@ jobs:
     
     - name: Build and install blazesym
       run: |
-        git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+        git clone --depth 1 --branch "$(cat .blazesym-ref)" https://github.com/libbpf/blazesym.git /tmp/blazesym
         cd /tmp/blazesym
         echo "Building blazesym C bindings package..."
         LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz

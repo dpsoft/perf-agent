@@ -60,7 +60,7 @@ jobs:
 
       - name: Build and install blazesym
         run: |
-          git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+          git clone --depth 1 --branch "$(cat .blazesym-ref)" https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings
@@ -285,7 +285,7 @@ jobs:
 
       - name: Build and install blazesym
         run: |
-          git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+          git clone --depth 1 --branch "$(cat .blazesym-ref)" https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           sudo mkdir -p /usr/local/include /usr/local/lib
@@ -433,7 +433,7 @@ jobs:
 
       - name: Build and install blazesym
         run: |
-          git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+          git clone --depth 1 --branch "$(cat .blazesym-ref)" https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings
@@ -577,7 +577,7 @@ jobs:
 
       - name: Build and install blazesym
         run: |
-          git clone https://github.com/libbpf/blazesym.git /tmp/blazesym
+          git clone --depth 1 --branch "$(cat .blazesym-ref)" https://github.com/libbpf/blazesym.git /tmp/blazesym
           cd /tmp/blazesym
           LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
           # Install headers and library for official Go bindings

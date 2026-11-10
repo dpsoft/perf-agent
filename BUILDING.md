@@ -24,12 +24,14 @@ sudo apt-get install -y clang llvm libelf-dev linux-headers-$(uname -r)
 
 perf-agent uses the official Go bindings from `github.com/libbpf/blazesym/go`. You need to build the blazesym C library before building perf-agent.
 
+Use the blazesym release named in `.blazesym-ref`, the one CI, release binaries and container images are built with. `make build` warns when your checkout is at another ref, or when the library was built without xz (MiniDebugInfo).
+
 ### Option 1: Local Development Setup
 
 ```bash
 # Clone blazesym to your preferred location
 cd ~/github  # or any directory you prefer
-git clone https://github.com/libbpf/blazesym.git
+git clone --branch "$(cat /path/to/perf-agent/.blazesym-ref)" https://github.com/libbpf/blazesym.git
 cd blazesym
 
 # Build the C library
@@ -49,7 +51,7 @@ go build .
 
 ```bash
 # Clone and build
-git clone https://github.com/libbpf/blazesym.git
+git clone --branch "$(cat /path/to/perf-agent/.blazesym-ref)" https://github.com/libbpf/blazesym.git
 cd blazesym
 LZMA_API_STATIC=1 cargo build --release --package blazesym-c --features blazesym/xz
 

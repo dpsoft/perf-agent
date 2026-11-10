@@ -108,9 +108,10 @@ func TestCancelInterruptsARealBlockedRingbufRead(t *testing.T) {
 func ringbufWriter(t *testing.T, m *ebpf.Map) *ebpf.Program {
 	t.Helper()
 	const size = 32
-	insns := asm.Instructions{}
+	// asm has no 64-bit store-immediate, so zero a register and store it.
+	insns := asm.Instructions{asm.Mov.Imm(asm.R0, 0)}
 	for off := int16(-size); off < 0; off += 8 {
-		insns = append(insns, asm.StoreImm(asm.R10, off, 0, asm.DWord))
+		insns = append(insns, asm.StoreMem(asm.R10, off, asm.R0, asm.DWord))
 	}
 	insns = append(insns,
 		asm.LoadMapPtr(asm.R1, m.FD()),

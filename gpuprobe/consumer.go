@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -3050,7 +3051,11 @@ func (c *Consumer) resolveStackLocked(pid uint32, stackID int32) ([]pp.Frame, bo
 				c.stats.SymbolizeFailed++
 				return nil, false
 			}
-			if len(frames) == len(native) {
+			// A batch the symbolizer failed comes back as address-only frames
+			// with no error, and a later call may resolve it, so a stack with
+			// no resolved frame is not remembered. A partly resolved one is:
+			// a library without symbols stays unresolved on every call.
+			if len(frames) == len(native) && slices.ContainsFunc(frames, frameResolved) {
 				c.memo.put(pid, native, frames, now)
 			}
 		}

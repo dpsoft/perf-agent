@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-10
+
+A patch release for `--gpu` under a heavy launch rate. Batches that arrived out
+of order were counted as lost, stopping a capture discarded what the probes had
+already written, and most sampled launches lost their CPU stack while the
+consumer was busy symbolizing. On an RTX 3090, a capture of exactly 4 million
+launches now attaches a CPU stack to all 499,928 sampled launches instead of
+about 14%, with the agent using about 170% CPU instead of about 200%.
+
+### Added
+
+- `--gpu-stack-memo N` sets how many symbolized GPU launch stacks are
+  remembered for reuse (default 4096); `-1` turns the memo off.
+
 ### Fixed
 
 - GPU `sequence_gaps` no longer counts batches that arrive out of order as
@@ -20,7 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written. Records already in the ring are drained into the profile, instead
   of being discarded by closing the reader. The drain is bounded, and anything
   it leaves behind is reported as `stop_unread_bytes`. Drop counters read
-  after the stop no longer include activity from after the capture.
+  after the stop no longer include activity from after the capture. On an
+  RTX 3090, a 5 s capture cut in the middle of a 4-million-launch loop kept
+  1.69 to 1.85 million executions in three runs, against about 1.5 million
+  before.
 - Most sampled GPU launches arrived without a CPU stack under a heavy launch
   rate ([#244](https://github.com/dpsoft/perf-agent/issues/244)). The consumer
   spent most of its time symbolizing one stack per sampled launch, and
@@ -30,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   100%, and the consumer's CPU dropped from 3.9 s to 1.7 s per 4 s window.
   `--gpu-stack-memo` sizes or disables it, and the shutdown log now says why
   stacks were missing.
+
+### Known issues
+
+- A CUDA process profiled with `--profile` can still occasionally stop in
+  `cuCtxSynchronize` with the GPU idle, or fail with an NVRM Xid 13 or 31,
+  around the moment the profiler attaches or detaches
+  ([#240](https://github.com/dpsoft/perf-agent/issues/240)). This release does
+  not change it.
 
 ## [1.5.0] - 2026-11-05
 
@@ -553,7 +578,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/dpsoft/perf-agent/compare/v1.3.0...v1.4.0

@@ -1109,9 +1109,10 @@ func logGPUIngestionStats(st gpuprobe.Stats) {
 		log.Printf("perf-agent: gpu: drop accounting incomplete: %d BPF counter slot(s) unreadable", st.KernelDropReadErrors)
 	}
 	if st.SequenceGaps > 0 {
-		log.Printf("perf-agent: gpu: sequence_gaps=%d forward batch-sequence gap(s) observed -- "+
-			"may reflect reordering across threads; record count unknown; "+
-			"may overlap BPF transport losses; not an additional record count", st.SequenceGaps)
+		log.Printf("perf-agent: gpu: sequence_gaps=%d batch(es) never arrived "+
+			"(reordered=%d stale=%d); record count unknown; "+
+			"may overlap BPF transport losses; not an additional record count",
+			st.SequenceGaps, st.SequenceReordered, st.SequenceStale)
 	}
 	if st.SinkRejected > 0 {
 		log.Printf("perf-agent: gpu: sink_rejected=%d event(s) after transport", st.SinkRejected)

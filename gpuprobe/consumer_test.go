@@ -310,15 +310,15 @@ func TestDecodeBatchRejectsCountBeyondPayload(t *testing.T) {
 	require.Error(t, err)
 }
 
-// Gaps in a probe's sequence numbers are losses the consumer did not observe
-// and must not hide (spec §6.1).
+// Positions that never arrive in a probe's sequence are losses the consumer
+// did not observe and must not hide (spec §6.1).
 func TestSequenceGapsAreCounted(t *testing.T) {
 	c := newTestConsumer(&recordingSink{})
 	c.noteSeq(1, 100, 0)
 	c.noteSeq(1, 100, 1)
-	assert.Zero(t, c.stats.SequenceGaps)
+	assert.Zero(t, c.Stats().SequenceGaps)
 	c.noteSeq(1, 100, 5) // 2,3,4 never arrived
-	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
+	assert.Equal(t, uint64(3), c.Stats().SequenceGaps)
 }
 
 // Sequence numbers are per-probe, so a gap on one kind must not be inferred
@@ -329,7 +329,7 @@ func TestSequenceGapsArePerKind(t *testing.T) {
 	c.noteSeq(kindExec, 100, 0)
 	c.noteSeq(kindLaunch, 100, 11)
 	c.noteSeq(kindExec, 100, 1)
-	assert.Zero(t, c.stats.SequenceGaps)
+	assert.Zero(t, c.Stats().SequenceGaps)
 }
 
 // The shim's seq_ counter is per-process, so a system-wide attach
@@ -343,13 +343,13 @@ func TestSequenceGapsArePerProcess(t *testing.T) {
 		c.noteSeq(kindLaunch, 111, seq)
 		c.noteSeq(kindLaunch, 222, seq)
 	}
-	assert.Zero(t, c.stats.SequenceGaps, "independent per-PID streams are not gaps")
+	assert.Zero(t, c.Stats().SequenceGaps, "independent per-PID streams are not gaps")
 
 	// A real gap inside one process is still counted, and only once.
 	c.noteSeq(kindLaunch, 111, 7) // 4,5,6 never arrived
-	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
+	assert.Equal(t, uint64(3), c.Stats().SequenceGaps)
 	c.noteSeq(kindLaunch, 222, 4) // 222 continues cleanly
-	assert.Equal(t, uint64(3), c.stats.SequenceGaps)
+	assert.Equal(t, uint64(3), c.Stats().SequenceGaps)
 }
 
 // applyBatch must take the PID from the batch header, not from Config.

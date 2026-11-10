@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- GPU `sequence_gaps` no longer counts batches that arrive out of order as
+  lost, and no longer counts the same region twice after a late batch
+  ([#241](https://github.com/dpsoft/perf-agent/issues/241)). A batch is a gap
+  only when it never arrives within a bounded reorder window. The shutdown line
+  also reports `reordered` and `stale`.
+
 ## [1.5.0] - 2026-11-05
 
 A GPU release. NVIDIA device telemetry joins the GPU profile: temperature,

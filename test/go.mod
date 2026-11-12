@@ -18,7 +18,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/iovisor/gobpf v0.2.0 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
-	github.com/libbpf/blazesym/go v0.0.0 // indirect
+	github.com/libbpf/blazesym/go v0.0.0-20261028163931-0c8df3ca3e54 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
@@ -33,5 +33,3 @@ require (
 )
 
 replace github.com/dpsoft/perf-agent => ../
-
-replace github.com/libbpf/blazesym/go => /home/diego/github/blazesym/go

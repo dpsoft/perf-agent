@@ -71,10 +71,9 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
-      - name: Configure blazesym Go module
-        run: |
-          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+
+      - name: Check the blazesym Go binding matches the library
+        run: sh scripts/check-blazesym-pin.sh /tmp/blazesym
 
       # A release must not ship notices that no longer match what it links:
       # a dependency bump without regenerating them fails here.

@@ -22,9 +22,18 @@ sudo apt-get install -y clang llvm libelf-dev linux-headers-$(uname -r)
 
 ## Building Blazesym
 
-perf-agent uses the official Go bindings from `github.com/libbpf/blazesym/go`. You need to build the blazesym C library before building perf-agent.
+perf-agent uses the official Go bindings from `github.com/libbpf/blazesym/go`. `go.mod` pins them at the commit of the blazesym release named in `.blazesym-ref`, and Go downloads them like any other module. The C library they call is not a Go module, so you need to build it before building perf-agent.
 
-Use the blazesym release named in `.blazesym-ref`, the one CI, release binaries and container images are built with. `make build` warns when your checkout is at another ref, or when the library was built without xz (MiniDebugInfo).
+Build the library from that same release. CI, release binaries and container images all use it, and `scripts/check-blazesym-pin.sh` fails CI when `go.mod` and `.blazesym-ref` name different commits. `make build` warns when your checkout is at another ref, or when the library was built without xz (MiniDebugInfo).
+
+`make` looks for the checkout next to the main perf-agent checkout (`../blazesym`, also from a linked worktree). Point it elsewhere with `make LIBBLAZESYM_SRC=/path/to/blazesym`.
+
+To build against a modified blazesym Go binding, use a Go workspace instead of editing `go.mod`. `go.work` is not committed:
+
+```bash
+go work init . ./test
+go work use /path/to/blazesym/go
+```
 
 ### Option 1: Local Development Setup
 

@@ -30,7 +30,7 @@ The Go standard library and runtime are covered by the Go license, BSD-3-Clause
 | github.com/grpc-ecosystem/grpc-gateway/v2 | v2.30.0 | `third_party/licenses/go/github.com/grpc-ecosystem/grpc-gateway/v2/`: `LICENSE` |
 | github.com/iovisor/gobpf | v0.2.0 | `third_party/licenses/go/github.com/iovisor/gobpf/`: `COPYRIGHT.txt` `LICENSE-bpf.txt` `LICENSE.txt` |
 | github.com/klauspost/compress | v1.18.5 | `third_party/licenses/go/github.com/klauspost/compress/`: `LICENSE` |
-| github.com/libbpf/blazesym/go | blazesym capi-v0.1.11 | `third_party/licenses/go/github.com/libbpf/blazesym/go/`: `LICENSE` |
+| github.com/libbpf/blazesym/go | v0.0.0-20261028163931-0c8df3ca3e54 | `third_party/licenses/go/github.com/libbpf/blazesym/go/`: `LICENSE` |
 | github.com/remyoudompheng/bigfft | v0.0.0-20230129092748-24d4a6f8daec | `third_party/licenses/go/github.com/remyoudompheng/bigfft/`: `LICENSE` |
 | github.com/ulikunitz/xz | v0.5.17 | `third_party/licenses/go/github.com/ulikunitz/xz/`: `LICENSE` |
 | go.opentelemetry.io/auto/sdk | v1.2.1 | `third_party/licenses/go/go.opentelemetry.io/auto/sdk/`: `LICENSE` |

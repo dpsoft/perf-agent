@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `go.mod` and `test/go.mod` require the blazesym Go binding at the commit of
+  `.blazesym-ref` from the module proxy instead of replacing it with a path on
+  a developer's machine. A fresh checkout now resolves its modules, CI and
+  the agent image no longer rewrite `go.mod` before building, and a check
+  fails when `go.mod` and `.blazesym-ref` name different commits. `make`
+  finds blazesym next to the main checkout unless `LIBBLAZESYM_SRC` is set.
 - The eBPF programs in `bpf/` are declared GPL-2.0-only in `bpf/LICENSE` and
   `bpf/LICENSING.md`, which matches the `GPL` license they already declared to
   the kernel. The rest of the project remains Apache-2.0.

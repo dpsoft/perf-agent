@@ -84,6 +84,12 @@ jobs:
         go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
         cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+    # THIRD_PARTY_NOTICES.md and third_party/licenses/ are generated from the
+    # modules and crates the release links. A dependency change that does not
+    # regenerate them fails here rather than at release time.
+    - name: Check third-party notices
+      run: BLAZESYM_SRC=/tmp/blazesym scripts/third-party-notices.sh --check
+
     - name: "Fingerprint the BPF toolchain (issue #87)"
       # Diagnostic only. Never fails the job.
       #
@@ -314,8 +320,22 @@ jobs:
           docker run --rm --entrypoint sh perf-agent-shim:ci -c \
             'test -s /usr/local/lib/libperfagent-gpu-nvidia.so && echo present'
 
+      - name: The shim image carries its license notices
+        run: |
+          docker run --rm --entrypoint sh perf-agent-shim:ci -c '
+            d=/usr/share/licenses/perf-agent
+            test -s $d/LICENSE && test -s $d/THIRD_PARTY_NOTICES.md \
+              && test -s $d/third_party/licenses/busybox/COPYING && echo present'
+
       - name: Build the agent image
         run: docker build -f Dockerfile.agent -t perf-agent:ci .
+
+      - name: The agent image carries its license notices
+        run: |
+          docker run --rm --entrypoint sh perf-agent:ci -c '
+            d=/usr/share/licenses/perf-agent
+            test -s $d/LICENSE && test -s $d/THIRD_PARTY_NOTICES.md \
+              && test -s $d/third_party/licenses/rust/blazesym/LICENSE && echo present'
 
       - name: The agent refuses without capabilities, and says which
         # The bare failure here is an EPERM at exec that names nothing. If the

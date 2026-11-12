@@ -1,3 +1,8 @@
+// Portions of this file are derived from github.com/grafana/pyroscope,
+// ebpf/pprof/pprof.go, Copyright 2020-2023 Grafana Labs, licensed under the
+// Apache License 2.0 (third_party/licenses/pyroscope-ebpf/LICENSE). This file
+// has been modified.
+
 package pprof
 
 import (

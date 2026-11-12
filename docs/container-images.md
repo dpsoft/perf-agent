@@ -97,3 +97,24 @@ The application still opts in. A `hostPath` shim changes which inode
 `CUDA_INJECTION64_PATH` names; it does not remove the variable, and the
 workload still has to be started with it set. Injecting it without editing
 the pod needs a mutating admission webhook, which is not built.
+
+## Licenses and notices
+
+Both images carry the project license and the third-party notices under
+`/usr/share/licenses/perf-agent/`: `LICENSE`, `THIRD_PARTY_NOTICES.md`, and
+the full license texts in `third_party/licenses/`.
+
+The shim image's base is BusyBox 1.36.1 (GPL-2.0), pinned by digest. Its
+corresponding source is the upstream release at
+https://busybox.net/downloads/busybox-1.36.1.tar.bz2. The agent image's base is
+Ubuntu 24.04. Each Ubuntu package keeps its license under
+`/usr/share/doc/<package>/copyright`, and its source is available from the
+Ubuntu archive.
+
+To read the notices without running anything:
+
+```
+podman create --name notices ghcr.io/dpsoft/perf-agent-shim:<tag>
+podman cp notices:/usr/share/licenses/perf-agent ./perf-agent-licenses
+podman rm notices
+```

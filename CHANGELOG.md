@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release binaries are also published as `.tar.gz` archives that carry
+  `LICENSE`, `THIRD_PARTY_NOTICES.md` and the full third-party license texts.
+  The bare binaries are still published under the same names.
+- Both container images carry the license and third-party notices under
+  `/usr/share/licenses/perf-agent/` and set `org.opencontainers.image.licenses`.
+
+### Changed
+
+- The eBPF programs in `bpf/` are declared GPL-2.0-only in `bpf/LICENSE` and
+  `bpf/LICENSING.md`, which matches the `GPL` license they already declared to
+  the kernel. The rest of the project remains Apache-2.0.
+- The shim image's `busybox:stable` base is pinned by digest, so the BusyBox
+  version named in the notices is the one shipped.
+
 ### Fixed
+
+- Code adapted from Grafana Pyroscope (`pprof/pprof.go`, `bpf/perf.bpf.c`) now
+  carries attribution, and the vendored libbpf headers now ship with their
+  license texts.
 
 - The Known issues of 1.5.0 and 1.5.1 blamed `--profile` for a CUDA process
   stopping in `cuCtxSynchronize` or failing with Xid 13/31

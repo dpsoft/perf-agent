@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Regenerates THIRD_PARTY_NOTICES.md and third_party/licenses/ from what the
+# release actually links: the Go modules of the two shipped binaries (both
+# architectures) and the Rust crates inside libblazesym_c.a.
+#
+#   scripts/third-party-notices.sh          rewrite the files in place
+#   scripts/third-party-notices.sh --check  fail if the committed files are stale
+#
+# License texts are copied verbatim from the module cache and the cargo
+# registry, never paraphrased: BSD and MIT require the notice itself to travel
+# with a binary distribution, and Apache-2.0 §4(d) requires NOTICE contents.
+# Components that no package manager describes (NVIDIA headers, libbpf headers,
+# the GCC runtime, base images) are written by hand in
+# third_party/NOTICES.manual.md and appended unchanged.
+#
+# BLAZESYM_SRC must point at a blazesym checkout at the tag in .blazesym-ref,
+# already built once so the cargo registry holds its dependencies.
+set -euo pipefail
+export LC_ALL=C
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+mode=write
+[ "${1:-}" = --check ] && mode=check
+
+blazesym=${BLAZESYM_SRC:-}
+if [ -z "$blazesym" ]; then
+  blazesym=$(go list -m -f '{{with .Replace}}{{.Dir}}{{end}}' github.com/libbpf/blazesym/go)
+  blazesym=${blazesym%/go}
+fi
+[ -f "$blazesym/capi/Cargo.toml" ] || { echo "blazesym checkout not found at '$blazesym' (set BLAZESYM_SRC)" >&2; exit 1; }
+want=$(cat .blazesym-ref)
+have=$(git -C "$blazesym" describe --tags --exact-match 2>/dev/null || echo unknown)
+[ "$have" = "$want" ] || { echo "blazesym checkout is at '$have', release uses '$want'" >&2; exit 1; }
+
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+lic=$out/third_party/licenses
+mkdir -p "$lic"
+
+# Files that carry license or attribution text, as they appear in module roots.
+license_files() {
+  find "$1" -maxdepth 1 -type f \( -iname 'LICEN[CS]E*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \
+    -o -iname 'PATENTS*' -o -iname 'COPYRIGHT*' -o -iname 'AUTHORS*' \) | sort
+}
+
+copy_licenses() { # <src dir> <dest dir>
+  local f n=0
+  mkdir -p "$2"
+  while read -r f; do
+    [ -n "$f" ] || continue
+    cp "$f" "$2/"; n=$((n + 1))
+  done < <(license_files "$1")
+  [ "$n" -gt 0 ] || { echo "no license file in $1" >&2; exit 1; }
+}
+
+# ---- Go -------------------------------------------------------------------
+# Modules linked into the shipped binaries, for every shipped architecture.
+# Test-only modules never reach a release artifact and are left out.
+gomods=$out/go.txt
+for arch in amd64 arm64; do
+  GOOS=linux GOARCH=$arch CGO_ENABLED=1 go list -deps \
+    -f '{{with .Module}}{{if not .Main}}{{.Path}}|{{.Version}}|{{with .Replace}}{{.Dir}}{{else}}{{.Dir}}{{end}}{{end}}{{end}}' \
+    . ./cmd/gpu-cuda-profile
+done | grep . | sort -u > "$gomods"
+
+while IFS='|' read -r path version dir; do
+  case $path in
+    github.com/libbpf/blazesym/go)
+      # The Go binding has no LICENSE of its own; the repository root's covers it.
+      copy_licenses "$blazesym" "$lic/go/$path" ;;
+    *) copy_licenses "$dir" "$lic/go/$path" ;;
+  esac
+done < "$gomods"
+
+# ---- Rust (libblazesym_c.a) -------------------------------------------------
+# Normal dependencies only: proc macros and build scripts run on the build host
+# and leave no code in the archive.
+rust=$out/rust.txt
+for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+  ( cd "$blazesym" && cargo tree -p blazesym-c --features blazesym/xz --target "$target" \
+      -e normal,no-proc-macro --locked --prefix none --color never --format '{p}|{l}' )
+done | sed 's/ (\*)//' | sort -u > "$rust"
+
+registry=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -mindepth 1 -maxdepth 1 -type d | head -1)
+while IFS='|' read -r pkg license; do
+  name=${pkg%% *}
+  rest=${pkg#* }
+  version=${rest%% *}; version=${version#v}
+  case $pkg in
+    *"($blazesym"*) src=$blazesym ;;
+    *) src=$registry/$name-$version ;;
+  esac
+  copy_licenses "$src" "$lic/rust/$name"
+  if [ "$name" = lzma-sys ]; then
+    # LZMA_API_STATIC compiles the vendored liblzma C sources into the archive.
+    xz=$(find "$src" -maxdepth 1 -type d -name 'xz-*' | head -1)
+    # Only liblzma is compiled; xz's GPL texts cover command-line tools and
+    # scripts that are not.
+    mkdir -p "$lic/c/liblzma"
+    cp "$xz/COPYING" "$xz/AUTHORS" "$lic/c/liblzma/"
+  fi
+done < "$rust"
+
+# blazesym's DWARF reader is based on gimli-rs/addr2line and quotes its MIT
+# notice in the source files rather than in a LICENSE file.
+mkdir -p "$lic/rust/blazesym-addr2line"
+f=$(grep -rl 'gimli-rs/addr2line' "$blazesym/src/dwarf" | sort | head -1)
+awk 'NR==1, /^$/' "$f" > "$lic/rust/blazesym-addr2line/NOTICE-from-source"
+
+# ---- notices file -----------------------------------------------------------
+{
+  cat <<'EOF'
+# Third-party notices
+
+perf-agent is licensed under the Apache License 2.0 (see `LICENSE`). The
+binaries and container images published by this project also contain the
+third-party components listed here. Their full license and notice texts are
+in `third_party/licenses/`, copied unmodified from each upstream source; in
+release archives and images that directory sits next to this file.
+
+This file is generated by `scripts/third-party-notices.sh`; the hand-written
+sections at the end come from `third_party/NOTICES.manual.md`.
+
+## Go modules
+
+Linked into `perf-agent` and `gpu-cuda-profile` (linux/amd64 and linux/arm64).
+The Go standard library and runtime are covered by the Go license, BSD-3-Clause
+(`third_party/licenses/go/golang.org/go/LICENSE`).
+
+| Module | Version | License texts |
+|---|---|---|
+EOF
+  while IFS='|' read -r path version dir; do
+    [ "$path" = github.com/libbpf/blazesym/go ] && version="blazesym $want"
+    files=$(cd "$lic/go/$path" && ls | sed 's/.*/`&`/' | paste -sd ' ' -)
+    echo "| $path | $version | \`third_party/licenses/go/$path/\`: $files |"
+  done < "$gomods"
+  cat <<EOF
+
+## Rust crates in libblazesym_c.a
+
+blazesym $want is statically linked into both binaries, built with
+\`--features blazesym/xz\` and \`LZMA_API_STATIC=1\`. Crates offered under a
+choice of licenses are used under the permissive option. The Rust standard
+library is licensed MIT OR Apache-2.0.
+
+| Crate | Version | Declared license | License texts |
+|---|---|---|---|
+EOF
+  while IFS='|' read -r pkg license; do
+    name=${pkg%% *}
+    rest=${pkg#* }
+    version=${rest%% *}
+    echo "| $name | $version | $license | \`third_party/licenses/rust/$name/\` |"
+  done < "$rust"
+  cat <<'EOF'
+| liblzma (vendored in lzma-sys) | see `third_party/licenses/c/liblzma/` | Public domain | `third_party/licenses/c/liblzma/` |
+| addr2line-derived code in blazesym | — | MIT | `third_party/licenses/rust/blazesym-addr2line/` |
+
+EOF
+  cat third_party/NOTICES.manual.md
+} > "$out/THIRD_PARTY_NOTICES.md"
+
+# Texts no package manager provides, kept by hand (see NOTICES.manual.md).
+cp -a third_party/static/. "$lic/"
+
+if [ "$mode" = check ]; then
+  if ! diff -r -q third_party/licenses "$lic" >/dev/null 2>&1 \
+     || ! cmp -s THIRD_PARTY_NOTICES.md "$out/THIRD_PARTY_NOTICES.md"; then
+    diff -r -u third_party/licenses "$lic" | head -40 || true
+    diff -u THIRD_PARTY_NOTICES.md "$out/THIRD_PARTY_NOTICES.md" | head -40 || true
+    echo "third-party notices are stale: run scripts/third-party-notices.sh and commit the result" >&2
+    exit 1
+  fi
+  echo "third-party notices are up to date"
+else
+  rm -rf third_party/licenses
+  cp -a "$lic" third_party/licenses
+  cp "$out/THIRD_PARTY_NOTICES.md" THIRD_PARTY_NOTICES.md
+  echo "wrote THIRD_PARTY_NOTICES.md and third_party/licenses/"
+fi

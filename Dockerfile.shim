@@ -81,15 +81,27 @@ RUN cd /src/shim \
 # cheap.
 RUN cd /src/shim && ./elfgate.sh /libperfagent-gpu-nvidia.so 2.34
 
+# The shim is compiled against CUPTI headers but must not link or carry any
+# NVIDIA library: CUPTI is dlopen'd from the host's CUDA installation. A
+# NEEDED entry for one would also change what this image redistributes.
+RUN ! readelf -d /libperfagent-gpu-nvidia.so | grep -E 'NEEDED.*(cupti|cudart|libcuda|nvidia-ml|nvperf)'
+
 # busybox for `cp`: the init container's whole job is one copy, and the
 # manifest invokes it through `sh -c`. Nothing here is ever executed in the
 # same process as the workload.
-FROM busybox:stable
+#
+# Pinned by digest (busybox 1.36.1): this image redistributes the BusyBox
+# binary under GPL-2.0, and THIRD_PARTY_NOTICES.md names the exact source
+# release it corresponds to. Moving the pin means updating that version.
+FROM busybox:stable@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
 COPY --from=build /libperfagent-gpu-nvidia.so /usr/local/lib/libperfagent-gpu-nvidia.so
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/perf-agent/
+COPY third_party/licenses/ /usr/share/licenses/perf-agent/third_party/licenses/
 
 LABEL org.opencontainers.image.title="perf-agent CUDA shim" \
       org.opencontainers.image.description="CUPTI adapter for CUDA_INJECTION64_PATH; init-container payload" \
-      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent"
+      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 # Not an entrypoint that runs the shim -- it is a library and cannot be run.
 # The default command states what the image is FOR, so `docker run` on it

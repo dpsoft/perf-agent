@@ -88,7 +88,9 @@ Deeper notes: [GPU injection](docs/gpu-injection.md) ·
 [Contributing](CONTRIBUTING.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) ·
 [Security](SECURITY.md) ·
-[License](LICENSE) (Apache-2.0)
+[License](LICENSE) (Apache-2.0; the eBPF programs in `bpf/` are GPL-2.0-only,
+see [bpf/LICENSING.md](bpf/LICENSING.md)) ·
+[Third-party notices](THIRD_PARTY_NOTICES.md)
 
 GPU device telemetry also supports continuous collection and optional OTLP/HTTP
 metrics export. See [continuous telemetry](docs/usage.md#continuous-gpu-telemetry-and-otlp)

@@ -92,6 +92,13 @@ RUN apt-get update -qq \
 COPY --from=build /gpu-cuda-profile /usr/local/bin/gpu-cuda-profile
 COPY build/agent-entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# The license and third-party notices travel with the binary: it statically
+# links BSD- and MIT-licensed code whose licenses require their text to
+# accompany any binary distribution. Ubuntu's own package notices stay in
+# /usr/share/doc, so nothing in this file may strip that directory.
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/perf-agent/
+COPY third_party/licenses/ /usr/share/licenses/perf-agent/third_party/licenses/
+
 # FILE CAPABILITIES, so the container does not have to run as root.
 #
 # securityContext.capabilities.add puts capabilities in the container's
@@ -136,7 +143,8 @@ USER 65532
 
 LABEL org.opencontainers.image.title="perf-agent GPU profiler" \
       org.opencontainers.image.description="Attaches to CUDA processes carrying the perf-agent CUPTI shim" \
-      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent"
+      org.opencontainers.image.source="https://github.com/dpsoft/perf-agent" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 # Not the binary directly: see build/agent-entrypoint.sh for why an
 # unexplained EPERM at exec is the failure this wrapper exists to prevent.

@@ -26,6 +26,11 @@ Thanks for your interest. perf-agent is an eBPF-based Linux profiler — a small
    ```
    CI runs this and it must pass before merge.
 4. **Cross-arch:** the project supports `amd64` and `arm64`. For BPF-touching changes, verify both architectures still build — but see below before regenerating anything.
+5. **Dependency changes:** adding, removing or bumping a Go module or the blazesym pin changes what the release links. Regenerate the notices and commit the result; CI fails while they are stale:
+   ```bash
+   BLAZESYM_SRC=/path/to/blazesym scripts/third-party-notices.sh
+   ```
+   Code copied or adapted from another project needs its attribution in `third_party/NOTICES.manual.md` and its license text in `third_party/static/`.
 
 ## BPF objects are CI's artifacts, not your machine's
 

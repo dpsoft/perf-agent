@@ -76,6 +76,11 @@ jobs:
           go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
           cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
+      # A release must not ship notices that no longer match what it links:
+      # a dependency bump without regenerating them fails here.
+      - name: Check third-party notices
+        run: BLAZESYM_SRC=/tmp/blazesym scripts/third-party-notices.sh --check
+
       - name: "Fingerprint the BPF toolchain (issue #87)"
         # Diagnostic only. Never fails the job.
         #
@@ -299,6 +304,30 @@ jobs:
         with:
           path: artifacts
 
+      # Each binary also ships as an archive carrying LICENSE and the
+      # third-party notices. The binaries statically link BSD- and
+      # MIT-licensed code, and those licenses require their text to travel
+      # with a binary distribution; a bare executable cannot carry it. The
+      # bare binaries stay for existing download URLs.
+      - name: Package binaries with license notices
+        run: |
+          set -eu
+          for bin in perf-agent gpu-cuda-profile; do
+            for arch in amd64 arm64; do
+              name=$bin-linux-$arch
+              dir=dist/$name
+              mkdir -p "$dir"
+              install -m 0755 "artifacts/$name/$name" "$dir/$bin"
+              cp LICENSE THIRD_PARTY_NOTICES.md "$dir/"
+              mkdir -p "$dir/third_party"
+              cp -a third_party/licenses "$dir/third_party/licenses"
+              test -s "$dir/LICENSE" && test -s "$dir/THIRD_PARTY_NOTICES.md"
+              test -n "$(ls -A "$dir/third_party/licenses")"
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            done
+          done
+          ls -l dist/*.tar.gz
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -312,5 +341,9 @@ jobs:
             artifacts/perf-agent-linux-arm64/perf-agent-linux-arm64
             artifacts/gpu-cuda-profile-linux-amd64/gpu-cuda-profile-linux-amd64
             artifacts/gpu-cuda-profile-linux-arm64/gpu-cuda-profile-linux-arm64
+            dist/perf-agent-linux-amd64.tar.gz
+            dist/perf-agent-linux-arm64.tar.gz
+            dist/gpu-cuda-profile-linux-amd64.tar.gz
+            dist/gpu-cuda-profile-linux-arm64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

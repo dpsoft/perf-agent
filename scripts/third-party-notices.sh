@@ -80,8 +80,8 @@ done < "$gomods"
 rust=$out/rust.txt
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   ( cd "$blazesym" && cargo tree -p blazesym-c --features blazesym/xz --target "$target" \
-      -e normal,no-proc-macro --locked --prefix none --format '{p}|{l}' )
-done | sed 's/ (\*)$//' | sort -u > "$rust"
+      -e normal,no-proc-macro --locked --prefix none --color never --format '{p}|{l}' )
+done | sed 's/ (\*)//' | sort -u > "$rust"
 
 registry=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -mindepth 1 -maxdepth 1 -type d | head -1)
 while IFS='|' read -r pkg license; do

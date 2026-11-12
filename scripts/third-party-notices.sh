@@ -24,12 +24,11 @@ cd "$root"
 mode=write
 [ "${1:-}" = --check ] && mode=check
 
-blazesym=${BLAZESYM_SRC:-}
-if [ -z "$blazesym" ]; then
-  blazesym=$(go list -m -f '{{with .Replace}}{{.Dir}}{{end}}' github.com/libbpf/blazesym/go)
-  blazesym=${blazesym%/go}
-fi
+# Default: a sibling of the main checkout, as in the Makefile.
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+blazesym=${BLAZESYM_SRC:-$main/../blazesym}
 [ -f "$blazesym/capi/Cargo.toml" ] || { echo "blazesym checkout not found at '$blazesym' (set BLAZESYM_SRC)" >&2; exit 1; }
+blazesym=$(cd "$blazesym" && pwd -P)
 want=$(cat .blazesym-ref)
 have=$(git -C "$blazesym" describe --tags --exact-match 2>/dev/null || echo unknown)
 [ "$have" = "$want" ] || { echo "blazesym checkout is at '$have', release uses '$want'" >&2; exit 1; }
@@ -66,12 +65,7 @@ for arch in amd64 arm64; do
 done | grep . | sort -u > "$gomods"
 
 while IFS='|' read -r path version dir; do
-  case $path in
-    github.com/libbpf/blazesym/go)
-      # The Go binding has no LICENSE of its own; the repository root's covers it.
-      copy_licenses "$blazesym" "$lic/go/$path" ;;
-    *) copy_licenses "$dir" "$lic/go/$path" ;;
-  esac
+  copy_licenses "$dir" "$lic/go/$path"
 done < "$gomods"
 
 # ---- Rust (libblazesym_c.a) -------------------------------------------------
@@ -133,7 +127,6 @@ The Go standard library and runtime are covered by the Go license, BSD-3-Clause
 |---|---|---|
 EOF
   while IFS='|' read -r path version dir; do
-    [ "$path" = github.com/libbpf/blazesym/go ] && version="blazesym $want"
     files=$(cd "$lic/go/$path" && ls | sed 's/.*/`&`/' | paste -sd ' ' -)
     echo "| $path | $version | \`third_party/licenses/go/$path/\`: $files |"
   done < "$gomods"

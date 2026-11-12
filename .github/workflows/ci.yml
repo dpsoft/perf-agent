@@ -79,10 +79,9 @@ jobs:
         sudo ldconfig
         echo "✓ blazesym installed"
     
-    - name: Configure blazesym Go module
-      run: |
-        go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-        cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
+
+    - name: Check the blazesym Go binding matches the library
+      run: sh scripts/check-blazesym-pin.sh /tmp/blazesym
 
     # THIRD_PARTY_NOTICES.md and third_party/licenses/ are generated from the
     # modules and crates the release links. A dependency change that does not

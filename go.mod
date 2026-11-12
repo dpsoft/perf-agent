@@ -10,7 +10,7 @@ require (
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936
 	github.com/iovisor/gobpf v0.2.0
 	github.com/klauspost/compress v1.18.5
-	github.com/libbpf/blazesym/go v0.0.0
+	github.com/libbpf/blazesym/go v0.0.0-20261028163931-0c8df3ca3e54
 	github.com/stretchr/testify v1.12.1
 	github.com/ulikunitz/xz v0.5.17
 	go.opentelemetry.io/otel v1.47.0
@@ -25,8 +25,6 @@ require (
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.77
 	modernc.org/sqlite v1.50.0
 )
-
-replace github.com/libbpf/blazesym/go => /home/diego/github/blazesym/go
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect

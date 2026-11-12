@@ -127,3 +127,7 @@ test/debuginfod/debuginfo-store/
 test/debuginfod/sample/hello
 test/debuginfod/sample/hello.full
 test/debuginfod/sample/hello.debug
+
+# Local Go workspace (see BUILDING.md); never committed.
+go.work
+go.work.sum

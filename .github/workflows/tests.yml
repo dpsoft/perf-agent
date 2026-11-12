@@ -69,10 +69,6 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
-      - name: Configure blazesym Go module
-        run: |
-          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
       - name: "Fingerprint the BPF toolchain (issue #87)"
         # Diagnostic only. Never fails the job.
@@ -293,10 +289,6 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
-      - name: Configure blazesym Go module
-        run: |
-          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
       - name: Build test workloads
         run: make test-workloads
@@ -442,10 +434,6 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
-      - name: Configure blazesym Go module
-        run: |
-          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
       - name: "Fingerprint the BPF toolchain (issue #87)"
         # Diagnostic only. Never fails the job.
@@ -586,10 +574,6 @@ jobs:
           sudo cp target/release/libblazesym_c.a /usr/local/lib/
           sudo ldconfig
 
-      - name: Configure blazesym Go module
-        run: |
-          go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
-          cd test && go mod edit -replace github.com/libbpf/blazesym/go=/tmp/blazesym/go
 
       - name: "Fingerprint the BPF toolchain (issue #87)"
         # Diagnostic only. Never fails the job.

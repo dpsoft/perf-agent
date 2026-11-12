@@ -7,7 +7,11 @@ all: build
 # to enforce the locally-installed toolchain.
 export GOTOOLCHAIN ?= auto
 
-LIBBLAZESYM_SRC := $(abspath /home/diego/github/blazesym/)
+# blazesym checkout, by default a sibling of the main checkout (resolved
+# through git's common dir so a linked worktree finds the same one).
+# Override with `make LIBBLAZESYM_SRC=/path/to/blazesym`.
+REPO_MAIN_DIR := $(dir $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo $(CURDIR)/.git))
+LIBBLAZESYM_SRC ?= $(abspath $(REPO_MAIN_DIR)../blazesym)
 LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(LIBBLAZESYM_SRC)/target/release/libblazesym_c.a)
 LIBBLAZESYM_LINK_DIR := $(abspath .build/blazesym)

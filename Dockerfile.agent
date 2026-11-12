@@ -51,20 +51,12 @@ RUN mkdir -p /blazeonly && cp /blazesym/target/release/libblazesym_c.a /blazeonl
 
 WORKDIR /src
 COPY go.mod go.sum ./
-
-# The committed go.mod carries an ABSOLUTE-PATH replace for the blazesym Go
-# binding, pointing at a checkout on a developer's machine. Nothing outside
-# that machine can resolve it -- CI rewrites it with the same `go mod edit`
-# before every build, and this image has to as well. Repointing it at the
-# checkout above is what makes this Dockerfile buildable by anyone.
-RUN go mod edit -replace github.com/libbpf/blazesym/go=/blazesym/go \
- && go mod download
+RUN go mod download
 
 COPY . .
-# COPY brought the committed go.mod back with its unusable absolute path, so
-# the rewrite has to happen again. Cheap, and the alternative -- excluding
-# go.mod from the copy -- silently diverges the build from the source tree.
-RUN go mod edit -replace github.com/libbpf/blazesym/go=/blazesym/go
+# The Go binding comes from the module proxy at the version go.mod pins; the
+# library above comes from the .blazesym-ref tag. They must be one commit.
+RUN sh scripts/check-blazesym-pin.sh /blazesym
 
 # No clang and no `go generate`: the BPF objects are committed and embedded
 # with //go:embed, so this image does not need the eBPF toolchain to exist.

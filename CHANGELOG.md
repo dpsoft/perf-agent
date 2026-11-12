@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-11-12
+
+A packaging and licensing release. Release archives and both container images
+now carry the project license, the third-party notices and the full license
+texts; a fresh checkout resolves its Go modules without a local blazesym path;
+and the GPU stack memo no longer reuses a stack that resolved no frame. The
+CUDA hang known issue is corrected: it is caused by host WiFi receive traffic,
+not by perf-agent.
+
 ### Added
 
 - Release binaries are also published as `.tar.gz` archives that carry
@@ -634,7 +643,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/dpsoft/perf-agent/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/dpsoft/perf-agent/compare/v1.4.0...v1.4.1

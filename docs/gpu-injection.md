@@ -102,7 +102,7 @@ published image carries it, so there is nothing to build:
 ```bash
 # Take the shim out of the image that ships it. The image is a carrier, not
 # a program -- running it prints that and exits non-zero.
-id=$(podman create ghcr.io/dpsoft/perf-agent-shim:v1.5.1)
+id=$(podman create ghcr.io/dpsoft/perf-agent-shim:v1.5.2)
 podman cp "$id":/usr/local/lib/libperfagent-gpu-nvidia.so ./shim.so
 podman rm "$id"
 

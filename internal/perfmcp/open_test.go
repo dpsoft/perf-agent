@@ -462,7 +462,7 @@ func TestToolsListOpen(t *testing.T) {
 	if err := json.Unmarshal(res.Result, &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Tools) != 1 || out.Tools[0].Name != "open" {
+	if len(out.Tools) == 0 || out.Tools[0].Name != "open" {
 		t.Fatalf("tools = %+v", out.Tools)
 	}
 	tool := out.Tools[0]

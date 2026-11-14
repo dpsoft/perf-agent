@@ -19,6 +19,8 @@ type entry struct {
 	name   string // the profile's path relative to the profiles root, as first opened
 	views  map[string]*profilemodel.View
 	opened []os.FileInfo
+	// sorted caches the sorted rows of top per view, rows and ordering.
+	sorted map[string]any
 }
 
 // store holds a server's open handles. It belongs to one Server and is used

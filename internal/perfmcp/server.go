@@ -105,7 +105,7 @@ func (s *Server) Close() error {
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
-	return []mcpstdio.Tool{s.openTool()}
+	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.

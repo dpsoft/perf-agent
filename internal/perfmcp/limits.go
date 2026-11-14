@@ -12,8 +12,8 @@ import (
 //
 // New fills in defaults: a zero Limits is DefaultLimits, and a zero Model
 // is profilemodel.DefaultLimits, so a Limits that sets only some of the
-// server's own fields still loads profiles. Any other non-positive server
-// field is refused.
+// server's own fields still loads profiles. MaxRows is filled in when zero. Any other
+// non-positive server field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -24,7 +24,12 @@ type Limits struct {
 	// MaxOpenHandles is how many handles the server keeps open; opening one
 	// more closes the least recently used.
 	MaxOpenHandles int
+	// MaxRows bounds the limit argument of the tools that page rows.
+	MaxRows int
 }
+
+// defaultMaxRows is the MaxRows a server runs with unless told otherwise.
+const defaultMaxRows = 200
 
 // DefaultLimits are the limits a server runs with unless told otherwise.
 func DefaultLimits() Limits {
@@ -33,6 +38,7 @@ func DefaultLimits() Limits {
 		MaxMessageBytes:  4 << 20,
 		MaxResponseBytes: 1 << 20,
 		MaxOpenHandles:   8,
+		MaxRows:          defaultMaxRows,
 	}
 }
 
@@ -43,6 +49,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.Model == (profilemodel.Limits{}) {
 		l.Model = profilemodel.DefaultLimits()
+	}
+	if l.MaxRows == 0 {
+		l.MaxRows = defaultMaxRows
 	}
 	return l
 }
@@ -56,6 +65,7 @@ func (l Limits) validate() error {
 		{"MaxMessageBytes", l.MaxMessageBytes},
 		{"MaxResponseBytes", l.MaxResponseBytes},
 		{"MaxOpenHandles", l.MaxOpenHandles},
+		{"MaxRows", l.MaxRows},
 	} {
 		if f.v <= 0 {
 			return fmt.Errorf("perfmcp: limit %s must be positive, got %d", f.name, f.v)

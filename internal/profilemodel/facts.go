@@ -45,16 +45,19 @@ const (
 
 // Metric names, as structured claims name them. RoundingFor takes these.
 const (
-	MetricCumulative          = "cumulative"
-	MetricSelf                = "self"
-	MetricShareOfTotal        = "share_of_total"
-	MetricShareOfParent       = "share_of_parent"
-	MetricExecutionsBelow     = "executions_below"
-	MetricKernelNamesObserved = "kernel_names_observed"
-	MetricInexactPortion      = "inexact_portion"
-	MetricUnsampledPortion    = "unsampled_portion"
-	MetricSerialization       = "serialization" // each of the four states
-	MetricPerWorkDelta        = "per_work_delta"
+	MetricCumulative           = "cumulative"
+	MetricSelf                 = "self"
+	MetricShareOfTotal         = "share_of_total"
+	MetricShareOfParent        = "share_of_parent"
+	MetricExecutionsBelow      = "executions_below"
+	MetricKernelNamesObserved  = "kernel_names_observed"
+	MetricInexactPortion       = "inexact_portion"
+	MetricUnsampledPortion     = "unsampled_portion"
+	MetricSerializationTrue    = "serialization_true"
+	MetricSerializationFalse   = "serialization_false"
+	MetricSerializationUnknown = "serialization_unknown"
+	MetricSerializationMissing = "serialization_missing"
+	MetricPerWorkDelta         = "per_work_delta"
 )
 
 // RoundingFor is the engine's display rounding for metric, and the only
@@ -62,7 +65,9 @@ const (
 //
 //	share_of_total, share_of_parent     "0.001 ratio" (0.1 percentage point)
 //	cumulative, self, inexact_portion,
-//	unsampled_portion, serialization    "exact" (integers in the sample unit)
+//	unsampled_portion,
+//	serialization_true, _false,
+//	_unknown, _missing                  "exact" (integers in the sample unit)
 //	executions_below,
 //	kernel_names_observed               "exact" (counts)
 //	per_work_delta                      "3 significant figures"
@@ -73,7 +78,8 @@ func RoundingFor(metric string) string {
 	switch metric {
 	case MetricShareOfTotal, MetricShareOfParent:
 		return "0.001 ratio"
-	case MetricCumulative, MetricSelf, MetricInexactPortion, MetricUnsampledPortion, MetricSerialization,
+	case MetricCumulative, MetricSelf, MetricInexactPortion, MetricUnsampledPortion,
+		MetricSerializationTrue, MetricSerializationFalse, MetricSerializationUnknown, MetricSerializationMissing,
 		MetricExecutionsBelow, MetricKernelNamesObserved:
 		return "exact"
 	case MetricPerWorkDelta:
@@ -130,45 +136,54 @@ type Classifier func(name, module string) string
 // Serialization is the value under a node by its samples' gpu_serialized
 // label. Unknown also holds samples whose label is not exactly one of
 // "true", "false" and "unknown"; Missing holds samples without the label.
-type Serialization struct{ True, False, Unknown, Missing Fact }
+type Serialization struct {
+	True    Fact `json:"true"`
+	False   Fact `json:"false"`
+	Unknown Fact `json:"unknown"`
+	Missing Fact `json:"missing"`
+}
 
 // PathFacts are the facts about one node of a view.
 type PathFacts struct {
-	Handle     Handle
-	View       string // "<type>/<unit>#<index>"
-	Node       NodeID
-	ParentNode NodeID   `json:",omitempty"` // "" for the synthetic root
-	Path       []string // display names root-first, the synthetic root excluded
+	Handle     Handle   `json:"handle"`
+	View       string   `json:"view"` // "<type>/<unit>#<index>"
+	Node       NodeID   `json:"node"`
+	ParentNode NodeID   `json:"parent_node,omitempty"` // "" for the synthetic root
+	Path       []string `json:"path"`                  // display names root-first, the synthetic root excluded
 	// Cumulative and Self are in the view's sample unit.
-	Cumulative, Self Fact
-	ShareOfTotal     Fact // Cumulative / view total
-	ShareOfParent    Fact // Cumulative / parent's cumulative; unavailable on the root
+	Cumulative    Fact `json:"cumulative"`
+	Self          Fact `json:"self"`
+	ShareOfTotal  Fact `json:"share_of_total"`  // Cumulative / view total
+	ShareOfParent Fact `json:"share_of_parent"` // Cumulative / parent's cumulative; unavailable on the root
 	// ExecutionsBelow counts distinct execution ordinals in the checked
 	// executions log over every sample through the node, zero-value ones
 	// included; unavailable with the log's reason when it is not usable.
-	ExecutionsBelow Fact
+	ExecutionsBelow Fact `json:"executions_below"`
 	// KernelNamesObserved counts distinct "[gpu:kernel:<name>]" names at or
 	// below the node in any sample through it, zero-value samples included:
-	// names observed, not binary-identical kernels.
-	KernelNamesObserved Fact
+	// names observed, not binary-identical kernels. GPU views only; else
+	// unavailable "not a GPU view", since no other profile has kernel frames.
+	KernelNamesObserved Fact `json:"kernel_names_observed"`
 	// InexactPortion is the part of Cumulative from samples matching
 	// foldedstacks.DefaultInexactLabels.
-	InexactPortion Fact
+	InexactPortion Fact `json:"inexact_portion"`
 	// UnsampledPortion is the view-level value under
 	// foldedstacks.UnsampledLaunchFrame, never redistributed to any node.
 	// GPU views only; else unavailable "not a GPU view".
-	UnsampledPortion Fact
-	// Serialization is GPU views only; else all four are unavailable.
-	Serialization Serialization
+	UnsampledPortion Fact `json:"unsampled_portion"`
+	// Serialization is GPU views only; else all four are unavailable. On a
+	// GPU view the four states sum to Cumulative.
+	Serialization Serialization `json:"serialization"`
 	// SamplePeriods are the distinct gpu_sample_period values on samples
-	// through the node, zero-value ones included, sorted numerically.
-	SamplePeriods     []string
-	Domain            string // the Classifier's key, or "unknown"
-	DomainInferred    bool   // always true: domains are a heuristic
-	CollisionPossible bool   // as Node.CollisionPossible
+	// through the node, zero-value ones included: integers first, in
+	// numeric order, then any other values in string order.
+	SamplePeriods     []string `json:"sample_periods"`
+	Domain            string   `json:"domain"`             // the Classifier's key, or "unknown"
+	DomainInferred    bool     `json:"domain_inferred"`    // always true: domains are a heuristic
+	CollisionPossible bool     `json:"collision_possible"` // as Node.CollisionPossible
 	// Notes is foldedstacks.SamplingNotes for the whole view, the same text
 	// Fold warns with, on GPU views with a non-zero total; nil otherwise.
-	Notes []string
+	Notes []string `json:"notes"`
 }
 
 // ErrUnknownNode is returned for a NodeID the view does not have.
@@ -222,15 +237,20 @@ func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error) {
 
 	observed := slices.Concat(n.samples, n.zeroSamples)
 	pf.ExecutionsBelow = v.executionsBelow(observed)
-	pf.KernelNamesObserved = intFact(MetricKernelNamesObserved, int64(v.kernelNamesBelow(n, observed)), UnitCount)
 	pf.SamplePeriods = v.samplePeriods(observed)
 
 	if v.SampleType != gpuSampleType {
+		pf.KernelNamesObserved = unavailableFact(MetricKernelNamesObserved, UnitCount, ReasonNotGPUView)
 		pf.UnsampledPortion = unavailableFact(MetricUnsampledPortion, v.Unit, ReasonNotGPUView)
-		na := unavailableFact(MetricSerialization, v.Unit, ReasonNotGPUView)
-		pf.Serialization = Serialization{True: na, False: na, Unknown: na, Missing: na}
+		pf.Serialization = Serialization{
+			True:    unavailableFact(MetricSerializationTrue, v.Unit, ReasonNotGPUView),
+			False:   unavailableFact(MetricSerializationFalse, v.Unit, ReasonNotGPUView),
+			Unknown: unavailableFact(MetricSerializationUnknown, v.Unit, ReasonNotGPUView),
+			Missing: unavailableFact(MetricSerializationMissing, v.Unit, ReasonNotGPUView),
+		}
 		return pf, nil
 	}
+	pf.KernelNamesObserved = intFact(MetricKernelNamesObserved, int64(v.kernelNamesBelow(n, observed)), UnitCount)
 	unsampled, err := v.unsampledTotal()
 	if err != nil {
 		return PathFacts{}, err
@@ -281,8 +301,10 @@ func (v *View) kernelNamesBelow(n *Node, samples []int) int {
 	return len(names)
 }
 
-// samplePeriods returns the distinct gpu_sample_period values on samples,
-// numerically sorted where both values are integers, else by string.
+// samplePeriods returns the distinct gpu_sample_period values on samples:
+// unsigned integers first, in numeric order (ties, such as "8" and "08",
+// by string), then every other value in string order. That is a total
+// order, so the result is the same for any map iteration.
 func (v *View) samplePeriods(samples []int) []string {
 	set := map[string]struct{}{}
 	for _, s := range samples {
@@ -296,8 +318,13 @@ func (v *View) samplePeriods(samples []int) []string {
 	return slices.SortedFunc(maps.Keys(set), func(a, b string) int {
 		x, errA := strconv.ParseUint(a, 10, 64)
 		y, errB := strconv.ParseUint(b, 10, 64)
-		if errA == nil && errB == nil {
-			return cmp.Compare(x, y)
+		switch {
+		case errA == nil && errB == nil:
+			return cmp.Or(cmp.Compare(x, y), cmp.Compare(a, b))
+		case errA == nil:
+			return -1
+		case errB == nil:
+			return 1
 		}
 		return cmp.Compare(a, b)
 	})
@@ -341,10 +368,10 @@ func (v *View) serialization(n *Node) (Serialization, error) {
 		}
 	}
 	return Serialization{
-		True:    intFact(MetricSerialization, t, v.Unit),
-		False:   intFact(MetricSerialization, f, v.Unit),
-		Unknown: intFact(MetricSerialization, u, v.Unit),
-		Missing: intFact(MetricSerialization, m, v.Unit),
+		True:    intFact(MetricSerializationTrue, t, v.Unit),
+		False:   intFact(MetricSerializationFalse, f, v.Unit),
+		Unknown: intFact(MetricSerializationUnknown, u, v.Unit),
+		Missing: intFact(MetricSerializationMissing, m, v.Unit),
 	}, nil
 }
 

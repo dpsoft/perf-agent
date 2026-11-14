@@ -3,6 +3,8 @@ package profilemodel
 import (
 	"encoding/json"
 	"errors"
+	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -237,7 +239,7 @@ func TestDistinctKernelNamesAreObservedNames(t *testing.T) {
 	// k1, k1 and k2; k2's only sample is zero-valued and still observed.
 	wantInt(t, "main", factsAt(t, v, "main").KernelNamesObserved, 2, "count", StatusOK)
 	wantInt(t, "k1", factsAt(t, v, "main", "[gpu:launch]", "[gpu:kernel:k1]").KernelNamesObserved, 1, "count", StatusOK)
-	wantInt(t, "cpu", factsAt(t, fixtureView(t, "cpu-one-sample"), "main").KernelNamesObserved, 0, "count", StatusZero)
+	wantUnavailable(t, "cpu", factsAt(t, fixtureView(t, "cpu-one-sample"), "main").KernelNamesObserved, ReasonNotGPUView)
 
 	// Only frames at or below the node count: a kernel frame above it does not.
 	above := viewOf(t, gpuProfile(fx{stack: []string{"[gpu:kernel:outer]", "x", "[gpu:kernel:inner]"}, value: 1}))
@@ -292,21 +294,27 @@ func TestFactInvariantsOnEveryFixture(t *testing.T) {
 					t.Fatal(err)
 				}
 				facts := map[string]Fact{
-					MetricCumulative:          pf.Cumulative,
-					MetricSelf:                pf.Self,
-					MetricShareOfTotal:        pf.ShareOfTotal,
-					MetricShareOfParent:       pf.ShareOfParent,
-					MetricExecutionsBelow:     pf.ExecutionsBelow,
-					MetricKernelNamesObserved: pf.KernelNamesObserved,
-					MetricInexactPortion:      pf.InexactPortion,
-					MetricUnsampledPortion:    pf.UnsampledPortion,
-					MetricSerialization:       pf.Serialization.True,
+					MetricCumulative:           pf.Cumulative,
+					MetricSelf:                 pf.Self,
+					MetricShareOfTotal:         pf.ShareOfTotal,
+					MetricShareOfParent:        pf.ShareOfParent,
+					MetricExecutionsBelow:      pf.ExecutionsBelow,
+					MetricKernelNamesObserved:  pf.KernelNamesObserved,
+					MetricInexactPortion:       pf.InexactPortion,
+					MetricUnsampledPortion:     pf.UnsampledPortion,
+					MetricSerializationTrue:    pf.Serialization.True,
+					MetricSerializationFalse:   pf.Serialization.False,
+					MetricSerializationUnknown: pf.Serialization.Unknown,
+					MetricSerializationMissing: pf.Serialization.Missing,
 				}
 				for metric, f := range facts {
 					checkFact(t, n.Function.Name+" "+metric, f, RoundingFor(metric))
 				}
-				for _, f := range []Fact{pf.Serialization.False, pf.Serialization.Unknown, pf.Serialization.Missing} {
-					checkFact(t, n.Function.Name+" serialization", f, RoundingFor(MetricSerialization))
+				if v.SampleType == gpuSampleType {
+					s := pf.Serialization
+					if sum := *s.True.Int + *s.False.Int + *s.Unknown.Int + *s.Missing.Int; sum != *pf.Cumulative.Int {
+						t.Errorf("%s: serialization states sum to %d, cumulative %d", n.Function.Name, sum, *pf.Cumulative.Int)
+					}
 				}
 				if *pf.Cumulative.Int != n.Cum || *pf.Self.Int != n.Self || *pf.InexactPortion.Int != n.Inexact {
 					t.Errorf("%s: facts disagree with the node", n.Function.Name)
@@ -354,20 +362,85 @@ func checkFact(t *testing.T, what string, f Fact, rounding string) {
 
 func TestRoundingForIsTheEnginePolicy(t *testing.T) {
 	for metric, want := range map[string]string{
-		MetricShareOfTotal:        "0.001 ratio",
-		MetricShareOfParent:       "0.001 ratio",
-		MetricCumulative:          "exact",
-		MetricSelf:                "exact",
-		MetricExecutionsBelow:     "exact",
-		MetricKernelNamesObserved: "exact",
-		MetricInexactPortion:      "exact",
-		MetricUnsampledPortion:    "exact",
-		MetricSerialization:       "exact",
-		MetricPerWorkDelta:        "3 significant figures",
-		"no-such-metric":          "",
+		MetricShareOfTotal:         "0.001 ratio",
+		MetricShareOfParent:        "0.001 ratio",
+		MetricCumulative:           "exact",
+		MetricSelf:                 "exact",
+		MetricExecutionsBelow:      "exact",
+		MetricKernelNamesObserved:  "exact",
+		MetricInexactPortion:       "exact",
+		MetricUnsampledPortion:     "exact",
+		MetricSerializationTrue:    "exact",
+		MetricSerializationFalse:   "exact",
+		MetricSerializationUnknown: "exact",
+		MetricSerializationMissing: "exact",
+		MetricPerWorkDelta:         "3 significant figures",
+		"no-such-metric":           "",
 	} {
 		if got := RoundingFor(metric); got != want {
 			t.Errorf("RoundingFor(%q) = %q, want %q", metric, got, want)
 		}
+	}
+}
+
+func TestSamplePeriodsHaveATotalOrder(t *testing.T) {
+	period := func(p string) map[string][]string { return map[string][]string{"gpu_sample_period": {p}} }
+	var samples []fx
+	for _, p := range []string{"x", "10", "1a", "9", "08", "8"} {
+		samples = append(samples, fx{stack: []string{"main"}, value: 1, labels: period(p)})
+	}
+	v := viewOf(t, gpuProfile(samples...))
+	want := []string{"08", "8", "9", "10", "1a", "x"}
+	// Map iteration order varies per call; the result must not.
+	for range 50 {
+		if got := factsAt(t, v, "main").SamplePeriods; !slices.Equal(got, want) {
+			t.Fatalf("periods %q, want %q", got, want)
+		}
+	}
+}
+
+// The JSON keys are a contract for the tools built on these facts.
+func TestPathFactsJSONKeys(t *testing.T) {
+	v := fixtureView(t, "gpu-sampled-and-unsampled")
+	pf := factsAt(t, v, "main", "[gpu:launch]")
+	b, err := json.Marshal(pf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(b, &top); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"handle", "view", "node", "parent_node", "path", "cumulative", "self",
+		"share_of_total", "share_of_parent", "executions_below", "kernel_names_observed",
+		"inexact_portion", "unsampled_portion", "serialization", "sample_periods",
+		"domain", "domain_inferred", "collision_possible", "notes",
+	}
+	if got := slices.Sorted(maps.Keys(top)); !slices.Equal(got, slices.Sorted(slices.Values(want))) {
+		t.Fatalf("keys %q\nwant %q", got, want)
+	}
+	var ser map[string]json.RawMessage
+	if err := json.Unmarshal(top["serialization"], &ser); err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(ser)); !slices.Equal(got, []string{"false", "missing", "true", "unknown"}) {
+		t.Fatalf("serialization keys %q", got)
+	}
+
+	var back PathFacts
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back, pf) {
+		t.Fatalf("round trip\n got %+v\nwant %+v", back, pf)
+	}
+
+	root, err := v.Facts(v.Root.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := json.Marshal(root); err != nil || strings.Contains(string(b), `"parent_node"`) {
+		t.Fatalf("root JSON %v %s", err, b)
 	}
 }

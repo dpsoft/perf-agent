@@ -89,6 +89,19 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 - A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning (a sign, an exponent, a decimal point) is rejected as `glued_to_claim`.
 - If anything fails, nothing is written. The result is `rejected`, lists every failure (with the engine's value when one can be computed; the result is itself bounded by `MaxResponseBytes`), and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view.
 
+## Agent skill
+
+`skills/perf-agent-mcp/SKILL.md` is a short skill (the `SKILL.md` format Claude Code and Codex both read) that tells an agent when to use these tools, the order to call them in, the rules it must keep, and how to fix the most common rejections. It sends the agent to the server's own guide, which stays the authority; a test keeps the tool, metric and failure names it cites in step with the server.
+
+Install it by copying or symlinking the directory into your agent's skills directory:
+
+```sh
+# Claude Code
+ln -s "$PWD/skills/perf-agent-mcp" ~/.claude/skills/perf-agent-mcp
+# Codex
+ln -s "$PWD/skills/perf-agent-mcp" ~/.codex/skills/perf-agent-mcp
+```
+
 ## Source statuses
 
 | Status | Meaning |

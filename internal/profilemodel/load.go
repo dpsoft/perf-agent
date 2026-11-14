@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -105,14 +106,24 @@ type Profile struct {
 // Load reads a profile and, if execlogPath is not "", its executions log.
 // A bad log never fails Load; it sets Executions.
 func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
-	raw, err := readCapped(profilePath, lim.MaxRawBytes, "MaxRawBytes")
+	return load(func(name string) (io.ReadCloser, error) { return os.Open(name) }, profilePath, execlogPath, lim)
+}
+
+// LoadFS is Load through fsys: both paths are fs.FS paths, so a root's FS
+// refuses names that leave it. Handle rules and limits are Load's.
+func LoadFS(fsys fs.FS, profilePath, execlogPath string, lim Limits) (*Profile, error) {
+	return load(func(name string) (io.ReadCloser, error) { return fsys.Open(name) }, profilePath, execlogPath, lim)
+}
+
+func load(open func(string) (io.ReadCloser, error), profilePath, execlogPath string, lim Limits) (*Profile, error) {
+	raw, err := readCapped(open, profilePath, lim.MaxRawBytes, "MaxRawBytes")
 	if err != nil {
 		return nil, err
 	}
 	if execlogPath == "" {
 		return assemble(raw, nil, "", lim)
 	}
-	side, err := readCapped(execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
+	side, err := readCapped(open, execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
 	switch {
 	case errors.Is(err, ErrLimit):
 		return assemble(raw, nil, ReasonSidecarLimits, lim)
@@ -127,8 +138,8 @@ func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
 
 // readCapped reads a whole file, refusing one larger than limit. It never
 // reads more than limit+1 bytes.
-func readCapped(path string, limit int64, name string) (b []byte, err error) {
-	f, err := os.Open(path)
+func readCapped(open func(string) (io.ReadCloser, error), path string, limit int64, name string) (b []byte, err error) {
+	f, err := open(path)
 	if err != nil {
 		return nil, err
 	}

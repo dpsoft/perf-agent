@@ -217,23 +217,24 @@ func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error) {
 	for _, q := range path {
 		names = append(names, q.Function.Name)
 	}
+	core, err := v.CoreFacts(id)
+	if err != nil {
+		return PathFacts{}, err
+	}
 	pf := PathFacts{
 		Handle:            v.Handle,
 		View:              v.name(),
 		Node:              n.ID,
 		Path:              names,
-		Cumulative:        intFact(MetricCumulative, n.Cum, v.Unit),
-		Self:              intFact(MetricSelf, n.Self, v.Unit),
-		ShareOfTotal:      shareFact(MetricShareOfTotal, n.Cum, v.Total, DenominatorViewTotal),
-		ShareOfParent:     unavailableFact(MetricShareOfParent, UnitRatio, ReasonNoParent),
-		InexactPortion:    intFact(MetricInexactPortion, n.Inexact, v.Unit),
+		ParentNode:        core.ParentNode,
+		Cumulative:        core.Cumulative,
+		Self:              core.Self,
+		ShareOfTotal:      core.ShareOfTotal,
+		ShareOfParent:     core.ShareOfParent,
+		InexactPortion:    core.InexactPortion,
 		Domain:            "unknown",
 		DomainInferred:    true,
 		CollisionPossible: n.CollisionPossible,
-	}
-	if n.Parent != nil {
-		pf.ParentNode = n.Parent.ID
-		pf.ShareOfParent = shareFact(MetricShareOfParent, n.Cum, n.Parent.Cum, denominatorParent+string(n.Parent.ID))
 	}
 	if classify != nil {
 		pf.Domain = classify(n.Function.Name, n.Function.Module.File)

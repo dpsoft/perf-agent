@@ -15,6 +15,7 @@ import (
 	"github.com/google/pprof/profile"
 
 	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
 func twoSamples() []byte {
@@ -448,5 +449,83 @@ func TestMaxFramesCountsEveryExpandedFrame(t *testing.T) {
 	}
 	if got := DefaultLimits().MaxFrames; got != 50_000_000 {
 		t.Fatalf("default MaxFrames %d", got)
+	}
+}
+
+func writeFixture(t *testing.T, dir, name string, b []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadFSMatchesLoad(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir, "cpu.pb.gz", pmfixture.CPUBasic())
+	writeFixture(t, dir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, dir, "gpu.execlog", pmfixture.GPUBasicExeclog(t))
+	for _, tc := range []struct{ prof, log string }{{"cpu.pb.gz", ""}, {"gpu.pb.gz", "gpu.execlog"}} {
+		want, err := Load(filepath.Join(dir, tc.prof), cmpJoin(dir, tc.log), DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := LoadFS(os.DirFS(dir), tc.prof, tc.log, DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Handle != want.Handle || got.Digest != want.Digest || got.Executions != want.Executions {
+			t.Errorf("%s: got %+v want %+v", tc.prof, got, want)
+		}
+	}
+}
+
+func cmpJoin(dir, name string) string {
+	if name == "" {
+		return ""
+	}
+	return filepath.Join(dir, name)
+}
+
+func TestLoadFSThroughARootRefusesEscapes(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "root")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, parent, "x.pb.gz", pmfixture.CPUBasic())
+	if err := os.Symlink(filepath.Join(parent, "x.pb.gz"), filepath.Join(dir, "link.pb.gz")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	for _, name := range []string{"../x.pb.gz", "link.pb.gz"} {
+		if _, err := LoadFS(root.FS(), name, "", DefaultLimits()); err == nil {
+			t.Errorf("%s was loaded", name)
+		}
+	}
+}
+
+func TestLoadFSSidecarOverLimitIsUnread(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, dir, "gpu.execlog", pmfixture.GPUBasicExeclog(t))
+	lim := DefaultLimits()
+	lim.MaxSidecarBytes = 8
+	p, err := LoadFS(os.DirFS(dir), "gpu.pb.gz", "gpu.execlog", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Executions.Reason != ReasonSidecarLimits || !strings.Contains(string(p.Handle), "+unread:") {
+		t.Fatalf("executions %+v handle %s", p.Executions, p.Handle)
+	}
+	// A missing sidecar is corrupt, not an error.
+	p, err = LoadFS(os.DirFS(dir), "gpu.pb.gz", "absent.execlog", DefaultLimits())
+	if err != nil || p.Executions.Reason != ReasonCorrupt {
+		t.Fatalf("missing sidecar: %+v, %v", p, err)
 	}
 }

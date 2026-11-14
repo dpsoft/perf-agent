@@ -75,18 +75,18 @@ func (d *decoder) explanation(raw json.RawMessage, path string) (Explanation, er
 	}
 	var e Explanation
 	for _, f := range fields {
-		at := path + "." + clip(f.name)
-		switch f.name {
+		at := path + "." + clip(f.Name)
+		switch f.Name {
 		case "node":
-			err = str(f.value, at, &e.Node)
+			err = str(f.Value, at, &e.Node)
 		case "prose":
-			err = str(f.value, at, &e.Prose)
+			err = str(f.Value, at, &e.Prose)
 		case "next_measurement":
-			err = str(f.value, at, &e.NextMeasurement)
+			err = str(f.Value, at, &e.NextMeasurement)
 		case "hypotheses":
-			e.Hypotheses, err = strs(f.value, at)
+			e.Hypotheses, err = strs(f.Value, at)
 		case "claims":
-			e.Claims, err = d.claims(f.value, at)
+			e.Claims, err = d.claims(f.Value, at)
 		case "rounding", "tolerance":
 			d.notice(at, "ignored: rounding is the engine's, set per claim by its metric")
 		default:
@@ -123,33 +123,33 @@ func (d *decoder) claim(raw json.RawMessage, path string) (Claim, error) {
 	// The rounding notice names the claim's metric wherever "metric" is.
 	var metric string
 	for _, f := range fields {
-		if f.name == "metric" {
-			_ = json.Unmarshal(f.value, &metric)
+		if f.Name == "metric" {
+			_ = json.Unmarshal(f.Value, &metric)
 		}
 	}
 	var c Claim
 	for _, f := range fields {
-		at := path + "." + clip(f.name)
-		switch f.name {
+		at := path + "." + clip(f.Name)
+		switch f.Name {
 		case "id":
-			err = str(f.value, at, &c.ID)
+			err = str(f.Value, at, &c.ID)
 		case "metric":
-			err = str(f.value, at, &c.Metric)
+			err = str(f.Value, at, &c.Metric)
 		case "scope":
-			err = str(f.value, at, &c.Scope)
+			err = str(f.Value, at, &c.Scope)
 		case "node":
-			err = str(f.value, at, &c.Node)
+			err = str(f.Value, at, &c.Node)
 		case "module":
 			var m string
-			if err = str(f.value, at, &m); err == nil {
+			if err = str(f.Value, at, &m); err == nil {
 				c.Module = &m
 			}
 		case "denominator":
-			err = str(f.value, at, &c.Denominator)
+			err = str(f.Value, at, &c.Denominator)
 		case "unit":
-			err = str(f.value, at, &c.Unit)
+			err = str(f.Value, at, &c.Unit)
 		case "value":
-			c.Value, err = literal(f.value, at)
+			c.Value, err = literal(f.Value, at)
 		case "rounding", "tolerance":
 			d.notice(at, roundingNotice(metric))
 		default:
@@ -169,9 +169,10 @@ func roundingNotice(metric string) string {
 	return fmt.Sprintf("ignored: rounding is the engine's, and %q is not a metric it knows", clip(metric))
 }
 
-type field struct {
-	name  string
-	value json.RawMessage
+// Field is one member of a JSON object, its value undecoded.
+type Field struct {
+	Name  string
+	Value json.RawMessage
 }
 
 // firstByte is the first byte of a JSON value; raw is valid JSON, which
@@ -190,9 +191,20 @@ func array(raw json.RawMessage, path string) ([]json.RawMessage, error) {
 	return items, nil
 }
 
-// object splits a JSON object, which raw must be, into its fields in order.
-// A field named twice is an error: which value was meant is unknowable.
-func object(raw json.RawMessage, path string) ([]field, error) {
+// Object splits a JSON object into its fields in order, matching names
+// exactly as sent (encoding/json would fold case). Anything but one valid
+// JSON object is an error, and so is a field named twice: which value was
+// meant is unknowable. path names the object in errors, which echo a field
+// name cut to maxEcho characters.
+func Object(raw json.RawMessage, path string) ([]Field, error) {
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("%s: not valid JSON", path)
+	}
+	return object(raw, path)
+}
+
+// object is Object for raw already known to be valid JSON.
+func object(raw json.RawMessage, path string) ([]Field, error) {
 	if firstByte(raw) != '{' {
 		return nil, fmt.Errorf("%s: must be an object", path)
 	}
@@ -200,7 +212,7 @@ func object(raw json.RawMessage, path string) ([]field, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	var fields []field
+	var fields []Field
 	seen := map[string]bool{}
 	for dec.More() {
 		tok, err := dec.Token()
@@ -219,7 +231,7 @@ func object(raw json.RawMessage, path string) ([]field, error) {
 		if err := dec.Decode(&v); err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", path, clip(name), err)
 		}
-		fields = append(fields, field{name: name, value: v})
+		fields = append(fields, Field{Name: name, Value: v})
 	}
 	return fields, nil
 }

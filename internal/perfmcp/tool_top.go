@@ -249,14 +249,14 @@ func (s *Server) handleTop(_ context.Context, raw json.RawMessage) (mcpstdio.Res
 		return mcpstdio.Result{}, err
 	}
 	if a.Rows != "functions" && a.Rows != "nodes" {
-		return mcpstdio.Result{}, fmt.Errorf("rows must be \"functions\" or \"nodes\", got %q", a.Rows)
+		return mcpstdio.Result{}, fmt.Errorf("rows must be \"functions\" or \"nodes\", got %q", echo(a.Rows))
 	}
 	by := cmp.Or(a.By, "cum")
 	if by != "cum" && by != "self" {
-		return mcpstdio.Result{}, fmt.Errorf("by must be \"cum\" or \"self\", got %q", a.By)
+		return mcpstdio.Result{}, fmt.Errorf("by must be \"cum\" or \"self\", got %q", echo(a.By))
 	}
 	if a.Domain != "" && !slices.Contains(rowDomains(), a.Domain) {
-		return mcpstdio.Result{}, fmt.Errorf("unknown domain %q; domain is one of: %s", a.Domain, strings.Join(rowDomains(), ", "))
+		return mcpstdio.Result{}, fmt.Errorf("unknown domain %q; domain is one of: %s", echo(a.Domain), strings.Join(rowDomains(), ", "))
 	}
 	limit, err := s.pageLimit(a.Limit)
 	if err != nil {

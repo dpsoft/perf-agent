@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 type response struct {
@@ -506,5 +507,41 @@ func TestMalformedArrayIsAParseErrorAndEmptyArrayIsABatch(t *testing.T) {
 	}
 	if r := c.call(`{"jsonrpc":"2.0","id":2,"method":"ping"}`); r.Error != nil {
 		t.Fatalf("ping: %+v", r.Error)
+	}
+}
+
+func TestToolErrorTextAndUnknownNamesAreBounded(t *testing.T) {
+	o := testOptions()
+	o.MaxToolErrorBytes = 100
+	o.Tools = append(o.Tools, Tool{Name: "long", Description: "fails at length",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			return Result{}, errors.New(strings.Repeat("é", 5000))
+		}})
+	c := newClient(t, o)
+	c.init()
+	r := c.call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"long","arguments":{}}}`)
+	var res struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(r.Result, &res); err != nil || !res.IsError || len(res.Content) != 1 {
+		t.Fatalf("result %s: %v", r.Result, err)
+	}
+	if text := res.Content[0].Text; len(text) > 100 || !strings.HasSuffix(text, "…") || !utf8.ValidString(text) {
+		t.Errorf("error text is %d bytes: %q", len(text), text)
+	}
+
+	huge := strings.Repeat("z", 100000)
+	for _, req := range []string{
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"` + huge + `"}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"` + huge + `"}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"` + huge + `"}}`,
+	} {
+		r := c.call(req)
+		if r.Error == nil || len(r.Error.Message) > 200 {
+			t.Errorf("%.60s: error %d bytes", req, len(r.Error.Message))
+		}
 	}
 }

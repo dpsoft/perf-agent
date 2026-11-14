@@ -61,12 +61,15 @@ type renderArgs struct {
 	Tolerance    json.RawMessage     `json:"tolerance"`
 }
 
+// renderRejected and renderWritten carry the view's sampling notes on a
+// GPU view, as every response about one does, and no notes key otherwise.
 type renderRejected struct {
 	Attempt  string            `json:"attempt"`
 	Status   string            `json:"status"`
 	Written  bool              `json:"written"`
 	Failures []explain.Failure `json:"failures"`
 	Notices  []explain.Notice  `json:"notices"`
+	Notes    []string          `json:"notes,omitzero"`
 	Next     string            `json:"next"`
 }
 
@@ -78,6 +81,7 @@ type renderWritten struct {
 	FiguresChecked   string           `json:"figures_checked"`
 	UncheckedNumbers string           `json:"unchecked_numbers"`
 	Notices          []explain.Notice `json:"notices"`
+	Notes            []string         `json:"notes,omitzero"`
 }
 
 // ignoredRounding is the notice for a top-level rounding or tolerance.
@@ -102,9 +106,16 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	// out is checked before anything is recorded, so a bad name costs no
-	// attempt; writePage checks it again when it writes.
+	// out and title are checked before anything is recorded, so a bad one
+	// costs no attempt; writePage checks out again when it writes.
 	if _, err := s.pageName(a.Out); err != nil {
+		return mcpstdio.Result{}, err
+	}
+	if err := explain.CheckTitle(a.Title, s.lim.Explain); err != nil {
+		return mcpstdio.Result{}, fmt.Errorf("%v (the limit is --limit Explain.MaxTitleBytes=N); nothing was recorded, so call render_flamegraph again without attempt", err)
+	}
+	notes, err := viewNotes(v)
+	if err != nil {
 		return mcpstdio.Result{}, err
 	}
 	if a.Attempt != "" {
@@ -144,7 +155,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 				len(r.Failures), id, maxStoredFailures, maxFailureBytes, strings.Join(says, " and "))})
 		}
 		res, err := s.respond("render_flamegraph", shrinkRejected, renderRejected{
-			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices,
+			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices, Notes: notes,
 			Next: fmt.Sprintf("nothing was written; correct every failure (the engine's value is in engine) and call render_flamegraph again with attempt %q", id),
 		})
 		if err != nil {
@@ -178,12 +189,13 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	s.log.Info("rendered", "attempt", id, "handle", a.Handle, "view", a.View, "path", path, "bytes", page.Len())
 	return s.respond("render_flamegraph", shrinkRender, renderWritten{
 		Attempt: id, Status: outcomeWritten, Path: path, Bytes: wireInt(int64(page.Len())),
-		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r))), Notices: notices,
+		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r, a.Title))), Notices: notices, Notes: notes,
 	})
 }
 
-// uncheckedNumbers counts the numbers no claim checked in r's text.
-func uncheckedNumbers(r explain.Result) int {
+// uncheckedNumbers counts the numbers no claim checked in r's text and in
+// the agent's title, which the page marks the same way.
+func uncheckedNumbers(r explain.Result, title string) int {
 	n := 0
 	count := func(segs []explain.Segment) {
 		for _, sg := range segs {
@@ -192,6 +204,7 @@ func uncheckedNumbers(r explain.Result) int {
 			}
 		}
 	}
+	count(explain.Tokenize(title))
 	for _, c := range r.Checked {
 		count(c.Prose)
 		for _, h := range c.Hypotheses {

@@ -100,8 +100,8 @@ type diffResult struct {
 	BaseQuality     Quality                   `json:"base_quality"`
 	NewQuality      Quality                   `json:"new_quality"`
 	QualityWarnings []string                  `json:"quality_warnings"`
-	BaseNotes       []string                  `json:"base_notes"`
-	NewNotes        []string                  `json:"new_notes"`
+	BaseNotes       []string                  `json:"base_notes,omitzero"`
+	NewNotes        []string                  `json:"new_notes,omitzero"`
 	PerUnit         profilemodel.Availability `json:"per_unit"`
 	Rows            []diffNodeRow             `json:"rows"`
 	pageInfo
@@ -224,8 +224,13 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 		BaseHandle: d.BaseHandle, NewHandle: d.NewHandle, View: d.View, SampleType: d.SampleType, Unit: d.Unit,
 		BaseTotal: wireInt(d.BaseTotal), NewTotal: wireInt(d.NewTotal),
 		BaseQuality: wireQuality(d.BaseQuality), NewQuality: wireQuality(d.NewQuality),
-		QualityWarnings: nonNil(d.QualityWarnings), BaseNotes: nonNil(d.BaseNotes), NewNotes: nonNil(d.NewNotes),
-		PerUnit: d.PerUnit, Rows: make([]diffNodeRow, 0, len(pg)), pageInfo: info,
+		QualityWarnings: nonNil(d.QualityWarnings),
+		PerUnit:         d.PerUnit, Rows: make([]diffNodeRow, 0, len(pg)), pageInfo: info,
+	}
+	// Like every other tool, a diff of CPU views has no notes keys and one
+	// of GPU views always has them.
+	if bv.IsGPU() {
+		out.BaseNotes, out.NewNotes = nonNil(d.BaseNotes), nonNil(d.NewNotes)
 	}
 	for _, n := range pg {
 		r := diffNodeRow{

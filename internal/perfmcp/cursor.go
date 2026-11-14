@@ -46,7 +46,7 @@ func encodeCursor(b string, offsets ...int) string {
 // encodeCursor writes them.
 func decodeCursor(c, b string, n, want int) ([]int, error) {
 	bad := func(why string) error {
-		return fmt.Errorf("cursor %q is not valid here (%s); repeat the query without cursor to start from the first page", c, why)
+		return fmt.Errorf("cursor %q is not valid here (%s); repeat the query without cursor to start from the first page", echo(c), why)
 	}
 	if len(c) > maxCursorBytes {
 		return nil, bad("too long")

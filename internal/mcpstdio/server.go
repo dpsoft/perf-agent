@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strconv"
+	"unicode/utf8"
 )
 
 // Server is an MCP server. Requests are handled one at a time, in order.
@@ -337,7 +339,7 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	}
 	i := slices.IndexFunc(s.o.Tools, func(t Tool) bool { return t.Name == p.Name })
 	if i < 0 || s.o.Tools[i].Handler == nil {
-		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + p.Name}
+		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + echoName(p.Name)}
 	}
 	args := p.Arguments
 	if len(args) == 0 || string(args) == "null" {
@@ -348,7 +350,7 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 		return nil, &rpcError{Code: codeInternalError, Message: "internal error: tool " + p.Name + " failed"}
 	}
 	if err != nil {
-		res = Result{Text: err.Error(), IsError: true}
+		res = Result{Text: cut(err.Error(), s.o.MaxToolErrorBytes), IsError: true}
 	}
 	return map[string]any{
 		"content": []textContent{{Type: "text", Text: res.Text}},
@@ -378,7 +380,7 @@ func (s *Server) getPrompt(params json.RawMessage) (any, *rpcError) {
 	}
 	i := slices.IndexFunc(s.o.Prompts, func(x Prompt) bool { return x.Name == p.Name })
 	if i < 0 {
-		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown prompt: " + p.Name}
+		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown prompt: " + echoName(p.Name)}
 	}
 	pr := s.o.Prompts[i]
 	res := map[string]any{
@@ -402,7 +404,7 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 	}
 	i := slices.IndexFunc(s.o.Resources, func(x Resource) bool { return x.URI == p.URI })
 	if i < 0 {
-		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource: " + p.URI}
+		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource: " + echoName(p.URI)}
 	}
 	r := s.o.Resources[i]
 	content := map[string]string{"uri": r.URI, "text": r.Text}
@@ -410,4 +412,30 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 		content["mimeType"] = r.MIMEType
 	}
 	return map[string]any{"contents": []map[string]string{content}}, nil
+}
+
+// maxEchoName is the most characters of a client's tool, prompt or
+// resource name an error repeats.
+const maxEchoName = 64
+
+// echoName is name cut to maxEchoName characters, quoted.
+func echoName(name string) string {
+	if r := []rune(name); len(r) > maxEchoName {
+		name = string(r[:maxEchoName-1]) + "…"
+	}
+	return strconv.Quote(name)
+}
+
+// cut is s bounded to limit bytes (no bound when limit <= 0), cut at a
+// rune boundary and ending in "…" when cut.
+func cut(s string, limit int) string {
+	const ellipsis = "…"
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	n := max(limit-len(ellipsis), 0)
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + ellipsis
 }

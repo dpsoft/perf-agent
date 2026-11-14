@@ -91,6 +91,9 @@ type Options struct {
 	Resources    []Resource
 	// MaxMessageBytes bounds one input line; 0 means 4 MiB.
 	MaxMessageBytes int
+	// MaxToolErrorBytes bounds the text of a tool error; longer text is cut
+	// and ends in "…". 0 means no bound.
+	MaxToolErrorBytes int
 	// Log receives diagnostics; nil discards them. It must not write to the
 	// stream passed to Serve.
 	Log *slog.Logger

@@ -42,13 +42,14 @@ func (s *Server) rootKind(root *os.Root) string {
 }
 
 // rel turns p into a path relative to root. A relative path is used as is;
-// an absolute one is made relative to the root's directory and refused
-// when it is not inside it. Either side may reach the directory through a
-// symlinked alias, so the root is also tried with its symlinks resolved and,
-// failing that, p with its parent directory's symlinks resolved (its last
-// element is left alone, so a symlink there is still judged by os.Root).
-// This is only the translation: os.Root enforces the root when the path is
-// opened, so ".." and symlinks that leave the root fail there.
+// an absolute one must lie lexically inside the root's directory, as the
+// server was given it or with its symlinks resolved (the server's own
+// path, never the agent's), and is made relative to it. Anything else is
+// refused by its text alone: the agent's path is never resolved, so naming
+// a directory elsewhere (a missing one, an automount, a slow mount) touches
+// no filesystem. This is only the translation: os.Root enforces the root
+// when the path is opened, so ".." and symlinks that leave the root, and
+// symlinks inside it, are judged there.
 func (s *Server) rel(root *os.Root, p string) (string, error) {
 	kind := s.rootKind(root)
 	if p == "" {
@@ -58,20 +59,12 @@ func (s *Server) rel(root *os.Root, p string) (string, error) {
 		return p, nil
 	}
 	dirs := []string{root.Name()}
-	if real, err := filepath.EvalSymlinks(root.Name()); err == nil && real != root.Name() {
+	if real, err := s.evalSymlinks(root.Name()); err == nil && real != root.Name() {
 		dirs = append(dirs, real)
 	}
-	paths := []string{p}
-	if parent, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
-		if resolved := filepath.Join(parent, filepath.Base(p)); resolved != p {
-			paths = append(paths, resolved)
-		}
-	}
-	for _, q := range paths {
-		for _, dir := range dirs {
-			if r, err := filepath.Rel(dir, q); err == nil && filepath.IsLocal(r) {
-				return r, nil
-			}
+	for _, dir := range dirs {
+		if r, err := filepath.Rel(dir, p); err == nil && filepath.IsLocal(r) {
+			return r, nil
 		}
 	}
 	return "", outsideRoot(kind, root.Name(), p)

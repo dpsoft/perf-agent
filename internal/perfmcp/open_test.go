@@ -244,17 +244,23 @@ func aliasedRoot(t *testing.T) (real, alias string) {
 
 func TestOpenAcceptsAPathThroughAnAliasOfTheRoot(t *testing.T) {
 	real, alias := aliasedRoot(t)
-	for _, tc := range []struct{ root, arg string }{
-		{real, filepath.Join(alias, "cpu.pb.gz")}, // root given as the real path, argument through the alias
-		{alias, filepath.Join(real, "cpu.pb.gz")}, // root given as the alias, argument as the real path
-	} {
-		cfg := testConfig(t)
-		cfg.ProfilesDir = tc.root
-		var out openOut
-		newTestServer(t, cfg).callOK("open", map[string]any{"path": tc.arg}, &out)
-		if out.ProfileName != "cpu.pb.gz" {
-			t.Errorf("root %s, path %s: profile_name %q", tc.root, tc.arg, out.ProfileName)
-		}
+	// The root given as the alias, the argument as the real path: the
+	// server resolves its own root, so the real path is inside it.
+	cfg := testConfig(t)
+	cfg.ProfilesDir = alias
+	var out openOut
+	newTestServer(t, cfg).callOK("open", map[string]any{"path": filepath.Join(real, "cpu.pb.gz")}, &out)
+	if out.ProfileName != "cpu.pb.gz" {
+		t.Errorf("profile_name %q", out.ProfileName)
+	}
+	// The root given as the real path, the argument through an alias the
+	// server does not know: the agent's path is never resolved, so it is
+	// outside, and the error names the root to pass paths under.
+	cfg = testConfig(t)
+	cfg.ProfilesDir = real
+	text, isErr := newTestServer(t, cfg).call("open", map[string]any{"path": filepath.Join(alias, "cpu.pb.gz")})
+	if !isErr || !strings.Contains(text, "is outside the profiles root "+real) {
+		t.Errorf("isError=%v %s", isErr, text)
 	}
 }
 

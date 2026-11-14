@@ -9,9 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/sourceroot"
 )
@@ -45,6 +48,8 @@ type Server struct {
 	// seams for tests.
 	link          func(r *os.Root, oldname, newname string) error
 	beforePublish func(name string)
+	// evalSymlinks is filepath.EvalSymlinks; a seam for tests.
+	evalSymlinks func(string) (string, error)
 }
 
 // New opens every root of cfg and builds a server. It refuses a missing or
@@ -63,6 +68,8 @@ func New(cfg Config) (_ *Server, err error) {
 		log:      cfg.Log,
 		attempts: newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews, lim.MaxHistoryBytes),
 		link:     (*os.Root).Link,
+
+		evalSymlinks: filepath.EvalSymlinks,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -92,7 +99,11 @@ func New(cfg Config) (_ *Server, err error) {
 		Prompts:         guidePrompts(),
 		Resources:       guideResources(),
 		MaxMessageBytes: lim.MaxMessageBytes,
-		Log:             s.log,
+		// A tool error is a result too: no agent argument echoed in one
+		// can make it larger than a result may be. The floor keeps the
+		// advice to raise a tiny MaxResponseBytes readable.
+		MaxToolErrorBytes: max(lim.MaxResponseBytes, minToolErrorBytes),
+		Log:               s.log,
 	})
 	return s, nil
 }
@@ -115,6 +126,10 @@ func (s *Server) Close() error {
 	}
 	return errors.Join(errs...)
 }
+
+// minToolErrorBytes is the least a tool error's text is cut to, whatever
+// MaxResponseBytes is.
+const minToolErrorBytes = 1024
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
@@ -149,20 +164,45 @@ func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 	return mcpstdio.Result{Text: string(b)}, nil
 }
 
-// decodeArgs decodes a tool's arguments into v, a pointer to a struct,
-// refusing unknown names and trailing data. The error lists the tool's
-// arguments, taken from v's JSON names.
+// decodeArgs decodes a tool's arguments into v, a pointer to a struct.
+// Names match exactly as sent, as explanations' fields do (encoding/json
+// alone would fold case), and an unknown name, a name given twice or
+// anything but one JSON object is refused. The error lists the tool's
+// arguments, taken from v's JSON names, and repeats the agent's text only
+// cut short.
 func decodeArgs(tool string, raw json.RawMessage, v any) error {
+	names := argNames(v)
+	bad := func(why string) error {
+		return fmt.Errorf("invalid arguments to %s: %s; its arguments are: %s", tool, why, strings.Join(names, ", "))
+	}
+	fields, err := explain.Object(raw, "arguments")
+	if err != nil {
+		return bad(echoError(err))
+	}
+	for _, f := range fields {
+		if !slices.Contains(names, f.Name) {
+			return bad(fmt.Sprintf("unknown argument %q (names are case-sensitive)", echo(f.Name)))
+		}
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	err := dec.Decode(v)
-	if err == nil && dec.More() {
-		err = errors.New("trailing data after the arguments object")
-	}
-	if err != nil {
-		return fmt.Errorf("invalid arguments to %s: %v; its arguments are: %s", tool, err, strings.Join(argNames(v), ", "))
+	if err := dec.Decode(v); err != nil {
+		return bad(echoError(err))
 	}
 	return nil
+}
+
+// maxEchoError is the most characters of a decoding error a message
+// repeats: a JSON type error quotes the offending number whole.
+const maxEchoError = 256
+
+// echoError is err's text cut to maxEchoError characters.
+func echoError(err error) string {
+	r := []rune(err.Error())
+	if len(r) <= maxEchoError {
+		return string(r)
+	}
+	return string(r[:maxEchoError-1]) + "…"
 }
 
 // argNames are the JSON names of the fields of the struct v points to.

@@ -112,7 +112,7 @@ func (s *Server) handleSandwich(_ context.Context, raw json.RawMessage) (mcpstdi
 			if errors.Is(err, profilemodel.ErrUnknownFunction) {
 				return mcpstdio.Result{}, fmt.Errorf("function %s is not in view %s; call top with rows=\"functions\" to list function refs", echo(string(a.Function)), a.View)
 			}
-			return mcpstdio.Result{}, fmt.Errorf("cannot compute the sandwich of function %s: %v", a.Function, err)
+			return mcpstdio.Result{}, fmt.Errorf("cannot compute the sandwich of function %s: %v", echo(string(a.Function)), err)
 		}
 		if e.sorted == nil {
 			e.sorted = map[string]any{}
@@ -129,7 +129,7 @@ func (s *Server) handleSandwich(_ context.Context, raw json.RawMessage) (mcpstdi
 			return mcpstdio.Result{}, err
 		}
 		if got[0] > len(sw.Callers) || got[1] > len(sw.Callees) {
-			return mcpstdio.Result{}, fmt.Errorf("cursor %q is not valid here (an offset is beyond its list); repeat the query without cursor to start from the first page", a.Cursor)
+			return mcpstdio.Result{}, fmt.Errorf("cursor %q is not valid here (an offset is beyond its list); repeat the query without cursor to start from the first page", echo(a.Cursor))
 		}
 		offs = [2]int{got[0], got[1]}
 	}

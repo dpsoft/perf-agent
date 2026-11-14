@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/pprof/profile"
 
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
 type qPath struct {
@@ -193,5 +195,213 @@ func TestKernelsPageWithACursor(t *testing.T) {
 	o.c.callOK("gpu_kernels_for", o.args(map[string]any{"node": conv, "limit": 1, "cursor": first.NextCursor}), &second)
 	if second.OmittedCount != "1" || second.OmittedWeight != "0" || second.Rows[0].Kernel != "k2" || second.Skipped != "1" {
 		t.Errorf("second = %+v", second)
+	}
+}
+
+func TestRenderTitleIsFreeTextBoundedAndCounted(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	exps := shareClaim(b, "0.411", "b takes {c1} of the time")
+
+	long := "Verified: b is 87% of CPU" + strings.Repeat("x", 300<<10)
+	for _, title := range []string{long, "b is {c1}", "{n:" + b + "} is hot"} {
+		text, isErr := o.c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "out": "t.html", "title": title}))
+		if !isErr || len(text) > 1024 || !strings.Contains(text, "title") {
+			t.Errorf("title %.40q: isError=%v %.300s", title, isErr, text)
+		}
+	}
+	if text, _ := o.c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "out": "t.html", "title": long})); !strings.Contains(text, "MaxTitleBytes") {
+		t.Errorf("a long title's error does not name MaxTitleBytes: %.300s", text)
+	}
+	if names := entries(t, o.out); len(names) != 0 {
+		t.Errorf("a refused title wrote %v", names)
+	}
+
+	out, text, isErr := o.render(t, map[string]any{"explanations": exps, "out": "t.html", "title": "Verified: b is 87% of CPU"})
+	if isErr {
+		t.Fatal(text)
+	}
+	// A refused title records no attempt.
+	if out.Attempt != "a1" || out.UncheckedNumbers != "1" {
+		t.Errorf("attempt %s, unchecked_numbers %s; want a1 and 1 (the title's 87%%)", out.Attempt, out.UncheckedNumbers)
+	}
+	page := string(readFile(t, out.Path))
+	if !strings.Contains(page, `<h1>Verified: b is <mark class="unchecked" title="not checked by perf-agent">87%</mark> of CPU</h1>`) {
+		t.Errorf("the heading does not mark the title's number")
+	}
+}
+
+func TestToolErrorsAreBoundedByMaxResponseBytes(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits.MaxResponseBytes = 4096
+	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
+	c := newTestServer(t, cfg)
+	var op openOut
+	c.callOK("open", map[string]any{"path": "cpu.pb.gz"}, &op)
+	o := opened{c: c, handle: op.Handle, view: op.DefaultView}
+	huge := strings.Repeat("z", 300<<10)
+	fn := o.functionRef(t, "b")
+
+	for name, call := range map[string]struct {
+		tool string
+		args any
+	}{
+		"cursor":           {"top", o.args(map[string]any{"rows": "nodes", "cursor": "c1." + huge})},
+		"rows":             {"top", o.args(map[string]any{"rows": huge})},
+		"by":               {"top", o.args(map[string]any{"rows": "nodes", "by": huge})},
+		"domain":           {"top", o.args(map[string]any{"rows": "nodes", "domain": huge})},
+		"unknown argument": {"top", o.args(map[string]any{"rows": "nodes", huge: 1})},
+		"sandwich cursor":  {"sandwich", o.args(map[string]any{"function": fn, "cursor": "c1." + huge})},
+		"view":             {"facts", map[string]any{"handle": o.handle, "view": huge, "node": "x"}},
+	} {
+		text, isErr := c.call(call.tool, call.args)
+		if !isErr || len(text) > cfg.Limits.MaxResponseBytes || strings.Contains(text, strings.Repeat("z", 100)) {
+			t.Errorf("%s: isError=%v, %d bytes: %.200s", name, isErr, len(text), text)
+		}
+	}
+
+	res := c.rpc("tools/call", map[string]any{"name": huge, "arguments": map[string]any{}})
+	if res.Error == nil || len(res.Error.Message) > cfg.Limits.MaxResponseBytes || strings.Contains(res.Error.Message, strings.Repeat("z", 100)) {
+		t.Errorf("unknown tool: %+v", res.Error)
+	}
+}
+
+func TestToolArgumentNamesMatchExactlyOnce(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	exps := mustJSON(t, shareClaim(b, "0.411", "b takes {c1} of the time"))
+	for name, raw := range map[string]string{
+		"case-folded name": fmt.Sprintf(`{"handle": %q, "view": %q, "Explanations": %s, "out": "a.html"}`, o.handle, o.view, exps),
+		"duplicate out":    fmt.Sprintf(`{"handle": %q, "view": %q, "explanations": %s, "out": "a.html", "out": "b.html"}`, o.handle, o.view, exps),
+		"duplicate title":  fmt.Sprintf(`{"handle": %q, "view": %q, "explanations": %s, "out": "a.html", "title": "x", "title": "y"}`, o.handle, o.view, exps),
+	} {
+		text, isErr := o.c.call("render_flamegraph", json.RawMessage(raw))
+		if !isErr || !strings.Contains(text, "render_flamegraph") {
+			t.Errorf("%s: isError=%v %s", name, isErr, text)
+		}
+	}
+	if names := entries(t, o.out); len(names) != 0 {
+		t.Errorf("refused arguments wrote %v", names)
+	}
+	// Every tool decodes its arguments the same way.
+	text, isErr := o.c.call("top", json.RawMessage(fmt.Sprintf(`{"handle": %q, "view": %q, "rows": "nodes", "rows": "functions"}`, o.handle, o.view)))
+	if !isErr || !strings.Contains(text, "twice") {
+		t.Errorf("duplicate rows: isError=%v %s", isErr, text)
+	}
+	text, isErr = o.c.call("top", json.RawMessage(fmt.Sprintf(`{"Handle": %q, "view": %q, "rows": "nodes"}`, o.handle, o.view)))
+	if !isErr || !strings.Contains(text, "Handle") {
+		t.Errorf("case-folded handle: isError=%v %s", isErr, text)
+	}
+}
+
+// An absolute path outside every root is refused by its text alone: nothing
+// under it is looked up, so a path naming a directory that does not exist,
+// or an automounter, costs no filesystem access.
+func TestAnAbsolutePathOutsideTheRootIsNotResolved(t *testing.T) {
+	cfg := testConfig(t)
+	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
+	c := newTestServer(t, cfg)
+	var resolved []string
+	c.srv.evalSymlinks = func(p string) (string, error) {
+		resolved = append(resolved, p)
+		return filepath.EvalSymlinks(p)
+	}
+	missing := filepath.Join(string(filepath.Separator), "perf-agent-no-such-top-dir", "sub", "cpu.pb.gz")
+	text, isErr := c.call("open", map[string]any{"path": missing})
+	if !isErr || !strings.Contains(text, "is outside the profiles root "+cfg.ProfilesDir) {
+		t.Errorf("open %s: isError=%v %s", missing, isErr, text)
+	}
+	for _, p := range resolved {
+		if strings.Contains(p, "perf-agent-no-such-top-dir") {
+			t.Errorf("rel resolved the agent's path %s", p)
+		}
+	}
+	// An absolute path inside the root still works.
+	c.callOK("open", map[string]any{"path": filepath.Join(cfg.ProfilesDir, "cpu.pb.gz")}, nil)
+}
+
+func TestFactsCarryTheViewsQualityInViewScope(t *testing.T) {
+	p := &profile.Profile{SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}, {Type: "cpu", Unit: "nanoseconds"}}}
+	fn := &profile.Function{ID: 1, Name: "main"}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
+	p.Function, p.Location = []*profile.Function{fn}, []*profile.Location{loc}
+	p.Sample = []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{3, 30}}}
+	var raw bytes.Buffer
+	if err := p.Write(&raw); err != nil {
+		t.Fatal(err)
+	}
+	o := openFixture(t, "two.pb.gz", raw.Bytes(), nil)
+	var op struct {
+		Quality json.RawMessage `json:"quality"`
+		Views   []struct {
+			View string `json:"view"`
+		} `json:"views"`
+	}
+	o.c.callOK("open", map[string]any{"path": "two.pb.gz"}, &op)
+	for _, vw := range op.Views {
+		ov := opened{c: o.c, handle: o.handle, view: vw.View}
+		var out struct {
+			ViewScope struct {
+				Quality json.RawMessage `json:"quality"`
+			} `json:"view_scope"`
+		}
+		ov.c.callOK("facts", ov.args(map[string]any{"node": ov.nodeID(t, "main")}), &out)
+		_, v, err := o.c.srv.store.view(profilemodel.Handle(o.handle), vw.View)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := mustJSON(t, wireQuality(v.Quality())); string(out.ViewScope.Quality) != want {
+			t.Errorf("view %s: view_scope.quality = %s, want %s", vw.View, out.ViewScope.Quality, want)
+		}
+		if vw.View == o.view && string(out.ViewScope.Quality) != string(op.Quality) {
+			t.Errorf("default view: view_scope.quality differs from open's quality")
+		}
+	}
+}
+
+func TestRenderResultsOnAGPUViewCarryTheNotes(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OutputDir = t.TempDir()
+	writeFixture(t, cfg.ProfilesDir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
+	c := newTestServer(t, cfg)
+	var gop, cop openOut
+	c.callOK("open", map[string]any{"path": "gpu.pb.gz"}, &gop)
+	c.callOK("open", map[string]any{"path": "cpu.pb.gz"}, &cop)
+	g := rendering{opened: opened{c: c, handle: gop.Handle, view: gop.DefaultView}, out: cfg.OutputDir}
+	conv := g.nodeID(t, "conv")
+	notesOf := func(text string) (json.RawMessage, bool) {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(text), &m); err != nil {
+			t.Fatalf("decode %s: %v", text, err)
+		}
+		n, ok := m["notes"]
+		return n, ok
+	}
+	want := mustJSON(t, gop.Notes)
+	for _, value := range []string{"0.9", "0.8"} {
+		_, text, _ := g.render(t, map[string]any{"explanations": shareClaim(conv, value, "conv is {c1}"), "out": "g" + value + ".html"})
+		if n, ok := notesOf(text); !ok || string(n) != want || len(gop.Notes) == 0 {
+			t.Errorf("value %s: notes = %s (present %v), want %s", value, n, ok, want)
+		}
+	}
+	cr := rendering{opened: opened{c: c, handle: cop.Handle, view: cop.DefaultView}, out: cfg.OutputDir}
+	_, text, _ := cr.render(t, map[string]any{"explanations": shareClaim(cr.nodeID(t, "b"), "0.411", "b is {c1}"), "out": "c.html"})
+	if _, ok := notesOf(text); ok {
+		t.Errorf("a CPU render result has notes: %s", text)
+	}
+}
+
+func TestACPUDiffHasNoNotesKeys(t *testing.T) {
+	p := openPair(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	_, text := p.diff(t, nil)
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"base_notes", "new_notes"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("a CPU diff has %s", k)
+		}
 	}
 }

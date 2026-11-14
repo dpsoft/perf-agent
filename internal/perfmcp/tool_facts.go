@@ -11,7 +11,7 @@ import (
 
 const factsDescription = "Every fact about one node: values, shares, executions below it, kernel names observed, serialization, sample periods, " +
 	"domain (inferred), the node's quality (shares of the node's own value) and the number of call sites. " +
-	"view_scope.unsampled_portion and the notes describe the whole view, never this node. A zero fact has status \"zero\"; an unavailable one has a reason and no value."
+	"view_scope (unsampled_portion and the view's quality, the same shape open returns for the default view) and the notes describe the whole view, never this node. A zero fact has status \"zero\"; an unavailable one has a reason and no value."
 
 func (s *Server) factsTool() mcpstdio.Tool {
 	return mcpstdio.Tool{
@@ -20,9 +20,12 @@ func (s *Server) factsTool() mcpstdio.Tool {
 	}
 }
 
-// viewScope holds values that describe the whole view, never the node.
+// viewScope holds values that describe the whole view, never the node:
+// the unsampled portion and the view's quality, which open reports only
+// for the default view.
 type viewScope struct {
-	UnsampledPortion Fact `json:"unsampled_portion"`
+	UnsampledPortion Fact    `json:"unsampled_portion"`
+	Quality          Quality `json:"quality"`
 }
 
 // shrinkFacts is the advice for a facts response over MaxResponseBytes: the
@@ -84,7 +87,7 @@ func (s *Server) handleFacts(_ context.Context, raw json.RawMessage) (mcpstdio.R
 		Cumulative: wireFact(pf.Cumulative), Self: wireFact(pf.Self),
 		ShareOfTotal: wireFact(pf.ShareOfTotal), ShareOfParent: wireFact(pf.ShareOfParent),
 		ExecutionsBelow: wireFact(pf.ExecutionsBelow), KernelNamesObserved: wireFact(pf.KernelNamesObserved),
-		InexactPortion: wireFact(pf.InexactPortion), ViewScope: viewScope{UnsampledPortion: wireFact(pf.UnsampledPortion)},
+		InexactPortion: wireFact(pf.InexactPortion), ViewScope: viewScope{UnsampledPortion: wireFact(pf.UnsampledPortion), Quality: wireQuality(v.Quality())},
 		Serialization: wireSerialization(pf.Serialization), SamplePeriods: nonNil(pf.SamplePeriods),
 		Domain: pf.Domain, DomainInferred: pf.DomainInferred, CollisionPossible: pf.CollisionPossible,
 		Notes: notes, Quality: wireQuality(q), CallSites: wireInt(int64(len(n.CallSites))),

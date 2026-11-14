@@ -142,12 +142,10 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 
 	id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeWritten, nil)
 	rejected, dropped := s.attempts.rejected(a.Handle, a.View)
-	if dropped > 0 {
-		rejected = append([]explain.RejectedAttempt{droppedAttempts(dropped, s.lim.MaxAttemptsPerView)}, rejected...)
-	}
 	var page bytes.Buffer
 	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
-		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id, Rejected: rejected,
+		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,
+		Rejected: rejected, DroppedRejected: dropped,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
 	})
 	if err == nil && page.Len() > s.lim.MaxPageBytes {
@@ -168,22 +166,6 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		Attempt: id, Status: outcomeWritten, Path: path, Bytes: wireInt(int64(page.Len())),
 		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r))), Notices: notices,
 	})
-}
-
-// droppedAttempts is the page's row for the rejected attempts the server
-// no longer keeps, so the page does not read as if they never happened.
-func droppedAttempts(n, max int) explain.RejectedAttempt {
-	return explain.RejectedAttempt{Attempt: "earlier", Failures: []explain.Failure{{
-		Explanation: -1, Ref: "MaxAttemptsPerView", Code: explain.CodeLimitExceeded,
-		Message: fmt.Sprintf("%s not listed: the server keeps the last %d attempts of each handle and view", earlier(n), max),
-	}}}
-}
-
-func earlier(n int) string {
-	if n == 1 {
-		return "1 earlier rejected attempt is"
-	}
-	return fmt.Sprintf("%d earlier rejected attempts are", n)
 }
 
 // uncheckedNumbers counts the numbers no claim checked in r's text.

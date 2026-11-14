@@ -93,6 +93,7 @@ func New(cfg Config) (_ *Server, err error) {
 	}
 	s.diffs = newDiffCache(lim.MaxCachedDiffs)
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles)
+	s.store.evicted = s.attempts.forget
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
 		Tools:           s.tools(),

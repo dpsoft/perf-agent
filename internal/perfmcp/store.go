@@ -39,6 +39,8 @@ type store struct {
 	// executions log from, kept after its handle is evicted: a page the
 	// server writes must never replace one of them.
 	inputs []os.FileInfo
+	// evicted, when set, is called with each handle the store drops.
+	evicted func(profilemodel.Handle)
 }
 
 func newStore(root *os.Root, lim profilemodel.Limits, max int) *store {
@@ -116,8 +118,12 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	s.entries[p.Handle] = e
 	s.order = append(s.order, p.Handle)
 	for len(s.order) > s.max {
-		delete(s.entries, s.order[0])
+		h := s.order[0]
+		delete(s.entries, h)
 		s.order = slices.Delete(s.order, 0, 1)
+		if s.evicted != nil {
+			s.evicted(h)
+		}
 	}
 	return e, nil
 }

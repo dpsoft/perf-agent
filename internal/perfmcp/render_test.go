@@ -218,16 +218,29 @@ func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 	a.add("h", "v", "", outcomeRejected, nil)
 	a.add("h", "v", "a1", outcomeRejected, nil)
 	a.add("h", "v", "a2", outcomeRejected, nil)
+	// Other outcomes are bounded apart and never evict a rejection.
+	for range 3 {
+		a.add("h", "v", "", outcomeInvalid, nil)
+	}
 	a.add("h", "w", "", outcomeRejected, nil)
 	rej, dropped := a.rejected("h", "v")
 	if len(rej) != 2 || rej[0].Attempt != "a2" || rej[1].Attempt != "a3" || rej[1].RetryOf != "a2" || dropped != 1 {
 		t.Errorf("rejected = %+v, dropped %d", rej, dropped)
 	}
-	if _, err := a.lookup("a1", "h", "v"); err == nil {
-		t.Error("a dropped attempt is still known")
+	for _, id := range []string{"a1", "a4"} {
+		if _, err := a.lookup(id, "h", "v"); err == nil {
+			t.Errorf("dropped attempt %s is still known", id)
+		}
 	}
-	if _, err := a.lookup("a4", "h", "v"); err == nil || !strings.Contains(err.Error(), "w") {
-		t.Errorf("a4 with view v: %v", err)
+	if _, err := a.lookup("a5", "h", "v"); err != nil {
+		t.Errorf("a5: %v", err)
+	}
+	if _, err := a.lookup("a7", "h", "v"); err == nil || !strings.Contains(err.Error(), "w") {
+		t.Errorf("a7 with view v: %v", err)
+	}
+	a.forget("h")
+	if rej, dropped := a.rejected("h", "v"); len(rej) != 0 || dropped != 0 || len(a.byID) != 0 || len(a.views) != 0 {
+		t.Errorf("after forget: %+v %d %d %d", rej, dropped, len(a.byID), len(a.views))
 	}
 }
 
@@ -453,10 +466,28 @@ func TestRenderPageSizeLimit(t *testing.T) {
 	}
 }
 
+// rejectedSection is the page's rejected pill and section, failing the
+// test without one.
+func rejectedSection(t *testing.T, path string) string {
+	t.Helper()
+	page := string(readFile(t, path))
+	i := strings.Index(page, "rejected at render")
+	if i < 0 {
+		i = strings.Index(page, "not kept</span>")
+	}
+	if i < 0 {
+		t.Fatal("the page lists no rejected attempt")
+	}
+	if strings.Contains(page, "exceeded at render") {
+		t.Error("the page shows a limit pill")
+	}
+	return page[max(i-200, 0):]
+}
+
 func TestThePageCountsRejectedAttemptsTheServerDropped(t *testing.T) {
 	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxAttemptsPerView = 2 })
 	b := o.nodeID(t, "b")
-	for _, retry := range []string{"", "a1"} {
+	for _, retry := range []string{"", "a1", "a2"} {
 		args := map[string]any{"explanations": shareClaim(b, "0.62", "{c1}"), "out": "x.html"}
 		if retry != "" {
 			args["attempt"] = retry
@@ -465,13 +496,93 @@ func TestThePageCountsRejectedAttemptsTheServerDropped(t *testing.T) {
 			t.Fatalf("passed: %s", text)
 		}
 	}
-	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html", "attempt": "a2"})
-	if isErr || out.Attempt != "a3" {
-		t.Fatalf("a3: %s", text)
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html", "attempt": "a3"})
+	if isErr || out.Attempt != "a4" {
+		t.Fatalf("a4: %s", text)
 	}
-	sec := string(readFile(t, out.Path))
-	sec = sec[strings.Index(sec, "<h5>Rejected at render"):]
-	if !strings.Contains(sec, "a2") || !strings.Contains(sec, "1 earlier rejected attempt is not listed") || !strings.Contains(sec, "MaxAttemptsPerView") {
-		t.Errorf("rejected section: %.2000s", sec)
+	sec := rejectedSection(t, out.Path)
+	if !strings.Contains(sec, "2 claims rejected at render in 2 attempts, plus 1 earlier rejected attempt not kept</span>") {
+		t.Errorf("rejected section: %.1500s", sec)
 	}
+}
+
+func TestRejectionsOutliveCheapAttempts(t *testing.T) {
+	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxAttemptsPerView = 2 })
+	b := o.nodeID(t, "b")
+	if _, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.62", "{c1}"), "out": "x.html"}); !isErr {
+		t.Fatalf("passed: %s", text)
+	}
+	for range 2 {
+		if _, text, isErr := o.render(t, map[string]any{"explanations": map[string]any{}, "out": "x.html"}); !isErr {
+			t.Fatalf("invalid passed: %s", text)
+		}
+	}
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html"})
+	if isErr {
+		t.Fatalf("write: %s", text)
+	}
+	sec := rejectedSection(t, out.Path)
+	if !strings.Contains(sec, "1 claim rejected at render</span>") || !strings.Contains(sec, "<s>0.62</s>") || strings.Contains(sec, "not kept") {
+		t.Errorf("rejected section: %.1500s", sec)
+	}
+}
+
+func TestAttemptsAreForgottenWithTheirHandle(t *testing.T) {
+	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxOpenHandles = 1 })
+	writeFixture(t, o.profiles, "new.pb.gz", pmfixture.CPUBasicNew())
+	b := o.nodeID(t, "b")
+	if _, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.62", "{c1}"), "out": "x.html"}); !isErr {
+		t.Fatalf("passed: %s", text)
+	}
+	o.c.callOK("open", map[string]any{"path": "new.pb.gz"}, nil)
+	o.c.callOK("open", map[string]any{"path": "cpu.pb.gz"}, nil)
+	if _, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html", "attempt": "a1"}); !isErr || !strings.Contains(text, "a1") {
+		t.Errorf("a1 after its handle was evicted: isError=%v %s", isErr, text)
+	}
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html"})
+	if isErr {
+		t.Fatalf("write: %s", text)
+	}
+	if page := string(readFile(t, out.Path)); strings.Contains(page, "Rejected at render") {
+		t.Error("the page lists an attempt of an evicted handle")
+	}
+	if len(o.c.srv.attempts.byID) != 1 {
+		t.Errorf("the record holds %d attempts", len(o.c.srv.attempts.byID))
+	}
+}
+
+func TestRenderRefusesBadPageNames(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	writeFixture(t, o.out, "file", []byte("x"))
+	if err := os.Mkdir(filepath.Join(o.out, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	long := strings.Repeat("x", 300)
+	for _, tc := range []struct{ out, want string }{
+		{strings.Repeat("p", 255-22-len(".html")+1) + ".html", "shorter"},
+		{".html", "name"},
+		{"sub/.html", "name"},
+		{"file/x.html", "a regular file"},
+		{"sub/../x.html", `".."`},
+		{"../x.html", `".."`},
+		{filepath.Join(outside, long+".html"), "outside"},
+		{long + "/x.html", "cannot open"},
+	} {
+		// A failing claim: a refused name is reported before the check.
+		_, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.62", "{c1}"), "out": tc.out})
+		if !isErr || !strings.Contains(text, tc.want) || strings.Contains(text, "rejected") {
+			t.Errorf("out %.40q: isError=%v %s", tc.out, isErr, text)
+		}
+		if strings.Contains(text, long[:100]) || strings.Contains(text, strings.Repeat("p", 100)) {
+			t.Errorf("out %.40q: the message repeats the whole path: %s", tc.out, text)
+		}
+	}
+	// The longest allowed name works, and no attempt was recorded before it.
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": strings.Repeat("p", 255-22-len(".html")) + ".html"})
+	if isErr || out.Attempt != "a1" {
+		t.Errorf("longest name: %s", text)
+	}
+	entries(t, o.out)
 }

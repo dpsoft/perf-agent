@@ -41,8 +41,10 @@ type Limits struct {
 	MaxPageBytes int
 	// MaxPageNodes bounds the frames one page draws.
 	MaxPageNodes int
-	// MaxAttemptsPerView is how many render attempts the server keeps per
-	// handle and view; one more drops the oldest.
+	// MaxAttemptsPerView is how many rejected render attempts, and apart
+	// from them how many other attempts, the server keeps per handle and
+	// view; one more drops the oldest of its kind, and the page counts the
+	// rejected ones dropped.
 	MaxAttemptsPerView int
 }
 

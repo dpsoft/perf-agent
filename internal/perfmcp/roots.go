@@ -78,7 +78,7 @@ func (s *Server) rel(root *os.Root, p string) (string, error) {
 }
 
 func outsideRoot(kind, dir, p string) error {
-	return fmt.Errorf("path %q is outside the %s root %s; pass a path inside it", p, kind, dir)
+	return fmt.Errorf("path %q is outside the %s root %s; pass a path inside it", echo(p), kind, dir)
 }
 
 // openRegular opens name inside root for reading and refuses anything but a
@@ -94,12 +94,12 @@ func openRegular(root *os.Root, kind, noun, name string) (*os.File, os.FileInfo,
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, nil, fmt.Errorf("%s %q under the %s root %s: %w", noun, name, kind, root.Name(), err)
+		return nil, nil, fmt.Errorf("%s %q under the %s root %s: %w", noun, echo(name), kind, root.Name(), err)
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
 		return nil, nil, fmt.Errorf("%s %q under the %s root %s is not a regular file (%s); pass a profile or executions log file",
-			noun, name, kind, root.Name(), describeType(fi.Mode()))
+			noun, echo(name), kind, root.Name(), describeType(fi.Mode()))
 	}
 	return f, fi, nil
 }
@@ -109,11 +109,15 @@ func openRegular(root *os.Root, kind, noun, name string) (*os.File, os.FileInfo,
 func openError(kind, dir, noun, name string, err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("%s %q not found under the %s root %s; pass a path inside it (relative to it, or absolute)", noun, name, kind, dir)
+		return fmt.Errorf("%s %q not found under the %s root %s; pass a path inside it (relative to it, or absolute)", noun, echo(name), kind, dir)
 	case escapesRoot(err):
 		return outsideRoot(kind, dir, name)
 	}
-	return fmt.Errorf("cannot open %s %q under the %s root %s: %w", noun, name, kind, dir, err)
+	// The path is named once, bounded; a PathError would repeat it whole.
+	if pe, ok := errors.AsType[*os.PathError](err); ok {
+		err = pe.Err
+	}
+	return fmt.Errorf("cannot open %s %q under the %s root %s: %w", noun, echo(name), kind, dir, err)
 }
 
 // escapesRoot reports whether err is os.Root's refusal of a path (through
@@ -136,6 +140,20 @@ func describeType(m fs.FileMode) string {
 		return "a socket"
 	case m&fs.ModeDevice != 0:
 		return "a device"
+	case m.IsRegular():
+		return "a regular file"
 	}
 	return "mode " + m.Type().String()
+}
+
+// maxEcho is the most characters of an agent's argument a message repeats.
+const maxEcho = 64
+
+// echo is s cut to maxEcho characters, ending in "…" when cut.
+func echo(s string) string {
+	r := []rune(s)
+	if len(r) <= maxEcho {
+		return s
+	}
+	return string(r[:maxEcho-1]) + "…"
 }

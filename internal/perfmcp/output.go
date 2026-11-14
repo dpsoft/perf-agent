@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 )
 
 // errRenderDisabled is every render call's answer on a server without an
@@ -21,6 +22,15 @@ const pageExt = ".html"
 
 // maxTempTries bounds the temporary names tried before giving up.
 const maxTempTries = 8
+
+// A page's temporary is ".<base>.tmp-<16 hex>", tempExtra bytes longer
+// than the page's own file name, and both must fit the maxFileName bytes a
+// file name has on common filesystems.
+const (
+	tempExtra   = len(".") + len(".tmp-") + 16
+	maxFileName = 255
+	maxPageBase = maxFileName - tempExtra
+)
 
 // writePage writes page as out inside the output root and returns its
 // absolute path. out is relative to the root, or absolute inside it, and
@@ -39,7 +49,7 @@ func (s *Server) writePage(out string, page []byte) (string, error) {
 		return "", err
 	}
 	root := s.output
-	dir, base := filepath.Split(name)
+	dir, base := filepath.Dir(name), filepath.Base(name)
 	tmp, err := writeTemp(root, dir, base, page)
 	if tmp != "" {
 		defer func() { _ = root.Remove(tmp) }()
@@ -56,7 +66,7 @@ func (s *Server) writePage(out string, page []byte) (string, error) {
 		}
 		return "", fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
 			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
-			"Start perf-agent-mcp with --output on a filesystem that supports hard links", name, root.Name(), err)
+			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), err)
 	}
 	return filepath.Join(root.Name(), name), nil
 }
@@ -69,6 +79,11 @@ func (s *Server) pageName(out string) (string, error) {
 		return "", errRenderDisabled
 	}
 	root := s.output
+	for part := range strings.SplitSeq(filepath.ToSlash(out), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("out %q has a \"..\" component; pass a path inside the output root %s without \"..\"", echo(out), root.Name())
+		}
+	}
 	name, err := s.rel(root, out)
 	if err != nil {
 		return "", err
@@ -77,8 +92,15 @@ func (s *Server) pageName(out string) (string, error) {
 	if !filepath.IsLocal(name) {
 		return "", outsideRoot(rootOutput, root.Name(), out)
 	}
-	if filepath.Ext(name) != pageExt {
+	base := filepath.Base(name)
+	switch {
+	case filepath.Ext(name) != pageExt:
 		return "", fmt.Errorf("out %q does not end in %s; pass a page name such as profile.html inside the output root %s", echo(out), pageExt, root.Name())
+	case base == pageExt:
+		return "", fmt.Errorf("out %q has no name before %s; pass a page name such as profile.html inside the output root %s", echo(out), pageExt, root.Name())
+	case len(base) > maxPageBase:
+		return "", fmt.Errorf("out %q has a %d-byte file name; the page is written beside a temporary whose name is %d bytes longer, "+
+			"and a file name is at most %d bytes, so choose a shorter name (at most %d bytes)", echo(out), len(base), tempExtra, maxFileName, maxPageBase)
 	}
 	dir := filepath.Dir(name)
 	fi, err := root.Stat(dir)
@@ -106,16 +128,16 @@ func (s *Server) refuseExisting(name string) error {
 	case err != nil:
 		return openError(rootOutput, root.Name(), "out", name, err)
 	case fi.Mode()&fs.ModeSymlink != 0:
-		return fmt.Errorf("out %s under the output root %s is a symbolic link; refusing to write through it; choose a new file name", name, root.Name())
+		return fmt.Errorf("out %s under the output root %s is a symbolic link; refusing to write through it; choose a new file name", echo(name), root.Name())
 	case slices.ContainsFunc(s.store.inputs, func(in os.FileInfo) bool { return os.SameFile(in, fi) }):
 		return fmt.Errorf("refusing to overwrite input %s: out %s under the output root %s is a file this server read; choose a new file name",
-			name, name, root.Name())
+			echo(name), echo(name), root.Name())
 	}
 	return existsError(name, root.Name())
 }
 
 func existsError(name, dir string) error {
-	return fmt.Errorf("out %s already exists under the output root %s and is never replaced; choose a new file name", name, dir)
+	return fmt.Errorf("out %s already exists under the output root %s and is never replaced; choose a new file name", echo(name), dir)
 }
 
 // writeTemp writes page to a new file ".<base>.tmp-<16 hex>" in dir inside

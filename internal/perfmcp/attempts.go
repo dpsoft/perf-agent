@@ -33,10 +33,13 @@ type viewKey struct {
 }
 
 // viewAttempts are the attempts kept for one handle and view, oldest
-// first, and how many rejected ones were dropped to keep them bounded.
+// first. Rejected attempts are bounded apart from the others, so no number
+// of cheap invalid calls can push a rejection off the page; dropped counts
+// the rejected ones dropped to keep them bounded.
 type viewAttempts struct {
-	kept    []*attempt
-	dropped int
+	rejected []*attempt
+	others   []*attempt
+	dropped  int
 }
 
 // attempts is a server's record of render attempts. IDs are "a1", "a2", …
@@ -69,20 +72,44 @@ func (a *attempts) add(h profilemodel.Handle, view, retryOf, outcome string, fai
 		va = &viewAttempts{}
 		a.views[k] = va
 	}
-	va.kept = append(va.kept, at)
 	a.byID[at.id] = at
-	for len(va.kept) > a.max {
-		old := va.kept[0]
-		va.kept = slices.Delete(va.kept, 0, 1)
-		delete(a.byID, old.id)
-		if old.outcome == outcomeRejected {
-			va.dropped++
-		}
+	if outcome == outcomeRejected {
+		va.dropped += a.keep(&va.rejected, at)
+	} else {
+		a.keep(&va.others, at)
 	}
 	return at.id
 }
 
-// setOutcome changes the outcome of the kept attempt id.
+// keep appends at to list, drops the oldest beyond max and returns how
+// many it dropped.
+func (a *attempts) keep(list *[]*attempt, at *attempt) int {
+	*list = append(*list, at)
+	n := 0
+	for len(*list) > a.max {
+		delete(a.byID, (*list)[0].id)
+		*list = slices.Delete(*list, 0, 1)
+		n++
+	}
+	return n
+}
+
+// forget drops every attempt of handle h, which the store no longer
+// holds, so the record stays as bounded as the store.
+func (a *attempts) forget(h profilemodel.Handle) {
+	for k, va := range a.views {
+		if k.handle != h {
+			continue
+		}
+		for _, at := range slices.Concat(va.rejected, va.others) {
+			delete(a.byID, at.id)
+		}
+		delete(a.views, k)
+	}
+}
+
+// setOutcome changes the outcome of the kept attempt id between outcomes
+// other than rejected, which is final and kept apart.
 func (a *attempts) setOutcome(id, outcome string) {
 	if at, ok := a.byID[id]; ok {
 		at.outcome = outcome
@@ -96,11 +123,9 @@ func (a *attempts) rejected(h profilemodel.Handle, view string) ([]explain.Rejec
 	if va == nil {
 		return nil, 0
 	}
-	var out []explain.RejectedAttempt
-	for _, at := range va.kept {
-		if at.outcome == outcomeRejected {
-			out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: at.failures})
-		}
+	out := make([]explain.RejectedAttempt, 0, len(va.rejected))
+	for _, at := range va.rejected {
+		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: at.failures})
 	}
 	return out, va.dropped
 }
@@ -118,16 +143,4 @@ func (a *attempts) lookup(id string, h profilemodel.Handle, view string) (*attem
 			"pass an attempt of this handle and view, or omit attempt", at.id, at.handle, echo(at.view), h, echo(view))
 	}
 	return at, nil
-}
-
-// maxEcho is the most characters of an agent's argument a message repeats.
-const maxEcho = 64
-
-// echo is s cut to maxEcho characters, ending in "…" when cut.
-func echo(s string) string {
-	r := []rune(s)
-	if len(r) <= maxEcho {
-		return s
-	}
-	return string(r[:maxEcho-1]) + "…"
 }

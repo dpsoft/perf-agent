@@ -143,7 +143,7 @@ func intWire(metric string, v int64, unit string) Fact {
 
 // errNode is the error for a node the view does not have.
 func errNode(node profilemodel.NodeID, view string, h profilemodel.Handle) error {
-	return fmt.Errorf("node %s is not in view %s of handle %s; call top with rows=\"nodes\" or path to find node IDs", node, view, h)
+	return fmt.Errorf("node %s is not in view %s of handle %s; call top with rows=\"nodes\" or path to find node IDs", echo(string(node)), view, h)
 }
 
 // nodeOf returns the node id of v.

@@ -218,7 +218,7 @@ func TestAttemptsAreBoundToProfileAndView(t *testing.T) {
 
 func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 	a := newAttempts(2, 256)
-	var h profilemodel.Digest
+	h := &profilemodel.Profile{}
 	a.add(h, "v", "", outcomeRejected, nil)
 	a.add(h, "v", "a1", outcomeRejected, nil)
 	a.add(h, "v", "a2", outcomeRejected, nil)
@@ -246,7 +246,7 @@ func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 
 func TestAttemptViewsAreBoundedAndKeepTheirRejectedCount(t *testing.T) {
 	a := newAttempts(2, 1)
-	var h profilemodel.Digest
+	h := &profilemodel.Profile{}
 	a.add(h, "v", "", outcomeRejected, nil)
 	a.add(h, "v", "", outcomeRejected, nil)
 	a.add(h, "w", "", outcomeRejected, nil) // evicts v's record
@@ -848,5 +848,99 @@ func TestPublishErrorsBoundTheNames(t *testing.T) {
 	_, text, isErr = o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": long + "/x.html"})
 	if !isErr || !strings.Contains(text, "permission denied") || strings.Contains(text, long[:100]) {
 		t.Errorf("temporary error: isError=%v %s", isErr, text)
+	}
+}
+
+func TestAViewNameIsEchoedBounded(t *testing.T) {
+	o := renderFixture(t, nil)
+	long := strings.Repeat("v", 200_000)
+	for _, tool := range []string{"top", "render_flamegraph"} {
+		args := map[string]any{"handle": o.handle, "view": long}
+		switch tool {
+		case "top":
+			args["rows"] = "nodes"
+		case "render_flamegraph":
+			args["explanations"], args["out"] = []any{}, "x.html"
+		}
+		text, isErr := o.c.call(tool, args)
+		if !isErr || !strings.Contains(text, "is not a view of this profile") || len(text) > 1000 || strings.Contains(text, long[:100]) {
+			t.Errorf("%s: isError=%v, %d bytes: %.300s", tool, isErr, len(text), text)
+		}
+	}
+	// A node or function the view does not have is named bounded too.
+	for _, tc := range []struct{ tool, arg, want string }{{"facts", "node", "is not in view"}, {"sandwich", "function", "is not in view"}} {
+		text, isErr := o.c.call(tc.tool, o.args(map[string]any{tc.arg: long}))
+		if !isErr || !strings.Contains(text, tc.want) || len(text) > 1000 {
+			t.Errorf("%s %s: isError=%v, %d bytes: %.300s", tc.tool, tc.arg, isErr, len(text), text)
+		}
+	}
+}
+
+func TestRejectionsMadeWithAnotherHandleAreLabelled(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OutputDir = t.TempDir()
+	writeFixture(t, cfg.ProfilesDir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, cfg.ProfilesDir, "gpu.execlog", pmfixture.GPUBasicExeclog(t))
+	c := newTestServer(t, cfg)
+	var bare, withLog openOut
+	c.callOK("open", map[string]any{"path": "gpu.pb.gz"}, &bare)
+	c.callOK("open", map[string]any{"path": "gpu.pb.gz", "execlog": "gpu.execlog"}, &withLog)
+	b := opened{c: c, handle: bare.Handle, view: bare.DefaultView}
+	l := opened{c: c, handle: withLog.Handle, view: withLog.DefaultView}
+	conv := l.nodeID(t, "conv")
+	execs := func(value string) []any {
+		return []any{map[string]any{"node": conv, "prose": "conv ran {c1} times", "claims": []any{map[string]any{
+			"id": "c1", "metric": "executions_below", "unit": "count", "value": json.RawMessage(value),
+		}}}}
+	}
+	// a1: without the log, executions are unavailable.
+	if text, isErr := c.call("render_flamegraph", b.args(map[string]any{"explanations": execs("4"), "out": "x.html"})); !isErr || !strings.Contains(text, "no sidecar") {
+		t.Fatalf("a1: isError=%v %.400s", isErr, text)
+	}
+	// a2: with the log, a wrong count.
+	if text, isErr := c.call("render_flamegraph", l.args(map[string]any{"explanations": execs("5"), "out": "x.html"})); !isErr || !strings.Contains(text, "value_mismatch") {
+		t.Fatalf("a2: isError=%v %.400s", isErr, text)
+	}
+	var res renderOut
+	c.callOK("render_flamegraph", l.args(map[string]any{"explanations": execs("4"), "out": "x.html", "attempt": "a2"}), &res)
+	sec := rejectedSection(t, res.Path)
+	label := "(made with handle " + bare.Handle[:12] + "…: opened without an executions log)"
+	if n := strings.Count(sec, label); n != 1 || !strings.Contains(sec, `<span class="ref">a1</span> <span class="muted">`+label+`</span> claim c1`) {
+		t.Errorf("a1's row is not labelled once with %q: %.2000s", label, sec)
+	}
+	if strings.Contains(sec, `<span class="ref">a2</span> <span class="muted">`) {
+		t.Errorf("a2, made with the page's own handle, is labelled: %.2000s", sec)
+	}
+	// From the bare handle, a2's row is the one made with another handle.
+	c.callOK("render_flamegraph", b.args(map[string]any{"out": "y.html", "explanations": []any{map[string]any{"node": conv, "prose": "conv"}}}), &res)
+	sec = rejectedSection(t, res.Path)
+	if !strings.Contains(sec, `<span class="ref">a2</span> <span class="muted">(made with handle `+bare.Handle[:12]+"…&#43;") ||
+		!strings.Contains(sec, ": opened with an executions log)</span>") || strings.Contains(sec, `<span class="ref">a1</span> <span class="muted">`) {
+		t.Errorf("from the bare handle: %s", sec[strings.Index(sec, "<h5>Rejected"):])
+	}
+}
+
+func TestAttemptEvidenceNamesTheHandle(t *testing.T) {
+	pd := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		h    profilemodel.Handle
+		ex   profilemodel.Availability
+		want string
+	}{
+		{profilemodel.Handle(pd), profilemodel.Availability{Reason: profilemodel.ReasonNoSidecar}, "made with handle abababababab…: opened without an executions log"},
+		{profilemodel.Handle(pd + "+" + strings.Repeat("cd", 32)), profilemodel.Availability{OK: true}, "made with handle abababababab…+cdcdcdcdcdcd…: opened with an executions log"},
+		{profilemodel.Handle(pd + "+empty"), profilemodel.Availability{Reason: profilemodel.ReasonEmptySidecar}, "made with handle abababababab…+empty: opened with an executions log that was not used (empty sidecar)"},
+		{profilemodel.Handle(pd + "+unread:sidecar-exceeds-limits:0123456789abcdef"), profilemodel.Availability{Reason: profilemodel.ReasonSidecarLimits},
+			"made with handle abababababab…+unread:sidecar-exceeds-limits:0123456789abcdef: opened with an executions log that was not used (sidecar exceeds limits)"},
+	} {
+		a := newAttempts(2, 2)
+		a.add(&profilemodel.Profile{Handle: tc.h, Executions: tc.ex}, "v", "", outcomeRejected, nil)
+		rej, _, _ := a.rejected(&profilemodel.Profile{Handle: "other"}, "v")
+		if len(rej) != 1 || rej[0].Evidence != tc.want {
+			t.Errorf("%s: %+v", tc.h, rej)
+		}
+		if rej, _, _ := a.rejected(&profilemodel.Profile{Handle: tc.h}, "v"); len(rej) != 1 || rej[0].Evidence != "" {
+			t.Errorf("%s on its own handle: %+v", tc.h, rej)
+		}
 	}
 }

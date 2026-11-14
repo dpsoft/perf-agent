@@ -18,13 +18,17 @@ const (
 	outcomeFailed   = "failed"   // checked, but the page could not be rendered or written
 )
 
-// attempt is one recorded render_flamegraph call.
+// attempt is one recorded render_flamegraph call: the view it was made on
+// and, since every handle of a profile shares the record, the handle it
+// was made with and whether that handle had executions.
 type attempt struct {
-	id       string
-	key      viewKey
-	retryOf  string
-	outcome  string
-	failures storedRecord
+	id         string
+	key        viewKey
+	handle     profilemodel.Handle
+	executions profilemodel.Availability
+	retryOf    string
+	outcome    string
+	failures   storedRecord
 }
 
 // viewKey names a view of a profile by the profile's digest, not by the
@@ -92,13 +96,14 @@ func newAttempts(max, maxViews int) *attempts {
 	}
 }
 
-// add records an attempt on view of the profile with digest d and returns
-// its ID. retryOf is the attempt it retries, already checked with lookup,
-// or "". Of failures it keeps what storedFailures keeps.
-func (a *attempts) add(d profilemodel.Digest, view, retryOf, outcome string, failures []explain.Failure) string {
+// add records an attempt on view of p, as loaded under one of its handles,
+// and returns its ID. retryOf is the attempt it retries, already checked
+// with lookup, or "". Of failures it keeps what storedFailures keeps.
+func (a *attempts) add(p *profilemodel.Profile, view, retryOf, outcome string, failures []explain.Failure) string {
 	a.next++
-	k := viewKey{d, view}
-	at := &attempt{id: "a" + strconv.Itoa(a.next), key: k, retryOf: retryOf, outcome: outcome, failures: storedFailures(failures)}
+	k := viewKey{p.Digest, view}
+	at := &attempt{id: "a" + strconv.Itoa(a.next), key: k, handle: p.Handle, executions: p.Executions,
+		retryOf: retryOf, outcome: outcome, failures: storedFailures(failures)}
 	va := a.record(k)
 	a.byID[at.id] = at
 	if outcome == outcomeRejected {
@@ -171,11 +176,12 @@ func (a *attempts) setOutcome(id, outcome string) {
 	}
 }
 
-// rejected are the kept rejected attempts of view of the profile with
-// digest d, made with any of its handles, oldest first, how many older
-// rejected ones are no longer kept, and whether that count may be short.
-func (a *attempts) rejected(d profilemodel.Digest, view string) ([]explain.RejectedAttempt, int, bool) {
-	k := viewKey{d, view}
+// rejected are the kept rejected attempts of view of p's profile, made
+// with any of its handles, oldest first, how many older rejected ones are
+// no longer kept, and whether that count may be short. An attempt made
+// with a handle other than p's says which and what executions it had.
+func (a *attempts) rejected(p *profilemodel.Profile, view string) ([]explain.RejectedAttempt, int, bool) {
+	k := viewKey{p.Digest, view}
 	va := a.views[k]
 	if va == nil {
 		c, ok := a.counts[k]
@@ -184,16 +190,21 @@ func (a *attempts) rejected(d profilemodel.Digest, view string) ([]explain.Rejec
 	out := make([]explain.RejectedAttempt, 0, len(va.rejected))
 	for _, at := range va.rejected {
 		f := at.failures
-		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: f.kept,
-			Omitted: f.omitted, OmittedClaims: f.omittedClaims, OmittedReferences: f.omittedRefs})
+		ra := explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: f.kept,
+			Omitted: f.omitted, OmittedClaims: f.omittedClaims, OmittedReferences: f.omittedRefs}
+		if at.handle != p.Handle {
+			ra.Evidence = "made with handle " + shortHandle(at.handle) + ": " + describeExecutions(at.executions)
+		}
+		out = append(out, ra)
 	}
 	return out, va.dropped, va.incomplete
 }
 
 // lookup returns the attempt id, refusing one the server does not keep and
 // one made for another profile or view. An attempt made with any handle of
-// the profile with digest d is accepted: the handles share one history.
-func (a *attempts) lookup(id string, d profilemodel.Digest, view string) (*attempt, error) {
+// p's profile is accepted: the handles share one history.
+func (a *attempts) lookup(id string, p *profilemodel.Profile, view string) (*attempt, error) {
+	d := p.Digest
 	at, ok := a.byID[id]
 	if !ok {
 		return nil, fmt.Errorf("attempt %q is not a render attempt this server keeps (it keeps the last MaxAttemptsPerView=%d of each profile and view, for the MaxAttemptViews=%d most recently used); "+
@@ -205,6 +216,37 @@ func (a *attempts) lookup(id string, d profilemodel.Digest, view string) (*attem
 			at.id, echo(at.key.view), at.key.profile, echo(view), d)
 	}
 	return at, nil
+}
+
+// shortHandle is h with its profile digest and executions log hash cut to
+// 12 hex digits each, enough to tell a profile's handles apart on a page.
+func shortHandle(h profilemodel.Handle) string {
+	cut := func(s string) string {
+		if len(s) > 12 {
+			return s[:12] + "…"
+		}
+		return s
+	}
+	pd, log, ok := strings.Cut(string(h), "+")
+	if !ok {
+		return cut(pd)
+	}
+	if reason, ok := strings.CutPrefix(log, "unread:"); ok {
+		return cut(pd) + "+unread:" + echo(reason)
+	}
+	return cut(pd) + "+" + cut(log)
+}
+
+// describeExecutions says how a handle was opened, as its executions
+// availability tells.
+func describeExecutions(ex profilemodel.Availability) string {
+	switch {
+	case ex.OK:
+		return "opened with an executions log"
+	case ex.Reason == profilemodel.ReasonNoSidecar:
+		return "opened without an executions log"
+	}
+	return "opened with an executions log that was not used (" + ex.Reason + ")"
 }
 
 // maxStoredFailures is the most failures the record keeps of one rejected

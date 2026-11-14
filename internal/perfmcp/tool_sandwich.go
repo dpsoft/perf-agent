@@ -110,7 +110,7 @@ func (s *Server) handleSandwich(_ context.Context, raw json.RawMessage) (mcpstdi
 	} else {
 		if sw, err = v.Sandwich(a.Function); err != nil {
 			if errors.Is(err, profilemodel.ErrUnknownFunction) {
-				return mcpstdio.Result{}, fmt.Errorf("function %s is not in view %s; call top with rows=\"functions\" to list function refs", a.Function, a.View)
+				return mcpstdio.Result{}, fmt.Errorf("function %s is not in view %s; call top with rows=\"functions\" to list function refs", echo(string(a.Function)), a.View)
 			}
 			return mcpstdio.Result{}, fmt.Errorf("cannot compute the sandwich of function %s: %v", a.Function, err)
 		}

@@ -104,7 +104,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	}
 
 	if len(p.Source.SampleType) == 0 {
-		return nil, fmt.Errorf("cannot open %q: the profile declares no sample types, so it has no view", name)
+		return nil, fmt.Errorf("cannot open %q: the profile declares no sample types, so it has no view", echo(name))
 	}
 	e := &entry{prof: p, name: name, views: map[string]*profilemodel.View{}, opened: opened}
 	def := defaultView(p)
@@ -176,7 +176,7 @@ func parseView(p *profilemodel.Profile, name string) (int, error) {
 	if i := slices.Index(names, name); i >= 0 {
 		return i, nil
 	}
-	return 0, fmt.Errorf("view %q is not a view of this profile; pass one of the views open returned: %s", name, strings.Join(names, ", "))
+	return 0, fmt.Errorf("view %q is not a view of this profile; pass one of the views open returned: %s", echo(name), strings.Join(names, ", "))
 }
 
 // defaultView is the view the flame graph shows by default. p declares at

@@ -35,7 +35,7 @@ const renderSchema = `{
 const renderDescription = "Check structured explanations of a view's nodes against the engine and, when every claim and reference passes, " +
 	"write an explained flame graph page under the output root. Every figure on the page is the engine's value of a checked claim; " +
 	"other numbers in the text are marked unchecked. A failing check writes nothing and returns status \"rejected\" with every failure and the engine's value; " +
-	"fix them and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record, for every handle of the same profile. " +
+	"fix them and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record, for every handle of the same profile, and names the handle of any made with another. " +
 	"An existing file is never replaced."
 
 func (s *Server) renderTool() mcpstdio.Tool {
@@ -107,7 +107,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, err
 	}
 	if a.Attempt != "" {
-		if _, err := s.attempts.lookup(a.Attempt, e.prof.Digest, a.View); err != nil {
+		if _, err := s.attempts.lookup(a.Attempt, e.prof, a.View); err != nil {
 			return mcpstdio.Result{}, err
 		}
 	}
@@ -121,14 +121,14 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 
 	exps, decoded, err := explain.Decode(a.Explanations, s.lim.Explain)
 	if err != nil {
-		id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeInvalid, nil)
+		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeInvalid, nil)
 		return mcpstdio.Result{}, fmt.Errorf("attempt %s: %v; fix explanations and call render_flamegraph again with attempt %q", id, err, id)
 	}
 	notices = append(notices, decoded...)
 
 	r := explain.Check(v, exps, s.lim.Explain)
 	if !r.OK {
-		id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeRejected, r.Failures)
+		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeRejected, r.Failures)
 		if omitted := len(r.Failures) - maxStoredFailures; omitted > 0 {
 			notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
 				"this result lists all %d failures; the server's record of %s keeps %d of them (claims first, then references, then limits), "+
@@ -145,8 +145,8 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return res, nil
 	}
 
-	id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeWritten, nil)
-	rejected, dropped, incomplete := s.attempts.rejected(e.prof.Digest, a.View)
+	id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeWritten, nil)
+	rejected, dropped, incomplete := s.attempts.rejected(e.prof, a.View)
 	var page bytes.Buffer
 	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
 		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,

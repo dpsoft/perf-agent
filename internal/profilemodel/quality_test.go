@@ -220,6 +220,16 @@ func TestNodeQualityRestrictsToTheNode(t *testing.T) {
 
 	q, den = nodeQualityAt(t, v, "main")
 	wantRatio(t, "main", q.Unresolved, 0.4, den, StatusOK)
+
+	// The diff's basis leaves the node's own frame out; NodeQuality keeps it.
+	n := oneNodeAt(t, v, "main", "libfoo.so+0x123")
+	below, _ := v.qualityBelow(n)
+	wantRatio(t, "libfoo node, strictly below", below.Unresolved, 0, "node:"+string(n.ID), StatusZero)
+	if len(below.UnresolvedByModule) != 0 {
+		t.Fatalf("strictly below libfoo node: modules %v", below.UnresolvedByModule)
+	}
+	root, _ := v.qualityBelow(v.Root)
+	wantRatio(t, "root strictly below", root.Unresolved, *v.Quality().Unresolved.Ratio, DenominatorViewTotal, StatusOK)
 }
 
 func TestZeroTotalQualityIsUnavailable(t *testing.T) {

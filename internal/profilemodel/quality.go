@@ -108,7 +108,7 @@ type Quality struct {
 
 // Quality is the quality of the whole view.
 func (v *View) Quality() Quality {
-	q, _ := v.quality(v.Root, DenominatorViewTotal)
+	q, _ := v.quality(v.Root, DenominatorViewTotal, false)
 	return q
 }
 
@@ -127,11 +127,22 @@ func (v *View) NodeQuality(id NodeID) (Quality, error) {
 // nodeQuality is NodeQuality for a node of v, with the integer weights
 // behind its shares.
 func (v *View) nodeQuality(n *Node) (Quality, qualityWeights) {
-	denominator := denominatorNode + string(n.ID)
+	return v.quality(n, nodeDenominator(v, n), false)
+}
+
+// qualityBelow is nodeQuality with unresolved frames counted strictly
+// below n: a diff judges a matched pair on it, since the pair's own frames
+// are the same on both sides and an unresolved one would only put its
+// module's share at 1 on both. For the root it is nodeQuality.
+func (v *View) qualityBelow(n *Node) (Quality, qualityWeights) {
+	return v.quality(n, nodeDenominator(v, n), true)
+}
+
+func nodeDenominator(v *View, n *Node) string {
 	if n == v.Root {
-		denominator = DenominatorViewTotal
+		return DenominatorViewTotal
 	}
-	return v.quality(n, denominator)
+	return denominatorNode + string(n.ID)
 }
 
 // qualityWeights are the integer parts behind some of a Quality's shares,
@@ -158,12 +169,12 @@ type stackMarks struct {
 
 // marksFor finds, for the samples through n, which stacks are unsampled or
 // pass through a collision, and which have an unresolved frame at or below
-// n (and in which modules). Only n's ancestors and its subtree share
-// samples with n: an ancestor's frame is on every one of n's stacks, and a
-// subtree node's samples are a subset of n's. Ancestors are never checked
-// for unresolved frames; the root has none, so for the view that is the
-// whole stack.
-func (v *View) marksFor(n *Node) stackMarks {
+// n, or strictly below it when below is set (and in which modules). Only
+// n's ancestors and its subtree share samples with n: an ancestor's frame
+// is on every one of n's stacks, and a subtree node's samples are a subset
+// of n's. Ancestors are never checked for unresolved frames; the root has
+// none, so for the view that is the whole stack.
+func (v *View) marksFor(n *Node, below bool) stackMarks {
 	m := stackMarks{
 		unsampled:  map[int]struct{}{},
 		unresolved: map[int]struct{}{},
@@ -171,7 +182,7 @@ func (v *View) marksFor(n *Node) stackMarks {
 		byModule:   map[string]map[int]struct{}{},
 		modules:    map[string]ModuleRef{},
 	}
-	mark := func(at *Node, samples []int, ancestor bool) {
+	mark := func(at *Node, samples []int, skipUnresolved bool) {
 		if len(samples) == 0 {
 			// Only zero-value samples: nothing to weigh, and no module
 			// entry for a frame seen only on them.
@@ -184,7 +195,7 @@ func (v *View) marksFor(n *Node) stackMarks {
 		if at.CollisionPossible {
 			sets = append(sets, m.collision)
 		}
-		if !ancestor && at.Depth > 0 && isUnresolved(at.Function.Name) {
+		if !skipUnresolved && at.Depth > 0 && isUnresolved(at.Function.Name) {
 			key := at.Function.Module.Key()
 			if m.byModule[key] == nil {
 				m.byModule[key] = map[int]struct{}{}
@@ -204,15 +215,17 @@ func (v *View) marksFor(n *Node) stackMarks {
 	for stack := []*Node{n}; len(stack) > 0; {
 		at := stack[len(stack)-1]
 		stack = append(stack[:len(stack)-1], at.Children...)
-		mark(at, at.samples, false)
+		mark(at, at.samples, below && at == n)
 	}
 	return m
 }
 
-// quality measures the samples through n against n.Cum. No sum here can
-// overflow: each counts a subset of n's samples at most once, and n.Cum,
-// their total, was accumulated with checks when the view was built.
-func (v *View) quality(n *Node, denominator string) (Quality, qualityWeights) {
+// quality measures the samples through n against n.Cum, counting
+// unresolved frames strictly below n when below is set (see marksFor). No
+// sum here can overflow: each counts a subset of n's samples at most once,
+// and n.Cum, their total, was accumulated with checks when the view was
+// built.
+func (v *View) quality(n *Node, denominator string, below bool) (Quality, qualityWeights) {
 	value := func(s int) int64 { return v.profile.Source.Sample[s].Value[v.Index] }
 	sumOf := func(set map[int]struct{}) int64 {
 		var sum int64
@@ -223,7 +236,7 @@ func (v *View) quality(n *Node, denominator string) (Quality, qualityWeights) {
 	}
 	share := func(metric string, part int64) Fact { return shareFact(metric, part, n.Cum, denominator) }
 
-	m := v.marksFor(n)
+	m := v.marksFor(n, below)
 	q := Quality{
 		SamplePeriods:      v.samplePeriods(n.samples),
 		Unresolved:         share(MetricQualityUnresolved, sumOf(m.unresolved)),

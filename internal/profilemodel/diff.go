@@ -60,6 +60,11 @@ const (
 	ReasonNonFinite    = "non-finite result"                  // the delta itself is not a finite float64
 )
 
+// ReasonOwnFrameUnresolved is the Why of a one-sided node whose own frame
+// is unresolved: it names no function the other side could be checked
+// for, so its absence there says nothing.
+const ReasonOwnFrameUnresolved = "own frame unresolved"
+
 // Comparability thresholds: a share moving by more than this between the
 // sides makes the nodes judged on it not comparable. They are compared
 // exactly, as rationals on the integer weights (see shiftExceeds), so a
@@ -212,7 +217,8 @@ var sideNames = [2]string{SideBase, SideNew}
 // matched.
 //
 // A node is judged on the quality of the nearest matched node at or above
-// it, on each side; the root's is the view's. The synthetic root has no
+// it, on each side, with unresolved frames counted strictly below that
+// node; the root's is the view's. The synthetic root has no
 // module, so the module rule is skipped for it: the view-level module
 // comparison is in QualityWarnings. A node is not comparable when,
 // in order: its module's unresolved share moves by more than
@@ -226,7 +232,8 @@ var sideNames = [2]string{SideBase, SideNew}
 // 0: that comparison is recorded in Why as unavailable and does not by
 // itself make the node not comparable. A one-sided node below a one-sided
 // node that is not comparable is not comparable for the same reason: its
-// absence follows from its parent's.
+// absence follows from its parent's. Last, a one-sided node whose own
+// frame is unresolved is not comparable (ReasonOwnFrameUnresolved).
 func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	if baseView.SampleType != newView.SampleType || baseView.Unit != newView.Unit ||
 		baseView.Index != newView.Index || baseView.Options.CollapseVendorRuns != newView.Options.CollapseVendorRuns {
@@ -290,8 +297,11 @@ func (d *differ) gpu() bool { return d.views[baseSide].SampleType == gpuSampleTy
 
 // basis is a matched pair that nodes are judged on, with its quality and
 // the findings that do not depend on a node's module. It is computed once
-// per matched pair, the only NodeQuality call for it, and shared by every
-// one-sided node below the pair.
+// per matched pair and shared by every one-sided node below the pair. Its
+// quality counts unresolved frames strictly below the pair (see
+// View.qualityBelow): NodeQuality's at-or-below count would include the
+// pair's own frame, the same on both sides, and an unresolved one would
+// saturate its module's share at 1 on both sides.
 type basis struct {
 	q      [2]Quality
 	w      [2]qualityWeights
@@ -302,7 +312,7 @@ type basis struct {
 func (d *differ) basisOf(pair [2]*Node) *basis {
 	b := &basis{}
 	for s, n := range pair {
-		b.q[s], b.w[s] = d.views[s].nodeQuality(n)
+		b.q[s], b.w[s] = d.views[s].qualityBelow(n)
 		b.value[s] = n.Cum
 	}
 	d.sharedFindings(b)
@@ -575,7 +585,10 @@ func groupBy(sides [2][]*Node, key func(FunctionID) (string, bool)) ([]string, m
 
 // judge decides a node's interpretation on basis b. The synthetic root is
 // judged on the shared findings only: it has no module of its own, and
-// its "no module" share would only repeat a view-level warning.
+// its "no module" share would only repeat a view-level warning. A
+// one-sided node whose own frame is unresolved is not comparable whatever
+// the shares say; that cause comes last, so a share that moved is named
+// first.
 func judge(b *basis, pair [2]*Node, root bool) (Interpretation, string) {
 	var f findings
 	if !root {
@@ -583,6 +596,9 @@ func judge(b *basis, pair [2]*Node, root bool) (Interpretation, string) {
 	}
 	f.causes = append(f.causes, b.shared.causes...)
 	f.notes = append(f.notes, b.shared.notes...)
+	if own := cmp.Or(pair[baseSide], pair[newSide]); !root && (pair[baseSide] == nil || pair[newSide] == nil) && isUnresolved(own.Function.Name) {
+		f.cause("%s", ReasonOwnFrameUnresolved)
+	}
 	if len(f.causes) > 0 {
 		return NotComparable, f.causes[0]
 	}

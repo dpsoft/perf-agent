@@ -619,6 +619,28 @@ func diffPairs() map[string]diffPair {
 				return gpuProfile(gpuK("[gpu:kernel:k]", 50, period("16", "exact")), gpuK("[gpu:kernel:k]", 50, period("16", "heuristic")))
 			},
 		},
+		// The matched [unknown] under main has an unresolved frame below it
+		// in the base only: what is under it lost its symbols, or gained
+		// them.
+		"unresolved-below-matched-unresolved": {
+			base: func() []byte {
+				return cpuProfile(fx{stack: []string{"main", "[unknown]", "[unknown]", "foo"}, value: 100})
+			},
+			new: func() []byte {
+				return cpuProfile(fx{stack: []string{"main", "[unknown]", "bar"}, value: 100})
+			},
+		},
+		// Under main, half of each side is a bare address, a different one
+		// on each side: the share does not move, but neither address can be
+		// paired with anything.
+		"own-frame-unresolved": {
+			base: func() []byte {
+				return cpuProfile(fx{stack: []string{"main", "foo"}, value: 50}, fx{stack: []string{"main", "0xdead"}, value: 50})
+			},
+			new: func() []byte {
+				return cpuProfile(fx{stack: []string{"main", "foo"}, value: 50}, fx{stack: []string{"main", "0xbeef"}, value: 50})
+			},
+		},
 		// idle and the /a foo only have zero-value samples in the base.
 		"zero-value-nodes": {
 			base: func() []byte {

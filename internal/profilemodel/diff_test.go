@@ -454,9 +454,16 @@ func TestModuleLadderPrefersTheStrongerMatch(t *testing.T) {
 // a comparison that could not be made.
 func TestUnavailableUnresolvedShareIsNotZero(t *testing.T) {
 	d := pairDiff(t, "unresolved-base-zero-new")
+	work := oneDiffAt(t, d, "main", "work")
+	wantPresence(t, work, PresenceOnlyBase, "", Comparable)
+	if !strings.Contains(work.Why, "symbols of no module: comparison unavailable in new: zero total") {
+		t.Fatalf("why %q", work.Why)
+	}
+	// The address is not comparable for its own frame, not for a share
+	// read as 0.
 	addr := oneDiffAt(t, d, "main", "libfoo.so+0x1")
-	wantPresence(t, addr, PresenceOnlyBase, "", Comparable)
-	if !strings.Contains(addr.Why, "symbols of libfoo.so: comparison unavailable in new: zero total") {
+	wantPresence(t, addr, PresenceOnlyBase, "", NotComparable)
+	if addr.Why != ReasonOwnFrameUnresolved {
 		t.Fatalf("why %q", addr.Why)
 	}
 	if !slices.Contains(d.QualityWarnings, "symbols: comparison unavailable in new: zero total") {
@@ -557,6 +564,50 @@ func TestBothTotalsZeroIsAnEmptyUnion(t *testing.T) {
 	wantUnavailable(t, "share delta", r.DeltaShare, ReasonZeroTotal)
 	if r.Interpretation != Comparable {
 		t.Fatalf("root %s (%q)", r.Interpretation, r.Why)
+	}
+}
+
+// A matched node is judged on the frames strictly below it: its own frame
+// is the same on both sides, and counting an unresolved one would put its
+// module's share at 1 on both sides and hide any change under it.
+func TestUnresolvedMatchedNodeDoesNotSaturateItsBasis(t *testing.T) {
+	d := pairDiff(t, "unresolved-below-matched-unresolved")
+	wantPresence(t, oneDiffAt(t, d, "main"), PresenceBoth, MatchByName, Comparable)
+	unk := oneDiffAt(t, d, "main", "[unknown]")
+	if unk.Presence != PresenceBoth || unk.Match != MatchByName {
+		t.Fatalf("matched [unknown]: %s %q", unk.Presence, unk.Match)
+	}
+	const shift = "symbols of no module: unresolved share 1.000 in base, 0.000 in new"
+	gone := oneDiffAt(t, d, "main", "[unknown]", "[unknown]")
+	wantPresence(t, gone, PresenceOnlyBase, "", NotComparable)
+	if gone.Why != shift {
+		t.Fatalf("one-sided [unknown] why %q, want %q", gone.Why, shift)
+	}
+	foo := oneDiffAt(t, d, "main", "[unknown]", "[unknown]", "foo")
+	wantPresence(t, foo, PresenceOnlyBase, "", NotComparable)
+	bar := oneDiffAt(t, d, "main", "[unknown]", "bar")
+	wantPresence(t, bar, PresenceOnlyNew, "", NotComparable)
+	if bar.Why != shift {
+		t.Fatalf("bar why %q, want %q", bar.Why, shift)
+	}
+}
+
+// A one-sided node whose own frame is unresolved names nothing the other
+// side could be checked for: it is not comparable even when no share
+// moved.
+func TestOneSidedUnresolvedFrameIsNotComparable(t *testing.T) {
+	d := pairDiff(t, "own-frame-unresolved")
+	wantPresence(t, oneDiffAt(t, d, "main"), PresenceBoth, MatchByName, Comparable)
+	wantPresence(t, oneDiffAt(t, d, "main", "foo"), PresenceBoth, MatchByName, Comparable)
+	for _, tc := range []struct {
+		name string
+		p    Presence
+	}{{"0xdead", PresenceOnlyBase}, {"0xbeef", PresenceOnlyNew}} {
+		n := oneDiffAt(t, d, "main", tc.name)
+		wantPresence(t, n, tc.p, "", NotComparable)
+		if n.Why != ReasonOwnFrameUnresolved {
+			t.Fatalf("%s why %q, want %q", tc.name, n.Why, ReasonOwnFrameUnresolved)
+		}
 	}
 }
 

@@ -48,8 +48,14 @@ const (
 // ExplainedPageOptions name what an explained page shows about its input
 // and how large it may be.
 type ExplainedPageOptions struct {
-	Title       string
-	ProfileName string // the input's file name, shown in the footer
+	// Title is the agent's title. It is free text: its numbers are marked
+	// unchecked in the heading, like any number no claim checked, and
+	// placeholders in it are shown as written. Empty means the profile's
+	// name, which is not agent text and is shown as it is.
+	Title string
+	// ProfileName is the profile's path relative to the profiles root,
+	// shown in the footer and named by the follow-up prompts.
+	ProfileName string
 	Digest      string // the profile digest the follow-up prompts name
 	Attempt     string // the attempt this page was written for
 	// Rejected are the server's record of the attempts refused before this
@@ -184,6 +190,7 @@ type exLegend struct{ Key, Label string }
 type explainedPageData struct {
 	LightChrome, DarkChrome, Palette template.CSS
 	Title, ProfileName, Digest       string
+	TitleSegs                        []exSegment
 	Attempt, View                    string
 	CheckedPill                      string
 	RejectedPill, LimitPill          string
@@ -359,6 +366,7 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		DarkChrome:  template.CSS(darkChrome),
 		Palette:     template.CSS(paletteCSS + jitterCSS),
 		Title:       cmp.Or(b.opts.Title, b.opts.ProfileName, "Explained flame graph"),
+		TitleSegs:   titleSegments(b.opts),
 		ProfileName: b.opts.ProfileName,
 		Digest:      b.opts.Digest,
 		Attempt:     b.opts.Attempt,
@@ -791,6 +799,24 @@ func (b *explainedBuilder) segments(segs []explain.Segment, claims map[string]ex
 	return out
 }
 
+// titleSegments is the heading: the agent's title with its numbers marked
+// unchecked (a title has no claims, so a placeholder in it is text), or
+// the default title as plain text.
+func titleSegments(opts ExplainedPageOptions) []exSegment {
+	if opts.Title == "" {
+		return []exSegment{{Kind: "text", Text: cmp.Or(opts.ProfileName, "Explained flame graph")}}
+	}
+	out := []exSegment{}
+	for _, sg := range explain.Tokenize(opts.Title) {
+		if sg.Kind == explain.SegmentUnchecked {
+			out = append(out, exSegment{Kind: "unchecked", Text: sg.Text, Title: "not checked by perf-agent"})
+		} else {
+			out = append(out, exSegment{Kind: "text", Text: sg.Text})
+		}
+	}
+	return out
+}
+
 // claimTitle names what a claim's figure is about: the metric, the node by
 // name and ID (or the whole view), the exact value and its rounding.
 func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
@@ -859,9 +885,16 @@ func (b *explainedBuilder) path(f *exFrame) []exPathItem {
 	return out
 }
 
-// prompts are the follow-up questions, with slots for the frame.
+// prompts are the follow-up questions, with slots for the frame. Each
+// names the profile's path relative to the profiles root, when known, and
+// its digest, so whoever follows one opens that file and checks it is the
+// same evidence before asking about it.
 func (b *explainedBuilder) prompts() []exPrompt {
 	suffix := " Use perf-agent-mcp: profile digest " + b.opts.Digest + ", view " + b.view + "."
+	if b.opts.ProfileName != "" {
+		suffix = " Use perf-agent-mcp: open the profile " + b.opts.ProfileName + " (relative to the profiles root), check that its profile_digest is " +
+			b.opts.Digest + ", view " + b.view + "."
+	}
 	id, name := exPromptPart{Slot: "id"}, exPromptPart{Slot: "name"}
 	lit := func(s string) exPromptPart { return exPromptPart{Text: s} }
 	out := []exPrompt{

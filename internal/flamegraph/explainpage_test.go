@@ -280,7 +280,14 @@ func TestExplainedPageChipsNameDigestViewAndNode(t *testing.T) {
 		assert.Contains(t, s, "cpu/nanoseconds#0")
 		assert.Contains(t, s, string(b))
 	}
-	assert.Contains(t, got, html.EscapeString("Why is node "+string(b)+" (b) wide? Use perf-agent-mcp: profile digest "+exDigest+", view cpu/nanoseconds#0."))
+	assert.Contains(t, got, html.EscapeString("Why is node "+string(b)+" (b) wide? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is "+exDigest+", view cpu/nanoseconds#0."))
+	for _, p := range prompts {
+		assert.Contains(t, html.UnescapeString(p[1]), "open the profile cpu.pb.gz")
+	}
+	// Without a profile name the prompts still name the digest and view.
+	opts := exOpts()
+	opts.ProfileName = ""
+	assert.Contains(t, exPage(t, v, r, opts), html.EscapeString("wide? Use perf-agent-mcp: profile digest "+exDigest+", view cpu/nanoseconds#0."))
 
 	gv, conv, gr := gpuBasicExplained(t)
 	gpu := exPage(t, gv, gr, exOpts())
@@ -891,4 +898,27 @@ func TestALongHistoryIsNotRenderedWhole(t *testing.T) {
 	assert.Less(t, alloc, uint64(32<<20), "rendering a %d-byte page allocated %d bytes", page.Len(), alloc)
 	assert.LessOrEqual(t, page.Len(), opts.MaxBytes)
 	assert.Contains(t, page.String(), `<span class="ref">a5000</span>`)
+}
+
+func TestExplainedPageMarksNumbersInTheTitle(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	opts := exOpts()
+	opts.Title = "Verified: b is 87% of CPU"
+	got := exPage(t, v, r, opts)
+	h1 := regexp.MustCompile(`(?s)<h1>(.*?)</h1>`).FindStringSubmatch(got)
+	require.Len(t, h1, 2)
+	assert.Equal(t, `Verified: b is <mark class="unchecked" title="not checked by perf-agent">87%</mark> of CPU`, h1[1])
+	assert.Contains(t, got, "<title>Verified: b is 87% of CPU</title>")
+
+	// A title with placeholders (which a server refuses) shows them as text.
+	opts.Title = "{c1} under {n:0123456789abcdef}"
+	h1 = regexp.MustCompile(`(?s)<h1>(.*?)</h1>`).FindStringSubmatch(exPage(t, v, r, opts))
+	require.Len(t, h1, 2)
+	assert.Equal(t, "{c1} under {n:0123456789abcdef}", h1[1])
+
+	// The default title is the profile's name, not agent text: no marks.
+	opts.Title, opts.ProfileName = "", "cpu-2026.pb.gz"
+	h1 = regexp.MustCompile(`(?s)<h1>(.*?)</h1>`).FindStringSubmatch(exPage(t, v, r, opts))
+	require.Len(t, h1, 2)
+	assert.Equal(t, "cpu-2026.pb.gz", h1[1])
 }

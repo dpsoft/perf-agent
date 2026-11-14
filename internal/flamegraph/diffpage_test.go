@@ -2,6 +2,7 @@ package flamegraph
 
 import (
 	"bytes"
+	"fmt"
 	"html"
 	"os"
 	"regexp"
@@ -178,5 +179,50 @@ func TestWriteDiffPageSample(t *testing.T) {
 	}
 	if err := os.WriteFile(dir+"/task-7-sample.html", []byte(pageOf(t, sampleDiff())), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDiffPageCountsUndrawnNodes(t *testing.T) {
+	root := dnode("", 100000, 100000, dnode("big", 99990, 99990), dnode("tiny1", 4, 4), dnode("tiny2", 3, 3))
+	page := pageOf(t, diffOf("cpu", "nanoseconds", 100000, 100000, root))
+	if !strings.Contains(page, "2 nodes under 0.05% of the total are not drawn") {
+		t.Error("omitted count missing")
+	}
+	if strings.Contains(pageOf(t, sampleDiff()), "not drawn") {
+		t.Error("omitted line shown with nothing omitted")
+	}
+}
+
+func TestDiffPageTableCapKeepsLargestRemovals(t *testing.T) {
+	var kids []*profilemodel.DiffNode
+	for i := range maxTableRows + 20 {
+		kids = append(kids, dnode(fmt.Sprintf("small_%03d", i), 1, 0))
+	}
+	kids = append(kids, dnode("huge_removal", 5000, 0))
+	root := dnode("", 10000, 10000, kids...)
+	page := pageOf(t, diffOf("cpu", "nanoseconds", 10000, 10000, root))
+	if !strings.Contains(page, "huge_removal") {
+		t.Error("largest removal lost to the cap")
+	}
+	if !strings.Contains(page, "Showing 500 of 521") {
+		t.Error("cap not stated")
+	}
+}
+
+func TestDiffPageShowsSamplingNotes(t *testing.T) {
+	d := sampleDiff()
+	d.BaseNotes = []string{"launches sampled 1 in 8"}
+	d.NewNotes = []string{"no sampling here"}
+	page := pageOf(t, d)
+	for _, want := range []string{"base: launches sampled 1 in 8", "new: no sampling here"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+}
+
+func TestDiffPageNilDiff(t *testing.T) {
+	if err := WriteDiffPage(&bytes.Buffer{}, nil, "x"); err == nil {
+		t.Error("nil diff accepted")
 	}
 }

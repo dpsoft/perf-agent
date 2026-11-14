@@ -1,11 +1,14 @@
 package flamegraph
 
 import (
+	"cmp"
 	_ "embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -49,6 +52,7 @@ type diffRow struct {
 	Delta          string
 	Interpretation string
 	Why            string
+	absDelta       int64
 }
 
 type diffPageData struct {
@@ -61,7 +65,11 @@ type diffPageData struct {
 	Warnings                []string
 	Root                    *diffNodeView
 	Rows                    []diffRow
+	RowsTotal               int
 	RowsTruncated           bool
+	Omitted                 int
+	FullScale               string
+	BaseNotes, NewNotes     []string
 }
 
 // WriteDiffPage renders d as one self-contained HTML page: an icicle of
@@ -74,6 +82,9 @@ type diffPageData struct {
 // raw DeltaAbs in the sample unit is always shown beside it. A node whose
 // share is unavailable is grey.
 func WriteDiffPage(w io.Writer, d *profilemodel.Diff, title string) error {
+	if d == nil {
+		return errors.New("flamegraph: nil diff")
+	}
 	data := &diffPageData{
 		PageTitle:   title,
 		LightChrome: lightChrome,
@@ -85,13 +96,21 @@ func WriteDiffPage(w io.Writer, d *profilemodel.Diff, title string) error {
 		BaseHandle:  string(d.BaseHandle),
 		NewHandle:   string(d.NewHandle),
 		Warnings:    d.QualityWarnings,
+		BaseNotes:   d.BaseNotes,
+		NewNotes:    d.NewNotes,
 	}
 	data.Empty = d.Root == nil || (d.BaseTotal == 0 && d.NewTotal == 0) || d.Root.Combined <= 0
 	data.OneEmpty = !data.Empty && (d.BaseTotal == 0 || d.NewTotal == 0)
 	if !data.Empty {
 		b := &diffBuilder{unit: d.Unit, rootCombined: d.Root.Combined, scale: shareScale(d.Root)}
 		data.Root = b.view(d.Root, d.Root.Combined)
+		data.Omitted = b.omitted
+		data.FullScale = strconv.FormatFloat(100*b.scale, 'f', 2, 64)
 		b.collect(d.Root, nil, false)
+		slices.SortStableFunc(b.rows, func(x, y diffRow) int {
+			return cmp.Or(cmp.Compare(y.absDelta, x.absDelta), strings.Compare(x.Path, y.Path))
+		})
+		data.RowsTotal = len(b.rows)
 		if len(b.rows) > maxTableRows {
 			b.rows, data.RowsTruncated = b.rows[:maxTableRows], true
 		}
@@ -107,6 +126,7 @@ type diffBuilder struct {
 	rootCombined int64
 	scale        float64
 	rows         []diffRow
+	omitted      int
 }
 
 // shareScale is the share shift drawn at full saturation.
@@ -152,7 +172,10 @@ func (b *diffBuilder) view(n *profilemodel.DiffNode, parentCombined int64) *diff
 		classes = append(classes, "share-same")
 	}
 	if ok && share != 0 {
-		v.Hue = strconv.Itoa(map[bool]int{true: hueHigher, false: hueLower}[share > 0])
+		v.Hue = strconv.Itoa(hueLower)
+		if share > 0 {
+			v.Hue = strconv.Itoa(hueHigher)
+		}
 		v.Tint = strconv.FormatFloat(min(1, math.Abs(share)/b.scale), 'f', 3, 64)
 	} else {
 		v.Hue, v.Tint = "0", "0"
@@ -174,6 +197,9 @@ func (b *diffBuilder) view(n *profilemodel.DiffNode, parentCombined int64) *diff
 	v.Tooltip = b.tooltip(n, share, ok)
 	for _, c := range n.Children {
 		if float64(c.Combined) < minDrawFraction*float64(b.rootCombined) || c.Combined <= 0 {
+			if c.Combined > 0 {
+				b.omitted += countNodes(c)
+			}
 			continue
 		}
 		v.Kids = append(v.Kids, b.view(c, n.Combined))
@@ -219,6 +245,7 @@ func (b *diffBuilder) collect(n *profilemodel.DiffNode, path []string, parentOne
 			Delta:          signed(n.DeltaAbs, b.unit),
 			Interpretation: string(n.Interpretation),
 			Why:            n.Why,
+			absDelta:       absDelta(n.DeltaAbs),
 		})
 	}
 	for _, c := range n.Children {
@@ -234,4 +261,25 @@ func percent(part, whole int64) string {
 		return "0"
 	}
 	return strconv.FormatFloat(100*float64(part)/float64(whole), 'f', 4, 64)
+}
+
+// countNodes counts n and everything below it: a node left out of the
+// drawing takes its subtree with it.
+func countNodes(n *profilemodel.DiffNode) int {
+	c := 1
+	for _, k := range n.Children {
+		c += countNodes(k)
+	}
+	return c
+}
+
+// absDelta is |v|, saturating at MaxInt64 for MinInt64.
+func absDelta(v int64) int64 {
+	switch {
+	case v == math.MinInt64:
+		return math.MaxInt64
+	case v < 0:
+		return -v
+	}
+	return v
 }

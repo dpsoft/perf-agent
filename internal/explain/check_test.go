@@ -652,3 +652,35 @@ func TestEchoedAgentTextIsBounded(t *testing.T) {
 	}
 	bounded("decode error", err.Error())
 }
+
+func TestGluedDotsSignedExponentsAndAdjacentPlaceholdersAreRefused(t *testing.T) {
+	v, conv := gpuBasic(t, true)
+	claims := []string{
+		`{"id": "c1", "metric": "executions_below", "unit": "count", "value": 4}`,
+		`{"id": "c2", "metric": "kernel_names_observed", "unit": "count", "value": 3}`,
+	}
+	for _, prose := range []string{
+		".{c1}", "x.{c1}", "{c1}{c1}", "{c1}{c2}", "{c1}{n:" + string(conv) + "}", "{n:" + string(conv) + "}{c1}",
+		"{c1}e+3", "{c1}E-3", "{c1}e−3",
+	} {
+		r, _ := check(t, v, one(conv, prose, claims...))
+		if r.OK || len(r.Failures) == 0 {
+			t.Errorf("%q accepted", prose)
+			continue
+		}
+		for _, f := range r.Failures {
+			if f.Code != CodeGluedToClaim {
+				t.Errorf("%q: failure = %+v, want only glued_to_claim", prose, f)
+			}
+		}
+	}
+	for _, prose := range []string{
+		"{c1}, {c2}", "({c1})", "{c1}%", "{c1} ms", "between {c1} and {c2}", "{c1}e+", "{c1}E-x", "was {c1}.",
+		"{c1} under {n:" + string(conv) + "}", "{c1}/{c2}",
+	} {
+		r, _ := check(t, v, one(conv, prose, claims...))
+		if !r.OK {
+			t.Errorf("%q: %+v", prose, r.Failures)
+		}
+	}
+}

@@ -77,8 +77,8 @@ var claimable = func() []string {
 // the value at the engine's rounding (profilemodel.PolicyFor) equal to the
 // fact's canonical value, compared as decimals. Every explanation's node
 // and every "{n:…}" placeholder in its text must resolve, a "{cN}" only to a
-// claim of the same explanation, with no sign, digit, exponent or decimals
-// glued to it, and every "{n:" must be a well-formed node reference. Near
+// claim of the same explanation, with nothing glued to it that changes the
+// number read (see gluedText), and every "{n:" must be a well-formed node reference. Near
 // misses of the claim pattern, like "{c1 }", stay text. Any limit exceeded
 // is reported instead of all of that. Every failure is reported, with agent
 // text echoed in it cut to maxEcho characters, and nothing is accepted when
@@ -246,7 +246,7 @@ func (c *checker) explanation(i int, e Explanation) Checked {
 func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) []Segment {
 	segs := Tokenize(s)
 	end := 0
-	for _, sg := range segs {
+	for k, sg := range segs {
 		start := end
 		end += len(sg.Text)
 		switch sg.Kind {
@@ -259,9 +259,16 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeUnresolvedClaimRef,
 					Message: fmt.Sprintf("%s is a claim of explanations[%d]: a placeholder names only claims of its own explanation, so state the figure here as a claim with its own id. %s", sg.Text, def.explanation, bracesAdvice)})
 			}
-			if glued, ok := gluedText(s[:start], sg.Text, s[end:]); ok {
+			var prev, next *Segment
+			if k > 0 {
+				prev = &segs[k-1]
+			}
+			if k+1 < len(segs) {
+				next = &segs[k+1]
+			}
+			if glued, ok := gluedText(s[:start], sg.Text, s[end:], prev, next); ok {
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeGluedToClaim,
-					Message: fmt.Sprintf("%q glues text to %s: a sign or digits before a claim, or digits, an exponent or decimals after it, change the number a reader sees; put a space or words between them", clip(glued), sg.Text)})
+					Message: fmt.Sprintf("%q glues text to %s: a sign, digits, a dot or another placeholder right before a claim, or digits, an exponent, decimals or another placeholder right after it, change the number a reader sees; put a space or words between them", clip(glued), sg.Text)})
 			}
 		case SegmentNode:
 			refs[sg.Node] = struct{}{}
@@ -296,34 +303,47 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 const bracesAdvice = "To mention a frame whose name contains braces, use {n:<id>} instead of its name."
 
 // gluedText reports whether the text around a claim placeholder changes the
-// number it shows: a sign (+, -, U+2212) or a numeric character right
-// before it, or a "." right before it that follows a numeric character; a
-// numeric character right after it, or "e", "E", "." or "," followed by
-// one. It returns the placeholder with the glued characters.
-func gluedText(before, ph, after string) (string, bool) {
-	prev, size := utf8.DecodeLastRuneInString(before)
-	if before != "" {
-		switch {
-		case prev == '+' || prev == '-' || prev == '\u2212' || unicode.IsNumber(prev):
-			return string(prev) + ph, true
-		case prev == '.':
-			if p2, _ := utf8.DecodeLastRuneInString(before[:len(before)-size]); unicode.IsNumber(p2) {
-				return string(p2) + "." + ph, true
-			}
-		}
+// number it shows. Before it: a sign (+, -, U+2212), a numeric character
+// or a "." (".{c1}" reads as a fraction). After it: a numeric character, a
+// "." or "," followed by one, or "e"/"E" followed by an optional sign and
+// one (an exponent). On either side: another claim or node placeholder with
+// nothing between ("{c1}{c2}" reads as one number). prev and next are the
+// neighbouring segments, nil at the ends. It returns the placeholder with
+// what is glued to it.
+func gluedText(before, ph, after string, prev, next *Segment) (string, bool) {
+	isPlaceholder := func(sg *Segment) bool { return sg != nil && (sg.Kind == SegmentClaim || sg.Kind == SegmentNode) }
+	if isPlaceholder(prev) {
+		return prev.Text + ph, true
 	}
-	next, size := utf8.DecodeRuneInString(after)
+	if isPlaceholder(next) {
+		return ph + next.Text, true
+	}
+	if p, _ := utf8.DecodeLastRuneInString(before); before != "" && (isSign(p) || p == '.' || unicode.IsNumber(p)) {
+		return string(p) + ph, true
+	}
+	r, size := utf8.DecodeRuneInString(after)
 	switch {
 	case after == "":
-	case unicode.IsNumber(next):
-		return ph + string(next), true
-	case next == 'e' || next == 'E' || next == '.' || next == ',':
-		if n2, size2 := utf8.DecodeRuneInString(after[size:]); unicode.IsNumber(n2) {
+	case unicode.IsNumber(r):
+		return ph + string(r), true
+	case r == '.' || r == ',':
+		if r2, size2 := utf8.DecodeRuneInString(after[size:]); unicode.IsNumber(r2) {
 			return ph + after[:size+size2], true
+		}
+	case r == 'e' || r == 'E':
+		at := size
+		if r2, size2 := utf8.DecodeRuneInString(after[at:]); isSign(r2) {
+			at += size2
+		}
+		if r3, size3 := utf8.DecodeRuneInString(after[at:]); unicode.IsNumber(r3) {
+			return ph + after[:at+size3], true
 		}
 	}
 	return "", false
 }
+
+// isSign reports whether r is a plus or minus sign.
+func isSign(r rune) bool { return r == '+' || r == '-' || r == '\u2212' }
 
 // claimDef is where a claim ID was first defined.
 type claimDef struct {

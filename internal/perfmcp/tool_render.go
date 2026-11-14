@@ -141,11 +141,11 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	}
 
 	id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeWritten, nil)
-	rejected, dropped := s.attempts.rejected(a.Handle, a.View)
+	rejected, dropped, incomplete := s.attempts.rejected(a.Handle, a.View)
 	var page bytes.Buffer
 	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
 		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,
-		Rejected: rejected, DroppedRejected: dropped,
+		Rejected: rejected, DroppedRejected: dropped, HistoryIncomplete: incomplete,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
 	})
 	if err == nil && page.Len() > s.lim.MaxPageBytes {

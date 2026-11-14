@@ -214,7 +214,7 @@ func TestAttemptsAreBoundToHandleAndView(t *testing.T) {
 }
 
 func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
-	a := newAttempts(2)
+	a := newAttempts(2, 256)
 	a.add("h", "v", "", outcomeRejected, nil)
 	a.add("h", "v", "a1", outcomeRejected, nil)
 	a.add("h", "v", "a2", outcomeRejected, nil)
@@ -223,7 +223,7 @@ func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 		a.add("h", "v", "", outcomeInvalid, nil)
 	}
 	a.add("h", "w", "", outcomeRejected, nil)
-	rej, dropped := a.rejected("h", "v")
+	rej, dropped, _ := a.rejected("h", "v")
 	if len(rej) != 2 || rej[0].Attempt != "a2" || rej[1].Attempt != "a3" || rej[1].RetryOf != "a2" || dropped != 1 {
 		t.Errorf("rejected = %+v, dropped %d", rej, dropped)
 	}
@@ -238,9 +238,34 @@ func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 	if _, err := a.lookup("a7", "h", "v"); err == nil || !strings.Contains(err.Error(), "w") {
 		t.Errorf("a7 with view v: %v", err)
 	}
-	a.forget("h")
-	if rej, dropped := a.rejected("h", "v"); len(rej) != 0 || dropped != 0 || len(a.byID) != 0 || len(a.views) != 0 {
-		t.Errorf("after forget: %+v %d %d %d", rej, dropped, len(a.byID), len(a.views))
+}
+
+func TestAttemptViewsAreBoundedAndKeepTheirRejectedCount(t *testing.T) {
+	a := newAttempts(2, 1)
+	a.add("h", "v", "", outcomeRejected, nil)
+	a.add("h", "v", "", outcomeRejected, nil)
+	a.add("h", "w", "", outcomeRejected, nil) // evicts v's record
+	if _, err := a.lookup("a1", "h", "v"); err == nil {
+		t.Error("an attempt of an evicted view is still known")
+	}
+	if len(a.views) != 1 || len(a.byID) != 1 {
+		t.Errorf("%d views, %d attempts kept", len(a.views), len(a.byID))
+	}
+	a.add("h", "v", "", outcomeWritten, nil) // evicts w's record
+	rej, dropped, incomplete := a.rejected("h", "v")
+	if len(rej) != 0 || dropped != 2 || incomplete {
+		t.Errorf("v: %+v dropped %d incomplete %v", rej, dropped, incomplete)
+	}
+	// The counters hold 4 views; one more rejected view evicted loses count.
+	for i := range 6 {
+		a.add("h", fmt.Sprint("x", i), "", outcomeRejected, nil)
+	}
+	if len(a.counts) > 4 {
+		t.Errorf("%d counters", len(a.counts))
+	}
+	a.add("h", "fresh", "", outcomeWritten, nil)
+	if _, _, incomplete := a.rejected("h", "fresh"); !incomplete {
+		t.Error("a view without a record after the counters overflowed reads as complete")
 	}
 }
 
@@ -527,7 +552,7 @@ func TestRejectionsOutliveCheapAttempts(t *testing.T) {
 	}
 }
 
-func TestAttemptsAreForgottenWithTheirHandle(t *testing.T) {
+func TestRejectionsSurviveHandleEviction(t *testing.T) {
 	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxOpenHandles = 1 })
 	writeFixture(t, o.profiles, "new.pb.gz", pmfixture.CPUBasicNew())
 	b := o.nodeID(t, "b")
@@ -536,18 +561,80 @@ func TestAttemptsAreForgottenWithTheirHandle(t *testing.T) {
 	}
 	o.c.callOK("open", map[string]any{"path": "new.pb.gz"}, nil)
 	o.c.callOK("open", map[string]any{"path": "cpu.pb.gz"}, nil)
-	if _, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html", "attempt": "a1"}); !isErr || !strings.Contains(text, "a1") {
-		t.Errorf("a1 after its handle was evicted: isError=%v %s", isErr, text)
-	}
 	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html"})
 	if isErr {
 		t.Fatalf("write: %s", text)
 	}
-	if page := string(readFile(t, out.Path)); strings.Contains(page, "Rejected at render") {
-		t.Error("the page lists an attempt of an evicted handle")
+	sec := rejectedSection(t, out.Path)
+	if !strings.Contains(sec, "1 claim rejected at render</span>") || !strings.Contains(sec, "<s>0.62</s>") {
+		t.Errorf("rejected section: %.1500s", sec)
 	}
-	if len(o.c.srv.attempts.byID) != 1 {
-		t.Errorf("the record holds %d attempts", len(o.c.srv.attempts.byID))
+}
+
+// rejectBadNode records a rejected attempt on o's handle and view: an
+// explanation of a node that does not exist.
+func rejectBadNode(t *testing.T, c *testClient, handle, view string) {
+	t.Helper()
+	text, isErr := c.call("render_flamegraph", map[string]any{
+		"handle": handle, "view": view, "out": "x.html",
+		"explanations": []any{map[string]any{"node": "0000000000000000", "prose": "x"}},
+	})
+	if !isErr || !strings.Contains(text, `"status":"rejected"`) {
+		t.Fatalf("not rejected: %s", text)
+	}
+}
+
+func TestEvictedAttemptViewsKeepTheirRejectedCount(t *testing.T) {
+	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxAttemptViews = 1 })
+	writeFixture(t, o.profiles, "new.pb.gz", pmfixture.CPUBasicNew())
+	var other openOut
+	o.c.callOK("open", map[string]any{"path": "new.pb.gz"}, &other)
+	rejectBadNode(t, o.c, o.handle, o.view)
+	rejectBadNode(t, o.c, o.handle, o.view)
+	rejectBadNode(t, o.c, other.Handle, other.DefaultView) // evicts the first view's record
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(o.nodeID(t, "b"), "0.411", "{c1}"), "out": "y.html"})
+	if isErr {
+		t.Fatalf("write: %s", text)
+	}
+	if sec := rejectedSection(t, out.Path); !strings.Contains(sec, "2 earlier rejected attempts not kept</span>") {
+		t.Errorf("rejected section: %.1500s", sec)
+	}
+}
+
+func TestPagesSayWhenAttemptHistoryMayBeIncomplete(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OutputDir = t.TempDir()
+	cfg.Limits.MaxAttemptViews = 1 // so 4 counters
+	c := newTestServer(t, cfg)
+	var ops []openOut
+	for i := range 7 {
+		name := fmt.Sprintf("p%d.pb.gz", i)
+		writeFixture(t, cfg.ProfilesDir, name, pmfixture.Build("cpu", "nanoseconds", nil,
+			pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("work")}, Value: int64(i + 1)}))
+		var op openOut
+		c.callOK("open", map[string]any{"path": name}, &op)
+		ops = append(ops, op)
+	}
+	// Six views rejected in turn: four counts are kept, the fifth is lost.
+	for _, op := range ops[:6] {
+		rejectBadNode(t, c, op.Handle, op.DefaultView)
+	}
+	last := opened{c: c, handle: ops[6].Handle, view: ops[6].DefaultView}
+	var res renderOut
+	text := c.callOK("render_flamegraph", last.args(map[string]any{
+		"out": "z.html", "explanations": []any{map[string]any{"node": last.nodeID(t, "work"), "prose": "work"}},
+	}), &res)
+	page := string(readFile(t, res.Path))
+	if !strings.Contains(page, "earlier attempt history for this view may be incomplete</span>") {
+		t.Errorf("no incomplete-history note: %s", text)
+	}
+	// A view whose count was kept is complete.
+	first := opened{c: c, handle: ops[1].Handle, view: ops[1].DefaultView}
+	c.callOK("render_flamegraph", first.args(map[string]any{
+		"out": "w.html", "explanations": []any{map[string]any{"node": first.nodeID(t, "work"), "prose": "work"}},
+	}), &res)
+	if page := string(readFile(t, res.Path)); strings.Contains(page, "may be incomplete") || !strings.Contains(page, "1 earlier rejected attempt not kept</span>") {
+		t.Error("a view whose count was kept reads as incomplete or lost its count")
 	}
 }
 

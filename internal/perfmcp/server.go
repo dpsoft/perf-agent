@@ -65,7 +65,7 @@ func New(cfg Config) (_ *Server, err error) {
 		log:       cfg.Log,
 		manifests: slices.Clone(cfg.SourceManifests),
 		sourceGit: cfg.SourceGit,
-		attempts:  newAttempts(lim.MaxAttemptsPerView),
+		attempts:  newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews),
 		link:      (*os.Root).Link,
 	}
 	if s.log == nil {
@@ -93,7 +93,6 @@ func New(cfg Config) (_ *Server, err error) {
 	}
 	s.diffs = newDiffCache(lim.MaxCachedDiffs)
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles)
-	s.store.evicted = s.attempts.forget
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
 		Tools:           s.tools(),

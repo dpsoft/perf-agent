@@ -16,15 +16,16 @@ h1{font-size:16px;margin:0 0 4px}h2{font-size:14px;margin:20px 0 6px}
 .sw{display:inline-block;width:14px;height:14px;border:1px solid var(--line);box-sizing:border-box}
 .ramp{display:inline-block;width:120px;height:12px;border:1px solid var(--line);background:linear-gradient(90deg,hsl(215 75% calc(var(--l0) - var(--drop))),var(--grey),hsl(5 75% calc(var(--l0) - var(--drop))))}
 .icicle{background:var(--panel);border:1px solid var(--line);padding:2px;overflow-x:auto}
-.n{box-sizing:border-box;flex:none}
+.n{box-sizing:border-box;flex:none;min-width:0;overflow:hidden}
 .kids{display:flex;align-items:flex-start;width:100%}
-.b{box-sizing:border-box;height:18px;margin:0 0 1px;padding:0 4px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:11px;line-height:18px;color:var(--ink-on);border:1px solid var(--panel);
+.b{box-sizing:border-box;height:18px;margin:0 0 1px;padding:0;border:0;overflow:hidden;font-size:11px;line-height:18px;color:var(--ink-on);
 background:hsl(var(--h,0) calc(var(--t,0)*75%) calc(var(--l0) - var(--t,0)*var(--drop)))}
 .b.share-none,.b.share-same{background:var(--grey)}
 .b.only-base{background-image:repeating-linear-gradient(45deg,rgb(0 0 0/.35) 0 2px,transparent 2px 6px)}
 .b.only-new{outline:2px solid var(--ink);outline-offset:-2px}
 .b.ambiguous{outline:2px dashed var(--accent);outline-offset:-2px}
-.b.not-comparable{border:2px dotted var(--accent);font-style:italic}
+.b.not-comparable{box-shadow:inset 0 0 0 2px var(--accent);font-style:italic}
+.l{display:block;padding:0 4px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 table{border-collapse:collapse;width:100%;background:var(--panel)}
 th,td{border:1px solid var(--line);padding:3px 8px;text-align:left;vertical-align:top}
 td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -63,4 +64,4 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
 {{end}}
 </body>
 </html>
-{{define "node"}}<div class="n" style="width:{{.Width}}%"><div class="{{.Classes}}" style="--h:{{.Hue}};--t:{{.Tint}}" title="{{.Tooltip}}">{{if .Marker}}{{.Marker}} {{end}}{{.Name}}</div>{{if .Kids}}<div class="kids">{{range .Kids}}{{template "node" .}}{{end}}</div>{{end}}</div>{{end}}
+{{define "node"}}<div class="n" style="width:{{.Width}}%"><div class="{{.Classes}}" style="--h:{{.Hue}};--t:{{.Tint}}" title="{{.Tooltip}}"><span class="l">{{if .Marker}}{{.Marker}} {{end}}{{.Name}}</span></div>{{if .Kids}}<div class="kids">{{range .Kids}}{{template "node" .}}{{end}}</div>{{end}}</div>{{end}}

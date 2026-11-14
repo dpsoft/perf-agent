@@ -113,7 +113,7 @@ func TestDiffPageStylesSurviveEscaping(t *testing.T) {
 
 func TestDiffPageSharePlusRawCounterexample(t *testing.T) {
 	page := pageOf(t, sampleDiff())
-	m := regexp.MustCompile(`<div class="([^"]*)"[^>]*title="([^"]*)">kept</div>`).FindStringSubmatch(page)
+	m := regexp.MustCompile(`<div class="([^"]*)"[^>]*title="([^"]*)"><span class="l">kept</span></div>`).FindStringSubmatch(page)
 	if m == nil {
 		t.Fatal("no kept node")
 	}
@@ -172,12 +172,38 @@ func TestDiffPageWidthIsCombinedOverRoot(t *testing.T) {
 	}
 }
 
+func TestDiffPageBoxesCannotExceedTheirWrapper(t *testing.T) {
+	page := pageOf(t, sampleDiff())
+	rule := func(sel string) string {
+		m := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(sel) + `\{([^}]*)\}`).FindStringSubmatch(page)
+		if m == nil {
+			t.Fatalf("no CSS rule %s", sel)
+		}
+		return m[1]
+	}
+	if n := rule(".n"); !strings.Contains(n, "overflow:hidden") || !strings.Contains(n, "min-width:0") {
+		t.Errorf(".n rule %q does not clip to the wrapper", n)
+	}
+	b := rule(".b")
+	for _, bad := range []string{"border:1px", "border:2px", "padding:0 4px"} {
+		if strings.Contains(b, bad) {
+			t.Errorf(".b rule %q enlarges the box with %q", b, bad)
+		}
+	}
+	if !strings.Contains(b, "padding:0") || !strings.Contains(b, "border:0") {
+		t.Errorf(".b rule %q should have no padding or border", b)
+	}
+	if strings.Contains(rule(".b.not-comparable"), "border:") {
+		t.Error("not-comparable marker uses a real border")
+	}
+}
+
 func TestWriteDiffPageSample(t *testing.T) {
 	dir := os.Getenv("DIFFPAGE_SAMPLE_DIR")
 	if dir == "" {
 		t.Skip("DIFFPAGE_SAMPLE_DIR not set")
 	}
-	if err := os.WriteFile(dir+"/task-7-sample.html", []byte(pageOf(t, sampleDiff())), 0o644); err != nil {
+	if err := os.WriteFile(dir+"/task-7-sample.html", []byte(pageOf(t, sampleWithNarrowNodes())), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -225,4 +251,14 @@ func TestDiffPageNilDiff(t *testing.T) {
 	if err := WriteDiffPage(&bytes.Buffer{}, nil, "x"); err == nil {
 		t.Error("nil diff accepted")
 	}
+}
+
+// sampleWithNarrowNodes adds nodes of about 0.1% of the root, the width at
+// which a padded bar used to overflow its wrapper.
+func sampleWithNarrowNodes() *profilemodel.Diff {
+	d := sampleDiff()
+	d.Root.Children = append(d.Root.Children,
+		dnode("bulk", 800, 800), dnode("narrow_a", 0, 2), dnode("narrow_b", 2, 0), dnode("narrow_c", 1, 1), dnode("narrow_d", 1, 2))
+	d.Root.Combined = 2000
+	return d
 }

@@ -12,7 +12,9 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"runtime"
 	"strings"
+	"unicode/utf8"
 	"testing"
 	"time"
 
@@ -841,4 +843,52 @@ func TestTheRejectedSectionIsBudgetedBeforeForcedFrames(t *testing.T) {
 			assert.Contains(t, got, frame, "room %d: forced frame %s", room, frame)
 		}
 	}
+}
+
+func TestLongFrameNamesAreCappedOnThePage(t *testing.T) {
+	long := "é" + strings.Repeat("&", 64<<10)
+	v := exView(t, pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn(long)}, Value: 3}), nil)
+	main, callee := exNode(t, v, "main"), exNode(t, v, "main", long)
+	r := exCheck(t, v, explain.Explanation{Node: string(main), Prose: "main calls {n:" + string(callee) + "}"})
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: callee, Denominator: "view_total", Unit: "ratio",
+		Value: "1", Rounding: "0.001 ratio", Status: "ok"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{{Attempt: "a1", Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}}}
+	got := exPage(t, v, r, opts)
+	assert.NotContains(t, got, strings.Repeat("&amp;", maxShownName), "a name is shown whole")
+	assert.Less(t, len(got), 200<<10)
+	capped := "é" + strings.Repeat("&amp;", maxShownName-len("é")-len("…")) + "…"
+	assert.Contains(t, got, capped+"</span></div>", "the drawn frame")
+	assert.Contains(t, got, "<code>"+capped+"</code>", "the reference in the prose")
+	assert.Contains(t, got, " of "+capped+" (node "+string(callee)+"))", "the rejected row")
+	assert.Equal(t, maxShownName, len(shownName(strings.Repeat("&", 64<<10))))
+	cut := shownName(strings.Repeat("é", 601))
+	assert.True(t, utf8.ValidString(cut) && len(cut) <= maxShownName && strings.HasSuffix(cut, "é…"), "%d bytes", len(cut))
+	assert.Equal(t, "main", shownName("main"))
+}
+
+func TestALongHistoryIsNotRenderedWhole(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	reason := strings.Repeat("&", 4<<10)
+	opts := exOpts()
+	for i := range 5000 {
+		f := failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)
+		f.Message = reason
+		opts.Rejected = append(opts.Rejected, explain.RejectedAttempt{Attempt: fmt.Sprint("a", i+1), Failures: []explain.Failure{f}})
+	}
+	opts.MaxBytes = len(exPage(t, v, r, exOpts())) + 64<<10
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var page bytes.Buffer
+	require.NoError(t, WriteExplainedPage(&page, v, r, opts))
+	runtime.ReadMemStats(&after)
+	// The history escapes to about 100 MB; the page is a few hundred KB.
+	alloc := after.TotalAlloc - before.TotalAlloc
+	assert.Less(t, alloc, uint64(32<<20), "rendering a %d-byte page allocated %d bytes", page.Len(), alloc)
+	assert.LessOrEqual(t, page.Len(), opts.MaxBytes)
+	assert.Contains(t, page.String(), `<span class="ref">a5000</span>`)
 }

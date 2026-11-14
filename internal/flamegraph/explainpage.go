@@ -197,14 +197,16 @@ type explainedPageData struct {
 	Frames                           []exDrawn
 	NarrowNote, LimitNote, SizeNote  string
 	RejectedNote                     string
-	Rows                             []exRow
-	Sel                              *exFrame
-	SelFacts                         []exFactRow
-	SelPath                          []exPathItem
-	Chips                            []exChip
-	Rejected                         []exRejected
-	Model                            template.JS
-	Script                           template.JS
+	// allRejected are every rejected row, before historyRows cut them.
+	allRejected []exRejected
+	Rows        []exRow
+	Sel         *exFrame
+	SelFacts    []exFactRow
+	SelPath     []exPathItem
+	Chips       []exChip
+	Rejected    []exRejected
+	Model       template.JS
+	Script      template.JS
 }
 
 // WriteExplainedPage renders v with the explanations r checked, as one
@@ -240,15 +242,9 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 		}
 		return explainPageTmpl.Execute(w, data)
 	}
-	base, err := renderExplained(v, r, opts, 0, -1)
+	base, rows, err := fitHistory(v, r, opts)
 	if err != nil {
 		return err
-	}
-	rows := -1
-	if len(base) > opts.MaxBytes {
-		if base, rows, err = fitHistory(v, r, opts); err != nil {
-			return err
-		}
 	}
 	frameBytes := int64(opts.MaxBytes - len(base) - pageSlack)
 	for range maxBudgetPasses {
@@ -271,28 +267,33 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 const rowOverhead = 320
 
 // fitHistory renders the page with only the explained and referenced
-// paths and as many of the newest rejected rows as fit opts.MaxBytes, and
-// returns it with that number of rows. Without any row the page must fit.
+// paths and as many of the newest rejected rows as fit opts.MaxBytes by
+// rowEstimate, and returns it with that number of rows. It never renders a
+// row the estimate left out, so a long history costs no more than the
+// budget; without any row the page must fit.
 func fitHistory(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) ([]byte, int, error) {
-	bare, err := renderExplained(v, r, opts, 0, 0)
+	data, err := buildExplained(v, r, opts, 0, 0)
 	if err != nil {
 		return nil, 0, err
 	}
+	var buf bytes.Buffer
+	if err := explainPageTmpl.Execute(&buf, data); err != nil {
+		return nil, 0, err
+	}
+	bare := buf.Bytes()
 	if len(bare) > opts.MaxBytes {
 		return nil, 0, fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
 			len(bare), opts.MaxBytes)
 	}
-	data, err := buildExplained(v, r, opts, 0, -1)
-	if err != nil {
-		return nil, 0, err
-	}
 	keep, room := 0, int64(opts.MaxBytes-len(bare))
-	for i := len(data.Rejected) - 1; i >= 0; i-- {
-		if room -= rowEstimate(data.Rejected[i]); room < 0 {
+	for i := len(data.allRejected) - 1; i >= 0; i-- {
+		if room -= rowEstimate(data.allRejected[i]); room < 0 {
 			break
 		}
 		keep++
 	}
+	// The estimate bounds each row, so this render fits; halving is only a
+	// safety net.
 	for ; keep > 0; keep /= 2 {
 		page, err := renderExplained(v, r, opts, 0, keep)
 		if err != nil {
@@ -411,6 +412,7 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		}
 	}
 	data.Rejected, data.RejectedPill, data.LimitPill = b.rejected()
+	data.allRejected = data.Rejected
 	if n := len(data.Rejected) - b.historyRows; b.historyRows >= 0 && n > 0 {
 		data.Rejected = data.Rejected[n:]
 		data.RejectedNote = fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
@@ -632,7 +634,8 @@ func countLeftOut(n *profilemodel.Node, wide func(*profilemodel.Node) bool, reas
 // frameEstimate bounds the bytes drawing n adds: its div and model entry,
 // and its name escaped once for HTML text and once as a JSON string.
 func frameEstimate(n *profilemodel.Node) int64 {
-	return frameOverhead + htmlEscapedBound(n.Function.Name) + jsonEscapedBound(n.Function.Name)
+	name := shownName(n.Function.Name)
+	return frameOverhead + htmlEscapedBound(name) + jsonEscapedBound(name)
 }
 
 // htmlEscapedBound bounds the length of s as html/template escapes text:
@@ -707,7 +710,7 @@ func (b *explainedBuilder) frame(n *profilemodel.Node) (*exFrame, error) {
 	f := &exFrame{
 		ID:    string(n.ID),
 		Ref:   "f" + strconv.Itoa(len(b.frames)),
-		Name:  n.Function.Name,
+		Name:  shownName(n.Function.Name),
 		Cum:   strconv.FormatInt(n.Cum, 10),
 		Share: factValue(cf.ShareOfTotal),
 		Facts: []exFactVal{valueOf(cf.Cumulative), valueOf(cf.Self), valueOf(cf.ShareOfTotal), valueOf(cf.ShareOfParent), valueOf(cf.InexactPortion)},
@@ -776,7 +779,7 @@ func (b *explainedBuilder) segments(segs []explain.Segment, claims map[string]ex
 		case explain.SegmentNode:
 			name := string(sg.Node)
 			if n, ok := b.v.Node(sg.Node); ok {
-				name = n.Function.Name
+				name = shownName(n.Function.Name)
 			}
 			out = append(out, exSegment{Kind: "node", Text: b.refs[sg.Node], Title: string(sg.Node), Node: string(sg.Node), Name: name})
 		case explain.SegmentUnchecked:
@@ -810,7 +813,7 @@ func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
 // does not have.
 func (b *explainedBuilder) nodeName(id profilemodel.NodeID) string {
 	if n, ok := b.v.Node(id); ok {
-		return n.Function.Name + " (node " + string(id) + ")"
+		return shownName(n.Function.Name) + " (node " + string(id) + ")"
 	}
 	return "node " + string(id)
 }
@@ -1134,4 +1137,21 @@ func pctOf(part, whole int64) string {
 		return "0"
 	}
 	return pct(100 * float64(part) / float64(whole))
+}
+
+// maxShownName is the most bytes of a frame's name the page shows; the
+// node ID beside it stays the frame's exact identity.
+const maxShownName = 1 << 10
+
+// shownName is name as the page shows it: at most maxShownName bytes, cut
+// at a character boundary and ending in "…" when it was cut.
+func shownName(name string) string {
+	if len(name) <= maxShownName {
+		return name
+	}
+	cut := maxShownName - len("…")
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut] + "…"
 }

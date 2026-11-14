@@ -56,7 +56,7 @@
     interp.appendChild(p);
     parent.appendChild(interp);
     if (e.hypotheses && e.hypotheses.length) {
-      const hs = section('', 'Hypotheses');
+      const hs = section('', "Hypotheses — the agent's, not measured");
       const ul = make('ul', 'hyp');
       for (const h of e.hypotheses) {
         const li = make('li');
@@ -69,7 +69,7 @@
       parent.appendChild(hs);
     }
     if (e.next && e.next.length) {
-      const ns = section('', 'Next measurement');
+      const ns = section('', "Next measurement — the agent's suggestion, not verified");
       const p2 = make('p');
       segments(p2, e.next);
       ns.appendChild(p2);
@@ -77,11 +77,37 @@
     }
   };
 
+  const maxPromptName = 200;
+  const promptName = (name) => {
+    const chars = Array.from(name);
+    return chars.length > maxPromptName ? chars.slice(0, maxPromptName).join('') + '…' : name;
+  };
   const prompt = (p, f) => p.parts.map((part) => {
     if (part.slot === 'id') return f.id;
-    if (part.slot === 'name') return f.name;
+    if (part.slot === 'name') return promptName(f.name);
     return part.s || '';
   }).join('');
+
+  const exactTitle = (c, unit, den, rounding, zero) => {
+    let s = c + ' ' + unit;
+    if (den) s += ' of ' + den;
+    if (rounding === 'exact') s += ', exact';
+    else if (rounding) s += ', rounded to ' + rounding;
+    if (zero) s += ', measured zero';
+    return s;
+  };
+  const factRows = (f) => {
+    const parent = f.parent ? frames[byId.get(f.parent)] : undefined;
+    const rows = model.fact_rows.map((spec, i) => {
+      const val = f.facts[i];
+      let note = spec.n || '';
+      if (spec.pn) note = parent ? 'of ' + parent.name : '';
+      let title = val.v;
+      if (val.c) title = exactTitle(val.c, spec.u, spec.d === 'parent' ? 'parent:' + f.parent : spec.d, spec.r, val.z);
+      return {k: spec.k, v: val.v, t: title, n: note};
+    });
+    return rows.concat(f.extra || []);
+  };
 
   let current = -1;
   const select = (i, scroll) => {
@@ -101,7 +127,7 @@
 
     const facts = $('facts');
     clear(facts);
-    for (const r of f.facts) {
+    for (const r of factRows(f)) {
       facts.appendChild(make('span', 'k', r.k));
       const v = make('span', 'v', r.v);
       v.title = r.t;

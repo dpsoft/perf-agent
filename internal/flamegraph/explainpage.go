@@ -1,6 +1,7 @@
 package flamegraph
 
 import (
+	"bytes"
 	"cmp"
 	_ "embed"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -29,10 +31,22 @@ const (
 	defaultExplainedMaxNodes = 20000
 	// explainedRowPitch is the vertical distance between depths, in px.
 	explainedRowPitch = 20
+	// maxPromptName is the most characters of a frame name a follow-up
+	// prompt carries; a longer name is cut and ends in "…". The script
+	// uses the same bound.
+	maxPromptName = 200
+	// frameOverhead bounds the bytes one drawn frame adds to the page
+	// besides its name: its div and its model entry with every fact.
+	frameOverhead = 640
+	// pageSlack is the room left for what a frame budget does not model:
+	// the legend, the chart height and the sentences about frames left out.
+	pageSlack = 16 << 10
+	// maxBudgetPasses bounds the renders spent fitting a byte budget.
+	maxBudgetPasses = 5
 )
 
 // ExplainedPageOptions name what an explained page shows about its input
-// and how many frames it draws.
+// and how large it may be.
 type ExplainedPageOptions struct {
 	Title       string
 	ProfileName string // the input's file name, shown in the footer
@@ -44,6 +58,33 @@ type ExplainedPageOptions struct {
 	// MaxNodes bounds the frames drawn; 0 means defaultExplainedMaxNodes.
 	// Explained and referenced nodes and their callers are always drawn.
 	MaxNodes int
+	// MaxBytes bounds the page's size; 0 means no bound. Frames are left
+	// out, and counted on the page, until the page fits; a page that does
+	// not fit with only the explained and referenced paths is an error.
+	MaxBytes int
+}
+
+// exRowSpec is what every frame's fact row shares: its label, note, unit,
+// denominator and rounding. The model carries each once; frames carry only
+// their values.
+type exRowSpec struct {
+	Label string `json:"k"`
+	Note  string `json:"n,omitzero"`
+	// ParentNote makes the note "of <parent's name>", built by the script.
+	ParentNote bool   `json:"pn,omitzero"`
+	Unit       string `json:"u"`
+	// Denominator is "parent" for a share of the frame's parent, which the
+	// title names as "parent:<parent id>".
+	Denominator string `json:"d,omitzero"`
+	Rounding    string `json:"r"`
+}
+
+// exFactVal is one frame's value in a shared row: as shown, its canonical
+// value (absent when unavailable) and whether it is a measured zero.
+type exFactVal struct {
+	Value     string `json:"v"`
+	Canonical string `json:"c,omitzero"`
+	Zero      bool   `json:"z,omitzero"`
 }
 
 // exFactRow is one displayed fact: a label, the value as shown, its exact
@@ -79,15 +120,18 @@ type exExplanation struct {
 }
 
 // exFrame is one frame of the model the script reads. Integers are
-// strings; every displayed string is computed here.
+// strings; displayed values are computed here, and the text every frame
+// shares is in the model's fact rows.
 type exFrame struct {
-	ID          string          `json:"id"`
-	Ref         string          `json:"ref"` // "f<k>", its index in the frames array
-	Name        string          `json:"name"`
-	Parent      string          `json:"parent,omitzero"`
-	Cum         string          `json:"cum"`   // exact, in the sample unit
-	Share       string          `json:"share"` // share of total, as shown
-	Facts       []exFactRow     `json:"facts"`
+	ID     string      `json:"id"`
+	Ref    string      `json:"ref"` // "f<k>", its index in the frames array
+	Name   string      `json:"name"`
+	Parent string      `json:"parent,omitzero"`
+	Cum    string      `json:"cum"`   // exact, in the sample unit
+	Share  string      `json:"share"` // share of total, as shown
+	Facts  []exFactVal `json:"facts"` // one per model fact row
+	// Extra are the facts only an explained frame shows.
+	Extra       []exFactRow     `json:"extra,omitzero"`
 	Explanation []exExplanation `json:"explanation,omitzero"`
 }
 
@@ -104,10 +148,11 @@ type exPrompt struct {
 }
 
 type exModel struct {
-	View     string     `json:"view"`
-	Selected string     `json:"selected"`
-	Frames   []*exFrame `json:"frames"`
-	Prompts  []exPrompt `json:"prompts"`
+	View     string      `json:"view"`
+	Selected string      `json:"selected"`
+	FactRows []exRowSpec `json:"fact_rows"`
+	Frames   []*exFrame  `json:"frames"`
+	Prompts  []exPrompt  `json:"prompts"`
 }
 
 // exDrawn is one frame div.
@@ -122,8 +167,10 @@ type exPathItem struct{ Ref, Node, Name, Share string }
 
 type exRow struct{ Ref, Node, Name, Share, Cum string }
 
+// exRejected is one row of "Rejected at render". Kind is "claim",
+// "reference" or "limit"; only claim rows carry a metric and figures.
 type exRejected struct {
-	Attempt, RetryOf, Code, Metric, Node, Agent, Engine, Reason string
+	Attempt, Kind, Label, Metric, Node, Agent, Engine, Code, Reason string
 }
 
 type exLegend struct{ Key, Label string }
@@ -132,7 +179,8 @@ type explainedPageData struct {
 	LightChrome, DarkChrome, Palette template.CSS
 	Title, ProfileName, Digest       string
 	Attempt, View                    string
-	Checked, RejectedCount           int
+	CheckedPill                      string
+	RejectedPill, LimitPill          string
 	GPU                              bool
 	Notes                            []string
 	Quality                          []exQualityRow
@@ -140,10 +188,10 @@ type explainedPageData struct {
 	Axis, Total, TotalTitle          string
 	Height                           string
 	Frames                           []exDrawn
-	Narrow, Beyond, MaxNodes         int
-	MinWidth                         string
+	NarrowNote, LimitNote, SizeNote  string
 	Rows                             []exRow
 	Sel                              *exFrame
+	SelFacts                         []exFactRow
 	SelPath                          []exPathItem
 	Chips                            []exChip
 	Rejected                         []exRejected
@@ -161,6 +209,12 @@ type explainedPageData struct {
 // shown at Fact.Canonical(); numbers no claim checked are marked. Agent
 // text and frame names are escaped and never become links, and the page
 // loads nothing. It refuses a nil view and a check that did not pass.
+//
+// With opts.MaxBytes the page is fitted to the budget: it is first
+// rendered with only the explained and referenced paths, the rest of the
+// budget is spent on frames by an upper-bound estimate of their bytes, and
+// the page is rendered again with a smaller frame budget if it still does
+// not fit. Nothing is written unless the page fits.
 func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) error {
 	if v == nil {
 		return errors.New("flamegraph: nil view")
@@ -168,12 +222,56 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 	if !r.OK {
 		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
 	}
-	b := &explainedBuilder{v: v, r: r, opts: opts, refs: map[profilemodel.NodeID]string{}}
-	data, err := b.build()
+	if opts.MaxBytes <= 0 {
+		data, err := buildExplained(v, r, opts, -1)
+		if err != nil {
+			return err
+		}
+		return explainPageTmpl.Execute(w, data)
+	}
+	base, err := renderExplained(v, r, opts, 0)
 	if err != nil {
 		return err
 	}
-	return explainPageTmpl.Execute(w, data)
+	if len(base) > opts.MaxBytes {
+		return fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
+			len(base), opts.MaxBytes)
+	}
+	frameBytes := int64(opts.MaxBytes - len(base) - pageSlack)
+	for range maxBudgetPasses {
+		page, err := renderExplained(v, r, opts, max(frameBytes, 0))
+		if err != nil {
+			return err
+		}
+		if len(page) <= opts.MaxBytes {
+			_, err = w.Write(page)
+			return err
+		}
+		frameBytes -= int64(len(page)-opts.MaxBytes) + pageSlack
+	}
+	// Only the explained and referenced paths are certain to fit.
+	_, err = w.Write(base)
+	return err
+}
+
+// renderExplained renders the page into memory with frameBytes for the
+// frames not always drawn.
+func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64) ([]byte, error) {
+	data, err := buildExplained(v, r, opts, frameBytes)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := explainPageTmpl.Execute(&buf, data); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// buildExplained assembles the page; frameBytes < 0 means no byte budget.
+func buildExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64) (*explainedPageData, error) {
+	b := &explainedBuilder{v: v, r: r, opts: opts, refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
+	return b.build(frameBytes)
 }
 
 type explainedBuilder struct {
@@ -181,14 +279,16 @@ type explainedBuilder struct {
 	r      explain.Result
 	opts   ExplainedPageOptions
 	view   string
+	specs  []exRowSpec
 	frames []*exFrame
 	refs   map[profilemodel.NodeID]string // node -> "f<k>" for drawn nodes
 	byID   map[profilemodel.NodeID]*exFrame
 }
 
-func (b *explainedBuilder) build() (*explainedPageData, error) {
+func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	v := b.v
 	b.view = fmt.Sprintf("%s/%s#%d", v.SampleType, v.Unit, v.Index)
+	b.specs = b.rowSpecs()
 	data := &explainedPageData{
 		LightChrome: lightChrome,
 		DarkChrome:  template.CSS(darkChrome),
@@ -198,13 +298,14 @@ func (b *explainedBuilder) build() (*explainedPageData, error) {
 		Digest:      b.opts.Digest,
 		Attempt:     b.opts.Attempt,
 		View:        b.view,
-		Checked:     b.r.Figures + b.r.References,
 		GPU:         v.IsGPU(),
-		MaxNodes:    cmp.Or(b.opts.MaxNodes, defaultExplainedMaxNodes),
-		MinWidth:    strconv.FormatFloat(minDrawFraction*100, 'f', -1, 64) + "%",
 		Total:       FormatValue(v.Total, v.Unit),
 		TotalTitle:  strconv.FormatInt(v.Total, 10) + " " + v.Unit + ", exact",
 		Script:      template.JS(explainPageScript),
+	}
+	data.CheckedPill = fmt.Sprintf("%d figures and references checked", b.r.Figures+b.r.References)
+	if b.r.Figures+b.r.References == 1 {
+		data.CheckedPill = "1 figure or reference checked"
 	}
 	data.Axis = fmt.Sprintf("width = %s (%s) at or below the frame", v.SampleType, v.Unit)
 	if data.GPU {
@@ -217,7 +318,7 @@ func (b *explainedBuilder) build() (*explainedPageData, error) {
 	data.Notes = notes
 	data.Quality = b.quality()
 
-	if err := b.layout(data); err != nil {
+	if err := b.layout(data, frameBytes); err != nil {
 		return nil, err
 	}
 	if err := b.attachExplanations(); err != nil {
@@ -233,6 +334,7 @@ func (b *explainedBuilder) build() (*explainedPageData, error) {
 		sel = b.byID[b.r.Checked[0].Node]
 	}
 	data.Sel = sel
+	data.SelFacts = b.factRows(sel)
 	data.SelPath = b.path(sel)
 	prompts := b.prompts()
 	for _, p := range prompts {
@@ -244,15 +346,57 @@ func (b *explainedBuilder) build() (*explainedPageData, error) {
 			data.Frames[i].Class += " cur"
 		}
 	}
-	data.Rejected, data.RejectedCount = b.rejected()
+	data.Rejected, data.RejectedPill, data.LimitPill = b.rejected()
 	data.Legend = legendOf(data.Frames)
 
-	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, Frames: b.frames, Prompts: prompts})
+	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, FactRows: b.specs, Frames: b.frames, Prompts: prompts})
 	if err != nil {
 		return nil, err
 	}
 	data.Model = template.JS(model)
 	return data, nil
+}
+
+// rowSpecs are the fact rows every frame has, in the order of
+// exFrame.Facts.
+func (b *explainedBuilder) rowSpecs() []exRowSpec {
+	unit := b.v.Unit
+	exact := profilemodel.RoundingFor(profilemodel.MetricCumulative)
+	ratio := profilemodel.RoundingFor(profilemodel.MetricShareOfTotal)
+	return []exRowSpec{
+		{Label: "Cumulative", Unit: unit, Rounding: exact},
+		{Label: "Self", Unit: unit, Rounding: exact},
+		{Label: "Share of total", Note: "of the view total", Unit: profilemodel.UnitRatio, Denominator: profilemodel.DenominatorViewTotal, Rounding: ratio},
+		{Label: "Share of parent", ParentNote: true, Unit: profilemodel.UnitRatio, Denominator: "parent", Rounding: ratio},
+		{Label: "Inexact portion", Note: "from inexact samples", Unit: unit, Rounding: exact},
+	}
+}
+
+// factRows are a frame's facts as the panel shows them: the shared rows
+// with this frame's values, then its extra rows. The script builds the
+// same rows from the model.
+func (b *explainedBuilder) factRows(f *exFrame) []exFactRow {
+	var parentName string
+	if p := b.byID[profilemodel.NodeID(f.Parent)]; p != nil {
+		parentName = p.Name
+	}
+	out := make([]exFactRow, 0, len(b.specs)+len(f.Extra))
+	for i, spec := range b.specs {
+		val := f.Facts[i]
+		row := exFactRow{Label: spec.Label, Value: val.Value, Title: val.Value, Note: spec.Note}
+		if spec.ParentNote && parentName != "" {
+			row.Note = "of " + parentName
+		}
+		if val.Canonical != "" {
+			den := spec.Denominator
+			if den == "parent" {
+				den = "parent:" + f.Parent
+			}
+			row.Title = exactTitle(val.Canonical, spec.Unit, den, spec.Rounding, val.Zero)
+		}
+		out = append(out, row)
+	}
+	return append(out, f.Extra...)
 }
 
 // forced is the set of nodes always drawn: every explained node, every
@@ -283,16 +427,27 @@ func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
 	return out
 }
 
+// leftOut counts the nodes not drawn, by why.
+type leftOut struct{ narrow, limit, size int }
+
+// Why a node at least minDrawFraction wide is left out.
+const (
+	reasonLimit = iota
+	reasonSize
+)
+
 // layout chooses the frames to draw, breadth first so the widest and
 // shallowest come first, and places each at its offset within its parent:
 // left and width are percentages of the view total, top is its depth.
-// A node narrower than minDrawFraction of the total, or past MaxNodes, is
-// not drawn and neither is anything below it; they are counted instead.
-func (b *explainedBuilder) layout(data *explainedPageData) error {
+// Forced nodes are always drawn. Any other node is drawn only when it is
+// at least minDrawFraction of the total, the MaxNodes budget has room and
+// its estimated bytes fit in frameBytes (unless frameBytes < 0). A node
+// not drawn takes everything below it along; they are counted instead.
+func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) error {
 	v := b.v
 	forced := b.forced()
-	budget := max(0, data.MaxNodes-len(forced))
-	b.byID = map[profilemodel.NodeID]*exFrame{}
+	maxNodes := cmp.Or(b.opts.MaxNodes, defaultExplainedMaxNodes)
+	nodeBudget := max(0, maxNodes-len(forced))
 	type queued struct {
 		n      *profilemodel.Node
 		offset int64
@@ -305,6 +460,8 @@ func (b *explainedBuilder) layout(data *explainedPageData) error {
 	for _, ch := range b.r.Checked {
 		explained[ch.Node] = true
 	}
+	var out leftOut
+	var usedBytes int64
 	queue := []queued{{n: v.Root}}
 	maxDepth, unforced := 0, 0
 	for len(queue) > 0 {
@@ -323,7 +480,7 @@ func (b *explainedBuilder) layout(data *explainedPageData) error {
 			Width: pctOf(n.Cum, v.Total),
 			Top:   strconv.Itoa(n.Depth * explainedRowPitch),
 			Name:  f.Name,
-			Tip:   f.Name + "\n" + f.Facts[0].Value + ", " + f.Share + " of total",
+			Tip:   f.Facts[0].Value + ", " + f.Share + " of total",
 			Star:  explained[n.ID],
 		}
 		if v.Total <= 0 && n == v.Root {
@@ -347,37 +504,127 @@ func (b *explainedBuilder) layout(data *explainedPageData) error {
 
 		offset := q.offset
 		for i, c := range n.Children {
+			drawn := true
 			switch {
 			case forced[c.ID]:
-			case wide(c) && unforced < budget:
-				unforced++
+			case !wide(c) || unforced >= nodeBudget:
+				countLeftOut(c, wide, reasonLimit, &out)
+				drawn = false
+			case frameBytes >= 0 && usedBytes+frameEstimate(c) > frameBytes:
+				countLeftOut(c, wide, reasonSize, &out)
+				drawn = false
 			default:
-				b.countLeftOut(c, wide, data)
-				offset += c.Cum
-				continue
+				unforced++
+				usedBytes += frameEstimate(c)
 			}
-			queue = append(queue, queued{n: c, offset: offset, jitter: (i * 3) % jitterSteps})
+			if drawn {
+				queue = append(queue, queued{n: c, offset: offset, jitter: (i * 3) % jitterSteps})
+			}
 			offset += c.Cum
 		}
 	}
 	data.Height = strconv.Itoa((maxDepth + 1) * explainedRowPitch)
+
+	minWidth := strconv.FormatFloat(minDrawFraction*100, 'f', -1, 64) + "%"
+	if out.narrow > 0 {
+		data.NarrowNote = fmt.Sprintf("%s narrower than %s %s not drawn.", plural(out.narrow, "node", "nodes"), minWidth, isAre(out.narrow))
+	}
+	if out.limit > 0 {
+		data.LimitNote = fmt.Sprintf("%d of %d frames drawn; %d left out by the page's limit of %d frames, after the explained and referenced paths, which are always drawn.",
+			len(b.frames), len(b.frames)+out.narrow+out.limit+out.size, out.limit, maxNodes)
+	}
+	if out.size > 0 {
+		data.SizeNote = fmt.Sprintf("%s beyond the page's size budget %s not drawn.", plural(out.size, "node", "nodes"), isAre(out.size))
+	}
 	return nil
 }
 
 // countLeftOut counts n and everything below it as not drawn: as narrow
-// when a node is under minDrawFraction, as beyond MaxNodes otherwise.
-func (b *explainedBuilder) countLeftOut(n *profilemodel.Node, wide func(*profilemodel.Node) bool, data *explainedPageData) {
+// when a node is under minDrawFraction, for reason otherwise.
+func countLeftOut(n *profilemodel.Node, wide func(*profilemodel.Node) bool, reason int, out *leftOut) {
 	stack := []*profilemodel.Node{n}
 	for len(stack) > 0 {
 		m := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if wide(m) {
-			data.Beyond++
-		} else {
-			data.Narrow++
+		switch {
+		case !wide(m):
+			out.narrow++
+		case reason == reasonSize:
+			out.size++
+		default:
+			out.limit++
 		}
 		stack = append(stack, m.Children...)
 	}
+}
+
+// frameEstimate bounds the bytes drawing n adds: its div and model entry,
+// and its name escaped once for HTML text and once as a JSON string.
+func frameEstimate(n *profilemodel.Node) int64 {
+	return frameOverhead + htmlEscapedBound(n.Function.Name) + jsonEscapedBound(n.Function.Name)
+}
+
+// htmlEscapedBound bounds the length of s as html/template escapes text:
+// "&amp;", "&#39;", "&#34;" and "&#43;" are 5 bytes, "&lt;" and "&gt;" 4,
+// and a NUL or an invalid byte becomes U+FFFD, 3.
+func htmlEscapedBound(s string) int64 {
+	var size int64
+	for i := 0; i < len(s); {
+		switch c := s[i]; {
+		case c == '&', c == '\'', c == '"', c == '+':
+			size += 5
+		case c == '<', c == '>':
+			size += 4
+		case c == 0:
+			size += 3
+		case c < utf8.RuneSelf:
+			size++
+		default:
+			r, n := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && n == 1 {
+				size += 3
+			} else {
+				size += int64(n)
+			}
+			i += n
+			continue
+		}
+		i++
+	}
+	return size
+}
+
+// jsonEscapedBound bounds the length of s as encoding/json writes it in a
+// string: "<", ">", "&" and control bytes as "\u00XX", 6 bytes; '"' and
+// "\\" as 2; an invalid byte as "\ufffd", 6; U+2028 and U+2029, 3 bytes
+// each, as 6.
+func jsonEscapedBound(s string) int64 {
+	var size int64
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '<', c == '>', c == '&', c < 0x20:
+			size += 6
+		case c == '"', c == '\\':
+			size += 2
+		case c < utf8.RuneSelf:
+			size++
+		default:
+			r, n := utf8.DecodeRuneInString(s[i:])
+			switch {
+			case r == utf8.RuneError && n == 1:
+				size += 6
+			case r == '\u2028', r == '\u2029':
+				size += 6
+			default:
+				size += int64(n)
+			}
+			i += n
+			continue
+		}
+		i++
+	}
+	return size
 }
 
 // frame adds n to the model with its core facts.
@@ -392,24 +639,23 @@ func (b *explainedBuilder) frame(n *profilemodel.Node) (*exFrame, error) {
 		Name:  n.Function.Name,
 		Cum:   strconv.FormatInt(n.Cum, 10),
 		Share: factValue(cf.ShareOfTotal),
+		Facts: []exFactVal{valueOf(cf.Cumulative), valueOf(cf.Self), valueOf(cf.ShareOfTotal), valueOf(cf.ShareOfParent), valueOf(cf.InexactPortion)},
 	}
 	if n.Parent != nil {
 		f.Parent = string(n.Parent.ID)
 	}
-	parentNote := ""
-	if n.Parent != nil {
-		parentNote = "of " + n.Parent.Function.Name
-	}
-	f.Facts = []exFactRow{
-		factRow("Cumulative", cf.Cumulative, ""),
-		factRow("Self", cf.Self, ""),
-		factRow("Share of total", cf.ShareOfTotal, "of the view total"),
-		factRow("Share of parent", cf.ShareOfParent, parentNote),
-		factRow("Inexact portion", cf.InexactPortion, "from inexact samples"),
-	}
 	b.frames = append(b.frames, f)
 	b.byID[n.ID] = f
 	return f, nil
+}
+
+// valueOf is a fact's value in a shared row.
+func valueOf(f profilemodel.Fact) exFactVal {
+	c, ok := f.Canonical()
+	if f.Status == profilemodel.StatusUnavailable || !ok {
+		return exFactVal{Value: factValue(f)}
+	}
+	return exFactVal{Value: displayValue(c, f.Unit, f.Status), Canonical: c, Zero: f.Status == profilemodel.StatusZero}
 }
 
 // attachExplanations adds each checked explanation, and the facts only an
@@ -429,7 +675,7 @@ func (b *explainedBuilder) attachExplanations() error {
 			if ch.Facts.ExecutionsBelow.Status == profilemodel.StatusUnavailable {
 				execNote = "the executions log is not usable"
 			}
-			f.Facts = append(f.Facts,
+			f.Extra = append(f.Extra,
 				factRow("Executions below", ch.Facts.ExecutionsBelow, execNote),
 				factRow("Kernel names observed", ch.Facts.KernelNamesObserved, "names at or below, not distinct kernels"))
 		}
@@ -476,11 +722,7 @@ func (b *explainedBuilder) segments(segs []explain.Segment, claims map[string]ex
 func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
 	subject := "the whole view"
 	if c.Scope != explain.ScopeView {
-		name := string(c.Node)
-		if n, ok := b.v.Node(c.Node); ok {
-			name = n.Function.Name
-		}
-		subject = name + " (node " + string(c.Node) + ")"
+		subject = b.nodeName(c.Node)
 	}
 	switch {
 	case c.Module == nil:
@@ -490,7 +732,16 @@ func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
 		subject += ", module " + *c.Module
 	}
 	return fmt.Sprintf("%s of %s: %s; checked by perf-agent", c.Metric, subject,
-		exactTitle(c.Value, c.Unit, c.Denominator, c.Rounding, c.Status))
+		exactTitle(c.Value, c.Unit, c.Denominator, c.Rounding, c.Status == profilemodel.StatusZero))
+}
+
+// nodeName is "<name> (node <id>)", or "node <id>" for a node the view
+// does not have.
+func (b *explainedBuilder) nodeName(id profilemodel.NodeID) string {
+	if n, ok := b.v.Node(id); ok {
+		return n.Function.Name + " (node " + string(id) + ")"
+	}
+	return "node " + string(id)
 }
 
 // quality is the view's quality summary.
@@ -559,7 +810,7 @@ func fillPrompt(p exPrompt, f *exFrame) string {
 		case "id":
 			s.WriteString(f.ID)
 		case "name":
-			s.WriteString(f.Name)
+			s.WriteString(promptName(f.Name))
 		default:
 			s.WriteString(part.Text)
 		}
@@ -567,30 +818,112 @@ func fillPrompt(p exPrompt, f *exFrame) string {
 	return s.String()
 }
 
-// rejected lists every failure of the rejected attempts.
-func (b *explainedBuilder) rejected() ([]exRejected, int) {
-	var out []exRejected
+// promptName is name cut to maxPromptName characters, ending in "…" when
+// it was cut.
+func promptName(name string) string {
+	if utf8.RuneCountInString(name) <= maxPromptName {
+		return name
+	}
+	return string([]rune(name)[:maxPromptName]) + "…"
+}
+
+// rejected lists the failures of the rejected attempts and the pills that
+// count them. A failure naming a claim is a claim row, shown once per
+// claim per attempt; a limit failure is a limit row; any other failure is
+// about a reference. Claims are counted per attempt, so a claim refused in
+// two attempts counts twice and the pill says how many attempts.
+func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill string) {
+	var claims, refs, limits, attempts int
 	for _, a := range b.opts.Rejected {
+		seen := map[string]bool{}
+		counted := false
 		for _, f := range a.Failures {
-			row := exRejected{Attempt: a.Attempt, RetryOf: a.RetryOf, Code: string(f.Code), Metric: "—", Node: f.Ref,
-				Agent: f.Agent, Reason: f.Message}
-			if e := f.Engine; e != nil {
-				row.Metric = e.Metric
-				switch {
-				case e.Scope == explain.ScopeView:
+			row := exRejected{Attempt: a.Attempt, Code: string(f.Code), Reason: f.Message}
+			switch {
+			case f.Claim != "":
+				if seen["claim\x00"+f.Claim] {
+					continue
+				}
+				seen["claim\x00"+f.Claim] = true
+				claims++
+				counted = true
+				row.Kind, row.Label, row.Agent = "claim", "claim "+f.Claim, f.Agent
+				if e := f.Engine; e != nil {
+					row.Metric, row.Engine = e.Metric, displayEngine(*e)
 					row.Node = "the whole view"
-				case e.Node != "":
-					row.Node = string(e.Node)
-					if n, ok := b.v.Node(e.Node); ok {
-						row.Node = n.Function.Name + " (node " + string(e.Node) + ")"
+					if e.Scope != explain.ScopeView {
+						row.Node = b.nodeName(e.Node)
 					}
 				}
-				row.Engine = displayEngine(*e)
+			case f.Code == explain.CodeLimitExceeded:
+				limits++
+				row.Kind, row.Label = "limit", strings.TrimSpace("limit "+f.Ref)
+			default:
+				key := "ref\x00" + string(f.Code) + "\x00" + f.Ref
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				refs++
+				counted = true
+				row.Kind, row.Label = "reference", referenceLabel(f)
 			}
-			out = append(out, row)
+			rows = append(rows, row)
+		}
+		if counted {
+			attempts++
 		}
 	}
-	return out, len(out)
+	var parts []string
+	if claims > 0 {
+		parts = append(parts, plural(claims, "claim", "claims"))
+	}
+	if refs > 0 {
+		parts = append(parts, plural(refs, "reference", "references"))
+	}
+	if len(parts) > 0 {
+		claimsPill = strings.Join(parts, " and ") + " rejected at render"
+		if attempts > 1 {
+			claimsPill += fmt.Sprintf(" in %d attempts", attempts)
+		}
+	}
+	if limits > 0 {
+		limitsPill = plural(limits, "limit", "limits") + " exceeded at render"
+	}
+	return rows, claimsPill, limitsPill
+}
+
+// referenceLabel names the reference a failure is about: the placeholder
+// as the agent wrote it, or the explanation's node.
+func referenceLabel(f explain.Failure) string {
+	switch f.Code {
+	case explain.CodeUnresolvedClaimRef, explain.CodeGluedToClaim:
+		return "reference {" + f.Ref + "}"
+	case explain.CodeUnresolvedNodeRef:
+		if strings.HasPrefix(f.Ref, "{") {
+			return "reference " + f.Ref
+		}
+		return "reference {n:" + f.Ref + "}"
+	}
+	if f.Ref == "" {
+		return "reference"
+	}
+	return "reference node " + f.Ref
+}
+
+// plural is "1 <one>" or "<n> <many>".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return strconv.Itoa(n) + " " + many
+}
+
+func isAre(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
 }
 
 // legendOf lists the domains drawn, in the CPU-to-GPU reading order.
@@ -627,7 +960,7 @@ func factText(f profilemodel.Fact) (string, string) {
 		s := "unavailable: " + cmp.Or(f.Reason, "the engine has no value")
 		return s, s
 	}
-	return displayValue(c, f.Unit, f.Status), exactTitle(c, f.Unit, f.Denominator, f.Rounding, f.Status)
+	return displayValue(c, f.Unit, f.Status), exactTitle(c, f.Unit, f.Denominator, f.Rounding, f.Status == profilemodel.StatusZero)
 }
 
 // displayEngine is a claim's engine value as shown.
@@ -662,8 +995,9 @@ func displayValue(canonical, unit string, status profilemodel.Status) string {
 }
 
 // exactTitle is a value's exact canonical form, unit, denominator and
-// rounding: "0.411 ratio of view_total, rounded to 0.001 ratio".
-func exactTitle(canonical, unit, denominator, rounding string, status profilemodel.Status) string {
+// rounding: "0.411 ratio of view_total, rounded to 0.001 ratio". The
+// script's exactTitle writes the same text.
+func exactTitle(canonical, unit, denominator, rounding string, zero bool) string {
 	s := canonical + " " + unit
 	if denominator != "" {
 		s += " of " + denominator
@@ -675,7 +1009,7 @@ func exactTitle(canonical, unit, denominator, rounding string, status profilemod
 	default:
 		s += ", rounded to " + rounding
 	}
-	if status == profilemodel.StatusZero {
+	if zero {
 		s += ", measured zero"
 	}
 	return s

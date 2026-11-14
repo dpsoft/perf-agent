@@ -3,6 +3,7 @@ package flamegraph
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"html"
 	"os"
 	"regexp"
@@ -294,7 +295,7 @@ func TestExplainedPageListsRejectedAttempts(t *testing.T) {
 	opts := exOpts()
 	opts.Rejected = []explain.RejectedAttempt{{Attempt: "a1", Failures: bad.Failures}}
 	got := exPage(t, v, r, opts)
-	assert.Contains(t, got, "1 claims rejected at render")
+	assert.Contains(t, got, "1 claim rejected at render</span>")
 	sec := got[strings.Index(got, "Rejected at render"):]
 	assert.Contains(t, sec, "<s>0.62</s>")
 	assert.Contains(t, sec, "41.1%")
@@ -417,8 +418,15 @@ func TestExplainedPageStatesNodesNotDrawn(t *testing.T) {
 	opts := exOpts()
 	opts.MaxNodes = 2
 	got = exPage(t, v, r, opts)
-	assert.Contains(t, got, "1 nodes beyond the page's limit of 2 frames are not drawn")
+	// Three forced frames exceed the limit of 2: the sentence stays true.
+	assert.Contains(t, got, html.EscapeString("3 of 7 frames drawn; 1 left out by the page's limit of 2 frames"))
 	assert.Contains(t, got, "3 nodes narrower than 0.05% are not drawn")
+
+	one := pmfixture.Build("cpu", "nanoseconds", nil, append(samples[:2:2],
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("tiny")}, Value: 1})...)
+	ov := exView(t, one, nil)
+	or := exCheck(t, ov, explain.Explanation{Node: string(exNode(t, ov, "main", "hot")), Prose: "hot"})
+	assert.Contains(t, exPage(t, ov, or, exOpts()), "1 node narrower than 0.05% is not drawn")
 	assert.Equal(t, 3, strings.Count(got, `class="frame`), "root, main and the explained hot are drawn")
 }
 
@@ -439,4 +447,138 @@ func TestExplainedPageClaimTitleNamesTheModule(t *testing.T) {
 	require.Len(t, title, 2)
 	assert.Equal(t, `quality_unresolved_by_module of the whole view, module b:"f00d": 1.000 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent`,
 		html.UnescapeString(title[1]))
+}
+
+// failure is a hand-made failure of the kind Check reports.
+func failure(code explain.Code, claim, ref, agent string, engine *explain.EngineValue) explain.Failure {
+	return explain.Failure{Code: code, Claim: claim, Ref: ref, Agent: agent, Engine: engine, Message: "message for " + string(code)}
+}
+
+func TestExplainedPageCountsRejectedClaimsApartFromReferences(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{
+		{Attempt: "a1", Failures: []explain.Failure{
+			failure(explain.CodeValueMismatch, "c1", "", "0.62", engine),
+			failure(explain.CodeDuplicateClaimID, "c1", "", "0.5", nil),
+			failure(explain.CodeUnresolvedClaimRef, "", "c9", "", nil),
+		}},
+		{Attempt: "a2", RetryOf: "a1", Failures: []explain.Failure{
+			failure(explain.CodeValueMismatch, "c1", "", "0.63", engine),
+		}},
+		{Attempt: "a3", RetryOf: "a2", Failures: []explain.Failure{
+			{Explanation: -1, Ref: "MaxProseBytes", Code: explain.CodeLimitExceeded, Message: "the prose's size in bytes is 9000"},
+		}},
+	}
+	got := exPage(t, v, r, opts)
+	assert.Contains(t, got, "2 claims and 1 reference rejected at render in 2 attempts</span>",
+		"c1 counts once in a1 and once in a2; c9 is a reference")
+	assert.Contains(t, got, "1 limit exceeded at render</span>")
+	sec := got[strings.Index(got, "<h5>Rejected at render"):]
+	sec = sec[:strings.Index(sec, "</section>")]
+	assert.Equal(t, 2, strings.Count(sec, "<s>"), "only claim rows strike a figure, and c1 once per attempt")
+	assert.Contains(t, sec, "<s>0.62</s>")
+	assert.Contains(t, sec, "<s>0.63</s>")
+	assert.NotContains(t, sec, "<s>0.5</s>")
+	assert.Contains(t, sec, "reference {c9}: message for unresolved_claim_ref")
+	assert.Contains(t, sec, "limit MaxProseBytes: the prose&#39;s size in bytes is 9000")
+	assert.NotContains(t, sec, "— of")
+	assert.Contains(t, sec, "A claim row strikes through the agent's figure beside the engine's")
+}
+
+func TestExplainedPageHeadingsSayWhoseTextItIs(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	got := exPage(t, v, r, exOpts())
+	src, err := os.ReadFile("explainpage.js")
+	require.NoError(t, err)
+	for _, h := range []string{"Hypotheses — the agent's, not measured", "Next measurement — the agent's suggestion, not verified"} {
+		assert.Contains(t, got, h)
+		assert.Contains(t, string(src), h)
+	}
+}
+
+func TestExplainedPageBoundsTheNameInPrompts(t *testing.T) {
+	long := strings.Repeat("n", 150) + strings.Repeat("é", 150)
+	raw := pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn(long)}, Value: 10})
+	v := exView(t, raw, nil)
+	n := exNode(t, v, "main", long)
+	r := exCheck(t, v, explain.Explanation{Node: string(n), Prose: "long"})
+	got := exPage(t, v, r, exOpts())
+	cut := string([]rune(long)[:200]) + "…"
+	assert.Contains(t, got, html.EscapeString("Why is node "+string(n)+" ("+cut+") wide?"))
+	prompts := regexp.MustCompile(`data-prompt="([^"]*)"`).FindAllStringSubmatch(got, -1)
+	require.NotEmpty(t, prompts)
+	for _, p := range prompts {
+		assert.NotContains(t, html.UnescapeString(p[1]), string([]rune(long)[:201]))
+	}
+	src, err := os.ReadFile("explainpage.js")
+	require.NoError(t, err)
+	assert.Contains(t, string(src), "200", "the script bounds the name the same way")
+}
+
+// wideView is a view of at least frames nodes with names of nameLen bytes
+// full of template brackets, every node wide enough to draw.
+func wideView(t *testing.T, frames, nameLen int) *profilemodel.View {
+	t.Helper()
+	const depth = 10
+	var samples []pmfixture.Sample
+	// frames/depth unit samples: each node is 1/(frames/depth) of the total,
+	// which is minDrawFraction at 20000 frames.
+	for i := range frames / depth {
+		fr := []pmfixture.Frame{pmfixture.Fn("main")}
+		for d := range depth {
+			name := fmt.Sprintf("ns::tmpl<std::pair<int,%d>>::f%d&", i, d)
+			name += strings.Repeat("<x>", (nameLen-len(name))/3+1)
+			fr = append(fr, pmfixture.Fn(name[:nameLen]))
+		}
+		samples = append(samples, pmfixture.Sample{Frames: fr, Value: 1})
+	}
+	return exView(t, pmfixture.Build("cpu", "nanoseconds", nil, samples...), nil)
+}
+
+func TestExplainedPageStaysUnderItsByteBudget(t *testing.T) {
+	v := wideView(t, 20000, 300)
+	main := exNode(t, v, "main")
+	r := exCheck(t, v, explain.Explanation{Node: string(main), Prose: "main"})
+	for _, budget := range []int{32 << 20, 4 << 20} {
+		opts := exOpts()
+		opts.MaxBytes = budget
+		got := exPage(t, v, r, opts)
+		assert.LessOrEqual(t, len(got), budget)
+		left := regexp.MustCompile(`(\d+) nodes? beyond the page&#39;s size budget (is|are) not drawn|(\d+) left out by the page&#39;s limit`).FindString(got)
+		assert.NotEmpty(t, left, "budget %d: the page states what it left out", budget)
+		if budget == 4<<20 {
+			assert.Regexp(t, `\d+ nodes beyond the page&#39;s size budget are not drawn`, got)
+			assert.Greater(t, len(got), budget/2, "the budget is used, not wasted")
+		}
+	}
+}
+
+func TestExplainedPageRefusesABudgetTooSmallForTheExplainedPaths(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	opts := exOpts()
+	opts.MaxBytes = 1024
+	var b bytes.Buffer
+	err := WriteExplainedPage(&b, v, r, opts)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "1024")
+	assert.Zero(t, b.Len())
+}
+
+func TestExplainedPageEmitsRepeatedTextOnce(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	got := exPage(t, v, r, exOpts())
+	model := modelJSONText(t, got)
+	for _, label := range []string{`"Cumulative"`, `"Share of parent"`, `"from inexact samples"`, `"rounded to "`} {
+		assert.LessOrEqual(t, strings.Count(model, label), 1, "%s is emitted once", label)
+	}
+	assert.NotContains(t, model, `"of main"`, "the parent note is built by the script")
+	for _, tip := range regexp.MustCompile(`class="frame[^"]*"[^>]*title="([^"]*)"`).FindAllStringSubmatch(got, -1) {
+		for _, name := range []string{"main", "all", "c\n", "\nb"} {
+			assert.NotContains(t, tip[1], name)
+		}
+	}
 }

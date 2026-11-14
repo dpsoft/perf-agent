@@ -756,3 +756,13 @@ func TestExplainedPageCountsRejectedAttemptsTheServerDidNotKeep(t *testing.T) {
 	assert.Contains(t, got, "1 earlier rejected attempt not kept</span>")
 	assert.NotContains(t, got, "exceeded at render")
 }
+
+func TestExplainedPageSaysWhenAttemptHistoryMayBeIncomplete(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	opts := exOpts()
+	assert.NotContains(t, exPage(t, v, r, opts), "may be incomplete")
+	opts.HistoryIncomplete = true
+	got := exPage(t, v, r, opts)
+	assert.Contains(t, got, "earlier attempt history for this view may be incomplete</span>")
+	assert.NotContains(t, got, "exceeded at render")
+}

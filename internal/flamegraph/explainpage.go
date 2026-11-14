@@ -58,6 +58,9 @@ type ExplainedPageOptions struct {
 	// DroppedRejected is how many rejected attempts before Rejected the
 	// server no longer keeps; the rejected pill counts them.
 	DroppedRejected int
+	// HistoryIncomplete says the server may have lost count of earlier
+	// attempts of this view; the page says so.
+	HistoryIncomplete bool
 	// MaxNodes bounds the frames drawn; 0 means defaultExplainedMaxNodes.
 	// Explained and referenced nodes and their callers are always drawn.
 	MaxNodes int
@@ -184,6 +187,7 @@ type explainedPageData struct {
 	Attempt, View                    string
 	CheckedPill                      string
 	RejectedPill, LimitPill          string
+	HistoryPill                      string
 	GPU                              bool
 	Notes                            []string
 	Quality                          []exQualityRow
@@ -350,6 +354,9 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		}
 	}
 	data.Rejected, data.RejectedPill, data.LimitPill = b.rejected()
+	if b.opts.HistoryIncomplete {
+		data.HistoryPill = "earlier attempt history for this view may be incomplete"
+	}
 	data.Legend = legendOf(data.Frames)
 
 	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, FactRows: b.specs, Frames: b.frames, Prompts: prompts})

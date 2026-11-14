@@ -108,6 +108,7 @@ button.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,
 <span class="pill">prose is not verified</span>
 {{with .RejectedPill}}<span class="pill bad">{{.}}</span>
 {{end}}{{with .LimitPill}}<span class="pill bad">{{.}}</span>
+{{end}}{{with .HistoryPill}}<span class="pill bad">{{.}}</span>
 {{end}}</div>
 </header>
 <div class="legend" aria-label="Colour key">{{range .Legend}}<span class="c"><i class="sw" data-domain="{{.Key}}"></i>{{.Label}}</span>{{end}}<span class="c key">✦ path with an explanation</span></div>

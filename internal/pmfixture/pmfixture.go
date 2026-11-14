@@ -5,9 +5,10 @@ package pmfixture
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/pprof/profile"
@@ -50,6 +51,27 @@ func In(file, buildID string, addr uint64, lines ...Line) Frame {
 	return Frame{File: file, BuildID: buildID, Addr: addr, Lines: lines}
 }
 
+// locationKey identifies a location by its mapping, address and every field
+// of every line. Strings are quoted and numbers delimited, so no two
+// different frames share a key.
+func locationKey(mapping uint64, fr Frame) string {
+	var b strings.Builder
+	b.WriteString(strconv.FormatUint(mapping, 10))
+	b.WriteByte(',')
+	b.WriteString(strconv.FormatUint(fr.Addr, 10))
+	for _, l := range fr.Lines {
+		b.WriteByte(',')
+		b.WriteString(strconv.Quote(l.Name))
+		b.WriteByte(',')
+		b.WriteString(strconv.Quote(l.Filename))
+		b.WriteByte(',')
+		b.WriteString(strconv.FormatInt(l.StartLine, 10))
+		b.WriteByte(',')
+		b.WriteString(strconv.FormatInt(l.Line, 10))
+	}
+	return b.String()
+}
+
 // Build serializes a single-sample-type profile (leaf first, gzipped by
 // profile.Write). Mappings, functions and locations are shared between
 // samples whenever their fields are equal.
@@ -90,7 +112,7 @@ func Build(typ, unit string, comments []string, samples ...Sample) []byte {
 	}
 	location := func(fr Frame) *profile.Location {
 		m := mapping(fr)
-		k := fmt.Sprint(m.ID, fr.Addr, fr.Lines)
+		k := locationKey(m.ID, fr)
 		if l, ok := locs[k]; ok {
 			return l
 		}

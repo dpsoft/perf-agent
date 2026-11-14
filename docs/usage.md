@@ -327,6 +327,11 @@ go run ./cmd/flamegraph -diff base.pb.gz -execlog-base base.executions \
     -execlog profile.executions profile.pb.gz
 ```
 
+A sidecar named by `-execlog` or `-execlog-base` that is missing, a
+directory or unreadable exits 1 before anything is loaded. One that is read
+but does not match its profile (another capture, a truncated file) is not an
+error: the executions facts say why they are unavailable.
+
 A name path that matches several nodes (the same name in different modules)
 exits 1 and lists the candidate IDs on stderr; pass one of them instead.
 `-diff` writes the page to `-o` (default `<profile>.diff.html`) and the diff

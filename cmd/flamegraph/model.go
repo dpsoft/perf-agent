@@ -64,6 +64,18 @@ func runModel(stdout, stderr io.Writer, a modelArgs) int {
 		return usageErr(stderr, "-o and -title apply to -diff only")
 	}
 
+	// Load never fails on a sidecar's content, only reports it in the
+	// facts; a sidecar named on the command line that cannot be opened is
+	// a mistake in the command line, so it is refused before any work.
+	for _, s := range []struct{ flag, path string }{{"execlog", a.execlog}, {"execlog-base", a.execlogBase}} {
+		if s.path == "" {
+			continue
+		}
+		if err := checkReadable(s.path); err != nil {
+			return failf(stderr, "-%s: %v", s.flag, err)
+		}
+	}
+
 	view, err := loadView(a.in, a.execlog, a.sampleIdx)
 	if err != nil {
 		return failf(stderr, "%v", err)
@@ -75,6 +87,27 @@ func runModel(stdout, stderr io.Writer, a modelArgs) int {
 		return runListNodes(stdout, stderr, view, a.listNodes)
 	}
 	return runDiff(stdout, stderr, a, view)
+}
+
+// checkReadable reports why path cannot be read, or nil. Only a regular
+// file is opened to check permission: opening and closing a pipe, such as
+// a shell's process substitution, would cut off its writer.
+func checkReadable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 func loadView(path, execlogPath string, sampleIdx int) (*profilemodel.View, error) {

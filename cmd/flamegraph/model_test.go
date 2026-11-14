@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dpsoft/perf-agent/gpu/execlog"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 	"github.com/google/pprof/profile"
 )
@@ -21,9 +22,15 @@ type sample struct {
 
 func writeProfile(t *testing.T, dir, name string, samples ...sample) string {
 	t.Helper()
+	return writeTypedProfile(t, dir, name, "cpu", samples...)
+}
+
+// writeTypedProfile is writeProfile with sample type typ, in nanoseconds.
+func writeTypedProfile(t *testing.T, dir, name, typ string, samples ...sample) string {
+	t.Helper()
 	p := &profile.Profile{
-		SampleType: []*profile.ValueType{{Type: "cpu", Unit: "nanoseconds"}},
-		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		SampleType: []*profile.ValueType{{Type: typ, Unit: "nanoseconds"}},
+		PeriodType: &profile.ValueType{Type: typ, Unit: "nanoseconds"},
 		Period:     1,
 	}
 	mappings := map[string]*profile.Mapping{}
@@ -382,5 +389,126 @@ func TestLegacyFoldedStillWorks(t *testing.T) {
 	code, out, _ := exec("-folded", basicProfile(t))
 	if code != 0 || !strings.Contains(out, "main;work;inner 30") {
 		t.Fatalf("exit %d, out %q", code, out)
+	}
+}
+
+// gpuWithSidecar writes a GPU profile of two samples carrying three
+// executions (0 and 1 on the first, 2 on the second) and its executions
+// sidecar, bound to the profile's bytes as perf-agent writes it.
+func gpuWithSidecar(t *testing.T, dir, name string) (prof, sidecar string) {
+	t.Helper()
+	prof = writeTypedProfile(t, dir, name+".pb.gz", "gpu",
+		sample{[]string{"main", "[gpu:launch]", "[gpu:kernel:k1]"}, 300},
+		sample{[]string{"main", "[gpu:launch]", "[gpu:kernel:k2]"}, 50},
+	)
+	raw, err := os.ReadFile(prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar = filepath.Join(dir, name+".executions")
+	w, err := execlog.Create(sidecar, execlog.Header{Backend: "cupti", SampleType: "gpu/nanoseconds"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []execlog.Row{
+		{Sample: 0, Execution: 0, Value: 100},
+		{Sample: 0, Execution: 1, Value: 200},
+		{Sample: 1, Execution: 2, Value: 50},
+	} {
+		w.Add(r)
+	}
+	if err := w.Finish(2, execlog.ProfileSHA256(raw)); err != nil {
+		t.Fatal(err)
+	}
+	return prof, sidecar
+}
+
+func TestFactsReadARealSidecar(t *testing.T) {
+	prof, sidecar := gpuWithSidecar(t, t.TempDir(), "gpu")
+	code, out, errOut := exec("-facts", "main", "-execlog", sidecar, prof)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	var got struct {
+		ExecutionsBelow profilemodel.Fact `json:"executions_below"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if f := got.ExecutionsBelow; f.Status != profilemodel.StatusOK || f.Int == nil || *f.Int != 3 {
+		t.Fatalf("executions_below %+v, want ok 3", f)
+	}
+}
+
+// Each sidecar reaches its own side of the diff.
+func TestDiffWiresEachSidecarToItsSide(t *testing.T) {
+	dir := t.TempDir()
+	base, baseLog := gpuWithSidecar(t, dir, "base")
+	newer, newLog := gpuWithSidecar(t, dir, "new")
+	type executions struct {
+		OK     bool   `json:"ok"`
+		Reason string `json:"reason"`
+	}
+	for _, tc := range []struct {
+		flag, log         string
+		wantBase, wantNew executions
+	}{
+		{"-execlog-base", baseLog, executions{OK: true}, executions{Reason: profilemodel.ReasonNoSidecar}},
+		{"-execlog", newLog, executions{Reason: profilemodel.ReasonNoSidecar}, executions{OK: true}},
+	} {
+		out := filepath.Join(dir, strings.TrimPrefix(tc.flag, "-")+".html")
+		if code, _, e := exec("-diff", base, tc.flag, tc.log, "-o", out, newer); code != 0 {
+			t.Fatalf("%s: exit %d: %s", tc.flag, code, e)
+		}
+		raw, err := os.ReadFile(strings.TrimSuffix(out, ".html") + ".json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d struct {
+			Base struct {
+				Executions executions `json:"executions"`
+			} `json:"base_quality"`
+			New struct {
+				Executions executions `json:"executions"`
+			} `json:"new_quality"`
+		}
+		if err := json.Unmarshal(raw, &d); err != nil {
+			t.Fatal(err)
+		}
+		if d.Base.Executions != tc.wantBase || d.New.Executions != tc.wantNew {
+			t.Fatalf("%s: base %+v new %+v, want base %+v new %+v", tc.flag, d.Base.Executions, d.New.Executions, tc.wantBase, tc.wantNew)
+		}
+	}
+}
+
+// A sidecar that was named but cannot be read is an error of the command
+// line, not a fact about the profile.
+func TestMissingOrUnreadableSidecarExits1(t *testing.T) {
+	dir := t.TempDir()
+	prof := basicProfile(t)
+	missing := filepath.Join(dir, "missing.executions")
+	locked := filepath.Join(dir, "locked.executions")
+	if err := os.WriteFile(locked, []byte("x"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	cases := [][]string{
+		{"-facts", "main", "-execlog", missing, prof},
+		{"-list-nodes", "1", "-execlog", dir, prof},
+		{"-diff", prof, "-execlog-base", missing, "-o", filepath.Join(dir, "d.html"), prof},
+		{"-diff", prof, "-execlog", dir, "-o", filepath.Join(dir, "d.html"), prof},
+	}
+	if f, err := os.Open(locked); err == nil {
+		_ = f.Close() // running with privileges that read anything
+	} else {
+		cases = append(cases, []string{"-facts", "main", "-execlog", locked, prof})
+	}
+	for _, args := range cases {
+		code, out, errOut := exec(args...)
+		if code != 1 || out != "" || !strings.Contains(errOut, "execlog") {
+			t.Errorf("%v: exit %d, stdout %q, stderr %q; want 1 naming the flag", args, code, out, errOut)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "d.html")); err == nil {
+		t.Error("a diff page was written despite an unreadable sidecar")
 	}
 }

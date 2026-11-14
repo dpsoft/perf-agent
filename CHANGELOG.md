@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cmd/flamegraph` reads profiles through a profile model: `-facts NODE` prints
+  one node's path facts as JSON, `-list-nodes N` lists the widest nodes, and
+  `-diff BASE` writes a comparison page and its JSON. `-execlog` and
+  `-execlog-base` name the executions sidecars; none is ever found implicitly.
+
 ## [1.5.2] - 2026-11-12
 
 A packaging and licensing release. Release archives and both container images

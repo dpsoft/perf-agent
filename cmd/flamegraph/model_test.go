@@ -250,6 +250,27 @@ func TestDiffWritesPageAndJSON(t *testing.T) {
 	}
 }
 
+// The diff JSON is a deep tree: indenting it multiplies its size.
+func TestDiffJSONIsCompact(t *testing.T) {
+	dir := t.TempDir()
+	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main", "work", "inner"}, 100})
+	newer := writeProfile(t, dir, "new.pb.gz", sample{[]string{"main", "work", "inner"}, 150})
+	if code, _, e := exec("-diff", base, newer); code != 0 {
+		t.Fatalf("exit %d: %s", code, e)
+	}
+	raw, err := os.ReadFile(newer + ".diff.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := bytes.CutSuffix(raw, []byte("\n"))
+	if !ok || bytes.ContainsAny(body, "\n\t") {
+		t.Fatalf("diff JSON is not compact:\n%s", raw)
+	}
+	if bytes.Contains(raw, []byte(`"delta_per_unit"`)) || !bytes.Contains(raw, []byte(`"per_unit":{"ok":false,"reason":"no work count"}`)) {
+		t.Fatalf("per-unit availability should be stated once, not per node:\n%s", raw)
+	}
+}
+
 func TestDiffExplicitOutputPath(t *testing.T) {
 	dir := t.TempDir()
 	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main"}, 1})

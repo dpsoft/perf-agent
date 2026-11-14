@@ -335,6 +335,12 @@ names an input profile or sidecar, or a link to one. Each output file is
 written atomically (the JSON first, then the page); the pair is not, so a
 failure between the two can leave a new JSON beside an old page.
 
+The diff JSON is compact and its format is unstable: it nests the union as a
+tree as deep as the deepest stack, and a later release replaces that with a
+flat node list carrying parent IDs. `per_unit` states once whether
+per-unit-of-work deltas are available, and why not; nodes carry
+`delta_per_unit` only when they are.
+
 ## Continuous GPU telemetry and OTLP
 
 Run telemetry until SIGINT/SIGTERM, with optional OTLP/HTTP protobuf delivery:

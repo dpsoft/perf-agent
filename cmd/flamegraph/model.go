@@ -222,7 +222,9 @@ func runDiff(stdout, stderr io.Writer, a modelArgs, newView *profilemodel.View) 
 	if err := flamegraph.WriteDiffPage(&html, d, title); err != nil {
 		return failf(stderr, "diff page: %v", err)
 	}
-	js, err := json.MarshalIndent(d, "", "  ")
+	// Compact: the union is a tree as deep as the deepest stack, and
+	// indenting it makes the file mostly whitespace.
+	js, err := json.Marshal(d)
 	if err != nil {
 		return failf(stderr, "encode diff JSON: %v", err)
 	}

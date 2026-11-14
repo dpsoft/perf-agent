@@ -219,12 +219,17 @@ func TestDiffInvariantsOnEveryPair(t *testing.T) {
 				t.Errorf("%s: children out of order", n.Name)
 			}
 			checkFact(t, n.Name+" share delta", n.DeltaShare, RoundingFor(MetricShareDelta))
-			checkFact(t, n.Name+" per-unit delta", n.DeltaPerUnit, RoundingFor(MetricPerWorkDelta))
 			if n.DeltaShare.Status != StatusUnavailable && n.DeltaShare.Denominator != DenominatorViewTotal {
 				t.Errorf("%s: share delta denominator %q", n.Name, n.DeltaShare.Denominator)
 			}
-			if n.DeltaPerUnit.Unit != d.Unit+"/work" {
-				t.Errorf("%s: per-unit unit %q", n.Name, n.DeltaPerUnit.Unit)
+			if (n.DeltaPerUnit != nil) != d.PerUnit.OK {
+				t.Errorf("%s: per-unit delta %v with diff per-unit %+v", n.Name, n.DeltaPerUnit, d.PerUnit)
+			}
+			if n.DeltaPerUnit != nil {
+				checkFact(t, n.Name+" per-unit delta", *n.DeltaPerUnit, RoundingFor(MetricPerWorkDelta))
+				if n.DeltaPerUnit.Unit != d.Unit+"/work" {
+					t.Errorf("%s: per-unit unit %q", n.Name, n.DeltaPerUnit.Unit)
+				}
 			}
 		})
 		for s, side := range []*Node{d.Root.Base, d.Root.New} {
@@ -851,14 +856,27 @@ func TestPerUnitDeltaNeedsPositiveFiniteWork(t *testing.T) {
 		{WorkCounts{Base: 1, New: math.NaN()}, ReasonBadWorkCount},
 		{WorkCounts{Base: -5, New: 1}, ReasonBadWorkCount},
 	} {
-		wantUnavailable(t, "per-unit delta", compareOf(t, base, next, tc.work).Root.DeltaPerUnit, tc.reason)
+		// Unusable work counts are stated once on the diff, not per node.
+		d := compareOf(t, base, next, tc.work)
+		if d.PerUnit != (Availability{Reason: tc.reason}) {
+			t.Fatalf("work %+v: per-unit %+v, want unavailable %q", tc.work, d.PerUnit, tc.reason)
+		}
+		walkDiff(d.Root, func(n *DiffNode) {
+			if n.DeltaPerUnit != nil {
+				t.Fatalf("work %+v: %s carries a per-unit delta %+v", tc.work, n.Name, *n.DeltaPerUnit)
+			}
+		})
 	}
-	f := compareOf(t, base, next, WorkCounts{Base: 100, New: 100}).Root.DeltaPerUnit
-	if f.Status != StatusOK || f.Derived == nil || *f.Derived != 0.5 {
+	d := compareOf(t, base, next, WorkCounts{Base: 100, New: 100})
+	if !d.PerUnit.OK || d.PerUnit.Reason != "" {
+		t.Fatalf("per-unit %+v, want ok", d.PerUnit)
+	}
+	f := d.Root.DeltaPerUnit
+	if f == nil || f.Status != StatusOK || f.Derived == nil || *f.Derived != 0.5 {
 		t.Fatalf("per-unit delta %+v, want ok 0.5", f)
 	}
 	same := compareOf(t, base, base, WorkCounts{Base: 100, New: 100}).Root.DeltaPerUnit
-	if same.Status != StatusZero || same.Derived == nil || *same.Derived != 0 {
+	if same == nil || same.Status != StatusZero || same.Derived == nil || *same.Derived != 0 {
 		t.Fatalf("per-unit delta of equal views %+v, want zero", same)
 	}
 }
@@ -872,7 +890,7 @@ func TestPerUnitDeltaKeepsFractionsAndUnit(t *testing.T) {
 		want       float64
 	}{{one, two, 0.5}, {two, one, -0.5}} {
 		f := compareOf(t, tc.base, tc.next, work).Root.DeltaPerUnit
-		if f.Derived == nil || *f.Derived != tc.want || f.Int != nil || f.Ratio != nil {
+		if f == nil || f.Derived == nil || *f.Derived != tc.want || f.Int != nil || f.Ratio != nil {
 			t.Fatalf("per-unit delta %+v, want derived %v alone", f, tc.want)
 		}
 		if f.Unit != "nanoseconds/work" || f.Status != StatusOK || f.Rounding != RoundingFor(MetricPerWorkDelta) {
@@ -885,7 +903,10 @@ func TestPerUnitDeltaRejectsNonFiniteResult(t *testing.T) {
 	huge := cpuProfile(fx{stack: []string{"main"}, value: math.MaxInt64})
 	empty := allFixtures()["cpu-all-zero"]()
 	d := compareOf(t, huge, empty, WorkCounts{Base: math.SmallestNonzeroFloat64, New: 1})
-	wantUnavailable(t, "per-unit delta", d.Root.DeltaPerUnit, ReasonNonFinite)
+	if !d.PerUnit.OK || d.Root.DeltaPerUnit == nil {
+		t.Fatalf("per-unit %+v, root delta %v: want usable work counts", d.PerUnit, d.Root.DeltaPerUnit)
+	}
+	wantUnavailable(t, "per-unit delta", *d.Root.DeltaPerUnit, ReasonNonFinite)
 	b, err := json.Marshal(d)
 	if err != nil {
 		t.Fatal(err)
@@ -914,9 +935,11 @@ func TestDiffJSONKeys(t *testing.T) {
 		}
 	}
 	wantKeys("diff", top, "base_handle", "new_handle", "sample_type", "unit", "base_total", "new_total",
-		"base_quality", "new_quality", "quality_warnings", "base_notes", "new_notes", "root")
+		"base_quality", "new_quality", "quality_warnings", "base_notes", "new_notes", "per_unit", "root")
+	// Without work counts no node carries delta_per_unit: per_unit says why
+	// once.
 	common := []string{"name", "presence", "interpretation", "base_cum", "new_cum", "base_self",
-		"new_self", "combined", "delta_abs", "delta_share", "delta_per_unit"}
+		"new_self", "combined", "delta_abs", "delta_share"}
 
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(top["root"], &root); err != nil {
@@ -943,4 +966,16 @@ func TestDiffJSONKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantKeys("candidate", cands[0], "side", "handle", "node")
+
+	p := diffPairs()["one-vs-two"]
+	withWork, err := json.Marshal(compareOf(t, p.base(), p.new(), WorkCounts{Base: 1, New: 2}).Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(withWork, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := root["delta_per_unit"]; !ok {
+		t.Fatalf("root with work counts lacks delta_per_unit: %s", withWork)
+	}
 }

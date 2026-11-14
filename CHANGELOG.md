@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one node's path facts as JSON, `-list-nodes N` lists the widest nodes, and
   `-diff BASE` writes a comparison page and its JSON. `-execlog` and
   `-execlog-base` name the executions sidecars; none is ever found implicitly.
+  The diff JSON format is unstable: it is a nested tree that a later release
+  flattens into a node list with parent IDs.
 
 ## [1.5.2] - 2026-11-12
 

@@ -142,9 +142,11 @@ type DiffNode struct {
 	// the base total; unavailable "zero total" when either total is 0.
 	DeltaShare Fact `json:"delta_share"`
 	// DeltaPerUnit is NewCum/work.New - BaseCum/work.Base, in
-	// "<sample unit>/work"; unavailable unless both work counts are
-	// positive and finite and the result is finite.
-	DeltaPerUnit Fact        `json:"delta_per_unit"`
+	// "<sample unit>/work", unavailable when the result is not finite. It
+	// is nil exactly when Diff.PerUnit is not OK: the work counts are
+	// missing or unusable for every node alike, so the reason is stated
+	// once there.
+	DeltaPerUnit *Fact       `json:"delta_per_unit,omitempty"`
 	Children     []*DiffNode `json:"children,omitzero"` // by |DeltaAbs| desc, then Name
 }
 
@@ -179,9 +181,14 @@ type Diff struct {
 	// BaseNotes and NewNotes are each view's sampling notes, the text its
 	// path facts carry in PathFacts.Notes; nil except on GPU views with a
 	// non-zero total.
-	BaseNotes []string  `json:"base_notes"`
-	NewNotes  []string  `json:"new_notes"`
-	Root      *DiffNode `json:"root"`
+	BaseNotes []string `json:"base_notes"`
+	NewNotes  []string `json:"new_notes"`
+	// PerUnit says whether the work counts allow per-unit-of-work deltas:
+	// not OK with ReasonNoWorkCount when a count was not supplied, or
+	// ReasonBadWorkCount when one is not positive and finite. Only when it
+	// is OK do nodes carry DeltaPerUnit.
+	PerUnit Availability `json:"per_unit"`
+	Root    *DiffNode    `json:"root"`
 }
 
 // ErrIncompatibleViews is returned when the views differ in sample type,
@@ -226,6 +233,7 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 		return nil, fmt.Errorf("%w: base %s, new %s", ErrIncompatibleViews, describeView(baseView), describeView(newView))
 	}
 	d := &differ{views: [2]*View{baseView, newView}, work: [2]float64{work.Base, work.New}}
+	d.perUnit = workAvailability(d.work)
 	roots := [2]*Node{baseView.Root, newView.Root}
 	top := d.basisOf(roots)
 	root, err := d.node(roots, "", nil, top, nil)
@@ -250,6 +258,7 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 		QualityWarnings: d.viewWarnings(top),
 		BaseNotes:       notes[baseSide],
 		NewNotes:        notes[newSide],
+		PerUnit:         d.perUnit,
 		Root:            root,
 	}, nil
 }
@@ -272,8 +281,9 @@ func describeView(v *View) string {
 }
 
 type differ struct {
-	views [2]*View
-	work  [2]float64
+	views   [2]*View
+	work    [2]float64
+	perUnit Availability
 }
 
 func (d *differ) gpu() bool { return d.views[baseSide].SampleType == gpuSampleType }
@@ -400,27 +410,37 @@ func (d *differ) shareDelta(cum [2]int64) Fact {
 	return f
 }
 
-func (d *differ) perUnitDelta(cum [2]int64) Fact {
-	unit := d.views[baseSide].Unit + "/work"
-	for _, w := range d.work {
+// workAvailability says whether both work counts can divide: a count of
+// 0 was not supplied, and any other count must be positive and finite.
+func workAvailability(work [2]float64) Availability {
+	for _, w := range work {
 		if w == 0 {
-			return unavailableFact(MetricPerWorkDelta, unit, ReasonNoWorkCount)
+			return Availability{Reason: ReasonNoWorkCount}
 		}
 	}
-	for _, w := range d.work {
+	for _, w := range work {
 		if !(w > 0) || math.IsInf(w, 1) {
-			return unavailableFact(MetricPerWorkDelta, unit, ReasonBadWorkCount)
+			return Availability{Reason: ReasonBadWorkCount}
 		}
 	}
+	return Availability{OK: true}
+}
+
+// perUnitDelta is nil unless the work counts are usable (see Diff.PerUnit).
+func (d *differ) perUnitDelta(cum [2]int64) *Fact {
+	if !d.perUnit.OK {
+		return nil
+	}
+	unit := d.views[baseSide].Unit + "/work"
 	delta := float64(cum[newSide])/d.work[newSide] - float64(cum[baseSide])/d.work[baseSide]
 	if math.IsInf(delta, 0) || math.IsNaN(delta) {
-		return unavailableFact(MetricPerWorkDelta, unit, ReasonNonFinite)
+		return new(unavailableFact(MetricPerWorkDelta, unit, ReasonNonFinite))
 	}
 	f := Fact{Derived: new(delta), Unit: unit, Status: StatusOK, Rounding: RoundingFor(MetricPerWorkDelta)}
 	if delta == 0 {
 		f.Status = StatusZero
 	}
-	return f
+	return &f
 }
 
 // pairing is one union child before it is built.

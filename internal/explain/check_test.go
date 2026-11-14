@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -690,7 +691,7 @@ func TestGluedDotsSignedExponentsAndAdjacentPlaceholdersAreRefused(t *testing.T)
 	}
 	for _, prose := range []string{
 		"{c1}, {c2}", "({c1}) {c2}", "{c1} % {c2}", "{c1} ms {c2}", "between {c1} and {c2}", "{c1} e+ {c2}", "was {c1}. {c2}",
-		"{c1} under {n:" + string(conv) + "} {c2}", "{c1}/{c2}",
+		"{c1} under {n:" + string(conv) + "} {c2}", "{c1} / {c2}",
 	} {
 		r, _ := check(t, v, one(conv, prose, claims...))
 		if !r.OK {
@@ -708,7 +709,18 @@ func TestPercentOrALetterGluedAfterAClaimIsRefused(t *testing.T) {
 			t.Errorf("%q: failure = %+v", prose, f)
 		}
 	}
-	for _, prose := range []string{"{c1} %", "{c1} of it", "({c1})", "{c1}.", "{c1}, then", "{c1}é"} {
+	// After a claim only the end, whitespace or closing punctuation may
+	// follow: a letter in any script, a percent or per-mille sign of any
+	// width, a multiplication sign or other symbol reads as the claim's unit.
+	count := `{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": 411}`
+	for _, prose := range []string{"{c1}µs", "{c1}μs", "{c1}％", "{c1}‰", "{c1}‱", "{c1}×2", "{c1}é", "{c1}/s", "{c1}-ish", "{c1}(", "{c1}#"} {
+		r, _ := check(t, v, one(b, prose, count))
+		if f := onlyFailure(t, r, CodeGluedToClaim); f.Ref != "c1" {
+			t.Errorf("%q: failure = %+v", prose, f)
+		}
+	}
+	for _, prose := range []string{"{c1} %", "{c1} of it", "({c1})", "{c1}.", "{c1}, then", "\"{c1}\"", "'{c1}'", "«{c1}»", "“{c1}”",
+		"{c1}…", "{c1}!", "{c1}?", "{c1};", "{c1}: so", "[{c1}]", "{c1}\nnext", "{c1}\u00a0ns"} {
 		r, _ := check(t, v, one(b, prose, claim))
 		if !r.OK {
 			t.Errorf("%q: %+v", prose, r.Failures)
@@ -785,5 +797,35 @@ func TestFailureIndexesAndCountsAreDecimalStrings(t *testing.T) {
 	r, _ = checkWith(t, v, one(b, ""), lim)
 	if raw, _ := json.Marshal(r.Failures[0]); !strings.Contains(string(raw), `"explanation":"-1"`) {
 		t.Errorf("limit failure JSON %s", raw)
+	}
+}
+
+// Tokenize is linear: a long run of digits that may not start a number is
+// scanned once, not once per digit. Quadratic scanning took seconds here.
+func TestTokenizeIsLinearInDigitRuns(t *testing.T) {
+	run := "a" + strings.Repeat("1", 8191)
+	start := time.Now()
+	for range 64 {
+		if segs := Tokenize(run); len(segs) != 1 || segs[0].Kind != SegmentText {
+			t.Fatalf("Tokenize(a111…) = %d segments", len(segs))
+		}
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("64 tokenizations of an 8 KiB digit run took %v", d)
+	}
+	if segs := Tokenize("about41% and a" + strings.Repeat("1", 50) + "%"); len(segs) != 4 || segs[1].Text != "41%" || segs[3].Text != strings.Repeat("1", 50)+"%" {
+		t.Errorf("percent runs after letters: %+v", segs)
+	}
+
+	v, b := cpuBasic(t)
+	var exps []string
+	for range 64 {
+		exps = append(exps, fmt.Sprintf(`{"node": %q, "prose": %q}`, b, run))
+	}
+	start = time.Now()
+	r, _ := check(t, v, "["+strings.Join(exps, ",")+"]")
+	mustOK(t, r)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("checking 64 explanations of 8 KiB digit runs took %v", d)
 	}
 }

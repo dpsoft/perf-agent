@@ -80,10 +80,19 @@ func Tokenize(s string) []Segment {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		n := 0
 		switch {
-		case unicode.IsNumber(r) && (numberMayStart(s[:i]) || endsInPercent(s[i:])):
+		case unicode.IsNumber(r):
+			// The run is scanned once: a number that may not start here is
+			// skipped whole, since no digit inside it may start one either
+			// and its end, "%" or not, is the same from any of them.
 			n = numberLen(s[i:])
-		case r == '.' && digitsLen(s[i+1:]) > 0 && dotMayStart(s[:i]):
-			n = 1 + numberLen(s[i+1:])
+			if !numberMayStart(s[:i]) && s[i+n-1] != '%' {
+				i += n
+				continue
+			}
+		case r == '.' && dotMayStart(s[:i]):
+			if d := digitsLen(s[i+1:]); d > 0 {
+				n = 1 + numberLen(s[i+1:])
+			}
 		}
 		if n > 0 {
 			flush(i)
@@ -144,13 +153,6 @@ func isASCIILetterRune(r rune) bool { return r < utf8.RuneSelf && isASCIILetter(
 func dotMayStart(before string) bool {
 	r, _ := utf8.DecodeLastRuneInString(before)
 	return before == "" || !isASCIILetterRune(r) && !unicode.IsNumber(r)
-}
-
-// endsInPercent reports whether the number at the start of s, which starts
-// with a numeric character, ends in "%".
-func endsInPercent(s string) bool {
-	n := numberLen(s)
-	return s[n-1] == '%'
 }
 
 // numberLen is the length in bytes of the number at the start of s, which

@@ -277,7 +277,7 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 			}
 			if glued, ok := gluedText(s[:start], sg.Text, s[end:], prev, next); ok {
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeGluedToClaim,
-					Message: fmt.Sprintf("%q glues text to %s: a sign, digits, a dot or another placeholder right before a claim, or digits, an exponent, decimals, a %%, a letter or another placeholder right after it, change the number a reader sees; put a space or words between them (a claim shows its own unit)", clip(glued), sg.Text)})
+					Message: fmt.Sprintf("%q glues text to %s: a sign, digits, a dot or another placeholder right before a claim change the number a reader sees, and only a space, the end of the text or closing punctuation (. , ; : ! ? … or a closing bracket or quote) may follow it, since a claim shows its own unit; put a space or words between them", clip(glued), sg.Text)})
 			}
 		case SegmentNode:
 			refs[sg.Node] = struct{}{}
@@ -346,14 +346,15 @@ const bracesAdvice = "To mention a frame whose name contains braces, use {n:<id>
 
 // gluedText reports whether the text around a claim placeholder changes the
 // number it shows. Before it: a sign (+, -, U+2212), a numeric character
-// or a "." (".{c1}" reads as a fraction). After it: a numeric character, a
-// "." or "," followed by one, "e"/"E" followed by an optional sign and one
-// (an exponent), a "%" (a claim shows its own unit, so "{c1}%" turns a
-// ratio into a percentage) or any other ASCII letter (a unit or multiplier
-// such as "{c1}k" or "{c1}ms"). On either side: another claim or node placeholder with
-// nothing between ("{c1}{c2}" reads as one number). prev and next are the
-// neighbouring segments, nil at the ends. It returns the placeholder with
-// what is glued to it.
+// or a "." (".{c1}" reads as a fraction). After it only the end of the
+// text, whitespace or closing punctuation may follow (see endsAClaim): a
+// claim shows its own unit, so a letter in any script ("{c1}ms", "{c1}µs"),
+// a percent or per-mille sign of any width, a digit, a multiplication sign
+// or any other symbol reads as part of the figure, and so does a "." or ","
+// followed by a digit ("{c1}.5"). On either side: another claim or node
+// placeholder with nothing between ("{c1}{c2}" reads as one number). prev
+// and next are the neighbouring segments, nil at the ends. It returns the
+// placeholder with what is glued to it.
 func gluedText(before, ph, after string, prev, next *Segment) (string, bool) {
 	isPlaceholder := func(sg *Segment) bool { return sg != nil && (sg.Kind == SegmentClaim || sg.Kind == SegmentNode) }
 	if isPlaceholder(prev) {
@@ -365,28 +366,26 @@ func gluedText(before, ph, after string, prev, next *Segment) (string, bool) {
 	if p, _ := utf8.DecodeLastRuneInString(before); before != "" && (isSign(p) || p == '.' || unicode.IsNumber(p)) {
 		return string(p) + ph, true
 	}
+	if after == "" {
+		return "", false
+	}
 	r, size := utf8.DecodeRuneInString(after)
-	switch {
-	case after == "":
-	case unicode.IsNumber(r):
-		return ph + string(r), true
-	case r == '.' || r == ',':
+	if r == '.' || r == ',' {
 		if r2, size2 := utf8.DecodeRuneInString(after[size:]); unicode.IsNumber(r2) {
 			return ph + after[:size+size2], true
 		}
-	case r == 'e' || r == 'E':
-		at := size
-		if r2, size2 := utf8.DecodeRuneInString(after[at:]); isSign(r2) {
-			at += size2
-		}
-		if r3, size3 := utf8.DecodeRuneInString(after[at:]); unicode.IsNumber(r3) {
-			return ph + after[:at+size3], true
-		}
-		return ph + string(r), true
-	case r == '%' || isASCIILetterRune(r):
+	}
+	if !endsAClaim(r) {
 		return ph + string(r), true
 	}
 	return "", false
+}
+
+// endsAClaim reports whether r may follow a claim placeholder: whitespace,
+// a closing bracket or quote (Unicode Pe and Pf, and the ASCII quotes,
+// which close as often as they open) or sentence punctuation.
+func endsAClaim(r rune) bool {
+	return unicode.IsSpace(r) || unicode.In(r, unicode.Pe, unicode.Pf) || strings.ContainsRune(".,;:!?…\"'", r)
 }
 
 // isSign reports whether r is a plus or minus sign.

@@ -152,3 +152,11 @@ claude mcp add perf-agent -- /path/to/perf-agent-mcp --profiles /path/to/profile
 ```
 
 Any other MCP client: run `/path/to/perf-agent-mcp --profiles DIR --output DIR` as a stdio server. The server answers protocol versions 2025-11-25 and 2025-06-18 and answers `server/discover` with method-not-found, so clients fall back to `initialize`.
+
+## Evals
+
+`scripts/mcp-evals.sh` replays a fixed set of questions through a real agent over frozen synthetic fixtures. It needs the `claude` CLI, `go` and `jq`, and it needs a model, so it costs tokens and is run by hand, never in CI. No capture leaves the machine.
+
+The script builds `perf-agent-mcp` into a temporary directory, writes the fixtures (`cpu.pb.gz`, `cpu-new.pb.gz`, `gpu.pb.gz` and its `gpu.executions` log), and runs `claude -p` once per question in `internal/perfmcp/evals/questions.json` with a generated `--mcp-config` and `--strict-mcp-config`, so your own Claude MCP configuration is neither loaded nor changed. It then checks the rendered pages: each exists, its header counts at least one checked figure, each expected value sits inside a checked claim, and no forbidden text (for example reading a sampled share as GPU time) appears. Unchecked-number counts are printed per page.
+
+Each question has `id`, `prompt`, `profile`, an optional `execlog`, and `expect` (`page`, `checked_values`, `require`, `forbid`). The checks run as `TestEvalPages` with `PERF_AGENT_MCP_EVAL_DIR` set to the scratch directory; without it both eval tests skip.

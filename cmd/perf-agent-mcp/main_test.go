@@ -160,7 +160,7 @@ func TestStdoutCarriesOnlyJSONRPC(t *testing.T) {
 }
 
 func TestTheServerLinksNoNetworkingOrProfiler(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".").Output()
+	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}

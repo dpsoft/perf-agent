@@ -140,9 +140,10 @@ button.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,
 </section>
 <div id="exp">{{range .Sel.Explanation}}{{template "exp" .}}{{end}}</div>
 <p class="sec muted" id="noexp"{{if .Sel.Explanation}} hidden{{end}}>The agent did not explain this frame: these are the profile's facts only.</p>
-{{if .Rejected}}<section class="sec"><h5>Rejected at render</h5>
+{{if or .Rejected .RejectedNote}}<section class="sec"><h5>Rejected at render</h5>
 <p class="muted">perf-agent refused these in earlier attempts. A claim row strikes through the agent's figure beside the engine's; reference and limit rows say what was wrong. This page is the attempt that passed.</p>
-<ul class="rej">{{range .Rejected}}<li><span class="ref">{{.Attempt}}</span> {{with .Evidence}}<span class="muted">({{.}})</span> {{end}}{{.Label}}{{if eq .Kind "claim"}}{{if .Metric}} (<code>{{.Metric}}</code> of {{.Node}}){{end}}:{{if .Agent}} the agent wrote <s>{{.Agent}}</s>{{end}}{{if .Engine}}{{if .Agent}},{{end}} perf-agent has <b>{{.Engine}}</b>{{end}}<div class="why">{{.Code}}: {{.Reason}}</div>{{else if eq .Kind "more"}}{{else}}: {{.Reason}}{{end}}</li>
+{{with .RejectedNote}}<p class="muted">{{.}}</p>
+{{end}}<ul class="rej">{{range .Rejected}}<li><span class="ref">{{.Attempt}}</span> {{with .Evidence}}<span class="muted">({{.}})</span> {{end}}{{.Label}}{{if eq .Kind "claim"}}{{if .Metric}} (<code>{{.Metric}}</code> of {{.Node}}){{end}}:{{if .Agent}} the agent wrote <s>{{.Agent}}</s>{{end}}{{if .Engine}}{{if .Agent}},{{end}} perf-agent has <b>{{.Engine}}</b>{{end}}<div class="why">{{.Code}}: {{.Reason}}</div>{{else if eq .Kind "more"}}{{else}}: {{.Reason}}{{end}}</li>
 {{end}}</ul>
 </section>
 {{end}}<section class="sec"><h5>Path (root → frame)</h5>

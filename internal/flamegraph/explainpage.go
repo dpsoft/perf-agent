@@ -196,6 +196,7 @@ type explainedPageData struct {
 	Height                           string
 	Frames                           []exDrawn
 	NarrowNote, LimitNote, SizeNote  string
+	RejectedNote                     string
 	Rows                             []exRow
 	Sel                              *exFrame
 	SelFacts                         []exFactRow
@@ -221,7 +222,10 @@ type explainedPageData struct {
 // rendered with only the explained and referenced paths, the rest of the
 // budget is spent on frames by an upper-bound estimate of their bytes, and
 // the page is rendered again with a smaller frame budget if it still does
-// not fit. Nothing is written unless the page fits.
+// not fit. The explained and referenced paths come before the rejected
+// attempts' rows: when they do not fit together, the oldest rows are left
+// out and counted on the page, so the history alone never makes a page
+// fail. Nothing is written unless the page fits.
 func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) error {
 	if v == nil {
 		return errors.New("flamegraph: nil view")
@@ -230,23 +234,25 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
 	}
 	if opts.MaxBytes <= 0 {
-		data, err := buildExplained(v, r, opts, -1)
+		data, err := buildExplained(v, r, opts, -1, -1)
 		if err != nil {
 			return err
 		}
 		return explainPageTmpl.Execute(w, data)
 	}
-	base, err := renderExplained(v, r, opts, 0)
+	base, err := renderExplained(v, r, opts, 0, -1)
 	if err != nil {
 		return err
 	}
+	rows := -1
 	if len(base) > opts.MaxBytes {
-		return fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
-			len(base), opts.MaxBytes)
+		if base, rows, err = fitHistory(v, r, opts); err != nil {
+			return err
+		}
 	}
 	frameBytes := int64(opts.MaxBytes - len(base) - pageSlack)
 	for range maxBudgetPasses {
-		page, err := renderExplained(v, r, opts, max(frameBytes, 0))
+		page, err := renderExplained(v, r, opts, max(frameBytes, 0), rows)
 		if err != nil {
 			return err
 		}
@@ -261,10 +267,57 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 	return err
 }
 
+// rowOverhead bounds the markup of one rejected row besides its text.
+const rowOverhead = 320
+
+// fitHistory renders the page with only the explained and referenced
+// paths and as many of the newest rejected rows as fit opts.MaxBytes, and
+// returns it with that number of rows. Without any row the page must fit.
+func fitHistory(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) ([]byte, int, error) {
+	bare, err := renderExplained(v, r, opts, 0, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(bare) > opts.MaxBytes {
+		return nil, 0, fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
+			len(bare), opts.MaxBytes)
+	}
+	data, err := buildExplained(v, r, opts, 0, -1)
+	if err != nil {
+		return nil, 0, err
+	}
+	keep, room := 0, int64(opts.MaxBytes-len(bare))
+	for i := len(data.Rejected) - 1; i >= 0; i-- {
+		if room -= rowEstimate(data.Rejected[i]); room < 0 {
+			break
+		}
+		keep++
+	}
+	for ; keep > 0; keep /= 2 {
+		page, err := renderExplained(v, r, opts, 0, keep)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(page) <= opts.MaxBytes {
+			return page, keep, nil
+		}
+	}
+	return bare, 0, nil
+}
+
+// rowEstimate bounds the bytes one rejected row takes on the page.
+func rowEstimate(row exRejected) int64 {
+	n := int64(rowOverhead)
+	for _, s := range []string{row.Attempt, row.Evidence, row.Label, row.Metric, row.Node, row.Agent, row.Engine, row.Code, row.Reason} {
+		n += htmlEscapedBound(s)
+	}
+	return n
+}
+
 // renderExplained renders the page into memory with frameBytes for the
-// frames not always drawn.
-func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64) ([]byte, error) {
-	data, err := buildExplained(v, r, opts, frameBytes)
+// frames not always drawn and the newest historyRows rejected rows.
+func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64, historyRows int) ([]byte, error) {
+	data, err := buildExplained(v, r, opts, frameBytes, historyRows)
 	if err != nil {
 		return nil, err
 	}
@@ -275,21 +328,25 @@ func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageO
 	return buf.Bytes(), nil
 }
 
-// buildExplained assembles the page; frameBytes < 0 means no byte budget.
-func buildExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64) (*explainedPageData, error) {
-	b := &explainedBuilder{v: v, r: r, opts: opts, refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
+// buildExplained assembles the page; frameBytes < 0 means no byte budget,
+// and historyRows < 0 every rejected row.
+func buildExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64, historyRows int) (*explainedPageData, error) {
+	b := &explainedBuilder{v: v, r: r, opts: opts, historyRows: historyRows, refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
 	return b.build(frameBytes)
 }
 
 type explainedBuilder struct {
-	v      *profilemodel.View
-	r      explain.Result
-	opts   ExplainedPageOptions
-	view   string
-	specs  []exRowSpec
-	frames []*exFrame
-	refs   map[profilemodel.NodeID]string // node -> "f<k>" for drawn nodes
-	byID   map[profilemodel.NodeID]*exFrame
+	v    *profilemodel.View
+	r    explain.Result
+	opts ExplainedPageOptions
+	// historyRows is how many of the newest rejected rows the page lists;
+	// < 0 lists them all.
+	historyRows int
+	view        string
+	specs       []exRowSpec
+	frames      []*exFrame
+	refs        map[profilemodel.NodeID]string // node -> "f<k>" for drawn nodes
+	byID        map[profilemodel.NodeID]*exFrame
 }
 
 func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
@@ -354,6 +411,10 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		}
 	}
 	data.Rejected, data.RejectedPill, data.LimitPill = b.rejected()
+	if n := len(data.Rejected) - b.historyRows; b.historyRows >= 0 && n > 0 {
+		data.Rejected = data.Rejected[n:]
+		data.RejectedNote = fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
+	}
 	if b.opts.HistoryIncomplete {
 		data.HistoryPill = "earlier attempt history for this view may be incomplete"
 	}
@@ -886,6 +947,9 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 		}
 		if a.Omitted > 0 {
 			rows = append(rows, exRejected{Attempt: a.Attempt, Evidence: a.Evidence, Kind: "more", Label: "and " + plural(a.Omitted, "more failure", "more failures")})
+		}
+		if a.TooLarge > 0 {
+			rows = append(rows, exRejected{Attempt: a.Attempt, Evidence: a.Evidence, Kind: "more", Label: plural(a.TooLarge, "failure", "failures") + " too large to keep"})
 		}
 		claims += a.OmittedClaims
 		refs += a.OmittedReferences

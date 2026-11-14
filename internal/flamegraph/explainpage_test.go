@@ -809,3 +809,36 @@ func TestExplainedPageLabelsAttemptsCheckedAgainstOtherEvidence(t *testing.T) {
 	assert.Contains(t, got, `<span class="ref">a1</span> `+label+` and 2 more failures</li>`)
 	assert.Contains(t, got, `<span class="ref">a2</span> claim c1`)
 }
+
+func TestTheRejectedSectionIsBudgetedBeforeForcedFrames(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	bare := exPage(t, v, r, exOpts())
+	opts := exOpts()
+	for i := range 40 {
+		f := failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)
+		f.Message = strings.Repeat("m", 1000)
+		opts.Rejected = append(opts.Rejected, explain.RejectedAttempt{Attempt: fmt.Sprint("a", i+1), Failures: []explain.Failure{f}})
+	}
+	full := exPage(t, v, r, opts)
+	require.Greater(t, len(full), len(bare)+40_000)
+	for _, room := range []int{20_000, 2_000} {
+		opts.MaxBytes = len(bare) + room
+		got := exPage(t, v, r, opts)
+		assert.LessOrEqual(t, len(got), opts.MaxBytes, "room %d", room)
+		assert.Contains(t, got, "40 claims rejected at render in 40 attempts</span>", "room %d", room)
+		sec := got[strings.Index(got, "<h5>Rejected at render"):]
+		sec = sec[:strings.Index(sec, "</section>")]
+		listed := strings.Count(sec, "<li>")
+		assert.Less(t, listed, 40, "room %d", room)
+		assert.Contains(t, sec, fmt.Sprintf("%d earlier rows beyond the page&#39;s size budget are not listed", 40-listed), "room %d", room)
+		if listed > 0 {
+			assert.Contains(t, sec, `<span class="ref">a40</span>`, "room %d: the newest rows are the ones kept", room)
+			assert.NotContains(t, sec, `<span class="ref">a1</span>`, "room %d", room)
+		}
+		for _, frame := range []string{">main</span></div>", ">a</span></div>", "✦</span>b</span></div>"} {
+			assert.Contains(t, got, frame, "room %d: forced frame %s", room, frame)
+		}
+	}
+}

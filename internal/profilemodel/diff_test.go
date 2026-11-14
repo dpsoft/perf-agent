@@ -573,11 +573,15 @@ func TestBothTotalsZeroIsAnEmptyUnion(t *testing.T) {
 func TestUnresolvedMatchedNodeDoesNotSaturateItsBasis(t *testing.T) {
 	d := pairDiff(t, "unresolved-below-matched-unresolved")
 	wantPresence(t, oneDiffAt(t, d, "main"), PresenceBoth, MatchByName, Comparable)
-	unk := oneDiffAt(t, d, "main", "[unknown]")
-	if unk.Presence != PresenceBoth || unk.Match != MatchByName {
-		t.Fatalf("matched [unknown]: %s %q", unk.Presence, unk.Match)
-	}
 	const shift = "symbols of no module: unresolved share 1.000 in base, 0.000 in new"
+	// The matched [unknown] is judged on what is below it, which lost or
+	// gained its symbols: its share is measured strictly below it, so it
+	// differs from its NodeQuality, which counts its own frame.
+	unk := oneDiffAt(t, d, "main", "[unknown]")
+	wantPresence(t, unk, PresenceBoth, MatchByName, NotComparable)
+	if unk.Why != shift {
+		t.Fatalf("matched [unknown] why %q, want %q", unk.Why, shift)
+	}
 	gone := oneDiffAt(t, d, "main", "[unknown]", "[unknown]")
 	wantPresence(t, gone, PresenceOnlyBase, "", NotComparable)
 	if gone.Why != shift {
@@ -609,6 +613,15 @@ func TestOneSidedUnresolvedFrameIsNotComparable(t *testing.T) {
 			t.Fatalf("%s why %q, want %q", tc.name, n.Why, ReasonOwnFrameUnresolved)
 		}
 	}
+	// What is under the address inherits its verdict, but its own frames
+	// are resolved: the reason names the ancestor, at every depth.
+	for _, path := range [][]string{{"main", "0xdead", "helper"}, {"main", "0xdead", "helper", "leaf"}} {
+		n := oneDiffAt(t, d, path...)
+		wantPresence(t, n, PresenceOnlyBase, "", NotComparable)
+		if n.Why != ReasonAncestorFrameUnresolved {
+			t.Fatalf("%v why %q, want %q", path, n.Why, ReasonAncestorFrameUnresolved)
+		}
+	}
 }
 
 func TestGPUAncestorDegradationIsNotComparable(t *testing.T) {
@@ -619,7 +632,7 @@ func TestGPUAncestorDegradationIsNotComparable(t *testing.T) {
 		t.Fatalf("why %q does not name libfoo.so", foo.Why)
 	}
 	// The kernel under foo lost its caller, not its cost: it is judged
-	// with foo.
+	// with foo, and a share cause is inherited as it is.
 	k := oneDiffAt(t, d, "main", "foo", "[gpu:kernel:k]")
 	wantPresence(t, k, PresenceOnlyBase, "", NotComparable)
 	if k.Why != foo.Why {

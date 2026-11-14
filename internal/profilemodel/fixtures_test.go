@@ -632,10 +632,10 @@ func diffPairs() map[string]diffPair {
 		},
 		// Under main, half of each side is a bare address, a different one
 		// on each side: the share does not move, but neither address can be
-		// paired with anything.
+		// paired with anything. The base address calls resolved frames.
 		"own-frame-unresolved": {
 			base: func() []byte {
-				return cpuProfile(fx{stack: []string{"main", "foo"}, value: 50}, fx{stack: []string{"main", "0xdead"}, value: 50})
+				return cpuProfile(fx{stack: []string{"main", "foo"}, value: 50}, fx{stack: []string{"main", "0xdead", "helper", "leaf"}, value: 50})
 			},
 			new: func() []byte {
 				return cpuProfile(fx{stack: []string{"main", "foo"}, value: 50}, fx{stack: []string{"main", "0xbeef"}, value: 50})

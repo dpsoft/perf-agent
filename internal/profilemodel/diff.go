@@ -70,6 +70,11 @@ const WarningPerturbationNotGPU = "perturbation: comparison unavailable: " + Rea
 // for, so its absence there says nothing.
 const ReasonOwnFrameUnresolved = "own frame unresolved"
 
+// ReasonAncestorFrameUnresolved is the Why of a one-sided node below a
+// one-sided node that is not comparable for ReasonOwnFrameUnresolved: it
+// inherits the verdict, but its own frame may well be resolved.
+const ReasonAncestorFrameUnresolved = "ancestor frame unresolved"
+
 // Comparability thresholds: a share moving by more than this between the
 // sides makes the nodes judged on it not comparable. They are compared
 // exactly, as rationals on the integer weights (see shiftExceeds), so a
@@ -140,7 +145,12 @@ type DiffNode struct {
 	// be made (a zero value on a side), "; "-separated, and is "" when
 	// every one was made. Comparisons that do not apply to the view type,
 	// the GPU-only rules on a CPU view, are reported once in
-	// Diff.QualityWarnings, not per node.
+	// Diff.QualityWarnings, not per node. A share in a cause is measured
+	// strictly below the nearest matched node at or above this one, so on
+	// a matched node whose own frame is unresolved it differs from that
+	// node's NodeQuality, which counts the frame. Below a one-sided node
+	// not comparable for ReasonOwnFrameUnresolved, Why is
+	// ReasonAncestorFrameUnresolved.
 	Why      string `json:"why,omitempty"`
 	BaseCum  int64  `json:"base_cum"`
 	NewCum   int64  `json:"new_cum"`
@@ -240,8 +250,10 @@ var sideNames = [2]string{SideBase, SideNew}
 // 0: that comparison is recorded in Why as unavailable and does not by
 // itself make the node not comparable. A one-sided node below a one-sided
 // node that is not comparable is not comparable for the same reason: its
-// absence follows from its parent's. Last, a one-sided node whose own
-// frame is unresolved is not comparable (ReasonOwnFrameUnresolved).
+// absence follows from its parent's; when that reason is the parent's
+// own unresolved frame, the child's is ReasonAncestorFrameUnresolved.
+// Last, a one-sided node whose own frame is unresolved is not comparable
+// (ReasonOwnFrameUnresolved).
 func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	if baseView.SampleType != newView.SampleType || baseView.Unit != newView.Unit ||
 		baseView.Index != newView.Index || baseView.Options.CollapseVendorRuns != newView.Options.CollapseVendorRuns {
@@ -385,7 +397,7 @@ func (d *differ) node(pair [2]*Node, match Match, cands []Candidate, up *basis, 
 	}
 
 	if parent != nil && parent.Presence != PresenceBoth && parent.Interpretation == NotComparable {
-		dn.Interpretation, dn.Why = NotComparable, parent.Why
+		dn.Interpretation, dn.Why = NotComparable, inheritedWhy(parent.Why)
 	} else {
 		dn.Interpretation, dn.Why = judge(here, pair, parent == nil)
 	}
@@ -410,6 +422,16 @@ func (d *differ) node(pair [2]*Node, match Match, cands []Candidate, up *basis, 
 }
 
 func absDelta(x int64) int64 { return max(x, -x) }
+
+// inheritedWhy is the Why a one-sided node takes from its not comparable
+// one-sided parent: the parent's cause, except that a cause about the
+// parent's own frame becomes one about an ancestor's.
+func inheritedWhy(why string) string {
+	if why == ReasonOwnFrameUnresolved {
+		return ReasonAncestorFrameUnresolved
+	}
+	return why
+}
 
 func (d *differ) shareDelta(cum [2]int64) Fact {
 	var share [2]float64

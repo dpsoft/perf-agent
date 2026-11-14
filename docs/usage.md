@@ -327,8 +327,9 @@ go run ./cmd/flamegraph -diff base.pb.gz -execlog-base base.executions \
     -execlog profile.executions profile.pb.gz
 ```
 
-A sidecar named by `-execlog` or `-execlog-base` that is missing, a
-directory or unreadable exits 1 before anything is loaded. One that is read
+A sidecar named by `-execlog` or `-execlog-base` that is a missing file, a
+directory, or a regular file that cannot be opened exits 1 before anything
+is loaded. One that is read
 but does not match its profile (another capture, a truncated file) is not an
 error: the executions facts say why they are unavailable.
 
@@ -348,6 +349,14 @@ tree as deep as the deepest stack, and a later release replaces that with a
 flat node list carrying parent IDs. `per_unit` states once whether
 per-unit-of-work deltas are available, and why not; nodes carry
 `delta_per_unit` only when they are.
+
+A node's `why` measures shares strictly below the nearest matched node at or
+above it, because that node's own frame is the same on both sides. On a
+matched node whose own frame is unresolved, the share in its `why` can
+therefore differ from that node's quality in the profile model (its
+`NodeQuality`), which counts the node's own frame; `-facts` prints neither.
+A one-sided node whose own frame is unresolved is `own frame unresolved`,
+and everything below it `ancestor frame unresolved`.
 
 ## Continuous GPU telemetry and OTLP
 

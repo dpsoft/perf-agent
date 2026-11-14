@@ -2,15 +2,19 @@ package flamegraph
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -335,7 +339,7 @@ func TestExplainedPageIsFlatOnDeepStacks(t *testing.T) {
 	assert.Equal(t, 601, strings.Count(got, `class="frame`), "every node of the chain and the root is drawn")
 	chart := regexp.MustCompile(`(?s)<div class="chart"[^>]*>(.*?)</div>\n</div>`).FindStringSubmatch(got)
 	require.Len(t, chart, 2)
-	assert.LessOrEqual(t, maxNesting(chart[1]), 2, "frames are siblings in one container, holding at most their ✦")
+	assert.LessOrEqual(t, maxNesting(chart[1]), 3, "frames are siblings in one container, each holding its label and ✦")
 }
 
 func TestExplainedPageIsDeterministic(t *testing.T) {
@@ -580,5 +584,123 @@ func TestExplainedPageEmitsRepeatedTextOnce(t *testing.T) {
 		for _, name := range []string{"main", "all", "c\n", "\nb"} {
 			assert.NotContains(t, tip[1], name)
 		}
+	}
+}
+
+// frameRules are the CSS rules of page that can size a frame box: a
+// selector whose last compound names .frame or a data-domain or
+// data-resolution attribute.
+func frameRules(page string) map[string]string {
+	css := strings.Join(regexp.MustCompile(`(?s)<style>(.*?)</style>`).FindAllString(page, -1), "\n")
+	out := map[string]string{}
+	for _, m := range regexp.MustCompile(`([^{}]+)\{([^{}]*)\}`).FindAllStringSubmatch(css, -1) {
+		for sel := range strings.SplitSeq(m[1], ",") {
+			sel = strings.TrimSpace(sel)
+			parts := strings.Fields(strings.NewReplacer(">", " ", "+", " ", "~", " ").Replace(sel))
+			if len(parts) == 0 {
+				continue
+			}
+			last := parts[len(parts)-1]
+			if regexp.MustCompile(`\.frame\b`).MatchString(last) && !strings.Contains(last, ".frame-") ||
+				strings.HasPrefix(last, "[data-domain") || strings.HasPrefix(last, "[data-resolution") {
+				out[sel] += m[2] + ";"
+			}
+		}
+	}
+	return out
+}
+
+// A frame's width is its value's share of the chart. Padding or a border
+// on the positioned box would make every frame at least that wide, so a
+// 0.1% frame or a zero-weight one would overstate its cost and spill over
+// its siblings.
+func TestExplainedPageFrameBoxCarriesNoPaddingOrBorder(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	got := exPage(t, v, r, exOpts())
+	rules := frameRules(got)
+	require.Contains(t, rules, ".frame")
+	assert.Contains(t, rules[".frame"], "overflow:hidden")
+	sizing := regexp.MustCompile(`(^|;)\s*(padding(-left|-right|-inline[-a-z]*)?|border(-left|-right|-width|-inline[-a-z]*)?|min-width|margin(-left|-right)?)\s*:\s*([^;]*)`)
+	for sel, decls := range rules {
+		for _, d := range sizing.FindAllStringSubmatch(decls, -1) {
+			assert.Contains(t, []string{"0", "0px", "none"}, strings.TrimSpace(d[6]), "%s sets %s: %s", sel, d[2], d[6])
+		}
+	}
+	assert.Regexp(t, `\.frame \.fl\{[^}]*padding:0 5px[^}]*text-overflow:ellipsis`, got, "the label carries the padding, clipped by the frame")
+	assert.Regexp(t, `<div class="frame[^>]*><span class="fl">`, got)
+}
+
+func chromePath() string {
+	for _, name := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// geometryProbe measures every frame after layout and writes, per frame,
+// its rendered width, the width its percentage asks for and its name.
+const geometryProbe = `<script>
+addEventListener('load', () => {
+  const chart = document.getElementById('chart');
+  const cw = chart.getBoundingClientRect().width;
+  const rows = [...chart.querySelectorAll('.frame')].map((el) => [
+    el.getBoundingClientRect().width.toFixed(3),
+    (parseFloat(el.style.width) / 100 * cw).toFixed(3),
+    el.textContent,
+  ].join('\t'));
+  const pre = document.createElement('pre');
+  pre.id = 'geometry';
+  pre.textContent = rows.join('\n');
+  document.body.appendChild(pre);
+});
+</script>`
+
+func TestExplainedPageFramesAreNoWiderThanTheirShareInChrome(t *testing.T) {
+	chrome := chromePath()
+	if chrome == "" || testing.Short() {
+		t.Skip("no headless Chrome")
+	}
+	samples := []pmfixture.Sample{{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("big")}, Value: 997}}
+	for _, name := range []string{"tiny1", "tiny2", "tiny3"} {
+		samples = append(samples, pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn(name)}, Value: 1})
+	}
+	samples = append(samples, pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("zero")}, Value: 0})
+	v := exView(t, pmfixture.Build("cpu", "nanoseconds", nil, samples...), nil)
+	zero := exNode(t, v, "main", "zero")
+	r := exCheck(t, v, explain.Explanation{Node: string(zero), Prose: "nothing measured under {n:" + string(zero) + "}"})
+	page := exPage(t, v, r, exOpts())
+	require.Contains(t, page, `width:0%`, "the zero-weight node is drawn because it is explained")
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "page.html")
+	require.NoError(t, os.WriteFile(file, []byte(strings.Replace(page, "</body>", geometryProbe+"</body>", 1)), 0o644))
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-first-run",
+		"--user-data-dir="+filepath.Join(dir, "profile"), "--window-size=1000,800", "--virtual-time-budget=2000",
+		"--dump-dom", "file://"+file).Output()
+	if err != nil {
+		t.Skipf("headless Chrome did not run: %v", err)
+	}
+	m := regexp.MustCompile(`(?s)<pre id="geometry">(.*?)</pre>`).FindStringSubmatch(string(out))
+	require.Len(t, m, 2, "the probe did not run")
+	seen := map[string]bool{}
+	for line := range strings.SplitSeq(html.UnescapeString(m[1]), "\n") {
+		f := strings.SplitN(line, "\t", 3)
+		require.Len(t, f, 3, line)
+		rendered, err := strconv.ParseFloat(f[0], 64)
+		require.NoError(t, err)
+		want, err := strconv.ParseFloat(f[1], 64)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, rendered, want+1, "frame %q is %.3fpx wide, its share is %.3fpx", f[2], rendered, want)
+		seen[f[2]] = true
+		if f[2] == "✦zero" {
+			assert.LessOrEqual(t, rendered, 1.0, "the zero-weight frame is drawn %.3fpx wide", rendered)
+		}
+	}
+	for _, name := range []string{"tiny1", "tiny2", "tiny3", "✦zero"} {
+		assert.True(t, seen[name], "frame %s was measured", name)
 	}
 }

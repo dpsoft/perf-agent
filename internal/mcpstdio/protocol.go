@@ -103,6 +103,10 @@ type envelope struct {
 	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params"`
+	// Result and Error are only present on a client's response to a server
+	// request, which this server never makes.
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error"`
 }
 
 type rpcError struct {

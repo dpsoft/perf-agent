@@ -41,6 +41,10 @@ type inputLine struct {
 // Serve reads newline-delimited JSON-RPC messages from r and writes
 // responses to w until r reaches EOF or ctx ends, both of which return nil.
 // Nothing but compact JSON-RPC lines is ever written to w.
+//
+// A reader goroutine owns r: it may still read from r once more after Serve
+// returns, so the caller should close r. A blocked w.Write is not
+// interrupted by ctx.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -146,22 +150,71 @@ func errorResponse(id json.RawMessage, code int, msg string) *outgoing {
 	return &outgoing{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
 }
 
+// validID reports whether raw is a JSON string or integer, the only id forms
+// MCP allows (null, fractions, exponents, objects and so on are not).
+func validID(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	if raw[0] == '"' {
+		return true
+	}
+	digits := bytes.TrimPrefix(raw, []byte("-"))
+	if len(digits) == 0 {
+		return false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// marshal encodes v compactly without HTML escaping, so text such as "<b>&"
+// reaches the client literally.
+func marshal(v any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+}
+
 // dispatch handles one line and returns the response, or nil for none.
 func (s *Server) dispatch(ctx context.Context, line []byte, initialized *bool) *outgoing {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		return errorResponse(nil, codeInvalidRequest, "batches are not supported")
 	}
+	if !json.Valid(trimmed) {
+		return errorResponse(nil, codeParseError, "parse error: invalid JSON")
+	}
+	if trimmed[0] != '{' {
+		return errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")
+	}
 	var env envelope
 	if err := json.Unmarshal(trimmed, &env); err != nil {
-		return errorResponse(nil, codeParseError, "parse error: "+err.Error())
+		return errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
 	}
-	if len(env.ID) == 0 {
-		// Notification: never answered, whatever it says.
+	if env.Method == "" && (len(env.Result) > 0 || len(env.Error) > 0) {
+		s.log.Warn("dropping a client response; this server sends no requests")
 		return nil
+	}
+	if len(env.ID) > 0 && !validID(env.ID) {
+		return errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
+	}
+	if env.JSONRPC != "2.0" {
+		return errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)
 	}
 	if env.Method == "" {
 		return errorResponse(env.ID, codeInvalidRequest, "invalid request: method is required")
+	}
+	if len(env.ID) == 0 {
+		// Notification: never answered.
+		return nil
 	}
 	// Unknown methods (server/discover included) answer method-not-found even
 	// before initialize so clients can fall back to the initialize handshake.
@@ -175,7 +228,7 @@ func (s *Server) dispatch(ctx context.Context, line []byte, initialized *bool) *
 	if env.Method == "initialize" {
 		*initialized = true
 	}
-	raw, err := json.Marshal(result)
+	raw, err := marshal(result)
 	if err != nil {
 		s.log.Error("marshal result", "method", env.Method, "err", err)
 		return errorResponse(env.ID, codeInternalError, "internal error")
@@ -254,16 +307,19 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 		Subscribe   bool `json:"subscribe"`
 		ListChanged bool `json:"listChanged"`
 	}
-	return map[string]any{
+	res := map[string]any{
 		"protocolVersion": version,
 		"capabilities": map[string]any{
 			"tools":     listChanged{},
 			"prompts":   listChanged{},
 			"resources": resourcesCap{},
 		},
-		"serverInfo":   s.o.Info,
-		"instructions": s.o.Instructions,
-	}, nil
+		"serverInfo": s.o.Info,
+	}
+	if s.o.Instructions != "" {
+		res["instructions"] = s.o.Instructions
+	}
+	return res, nil
 }
 
 type textContent struct {
@@ -325,13 +381,16 @@ func (s *Server) getPrompt(params json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown prompt: " + p.Name}
 	}
 	pr := s.o.Prompts[i]
-	return map[string]any{
-		"description": pr.Description,
+	res := map[string]any{
 		"messages": []map[string]any{{
 			"role":    "user",
 			"content": textContent{Type: "text", Text: pr.Text},
 		}},
-	}, nil
+	}
+	if pr.Description != "" {
+		res["description"] = pr.Description
+	}
+	return res, nil
 }
 
 func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
@@ -346,7 +405,9 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource: " + p.URI}
 	}
 	r := s.o.Resources[i]
-	return map[string]any{
-		"contents": []map[string]string{{"uri": r.URI, "mimeType": r.MIMEType, "text": r.Text}},
-	}, nil
+	content := map[string]string{"uri": r.URI, "text": r.Text}
+	if r.MIMEType != "" {
+		content["mimeType"] = r.MIMEType
+	}
+	return map[string]any{"contents": []map[string]string{content}}, nil
 }

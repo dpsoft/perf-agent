@@ -410,3 +410,84 @@ func TestServeReturnsWhenContextEnds(t *testing.T) {
 		t.Fatalf("Serve = %v", err)
 	}
 }
+
+func TestInvalidIDsAreRefused(t *testing.T) {
+	c := newClient(t, testOptions())
+	for _, id := range []string{`null`, `{"a":1}`, `1.5`, `1e3`, `true`, `[1]`} {
+		r := c.call(`{"jsonrpc":"2.0","id":` + id + `,"method":"ping"}`)
+		wantErr(t, r, -32600)
+		if string(r.ID) != "null" || !strings.Contains(r.Error.Message, "id must be a string or integer") {
+			t.Errorf("id %s: %+v id=%s", id, r.Error, r.ID)
+		}
+	}
+	if r := c.call(`{"jsonrpc":"2.0","id":-5,"method":"ping"}`); r.Error != nil || string(r.ID) != "-5" {
+		t.Fatalf("negative integer id: %+v", r)
+	}
+}
+
+func TestMalformedEnvelopesAreInvalidRequests(t *testing.T) {
+	c := newClient(t, testOptions())
+	for _, line := range []string{
+		`42`, `"str"`, `null`, `true`,
+		`{}`,
+		`{"id":1,"method":"ping"}`,
+		`{"jsonrpc":"1.0","id":1,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":1}`,
+		`{"jsonrpc":"2.0","id":1,"method":7}`,
+	} {
+		r := c.call(line)
+		wantErr(t, r, -32600)
+	}
+	if r := c.call(`{}`); string(r.ID) != "null" {
+		t.Errorf("id = %s", r.ID)
+	}
+	if r := c.call(`{"jsonrpc":"2.0","id":2,"method":"ping"}`); r.Error != nil {
+		t.Fatalf("ping: %+v", r.Error)
+	}
+}
+
+func TestClientResponsesAreDroppedSilently(t *testing.T) {
+	c := newClient(t, testOptions())
+	c.send(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+	c.send(`{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"x"}}`)
+	r := c.call(`{"jsonrpc":"2.0","id":3,"method":"ping"}`)
+	if string(r.ID) != "3" || r.Error != nil {
+		t.Fatalf("next line was %+v", r)
+	}
+}
+
+func TestResultsAreNotHTMLEscaped(t *testing.T) {
+	c := newClient(t, testOptions())
+	c.init()
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"t":"<b>&"}}}`)
+	if raw := c.recvRaw(); !bytes.Contains(raw, []byte(`<b>&`)) || bytes.Contains(raw, []byte(`\u003c`)) {
+		t.Fatalf("escaped: %s", raw)
+	}
+}
+
+func TestLineLargerThanTheReadBufferIsDiscarded(t *testing.T) {
+	o := testOptions()
+	o.MaxMessageBytes = 1024
+	c := newClient(t, o)
+	pad := strings.Repeat("z", 1<<20)
+	r := c.call(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"` + pad + `"}}`)
+	wantErr(t, r, -32600)
+	if r := c.call(`{"jsonrpc":"2.0","id":2,"method":"ping"}`); r.Error != nil || string(r.ID) != "2" {
+		t.Fatalf("ping: %+v", r)
+	}
+}
+
+func TestEmptyOptionalFieldsAreOmitted(t *testing.T) {
+	o := testOptions()
+	o.Instructions = ""
+	o.Resources = []Resource{{URI: "mem://n", Name: "n", Text: "t"}}
+	c := newClient(t, o)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	if raw := c.recvRaw(); bytes.Contains(raw, []byte("instructions")) {
+		t.Errorf("instructions present: %s", raw)
+	}
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"mem://n"}}`)
+	if raw := c.recvRaw(); bytes.Contains(raw, []byte("mimeType")) {
+		t.Errorf("mimeType present: %s", raw)
+	}
+}

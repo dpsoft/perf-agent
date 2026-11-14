@@ -63,7 +63,8 @@ const (
 // RoundingFor is the engine's display rounding for metric, and the only
 // tolerance a claim about that metric is checked against:
 //
-//	share_of_total, share_of_parent     "0.001 ratio" (0.1 percentage point)
+//	share_of_total, share_of_parent,
+//	quality_*                           "0.001 ratio" (0.1 percentage point)
 //	cumulative, self, inexact_portion,
 //	unsampled_portion,
 //	serialization_true, _false,
@@ -77,6 +78,12 @@ const (
 func RoundingFor(metric string) string {
 	switch metric {
 	case MetricShareOfTotal, MetricShareOfParent:
+		return "0.001 ratio"
+	case MetricQualityJoinExact, MetricQualityJoinHeuristic, MetricQualityJoinUnmatched,
+		MetricQualityAmbiguous, MetricQualityGraphRefused, MetricQualityUnsampled,
+		MetricQualitySerializedTrue, MetricQualitySerializedFalse,
+		MetricQualitySerializedUnknown, MetricQualitySerializedMissing,
+		MetricQualityUnresolved, MetricQualityUnresolvedByModule, MetricQualityCollision:
 		return "0.001 ratio"
 	case MetricCumulative, MetricSelf, MetricInexactPortion, MetricUnsampledPortion,
 		MetricSerializationTrue, MetricSerializationFalse, MetricSerializationUnknown, MetricSerializationMissing,
@@ -98,7 +105,7 @@ type Fact struct {
 	Unit        string   `json:"unit"`              // sample unit, "ratio", "count" or "<sample unit>/work"
 	Status      Status   `json:"status"`
 	Reason      string   `json:"reason,omitempty"`      // set exactly when unavailable
-	Denominator string   `json:"denominator,omitempty"` // "view_total" or "parent:<node id>", for shares
+	Denominator string   `json:"denominator,omitempty"` // "view_total", "parent:<node id>" or "node:<node id>", for shares
 	Rounding    string   `json:"rounding"`              // RoundingFor the fact's metric
 }
 
@@ -346,32 +353,47 @@ func (v *View) unsampledTotal() (int64, error) {
 	return sum, nil
 }
 
+// serializedState is a sample's gpu_serialized state, as Serialization
+// splits it.
+type serializedState int
+
+const (
+	serializedTrue serializedState = iota
+	serializedFalse
+	serializedUnknown
+	serializedMissing
+	serializedStates // the number of states
+)
+
+func serializedStateOf(labels map[string][]string) serializedState {
+	vals := labels[serializedLabel]
+	switch {
+	case len(vals) == 0:
+		return serializedMissing
+	case len(vals) == 1 && vals[0] == "true":
+		return serializedTrue
+	case len(vals) == 1 && vals[0] == "false":
+		return serializedFalse
+	}
+	return serializedUnknown
+}
+
 // serialization splits n's value by the samples' gpu_serialized label.
 func (v *View) serialization(n *Node) (Serialization, error) {
-	var t, f, u, m int64
+	var sums [serializedStates]int64
 	for _, s := range n.samples {
 		smp := v.profile.Source.Sample[s]
-		val := smp.Value[v.Index]
-		vals := smp.Label[serializedLabel]
-		acc := &u
-		switch {
-		case len(vals) == 0:
-			acc = &m
-		case len(vals) == 1 && vals[0] == "true":
-			acc = &t
-		case len(vals) == 1 && vals[0] == "false":
-			acc = &f
-		}
+		st := serializedStateOf(smp.Label)
 		var err error
-		if *acc, err = addChecked(*acc, val, "serialization value"); err != nil {
+		if sums[st], err = addChecked(sums[st], smp.Value[v.Index], "serialization value"); err != nil {
 			return Serialization{}, err
 		}
 	}
 	return Serialization{
-		True:    intFact(MetricSerializationTrue, t, v.Unit),
-		False:   intFact(MetricSerializationFalse, f, v.Unit),
-		Unknown: intFact(MetricSerializationUnknown, u, v.Unit),
-		Missing: intFact(MetricSerializationMissing, m, v.Unit),
+		True:    intFact(MetricSerializationTrue, sums[serializedTrue], v.Unit),
+		False:   intFact(MetricSerializationFalse, sums[serializedFalse], v.Unit),
+		Unknown: intFact(MetricSerializationUnknown, sums[serializedUnknown], v.Unit),
+		Missing: intFact(MetricSerializationMissing, sums[serializedMissing], v.Unit),
 	}, nil
 }
 

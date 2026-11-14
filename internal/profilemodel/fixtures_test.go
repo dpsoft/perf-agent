@@ -190,6 +190,54 @@ func allFixtures() map[string]func() []byte {
 				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k2]"}, value: 0},
 			)
 		},
+		"gpu-unresolved-ancestor": func() []byte {
+			// The kernel leaf is named on both stacks; only the CPU caller
+			// beneath it is unsymbolized.
+			return rich("gpu", "nanoseconds",
+				rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f00", 0x123), fn("[gpu:kernel:k]")}, value: 40},
+				rs{stack: []frame{fn("main"), fn("launch"), fn("[gpu:kernel:k]")}, value: 60},
+			)
+		},
+		"unresolved-twice-in-one-module": func() []byte {
+			return rich("cpu", "nanoseconds",
+				rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f00", 0x10), in("/usr/lib/libfoo.so", "f00", 0x20), fn("leaf")}, value: 50},
+				rs{stack: []frame{fn("main"), fn("work")}, value: 50},
+				rs{stack: []frame{fn("main"), in("/usr/lib/libbar.so", "ba5", 0x30)}, value: 0},
+			)
+		},
+		"same-base-name-two-modules": func() []byte {
+			// Both frames display as "libfoo.so+0x10".
+			return rich("cpu", "nanoseconds",
+				rs{stack: []frame{fn("main"), in("/a/libfoo.so", "1", 0x10)}, value: 30},
+				rs{stack: []frame{fn("main"), in("/b/libfoo.so", "2", 0x10)}, value: 70},
+			)
+		},
+		"mapped-with-collisions": func() []byte {
+			// x and y are bare unmapped functions, so both are
+			// collision_possible; the second sample passes through both.
+			app := func(addr uint64, name string) frame { return in("/usr/bin/app", "app", addr, ln(name)) }
+			return rich("cpu", "nanoseconds",
+				rs{stack: []frame{app(0x1, "main"), app(0x2, "work")}, value: 70},
+				rs{stack: []frame{app(0x1, "main"), fn("x"), fn("y")}, value: 30},
+			)
+		},
+		"gpu-graph-refused": func() []byte {
+			refused := func(v string) map[string][]string {
+				return map[string][]string{"gpu_join": {"exact"}, "gpu_graph_refused": {v}}
+			}
+			return gpuProfile(
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 25, labels: refused("true")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 70, labels: map[string][]string{"gpu_join": {"exact"}}},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 5, labels: refused("false")},
+			)
+		},
+		"gpu-zero-total": func() []byte {
+			return gpuProfile(fx{
+				stack:  []string{"main", "[gpu:launch]", "[gpu:kernel:k]"},
+				value:  0,
+				labels: map[string][]string{"gpu_serialized": {"true"}, "gpu_join": {"exact"}, "gpu_sample_period": {"8"}},
+			})
+		},
 	}
 }
 

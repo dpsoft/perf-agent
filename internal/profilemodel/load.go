@@ -26,8 +26,8 @@ func (d Digest) String() string { return hex.EncodeToString(d[:]) }
 
 // Availability says whether a fact source can be used and, if not, why.
 type Availability struct {
-	OK     bool
-	Reason string
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // Reasons an executions log is not used.

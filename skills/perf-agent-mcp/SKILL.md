@@ -24,7 +24,7 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 3. Drill into a node: `path` (its stack), `facts` (every fact), `sandwich` (callers and callees of a function), `gpu_kernels_for` (kernels under a launch node), `source` (source lines, when roots are configured).
 4. Two profiles: `open` both, then `diff`.
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
-6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all, and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
+6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all (for a mismatch, re-check the claim's node and metric rather than copying the value), and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
 
 Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`, and `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`. If a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 
@@ -44,7 +44,7 @@ Every call names its `handle` and `view`; nothing is "current". The exceptions: 
 | Failure | Fix |
 |---|---|
 | `value_mismatch` | Re-check that the claim's node and metric are what the sentence says; rewrite the sentence or the claim. Never just copy the engine's value into the claim. |
-| `glued_to_claim` | Write a range as "between {c1} and {c2}". No sign, exponent, dash, `%` or letter next to a placeholder: the claim shows its own unit. |
+| `glued_to_claim` | Write a range as "between {c1} and {c2}". No sign or digit before a placeholder; after it only a space, the end, or closing punctuation (. , ; : ! ? … or a closing bracket or quote). The claim shows its own unit, so no `%`, unit or letter after it. |
 | `unplaced_claim` | Every claim needs its `{cN}` in the explanation's text; place it or drop the claim. |
 | `unknown_metric` | The `metric` is a claimable-metric name, not a path in the `facts` JSON. Use `share_of_total`, `cumulative`, `quality_join_exact`, `serialization_true` and the other names the guide lists. |
 | `wrong_scope` | `unsampled_portion` is a view-level fact: `"scope": "view"` and no node. Quality metrics take `"scope": "node"` or `"scope": "view"`. |

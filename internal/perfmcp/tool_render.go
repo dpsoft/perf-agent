@@ -36,7 +36,7 @@ const renderSchema = `{
 const renderDescription = "Check structured explanations of a view's nodes against the engine and, when every claim and reference passes, " +
 	"write an explained flame graph page under the output root. Every figure on the page is the engine's value of a checked claim; " +
 	"other numbers in the text are marked unchecked. A failing check writes nothing and returns status \"rejected\" with every failure and the engine's value; " +
-	"fix them and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record, for every handle of the same profile, and names the handle of any made with another. " +
+	recheckAdvice + ", and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record, for every handle of the same profile, and names the handle of any made with another. " +
 	"An existing file is never replaced."
 
 func (s *Server) renderTool() mcpstdio.Tool {
@@ -84,6 +84,11 @@ type renderWritten struct {
 	Notes            []string         `json:"notes,omitzero"`
 }
 
+// recheckAdvice is what to do about failed claims: a mismatch may mean the
+// claim names the wrong node or metric for its sentence, so the engine's
+// value is never simply copied in.
+const recheckAdvice = "re-check that each claim's node and metric match the sentence, then rewrite the sentence or the claim"
+
 // ignoredRounding is the notice for a top-level rounding or tolerance.
 const ignoredRounding = "ignored: rounding is the engine's (each claim is compared at its metric's rounding); an agent cannot set or widen it"
 
@@ -112,7 +117,11 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, err
 	}
 	if err := explain.CheckTitle(a.Title, s.lim.Explain); err != nil {
-		return mcpstdio.Result{}, fmt.Errorf("%v (the limit is --limit Explain.MaxTitleBytes=N); nothing was recorded, so call render_flamegraph again without attempt", err)
+		limit := ""
+		if len(a.Title) > s.lim.Explain.MaxTitleBytes {
+			limit = " (--limit Explain.MaxTitleBytes=N)"
+		}
+		return mcpstdio.Result{}, fmt.Errorf("%v%s; nothing was recorded, so call render_flamegraph again with the same attempt, if any", err, limit)
 	}
 	notes, err := viewNotes(v)
 	if err != nil {
@@ -156,7 +165,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		}
 		res, err := s.respond("render_flamegraph", shrinkRejected, renderRejected{
 			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices, Notes: notes,
-			Next: fmt.Sprintf("nothing was written; correct every failure (the engine's value is in engine) and call render_flamegraph again with attempt %q", id),
+			Next: fmt.Sprintf("nothing was written; %s (the engine's value is in engine), and call render_flamegraph again with attempt %q", recheckAdvice, id),
 		})
 		if err != nil {
 			return mcpstdio.Result{}, fmt.Errorf("attempt %s was rejected with %d failures: %v", id, len(r.Failures), err)

@@ -405,3 +405,40 @@ func TestACPUDiffHasNoNotesKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestTitleRefusalsSayWhatToChange(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	exps := shareClaim(b, "0.411", "b takes {c1} of the time")
+	text, _ := o.c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "out": "t.html", "title": strings.Repeat("t", 201)}))
+	if !strings.Contains(text, "--limit Explain.MaxTitleBytes=N") || !strings.Contains(text, "same attempt, if any") || strings.Contains(text, "without attempt") {
+		t.Errorf("long title: %s", text)
+	}
+	text, _ = o.c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "out": "t.html", "title": "b is {c1}"}))
+	if strings.Contains(text, "MaxTitleBytes") || !strings.Contains(text, "same attempt, if any") || strings.Contains(text, "without attempt") {
+		t.Errorf("placeholder title: %s", text)
+	}
+}
+
+// A rejection never advises copying the engine's value: the claim's node or
+// metric may be the mistake, not its value.
+func TestRejectionAdviceIsToRecheckNotCopy(t *testing.T) {
+	o := renderFixture(t, nil)
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(o.nodeID(t, "b"), "0.62", "b takes {c1}"), "out": "r.html"})
+	if !isErr || out.Status != "rejected" {
+		t.Fatalf("isError=%v %s", isErr, text)
+	}
+	var rej struct {
+		Next string `json:"next"`
+	}
+	if err := json.Unmarshal([]byte(text), &rej); err != nil {
+		t.Fatal(err)
+	}
+	const advice = "re-check that each claim's node and metric match the sentence, then rewrite the sentence or the claim"
+	if !strings.Contains(rej.Next, advice) || strings.Contains(strings.ToLower(rej.Next), "copy") || strings.Contains(rej.Next, "correct every failure") {
+		t.Errorf("next = %q", rej.Next)
+	}
+	if !strings.Contains(o.c.srv.renderTool().Description, advice) {
+		t.Errorf("the render description lacks %q", advice)
+	}
+}

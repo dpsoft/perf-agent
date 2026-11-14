@@ -60,11 +60,11 @@ Write each figure as a claim and refer to it from the prose. The engine checks t
 
 - A claim's `metric` is one of the names under Claimable metrics below, not a path in the `facts` JSON. Node-level metrics (the default scope) need a `node` (or the explanation's node). Quality metrics take either scope: `"scope": "node"` for the node, `"scope": "view"` with no `node` for the whole view. `unsampled_portion` is view-level only: `"scope": "view"` and no node.
 - Put every number in prose from a claim placeholder `{cN}` (`{c1}`). `{cN}` refers to a claim of the same explanation, and every claim must be placed by its `{cN}` (else `unplaced_claim`). Numbers typed freely are marked unchecked on the page.
-- A claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns"); a `%` or letter glued after it ("{c1}%", "{c1}ms") is rejected.
+- A claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns"). After a placeholder only a space, the end of the text or closing punctuation (. , ; : ! ? … or a closing bracket or quote) may follow: "{c1}%", "{c1}ms" and "{c1}µs" are glued_to_claim.
 - `title` is free text of at most 200 bytes (`Explain.MaxTitleBytes`) with no placeholders. Numbers in it are marked unchecked and counted in `unchecked_numbers`; keep figures in claims.
 - To name a frame use `{n:<id>}`, especially for frame names containing braces; frame names are never parsed for placeholders.
 - For a range write "between {c1} and {c2}". A bare range like "{c1}-{c2}" is glued_to_claim and rejected, as is a sign or exponent next to a placeholder.
-- A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; fix them and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.
+- A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; re-check that each claim's node and metric match the sentence, rewrite the sentence or the claim (never just copy the engine's value), and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.
 - An existing `out` is never replaced: choose a new name. You cannot set rounding or tolerance.
 - When a tool result is an error it says what to call next.
 - A page's follow-up prompts name the profile's path relative to the profiles root and its digest: open that path and check that `profile_digest` matches before answering them.

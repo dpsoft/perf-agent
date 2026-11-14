@@ -271,7 +271,7 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "resources/read":
 		return s.readResource(params)
 	}
-	return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + method}
+	return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + echoName(method)}
 }
 
 func nonNil[T any](s []T) []T {

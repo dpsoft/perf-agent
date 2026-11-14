@@ -545,3 +545,12 @@ func TestToolErrorTextAndUnknownNamesAreBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestAnUnknownMethodIsEchoedBounded(t *testing.T) {
+	c := newClient(t, testOptions())
+	c.init()
+	r := c.call(`{"jsonrpc":"2.0","id":2,"method":"` + strings.Repeat("m", 100000) + `"}`)
+	if r.Error == nil || r.Error.Code != -32601 || len(r.Error.Message) > 200 || !strings.Contains(r.Error.Message, "mmmm") {
+		t.Errorf("error = %.300v", r.Error)
+	}
+}

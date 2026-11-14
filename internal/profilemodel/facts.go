@@ -92,7 +92,7 @@ type Fact struct {
 	Unit        string   `json:"unit"`              // sample unit, "ratio", "count" or "<sample unit>/work"
 	Status      Status   `json:"status"`
 	Reason      string   `json:"reason,omitempty"`      // set exactly when unavailable
-	Denominator string   `json:"denominator,omitempty"` // "view_total", "parent:<node id>" or "node:<node id>", for shares
+	Denominator string   `json:"denominator,omitempty"` // "view_total", "parent:<node id>", "node:<node id>" or "function:<ref>", for shares
 	Rounding    string   `json:"rounding"`              // RoundingFor the fact's metric
 
 	policy Rounding // PolicyFor the fact's metric

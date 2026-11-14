@@ -19,7 +19,7 @@ func RefOf(f FunctionID) FunctionRef {
 	return FunctionRef(hex.EncodeToString(sum[:])[:16])
 }
 
-// ErrUnknownFunction is returned for a reference no sample in the view holds.
+// ErrUnknownFunction is returned when no sample with a non-zero value holds this function.
 var ErrUnknownFunction = errors.New("profilemodel: no such function in the view")
 
 // denominatorFunction prefixes a function reference in a share's denominator.

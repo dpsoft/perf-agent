@@ -13,7 +13,7 @@ func fixtureViews(t *testing.T) map[string]*View {
 	raws := map[string][]byte{
 		"cpu": pmfixture.CPUBasic(), "cpuNew": pmfixture.CPUBasicNew(), "gpu": pmfixture.GPUBasic(),
 		"huge": pmfixture.HugeValue(), "recursive": pmfixture.Recursive(),
-		"deep": pmfixture.Deep(600), "same": pmfixture.SameNameTwoModules(),
+		"deep": pmfixture.Deep(600), "deepNew": pmfixture.DeepNew(600), "same": pmfixture.SameNameTwoModules(),
 	}
 	out := map[string]*View{}
 	for name, raw := range raws {
@@ -105,7 +105,10 @@ func TestFunctionsOrderIsTotal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, _ := v.Functions()
+		b, err := v.Functions()
+		if err != nil {
+			t.Fatal(name, err)
+		}
 		if !reflect.DeepEqual(a, b) {
 			t.Errorf("%s: two calls differ", name)
 		}
@@ -129,7 +132,10 @@ func shareString(t *testing.T, f Fact) string {
 
 func TestSandwichCallersAndCallees(t *testing.T) {
 	v := pmView(t, pmfixture.CPUBasic())
-	rows, _ := v.Functions()
+	rows, err := v.Functions()
+	if err != nil {
+		t.Fatal(err)
+	}
 	a := rowByName(t, rows, "a")
 	sw, err := v.Sandwich(a.Ref)
 	if err != nil {
@@ -151,7 +157,10 @@ func TestSandwichCallersAndCallees(t *testing.T) {
 
 func TestSandwichRecursionCountsEachEdgeOncePerSample(t *testing.T) {
 	v := pmView(t, pmfixture.Recursive())
-	rows, _ := v.Functions()
+	rows, err := v.Functions()
+	if err != nil {
+		t.Fatal(err)
+	}
 	a, b := rowByName(t, rows, "a"), rowByName(t, rows, "b")
 	swa, err := v.Sandwich(a.Ref)
 	if err != nil {
@@ -186,6 +195,14 @@ func TestEdgeValuesNeverExceedTheFunction(t *testing.T) {
 			if sw.RootValue > r.Cum {
 				t.Errorf("%s %s: root %d > cum %d", name, r.Function.Name, sw.RootValue, r.Cum)
 			}
+			for _, edges := range [][]EdgeRow{sw.Callers, sw.Callees} {
+				for i := 1; i < len(edges); i++ {
+					p, q := edges[i-1], edges[i]
+					if p.Value < q.Value || (p.Value == q.Value && p.Ref >= q.Ref) {
+						t.Errorf("%s %s: edges %d,%d out of order", name, r.Function.Name, i-1, i)
+					}
+				}
+			}
 			for _, e := range append(append([]EdgeRow{}, sw.Callers...), sw.Callees...) {
 				if e.Value > r.Cum {
 					t.Errorf("%s %s: edge %d > cum %d", name, r.Function.Name, e.Value, r.Cum)
@@ -199,5 +216,88 @@ func TestSandwichUnknownRef(t *testing.T) {
 	v := pmView(t, pmfixture.CPUBasic())
 	if _, err := v.Sandwich("0000000000000000"); !errors.Is(err, ErrUnknownFunction) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+func TestFunctionsExcludeZeroValueSamples(t *testing.T) {
+	v := pmView(t, pmfixture.GPUBasic())
+	rows, err := v.Functions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k3 := FunctionID{Name: "[gpu:kernel:k3]"}
+	for _, r := range rows {
+		if r.Function.Name == k3.Name {
+			t.Fatalf("zero-value-only function listed: %+v", r)
+		}
+	}
+	launch := rowByName(t, rows, "[gpu:launch]")
+	sw, err := v.Sandwich(launch.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range sw.Callees {
+		if e.Function.Name == k3.Name {
+			t.Fatalf("zero-value edge listed: %+v", e)
+		}
+	}
+	if _, err := v.Sandwich(RefOf(k3)); !errors.Is(err, ErrUnknownFunction) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestSandwichEdgesAreOrderedByValue(t *testing.T) {
+	v := pmView(t, pmfixture.CPUBasic())
+	rows, _ := v.Functions()
+	sw, err := v.Sandwich(rowByName(t, rows, "main").Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sw.Callees) != 2 || sw.Callees[0].Function.Name != "a" || sw.Callees[0].Value != 511 ||
+		sw.Callees[1].Function.Name != "c" || sw.Callees[1].Value != 489 {
+		t.Fatalf("callees %+v", sw.Callees)
+	}
+}
+
+func TestSandwichRecursiveComesFromTheTargetOnly(t *testing.T) {
+	raw := pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("a"), pmfixture.Fn("b"), pmfixture.Fn("a")}, Value: 4})
+	v := pmView(t, raw)
+	rows, err := v.Functions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"main": false, "b": false, "a": true} {
+		sw, err := v.Sandwich(rowByName(t, rows, name).Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sw.Recursive != want {
+			t.Errorf("%s: Recursive %v, want %v", name, sw.Recursive, want)
+		}
+	}
+}
+
+func TestSandwichEdgeTiesBreakByRef(t *testing.T) {
+	raw := pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("x")}, Value: 5},
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("y")}, Value: 5},
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("z")}, Value: 5})
+	v := pmView(t, raw)
+	rows, err := v.Functions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sw, err := v.Sandwich(rowByName(t, rows, "main").Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sw.Callees) != 3 {
+		t.Fatalf("callees %+v", sw.Callees)
+	}
+	for i := 1; i < len(sw.Callees); i++ {
+		if sw.Callees[i-1].Ref >= sw.Callees[i].Ref {
+			t.Errorf("tied callees not in Ref order: %+v", sw.Callees)
+		}
 	}
 }

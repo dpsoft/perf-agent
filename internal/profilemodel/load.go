@@ -127,18 +127,18 @@ func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
 }
 
 // readCapped reads a whole file, refusing one larger than max.
-func readCapped(path string, max int64, name string) ([]byte, error) {
+func readCapped(path string, limit int64, name string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, max+1))
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(b)) > max {
-		return nil, limitErr(name, max, ">"+fmt.Sprint(max))
+	if int64(len(b)) > limit {
+		return nil, limitErr(name, limit, ">"+fmt.Sprint(limit))
 	}
 	return b, nil
 }
@@ -162,7 +162,13 @@ func FromBytes(raw []byte, execlogBytes []byte, lim Limits) (*Profile, error) {
 	if int64(len(data)) > lim.MaxDecompressedBytes {
 		return nil, limitErr("MaxDecompressedBytes", lim.MaxDecompressedBytes, ">"+fmt.Sprint(lim.MaxDecompressedBytes))
 	}
-	src, err := profile.ParseData(data)
+	// ParseUncompressed never inflates again, so the cap above is the only
+	// decompression bound (ParseData would re-inflate a nested gzip stream
+	// without a limit).
+	src, err := profile.ParseUncompressed(data)
+	if err == nil {
+		err = src.CheckValid()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("profilemodel: parse profile: %w", err)
 	}

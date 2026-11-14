@@ -256,3 +256,36 @@ func TestFixturesParse(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRefusesNestedGzipWithoutInflatingIt(t *testing.T) {
+	gz := func(b []byte) []byte {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, _ = zw.Write(b)
+		_ = zw.Close()
+		return buf.Bytes()
+	}
+	nested := gz(gz(make([]byte, 8<<20)))
+	lim := DefaultLimits()
+	lim.MaxDecompressedBytes = 1 << 20
+	if _, err := FromBytes(nested, nil, lim); err == nil {
+		t.Fatal("nested gzip accepted")
+	}
+	// Within the cap, the inner stream is still not inflated: it is a parse
+	// refusal, not a decompression.
+	if _, err := FromBytes(nested, nil, DefaultLimits()); err == nil {
+		t.Fatal("nested gzip accepted under the default cap")
+	}
+}
+
+func TestLoadAcceptsUncompressedProtobuf(t *testing.T) {
+	p := mustLoad(t, twoSamples(), nil, DefaultLimits())
+	var buf bytes.Buffer
+	if err := p.Source.WriteUncompressed(&buf); err != nil {
+		t.Fatal(err)
+	}
+	q, err := FromBytes(buf.Bytes(), nil, DefaultLimits())
+	if err != nil || len(q.Source.Sample) != 2 {
+		t.Fatalf("err=%v", err)
+	}
+}

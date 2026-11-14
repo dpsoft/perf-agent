@@ -87,7 +87,10 @@ func New(cfg Config) (_ *Server, err error) {
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles)
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
+		Instructions:    instructions,
 		Tools:           s.tools(),
+		Prompts:         guidePrompts(),
+		Resources:       guideResources(),
 		MaxMessageBytes: lim.MaxMessageBytes,
 		Log:             s.log,
 	})

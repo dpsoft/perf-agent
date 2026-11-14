@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-execlog-base` name the executions sidecars; none is ever found implicitly.
   The diff JSON format is unstable: it is a flat `nodes` list in pre-order,
   each node carrying an `id` and its `parent`'s `id`.
+- `cmd/perf-agent-mcp`, an MCP server over stdio that lets an AI agent
+  investigate profiles with `open`, `top`, `path`, `sandwich`,
+  `gpu_kernels_for`, `facts`, `diff`, `source` and `render_flamegraph`. It is
+  read-only, offline, needs no capabilities, checks every figure an agent
+  states against the engine, and is built from source only. See
+  [docs/mcp.md](docs/mcp.md).
 
 ## [1.5.2] - 2026-11-12
 

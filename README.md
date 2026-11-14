@@ -74,6 +74,7 @@ For temperature, power, memory and clocks during a finite capture, see
 | [Output](docs/output.md) | file naming, pprof fidelity, PMU format |
 | [What you can do](docs/use-cases.md) | the capabilities above, in full |
 | [Library usage](docs/library-usage.md) | embedding the agent in Go |
+| [MCP server](docs/mcp.md) | let an AI agent investigate profiles (`perf-agent-mcp`, built from source) |
 | [Container images](docs/container-images.md) | the published images, and what they need |
 | [Building](BUILDING.md) · [Testing](TESTING.md) | toolchain and test gates |
 | [Releases](RELEASES.md) · [Changelog](CHANGELOG.md) | what shipped when |

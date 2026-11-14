@@ -1,0 +1,72 @@
+package perfmcp
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestGuideIsShortAndStatesTheRules(t *testing.T) {
+	if len(guideText) > 12288 {
+		t.Errorf("guide is %d bytes, want at most 12288", len(guideText))
+	}
+	for _, want := range []string{
+		"not a share of GPU time",
+		"never multiplied by the sample period",
+		"unavailable is not zero",
+		"{c1}",
+		`"scope": "view"`,
+		"between {c1} and {c2}",
+		"{n:<id>}",
+		"gpu_pc",
+		"omitted_weight",
+	} {
+		if !strings.Contains(guideText, want) {
+			t.Errorf("guide does not contain %q", want)
+		}
+	}
+}
+
+func TestGuideIsServedAsPromptAndResource(t *testing.T) {
+	c := newTestServer(t, testConfig(t))
+
+	res := c.rpc("prompts/get", map[string]any{"name": "perf-agent-guide"})
+	var prompt struct {
+		Messages []struct {
+			Content struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res.Result, &prompt); err != nil || len(prompt.Messages) != 1 {
+		t.Fatalf("prompts/get = %s (%v)", res.Result, err)
+	}
+	if prompt.Messages[0].Content.Text != guideText {
+		t.Error("the prompt is not the guide")
+	}
+
+	res = c.rpc("resources/read", map[string]any{"uri": "perf-agent://guide"})
+	var rsc struct {
+		Contents []struct {
+			Text     string `json:"text"`
+			MIMEType string `json:"mimeType"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(res.Result, &rsc); err != nil || len(rsc.Contents) != 1 {
+		t.Fatalf("resources/read = %s (%v)", res.Result, err)
+	}
+	if rsc.Contents[0].Text != guideText || rsc.Contents[0].MIMEType != "text/markdown" {
+		t.Errorf("resource mime %q or text differs from the guide", rsc.Contents[0].MIMEType)
+	}
+}
+
+func TestInitializeInstructionsPointAtTheGuide(t *testing.T) {
+	srv, err := New(testConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if !strings.Contains(instructions, "perf-agent-guide") || !strings.Contains(instructions, "perf-agent://guide") {
+		t.Errorf("instructions = %q", instructions)
+	}
+}

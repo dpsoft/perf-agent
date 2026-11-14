@@ -305,6 +305,50 @@ to OTLP, and the internal `/metrics` endpoint is unchanged.
 
 ---
 
+## Inspecting and comparing profiles
+
+`cmd/flamegraph` can also answer questions about one profile or compare two,
+over the same profile model, without drawing the full graph. These flags read
+leaf-first pprof only, never find an executions sidecar on their own, and exit
+2 when combined with `-folded`, `-fuse`, `-stack-order root-first`,
+`-gpu-telemetry` or `-raw-vendor-frames`. `-sample-index` applies to all of
+them; any negative value chooses automatically, as for `-folded`. The executions sidecar is the file perf-agent writes with
+`--gpu-executions-output`.
+
+```bash
+# The 20 widest nodes, as JSON lines {"id","path","cum"}; -list-nodes 0 prints none
+go run ./cmd/flamegraph -list-nodes 20 profile.pb.gz
+
+# Facts for one node: its ID, or a root-first name path
+go run ./cmd/flamegraph -facts 'main;work;inner' -execlog profile.executions profile.pb.gz
+
+# Diff against a base profile: writes profile.pb.gz.diff.html and .diff.json
+go run ./cmd/flamegraph -diff base.pb.gz -execlog-base base.executions \
+    -execlog profile.executions profile.pb.gz
+```
+
+A sidecar named by `-execlog` or `-execlog-base` that is missing, a
+directory or unreadable exits 1 before anything is loaded. One that is read
+but does not match its profile (another capture, a truncated file) is not an
+error: the executions facts say why they are unavailable.
+
+A name path that matches several nodes (the same name in different modules)
+exits 1 and lists the candidate IDs on stderr; pass one of them instead.
+`-diff` writes the page to `-o` (default `<profile>.diff.html`) and the diff
+JSON next to it with `.json` replacing `.html`; it refuses an `-o` that
+names an input profile or sidecar, or a link to one. Each output file is
+written atomically (the JSON first, then the page); the pair is not, so a
+failure between the two can leave a new JSON beside an old page. The page
+names each side by its file name (hover for the profile's handle), shows
+readable durations and sizes beside the exact values, and its tooltips
+carry each node's base and new IDs for `-facts`.
+
+The diff JSON is compact and its format is unstable: it nests the union as a
+tree as deep as the deepest stack, and a later release replaces that with a
+flat node list carrying parent IDs. `per_unit` states once whether
+per-unit-of-work deltas are available, and why not; nodes carry
+`delta_per_unit` only when they are.
+
 ## Continuous GPU telemetry and OTLP
 
 Run telemetry until SIGINT/SIGTERM, with optional OTLP/HTTP protobuf delivery:

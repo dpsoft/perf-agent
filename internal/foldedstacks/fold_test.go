@@ -379,3 +379,20 @@ func TestFoldSaysNothingAboutSamplingWhenThereIsNone(t *testing.T) {
 	assert.NotContains(t, joined, "launch")
 	assert.NotContains(t, joined, "sample of GPU time")
 }
+
+func TestSamplingNotesMatchesFoldWarnings(t *testing.T) {
+	p := oneType(
+		sample(30, nil, loc(1, UnsampledLaunchFrame), loc(2, "[gpu:kernel:k]")),
+		sample(70, map[string][]string{SamplePeriodLabel: {"8"}},
+			loc(3, "main"), loc(4, "[gpu:launch]"), loc(2, "[gpu:kernel:k]")),
+	)
+	res, err := Fold(p, Options{SampleIndex: -1})
+	require.NoError(t, err)
+
+	notes := SamplingNotes(30, 100, "8", 1)
+	require.Len(t, notes, 2)
+	for _, n := range notes {
+		assert.Contains(t, res.Warnings, n)
+	}
+	assert.Nil(t, SamplingNotes(0, 100, "", 0))
+}

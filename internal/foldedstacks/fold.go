@@ -70,7 +70,7 @@ const UnknownFrame = "[unknown]"
 // Options configures Fold.
 type Options struct {
 	// SampleIndex selects which of Profile.SampleType to fold. Negative
-	// means "choose automatically" — see chooseSampleIndex.
+	// means "choose automatically" — see ChooseSampleIndex.
 	SampleIndex int
 
 	// StackOrder is how the profile stores Sample.Location. Defaults to
@@ -272,7 +272,7 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 
 	idx := opts.SampleIndex
 	if idx < 0 {
-		idx = chooseSampleIndex(p)
+		idx = ChooseSampleIndex(p)
 	}
 	if idx >= len(p.SampleType) {
 		return nil, fmt.Errorf("foldedstacks: sample index %d out of range (profile has %d sample types)", idx, len(p.SampleType))
@@ -357,7 +357,7 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 			order = append(order, key)
 		}
 		st.Value += v
-		if matchesInexact(s.Label, rules) {
+		if MatchesInexact(s.Label, rules) {
 			st.Inexact += v
 		}
 	}
@@ -410,7 +410,7 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 			return
 		}
 		if len(loc.Line) == 0 {
-			name := addressName(loc)
+			name := AddressName(loc)
 			out = append(out, name)
 			mods = append(mods, mod)
 			stats.addressOnly++
@@ -421,7 +421,7 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 		// backwards emits the inlined chain root-first, matching the frame
 		// order we produce for locations.
 		for i := len(loc.Line) - 1; i >= 0; i-- {
-			name := lineName(loc, loc.Line[i])
+			name := LineName(loc, loc.Line[i])
 			if isAddressOnly(name) {
 				stats.addressOnly++
 			}
@@ -445,7 +445,10 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 	return out, mods, stats
 }
 
-func lineName(loc *profile.Location, ln profile.Line) string {
+// LineName is the display name Fold gives one Line of loc: the function
+// name, else its system name, else "file:line", else AddressName(loc).
+// Other packages that name frames call it so their names match Fold's.
+func LineName(loc *profile.Location, ln profile.Line) string {
 	if ln.Function != nil {
 		if n := strings.TrimSpace(ln.Function.Name); n != "" {
 			return n
@@ -460,10 +463,10 @@ func lineName(loc *profile.Location, ln profile.Line) string {
 			return f
 		}
 	}
-	return addressName(loc)
+	return AddressName(loc)
 }
 
-// addressName names a Location that has no usable Function. The mapping form
+// AddressName names a Location that has no usable Function. The mapping form
 // is preferred over the bare address: Location.Address is already relative to
 // the mapping, so "libcuda.so.1+0x1b71c6" is the same number with the file it
 // belongs to attached, and it survives ASLR where the bare form does not.
@@ -471,7 +474,7 @@ func lineName(loc *profile.Location, ln profile.Line) string {
 // (The bare form was previously unreachable-first here: the Address!=0 test
 // came before the mapping test, so a location with both always printed the
 // address alone.)
-func addressName(loc *profile.Location) string {
+func AddressName(loc *profile.Location) string {
 	if loc == nil {
 		return UnknownFrame
 	}
@@ -505,7 +508,9 @@ func isAddressOnly(name string) bool {
 	return framename.IsAddressOnly(name)
 }
 
-func matchesInexact(labels map[string][]string, rules []InexactRule) bool {
+// MatchesInexact reports whether a sample's labels match any of rules, the
+// test Fold uses for Stack.Inexact.
+func MatchesInexact(labels map[string][]string, rules []InexactRule) bool {
 	for _, rule := range rules {
 		vals, ok := labels[rule.Key]
 		if !ok {
@@ -643,15 +648,24 @@ func gpuSamplingWarnings(res *Result) []string {
 			periodSamples = l.Count
 		}
 	}
-	if res.UnsampledLaunchTotal == 0 && period == "" {
+	return SamplingNotes(res.UnsampledLaunchTotal, res.Total, period, periodSamples)
+}
+
+// SamplingNotes renders the launch-sampling explanation for a profile with
+// the given unsampled-launch value, total, sampling period label value and
+// count of samples carrying that label. It returns nil when there is neither
+// unsampled time nor a period, so callers outside Fold state exactly the
+// same text as the folded view.
+func SamplingNotes(unsampled, total int64, period string, periodSamples int) []string {
+	if unsampled == 0 && period == "" {
 		return nil
 	}
 
 	var w []string
-	if res.UnsampledLaunchTotal > 0 {
+	if unsampled > 0 {
 		w = append(w, fmt.Sprintf(
 			"%.1f%% of the total sits under %s: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.",
-			pct(res.UnsampledLaunchTotal, res.Total), UnsampledLaunchFrame))
+			pct(unsampled, total), UnsampledLaunchFrame))
 	}
 	if period != "" {
 		w = append(w, fmt.Sprintf(
@@ -668,7 +682,7 @@ func pct(part, whole int64) float64 {
 	return float64(part) / float64(whole) * 100
 }
 
-// chooseSampleIndex picks the value axis to fold.
+// ChooseSampleIndex picks the value axis to fold.
 //
 // The rule, in order: honour Profile.DefaultSampleType when it names a real
 // type; otherwise take the LAST sample type, which is what google/pprof's
@@ -677,7 +691,7 @@ func pct(part, whole int64) float64 {
 // bytes). Every profiling mode perf-agent ships today — cpu, offcpu, gpu —
 // declares exactly one type, so this only matters for the memory builder
 // and for foreign profiles.
-func chooseSampleIndex(p *profile.Profile) int {
+func ChooseSampleIndex(p *profile.Profile) int {
 	if p.DefaultSampleType != "" {
 		for i, st := range p.SampleType {
 			if st.Type == p.DefaultSampleType {

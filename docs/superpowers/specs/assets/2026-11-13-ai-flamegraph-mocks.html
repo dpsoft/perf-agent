@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>perf-agent AI mocks</title>
+<style>
+:root{
+  --bg:#f6f4f1; --panel:#fff; --ink:#1d1b19; --muted:#6b655f; --line:#e3ded8;
+  --accent:#5b4bdb; --ok:#1f8a4c; --bad:#c0392b; --warn:#b7791f;
+  --fill-app:hsl(335 78% 79%); --fill-system:hsl(2 68% 78%); --fill-vendor:hsl(50 88% 69%);
+  --fill-kernel:hsl(28 92% 70%); --fill-boundary:hsl(0 0% 84%); --fill-gpu:hsl(128 48% 67%);
+  --fill-shim:hsl(215 15% 77%); --fill-unsym:hsl(45 20% 77%); --fill-root:hsl(30 8% 81%);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans)}
+.mocknav{display:flex;gap:6px;padding:10px 16px;background:#1d1b19;color:#eee;align-items:center;flex-wrap:wrap}
+.mocknav b{margin-right:12px;font-weight:600}
+.mocknav button{background:#34302c;color:#ddd;border:0;border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
+.mocknav button.on{background:var(--accent);color:#fff}
+.mocknav .note{margin-left:auto;color:#aaa;font-size:12px}
+.screen{display:none;padding:16px}
+.screen.on{display:block}
+.caption{max-width:1400px;margin:0 auto 12px;color:var(--muted);font-size:13px}
+.caption b{color:var(--ink)}
+
+/* --- explained flame graph page --- */
+.app{max-width:1400px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.top{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{font-weight:700;font-size:18px}.brand i{font-weight:400;color:var(--muted);font-size:14px;margin-left:6px}
+.sel{border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:13px;background:#fff}
+.sel span{color:var(--muted)}
+.prov{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 9px;font-size:12px;border:1px solid var(--line);background:#faf9f7;white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:#bfe3cd;background:#f1faf4}
+.pill.bad{color:var(--bad);border-color:#f0c8c3;background:#fdf3f2}
+.pill.ai{color:var(--accent);border-color:#d6d1fa;background:#f5f3ff}
+.legend{display:flex;gap:14px;padding:8px 16px;border-bottom:1px solid var(--line);font-size:12px;flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+.body{display:grid;grid-template-columns:minmax(0,1fr) 430px}
+@media (max-width:1000px){.body{grid-template-columns:1fr}}
+.graph{padding:12px 16px;border-right:1px solid var(--line);min-width:0}
+.fg{position:relative;height:330px}
+.fr{position:absolute;height:24px;border-radius:2px;font:12px/24px var(--mono);padding:0 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;border:1px solid rgba(0,0,0,.06)}
+.fr:hover{filter:brightness(.94)}
+.fr.sel{outline:2px solid var(--ink);z-index:2}
+.fr.cite{outline:2px dashed var(--accent);z-index:2}
+.fr.dim{opacity:.35}
+.fr .star{color:var(--accent);font-weight:700;margin-right:3px}
+.fr.hatch{background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.09) 0 3px,transparent 3px 7px)}
+.axis{font-size:12px;color:var(--muted);margin-top:6px;display:flex;justify-content:space-between}
+.explained{margin-top:14px}
+.explained h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.exrow{display:flex;gap:8px;align-items:center;padding:6px 8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px}
+.exrow:hover{background:#faf9f7}
+.exrow code{font-family:var(--mono);font-size:12px}
+.exrow .w{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums}
+
+.side{padding:0;min-width:0}
+.side .hd{padding:12px 16px;border-bottom:1px solid var(--line)}
+.side .hd .lbl{font-size:12px;color:var(--muted)}
+.side .hd .nm{font:600 14px var(--mono);word-break:break-all}
+.tabs{display:flex;border-bottom:1px solid var(--line)}
+.tabs div{padding:8px 12px;font-size:13px;color:var(--muted);cursor:default}
+.tabs div.on{color:var(--accent);border-bottom:2px solid var(--accent);font-weight:600}
+.sec{padding:12px 16px;border-bottom:1px solid var(--line)}
+.sec h5{margin:0 0 8px;font-size:13px;display:flex;align-items:center;gap:6px}
+.facts{display:grid;grid-template-columns:1fr auto auto;gap:3px 10px;font-size:13px;font-variant-numeric:tabular-nums}
+.facts .k{color:var(--muted)}
+.facts .p{color:var(--muted)}
+.interp p{margin:0 0 8px}
+.cite-chip{display:inline-flex;align-items:center;gap:2px;font:11px var(--mono);background:#f5f3ff;color:var(--accent);border:1px solid #d6d1fa;border-radius:4px;padding:0 4px;cursor:pointer;vertical-align:1px}
+.cite-chip::after{content:"✓";color:var(--ok);font-size:10px}
+.rej{background:#fdf3f2;border:1px solid #f0c8c3;border-radius:6px;padding:8px 10px;font-size:12.5px}
+.rej s{color:var(--bad)}
+.path{list-style:none;margin:0;padding:0;font:12px var(--mono)}
+.path li{display:flex;align-items:center;gap:6px;padding:2px 0}
+.path li .c{margin-left:auto;font-family:var(--sans);color:var(--muted);font-size:11px}
+.path li.hl{background:#f5f3ff;border-radius:4px}
+.next{font-size:13px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;background:#fff;cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1d1b19;color:#fff;padding:8px 14px;border-radius:8px;font:12px var(--mono);opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+.toast.on{opacity:1}
+.foot{display:flex;gap:18px;padding:8px 16px;border-top:1px solid var(--line);font-size:12px;color:var(--muted);flex-wrap:wrap}
+
+/* --- agent session --- */
+.term{max-width:1100px;margin:0 auto;background:#16140f;color:#e8e3da;border-radius:10px;padding:16px 18px;font:12.5px/1.55 var(--mono);overflow-x:auto}
+.term .u{color:#9fd3ff}
+.term .t{color:#c7b8ff}
+.term .o{color:#a8a197}
+.term .g{color:#8fdc9a}
+.term .r{color:#ff9b8f}
+.term .y{color:#f2cf6b}
+.term pre{margin:0;white-space:pre}
+.term .blk{border-left:2px solid #3a352d;padding-left:10px;margin:4px 0 10px}
+
+/* --- loop report --- */
+.rep{max-width:1400px;margin:0 auto;display:grid;gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h3{margin:0 0 8px;font-size:15px}
+.goal{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+.goal .k{color:var(--muted)}
+.goal code{font:12px var(--mono);background:#f3f0ec;padding:1px 5px;border-radius:4px}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--muted);font-weight:600}
+.dots{display:inline-flex;gap:3px}
+.dots i{width:9px;height:9px;border-radius:50%;display:inline-block;background:#ccc}
+.dots i.w{background:var(--ok)}.dots i.l{background:var(--bad)}.dots i.n{background:#bbb}
+.st{font-weight:600}.st.acc{color:var(--ok)}.st.rej{color:var(--bad)}.st.base{color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:1000px){.grid2{grid-template-columns:1fr}}
+.dfg{position:relative;height:190px}
+.dlegend{display:flex;gap:12px;font-size:12px;color:var(--muted);margin-top:6px;align-items:center;flex-wrap:wrap}
+.grad{width:120px;height:10px;border-radius:3px;background:linear-gradient(90deg,hsl(215 70% 55%),#eee,hsl(2 75% 58%))}
+.bar{height:16px;border-radius:3px;display:inline-block;vertical-align:middle}
+.pr{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.pr .box{flex:1;min-width:280px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px}
+.pr .box .t{font-weight:600}
+.pr .box ul{margin:6px 0 0;padding-left:18px}
+.gate{border:1px dashed var(--accent);border-radius:8px;padding:10px 12px;font-size:13px;color:var(--accent);background:#f8f7ff}
+</style>
+</head>
+<body>
+
+<div class="mocknav">
+  <b>perf-agent · AI mocks</b>
+  <button data-s="s1" class="on">1 · HTML explicado (humano)</button>
+  <button data-s="s2">2 · Sesión del agente (MCP)</button>
+  <button data-s="s3">3 · Loop autónomo (reporte)</button>
+  <span class="note">Mock estático: datos inventados, no es un profile real</span>
+</div>
+
+<!-- ================= SCREEN 1 ================= -->
+<section class="screen on" id="s1">
+<p class="caption"><b>Qué es:</b> el archivo que genera <code>render_flamegraph</code> cuando el agente termina de investigar. Los números (<i>Profile facts</i>, anchos, porcentajes) los pone perf-agent; el agente solo aporta el texto, y cada <span class="cite-chip">f9</span> es una cita a un frame que perf-agent verificó. Hacé click en las citas, en los frames y en las preguntas de abajo.</p>
+<div class="app">
+  <div class="top">
+    <div class="brand">perf-agent<i>Enjoy the Flames.</i></div>
+    <div class="sel"><span>View:</span> AI Flame Graph ▾</div>
+    <div class="sel"><span>Metric:</span> GPU time ▾</div>
+    <div class="prov">
+      <span class="pill ai">✦ Explicado por un agente vía MCP</span>
+      <span class="pill ok">11 cifras y referencias comprobadas</span><span class="pill">la prosa no se verifica</span>
+      <span class="pill bad">1 afirmación rechazada</span>
+      <span>2026-11-12 18:40</span>
+    </div>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--fill-app)"></i>application</span>
+    <span><i class="sw" style="background:var(--fill-vendor)"></i>GPU runtime / driver</span>
+    <span><i class="sw" style="background:var(--fill-shim)"></i>perf-agent</span>
+    <span><i class="sw" style="background:var(--fill-boundary)"></i>CPU→GPU boundary</span>
+    <span><i class="sw" style="background:var(--fill-gpu)"></i>GPU kernel</span>
+    <span><i class="sw" style="background:var(--fill-root);background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.12) 0 3px,transparent 3px 7px)"></i>join inferido</span>
+    <span style="margin-left:auto;color:var(--accent)">✦ = path con explicación</span>
+  </div>
+  <div class="body">
+    <div class="graph">
+      <div class="fg" id="fg"></div>
+      <div class="axis"><span>gpu/nanoseconds · ancho = tiempo de GPU lanzado desde ese path, no tiempo de CPU</span><span>689.3 ms</span></div>
+      <div class="explained">
+        <h4>Paths que el agente explicó</h4>
+        <div class="exrow" data-f="f4"><span class="star" style="color:var(--accent)">✦</span><code>torch::nn::Conv2d::forward</code><span class="pill">“41.1% del GPU time de stacks muestreados”</span><span class="w">283.1 ms</span></div>
+        <div class="exrow" data-f="f14"><span class="star" style="color:var(--accent)">✦</span><code>at::native::add_relu</code><span class="pill">“Elementwise sin fusionar: 2 kernels por capa”</span><span class="w">121.4 ms</span></div>
+        <div class="exrow" data-f="f20"><span class="star" style="color:var(--accent)">✦</span><code>[gpu:launch unsampled]</code><span class="pill">“9% sin stack: no inventar causa”</span><span class="w">62.0 ms</span></div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="hd"><div class="lbl">Frame details</div><div class="nm" id="nm">torch::nn::Conv2d::forward</div></div>
+      <div class="tabs"><div>Summary</div><div>Stack</div><div>Across graph</div><div class="on">✦ Explain path</div></div>
+
+      <div class="sec">
+        <h5>Profile facts <span class="pill ok">calculado por perf-agent</span></h5>
+        <div class="facts">
+          <span class="k">Cumulative</span><span>283.1 ms</span><span class="p">41.1% del total</span>
+          <span class="k">Self</span><span>0 ns</span><span class="p">0.0%</span>
+          <span class="k">Share of parent</span><span>68.3%</span><span class="p">de <code>train_step</code></span>
+          <span class="k">Ejecuciones debajo</span><span>1,416</span><span class="p">execlog verificado (sha256)</span>
+          <span class="k">Nombres de kernel distintos</span><span>4</span><span class="p">observados</span>
+          <span class="k">Inferred join</span><span>7.2 ms</span><span class="p">2.5% (hatched)</span>
+        </div>
+        <div class="rej" style="background:#fff8e8;border-color:#f1dca8;margin-top:8px">⚠ <b>Muestreo de stacks 1/8.</b> El 41.1% es la parte del GPU time medido que cayó bajo los stacks <i>muestreados</i> de este path, no “el 41% del GPU time”. 62.0 ms (9.0%) no tienen caller y no se reparten. Nada está multiplicado por 8.</div>
+      </div>
+
+      <div class="sec interp">
+        <h5>Interpretación del agente <span class="pill ai">✦ AI · prosa no verificada</span></h5>
+        <p>Casi todo el GPU time de este path termina en un solo kernel de cuDNN, <span class="cite-chip" data-f="f9">f9</span> <code>sm86_xmma_fprop_implicit_gemm</code>, que ocupa 238.4 ms de los 283.1 ms. El kernel es el que ejecuta la convolución; este profile no mide el overhead de CPU del profiler, para eso hace falta el CPU profile (<span class="cite-chip" data-f="f7">f7</span> es solo el punto de inyección).</p>
+        <p>Los otros 3 kernels debajo de <span class="cite-chip" data-f="f4">f4</span> son transformaciones de layout (<span class="cite-chip" data-f="f11">f11</span> <code>nchwToNhwc</code>, 37.6 ms). <b>Hipótesis</b> (no medida): el modelo corre en NCHW y cuDNN convierte el layout. Para confirmarla: contar ejecuciones de <code>nchwToNhwcKernel</code> por iteración contra el número de capas.</p>
+      </div>
+
+      <div class="sec">
+        <h5>Rechazado al generar</h5>
+        <div class="rej">El agente escribió <s>“las convoluciones son el 62% del GPU time”</s>. El profile dice <b>41.1%</b> para <span class="cite-chip" data-f="f4">f4</span>. perf-agent rechazó la afirmación; el agente la corrigió y el texto de arriba es la versión aceptada.</div>
+      </div>
+
+      <div class="sec">
+        <h5>Causal path (root → GPU kernel)</h5>
+        <ul class="path" id="cpath"></ul>
+      </div>
+
+      <div class="sec next">
+        <h5>Siguiente paso sugerido</h5>
+        Primero medir: ejecuciones de <span class="cite-chip" data-f="f11">f11</span> por iteración. Si coincide con el número de capas, probar <code>channels_last</code> y comparar con el diff (no solo con el ancho de <span class="cite-chip" data-f="f4">f4</span>).
+      </div>
+
+      <div class="sec">
+        <h5>Seguir en tu agente</h5>
+        <div style="font-size:12px;color:var(--muted)">Copia una pregunta lista para pegar en Claude Code (o cualquier cliente MCP), con el profile y el frame ya referenciados.</div>
+        <div class="chips">
+          <span class="chip" data-q="¿Por qué f4 es tan ancho?">¿Por qué es ancho?</span>
+          <span class="chip" data-q="Explicá la causalidad CPU→GPU de f4 a f9">Causalidad CPU→GPU</span>
+          <span class="chip" data-q="¿Cuánto de f4 es overhead de perf-agent?">¿Es overhead del profiler?</span>
+          <span class="chip" data-q="Compará f4 contra el profile anterior">Comparar con otro profile</span>
+          <span class="chip" data-q="Optimizá f11 con un loop autónomo y abrí un draft PR">Optimizar esto (loop)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>Total 689.3 ms</span><span>Samples 33,342</span><span>Stacks 151</span><span>Inferred 7.2 ms</span><span>Unsampled launches 62.0 ms</span><span style="margin-left:auto">pytorch_resnet50-gpu.pb.gz · capture_id 7f3a…</span></div>
+</div>
+</section>
+
+<!-- ================= SCREEN 2 ================= -->
+<section class="screen" id="s2">
+<p class="caption"><b>Qué es:</b> cómo se ve del lado del agente (por ejemplo Claude Code con <code>perf-agent mcp</code> configurado). Navega de lo general a lo particular en vez de recibir el profile entero, y al final pide el HTML. perf-agent valida las citas en <code>render_flamegraph</code> y devuelve el error para que el agente corrija.</p>
+<div class="term">
+<pre><span class="u">&gt; explicame dónde se va el tiempo de GPU en pytorch_resnet50-gpu.pb.gz y dejame el HTML</span></pre>
+<div class="blk"><pre><span class="t">● perf-agent.summary</span>(profile="pytorch_resnet50-gpu.pb.gz")
+<span class="o">  handle p_9c1e… (sha256 9c1e…) · view gpu/nanoseconds · total 689.3 ms · 151 stacks
+  quality: inferred joins 7.2 ms (1.0%) · unsampled launches 62.0 ms (9.0%) · launch stack period 8
+  available: execlog (verified) · pc sampling: no · source roots: ./  
+  <span class="y">⚠ widths under [gpu:launch] are sampled launch stacks, not shares of GPU time</span></span></pre></div>
+<div class="blk"><pre><span class="t">● perf-agent.top</span>(by="cum", domain="application", limit=10)
+<span class="o">  id   cum        cum%   self   frame
+  f4   283.1 ms   41.1%  0      torch::nn::Conv2d::forward
+  f14  121.4 ms   17.6%  0      at::native::add_relu
+  f17   98.7 ms   14.3%  0      torch::nn::BatchNorm2d::forward
+  …   omitted 28 frames · 186.1 ms (27.0%) · cursor c_2</span></pre></div>
+<div class="blk"><pre><span class="t">● perf-agent.gpu_kernels_for</span>(handle="p_9c1e…", frame="f4")
+<span class="o">  id   time       share  execs*    kernel
+  f9   238.4 ms   84.2%  1,416     sm86_xmma_fprop_implicit_gemm_…
+  f11   37.6 ms   13.3%    472     nchwToNhwcKernel
+  f12    5.9 ms    2.1%     16     cudnn::winograd::generateWinogradTilesKernel
+  f13    1.2 ms    0.4%      8     cask_cudnn::computeOffsetsKernel
+  * executions from the verified execlog sidecar; unavailable without it</span></pre></div>
+<div class="blk"><pre><span class="t">● perf-agent.path</span>(frame="f9")
+<span class="o">  root › python › &lt;module&gt; › train_step › f4 Conv2d::forward › f5 cudnn_convolution › f6 cudnnBackendExecute
+       › libcuda.so.1+0x7d2f4 › f7 perf-agent on_launch [shim] › f8 [gpu:launch] › f9 [gpu:kernel:…]</span></pre></div>
+<div class="blk"><pre><span class="t">● perf-agent.render_flamegraph</span>(profile=…, explanations=[3 paths])
+<span class="r">  ✗ claim rejected: {path f4, metric cum_share, value 62%} — engine value 41.1% (declared rounding 0.1)
+  ✗ 1 of 12 citations rejected; nothing written</span></pre></div>
+<div class="blk"><pre><span class="t">● perf-agent.render_flamegraph</span>(profile=…, explanations=[3 paths, corrected])
+<span class="g">  ✓ 11 structured claims checked (numbers rendered by perf-agent) · prose marked unverified
+  ✓ wrote ./pytorch_resnet50-gpu.explained.html</span></pre></div>
+<pre>De los stacks muestreados, el 41.1% del GPU time medido cae bajo las convoluciones (f4), casi todo en el kernel de cuDNN f9.
+Llama la atención f11 nchwToNhwcKernel (37.6 ms). Hipótesis: el modelo está en NCHW; lo confirmaría contando ejecuciones por iteración.
+Te dejé el detalle en <span class="y">pytorch_resnet50-gpu.explained.html</span>.</pre>
+</div>
+</section>
+
+<!-- ================= SCREEN 3 ================= -->
+<section class="screen" id="s3">
+<p class="caption"><b>Qué es:</b> el reporte que deja el loop autónomo (en el worktree y adjunto al draft PR). El agente llega hasta abrir el PR; el merge lo hacés vos o se lo pedís explícitamente. Baseline y candidato se miden <i>intercalados</i> (A/B balanceado) sin profiler; el profile explicativo va aparte. Un cambio se acepta con un criterio fijado antes de empezar, y el ganador se vuelve a medir desde cero.</p>
+<div class="rep">
+  <div class="card">
+    <h3>Objetivo del loop</h3>
+    <div class="goal">
+      <span class="k">Path objetivo</span><span><code>Conv2d::forward › … › [gpu:kernel:nchwToNhwcKernel]</code> (37.6 ms, 5.5%)</span>
+      <span class="k">Benchmark congelado</span><span><code>python bench/train_step.py --iters 200</code> · comando, inputs, entorno y dependencias fijados (hash) · warm-up 20 iters · <code>cuda.synchronize()</code> por iteración</span>
+      <span class="k">Correctitud</span><span><code>pytest tests/</code> (0 fallas observadas en 3 ejecuciones) + salida del modelo dentro de 1e-3 del baseline</span>
+      <span class="k">Criterio</span><span>mejora ≥ 3% con el intervalo de confianza (95%) por debajo de 0 en 10 pares A/B intercalados · cobertura del profile comparable (símbolos, stacks, joins) · tests y tolerancia numérica · benchmark intacto</span>
+      <span class="k">Límites</span><span>máx 5 iteraciones · 2 h · intentos fallidos conservados · solo en worktree <code>.worktrees/ai-opt-7f3a</code> · termina en draft PR</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Iteraciones</h3>
+    <table>
+      <thead><tr><th>#</th><th>Cambio</th><th>Pares A/B</th><th>Wall time (mediana)</th><th>Path objetivo</th><th>GPU total</th><th>Resultado</th><th></th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>baseline</td><td><span class="dots"><i class="n"></i><i class="n"></i><i class="n"></i><i class="n"></i><i class="n"></i></span></td><td>812 ms ±1.1%</td><td>37.6 ms</td><td>689.3 ms</td><td class="st base">—</td><td><a href="#">HTML</a></td></tr>
+        <tr><td>1</td><td>fusionar <code>add</code>+<code>relu</code> con <code>torch.compile</code> en el bloque residual</td><td><span class="dots"><i class="w"></i><i class="w"></i><i class="l"></i><i class="w"></i><i class="l"></i></span></td><td>805 ms −0.9% [−2.1, +0.4]</td><td>37.4 ms</td><td>676.0 ms</td><td class="st rej">rechazado: intervalo cruza 0</td><td><a href="#">HTML</a></td></tr>
+        <tr><td>2</td><td><code>model.to(memory_format=torch.channels_last)</code> + input en NHWC</td><td><span class="dots"><i class="w"></i><i class="w"></i><i class="w"></i><i class="w"></i><i class="w"></i></span></td><td>697 ms −14.2% [−15.0, −13.3]</td><td>0 ms (no aparece; cobertura comparable)</td><td>598.1 ms</td><td class="st acc">aceptado · re-medido: −13.9%</td><td><a href="#">HTML</a> · <a href="#">diff</a></td></tr>
+        <tr><td>3</td><td>sobre #2: <code>cudnn.benchmark = True</code></td><td><span class="dots"><i class="w"></i><i class="w"></i><i class="w"></i><i class="w"></i><i class="w"></i></span></td><td>—</td><td>—</td><td>—</td><td class="st rej">rechazado: 2 tests fallan (no determinismo)</td><td><a href="#">log</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>Diff flame graph · baseline → #2 (GPU time acumulado)</h3>
+      <div class="dfg" id="dfg"></div>
+      <div class="dlegend"><span>menos GPU time</span><span class="grad"></span><span>más GPU time</span><span style="margin-left:auto">ancho = unión de antes y después · hatched = solo en baseline</span></div>
+    </div>
+    <div class="card">
+      <h3>Qué cambió en el path objetivo</h3>
+      <table>
+        <thead><tr><th>Frame</th><th>Antes</th><th>Después</th><th></th></tr></thead>
+        <tbody>
+          <tr><td><code>Conv2d::forward</code></td><td>283.1 ms</td><td>229.8 ms</td><td><span class="bar" style="width:60px;background:hsl(215 70% 62%)"></span> −18.8%</td></tr>
+          <tr><td><code>[gpu:kernel:nchwToNhwcKernel]</code></td><td>37.6 ms</td><td>0 ms</td><td><span class="bar" style="width:80px;background:hsl(215 70% 55%)"></span> −100%</td></tr>
+          <tr><td><code>[gpu:kernel:sm86_xmma_fprop…nhwc]</code></td><td>238.4 ms</td><td>224.6 ms</td><td><span class="bar" style="width:20px;background:hsl(215 70% 70%)"></span> −5.8%</td></tr>
+           <tr><td><code>[gpu:kernel:nchwToNhwcKernel]</code> <span class="pill">solo en baseline</span></td><td>472 execs</td><td>—</td><td>removido: mismo build-id de libcudnn, símbolos resueltos en ambos</td></tr>
+          <tr><td><code>BatchNorm2d::forward</code></td><td>98.7 ms</td><td>101.2 ms</td><td><span class="bar" style="width:8px;background:hsl(2 75% 70%)"></span> +2.5%</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:13px;color:var(--muted);margin:10px 0 0">Interpretación del agente <span class="pill ai">✦ AI</span>: la conversión de layout desaparece y el kernel de convolución elige la variante NHWC. BatchNorm sube 2.5%, dentro del ruido de 3/5 rondas; no lo atribuye al cambio.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Resultado</h3>
+    <div class="pr">
+      <div class="box">
+        <div class="t">Draft PR: perf: run ResNet50 in channels_last to drop per-layer layout conversion</div>
+        <ul>
+          <li>1 commit en <code>ai-opt-7f3a</code> · 2 archivos · +6 −1</li>
+          <li>Adjuntos: este reporte, los HTML explicados de baseline y #2, el diff</li>
+          <li>Comando para reproducir la medición</li>
+        </ul>
+      </div>
+      <div class="gate">🔒 El agente se detiene acá. El merge lo hacés vos, o se lo pedís explícitamente.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// --- nav
+document.querySelectorAll('.mocknav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.mocknav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===b.dataset.s));
+});
+
+// --- flame graph data: [id, depth, x%, w%, label, fill, explained, hatch]
+const F=[
+ ['f0',0,0,100,'all (689.3 ms)','root'],
+ ['f1',1,0,91,'python3.12','app'],
+ ['f20',1,91,9,'[gpu:launch unsampled]','boundary',1,1],
+ ['f2',2,0,91,'<module>','app'],
+ ['f3',3,0,60,'train_step','app'],
+ ['f15',3,60,31,'eval_step','app'],
+ ['f4',4,0,41,'torch::nn::Conv2d::forward','app',1],
+ ['f14',4,41,17.6,'at::native::add_relu','app',1],
+ ['f17',4,60,14.3,'BatchNorm2d::forward','app'],
+ ['f18',4,74.3,16.7,'Linear::forward','app'],
+ ['f5',5,0,41,'at::_ops::cudnn_convolution::call','app'],
+ ['f16',5,41,17.6,'launch_vectorized_kernel','vendor'],
+ ['f19',5,60,31,'cudaLaunchKernel','vendor'],
+ ['f6',6,0,41,'cudnnBackendExecute','vendor'],
+ ['f21',6,41,17.6,'libcuda.so.1+0x7d2f4','vendor'],
+ ['f22',6,60,31,'libcuda.so.1+0x7d2f4','vendor'],
+ ['f10',7,0,41,'libcuda.so.1+0x7d2f4','vendor'],
+ ['f23',7,41,17.6,'on_launch [perf-agent]','shim'],
+ ['f24',7,60,31,'on_launch [perf-agent]','shim'],
+ ['f7',8,0,41,'on_launch [perf-agent]','shim'],
+ ['f25',8,41,17.6,'[gpu:launch]','boundary'],
+ ['f26',8,60,31,'[gpu:launch]','boundary'],
+ ['f8',9,0,41,'[gpu:launch]','boundary'],
+ ['f27',9,41,8.8,'[gpu:kernel:vectorized_elementwise add]','gpu'],
+ ['f28',9,49.8,8.8,'[gpu:kernel:vectorized_elementwise relu]','gpu'],
+ ['f29',9,60,31,'[gpu:kernel:bn_fw / gemm …]','gpu'],
+ ['f9',10,0,34.6,'[gpu:kernel:sm86_xmma_fprop_implicit_gemm_…]','gpu'],
+ ['f11',10,34.6,5.4,'[gpu:kernel:nchwToNhwcKernel]','gpu',0,1],
+ ['f12',10,40,0.8,'winograd','gpu'],
+ ['f13',10,40.8,0.2,'off','gpu'],
+];
+const fillVar={root:'--fill-root',app:'--fill-app',vendor:'--fill-vendor',shim:'--fill-shim',boundary:'--fill-boundary',gpu:'--fill-gpu'};
+const catName={root:'other',app:'application',vendor:'GPU runtime / driver',shim:'perf-agent',boundary:'boundary',gpu:'GPU kernel'};
+const byId={};
+function draw(el,data,rowH,colorFn){
+  data.forEach(d=>{
+    const [id,dep,x,w,lab,cat,ex,ha]=d;
+    const e=document.createElement('div');
+    e.className='fr'+(ha?' hatch':'');
+    e.style.left=x+'%';e.style.width='calc('+w+'% - 1px)';e.style.top=(dep*(rowH+2))+'px';e.style.height=rowH+'px';e.style.lineHeight=rowH+'px';
+    e.style.backgroundColor=colorFn?colorFn(d):'var('+fillVar[cat]+')';
+    e.innerHTML=(ex?'<span class="star">✦</span>':'')+lab.replace(/</g,'&lt;');
+    e.title=id+' · '+lab;
+    el.appendChild(e);
+    if(!colorFn){byId[id]={el:e,d};e.onclick=()=>{ if(id==='f4'){select(id);} else {toast.textContent='Mock: solo f4 tiene detalle; en el real los facts y el texto cambian junto con el frame';toast.classList.add('on');setTimeout(()=>toast.classList.remove('on'),2200);} };}
+  });
+}
+const toast=document.getElementById('toast');
+draw(document.getElementById('fg'),F,24);
+
+// parents chain for the causal path of f9
+const chain=['f0','f1','f2','f3','f4','f5','f6','f10','f7','f8','f9'];
+function renderPath(sel){
+  const ul=document.getElementById('cpath');ul.innerHTML='';
+  chain.forEach(id=>{const d=byId[id].d;const li=document.createElement('li');
+    if(id===sel)li.className='hl';
+    li.innerHTML='<i class="sw" style="background:var('+fillVar[d[5]]+')"></i>'+id+' '+d[4].replace(/</g,'&lt;')+'<span class="c">'+catName[d[5]]+'</span>';
+    ul.appendChild(li);});
+}
+function select(id){
+  Object.values(byId).forEach(o=>o.el.classList.remove('sel','cite'));
+  byId[id].el.classList.add('sel');
+  document.getElementById('nm').textContent=byId[id].d[4];
+  renderPath(id);
+}
+function cite(id){
+  Object.values(byId).forEach(o=>o.el.classList.remove('cite'));
+  if(byId[id]){byId[id].el.classList.add('cite');byId[id].el.scrollIntoView({block:'nearest'});}
+}
+select('f4');
+document.querySelectorAll('.cite-chip').forEach(c=>c.onclick=()=>cite(c.dataset.f));
+document.querySelectorAll('.exrow').forEach(r=>r.onclick=()=>byId[r.dataset.f].el.click());
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
+  const q='perf-agent: en pytorch_resnet50-gpu.pb.gz (capture 7f3a…), '+c.dataset.q;
+  try{navigator.clipboard.writeText(q);}catch(e){}
+  toast.textContent='Copiado: '+q;toast.classList.add('on');setTimeout(()=>toast.classList.remove('on'),2200);
+});
+
+// --- diff flame graph: colour by change
+const D=[
+ ['d0',0,0,100,'all (598.1 ms, −13.2%)','root',-13],
+ ['d1',1,0,90,'python3.12','app',-14],
+ ['d2',1,90,10,'[gpu:launch unsampled]','boundary',0],
+ ['d3',2,0,58,'train_step','app',-16],
+ ['d4',2,58,32,'eval_step','app',-9],
+ ['d5',3,0,38.4,'Conv2d::forward','app',-19],
+ ['d6',3,38.4,19.6,'add_relu','app',0],
+ ['d7',3,58,17,'BatchNorm2d::forward','app',2.5],
+ ['d8',3,75,15,'Linear::forward','app',0],
+ ['d9',4,0,37.6,'[gpu:kernel:sm86_xmma_fprop…nhwc]','gpu',-6],
+ ['d10',4,37.6,0.8,'winograd','gpu',0],
+ ['d11',4,38.4,19.6,'[gpu:kernel:elementwise]','gpu',0],
+ ['d12',4,58,32,'[gpu:kernel:bn / gemm]','gpu',1],
+ ['d13',4,38.4,0,'','gpu',0],
+ ['d14',4,37.6,0.001,'','gpu',-100],
+];
+function diffColor(d){const v=d[6]||0;if(Math.abs(v)<1)return '#ececec';
+  const t=Math.min(1,Math.abs(v)/25);return v<0?`hsl(215 70% ${92-t*35}%)`:`hsl(2 75% ${92-t*30}%)`;}
+draw(document.getElementById('dfg'),D,22,diffColor);
+</script>
+</body>
+</html>

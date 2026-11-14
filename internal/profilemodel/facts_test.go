@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -433,8 +432,14 @@ func TestPathFactsJSONKeys(t *testing.T) {
 	if err := json.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(back, pf) {
-		t.Fatalf("round trip\n got %+v\nwant %+v", back, pf)
+	// The unexported rounding policy and exact ratio are not on the wire, so
+	// the round trip is judged on the JSON it produces.
+	again, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(b) {
+		t.Fatalf("round trip\n got %s\nwant %s", again, b)
 	}
 
 	root, err := v.Facts(v.Root.ID, nil)

@@ -5,6 +5,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
+	"github.com/dpsoft/perf-agent/internal/sourceroot"
 )
 
 // Limits bound what a server accepts and answers. A server copies them at
@@ -16,7 +17,7 @@ import (
 // so a Limits that sets only some of the server's own fields still loads
 // profiles and checks explanations. MaxRows, MaxCachedDiffs, MaxDiffRows,
 // MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews and
-// MaxHistoryBytes are filled in when zero. Any other non-positive field is refused.
+// MaxHistoryBytes and Source are filled in when zero. Any other non-positive field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -54,6 +55,9 @@ type Limits struct {
 	// keeps; beyond it the least recently used views are evicted, and
 	// their rejected count kept for the page.
 	MaxHistoryBytes int
+	// Source bounds the source files, manifests and git probes of the
+	// source tool.
+	Source sourceroot.Limits
 }
 
 // defaultMaxRows is the MaxRows a server runs with unless told otherwise.
@@ -91,6 +95,7 @@ func DefaultLimits() Limits {
 		MaxAttemptsPerView: defaultMaxAttemptsPerView,
 		MaxAttemptViews:    defaultMaxAttemptViews,
 		MaxHistoryBytes:    defaultMaxHistoryBytes,
+		Source:             sourceroot.DefaultLimits(),
 	}
 }
 
@@ -128,6 +133,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.MaxHistoryBytes == 0 {
 		l.MaxHistoryBytes = defaultMaxHistoryBytes
+	}
+	if l.Source == (sourceroot.Limits{}) {
+		l.Source = sourceroot.DefaultLimits()
 	}
 	return l
 }

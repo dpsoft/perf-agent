@@ -125,9 +125,7 @@ func (s *Server) handleOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	for i, st := range p.Source.SampleType {
 		out.Views = append(out.Views, viewInfo{View: names[i], SampleType: st.Type, Unit: st.Unit, Index: wireInt(int64(i))})
 	}
-	for _, r := range s.sources {
-		out.Capabilities.SourceRoots = append(out.Capabilities.SourceRoots, r.Name())
-	}
+	out.Capabilities.SourceRoots = append(out.Capabilities.SourceRoots, s.src.Dirs()...)
 	if s.output != nil {
 		out.Capabilities.Render = renderCapability{Enabled: true, OutputRoot: s.output.Name()}
 	}

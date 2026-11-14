@@ -10,10 +10,10 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
-	"slices"
 	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
+	"github.com/dpsoft/perf-agent/internal/sourceroot"
 )
 
 // Server is the perf-agent MCP server. It handles one request at a time,
@@ -23,15 +23,13 @@ type Server struct {
 	lim Limits
 	log *slog.Logger
 
-	// profiles is the profiles root; sources are the source roots and
-	// output is the output root, nil when rendering is disabled. Every name
-	// is the absolute directory.
+	// profiles is the profiles root and output the output root, nil when
+	// rendering is disabled; each name is the absolute directory. src is
+	// the source roots with the evidence the source tool reports; it holds
+	// no directory when none was given.
 	profiles *os.Root
-	sources  []*os.Root
+	src      *sourceroot.Roots
 	output   *os.Root
-	// manifests and sourceGit configure source evidence.
-	manifests []string
-	sourceGit bool
 
 	store *store
 	// diffs caches computed diffs; it belongs to this server alone.
@@ -61,12 +59,10 @@ func New(cfg Config) (_ *Server, err error) {
 		return nil, err
 	}
 	s := &Server{
-		lim:       lim,
-		log:       cfg.Log,
-		manifests: slices.Clone(cfg.SourceManifests),
-		sourceGit: cfg.SourceGit,
-		attempts:  newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews, lim.MaxHistoryBytes),
-		link:      (*os.Root).Link,
+		lim:      lim,
+		log:      cfg.Log,
+		attempts: newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews, lim.MaxHistoryBytes),
+		link:     (*os.Root).Link,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -79,12 +75,8 @@ func New(cfg Config) (_ *Server, err error) {
 	if s.profiles, err = openRoot(rootProfiles, cfg.ProfilesDir); err != nil {
 		return nil, err
 	}
-	for _, dir := range cfg.SourceDirs {
-		r, err := openRoot(rootSource, dir)
-		if err != nil {
-			return nil, err
-		}
-		s.sources = append(s.sources, r)
+	if s.src, err = openSources(cfg, lim.Source); err != nil {
+		return nil, err
 	}
 	if cfg.OutputDir != "" {
 		if s.output, err = openRoot(rootOutput, cfg.OutputDir); err != nil {
@@ -110,17 +102,20 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 // Close closes the server's roots.
 func (s *Server) Close() error {
 	var errs []error
-	for _, r := range append([]*os.Root{s.profiles, s.output}, s.sources...) {
+	for _, r := range []*os.Root{s.profiles, s.output} {
 		if r != nil {
 			errs = append(errs, r.Close())
 		}
+	}
+	if s.src != nil {
+		errs = append(errs, s.src.Close())
 	}
 	return errors.Join(errs...)
 }
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
-	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.renderTool()}
+	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.

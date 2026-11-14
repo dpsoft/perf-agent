@@ -129,7 +129,7 @@ func (s *Server) refuseExisting(name string) error {
 		return openError(rootOutput, root.Name(), "out", name, err)
 	case fi.Mode()&fs.ModeSymlink != 0:
 		return fmt.Errorf("out %s under the output root %s is a symbolic link; refusing to write through it; choose a new file name", echo(name), root.Name())
-	case slices.ContainsFunc(s.store.inputs, func(in os.FileInfo) bool { return os.SameFile(in, fi) }):
+	case s.isInput(fi):
 		return fmt.Errorf("refusing to overwrite input %s: out %s under the output root %s is a file this server read; choose a new file name",
 			echo(name), echo(name), root.Name())
 	}
@@ -170,4 +170,11 @@ func writeTemp(root *os.Root, dir, base string, page []byte) (string, error) {
 		return tmp, nil
 	}
 	return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: every name tried exists", echo(dir), root.Name())
+}
+
+// isInput reports whether fi is a file this server has read: a profile, an
+// executions log or a source file.
+func (s *Server) isInput(fi os.FileInfo) bool {
+	same := func(in os.FileInfo) bool { return os.SameFile(in, fi) }
+	return slices.ContainsFunc(s.store.inputs, same) || slices.ContainsFunc(s.src.Opened(), same)
 }

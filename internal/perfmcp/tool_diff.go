@@ -32,6 +32,7 @@ const diffSchema = `{
 const diffDescription = "Compare two views of the same sample type as a flat list of union nodes (id, parent id, depth), " +
 	"the largest absolute change first, paged with limit and cursor. A node on one side only stays in the list. " +
 	"The header carries both totals, both qualities, the quality warnings, the GPU sampling notes and whether per-unit deltas are possible. " +
+	"Presence is structural; a node's absence on one side alone never proves its cost was eliminated: read interpretation and why. " +
 	"omitted_weight sums the omitted rows' absolute deltas; rows overlap, so it is never a remaining share."
 
 // defaultDiffLimit is the page size of diff when limit is omitted.
@@ -106,21 +107,18 @@ type diffResult struct {
 	pageInfo
 }
 
-// diffHeader is what a cached diff keeps besides its sorted nodes.
-type diffHeader struct {
-	profilemodel.FlatDiff
-}
-
 // diffCache is a per-server LRU of flat diffs, rows sorted for paging.
 type diffCache struct {
 	max   int
-	m     map[string]*diffHeader
+	m     map[string]*profilemodel.FlatDiff
 	order []string // least recently used first
 }
 
-func newDiffCache(max int) *diffCache { return &diffCache{max: max, m: map[string]*diffHeader{}} }
+func newDiffCache(max int) *diffCache {
+	return &diffCache{max: max, m: map[string]*profilemodel.FlatDiff{}}
+}
 
-func (c *diffCache) get(key string) (*diffHeader, bool) {
+func (c *diffCache) get(key string) (*profilemodel.FlatDiff, bool) {
 	d, ok := c.m[key]
 	if ok {
 		if i := slices.Index(c.order, key); i >= 0 {
@@ -130,7 +128,7 @@ func (c *diffCache) get(key string) (*diffHeader, bool) {
 	return d, ok
 }
 
-func (c *diffCache) put(key string, d *diffHeader) {
+func (c *diffCache) put(key string, d *profilemodel.FlatDiff) {
 	c.m[key] = d
 	c.order = append(c.order, key)
 	for len(c.order) > c.max {
@@ -210,9 +208,10 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 				a.BaseView, a.BaseHandle, a.NewView, a.NewHandle, err)
 		}
 		if err != nil {
-			return mcpstdio.Result{}, fmt.Errorf("cannot diff the views: %v", err)
+			return mcpstdio.Result{}, fmt.Errorf("cannot diff the views: %v; call open again for both profiles and retry, and report this if it repeats", err)
 		}
-		d = &diffHeader{FlatDiff: full.Flatten()}
+		flat := full.Flatten()
+		d = &flat
 		sortFlat(d.Nodes)
 		s.diffs.put(key, d)
 	}

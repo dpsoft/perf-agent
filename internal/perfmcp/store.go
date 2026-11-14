@@ -19,7 +19,8 @@ type entry struct {
 	name   string // the profile's path relative to the profiles root, as first opened
 	views  map[string]*profilemodel.View
 	opened []os.FileInfo
-	// sorted caches the sorted rows of top per view, rows and ordering.
+	// sorted caches the sorted rows of top per view, rows and ordering, and
+	// holds the last sandwich computed.
 	sorted map[string]any
 }
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
 type qDiffRow struct {
@@ -27,13 +28,15 @@ type qDiffRow struct {
 }
 
 type qDiff struct {
-	BaseHandle string `json:"base_handle"`
-	NewHandle  string `json:"new_handle"`
-	View       string `json:"view"`
-	SampleType string `json:"sample_type"`
-	Unit       string `json:"unit"`
-	BaseTotal  string `json:"base_total"`
-	NewTotal   string `json:"new_total"`
+	BaseHandle string   `json:"base_handle"`
+	NewHandle  string   `json:"new_handle"`
+	View       string   `json:"view"`
+	SampleType string   `json:"sample_type"`
+	Unit       string   `json:"unit"`
+	BaseTotal  string   `json:"base_total"`
+	NewTotal   string   `json:"new_total"`
+	BaseNotes  []string `json:"base_notes"`
+	NewNotes   []string `json:"new_notes"`
 	PerUnit    struct {
 		OK     bool   `json:"ok"`
 		Reason string `json:"reason"`
@@ -235,5 +238,32 @@ func TestDiffCacheIsPerServerAndBounded(t *testing.T) {
 	q := openPair(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
 	if len(q.c.srv.diffs.m) != 0 {
 		t.Error("a new server starts with cached diffs")
+	}
+}
+
+func TestDiffCarriesEachSidesSamplingNotes(t *testing.T) {
+	g := openPair(t, pmfixture.GPUBasic(), pmfixture.GPUBasic())
+	out, _ := g.diff(t, nil)
+	for side, o := range map[string]opened{"base": g.base, "new": g.new} {
+		_, v, err := g.c.srv.store.view(profilemodel.Handle(o.handle), o.view)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := v.Notes()
+		if err != nil || len(want) == 0 {
+			t.Fatalf("%s notes = %v, %v", side, want, err)
+		}
+		got := out.BaseNotes
+		if side == "new" {
+			got = out.NewNotes
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s_notes = %v, want %v", side, got, want)
+		}
+	}
+	c := openPair(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	cout, _ := c.diff(t, nil)
+	if len(cout.BaseNotes) != 0 || len(cout.NewNotes) != 0 {
+		t.Errorf("CPU diff notes = %v %v", cout.BaseNotes, cout.NewNotes)
 	}
 }

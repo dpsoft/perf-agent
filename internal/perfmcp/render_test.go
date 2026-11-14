@@ -217,7 +217,7 @@ func TestAttemptsAreBoundToProfileAndView(t *testing.T) {
 }
 
 func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
-	a := newAttempts(2, 256)
+	a := newAttempts(2, 256, 4<<20)
 	h := &profilemodel.Profile{}
 	a.add(h, "v", "", outcomeRejected, nil)
 	a.add(h, "v", "a1", outcomeRejected, nil)
@@ -245,7 +245,7 @@ func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 }
 
 func TestAttemptViewsAreBoundedAndKeepTheirRejectedCount(t *testing.T) {
-	a := newAttempts(2, 1)
+	a := newAttempts(2, 1, 4<<20)
 	h := &profilemodel.Profile{}
 	a.add(h, "v", "", outcomeRejected, nil)
 	a.add(h, "v", "", outcomeRejected, nil)
@@ -933,7 +933,7 @@ func TestAttemptEvidenceNamesTheHandle(t *testing.T) {
 		{profilemodel.Handle(pd + "+unread:sidecar-exceeds-limits:0123456789abcdef"), profilemodel.Availability{Reason: profilemodel.ReasonSidecarLimits},
 			"made with handle abababababab…+unread:sidecar-exceeds-limits:0123456789abcdef: opened with an executions log that was not used (sidecar exceeds limits)"},
 	} {
-		a := newAttempts(2, 2)
+		a := newAttempts(2, 2, 4<<20)
 		a.add(&profilemodel.Profile{Handle: tc.h, Executions: tc.ex}, "v", "", outcomeRejected, nil)
 		rej, _, _ := a.rejected(&profilemodel.Profile{Handle: "other"}, "v")
 		if len(rej) != 1 || rej[0].Evidence != tc.want {
@@ -942,5 +942,129 @@ func TestAttemptEvidenceNamesTheHandle(t *testing.T) {
 		if rej, _, _ := a.rejected(&profilemodel.Profile{Handle: tc.h}, "v"); len(rej) != 1 || rej[0].Evidence != "" {
 			t.Errorf("%s on its own handle: %+v", tc.h, rej)
 		}
+	}
+}
+
+func TestAProfileWithLongMetadataIsRefused(t *testing.T) {
+	cfg := testConfig(t)
+	writeFixture(t, cfg.ProfilesDir, "long.pb.gz", pmfixture.Build("cpu", strings.Repeat("u", 64<<10), nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main")}, Value: 1}))
+	c := newTestServer(t, cfg)
+	if text, isErr := c.call("open", map[string]any{"path": "long.pb.gz"}); !isErr || !strings.Contains(text, "MaxMetaBytes") || len(text) > 1000 {
+		t.Errorf("isError=%v %.300s", isErr, text)
+	}
+}
+
+// keptBytes is the string bytes of every failure the record keeps.
+func keptBytes(a *attempts) int {
+	n := 0
+	for _, at := range a.byID {
+		for _, f := range at.failures.kept {
+			n += failureBytes(f)
+		}
+	}
+	return n
+}
+
+func TestLargeFailuresAreCountedNotKept(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OutputDir = t.TempDir()
+	cfg.Limits.Model.MaxMetaBytes = 128 << 10 // let a 64 KiB unit in, as an older bound did
+	writeFixture(t, cfg.ProfilesDir, "long.pb.gz", pmfixture.Build("cpu", strings.Repeat("u", 64<<10), nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main")}, Value: 1}))
+	c := newTestServer(t, cfg)
+	var op openOut
+	c.callOK("open", map[string]any{"path": "long.pb.gz"}, &op)
+	o := opened{c: c, handle: op.Handle, view: op.DefaultView}
+	node := o.nodeID(t, "main")
+	claims := make([]any, 32)
+	for i := range claims {
+		claims[i] = map[string]any{"id": fmt.Sprintf("c%d", i), "metric": "cumulative", "unit": "wrong", "value": 1}
+	}
+	args := o.args(map[string]any{"out": "x.html", "explanations": []any{map[string]any{"node": node, "claims": claims}}})
+	for range 8 {
+		if text, isErr := c.call("render_flamegraph", args); !isErr || strings.Contains(text, `"status":"written"`) {
+			t.Fatalf("wrong unit passed: %.300s", text)
+		}
+	}
+	if n := keptBytes(c.srv.attempts); n > 64<<10 {
+		t.Errorf("8 rejections of a 64 KiB unit keep %d bytes of failures", n)
+	}
+	var res renderOut
+	text := c.callOK("render_flamegraph", o.args(map[string]any{"out": "after.html", "explanations": []any{}}), &res)
+	if res.Status != "written" {
+		t.Fatalf("a valid render after the rejections: %.400s", text)
+	}
+	sec := rejectedSection(t, res.Path)
+	if !strings.Contains(sec, "256 claims rejected at render in 8 attempts") || strings.Count(sec, "32 failures too large to keep") != 8 {
+		t.Errorf("rejected section: %.1500s", sec[strings.Index(sec, "<h5>Rejected"):])
+	}
+}
+
+func TestStoredFailuresLeaveOutLargeOnes(t *testing.T) {
+	big := strings.Repeat("m", 1000)
+	fs := []explain.Failure{
+		{Code: explain.CodeValueMismatch, Claim: "c1", Message: big},
+		{Code: explain.CodeValueMismatch, Claim: "c2", Message: "short", Engine: &explain.EngineValue{Unit: strings.Repeat("u", 1100)}},
+		{Code: explain.CodeUnresolvedNodeRef, Ref: "{n:x}", Message: big + big},
+		{Code: explain.CodeValueMismatch, Claim: "c3", Message: "short"},
+	}
+	r := storedFailures(fs)
+	if len(r.kept) != 2 || r.kept[0].Claim != "c1" || r.kept[1].Claim != "c3" || r.tooLarge != 2 || r.omitted != 0 ||
+		r.omittedClaims != 1 || r.omittedRefs != 1 {
+		t.Errorf("%+v", r)
+	}
+}
+
+func TestHistoryBytesAreBounded(t *testing.T) {
+	msg := strings.Repeat("m", 900)
+	two := []explain.Failure{{Code: explain.CodeValueMismatch, Claim: "c1", Message: msg}, {Code: explain.CodeValueMismatch, Claim: "c2", Message: msg}}
+	h := &profilemodel.Profile{}
+	a := newAttempts(20, 64, 10_000)
+	for i := range 20 {
+		a.add(h, fmt.Sprint("v", i), "", outcomeRejected, two)
+		if a.bytes > 10_000 {
+			t.Fatalf("after %d views the record holds %d bytes", i+1, a.bytes)
+		}
+	}
+	if rej, dropped, incomplete := a.rejected(h, "v0"); len(rej) != 0 || dropped != 1 || incomplete {
+		t.Errorf("v0: %d kept, dropped %d, incomplete %v", len(rej), dropped, incomplete)
+	}
+	if rej, _, _ := a.rejected(h, "v19"); len(rej) != 1 {
+		t.Errorf("v19: %d kept", len(rej))
+	}
+	// One view alone over the budget keeps its newest rejections and counts the rest.
+	a = newAttempts(20, 64, 5_000)
+	for range 5 {
+		a.add(h, "v", "", outcomeRejected, two)
+	}
+	rej, dropped, _ := a.rejected(h, "v")
+	if a.bytes > 5_000 || len(rej) == 0 || len(rej)+dropped != 5 || rej[len(rej)-1].Attempt != "a5" {
+		t.Errorf("%d bytes, %d kept, dropped %d", a.bytes, len(rej), dropped)
+	}
+	if d := DefaultLimits(); d.MaxHistoryBytes != 4<<20 {
+		t.Errorf("MaxHistoryBytes default %d", d.MaxHistoryBytes)
+	}
+}
+
+func TestHistoryNeverMakesAValidRenderFail(t *testing.T) {
+	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxPageBytes = 64 << 10 })
+	b := o.nodeID(t, "b")
+	claims := make([]any, 32)
+	for i := range claims {
+		claims[i] = map[string]any{"id": fmt.Sprintf("c%d", i+1), "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": json.RawMessage("0.62")}
+	}
+	for range 20 {
+		if _, text, isErr := o.render(t, map[string]any{"explanations": []any{map[string]any{"node": b, "claims": claims, "prose": "x"}}, "out": "x.html"}); !isErr {
+			t.Fatalf("passed: %.300s", text)
+		}
+	}
+	out, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html"})
+	if isErr {
+		t.Fatalf("a valid render after 20 rejections: %.400s", text)
+	}
+	page := readFile(t, out.Path)
+	if len(page) > 64<<10 || !bytes.Contains(page, []byte("640 claims rejected at render in 20 attempts")) || !bytes.Contains(page, []byte("beyond the page&#39;s size budget are not listed")) {
+		t.Errorf("%d-byte page: %.300s", len(page), text)
 	}
 }

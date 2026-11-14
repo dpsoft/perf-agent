@@ -15,9 +15,8 @@ import (
 // profilemodel.DefaultLimits and a zero Explain is explain.DefaultLimits,
 // so a Limits that sets only some of the server's own fields still loads
 // profiles and checks explanations. MaxRows, MaxCachedDiffs, MaxDiffRows,
-// MaxPageBytes, MaxPageNodes, MaxAttemptsPerView and MaxAttemptViews are
-// filled in when
-// zero. Any other non-positive field is refused.
+// MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews and
+// MaxHistoryBytes are filled in when zero. Any other non-positive field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -51,6 +50,10 @@ type Limits struct {
 	// record; one more evicts the least recently used, whose rejected
 	// count is kept for the page.
 	MaxAttemptViews int
+	// MaxHistoryBytes bounds the bytes of every attempt record the server
+	// keeps; beyond it the least recently used views are evicted, and
+	// their rejected count kept for the page.
+	MaxHistoryBytes int
 }
 
 // defaultMaxRows is the MaxRows a server runs with unless told otherwise.
@@ -68,6 +71,7 @@ const (
 	defaultMaxPageNodes       = 20000
 	defaultMaxAttemptsPerView = 20
 	defaultMaxAttemptViews    = 64
+	defaultMaxHistoryBytes    = 4 << 20
 )
 
 // DefaultLimits are the limits a server runs with unless told otherwise.
@@ -86,6 +90,7 @@ func DefaultLimits() Limits {
 		MaxPageNodes:       defaultMaxPageNodes,
 		MaxAttemptsPerView: defaultMaxAttemptsPerView,
 		MaxAttemptViews:    defaultMaxAttemptViews,
+		MaxHistoryBytes:    defaultMaxHistoryBytes,
 	}
 }
 
@@ -121,6 +126,9 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxAttemptViews == 0 {
 		l.MaxAttemptViews = defaultMaxAttemptViews
 	}
+	if l.MaxHistoryBytes == 0 {
+		l.MaxHistoryBytes = defaultMaxHistoryBytes
+	}
 	return l
 }
 
@@ -140,6 +148,7 @@ func (l Limits) validate() error {
 		{"MaxPageNodes", l.MaxPageNodes},
 		{"MaxAttemptsPerView", l.MaxAttemptsPerView},
 		{"MaxAttemptViews", l.MaxAttemptViews},
+		{"MaxHistoryBytes", l.MaxHistoryBytes},
 		{"Explain.MaxExplanations", l.Explain.MaxExplanations},
 		{"Explain.MaxClaimsPerExplanation", l.Explain.MaxClaimsPerExplanation},
 		{"Explain.MaxClaimsTotal", l.Explain.MaxClaimsTotal},

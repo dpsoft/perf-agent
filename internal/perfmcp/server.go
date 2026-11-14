@@ -65,7 +65,7 @@ func New(cfg Config) (_ *Server, err error) {
 		log:       cfg.Log,
 		manifests: slices.Clone(cfg.SourceManifests),
 		sourceGit: cfg.SourceGit,
-		attempts:  newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews),
+		attempts:  newAttempts(lim.MaxAttemptsPerView, lim.MaxAttemptViews, lim.MaxHistoryBytes),
 		link:      (*os.Root).Link,
 	}
 	if s.log == nil {

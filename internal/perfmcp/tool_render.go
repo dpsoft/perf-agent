@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
@@ -129,10 +130,18 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	r := explain.Check(v, exps, s.lim.Explain)
 	if !r.OK {
 		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeRejected, r.Failures)
-		if omitted := len(r.Failures) - maxStoredFailures; omitted > 0 {
+		if omitted, tooLarge := leftOut(r.Failures); omitted+tooLarge > 0 {
+			var says []string
+			if omitted > 0 {
+				says = append(says, fmt.Sprintf("\"and %d more failures\"", omitted))
+			}
+			if tooLarge > 0 {
+				says = append(says, fmt.Sprintf("\"%d failures too large to keep\"", tooLarge))
+			}
 			notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
-				"this result lists all %d failures; the server's record of %s keeps %d of them (claims first, then references, then limits), "+
-					"so a later page lists those and says \"and %d more failures\"", len(r.Failures), id, maxStoredFailures, omitted)})
+				"this result lists all %d failures; the server's record of %s keeps at most %d of them (claims first, then references, then limits) "+
+					"and none whose text exceeds %d bytes, so a later page lists those and says %s",
+				len(r.Failures), id, maxStoredFailures, maxFailureBytes, strings.Join(says, " and "))})
 		}
 		res, err := s.respond("render_flamegraph", shrinkRejected, renderRejected{
 			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices,

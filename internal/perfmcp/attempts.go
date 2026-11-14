@@ -29,6 +29,8 @@ type attempt struct {
 	retryOf    string
 	outcome    string
 	failures   storedRecord
+	// size is what the attempt counts against the record's byte budget.
+	size int
 }
 
 // viewKey names a view of a profile by the profile's digest, not by the
@@ -75,10 +77,14 @@ const countsPerView = 4
 // views keep a record, least recently used evicted first; an evicted
 // view's rejected count is kept in counts, at most countsPerView*maxViews
 // of them. Once a count could not be kept, a view without a record may
-// have lost one, and its pages say so. It belongs to one Server and takes
+// have lost one, and its pages say so. The attempts kept hold at most
+// maxBytes in all, by attemptSize: beyond it the least recently used views
+// are evicted into counts, and a view alone over it drops its oldest
+// attempts, counting the rejected ones. It belongs to one Server and takes
 // no locks.
 type attempts struct {
 	max, maxViews int
+	maxBytes      int
 	next          int
 	byID          map[string]*attempt
 	views         map[viewKey]*viewAttempts
@@ -87,11 +93,13 @@ type attempts struct {
 	counts map[viewKey]viewCount
 	// lost is set once an evicted view's count could not be kept.
 	lost bool
+	// bytes is the attemptSize of every attempt kept.
+	bytes int
 }
 
-func newAttempts(max, maxViews int) *attempts {
+func newAttempts(max, maxViews, maxBytes int) *attempts {
 	return &attempts{
-		max: max, maxViews: maxViews,
+		max: max, maxViews: maxViews, maxBytes: maxBytes,
 		byID: map[string]*attempt{}, views: map[viewKey]*viewAttempts{}, counts: map[viewKey]viewCount{},
 	}
 }
@@ -104,14 +112,45 @@ func (a *attempts) add(p *profilemodel.Profile, view, retryOf, outcome string, f
 	k := viewKey{p.Digest, view}
 	at := &attempt{id: "a" + strconv.Itoa(a.next), key: k, handle: p.Handle, executions: p.Executions,
 		retryOf: retryOf, outcome: outcome, failures: storedFailures(failures)}
+	at.size = attemptSize(at)
 	va := a.record(k)
 	a.byID[at.id] = at
+	a.bytes += at.size
 	if outcome == outcomeRejected {
 		va.dropped += a.keep(&va.rejected, at)
 	} else {
 		a.keep(&va.others, at)
 	}
+	a.fit(va)
 	return at.id
+}
+
+// fit brings the record within maxBytes: it evicts the least recently used
+// views other than va's, then drops va's oldest other attempts and then
+// its oldest rejected ones, which it counts.
+func (a *attempts) fit(va *viewAttempts) {
+	for a.bytes > a.maxBytes {
+		switch {
+		case len(a.order) > 1:
+			a.evict(a.order[0])
+			a.order = slices.Delete(a.order, 0, 1)
+		case len(va.others) > 0:
+			a.forget(va.others[0])
+			va.others = slices.Delete(va.others, 0, 1)
+		case len(va.rejected) > 0:
+			a.forget(va.rejected[0])
+			va.rejected = slices.Delete(va.rejected, 0, 1)
+			va.dropped++
+		default:
+			return
+		}
+	}
+}
+
+// forget removes at from the attempts kept.
+func (a *attempts) forget(at *attempt) {
+	delete(a.byID, at.id)
+	a.bytes -= at.size
 }
 
 // record returns k's record, most recently used now, creating it from k's
@@ -143,7 +182,7 @@ func (a *attempts) evict(k viewKey) {
 	va := a.views[k]
 	delete(a.views, k)
 	for _, at := range slices.Concat(va.rejected, va.others) {
-		delete(a.byID, at.id)
+		a.forget(at)
 	}
 	c := viewCount{rejected: len(va.rejected) + va.dropped, incomplete: va.incomplete}
 	switch {
@@ -161,7 +200,7 @@ func (a *attempts) keep(list *[]*attempt, at *attempt) int {
 	*list = append(*list, at)
 	n := 0
 	for len(*list) > a.max {
-		delete(a.byID, (*list)[0].id)
+		a.forget((*list)[0])
 		*list = slices.Delete(*list, 0, 1)
 		n++
 	}
@@ -191,7 +230,7 @@ func (a *attempts) rejected(p *profilemodel.Profile, view string) ([]explain.Rej
 	for _, at := range va.rejected {
 		f := at.failures
 		ra := explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: f.kept,
-			Omitted: f.omitted, OmittedClaims: f.omittedClaims, OmittedReferences: f.omittedRefs}
+			Omitted: f.omitted, TooLarge: f.tooLarge, OmittedClaims: f.omittedClaims, OmittedReferences: f.omittedRefs}
 		if at.handle != p.Handle {
 			ra.Evidence = "made with handle " + shortHandle(at.handle) + ": " + describeExecutions(at.executions)
 		}
@@ -253,19 +292,67 @@ func describeExecutions(ex profilemodel.Availability) string {
 // attempt; the rest are counted.
 const maxStoredFailures = 32
 
+// maxFailureBytes is the most string bytes one kept failure may hold. A
+// larger one is counted, not kept: cutting it would record a different
+// value than the one the agent was told.
+const maxFailureBytes = 1 << 10
+
+// What an attempt and a kept failure count against the record's byte
+// budget besides their strings.
+const (
+	attemptOverhead = 256
+	failureOverhead = 256
+)
+
 // storedRecord is what the record keeps of one attempt's failures: at most
-// maxStoredFailures of them, how many it left out and, of those, how many
+// maxStoredFailures of them; how many it left out over that number and how
+// many because they were too large; and, of all those left out, how many
 // distinct claims and references no kept failure names.
 type storedRecord struct {
-	kept                                []explain.Failure
-	omitted, omittedClaims, omittedRefs int
+	kept                       []explain.Failure
+	omitted, tooLarge          int
+	omittedClaims, omittedRefs int
 }
 
-// storedFailures is what the record keeps of fs: claim failures first, then
-// reference failures, then limits, each in fs's order, up to
-// maxStoredFailures, with the rest counted. Every kept string is a copy,
-// so the record never holds the agent's prose or arguments a failure's
-// text was cut from.
+// failureBytes is the bytes of f's strings.
+func failureBytes(f explain.Failure) int {
+	n := len(f.Claim) + len(f.Ref) + len(f.Code) + len(f.Message) + len(f.Agent)
+	if e := f.Engine; e != nil {
+		n += len(e.Metric) + len(e.Scope) + len(e.Node) + len(e.Denominator) + len(e.Unit) + len(e.Value) +
+			len(e.Rounding) + len(e.Status) + len(e.Reason)
+		if e.Module != nil {
+			n += len(*e.Module)
+		}
+	}
+	return n
+}
+
+// attemptSize is what at counts against the record's byte budget.
+func attemptSize(at *attempt) int {
+	n := attemptOverhead
+	for _, f := range at.failures.kept {
+		n += failureOverhead + failureBytes(f)
+	}
+	return n
+}
+
+// leftOut is how many failures of fs the record leaves out: over
+// maxStoredFailures, and too large to keep.
+func leftOut(fs []explain.Failure) (omitted, tooLarge int) {
+	for _, f := range fs {
+		if failureBytes(f) > maxFailureBytes {
+			tooLarge++
+		}
+	}
+	return max(len(fs)-tooLarge-maxStoredFailures, 0), tooLarge
+}
+
+// storedFailures is what the record keeps of fs: of the failures with at
+// most maxFailureBytes of strings, claim failures first, then reference
+// failures, then limits, each in fs's order, up to maxStoredFailures, with
+// the rest counted, and the larger ones counted apart. Every kept string
+// is a copy, so the record never holds the agent's prose or arguments a
+// failure's text was cut from.
 func storedFailures(fs []explain.Failure) storedRecord {
 	rank := func(f explain.Failure) int {
 		switch {
@@ -276,16 +363,23 @@ func storedFailures(fs []explain.Failure) storedRecord {
 		}
 		return 1
 	}
-	sorted := slices.Clone(fs)
-	slices.SortStableFunc(sorted, func(x, y explain.Failure) int { return rank(x) - rank(y) })
-	n := min(len(sorted), maxStoredFailures)
-	r := storedRecord{kept: make([]explain.Failure, n), omitted: len(sorted) - n}
+	var small, large []explain.Failure
+	for _, f := range fs {
+		if failureBytes(f) > maxFailureBytes {
+			large = append(large, f)
+		} else {
+			small = append(small, f)
+		}
+	}
+	slices.SortStableFunc(small, func(x, y explain.Failure) int { return rank(x) - rank(y) })
+	n := min(len(small), maxStoredFailures)
+	r := storedRecord{kept: make([]explain.Failure, n), omitted: len(small) - n, tooLarge: len(large)}
 	named := map[string]bool{}
-	for i, f := range sorted[:n] {
+	for i, f := range small[:n] {
 		r.kept[i] = cloneFailure(f)
 		named[failureKey(f)] = true
 	}
-	for _, f := range sorted[n:] {
+	for _, f := range slices.Concat(small[n:], large) {
 		k := failureKey(f)
 		if f.Code == explain.CodeLimitExceeded && f.Claim == "" || named[k] {
 			continue

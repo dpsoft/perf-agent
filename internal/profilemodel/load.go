@@ -47,10 +47,13 @@ type Limits struct {
 	// MaxRawBytes caps the file; MaxDecompressedBytes caps the inflated
 	// stream. Both are enforced before and during parsing.
 	MaxRawBytes, MaxDecompressedBytes int64
-	// MaxSamples, MaxLocations and MaxDepth are structural and checked after
-	// parsing, before any tree is built. MaxDepth applies to a sample's
-	// expanded depth: the sum over its locations of max(1, inline lines).
-	MaxSamples, MaxLocations, MaxDepth int
+	// MaxSamples, MaxLocations, MaxDepth and MaxFrames are structural and
+	// checked after parsing, before any tree is built. MaxDepth applies to
+	// a sample's expanded depth: the sum over its locations of max(1,
+	// inline lines). MaxFrames applies to the sum of every sample's
+	// expanded depth, which bounds a view's node count and the sample
+	// indices its nodes hold.
+	MaxSamples, MaxLocations, MaxDepth, MaxFrames int
 	// MaxSidecarBytes is enforced while reading the log.
 	MaxSidecarBytes int64
 	// MaxSidecarRows and MaxSidecarExecutions (distinct ordinals) are
@@ -66,6 +69,7 @@ func DefaultLimits() Limits {
 		MaxSamples:           5_000_000,
 		MaxLocations:         5_000_000,
 		MaxDepth:             8192,
+		MaxFrames:            50_000_000,
 		MaxSidecarBytes:      256 << 20,
 		MaxSidecarRows:       10_000_000,
 		MaxSidecarExecutions: 10_000_000,
@@ -227,14 +231,21 @@ func checkStructure(p *profile.Profile, lim Limits) error {
 		return limitErr("MaxLocations", lim.MaxLocations, len(p.Location))
 	}
 	// Depth is the expanded one: every inline Line of a location is a frame.
+	// Both sums compare by subtraction, so neither can wrap.
+	frames := 0
 	for _, s := range p.Sample {
 		depth := 0
 		for _, l := range s.Location {
-			depth += max(1, len(l.Line))
-			if depth > lim.MaxDepth {
+			n := max(1, len(l.Line))
+			if depth > lim.MaxDepth-n {
 				return limitErr("MaxDepth", lim.MaxDepth, ">"+fmt.Sprint(lim.MaxDepth))
 			}
+			depth += n
 		}
+		if frames > lim.MaxFrames-depth {
+			return limitErr("MaxFrames", lim.MaxFrames, ">"+fmt.Sprint(lim.MaxFrames))
+		}
+		frames += depth
 	}
 	return nil
 }

@@ -421,3 +421,32 @@ func TestMaxDepthCountsInlineFrames(t *testing.T) {
 		t.Fatalf("repeated at 15: %v", err)
 	}
 }
+
+// MaxFrames bounds the tree: every expanded frame of every sample can be a
+// node, so it is the sum of the samples' expanded depths that is capped.
+func TestMaxFramesCountsEveryExpandedFrame(t *testing.T) {
+	// twoSamples has two 2-frame stacks: 4 frames.
+	lim := DefaultLimits()
+	lim.MaxFrames = 3
+	_, err := FromBytes(twoSamples(), nil, lim)
+	if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxFrames") {
+		t.Fatalf("4 frames under 3: %v", err)
+	}
+	lim.MaxFrames = 4
+	if _, err := FromBytes(twoSamples(), nil, lim); err != nil {
+		t.Fatalf("4 frames at 4: %v", err)
+	}
+	// Inline lines are frames: 5 lines referenced 3 times is 15.
+	lim.MaxFrames = 14
+	_, err = FromBytes(inlineProfile(t, 5, 3), nil, lim)
+	if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxFrames") {
+		t.Fatalf("15 inline frames under 14: %v", err)
+	}
+	lim.MaxFrames = 15
+	if _, err := FromBytes(inlineProfile(t, 5, 3), nil, lim); err != nil {
+		t.Fatalf("15 inline frames at 15: %v", err)
+	}
+	if got := DefaultLimits().MaxFrames; got != 50_000_000 {
+		t.Fatalf("default MaxFrames %d", got)
+	}
+}

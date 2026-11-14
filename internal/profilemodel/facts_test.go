@@ -345,7 +345,7 @@ func checkFact(t *testing.T, what string, f Fact, rounding string) {
 		if set != 1 || f.Reason != "" {
 			t.Errorf("%s: %s with %d values, reason %q", what, f.Status, set, f.Reason)
 		}
-		zero := (f.Int != nil && *f.Int == 0) || (f.Ratio != nil && *f.Ratio == 0)
+		zero := (f.Int != nil && *f.Int == 0) || (f.Ratio != nil && *f.Ratio == 0) || (f.Derived != nil && *f.Derived == 0)
 		if zero != (f.Status == StatusZero) {
 			t.Errorf("%s: status %s does not match value %+v", what, f.Status, f)
 		}
@@ -375,6 +375,7 @@ func TestRoundingForIsTheEnginePolicy(t *testing.T) {
 		MetricSerializationUnknown: "exact",
 		MetricSerializationMissing: "exact",
 		MetricPerWorkDelta:         "3 significant figures",
+		MetricShareDelta:           "0.001 ratio",
 		"no-such-metric":           "",
 	} {
 		if got := RoundingFor(metric); got != want {

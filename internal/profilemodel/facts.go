@@ -58,13 +58,14 @@ const (
 	MetricSerializationUnknown = "serialization_unknown"
 	MetricSerializationMissing = "serialization_missing"
 	MetricPerWorkDelta         = "per_work_delta"
+	MetricShareDelta           = "share_delta"
 )
 
 // RoundingFor is the engine's display rounding for metric, and the only
 // tolerance a claim about that metric is checked against:
 //
 //	share_of_total, share_of_parent,
-//	quality_*                           "0.001 ratio" (0.1 percentage point)
+//	share_delta, quality_*              "0.001 ratio" (0.1 percentage point)
 //	cumulative, self, inexact_portion,
 //	unsampled_portion,
 //	serialization_true, _false,
@@ -77,7 +78,7 @@ const (
 // one must state it exactly. It returns "" for a metric it does not know.
 func RoundingFor(metric string) string {
 	switch metric {
-	case MetricShareOfTotal, MetricShareOfParent:
+	case MetricShareOfTotal, MetricShareOfParent, MetricShareDelta:
 		return "0.001 ratio"
 	case MetricQualityJoinExact, MetricQualityJoinHeuristic, MetricQualityJoinUnmatched,
 		MetricQualityAmbiguous, MetricQualityGraphRefused, MetricQualityUnsampled,

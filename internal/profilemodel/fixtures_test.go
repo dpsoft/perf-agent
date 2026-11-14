@@ -382,3 +382,237 @@ func rich(typ, unit string, samples ...rs) []byte {
 }
 
 var gpuHdr = execlog.Header{Backend: "cupti", SampleType: "gpu/nanoseconds"}
+
+// diffPair is a base and a new profile for the diff tests.
+type diffPair struct{ base, new func() []byte }
+
+// diffPairs is the registry of named base/new pairs; every one is also
+// checked against the union invariants.
+func diffPairs() map[string]diffPair {
+	app := func(buildID string, addr uint64, name string) frame {
+		return in("/usr/bin/app", buildID, addr, ln(name))
+	}
+	ser := func(v string) map[string][]string { return map[string][]string{"gpu_serialized": {v}} }
+	gpuK := func(kernel string, value int64, labels map[string][]string) fx {
+		return fx{stack: []string{"main", "[gpu:launch]", kernel}, value: value, labels: labels}
+	}
+	period := func(p, join string) map[string][]string {
+		return map[string][]string{"gpu_sample_period": {p}, "gpu_join": {join}}
+	}
+	initAt := func(file string, start int64) frame {
+		return frame{lines: []line{{name: "__init__", filename: file, startLine: start}}}
+	}
+	// degraded builds a pair whose base calls foo in libfoo and whose new
+	// profile has the same call unsymbolized in the module given.
+	degraded := func(file, buildID string) diffPair {
+		return diffPair{
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f", 0x123, ln("foo"))}, value: 50},
+					rs{stack: []frame{fn("main"), fn("work")}, value: 50},
+				)
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in(file, buildID, 0x123)}, value: 50},
+					rs{stack: []frame{fn("main"), fn("work")}, value: 50},
+				)
+			},
+		}
+	}
+	oneFoo := func() []byte {
+		return rich("cpu", "nanoseconds",
+			rs{stack: []frame{fn("main"), in("/a/libfoo.so", "x1", 0x10, ln("foo"))}, value: 10},
+		)
+	}
+	twoFoos := func() []byte {
+		return rich("cpu", "nanoseconds",
+			rs{stack: []frame{fn("main"), in("/a/libfoo.so", "y1", 0x10, ln("foo"))}, value: 5},
+			rs{stack: []frame{fn("main"), in("/b/libfoo.so", "y2", 0x10, ln("foo"))}, value: 6},
+		)
+	}
+	return map[string]diffPair{
+		// The application was rebuilt (build id a → b); libz was not.
+		"rebuilt-app-unchanged-lib": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{app("a", 1, "main"), app("a", 2, "work")}, value: 60},
+					rs{stack: []frame{app("a", 1, "main"), in("/usr/lib/libz.so", "z", 0x10, ln("compress"))}, value: 40},
+				)
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{app("b", 1, "main"), app("b", 2, "work")}, value: 30},
+					rs{stack: []frame{app("b", 1, "main"), in("/usr/lib/libz.so", "z", 0x10, ln("compress"))}, value: 50},
+				)
+			},
+		},
+		"no-build-id": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{app("", 1, "main"), app("", 2, "foo")}, value: 10})
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{app("", 1, "main"), app("", 2, "foo")}, value: 20})
+			},
+		},
+		"moved-module": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{fn("main"), in("/opt/a/libfoo.so", "1", 0x10, ln("foo"))}, value: 10})
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{fn("main"), in("/opt/b/libfoo.so", "2", 0x10, ln("foo"))}, value: 12})
+			},
+		},
+		"one-vs-two": {base: oneFoo, new: twoFoos},
+		"two-vs-one": {base: twoFoos, new: oneFoo},
+		"removed-kernel": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), fn("work")}, value: 63},
+					rs{stack: []frame{fn("main"), in("[kernel]", "", 0x30, ln("do_syscall_64"))}, value: 37},
+				)
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{fn("main"), fn("work")}, value: 63})
+			},
+		},
+		// The unsymbolized libfoo frame is found on the new side by build
+		// id, by full path, and by base name; libbar is another module.
+		"degraded-same-module":   degraded("/usr/lib/libfoo.so", "f"),
+		"degraded-same-path":     degraded("/usr/lib/libfoo.so", "g"),
+		"degraded-same-basename": degraded("/opt/lib/libfoo.so", "h"),
+		"degraded-other-module":  degraded("/usr/lib/libbar.so", "b"),
+		// foo's module is /usr/lib/libfoo.so with build id f. The new side
+		// has two unsymbolized libfoo modules: the one the ladder picks
+		// first moved by 0.05, the other by 0.5.
+		"ladder-build-id-before-path": {
+			base: degraded("", "").base,
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/opt/x/libfoo.so", "f", 0x1)}, value: 5},
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "g", 0x2)}, value: 50},
+					rs{stack: []frame{fn("main"), fn("work")}, value: 45},
+				)
+			},
+		},
+		"ladder-path-before-base-name": {
+			base: degraded("", "").base,
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "g", 0x1)}, value: 5},
+					rs{stack: []frame{fn("main"), in("/opt/lib/libfoo.so", "h", 0x2)}, value: 50},
+					rs{stack: []frame{fn("main"), fn("work")}, value: 45},
+				)
+			},
+		},
+		// Half the base is unsymbolized libfoo; the new view is empty.
+		"unresolved-base-zero-new": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f", 0x1)}, value: 50},
+					rs{stack: []frame{fn("main"), fn("work")}, value: 50},
+				)
+			},
+			new: allFixtures()["cpu-all-zero"],
+		},
+		"perturbation-shift": {
+			base: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k1]", 50, ser("false")), gpuK("[gpu:kernel:k2]", 50, ser("false")))
+			},
+			new: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k1]", 50, ser("true")), gpuK("[gpu:kernel:k2]", 50, ser("false")))
+			},
+		},
+		"serialized-missing-to-false": {
+			base: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, nil)) },
+			new:  func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("false"))) },
+		},
+		"serialized-unknown-to-false": {
+			base: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("unknown"))) },
+			new:  func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("false"))) },
+		},
+		// Every state moves by 0.05, under the threshold, but the new side
+		// knows its perturbation and the base does not.
+		"serialized-known-vs-unknown": {
+			base: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("unknown"))) },
+			new: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k]", 5, ser("false")), gpuK("[gpu:kernel:k]", 95, ser("unknown")))
+			},
+		},
+		// Known on both sides, every state within the threshold.
+		"serialized-small-shift": {
+			base: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k]", 95, ser("false")), gpuK("[gpu:kernel:k]", 5, ser("unknown")))
+			},
+			new: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("false"))) },
+		},
+		"zero-total-new": {
+			base: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, ser("false"))) },
+			new:  allFixtures()["gpu-zero-total"],
+		},
+		"gpu-ancestor-degradation": {
+			base: func() []byte {
+				return rich("gpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f", 0x123, ln("foo")), fn("[gpu:kernel:k]")}, value: 100},
+				)
+			},
+			new: func() []byte {
+				return rich("gpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f", 0x123), fn("[gpu:kernel:k]")}, value: 100},
+				)
+			},
+		},
+		"unmapped-filename-change": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{fn("main"), initAt("a.py", 10)}, value: 4})
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{fn("main"), initAt("b.py", 20)}, value: 4})
+			},
+		},
+		"unmapped-stable-siblings": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), initAt("a.py", 1)}, value: 2},
+					rs{stack: []frame{fn("main"), initAt("b.py", 1)}, value: 3},
+				)
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), initAt("a.py", 1)}, value: 5},
+					rs{stack: []frame{fn("main"), initAt("b.py", 1)}, value: 6},
+				)
+			},
+		},
+		"sample-period-change": {
+			base: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, period("8", "exact"))) },
+			new:  func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, period("16", "exact"))) },
+		},
+		// Join coverage and the sample period both change; join comes first.
+		"join-and-period-change": {
+			base: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k]", 90, period("8", "exact")), gpuK("[gpu:kernel:k]", 10, period("8", "heuristic")))
+			},
+			new: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k]", 50, period("16", "exact")), gpuK("[gpu:kernel:k]", 50, period("16", "heuristic")))
+			},
+		},
+		// idle and the /a foo only have zero-value samples in the base.
+		"zero-value-nodes": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), fn("work")}, value: 10},
+					rs{stack: []frame{fn("main"), fn("idle")}, value: 0},
+					rs{stack: []frame{fn("main"), in("/a/libfoo.so", "1", 0x10, ln("foo"))}, value: 0},
+					rs{stack: []frame{fn("main"), in("/b/libfoo.so", "2", 0x10, ln("foo"))}, value: 5},
+				)
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), fn("idle")}, value: 5},
+					rs{stack: []frame{fn("main"), in("/c/libfoo.so", "3", 0x10, ln("foo"))}, value: 5},
+				)
+			},
+		},
+	}
+}

@@ -170,11 +170,21 @@ func TestFactsAmbiguousNamePathListsCandidates(t *testing.T) {
 			t.Errorf("stderr should name candidate in %s: %q", mod, errOut)
 		}
 	}
-	for _, c := range []profilemodel.NodeID{
-		nodeIDFor(t, path, "main", "foo"), // one of the two
-	} {
-		if !strings.Contains(errOut, string(c)) {
-			t.Errorf("stderr should list candidate ID %s: %q", c, errOut)
+	p, err := profilemodel.Load(path, "", profilemodel.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := p.View(profilemodel.ViewOptions{SampleIndex: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := v.Root.Children[0]
+	if len(main.Children) != 2 {
+		t.Fatalf("want 2 foo nodes, got %d", len(main.Children))
+	}
+	for _, c := range main.Children {
+		if !strings.Contains(errOut, string(c.ID)) {
+			t.Errorf("stderr should list candidate ID %s: %q", c.ID, errOut)
 		}
 	}
 }
@@ -272,6 +282,59 @@ func TestDiffRefusesToOverwriteInputs(t *testing.T) {
 	after, _ := os.ReadFile(newer)
 	if !bytes.Equal(before, after) {
 		t.Error("input profile was modified")
+	}
+}
+
+func TestDiffRefusesLinksToInputs(t *testing.T) {
+	dir := t.TempDir()
+	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main"}, 1})
+	newer := writeProfile(t, dir, "new.pb.gz", sample{[]string{"main"}, 2})
+	exNew := filepath.Join(dir, "new.exec")
+	exBase := filepath.Join(dir, "base.exec")
+	for _, f := range []string{exNew, exBase} {
+		if err := os.WriteFile(f, []byte("sidecar "+f), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(target, name string) string {
+		l := filepath.Join(dir, name)
+		if err := os.Symlink(target, l); err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+	tracked := []string{base, newer, exNew, exBase}
+	snap := func() [][]byte {
+		var out [][]byte
+		for _, f := range tracked {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, b)
+		}
+		return out
+	}
+	before := snap()
+
+	pageLink := link(newer, "link.html")
+	if code, _, e := exec("-diff", base, "-o", pageLink, newer); code != 1 || !strings.Contains(e, "refusing to overwrite") {
+		t.Errorf("page symlink: exit %d, stderr %q", code, e)
+	}
+	jsonNew := link(exNew, "x.json")
+	if code, _, e := exec("-diff", base, "-o", filepath.Join(dir, "x.html"), "-execlog", exNew, newer); code != 1 || !strings.Contains(e, "refusing to overwrite") {
+		t.Errorf("json symlink to execlog: exit %d, stderr %q", code, e)
+	}
+	_ = os.Remove(jsonNew)
+	link(exBase, "x.json")
+	if code, _, e := exec("-diff", base, "-o", filepath.Join(dir, "x.html"), "-execlog-base", exBase, newer); code != 1 || !strings.Contains(e, "refusing to overwrite") {
+		t.Errorf("json symlink to execlog-base: exit %d, stderr %q", code, e)
+	}
+	after := snap()
+	for i := range tracked {
+		if !bytes.Equal(before[i], after[i]) {
+			t.Errorf("%s changed", tracked[i])
+		}
 	}
 }
 

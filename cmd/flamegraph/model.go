@@ -54,8 +54,8 @@ func runModel(stdout, stderr io.Writer, a modelArgs) int {
 		return usageErr(stderr, "-folded cannot be combined with -facts, -list-nodes or -diff")
 	case a.rootFirst:
 		return usageErr(stderr, "-stack-order root-first is not supported with -facts, -list-nodes or -diff: the profile model reads leaf-first profiles only")
-	case a.set["gpu-telemetry"] || a.set["raw-vendor-frames"] || a.set["fuse"] || a.set["in"]:
-		return usageErr(stderr, "-gpu-telemetry, -raw-vendor-frames, -fuse and -in do not apply to -facts, -list-nodes or -diff")
+	case a.set["gpu-telemetry"] || a.set["raw-vendor-frames"]:
+		return usageErr(stderr, "-gpu-telemetry and -raw-vendor-frames do not apply to -facts, -list-nodes or -diff")
 	case a.set["execlog-base"] && !a.set["diff"]:
 		return usageErr(stderr, "-execlog-base needs -diff")
 	case a.set["list-nodes"] && a.listNodes < 0:
@@ -137,9 +137,6 @@ func matchNamePath(v *profilemodel.View, path string) []*profilemodel.Node {
 			}
 		}
 		level = next
-	}
-	if len(level) == 1 && level[0] == v.Root {
-		return nil
 	}
 	return level
 }
@@ -229,10 +226,12 @@ func runDiff(stdout, stderr io.Writer, a modelArgs, newView *profilemodel.View) 
 	if err != nil {
 		return failf(stderr, "encode diff JSON: %v", err)
 	}
-	if err := writeFileAtomic(page, html.Bytes()); err != nil {
+	// Each file is replaced atomically; the pair is not. The JSON goes first
+	// so a failed write never leaves a fresh page beside a stale JSON.
+	if err := writeFileAtomic(data, append(js, '\n')); err != nil {
 		return failf(stderr, "%v", err)
 	}
-	if err := writeFileAtomic(data, append(js, '\n')); err != nil {
+	if err := writeFileAtomic(page, html.Bytes()); err != nil {
 		return failf(stderr, "%v", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "wrote %s\nwrote %s\n", page, data)

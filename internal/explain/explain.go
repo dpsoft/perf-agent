@@ -219,9 +219,11 @@ type Result struct {
 }
 
 // RejectedAttempt is a render call whose check failed, as a server records
-// it for the page's "rejected at render" section.
+// it for the page's "rejected at render" section. A server may keep only
+// some of the failures; Omitted counts the ones it left out.
 type RejectedAttempt struct {
 	Attempt  string    `json:"attempt"`
 	RetryOf  string    `json:"retry_of,omitzero"`
 	Failures []Failure `json:"failures"`
+	Omitted  int       `json:"omitted,omitzero"`
 }

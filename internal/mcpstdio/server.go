@@ -186,11 +186,11 @@ func marshal(v any) ([]byte, error) {
 // dispatch handles one line and returns the response, or nil for none.
 func (s *Server) dispatch(ctx context.Context, line []byte, initialized *bool) *outgoing {
 	trimmed := bytes.TrimSpace(line)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		return errorResponse(nil, codeInvalidRequest, "batches are not supported")
-	}
 	if !json.Valid(trimmed) {
 		return errorResponse(nil, codeParseError, "parse error: invalid JSON")
+	}
+	if trimmed[0] == '[' {
+		return errorResponse(nil, codeInvalidRequest, "batches are not supported")
 	}
 	if trimmed[0] != '{' {
 		return errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")

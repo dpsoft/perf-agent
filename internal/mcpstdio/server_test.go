@@ -491,3 +491,20 @@ func TestEmptyOptionalFieldsAreOmitted(t *testing.T) {
 		t.Errorf("mimeType present: %s", raw)
 	}
 }
+
+func TestMalformedArrayIsAParseErrorAndEmptyArrayIsABatch(t *testing.T) {
+	c := newClient(t, testOptions())
+	r := c.call(`[oops`)
+	wantErr(t, r, -32700)
+	if string(r.ID) != "null" {
+		t.Errorf("id = %s", r.ID)
+	}
+	r = c.call(`[]`)
+	wantErr(t, r, -32600)
+	if !strings.Contains(r.Error.Message, "batches are not supported") {
+		t.Errorf("message = %q", r.Error.Message)
+	}
+	if r := c.call(`{"jsonrpc":"2.0","id":2,"method":"ping"}`); r.Error != nil {
+		t.Fatalf("ping: %+v", r.Error)
+	}
+}

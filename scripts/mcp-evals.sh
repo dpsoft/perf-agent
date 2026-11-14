@@ -47,12 +47,15 @@ jq -n --arg bin "$work/bin/perf-agent-mcp" --arg profiles "$work/profiles" --arg
     '{mcpServers: {"perf-agent": {command: $bin, args: ["--profiles", $profiles, "--output", $out]}}}' \
     >"$work/mcp.json"
 
+# The agent gets the perf-agent-mcp skill, as an installed skill would give it.
+skill=$(cat "$root/skills/perf-agent-mcp/SKILL.md")
+
 questions="$root/internal/perfmcp/evals/questions.json"
 while IFS=$'\t' read -r id prompt; do
     echo "== $id" >&2
     # stdin is closed so claude cannot swallow the rest of the question list.
     if ! claude -p "$prompt Render the explanation to $id.html." \
-        --mcp-config "$work/mcp.json" --strict-mcp-config \
+        --mcp-config "$work/mcp.json" --strict-mcp-config --append-system-prompt "$skill" \
         --allowedTools 'mcp__perf-agent__*' </dev/null >"$work/$id.answer"; then
         echo "mcp-evals: claude failed on $id; answer in $work/$id.answer" >&2
         failed=1

@@ -203,6 +203,7 @@ func TestRunValidatesResolvedLimits(t *testing.T) {
 		{"Model.MaxSamples=0", "Model.MaxSamples"},
 		{"Model.MaxCommentBytes=-5", "Model.MaxCommentBytes"},
 		{"Explain.MaxClaimsTotal=0", "Explain.MaxClaimsTotal"},
+		{"Explain.MaxTitleBytes=0", "Explain.MaxTitleBytes"},
 		{"Source.GitTimeout=0s", "Source.GitTimeout"},
 	} {
 		var out, errb bytes.Buffer
@@ -390,7 +391,7 @@ func TestSourceGitIsOnByDefault(t *testing.T) {
 func buildServer(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "perf-agent-mcp")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 	return bin

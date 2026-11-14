@@ -265,6 +265,16 @@ func TestLoadRefusesNestedGzipWithoutInflatingIt(t *testing.T) {
 		_ = zw.Close()
 		return buf.Bytes()
 	}
+	var plain bytes.Buffer
+	if err := mustLoad(t, twoSamples(), nil, DefaultLimits()).Source.WriteUncompressed(&plain); err != nil {
+		t.Fatal(err)
+	}
+	// A valid profile inside two gzip layers: ParseData would inflate the
+	// inner layer itself and load it; it must be refused instead.
+	valid := gz(gz(plain.Bytes()))
+	if _, err := FromBytes(valid, nil, DefaultLimits()); err == nil {
+		t.Fatal("doubly gzipped profile accepted")
+	}
 	nested := gz(gz(make([]byte, 8<<20)))
 	lim := DefaultLimits()
 	lim.MaxDecompressedBytes = 1 << 20

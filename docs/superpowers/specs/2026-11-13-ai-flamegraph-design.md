@@ -1,6 +1,7 @@
 # AI-explained flame graphs and profile-driven optimization: design
 
-**Status:** design, not implemented. Iterated locally before any draft PR.
+**Status:** design, not implemented. Iterated in draft PR #262; revised after
+two read-only reviews (Workforce messages #267 and #271).
 **Date:** 2026-11-13
 **Mocks:** [assets/2026-11-13-ai-flamegraph-mocks.html](assets/2026-11-13-ai-flamegraph-mocks.html).
 The mocks are static and use invented numbers. They show the intended shape:
@@ -55,8 +56,12 @@ Two kinds of users, one engine:
 - **Caution:** a 2026 replay study (arXiv 2607.01211) found that most
   published "performance patches" did not reproduce their gain across
   machines and rounds. Machine noise is easy to mistake for a patch effect.
-- **Open space:** no existing tool explains a single selected path, and none
-  attributes GPU kernels to the CPU launch stack. perf-agent can do both.
+- **Open space (as far as we found):** among the tools above, none explains a
+  single selected path, and none attributes GPU kernels to the CPU launch
+  stack. This is a reading of their public docs and code in November 2026, not
+  a survey of every profiler.
+- The descriptions above come from public docs, blog posts and, for Grafana,
+  its source; their accuracy and eval claims were not reproduced here.
 
 ## 2. Decisions already made
 
@@ -73,8 +78,8 @@ These were decided by the user and are not open:
    - The autonomous loop may open a draft PR.
    - It never merges. Merging is done by the user, or by an agent only on the
      user's explicit instruction for that PR.
-4. **Local first.** Work is iterated locally and shown to the user before any
-   draft PR is opened.
+4. **Draft PR first.** Work is iterated in a draft PR shown to the user, and
+   nothing is merged without the user's explicit approval.
 5. **Order:**
    1. offline facts engine, with identity, provenance, quality and diff;
    2. MCP server and structured explanations;
@@ -126,12 +131,12 @@ These were decided by the user and are not open:
 ### Fold and render
 
 - `internal/foldedstacks.Fold` (`internal/foldedstacks/fold.go:265`)
-  aggregates samples by the concatenated frame **names** (`fold.go:352`).
+  aggregates samples by the concatenated frame **names** (`fold.go:357`).
 - Location and function identity is lost at that point.
 - Label summaries are kept only globally, not per path.
-- It refuses negative values, that is, diff profiles (`fold.go:310-316`).
-- The renderer also builds its tree keyed by name
-  (`internal/flamegraph/render.go:268-300`).
+- It refuses negative values, that is, diff profiles (`fold.go:313-319`).
+- The renderer also builds its tree keyed by name (`buildTree`,
+  `internal/flamegraph/render.go:270`).
 
 ### Inexact samples and sampling warnings
 
@@ -149,7 +154,10 @@ These were decided by the user and are not open:
 - Without a sampled stack, it builds
   `[gpu:kernel:<name>] → [gpu:launch unsampled]`.
 - The synthetic frames carry a name only (`pprof.FrameFromName`,
-  `pprof/pprof.go:104`), with no mapping.
+  `pprof/pprof.go:104`). They still get a mapping: the builder's fallback puts
+  them on the profile's first mapping, which has an empty file name
+  (`pprof/pprof.go:430`, `534-550`). "No mapping" therefore means
+  `Mapping == nil` **or** `Mapping.File == ""`.
 - With PC sampling, one execution yields several samples
   (`gpu/projection.go:158`).
 
@@ -169,11 +177,19 @@ These were decided by the user and are not open:
 
 ### Labels and CPU profiles
 
-- `gpu_serialized` is **not emitted** in this tree (`gpu/projection.go:83-87`).
-  Quality must report it as unavailable, never as false.
+- `gpu_serialized` **is emitted on every GPU execution**
+  (`gpu/projection.go:791-812`), with values `true`, `false` or `unknown` from
+  `SerializationState.String()` (`gpu/types.go:515`); the zero value is
+  `unknown`. The windows are classified in `gpu/serialization.go`. The comment
+  at `gpu/projection.go:83-87` saying the label does not exist yet is stale and
+  should be corrected separately. A sample may also lack the label (a profile
+  from an older build); that is a fourth state, `missing`.
 - `gpu_graph_refused` is emitted (`gpu/projection.go:765`).
-- CPU and off-CPU profiles carry a mapping path, a GNU build-id and file
-  offsets for every location (`docs/output.md`).
+- CPU and off-CPU profiles carry a mapping path, a GNU build-id and a file
+  offset for locations the symbolizer could place in a module
+  (`docs/output.md`). Not every location has them: unresolved frames fall back
+  to name-based locations on the default mapping (`pprof/pprof.go:430`), and
+  kernel and JIT frames sit on the `[kernel]` and `[jit]` sentinel mappings.
 
 ### Other building blocks
 
@@ -232,54 +248,94 @@ section of the page and gives the repository its first diff.
 
 **Builder's call:** the package name.
 
-### 6.2 Loading and provenance
+### 6.2 Loading, provenance and evidence identity
 
 - **Load a profile** from a `.pb.gz` or `.pb` file. Keep:
   - its SHA-256 over the raw bytes as read, which is the **profile digest**;
   - its sample types;
   - its comments, including `perf-agent.capture_id=`;
   - its mappings.
-- **The executions log is optional.** If one is supplied, read it with
-  `execlog.Read` and accept it only if `Trailer.Verify` passes against the
-  same bytes. Otherwise mark executions as `unavailable`, with the reason:
+- **Input limits.** Loading is bounded before parsing finishes, not only when
+  answering: a maximum of decompressed bytes, samples, locations and stack
+  depth (defaults are the builder's call, all configurable). A profile over a
+  limit is refused with the limit named. Truncating answers does not bound the
+  cost of loading.
+- **The executions log is optional and is checked before it is trusted.** If
+  one is supplied:
+  1. read it with `execlog.Read`, which checks its structure and CRC;
+  2. `Trailer.Verify` against the same bytes (digest and aggregated sample
+     count);
+  3. the header's `SampleType` matches the profile's GPU sample type, and its
+     `CaptureID` matches the profile's `capture_id` comment when both exist;
+  4. **value conservation:** for every aggregated sample, the sum of
+     `Row.Value` over its rows equals `Sample.Value` at the GPU index.
+  Only a log that passes all four is used. Rows are held provisionally while
+  reading and never reach the facts before the checks pass. Otherwise
+  executions are `unavailable`, with the reason:
   - `no sidecar`;
   - `digest mismatch`;
   - `sample count mismatch`;
+  - `metadata mismatch`;
+  - `value mismatch`;
   - `corrupt`.
+- **Rows with `Value == 0`** (a PC sample that received no weight,
+  `gpu/execlog/execlog.go:70`) still name an execution that was observed. They
+  count toward `executions below` for the sample they name, even though a view
+  skips zero-weight samples when drawing.
 - **No inference.** Never count pprof samples or rows as executions or
   launches, and never multiply by a period.
-- **A view** is (digest, sample index, collapse options), for example the raw
-  vendor frames switch that already exists in `cmd/flamegraph`.
-- **Fact identity.** Every fact is tied to a profile digest and a view. Two
-  facts from different views are never compared silently.
+- **Evidence identity.** Two different things are identified:
+  - the **profile digest**, a property of the file;
+  - the **evidence handle**, which names an immutable bundle: one profile
+    digest plus the exact sidecar selection (no log, or a log identified by
+    its own SHA-256). Opening the same profile with and without a log gives
+    two different handles. A handle never changes after it is created.
+- **A view** is (handle, sample index, collapse options). Two views are equal
+  only if all three are equal; the options are compared field by field.
+- **Fact identity.** Every fact is tied to a handle and a view. Two facts from
+  different views are never compared silently.
 
 ### 6.3 Identity
 
 The model is built from `profile.Profile` **before** anything is folded by
-name.
+name. Three identities are kept apart, because pprof itself keeps them apart:
+`pprof/pprof.go:494-530` interns a Location by mapping and offset, while
+`555-569` interns a Function by mapping and name.
 
-- **Frame identity:**
-  - For a location with a mapping: the mapping's build-id (or path when there
-    is no build-id), the function name, and the file offset when present.
-  - For synthetic frames (`[gpu:launch]`, `[gpu:launch unsampled]`,
-    `[gpu:kernel:…]`, `[kernel]`, `[jit]`): a kind plus the name.
-  - Two functions with the same name in different modules are different
-    frames.
-- **Path identity:** the root-to-leaf sequence of frame identities.
-- **Node ID:**
-  - A node is one occurrence of a path prefix, so recursion produces distinct
-    nodes for each depth.
-  - The node ID is a short hash of the path identity, stable for the same
-    profile and view.
-  - It is also the key for matching across profiles (§6.6).
-- **Frames without a mapping:** frames such as interpreter frames from the
-  Python unwinder are identified by kind plus name, like the synthetic
-  frames.
-- **Function identity:** the aggregate of all nodes for one frame identity.
-  It is used by `top` and `sandwich`. Recursion is counted once per sample
-  for cumulative values, the same rule pprof uses.
-- **IDs in the page:** short IDs like `f9` in the page are display aliases.
-  They are never the contract. The contract is the node ID plus the digest.
+- **"No mapping"** means `Mapping == nil` or `Mapping.File == ""`. The GPU
+  builder and the fallback path put synthetic and unresolved frames on the
+  first mapping with an empty file (§4), so testing for `nil` alone would treat
+  all of them as one module.
+- **Sentinel mappings.** `[kernel]` and `[jit]` are mapping file names, not
+  frame names. A frame on them is identified by the sentinel plus the function
+  name.
+- **Location identity** (one PC, one inline level): the mapping's build-id (or
+  its file path when there is no build-id), the file offset, and the inline
+  index within the location's `Line` list. Two PCs of the same function are
+  two locations.
+- **Function identity:** the mapping's build-id (or file path, or sentinel) plus
+  the function name. Two PCs of one function are one function. Two functions
+  with the same name in different modules are two functions.
+  - **No mapping:** the function name plus its `Filename` and `StartLine` when
+    the profile has them. Python frames from the unwinder and synthetic frames
+    (`[gpu:launch]`, `[gpu:launch unsampled]`, `[gpu:kernel:…]`) are
+    identified this way.
+  - **Unresolvable collisions are declared, not hidden.** Two different
+    functions with the same name, no mapping and no file or start line (two
+    `__init__` with nothing else known) cannot be told apart. The model merges
+    them and marks the function `collision_possible`, so a consumer knows the
+    identity is weaker.
+- **Path node identity:** a node is one occurrence of a path prefix of
+  **function** identities, one per inline level. Recursion therefore produces
+  a distinct node at each depth. The node ID is a short hash of that sequence,
+  stable for the same handle and view.
+- **Call-site detail.** The locations (PCs) that make up a node are kept on the
+  node as its call sites, so source lookup and a future per-line view can use
+  them, but they do not split the node.
+- **Recursion in aggregates.** `top` and `sandwich` aggregate by function and
+  count a function once per sample for cumulative values, the rule pprof uses.
+- **IDs in the page:** short IDs like `f9` are display aliases. The contract
+  is the node ID plus the handle and view.
 
 ### 6.4 Path facts
 
@@ -291,22 +347,28 @@ For a node in a view:
 | self | sum of values where the node is the leaf | pprof |
 | share of total | cumulative / view total; the denominator is named | pprof |
 | share of parent | cumulative / parent cumulative; the parent node ID is named | pprof |
-| executions below | distinct `Execution` ordinals over the samples under the node | verified execlog only, else `unavailable` |
+| executions below | distinct `Execution` ordinals over the samples under the node, including rows with `Value == 0` | checked execlog only (§6.2), else `unavailable` |
 | distinct kernel names below | count of distinct `[gpu:kernel:…]` names observed | pprof; named "observed", not "binary-identical kernels" |
 | inexact portion | value under the node from samples matching the existing inexact rules | pprof labels |
 | unsampled portion | for GPU views: value under `[gpu:launch unsampled]` at view level, never redistributed | pprof |
 | sample period | the `gpu_sample_period` values seen under the node | pprof labels |
+| serialization | value under the node by `gpu_serialized`: `true`, `false`, `unknown`, `missing` | pprof labels |
 | domain | the result of `flamegraph.Classify`, marked "inferred" | heuristic |
 
 **Rules:**
 - **Value and status.** Every fact has a value and a status: `ok`, `zero` or
   `unavailable` (with a reason). Zero and unavailable are distinct in code
-  and in output.
+  and in output. A share whose denominator is zero is `unavailable` with
+  reason `zero total`, never 0 and never NaN.
 - **Semantics note.** GPU views always carry the sampling note from
   `gpuSamplingWarnings`, attached to the facts as a structured field. A
   consumer cannot get the share without the note next to it.
 - **Units.** Numbers keep their sample-type unit (`gpu/nanoseconds` and so
-  on). Rounding for display is declared next to each value.
+  on).
+- **Rounding policy is the engine's.** Each metric has a display rounding
+  fixed by the engine (for example shares to 0.1 percentage point, durations
+  to three significant figures). It is reported next to each value and is the
+  only tolerance the claim check in §7.3 uses.
 
 ### 6.5 Quality
 
@@ -319,58 +381,91 @@ Quality is profile-level and per-node:
 - **Sampling:**
   - the unsampled launch share;
   - the sample period, or periods.
-- **`gpu_serialized`:** `unavailable` in this tree (§4).
+- **Perturbation (`gpu_serialized`):** the shares labelled `true`, `false`,
+  `unknown` and the share where the label is `missing`, reported separately.
+  `true` means the execution ran inside a serialized sampling window (Tier A
+  PC sampling), so its duration is perturbed. A perturbed profile is still
+  evidence: it is reported as perturbed, not dropped as unavailable.
 - **Symbols:** the share in unsymbolized frames (module plus offset, or a bare
-  address), by frame resolution.
-- **Executions log:** whether it is available and verified.
+  address), by module.
+- **Identity strength:** the share under functions marked
+  `collision_possible` (§6.3).
+- **Executions log:** whether it is available, and if not, why.
 - **Comparability.** A diff compares the quality of both sides and flags any
-  material difference. For example, if symbolization or join coverage
-  degraded between the two profiles, "path disappeared" is not trustworthy.
+  material difference: degraded symbolization or join coverage, a different
+  sample period, or a different perturbation share. With such a difference,
+  "path disappeared" or "path got cheaper" is not trustworthy.
 
 ### 6.6 Bilateral diff
 
 - **Not a subtracted pprof.** The diff is a model of both profiles, not a
   subtracted pprof; `Fold` correctly refuses negative values.
-- **Matching:**
-  - Nodes match by path identity.
-  - When build-ids differ (a rebuilt binary), they fall back to matching by
-    module path plus function-name path. Such a match is labelled `by name`.
-  - A many-to-one fallback is reported as `ambiguous`; it is never resolved
-    silently.
-- **Classification:** each node in the union is `both`, `only base` (removed)
-  or `only new` (added). A removed node is reported together with the
-  comparability of its side: was its module still symbolized, and was join
-  coverage similar? Absence alone does not prove the cost was eliminated.
-  The path may have been renamed, inlined or fused, or may have lost its
-  symbols or its stack.
-- **Normalization:**
-  - Absolute deltas are always shown.
-  - Share deltas are shown against each side's own total.
-  - Per-unit-of-work deltas are shown only when the caller supplies the work
-    count for each side, such as iterations from the loop (§8).
-  - The diff never guesses the work count.
-- **Matching in the loop:** in the loop every candidate is a rebuilt binary,
-  so the build-ids always differ there. Matching by name is the normal case,
-  not the exception, and it must be tested as the main path.
-- **Incompatible views:** the diff refuses views with different sample types
-  or units.
-- **Rendering:** the diff HTML draws the **union** of both trees, so removed
-  paths stay visible (hatched). It also lists removed and added paths in a
-  table. Colour means "less or more accumulated GPU time" (or CPU time). It
+- **Inputs:** a base view and a new view, each selected independently on its
+  own handle. They must have the same sample type and unit and equal view
+  options (§6.2); otherwise the diff is refused.
+- **Matching**, top-down, per parent:
+  1. **exact:** the same function identity (§6.3), which includes the build-id.
+     When a mapping has **no build-id** on either side, a match on file path
+     and name is never labelled exact, because two different builds at the
+     same path would look identical; it is labelled `by_path`.
+  2. **by name:** the remaining children match on module **file name** (not
+     full path, so a module that moved directories still matches) plus
+     function name. This is the normal case whenever the code was rebuilt.
+  3. **ambiguous:** when, in either direction, one node has several
+     candidates on the other side (repeated names, a recursive function
+     appearing twice under one parent, two modules with the same file name),
+     the nodes are not merged. Each is listed with its candidates and stays
+     separate in the union.
+  The match label (`exact`, `by_path`, `by_name`, `ambiguous`) is reported per
+  node.
+- **Presence and interpretation are separate fields:**
+  - **presence** is structural: `both`, `only_base` or `only_new`. It is never
+    hidden; an `only_base` branch stays in the union and in the table.
+  - **interpretation** says whether the change can be read as a change in
+    cost: `comparable` or `not_comparable`, with the reason. A node is
+    `not_comparable` when its module's symbolization, the join coverage, the
+    sample period or the perturbation share differs materially between the
+    sides (thresholds are named constants; the defaults are the builder's
+    call). Absence alone never proves the cost was eliminated: the path may
+    have been renamed, inlined or fused, or may have lost its symbols or its
+    stack.
+- **Deltas:**
+  - the **raw** delta (new minus base, in the sample unit) is always shown;
+  - the **share** delta is shown against each side's own total, and is
+    `unavailable` when either total is zero;
+  - a **per-unit-of-work** delta is shown only when the caller supplies a work
+    count for each side, and both counts are positive and finite; otherwise it
+    is `unavailable` with the reason. The diff never guesses the work count.
+- **Rebuilt code is common, not universal.** In the loop, the changed binary
+  is rebuilt, so its build-id changes and its nodes match by name. Python
+  code, configuration changes and libraries that were not recompiled keep their
+  build-ids, so the same diff mixes exact and by-name matches. Both are main
+  paths and both are tested.
+- **Union geometry (my call).** Each node of the union has two weights, base
+  and new. The drawing uses the **combined weight** base + new: it is additive
+  (a node's combined weight equals the sum of its children's combined weights
+  plus its combined self), so the icicle never overflows when cost moves
+  between branches, and removed or added nodes keep a visible width. Colour
+  shows the share delta. Every node shows both values, base and new.
+- **Rendering:** the diff HTML draws that union; `only_base` nodes are
+  hatched, `only_new` nodes outlined, `not_comparable` nodes marked. It also
+  lists removed and added paths in a table with presence, interpretation and
+  reason. Colour means "less or more accumulated GPU time" (or CPU time). It
   never means "faster or slower", because accumulated GPU time is neither
   wall time nor the critical path.
 
 ### 6.7 Surface in M1
 
 **My call:**
-- `cmd/flamegraph` gains two flags:
+- `cmd/flamegraph` gains flags:
   - `-facts <node-id|path>`, which writes JSON facts;
-  - `-diff <base>`, which writes a diff HTML and its JSON.
-- The renderer reads its numbers from the model.
+  - `-diff <base>`, which writes a diff HTML and its JSON;
+  - `-execlog <file>` (and `-execlog-base <file>` for the diff) to select the
+    sidecar explicitly. A log is never picked up implicitly from a file name.
 
-The existing HTML output for a single profile must stay byte-for-byte
-equivalent except where the model fixes a known name-collision bug. Any such
-change is listed in the PR.
+The existing single-profile HTML is not migrated onto the model in M1. That
+migration, and the byte-for-byte equivalence it must prove, is a separate step
+(M1b) after the model is reviewed, so M1 cannot change the existing page.
 
 **Builder's call:** the exact flag names and JSON field names.
 
@@ -379,30 +474,55 @@ change is listed in the PR.
 Fixtures are small synthetic pprof files built in tests, plus one or two real
 captures checked in only if they are small. Required cases:
 
-1. **Aggregation:** several executions merged into one sample. With a
-   verified execlog, executions are counted exactly. Without one, the value is
-   `unavailable`. With a log for a different profile, it is
-   `unavailable: digest mismatch`.
-2. **PC sampling:** one execution produces several samples. Executions are
-   counted once, and rows are never reported as executions.
+1. **Aggregation:** several executions merged into one sample. With a checked
+   execlog, executions are counted exactly. Without one, the value is
+   `unavailable: no sidecar`. With a log for a different profile, it is
+   `unavailable: digest mismatch`; with a wrong sample type or capture ID,
+   `metadata mismatch`; with rows that do not add up to the sample,
+   `value mismatch`.
+2. **PC sampling:** one execution produces several samples, one row with
+   `Value == 0`. Executions are counted once, the zero-value row's execution
+   is counted, and rows are never reported as executions.
 3. **Recursion:** `a → b → a → b`. Cumulative values are not double counted,
    and nodes at different depths have distinct IDs.
 4. **Same name, different modules:** `foo` in `libx.so` and in `liby.so`
    stay separate frames and separate functions.
-5. **Degraded coverage:** a base with symbols and a new profile where the
-   same module is unsymbolized. The diff flags the result as not comparable
-   instead of reporting the path as "removed".
-6. **Sampling semantics:** a GPU profile with a period of 8. The facts carry
-   the note, and no value is scaled.
-7. **Inexact joins:** heuristic, unmatched and ambiguous samples are counted
-   in the inexact portion.
-8. **Zero vs unavailable:** a fact whose source exists but sums to zero, next
-   to one whose source is missing.
+5. **Several PCs per function:** `foo` at offsets `0x10` and `0x20` in the same
+   module is two locations, one function and one node; both PCs are its call
+   sites.
+6. **Empty mapping:** a GPU profile whose synthetic frames sit on the first
+   mapping with an empty file is treated as "no mapping".
+7. **JIT and same name without a mapping:** two `__init__` with different
+   `Filename`/`StartLine` stay separate; two with nothing else known merge and
+   are marked `collision_possible`; a frame on the `[jit]` sentinel is
+   identified by sentinel plus name.
+8. **Inline frames:** a location with two `Line` entries yields two nodes,
+   inlined chain root-first, as `Fold` emits them.
+9. **Degraded coverage:** a base with symbols and a new profile where the
+   same module is unsymbolized. The base path is `only_base` (presence) and
+   `not_comparable` (interpretation), with the module named as the reason.
+10. **Sampling semantics:** a GPU profile with a period of 8. The facts carry
+    the note, and no value is scaled.
+11. **Inexact joins:** heuristic, unmatched and ambiguous samples are counted
+    in the inexact portion.
+12. **Perturbation:** samples with `gpu_serialized` `true`, `false`,
+    `unknown` and absent are reported as four shares; a diff between a
+    perturbed and an unperturbed capture marks the affected nodes
+    `not_comparable`.
+13. **Zero vs unavailable:** a fact whose source exists but sums to zero, next
+    to one whose source is missing, and a share over a zero total.
+14. **Diff matching:** a rebuilt binary (by name), an unchanged library
+    (exact), a module without a build-id (`by_path`, never exact), a moved
+    module path (by name), and an ambiguity in each direction.
+15. **Input limits:** a profile over each limit is refused with the limit
+    named.
 
 **Invariants checked on every fixture:**
 - the children's cumulative values plus self equal the parent's cumulative;
 - the root equals the view total;
-- the diff's base and new totals equal those of the two inputs.
+- the diff's base and new totals equal those of the two inputs;
+- in the diff union, each node's combined weight equals its children's
+  combined weights plus its combined self.
 
 ## 7. Milestone 2: MCP server and structured explanations
 
@@ -417,38 +537,67 @@ captures checked in only if they are small. Required cases:
   minimal hand-written JSON-RPC. Any new dependency must pass the
   third-party notices check (`scripts/third-party-notices.sh --check`), and
   its license must be compatible with Apache-2.0.
-- **Allowed roots:** the server is started with explicit allowed roots for
-  profiles, the execlog and source code, for example
-  `--profiles DIR --source DIR`. It refuses paths outside them, including
-  paths that the profile's own mappings name.
+- **Roots are configured explicitly** at start-up, one flag each:
+  `--profiles DIR` (profiles and execlogs, read), `--source DIR` (source, read,
+  repeatable) and `--output DIR` (rendered pages, write). There is no default
+  output root: without `--output`, `render_flamegraph` is disabled.
+- **Root enforcement** uses `os.Root` (Go 1.24+; the chosen primitive, not yet used elsewhere in perf-agent), not a textual prefix check, so
+  symlinks, `..` and races cannot escape a root. Paths named by a profile's own
+  mappings are subject to the same roots.
+- **Render never overwrites inputs.** The output file must not resolve (through
+  any alias or symlink) to a profile, a sidecar or a source file the server has
+  opened, and must not already exist unless the call says `overwrite` and the
+  existing file is a page this server rendered.
+- **Limits:** the §6.2 input limits, plus a maximum size for each tool
+  response, for explanation text and for a rendered page.
 
 ### 7.2 Tools
 
-Every tool takes an explicit `handle` and `view`, never an implicit "current
-profile".
+Every tool takes an explicit evidence `handle` (§6.2) and `view`, never an
+implicit "current profile".
 
 | Tool | Returns |
 |---|---|
-| `open(path, execlog?)` | `handle` (= digest), sample types, available views, capabilities (execlog verified?, PC sampling?, source roots), profile-level quality, semantic notes |
-| `top(handle, view, by, domain?, limit, cursor?)` | functions or path nodes (the caller says which), with cumulative, self and share. Truncated with `omitted_count`, `omitted_weight` and a `cursor` for the tail |
+| `open(path, execlog?)` | a new immutable `handle` (profile digest + sidecar selection), the profile digest, sample types, available views, capabilities (execlog checked and why not, PC sampling, source roots), profile-level quality, semantic notes |
+| `top(handle, view, by, domain?, limit, cursor?)` | functions or path nodes (the caller says which), with cumulative, self and share. Truncated with `omitted_count` and `omitted_weight` (defined below) and a `cursor` for the tail |
 | `path(handle, view, node)` | the root-to-node path with per-frame facts and domain |
 | `sandwich(handle, view, function, limit, cursor?)` | callers and callees of a function, with explicit aggregation rules for recursion |
 | `gpu_kernels_for(handle, view, node)` | kernels under the node: time, share, and executions (or `unavailable` with a reason) |
 | `facts(handle, view, node)` | the §6.4 facts and quality for one node |
-| `diff(base_handle, new_handle, view, work_base?, work_new?, limit, cursor?)` | the §6.6 diff, truncated like `top` |
-| `source(handle, node)` | source lines for the node, only within the source roots and only when the build matches; otherwise `unresolved` with the reason |
-| `render_flamegraph(handle, view, explanations, out)` | see §7.3 |
+| `diff(base_handle, base_view, new_handle, new_view, work_base?, work_new?, limit, cursor?)` | the §6.6 diff, truncated like `top` |
+| `source(handle, view, node)` | source lines for the node's call sites, only within the source roots and only with source evidence (below); otherwise `unresolved` or `source_unverified`, with the reason |
+| `render_flamegraph(handle, view, explanations, out, attempt?)` | see §7.3 |
 
 **Rules for all tools:**
-- **Truncation:** results are truncated by weight. Every truncation states
-  how much was omitted, and a cursor reaches the rest.
+- **Truncation:** results are truncated by weight. `omitted_count` is the
+  number of rows not returned. `omitted_weight` is the **sum of the omitted
+  rows' own values** and is labelled that way: rows of `top(by=cum)` overlap
+  (nested functions and paths share samples), so it is not "the rest of the
+  total" and is never shown as a remaining percentage.
+- **Cursors** are bound to the handle, the view and the query parameters, and
+  the row order is stable (weight, then node or function ID). A cursor used
+  with anything else is rejected.
 - **Errors:** messages are prescriptive. They say what to call next, for
   example "node not in view; call `path` with …".
 - **Agent guide:** a short guide for the agent, about 3k tokens, shipped as an
   MCP prompt or resource. It sets the investigation order (open → top →
   path / gpu_kernels_for → facts → render) and repeats the semantic rules.
 
+**Source evidence.** A build-id proves which binary ran, not that a local
+`.cc` or `.py` file is the one it was built from. `source` returns lines as
+verified only when one of these holds:
+- a source manifest (path → SHA-256) recorded with the build matches the file;
+- the source root is a git checkout at a commit the user named when starting
+  the server, and the file is unmodified there.
+Otherwise it returns the lines marked `source_unverified`, or `unresolved` when
+no file matches. `gpu_src_file` from PC sampling is a basename, not a path; it
+is looked up inside the source roots and an ambiguous basename is reported as
+ambiguous, never resolved by guess.
+
 ### 7.3 Structured explanations and the render check
+
+What is guaranteed is narrow and stated: **only structured claims are
+checked.** Prose, hypotheses and next steps are not, and the page says so.
 
 An explanation for one node has these parts:
 
@@ -457,40 +606,65 @@ An explanation for one node has these parts:
   "node": "<node id>",
   "claims": [
     {"id": "c1", "metric": "share_of_total", "node": "<node id>",
-     "denominator": "view_total", "value": 0.411, "rounding": 0.001}
+     "denominator": "view_total", "value": 0.411}
   ],
-  "prose": "Text that may reference claims as {c1} and nodes as {n:<node id>}.",
+  "prose": "Text that references claims as {c1} and nodes as {n:<node id>}.",
   "hypotheses": ["Text, rendered as a hypothesis, never as a finding."],
   "next_measurement": "Text."
 }
 ```
 
+**Numbers in free text (my call).** A digit sequence in prose, hypotheses or
+next-measurement text that is not inside a `{cN}` placeholder is **not
+rejected**; it is rendered visibly marked as an unchecked figure. Rejecting
+would push agents to spell numbers out; marking keeps them honest and visible.
+The header counts only checked figures.
+
 **Validation before anything is written:**
+- claim IDs are unique within the call, and every `{cN}` and `{n:…}` reference
+  resolves;
 - every referenced node exists in the handle and view;
-- every claim's metric is a known fact for that node;
-- every stated value equals the engine's value within the **declared
-  rounding** of the rendered figure, with no blanket tolerance.
+- every claim's metric is a known fact for that node, with the claim's unit
+  and type (a share is a ratio, a duration has the view's unit);
+- the claim's `denominator` is the one that fact actually uses (for
+  `share_of_parent`, the node's real parent), not merely a valid name;
+- the fact is available; a claim against an `unavailable` fact is rejected
+  with the fact's reason;
+- the value is finite, and inside the metric's range (shares in [0, 1],
+  counts and durations ≥ 0);
+- the value equals the engine's value **at the engine's rounding for that
+  metric** (§6.4), compared as decimals. The agent does not supply a
+  tolerance and cannot widen it.
 
 **Rendering:**
-- The engine renders every number in the page. Claim placeholders in the
-  prose are replaced by the engine's value, not the agent's.
+- The engine renders every checked number. Claim placeholders are replaced by
+  the engine's canonical value, never the agent's.
 - Prose is rendered as untrusted text. All prose, frame names and paths are
   HTML-escaped, and no agent-supplied URL becomes a link.
 
-**Failure:**
-- The tool returns every failing claim and node, with the engine's values,
-  so the agent can correct and retry.
-- Rejected claims and their corrections are recorded in the page's
-  "rejected at render" section.
+**Failure and attempts:**
+- The tool returns every failing claim and reference, with the engine's
+  values, so the agent can correct and retry.
+- Every call gets an **attempt ID** recorded by the server, bound to the
+  handle and view. A retry passes the previous attempt ID. The page's
+  "rejected at render" section is built from the server's own record of the
+  rejected attempts for that handle and view, not from anything the agent
+  says about earlier attempts.
+- A claim check does not validate causality. Hypotheses stay hypotheses.
 
 **Writing:**
 - The output goes to a temporary file in the destination directory and is
-  renamed into place.
-- The destination must be inside an allowed output root.
+  renamed into place, inside the output root (§7.1).
+
+**Tests (deterministic, no model):** a numeric literal without a claim (marked
+unchecked), a correct value with the wrong parent as denominator (rejected), a
+claim against an unavailable fact (rejected), NaN and ±Inf values (rejected),
+an attempt to pass a rounding or tolerance (ignored; the engine's policy
+applies), duplicate claim IDs and unresolved references (rejected).
 
 The page labels the parts honestly:
 - **Profile facts:** computed by perf-agent.
-- **Agent interpretation:** prose, not verified.
+- **Agent interpretation:** prose, not verified; unchecked figures marked.
 - **Hypotheses:** shown as hypotheses.
 - **Header:** "N figures and references checked". It never says "verified
   explanation".
@@ -556,18 +730,21 @@ not be perf-agent.
 - **Benchmark without the profiler:** baseline and candidate are measured
   **interleaved** in balanced order (ABBA…).
 - **Explanatory profiles** are captured separately, and only their coverage
-  (symbols, joins, sample period) is compared. A candidate whose profile
+  (symbols, joins, sample period, perturbation) is compared. A candidate whose profile
   coverage differs materially from the baseline is not judged by the profile
   diff.
 - **Accepting a candidate:**
-  - its paired result meets the criterion;
+  - the **lower bound** of its confidence interval for the improvement is
+    above the minimum gain (a point estimate above 3% with an interval that
+    includes 0 does not pass);
   - the target path's diff agrees;
   - tests pass;
   - outputs stay within tolerance;
   - the benchmark files are unchanged (hash check).
-- **Fresh confirmation:** the selected winner is re-measured from scratch
-  before the PR. A winner that fails re-measurement is reported as such and
-  not proposed.
+- **Fresh confirmation:** the selected winner is re-measured once, from
+  scratch, with the same protocol and criterion. A winner that fails
+  re-measurement is reported as such and not proposed; it is not re-measured
+  again until it passes.
 - **Keep everything:** failed and rejected attempts stay in the report with
   their reason.
 
@@ -596,8 +773,8 @@ not be perf-agent.
 - **No regressions:** existing CLI behavior and output formats do not change
   unless a change is stated in the CHANGELOG.
 - **Process:** commits and PRs follow the repository's POLICY (no session
-  URLs or AI attribution). Work stays local until the user asks for a draft
-  PR.
+  URLs or AI attribution). Work is iterated in the draft PR; nothing is
+  merged without the user's explicit approval.
 
 ## 10. Testing the AI parts
 
@@ -613,8 +790,10 @@ not be perf-agent.
 - **Names:** package, binary, flag and JSON field names.
 - **Node ID details:** the hash function and length.
 - **MCP plumbing:** SDK vs hand-written JSON-RPC (§7.1).
-- **Diff by-name fallback:** how far it goes when build-ids differ (for
-  example, whether to match through inlined frames).
+- **Diff by-name fallback:** whether it matches through inlined frames
+  (the matching levels themselves are fixed in §6.6).
+- **Defaults:** input limits (§6.2) and the comparability thresholds (§6.6),
+  as named, configurable constants.
 - **Loop packaging:** a skill plus a helper binary, or a single binary.
 - **Checked-in data:** which real captures, if any, are small enough to
   commit as fixtures.
@@ -648,3 +827,26 @@ that came up and how they were settled:
   - loop defaults (§8);
   - how the AI parts are tested (§10).
 - **Theirs:** the two questions in §12.
+
+## Appendix B: changes after review #271
+
+- `gpu_serialized` is emitted (four states, including `missing`) and feeds
+  quality and comparability (§4, §6.4, §6.5, §6.6).
+- Location, function and path-node identity are separate; "no mapping"
+  includes the empty first mapping; sentinel mappings and unresolvable
+  collisions are explicit (§6.3).
+- Only structured claims are checked; numeric literals in free text are marked
+  unchecked; denominator, unit, availability, range and engine-owned rounding
+  are validated; attempts are recorded by the server (§7.3).
+- Evidence handle vs profile digest; independent base and new views; cursors
+  bound to handle, view and query; explicit output root enforced with
+  `os.Root`; render never overwrites inputs (§6.2, §7.1, §7.2).
+- Diff: `by_path` for missing build-ids, ambiguity in both directions,
+  presence separate from interpretation, additive union geometry, deltas with
+  explicit availability (§6.6).
+- Source needs a manifest or a named checkout, else `source_unverified`;
+  input and output limits (§6.2, §7.1, §7.2).
+- Execlog: metadata and value-conservation checks, `Value == 0` rows count as
+  observed executions (§6.2).
+- Loop: accept only when the CI lower bound clears the minimum gain;
+  re-measure the winner once (§8).

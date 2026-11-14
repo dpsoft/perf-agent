@@ -189,3 +189,20 @@ func TestAnApplicationsOwnOnLaunchIsNotTheProfiler(t *testing.T) {
 	assert.Equal(t, DomainApplication, Classify("myapp::on_launch(int)", ""))
 	assert.Equal(t, DomainApplication, Classify("Renderer::on_launch()", ""))
 }
+
+func TestDomainKeysAreEveryDomainOnceInLegendOrder(t *testing.T) {
+	keys := DomainKeys()
+	if len(keys) != int(numDomains) {
+		t.Fatalf("keys = %v", keys)
+	}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if seen[k] {
+			t.Errorf("duplicate key %q", k)
+		}
+		seen[k] = true
+	}
+	if keys[0] != "app" || keys[len(keys)-1] != "root" {
+		t.Errorf("order = %v", keys)
+	}
+}

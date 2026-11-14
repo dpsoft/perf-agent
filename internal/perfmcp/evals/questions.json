@@ -1,0 +1,28 @@
+[
+  {
+    "id": "why-b-is-wide",
+    "prompt": "Open cpu.pb.gz and explain why the frame b is wide.",
+    "profile": "cpu.pb.gz",
+    "expect": {"page": true, "checked_values": ["41.1%"], "forbid": []}
+  },
+  {
+    "id": "conv-gpu",
+    "prompt": "Open gpu.pb.gz with the executions log gpu.executions and explain the frame conv.",
+    "profile": "gpu.pb.gz",
+    "execlog": "gpu.executions",
+    "expect": {"page": true, "checked_values": [], "require": ["Sampling notes"], "forbid": ["% of GPU time"]}
+  },
+  {
+    "id": "what-changed",
+    "prompt": "Compare cpu.pb.gz (before) with cpu-new.pb.gz (after) and explain what changed.",
+    "profile": "cpu.pb.gz",
+    "expect": {"page": true, "checked_values": [], "forbid": []}
+  },
+  {
+    "id": "conv-executions",
+    "prompt": "Open gpu.pb.gz with the executions log gpu.executions and say how many executions ran under the frame conv.",
+    "profile": "gpu.pb.gz",
+    "execlog": "gpu.executions",
+    "expect": {"page": true, "checked_values": ["4"], "forbid": []}
+  }
+]

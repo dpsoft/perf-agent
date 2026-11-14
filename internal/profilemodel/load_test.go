@@ -15,6 +15,7 @@ import (
 	"github.com/google/pprof/profile"
 
 	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
 func twoSamples() []byte {
@@ -448,5 +449,117 @@ func TestMaxFramesCountsEveryExpandedFrame(t *testing.T) {
 	}
 	if got := DefaultLimits().MaxFrames; got != 50_000_000 {
 		t.Fatalf("default MaxFrames %d", got)
+	}
+}
+
+func writeFixture(t *testing.T, dir, name string, b []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadFSMatchesLoad(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir, "cpu.pb.gz", pmfixture.CPUBasic())
+	writeFixture(t, dir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, dir, "gpu.execlog", pmfixture.GPUBasicExeclog(t))
+	for _, tc := range []struct{ prof, log string }{{"cpu.pb.gz", ""}, {"gpu.pb.gz", "gpu.execlog"}} {
+		want, err := Load(filepath.Join(dir, tc.prof), cmpJoin(dir, tc.log), DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := LoadFS(os.DirFS(dir), tc.prof, tc.log, DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Handle != want.Handle || got.Digest != want.Digest || got.Executions != want.Executions {
+			t.Errorf("%s: got %+v want %+v", tc.prof, got, want)
+		}
+	}
+}
+
+func cmpJoin(dir, name string) string {
+	if name == "" {
+		return ""
+	}
+	return filepath.Join(dir, name)
+}
+
+func TestLoadFSThroughARootRefusesEscapes(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "root")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, parent, "x.pb.gz", pmfixture.CPUBasic())
+	writeFixture(t, dir, "ok.pb.gz", pmfixture.CPUBasic())
+	if err := os.Symlink(filepath.Join(parent, "x.pb.gz"), filepath.Join(dir, "link.pb.gz")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	if _, err := LoadFS(root.FS(), "ok.pb.gz", "", DefaultLimits()); err != nil {
+		t.Fatalf("in-root profile refused: %v", err)
+	}
+	for _, name := range []string{"../x.pb.gz", "link.pb.gz"} {
+		if _, err := LoadFS(root.FS(), name, "", DefaultLimits()); err == nil {
+			t.Errorf("%s was loaded", name)
+		}
+	}
+}
+
+func TestLoadFSSidecarOverLimitIsUnread(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir, "gpu.pb.gz", pmfixture.GPUBasic())
+	writeFixture(t, dir, "gpu.execlog", pmfixture.GPUBasicExeclog(t))
+	lim := DefaultLimits()
+	lim.MaxSidecarBytes = 8
+	p, err := LoadFS(os.DirFS(dir), "gpu.pb.gz", "gpu.execlog", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Executions.Reason != ReasonSidecarLimits || !strings.Contains(string(p.Handle), "+unread:") {
+		t.Fatalf("executions %+v handle %s", p.Executions, p.Handle)
+	}
+	// A missing sidecar is corrupt, not an error.
+	p, err = LoadFS(os.DirFS(dir), "gpu.pb.gz", "absent.execlog", DefaultLimits())
+	if err != nil || p.Executions.Reason != ReasonCorrupt {
+		t.Fatalf("missing sidecar: %+v, %v", p, err)
+	}
+}
+
+func TestLoadRefusesLongMetadata(t *testing.T) {
+	d := DefaultLimits()
+	if d.MaxMetaBytes != 256 || d.MaxCommentBytes != 64<<10 {
+		t.Fatalf("MaxMetaBytes default %d, MaxCommentBytes default %d", d.MaxMetaBytes, d.MaxCommentBytes)
+	}
+	sample := pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main")}, Value: 1}
+	long := strings.Repeat("u", 300)
+	tag := strings.Repeat("t", 10<<10)
+	for _, tc := range []struct {
+		name, limit string
+		raw         []byte
+	}{
+		{"sample type", "MaxMetaBytes", pmfixture.Build(long, "nanoseconds", nil, sample)},
+		{"unit", "MaxMetaBytes", pmfixture.Build("cpu", long, nil, sample)},
+		{"comments", "MaxCommentBytes", pmfixture.Build("cpu", "nanoseconds", slices.Repeat([]string{tag}, 7), sample)},
+	} {
+		_, err := FromBytes(tc.raw, nil, d)
+		if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), tc.limit) || strings.Contains(err.Error(), long) || strings.Contains(err.Error(), tag[:100]) {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+	}
+	at := strings.Repeat("u", 256)
+	if _, err := FromBytes(pmfixture.Build(at, at, []string{strings.Repeat("c", 1<<10), "perf-agent.capture_id=x"}, sample), nil, d); err != nil {
+		t.Errorf("256-byte names and a 1 KiB comment: %v", err)
+	}
+	if _, err := FromBytes(pmfixture.Build("cpu", "nanoseconds", []string{strings.Repeat("c", 64<<10)}, sample), nil, d); err != nil {
+		t.Errorf("64 KiB of comments: %v", err)
 	}
 }

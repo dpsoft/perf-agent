@@ -256,9 +256,9 @@ func runDiff(stdout, stderr io.Writer, a modelArgs, newView *profilemodel.View) 
 	if err := flamegraph.WriteDiffPage(&html, d, opts); err != nil {
 		return failf(stderr, "diff page: %v", err)
 	}
-	// Compact: the union is a tree as deep as the deepest stack, and
+	// Compact: the union is a node list as long as the union, and
 	// indenting it makes the file mostly whitespace.
-	js, err := json.Marshal(d)
+	js, err := json.Marshal(d.Flatten())
 	if err != nil {
 		return failf(stderr, "encode diff JSON: %v", err)
 	}

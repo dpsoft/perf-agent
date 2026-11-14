@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 	"github.com/google/pprof/profile"
 )
@@ -280,7 +281,7 @@ func TestDiffWritesPageAndJSON(t *testing.T) {
 	}
 }
 
-// The diff JSON is a deep tree: indenting it multiplies its size.
+// Indenting the diff JSON multiplies its size.
 func TestDiffJSONIsCompact(t *testing.T) {
 	dir := t.TempDir()
 	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main", "work", "inner"}, 100})
@@ -533,5 +534,62 @@ func TestMissingOrUnreadableSidecarExits1(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "d.html")); err == nil {
 		t.Error("a diff page was written despite an unreadable sidecar")
+	}
+}
+
+// The diff JSON is a flat node list: a deep stack must not nest it.
+func TestDiffJSONIsAFlatNodeList(t *testing.T) {
+	dir := t.TempDir()
+	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main", "work", "inner"}, 100})
+	newer := writeProfile(t, dir, "new.pb.gz", sample{[]string{"main", "work", "inner"}, 150})
+	if code, _, e := exec("-diff", base, newer); code != 0 {
+		t.Fatalf("exit %d: %s", code, e)
+	}
+	raw, err := os.ReadFile(newer + ".diff.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := top["root"]; ok {
+		t.Error("diff JSON has a nested root")
+	}
+	var nodes []map[string]json.RawMessage
+	if err := json.Unmarshal(top["nodes"], &nodes); err != nil || len(nodes) != 4 {
+		t.Fatalf("nodes: %d, %v; want 4", len(nodes), err)
+	}
+	if _, ok := nodes[0]["parent"]; ok {
+		t.Error("root node has a parent")
+	}
+	if _, ok := nodes[1]["parent"]; !ok {
+		t.Error("second node has no parent")
+	}
+
+	// The page is the same as WriteDiffPage of the same Diff.
+	bv, err := loadView(base, "", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nv, err := loadView(newer, "", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := profilemodel.Compare(bv, nv, profilemodel.WorkCounts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want bytes.Buffer
+	opts := flamegraph.DiffPageOptions{Title: "new.pb.gz", BaseName: "base.pb.gz", NewName: "new.pb.gz"}
+	if err := flamegraph.WriteDiffPage(&want, d, opts); err != nil {
+		t.Fatal(err)
+	}
+	page, err := os.ReadFile(newer + ".diff.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(page, want.Bytes()) {
+		t.Error("diff page differs from WriteDiffPage of the same Diff")
 	}
 }

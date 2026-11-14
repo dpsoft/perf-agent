@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -59,6 +60,14 @@ type Limits struct {
 	// MaxSidecarRows and MaxSidecarExecutions (distinct ordinals) are
 	// enforced in the row callback.
 	MaxSidecarRows, MaxSidecarExecutions int
+	// MaxMetaBytes bounds each sample type name and sample unit, checked
+	// after parsing: they come from the profile and are repeated in view
+	// names, check failures and pages.
+	MaxMetaBytes int
+	// MaxCommentBytes bounds the bytes of all the profile's comments
+	// together, checked after parsing. Comments carry user tags, so the
+	// bound is generous.
+	MaxCommentBytes int
 }
 
 // DefaultLimits returns the limits documented in the package comment.
@@ -73,6 +82,8 @@ func DefaultLimits() Limits {
 		MaxSidecarBytes:      256 << 20,
 		MaxSidecarRows:       10_000_000,
 		MaxSidecarExecutions: 10_000_000,
+		MaxMetaBytes:         256,
+		MaxCommentBytes:      64 << 10,
 	}
 }
 
@@ -105,14 +116,24 @@ type Profile struct {
 // Load reads a profile and, if execlogPath is not "", its executions log.
 // A bad log never fails Load; it sets Executions.
 func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
-	raw, err := readCapped(profilePath, lim.MaxRawBytes, "MaxRawBytes")
+	return load(func(name string) (io.ReadCloser, error) { return os.Open(name) }, profilePath, execlogPath, lim)
+}
+
+// LoadFS is Load through fsys: both paths are fs.FS paths, so a root's FS
+// refuses names that leave it. Handle rules and limits are Load's.
+func LoadFS(fsys fs.FS, profilePath, execlogPath string, lim Limits) (*Profile, error) {
+	return load(func(name string) (io.ReadCloser, error) { return fsys.Open(name) }, profilePath, execlogPath, lim)
+}
+
+func load(open func(string) (io.ReadCloser, error), profilePath, execlogPath string, lim Limits) (*Profile, error) {
+	raw, err := readCapped(open, profilePath, lim.MaxRawBytes, "MaxRawBytes")
 	if err != nil {
 		return nil, err
 	}
 	if execlogPath == "" {
 		return assemble(raw, nil, "", lim)
 	}
-	side, err := readCapped(execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
+	side, err := readCapped(open, execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
 	switch {
 	case errors.Is(err, ErrLimit):
 		return assemble(raw, nil, ReasonSidecarLimits, lim)
@@ -127,8 +148,8 @@ func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
 
 // readCapped reads a whole file, refusing one larger than limit. It never
 // reads more than limit+1 bytes.
-func readCapped(path string, limit int64, name string) (b []byte, err error) {
-	f, err := os.Open(path)
+func readCapped(open func(string) (io.ReadCloser, error), path string, limit int64, name string) (b []byte, err error) {
+	f, err := open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +245,17 @@ func assemble(raw, execlogBytes []byte, unread string, lim Limits) (*Profile, er
 }
 
 func checkStructure(p *profile.Profile, lim Limits) error {
+	for _, st := range p.SampleType {
+		if n := max(len(st.Type), len(st.Unit)); n > lim.MaxMetaBytes {
+			return limitErr("MaxMetaBytes", lim.MaxMetaBytes, fmt.Sprintf("a %d-byte sample type or unit", n))
+		}
+	}
+	comments := 0
+	for _, c := range p.Comments {
+		if comments += len(c); comments > lim.MaxCommentBytes {
+			return limitErr("MaxCommentBytes", lim.MaxCommentBytes, ">"+fmt.Sprint(lim.MaxCommentBytes)+" bytes of comments")
+		}
+	}
 	if len(p.Sample) > lim.MaxSamples {
 		return limitErr("MaxSamples", lim.MaxSamples, len(p.Sample))
 	}

@@ -341,3 +341,13 @@ func isSystemSymbol(name string) bool {
 func isUnsymbolized(name string) bool {
 	return name == foldedstacks.UnknownFrame || framename.IsAddressOnly(name)
 }
+
+// DomainKeys are the keys Info().Key takes, in legend order (the reading
+// order CPU to accelerator, then the synthetic root).
+func DomainKeys() []string {
+	keys := make([]string, len(legendOrder))
+	for i, d := range legendOrder {
+		keys[i] = d.Info().Key
+	}
+	return keys
+}

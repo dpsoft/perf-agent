@@ -435,6 +435,7 @@ func inheritedWhy(why string) string {
 
 func (d *differ) shareDelta(cum [2]int64) Fact {
 	var share [2]float64
+	var exact [2]*big.Rat
 	for s, v := range d.views {
 		if v.Total == 0 {
 			f := unavailableFact(MetricShareDelta, UnitRatio, ReasonZeroTotal)
@@ -442,10 +443,16 @@ func (d *differ) shareDelta(cum [2]int64) Fact {
 			return f
 		}
 		share[s] = float64(cum[s]) / float64(v.Total)
+		exact[s] = big.NewRat(cum[s], v.Total)
 	}
 	delta := share[newSide] - share[baseSide]
-	f := Fact{Ratio: new(delta), Unit: UnitRatio, Status: StatusOK, Denominator: DenominatorViewTotal, Rounding: RoundingFor(MetricShareDelta)}
-	if delta == 0 {
+	// The status comes from the rational: two float shares that differ in
+	// the last bit must not make an equal pair look changed, nor the
+	// reverse.
+	diff := new(big.Rat).Sub(exact[newSide], exact[baseSide])
+	f := Fact{Ratio: new(delta), Unit: UnitRatio, Status: StatusOK, Denominator: DenominatorViewTotal,
+		Rounding: RoundingFor(MetricShareDelta), policy: policyOf(MetricShareDelta), exact: diff}
+	if diff.Sign() == 0 {
 		f.Status = StatusZero
 	}
 	return f
@@ -477,7 +484,7 @@ func (d *differ) perUnitDelta(cum [2]int64) *Fact {
 	if math.IsInf(delta, 0) || math.IsNaN(delta) {
 		return new(unavailableFact(MetricPerWorkDelta, unit, ReasonNonFinite))
 	}
-	f := Fact{Derived: new(delta), Unit: unit, Status: StatusOK, Rounding: RoundingFor(MetricPerWorkDelta)}
+	f := Fact{Derived: new(delta), Unit: unit, Status: StatusOK, Rounding: RoundingFor(MetricPerWorkDelta), policy: policyOf(MetricPerWorkDelta)}
 	if delta == 0 {
 		f.Status = StatusZero
 	}

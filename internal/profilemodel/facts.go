@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -77,23 +78,8 @@ const (
 // Values in the sample unit and counts are exact integers, so a claim about
 // one must state it exactly. It returns "" for a metric it does not know.
 func RoundingFor(metric string) string {
-	switch metric {
-	case MetricShareOfTotal, MetricShareOfParent, MetricShareDelta:
-		return "0.001 ratio"
-	case MetricQualityJoinExact, MetricQualityJoinHeuristic, MetricQualityJoinUnmatched,
-		MetricQualityAmbiguous, MetricQualityGraphRefused, MetricQualityUnsampled,
-		MetricQualitySerializedTrue, MetricQualitySerializedFalse,
-		MetricQualitySerializedUnknown, MetricQualitySerializedMissing,
-		MetricQualityUnresolved, MetricQualityUnresolvedByModule, MetricQualityCollision:
-		return "0.001 ratio"
-	case MetricCumulative, MetricSelf, MetricInexactPortion, MetricUnsampledPortion,
-		MetricSerializationTrue, MetricSerializationFalse, MetricSerializationUnknown, MetricSerializationMissing,
-		MetricExecutionsBelow, MetricKernelNamesObserved:
-		return "exact"
-	case MetricPerWorkDelta:
-		return "3 significant figures"
-	}
-	return ""
+	p, _ := PolicyFor(metric)
+	return p.String()
 }
 
 // Fact is one value with its unit, status and the engine's rounding.
@@ -106,12 +92,20 @@ type Fact struct {
 	Unit        string   `json:"unit"`              // sample unit, "ratio", "count" or "<sample unit>/work"
 	Status      Status   `json:"status"`
 	Reason      string   `json:"reason,omitempty"`      // set exactly when unavailable
-	Denominator string   `json:"denominator,omitempty"` // "view_total", "parent:<node id>" or "node:<node id>", for shares
+	Denominator string   `json:"denominator,omitempty"` // "view_total", "parent:<node id>", "node:<node id>" or "function:<ref>", for shares
 	Rounding    string   `json:"rounding"`              // RoundingFor the fact's metric
+
+	policy Rounding // PolicyFor the fact's metric
+	exact  *big.Rat // part/whole of a share; nil otherwise
+}
+
+func policyOf(metric string) Rounding {
+	p, _ := PolicyFor(metric)
+	return p
 }
 
 func intFact(metric string, v int64, unit string) Fact {
-	f := Fact{Int: new(v), Unit: unit, Status: StatusOK, Rounding: RoundingFor(metric)}
+	f := Fact{Int: new(v), Unit: unit, Status: StatusOK, Rounding: RoundingFor(metric), policy: policyOf(metric)}
 	if v == 0 {
 		f.Status = StatusZero
 	}
@@ -119,7 +113,7 @@ func intFact(metric string, v int64, unit string) Fact {
 }
 
 func unavailableFact(metric, unit, reason string) Fact {
-	return Fact{Unit: unit, Status: StatusUnavailable, Reason: reason, Rounding: RoundingFor(metric)}
+	return Fact{Unit: unit, Status: StatusUnavailable, Reason: reason, Rounding: RoundingFor(metric), policy: policyOf(metric)}
 }
 
 // shareFact is part/whole, unavailable with ReasonZeroTotal when whole is 0
@@ -130,7 +124,8 @@ func shareFact(metric string, part, whole int64, denominator string) Fact {
 		f.Denominator = denominator
 		return f
 	}
-	f := Fact{Ratio: new(float64(part) / float64(whole)), Unit: UnitRatio, Status: StatusOK, Denominator: denominator, Rounding: RoundingFor(metric)}
+	f := Fact{Ratio: new(float64(part) / float64(whole)), Unit: UnitRatio, Status: StatusOK, Denominator: denominator, Rounding: RoundingFor(metric),
+		policy: policyOf(metric), exact: big.NewRat(part, whole)}
 	if part == 0 {
 		f.Status = StatusZero
 	}
@@ -222,23 +217,24 @@ func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error) {
 	for _, q := range path {
 		names = append(names, q.Function.Name)
 	}
+	core, err := v.CoreFacts(id)
+	if err != nil {
+		return PathFacts{}, err
+	}
 	pf := PathFacts{
 		Handle:            v.Handle,
 		View:              v.name(),
 		Node:              n.ID,
 		Path:              names,
-		Cumulative:        intFact(MetricCumulative, n.Cum, v.Unit),
-		Self:              intFact(MetricSelf, n.Self, v.Unit),
-		ShareOfTotal:      shareFact(MetricShareOfTotal, n.Cum, v.Total, DenominatorViewTotal),
-		ShareOfParent:     unavailableFact(MetricShareOfParent, UnitRatio, ReasonNoParent),
-		InexactPortion:    intFact(MetricInexactPortion, n.Inexact, v.Unit),
+		ParentNode:        core.ParentNode,
+		Cumulative:        core.Cumulative,
+		Self:              core.Self,
+		ShareOfTotal:      core.ShareOfTotal,
+		ShareOfParent:     core.ShareOfParent,
+		InexactPortion:    core.InexactPortion,
 		Domain:            "unknown",
 		DomainInferred:    true,
 		CollisionPossible: n.CollisionPossible,
-	}
-	if n.Parent != nil {
-		pf.ParentNode = n.Parent.ID
-		pf.ShareOfParent = shareFact(MetricShareOfParent, n.Cum, n.Parent.Cum, denominatorParent+string(n.Parent.ID))
 	}
 	if classify != nil {
 		pf.Domain = classify(n.Function.Name, n.Function.Module.File)

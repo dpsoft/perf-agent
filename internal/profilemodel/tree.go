@@ -230,13 +230,16 @@ func addChecked(a, b int64, what string) (int64, error) {
 	return a + b, nil
 }
 
-// frameRef is one emitted frame: its function, the function's key, and the
-// location it came from (absent for a frame invented for a missing one).
+// frameRef is one emitted frame: its function, the function's key, the
+// location it came from (absent for a frame invented for a missing one), and
+// the source file and line the profile gives for it ("" and 0 when none).
 type frameRef struct {
 	fn      FunctionID
 	key     string
 	site    LocationID
 	hasSite bool
+	file    string
+	line    int64
 }
 
 type edge struct {
@@ -315,7 +318,11 @@ func (b *builder) locationFrames(loc *profile.Location) []frameRef {
 			fn.Filename, fn.StartLine = ln.Function.Filename, ln.Function.StartLine
 		}
 		site := LocationID{Module: mod, Offset: loc.Address, Inline: len(loc.Line) - 1 - i}
-		out = append(out, frameRef{fn: fn, key: fn.Key(), site: site, hasSite: true})
+		fr := frameRef{fn: fn, key: fn.Key(), site: site, hasSite: true, line: ln.Line}
+		if ln.Function != nil {
+			fr.file = ln.Function.Filename
+		}
+		out = append(out, fr)
 	}
 	b.frames[loc] = out
 	return out

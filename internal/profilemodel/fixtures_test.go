@@ -154,6 +154,78 @@ func allFixtures() map[string]func() []byte {
 				fx{stack: []string{"main", "other", "[gpu:k]"}, value: 15, labels: map[string][]string{"gpu_ambiguous": {"true"}}},
 			)
 		},
+		"gpu-three-executions": gpuThreeExecutions,
+		"gpu-pc-sampling":      gpuPCSampling,
+		"gpu-sampled-and-unsampled": func() []byte {
+			return gpuProfile(
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 70, labels: map[string][]string{"gpu_sample_period": {"8"}}},
+				fx{stack: []string{"[gpu:launch unsampled]", "[gpu:kernel:k]"}, value: 30},
+			)
+		},
+		"inexact-joins": func() []byte {
+			join := func(v string) map[string][]string { return map[string][]string{"gpu_join": {v}} }
+			return gpuProfile(
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 65, labels: join("exact")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 10, labels: join("heuristic")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 20, labels: join("unmatched")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 5, labels: map[string][]string{"gpu_ambiguous": {"true"}}},
+			)
+		},
+		"gpu-serialized": func() []byte {
+			ser := func(v string) map[string][]string { return map[string][]string{"gpu_serialized": {v}} }
+			return gpuProfile(
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 10, labels: ser("true")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 50, labels: ser("false")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 30, labels: ser("unknown")},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 10},
+			)
+		},
+		"cpu-all-zero": func() []byte {
+			return cpuProfile(fx{stack: []string{"main", "work"}, value: 0})
+		},
+		"gpu-kernel-names": func() []byte {
+			return gpuProfile(
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k1]"}, value: 10, labels: map[string][]string{"stall": {"a"}}},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k1]"}, value: 20, labels: map[string][]string{"stall": {"b"}}},
+				fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k2]"}, value: 0},
+			)
+		},
+	}
+}
+
+// gpuThreeExecutions has two samples carrying three executions: 0 and 1
+// on sample 0, 2 on sample 1 (see threeExecutionRows).
+func gpuThreeExecutions() []byte {
+	return gpuProfile(
+		fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k1]"}, value: 300},
+		fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k2]"}, value: 50},
+	)
+}
+
+func threeExecutionRows() []execlog.Row {
+	return []execlog.Row{
+		{Sample: 0, Execution: 0, Value: 100},
+		{Sample: 0, Execution: 1, Value: 200},
+		{Sample: 1, Execution: 2, Value: 50},
+	}
+}
+
+// gpuPCSampling is one execution's PC samples split by stall reason into
+// three samples; the last received no weight (see pcSamplingRows).
+func gpuPCSampling() []byte {
+	stall := func(v string) map[string][]string { return map[string][]string{"stall": {v}} }
+	return gpuProfile(
+		fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 4, labels: stall("a")},
+		fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 6, labels: stall("b")},
+		fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 0, labels: stall("c")},
+	)
+}
+
+func pcSamplingRows() []execlog.Row {
+	return []execlog.Row{
+		{Sample: 0, Execution: 7, Value: 4},
+		{Sample: 1, Execution: 7, Value: 6},
+		{Sample: 2, Execution: 7, Value: 0},
 	}
 }
 

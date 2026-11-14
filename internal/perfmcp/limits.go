@@ -3,6 +3,7 @@ package perfmcp
 import (
 	"fmt"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
@@ -10,10 +11,12 @@ import (
 // New and never changes them, so two servers with different limits can hold
 // the same handle and still judge its evidence differently.
 //
-// New fills in defaults: a zero Limits is DefaultLimits, and a zero Model
-// is profilemodel.DefaultLimits, so a Limits that sets only some of the
-// server's own fields still loads profiles. MaxRows, MaxCachedDiffs and MaxDiffRows are filled in when zero. Any other
-// non-positive server field is refused.
+// New fills in defaults: a zero Limits is DefaultLimits, a zero Model is
+// profilemodel.DefaultLimits and a zero Explain is explain.DefaultLimits,
+// so a Limits that sets only some of the server's own fields still loads
+// profiles and checks explanations. MaxRows, MaxCachedDiffs, MaxDiffRows,
+// MaxPageBytes, MaxPageNodes and MaxAttemptsPerView are filled in when
+// zero. Any other non-positive field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -31,6 +34,16 @@ type Limits struct {
 	MaxCachedDiffs int
 	// MaxDiffRows bounds the limit argument of diff.
 	MaxDiffRows int
+	// Explain bounds the explanations one render_flamegraph call checks.
+	Explain explain.Limits
+	// MaxPageBytes bounds one rendered page; frames are left out, and
+	// counted on the page, to stay under it.
+	MaxPageBytes int
+	// MaxPageNodes bounds the frames one page draws.
+	MaxPageNodes int
+	// MaxAttemptsPerView is how many render attempts the server keeps per
+	// handle and view; one more drops the oldest.
+	MaxAttemptsPerView int
 }
 
 // defaultMaxRows is the MaxRows a server runs with unless told otherwise.
@@ -40,6 +53,13 @@ const defaultMaxRows = 200
 const (
 	defaultMaxCachedDiffs = 4
 	defaultMaxDiffRows    = 500
+)
+
+// Defaults of the render limits.
+const (
+	defaultMaxPageBytes       = 32 << 20
+	defaultMaxPageNodes       = 20000
+	defaultMaxAttemptsPerView = 100
 )
 
 // DefaultLimits are the limits a server runs with unless told otherwise.
@@ -52,6 +72,11 @@ func DefaultLimits() Limits {
 		MaxRows:          defaultMaxRows,
 		MaxCachedDiffs:   defaultMaxCachedDiffs,
 		MaxDiffRows:      defaultMaxDiffRows,
+
+		Explain:            explain.DefaultLimits(),
+		MaxPageBytes:       defaultMaxPageBytes,
+		MaxPageNodes:       defaultMaxPageNodes,
+		MaxAttemptsPerView: defaultMaxAttemptsPerView,
 	}
 }
 
@@ -72,6 +97,18 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxDiffRows == 0 {
 		l.MaxDiffRows = defaultMaxDiffRows
 	}
+	if l.Explain == (explain.Limits{}) {
+		l.Explain = explain.DefaultLimits()
+	}
+	if l.MaxPageBytes == 0 {
+		l.MaxPageBytes = defaultMaxPageBytes
+	}
+	if l.MaxPageNodes == 0 {
+		l.MaxPageNodes = defaultMaxPageNodes
+	}
+	if l.MaxAttemptsPerView == 0 {
+		l.MaxAttemptsPerView = defaultMaxAttemptsPerView
+	}
 	return l
 }
 
@@ -87,6 +124,16 @@ func (l Limits) validate() error {
 		{"MaxRows", l.MaxRows},
 		{"MaxCachedDiffs", l.MaxCachedDiffs},
 		{"MaxDiffRows", l.MaxDiffRows},
+		{"MaxPageBytes", l.MaxPageBytes},
+		{"MaxPageNodes", l.MaxPageNodes},
+		{"MaxAttemptsPerView", l.MaxAttemptsPerView},
+		{"Explain.MaxExplanations", l.Explain.MaxExplanations},
+		{"Explain.MaxClaimsPerExplanation", l.Explain.MaxClaimsPerExplanation},
+		{"Explain.MaxClaimsTotal", l.Explain.MaxClaimsTotal},
+		{"Explain.MaxProseBytes", l.Explain.MaxProseBytes},
+		{"Explain.MaxHypotheses", l.Explain.MaxHypotheses},
+		{"Explain.MaxHypothesisBytes", l.Explain.MaxHypothesisBytes},
+		{"Explain.MaxNextBytes", l.Explain.MaxNextBytes},
 	} {
 		if f.v <= 0 {
 			return fmt.Errorf("perfmcp: limit %s must be positive, got %d", f.name, f.v)

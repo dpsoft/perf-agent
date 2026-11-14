@@ -36,7 +36,17 @@ type Server struct {
 	store *store
 	// diffs caches computed diffs; it belongs to this server alone.
 	diffs *diffCache
-	mcp   *mcpstdio.Server
+	// attempts records every render_flamegraph call that got as far as
+	// checking, so a page lists the rejected ones from this record.
+	attempts *attempts
+	mcp      *mcpstdio.Server
+
+	// link publishes a written temporary under its final name without
+	// replacing anything; it is (*os.Root).Link. beforePublish, when set,
+	// runs between writing the temporary and publishing it. Both are
+	// seams for tests.
+	link          func(r *os.Root, oldname, newname string) error
+	beforePublish func(name string)
 }
 
 // New opens every root of cfg and builds a server. It refuses a missing or
@@ -55,6 +65,8 @@ func New(cfg Config) (_ *Server, err error) {
 		log:       cfg.Log,
 		manifests: slices.Clone(cfg.SourceManifests),
 		sourceGit: cfg.SourceGit,
+		attempts:  newAttempts(lim.MaxAttemptsPerView),
+		link:      (*os.Root).Link,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -108,7 +120,7 @@ func (s *Server) Close() error {
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
-	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool()}
+	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.renderTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.

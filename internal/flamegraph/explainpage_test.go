@@ -779,3 +779,18 @@ func TestExplainedPageSaysHowManyFailuresARecordLeftOut(t *testing.T) {
 	assert.Contains(t, sec, `<span class="ref">a1</span> and 8 more failures</li>`)
 	assert.Contains(t, got, "1 claim rejected at render</span>")
 }
+
+func TestTheRejectedPillCountsOmittedClaimsAndReferences(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{{Attempt: "a1", Failures: []explain.Failure{
+		failure(explain.CodeValueMismatch, "c1", "", "0.62", engine),
+		failure(explain.CodeValueMismatch, "c2", "", "0.63", engine),
+	}, Omitted: 10, OmittedClaims: 6, OmittedReferences: 3}}
+	got := exPage(t, v, r, opts)
+	assert.Contains(t, got, "8 claims and 3 references rejected at render</span>")
+	assert.Contains(t, got, `<span class="ref">a1</span> and 10 more failures</li>`)
+	assert.Equal(t, 2, strings.Count(got, "<s>0.6"), "only the kept claims are listed")
+}

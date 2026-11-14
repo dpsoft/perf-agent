@@ -67,6 +67,11 @@ func TestCPUViewJoinFactsAreUnavailable(t *testing.T) {
 	} {
 		wantUnavailable(t, name, f, ReasonNotGPUView)
 	}
+	for name, f := range map[string]Fact{"exact": q.JoinExact, "serialized missing": q.Serialized.Missing} {
+		if f.Denominator != DenominatorViewTotal {
+			t.Fatalf("%s: denominator %q, want %q", name, f.Denominator, DenominatorViewTotal)
+		}
+	}
 	// Symbols are measured on every view: resolved is a zero, not unavailable.
 	wantRatio(t, "unresolved", q.Unresolved, 0, DenominatorViewTotal, StatusZero)
 	if len(q.UnresolvedByModule) != 0 {
@@ -95,6 +100,31 @@ func TestUnresolvedWeightCountedOncePerModule(t *testing.T) {
 	}
 }
 
+// A matched ancestor is unresolved the same way on both sides of a diff.
+// Counting it would put libfoo at 1.0 under foo on both and hide that
+// libfoo now also fails to symbolize below foo.
+func TestNodeQualityIgnoresUnresolvedAncestors(t *testing.T) {
+	key := libfooKey("/usr/lib/libfoo.so", "f00")
+	foo := []string{"main", "libfoo.so+0x1", "foo"}
+
+	base := fixtureView(t, "unresolved-ancestor-base")
+	q, den := nodeQualityAt(t, base, foo...)
+	wantRatio(t, "base foo", q.Unresolved, 0, den, StatusZero)
+	if _, ok := q.UnresolvedByModule[key]; ok {
+		t.Fatalf("base foo lists libfoo: %v", q.UnresolvedByModule)
+	}
+
+	next := fixtureView(t, "unresolved-ancestor-new")
+	q, den = nodeQualityAt(t, next, foo...)
+	wantRatio(t, "new foo", q.Unresolved, 0.5, den, StatusOK)
+	wantRatio(t, "new foo libfoo", q.UnresolvedByModule[key], 0.5, den, StatusOK)
+
+	// The view still sees the ancestor, on both sides.
+	for name, v := range map[string]*View{"base": base, "new": next} {
+		wantRatio(t, name+" view libfoo", v.Quality().UnresolvedByModule[key], 1, DenominatorViewTotal, StatusOK)
+	}
+}
+
 func TestNodeQualityOfTheRootUsesTheViewTotal(t *testing.T) {
 	v := fixtureView(t, "gpu-unresolved-ancestor")
 	q, err := v.NodeQuality(v.Root.ID)
@@ -111,6 +141,11 @@ func TestModulesWithTheSameBaseNameStaySeparate(t *testing.T) {
 		t.Fatalf("modules %q, want %q and %q", got, a, b)
 	}
 	wantRatio(t, "/a", q.UnresolvedByModule[a], 0.3, DenominatorViewTotal, StatusOK)
+	for key, want := range map[string]ModuleRef{a: {File: "/a/libfoo.so", BuildID: "1"}, b: {File: "/b/libfoo.so", BuildID: "2"}} {
+		if got := q.UnresolvedModules[key]; got != want {
+			t.Fatalf("module %s: %+v, want %+v", key, got, want)
+		}
+	}
 	wantRatio(t, "/b", q.UnresolvedByModule[b], 0.7, DenominatorViewTotal, StatusOK)
 	wantRatio(t, "unresolved", q.Unresolved, 1, DenominatorViewTotal, StatusOK)
 }
@@ -121,6 +156,9 @@ func TestUnresolvedWithoutAModule(t *testing.T) {
 	q := fixtureView(t, "address-only-and-empty-stack").Quality()
 	wantRatio(t, "unresolved", q.Unresolved, 1, DenominatorViewTotal, StatusOK)
 	wantRatio(t, "no module", q.UnresolvedByModule[""], 5.0/11, DenominatorViewTotal, StatusOK)
+	if got, ok := q.UnresolvedModules[""]; !ok || got != (ModuleRef{}) {
+		t.Fatalf("no-module entry %+v (present %v), want the zero ModuleRef", got, ok)
+	}
 	wantRatio(t, "libfoo", q.UnresolvedByModule[libfooKey("/usr/lib/libfoo.so", "f")], 6.0/11, DenominatorViewTotal, StatusOK)
 }
 
@@ -166,9 +204,13 @@ func TestNodeQualityRestrictsToTheNode(t *testing.T) {
 	wantRatio(t, "libfoo node", q.Unresolved, 1, den, StatusOK)
 	wantRatio(t, "libfoo node module", q.UnresolvedByModule[key], 1, den, StatusOK)
 
-	// The kernel's own frame is named; its unresolved caller still counts.
+	// At node level only frames at or below the node count: the kernel is
+	// named, and its unresolved caller is left to the view's quality.
 	q, den = nodeQualityAt(t, v, "main", "libfoo.so+0x123", "[gpu:kernel:k]")
-	wantRatio(t, "kernel under libfoo", q.Unresolved, 1, den, StatusOK)
+	wantRatio(t, "kernel under libfoo", q.Unresolved, 0, den, StatusZero)
+	if len(q.UnresolvedByModule) != 0 || len(q.UnresolvedModules) != 0 {
+		t.Fatalf("kernel node modules %v %v", q.UnresolvedByModule, q.UnresolvedModules)
+	}
 
 	q, den = nodeQualityAt(t, v, "main", "launch")
 	wantRatio(t, "launch node", q.Unresolved, 0, den, StatusZero)
@@ -270,18 +312,23 @@ func TestQualityInvariantsOnEveryFixture(t *testing.T) {
 					if f.Ratio != nil && (*f.Ratio < 0 || *f.Ratio > 1) {
 						t.Errorf("%s %s: share %v outside [0, 1]", what, metric, *f.Ratio)
 					}
-					if f.Status == StatusUnavailable {
-						if n.Cum != 0 && f.Reason != ReasonNotGPUView {
-							t.Errorf("%s %s: unavailable %q with a value of %d", what, metric, f.Reason, n.Cum)
-						}
-						continue
-					}
 					want := DenominatorViewTotal
 					if n != v.Root {
 						want = "node:" + string(n.ID)
 					}
 					if f.Denominator != want {
 						t.Errorf("%s %s: denominator %q, want %q", what, metric, f.Denominator, want)
+					}
+					if f.Status == StatusUnavailable && n.Cum != 0 && f.Reason != ReasonNotGPUView {
+						t.Errorf("%s %s: unavailable %q with a value of %d", what, metric, f.Reason, n.Cum)
+					}
+				}
+				if !slices.Equal(slices.Sorted(maps.Keys(q.UnresolvedModules)), slices.Sorted(maps.Keys(q.UnresolvedByModule))) {
+					t.Errorf("%s: modules %v and shares %v disagree", what, q.UnresolvedModules, q.UnresolvedByModule)
+				}
+				for k, mod := range q.UnresolvedModules {
+					if mod.Key() != k {
+						t.Errorf("%s: module %+v under key %q", what, mod, k)
 					}
 				}
 				if b, err := json.Marshal(q); err != nil || strings.Contains(string(b), "NaN") {
@@ -327,7 +374,7 @@ func TestQualityJSONKeys(t *testing.T) {
 	want := []string{
 		"join_exact", "join_heuristic", "join_unmatched", "ambiguous", "graph_refused",
 		"unsampled_launches", "sample_periods", "serialized", "unresolved",
-		"unresolved_by_module", "collision_possible", "executions",
+		"unresolved_by_module", "unresolved_modules", "collision_possible", "executions",
 	}
 	if got := slices.Sorted(maps.Keys(top)); !slices.Equal(got, slices.Sorted(slices.Values(want))) {
 		t.Fatalf("keys %q\nwant %q", got, want)

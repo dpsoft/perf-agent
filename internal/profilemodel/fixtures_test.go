@@ -205,6 +205,19 @@ func allFixtures() map[string]func() []byte {
 				rs{stack: []frame{fn("main"), in("/usr/lib/libbar.so", "ba5", 0x30)}, value: 0},
 			)
 		},
+		"unresolved-ancestor-base": func() []byte {
+			return rich("cpu", "nanoseconds",
+				rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f00", 0x1), fn("foo"), fn("bar")}, value: 100},
+			)
+		},
+		"unresolved-ancestor-new": func() []byte {
+			// As the base, but half of foo now ends in an unsymbolized
+			// libfoo frame.
+			return rich("cpu", "nanoseconds",
+				rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f00", 0x1), fn("foo"), fn("bar")}, value: 50},
+				rs{stack: []frame{fn("main"), in("/usr/lib/libfoo.so", "f00", 0x1), fn("foo"), in("/usr/lib/libfoo.so", "f00", 0x9)}, value: 50},
+			)
+		},
 		"same-base-name-two-modules": func() []byte {
 			// Both frames display as "libfoo.so+0x10".
 			return rich("cpu", "nanoseconds",

@@ -22,9 +22,9 @@ const (
 //     string, as the profile does.
 //   - real: any other non-empty File.
 type ModuleRef struct {
-	File     string // "" = no mapping (nil, or Mapping.File == "")
-	BuildID  string
-	Sentinel string // "[kernel]" or "[jit]" when the mapping file is one of them
+	File     string `json:"file"` // "" = no mapping (nil, or Mapping.File == "")
+	BuildID  string `json:"build_id,omitempty"`
+	Sentinel string `json:"sentinel,omitempty"` // "[kernel]" or "[jit]" when the mapping file is one of them
 }
 
 func moduleOf(file, buildID string) ModuleRef {

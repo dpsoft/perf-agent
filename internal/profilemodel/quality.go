@@ -49,8 +49,13 @@ const (
 // trusted. Every fact is a share of the scope's value: the view total
 // (denominator "view_total") or the node's cumulative value ("node:<id>").
 // A zero value makes every share unavailable "zero total"; the GPU-only
-// facts are unavailable "not a GPU view" on other views. Only samples with
-// a non-zero value at the view's index carry weight.
+// facts are unavailable "not a GPU view" on other views, still naming the
+// denominator they would have had. Only samples with a non-zero value at
+// the view's index carry weight.
+//
+// In unresolved_by_module and unresolved_modules the key "" means "no
+// module": unresolved frames without a mapping file, such as a bare
+// address on the empty first mapping or the "[unknown]" of an empty stack.
 type Quality struct {
 	// JoinExact, JoinHeuristic and JoinUnmatched are the shares whose
 	// gpu_join label is exactly that one value. A sample without the label,
@@ -72,18 +77,24 @@ type Quality struct {
 	// PathFacts.Serialization is. GPU views only; on a GPU view with a
 	// non-zero value the four sum to 1.
 	Serialized Serialization `json:"serialized"`
-	// Unresolved is the share whose stack has an unresolved frame (a bare
-	// address, "<module>+0x<offset>", or "[unknown]") anywhere on it, not
-	// only at the leaf: a GPU leaf is a named kernel above CPU callers.
-	// For a node that is the whole stack of each of its samples, the
-	// node's callers included.
+	// Unresolved is the share with an unresolved frame (a bare address,
+	// "<module>+0x<offset>", or "[unknown]"). For the view, Quality, that
+	// is anywhere on the stack, not only at the leaf: a GPU leaf is a named
+	// kernel above CPU callers. For a node, NodeQuality, it is frames at or
+	// below the node: its callers are the same on both sides of a matched
+	// diff path, so counting them would only saturate the share at 1 and
+	// hide a change below the node. The view-level Quality covers them.
 	Unresolved Fact `json:"unresolved"`
 	// UnresolvedByModule splits Unresolved by the unresolved frames'
 	// ModuleRef.Key(): build id, else sentinel, else full path, and "" for
-	// frames with no module. A sample counts once in each module it has an
-	// unresolved frame in, however many there are, so the entries may sum
-	// to more than Unresolved but none exceeds it. Never nil.
+	// no module. A sample counts once in each module it has an unresolved
+	// frame in, however many there are, so the entries may sum to more
+	// than Unresolved but none exceeds it. Never nil.
 	UnresolvedByModule map[string]Fact `json:"unresolved_by_module"`
+	// UnresolvedModules names the module behind each UnresolvedByModule
+	// key, with the same keys, so a diff can match modules by build id,
+	// full path or base name and say which one degraded. Never nil.
+	UnresolvedModules map[string]ModuleRef `json:"unresolved_modules"`
 	// CollisionPossible is the share whose stack passes through a node
 	// marked Node.CollisionPossible, each sample counted once.
 	CollisionPossible Fact `json:"collision_possible"`
@@ -118,20 +129,25 @@ func isUnresolved(name string) bool {
 type stackMarks struct {
 	unsampled, unresolved, collision map[int]struct{}
 	byModule                         map[string]map[int]struct{}
+	modules                          map[string]ModuleRef
 }
 
-// marksFor finds, for the samples through n, which stacks are unsampled,
-// unresolved (and in which modules) and pass through a collision. Only n's
-// ancestors and its subtree share samples with n: an ancestor's frame is on
-// every one of n's stacks, and a subtree node's samples are a subset of n's.
+// marksFor finds, for the samples through n, which stacks are unsampled or
+// pass through a collision, and which have an unresolved frame at or below
+// n (and in which modules). Only n's ancestors and its subtree share
+// samples with n: an ancestor's frame is on every one of n's stacks, and a
+// subtree node's samples are a subset of n's. Ancestors are never checked
+// for unresolved frames; the root has none, so for the view that is the
+// whole stack.
 func (v *View) marksFor(n *Node) stackMarks {
 	m := stackMarks{
 		unsampled:  map[int]struct{}{},
 		unresolved: map[int]struct{}{},
 		collision:  map[int]struct{}{},
 		byModule:   map[string]map[int]struct{}{},
+		modules:    map[string]ModuleRef{},
 	}
-	mark := func(at *Node, samples []int) {
+	mark := func(at *Node, samples []int, ancestor bool) {
 		if len(samples) == 0 {
 			// Only zero-value samples: nothing to weigh, and no module
 			// entry for a frame seen only on them.
@@ -144,10 +160,11 @@ func (v *View) marksFor(n *Node) stackMarks {
 		if at.CollisionPossible {
 			sets = append(sets, m.collision)
 		}
-		if at.Depth > 0 && isUnresolved(at.Function.Name) {
+		if !ancestor && at.Depth > 0 && isUnresolved(at.Function.Name) {
 			key := at.Function.Module.Key()
 			if m.byModule[key] == nil {
 				m.byModule[key] = map[int]struct{}{}
+				m.modules[key] = at.Function.Module
 			}
 			sets = append(sets, m.unresolved, m.byModule[key])
 		}
@@ -158,12 +175,12 @@ func (v *View) marksFor(n *Node) stackMarks {
 		}
 	}
 	for p := n.Parent; p != nil; p = p.Parent {
-		mark(p, n.samples)
+		mark(p, n.samples, true)
 	}
 	for stack := []*Node{n}; len(stack) > 0; {
 		at := stack[len(stack)-1]
 		stack = append(stack[:len(stack)-1], at.Children...)
-		mark(at, at.samples)
+		mark(at, at.samples, false)
 	}
 	return m
 }
@@ -187,6 +204,7 @@ func (v *View) quality(n *Node, denominator string) Quality {
 		SamplePeriods:      v.samplePeriods(slices.Concat(n.samples, n.zeroSamples)),
 		Unresolved:         share(MetricQualityUnresolved, sumOf(m.unresolved)),
 		UnresolvedByModule: make(map[string]Fact, len(m.byModule)),
+		UnresolvedModules:  m.modules,
 		CollisionPossible:  share(MetricQualityCollision, sumOf(m.collision)),
 		Executions:         v.profile.Executions,
 	}
@@ -195,7 +213,11 @@ func (v *View) quality(n *Node, denominator string) Quality {
 	}
 
 	if v.SampleType != gpuSampleType {
-		gpuOnly := func(metric string) Fact { return unavailableFact(metric, UnitRatio, ReasonNotGPUView) }
+		gpuOnly := func(metric string) Fact {
+			f := unavailableFact(metric, UnitRatio, ReasonNotGPUView)
+			f.Denominator = denominator
+			return f
+		}
 		q.JoinExact = gpuOnly(MetricQualityJoinExact)
 		q.JoinHeuristic = gpuOnly(MetricQualityJoinHeuristic)
 		q.JoinUnmatched = gpuOnly(MetricQualityJoinUnmatched)

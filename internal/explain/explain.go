@@ -224,6 +224,9 @@ type Result struct {
 // OmittedClaims counts the claims and OmittedReferences the references
 // that no kept failure names, so a page can count every claim and
 // reference the attempt failed on while listing only the kept failures.
+// Evidence, when set, says how the evidence the attempt was checked
+// against differs from the page's: another handle of the same profile,
+// opened with a different executions log or none.
 type RejectedAttempt struct {
 	Attempt           string    `json:"attempt"`
 	RetryOf           string    `json:"retry_of,omitzero"`
@@ -231,4 +234,5 @@ type RejectedAttempt struct {
 	Omitted           int       `json:"omitted,omitzero"`
 	OmittedClaims     int       `json:"omitted_claims,omitzero"`
 	OmittedReferences int       `json:"omitted_references,omitzero"`
+	Evidence          string    `json:"evidence,omitzero"`
 }

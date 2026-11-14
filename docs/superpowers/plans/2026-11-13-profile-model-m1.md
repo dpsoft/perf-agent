@@ -20,6 +20,8 @@
 - Never count pprof samples or execlog rows as executions or launches; never multiply by `gpu_sample_period`.
 - Zero and unavailable are distinct values in code and in JSON; a zero denominator gives `unavailable: zero total`, never 0 or NaN.
 - "No mapping" means `Mapping == nil || Mapping.File == ""` (synthetic and fallback frames sit on the first mapping with an empty file).
+- Negative values at the selected index are refused, and every accumulation is checked for overflow (`int64` values, `uint64` sidecar sums, base + new combined weights); nothing wraps.
+- Values in the sample unit and counts stay exact integers (`int64`); `float64` is used only for ratios.
 - Comments say what the code does and why; no issue numbers or release history in comments.
 - Commits: no Co-Authored-By, no AI attribution, no session URLs. Push to `ai-flamegraph-design` (draft PR #262); never merge.
 
@@ -61,14 +63,21 @@
   func (d Digest) String() string      // lowercase hex
   type Availability struct{ OK bool; Reason string }
   const (
-      ReasonNoSidecar        = "no sidecar"
+      ReasonNoSidecar        = "no sidecar"        // execlog argument was nil / path ""
+      ReasonEmptySidecar     = "empty sidecar"     // a file was supplied but has 0 bytes
+      ReasonSidecarLimits    = "sidecar exceeds limits"
       ReasonDigestMismatch   = "digest mismatch"
       ReasonSampleCount      = "sample count mismatch"
       ReasonMetadataMismatch = "metadata mismatch"
       ReasonValueMismatch    = "value mismatch"
       ReasonCorrupt          = "corrupt"
   )
-  type Limits struct{ MaxDecompressedBytes, MaxSamples, MaxLocations, MaxDepth int }
+  type Limits struct {
+      MaxRawBytes, MaxDecompressedBytes int64 // enforced before and during parsing
+      MaxSamples, MaxLocations, MaxDepth int  // enforced after parsing, before the tree
+      MaxSidecarBytes                    int64 // enforced while reading the sidecar
+      MaxSidecarRows, MaxSidecarExecutions int // rows and distinct execution ordinals, enforced in the row callback
+  }
   func DefaultLimits() Limits        // values are the builder's call; documented in doc.go
   var ErrLimit = errors.New("profilemodel: input exceeds limit") // wrapped with the limit's name
   type Handle string                   // "<profile digest hex>" or "<profile digest hex>+<execlog sha hex>"
@@ -83,8 +92,8 @@
   func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) // execlogPath "" = none
   func FromBytes(raw []byte, execlog []byte, lim Limits) (*Profile, error) // execlog nil = none
   ```
-- Decompression is bounded by `MaxDecompressedBytes` before `profile.ParseData` sees the bytes; sample, location and depth limits are checked after parsing, before any tree is built.
-- The log is accepted only if, in order: `execlog.Read` succeeds; `Trailer.Verify(raw, len(p.Sample))` passes; `Header.SampleType` equals the profile's GPU sample type string and `Header.CaptureID` equals `CaptureID` when both are non-empty; for every sample index, the sum of its rows' `Value` equals `Sample.Value` at the GPU index. Rows are collected into a local map and copied into `execOf` only after all checks pass. A bad sidecar never fails `Load`; it sets `Executions`.
+- `MaxRawBytes` caps the file; the gzip stream is read through an `io.LimitReader` of `MaxDecompressedBytes + 1` so an over-limit stream is detected before `profile.ParseData` decodes it. That is the only limit active during decoding; samples, locations and depth are structural and are checked after parsing, before any tree is built.
+- The log is accepted only if, in order: its size is within `MaxSidecarBytes` (a supplied 0-byte file → `empty sidecar`); `execlog.Read` succeeds, with the row callback returning an error that stops reading as soon as `MaxSidecarRows` or `MaxSidecarExecutions` would be exceeded (→ `sidecar exceeds limits`) and rejecting any `row.Sample >= len(p.Sample)` **before** indexing (→ `corrupt`; `Read` itself checks the range only after all callbacks); `Trailer.Verify(raw, len(p.Sample))` passes; `Header.SampleType` equals `p.SampleType[i].Type + "/" + p.SampleType[i].Unit` for the GPU index (the producer writes the joined `"gpu/nanoseconds"`, `gpuprofile/profiler.go:200`) and `Header.CaptureID` equals `CaptureID` when both are non-empty; for every sample index, the `uint64` sum of its rows' `Value`, checked for overflow, equals `Sample.Value` at the GPU index, which must be non-negative (a wrapped or negative case → `value mismatch`). Rows are collected into a local map and copied into `execOf` only after all checks pass. A bad sidecar never fails `Load`; it sets `Executions`.
 
 - [ ] **Step 1: Fixture helpers** in `fixtures_test.go`: `gpuProfile(samples ...fx) []byte` (sample type `gpu/nanoseconds`, all synthetic frames on `Mapping[0]` with `File: ""`, labels per sample, serialized bytes); `cpuProfile(...)`; `execlogFor(t, raw []byte, hdr execlog.Header, rows []execlog.Row, nSamples int) []byte` (writes with `execlog.Create` in `t.TempDir()`, `Finish(uint64(nSamples), execlog.ProfileSHA256(raw))`, returns the bytes).
 - [ ] **Step 2: Write the failing tests**:
@@ -93,7 +102,12 @@
   - `TestLoadRejectsAnotherProfilesLog` → `digest mismatch`; `TestLoadRejectsSampleCountMismatch` → `sample count mismatch`; `TestLoadRejectsTruncatedLog` → `corrupt`.
   - `TestLoadRejectsMetadataMismatch`: header `SampleType: "cpu"` → `metadata mismatch`; header capture ID `other` vs comment `7f3a` → `metadata mismatch`.
   - `TestLoadRejectsValueMismatch`: rows summing to 250 for a sample of 300 → `value mismatch`, `execOf == nil`.
-  - `TestLoadEnforcesLimits`: `MaxSamples: 1` with two samples → `errors.Is(err, ErrLimit)` and the message names `MaxSamples`; same for depth.
+  - `TestLoadEnforcesLimits`: `MaxSamples: 1` with two samples → `errors.Is(err, ErrLimit)` and the message names `MaxSamples`; same for depth and for `MaxDecompressedBytes` (a gzip stream that inflates past the cap).
+  - `TestLoadAcceptsTheProducersJoinedSampleType`: header `SampleType: "gpu/nanoseconds"` → `OK` (guards against comparing with `Type` alone).
+  - `TestLoadDistinguishesNoSidecarFromEmptyFile`: `nil` → `no sidecar`; `[]byte{}` → `empty sidecar`.
+  - `TestLoadBoundsTheSidecarWhileReading`: `MaxSidecarRows: 2` with 3 rows → `sidecar exceeds limits`, and the callback ran at most 3 times; `MaxSidecarExecutions: 1` with 2 ordinals → same reason.
+  - `TestLoadRejectsRowOutsideTheProfile`: a row with `Sample: 5` in a 2-sample profile → `corrupt`, no panic.
+  - `TestLoadRejectsWrappedValueSums`: rows `Value: math.MaxUint64` and `Value: 2` on a sample of value 1 → `value mismatch`.
 - [ ] **Step 3: Run** `go test -race ./internal/profilemodel` → FAIL.
 - [ ] **Step 4: Implement** `load.go`; `doc.go` states: facts come from the profile and a checked log only; nothing is inferred or scaled.
 - [ ] **Step 5: Run** → PASS. **Step 6: Commit** `profilemodel: load a profile with limits and a checked executions log`.
@@ -121,8 +135,10 @@
       StartLine int64  // likewise
   }
   func (f FunctionID) Key() string      // exact: build-id (else file, else sentinel) + name (+ filename/startline when no module)
-  func (f FunctionID) NameKey() string  // by-name: base(file) + name; sentinel + name; or name + filename/startline
+  func (f FunctionID) NameKey() string  // by-name, per kind: real module → base(file) + name; sentinel → sentinel + name; unmapped → name + Filename + StartLine
   type NodeID string                    // 16 lowercase hex chars of SHA-256 over the root-to-node FunctionID.Key() sequence
+  func (m ModuleRef) Key() string        // unambiguous module identity: build-id, else full file path, else sentinel, else ""
+  func (f FunctionID) PathKey() (string, bool) // full file path + name; ok only for a real, non-empty, non-sentinel module path
   type Node struct {
       ID                 NodeID
       Function           FunctionID
@@ -149,6 +165,8 @@
       nodes              map[NodeID]*Node
   }
   var ErrUnsupportedView = errors.New("profilemodel: view option not supported yet")
+  var ErrNegativeValue   = errors.New("profilemodel: negative value at the selected sample index")
+  var ErrOverflow        = errors.New("profilemodel: value overflow") // wrapped with the quantity named
   func (p *Profile) View(opts ViewOptions) (*View, error)
   func (v *View) Node(id NodeID) (*Node, bool)
   func (v *View) Walk(fn func(*Node) bool) // pre-order; false stops descent
@@ -166,6 +184,9 @@
   - `TestUnmappedSameNameUsesFilenameAndStartLine`: two `__init__` with different `Filename` → two nodes, `CollisionPossible == false`; two with no filename/start line → one node, `CollisionPossible == true`.
   - `TestInlineFramesBecomeNodesRootFirst`: one location with `Line{inner}, Line{outer}` → nodes `outer` then `inner`.
   - `TestNodeIDsAreStableAcrossLoads`; `TestCollapsedViewIsRejected` (`ErrUnsupportedView`).
+  - `TestViewRejectsNegativeValues`: one sample `-5` at the selected index → `ErrNegativeValue`.
+  - `TestViewRejectsOverflowingAccumulation`: two samples of `math.MaxInt64` on one path → `errors.Is(err, ErrOverflow)`.
+  - `TestPathKeyOnlyForRealModules`: unmapped and `[jit]` frames → `PathKey` ok false; `/opt/a/libfoo.so` → ok true.
 - [ ] **Step 2: Run** `go test -race ./internal/profilemodel` → FAIL. **Step 3: Implement** `identity.go`, `tree.go`. **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `profilemodel: separate location, function and path-node identity`.
 
@@ -181,7 +202,8 @@
   ```go
   type Status string // "ok", "zero", "unavailable"
   type Fact struct {
-      Value       float64 `json:"value"`
+      Int         *int64   `json:"int,omitempty"`       // exact value for sample units and counts; set unless unavailable
+      Ratio       *float64 `json:"ratio,omitempty"`     // set only when Unit == "ratio" and not unavailable
       Unit        string  `json:"unit"`                  // sample unit, "ratio" or "count"
       Status      Status  `json:"status"`
       Reason      string  `json:"reason,omitempty"`      // required when unavailable
@@ -213,11 +235,12 @@
   func RoundingFor(metric string) string // the engine's per-metric policy, single source for §7.3
   func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error)
   ```
+- Exactly one of `Int` and `Ratio` is non-nil when `Status != "unavailable"`; both are nil when it is. Tests below write `{3,"count","ok"}` for `*Int == 3, Unit "count", Status "ok"`.
 - A GPU view is one whose sample type is `gpu`. `ExecutionsBelow` counts distinct ordinals in `execOf[s]` over `node.samples` **and** over zero-value samples whose stack passes through the node (kept aside in Task 3 for this purpose); `unavailable` with `Profile.Executions.Reason` when the log is not OK.
 
 - [ ] **Step 1: Write the failing tests**:
   - `TestAggregatedExecutionsAreCountedFromTheLog` (3 executions → `{3,"count","ok"}`; no log → `unavailable/no sidecar`; other log → `digest mismatch`).
-  - `TestPCSamplingCountsAnExecutionOnce`: rows on samples 0,1,2 all `Execution: 7`, one with `Value: 0` → `ExecutionsBelow.Value == 1`.
+  - `TestPCSamplingCountsAnExecutionOnce`: rows on samples 0,1,2 all `Execution: 7`, one with `Value: 0` → `*ExecutionsBelow.Int == 1`.
   - `TestSamplingSemanticsCarryTheNoteUnscaled`: sampled 70 under `[gpu:launch]` with period 8, unsampled 30 → `Cumulative == 70` (not 560), `Notes == SamplingNotes(30,100,"8",n)`, `UnsampledPortion == 30`, `SamplePeriods == ["8"]`.
   - `TestInexactPortionCountsHeuristicUnmatchedAmbiguous`: 10/20/5 inexact of 100 → `35`.
   - `TestSerializationFourStates`: samples `gpu_serialized` true 10, false 50, unknown 30, absent 10 → `True 10, False 50, Unknown 30, Missing 10`; CPU view → all `unavailable`.
@@ -237,13 +260,14 @@
 - Produces:
   ```go
   type Quality struct {
+      // Serialized below is unavailable (all four) for CPU views and for a zero total.
       JoinExact, JoinHeuristic, JoinUnmatched Fact // shares of the view total; unavailable outside GPU views
       Ambiguous, GraphRefused                 Fact
       UnsampledLaunches                       Fact
       SamplePeriods                           []string
       Serialized                              Serialization // as shares of the view total
-      AddressOnly                             Fact          // share whose leaf is an address-only or unknown frame
-      AddressOnlyByModule                     map[string]Fact // keyed by module file base name ("" = no module)
+      Unresolved                              Fact            // share of samples with an unresolved frame (address-only or [unknown]) ANYWHERE on the stack
+      UnresolvedByModule                      map[string]Fact // keyed by ModuleRef.Key(); each sample's weight counted once per module
       CollisionPossible                       Fact          // share under CollisionPossible nodes
       Executions                              Availability
   }
@@ -251,7 +275,10 @@
   func (v *View) NodeQuality(id NodeID) (Quality, error) // restricted to the node's samples
   ```
 
-- [ ] **Step 1: Write the failing tests**: `TestQualityJoinShares` (65/10/20/5 → 0.65/0.10/0.20), `TestQualitySerializedShares` (as Task 4 → 0.1/0.5/0.3/0.1), `TestAddressOnlyShareByModule` (`libcuda.so.1+0x1b71c6` leaf 40 of 100 → 0.4), `TestCPUViewJoinFactsAreUnavailable`.
+- [ ] **Step 1: Write the failing tests**: `TestQualityJoinShares` (65/10/20/5 → 0.65/0.10/0.20), `TestQualitySerializedShares` (as Task 4 → 0.1/0.5/0.3/0.1), `TestCPUViewJoinFactsAreUnavailable`, and:
+  - `TestUnresolvedAncestorCounts`: GPU stack `main → libfoo.so+0x123 → [gpu:kernel:k]` worth 40 of 100 (the leaf is named) → `Unresolved == 0.4`, `UnresolvedByModule[libfoo key] == 0.4`.
+  - `TestUnresolvedWeightCountedOncePerModule`: one sample of 50 with two unresolved `libfoo.so` frames → `UnresolvedByModule[libfoo key] == 0.5`, not 1.0.
+  - `TestModulesWithTheSameBaseNameStaySeparate`: `/a/libfoo.so` (build-id `1`) and `/b/libfoo.so` (build-id `2`) → two keys.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `profilemodel: profile and node quality, including perturbation`.
 
@@ -273,7 +300,7 @@
       Name            string
       Presence        Presence
       Match           Match
-      Candidates      []NodeID   // when Match == "ambiguous"
+      Candidates      []Candidate // when Match == "ambiguous"
       Interpretation  Interpretation
       Why             string     // set when not_comparable
       BaseCum, NewCum int64
@@ -283,9 +310,10 @@
       DeltaPerUnit    Fact       // unavailable unless both work counts are positive and finite
       Children        []*DiffNode // sorted by |DeltaAbs| desc, then Name
   }
+  type Candidate struct{ Side string; Handle Handle; Node NodeID } // Side is "base" or "new": equal NodeIDs can occur in both views
   type WorkCounts struct{ Base, New float64 } // zero value = not supplied
   const (
-      MaxAddressOnlyShift = 0.10
+      MaxUnresolvedShift  = 0.10
       MaxJoinShift        = 0.10
       MaxSerializedShift  = 0.10
   )
@@ -300,8 +328,9 @@
   var ErrIncompatibleViews = errors.New("profilemodel: views differ in sample type, unit or options")
   func Compare(base, new *View, work WorkCounts) (*Diff, error)
   ```
-- Matching per parent, in order: `exact` on `FunctionID.Key()` when both sides have a build-id; `by_path` on file + name when either side lacks a build-id (never `exact`); `by_name` on `NameKey()` for the leftovers. A leftover with several candidates on the other side — in either direction — is `ambiguous`, keeps its own node and lists `Candidates`.
-- `not_comparable` when the node's module `AddressOnlyByModule` shift, the `JoinExact` shift (GPU), or the `Serialized.True` shift exceeds its constant, or the sample periods differ; `Why` names the first cause.
+- Matching per parent, in order: `exact` on `FunctionID.Key()` when both sides have a build-id; `by_path` on `PathKey()` when both sides have a real module path and at least one lacks a build-id (never `exact`; unmapped and sentinel frames never match by path); `by_name` on `NameKey()` for the leftovers (unmapped frames keep `Filename`/`StartLine` in the key). A leftover with several candidates on the other side — in either direction — is `ambiguous`, keeps its own node and lists `Candidates` with their side and handle.
+- `Combined` and every sum are checked; overflow → `ErrOverflow`.
+- Comparability is evaluated on the nearest matched ancestor's `NodeQuality` on each side (for the root, the view `Quality`). A node is `not_comparable` when, in order: its module's `UnresolvedByModule` share shifts by more than `MaxUnresolvedShift` (modules matched across sides with the same ladder as functions: build-id, else full path, else base name); in GPU views `JoinExact` shifts by more than `MaxJoinShift`; the sample periods differ; or the perturbation policy fails. Perturbation policy: compare all four `Serialized` states; fail when any state's share shifts by more than `MaxSerializedShift`, or when perturbation is known on one side (`True + False > 0`) and entirely `Unknown + Missing` on the other. A state that is `unavailable` (zero total, CPU view) is never used as 0: the comparison is then `unavailable` and recorded in `Why` without forcing `not_comparable`. `Why` names the first cause.
 
 - [ ] **Step 1: Write the failing tests**:
   - `TestDiffTotalsEqualInputs` (100 vs 80 → totals, root `DeltaAbs == -20`).
@@ -313,6 +342,13 @@
   - `TestRemovedPathStaysInTheUnion`: kernel only in base, equal quality → `only_base`, `comparable`, `DeltaAbs == -37`.
   - `TestDegradedSymbolsArePresentButNotComparable`: base `foo` symbolized, new same module address-only → `only_base` **and** `not_comparable`, `Why` names the module.
   - `TestPerturbationShiftIsNotComparable`: base `gpu_serialized=false` everywhere, new 50% `true` → affected nodes `not_comparable`.
+  - `TestSerializationMissingToFalseIsNotComparable` and `TestSerializationUnknownToFalseIsNotComparable`: base 100% missing (resp. unknown), new 100% false, `True == 0` on both → `not_comparable`.
+  - `TestZeroTotalSideIsUnavailableNotZero`: new view total 0 → `DeltaShare` and the perturbation comparison `unavailable`, no panic, no `not_comparable` caused by a zero.
+  - `TestGPUAncestorDegradationIsNotComparable`: base `main → foo(libfoo.so) → [gpu:kernel:k]`, new `main → libfoo.so+0x123 → [gpu:kernel:k]` → `foo` is `only_base` and `not_comparable`, `Why` names `libfoo.so`.
+  - `TestUnmappedSameNameChangingFilenameDoesNotMerge`: `__init__` (a.py:10) vs `__init__` (b.py:20), no mapping → `only_base` + `only_new`, not `both`.
+  - `TestUnmappedSiblingsWithStableFilenamesMatchOneToOne`: two `__init__` siblings (a.py, b.py) on both sides → two `both` nodes, none `ambiguous`.
+  - `TestAmbiguousCandidatesCarrySide`: candidates have `Side` and `Handle` set.
+  - `TestCombinedOverflowIsAnError`: base and new roots of `math.MaxInt64` → `ErrOverflow`.
   - `TestDiffRefusesIncompatibleViews`: cpu vs gpu, and equal type with different `ViewOptions` → `ErrIncompatibleViews`.
   - `TestPerUnitDeltaNeedsPositiveFiniteWork`: none, `{0,100}`, `{+Inf,1}` → `unavailable`; `{100,100}` → `ok`.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** `go test -race ./internal/profilemodel` → PASS.
@@ -327,13 +363,17 @@
 **Interfaces:**
 - Consumes: `profilemodel.Diff` (Task 6); palette variables in `internal/flamegraph/assets.go`.
 - Produces: `func WriteDiffPage(w io.Writer, d *profilemodel.Diff, title string) error` — self-contained HTML (`html/template`, no external assets):
-  - icicle of the union, width = `Combined / root Combined`, colour blue (less) → grey → red (more) by `DeltaShare` (grey when unavailable);
-  - `only_base` hatched, `only_new` outlined, `not_comparable` marked; every node's tooltip shows base and new values;
-  - legend reads "less / more accumulated <sample type> time", never "faster" or "slower";
-  - a table of `only_base` and `only_new` paths with delta, interpretation and `Why`;
+  - icicle of the union, width = `Combined / root Combined`, colour blue (lower share) → grey → red (higher share) by `DeltaShare` (grey when unavailable);
+  - `only_base` hatched, `only_new` outlined, `not_comparable` marked; every node's tooltip shows base, new and raw `DeltaAbs` with the unit;
+  - legend reads "lower / higher share of total <sample type> (<unit>)" from `d.SampleType`/`d.Unit`; never "time" unless that is the unit, never "faster" or "slower";
+  - when both totals are 0: a statement that both views are empty and no icicle (no 0/0);
+  - a table of `only_base` and `only_new` paths with raw delta and unit, interpretation and `Why`;
   - `QualityWarnings` and GPU sampling notes when present.
 
-- [ ] **Step 1: Write the failing tests**: `TestDiffPageNeverSaysFasterOrSlower`, `TestDiffPageListsRemovedPathsWithInterpretation`, `TestDiffPageEscapesNames` (`<script>` frame escaped), `TestDiffPageHasNoExternalAssets`.
+- [ ] **Step 1: Write the failing tests**: `TestDiffPageNeverSaysFasterOrSlower`, `TestDiffPageListsRemovedPathsWithInterpretation`, `TestDiffPageEscapesNames` (`<script>` frame escaped), `TestDiffPageHasNoExternalAssets`, and:
+  - `TestDiffPageSharePlusRawCounterexample`: totals 100 → 200, node 50 → 60 → the node is styled "lower share" and its tooltip/table show `+10`.
+  - `TestDiffPageLegendUsesTheViewsUnit`: an `alloc_space`/`bytes` diff → legend contains `alloc_space` and `bytes`, not `time`.
+  - `TestDiffPageAllZero`: both totals 0 → page renders, states both views are empty, contains no `NaN`/`Infinity`.
 - [ ] **Step 2: Run** `go test -race ./internal/flamegraph -run DiffPage` → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `flamegraph: diff page over the union of both profiles`.
 

@@ -255,24 +255,53 @@ section of the page and gives the repository its first diff.
   - its sample types;
   - its comments, including `perf-agent.capture_id=`;
   - its mappings.
-- **Input limits.** Loading is bounded before parsing finishes, not only when
-  answering: a maximum of decompressed bytes, samples, locations and stack
-  depth (defaults are the builder's call, all configurable). A profile over a
-  limit is refused with the limit named. Truncating answers does not bound the
-  cost of loading.
+- **Input limits.** Loading is bounded, not only answering (defaults are the
+  builder's call, all configurable; a profile over a limit is refused with the
+  limit named; truncating answers does not bound the cost of loading):
+  - **during parsing:** the raw file size and the decompressed byte count are
+    capped before `profile.ParseData` sees the bytes. This is the only limit
+    that applies while the protobuf is decoded.
+  - **after parsing, before any tree is built:** the number of samples,
+    locations and the stack depth. These are structural and cannot be checked
+    until the profile is decoded; the decompressed-byte cap is what bounds that
+    decoding.
+  - **while reading the sidecar:** its size in bytes, its number of rows and
+    its number of distinct execution references, enforced inside the row
+    callback so reading stops at the limit. `execlog.Read` streams rows and
+    bounds only its header strings (`gpu/execlog/execlog.go:324-426`), so the
+    consumer must bound the rest. A sidecar over a limit makes executions
+    `unavailable: sidecar exceeds limits`; it never fails the load.
+- **Negative values and overflow.** The model bypasses `Fold`, so it repeats
+  `Fold`'s guard: a negative value at the selected sample index refuses the
+  view (the input is a diff or a malformed profile, not a measurement). All
+  accumulation is checked: node cumulative and view totals in `int64`, sidecar
+  value sums in `uint64`, and the diff's combined weight (base + new). An
+  overflow refuses the operation with the quantity named; it never wraps.
+- **Exact integers.** Values in the sample unit and counts are kept as exact
+  integers end to end; a floating-point value is used only for ratios. A
+  `float64` cannot hold every `int64`, so a fact never carries a large count as
+  a float.
 - **The executions log is optional and is checked before it is trusted.** If
   one is supplied:
   1. read it with `execlog.Read`, which checks its structure and CRC;
   2. `Trailer.Verify` against the same bytes (digest and aggregated sample
      count);
   3. the header's `SampleType` matches the profile's GPU sample type, and its
-     `CaptureID` matches the profile's `capture_id` comment when both exist;
+     `CaptureID` matches the profile's `capture_id` comment when both exist.
+     The header carries the joined string `gpu/nanoseconds`
+     (`gpuprofile/profiler.go:200`), so it is compared with
+     `SampleType[i].Type + "/" + SampleType[i].Unit`, not with `Type` alone;
   4. **value conservation:** for every aggregated sample, the sum of
      `Row.Value` over its rows equals `Sample.Value` at the GPU index.
   Only a log that passes all four is used. Rows are held provisionally while
-  reading and never reach the facts before the checks pass. Otherwise
-  executions are `unavailable`, with the reason:
-  - `no sidecar`;
+  reading and never reach the facts before the checks pass. Each row's
+  `Sample` index is bounds-checked against the profile **before** it indexes
+  anything: `execlog.Read` checks the sample range against the trailer only
+  after all callbacks have run. Otherwise executions are `unavailable`, with
+  the reason:
+  - `no sidecar` (none was supplied);
+  - `empty sidecar` (a file was supplied but holds no bytes);
+  - `sidecar exceeds limits`;
   - `digest mismatch`;
   - `sample count mismatch`;
   - `metadata mismatch`;
@@ -386,15 +415,29 @@ Quality is profile-level and per-node:
   `true` means the execution ran inside a serialized sampling window (Tier A
   PC sampling), so its duration is perturbed. A perturbed profile is still
   evidence: it is reported as perturbed, not dropped as unavailable.
-- **Symbols:** the share in unsymbolized frames (module plus offset, or a bare
-  address), by module.
+- **Symbols:** the share of the view whose stack contains an unresolved frame
+  (module plus offset, a bare address, or `[unknown]`) **anywhere** on it, not
+  only at the leaf. A GPU stack's leaf is a named kernel, so a leaf-only rule
+  would miss an unsymbolized CPU caller beneath it. Reported per module, with
+  each sample's weight counted once per module however many of its frames are
+  unresolved there. A module is identified unambiguously (build-id, else full
+  path, else sentinel), never by file name alone.
 - **Identity strength:** the share under functions marked
   `collision_possible` (§6.3).
 - **Executions log:** whether it is available, and if not, why.
 - **Comparability.** A diff compares the quality of both sides and flags any
   material difference: degraded symbolization or join coverage, a different
-  sample period, or a different perturbation share. With such a difference,
+  sample period, or a different perturbation picture. With such a difference,
   "path disappeared" or "path got cheaper" is not trustworthy.
+- **Perturbation comparison policy (my call).** All four `gpu_serialized`
+  states are compared, not only `true`: the sides are not comparable when any
+  state's share moves by more than the threshold, or when perturbation is
+  known on one side and unknown (`unknown` or `missing`) on the other. A base
+  that is entirely `missing` and a new profile that is entirely `false` are
+  therefore not comparable, although `true` is zero on both. An `unavailable`
+  share (a zero total, a CPU view) never takes part as a numeric zero: when it
+  is unavailable on either side, the comparison is reported as unavailable
+  with the reason.
 
 ### 6.6 Bilateral diff
 
@@ -408,14 +451,25 @@ Quality is profile-level and per-node:
      When a mapping has **no build-id** on either side, a match on file path
      and name is never labelled exact, because two different builds at the
      same path would look identical; it is labelled `by_path`.
-  2. **by name:** the remaining children match on module **file name** (not
-     full path, so a module that moved directories still matches) plus
-     function name. This is the normal case whenever the code was rebuilt.
+     `by_path` applies only to frames with a real, non-empty module path. A
+     frame with no mapping or on a sentinel mapping never matches by path.
+  2. **by name:** the remaining children match on a name key that depends on
+     the frame's kind:
+     - a frame in a real module: module **file name** (not full path, so a
+       module that moved directories still matches) plus function name. This
+       is the normal case whenever the code was rebuilt;
+     - a frame on a sentinel mapping (`[kernel]`, `[jit]`): sentinel plus name;
+     - a frame with no mapping: name plus `Filename` and `StartLine` when the
+       profile has them. Two same-named unmapped functions whose file names
+       differ never merge, and two same-named unmapped siblings whose file
+       names are stable on both sides match one to one rather than becoming
+       ambiguous.
   3. **ambiguous:** when, in either direction, one node has several
      candidates on the other side (repeated names, a recursive function
      appearing twice under one parent, two modules with the same file name),
      the nodes are not merged. Each is listed with its candidates and stays
-     separate in the union.
+     separate in the union. A candidate is named by side (`base` or `new`),
+     handle and node ID, because the same node ID can occur in both views.
   The match label (`exact`, `by_path`, `by_name`, `ambiguous`) is reported per
   node.
 - **Presence and interpretation are separate fields:**
@@ -445,14 +499,25 @@ Quality is profile-level and per-node:
   and new. The drawing uses the **combined weight** base + new: it is additive
   (a node's combined weight equals the sum of its children's combined weights
   plus its combined self), so the icicle never overflows when cost moves
-  between branches, and removed or added nodes keep a visible width. Colour
-  shows the share delta. Every node shows both values, base and new.
+  between branches, and removed or added nodes keep a visible width. The sum
+  is checked for overflow. Every node shows both values, base and new.
+- **Colour and legend (my call).** Colour shows the **share** delta, and the
+  legend says so: "lower / higher share of total <sample type> (<unit>)",
+  built from the view's real sample type and unit. It does not say "time": an
+  `alloc_space`/bytes or `alloc_objects`/count view is not time. Share and
+  absolute change can disagree: with totals 100 → 200 and a node 50 → 60, the
+  node's accumulated value rose by 10 while its share fell from 50% to 30%, so
+  it is coloured "lower share". The raw delta, with its unit, is shown next to
+  every node and in the table, so that case is never hidden. The legend never
+  says "faster or slower": accumulated time is neither wall time nor the
+  critical path.
+- **All-zero diff.** When both totals are zero, the combined root weight is
+  zero and there is nothing to divide: the page states that both views are
+  empty and draws no icicle; shares and share deltas are `unavailable`.
 - **Rendering:** the diff HTML draws that union; `only_base` nodes are
   hatched, `only_new` nodes outlined, `not_comparable` nodes marked. It also
-  lists removed and added paths in a table with presence, interpretation and
-  reason. Colour means "less or more accumulated GPU time" (or CPU time). It
-  never means "faster or slower", because accumulated GPU time is neither
-  wall time nor the critical path.
+  lists removed and added paths in a table with presence, interpretation,
+  reason and raw delta.
 
 ### 6.7 Surface in M1
 
@@ -501,6 +566,10 @@ captures checked in only if they are small. Required cases:
 9. **Degraded coverage:** a base with symbols and a new profile where the
    same module is unsymbolized. The base path is `only_base` (presence) and
    `not_comparable` (interpretation), with the module named as the reason.
+   Also the GPU ancestor case: base `main → foo → [gpu:kernel:k]`, new
+   `main → libfoo.so+0x123 → [gpu:kernel:k]`. The kernel leaf is named on both
+   sides, yet the vanished `foo` is `not_comparable`, because `libfoo.so`
+   became unresolved on the new side.
 10. **Sampling semantics:** a GPU profile with a period of 8. The facts carry
     the note, and no value is scaled.
 11. **Inexact joins:** heuristic, unmatched and ambiguous samples are counted
@@ -508,14 +577,26 @@ captures checked in only if they are small. Required cases:
 12. **Perturbation:** samples with `gpu_serialized` `true`, `false`,
     `unknown` and absent are reported as four shares; a diff between a
     perturbed and an unperturbed capture marks the affected nodes
-    `not_comparable`.
+    `not_comparable`, and so do `missing` → `false` and `unknown` → `false`
+    with `true` at zero on both sides. A zero-total side makes the comparison
+    unavailable, not zero.
 13. **Zero vs unavailable:** a fact whose source exists but sums to zero, next
     to one whose source is missing, and a share over a zero total.
 14. **Diff matching:** a rebuilt binary (by name), an unchanged library
     (exact), a module without a build-id (`by_path`, never exact), a moved
-    module path (by name), and an ambiguity in each direction.
+    module path (by name), an ambiguity in each direction, a same-named
+    unmapped function whose file name changed (no merge), and two same-named
+    unmapped siblings with stable file names (one-to-one match).
 15. **Input limits:** a profile over each limit is refused with the limit
-    named.
+    named; a sidecar over its row or byte limit stops reading at the limit and
+    reports `sidecar exceeds limits`.
+16. **Arithmetic:** a negative value at the selected index refuses the view;
+    accumulation that would overflow `int64`, a combined base + new weight that
+    would overflow, and sidecar value sums that would wrap `uint64` are all
+    refused or rejected, never wrapped.
+17. **Colour semantics:** the 100 → 200 total / 50 → 60 node counterexample is
+    coloured by share with the raw +10 shown, and a bytes or count view's
+    legend names its own sample type and unit.
 
 **Invariants checked on every fixture:**
 - the children's cumulative values plus self equal the parent's cumulative;
@@ -584,13 +665,20 @@ implicit "current profile".
   path / gpu_kernels_for → facts → render) and repeats the semantic rules.
 
 **Source evidence.** A build-id proves which binary ran, not that a local
-`.cc` or `.py` file is the one it was built from. `source` returns lines as
-verified only when one of these holds:
-- a source manifest (path → SHA-256) recorded with the build matches the file;
-- the source root is a git checkout at a commit the user named when starting
-  the server, and the file is unmodified there.
-Otherwise it returns the lines marked `source_unverified`, or `unresolved` when
-no file matches. `gpu_src_file` from PC sampling is a basename, not a path; it
+`.cc` or `.py` file is the one it was built from. `source` reports one of
+three statuses:
+- **`build_verified`:** there is provenance that ties the profiled binary
+  (its build-id, or the profile itself) to the source revision: a source
+  manifest (path → SHA-256) recorded with that build and matching the file,
+  or a build record that names the commit the binary with that build-id was
+  built from. Only this status claims the lines are the ones that ran.
+- **`user_selected`:** the source root is a checkout the user named when
+  starting the server, the file is unmodified there, but nothing ties that
+  revision to the binary. An unrelated binary and an arbitrary clean commit
+  satisfy this, so it is reported as the user's choice, not as verified. It
+  is still useful, with that status shown.
+- **`source_unverified`:** neither holds.
+`unresolved` is returned when no file matches. `gpu_src_file` from PC sampling is a basename, not a path; it
 is looked up inside the source roots and an ambiguous basename is reported as
 ambiguous, never resolved by guess.
 
@@ -845,8 +933,31 @@ that came up and how they were settled:
   presence separate from interpretation, additive union geometry, deltas with
   explicit availability (§6.6).
 - Source needs a manifest or a named checkout, else `source_unverified`;
-  input and output limits (§6.2, §7.1, §7.2).
+  input and output limits (§6.2, §7.1, §7.2). Refined after review #274:
+  a named checkout alone is `user_selected`, only build provenance is
+  `build_verified`.
 - Execlog: metadata and value-conservation checks, `Value == 0` rows count as
   observed executions (§6.2).
 - Loop: accept only when the CI lower bound clears the minimum gain;
   re-measure the winner once (§8).
+
+## Appendix C: changes after review #274
+
+- Symbol quality counts unresolved frames anywhere on a stack, weighted once
+  per module, with unambiguous module identity; the GPU ancestor case is a
+  fixture (§6.5, §6.8).
+- Perturbation comparison uses all four `gpu_serialized` states and treats
+  unavailable as unavailable, never zero (§6.5).
+- `by_path` only for real module paths; sentinel and unmapped frames have
+  their own name keys; ambiguous candidates carry side and handle (§6.6).
+- The diff legend describes share, uses the view's real sample type and unit,
+  shows the raw delta, and defines the all-zero case (§6.6).
+- Limits: during-parse vs after-parse limits stated precisely; sidecar byte,
+  row and reference limits enforced while reading; row sample index
+  bounds-checked first; `empty sidecar` and `sidecar exceeds limits` reasons
+  (§6.2).
+- Negative values refused; checked arithmetic; exact integers for values and
+  counts (§6.2, §6.8).
+- Source status splits `user_selected` from `build_verified` (§7.2).
+- The execlog header's joined `gpu/nanoseconds` sample type is compared
+  against `Type + "/" + Unit` (§6.2).

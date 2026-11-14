@@ -495,6 +495,7 @@ func TestLoadFSThroughARootRefusesEscapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFixture(t, parent, "x.pb.gz", pmfixture.CPUBasic())
+	writeFixture(t, dir, "ok.pb.gz", pmfixture.CPUBasic())
 	if err := os.Symlink(filepath.Join(parent, "x.pb.gz"), filepath.Join(dir, "link.pb.gz")); err != nil {
 		t.Fatal(err)
 	}
@@ -503,6 +504,9 @@ func TestLoadFSThroughARootRefusesEscapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
+	if _, err := LoadFS(root.FS(), "ok.pb.gz", "", DefaultLimits()); err != nil {
+		t.Fatalf("in-root profile refused: %v", err)
+	}
 	for _, name := range []string{"../x.pb.gz", "link.pb.gz"} {
 		if _, err := LoadFS(root.FS(), name, "", DefaultLimits()); err == nil {
 			t.Errorf("%s was loaded", name)

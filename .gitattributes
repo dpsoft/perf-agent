@@ -1,0 +1,1 @@
+internal/flamegraph/testdata/*.golden.html -whitespace

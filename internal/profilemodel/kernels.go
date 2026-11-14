@@ -13,16 +13,16 @@ var ErrNotGPUView = errors.New("profilemodel: not a GPU view")
 
 // KernelRow is one kernel name at or below a node.
 type KernelRow struct {
-	Name string
+	Name string `json:"name"`
 	// Value is the sum of the values of the samples through the node whose
 	// frames at or below it include the kernel, once per sample; never
 	// scaled by the launch sampling period.
-	Value        Fact
-	ShareOfNode  Fact // Value / the node's cumulative; denominator "node:<id>"
-	ShareOfTotal Fact // Value / the view total
+	Value        Fact `json:"value"`
+	ShareOfNode  Fact `json:"share_of_node"`  // Value / the node's cumulative; denominator "node:<id>"
+	ShareOfTotal Fact `json:"share_of_total"` // Value / the view total
 	// Executions counts distinct ordinals of the checked log over those
 	// samples, zero-value ones included; unavailable without a usable log.
-	Executions Fact
+	Executions Fact `json:"executions"`
 }
 
 // KernelsBelow lists the kernels at or below id, largest value first, then

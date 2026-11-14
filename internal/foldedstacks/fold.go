@@ -357,7 +357,7 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 			order = append(order, key)
 		}
 		st.Value += v
-		if matchesInexact(s.Label, rules) {
+		if MatchesInexact(s.Label, rules) {
 			st.Inexact += v
 		}
 	}
@@ -410,7 +410,7 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 			return
 		}
 		if len(loc.Line) == 0 {
-			name := addressName(loc)
+			name := AddressName(loc)
 			out = append(out, name)
 			mods = append(mods, mod)
 			stats.addressOnly++
@@ -421,7 +421,7 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 		// backwards emits the inlined chain root-first, matching the frame
 		// order we produce for locations.
 		for i := len(loc.Line) - 1; i >= 0; i-- {
-			name := lineName(loc, loc.Line[i])
+			name := LineName(loc, loc.Line[i])
 			if isAddressOnly(name) {
 				stats.addressOnly++
 			}
@@ -445,7 +445,10 @@ func framesOf(s *profile.Sample, order StackOrder) ([]string, []string, frameSta
 	return out, mods, stats
 }
 
-func lineName(loc *profile.Location, ln profile.Line) string {
+// LineName is the display name Fold gives one Line of loc: the function
+// name, else its system name, else "file:line", else AddressName(loc).
+// Other packages that name frames call it so their names match Fold's.
+func LineName(loc *profile.Location, ln profile.Line) string {
 	if ln.Function != nil {
 		if n := strings.TrimSpace(ln.Function.Name); n != "" {
 			return n
@@ -460,10 +463,10 @@ func lineName(loc *profile.Location, ln profile.Line) string {
 			return f
 		}
 	}
-	return addressName(loc)
+	return AddressName(loc)
 }
 
-// addressName names a Location that has no usable Function. The mapping form
+// AddressName names a Location that has no usable Function. The mapping form
 // is preferred over the bare address: Location.Address is already relative to
 // the mapping, so "libcuda.so.1+0x1b71c6" is the same number with the file it
 // belongs to attached, and it survives ASLR where the bare form does not.
@@ -471,7 +474,7 @@ func lineName(loc *profile.Location, ln profile.Line) string {
 // (The bare form was previously unreachable-first here: the Address!=0 test
 // came before the mapping test, so a location with both always printed the
 // address alone.)
-func addressName(loc *profile.Location) string {
+func AddressName(loc *profile.Location) string {
 	if loc == nil {
 		return UnknownFrame
 	}
@@ -505,7 +508,9 @@ func isAddressOnly(name string) bool {
 	return framename.IsAddressOnly(name)
 }
 
-func matchesInexact(labels map[string][]string, rules []InexactRule) bool {
+// MatchesInexact reports whether a sample's labels match any of rules, the
+// test Fold uses for Stack.Inexact.
+func MatchesInexact(labels map[string][]string, rules []InexactRule) bool {
 	for _, rule := range rules {
 		vals, ok := labels[rule.Key]
 		if !ok {

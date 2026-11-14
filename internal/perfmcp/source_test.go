@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -26,9 +28,14 @@ type srcRow struct {
 		Reason     string   `json:"reason"`
 		Path       string   `json:"path"`
 		Candidates []string `json:"candidates"`
+		Total      string   `json:"candidates_total"`
 		SHA256     string   `json:"sha256"`
+		VerifiedBy string   `json:"verified_by"`
+		Commit     string   `json:"commit"`
+		TopLevel   string   `json:"git_toplevel"`
 	} `json:"resolution"`
-	Lines []struct {
+	LinesError string `json:"lines_error"`
+	Lines      []struct {
 		N    int64  `json:"n"`
 		Text string `json:"text"`
 	} `json:"lines"`
@@ -106,7 +113,6 @@ func TestSourceGPUBasenameAmbiguity(t *testing.T) {
 	mkfile(t, src, "b/conv.cu", numbered(50))
 	cfg := testConfig(t)
 	cfg.SourceDirs = []string{src}
-	writeFixture(t, cfg.ProfilesDir, "x.execlog", pmfixture.GPUBasicExeclog(t))
 	o := openWith(t, cfg, "gpu.pb.gz", pmfixture.GPUBasic())
 
 	var out sourceOut
@@ -188,7 +194,123 @@ func TestSourceFilesCountAsInputsForRender(t *testing.T) {
 	o.c.callOK("source", o.args(map[string]any{"node": b}), &out)
 
 	text, isErr := o.c.call("render_flamegraph", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "app.html"}))
-	if !isErr || !strings.Contains(text, "input") {
+	if !isErr || !strings.Contains(text, "refusing to overwrite input") {
 		t.Errorf("render over a source file: isError=%v %s", isErr, text)
+	}
+}
+
+func TestSourceCapsAmbiguousCandidates(t *testing.T) {
+	src := t.TempDir()
+	for i := range 20 {
+		mkfile(t, src, fmt.Sprintf("d%02d/conv.cu", i), numbered(50))
+	}
+	cfg := testConfig(t)
+	cfg.SourceDirs = []string{src}
+	o := openWith(t, cfg, "gpu.pb.gz", pmfixture.GPUBasic())
+	var out sourceOut
+	o.c.callOK("source", o.args(map[string]any{"node": o.nodeID(t, "conv")}), &out)
+	r := out.Rows[0].Resolution
+	if r.Status != "ambiguous" || len(r.Candidates) != 16 || r.Total != "20" || !slices.IsSorted(r.Candidates) {
+		t.Errorf("resolution = %+v", r)
+	}
+}
+
+func TestSourceLinesErrorSaysWhatToDo(t *testing.T) {
+	src := t.TempDir()
+	mkfile(t, src, "src/app.c", numbered(10))
+	cfg := testConfig(t)
+	cfg.SourceDirs = []string{src}
+	o := openWith(t, cfg, "cpu.pb.gz", pmfixture.CPUBasic())
+	var out sourceOut
+	o.c.callOK("source", o.args(map[string]any{"node": o.nodeID(t, "b")}), &out)
+	r := out.Rows[0]
+	if len(r.Lines) != 0 || !strings.Contains(r.LinesError, "line 30 is past the end of src/app.c (10 lines)") || strings.Contains(r.LinesError, "sourceroot:") {
+		t.Errorf("lines_error = %q lines %v", r.LinesError, r.Lines)
+	}
+}
+
+func TestSourceLimitIsClampedToMaxRows(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits = DefaultLimits()
+	cfg.Limits.MaxRows = 3
+	o := openWith(t, cfg, "cpu.pb.gz", pmfixture.CPUBasic())
+	var b string
+	for _, r := range o.top(t, map[string]any{"rows": "nodes", "limit": 3}).Rows {
+		b = r.Node
+	}
+	var out sourceOut
+	o.c.callOK("source", o.args(map[string]any{"node": b}), &out)
+	text, isErr := o.c.call("source", o.args(map[string]any{"node": b, "limit": 4}))
+	if !isErr || !strings.Contains(text, "this server's MaxRows") {
+		t.Errorf("limit 4: isError=%v %s", isErr, text)
+	}
+}
+
+// gitInDir runs git for test setup in dir.
+func gitInDir(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+		"-c", "init.defaultBranch=main", "-C", dir}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestSourceGitSelectsTheTrackedFileAndReadsHeadOncePerCall(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+	src := t.TempDir()
+	mkfile(t, src, "src/app.c", numbered(60))
+	gitInDir(t, src, "init", "-q")
+	gitInDir(t, src, "add", ".")
+	gitInDir(t, src, "commit", "-q", "-m", "init")
+	commit := gitInDir(t, src, "rev-parse", "HEAD")
+
+	// Three samples through main;a with different lines of app.c give a
+	// page of three rows.
+	file := "/build/app/src/app.c"
+	frame := func(name string, line int64) pmfixture.Frame {
+		return pmfixture.In("/opt/app/bin/app", "b1", uint64(line), pmfixture.L(name, file, line))
+	}
+	raw := pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{frame("main", 10), frame("a", 20)}, Value: 5},
+		pmfixture.Sample{Frames: []pmfixture.Frame{frame("main", 10), frame("a", 21)}, Value: 4},
+		pmfixture.Sample{Frames: []pmfixture.Frame{frame("main", 10), frame("a", 22)}, Value: 3},
+	)
+
+	log := filepath.Join(t.TempDir(), "heads.log")
+	bin := t.TempDir()
+	shim := fmt.Sprintf("#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in 'HEAD^{commit}') echo head >> %s;; esac; done\nexec %s \"$@\"\n", log, realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := testConfig(t)
+	cfg.SourceDirs, cfg.SourceGit = []string{src}, true
+	o := openWith(t, cfg, "cpu.pb.gz", raw)
+	var out sourceOut
+	o.c.callOK("source", o.args(map[string]any{"node": o.nodeID(t, "a")}), &out)
+	if len(out.Rows) != 3 {
+		t.Fatalf("rows = %d, want 3: %+v", len(out.Rows), out.Rows)
+	}
+	for _, r := range out.Rows {
+		res := r.Resolution
+		if res.Status != "user_selected" || res.VerifiedBy != "git" || res.Commit != commit || res.TopLevel == "" || len(r.Lines) == 0 {
+			t.Errorf("row %d: %+v", r.Line, r)
+		}
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(got), "head"); n != 1 {
+		t.Errorf("HEAD read %d times for one call, want 1", n)
 	}
 }

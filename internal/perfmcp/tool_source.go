@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -34,7 +35,8 @@ const sourceSchema = `{
 const sourceDescription = "The source lines a node's samples point at, from inside the --source roots only, each with how the file was matched: " +
 	"build_verified (a source manifest for the build lists these exact bytes), user_selected (the file is tracked at the HEAD of a git checkout inside the source root; " +
 	"nothing ties that commit to the build), source_unverified (one file matched with no evidence it is the source that was built), ambiguous (several matched; candidates are listed, no lines) " +
-	"or unresolved. Lines are shown only for the first three. Rows are call_site (the node's own frame) or gpu_pc (a PC-sampled line, matched by base name). " +
+	"or unresolved. Lines are shown only for the first three; when a matched file cannot show its line (past the end, over the read limit, no line number) the row has lines_error instead. " +
+	"An ambiguous row lists at most 16 sorted candidates and candidates_total, the number of matches. A PC-sampled line is build_verified only by a manifest naming the capture id. Rows are call_site (the node's own frame) or gpu_pc (a PC-sampled line, matched by base name). " +
 	"The value is a decimal string in the view's unit, the sum of the samples through the node that give the reference; line numbers are plain JSON integers. " +
 	"Rows are ordered by value, paged with limit and cursor; GPU views carry the sampling notes. A file the tool reads is never overwritten by render_flamegraph."
 
@@ -68,17 +70,52 @@ type sourceQuery struct {
 }
 
 type sourceRow struct {
-	Kind       string                `json:"kind"`
-	Function   string                `json:"function"`
-	Filename   string                `json:"filename"`
-	Line       int64                 `json:"line"`
-	Module     string                `json:"module"`
-	BuildID    string                `json:"build_id"`
-	Value      Fact                  `json:"value"`
-	Resolution sourceroot.Resolution `json:"resolution"`
-	Lines      []sourceroot.Line     `json:"lines,omitzero"`
+	Kind       string            `json:"kind"`
+	Function   string            `json:"function"`
+	Filename   string            `json:"filename"`
+	Line       int64             `json:"line"`
+	Module     string            `json:"module"`
+	BuildID    string            `json:"build_id"`
+	Value      Fact              `json:"value"`
+	Resolution sourceResolution  `json:"resolution"`
+	Lines      []sourceroot.Line `json:"lines,omitzero"`
 	// LinesError says why a matched file shows no lines.
 	LinesError string `json:"lines_error,omitempty"`
+}
+
+// maxSourceCandidates is how many ambiguous candidates a row lists; the
+// rest are counted in candidates_total.
+const maxSourceCandidates = 16
+
+// sourceResolution is a sourceroot.Resolution with its candidate list
+// bounded.
+type sourceResolution struct {
+	sourceroot.Resolution
+	CandidatesTotal string `json:"candidates_total,omitempty"`
+}
+
+func wireResolution(r sourceroot.Resolution) sourceResolution {
+	w := sourceResolution{Resolution: r}
+	if len(r.Candidates) > 0 {
+		w.CandidatesTotal = wireInt(int64(len(r.Candidates)))
+		if len(r.Candidates) > maxSourceCandidates {
+			w.Candidates = r.Candidates[:maxSourceCandidates:maxSourceCandidates]
+		}
+	}
+	return w
+}
+
+// linesError says why a matched file shows no lines, bounding the path the
+// message names.
+func linesError(res sourceroot.Resolution, line int64, err error) string {
+	if line < 1 {
+		return "the profile gives no line number"
+	}
+	msg := strings.TrimPrefix(err.Error(), "sourceroot: ")
+	if res.Path != "" {
+		msg = strings.ReplaceAll(msg, res.Path, echo(res.Path))
+	}
+	return msg
 }
 
 type sourceResult struct {
@@ -96,12 +133,13 @@ func (s *Server) handleSource(_ context.Context, raw json.RawMessage) (mcpstdio.
 	if err := decodeArgs("source", raw, &a); err != nil {
 		return mcpstdio.Result{}, err
 	}
-	limit := defaultSourceLimit
+	maxLimit := min(maxSourceLimit, s.lim.MaxRows)
+	limit := min(defaultSourceLimit, maxLimit)
 	if a.Limit != nil {
 		limit = *a.Limit
 	}
-	if limit < 1 || limit > min(maxSourceLimit, s.lim.MaxRows) {
-		return mcpstdio.Result{}, fmt.Errorf("limit must be between 1 and %d, got %d", min(maxSourceLimit, s.lim.MaxRows), limit)
+	if limit < 1 || limit > maxLimit {
+		return mcpstdio.Result{}, fmt.Errorf("limit must be between 1 and %d (this server's MaxRows, and at most %d), got %d", maxLimit, maxSourceLimit, limit)
 	}
 	ctx := defaultSourceContext
 	if a.Context != nil {
@@ -142,19 +180,21 @@ func (s *Server) handleSource(_ context.Context, raw json.RawMessage) (mcpstdio.
 			Kind: r.Kind, Function: r.Function, Filename: r.Filename, Line: r.Line,
 			Module: r.Module.File, BuildID: r.Module.BuildID, Value: intWire(profilemodel.MetricCumulative, r.Value, v.Unit),
 		}
+		var res sourceroot.Resolution
 		switch {
 		case !hasRoots:
-			row.Resolution = sourceroot.Resolution{Status: sourceroot.StatusUnresolved, Reason: noSourceRoots}
+			res = sourceroot.Resolution{Status: sourceroot.StatusUnresolved, Reason: noSourceRoots}
 		case r.Kind == profilemodel.SourceGPUPC:
-			row.Resolution = batch.ResolveBasename(r.Filename, r.Module.BuildID, e.prof.CaptureID)
+			res = batch.ResolveBasename(r.Filename, r.Module.BuildID, e.prof.CaptureID)
 		default:
-			row.Resolution = batch.Resolve(r.Filename, r.Module.BuildID, e.prof.CaptureID)
+			res = batch.Resolve(r.Filename, r.Module.BuildID, e.prof.CaptureID)
 		}
-		switch row.Resolution.Status {
+		row.Resolution = wireResolution(res)
+		switch res.Status {
 		case sourceroot.StatusBuildVerified, sourceroot.StatusUserSelected, sourceroot.StatusSourceUnverified:
-			lines, err := s.src.Lines(row.Resolution, r.Line, ctx)
+			lines, err := s.src.Lines(res, r.Line, ctx)
 			if err != nil {
-				row.LinesError = echo(err.Error())
+				row.LinesError = linesError(res, r.Line, err)
 			}
 			row.Lines = lines
 		}

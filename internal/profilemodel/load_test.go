@@ -535,23 +535,31 @@ func TestLoadFSSidecarOverLimitIsUnread(t *testing.T) {
 }
 
 func TestLoadRefusesLongMetadata(t *testing.T) {
-	if got := DefaultLimits().MaxMetaBytes; got != 256 {
-		t.Fatalf("MaxMetaBytes default %d", got)
+	d := DefaultLimits()
+	if d.MaxMetaBytes != 256 || d.MaxCommentBytes != 64<<10 {
+		t.Fatalf("MaxMetaBytes default %d, MaxCommentBytes default %d", d.MaxMetaBytes, d.MaxCommentBytes)
 	}
 	sample := pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main")}, Value: 1}
-	long := strings.Repeat("u", 257)
-	for name, raw := range map[string][]byte{
-		"sample type": pmfixture.Build(long, "nanoseconds", nil, sample),
-		"unit":        pmfixture.Build("cpu", long, nil, sample),
-		"comment":     pmfixture.Build("cpu", "nanoseconds", []string{"ok", long}, sample),
+	long := strings.Repeat("u", 300)
+	tag := strings.Repeat("t", 10<<10)
+	for _, tc := range []struct {
+		name, limit string
+		raw         []byte
+	}{
+		{"sample type", "MaxMetaBytes", pmfixture.Build(long, "nanoseconds", nil, sample)},
+		{"unit", "MaxMetaBytes", pmfixture.Build("cpu", long, nil, sample)},
+		{"comments", "MaxCommentBytes", pmfixture.Build("cpu", "nanoseconds", slices.Repeat([]string{tag}, 7), sample)},
 	} {
-		_, err := FromBytes(raw, nil, DefaultLimits())
-		if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxMetaBytes") || strings.Contains(err.Error(), long) {
-			t.Errorf("%s: %v", name, err)
+		_, err := FromBytes(tc.raw, nil, d)
+		if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), tc.limit) || strings.Contains(err.Error(), long) || strings.Contains(err.Error(), tag[:100]) {
+			t.Errorf("%s: %v", tc.name, err)
 		}
 	}
 	at := strings.Repeat("u", 256)
-	if _, err := FromBytes(pmfixture.Build(at, at, []string{at}, sample), nil, DefaultLimits()); err != nil {
-		t.Errorf("256 bytes each: %v", err)
+	if _, err := FromBytes(pmfixture.Build(at, at, []string{strings.Repeat("c", 1<<10), "perf-agent.capture_id=x"}, sample), nil, d); err != nil {
+		t.Errorf("256-byte names and a 1 KiB comment: %v", err)
+	}
+	if _, err := FromBytes(pmfixture.Build("cpu", "nanoseconds", []string{strings.Repeat("c", 64<<10)}, sample), nil, d); err != nil {
+		t.Errorf("64 KiB of comments: %v", err)
 	}
 }

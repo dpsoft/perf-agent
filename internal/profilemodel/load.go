@@ -60,10 +60,14 @@ type Limits struct {
 	// MaxSidecarRows and MaxSidecarExecutions (distinct ordinals) are
 	// enforced in the row callback.
 	MaxSidecarRows, MaxSidecarExecutions int
-	// MaxMetaBytes bounds each sample type name, sample unit and comment,
-	// checked after parsing: they come from the profile and are repeated in
-	// view names, messages and pages.
+	// MaxMetaBytes bounds each sample type name and sample unit, checked
+	// after parsing: they come from the profile and are repeated in view
+	// names, check failures and pages.
 	MaxMetaBytes int
+	// MaxCommentBytes bounds the bytes of all the profile's comments
+	// together, checked after parsing. Comments carry user tags, so the
+	// bound is generous.
+	MaxCommentBytes int
 }
 
 // DefaultLimits returns the limits documented in the package comment.
@@ -79,6 +83,7 @@ func DefaultLimits() Limits {
 		MaxSidecarRows:       10_000_000,
 		MaxSidecarExecutions: 10_000_000,
 		MaxMetaBytes:         256,
+		MaxCommentBytes:      64 << 10,
 	}
 }
 
@@ -245,9 +250,10 @@ func checkStructure(p *profile.Profile, lim Limits) error {
 			return limitErr("MaxMetaBytes", lim.MaxMetaBytes, fmt.Sprintf("a %d-byte sample type or unit", n))
 		}
 	}
+	comments := 0
 	for _, c := range p.Comments {
-		if len(c) > lim.MaxMetaBytes {
-			return limitErr("MaxMetaBytes", lim.MaxMetaBytes, fmt.Sprintf("a %d-byte comment", len(c)))
+		if comments += len(c); comments > lim.MaxCommentBytes {
+			return limitErr("MaxCommentBytes", lim.MaxCommentBytes, ">"+fmt.Sprint(lim.MaxCommentBytes)+" bytes of comments")
 		}
 	}
 	if len(p.Sample) > lim.MaxSamples {

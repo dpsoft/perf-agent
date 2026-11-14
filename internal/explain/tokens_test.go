@@ -49,8 +49,26 @@ func TestTokenizeNumberEdges(t *testing.T) {
 		// one % is taken.
 		{"3.14. and 5,", []Segment{seg(SegmentUnchecked, "3.14"), seg(SegmentText, ". and "), seg(SegmentUnchecked, "5"), seg(SegmentText, ",")}},
 		{"62%%", []Segment{seg(SegmentUnchecked, "62%"), seg(SegmentText, "%")}},
-		// Preceded by a letter, digit, underscore or dot: not a number start.
-		{"x.5 _7 é9", []Segment{seg(SegmentText, "x.5 _7 é9")}},
+		// Preceded by an ASCII letter, a digit or an underscore, or by a dot
+		// that follows one: not a number start ("sm86", "x_1", "v1.2").
+		{"x.5 _7 v1.2 sm86", []Segment{seg(SegmentText, "x.5 _7 v1.2 sm86")}},
+		// Any other letter does not hide a figure: prose in scripts without
+		// spaces, or after a filler character, is still marked.
+		{"x.5 _7 é9", []Segment{seg(SegmentText, "x.5 _7 é"), seg(SegmentUnchecked, "9")}},
+		{"函数b占用了41.1%的时间", []Segment{seg(SegmentText, "函数b占用了"), seg(SegmentUnchecked, "41.1%"), seg(SegmentText, "的时间")}},
+		{"это заняло62%", []Segment{seg(SegmentText, "это заняло"), seg(SegmentUnchecked, "62%")}},
+		{"\u316462%", []Segment{seg(SegmentText, "\u3164"), seg(SegmentUnchecked, "62%")}},
+		// A leading dot is part of the figure unless it follows an ASCII
+		// letter or digit.
+		{".41 and ~.4", []Segment{seg(SegmentUnchecked, ".41"), seg(SegmentText, " and ~"), seg(SegmentUnchecked, ".4")}},
+		{"函数.41", []Segment{seg(SegmentText, "函数"), seg(SegmentUnchecked, ".41")}},
+		// Every numeric character counts: fractions, superscripts, circled
+		// and Roman numerals.
+		{"½ ² ① Ⅻ x²", []Segment{
+			seg(SegmentUnchecked, "½"), seg(SegmentText, " "), seg(SegmentUnchecked, "²"), seg(SegmentText, " "),
+			seg(SegmentUnchecked, "①"), seg(SegmentText, " "), seg(SegmentUnchecked, "Ⅻ"), seg(SegmentText, " x²"),
+		}},
+		{"10²", []Segment{seg(SegmentUnchecked, "10²")}},
 		// After a placeholder or punctuation a digit starts a number.
 		{"{c1}5 (8)", []Segment{
 			{Kind: SegmentClaim, Text: "{c1}", Claim: "c1"},

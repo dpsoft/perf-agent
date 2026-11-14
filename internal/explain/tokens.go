@@ -11,6 +11,9 @@ import (
 // maxClaimIDLen is the longest claim ID: a letter and up to 31 more.
 const maxClaimIDLen = 32
 
+// nodeRefPrefix starts a node placeholder.
+const nodeRefPrefix = "{n:"
+
 // nodeIDLen is the length of a NodeID: 16 lowercase hex digits.
 const nodeIDLen = 16
 
@@ -40,11 +43,16 @@ func isLowerHex(c byte) bool { return isASCIIDigit(c) || 'a' <= c && c <= 'f' }
 
 // Tokenize splits agent text into segments. "{<claim id>}" is a claim
 // placeholder and "{n:<16 lowercase hex>}" a node placeholder; any other "{"
-// is text. A number starts at a digit (in any script) not preceded by a
-// letter, digit, "_" or ".", continues over digits and over a "." or ","
-// followed by a digit, and takes one trailing "%"; it becomes an
-// unchecked_number segment, so a figure no claim checked is never shown as
-// if it were one. Everything else is text, with adjacent text merged.
+// is text. A number starts at a numeric character (unicode.IsNumber: any
+// script's digits, and "½", "²", "①") that does not follow an ASCII letter,
+// a numeric character or "_", or at a "." before one, unless that "." itself
+// follows an ASCII letter or numeric character. It continues over numeric
+// characters and over a "." or "," followed by one, and takes one trailing
+// "%"; it becomes an unchecked_number segment, so a figure no claim checked
+// is never shown as if it were one. Only ASCII letters hide a number, as in
+// "sm86", "x_1" and "v1.2": prose in a script without spaces ("占用了41.1%")
+// or after a filler character is still marked. Everything else is text,
+// with adjacent text merged.
 //
 // Only agent text is tokenized. Frame names are never passed here: a name
 // like "operator{}" or one containing "{c1}" is a name, not a placeholder.
@@ -69,8 +77,14 @@ func Tokenize(s string) []Segment {
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if unicode.IsDigit(r) && numberMayStart(s[:i]) {
-			n := numberLen(s[i:])
+		n := 0
+		switch {
+		case unicode.IsNumber(r) && numberMayStart(s[:i]):
+			n = numberLen(s[i:])
+		case r == '.' && digitsLen(s[i+1:]) > 0 && dotMayStart(s[:i]):
+			n = 1 + numberLen(s[i+1:])
+		}
+		if n > 0 {
 			flush(i)
 			out = append(out, Segment{Kind: SegmentUnchecked, Text: s[i : i+n]})
 			i += n
@@ -91,7 +105,7 @@ func placeholder(s string) (Segment, int, bool) {
 		return Segment{}, 0, false
 	}
 	inner := s[1:end]
-	if id, ok := strings.CutPrefix(inner, "n:"); ok {
+	if id, ok := strings.CutPrefix(inner, nodeRefPrefix[1:]); ok {
 		if len(id) != nodeIDLen {
 			return Segment{}, 0, false
 		}
@@ -108,19 +122,31 @@ func placeholder(s string) (Segment, int, bool) {
 	return Segment{Kind: SegmentClaim, Text: s[:end+1], Claim: inner}, end + 1, true
 }
 
-// numberMayStart reports whether a number may start right after before: not
-// after a letter, digit, "_" or ".", so "sm86", "v2", "x_1" and ".5" are
-// not numbers.
+// numberMayStart reports whether a number may start at a numeric character
+// right after before: not after an ASCII letter, a numeric character or
+// "_", and not after a "." that could not start one either.
 func numberMayStart(before string) bool {
-	if before == "" {
+	r, size := utf8.DecodeLastRuneInString(before)
+	switch {
+	case before == "":
 		return true
+	case r == '.':
+		return dotMayStart(before[:len(before)-size])
 	}
+	return !isASCIILetterRune(r) && r != '_' && !unicode.IsNumber(r)
+}
+
+func isASCIILetterRune(r rune) bool { return r < utf8.RuneSelf && isASCIILetter(byte(r)) }
+
+// dotMayStart reports whether a "." right after before may start a number:
+// not after an ASCII letter or a numeric character, as in "x.5" or "1.2".
+func dotMayStart(before string) bool {
 	r, _ := utf8.DecodeLastRuneInString(before)
-	return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '.'
+	return before == "" || !isASCIILetterRune(r) && !unicode.IsNumber(r)
 }
 
 // numberLen is the length in bytes of the number at the start of s, which
-// starts with a digit.
+// starts with a numeric character.
 func numberLen(s string) int {
 	i := digitsLen(s)
 	for i < len(s) && (s[i] == '.' || s[i] == ',') {
@@ -136,12 +162,13 @@ func numberLen(s string) int {
 	return i
 }
 
-// digitsLen is the length in bytes of the run of digits at the start of s.
+// digitsLen is the length in bytes of the run of numeric characters at the
+// start of s.
 func digitsLen(s string) int {
 	i := 0
 	for i < len(s) {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !unicode.IsDigit(r) {
+		if !unicode.IsNumber(r) {
 			break
 		}
 		i += size

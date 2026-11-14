@@ -75,7 +75,7 @@ func (d *decoder) explanation(raw json.RawMessage, path string) (Explanation, er
 	}
 	var e Explanation
 	for _, f := range fields {
-		at := path + "." + f.name
+		at := path + "." + clip(f.name)
 		switch f.name {
 		case "node":
 			err = str(f.value, at, &e.Node)
@@ -129,7 +129,7 @@ func (d *decoder) claim(raw json.RawMessage, path string) (Claim, error) {
 	}
 	var c Claim
 	for _, f := range fields {
-		at := path + "." + f.name
+		at := path + "." + clip(f.name)
 		switch f.name {
 		case "id":
 			err = str(f.value, at, &c.ID)
@@ -166,7 +166,7 @@ func roundingNotice(metric string) string {
 	if p, ok := profilemodel.PolicyFor(metric); ok {
 		return fmt.Sprintf("ignored: the engine's rounding for %s is %s", metric, p)
 	}
-	return fmt.Sprintf("ignored: rounding is the engine's, and %q is not a metric it knows", metric)
+	return fmt.Sprintf("ignored: rounding is the engine's, and %q is not a metric it knows", clip(metric))
 }
 
 type field struct {
@@ -212,12 +212,12 @@ func object(raw json.RawMessage, path string) ([]field, error) {
 			return nil, fmt.Errorf("%s: field name is not a string", path)
 		}
 		if seen[name] {
-			return nil, fmt.Errorf("%s.%s: field given twice", path, name)
+			return nil, fmt.Errorf("%s.%s: field given twice", path, clip(name))
 		}
 		seen[name] = true
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return nil, fmt.Errorf("%s.%s: %w", path, name, err)
+			return nil, fmt.Errorf("%s.%s: %w", path, clip(name), err)
 		}
 		fields = append(fields, field{name: name, value: v})
 	}

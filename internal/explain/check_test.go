@@ -546,3 +546,109 @@ func TestResultJSON(t *testing.T) {
 		t.Errorf("JSON\n got %s\nwant %s", raw, want)
 	}
 }
+
+func TestTextGluedToAClaimIsRefused(t *testing.T) {
+	v, b := cpuBasic(t)
+	claim := `{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": 0.411}`
+	for _, prose := range []string{"-{c1}", "+{c1}", "\u2212{c1}", "{c1}e3", "{c1}E3", "{c1}.5", "{c1},5", "{c1}5", "5{c1}", "1.{c1}"} {
+		r, _ := check(t, v, one(b, prose, claim))
+		if f := onlyFailure(t, r, CodeGluedToClaim); f.Ref != "c1" || !strings.Contains(f.Message, "{c1}") {
+			t.Errorf("%q: failure = %+v", prose, f)
+		}
+	}
+	for _, prose := range []string{"{c1}%", "{c1} ms", "({c1})", "was {c1}.", "{c1}, then", "{c1}e", "{c1}.x", "a-b {c1}", "x{c1}y"} {
+		r, _ := check(t, v, one(b, prose, claim))
+		if !r.OK {
+			t.Errorf("%q: %+v", prose, r.Failures)
+		}
+	}
+	// In hypotheses and next measurements too.
+	r, _ := check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s], "hypotheses": ["-{c1}"], "next_measurement": "{c1}e2"}]`, b, claim))
+	if len(r.Failures) != 2 || r.Failures[0].Code != CodeGluedToClaim || r.Failures[1].Code != CodeGluedToClaim {
+		t.Errorf("failures = %+v", r.Failures)
+	}
+}
+
+func TestClaimRefsStayInTheirExplanation(t *testing.T) {
+	v, b := cpuBasic(t)
+	a := nodeID(t, v, "main", "a")
+	js := fmt.Sprintf(`[{"node": %q, "claims": [{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": 411}], "prose": "{c1}"},
+		{"node": %q, "prose": "as {c1} said"}]`, b, a)
+	r, _ := check(t, v, js)
+	f := onlyFailure(t, r, CodeUnresolvedClaimRef)
+	if f.Explanation != 1 || f.Ref != "c1" || !strings.Contains(f.Message, "explanations[0]") || !strings.Contains(f.Message, "{n:<id>}") {
+		t.Errorf("failure = %+v", f)
+	}
+	r, _ = check(t, v, one(b, "{zz}"))
+	if f := onlyFailure(t, r, CodeUnresolvedClaimRef); !strings.Contains(f.Message, "{n:<id>}") {
+		t.Errorf("message = %q", f.Message)
+	}
+}
+
+func TestMalformedNodeRefsFail(t *testing.T) {
+	v, b := cpuBasic(t)
+	for _, prose := range []string{"{n:0123}", "{n:0123456789ABCDEF}", "{n:0123456789abcdef", "{n:}", "{n:0123456789abcdef0}", "x {n:zz} y"} {
+		r, _ := check(t, v, one(b, prose))
+		if f := onlyFailure(t, r, CodeUnresolvedNodeRef); !strings.Contains(f.Message, "{n:") {
+			t.Errorf("%q: failure = %+v", prose, f)
+		}
+	}
+	// Near misses of the claim pattern and other braces stay text.
+	for _, prose := range []string{"{c1 }", "{c1", "{ c1}", "operator{}", "{n", "{N:0123456789abcdef}"} {
+		r, _ := check(t, v, one(b, prose))
+		if !r.OK {
+			t.Errorf("%q: %+v", prose, r.Failures)
+		}
+	}
+}
+
+func TestEchoedAgentTextIsBounded(t *testing.T) {
+	v, b := cpuBasic(t)
+	long := strings.Repeat("m", 1000)
+	bounded := func(what, s string) {
+		t.Helper()
+		if strings.Contains(s, strings.Repeat("m", maxEcho+1)) || strings.Contains(s, strings.Repeat("9", maxEcho+1)) ||
+			strings.Contains(s, strings.Repeat("0", maxEcho+1)) {
+			t.Errorf("%s echoes more than %d characters: %d bytes", what, maxEcho, len(s))
+		}
+	}
+	for _, claim := range []string{
+		fmt.Sprintf(`{"id": "c1", "metric": %q, "unit": "ratio", "value": 0}`, long),
+		fmt.Sprintf(`{"id": %q, "metric": "cumulative", "unit": "nanoseconds", "value": 411}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "cumulative", "node": %q, "unit": "nanoseconds", "value": 411}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "cumulative", "scope": %q, "unit": "nanoseconds", "value": 411}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "cumulative", "unit": %q, "value": 411}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "share_of_total", "unit": "ratio", "denominator": %q, "value": 0.411}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "quality_unresolved_by_module", "scope": "view", "module": %q, "unit": "ratio", "value": 0}`, long),
+		fmt.Sprintf(`{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": "%s"}`, strings.Repeat("9", 1000)),
+		fmt.Sprintf(`{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": %s}`, strings.Repeat("9", 40)),
+		`{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": 1e999}`,
+		`{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": 0.` + strings.Repeat("0", 39) + `1}`,
+	} {
+		r, _ := check(t, v, one(b, "", claim))
+		if r.OK || len(r.Failures) != 1 {
+			t.Fatalf("%.80s: %+v", claim, r.Failures)
+		}
+		f := r.Failures[0]
+		for what, s := range map[string]string{"message": f.Message, "agent": f.Agent, "claim": f.Claim, "ref": f.Ref} {
+			bounded(what, s)
+		}
+	}
+	r, _ := check(t, v, `[{"node": "`+long+`"}]`)
+	bounded("node message", r.Failures[0].Message)
+	bounded("node ref", r.Failures[0].Ref)
+	if !strings.Contains(r.Failures[0].Ref, "…") {
+		t.Errorf("ref = %q, want an ellipsis", r.Failures[0].Ref)
+	}
+
+	_, notices, err := Decode(json.RawMessage(`[{"node": "n", "`+long+`": 1}]`), DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bounded("notice path", notices[0].Path)
+	_, _, err = Decode(json.RawMessage(`[{"node": "n", "claims": [{"`+long+`": 1, "`+long+`": 2}]}]`), DefaultLimits())
+	if err == nil {
+		t.Fatal("duplicate field accepted")
+	}
+	bounded("decode error", err.Error())
+}

@@ -101,6 +101,10 @@ func (l Literal) MarshalJSON() ([]byte, error) {
 	return json.Marshal(l.Text)
 }
 
+// maxEcho is the most characters of any one piece of agent text a failure,
+// notice or error repeats back; longer text is cut and ends in "…".
+const maxEcho = 64
+
 // Notice is something Decode ignored, at a path like
 // "explanations[0].claims[1].tolerance".
 type Notice struct {
@@ -116,6 +120,7 @@ const (
 	CodeBadClaimID          Code = "bad_claim_id"
 	CodeUnresolvedClaimRef  Code = "unresolved_claim_ref"
 	CodeUnresolvedNodeRef   Code = "unresolved_node_ref"
+	CodeGluedToClaim        Code = "glued_to_claim"
 	CodeUnknownNode         Code = "unknown_node"
 	CodeUnknownMetric       Code = "unknown_metric"
 	CodeDiffMetric          Code = "diff_metric"

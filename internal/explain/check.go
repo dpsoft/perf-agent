@@ -8,6 +8,8 @@ import (
 	"math/big"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
@@ -74,9 +76,13 @@ var claimable = func() []string {
 // decimal value in the metric's range, an integer for exact metrics; and
 // the value at the engine's rounding (profilemodel.PolicyFor) equal to the
 // fact's canonical value, compared as decimals. Every explanation's node
-// and every "{cN}" and "{n:…}" placeholder in its text must resolve. Any
-// limit exceeded is reported instead of all of that. Every failure is
-// reported, and nothing is accepted when there is one. v must not be nil.
+// and every "{n:…}" placeholder in its text must resolve, a "{cN}" only to a
+// claim of the same explanation, with no sign, digit, exponent or decimals
+// glued to it, and every "{n:" must be a well-formed node reference. Near
+// misses of the claim pattern, like "{c1 }", stay text. Any limit exceeded
+// is reported instead of all of that. Every failure is reported, with agent
+// text echoed in it cut to maxEcho characters, and nothing is accepted when
+// there is one. v must not be nil.
 func Check(v *profilemodel.View, exps []Explanation, lim Limits) Result {
 	r := Result{}
 	for _, e := range exps {
@@ -89,7 +95,7 @@ func Check(v *profilemodel.View, exps []Explanation, lim Limits) Result {
 		v:       v,
 		facts:   map[profilemodel.NodeID]factsOrErr{},
 		quality: map[profilemodel.NodeID]qualityOrErr{},
-		ids:     map[string]string{},
+		ids:     map[string]claimDef{},
 	}
 	checked := make([]Checked, len(exps))
 	for i, e := range exps {
@@ -171,7 +177,7 @@ type checker struct {
 	facts       map[profilemodel.NodeID]factsOrErr
 	quality     map[profilemodel.NodeID]qualityOrErr
 	viewQuality *profilemodel.Quality
-	ids         map[string]string // claim ID -> where it was first defined
+	ids         map[string]claimDef // claim ID -> where it was first defined
 	failures    []Failure
 }
 
@@ -214,8 +220,8 @@ func (c *checker) explanation(i int, e Explanation) Checked {
 		c.fail(Failure{Explanation: i, Code: CodeUnknownNode,
 			Message: fmt.Sprintf(`explanations[%d] has no "node": set it to the ID of the node it explains, from top, path or facts`, i)})
 	case !ok:
-		c.fail(Failure{Explanation: i, Ref: e.Node, Code: CodeUnknownNode,
-			Message: fmt.Sprintf("explanations[%d]: node %q is not in view %s: take node IDs from top, path or facts on this view", i, e.Node, c.viewName())})
+		c.fail(Failure{Explanation: i, Ref: clip(e.Node), Code: CodeUnknownNode,
+			Message: fmt.Sprintf("explanations[%d]: node %q is not in view %s: take node IDs from top, path or facts on this view", i, clip(e.Node), c.viewName())})
 	default:
 		pf, err := c.pathFacts(ch.Node)
 		if err != nil {
@@ -233,15 +239,29 @@ func (c *checker) explanation(i int, e Explanation) Checked {
 }
 
 // text tokenizes s, checks its placeholders resolve and adds the nodes it
-// names to refs.
+// names to refs. A "{cN}" names only a claim of the same explanation, so
+// each explanation's figures are its own claims, and nothing glued to it
+// may change the number a reader sees. Every "{n:" must be a node
+// reference: a malformed one fails rather than reading as text.
 func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) []Segment {
 	segs := Tokenize(s)
+	end := 0
 	for _, sg := range segs {
+		start := end
+		end += len(sg.Text)
 		switch sg.Kind {
 		case SegmentClaim:
-			if _, ok := c.ids[sg.Claim]; !ok {
+			switch def, ok := c.ids[sg.Claim]; {
+			case !ok:
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeUnresolvedClaimRef,
-					Message: fmt.Sprintf("%s names no claim in this call: add a claim with id %q, or drop the placeholder", sg.Text, sg.Claim)})
+					Message: fmt.Sprintf("%s names no claim of explanations[%d]: add a claim with id %q to it, or drop the placeholder. %s", sg.Text, i, sg.Claim, bracesAdvice)})
+			case def.explanation != i:
+				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeUnresolvedClaimRef,
+					Message: fmt.Sprintf("%s is a claim of explanations[%d]: a placeholder names only claims of its own explanation, so state the figure here as a claim with its own id. %s", sg.Text, def.explanation, bracesAdvice)})
+			}
+			if glued, ok := gluedText(s[:start], sg.Text, s[end:]); ok {
+				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeGluedToClaim,
+					Message: fmt.Sprintf("%q glues text to %s: a sign or digits before a claim, or digits, an exponent or decimals after it, change the number a reader sees; put a space or words between them", clip(glued), sg.Text)})
 			}
 		case SegmentNode:
 			refs[sg.Node] = struct{}{}
@@ -251,7 +271,64 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 			}
 		}
 	}
+	for rest := s; ; {
+		at := strings.Index(rest, nodeRefPrefix)
+		if at < 0 {
+			break
+		}
+		rest = rest[at:]
+		if _, _, ok := placeholder(rest); !ok {
+			bad := rest[:min(len(rest), maxPlaceholderLen)]
+			if close := strings.IndexByte(bad, '}'); close >= 0 {
+				bad = bad[:close+1]
+			}
+			bad = strings.ToValidUTF8(bad, "")
+			c.fail(Failure{Explanation: i, Ref: bad, Code: CodeUnresolvedNodeRef,
+				Message: fmt.Sprintf("%q is not a node reference: write {n:<id>} with a node's 16 lowercase hex digit ID from top, path or facts on view %s", bad, c.viewName())})
+		}
+		rest = rest[len(nodeRefPrefix):]
+	}
 	return segs
+}
+
+// bracesAdvice ends every unresolved claim reference's message, since a
+// frame name with braces in it reads as a placeholder.
+const bracesAdvice = "To mention a frame whose name contains braces, use {n:<id>} instead of its name."
+
+// gluedText reports whether the text around a claim placeholder changes the
+// number it shows: a sign (+, -, U+2212) or a numeric character right
+// before it, or a "." right before it that follows a numeric character; a
+// numeric character right after it, or "e", "E", "." or "," followed by
+// one. It returns the placeholder with the glued characters.
+func gluedText(before, ph, after string) (string, bool) {
+	prev, size := utf8.DecodeLastRuneInString(before)
+	if before != "" {
+		switch {
+		case prev == '+' || prev == '-' || prev == '\u2212' || unicode.IsNumber(prev):
+			return string(prev) + ph, true
+		case prev == '.':
+			if p2, _ := utf8.DecodeLastRuneInString(before[:len(before)-size]); unicode.IsNumber(p2) {
+				return string(p2) + "." + ph, true
+			}
+		}
+	}
+	next, size := utf8.DecodeRuneInString(after)
+	switch {
+	case after == "":
+	case unicode.IsNumber(next):
+		return ph + string(next), true
+	case next == 'e' || next == 'E' || next == '.' || next == ',':
+		if n2, size2 := utf8.DecodeRuneInString(after[size:]); unicode.IsNumber(n2) {
+			return ph + after[:size+size2], true
+		}
+	}
+	return "", false
+}
+
+// claimDef is where a claim ID was first defined.
+type claimDef struct {
+	explanation int
+	path        string
 }
 
 // claimError is a claim failure found while looking up its fact.
@@ -277,24 +354,24 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 		ref    string
 	)
 	fail := func(code Code, format string, args ...any) (CheckedClaim, bool) {
-		c.fail(Failure{Explanation: i, Claim: cl.ID, Ref: ref, Code: code, Message: fmt.Sprintf(format, args...), Agent: cl.Value.Text, Engine: engine})
+		c.fail(Failure{Explanation: i, Claim: clip(cl.ID), Ref: clip(ref), Code: code, Message: fmt.Sprintf(format, args...), Agent: clip(cl.Value.Text), Engine: engine})
 		return CheckedClaim{}, false
 	}
 
 	if !validClaimID(cl.ID) {
-		return fail(CodeBadClaimID, "%s: claim id %q does not match ^[A-Za-z][A-Za-z0-9_-]{0,31}$", path, cl.ID)
+		return fail(CodeBadClaimID, "%s: claim id %q does not match ^[A-Za-z][A-Za-z0-9_-]{0,31}$", path, clip(cl.ID))
 	}
 	if first, dup := c.ids[cl.ID]; dup {
-		return fail(CodeDuplicateClaimID, "%s: claim id %q is already used by %s: give each claim its own id", path, cl.ID, first)
+		return fail(CodeDuplicateClaimID, "%s: claim id %q is already used by %s: give each claim its own id", path, cl.ID, first.path)
 	}
-	c.ids[cl.ID] = path
+	c.ids[cl.ID] = claimDef{explanation: i, path: path}
 
 	t := target{metric: cl.Metric, scope: cl.Scope, module: cl.Module}
 	switch {
 	case isDiffMetric(t.metric):
 		return fail(CodeDiffMetric, "%s compares two profiles: diff reports it, and a claim about one view cannot state it", t.metric)
 	case nodeFacts[t.metric] == nil && !isQuality(t.metric) && t.metric != profilemodel.MetricUnsampledPortion:
-		return fail(CodeUnknownMetric, "metric %q is not a fact a claim can state; one of: %s", t.metric, strings.Join(claimable, ", "))
+		return fail(CodeUnknownMetric, "metric %q is not a fact a claim can state; one of: %s", clip(t.metric), strings.Join(claimable, ", "))
 	}
 	switch t.scope {
 	case "", ScopeNode:
@@ -310,7 +387,7 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 			return fail(CodeWrongScope, `a view-level claim takes no node: drop "node" or claim the node-level fact with "scope": "node"`)
 		}
 	default:
-		return fail(CodeWrongScope, `scope must be "node" or "view", not %q`, t.scope)
+		return fail(CodeWrongScope, `scope must be "node" or "view", not %q`, clip(t.scope))
 	}
 	if t.module != nil && t.metric != profilemodel.MetricQualityUnresolvedByModule {
 		return fail(CodeModuleNotApplicable, `"module" applies only to %s: drop it from this %s claim`, profilemodel.MetricQualityUnresolvedByModule, t.metric)
@@ -322,7 +399,7 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 				return fail(CodeUnknownNode, `%s has no "node" and neither has its explanation: name the node the claim is about`, path)
 			}
 			ref = string(t.node)
-			return fail(CodeUnknownNode, "%s: node %q is not in view %s: take node IDs from top, path or facts on this view", path, t.node, c.viewName())
+			return fail(CodeUnknownNode, "%s: node %q is not in view %s: take node IDs from top, path or facts on this view", path, clip(ref), c.viewName())
 		}
 	}
 
@@ -352,7 +429,7 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 	case cl.Unit == "":
 		return fail(CodeWrongUnit, `"unit" is required: %s is in %s`, t.metric, fact.Unit)
 	case cl.Unit != fact.Unit:
-		return fail(CodeWrongUnit, "unit is %q, but %s is in %s", cl.Unit, t.metric, fact.Unit)
+		return fail(CodeWrongUnit, "unit is %q, but %s is in %s", clip(cl.Unit), t.metric, fact.Unit)
 	}
 	switch {
 	case fact.Denominator == "" && cl.Denominator != "":
@@ -360,7 +437,7 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 	case cl.Denominator == "" && fact.Denominator != "":
 		return fail(CodeWrongDenominator, `"denominator" is required: %s here is a share of %s`, t.metric, fact.Denominator)
 	case cl.Denominator != fact.Denominator:
-		return fail(CodeWrongDenominator, "denominator is %q, but %s here is a share of %s", cl.Denominator, t.metric, fact.Denominator)
+		return fail(CodeWrongDenominator, "denominator is %q, but %s here is a share of %s", clip(cl.Denominator), t.metric, fact.Denominator)
 	}
 
 	x, code, msg := parseValue(cl.Value)
@@ -369,15 +446,15 @@ func (c *checker) claim(i, j int, e Explanation, cl Claim) (CheckedClaim, bool) 
 	}
 	switch {
 	case fact.Unit == profilemodel.UnitRatio && (x.Sign() < 0 || x.Cmp(big.NewRat(1, 1)) > 0):
-		return fail(CodeOutOfRange, "%s is a share and lies in [0, 1]; %s does not", t.metric, cl.Value.Text)
+		return fail(CodeOutOfRange, "%s is a share and lies in [0, 1]; %s does not", t.metric, clip(cl.Value.Text))
 	case x.Sign() < 0:
-		return fail(CodeOutOfRange, "%s is never negative; %s is", t.metric, cl.Value.Text)
+		return fail(CodeOutOfRange, "%s is never negative; %s is", t.metric, clip(cl.Value.Text))
 	case policy.Kind == profilemodel.RoundExact && !x.IsInt():
-		return fail(CodeNotInteger, "%s is an exact integer in %s; %s is not an integer: state it exactly, digits only", t.metric, fact.Unit, cl.Value.Text)
+		return fail(CodeNotInteger, "%s is an exact integer in %s; %s is not an integer: state it exactly, digits only", t.metric, fact.Unit, clip(cl.Value.Text))
 	}
 	got, ok := policy.Canonical(x)
 	if !ok || got != want {
-		return fail(CodeValueMismatch, "%s is %s at the engine's rounding (%s); %s is %s at that rounding", t.metric, want, policy, cl.Value.Text, cmp.Or(got, "not representable"))
+		return fail(CodeValueMismatch, "%s is %s at the engine's rounding (%s); %s is %s at that rounding", t.metric, want, policy, clip(cl.Value.Text), clip(cmp.Or(got, "not representable")))
 	}
 	return CheckedClaim{ID: cl.ID, EngineValue: ev}, true
 }
@@ -428,7 +505,7 @@ func qualityFact(q profilemodel.Quality, t target) (profilemodel.Fact, error) {
 	f, ok := q.UnresolvedByModule[*t.module]
 	if !ok {
 		return profilemodel.Fact{}, &claimError{CodeUnknownModule,
-			fmt.Sprintf("module %q has no unresolved frames here; the keys of unresolved_by_module are: %s", *t.module, keys)}
+			fmt.Sprintf("module %q has no unresolved frames here; the keys of unresolved_by_module are: %s", clip(*t.module), keys)}
 	}
 	return f, nil
 }
@@ -452,18 +529,18 @@ func parseValue(l Literal) (*big.Rat, Code, string) {
 	case "":
 		return nil, CodeBadValue, `the claim has no value: send "value" as a JSON number or a decimal string`
 	case LiteralOther:
-		return nil, CodeBadValue, fmt.Sprintf("value %s is not a number: send a JSON number or a decimal string", l.Text)
+		return nil, CodeBadValue, fmt.Sprintf("value %s is not a number: send a JSON number or a decimal string", clip(l.Text))
 	}
 	if isNonFinite(l.Text) {
-		return nil, CodeNonFinite, fmt.Sprintf("value %q is not finite: every fact is a finite number", l.Text)
+		return nil, CodeNonFinite, fmt.Sprintf("value %q is not finite: every fact is a finite number", clip(l.Text))
 	}
 	if !isDecimal(l.Text) {
 		return nil, CodeBadValue, fmt.Sprintf("value %q is not a decimal: write digits with an optional sign, fraction and exponent, like 0.411, \"9007199254740993\" or 4.11e-1 (at most %d digits before the point, %d after it and %d in the exponent)",
-			l.Text, maxIntDigits, maxFracDigits, maxExpDigits)
+			clip(l.Text), maxIntDigits, maxFracDigits, maxExpDigits)
 	}
 	x, ok := new(big.Rat).SetString(l.Text)
 	if !ok {
-		return nil, CodeBadValue, fmt.Sprintf("value %q is not a decimal", l.Text)
+		return nil, CodeBadValue, fmt.Sprintf("value %q is not a decimal", clip(l.Text))
 	}
 	return x, "", ""
 }
@@ -510,4 +587,17 @@ func isDecimal(s string) bool {
 		}
 	}
 	return i == len(s)
+}
+
+// clip cuts agent text echoed in a failure to maxEcho characters, ending it
+// in "…", so a huge field cannot make a failure huge.
+func clip(s string) string {
+	n := 0
+	for i := range s {
+		if n == maxEcho {
+			return strings.ToValidUTF8(s[:i], "\uFFFD") + "…"
+		}
+		n++
+	}
+	return s
 }

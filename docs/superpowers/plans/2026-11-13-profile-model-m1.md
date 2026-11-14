@@ -204,7 +204,8 @@
   type Fact struct {
       Int         *int64   `json:"int,omitempty"`       // exact value for sample units and counts; set unless unavailable
       Ratio       *float64 `json:"ratio,omitempty"`     // set only when Unit == "ratio" and not unavailable
-      Unit        string  `json:"unit"`                  // sample unit, "ratio" or "count"
+      Derived     *float64 `json:"derived,omitempty"`   // finite derived metric with its own unit, e.g. "<sample unit>/work"; never used for raw values
+      Unit        string  `json:"unit"`                  // sample unit, "ratio", "count" or "<sample unit>/work"
       Status      Status  `json:"status"`
       Reason      string  `json:"reason,omitempty"`      // required when unavailable
       Denominator string  `json:"denominator,omitempty"` // "view_total" or "parent:<node id>"
@@ -307,7 +308,7 @@
       Combined        int64      // BaseCum + NewCum: the drawing weight, additive
       DeltaAbs        int64      // NewCum - BaseCum
       DeltaShare      Fact       // new share - base share; unavailable if a total is 0
-      DeltaPerUnit    Fact       // unavailable unless both work counts are positive and finite
+      DeltaPerUnit    Fact       // Derived, Unit "<sample unit>/work": NewCum/New - BaseCum/Base; unavailable unless both work counts are positive and finite and the result is finite
       Children        []*DiffNode // sorted by |DeltaAbs| desc, then Name
   }
   type Candidate struct{ Side string; Handle Handle; Node NodeID } // Side is "base" or "new": equal NodeIDs can occur in both views
@@ -351,6 +352,8 @@
   - `TestCombinedOverflowIsAnError`: base and new roots of `math.MaxInt64` → `ErrOverflow`.
   - `TestDiffRefusesIncompatibleViews`: cpu vs gpu, and equal type with different `ViewOptions` → `ErrIncompatibleViews`.
   - `TestPerUnitDeltaNeedsPositiveFiniteWork`: none, `{0,100}`, `{+Inf,1}` → `unavailable`; `{100,100}` → `ok`.
+  - `TestPerUnitDeltaKeepsFractionsAndUnit`: base 1 ns over 2 work, new 2 ns over 2 work → `Derived == +0.5`, `Unit == "nanoseconds/work"`, `Int == nil`; swapped sides → `-0.5`.
+  - `TestPerUnitDeltaRejectsNonFiniteResult`: base work `math.SmallestNonzeroFloat64` with `BaseCum == math.MaxInt64` → `unavailable` with reason `non-finite result`, never `+Inf` in JSON.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** `go test -race ./internal/profilemodel` → PASS.
 - [ ] **Step 5: Commit** `profilemodel: bilateral diff with explicit matching and comparability`.
 
@@ -401,3 +404,7 @@
 - [ ] **Step 3:** Real-profile smoke test on checked-in captures in the main checkout (`python3-202604021640-on-cpu.pb.gz` and another on-CPU capture of the same program): `-list-nodes 5`, `-facts <id>`, `-diff`; open the page and check removed paths, interpretation and legend.
 - [ ] **Step 4:** Existing HTML unchanged: render one GPU and one CPU profile with `cmd/flamegraph` on `main` and on the branch, `cmp` → identical.
 - [ ] **Step 5:** `git push` to `ai-flamegraph-design`; update PR #262's description. Do not mark ready, do not merge.
+
+## Note for M2 consumers
+
+Integer facts are exact `int64` in Go. A JavaScript client that `JSON.parse`s a token above 2^53 loses precision; the MCP and HTML contracts in M2 must carry integer payloads losslessly (for example as decimal strings) and test a value above 2^53.

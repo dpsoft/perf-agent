@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/big"
 	"path"
 	"slices"
 	"strings"
@@ -60,12 +61,47 @@ const (
 )
 
 // Comparability thresholds: a share moving by more than this between the
-// sides makes the nodes judged on it not comparable.
+// sides makes the nodes judged on it not comparable. They are compared
+// exactly, as rationals on the integer weights (see shiftExceeds), so a
+// move of exactly the threshold is comparable.
 const (
 	MaxUnresolvedShift = 0.10 // a module's unresolved share
 	MaxJoinShift       = 0.10 // the gpu_join=exact share, GPU views only
 	MaxSerializedShift = 0.10 // each gpu_serialized state's share, GPU views only
 )
+
+// threshold is a share shift as the exact rational num/den.
+type threshold struct{ num, den int64 }
+
+// shiftScale turns each Max*Shift constant into an exact rational. The
+// constants are untyped, so the products below are exact, and the
+// conversion does not compile if a threshold has more than six decimals.
+const shiftScale = 1_000_000
+
+var (
+	unresolvedLimit = threshold{int64(MaxUnresolvedShift * shiftScale), shiftScale}
+	joinLimit       = threshold{int64(MaxJoinShift * shiftScale), shiftScale}
+	serializedLimit = threshold{int64(MaxSerializedShift * shiftScale), shiftScale}
+)
+
+// shiftExceeds reports whether a share moved by more than limit from a/da
+// (base) to b/db (new), decided exactly:
+//
+//	|b/db - a/da| > num/den  ⇔  den·|b·da - a·db| > num·da·db
+//
+// The products need up to 189 bits, so they are big.Ints. Denominators
+// are positive: callers have ruled out a zero total as unavailable.
+func shiftExceeds(a, da, b, db int64, limit threshold) bool {
+	cross := new(big.Int).Mul(big.NewInt(b), big.NewInt(da))
+	cross.Sub(cross, new(big.Int).Mul(big.NewInt(a), big.NewInt(db)))
+	cross.Abs(cross).Mul(cross, big.NewInt(limit.den))
+	bound := new(big.Int).Mul(big.NewInt(da), big.NewInt(db))
+	bound.Mul(bound, big.NewInt(limit.num))
+	return cross.Cmp(bound) > 0
+}
+
+// ratio is part/whole for display; whole is positive.
+func ratio(part, whole int64) float64 { return float64(part) / float64(whole) }
 
 // DiffNode is one node of the union of two views.
 //
@@ -139,8 +175,13 @@ type Diff struct {
 	// unresolved share moved past the threshold, then the join coverage,
 	// sample period and perturbation causes, then the comparisons that
 	// could not be made. Empty, not nil, when there is nothing to say.
-	QualityWarnings []string  `json:"quality_warnings"`
-	Root            *DiffNode `json:"root"`
+	QualityWarnings []string `json:"quality_warnings"`
+	// BaseNotes and NewNotes are each view's sampling notes, the text its
+	// path facts carry in PathFacts.Notes; nil except on GPU views with a
+	// non-zero total.
+	BaseNotes []string  `json:"base_notes"`
+	NewNotes  []string  `json:"new_notes"`
+	Root      *DiffNode `json:"root"`
 }
 
 // ErrIncompatibleViews is returned when the views differ in sample type,
@@ -186,13 +227,16 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	}
 	d := &differ{views: [2]*View{baseView, newView}, work: [2]float64{work.Base, work.New}}
 	roots := [2]*Node{baseView.Root, newView.Root}
-	top, err := d.basisOf(roots)
-	if err != nil {
-		return nil, err
-	}
+	top := d.basisOf(roots)
 	root, err := d.node(roots, "", nil, top, nil)
 	if err != nil {
 		return nil, err
+	}
+	var notes [2][]string
+	for s, v := range d.views {
+		if notes[s], err = viewSamplingNotes(v); err != nil {
+			return nil, err
+		}
 	}
 	return &Diff{
 		BaseHandle:      baseView.Handle,
@@ -204,8 +248,23 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 		BaseQuality:     top.q[baseSide],
 		NewQuality:      top.q[newSide],
 		QualityWarnings: d.viewWarnings(top),
+		BaseNotes:       notes[baseSide],
+		NewNotes:        notes[newSide],
 		Root:            root,
 	}, nil
+}
+
+// viewSamplingNotes is the view-level sampling note text PathFacts.Notes
+// carries: GPU views only, nil otherwise.
+func viewSamplingNotes(v *View) ([]string, error) {
+	if v.SampleType != gpuSampleType {
+		return nil, nil
+	}
+	unsampled, err := v.unsampledTotal()
+	if err != nil {
+		return nil, err
+	}
+	return v.samplingNotes(unsampled)
 }
 
 func describeView(v *View) string {
@@ -225,21 +284,19 @@ func (d *differ) gpu() bool { return d.views[baseSide].SampleType == gpuSampleTy
 // one-sided node below the pair.
 type basis struct {
 	q      [2]Quality
+	w      [2]qualityWeights
 	value  [2]int64
 	shared findings
 }
 
-func (d *differ) basisOf(pair [2]*Node) (*basis, error) {
+func (d *differ) basisOf(pair [2]*Node) *basis {
 	b := &basis{}
 	for s, n := range pair {
-		q, err := d.views[s].NodeQuality(n.ID)
-		if err != nil {
-			return nil, err
-		}
-		b.q[s], b.value[s] = q, n.Cum
+		b.q[s], b.w[s] = d.views[s].nodeQuality(n)
+		b.value[s] = n.Cum
 	}
 	d.sharedFindings(b)
-	return b, nil
+	return b
 }
 
 // findings are the causes that make a node not comparable, in rule order,
@@ -290,9 +347,7 @@ func (d *differ) node(pair [2]*Node, match Match, cands []Candidate, up *basis, 
 	case matched:
 		dn.Presence = PresenceBoth
 		if parent != nil {
-			if here, err = d.basisOf(pair); err != nil {
-				return nil, err
-			}
+			here = d.basisOf(pair)
 		}
 	case pair[baseSide] != nil:
 		dn.Presence = PresenceOnlyBase
@@ -579,7 +634,7 @@ func moduleLabel(m ModuleRef) string {
 // symbolFindings compares the module's unresolved share. A side with no
 // key for it has a share of 0, which is a measurement only while that
 // side's Unresolved is available. With several keys on a side (modules
-// sharing a base name) the largest shift counts.
+// sharing a base name) any one moving past the threshold is a cause.
 func symbolFindings(f *findings, b *basis, m moduleSides) {
 	for s := range b.q {
 		if u := b.q[s].Unresolved; u.Status == StatusUnavailable {
@@ -587,34 +642,24 @@ func symbolFindings(f *findings, b *basis, m moduleSides) {
 			return
 		}
 	}
-	var shares [2][]float64
+	var parts [2][]int64
 	for s, keys := range m.keys {
 		if len(keys) == 0 {
-			shares[s] = []float64{0}
+			parts[s] = []int64{0}
 		}
 		for _, k := range keys {
-			shares[s] = append(shares[s], ratioOf(b.q[s].UnresolvedByModule[k]))
+			parts[s] = append(parts[s], b.w[s].byModule[k])
 		}
 	}
-	worst, at := -1.0, [2]float64{}
-	for _, x := range shares[baseSide] {
-		for _, y := range shares[newSide] {
-			if shift := math.Abs(y - x); shift > worst {
-				worst, at = shift, [2]float64{x, y}
+	da, db := b.w[baseSide].total, b.w[newSide].total
+	for _, x := range parts[baseSide] {
+		for _, y := range parts[newSide] {
+			if shiftExceeds(x, da, y, db, unresolvedLimit) {
+				f.cause("symbols of %s: unresolved share %.3f in base, %.3f in new", m.label, ratio(x, da), ratio(y, db))
+				return
 			}
 		}
 	}
-	if worst > MaxUnresolvedShift {
-		f.cause("symbols of %s: unresolved share %.3f in base, %.3f in new", m.label, at[baseSide], at[newSide])
-	}
-}
-
-// ratioOf is an available share's value; a missing entry is 0.
-func ratioOf(f Fact) float64 {
-	if f.Ratio == nil {
-		return 0
-	}
-	return *f.Ratio
 }
 
 // unavailableSide returns the first side whose fact is unavailable.
@@ -635,8 +680,8 @@ func (d *differ) sharedFindings(b *basis) {
 		join := [2]Fact{b.q[baseSide].JoinExact, b.q[newSide].JoinExact}
 		if s, ok := unavailableSide(join); ok {
 			f.note("join coverage: comparison unavailable in %s: %s", sideNames[s], join[s].Reason)
-		} else if x, y := ratioOf(join[baseSide]), ratioOf(join[newSide]); math.Abs(y-x) > MaxJoinShift {
-			f.cause("join coverage: exact share %.3f in base, %.3f in new", x, y)
+		} else if x, y, da, db := b.w[baseSide].joinExact, b.w[newSide].joinExact, b.w[baseSide].total, b.w[newSide].total; shiftExceeds(x, da, y, db, joinLimit) {
+			f.cause("join coverage: exact share %.3f in base, %.3f in new", ratio(x, da), ratio(y, db))
 		}
 	}
 
@@ -674,16 +719,17 @@ func perturbationFindings(f *findings, b *basis) {
 			}
 		}
 	}
+	base, next := b.w[baseSide], b.w[newSide]
 	names := [serializedStates]string{"true", "false", "unknown", "missing"}
 	for i, name := range names {
-		if x, y := ratioOf(states[baseSide][i]), ratioOf(states[newSide][i]); math.Abs(y-x) > MaxSerializedShift {
-			f.cause("perturbation: serialized %s share %.3f in base, %.3f in new", name, x, y)
+		if x, y := base.serialized[i], next.serialized[i]; shiftExceeds(x, base.total, y, next.total, serializedLimit) {
+			f.cause("perturbation: serialized %s share %.3f in base, %.3f in new", name, ratio(x, base.total), ratio(y, next.total))
 			return
 		}
 	}
 	var known [2]bool
-	for s := range states {
-		known[s] = ratioOf(states[s][serializedTrue]) > 0 || ratioOf(states[s][serializedFalse]) > 0
+	for s := range b.w {
+		known[s] = b.w[s].serialized[serializedTrue] > 0 || b.w[s].serialized[serializedFalse] > 0
 	}
 	if known[baseSide] != known[newSide] {
 		k := baseSide

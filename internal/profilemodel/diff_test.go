@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -12,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/google/pprof/profile"
+
+	"github.com/dpsoft/perf-agent/internal/foldedstacks"
 )
 
 func compareOf(t *testing.T, base, next []byte, work WorkCounts) *Diff {
@@ -610,6 +613,102 @@ func TestZeroValuePeriodIsNotCompared(t *testing.T) {
 	}
 }
 
+// Each rule's threshold is "more than 0.10", decided on the integer
+// weights: 30 → 40 of 100 is exactly 0.10, although 0.4 - 0.3 is
+// 0.10000000000000003 in float64.
+func TestThresholdsAreExact(t *testing.T) {
+	cases := []struct {
+		base, next int64
+		want       Interpretation
+	}{
+		{30, 39, Comparable}, {30, 40, Comparable}, {30, 41, NotComparable},
+		{39, 30, Comparable}, {40, 30, Comparable}, {41, 30, NotComparable},
+	}
+	kernel := []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}
+	labelled := func(label, part, rest string) func(int64) []byte {
+		return func(x int64) []byte {
+			return gpuProfile(
+				fx{stack: kernel, value: x, labels: map[string][]string{label: {part}}},
+				fx{stack: kernel, value: 100 - x, labels: map[string][]string{label: {rest}}},
+			)
+		}
+	}
+	rules := map[string]struct {
+		build  func(part int64) []byte // part of 100 under the judged node
+		path   []string
+		prefix string
+	}{
+		// foo is in libfoo; part of its 100 ends in an unsymbolized libfoo frame.
+		"unresolved": {
+			build: func(x int64) []byte {
+				foo := in("/usr/lib/libfoo.so", "f", 0x10, ln("foo"))
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{fn("main"), foo, in("/usr/lib/libfoo.so", "f", 0x9)}, value: x},
+					rs{stack: []frame{fn("main"), foo, fn("bar")}, value: 100 - x},
+				)
+			},
+			path:   []string{"main", "foo"},
+			prefix: "symbols of libfoo.so:",
+		},
+		"join":       {build: labelled("gpu_join", "exact", "heuristic"), path: kernel, prefix: "join coverage:"},
+		"serialized": {build: labelled("gpu_serialized", "true", "false"), path: kernel, prefix: "perturbation:"},
+	}
+	for name, r := range rules {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s/%d-to-%d", name, tc.base, tc.next), func(t *testing.T) {
+				n := oneDiffAt(t, compareOf(t, r.build(tc.base), r.build(tc.next), WorkCounts{}), r.path...)
+				if n.Interpretation != tc.want {
+					t.Fatalf("%s: %s (%q), want %s", n.Name, n.Interpretation, n.Why, tc.want)
+				}
+				if tc.want == NotComparable && !strings.HasPrefix(n.Why, r.prefix) {
+					t.Fatalf("why %q, want prefix %q", n.Why, r.prefix)
+				}
+			})
+		}
+	}
+}
+
+func TestShiftExceedsAtTheLimits(t *testing.T) {
+	limit := threshold{num: 1, den: 10}
+	for _, tc := range []struct {
+		a, da, b, db int64
+		want         bool
+	}{
+		{0, math.MaxInt64, math.MaxInt64, math.MaxInt64, true},
+		{math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, false},
+		{1, 10, 2, 10, false}, // exactly 0.1
+		{1, 3, 2, 7, false},   // 2/7 - 1/3 = -1/21
+		{1, 7, 3, 7, true},
+	} {
+		if got := shiftExceeds(tc.a, tc.da, tc.b, tc.db, limit); got != tc.want {
+			t.Errorf("shiftExceeds(%d/%d → %d/%d) = %v, want %v", tc.a, tc.da, tc.b, tc.db, got, tc.want)
+		}
+	}
+}
+
+// Each view's sampling notes are those its path facts carry, GPU only.
+func TestDiffCarriesEachViewsSamplingNotes(t *testing.T) {
+	sampled := allFixtures()["gpu-sampled-and-unsampled"]()
+	other := gpuProfile(fx{stack: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, value: 50,
+		labels: map[string][]string{"gpu_sample_period": {"4"}}})
+	d := compareOf(t, sampled, other, WorkCounts{})
+	want := foldedstacks.SamplingNotes(30, 100, "8", 1)
+	if len(want) != 2 || !slices.Equal(d.BaseNotes, want) {
+		t.Fatalf("base notes %q, want %q", d.BaseNotes, want)
+	}
+	if pf := factsAt(t, viewOf(t, sampled), "main"); !slices.Equal(d.BaseNotes, pf.Notes) {
+		t.Fatalf("base notes %q, path facts %q", d.BaseNotes, pf.Notes)
+	}
+	pf := factsAt(t, viewOf(t, other), "main")
+	if len(pf.Notes) == 0 || !slices.Equal(d.NewNotes, pf.Notes) {
+		t.Fatalf("new notes %q, path facts %q", d.NewNotes, pf.Notes)
+	}
+	cpu := pairDiff(t, "removed-kernel")
+	if cpu.BaseNotes != nil || cpu.NewNotes != nil {
+		t.Fatalf("CPU notes %q %q", cpu.BaseNotes, cpu.NewNotes)
+	}
+}
+
 func TestWhyNamesTheFirstCause(t *testing.T) {
 	d := pairDiff(t, "join-and-period-change")
 	k := oneDiffAt(t, d, "main", "[gpu:launch]", "[gpu:kernel:k]")
@@ -815,7 +914,7 @@ func TestDiffJSONKeys(t *testing.T) {
 		}
 	}
 	wantKeys("diff", top, "base_handle", "new_handle", "sample_type", "unit", "base_total", "new_total",
-		"base_quality", "new_quality", "quality_warnings", "root")
+		"base_quality", "new_quality", "quality_warnings", "base_notes", "new_notes", "root")
 	common := []string{"name", "presence", "interpretation", "base_cum", "new_cum", "base_self",
 		"new_self", "combined", "delta_abs", "delta_share", "delta_per_unit"}
 

@@ -107,7 +107,10 @@ type Quality struct {
 }
 
 // Quality is the quality of the whole view.
-func (v *View) Quality() Quality { return v.quality(v.Root, DenominatorViewTotal) }
+func (v *View) Quality() Quality {
+	q, _ := v.quality(v.Root, DenominatorViewTotal)
+	return q
+}
 
 // NodeQuality is the quality of the samples through node id, with the
 // node's cumulative value as every share's denominator. The root's
@@ -117,11 +120,28 @@ func (v *View) NodeQuality(id NodeID) (Quality, error) {
 	if !ok {
 		return Quality{}, fmt.Errorf("%w: %s", ErrUnknownNode, id)
 	}
+	q, _ := v.nodeQuality(n)
+	return q, nil
+}
+
+// nodeQuality is NodeQuality for a node of v, with the integer weights
+// behind its shares.
+func (v *View) nodeQuality(n *Node) (Quality, qualityWeights) {
 	denominator := denominatorNode + string(n.ID)
 	if n == v.Root {
 		denominator = DenominatorViewTotal
 	}
-	return v.quality(n, denominator), nil
+	return v.quality(n, denominator)
+}
+
+// qualityWeights are the integer parts behind some of a Quality's shares,
+// in the view's sample unit, so a diff can compare shares exactly. total
+// is every share's denominator. The GPU-only parts are 0 on other views.
+type qualityWeights struct {
+	total      int64
+	byModule   map[string]int64 // UnresolvedByModule's parts, same keys
+	joinExact  int64
+	serialized [serializedStates]int64
 }
 
 // isUnresolved is the rule foldedstacks uses to count unsymbolized frames.
@@ -192,7 +212,7 @@ func (v *View) marksFor(n *Node) stackMarks {
 // quality measures the samples through n against n.Cum. No sum here can
 // overflow: each counts a subset of n's samples at most once, and n.Cum,
 // their total, was accumulated with checks when the view was built.
-func (v *View) quality(n *Node, denominator string) Quality {
+func (v *View) quality(n *Node, denominator string) (Quality, qualityWeights) {
 	value := func(s int) int64 { return v.profile.Source.Sample[s].Value[v.Index] }
 	sumOf := func(set map[int]struct{}) int64 {
 		var sum int64
@@ -212,8 +232,10 @@ func (v *View) quality(n *Node, denominator string) Quality {
 		CollisionPossible:  share(MetricQualityCollision, sumOf(m.collision)),
 		Executions:         v.profile.Executions,
 	}
+	w := qualityWeights{total: n.Cum, byModule: make(map[string]int64, len(m.byModule))}
 	for key, set := range m.byModule {
-		q.UnresolvedByModule[key] = share(MetricQualityUnresolvedByModule, sumOf(set))
+		w.byModule[key] = sumOf(set)
+		q.UnresolvedByModule[key] = share(MetricQualityUnresolvedByModule, w.byModule[key])
 	}
 
 	if v.SampleType != gpuSampleType {
@@ -234,7 +256,7 @@ func (v *View) quality(n *Node, denominator string) Quality {
 			Unknown: gpuOnly(MetricQualitySerializedUnknown),
 			Missing: gpuOnly(MetricQualitySerializedMissing),
 		}
-		return q
+		return q, w
 	}
 
 	var exact, heuristic, unmatched, ambiguous, refused int64
@@ -272,5 +294,6 @@ func (v *View) quality(n *Node, denominator string) Quality {
 		Unknown: share(MetricQualitySerializedUnknown, serialized[serializedUnknown]),
 		Missing: share(MetricQualitySerializedMissing, serialized[serializedMissing]),
 	}
-	return q
+	w.joinExact, w.serialized = exact, serialized
+	return q, w
 }

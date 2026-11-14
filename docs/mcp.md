@@ -97,9 +97,9 @@ Install it by copying or symlinking the directory into your agent's skills direc
 
 ```sh
 # Claude Code
-ln -s "$PWD/skills/perf-agent-mcp" ~/.claude/skills/perf-agent-mcp
-# Codex
-ln -s "$PWD/skills/perf-agent-mcp" ~/.codex/skills/perf-agent-mcp
+mkdir -p ~/.claude/skills && ln -s "$PWD/skills/perf-agent-mcp" ~/.claude/skills/perf-agent-mcp
+# Codex (user skills live in ~/.agents/skills; symlinks are supported)
+mkdir -p ~/.agents/skills && ln -s "$PWD/skills/perf-agent-mcp" ~/.agents/skills/perf-agent-mcp
 ```
 
 ## Source statuses

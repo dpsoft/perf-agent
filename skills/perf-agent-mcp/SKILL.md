@@ -26,16 +26,16 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
 6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all, and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
 
-Every call names its `handle` and `view`; nothing is "current". If a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
+Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`, and `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`. If a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 
 ## Hard rules
 
-- Integers are decimal strings. Quote them as strings; never turn them into floats.
+- Integers are decimal strings. Quote them as strings; never turn them into floats. The exception is source line numbers, which are JSON integers.
 - A fact is `ok`, `zero` or `unavailable`. Unavailable is not zero: never report it as 0.
 - Say which denominator a share uses (`view_total`, the parent, ...).
 - A width under `[gpu:launch]` is a sample of launches, not a share of GPU time. Never multiply anything by the sample period to get launches, executions or time.
 - Executions come only from an accepted execlog. Never count samples as executions.
-- `source_unverified` lines are not the code that ran. Do not present them as such.
+- `source_unverified` lines are NOT VERIFIED as the code that ran: they may be the exact file, but nothing proves it. Do not present them as verified.
 - A diff shows presence, not cause: a function missing from one side may have moved, been inlined or lost its symbols.
 - Report what the engine returned. Do not compute your own percentages or round values.
 
@@ -47,12 +47,12 @@ Every call names its `handle` and `view`; nothing is "current". If a handle is g
 | `glued_to_claim` | Write a range as "between {c1} and {c2}". No sign, exponent or dash next to a placeholder. |
 | `unknown_metric` | The `metric` is a claimable-metric name, not a path in the `facts` JSON. Use `share_of_total`, `cumulative`, `quality_join_exact`, `serialization_true` and the other names the guide lists. |
 | `wrong_scope` | `unsampled_portion` is a view-level fact: `"scope": "view"` and no node. Quality metrics take `"scope": "node"` or `"scope": "view"`. |
-| `wrong_denominator` | Copy the fact's `denominator` and `unit` from the `facts` response. |
+| `wrong_denominator` | A node claim copies the denominator and unit of the node's fact in `facts`; a view-scope quality claim uses the view quality from `open` or the engine value in the failure. |
 | `unavailable_fact` | The engine has no value for it. Say the figure is unavailable; do not claim it or write it as 0. |
 | `unresolved_node_ref` | Name a frame with `{n:<id>}` using an ID from `top` or `path`, never the frame's text. |
-| `unknown_node` | Use a node ID from this view; IDs differ between views and profiles. |
+| `unknown_node` | The ID must exist in the view you passed; take it from `top` or `path` on that view. |
 
-Other mistakes with no failure code: a figure typed freely in prose is shown as an unchecked number on the page, so put it in a claim; a frame name containing braces must be written as `{n:<id>}`, never pasted into prose; and a share under a GPU launch is not GPU time.
+Other mistakes with no failure code: a claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns"); a figure typed freely in prose is shown as an unchecked number on the page, so put it in a claim; a frame name containing braces must be written as `{n:<id>}`, never pasted into prose; and a share under a GPU launch is not GPU time.
 
 ## Verify
 

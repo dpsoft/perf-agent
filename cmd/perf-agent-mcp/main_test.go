@@ -404,10 +404,14 @@ func TestSignalEndsAServerBlockedOnOutput(t *testing.T) {
 		name    string
 		sig     syscall.Signal
 		blocked bool
+		// errBlocked also leaves stderr full and unread.
+		errBlocked bool
 	}{
-		{"SIGTERM blocked", syscall.SIGTERM, true},
-		{"SIGINT blocked", syscall.SIGINT, true},
-		{"SIGTERM drained", syscall.SIGTERM, false},
+		{"SIGTERM blocked", syscall.SIGTERM, true, false},
+		{"SIGINT blocked", syscall.SIGINT, true, false},
+		{"SIGTERM drained", syscall.SIGTERM, false, false},
+		{"SIGTERM stdout and stderr blocked", syscall.SIGTERM, true, true},
+		{"SIGINT stdout and stderr blocked", syscall.SIGINT, true, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			outR, outW, err := os.Pipe()
@@ -425,6 +429,21 @@ func TestSignalEndsAServerBlockedOnOutput(t *testing.T) {
 			defer func() { _ = inW.Close() }()
 			cmd := exec.Command(bin, "--profiles", t.TempDir())
 			cmd.Stdin, cmd.Stdout = inR, outW
+			if c.errBlocked {
+				errR, errW, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = errR.Close() }()
+				if _, err := unix.FcntlInt(errW.Fd(), unix.F_SETPIPE_SZ, 4096); err != nil {
+					t.Skipf("cannot shrink the pipe: %v", err)
+				}
+				if _, err := errW.Write(make([]byte, 4096)); err != nil {
+					t.Fatal(err)
+				}
+				cmd.Stderr = errW
+				defer func() { _ = errW.Close() }()
+			}
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}

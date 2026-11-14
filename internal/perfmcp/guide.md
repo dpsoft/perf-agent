@@ -60,6 +60,7 @@ Write each figure as a claim and refer to it from the prose. The engine checks t
 
 - A claim's `metric` is one of the names under Claimable metrics below, not a path in the `facts` JSON. Node-level metrics (the default scope) need a `node` (or the explanation's node). Quality metrics take either scope: `"scope": "node"` for the node, `"scope": "view"` with no `node` for the whole view. `unsampled_portion` is view-level only: `"scope": "view"` and no node.
 - Put every number in prose from a claim placeholder `{cN}` (`{c1}`). `{cN}` refers to a claim of the same explanation. Numbers typed freely are marked unchecked on the page.
+- A claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns").
 - To name a frame use `{n:<id>}`, especially for frame names containing braces; frame names are never parsed for placeholders.
 - For a range write "between {c1} and {c2}". A bare range like "{c1}-{c2}" is glued_to_claim and rejected, as is a sign or exponent next to a placeholder.
 - A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; fix them and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.

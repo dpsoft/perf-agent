@@ -119,7 +119,8 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		select {
 		case serveErr = <-serveDone:
 		case <-time.After(shutdownGrace):
-			log.Error("output was blocked: the client is not reading stdout; exiting")
+			// No synchronous I/O from here: stderr may be blocked too.
+			go log.Error("output was blocked: the client is not reading stdout; exiting")
 			closed := make(chan struct{})
 			go func() { _ = srv.Close(); close(closed) }()
 			select {

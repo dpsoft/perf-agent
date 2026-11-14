@@ -18,7 +18,7 @@ var skillArgs = []string{
 	"path", "execlog", "handle", "view", "notes", "rows", "functions", "nodes",
 	"next_cursor", "cursor", "attempt", "out", "ok", "zero", "unavailable",
 	"denominator", "unit", "value", "metric", "scope", "node", "facts",
-	"view_total", "source_unverified", "unsampled_portion", "base_handle",
+	"view_total", "source_unverified", "unsampled_portion", "base_handle", "base_view", "new_handle", "new_view",
 }
 
 // explainCodes reads the failure codes declared in internal/explain.

@@ -782,7 +782,10 @@ func TestWhyNamesTheFirstCause(t *testing.T) {
 
 func TestCPUDiffReportsPerturbationUnavailable(t *testing.T) {
 	d := pairDiff(t, "removed-kernel")
-	want := "perturbation: comparison unavailable: " + ReasonNotGPUView
+	want := WarningPerturbationNotGPU
+	if want != "perturbation: comparison unavailable: "+ReasonNotGPUView {
+		t.Fatalf("warning text %q", want)
+	}
 	if !slices.Contains(d.QualityWarnings, want) {
 		t.Fatalf("quality warnings %q lack %q", d.QualityWarnings, want)
 	}
@@ -986,7 +989,10 @@ func TestDiffJSONKeys(t *testing.T) {
 		}
 	}
 	wantKeys("diff", top, "base_handle", "new_handle", "sample_type", "unit", "base_total", "new_total",
-		"base_quality", "new_quality", "quality_warnings", "base_notes", "new_notes", "per_unit", "root")
+		"base_quality", "new_quality", "quality_warnings", "base_notes", "new_notes", "per_unit", "view", "root")
+	if d.View != "cpu/nanoseconds#0" {
+		t.Fatalf("view %q", d.View)
+	}
 	// Without work counts no node carries delta_per_unit: per_unit says why
 	// once.
 	common := []string{"name", "presence", "interpretation", "base_cum", "new_cum", "base_self",

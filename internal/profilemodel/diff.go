@@ -60,6 +60,11 @@ const (
 	ReasonNonFinite    = "non-finite result"                  // the delta itself is not a finite float64
 )
 
+// WarningPerturbationNotGPU is the QualityWarnings entry of a diff of
+// views other than GPU ones: the perturbation policy does not apply, and
+// saying so is a note, not a degradation.
+const WarningPerturbationNotGPU = "perturbation: comparison unavailable: " + ReasonNotGPUView
+
 // ReasonOwnFrameUnresolved is the Why of a one-sided node whose own frame
 // is unresolved: it names no function the other side could be checked
 // for, so its absence there says nothing.
@@ -170,8 +175,11 @@ type WorkCounts struct{ Base, New float64 }
 
 // Diff is the union of a base and a new view.
 type Diff struct {
-	BaseHandle  Handle  `json:"base_handle"`
-	NewHandle   Handle  `json:"new_handle"`
+	BaseHandle Handle `json:"base_handle"`
+	NewHandle  Handle `json:"new_handle"`
+	// View names the views compared, as PathFacts.View does:
+	// "<sample type>/<unit>#<resolved sample index>".
+	View        string  `json:"view"`
 	SampleType  string  `json:"sample_type"`
 	Unit        string  `json:"unit"`
 	BaseTotal   int64   `json:"base_total"`
@@ -256,6 +264,7 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	return &Diff{
 		BaseHandle:      baseView.Handle,
 		NewHandle:       newView.Handle,
+		View:            baseView.name(),
 		SampleType:      baseView.SampleType,
 		Unit:            baseView.Unit,
 		BaseTotal:       baseView.Total,
@@ -806,7 +815,7 @@ func (d *differ) viewWarnings(top *basis) []string {
 	f.causes = append(f.causes, top.shared.causes...)
 	f.notes = append(f.notes, top.shared.notes...)
 	if !d.gpu() {
-		f.note("perturbation: comparison unavailable: %s", ReasonNotGPUView)
+		f.note("%s", WarningPerturbationNotGPU)
 	}
 	out := []string{}
 	seen := map[string]bool{}

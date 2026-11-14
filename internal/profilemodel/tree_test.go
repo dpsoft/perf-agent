@@ -415,8 +415,12 @@ func TestViewRejectsBadSampleIndex(t *testing.T) {
 	if _, err := p.View(ViewOptions{SampleIndex: 1}); err == nil {
 		t.Fatal("index past the sample types accepted")
 	}
-	if _, err := p.View(ViewOptions{SampleIndex: -2}); err == nil {
-		t.Fatal("index -2 accepted")
+	// Any negative index chooses automatically, as foldedstacks does.
+	for _, idx := range []int{-1, -2, math.MinInt} {
+		v, err := p.View(ViewOptions{SampleIndex: idx})
+		if err != nil || v.Index != 0 {
+			t.Fatalf("index %d: view %+v err %v, want the automatic choice", idx, v, err)
+		}
 	}
 	v, err := p.View(ViewOptions{SampleIndex: 0})
 	if err != nil || v.SampleType != "cpu" || v.Unit != "nanoseconds" || v.Index != 0 || v.Handle != p.Handle {

@@ -224,7 +224,7 @@ func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error) {
 	}
 	pf := PathFacts{
 		Handle:            v.Handle,
-		View:              fmt.Sprintf("%s/%s#%d", v.SampleType, v.Unit, v.Index),
+		View:              v.name(),
 		Node:              n.ID,
 		Path:              names,
 		Cumulative:        intFact(MetricCumulative, n.Cum, v.Unit),

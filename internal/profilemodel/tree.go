@@ -41,7 +41,7 @@ type Node struct {
 
 // ViewOptions select how a profile is turned into a tree.
 type ViewOptions struct {
-	SampleIndex        int  // -1 = foldedstacks.ChooseSampleIndex
+	SampleIndex        int  // negative = foldedstacks.ChooseSampleIndex, as Fold reads it
 	CollapseVendorRuns bool // rejected in M1 with ErrUnsupportedView
 }
 
@@ -82,7 +82,7 @@ func (p *Profile) View(opts ViewOptions) (*View, error) {
 		return nil, errors.New("profilemodel: profile declares no sample types")
 	}
 	idx := opts.SampleIndex
-	if idx == -1 {
+	if idx < 0 {
 		idx = foldedstacks.ChooseSampleIndex(src)
 	}
 	if idx < 0 || idx >= len(src.SampleType) {
@@ -141,6 +141,9 @@ func (p *Profile) View(opts ViewOptions) (*View, error) {
 	}
 	return v, nil
 }
+
+// name is "<sample type>/<unit>#<index>", how facts and diffs name a view.
+func (v *View) name() string { return fmt.Sprintf("%s/%s#%d", v.SampleType, v.Unit, v.Index) }
 
 // Node returns the node with id.
 func (v *View) Node(id NodeID) (*Node, bool) {

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+:root{ {{.LightChrome}};--ai:#5b4bdb;--ai-bg:#f5f3ff;--ai-line:#d6d1fa;--ok:#1f7a45;--ok-bg:#f1faf4;--ok-line:#bfe3cd;--bad:#b3352a;--bad-bg:#fdf3f2;--bad-line:#f0c8c3;--chip-bg:#ffffff}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){ {{.DarkChrome}};--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}}
+:root[data-theme="dark"]{ {{.DarkChrome}};--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.muted{color:var(--muted)}
+button{font:inherit;color:inherit}
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:9px}
+.brand b{font-size:16px;font-weight:700;letter-spacing:-.015em}
+.brand i{font-style:italic;color:var(--muted);font-size:12.5px}
+h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width:8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.readout{padding:3px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);font-size:12px;white-space:nowrap}
+.prov{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 9px;font-size:12px;border:1px solid var(--line);background:var(--bg);white-space:nowrap;font-weight:500}
+.pill.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-bg)}
+.pill.bad{color:var(--bad);border-color:var(--bad-line);background:var(--bad-bg)}
+.pill.ai{color:var(--ai);border-color:var(--ai-line);background:var(--ai-bg)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
+.legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.legend .sw{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block}
+.legend .key{margin-left:auto;color:var(--ai)}
+.notes{margin:12px 16px 0;padding:8px 12px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:8px;font-size:12.5px}
+.notes ul{margin:4px 0 0;padding-left:18px}
+.body{display:grid;grid-template-columns:minmax(0,1fr) 420px;align-items:start}
+@media (max-width:1000px){.body{grid-template-columns:minmax(0,1fr)}}
+.graph{padding:12px 16px;min-width:0}
+.canvas{max-height:72vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:2px}
+.chart{position:relative;min-width:100%}
+.frame{position:absolute;height:19px;padding:0 5px;font:11px/19px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;border-radius:2px}
+.frame .star{color:#4a39c9;font-weight:700;margin-right:3px}
+.frame.cite{outline:2px dashed var(--ai);outline-offset:-2px;z-index:1}
+.frame:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;z-index:2}
+.axis{display:flex;justify-content:space-between;gap:12px;margin-top:6px;font-size:12px;color:var(--muted)}
+.left-out{margin:4px 0 0;font-size:12px;color:var(--muted)}
+h4{margin:16px 0 6px;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
+.exrow{display:flex;width:100%;gap:8px;align-items:center;padding:6px 9px;margin:0 0 6px;border:1px solid var(--line);border-radius:7px;background:var(--panel);cursor:pointer;text-align:left}
+.exrow:hover,.exrow:focus-visible{border-color:var(--ai)}
+.exrow .star{color:var(--ai);font-weight:700}
+.exrow code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exrow .w{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ref{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ai)}
+.qgrid,.facts{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.facts{grid-template-columns:max-content minmax(0,1fr) minmax(9em,1fr)}
+.facts .v{white-space:normal;overflow-wrap:anywhere}
+.k{color:var(--muted);white-space:nowrap}
+.v{font-weight:600;white-space:nowrap}
+.p{color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.st{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted);justify-self:start}
+.st-ok{color:var(--ok);border-color:var(--ok-line)}
+.st-unavailable{color:var(--bad);border-color:var(--bad-line)}
+.qgrid{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.side{background:var(--panel);border-left:1px solid var(--line);min-width:0;position:sticky;top:0;max-height:100vh;overflow:auto}
+@media (max-width:1000px){.side{position:static;max-height:none;border-left:0;border-top:1px solid var(--line)}}
+.hd{padding:12px 16px;border-bottom:1px solid var(--line)}
+.hd .lbl{font-size:12px;color:var(--muted)}
+.hd .nm{font:600 13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.hd .nid{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted)}
+.sec{padding:11px 16px;border-bottom:1px solid var(--line)}
+.sec h5{margin:0 0 8px;font-size:12.5px;font-weight:600}
+.sec h5 .tag{font-weight:500}
+.interp h5{color:var(--ai)}
+.sec p{margin:0 0 6px}
+.claim{font-weight:600;border-bottom:1px solid var(--ok-line);cursor:help}
+mark.unchecked{background:var(--warn-bg);color:inherit;border-bottom:1px dashed var(--warn-line);padding:0 1px;cursor:help}
+.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--ai-bg);color:var(--ai);border:1px solid var(--ai-line);border-radius:4px;padding:0 4px;cursor:pointer;vertical-align:1px}
+.hyp{margin:0;padding-left:18px}
+.hyp li{margin:0 0 4px}
+.hyp b{color:var(--ai)}
+.rej{margin:0;padding:0;list-style:none}
+.rej li{background:var(--bad-bg);border:1px solid var(--bad-line);border-radius:6px;padding:7px 10px;margin:0 0 6px;font-size:12.5px}
+.rej s{color:var(--bad)}
+.rej .why{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.path{list-style:none;margin:0;padding:0}
+.path button{display:flex;width:100%;gap:6px;align-items:baseline;padding:2px 4px;border:0;border-radius:4px;background:none;cursor:pointer;text-align:left}
+.path button:hover,.path button:focus-visible{background:var(--ai-bg)}
+.path .pn{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.path .c{color:var(--muted);font-size:11px;white-space:nowrap}
+.path li:last-child button{background:var(--ai-bg)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;background:var(--chip-bg);cursor:pointer}
+.chip:hover,.chip:focus-visible{border-color:var(--ai);color:var(--ai)}
+#copybox{display:block;width:100%;margin-top:8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+#copybox[hidden]{display:none}
+.foot{display:flex;flex-wrap:wrap;gap:6px 18px;padding:8px 16px;border-top:1px solid var(--line);background:var(--panel);font-size:12px;color:var(--muted)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:7px 14px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+.toast.on{opacity:1}
+</style>
+<style>{{.Palette}}</style>
+</head>
+<body>
+<header class="top">
+<span class="brand"><b>perf-agent</b><i>Enjoy the Flames.</i></span>
+<h1>{{.Title}}</h1>
+<span class="readout">View <b>{{.View}}</b></span>
+<div class="prov">
+<span class="pill ai">✦ Explained by an agent via MCP</span>
+<span class="pill ok" title="Each structured claim was compared with the engine at its rounding, and each frame reference resolved">{{.Checked}} figures and references checked</span>
+<span class="pill">prose is not verified</span>
+{{if .RejectedCount}}<span class="pill bad">{{.RejectedCount}} claims rejected at render</span>
+{{end}}</div>
+</header>
+<div class="legend" aria-label="Colour key">{{range .Legend}}<span class="c"><i class="sw" data-domain="{{.Key}}"></i>{{.Label}}</span>{{end}}<span class="c key">✦ path with an explanation</span></div>
+{{if .Notes}}<section class="notes" aria-label="Sampling notes"><b>Sampling notes</b>
+<ul>{{range .Notes}}<li>{{.}}</li>{{end}}</ul>
+</section>
+{{end}}<main class="body">
+<div class="graph">
+<div class="canvas"><div class="chart" id="chart" style="height:{{.Height}}px">
+{{range .Frames}}<div class="frame{{.Class}}" style="left:{{.Left}}%;width:{{.Width}}%;top:{{.Top}}px" data-i="{{.I}}" data-domain="{{.Domain}}"{{with .Resolution}} data-resolution="{{.}}"{{end}} tabindex="0" role="button" title="{{.Tip}}">{{if .Star}}<span class="star">✦</span>{{end}}{{.Name}}</div>
+{{end}}</div>
+</div>
+<div class="axis"><span>{{.View}} · {{.Axis}}</span><span title="{{.TotalTitle}}">total {{.Total}}</span></div>
+{{if .Narrow}}<p class="left-out">{{.Narrow}} nodes narrower than {{.MinWidth}} are not drawn.</p>
+{{end}}{{if .Beyond}}<p class="left-out">{{.Beyond}} nodes beyond the page's limit of {{.MaxNodes}} frames are not drawn.</p>
+{{end}}<section aria-label="Paths the agent explained"><h4>Paths the agent explained</h4>
+{{range .Rows}}<button type="button" class="exrow" data-node="{{.Node}}"><span class="star">✦</span><span class="ref">{{.Ref}}</span><code>{{.Name}}</code><span class="w">{{.Share}} · {{.Cum}}</span></button>
+{{else}}<p class="muted">The agent explained no path.</p>
+{{end}}</section>
+<section aria-label="Quality summary"><h4>Quality summary</h4>
+<div class="qgrid">{{range .Quality}}<span class="k">{{.Label}}</span><span class="v" title="{{.Title}}">{{.Value}}</span><span class="st st-{{.Status}}">{{.Status}}</span><span class="p">{{.Note}}</span>{{end}}</div>
+</section>
+</div>
+<aside class="side" aria-label="Selected frame">
+<div class="hd"><div class="lbl">Frame details · <span class="ref" id="sel-ref">{{.Sel.Ref}}</span></div><div class="nm" id="sel-name">{{.Sel.Name}}</div><div class="nid" id="sel-id">{{.Sel.ID}}</div></div>
+<section class="sec"><h5>Profile facts — computed by perf-agent</h5>
+<div class="facts" id="facts">{{range .Sel.Facts}}<span class="k">{{.Label}}</span><span class="v" title="{{.Title}}">{{.Value}}</span><span class="p">{{.Note}}</span>{{end}}</div>
+</section>
+<div id="exp">{{range .Sel.Explanation}}{{template "exp" .}}{{end}}</div>
+<p class="sec muted" id="noexp"{{if .Sel.Explanation}} hidden{{end}}>The agent did not explain this frame: these are the profile's facts only.</p>
+{{if .Rejected}}<section class="sec"><h5>Rejected at render</h5>
+<p class="muted">perf-agent refused these claims in earlier attempts. The agent's figure is struck through beside the engine's; this page is the attempt that passed.</p>
+<ul class="rej">{{range .Rejected}}<li><span class="ref">{{.Attempt}}</span> <code>{{.Metric}}</code> of {{.Node}}:{{if .Agent}} the agent wrote <s>{{.Agent}}</s>{{end}}{{if .Engine}}, perf-agent has <b>{{.Engine}}</b>{{end}}<div class="why">{{.Code}}: {{.Reason}}</div></li>
+{{end}}</ul>
+</section>
+{{end}}<section class="sec"><h5>Path (root → frame)</h5>
+<ol class="path" id="path">{{range .SelPath}}<li><button type="button" data-node="{{.Node}}"><span class="ref">{{.Ref}}</span><span class="pn">{{.Name}}</span><span class="c">{{.Share}}</span></button></li>{{end}}</ol>
+</section>
+<section class="sec"><h5>Follow up in your agent</h5>
+<p class="muted">Copies a question to paste into your MCP client, with the profile and the frame already named.</p>
+<div class="chips" id="chips">{{range .Chips}}<button type="button" class="chip" data-prompt="{{.Prompt}}">{{.Label}}</button>{{end}}</div>
+<textarea id="copybox" rows="3" readonly hidden aria-label="Prompt to copy"></textarea>
+</section>
+</aside>
+</main>
+<footer class="foot"><span title="{{.TotalTitle}}">Total {{.Total}}</span><span>View {{.View}}</span>{{with .ProfileName}}<span>Profile {{.}}</span>{{end}}{{with .Digest}}<span>Digest <code>{{.}}</code></span>{{end}}{{with .Attempt}}<span>Attempt {{.}}</span>{{end}}</footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script type="application/json" id="model">{{.Model}}</script>
+<script>{{.Script}}</script>
+</body>
+</html>
+{{define "segs"}}{{range .}}{{if eq .Kind "claim"}}<span class="claim" title="{{.Title}}">{{.Text}}</span>{{else if eq .Kind "node"}}<button type="button" class="cite" data-node="{{.Node}}" title="{{.Title}}">{{.Text}}</button> <code>{{.Name}}</code>{{else if eq .Kind "unchecked"}}<mark class="unchecked" title="{{.Title}}">{{.Text}}</mark>{{else}}{{.Text}}{{end}}{{end}}{{end}}
+{{define "exp"}}<section class="sec interp"><h5>Agent interpretation — prose, not verified</h5><p>{{template "segs" .Prose}}</p></section>
+{{if .Hypotheses}}<section class="sec"><h5>Hypotheses</h5><ul class="hyp">{{range .Hypotheses}}<li><b>Hypothesis:</b> {{template "segs" .}}</li>{{end}}</ul></section>
+{{end}}{{if .Next}}<section class="sec"><h5>Next measurement</h5><p>{{template "segs" .Next}}</p></section>
+{{end}}{{end}}

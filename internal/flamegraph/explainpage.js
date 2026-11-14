@@ -142,7 +142,7 @@
     $('noexp').hidden = list.length > 0;
 
     for (const c of chart.querySelectorAll('.frame.cite')) c.classList.remove('cite');
-    for (const b of exp.querySelectorAll('.cite')) {
+    for (const b of exp.querySelectorAll('button.cite')) {
       const j = byId.get(b.dataset.node);
       const ce = els.get(j);
       if (ce && j !== i) ce.classList.add('cite');

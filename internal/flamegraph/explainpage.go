@@ -55,6 +55,9 @@ type ExplainedPageOptions struct {
 	// Rejected are the server's record of the attempts refused before this
 	// one; every failure in them is listed on the page.
 	Rejected []explain.RejectedAttempt
+	// DroppedRejected is how many rejected attempts before Rejected the
+	// server no longer keeps; the rejected pill counts them.
+	DroppedRejected int
 	// MaxNodes bounds the frames drawn; 0 means defaultExplainedMaxNodes.
 	// Explained and referenced nodes and their callers are always drawn.
 	MaxNodes int
@@ -886,6 +889,13 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 		if attempts > 1 {
 			claimsPill += fmt.Sprintf(" in %d attempts", attempts)
 		}
+	}
+	if n := b.opts.DroppedRejected; n > 0 {
+		dropped := plural(n, "earlier rejected attempt", "earlier rejected attempts") + " not kept"
+		if claimsPill != "" {
+			dropped = claimsPill + ", plus " + dropped
+		}
+		claimsPill = dropped
 	}
 	if limits > 0 {
 		limitsPill = plural(limits, "limit", "limits") + " exceeded at render"

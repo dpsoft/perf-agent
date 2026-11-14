@@ -587,22 +587,44 @@ func TestExplainedPageEmitsRepeatedTextOnce(t *testing.T) {
 	}
 }
 
-// frameRules are the CSS rules of page that can size a frame box: a
-// selector whose last compound names .frame or a data-domain or
-// data-resolution attribute.
+// frameRules are the CSS rules of page that can match a frame element:
+// every selector whose last compound has no element type but div or *,
+// and whose classes are all classes a frame can carry, the ones it is
+// drawn with or the script adds. A bare .cite is such a rule: the script
+// adds cite to a frame the selected explanation references.
 func frameRules(page string) map[string]string {
-	css := strings.Join(regexp.MustCompile(`(?s)<style>(.*?)</style>`).FindAllString(page, -1), "\n")
+	var css strings.Builder
+	for _, m := range regexp.MustCompile(`(?s)<style>(.*?)</style>`).FindAllStringSubmatch(page, -1) {
+		css.WriteString(m[1] + "\n")
+	}
+	frameClasses := map[string]bool{"frame": true}
+	for _, m := range regexp.MustCompile(`<div class="(frame[^"]*)"`).FindAllStringSubmatch(page, -1) {
+		for c := range strings.FieldsSeq(m[1]) {
+			frameClasses[c] = true
+		}
+	}
+	for _, m := range regexp.MustCompile(`classList\.(?:add|toggle)\('([^']+)'`).FindAllStringSubmatch(page, -1) {
+		frameClasses[m[1]] = true
+	}
+	compound := regexp.MustCompile(`^([a-zA-Z*][a-zA-Z0-9-]*)?((?:\.[a-zA-Z0-9_-]+|\[[^\]]*\]|::?[a-zA-Z-]+(?:\([^)]*\))?)*)$`)
+	classRE := regexp.MustCompile(`\.([a-zA-Z0-9_-]+)`)
 	out := map[string]string{}
-	for _, m := range regexp.MustCompile(`([^{}]+)\{([^{}]*)\}`).FindAllStringSubmatch(css, -1) {
+	for _, m := range regexp.MustCompile(`([^{}]+)\{([^{}]*)\}`).FindAllStringSubmatch(css.String(), -1) {
 		for sel := range strings.SplitSeq(m[1], ",") {
 			sel = strings.TrimSpace(sel)
 			parts := strings.Fields(strings.NewReplacer(">", " ", "+", " ", "~", " ").Replace(sel))
-			if len(parts) == 0 {
+			if len(parts) == 0 || strings.HasPrefix(sel, "@") {
 				continue
 			}
-			last := parts[len(parts)-1]
-			if regexp.MustCompile(`\.frame\b`).MatchString(last) && !strings.Contains(last, ".frame-") ||
-				strings.HasPrefix(last, "[data-domain") || strings.HasPrefix(last, "[data-resolution") {
+			c := compound.FindStringSubmatch(parts[len(parts)-1])
+			if c == nil || c[1] != "" && c[1] != "div" && c[1] != "*" {
+				continue
+			}
+			matches := true
+			for _, cl := range classRE.FindAllStringSubmatch(c[2], -1) {
+				matches = matches && frameClasses[cl[1]]
+			}
+			if matches && c[1]+c[2] != "" {
 				out[sel] += m[2] + ";"
 			}
 		}
@@ -619,6 +641,8 @@ func TestExplainedPageFrameBoxCarriesNoPaddingOrBorder(t *testing.T) {
 	got := exPage(t, v, r, exOpts())
 	rules := frameRules(got)
 	require.Contains(t, rules, ".frame")
+	require.Contains(t, rules, ".frame.cite")
+	require.Contains(t, frameRules("<style>.cite{padding:0 4px}</style>"+got), ".cite", "a bare class a frame can carry is caught")
 	assert.Contains(t, rules[".frame"], "overflow:hidden")
 	sizing := regexp.MustCompile(`(^|;)\s*(padding(-left|-right|-inline[-a-z]*)?|border(-left|-right|-width|-inline[-a-z]*)?|min-width|margin(-left|-right)?)\s*:\s*([^;]*)`)
 	for sel, decls := range rules {
@@ -639,15 +663,19 @@ func chromePath() string {
 	return ""
 }
 
-// geometryProbe measures every frame after layout and writes, per frame,
-// its rendered width, the width its percentage asks for and its name.
+// geometryProbe selects the zero frame, then measures every frame and
+// writes, per frame, its rendered width, the width its percentage asks
+// for, whether it is cited by the selected explanation, and its name.
 const geometryProbe = `<script>
 addEventListener('load', () => {
   const chart = document.getElementById('chart');
   const cw = chart.getBoundingClientRect().width;
+  const sel = [...chart.querySelectorAll('.frame')].find((el) => el.textContent === '\u2726zero');
+  if (sel) sel.click();
   const rows = [...chart.querySelectorAll('.frame')].map((el) => [
     el.getBoundingClientRect().width.toFixed(3),
     (parseFloat(el.style.width) / 100 * cw).toFixed(3),
+    el.classList.contains('cite') ? 'cite' : '-',
     el.textContent,
   ].join('\t'));
   const pre = document.createElement('pre');
@@ -669,7 +697,8 @@ func TestExplainedPageFramesAreNoWiderThanTheirShareInChrome(t *testing.T) {
 	samples = append(samples, pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("zero")}, Value: 0})
 	v := exView(t, pmfixture.Build("cpu", "nanoseconds", nil, samples...), nil)
 	zero := exNode(t, v, "main", "zero")
-	r := exCheck(t, v, explain.Explanation{Node: string(zero), Prose: "nothing measured under {n:" + string(zero) + "}"})
+	tiny := exNode(t, v, "main", "tiny1")
+	r := exCheck(t, v, explain.Explanation{Node: string(zero), Prose: "nothing measured under {n:" + string(zero) + "}, unlike {n:" + string(tiny) + "}"})
 	page := exPage(t, v, r, exOpts())
 	require.Contains(t, page, `width:0%`, "the zero-weight node is drawn because it is explained")
 
@@ -688,14 +717,19 @@ func TestExplainedPageFramesAreNoWiderThanTheirShareInChrome(t *testing.T) {
 	require.Len(t, m, 2, "the probe did not run")
 	seen := map[string]bool{}
 	for line := range strings.SplitSeq(html.UnescapeString(m[1]), "\n") {
-		f := strings.SplitN(line, "\t", 3)
-		require.Len(t, f, 3, line)
+		f := strings.SplitN(line, "\t", 4)
+		require.Len(t, f, 4, line)
+		cited := f[2] == "cite"
+		f = []string{f[0], f[1], f[3]}
 		rendered, err := strconv.ParseFloat(f[0], 64)
 		require.NoError(t, err)
 		want, err := strconv.ParseFloat(f[1], 64)
 		require.NoError(t, err)
 		assert.LessOrEqual(t, rendered, want+1, "frame %q is %.3fpx wide, its share is %.3fpx", f[2], rendered, want)
 		seen[f[2]] = true
+		if f[2] == "tiny1" {
+			assert.True(t, cited, "the selected explanation cites tiny1")
+		}
 		if f[2] == "✦zero" {
 			assert.LessOrEqual(t, rendered, 1.0, "the zero-weight frame is drawn %.3fpx wide", rendered)
 		}
@@ -703,4 +737,22 @@ func TestExplainedPageFramesAreNoWiderThanTheirShareInChrome(t *testing.T) {
 	for _, name := range []string{"tiny1", "tiny2", "tiny3", "✦zero"} {
 		assert.True(t, seen[name], "frame %s was measured", name)
 	}
+}
+
+func TestExplainedPageCountsRejectedAttemptsTheServerDidNotKeep(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{{Attempt: "a3", Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}}}
+	opts.DroppedRejected = 2
+	got := exPage(t, v, r, opts)
+	assert.Contains(t, got, "1 claim rejected at render, plus 2 earlier rejected attempts not kept</span>")
+	assert.NotContains(t, got, "exceeded at render")
+	assert.Contains(t, got, "<s>0.62</s>")
+
+	opts.Rejected, opts.DroppedRejected = nil, 1
+	got = exPage(t, v, r, opts)
+	assert.Contains(t, got, "1 earlier rejected attempt not kept</span>")
+	assert.NotContains(t, got, "exceeded at render")
 }

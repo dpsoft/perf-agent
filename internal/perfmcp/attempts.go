@@ -25,6 +25,8 @@ type attempt struct {
 	retryOf  string
 	outcome  string
 	failures []explain.Failure
+	// omitted counts the failures not kept in failures.
+	omitted int
 }
 
 type viewKey struct {
@@ -87,13 +89,12 @@ func newAttempts(max, maxViews int) *attempts {
 }
 
 // add records an attempt and returns its ID. retryOf is the attempt it
-// retries, already checked with lookup, or "".
+// retries, already checked with lookup, or "". Of failures it keeps what
+// storedFailures keeps.
 func (a *attempts) add(h profilemodel.Handle, view, retryOf, outcome string, failures []explain.Failure) string {
 	a.next++
-	at := &attempt{
-		id: "a" + strconv.Itoa(a.next), handle: h, view: view, retryOf: retryOf,
-		outcome: outcome, failures: slices.Clone(failures),
-	}
+	at := &attempt{id: "a" + strconv.Itoa(a.next), handle: h, view: view, retryOf: retryOf, outcome: outcome}
+	at.failures, at.omitted = storedFailures(failures)
 	va := a.record(viewKey{h, view})
 	a.byID[at.id] = at
 	if outcome == outcomeRejected {
@@ -178,7 +179,7 @@ func (a *attempts) rejected(h profilemodel.Handle, view string) ([]explain.Rejec
 	}
 	out := make([]explain.RejectedAttempt, 0, len(va.rejected))
 	for _, at := range va.rejected {
-		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: at.failures})
+		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: at.failures, Omitted: at.omitted})
 	}
 	return out, va.dropped, va.incomplete
 }
@@ -196,4 +197,29 @@ func (a *attempts) lookup(id string, h profilemodel.Handle, view string) (*attem
 			"pass an attempt of this handle and view, or omit attempt", at.id, at.handle, echo(at.view), h, echo(view))
 	}
 	return at, nil
+}
+
+// maxStoredFailures is the most failures the record keeps of one rejected
+// attempt; the rest are counted.
+const maxStoredFailures = 32
+
+// storedFailures are the failures the record keeps of fs, claim failures
+// first, then reference failures, then limits, each in fs's order, and how
+// many it leaves out.
+func storedFailures(fs []explain.Failure) ([]explain.Failure, int) {
+	rank := func(f explain.Failure) int {
+		switch {
+		case f.Claim != "":
+			return 0
+		case f.Code == explain.CodeLimitExceeded:
+			return 2
+		}
+		return 1
+	}
+	kept := slices.Clone(fs)
+	slices.SortStableFunc(kept, func(x, y explain.Failure) int { return rank(x) - rank(y) })
+	if len(kept) <= maxStoredFailures {
+		return kept, 0
+	}
+	return slices.Clip(kept[:maxStoredFailures]), len(kept) - maxStoredFailures
 }

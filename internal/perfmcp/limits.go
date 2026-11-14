@@ -66,8 +66,8 @@ const (
 const (
 	defaultMaxPageBytes       = 32 << 20
 	defaultMaxPageNodes       = 20000
-	defaultMaxAttemptsPerView = 100
-	defaultMaxAttemptViews    = 256
+	defaultMaxAttemptsPerView = 20
+	defaultMaxAttemptViews    = 64
 )
 
 // DefaultLimits are the limits a server runs with unless told otherwise.

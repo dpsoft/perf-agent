@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
@@ -672,4 +673,69 @@ func TestRenderRefusesBadPageNames(t *testing.T) {
 		t.Errorf("longest name: %s", text)
 	}
 	entries(t, o.out)
+}
+
+func TestAttemptLimitDefaults(t *testing.T) {
+	d := DefaultLimits()
+	if d.MaxAttemptsPerView != 20 || d.MaxAttemptViews != 64 || maxStoredFailures != 32 {
+		t.Errorf("MaxAttemptsPerView %d, MaxAttemptViews %d, maxStoredFailures %d", d.MaxAttemptsPerView, d.MaxAttemptViews, maxStoredFailures)
+	}
+	if l := (Limits{MaxMessageBytes: 1, MaxResponseBytes: 1, MaxOpenHandles: 1}).withDefaults(); l.MaxAttemptsPerView != 20 || l.MaxAttemptViews != 64 {
+		t.Errorf("filled in: %d %d", l.MaxAttemptsPerView, l.MaxAttemptViews)
+	}
+}
+
+func TestStoredFailuresKeepClaimsFirst(t *testing.T) {
+	var fs []explain.Failure
+	for i := range 10 {
+		fs = append(fs, explain.Failure{Explanation: -1, Code: explain.CodeLimitExceeded, Ref: fmt.Sprint("L", i)})
+	}
+	for i := range 10 {
+		fs = append(fs, explain.Failure{Code: explain.CodeUnresolvedNodeRef, Ref: fmt.Sprint("r", i)})
+	}
+	for i := range 30 {
+		fs = append(fs, explain.Failure{Code: explain.CodeValueMismatch, Claim: fmt.Sprint("c", i)})
+	}
+	kept, omitted := storedFailures(fs)
+	if len(kept) != 32 || omitted != 18 {
+		t.Fatalf("kept %d omitted %d", len(kept), omitted)
+	}
+	if kept[0].Claim != "c0" || kept[29].Claim != "c29" || kept[30].Ref != "r0" || kept[31].Ref != "r1" {
+		t.Errorf("kept = %+v", kept)
+	}
+	if kept, omitted := storedFailures(fs[:3]); len(kept) != 3 || omitted != 0 {
+		t.Errorf("short list: %d %d", len(kept), omitted)
+	}
+}
+
+func TestARejectedAttemptKeepsAtMost32Failures(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	var exps []any
+	for e := range 2 {
+		var claims []any
+		for i := range 20 {
+			claims = append(claims, map[string]any{"id": fmt.Sprintf("c%d", e*20+i+1), "metric": "share_of_total",
+				"denominator": "view_total", "unit": "ratio", "value": json.RawMessage("0.62")})
+		}
+		exps = append(exps, map[string]any{"node": b, "claims": claims, "prose": "x"})
+	}
+	out, text, isErr := o.render(t, map[string]any{"explanations": exps, "out": "x.html"})
+	if !isErr || len(out.Failures) != 40 {
+		t.Fatalf("the rejection lists %d failures: isError=%v %.300s", len(out.Failures), isErr, text)
+	}
+	if !strings.Contains(text, "and 8 more failures") {
+		t.Errorf("the result does not say what the record leaves out: %.300s", text)
+	}
+	page, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": "x.html", "attempt": "a1"})
+	if isErr {
+		t.Fatalf("write: %s", text)
+	}
+	sec := rejectedSection(t, page.Path)
+	if !strings.Contains(sec, "32 claims rejected at render") || !strings.Contains(sec, "and 8 more failures") {
+		t.Errorf("rejected section: %.600s", sec)
+	}
+	if n := strings.Count(sec, "<s>0.62</s>"); n != 32 {
+		t.Errorf("%d claim rows", n)
+	}
 }

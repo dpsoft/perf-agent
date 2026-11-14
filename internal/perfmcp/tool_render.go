@@ -129,6 +129,11 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	r := explain.Check(v, exps, s.lim.Explain)
 	if !r.OK {
 		id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeRejected, r.Failures)
+		if _, omitted := storedFailures(r.Failures); omitted > 0 {
+			notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
+				"this result lists all %d failures; the server's record of %s keeps %d of them (claims first, then references, then limits), "+
+					"so a later page lists those and says \"and %d more failures\"", len(r.Failures), id, maxStoredFailures, omitted)})
+		}
 		res, err := s.respond("render_flamegraph", shrinkRejected, renderRejected{
 			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices,
 			Next: fmt.Sprintf("nothing was written; correct every failure (the engine's value is in engine) and call render_flamegraph again with attempt %q", id),

@@ -4,9 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -97,13 +96,12 @@ type pageOut[T any] struct {
 	Rows []T
 	// OmittedCount and OmittedWeight cover the rows after this page:
 	// their number and the sum of their own weights.
-	OmittedCount  int
-	OmittedWeight int64
+	OmittedCount int
+	// OmittedWeight is that sum as a decimal; it is exact however large.
+	OmittedWeight string
 	// Next is the offset of the next page, -1 on the last one.
 	Next int
 }
-
-var errWeightOverflow = errors.New("the omitted rows' weights overflow a 64-bit sum")
 
 // page returns rows[offset:offset+limit] and the count and weight sum of the
 // rows after it. offset may equal len(rows) (an empty last page).
@@ -116,13 +114,11 @@ func page[T any](rows []T, weight func(T) int64, offset, limit int) (pageOut[T],
 	}
 	end := offset + min(limit, len(rows)-offset)
 	out := pageOut[T]{Rows: nonNil(rows[offset:end:end]), OmittedCount: len(rows) - end, Next: -1}
+	sum := new(big.Int)
 	for _, r := range rows[end:] {
-		w := weight(r)
-		if (w > 0 && out.OmittedWeight > math.MaxInt64-w) || (w < 0 && out.OmittedWeight < math.MinInt64-w) {
-			return pageOut[T]{}, errWeightOverflow
-		}
-		out.OmittedWeight += w
+		sum.Add(sum, big.NewInt(weight(r)))
 	}
+	out.OmittedWeight = sum.String()
 	if end < len(rows) {
 		out.Next = end
 	}

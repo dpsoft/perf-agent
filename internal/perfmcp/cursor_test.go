@@ -71,15 +71,15 @@ func TestPageCountsAndWeighsTheOmittedRows(t *testing.T) {
 	w := func(x int64) int64 { return x }
 
 	p := must(page(rows, w, 0, 2))(t)
-	if !slices.Equal(p.Rows, []int64{50, 40}) || p.OmittedCount != 3 || p.OmittedWeight != 60 || p.Next != 2 {
+	if !slices.Equal(p.Rows, []int64{50, 40}) || p.OmittedCount != 3 || p.OmittedWeight != "60" || p.Next != 2 {
 		t.Errorf("first page = %+v", p)
 	}
 	p = must(page(rows, w, 2, 2))(t)
-	if !slices.Equal(p.Rows, []int64{30, 20}) || p.OmittedCount != 1 || p.OmittedWeight != 10 || p.Next != 4 {
+	if !slices.Equal(p.Rows, []int64{30, 20}) || p.OmittedCount != 1 || p.OmittedWeight != "10" || p.Next != 4 {
 		t.Errorf("second page = %+v", p)
 	}
 	p = must(page(rows, w, 4, 2))(t)
-	if !slices.Equal(p.Rows, []int64{10}) || p.OmittedCount != 0 || p.OmittedWeight != 0 || p.Next != -1 {
+	if !slices.Equal(p.Rows, []int64{10}) || p.OmittedCount != 0 || p.OmittedWeight != "0" || p.Next != -1 {
 		t.Errorf("last page = %+v", p)
 	}
 	p = must(page([]int64(nil), w, 0, 2))(t)
@@ -96,7 +96,12 @@ func TestPageCountsAndWeighsTheOmittedRows(t *testing.T) {
 	if _, err := page(rows, w, 0, 0); err == nil {
 		t.Error("zero limit accepted")
 	}
-	if _, err := page([]int64{1, math.MaxInt64, 1}, w, 0, 1); err == nil {
-		t.Error("an overflowing omitted weight was accepted")
+	p = must(page([]int64{1, math.MaxInt64, math.MaxInt64}, w, 1, 1))(t)
+	if p.OmittedWeight != "9223372036854775807" {
+		t.Errorf("one MaxInt64 omitted: %q", p.OmittedWeight)
+	}
+	p = must(page([]int64{1, math.MaxInt64, math.MaxInt64}, w, 0, 1))(t)
+	if p.OmittedWeight != "18446744073709551614" {
+		t.Errorf("two MaxInt64 omitted: %q", p.OmittedWeight)
 	}
 }

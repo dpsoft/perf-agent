@@ -5,6 +5,9 @@ package profilemodel
 // never one node.
 func (v *View) Notes() ([]string, error) { return viewSamplingNotes(v) }
 
+// IsGPU reports whether the view is a GPU view.
+func (v *View) IsGPU() bool { return v.SampleType == gpuSampleType }
+
 // UnsampledPortion is the view-level value under the unsampled launch
 // frame, unavailable "not a GPU view" off GPU. It is never a node's value.
 // The error is an overflow.

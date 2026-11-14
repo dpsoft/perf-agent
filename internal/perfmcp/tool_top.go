@@ -16,9 +16,6 @@ import (
 // defaultLimit is the page size of the paged tools when limit is omitted.
 const defaultLimit = 20
 
-// gpuSampleType is the sample type of a GPU view.
-const gpuSampleType = "gpu"
-
 const topSchema = `{
   "type": "object",
   "properties": {
@@ -26,7 +23,7 @@ const topSchema = `{
     "view": {"type": "string", "description": "One of the view names open returned."},
     "rows": {"type": "string", "enum": ["functions", "nodes"], "description": "functions aggregates by function (a recursive function counts once per sample); nodes lists call-tree nodes, which path and facts take."},
     "by": {"type": "string", "enum": ["cum", "self"], "description": "Order by cumulative (default) or self value."},
-    "domain": {"type": "string", "description": "Keep only rows of this inferred domain (app, system, kernel, vendor, unsym, shim, boundary, boundary-unattributed, gpu-kernel). Filtered rows are counted in filtered_out_count."},
+    "domain": {"type": "string", "description": "Keep only rows of this inferred domain (DOMAINS). Filtered rows are counted in filtered_out_count."},
     "limit": {"type": "integer", "minimum": 1, "description": "Rows per page (default 20, at most the server's MaxRows)."},
     "cursor": {"type": "string", "description": "next_cursor of the previous page of this same query."}
   },
@@ -42,7 +39,7 @@ const topDescription = "Rank the functions or the call-tree nodes of a view by c
 func (s *Server) topTool() mcpstdio.Tool {
 	return mcpstdio.Tool{
 		Name: "top", Title: "Top functions or nodes", Description: topDescription,
-		InputSchema: json.RawMessage(topSchema), Annotations: readOnly, Handler: s.handleTop,
+		InputSchema: json.RawMessage(strings.Replace(topSchema, "DOMAINS", strings.Join(rowDomains(), ", "), 1)), Annotations: readOnly, Handler: s.handleTop,
 	}
 }
 
@@ -92,7 +89,7 @@ func pageRows[T any](rows []T, weight func(T) int64, basis, bind, cursor string,
 	}
 	info := pageInfo{
 		TotalRows: wireInt(int64(len(rows))), Skipped: wireInt(int64(offset)),
-		OmittedCount: wireInt(int64(p.OmittedCount)), OmittedWeight: wireInt(p.OmittedWeight), OmittedWeightBasis: basis,
+		OmittedCount: wireInt(int64(p.OmittedCount)), OmittedWeight: p.OmittedWeight, OmittedWeightBasis: basis,
 	}
 	if p.Next >= 0 {
 		info.NextCursor = encodeCursor(bind, p.Next)
@@ -111,6 +108,12 @@ func (s *Server) pageLimit(limit *int) (int, error) {
 	return *limit, nil
 }
 
+// rowDomains are the domains a row can have: every key but the synthetic
+// root's, which no row has.
+func rowDomains() []string {
+	return slices.DeleteFunc(flamegraph.DomainKeys(), func(k string) bool { return k == "root" })
+}
+
 // domainOf is the inferred domain key of a frame.
 func domainOf(name, module string) string {
 	return flamegraph.Classify(name, module).Info().Key
@@ -119,7 +122,7 @@ func domainOf(name, module string) string {
 // viewNotes are the view's sampling notes, non-nil on a GPU view and nil
 // elsewhere, so a CPU response has no notes key and a GPU one always has.
 func viewNotes(v *profilemodel.View) ([]string, error) {
-	if v.SampleType != gpuSampleType {
+	if !v.IsGPU() {
 		return nil, nil
 	}
 	notes, err := v.Notes()
@@ -252,8 +255,8 @@ func (s *Server) handleTop(_ context.Context, raw json.RawMessage) (mcpstdio.Res
 	if by != "cum" && by != "self" {
 		return mcpstdio.Result{}, fmt.Errorf("by must be \"cum\" or \"self\", got %q", a.By)
 	}
-	if a.Domain != "" && !slices.Contains(flamegraph.DomainKeys(), a.Domain) {
-		return mcpstdio.Result{}, fmt.Errorf("unknown domain %q; domain is one of: %s", a.Domain, strings.Join(flamegraph.DomainKeys(), ", "))
+	if a.Domain != "" && !slices.Contains(rowDomains(), a.Domain) {
+		return mcpstdio.Result{}, fmt.Errorf("unknown domain %q; domain is one of: %s", a.Domain, strings.Join(rowDomains(), ", "))
 	}
 	limit, err := s.pageLimit(a.Limit)
 	if err != nil {

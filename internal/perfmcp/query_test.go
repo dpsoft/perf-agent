@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
@@ -176,7 +175,7 @@ func TestTopDomainFilter(t *testing.T) {
 	if !isErr {
 		t.Fatal("bogus domain accepted")
 	}
-	for _, k := range flamegraph.DomainKeys() {
+	for _, k := range rowDomains() {
 		if !strings.Contains(text, k) {
 			t.Errorf("error %q does not list %q", text, k)
 		}
@@ -334,8 +333,8 @@ func TestEveryGPUViewResponseCarriesTheSamplingNotes(t *testing.T) {
 	}
 }
 
-// mustViewNotes are View.Notes of the opened GPU view, from a model loaded
-// independently of the server.
+// mustViewNotes are View.Notes of the opened GPU view, taken from the view
+// the server's own store holds.
 func mustViewNotes(t *testing.T, o opened) []string {
 	t.Helper()
 	srv := o.c.srv

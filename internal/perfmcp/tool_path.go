@@ -13,13 +13,30 @@ const pathSchema = `{
   "properties": {
     "handle": {"type": "string", "description": "A handle returned by open."},
     "view": {"type": "string", "description": "One of the view names open returned."},
+    "node": {"type": "string", "description": "A node ID from top with rows=\"nodes\"."},
+    "limit": {"type": "integer", "minimum": 1, "description": "Frames per page (default 200, at most the server's MaxRows)."},
+    "cursor": {"type": "string", "description": "next_cursor of the previous page of this same query."}
+  },
+  "required": ["handle", "view", "node"],
+  "additionalProperties": false
+}`
+
+// factsSchema is the schema of the tools that take only a node.
+const factsSchema = `{
+  "type": "object",
+  "properties": {
+    "handle": {"type": "string", "description": "A handle returned by open."},
+    "view": {"type": "string", "description": "One of the view names open returned."},
     "node": {"type": "string", "description": "A node ID from top with rows=\"nodes\"."}
   },
   "required": ["handle", "view", "node"],
   "additionalProperties": false
 }`
 
-const pathDescription = "The call path to a node, root first with the synthetic root left out, with each frame's own facts " +
+// defaultPathLimit is the page size of path when limit is omitted.
+const defaultPathLimit = 200
+
+const pathDescription = "The call path to a node, root first with the synthetic root left out, paged with limit and cursor, with each frame's own facts " +
 	"(cumulative, self, shares of the total and of its parent). Domains are inferred. GPU views carry the sampling notes."
 
 func (s *Server) pathTool() mcpstdio.Tool {
@@ -30,6 +47,20 @@ func (s *Server) pathTool() mcpstdio.Tool {
 }
 
 type nodeArgs struct {
+	Handle profilemodel.Handle `json:"handle"`
+	View   string              `json:"view"`
+	Node   profilemodel.NodeID `json:"node"`
+}
+
+type pathArgs struct {
+	Handle profilemodel.Handle `json:"handle"`
+	View   string              `json:"view"`
+	Node   profilemodel.NodeID `json:"node"`
+	Limit  *int                `json:"limit"`
+	Cursor string              `json:"cursor"`
+}
+
+type pathQuery struct {
 	Handle profilemodel.Handle `json:"handle"`
 	View   string              `json:"view"`
 	Node   profilemodel.NodeID `json:"node"`
@@ -56,12 +87,20 @@ type pathResult struct {
 	Notes  []string            `json:"notes,omitzero"`
 	Node   profilemodel.NodeID `json:"node"`
 	Frames []pathFrame         `json:"frames"`
+	pageInfo
 }
 
 func (s *Server) handlePath(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
-	var a nodeArgs
+	var a pathArgs
 	if err := decodeArgs("path", raw, &a); err != nil {
 		return mcpstdio.Result{}, err
+	}
+	limit := min(defaultPathLimit, s.lim.MaxRows)
+	if a.Limit != nil {
+		var err error
+		if limit, err = s.pageLimit(a.Limit); err != nil {
+			return mcpstdio.Result{}, err
+		}
 	}
 	_, v, err := s.store.view(a.Handle, a.View)
 	if err != nil {
@@ -75,8 +114,13 @@ func (s *Server) handlePath(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	out := pathResult{Handle: a.Handle, View: a.View, Notes: notes, Node: n.ID, Frames: []pathFrame{}}
-	for _, q := range v.Path(n) {
+	bind := binding("path", pathQuery{Handle: a.Handle, View: a.View, Node: a.Node})
+	pg, info, err := pageRows(v.Path(n), func(q *profilemodel.Node) int64 { return q.Cum }, "cum", bind, a.Cursor, limit)
+	if err != nil {
+		return mcpstdio.Result{}, err
+	}
+	out := pathResult{Handle: a.Handle, View: a.View, Notes: notes, Node: n.ID, Frames: make([]pathFrame, 0, len(pg)), pageInfo: info}
+	for _, q := range pg {
 		c, err := v.CoreFacts(q.ID)
 		if err != nil {
 			return mcpstdio.Result{}, err

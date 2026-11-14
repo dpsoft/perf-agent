@@ -1,0 +1,367 @@
+package profilemodel
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/google/pprof/profile"
+
+	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/internal/capturemeta"
+)
+
+// Digest is the SHA-256 of a profile's bytes as read.
+type Digest [32]byte
+
+// String returns the digest as lowercase hex.
+func (d Digest) String() string { return hex.EncodeToString(d[:]) }
+
+// Availability says whether a fact source can be used and, if not, why.
+type Availability struct {
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// Reasons an executions log is not used.
+const (
+	ReasonNoSidecar        = "no sidecar"
+	ReasonEmptySidecar     = "empty sidecar"
+	ReasonSidecarLimits    = "sidecar exceeds limits"
+	ReasonDigestMismatch   = "digest mismatch"
+	ReasonSampleCount      = "sample count mismatch"
+	ReasonMetadataMismatch = "metadata mismatch"
+	ReasonValueMismatch    = "value mismatch"
+	ReasonCorrupt          = "corrupt"
+)
+
+// Limits bound what Load accepts.
+type Limits struct {
+	// MaxRawBytes caps the file; MaxDecompressedBytes caps the inflated
+	// stream. Both are enforced before and during parsing.
+	MaxRawBytes, MaxDecompressedBytes int64
+	// MaxSamples, MaxLocations, MaxDepth and MaxFrames are structural and
+	// checked after parsing, before any tree is built. MaxDepth applies to
+	// a sample's expanded depth: the sum over its locations of max(1,
+	// inline lines). MaxFrames applies to the sum of every sample's
+	// expanded depth, which bounds a view's node count and the sample
+	// indices its nodes hold.
+	MaxSamples, MaxLocations, MaxDepth, MaxFrames int
+	// MaxSidecarBytes is enforced while reading the log.
+	MaxSidecarBytes int64
+	// MaxSidecarRows and MaxSidecarExecutions (distinct ordinals) are
+	// enforced in the row callback.
+	MaxSidecarRows, MaxSidecarExecutions int
+}
+
+// DefaultLimits returns the limits documented in the package comment.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxRawBytes:          256 << 20,
+		MaxDecompressedBytes: 1 << 30,
+		MaxSamples:           5_000_000,
+		MaxLocations:         5_000_000,
+		MaxDepth:             8192,
+		MaxFrames:            50_000_000,
+		MaxSidecarBytes:      256 << 20,
+		MaxSidecarRows:       10_000_000,
+		MaxSidecarExecutions: 10_000_000,
+	}
+}
+
+// ErrLimit is wrapped by every error caused by an input exceeding a limit.
+var ErrLimit = errors.New("profilemodel: input exceeds limit")
+
+func limitErr(name string, limit, got any) error {
+	return fmt.Errorf("%w: %s %v exceeded (%v)", ErrLimit, name, limit, got)
+}
+
+// Handle names the evidence a load selected, not whether it was accepted:
+// "<pd>" with no sidecar; "<pd>+<sidecar sha256 hex>" for a sidecar that was
+// fully read (accepted or rejected); "<pd>+empty" for an empty one; and
+// "<pd>+unread:<reason>:<16 hex>" for one that could not be read or exceeded
+// MaxSidecarBytes, where the suffix is an opaque per-load id, not a content
+// hash.
+type Handle string
+
+// Profile is a parsed pprof profile and, when one was accepted, the
+// per-sample execution ordinals of its executions log.
+type Profile struct {
+	Handle     Handle
+	Digest     Digest
+	CaptureID  string // from "perf-agent.capture_id=", "" if absent
+	Source     *profile.Profile
+	Executions Availability
+	execOf     [][]uint64 // per sample index: execution ordinals; nil unless Executions.OK
+}
+
+// Load reads a profile and, if execlogPath is not "", its executions log.
+// A bad log never fails Load; it sets Executions.
+func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
+	raw, err := readCapped(profilePath, lim.MaxRawBytes, "MaxRawBytes")
+	if err != nil {
+		return nil, err
+	}
+	if execlogPath == "" {
+		return assemble(raw, nil, "", lim)
+	}
+	side, err := readCapped(execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
+	switch {
+	case errors.Is(err, ErrLimit):
+		return assemble(raw, nil, ReasonSidecarLimits, lim)
+	case err != nil:
+		return assemble(raw, nil, ReasonCorrupt, lim)
+	}
+	if side == nil {
+		side = []byte{}
+	}
+	return assemble(raw, side, "", lim)
+}
+
+// readCapped reads a whole file, refusing one larger than limit. It never
+// reads more than limit+1 bytes.
+func readCapped(path string, limit int64, name string) (b []byte, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			b, err = nil, cerr
+		}
+	}()
+	b, err = io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, limitErr(name, limit, ">"+fmt.Sprint(limit))
+	}
+	return b, nil
+}
+
+// FromBytes is Load on bytes already in memory; execlog nil means none.
+func FromBytes(raw []byte, execlogBytes []byte, lim Limits) (*Profile, error) {
+	if int64(len(execlogBytes)) > lim.MaxSidecarBytes {
+		return assemble(raw, nil, ReasonSidecarLimits, lim)
+	}
+	return assemble(raw, execlogBytes, "", lim)
+}
+
+// assemble loads raw. A sidecar is selected by execlogBytes (nil = none) or, when
+// it was supplied but not fully read, by unread holding why.
+func assemble(raw, execlogBytes []byte, unread string, lim Limits) (*Profile, error) {
+	if int64(len(raw)) > lim.MaxRawBytes {
+		return nil, limitErr("MaxRawBytes", lim.MaxRawBytes, len(raw))
+	}
+	data := raw
+	if len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return nil, fmt.Errorf("profilemodel: gzip: %w", err)
+		}
+		data, err = io.ReadAll(io.LimitReader(zr, lim.MaxDecompressedBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("profilemodel: gzip: %w", err)
+		}
+	}
+	if int64(len(data)) > lim.MaxDecompressedBytes {
+		return nil, limitErr("MaxDecompressedBytes", lim.MaxDecompressedBytes, ">"+fmt.Sprint(lim.MaxDecompressedBytes))
+	}
+	// ParseUncompressed never inflates again, so the cap above is the only
+	// decompression bound (ParseData would re-inflate a nested gzip stream
+	// without a limit).
+	src, err := profile.ParseUncompressed(data)
+	if err == nil {
+		err = src.CheckValid()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("profilemodel: parse profile: %w", err)
+	}
+	if err := checkStructure(src, lim); err != nil {
+		return nil, err
+	}
+
+	p := &Profile{
+		Digest:     sha256.Sum256(raw),
+		Source:     src,
+		CaptureID:  captureID(src),
+		Executions: Availability{Reason: ReasonNoSidecar},
+	}
+	p.Handle = Handle(p.Digest.String())
+
+	switch {
+	case unread != "":
+		var id [8]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return nil, fmt.Errorf("profilemodel: handle: %w", err)
+		}
+		p.Executions = Availability{Reason: unread}
+		p.Handle += Handle("+unread:" + strings.ReplaceAll(unread, " ", "-") + ":" + hex.EncodeToString(id[:]))
+	case execlogBytes != nil:
+		execOf, _, reason := checkExeclog(raw, execlogBytes, p, lim)
+		if reason != "" {
+			p.Executions = Availability{Reason: reason}
+		} else {
+			p.Executions = Availability{OK: true}
+			p.execOf = execOf
+		}
+		if len(execlogBytes) == 0 {
+			p.Handle += "+empty"
+		} else {
+			sum := sha256.Sum256(execlogBytes)
+			p.Handle += Handle("+" + hex.EncodeToString(sum[:]))
+		}
+	}
+	return p, nil
+}
+
+func checkStructure(p *profile.Profile, lim Limits) error {
+	if len(p.Sample) > lim.MaxSamples {
+		return limitErr("MaxSamples", lim.MaxSamples, len(p.Sample))
+	}
+	if len(p.Location) > lim.MaxLocations {
+		return limitErr("MaxLocations", lim.MaxLocations, len(p.Location))
+	}
+	// Depth is the expanded one: every inline Line of a location is a frame.
+	// Both sums compare by subtraction, so neither can wrap.
+	frames := 0
+	for _, s := range p.Sample {
+		depth := 0
+		for _, l := range s.Location {
+			n := max(1, len(l.Line))
+			if depth > lim.MaxDepth-n {
+				return limitErr("MaxDepth", lim.MaxDepth, ">"+fmt.Sprint(lim.MaxDepth))
+			}
+			depth += n
+		}
+		if frames > lim.MaxFrames-depth {
+			return limitErr("MaxFrames", lim.MaxFrames, ">"+fmt.Sprint(lim.MaxFrames))
+		}
+		frames += depth
+	}
+	return nil
+}
+
+func captureID(p *profile.Profile) string {
+	for _, c := range p.Comments {
+		if id, ok := strings.CutPrefix(c, capturemeta.CaptureIDComment); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+// errSidecarLimit marks a row-callback stop caused by a sidecar limit.
+var errSidecarLimit = errors.New("sidecar limit")
+
+// errRowRange marks a row naming a sample the profile does not have.
+var errRowRange = errors.New("row outside the profile")
+
+// checkExeclog validates a log against the profile. It returns the per-sample
+// ordinals and the log's digest on success, or the reason it is not used.
+func checkExeclog(raw, log []byte, p *Profile, lim Limits) ([][]uint64, [32]byte, string) {
+	var zero [32]byte
+	if len(log) == 0 {
+		return nil, zero, ReasonEmptySidecar
+	}
+	if int64(len(log)) > lim.MaxSidecarBytes {
+		return nil, zero, ReasonSidecarLimits
+	}
+	n := len(p.Source.Sample)
+	type acc struct {
+		sum   uint64
+		execs []uint64
+	}
+	bySample := map[uint32]*acc{}
+	var nrows, nexecs int
+	var last uint64
+	seen := false
+	hdr, tr, err := execlog.Read(bytes.NewReader(log), func(r execlog.Row) error {
+		if int64(r.Sample) >= int64(n) {
+			return errRowRange
+		}
+		nrows++
+		if nrows > lim.MaxSidecarRows {
+			return errSidecarLimit
+		}
+		if !seen || r.Execution != last {
+			nexecs++
+			if nexecs > lim.MaxSidecarExecutions {
+				return errSidecarLimit
+			}
+			seen, last = true, r.Execution
+		}
+		a := bySample[r.Sample]
+		if a == nil {
+			a = &acc{}
+			bySample[r.Sample] = a
+		}
+		sum := a.sum + r.Value
+		if sum < a.sum {
+			// Wrapped; remember it as an unmatchable sum.
+			sum = ^uint64(0)
+			a.sum = sum
+			a.execs = append(a.execs, r.Execution)
+			return nil
+		}
+		a.sum = sum
+		if k := len(a.execs); k == 0 || a.execs[k-1] != r.Execution {
+			a.execs = append(a.execs, r.Execution)
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSidecarLimit) {
+			return nil, zero, ReasonSidecarLimits
+		}
+		return nil, zero, ReasonCorrupt
+	}
+	if execlog.ProfileSHA256(raw) != tr.ProfileSHA256 {
+		return nil, zero, ReasonDigestMismatch
+	}
+	if err := tr.Verify(raw, n); err != nil {
+		return nil, zero, ReasonSampleCount
+	}
+
+	gpu := -1
+	for i, st := range p.Source.SampleType {
+		if st.Type == "gpu" {
+			gpu = i
+			break
+		}
+	}
+	if gpu < 0 {
+		return nil, zero, ReasonMetadataMismatch
+	}
+	st := p.Source.SampleType[gpu]
+	if hdr.SampleType != st.Type+"/"+st.Unit {
+		return nil, zero, ReasonMetadataMismatch
+	}
+	if hdr.CaptureID != "" && p.CaptureID != "" && hdr.CaptureID != p.CaptureID {
+		return nil, zero, ReasonMetadataMismatch
+	}
+
+	execOf := make([][]uint64, n)
+	for i, s := range p.Source.Sample {
+		if gpu >= len(s.Value) || s.Value[gpu] < 0 {
+			return nil, zero, ReasonValueMismatch
+		}
+		var sum uint64
+		if a := bySample[uint32(i)]; a != nil {
+			sum = a.sum
+			execOf[i] = a.execs
+		}
+		if sum != uint64(s.Value[gpu]) {
+			return nil, zero, ReasonValueMismatch
+		}
+	}
+	return execOf, sha256.Sum256(log), ""
+}

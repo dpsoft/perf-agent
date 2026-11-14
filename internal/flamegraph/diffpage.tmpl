@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{.PageTitle}}</title>
+<style>
+:root{ {{.LightChrome}};--ink-on:#1d1a17;--l0:90%;--drop:30%;--grey:hsl(0 0% 85%)}
+@media (prefers-color-scheme:dark){:root{ {{.DarkChrome}};--ink-on:#eceaf2;--l0:34%;--drop:-12%;--grey:hsl(0 0% 32%)}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--ink);font:13px/1.45 system-ui,sans-serif}
+h1{font-size:16px;margin:0 0 4px}h2{font-size:14px;margin:20px 0 6px}
+.meta{color:var(--muted);margin:0 0 10px}
+.warn{background:var(--warn-bg);border:1px solid var(--warn-line);padding:6px 10px;margin:6px 0;border-radius:4px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;margin:8px 0;color:var(--muted)}
+.legend span.kv{display:inline-flex;gap:6px;align-items:center}
+.sw{display:inline-block;width:14px;height:14px;border:1px solid var(--line);box-sizing:border-box}
+.ramp{display:inline-block;width:120px;height:12px;border:1px solid var(--line);background:linear-gradient(90deg,hsl(215 75% calc(var(--l0) - var(--drop))),var(--grey),hsl(5 75% calc(var(--l0) - var(--drop))))}
+.icicle{background:var(--panel);border:1px solid var(--line);padding:2px;overflow-x:auto}
+.n{box-sizing:border-box;flex:none;min-width:0;overflow:hidden}
+.kids{display:flex;align-items:flex-start;width:100%}
+.b{box-sizing:border-box;height:18px;margin:0 0 1px;padding:0;border:0;overflow:hidden;font-size:11px;line-height:18px;color:var(--ink-on);
+background:hsl(var(--h,0) calc(var(--t,0)*75%) calc(var(--l0) - var(--t,0)*var(--drop)))}
+.b.share-none,.b.share-same{background:var(--grey)}
+.b.only-base{background-image:repeating-linear-gradient(45deg,rgb(0 0 0/.35) 0 2px,transparent 2px 6px)}
+.b.only-new{outline:2px solid var(--ink);outline-offset:-2px}
+.b.ambiguous{outline:2px dashed var(--accent);outline-offset:-2px}
+.b.not-comparable{box-shadow:inset 0 0 0 2px var(--accent);font-style:italic}
+.l{display:block;padding:0 4px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+table{border-collapse:collapse;width:100%;background:var(--panel)}
+th,td{border:1px solid var(--line);padding:3px 8px;text-align:left;vertical-align:top}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.empty{background:var(--panel);border:1px solid var(--line);padding:12px;margin:12px 0}
+</style>
+</head>
+<body>
+<h1>{{.PageTitle}}</h1>
+<p class="meta">base <span title="{{.BaseHandle}}">{{.BaseName}}</span>: {{.BaseTotal}} &middot; new <span title="{{.NewHandle}}">{{.NewName}}</span>: {{.NewTotal}}</p>
+{{range .Warnings}}<div class="warn">{{.}}</div>
+{{end}}{{range .Notes}}<p class="meta">{{.}}</p>
+{{end}}{{range .BaseNotes}}<div class="warn">base: {{.}}</div>
+{{end}}{{range .NewNotes}}<div class="warn">new: {{.}}</div>
+{{end}}
+{{if .Empty}}<div class="empty">Both views are empty: neither has any {{.SampleType}} ({{.Unit}}) to compare, so there is nothing to draw.</div>
+{{else}}
+{{if .OneEmpty}}<div class="warn">One view is empty, so no node has a share of its total to compare; every node is grey and only the raw change is shown.</div>{{end}}
+<div class="legend">
+<span class="kv">lower share <span class="ramp"></span> higher share: lower / higher share of total {{.SampleType}} ({{.Unit}}); full colour = &plusmn;{{.FullScale}} points of share</span>
+<span class="kv"><span class="sw" style="background:var(--grey)"></span> share unavailable or unchanged</span>
+<span class="kv"><span class="sw" style="background-image:repeating-linear-gradient(45deg,rgb(0 0 0/.35) 0 2px,transparent 2px 6px)"></span> only in base</span>
+<span class="kv"><span class="sw" style="outline:2px solid var(--ink);outline-offset:-2px"></span> only in new</span>
+<span class="kv"><span class="sw" style="box-shadow:inset 0 0 0 2px var(--accent)"></span> not comparable (! marker, reason on hover)</span>
+<span class="kv"><span class="sw" style="outline:2px dashed var(--accent);outline-offset:-2px"></span> ambiguous match</span>
+</div>
+<p class="meta">Width is base plus new {{.Unit}} of a node over the root's. Colour is the change in the node's share of its own view's total; hover a node for the raw change in {{.Unit}}.</p>
+<div class="icicle">{{template "node" .Root}}</div>
+{{if .Omitted}}<p class="meta">{{.Omitted}} nodes under 0.05% of the total are not drawn.</p>{{end}}
+<h2>Removed and added paths</h2>
+<p class="meta">Absence from one side does not prove the cost was eliminated or introduced: the frame may be unresolved, renamed, inlined or sampled out there. Only the topmost path of each one-sided subtree is listed.</p>
+{{if .Rows}}<table>
+<tr><th>Path</th><th>Side</th><th>Change</th><th>Interpretation</th><th>Why</th></tr>
+{{range .Rows}}<tr><td>{{.Path}}</td><td>{{.Presence}}</td><td class="num">{{.Delta}}</td><td>{{.Interpretation}}</td><td>{{.Why}}</td></tr>
+{{end}}</table>
+{{if .RowsTruncated}}<p class="meta">Showing {{len .Rows}} of {{.RowsTotal}}, largest changes first.</p>{{end}}
+{{else}}<p class="meta">No path is present on only one side.</p>{{end}}
+{{end}}
+</body>
+</html>
+{{define "node"}}<div class="n" style="width:{{.Width}}%"><div class="{{.Classes}}" style="--h:{{.Hue}};--t:{{.Tint}}" title="{{.Tooltip}}"><span class="l">{{if .Marker}}{{.Marker}} {{end}}{{.Name}}</span></div>{{if .Kids}}<div class="kids">{{range .Kids}}{{template "node" .}}{{end}}</div>{{end}}</div>{{end}}

@@ -24,8 +24,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -35,50 +37,73 @@ import (
 )
 
 func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is main with its streams and exit status made explicit.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var (
-		telemetry  = flag.String("gpu-telemetry", "", "NVML JSONL sidecar with matching capture_id; aggregate only observations in the profile window")
-		out        = flag.String("o", "", "HTML output path (default: <input>.html)")
-		title      = flag.String("title", "", "page title (default: the input file name)")
-		folded     = flag.Bool("folded", false, "write folded stacks to stdout instead of HTML")
-		sampleIdx  = flag.Int("sample-index", -1, "which sample type to fold; -1 chooses automatically")
-		stackOrder = flag.String("stack-order", "leaf-first",
+		telemetry  = fs.String("gpu-telemetry", "", "NVML JSONL sidecar with matching capture_id; aggregate only observations in the profile window")
+		out        = fs.String("o", "", "HTML output path (default: <input>.html; <input>.diff.html with -diff)")
+		title      = fs.String("title", "", "page title (default: the input file name)")
+		folded     = fs.Bool("folded", false, "write folded stacks to stdout instead of HTML")
+		sampleIdx  = fs.Int("sample-index", -1, "which sample type to fold; -1 chooses automatically")
+		stackOrder = fs.String("stack-order", "leaf-first",
 			"how the profile stores Sample.Location: leaf-first (the pprof proto, "+
 				"and what perf-agent writes) | root-first (foreign profiles from "+
 				"producers that deviate)")
-		rawVendor = flag.Bool("raw-vendor-frames", false,
+		rawVendor = fs.Bool("raw-vendor-frames", false,
 			"draw every vendor frame separately instead of merging runs whose names say "+
 				"nothing (an address, or the CUDA symbol server's obfuscated libfoo_<hex>). "+
 				"The profile always contains them either way; this decides what the PICTURE "+
 				"shows")
-		fuse = flag.Bool("fuse", false,
+		fuse = fs.Bool("fuse", false,
 			"draw several profiles as one graph, each under its own labelled root; "+
 				"repeat -in once per profile")
-		inputs fuseInputs
+		execlogPath = fs.String("execlog", "", "executions sidecar for the profile (never found implicitly); with -facts, -list-nodes or -diff")
+		factsNode   = fs.String("facts", "", "print the path facts of one node as JSON; NODE is a node ID or a root-first name path a;b;c")
+		listNodes   = fs.Int("list-nodes", 0, "print the N widest nodes as JSON lines {id, path, cum}; 0 prints none")
+		diffBase    = fs.String("diff", "", "compare the profile argument against this BASE profile; writes a page and the diff JSON")
+		execlogBase = fs.String("execlog-base", "", "executions sidecar for the -diff BASE profile")
+		inputs      fuseInputs
 	)
-	flag.Var(&inputs, "in",
+	fs.Var(&inputs, "in",
 		"a profile to fuse, as path[;stack-order[;label]] (repeatable). "+
 			"stack-order defaults to leaf-first, label to the file's base name")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [flags] <profile.pb.gz>\n\n", os.Args[0])
-		flag.PrintDefaults()
+	fs.Usage = func() {
+		_, _ = fmt.Fprintf(stderr, "usage: %s [flags] <profile.pb.gz>\n\n", os.Args[0])
+		fs.PrintDefaults()
 	}
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	modelMode := set["facts"] || set["list-nodes"] || set["diff"] || set["execlog"] || set["execlog-base"]
+	if modelMode && *fuse {
+		return usageErr(stderr, "-facts, -list-nodes, -diff, -execlog and -execlog-base cannot be combined with -fuse")
+	}
 
 	if *fuse {
-		if flag.NArg() != 0 {
-			fatalf("-fuse takes its profiles via -in, not as positional arguments")
+		if fs.NArg() != 0 {
+			return failf(stderr, "-fuse takes its profiles via -in, not as positional arguments")
 		}
-		runFuse(inputs, *out, *title, *rawVendor, *telemetry)
-		return
+		return runFuse(stdout, stderr, inputs, *out, *title, *rawVendor, *telemetry)
 	}
 	if len(inputs) > 0 {
-		fatalf("-in is only meaningful with -fuse")
+		return failf(stderr, "-in is only meaningful with -fuse")
 	}
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
 	}
-	in := flag.Arg(0)
+	in := fs.Arg(0)
 
 	order := foldedstacks.LeafFirst
 	switch *stackOrder {
@@ -86,15 +111,23 @@ func main() {
 	case "root-first":
 		order = foldedstacks.RootFirst
 	default:
-		fatalf("unknown -stack-order %q: want root-first or leaf-first", *stackOrder)
+		return failf(stderr, "unknown -stack-order %q: want root-first or leaf-first", *stackOrder)
+	}
+
+	if modelMode {
+		return runModel(stdout, stderr, modelArgs{
+			in: in, out: *out, title: *title, sampleIdx: *sampleIdx,
+			execlog: *execlogPath, execlogBase: *execlogBase,
+			facts: *factsNode, listNodes: *listNodes, diffBase: *diffBase,
+			set: set, rootFirst: order == foldedstacks.RootFirst, folded: *folded,
+		})
 	}
 
 	if *folded {
 		if *telemetry != "" {
-			fatalf("-gpu-telemetry requires HTML output")
+			return failf(stderr, "-gpu-telemetry requires HTML output")
 		}
-		writeFolded(in, *sampleIdx, order)
-		return
+		return writeFolded(stdout, stderr, in, *sampleIdx, order)
 	}
 
 	dst := *out
@@ -108,57 +141,69 @@ func main() {
 		StackOrder:       order,
 	})
 	if err != nil {
-		fatalf("%v", err)
+		return failf(stderr, "%v", err)
 	}
-	report(dst, res)
+	report(stdout, dst, res)
+	return 0
 }
 
-func writeFolded(in string, sampleIdx int, order foldedstacks.StackOrder) {
-	res := fold(in, sampleIdx, order)
-	n, err := res.WriteFolded(os.Stdout)
+func writeFolded(stdout, stderr io.Writer, in string, sampleIdx int, order foldedstacks.StackOrder) int {
+	res, err := fold(in, sampleIdx, order)
 	if err != nil {
-		fatalf("write folded: %v", err)
+		return failf(stderr, "%v", err)
+	}
+	n, err := res.WriteFolded(stdout)
+	if err != nil {
+		return failf(stderr, "write folded: %v", err)
 	}
 	if n > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d frame names contained ';' or a newline and were substituted; the folded text form has no escape for them\n", n)
+		_, _ = fmt.Fprintf(stderr, "warning: %d frame names contained ';' or a newline and were substituted; the folded text form has no escape for them\n", n)
 	}
 	for _, w := range res.Warnings {
-		fmt.Fprintf(os.Stderr, "note: %s\n", w)
+		_, _ = fmt.Fprintf(stderr, "note: %s\n", w)
 	}
+	return 0
 }
 
-func fold(in string, sampleIdx int, order foldedstacks.StackOrder) *foldedstacks.Result {
+func fold(in string, sampleIdx int, order foldedstacks.StackOrder) (*foldedstacks.Result, error) {
 	f, err := os.Open(in)
 	if err != nil {
-		fatalf("open %s: %v", in, err)
+		return nil, fmt.Errorf("open %s: %v", in, err)
 	}
 	defer func() { _ = f.Close() }()
 	p, err := profile.Parse(f)
 	if err != nil {
-		fatalf("parse %s: %v", in, err)
+		return nil, fmt.Errorf("parse %s: %v", in, err)
 	}
 	res, err := foldedstacks.Fold(p, foldedstacks.Options{SampleIndex: sampleIdx, StackOrder: order})
 	if err != nil {
-		fatalf("fold %s: %v", in, err)
+		return nil, fmt.Errorf("fold %s: %v", in, err)
 	}
-	return res
+	return res, nil
 }
 
 // report prints the same honest numbers the page carries, so a user running
 // this in a pipeline sees a degenerate profile without opening a browser.
-func report(dst string, res *foldedstacks.Result) {
-	fmt.Printf("wrote %s\n", dst)
-	fmt.Printf("  axis     %s/%s\n", res.SampleTypeName, res.Unit)
-	fmt.Printf("  total    %s across %d samples in %d distinct stacks\n",
+func report(w io.Writer, dst string, res *foldedstacks.Result) {
+	_, _ = fmt.Fprintf(w, "wrote %s\n", dst)
+	_, _ = fmt.Fprintf(w, "  axis     %s/%s\n", res.SampleTypeName, res.Unit)
+	_, _ = fmt.Fprintf(w, "  total    %s across %d samples in %d distinct stacks\n",
 		flamegraph.FormatValue(res.Total, res.Unit), res.Samples, len(res.Stacks))
-	for _, w := range res.Warnings {
-		fmt.Printf("  note     %s\n", w)
+	for _, w2 := range res.Warnings {
+		_, _ = fmt.Fprintf(w, "  note     %s\n", w2)
 	}
 }
 
-func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
+// failf prints a runtime failure and returns exit status 1.
+func failf(stderr io.Writer, format string, args ...any) int {
+	_, _ = fmt.Fprintf(stderr, format+"\n", args...)
+	return 1
+}
+
+// usageErr prints a flag-combination error and returns exit status 2.
+func usageErr(stderr io.Writer, format string, args ...any) int {
+	_, _ = fmt.Fprintf(stderr, format+"\n", args...)
+	return 2
 }
 
 // fuseInputs collects repeated -in flags.
@@ -191,9 +236,9 @@ func (f *fuseInputs) Set(v string) error {
 	return nil
 }
 
-func runFuse(inputs fuseInputs, out, title string, rawVendor bool, telemetry string) {
+func runFuse(stdout, stderr io.Writer, inputs fuseInputs, out, title string, rawVendor bool, telemetry string) int {
 	if len(inputs) < 2 {
-		fatalf("-fuse needs at least 2 profiles; pass -in once per profile (got %d)", len(inputs))
+		return failf(stderr, "-fuse needs at least 2 profiles; pass -in once per profile (got %d)", len(inputs))
 	}
 	dst := out
 	if dst == "" {
@@ -205,7 +250,8 @@ func runFuse(inputs fuseInputs, out, title string, rawVendor bool, telemetry str
 		RawVendorFrames:  rawVendor,
 	})
 	if err != nil {
-		fatalf("%v", err)
+		return failf(stderr, "%v", err)
 	}
-	report(dst, res)
+	report(stdout, dst, res)
+	return 0
 }

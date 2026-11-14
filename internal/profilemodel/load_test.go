@@ -533,3 +533,25 @@ func TestLoadFSSidecarOverLimitIsUnread(t *testing.T) {
 		t.Fatalf("missing sidecar: %+v, %v", p, err)
 	}
 }
+
+func TestLoadRefusesLongMetadata(t *testing.T) {
+	if got := DefaultLimits().MaxMetaBytes; got != 256 {
+		t.Fatalf("MaxMetaBytes default %d", got)
+	}
+	sample := pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main")}, Value: 1}
+	long := strings.Repeat("u", 257)
+	for name, raw := range map[string][]byte{
+		"sample type": pmfixture.Build(long, "nanoseconds", nil, sample),
+		"unit":        pmfixture.Build("cpu", long, nil, sample),
+		"comment":     pmfixture.Build("cpu", "nanoseconds", []string{"ok", long}, sample),
+	} {
+		_, err := FromBytes(raw, nil, DefaultLimits())
+		if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxMetaBytes") || strings.Contains(err.Error(), long) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	at := strings.Repeat("u", 256)
+	if _, err := FromBytes(pmfixture.Build(at, at, []string{at}, sample), nil, DefaultLimits()); err != nil {
+		t.Errorf("256 bytes each: %v", err)
+	}
+}

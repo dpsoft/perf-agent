@@ -60,6 +60,10 @@ type Limits struct {
 	// MaxSidecarRows and MaxSidecarExecutions (distinct ordinals) are
 	// enforced in the row callback.
 	MaxSidecarRows, MaxSidecarExecutions int
+	// MaxMetaBytes bounds each sample type name, sample unit and comment,
+	// checked after parsing: they come from the profile and are repeated in
+	// view names, messages and pages.
+	MaxMetaBytes int
 }
 
 // DefaultLimits returns the limits documented in the package comment.
@@ -74,6 +78,7 @@ func DefaultLimits() Limits {
 		MaxSidecarBytes:      256 << 20,
 		MaxSidecarRows:       10_000_000,
 		MaxSidecarExecutions: 10_000_000,
+		MaxMetaBytes:         256,
 	}
 }
 
@@ -235,6 +240,16 @@ func assemble(raw, execlogBytes []byte, unread string, lim Limits) (*Profile, er
 }
 
 func checkStructure(p *profile.Profile, lim Limits) error {
+	for _, st := range p.SampleType {
+		if n := max(len(st.Type), len(st.Unit)); n > lim.MaxMetaBytes {
+			return limitErr("MaxMetaBytes", lim.MaxMetaBytes, fmt.Sprintf("a %d-byte sample type or unit", n))
+		}
+	}
+	for _, c := range p.Comments {
+		if len(c) > lim.MaxMetaBytes {
+			return limitErr("MaxMetaBytes", lim.MaxMetaBytes, fmt.Sprintf("a %d-byte comment", len(c)))
+		}
+	}
 	if len(p.Sample) > lim.MaxSamples {
 		return limitErr("MaxSamples", lim.MaxSamples, len(p.Sample))
 	}

@@ -233,9 +233,13 @@ func TestZeroTotalQualityIsUnavailable(t *testing.T) {
 	} {
 		wantUnavailable(t, name, f, ReasonZeroTotal)
 	}
-	// Periods are observed on zero-value samples too.
-	if !slices.Equal(q.SamplePeriods, []string{"8"}) {
-		t.Fatalf("periods %q", q.SamplePeriods)
+	// Quality counts periods on weighted samples only; the path facts
+	// still list the period the zero-value sample observed.
+	if q.SamplePeriods != nil {
+		t.Fatalf("periods %q, want none from a zero-value sample", q.SamplePeriods)
+	}
+	if pf := factsAt(t, fixtureView(t, "gpu-zero-total"), "main"); !slices.Equal(pf.SamplePeriods, []string{"8"}) {
+		t.Fatalf("path facts periods %q, want the observed 8", pf.SamplePeriods)
 	}
 
 	c := fixtureView(t, "cpu-all-zero").Quality()

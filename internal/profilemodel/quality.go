@@ -71,7 +71,11 @@ type Quality struct {
 	// UnsampledLaunches is the share whose stack starts at
 	// foldedstacks.UnsampledLaunchFrame. GPU views only.
 	UnsampledLaunches Fact `json:"unsampled_launches"`
-	// SamplePeriods are as PathFacts.SamplePeriods, over the scope.
+	// SamplePeriods are the distinct gpu_sample_period values on the
+	// scope's weighted samples (non-zero value at the view's index), in
+	// PathFacts.SamplePeriods' order. Unlike PathFacts.SamplePeriods, a
+	// period named only by zero-value samples is left out: it carries no
+	// weight, and a diff compares periods on weight.
 	SamplePeriods []string `json:"sample_periods"`
 	// Serialized is the share in each gpu_serialized state, split as
 	// PathFacts.Serialization is. GPU views only; on a GPU view with a
@@ -201,7 +205,7 @@ func (v *View) quality(n *Node, denominator string) Quality {
 
 	m := v.marksFor(n)
 	q := Quality{
-		SamplePeriods:      v.samplePeriods(slices.Concat(n.samples, n.zeroSamples)),
+		SamplePeriods:      v.samplePeriods(n.samples),
 		Unresolved:         share(MetricQualityUnresolved, sumOf(m.unresolved)),
 		UnresolvedByModule: make(map[string]Fact, len(m.byModule)),
 		UnresolvedModules:  m.modules,

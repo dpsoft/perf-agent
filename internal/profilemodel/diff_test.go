@@ -577,6 +577,39 @@ func TestSamplePeriodChangeIsNotComparable(t *testing.T) {
 	}
 }
 
+// The synthetic root has no module: an unmapped unresolved shift is a
+// view-level warning, and only the nodes that carry it are judged on it.
+func TestRootIsNotJudgedOnTheNoModuleShare(t *testing.T) {
+	d := pairDiff(t, "unmapped-unresolved-shift")
+	if d.Root.Interpretation != Comparable || d.Root.Why != "" {
+		t.Fatalf("root %s (%q)", d.Root.Interpretation, d.Root.Why)
+	}
+	want := "symbols of no module: unresolved share 0.000 in base, 0.300 in new"
+	if !slices.Contains(d.QualityWarnings, want) {
+		t.Fatalf("quality warnings %q lack %q", d.QualityWarnings, want)
+	}
+	wantPresence(t, oneDiffAt(t, d, "main"), PresenceBoth, MatchExact, Comparable)
+	addr := oneDiffAt(t, d, "0x7f00")
+	wantPresence(t, addr, PresenceOnlyNew, "", NotComparable)
+	if !strings.HasPrefix(addr.Why, "symbols of no module:") {
+		t.Fatalf("bare address why %q", addr.Why)
+	}
+}
+
+// A period named only by a zero-value sample carries no weight and does
+// not make the node not comparable.
+func TestZeroValuePeriodIsNotCompared(t *testing.T) {
+	d := pairDiff(t, "zero-value-period")
+	walkDiff(d.Root, func(n *DiffNode) {
+		if n.Interpretation != Comparable {
+			t.Fatalf("%s: %s (%q)", n.Name, n.Interpretation, n.Why)
+		}
+	})
+	if slices.ContainsFunc(d.QualityWarnings, func(w string) bool { return strings.HasPrefix(w, "sample period:") }) {
+		t.Fatalf("quality warnings %q", d.QualityWarnings)
+	}
+}
+
 func TestWhyNamesTheFirstCause(t *testing.T) {
 	d := pairDiff(t, "join-and-period-change")
 	k := oneDiffAt(t, d, "main", "[gpu:launch]", "[gpu:kernel:k]")

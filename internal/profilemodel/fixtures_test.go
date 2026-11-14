@@ -515,6 +515,28 @@ func diffPairs() map[string]diffPair {
 			},
 			new: allFixtures()["cpu-all-zero"],
 		},
+		// The same real modules on both sides; 30 of the new view moves to
+		// a bare address and an empty stack, which have no module.
+		"unmapped-unresolved-shift": {
+			base: func() []byte {
+				return rich("cpu", "nanoseconds", rs{stack: []frame{app("a", 1, "main"), app("a", 2, "work")}, value: 100})
+			},
+			new: func() []byte {
+				return rich("cpu", "nanoseconds",
+					rs{stack: []frame{app("a", 1, "main"), app("a", 2, "work")}, value: 70},
+					rs{stack: []frame{{addr: 0x7f00}}, value: 20},
+					rs{stack: nil, value: 10},
+				)
+			},
+		},
+		// A zero-value base sample names period 16 on k; only 8 carries
+		// weight on either side.
+		"zero-value-period": {
+			base: func() []byte {
+				return gpuProfile(gpuK("[gpu:kernel:k]", 100, period("8", "exact")), gpuK("[gpu:kernel:k]", 0, period("16", "exact")))
+			},
+			new: func() []byte { return gpuProfile(gpuK("[gpu:kernel:k]", 100, period("8", "exact"))) },
+		},
 		"perturbation-shift": {
 			base: func() []byte {
 				return gpuProfile(gpuK("[gpu:kernel:k1]", 50, ser("false")), gpuK("[gpu:kernel:k2]", 50, ser("false")))

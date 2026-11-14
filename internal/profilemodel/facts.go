@@ -183,8 +183,9 @@ type PathFacts struct {
 	// GPU view the four states sum to Cumulative.
 	Serialization Serialization `json:"serialization"`
 	// SamplePeriods are the distinct gpu_sample_period values on samples
-	// through the node, zero-value ones included: integers first, in
-	// numeric order, then any other values in string order.
+	// through the node, zero-value ones included (periods observed;
+	// Quality.SamplePeriods counts weighted samples only): integers first,
+	// in numeric order, then any other values in string order.
 	SamplePeriods     []string `json:"sample_periods"`
 	Domain            string   `json:"domain"`             // the Classifier's key, or "unknown"
 	DomainInferred    bool     `json:"domain_inferred"`    // always true: domains are a heuristic

@@ -90,8 +90,11 @@ type DiffNode struct {
 	Candidates     []Candidate    `json:"candidates,omitzero"`
 	Interpretation Interpretation `json:"interpretation"`
 	// Why is the first cause when the node is not comparable. On a
-	// comparable node it lists the comparisons that could not be made,
-	// "; "-separated, and is "" when every one was made.
+	// comparable node it lists the comparisons that applied but could not
+	// be made (a zero value on a side), "; "-separated, and is "" when
+	// every one was made. Comparisons that do not apply to the view type,
+	// the GPU-only rules on a CPU view, are reported once in
+	// Diff.QualityWarnings, not per node.
 	Why      string `json:"why,omitempty"`
 	BaseCum  int64  `json:"base_cum"`
 	NewCum   int64  `json:"new_cum"`
@@ -161,7 +164,9 @@ var sideNames = [2]string{SideBase, SideNew}
 // matched.
 //
 // A node is judged on the quality of the nearest matched node at or above
-// it, on each side; the root's is the view's. It is not comparable when,
+// it, on each side; the root's is the view's. The synthetic root has no
+// module, so the module rule is skipped for it: the view-level module
+// comparison is in QualityWarnings. A node is not comparable when,
 // in order: its module's unresolved share moves by more than
 // MaxUnresolvedShift (the module is found on the other side by build id,
 // else full path, else base name); in GPU views the gpu_join=exact share
@@ -298,7 +303,7 @@ func (d *differ) node(pair [2]*Node, match Match, cands []Candidate, up *basis, 
 	if parent != nil && parent.Presence != PresenceBoth && parent.Interpretation == NotComparable {
 		dn.Interpretation, dn.Why = NotComparable, parent.Why
 	} else {
-		dn.Interpretation, dn.Why = judge(here, pair)
+		dn.Interpretation, dn.Why = judge(here, pair, parent == nil)
 	}
 
 	for _, p := range matchChildren(pair, d.views) {
@@ -493,10 +498,14 @@ func groupBy(sides [2][]*Node, key func(FunctionID) (string, bool)) ([]string, m
 	return slices.Sorted(maps.Keys(groups)), groups
 }
 
-// judge decides a node's interpretation on basis b.
-func judge(b *basis, pair [2]*Node) (Interpretation, string) {
+// judge decides a node's interpretation on basis b. The synthetic root is
+// judged on the shared findings only: it has no module of its own, and
+// its "no module" share would only repeat a view-level warning.
+func judge(b *basis, pair [2]*Node, root bool) (Interpretation, string) {
 	var f findings
-	symbolFindings(&f, b, nodeModules(b, pair))
+	if !root {
+		symbolFindings(&f, b, nodeModules(b, pair))
+	}
 	f.causes = append(f.causes, b.shared.causes...)
 	f.notes = append(f.notes, b.shared.notes...)
 	if len(f.causes) > 0 {

@@ -94,7 +94,7 @@ func openRegular(root *os.Root, kind, noun, name string) (*os.File, os.FileInfo,
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, nil, fmt.Errorf("%s %q under the %s root %s: %w", noun, echo(name), kind, root.Name(), err)
+		return nil, nil, fmt.Errorf("cannot stat %s %q under the %s root %s: %w", noun, echo(name), kind, root.Name(), pathless(err))
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
@@ -113,11 +113,19 @@ func openError(kind, dir, noun, name string, err error) error {
 	case escapesRoot(err):
 		return outsideRoot(kind, dir, name)
 	}
-	// The path is named once, bounded; a PathError would repeat it whole.
+	return fmt.Errorf("cannot open %s %q under the %s root %s: %w", noun, echo(name), kind, dir, pathless(err))
+}
+
+// pathless is err without the names a PathError or LinkError carries, so a
+// message names the agent's path once, bounded by echo, and not again whole.
+func pathless(err error) error {
 	if pe, ok := errors.AsType[*os.PathError](err); ok {
-		err = pe.Err
+		return pe.Err
 	}
-	return fmt.Errorf("cannot open %s %q under the %s root %s: %w", noun, echo(name), kind, dir, err)
+	if le, ok := errors.AsType[*os.LinkError](err); ok {
+		return le.Err
+	}
+	return err
 }
 
 // escapesRoot reports whether err is os.Root's refusal of a path (through

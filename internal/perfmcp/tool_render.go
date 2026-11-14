@@ -23,7 +23,7 @@ const renderSchema = `{
       "items": {"type": "object"}
     },
     "out": {"type": "string", "description": "The page's file name inside the output root (relative to it, or absolute inside it), ending in .html, in a directory that exists. An existing file is never replaced: pass a name that does not exist yet."},
-    "attempt": {"type": "string", "description": "The attempt a previous render_flamegraph call of this handle and view returned, when this call retries it."},
+    "attempt": {"type": "string", "description": "The attempt a previous render_flamegraph call of this view returned, when this call retries it. Every handle of one profile (opened with or without an execlog) shares one attempt history, so an attempt made with any of them is accepted, and the page lists the rejections made with all of them."},
     "title": {"type": "string", "description": "The page's title (default: the profile's name)."},
     "rounding": {"description": "Ignored: rounding is the engine's, per metric."},
     "tolerance": {"description": "Ignored: rounding is the engine's, per metric."}
@@ -35,7 +35,7 @@ const renderSchema = `{
 const renderDescription = "Check structured explanations of a view's nodes against the engine and, when every claim and reference passes, " +
 	"write an explained flame graph page under the output root. Every figure on the page is the engine's value of a checked claim; " +
 	"other numbers in the text are marked unchecked. A failing check writes nothing and returns status \"rejected\" with every failure and the engine's value; " +
-	"fix them and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record. " +
+	"fix them and call again with attempt set to the returned attempt. The page lists the attempts rejected before it from the server's own record, for every handle of the same profile. " +
 	"An existing file is never replaced."
 
 func (s *Server) renderTool() mcpstdio.Tool {
@@ -107,7 +107,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, err
 	}
 	if a.Attempt != "" {
-		if _, err := s.attempts.lookup(a.Attempt, a.Handle, a.View); err != nil {
+		if _, err := s.attempts.lookup(a.Attempt, e.prof.Digest, a.View); err != nil {
 			return mcpstdio.Result{}, err
 		}
 	}
@@ -121,15 +121,15 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 
 	exps, decoded, err := explain.Decode(a.Explanations, s.lim.Explain)
 	if err != nil {
-		id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeInvalid, nil)
+		id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeInvalid, nil)
 		return mcpstdio.Result{}, fmt.Errorf("attempt %s: %v; fix explanations and call render_flamegraph again with attempt %q", id, err, id)
 	}
 	notices = append(notices, decoded...)
 
 	r := explain.Check(v, exps, s.lim.Explain)
 	if !r.OK {
-		id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeRejected, r.Failures)
-		if _, omitted := storedFailures(r.Failures); omitted > 0 {
+		id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeRejected, r.Failures)
+		if omitted := len(r.Failures) - maxStoredFailures; omitted > 0 {
 			notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
 				"this result lists all %d failures; the server's record of %s keeps %d of them (claims first, then references, then limits), "+
 					"so a later page lists those and says \"and %d more failures\"", len(r.Failures), id, maxStoredFailures, omitted)})
@@ -145,8 +145,8 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return res, nil
 	}
 
-	id := s.attempts.add(a.Handle, a.View, a.Attempt, outcomeWritten, nil)
-	rejected, dropped, incomplete := s.attempts.rejected(a.Handle, a.View)
+	id := s.attempts.add(e.prof.Digest, a.View, a.Attempt, outcomeWritten, nil)
+	rejected, dropped, incomplete := s.attempts.rejected(e.prof.Digest, a.View)
 	var page bytes.Buffer
 	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
 		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,

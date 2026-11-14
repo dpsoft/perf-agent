@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -20,21 +21,23 @@ const (
 // attempt is one recorded render_flamegraph call.
 type attempt struct {
 	id       string
-	handle   profilemodel.Handle
-	view     string
+	key      viewKey
 	retryOf  string
 	outcome  string
-	failures []explain.Failure
-	// omitted counts the failures not kept in failures.
-	omitted int
+	failures storedRecord
 }
 
+// viewKey names a view of a profile by the profile's digest, not by the
+// handle it was opened with: one profile opened with different executions
+// logs, or with one that could not be read, has a handle per load, but its
+// views and their names are the same, so every handle of it shares one
+// attempt history and none can render a page without its rejections.
 type viewKey struct {
-	handle profilemodel.Handle
-	view   string
+	profile profilemodel.Digest
+	view    string
 }
 
-// viewAttempts are the attempts kept for one handle and view, oldest
+// viewAttempts are the attempts kept for one profile and view, oldest
 // first. Rejected attempts are bounded apart from the others, so no number
 // of cheap invalid calls can push a rejection off the page; dropped counts
 // the rejected ones no longer kept. incomplete says the server may have
@@ -58,9 +61,10 @@ type viewCount struct {
 const countsPerView = 4
 
 // attempts is a server's record of render attempts. IDs are "a1", "a2", …
-// in the order the server made them, across all handles and views. The
-// record is keyed by handle and view and outlives the store's handles, so
-// evicting and reopening a profile does not clear its rejections. Each
+// in the order the server made them, across all profiles and views. The
+// record is keyed by profile digest and view, so every handle of one
+// profile shares it, and it outlives the store's handles, so evicting and
+// reopening a profile does not clear its rejections. Each
 // view keeps its max most recent rejected attempts and, apart, its max most
 // recent others; the rejected ones are what a page lists as rejected at
 // render, so a page never takes that list from the agent. At most maxViews
@@ -88,14 +92,14 @@ func newAttempts(max, maxViews int) *attempts {
 	}
 }
 
-// add records an attempt and returns its ID. retryOf is the attempt it
-// retries, already checked with lookup, or "". Of failures it keeps what
-// storedFailures keeps.
-func (a *attempts) add(h profilemodel.Handle, view, retryOf, outcome string, failures []explain.Failure) string {
+// add records an attempt on view of the profile with digest d and returns
+// its ID. retryOf is the attempt it retries, already checked with lookup,
+// or "". Of failures it keeps what storedFailures keeps.
+func (a *attempts) add(d profilemodel.Digest, view, retryOf, outcome string, failures []explain.Failure) string {
 	a.next++
-	at := &attempt{id: "a" + strconv.Itoa(a.next), handle: h, view: view, retryOf: retryOf, outcome: outcome}
-	at.failures, at.omitted = storedFailures(failures)
-	va := a.record(viewKey{h, view})
+	k := viewKey{d, view}
+	at := &attempt{id: "a" + strconv.Itoa(a.next), key: k, retryOf: retryOf, outcome: outcome, failures: storedFailures(failures)}
+	va := a.record(k)
 	a.byID[at.id] = at
 	if outcome == outcomeRejected {
 		va.dropped += a.keep(&va.rejected, at)
@@ -167,11 +171,11 @@ func (a *attempts) setOutcome(id, outcome string) {
 	}
 }
 
-// rejected are the kept rejected attempts of h and view, oldest first, how
-// many older rejected ones are no longer kept, and whether that count may
-// be short.
-func (a *attempts) rejected(h profilemodel.Handle, view string) ([]explain.RejectedAttempt, int, bool) {
-	k := viewKey{h, view}
+// rejected are the kept rejected attempts of view of the profile with
+// digest d, made with any of its handles, oldest first, how many older
+// rejected ones are no longer kept, and whether that count may be short.
+func (a *attempts) rejected(d profilemodel.Digest, view string) ([]explain.RejectedAttempt, int, bool) {
+	k := viewKey{d, view}
 	va := a.views[k]
 	if va == nil {
 		c, ok := a.counts[k]
@@ -179,22 +183,26 @@ func (a *attempts) rejected(h profilemodel.Handle, view string) ([]explain.Rejec
 	}
 	out := make([]explain.RejectedAttempt, 0, len(va.rejected))
 	for _, at := range va.rejected {
-		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: at.failures, Omitted: at.omitted})
+		f := at.failures
+		out = append(out, explain.RejectedAttempt{Attempt: at.id, RetryOf: at.retryOf, Failures: f.kept,
+			Omitted: f.omitted, OmittedClaims: f.omittedClaims, OmittedReferences: f.omittedRefs})
 	}
 	return out, va.dropped, va.incomplete
 }
 
 // lookup returns the attempt id, refusing one the server does not keep and
-// one made for another handle or view.
-func (a *attempts) lookup(id string, h profilemodel.Handle, view string) (*attempt, error) {
+// one made for another profile or view. An attempt made with any handle of
+// the profile with digest d is accepted: the handles share one history.
+func (a *attempts) lookup(id string, d profilemodel.Digest, view string) (*attempt, error) {
 	at, ok := a.byID[id]
 	if !ok {
-		return nil, fmt.Errorf("attempt %q is not a render attempt this server keeps (it keeps the last MaxAttemptsPerView=%d of each handle and view, for the MaxAttemptViews=%d most recently used); "+
-			"pass the attempt a previous render_flamegraph call of this handle and view returned, or omit attempt", echo(id), a.max, a.maxViews)
+		return nil, fmt.Errorf("attempt %q is not a render attempt this server keeps (it keeps the last MaxAttemptsPerView=%d of each profile and view, for the MaxAttemptViews=%d most recently used); "+
+			"pass the attempt a previous render_flamegraph call of this view of this profile returned, or omit attempt", echo(id), a.max, a.maxViews)
 	}
-	if at.handle != h || at.view != view {
-		return nil, fmt.Errorf("attempt %s was made for handle %s view %s, not handle %s view %s; "+
-			"pass an attempt of this handle and view, or omit attempt", at.id, at.handle, echo(at.view), h, echo(view))
+	if k := (viewKey{d, view}); at.key != k {
+		return nil, fmt.Errorf("attempt %s was made for view %s of profile %s, not view %s of profile %s; "+
+			"pass an attempt of this view of this profile (made with any of its handles), or omit attempt",
+			at.id, echo(at.key.view), at.key.profile, echo(view), d)
 	}
 	return at, nil
 }
@@ -203,10 +211,20 @@ func (a *attempts) lookup(id string, h profilemodel.Handle, view string) (*attem
 // attempt; the rest are counted.
 const maxStoredFailures = 32
 
-// storedFailures are the failures the record keeps of fs, claim failures
-// first, then reference failures, then limits, each in fs's order, and how
-// many it leaves out.
-func storedFailures(fs []explain.Failure) ([]explain.Failure, int) {
+// storedRecord is what the record keeps of one attempt's failures: at most
+// maxStoredFailures of them, how many it left out and, of those, how many
+// distinct claims and references no kept failure names.
+type storedRecord struct {
+	kept                                []explain.Failure
+	omitted, omittedClaims, omittedRefs int
+}
+
+// storedFailures is what the record keeps of fs: claim failures first, then
+// reference failures, then limits, each in fs's order, up to
+// maxStoredFailures, with the rest counted. Every kept string is a copy,
+// so the record never holds the agent's prose or arguments a failure's
+// text was cut from.
+func storedFailures(fs []explain.Failure) storedRecord {
 	rank := func(f explain.Failure) int {
 		switch {
 		case f.Claim != "":
@@ -216,10 +234,54 @@ func storedFailures(fs []explain.Failure) ([]explain.Failure, int) {
 		}
 		return 1
 	}
-	kept := slices.Clone(fs)
-	slices.SortStableFunc(kept, func(x, y explain.Failure) int { return rank(x) - rank(y) })
-	if len(kept) <= maxStoredFailures {
-		return kept, 0
+	sorted := slices.Clone(fs)
+	slices.SortStableFunc(sorted, func(x, y explain.Failure) int { return rank(x) - rank(y) })
+	n := min(len(sorted), maxStoredFailures)
+	r := storedRecord{kept: make([]explain.Failure, n), omitted: len(sorted) - n}
+	named := map[string]bool{}
+	for i, f := range sorted[:n] {
+		r.kept[i] = cloneFailure(f)
+		named[failureKey(f)] = true
 	}
-	return slices.Clip(kept[:maxStoredFailures]), len(kept) - maxStoredFailures
+	for _, f := range sorted[n:] {
+		k := failureKey(f)
+		if f.Code == explain.CodeLimitExceeded && f.Claim == "" || named[k] {
+			continue
+		}
+		named[k] = true
+		if f.Claim != "" {
+			r.omittedClaims++
+		} else {
+			r.omittedRefs++
+		}
+	}
+	return r
+}
+
+// failureKey is what a page counts a failure as: the claim it names, or
+// the reference, by code and what it refers to.
+func failureKey(f explain.Failure) string {
+	if f.Claim != "" {
+		return "claim\x00" + f.Claim
+	}
+	return "ref\x00" + string(f.Code) + "\x00" + f.Ref
+}
+
+// cloneFailure is f with every string copied.
+func cloneFailure(f explain.Failure) explain.Failure {
+	f.Claim, f.Ref = strings.Clone(f.Claim), strings.Clone(f.Ref)
+	f.Code = explain.Code(strings.Clone(string(f.Code)))
+	f.Message, f.Agent = strings.Clone(f.Message), strings.Clone(f.Agent)
+	if e := f.Engine; e != nil {
+		c := explain.EngineValue{
+			Metric: strings.Clone(e.Metric), Scope: strings.Clone(e.Scope), Node: profilemodel.NodeID(strings.Clone(string(e.Node))),
+			Denominator: strings.Clone(e.Denominator), Unit: strings.Clone(e.Unit), Value: strings.Clone(e.Value),
+			Rounding: strings.Clone(e.Rounding), Status: profilemodel.Status(strings.Clone(string(e.Status))), Reason: strings.Clone(e.Reason),
+		}
+		if e.Module != nil {
+			c.Module = new(strings.Clone(*e.Module))
+		}
+		f.Engine = &c
+	}
+	return f
 }

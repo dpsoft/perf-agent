@@ -94,9 +94,9 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	p, err := profilemodel.LoadFS(files, "profile", logName, s.lim)
 	if err != nil {
 		if errors.Is(err, profilemodel.ErrLimit) {
-			return nil, fmt.Errorf("cannot open %q: %v; this server's limits are fixed when it starts, so it cannot open this profile", name, err)
+			return nil, fmt.Errorf("cannot open %q: %v; this server's limits are fixed when it starts, so it cannot open this profile", echo(name), err)
 		}
-		return nil, fmt.Errorf("cannot open %q: %v; pass a pprof profile written by perf-agent", name, err)
+		return nil, fmt.Errorf("cannot open %q: %v; pass a pprof profile written by perf-agent", echo(name), err)
 	}
 	if e, ok := s.entries[p.Handle]; ok {
 		s.touch(p.Handle)
@@ -110,7 +110,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	def := defaultView(p)
 	v, err := p.View(profilemodel.ViewOptions{SampleIndex: foldedstacks.ChooseSampleIndex(p.Source)})
 	if err != nil {
-		return nil, fmt.Errorf("cannot build view %s of %q: %v", def, name, err)
+		return nil, fmt.Errorf("cannot build view %s of %q: %v", def, echo(name), err)
 	}
 	e.views[def] = v
 	s.entries[p.Handle] = e
@@ -141,7 +141,7 @@ func (s *store) touch(h profilemodel.Handle) {
 func (s *store) view(h profilemodel.Handle, view string) (*entry, *profilemodel.View, error) {
 	e, ok := s.entries[h]
 	if !ok {
-		return nil, nil, fmt.Errorf("handle %s is not open in this server (it keeps the MaxOpenHandles=%d most recently used); call open(path) again to get a handle", h, s.max)
+		return nil, nil, fmt.Errorf("handle %s is not open in this server (it keeps the MaxOpenHandles=%d most recently used); call open(path) again to get a handle", echo(string(h)), s.max)
 	}
 	s.touch(h)
 	if v, ok := e.views[view]; ok {

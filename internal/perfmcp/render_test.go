@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
 // rendering is a server with CPUBasic opened and an output root.
@@ -177,7 +179,7 @@ func TestRejectedAttemptsComeFromTheServersRecord(t *testing.T) {
 	}
 }
 
-func TestAttemptsAreBoundToHandleAndView(t *testing.T) {
+func TestAttemptsAreBoundToProfileAndView(t *testing.T) {
 	o := renderFixture(t, nil)
 	writeFixture(t, o.profiles, "new.pb.gz", pmfixture.CPUBasicNew())
 	var other openOut
@@ -216,56 +218,58 @@ func TestAttemptsAreBoundToHandleAndView(t *testing.T) {
 
 func TestAttemptsKeepAtMostMaxAttemptsPerView(t *testing.T) {
 	a := newAttempts(2, 256)
-	a.add("h", "v", "", outcomeRejected, nil)
-	a.add("h", "v", "a1", outcomeRejected, nil)
-	a.add("h", "v", "a2", outcomeRejected, nil)
+	var h profilemodel.Digest
+	a.add(h, "v", "", outcomeRejected, nil)
+	a.add(h, "v", "a1", outcomeRejected, nil)
+	a.add(h, "v", "a2", outcomeRejected, nil)
 	// Other outcomes are bounded apart and never evict a rejection.
 	for range 3 {
-		a.add("h", "v", "", outcomeInvalid, nil)
+		a.add(h, "v", "", outcomeInvalid, nil)
 	}
-	a.add("h", "w", "", outcomeRejected, nil)
-	rej, dropped, _ := a.rejected("h", "v")
+	a.add(h, "w", "", outcomeRejected, nil)
+	rej, dropped, _ := a.rejected(h, "v")
 	if len(rej) != 2 || rej[0].Attempt != "a2" || rej[1].Attempt != "a3" || rej[1].RetryOf != "a2" || dropped != 1 {
 		t.Errorf("rejected = %+v, dropped %d", rej, dropped)
 	}
 	for _, id := range []string{"a1", "a4"} {
-		if _, err := a.lookup(id, "h", "v"); err == nil {
+		if _, err := a.lookup(id, h, "v"); err == nil {
 			t.Errorf("dropped attempt %s is still known", id)
 		}
 	}
-	if _, err := a.lookup("a5", "h", "v"); err != nil {
+	if _, err := a.lookup("a5", h, "v"); err != nil {
 		t.Errorf("a5: %v", err)
 	}
-	if _, err := a.lookup("a7", "h", "v"); err == nil || !strings.Contains(err.Error(), "w") {
+	if _, err := a.lookup("a7", h, "v"); err == nil || !strings.Contains(err.Error(), "w") {
 		t.Errorf("a7 with view v: %v", err)
 	}
 }
 
 func TestAttemptViewsAreBoundedAndKeepTheirRejectedCount(t *testing.T) {
 	a := newAttempts(2, 1)
-	a.add("h", "v", "", outcomeRejected, nil)
-	a.add("h", "v", "", outcomeRejected, nil)
-	a.add("h", "w", "", outcomeRejected, nil) // evicts v's record
-	if _, err := a.lookup("a1", "h", "v"); err == nil {
+	var h profilemodel.Digest
+	a.add(h, "v", "", outcomeRejected, nil)
+	a.add(h, "v", "", outcomeRejected, nil)
+	a.add(h, "w", "", outcomeRejected, nil) // evicts v's record
+	if _, err := a.lookup("a1", h, "v"); err == nil {
 		t.Error("an attempt of an evicted view is still known")
 	}
 	if len(a.views) != 1 || len(a.byID) != 1 {
 		t.Errorf("%d views, %d attempts kept", len(a.views), len(a.byID))
 	}
-	a.add("h", "v", "", outcomeWritten, nil) // evicts w's record
-	rej, dropped, incomplete := a.rejected("h", "v")
+	a.add(h, "v", "", outcomeWritten, nil) // evicts w's record
+	rej, dropped, incomplete := a.rejected(h, "v")
 	if len(rej) != 0 || dropped != 2 || incomplete {
 		t.Errorf("v: %+v dropped %d incomplete %v", rej, dropped, incomplete)
 	}
 	// The counters hold 4 views; one more rejected view evicted loses count.
 	for i := range 6 {
-		a.add("h", fmt.Sprint("x", i), "", outcomeRejected, nil)
+		a.add(h, fmt.Sprint("x", i), "", outcomeRejected, nil)
 	}
 	if len(a.counts) > 4 {
 		t.Errorf("%d counters", len(a.counts))
 	}
-	a.add("h", "fresh", "", outcomeWritten, nil)
-	if _, _, incomplete := a.rejected("h", "fresh"); !incomplete {
+	a.add(h, "fresh", "", outcomeWritten, nil)
+	if _, _, incomplete := a.rejected(h, "fresh"); !incomplete {
 		t.Error("a view without a record after the counters overflowed reads as complete")
 	}
 }
@@ -696,15 +700,22 @@ func TestStoredFailuresKeepClaimsFirst(t *testing.T) {
 	for i := range 30 {
 		fs = append(fs, explain.Failure{Code: explain.CodeValueMismatch, Claim: fmt.Sprint("c", i)})
 	}
-	kept, omitted := storedFailures(fs)
-	if len(kept) != 32 || omitted != 18 {
-		t.Fatalf("kept %d omitted %d", len(kept), omitted)
+	r := storedFailures(fs)
+	kept := r.kept
+	if len(kept) != 32 || r.omitted != 18 || r.omittedClaims != 0 || r.omittedRefs != 8 {
+		t.Fatalf("kept %d omitted %d (%d claims, %d references)", len(kept), r.omitted, r.omittedClaims, r.omittedRefs)
 	}
 	if kept[0].Claim != "c0" || kept[29].Claim != "c29" || kept[30].Ref != "r0" || kept[31].Ref != "r1" {
 		t.Errorf("kept = %+v", kept)
 	}
-	if kept, omitted := storedFailures(fs[:3]); len(kept) != 3 || omitted != 0 {
-		t.Errorf("short list: %d %d", len(kept), omitted)
+	if r := storedFailures(fs[:3]); len(r.kept) != 3 || r.omitted != 0 {
+		t.Errorf("short list: %d %d", len(r.kept), r.omitted)
+	}
+	// A claim that a kept failure already names is not counted again.
+	fs = append(fs[10:], explain.Failure{Code: explain.CodeValueMismatch, Claim: "c30"}, explain.Failure{Code: explain.CodeValueMismatch, Claim: "c31"},
+		explain.Failure{Code: explain.CodeUnknownMetric, Claim: "c0"}, explain.Failure{Code: explain.CodeValueMismatch, Claim: "c32"})
+	if r := storedFailures(fs); r.omitted != 12 || r.omittedClaims != 1 || r.omittedRefs != 10 {
+		t.Errorf("omitted %d (%d claims, %d references)", r.omitted, r.omittedClaims, r.omittedRefs)
 	}
 }
 
@@ -732,10 +743,110 @@ func TestARejectedAttemptKeepsAtMost32Failures(t *testing.T) {
 		t.Fatalf("write: %s", text)
 	}
 	sec := rejectedSection(t, page.Path)
-	if !strings.Contains(sec, "32 claims rejected at render") || !strings.Contains(sec, "and 8 more failures") {
+	if !strings.Contains(sec, "40 claims rejected at render") || !strings.Contains(sec, "and 8 more failures") {
 		t.Errorf("rejected section: %.600s", sec)
 	}
 	if n := strings.Count(sec, "<s>0.62</s>"); n != 32 {
 		t.Errorf("%d claim rows", n)
+	}
+}
+
+func TestAliasHandlesShareRejections(t *testing.T) {
+	o := renderFixture(t, func(cfg *Config) {
+		cfg.Limits.Model = profilemodel.DefaultLimits()
+		cfg.Limits.Model.MaxSidecarBytes = 16
+	})
+	writeFixture(t, o.profiles, "notes.txt", []byte("not a log"))
+	writeFixture(t, o.profiles, "empty.log", nil)
+	writeFixture(t, o.profiles, "big.log", bytes.Repeat([]byte("x"), 64))
+	b := o.nodeID(t, "b")
+	if _, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.62", "{c1}"), "out": "x.html"}); !isErr {
+		t.Fatalf("a1 passed: %s", text)
+	}
+	for i, execlog := range []string{"notes.txt", "empty.log", "big.log", "big.log"} {
+		var alias openOut
+		o.c.callOK("open", map[string]any{"path": "cpu.pb.gz", "execlog": execlog}, &alias)
+		if alias.Handle == o.handle || !strings.HasPrefix(alias.Handle, string(o.handle)+"+") {
+			t.Fatalf("execlog %s: handle %q is not an alias of %q", execlog, alias.Handle, o.handle)
+		}
+		a := rendering{opened: opened{c: o.c, handle: alias.Handle, view: alias.DefaultView}, out: o.out}
+		args := map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": fmt.Sprintf("alias%d.html", i)}
+		if i == 3 {
+			args["attempt"] = "a1" // an attempt of the same profile and view, made with another handle
+		}
+		out, text, isErr := a.render(t, args)
+		if isErr {
+			t.Fatalf("execlog %s (%s): %s", execlog, alias.Handle, text)
+		}
+		sec := rejectedSection(t, out.Path)
+		if !strings.Contains(sec, "1 claim rejected at render</span>") || !strings.Contains(sec, "<s>0.62</s>") {
+			t.Errorf("execlog %s (%s): rejected section: %.1500s", execlog, alias.Handle, sec)
+		}
+	}
+}
+
+func TestStoredRejectionsDoNotRetainAgentProse(t *testing.T) {
+	// Each rejection has 32 explanations whose prose is its own 8000-byte
+	// string with one reference to a node that does not exist; the record
+	// keeping the failures must not keep the prose they were cut from.
+	const rejections, refs, prose = 50, 32, 8000
+	o := renderFixture(t, func(cfg *Config) { cfg.Limits.MaxAttemptsPerView = rejections })
+	b := o.nodeID(t, "b")
+	heap := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	before := heap()
+	for i := range rejections {
+		var exps []any
+		for e := range refs {
+			head := fmt.Sprint(i, " ", e, " ")
+			pad := strings.Repeat("x", prose-len(head)-len("{n:0000000000000000}"))
+			exps = append(exps, map[string]any{"node": b, "prose": head + pad + "{n:0000000000000000}"})
+		}
+		if _, text, isErr := o.render(t, map[string]any{"explanations": exps, "out": "x.html"}); !isErr {
+			t.Fatalf("passed: %.300s", text)
+		}
+	}
+	after := heap()
+	if n := len(o.c.srv.attempts.byID); n != rejections {
+		t.Fatalf("%d attempts kept", n)
+	}
+	// The prose is 12.2 MiB; the failures kept without it are under 0.5.
+	grew := int64(after) - int64(before)
+	t.Logf("%d rejections of %d references in %d-byte prose retain %d bytes", rejections, refs, prose, grew)
+	if grew > 2<<20 {
+		t.Errorf("%d rejections of %d references in %d-byte prose retain %d bytes", rejections, refs, prose, grew)
+	}
+}
+
+func TestPublishErrorsBoundTheNames(t *testing.T) {
+	o := renderFixture(t, nil)
+	b := o.nodeID(t, "b")
+	long := strings.Repeat("p", 200)
+	o.c.srv.link = func(_ *os.Root, oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EPERM}
+	}
+	_, text, isErr := o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": long + ".html"})
+	if !isErr || !strings.Contains(text, "operation not permitted") || strings.Contains(text, long[:100]) {
+		t.Errorf("link error: isError=%v %s", isErr, text)
+	}
+	o.c.srv.link = (*os.Root).Link
+
+	dir := filepath.Join(o.out, long)
+	if err := os.Mkdir(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if f, err := os.Create(filepath.Join(dir, "probe")); err == nil {
+		_ = f.Close()
+		t.Skip("this process can write into a read-only directory")
+	}
+	_, text, isErr = o.render(t, map[string]any{"explanations": shareClaim(b, "0.411", "{c1}"), "out": long + "/x.html"})
+	if !isErr || !strings.Contains(text, "permission denied") || strings.Contains(text, long[:100]) {
+		t.Errorf("temporary error: isError=%v %s", isErr, text)
 	}
 }

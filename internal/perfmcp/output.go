@@ -66,7 +66,7 @@ func (s *Server) writePage(out string, page []byte) (string, error) {
 		}
 		return "", fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
 			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
-			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), err)
+			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err))
 	}
 	return filepath.Join(root.Name(), name), nil
 }
@@ -155,7 +155,7 @@ func writeTemp(root *os.Root, dir, base string, page []byte) (string, error) {
 			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: %w", dir, root.Name(), err)
+			return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: %w", echo(dir), root.Name(), pathless(err))
 		}
 		_, err = f.Write(page)
 		if err == nil {
@@ -165,9 +165,9 @@ func writeTemp(root *os.Root, dir, base string, page []byte) (string, error) {
 			err = cerr
 		}
 		if err != nil {
-			return tmp, fmt.Errorf("cannot write the temporary page %s under the output root %s: %w", tmp, root.Name(), err)
+			return tmp, fmt.Errorf("cannot write the temporary page %s under the output root %s: %w", echo(tmp), root.Name(), pathless(err))
 		}
 		return tmp, nil
 	}
-	return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: every name tried exists", dir, root.Name())
+	return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: every name tried exists", echo(dir), root.Name())
 }

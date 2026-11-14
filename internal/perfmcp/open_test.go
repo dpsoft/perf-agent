@@ -206,14 +206,73 @@ func TestOpenRefusesPathsOutsideTheRoot(t *testing.T) {
 			t.Errorf("open %q succeeded: %s", p, text)
 			continue
 		}
-		if !strings.Contains(text, "profiles root "+cfg.ProfilesDir) {
-			t.Errorf("open %q: error does not name the profiles root: %s", p, text)
+		if !strings.Contains(text, "is outside the profiles root "+cfg.ProfilesDir) {
+			t.Errorf("open %q: error does not say it is outside the profiles root: %s", p, text)
 		}
 	}
 	// An execlog is confined the same way.
 	text, isErr := c.call("open", map[string]any{"path": "cpu.pb.gz", "execlog": "/etc/passwd"})
-	if !isErr || !strings.Contains(text, "profiles root "+cfg.ProfilesDir) {
+	if !isErr || !strings.Contains(text, "is outside the profiles root "+cfg.ProfilesDir) {
 		t.Errorf("execlog outside the root: isError=%v %s", isErr, text)
+	}
+}
+
+func TestOpenDoesNotCallAnInRootErrorAnEscape(t *testing.T) {
+	cfg := testConfig(t)
+	writeFixture(t, cfg.ProfilesDir, "escapes", []byte("a file, not a directory"))
+	c := newTestServer(t, cfg)
+	for _, p := range []string{"escapes/x", filepath.Join(cfg.ProfilesDir, "escapes", "x")} {
+		text, isErr := c.call("open", map[string]any{"path": p})
+		if !isErr || strings.Contains(text, "outside") || !strings.Contains(text, "profiles root "+cfg.ProfilesDir) {
+			t.Errorf("open %q: isError=%v %s", p, isErr, text)
+		}
+	}
+}
+
+// aliasedRoot is a profiles directory holding CPUBasic and a symlink to it
+// in another directory.
+func aliasedRoot(t *testing.T) (real, alias string) {
+	t.Helper()
+	real = t.TempDir()
+	writeFixture(t, real, "cpu.pb.gz", pmfixture.CPUBasic())
+	alias = filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+	return real, alias
+}
+
+func TestOpenAcceptsAPathThroughAnAliasOfTheRoot(t *testing.T) {
+	real, alias := aliasedRoot(t)
+	for _, tc := range []struct{ root, arg string }{
+		{real, filepath.Join(alias, "cpu.pb.gz")}, // root given as the real path, argument through the alias
+		{alias, filepath.Join(real, "cpu.pb.gz")}, // root given as the alias, argument as the real path
+	} {
+		cfg := testConfig(t)
+		cfg.ProfilesDir = tc.root
+		var out openOut
+		newTestServer(t, cfg).callOK("open", map[string]any{"path": tc.arg}, &out)
+		if out.ProfileName != "cpu.pb.gz" {
+			t.Errorf("root %s, path %s: profile_name %q", tc.root, tc.arg, out.ProfileName)
+		}
+	}
+}
+
+func TestOpenThroughAnAliasStillRefusesEscapes(t *testing.T) {
+	real, alias := aliasedRoot(t)
+	outside := t.TempDir()
+	writeFixture(t, outside, "other.pb.gz", pmfixture.CPUBasic())
+	if err := os.Symlink(filepath.Join(outside, "other.pb.gz"), filepath.Join(real, "link.pb.gz")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t)
+	cfg.ProfilesDir = real
+	c := newTestServer(t, cfg)
+	for _, p := range []string{filepath.Join(alias, "link.pb.gz"), filepath.Join(alias, "..", filepath.Base(outside), "other.pb.gz")} {
+		text, isErr := c.call("open", map[string]any{"path": p})
+		if !isErr || !strings.Contains(text, "is outside the profiles root "+real) {
+			t.Errorf("open %q: isError=%v %s", p, isErr, text)
+		}
 	}
 }
 
@@ -361,8 +420,32 @@ func TestOversizedResponsesSayHowToShrinkThem(t *testing.T) {
 	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
 	c := newTestServer(t, cfg)
 	text, isErr := c.call("open", map[string]any{"path": "cpu.pb.gz"})
-	if !isErr || !strings.Contains(text, "smaller limit") || !strings.Contains(text, "MaxResponseBytes=64") {
-		t.Errorf("isError=%v %s", isErr, text)
+	if !isErr || !strings.Contains(text, "MaxResponseBytes=64") || !strings.Contains(text, "--limit MaxResponseBytes=") ||
+		!strings.Contains(text, "unresolved_by_module") || strings.Contains(text, "smaller limit") {
+		t.Errorf("open: isError=%v %s", isErr, text)
+	}
+	// A paged tool's advice is to page with a smaller limit.
+	_, err := c.srv.respond("top", shrinkWithLimit, strings.Repeat("x", 100))
+	if err == nil || !strings.Contains(err.Error(), "the top response is 102 bytes, over MaxResponseBytes=64; call again with a smaller limit") {
+		t.Errorf("paged tool: %v", err)
+	}
+}
+
+func TestAPartialLimitsKeepsTheModelDefaults(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits = Limits{MaxMessageBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxOpenHandles: 2}
+	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
+	srv := must(New(cfg))(t)
+	t.Cleanup(func() { _ = srv.Close() })
+	if srv.lim.Model != DefaultLimits().Model || srv.lim.MaxOpenHandles != 2 {
+		t.Errorf("limits = %+v", srv.lim)
+	}
+	if _, err := srv.store.open("cpu.pb.gz", ""); err != nil {
+		t.Errorf("open under a partial Limits: %v", err)
+	}
+	cfg.Limits = Limits{Model: DefaultLimits().Model}
+	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "MaxMessageBytes") {
+		t.Errorf("zero server limits with a set Model: %v", err)
 	}
 }
 

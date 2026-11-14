@@ -38,16 +38,13 @@ type Server struct {
 }
 
 // New opens every root of cfg and builds a server. It refuses a missing or
-// unset ProfilesDir and any root it cannot open. A zero cfg.Limits means
-// DefaultLimits; the limits are copied and never change afterwards.
+// unset ProfilesDir and any root it cannot open. Zero limits take their
+// defaults (see Limits); the limits are copied and never change afterwards.
 func New(cfg Config) (_ *Server, err error) {
 	if cfg.ProfilesDir == "" {
 		return nil, errors.New("perfmcp: Config.ProfilesDir is required: the directory profiles are read from")
 	}
-	lim := cfg.Limits
-	if lim == (Limits{}) {
-		lim = DefaultLimits()
-	}
+	lim := cfg.Limits.withDefaults()
 	if err := lim.validate(); err != nil {
 		return nil, err
 	}
@@ -114,16 +111,27 @@ func (s *Server) tools() []mcpstdio.Tool {
 // readOnly are the annotations of every tool that only reads.
 var readOnly = mcpstdio.Annotations{ReadOnly: true, Idempotent: true}
 
+// Advice for a response over MaxResponseBytes, per kind of tool.
+const (
+	// shrinkWithLimit is for tools that page their rows with limit.
+	shrinkWithLimit = "call again with a smaller limit"
+	// shrinkOpen is for open, whose size is the profile's own: one
+	// unresolved_by_module entry per module with unresolved frames, and the
+	// notes.
+	shrinkOpen = "it is large because of the profile's unresolved_by_module entries and notes; " +
+		"restart perf-agent-mcp with a larger --limit MaxResponseBytes=N to open it"
+)
+
 // respond encodes a tool's result as compact JSON text, refusing one over
-// MaxResponseBytes.
-func (s *Server) respond(tool string, v any) (mcpstdio.Result, error) {
+// MaxResponseBytes with shrink, which says how to get a smaller one.
+func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 	b, err := marshal(v)
 	if err != nil {
 		return mcpstdio.Result{}, fmt.Errorf("internal error encoding the %s response: %v", tool, err)
 	}
 	if len(b) > s.lim.MaxResponseBytes {
-		return mcpstdio.Result{}, fmt.Errorf("the %s response is %d bytes, over MaxResponseBytes=%d; call again with a smaller limit",
-			tool, len(b), s.lim.MaxResponseBytes)
+		return mcpstdio.Result{}, fmt.Errorf("the %s response is %d bytes, over MaxResponseBytes=%d; %s",
+			tool, len(b), s.lim.MaxResponseBytes, shrink)
 	}
 	return mcpstdio.Result{Text: string(b)}, nil
 }

@@ -130,7 +130,7 @@ func (s *Server) handleOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	if s.output != nil {
 		out.Capabilities.Render = renderCapability{Enabled: true, OutputRoot: s.output.Name()}
 	}
-	return s.respond("open", out)
+	return s.respond("open", shrinkOpen, out)
 }
 
 // pcSampling reports whether any sample carries GPU PC sampling labels.

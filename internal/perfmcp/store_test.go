@@ -98,7 +98,15 @@ func TestTheStoreRecordsEveryOpenedInput(t *testing.T) {
 	if len(srv.store.inputs) != 3 {
 		t.Fatalf("inputs = %d, want 3 distinct files (eviction keeps them)", len(srv.store.inputs))
 	}
-	for _, name := range []string{"a.pb.gz", "gpu.pb.gz", "gpu.execlog"} {
+	// A file the server read is an input even when it did not load.
+	writeFixture(t, cfg.ProfilesDir, "junk.pb.gz", []byte("not a profile"))
+	if _, err := srv.store.open("junk.pb.gz", ""); err == nil {
+		t.Fatal("junk loaded")
+	}
+	if len(srv.store.inputs) != 4 {
+		t.Errorf("inputs = %d after a failed load, want 4", len(srv.store.inputs))
+	}
+	for _, name := range []string{"a.pb.gz", "gpu.pb.gz", "gpu.execlog", "junk.pb.gz"} {
 		fi := must(os.Stat(filepath.Join(cfg.ProfilesDir, name)))(t)
 		found := false
 		for _, in := range srv.store.inputs {

@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 )
 
@@ -43,11 +42,13 @@ func (s *Server) rootKind(root *os.Root) string {
 }
 
 // rel turns p into a path relative to root. A relative path is used as is;
-// an absolute one is made relative to the root's directory (or, failing
-// that, to the directory with its symlinks resolved, the form a shell's
-// realpath gives) and refused when it is not inside it. This is only the
-// translation: os.Root enforces the root when the path is opened, so ".."
-// and symlinks that leave the root fail there.
+// an absolute one is made relative to the root's directory and refused
+// when it is not inside it. Either side may reach the directory through a
+// symlinked alias, so the root is also tried with its symlinks resolved and,
+// failing that, p with its parent directory's symlinks resolved (its last
+// element is left alone, so a symlink there is still judged by os.Root).
+// This is only the translation: os.Root enforces the root when the path is
+// opened, so ".." and symlinks that leave the root fail there.
 func (s *Server) rel(root *os.Root, p string) (string, error) {
 	kind := s.rootKind(root)
 	if p == "" {
@@ -60,9 +61,17 @@ func (s *Server) rel(root *os.Root, p string) (string, error) {
 	if real, err := filepath.EvalSymlinks(root.Name()); err == nil && real != root.Name() {
 		dirs = append(dirs, real)
 	}
-	for _, dir := range dirs {
-		if r, err := filepath.Rel(dir, p); err == nil && filepath.IsLocal(r) {
-			return r, nil
+	paths := []string{p}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+		if resolved := filepath.Join(parent, filepath.Base(p)); resolved != p {
+			paths = append(paths, resolved)
+		}
+	}
+	for _, q := range paths {
+		for _, dir := range dirs {
+			if r, err := filepath.Rel(dir, q); err == nil && filepath.IsLocal(r) {
+				return r, nil
+			}
 		}
 	}
 	return "", outsideRoot(kind, root.Name(), p)
@@ -101,11 +110,20 @@ func openError(kind, dir, noun, name string, err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("%s %q not found under the %s root %s; pass a path inside it (relative to it, or absolute)", noun, name, kind, dir)
-	case strings.Contains(err.Error(), "escapes"):
-		// os.Root's refusal of "..", or of a symlink, that leaves the root.
+	case escapesRoot(err):
 		return outsideRoot(kind, dir, name)
 	}
 	return fmt.Errorf("cannot open %s %q under the %s root %s: %w", noun, name, kind, dir, err)
+}
+
+// escapesRoot reports whether err is os.Root's refusal of a path (through
+// "..", or a symlink) that leaves the root. The stdlib does not export that
+// error, so this matches its wording, "path escapes from parent", on the
+// PathError's own error only: the path in the message is the agent's and
+// may itself contain the word.
+func escapesRoot(err error) bool {
+	pe, ok := errors.AsType[*os.PathError](err)
+	return ok && pe.Err != nil && pe.Err.Error() == "path escapes from parent"
 }
 
 func describeType(m fs.FileMode) string {

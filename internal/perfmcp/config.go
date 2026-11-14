@@ -20,7 +20,8 @@ type Config struct {
 	// OutputDir is the root rendered pages are written to; "" disables
 	// rendering.
 	OutputDir string
-	// Limits bound every input and response; they are fixed at New.
+	// Limits bound every input and response; they are fixed at New, which
+	// fills in defaults for a zero Limits or a zero Model.
 	Limits Limits
 	// Version is reported to clients in serverInfo.
 	Version string

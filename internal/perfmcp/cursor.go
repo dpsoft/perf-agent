@@ -43,8 +43,9 @@ func encodeCursor(b string, offsets ...int) string {
 }
 
 // decodeCursor returns the offsets of cursor c, which must carry binding b
-// and offsets no greater than n, written as encodeCursor writes them.
-func decodeCursor(c, b string, n int) ([]int, error) {
+// and exactly want offsets, each no greater than n, written as
+// encodeCursor writes them.
+func decodeCursor(c, b string, n, want int) ([]int, error) {
 	bad := func(why string) error {
 		return fmt.Errorf("cursor %q is not valid here (%s); repeat the query without cursor to start from the first page", c, why)
 	}
@@ -72,6 +73,9 @@ func decodeCursor(c, b string, n int) ([]int, error) {
 			return nil, bad(fmt.Sprintf("offset %d is beyond the %d rows", v, n))
 		}
 		out = append(out, v)
+	}
+	if len(out) != want {
+		return nil, bad(fmt.Sprintf("it holds %d offsets, this query pages with %d", len(out), want))
 	}
 	return out, nil
 }

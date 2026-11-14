@@ -31,27 +31,38 @@ func TestCursorsAreBoundToTheirQuery(t *testing.T) {
 	if c != "c1.20."+b {
 		t.Errorf("cursor = %q", c)
 	}
-	if got, err := decodeCursor(c, b, 30); err != nil || !slices.Equal(got, []int{20}) {
+	if got, err := decodeCursor(c, b, 30, 1); err != nil || !slices.Equal(got, []int{20}) {
 		t.Errorf("decode = %v, %v", got, err)
 	}
 	two := encodeCursor(b, 3, 0)
-	if got, err := decodeCursor(two, b, 5); err != nil || !slices.Equal(got, []int{3, 0}) {
+	if got, err := decodeCursor(two, b, 5, 2); err != nil || !slices.Equal(got, []int{3, 0}) {
 		t.Errorf("decode two = %v, %v", got, err)
 	}
 
-	if _, err := decodeCursor(c, other, 30); err == nil || !strings.Contains(err.Error(), "another query") {
+	if _, err := decodeCursor(c, other, 30, 1); err == nil || !strings.Contains(err.Error(), "another query") {
 		t.Errorf("another binding: %v", err)
 	}
-	if _, err := decodeCursor(c, b, 19); err == nil {
+	if _, err := decodeCursor(c, b, 19, 1); err == nil {
 		t.Error("offset beyond n accepted")
 	}
 	for _, bad := range []string{
 		"", "garbage", "c1.", "c1.20", "c2.20." + b, "c1.-1." + b, "c1.+5." + b, "c1.020." + b,
 		"c1.x." + b, "c1.." + b, "c1.1,." + b, "c1.20." + b + ".x", "c1.99999999999999999999999." + b,
 	} {
-		if _, err := decodeCursor(bad, b, 30); err == nil {
+		if _, err := decodeCursor(bad, b, 30, 1); err == nil {
 			t.Errorf("decodeCursor(%q) accepted", bad)
 		}
+	}
+	// An edited cursor with another number of offsets is refused, so a tool
+	// paging two lists never indexes an offset that is not there.
+	if _, err := decodeCursor(c, b, 30, 2); err == nil || !strings.Contains(err.Error(), "without cursor") {
+		t.Errorf("one offset where two are paged: %v", err)
+	}
+	if _, err := decodeCursor(two, b, 5, 1); err == nil {
+		t.Error("two offsets where one is paged were accepted")
+	}
+	if _, err := decodeCursor(encodeCursor(b, 3, 6), b, 5, 2); err == nil {
+		t.Error("a second offset beyond n was accepted")
 	}
 }
 

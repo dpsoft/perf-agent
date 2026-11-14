@@ -9,6 +9,11 @@ import (
 // Limits bound what a server accepts and answers. A server copies them at
 // New and never changes them, so two servers with different limits can hold
 // the same handle and still judge its evidence differently.
+//
+// New fills in defaults: a zero Limits is DefaultLimits, and a zero Model
+// is profilemodel.DefaultLimits, so a Limits that sets only some of the
+// server's own fields still loads profiles. Any other non-positive server
+// field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -29,6 +34,17 @@ func DefaultLimits() Limits {
 		MaxResponseBytes: 1 << 20,
 		MaxOpenHandles:   8,
 	}
+}
+
+// withDefaults is l with the zero parts New fills in.
+func (l Limits) withDefaults() Limits {
+	if l == (Limits{}) {
+		return DefaultLimits()
+	}
+	if l.Model == (profilemodel.Limits{}) {
+		l.Model = profilemodel.DefaultLimits()
+	}
+	return l
 }
 
 // validate refuses limits a server cannot run with.

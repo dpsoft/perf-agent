@@ -61,7 +61,9 @@ func (m fileFS) Open(name string) (fs.File, error) {
 // open loads name (and execlog, if not "") from the profiles root, both
 // relative to it, and returns its entry. Opening evidence that is already
 // open returns the existing entry. A missing execlog, a load error or a
-// default view that cannot be built leaves the store as it was.
+// default view that cannot be built adds no handle, but every file opened
+// so far is already recorded among the inputs: the server has read it, so a
+// page it writes must not replace it.
 func (s *store) open(name, execlog string) (_ *entry, err error) {
 	pf, pfi, err := openRegular(s.root, rootProfiles, "path", name)
 	if err != nil {
@@ -69,6 +71,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	}
 	files := fileFS{"profile": pf}
 	opened := []os.FileInfo{pfi}
+	s.record(pfi)
 	defer func() {
 		for _, f := range files {
 			_ = f.Close()
@@ -82,6 +85,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 		}
 		files["execlog"], logName = lf, "execlog"
 		opened = append(opened, lfi)
+		s.record(lfi)
 	}
 
 	p, err := profilemodel.LoadFS(files, "profile", logName, s.lim)
@@ -91,7 +95,6 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 		}
 		return nil, fmt.Errorf("cannot open %q: %v; pass a pprof profile written by perf-agent", name, err)
 	}
-	s.record(opened)
 	if e, ok := s.entries[p.Handle]; ok {
 		s.touch(p.Handle)
 		return e, nil
@@ -116,12 +119,10 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	return e, nil
 }
 
-// record adds the files not already among the inputs.
-func (s *store) record(files []os.FileInfo) {
-	for _, fi := range files {
-		if !slices.ContainsFunc(s.inputs, func(in os.FileInfo) bool { return os.SameFile(in, fi) }) {
-			s.inputs = append(s.inputs, fi)
-		}
+// record adds fi to the inputs unless it is already among them.
+func (s *store) record(fi os.FileInfo) {
+	if !slices.ContainsFunc(s.inputs, func(in os.FileInfo) bool { return os.SameFile(in, fi) }) {
+		s.inputs = append(s.inputs, fi)
 	}
 }
 

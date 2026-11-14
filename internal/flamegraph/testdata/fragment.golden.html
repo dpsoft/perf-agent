@@ -1,0 +1,91 @@
+<style>
+
+:root{
+  --fill-dl:0%;
+  --fill-ds:1;
+  --fill-j:0;
+  --hatch-ink:rgb(22 20 18 / .26);
+
+  --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+  --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+
+  --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
+  --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
+  --fill-vendor:   hsl( 50 calc(88% * var(--fill-ds)) calc(69% + var(--fill-dl)));
+  --fill-kernel:   hsl( 28 calc(92% * var(--fill-ds)) calc(70% + var(--fill-dl)));
+  --fill-boundary: hsl(  0                        0%  calc(84% + var(--fill-dl)));
+  --fill-boundary-unattributed: hsl(0             0%  calc(92% + var(--fill-dl)));
+  --fill-gpu-kernel: hsl(128 calc(48% * var(--fill-ds)) calc(67% + var(--fill-dl)));
+  --fill-accel-source: hsl(184 calc(52% * var(--fill-ds)) calc(65% + var(--fill-dl)));
+  --fill-unsym: hsl( 45 calc(20% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-shim:  hsl(215 calc(15% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-root: hsl(30 calc(8% * var(--fill-ds)) calc(81% + var(--fill-dl)));
+
+  --edge-frame:        rgb(255 255 255 / .55);
+  --edge-boundary:     hsl(  0  0% calc(40% + var(--fill-dl)));
+  --edge-unattributed: hsl(  0  0% calc(55% + var(--fill-dl)));
+  --edge-shim:         hsl(215 24% calc(46% + var(--fill-dl)));
+
+  --frame-ink: hsl(30 12% 9%);
+  --fill-match: hsl(300 100% 71%);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}}
+:root[data-theme="dark"]{--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}
+
+.frame{color:var(--frame-ink);background-color:var(--fill-x);background-color:hsl(from var(--fill-x) h s calc(l + var(--fill-j)));box-shadow:inset 0 0 0 .5px var(--edge-frame)}
+[data-domain="root"]{--fill-x:var(--fill-root)}
+[data-domain="app"]{--fill-x:var(--fill-app)}
+[data-domain="system"]{--fill-x:var(--fill-system)}
+[data-domain="kernel"]{--fill-x:var(--fill-kernel)}
+[data-domain="vendor"]{--fill-x:var(--fill-vendor)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
+[data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
+[data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
+[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
+[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
+.frame.inexact{background-image:var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
+
+.frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
+.frame.match{background-color:var(--fill-match)}
+.frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
+.sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
+.j1{--fill-j:1.14}
+.j2{--fill-j:2.29}
+.j3{--fill-j:3.43}
+.j4{--fill-j:4.57}
+.j5{--fill-j:5.71}
+.j6{--fill-j:6.86}
+.j7{--fill-j:8.00}
+.frame{bottom:calc(var(--d)*21px)}
+.inv .frame{bottom:auto;top:calc(var(--d)*21px)}
+.d0{--d:0}.d1{--d:1}.d2{--d:2}
+
+.chart{position:relative}
+.frame{position:absolute;height:17px;padding:0 4px;box-sizing:border-box;border-radius:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:17px}
+</style>
+<div class="canvas">
+<div class="chart" style="height:62px" role="group" aria-label="Flame graph, gpu/nanoseconds" data-total="10" data-unit="nanoseconds">
+<div class="frame d0" style="left:0%;width:100%" role="img" aria-label="all, 10 ns, 100.00% of total" data-domain="root" data-value="10">all</div>
+<div class="frame d1 j4" style="left:0%;width:70%" role="img" aria-label="a, 7 ns, 70.00% of total" data-domain="app" data-value="7">a</div>
+<div class="frame d2" style="left:0%;width:50%" role="img" aria-label="b, 5 ns, 50.00% of total" data-domain="app" data-value="5">b</div>
+<div class="frame d2 j7" style="left:50%;width:20%" role="img" aria-label="c, 2 ns, 20.00% of total" data-domain="app" data-value="2">c</div>
+<div class="frame d1" style="left:70%;width:30%" role="img" aria-label="z, 3 ns, 30.00% of total" data-domain="app" data-value="3">z</div>
+<div class="frame d2 j4" style="left:70%;width:30%" role="img" aria-label="y, 3 ns, 30.00% of total" data-domain="app" data-value="3">y</div>
+</div>
+</div>

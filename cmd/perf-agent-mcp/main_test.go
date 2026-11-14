@@ -12,8 +12,11 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
@@ -380,5 +383,78 @@ func TestSourceGitIsOnByDefault(t *testing.T) {
 	status, reason := sourceStatus(t, "--source-git=false")
 	if status != "source_unverified" || reason != "git probe disabled" {
 		t.Errorf("--source-git=false: status %q reason %q", status, reason)
+	}
+}
+
+// buildServer builds the binary into a temporary directory.
+func buildServer(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "perf-agent-mcp")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// A signal ends the server with status 0 even when the client has stopped
+// reading its output and the server is blocked writing a response.
+func TestSignalEndsAServerBlockedOnOutput(t *testing.T) {
+	bin := buildServer(t)
+	for _, c := range []struct {
+		name    string
+		sig     syscall.Signal
+		blocked bool
+	}{
+		{"SIGTERM blocked", syscall.SIGTERM, true},
+		{"SIGINT blocked", syscall.SIGINT, true},
+		{"SIGTERM drained", syscall.SIGTERM, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			outR, outW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = outR.Close() }()
+			if _, err := unix.FcntlInt(outW.Fd(), unix.F_SETPIPE_SZ, 4096); err != nil {
+				t.Skipf("cannot shrink the pipe: %v", err)
+			}
+			inR, inW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = inW.Close() }()
+			cmd := exec.Command(bin, "--profiles", t.TempDir())
+			cmd.Stdin, cmd.Stdout = inR, outW
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			_ = inR.Close()
+			_ = outW.Close()
+			t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+			r := bufio.NewReader(outR)
+			_, _ = inW.WriteString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}` + "\n")
+			if _, err := r.ReadBytes('\n'); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = inW.WriteString(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}` + "\n")
+			if !c.blocked {
+				go func() { _, _ = io.Copy(io.Discard, r) }()
+			}
+			time.Sleep(500 * time.Millisecond)
+			if err := cmd.Process.Signal(c.sig); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("exit: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the server is still running 3s after the signal")
+			}
+		})
 	}
 }

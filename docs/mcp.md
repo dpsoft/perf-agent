@@ -35,7 +35,7 @@ Every file is opened through an `os.Root`, so `..`, symlinks that leave the root
 
 ## Tools
 
-Integers are decimal strings in every result. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
+Integers are decimal strings in every result, except source line numbers (a row's `line` and each `lines[].n`), which are JSON integers. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
 
 | Tool | Use |
 |---|---|
@@ -85,9 +85,9 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 
 - A claim is `{id, metric, scope, node, module, denominator, unit, value}`. The engine compares `value` with its own fact as decimals at the rounding of that metric; the agent cannot pass or widen a tolerance.
 - Prose, hypotheses and `next_measurement` place figures with `{cN}`, a claim of the same explanation, and frames with `{n:<id>}`. Any other number is shown as unchecked.
-- `unsampled_portion` is a view-level fact: claim it with `"scope": "view"` and no node.
+- A claim's `metric` is a claimable metric name (the guide lists them), not a path in the `facts` JSON: `serialization.true` is `serialization_true`, `quality.serialized.true` is `quality_serialized_true`. Quality metrics take `"scope": "node"` or `"scope": "view"`; `quality_unresolved_by_module` also needs `module`. `unsampled_portion` is view-level only: claim it with `"scope": "view"` and no node.
 - A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning (a sign, an exponent, a decimal point) is rejected as `glued_to_claim`.
-- If anything fails, nothing is written. The result is `rejected`, lists every failure with the engine's value, and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view.
+- If anything fails, nothing is written. The result is `rejected`, lists every failure (with the engine's value when one can be computed; the result is itself bounded by `MaxResponseBytes`), and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view.
 
 ## Source statuses
 

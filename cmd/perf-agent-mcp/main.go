@@ -107,7 +107,28 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: %v\n", err)
 		return 1
 	}
-	serveErr := srv.Serve(ctx, stdin, stdout)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ctx, stdin, stdout) }()
+	var serveErr error
+	select {
+	case serveErr = <-serveDone:
+	case <-ctx.Done():
+		// Cancelling ctx does not interrupt a write: a client that has
+		// stopped reading stdout would keep Serve, and so the process,
+		// alive. Give it a moment to finish, then exit regardless.
+		select {
+		case serveErr = <-serveDone:
+		case <-time.After(shutdownGrace):
+			log.Error("output was blocked: the client is not reading stdout; exiting")
+			closed := make(chan struct{})
+			go func() { _ = srv.Close(); close(closed) }()
+			select {
+			case <-closed:
+			case <-time.After(100 * time.Millisecond):
+			}
+			return 0
+		}
+	}
 	closeErr := srv.Close()
 	if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
 		log.Error("serve", "err", serveErr)
@@ -119,6 +140,10 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 	return 0
 }
+
+// shutdownGrace is how long Serve gets to finish after a signal before the
+// server exits anyway.
+const shutdownGrace = time.Second
 
 // limitFields maps every settable limit name ("MaxRows", "Model.MaxRawBytes")
 // to its field in l.

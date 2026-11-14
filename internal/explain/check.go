@@ -67,6 +67,9 @@ var claimable = func() []string {
 	return ms
 }()
 
+// Metrics returns every metric name a claim can state, sorted.
+func Metrics() []string { return slices.Clone(claimable) }
+
 // Check validates explanations against v and, when nothing fails, returns
 // them with the engine's values in place of the agent's. Per claim the rules
 // run in this order and the first failing one is reported: a well-formed ID

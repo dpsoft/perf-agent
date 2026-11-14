@@ -2,8 +2,12 @@ package perfmcp
 
 import (
 	"encoding/json"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/internal/explain"
 )
 
 func TestGuideIsShortAndStatesTheRules(t *testing.T) {
@@ -73,5 +77,26 @@ func TestInitializeInstructionsPointAtTheGuide(t *testing.T) {
 	}
 	if !strings.Contains(init.Instructions, "perf-agent-guide") || !strings.Contains(init.Instructions, "perf-agent://guide") {
 		t.Errorf("instructions = %q", init.Instructions)
+	}
+}
+
+// The guide's list of claimable metrics is exactly the engine's, so it
+// cannot drift from the checker.
+func TestGuideListsExactlyTheClaimableMetrics(t *testing.T) {
+	_, section, ok := strings.Cut(guideText, "## Claimable metrics")
+	if !ok {
+		t.Fatal("guide has no Claimable metrics section")
+	}
+	var listed []string
+	for _, m := range regexp.MustCompile("`([a-z_]+)`").FindAllStringSubmatch(section, -1) {
+		// Words like `module` and `quality` are not metrics.
+		if strings.Contains(m[1], "_") || slices.Contains([]string{"cumulative", "self"}, m[1]) {
+			listed = append(listed, m[1])
+		}
+	}
+	slices.Sort(listed)
+	listed = slices.Compact(listed)
+	if want := explain.Metrics(); !slices.Equal(listed, want) {
+		t.Errorf("guide lists %v, the checker accepts %v", listed, want)
 	}
 }

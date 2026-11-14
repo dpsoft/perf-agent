@@ -58,10 +58,19 @@ Write each figure as a claim and refer to it from the prose. The engine checks t
 }
 ```
 
-- Metrics are the fact names `facts` returns. `"scope": "view"` with no `node` is for `unsampled_portion` (view-level); every other metric is node-level.
+- A claim's `metric` is one of the names under Claimable metrics below, not a path in the `facts` JSON. Node-level metrics (the default scope) need a `node` (or the explanation's node). Quality metrics take either scope: `"scope": "node"` for the node, `"scope": "view"` with no `node` for the whole view. `unsampled_portion` is view-level only: `"scope": "view"` and no node.
 - Put every number in prose from a claim placeholder `{cN}` (`{c1}`). `{cN}` refers to a claim of the same explanation. Numbers typed freely are marked unchecked on the page.
 - To name a frame use `{n:<id>}`, especially for frame names containing braces; frame names are never parsed for placeholders.
 - For a range write "between {c1} and {c2}". A bare range like "{c1}-{c2}" is glued_to_claim and rejected, as is a sign or exponent next to a placeholder.
-- A rejected call writes nothing. It returns every failure with the engine's value; fix them and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.
+- A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; fix them and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.
 - An existing `out` is never replaced: choose a new name. You cannot set rounding or tolerance.
 - When a tool result is an error it says what to call next.
+
+## Claimable metrics
+
+A metric name is the fact's path in the `facts` JSON with the dots turned into underscores, and the fields of `quality` named quality_ followed by the path.
+
+- Node facts: `cumulative`, `self`, `share_of_total`, `share_of_parent`, `executions_below`, `kernel_names_observed`, `inexact_portion`; `serialization.true|false|unknown|missing` is `serialization_true`, `serialization_false`, `serialization_unknown`, `serialization_missing`.
+- Quality, node or view scope: `quality_join_exact`, `quality_join_heuristic`, `quality_join_unmatched`, `quality_ambiguous`, `quality_graph_refused`, `quality_unsampled_launches`, `quality_unresolved`, `quality_collision_possible`; `quality.serialized.true|false|unknown|missing` is `quality_serialized_true`, `quality_serialized_false`, `quality_serialized_unknown`, `quality_serialized_missing`.
+- `quality_unresolved_by_module` also needs `module`, a key of `quality.unresolved_by_module` (`""` is the no-module key).
+- View only: `unsampled_portion`.

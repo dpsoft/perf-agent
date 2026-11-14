@@ -766,3 +766,16 @@ func TestExplainedPageSaysWhenAttemptHistoryMayBeIncomplete(t *testing.T) {
 	assert.Contains(t, got, "earlier attempt history for this view may be incomplete</span>")
 	assert.NotContains(t, got, "exceeded at render")
 }
+
+func TestExplainedPageSaysHowManyFailuresARecordLeftOut(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{{Attempt: "a1", Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}, Omitted: 8}}
+	got := exPage(t, v, r, opts)
+	sec := got[strings.Index(got, "<h5>Rejected at render"):]
+	sec = sec[:strings.Index(sec, "</section>")]
+	assert.Contains(t, sec, `<span class="ref">a1</span> and 8 more failures</li>`)
+	assert.Contains(t, got, "1 claim rejected at render</span>")
+}

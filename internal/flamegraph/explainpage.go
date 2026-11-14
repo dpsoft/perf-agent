@@ -838,7 +838,8 @@ func promptName(name string) string {
 }
 
 // rejected lists the failures of the rejected attempts and the pills that
-// count them. A failure naming a claim is a claim row, shown once per
+// count them; an attempt whose record left failures out ends in a row
+// saying how many. A failure naming a claim is a claim row, shown once per
 // claim per attempt; a limit failure is a limit row; any other failure is
 // about a reference. Claims are counted per attempt, so a claim refused in
 // two attempts counts twice and the pill says how many attempts.
@@ -879,6 +880,9 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 				row.Kind, row.Label = "reference", referenceLabel(f)
 			}
 			rows = append(rows, row)
+		}
+		if a.Omitted > 0 {
+			rows = append(rows, exRejected{Attempt: a.Attempt, Kind: "more", Label: "and " + plural(a.Omitted, "more failure", "more failures")})
 		}
 		if counted {
 			attempts++

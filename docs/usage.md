@@ -312,11 +312,11 @@ over the same profile model, without drawing the full graph. These flags read
 leaf-first pprof only, never find an executions sidecar on their own, and exit
 2 when combined with `-folded`, `-fuse`, `-stack-order root-first`,
 `-gpu-telemetry` or `-raw-vendor-frames`. `-sample-index` applies to all of
-them. The executions sidecar is the file perf-agent writes with
+them; any negative value chooses automatically, as for `-folded`. The executions sidecar is the file perf-agent writes with
 `--gpu-executions-output`.
 
 ```bash
-# The 20 widest nodes, as JSON lines {"id","path","cum"}
+# The 20 widest nodes, as JSON lines {"id","path","cum"}; -list-nodes 0 prints none
 go run ./cmd/flamegraph -list-nodes 20 profile.pb.gz
 
 # Facts for one node: its ID, or a root-first name path
@@ -338,7 +338,10 @@ exits 1 and lists the candidate IDs on stderr; pass one of them instead.
 JSON next to it with `.json` replacing `.html`; it refuses an `-o` that
 names an input profile or sidecar, or a link to one. Each output file is
 written atomically (the JSON first, then the page); the pair is not, so a
-failure between the two can leave a new JSON beside an old page.
+failure between the two can leave a new JSON beside an old page. The page
+names each side by its file name (hover for the profile's handle), shows
+readable durations and sizes beside the exact values, and its tooltips
+carry each node's base and new IDs for `-facts`.
 
 The diff JSON is compact and its format is unstable: it nests the union as a
 tree as deep as the deepest stack, and a later release replaces that with a

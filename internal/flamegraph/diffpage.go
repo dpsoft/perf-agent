@@ -61,8 +61,9 @@ type diffPageData struct {
 	SampleType, Unit        string
 	BaseTotal, NewTotal     string
 	BaseHandle, NewHandle   string
+	BaseName, NewName       string
 	Empty, OneEmpty         bool
-	Warnings                []string
+	Warnings, Notes         []string
 	Root                    *diffNodeView
 	Rows                    []diffRow
 	RowsTotal               int
@@ -70,6 +71,14 @@ type diffPageData struct {
 	Omitted                 int
 	FullScale               string
 	BaseNotes, NewNotes     []string
+}
+
+// DiffPageOptions name what a diff page shows about its inputs.
+type DiffPageOptions struct {
+	Title string
+	// BaseName and NewName name the sides, typically by input file name;
+	// each side's handle is shown on hover. An empty name shows the handle.
+	BaseName, NewName string
 }
 
 // WriteDiffPage renders d as one self-contained HTML page: an icicle of
@@ -81,23 +90,33 @@ type diffPageData struct {
 // its own view's total, so it stays meaningful when the totals differ; the
 // raw DeltaAbs in the sample unit is always shown beside it. A node whose
 // share is unavailable is grey.
-func WriteDiffPage(w io.Writer, d *profilemodel.Diff, title string) error {
+func WriteDiffPage(w io.Writer, d *profilemodel.Diff, opts DiffPageOptions) error {
 	if d == nil {
 		return errors.New("flamegraph: nil diff")
 	}
 	data := &diffPageData{
-		PageTitle:   title,
+		PageTitle:   opts.Title,
 		LightChrome: lightChrome,
 		DarkChrome:  darkChrome,
 		SampleType:  d.SampleType,
 		Unit:        d.Unit,
-		BaseTotal:   fmt.Sprintf("%d %s", d.BaseTotal, d.Unit),
-		NewTotal:    fmt.Sprintf("%d %s", d.NewTotal, d.Unit),
+		BaseTotal:   withHuman(strconv.FormatInt(d.BaseTotal, 10), d.BaseTotal, d.Unit),
+		NewTotal:    withHuman(strconv.FormatInt(d.NewTotal, 10), d.NewTotal, d.Unit),
 		BaseHandle:  string(d.BaseHandle),
 		NewHandle:   string(d.NewHandle),
-		Warnings:    d.QualityWarnings,
+		BaseName:    cmp.Or(opts.BaseName, string(d.BaseHandle)),
+		NewName:     cmp.Or(opts.NewName, string(d.NewHandle)),
 		BaseNotes:   d.BaseNotes,
 		NewNotes:    d.NewNotes,
+	}
+	// A note that a comparison does not apply to the view type is not a
+	// degradation, so it is not drawn as one.
+	for _, w := range d.QualityWarnings {
+		if w == profilemodel.WarningPerturbationNotGPU {
+			data.Notes = append(data.Notes, w)
+		} else {
+			data.Warnings = append(data.Warnings, w)
+		}
 	}
 	data.Empty = d.Root == nil || (d.BaseTotal == 0 && d.NewTotal == 0) || d.Root.Combined <= 0
 	data.OneEmpty = !data.Empty && (d.BaseTotal == 0 || d.NewTotal == 0)
@@ -213,11 +232,24 @@ func (b *diffBuilder) tooltip(n *profilemodel.DiffNode, share float64, shareOK b
 	if name == "" {
 		name = "(all)"
 	}
-	fmt.Fprintf(&s, "%s\nbase %d %s, new %d %s\nchange %s", name, n.BaseCum, b.unit, n.NewCum, b.unit, signed(n.DeltaAbs, b.unit))
+	fmt.Fprintf(&s, "%s\nbase %s, new %s\nchange %s", name,
+		withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, b.unit),
+		withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, b.unit),
+		signed(n.DeltaAbs, b.unit))
 	if shareOK {
 		fmt.Fprintf(&s, "\nchange in share of own total %+.2f points", share*100)
 	} else {
 		s.WriteString("\nchange in share of own total unavailable")
+	}
+	var ids []string
+	if n.BaseID != "" {
+		ids = append(ids, "base id "+string(n.BaseID))
+	}
+	if n.NewID != "" {
+		ids = append(ids, "new id "+string(n.NewID))
+	}
+	if len(ids) > 0 {
+		fmt.Fprintf(&s, "\n%s", strings.Join(ids, ", "))
 	}
 	fmt.Fprintf(&s, "\npresence %s", n.Presence)
 	if n.Match != "" {
@@ -253,7 +285,58 @@ func (b *diffBuilder) collect(n *profilemodel.DiffNode, path []string, parentOne
 	}
 }
 
-func signed(v int64, unit string) string { return fmt.Sprintf("%+d %s", v, unit) }
+// signed is a change as an exact signed value, with a readable one beside
+// it when the unit has one.
+func signed(v int64, unit string) string { return withHuman(fmt.Sprintf("%+d", v), v, unit) }
+
+// withHuman is exact (v as text) in unit, followed by v in a readable unit
+// when there is one: "2490000000 nanoseconds (2.490 s)". A signed exact
+// value gets a signed readable one.
+func withHuman(exact string, v int64, unit string) string {
+	out := exact + " " + unit
+	h := humanValue(v, unit)
+	if h == "" {
+		return out
+	}
+	if v > 0 && strings.HasPrefix(exact, "+") {
+		h = "+" + h
+	}
+	return out + " (" + h + ")"
+}
+
+// humanValue is v scaled to a readable unit for nanoseconds (as the flame
+// graph shows durations) and bytes (binary multiples), or "" for any other
+// unit. The magnitude is unsigned so math.MinInt64 does not wrap.
+func humanValue(v int64, unit string) string {
+	sign, mag := "", uint64(v)
+	if v < 0 {
+		sign, mag = "-", -uint64(v)
+	}
+	f := float64(mag)
+	switch unit {
+	case "nanoseconds":
+		switch {
+		case mag < 1_000:
+			return fmt.Sprintf("%s%d ns", sign, mag)
+		case mag < 1_000_000:
+			return fmt.Sprintf("%s%.2f µs", sign, f/1e3)
+		case mag < 1_000_000_000:
+			return fmt.Sprintf("%s%.2f ms", sign, f/1e6)
+		}
+		return fmt.Sprintf("%s%.3f s", sign, f/1e9)
+	case "bytes":
+		if mag < 1<<10 {
+			return fmt.Sprintf("%s%d B", sign, mag)
+		}
+		prefixes := []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+		i := 0
+		for f /= 1 << 10; f >= 1<<10 && i < len(prefixes)-1; i++ {
+			f /= 1 << 10
+		}
+		return fmt.Sprintf("%s%.2f %s", sign, f, prefixes[i])
+	}
+	return ""
+}
 
 // percent is part/whole as a CSS percentage; whole is positive.
 func percent(part, whole int64) string {

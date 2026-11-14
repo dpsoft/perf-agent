@@ -229,6 +229,23 @@ func TestListNodes(t *testing.T) {
 	}
 }
 
+// -list-nodes takes a count; 0 lists none, as head -n 0 does.
+func TestListNodesZeroPrintsNothing(t *testing.T) {
+	code, out, errOut := exec("-list-nodes", "0", basicProfile(t))
+	if code != 0 || out != "" || errOut != "" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want 0 and nothing", code, out, errOut)
+	}
+}
+
+// Any negative -sample-index chooses automatically, as -folded does.
+func TestModelNegativeSampleIndexIsAutomatic(t *testing.T) {
+	path := basicProfile(t)
+	_, want, _ := exec("-list-nodes", "1", path)
+	if code, got, e := exec("-sample-index", "-7", "-list-nodes", "1", path); code != 0 || got != want {
+		t.Fatalf("exit %d, stdout %q (stderr %q), want %q", code, got, e, want)
+	}
+}
+
 func TestDiffWritesPageAndJSON(t *testing.T) {
 	dir := t.TempDir()
 	base := writeProfile(t, dir, "base.pb.gz", sample{[]string{"main", "work"}, 100}, sample{[]string{"main", "io"}, 20})
@@ -241,19 +258,25 @@ func TestDiffWritesPageAndJSON(t *testing.T) {
 	if err != nil || !strings.Contains(string(page), "<html") {
 		t.Fatalf("page missing or not HTML: %v", err)
 	}
+	for _, name := range []string{">base.pb.gz</span>", ">new.pb.gz</span>"} {
+		if !strings.Contains(string(page), name) {
+			t.Errorf("page does not name a side %s", name)
+		}
+	}
 	raw, err := os.ReadFile(newer + ".diff.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var d struct {
-		BaseTotal int64 `json:"base_total"`
-		NewTotal  int64 `json:"new_total"`
+		View      string `json:"view"`
+		BaseTotal int64  `json:"base_total"`
+		NewTotal  int64  `json:"new_total"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
 		t.Fatal(err)
 	}
-	if d.BaseTotal != 120 || d.NewTotal != 160 {
-		t.Errorf("totals = %d/%d, want 120/160", d.BaseTotal, d.NewTotal)
+	if d.BaseTotal != 120 || d.NewTotal != 160 || d.View != "cpu/nanoseconds#0" {
+		t.Errorf("totals = %d/%d view %q, want 120/160 cpu/nanoseconds#0", d.BaseTotal, d.NewTotal, d.View)
 	}
 }
 

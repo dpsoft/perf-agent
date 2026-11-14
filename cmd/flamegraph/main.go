@@ -64,7 +64,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				"repeat -in once per profile")
 		execlogPath = fs.String("execlog", "", "executions sidecar for the profile (never found implicitly); with -facts, -list-nodes or -diff")
 		factsNode   = fs.String("facts", "", "print the path facts of one node as JSON; NODE is a node ID or a root-first name path a;b;c")
-		listNodes   = fs.Int("list-nodes", 0, "print the N widest nodes as JSON lines {id, path, cum}")
+		listNodes   = fs.Int("list-nodes", 0, "print the N widest nodes as JSON lines {id, path, cum}; 0 prints none")
 		diffBase    = fs.String("diff", "", "compare the profile argument against this BASE profile; writes a page and the diff JSON")
 		execlogBase = fs.String("execlog-base", "", "executions sidecar for the -diff BASE profile")
 		inputs      fuseInputs

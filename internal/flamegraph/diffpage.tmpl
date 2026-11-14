@@ -34,8 +34,9 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
 </head>
 <body>
 <h1>{{.PageTitle}}</h1>
-<p class="meta">base {{.BaseHandle}}: {{.BaseTotal}} &middot; new {{.NewHandle}}: {{.NewTotal}}</p>
+<p class="meta">base <span title="{{.BaseHandle}}">{{.BaseName}}</span>: {{.BaseTotal}} &middot; new <span title="{{.NewHandle}}">{{.NewName}}</span>: {{.NewTotal}}</p>
 {{range .Warnings}}<div class="warn">{{.}}</div>
+{{end}}{{range .Notes}}<p class="meta">{{.}}</p>
 {{end}}{{range .BaseNotes}}<div class="warn">base: {{.}}</div>
 {{end}}{{range .NewNotes}}<div class="warn">new: {{.}}</div>
 {{end}}
@@ -47,7 +48,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
 <span class="kv"><span class="sw" style="background:var(--grey)"></span> share unavailable or unchanged</span>
 <span class="kv"><span class="sw" style="background-image:repeating-linear-gradient(45deg,rgb(0 0 0/.35) 0 2px,transparent 2px 6px)"></span> only in base</span>
 <span class="kv"><span class="sw" style="outline:2px solid var(--ink);outline-offset:-2px"></span> only in new</span>
-<span class="kv"><span class="sw" style="border:2px dotted var(--accent)"></span> not comparable (! marker, reason on hover)</span>
+<span class="kv"><span class="sw" style="box-shadow:inset 0 0 0 2px var(--accent)"></span> not comparable (! marker, reason on hover)</span>
 <span class="kv"><span class="sw" style="outline:2px dashed var(--accent);outline-offset:-2px"></span> ambiguous match</span>
 </div>
 <p class="meta">Width is base plus new {{.Unit}} of a node over the root's. Colour is the change in the node's share of its own view's total; hover a node for the raw change in {{.Unit}}.</p>

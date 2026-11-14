@@ -252,7 +252,8 @@ func runDiff(stdout, stderr io.Writer, a modelArgs, newView *profilemodel.View) 
 		title = filepath.Base(a.in)
 	}
 	var html bytes.Buffer
-	if err := flamegraph.WriteDiffPage(&html, d, title); err != nil {
+	opts := flamegraph.DiffPageOptions{Title: title, BaseName: filepath.Base(a.diffBase), NewName: filepath.Base(a.in)}
+	if err := flamegraph.WriteDiffPage(&html, d, opts); err != nil {
 		return failf(stderr, "diff page: %v", err)
 	}
 	// Compact: the union is a tree as deep as the deepest stack, and

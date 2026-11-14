@@ -344,9 +344,11 @@ names each side by its file name (hover for the profile's handle), shows
 readable durations and sizes beside the exact values, and its tooltips
 carry each node's base and new IDs for `-facts`.
 
-The diff JSON is compact and its format is unstable: it nests the union as a
-tree as deep as the deepest stack, and a later release replaces that with a
-flat node list carrying parent IDs. `per_unit` states once whether
+The diff JSON is compact and its format is unstable. The union is a flat
+`nodes` list in pre-order, so a node follows its parent and the JSON is no
+deeper for a deep stack. Each node has an `id` (`<base node id>/<new node id>`,
+`-` for a side the node is absent from), a `parent` (the parent's `id`,
+absent on the root) and a `depth`. `per_unit` states once whether
 per-unit-of-work deltas are available, and why not; nodes carry
 `delta_per_unit` only when they are.
 

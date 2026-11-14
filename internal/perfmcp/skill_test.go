@@ -19,6 +19,7 @@ var skillArgs = []string{
 	"next_cursor", "cursor", "attempt", "out", "ok", "zero", "unavailable",
 	"denominator", "unit", "value", "metric", "scope", "node", "facts",
 	"view_total", "source_unverified", "unsampled_portion", "base_handle", "base_view", "new_handle", "new_view",
+	"view_scope",
 }
 
 // explainCodes reads the failure codes declared in internal/explain.
@@ -92,6 +93,13 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	for _, name := range []string{guidePrompts()[0].Name, guideResources()[0].URI} {
 		if !strings.Contains(skill, name) {
 			t.Errorf("the skill does not name the guide as %q", name)
+		}
+	}
+
+	// The rules agents most often get wrong are stated as the guide states them.
+	for _, rule := range []string{"Only node facts are claimable", "Never just copy the engine's value", "`facts` under `view_scope`"} {
+		if !strings.Contains(skill, rule) {
+			t.Errorf("the skill does not say %q", rule)
 		}
 	}
 

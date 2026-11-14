@@ -480,3 +480,11 @@ func TestToolsListOpen(t *testing.T) {
 		t.Errorf("schema = %v", tool.InputSchema)
 	}
 }
+
+func TestNewRefusesAZeroTitleLimit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits.Explain.MaxTitleBytes = 0
+	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "Explain.MaxTitleBytes") {
+		t.Errorf("New = %v, want a refusal naming Explain.MaxTitleBytes", err)
+	}
+}

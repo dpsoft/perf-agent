@@ -20,7 +20,7 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 ## Workflow
 
 1. `open` the profile (`path`, and `execlog` for GPU). Keep the `handle`, pick a `view`, read the `notes`.
-2. `top` with `rows: "functions"` for the shape, `rows: "nodes"` for node IDs.
+2. `top` with `rows: "functions"` for the shape, `rows: "nodes"` for node IDs. Only node facts are claimable (`top` with `rows: "nodes"`, `path`, `facts`); function aggregates (`top` with `rows: "functions"`, `sandwich`) are not.
 3. Drill into a node: `path` (its stack), `facts` (every fact), `sandwich` (callers and callees of a function), `gpu_kernels_for` (kernels under a launch node), `source` (source lines, when roots are configured).
 4. Two profiles: `open` both, then `diff`.
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
@@ -43,11 +43,12 @@ Every call names its `handle` and `view`; nothing is "current". The exceptions: 
 
 | Failure | Fix |
 |---|---|
-| `value_mismatch` | Copy the engine's value from the failure into the claim; do not recompute it. |
-| `glued_to_claim` | Write a range as "between {c1} and {c2}". No sign, exponent or dash next to a placeholder. |
+| `value_mismatch` | Re-check that the claim's node and metric are what the sentence says; rewrite the sentence or the claim. Never just copy the engine's value into the claim. |
+| `glued_to_claim` | Write a range as "between {c1} and {c2}". No sign, exponent, dash, `%` or letter next to a placeholder: the claim shows its own unit. |
+| `unplaced_claim` | Every claim needs its `{cN}` in the explanation's text; place it or drop the claim. |
 | `unknown_metric` | The `metric` is a claimable-metric name, not a path in the `facts` JSON. Use `share_of_total`, `cumulative`, `quality_join_exact`, `serialization_true` and the other names the guide lists. |
 | `wrong_scope` | `unsampled_portion` is a view-level fact: `"scope": "view"` and no node. Quality metrics take `"scope": "node"` or `"scope": "view"`. |
-| `wrong_denominator` | A node claim copies the denominator and unit of the node's fact in `facts`; a view-scope quality claim uses the view quality from `open` or the engine value in the failure. |
+| `wrong_denominator` | A node claim copies the denominator and unit of the node's fact in `facts`; a view-scope quality claim copies them from the view's quality in `facts` under `view_scope`. |
 | `unavailable_fact` | The engine has no value for it. Say the figure is unavailable; do not claim it or write it as 0. |
 | `unresolved_node_ref` | Name a frame with `{n:<id>}` using an ID from `top` or `path`, never the frame's text. |
 | `unknown_node` | The ID must exist in the view you passed; take it from `top` or `path` on that view. |

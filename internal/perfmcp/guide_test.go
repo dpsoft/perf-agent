@@ -24,6 +24,11 @@ func TestGuideIsShortAndStatesTheRules(t *testing.T) {
 		"{n:<id>}",
 		"gpu_pc",
 		"omitted_weight",
+		"Only node facts are claimable",
+		"`sandwich`) sum a function",
+		"`unplaced_claim`",
+		"`Explain.MaxTitleBytes`",
+		"check that `profile_digest` matches",
 	} {
 		if !strings.Contains(guideText, want) {
 			t.Errorf("guide does not contain %q", want)

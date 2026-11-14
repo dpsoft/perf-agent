@@ -164,6 +164,7 @@ func (l Limits) validate() error {
 		{"Explain.MaxHypotheses", l.Explain.MaxHypotheses},
 		{"Explain.MaxHypothesisBytes", l.Explain.MaxHypothesisBytes},
 		{"Explain.MaxNextBytes", l.Explain.MaxNextBytes},
+		{"Explain.MaxTitleBytes", l.Explain.MaxTitleBytes},
 	} {
 		if f.v <= 0 {
 			return fmt.Errorf("perfmcp: limit %s must be positive, got %d", f.name, f.v)

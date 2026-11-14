@@ -31,11 +31,15 @@ Exit status: 0 at end of input or on SIGINT/SIGTERM, 1 on a runtime error, 2 on 
 
 ### Roots
 
-Every file is opened through an `os.Root`, so `..`, symlinks that leave the root and races cannot escape it. An agent may pass a path relative to a root or an absolute path inside it; anything else is refused and the error names the root. Profiles and sources are only read. The output root receives pages (`.html`), published with a no-replace hard link: a name that exists is refused, so the agent picks a new one. Using the same directory for `--profiles` and `--output` works, but a page can never be written over an opened profile.
+Every file is opened through an `os.Root`, so `..`, symlinks that leave the root and races cannot escape it. An agent may pass a path relative to a root or an absolute path inside it (under the root as given or under its resolved real path); anything else is refused by its text alone, without looking anything up, and the error names the root. Profiles and sources are only read. The output root receives pages (`.html`), published with a no-replace hard link: a name that exists is refused, so the agent picks a new one. Using the same directory for `--profiles` and `--output` works, but a page can never be written over an opened profile.
 
 ## Tools
 
-Integers are decimal strings in every result, except source line numbers (a row's `line` and each `lines[].n`), which are JSON integers. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
+Integers are decimal strings in every result, a failure's `explanation` index included, except source line numbers (a row's `line` and each `lines[].n`), which are JSON integers. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
+
+Every result about a GPU view carries the view's sampling `notes`, `render_flamegraph` results included. A result about a CPU view has no `notes` key (nor `diff`'s `base_notes` and `new_notes`), except `open`, whose `notes` is always present.
+
+Arguments match by exact name; an unknown argument, a name given twice or a differently cased name is refused. A tool error is a result with `isError: true` that says what to call next; it repeats at most a short prefix of any argument and is itself bounded by `MaxResponseBytes` (at least 1 KiB).
 
 | Tool | Use |
 |---|---|
@@ -44,7 +48,7 @@ Integers are decimal strings in every result, except source line numbers (a row'
 | `path` | The root-first frames of one node, paged. |
 | `sandwich` | Callers and callees of one function. |
 | `gpu_kernels_for` | The kernels under a GPU launch node. |
-| `facts` | Every fact of one node, plus view-level values under `view_scope`. |
+| `facts` | Every fact of one node, plus view-level values under `view_scope`: the unsampled portion and the view's quality (`open` gives the default view's only). |
 | `diff` | Compare two opened profiles of the same view. |
 | `source` | Source lines for a node and how well they are tied to the profiled build. |
 | `render_flamegraph` | Check explanations and write an explained flame graph page. |
@@ -64,7 +68,7 @@ source             {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "
 
 `render_flamegraph` has its own example under Explanations. `execlog`, `work_base`, `work_new` and `context` are optional; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
 
-Lists carry `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (the sum of the omitted rows' own values, which overlap, so never a remaining share) and `next_cursor`; pass the cursor back with the same arguments.
+Lists carry `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (the sum of the omitted rows' own values, which overlap, so never a remaining share), `omitted_weight_basis` (which value was summed: `cum`, `self`, `abs_delta` or `value`) and `next_cursor`; pass the cursor back with the same arguments.
 
 The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent://guide` resource (`text/markdown`), and the initialize `instructions` point to it.
 
@@ -84,9 +88,12 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 ```
 
 - A claim is `{id, metric, scope, node, module, denominator, unit, value}`. The engine compares `value` with its own fact as decimals at the rounding of that metric; the agent cannot pass or widen a tolerance.
-- Prose, hypotheses and `next_measurement` place figures with `{cN}`, a claim of the same explanation, and frames with `{n:<id>}`. Any other number is shown as unchecked.
+- Prose, hypotheses and `next_measurement` place figures with `{cN}`, a claim of the same explanation, and frames with `{n:<id>}`. Any other number is shown as unchecked. Every claim must be placed by its `{cN}`; a claim placed nowhere is rejected as `unplaced_claim`, so the page's checked count is the figures it shows.
+- Only node facts are claimable: what `top` with `rows: "nodes"`, `path` and `facts` give for a node. Function aggregates (`top` with `rows: "functions"`, `sandwich`) are not.
 - A claim's `metric` is a claimable metric name (the guide lists them), not a path in the `facts` JSON: `serialization.true` is `serialization_true`, `quality.serialized.true` is `quality_serialized_true`. Quality metrics take `"scope": "node"` or `"scope": "view"`; `quality_unresolved_by_module` also needs `module`. `unsampled_portion` is view-level only: claim it with `"scope": "view"` and no node.
-- A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning (a sign, an exponent, a decimal point) is rejected as `glued_to_claim`.
+- A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning (a sign, an exponent, a decimal point, or a `%` or letter after it: the claim shows its own unit) is rejected as `glued_to_claim`.
+- `title` is free text of at most `Explain.MaxTitleBytes` bytes with no placeholders; a longer one or one with a placeholder is refused before any attempt is recorded. Numbers in it are marked unchecked in the page's heading and counted in `unchecked_numbers`.
+- The page's follow-up prompts name the profile's path relative to the profiles root and its `profile_digest`: whoever follows one opens that path and checks the digest matches.
 - If anything fails, nothing is written. The result is `rejected`, lists every failure (with the engine's value when one can be computed; the result is itself bounded by `MaxResponseBytes`), and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view.
 
 ## Agent skill
@@ -142,6 +149,7 @@ Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must 
 | `Explain.MaxHypotheses` | 8 |
 | `Explain.MaxHypothesisBytes` | 2048 |
 | `Explain.MaxNextBytes` | 2048 |
+| `Explain.MaxTitleBytes` (the page title) | 200 |
 | `MaxPageBytes` | 33554432 (32 MiB) |
 | `MaxPageNodes` | 20000 |
 | `MaxAttemptsPerView` | 20 |

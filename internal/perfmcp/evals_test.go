@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -110,18 +111,11 @@ func TestEvalPages(t *testing.T) {
 			}
 			var claims []string
 			for _, m := range evalClaimRE.FindAllStringSubmatch(page, -1) {
-				claims = append(claims, html.UnescapeString(m[1]))
+				claims = append(claims, strings.TrimSpace(html.UnescapeString(m[1])))
 			}
 			for _, want := range q.Expect.CheckedValues {
-				found := false
-				for _, c := range claims {
-					if strings.Contains(c, want) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("no claim contains %q; claims = %q", want, claims)
+				if !slices.Contains(claims, want) {
+					t.Errorf("no claim is exactly %q; claims = %q", want, claims)
 				}
 			}
 			// Static markup and scripts carry words of their own, so the

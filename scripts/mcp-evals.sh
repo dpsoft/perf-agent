@@ -24,7 +24,17 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+failed=0
+# The scratch directory holds the rendered pages and the agent's answers, so
+# it is kept when anything failed.
+cleanup() {
+    if [ "$failed" -eq 0 ]; then
+        rm -rf -- "$work"
+    else
+        echo "mcp-evals: kept $work (pages in out/, agent answers in <id>.answer)" >&2
+    fi
+}
+trap cleanup EXIT
 mkdir -p -- "$work/bin" "$work/profiles" "$work/out"
 
 # perf-agent-mcp links no blazesym, so no cgo environment is needed.
@@ -37,19 +47,20 @@ jq -n --arg bin "$work/bin/perf-agent-mcp" --arg profiles "$work/profiles" --arg
     '{mcpServers: {"perf-agent": {command: $bin, args: ["--profiles", $profiles, "--output", $out]}}}' \
     >"$work/mcp.json"
 
-failed=0
 questions="$root/internal/perfmcp/evals/questions.json"
 while IFS=$'\t' read -r id prompt; do
     echo "== $id" >&2
-    # The agent runs from the output directory, so the relative page path in
-    # the prompt is also the name it passes to render_flamegraph.
-    if ! (cd "$work/out" && claude -p "$prompt Render the explanation to $id.html." \
+    # stdin is closed so claude cannot swallow the rest of the question list.
+    if ! claude -p "$prompt Render the explanation to $id.html." \
         --mcp-config "$work/mcp.json" --strict-mcp-config \
-        --allowedTools 'mcp__perf-agent__*' >"$work/$id.answer"); then
-        echo "mcp-evals: claude failed on $id" >&2
+        --allowedTools 'mcp__perf-agent__*' </dev/null >"$work/$id.answer"; then
+        echo "mcp-evals: claude failed on $id; answer in $work/$id.answer" >&2
         failed=1
     fi
 done < <(jq -r '.[] | [.id, .prompt] | @tsv' "$questions")
 
 go test ./internal/perfmcp/ -run '^TestEvalPages$' -count=1 -v || failed=1
+if [ "$failed" -ne 0 ]; then
+    echo "mcp-evals: FAILED; answers are $work/*.answer" >&2
+fi
 exit "$failed"

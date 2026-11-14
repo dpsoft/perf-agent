@@ -70,7 +70,7 @@ const UnknownFrame = "[unknown]"
 // Options configures Fold.
 type Options struct {
 	// SampleIndex selects which of Profile.SampleType to fold. Negative
-	// means "choose automatically" — see chooseSampleIndex.
+	// means "choose automatically" — see ChooseSampleIndex.
 	SampleIndex int
 
 	// StackOrder is how the profile stores Sample.Location. Defaults to
@@ -272,7 +272,7 @@ func Fold(p *profile.Profile, opts Options) (*Result, error) {
 
 	idx := opts.SampleIndex
 	if idx < 0 {
-		idx = chooseSampleIndex(p)
+		idx = ChooseSampleIndex(p)
 	}
 	if idx >= len(p.SampleType) {
 		return nil, fmt.Errorf("foldedstacks: sample index %d out of range (profile has %d sample types)", idx, len(p.SampleType))
@@ -643,15 +643,24 @@ func gpuSamplingWarnings(res *Result) []string {
 			periodSamples = l.Count
 		}
 	}
-	if res.UnsampledLaunchTotal == 0 && period == "" {
+	return SamplingNotes(res.UnsampledLaunchTotal, res.Total, period, periodSamples)
+}
+
+// SamplingNotes renders the launch-sampling explanation for a profile with
+// the given unsampled-launch value, total, sampling period label value and
+// count of samples carrying that label. It returns nil when there is neither
+// unsampled time nor a period, so callers outside Fold state exactly the
+// same text as the folded view.
+func SamplingNotes(unsampled, total int64, period string, periodSamples int) []string {
+	if unsampled == 0 && period == "" {
 		return nil
 	}
 
 	var w []string
-	if res.UnsampledLaunchTotal > 0 {
+	if unsampled > 0 {
 		w = append(w, fmt.Sprintf(
 			"%.1f%% of the total sits under %s: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.",
-			pct(res.UnsampledLaunchTotal, res.Total), UnsampledLaunchFrame))
+			pct(unsampled, total), UnsampledLaunchFrame))
 	}
 	if period != "" {
 		w = append(w, fmt.Sprintf(
@@ -668,7 +677,7 @@ func pct(part, whole int64) float64 {
 	return float64(part) / float64(whole) * 100
 }
 
-// chooseSampleIndex picks the value axis to fold.
+// ChooseSampleIndex picks the value axis to fold.
 //
 // The rule, in order: honour Profile.DefaultSampleType when it names a real
 // type; otherwise take the LAST sample type, which is what google/pprof's
@@ -677,7 +686,7 @@ func pct(part, whole int64) float64 {
 // bytes). Every profiling mode perf-agent ships today — cpu, offcpu, gpu —
 // declares exactly one type, so this only matters for the memory builder
 // and for foreign profiles.
-func chooseSampleIndex(p *profile.Profile) int {
+func ChooseSampleIndex(p *profile.Profile) int {
 	if p.DefaultSampleType != "" {
 		for i, st := range p.SampleType {
 			if st.Type == p.DefaultSampleType {

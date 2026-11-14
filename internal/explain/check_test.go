@@ -59,8 +59,22 @@ func checkWith(t *testing.T, v *profilemodel.View, js string, lim Limits) (Resul
 	return Check(v, exps, lim), notices
 }
 
-// one is the JSON of one explanation of node with the given claims.
+// one is the JSON of one explanation of node with the given claims. An
+// empty prose places every claim with a well-formed id ("{c1} {c2}"), so
+// a test about one claim sees only that claim's failures.
 func one(node profilemodel.NodeID, prose string, claims ...string) string {
+	if prose == "" {
+		var ids []string
+		for _, c := range claims {
+			var cl struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal([]byte(c), &cl) == nil && validClaimID(cl.ID) && !slices.Contains(ids, "{"+cl.ID+"}") {
+				ids = append(ids, "{"+cl.ID+"}")
+			}
+		}
+		prose = strings.Join(ids, " ")
+	}
 	return fmt.Sprintf(`[{"node": %q, "claims": [%s], "prose": %q}]`, node, strings.Join(claims, ", "), prose)
 }
 
@@ -246,16 +260,16 @@ func TestDuplicateIDsAndUnresolvedRefsAreRejected(t *testing.T) {
 		t.Errorf("failure = %+v", f)
 	}
 	// Across explanations too.
-	r, _ = check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s]}, {"node": %q, "claims": [%s]}]`, b, claim, b, claim))
+	r, _ = check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s], "prose": "{c1}"}, {"node": %q, "claims": [%s]}]`, b, claim, b, claim))
 	if f := onlyFailure(t, r, CodeDuplicateClaimID); f.Explanation != 1 {
 		t.Errorf("failure = %+v", f)
 	}
 
-	r, _ = check(t, v, one(b, "see {c9}", claim))
+	r, _ = check(t, v, one(b, "see {c9} and {c1}", claim))
 	if f := onlyFailure(t, r, CodeUnresolvedClaimRef); f.Ref != "c9" {
 		t.Errorf("failure = %+v", f)
 	}
-	r, _ = check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s], "hypotheses": ["{n:0000000000000000}"]}]`, b, claim))
+	r, _ = check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s], "prose": "{c1}", "hypotheses": ["{n:0000000000000000}"]}]`, b, claim))
 	if f := onlyFailure(t, r, CodeUnresolvedNodeRef); f.Ref != "0000000000000000" {
 		t.Errorf("failure = %+v", f)
 	}
@@ -277,7 +291,7 @@ func TestDuplicateIDsAndUnresolvedRefsAreRejected(t *testing.T) {
 		codes = append(codes, f.Code)
 	}
 	want := []Code{CodeUnknownNode, CodeUnknownNode, CodeDuplicateClaimID, CodeBadClaimID,
-		CodeUnresolvedClaimRef, CodeUnresolvedNodeRef, CodeUnresolvedClaimRef, CodeUnresolvedClaimRef}
+		CodeUnresolvedClaimRef, CodeUnresolvedNodeRef, CodeUnresolvedClaimRef, CodeUnresolvedClaimRef, CodeUnplacedClaim}
 	if r.OK || !slices.Equal(codes, want) {
 		t.Errorf("codes = %v, want %v", codes, want)
 	}
@@ -494,7 +508,7 @@ func TestLimitsAreEnforced(t *testing.T) {
 		{"MaxProseBytes", func(l *Limits) { l.MaxProseBytes = 8 }, one(b, "nine byte")},
 		{"MaxExplanations", func(l *Limits) { l.MaxExplanations = 1 }, fmt.Sprintf(`[{"node": %q}, {"node": %q}]`, b, b)},
 		{"MaxClaimsPerExplanation", func(l *Limits) { l.MaxClaimsPerExplanation = 1 }, one(b, "", claim("c1"), claim("c2"))},
-		{"MaxClaimsTotal", func(l *Limits) { l.MaxClaimsTotal = 2 }, fmt.Sprintf(`[{"node": %q, "claims": [%s, %s]}, {"node": %q, "claims": [%s]}]`, b, claim("c1"), claim("c2"), b, claim("c3"))},
+		{"MaxClaimsTotal", func(l *Limits) { l.MaxClaimsTotal = 2 }, fmt.Sprintf(`[{"node": %q, "claims": [%s, %s], "prose": "{c1} {c2}"}, {"node": %q, "claims": [%s], "prose": "{c3}"}]`, b, claim("c1"), claim("c2"), b, claim("c3"))},
 		{"MaxHypotheses", func(l *Limits) { l.MaxHypotheses = 1 }, fmt.Sprintf(`[{"node": %q, "hypotheses": ["a", "b"]}]`, b)},
 		{"MaxHypothesisBytes", func(l *Limits) { l.MaxHypothesisBytes = 3 }, fmt.Sprintf(`[{"node": %q, "hypotheses": ["abc", "abcd"]}]`, b)},
 		{"MaxNextBytes", func(l *Limits) { l.MaxNextBytes = 3 }, fmt.Sprintf(`[{"node": %q, "next_measurement": "abcd"}]`, b)},
@@ -514,7 +528,7 @@ func TestLimitsAreEnforced(t *testing.T) {
 
 func TestDefaultLimits(t *testing.T) {
 	want := Limits{MaxExplanations: 64, MaxClaimsPerExplanation: 32, MaxClaimsTotal: 512, MaxProseBytes: 8192,
-		MaxHypotheses: 8, MaxHypothesisBytes: 2048, MaxNextBytes: 2048}
+		MaxHypotheses: 8, MaxHypothesisBytes: 2048, MaxNextBytes: 2048, MaxTitleBytes: 200}
 	if got := DefaultLimits(); got != want {
 		t.Errorf("DefaultLimits() = %+v", got)
 	}
@@ -541,7 +555,7 @@ func TestResultJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf(`{"ok":false,"failures":[{"explanation":0,"claim":"c1","code":"value_mismatch","message":"share_of_total is 0.411 at the engine's rounding (0.001 ratio); 0.62 is 0.620 at that rounding","agent":"0.62","engine":{"metric":"share_of_total","scope":"node","node":"%s","denominator":"view_total","unit":"ratio","value":"0.411","rounding":"0.001 ratio","status":"ok"}}],"figures":1,"references":0}`, b)
+	want := fmt.Sprintf(`{"ok":false,"failures":[{"explanation":"0","claim":"c1","code":"value_mismatch","message":"share_of_total is 0.411 at the engine's rounding (0.001 ratio); 0.62 is 0.620 at that rounding","agent":"0.62","engine":{"metric":"share_of_total","scope":"node","node":"%s","denominator":"view_total","unit":"ratio","value":"0.411","rounding":"0.001 ratio","status":"ok"}}],"figures":"1","references":"0"}`, b)
 	if string(raw) != want {
 		t.Errorf("JSON\n got %s\nwant %s", raw, want)
 	}
@@ -550,13 +564,13 @@ func TestResultJSON(t *testing.T) {
 func TestTextGluedToAClaimIsRefused(t *testing.T) {
 	v, b := cpuBasic(t)
 	claim := `{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": 0.411}`
-	for _, prose := range []string{"-{c1}", "+{c1}", "\u2212{c1}", "{c1}e3", "{c1}E3", "{c1}.5", "{c1},5", "{c1}5", "5{c1}", "1.{c1}"} {
+	for _, prose := range []string{"-{c1}", "+{c1}", "\u2212{c1}", "{c1}e3", "{c1}E3", "{c1}.5", "{c1},5", "{c1}5", "5{c1}", "1.{c1}", "{c1}%", "{c1}e", "x{c1}y"} {
 		r, _ := check(t, v, one(b, prose, claim))
 		if f := onlyFailure(t, r, CodeGluedToClaim); f.Ref != "c1" || !strings.Contains(f.Message, "{c1}") {
 			t.Errorf("%q: failure = %+v", prose, f)
 		}
 	}
-	for _, prose := range []string{"{c1}%", "{c1} ms", "({c1})", "was {c1}.", "{c1}, then", "{c1}e", "{c1}.x", "a-b {c1}", "x{c1}y"} {
+	for _, prose := range []string{"{c1} %", "{c1} ms", "({c1})", "was {c1}.", "{c1}, then", "{c1}.x", "a-b {c1}", "x{c1} y"} {
 		r, _ := check(t, v, one(b, prose, claim))
 		if !r.OK {
 			t.Errorf("%q: %+v", prose, r.Failures)
@@ -661,9 +675,9 @@ func TestGluedDotsSignedExponentsAndAdjacentPlaceholdersAreRefused(t *testing.T)
 	}
 	for _, prose := range []string{
 		".{c1}", "x.{c1}", "{c1}{c1}", "{c1}{c2}", "{c1}{n:" + string(conv) + "}", "{n:" + string(conv) + "}{c1}",
-		"{c1}e+3", "{c1}E-3", "{c1}e−3",
+		"{c1}e+3", "{c1}E-3", "{c1}e−3", "{c1}e+", "{c1}E-x",
 	} {
-		r, _ := check(t, v, one(conv, prose, claims...))
+		r, _ := check(t, v, one(conv, prose+" and {c2}", claims...))
 		if r.OK || len(r.Failures) == 0 {
 			t.Errorf("%q accepted", prose)
 			continue
@@ -675,12 +689,101 @@ func TestGluedDotsSignedExponentsAndAdjacentPlaceholdersAreRefused(t *testing.T)
 		}
 	}
 	for _, prose := range []string{
-		"{c1}, {c2}", "({c1})", "{c1}%", "{c1} ms", "between {c1} and {c2}", "{c1}e+", "{c1}E-x", "was {c1}.",
-		"{c1} under {n:" + string(conv) + "}", "{c1}/{c2}",
+		"{c1}, {c2}", "({c1}) {c2}", "{c1} % {c2}", "{c1} ms {c2}", "between {c1} and {c2}", "{c1} e+ {c2}", "was {c1}. {c2}",
+		"{c1} under {n:" + string(conv) + "} {c2}", "{c1}/{c2}",
 	} {
 		r, _ := check(t, v, one(conv, prose, claims...))
 		if !r.OK {
 			t.Errorf("%q: %+v", prose, r.Failures)
 		}
+	}
+}
+
+func TestPercentOrALetterGluedAfterAClaimIsRefused(t *testing.T) {
+	v, b := cpuBasic(t)
+	claim := `{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": 0.411}`
+	for _, prose := range []string{"{c1}%", "{c1}k", "{c1}ms", "x{c1}y", "{c1}e", "{c1}E-x"} {
+		r, _ := check(t, v, one(b, prose, claim))
+		if f := onlyFailure(t, r, CodeGluedToClaim); f.Ref != "c1" || !strings.Contains(f.Message, "{c1}") {
+			t.Errorf("%q: failure = %+v", prose, f)
+		}
+	}
+	for _, prose := range []string{"{c1} %", "{c1} of it", "({c1})", "{c1}.", "{c1}, then", "{c1}é"} {
+		r, _ := check(t, v, one(b, prose, claim))
+		if !r.OK {
+			t.Errorf("%q: %+v", prose, r.Failures)
+		}
+	}
+}
+
+func TestUnplacedClaimsAreRefused(t *testing.T) {
+	v, b := cpuBasic(t)
+	a := nodeID(t, v, "main", "a")
+	claim := func(id string) string {
+		return fmt.Sprintf(`{"id": %q, "metric": "cumulative", "unit": "nanoseconds", "value": 411}`, id)
+	}
+	r, _ := check(t, v, one(b, "no figure here", claim("c1")))
+	f := onlyFailure(t, r, CodeUnplacedClaim)
+	if f.Explanation != 0 || f.Claim != "c1" || !strings.Contains(f.Message, "{c1}") {
+		t.Errorf("failure = %+v", f)
+	}
+	// A claim placed in a hypothesis or the next measurement is placed.
+	r, _ = check(t, v, fmt.Sprintf(`[{"node": %q, "claims": [%s, %s], "hypotheses": ["{c1} of it"], "next_measurement": "watch {c2}"}]`, b, claim("c1"), claim("c2")))
+	mustOK(t, r)
+	if r.Figures != 2 {
+		t.Errorf("Figures = %d, want 2", r.Figures)
+	}
+	// A placeholder in another explanation does not place it.
+	js := fmt.Sprintf(`[{"node": %q, "claims": [%s], "prose": "none"}, {"node": %q, "prose": "as {c1} said"}]`, b, claim("c1"), a)
+	r, _ = check(t, v, js)
+	var codes []Code
+	for _, f := range r.Failures {
+		codes = append(codes, f.Code)
+	}
+	if r.OK || !slices.Contains(codes, CodeUnplacedClaim) || !slices.Contains(codes, CodeUnresolvedClaimRef) {
+		t.Errorf("failures = %+v", r.Failures)
+	}
+}
+
+func TestCheckTitle(t *testing.T) {
+	lim := DefaultLimits()
+	if lim.MaxTitleBytes != 200 {
+		t.Fatalf("MaxTitleBytes = %d, want 200", lim.MaxTitleBytes)
+	}
+	for _, ok := range []string{"", "Verified: b is 87% of CPU", strings.Repeat("t", 200), "operator{} {c1 }"} {
+		if err := CheckTitle(ok, lim); err != nil {
+			t.Errorf("CheckTitle(%.40q) = %v", ok, err)
+		}
+	}
+	long := "Verified: b is 87% of CPU" + strings.Repeat("x", 300<<10)
+	err := CheckTitle(long, lim)
+	if err == nil || !strings.Contains(err.Error(), "MaxTitleBytes") || len(err.Error()) > 512 {
+		t.Errorf("CheckTitle(300 KB) = %.300v", err)
+	}
+	for _, ph := range []string{"b is {c1}", "{n:0123456789abcdef} is hot"} {
+		err := CheckTitle(ph, lim)
+		if err == nil || !strings.Contains(err.Error(), "placeholder") {
+			t.Errorf("CheckTitle(%q) = %v", ph, err)
+		}
+	}
+}
+
+func TestFailureIndexesAndCountsAreDecimalStrings(t *testing.T) {
+	v, b := cpuBasic(t)
+	r, _ := check(t, v, one(b, "{c1}", `{"id": "c1", "metric": "cumulative", "unit": "nanoseconds", "value": 1}`))
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"explanation":"0"`, `"figures":"1"`, `"references":"0"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("JSON %s lacks %s", raw, want)
+		}
+	}
+	lim := DefaultLimits()
+	lim.MaxExplanations = 0
+	r, _ = checkWith(t, v, one(b, ""), lim)
+	if raw, _ := json.Marshal(r.Failures[0]); !strings.Contains(string(raw), `"explanation":"-1"`) {
+		t.Errorf("limit failure JSON %s", raw)
 	}
 }

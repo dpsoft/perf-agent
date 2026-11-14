@@ -81,7 +81,8 @@ func Metrics() []string { return slices.Clone(claimable) }
 // fact's canonical value, compared as decimals. Every explanation's node
 // and every "{n:…}" placeholder in its text must resolve, a "{cN}" only to a
 // claim of the same explanation, with nothing glued to it that changes the
-// number read (see gluedText), and every "{n:" must be a well-formed node reference. Near
+// number read (see gluedText), every claim must be placed by a "{cN}" in
+// its explanation's text, and every "{n:" must be a well-formed node reference. Near
 // misses of the claim pattern, like "{c1 }", stay text. Any limit exceeded
 // is reported instead of all of that. Every failure is reported, with agent
 // text echoed in it cut to maxEcho characters, and nothing is accepted when
@@ -107,11 +108,13 @@ func Check(v *profilemodel.View, exps []Explanation, lim Limits) Result {
 	refs := map[profilemodel.NodeID]struct{}{}
 	for i, e := range exps {
 		ch := &checked[i]
+		c.placed = map[string]bool{}
 		ch.Prose = c.text(i, e.Prose, refs)
 		for _, h := range e.Hypotheses {
 			ch.Hypotheses = append(ch.Hypotheses, c.text(i, h, refs))
 		}
 		ch.NextMeasurement = c.text(i, e.NextMeasurement, refs)
+		c.unplaced(i, e)
 	}
 	r.References = len(refs)
 	r.Failures = c.failures
@@ -181,7 +184,9 @@ type checker struct {
 	quality     map[profilemodel.NodeID]qualityOrErr
 	viewQuality *profilemodel.Quality
 	ids         map[string]claimDef // claim ID -> where it was first defined
-	failures    []Failure
+	// placed are the claim IDs the current explanation's text places.
+	placed   map[string]bool
+	failures []Failure
 }
 
 func (c *checker) viewName() string {
@@ -254,6 +259,7 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 		end += len(sg.Text)
 		switch sg.Kind {
 		case SegmentClaim:
+			c.placed[sg.Claim] = true
 			switch def, ok := c.ids[sg.Claim]; {
 			case !ok:
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeUnresolvedClaimRef,
@@ -271,7 +277,7 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 			}
 			if glued, ok := gluedText(s[:start], sg.Text, s[end:], prev, next); ok {
 				c.fail(Failure{Explanation: i, Ref: sg.Claim, Code: CodeGluedToClaim,
-					Message: fmt.Sprintf("%q glues text to %s: a sign, digits, a dot or another placeholder right before a claim, or digits, an exponent, decimals or another placeholder right after it, change the number a reader sees; put a space or words between them", clip(glued), sg.Text)})
+					Message: fmt.Sprintf("%q glues text to %s: a sign, digits, a dot or another placeholder right before a claim, or digits, an exponent, decimals, a %%, a letter or another placeholder right after it, change the number a reader sees; put a space or words between them (a claim shows its own unit)", clip(glued), sg.Text)})
 			}
 		case SegmentNode:
 			refs[sg.Node] = struct{}{}
@@ -301,6 +307,39 @@ func (c *checker) text(i int, s string, refs map[profilemodel.NodeID]struct{}) [
 	return segs
 }
 
+// unplaced fails every claim of explanation i that no "{cN}" in its own
+// text places: a figure that appears nowhere on the page must not be
+// counted as one the page shows checked. A claim with a malformed ID, or
+// one another explanation defined first, has already failed for it.
+func (c *checker) unplaced(i int, e Explanation) {
+	for _, cl := range e.Claims {
+		if def, ok := c.ids[cl.ID]; !ok || def.explanation != i || c.placed[cl.ID] {
+			continue
+		}
+		c.placed[cl.ID] = true // one failure per ID
+		c.fail(Failure{Explanation: i, Claim: cl.ID, Code: CodeUnplacedClaim,
+			Message: fmt.Sprintf("claim %s of explanations[%d] is never placed: write {%s} in its prose, a hypothesis or next_measurement where the figure goes, or drop the claim", cl.ID, i, cl.ID)})
+	}
+}
+
+// CheckTitle refuses a page title the page could not show honestly: one
+// over lim.MaxTitleBytes, or one with a claim or node placeholder, which
+// the title never resolves. Numbers in a title are free text, which a page
+// marks unchecked like any other.
+func CheckTitle(title string, lim Limits) error {
+	if len(title) > lim.MaxTitleBytes {
+		return fmt.Errorf("title is %d bytes, over the server's MaxTitleBytes of %d: shorten it to a few words (put figures in an explanation's claims), or start the server with a higher MaxTitleBytes",
+			len(title), lim.MaxTitleBytes)
+	}
+	for _, sg := range Tokenize(title) {
+		if sg.Kind == SegmentClaim || sg.Kind == SegmentNode {
+			return fmt.Errorf("title contains the placeholder %s, which a title never resolves: name the subject in words and state figures as claims in an explanation's prose; numbers typed in the title are shown unchecked",
+				clip(sg.Text))
+		}
+	}
+	return nil
+}
+
 // bracesAdvice ends every unresolved claim reference's message, since a
 // frame name with braces in it reads as a placeholder.
 const bracesAdvice = "To mention a frame whose name contains braces, use {n:<id>} instead of its name."
@@ -308,8 +347,10 @@ const bracesAdvice = "To mention a frame whose name contains braces, use {n:<id>
 // gluedText reports whether the text around a claim placeholder changes the
 // number it shows. Before it: a sign (+, -, U+2212), a numeric character
 // or a "." (".{c1}" reads as a fraction). After it: a numeric character, a
-// "." or "," followed by one, or "e"/"E" followed by an optional sign and
-// one (an exponent). On either side: another claim or node placeholder with
+// "." or "," followed by one, "e"/"E" followed by an optional sign and one
+// (an exponent), a "%" (a claim shows its own unit, so "{c1}%" turns a
+// ratio into a percentage) or any other ASCII letter (a unit or multiplier
+// such as "{c1}k" or "{c1}ms"). On either side: another claim or node placeholder with
 // nothing between ("{c1}{c2}" reads as one number). prev and next are the
 // neighbouring segments, nil at the ends. It returns the placeholder with
 // what is glued to it.
@@ -341,6 +382,9 @@ func gluedText(before, ph, after string, prev, next *Segment) (string, bool) {
 		if r3, size3 := utf8.DecodeRuneInString(after[at:]); unicode.IsNumber(r3) {
 			return ph + after[:at+size3], true
 		}
+		return ph + string(r), true
+	case r == '%' || isASCIILetterRune(r):
+		return ph + string(r), true
 	}
 	return "", false
 }

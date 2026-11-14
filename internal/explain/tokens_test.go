@@ -58,6 +58,9 @@ func TestTokenizeNumberEdges(t *testing.T) {
 		{"函数b占用了41.1%的时间", []Segment{seg(SegmentText, "函数b占用了"), seg(SegmentUnchecked, "41.1%"), seg(SegmentText, "的时间")}},
 		{"это заняло62%", []Segment{seg(SegmentText, "это заняло"), seg(SegmentUnchecked, "62%")}},
 		{"\u316462%", []Segment{seg(SegmentText, "\u3164"), seg(SegmentUnchecked, "62%")}},
+		// A number ending in "%" is a figure even right after an ASCII letter.
+		{"about41%", []Segment{seg(SegmentText, "about"), seg(SegmentUnchecked, "41%")}},
+		{"v1.2% sm86", []Segment{seg(SegmentText, "v"), seg(SegmentUnchecked, "1.2%"), seg(SegmentText, " sm86")}},
 		// A leading dot is part of the figure unless it follows an ASCII
 		// letter or digit.
 		{".41 and ~.4", []Segment{seg(SegmentUnchecked, ".41"), seg(SegmentText, " and ~"), seg(SegmentUnchecked, ".4")}},

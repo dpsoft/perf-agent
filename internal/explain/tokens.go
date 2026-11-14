@@ -50,8 +50,9 @@ func isLowerHex(c byte) bool { return isASCIIDigit(c) || 'a' <= c && c <= 'f' }
 // characters and over a "." or "," followed by one, and takes one trailing
 // "%"; it becomes an unchecked_number segment, so a figure no claim checked
 // is never shown as if it were one. Only ASCII letters hide a number, as in
-// "sm86", "x_1" and "v1.2": prose in a script without spaces ("占用了41.1%")
-// or after a filler character is still marked. Everything else is text,
+// "sm86", "x_1" and "v1.2", and never one ending in "%" ("about41%" is a
+// figure): prose in a script without spaces ("占用了41.1%") or after a
+// filler character is still marked. Everything else is text,
 // with adjacent text merged.
 //
 // Only agent text is tokenized. Frame names are never passed here: a name
@@ -79,7 +80,7 @@ func Tokenize(s string) []Segment {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		n := 0
 		switch {
-		case unicode.IsNumber(r) && numberMayStart(s[:i]):
+		case unicode.IsNumber(r) && (numberMayStart(s[:i]) || endsInPercent(s[i:])):
 			n = numberLen(s[i:])
 		case r == '.' && digitsLen(s[i+1:]) > 0 && dotMayStart(s[:i]):
 			n = 1 + numberLen(s[i+1:])
@@ -143,6 +144,13 @@ func isASCIILetterRune(r rune) bool { return r < utf8.RuneSelf && isASCIILetter(
 func dotMayStart(before string) bool {
 	r, _ := utf8.DecodeLastRuneInString(before)
 	return before == "" || !isASCIILetterRune(r) && !unicode.IsNumber(r)
+}
+
+// endsInPercent reports whether the number at the start of s, which starts
+// with a numeric character, ends in "%".
+func endsInPercent(s string) bool {
+	n := numberLen(s)
+	return s[n-1] == '%'
 }
 
 // numberLen is the length in bytes of the number at the start of s, which

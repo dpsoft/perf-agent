@@ -157,7 +157,7 @@ func modelFrame(t *testing.T, model map[string]any, id profilemodel.NodeID) map[
 }
 
 func TestExplainedPageHeaderCountsOnlyCheckedFigures(t *testing.T) {
-	v, b, _ := cpuExplained(t, "x")
+	v, b, _ := cpuExplained(t, "{c1} {c2}")
 	_, _, r := cpuExplained(t, cpuProse(b)+" 62% elsewhere.")
 	require.Equal(t, 2, r.Figures)
 	require.Equal(t, 1, r.References)
@@ -184,7 +184,7 @@ func TestExplainedPageRendersTheEngineValueNotTheAgents(t *testing.T) {
 }
 
 func TestExplainedPageMarksFreeNumbers(t *testing.T) {
-	v, b, _ := cpuExplained(t, "x")
+	v, b, _ := cpuExplained(t, "{c1} {c2}")
 	_, _, r := cpuExplained(t, cpuProse(b)+" It is 62% of time.")
 	got := exPage(t, v, r, exOpts())
 	assert.Contains(t, got, `<mark class="unchecked" title="not checked by perf-agent">62%</mark>`)
@@ -216,7 +216,7 @@ func TestExplainedPageEscapesNamesAndText(t *testing.T) {
 }
 
 func TestExplainedPageLinksNothing(t *testing.T) {
-	v, b, _ := cpuExplained(t, "x")
+	v, b, _ := cpuExplained(t, "{c1} {c2}")
 	_, _, r := cpuExplained(t, cpuProse(b)+" See https://evil.example/x for more.")
 	got := exPage(t, v, r, exOpts())
 	for _, forbidden := range []string{

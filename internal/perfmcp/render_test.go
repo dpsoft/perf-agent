@@ -725,11 +725,14 @@ func TestARejectedAttemptKeepsAtMost32Failures(t *testing.T) {
 	var exps []any
 	for e := range 2 {
 		var claims []any
+		var prose []string
 		for i := range 20 {
-			claims = append(claims, map[string]any{"id": fmt.Sprintf("c%d", e*20+i+1), "metric": "share_of_total",
+			id := fmt.Sprintf("c%d", e*20+i+1)
+			claims = append(claims, map[string]any{"id": id, "metric": "share_of_total",
 				"denominator": "view_total", "unit": "ratio", "value": json.RawMessage("0.62")})
+			prose = append(prose, "{"+id+"}")
 		}
-		exps = append(exps, map[string]any{"node": b, "claims": claims, "prose": "x"})
+		exps = append(exps, map[string]any{"node": b, "claims": claims, "prose": strings.Join(prose, " ")})
 	}
 	out, text, isErr := o.render(t, map[string]any{"explanations": exps, "out": "x.html"})
 	if !isErr || len(out.Failures) != 40 {

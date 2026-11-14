@@ -24,6 +24,7 @@ type Limits struct {
 	MaxHypotheses           int // hypotheses in one explanation
 	MaxHypothesisBytes      int // bytes of one hypothesis
 	MaxNextBytes            int // bytes of one next_measurement
+	MaxTitleBytes           int // bytes of the page title
 }
 
 // DefaultLimits are the limits a server uses unless configured otherwise.
@@ -36,6 +37,7 @@ func DefaultLimits() Limits {
 		MaxHypotheses:           8,
 		MaxHypothesisBytes:      2048,
 		MaxNextBytes:            2048,
+		MaxTitleBytes:           200,
 	}
 }
 
@@ -136,6 +138,7 @@ const (
 	CodeNotInteger          Code = "not_integer"
 	CodeValueMismatch       Code = "value_mismatch"
 	CodeLimitExceeded       Code = "limit_exceeded"
+	CodeUnplacedClaim       Code = "unplaced_claim"
 )
 
 // EngineValue is the engine's fact for a claim's metric and scope. Value is
@@ -156,12 +159,13 @@ type EngineValue struct {
 }
 
 // Failure is one failing claim or reference. Explanation is the index of the
-// explanation it is in, or -1 for a limit on the whole call. Claim is the
+// explanation it is in, or -1 for a limit on the whole call; like every
+// integer on the wire it is a JSON string of decimal digits. Claim is the
 // claim's ID as sent; Ref is the claim ID, node ID or limit name a reference
 // or limit failure is about. Agent is the claim's value literal as sent, and
 // Engine the engine's fact whenever the claim got as far as finding it.
 type Failure struct {
-	Explanation int          `json:"explanation"`
+	Explanation int          `json:"explanation,string"`
 	Claim       string       `json:"claim,omitzero"`
 	Ref         string       `json:"ref,omitzero"`
 	Code        Code         `json:"code"`
@@ -209,13 +213,14 @@ type Checked struct {
 
 // Result is the outcome of a check. OK is true only with no failure, and
 // only then is Checked set. Figures is the number of claims in the call and
-// References the number of distinct nodes named by "{n:…}" placeholders.
+// References the number of distinct nodes named by "{n:…}" placeholders;
+// both are JSON strings of decimal digits.
 type Result struct {
 	OK         bool      `json:"ok"`
 	Checked    []Checked `json:"checked,omitzero"`
 	Failures   []Failure `json:"failures,omitzero"`
-	Figures    int       `json:"figures"`
-	References int       `json:"references"`
+	Figures    int       `json:"figures,string"`
+	References int       `json:"references,string"`
 }
 
 // RejectedAttempt is a render call whose check failed, as a server records

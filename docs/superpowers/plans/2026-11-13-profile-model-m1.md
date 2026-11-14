@@ -21,7 +21,7 @@
 - Zero and unavailable are distinct values in code and in JSON; a zero denominator gives `unavailable: zero total`, never 0 or NaN.
 - "No mapping" means `Mapping == nil || Mapping.File == ""` (synthetic and fallback frames sit on the first mapping with an empty file).
 - Negative values at the selected index are refused, and every accumulation is checked for overflow (`int64` values, `uint64` sidecar sums, base + new combined weights); nothing wraps.
-- Values in the sample unit and counts stay exact integers (`int64`); `float64` is used only for ratios.
+- Values in the sample unit and counts stay exact integers (`int64`); `float64` is used only for ratios and for derived metrics that carry their own unit (per-unit-of-work deltas).
 - Comments say what the code does and why; no issue numbers or release history in comments.
 - Commits: no Co-Authored-By, no AI attribution, no session URLs. Push to `ai-flamegraph-design` (draft PR #262); never merge.
 
@@ -236,7 +236,7 @@
   func RoundingFor(metric string) string // the engine's per-metric policy, single source for §7.3
   func (v *View) Facts(id NodeID, classify Classifier) (PathFacts, error)
   ```
-- Exactly one of `Int` and `Ratio` is non-nil when `Status != "unavailable"`; both are nil when it is. Tests below write `{3,"count","ok"}` for `*Int == 3, Unit "count", Status "ok"`.
+- Exactly one of `Int`, `Ratio` and `Derived` is non-nil when `Status != "unavailable"`; all three are nil when it is. Tests below write `{3,"count","ok"}` for `*Int == 3, Unit "count", Status "ok"`.
 - A GPU view is one whose sample type is `gpu`. `ExecutionsBelow` counts distinct ordinals in `execOf[s]` over `node.samples` **and** over zero-value samples whose stack passes through the node (kept aside in Task 3 for this purpose); `unavailable` with `Profile.Executions.Reason` when the log is not OK.
 
 - [ ] **Step 1: Write the failing tests**:

@@ -72,12 +72,15 @@ func (rs *Roots) ResolveBasename(base, buildID, captureID string) Resolution {
 
 // Batch is a set of resolutions that share one HEAD reading per root, so
 // looking up many references runs git once per root rather than per
-// reference. Each resolution still pairs its blob with the commit read for
-// the batch. A Batch is safe for concurrent use.
+// reference, and one snapshot per file, so every reference to a file sees
+// the same bytes even if it changes during the batch. Each resolution
+// still pairs its blob with the commit read for the batch. A Batch is safe
+// for concurrent use.
 type Batch struct {
 	rs    *Roots
 	mu    sync.Mutex
 	heads map[int]headResult
+	snaps map[snapKey]snapResult
 }
 
 type headResult struct {
@@ -85,8 +88,35 @@ type headResult struct {
 	err  error
 }
 
-// Batch starts a batch. Resolutions outside one each read HEAD afresh.
-func (rs *Roots) Batch() *Batch { return &Batch{rs: rs, heads: map[int]headResult{}} }
+// snapKey is a file by its root and its slash path inside it.
+type snapKey struct {
+	root int
+	rel  string
+}
+
+type snapResult struct {
+	snap *snapshot
+	err  error
+}
+
+// Batch starts a batch. Resolutions outside one each read HEAD and the
+// file afresh.
+func (rs *Roots) Batch() *Batch {
+	return &Batch{rs: rs, heads: map[int]headResult{}, snaps: map[snapKey]snapResult{}}
+}
+
+// snapshot is rel in root i, read once per batch.
+func (b *Batch) snapshot(i int, rel string) (*snapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	k := snapKey{i, rel}
+	if s, ok := b.snaps[k]; ok {
+		return s.snap, s.err
+	}
+	snap, err := b.rs.snapshot(i, rel)
+	b.snaps[k] = snapResult{snap, err}
+	return snap, err
+}
 
 // head is root i's HEAD, read once per batch.
 func (b *Batch) head(i int) (HeadInfo, error) {
@@ -232,7 +262,7 @@ func (b *Batch) decide(hits []hit, buildID, captureID string) Resolution {
 		return res
 	}
 	h := hits[0]
-	snap, err := rs.snapshot(h.root, h.rel)
+	snap, err := b.snapshot(h.root, h.rel)
 	if err != nil {
 		return unresolved("cannot read " + h.rel + ": " + pathless(err).Error())
 	}

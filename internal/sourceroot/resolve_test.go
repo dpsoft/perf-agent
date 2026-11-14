@@ -432,3 +432,33 @@ func TestUnresolvedReasonBoundsTheName(t *testing.T) {
 		t.Fatalf("short name: reason %q, want it whole", res.Reason)
 	}
 }
+
+// Rows of one source call that point at the same file see the same bytes:
+// a batch reads each file once, so a rewrite between two rows changes
+// neither the digest nor the lines.
+func TestABatchReadsEachFileOnce(t *testing.T) {
+	dir := sourceTree(t)
+	r := openRoots(t, []string{dir}, nil, nil, DefaultLimits())
+	b := r.Batch()
+	first := b.Resolve("/build/src/app.c", "", "")
+	writeFile(t, dir, "src/app.c", "rewritten\n")
+	second := b.Resolve("/build/src/app.c", "", "")
+	third := b.ResolveBasename("app.c", "", "")
+	if first.SHA256 != sha256Hex(appC) || second.SHA256 != first.SHA256 {
+		t.Fatalf("digests %s then %s, want both %s", first.SHA256, second.SHA256, sha256Hex(appC))
+	}
+	if first.snap != second.snap {
+		t.Error("the batch read src/app.c twice")
+	}
+	lines, err := r.Lines(second, 1, 0)
+	if err != nil || len(lines) != 1 || lines[0].Text != "line 1" {
+		t.Errorf("Lines = %+v, %v; want the bytes first read", lines, err)
+	}
+	if third.Status != StatusAmbiguous {
+		t.Errorf("basename lookup = %+v, want ambiguous (two app.c files)", third)
+	}
+	// A new batch reads the file again.
+	if got := r.Batch().Resolve("/build/src/app.c", "", ""); got.SHA256 != sha256Hex("rewritten\n") {
+		t.Errorf("a new batch's digest %s, want the rewritten file's", got.SHA256)
+	}
+}

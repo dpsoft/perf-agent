@@ -172,7 +172,8 @@ func (s *Server) handleSource(_ context.Context, raw json.RawMessage) (mcpstdio.
 		Handle: a.Handle, View: a.View, Notes: notes, Node: a.Node,
 		SourceRoots: nonNil(s.src.Dirs()), Rows: make([]sourceRow, 0, len(pg)), pageInfo: info,
 	}
-	// One batch reads each root's HEAD once for the whole page.
+	// One batch reads each root's HEAD and each file once for the whole
+	// page, so rows pointing at the same file share its bytes and digest.
 	batch := s.src.Batch()
 	hasRoots := len(out.SourceRoots) > 0
 	for _, r := range pg {

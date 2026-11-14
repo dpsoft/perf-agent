@@ -794,3 +794,18 @@ func TestTheRejectedPillCountsOmittedClaimsAndReferences(t *testing.T) {
 	assert.Contains(t, got, `<span class="ref">a1</span> and 10 more failures</li>`)
 	assert.Equal(t, 2, strings.Count(got, "<s>0.6"), "only the kept claims are listed")
 }
+
+func TestExplainedPageLabelsAttemptsCheckedAgainstOtherEvidence(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "executions_below", Scope: "node", Node: b, Unit: "count", Rounding: "exact", Status: "unavailable", Reason: "no sidecar"}
+	opts := exOpts()
+	opts.Rejected = []explain.RejectedAttempt{
+		{Attempt: "a1", Failures: []explain.Failure{failure(explain.CodeUnavailableFact, "c1", "", "4", engine)}, Omitted: 2, Evidence: "made with handle 0123<b>: opened without an executions log"},
+		{Attempt: "a2", Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}},
+	}
+	got := exPage(t, v, r, opts)
+	label := `<span class="muted">(made with handle 0123&lt;b&gt;: opened without an executions log)</span>`
+	assert.Contains(t, got, `<span class="ref">a1</span> `+label+` claim c1`)
+	assert.Contains(t, got, `<span class="ref">a1</span> `+label+` and 2 more failures</li>`)
+	assert.Contains(t, got, `<span class="ref">a2</span> claim c1`)
+}

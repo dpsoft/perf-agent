@@ -176,7 +176,7 @@ type exRow struct{ Ref, Node, Name, Share, Cum string }
 // exRejected is one row of "Rejected at render". Kind is "claim",
 // "reference" or "limit"; only claim rows carry a metric and figures.
 type exRejected struct {
-	Attempt, Kind, Label, Metric, Node, Agent, Engine, Code, Reason string
+	Attempt, Evidence, Kind, Label, Metric, Node, Agent, Engine, Code, Reason string
 }
 
 type exLegend struct{ Key, Label string }
@@ -843,14 +843,16 @@ func promptName(name string) string {
 // claim per attempt; a limit failure is a limit row; any other failure is
 // about a reference. Claims are counted per attempt, so a claim refused in
 // two attempts counts twice and the pill says how many attempts. The claims
-// and references a record left out are counted too, though not listed.
+// and references a record left out are counted too, though not listed. Every
+// row of an attempt checked against other evidence than the page's says
+// which, so its engine values are not read as this page's.
 func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill string) {
 	var claims, refs, limits, attempts int
 	for _, a := range b.opts.Rejected {
 		seen := map[string]bool{}
 		counted := false
 		for _, f := range a.Failures {
-			row := exRejected{Attempt: a.Attempt, Code: string(f.Code), Reason: f.Message}
+			row := exRejected{Attempt: a.Attempt, Evidence: a.Evidence, Code: string(f.Code), Reason: f.Message}
 			switch {
 			case f.Claim != "":
 				if seen["claim\x00"+f.Claim] {
@@ -883,7 +885,7 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 			rows = append(rows, row)
 		}
 		if a.Omitted > 0 {
-			rows = append(rows, exRejected{Attempt: a.Attempt, Kind: "more", Label: "and " + plural(a.Omitted, "more failure", "more failures")})
+			rows = append(rows, exRejected{Attempt: a.Attempt, Evidence: a.Evidence, Kind: "more", Label: "and " + plural(a.Omitted, "more failure", "more failures")})
 		}
 		claims += a.OmittedClaims
 		refs += a.OmittedReferences

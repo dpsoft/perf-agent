@@ -3,6 +3,7 @@ package sourceroot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const appC = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"
@@ -399,5 +401,34 @@ func TestDirsAreAbsolute(t *testing.T) {
 	}
 	if res := r.Resolve("src/util.c", "", ""); res.Root != dir {
 		t.Fatalf("Root = %q, want %q", res.Root, dir)
+	}
+}
+
+func TestLinesPastTheReadLimitSayWhy(t *testing.T) {
+	dir := t.TempDir()
+	var b strings.Builder
+	for i := range 100 {
+		fmt.Fprintf(&b, "line %d\n", i+1)
+	}
+	writeFile(t, dir, "big.c", b.String())
+	lim := DefaultLimits()
+	lim.MaxFileBytes = 40
+	r := openRoots(t, []string{dir}, nil, nil, lim)
+	_, err := r.Lines(r.Resolve("big.c", "", ""), 50, 0)
+	if err == nil || !strings.Contains(err.Error(), "40-byte read limit") || strings.Contains(err.Error(), "past the end") {
+		t.Fatalf("err = %v, want the line placed beyond the 40-byte read limit", err)
+	}
+}
+
+func TestUnresolvedReasonBoundsTheName(t *testing.T) {
+	r := openRoots(t, []string{t.TempDir()}, nil, nil, DefaultLimits())
+	long := strings.Repeat("é", 1000) + ".c"
+	for _, res := range []Resolution{r.Resolve("/x/"+long, "", ""), r.ResolveBasename(long, "", "")} {
+		if res.Status != StatusUnresolved || !strings.Contains(res.Reason, "…") || utf8.RuneCountInString(res.Reason) > 256+64 {
+			t.Fatalf("reason (%d runes) = %.80q..., want the name cut to 256 characters with an ellipsis", utf8.RuneCountInString(res.Reason), res.Reason)
+		}
+	}
+	if res := r.Resolve("/x/short.c", "", ""); !strings.HasSuffix(res.Reason, "x/short.c") {
+		t.Fatalf("short name: reason %q, want it whole", res.Reason)
 	}
 }

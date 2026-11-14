@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -29,6 +30,9 @@ type Resolution struct {
 	// SHA256 is the hex digest of the snapshot, absent when the file was
 	// over the size limit.
 	SHA256 string `json:"sha256,omitempty"`
+	// GitTopLevel is the working tree top-level of the git repository the
+	// root is in, when git answered.
+	GitTopLevel string `json:"git_toplevel,omitempty"`
 
 	snap *snapshot // the bytes the evidence is about; nil unless one file matched
 }
@@ -58,6 +62,47 @@ type hit struct {
 // matches any regular file decides. One match is verified; several are
 // ambiguous.
 func (rs *Roots) Resolve(filename, buildID, captureID string) Resolution {
+	return rs.Batch().Resolve(filename, buildID, captureID)
+}
+
+// ResolveBasename resolves base in a batch of its own.
+func (rs *Roots) ResolveBasename(base, buildID, captureID string) Resolution {
+	return rs.Batch().ResolveBasename(base, buildID, captureID)
+}
+
+// Batch is a set of resolutions that share one HEAD reading per root, so
+// looking up many references runs git once per root rather than per
+// reference. Each resolution still pairs its blob with the commit read for
+// the batch. A Batch is safe for concurrent use.
+type Batch struct {
+	rs    *Roots
+	mu    sync.Mutex
+	heads map[int]headResult
+}
+
+type headResult struct {
+	head HeadInfo
+	err  error
+}
+
+// Batch starts a batch. Resolutions outside one each read HEAD afresh.
+func (rs *Roots) Batch() *Batch { return &Batch{rs: rs, heads: map[int]headResult{}} }
+
+// head is root i's HEAD, read once per batch.
+func (b *Batch) head(i int) (HeadInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if h, ok := b.heads[i]; ok {
+		return h.head, h.err
+	}
+	h, err := b.rs.probe.Head(b.rs.roots[i].dir)
+	b.heads[i] = headResult{h, err}
+	return h, err
+}
+
+// Resolve is Roots.Resolve within the batch.
+func (b *Batch) Resolve(filename, buildID, captureID string) Resolution {
+	rs := b.rs
 	comps := components(filename)
 	if len(comps) == 0 {
 		return unresolved("no file name to look up")
@@ -76,10 +121,10 @@ func (rs *Roots) Resolve(filename, buildID, captureID string) Resolution {
 			}
 		}
 		if len(hits) > 0 {
-			return rs.decide(hits, buildID, captureID)
+			return b.decide(hits, buildID, captureID)
 		}
 	}
-	return unresolved("no file under the source roots matches " + strings.Join(comps, "/"))
+	return unresolved("no file under the source roots matches " + bound(strings.Join(comps, "/")))
 }
 
 // components is the slash path's cleaned components without "/", "." or
@@ -106,7 +151,8 @@ func addHit(hits []hit, h hit) []hit {
 // ResolveBasename finds a bare file name, as PC sampling records it, by
 // indexing each root's regular files (not following symlinks, skipping
 // .git). Two matches anywhere are ambiguous: the lookup never guesses.
-func (rs *Roots) ResolveBasename(base, buildID, captureID string) Resolution {
+func (b *Batch) ResolveBasename(base, buildID, captureID string) Resolution {
+	rs := b.rs
 	if strings.Contains(base, "/") {
 		base = path.Base(path.Clean(base))
 	}
@@ -126,13 +172,13 @@ func (rs *Roots) ResolveBasename(base, buildID, captureID string) Resolution {
 	}
 	switch {
 	case len(hits) > 1:
-		return rs.decide(hits, buildID, captureID)
+		return b.decide(hits, buildID, captureID)
 	case limited:
 		return unresolved("source walk limit reached")
 	case len(hits) == 0:
-		return unresolved("no file named " + base + " under the source roots")
+		return unresolved("no file named " + bound(base) + " under the source roots")
 	}
-	return rs.decide(hits, buildID, captureID)
+	return b.decide(hits, buildID, captureID)
 }
 
 // basenameIndex maps a file name to the slash paths holding it in one root.
@@ -175,7 +221,8 @@ func (rs *Roots) indexOf(r *root) *basenameIndex {
 }
 
 // decide turns the matches of one lookup into a resolution.
-func (rs *Roots) decide(hits []hit, buildID, captureID string) Resolution {
+func (b *Batch) decide(hits []hit, buildID, captureID string) Resolution {
+	rs := b.rs
 	if len(hits) > 1 {
 		res := Resolution{Status: StatusAmbiguous, Reason: fmt.Sprintf("%d files match", len(hits))}
 		for _, h := range hits {
@@ -197,14 +244,15 @@ func (rs *Roots) decide(hits []hit, buildID, captureID string) Resolution {
 		return res
 	}
 	res.SHA256 = hex.EncodeToString(snap.digest[:])
-	rs.evidence(&res, buildID, captureID)
+	b.evidence(h.root, &res, buildID, captureID)
 	return res
 }
 
 // evidence sets the status from what ties the snapshot to the binary: a
 // manifest for the build or capture listing the file, else the HEAD of the
 // root's git checkout.
-func (rs *Roots) evidence(res *Resolution, buildID, captureID string) {
+func (b *Batch) evidence(i int, res *Resolution, buildID, captureID string) {
+	rs := b.rs
 	differs := false
 	for _, m := range rs.manifests {
 		if !m.names(buildID, captureID) {
@@ -229,15 +277,26 @@ func (rs *Roots) evidence(res *Resolution, buildID, captureID string) {
 		res.Reason = "git probe disabled"
 		return
 	}
-	dir := res.Root
-	commit, format, err := rs.probe.Head(dir)
+	head, err := b.head(i)
 	if err != nil {
 		res.Reason = gitReason(err)
 		return
 	}
+	commit, format := head.Commit, head.Format
+	res.GitTopLevel = head.TopLevel
+	// A repository above the root is not the checkout the user named: the
+	// root may be any directory of someone else's tree.
+	if !rs.roots[i].holds(head.TopLevel) {
+		res.Reason = "git repository is outside the source root"
+		return
+	}
+	if rs.inNestedRepo(i, res.Path) {
+		res.Reason = "inside a submodule or nested repository"
+		return
+	}
 	// The blob is looked up at the commit Head returned, never at HEAD
 	// again, so a HEAD that moves in between cannot pair two commits.
-	blob, err := rs.probe.Blob(dir, commit, res.Path)
+	blob, err := rs.probe.Blob(rs.roots[i].dir, commit, res.Path)
 	if err != nil {
 		res.Reason = gitReason(err)
 		return
@@ -286,6 +345,10 @@ func (rs *Roots) Lines(res Resolution, line int64, context int) ([]Line, error) 
 		out = append(out, Line{N: n, Text: text, Truncated: clipped || cut})
 	}
 	if line > n {
+		if res.snap.truncated {
+			return nil, fmt.Errorf("sourceroot: line %d of %s is beyond the %d-byte read limit (the first %d lines were read)",
+				line, res.Path, len(res.snap.data), n)
+		}
 		return nil, fmt.Errorf("sourceroot: line %d is past the end of %s (%d lines)", line, res.Path, n)
 	}
 	return out, nil
@@ -307,4 +370,37 @@ func clip(raw []byte, limit int) (string, bool) {
 		i += size
 	}
 	return b.String(), false
+}
+
+// inNestedRepo reports whether a directory between root i and rel (the root
+// itself excluded) holds a .git entry: a submodule (a .git file) or an
+// embedded repository (a .git directory), whose files the root's
+// repository does not track.
+func (rs *Roots) inNestedRepo(i int, rel string) bool {
+	dir := path.Dir(rel)
+	if dir == "." {
+		return false
+	}
+	parts := strings.Split(dir, "/")
+	for k := 1; k <= len(parts); k++ {
+		if _, err := rs.roots[i].r.Lstat(strings.Join(parts[:k], "/") + "/.git"); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// maxNameInReason is the most characters of a profile's file name a reason
+// repeats.
+const maxNameInReason = 256
+
+// bound is name as valid UTF-8, cut to maxNameInReason characters and
+// ending in "…" when cut.
+func bound(name string) string {
+	name = strings.ToValidUTF8(name, "\uFFFD")
+	if utf8.RuneCountInString(name) <= maxNameInReason {
+		return name
+	}
+	runes := []rune(name)
+	return string(runes[:maxNameInReason-1]) + "…"
 }

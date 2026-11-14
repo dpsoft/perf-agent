@@ -75,6 +75,7 @@ const (
 // root is one opened source directory.
 type root struct {
 	dir   string // absolute, as opened
+	real  string // dir with symlinks resolved, to compare with git's paths
 	r     *os.Root
 	index *basenameIndex // built on the first basename lookup
 }
@@ -114,7 +115,11 @@ func Open(dirs []string, manifests []Manifest, probe Prober, lim Limits) (*Roots
 			_ = rs.Close()
 			return nil, fmt.Errorf("sourceroot: source root: %w", err)
 		}
-		rs.roots = append(rs.roots, &root{dir: abs, r: r})
+		real, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			real = abs
+		}
+		rs.roots = append(rs.roots, &root{dir: abs, real: real, r: r})
 	}
 	return rs, nil
 }
@@ -190,4 +195,13 @@ func (rs *Roots) snapshot(i int, rel string) (*snapshot, error) {
 		s.digest = sha256.Sum256(data)
 	}
 	return s, nil
+}
+
+// holds reports whether dir (a path git printed) is the root or inside it.
+func (r *root) holds(dir string) bool {
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
+	rel, err := filepath.Rel(r.real, dir)
+	return err == nil && (rel == "." || filepath.IsLocal(rel))
 }

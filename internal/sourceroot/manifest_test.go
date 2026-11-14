@@ -81,6 +81,9 @@ func TestReadManifestRefusesBadInput(t *testing.T) {
 		"bad commit":    map[string]any{"format": ManifestFormat, "build_ids": []string{"b1"}, "commit": "HEAD", "files": map[string]string{"a.c": good}},
 		"empty id":      map[string]any{"format": ManifestFormat, "build_ids": []string{""}, "files": map[string]string{"a.c": good}},
 		"not an object": []string{"x"},
+		"dot":           map[string]any{"format": ManifestFormat, "build_ids": []string{"b1"}, "files": map[string]string{".": good}},
+		"git dir":       map[string]any{"format": ManifestFormat, "build_ids": []string{"b1"}, "files": map[string]string{".git/config": good}},
+		"nested git":    map[string]any{"format": ManifestFormat, "build_ids": []string{"b1"}, "files": map[string]string{"a/.git/x": good}},
 	}
 	for name, v := range cases {
 		if _, err := ReadManifest(writeManifest(t, v), 1<<20); err == nil {

@@ -59,11 +59,103 @@ func TestGitCleanFileIsUserSelected(t *testing.T) {
 	}
 }
 
-func TestGitWorksFromASubdirectoryRoot(t *testing.T) {
-	dir, commit := gitTree(t)
+func TestGitRepositoryAboveTheRootIsUnverified(t *testing.T) {
+	dir, _ := gitTree(t)
 	r := openRoots(t, []string{filepath.Join(dir, "src")}, nil, GitProber(DefaultLimits().GitTimeout), DefaultLimits())
-	if res := r.Resolve("/build/app/src/util.c", "", ""); res.Status != StatusUserSelected || res.Commit != commit {
-		t.Fatalf("Resolve = %+v, want user_selected at %s", res, commit)
+	res := r.Resolve("/build/app/src/util.c", "", "")
+	if res.Status != StatusSourceUnverified || res.Reason != "git repository is outside the source root" || res.GitTopLevel != dir || res.Commit != "" {
+		t.Fatalf("Resolve = %+v, want source_unverified %q with top-level %s", res, "git repository is outside the source root", dir)
+	}
+}
+
+func TestGitTopLevelIsReported(t *testing.T) {
+	dir, commit := gitTree(t)
+	r := openRoots(t, []string{dir}, nil, GitProber(DefaultLimits().GitTimeout), DefaultLimits())
+	if res := r.Resolve("src/app.c", "", ""); res.Status != StatusUserSelected || res.GitTopLevel != dir || res.Commit != commit {
+		t.Fatalf("Resolve = %+v, want user_selected with top-level %s", res, dir)
+	}
+}
+
+func TestGitWorktreeRootIsUserSelected(t *testing.T) {
+	dir, commit := gitTree(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	testGit(t, dir, "worktree", "add", "-q", "--detach", wt)
+	r := openRoots(t, []string{wt}, nil, GitProber(DefaultLimits().GitTimeout), DefaultLimits())
+	if res := r.Resolve("/build/app/src/app.c", "", ""); res.Status != StatusUserSelected || res.Commit != commit || res.GitTopLevel != wt {
+		t.Fatalf("Resolve = %+v, want user_selected at %s with top-level %s", res, commit, wt)
+	}
+}
+
+func TestGitSubmoduleFileHasItsOwnReason(t *testing.T) {
+	dir, _ := gitTree(t)
+	// A repository embedded in the superproject (a gitlink, .git directory)
+	// and a submodule proper (a .git file pointing into the superproject).
+	nested := filepath.Join(dir, "vendor", "lib")
+	writeFile(t, nested, "lib.c", "lib\n")
+	testGit(t, nested, "init", "-q")
+	testGit(t, nested, "add", ".")
+	testGit(t, nested, "commit", "-q", "-m", "lib")
+	testGit(t, dir, "add", "vendor/lib")
+	sub := t.TempDir()
+	writeFile(t, sub, "s/sub.c", "sub\n")
+	testGit(t, sub, "init", "-q")
+	testGit(t, sub, "add", ".")
+	testGit(t, sub, "commit", "-q", "-m", "sub")
+	testGit(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "third")
+	testGit(t, dir, "commit", "-q", "-m", "modules")
+	if fi, err := os.Lstat(filepath.Join(dir, "third", ".git")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("submodule .git is not a file (%v)", err)
+	}
+
+	r := openRoots(t, []string{dir}, nil, GitProber(DefaultLimits().GitTimeout), DefaultLimits())
+	for _, name := range []string{"vendor/lib/lib.c", "third/s/sub.c"} {
+		if res := r.Resolve(name, "", ""); res.Status != StatusSourceUnverified || res.Reason != "inside a submodule or nested repository" {
+			t.Errorf("Resolve(%s) = %+v, want source_unverified %q", name, res, "inside a submodule or nested repository")
+		}
+	}
+	if res := r.Resolve("src/app.c", "", ""); res.Status != StatusUserSelected {
+		t.Fatalf("superproject file: %+v, want user_selected", res)
+	}
+}
+
+// countingProber answers like a clean checkout at one commit and counts
+// the Head calls.
+type countingProber struct {
+	mu    sync.Mutex
+	heads int
+}
+
+func (p *countingProber) Head(dir string) (HeadInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.heads++
+	return HeadInfo{Commit: strings.Repeat("c", 40), Format: "sha1", TopLevel: dir}, nil
+}
+
+func (p *countingProber) Blob(string, string, string) (string, error) { return gitBlobSHA1(appC), nil }
+
+func TestBatchProbesHeadOncePerRoot(t *testing.T) {
+	p := &countingProber{}
+	a, b := sourceTree(t), t.TempDir()
+	writeFile(t, b, "b.c", appC)
+	r := openRoots(t, []string{a, b}, nil, p, DefaultLimits())
+	batch := r.Batch()
+	for range 3 {
+		if res := batch.Resolve("/build/src/app.c", "", ""); res.Status != StatusUserSelected || res.Root != a {
+			t.Fatalf("Resolve = %+v, want user_selected in %s", res, a)
+		}
+	}
+	if res := batch.ResolveBasename("b.c", "", ""); res.Status != StatusUserSelected || res.Root != b {
+		t.Fatalf("ResolveBasename = %+v, want user_selected in %s", res, b)
+	}
+	if p.heads != 2 {
+		t.Fatalf("a batch over two roots ran Head %d times, want 2", p.heads)
+	}
+	// Outside a batch every resolution reads HEAD afresh.
+	r.Resolve("src/app.c", "", "")
+	r.ResolveBasename("b.c", "", "")
+	if p.heads != 4 {
+		t.Fatalf("Head ran %d times, want 4", p.heads)
 	}
 }
 
@@ -198,7 +290,7 @@ exec %s "$@"
 	}
 	prefix := []string{"--no-lazy-fetch", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false", "-C", dir, "rev-parse"}
 	wantEnv := []string{
-		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_NO_LAZY_FETCH=1", "GIT_NO_REPLACE_OBJECTS=1",
+		"GIT_ALLOW_PROTOCOL=", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_NO_LAZY_FETCH=1", "GIT_NO_REPLACE_OBJECTS=1",
 		"GIT_OPTIONAL_LOCKS=0", "GIT_PROTOCOL_FROM_USER=0", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C",
 	}
 	for i, c := range calls {
@@ -206,7 +298,7 @@ exec %s "$@"
 			t.Errorf("run %d: argv %q, want it to start %q", i, c.args, prefix)
 		}
 		for _, a := range c.args[min(len(prefix), len(c.args)):] {
-			if !strings.HasPrefix(a, "--verify") && a != "--quiet" && a != "--show-object-format" && !isRevision(a) {
+			if !strings.HasPrefix(a, "--verify") && a != "--quiet" && a != "--show-object-format" && a != "--show-toplevel" && !isRevision(a) {
 				t.Errorf("run %d: unexpected argument %q in %q", i, a, c.args)
 			}
 		}
@@ -266,6 +358,10 @@ func partialClone(t *testing.T, filter, marker string) (clone, bin, blob string)
 	clone = filepath.Join(base, "clone")
 	testGit(t, base, "clone", "-q", "--no-checkout", "--filter="+filter, "file://"+bare, clone)
 	testGit(t, clone, "config", "remote.origin.url", "fake::"+bare)
+	// Repository configuration that allows every transport: the prober
+	// must not let it reopen the protocol layer.
+	testGit(t, clone, "config", "protocol.allow", "always")
+	testGit(t, clone, "config", "protocol.fake.allow", "always")
 	writeFile(t, clone, "d/f.c", "hello\n")
 
 	bin = t.TempDir()
@@ -317,12 +413,12 @@ type movingProber struct {
 	blobID string
 }
 
-func (p *movingProber) Head(string) (string, string, error) {
+func (p *movingProber) Head(dir string) (HeadInfo, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	h := p.heads[0]
 	p.heads = p.heads[1:]
-	return h, "sha1", nil
+	return HeadInfo{Commit: h, Format: "sha1", TopLevel: dir}, nil
 }
 
 func (p *movingProber) Blob(_, commit, _ string) (string, error) {
@@ -387,5 +483,26 @@ func TestGitSHA256Repository(t *testing.T) {
 	r := openRoots(t, []string{dir}, nil, GitProber(DefaultLimits().GitTimeout), DefaultLimits())
 	if res := r.Resolve("src/app.c", "", ""); res.Status != StatusUserSelected || res.Commit != commit || len(commit) != 64 {
 		t.Fatalf("Resolve = %+v, want user_selected at the 64-hex %s", res, commit)
+	}
+}
+
+func TestGitProtocolLayerAloneBlocksTheHelper(t *testing.T) {
+	for _, filter := range []string{"blob:none", "tree:0"} {
+		t.Run(filter, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "helper-ran")
+			clone, bin, _ := partialClone(t, filter, marker)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			// With lazy fetching left on, git does try the promisor remote;
+			// only the protocol settings stand between it and the helper.
+			p := gitProber{timeout: DefaultLimits().GitTimeout, lazyFetch: true}
+			r := openRoots(t, []string{clone}, nil, p, DefaultLimits())
+			res := r.Resolve("/build/d/f.c", "", "")
+			if res.Status != StatusSourceUnverified || res.Reason != "object not available locally" {
+				t.Fatalf("Resolve = %+v, want source_unverified %q", res, "object not available locally")
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the protocol layer let git invoke the helper (stat err %v)", err)
+			}
+		})
 	}
 }

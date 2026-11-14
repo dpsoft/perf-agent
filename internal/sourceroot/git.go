@@ -11,18 +11,26 @@ import (
 	"hash"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Prober reads a git checkout's HEAD. Head returns the commit HEAD names
-// and the repository's object format ("sha1" or "sha256"); Blob returns the
+// Prober reads a git checkout's HEAD. Head returns the commit HEAD names,
+// the repository's object format and its top-level; Blob returns the
 // object id of rel (a slash path relative to dir) in that commit's tree.
 // Blob takes the commit Head returned, so both answers are about one commit.
 type Prober interface {
-	Head(dir string) (commit, format string, err error)
+	Head(dir string) (HeadInfo, error)
 	Blob(dir, commit, rel string) (string, error)
+}
+
+// HeadInfo is what Head reads: the commit HEAD names, the object format
+// ("sha1" or "sha256") and the repository's working tree top-level.
+type HeadInfo struct {
+	Commit, Format, TopLevel string
 }
 
 // Errors a Prober returns; each becomes a source_unverified reason.
@@ -45,17 +53,23 @@ func gitReason(err error) string {
 	return "git probe failed: " + err.Error()
 }
 
-// gitOptions come before the subcommand on every run. --no-lazy-fetch and
-// protocol.allow=never keep a partial clone from fetching a missing object
-// (git fails instead); core.fsmonitor=false keeps a repository's
-// configuration from starting a monitor.
+// gitOptions come before the subcommand on every run. --no-lazy-fetch keeps
+// a partial clone from fetching a missing object (git fails instead).
+// protocol.allow=never is a second guard, but a repository's own
+// protocol.<name>.allow can override it; the empty GIT_ALLOW_PROTOCOL in
+// gitEnv is the guard repository configuration cannot lift.
+// core.fsmonitor=false keeps a repository's configuration from starting a
+// monitor.
 var gitOptions = []string{"--no-lazy-fetch", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false"}
 
-// gitEnv is git's whole environment besides PATH: no user or system
-// configuration, no lazy fetch, no prompts, no optional lock files, no
-// replace refs, and messages in the C locale. Nothing else from the
-// server's environment (GIT_DIR, HOME, ...) reaches git.
+// gitEnv is git's whole environment besides PATH: no transport allowed
+// (an empty GIT_ALLOW_PROTOCOL lists none, and overrides any
+// protocol.*.allow), no user or system configuration, no lazy fetch, no
+// prompts, no optional lock files, no replace refs, and messages in the C
+// locale. Nothing else from the server's environment (GIT_DIR, HOME, ...)
+// reaches git.
 var gitEnv = []string{
+	"GIT_ALLOW_PROTOCOL=",
 	"GIT_CONFIG_GLOBAL=/dev/null",
 	"GIT_CONFIG_NOSYSTEM=1",
 	"GIT_NO_LAZY_FETCH=1",
@@ -69,15 +83,20 @@ var gitEnv = []string{
 // maxGitOutput bounds what is kept of one run's stdout and stderr.
 const maxGitOutput = 4096
 
-type gitProber struct{ timeout time.Duration }
+type gitProber struct {
+	timeout time.Duration
+	// lazyFetch drops --no-lazy-fetch and GIT_NO_LAZY_FETCH, so a test can
+	// show the protocol settings alone keep git offline.
+	lazyFetch bool
+}
 
 // GitProber runs only `git rev-parse`, offline and read-only, each run
 // limited to timeout. It never runs status, diff or anything that applies
 // filters: the file's blob id is computed here from the snapshot.
-func GitProber(timeout time.Duration) Prober { return gitProber{timeout} }
+func GitProber(timeout time.Duration) Prober { return gitProber{timeout: timeout} }
 
 // revParse runs `git <options> -C dir rev-parse args...`. A clean exit
-// gives the first line of stdout; exit 1 (what --verify --quiet gives for a
+// gives stdout without its surrounding space; exit 1 (what --verify --quiet gives for a
 // name that does not resolve) gives found == false and no error.
 func (g gitProber) revParse(dir string, args ...string) (out string, found bool, err error) {
 	bin, err := exec.LookPath("git")
@@ -86,9 +105,14 @@ func (g gitProber) revParse(dir string, args ...string) (out string, found bool,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
-	argv := append(append(append([]string{}, gitOptions...), "-C", dir, "rev-parse"), args...)
+	opts, env := gitOptions, gitEnv
+	if g.lazyFetch {
+		opts = slices.DeleteFunc(slices.Clone(opts), func(o string) bool { return o == "--no-lazy-fetch" })
+		env = slices.DeleteFunc(slices.Clone(env), func(e string) bool { return e == "GIT_NO_LAZY_FETCH=1" })
+	}
+	argv := append(append(slices.Clone(opts), "-C", dir, "rev-parse"), args...)
 	cmd := exec.CommandContext(ctx, bin, argv...)
-	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, gitEnv...)
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, env...)
 	cmd.Dir = dir
 	var stdout, stderr capped
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -98,8 +122,7 @@ func (g gitProber) revParse(dir string, args ...string) (out string, found bool,
 		return "", false, fmt.Errorf("git timed out after %s", g.timeout)
 	}
 	if runErr == nil {
-		line, _, _ := strings.Cut(stdout.String(), "\n")
-		return strings.TrimSpace(line), true, nil
+		return strings.TrimSpace(stdout.String()), true, nil
 	}
 	exitErr, ok := errors.AsType[*exec.ExitError](runErr)
 	if !ok {
@@ -111,6 +134,9 @@ func (g gitProber) revParse(dir string, args ...string) (out string, found bool,
 		return "", false, ErrGitTooOld
 	case strings.Contains(msg, "not a git repository"):
 		return "", false, ErrNotCheckout
+	case strings.Contains(msg, "from promisor remote"), strings.Contains(msg, "transport '") && strings.Contains(msg, "' not allowed"):
+		// A missing object git was refused leave to fetch.
+		return "", false, ErrObjectMissing
 	case strings.Contains(msg, "dubious ownership"):
 		return "", false, errors.New("git refuses a repository owned by another user")
 	case code == 1 && strings.TrimSpace(msg) == "":
@@ -121,25 +147,29 @@ func (g gitProber) revParse(dir string, args ...string) (out string, found bool,
 	}
 }
 
-func (g gitProber) Head(dir string) (string, string, error) {
+func (g gitProber) Head(dir string) (HeadInfo, error) {
 	commit, found, err := g.revParse(dir, "--verify", "--quiet", "HEAD^{commit}")
 	if err != nil {
-		return "", "", err
+		return HeadInfo{}, err
 	}
 	if !found {
-		return "", "", ErrNoCommit
+		return HeadInfo{}, ErrNoCommit
 	}
-	format, found, err := g.revParse(dir, "--show-object-format")
+	out, found, err := g.revParse(dir, "--show-object-format", "--show-toplevel")
 	if err != nil {
-		return "", "", err
+		return HeadInfo{}, err
 	}
+	format, top, _ := strings.Cut(out, "\n")
 	if !found || oidLen(format) == 0 {
-		return "", "", fmt.Errorf("unknown object format %q", format)
+		return HeadInfo{}, fmt.Errorf("unknown object format %q", format)
 	}
 	if !validOID(commit) || len(commit) != oidLen(format) {
-		return "", "", fmt.Errorf("unexpected commit id %q", commit)
+		return HeadInfo{}, fmt.Errorf("unexpected commit id %q", commit)
 	}
-	return commit, format, nil
+	if !filepath.IsAbs(top) || strings.Contains(top, "\n") {
+		return HeadInfo{}, fmt.Errorf("unexpected top-level %q", top)
+	}
+	return HeadInfo{Commit: commit, Format: format, TopLevel: top}, nil
 }
 
 // Blob looks rel up in commit's tree and checks the object is present

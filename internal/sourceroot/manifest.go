@@ -81,8 +81,11 @@ func (m Manifest) validate() error {
 		return fmt.Errorf("commit %q is not a full lowercase hex object id", m.Commit)
 	}
 	for p, sum := range m.Files {
-		if p == "" || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
+		if p == "" || p == "." || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
 			return fmt.Errorf("file %q is not a clean path relative to a source root", p)
+		}
+		if slices.Contains(strings.Split(p, "/"), ".git") {
+			return fmt.Errorf("file %q is inside git metadata, which is never source", p)
 		}
 		if b, err := hex.DecodeString(sum); err != nil || len(b) != 32 || strings.ToLower(sum) != sum {
 			return fmt.Errorf("file %q: %q is not a lowercase hex SHA-256", p, sum)

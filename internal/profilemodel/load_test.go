@@ -299,3 +299,125 @@ func TestLoadAcceptsUncompressedProtobuf(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestHandleNamesTheSidecarSelection(t *testing.T) {
+	raw := twoSamples()
+	good := execlogFor(t, raw, gpuHdr, goodRows(), 2)
+	wrong := execlogFor(t, gpuProfile(fx{stack: []string{"x"}, value: 5}), gpuHdr, []execlog.Row{{Value: 5}}, 1)
+	badValue := execlogFor(t, raw, gpuHdr, []execlog.Row{{Sample: 0, Value: 1}, {Sample: 1, Execution: 1}}, 2)
+	over := DefaultLimits()
+	over.MaxSidecarBytes = 8
+
+	type c struct {
+		name string
+		log  []byte
+		lim  Limits
+	}
+	cases := []c{
+		{"none", nil, DefaultLimits()},
+		{"empty", []byte{}, DefaultLimits()},
+		{"corrupt", good[:len(good)-3], DefaultLimits()},
+		{"wrong profile", wrong, DefaultLimits()},
+		{"value mismatch", badValue, DefaultLimits()},
+		{"over limit", good, over},
+		{"accepted", good, DefaultLimits()},
+	}
+	seen := map[Handle]string{}
+	for _, tc := range cases {
+		p := mustLoad(t, raw, tc.log, tc.lim)
+		if prev, dup := seen[p.Handle]; dup {
+			t.Fatalf("%s and %s share handle %q", prev, tc.name, p.Handle)
+		}
+		seen[p.Handle] = tc.name
+	}
+	// Same accepted sidecar twice: same handle.
+	a, b := mustLoad(t, raw, good, DefaultLimits()), mustLoad(t, raw, good, DefaultLimits())
+	if a.Handle != b.Handle || !a.Executions.OK {
+		t.Fatalf("handles %q %q", a.Handle, b.Handle)
+	}
+	// Over-limit files are never hashed: two different ones do not collide.
+	other := execlogFor(t, raw, gpuHdr, goodRows()[:2], 2)
+	x, y := mustLoad(t, raw, good, over), mustLoad(t, raw, other, over)
+	if x.Handle == y.Handle || !strings.Contains(string(x.Handle), "+unread:") {
+		t.Fatalf("over-limit handles %q %q", x.Handle, y.Handle)
+	}
+	// Equal handles never carry different states.
+	states := map[Handle]Availability{}
+	for _, tc := range cases {
+		p := mustLoad(t, raw, tc.log, tc.lim)
+		if s, ok := states[p.Handle]; ok && s != p.Executions {
+			t.Fatalf("handle %q has two states", p.Handle)
+		}
+		states[p.Handle] = p.Executions
+	}
+}
+
+func TestLoadFileOverSidecarCapIsUnreadHandle(t *testing.T) {
+	dir := t.TempDir()
+	pp, lp := filepath.Join(dir, "p"), filepath.Join(dir, "l")
+	if err := os.WriteFile(pp, twoSamples(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lp, bytes.Repeat([]byte{1}, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lim := DefaultLimits()
+	lim.MaxSidecarBytes = 10
+	p, err := Load(pp, lp, lim)
+	if err != nil || p.Executions.Reason != ReasonSidecarLimits || !strings.Contains(string(p.Handle), "+unread:") {
+		t.Fatalf("%v %+v %q", err, p.Executions, p.Handle)
+	}
+	p, err = Load(pp, filepath.Join(dir, "missing"), lim)
+	if err != nil || p.Executions.Reason != ReasonCorrupt || !strings.Contains(string(p.Handle), "+unread:") {
+		t.Fatalf("%v %+v %q", err, p.Executions, p.Handle)
+	}
+}
+
+// inlineProfile has one location with n inline Line entries, referenced
+// refs times by a single sample.
+func inlineProfile(t *testing.T, n, refs int) []byte {
+	t.Helper()
+	p := &profile.Profile{SampleType: []*profile.ValueType{{Type: "gpu", Unit: "nanoseconds"}}}
+	m := &profile.Mapping{ID: 1}
+	p.Mapping = []*profile.Mapping{m}
+	l := &profile.Location{ID: 1, Mapping: m}
+	for i := range n {
+		f := &profile.Function{ID: uint64(i + 1), Name: "f" + strings.Repeat("x", i)}
+		p.Function = append(p.Function, f)
+		l.Line = append(l.Line, profile.Line{Function: f})
+	}
+	p.Location = []*profile.Location{l}
+	s := &profile.Sample{Value: []int64{1}}
+	for range refs {
+		s.Location = append(s.Location, l)
+	}
+	p.Sample = []*profile.Sample{s}
+	var buf bytes.Buffer
+	if err := p.Write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestMaxDepthCountsInlineFrames(t *testing.T) {
+	lim := DefaultLimits()
+	lim.MaxDepth = 12
+	_, err := FromBytes(inlineProfile(t, 13, 1), nil, lim)
+	if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxDepth") {
+		t.Fatalf("13 inline lines under 12: %v", err)
+	}
+	lim.MaxDepth = 13
+	if _, err := FromBytes(inlineProfile(t, 13, 1), nil, lim); err != nil {
+		t.Fatalf("13 at 13: %v", err)
+	}
+	// Repeated reference to an inline-heavy location: 5 lines x 3 = 15.
+	lim.MaxDepth = 14
+	_, err = FromBytes(inlineProfile(t, 5, 3), nil, lim)
+	if !errors.Is(err, ErrLimit) || !strings.Contains(err.Error(), "MaxDepth") {
+		t.Fatalf("repeated: %v", err)
+	}
+	lim.MaxDepth = 15
+	if _, err := FromBytes(inlineProfile(t, 5, 3), nil, lim); err != nil {
+		t.Fatalf("repeated at 15: %v", err)
+	}
+}

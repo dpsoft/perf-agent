@@ -3,6 +3,7 @@ package profilemodel
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -47,8 +48,8 @@ type Limits struct {
 	// stream. Both are enforced before and during parsing.
 	MaxRawBytes, MaxDecompressedBytes int64
 	// MaxSamples, MaxLocations and MaxDepth are structural and checked after
-	// parsing, before any tree is built. MaxDepth applies to the number of
-	// locations in one sample.
+	// parsing, before any tree is built. MaxDepth applies to a sample's
+	// expanded depth: the sum over its locations of max(1, inline lines).
 	MaxSamples, MaxLocations, MaxDepth int
 	// MaxSidecarBytes is enforced while reading the log.
 	MaxSidecarBytes int64
@@ -78,8 +79,12 @@ func limitErr(name string, limit, got any) error {
 	return fmt.Errorf("%w: %s %v exceeded (%v)", ErrLimit, name, limit, got)
 }
 
-// Handle names a loaded profile: "<profile digest hex>", or
-// "<profile digest hex>+<execlog sha hex>" when a log was accepted.
+// Handle names the evidence a load selected, not whether it was accepted:
+// "<pd>" with no sidecar; "<pd>+<sidecar sha256 hex>" for a sidecar that was
+// fully read (accepted or rejected); "<pd>+empty" for an empty one; and
+// "<pd>+unread:<reason>:<16 hex>" for one that could not be read or exceeded
+// MaxSidecarBytes, where the suffix is an opaque per-load id, not a content
+// hash.
 type Handle string
 
 // Profile is a parsed pprof profile and, when one was accepted, the
@@ -100,40 +105,35 @@ func Load(profilePath, execlogPath string, lim Limits) (*Profile, error) {
 	if err != nil {
 		return nil, err
 	}
-	var side []byte
-	if execlogPath != "" {
-		side, err = readCapped(execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
-		switch {
-		case errors.Is(err, ErrLimit):
-			p, perr := FromBytes(raw, nil, lim)
-			if perr != nil {
-				return nil, perr
-			}
-			p.Executions = Availability{Reason: ReasonSidecarLimits}
-			return p, nil
-		case err != nil:
-			p, perr := FromBytes(raw, nil, lim)
-			if perr != nil {
-				return nil, perr
-			}
-			p.Executions = Availability{Reason: ReasonCorrupt}
-			return p, nil
-		}
-		if side == nil {
-			side = []byte{}
-		}
+	if execlogPath == "" {
+		return assemble(raw, nil, "", lim)
 	}
-	return FromBytes(raw, side, lim)
+	side, err := readCapped(execlogPath, lim.MaxSidecarBytes, "MaxSidecarBytes")
+	switch {
+	case errors.Is(err, ErrLimit):
+		return assemble(raw, nil, ReasonSidecarLimits, lim)
+	case err != nil:
+		return assemble(raw, nil, ReasonCorrupt, lim)
+	}
+	if side == nil {
+		side = []byte{}
+	}
+	return assemble(raw, side, "", lim)
 }
 
-// readCapped reads a whole file, refusing one larger than max.
-func readCapped(path string, limit int64, name string) ([]byte, error) {
+// readCapped reads a whole file, refusing one larger than limit. It never
+// reads more than limit+1 bytes.
+func readCapped(path string, limit int64, name string) (b []byte, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			b, err = nil, cerr
+		}
+	}()
+	b, err = io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +145,15 @@ func readCapped(path string, limit int64, name string) ([]byte, error) {
 
 // FromBytes is Load on bytes already in memory; execlog nil means none.
 func FromBytes(raw []byte, execlogBytes []byte, lim Limits) (*Profile, error) {
+	if int64(len(execlogBytes)) > lim.MaxSidecarBytes {
+		return assemble(raw, nil, ReasonSidecarLimits, lim)
+	}
+	return assemble(raw, execlogBytes, "", lim)
+}
+
+// assemble loads raw. A sidecar is selected by execlogBytes (nil = none) or, when
+// it was supplied but not fully read, by unread holding why.
+func assemble(raw, execlogBytes []byte, unread string, lim Limits) (*Profile, error) {
 	if int64(len(raw)) > lim.MaxRawBytes {
 		return nil, limitErr("MaxRawBytes", lim.MaxRawBytes, len(raw))
 	}
@@ -184,14 +193,27 @@ func FromBytes(raw []byte, execlogBytes []byte, lim Limits) (*Profile, error) {
 	}
 	p.Handle = Handle(p.Digest.String())
 
-	if execlogBytes != nil {
-		execOf, sha, reason := checkExeclog(raw, execlogBytes, p, lim)
+	switch {
+	case unread != "":
+		var id [8]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return nil, fmt.Errorf("profilemodel: handle: %w", err)
+		}
+		p.Executions = Availability{Reason: unread}
+		p.Handle += Handle("+unread:" + strings.ReplaceAll(unread, " ", "-") + ":" + hex.EncodeToString(id[:]))
+	case execlogBytes != nil:
+		execOf, _, reason := checkExeclog(raw, execlogBytes, p, lim)
 		if reason != "" {
 			p.Executions = Availability{Reason: reason}
 		} else {
 			p.Executions = Availability{OK: true}
 			p.execOf = execOf
-			p.Handle = Handle(p.Digest.String() + "+" + hex.EncodeToString(sha[:]))
+		}
+		if len(execlogBytes) == 0 {
+			p.Handle += "+empty"
+		} else {
+			sum := sha256.Sum256(execlogBytes)
+			p.Handle += Handle("+" + hex.EncodeToString(sum[:]))
 		}
 	}
 	return p, nil
@@ -204,9 +226,14 @@ func checkStructure(p *profile.Profile, lim Limits) error {
 	if len(p.Location) > lim.MaxLocations {
 		return limitErr("MaxLocations", lim.MaxLocations, len(p.Location))
 	}
+	// Depth is the expanded one: every inline Line of a location is a frame.
 	for _, s := range p.Sample {
-		if len(s.Location) > lim.MaxDepth {
-			return limitErr("MaxDepth", lim.MaxDepth, len(s.Location))
+		depth := 0
+		for _, l := range s.Location {
+			depth += max(1, len(l.Line))
+			if depth > lim.MaxDepth {
+				return limitErr("MaxDepth", lim.MaxDepth, ">"+fmt.Sprint(lim.MaxDepth))
+			}
 		}
 	}
 	return nil

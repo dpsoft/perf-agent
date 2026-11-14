@@ -34,6 +34,8 @@ type Server struct {
 	sourceGit bool
 
 	store *store
+	// diffs caches computed diffs; it belongs to this server alone.
+	diffs *diffCache
 	mcp   *mcpstdio.Server
 }
 
@@ -77,6 +79,7 @@ func New(cfg Config) (_ *Server, err error) {
 			return nil, err
 		}
 	}
+	s.diffs = newDiffCache(lim.MaxCachedDiffs)
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles)
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
@@ -105,7 +108,7 @@ func (s *Server) Close() error {
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
-	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool()}
+	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.

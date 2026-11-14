@@ -12,7 +12,7 @@ import (
 //
 // New fills in defaults: a zero Limits is DefaultLimits, and a zero Model
 // is profilemodel.DefaultLimits, so a Limits that sets only some of the
-// server's own fields still loads profiles. MaxRows is filled in when zero. Any other
+// server's own fields still loads profiles. MaxRows, MaxCachedDiffs and MaxDiffRows are filled in when zero. Any other
 // non-positive server field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
@@ -26,10 +26,21 @@ type Limits struct {
 	MaxOpenHandles int
 	// MaxRows bounds the limit argument of the tools that page rows.
 	MaxRows int
+	// MaxCachedDiffs is how many computed diffs the server keeps; one more
+	// evicts the least recently used.
+	MaxCachedDiffs int
+	// MaxDiffRows bounds the limit argument of diff.
+	MaxDiffRows int
 }
 
 // defaultMaxRows is the MaxRows a server runs with unless told otherwise.
 const defaultMaxRows = 200
+
+// Defaults of the diff limits.
+const (
+	defaultMaxCachedDiffs = 4
+	defaultMaxDiffRows    = 500
+)
 
 // DefaultLimits are the limits a server runs with unless told otherwise.
 func DefaultLimits() Limits {
@@ -39,6 +50,8 @@ func DefaultLimits() Limits {
 		MaxResponseBytes: 1 << 20,
 		MaxOpenHandles:   8,
 		MaxRows:          defaultMaxRows,
+		MaxCachedDiffs:   defaultMaxCachedDiffs,
+		MaxDiffRows:      defaultMaxDiffRows,
 	}
 }
 
@@ -53,6 +66,12 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxRows == 0 {
 		l.MaxRows = defaultMaxRows
 	}
+	if l.MaxCachedDiffs == 0 {
+		l.MaxCachedDiffs = defaultMaxCachedDiffs
+	}
+	if l.MaxDiffRows == 0 {
+		l.MaxDiffRows = defaultMaxDiffRows
+	}
 	return l
 }
 
@@ -66,6 +85,8 @@ func (l Limits) validate() error {
 		{"MaxResponseBytes", l.MaxResponseBytes},
 		{"MaxOpenHandles", l.MaxOpenHandles},
 		{"MaxRows", l.MaxRows},
+		{"MaxCachedDiffs", l.MaxCachedDiffs},
+		{"MaxDiffRows", l.MaxDiffRows},
 	} {
 		if f.v <= 0 {
 			return fmt.Errorf("perfmcp: limit %s must be positive, got %d", f.name, f.v)

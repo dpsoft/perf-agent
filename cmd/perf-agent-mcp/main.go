@@ -87,6 +87,11 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		}
 	}
 
+	if err := checkLimits(&lim); err != nil {
+		_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: %v\n", err)
+		return 2
+	}
+
 	log := slog.New(slog.NewTextHandler(stderr, nil))
 	srv, err := perfmcp.New(perfmcp.Config{
 		ProfilesDir:     *profiles,
@@ -127,9 +132,14 @@ func limitFields(l *perfmcp.Limits) map[string]reflect.Value {
 				continue
 			}
 			name := prefix + f.Name
-			if f.Type.Kind() == reflect.Struct {
+			switch {
+			case f.Type == durationType:
+			case f.Type.Kind() == reflect.Struct:
 				walk(name+".", v.Field(i))
 				continue
+			case isSignedInt(f.Type.Kind()):
+			default:
+				panic("perf-agent-mcp: limit " + name + " has a type --limit cannot set: " + f.Type.String())
 			}
 			out[name] = v.Field(i)
 		}
@@ -139,6 +149,31 @@ func limitFields(l *perfmcp.Limits) map[string]reflect.Value {
 }
 
 var durationType = reflect.TypeFor[time.Duration]()
+
+// checkLimitTypes fails at start-up if a field of perfmcp.Limits could not
+// be set by --limit, so a new field of another type cannot go unnoticed.
+var _ = limitFields(&perfmcp.Limits{})
+
+func isSignedInt(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	}
+	return false
+}
+
+// checkLimits refuses a limit that is not positive, naming it; the server
+// would otherwise replace a zero with a default without saying so.
+// Source.MaxContext may be zero (no context lines).
+func checkLimits(l *perfmcp.Limits) error {
+	for name, f := range limitFields(l) {
+		if f.Int() > 0 || (f.Int() == 0 && name == "Source.MaxContext") {
+			continue
+		}
+		return fmt.Errorf("limit %s must be positive, got %d", name, f.Int())
+	}
+	return nil
+}
 
 // setLimit applies one Name=Value to l.
 func setLimit(l *perfmcp.Limits, kv string) error {
@@ -165,6 +200,9 @@ func setLimit(l *perfmcp.Limits, kv string) error {
 		return nil
 	}
 	n, err := strconv.ParseInt(val, 10, 64)
+	if errors.Is(err, strconv.ErrRange) {
+		return fmt.Errorf("%q is out of range for %s", val, name)
+	}
 	if err != nil {
 		return fmt.Errorf("%q is not an integer", val)
 	}

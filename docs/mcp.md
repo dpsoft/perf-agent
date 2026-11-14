@@ -27,7 +27,7 @@ go build -o perf-agent-mcp ./cmd/perf-agent-mcp
 | `--limit Name=Value` | Override a limit. Repeatable. Names are the fields of the limits table below, such as `Model.MaxRawBytes=1073741824`. An unknown name exits 2 and lists the valid ones. |
 | `--version` | Print the version. |
 
-Exit status: 0 at end of input, 1 on a runtime error, 2 on a usage error. Logs go to stderr; stdout carries only JSON-RPC.
+Exit status: 0 at end of input or on SIGINT/SIGTERM, 1 on a runtime error, 2 on a usage error. Logs go to stderr; stdout carries only JSON-RPC.
 
 ### Roots
 
@@ -49,12 +49,20 @@ Integers are decimal strings in every result. A fact has `status` `ok`, `zero` o
 | `source` | Source lines for a node and how well they are tied to the profiled build. |
 | `render_flamegraph` | Check explanations and write an explained flame graph page. |
 
-Example, opening a profile and listing its widest nodes:
+Every tool takes `handle` and `view` (a view name `open` returned, such as `cpu/nanoseconds#0`) unless noted. One example call of each, as `arguments`:
 
 ```json
-{"name": "open", "arguments": {"path": "cpu.pb.gz"}}
-{"name": "top", "arguments": {"handle": "<handle from open>", "view": "cpu/nanoseconds#0", "rows": "nodes", "limit": 5}}
+open               {"path": "cpu.pb.gz", "execlog": "run.execlog"}
+top                {"handle": "<handle>", "view": "cpu/nanoseconds#0", "rows": "nodes", "by": "cum", "limit": 5}
+path               {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>", "limit": 200}
+sandwich           {"handle": "<handle>", "view": "cpu/nanoseconds#0", "function": "<function ref from top with rows=functions>"}
+gpu_kernels_for    {"handle": "<handle>", "view": "<a GPU view>", "node": "<launch node id from top>"}
+facts              {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>"}
+diff               {"base_handle": "<handle>", "base_view": "cpu/nanoseconds#0", "new_handle": "<handle>", "new_view": "cpu/nanoseconds#0", "work_base": 1000, "work_new": 1200}
+source             {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>", "context": 5}
 ```
+
+`render_flamegraph` has its own example under Explanations. `execlog`, `work_base`, `work_new` and `context` are optional; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
 
 Lists carry `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (the sum of the omitted rows' own values, which overlap, so never a remaining share) and `next_cursor`; pass the cursor back with the same arguments.
 
@@ -89,11 +97,11 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 | `user_selected` | The file is in a git checkout under the named source root and matches its committed blob. |
 | `source_unverified` | The file exists but nothing ties it to the profiled build; the reason says why. |
 | `ambiguous` | Several candidate files (at most 16 are listed). |
-| `unresolved` | No file was found. |
+| `unresolved` | No file was found, or the file could not be read. |
 
 ## Limits
 
-Defaults; override with `--limit Name=Value`. Sizes are bytes; every limit must be positive.
+Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must be positive (`Source.MaxContext` may be 0); a zero, negative or out-of-range value exits 2 and names the limit.
 
 | Name | Default |
 |---|---|

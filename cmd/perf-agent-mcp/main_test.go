@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
@@ -184,5 +190,195 @@ func TestTheServerIsNotShipped(t *testing.T) {
 		if bytes.Contains(b, []byte("perf-agent-mcp")) {
 			t.Errorf("%s mentions perf-agent-mcp: the server is source-only", f)
 		}
+	}
+}
+
+func TestRunValidatesResolvedLimits(t *testing.T) {
+	for _, c := range []struct{ limit, field string }{
+		{"MaxRows=0", "MaxRows"},
+		{"MaxOpenHandles=-1", "MaxOpenHandles"},
+		{"Model.MaxSamples=0", "Model.MaxSamples"},
+		{"Model.MaxCommentBytes=-5", "Model.MaxCommentBytes"},
+		{"Explain.MaxClaimsTotal=0", "Explain.MaxClaimsTotal"},
+		{"Source.GitTimeout=0s", "Source.GitTimeout"},
+	} {
+		var out, errb bytes.Buffer
+		code := run([]string{"--profiles", t.TempDir(), "--limit", c.limit}, strings.NewReader(""), &out, &errb)
+		if code != 2 || !strings.Contains(errb.String(), c.field) {
+			t.Errorf("%s: exit %d, stderr %q", c.limit, code, errb.String())
+		}
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"--profiles", t.TempDir(), "--limit", "Source.MaxContext=0"}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Errorf("Source.MaxContext=0: exit %d, stderr %q", code, errb.String())
+	}
+}
+
+func TestRunSaysOutOfRangeLimits(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxRows=99999999999999999999"}, strings.NewReader(""), &out, &errb)
+	if code != 2 || !strings.Contains(errb.String(), "out of range") || strings.Contains(errb.String(), "not an integer") {
+		t.Errorf("exit %d, stderr %q", code, errb.String())
+	}
+}
+
+func TestEveryLimitFieldCanBeSetByFlag(t *testing.T) {
+	l := perfmcp.DefaultLimits()
+	fields := limitFields(&l)
+	if len(fields) < 30 {
+		t.Errorf("only %d settable limits", len(fields))
+	}
+	for name, f := range fields {
+		switch k := f.Kind(); {
+		case f.Type() == reflect.TypeFor[time.Duration](), k >= reflect.Int && k <= reflect.Int64:
+		default:
+			t.Errorf("%s has kind %v", name, k)
+		}
+	}
+}
+
+func TestLogsReachStderr(t *testing.T) {
+	_, stderr, _, _ := session(t)
+	if !strings.Contains(stderr, "msg=opened") {
+		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+// stdioClient drives run over pipes.
+type stdioClient struct {
+	t      *testing.T
+	w      *io.PipeWriter
+	r      *bufio.Reader
+	nextID int
+	done   chan int
+}
+
+func startRun(t *testing.T, args ...string) *stdioClient {
+	t.Helper()
+	sr, cw := io.Pipe()
+	cr, sw := io.Pipe()
+	c := &stdioClient{t: t, w: cw, r: bufio.NewReaderSize(cr, 1<<20), nextID: 1, done: make(chan int, 1)}
+	go func() {
+		code := run(args, sr, sw, io.Discard)
+		_ = sw.Close()
+		c.done <- code
+	}()
+	t.Cleanup(func() {
+		_ = cw.Close()
+		if code := <-c.done; code != 0 {
+			t.Errorf("exit %d", code)
+		}
+	})
+	c.call("initialize", map[string]any{"protocolVersion": "2025-11-25"})
+	return c
+}
+
+func (c *stdioClient) call(method string, params any) json.RawMessage {
+	c.t.Helper()
+	req, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": c.nextID, "method": method, "params": params})
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	c.nextID++
+	if _, err := c.w.Write(append(req, '\n')); err != nil {
+		c.t.Fatal(err)
+	}
+	line, err := c.r.ReadBytes('\n')
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var res struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(line, &res); err != nil {
+		c.t.Fatalf("%s: %v", line, err)
+	}
+	return res.Result
+}
+
+// tool calls a tool and returns its text.
+func (c *stdioClient) tool(name string, args any) string {
+	c.t.Helper()
+	var res struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	raw := c.call("tools/call", map[string]any{"name": name, "arguments": args})
+	if err := json.Unmarshal(raw, &res); err != nil || len(res.Content) != 1 || res.IsError {
+		c.t.Fatalf("%s: %s (%v)", name, raw, err)
+	}
+	return res.Content[0].Text
+}
+
+// sourceStatus runs the source tool on CPUBasic's node b against a git
+// checkout holding src/app.c and returns the row's status and reason.
+func sourceStatus(t *testing.T, extra ...string) (status, reason string) {
+	t.Helper()
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var lines strings.Builder
+	for i := 1; i <= 60; i++ {
+		fmt.Fprintf(&lines, "line %d\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(src, "src", "app.c"), []byte(lines.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"commit", "-q", "-m", "init"}} {
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", "-C", src}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	profiles := t.TempDir()
+	if err := os.WriteFile(filepath.Join(profiles, "cpu.pb.gz"), pmfixture.CPUBasic(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := startRun(t, append([]string{"--profiles", profiles, "--source", src}, extra...)...)
+	var o struct {
+		Handle      string `json:"handle"`
+		DefaultView string `json:"default_view"`
+	}
+	if err := json.Unmarshal([]byte(c.tool("open", map[string]any{"path": "cpu.pb.gz"})), &o); err != nil {
+		t.Fatal(err)
+	}
+	var top struct {
+		Rows []struct{ Node, Name string } `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.tool("top", map[string]any{"handle": o.Handle, "view": o.DefaultView, "rows": "nodes", "limit": 20})), &top); err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(top.Rows, func(r struct{ Node, Name string }) bool { return r.Name == "b" })
+	if i < 0 {
+		t.Fatalf("no node b in %+v", top.Rows)
+	}
+	var out struct {
+		Rows []struct {
+			Resolution struct {
+				Status string `json:"status"`
+				Reason string `json:"reason"`
+			} `json:"resolution"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.tool("source", map[string]any{"handle": o.Handle, "view": o.DefaultView, "node": top.Rows[i].Node})), &out); err != nil || len(out.Rows) != 1 {
+		t.Fatalf("source: %+v (%v)", out, err)
+	}
+	return out.Rows[0].Resolution.Status, out.Rows[0].Resolution.Reason
+}
+
+func TestSourceGitIsOnByDefault(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if status, reason := sourceStatus(t); status != "user_selected" {
+		t.Errorf("default: status %q (%s), want user_selected", status, reason)
+	}
+	status, reason := sourceStatus(t, "--source-git=false")
+	if status != "source_unverified" || reason != "git probe disabled" {
+		t.Errorf("--source-git=false: status %q reason %q", status, reason)
 	}
 }

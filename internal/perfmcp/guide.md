@@ -6,7 +6,7 @@ perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with
 
 `open` -> `top` -> `path` / `gpu_kernels_for` / `sandwich` -> `facts` -> `source` -> `render_flamegraph`. For two profiles, open both and call `diff`.
 
-1. `open {path}` returns a `handle`, the `views` (pass one as `view`), the default view and its quality and sampling `notes`. Paths are relative to the profiles root or absolute inside it.
+1. `open {path, execlog?}` (`execlog` is a GPU executions log in the profiles root) returns a `handle`, the `views` (pass one as `view`), the default view and its quality and sampling `notes`. Paths are relative to the profiles root or absolute inside it.
 2. `top` with `rows: "functions"` (aggregated by function) or `"nodes"` (call-tree nodes, which carry the node IDs). `by: cum|self`.
 3. `path {node}` is the root-first stack of a node; `sandwich {function}` its callers and callees; `gpu_kernels_for {node}` the kernels under a launch node.
 4. `facts {node}` is the full fact set of one node.
@@ -19,7 +19,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 - Every integer (values, counts, weights) is a decimal string. Do not convert it to a float; quote it as the string.
 - A fact has `status` `ok`, `zero` or `unavailable`. An unavailable fact has a `reason` and no `value`: unavailable is not zero, never report it as 0.
-- A share names its `denominator` (`view_total`, parent, ...). Say which one.
+- A share names its `denominator` (`view_total`, parent, ...). Say which one, and copy the fact's denominator and unit into the claim.
 - Lists are paged: `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (with `omitted_weight_basis`) and `next_cursor`. Pass the cursor back with the same arguments. The omitted rows overlap (a callee is inside its caller), so `omitted_weight` is a sum of the rows' own values, never a remaining share.
 - `unsampled_portion` is a view-level fact. It is in the `facts` response under `view_scope`, not on any node.
 
@@ -27,7 +27,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 - A width under `[gpu:launch]` is a sample of launches, not a share of GPU time.
 - `[gpu:launch unsampled]` has no caller and is never attributed to a stack.
-- Nothing is ever multiplied by the sample period: it is never multiplied by the sample period to get launches, executions or time.
+- Nothing is multiplied by the sample period to get launches, executions or time: it is never multiplied by the sample period.
 - Executions come only from a checked execlog (`open` reports whether one was accepted and why not). Never count samples or execlog rows as executions.
 - Every GPU answer carries the view's sampling `notes`; read them.
 
@@ -37,7 +37,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 ## Source
 
-`source` statuses: `build_verified` (a manifest ties the file to the build), `user_selected` (the file is in a git checkout the user named), `source_unverified` (it exists but nothing ties it to the profiled build), `ambiguous` (several candidates), `unresolved`. A PC-sampled (`gpu_pc`) source line is `build_verified` only by a manifest naming the capture id. Do not present `source_unverified` lines as the code that ran.
+`source` statuses: `build_verified` (a manifest ties the file to the build), `user_selected` (the file is in a git checkout the user named and matches its committed blob; this does not tie it to the profiled build), `source_unverified` (it exists but nothing ties it to the profiled build), `ambiguous` (several candidates), `unresolved` (also an unreadable file). A PC-sampled (`gpu_pc`) source line is `build_verified` only by a manifest naming the capture id. Do not present `source_unverified` lines as the code that ran.
 
 ## Explanations (render_flamegraph)
 

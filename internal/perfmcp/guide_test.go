@@ -61,12 +61,17 @@ func TestGuideIsServedAsPromptAndResource(t *testing.T) {
 }
 
 func TestInitializeInstructionsPointAtTheGuide(t *testing.T) {
-	srv, err := New(testConfig(t))
-	if err != nil {
+	c := newTestServer(t, testConfig(t))
+	// newTestServer has already initialized; a second initialize returns the
+	// same reply.
+	res := c.rpc("initialize", map[string]any{"protocolVersion": "2025-11-25"})
+	var init struct {
+		Instructions string `json:"instructions"`
+	}
+	if err := json.Unmarshal(res.Result, &init); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = srv.Close() })
-	if !strings.Contains(instructions, "perf-agent-guide") || !strings.Contains(instructions, "perf-agent://guide") {
-		t.Errorf("instructions = %q", instructions)
+	if !strings.Contains(init.Instructions, "perf-agent-guide") || !strings.Contains(init.Instructions, "perf-agent://guide") {
+		t.Errorf("instructions = %q", init.Instructions)
 	}
 }

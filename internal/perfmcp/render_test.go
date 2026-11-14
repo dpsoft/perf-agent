@@ -1068,3 +1068,41 @@ func TestHistoryNeverMakesAValidRenderFail(t *testing.T) {
 		t.Errorf("%d-byte page: %.300s", len(page), text)
 	}
 }
+
+func TestHistoryOnALongFrameNameRendersInBoundedMemory(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OutputDir = t.TempDir()
+	long := strings.Repeat("&", 64<<10)
+	writeFixture(t, cfg.ProfilesDir, "long.pb.gz", pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn(long)}, Value: 1}))
+	c := newTestServer(t, cfg)
+	var op openOut
+	c.callOK("open", map[string]any{"path": "long.pb.gz"}, &op)
+	o := opened{c: c, handle: op.Handle, view: op.DefaultView}
+	main, callee := o.nodeID(t, "main"), o.nodeID(t, long)
+	claims := make([]any, 32)
+	for i := range claims {
+		claims[i] = map[string]any{"id": fmt.Sprintf("c%d", i+1), "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": json.RawMessage("0.62")}
+	}
+	for range 20 {
+		if text, isErr := c.call("render_flamegraph", o.args(map[string]any{"out": "x.html",
+			"explanations": []any{map[string]any{"node": callee, "claims": claims, "prose": "x"}}})); !isErr {
+			t.Fatalf("passed: %.300s", text)
+		}
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var res renderOut
+	text := c.callOK("render_flamegraph", o.args(map[string]any{"out": "after.html",
+		"explanations": []any{map[string]any{"node": main, "prose": "main"}}}), &res)
+	runtime.ReadMemStats(&after)
+	if res.Status != "written" {
+		t.Fatalf("valid render: %.400s", text)
+	}
+	alloc := after.TotalAlloc - before.TotalAlloc
+	t.Logf("the valid render allocated %d bytes for a %s-byte page", alloc, res.Bytes)
+	if alloc > 256<<20 {
+		t.Errorf("the valid render allocated %d bytes", alloc)
+	}
+}

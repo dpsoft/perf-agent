@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unsafe"
 
 	pprof "github.com/google/pprof/profile"
 
@@ -195,5 +196,64 @@ func TestDiffRetainedEstimatesTrackTheHeap(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// longUnitChain is a depth-frame chain in a sample unit of unitLen bytes.
+func longUnitChain(depth, unitLen int) []byte {
+	frames := make([]pmfixture.Frame, depth)
+	for i := range frames {
+		frames[i] = pmfixture.Fn("f" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + strings.Repeat("y", i/26))
+	}
+	return pmfixture.Build("cpu", strings.Repeat("u", unitLen), nil, pmfixture.Sample{Frames: frames, Value: 1})
+}
+
+// Every per-unit delta of a diff names one derived unit, "<unit>/work",
+// built once and shared, and the diff's estimate counts it once: a long
+// unit does not make a long string per node.
+func TestPerUnitDeltasShareOneDerivedUnit(t *testing.T) {
+	const depth, unitLen = 1500, 16 << 10
+	lim := DefaultLimits()
+	lim.MaxMetaBytes = unitLen
+	p, err := FromBytes(longUnitChain(depth, unitLen), nil, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := p.View(ViewOptions{SampleIndex: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, held := heapGrowth(func() *Diff {
+		d, err := Compare(v, v, WorkCounts{Base: 1, New: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	})
+	units := map[*byte]bool{}
+	nodes := 0
+	stack := []*DiffNode{d.Root}
+	for len(stack) > 0 {
+		dn := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if dn.DeltaPerUnit == nil {
+			t.Fatal("a node has no per-unit delta")
+		}
+		if want := v.Unit + "/work"; dn.DeltaPerUnit.Unit != want {
+			t.Fatalf("unit %.40q…, want %.40q…", dn.DeltaPerUnit.Unit, want)
+		}
+		units[unsafe.StringData(dn.DeltaPerUnit.Unit)] = true
+		nodes++
+		stack = append(stack, dn.Children...)
+	}
+	if len(units) != 1 || nodes != depth+1 {
+		t.Errorf("%d nodes hold %d copies of the derived unit, want one", nodes, len(units))
+	}
+	est := d.RetainedBytes()
+	if est < unitLen || float64(est) < 0.5*float64(held) || float64(est) > 2*float64(held) {
+		t.Errorf("RetainedBytes %d for a diff holding %d bytes, a %d-byte derived unit among them", est, held, unitLen)
+	}
+	if lit := (&Diff{Root: d.Root}).RetainedBytes(); lit < unitLen {
+		t.Errorf("the walked estimate %d does not count the derived unit", lit)
 	}
 }

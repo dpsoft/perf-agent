@@ -147,10 +147,10 @@ func viewRetained(v *View) int64 {
 
 // RetainedBytes estimates the heap d keeps reachable beyond the views it
 // compares: its union nodes, their slices and facts, and the strings the
-// diff made (causes, notes, warnings), each counted once. A diff built by
-// Compare has it computed once, at construction; any other diff is
-// estimated from its nodes on every call, which reads d and changes
-// nothing.
+// diff made (causes, notes, warnings, the per-unit deltas' derived unit),
+// each counted once. A diff built by Compare has it computed once, at
+// construction; any other diff is estimated from its nodes on every call,
+// which reads d and changes nothing.
 func (d *Diff) RetainedBytes() int64 {
 	if d.retained > 0 {
 		return d.retained
@@ -177,6 +177,9 @@ func diffRetained(d *Diff) int64 {
 		n += retainedPerDiffNode + retainedPerDiffChild*int64(cap(dn.Children)) + retainedPerCandidate*int64(cap(dn.Candidates))
 		if dn.DeltaPerUnit != nil {
 			n += retainedPerUnitDelta
+			// Compare shares one derived unit among the nodes; strs
+			// counts it once.
+			strs.add(dn.DeltaPerUnit.Unit)
 		}
 		strs.add(dn.Why)
 		stack = append(stack, dn.Children...)

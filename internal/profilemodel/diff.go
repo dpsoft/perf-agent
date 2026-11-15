@@ -263,6 +263,9 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	}
 	d := &differ{views: [2]*View{baseView, newView}, work: [2]float64{work.Base, work.New}}
 	d.perUnit = workAvailability(d.work)
+	if d.perUnit.OK {
+		d.perUnitUnit = baseView.Unit + "/work"
+	}
 	roots := [2]*Node{baseView.Root, newView.Root}
 	top := d.basisOf(roots)
 	root, err := d.node(roots, "", nil, top, nil)
@@ -316,6 +319,9 @@ type differ struct {
 	views   [2]*View
 	work    [2]float64
 	perUnit Availability
+	// perUnitUnit is the per-unit deltas' unit, "<unit>/work", built once
+	// and shared by every node: a long sample unit is held once.
+	perUnitUnit string
 }
 
 func (d *differ) gpu() bool { return d.views[baseSide].SampleType == gpuSampleType }
@@ -483,7 +489,7 @@ func (d *differ) perUnitDelta(cum [2]int64) *Fact {
 	if !d.perUnit.OK {
 		return nil
 	}
-	unit := d.views[baseSide].Unit + "/work"
+	unit := d.perUnitUnit
 	delta := float64(cum[newSide])/d.work[newSide] - float64(cum[baseSide])/d.work[baseSide]
 	if math.IsInf(delta, 0) || math.IsNaN(delta) {
 		return new(unavailableFact(MetricPerWorkDelta, unit, ReasonNonFinite))

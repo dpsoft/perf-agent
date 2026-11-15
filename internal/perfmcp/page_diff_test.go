@@ -491,3 +491,19 @@ func TestOnlyAUnionIDMayBeEscaped(t *testing.T) {
 		}
 	}
 }
+
+// A diff whose model cannot be built within MaxPageBytes publishes
+// nothing, and says which limit to raise.
+func TestPageDiffThatCannotBeDrawnSaysWhy(t *testing.T) {
+	p := openLivePair(t, func(c *Config) { c.Limits.MaxPageBytes = 600 }, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	url := pageOpen(t, p.c).URL
+	before := pageState(t, url)
+	text, isErr := p.c.call("page_diff", p.args(nil))
+	if !isErr || !strings.HasPrefix(text, "the diff cannot be drawn within this server's MaxPageBytes=600: ") ||
+		!strings.HasSuffix(text, "; restart perf-agent-mcp with a larger --limit MaxPageBytes=N; nothing was published") {
+		t.Errorf("isError=%v %s", isErr, text)
+	}
+	if after := pageState(t, url); after.Seq != before.Seq || len(after.Publications) != 0 {
+		t.Errorf("the page changed: %+v, then %+v", before, after)
+	}
+}

@@ -19,11 +19,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
 // lockedBuffer is a log destination the request goroutine and the HTTP
@@ -262,10 +264,9 @@ func liveDiffed(t *testing.T, edit func(*Config)) (*Server, *publication, string
 	o := openLive(t, s, "cpu.pb.gz")
 	o.publish(t, s, o.explained(t, s, "b", "0.411"), "")
 	n := openLive(t, s, "new.pb.gz")
-	d, bs, ns, err := s.compare(diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view})
-	if err != nil {
-		t.Fatal(err)
-	}
+	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
+	bs, ns := mustBoth(s.diffSides(q))(t)
+	d := must(s.compare(q, bs, ns))(t)
 	p := must(s.publishDiff(d, bs, ns, "", ""))(t)
 	return s, p, base
 }
@@ -287,19 +288,26 @@ func TestADiffPublicationHasAnEmptyHistory(t *testing.T) {
 
 // A diff publication pins what its routes read: the Diff, its index and
 // both sides' Profiles and Views, shared with their other holders and
-// counted once.
+// counted once, and kept when the store evicts both handles.
 func TestADiffPinsBothSides(t *testing.T) {
-	s, p, _ := liveDiffed(t, nil)
+	fixtures := map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic(), "new.pb.gz": pmfixture.CPUBasicNew(),
+		"gpu.pb.gz": pmfixture.GPUBasic(), "deep.pb.gz": pmfixture.Deep(10)}
+	s := newLiveServer(t, func(c *Config) { c.Limits.MaxOpenHandles = 2 }, fixtures)
+	base := liveURL(t, s)
+	o, n := openLive(t, s, "cpu.pb.gz"), openLive(t, s, "new.pb.gz")
+	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
+	bs, ns := mustBoth(s.diffSides(q))(t)
+	p := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", ""))(t)
 	if p.prof == p.newProf || p.v == p.newV {
 		t.Fatal("the sides are one profile")
 	}
 	// The diff alone holds its Diff and index; the store holds both sides
-	// too, and p1, an explanation of the base view, the base side.
+	// too, until opening two other profiles evicts them.
 	cases := []struct {
 		o             retained
 		held, evicted int
 	}{
-		{p.diff, 1, 1}, {p.index, 1, 1}, {p.prof, 3, 2}, {p.v, 3, 2}, {p.newProf, 2, 1}, {p.newV, 2, 1},
+		{p.diff, 1, 1}, {p.index, 1, 1}, {p.prof, 2, 1}, {p.v, 2, 1}, {p.newProf, 2, 1}, {p.newV, 2, 1},
 	}
 	for _, c := range cases {
 		if got := s.pins.holders(c.o); got != c.held {
@@ -309,15 +317,24 @@ func TestADiffPinsBothSides(t *testing.T) {
 			t.Errorf("%T is not pinned", c.o)
 		}
 	}
-	for _, h := range slices.Clone(s.store.order) {
-		s.pins.release(s.store.entries[h])
-		delete(s.store.entries, h)
+	openLive(t, s, "gpu.pb.gz")
+	openLive(t, s, "deep.pb.gz")
+	if _, ok := s.store.entries[o.e.prof.Handle]; ok {
+		t.Fatal("the base handle is still open")
 	}
-	s.store.order = nil
+	if _, ok := s.store.entries[n.e.prof.Handle]; ok {
+		t.Fatal("the new handle is still open")
+	}
 	for _, c := range cases {
 		if got := s.pins.holders(c.o); got != c.evicted {
 			t.Errorf("%T has %d holders after the store let go, want %d", c.o, got, c.evicted)
 		}
+	}
+	// The routes still compute from what the publication pins.
+	main := url.PathEscape(string(p.diff.Root.Children[0].UnionID()))
+	for _, route := range []string{"pub/p1/model", "pub/p1/frame/" + main, "pub/p1/focus/" + main, "pub/p1/export"} {
+		res, body := httpGet(t, base+route, nil)
+		wantStatus(t, route, res, body, http.StatusOK)
 	}
 }
 
@@ -1142,4 +1159,46 @@ func TestHeavyRoutesAreBounded(t *testing.T) {
 		t.Errorf("%d slots still taken", n)
 	}
 	t.Logf("%d exports, %d told to retry", ok.Load(), busy.Load())
+}
+
+// A diff with per-unit deltas in a long unit is charged for its derived
+// unit strings: whatever the diff holds, its estimate covers, so the
+// budget admits it only when it fits.
+func TestADiffIsChargedForItsDerivedUnits(t *testing.T) {
+	const depth, unitLen = 1500, 16 << 10
+	frames := make([]pmfixture.Frame, depth)
+	for i := range frames {
+		frames[i] = pmfixture.Fn(fmt.Sprintf("f%d", i))
+	}
+	raw := pmfixture.Build("cpu", strings.Repeat("u", unitLen), nil, pmfixture.Sample{Frames: frames, Value: 1})
+	s := newLiveServer(t, func(c *Config) {
+		c.Limits.Model.MaxMetaBytes = unitLen
+		c.Limits.MaxPageNodes = 1
+		c.Limits.MaxPageBytes = 1 << 20
+		c.Limits.MaxRetainedBytes = 8 << 20
+	}, map[string][]byte{"x.pb.gz": raw})
+	o := openLive(t, s, "x.pb.gz")
+	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: o.e.prof.Handle, NewView: o.view, WorkBase: new(1.0), WorkNew: new(2.0)}
+	b, n := mustBoth(s.diffSides(q))(t)
+	d := must(s.compare(q, b, n))(t)
+	units := map[*byte]int{}
+	stack := []*profilemodel.DiffNode{d.Root}
+	for len(stack) > 0 {
+		dn := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if dn.DeltaPerUnit != nil {
+			units[unsafe.StringData(dn.DeltaPerUnit.Unit)] = len(dn.DeltaPerUnit.Unit)
+		}
+		stack = append(stack, dn.Children...)
+	}
+	var unitBytes int64
+	for _, n := range units {
+		unitBytes += int64(n)
+	}
+	if d.RetainedBytes() < unitBytes {
+		t.Errorf("the diff is estimated at %d bytes while its %d derived unit strings hold %d", d.RetainedBytes(), len(units), unitBytes)
+	}
+	if _, err := s.publishDiff(d, b, n, "", ""); err != nil {
+		t.Errorf("one shared derived unit fits the budget: %v", err)
+	}
 }

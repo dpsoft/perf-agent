@@ -549,11 +549,13 @@ func TestARefusedAdmissionChangesNothing(t *testing.T) {
 	profiles := equalCPU(2)
 	cost := pubCost(t, profiles)
 	profiles["deep.pb.gz"] = pmfixture.Deep(5000)
+	profiles["deepnew.pb.gz"] = pmfixture.DeepNew(5000)
 	s := newLiveServer(t, func(c *Config) {
 		c.Limits.MaxRetainedBytes = 3 * cost
 		c.Limits.MaxPageBytes = int(cost)
 	}, profiles)
 	a, b, deep := openLive(t, s, "a.pb.gz"), openLive(t, s, "b.pb.gz"), openLive(t, s, "deep.pb.gz")
+	deepNew := openLive(t, s, "deepnew.pb.gz")
 	a.publish(t, s, a.explained(t, s, "b", "0.411"), "")
 	b.facts(t, s)
 	if err := s.live.show("p1", string(a.node(t, "b")), true); err != nil {
@@ -565,6 +567,14 @@ func TestARefusedAdmissionChangesNothing(t *testing.T) {
 	_, err := s.publishExplained(deep.e, deep.v, deep.view, deep.check(t, s, nil), "", "a9")
 	if err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=") || !strings.Contains(err.Error(), " bytes in memory (profile, view, page model and history), over MaxRetainedBytes=") {
 		t.Fatalf("publish over the budget alone: %v", err)
+	}
+	// A diff's refusal names what a diff keeps.
+	q := diffQuery{BaseHandle: deep.e.prof.Handle, BaseView: deep.view, NewHandle: deepNew.e.prof.Handle, NewView: deepNew.view}
+	bs, ns := mustBoth(s.diffSides(q))(t)
+	_, err = s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "")
+	if err == nil || !strings.Contains(err.Error(), " bytes in memory (the profiles and views of both sides, the diff and its index, and the page model), over MaxRetainedBytes=") ||
+		!strings.Contains(err.Error(), "compare smaller views") {
+		t.Fatalf("a diff over the budget alone: %v", err)
 	}
 	if after := dumpLive(s); !reflect.DeepEqual(before, after) {
 		t.Errorf("a refused admission changed the live state:\nbefore %+v\nafter  %+v", before, after)

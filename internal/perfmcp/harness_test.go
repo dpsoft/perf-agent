@@ -202,3 +202,14 @@ func httpDo(t *testing.T, method, url string, hdr map[string]string) (*http.Resp
 	}
 	return res, body
 }
+
+// mustBoth is must for a call with two results.
+func mustBoth[A, B any](a A, b B, err error) func(*testing.T) (A, B) {
+	return func(t *testing.T) (A, B) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(fmt.Errorf("unexpected error: %w", err))
+		}
+		return a, b
+	}
+}

@@ -540,9 +540,13 @@ func (s *Server) admit(p *publication) error {
 		kept = kept[1:]
 	}
 	if len(kept) == 0 && cost(nil) > s.lim.MaxRetainedBytes {
-		return fmt.Errorf("the page would keep %d bytes in memory (profile, view, page model and history), over MaxRetainedBytes=%d; "+
-			"publish a smaller view or restart perf-agent-mcp with a larger --limit MaxRetainedBytes=N",
-			cost(nil), s.lim.MaxRetainedBytes)
+		what, smaller := "profile, view, page model and history", "publish a smaller view"
+		if p.kind == pubDiff {
+			what, smaller = "the profiles and views of both sides, the diff and its index, and the page model", "compare smaller views"
+		}
+		return fmt.Errorf("the page would keep %d bytes in memory (%s), over MaxRetainedBytes=%d; "+
+			"%s or restart perf-agent-mcp with a larger --limit MaxRetainedBytes=N",
+			cost(nil), what, s.lim.MaxRetainedBytes, smaller)
 	}
 
 	for _, d := range l.pubs[:len(l.pubs)-len(kept)] {

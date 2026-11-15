@@ -88,9 +88,12 @@ func (s *Server) handlePageDiff(_ context.Context, raw json.RawMessage) (mcpstdi
 			return mcpstdio.Result{}, &nodeError{node}
 		}
 	}
-	d, base, next, err := s.compare(diffQuery{
-		BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew,
-	})
+	q := diffQuery{BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew}
+	base, next, err := s.diffSides(q)
+	if err != nil {
+		return mcpstdio.Result{}, err
+	}
+	d, err := s.compare(q, base, next)
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}

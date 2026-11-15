@@ -192,14 +192,10 @@ func (s *Server) diffSides(q diffQuery) (base, next diffSide, err error) {
 	return base, next, nil
 }
 
-// compare checks q as diff does and compares its two views, uncached:
-// every error is diff's, word for word. It returns the whole union with
-// both sides, which a publication pins.
-func (s *Server) compare(q diffQuery) (*profilemodel.Diff, diffSide, diffSide, error) {
-	base, next, err := s.diffSides(q)
-	if err != nil {
-		return nil, diffSide{}, diffSide{}, err
-	}
+// compare compares the views of q's sides, which diffSides found,
+// uncached: every error is diff's, word for word. It returns the whole
+// union, which a publication pins with both sides.
+func (s *Server) compare(q diffQuery, base, next diffSide) (*profilemodel.Diff, error) {
 	var work profilemodel.WorkCounts
 	if q.WorkBase != nil {
 		work.Base = *q.WorkBase
@@ -209,13 +205,13 @@ func (s *Server) compare(q diffQuery) (*profilemodel.Diff, diffSide, diffSide, e
 	}
 	d, err := profilemodel.Compare(base.v, next.v, work)
 	if errors.Is(err, profilemodel.ErrIncompatibleViews) {
-		return nil, diffSide{}, diffSide{}, fmt.Errorf("cannot diff view %s of %s against view %s of %s: %v; pick views with the same sample type, unit and index",
+		return nil, fmt.Errorf("cannot diff view %s of %s against view %s of %s: %v; pick views with the same sample type, unit and index",
 			q.BaseView, q.BaseHandle, q.NewView, q.NewHandle, err)
 	}
 	if err != nil {
-		return nil, diffSide{}, diffSide{}, fmt.Errorf("cannot diff the views: %v; call open again for both profiles and retry, and report this if it repeats", err)
+		return nil, fmt.Errorf("cannot diff the views: %v; call open again for both profiles and retry, and report this if it repeats", err)
 	}
-	return d, base, next, nil
+	return d, nil
 }
 
 func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
@@ -233,14 +229,14 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	q := diffQuery{BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew}
 	// The sides are checked on a cache hit too: a handle evicted since
 	// is not open, whatever the cache still holds.
-	base, _, err := s.diffSides(q)
+	base, next, err := s.diffSides(q)
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
 	key := diffKey(q)
 	d, ok := s.diffs.get(key)
 	if !ok {
-		full, _, _, err := s.compare(q)
+		full, err := s.compare(q, base, next)
 		if err != nil {
 			return mcpstdio.Result{}, err
 		}

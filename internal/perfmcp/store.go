@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/dpsoft/perf-agent/internal/foldedstacks"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -25,11 +26,11 @@ type entry struct {
 }
 
 // store holds a server's open handles. It belongs to one Server and is used
-// from its single request goroutine, so it takes no locks; there is no cache
-// shared between servers, so each server judges evidence by its own limits.
-// Each entry holds its profile and views in the server's pin ledger, and
-// lets go of them when it is evicted; a publication of them holds them on
-// its own.
+// by its engine holder only, so it takes no locks; there is no cache shared
+// between servers, so each server judges evidence by its own limits. Each
+// entry holds its profile and views in the server's pin ledger, and lets go
+// of them when it is evicted; a publication of them holds them on its own.
+// published is the exception: any goroutine may read it (openNames).
 type store struct {
 	root *os.Root
 	lim  profilemodel.Limits
@@ -43,10 +44,32 @@ type store struct {
 	// executions log from, kept after its handle is evicted: a page the
 	// server writes must never replace one of them.
 	inputs []os.FileInfo
+	// published maps the path of every open profile to its handle. The
+	// engine holder stores a new map whenever the entries change, and a
+	// stored map never changes.
+	published atomic.Pointer[map[string]profilemodel.Handle]
 }
 
 func newStore(root *os.Root, lim profilemodel.Limits, max int, pins *pins) *store {
-	return &store{root: root, lim: lim, max: max, pins: pins, entries: map[profilemodel.Handle]*entry{}}
+	s := &store{root: root, lim: lim, max: max, pins: pins, entries: map[profilemodel.Handle]*entry{}}
+	s.publish()
+	return s
+}
+
+// openNames maps the path, relative to the profiles root, of each open
+// profile to its handle, as the engine holder last published it. Any
+// goroutine may call it, without the engine; the map must not be changed.
+// A path open with and without an executions log maps to the handle used
+// most recently.
+func (s *store) openNames() map[string]profilemodel.Handle { return *s.published.Load() }
+
+// publish stores the map openNames returns. It runs under the engine.
+func (s *store) publish() {
+	m := make(map[string]profilemodel.Handle, len(s.order))
+	for _, h := range s.order {
+		m[s.entries[h].name] = h
+	}
+	s.published.Store(&m)
 }
 
 // fileFS serves already opened files under fixed names, so LoadFS reads the
@@ -104,6 +127,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	}
 	if e, ok := s.entries[p.Handle]; ok {
 		s.touch(p.Handle)
+		s.publish()
 		return e, nil
 	}
 
@@ -125,6 +149,7 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 		delete(s.entries, s.order[0])
 		s.order = slices.Delete(s.order, 0, 1)
 	}
+	s.publish()
 	return e, nil
 }
 

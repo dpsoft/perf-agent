@@ -67,16 +67,54 @@ var listenNames = map[string][]string{
 	"net/http": {"ListenAndServe", "ListenAndServeTLS"},
 }
 
-// listenFile is the one file allowed a listening call; execFile is the
-// one file allowed to import os/exec, for the offline git probe.
+// listenFile is the one file allowed a listening call. execFiles are the
+// files allowed to import os/exec: the offline git probe, and capture's
+// process starts, held to commandFile's rules. launchFile is the one file
+// allowed syscall.Exec and, for two prctl options, syscall.RawSyscall.
+// No file under shellFreeDir names a shell, sudo or pkexec in a string.
 const (
-	listenFile = "internal/livehttp/listen.go"
-	execFile   = "internal/sourceroot/git.go"
+	listenFile   = "internal/livehttp/listen.go"
+	commandFile  = "internal/capture/exec_linux.go"
+	launchFile   = "internal/capture/launch_linux.go"
+	shellFreeDir = "internal/capture/"
 )
 
+var execFiles = []string{"internal/sourceroot/git.go", commandFile}
+
 // allowedFiles names, as the scan displays them, the files allowed a
-// listening call and an os/exec import.
-type allowedFiles struct{ listen, exec string }
+// listening call, an os/exec import, the capture process starts and the
+// launcher's system calls, and the prefix of the files that must name no
+// shell ("" for every file).
+type allowedFiles struct {
+	listen          string
+	exec            []string
+	command, launch string
+	noShell         string
+}
+
+// allowedCommands are the exec.Command calls commandFile may make: in the
+// function named by the key, with the one argument named by the value. The
+// server's own executable runs in its reaper and launcher modes, and the
+// verified perf-agent; argv and environment are set on the Cmd.
+var allowedCommands = map[string]string{"selfCommand": "self", "startPerfAgent": "path"}
+
+// prctlOptions are the prctl options launchFile may pass to RawSyscall,
+// with the value the kernel gives each: the launcher's no_new_privs and
+// the reaper's child subreaper.
+var prctlOptions = map[string]struct {
+	value  string
+	kernel string
+}{
+	"prSetNoNewPrivs":     {"38", "PR_SET_NO_NEW_PRIVS"},
+	"prSetChildSubreaper": {"36", "PR_SET_CHILD_SUBREAPER"},
+}
+
+// shellNames are programs the server never runs: a string naming one, or a
+// path ending in one, is a finding where shells are checked.
+var shellNames = []string{"sh", "bash", "dash", "zsh", "sudo", "pkexec", "su", "doas"}
+
+// onlyCommands is the advice of a finding in commandFile.
+const onlyCommands = "only exec.Command(self) in selfCommand and exec.Command(path) in startPerfAgent may start a process"
 
 // clientMethods are names that dial, resolve or listen whatever their
 // receiver, so a dialer or client reached without naming its type is
@@ -98,9 +136,13 @@ var clientPackages = []string{
 type scanned struct {
 	findings []string
 	// listens are the listening calls in the allowed file, as
-	// "pkg.Name"; exec says the allowed file imports os/exec.
+	// "pkg.Name"; exec has each allowed file seen importing os/exec.
 	listens []string
-	exec    bool
+	exec    map[string]bool
+	// commands are the allowed process starts seen in the command file,
+	// as "func: exec.Command(arg)", and launches the allowed system calls
+	// seen in the launch file, in source order.
+	commands, launches []string
 }
 
 // scanNetworking parses every file and reports each use of a client name
@@ -109,9 +151,16 @@ type scanned struct {
 // import of a networking package is a finding too, as its names could not
 // be told apart, and so are cgo and go:linkname, which reach code the scan
 // cannot read. Import names are resolved per file.
+//
+// In allow.command, os/exec offers only the Cmd type and the
+// allowedCommands calls, each once. In allow.launch, syscall.Exec may be
+// called once and syscall.RawSyscall only as RawSyscall(syscall.SYS_PRCTL,
+// option, …) for each of prctlOptions once, the option a constant of the
+// kernel's value declared in that file; any other use of them is the raw
+// call finding it is everywhere else.
 func scanNetworking(t *testing.T, files []string, display func(string) string, allow allowedFiles) scanned {
 	t.Helper()
-	var out scanned
+	out := scanned{exec: map[string]bool{}}
 	fset := token.NewFileSet()
 	for _, file := range files {
 		f, err := parser.ParseFile(fset, file, nil, parser.SkipObjectResolution|parser.ParseComments)
@@ -134,10 +183,10 @@ func scanNetworking(t *testing.T, files []string, display func(string) string, a
 				report(imp, "imports %s", p)
 			case p == "C":
 				report(imp, "imports C: cgo the scan cannot read")
-			case p == "os/exec" && name == allow.exec:
-				out.exec = true
+			case p == "os/exec" && slices.Contains(allow.exec, name):
+				out.exec[name] = true
 			case p == "os/exec":
-				report(imp, "imports os/exec outside %s", allow.exec)
+				report(imp, "imports os/exec outside %s", strings.Join(allow.exec, " and "))
 			}
 			_, client := clientNames[p]
 			_, listen := listenNames[p]
@@ -162,14 +211,37 @@ func scanNetworking(t *testing.T, files []string, display func(string) string, a
 				}
 			}
 		}
+		// The allowed forms, found first, are skipped by the walk below;
+		// every other use of the same names is reported there.
+		allowed := map[*ast.SelectorExpr]bool{}
+		switch name {
+		case allow.command:
+			out.commands = append(out.commands, allowedCommandCalls(f, local, allowed)...)
+		case allow.launch:
+			launches, bad := allowedLaunchCalls(f, local, allowed)
+			out.launches = append(out.launches, launches...)
+			for _, b := range bad {
+				report(b.node, "%s", b.why)
+			}
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING && strings.HasPrefix(name, allow.noShell) {
+				if v, err := strconv.Unquote(lit.Value); err == nil && slices.Contains(shellNames, path.Base(v)) {
+					report(lit, "has the string %q: the server never runs a shell, sudo or pkexec", v)
+				}
+				return true
+			}
 			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
+			if !ok || allowed[sel] {
 				return true
 			}
 			if x, ok := sel.X.(*ast.Ident); ok {
 				if p, ok := local[x.Name]; ok {
 					qual := p + "." + sel.Sel.Name
+					if p == "os/exec" && name == allow.command && sel.Sel.Name != "Cmd" {
+						report(sel, "uses %s: %s", qual, onlyCommands)
+						return true
+					}
 					switch {
 					case slices.Contains(listenNames[p], sel.Sel.Name):
 						if name == allow.listen {
@@ -190,6 +262,117 @@ func scanNetworking(t *testing.T, files []string, display func(string) string, a
 		})
 	}
 	return out
+}
+
+// allowedCommandCalls finds, in f's functions, the exec.Command calls of
+// allowedCommands, each the first of its kind, marks their selectors in
+// allowed and describes them in source order.
+func allowedCommandCalls(f *ast.File, local map[string]string, allowed map[*ast.SelectorExpr]bool) []string {
+	var seen []string
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := qualified(call.Fun, local, "os/exec", "Command")
+			if !ok || len(call.Args) != 1 {
+				return true
+			}
+			arg, ok := call.Args[0].(*ast.Ident)
+			if !ok {
+				return true
+			}
+			desc := fmt.Sprintf("%s: exec.Command(%s)", fd.Name.Name, arg.Name)
+			if allowedCommands[fd.Name.Name] == arg.Name && !slices.Contains(seen, desc) {
+				allowed[sel] = true
+				seen = append(seen, desc)
+			}
+			return true
+		})
+	}
+	return seen
+}
+
+// finding is a node the scan reports and why.
+type finding struct {
+	node ast.Node
+	why  string
+}
+
+// allowedLaunchCalls finds, in f, the first syscall.Exec call and the
+// first RawSyscall(syscall.SYS_PRCTL, option, …) of each prctlOptions
+// option, marks their selectors in allowed and describes them in source
+// order. A prctl call whose option is not declared in f as a constant of
+// the kernel's value is a finding, and is not allowed.
+func allowedLaunchCalls(f *ast.File, local map[string]string, allowed map[*ast.SelectorExpr]bool) (seen []string, bad []finding) {
+	consts := map[string]string{} // constant name -> its literal value
+	for _, d := range f.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs := spec.(*ast.ValueSpec)
+			for i, n := range vs.Names {
+				if i < len(vs.Values) {
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.INT {
+						consts[n.Name] = lit.Value
+					}
+				}
+			}
+		}
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := qualified(call.Fun, local, "syscall", "Exec"); ok && !slices.Contains(seen, "syscall.Exec") {
+			allowed[sel] = true
+			seen = append(seen, "syscall.Exec")
+			return true
+		}
+		sel, ok := qualified(call.Fun, local, "syscall", "RawSyscall")
+		if !ok || len(call.Args) != 4 {
+			return true
+		}
+		if _, ok := qualified(call.Args[0], local, "syscall", "SYS_PRCTL"); !ok {
+			return true
+		}
+		opt, ok := call.Args[1].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		want, ok := prctlOptions[opt.Name]
+		desc := "syscall.RawSyscall(SYS_PRCTL, " + opt.Name + ")"
+		switch {
+		case !ok || slices.Contains(seen, desc):
+		case consts[opt.Name] != want.value:
+			bad = append(bad, finding{call, fmt.Sprintf("%s is not the constant %s (%s)", opt.Name, want.value, want.kernel)})
+			allowed[sel] = true
+		default:
+			allowed[sel] = true
+			seen = append(seen, desc)
+		}
+		return true
+	})
+	return seen, bad
+}
+
+// qualified reports whether e is pkg.name, pkg being the import path that
+// f's local names resolve the selector's package name to.
+func qualified(e ast.Expr, local map[string]string, pkg, name string) (*ast.SelectorExpr, bool) {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
+		return nil, false
+	}
+	x, ok := sel.X.(*ast.Ident)
+	return sel, ok && local[x.Name] == pkg
 }
 
 // listedPackage is one non-standard package of go list -deps, with the
@@ -255,7 +438,9 @@ func nativeCode(p listedPackage) string {
 // package the binary links, internal/livehttp's included, and finds no
 // dial, name lookup, HTTP client, non-TCP socket or raw system call, no
 // listening call but the one in internal/livehttp/listen.go, which checks
-// the address is loopback first, and no os/exec outside the git probe.
+// the address is loopback first, no os/exec outside the git probe and
+// capture's exec_linux.go, and in capture no process start but its two and
+// no raw system call but the launcher's prctl and exec.
 // None of those packages has code the scan cannot read: no cgo, assembly
 // or object files, and no go:linkname.
 func TestNoClientNetworkingInTheServer(t *testing.T) {
@@ -281,6 +466,7 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
+		"github.com/dpsoft/perf-agent/internal/capture",
 		"github.com/dpsoft/perf-agent/internal/livehttp",
 		"github.com/dpsoft/perf-agent/internal/perfmcp",
 		"github.com/dpsoft/perf-agent/internal/mcpstdio",
@@ -297,17 +483,28 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 		}
 		return file
 	}
-	got := scanNetworking(t, files, display, allowedFiles{listen: listenFile, exec: execFile})
+	got := scanNetworking(t, files, display, allowedFiles{
+		listen: listenFile, exec: execFiles, command: commandFile, launch: launchFile, noShell: shellFreeDir,
+	})
 	for _, f := range got.findings {
 		t.Error(f)
 	}
-	// The one listening call and the one os/exec import are found, so the
-	// scan reads the files that hold them and resolves their imports.
+	// The one listening call, each os/exec import, the two process starts
+	// and the launcher's three system calls are found, so the scan reads
+	// the files that hold them and resolves their imports.
 	if !slices.Equal(got.listens, []string{"net.Listen"}) {
 		t.Errorf("listening calls in %s = %v, want exactly net.Listen", listenFile, got.listens)
 	}
-	if !got.exec {
-		t.Errorf("the scan did not see %s import os/exec", execFile)
+	for _, f := range execFiles {
+		if !got.exec[f] {
+			t.Errorf("the scan did not see %s import os/exec", f)
+		}
+	}
+	if want := []string{"selfCommand: exec.Command(self)", "startPerfAgent: exec.Command(path)"}; !slices.Equal(got.commands, want) {
+		t.Errorf("process starts in %s = %v, want exactly %v", commandFile, got.commands, want)
+	}
+	if want := []string{"syscall.RawSyscall(SYS_PRCTL, prSetNoNewPrivs)", "syscall.RawSyscall(SYS_PRCTL, prSetChildSubreaper)", "syscall.Exec"}; !slices.Equal(got.launches, want) {
+		t.Errorf("system calls in %s = %v, want exactly %v", launchFile, got.launches, want)
 	}
 	t.Logf("scanned %d files in %d packages", len(files), len(pkgs))
 }
@@ -342,7 +539,7 @@ func TestTheNetworkScanSeesRenamedImports(t *testing.T) {
 		"f.go":      "package x\ntype t struct{ Get int }\nvar http t\nvar _ = http.Get\n",
 		"listen.go": "package x\nimport \"net\"\nfunc l() { _, _ = net.Listen(\"tcp\", \"\") }\n",
 	})
-	got := scanNetworking(t, files, filepath.Base, allowedFiles{listen: "listen.go", exec: "git.go"})
+	got := scanNetworking(t, files, filepath.Base, allowedFiles{listen: "listen.go", exec: []string{"git.go"}})
 	want := []string{
 		"a.go:3: uses net/http.Get",
 		"b.go:3: uses crypto/tls.Dial",
@@ -376,7 +573,7 @@ func TestTheNetworkScanSeesSyscallsExecAndDirectives(t *testing.T) {
 		// The allowed file may import os/exec, renamed or not.
 		"git.go": "package x\nimport run \"os/exec\"\nvar _ = run.Command\n",
 	})
-	got := scanNetworking(t, files, filepath.Base, allowedFiles{listen: "listen.go", exec: "git.go"})
+	got := scanNetworking(t, files, filepath.Base, allowedFiles{listen: "listen.go", exec: []string{"git.go"}})
 	want := []string{
 		"g.go:3: uses syscall.Bind",
 		"g.go:4: uses syscall.Listen",
@@ -399,8 +596,93 @@ func TestTheNetworkScanSeesSyscallsExecAndDirectives(t *testing.T) {
 	if !slices.Equal(got.findings, want) {
 		t.Errorf("findings:\n%s\nwant:\n%s", strings.Join(got.findings, "\n"), strings.Join(want, "\n"))
 	}
-	if !got.exec {
+	if !got.exec["git.go"] {
 		t.Error("the allowed os/exec import was not seen")
+	}
+}
+
+// The capture package starts processes in two files only: exec_linux.go
+// with exactly exec.Command(self) in selfCommand and exec.Command(path) in
+// startPerfAgent, and launch_linux.go with syscall.Exec and the two prctl
+// calls through RawSyscall. Any other form there is a finding, and so is
+// a shell, sudo or pkexec named in a string.
+func TestTheNetworkScanSeesTheCaptureExecRules(t *testing.T) {
+	allow := allowedFiles{
+		listen: "listen.go", exec: []string{"git.go", "exec_linux.go"},
+		command: "exec_linux.go", launch: "launch_linux.go", noShell: "",
+	}
+	files := writeFixtures(t, map[string]string{
+		"exec_linux.go": "package x\nimport \"os/exec\"\n" +
+			"func selfCommand(self, mode string) *exec.Cmd { return exec.Command(self) }\n" +
+			"func startPerfAgent(path string) *exec.Cmd { return exec.Command(path) }\n" +
+			"func third(p string) *exec.Cmd { return exec.Command(p) }\n" +
+			"func look() { _, _ = exec.LookPath(\"git\") }\n" +
+			"func withContext() *exec.Cmd { return exec.CommandContext(nil, \"x\") }\n" +
+			"var shell = \"sh\"\n" +
+			"var _ = []string{\"/bin/bash\", \"sudo\", \"pkexec\"}\n" +
+			"func again(self string) *exec.Cmd { return exec.Command(self) }\n" +
+			"func startPerfAgent2(path string) *exec.Cmd { return exec.Command(path, \"-x\") }\n" +
+			"func startPerfAgent3(p []string) *exec.Cmd { return exec.Command(p[0]) }\n",
+		"launch_linux.go": "package x\nimport \"syscall\"\n" +
+			"const (\n\tprSetChildSubreaper = 36\n\tprSetNoNewPrivs = 38\n\tprSetDumpable = 4\n)\n" +
+			"func a() { syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0) }\n" +
+			"func b() { syscall.RawSyscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0) }\n" +
+			"func c() { syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0) }\n" +
+			"func d() { syscall.RawSyscall(syscall.SYS_PRCTL, prSetDumpable, 0, 0) }\n" +
+			"func e() { _ = syscall.Exec(\"/x\", nil, nil) }\n" +
+			"var f = syscall.RawSyscall\n",
+		"other.go": "package x\nimport \"syscall\"\nfunc o() { _ = syscall.Exec(\"/x\", nil, nil) }\n",
+		"git.go":   "package x\nimport \"os/exec\"\nfunc g() { _, _ = exec.LookPath(\"git\") }\n",
+	})
+	got := scanNetworking(t, files, filepath.Base, allow)
+	only := "only exec.Command(self) in selfCommand and exec.Command(path) in startPerfAgent may start a process"
+	want := []string{
+		"exec_linux.go:5: uses os/exec.Command: " + only,
+		"exec_linux.go:6: uses os/exec.LookPath: " + only,
+		"exec_linux.go:7: uses os/exec.CommandContext: " + only,
+		"exec_linux.go:8: has the string \"sh\": the server never runs a shell, sudo or pkexec",
+		"exec_linux.go:9: has the string \"/bin/bash\": the server never runs a shell, sudo or pkexec",
+		"exec_linux.go:9: has the string \"sudo\": the server never runs a shell, sudo or pkexec",
+		"exec_linux.go:9: has the string \"pkexec\": the server never runs a shell, sudo or pkexec",
+		"exec_linux.go:10: uses os/exec.Command: " + only,
+		"exec_linux.go:11: uses os/exec.Command: " + only,
+		"exec_linux.go:12: uses os/exec.Command: " + only,
+		"launch_linux.go:10: uses syscall.RawSyscall",
+		"launch_linux.go:11: uses syscall.RawSyscall",
+		"launch_linux.go:13: uses syscall.RawSyscall",
+		"other.go:3: uses syscall.Exec",
+	}
+	if !slices.Equal(got.findings, want) {
+		t.Errorf("findings:\n%s\nwant:\n%s", strings.Join(got.findings, "\n"), strings.Join(want, "\n"))
+	}
+	if want := []string{"selfCommand: exec.Command(self)", "startPerfAgent: exec.Command(path)"}; !slices.Equal(got.commands, want) {
+		t.Errorf("commands = %v, want %v", got.commands, want)
+	}
+	if want := []string{"syscall.RawSyscall(SYS_PRCTL, prSetNoNewPrivs)", "syscall.RawSyscall(SYS_PRCTL, prSetChildSubreaper)", "syscall.Exec"}; !slices.Equal(got.launches, want) {
+		t.Errorf("launches = %v, want %v", got.launches, want)
+	}
+	for _, f := range allow.exec {
+		if !got.exec[f] {
+			t.Errorf("the os/exec import of %s was not seen", f)
+		}
+	}
+
+	// The prctl options must be the constants the kernel defines: a
+	// renumbered one would let the allowed form make another call.
+	files = writeFixtures(t, map[string]string{
+		"launch_linux.go": "package x\nimport \"syscall\"\n" +
+			"const prSetNoNewPrivs = 4\n" +
+			"var prSetChildSubreaper = 36\n" +
+			"func a() { syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0) }\n" +
+			"func b() { syscall.RawSyscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0) }\n",
+	})
+	got = scanNetworking(t, files, filepath.Base, allow)
+	want = []string{
+		"launch_linux.go:5: prSetNoNewPrivs is not the constant 38 (PR_SET_NO_NEW_PRIVS)",
+		"launch_linux.go:6: prSetChildSubreaper is not the constant 36 (PR_SET_CHILD_SUBREAPER)",
+	}
+	if !slices.Equal(got.findings, want) {
+		t.Errorf("findings:\n%s\nwant:\n%s", strings.Join(got.findings, "\n"), strings.Join(want, "\n"))
 	}
 }
 

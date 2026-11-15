@@ -48,9 +48,21 @@ func (s *Server) writePage(out string, page []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root := s.output
-	dir, base := filepath.Dir(name), filepath.Base(name)
-	tmp, err := writeTemp(root, dir, base, page)
+	if _, err := s.publishNew(s.output, rootOutput, filepath.Dir(name), filepath.Base(name), page, 0o644); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.output.Name(), name), nil
+}
+
+// publishNew writes b as base in dir inside root, kind naming the root in
+// messages, and returns its name inside root. It never replaces anything:
+// the bytes go to a temporary created exclusively beside the name (see
+// writeTemp), which is published with linkNoReplace and removed on every
+// path. A name that is taken is an error wrapping fs.ErrExist. The file
+// gets perm, less the umask.
+func (s *Server) publishNew(root *os.Root, kind, dir, base string, b []byte, perm fs.FileMode) (string, error) {
+	name := filepath.Join(dir, base)
+	tmp, err := writeTemp(root, kind, dir, base, b, perm)
 	if tmp != "" {
 		defer func() { _ = root.Remove(tmp) }()
 	}
@@ -60,15 +72,38 @@ func (s *Server) writePage(out string, page []byte) (string, error) {
 	if s.beforePublish != nil {
 		s.beforePublish(name)
 	}
-	if err := s.link(root, tmp, name); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return "", existsError(name, root.Name())
-		}
-		return "", fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
+	if err := s.linkNoReplace(root, kind, tmp, name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// takenError is a refusal to replace a name; it is fs.ErrExist to errors.Is.
+type takenError struct{ error }
+
+func (takenError) Is(target error) bool { return target == fs.ErrExist }
+
+// linkNoReplace publishes tmp as name inside root with a hard link, which
+// fails rather than replaces when the name is taken; that error wraps
+// fs.ErrExist. kind names the root in messages, and the flag that moves it
+// in the advice for a filesystem without hard links.
+func (s *Server) linkNoReplace(root *os.Root, kind, tmp, name string) error {
+	err := s.link(root, tmp, name)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrExist) && kind == rootOutput:
+		return takenError{existsError(name, root.Name())}
+	case errors.Is(err, fs.ErrExist):
+		return takenError{fmt.Errorf("%s already exists under the %s root %s and is never replaced", echo(name), kind, root.Name())}
+	case kind == rootOutput:
+		return fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
 			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
 			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err))
 	}
-	return filepath.Join(root.Name(), name), nil
+	return fmt.Errorf("cannot publish %s under the %s root %s with a hard link: %v; "+
+		"perf-agent-mcp publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
+		"Start perf-agent-mcp with --captures on a filesystem that supports hard links", echo(name), kind, root.Name(), pathless(err))
 }
 
 // pageName is out as a name inside the output root, refusing one that
@@ -140,24 +175,30 @@ func existsError(name, dir string) error {
 	return fmt.Errorf("out %s already exists under the output root %s and is never replaced; choose a new file name", echo(name), dir)
 }
 
-// writeTemp writes page to a new file ".<base>.tmp-<16 hex>" in dir inside
-// root, created exclusively and written through the handle that created
-// it, so the bytes go to a new file nobody else holds and never through a
-// name something else could have replaced. It returns the temporary's
-// name, which the caller removes, even on error.
-func writeTemp(root *os.Root, dir, base string, page []byte) (string, error) {
-	var b [8]byte
+// writeTemp writes b to a new file ".<base>.tmp-<16 hex>" in dir inside
+// root, with perm less the umask, created exclusively and written and
+// synced through the handle that created it, so the bytes go to a new file
+// nobody else holds and never through a name something else could have
+// replaced. kind names the root in messages: in the output root what is
+// written is a page, elsewhere a file. It returns the temporary's name,
+// which the caller removes, even on error.
+func writeTemp(root *os.Root, kind, dir, base string, b []byte, perm fs.FileMode) (string, error) {
+	what := "file"
+	if kind == rootOutput {
+		what = "page"
+	}
+	var r [8]byte
 	for range maxTempTries {
-		_, _ = rand.Read(b[:])
-		tmp := filepath.Join(dir, "."+base+".tmp-"+hex.EncodeToString(b[:]))
-		f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		_, _ = rand.Read(r[:])
+		tmp := filepath.Join(dir, "."+base+".tmp-"+hex.EncodeToString(r[:]))
+		f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 		if errors.Is(err, fs.ErrExist) {
 			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: %w", echo(dir), root.Name(), pathless(err))
+			return "", fmt.Errorf("cannot create a temporary %s in %s under the %s root %s: %w", what, echo(dir), kind, root.Name(), pathless(err))
 		}
-		_, err = f.Write(page)
+		_, err = f.Write(b)
 		if err == nil {
 			err = f.Sync()
 		}
@@ -165,11 +206,11 @@ func writeTemp(root *os.Root, dir, base string, page []byte) (string, error) {
 			err = cerr
 		}
 		if err != nil {
-			return tmp, fmt.Errorf("cannot write the temporary page %s under the output root %s: %w", echo(tmp), root.Name(), pathless(err))
+			return tmp, fmt.Errorf("cannot write the temporary %s %s under the %s root %s: %w", what, echo(tmp), kind, root.Name(), pathless(err))
 		}
 		return tmp, nil
 	}
-	return "", fmt.Errorf("cannot create a temporary page in %s under the output root %s: every name tried exists", echo(dir), root.Name())
+	return "", fmt.Errorf("cannot create a temporary %s in %s under the %s root %s: every name tried exists", what, echo(dir), kind, root.Name())
 }
 
 // isInput reports whether fi is a file this server has read: a profile, an

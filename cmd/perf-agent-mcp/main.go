@@ -198,12 +198,16 @@ func isSignedInt(k reflect.Kind) bool {
 	return false
 }
 
+// zeroLimits are the limits that may be zero: Source.MaxContext (no
+// context lines) and Capture.TTL (no age limit).
+var zeroLimits = []string{"Source.MaxContext", "Capture.TTL"}
+
 // checkLimits refuses a limit that is not positive, naming it; the server
 // would otherwise replace a zero with a default without saying so.
-// Source.MaxContext may be zero (no context lines).
+// zeroLimits may be zero.
 func checkLimits(l *perfmcp.Limits) error {
 	for name, f := range limitFields(l) {
-		if f.Int() > 0 || (f.Int() == 0 && name == "Source.MaxContext") {
+		if f.Int() > 0 || (f.Int() == 0 && slices.Contains(zeroLimits, name)) {
 			continue
 		}
 		return fmt.Errorf("limit %s must be positive, got %d", name, f.Int())

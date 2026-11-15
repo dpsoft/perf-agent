@@ -5,7 +5,11 @@
 // stays open in this server only.
 package perfmcp
 
-import "log/slog"
+import (
+	"log/slog"
+
+	"github.com/dpsoft/perf-agent/internal/capture"
+)
 
 // Config is what a Server is built from. New copies it; changing a Config
 // after New has no effect on the server.
@@ -33,4 +37,26 @@ type Config struct {
 	// Log receives diagnostics; nil discards them. It must not write to the
 	// stream Serve answers on.
 	Log *slog.Logger
+	// Capture configures the capture tools.
+	Capture CaptureConfig
+}
+
+// CaptureConfig configures capturing. With PerfAgent empty capture is
+// disabled; otherwise New verifies the binary, the GPU shim and every
+// command, and a failure is New's error.
+type CaptureConfig struct {
+	// PerfAgent is the absolute path of the setcap'd perf-agent binary.
+	PerfAgent string
+	// Dir is the captures directory; GPUShim the absolute path of the
+	// CUPTI adapter a gpu capture injects, "" when gpu captures are off.
+	Dir, GPUShim string
+	// Owner is the kind of server that writes in Dir ("stdio" or
+	// "serve"), so two kinds never share one captures directory.
+	Owner string
+	// Commands, when set, are the only programs a capture may launch, each
+	// an absolute path.
+	Commands []string
+	// Verify checks PerfAgent; nil means capture.VerifyBinary. It is a seam
+	// for tests, whose binaries cannot be setcap'd.
+	Verify func(path string) (capture.Binary, error)
 }

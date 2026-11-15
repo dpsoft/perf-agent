@@ -227,18 +227,28 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 		limit = *a.Limit
 	}
 	q := diffQuery{BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew}
+	out, err := s.diffPage(q, limit, a.Cursor)
+	if err != nil {
+		return mcpstdio.Result{}, err
+	}
+	return s.respond("diff", shrinkWithLimit, out)
+}
+
+// diffPage is the page of q's diff that limit rows from cursor ("" for the
+// first) select, as diff answers it. It runs under the engine.
+func (s *Server) diffPage(q diffQuery, limit int, cursor string) (diffResult, error) {
 	// The sides are checked on a cache hit too: a handle evicted since
 	// is not open, whatever the cache still holds.
 	base, next, err := s.diffSides(q)
 	if err != nil {
-		return mcpstdio.Result{}, err
+		return diffResult{}, err
 	}
 	key := diffKey(q)
 	d, ok := s.diffs.get(key)
 	if !ok {
 		full, err := s.compare(q, base, next)
 		if err != nil {
-			return mcpstdio.Result{}, err
+			return diffResult{}, err
 		}
 		flat := full.Flatten()
 		d = &flat
@@ -246,9 +256,9 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 		s.diffs.put(key, d)
 	}
 
-	pg, info, err := pageRows(d.Nodes, func(n profilemodel.FlatDiffNode) int64 { return absInt(n.DeltaAbs) }, "abs_delta", binding("diff", q), a.Cursor, limit)
+	pg, info, err := pageRows(d.Nodes, func(n profilemodel.FlatDiffNode) int64 { return absInt(n.DeltaAbs) }, "abs_delta", binding("diff", q), cursor, limit)
 	if err != nil {
-		return mcpstdio.Result{}, err
+		return diffResult{}, err
 	}
 	out := diffResult{
 		BaseHandle: d.BaseHandle, NewHandle: d.NewHandle, View: d.View, SampleType: d.SampleType, Unit: d.Unit,
@@ -275,5 +285,5 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 		}
 		out.Rows = append(out.Rows, r)
 	}
-	return s.respond("diff", shrinkWithLimit, out)
+	return out, nil
 }

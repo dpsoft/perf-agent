@@ -527,6 +527,28 @@ func TestRunValidatesResolvedLimits(t *testing.T) {
 	}
 }
 
+// Capture.TTL 0 means no age limit, so --limit takes it; the other
+// capture limits must be positive, and a ceiling is the server's to refuse.
+func TestRunAcceptsAZeroCaptureTTL(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"--profiles", t.TempDir(), "--limit", "Capture.TTL=0s"}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Errorf("Capture.TTL=0s: exit %d, stderr %q", code, errb.String())
+	}
+	for _, c := range []struct {
+		limit, want string
+		code        int
+	}{
+		{"Capture.StopGrace=0s", "Capture.StopGrace", 2},
+		{"Capture.MaxStoredBytes=0", "Capture.MaxStoredBytes", 2},
+		{"Capture.MaxDuration=6m", "5m0s", 1},
+	} {
+		errb.Reset()
+		if code := run([]string{"--profiles", t.TempDir(), "--limit", c.limit}, strings.NewReader(""), &out, &errb); code != c.code || !strings.Contains(errb.String(), c.want) {
+			t.Errorf("%s: exit %d, stderr %q", c.limit, code, errb.String())
+		}
+	}
+}
+
 func TestRunSaysOutOfRangeLimits(t *testing.T) {
 	var out, errb bytes.Buffer
 	code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxRows=99999999999999999999"}, strings.NewReader(""), &out, &errb)

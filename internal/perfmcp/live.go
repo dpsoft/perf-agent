@@ -273,12 +273,12 @@ type liveSnapshot struct {
 
 // live is the live page's state.
 //
-// The request goroutine alone changes the publications, the steering and
-// the snapshot: every field below snap is its own, and commit, the only
-// writer of snap, runs on it. HTTP handlers read only what snap points to,
-// and the hub, which never changes. The listener's lifecycle is the
-// exception: the request goroutine starts it and Close may end it from
-// another goroutine (a forced exit), so it is behind mu.
+// The engine holder alone changes the publications, the steering and the
+// snapshot: every field below snap is its own, and commit, the only writer
+// of snap, runs under the engine. HTTP handlers read only what snap points
+// to, and the hub, which never changes. The listener's lifecycle is the
+// exception: the engine holder starts it and Close may end it from another
+// goroutine (a forced exit), so it is behind mu.
 type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
@@ -384,7 +384,7 @@ func (l *live) start(mux func() http.Handler, log *slog.Logger) (url, addr strin
 }
 
 // ensureLive starts the live page on first use and returns its URL; later
-// calls return the same URL. It runs on the request goroutine, and refuses
+// calls return the same URL. It runs under the engine, and refuses
 // once Close has run. The first start commits, so a page that connects
 // before anything is published is still sent a state.
 func (s *Server) ensureLive() (string, error) {
@@ -701,7 +701,7 @@ func (l *live) heldByKept() int64 {
 
 // commit stores a new snapshot of the live state, at the next seq, and
 // sends its state to every page. It is the only writer of the snapshot,
-// and runs on the request goroutine.
+// and runs under the engine.
 func (s *Server) commit() {
 	l := s.live
 	l.seq++

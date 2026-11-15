@@ -13,19 +13,22 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/dpsoft/perf-agent/internal/capture"
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/sourceroot"
 )
 
-// Server is the perf-agent MCP server. It handles one request at a time on
-// one request goroutine, which alone changes the store, the diffs, the
-// attempts and the live page's publications, so they need no locks; Serve
-// must not run concurrently with itself. The live page's HTTP handlers
-// read only the snapshot the request goroutine last committed and the
-// immutable publications it holds. Close may run on another goroutine,
-// and stops the live page under its lock.
+// Server is the perf-agent MCP server. The store, the diffs, the attempts,
+// the pins and the live page's publications belong to the engine holder:
+// every tool runs holding the engine (see engine), and so will a capture
+// job's steps, so they need no locks of their own. Serve must not run
+// concurrently with itself. The live page's HTTP handlers read only the
+// snapshot the engine holder last committed and the immutable publications
+// it holds. Close may run on another goroutine, even after Serve returned
+// while a handler still runs, and stops the live page under its lock.
 type Server struct {
 	lim Limits
 	log *slog.Logger
@@ -58,7 +61,29 @@ type Server struct {
 	beforePublish func(name string)
 	// evalSymlinks is filepath.EvalSymlinks; a seam for tests.
 	evalSymlinks func(string) (string, error)
+
+	// engine grants the engine state to one holder at a time.
+	engine *engine
+	// captureCfg is the capture configuration, and perfAgent and shim what
+	// New verified of it. captureDisabled says why capture is off, and is
+	// "" when it is on.
+	captureCfg      CaptureConfig
+	perfAgent       capture.Binary
+	shim            capture.Shim
+	captureDisabled string
 }
+
+// readSelfStatus reads this process's /proc/self/status; a seam for tests.
+var readSelfStatus = capture.ReadSelfStatus
+
+// captureDisabledText is every capture call's answer, and the start of the
+// tool's description, on a server started without a perf-agent binary.
+const captureDisabledText = "DISABLED: start perf-agent-mcp with --perf-agent PATH (the setcap'd perf-agent binary) to enable capturing."
+
+// drainTimeout bounds how long Serve, once its input or context ended,
+// writes the answers already queued: under the command's 1 s shutdown
+// grace, so an answer in flight at a signal is still written.
+const drainTimeout = 800 * time.Millisecond
 
 // New opens every root of cfg and builds a server. It refuses a missing or
 // unset ProfilesDir and any root it cannot open. Zero limits take their
@@ -78,6 +103,7 @@ func New(cfg Config) (_ *Server, err error) {
 		link:     (*os.Root).Link,
 
 		evalSymlinks: filepath.EvalSymlinks,
+		engine:       newEngine(),
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -104,6 +130,9 @@ func New(cfg Config) (_ *Server, err error) {
 	if cfg.Live {
 		s.live = newLive(lim, s.pins)
 	}
+	if err := s.setupCapture(cfg.Capture); err != nil {
+		return nil, err
+	}
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
 		Instructions:    instructions,
@@ -115,9 +144,72 @@ func New(cfg Config) (_ *Server, err error) {
 		// can make it larger than a result may be. The floor keeps the
 		// advice to raise a tiny MaxResponseBytes readable.
 		MaxToolErrorBytes: max(lim.MaxResponseBytes, minToolErrorBytes),
-		Log:               s.log,
+		// MaxOutBytes is left to mcpstdio, which makes room for two
+		// answers of MaxToolErrorBytes at their worst escaping.
+		DrainTimeout: drainTimeout,
+		Log:          s.log,
 	})
 	return s, nil
+}
+
+// setupCapture verifies c and records whether capture is on. A perf-agent
+// binary, GPU shim or command that fails verification is an error, since
+// the user named it; a server that may not capture (privileged, under
+// no_new_privs, not on Linux, or started without a perf-agent) runs with
+// capture disabled, and captureDisabled says why.
+func (s *Server) setupCapture(c CaptureConfig) error {
+	c.Commands = slices.Clone(c.Commands)
+	s.captureCfg = c
+	switch {
+	case !capture.Supported:
+		s.captureDisabled = "capture needs Linux"
+		return nil
+	case c.PerfAgent == "":
+		s.captureDisabled = captureDisabledText
+		return nil
+	}
+	verify := c.Verify
+	if verify == nil {
+		verify = capture.VerifyBinary
+	}
+	bin, err := verify(c.PerfAgent)
+	if err != nil {
+		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, err)
+	}
+	s.perfAgent = bin
+	for _, w := range bin.Warnings {
+		s.log.Warn("perf-agent", "path", bin.Path, "warning", w)
+	}
+	if c.GPUShim != "" {
+		if s.shim, err = capture.VerifyShim(c.GPUShim); err != nil {
+			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, err)
+		}
+	}
+	for _, cmd := range c.Commands {
+		if !filepath.IsAbs(cmd) {
+			return fmt.Errorf("perfmcp: capture command %q is not an absolute path; name each allowed program by its absolute path", cmd)
+		}
+		if e := capture.CheckCommandFile(cmd); e != nil {
+			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, e)
+		}
+	}
+	status, err := readSelfStatus()
+	if err != nil {
+		err = capture.Errorf(capture.CodeDisabled, "", "cannot read /proc/self/status: %v", err)
+	}
+	if err == nil {
+		err = capture.CheckSelf(status)
+	}
+	if err == nil {
+		err = capture.CheckBounding(status, bin.Caps)
+	}
+	if err != nil {
+		s.captureDisabled = err.Error()
+		s.log.Warn("capture disabled", "reason", err)
+		return nil
+	}
+	s.log.Info("capture enabled", "perf_agent", bin.Path, "version", bin.Version, "revision", bin.Revision)
+	return nil
 }
 
 // Serve answers MCP requests read from r on w until r ends or ctx is done.
@@ -126,7 +218,9 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 }
 
 // Close stops the live page, if any, and closes the server's roots. It may
-// run on another goroutine than Serve's, while a request is in flight. The
+// run on another goroutine than Serve's, while a request is in flight, and
+// does not wait for the engine: a handler may still run after Serve
+// returned. The
 // page's streams end first and its other responses get liveShutdown before
 // their connections are dropped, so a tab that stopped reading delays Close
 // by at most that.
@@ -155,6 +249,9 @@ func (s *Server) tools() []mcpstdio.Tool {
 	ts := []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool()}
 	if s.live != nil {
 		ts = append(ts, s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool())
+	}
+	for i := range ts {
+		ts[i].Handler = s.engineHandler(ts[i].Handler)
 	}
 	return ts
 }

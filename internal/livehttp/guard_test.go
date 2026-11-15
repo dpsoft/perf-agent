@@ -1,15 +1,20 @@
 package livehttp
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // guarded is a real loopback server running Guard over an echo handler that
@@ -17,6 +22,7 @@ import (
 type guarded struct {
 	tok    Token
 	addr   string
+	srv    *http.Server
 	client *http.Client
 	calls  atomic.Int64
 	mu     sync.Mutex
@@ -51,6 +57,7 @@ func startGuarded(t *testing.T) *guarded {
 		_, _ = io.WriteString(w, r.URL.Path)
 	})
 	srv := NewServer(Guard(tok, echo), slog.New(slog.DiscardHandler))
+	g.srv = srv
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -396,6 +403,189 @@ func TestGuardWithAnEmptyTokenAdmitsNothing(t *testing.T) {
 		h.ServeHTTP(w, req)
 		if w.Code != http.StatusNotFound {
 			t.Errorf("GET %s under an empty token: status %d, want 404", path, w.Code)
+		}
+	}
+}
+
+// raw sends req over its own TCP connection and reads one response. The
+// connection stays open until the test ends, so the server cannot rely on
+// the client hanging up.
+func (g *guarded) raw(t *testing.T, req string) *http.Response {
+	t.Helper()
+	conn := g.rawConn(t, req)
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no response to %q: %v", strings.SplitN(req, "\r\n", 2)[0], err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp
+}
+
+func (g *guarded) rawConn(t *testing.T, req string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", g.addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", g.addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return conn
+}
+
+// announcedBodies are requests that promise a body and never send it.
+func announcedBodies(g *guarded) map[string]string {
+	good := "/s/" + string(g.tok) + "/"
+	host := "Host: " + g.addr + "\r\n"
+	return map[string]string{
+		"GET Content-Length, token":    "GET " + good + " HTTP/1.1\r\n" + host + "Content-Length: 1\r\n\r\n",
+		"GET Content-Length, no token": "GET /s/nope/ HTTP/1.1\r\n" + host + "Content-Length: 1\r\n\r\n",
+		"POST Content-Length, token":   "POST " + good + " HTTP/1.1\r\n" + host + "Content-Length: 1\r\n\r\n",
+		"GET Content-Length, bad Host": "GET " + good + " HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 1\r\n\r\n",
+		"GET chunked, token":           "GET " + good + " HTTP/1.1\r\n" + host + "Transfer-Encoding: chunked\r\n\r\n5\r\nab",
+		"GET chunked, no token":        "GET /s/nope/ HTTP/1.1\r\n" + host + "Transfer-Encoding: chunked\r\n\r\n",
+		"POST chunked, bad Host":       "POST " + good + " HTTP/1.1\r\nHost: evil.example\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"GET Content-Length, HTTP/1.0": "GET " + good + " HTTP/1.0\r\n" + host + "Content-Length: 10\r\n\r\nabc",
+	}
+}
+
+func TestGuardRefusesRequestBodiesWithoutWaitingForThem(t *testing.T) {
+	g := startGuarded(t)
+	baseline := runtime.NumGoroutine()
+	for name, req := range announcedBodies(g) {
+		start := time.Now()
+		resp := g.raw(t, req)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Security-Policy"); got != CSP {
+			t.Errorf("%s: Content-Security-Policy %q, want CSP", name, got)
+		}
+		if !resp.Close {
+			t.Errorf("%s: response keeps the connection open", name)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("%s: response took %v", name, d)
+		}
+	}
+	if n := g.calls.Load(); n != 0 {
+		t.Errorf("next called %d times for requests with bodies", n)
+	}
+
+	// The clients keep their connections open; the server's goroutines must
+	// still end.
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > baseline {
+		if time.Now().After(deadline) {
+			buf := make([]byte, 1<<20)
+			t.Fatalf("%d goroutines, baseline %d; server goroutines stay parked:\n%s",
+				runtime.NumGoroutine(), baseline, buf[:runtime.Stack(buf, true)])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestShutdownIsNotHeldByAnUnsentBody(t *testing.T) {
+	g := startGuarded(t)
+	for _, req := range announcedBodies(g) {
+		g.rawConn(t, req)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := g.srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v after %v", err, time.Since(start))
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("Shutdown took %v with unsent bodies open", d)
+	}
+}
+
+func TestServerSendsOptionsStarToTheGuard(t *testing.T) {
+	g := startGuarded(t)
+	resp := g.raw(t, "OPTIONS * HTTP/1.1\r\nHost: "+g.addr+"\r\n\r\n")
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("OPTIONS *: status %d, want 405", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); got != CSP {
+		t.Errorf("OPTIONS *: Content-Security-Policy %q, want CSP", got)
+	}
+}
+
+func TestGuardRefusesAnAbsoluteFormElsewhere(t *testing.T) {
+	g := startGuarded(t)
+	resp := g.raw(t, "GET http://evil.example/s/"+string(g.tok)+"/ HTTP/1.1\r\nHost: "+g.addr+"\r\n\r\n")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("absolute-form evil.example: status %d, want 403", resp.StatusCode)
+	}
+	if n := g.calls.Load(); n != 0 {
+		t.Errorf("next called %d times", n)
+	}
+}
+
+func TestShellExemptionCoversOnlyTheShell(t *testing.T) {
+	g := startGuarded(t)
+	tok := string(g.tok)
+	nav := func(req *http.Request, dest string) {
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Dest", dest)
+	}
+	for _, path := range []string{
+		"/s/" + tok + "/../state",
+		"/s/" + tok + "/./",
+		"//s/" + tok + "/",
+		"/s/" + tok + "%2Fstate",
+		"/s/" + tok + "/%2F",
+		"/s/" + tok + "/%2E%2E/state",
+		"/s/" + tok + "/%252F",
+		"/s/" + tok + "/%252E%252E/state",
+		"/s/" + tok + "//",
+		"/s/" + tok + "/state",
+	} {
+		req := g.request(t, http.MethodGet, path)
+		nav(req, "document")
+		if got := g.status(t, req); got != http.StatusForbidden {
+			t.Errorf("cross-site navigation to %s: status %d, want 403", path, got)
+		}
+	}
+	for _, dest := range []string{"iframe", "embed", "object", "frame", "fencedframe", "empty", "Document"} {
+		req := g.request(t, http.MethodGet, "/s/"+tok+"/")
+		nav(req, dest)
+		if got := g.status(t, req); got != http.StatusForbidden {
+			t.Errorf("cross-site navigate with dest %q: status %d, want 403", dest, got)
+		}
+	}
+	for name, dup := range map[string]func(*http.Request){
+		"Sec-Fetch-Mode twice": func(r *http.Request) { r.Header.Add("Sec-Fetch-Mode", "navigate") },
+		"Sec-Fetch-Dest twice": func(r *http.Request) { r.Header.Add("Sec-Fetch-Dest", "document") },
+	} {
+		req := g.request(t, http.MethodGet, "/s/"+tok+"/")
+		nav(req, "document")
+		dup(req)
+		if got := g.status(t, req); got != http.StatusForbidden {
+			t.Errorf("cross-site navigation with %s: status %d, want 403", name, got)
+		}
+	}
+	for name, set := range map[string]func(*http.Request){
+		"Sec-Fetch-Site twice": func(r *http.Request) {
+			r.Header.Add("Sec-Fetch-Site", "same-origin")
+			r.Header.Add("Sec-Fetch-Site", "same-origin")
+		},
+		"Origin twice": func(r *http.Request) {
+			r.Header.Add("Origin", "http://"+g.addr)
+			r.Header.Add("Origin", "http://"+g.addr)
+		},
+	} {
+		req := g.request(t, http.MethodGet, "/s/"+tok+"/state")
+		set(req)
+		if got := g.status(t, req); got != http.StatusForbidden {
+			t.Errorf("%s: status %d, want 403", name, got)
 		}
 	}
 }

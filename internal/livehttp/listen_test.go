@@ -38,6 +38,18 @@ func TestCheckAddrRefusesEverythingElse(t *testing.T) {
 		{"", "not loopback"},
 		{"localhost:0", "hostname"},
 		{"example.com:80", "hostname"},
+		{"1abc.def:80", "hostname"},
+		{"0x.example:80", "hostname"},
+		{"127.0.0.1", "missing port"},
+		{"[::1]", "missing port"},
+		{"::1", "missing port"},
+		{"127.0.0.1:65536", "port out of range"},
+		{"127.0.0.1:http", "port out of range"},
+		{"127.1:0", "numeric shorthand not accepted"},
+		{"2130706433:0", "numeric shorthand not accepted"},
+		{"0x7f.0.0.1:0", "numeric shorthand not accepted"},
+		{"0x7f000001:0", "numeric shorthand not accepted"},
+		{"0177.0.0.01:0", "numeric shorthand not accepted"},
 	} {
 		ap, err := CheckAddr(tc.addr)
 		if err == nil {

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CSP is the Content-Security-Policy of every live page response: scripts,
@@ -29,7 +30,7 @@ var securityHeaders = [...][2]string{
 	{"X-Frame-Options", "DENY"},
 }
 
-// Guard admits a request to next only if it is a read, names this machine
+// Guard admits a request to next only if it has no body, is a read, names this machine
 // in Host, comes from the page itself (or is a top-level navigation to the
 // shell) and carries tok as its first path segment. next sees the path with
 // the /s/<tok> prefix removed. Every response, refusals included, carries
@@ -43,6 +44,16 @@ func Guard(tok Token, next http.Handler) http.Handler {
 			h.Set(kv[0], kv[1])
 		}
 
+		// A request that announces a body would park this goroutine while
+		// net/http drains it after the handler, with no deadline, because the
+		// server sets no ReadTimeout (it would end streams). No route takes a
+		// body, so refuse it, stop reading soon and drop the connection.
+		if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			h.Set("Connection", "close")
+			http.Error(w, "request bodies are not accepted", http.StatusBadRequest)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			h.Set("Allow", "GET, HEAD")
 			http.Error(w, "only GET and HEAD are served", http.StatusMethodNotAllowed)
@@ -85,7 +96,10 @@ func Guard(tok Token, next http.Handler) http.Handler {
 // itself is checked afterwards for every request, so a navigation with a
 // wrong token still gets the same 404 as any other.
 func isShellNavigation(r *http.Request) bool {
-	if r.Header.Get("Sec-Fetch-Mode") != "navigate" || r.Header.Get("Sec-Fetch-Dest") != "document" {
+	if mode, _ := single(r.Header, "Sec-Fetch-Mode"); mode != "navigate" {
+		return false
+	}
+	if dest, _ := single(r.Header, "Sec-Fetch-Dest"); dest != "document" {
 		return false
 	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/s/")

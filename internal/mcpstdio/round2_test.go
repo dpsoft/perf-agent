@@ -80,7 +80,8 @@ func TestMaxResultBytesKeepsAResultUnderHalfTheOutput(t *testing.T) {
 		n := s.MaxResultBytes()
 		id := json.RawMessage(`"` + strings.Repeat("i", maxResultIDBytes-2) + `"`)
 		line := func(n int) int {
-			// The worst escaping of a JSON text: every byte doubles.
+			// Quotes double, the escaping MaxResultBytes allows for; a
+			// line that escapes worse is replaced (toolarge_test.go).
 			raw, err := marshal(toolResult(Result{Text: strings.Repeat(`"`, n)}))
 			if err != nil {
 				t.Fatal(err)

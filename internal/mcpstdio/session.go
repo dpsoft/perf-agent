@@ -171,6 +171,40 @@ func (ss *session) send(m any) bool {
 	return ss.out.enqueue(line)
 }
 
+// tooLargeText answers a call whose answer line would exceed half of
+// MaxOutBytes.
+const tooLargeText = "result too large for the output bound"
+
+// sendAnswer encodes the answer to env and enqueues it like send. A line
+// over half of MaxOutBytes is never enqueued: behind a backlog under half
+// the bound, which is when a request starts, it could fill the backlog to
+// the bound, and then the reader's own small answers would mark a live
+// client dead. Escaping makes the line's size hard to foresee (a control
+// byte or an invalid UTF-8 byte becomes six), so the line itself is
+// measured, and replaced by a small answer for the same id: an isError
+// result for tools/call, an internal error otherwise.
+func (ss *session) sendAnswer(env *envelope, out *outgoing) bool {
+	line, err := encodeLine(out)
+	if err != nil {
+		ss.s.log.Error("encode message", "err", err)
+		return false
+	}
+	if 2*len(line) > ss.s.o.MaxOutBytes {
+		ss.s.log.Warn("answer over half the output bound replaced", "method", env.Method, "bytes", len(line))
+		small := errorResponse(env.ID, codeInternalError, "internal error: "+tooLargeText)
+		if env.Method == "tools/call" {
+			if raw, err := marshal(toolResult(Result{Text: tooLargeText, IsError: true})); err == nil {
+				small = &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}
+			}
+		}
+		if line, err = encodeLine(small); err != nil {
+			ss.s.log.Error("encode message", "err", err)
+			return false
+		}
+	}
+	return ss.out.enqueue(line)
+}
+
 // encodeLine is m as one compact JSON line without HTML escaping.
 func encodeLine(m any) ([]byte, error) {
 	var b bytes.Buffer
@@ -250,7 +284,7 @@ func (ss *session) take(line []byte, oversized bool) {
 	}
 	if ss.initialized.Load() && ss.s.isControlCall(env) {
 		if out, _ := ss.answer(ss.hctx, env); out != nil {
-			ss.send(out)
+			ss.sendAnswer(env, out)
 		}
 		return
 	}
@@ -334,7 +368,7 @@ func (ss *session) dispatch() {
 		ss.mu.Unlock()
 		r.cancel()
 		if out != nil && !dropped {
-			ss.send(out)
+			ss.sendAnswer(r.env, out)
 		}
 		if initialized {
 			ss.initialized.Store(true)

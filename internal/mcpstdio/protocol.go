@@ -154,12 +154,16 @@ type Options struct {
 	// the client stopped reading, so one response of any size fits behind
 	// a smaller backlog. A request is started, and a notification sent,
 	// only while the backlog is under half of both; a notification is
-	// dropped otherwise. One answer line must stay under half of
-	// MaxOutBytes (see Server.MaxResultBytes): a larger one can fill the
-	// backlog to the bound, and then even a small answer from the reader
-	// (server busy, a Control result) marks the client dead. 0 means 64
-	// messages, and room for two answers of MaxToolErrorBytes (4 ×
-	// MaxToolErrorBytes plus their envelopes; 4 MiB when that is 0).
+	// dropped otherwise. An answer line over half of MaxOutBytes could
+	// fill the backlog to the bound, and then even a small answer from the
+	// reader (server busy, a Control result) would mark the client dead,
+	// so such a line is measured after escaping and replaced by a small
+	// isError result "result too large for the output bound" (an internal
+	// error for a method other than tools/call). Server.MaxResultBytes is
+	// the largest result sure to fit when escaping at most doubles it;
+	// control and invalid UTF-8 bytes escape to six. 0 means 64 messages,
+	// and room for two answers of MaxToolErrorBytes (4 × MaxToolErrorBytes
+	// plus their envelopes; 4 MiB when that is 0).
 	MaxOutMessages int
 	MaxOutBytes    int
 	// DrainTimeout bounds how long Serve, once the input or its context

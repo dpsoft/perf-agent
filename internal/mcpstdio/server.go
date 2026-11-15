@@ -40,8 +40,9 @@ func New(o Options) *Server {
 	if s.o.MaxOutBytes <= 0 {
 		s.o.MaxOutBytes = defaultMaxOutBytes
 		if s.o.MaxToolErrorBytes > 0 {
-			// Room for two results of MaxToolErrorBytes, each at its worst
-			// escaping, with their envelopes (see MaxResultBytes).
+			// Room for two results of MaxToolErrorBytes, each with every
+			// byte doubled by escaping, with their envelopes (see
+			// MaxResultBytes).
 			s.o.MaxOutBytes = 4*s.o.MaxToolErrorBytes + 2*resultEnvelopeBytes
 		}
 	}
@@ -341,10 +342,15 @@ const (
 )
 
 // MaxResultBytes is the largest tool result text whose answer line stays
-// within half of MaxOutBytes, even when JSON escaping doubles every byte
-// (the worst case for a JSON text) and the id is up to 64 bytes. A result
-// that size behind a backlog under half the bound, which is when the
-// dispatcher starts a request, leaves room for the reader's own answers.
+// within half of MaxOutBytes when JSON escaping doubles every byte, with
+// an id of up to 64 bytes. Doubling is the worst case only for text whose
+// bytes are valid UTF-8 and printable or \n, \r, \t, quotes and
+// backslashes: any other control byte, and an invalid UTF-8 byte, becomes
+// six. An answer line over half of MaxOutBytes, whatever its escaping, is
+// replaced by a small isError result "result too large for the output
+// bound", so a result that size behind a backlog under half the bound,
+// which is when the dispatcher starts a request, always leaves room for
+// the reader's own answers.
 func (s *Server) MaxResultBytes() int {
 	return max((s.o.MaxOutBytes/2-resultEnvelopeBytes)/2, 0)
 }

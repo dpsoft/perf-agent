@@ -340,9 +340,11 @@ func TestAControlToolBeforeInitializeQueues(t *testing.T) {
 	}
 }
 
+// An answer just under half of MaxOutBytes is delivered into an empty
+// queue; one over half is refused (see TestAnAnswerOverHalfTheOutputBoundIsRefused).
 func TestABigAnswerIntoAnEmptyQueueFits(t *testing.T) {
 	o := testOptions()
-	o.MaxOutBytes = 1 << 10
+	o.MaxOutBytes = 2*(64<<10) + 1<<10
 	closes := newCloseLog(&o)
 	c := newClient(t, o)
 	c.init()

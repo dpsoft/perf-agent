@@ -73,9 +73,11 @@
   let acceptedSeq = '';
   let renderedSeq = '';
   // retrySeq is an accepted seq whose work failed: the same state may be
-  // accepted once more. failures counts its failed attempts.
+  // accepted once more. failures counts its failed attempts, and failGen
+  // is the generation when the last one failed.
   let retrySeq = '';
   let failures = 0;
+  let failGen = -1;
   // gen moves on every accepted agent state and every local navigation. An
   // async chain commits to the DOM only if gen is still the one it started
   // with.
@@ -504,6 +506,27 @@
     n.textContent = text;
     n.hidden = !text;
   };
+  const TRYING = 'perf-agent could not load this publication; the page keeps trying.';
+  const PARTIAL = "Your agent's last page could not be fully loaded.";
+
+  // settled records st as applied: its work is done, so nothing is being
+  // retried.
+  const settled = (st) => {
+    applied = st;
+    rendered(st.seq);
+    retrySeq = '';
+    failures = 0;
+    loadNote('');
+  };
+
+  // stopRetrying ends the retries of a state the page moved away from. If
+  // the page had said it keeps trying, it now says the agent's page was
+  // not fully loaded.
+  const stopRetrying = () => {
+    if (failures >= quickRetries) loadNote(PARTIAL);
+    retrySeq = '';
+    failures = 0;
+  };
 
   // applyState refreshes the shown publication's history when st moves
   // it, and, unless st is quiet, steers the page to st's publication,
@@ -517,8 +540,7 @@
       if (e && (!view.hist || newer(e.history, view.hist.version))) quietly(refreshHistory(view.pub));
     }
     if (quiet || !isPub(st.current)) {
-      applied = st;
-      rendered(st.seq);
+      settled(st);
       return;
     }
     if (!view || view.pub !== st.current) {
@@ -546,15 +568,13 @@
     }
     if (g !== gen) return;
     if (f && prev && !sameTarget(prev, st)) toast('Your agent selected ' + f.ref + ' ' + f.name);
-    applied = st;
-    rendered(st.seq);
-    failures = 0;
-    loadNote('');
+    settled(st);
   };
 
-  // Retries of a state whose work failed back off; after quickRetries
-  // failures they stop cancelling the user's own navigation and the page
-  // says it cannot load the publication.
+  // Retries of a state whose work failed back off. After quickRetries
+  // failures the page says it cannot load the publication, and a retry
+  // keeps the generation: it runs only while the user has not navigated
+  // since the last failure, and otherwise the retries stop.
   const retryDelays = [1000, 2000, 5000, 10000];
   const quickRetries = 3;
 
@@ -567,6 +587,10 @@
     if (!st || typeof st !== 'object') return;
     const again = retrySeq !== '' && st.seq === retrySeq && st.seq === acceptedSeq;
     if (!again && !newer(st.seq, acceptedSeq)) return;
+    if (again && failures >= quickRetries && gen !== failGen) {
+      stopRetrying();
+      return;
+    }
     acceptedSeq = st.seq;
     retrySeq = '';
     if (!again) failures = 0;
@@ -574,11 +598,18 @@
     const quiet = !again && applied !== null && applied === agent && sameTarget(st, agent);
     const g = quiet || failures >= quickRetries ? gen : ++gen;
     agent = st;
-    applyState(st, g, quiet, again ? st : prev).catch(() => {
-      if (g !== gen || agent !== st) return;
+    applyState(st, g, quiet, again ? st : prev).then(() => {
+      // Cut short by a newer state or by the user's own navigation.
+      if (applied !== st && agent === st) stopRetrying();
+    }, () => {
+      if (g !== gen || agent !== st) {
+        if (agent === st) stopRetrying();
+        return;
+      }
       retrySeq = st.seq;
       failures++;
-      if (failures >= quickRetries) loadNote('perf-agent could not load this publication; the page keeps trying.');
+      failGen = gen;
+      if (failures >= quickRetries) loadNote(TRYING);
       setTimeout(checkState, retryDelays[Math.min(failures, retryDelays.length) - 1]);
     });
   };

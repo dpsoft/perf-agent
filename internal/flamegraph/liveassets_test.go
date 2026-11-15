@@ -1153,6 +1153,58 @@ func TestLivePageSteeringInChrome(t *testing.T) {
 	})
 }
 
+// livePartialNote is what the page says once it stops retrying a state
+// the user navigated away from.
+const livePartialNote = "Your agent's last page could not be fully loaded."
+
+// Retries after the note keep the generation, so they must not undo what
+// the user chose since: a publication that loads but whose selection does
+// not stays behind the user's own publication.
+func TestLivePageRetriesInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	frameC := "pub/p1/frame/" + string(f.c)
+
+	t.Run("a retry after the note does not undo the user's publication", func(t *testing.T) {
+		_, tab := newLivePage(t, c, f, liveState("1", "p1", f.c, "", "p1", "p2"), func(s *liveServer) {
+			delete(s.pubs["p1"].frames, string(f.c))
+		})
+		tab.waitFor("the note", func(d liveDOM) bool { return d.LoadNote != "" })
+		tab.eval(`document.querySelector('#pubs button[data-pub="p2"]').click(), ''`)
+		tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" })
+		time.Sleep(7 * time.Second)
+		d := tab.dom()
+		assert.Equal(t, "second", d.Title, "the user's publication stays")
+		assert.Equal(t, livePartialNote, d.LoadNote)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("retries cut short by the user stop, and the note says so", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.c, "", "p1", "p2"), func(s *liveServer) {
+			delete(s.pubs["p1"].frames, string(f.c))
+			s.setDelay(frameC, 1200*time.Millisecond)
+		})
+		tab.waitFor("the note", func(d liveDOM) bool { return d.LoadNote != "" })
+		tries := func() int {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return countOf(s.served, frameC)
+		}
+		n := tries()
+		require.Eventually(t, func() bool { return tries() > n }, 15*time.Second, 50*time.Millisecond, "the next retry")
+		time.Sleep(300 * time.Millisecond) // that retry's frame request is in flight
+		tab.eval(`document.querySelector('#pubs button[data-pub="p2"]').click(), ''`)
+		tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" })
+		at := tries()
+		time.Sleep(11 * time.Second)
+		d := tab.dom()
+		assert.Equal(t, "second", d.Title)
+		assert.Equal(t, at, tries(), "the page stopped retrying")
+		assert.Equal(t, livePartialNote, d.LoadNote)
+		assert.Empty(t, tab.errors())
+	})
+}
+
 func TestLivePageConnectionInChrome(t *testing.T) {
 	c := startChrome(t)
 	f := newLiveFixture(t)

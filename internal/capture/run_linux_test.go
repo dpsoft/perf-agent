@@ -1199,6 +1199,142 @@ func TestAnUnreadableTargetCannotBeRechecked(t *testing.T) {
 	}
 }
 
+// waitAllStopped waits until every thread of pid is stopped (T): kill(2)
+// returns before a group stop completes, and a thread still running could
+// read the command pipe's EOF and clean up after all.
+func waitAllStopped(t *testing.T, pid int) {
+	t.Helper()
+	ok := eventually(10*time.Second, func() bool {
+		tasks, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "task"))
+		if err != nil || len(tasks) == 0 {
+			return false
+		}
+		for _, task := range tasks {
+			b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "task", task.Name(), "stat"))
+			if err != nil {
+				return false
+			}
+			f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))
+			if len(f) == 0 || f[0] != "T" {
+				return false
+			}
+		}
+		return true
+	})
+	if !ok {
+		t.Fatalf("reaper %d did not stop", pid)
+	}
+}
+
+// A reused PID is pid_reused even when the process now at it has ended:
+// the start time is compared before the exit is believed.
+func TestAReusedPIDThatHasEndedIsPIDReused(t *testing.T) {
+	kills := 0
+	status := fakeStatus(ids(os.Getuid()), ids(os.Getgid()), "0000000000000000")
+	for name, stat := range map[string]string{
+		"zombie":  fakeStat(11, "w", "Z", 600),
+		"exiting": strings.Replace(fakeStat(11, "w", "S", 600), " 4194304 ", " 4194308 ", 1),
+	} {
+		r := testRun(t, &kills)
+		r.spec.Proc = fakeProc(t, 11, stat, status, "", "")
+		r.spec.PID = 11
+		r.target, r.targetKnown = TargetState{PID: 11, StartTime: 500}, true
+		if gone, e := r.observe(); gone || errCode(e) != CodePIDReused {
+			t.Errorf("%s at a reused pid: gone %v, %v; want pid_reused", name, gone, e)
+		}
+	}
+}
+
+// The same through the poll: the process at the pid is a zombie that, by
+// its start time, is another process.
+func TestRunAReusedPIDThatIsAZombieIsPIDReused(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Settings.Duration = 20 * time.Second
+	spec.Bounds.Recheck = time.Hour
+	target := startChild(t, "sleep")
+	statPath := filepath.Join("/proc", strconv.Itoa(target.PID), "stat")
+	spec.Proc.StartTimeHook = func(pid int, start uint64) uint64 {
+		// From the moment it is a zombie, the pid reads as another process.
+		if b, err := os.ReadFile(statPath); pid == target.PID && err == nil {
+			if f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:])); len(f) > 0 && f[0] == "Z" {
+				return start + 1
+			}
+		}
+		return start
+	}
+	spec.PID = target.PID
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseProfiling, 10*time.Second)
+	target.exit()
+	if o := waitRun(t, r, 30*time.Second); errCode(o.Err) != CodePIDReused {
+		t.Fatalf("Err %v, stopped by %q; want pid_reused", o.Err, o.StoppedBy)
+	}
+}
+
+// A perf-agent that ran its course profiled for its duration, not for the
+// supervisor's delay in hearing of its exit.
+func TestRanItsCourseIsCappedAtTheDuration(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	r.spec.Settings.Duration = 500 * time.Millisecond
+	r.readyAt = time.Now().Add(-1200 * time.Millisecond)
+	r.setPhase(PhaseProfiling)
+	r.perfDone(Event{Op: EventExited, Who: WhoPerfAgent, PID: 1})
+	if r.o.StoppedBy != StoppedByDuration || r.o.Profiled != r.spec.Settings.Duration {
+		t.Errorf("stopped by %q, Profiled %v; want duration, %v", r.o.StoppedBy, r.o.Profiled, r.spec.Settings.Duration)
+	}
+}
+
+// An event stream that ends mid-profiling without reaped is containment
+// lost, and its stop is recorded: Profiled is the time profiled.
+func TestRunContainmentLostRecordsItsStop(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Settings.Duration = 20 * time.Second
+	spec.PID = startChild(t, "sleep").PID
+	cut := make(chan struct{})
+	spec.Events = func(in <-chan Event) <-chan Event {
+		out := make(chan Event)
+		go func() {
+			defer close(out)
+			for {
+				select {
+				case ev, ok := <-in:
+					if !ok {
+						return
+					}
+					select {
+					case out <- ev:
+					case <-cut:
+						go func() {
+							for range in {
+							}
+						}()
+						return
+					}
+				case <-cut:
+					go func() {
+						for range in {
+						}
+					}()
+					return
+				}
+			}
+		}()
+		return out
+	}
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseProfiling, 10*time.Second)
+	time.Sleep(300 * time.Millisecond)
+	close(cut)
+	o := waitRun(t, r, 30*time.Second)
+	if errCode(o.Err) != CodeStuckChild || !strings.Contains(o.Err.Message, "containment") {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	if o.Profiled < 300*time.Millisecond || o.Profiled > 300*time.Millisecond+slack {
+		t.Errorf("Profiled = %v, want the time to the loss", o.Profiled)
+	}
+}
+
 // A reaper that does not answer a kill is not waited for forever: Wait
 // says stuck_child, naming what is known to be left.
 func TestRunAnUnresponsiveReaperIsStuckChild(t *testing.T) {
@@ -1215,6 +1351,7 @@ func TestRunAnUnresponsiveReaperIsStuckChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = syscall.Kill(reaper, syscall.SIGCONT) })
+	waitAllStopped(t, reaper)
 	killed := time.Now()
 	r.Kill()
 	o := waitRun(t, r, 30*time.Second)
@@ -1270,6 +1407,7 @@ func TestRunAnUnresponsiveReaperNamesTheCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = syscall.Kill(reaper, syscall.SIGCONT) })
+	waitAllStopped(t, reaper)
 	r.Kill()
 	o := waitRun(t, r, 30*time.Second)
 	if errCode(o.Err) != CodeStuckChild {

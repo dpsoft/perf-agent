@@ -847,6 +847,13 @@ of yours").
 
   It grants nothing beyond what the setcap'd perf-agent already gives the
   user run by hand, against any PID.
+- **Other limits of the checks, as they stand.**
+  - A process whose leader thread called `pthread_exit` while its other
+    threads run shows `Z` in `/proc/<pid>/stat`, so the capture ends there
+    as `target_exit`.
+  - After a kill, `Wait` on a reaper that never answers returns once the
+    bound (`StopGrace + FinishTimeout + 5 s`) has passed, plus the 0.5 s
+    the output readers get to drain.
 
 Under the server's PID namespace the PID is as the server sees it.
 perf-agent translates it to the host PID itself (`resolveTarget`).

@@ -445,7 +445,11 @@ func (r *Run) goneFirst() bool {
 
 // ranItsCourse is the stop of a perf-agent left to its duration: the
 // duration stopped it, unless the target was already gone, which then did.
+// It profiled at most its duration, whatever the delay in hearing of it.
 func (r *Run) ranItsCourse(gone bool, at time.Time) {
+	if end := r.readyAt.Add(r.spec.Settings.Duration); at.After(end) {
+		at = end
+	}
 	by := StoppedByDuration
 	switch {
 	case gone && r.spec.Launch != nil:
@@ -801,6 +805,11 @@ func (r *Run) observe() (gone bool, e *Error) {
 	now, oe := Observe(r.spec.Proc, r.target.PID)
 	if oe != nil {
 		if oe.Code == CodeTargetExited || oe.Code == CodeTargetNotFound {
+			// What has ended at the pid may be another process: the start
+			// time decides first.
+			if st, err := readStat(r.spec.Proc, r.target.PID); err == nil && st.start != r.target.StartTime {
+				return false, r.target.Compare(TargetState{PID: r.target.PID, StartTime: st.start})
+			}
 			return true, nil
 		}
 		r.cannotRecheck(oe)
@@ -1058,6 +1067,7 @@ func attachNote(latency time.Duration) string {
 // started may still run, and that is never a success. The survivors are
 // what is known: perf-agent, the command and the command's cgroup.
 func (r *Run) lost(why string) {
+	r.markStopped("", time.Now())
 	r.o.Cleanup = "incomplete: " + why
 	r.o.Notes = append(r.o.Notes, why+"; perf-agent or the command may still be running")
 	add := func(pid int, start uint64) {

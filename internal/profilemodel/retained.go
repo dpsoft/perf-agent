@@ -1,5 +1,7 @@
 package profilemodel
 
+import "unsafe"
+
 // Weights of the retained-memory estimates: the heap bytes one item keeps
 // reachable, size-class rounding and map overhead included. They were
 // calibrated against the measured heap of a 100k-sample profile and of a
@@ -31,7 +33,8 @@ const (
 )
 
 // RetainedBytes estimates the heap p keeps reachable: its parsed profile,
-// its names and its execution ordinals. It is computed once, at load, from
+// every string in it (names, labels, comments) counted once, and its
+// execution ordinals. It is computed once, at load, from
 // counts, so it costs nothing to ask for and never changes.
 func (p *Profile) RetainedBytes() int64 { return p.retained }
 
@@ -40,21 +43,34 @@ func (p *Profile) RetainedBytes() int64 { return p.retained }
 // the view is built, from counts.
 func (v *View) RetainedBytes() int64 { return v.retained }
 
-// profileRetained is p's estimate, from its counts.
+// profileRetained is p's estimate, from its counts and its strings.
 func profileRetained(p *Profile) int64 {
 	src := p.Source
+	strs := stringBytes{}
 	n := int64(retainedProfileBase)
-	for _, c := range src.Comments {
-		n += int64(len(c))
+	for _, st := range src.SampleType {
+		strs.add(st.Type, st.Unit)
 	}
+	if pt := src.PeriodType; pt != nil {
+		strs.add(pt.Type, pt.Unit)
+	}
+	strs.add(src.DropFrames, src.KeepFrames, src.DefaultSampleType, src.DocURL)
+	strs.add(src.Comments...)
 	for _, s := range src.Sample {
 		n += retainedPerSample + retainedPerLocationRef*int64(len(s.Location)) + 8*int64(len(s.Value))
 		labels := 0
-		for _, vs := range s.Label {
+		for k, vs := range s.Label {
 			labels += len(vs)
+			strs.add(k)
+			strs.add(vs...)
 		}
-		for _, vs := range s.NumLabel {
+		for k, vs := range s.NumLabel {
 			labels += len(vs)
+			strs.add(k)
+		}
+		for k, us := range s.NumUnit {
+			strs.add(k)
+			strs.add(us...)
 		}
 		if labels > 0 {
 			n += retainedPerLabelledSample + retainedPerLabel*int64(labels)
@@ -64,13 +80,12 @@ func profileRetained(p *Profile) int64 {
 		n += retainedPerLocation + retainedPerLine*int64(len(l.Line))
 	}
 	for _, f := range src.Function {
-		n += retainedPerFunction + int64(len(f.Name)+len(f.Filename))
-		if f.SystemName != f.Name {
-			n += int64(len(f.SystemName))
-		}
+		n += retainedPerFunction
+		strs.add(f.Name, f.SystemName, f.Filename)
 	}
 	for _, m := range src.Mapping {
-		n += retainedPerMapping + int64(len(m.File)+len(m.BuildID))
+		n += retainedPerMapping
+		strs.add(m.File, m.BuildID, m.KernelRelocationSymbol)
 	}
 	if p.execOf != nil {
 		n += retainedPerExecSample * int64(len(p.execOf))
@@ -78,7 +93,32 @@ func profileRetained(p *Profile) int64 {
 			n += retainedPerExecution * int64(cap(ex))
 		}
 	}
-	return n
+	return n + strs.total
+}
+
+// stringBytes sums the bytes of distinct string storage. A parsed profile
+// interns its strings in a table, so one string a million samples label
+// with is one allocation: strings are told apart by where their bytes
+// are, not by their text, and each is counted once at its longest.
+type stringBytes struct {
+	seen  map[*byte]int
+	total int64
+}
+
+func (b *stringBytes) add(ss ...string) {
+	for _, s := range ss {
+		if s == "" {
+			continue
+		}
+		if b.seen == nil {
+			b.seen = map[*byte]int{}
+		}
+		d := unsafe.StringData(s)
+		if had := b.seen[d]; len(s) > had {
+			b.seen[d] = len(s)
+			b.total += int64(len(s) - had)
+		}
+	}
 }
 
 // viewRetained is v's estimate, from its counts. Slices count at their

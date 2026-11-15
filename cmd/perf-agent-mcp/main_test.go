@@ -185,6 +185,67 @@ func TestTheServerLinksNoProfiler(t *testing.T) {
 	}
 }
 
+// networkingPackages are the packages that open connections. Among the
+// binary's own packages only internal/livehttp, the loopback listener, may
+// import them.
+var networkingPackages = []string{"net", "net/http", "crypto/tls"}
+
+// clientSymbols are functions every outgoing connection or name lookup
+// through the standard library runs.
+var clientSymbols = []string{
+	"net/http.(*Client).do",
+	"net/http.(*Transport).roundTrip",
+	"net/http.(*Transport).dialConn",
+	"net.Dial",
+	"net.DialTimeout",
+	"net.(*Resolver).LookupHost",
+	"net.(*Resolver).LookupIPAddr",
+	"crypto/tls.(*Conn).clientHandshake",
+}
+
+// TestTheServerOpensNoConnection is a stopgap for the network scan that
+// replaces it: only internal/livehttp imports a networking package, and
+// the linked binary has none of the client symbols. A call of
+// (*net.Dialer).DialContext is linked by the server side too, so nm cannot
+// tell it apart; the source scan and the socket test are still required.
+func TestTheServerOpensNoConnection(t *testing.T) {
+	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", `{{if not .Standard}}{{.ImportPath}}: {{join .Imports " "}}{{end}}`, ".").Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		path, imports, _ := strings.Cut(line, ": ")
+		if path == "github.com/dpsoft/perf-agent/internal/livehttp" {
+			continue
+		}
+		for imp := range strings.FieldsSeq(imports) {
+			if slices.Contains(networkingPackages, imp) || strings.HasPrefix(imp, "net/http/") {
+				t.Errorf("%s imports %s; only internal/livehttp may", path, imp)
+			}
+		}
+	}
+
+	bin := filepath.Join(t.TempDir(), "perf-agent-mcp")
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	syms, err := exec.Command("go", "tool", "nm", bin).Output()
+	if err != nil {
+		t.Fatalf("go tool nm: %v", err)
+	}
+	linked := map[string]bool{}
+	for line := range strings.SplitSeq(string(syms), "\n") {
+		if f := strings.Fields(line); len(f) >= 3 {
+			linked[f[len(f)-1]] = true
+		}
+	}
+	for _, sym := range clientSymbols {
+		if linked[sym] {
+			t.Errorf("the binary links %s, which opens a connection or looks a name up", sym)
+		}
+	}
+}
+
 func TestTheServerIsNotShipped(t *testing.T) {
 	for _, f := range []string{"Makefile", "Dockerfile.agent", "Dockerfile.shim", ".github/workflows/release.yml", "scripts/third-party-notices.sh"} {
 		b, err := os.ReadFile(filepath.Join("..", "..", f))

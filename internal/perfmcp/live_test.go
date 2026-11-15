@@ -3,13 +3,17 @@ package perfmcp
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/netip"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+
+	pprof "github.com/google/pprof/profile"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
@@ -328,6 +332,78 @@ func TestALargeProfileWithATinyModelIsChargedForItsEngine(t *testing.T) {
 	}
 }
 
+// denseExplanations are n explanations of the deepest nodes of a Deep
+// view, each with one claim and its prose, hypotheses and next
+// measurement as full of numbers as the limits allow: every number is a
+// segment the checked result keeps.
+func denseExplanations(t *testing.T, o liveOpened, n int) []any {
+	t.Helper()
+	ones := func(k int) string { return strings.Repeat(" 1", k) }
+	var exps []any
+	for i := range n {
+		hyp := make([]string, 8)
+		for j := range hyp {
+			hyp[j] = "h" + ones(1000)
+		}
+		exps = append(exps, map[string]any{
+			"node":   string(o.node(t, fmt.Sprintf("f%d", 4999-i))),
+			"claims": []any{map[string]any{"id": fmt.Sprintf("c%d", i+1), "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": json.RawMessage("1")}},
+			"prose":  fmt.Sprintf("{c%d} of the time.", i+1) + ones(4080), "hypotheses": hyp, "next_measurement": "n" + ones(1000),
+		})
+	}
+	return exps
+}
+
+func TestThePublicationCountsItsCheckedExplanations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("checks explanations on a 5000-frame view")
+	}
+	s := newLiveServer(t, nil, map[string][]byte{"deep.pb.gz": pmfixture.Deep(5000)})
+	o := openLive(t, s, "deep.pb.gz")
+	for _, tc := range []struct {
+		name string
+		exps []any
+	}{
+		{"one plain claim", shareClaim(string(o.node(t, "f4999")), "1", "{c1} of the time")},
+		{"1 dense", denseExplanations(t, o, 1)},
+		{"12 dense", denseExplanations(t, o, 12)},
+	} {
+		n := tc.name
+		req := json.RawMessage(mustJSON(t, tc.exps))
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		decoded, _, err := explain.Decode(req, s.lim.Explain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := explain.Check(o.v, decoded, s.lim.Explain)
+		decoded = nil
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		runtime.KeepAlive(decoded)
+		if !r.OK {
+			t.Fatalf("check failed: %+v", r.Failures[0])
+		}
+		held := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+		est := resultBytes(r)
+		ratio := float64(est) / float64(held)
+		t.Logf("%s: estimate %d, heap %d, ratio %.3f", n, est, held, ratio)
+		if held <= 0 || ratio < 0.5 || ratio > 2 {
+			t.Errorf("%s: resultBytes %d is not within [0.5x, 2x] of the %d bytes the result holds", n, est, held)
+		}
+		p, err := s.publishExplained(o.e, o.v, o.view, r, "", "a0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := p.RetainedBytes(), est+int64(len(p.model)); got < want {
+			t.Errorf("%s: the publication counts %d, less than its result and model, %d", n, got, want)
+		}
+	}
+}
+
 func TestPinsAreSharedWithTheStore(t *testing.T) {
 	s := newLiveServer(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o := openLive(t, s, "cpu.pb.gz")
@@ -487,7 +563,7 @@ func TestARefusedAdmissionChangesNothing(t *testing.T) {
 	before := dumpLive(s)
 
 	_, err := s.publishExplained(deep.e, deep.v, deep.view, deep.check(t, s, nil), "", "a9")
-	if err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=") || !strings.Contains(err.Error(), "in memory (profile, view and page model)") {
+	if err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=") || !strings.Contains(err.Error(), " bytes in memory (profile, view, page model and history), over MaxRetainedBytes=") {
 		t.Fatalf("publish over the budget alone: %v", err)
 	}
 	if after := dumpLive(s); !reflect.DeepEqual(before, after) {
@@ -587,6 +663,104 @@ func TestHistoryCountsInTheBudget(t *testing.T) {
 	}
 	if got := ids(s.live.pubs); !slices.Equal(got, []string{"p2"}) {
 		t.Errorf("kept %v, want [p2]: the grown histories go over the budget, and the current one stays", got)
+	}
+}
+
+// manyClaimsRejected is a check of n wrong share claims on node, each a
+// distinct claim.
+func manyClaimsRejected(t *testing.T, s *Server, o liveOpened, node string, n int) explain.Result {
+	t.Helper()
+	ex := explain.Explanation{Node: string(o.node(t, node))}
+	for i := range n {
+		id := fmt.Sprintf("c%d", i)
+		ex.Claims = append(ex.Claims, explain.Claim{ID: id, Metric: "share_of_total", Unit: "ratio", Denominator: "view_total",
+			Value: explain.Literal{Text: "0.62", Kind: explain.LiteralString}})
+		ex.Prose += "{" + id + "} "
+	}
+	r := explain.Check(o.v, []explain.Explanation{ex}, s.lim.Explain)
+	if r.OK || len(r.Failures) != n {
+		t.Fatalf("check: ok %v, %d failures", r.OK, len(r.Failures))
+	}
+	return r
+}
+
+func TestTheHistoryKeepsOnlyWhatItShows(t *testing.T) {
+	s := newLiveServer(t, func(c *Config) {
+		c.Limits.MaxRetainedBytes = 32 << 10
+		c.Limits.MaxPageBytes = 16 << 10
+	}, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o := openLive(t, s, "cpu.pb.gz")
+	p := o.facts(t, s)
+	r := manyClaimsRejected(t, s, o, "b", 32)
+	for range 20 {
+		s.attempts.add(o.e.prof, o.view, "", outcomeRejected, r.Failures)
+		s.refreshHistory()
+		s.commit()
+	}
+	h := s.live.snapshot().history[p.id]
+	if got := h.RetainedBytes(); got > int64(s.lim.MaxPageBytes) {
+		t.Errorf("the history keeps %d bytes, over MaxPageBytes=%d", got, s.lim.MaxPageBytes)
+	}
+	if got, budget := s.live.heldByKept(), s.lim.MaxRetainedBytes; got > budget {
+		t.Errorf("the current publication alone holds %d, over MaxRetainedBytes=%d", got, budget)
+	}
+	var page struct {
+		RejectedPill string `json:"rejected_pill"`
+		RejectedNote string `json:"rejected_note"`
+		Rows         []struct {
+			Attempt string `json:"attempt"`
+			Kind    string `json:"kind"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(h.json, &page); err != nil {
+		t.Fatal(err)
+	}
+	if want := "640 claims rejected at render in 20 attempts"; page.RejectedPill != want {
+		t.Errorf("pill %q, want %q: it counts every attempt", page.RejectedPill, want)
+	}
+	if page.RejectedNote != "" {
+		t.Errorf("the JSON left out rows the kept history holds: %q", page.RejectedNote)
+	}
+	shown := 0
+	for _, row := range page.Rows {
+		if row.Kind == "claim" {
+			shown++
+		}
+	}
+	kept := 0
+	for _, ra := range h.rejected {
+		kept += len(ra.Failures)
+	}
+	if shown == 0 || shown != kept {
+		t.Errorf("the page shows %d claim rows, the history keeps %d failures", shown, kept)
+	}
+	if last := page.Rows[len(page.Rows)-1].Attempt; last != h.rejected[len(h.rejected)-1].Attempt {
+		t.Errorf("the newest row is from %s, not the newest attempt", last)
+	}
+
+	version := h.version
+	if s.refreshHistory() || s.live.history[p.id].version != version {
+		t.Error("an unchanged record moved a trimmed history")
+	}
+}
+
+func TestALargeLabelIsChargedToItsProfile(t *testing.T) {
+	src, err := pprof.ParseData(pmfixture.CPUBasic())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src.Sample[0].Label = map[string][]string{"request": {strings.Repeat("x", 8<<20)}}
+	var b bytes.Buffer
+	if err := src.Write(&b); err != nil {
+		t.Fatal(err)
+	}
+	s := newLiveServer(t, func(c *Config) {
+		c.Limits.MaxRetainedBytes = 64 << 10
+		c.Limits.MaxPageBytes = 32 << 10
+	}, map[string][]byte{"cpu.pb.gz": b.Bytes()})
+	o := openLive(t, s, "cpu.pb.gz")
+	if _, err := s.publishExplained(o.e, o.v, o.view, o.check(t, s, nil), "", "a1"); err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=65536") {
+		t.Errorf("a profile holding an 8 MiB label was admitted under a 64 KiB budget: %v", err)
 	}
 }
 

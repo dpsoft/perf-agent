@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"reflect"
 	"slices"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,19 +58,64 @@ type publication struct {
 	prof   *profilemodel.Profile
 	v      *profilemodel.View
 	result explain.Result
+	// resultSize is resultBytes(result), counted when the publication is
+	// built: the frame and focus routes recompute from the result, so it
+	// stays in memory as long as the publication does.
+	resultSize int64
 
 	opts  flamegraph.LiveOptions
 	model []byte
 }
 
-// publicationOverhead is what a publication costs besides its model: its
-// fields and its entry in the state.
+// publicationOverhead is what a publication costs besides its model and
+// its checked result: its fields and its entry in the state.
 const publicationOverhead = 1 << 10
 
 // RetainedBytes is the bytes the publication holds besides the objects it
-// pins: its model and its title.
+// pins: its model, its title and its checked result.
 func (p *publication) RetainedBytes() int64 {
-	return int64(len(p.model)+len(p.titleSegs)+len(p.title)) + publicationOverhead
+	return int64(len(p.model)+len(p.titleSegs)+len(p.title)) + p.resultSize + publicationOverhead
+}
+
+// Weights of resultBytes, in heap bytes per item: an explain.Checked is
+// 1808 bytes, a Segment 64 and a CheckedClaim 168. An explanation also
+// holds its facts' values and exact shares, and a claim its engine value's
+// strings.
+const (
+	resultPerExplanation = 1808 + 512
+	resultPerPathEntry   = 16
+	resultPerClaim       = 168 + 64
+	resultPerHypothesis  = 24
+	resultPerSegment     = 64
+)
+
+// resultBytes estimates the heap a checked result keeps, from its counts:
+// its explanations, their facts' paths, notes and sample periods, their
+// claims, and their text segments with the text they hold. Slices count at
+// their capacity. Path names are the view's own strings, so they count as
+// slice entries only.
+func resultBytes(r explain.Result) int64 {
+	n := int64(resultPerExplanation) * int64(cap(r.Checked))
+	segs := func(ss []explain.Segment) {
+		n += resultPerSegment * int64(cap(ss))
+		for _, sg := range ss {
+			n += int64(len(sg.Text))
+		}
+	}
+	for _, c := range r.Checked {
+		n += resultPerPathEntry * int64(cap(c.Facts.Path)+cap(c.Facts.Notes)+cap(c.Facts.SamplePeriods))
+		for _, s := range slices.Concat(c.Facts.Notes, c.Facts.SamplePeriods) {
+			n += int64(len(s))
+		}
+		n += resultPerClaim * int64(cap(c.Claims))
+		segs(c.Prose)
+		segs(c.NextMeasurement)
+		n += resultPerHypothesis * int64(cap(c.Hypotheses))
+		for _, h := range c.Hypotheses {
+			segs(h)
+		}
+	}
+	return n
 }
 
 // pinned is everything p holds in the ledger with h, its history (nil for
@@ -89,15 +135,25 @@ func (p *publication) pinned(h *liveHistory) []retained {
 }
 
 // liveHistory is the rejected attempts of an explained publication's
-// profile and view, as the server's record held them at version. rejected
-// is a deep copy, so nothing the record does later reaches it, and json is
-// the page's history built from it. It never changes once built.
+// profile and view, as the server's record held them at version, and json,
+// the page's history built from them. rejected is a copy that shares no
+// memory with the record, so nothing the record does later reaches it, and
+// it keeps only what json shows: the newest failures that fit, with the
+// older ones counted on their attempts (Omitted, OmittedClaims,
+// OmittedReferences) and, when even that is too large, the oldest
+// attempts counted in dropped. The pills therefore still count every
+// claim and attempt the record holds. Copy and JSON together keep at most
+// about MaxPageBytes. record and recordDropped say which record the
+// history was built from. It never changes once built.
 type liveHistory struct {
 	version    int64
 	rejected   []explain.RejectedAttempt
 	dropped    int
 	incomplete bool
 	json       []byte
+
+	record        []string // the IDs of the record's rejected attempts
+	recordDropped int
 }
 
 // RetainedBytes is the history's JSON and its copy of the rejected
@@ -110,30 +166,56 @@ func (h *liveHistory) RetainedBytes() int64 {
 			n += failureOverhead + int64(failureBytes(f))
 		}
 	}
+	for _, id := range h.record {
+		n += 16 + int64(len(id))
+	}
 	return n
 }
 
-// same reports whether h holds exactly this record.
+// same reports whether h was built from this record. A recorded attempt
+// never changes, so its ID stands for it.
 func (h *liveHistory) same(rejected []explain.RejectedAttempt, dropped int, incomplete bool) bool {
-	return h.dropped == dropped && h.incomplete == incomplete &&
-		slices.EqualFunc(h.rejected, rejected, func(a, b explain.RejectedAttempt) bool { return reflect.DeepEqual(a, b) })
+	return h.recordDropped == dropped && h.incomplete == incomplete &&
+		slices.EqualFunc(h.record, rejected, func(id string, ra explain.RejectedAttempt) bool { return id == ra.Attempt })
 }
 
-// copyRejected is rejected with every failure copied, its strings and
-// engine value included, so a history never shares memory with the
-// record. A nil failures list stays nil.
-func copyRejected(rejected []explain.RejectedAttempt) []explain.RejectedAttempt {
-	out := make([]explain.RejectedAttempt, len(rejected))
-	for i, ra := range rejected {
+// trimRejected copies the newest keepAttempts of rejected with, of their
+// failures, only the newest keepFailures in all (in page order: the last
+// failure of the last attempt is the newest). Every copied string and
+// engine value is new. A failure left out is counted on its attempt as
+// the record counts the failures it does not keep, so a page still
+// counts it; the attempts left out are returned as a count.
+func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts int) ([]explain.RejectedAttempt, int) {
+	keepAttempts = min(keepAttempts, len(rejected))
+	from := len(rejected) - keepAttempts
+	out := make([]explain.RejectedAttempt, keepAttempts)
+	for i := keepAttempts - 1; i >= 0; i-- {
+		ra := rejected[from+i]
+		m := min(keepFailures, len(ra.Failures))
+		keepFailures -= m
+		kept, left := ra.Failures[len(ra.Failures)-m:], ra.Failures[:len(ra.Failures)-m]
 		out[i] = ra
-		if ra.Failures != nil {
-			out[i].Failures = make([]explain.Failure, len(ra.Failures))
-			for j, f := range ra.Failures {
-				out[i].Failures[j] = cloneFailure(f)
+		out[i].Failures = make([]explain.Failure, len(kept))
+		named := map[string]bool{}
+		for j, f := range kept {
+			out[i].Failures[j] = cloneFailure(f)
+			named[failureKey(f)] = true
+		}
+		out[i].Omitted += len(left)
+		for _, f := range left {
+			k := failureKey(f)
+			if f.Code == explain.CodeLimitExceeded && f.Claim == "" || named[k] {
+				continue
+			}
+			named[k] = true
+			if f.Claim != "" {
+				out[i].OmittedClaims++
+			} else {
+				out[i].OmittedReferences++
 			}
 		}
 	}
-	return out
+	return out, from
 }
 
 // liveSnapshot is what the live page's HTTP handlers read: the steering,
@@ -247,7 +329,7 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	p := &publication{
 		kind: pubExplained, title: title, titleSegs: flamegraph.LiveTitleSegments(title, e.name),
 		view: view, digest: e.prof.Digest, attempt: attempt,
-		prof: e.prof, v: v, result: r, opts: opts, model: model,
+		prof: e.prof, v: v, result: r, resultSize: resultBytes(r), opts: opts, model: model,
 	}
 	if err := s.admit(p); err != nil {
 		return nil, err
@@ -290,9 +372,9 @@ func (s *Server) admit(p *publication) error {
 		kept = kept[1:]
 	}
 	if len(kept) == 0 && cost(nil) > s.lim.MaxRetainedBytes {
-		return fmt.Errorf("the page would keep %s in memory (profile, view and page model), over MaxRetainedBytes=%d; "+
+		return fmt.Errorf("the page would keep %d bytes in memory (profile, view, page model and history), over MaxRetainedBytes=%d; "+
 			"publish a smaller view or restart perf-agent-mcp with a larger --limit MaxRetainedBytes=N",
-			strconv.FormatInt(cost(nil), 10)+" bytes", s.lim.MaxRetainedBytes)
+			cost(nil), s.lim.MaxRetainedBytes)
 	}
 
 	for _, d := range l.pubs[:len(l.pubs)-len(kept)] {
@@ -316,21 +398,54 @@ func (l *live) drop(p *publication) {
 }
 
 // newHistory is the history of a publication id of view v, at version,
-// from the record's rejected attempts.
+// from the record's rejected attempts. It keeps the most of the newest
+// failures, and failing that of the newest attempts, whose copy and JSON
+// fit in MaxPageBytes.
 func (s *Server) newHistory(v *profilemodel.View, id string, version int64, rejected []explain.RejectedAttempt, dropped int, incomplete bool) *liveHistory {
-	rejected = copyRejected(rejected)
-	return &liveHistory{
-		version: version, rejected: rejected, dropped: dropped, incomplete: incomplete,
-		json: flamegraph.ExplainedLiveHistory(v, id, strconv.FormatInt(version, 10), rejected, dropped, incomplete, s.lim.MaxPageBytes),
+	record := make([]string, len(rejected))
+	for i, ra := range rejected {
+		record[i] = strings.Clone(ra.Attempt)
 	}
+	build := func(keepFailures, keepAttempts int) *liveHistory {
+		kept, left := trimRejected(rejected, keepFailures, keepAttempts)
+		h := &liveHistory{version: version, rejected: kept, dropped: dropped + left, incomplete: incomplete,
+			record: record, recordDropped: dropped}
+		h.json = flamegraph.ExplainedLiveHistory(v, id, strconv.FormatInt(version, 10), kept, h.dropped, incomplete, 0)
+		return h
+	}
+	limit := int64(s.lim.MaxPageBytes)
+	over := func(h *liveHistory) bool { return h.RetainedBytes() > limit }
+	failures := 0
+	for _, ra := range rejected {
+		failures += len(ra.Failures)
+	}
+	if h := build(failures, len(rejected)); !over(h) {
+		return h
+	}
+	// Fewer failures, and then fewer attempts, make a smaller history, so
+	// each search finds the most that fits.
+	if k := sort.Search(failures+1, func(k int) bool { return over(build(k, len(rejected))) }) - 1; k >= 0 {
+		if h := build(k, len(rejected)); !over(h) {
+			return h
+		}
+	}
+	if a := sort.Search(len(rejected)+1, func(a int) bool { return over(build(0, a)) }) - 1; a >= 0 {
+		if h := build(0, a); !over(h) {
+			return h
+		}
+	}
+	return build(0, 0)
 }
 
 // refreshHistory rebuilds, at the next version, the history of every kept
 // explained publication whose record of rejected attempts changed, and
 // reports whether any did. A grown history counts against
 // MaxRetainedBytes: while the kept publications go over it, the least
-// recently shown ones other than the current one are dropped. The page is
-// told at the next commit.
+// recently shown ones other than the current one are dropped. The current
+// one is never dropped, since the page must show its current record, so it
+// alone may stay over the budget after its history grew; the growth is
+// bounded by its history JSON (at most MaxPageBytes) and the copy of the
+// record it was built from. The page is told at the next commit.
 func (s *Server) refreshHistory() bool {
 	l := s.live
 	moved := false
@@ -394,7 +509,7 @@ func (s *Server) commit() {
 	_ = l.hub.Publish(snap.state)
 }
 
-// stateEntry is a publication as the state lists it. history is its
+// liveStateEntry is a publication as the state lists it. history is its
 // history's version, "0" for a publication without one.
 type liveStateEntry struct {
 	ID        string          `json:"id"`

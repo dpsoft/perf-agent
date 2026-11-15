@@ -63,13 +63,15 @@ type Limits struct {
 	// more drops the least recently shown, never the one on screen.
 	MaxPublications int
 	// MaxRetainedBytes is an estimated budget for the memory the live
-	// page's publications keep: the profiles, views and diffs they pin,
-	// each counted once however many publications and handles share it,
-	// plus their page models and histories. The estimates are within half
-	// and twice the heap they stand for, so the real heap can reach about
-	// twice this budget. Responses being written are not counted. A
-	// publication that does not fit even alone is refused. With the live
-	// page on it must be at least MaxPageBytes.
+	// page's publications keep: the profiles and views they pin, each
+	// counted once however many publications and handles share it, plus
+	// their checked results, page models and histories. The estimates are
+	// within half and twice the heap they stand for, so the real heap can
+	// reach about twice this budget. Responses being written are not
+	// counted. A publication that does not fit even alone is refused. The
+	// publication on screen is never dropped, so after its history grows
+	// it alone may stay over the budget, by at most that history. With the
+	// live page on it must be at least MaxPageBytes.
 	MaxRetainedBytes int64
 	// MaxPageClients is how many live page streams may be open at once.
 	MaxPageClients int

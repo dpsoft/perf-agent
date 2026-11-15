@@ -1,8 +1,12 @@
 package profilemodel
 
 import (
+	"bytes"
 	"runtime"
+	"strings"
 	"testing"
+
+	pprof "github.com/google/pprof/profile"
 
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
@@ -101,5 +105,54 @@ func TestExecutionsCountInTheProfileEstimate(t *testing.T) {
 	}
 	if with.RetainedBytes() <= without.RetainedBytes() {
 		t.Errorf("with executions %d, without %d: the ordinals are not counted", with.RetainedBytes(), without.RetainedBytes())
+	}
+}
+
+// labelled is CPUBasic with sample 0 copied n times, every copy carrying
+// the same label value of size bytes, which the profile stores once.
+func labelled(t *testing.T, n, size int) []byte {
+	t.Helper()
+	p, err := pprof.ParseData(pmfixture.CPUBasic())
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := strings.Repeat("x", size)
+	first := p.Sample[0]
+	first.Label = map[string][]string{"request": {value}}
+	for range n - 1 {
+		c := *first
+		c.Label = map[string][]string{"request": {value}}
+		p.Sample = append(p.Sample, &c)
+	}
+	var b bytes.Buffer
+	if err := p.Write(&b); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func TestRetainedEstimatesCountEveryStringOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		n, size int
+	}{
+		{"one 8 MiB label", 1, 8 << 20},
+		{"one 1 MiB label on 1000 samples", 1000, 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := labelled(t, tc.n, tc.size)
+			p, held := heapGrowth(func() *Profile {
+				p, err := FromBytes(raw, nil, DefaultLimits())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return p
+			})
+			ratio := float64(p.RetainedBytes()) / float64(held)
+			t.Logf("%d compressed bytes: estimate %d, heap %d, ratio %.3f", len(raw), p.RetainedBytes(), held, ratio)
+			if held <= 0 || ratio < 0.5 || ratio > 2 {
+				t.Errorf("RetainedBytes %d is not within [0.5x, 2x] of the %d bytes the profile holds", p.RetainedBytes(), held)
+			}
+		})
 	}
 }

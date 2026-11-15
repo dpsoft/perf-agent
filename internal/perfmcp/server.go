@@ -19,9 +19,13 @@ import (
 	"github.com/dpsoft/perf-agent/internal/sourceroot"
 )
 
-// Server is the perf-agent MCP server. It handles one request at a time,
-// so its handle store needs no locks; Serve must not run concurrently with
-// itself.
+// Server is the perf-agent MCP server. It handles one request at a time on
+// one request goroutine, which alone changes the store, the diffs, the
+// attempts and the live page's publications, so they need no locks; Serve
+// must not run concurrently with itself. The live page's HTTP handlers
+// read only the snapshot the request goroutine last committed and the
+// immutable publications it holds. Close may run on another goroutine,
+// and stops the live page under its lock.
 type Server struct {
 	lim Limits
 	log *slog.Logger
@@ -41,6 +45,10 @@ type Server struct {
 	// checking, so a page lists the rejected ones from this record.
 	attempts *attempts
 	mcp      *mcpstdio.Server
+	// pins is the ledger of the profiles and views the store and the live
+	// page keep. live is the live page, nil unless Config.Live.
+	pins *pins
+	live *live
 
 	// link publishes a written temporary under its final name without
 	// replacing anything; it is (*os.Root).Link. beforePublish, when set,
@@ -60,7 +68,7 @@ func New(cfg Config) (_ *Server, err error) {
 		return nil, errors.New("perfmcp: Config.ProfilesDir is required: the directory profiles are read from")
 	}
 	lim := cfg.Limits.withDefaults()
-	if err := lim.validate(); err != nil {
+	if err := lim.validate(cfg.Live); err != nil {
 		return nil, err
 	}
 	s := &Server{
@@ -91,7 +99,11 @@ func New(cfg Config) (_ *Server, err error) {
 		}
 	}
 	s.diffs = newDiffCache(lim.MaxCachedDiffs)
-	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles)
+	s.pins = newPins()
+	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles, s.pins)
+	if cfg.Live {
+		s.live = newLive(lim, s.pins)
+	}
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
 		Instructions:    instructions,
@@ -113,8 +125,12 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	return s.mcp.Serve(ctx, r, w)
 }
 
-// Close closes the server's roots.
+// Close stops the live page, if any, and closes the server's roots. It may
+// run on another goroutine than Serve's, while a request is in flight.
 func (s *Server) Close() error {
+	if s.live != nil {
+		s.live.close()
+	}
 	var errs []error
 	for _, r := range []*os.Root{s.profiles, s.output} {
 		if r != nil {

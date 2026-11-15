@@ -55,6 +55,7 @@ type View struct {
 	Total            int64
 	nodes            map[NodeID]*Node
 	profile          *Profile
+	retained         int64 // RetainedBytes, set once the view is built
 }
 
 var (
@@ -139,6 +140,7 @@ func (p *Profile) View(opts ViewOptions) (*View, error) {
 		})
 		slices.SortFunc(n.CallSites, compareLocations)
 	}
+	v.retained = viewRetained(v)
 	return v, nil
 }
 

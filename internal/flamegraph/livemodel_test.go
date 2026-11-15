@@ -176,6 +176,20 @@ func TestLiveModelMarksNumbersInTheTitle(t *testing.T) {
 	}, live["title_segs"])
 }
 
+func TestLiveTitleSegmentsAreTheModels(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	for _, title := range []string{"Verified: b is 87% of CPU", ""} {
+		opts := liveOpts()
+		opts.Title = title
+		var model struct {
+			TitleSegs json.RawMessage `json:"title_segs"`
+		}
+		_, raw := liveOf(t, v, r, opts)
+		require.NoError(t, json.Unmarshal(raw, &model))
+		assert.JSONEq(t, string(model.TitleSegs), string(LiveTitleSegments(title, opts.ProfileName)), "title %q", title)
+	}
+}
+
 func TestLiveModelRendersTheEngineValueNotTheAgents(t *testing.T) {
 	v, _, r := cpuBasicExplained(t)
 	_, raw := liveOf(t, v, r, liveOpts())

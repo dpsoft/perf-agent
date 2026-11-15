@@ -103,6 +103,20 @@ func ExplainedLiveModel(v *profilemodel.View, r explain.Result, opts LiveOptions
 	return fitFrames(opts.MaxBytes, base, render)
 }
 
+// LiveTitleSegments is the heading of a live publication titled title, of
+// the profile profileName, as the JSON array a live model's title_segs
+// holds: the title's numbers are marked unchecked, and an empty title is
+// the profile's name. The page's list of publications shows it, so the
+// list marks the title's numbers as the heading does.
+func LiveTitleSegments(title, profileName string) []byte {
+	out, err := json.Marshal(titleSegments(ExplainedPageOptions{Title: title, ProfileName: profileName}))
+	if err != nil {
+		// Segments are strings only, so they always encode.
+		panic(err)
+	}
+	return out
+}
+
 func checkLiveInput(v *profilemodel.View, r explain.Result) error {
 	if v == nil {
 		return errors.New("flamegraph: nil view")

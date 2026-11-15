@@ -162,12 +162,14 @@ func TestStdoutCarriesOnlyJSONRPC(t *testing.T) {
 	}
 }
 
-func TestTheServerLinksNoNetworkingOrProfiler(t *testing.T) {
+// TestTheServerLinksNoProfiler keeps the profiler out of the binary. net,
+// net/http and crypto/tls are linked for the live page's loopback listener.
+func TestTheServerLinksNoProfiler(t *testing.T) {
 	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
-	forbidden := []string{"net", "net/http", "crypto/tls", "github.com/dpsoft/perf-agent/perfagent", "github.com/cilium/ebpf", "github.com/libbpf/blazesym/go"}
+	forbidden := []string{"github.com/dpsoft/perf-agent/perfagent", "github.com/cilium/ebpf", "github.com/libbpf/blazesym/go"}
 	allowed := []string{"github.com/dpsoft/perf-agent", "github.com/google/pprof"}
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		path, std, _ := strings.Cut(line, " ")

@@ -16,8 +16,9 @@ import (
 // profilemodel.DefaultLimits and a zero Explain is explain.DefaultLimits,
 // so a Limits that sets only some of the server's own fields still loads
 // profiles and checks explanations. MaxRows, MaxCachedDiffs, MaxDiffRows,
-// MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews and
-// MaxHistoryBytes and Source are filled in when zero. Any other non-positive field is refused.
+// MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews,
+// MaxHistoryBytes, MaxPublications, MaxRetainedBytes, MaxPageClients and
+// Source are filled in when zero. Any other non-positive field is refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -58,6 +59,20 @@ type Limits struct {
 	// Source bounds the source files, manifests and git probes of the
 	// source tool.
 	Source sourceroot.Limits
+	// MaxPublications is how many publications the live page keeps; one
+	// more drops the least recently shown, never the one on screen.
+	MaxPublications int
+	// MaxRetainedBytes is an estimated budget for the memory the live
+	// page's publications keep: the profiles, views and diffs they pin,
+	// each counted once however many publications and handles share it,
+	// plus their page models and histories. The estimates are within half
+	// and twice the heap they stand for, so the real heap can reach about
+	// twice this budget. Responses being written are not counted. A
+	// publication that does not fit even alone is refused. With the live
+	// page on it must be at least MaxPageBytes.
+	MaxRetainedBytes int64
+	// MaxPageClients is how many live page streams may be open at once.
+	MaxPageClients int
 }
 
 // defaultMaxRows is the MaxRows a server runs with unless told otherwise.
@@ -78,6 +93,13 @@ const (
 	defaultMaxHistoryBytes    = 4 << 20
 )
 
+// Defaults of the live page limits.
+const (
+	defaultMaxPublications  = 8
+	defaultMaxRetainedBytes = 2 << 30
+	defaultMaxPageClients   = 8
+)
+
 // DefaultLimits are the limits a server runs with unless told otherwise.
 func DefaultLimits() Limits {
 	return Limits{
@@ -96,6 +118,10 @@ func DefaultLimits() Limits {
 		MaxAttemptViews:    defaultMaxAttemptViews,
 		MaxHistoryBytes:    defaultMaxHistoryBytes,
 		Source:             sourceroot.DefaultLimits(),
+
+		MaxPublications:  defaultMaxPublications,
+		MaxRetainedBytes: defaultMaxRetainedBytes,
+		MaxPageClients:   defaultMaxPageClients,
 	}
 }
 
@@ -137,11 +163,21 @@ func (l Limits) withDefaults() Limits {
 	if l.Source == (sourceroot.Limits{}) {
 		l.Source = sourceroot.DefaultLimits()
 	}
+	if l.MaxPublications == 0 {
+		l.MaxPublications = defaultMaxPublications
+	}
+	if l.MaxRetainedBytes == 0 {
+		l.MaxRetainedBytes = defaultMaxRetainedBytes
+	}
+	if l.MaxPageClients == 0 {
+		l.MaxPageClients = defaultMaxPageClients
+	}
 	return l
 }
 
-// validate refuses limits a server cannot run with.
-func (l Limits) validate() error {
+// validate refuses limits a server cannot run with. live says the live
+// page is on: only then must the retained budget hold a whole page.
+func (l Limits) validate(live bool) error {
 	for _, f := range []struct {
 		name string
 		v    int
@@ -165,10 +201,19 @@ func (l Limits) validate() error {
 		{"Explain.MaxHypothesisBytes", l.Explain.MaxHypothesisBytes},
 		{"Explain.MaxNextBytes", l.Explain.MaxNextBytes},
 		{"Explain.MaxTitleBytes", l.Explain.MaxTitleBytes},
+		{"MaxPublications", l.MaxPublications},
+		{"MaxPageClients", l.MaxPageClients},
 	} {
 		if f.v <= 0 {
 			return fmt.Errorf("perfmcp: limit %s must be positive, got %d", f.name, f.v)
 		}
+	}
+	if l.MaxRetainedBytes <= 0 {
+		return fmt.Errorf("perfmcp: limit MaxRetainedBytes must be positive, got %d", l.MaxRetainedBytes)
+	}
+	if live && l.MaxRetainedBytes < int64(l.MaxPageBytes) {
+		return fmt.Errorf("perfmcp: MaxRetainedBytes must be at least MaxPageBytes: a live page keeps its model, so a budget of %d bytes cannot hold a %d-byte page",
+			l.MaxRetainedBytes, l.MaxPageBytes)
 	}
 	return nil
 }

@@ -111,6 +111,7 @@ type Profile struct {
 	Source     *profile.Profile
 	Executions Availability
 	execOf     [][]uint64 // per sample index: execution ordinals; nil unless Executions.OK
+	retained   int64      // RetainedBytes, set once the profile is loaded
 }
 
 // Load reads a profile and, if execlogPath is not "", its executions log.
@@ -241,6 +242,7 @@ func assemble(raw, execlogBytes []byte, unread string, lim Limits) (*Profile, er
 			p.Handle += Handle("+" + hex.EncodeToString(sum[:]))
 		}
 	}
+	p.retained = profileRetained(p)
 	return p, nil
 }
 

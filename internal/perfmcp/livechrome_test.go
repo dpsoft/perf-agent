@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -277,5 +278,49 @@ func TestADiffNodeOutsideTheModelIsShownInChrome(t *testing.T) {
 	}
 	if errs := c.errors(); len(errs) != 0 || strings.Contains(tab.eval(`document.body.textContent`), "no such publication") {
 		t.Errorf("the page reported errors: %v", errs)
+	}
+}
+
+// A browser opens at most six connections to one host and port, and every
+// tab's event stream holds one. With six tabs open on the page, the server
+// still lets every tab follow a new publication: the tabs beyond
+// MaxPageClients are refused a stream and poll, which leaves connections
+// free for every tab's fetches.
+func TestSixTabsAllFollowThePageInChrome(t *testing.T) {
+	c := startChrome(t)
+	srv := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, srv, "cpu.pb.gz", "")
+	url := pageOpen(t, srv).URL
+	const tabs = 6
+	var open []*chromeTab
+	for range tabs {
+		open = append(open, c.open(t, url))
+	}
+	// Every tab has loaded and has its stream or its refusal.
+	streams := strconv.Itoa(min(tabs, DefaultLimits().MaxPageClients))
+	deadline := time.Now().Add(10 * time.Second)
+	for pageOpen(t, srv).Viewers != streams {
+		if time.Now().After(deadline) {
+			t.Fatalf("viewers %s with %d tabs open; want %s", pageOpen(t, srv).Viewers, tabs, streams)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(time.Second)
+
+	var pub pageExplainOut
+	srv.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &pub)
+	seq := pageState(t, url).Seq
+	probe := `(() => document.body && document.body.dataset.seq === ` + strconv.Quote(seq) + ` && document.getElementById('waiting').hidden ? 'ok' : '')()`
+	deadline = time.Now().Add(15 * time.Second)
+	for i, tab := range open {
+		for tab.eval(probe) == "" {
+			if time.Now().After(deadline) {
+				t.Fatalf("tab %d of %d never showed seq %s: it shows %q", i+1, tabs, seq, tab.eval(`String(document.body && document.body.dataset.seq)`))
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if errs := c.errors(); len(errs) != 0 {
+		t.Errorf("the tabs reported errors: %v", errs)
 	}
 }

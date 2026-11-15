@@ -209,8 +209,12 @@ Apps host can supply a `postMessage` transport and the same assets as one
 - **Never blocking.** Each subscriber has a one-slot, coalescing mailbox:
   the newest state replaces an unsent one. Publishing a state never waits
   on a socket. A keep-alive comment is sent every 15 s.
-  `MaxPageClients` (default 8) bounds concurrent streams; one more gets
-  `503`.
+  `MaxPageClients` (default 4) bounds concurrent streams; one more gets
+  `503`, and that tab polls `GET …/state` instead. A browser opens at most
+  six HTTP/1.1 connections to one host and port, and each stream holds
+  one, so the default leaves two for the tabs' fetches: with more streams
+  than that, every tab's model and frame requests queue behind the
+  streams and no tab follows a new publication.
 
 ### D3. What the agent drives, and what the page does on its own **[mine]**
 

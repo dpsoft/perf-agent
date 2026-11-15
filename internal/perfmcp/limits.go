@@ -73,7 +73,10 @@ type Limits struct {
 	// it alone may stay over the budget, by at most that history. With the
 	// live page on it must be at least MaxPageBytes.
 	MaxRetainedBytes int64
-	// MaxPageClients is how many live page streams may be open at once.
+	// MaxPageClients is how many live page streams may be open at once. A
+	// browser opens at most six connections to one host and port, and each
+	// tab's stream holds one, so the default leaves two for the tabs'
+	// fetches: a tab beyond it is refused a stream and polls instead.
 	MaxPageClients int
 }
 
@@ -99,7 +102,7 @@ const (
 const (
 	defaultMaxPublications  = 8
 	defaultMaxRetainedBytes = 2 << 30
-	defaultMaxPageClients   = 8
+	defaultMaxPageClients   = 4
 )
 
 // DefaultLimits are the limits a server runs with unless told otherwise.

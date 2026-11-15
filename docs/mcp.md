@@ -133,7 +133,7 @@ What the page never does:
 - It runs no tool and changes nothing: the agent steers it, the user only reads and navigates.
 - It does not work offline. It reads everything from the running server, so once `perf-agent-mcp` exits it says the server is gone and keeps the last state it showed. Download a static copy to keep one.
 
-The page keeps at most `MaxPublications` publications, dropping the least recently shown and never the one on screen. `MaxRetainedBytes` is an estimated budget for what they keep: the profiles and views they pin, each counted once however many publications share it, plus their checked results, page models and histories. It is not a physical memory cap. The estimates are within half and twice the heap they stand for, so the real heap can reach about twice the budget, and responses being written are not counted. A publication that cannot fit is refused and changes nothing. `MaxPageClients` bounds the tabs that stream the page at once; a tab beyond it polls the server instead.
+The page keeps at most `MaxPublications` publications, dropping the least recently shown and never the one on screen. `MaxRetainedBytes` is an estimated budget for what they keep: the profiles and views they pin, each counted once however many publications share it, plus their checked results, page models and histories. It is not a physical memory cap. The estimates are within half and twice the heap they stand for, so the real heap can reach about twice the budget, and responses being written are not counted. A publication that cannot fit is refused and changes nothing. `MaxPageClients` bounds the tabs that stream the page at once. A tab beyond it polls the server every few seconds instead, and says so. A browser opens at most six connections to one host and port, and each streaming tab holds one, so keep `MaxPageClients` at least two below that: the default 4 leaves two for every tab's fetches.
 
 ## Agent skill
 
@@ -196,7 +196,7 @@ Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must 
 | `MaxHistoryBytes` (all attempt records) | 4194304 (4 MiB) |
 | `MaxPublications` (live page publications kept) | 8 |
 | `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; with `--live` at least `MaxPageBytes`) | 2147483648 (2 GiB) |
-| `MaxPageClients` (live page streams at once) | 8 |
+| `MaxPageClients` (live page streams at once) | 4 |
 | `Source.MaxFileBytes` | 8388608 (8 MiB) |
 | `Source.MaxLineBytes` | 512 |
 | `Source.MaxContext` | 50 |

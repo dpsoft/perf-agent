@@ -865,10 +865,10 @@ func TestLimitsValidateTheRetainedBudget(t *testing.T) {
 	}
 
 	lim := (Limits{MaxRows: 1}).withDefaults()
-	if lim.MaxPublications != 8 || lim.MaxRetainedBytes != 2<<30 || lim.MaxPageClients != 8 {
-		t.Errorf("defaults %d, %d, %d; want 8, 2 GiB, 8", lim.MaxPublications, lim.MaxRetainedBytes, lim.MaxPageClients)
+	if lim.MaxPublications != 8 || lim.MaxRetainedBytes != 2<<30 || lim.MaxPageClients != 4 {
+		t.Errorf("defaults %d, %d, %d; want 8, 2 GiB, 4", lim.MaxPublications, lim.MaxRetainedBytes, lim.MaxPageClients)
 	}
-	if d := DefaultLimits(); d.MaxPublications != 8 || d.MaxRetainedBytes != 2<<30 || d.MaxPageClients != 8 {
+	if d := DefaultLimits(); d.MaxPublications != 8 || d.MaxRetainedBytes != 2<<30 || d.MaxPageClients != 4 {
 		t.Errorf("DefaultLimits %d, %d, %d", d.MaxPublications, d.MaxRetainedBytes, d.MaxPageClients)
 	}
 }

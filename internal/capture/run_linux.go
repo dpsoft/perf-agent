@@ -878,7 +878,7 @@ func (r *Run) workDone() {
 }
 
 // perfDone is perf-agent's exit; the end recheck runs while the target is
-// still there.
+// still there, and not once it was seen gone.
 func (r *Run) perfDone(ev Event) {
 	r.lateReadiness()
 	r.perfExited, r.perfStatus, r.perfSignal = true, ev.Status, ev.Signal
@@ -889,7 +889,10 @@ func (r *Run) perfDone(ev Event) {
 	if r.finish != nil {
 		r.finish.Stop()
 	}
-	if !r.readyAt.IsZero() && r.o.Err == nil {
+	// The end recheck, unless the target was already seen gone: nothing can
+	// change after its end, and its pid may since belong to another process.
+	// A reuse found only now, with no end seen first, is still pid_reused.
+	if !r.readyAt.IsZero() && r.o.Err == nil && !r.targetIsGone && !r.workExited {
 		if _, e := r.observe(); e != nil {
 			r.fail(e)
 		}

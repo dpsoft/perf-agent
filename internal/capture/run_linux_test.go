@@ -1271,6 +1271,37 @@ func TestRunAReusedPIDThatIsAZombieIsPIDReused(t *testing.T) {
 	}
 }
 
+// A target already seen gone cannot change after it: a pid reused before
+// perf-agent's exit event (symbolization may take seconds) does not turn
+// the target's exit into pid_reused. For a PID target and for a command
+// whose exit event came first.
+func TestAReuseAfterTheTargetEndedKeepsItsExit(t *testing.T) {
+	status := fakeStatus(ids(os.Getuid()), ids(os.Getgid()), "0000000000000000")
+	for _, launch := range []bool{false, true} {
+		kills := 0
+		r := testRun(t, &kills)
+		// Another live process now holds the pid.
+		r.spec.Proc = fakeProc(t, 11, fakeStat(11, "other", "S", 600), status, "", "/bin/true")
+		r.target, r.targetKnown = TargetState{PID: 11, StartTime: 500}, true
+		r.readyAt = time.Now().Add(-time.Second)
+		r.setPhase(PhaseProfiling)
+		want := StoppedByTargetExit
+		if launch {
+			r.spec.Launch = &LaunchSpec{Path: "/x/bench"}
+			r.work = instance{11, 500}
+			r.workDone()
+			want = StoppedByCommandExit
+		} else {
+			r.spec.PID = 11
+			r.targetGone()
+		}
+		r.perfDone(Event{Op: EventExited, Who: WhoPerfAgent, PID: 1})
+		if r.o.Err != nil || r.o.StoppedBy != want {
+			t.Errorf("launch %v: Err %v, stopped by %q; want ok, %s", launch, r.o.Err, r.o.StoppedBy, want)
+		}
+	}
+}
+
 // A perf-agent that ran its course profiled for its duration, not for the
 // supervisor's delay in hearing of its exit.
 func TestRanItsCourseIsCappedAtTheDuration(t *testing.T) {

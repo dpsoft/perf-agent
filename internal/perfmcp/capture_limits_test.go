@@ -100,10 +100,10 @@ func TestCaptureLimitsCeilings(t *testing.T) {
 	at := set(func(c *CaptureLimits) {
 		*c = CaptureLimits{
 			MaxDuration: 5 * time.Minute, StartTimeout: 5 * time.Minute, FinishTimeout: 10 * time.Minute,
-			StopGrace: 30 * time.Second, WindowDuration: time.Minute,
+			StopGrace: 30 * time.Second, WindowDuration: 5 * time.Minute,
 			MaxSampleRate: 10000, KeepPerSeries: 1, MaxKeptPerSeries: 1, CompareRows: defaultMaxDiffRows,
 			MaxJobs: 1, MaxJobBytes: 1, WindowCaptures: 1, MaxOutputTail: 64 << 10,
-			MaxProfileBytes: 1, MaxExeclogBytes: 1, MaxStoredBytes: 1, MinFreeBytes: 1,
+			MaxProfileBytes: 1, MaxExeclogBytes: 1, MaxStoredBytes: 2, MinFreeBytes: 1,
 		}
 	})
 	cfg := testConfig(t)
@@ -282,5 +282,76 @@ func TestCaptureIsDisabledForAPrivilegedOrSandboxedServer(t *testing.T) {
 	const want = "DISABLED: start perf-agent-mcp with --perf-agent PATH (the setcap'd perf-agent binary) to enable capturing."
 	if s.captureDisabled != want {
 		t.Errorf("captureDisabled = %q, want %q", s.captureDisabled, want)
+	}
+}
+
+// A capture limit left at its default follows the M2 limit it depends
+// on, so lowering that limit alone never refuses the server.
+func TestCaptureLimitsFollowTheM2Limits(t *testing.T) {
+	l := DefaultLimits()
+	l.MaxDiffRows = 10
+	l.Model.MaxRawBytes = 1 << 20
+	l.Model.MaxSidecarBytes = 2 << 20
+	l.MaxResponseBytes = 1024
+	cfg := testConfig(t)
+	cfg.Limits = l
+	s := must(New(cfg))(t)
+	defer func() { _ = s.Close() }()
+	c := s.lim.Capture
+	if c.CompareRows != 10 || c.MaxProfileBytes != 1<<20 || c.MaxExeclogBytes != 2<<20 || c.MaxOutputTail != 64 {
+		t.Errorf("CompareRows %d, MaxProfileBytes %d, MaxExeclogBytes %d, MaxOutputTail %d; want 10, 1 MiB, 2 MiB, 64",
+			c.CompareRows, c.MaxProfileBytes, c.MaxExeclogBytes, c.MaxOutputTail)
+	}
+
+	// A zero Capture is filled the same way.
+	cfg = testConfig(t)
+	cfg.Limits = Limits{MaxMessageBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxOpenHandles: 4, MaxDiffRows: 10}
+	s2 := must(New(cfg))(t)
+	defer func() { _ = s2.Close() }()
+	if s2.lim.Capture.CompareRows != 10 {
+		t.Errorf("a zero Capture with MaxDiffRows 10: CompareRows %d", s2.lim.Capture.CompareRows)
+	}
+}
+
+// A capture limit set against the limit it depends on is refused at
+// start-up, naming both.
+func TestCaptureLimitsCrossFieldChecks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Limits)
+		want []string
+	}{
+		{"profile over the model", func(l *Limits) { l.Capture.MaxProfileBytes = l.Model.MaxRawBytes + 1 }, []string{"Capture.MaxProfileBytes", "Model.MaxRawBytes"}},
+		{"execlog over the model", func(l *Limits) { l.Capture.MaxExeclogBytes = l.Model.MaxSidecarBytes + 1 }, []string{"Capture.MaxExeclogBytes", "Model.MaxSidecarBytes"}},
+		{"window under one capture", func(l *Limits) { l.Capture.WindowDuration = l.Capture.MaxDuration - time.Second }, []string{"Capture.WindowDuration", "Capture.MaxDuration"}},
+		{"store under one capture", func(l *Limits) { l.Capture.MaxStoredBytes = 300 << 20 }, []string{"Capture.MaxStoredBytes", "Capture.MaxProfileBytes", "Capture.MaxExeclogBytes"}},
+		{"tails over the response", func(l *Limits) { l.Capture.MaxOutputTail = 16 << 10; l.MaxResponseBytes = 256 << 10 - 1 }, []string{"Capture.MaxOutputTail", "MaxResponseBytes"}},
+		{"explicit compare rows", func(l *Limits) { l.MaxDiffRows = 10; l.Capture.CompareRows = 15 }, []string{"Capture.CompareRows", "MaxDiffRows"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := DefaultLimits()
+			tc.set(&l)
+			cfg := testConfig(t)
+			cfg.Limits = l
+			s, err := New(cfg)
+			if err == nil {
+				_ = s.Close()
+				t.Fatal("New accepted it")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("%v does not name %s", err, w)
+				}
+			}
+		})
+	}
+}
+
+func TestANegativeTTLSaysNotNegative(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits = DefaultLimits()
+	cfg.Limits.Capture.TTL = -time.Second
+	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Errorf("New = %v", err)
 	}
 }

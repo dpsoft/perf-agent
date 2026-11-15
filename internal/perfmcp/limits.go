@@ -20,7 +20,9 @@ import (
 // MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews,
 // MaxHistoryBytes, MaxPublications, MaxRetainedBytes, MaxPageClients and
 // Source are filled in when zero, and Capture when all of it is zero. Any
-// other non-positive field is refused (Capture.TTL may be zero).
+// other non-positive field is refused (Capture.TTL may be zero). A capture
+// limit left at its default follows the limit it depends on downwards
+// (see CaptureLimits), so lowering that limit alone is never refused.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -86,7 +88,13 @@ type Limits struct {
 
 // CaptureLimits bound what a capture may ask for and keep. Each is
 // settable with --limit Capture.Name=V, up to a ceiling compiled in where
-// there is one.
+// there is one. Some depend on another limit, and New refuses one set
+// against it: CompareRows is at most MaxDiffRows, MaxProfileBytes and
+// MaxExeclogBytes at most Model.MaxRawBytes and Model.MaxSidecarBytes,
+// WindowDuration at least MaxDuration, MaxStoredBytes at least one
+// capture's files, and four tails at most a quarter of MaxResponseBytes.
+// Where one of them is left at its default, it is lowered to fit instead,
+// so a value equal to the default follows the limit it depends on.
 type CaptureLimits struct {
 	// MaxDuration is the longest capture (at most 5 min).
 	MaxDuration time.Duration
@@ -266,8 +274,33 @@ func (l Limits) withDefaults() Limits {
 	if l.Capture == (CaptureLimits{}) {
 		l.Capture = defaultCaptureLimits(l.Model)
 	}
+	l.Capture = l.Capture.fit(l)
 	return l
 }
+
+// fit lowers the capture limits left at their defaults to what the limits
+// they depend on allow.
+func (c CaptureLimits) fit(l Limits) CaptureLimits {
+	def := defaultCaptureLimits(profilemodel.DefaultLimits())
+	if c.CompareRows == def.CompareRows {
+		c.CompareRows = min(c.CompareRows, l.MaxDiffRows)
+	}
+	if c.MaxProfileBytes == def.MaxProfileBytes {
+		c.MaxProfileBytes = min(c.MaxProfileBytes, l.Model.MaxRawBytes)
+	}
+	if c.MaxExeclogBytes == def.MaxExeclogBytes {
+		c.MaxExeclogBytes = min(c.MaxExeclogBytes, l.Model.MaxSidecarBytes)
+	}
+	if c.MaxOutputTail == def.MaxOutputTail {
+		c.MaxOutputTail = min(c.MaxOutputTail, max(l.MaxResponseBytes/(4*maxTailsPerResult), 1))
+	}
+	return c
+}
+
+// maxTailsPerResult is how many output tails one capture result carries
+// at most: stdout and stderr of the workload, and of perf-agent on
+// failure. Together they may take a quarter of MaxResponseBytes.
+const maxTailsPerResult = 4
 
 // validate refuses limits a server cannot run with. live says the live
 // page is on: only then must the retained budget hold a whole page.
@@ -309,12 +342,13 @@ func (l Limits) validate(live bool) error {
 		return fmt.Errorf("perfmcp: MaxRetainedBytes must be at least MaxPageBytes: a live page keeps its model, so a budget of %d bytes cannot hold a %d-byte page",
 			l.MaxRetainedBytes, l.MaxPageBytes)
 	}
-	return l.Capture.validate(l.MaxDiffRows)
+	return l.Capture.validate(l)
 }
 
-// validate refuses capture limits that are not positive (TTL may be zero)
-// or are over their ceilings; maxDiffRows bounds CompareRows.
-func (c CaptureLimits) validate(maxDiffRows int) error {
+// validate refuses capture limits that are not positive (TTL may be zero),
+// are over their ceilings, or do not fit the limits of l they depend on.
+func (c CaptureLimits) validate(l Limits) error {
+	maxDiffRows := l.MaxDiffRows
 	for _, f := range []struct {
 		name     string
 		v, limit time.Duration
@@ -333,7 +367,7 @@ func (c CaptureLimits) validate(maxDiffRows int) error {
 		}
 	}
 	if c.TTL < 0 {
-		return fmt.Errorf("perfmcp: limit Capture.TTL must be zero (no age limit) or positive, got %v", c.TTL)
+		return fmt.Errorf("perfmcp: limit Capture.TTL must not be negative (0 means no age limit), got %v", c.TTL)
 	}
 	for _, f := range []struct {
 		name     string
@@ -359,6 +393,23 @@ func (c CaptureLimits) validate(maxDiffRows int) error {
 		case f.limit > 0 && f.v > f.limit:
 			return fmt.Errorf("perfmcp: limit Capture.%s is %d, over %s", f.name, f.v, fmt.Sprintf(f.over, f.limit))
 		}
+	}
+	switch {
+	case c.MaxProfileBytes > l.Model.MaxRawBytes:
+		return fmt.Errorf("perfmcp: limit Capture.MaxProfileBytes is %d, over Model.MaxRawBytes (%d): a capture that large could not be opened",
+			c.MaxProfileBytes, l.Model.MaxRawBytes)
+	case c.MaxExeclogBytes > l.Model.MaxSidecarBytes:
+		return fmt.Errorf("perfmcp: limit Capture.MaxExeclogBytes is %d, over Model.MaxSidecarBytes (%d): an executions log that large could not be opened",
+			c.MaxExeclogBytes, l.Model.MaxSidecarBytes)
+	case c.WindowDuration < c.MaxDuration:
+		return fmt.Errorf("perfmcp: limit Capture.WindowDuration is %v, under Capture.MaxDuration (%v): the longest capture would never fit the window",
+			c.WindowDuration, c.MaxDuration)
+	case c.MaxStoredBytes < c.MaxProfileBytes+c.MaxExeclogBytes:
+		return fmt.Errorf("perfmcp: limit Capture.MaxStoredBytes is %d, under Capture.MaxProfileBytes + Capture.MaxExeclogBytes (%d): the largest capture would not fit",
+			c.MaxStoredBytes, c.MaxProfileBytes+c.MaxExeclogBytes)
+	case maxTailsPerResult*c.MaxOutputTail > l.MaxResponseBytes/4:
+		return fmt.Errorf("perfmcp: limit Capture.MaxOutputTail is %d: %d tails take %d bytes, over a quarter of MaxResponseBytes (%d), which must leave room for the rest of a result",
+			c.MaxOutputTail, maxTailsPerResult, maxTailsPerResult*c.MaxOutputTail, l.MaxResponseBytes/4)
 	}
 	return nil
 }

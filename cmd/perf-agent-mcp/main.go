@@ -207,8 +207,12 @@ var zeroLimits = []string{"Source.MaxContext", "Capture.TTL"}
 // zeroLimits may be zero.
 func checkLimits(l *perfmcp.Limits) error {
 	for name, f := range limitFields(l) {
-		if f.Int() > 0 || (f.Int() == 0 && slices.Contains(zeroLimits, name)) {
+		zero := slices.Contains(zeroLimits, name)
+		if f.Int() > 0 || (f.Int() == 0 && zero) {
 			continue
+		}
+		if zero {
+			return fmt.Errorf("limit %s must not be negative (0 is allowed), got %d", name, f.Int())
 		}
 		return fmt.Errorf("limit %s must be positive, got %d", name, f.Int())
 	}

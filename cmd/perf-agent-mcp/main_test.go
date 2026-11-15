@@ -538,6 +538,7 @@ func TestRunAcceptsAZeroCaptureTTL(t *testing.T) {
 		limit, want string
 		code        int
 	}{
+		{"Capture.TTL=-1s", "must not be negative", 2},
 		{"Capture.StopGrace=0s", "Capture.StopGrace", 2},
 		{"Capture.MaxStoredBytes=0", "Capture.MaxStoredBytes", 2},
 		{"Capture.MaxDuration=6m", "5m0s", 1},
@@ -545,6 +546,17 @@ func TestRunAcceptsAZeroCaptureTTL(t *testing.T) {
 		errb.Reset()
 		if code := run([]string{"--profiles", t.TempDir(), "--limit", c.limit}, strings.NewReader(""), &out, &errb); code != c.code || !strings.Contains(errb.String(), c.want) {
 			t.Errorf("%s: exit %d, stderr %q", c.limit, code, errb.String())
+		}
+	}
+}
+
+// Lowering an M2 limit alone still starts the server: the capture limits
+// left at their defaults follow it.
+func TestRunAcceptsLoweredM2LimitsAlone(t *testing.T) {
+	for _, limit := range []string{"MaxDiffRows=10", "Model.MaxRawBytes=1048576", "Model.MaxSidecarBytes=1048576", "MaxResponseBytes=4096"} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"--profiles", t.TempDir(), "--limit", limit}, strings.NewReader(""), &out, &errb); code != 0 {
+			t.Errorf("%s: exit %d, stderr %q", limit, code, errb.String())
 		}
 	}
 }

@@ -233,14 +233,14 @@ type liveHistory struct {
 // any is encoded, so a long history costs no more than the budget. Without
 // any row the history is returned even over maxBytes: its pills are small.
 func ExplainedLiveHistory(v *profilemodel.View, pub, version string, rejected []explain.RejectedAttempt, dropped int, incomplete bool, maxBytes int) []byte {
-	b := newExplainedBuilder(v, explain.Result{}, ExplainedPageOptions{Rejected: rejected, DroppedRejected: dropped, HistoryIncomplete: incomplete}, nil, -1)
+	b := newExplainedBuilder(v, explain.Result{}, ExplainedPageOptions{Rejected: rejected, DroppedRejected: dropped, HistoryIncomplete: incomplete, LiveHistory: true}, nil, -1)
 	rows, rejectedPill, limitPill := b.rejected()
 	h := liveHistory{Publication: pub, Version: version, RejectedPill: rejectedPill, LimitPill: limitPill,
-		HistoryPill: historyPill(incomplete), Rows: []exRejected{}}
+		HistoryPill: historyPill(incomplete, true), Rows: []exRejected{}}
 	encode := func(keep int) []byte {
 		h.Rows, h.RejectedNote = nonNil(rows[len(rows)-keep:]), ""
 		if n := len(rows) - keep; n > 0 {
-			h.RejectedNote = rejectedNote(n)
+			h.RejectedNote = rejectedNote(n, true)
 		}
 		out, err := json.Marshal(h)
 		if err != nil {

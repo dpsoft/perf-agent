@@ -253,11 +253,12 @@ func (e *exportSizeError) Error() string { return e.msg }
 // page. One over the limits is an *exportSizeError; any other failure
 // says nothing of the limits. The rows h left out are counted on their
 // attempts and in its dropped attempts, so the page says how many it does
-// not list.
+// not list. Like the live page, it words the history for attempts made
+// before the publication or after it.
 func exportExplained(p *publication, h *liveHistory) ([]byte, error) {
 	opts := flamegraph.ExplainedPageOptions{
 		Title: p.opts.Title, ProfileName: p.opts.ProfileName, Digest: p.opts.Digest, Attempt: p.opts.Attempt,
-		MaxNodes: p.opts.MaxNodes, MaxBytes: p.opts.MaxBytes,
+		MaxNodes: p.opts.MaxNodes, MaxBytes: p.opts.MaxBytes, LiveHistory: true,
 	}
 	if h != nil {
 		opts.Rejected, opts.DroppedRejected, opts.HistoryIncomplete = h.rejected, h.dropped, h.incomplete

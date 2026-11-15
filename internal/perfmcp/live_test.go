@@ -725,7 +725,7 @@ func TestTheHistoryKeepsOnlyWhatItShows(t *testing.T) {
 	if err := json.Unmarshal(h.json, &page); err != nil {
 		t.Fatal(err)
 	}
-	if want := "640 claims rejected at render in 20 attempts"; page.RejectedPill != want {
+	if want := "640 claims rejected in 20 attempts"; page.RejectedPill != want {
 		t.Errorf("pill %q, want %q: it counts every attempt", page.RejectedPill, want)
 	}
 	if page.RejectedNote != "" {

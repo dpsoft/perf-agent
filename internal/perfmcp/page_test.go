@@ -343,7 +343,7 @@ func TestPageExplainSharesTheAttemptRecord(t *testing.T) {
 		t.Errorf("the retry %+v", out)
 	}
 	history := pageGet(t, out.URL, "pub/p1/history")
-	if !strings.Contains(history, `"a1"`) || !strings.Contains(history, "1 claim rejected at render") {
+	if !strings.Contains(history, `"a1"`) || !strings.Contains(history, "1 claim rejected") {
 		t.Errorf("p1's history does not show a1: %s", history)
 	}
 
@@ -398,6 +398,39 @@ func TestLiveHistoryFollowsNewRejections(t *testing.T) {
 	}
 }
 
+// A publication's history follows the attempt record, so it lists an
+// attempt made after the publication too; the history and the export say
+// so instead of calling the rejections earlier attempts.
+func TestALaterRejectionIsNotCalledEarlier(t *testing.T) {
+	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, c, "cpu.pb.gz", "")
+	b := o.nodeID(t, "b")
+	var out pageExplainOut
+	c.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &out)
+	if text, isErr := c.call("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.62", "b takes {c1}")})); !isErr {
+		t.Fatalf("the later rejection: %s", text)
+	}
+	history := pageGet(t, out.URL, "pub/"+out.Publication+"/history")
+	if !strings.Contains(history, `"a2"`) || !strings.Contains(history, `"rejected_pill":"1 claim rejected"`) {
+		t.Errorf("the history of %s: %s", out.Publication, history)
+	}
+	page := pageGet(t, out.URL, "pub/"+out.Publication+"/export")
+	for _, want := range []string{
+		"<h5>Rejected attempts on this profile and view</h5>",
+		"before or after this publication (attempt " + out.Attempt + ").",
+		`<span class="pill bad">1 claim rejected</span>`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the export lacks %q", want)
+		}
+	}
+	for _, wrong := range []string{"at render", "earlier attempts", "the attempt that passed"} {
+		if strings.Contains(history+page, wrong) {
+			t.Errorf("the history or export says %q", wrong)
+		}
+	}
+}
+
 func TestAFactsOnlyPageStillShowsRejections(t *testing.T) {
 	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o, _ := openOn(t, c, "cpu.pb.gz", "")
@@ -412,7 +445,7 @@ func TestAFactsOnlyPageStillShowsRejections(t *testing.T) {
 	if st := pageState(t, out.URL); st.Current != out.Publication || st.Selected != "" {
 		t.Errorf("state %+v", st)
 	}
-	if history := pageGet(t, out.URL, "pub/"+out.Publication+"/history"); !strings.Contains(history, "1 claim rejected at render") {
+	if history := pageGet(t, out.URL, "pub/"+out.Publication+"/history"); !strings.Contains(history, "1 claim rejected") {
 		t.Errorf("the facts-only page hides the rejection: %s", history)
 	}
 }

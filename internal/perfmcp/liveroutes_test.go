@@ -494,12 +494,13 @@ func TestExportIsTheStaticPageAsADownload(t *testing.T) {
 		t.Errorf("export starts %.40q", body)
 	}
 
-	// It is the page render_flamegraph writes for the same check and record.
+	// It is the page render_flamegraph writes for the same check and
+	// record, with the history worded for attempts in any order.
 	recorded, dropped, incomplete := s.attempts.rejected(o.e.prof, o.view)
 	var want bytes.Buffer
 	if err := flamegraph.WriteExplainedPage(&want, o.v, p.result, flamegraph.ExplainedPageOptions{
 		ProfileName: "cpu.pb.gz", Digest: o.e.prof.Digest.String(), Attempt: "a0",
-		Rejected: recorded, DroppedRejected: dropped, HistoryIncomplete: incomplete,
+		Rejected: recorded, DroppedRejected: dropped, HistoryIncomplete: incomplete, LiveHistory: true,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
 	}); err != nil {
 		t.Fatal(err)
@@ -544,7 +545,7 @@ func TestTheExportShowsOnlyWhatTheHistoryKeeps(t *testing.T) {
 	var full bytes.Buffer
 	if err := flamegraph.WriteExplainedPage(&full, o.v, p.result, flamegraph.ExplainedPageOptions{
 		ProfileName: "cpu.pb.gz", Digest: o.e.prof.Digest.String(), Attempt: "a0",
-		Rejected: recorded, DroppedRejected: dropped, HistoryIncomplete: incomplete,
+		Rejected: recorded, DroppedRejected: dropped, HistoryIncomplete: incomplete, LiveHistory: true,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
 	}); err != nil {
 		t.Fatal(err)
@@ -553,7 +554,7 @@ func TestTheExportShowsOnlyWhatTheHistoryKeeps(t *testing.T) {
 		t.Error("the export shows the whole record, not what the history keeps")
 	}
 	page := string(body)
-	if !strings.Contains(page, "640 claims rejected at render in 20 attempts") {
+	if !strings.Contains(page, "640 claims rejected in 20 attempts") {
 		t.Error("the export's pill does not count every claim and attempt")
 	}
 	// Every failure of the record is either listed or counted, attempt by

@@ -208,9 +208,13 @@
     clear(box);
     const h = view && view.hist;
     if (!h || (!(h.rows && h.rows.length) && !h.rejected_note)) return;
+    // The history follows the server's record of the profile and view, so
+    // it lists attempts made after this publication as well as before it.
     const sec = make('section', 'sec');
-    sec.appendChild(make('h5', '', 'Rejected at render'));
-    sec.appendChild(make('p', 'muted', "perf-agent refused these in earlier attempts. A claim row strikes through the agent's figure beside the engine's; reference and limit rows say what was wrong. This page is the attempt that passed."));
+    const attempt = view.whole.attempt ? ' (attempt ' + view.whole.attempt + ')' : '';
+    sec.appendChild(make('h5', '', 'Rejected attempts on this profile and view'));
+    sec.appendChild(make('p', 'muted', 'perf-agent refused these attempts on this profile and view, before or after this publication' + attempt +
+      ". A claim row strikes through the agent's figure beside the engine's; reference and limit rows say what was wrong."));
     if (h.rejected_note) sec.appendChild(make('p', 'muted', h.rejected_note));
     const ul = make('ul', 'rej');
     for (const row of h.rows || []) ul.appendChild(rejectedRow(row));

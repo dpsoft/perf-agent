@@ -468,7 +468,7 @@ func TestLiveHistoryMatchesTheStaticRejectedSection(t *testing.T) {
 		}},
 	}
 	opts := exOpts()
-	opts.Rejected, opts.DroppedRejected, opts.HistoryIncomplete = rejected, 2, true
+	opts.Rejected, opts.DroppedRejected, opts.HistoryIncomplete, opts.LiveHistory = rejected, 2, true, true
 	page := exPage(t, v, r, opts)
 	h := historyOf(t, ExplainedLiveHistory(v, "p3", "7", rejected, 2, true, 1<<20))
 	assert.Equal(t, "p3", h["publication"])
@@ -481,7 +481,7 @@ func TestLiveHistoryMatchesTheStaticRejectedSection(t *testing.T) {
 	assert.Equal(t, unesc(pills[2][1]), h["history_pill"])
 	assert.Equal(t, "", h["rejected_note"])
 
-	sec := page[strings.Index(page, "<h5>Rejected at render"):]
+	sec := page[strings.Index(page, "<h5>Rejected attempts on this profile and view"):]
 	sec = sec[:strings.Index(sec, "</section>")]
 	items := regexp.MustCompile(`<li>(.*?)</li>`).FindAllStringSubmatch(sec, -1)
 	rows := list(t, h, "rows")
@@ -495,6 +495,50 @@ func TestLiveHistoryMatchesTheStaticRejectedSection(t *testing.T) {
 	empty := historyOf(t, ExplainedLiveHistory(v, "p1", "0", nil, 0, false, 1<<20))
 	assert.Equal(t, []any{}, empty["rows"])
 	assert.Equal(t, "", empty["rejected_pill"])
+}
+
+// A publication's history follows the server's record, which holds the
+// attempts before the publication and any made after it, so the live page
+// and its export never call the rejections earlier or the page the
+// attempt that passed. The static page render_flamegraph writes keeps its
+// own words.
+func TestLiveHistoryIsWordedForAttemptsInAnyOrder(t *testing.T) {
+	v, b, r := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	rejected := []explain.RejectedAttempt{
+		{Attempt: "a1", Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}},
+		{Attempt: "a3", Failures: []explain.Failure{
+			failure(explain.CodeUnresolvedClaimRef, "", "c9", "", nil),
+			{Explanation: -1, Ref: "MaxProseBytes", Code: explain.CodeLimitExceeded, Message: "the prose's size in bytes is 9000"},
+		}},
+	}
+	h := historyOf(t, ExplainedLiveHistory(v, "p1", "2", rejected, 1, true, 1<<20))
+	assert.Equal(t, "1 claim and 1 reference rejected in 2 attempts, plus 1 older rejected attempt not kept", h["rejected_pill"])
+	assert.Equal(t, "1 limit exceeded", h["limit_pill"])
+	assert.Equal(t, "attempt history for this view may be incomplete", h["history_pill"])
+	small := historyOf(t, ExplainedLiveHistory(v, "p1", "2", rejected, 0, false, 900))
+	assert.Regexp(t, `^\d+ older rows? beyond the page's size budget (is|are) not listed; the pills count them\.$`, small["rejected_note"])
+
+	opts := exOpts()
+	opts.Rejected, opts.DroppedRejected, opts.HistoryIncomplete, opts.LiveHistory = rejected, 1, true, true
+	page := exPage(t, v, r, opts)
+	assert.Contains(t, page, "<h5>Rejected attempts on this profile and view</h5>")
+	assert.Contains(t, page, "perf-agent refused these attempts on this profile and view, before or after this publication (attempt a2). ")
+	for _, s := range []string{h["rejected_pill"].(string), h["limit_pill"].(string), h["history_pill"].(string)} {
+		assert.Contains(t, page, `<span class="pill bad">`+s+"</span>")
+	}
+	for _, wrong := range []string{"at render", "earlier", "attempt that passed"} {
+		assert.NotContains(t, page, wrong)
+		assert.NotContains(t, fmt.Sprint(h), wrong)
+	}
+
+	opts.LiveHistory = false
+	static := exPage(t, v, r, opts)
+	assert.Contains(t, static, "<h5>Rejected at render</h5>")
+	assert.Contains(t, static, "This page is the attempt that passed.")
+	assert.Contains(t, static, "1 claim and 1 reference rejected at render in 2 attempts, plus 1 earlier rejected attempt not kept</span>")
+	assert.NotContains(t, static, "before or after this publication")
 }
 
 func TestLiveHistoryIsBudgeted(t *testing.T) {
@@ -513,10 +557,10 @@ func TestLiveHistoryIsBudgeted(t *testing.T) {
 		raw := ExplainedLiveHistory(v, "p1", "1", rejected, 0, false, budget)
 		assert.LessOrEqual(t, len(raw), budget)
 		h := historyOf(t, raw)
-		assert.Equal(t, "40 claims rejected at render in 40 attempts", h["rejected_pill"], "budget %d", budget)
+		assert.Equal(t, "40 claims rejected in 40 attempts", h["rejected_pill"], "budget %d", budget)
 		rows := list(t, h, "rows")
 		assert.Less(t, len(rows), 40)
-		assert.Equal(t, fmt.Sprintf("%d earlier rows beyond the page's size budget are not listed; the pills count them.", 40-len(rows)), h["rejected_note"])
+		assert.Equal(t, fmt.Sprintf("%d older rows beyond the page's size budget are not listed; the pills count them.", 40-len(rows)), h["rejected_note"])
 		if len(rows) > 0 {
 			assert.Equal(t, "a40", rows[len(rows)-1]["attempt"], "the newest rows are kept")
 			assert.NotEqual(t, "a1", rows[0]["attempt"])

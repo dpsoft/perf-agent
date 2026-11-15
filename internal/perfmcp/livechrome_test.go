@@ -324,3 +324,59 @@ func TestSixTabsAllFollowThePageInChrome(t *testing.T) {
 		t.Errorf("the tabs reported errors: %v", errs)
 	}
 }
+
+// The live page lists a rejection made after the publication it shows, and
+// says the rejections may come before or after it.
+func TestTheLivePageWordsRejectionsForAnyOrderInChrome(t *testing.T) {
+	c := startChrome(t)
+	srv := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, srv, "cpu.pb.gz", "")
+	b := o.nodeID(t, "b")
+	var out pageExplainOut
+	srv.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &out)
+	tab := c.open(t, out.URL)
+	if text, isErr := srv.call("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.62", "b takes {c1}")})); !isErr {
+		t.Fatalf("the later rejection: %s", text)
+	}
+	const probe = `(() => {
+  const sec = document.querySelector('#rejected section');
+  if (!sec || !sec.querySelector('li')) return '';
+  return JSON.stringify({
+    heading: sec.querySelector('h5').textContent,
+    intro: sec.querySelector('p').textContent,
+    rows: [...sec.querySelectorAll('li')].map((e) => e.textContent),
+    pills: [...document.querySelectorAll('#pills .pill')].map((e) => e.textContent),
+  });
+})()`
+	var got struct {
+		Heading string   `json:"heading"`
+		Intro   string   `json:"intro"`
+		Rows    []string `json:"rows"`
+		Pills   []string `json:"pills"`
+	}
+	if err := json.Unmarshal([]byte(tab.waitText("the later rejection", probe)), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Heading != "Rejected attempts on this profile and view" {
+		t.Errorf("heading %q", got.Heading)
+	}
+	if !strings.HasPrefix(got.Intro, "perf-agent refused these attempts on this profile and view, before or after this publication (attempt "+out.Attempt+"). ") {
+		t.Errorf("intro %q", got.Intro)
+	}
+	if len(got.Rows) != 1 || !strings.HasPrefix(got.Rows[0], "a2 ") {
+		t.Errorf("rows %q", got.Rows)
+	}
+	if !slices.Contains(got.Pills, "1 claim rejected") {
+		t.Errorf("pills %q", got.Pills)
+	}
+	for _, s := range append([]string{got.Heading, got.Intro}, got.Pills...) {
+		for _, wrong := range []string{"at render", "earlier", "attempt that passed"} {
+			if strings.Contains(s, wrong) {
+				t.Errorf("%q says %q", s, wrong)
+			}
+		}
+	}
+	if errs := c.errors(); len(errs) != 0 {
+		t.Errorf("the page reported errors: %v", errs)
+	}
+}

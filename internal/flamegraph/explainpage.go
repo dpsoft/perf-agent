@@ -89,6 +89,12 @@ type ExplainedPageOptions struct {
 	// HistoryIncomplete says the server may have lost count of earlier
 	// attempts of this view; the page says so.
 	HistoryIncomplete bool
+	// LiveHistory words the rejected attempts for a live publication's
+	// history, which follows the server's record: it holds the attempts on
+	// the profile and view made before the publication and after it, so
+	// the page does not call them earlier attempts or itself the attempt
+	// that passed. render_flamegraph's page leaves it false.
+	LiveHistory bool
 	// MaxNodes bounds the frames drawn; 0 means defaultExplainedMaxNodes.
 	// Explained and referenced nodes and their callers are always drawn.
 	MaxNodes int
@@ -263,6 +269,8 @@ type explainedPageData struct {
 	Frames                          []exDrawn
 	NarrowNote, LimitNote, SizeNote string
 	RejectedNote                    string
+	// LiveHistory words the rejected section for a live publication.
+	LiveHistory bool
 	// allRejected are every rejected row, before historyRows cut them.
 	allRejected []exRejected
 	Rows        []exRow
@@ -574,9 +582,10 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	data.allRejected = data.Rejected
 	if n := len(data.Rejected) - b.historyRows; b.historyRows >= 0 && n > 0 {
 		data.Rejected = data.Rejected[n:]
-		data.RejectedNote = rejectedNote(n)
+		data.RejectedNote = rejectedNote(n, b.opts.LiveHistory)
 	}
-	data.HistoryPill = historyPill(b.opts.HistoryIncomplete)
+	data.HistoryPill = historyPill(b.opts.HistoryIncomplete, b.opts.LiveHistory)
+	data.LiveHistory = b.opts.LiveHistory
 	data.Legend = legendOf(data.Frames)
 
 	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, FactRows: b.specs, Frames: b.frames, Prompts: prompts})
@@ -630,15 +639,23 @@ func (b *explainedBuilder) factRows(f *exFrame) []exFactRow {
 }
 
 // rejectedNote says how many of the oldest rejected rows a budget left
-// out.
-func rejectedNote(n int) string {
-	return fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
+// out. A live history (live) holds attempts made after its publication
+// too, so it calls them older rather than earlier.
+func rejectedNote(n int, live bool) string {
+	rows := plural(n, "earlier row", "earlier rows")
+	if live {
+		rows = plural(n, "older row", "older rows")
+	}
+	return fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", rows, isAre(n))
 }
 
 // historyPill says the attempt history may be incomplete, or is "".
-func historyPill(incomplete bool) string {
-	if !incomplete {
+func historyPill(incomplete, live bool) string {
+	switch {
+	case !incomplete:
 		return ""
+	case live:
+		return "attempt history for this view may be incomplete"
 	}
 	return "earlier attempt history for this view may be incomplete"
 }
@@ -1228,21 +1245,27 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 	if refs > 0 {
 		parts = append(parts, plural(refs, "reference", "references"))
 	}
+	// A live history follows the record, whose attempts may come after the
+	// publication: its pills say what was rejected, not when.
+	rejectedAt, exceededAt, older := " rejected at render", " exceeded at render", "earlier"
+	if b.opts.LiveHistory {
+		rejectedAt, exceededAt, older = " rejected", " exceeded", "older"
+	}
 	if len(parts) > 0 {
-		claimsPill = strings.Join(parts, " and ") + " rejected at render"
+		claimsPill = strings.Join(parts, " and ") + rejectedAt
 		if attempts > 1 {
 			claimsPill += fmt.Sprintf(" in %d attempts", attempts)
 		}
 	}
 	if n := b.opts.DroppedRejected; n > 0 {
-		dropped := plural(n, "earlier rejected attempt", "earlier rejected attempts") + " not kept"
+		dropped := plural(n, older+" rejected attempt", older+" rejected attempts") + " not kept"
 		if claimsPill != "" {
 			dropped = claimsPill + ", plus " + dropped
 		}
 		claimsPill = dropped
 	}
 	if limits > 0 {
-		limitsPill = plural(limits, "limit", "limits") + " exceeded at render"
+		limitsPill = plural(limits, "limit", "limits") + exceededAt
 	}
 	return rows, claimsPill, limitsPill
 }

@@ -278,6 +278,13 @@ How the tools behave:
   **refreshed whenever the record for that key changes**, from either tool
   and any handle of the digest. A facts-only publication shows it too, and
   no tool argument can hide it.
+- Because the record holds attempts made after a publication as well as
+  before it, the live page and its export word the section for either
+  order (M2b-R15): "Rejected attempts on this profile and view", "before
+  or after this publication (attempt aN)", and pills such as "2 claims
+  rejected". `render_flamegraph`'s static page keeps "Rejected at render"
+  and "earlier attempts": `ExplainedPageOptions.LiveHistory` chooses the
+  wording, and only the live routes set it.
 
 ### D4. Concurrency and ownership **[mine]**
 

@@ -132,7 +132,7 @@ func TestVerifyBinaryRefusesNosuidMount(t *testing.T) {
 	}
 	_, err := VerifyBinary(file(t, filepath.Join(dir, "perf-agent"), 0o755))
 	e := asError(t, err, CodeDisabled)
-	if !strings.Contains(e.Error(), "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there") {
+	if !strings.Contains(e.Error(), "copy it outside /tmp, to a private directory you own (e.g. under ~), and setcap it there") {
 		t.Fatalf("error %q does not advise copying it outside /tmp", e)
 	}
 }
@@ -208,82 +208,116 @@ func TestReadSelfStatus(t *testing.T) {
 	}
 }
 
+// TestVerifyBinaryDirectoryRules runs the directory rule on real
+// directories. Every test directory sits below a private one (t.TempDir's
+// own 0700 parent, or the user's 0700 home), so the refusals without a
+// private gate are in TestCheckAncestors, on a fake tree.
 func TestVerifyBinaryDirectoryRules(t *testing.T) {
 	dir := execDir(t)
+	mkdir := func(path string, mode os.FileMode) string {
+		t.Helper()
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
 
-	open := filepath.Join(dir, "open")
-	if err := os.Mkdir(open, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(open, 0o777); err != nil {
-		t.Fatal(err)
-	}
+	// A world-writable directory below a private one: nobody else can reach it.
+	gate := mkdir(filepath.Join(dir, "gate"), 0o700)
+	open := mkdir(filepath.Join(gate, "open"), 0o777)
 	_, err := VerifyBinary(file(t, filepath.Join(open, "perf-agent"), 0o755))
 	e := asError(t, err, CodeDisabled)
-	if !strings.Contains(e.Message, "directory "+open+" is writable by group or other") {
-		t.Fatalf("a 0777 parent: %q, want refused naming %s", e, open)
+	if !strings.Contains(e.Message, "no file capabilities") {
+		t.Fatalf("a 0777 directory below a 0700 one: %q, want it to pass the directory rule and stop at the capability step", e)
+	}
+	if _, err := VerifyShim(file(t, filepath.Join(open, "libshim.so"), 0o644)); err != nil {
+		t.Fatalf("a shim in a 0777 directory below a 0700 one: %v", err)
 	}
 
-	sticky := filepath.Join(dir, "sticky")
-	if err := os.Mkdir(sticky, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
-		t.Fatal(err)
-	}
+	sticky := mkdir(filepath.Join(dir, "sticky"), 0o777|os.ModeSticky)
 	_, err = VerifyBinary(file(t, filepath.Join(sticky, "perf-agent"), 0o755))
 	e = asError(t, err, CodeDisabled)
 	if !strings.Contains(e.Message, "no file capabilities") {
 		t.Fatalf("a sticky world-writable parent: %q, want it to pass the directory rule and stop at the capability step", e)
-	}
-
-	_, err = VerifyShim(file(t, filepath.Join(open, "libshim.so"), 0o644))
-	e = asError(t, err, CodeDisabled)
-	if !strings.Contains(e.Message, "directory "+open+" is writable by group or other") {
-		t.Fatalf("a shim in a 0777 parent: %q, want refused naming %s", e, open)
 	}
 	if _, err := VerifyShim(file(t, filepath.Join(sticky, "libshim.so"), 0o644)); err != nil {
 		t.Fatalf("a shim in a sticky world-writable parent: %v", err)
 	}
 }
 
-// fakeLstat reports the real lstat of every path, with change applied to
-// dir's result.
-func fakeLstat(dir string, change func(*syscall.Stat_t)) func(string, *syscall.Stat_t) error {
-	return func(p string, st *syscall.Stat_t) error {
-		if err := syscall.Lstat(p, st); err != nil {
-			return err
-		}
-		if p == dir {
-			change(st)
-		}
-		return nil
+// fakeTree is an lstat over a made-up directory tree.
+type fakeTree map[string]syscall.Stat_t
+
+func (f fakeTree) lstat(p string, st *syscall.Stat_t) error {
+	s, ok := f[p]
+	if !ok {
+		return syscall.ENOENT
 	}
+	*st = s
+	return nil
 }
 
-func TestCheckAncestorsOwner(t *testing.T) {
-	dir := execDir(t)
-	path := filepath.Join(dir, "perf-agent")
-	c := currentCreds()
-	if err := checkAncestors(path, c, syscall.Lstat); err != nil {
+func dirStat(uid, mode uint32) syscall.Stat_t {
+	return syscall.Stat_t{Uid: uid, Mode: syscall.S_IFDIR | mode}
+}
+
+func TestCheckAncestors(t *testing.T) {
+	const me, other = 1000, 1234
+	c := creds{uid: me, gid: me}
+	// tree builds / (root 0555), /home (root 0755), /home/u, /home/u/src
+	// and /home/u/src/bin, with the modes given for the last three.
+	tree := func(u, src, bin syscall.Stat_t) fakeTree {
+		return fakeTree{
+			"/":               dirStat(0, 0o555),
+			"/home":           dirStat(0, 0o755),
+			"/home/u":         u,
+			"/home/u/src":     src,
+			"/home/u/src/bin": bin,
+		}
+	}
+	const path = "/home/u/src/bin/perf-agent"
+	for _, tc := range []struct {
+		name string
+		tree fakeTree
+		want string // empty: accepted
+	}{
+		{"all 0755", tree(dirStat(me, 0o755), dirStat(me, 0o755), dirStat(me, 0o755)), ""},
+		{"0777 below a 0700 gate", tree(dirStat(me, 0o700), dirStat(me, 0o777), dirStat(me, 0o777)), ""},
+		{"0777 without a gate", tree(dirStat(me, 0o755), dirStat(me, 0o777), dirStat(me, 0o755)), "directory /home/u/src is writable by group or other"},
+		{"the nearest offender is named", tree(dirStat(me, 0o755), dirStat(me, 0o777), dirStat(me, 0o777)), "directory /home/u/src/bin is writable"},
+		{"sticky world-writable", tree(dirStat(me, 0o755), dirStat(me, 0o755), dirStat(me, 0o777|syscall.S_ISVTX)), ""},
+		{"a gate owned by another uid is no gate", tree(dirStat(other, 0o700), dirStat(me, 0o777), dirStat(me, 0o755)), "directory /home/u/src is writable"},
+		{"another uid's directory without a gate", tree(dirStat(me, 0o755), dirStat(other, 0o755), dirStat(me, 0o755)), "directory /home/u/src is owned by uid 1234"},
+		{"another uid's directory below a gate", tree(dirStat(me, 0o700), dirStat(other, 0o755), dirStat(me, 0o755)), ""},
+		{"a root-owned gate", tree(dirStat(0, 0o700), dirStat(me, 0o777), dirStat(me, 0o755)), ""},
+		{"0710 still lets the group search", tree(dirStat(me, 0o710), dirStat(me, 0o777), dirStat(me, 0o755)), "directory /home/u/src is writable"},
+		{"0701 still lets others search", tree(dirStat(me, 0o701), dirStat(me, 0o777), dirStat(me, 0o755)), "directory /home/u/src is writable"},
+		{"a gate below a writable directory", tree(dirStat(me, 0o777), dirStat(me, 0o700), dirStat(me, 0o755)), "directory /home/u is writable"},
+		{"a parent that became a symlink", tree(dirStat(me, 0o700), syscall.Stat_t{Uid: me, Mode: syscall.S_IFLNK | 0o777}, dirStat(me, 0o755)), "not a directory"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkAncestors(path, c, tc.tree.lstat)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("refused: %v", err)
+			case tc.want != "":
+				e := asError(t, err, CodeDisabled)
+				if !strings.Contains(e.Message, tc.want) {
+					t.Fatalf("%q, want %q", e, tc.want)
+				}
+				if tc.want != "not a directory" && !strings.Contains(e.Next, "private directory") {
+					t.Fatalf("next %q does not say how to fix it", e.Next)
+				}
+			}
+		})
+	}
+
+	// The real directories above a test directory pass.
+	if err := checkAncestors(filepath.Join(execDir(t), "perf-agent"), currentCreds(), syscall.Lstat); err != nil {
 		t.Fatalf("the real directories: %v", err)
-	}
-	other := c.uid + 1000
-	err := checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Uid = other }))
-	e := asError(t, err, CodeDisabled)
-	if !strings.Contains(e.Message, "directory "+dir+" is owned by uid") {
-		t.Fatalf("a parent owned by uid %d: %q, want refused naming %s", other, e, dir)
-	}
-	if err := checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Uid = 0 })); err != nil {
-		t.Fatalf("a root-owned parent: %v", err)
-	}
-	err = checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Mode = syscall.S_IFLNK | 0o777 }))
-	if err == nil || !strings.Contains(err.Error(), "not a directory") {
-		t.Fatalf("a parent that became a symlink: %v, want refused", err)
-	}
-	err = checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Mode |= 0o020 }))
-	if err == nil || !strings.Contains(err.Error(), "writable by group or other") {
-		t.Fatalf("a group-writable parent: %v, want refused", err)
 	}
 }
 

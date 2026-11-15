@@ -16,7 +16,7 @@ const capXattr = "security.capability"
 
 // copyAdvice is the next step for a binary on a nosuid or noexec mount,
 // where file capabilities are ignored. /tmp is mounted so on most hosts.
-const copyAdvice = "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there"
+const copyAdvice = "copy it outside /tmp, to a private directory you own (e.g. under ~), and setcap it there"
 
 // creds are the server's effective ids, which decide who may run and
 // replace the binary.
@@ -48,9 +48,8 @@ func (c creds) inGroup(gid uint32) bool {
 //   - the file is regular, not setuid or setgid, not writable by group or
 //     other, owned by root or the server's user, and executable by the
 //     server's user;
-//   - every directory above it is owned by root or the server's user and
-//     is not writable by group or other unless it is sticky, so no other
-//     user can replace the file;
+//   - no other user can replace it through a directory above it (see
+//     checkAncestors);
 //   - its filesystem honours file capabilities;
 //   - its security.capability grants the required set and nothing outside
 //     the allowed one;
@@ -220,10 +219,19 @@ func checkShimStat(path string, st *syscall.Stat_t, c creds) error {
 // checkAncestors refuses path when a directory above it would let another
 // user replace it: one owned by neither root nor the server's user, or one
 // writable by group or other without the sticky bit (which limits
-// renaming and removal to an entry's owner). path is resolved, so each
-// ancestor is a directory; one that is not has changed since.
+// renaming and removal to an entry's owner).
+//
+// A private directory is a gate: owned by root or the server's user, with
+// no search permission for group or other (such as a 0700 home). No other
+// non-root user can reach anything below it, so a failing directory below
+// a gate is excused; directories above the gate are still checked, since
+// whoever could write them could replace the gate itself. The walk goes
+// from the file upward and refuses with the nearest failing directory
+// that no gate covers. path is resolved, so each ancestor is a directory;
+// one that is not has changed since, and is refused at once.
 func checkAncestors(path string, c creds, lstat func(string, *syscall.Stat_t) error) error {
-	next := "move it to a directory only you or root can write, e.g. ~/bin"
+	const private = "move perf-agent under a private directory you own (e.g. under ~)"
+	var pending error
 	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
 		var st syscall.Stat_t
 		if err := lstat(dir, &st); err != nil {
@@ -232,15 +240,20 @@ func checkAncestors(path string, c creds, lstat func(string, *syscall.Stat_t) er
 		if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
 			return Errorf(CodeDisabled, "", "%s is not a directory any more", dir)
 		}
-		if err := checkOwner("directory", dir, &st, c, next); err != nil {
-			return err
-		}
-		if st.Mode&0o022 != 0 && st.Mode&syscall.S_ISVTX == 0 {
-			return Errorf(CodeDisabled, "chmod go-w "+dir+", or "+next,
+		owned := st.Uid == 0 || st.Uid == c.uid
+		switch {
+		case owned && st.Mode&0o011 == 0:
+			pending = nil
+		case pending != nil:
+		case !owned:
+			pending = Errorf(CodeDisabled, private,
+				"directory %s is owned by uid %d, neither root nor this server's user", dir, st.Uid)
+		case st.Mode&0o022 != 0 && st.Mode&syscall.S_ISVTX == 0:
+			pending = Errorf(CodeDisabled, private+", or chmod go-w "+dir,
 				"directory %s is writable by group or other and not sticky (mode %#o), so another user could replace %s", dir, st.Mode&0o7777, path)
 		}
 		if dir == "/" {
-			return nil
+			return pending
 		}
 	}
 }

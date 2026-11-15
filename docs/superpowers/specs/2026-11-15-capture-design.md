@@ -547,12 +547,14 @@ at start-up and before every exec:
 
 | Check | How | Why |
 |---|---|---|
-| Regular file, executable, not setuid or setgid | `Lstat` of the resolved path | Setuid would change uids, which the target rule (§6.3) depends on |
-| Not writable by group or other (`mode & 022 == 0`); owner is root or the server's uid | `Stat` | A user-owned file is accepted, since the user builds in a worktree or under `~/`. Writing to a file clears its `security.capability`, so the user cannot alter a capped file and keep its caps |
-| Filesystem not mounted `nosuid` or `noexec` | `syscall.Statfs`, `Flags & (MS_NOSUID|MS_NOEXEC)` | File capabilities are ignored on a nosuid mount, as `/tmp` is here (memory note). Refused with "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there" |
-| File capabilities | `syscall.Getxattr(path, "security.capability")`, parsed as `vfs_cap_data` | See the next table. This is the getcap check without running getcap |
-| It is perf-agent | `debug/buildinfo.ReadFile`: main module `github.com/dpsoft/perf-agent`, main package path is the module root | Identifies the file as perf-agent without running it (a marker, not authentication; the capability xattr is the trust anchor). The version and `vcs.revision` go into each result |
-| Shared blazesym | `debug/elf` `DT_NEEDED` names a `*blazesym*` library | A warning, not a refusal. Under secure execution `LD_LIBRARY_PATH` is ignored, so the library must be in a system path or linked statically (memory note) |
+| Regular file, executable by the server's user, not setuid or setgid | `Lstat` of the resolved path before opening it (a FIFO or device is never opened), then `Fstat` of the one descriptor opened with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, which must be the same dev/inode. "Executable" uses the kernel's class: the owner bits when the server owns the file, else the group bits when it is in the file's group, else the other bits | Setuid would change uids, which the target rule (§6.3) depends on. A user-owned 0405 file is refused rather than failing at exec |
+| Not writable by group or other (`mode & 022 == 0`); owner is root or the server's uid | The same `Lstat` and `Fstat` | A user-owned file is accepted, since the user builds in their own directories. Writing to a file clears its `security.capability`, so the user cannot alter a capped file and keep its caps |
+| No other user can replace it through a directory (CAP-R18, CAP-R18b) | `Lstat` of each ancestor of the resolved path, walking from the file upward. Each must be owned by root or the server's uid, and not writable by group or other unless sticky (`+t`). The walk is satisfied by a **gate**: an ancestor owned by root or the server's uid whose mode denies search to both group and other (`mode & 011 == 0`, e.g. a 0700 home). A failing directory below a gate is excused; directories above it are still checked. An ancestor that is no longer a directory is refused at once | Whoever can write a directory, or owns it, can rename the file away and put another in its place. Nobody else can reach anything below a private directory. The refusal names the nearest uncovered directory and says "move perf-agent under a private directory you own (e.g. under ~), or chmod go-w <dir>" |
+| Filesystem not mounted `nosuid` or `noexec` | `syscall.Fstatfs` on the descriptor, `Flags & (MS_NOSUID|MS_NOEXEC)` | File capabilities are ignored on a nosuid mount, as `/tmp` is here (memory note). Refused with "copy it outside /tmp, to a private directory you own (e.g. under ~), and setcap it there" |
+| File capabilities | `syscall.Getxattr("/proc/self/fd/N", "security.capability")` on the descriptor (the `syscall` package has no `fgetxattr`), parsed as `vfs_cap_data` | See the next table. This is the getcap check without running getcap |
+| It is perf-agent | `debug/buildinfo.Read` on the descriptor: main module `github.com/dpsoft/perf-agent`, main package path is the module root. Echoed paths, the version and the revision are cut to 200 bytes | Identifies the file as perf-agent without running it (a marker, not authentication; the capability xattr is the trust anchor). The version and `vcs.revision` go into each result |
+| Shared blazesym | `debug/elf.NewFile` on the descriptor: a `DT_NEEDED` names a `*blazesym*` library | A warning, not a refusal. Under secure execution `LD_LIBRARY_PATH` is ignored, so the library must be in a system path or linked statically (memory note) |
+| Unchanged during verification | The identity from the `Fstat` plus the raw xattr bytes, compared with the path's identity after the reads | The path still names the inode that was read, and its size, times and xattr did not change while it was read. Otherwise `binary_changed`: "check that no build, copy or setcap is still writing it, then restart perf-agent-mcp" |
 | Unchanged since start-up | `(dev, ino, size, mtime, ctime)` and the xattr bytes compared before each exec | Refused with "perf-agent changed since start-up; restart perf-agent-mcp" |
 
 How `security.capability` is parsed:
@@ -1329,8 +1331,10 @@ Two dedicated cases:
 
 ## 8. GPU captures **[mine]**
 
-- **Flag:** `--gpu-shim PATH` (absolute; a regular file, not group or
-  other writable) names the CUPTI adapter. Without it, `modes: ["gpu"]` is
+- **Flag:** `--gpu-shim PATH` (absolute, resolved once; a regular file
+  owned by root or the server's uid and not group or other writable, in
+  directories that pass the §5.1 directory rule, CAP-R18/R18b and CAP-R19)
+  names the CUPTI adapter. Without it, `modes: ["gpu"]` is
   refused with "start perf-agent-mcp with --gpu-shim PATH". The shim is
   loaded by the user's own process, not by the privileged child, so it
   needs no capability check.

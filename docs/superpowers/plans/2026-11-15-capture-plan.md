@@ -232,7 +232,7 @@ Related records:
     - `func VerifyBinary(path string) (Binary, error)` runs §5.1's rows in production order:
       1. the path is absolute, and is resolved with `EvalSymlinks` once;
       2. `checkStat`: regular, executable, not setuid or setgid, `mode&022 == 0`, owner root or `os.Getuid()`;
-      3. `Statfs` without `MS_NOSUID|MS_NOEXEC`, else "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there";
+      3. `Statfs` without `MS_NOSUID|MS_NOEXEC`, else "copy it outside /tmp, to a private directory you own (e.g. under ~), and setcap it there";
       4. the `security.capability` xattr, then `ParseFileCaps` and `checkCaps`;
       5. `checkBuildInfo`;
       6. `checkELF`.

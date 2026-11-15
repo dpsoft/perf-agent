@@ -59,8 +59,8 @@ func newStore(root *os.Root, lim profilemodel.Limits, max int, pins *pins) *stor
 // openNames maps the path, relative to the profiles root, of each open
 // profile to its handle, as the engine holder last published it. Any
 // goroutine may call it, without the engine; the map must not be changed.
-// A path open with and without an executions log maps to the handle used
-// most recently.
+// A path open with and without an executions log maps to the handle
+// opened most recently.
 func (s *store) openNames() map[string]profilemodel.Handle { return *s.published.Load() }
 
 // publish stores the map openNames returns. It runs under the engine.

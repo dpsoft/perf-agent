@@ -79,10 +79,10 @@ func CheckSelf(status []byte) error {
 
 // CheckBounding refuses to capture with a perf-agent whose file grants a
 // capability outside the server's bounding set, read from its
-// /proc/self/status: the kernel refuses to execute a file with the
-// effective flag set when the bounding set would cut its permitted set,
-// so every capture would fail with EPERM. A CapBnd it cannot read exactly
-// refuses too.
+// /proc/self/status: at exec those capabilities would be refused (the
+// exec fails when the file's effective flag is set) or dropped, and
+// perf-agent could not profile either way. A CapBnd it cannot read
+// exactly refuses too.
 func CheckBounding(status []byte, need CapSet) error {
 	var bnd string
 	seen := false
@@ -106,7 +106,7 @@ func CheckBounding(status []byte, need CapSet) error {
 	}
 	if missing := need &^ CapSet(n); missing != 0 {
 		return Errorf(CodeDisabled, "start perf-agent-mcp where the capability bounding set keeps perf-agent's capabilities",
-			"this server's capability bounding set lacks %s, which perf-agent's file grants; the kernel would refuse to execute it",
+			"this server's capability bounding set lacks %s, which perf-agent's file grants; at exec they would be refused or dropped",
 			strings.Join(missing.Names(), ","))
 	}
 	return nil

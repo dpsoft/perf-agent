@@ -72,7 +72,7 @@ func TestCheckBounding(t *testing.T) {
 		status []byte
 		want   string
 	}{
-		{"no cap_bpf", withBnd("0000007fffffffff"), "cap_bpf"},
+		{"no cap_bpf", withBnd("0000007fffffffff"), "cap_bpf, which perf-agent's file grants; at exec they would be refused or dropped"},
 		{"empty", withBnd(zero), "cap_sys_admin,cap_perfmon,cap_bpf"},
 		{"no CapBnd", []byte("Uid:\t1000\t1000\t1000\t1000\n"), "CapBnd"},
 		{"bad CapBnd", withBnd("zz"), "CapBnd"},

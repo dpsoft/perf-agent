@@ -364,6 +364,9 @@ func TestFoldExplainsWhatLaunchSamplingDoesToTheShape(t *testing.T) {
 	assert.Equal(t, int64(5590723), res.UnsampledLaunchTotal)
 	joined := strings.Join(res.Warnings, "\n")
 	assert.Contains(t, joined, "93.4% of the total sits under [gpu:launch unsampled]")
+	assert.Contains(t, joined, "whose launch carried no CPU stack")
+	assert.NotContains(t, joined, "not one of the sampled ones",
+		"true only above period 1; the residual at period 1 is launches with no attributable stack")
 	assert.Contains(t, joined, "one launch in 8 contributed a CPU stack")
 	assert.Contains(t, joined, "not a sample of GPU time")
 	assert.Contains(t, joined, "every value is a measured duration",

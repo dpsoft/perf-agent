@@ -579,7 +579,7 @@ function widthMeaning(it,d){
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
   case "boundary": return everyLaunch?"width: device time launched from this path":"width: device time launched from this path, sampled one launch in N";
-  case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
+  case "boundary-unattributed": return "width: measured device time whose launch carried no CPU stack, so it has no caller";
   default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
   }
 }

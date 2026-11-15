@@ -664,7 +664,7 @@ func gpuSamplingWarnings(res *Result) []string {
 	var w []string
 	if res.UnsampledLaunchTotal > 0 {
 		w = append(w, fmt.Sprintf(
-			"%.1f%% of the total sits under %s: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.",
+			"%.1f%% of the total sits under %s: measured GPU time whose launch carried no CPU stack, so it has no CPU caller and none is borrowed from a sampled sibling.",
 			pct(res.UnsampledLaunchTotal, res.Total), UnsampledLaunchFrame))
 	}
 	if period != "" {

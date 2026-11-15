@@ -1010,10 +1010,19 @@ func TestGPUProfilesExplainWhatWidthMeans(t *testing.T) {
 	}
 	for _, want := range []string{
 		"measured time this kernel ran on the device",
-		"whose launch was not stack-sampled",
+		"whose launch carried no CPU stack",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("missing width explanation: %q", want)
+		}
+	}
+	// [gpu:launch unsampled] holds every execution whose launch has no CPU
+	// stack, which at gpu_sample_period=1 is not about sampling at all (an
+	// execution from before attach, say). Its texts must be true at any
+	// period.
+	for _, wrong := range []string{"not stack-sampled", "not one of the sampled ones"} {
+		if strings.Contains(page, wrong) {
+			t.Errorf("the unattributed boundary is described by sampling: %q", wrong)
 		}
 	}
 }

@@ -170,10 +170,14 @@ function perfAgentPanel(model, hooks) {
   };
 
   // Frames picked inside the panel (a reference in the explanation or a
-  // path entry) go to onSelect.
+  // path entry) go to onSelect. The click stops here: show() replaces the
+  // panel's content, so a handler further up would find the target detached
+  // from the panel and take it for a click elsewhere.
   const picked = (ev) => {
     const b = ev.target.closest('[data-node]');
-    if (b) hooks.onSelect(b.dataset.node);
+    if (!b) return;
+    ev.stopPropagation();
+    hooks.onSelect(b.dataset.node);
   };
   $('exp').addEventListener('click', picked);
   $('path').addEventListener('click', picked);

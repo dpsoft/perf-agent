@@ -171,6 +171,7 @@ type exFrame struct {
 	// Extra are the facts only an explained frame shows.
 	Extra       []exFactRow     `json:"extra,omitzero"`
 	Explanation []exExplanation `json:"explanation,omitzero"`
+	index       int             // its index in the builder's frames
 }
 
 // exPromptPart is a literal piece of a follow-up prompt or a slot the
@@ -482,12 +483,24 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	if err := b.layout(data, frameBytes); err != nil {
 		return nil, err
 	}
-	drawn := b.frames[:len(b.frames):len(b.frames)]
+	nDrawn := len(b.frames)
 	if b.root != nil {
 		// The focus's callers and every explained and referenced path are
-		// in the model, undrawn, so the path panel and the rows can name them.
-		for _, id := range append([]profilemodel.NodeID{b.root.ID}, b.anchors()...) {
-			if err := b.addPath(id); err != nil {
+		// in the model, undrawn, so the path panel and the rows can name
+		// them. The callers go in first: with them the model's frames are
+		// closed under parents, so each anchor's path stops at its first
+		// caller already in the model, and each anchor is added once.
+		if err := b.addPath(b.root.Parent); err != nil {
+			return nil, err
+		}
+		seen := map[profilemodel.NodeID]bool{}
+		for _, id := range b.anchors() {
+			n, ok := b.v.Node(id)
+			if !ok || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if err := b.addPath(n); err != nil {
 				return nil, err
 			}
 		}
@@ -503,7 +516,7 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	// The first explained frame drawn is selected, else the layout's root.
 	sel := b.frames[0]
 	for _, ch := range b.r.Checked {
-		if f := b.byID[ch.Node]; slices.Contains(drawn, f) {
+		if f := b.byID[ch.Node]; f.index < nDrawn {
 			sel = f
 			break
 		}
@@ -629,18 +642,16 @@ func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
 	return out
 }
 
-// addPath adds the view's root and id's callers down to id to the model,
-// undrawn, where they are not in it yet. A node the view does not have
-// adds nothing.
-func (b *explainedBuilder) addPath(id profilemodel.NodeID) error {
-	n, ok := b.v.Node(id)
-	if !ok {
-		return nil
+// addPath adds n and its callers up to the view's root to the model,
+// undrawn, root first, stopping at the first caller already in it: the
+// callers of a frame in the model must be in it too, except those of the
+// layout's root. A nil n adds nothing.
+func (b *explainedBuilder) addPath(n *profilemodel.Node) error {
+	var missing []*profilemodel.Node
+	for ; n != nil && b.byID[n.ID] == nil; n = n.Parent {
+		missing = append(missing, n)
 	}
-	for _, p := range append([]*profilemodel.Node{b.v.Root}, b.v.Path(n)...) {
-		if b.byID[p.ID] != nil {
-			continue
-		}
+	for _, p := range slices.Backward(missing) {
 		f, err := b.frame(p)
 		if err != nil {
 			return err
@@ -888,6 +899,7 @@ func (b *explainedBuilder) frame(n *profilemodel.Node) (*exFrame, error) {
 	}
 	f := &exFrame{
 		ID:    string(n.ID),
+		index: len(b.frames),
 		Ref:   "f" + strconv.Itoa(len(b.frames)),
 		Name:  shownName(n.Function.Name),
 		Cum:   strconv.FormatInt(n.Cum, 10),

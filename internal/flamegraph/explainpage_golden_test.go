@@ -1,9 +1,14 @@
 package flamegraph
 
 import (
+	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,4 +57,51 @@ func TestPanelScriptUsesTextContentOnly(t *testing.T) {
 	for _, bad := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "setAttribute('style'", "cssText"} {
 		assert.NotContains(t, string(src), bad)
 	}
+}
+
+// clickProbe counts the panel's renders (each sets #sel-id) while it
+// clicks a reference in the explanation, then a path entry, and writes the
+// count after each click.
+const clickProbe = `<script>
+addEventListener('load', () => {
+  const counts = [];
+  let renders = 0;
+  new MutationObserver((records) => { renders += records.length; })
+    .observe(document.getElementById('sel-id'), {childList: true, characterData: true, subtree: true});
+  const step = (sel, then) => {
+    const el = document.querySelector(sel);
+    renders = 0;
+    if (el) el.click();
+    setTimeout(() => { counts.push(el ? String(renders) : 'missing'); then(); }, 50);
+  };
+  step('#exp button.cite', () => step('#path button', () => {
+    const pre = document.createElement('pre');
+    pre.id = 'clicks';
+    pre.textContent = counts.join(' ');
+    document.body.appendChild(pre);
+  }));
+});
+</script>`
+
+func TestPanelClicksSelectOnceInChrome(t *testing.T) {
+	chrome := chromePath()
+	if chrome == "" || testing.Short() {
+		t.Skip("no headless Chrome")
+	}
+	v, _, r := cpuBasicExplained(t)
+	page := exPage(t, v, r, exOpts())
+	dir := t.TempDir()
+	file := filepath.Join(dir, "page.html")
+	require.NoError(t, os.WriteFile(file, []byte(strings.Replace(page, "</body>", clickProbe+"</body>", 1)), 0o644))
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-first-run",
+		"--user-data-dir="+filepath.Join(dir, "profile"), "--window-size=1000,800", "--virtual-time-budget=2000",
+		"--dump-dom", "file://"+file).Output()
+	if err != nil {
+		t.Skipf("headless Chrome did not run: %v", err)
+	}
+	m := regexp.MustCompile(`<pre id="clicks">(.*?)</pre>`).FindStringSubmatch(string(out))
+	require.Len(t, m, 2, "the probe did not run")
+	assert.Equal(t, "1 1", m[1], "one click on a reference, then on a path entry, renders the panel once each")
 }

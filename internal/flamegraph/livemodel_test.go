@@ -82,7 +82,8 @@ func TestLiveModelMatchesTheStaticPage(t *testing.T) {
 			assert.Equal(t, "cpu.pb.gz", live["profile_name"])
 			assert.Equal(t, "a2", live["attempt"])
 			assert.Equal(t, "", live["focus"])
-			assert.Equal(t, unesc(regexp.MustCompile(`<title>(.*?)</title>`).FindStringSubmatch(page)[1]), live["title"])
+			assert.Equal(t, unesc(regexp.MustCompile(`<title>(.*?)</title>`).FindStringSubmatch(page)[1]), live["doc_title"])
+			assert.NotContains(t, live, "title", "the heading is title_segs only")
 
 			pill := regexp.MustCompile(`<span class="pill ok" title="[^"]*">([^<]*)</span>`).FindStringSubmatch(page)
 			require.Len(t, pill, 2)
@@ -588,4 +589,107 @@ func TestStaticPageUnchanged(t *testing.T) {
 	checkGolden(t, "explainpage-cpu.golden.html", stripInlineScript(exPage(t, v, r, exOpts())))
 	gv, _, gr := gpuBasicExplained(t)
 	checkGolden(t, "explainpage-gpu.golden.html", stripInlineScript(exPage(t, gv, gr, exOpts())))
+}
+
+func TestLiveModelNestingIsConstantWithHypotheses(t *testing.T) {
+	v, _, r := cpuBasicExplained(t)
+	_, raw := liveOf(t, v, r, liveOpts())
+	assert.Equal(t, 9, jsonDepth(t, raw), "model > frames > frame > explanation > hypotheses > hypothesis > segment")
+
+	deep := exView(t, pmfixture.Deep(2000), nil)
+	leaf := deep.Root
+	for len(leaf.Children) > 0 {
+		leaf = leaf.Children[0]
+	}
+	dr := exCheck(t, deep, explain.Explanation{Node: string(leaf.ID), Prose: "The leaf {n:" + string(leaf.ID) + "}.",
+		Hypotheses: []string{"{n:" + string(leaf.ID) + "} spins."}})
+	_, raw = liveOf(t, deep, dr, liveOpts())
+	assert.LessOrEqual(t, jsonDepth(t, raw), 9, "the nesting does not grow with the stack")
+}
+
+// referenceFocusFrames are the model frames a focus model holds, by the
+// rule written out directly: the drawn frames, then the view's root and
+// each caller of the focus and of every anchor, root first, the first time
+// a node is named.
+func referenceFocusFrames(v *profilemodel.View, drawn []string, focus profilemodel.NodeID, anchors []profilemodel.NodeID) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, id := range drawn {
+		seen[id] = true
+		out = append(out, id)
+	}
+	for _, id := range append([]profilemodel.NodeID{focus}, anchors...) {
+		n, _ := v.Node(id)
+		for _, p := range append([]*profilemodel.Node{v.Root}, v.Path(n)...) {
+			if !seen[string(p.ID)] {
+				seen[string(p.ID)] = true
+				out = append(out, string(p.ID))
+			}
+		}
+	}
+	return out
+}
+
+func TestLiveModelFocusFramesFollowTheReferenceOrder(t *testing.T) {
+	v := exView(t, pmfixture.CPUBasic(), nil)
+	main, a, b, c := exNode(t, v, "main"), exNode(t, v, "main", "a"), exNode(t, v, "main", "a", "b"), exNode(t, v, "main", "c")
+	ref := func(id profilemodel.NodeID) string { return "{n:" + string(id) + "}" }
+	r := exCheck(t, v,
+		explain.Explanation{Node: string(b), Prose: ref(a) + " " + ref(b) + " " + ref(main) + " " + ref(b)},
+		explain.Explanation{Node: string(a), Prose: ref(b) + " " + ref(c), Hypotheses: []string{ref(main)}, NextMeasurement: ref(a)},
+	)
+	anchors := []profilemodel.NodeID{b, a, b, main, b, a, b, c, main, a}
+	for _, focus := range []profilemodel.NodeID{c, a, b, v.Root.ID} {
+		opts := liveOpts()
+		opts.Focus = focus
+		live, _ := liveOf(t, v, r, opts)
+		drawn := drawnIDs(t, live)
+		var got []string
+		for i, f := range list(t, live["model"].(map[string]any), "frames") {
+			assert.Equal(t, "f"+strconv.Itoa(i), f["ref"])
+			got = append(got, str(f, "id"))
+		}
+		assert.Equal(t, referenceFocusFrames(v, drawn, focus, anchors), got, "focus %s", focus)
+	}
+}
+
+func TestLiveModelFocusAddsEachPathOnce(t *testing.T) {
+	v := exView(t, pmfixture.Deep(8192), nil)
+	leaf := v.Root
+	for len(leaf.Children) > 0 {
+		leaf = leaf.Children[0]
+	}
+	prose := strings.Repeat("{n:"+string(leaf.ID)+"} ", 300)
+	var exps []explain.Explanation
+	for range 8 {
+		exps = append(exps, explain.Explanation{Node: string(leaf.ID), Prose: prose})
+	}
+	r := exCheck(t, v, exps...)
+	opts := liveOpts()
+	opts.Focus, opts.MaxBytes = leaf.ID, 4<<20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	raw, err := ExplainedLiveModel(v, r, opts)
+	runtime.ReadMemStats(&after)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), opts.MaxBytes)
+	alloc := after.TotalAlloc - before.TotalAlloc
+	assert.Less(t, alloc, uint64(200<<20), "building a %d-byte focus model allocated %d bytes", len(raw), alloc)
+}
+
+func TestLiveHistoryIsUnboundedWithoutABudget(t *testing.T) {
+	v, b, _ := cpuBasicExplained(t)
+	engine := &explain.EngineValue{Metric: "share_of_total", Scope: "node", Node: b, Denominator: "view_total", Unit: "ratio",
+		Value: "0.411", Rounding: "0.001 ratio", Status: "ok"}
+	var rejected []explain.RejectedAttempt
+	for i := range 40 {
+		rejected = append(rejected, explain.RejectedAttempt{Attempt: fmt.Sprint("a", i+1),
+			Failures: []explain.Failure{failure(explain.CodeValueMismatch, "c1", "", "0.62", engine)}})
+	}
+	for _, budget := range []int{0, -1} {
+		h := historyOf(t, ExplainedLiveHistory(v, "p1", "1", rejected, 0, false, budget))
+		assert.Len(t, list(t, h, "rows"), 40, "budget %d", budget)
+		assert.Equal(t, "", h["rejected_note"])
+	}
 }

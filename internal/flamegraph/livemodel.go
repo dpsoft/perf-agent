@@ -32,7 +32,7 @@ func (o LiveOptions) pageOptions() ExplainedPageOptions {
 // panel's model is the page's model JSON as it is.
 type liveModel struct {
 	Kind        string          `json:"kind"`
-	Title       string          `json:"title"`
+	Title       string          `json:"doc_title"` // the document title; the heading is TitleSegs
 	TitleSegs   []exSegment     `json:"title_segs"`
 	Attempt     string          `json:"attempt"`
 	View        string          `json:"view"`
@@ -178,7 +178,7 @@ func ExplainedLiveFrame(v *profilemodel.View, r explain.Result, id profilemodel.
 	}
 	b := newExplainedBuilder(v, r, ExplainedPageOptions{Digest: digest}, nil, 0)
 	b.partial = true
-	if err := b.addPath(n.ID); err != nil {
+	if err := b.addPath(n); err != nil {
 		return nil, err
 	}
 	clear(b.refs)
@@ -214,7 +214,8 @@ type liveHistory struct {
 // history version version, as the live page lists them: the rows and pills
 // of the static page's rejected section, built by the same function. Over
 // maxBytes the oldest rows are left out and counted in rejected_note, as
-// on the page; the pills count every attempt. Rows are estimated before
+// on the page; the pills count every attempt. maxBytes <= 0 means no
+// bound. Rows are estimated before
 // any is encoded, so a long history costs no more than the budget. Without
 // any row the history is returned even over maxBytes: its pills are small.
 func ExplainedLiveHistory(v *profilemodel.View, pub, version string, rejected []explain.RejectedAttempt, dropped int, incomplete bool, maxBytes int) []byte {
@@ -233,6 +234,9 @@ func ExplainedLiveHistory(v *profilemodel.View, pub, version string, rejected []
 			panic(err)
 		}
 		return out
+	}
+	if maxBytes <= 0 {
+		return encode(len(rows))
 	}
 	bare := encode(0)
 	keep, room := 0, int64(maxBytes-len(bare))

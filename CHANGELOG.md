@@ -10,21 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.5.3] - 2026-11-15
 
 A fix release for current kernels. perf-agent 1.5.2 and earlier cannot load
-any BPF program on a kernel whose BTF uses the extended header (seen on
-Linux 7.3); 1.5.3 can.
+any BPF program on Linux 7.1 and later, whose BTF header was extended; 1.5.3
+can.
 
 ### Fixed
 
-- On a kernel whose BTF header carries the newer, longer layout, every BPF
-  program failed to load with `apply CO-RE relocations: load kernel spec:
-  load vmlinux: parsing .BTF header: header contains non-zero trailer`, so no
-  profiler could start. The header in `/sys/kernel/btf/vmlinux` grew from 24
-  to 32 bytes; cilium/ebpf v0.21.0 refused a longer header whose extra bytes
-  are not zero. perf-agent now uses cilium/ebpf v0.22.0, which reads it.
-  Seen on Fedora 44 with kernel 7.3.3; earlier kernels were not affected.
+- On Linux 7.1 and later every BPF program failed to load with `apply CO-RE
+  relocations: load kernel spec: load vmlinux: parsing .BTF header: header
+  contains non-zero trailer`, so no profiler could start. The header in `/sys/kernel/btf/vmlinux` grew from 24
+  to 32 bytes to describe the new BTF layout section, and cilium/ebpf v0.21.0
+  refused a longer header whose extra bytes are not zero. perf-agent now uses
+  cilium/ebpf v0.22.0, which reads it
+  ([#266](https://github.com/dpsoft/perf-agent/pull/266)). Seen on Fedora 44
+  with kernel 7.3.3; kernels before 7.1 are not affected.
 - The "Interactive version" links in the README and in
   `docs/use-cases.md` opened the flame graph's HTML source on GitHub. They
-  now open the rendered page through htmlpreview.github.io.
+  now open the rendered page through htmlpreview.github.io
+  ([#267](https://github.com/dpsoft/perf-agent/pull/267)).
+
+### Changed
+
+- With cilium/ebpf v0.22.0 the kernel's BTF is no longer cached for the life
+  of the process: each set of BPF programs parses it again when it loads. That
+  adds a few tens of milliseconds per load at start-up, and less memory stays
+  in use afterwards.
+- cilium/ebpf v0.22.0 uses a BPF token when one is available. As root or with
+  file capabilities on the host nothing changes. Inside a user namespace that
+  delegates BPF through a token (LXC, Incus, systemd), the token's limits
+  apply.
 
 ### Internal
 

@@ -73,16 +73,21 @@
   let acceptedSeq = '';
   let renderedSeq = '';
   // retrySeq is an accepted seq whose work failed: the same state may be
-  // accepted once more.
+  // accepted once more. failures counts its failed attempts.
   let retrySeq = '';
+  let failures = 0;
   // gen moves on every accepted agent state and every local navigation. An
   // async chain commits to the DOM only if gen is still the one it started
   // with.
   let gen = 0;
   // agent is the last accepted state; applied the last one whose work
-  // finished, which is what the agent last steered the page to.
+  // finished. While they differ, an agent chain is pending or was cut
+  // short, possibly after committing part of its work.
   let agent = null;
   let applied = null;
+  // loadingGen is the generation of an agent chain that is loading a
+  // publication switch; -1 when none is.
+  let loadingGen = -1;
   // view is what the DOM shows: the publication, its whole model, the model
   // drawn (the whole one or a focus), its history, the focused node and the
   // selected node, with the drawn model's frames and elements by node ID.
@@ -403,6 +408,7 @@
   // the model does not hold it. It resolves to the frame shown, or null when
   // the page moved on first.
   const selectIn = async (id, g, scroll) => {
+    if (g !== gen || !view) return null;
     if (view.frames.has(id)) return showFrame(view.frames.get(id), chainOf(id), scroll);
     const v = view;
     const r = await transport.getJSON(nodePath(v.pub, 'frame', id));
@@ -446,22 +452,25 @@
   // --- The user's own navigation: local until the next agent state ---
 
   const quietly = (p) => p.catch(() => {});
+  // While the agent's publication switch loads, the frames on screen are
+  // about to go: navigating them would only cancel the switch.
+  const agentLoading = () => loadingGen === gen;
 
   const localSelect = (id, scroll) => {
-    if (!view || !isNode(id)) return;
+    if (!view || !isNode(id) || agentLoading()) return;
     const g = ++gen;
     quietly(selectIn(id, g, scroll));
   };
 
   const focusHere = () => {
-    if (!view || !view.selected) return;
+    if (!view || !view.selected || agentLoading()) return;
     const id = view.selected;
     const g = ++gen;
     quietly(focusOn(id, g).then((ok) => ok && selectIn(id, g, false)));
   };
 
   const wholeView = () => {
-    if (!view || !view.focus) return;
+    if (!view || !view.focus || agentLoading()) return;
     const g = ++gen;
     const id = view.selected;
     view.focus = '';
@@ -488,31 +497,39 @@
 
   const entryOf = (st, id) => ((st && st.publications) || []).find((p) => p.id === id);
 
-  // applyState steers the page to st: its publication, focus and
-  // selection, when they differ from what the agent last steered the page
-  // to. A state that only moves a publication's history refreshes that
-  // history and leaves the user's own navigation alone.
-  const applyState = async (st, g) => {
+  const sameTarget = (a, b) => !!a && !!b && a.current === b.current && a.selected === b.selected && a.focus === b.focus;
+
+  const loadNote = (text) => {
+    const n = $('load-note');
+    n.textContent = text;
+    n.hidden = !text;
+  };
+
+  // applyState refreshes the shown publication's history when st moves
+  // it, and, unless st is quiet, steers the page to st's publication,
+  // focus and selection. Each step compares st with what is on screen
+  // (view), not with an earlier state, so a chain cut short after drawing
+  // part of its work is undone or finished by the next state.
+  const applyState = async (st, g, quiet, prev) => {
     renderPubs();
     if (view) {
       const e = entryOf(st, view.pub);
       if (e && (!view.hist || newer(e.history, view.hist.version))) quietly(refreshHistory(view.pub));
     }
-    const prev = applied;
-    const steer = !prev || prev.current !== st.current || prev.selected !== st.selected || prev.focus !== st.focus;
-    if (!steer) {
-      applied = st;
-      rendered(st.seq);
-      return;
-    }
-    if (!isPub(st.current)) {
+    if (quiet || !isPub(st.current)) {
       applied = st;
       rendered(st.seq);
       return;
     }
     if (!view || view.pub !== st.current) {
-      if (!(await loadPub(st.current, g))) return;
+      loadingGen = g;
+      try {
+        if (!(await loadPub(st.current, g))) return;
+      } finally {
+        if (loadingGen === g) loadingGen = -1;
+      }
     }
+    if (g !== gen) return;
     const focus = isNode(st.focus) ? st.focus : '';
     if (focus) {
       if (view.focus !== focus && !(await focusOn(focus, g))) return;
@@ -520,31 +537,49 @@
       view.focus = '';
       drawModel(view.whole);
     }
+    if (g !== gen) return;
     const sel = isNode(st.selected) ? st.selected : view.whole.model.selected;
+    let f = null;
     if (isNode(sel)) {
-      const f = await selectIn(sel, g, true);
+      f = await selectIn(sel, g, true);
       if (!f) return;
-      if (prev && (prev.selected !== st.selected || prev.focus !== st.focus || prev.current !== st.current)) {
-        toast('Your agent selected ' + f.ref + ' ' + f.name);
-      }
     }
+    if (g !== gen) return;
+    if (f && prev && !sameTarget(prev, st)) toast('Your agent selected ' + f.ref + ' ' + f.name);
     applied = st;
     rendered(st.seq);
+    failures = 0;
+    loadNote('');
   };
 
+  // Retries of a state whose work failed back off; after quickRetries
+  // failures they stop cancelling the user's own navigation and the page
+  // says it cannot load the publication.
+  const retryDelays = [1000, 2000, 5000, 10000];
+  const quickRetries = 3;
+
+  // onState accepts st if its seq is newer than any accepted so far, and
+  // records that before any of its work starts. A quiet state (no agent
+  // chain pending or cut short, and the same publication, selection and
+  // focus as the last accepted) only refreshes history and keeps the
+  // generation, so the user's own fetches in flight still land.
   const onState = (st) => {
     if (!st || typeof st !== 'object') return;
     const again = retrySeq !== '' && st.seq === retrySeq && st.seq === acceptedSeq;
     if (!again && !newer(st.seq, acceptedSeq)) return;
     acceptedSeq = st.seq;
     retrySeq = '';
-    const g = ++gen;
+    if (!again) failures = 0;
+    const prev = agent;
+    const quiet = !again && applied !== null && applied === agent && sameTarget(st, agent);
+    const g = quiet || failures >= quickRetries ? gen : ++gen;
     agent = st;
-    applyState(st, g).catch(() => {
-      if (g === gen) {
-        retrySeq = st.seq;
-        setTimeout(checkState, 1000);
-      }
+    applyState(st, g, quiet, again ? st : prev).catch(() => {
+      if (g !== gen || agent !== st) return;
+      retrySeq = st.seq;
+      failures++;
+      if (failures >= quickRetries) loadNote('perf-agent could not load this publication; the page keeps trying.');
+      setTimeout(checkState, retryDelays[Math.min(failures, retryDelays.length) - 1]);
     });
   };
 
@@ -558,53 +593,80 @@
   };
 
   let stream = null;
-  let polling = false;
+  // epoch moves on every connection event: the stream opening, failing or
+  // delivering a state. A check of GET state changes the banner only if no
+  // connection event happened while it waited, so an old answer never
+  // overrides what the connection has shown since.
+  let epoch = 0;
+  // pollRun names the one polling loop allowed to run; 0 when none is.
+  let pollRun = 0;
+  let pollRuns = 0;
   let pollStep = 0;
   let polls = 0;
   const pollDelays = [1000, 2000, 5000];
 
+  // checkState reads GET state and resolves to 'ok', 'failed' (and the
+  // banner says the server is gone) or 'stale'.
   const checkState = async () => {
+    const e = epoch;
     try {
       onState(await transport.getJSON('state'));
-      return true;
-    } catch (e) {
+      return e === epoch ? 'ok' : 'stale';
+    } catch (err) {
+      if (e !== epoch) return 'stale';
       banner('gone', GONE);
-      return false;
+      return 'failed';
     }
   };
 
   // poll reads the state while the stream is refused, slower while
-  // nothing changes, and tries the stream again now and then.
-  const poll = async () => {
+  // nothing changes, and tries the stream again now and then. A loop whose
+  // run is no longer pollRun stops, before and after each read.
+  const poll = async (run) => {
+    if (run !== pollRun) return;
     const before = acceptedSeq;
-    if (await checkState()) banner('quiet', PAUSED);
+    const r = await checkState();
+    if (run !== pollRun) return;
+    if (r === 'ok') banner('quiet', PAUSED);
     pollStep = acceptedSeq !== before ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
     polls++;
-    if (polls % 6 === 0 && stream && stream.readyState === EventSource.CLOSED) connect();
-    if (polling) setTimeout(poll, pollDelays[pollStep]);
+    if (polls % 3 === 0 && stream && stream.readyState === EventSource.CLOSED) connect();
+    if (run === pollRun) setTimeout(() => poll(run), pollDelays[pollStep]);
+  };
+
+  const startPolling = () => {
+    if (pollRun) return;
+    pollRun = ++pollRuns;
+    pollStep = 0;
+    const run = pollRun;
+    setTimeout(() => poll(run), pollDelays[0]);
   };
 
   const onOpen = () => {
-    polling = false;
+    epoch++;
+    pollRun = 0;
     banner('', '');
   };
 
   const onTrouble = async (gaveUp) => {
-    const ok = await checkState();
+    epoch++;
+    const r = await checkState();
+    if (r === 'stale') return;
     if (gaveUp) {
-      if (ok) banner('quiet', PAUSED);
-      if (!polling) {
-        polling = true;
-        pollStep = 0;
-        setTimeout(poll, pollDelays[0]);
-      }
-    } else if (ok && !polling) {
+      if (r === 'ok') banner('quiet', PAUSED);
+      startPolling();
+    } else if (r === 'ok' && !pollRun) {
       banner('', '');
     }
   };
 
+  const onStreamState = (st) => {
+    epoch++;
+    onState(st);
+  };
+
   const connect = () => {
-    stream = transport.subscribe(onState, onTrouble, onOpen);
+    stream = transport.subscribe(onStreamState, onTrouble, onOpen);
   };
 
   // --- Wiring ---

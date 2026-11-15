@@ -167,6 +167,7 @@ func startChrome(t *testing.T) *chromeSession {
 	cmd := exec.Command(chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
 		"--remote-debugging-pipe", "--user-data-dir="+filepath.Join(dir, "profile"), "--window-size=1200,900", "about:blank")
 	cmd.ExtraFiles = []*os.File{toChrome, fromChrome} // fd 3: commands in, fd 4: replies out
+	killWithTest(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Skipf("headless Chrome did not start: %v", err)
 	}
@@ -332,6 +333,7 @@ type liveDOM struct {
 	Toast      string   `json:"toast"`
 	Pubs       []string `json:"pubs"`
 	Waiting    bool     `json:"waiting"`
+	LoadNote   string   `json:"load_note"`
 	Facts      int      `json:"facts"`
 	Chips      []string `json:"chips"`
 	Cites      []string `json:"cites"`
@@ -368,6 +370,7 @@ const domProbe = `(() => {
     toast: $('toast').textContent,
     pubs: text('#pubs button'),
     waiting: !$('waiting').hidden,
+    load_note: $('load-note') && !$('load-note').hidden ? $('load-note').textContent : '',
     facts: $('facts').children.length,
     chips: text('#chips .chip'),
     cites: text('#exp button.cite'),
@@ -1036,6 +1039,161 @@ func TestLivePageOrderingInChrome(t *testing.T) {
 		assert.Equal(t, "pub/p2/export", d.Export)
 		s.push(liveState("2", "p1", f.a, "", "p1", "p2"))
 		d = tab.waitFor("the agent's p1", func(d liveDOM) bool { return d.Title == "first look at 3 frames" && d.SelName == "a" })
+		assert.Empty(t, tab.errors())
+	})
+}
+
+func TestLivePageSteeringInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	settle := func() { time.Sleep(1100 * time.Millisecond) }
+
+	// The agent switches to p2 and comes back to p1 while p2's selection is
+	// still loading: p2's model is already on screen, so the return must
+	// draw p1 again.
+	t.Run("a return after a partial publication switch", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p2"), nil)
+		tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
+		s.setDelay("pub/p2/frame/"+string(f.b), 800*time.Millisecond)
+		s.push(liveState("2", "p2", f.b, "", "p1", "p2"))
+		tab.waitFor("p2's model", func(d liveDOM) bool { return d.Title == "second" })
+		s.push(liveState("3", "p1", f.b, "", "p1", "p2"))
+		settle()
+		d := tab.dom()
+		assert.Equal(t, "first look at 3 frames", d.Title)
+		assert.Equal(t, "b", d.SelName)
+		assert.Equal(t, "pub/p1/export", d.Export)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a return after a partial focus", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
+		s.setDelay("pub/p1/frame/"+string(f.c), 800*time.Millisecond)
+		s.push(liveState("2", "p1", f.c, f.a, "p1"))
+		tab.waitFor("a's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to a") })
+		s.push(liveState("3", "p1", f.b, "", "p1"))
+		settle()
+		d := tab.dom()
+		assert.NotContains(t, d.Axis, "relative to")
+		assert.True(t, d.WholeOff)
+		assert.Equal(t, "b", d.SelName)
+		assert.Equal(t, []string{"✦b"}, d.Cur)
+		assert.Empty(t, tab.errors())
+	})
+
+	// A state that changes only a history is quiet: the user's own focus,
+	// still loading, lands, and the history moves.
+	t.Run("a history-only state leaves a local focus alone", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("2", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.setDelay("pub/p1/focus/"+string(f.b), 800*time.Millisecond)
+		})
+		tab.waitFor("seq 2", func(d liveDOM) bool { return d.SelName == "b" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		time.Sleep(200 * time.Millisecond)
+		s.setHistory("p1", f.history("p1", "1", "a1"))
+		s.push(liveState("3", "p1", f.b, "", "p1@1"))
+		settle()
+		d := tab.dom()
+		assert.Len(t, d.Rejected, 1, "the history moved")
+		assert.Contains(t, d.Axis, "relative to b", "the user's focus landed")
+		assert.Empty(t, tab.errors())
+	})
+
+	// While the agent's publication switch loads, the old frames are not
+	// the user's to navigate: a click there does nothing.
+	t.Run("a local click during an agent switch", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.setDelay("pub/p2/model", 800*time.Millisecond)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		s.push(liveState("2", "p2", f.c, "", "p1", "p2"))
+		time.Sleep(200 * time.Millisecond)
+		tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === 'a').click(), ''`)
+		settle()
+		d := tab.dom()
+		assert.Equal(t, "second", d.Title, "the agent's publication is shown")
+		assert.Equal(t, "c", d.SelName)
+		assert.Empty(t, tab.errors())
+	})
+
+	// The user's explicit choice of publication still wins over a switch
+	// that is loading.
+	t.Run("choosing a publication during an agent switch", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p3"), func(s *liveServer) {
+			s.setDelay("pub/p2/model", 800*time.Millisecond)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && len(d.Pubs) == 2 })
+		s.push(liveState("2", "p2", f.c, "", "p1", "p2", "p3"))
+		time.Sleep(200 * time.Millisecond)
+		tab.eval(`document.querySelector('#pubs button[data-pub="p3"]').click(), ''`)
+		settle()
+		d := tab.dom()
+		assert.Equal(t, "third", d.Title)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a publication that cannot be loaded is retried with a note", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p9", "", "", "p1"), nil)
+		d := tab.waitFor("the note", func(d liveDOM) bool { return d.LoadNote != "" })
+		assert.Equal(t, "perf-agent could not load this publication; the page keeps trying.", d.LoadNote)
+		assert.True(t, d.BannerHid)
+		tries := func() int {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return countOf(s.served, "pub/p9/model")
+		}
+		atNote := tries()
+		assert.GreaterOrEqual(t, atNote, 3)
+		time.Sleep(3 * time.Second)
+		assert.LessOrEqual(t, tries()-atNote, 1, "after three failures the retries are seconds apart")
+		s.push(liveState("2", "p1", f.b, "", "p1"))
+		d = tab.waitFor("p1", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.Empty(t, d.LoadNote)
+	})
+}
+
+func TestLivePageConnectionInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+
+	// After a 503 the page polls; when the stream is accepted again the
+	// "paused" note goes away and a poll already scheduled does not bring
+	// it back.
+	t.Run("the paused note goes when the stream is back", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) { s.refuse = true })
+		tab.waitFor("paused", func(d liveDOM) bool { return d.SelName == "b" && !d.BannerHid })
+		s.mu.Lock()
+		s.refuse = false
+		s.mu.Unlock()
+		require.Eventually(t, func() bool { return s.streamCount() > 0 }, 30*time.Second, 100*time.Millisecond, "the page tries the stream again")
+		time.Sleep(6 * time.Second)
+		d := tab.dom()
+		assert.True(t, d.BannerHid, "the stream is open, so updates are not paused: %q", d.Banner)
+		s.push(liveState("2", "p1", f.c, "", "p1"))
+		d = tab.waitFor("seq 2 over the reopened stream", func(d liveDOM) bool { return d.SelName == "c" })
+		assert.True(t, d.BannerHid)
+		assert.Empty(t, tab.errors())
+	})
+
+	// A fallback GET state that fails after the stream came back and
+	// delivered states says nothing about the server now.
+	t.Run("a stale failed fallback does not mark a live server gone", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
+		before := s.gets()
+		s.setState(nil)
+		s.setDelay("state", 5*time.Second)
+		s.drop()
+		require.Eventually(t, func() bool { return s.gets() > before }, 2*time.Second, 20*time.Millisecond)
+		next := liveState("2", "p1", f.a, "", "p1")
+		s.setState(next)
+		s.push(next)
+		tab.waitFor("reconnected with a new state", func(d liveDOM) bool { return d.SelName == "a" && d.BannerHid })
+		time.Sleep(2300 * time.Millisecond)
+		s.push(liveState("3", "p1", f.b, "", "p1"))
+		d := tab.waitFor("still receiving", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.True(t, d.BannerHid, "an old failed fallback must not mark a recovered connection gone: %q", d.Banner)
 		assert.Empty(t, tab.errors())
 	})
 }

@@ -14,7 +14,9 @@ import (
 // maxMsgs and maxBytes bound the backlog (the lines not yet taken by a
 // write). A response is refused only when the backlog has already reached
 // a bound, so one line of any size fits behind a small backlog; a refused
-// response marks the client dead. The dispatcher waits for the backlog to
+// response marks the client dead. A notification is dropped instead,
+// without harm, while the backlog is at half a bound or more. The
+// dispatcher waits for the backlog to
 // fall under half the bounds before it starts a request (room), so a live
 // client is not declared dead for reading slowly. The client is dead too
 // when a write fails, or when no write ends for stall while lines wait.
@@ -64,6 +66,19 @@ func (o *outQueue) enqueue(line []byte) bool {
 	}
 	if len(o.q) >= o.maxMsgs || o.size >= o.maxBytes {
 		o.dieLocked(nil)
+		return false
+	}
+	o.addLocked(line)
+	return true
+}
+
+// enqueueNote adds a notification and reports whether it was accepted.
+// Notifications are lossy: one is dropped while the backlog is at half a
+// bound or more, and that never marks the client dead.
+func (o *outQueue) enqueueNote(line []byte) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || !o.roomLocked() {
 		return false
 	}
 	o.addLocked(line)

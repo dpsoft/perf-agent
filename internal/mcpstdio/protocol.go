@@ -150,8 +150,9 @@ type Options struct {
 	// MaxOutMessages and MaxOutBytes bound the messages waiting to be
 	// written. A response that finds the backlog already at a bound means
 	// the client stopped reading, so one response of any size fits behind
-	// a smaller backlog. A request is started only once the backlog is
-	// under half of both. 0 means 64 messages, and 4 × MaxToolErrorBytes
+	// a smaller backlog. A request is started, and a notification sent,
+	// only while the backlog is under half of both; a notification is
+	// dropped otherwise. 0 means 64 messages, and 4 × MaxToolErrorBytes
 	// (4 MiB when that is 0).
 	MaxOutMessages int
 	MaxOutBytes    int

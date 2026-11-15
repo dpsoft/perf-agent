@@ -287,8 +287,10 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	if i < 0 || s.o.Tools[i].Handler == nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + echoName(p.Name)}
 	}
-	if ss, ok := ctx.Value(sessionKey{}).(*session); ok && !s.o.Tools[i].Control && validID(p.Meta.ProgressToken) {
-		ctx = context.WithValue(ctx, progressKey{}, &progressTarget{token: p.Meta.ProgressToken, ss: ss})
+	ss, inSession := ctx.Value(sessionKey{}).(*session)
+	r, queued := ctx.Value(requestKey{}).(*request)
+	if inSession && queued && !s.o.Tools[i].Control && validID(p.Meta.ProgressToken) {
+		ctx = context.WithValue(ctx, progressKey{}, &progressTarget{token: p.Meta.ProgressToken, ss: ss, r: r})
 	}
 	args := p.Arguments
 	if len(args) == 0 || string(args) == "null" {

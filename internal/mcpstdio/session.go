@@ -48,7 +48,10 @@ type request struct {
 	cancelled bool
 }
 
-type sessionKey struct{}
+type (
+	sessionKey struct{}
+	requestKey struct{}
+)
 
 func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
 	ss := &session{
@@ -354,7 +357,7 @@ func (ss *session) next() (*request, context.Context) {
 		r := ss.queue[0]
 		ss.queue[0] = nil
 		ss.queue = ss.queue[1:]
-		ctx, cancel := context.WithCancel(ss.hctx)
+		ctx, cancel := context.WithCancel(context.WithValue(ss.hctx, requestKey{}, r))
 		r.cancel = cancel
 		ss.running = r
 		ss.mu.Unlock()
@@ -388,15 +391,16 @@ type progressKey struct{}
 type progressTarget struct {
 	token json.RawMessage
 	ss    *session
+	r     *request
 }
 
 // Progress sends a notifications/progress for the tool call ctx belongs to,
 // through the output queue, and reports whether it was enqueued. It sends
 // nothing, and returns false, when the call carried no progressToken, when
-// ctx is done (the call was cancelled or has been answered), or outside a
-// tool call. A total <= 0 and an empty message are left out. It never
-// waits; a notification that does not fit the output queue marks the
-// client dead, as any message does.
+// the call was cancelled or has been answered, outside a tool call, and in
+// a Control tool. A total <= 0 and an empty message are left out. It never
+// waits. Notifications are lossy: one is dropped (false) while the output
+// backlog is at half its bounds or more, and that never ends the session.
 func Progress(ctx context.Context, progress, total float64, message string) bool {
 	p, ok := ctx.Value(progressKey{}).(*progressTarget)
 	if !ok || ctx.Err() != nil {
@@ -408,9 +412,20 @@ func Progress(ctx context.Context, progress, total float64, message string) bool
 		Total         float64         `json:"total,omitzero"`
 		Message       string          `json:"message,omitzero"`
 	}
-	return p.ss.send(struct {
+	line, err := encodeLine(struct {
 		JSONRPC string `json:"jsonrpc"`
 		Method  string `json:"method"`
 		Params  params `json:"params"`
 	}{"2.0", "notifications/progress", params{p.token, progress, max(total, 0), message}})
+	if err != nil {
+		return false
+	}
+	// Under ss.mu the dispatcher cannot answer the call meanwhile, so no
+	// notification follows the call's answer.
+	p.ss.mu.Lock()
+	defer p.ss.mu.Unlock()
+	if p.ss.running != p.r || p.r.cancelled {
+		return false
+	}
+	return p.ss.out.enqueueNote(line)
 }

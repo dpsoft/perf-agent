@@ -154,15 +154,23 @@ type Options struct {
 	// the client stopped reading, so one response of any size fits behind
 	// a smaller backlog. A request is started, and a notification sent,
 	// only while the backlog is under half of both; a notification is
-	// dropped otherwise. 0 means 64 messages, and 4 × MaxToolErrorBytes
-	// (4 MiB when that is 0).
+	// dropped otherwise. One answer line must stay under half of
+	// MaxOutBytes (see Server.MaxResultBytes): a larger one can fill the
+	// backlog to the bound, and then even a small answer from the reader
+	// (server busy, a Control result) marks the client dead. 0 means 64
+	// messages, and room for two answers of MaxToolErrorBytes (4 ×
+	// MaxToolErrorBytes plus their envelopes; 4 MiB when that is 0).
 	MaxOutMessages int
 	MaxOutBytes    int
 	// DrainTimeout bounds how long Serve, once the input or its context
 	// ended, waits for the queued output to be written. 0 means 1 s.
 	DrainTimeout time.Duration
 	// StallTimeout is how long the output may make no progress, with
-	// messages waiting, before the client is taken as gone. 0 means 30 s.
+	// messages waiting, before the client is taken as gone. Progress is
+	// counted per finished write, so one line must finish writing within
+	// StallTimeout; the clock runs only while lines wait behind the one
+	// being written, so a single slow line with nothing behind it is not
+	// timed. 0 means 30 s.
 	StallTimeout time.Duration
 	// OnClose, when set, is called once, on Serve's goroutine, when the
 	// session starts to end and before the handlers' contexts are

@@ -90,7 +90,7 @@ func (ss *session) halt() {
 func (ss *session) endGone() error {
 	ss.end(CloseClientGone)
 	ss.halt()
-	return ss.out.goneErr()
+	return errors.Join(ss.out.goneErr(), ss.inputErr())
 }
 
 // endContext ends a session whose context is done: no new request is
@@ -114,9 +114,29 @@ func (ss *session) endContext(ctx context.Context) error {
 	ss.halt()
 	if !drained {
 		// It wraps ctx.Err() too: the session ended because ctx did.
-		return fmt.Errorf("%w (%w)", ss.out.goneErr(), ctx.Err())
+		return errors.Join(fmt.Errorf("%w (%w)", ss.out.goneErr(), ctx.Err()), ss.inputErr())
 	}
-	return nil
+	return ss.inputErr()
+}
+
+// clientDead reports whether the output has marked the client dead.
+func (ss *session) clientDead() bool {
+	select {
+	case <-ss.out.dead:
+		return true
+	default:
+		return false
+	}
+}
+
+// inputErr is the read error that ended the input, if the input has ended.
+func (ss *session) inputErr() error {
+	select {
+	case <-ss.inputEnded:
+		return ss.readErr
+	default:
+		return nil
+	}
 }
 
 func (ss *session) wakeDispatcher() {
@@ -128,17 +148,20 @@ func (ss *session) wakeDispatcher() {
 
 // halted reports whether the reader must stop.
 func (ss *session) halted() bool {
-	select {
-	case <-ss.out.dead:
+	if ss.clientDead() {
 		return true
-	default:
 	}
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	return ss.stopped
 }
 
-// send encodes m and enqueues it, and reports whether it was enqueued.
+// send encodes the response m and enqueues it, and reports whether it was
+// enqueued. It uses the fatal enqueue: a response refused because the
+// backlog is at its bound marks the client dead. The reader's own answers
+// (server busy, parse and invalid-request errors, Control results) go
+// through it by design, as the dispatcher's do. A notification must never
+// go through send: notifications use the lossy enqueueNote (see Progress).
 func (ss *session) send(m any) bool {
 	line, err := encodeLine(m)
 	if err != nil {
@@ -326,6 +349,10 @@ func (ss *session) dispatch() {
 // reader goes on meanwhile: cancels, EOF and the end of ctx are still seen.
 func (ss *session) next() (*request, context.Context) {
 	for {
+		if ss.clientDead() {
+			// No answer can be delivered: start nothing more.
+			return nil, nil
+		}
 		ss.mu.Lock()
 		if ss.stopped {
 			ss.mu.Unlock()
@@ -346,13 +373,11 @@ func (ss *session) next() (*request, context.Context) {
 			case <-changed:
 			case <-ss.wake:
 			case <-ss.out.dead:
-				// Nothing more will be written; wait for Serve to stop us.
-				<-ss.wake
 			}
 			continue
 		}
 		ss.mu.Lock()
-		if ss.stopped || len(ss.queue) == 0 {
+		if ss.stopped || len(ss.queue) == 0 || ss.clientDead() {
 			ss.mu.Unlock()
 			continue
 		}

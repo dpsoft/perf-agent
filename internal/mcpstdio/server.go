@@ -40,7 +40,9 @@ func New(o Options) *Server {
 	if s.o.MaxOutBytes <= 0 {
 		s.o.MaxOutBytes = defaultMaxOutBytes
 		if s.o.MaxToolErrorBytes > 0 {
-			s.o.MaxOutBytes = 4 * s.o.MaxToolErrorBytes
+			// Room for two results of MaxToolErrorBytes, each at its worst
+			// escaping, with their envelopes (see MaxResultBytes).
+			s.o.MaxOutBytes = 4*s.o.MaxToolErrorBytes + 2*resultEnvelopeBytes
 		}
 	}
 	if s.o.DrainTimeout <= 0 {
@@ -320,10 +322,31 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	if err != nil {
 		res = Result{Text: cut(err.Error(), s.o.MaxToolErrorBytes), IsError: true}
 	}
+	return toolResult(res), nil
+}
+
+// toolResult is the tools/call result for res.
+func toolResult(res Result) any {
 	return map[string]any{
 		"content": []textContent{{Type: "text", Text: res.Text}},
 		"isError": res.IsError,
-	}, nil
+	}
+}
+
+// resultEnvelopeBytes bounds what a tools/call answer adds to its escaped
+// text, for an id of up to maxResultIDBytes.
+const (
+	resultEnvelopeBytes = 256
+	maxResultIDBytes    = 64
+)
+
+// MaxResultBytes is the largest tool result text whose answer line stays
+// within half of MaxOutBytes, even when JSON escaping doubles every byte
+// (the worst case for a JSON text) and the id is up to 64 bytes. A result
+// that size behind a backlog under half the bound, which is when the
+// dispatcher starts a request, leaves room for the reader's own answers.
+func (s *Server) MaxResultBytes() int {
+	return max((s.o.MaxOutBytes/2-resultEnvelopeBytes)/2, 0)
 }
 
 // runHandler calls the tool and turns a panic into a flag so one bad handler

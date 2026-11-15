@@ -13,6 +13,10 @@ import (
 // would end the event's data line early.
 var ErrMultiline = errors.New("live state must be a single line")
 
+// ErrEmpty is returned by Publish for empty data. EventSource drops an event
+// whose data is empty, so the page would keep its old state without a sign.
+var ErrEmpty = errors.New("live state must not be empty")
+
 // Hub streams the newest published state to every connected page as
 // Server-Sent Events.
 //
@@ -53,9 +57,12 @@ func NewHub(maxClients int, keepAlive, writeTimeout time.Duration) *Hub {
 var keepAliveFrame = []byte(": keep-alive\n\n")
 
 // Publish makes data the latest state, which every connected client is sent
-// next and every new client is sent first. data must be one line; it is
-// copied, so the caller may reuse it. Publish never blocks.
+// next and every new client is sent first. data must be one non-empty line;
+// it is copied, so the caller may reuse it. Publish never blocks.
 func (h *Hub) Publish(data []byte) error {
+	if len(data) == 0 {
+		return ErrEmpty
+	}
 	if bytes.ContainsAny(data, "\r\n") {
 		return ErrMultiline
 	}

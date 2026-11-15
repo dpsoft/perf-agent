@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -383,6 +386,34 @@ func TestPublishRefusesMultilineData(t *testing.T) {
 	}
 }
 
+func TestPublishRefusesEmptyData(t *testing.T) {
+	h := NewHub(8, time.Minute, time.Second)
+	addr := startHub(t, h)
+	mustPublish(t, h, state(1, 0))
+	s := openStream(t, addr)
+	if seq := s.nextState(t); seq != 1 {
+		t.Fatalf("first state seq %d, want 1", seq)
+	}
+
+	// EventSource drops an event whose data is empty, so the page would stay
+	// on the old state without a sign.
+	for _, data := range [][]byte{nil, {}} {
+		if err := h.Publish(data); !errors.Is(err, ErrEmpty) {
+			t.Errorf("Publish(%#v) = %v, want ErrEmpty", data, err)
+		}
+	}
+	late := openStream(t, addr)
+	if seq := late.nextState(t); seq != 1 {
+		t.Errorf("new client's first state seq %d, want 1", seq)
+	}
+	mustPublish(t, h, state(2, 0))
+	for _, c := range []*sseStream{s, late} {
+		if seq := c.nextState(t); seq != 2 {
+			t.Errorf("next state seq %d, want 2", seq)
+		}
+	}
+}
+
 func TestAReconnectGetsTheCurrentState(t *testing.T) {
 	h := NewHub(8, time.Minute, time.Second)
 	addr := startHub(t, h)
@@ -434,22 +465,63 @@ func TestAHealthyStreamOutlivesTheServerWriteTimeout(t *testing.T) {
 	}
 }
 
-func TestHubAnswersHeadWithoutAStream(t *testing.T) {
-	h := NewHub(8, time.Minute, time.Second)
-	addr := startHub(t, h)
+// In production keepAlive (15 s) is longer than the hub's writeTimeout
+// (10 s), so the deadline from the previous write has always passed when the
+// next keep-alive goes out, and the server's WriteTimeout has passed too.
+// Each write must set a fresh deadline before it starts.
+func TestAStreamSurvivesKeepAlivesLongerThanItsWriteTimeout(t *testing.T) {
+	const keepAlive, writeTimeout = 300 * time.Millisecond, 100 * time.Millisecond
+	h := NewHub(8, keepAlive, writeTimeout)
+	addr := startHub(t, h, func(s *http.Server) { s.WriteTimeout = 150 * time.Millisecond })
+	s := openStream(t, addr)
+	for i := range 3 {
+		ev, err := s.next(time.Second)
+		if err != nil {
+			t.Fatalf("keep-alive %d: %v", i+1, err)
+		}
+		if want := (sseEvent{comment: "keep-alive"}); ev != want {
+			t.Fatalf("event %d: %+v, want %+v", i+1, ev, want)
+		}
+	}
+	time.Sleep(250 * time.Millisecond)
+	mustPublish(t, h, state(1, 0))
+	if seq := s.nextState(t); seq != 1 {
+		t.Errorf("state seq %d, want 1", seq)
+	}
+}
+
+func head(t *testing.T, addr string) *http.Response {
+	t.Helper()
 	conn := dialHub(t, addr)
 	request(t, conn, http.MethodHead, addr)
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodHead})
 	if err != nil {
-		t.Fatalf("read response: %v", err)
+		t.Fatalf("read HEAD response: %v", err)
 	}
+	return resp
+}
+
+func TestHubAnswersHeadWithoutAStream(t *testing.T) {
+	h := NewHub(1, time.Minute, time.Second)
+	addr := startHub(t, h)
+	resp := head(t, addr)
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
 		t.Errorf("HEAD: status %d, Content-Type %q; want 200 text/event-stream",
 			resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
 	if got := h.Clients(); got != 0 {
 		t.Errorf("Clients() = %d after HEAD, want 0", got)
+	}
+
+	openStream(t, addr)
+	waitClients(t, h, 1, 5*time.Second)
+	if got := head(t, addr).StatusCode; got != http.StatusServiceUnavailable {
+		t.Errorf("HEAD with the hub full: status %d, want 503", got)
+	}
+	h.Close()
+	if got := head(t, addr).StatusCode; got != http.StatusServiceUnavailable {
+		t.Errorf("HEAD after Close: status %d, want 503", got)
 	}
 }
 
@@ -470,5 +542,145 @@ func TestNewHubRefusesNonPositiveLimits(t *testing.T) {
 			}()
 			NewHub(tc.max, tc.keepAlive, tc.writeTimeout)
 		}()
+	}
+}
+
+// TestHubUnderChurn runs publishers, clients that join, read and leave, and
+// a racing double Close, all at once. Clients() stays within the limit, each
+// publisher's states arrive in order on every connection, no slot leaks, and
+// after Close every connect is refused.
+func TestHubUnderChurn(t *testing.T) {
+	const maxClients, publishers, clients = 4, 3, 8
+	h := NewHub(maxClients, 10*time.Millisecond, time.Second)
+	addr := startHub(t, h)
+	var closing atomic.Bool
+
+	churn := func(d, closeAt time.Duration) {
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for p := range publishers {
+			wg.Go(func() {
+				for seq := 1; ; seq++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if err := h.Publish(fmt.Appendf(nil, `{"p":"%d","seq":%d}`, p, seq)); err != nil {
+						t.Errorf("Publish: %v", err)
+						return
+					}
+					time.Sleep(50 * time.Microsecond)
+				}
+			})
+		}
+		for range clients {
+			wg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					churnOnce(t, addr, &closing)
+				}
+			})
+		}
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if n := h.Clients(); n < 0 || n > maxClients {
+					t.Errorf("Clients() = %d, want 0..%d", n, maxClients)
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+		})
+		if closeAt > 0 {
+			wg.Go(func() {
+				time.Sleep(closeAt)
+				closing.Store(true)
+				var cw sync.WaitGroup
+				cw.Go(h.Close)
+				cw.Go(h.Close)
+				cw.Wait()
+			})
+		}
+		time.Sleep(d)
+		close(stop)
+		wg.Wait()
+	}
+
+	churn(700*time.Millisecond, 0)
+	waitClients(t, h, 0, 2*time.Second)
+	openStream(t, addr)
+	waitClients(t, h, 1, 2*time.Second)
+
+	churn(800*time.Millisecond, 100*time.Millisecond+rand.N(500*time.Millisecond))
+	if got := h.Clients(); got != 0 {
+		t.Errorf("Clients() = %d after Close, want 0", got)
+	}
+	if resp, _ := connect(t, addr); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("connect after Close: status %d, want 503", resp.StatusCode)
+	}
+}
+
+// churnOnce connects, reads a few events and leaves. It runs on its own
+// goroutine, so it reports with t.Errorf and returns.
+func churnOnce(t *testing.T, addr string, closing *atomic.Bool) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Errorf("dial: %v", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprintf(conn, "GET /events HTTP/1.1\r\nHost: %s\r\n\r\n", addr); err != nil {
+		t.Errorf("write request: %v", err)
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Errorf("read response: %v", err)
+		return
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusServiceUnavailable:
+		time.Sleep(time.Millisecond)
+		return
+	default:
+		t.Errorf("status %d, want 200 or 503", resp.StatusCode)
+		return
+	}
+	s := &sseStream{conn: conn, body: bufio.NewReader(resp.Body)}
+	last := map[string]int{}
+	for range rand.N(8) + 1 {
+		ev, err := s.next(5 * time.Second)
+		if err != nil {
+			if !errors.Is(err, io.EOF) || !closing.Load() {
+				t.Errorf("read event: %v", err)
+			}
+			return
+		}
+		if ev.comment == "keep-alive" {
+			continue
+		}
+		var v struct {
+			P   string `json:"p"`
+			Seq int    `json:"seq"`
+		}
+		if err := json.Unmarshal([]byte(ev.data), &v); err != nil || ev.name != "state" {
+			t.Errorf("event %+v: %v", ev, err)
+			return
+		}
+		if v.Seq <= last[v.P] {
+			t.Errorf("publisher %s: seq %d after %d on one connection", v.P, v.Seq, last[v.P])
+			return
+		}
+		last[v.P] = v.Seq
 	}
 }

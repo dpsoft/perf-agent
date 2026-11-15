@@ -583,10 +583,11 @@ func TestRunTransitionAndRevertWithinOneIntervalIsMissed(t *testing.T) {
 		name    string
 		recheck time.Duration
 		hold    time.Duration
+		slow    bool
 		want    Code
 	}{
-		{"missed", time.Hour, 0, ""},
-		{"held across a recheck", 100 * time.Millisecond, 500 * time.Millisecond, CodeTargetChanged},
+		{"missed", time.Hour, 500 * time.Millisecond, true, ""},
+		{"held across a recheck", 100 * time.Millisecond, 500 * time.Millisecond, false, CodeTargetChanged},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := runSpec(t, capturetest.FakeOptions{})
@@ -594,7 +595,19 @@ func TestRunTransitionAndRevertWithinOneIntervalIsMissed(t *testing.T) {
 			spec.Bounds.Recheck = tc.recheck
 			target := startChild(t, "flip-dumpable")
 			spec.PID = target.PID
+			// With slow, every read of the target from here on takes 200ms,
+			// the readiness recheck's included: a phase that said profiling
+			// before that recheck finished would let the change below land
+			// inside it.
+			var slow atomic.Bool
+			spec.Proc.StartTimeHook = func(pid int, start uint64) uint64 {
+				if pid == target.PID && slow.Load() {
+					time.Sleep(200 * time.Millisecond)
+				}
+				return start
+			}
 			r := startRun(t, spec)
+			slow.Store(tc.slow)
 			waitPhase(t, r, PhaseProfiling, 10*time.Second)
 			_ = syscall.Kill(target.PID, syscall.SIGUSR1)
 			if l := target.next(t); l != "dropped" {
@@ -885,5 +898,185 @@ func TestExecProofNeedsTheCommandNotTheLauncher(t *testing.T) {
 	r := &Run{spec: RunSpec{Proc: DefaultProc(), Launch: &LaunchSpec{Path: w}}, launchers: launcherIDs(self), cmdIDs: commandIDs(w)}
 	if e := r.execProven(gone.PID, start); errCode(e) != CodeTargetExited {
 		t.Errorf("a reaped pid: %v", e)
+	}
+}
+
+// An error-driven stop records its time: the finish bound counts from it,
+// StoppedBy stays empty (the error is the cause) and Profiled is real.
+func TestRunAFailureStopArmsTheFinishBound(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{Mode: capturetest.FakeHangAfterSIGINT})
+	spec.Settings.Duration = 8 * time.Second
+	spec.Bounds.Recheck = 100 * time.Millisecond
+	spec.Bounds.FinishTimeout = time.Second
+	spec.Launch = launchOf(t, "drop-dumpable-after", "500ms", "1m")
+	began := time.Now()
+	o := waitRun(t, startRun(t, spec), 30*time.Second)
+	if errCode(o.Err) != CodeTargetChanged || o.StoppedBy != "" {
+		t.Fatalf("Err %v, stopped by %q; want target_changed and no StoppedBy", o.Err, o.StoppedBy)
+	}
+	// 0.5s to the change, 1s of FinishTimeout, the kill: about 1.5s, not
+	// the 9s a bound counted from the duration's end would take.
+	if d := time.Since(began); d > 1500*time.Millisecond+slack {
+		t.Errorf("Wait took %v, want about 1.5s", d)
+	}
+	if o.Profiled <= 0 || o.Profiled > time.Second {
+		t.Errorf("Profiled = %v, want the real time to the change", o.Profiled)
+	}
+}
+
+// Run.Kill is a cancel decided when Kill is called, whatever order the
+// reaper's exits then arrive in; Profiled runs to the kill.
+func TestRunKillIsCancelWithItsOwnStop(t *testing.T) {
+	for i := range 3 {
+		spec := runSpec(t, capturetest.FakeOptions{})
+		spec.Settings.Duration = 20 * time.Second
+		spec.PID = startChild(t, "sleep").PID
+		r := startRun(t, spec)
+		waitPhase(t, r, PhaseProfiling, 10*time.Second)
+		time.Sleep(300 * time.Millisecond)
+		r.Kill()
+		o := waitRun(t, r, 30*time.Second)
+		if errCode(o.Err) != CodeCancelled || o.StoppedBy != StoppedByCancel {
+			t.Fatalf("run %d: Err %v, stopped by %q; want cancelled, cancel", i, o.Err, o.StoppedBy)
+		}
+		if o.Profiled < 300*time.Millisecond || o.Profiled > 300*time.Millisecond+slack {
+			t.Errorf("run %d: Profiled = %v, want the time to the kill", i, o.Profiled)
+		}
+	}
+}
+
+// After a cancel before readiness, the start bound no longer kills: the
+// reaper's SIGINT and StopGrace run their course.
+func TestRunAStopDisarmsTheStartBound(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{Mode: capturetest.FakeIgnoreSIGINT, ReadyAfter: 10 * time.Second})
+	spec.Bounds.StartTimeout = time.Second
+	spec.Bounds.StopGrace = 2 * time.Second
+	spec.PID = startChild(t, "sleep").PID
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseAttaching, 10*time.Second)
+	// Let the fake ignore SIGINT first; still well before the start bound.
+	time.Sleep(300 * time.Millisecond)
+	cancelled := time.Now()
+	r.Cancel()
+	o := waitRun(t, r, 30*time.Second)
+	if errCode(o.Err) != CodeCancelled {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	if d := time.Since(cancelled); d < spec.Bounds.StopGrace-100*time.Millisecond {
+		t.Errorf("gone %v after Cancel: the start bound cut StopGrace (%v) short", d, spec.Bounds.StopGrace)
+	}
+}
+
+// testRun is a Run with no reaper process: kills are counted, commands
+// are dropped. It is for the supervisor's decisions alone.
+func testRun(t *testing.T, kills *int) *Run {
+	t.Helper()
+	r := &Run{
+		spec:  RunSpec{Proc: DefaultProc(), Settings: Settings{Modes: []Mode{ModeCPU}, Duration: time.Minute}, CaptureID: "t"},
+		b:     testBounds(),
+		log:   slog.New(slog.DiscardHandler),
+		ready: make(chan time.Time, 1),
+		o:     Outcome{PerfAgentExit: -1, Started: time.Now()},
+	}
+	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = null.Close() })
+	r.reaper = &Reaper{cmds: null, closeCmds: func() { *kills++ }}
+	r.killCh, r.wakeKill = make(chan struct{}), func() {}
+	ended := make(chan struct{})
+	close(ended)
+	r.perfOut = &stream{done: ended}
+	r.setPhase(PhaseAttaching)
+	r.argvPID, r.perf = 1, instance{1, 1}
+	return r
+}
+
+// A bound that expires while what would satisfy it is already queued does
+// not kill: the queue is drained first.
+func TestBoundsDrainWhatIsQueuedFirst(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	r.ready <- time.Now()
+	r.startExpired()
+	if kills != 0 || r.readyAt.IsZero() {
+		t.Errorf("start bound with a readiness line queued: %d kills, ready %v", kills, r.readyAt)
+	}
+
+	kills = 0
+	r = testRun(t, &kills)
+	evs := make(chan Event, 1)
+	evs <- Event{Op: EventExited, Who: WhoPerfAgent, PID: 1}
+	r.evc = evs
+	r.markStopped(StoppedByCancel, time.Now())
+	r.finishExpired()
+	if kills != 0 || !r.perfExited {
+		t.Errorf("finish bound with perf-agent's exit queued: %d kills, exited %v", kills, r.perfExited)
+	}
+}
+
+// Run.Kill decides the stop when it is called: the exits it causes, in
+// whatever order they are handled, never make it "duration".
+func TestAKillDecidesTheStopNotTheExitsItCauses(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	r.readyAt = time.Now().Add(-time.Second)
+	r.setPhase(PhaseProfiling)
+	r.Kill()
+	at := *r.killAt.Load()
+	time.Sleep(50 * time.Millisecond)
+	evs := make(chan Event, 1)
+	evs <- Event{Op: EventExited, Who: WhoPerfAgent, PID: 1, Status: -1, Signal: "killed"}
+	r.evc = evs
+	ev, ok := <-r.evc
+	r.handleEvent(ev, ok)
+	if r.o.StoppedBy != StoppedByCancel || errCode(r.o.Err) != CodeCancelled {
+		t.Fatalf("stopped by %q, Err %v; want cancel, cancelled", r.o.StoppedBy, r.o.Err)
+	}
+	if want := at.Sub(r.readyAt); r.o.Profiled != want {
+		t.Errorf("Profiled = %v, want %v, to the kill", r.o.Profiled, want)
+	}
+}
+
+// A reaper that does not answer a kill is not waited for forever: Wait
+// says stuck_child, naming what is known to be left.
+func TestRunAnUnresponsiveReaperIsStuckChild(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "record.json")
+	spec := runSpec(t, capturetest.FakeOptions{Record: record})
+	spec.Settings.Duration = time.Minute
+	spec.Bounds.StopGrace = 200 * time.Millisecond
+	spec.Bounds.FinishTimeout = 300 * time.Millisecond
+	spec.PID = startChild(t, "sleep").PID
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseProfiling, 10*time.Second)
+	reaper := r.reaper.PID()
+	if err := syscall.Kill(reaper, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(reaper, syscall.SIGCONT) })
+	killed := time.Now()
+	r.Kill()
+	o := waitRun(t, r, 30*time.Second)
+	if d, bound := time.Since(killed), spec.Bounds.StopGrace+spec.Bounds.FinishTimeout+5*time.Second; d > bound+slack {
+		t.Errorf("Wait took %v after the kill, want within %v", d, bound)
+	}
+	if errCode(o.Err) != CodeStuckChild || !strings.Contains(o.Err.Message, "unresponsive") {
+		t.Fatalf("Err = %v, want stuck_child naming the unresponsive reaper", o.Err)
+	}
+	rec, _ := readRecord(t, record)
+	found := false
+	for _, s := range o.Survivors {
+		found = found || s.PID == rec.PID
+	}
+	if !found {
+		t.Errorf("survivors %+v do not name perf-agent %d", o.Survivors, rec.PID)
+	}
+	// Let the reaper go on: it reads the EOF and cleans up.
+	_ = syscall.Kill(reaper, syscall.SIGCONT)
+	select {
+	case <-r.reaper.Done():
+	case <-time.After(20 * time.Second):
+		t.Error("the reaper did not finish once continued")
 	}
 }

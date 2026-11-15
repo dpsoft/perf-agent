@@ -36,6 +36,12 @@ const (
 	reaperGone = 2 * time.Second
 	// shebangRead is how much of a command is read for a #! line.
 	shebangRead = 256
+	// unresponsiveSlack is how much longer than StopGrace and
+	// FinishTimeout a killed capture's reaper gets to report.
+	unresponsiveSlack = 5 * time.Second
+	// lateReadiness bounds the wait, at perf-agent's exit, for a readiness
+	// line still in the stdout pipe.
+	lateReadiness = 200 * time.Millisecond
 )
 
 // Run is the server's side of one capture: it asks the reaper to start
@@ -48,10 +54,12 @@ type Run struct {
 	b      Bounds
 	log    *slog.Logger
 	reaper *Reaper
-	events <-chan Event
 
-	phase      atomic.Pointer[string]
-	killed     atomic.Bool
+	phase atomic.Pointer[string]
+	// killAt is when Kill was first called; killCh wakes the supervisor.
+	killAt     atomic.Pointer[time.Time]
+	killCh     chan struct{}
+	wakeKill   func()
 	cancel     chan struct{}
 	cancelOnce func()
 	done       chan struct{}
@@ -61,7 +69,19 @@ type Run struct {
 	ready                              chan time.Time
 
 	// The rest belongs to the supervising goroutine.
-	o                 Outcome
+	o Outcome
+	// evc is the reaper's event stream, nil once it ended or reaped came;
+	// reaped is that event.
+	evc    <-chan Event
+	reaped *Event
+	// cgroup is the command's own cgroup, when Start made one.
+	cgroup string
+	// killNoticed says a Run.Kill was taken up; unresponsiveT bounds the
+	// wait for the reaper's report after any kill, and unresponsive says
+	// it expired.
+	killNoticed       bool
+	unresponsiveT     *time.Timer
+	unresponsive      bool
 	launchers, cmdIDs []fileID
 	argvPID           int
 	target            TargetState
@@ -74,6 +94,7 @@ type Run struct {
 	perfExited               bool
 	perfStatus               int
 	perfSignal               string
+	recheckNoted             bool
 	attachFrom               time.Time
 	readyAt                  time.Time
 	stopped                  bool
@@ -115,6 +136,7 @@ func Start(spec RunSpec) (*Run, *Error) {
 		b:      spec.Bounds,
 		log:    spec.Log,
 		cancel: make(chan struct{}),
+		killCh: make(chan struct{}),
 		done:   make(chan struct{}),
 		ready:  make(chan time.Time, 1),
 		o:      Outcome{PerfAgentExit: -1, Started: time.Now()},
@@ -123,6 +145,7 @@ func Start(spec RunSpec) (*Run, *Error) {
 		r.log = slog.New(slog.DiscardHandler)
 	}
 	r.cancelOnce = sync.OnceFunc(func() { close(r.cancel) })
+	r.wakeKill = sync.OnceFunc(func() { close(r.killCh) })
 	r.setPhase(PhaseAttaching)
 	if spec.PID > 0 {
 		st, e := Preflight(spec.Proc, spec.PID, spec.SelfID)
@@ -154,7 +177,7 @@ func Start(spec RunSpec) (*Run, *Error) {
 			if err != nil {
 				r.o.Notes = append(r.o.Notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", err))
 			}
-			rspec.Cgroup = cg
+			rspec.Cgroup, r.cgroup = cg, cg
 		}
 	}
 	if e := r.startReaper(rspec); e != nil {
@@ -290,9 +313,9 @@ func (r *Run) startReaper(rs ReaperSpec) *Error {
 		return Errorf(CodePerfAgentUnstartable, "check that perf-agent-mcp's own binary is intact", "start the capture's reaper: %v", err)
 	}
 	r.reaper = reaper
-	r.events = reaper.Events()
+	r.evc = reaper.Events()
 	if r.spec.Events != nil {
-		r.events = r.spec.Events(r.events)
+		r.evc = r.spec.Events(r.evc)
 	}
 	size := max(ringFloor, 8*r.b.MaxOutputTail)
 	r.perfOut = r.read(reads[0], size, "perf-agent stdout", r.readiness)
@@ -324,17 +347,21 @@ func (r *Run) Cancel() { r.cancelOnce() }
 
 // Kill is the emergency end: it closes the reaper's command pipe, which
 // the reaper answers by killing both children and sweeping, as on a dead
-// server. It never blocks, and is safe from any goroutine and more than
-// once.
+// server. The capture is then cancelled, stopped when Kill was called,
+// whatever order the reaper's exits arrive in. It never blocks, and is
+// safe from any goroutine and more than once.
 func (r *Run) Kill() {
-	r.killed.Store(true)
+	now := time.Now()
+	r.killAt.CompareAndSwap(nil, &now)
 	r.reaper.Kill()
+	r.wakeKill()
 }
 
 // Wait blocks until the reaper reports its cleanup, or exits without
-// doing so, and returns how the capture ended. The captures lock may stay
-// held by the reaper after Wait returns, while a child it could not reap
-// lives; it is free once the reaper exits.
+// doing so, or does not answer a kill in time, and returns how the
+// capture ended. The captures lock may stay held by the reaper after Wait
+// returns, while a child it could not reap lives; it is free once the
+// reaper exits.
 func (r *Run) Wait() Outcome {
 	<-r.done
 	return r.outcome
@@ -369,17 +396,31 @@ func (r *Run) stop() {
 
 // earlyStop ends profiling before the duration: the stop point is now.
 func (r *Run) earlyStop(by string) {
-	r.markStopped(by, time.Since(r.readyAt))
+	r.markStopped(by, time.Now())
 	r.stop()
 }
 
-// markStopped fixes the stop point and starts the finish bound.
-func (r *Run) markStopped(by string, profiled time.Duration) {
+// failStop is a stop for a failure: the error is the cause, so StoppedBy
+// stays empty, and the stop point is now.
+func (r *Run) failStop(e *Error) {
+	r.markStopped("", time.Now())
+	r.fail(e)
+	r.stop()
+}
+
+// markStopped records the stop, once: the first stop wins. by is one of
+// the StoppedBy values, or empty for a failure. at is when it happened:
+// Profiled runs to it from the readiness line, and FinishTimeout counts
+// from it.
+func (r *Run) markStopped(by string, at time.Time) {
 	if r.stopped {
 		return
 	}
 	r.stopped = true
-	r.o.StoppedBy, r.o.Profiled = by, min(profiled, r.spec.Settings.Duration)
+	r.o.StoppedBy = by
+	if !r.readyAt.IsZero() && at.After(r.readyAt) {
+		r.o.Profiled = at.Sub(r.readyAt)
+	}
 	r.setPhase(PhaseFinishing)
 	if r.durationT != nil {
 		r.durationT.Stop()
@@ -387,7 +428,7 @@ func (r *Run) markStopped(by string, profiled time.Duration) {
 	if r.recheckT != nil {
 		r.recheckT.Stop()
 	}
-	r.finish = time.NewTimer(r.b.FinishTimeout)
+	r.finish = time.NewTimer(max(0, r.b.FinishTimeout-time.Since(at)))
 }
 
 // goneFirst says the target ended before perf-agent did. A launched
@@ -399,12 +440,12 @@ func (r *Run) goneFirst() bool {
 	if r.spec.Launch != nil {
 		return r.workExited
 	}
-	return r.targetIsGone || r.targetKnown && !Alive(r.spec.Proc, r.target.PID, r.target.StartTime)
+	return r.targetIsGone || r.pidGone()
 }
 
 // ranItsCourse is the stop of a perf-agent left to its duration: the
 // duration stopped it, unless the target was already gone, which then did.
-func (r *Run) ranItsCourse(gone bool, profiled time.Duration) {
+func (r *Run) ranItsCourse(gone bool, at time.Time) {
 	by := StoppedByDuration
 	switch {
 	case gone && r.spec.Launch != nil:
@@ -412,17 +453,47 @@ func (r *Run) ranItsCourse(gone bool, profiled time.Duration) {
 	case gone:
 		by = StoppedByTargetExit
 	}
-	r.markStopped(by, profiled)
+	r.markStopped(by, at)
 }
 
-// kill ends the capture through the reaper for a failed bound, once.
+// kill ends the capture through the reaper for a failed bound, once. The
+// error is the cause, so StoppedBy stays empty.
 func (r *Run) kill(e *Error) {
 	if r.killSent {
 		return
 	}
 	r.killSent = true
+	now := time.Now()
+	r.markStopped("", now)
 	r.fail(e)
 	r.reaper.Kill()
+	r.armUnresponsive(now)
+}
+
+// noticeKill takes up a Run.Kill: a cancel, stopped at the moment of the
+// call. It runs before anything else the loop handles, so an exit the
+// kill caused never decides the stop.
+func (r *Run) noticeKill() {
+	at := r.killAt.Load()
+	if at == nil || r.killNoticed {
+		return
+	}
+	r.killNoticed = true
+	r.markStopped(StoppedByCancel, *at)
+	r.fail(Errorf(CodeCancelled, "", "the capture was killed"))
+	r.armUnresponsive(*at)
+}
+
+// armUnresponsive bounds the wait for the reaper's report after a kill: it
+// should take StopGrace, and the reaper gets FinishTimeout and 5s more.
+func (r *Run) armUnresponsive(at time.Time) {
+	if r.unresponsiveT == nil {
+		r.unresponsiveT = time.NewTimer(max(0, r.unresponsiveAfter()-time.Since(at)))
+	}
+}
+
+func (r *Run) unresponsiveAfter() time.Duration {
+	return r.b.StopGrace + r.b.FinishTimeout + unresponsiveSlack
 }
 
 // profiling says the readiness line came and no stop yet.
@@ -438,7 +509,7 @@ func (r *Run) supervise() {
 	poll := time.NewTicker(r.b.Poll)
 	defer poll.Stop()
 	defer func() {
-		for _, t := range []*time.Timer{r.finish, r.durationT} {
+		for _, t := range []*time.Timer{r.finish, r.durationT, r.unresponsiveT} {
 			if t != nil {
 				t.Stop()
 			}
@@ -450,13 +521,12 @@ func (r *Run) supervise() {
 	if r.spec.PID > 0 {
 		r.attach(r.spec.PID)
 	}
-	var reaped *Event
-	cancel := r.cancel
+	cancel, killed := r.cancel, r.killCh
 	reaperDone := r.reaper.Done()
 	var gone <-chan time.Time
-	events := r.events
-	for events != nil {
-		var finish, duration, recheck <-chan time.Time
+	for r.evc != nil {
+		r.noticeKill()
+		var finish, duration, recheck, unresponsive <-chan time.Time
 		if r.finish != nil {
 			finish = r.finish.C
 		}
@@ -466,32 +536,20 @@ func (r *Run) supervise() {
 		if r.recheckT != nil {
 			recheck = r.recheckT.C
 		}
+		if r.unresponsiveT != nil {
+			unresponsive = r.unresponsiveT.C
+		}
 		select {
-		case ev, ok := <-events:
-			if !ok {
-				events = nil
-				break
-			}
-			if ev.Op == EventReaped {
-				reaped = &ev
-				events = nil
-				break
-			}
-			r.event(ev)
+		case ev, ok := <-r.evc:
+			r.handleEvent(ev, ok)
 		case t := <-r.ready:
 			r.readied(t)
 		case <-start.C:
-			if r.readyAt.IsZero() && !r.perfExited {
-				r.kill(Errorf(CodeStartTimeout, "raise --limit Capture.StartTimeout, or profile a smaller target",
-					"perf-agent did not start profiling within StartTimeout=%v", r.b.StartTimeout))
-			}
+			r.startExpired()
 		case <-duration:
-			r.ranItsCourse(r.goneFirst(), r.spec.Settings.Duration)
+			r.ranItsCourse(r.goneFirst(), r.readyAt.Add(r.spec.Settings.Duration))
 		case <-finish:
-			if !r.perfExited {
-				r.kill(Errorf(CodeFinishTimeout, "raise --limit Capture.FinishTimeout, or capture for less time",
-					"perf-agent did not finish within FinishTimeout=%v of the stop", r.b.FinishTimeout))
-			}
+			r.finishExpired()
 		case <-recheck:
 			if r.profiling() {
 				r.recheckTarget()
@@ -501,23 +559,88 @@ func (r *Run) supervise() {
 		case <-cancel:
 			cancel = nil
 			r.cancelled()
+		case <-killed:
+			killed = nil
 		case <-reaperDone:
 			reaperDone = nil
 			gone = time.After(reaperGone)
 		case <-gone:
-			events = nil
+			r.drainPending()
+			r.evc = nil
+		case <-unresponsive:
+			r.drainPending()
+			if r.evc != nil {
+				r.unresponsive, r.evc = true, nil
+			}
 		}
 	}
-	r.finishOutcome(reaped)
+	r.finishOutcome()
 	r.outcome = r.o
+}
+
+// handleEvent takes one item of the event stream; reaped, or its end,
+// ends the loop.
+func (r *Run) handleEvent(ev Event, ok bool) {
+	// An exit the kill caused must find the kill already decided.
+	r.noticeKill()
+	switch {
+	case !ok:
+		r.evc = nil
+	case ev.Op == EventReaped:
+		r.reaped, r.evc = &ev, nil
+	default:
+		r.event(ev)
+	}
+}
+
+// drainPending handles every event and readiness line already queued, so
+// a bound that expires decides on what has happened, not on which ready
+// channel a select picked first.
+func (r *Run) drainPending() {
+	for {
+		select {
+		case t := <-r.ready:
+			r.readied(t)
+			continue
+		default:
+		}
+		if r.evc == nil {
+			return
+		}
+		select {
+		case ev, ok := <-r.evc:
+			r.handleEvent(ev, ok)
+		default:
+			return
+		}
+	}
+}
+
+// startExpired is the start bound: perf-agent not profiling by
+// StartTimeout. A capture already stopping is left to its finish bound.
+func (r *Run) startExpired() {
+	r.drainPending()
+	if r.readyAt.IsZero() && !r.perfExited && !r.stopping() {
+		r.kill(Errorf(CodeStartTimeout, "raise --limit Capture.StartTimeout, or profile a smaller target",
+			"perf-agent did not start profiling within StartTimeout=%v", r.b.StartTimeout))
+	}
+}
+
+// finishExpired is the finish bound: perf-agent not done by FinishTimeout
+// after the stop.
+func (r *Run) finishExpired() {
+	r.drainPending()
+	if !r.perfExited && r.evc != nil {
+		r.kill(Errorf(CodeFinishTimeout, "raise --limit Capture.FinishTimeout, or capture for less time",
+			"perf-agent did not finish within FinishTimeout=%v of the stop", r.b.FinishTimeout))
+	}
 }
 
 // attach builds perf-agent's argv for pid and asks the reaper to start it.
 func (r *Run) attach(pid int) {
 	argv, err := BuildArgv(argvSpec(r.spec, pid))
 	if err != nil {
-		r.fail(Errorf(CodeInvalidArgument, "", "%v", err))
-		r.stop()
+		r.failStop(Errorf(CodeInvalidArgument, "", "%v", err))
 		return
 	}
 	r.o.Argv, r.argvPID = argv, pid
@@ -528,7 +651,7 @@ func (r *Run) attach(pid int) {
 
 // stopping says the capture is ending before perf-agent ran its course.
 func (r *Run) stopping() bool {
-	return r.o.Err != nil || r.stopSent || r.cancelSent || r.killSent || r.killed.Load()
+	return r.o.Err != nil || r.stopped || r.stopSent || r.cancelSent || r.killSent || r.killAt.Load() != nil
 }
 
 func (r *Run) event(ev Event) {
@@ -566,8 +689,7 @@ func (r *Run) launched(ev Event) {
 		if e.Code == CodeTargetExited || e.Code == CodeTargetNotFound {
 			e = r.commandEnded(ev.PID, "before it could be profiled: it exited at once, or never ran the command")
 		}
-		r.fail(e)
-		r.stop()
+		r.failStop(e)
 		return
 	}
 	r.target, r.targetKnown, r.o.Target, r.o.Launched = st, true, st, true
@@ -603,9 +725,10 @@ func (r *Run) commandEnded(pid int, how string) *Error {
 		"the launched command (pid %d) ended %s, %.1fs after the start", pid, how, time.Since(r.o.Started).Seconds())
 }
 
-// readied is the readiness line: the attach latency, the readiness
-// recheck, and the duration and recheck timers. A line that comes once the
-// capture is ending starts no profiling: readyAt stays zero.
+// readied is the readiness line: the attach latency, the duration and
+// recheck timers, and the readiness recheck, which runs before the phase
+// says profiling. A line that comes once the capture is ending starts no
+// profiling: readyAt stays zero.
 func (r *Run) readied(t time.Time) {
 	if !r.readyAt.IsZero() || r.stopping() {
 		return
@@ -614,10 +737,12 @@ func (r *Run) readied(t time.Time) {
 	if !r.attachFrom.IsZero() {
 		r.o.AttachLatency = t.Sub(r.attachFrom)
 	}
-	r.setPhase(PhaseProfiling)
 	r.durationT = time.NewTimer(r.spec.Settings.Duration - time.Since(t))
 	r.recheckT = time.NewTicker(r.b.Recheck)
 	r.recheckTarget()
+	if !r.stopped {
+		r.setPhase(PhaseProfiling)
+	}
 }
 
 // drainReady takes a readiness line that is already in, so an exit
@@ -630,39 +755,73 @@ func (r *Run) drainReady() {
 	}
 }
 
+// lateReadiness waits briefly, at perf-agent's exit, for a readiness line
+// still in its stdout pipe: the exit comes by another pipe and may
+// overtake it.
+func (r *Run) lateReadiness() {
+	if !r.readyAt.IsZero() {
+		return
+	}
+	select {
+	case t := <-r.ready:
+		r.readied(t)
+	case <-r.perfOut.done:
+		r.drainReady()
+	case <-time.After(lateReadiness):
+	}
+}
+
 // recheckTarget repeats the preflight: Observe, then Compare. A target
-// that is gone stops the capture; one that changed, or that can no longer
-// be observed while alive, fails it.
+// that is gone stops the capture; one that changed fails it.
 func (r *Run) recheckTarget() {
 	gone, e := r.observe()
 	switch {
 	case gone:
 		r.targetGone()
 	case e != nil:
-		r.fail(e)
-		r.stop()
+		r.failStop(e)
 	}
 }
 
 // observe compares the target with the preflight. gone is a target that
-// exited or no longer exists; a live one that cannot be observed is a
-// change ("unreadable").
+// has ended or no longer exists. A failure to read it that is not its end
+// is "cannot recheck": noted once, and the capture goes on.
 func (r *Run) observe() (gone bool, e *Error) {
 	if !r.targetKnown {
 		return false, nil
 	}
-	pid := r.target.PID
-	now, oe := Observe(r.spec.Proc, pid)
+	now, oe := Observe(r.spec.Proc, r.target.PID)
 	if oe != nil {
-		if !Alive(r.spec.Proc, pid, r.target.StartTime) {
+		if oe.Code == CodeTargetExited || oe.Code == CodeTargetNotFound {
 			return true, nil
 		}
-		return false, r.target.Compare(TargetState{})
+		r.cannotRecheck(oe)
+		return false, nil
 	}
-	if ce := r.target.Compare(now); ce != nil {
-		return false, ce
+	return false, r.target.Compare(now)
+}
+
+// cannotRecheck notes, once, that the target could not be read.
+func (r *Run) cannotRecheck(e *Error) {
+	if r.recheckNoted {
+		return
 	}
-	return false, nil
+	r.recheckNoted = true
+	r.o.Notes = append(r.o.Notes, fmt.Sprintf("pid %d could not be rechecked (%s); the capture went on without that check", r.target.PID, e.Message))
+}
+
+// pidGone says a PID target is no longer the live process the preflight
+// saw: it does not exist, has ended, or is another process now. A read
+// error that is not its end says nothing.
+func (r *Run) pidGone() bool {
+	if !r.targetKnown {
+		return false
+	}
+	s, err := readStat(r.spec.Proc, r.target.PID)
+	if err != nil {
+		return gone(err)
+	}
+	return s.start != r.target.StartTime || s.exited()
 }
 
 // targetGone handles a PID target that exited: before readiness it is
@@ -677,9 +836,8 @@ func (r *Run) targetGone() {
 	switch {
 	case r.readyAt.IsZero():
 		if !r.perfExited {
-			r.fail(Errorf(CodeTargetExited, "start it again", "pid %d exited before profiling began", r.spec.PID))
+			r.failStop(Errorf(CodeTargetExited, "start it again", "pid %d exited before profiling began", r.spec.PID))
 		}
-		r.stop()
 	case r.profiling():
 		r.earlyStop(StoppedByTargetExit)
 	}
@@ -695,9 +853,8 @@ func (r *Run) workDone() {
 	switch {
 	case r.readyAt.IsZero():
 		if !r.perfExited {
-			r.fail(r.commandEnded(r.work.pid, "before profiling began"))
+			r.failStop(r.commandEnded(r.work.pid, "before profiling began"))
 		}
-		r.stop()
 	case r.profiling():
 		r.earlyStop(StoppedByCommandExit)
 	}
@@ -706,11 +863,11 @@ func (r *Run) workDone() {
 // perfDone is perf-agent's exit; the end recheck runs while the target is
 // still there.
 func (r *Run) perfDone(ev Event) {
-	r.drainReady()
+	r.lateReadiness()
 	r.perfExited, r.perfStatus, r.perfSignal = true, ev.Status, ev.Signal
 	r.goneAtExit = r.goneFirst()
 	if r.profiling() {
-		r.ranItsCourse(r.goneAtExit, time.Since(r.readyAt))
+		r.ranItsCourse(r.goneAtExit, time.Now())
 	}
 	if r.finish != nil {
 		r.finish.Stop()
@@ -732,19 +889,16 @@ func (r *Run) reaperError(ev Event) {
 	case strings.HasPrefix(ev.Err, "the capture is ending"), strings.HasPrefix(ev.Err, "perf-agent was already started"):
 		return
 	case ev.Who == WhoWorkload:
-		r.fail(Errorf(CodeInvalidArgument, "check that command[0] is an executable file this user may run",
+		r.failStop(Errorf(CodeInvalidArgument, "check that command[0] is an executable file this user may run",
 			"the command could not be started: %s", cut(ev.Err, maxPathEcho)))
 	case ev.Who == WhoPerfAgent:
 		code, rest, ok := strings.Cut(ev.Err, ": ")
 		if _, known := DefaultRetryable[Code(code)]; ok && known {
-			r.fail(Errorf(Code(code), "", "%s", rest))
+			r.failStop(Errorf(Code(code), "", "%s", rest))
 		} else {
-			r.fail(Errorf(CodePerfAgentUnstartable, "check the perf-agent binary", "perf-agent could not start: %s", cut(ev.Err, maxPathEcho)))
+			r.failStop(Errorf(CodePerfAgentUnstartable, "check the perf-agent binary", "perf-agent could not start: %s", cut(ev.Err, maxPathEcho)))
 		}
-	default:
-		return
 	}
-	r.stop()
 }
 
 // poll checks the staging sizes while perf-agent writes, and whether a PID
@@ -756,15 +910,16 @@ func (r *Run) poll() {
 			return
 		}
 	}
-	if r.spec.PID > 0 && r.targetKnown && !r.targetIsGone && !Alive(r.spec.Proc, r.target.PID, r.target.StartTime) {
-		// Not the recorded live process: gone, or a reused pid.
-		if _, e := r.observe(); e != nil {
+	if r.spec.PID > 0 && !r.targetIsGone && r.pidGone() {
+		// Not the recorded live process: ended, or a reused pid.
+		gone, e := r.observe()
+		switch {
+		case e != nil:
 			r.targetIsGone = true
-			r.fail(e)
-			r.stop()
-			return
+			r.failStop(e)
+		case gone:
+			r.targetGone()
 		}
-		r.targetGone()
 	}
 }
 
@@ -789,14 +944,8 @@ func (r *Run) sizes() *Error {
 
 // cancelled relays the cancel to the reaper.
 func (r *Run) cancelled() {
+	r.markStopped(StoppedByCancel, time.Now())
 	r.fail(Errorf(CodeCancelled, "", "the capture was cancelled"))
-	if !r.stopped {
-		if r.readyAt.IsZero() {
-			r.markStopped(StoppedByCancel, 0)
-		} else {
-			r.markStopped(StoppedByCancel, time.Since(r.readyAt))
-		}
-	}
 	if !r.cancelSent {
 		r.cancelSent = true
 		r.send(Command{Op: OpCancel})
@@ -804,13 +953,20 @@ func (r *Run) cancelled() {
 }
 
 // finishOutcome turns the end into the Outcome: the tails, the exit
-// mapping, the survivors and the notes.
-func (r *Run) finishOutcome(reaped *Event) {
-	r.drainReady()
+// mapping, the survivors and the notes. The readers get readerDrain to
+// reach EOF, then their pipes are closed, so a survivor holding one open
+// keeps no reader behind; a readiness line they passed on by then still
+// counts.
+func (r *Run) finishOutcome() {
 	end := time.Now().Add(readerDrain)
-	for _, s := range []*stream{r.perfOut, r.perfErr, r.workOut, r.workErr} {
+	streams := []*stream{r.perfOut, r.perfErr, r.workOut, r.workErr}
+	for _, s := range streams {
 		s.wait(end)
 	}
+	for _, s := range streams {
+		s.detach()
+	}
+	r.drainReady()
 	stderr := r.perfErr.tail(r.b.MaxOutputTail)
 	if r.spec.Launch != nil {
 		r.o.Workload = Tail{Stdout: r.workOut.tail(r.b.MaxOutputTail), Stderr: r.workErr.tail(r.b.MaxOutputTail)}
@@ -818,13 +974,13 @@ func (r *Run) finishOutcome(reaped *Event) {
 	if r.perfExited && r.perfSignal == "" {
 		r.o.PerfAgentExit = r.perfStatus
 	}
-	if reaped == nil {
-		r.containmentLost()
-	} else {
-		r.o.Survivors, r.o.Cleanup = reaped.Survivors, reaped.Cleanup
-	}
-	if r.o.Err == nil && r.killed.Load() {
-		r.o.Err = Errorf(CodeCancelled, "", "the capture was killed")
+	switch {
+	case r.unresponsive:
+		r.lost(fmt.Sprintf("the capture's reaper is unresponsive: it reported no cleanup within %v of the kill", r.unresponsiveAfter()))
+	case r.reaped == nil:
+		r.lost("containment lost: the capture's reaper exited before it reported its cleanup")
+	default:
+		r.o.Survivors, r.o.Cleanup = r.reaped.Survivors, r.reaped.Cleanup
 	}
 	if r.o.Err == nil {
 		r.o.Err = r.exitError(stderr)
@@ -855,19 +1011,37 @@ func (r *Run) finishOutcome(reaped *Event) {
 	}
 }
 
-// containmentLost is a reaper gone without its report: whatever it
-// started may still run, and that is never a success.
-func (r *Run) containmentLost() {
-	const why = "containment lost: the capture's reaper exited before it reported its cleanup"
+// lost is a reaper that gave no report, gone or unresponsive: whatever it
+// started may still run, and that is never a success. The survivors are
+// what is known: perf-agent, the command and the command's cgroup.
+func (r *Run) lost(why string) {
 	r.o.Cleanup = "incomplete: " + why
 	r.o.Notes = append(r.o.Notes, why+"; perf-agent or the command may still be running")
-	for _, p := range []instance{r.perf, r.work} {
-		if p.pid > 0 && present(r.spec.Proc, p.pid, p.start) {
-			s := Survivor{PID: p.pid, StartTime: p.start}
-			if st, err := readStat(r.spec.Proc, p.pid); err == nil {
-				s.Comm, s.State = st.comm, string(st.state)
+	add := func(pid int, start uint64) {
+		for _, s := range r.o.Survivors {
+			if s.PID == pid {
+				return
 			}
-			r.o.Survivors = append(r.o.Survivors, s)
+		}
+		st, err := readStat(r.spec.Proc, pid)
+		if err != nil || st.start != start || !present(r.spec.Proc, pid, start) {
+			return
+		}
+		r.o.Survivors = append(r.o.Survivors, Survivor{PID: pid, Comm: st.comm, StartTime: start, State: string(st.state)})
+	}
+	for _, p := range []instance{r.perf, r.work} {
+		if p.pid > 0 {
+			add(p.pid, p.start)
+		}
+	}
+	if r.cgroup != "" {
+		if _, err := os.Stat(r.cgroup); err == nil {
+			r.o.Notes = append(r.o.Notes, fmt.Sprintf("the command's cgroup %s was not removed; it may still hold processes", r.cgroup))
+			for _, pid := range cgroupProcs(r.cgroup) {
+				if st, err := readStat(r.spec.Proc, pid); err == nil {
+					add(pid, st.start)
+				}
+			}
 		}
 	}
 	r.stuck(Errorf(CodeStuckChild, "do not retry; tell the user to look for leftover perf-agent or command processes", "%s", why))
@@ -975,12 +1149,13 @@ type stream struct {
 	mu   sync.Mutex
 	ring []byte
 	size int
+	f    *os.File
 	done chan struct{}
 }
 
 // read starts the reader of f. onLine sees each line until it returns true.
 func (r *Run) read(f *os.File, size int, name string, onLine func([]byte) bool) *stream {
-	s := &stream{size: size, done: make(chan struct{})}
+	s := &stream{size: size, f: f, done: make(chan struct{})}
 	debug := r.log.Enabled(context.Background(), slog.LevelDebug)
 	go func() {
 		defer close(s.done)
@@ -1046,6 +1221,10 @@ func (s *stream) add(b []byte) {
 	}
 	s.ring = append(s.ring, b...)
 }
+
+// detach closes the read end, which ends a reader still blocked on a pipe
+// that something else holds open.
+func (s *stream) detach() { _ = s.f.Close() }
 
 // wait waits for the reader's EOF until end.
 func (s *stream) wait(end time.Time) {

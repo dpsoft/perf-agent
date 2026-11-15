@@ -92,7 +92,7 @@ func New(cfg Config) (_ *Server, err error) {
 	if cfg.ProfilesDir == "" {
 		return nil, errors.New("perfmcp: Config.ProfilesDir is required: the directory profiles are read from")
 	}
-	lim := cfg.Limits.withDefaults()
+	lim, fitted := cfg.Limits.resolve()
 	if err := lim.validate(cfg.Live); err != nil {
 		return nil, err
 	}
@@ -107,6 +107,9 @@ func New(cfg Config) (_ *Server, err error) {
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
+	}
+	for _, c := range fitted {
+		s.log.Info("capture limit fitted", "limit", c.field, "default", c.from, "now", c.to, "fits", c.fits)
 	}
 	defer func() {
 		if err != nil {

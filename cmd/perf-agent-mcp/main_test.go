@@ -561,6 +561,18 @@ func TestRunAcceptsLoweredM2LimitsAlone(t *testing.T) {
 	}
 }
 
+// A tiny MaxResponseBytes alone still starts the server, and the tail it
+// lowered is named on stderr.
+func TestRunAcceptsATinyResponseLimit(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxResponseBytes=8"}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "limit=Capture.MaxOutputTail default=2048 now=1") {
+		t.Errorf("stderr %q does not name the lowered tail", errb.String())
+	}
+}
+
 func TestRunSaysOutOfRangeLimits(t *testing.T) {
 	var out, errb bytes.Buffer
 	code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxRows=99999999999999999999"}, strings.NewReader(""), &out, &errb)

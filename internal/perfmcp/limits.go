@@ -21,8 +21,9 @@ import (
 // MaxHistoryBytes, MaxPublications, MaxRetainedBytes, MaxPageClients and
 // Source are filled in when zero, and Capture when all of it is zero. Any
 // other non-positive field is refused (Capture.TTL may be zero). A capture
-// limit left at its default follows the limit it depends on downwards
-// (see CaptureLimits), so lowering that limit alone is never refused.
+// limit left at its default follows the limit it depends on (see
+// CaptureLimits), so lowering that limit alone is never refused; New logs
+// each one it moves.
 type Limits struct {
 	// Model bounds every profile and executions log the server loads.
 	Model profilemodel.Limits
@@ -93,8 +94,10 @@ type Limits struct {
 // MaxExeclogBytes at most Model.MaxRawBytes and Model.MaxSidecarBytes,
 // WindowDuration at least MaxDuration, MaxStoredBytes at least one
 // capture's files, and four tails at most a quarter of MaxResponseBytes.
-// Where one of them is left at its default, it is lowered to fit instead,
-// so a value equal to the default follows the limit it depends on.
+// Where one of them is left at its default, it is moved to fit instead, so
+// a value equal to the default follows the limit it depends on: lowered,
+// or for MaxStoredBytes raised to hold the largest capture's files. New
+// logs each limit it moves, with its default and the value it now has.
 type CaptureLimits struct {
 	// MaxDuration is the longest capture (at most 5 min).
 	MaxDuration time.Duration
@@ -226,8 +229,21 @@ func DefaultLimits() Limits {
 
 // withDefaults is l with the zero parts New fills in.
 func (l Limits) withDefaults() Limits {
+	l, _ = l.resolve()
+	return l
+}
+
+// limitChange is a capture limit fit moved from its default to fit the
+// limit it depends on.
+type limitChange struct {
+	field, fits string
+	from, to    int64
+}
+
+// resolve is withDefaults, with the capture limits fit moved.
+func (l Limits) resolve() (Limits, []limitChange) {
 	if l == (Limits{}) {
-		return DefaultLimits()
+		l = DefaultLimits()
 	}
 	if l.Model == (profilemodel.Limits{}) {
 		l.Model = profilemodel.DefaultLimits()
@@ -274,27 +290,38 @@ func (l Limits) withDefaults() Limits {
 	if l.Capture == (CaptureLimits{}) {
 		l.Capture = defaultCaptureLimits(l.Model)
 	}
-	l.Capture = l.Capture.fit(l)
-	return l
+	var changes []limitChange
+	l.Capture, changes = l.Capture.fit(l)
+	return l, changes
 }
 
-// fit lowers the capture limits left at their defaults to what the limits
-// they depend on allow.
-func (c CaptureLimits) fit(l Limits) CaptureLimits {
+// fit moves the capture limits left at their defaults to fit the limits
+// they depend on, and says which it moved: CompareRows, MaxProfileBytes,
+// MaxExeclogBytes and MaxOutputTail are lowered, then MaxStoredBytes is
+// raised to hold the largest capture's files.
+func (c CaptureLimits) fit(l Limits) (CaptureLimits, []limitChange) {
 	def := defaultCaptureLimits(profilemodel.DefaultLimits())
-	if c.CompareRows == def.CompareRows {
-		c.CompareRows = min(c.CompareRows, l.MaxDiffRows)
+	var changes []limitChange
+	fitTo(&changes, "Capture.CompareRows", "MaxDiffRows", &c.CompareRows, def.CompareRows, min(def.CompareRows, l.MaxDiffRows))
+	fitTo(&changes, "Capture.MaxProfileBytes", "Model.MaxRawBytes", &c.MaxProfileBytes, def.MaxProfileBytes, min(def.MaxProfileBytes, l.Model.MaxRawBytes))
+	fitTo(&changes, "Capture.MaxExeclogBytes", "Model.MaxSidecarBytes", &c.MaxExeclogBytes, def.MaxExeclogBytes, min(def.MaxExeclogBytes, l.Model.MaxSidecarBytes))
+	fitTo(&changes, "Capture.MaxOutputTail", "MaxResponseBytes", &c.MaxOutputTail, def.MaxOutputTail, fittedTail(l))
+	fitTo(&changes, "Capture.MaxStoredBytes", "Capture.MaxProfileBytes + Capture.MaxExeclogBytes", &c.MaxStoredBytes, def.MaxStoredBytes, max(def.MaxStoredBytes, c.MaxProfileBytes+c.MaxExeclogBytes))
+	return c, changes
+}
+
+// fitTo sets *v to to when it is at its default def, recording the move.
+func fitTo[T int | int64](changes *[]limitChange, field, fits string, v *T, def, to T) {
+	if *v == def && to != def {
+		*changes = append(*changes, limitChange{field: field, fits: fits, from: int64(def), to: int64(to)})
+		*v = to
 	}
-	if c.MaxProfileBytes == def.MaxProfileBytes {
-		c.MaxProfileBytes = min(c.MaxProfileBytes, l.Model.MaxRawBytes)
-	}
-	if c.MaxExeclogBytes == def.MaxExeclogBytes {
-		c.MaxExeclogBytes = min(c.MaxExeclogBytes, l.Model.MaxSidecarBytes)
-	}
-	if c.MaxOutputTail == def.MaxOutputTail {
-		c.MaxOutputTail = min(c.MaxOutputTail, max(l.MaxResponseBytes/(4*maxTailsPerResult), 1))
-	}
-	return c
+}
+
+// fittedTail is MaxOutputTail's default lowered to fit l.MaxResponseBytes:
+// the tails take at most a quarter of it, and each is at least a byte.
+func fittedTail(l Limits) int {
+	return min(defaultCaptureLimits(profilemodel.DefaultLimits()).MaxOutputTail, max(l.MaxResponseBytes/(4*maxTailsPerResult), 1))
 }
 
 // maxTailsPerResult is how many output tails one capture result carries
@@ -407,7 +434,9 @@ func (c CaptureLimits) validate(l Limits) error {
 	case c.MaxStoredBytes < c.MaxProfileBytes+c.MaxExeclogBytes:
 		return fmt.Errorf("perfmcp: limit Capture.MaxStoredBytes is %d, under Capture.MaxProfileBytes + Capture.MaxExeclogBytes (%d): the largest capture would not fit",
 			c.MaxStoredBytes, c.MaxProfileBytes+c.MaxExeclogBytes)
-	case maxTailsPerResult*c.MaxOutputTail > l.MaxResponseBytes/4:
+	// A tail at its fitted default is as small as fit makes it: under 16
+	// bytes of response it is one byte, and not refused.
+	case maxTailsPerResult*c.MaxOutputTail > l.MaxResponseBytes/4 && c.MaxOutputTail != fittedTail(l):
 		return fmt.Errorf("perfmcp: limit Capture.MaxOutputTail is %d: %d tails take %d bytes, over a quarter of MaxResponseBytes (%d), which must leave room for the rest of a result",
 			c.MaxOutputTail, maxTailsPerResult, maxTailsPerResult*c.MaxOutputTail, l.MaxResponseBytes/4)
 	}

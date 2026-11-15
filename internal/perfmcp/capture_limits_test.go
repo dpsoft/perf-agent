@@ -1,8 +1,10 @@
 package perfmcp
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -325,7 +327,7 @@ func TestCaptureLimitsCrossFieldChecks(t *testing.T) {
 		{"execlog over the model", func(l *Limits) { l.Capture.MaxExeclogBytes = l.Model.MaxSidecarBytes + 1 }, []string{"Capture.MaxExeclogBytes", "Model.MaxSidecarBytes"}},
 		{"window under one capture", func(l *Limits) { l.Capture.WindowDuration = l.Capture.MaxDuration - time.Second }, []string{"Capture.WindowDuration", "Capture.MaxDuration"}},
 		{"store under one capture", func(l *Limits) { l.Capture.MaxStoredBytes = 300 << 20 }, []string{"Capture.MaxStoredBytes", "Capture.MaxProfileBytes", "Capture.MaxExeclogBytes"}},
-		{"tails over the response", func(l *Limits) { l.Capture.MaxOutputTail = 16 << 10; l.MaxResponseBytes = 256 << 10 - 1 }, []string{"Capture.MaxOutputTail", "MaxResponseBytes"}},
+		{"tails over the response", func(l *Limits) { l.Capture.MaxOutputTail = 16 << 10; l.MaxResponseBytes = 256<<10 - 1 }, []string{"Capture.MaxOutputTail", "MaxResponseBytes"}},
 		{"explicit compare rows", func(l *Limits) { l.MaxDiffRows = 10; l.Capture.CompareRows = 15 }, []string{"Capture.CompareRows", "MaxDiffRows"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -353,5 +355,89 @@ func TestANegativeTTLSaysNotNegative(t *testing.T) {
 	cfg.Limits.Capture.TTL = -time.Second
 	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "must not be negative") {
 		t.Errorf("New = %v", err)
+	}
+}
+
+// With a raised Model and a zero Capture, the store left at its default
+// grows to hold the largest capture, so the defaults never trip their own
+// rule.
+func TestCaptureLimitsDefaultStoreHoldsTheLargestCapture(t *testing.T) {
+	model := profilemodel.DefaultLimits()
+	model.MaxRawBytes, model.MaxSidecarBytes = 4<<30, 1<<30
+	cfg := testConfig(t)
+	cfg.Limits = Limits{Model: model, MaxMessageBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxOpenHandles: 4}
+	s := must(New(cfg))(t)
+	defer func() { _ = s.Close() }()
+	if got, want := s.lim.Capture.MaxStoredBytes, int64(5<<30); got != want {
+		t.Errorf("MaxStoredBytes %d, want %d", got, want)
+	}
+	// Under the default it stays 4 GiB.
+	if got := DefaultLimits().withDefaults().Capture.MaxStoredBytes; got != 4<<30 {
+		t.Errorf("default MaxStoredBytes %d", got)
+	}
+}
+
+// A tail left at its default is lowered to fit any MaxResponseBytes, so
+// lowering that limit alone is never refused; an explicit tail is still
+// checked against it.
+func TestCaptureLimitsDefaultTailFitsATinyResponse(t *testing.T) {
+	for _, n := range []int{1, 8, 15, 16, 64} {
+		l := DefaultLimits()
+		l.MaxResponseBytes = n
+		cfg := testConfig(t)
+		cfg.Limits = l
+		s, err := New(cfg)
+		if err != nil {
+			t.Errorf("MaxResponseBytes %d: %v", n, err)
+			continue
+		}
+		if s.lim.Capture.MaxOutputTail != max(n/16, 1) {
+			t.Errorf("MaxResponseBytes %d: MaxOutputTail %d", n, s.lim.Capture.MaxOutputTail)
+		}
+		_ = s.Close()
+	}
+	l := DefaultLimits()
+	l.MaxResponseBytes, l.Capture.MaxOutputTail = 8, 2
+	cfg := testConfig(t)
+	cfg.Limits = l
+	if s, err := New(cfg); err == nil {
+		_ = s.Close()
+		t.Error("an explicit tail of 2 with MaxResponseBytes 8 was accepted")
+	}
+}
+
+// Each capture limit fit moves from its default is logged once, naming
+// the field, its default and the value it now has; none is logged when
+// nothing moves.
+func TestCaptureLimitsFitIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	l := DefaultLimits()
+	l.MaxDiffRows = 10
+	l.MaxResponseBytes = 1024
+	cfg := testConfig(t)
+	cfg.Limits = l
+	cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	s := must(New(cfg))(t)
+	_ = s.Close()
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var fitted []string
+	for _, line := range lines {
+		if strings.Contains(line, "fitted") {
+			fitted = append(fitted, line)
+		}
+	}
+	if len(fitted) != 2 ||
+		!strings.Contains(fitted[0], "limit=Capture.CompareRows default=20 now=10") ||
+		!strings.Contains(fitted[1], "limit=Capture.MaxOutputTail default=2048 now=64") {
+		t.Errorf("log:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	cfg = testConfig(t)
+	cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	s = must(New(cfg))(t)
+	_ = s.Close()
+	if strings.Contains(buf.String(), "fitted") {
+		t.Errorf("defaults logged a fit:\n%s", buf.String())
 	}
 }

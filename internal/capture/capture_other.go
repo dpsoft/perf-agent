@@ -21,3 +21,24 @@ func VerifyShim(string) (Shim, error) { return Shim{}, notLinux() }
 
 // ReadSelfStatus is disabled: capture needs Linux.
 func ReadSelfStatus() ([]byte, error) { return nil, notLinux() }
+
+// StartTime is disabled: capture needs Linux.
+func StartTime(Proc, int) (uint64, error) { return 0, notLinux() }
+
+// Alive is disabled: capture needs Linux.
+func Alive(Proc, int, uint64) bool { return false }
+
+// Preflight is disabled: capture needs Linux.
+func Preflight(Proc, int, SelfID) (TargetState, *Error) { return TargetState{}, notLinux() }
+
+// Compare is disabled: capture needs Linux.
+func (TargetState) Compare(TargetState) *Error { return notLinux() }
+
+// ReadBuildID is disabled: capture needs Linux.
+func ReadBuildID(Proc, int) string { return "" }
+
+// CheckShimMapped is disabled: capture needs Linux.
+func CheckShimMapped(Proc, int, Shim) *Error { return notLinux() }
+
+// CheckCommandFile is disabled: capture needs Linux.
+func CheckCommandFile(string) *Error { return notLinux() }

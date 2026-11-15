@@ -23,6 +23,14 @@ import (
 // instead of the tests.
 const testChildEnv = "PERFMCP_TEST_CHILD"
 
+// The environment the hold-lock child reads, and the lease it keeps.
+const (
+	testLockDirEnv      = "PERFMCP_TEST_LOCK_DIR"
+	testLockDeadlineEnv = "PERFMCP_TEST_LOCK_DEADLINE"
+)
+
+var heldLease *Lease
+
 // testChildBodies are the helper children. Each prints one line once it is
 // set up ("ready", or "skip <reason>" when the host cannot give it the
 // state the test needs), then lives until its stdin reaches EOF. The
@@ -48,6 +56,21 @@ var testChildBodies = map[string]func() string{
 			fmt.Println("dropped")
 		}()
 		return "ready"
+	},
+	// hold-lock takes the captures lock in testLockDirEnv for the life of
+	// the child and prints "held".
+	"hold-lock": func() string {
+		root, err := os.OpenRoot(os.Getenv(testLockDirEnv))
+		if err != nil {
+			return "skip " + err.Error()
+		}
+		deadline, _ := time.Parse(time.RFC3339, os.Getenv(testLockDeadlineEnv))
+		l, e := TryLock(root, Holder{ServerPID: os.Getpid(), CaptureID: "cap/001", Deadline: deadline})
+		if e != nil {
+			return "skip " + e.Error()
+		}
+		heldLease = l
+		return "held"
 	},
 	"setresgid": func() string {
 		egid := os.Getegid()
@@ -144,12 +167,20 @@ type testChild struct {
 // ends, if the test has not reaped it.
 func startChild(t *testing.T, mode string) *testChild {
 	t.Helper()
+	return startChildWith(t, mode, nil, nil)
+}
+
+// startChildWith is startChild with extra environment entries and
+// descriptors, which the child receives from fd 3 on.
+func startChildWith(t *testing.T, mode string, env []string, extra []*os.File) *testChild {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(self)
-	cmd.Env = append(os.Environ(), testChildEnv+"="+mode)
+	cmd.Env = append(append(os.Environ(), testChildEnv+"="+mode), env...)
+	cmd.ExtraFiles = extra
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

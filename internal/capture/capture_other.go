@@ -2,7 +2,10 @@
 
 package capture
 
-import "io/fs"
+import (
+	"io/fs"
+	"os"
+)
 
 // Supported reports whether capture can run on this platform.
 const Supported = false
@@ -53,3 +56,18 @@ func CheckCommandFile(string) *Error { return notLinux() }
 func executableHere() func(fs.FileInfo) bool {
 	return func(fi fs.FileInfo) bool { return fi.Mode()&0o111 != 0 }
 }
+
+// Lease is the captures lock, which needs Linux.
+type Lease struct{}
+
+// TryLock is disabled: capture needs Linux.
+func TryLock(*os.Root, Holder) (*Lease, *Error) { return nil, notLinux() }
+
+// File is disabled: capture needs Linux.
+func (*Lease) File() *os.File { return nil }
+
+// Update is disabled: capture needs Linux.
+func (*Lease) Update(Holder) error { return notLinux() }
+
+// Close is disabled: capture needs Linux.
+func (*Lease) Close() error { return nil }

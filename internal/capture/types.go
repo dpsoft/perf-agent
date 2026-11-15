@@ -1,5 +1,7 @@
 package capture
 
+import "time"
+
 // Identity pins a file's contents and attributes, so a change after
 // verification is seen before the next exec. Mtime and Ctime are in
 // nanoseconds; Xattr is the SHA-256 of the raw security.capability value,
@@ -67,4 +69,18 @@ type TargetState struct {
 	Comm, Exe   string
 	BuildID     string
 	ExeReadable bool
+}
+
+// Holder is what the captures lock file records about the capture that
+// holds it: the server and the reaper, each by PID and start time, the
+// capture and its series, and the latest time it can end. A reader judges
+// a process gone only when both its PID and start time no longer match.
+type Holder struct {
+	ServerPID   int       `json:"server_pid"`
+	ServerStart uint64    `json:"server_start"`
+	ReaperPID   int       `json:"reaper_pid"`
+	ReaperStart uint64    `json:"reaper_start"`
+	CaptureID   string    `json:"capture_id"`
+	Series      string    `json:"series"`
+	Deadline    time.Time `json:"deadline"`
 }

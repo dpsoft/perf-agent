@@ -70,9 +70,25 @@ func RunInternal() (code int, handled bool) {
 		}
 		return launch(l), true
 	}
-	var s ReaperSpec
-	err := readSpec(spec, &s)
-	return runReaper(s, err), true
+	var w reaperWire
+	err := readSpec(spec, &w)
+	return runReaper(w, err), true
+}
+
+// reaperWire is what fd 3 carries to a reaper: the spec, and which of the
+// slots from fd 6 on (lock, perf-agent stdout and stderr, workload stdout
+// and stderr) carry a real file rather than the null device.
+type reaperWire struct {
+	Spec    ReaperSpec
+	Present uint8
+}
+
+// slot returns fd as a file when the wire says it carries one.
+func (w reaperWire) slot(fd int, name string) *os.File {
+	if w.Present&(1<<(fd-lockFD)) == 0 {
+		return nil
+	}
+	return os.NewFile(uintptr(fd), name)
 }
 
 func readSpec(f *os.File, v any) error {
@@ -80,32 +96,46 @@ func readSpec(f *os.File, v any) error {
 	return json.NewDecoder(io.LimitReader(f, maxSpec)).Decode(v)
 }
 
-// inherited wraps fd when it is open; a descriptor the server passed as nil
-// is closed here.
-func inherited(fd int, name string) *os.File {
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
-		return nil
-	}
-	return os.NewFile(uintptr(fd), name)
-}
+// oCloexec is O_CLOEXEC as /proc/<pid>/fdinfo prints it, in octal.
+const oCloexec = 0o2000000
 
-// closeOnExecInherited marks every inherited descriptor from fd 4 on
+// closeOnExecInherited marks the inherited descriptors 4 to 10
 // close-on-exec, so no child inherits the lock or another child's pipes;
-// each child is handed exactly its own through os/exec.
+// each child is handed exactly its own through os/exec. A descriptor
+// above 10 without close-on-exec was leaked to the reaper by whatever
+// started the server, and is closed; the runtime's own all have the flag.
 func closeOnExecInherited() {
+	for fd := cmdFD; fd <= workErrFD; fd++ {
+		syscall.CloseOnExec(fd)
+	}
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
-		for fd := cmdFD; fd <= workErrFD; fd++ {
-			syscall.CloseOnExec(fd)
-		}
 		return
 	}
 	for _, e := range ents {
-		if fd, err := strconv.Atoi(e.Name()); err == nil && fd >= cmdFD {
-			syscall.CloseOnExec(fd)
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil || fd <= workErrFD {
+			continue
+		}
+		if flags, ok := fdFlags(fd); ok && flags&oCloexec == 0 {
+			_ = syscall.Close(fd)
 		}
 	}
+}
+
+// fdFlags reads a descriptor's open flags from /proc/self/fdinfo.
+func fdFlags(fd int) (int64, bool) {
+	b, err := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(fd))
+	if err != nil {
+		return 0, false
+	}
+	for line := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(line, "flags:"); ok {
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 8, 64)
+			return n, err == nil
+		}
+	}
+	return 0, false
 }
 
 // reaper is the reaper process's state. The main goroutine owns everything
@@ -167,21 +197,22 @@ func (w *eventWriter) publish(ev Event) {
 	}
 }
 
-func runReaper(spec ReaperSpec, specErr error) int {
+func runReaper(w reaperWire, specErr error) int {
 	closeOnExecInherited()
 	// A non-blocking descriptor goes through the poller, which gives event
 	// writes their deadline.
 	_ = syscall.SetNonblock(eventFD, true)
+	spec := w.Spec
 	r := &reaper{
 		spec:    spec,
 		self:    os.Getpid(),
 		proc:    DefaultProc(),
-		out:     eventWriter{f: inherited(eventFD, "events")},
-		lock:    inherited(lockFD, "lock"),
-		perfOut: inherited(perfOutFD, "perf-agent stdout"),
-		perfErr: inherited(perfErrFD, "perf-agent stderr"),
-		workOut: inherited(workOutFD, "workload stdout"),
-		workErr: inherited(workErrFD, "workload stderr"),
+		out:     eventWriter{f: os.NewFile(eventFD, "events")},
+		lock:    w.slot(lockFD, "lock"),
+		perfOut: w.slot(perfOutFD, "perf-agent stdout"),
+		perfErr: w.slot(perfErrFD, "perf-agent stderr"),
+		workOut: w.slot(workOutFD, "workload stdout"),
+		workErr: w.slot(workErrFD, "workload stderr"),
 		live:    map[int]bool{},
 		exits:   make(chan exitNote, 4),
 		starts:  map[int]uint64{},
@@ -208,7 +239,7 @@ func (r *reaper) run() int {
 	sigchld := make(chan os.Signal, 1)
 	signal.Notify(sigchld, syscall.SIGCHLD)
 	go r.waitLoop(sigchld)
-	r.cmds = readCommands(inherited(cmdFD, "commands"))
+	r.cmds = readCommands(os.NewFile(cmdFD, "commands"))
 	deadline := time.NewTimer(r.spec.Deadline)
 	defer deadline.Stop()
 	r.deadline = deadline.C

@@ -38,6 +38,12 @@ const eventBuffer = 64
 // it is in its own session, has no parent-death signal (it must outlive a
 // dead server) and its stdio is the null device. A goroutine waits for it.
 func StartReaper(self string, spec ReaperSpec, f ReaperFiles) (*Reaper, error) {
+	return startReaper(self, spec, f, nil)
+}
+
+// startReaper is StartReaper with more descriptors from fd 11 on, which a
+// test uses to check that the reaper closes strays.
+func startReaper(self string, spec ReaperSpec, f ReaperFiles, more []*os.File) (*Reaper, error) {
 	if !filepath.IsAbs(self) {
 		return nil, fmt.Errorf("the server's own path %q is not absolute", self)
 	}
@@ -47,7 +53,25 @@ func StartReaper(self string, spec ReaperSpec, f ReaperFiles) (*Reaper, error) {
 	if spec.StopGrace < 0 {
 		return nil, errors.New("a reaper's stop grace cannot be negative")
 	}
-	b, err := json.Marshal(spec)
+	// No slot is left empty: a closed one would be taken by the reaper's
+	// runtime for its own files (cpu.max, an eventfd) before the reaper
+	// runs, and look inherited. A missing file is the null device, and the
+	// wire says which slots carry a real one.
+	slots := []*os.File{f.Lock, f.PerfOut, f.PerfErr, f.WorkOut, f.WorkErr}
+	w := reaperWire{Spec: spec}
+	for i, sf := range slots {
+		if sf != nil {
+			w.Present |= 1 << i
+			continue
+		}
+		null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = null.Close() }()
+		slots[i] = null
+	}
+	b, err := json.Marshal(w)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +92,7 @@ func StartReaper(self string, spec ReaperSpec, f ReaperFiles) (*Reaper, error) {
 	specR, specW, cmdR, cmdW, evR, evW := ends[0], ends[1], ends[2], ends[3], ends[4], ends[5]
 	// fd 3 the spec, 4 commands, 5 events, 6 the lock, 7 and 8 perf-agent's
 	// output, 9 and 10 the workload's.
-	extra := []*os.File{specR, cmdR, evW, f.Lock, f.PerfOut, f.PerfErr, f.WorkOut, f.WorkErr}
+	extra := append(append([]*os.File{specR, cmdR, evW}, slots...), more...)
 	proc, err := startReaperProcess(self, extra)
 	// The reaper has its copies; holding these would hide its EOFs.
 	closeAll(specR, cmdR, evW)

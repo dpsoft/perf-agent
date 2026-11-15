@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -60,7 +61,19 @@ type harness struct {
 	exitArm string
 }
 
+// harnessOpts varies how the reaper is started: noFiles passes no output
+// pipes and no lock, and more are extra descriptors from fd 11 on.
+type harnessOpts struct {
+	noFiles bool
+	more    []*os.File
+}
+
 func startHarness(t *testing.T, spec ReaperSpec) *harness {
+	t.Helper()
+	return startHarnessOpts(t, spec, harnessOpts{})
+}
+
+func startHarnessOpts(t *testing.T, spec ReaperSpec, o harnessOpts) *harness {
 	t.Helper()
 	capturetest.SkipIfPrivileged(t)
 	self, err := os.Executable()
@@ -89,8 +102,12 @@ func startHarness(t *testing.T, spec ReaperSpec) *harness {
 			t.Fatal(err)
 		}
 	}
-	r, err := StartReaper(self, spec, ReaperFiles{Lock: lease.File(),
-		PerfOut: writes[0], PerfErr: writes[1], WorkOut: writes[2], WorkErr: writes[3]})
+	files := ReaperFiles{Lock: lease.File(),
+		PerfOut: writes[0], PerfErr: writes[1], WorkOut: writes[2], WorkErr: writes[3]}
+	if o.noFiles {
+		files = ReaperFiles{}
+	}
+	r, err := startReaper(self, spec, files, o.more)
 	for _, w := range writes {
 		_ = w.Close()
 	}
@@ -345,7 +362,7 @@ func TestReaperRunsPerfAgentWithTheExactEnvironment(t *testing.T) {
 		t.Errorf("exited = %+v, want status 0", ex)
 	}
 	rp := h.waitFor(EventReaped, "", 10*time.Second)
-	if rp.Cleanup != CleanupComplete || len(rp.Survivors) != 0 {
+	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
 		t.Errorf("reaped = %+v, want complete", rp)
 	}
 	if got, want := ops(h.rest(10*time.Second)), []string{"attached perf-agent", "exited perf-agent", "reaped"}; !slices.Equal(got, want) {
@@ -404,7 +421,7 @@ func TestReaperIsInItsOwnSession(t *testing.T) {
 		t.Errorf("reaper tty_nr = %s, want no controlling terminal", f[4])
 	}
 	h.r.Kill()
-	if rp := h.waitFor(EventReaped, "", 10*time.Second); rp.Cleanup != CleanupComplete {
+	if rp := h.waitFor(EventReaped, "", 10*time.Second); !CleanupIsComplete(rp.Cleanup) {
 		t.Errorf("reaped = %+v", rp)
 	}
 	h.waitDone(10 * time.Second)
@@ -466,7 +483,7 @@ func TestTheLauncherSetsNoNewPrivsAfterExec(t *testing.T) {
 				t.Errorf("workload exited %+v", ex)
 			}
 			h.send(Command{Op: OpStop})
-			if rp := h.waitFor(EventReaped, "", 10*time.Second); rp.Cleanup != CleanupComplete {
+			if rp := h.waitFor(EventReaped, "", 10*time.Second); !CleanupIsComplete(rp.Cleanup) {
 				t.Errorf("reaped = %+v", rp)
 			}
 			h.waitDone(10 * time.Second)
@@ -501,7 +518,7 @@ func TestReaperKillsOnEOF(t *testing.T) {
 			closed := time.Now()
 			h.r.closeCommands()
 			rp := h.waitFor(EventReaped, "", spec.StopGrace+slack)
-			if rp.Cleanup != CleanupComplete || len(rp.Survivors) != 0 {
+			if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
 				t.Errorf("reaped = %+v", rp)
 			}
 			if !groupGone(at.PGID) || !groupGone(wl.PGID) {
@@ -533,7 +550,7 @@ func TestReaperKillsAtTheAbsoluteDeadline(t *testing.T) {
 	if d := time.Since(began); d < spec.Deadline {
 		t.Errorf("reaped after %v, before the deadline %v", d, spec.Deadline)
 	}
-	if rp.Cleanup != CleanupComplete {
+	if !CleanupIsComplete(rp.Cleanup) {
 		t.Errorf("reaped = %+v", rp)
 	}
 	if !groupGone(at.PGID) || !groupGone(wl.PGID) {
@@ -577,7 +594,7 @@ func TestReaperEndsTheWorkloadAfterPerfAgent(t *testing.T) {
 			h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
 			h.send(attach(spec, "300ms", t.TempDir()))
 			rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-			if rp.Cleanup != CleanupComplete {
+			if !CleanupIsComplete(rp.Cleanup) {
 				t.Errorf("reaped = %+v", rp)
 			}
 			got := ops(h.all())
@@ -610,7 +627,7 @@ func TestReaperSweepsSetsidGrandchildren(t *testing.T) {
 			rp := h.waitFor(EventReaped, "", 10*time.Second+2*spec.StopGrace)
 			h.waitDone(10 * time.Second)
 			if pause == "" {
-				if rp.Cleanup != CleanupComplete || gc.alive() {
+				if !CleanupIsComplete(rp.Cleanup) || gc.alive() {
 					t.Errorf("reaped = %+v; grandchild alive %v", rp, gc.alive())
 				}
 				return
@@ -653,7 +670,7 @@ func TestKillLeavesTheReaperToCleanUp(t *testing.T) {
 	if d := time.Since(killed); d > spec.StopGrace+500*time.Millisecond {
 		t.Logf("reaped %v after Kill (StopGrace %v)", d, spec.StopGrace)
 	}
-	if rp.Cleanup != CleanupComplete || len(rp.Survivors) != 0 {
+	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
 		t.Errorf("reaped = %+v", rp)
 	}
 	if gc.alive() {
@@ -809,7 +826,7 @@ func TestReaperKillsTheCgroup(t *testing.T) {
 	}
 	h.send(attach(spec, "300ms", t.TempDir()))
 	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-	if rp.Cleanup != CleanupComplete || len(rp.Survivors) != 0 {
+	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
 		t.Errorf("reaped = %+v", rp)
 	}
 	if gc.alive() {
@@ -846,7 +863,7 @@ func TestACgroupStartFailureFallsBack(t *testing.T) {
 	h.send(attach(spec, "200ms", t.TempDir()))
 	h.waitFor(EventExited, WhoPerfAgent, 10*time.Second)
 	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-	if rp.Cleanup != CleanupComplete {
+	if !CleanupIsComplete(rp.Cleanup) {
 		t.Errorf("reaped = %+v", rp)
 	}
 	h.waitDone(10 * time.Second)
@@ -985,4 +1002,53 @@ func TestReaperRefusesARelativePath(t *testing.T) {
 	h.send(Command{Op: OpStop})
 	h.waitFor(EventReaped, "", 10*time.Second)
 	h.waitDone(10 * time.Second)
+}
+
+// A reaper started without output pipes or a lock gets the null device in
+// those slots, never a descriptor its own runtime opened there.
+func TestReaperWithoutFilesUsesTheNullDevice(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Launch = workload(t, "sleep", "1m")
+	h := startHarnessOpts(t, spec, harnessOpts{noFiles: true})
+	h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
+	// Each empty slot is the null device, so the reaper's runtime could
+	// not open its own files (cpu.max, an eventfd) there and have them
+	// taken for the lock or a child's stdout.
+	for fd := lockFD; fd <= workErrFD; fd++ {
+		l, err := os.Readlink("/proc/" + strconv.Itoa(h.r.PID()) + "/fd/" + strconv.Itoa(fd))
+		if err != nil || l != os.DevNull {
+			t.Errorf("reaper fd %d = %q (%v), want %s", fd, l, err, os.DevNull)
+		}
+	}
+	h.send(attach(spec, "300ms", t.TempDir()))
+	h.waitFor(EventAttached, WhoPerfAgent, 10*time.Second)
+	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
+	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
+		t.Errorf("reaped = %+v", rp)
+	}
+	h.waitDone(10 * time.Second)
+	for _, e := range h.all() {
+		if e.Op == EventError {
+			t.Errorf("error event %+v", e)
+		}
+	}
+}
+
+// A descriptor above fd 10 that leaked into the reaper is closed there.
+func TestReaperClosesStrayDescriptors(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	h := startHarnessOpts(t, fakeSpec(t, capturetest.FakeOptions{}), harnessOpts{more: []*os.File{w}})
+	_ = w.Close()
+	// Only the reaper still has the write end; EOF means it closed it.
+	_ = r.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("read = %v, want EOF: the reaper kept fd 11", err)
+	}
+	if !h.reaper.alive() {
+		t.Error("the reaper exited; the test proves nothing")
+	}
 }

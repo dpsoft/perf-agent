@@ -2,6 +2,7 @@ package capture
 
 import (
 	"os"
+	"strings"
 	"time"
 )
 
@@ -153,9 +154,16 @@ const (
 	WhoWorkload  = "workload"
 )
 
-// CleanupComplete is the Cleanup of a reaped event that left nothing
+// CleanupComplete starts the Cleanup of a reaped event that left nothing
 // behind; any other value starts with "incomplete: " and gives the reasons.
+// Either may end with notes in parentheses, such as a cgroup fallback.
 const CleanupComplete = "complete"
+
+// CleanupIsComplete reports whether a reaped event's Cleanup says nothing
+// was left behind.
+func CleanupIsComplete(cleanup string) bool {
+	return cleanup == CleanupComplete || strings.HasPrefix(cleanup, CleanupComplete+" (")
+}
 
 // Event is one line on the reaper's event pipe. launched and attached
 // carry a child's PID, PGID and StartTime; Cgroup says the workload

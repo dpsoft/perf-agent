@@ -12,6 +12,28 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	cpuMapCacheMissesReader     = "cache_misses_reader"
+	cpuMapCpuCyclesReader       = "cpu_cycles_reader"
+	cpuMapCpuInstructionsReader = "cpu_instructions_reader"
+	cpuMapHwCountersEnabled     = "hw_counters_enabled"
+	cpuMapLastSeen              = "last_seen"
+	cpuMapPidFilter             = "pid_filter"
+	cpuMapPidRunqLatency        = "pid_runq_latency"
+	cpuMapPrevCacheMisses       = "prev_cache_misses"
+	cpuMapPrevCycles            = "prev_cycles"
+	cpuMapPrevInstructions      = "prev_instructions"
+	cpuMapRb                    = "rb"
+	cpuMapWakeupTs              = "wakeup_ts"
+	cpuProgHandleSwitch         = "handle_switch"
+	cpuProgHandleWakeup         = "handle_wakeup"
+	cpuProgHandleWakeupNew      = "handle_wakeup_new"
+	cpuVarSystemWide            = "system_wide"
+)
+
 // loadCpu returns the embedded CollectionSpec for cpu.
 func loadCpu() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_CpuBytes)
@@ -32,7 +54,7 @@ func loadCpu() (*ebpf.CollectionSpec, error) {
 //	*cpuMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadCpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadCpuObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadCpu()
 	if err != nil {
 		return err

@@ -34,6 +34,19 @@ type offcpuStartVal struct {
 	UserStack int64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	offcpuMapOffcpuCounts        = "offcpu_counts"
+	offcpuMapPidFilter           = "pid_filter"
+	offcpuMapStackmap            = "stackmap"
+	offcpuMapStart               = "start"
+	offcpuProgOffcpuSchedSwitch  = "offcpu_sched_switch"
+	offcpuVarKernelStacksEnabled = "kernel_stacks_enabled"
+	offcpuVarSystemWide          = "system_wide"
+)
+
 // loadOffcpu returns the embedded CollectionSpec for offcpu.
 func loadOffcpu() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_OffcpuBytes)
@@ -54,7 +67,7 @@ func loadOffcpu() (*ebpf.CollectionSpec, error) {
 //	*offcpuMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadOffcpuObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadOffcpuObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadOffcpu()
 	if err != nil {
 		return err

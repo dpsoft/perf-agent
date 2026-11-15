@@ -17,6 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
@@ -787,5 +788,39 @@ func TestARepeatedUnitIsANotice(t *testing.T) {
 	c.callOK("page_explain", o.args(map[string]any{"explanations": exps("b runs {c2} ns", "{c1} of it")}), &out)
 	if len(out.Notices) != 1 || !strings.Contains(out.Notices[0].Message, `"411 ns"`) {
 		t.Errorf("the notice %+v does not show the page's value", out.Notices)
+	}
+}
+
+// A measured zero is shown as "0", with no unit, so a unit after its
+// placeholder repeats nothing; a share that rounds to zero is "0.0%" and
+// still does.
+func TestAMeasuredZeroRepeatsNoUnit(t *testing.T) {
+	c := pageClient(t, nil, map[string][]byte{"gpu.pb.gz": pmfixture.GPUBasic()})
+	o, _ := openOn(t, c, "gpu.pb.gz", "")
+	node := o.nodeID(t, "conv")
+	exps := []any{map[string]any{"node": node, "prose": "Unknown serialization is {c1} % of the node", "claims": []any{map[string]any{
+		"id": "c1", "metric": "quality_serialized_unknown", "denominator": "node:" + node, "unit": "ratio", "value": "0",
+	}}}}
+	for _, tool := range []string{"page_explain", "render_flamegraph"} {
+		args := o.args(map[string]any{"explanations": exps})
+		if tool == "render_flamegraph" {
+			args["out"] = "zero.html"
+		}
+		var out struct {
+			Notices []explain.Notice `json:"notices"`
+		}
+		c.callOK(tool, args, &out)
+		if len(out.Notices) != 0 {
+			t.Errorf("%s: a measured zero, shown as 0, got notices %+v", tool, out.Notices)
+		}
+	}
+
+	rounded := explain.EngineValue{Unit: "ratio", Value: "0.000", Status: "ok"}
+	r := explain.Result{OK: true, Checked: []explain.Checked{{
+		Claims: []explain.CheckedClaim{{ID: "c1", EngineValue: rounded}},
+		Prose:  []explain.Segment{{Kind: explain.SegmentClaim, Claim: "c1"}, {Kind: explain.SegmentText, Text: " % of the view"}},
+	}}}
+	if ns := unitNotices(r); len(ns) != 1 || ns[0].Code != explain.NoticeUnitRepeated {
+		t.Errorf("a share shown as 0.0%% followed by %%: notices %+v", ns)
 	}
 }

@@ -927,6 +927,8 @@ func TestShownClaimNamesTheUnitsItShows(t *testing.T) {
 		units []string
 	}{
 		{explain.EngineValue{Unit: "ratio", Value: "0.411", Status: "ok"}, "41.1%", []string{"%"}},
+		{explain.EngineValue{Unit: "ratio", Value: "0.000", Status: "ok"}, "0.0%", []string{"%"}},
+		{explain.EngineValue{Unit: "ratio", Value: "0.000", Status: "zero"}, "0", nil},
 		{explain.EngineValue{Unit: "nanoseconds", Value: "411", Status: "ok"}, "411 ns", []string{"ns", "µs", "ms", "s"}},
 		{explain.EngineValue{Unit: "nanoseconds", Value: "1500000", Status: "ok"}, "1.50 ms", []string{"ns", "µs", "ms", "s"}},
 		{explain.EngineValue{Unit: "bytes", Value: "1234", Status: "ok"}, "1,234 bytes", []string{"bytes"}},

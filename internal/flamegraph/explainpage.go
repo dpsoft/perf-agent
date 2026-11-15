@@ -1348,7 +1348,9 @@ func factText(f profilemodel.Fact) (string, string) {
 // value carry none.
 func ShownClaim(e explain.EngineValue) (text string, units []string) {
 	text = displayEngine(e)
-	if e.Status == profilemodel.StatusUnavailable || e.Value == "" {
+	// A measured zero is shown as "0", with no unit; a share that only
+	// rounds to zero is "0.0%" and keeps its "%".
+	if e.Status == profilemodel.StatusUnavailable || e.Status == profilemodel.StatusZero || e.Value == "" {
 		return text, nil
 	}
 	if e.Unit == profilemodel.UnitRatio {

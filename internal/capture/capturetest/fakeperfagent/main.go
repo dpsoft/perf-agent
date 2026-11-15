@@ -8,10 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -44,10 +46,17 @@ func run() int {
 	fs := flag.NewFlagSet("fakeperfagent", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	vals := map[string]*string{}
+	bools := map[string]*bool{}
+	var pid *int
 	for _, f := range capture.Flags {
-		if f.Bool {
-			fs.Bool(f.Name, false, "")
-		} else {
+		switch {
+		case f.Bool:
+			bools[f.Name] = fs.Bool(f.Name, false, "")
+		case f.Name == "pid":
+			pid = fs.Int(f.Name, 0, "")
+		case f.Name == "sample-rate":
+			fs.Int(f.Name, 99, "")
+		default:
 			vals[f.Name] = fs.String(f.Name, "", "")
 		}
 	}
@@ -65,6 +74,25 @@ func run() int {
 			fmt.Fprintln(os.Stderr, "fakeperfagent: bad --duration:", err)
 			return 2
 		}
+	}
+
+	// The checks perf-agent's main makes before it starts, with its
+	// log.Fatal shape (a timestamped line, exit 1).
+	if !slices.Contains(fakemode.All, mf.Mode) {
+		log.Fatalf("fakeperfagent: unknown fake mode %q", mf.Mode)
+	}
+	if *pid == 0 {
+		log.Fatal("Either --pid or -a/--all is required")
+	}
+	if !*bools["profile"] && !*bools["offcpu"] && !*bools["gpu"] {
+		log.Fatal("At least one of --profile, --offcpu, --gpu, or --pmu must be specified")
+	}
+	if *bools["gpu"] && *vals["gpu-shim"] == "" {
+		log.Fatal("--gpu requires --gpu-shim: it names the adapter the target loaded through " +
+			"CUDA_INJECTION64_PATH, and the uprobe attaches to that file's inode")
+	}
+	if *vals["gpu-shim"] != "" && !*bools["gpu"] {
+		log.Fatal("--gpu-shim is only meaningful with --gpu")
 	}
 
 	rec := fakemode.Record{Argv: os.Args, Env: os.Environ(), PID: os.Getpid(), PGID: syscall.Getpgrp()}
@@ -125,7 +153,7 @@ func run() int {
 	case <-timeout:
 	}
 
-	if err := writeOutputs(mf.Mode, dir, vals); err != nil {
+	if err := writeOutputs(mf.Mode, dir, vals, bools); err != nil {
 		return fail(err)
 	}
 	return 0
@@ -146,25 +174,32 @@ func spam(w io.Writer) {
 
 // writeOutputs creates the files the argv asked for from the fixtures
 // beside the executable.
-func writeOutputs(mode fakemode.Mode, dir string, vals map[string]*string) error {
+//
+// An output is written only when its mode flag is on, as in perf-agent.
+// FakeHugeFile sets the file's size without writing data, and does so only
+// here, at completion.
+func writeOutputs(mode fakemode.Mode, dir string, vals map[string]*string, bools map[string]*bool) error {
 	if mode == fakemode.NoFile {
 		return nil
 	}
 	fix := func(name string) string { return filepath.Join(dir, "fixtures", name) }
-	outs := []struct{ flag, fixture string }{
-		{"profile-output", fakemode.FixtureCPU},
-		{"offcpu-output", fakemode.FixtureCPU},
-		{"gpu-output", fakemode.FixtureGPU},
-		{"gpu-executions-output", fakemode.FixtureExeclog},
+	outs := []struct{ enabled, flag, fixture string }{
+		{"profile", "profile-output", fakemode.FixtureCPU},
+		{"offcpu", "offcpu-output", fakemode.FixtureOffCPU},
+		{"gpu", "gpu-output", fakemode.FixtureGPU},
+		{"gpu", "gpu-executions-output", fakemode.FixtureExeclog},
 	}
 	if mode == fakemode.NoGPUSamples {
 		outs[2].fixture, outs[3].fixture = fakemode.FixtureGPUEmpty, fakemode.FixtureExeclogEmpty
 	}
-	for i, o := range outs {
+	written := 0
+	for _, o := range outs {
 		dst := *vals[o.flag]
-		if dst == "" {
+		if dst == "" || !*bools[o.enabled] {
 			continue
 		}
+		i := written
+		written++
 		var err error
 		switch {
 		case mode == fakemode.SymlinkOutput && i == 0:

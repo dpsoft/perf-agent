@@ -23,6 +23,10 @@ const (
 	NoGPUSamples    Mode = "no-gpu-samples"
 )
 
+// All lists every mode; the fake refuses a mode that is not here.
+var All = []Mode{Normal, NeverReady, IgnoreSIGINT, Exit1Stderr, Exit2, Exit127Loader, NoFile,
+	HugeFile, SymlinkOutput, HardlinkOutput, SpamStdout, ForkGrandchild, HangAfterSIGINT, NoGPUSamples}
+
 // File is fake-mode.json, which sits beside the fake executable because the
 // fake runs with a scrubbed environment.
 type File struct {
@@ -43,6 +47,7 @@ type Record struct {
 // Names inside fixtures/, beside the fake.
 const (
 	FixtureCPU          = "cpu.pb.gz"
+	FixtureOffCPU       = "offcpu.pb.gz"
 	FixtureGPU          = "gpu.pb.gz"
 	FixtureExeclog      = "gpu.execlog"
 	FixtureGPUEmpty     = "gpu-empty.pb.gz"

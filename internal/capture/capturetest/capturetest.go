@@ -90,13 +90,16 @@ func Workload(tb testing.TB) string {
 type FakeMode = fakemode.Mode
 
 const (
-	FakeNormal         = fakemode.Normal
-	FakeNeverReady     = fakemode.NeverReady
-	FakeIgnoreSIGINT   = fakemode.IgnoreSIGINT
-	FakeExit1Stderr    = fakemode.Exit1Stderr
-	FakeExit2          = fakemode.Exit2
-	FakeExit127Loader  = fakemode.Exit127Loader
-	FakeNoFile         = fakemode.NoFile
+	FakeNormal        = fakemode.Normal
+	FakeNeverReady    = fakemode.NeverReady
+	FakeIgnoreSIGINT  = fakemode.IgnoreSIGINT
+	FakeExit1Stderr   = fakemode.Exit1Stderr
+	FakeExit2         = fakemode.Exit2
+	FakeExit127Loader = fakemode.Exit127Loader
+	FakeNoFile        = fakemode.NoFile
+	// FakeHugeFile gives its first output a 256 MiB size without data, and
+	// only when it completes; a test of oversize interruption needs a
+	// smaller limit.
 	FakeHugeFile       = fakemode.HugeFile
 	FakeSymlinkOutput  = fakemode.SymlinkOutput
 	FakeHardlinkOutput = fakemode.HardlinkOutput
@@ -152,6 +155,8 @@ func FakePerfAgent(tb testing.TB, o FakeOptions) string {
 		tb.Fatal(err)
 	}
 	write(filepath.Join(fixtures, fakemode.FixtureCPU), pmfixture.CPUBasic())
+	write(filepath.Join(fixtures, fakemode.FixtureOffCPU), pmfixture.Build("offcpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("wait")}, Value: 1000}))
 	write(filepath.Join(fixtures, fakemode.FixtureGPU), pmfixture.GPUBasic())
 	write(filepath.Join(fixtures, fakemode.FixtureExeclog), pmfixture.GPUBasicExeclog(tb))
 	empty := pmfixture.Build("gpu", "nanoseconds", []string{"perf-agent.capture_id=cap-1"})

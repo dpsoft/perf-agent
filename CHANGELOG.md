@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.5.3] - 2026-11-15
 
 A fix release that adds support for Linux 7.1 and later. The kernel floor is
-unchanged: Linux 6.2 and later. On Linux 7.1 and later, whose BTF header was extended, perf-agent 1.5.2 and
-earlier cannot load any BPF program; 1.5.3 can. On kernels before 7.1 both
-versions work.
+unchanged: Linux 6.2 and later. On Linux 7.1 and later, whose BTF header was
+extended, perf-agent 1.5.2 and earlier cannot load any BPF program; 1.5.3 can.
+On kernels before 7.1 both versions work.
 
 ### Fixed
 

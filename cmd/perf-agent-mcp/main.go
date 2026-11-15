@@ -1,6 +1,9 @@
 // Command perf-agent-mcp serves perf-agent profiles to an MCP client over
-// stdio. It is read-only, needs no capabilities and opens no network
-// connection; the only files it writes are pages under --output.
+// stdio. It is read-only, needs no capabilities and never opens an outgoing
+// connection; the only files it writes are pages under --output. With
+// --live it also serves a read-only live page to a browser on this
+// machine, from a listener on 127.0.0.1 and a port the kernel picks, opened
+// at the first page tool call.
 package main
 
 import (
@@ -53,6 +56,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		profiles    = fs.String("profiles", "", "`DIR` profiles and executions logs are read from (required)")
 		output      = fs.String("output", "", "`DIR` rendered pages are written to; without it render_flamegraph is disabled")
 		sourceGit   = fs.Bool("source-git", true, "allow read-only offline git probes in the source roots (--source-git=false disables)")
+		live        = fs.Bool("live", false, "serve the live page, on 127.0.0.1 and a random port, from the first page_* tool call")
 		showVersion = fs.Bool("version", false, "print the version and exit")
 		sources     multiFlag
 		manifests   multiFlag
@@ -99,6 +103,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		SourceManifests: manifests,
 		SourceGit:       *sourceGit,
 		OutputDir:       *output,
+		Live:            *live,
 		Limits:          lim,
 		Version:         version,
 		Log:             log,

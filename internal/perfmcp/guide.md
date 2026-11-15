@@ -13,7 +13,7 @@ perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with
 5. `source {node}` shows source lines for a node, when source roots were configured.
 6. `render_flamegraph` writes an explained page (see Explanations).
 
-Handles and views are explicit and immutable: every call names its `handle` and `view`, nothing is "current" (`open` takes a `path` instead; `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`). A handle names evidence (the profile digest and the execlog) and stays valid while the server keeps it open; if it is gone, `open` again.
+Handles and views are explicit and immutable: every call names its `handle` and `view`, nothing is "current". The exceptions: `open` takes a `path`; `diff` and `page_diff` take `base_handle`, `base_view`, `new_handle` and `new_view`; `page_open` takes no arguments; `page_show` takes a `publication` and a `node`, and steers the page's current publication when `publication` is left out. A handle names evidence (the profile digest and the execlog) and stays valid while the server keeps it open; if it is gone, `open` again.
 
 ## Reading the numbers
 
@@ -64,10 +64,22 @@ Write each figure as a claim and refer to it from the prose. The engine checks t
 - `title` is free text of at most 200 bytes (`Explain.MaxTitleBytes`) with no placeholders. Numbers in it are marked unchecked and counted in `unchecked_numbers`; keep figures in claims.
 - To name a frame use `{n:<id>}`, especially for frame names containing braces; frame names are never parsed for placeholders.
 - For a range write "between {c1} and {c2}". A bare range like "{c1}-{c2}" is glued_to_claim and rejected, as is a sign or exponent next to a placeholder.
-- A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; re-check that each claim's node and metric match the sentence, rewrite the sentence or the claim (never just copy the engine's value), and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible.
+- A rejected call writes nothing. It returns every failure, with the engine's value when one can be computed, and is itself bounded by MaxResponseBytes; re-check that each claim's node and metric match the sentence, rewrite the sentence or the claim (never just copy the engine's value), and call again with `attempt` set to the returned attempt. Rejected renders stay on the page's history, so retries are visible. That history is bounded (`MaxAttemptsPerView` rejections per profile and view, and the page's size): the page lists the rejections the server kept and counts the ones it left out.
 - An existing `out` is never replaced: choose a new name. You cannot set rounding or tolerance.
 - When a tool result is an error it says what to call next.
 - A page's follow-up prompts name the profile's path relative to the profiles root and its digest: open that path and check that `profile_digest` matches before answering them.
+
+## Live page (page_*)
+
+When the server runs with `--live`, it can also show a read-only page to a browser on the user's machine. Without `--live` every page tool says it is disabled.
+
+- Start with `page_open` and give the user the URL: the server never opens a browser. The URL holds the page's access token, so give it to the user only. Calling `page_open` again returns the same URL.
+- `page_explain` takes `render_flamegraph`'s arguments without `out`. It runs the same check as render_flamegraph, with the same failures and the same `attempt` rules (the two tools share one attempt history), and publishes the page instead of writing a file. A rejected call publishes nothing. `"explanations": []` publishes the view's facts alone.
+- `page_show` points the user at what you are talking about: `node` selects a node (drawn or not), `"focus": true` lays the flame graph out from it, and `publication` goes back to an earlier publication (`p1`, `p2` and so on, as `page_explain`, `page_diff` and `page_open` return them).
+- `page_diff` takes `diff`'s arguments without `limit` and `cursor`, refuses what `diff` refuses, and publishes the comparison. Its `node`, and `page_show`'s `node` on a diff, is a union `id` from `diff`.
+- For an explained view the page shows every rejection the server kept for that profile and view, made through any handle, with counts for the rest. No argument hides it, and it follows the record as it grows.
+- The page keeps at most `MaxPublications` publications, dropping the least recently shown, within an estimated memory budget (`MaxRetainedBytes`). A publication that cannot fit even so is refused and changes nothing.
+- When the user wants a file, use `render_flamegraph`: the live page writes nothing (its export is a download the browser saves).
 
 ## Claimable metrics
 

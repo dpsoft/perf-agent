@@ -11,6 +11,12 @@ import (
 )
 
 func TestGuideIsShortAndStatesTheRules(t *testing.T) {
+	// The live page's section must come before the claimable metrics,
+	// whose section runs to the end of the guide.
+	live, metrics := strings.Index(guideText, "## Live page"), strings.Index(guideText, "## Claimable metrics")
+	if live < 0 || metrics < 0 || live > metrics {
+		t.Errorf("the Live page section is at %d and Claimable metrics at %d; want Live page first", live, metrics)
+	}
 	if len(guideText) > 12288 {
 		t.Errorf("guide is %d bytes, want at most 12288", len(guideText))
 	}
@@ -29,6 +35,14 @@ func TestGuideIsShortAndStatesTheRules(t *testing.T) {
 		"`unplaced_claim`",
 		"`Explain.MaxTitleBytes`",
 		"check that `profile_digest` matches",
+		"page_open",
+		"give the user the URL",
+		"same check as render_flamegraph",
+		"every rejection the server kept for that profile and view, made through any handle, with counts for the rest",
+		"the page lists the rejections the server kept and counts the ones it left out",
+		"`page_open` takes no arguments",
+		"`page_show` takes a `publication` and a `node`",
+		"`diff` and `page_diff` take",
 	} {
 		if !strings.Contains(guideText, want) {
 			t.Errorf("guide does not contain %q", want)

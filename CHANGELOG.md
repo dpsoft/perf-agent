@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only, offline, needs no capabilities, checks every figure an agent
   states against the engine, and is built from source only. See
   [docs/mcp.md](docs/mcp.md).
+- `perf-agent-mcp --live` serves a read-only live page to a browser on the
+  same machine: `page_open` returns its URL, `page_explain` publishes an
+  explained flame graph after the same check as `render_flamegraph`,
+  `page_diff` publishes a comparison, and `page_show` points the page at a
+  node. It listens only on `127.0.0.1` at a random port behind a per-run
+  token, serves `GET` and `HEAD` only, never opens an outgoing connection,
+  and lets the user download a static copy. New limits: `MaxPublications`,
+  `MaxRetainedBytes` (an estimated memory budget) and `MaxPageClients`. See
+  [docs/mcp.md](docs/mcp.md#live-page).
 
 ## [1.5.2] - 2026-11-12
 

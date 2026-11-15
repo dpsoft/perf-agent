@@ -91,7 +91,7 @@ func NewToken() (Token, error) {
 	return Token(base64.RawURLEncoding.EncodeToString(b[:])), nil
 }
 
-// NewServer returns the http.Server for the live page. Header reads,
+// NewServer returns the HTTP/1 server for the live page. Header reads,
 // idle connections and header size are bounded, and so is every response
 // write: a tab that stops reading a large model holds its goroutine and
 // snapshot for at most WriteTimeout. Streaming handlers extend their own
@@ -105,8 +105,13 @@ func NewServer(h http.Handler, log *slog.Logger) *http.Server {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// HTTP/1 only. The page needs nothing else, and without this net/http
+	// hands a request that opens with the HTTP/2 preface to the handler.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
 	return &http.Server{
 		Handler:           h,
+		Protocols:         protocols,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,

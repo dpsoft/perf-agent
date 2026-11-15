@@ -1,9 +1,13 @@
 package livehttp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"regexp"
@@ -246,4 +250,59 @@ func (w lockedWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.buf.Write(p)
+}
+
+// The server speaks HTTP/1 only. A client that opens with the HTTP/2
+// preface, as h2c with prior knowledge does, gets no HTTP/2 connection:
+// net/http hands the preface to the handler as a PRI request with a body
+// of unknown length, which Guard refuses. An h2c upgrade request is answered over HTTP/1.1.
+func TestServerSpeaksHTTP1Only(t *testing.T) {
+	g := startGuarded(t)
+	if p := g.srv.Protocols; p == nil || !p.HTTP1() || p.HTTP2() || p.UnencryptedHTTP2() {
+		t.Errorf("Protocols = %v, want HTTP1 only", p)
+	}
+	page := "/s/" + string(g.tok) + "/"
+
+	exchange := func(t *testing.T, req string) string {
+		t.Helper()
+		c, err := net.Dial("tcp", g.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.WriteString(c, req); err != nil {
+			t.Fatal(err)
+		}
+		head := make([]byte, 9)
+		if _, err := io.ReadFull(c, head); err != nil {
+			return string(head)
+		}
+		// An HTTP/2 server answers the preface with a SETTINGS frame: a
+		// 9-byte header whose type byte is 0x4.
+		if head[3] == 0x4 && !bytes.HasPrefix(head, []byte("HTTP/")) {
+			return "SETTINGS"
+		}
+		res, err := http.ReadResponse(bufio.NewReader(io.MultiReader(bytes.NewReader(head), c)), nil)
+		if err != nil {
+			return "unreadable: " + err.Error()
+		}
+		defer func() { _ = res.Body.Close() }()
+		body, _ := io.ReadAll(res.Body)
+		return fmt.Sprintf("%s %s\n%s", res.Proto, res.Status, body)
+	}
+
+	if got := exchange(t, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"); !strings.HasPrefix(got, "HTTP/1.1 4") {
+		t.Errorf("the HTTP/2 preface got %q, want an HTTP/1.1 refusal", got)
+	}
+	got := exchange(t, "GET "+page+" HTTP/1.1\r\nHost: "+g.addr+"\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n")
+	if !strings.HasPrefix(got, "HTTP/1.1 200") || !strings.HasSuffix(got, "\n/") {
+		t.Errorf("an h2c upgrade request got %q, want an HTTP/1.1 200 from the handler", got)
+	}
+	if n := g.calls.Load(); n != 1 {
+		t.Errorf("the handler ran %d times, want once (the upgrade request only)", n)
+	}
+	if _, ok := g.srv.TLSNextProto["unencrypted_http2"]; ok {
+		t.Error("the server registered an unencrypted HTTP/2 handler")
+	}
 }

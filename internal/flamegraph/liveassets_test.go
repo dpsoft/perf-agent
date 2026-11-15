@@ -1203,6 +1203,26 @@ func TestLivePageRetriesInChrome(t *testing.T) {
 		assert.Equal(t, livePartialNote, d.LoadNote)
 		assert.Empty(t, tab.errors())
 	})
+
+	// A newer agent state supersedes the one being retried; when the user
+	// then cancels the newer one too, nothing is being retried, so the
+	// page must not say it keeps trying.
+	t.Run("a superseded retry note does not outlive its retries", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.c, "", "p1", "p2", "p3"), func(s *liveServer) {
+			delete(s.pubs["p1"].frames, string(f.c))
+			s.setDelay("pub/p2/model", 800*time.Millisecond)
+		})
+		tab.waitFor("the note", func(d liveDOM) bool { return d.LoadNote != "" })
+		s.push(liveState("2", "p2", f.c, "", "p1", "p2", "p3"))
+		time.Sleep(200 * time.Millisecond)
+		tab.eval(`document.querySelector('#pubs button[data-pub="p3"]').click(), ''`)
+		tab.waitFor("p3", func(d liveDOM) bool { return d.Title == "third" })
+		time.Sleep(1200 * time.Millisecond)
+		d := tab.dom()
+		assert.Equal(t, "third", d.Title)
+		assert.NotContains(t, d.LoadNote, "keeps trying", "no retry remains")
+		assert.Empty(t, tab.errors())
+	})
 }
 
 func TestLivePageConnectionInChrome(t *testing.T) {

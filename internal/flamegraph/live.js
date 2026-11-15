@@ -501,13 +501,21 @@
 
   const sameTarget = (a, b) => !!a && !!b && a.current === b.current && a.selected === b.selected && a.focus === b.focus;
 
-  const loadNote = (text) => {
-    const n = $('load-note');
-    n.textContent = text;
-    n.hidden = !text;
+  // noteState is what #load-note says, apart from the failure count:
+  // '' (nothing), 'trying' (a state's retries are live) or 'partial' (the
+  // page stopped retrying the agent's last state).
+  let noteState = '';
+  const noteText = {
+    '': '',
+    trying: 'perf-agent could not load this publication; the page keeps trying.',
+    partial: "Your agent's last page could not be fully loaded.",
   };
-  const TRYING = 'perf-agent could not load this publication; the page keeps trying.';
-  const PARTIAL = "Your agent's last page could not be fully loaded.";
+  const loadNote = (state) => {
+    noteState = state;
+    const n = $('load-note');
+    n.textContent = noteText[state];
+    n.hidden = !state;
+  };
 
   // settled records st as applied: its work is done, so nothing is being
   // retried.
@@ -520,10 +528,10 @@
   };
 
   // stopRetrying ends the retries of a state the page moved away from. If
-  // the page had said it keeps trying, it now says the agent's page was
-  // not fully loaded.
+  // the page says it keeps trying, it now says the agent's page was not
+  // fully loaded.
   const stopRetrying = () => {
-    if (failures >= quickRetries) loadNote(PARTIAL);
+    if (noteState === 'trying') loadNote('partial');
     retrySeq = '';
     failures = 0;
   };
@@ -593,7 +601,12 @@
     }
     acceptedSeq = st.seq;
     retrySeq = '';
-    if (!again) failures = 0;
+    if (!again) {
+      // A newer state supersedes the one being retried: its retries end
+      // here, and so does the note promising them.
+      failures = 0;
+      if (noteState === 'trying') loadNote('');
+    }
     const prev = agent;
     const quiet = !again && applied !== null && applied === agent && sameTarget(st, agent);
     const g = quiet || failures >= quickRetries ? gen : ++gen;
@@ -609,7 +622,7 @@
       retrySeq = st.seq;
       failures++;
       failGen = gen;
-      if (failures >= quickRetries) loadNote(TRYING);
+      if (failures >= quickRetries) loadNote('trying');
       setTimeout(checkState, retryDelays[Math.min(failures, retryDelays.length) - 1]);
     });
   };

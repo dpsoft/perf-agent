@@ -1,6 +1,6 @@
 # M2b: the live page — design addendum
 
-**Status:** design, not implemented. Addendum to
+**Status:** implemented in M2b (draft PR). Addendum to
 [2026-11-13-ai-flamegraph-design.md](2026-11-13-ai-flamegraph-design.md)
 (the spec). It builds on M2 as M2 is after its Task 16
 ([plan](../plans/2026-11-14-mcp-server-m2.md), rulings M2-R1..R20 in
@@ -377,15 +377,17 @@ keeps them that way:
   Frame names are never parsed for placeholders.
 - **The server's own limits:**
   - `ReadHeaderTimeout` 5 s and `MaxHeaderBytes` 8 KiB;
-  - path segments bounded (a node ID is 16 hex, a union ID 33 bytes, a
-    publication ID at most 12 bytes);
+  - path segments bounded: a publication ID, node ID, union ID or asset
+    name over 64 bytes is `404` without a lookup (a node ID is 16 hex, a
+    union ID 33 bytes);
   - `MaxPageClients` on streams;
-  - focus and export bounded by `MaxPageBytes`;
+  - focus, frame and export responses bounded by `MaxPageBytes`;
   - `http.Server.ErrorLog` goes to the slog logger on stderr, never to
     stdout.
 - **Shutdown.** When stdio reaches EOF, `Server.Close` shuts the HTTP
-  server down (2 s grace, then `Close`) and ends every stream. A test
-  checks that the port refuses connections afterwards.
+  server down: it stops the hub, which ends every stream, then calls
+  `Shutdown` with a 500 ms grace, then `Close`, so it never blocks past
+  that (C1). A test checks that the port refuses connections afterwards.
 - **Offline use of a saved live page.** It is not supported: the live
   shell is empty without its server. When the server goes away, the page
   keeps the last content it received and shows the banner:
@@ -580,7 +582,8 @@ already constrain, and Task 4's tests include a 64 KiB frame name.
 ## 6. HTTP surface
 
 All paths are below `/s/<token>/` and all are `GET`. `<p>` is a publication
-ID; `<node>` is a node ID, or a union ID for a diff.
+ID; `<node>` is a node ID, or a union ID for a diff. A path segment over
+64 bytes is `404` without a lookup.
 
 | Path | Returns |
 |---|---|

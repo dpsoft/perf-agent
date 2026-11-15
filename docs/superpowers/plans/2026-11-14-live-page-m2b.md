@@ -503,7 +503,7 @@ git commit -m "perfmcp: immutable live publications behind an atomic snapshot, b
 - Consumes: Task 1 `Listen`, `NewToken`, `Guard`, `NewServer`, `ExportCSP`; Task 2 `Hub`; Task 4 `ExplainedLiveFrame`, `ExplainedLiveModel` (focus); Task 5 `LiveAsset`; Task 6 snapshot and publications; M2 `flamegraph.WriteExplainedPage`, `WriteDiffPage`.
 - Produces:
   - **Starting the listener.** `func (s *Server) ensureLive() (url string, err error)`. Request goroutine only, idempotent. It runs `NewToken`, then `Listen(LiveAddr)`, then `NewServer(Guard(tok, s.liveMux()))`, then `go srv.Serve(ln)`, then `commit()`. It logs `live page listening` with `addr` (never the token) and returns `http://<ln.Addr()>/s/<tok>/`, with IPv6 bracketed.
-  - **Shutdown.** `Close` calls `hub.Close()`, then `srv.Shutdown` with a 2 s context, then `srv.Close()`.
+  - **Shutdown.** `Close` calls `hub.Close()`, then `srv.Shutdown` with a 500 ms context (C1), then `srv.Close()`.
   - **Routes.** `func (s *Server) liveMux() http.Handler` is a `http.ServeMux` with these `GET` patterns:
     - `/{$}` → `LiveAsset("")`;
     - `/assets/{name}` → `LiveAsset("assets/"+name)`;

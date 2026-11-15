@@ -337,7 +337,10 @@ var handlerImports = map[string][]string{
 // through the standard library runs. crypto/tls's client handshake is not
 // one of them: net/http's server links it too, since it wraps an accepted
 // unencrypted HTTP/2 connection with tls.Client, so nm cannot tell it
-// apart.
+// apart. Nor is (*net.Resolver).LookupIPAddr: the compiler always inlines
+// it into its callers, so it never has a symbol, and the lookupIPAddr it
+// calls is linked by the listener's address parsing too. The source scan
+// (TestNoClientNetworkingInTheServer) refuses calls of it.
 var clientSymbols = []string{
 	"net/http.(*Client).do",
 	"net/http.(*Transport).roundTrip",
@@ -345,7 +348,6 @@ var clientSymbols = []string{
 	"net.Dial",
 	"net.DialTimeout",
 	"net.(*Resolver).LookupHost",
-	"net.(*Resolver).LookupIPAddr",
 }
 
 // liveSymbols are functions of the live page's server and handlers. The

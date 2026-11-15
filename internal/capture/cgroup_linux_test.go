@@ -59,7 +59,7 @@ func TestDelegatedCgroupParsing(t *testing.T) {
 
 func TestCreateCgroupRefusesAPathName(t *testing.T) {
 	parent := t.TempDir()
-	for _, name := range []string{"", ".", "..", "a/b"} {
+	for _, name := range []string{"", ".", "..", "a/b", "perf-agent-mcp-1/x", "user.slice"} {
 		if _, err := CreateCgroup(parent, name); err == nil {
 			t.Errorf("CreateCgroup(%q) succeeded", name)
 		}

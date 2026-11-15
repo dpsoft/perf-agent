@@ -174,6 +174,8 @@ type reaper struct {
 	// starts records the start time of each child the sweep listed.
 	starts  map[int]uint64
 	reasons []string
+	// notes qualify a complete cleanup, such as a cgroup fallback.
+	notes []string
 }
 
 // exitNote is a known child the wait loop reaped.
@@ -260,14 +262,17 @@ func (r *reaper) run() int {
 		r.killAll()
 	}
 	survivors := r.settle()
+	if r.spec.Cgroup != "" {
+		r.removeCgroup()
+	}
 	cleanup := CleanupComplete
 	if len(r.reasons) > 0 {
 		cleanup = "incomplete: " + strings.Join(r.reasons, "; ")
 	}
-	r.out.publish(Event{Op: EventReaped, PID: r.self, Survivors: survivors, Cleanup: cleanup})
-	if r.spec.Cgroup != "" {
-		r.removeCgroup()
+	if len(r.notes) > 0 {
+		cleanup += " (" + strings.Join(r.notes, "; ") + ")"
 	}
+	r.out.publish(Event{Op: EventReaped, PID: r.self, Survivors: survivors, Cleanup: cleanup})
 	r.beforeExit()
 	for _, f := range []*os.File{r.perfOut, r.perfErr, r.workOut, r.workErr, r.out.f} {
 		if f != nil {
@@ -489,15 +494,20 @@ func (r *reaper) startWorkload() {
 		return
 	}
 	var cg *os.File
+	fallback := func(why error) {
+		r.notes = append(r.notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", why))
+	}
 	if r.spec.Cgroup != "" {
 		if cg, err = os.OpenFile(r.spec.Cgroup, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0); err != nil {
 			cg = nil
+			fallback(err)
 		}
 	}
 	r.mu.Lock()
 	ch, err := startLauncher(selfExe, specR, r.spec.Launch.Dir, r.workOut, r.workErr, cg)
 	inCgroup := cg != nil
 	if err != nil && cg != nil && cgroupRetry(err) {
+		fallback(fmt.Errorf("start in %s: %w", r.spec.Cgroup, err))
 		ch, err = startLauncher(selfExe, specR, r.spec.Launch.Dir, r.workOut, r.workErr, nil)
 		inCgroup = false
 	}
@@ -672,8 +682,20 @@ func (r *reaper) settle() []Survivor {
 		r.reasons = append(r.reasons, "the process tree was not quiescent at the stop grace")
 	}
 	if r.inCgroup {
-		empty := func() bool { p, err := cgroupPopulated(r.spec.Cgroup); return err == nil && !p }
+		// populated in cgroup.events covers the whole subtree, so it is the
+		// proof; an unreadable file proves nothing.
+		var perr error
+		empty := func() bool {
+			p, err := cgroupPopulated(r.spec.Cgroup)
+			perr = err
+			return err == nil && !p
+		}
 		if ok, _ := r.waitUntil(end, false, empty); !ok {
+			if perr != nil {
+				r.reasons = append(r.reasons, fmt.Sprintf("cannot prove cgroup %s empty: %v", r.spec.Cgroup, perr))
+			} else {
+				r.reasons = append(r.reasons, fmt.Sprintf("cgroup %s still populated", r.spec.Cgroup))
+			}
 			for _, pid := range cgroupProcs(r.spec.Cgroup) {
 				add(pid, "still in the cgroup")
 			}
@@ -778,14 +800,26 @@ func sweep(children func() (pids []int, quiet bool), kill func(pid int, sig sysc
 	}
 }
 
-// removeCgroup removes the capture's cgroup, retrying briefly while the
-// kernel still counts an exiting process in it.
+// removeCgroup removes the capture's cgroup and any cgroup the workload
+// made below it, depth first, before reaped is published, retrying
+// briefly while the kernel still counts an exiting process. A failure is
+// a reason. A cgroup this server would not have created is left alone,
+// and noted.
 func (r *reaper) removeCgroup() {
+	cg := r.spec.Cgroup
+	if !strings.HasPrefix(filepath.Base(cg), CgroupPrefix) {
+		r.notes = append(r.notes, fmt.Sprintf("cgroup %s left in place: not a %s cgroup", cg, CgroupPrefix))
+		return
+	}
+	var err error
 	for range 10 {
-		if err := RemoveCgroup(r.spec.Cgroup); err == nil || !errors.Is(err, syscall.EBUSY) {
-			return
+		if err = RemoveCgroup(cg); err == nil || !errors.Is(err, syscall.EBUSY) {
+			break
 		}
 		time.Sleep(sweepTick)
+	}
+	if err != nil {
+		r.reasons = append(r.reasons, "remove cgroup: "+err.Error())
 	}
 }
 

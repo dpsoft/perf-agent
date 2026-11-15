@@ -801,18 +801,7 @@ func TestReaperKillsTheCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The test's own cgroup: whatever a failure left in it is killed, so
-	// the directory can go.
-	t.Cleanup(func() {
-		if _, err := os.Stat(cg); err != nil {
-			return
-		}
-		_ = KillCgroup(cg)
-		eventually(5*time.Second, func() bool { p, err := cgroupPopulated(cg); return err != nil || !p })
-		if err := RemoveCgroup(cg); err != nil {
-			t.Errorf("remove the test cgroup: %v", err)
-		}
-	})
+	t.Cleanup(func() { dropTestCgroup(t, cg) })
 
 	spec := fakeSpec(t, capturetest.FakeOptions{})
 	spec.Cgroup = cg
@@ -867,12 +856,84 @@ func TestACgroupStartFailureFallsBack(t *testing.T) {
 	h.send(attach(spec, "200ms", t.TempDir()))
 	h.waitFor(EventExited, WhoPerfAgent, 10*time.Second)
 	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-	if !CleanupIsComplete(rp.Cleanup) {
-		t.Errorf("reaped = %+v", rp)
+	// The fallback is noted, and the foreign cgroup is left in place.
+	if !CleanupIsComplete(rp.Cleanup) || !strings.Contains(rp.Cleanup, "no cgroup") {
+		t.Errorf("reaped = %+v, want complete with the fallback noted", rp)
 	}
 	h.waitDone(10 * time.Second)
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("the reaper removed a cgroup it never used: %v", err)
+	}
+}
+
+// A cgroup that cannot be opened is a fallback too, and is noted.
+func TestAMissingCgroupFallsBack(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Cgroup = filepath.Join(t.TempDir(), "perf-agent-mcp-gone")
+	spec.Launch = workload(t, "sleep", "1m")
+	h := startHarness(t, spec)
+	if l := h.waitFor(EventLaunched, WhoWorkload, 10*time.Second); l.Cgroup {
+		t.Fatalf("launched = %+v", l)
+	}
+	h.send(attach(spec, "200ms", t.TempDir()))
+	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
+	if !CleanupIsComplete(rp.Cleanup) || !strings.Contains(rp.Cleanup, "no cgroup") {
+		t.Errorf("reaped = %+v, want complete with the fallback noted", rp)
+	}
+	h.waitDone(10 * time.Second)
+}
+
+// A workload that makes its own sub-cgroup still has the whole tree
+// killed and removed, depth first, before reaped is published.
+func TestReaperRemovesTheWorkloadsSubCgroups(t *testing.T) {
+	capturetest.SkipIfPrivileged(t)
+	parent, why := DelegatedCgroup(selfCgroup(t), cgroupMount)
+	if why != "" {
+		t.Skip("no delegated cgroup: " + why)
+	}
+	cg, err := CreateCgroup(parent, "perf-agent-mcp-test-"+strconv.Itoa(os.Getpid())+"-"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dropTestCgroup(t, cg) })
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Cgroup = cg
+	spec.Launch = workload(t, "double-fork-setsid", "1m")
+	h := startHarness(t, spec)
+	if l := h.waitFor(EventLaunched, WhoWorkload, 10*time.Second); !l.Cgroup {
+		t.Fatalf("launched = %+v", l)
+	}
+	gc := h.grandchild()
+	sub := filepath.Join(cg, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "cgroup.procs"), []byte(strconv.Itoa(gc.pid)), 0); err != nil {
+		t.Fatalf("move the grandchild into %s: %v", sub, err)
+	}
+	h.send(attach(spec, "300ms", t.TempDir()))
+	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
+	if _, err := os.Stat(cg); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cgroup %s still exists when reaped is published (%v)", cg, err)
+	}
+	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
+		t.Errorf("reaped = %+v", rp)
+	}
+	if gc.alive() {
+		t.Error("the grandchild in the sub-cgroup survived")
+	}
+	h.waitDone(10 * time.Second)
+}
+
+// dropTestCgroup kills and removes, depth first, a cgroup a test made.
+func dropTestCgroup(t *testing.T, cg string) {
+	if _, err := os.Stat(cg); err != nil {
+		return
+	}
+	_ = KillCgroup(cg)
+	eventually(5*time.Second, func() bool { p, err := cgroupPopulated(cg); return err != nil || !p })
+	if err := RemoveCgroup(cg); err != nil {
+		t.Errorf("remove the test cgroup: %v", err)
 	}
 }
 

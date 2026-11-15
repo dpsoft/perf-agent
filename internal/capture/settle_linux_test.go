@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -101,5 +102,99 @@ func TestSettleWithoutECHILDIsIncomplete(t *testing.T) {
 	r.settle()
 	if len(r.reasons) == 0 {
 		t.Error("cleanup would read complete though children remain")
+	}
+}
+
+// fakeCgroup is a directory shaped like a cgroup: cgroup.procs, and
+// cgroup.events when events is not empty.
+func fakeCgroup(t *testing.T, dir, events string, procs ...int) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, p := range procs {
+		fmt.Fprintln(&b, p)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if events != "" {
+		if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte(events), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The cgroup is empty only when its cgroup.events says so for the whole
+// subtree; a populated nested cgroup or an unreadable events file is
+// incomplete, with the nested processes named.
+func TestSettleNeedsTheCgroupProvenEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name, events string
+		nested       []int
+	}{
+		{"nested populated", "populated 1\n", []int{synthetic + 3}},
+		{"unreadable events", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cg := filepath.Join(t.TempDir(), "perf-agent-mcp-1")
+			fakeCgroup(t, cg, tc.events)
+			if tc.nested != nil {
+				fakeCgroup(t, filepath.Join(cg, "nested"), "populated 1\n", tc.nested...)
+			}
+			r := fakeReaper(t.TempDir(), echild)
+			r.inCgroup, r.spec.Cgroup = true, cg
+			left := r.settle()
+			if len(r.reasons) == 0 {
+				t.Fatal("cleanup would read complete")
+			}
+			for _, pid := range tc.nested {
+				if !slices.ContainsFunc(left, func(s Survivor) bool { return s.PID == pid }) {
+					t.Errorf("survivors %+v miss the nested %d", left, pid)
+				}
+			}
+		})
+	}
+}
+
+// Removal is depth-first, and a failure is a reason, never swallowed.
+func TestRemovingTheCgroupIsDepthFirstAndReported(t *testing.T) {
+	parent := t.TempDir()
+	cg := filepath.Join(parent, "perf-agent-mcp-2")
+	if err := os.MkdirAll(filepath.Join(cg, "a", "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := fakeReaper(t.TempDir(), echild)
+	r.spec.Cgroup = cg
+	r.removeCgroup()
+	if _, err := os.Stat(cg); !os.IsNotExist(err) || len(r.reasons) != 0 {
+		t.Errorf("cgroup left: %v; reasons %q", err, r.reasons)
+	}
+
+	cg = filepath.Join(parent, "perf-agent-mcp-3")
+	fakeCgroup(t, filepath.Join(cg, "a"), "populated 0\n")
+	r = fakeReaper(t.TempDir(), echild)
+	r.spec.Cgroup = cg
+	r.removeCgroup()
+	if len(r.reasons) == 0 || !strings.Contains(strings.Join(r.reasons, ";"), "remove") {
+		t.Errorf("reasons %q, want the removal failure", r.reasons)
+	}
+}
+
+// The reaper removes only a cgroup this server creates.
+func TestTheReaperLeavesAForeignCgroup(t *testing.T) {
+	cg := filepath.Join(t.TempDir(), "user.slice")
+	if err := os.Mkdir(cg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := fakeReaper(t.TempDir(), echild)
+	r.spec.Cgroup = cg
+	r.removeCgroup()
+	if _, err := os.Stat(cg); err != nil {
+		t.Errorf("removed a foreign cgroup: %v", err)
+	}
+	if len(r.notes) == 0 {
+		t.Error("leaving it was not noted")
 	}
 }

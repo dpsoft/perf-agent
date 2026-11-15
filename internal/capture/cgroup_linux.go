@@ -3,6 +3,7 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -47,11 +48,16 @@ func DelegatedCgroup(selfCgroup []byte, mount string) (parent, why string) {
 	return dir, ""
 }
 
+// CgroupPrefix starts the name of every cgroup this server creates; the
+// reaper removes no other.
+const CgroupPrefix = "perf-agent-mcp-"
+
 // CreateCgroup creates the child cgroup name under parent and returns its
-// path. name is one path element, and the directory must not exist yet.
+// path. name is one path element starting with CgroupPrefix, and the
+// directory must not exist yet.
 func CreateCgroup(parent, name string) (string, error) {
-	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
-		return "", fmt.Errorf("cgroup name %q is not one path element", name)
+	if !strings.HasPrefix(name, CgroupPrefix) || strings.ContainsRune(name, '/') {
+		return "", fmt.Errorf("cgroup name %q is not one path element starting with %s", name, CgroupPrefix)
 	}
 	path := filepath.Join(parent, name)
 	if err := os.Mkdir(path, 0o755); err != nil {
@@ -71,13 +77,27 @@ func KillCgroup(path string) error {
 	return errors.Join(err, f.Close())
 }
 
-// RemoveCgroup removes the cgroup at path; one already gone is not an
-// error. The kernel refuses while it still has processes.
+// RemoveCgroup removes the cgroup at path and the cgroups below it, depth
+// first; one already gone is not an error. The kernel refuses a cgroup
+// that still has processes, and every refusal is returned.
 func RemoveCgroup(path string) error {
-	if err := syscall.Rmdir(path); err != nil && !errors.Is(err, syscall.ENOENT) {
-		return &os.PathError{Op: "rmdir", Path: path, Err: err}
+	ents, err := os.ReadDir(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range ents {
+		if e.IsDir() {
+			errs = append(errs, RemoveCgroup(filepath.Join(path, e.Name())))
+		}
+	}
+	if err := syscall.Rmdir(path); err != nil && !errors.Is(err, syscall.ENOENT) {
+		errs = append(errs, &os.PathError{Op: "rmdir", Path: path, Err: err})
+	}
+	return errors.Join(errs...)
 }
 
 // cgroupPopulated reports whether the cgroup at path, or one below it,
@@ -95,16 +115,21 @@ func cgroupPopulated(path string) (bool, error) {
 	return false, fmt.Errorf("%s/cgroup.events has no populated line", path)
 }
 
-// cgroupProcs lists the processes directly in the cgroup at path.
+// cgroupProcs lists the processes in the cgroup at path and in every
+// cgroup below it.
 func cgroupProcs(path string) []int {
-	b, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
-	if err != nil {
-		return nil
-	}
 	var pids []int
-	for f := range strings.FieldsSeq(string(b)) {
-		if pid, err := strconv.Atoi(f); err == nil {
-			pids = append(pids, pid)
+	if b, err := os.ReadFile(filepath.Join(path, "cgroup.procs")); err == nil {
+		for f := range strings.FieldsSeq(string(b)) {
+			if pid, err := strconv.Atoi(f); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	ents, _ := os.ReadDir(path)
+	for _, e := range ents {
+		if e.IsDir() {
+			pids = append(pids, cgroupProcs(filepath.Join(path, e.Name()))...)
 		}
 	}
 	return pids

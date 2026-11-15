@@ -136,6 +136,11 @@ func errorResponse(id json.RawMessage, code int, msg string) *outgoing {
 	return &outgoing{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
 }
 
+// maxIDBytes bounds an id as sent. A longer one is refused with a null id,
+// so no answer repeats it, and the answer that replaces one too large for
+// the output bound stays small.
+const maxIDBytes = 1024
+
 // validID reports whether raw is a JSON string or integer, the only id forms
 // MCP allows (null, fractions, exponents, objects and so on are not).
 func validID(raw json.RawMessage) bool {
@@ -191,6 +196,9 @@ func (s *Server) parse(line []byte) (*envelope, *outgoing) {
 	}
 	if len(env.ID) > 0 && !validID(env.ID) {
 		return nil, errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
+	}
+	if len(env.ID) > maxIDBytes {
+		return nil, errorResponse(nil, codeInvalidRequest, fmt.Sprintf("invalid request: id is %d bytes, over %d", len(env.ID), maxIDBytes))
 	}
 	if env.JSONRPC != "2.0" {
 		return nil, errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)

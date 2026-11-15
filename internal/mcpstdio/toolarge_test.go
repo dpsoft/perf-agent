@@ -72,3 +72,20 @@ func TestAControlAnswerOverHalfTheOutputBoundIsRefused(t *testing.T) {
 		t.Fatalf("echo after the refused answer = %q isError=%v", text, isErr)
 	}
 }
+
+// An id over 1 KiB is refused at ingress, with a null id, so no answer
+// echoes it: the answer that replaces a too-large one stays small.
+func TestALongIDIsRefused(t *testing.T) {
+	c := newClient(t, testOptions())
+	c.init()
+	long := `"` + strings.Repeat("i", maxIDBytes) + `"`
+	r := c.call(`{"jsonrpc":"2.0","id":` + long + `,"method":"ping"}`)
+	wantErr(t, r, codeInvalidRequest)
+	if string(r.ID) != "null" || !strings.Contains(r.Error.Message, "1024") {
+		t.Fatalf("id %s, error %+v", r.ID, r.Error)
+	}
+	ok := `"` + strings.Repeat("i", maxIDBytes-2) + `"`
+	if r := c.call(`{"jsonrpc":"2.0","id":` + ok + `,"method":"ping"}`); r.Error != nil || string(r.ID) != ok {
+		t.Fatalf("a 1024-byte id: id %.20s…, error %+v", r.ID, r.Error)
+	}
+}

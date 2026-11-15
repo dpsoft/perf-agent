@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -57,24 +58,34 @@ func New(o Options) *Server {
 //
 // Nothing Serve does waits on w. The reader goroutine takes every line as
 // it comes: notifications/cancelled ends the named request, a Control tool
-// is answered at once, and any other request joins a queue of MaxQueued,
-// beyond which it is answered "server busy". One dispatcher answers the
-// queue in order. Every message goes through a bounded output queue.
+// is answered at once, and any other request joins a queue of MaxQueued
+// (beyond the one running), past which it is answered "server busy". One
+// dispatcher answers the queue in order, starting each request only once
+// the output backlog is under half its bounds. Every message goes through
+// a bounded output queue.
+//
+// EOF on r means the client is gone. The handler running and the requests
+// still queued run with a cancelled context and are answered in order: a
+// handler that honours its context answers as cancelled (isError). A
+// script that pipes requests in must keep r open until it has its answers.
 //
 // Serve returns:
-//   - at EOF, once the queued requests are answered (their contexts are
-//     cancelled first) and the output is drained: nil, or ErrClientGone
-//     when the drain took longer than DrainTimeout. An input that fails
-//     to read ends the same way, and Serve then returns the read error;
+//   - at EOF, once the queued requests are answered and the output is
+//     drained: nil, or ErrClientGone when the drain took longer than
+//     DrainTimeout. An input that fails to read ends the same way, and
+//     Serve then returns the read error (joined to ErrClientGone when the
+//     drain ran out);
 //   - when ctx ends, once the output enqueued so far is drained, for at
 //     most DrainTimeout: nil, or an error that is both ErrClientGone and
 //     ctx.Err() when the drain ran out;
 //   - at once with ErrClientGone when the client stopped reading its
-//     output (the output queue overflowed or a write failed).
+//     output: a response found the backlog at its bound, a write failed,
+//     or no write ended for StallTimeout while messages waited.
 //
-// A handler or a write still running then is not waited for. The reader
-// goroutine owns r: it may still read from r once more after Serve
-// returns, so the caller should close r.
+// On each path OnClose runs first, then every handler's context is
+// cancelled. A handler or a write still running when Serve returns is not
+// waited for. The reader goroutine owns r: it may still read from r once
+// more after Serve returns, so the caller should close r.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	ss := s.newSession(ctx, w)
 	defer ss.hcancel()
@@ -88,6 +99,12 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	case <-ss.out.dead:
 		return ss.endGone()
 	case <-ss.inputEnded:
+	}
+	// The reader stops when the client is dead too; that is not an EOF.
+	select {
+	case <-ss.out.dead:
+		return ss.endGone()
+	default:
 	}
 	ss.end(CloseEOF)
 	ss.mu.Lock()
@@ -104,7 +121,7 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	drained := ss.out.drain(time.Now().Add(s.o.DrainTimeout))
 	ss.halt()
 	if !drained {
-		return ss.out.goneErr()
+		return errors.Join(ss.out.goneErr(), ss.readErr)
 	}
 	return ss.readErr
 }

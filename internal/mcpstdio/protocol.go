@@ -105,9 +105,11 @@ type Tool struct {
 	// Control marks a tool whose calls are answered on the reader
 	// goroutine, ahead of the queued requests, once initialize has
 	// completed (before that they queue like any request). Its Handler
-	// must not block: while it runs no input is read, so it must do no
-	// I/O, wait on nothing and take no lock that is held across I/O or
-	// across another handler. Progress does nothing in it.
+	// runs concurrently with the handler the dispatcher is running, so it
+	// must not touch state that only the request handlers own. It must not
+	// block either: while it runs no input is read, so it must do no I/O,
+	// wait on nothing and take no lock that is held across I/O or across
+	// another handler. Progress does nothing in it.
 	Control bool `json:"-"`
 }
 

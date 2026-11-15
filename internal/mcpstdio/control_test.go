@@ -454,12 +454,14 @@ func TestContextDoneDrainsThenReturns(t *testing.T) {
 			done <- err
 		}()
 		in := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}` + "\n" +
-			`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{},"_meta":{"progressToken":"p"}}}` + "\n"
+			`{"jsonrpc":"2.0","id":2,"method":"ping"}` + "\n" +
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{},"_meta":{"progressToken":"p"}}}` + "\n"
 		if _, err := io.WriteString(cw, in); err != nil {
 			t.Fatal(err)
 		}
 		// Nothing has been read: the answer to initialize is stuck in a
-		// write and the progress notification waits in the queue.
+		// write, and behind it wait the answer to ping (enqueued before the
+		// dispatcher started slow) and the progress notification.
 		<-progressed
 		cancel()
 		out, err := io.ReadAll(or)
@@ -468,6 +470,9 @@ func TestContextDoneDrainsThenReturns(t *testing.T) {
 		}
 		if err := <-done; err != nil {
 			t.Fatalf("Serve = %v", err)
+		}
+		if !bytes.Contains(out, []byte(`{"jsonrpc":"2.0","id":2,"result":{}}`)) {
+			t.Fatalf("the enqueued response was not written:\n%s", out)
 		}
 		if !bytes.Contains(out, []byte(`"method":"notifications/progress"`)) || !bytes.Contains(out, []byte(`"progressToken":"p"`)) {
 			t.Fatalf("the enqueued progress was not written:\n%s", out)

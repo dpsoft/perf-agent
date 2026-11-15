@@ -61,7 +61,9 @@ func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
 		inputEnded: make(chan struct{}),
 		dispatched: make(chan struct{}),
 	}
-	ss.hctx, ss.hcancel = context.WithCancel(context.WithValue(ctx, sessionKey{}, ss))
+	// The handlers' contexts do not inherit ctx's cancellation: end
+	// cancels them after OnClose, on every path, ctx's end included.
+	ss.hctx, ss.hcancel = context.WithCancel(context.WithValue(context.WithoutCancel(ctx), sessionKey{}, ss))
 	return ss
 }
 

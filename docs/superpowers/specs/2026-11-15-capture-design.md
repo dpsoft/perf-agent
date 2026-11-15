@@ -1399,7 +1399,12 @@ changed (§11).
     ends the named request's handler (with two-step calls this is a
     `capture_wait`, §4.0), and no response is sent. **EOF in stdio
     cancels every running capture**: the client is gone, and nobody would
-    collect the result;
+    collect the result. **EOF means the client is gone (CAP-R34):** the
+    running handler and the requests still queued run with a cancelled
+    context and are answered in order (as cancelled, `isError`, where they
+    honour it), and the server-owned capture jobs are cancelled with the
+    server. A script that pipes requests in must keep stdin open until it
+    has its answers;
   - **`capture_cancel` is a control message too (CAP-R10).** The reader
     recognises a `tools/call` whose `name` is `capture_cancel`. It sets
     the flag in the cancellation registry (a mutex-guarded map the reader
@@ -1416,10 +1421,19 @@ changed (§11).
   - responses, progress notifications and overload errors alike;
   - bounded at 64 messages and 4 × `MaxResponseBytes`;
   - a single writer goroutine drains it to stdout, so lines never
-    interleave.
+    interleave;
+  - **back-pressure (CAP-R35):** the dispatcher starts the next queued
+    request only once the backlog is under half of both bounds (the
+    reader stays live meanwhile), so a slow but live client is never
+    mistaken for a dead one;
+  - **notifications are lossy (CAP-R33):** a progress notification is
+    dropped while the backlog is at half a bound or more, and that is
+    never fatal.
 
   Neither the reader nor a handler ever waits on stdout.
-- **When the client stops reading.** If an enqueue finds the queue full,
+- **When the client stops reading.** If a response finds the backlog
+  already at a bound (one line of any size fits behind a smaller
+  backlog), or no write ends for `StallTimeout` (30 s) while lines wait,
   the client has stopped reading stdout. The server then **treats the
   client as dead**:
   - it cancels every handler and every capture (§6.6);

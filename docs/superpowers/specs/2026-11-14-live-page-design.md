@@ -85,8 +85,10 @@ What these decisions supersede in the spec:
 - In-page chat, or any way for the page to ask the agent something. The
   follow-up chips still copy a prompt.
 - Capturing profiles (the next milestone).
-- Remote viewing. The page is for a browser on the same host. SSH port
-  forwarding is documented, and the server never listens beyond loopback.
+- Remote viewing, including SSH port forwarding (user decision 2026-11-14:
+  a risk vector not needed now). The page is for a browser on the same host;
+  the server listens only on 127.0.0.1 on a random port and the docs do not
+  describe any way to reach it from another machine.
 - Rendering inside an MCP client (MCP Apps). This is deferred, and the
   design keeps it possible (§10).
 - Multi-user sharing. A page URL is a bearer secret for one person's
@@ -124,7 +126,7 @@ Each decision says **who decides**:
 
 **Decision.** `perf-agent-mcp --live` serves the page over HTTP/1.1. The
 rules:
-- **Address:** `127.0.0.1` on a random port (`--live-addr`, default
+- **Address:** `127.0.0.1` on a random port (no flag: always
   `127.0.0.1:0`). `::1` and any other loopback literal are accepted. A
   hostname, `0.0.0.0`, `::` or any non-loopback address is refused at
   start-up.
@@ -330,7 +332,7 @@ keeps them that way:
   other local server would receive it.
 - **DNS rebinding and cross-site requests.**
   - `Host` must be `localhost`, `127.x.x.x` or `[::1]`, with any port, so
-    SSH forwarding to another local port works.
+    a browser that names the server `localhost:<port>` works.
   - `Origin`, when present, must equal `http://` + `Host`.
   - `Sec-Fetch-Site`, when present, must be `same-origin` or `none`. The
     exception: on the **shell route only**, a request with
@@ -609,7 +611,7 @@ can already read the profile files.
 | `render_flamegraph` writes the page | Unchanged; `page_explain` runs the same check and publishes instead |
 | Rejected history at write time | Static page: unchanged. Live page: the current record, refreshed on change |
 | Static page script inline | Static page still inline; the panel code is shared with the live assets, and the page is byte-identical outside `<script>` |
-| Flags: `--profiles --source --source-manifest --output --source-git --limit --version` | Adds `--live` (default off) and `--live-addr` (default `127.0.0.1:0`); new limits `MaxPublications`, `MaxRetainedBytes`, `MaxPageClients` through `--limit` |
+| Flags: `--profiles --source --source-manifest --output --source-git --limit --version` | Adds `--live` (default off; 127.0.0.1 on a random port, not configurable); new limits `MaxPublications`, `MaxRetainedBytes`, `MaxPageClients` through `--limit` |
 | Guide: investigation order ends in `render_flamegraph` | Adds a live-page section: `page_open`, give the user the URL, then `page_explain`, `page_show` and `page_diff`; `render_flamegraph` for files |
 
 ## 9. Testing
@@ -677,7 +679,7 @@ can already read the profile files.
 
 ## 12. Open questions for the user
 
-**Decided 2026-11-14 by the user: every default below holds** (loopback listener opt-in with `--live`; `--live` off by default; the page stays read-only and never reports clicks to the agent; the server never opens a browser, the agent gives the URL; `ssh -L` port forwarding is enough for remote machines).
+**Decided 2026-11-14 by the user: every default below holds** (loopback listener opt-in with `--live`; `--live` off by default; the page stays read-only and never reports clicks to the agent; the server never opens a browser, the agent gives the URL). Question 5 was answered differently: **no remote or SSH use in M2b** — the user considers it a risk vector not needed now; there is no `--live-addr` flag (127.0.0.1, random port only) and the docs do not describe SSH forwarding (ruling M2b-R7).
 
 Most important first.
 
@@ -700,8 +702,7 @@ Most important first.
 4. **Should the server open the browser itself** (`xdg-open`)?
    - **Default:** no. It runs no process besides M2's read-only `git`; the
      agent prints the URL and the user clicks it.
-5. **Remote GPU lab use.** Is documenting
-   `ssh -L 7777:127.0.0.1:7777` with `--live-addr 127.0.0.1:7777` enough
-   for the lab machine?
+5. **Remote GPU lab use.** *(Answered: out of scope, see above.)* Was:
+   documenting SSH port forwarding with an address flag for the lab machine.
    - **Default:** yes; the Host check accepts any loopback port for this
      reason.

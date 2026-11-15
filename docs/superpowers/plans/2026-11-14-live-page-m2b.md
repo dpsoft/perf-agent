@@ -11,7 +11,7 @@
   - immutable publications, exposed to the HTTP goroutines through an `atomic.Pointer` snapshot;
   - the HTTP routes;
   - the four `page_*` tools.
-- **`cmd/perf-agent-mcp`** gains `--live` and `--live-addr`. The M2 "links no `net/http`" test is replaced by loopback-only, no-client-networking and every-socket-loopback tests.
+- **`cmd/perf-agent-mcp`** gains `--live` (127.0.0.1, random port; no address flag — ruling M2b-R7). The M2 "links no `net/http`" test is replaced by loopback-only, no-client-networking and every-socket-loopback tests.
 
 **Tech Stack:** Go 1.26 standard library (`net/http`, `net/netip`, `crypto/rand`, `crypto/subtle`, `sync/atomic`, `go/parser` for the source scan), the existing `html/template` and `encoding/json`, and vanilla JS with no build step. No new module.
 
@@ -67,7 +67,7 @@
 ## Review Focus
 
 1. **A web page in the same browser targets the port** (cross-site fetch, `<script src>` include, EventSource, DNS rebinding through `evil.example` → 127.0.0.1). Expected: nothing is readable without the token. With the token, cross-site and rebinding requests still get `403`. Tests in Task 1, and through the real routes in Task 7.
-2. **The GPU lab over SSH, forwarded to a different local port** (`ssh -L 9000:127.0.0.1:7777`). The browser sends `Host: localhost:9000` and `Origin: http://localhost:9000`; the page must work. Test in Task 1; documented in Task 11.
+2. **The browser names the server as `localhost:<port>` instead of `127.0.0.1:<port>`** (a user retyping the URL). The browser sends `Host: localhost:<port>` and `Origin: http://localhost:<port>`; the page must work. Test in Task 1. Remote/SSH use is out of scope (M2b-R7) and is not documented.
 3. **A reload, a second tab, a laptop resume, or a tab that stops reading.**
    - Every (re)connecting tab must show the current publication and selection.
    - A stuck tab must never delay a tool call.
@@ -83,7 +83,7 @@
 | Package split | `internal/livehttp` (listener, guard, hub; knows nothing of profiles), live builders in `internal/flamegraph`, routes and tools in `internal/perfmcp` | Mirrors M2's `mcpstdio`/`perfmcp` split; the security surface is testable alone. |
 | Listener start | Lazily, at the first `page_*` call; `--live` is the consent | No open port in sessions that never use the page. |
 | Token | 32 random bytes, base64url without padding (43 chars), first path segment `/s/<token>/` | Not a cookie: cookies are not port-scoped, so other local servers would receive one. |
-| Host check | Host is `localhost`, an IPv4 loopback literal or `[::1]`, with **any** port | Defeats DNS rebinding and still works through SSH forwarding to another port. |
+| Host check | Host is `localhost`, an IPv4 loopback literal or `[::1]`, with **any** port | Defeats DNS rebinding; any port because the port is random. |
 | Push | SSE with a one-slot coalescing mailbox per client; keep-alive 15 s; `MaxPageClients` 8 | Stdlib only; auto-reconnect; never blocks a tool call. |
 | State shape | `GET state` and SSE data: `{"seq","current","selected","focus","publications":[{"id","kind","title","view","digest","history"}]}`; `history` is a decimal-string version per publication | The page refetches a model only when `current` changes, and history only when its version changes. |
 | Publications | `p1, p2, …`, immutable, pin their Profile and View (or Diff and DiffIndex) and model bytes; `MaxPublications` 8, `MaxRetainedBytes` 2 GiB over a pointer-keyed pin ledger shared with the store; LRU by last shown; current never evicted; a new current that cannot fit is refused (M2b-R4) | Valid after store eviction; the budget bounds real engine memory, not only JSON. |
@@ -148,7 +148,7 @@ func TestGuardRefusesAWrongOrMissingToken(t *testing.T) // "/", "/s/", "/s/<othe
 func TestGuardRedirectsThePrefixToItsSlash(t *testing.T) // "/s/<tok>" → 301 Location "/s/<tok>/"; "/s/<tok>/state" → next sees "/state"
 func TestGuardChecksHostAgainstRebinding(t *testing.T)  // Host "evil.example:PORT", "127.0.0.1.evil.example:PORT", "[fe80::1]:PORT" → 403; "127.0.0.1:PORT", "localhost:9000", "[::1]:5", "127.0.0.5:1" → 200
 func TestGuardChecksOriginAndFetchMetadata(t *testing.T) // Origin "http://evil.example" / "null" / "http://localhost:9001" with Host localhost:9000 → 403; Sec-Fetch-Site "cross-site" / "same-site" → 403; "same-origin", "none", absent → 200
-func TestGuardWorksThroughAForwardedPort(t *testing.T)  // Host "localhost:9000" + Origin "http://localhost:9000" + Sec-Fetch-Site same-origin → 200 (SSH -L to another port)
+func TestGuardAcceptsLocalhostName(t *testing.T)  // Host "localhost:9000" + Origin "http://localhost:9000" + Sec-Fetch-Site same-origin → 200
 func TestNavigationHeaderMatrix(t *testing.T)           // table over route {"/s/<tok>/", "/s/<tok>", "/s/<tok>/state", "/s/<tok>/events", "/s/<tok>/assets/live.js", "/s/<tok>/pub/p1/export"} × Sec-Fetch-Site {absent, none, same-origin, same-site, cross-site} × (Mode, Dest) {(navigate, document), (navigate, iframe), (cors, empty), (no-cors, script), (absent, absent)}: shell routes with (navigate, document) pass for every site (200, or 301 for the slashless form); every other cell passes only for site absent/none/same-origin; a cross-site navigate+document to the shell with a wrong token is 404 and with Host evil.example is 403
 func TestGuardServesOnlyReads(t *testing.T)             // POST, PUT, DELETE, PATCH, OPTIONS → 405, next never called; HEAD → 200
 func TestEveryResponseCarriesTheSecurityHeaders(t *testing.T) // for 200, 301, 403, 404, 405: Content-Security-Policy == CSP, nosniff, no-referrer, no-store, COOP, CORP same-origin, X-Frame-Options DENY; no header starting "Access-Control-"
@@ -728,8 +728,7 @@ git commit -m "perfmcp: page_diff shows a comparison on the live page"
 - Produces:
   - **Flags.**
     - `--live` (bool, default false) sets `Config.Live`.
-    - `--live-addr ADDR` (default `127.0.0.1:0`) is checked at start-up with `livehttp.CheckAddr`; a refusal exits 2 with its message.
-    - `--live-addr` without `--live` exits 2 with `--live-addr needs --live`.
+    - The listener always binds `127.0.0.1:0`; there is no address flag (M2b-R7). `livehttp.CheckAddr` still guards the bind address internally.
   - **The binary's dependency test** is renamed `TestTheServerLinksNoProfiler`. It keeps the forbidden packages `perfagent`, `cilium/ebpf` and blazesym and the non-std module set; `net`, `net/http` and `crypto/tls` are now allowed.
   - **`netscan_test.go`, `TestNoClientNetworkingInTheServer`:**
     - takes every non-std package from `go list -deps -f '{{if not .Standard}}{{.Dir}}{{end}}' ./cmd/perf-agent-mcp` and parses its non-test `.go` files with `go/parser`;
@@ -752,9 +751,9 @@ git commit -m "perfmcp: page_diff shows a comparison on the live page"
     - "the page shows every rejection the server recorded for the view";
     - `render_flamegraph` when a file is wanted.
   - **`docs/mcp.md` "Live page"** covers:
-    - `--live` and `--live-addr`;
+    - `--live`;
     - what is served and to whom: loopback, token, read-only;
-    - SSH use: `ssh -L 7777:127.0.0.1:7777 lab` with `--live-addr 127.0.0.1:7777`, and that another local port works;
+    - local use only: the page is for a browser on the same machine (remote use is not supported);
     - the four tools;
     - download a static copy;
     - what the page never does: send anything, run tools, or work offline;
@@ -764,7 +763,7 @@ git commit -m "perfmcp: page_diff shows a comparison on the live page"
 - [ ] **Step 1: Write the failing tests**
 
 ```go
-func TestRunRefusesANonLoopbackLiveAddr(t *testing.T)     // --live --live-addr 0.0.0.0:0 → 2, stderr "not loopback"; --live-addr localhost:0 → 2 "hostname"; --live-addr without --live → 2
+func TestRunHasNoLiveAddressFlag(t *testing.T)     // --live-addr anything → 2 (unknown flag); with --live the listener's address is 127.0.0.1
 func TestRunServesTheLivePage(t *testing.T)               // pipes: initialize, open CPUBasic, page_open, page_explain; GET url → 200; EOF → run returns 0 and the port refuses connections
 func TestStdoutCarriesOnlyJSONRPC(t *testing.T)           // M2's test, the session extended with page_open, page_explain, page_show and a browser GET; still only JSON-RPC lines; stderr has the listen addr and not the token
 func TestTheServerLinksNoProfiler(t *testing.T)           // renamed and amended as above
@@ -825,7 +824,7 @@ Configure the built binary with `--profiles` (the eval fixtures), `--output` (sc
 - "Download static copy" saves a page that works from `file://`;
 - stopping the client shows the banner.
 
-Also check over `ssh -L` to the lab machine if it is reachable. Record what was checked in the PR body.
+Record what was checked in the PR body.
 
 - [ ] **Step 6: Push**
 
@@ -891,4 +890,4 @@ Expected: the branch is on the remote; the controller opens a draft PR stacked o
   2. `--live` default off;
   3. no browser-to-agent selection signal;
   4. the server never opens a browser;
-  5. SSH forwarding as the lab story.
+  5. Remote/SSH use: out of scope (user decision, M2b-R7).

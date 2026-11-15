@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-11-15
+
+A fix release for current kernels. perf-agent 1.5.2 and earlier cannot load
+any BPF program on a kernel whose BTF uses the extended header (seen on
+Linux 7.3); 1.5.3 can.
+
+### Fixed
+
+- On a kernel whose BTF header carries the newer, longer layout, every BPF
+  program failed to load with `apply CO-RE relocations: load kernel spec:
+  load vmlinux: parsing .BTF header: header contains non-zero trailer`, so no
+  profiler could start. The header in `/sys/kernel/btf/vmlinux` grew from 24
+  to 32 bytes; cilium/ebpf v0.21.0 refused a longer header whose extra bytes
+  are not zero. perf-agent now uses cilium/ebpf v0.22.0, which reads it.
+  Seen on Fedora 44 with kernel 7.3.3; earlier kernels were not affected.
+- The "Interactive version" links in the README and in
+  `docs/use-cases.md` opened the flame graph's HTML source on GitHub. They
+  now open the rendered page through htmlpreview.github.io.
+
+### Internal
+
+- `github.com/cilium/ebpf` is v0.22.0 in both `go.mod` and `test/go.mod`, and
+  the bpf2go wrappers are regenerated with it. No BPF object changed.
+
 ## [1.5.2] - 2026-11-12
 
 A packaging and licensing release. Release archives and both container images
@@ -643,7 +667,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/dpsoft/perf-agent/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/dpsoft/perf-agent/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...v1.5.0

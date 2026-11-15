@@ -365,7 +365,7 @@ func (l *live) start(mux func() http.Handler, log *slog.Logger) (url, addr strin
 // before anything is published is still sent a state.
 func (s *Server) ensureLive() (string, error) {
 	if s.live == nil {
-		return "", errors.New("the live page is off; restart perf-agent-mcp with --live to use it")
+		return "", errLiveDisabled
 	}
 	url, addr, started, err := s.live.start(s.liveMux, s.log)
 	if err != nil {
@@ -409,7 +409,7 @@ func (l *live) show(id, node string, focus bool) error {
 // within the page limits; one that cannot be built publishes nothing. An
 // admitted publication becomes current with its first explained node
 // selected (none for a facts-only page) and no focus, and the page is
-// told.
+// told. A model that cannot be built is a *modelError.
 func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt string) (*publication, error) {
 	opts := flamegraph.LiveOptions{
 		Title: title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: attempt,
@@ -417,7 +417,7 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	}
 	model, err := flamegraph.ExplainedLiveModel(v, r, opts)
 	if err != nil {
-		return nil, err
+		return nil, &modelError{err}
 	}
 	p := &publication{
 		kind: pubExplained, title: title, titleSegs: flamegraph.LiveTitleSegments(title, e.name),
@@ -428,13 +428,17 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 		return nil, err
 	}
 	l := s.live
-	l.selected, l.focus = "", ""
-	if len(r.Checked) > 0 {
-		l.selected = string(r.Checked[0].Node)
-	}
+	l.selected, l.focus = p.firstSelected(), ""
 	s.commit()
 	return p, nil
 }
+
+// modelError is publishExplained's error for a model that cannot be built
+// within the page limits, as opposed to one the retained budget refuses.
+type modelError struct{ err error }
+
+func (e *modelError) Error() string { return e.err.Error() }
+func (e *modelError) Unwrap() error { return e.err }
 
 // admit keeps p as the current publication, with its history. It first
 // tries the change on a copy: it drops the least recently shown other

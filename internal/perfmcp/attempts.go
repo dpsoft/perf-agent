@@ -10,15 +10,17 @@ import (
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
-// Outcomes of a render attempt.
+// Outcomes of an attempt. Every outcome but rejected is kept with the
+// view's other attempts, apart from its rejected ones.
 const (
-	outcomeWritten  = "written"  // the page was written
-	outcomeRejected = "rejected" // the check failed
-	outcomeInvalid  = "invalid"  // the explanations were not the right shape
-	outcomeFailed   = "failed"   // checked, but the page could not be rendered or written
+	outcomeWritten   = "written"   // the page was written
+	outcomePublished = "published" // the page was published on the live page
+	outcomeRejected  = "rejected"  // the check failed
+	outcomeInvalid   = "invalid"   // the explanations were not the right shape
+	outcomeFailed    = "failed"    // checked, but the page could not be rendered, written or published
 )
 
-// attempt is one recorded render_flamegraph call: the view it was made on
+// attempt is one recorded render_flamegraph or page_explain call: the view it was made on
 // and, since every handle of a profile shares the record, the handle it
 // was made with and whether that handle had executions.
 type attempt struct {
@@ -66,7 +68,8 @@ type viewCount struct {
 // record the server keeps.
 const countsPerView = 4
 
-// attempts is a server's record of render attempts. IDs are "a1", "a2", …
+// attempts is a server's record of the attempts render_flamegraph and
+// page_explain make. IDs are "a1", "a2", …
 // in the order the server made them, across all profiles and views. The
 // record is keyed by profile digest and view, so every handle of one
 // profile shares it, and it outlives the store's handles, so evicting and
@@ -246,8 +249,8 @@ func (a *attempts) lookup(id string, p *profilemodel.Profile, view string) (*att
 	d := p.Digest
 	at, ok := a.byID[id]
 	if !ok {
-		return nil, fmt.Errorf("attempt %q is not a render attempt this server keeps (it keeps the last MaxAttemptsPerView=%d of each profile and view, for the MaxAttemptViews=%d most recently used); "+
-			"pass the attempt a previous render_flamegraph call of this view of this profile returned, or omit attempt", echo(id), a.max, a.maxViews)
+		return nil, fmt.Errorf("attempt %q is not an attempt this server keeps (it keeps the last MaxAttemptsPerView=%d of each profile and view, for the MaxAttemptViews=%d most recently used); "+
+			"pass the attempt a previous render_flamegraph or page_explain call of this view of this profile returned, or omit attempt", echo(id), a.max, a.maxViews)
 	}
 	if k := (viewKey{d, view}); at.key != k {
 		return nil, fmt.Errorf("attempt %s was made for view %s of profile %s, not view %s of profile %s; "+

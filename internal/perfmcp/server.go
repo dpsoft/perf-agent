@@ -152,7 +152,8 @@ const minToolErrorBytes = 1024
 
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
-	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool()}
+	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool(),
+		s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.
@@ -183,7 +184,8 @@ func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 	return mcpstdio.Result{Text: string(b)}, nil
 }
 
-// decodeArgs decodes a tool's arguments into v, a pointer to a struct.
+// decodeArgs decodes a tool's arguments into v, a pointer to a struct
+// (one without fields for a tool that takes none).
 // Names match exactly as sent, as explanations' fields do (encoding/json
 // alone would fold case), and an unknown name, a name given twice or
 // anything but one JSON object is refused. The error lists the tool's
@@ -191,8 +193,12 @@ func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 // cut short.
 func decodeArgs(tool string, raw json.RawMessage, v any) error {
 	names := argNames(v)
+	takes := "its arguments are: " + strings.Join(names, ", ")
+	if len(names) == 0 {
+		takes = "it takes no arguments"
+	}
 	bad := func(why string) error {
-		return fmt.Errorf("invalid arguments to %s: %s; its arguments are: %s", tool, why, strings.Join(names, ", "))
+		return fmt.Errorf("invalid arguments to %s: %s; %s", tool, why, takes)
 	}
 	fields, err := explain.Object(raw, "arguments")
 	if err != nil {

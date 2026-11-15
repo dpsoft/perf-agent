@@ -99,7 +99,8 @@ func TestRunServesOverStdio(t *testing.T) {
 	for _, tl := range list.Result.Tools {
 		names = append(names, tl.Name)
 	}
-	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph"}
+	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph",
+		"page_open", "page_explain", "page_show"}
 	slices.Sort(names)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
@@ -198,7 +199,10 @@ var handlerImports = map[string][]string{
 }
 
 // clientSymbols are functions every outgoing connection or name lookup
-// through the standard library runs.
+// through the standard library runs. crypto/tls's client handshake is not
+// one of them: net/http's server links it too, since it wraps an accepted
+// unencrypted HTTP/2 connection with tls.Client, so nm cannot tell it
+// apart.
 var clientSymbols = []string{
 	"net/http.(*Client).do",
 	"net/http.(*Transport).roundTrip",
@@ -207,15 +211,25 @@ var clientSymbols = []string{
 	"net.DialTimeout",
 	"net.(*Resolver).LookupHost",
 	"net.(*Resolver).LookupIPAddr",
-	"crypto/tls.(*Conn).clientHandshake",
+}
+
+// liveSymbols are functions of the live page's server and handlers. The
+// linker keeps only code a page tool can reach, so the client symbols'
+// absence says something about the handlers only while these are linked.
+var liveSymbols = []string{
+	"github.com/dpsoft/perf-agent/internal/perfmcp.(*Server).liveMux",
+	"github.com/dpsoft/perf-agent/internal/livehttp.NewServer",
+	"github.com/dpsoft/perf-agent/internal/livehttp.isShellNavigation",
+	"github.com/dpsoft/perf-agent/internal/livehttp.(*Hub).ServeHTTP",
 }
 
 // TestTheServerOpensNoConnection is a stopgap for the network scan that
 // replaces it: only internal/livehttp imports a networking package (and
 // internal/perfmcp net/http, for its handlers), and
-// the linked binary has none of the client symbols. A call of
-// (*net.Dialer).DialContext is linked by the server side too, so nm cannot
-// tell it apart; the source scan and the socket test are still required.
+// the linked binary has none of the client symbols while it links the live
+// page's handlers. A call of (*net.Dialer).DialContext is linked by the
+// server side too, so nm cannot tell it apart; the source scan and the
+// socket test are still required.
 func TestTheServerOpensNoConnection(t *testing.T) {
 	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", `{{if not .Standard}}{{.ImportPath}}: {{join .Imports " "}}{{end}}`, ".").Output()
 	if err != nil {
@@ -248,6 +262,11 @@ func TestTheServerOpensNoConnection(t *testing.T) {
 	for line := range strings.SplitSeq(string(syms), "\n") {
 		if f := strings.Fields(line); len(f) >= 3 {
 			linked[f[len(f)-1]] = true
+		}
+	}
+	for _, sym := range liveSymbols {
+		if !linked[sym] {
+			t.Errorf("the binary does not link %s: the live page's handlers are unreachable, so finding no client symbol proves nothing about them", sym)
 		}
 	}
 	for _, sym := range clientSymbols {

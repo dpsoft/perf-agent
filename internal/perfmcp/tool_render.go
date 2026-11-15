@@ -24,7 +24,7 @@ const renderSchema = `{
       "items": {"type": "object"}
     },
     "out": {"type": "string", "description": "The page's file name inside the output root (relative to it, or absolute inside it), ending in .html, in a directory that exists. An existing file is never replaced: pass a name that does not exist yet."},
-    "attempt": {"type": "string", "description": "The attempt a previous render_flamegraph call of this view returned, when this call retries it. Every handle of one profile (opened with or without an execlog) shares one attempt history, so an attempt made with any of them is accepted, and the page lists the rejections made with all of them."},
+    "attempt": {"type": "string", "description": "The attempt a previous render_flamegraph or page_explain call of this view returned, when this call retries it. Every handle of one profile (opened with or without an execlog) shares one attempt history, so an attempt made with any of them is accepted, and the page lists the rejections made with all of them."},
     "title": {"type": "string", "description": "The page's title (default: the profile's name)."},
     "rounding": {"description": "Ignored: rounding is the engine's, per metric."},
     "tolerance": {"description": "Ignored: rounding is the engine's, per metric."}
@@ -107,29 +107,113 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	if err := decodeArgs("render_flamegraph", raw, &a); err != nil {
 		return mcpstdio.Result{}, err
 	}
-	e, v, err := s.store.view(a.Handle, a.View)
+	if _, _, err := s.store.view(a.Handle, a.View); err != nil {
+		return mcpstdio.Result{}, err
+	}
+	// out is checked before anything is recorded, so a bad one costs no
+	// attempt; writePage checks it again when it writes.
+	if _, err := s.pageName(a.Out); err != nil {
+		return mcpstdio.Result{}, err
+	}
+	c, err := s.checkCall("render_flamegraph", explainCall{
+		Handle: a.Handle, View: a.View, Attempt: a.Attempt, Title: a.Title,
+		Explanations: a.Explanations, Rounding: a.Rounding, Tolerance: a.Tolerance,
+	})
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	// out and title are checked before anything is recorded, so a bad one
-	// costs no attempt; writePage checks out again when it writes.
-	if _, err := s.pageName(a.Out); err != nil {
-		return mcpstdio.Result{}, err
+	if c.rejection != nil {
+		return *c.rejection, nil
+	}
+	e, v, r, notices, notes := c.e, c.v, c.r, c.notices, c.notes
+
+	id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeWritten, nil)
+	s.recorded()
+	rejected, dropped, incomplete := s.attempts.rejected(e.prof, a.View)
+	var page bytes.Buffer
+	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
+		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,
+		Rejected: rejected, DroppedRejected: dropped, HistoryIncomplete: incomplete,
+		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
+	})
+	if err == nil && page.Len() > s.lim.MaxPageBytes {
+		err = fmt.Errorf("the page is %d bytes", page.Len())
+	}
+	if err != nil {
+		s.attempts.setOutcome(id, outcomeFailed)
+		s.recorded()
+		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but the page cannot be rendered within this server's MaxPageBytes=%d: %v; "+
+			"explain fewer or shorter paths, or restart perf-agent-mcp with a larger --limit MaxPageBytes=N", id, s.lim.MaxPageBytes, err)
+	}
+	path, err := s.writePage(a.Out, page.Bytes())
+	if err != nil {
+		s.attempts.setOutcome(id, outcomeFailed)
+		s.recorded()
+		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but no page was written: %v", id, err)
+	}
+	s.log.Info("rendered", "attempt", id, "handle", a.Handle, "view", a.View, "path", path, "bytes", page.Len())
+	return s.respond("render_flamegraph", shrinkRender, renderWritten{
+		Attempt: id, Status: outcomeWritten, Path: path, Bytes: wireInt(int64(page.Len())),
+		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r, a.Title))), Notices: notices, Notes: notes,
+	})
+}
+
+// explainCall is what render_flamegraph and page_explain check alike.
+type explainCall struct {
+	Handle                            profilemodel.Handle
+	View, Attempt, Title              string
+	Explanations, Rounding, Tolerance json.RawMessage
+}
+
+// checked is a call checkCall checked: the entry and view it named, the
+// passing check and its notices, and the view's sampling notes on a GPU
+// view. When the check failed, rejection is the result to return and the
+// rest is unset but for notes.
+type checked struct {
+	e         *entry
+	v         *profilemodel.View
+	r         explain.Result
+	notices   []explain.Notice
+	notes     []string
+	rejection *mcpstdio.Result
+}
+
+// verbOf is what tool does with a page that passes: render_flamegraph
+// writes it, page_explain publishes it.
+func verbOf(tool string) string {
+	if tool == "page_explain" {
+		return "published"
+	}
+	return "written"
+}
+
+// checkCall runs the check render_flamegraph and page_explain share, and
+// records the attempt when it gets that far: it finds the handle's view,
+// refuses a bad title or an attempt of another view before anything is
+// recorded, decodes the explanations (an invalid shape is recorded as
+// invalid) and checks them against the engine. A failed check is recorded
+// as rejected and answered with the rejection result, an isError result
+// listing every failure with the engine's value. Every piece of advice
+// names tool, the tool to call again.
+func (s *Server) checkCall(tool string, a explainCall) (checked, error) {
+	e, v, err := s.store.view(a.Handle, a.View)
+	if err != nil {
+		return checked{}, err
 	}
 	if err := explain.CheckTitle(a.Title, s.lim.Explain); err != nil {
 		limit := ""
 		if len(a.Title) > s.lim.Explain.MaxTitleBytes {
 			limit = " (--limit Explain.MaxTitleBytes=N)"
 		}
-		return mcpstdio.Result{}, fmt.Errorf("%v%s; nothing was recorded, so call render_flamegraph again with the same attempt, if any", err, limit)
+		return checked{}, fmt.Errorf("%v%s; nothing was recorded, so call %s again with the same attempt, if any", err, limit, tool)
 	}
 	notes, err := viewNotes(v)
 	if err != nil {
-		return mcpstdio.Result{}, err
+		return checked{}, err
 	}
 	if a.Attempt != "" {
 		if _, err := s.attempts.lookup(a.Attempt, e.prof, a.View); err != nil {
-			return mcpstdio.Result{}, err
+			return checked{}, err
 		}
 	}
 	notices := []explain.Notice{}
@@ -143,63 +227,47 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	exps, decoded, err := explain.Decode(a.Explanations, s.lim.Explain)
 	if err != nil {
 		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeInvalid, nil)
-		return mcpstdio.Result{}, fmt.Errorf("attempt %s: %v; fix explanations and call render_flamegraph again with attempt %q", id, err, id)
+		s.recorded()
+		return checked{}, fmt.Errorf("attempt %s: %v; fix explanations and call %s again with attempt %q", id, err, tool, id)
 	}
 	notices = append(notices, decoded...)
 
 	r := explain.Check(v, exps, s.lim.Explain)
-	if !r.OK {
-		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeRejected, r.Failures)
-		if omitted, tooLarge := leftOut(r.Failures); omitted+tooLarge > 0 {
-			var says []string
-			if omitted > 0 {
-				says = append(says, fmt.Sprintf("\"and %d more failures\"", omitted))
-			}
-			if tooLarge > 0 {
-				says = append(says, fmt.Sprintf("\"%d failures too large to keep\"", tooLarge))
-			}
-			notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
-				"this result lists all %d failures; the server's record of %s keeps at most %d of them (claims first, then references, then limits) "+
-					"and none whose text exceeds %d bytes, so a later page lists those and says %s",
-				len(r.Failures), id, maxStoredFailures, maxFailureBytes, strings.Join(says, " and "))})
-		}
-		res, err := s.respond("render_flamegraph", shrinkRejected, renderRejected{
-			Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices, Notes: notes,
-			Next: fmt.Sprintf("nothing was written; %s (the engine's value is in engine), and call render_flamegraph again with attempt %q", recheckAdvice, id),
-		})
-		if err != nil {
-			return mcpstdio.Result{}, fmt.Errorf("attempt %s was rejected with %d failures: %v", id, len(r.Failures), err)
-		}
-		res.IsError = true
-		return res, nil
+	if r.OK {
+		return checked{e: e, v: v, r: r, notices: notices, notes: notes}, nil
 	}
+	id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeRejected, r.Failures)
+	s.recorded()
+	if omitted, tooLarge := leftOut(r.Failures); omitted+tooLarge > 0 {
+		var says []string
+		if omitted > 0 {
+			says = append(says, fmt.Sprintf("\"and %d more failures\"", omitted))
+		}
+		if tooLarge > 0 {
+			says = append(says, fmt.Sprintf("\"%d failures too large to keep\"", tooLarge))
+		}
+		notices = append(notices, explain.Notice{Path: "explanations", Message: fmt.Sprintf(
+			"this result lists all %d failures; the server's record of %s keeps at most %d of them (claims first, then references, then limits) "+
+				"and none whose text exceeds %d bytes, so a later page lists those and says %s",
+			len(r.Failures), id, maxStoredFailures, maxFailureBytes, strings.Join(says, " and "))})
+	}
+	res, err := s.respond(tool, shrinkRejected, renderRejected{
+		Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices, Notes: notes,
+		Next: fmt.Sprintf("nothing was %s; %s (the engine's value is in engine), and call %s again with attempt %q", verbOf(tool), recheckAdvice, tool, id),
+	})
+	if err != nil {
+		return checked{}, fmt.Errorf("attempt %s was rejected with %d failures: %v", id, len(r.Failures), err)
+	}
+	res.IsError = true
+	return checked{notes: notes, rejection: &res}, nil
+}
 
-	id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeWritten, nil)
-	rejected, dropped, incomplete := s.attempts.rejected(e.prof, a.View)
-	var page bytes.Buffer
-	err = flamegraph.WriteExplainedPage(&page, v, r, flamegraph.ExplainedPageOptions{
-		Title: a.Title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: id,
-		Rejected: rejected, DroppedRejected: dropped, HistoryIncomplete: incomplete,
-		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
-	})
-	if err == nil && page.Len() > s.lim.MaxPageBytes {
-		err = fmt.Errorf("the page is %d bytes", page.Len())
+// recorded brings the live page's histories up to the attempt record
+// after the record changed, and tells the page when one moved.
+func (s *Server) recorded() {
+	if s.live != nil && s.refreshHistory() {
+		s.commit()
 	}
-	if err != nil {
-		s.attempts.setOutcome(id, outcomeFailed)
-		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but the page cannot be rendered within this server's MaxPageBytes=%d: %v; "+
-			"explain fewer or shorter paths, or restart perf-agent-mcp with a larger --limit MaxPageBytes=N", id, s.lim.MaxPageBytes, err)
-	}
-	path, err := s.writePage(a.Out, page.Bytes())
-	if err != nil {
-		s.attempts.setOutcome(id, outcomeFailed)
-		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but no page was written: %v", id, err)
-	}
-	s.log.Info("rendered", "attempt", id, "handle", a.Handle, "view", a.View, "path", path, "bytes", page.Len())
-	return s.respond("render_flamegraph", shrinkRender, renderWritten{
-		Attempt: id, Status: outcomeWritten, Path: path, Bytes: wireInt(int64(page.Len())),
-		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r, a.Title))), Notices: notices, Notes: notes,
-	})
 }
 
 // uncheckedNumbers counts the numbers no claim checked in r's text and in

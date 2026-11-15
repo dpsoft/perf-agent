@@ -17,27 +17,12 @@ import (
 	"time"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest/fakemode"
 )
 
-type modeFile struct {
-	Mode       string `json:"mode"`
-	ReadyAfter int64  `json:"ready_after_ns"`
-	Record     string `json:"record"`
-}
-
-type record struct {
-	Argv       []string `json:"argv"`
-	Env        []string `json:"env"`
-	PID        int      `json:"pid"`
-	PGID       int      `json:"pgid"`
-	Grandchild int      `json:"grandchild,omitzero"`
-}
-
-const grandchildArg = "--fake-grandchild"
-
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == grandchildArg {
-		time.Sleep(30 * time.Second)
+	if len(os.Args) == 2 && os.Args[1] == fakemode.GrandchildArg {
+		time.Sleep(10 * time.Second)
 		return
 	}
 	os.Exit(run())
@@ -49,7 +34,7 @@ func run() int {
 		return fail(err)
 	}
 	dir := filepath.Dir(exe)
-	var mf modeFile
+	var mf fakemode.File
 	if b, err := os.ReadFile(filepath.Join(dir, "fake-mode.json")); err != nil {
 		return fail(err)
 	} else if err := json.Unmarshal(b, &mf); err != nil {
@@ -70,11 +55,21 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "fakeperfagent:", err)
 		return 2
 	}
-	duration, _ := time.ParseDuration(*vals["duration"])
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "fakeperfagent: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	var duration time.Duration
+	if v := *vals["duration"]; v != "" {
+		if duration, err = time.ParseDuration(v); err != nil {
+			fmt.Fprintln(os.Stderr, "fakeperfagent: bad --duration:", err)
+			return 2
+		}
+	}
 
-	rec := record{Argv: os.Args, Env: os.Environ(), PID: os.Getpid(), PGID: syscall.Getpgrp()}
-	if mf.Mode == "fork-grandchild" {
-		gc := exec.Command(exe, grandchildArg)
+	rec := fakemode.Record{Argv: os.Args, Env: os.Environ(), PID: os.Getpid(), PGID: syscall.Getpgrp()}
+	if mf.Mode == fakemode.ForkGrandchild {
+		gc := exec.Command(exe, fakemode.GrandchildArg)
 		if err := gc.Start(); err != nil {
 			return fail(err)
 		}
@@ -90,29 +85,29 @@ func run() int {
 
 	sigs := make(chan os.Signal, 1)
 	switch mf.Mode {
-	case "exit1-stderr":
+	case fakemode.Exit1Stderr:
 		fmt.Fprintln(os.Stderr, "failed to set capabilities")
 		return 1
-	case "exit2":
+	case fakemode.Exit2:
 		fmt.Fprintln(os.Stderr, "usage: fakeperfagent")
 		return 2
-	case "exit127-loader":
+	case fakemode.Exit127Loader:
 		fmt.Fprintln(os.Stderr, "error while loading shared libraries: libblazesym_c.so")
 		return 127
-	case "ignore-sigint":
+	case fakemode.IgnoreSIGINT:
 		signal.Ignore(syscall.SIGINT)
 	default:
 		signal.Notify(sigs, syscall.SIGINT)
 	}
 
 	time.Sleep(time.Duration(mf.ReadyAfter))
-	if mf.Mode == "never-ready" {
+	if mf.Mode == fakemode.NeverReady {
 		<-sigs
 		return 1
 	}
 	fmt.Printf(capture.ReadinessFormat+"\n", duration)
 
-	if mf.Mode == "spam-stdout" {
+	if mf.Mode == fakemode.SpamStdout {
 		spam(os.Stdout)
 		spam(os.Stderr)
 	}
@@ -123,7 +118,7 @@ func run() int {
 	}
 	select {
 	case <-sigs:
-		if mf.Mode == "hang-after-sigint" {
+		if mf.Mode == fakemode.HangAfterSIGINT {
 			time.Sleep(10 * time.Minute)
 			return 1
 		}
@@ -151,16 +146,19 @@ func spam(w io.Writer) {
 
 // writeOutputs creates the files the argv asked for from the fixtures
 // beside the executable.
-func writeOutputs(mode, dir string, vals map[string]*string) error {
-	if mode == "no-file" {
+func writeOutputs(mode fakemode.Mode, dir string, vals map[string]*string) error {
+	if mode == fakemode.NoFile {
 		return nil
 	}
 	fix := func(name string) string { return filepath.Join(dir, "fixtures", name) }
 	outs := []struct{ flag, fixture string }{
-		{"profile-output", "cpu.pb.gz"},
-		{"offcpu-output", "cpu.pb.gz"},
-		{"gpu-output", "gpu.pb.gz"},
-		{"gpu-executions-output", "gpu.execlog"},
+		{"profile-output", fakemode.FixtureCPU},
+		{"offcpu-output", fakemode.FixtureCPU},
+		{"gpu-output", fakemode.FixtureGPU},
+		{"gpu-executions-output", fakemode.FixtureExeclog},
+	}
+	if mode == fakemode.NoGPUSamples {
+		outs[2].fixture, outs[3].fixture = fakemode.FixtureGPUEmpty, fakemode.FixtureExeclogEmpty
 	}
 	for i, o := range outs {
 		dst := *vals[o.flag]
@@ -169,16 +167,12 @@ func writeOutputs(mode, dir string, vals map[string]*string) error {
 		}
 		var err error
 		switch {
-		case mode == "symlink-output" && i == 0:
+		case mode == fakemode.SymlinkOutput && i == 0:
 			err = os.Symlink(fix(o.fixture), dst)
-		case mode == "hardlink-output" && i == 0:
+		case mode == fakemode.HardlinkOutput && i == 0:
 			err = os.Link(fix(o.fixture), dst)
-		case mode == "huge-file" && i == 0:
+		case mode == fakemode.HugeFile && i == 0:
 			err = sparse(dst, 256<<20)
-		case mode == "no-gpu-samples" && o.flag == "gpu-output":
-			err = os.WriteFile(dst, nil, 0o644)
-		case mode == "no-gpu-samples" && o.flag == "gpu-executions-output":
-			err = os.WriteFile(dst, nil, 0o644)
 		default:
 			err = copyFile(fix(o.fixture), dst)
 		}

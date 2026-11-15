@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -161,7 +162,7 @@ func TestFakeKeepsItsComm(t *testing.T) {
 	if _, err := bufio.NewReader(stdout).ReadString('\n'); err != nil {
 		t.Fatal(err)
 	}
-	comm, err := os.ReadFile("/proc/" + itoa(cmd.Process.Pid) + "/comm")
+	comm, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/comm")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,8 +170,6 @@ func TestFakeKeepsItsComm(t *testing.T) {
 		t.Fatalf("comm %q", got)
 	}
 }
-
-func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 
 func TestWorkloadReportAndExecChain(t *testing.T) {
 	w := capturetest.Workload(t)
@@ -202,7 +201,7 @@ func TestFakeFailureModes(t *testing.T) {
 		err  string
 	}{
 		capturetest.FakeExit1Stderr:   {1, "failed to set capabilities"},
-		capturetest.FakeExit2:         {2, ""},
+		capturetest.FakeExit2:         {2, "usage: fakeperfagent"},
 		capturetest.FakeExit127Loader: {127, "error while loading shared libraries: libblazesym_c.so"},
 	} {
 		fake := capturetest.FakePerfAgent(t, capturetest.FakeOptions{Mode: mode})

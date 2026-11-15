@@ -5,6 +5,7 @@ package capturetest
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -15,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/gpu/execlog"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest/fakemode"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
@@ -33,7 +36,8 @@ var buildDir string
 func Main(m *testing.M) int {
 	dir, err := os.MkdirTemp("", "capturetest-")
 	if err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, "capturetest:", err)
+		return 1
 	}
 	buildDir = dir
 	defer func() { _ = os.RemoveAll(dir) }()
@@ -83,23 +87,27 @@ func Workload(tb testing.TB) string {
 }
 
 // FakeMode selects what the fake perf-agent does.
-type FakeMode string
+type FakeMode = fakemode.Mode
 
 const (
-	FakeNormal          FakeMode = "normal"
-	FakeNeverReady      FakeMode = "never-ready"
-	FakeIgnoreSIGINT    FakeMode = "ignore-sigint"
-	FakeExit1Stderr     FakeMode = "exit1-stderr"
-	FakeExit2           FakeMode = "exit2"
-	FakeExit127Loader   FakeMode = "exit127-loader"
-	FakeNoFile          FakeMode = "no-file"
-	FakeHugeFile        FakeMode = "huge-file"
-	FakeSymlinkOutput   FakeMode = "symlink-output"
-	FakeHardlinkOutput  FakeMode = "hardlink-output"
-	FakeSpamStdout      FakeMode = "spam-stdout"
-	FakeForkGrandchild  FakeMode = "fork-grandchild"
-	FakeHangAfterSIGINT FakeMode = "hang-after-sigint"
-	FakeNoGPUSamples    FakeMode = "no-gpu-samples"
+	FakeNormal         = fakemode.Normal
+	FakeNeverReady     = fakemode.NeverReady
+	FakeIgnoreSIGINT   = fakemode.IgnoreSIGINT
+	FakeExit1Stderr    = fakemode.Exit1Stderr
+	FakeExit2          = fakemode.Exit2
+	FakeExit127Loader  = fakemode.Exit127Loader
+	FakeNoFile         = fakemode.NoFile
+	FakeHugeFile       = fakemode.HugeFile
+	FakeSymlinkOutput  = fakemode.SymlinkOutput
+	FakeHardlinkOutput = fakemode.HardlinkOutput
+	FakeSpamStdout     = fakemode.SpamStdout
+	FakeForkGrandchild = fakemode.ForkGrandchild
+	// FakeHangAfterSIGINT ignores the stop request's effect: it never exits
+	// after SIGINT until killed.
+	FakeHangAfterSIGINT = fakemode.HangAfterSIGINT
+	// FakeNoGPUSamples writes a valid profile with zero GPU samples and an
+	// execution log consistent with it.
+	FakeNoGPUSamples = fakemode.NoGPUSamples
 )
 
 // FakeOptions configures one fake perf-agent.
@@ -109,14 +117,6 @@ type FakeOptions struct {
 	// Record is a path the fake writes its argv, environment, pid and
 	// pgid to as JSON.
 	Record string
-}
-
-// modeFile is the on-disk form of FakeOptions. The fake runs with a
-// scrubbed environment, so it reads this file beside its executable.
-type modeFile struct {
-	Mode       FakeMode `json:"mode"`
-	ReadyAfter int64    `json:"ready_after_ns"`
-	Record     string   `json:"record"`
 }
 
 // FakePerfAgent stages a fake perf-agent in tb.TempDir() and returns its
@@ -137,7 +137,7 @@ func FakePerfAgent(tb testing.TB, o FakeOptions) string {
 	if mode == "" {
 		mode = FakeNormal
 	}
-	b, err := json.Marshal(modeFile{Mode: mode, ReadyAfter: int64(o.ReadyAfter), Record: o.Record})
+	b, err := json.Marshal(fakemode.File{Mode: mode, ReadyAfter: int64(o.ReadyAfter), Record: o.Record})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -151,9 +151,13 @@ func FakePerfAgent(tb testing.TB, o FakeOptions) string {
 	if err := os.Mkdir(fixtures, 0o755); err != nil {
 		tb.Fatal(err)
 	}
-	write(filepath.Join(fixtures, "cpu.pb.gz"), pmfixture.CPUBasic())
-	write(filepath.Join(fixtures, "gpu.pb.gz"), pmfixture.GPUBasic())
-	write(filepath.Join(fixtures, "gpu.execlog"), pmfixture.GPUBasicExeclog(tb))
+	write(filepath.Join(fixtures, fakemode.FixtureCPU), pmfixture.CPUBasic())
+	write(filepath.Join(fixtures, fakemode.FixtureGPU), pmfixture.GPUBasic())
+	write(filepath.Join(fixtures, fakemode.FixtureExeclog), pmfixture.GPUBasicExeclog(tb))
+	empty := pmfixture.Build("gpu", "nanoseconds", []string{"perf-agent.capture_id=cap-1"})
+	write(filepath.Join(fixtures, fakemode.FixtureGPUEmpty), empty)
+	write(filepath.Join(fixtures, fakemode.FixtureExeclogEmpty), pmfixture.Execlog(tb, empty,
+		execlog.Header{CaptureID: "cap-1", Backend: "cupti", SampleType: "gpu/nanoseconds"}, nil))
 	return path
 }
 
@@ -175,7 +179,9 @@ func copyFile(src, dst string) error {
 }
 
 // SkipIfPrivileged skips tb when the process runs as root or holds
-// capabilities, since the checks under test then behave differently.
+// capabilities, since the checks under test then behave differently. It
+// fails open: when /proc/self/status cannot be read only the euid is
+// checked.
 func SkipIfPrivileged(tb testing.TB) {
 	tb.Helper()
 	if os.Geteuid() == 0 {

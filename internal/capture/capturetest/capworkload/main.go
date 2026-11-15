@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,15 +36,44 @@ func main() {
 }
 
 func run(mode string, args []string) error {
+	var perr error
 	arg := func(i int) string {
 		if i < len(args) {
 			return args[i]
 		}
+		perr = errors.Join(perr, fmt.Errorf("%s needs argument %d", mode, i+1))
 		return ""
 	}
 	dur := func(i int) time.Duration {
-		d, _ := time.ParseDuration(arg(i))
+		d, err := time.ParseDuration(arg(i))
+		if err != nil {
+			perr = errors.Join(perr, err)
+		}
 		return d
+	}
+	num := func(i int) int {
+		n, err := strconv.Atoi(arg(i))
+		if err != nil {
+			perr = errors.Join(perr, err)
+		}
+		return n
+	}
+	// Arguments are parsed up front so a bad one is an error, never a
+	// zero duration.
+	switch mode {
+	case "busy", "sleep", "fork-and-exit", "double-fork-setsid", spawnSetsid, "ignore-sigterm":
+		dur(0)
+	case "exit-after":
+		dur(0)
+		num(1)
+	case "drop-dumpable-after", "setresgid-after":
+		dur(0)
+		dur(1)
+	case "flood-output":
+		num(0)
+	}
+	if perr != nil {
+		return perr
 	}
 	switch mode {
 	case "busy":
@@ -53,8 +83,7 @@ func run(mode string, args []string) error {
 		time.Sleep(dur(0))
 	case "exit-after":
 		time.Sleep(dur(0))
-		code, _ := strconv.Atoi(arg(1))
-		os.Exit(code)
+		os.Exit(num(1))
 	case "fork-and-exit":
 		return forkAndExit(dur(0))
 	case "double-fork-setsid":
@@ -73,8 +102,7 @@ func run(mode string, args []string) error {
 		signal.Ignore(syscall.SIGTERM)
 		time.Sleep(dur(0))
 	case "flood-output":
-		mib, _ := strconv.Atoi(arg(0))
-		flood(mib)
+		flood(num(0))
 	case "report":
 		return report()
 	case "exec":
@@ -170,9 +198,13 @@ func report() error {
 	if err != nil {
 		return err
 	}
-	// The comm field may hold spaces; the rest starts after the last ')'.
-	_, rest, _ := strings.Cut(string(stat), ") ")
-	fields := strings.Fields(rest)
+	// The comm field may hold spaces and parentheses; the rest starts after
+	// the last ')'.
+	i := strings.LastIndex(string(stat), ")")
+	if i < 0 {
+		return errors.New("malformed /proc/self/stat")
+	}
+	fields := strings.Fields(string(stat)[i+1:])
 	tty := -1
 	if len(fields) > 4 {
 		tty, _ = strconv.Atoi(fields[4])

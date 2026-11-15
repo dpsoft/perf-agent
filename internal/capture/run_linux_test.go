@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -229,8 +230,9 @@ func TestRunLaunchesACommand(t *testing.T) {
 		t.Errorf("target = %+v, want the launched workload", o.Target)
 	}
 	notes := strings.Join(o.Notes, "\n")
-	if !strings.Contains(notes, "after the command started") || !strings.Contains(notes, "only pid "+strconv.Itoa(o.Target.PID)+" was profiled") {
-		t.Errorf("notes = %q", o.Notes)
+	if attached := strings.Contains(notes, "after the command started"); attached != (o.AttachLatency.Round(100*time.Millisecond) > 0) ||
+		!strings.Contains(notes, "only pid "+strconv.Itoa(o.Target.PID)+" was profiled") {
+		t.Errorf("notes = %q (attach latency %v)", o.Notes, o.AttachLatency)
 	}
 	if (procRef{o.Target.PID, o.Target.StartTime}).alive() {
 		t.Error("the command still runs after Wait")
@@ -495,15 +497,71 @@ func TestRunSizeKill(t *testing.T) {
 	spec.Bounds.MaxProfileBytes = 1 << 20
 	target := startChild(t, "sleep")
 	spec.PID = target.PID
-	began := time.Now()
+	// The test watches the file itself, for when it passes the limit.
+	crossed := make(chan time.Time, 1)
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		for {
+			if fi, err := os.Lstat(filepath.Join(spec.StagingPath, OutputFile(ModeCPU))); err == nil && fi.Size() > spec.Bounds.MaxProfileBytes {
+				crossed <- time.Now()
+				return
+			}
+			select {
+			case <-stopWatch:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}()
 	o := waitRun(t, startRun(t, spec), 30*time.Second)
+	returned := time.Now()
 	if errCode(o.Err) != CodeTooLarge || !strings.Contains(o.Err.Message, OutputFile(ModeCPU)) {
 		t.Fatalf("Err = %v", o.Err)
 	}
-	// The fake grows the file just after readiness; the poll catches it
-	// within one interval and the kill ends it. A second of slack.
-	if d := time.Since(began) - o.AttachLatency; d > time.Second+time.Second {
-		t.Errorf("too_large %v after readiness, want within 1s (+1s slack)", d)
+	select {
+	case at := <-crossed:
+		// One poll to see it, the kill and the reaper's report: within 1s.
+		if d := returned.Sub(at); d > time.Second {
+			t.Errorf("Wait returned %v after the file passed its limit, want within 1s", d)
+		}
+	default:
+		t.Fatal("the file never passed its limit")
+	}
+}
+
+// Any regular file in staging is bounded: an unexpected name by
+// MaxProfileBytes, the execution log by MaxExeclogBytes.
+func TestSizesBoundEveryFileInStaging(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	r.spec.Staging = root
+	r.b.MaxExeclogBytes = 2 * r.b.MaxProfileBytes
+	grow := func(name string, size int64) {
+		t.Helper()
+		f, err := os.Create(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(size); err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+	}
+	grow(OutputFile(ModeCPU), 10)
+	grow(ExeclogFile, r.b.MaxProfileBytes+1)
+	if e := r.sizes(); e != nil {
+		t.Errorf("an execution log within MaxExeclogBytes: %v", e)
+	}
+	grow("stray.bin", r.b.MaxProfileBytes+1)
+	if e := r.sizes(); errCode(e) != CodeTooLarge || !strings.Contains(e.Message, "stray.bin") {
+		t.Errorf("an unexpected file over MaxProfileBytes: %v", e)
 	}
 }
 
@@ -872,8 +930,19 @@ func TestExecProofNeedsTheCommandNotTheLauncher(t *testing.T) {
 	// A helper child is this test binary: what a launcher that never
 	// executed would still be.
 	launcher := startChild(t, "sleep")
-	if e := proof(w, launcher.PID); errCode(e) != CodeInvalidArgument || !strings.Contains(e.Message, "still runs the launcher") {
-		t.Errorf("a launcher passed for the command: %v", e)
+	if e := proof(w, launcher.PID); errCode(e) != CodeTargetExited || !e.Retryable || !strings.Contains(e.Message, "still runs the launcher") {
+		t.Errorf("a launcher passed for the command, or not as target_exited: %v", e)
+	}
+	// Another program is accepted, and noted for what it is.
+	other := exec.Command("/bin/sleep", "60")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	or := &Run{spec: RunSpec{Proc: DefaultProc(), Launch: &LaunchSpec{Path: w}}, launchers: launcherIDs(self), cmdIDs: commandIDs(w)}
+	ostart, _ := StartTime(DefaultProc(), other.Process.Pid)
+	if e := or.execProven(other.Process.Pid, ostart); e != nil || !strings.Contains(strings.Join(or.o.Notes, ""), "executed a program other than the resolved command") {
+		t.Errorf("another program: %v, notes %q", e, or.o.Notes)
 	}
 	cmd := exec.Command(w, "sleep", "1m")
 	if err := cmd.Start(); err != nil {
@@ -1039,6 +1108,97 @@ func TestAKillDecidesTheStopNotTheExitsItCauses(t *testing.T) {
 	}
 }
 
+// The launcher's own failures (CAP-R29): an exec it reports is the
+// command's fault, invalid_argument naming it; a launcher that never got
+// to the command is target_exited, retryable, with a note.
+func TestLaunchErrorsMapToTheirCodes(t *testing.T) {
+	for _, tc := range []struct {
+		err       string
+		code      Code
+		retryable bool
+		note      bool
+	}{
+		{"launch: exec /x/bench: no such file or directory", CodeInvalidArgument, false, false},
+		{"launch: exec /x/bench: exec format error", CodeInvalidArgument, false, false},
+		{"launch: the launcher exited before executing the command", CodeTargetExited, true, true},
+		{"launch: the launcher did not confirm its exec: i/o timeout", CodeTargetExited, true, true},
+	} {
+		kills := 0
+		r := testRun(t, &kills)
+		r.spec.Launch = &LaunchSpec{Path: "/x/bench"}
+		r.argvPID, r.perf = 0, instance{}
+		r.reaperError(Event{Op: EventError, Who: WhoWorkload, Err: tc.err})
+		e := r.o.Err
+		if errCode(e) != tc.code || e.Retryable != tc.retryable || r.o.Launched {
+			t.Errorf("%q: Err %+v", tc.err, e)
+			continue
+		}
+		if tc.code == CodeInvalidArgument && (!strings.Contains(e.Message, "command") || !strings.Contains(e.Message, tc.err[len("launch: exec /x/bench: "):])) {
+			t.Errorf("%q: message %q does not name the command and the errno", tc.err, e.Message)
+		}
+		if got := len(r.o.Notes) > 0; got != tc.note {
+			t.Errorf("%q: notes %q", tc.err, r.o.Notes)
+		}
+	}
+}
+
+// A command's attach latency is what its profile misses: it runs from
+// launched, the preflight included, not from the attach.
+func TestRunACommandsAttachLatencyRunsFromItsLaunch(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Launch = launchOf(t, "sleep", "1m")
+	var once sync.Once
+	spec.Proc.StartTimeHook = func(_ int, start uint64) uint64 {
+		once.Do(func() { time.Sleep(300 * time.Millisecond) }) // the launched preflight
+		return start
+	}
+	o := waitRun(t, startRun(t, spec), 30*time.Second)
+	if o.Err != nil {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	if o.AttachLatency < 300*time.Millisecond {
+		t.Errorf("AttachLatency = %v, want at least the 300ms preflight after launched", o.AttachLatency)
+	}
+}
+
+// The attach-latency note says nothing when the latency rounds to zero.
+func TestTheAttachNoteIsOmittedWhenItRoundsToZero(t *testing.T) {
+	if n := attachNote(40 * time.Millisecond); n != "" {
+		t.Errorf("note for 40ms = %q", n)
+	}
+	if n := attachNote(1400 * time.Millisecond); !strings.Contains(n, "1.4s after the command started") {
+		t.Errorf("note for 1.4s = %q", n)
+	}
+}
+
+// A target that cannot be read, though it has not ended, is "cannot
+// recheck": noted once, never a change and never its exit.
+func TestAnUnreadableTargetCannotBeRechecked(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	status := fakeStatus(ids(os.Getuid()), ids(os.Getgid()), "0000000000000000")
+	fp := fakeProc(t, 11, fakeStat(11, "w", "S", 500), status, "", "/bin/true")
+	r.spec.Proc = fp
+	r.target, r.targetKnown = TargetState{PID: 11, StartTime: 500}, true
+	if err := os.Chmod(filepath.Join(fp.Root, "11", "status"), 0); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if gone, e := r.observe(); gone || e != nil {
+			t.Fatalf("observe = %v, %v; want neither gone nor a change", gone, e)
+		}
+	}
+	if len(r.o.Notes) != 1 || !strings.Contains(r.o.Notes[0], "could not be rechecked") {
+		t.Errorf("notes = %q, want one cannot-recheck note", r.o.Notes)
+	}
+	if err := os.Chmod(filepath.Join(fp.Root, "11", "stat"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if r.pidGone() {
+		t.Error("an unreadable stat reads as the target's end")
+	}
+}
+
 // A reaper that does not answer a kill is not waited for forever: Wait
 // says stuck_child, naming what is known to be left.
 func TestRunAnUnresponsiveReaperIsStuckChild(t *testing.T) {
@@ -1072,7 +1232,59 @@ func TestRunAnUnresponsiveReaperIsStuckChild(t *testing.T) {
 	if !found {
 		t.Errorf("survivors %+v do not name perf-agent %d", o.Survivors, rec.PID)
 	}
+	// The readers did not stay behind on pipes the stopped children hold.
+	for _, st := range []*stream{r.perfOut, r.perfErr, r.workOut, r.workErr} {
+		select {
+		case <-st.done:
+		case <-time.After(5 * time.Second):
+			t.Error("a reader is still blocked after Wait")
+		}
+	}
 	// Let the reaper go on: it reads the EOF and cleans up.
+	_ = syscall.Kill(reaper, syscall.SIGCONT)
+	select {
+	case <-r.reaper.Done():
+	case <-time.After(20 * time.Second):
+		t.Error("the reaper did not finish once continued")
+	}
+}
+
+// With a command in its own cgroup, an unresponsive reaper's outcome names
+// the cgroup and lists the command.
+func TestRunAnUnresponsiveReaperNamesTheCgroup(t *testing.T) {
+	capturetest.SkipIfPrivileged(t)
+	parent, why := DelegatedCgroup(selfCgroup(t), cgroupMount)
+	if why != "" {
+		t.Skip("no delegated cgroup: " + why)
+	}
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Settings.Duration = time.Minute
+	spec.Bounds.StopGrace = 200 * time.Millisecond
+	spec.Bounds.FinishTimeout = 300 * time.Millisecond
+	spec.Cgroup = parent
+	spec.Launch = launchOf(t, "sleep", "1m")
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseProfiling, 10*time.Second)
+	reaper := r.reaper.PID()
+	if err := syscall.Kill(reaper, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(reaper, syscall.SIGCONT) })
+	r.Kill()
+	o := waitRun(t, r, 30*time.Second)
+	if errCode(o.Err) != CodeStuckChild {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	if !strings.Contains(strings.Join(o.Notes, "\n"), filepath.Join(parent, CgroupPrefix)) {
+		t.Errorf("notes %q do not name the cgroup", o.Notes)
+	}
+	listed := false
+	for _, s := range o.Survivors {
+		listed = listed || s.PID == o.Target.PID
+	}
+	if !listed {
+		t.Errorf("survivors %+v do not list the command %d", o.Survivors, o.Target.PID)
+	}
 	_ = syscall.Kill(reaper, syscall.SIGCONT)
 	select {
 	case <-r.reaper.Done():

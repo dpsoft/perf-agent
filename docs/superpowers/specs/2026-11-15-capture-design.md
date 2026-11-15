@@ -911,6 +911,11 @@ perf-agent translates it to the host PID itself (`resolveTarget`).
      `no_new_privs`);
   3. perf-agent starts with `--pid`.
 
+  Before step 2, `/proc/<pid>/exe` must no longer be the launcher. That
+  proves the exec happened, not that the program is the one resolved at
+  the start: a command swapped in after resolution is accepted with the
+  note "executed a program other than the resolved command".
+
   There is no start gate: a gate would have to `exec` the target after
   perf-agent attaches. perf-agent's interpreter enrolment would then see
   the gate process instead of the workload (`unwind/interp` enrols at

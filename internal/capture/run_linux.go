@@ -644,7 +644,9 @@ func (r *Run) attach(pid int) {
 		return
 	}
 	r.o.Argv, r.argvPID = argv, pid
-	r.attachFrom = time.Now()
+	if r.attachFrom.IsZero() {
+		r.attachFrom = time.Now()
+	}
 	r.setPhase(PhaseAttaching)
 	r.send(Command{Op: OpAttach, Argv: argv, Dir: r.spec.StagingPath})
 }
@@ -675,6 +677,9 @@ func (r *Run) event(ev Event) {
 func (r *Run) launched(ev Event) {
 	r.work = instance{ev.PID, ev.StartTime}
 	r.o.Target = TargetState{PID: ev.PID, StartTime: ev.StartTime}
+	// The command runs from here: its attach latency is what the profile
+	// misses of it, the preflight included.
+	r.attachFrom = time.Now()
 	if r.stopping() {
 		return
 	}
@@ -696,9 +701,9 @@ func (r *Run) launched(ev Event) {
 	r.attach(ev.PID)
 }
 
-// execProven checks that pid runs the command: its exe is the command or
-// its interpreter, or at least no longer the launcher (a command may exec
-// another program at once).
+// execProven checks that pid ran the exec: its exe is the command or its
+// interpreter, or at least no longer the launcher (a command may exec
+// another program at once, and that case is noted).
 func (r *Run) execProven(pid int, start uint64) *Error {
 	id, ok := statID(r.spec.Proc.path(pid, "exe"))
 	if !ok || !Alive(r.spec.Proc, pid, start) {
@@ -708,12 +713,15 @@ func (r *Run) execProven(pid int, start uint64) *Error {
 	case slices.Contains(r.cmdIDs, id):
 		return nil
 	case slices.Contains(r.launchers, id):
-		return Errorf(CodeInvalidArgument, "check that command[0] is an executable file",
+		r.o.Notes = append(r.o.Notes, fmt.Sprintf("pid %d never ran the command: it was still the launcher", pid))
+		return Errorf(CodeTargetExited, "capture it again",
 			"pid %d still runs the launcher, not %s: the command was never executed", pid, echo(r.spec.Launch.Path))
 	}
+	// Not the launcher, so the exec happened; but this shows only that, not
+	// that it was the command resolved at the start.
 	exe, _ := os.Readlink(r.spec.Proc.path(pid, "exe"))
-	r.o.Notes = append(r.o.Notes, fmt.Sprintf("pid %d runs %s, not %s: the command executed another program", pid,
-		filepath.Base(exe), filepath.Base(r.spec.Launch.Path)))
+	r.o.Notes = append(r.o.Notes, fmt.Sprintf("pid %d runs %s: it executed a program other than the resolved command %s",
+		pid, filepath.Base(exe), filepath.Base(r.spec.Launch.Path)))
 	return nil
 }
 
@@ -889,8 +897,7 @@ func (r *Run) reaperError(ev Event) {
 	case strings.HasPrefix(ev.Err, "the capture is ending"), strings.HasPrefix(ev.Err, "perf-agent was already started"):
 		return
 	case ev.Who == WhoWorkload:
-		r.failStop(Errorf(CodeInvalidArgument, "check that command[0] is an executable file this user may run",
-			"the command could not be started: %s", cut(ev.Err, maxPathEcho)))
+		r.failStop(r.launchError(ev.Err))
 	case ev.Who == WhoPerfAgent:
 		code, rest, ok := strings.Cut(ev.Err, ": ")
 		if _, known := DefaultRetryable[Code(code)]; ok && known {
@@ -899,6 +906,24 @@ func (r *Run) reaperError(ev Event) {
 			r.failStop(Errorf(CodePerfAgentUnstartable, "check the perf-agent binary", "perf-agent could not start: %s", cut(ev.Err, maxPathEcho)))
 		}
 	}
+}
+
+// launchError maps the launcher's failure. An exec it reports is the
+// command's: invalid_argument, naming it and the error. A launcher that
+// never got to the command (it exited, or its handshake failed) is
+// target_exited, retryable, with a note.
+func (r *Run) launchError(msg string) *Error {
+	text := strings.TrimPrefix(msg, "launch: ")
+	if rest, ok := strings.CutPrefix(text, "exec "); ok {
+		why := rest
+		if _, after, found := strings.Cut(rest, ": "); found {
+			why = after
+		}
+		return Errorf(CodeInvalidArgument, "check that command[0] is an executable file this user may run",
+			"the command %s could not be executed: %s", echo(r.spec.Launch.Path), cut(why, maxPathEcho))
+	}
+	r.o.Notes = append(r.o.Notes, "the launcher did not get to the command: "+cut(text, maxPathEcho))
+	return Errorf(CodeTargetExited, "capture it again", "the command was not started: %s", cut(text, maxPathEcho))
 }
 
 // poll checks the staging sizes while perf-agent writes, and whether a PID
@@ -923,11 +948,20 @@ func (r *Run) poll() {
 	}
 }
 
-// sizes is too_large for an expected file over its limit.
+// sizes is too_large for any regular file in staging over its limit: the
+// execution log's is MaxExeclogBytes, every other file's, an unexpected
+// one's included, MaxProfileBytes.
 func (r *Run) sizes() *Error {
-	for _, name := range ExpectedFiles(r.spec.Settings.Modes) {
+	dir, err := r.spec.Staging.Open(".")
+	if err != nil {
+		return nil
+	}
+	ents, _ := dir.ReadDir(-1)
+	_ = dir.Close()
+	for _, ent := range ents {
+		name := ent.Name()
 		fi, err := r.spec.Staging.Lstat(name)
-		if err != nil {
+		if err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
 		limit, which := r.b.MaxProfileBytes, "MaxProfileBytes"
@@ -1000,15 +1034,24 @@ func (r *Run) finishOutcome() {
 		r.o.Notes = append(r.o.Notes, "descendants may survive: "+r.o.Cleanup)
 	}
 	if r.o.Launched {
-		if !r.readyAt.IsZero() {
-			lat := r.o.AttachLatency.Round(100 * time.Millisecond)
-			r.o.Notes = append(r.o.Notes, fmt.Sprintf("profiling began %v after the command started; the first %v are not in the profile", lat, lat))
+		if n := attachNote(r.o.AttachLatency); !r.readyAt.IsZero() && n != "" {
+			r.o.Notes = append(r.o.Notes, n)
 		}
 		r.o.Notes = append(r.o.Notes, fmt.Sprintf("only pid %d was profiled, not processes it started", r.target.PID))
 	}
 	if r.o.Err == nil {
 		r.o.StderrTail = ""
 	}
+}
+
+// attachNote says how much of a command's run the profile misses; nothing
+// when that rounds to zero.
+func attachNote(latency time.Duration) string {
+	lat := latency.Round(100 * time.Millisecond)
+	if lat == 0 {
+		return ""
+	}
+	return fmt.Sprintf("profiling began %v after the command started; the first %v are not in the profile", lat, lat)
 }
 
 // lost is a reaper that gave no report, gone or unresponsive: whatever it

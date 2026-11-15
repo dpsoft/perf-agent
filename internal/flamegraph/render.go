@@ -448,9 +448,15 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 	// that height. The card gets its own element so the graph's arithmetic is
 	// untouched.
 	ew.s("<div class=\"canvas\">\n")
-	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s">`+"\n",
+	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s"`,
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
+	// Read by widthMeaning: at gpu_sample_period=1 the [gpu:launch] tooltip
+	// must not call the path beneath it a sample of launches.
+	if everyLaunchSampled(res) {
+		ew.s(` data-every-launch="1"`)
+	}
+	ew.s(">\n")
 	writeModuleTable(ew, mods)
 	writeNode(ew, root, res.Unit, root.value, mods, fusedAxesOf(res))
 	ew.s("</div>\n")
@@ -805,13 +811,19 @@ func writeSamplePeriodNote(ew *errWriter, res *foldedstacks.Result) {
 		html.EscapeString(period), html.EscapeString(period))
 }
 
+// samplePeriod reports the launch sampling period worth warning about. At
+// period 1 there is none: every launch carried its stack.
 func samplePeriod(res *foldedstacks.Result) (string, bool) {
 	for _, l := range res.Labels {
-		if l.Key == foldedstacks.SamplePeriodLabel && len(l.Top) > 0 {
+		if l.Key == foldedstacks.SamplePeriodLabel && len(l.Top) > 0 && !foldedstacks.EveryLaunchSampled(l) {
 			return l.Top[0].Value, true
 		}
 	}
 	return "", false
+}
+
+func everyLaunchSampled(res *foldedstacks.Result) bool {
+	return slices.ContainsFunc(res.Labels, foldedstacks.EveryLaunchSampled)
 }
 
 // writeTreeContainer emits the empty box the tree view is built into.

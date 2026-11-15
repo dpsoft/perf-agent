@@ -392,6 +392,35 @@ func TestRenderHTMLKeepsTheChromeOffThePage(t *testing.T) {
 	assert.Contains(t, got, `<summary id="info-btn" class="notes"`)
 }
 
+// At gpu_sample_period=1 every launch carried its stack, so the width under
+// [gpu:launch] is that path's share of GPU time and the banner saying
+// otherwise would be false. The [gpu:launch] tooltip drops its "one launch in
+// N" clause for the same reason, which the chart attribute tells it.
+func TestEveryLaunchSampledCarriesNoSamplingWarning(t *testing.T) {
+	page := func(periods ...string) string {
+		res := result(foldedstacks.Stack{Frames: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, Value: 100})
+		ls := foldedstacks.LabelSummary{Key: foldedstacks.SamplePeriodLabel, Distinct: len(periods), Total: 100, Count: 12}
+		for _, v := range periods {
+			ls.Top = append(ls.Top, foldedstacks.LabelValue{Value: v, Total: 50, Count: 6})
+		}
+		res.Labels = []foldedstacks.LabelSummary{ls}
+		return renderString(t, res, Options{Title: "t"})
+	}
+
+	got := page("1")
+	assert.NotContains(t, got, `<p class="note">`)
+	assert.NotContains(t, got, "not that path&rsquo;s share of GPU time")
+	assert.Contains(t, got, `data-every-launch="1"`)
+
+	for _, periods := range [][]string{{"8"}, {"1", "8"}} {
+		got := page(periods...)
+		assert.Contains(t, got, "not that path&rsquo;s share of GPU time", "periods %v", periods)
+		assert.NotContains(t, got, "data-every-launch", "periods %v", periods)
+	}
+	assert.NotContains(t, renderString(t, result(foldedstacks.Stack{Frames: []string{"main"}, Value: 1}), Options{}),
+		"data-every-launch", "no period label, no claim")
+}
+
 func TestRenderHTMLDoesNotFlagNotesOnAProfileThatHasNone(t *testing.T) {
 	got := renderString(t, result(foldedstacks.Stack{Frames: []string{"main"}, Value: 1}), Options{})
 	assert.Contains(t, got, `<summary id="info-btn" title=`)
@@ -1346,7 +1375,7 @@ func TestWidthMeaningFollowsTheFrameNotTheChart(t *testing.T) {
 	}
 
 	prog := `var out=typeof print==="function"?print:console.log;
-var unit="nanoseconds",axis;
+var unit="nanoseconds",axis,everyLaunch=false;
 ` + jsFunction(t, "axisOf") + "\n" + jsFunction(t, "widthMeaning") + `
 function f(d,up,ax){return {d:d,up:up,el:{dataset:ax===undefined?{}:{axis:ax}}};}
 function tree(fused){
@@ -1369,6 +1398,7 @@ out(JSON.stringify({
   gpuFirst:run("gpu+cpu/nanoseconds",true),
   noCPU:run("offcpu+gpu/nanoseconds",true),
   mixedRoot:run("",true),
+  everyLaunch:(function(){everyLaunch=true;var r=run("gpu/nanoseconds",false);everyLaunch=false;return r;})(),
   cpu:run("cpu/nanoseconds",false),
   gpu:run("gpu/nanoseconds",false)
 }));
@@ -1394,6 +1424,9 @@ out(JSON.stringify({
 	assert.Equal(t, got["fused"], got["gpuFirst"], "the order the inputs were given in changes nothing")
 	assert.Empty(t, got["noCPU"]["all"], "a sum with no CPU samples in it is not described as one")
 	assert.Empty(t, got["mixedRoot"]["all"], "a root that claims no axis says nothing")
+	assert.Equal(t, map[string]string{
+		"work": launched, "gmain": launched, "launch": "width: device time launched from this path", "kernel": kernel, "all": launched,
+	}, got["everyLaunch"], "at period 1 the boundary is not a sample of launches")
 	assert.Equal(t, map[string]string{
 		"work": "", "gmain": "", "launch": "", "kernel": "", "all": "",
 	}, got["cpu"], "a CPU page explains nothing")

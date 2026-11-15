@@ -492,6 +492,7 @@ var mods=(function(){var e=doc.getElementById("modules");if(!e){return [];}
 function moduleOf(d){var i=d.m;return i===undefined?"":(mods[+i]||"");}
 var idle=st.textContent,zoomTarget=null;
 var axis=chart.getAttribute("aria-label");
+var everyLaunch=chart.dataset.everyLaunch==="1";
 var inverted=false,treeOn=false,treeRoot=null;
 var nav=[],navIdx=-1,cur=null,tally="";
 
@@ -577,7 +578,7 @@ function widthMeaning(it,d){
   if(types.length>1){return types.indexOf("cpu")<0?"":"width: CPU samples and GPU time added together \u2014 compare within one root";}
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
-  case "boundary": return "width: device time launched from this path, sampled one launch in N";
+  case "boundary": return everyLaunch?"width: device time launched from this path":"width: device time launched from this path, sampled one launch in N";
   case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
   default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
   }

@@ -125,6 +125,14 @@ const UnsampledLaunchFrame = "[gpu:launch unsampled]"
 // attaches to the sampled population only.
 const SamplePeriodLabel = "gpu_sample_period"
 
+// EveryLaunchSampled reports whether a SamplePeriodLabel summary says every
+// launch carried its CPU stack: it has one value, and that value is 1. Then
+// the call path under [gpu:launch] is not a sample of launches but all of
+// them, and a warning that says otherwise would be false.
+func EveryLaunchSampled(l LabelSummary) bool {
+	return l.Key == SamplePeriodLabel && l.Distinct <= 1 && len(l.Top) == 1 && l.Top[0].Value == "1"
+}
+
 // DefaultInexactLabels encodes gpu/projection.go's honesty contract:
 // gpu_join is written unconditionally as exactly "exact", "heuristic" or
 // "unmatched", and gpu_ambiguous appears only when the join picked one of
@@ -644,7 +652,7 @@ func gpuSamplingWarnings(res *Result) []string {
 	var period string
 	var periodSamples int
 	for _, l := range res.Labels {
-		if l.Key == SamplePeriodLabel && len(l.Top) > 0 {
+		if l.Key == SamplePeriodLabel && len(l.Top) > 0 && !EveryLaunchSampled(l) {
 			period = l.Top[0].Value
 			periodSamples = l.Count
 		}

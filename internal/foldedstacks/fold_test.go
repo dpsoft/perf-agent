@@ -379,3 +379,27 @@ func TestFoldSaysNothingAboutSamplingWhenThereIsNone(t *testing.T) {
 	assert.NotContains(t, joined, "launch")
 	assert.NotContains(t, joined, "sample of GPU time")
 }
+
+// At gpu_sample_period=1 every launch carried its stack, so the call path
+// under [gpu:launch] IS that path's share of GPU time. The sampling warning
+// would say the opposite of the truth.
+func TestFoldSaysNothingAboutSamplingWhenEveryLaunchCarriedAStack(t *testing.T) {
+	p := oneType(
+		sample(397131, map[string][]string{"gpu_join": {"exact"}, SamplePeriodLabel: {"1"}},
+			loc(3, "main"), loc(4, "[gpu:launch]"), loc(2, "[gpu:kernel:k]")),
+	)
+	res, err := Fold(p, Options{SampleIndex: -1})
+	require.NoError(t, err)
+	joined := strings.Join(res.Warnings, "\n")
+	assert.NotContains(t, joined, "one launch in")
+	assert.NotContains(t, joined, "sample of GPU time")
+
+	// One sampled population is enough for the warning to be true of it.
+	p = oneType(
+		sample(1, map[string][]string{SamplePeriodLabel: {"1"}}, loc(3, "main"), loc(4, "[gpu:launch]")),
+		sample(1, map[string][]string{SamplePeriodLabel: {"8"}}, loc(5, "other"), loc(4, "[gpu:launch]")),
+	)
+	res, err = Fold(p, Options{SampleIndex: -1})
+	require.NoError(t, err)
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "not a sample of GPU time")
+}

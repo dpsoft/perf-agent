@@ -1,0 +1,676 @@
+// The live page. It reads the state the agent drives (the event stream, and
+// GET state when the stream is down), fetches the shown publication's model
+// and rejected history, and draws them with the shared panel. Every request
+// is a relative GET. The only received strings that become part of a request
+// path are publication and node IDs, and only when they have their fixed
+// shapes. Every figure comes from the server: this script formats no number.
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+
+  const transport = {
+    getJSON: async (path) => {
+      const r = await fetch(path, {cache: 'no-store'});
+      if (!r.ok) throw new Error('request refused: ' + path);
+      return r.json();
+    },
+    // subscribe opens the event stream. onState gets each state; onTrouble
+    // gets true when the browser gave the stream up for good (a refusal,
+    // such as too many open tabs) and false while it reconnects; onOpen is
+    // called when the stream is open.
+    subscribe: (onState, onTrouble, onOpen) => {
+      const es = new EventSource('events');
+      es.addEventListener('state', (ev) => {
+        let st;
+        try {
+          st = JSON.parse(ev.data);
+        } catch (e) {
+          return;
+        }
+        onState(st);
+      });
+      es.addEventListener('open', () => onOpen());
+      es.addEventListener('error', () => onTrouble(es.readyState === EventSource.CLOSED));
+      return es;
+    },
+  };
+
+  const GONE = 'perf-agent-mcp is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.';
+  const PAUSED = 'Live updates are paused because too many tabs have this page open. The page checks for changes every few seconds.';
+
+  // A seq is a decimal string. newer compares two by length, then
+  // lexically, so "10" is newer than "9" and no seq is ever a number.
+  const digits = /^[0-9]+$/;
+  const canonical = (s) => s.replace(/^0+(?=[0-9])/, '');
+  const newer = (a, b) => {
+    if (typeof a !== 'string' || !digits.test(a)) return false;
+    if (typeof b !== 'string' || !digits.test(b)) return true;
+    const x = canonical(a);
+    const y = canonical(b);
+    return x.length !== y.length ? x.length > y.length : x > y;
+  };
+
+  const pubShape = /^p[0-9]{1,18}$/;
+  const nodeShape = /^[0-9A-Za-z_-]{1,64}(\/[0-9A-Za-z_-]{1,64})?$/;
+  const isPub = (id) => typeof id === 'string' && pubShape.test(id);
+  const isNode = (id) => typeof id === 'string' && nodeShape.test(id);
+  const pubPath = (id, rest) => 'pub/' + id + '/' + rest;
+  const nodePath = (id, route, node) => pubPath(id, route + '/' + encodeURIComponent(node));
+
+  const make = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const clear = (e) => {
+    while (e.firstChild) e.removeChild(e.firstChild);
+  };
+
+  // acceptedSeq is the highest seq accepted so far. It is set before any of
+  // a state's work starts, so an older state that arrives while a newer one
+  // is still loading is refused. renderedSeq is the seq whose work finished.
+  let acceptedSeq = '';
+  let renderedSeq = '';
+  // retrySeq is an accepted seq whose work failed: the same state may be
+  // accepted once more.
+  let retrySeq = '';
+  // gen moves on every accepted agent state and every local navigation. An
+  // async chain commits to the DOM only if gen is still the one it started
+  // with.
+  let gen = 0;
+  // agent is the last accepted state; applied the last one whose work
+  // finished, which is what the agent last steered the page to.
+  let agent = null;
+  let applied = null;
+  // view is what the DOM shows: the publication, its whole model, the model
+  // drawn (the whole one or a focus), its history, the focused node and the
+  // selected node, with the drawn model's frames and elements by node ID.
+  let view = null;
+
+  let panel = null;
+  const panelModel = {
+    get fact_rows() {
+      return view ? view.shown.model.fact_rows : [];
+    },
+    get prompts() {
+      return view ? view.shown.model.prompts : [];
+    },
+  };
+
+  // --- Drawing a publication ---
+
+  // titleSegments writes a title's segments: text, and the numbers no claim
+  // checked, marked as the static page marks them.
+  const titleSegments = (parent, segs) => {
+    for (const s of segs || []) {
+      if (s.kind === 'unchecked') {
+        const m = make('mark', 'unchecked', s.text);
+        m.title = s.title || '';
+        parent.appendChild(m);
+      } else {
+        parent.appendChild(document.createTextNode(s.text || ''));
+      }
+    }
+  };
+
+  const renderPubs = () => {
+    const nav = $('pubs');
+    clear(nav);
+    for (const p of (agent && agent.publications) || []) {
+      if (!isPub(p.id)) continue;
+      const b = make('button');
+      b.type = 'button';
+      b.dataset.pub = p.id;
+      if (view && view.pub === p.id) b.setAttribute('aria-current', 'true');
+      b.appendChild(make('span', 'ref', p.id));
+      const t = make('span');
+      titleSegments(t, p.title_segs);
+      b.appendChild(t);
+      b.appendChild(make('span', 'vw', p.view || ''));
+      nav.appendChild(b);
+    }
+  };
+
+  const renderPills = () => {
+    const pills = $('pills');
+    clear(pills);
+    if (!view) return;
+    pills.appendChild(make('span', 'pill ai', '✦ Explained by an agent via MCP'));
+    const ok = make('span', 'pill ok', view.whole.checked_pill);
+    ok.title = 'Each structured claim was compared with the engine at its rounding, and each frame reference resolved';
+    pills.appendChild(ok);
+    pills.appendChild(make('span', 'pill', 'prose is not verified'));
+    const h = view.hist;
+    if (!h) return;
+    for (const text of [h.rejected_pill, h.limit_pill, h.history_pill]) {
+      if (text) pills.appendChild(make('span', 'pill bad', text));
+    }
+  };
+
+  const rejectedRow = (row) => {
+    const li = make('li');
+    li.appendChild(make('span', 'ref', row.attempt));
+    li.appendChild(document.createTextNode(' '));
+    if (row.evidence) {
+      li.appendChild(make('span', 'muted', '(' + row.evidence + ')'));
+      li.appendChild(document.createTextNode(' '));
+    }
+    li.appendChild(document.createTextNode(row.label));
+    if (row.kind === 'claim') {
+      if (row.metric) {
+        li.appendChild(document.createTextNode(' ('));
+        li.appendChild(make('code', '', row.metric));
+        li.appendChild(document.createTextNode(' of ' + (row.node || '') + ')'));
+      }
+      li.appendChild(document.createTextNode(':'));
+      if (row.agent) {
+        li.appendChild(document.createTextNode(' the agent wrote '));
+        li.appendChild(make('s', '', row.agent));
+      }
+      if (row.engine) {
+        li.appendChild(document.createTextNode((row.agent ? ',' : '') + ' perf-agent has '));
+        li.appendChild(make('b', '', row.engine));
+      }
+      li.appendChild(make('div', 'why', (row.code || '') + ': ' + (row.reason || '')));
+    } else if (row.kind !== 'more') {
+      li.appendChild(document.createTextNode(': ' + (row.reason || '')));
+    }
+    return li;
+  };
+
+  const renderRejected = () => {
+    const box = $('rejected');
+    clear(box);
+    const h = view && view.hist;
+    if (!h || (!(h.rows && h.rows.length) && !h.rejected_note)) return;
+    const sec = make('section', 'sec');
+    sec.appendChild(make('h5', '', 'Rejected at render'));
+    sec.appendChild(make('p', 'muted', "perf-agent refused these in earlier attempts. A claim row strikes through the agent's figure beside the engine's; reference and limit rows say what was wrong. This page is the attempt that passed."));
+    if (h.rejected_note) sec.appendChild(make('p', 'muted', h.rejected_note));
+    const ul = make('ul', 'rej');
+    for (const row of h.rows || []) ul.appendChild(rejectedRow(row));
+    sec.appendChild(ul);
+    box.appendChild(sec);
+  };
+
+  // applyHistory shows h if it is the shown publication's and newer than
+  // the history shown. Histories are not tied to a generation: a newer one
+  // is right whatever the page has selected since.
+  const applyHistory = (h) => {
+    if (!view || !h || h.publication !== view.pub) return;
+    if (view.hist && !newer(h.version, view.hist.version)) return;
+    view.hist = h;
+    renderPills();
+    renderRejected();
+  };
+
+  const renderLegend = (m) => {
+    const legend = $('legend');
+    clear(legend);
+    for (const l of m.legend || []) {
+      const c = make('span', 'c');
+      const sw = make('i', 'sw');
+      sw.dataset.domain = l.key;
+      c.appendChild(sw);
+      c.appendChild(document.createTextNode(l.label));
+      legend.appendChild(c);
+    }
+    legend.appendChild(make('span', 'c key', '✦ path with an explanation'));
+  };
+
+  const renderNotes = (m) => {
+    const notes = $('notes');
+    clear(notes);
+    notes.hidden = !(m.notes && m.notes.length);
+    if (notes.hidden) return;
+    notes.appendChild(make('b', '', 'Sampling notes'));
+    const ul = make('ul');
+    for (const n of m.notes) ul.appendChild(make('li', '', n));
+    notes.appendChild(ul);
+  };
+
+  const renderQuality = (m) => {
+    const q = $('quality');
+    clear(q);
+    for (const r of m.quality || []) {
+      q.appendChild(make('span', 'k', r.k));
+      const v = make('span', 'v', r.v);
+      v.title = r.t;
+      q.appendChild(v);
+      q.appendChild(make('span', 'st st-' + r.s, r.s));
+      q.appendChild(make('span', 'p', r.n));
+    }
+  };
+
+  const renderFoot = (m) => {
+    const foot = $('foot');
+    clear(foot);
+    const total = make('span', '', 'Total ' + m.total);
+    total.title = m.total_title;
+    foot.appendChild(total);
+    foot.appendChild(make('span', '', 'View ' + m.view));
+    if (m.profile_name) foot.appendChild(make('span', '', 'Profile ' + m.profile_name));
+    if (m.digest) {
+      const d = make('span', '', 'Digest ');
+      d.appendChild(make('code', '', m.digest));
+      foot.appendChild(d);
+    }
+    if (m.attempt) foot.appendChild(make('span', '', 'Attempt ' + m.attempt));
+  };
+
+  const updateButtons = () => {
+    $('focus-btn').disabled = !view || !view.selected || view.focus === view.selected;
+    $('whole-btn').disabled = !view || !view.focus;
+  };
+
+  // drawModel draws m, the publication's whole model or a focus of it:
+  // the frames, the axis, what was left out and the explained rows. The
+  // frames' geometry is the model's strings with their units; the static
+  // page's "cur" class is dropped, because this page owns the selection.
+  const drawModel = (m) => {
+    view.shown = m;
+    view.frames = new Map();
+    view.els = new Map();
+    for (const f of m.model.frames) view.frames.set(f.id, f);
+
+    const chart = $('chart');
+    clear(chart);
+    chart.style.height = m.height + 'px';
+    for (const d of m.drawn) {
+      const f = m.model.frames[d.i];
+      if (!f) continue;
+      const el = make('div', 'frame');
+      for (const c of (d.cls || '').split(' ')) {
+        if (c && c !== 'cur') el.classList.add(c);
+      }
+      el.style.left = d.left + '%';
+      el.style.width = d.width + '%';
+      el.style.top = d.top + 'px';
+      el.dataset.i = d.i;
+      el.dataset.domain = d.domain;
+      if (d.res) el.dataset.resolution = d.res;
+      el.tabIndex = 0;
+      el.setAttribute('role', 'button');
+      el.title = d.tip;
+      const label = make('span', 'fl');
+      if (d.star) label.appendChild(make('span', 'star', '✦'));
+      label.appendChild(document.createTextNode(f.name));
+      el.appendChild(label);
+      chart.appendChild(el);
+      view.els.set(f.id, el);
+    }
+
+    const axis = $('axis');
+    clear(axis);
+    axis.appendChild(make('span', '', m.view + ' · ' + m.axis));
+    const total = make('span', '', 'total ' + m.total);
+    total.title = m.total_title;
+    axis.appendChild(total);
+
+    const left = $('left-out');
+    clear(left);
+    for (const note of [m.narrow_note, m.limit_note, m.size_note]) {
+      if (note) left.appendChild(make('p', 'left-out', note));
+    }
+
+    const rows = $('rows');
+    clear(rows);
+    for (const r of m.rows || []) {
+      const b = make('button', 'exrow');
+      b.type = 'button';
+      b.dataset.node = r.node;
+      b.appendChild(make('span', 'star', '✦'));
+      b.appendChild(make('span', 'ref', r.ref));
+      b.appendChild(make('code', '', r.name));
+      b.appendChild(make('span', 'w', r.share + ' · ' + r.cum));
+      rows.appendChild(b);
+    }
+    if (!rows.firstChild) rows.appendChild(make('p', 'muted', 'The agent explained no path.'));
+    updateButtons();
+  };
+
+  const clearPanel = () => {
+    for (const id of ['sel-ref', 'sel-name', 'sel-id']) $(id).textContent = '';
+    for (const id of ['facts', 'exp', 'path', 'chips']) clear($(id));
+    $('noexp').hidden = true;
+  };
+
+  // commitPublication shows publication id with its model and history,
+  // which were fetched together and are shown together.
+  const commitPublication = (id, model, hist) => {
+    view = {pub: id, whole: model, shown: null, hist: null, focus: '', selected: '', frames: new Map(), els: new Map()};
+    document.title = model.doc_title || 'perf-agent live page';
+    const title = $('title');
+    clear(title);
+    titleSegments(title, model.title_segs);
+    $('view').textContent = model.view;
+    $('waiting').hidden = true;
+    const exp = $('export');
+    exp.href = pubPath(id, 'export');
+    exp.download = id + '.html';
+    exp.hidden = false;
+    renderLegend(model);
+    renderNotes(model);
+    renderQuality(model);
+    renderFoot(model);
+    clearPanel();
+    drawModel(model);
+    applyHistory(hist);
+    renderPills();
+    renderRejected();
+    renderPubs();
+  };
+
+  // --- Selecting a node ---
+
+  // refOf names a node as the drawn model does, or by its node ID when the
+  // model does not hold it.
+  const refOf = (id) => {
+    const f = view && view.frames.get(id);
+    return f ? f.ref : id;
+  };
+  const relabelSegs = (segs) => (segs || []).map((s) => (s.kind === 'node' ? Object.assign({}, s, {text: refOf(s.node)}) : s));
+  // relabel names a fetched frame, its node references and its path from
+  // the drawn model: a frame response carries no refs of its own.
+  const relabel = (frame) => {
+    const f = Object.assign({}, frame, {ref: refOf(frame.id)});
+    if (frame.explanation) {
+      f.explanation = frame.explanation.map((e) => ({
+        prose: relabelSegs(e.prose),
+        hypotheses: (e.hypotheses || []).map(relabelSegs),
+        next: relabelSegs(e.next),
+      }));
+    }
+    return f;
+  };
+  const chainOf = (id) => {
+    const chain = [];
+    for (let g = view.frames.get(id); g && g.parent; g = view.frames.get(g.parent)) chain.push(g);
+    return chain.reverse();
+  };
+
+  const showFrame = (f, path, scroll) => {
+    panel.show(f, path);
+    view.selected = f.id;
+    const el = view.els.get(f.id);
+    if (el && scroll) el.scrollIntoView({block: 'nearest', inline: 'nearest'});
+    updateButtons();
+    return f;
+  };
+
+  // selectIn selects node id in the drawn model, fetching its frame when
+  // the model does not hold it. It resolves to the frame shown, or null when
+  // the page moved on first.
+  const selectIn = async (id, g, scroll) => {
+    if (view.frames.has(id)) return showFrame(view.frames.get(id), chainOf(id), scroll);
+    const v = view;
+    const r = await transport.getJSON(nodePath(v.pub, 'frame', id));
+    if (g !== gen || view !== v || !r || !r.frame || r.frame.id !== id) return null;
+    const path = (r.path || []).map((p) => Object.assign({}, p, {ref: refOf(p.id)}));
+    return showFrame(relabel(r.frame), path, scroll);
+  };
+
+  // focusOn draws the subtree under node id. It resolves to false when the
+  // page moved on first.
+  const focusOn = async (id, g) => {
+    const v = view;
+    const m = await transport.getJSON(nodePath(v.pub, 'focus', id));
+    if (g !== gen || view !== v || !m || m.focus !== id) return false;
+    v.focus = id;
+    drawModel(m);
+    return true;
+  };
+
+  const loadPub = async (id, g) => {
+    const [model, hist] = await Promise.all([transport.getJSON(pubPath(id, 'model')), transport.getJSON(pubPath(id, 'history'))]);
+    if (g !== gen) return false;
+    if (!model || model.kind !== 'explained') throw new Error('this page cannot show a publication of this kind');
+    commitPublication(id, model, hist);
+    return true;
+  };
+
+  const refreshHistory = async (id) => {
+    applyHistory(await transport.getJSON(pubPath(id, 'history')));
+  };
+
+  let toastTimer = 0;
+  const toast = (msg) => {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+  };
+
+  // --- The user's own navigation: local until the next agent state ---
+
+  const quietly = (p) => p.catch(() => {});
+
+  const localSelect = (id, scroll) => {
+    if (!view || !isNode(id)) return;
+    const g = ++gen;
+    quietly(selectIn(id, g, scroll));
+  };
+
+  const focusHere = () => {
+    if (!view || !view.selected) return;
+    const id = view.selected;
+    const g = ++gen;
+    quietly(focusOn(id, g).then((ok) => ok && selectIn(id, g, false)));
+  };
+
+  const wholeView = () => {
+    if (!view || !view.focus) return;
+    const g = ++gen;
+    const id = view.selected;
+    view.focus = '';
+    drawModel(view.whole);
+    if (id) quietly(selectIn(id, g, true));
+  };
+
+  const openPub = (id) => {
+    if (!isPub(id)) return;
+    const g = ++gen;
+    quietly(loadPub(id, g).then((ok) => {
+      const sel = ok && view.whole.model.selected;
+      return sel && isNode(sel) ? selectIn(sel, g, true) : null;
+    }));
+  };
+
+  // --- Agent states ---
+
+  // rendered records the seq whose work finished, for display only.
+  const rendered = (seq) => {
+    renderedSeq = seq;
+    document.body.dataset.seq = renderedSeq;
+  };
+
+  const entryOf = (st, id) => ((st && st.publications) || []).find((p) => p.id === id);
+
+  // applyState steers the page to st: its publication, focus and
+  // selection, when they differ from what the agent last steered the page
+  // to. A state that only moves a publication's history refreshes that
+  // history and leaves the user's own navigation alone.
+  const applyState = async (st, g) => {
+    renderPubs();
+    if (view) {
+      const e = entryOf(st, view.pub);
+      if (e && (!view.hist || newer(e.history, view.hist.version))) quietly(refreshHistory(view.pub));
+    }
+    const prev = applied;
+    const steer = !prev || prev.current !== st.current || prev.selected !== st.selected || prev.focus !== st.focus;
+    if (!steer) {
+      applied = st;
+      rendered(st.seq);
+      return;
+    }
+    if (!isPub(st.current)) {
+      applied = st;
+      rendered(st.seq);
+      return;
+    }
+    if (!view || view.pub !== st.current) {
+      if (!(await loadPub(st.current, g))) return;
+    }
+    const focus = isNode(st.focus) ? st.focus : '';
+    if (focus) {
+      if (view.focus !== focus && !(await focusOn(focus, g))) return;
+    } else if (view.focus) {
+      view.focus = '';
+      drawModel(view.whole);
+    }
+    const sel = isNode(st.selected) ? st.selected : view.whole.model.selected;
+    if (isNode(sel)) {
+      const f = await selectIn(sel, g, true);
+      if (!f) return;
+      if (prev && (prev.selected !== st.selected || prev.focus !== st.focus || prev.current !== st.current)) {
+        toast('Your agent selected ' + f.ref + ' ' + f.name);
+      }
+    }
+    applied = st;
+    rendered(st.seq);
+  };
+
+  const onState = (st) => {
+    if (!st || typeof st !== 'object') return;
+    const again = retrySeq !== '' && st.seq === retrySeq && st.seq === acceptedSeq;
+    if (!again && !newer(st.seq, acceptedSeq)) return;
+    acceptedSeq = st.seq;
+    retrySeq = '';
+    const g = ++gen;
+    agent = st;
+    applyState(st, g).catch(() => {
+      if (g === gen) {
+        retrySeq = st.seq;
+        setTimeout(checkState, 1000);
+      }
+    });
+  };
+
+  // --- The connection ---
+
+  const banner = (kind, text) => {
+    const b = $('banner');
+    b.className = kind;
+    b.textContent = text;
+    b.hidden = !text;
+  };
+
+  let stream = null;
+  let polling = false;
+  let pollStep = 0;
+  let polls = 0;
+  const pollDelays = [1000, 2000, 5000];
+
+  const checkState = async () => {
+    try {
+      onState(await transport.getJSON('state'));
+      return true;
+    } catch (e) {
+      banner('gone', GONE);
+      return false;
+    }
+  };
+
+  // poll reads the state while the stream is refused, slower while
+  // nothing changes, and tries the stream again now and then.
+  const poll = async () => {
+    const before = acceptedSeq;
+    if (await checkState()) banner('quiet', PAUSED);
+    pollStep = acceptedSeq !== before ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
+    polls++;
+    if (polls % 6 === 0 && stream && stream.readyState === EventSource.CLOSED) connect();
+    if (polling) setTimeout(poll, pollDelays[pollStep]);
+  };
+
+  const onOpen = () => {
+    polling = false;
+    banner('', '');
+  };
+
+  const onTrouble = async (gaveUp) => {
+    const ok = await checkState();
+    if (gaveUp) {
+      if (ok) banner('quiet', PAUSED);
+      if (!polling) {
+        polling = true;
+        pollStep = 0;
+        setTimeout(poll, pollDelays[0]);
+      }
+    } else if (ok && !polling) {
+      banner('', '');
+    }
+  };
+
+  const connect = () => {
+    stream = transport.subscribe(onState, onTrouble, onOpen);
+  };
+
+  // --- Wiring ---
+
+  panel = perfAgentPanel(panelModel, {
+    frameById: (id) => (view ? view.frames.get(id) : undefined),
+    elementFor: (id) => (view && view.els.get(id)) || null,
+    onSelect: (id) => localSelect(id, true),
+  });
+
+  const fallback = (text) => {
+    const box = $('copybox');
+    box.value = text;
+    box.hidden = false;
+    box.focus();
+    box.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (e) {
+      ok = false;
+    }
+    toast(ok ? 'Copied the prompt' : 'Press Ctrl+C to copy the selected prompt');
+  };
+  const copy = (text) => {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast('Copied the prompt'), () => fallback(text));
+    } else {
+      fallback(text);
+    }
+  };
+
+  const frameOf = (el) => view && view.shown && view.shown.model.frames[el.dataset.i];
+  const chart = $('chart');
+  chart.addEventListener('click', (ev) => {
+    const el = ev.target.closest('.frame');
+    const f = el && frameOf(el);
+    if (f) localSelect(f.id, false);
+  });
+  chart.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    const el = ev.target.closest('.frame');
+    const f = el && frameOf(el);
+    if (!f) return;
+    ev.preventDefault();
+    localSelect(f.id, false);
+  });
+  $('focus-btn').addEventListener('click', focusHere);
+  $('whole-btn').addEventListener('click', wholeView);
+  document.addEventListener('click', (ev) => {
+    const chip = ev.target.closest('[data-prompt]');
+    if (chip) {
+      copy(chip.dataset.prompt);
+      return;
+    }
+    const pub = ev.target.closest('[data-pub]');
+    if (pub) {
+      openPub(pub.dataset.pub);
+      return;
+    }
+    const ref = ev.target.closest('[data-node]');
+    if (ref && !ref.closest('#exp, #path, #chart')) localSelect(ref.dataset.node, true);
+  });
+
+  (async () => {
+    await checkState();
+    connect();
+  })();
+})();

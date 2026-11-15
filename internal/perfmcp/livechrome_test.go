@@ -380,3 +380,91 @@ func TestTheLivePageWordsRejectionsForAnyOrderInChrome(t *testing.T) {
 		t.Errorf("the page reported errors: %v", errs)
 	}
 }
+
+// pageChrome is what the live page shows around a publication: its pills,
+// the toast's text, whether the follow-up section shows, and its seq.
+type pageChrome struct {
+	Seq      string   `json:"seq"`
+	Pills    []string `json:"pills"`
+	Toast    string   `json:"toast"`
+	FollowUp bool     `json:"follow_up"`
+	Chips    int      `json:"chips"`
+}
+
+// chromeAt waits until tab shows seq and reads what it shows around it.
+func (tab *chromeTab) chromeAt(seq string) pageChrome {
+	tab.t.Helper()
+	probe := `(() => {
+  const $ = (id) => document.getElementById(id);
+  if (!document.body || document.body.dataset.seq !== ` + strconv.Quote(seq) + `) return '';
+  const sec = $('chips').closest('section');
+  return JSON.stringify({
+    seq: document.body.dataset.seq,
+    pills: [...document.querySelectorAll('#pills .pill')].map((e) => e.textContent),
+    toast: $('toast').textContent,
+    follow_up: !sec.hidden && !sec.closest('[hidden]'),
+    chips: $('chips').children.length,
+  });
+})()`
+	var got pageChrome
+	if err := json.Unmarshal([]byte(tab.waitText("seq "+seq, probe)), &got); err != nil {
+		tab.t.Fatal(err)
+	}
+	return got
+}
+
+// Only a publication of explanations says an agent explained it and that
+// its prose is not verified; a facts-only page and a diff say where their
+// facts come from. The page announces only a selection the agent made,
+// and offers follow-up prompts only when it has some.
+func TestThePageChromeFitsThePublicationInChrome(t *testing.T) {
+	c := startChrome(t)
+	p := openLivePair(t, nil, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	srv, o := p.c, p.base
+	b := o.nodeID(t, "b")
+	var out pageExplainOut
+	srv.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &out)
+	tab := c.open(t, out.URL)
+	agentPills := []string{"✦ Explained by an agent via MCP", "prose is not verified"}
+
+	explained := tab.chromeAt(pageState(t, out.URL).Seq)
+	for _, want := range agentPills {
+		if !slices.Contains(explained.Pills, want) {
+			t.Errorf("an explained page's pills %q lack %q", explained.Pills, want)
+		}
+	}
+	if !explained.FollowUp || explained.Chips == 0 {
+		t.Errorf("an explained page hides its follow-up prompts: %+v", explained)
+	}
+
+	srv.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &out)
+	facts := tab.chromeAt(pageState(t, out.URL).Seq)
+	if !slices.Contains(facts.Pills, "Facts from perf-agent") || slices.ContainsFunc(facts.Pills, func(s string) bool { return slices.Contains(agentPills, s) }) {
+		t.Errorf("a facts-only page's pills %q", facts.Pills)
+	}
+	if facts.Toast != "" {
+		t.Errorf("a facts-only page, which selects nothing, says %q", facts.Toast)
+	}
+
+	diff, _ := p.pageDiff(t, nil)
+	shown := tab.chromeAt(pageState(t, diff.URL).Seq)
+	if slices.ContainsFunc(shown.Pills, func(s string) bool { return slices.Contains(agentPills, s) }) || len(shown.Pills) != 1 {
+		t.Errorf("a diff's pills %q", shown.Pills)
+	}
+	if shown.Toast != "" {
+		t.Errorf("a diff that selects nothing says %q", shown.Toast)
+	}
+	if shown.FollowUp {
+		t.Errorf("a diff, which has no prompts, shows the follow-up section: %+v", shown)
+	}
+
+	// A selection the agent makes is still announced.
+	var show pageShowOut
+	srv.callOK("page_show", map[string]any{"publication": "p1", "node": b}, &show)
+	if got := tab.chromeAt(pageState(t, diff.URL).Seq); !strings.HasPrefix(got.Toast, "Your agent selected ") || !got.FollowUp {
+		t.Errorf("after page_show: %+v", got)
+	}
+	if errs := c.errors(); len(errs) != 0 {
+		t.Errorf("the page reported errors: %v", errs)
+	}
+}

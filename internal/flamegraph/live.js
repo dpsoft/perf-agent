@@ -98,6 +98,8 @@
   // A publication is an explained view or a diff; their models differ in
   // shape, and a diff's frames are turned into the panel's frames.
   const isDiff = (m) => !!m && m.kind === 'diff';
+  // A facts-only publication explains no path.
+  const factsOnly = (m) => !isDiff(m) && !(m.rows && m.rows.length);
   const selectedOf = (m) => (isDiff(m) ? m.selected : m.model.selected);
   // diffPanelFrame is a diff frame as the panel shows one: its facts are
   // the model's fact rows read from the frame's fields, and its share in a
@@ -160,11 +162,17 @@
       pills.appendChild(make('span', 'pill ok', view.whole.pill));
       return;
     }
-    pills.appendChild(make('span', 'pill ai', '✦ Explained by an agent via MCP'));
-    const ok = make('span', 'pill ok', view.whole.checked_pill);
-    ok.title = 'Each structured claim was compared with the engine at its rounding, and each frame reference resolved';
-    pills.appendChild(ok);
-    pills.appendChild(make('span', 'pill', 'prose is not verified'));
+    // A facts-only publication has no agent text: its figures are the
+    // engine's, and nothing in it is the agent's to verify.
+    if (factsOnly(view.whole)) {
+      pills.appendChild(make('span', 'pill ok', 'Facts from perf-agent'));
+    } else {
+      pills.appendChild(make('span', 'pill ai', '✦ Explained by an agent via MCP'));
+      const ok = make('span', 'pill ok', view.whole.checked_pill);
+      ok.title = 'Each structured claim was compared with the engine at its rounding, and each frame reference resolved';
+      pills.appendChild(ok);
+      pills.appendChild(make('span', 'pill', 'prose is not verified'));
+    }
     const h = view.hist;
     if (!h) return;
     for (const text of [h.rejected_pill, h.limit_pill, h.history_pill]) {
@@ -437,6 +445,8 @@
     }
     exp.hidden = false;
     $('quality-sec').hidden = isDiff(model);
+    // A diff has no follow-up prompts, and the section would be empty.
+    $('followup').hidden = isDiff(model) || !(model.model && model.model.prompts && model.model.prompts.length);
     renderLegend(model);
     renderNotes(model);
     renderQuality(model);
@@ -667,7 +677,9 @@
       if (!f) return;
     }
     if (g !== gen) return;
-    if (f && prev && !sameTarget(prev, st)) toast('Your agent selected ' + f.ref + ' ' + f.name);
+    // Only a node the agent selected is announced, not the publication's
+    // own first selection.
+    if (f && prev && isNode(st.selected) && !sameTarget(prev, st)) toast('Your agent selected ' + f.ref + ' ' + f.name);
     settled(st);
   };
 

@@ -2,6 +2,8 @@
 
 package capture
 
+import "io/fs"
+
 // Supported reports whether capture can run on this platform.
 const Supported = false
 
@@ -28,6 +30,9 @@ func StartTime(Proc, int) (uint64, error) { return 0, notLinux() }
 // Alive is disabled: capture needs Linux.
 func Alive(Proc, int, uint64) bool { return false }
 
+// Observe is disabled: capture needs Linux.
+func Observe(Proc, int) (TargetState, *Error) { return TargetState{}, notLinux() }
+
 // Preflight is disabled: capture needs Linux.
 func Preflight(Proc, int, SelfID) (TargetState, *Error) { return TargetState{}, notLinux() }
 
@@ -42,3 +47,9 @@ func CheckShimMapped(Proc, int, Shim) *Error { return notLinux() }
 
 // CheckCommandFile is disabled: capture needs Linux.
 func CheckCommandFile(string) *Error { return notLinux() }
+
+// executableHere is the any-x-bit check: capture is disabled here, and
+// ResolveCommand needs one.
+func executableHere() func(fs.FileInfo) bool {
+	return func(fi fs.FileInfo) bool { return fi.Mode()&0o111 != 0 }
+}

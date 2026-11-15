@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +33,20 @@ var testChildBodies = map[string]func() string{
 		if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 			return "skip prctl(PR_SET_DUMPABLE, 0): " + err.Error()
 		}
+		return "ready"
+	},
+	// drop-dumpable turns non-dumpable on SIGUSR1 and prints "dropped".
+	"drop-dumpable": func() string {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGUSR1)
+		go func() {
+			<-sig
+			if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+				fmt.Println("failed", err)
+				return
+			}
+			fmt.Println("dropped")
+		}()
 		return "ready"
 	},
 	"setresgid": func() string {
@@ -112,12 +127,14 @@ func (s *childSet) killAll() {
 	}
 }
 
-// testChild is a running helper child.
+// testChild is a running helper child. Line is its first line; later
+// lines arrive through next.
 type testChild struct {
 	PID   int
 	Line  string
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
+	lines chan string
 	once  sync.Once
 	err   error
 }
@@ -145,24 +162,35 @@ func startChild(t *testing.T, mode string) *testChild {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	c := &testChild{PID: cmd.Process.Pid, cmd: cmd, stdin: stdin}
+	c := &testChild{PID: cmd.Process.Pid, cmd: cmd, stdin: stdin, lines: make(chan string, 8)}
 	testChildren.add(c)
 	t.Cleanup(c.kill)
 
-	line := make(chan string, 1)
 	go func() {
-		s, _ := bufio.NewReader(stdout).ReadString('\n')
-		line <- strings.TrimSpace(s)
+		defer close(c.lines)
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			c.lines <- strings.TrimSpace(sc.Text())
+		}
 	}()
-	select {
-	case c.Line = <-line:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("helper child %s (pid %d) printed nothing in 10s", mode, c.PID)
-	}
-	if c.Line == "" {
-		t.Fatalf("helper child %s (pid %d) exited before it was ready", mode, c.PID)
-	}
+	c.Line = c.next(t)
 	return c
+}
+
+// next returns the child's next line, failing the test when the child
+// prints none within 10 s or exits first.
+func (c *testChild) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case l, ok := <-c.lines:
+		if !ok {
+			t.Fatalf("helper child (pid %d) exited before printing a line", c.PID)
+		}
+		return l
+	case <-time.After(10 * time.Second):
+		t.Fatalf("helper child (pid %d) printed nothing in 10s", c.PID)
+	}
+	return ""
 }
 
 // exit ends the child by closing its stdin, without reaping it.

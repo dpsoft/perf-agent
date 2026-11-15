@@ -54,7 +54,10 @@ type SelfID struct {
 // TargetState is what the preflight saw of a target. StartTime is
 // /proc/<pid>/stat field 22; UIDs and GIDs are the real, effective, saved
 // and filesystem ids; StatusOwner owns /proc/<pid>/status, which is root
-// for a non-dumpable task; CapPrm is the permitted capability set.
+// for a non-dumpable task; ExeReadable says /proc/<pid>/exe could be read,
+// which the kernel allows only for a dumpable task the server may
+// ptrace-read; CapPrm is the permitted capability set. BuildID is filled
+// by Preflight only.
 type TargetState struct {
 	PID         int
 	StartTime   uint64
@@ -63,4 +66,5 @@ type TargetState struct {
 	CapPrm      uint64
 	Comm, Exe   string
 	BuildID     string
+	ExeReadable bool
 }

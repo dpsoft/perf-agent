@@ -113,30 +113,94 @@ func targetNotFound(pid int) *Error {
 
 const notYoursNext = "profile a process you started as your own user, or capture it as a command"
 
-// Preflight applies the §6.3 target rule to pid, as the kernel's
-// ptrace_may_access credential test without Yama would, and returns what
-// it saw for the rechecks. In order: the process exists and has not
-// exited; it is not pid 1, the server or one of the server's children;
-// its exe link is readable, which the kernel allows only for a dumpable
-// task it would let the server ptrace-read (never a kernel thread);
-// /proc/<pid>/status is owned by the server's uid, which it is not for a
-// non-dumpable task; its four uids and four gids are the server's; and it
-// holds no permitted capability. The /proc/<pid> directory owner is never
-// consulted: it does not follow dumpability.
-func Preflight(p Proc, pid int, self SelfID) (TargetState, *Error) {
-	if pid <= 0 {
-		return TargetState{}, Errorf(CodeInvalidArgument, "pass a positive pid", "pid %d is not a process id", pid)
-	}
+// Observe reads what the target rule and its rechecks compare: the start
+// time and comm from stat, whether the exe link is readable (and its
+// target), the owner of /proc/<pid>/status and its uids, gids and CapPrm.
+// It fails only when the process is gone, has exited, or its status
+// cannot be read or parsed; a target that turned non-dumpable is still
+// observed, so a recheck can name the change. The stat is read again
+// last, so a pid that names another process by then is target_not_found.
+// It never consults the /proc/<pid> directory owner and does not read the
+// build-id.
+func Observe(p Proc, pid int) (TargetState, *Error) {
 	s, err := readStat(p, pid)
 	switch {
 	case gone(err):
 		return TargetState{}, targetNotFound(pid)
 	case err != nil:
-		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's stat: %v", pid, err)
+		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's stat: %v", pid, pathErr(err))
 	case s.exited():
 		return TargetState{}, targetExited(pid)
 	}
 
+	// readlink is gated on ptrace_may_access(PTRACE_MODE_READ_FSCREDS):
+	// it fails for a non-dumpable task, a kernel thread, or another user's.
+	exe, err := os.Readlink(p.path(pid, "exe"))
+	readable := err == nil
+
+	statusPath := p.path(pid, "status")
+	owner, err := p.ownerOf(statusPath)
+	if err != nil {
+		if e := vanished(p, pid, s.start); e != nil {
+			return TargetState{}, e
+		}
+		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot stat pid %d's status: %v", pid, pathErr(err))
+	}
+	b, err := os.ReadFile(statusPath)
+	if err != nil {
+		if e := vanished(p, pid, s.start); e != nil {
+			return TargetState{}, e
+		}
+		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's status: %v", pid, pathErr(err))
+	}
+	st, err := parseTargetStatus(b)
+	if err != nil {
+		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "pid %d: %v", pid, err)
+	}
+	if e := vanished(p, pid, s.start); e != nil {
+		return TargetState{}, e
+	}
+	st.PID = pid
+	st.StartTime = s.start
+	st.StatusOwner = owner
+	st.ExeReadable = readable
+	st.Comm = s.comm
+	st.Exe = exe
+	return st, nil
+}
+
+// pathErr is the error a *fs.PathError wraps, so a message does not
+// repeat the path; other errors are returned as they are.
+func pathErr(err error) error {
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
+		return pe.Err
+	}
+	return err
+}
+
+// Preflight applies the §6.3 target rule to pid, as the kernel's
+// ptrace_may_access credential test without Yama would, and returns what
+// it saw, with the build-id, for the rechecks. In order: the process
+// exists and has not exited; it is not pid 1, the server or one of the
+// server's children; its exe link is readable, which the kernel allows
+// only for a dumpable task it would let the server ptrace-read (never a
+// kernel thread); /proc/<pid>/status is owned by the server's uid, which
+// it is not for a non-dumpable task; its four uids and four gids are the
+// server's; and it holds no permitted capability. The /proc/<pid>
+// directory owner is never consulted: it does not follow dumpability.
+//
+// CapPrm is compared with zero whatever user namespace the target is in,
+// so a process holding capabilities only inside its own namespace is
+// refused too. That is stricter than the kernel, which lets a parent
+// namespace's owner ptrace it; §6.3 asks for no capabilities at all.
+func Preflight(p Proc, pid int, self SelfID) (TargetState, *Error) {
+	if pid <= 0 {
+		return TargetState{}, Errorf(CodeInvalidArgument, "pass a positive pid", "pid %d is not a process id", pid)
+	}
+	st, e := Observe(p, pid)
+	if e != nil {
+		return TargetState{}, e
+	}
 	switch {
 	case pid == 1:
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "pid 1 is never a target")
@@ -144,41 +208,12 @@ func Preflight(p Proc, pid int, self SelfID) (TargetState, *Error) {
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "pid %d is this server", pid)
 	case self.Exclude != nil && self.Exclude(pid):
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "pid %d is this server's perf-agent or a reaper", pid)
-	}
-
-	exe, err := os.Readlink(p.path(pid, "exe"))
-	if err != nil {
-		// An exit between the stat and the readlink also fails it.
-		if e := vanished(p, pid, s.start); e != nil {
-			return TargetState{}, e
-		}
+	case !st.ExeReadable:
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext,
-			"pid %d is not dumpable, a kernel thread, or not yours (its exe link is unreadable: %v)", pid, err)
-	}
-
-	statusPath := p.path(pid, "status")
-	owner, err := p.ownerOf(statusPath)
-	if err != nil {
-		if gone(err) {
-			return TargetState{}, targetNotFound(pid)
-		}
-		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot stat pid %d's status: %v", pid, err)
-	}
-	if owner != self.UID {
+			"pid %d is not dumpable, a kernel thread, or not yours: its exe link is unreadable", pid)
+	case st.StatusOwner != self.UID:
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext,
-			"pid %d is not dumpable: its status is owned by uid %d, not this server's uid %d", pid, owner, self.UID)
-	}
-
-	b, err := os.ReadFile(statusPath)
-	if err != nil {
-		if gone(err) {
-			return TargetState{}, targetNotFound(pid)
-		}
-		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's status: %v", pid, err)
-	}
-	st, err := parseTargetStatus(b)
-	if err != nil {
-		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext, "pid %d: %v", pid, err)
+			"pid %d is not dumpable: its status is owned by uid %d, not this server's uid %d", pid, st.StatusOwner, self.UID)
 	}
 	if e := checkIDs(pid, "uid", st.UIDs, self.UID); e != nil {
 		return TargetState{}, e
@@ -190,12 +225,6 @@ func Preflight(p Proc, pid int, self SelfID) (TargetState, *Error) {
 		return TargetState{}, Errorf(CodeTargetRefused, notYoursNext,
 			"pid %d holds capabilities (CapPrm: %s)", pid, strings.Join(CapSet(st.CapPrm).Names(), ","))
 	}
-
-	st.PID = pid
-	st.StartTime = s.start
-	st.StatusOwner = owner
-	st.Comm = s.comm
-	st.Exe = exe
 	st.BuildID = ReadBuildID(p, pid)
 	return st, nil
 }
@@ -258,11 +287,18 @@ func parseTargetStatus(status []byte) (TargetState, error) {
 }
 
 // Compare is the recheck: was is the preflight, now a later one of the
-// same pid. A changed start time is pid_reused. A changed uid, gid,
-// status owner (dumpability) or CapPrm is target_changed, with Changed
-// naming each. The exe, comm and build-id may change by an ordinary exec,
-// which gains nothing the ids and capabilities would not show.
+// same pid, from Observe. A changed start time is pid_reused. A changed
+// uid, gid, dumpability (the status owner or whether the exe link is
+// readable) or CapPrm is target_changed, with Changed naming each; so is
+// a zero now, which says nothing could be observed. The exe, comm and
+// build-id may change by an ordinary exec, which gains nothing the ids
+// and capabilities would not show.
 func (was TargetState) Compare(now TargetState) *Error {
+	if now.PID == 0 {
+		e := Errorf(CodeTargetChanged, "capture again once the target has settled", "pid %d could not be observed again", was.PID)
+		e.Changed = "unreadable"
+		return e
+	}
 	if now.StartTime != was.StartTime {
 		return Errorf(CodePIDReused, "capture again", "pid %d was reused: its start time changed", was.PID)
 	}
@@ -273,7 +309,7 @@ func (was TargetState) Compare(now TargetState) *Error {
 	if now.GIDs != was.GIDs {
 		changed = append(changed, "gid")
 	}
-	if now.StatusOwner != was.StatusOwner {
+	if now.StatusOwner != was.StatusOwner || now.ExeReadable != was.ExeReadable {
 		changed = append(changed, "dumpable")
 	}
 	if now.CapPrm != was.CapPrm {
@@ -303,7 +339,7 @@ func ReadBuildID(p Proc, pid int) string {
 	data, err := sec.Data()
 	// The note header is namesz, descsz and type, then the name "GNU\0".
 	const header = 16
-	if err != nil || len(data) < header || string(data[12:16]) != "GNU\x00" {
+	if err != nil || len(data) < header || f.ByteOrder.Uint32(data[0:4]) != 4 || string(data[12:16]) != "GNU\x00" {
 		return ""
 	}
 	n := int(f.ByteOrder.Uint32(data[4:8]))
@@ -326,31 +362,36 @@ func devNumbers(dev uint64) (major, minor uint64) {
 // path would capture nothing. A mapping matches on the shim's dev:ino, or
 // on its inode when the mapped path, resolved in the target's root, is
 // the shim: btrfs reports a different dev in maps than stat does.
+//
+// The path is the rest of the line after the inode and its padding, byte
+// for byte, since a file name may hold spaces, tabs or a trailing space.
+// The kernel appends " (deleted)" to an unlinked file; such a path is
+// tried as it is, so it matches only a file really named so, never the
+// file that now sits where the deleted one was.
 func CheckShimMapped(p Proc, pid int, s Shim) *Error {
 	f, err := os.Open(p.path(pid, "maps"))
 	if err != nil {
 		if gone(err) {
 			return targetNotFound(pid)
 		}
-		return Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's maps: %v", pid, err)
+		return Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's maps: %v", pid, pathErr(err))
 	}
 	defer func() { _ = f.Close() }()
 	major, minor := devNumbers(s.Dev)
 	dev := fmt.Sprintf("%02x:%02x", major, minor)
 	ino := strconv.FormatUint(s.Ino, 10)
+	root := p.path(pid, "root")
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		// address perms offset dev inode path
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 6 || fields[4] != ino {
+		cols, path, ok := mapsLine(sc.Text())
+		if !ok || cols[4] != ino {
 			continue
 		}
-		if fields[3] == dev {
+		if cols[3] == dev {
 			return nil
 		}
-		path := strings.Join(fields[5:], " ")
 		var st syscall.Stat_t
-		if filepath.IsAbs(path) && syscall.Stat(filepath.Join(p.path(pid, "root"), path), &st) == nil &&
+		if strings.HasPrefix(path, "/") && syscall.Stat(root+path, &st) == nil &&
 			uint64(st.Dev) == s.Dev && uint64(st.Ino) == s.Ino {
 			return nil
 		}
@@ -359,5 +400,25 @@ func CheckShimMapped(p Proc, pid int, s Shim) *Error {
 		return Errorf(CodeTargetRefused, notYoursNext, "cannot read pid %d's maps: %v", pid, err)
 	}
 	return Errorf(CodeGPUNotInjected, "restart it with CUDA_INJECTION64_PATH="+s.Path+", or capture it as a command",
-		"the target did not load the CUPTI adapter at start; restart it with CUDA_INJECTION64_PATH=%s, or capture it as a command", s.Path)
+		"the target did not load the CUPTI adapter at start")
+}
+
+// mapsLine splits a /proc/<pid>/maps line into its first five columns
+// (address, perms, offset, dev, inode) and the pathname, which is the
+// rest of the line after the spaces that pad it, unchanged.
+func mapsLine(line string) (cols [5]string, path string, ok bool) {
+	rest := line
+	for i := range cols {
+		rest = strings.TrimLeft(rest, " ")
+		end := strings.IndexByte(rest, ' ')
+		if end < 0 {
+			if i < 4 || rest == "" {
+				return cols, "", false
+			}
+			cols[i], rest = rest, ""
+			break
+		}
+		cols[i], rest = rest[:end], rest[end:]
+	}
+	return cols, strings.TrimLeft(rest, " "), true
 }

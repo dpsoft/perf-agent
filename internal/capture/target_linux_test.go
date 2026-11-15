@@ -2,6 +2,9 @@ package capture
 
 import (
 	"bufio"
+	"bytes"
+	"debug/elf"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -191,16 +194,24 @@ func TestPreflightRefusesANonDumpableChild(t *testing.T) {
 	targetError(t, e, CodeTargetRefused, "not dumpable")
 }
 
-// TestPreflightRefusesAChangedGID uses a child that moved its effective
-// gid to a supplementary group, which needs a host that permits it; the
-// SelfID case in TestPreflightRefuses covers the rule everywhere.
+// TestPreflightRefusesAChangedGID: a child that asked to move its
+// effective gid to a supplementary group is refused when the kernel let
+// it, and accepted with its unchanged credentials when it did not (an
+// unprivileged setresgid may only pick the current real, effective or
+// saved gid).
 func TestPreflightRefusesAChangedGID(t *testing.T) {
 	c := startChild(t, "setresgid")
-	if reason, skip := strings.CutPrefix(c.Line, "skip "); skip {
-		t.Skip(reason)
-	}
 	_, e := Preflight(DefaultProc(), c.PID, ourSelf())
-	targetError(t, e, CodeTargetRefused, "effective gid")
+	if c.Line == "ready" {
+		targetError(t, e, CodeTargetRefused, "effective gid")
+		return
+	}
+	if !strings.HasPrefix(c.Line, "skip ") {
+		t.Fatalf("child printed %q", c.Line)
+	}
+	if e != nil {
+		t.Fatalf("the gid change failed (%s), yet the preflight refused: %v", c.Line, e)
+	}
 }
 
 // TestPreflightNeverConsultsTheProcDirOwner pins §6.3: dumpability is the
@@ -252,6 +263,60 @@ func TestPreflightNeverConsultsTheProcDirOwner(t *testing.T) {
 	}
 }
 
+// TestObserveSeesADumpableDrop is the recheck: a target that passed the
+// preflight and then turned non-dumpable is still observed, and Compare
+// names the change instead of losing it to a refusal.
+func TestObserveSeesADumpableDrop(t *testing.T) {
+	c := startChild(t, "drop-dumpable")
+	was, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !was.ExeReadable {
+		t.Fatal("a passing preflight has an unreadable exe")
+	}
+	if err := syscall.Kill(c.PID, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	if l := c.next(t); l != "dropped" {
+		t.Fatalf("child printed %q, want dropped", l)
+	}
+	now, e := Observe(DefaultProc(), c.PID)
+	if e != nil {
+		t.Fatalf("observe after the drop: %v", e)
+	}
+	if now.ExeReadable || now.StartTime != was.StartTime {
+		t.Fatalf("after the drop: exe readable %v, start %d (was %d)", now.ExeReadable, now.StartTime, was.StartTime)
+	}
+	e = was.Compare(now)
+	targetError(t, e, CodeTargetChanged, "dumpable")
+	if e.Changed != "dumpable" {
+		t.Fatalf("changed %q, want dumpable", e.Changed)
+	}
+	_, e = Preflight(DefaultProc(), c.PID, ourSelf())
+	targetError(t, e, CodeTargetRefused, "not dumpable")
+}
+
+// TestObserveRereadsTheStartTime: a start time that differs between the
+// first and the last stat read means the pid now names another process,
+// whether or not its exe link was readable.
+func TestObserveRereadsTheStartTime(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+	for _, exe := range []string{"", "/bin/true"} {
+		p := fakeProc(t, 44, fakeStat(44, "fake", "S", 9), fakeStatus(ids(uid), ids(gid), zero), "", exe)
+		calls := 0
+		p.StartTimeHook = func(_ int, s uint64) uint64 {
+			calls++
+			return s + uint64(calls)
+		}
+		_, e := Observe(p, 44)
+		targetError(t, e, CodeTargetNotFound, "44")
+		calls = 0
+		_, e = Preflight(p, 44, ourSelf())
+		targetError(t, e, CodeTargetNotFound, "44")
+	}
+}
+
 // TestCompareNamesWhatChanged pins the §6.3 recheck: credentials,
 // dumpability, CapPrm and the start time. An exec of an ordinary program
 // changes none of them and is not a change.
@@ -259,7 +324,7 @@ func TestCompareNamesWhatChanged(t *testing.T) {
 	was := TargetState{
 		PID: 5, StartTime: 100,
 		UIDs: [4]int{1000, 1000, 1000, 1000}, GIDs: [4]int{1000, 1000, 1000, 1000},
-		StatusOwner: 1000, Comm: "app", Exe: "/usr/bin/app", BuildID: "ab",
+		StatusOwner: 1000, ExeReadable: true, Comm: "app", Exe: "/usr/bin/app", BuildID: "ab",
 	}
 	if e := was.Compare(was); e != nil {
 		t.Fatalf("equal states: %v", e)
@@ -279,6 +344,8 @@ func TestCompareNamesWhatChanged(t *testing.T) {
 		{"effective gid", func(s *TargetState) { s.GIDs[1] = 10 }, CodeTargetChanged, "gid"},
 		{"saved uid", func(s *TargetState) { s.UIDs[2] = 0 }, CodeTargetChanged, "uid"},
 		{"status owner", func(s *TargetState) { s.StatusOwner = 0 }, CodeTargetChanged, "dumpable"},
+		{"exe unreadable", func(s *TargetState) { s.ExeReadable = false }, CodeTargetChanged, "dumpable"},
+		{"nothing observed", func(s *TargetState) { *s = TargetState{} }, CodeTargetChanged, "unreadable"},
 		{"CapPrm", func(s *TargetState) { s.CapPrm = 1 << CapSysAdmin }, CodeTargetChanged, "capabilities"},
 		{"uid and gid", func(s *TargetState) { s.UIDs[0], s.GIDs[3] = 0, 0 }, CodeTargetChanged, "uid,gid"},
 	} {
@@ -420,28 +487,55 @@ func TestCheckShimMapped(t *testing.T) {
 	}
 	head := line("fd:01", 1111, "/usr/bin/app") + "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0    [stack]\n"
 
+	wrongDev := shim
+	wrongDev.Dev++
+	odd := map[string]Shim{}
+	for _, name := range []string{"two  spaces.so", "with\ttab.so", "trailing.so "} {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte("shim"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		odd[name] = Shim{Path: path, Dev: uint64(st.Dev), Ino: st.Ino}
+	}
 	for _, tc := range []struct {
 		name, maps string
+		shim       Shim
 		ok         bool
 	}{
-		{"the shim's dev:ino", head + line(devField, shim.Ino, shimFile), true},
+		{"the shim's dev:ino", head + line(devField, shim.Ino, shimFile), shim, true},
 		// btrfs reports one dev in maps and another to stat for the same
 		// inode; the mapped path, resolved in the target's root, is the shim.
-		{"another dev, the shim's path", head + line("00:99", shim.Ino, shimFile), true},
-		{"another inode", head + line(devField, shim.Ino+1, shimFile), false},
-		{"another dev, another file", head + line("00:99", shim.Ino, other), false},
-		{"not mapped", head, false},
+		{"another dev, the shim's path", head + line("00:99", shim.Ino, shimFile), shim, true},
+		{"another inode", head + line(devField, shim.Ino+1, shimFile), shim, false},
+		{"another dev, another file", head + line("00:99", shim.Ino, other), shim, false},
+		// The path names a file with the inode but on another dev than the
+		// shim's: the inode number alone is no match.
+		{"the inode on another dev", head + line("00:99", shim.Ino, shimFile), wrongDev, false},
+		// A deleted mapping is not the file now at that path.
+		{"a deleted mapping", head + line("00:99", shim.Ino, shimFile+" (deleted)"), shim, false},
+		{"not mapped", head, shim, false},
+		// The path is the rest of the line byte for byte.
+		{"two spaces", line("ff:ff", odd["two  spaces.so"].Ino, odd["two  spaces.so"].Path), odd["two  spaces.so"], true},
+		{"a tab", line("ff:ff", odd["with\ttab.so"].Ino, odd["with\ttab.so"].Path), odd["with\ttab.so"], true},
+		{"a trailing space", line("ff:ff", odd["trailing.so "].Ino, odd["trailing.so "].Path), odd["trailing.so "], true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := fakeProc(t, 33, fakeStat(33, "app", "S", 1), "", tc.maps, "")
-			e := CheckShimMapped(p, 33, shim)
+			e := CheckShimMapped(p, 33, tc.shim)
 			if tc.ok {
 				if e != nil {
 					t.Fatalf("mapped: %v", e)
 				}
 				return
 			}
-			targetError(t, e, CodeGPUNotInjected, "CUDA_INJECTION64_PATH="+shimFile)
+			targetError(t, e, CodeGPUNotInjected, "did not load the CUPTI adapter")
+			if want := "restart it with CUDA_INJECTION64_PATH=" + tc.shim.Path + ", or capture it as a command"; e.Next != want || strings.Contains(e.Message, "restart") {
+				t.Fatalf("message %q, next %q; want the instruction %q in next only", e.Message, e.Next, want)
+			}
 		})
 	}
 
@@ -451,6 +545,7 @@ func TestCheckShimMapped(t *testing.T) {
 			t.Skip(err)
 		}
 		cmd := exec.Command(sleep, "30")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -488,4 +583,68 @@ func mappedLibrary(t *testing.T, pid int) string {
 	}
 	t.Skipf("pid %d mapped no shared library (a static sleep?)", pid)
 	return ""
+}
+
+// writeNoteELF writes a minimal ELF64 file whose only section is a
+// .note.gnu.build-id note with the given owner name and descriptor.
+func writeNoteELF(t *testing.T, path, name string, desc []byte) {
+	t.Helper()
+	pad := func(b []byte) []byte { return append(b, make([]byte, (4-len(b)%4)%4)...) }
+	var note bytes.Buffer
+	nameBytes := append([]byte(name), 0)
+	for _, v := range []uint32{uint32(len(nameBytes)), uint32(len(desc)), 3 /* NT_GNU_BUILD_ID */} {
+		_ = binary.Write(&note, binary.LittleEndian, v)
+	}
+	note.Write(pad(nameBytes))
+	note.Write(pad(slices.Clone(desc)))
+	strtab := []byte("\x00.note.gnu.build-id\x00.shstrtab\x00")
+
+	const ehsize, shentsize = 64, 64
+	noteOff := uint64(ehsize)
+	strOff := noteOff + uint64(note.Len())
+	shOff := (strOff + uint64(len(strtab)) + 7) &^ 7
+	var out bytes.Buffer
+	hdr := elf.Header64{
+		Type: uint16(elf.ET_EXEC), Machine: uint16(elf.EM_X86_64), Version: uint32(elf.EV_CURRENT),
+		Shoff: shOff, Ehsize: ehsize, Shentsize: shentsize, Shnum: 3, Shstrndx: 2,
+	}
+	copy(hdr.Ident[:], []byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)})
+	_ = binary.Write(&out, binary.LittleEndian, hdr)
+	out.Write(note.Bytes())
+	out.Write(strtab)
+	out.Write(make([]byte, shOff-uint64(out.Len())))
+	for _, sh := range []elf.Section64{
+		{},
+		{Name: 1, Type: uint32(elf.SHT_NOTE), Flags: uint64(elf.SHF_ALLOC), Off: noteOff, Size: uint64(note.Len()), Addralign: 4},
+		{Name: 20, Type: uint32(elf.SHT_STRTAB), Off: strOff, Size: uint64(len(strtab)), Addralign: 1},
+	} {
+		_ = binary.Write(&out, binary.LittleEndian, sh)
+	}
+	if err := os.WriteFile(path, out.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadBuildIDReadsTheDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name, owner string
+		desc        []byte
+		want        string
+	}{
+		// descsz (8) differs from namesz (4), so the length is the descriptor's.
+		{"gnu", "GNU", []byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}, "deadbeef01020304"},
+		{"twenty bytes", "GNU", bytes.Repeat([]byte{0xab}, 20), strings.Repeat("ab", 20)},
+		{"another owner", "Go", []byte{1, 2, 3, 4}, ""},
+		{"no descriptor", "GNU", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exe := filepath.Join(dir, tc.name)
+			writeNoteELF(t, exe, tc.owner, tc.desc)
+			p := fakeProc(t, 5, fakeStat(5, "x", "S", 1), "", "", exe)
+			if got := ReadBuildID(p, 5); got != tc.want {
+				t.Fatalf("build-id %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

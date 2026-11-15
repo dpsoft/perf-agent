@@ -11,8 +11,10 @@ import (
 //   - an absolute name is used as is;
 //   - a bare name is looked up once in pathEnv, the scrubbed PATH the
 //     workload itself gets, taking the first absolute entry that holds a
-//     regular, executable file of that name; relative and empty entries
-//     are skipped, since they would depend on the server's directory;
+//     regular file of that name this server's user may execute (by the
+//     owner, group or other class that applies to it); relative and
+//     empty entries are skipped, since they would depend on the server's
+//     directory;
 //   - anything else (./x, bin/x) is invalid_argument.
 //
 // With allow set (--capture-command), the result must equal one of its
@@ -28,12 +30,13 @@ func ResolveCommand(name, pathEnv string, allow []string) (string, *Error) {
 	case strings.ContainsRune(name, '/'):
 		return "", Errorf(CodeInvalidArgument, next, "command[0] %q is a relative path", echo(name))
 	default:
+		executable := executableHere()
 		for dir := range strings.SplitSeq(pathEnv, string(os.PathListSeparator)) {
 			if !filepath.IsAbs(dir) {
 				continue
 			}
 			p := filepath.Join(dir, name)
-			if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && executable(fi) {
 				resolved = p
 				break
 			}

@@ -44,6 +44,14 @@ func TestResolveCommand(t *testing.T) {
 	writeMode(t, filepath.Join(work, "rel", "tool"), 0o755)
 	writeMode(t, filepath.Join(work, "tool"), 0o755)
 	writeMode(t, filepath.Join(noexec, "tool"), 0o644)
+	first, second := filepath.Join(work, "first"), filepath.Join(work, "second")
+	for _, d := range []string{first, second} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMode(t, filepath.Join(first, "both"), 0o405)
+	both := writeMode(t, filepath.Join(second, "both"), 0o700)
 	prog := writeMode(t, filepath.Join(bin, "prog"), 0o755)
 	tool := writeMode(t, filepath.Join(bin, "tool"), 0o755)
 
@@ -61,6 +69,9 @@ func TestResolveCommand(t *testing.T) {
 		{"relative and empty entries skipped", "tool", "rel::" + bin, nil, tool},
 		{"in the allow-list", "prog", bin, []string{"/usr/bin/x", prog}, prog},
 		{"absolute in the allow-list", prog, "", []string{prog}, prog},
+		// 0405 owned by this user has only other's x bit, which the kernel
+		// does not apply to the owner; the later 0700 file is the one.
+		{"past a file only others may execute", "both", first + ":" + second, nil, both},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, e := ResolveCommand(tc.cmd, tc.path, tc.allow)

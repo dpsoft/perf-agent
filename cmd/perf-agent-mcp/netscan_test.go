@@ -507,7 +507,7 @@ func socketInodes(t *testing.T, pid int) []string {
 	return out
 }
 
-// TestEverySocketIsLoopback runs the built server with the live page, has
+// TestEverySocketIsLoopback runs the server with the live page engine, in a re-executed test binary,, has
 // a browser read it, and checks every socket the process holds: each is
 // TCP on a loopback address, listening or connected to a loopback peer.
 // When its input ends it exits 0 and the port is closed.
@@ -515,12 +515,11 @@ func TestEverySocketIsLoopback(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("reads the process's sockets from /proc/<pid>/fd and /proc/<pid>/net, which only Linux has")
 	}
-	bin := buildServer(t)
 	profiles, output := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(profiles, "cpu.pb.gz"), pmfixture.CPUBasic(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--profiles", profiles, "--output", output, "--live")
+	cmd := liveCommand(t, "--profiles", profiles, "--output", output)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)

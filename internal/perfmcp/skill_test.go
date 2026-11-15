@@ -100,8 +100,6 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	// The rules agents most often get wrong are stated as the guide states them.
 	for _, rule := range []string{
 		"Only node facts are claimable", "Never just copy the engine's value", "`facts` under `view_scope`",
-		"`page_open` takes no arguments", "`page_show` takes a `publication` and a `node`",
-		"counts the ones it left out; its history is bounded",
 	} {
 		if !strings.Contains(skill, rule) {
 			t.Errorf("the skill does not say %q", rule)

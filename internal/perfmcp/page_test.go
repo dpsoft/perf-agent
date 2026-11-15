@@ -171,54 +171,35 @@ func pageGet(t *testing.T, url, route string) string {
 
 var pageTools = []string{"page_open", "page_explain", "page_show", "page_diff"}
 
-func TestPageToolsAreDisabledWithoutLive(t *testing.T) {
+// Without Live no page tool is registered: the stdio server lists none and
+// answers a call to one as an unknown tool, and records nothing.
+func TestNoPageToolsWithoutLive(t *testing.T) {
 	cfg := testConfig(t)
 	writeFixture(t, cfg.ProfilesDir, "cpu.pb.gz", pmfixture.CPUBasic())
 	c := newTestServer(t, cfg)
 	var list struct {
 		Tools []struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
+			Name string `json:"name"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(c.rpc("tools/list", map[string]any{}).Result, &list); err != nil {
 		t.Fatal(err)
 	}
-	const disabled = "DISABLED: start perf-agent-mcp with --live to enable the live page."
-	for _, name := range pageTools {
-		i := slices.IndexFunc(list.Tools, func(tl struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}) bool {
-			return tl.Name == name
-		})
-		if i < 0 {
-			t.Errorf("%s is not listed", name)
-			continue
-		}
-		if !strings.HasPrefix(list.Tools[i].Description, disabled) {
-			t.Errorf("%s description %q", name, list.Tools[i].Description)
+	for _, tl := range list.Tools {
+		if slices.Contains(pageTools, tl.Name) {
+			t.Errorf("%s is listed", tl.Name)
 		}
 	}
-	o, _ := openOn(t, c, "cpu.pb.gz", "")
-	for name, args := range map[string]any{
-		"page_open":    map[string]any{},
-		"page_explain": o.args(map[string]any{"explanations": []any{}}),
-		"page_show":    map[string]any{"publication": "p1"},
-		"page_diff":    map[string]any{"base_handle": o.handle, "base_view": o.view, "new_handle": o.handle, "new_view": o.view},
-	} {
-		for _, a := range []any{args, map[string]any{"bogus": 1}} {
-			text, isErr := c.call(name, a)
-			if !isErr || !strings.HasPrefix(text, disabled) || len(text) > 200 {
-				t.Errorf("%s %v: isError=%v %q", name, a, isErr, text)
-			}
+	for _, name := range pageTools {
+		if res := c.rpc("tools/call", map[string]any{"name": name, "arguments": map[string]any{}}); res.Error == nil {
+			t.Errorf("tools/call %s: no protocol error", name)
 		}
 	}
 	if c.srv.live != nil {
 		t.Error("a server without Live has a live page")
 	}
 	if c.srv.attempts.next != 0 {
-		t.Errorf("a disabled page_explain recorded %d attempts", c.srv.attempts.next)
+		t.Errorf("a page tool call recorded %d attempts", c.srv.attempts.next)
 	}
 }
 

@@ -27,6 +27,61 @@ import (
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
 
+// liveEnv makes a test binary run as the server with the live page engine,
+// which the stdio command does not expose: the engine is exercised through
+// the same run function, and a subprocess is this package's test binary, built without -race.
+const liveEnv = "PERF_AGENT_MCP_TEST_LIVE"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(liveEnv) == "1" {
+		configHook = func(c *perfmcp.Config) { c.Live = true }
+		main()
+		return
+	}
+	code := m.Run()
+	if liveBinDir != "" {
+		_ = os.RemoveAll(liveBinDir)
+	}
+	os.Exit(code)
+}
+
+// liveBinDir holds the test binary liveCommand builds.
+var liveBinDir string
+
+// liveTestBinary builds this package's test binary without the race
+// detector, whose overhead slows the shutdown the signal tests time.
+var liveTestBinary = sync.OnceValues(func() (string, error) {
+	dir, err := os.MkdirTemp("", "perf-agent-mcp-live")
+	if err != nil {
+		return "", err
+	}
+	liveBinDir = dir
+	bin := filepath.Join(dir, "live.test")
+	if out, err := exec.Command("go", "test", "-c", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("go test -c: %v\n%s", err, out)
+	}
+	return bin, nil
+})
+
+// withLive runs the server of this test with the live page engine.
+func withLive(t *testing.T) {
+	t.Helper()
+	configHook = func(c *perfmcp.Config) { c.Live = true }
+	t.Cleanup(func() { configHook = nil })
+}
+
+// liveCommand is a subprocess running the server with the live page engine.
+func liveCommand(t *testing.T, args ...string) *exec.Cmd {
+	t.Helper()
+	exe, err := liveTestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), liveEnv+"=1")
+	return cmd
+}
+
 func TestRunNeedsAProfilesRoot(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run(nil, strings.NewReader(""), &out, &errb); code != 2 {
@@ -104,8 +159,7 @@ func TestRunServesOverStdio(t *testing.T) {
 	for _, tl := range list.Result.Tools {
 		names = append(names, tl.Name)
 	}
-	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph",
-		"page_open", "page_explain", "page_show", "page_diff"}
+	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph"}
 	slices.Sort(names)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
@@ -167,7 +221,8 @@ func liveSession(t *testing.T) (c *stdioClient, stderr, pageURL string) {
 		t.Fatal(err)
 	}
 	var errb lockedBuffer
-	c = startRunLogging(t, &errb, "--profiles", profiles, "--output", output, "--live")
+	withLive(t)
+	c = startRunLogging(t, &errb, "--profiles", profiles, "--output", output)
 	c.call("tools/list", map[string]any{})
 	pageURL, pub := c.openAndPublish()
 	c.tool("page_show", map[string]any{"publication": pub})
@@ -241,20 +296,49 @@ func TestStdoutCarriesOnlyJSONRPC(t *testing.T) {
 	}
 }
 
-// There is no flag to choose the live page's address: it is always the IPv4
-// loopback, on a port the kernel picks.
-func TestRunHasNoLiveAddressFlag(t *testing.T) {
+// The command has no live page flags: the page is not served over stdio,
+// so there is no address to choose and no way to switch it on.
+func TestRunHasNoLiveFlags(t *testing.T) {
 	for _, args := range [][]string{
+		{"--live"},
 		{"--live", "--live-addr", "127.0.0.1:8080"},
 		{"--live-addr", "0.0.0.0:0"},
 	} {
 		var out, errb bytes.Buffer
 		code := run(append([]string{"--profiles", t.TempDir()}, args...), strings.NewReader(""), &out, &errb)
-		if code != 2 || !strings.Contains(errb.String(), "live-addr") {
+		if code != 2 || !strings.Contains(errb.String(), "live") {
 			t.Errorf("%v: exit %d, stderr %q; want 2 and an unknown flag", args, code, errb.String())
 		}
 	}
-	c := startRun(t, "--profiles", t.TempDir(), "--live")
+}
+
+// The stdio server registers no page tool: tools/list is the nine tools
+// of the profile and render surface, and a page tool call is unknown.
+func TestRunRegistersNoPageTools(t *testing.T) {
+	c := startRun(t, "--profiles", t.TempDir())
+	var list struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(c.call("tools/list", map[string]any{}), &list); err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range list.Tools {
+		if strings.HasPrefix(tl.Name, "page_") {
+			t.Errorf("tools/list has %s", tl.Name)
+		}
+	}
+	if raw := c.call("tools/call", map[string]any{"name": "page_open", "arguments": map[string]any{}}); len(raw) != 0 {
+		t.Errorf("page_open answered with a result: %s", raw)
+	}
+}
+
+// The live page engine, run through the same entry point with the page
+// switched on by a test, listens on 127.0.0.1 and a port the kernel picks.
+func TestLivePageListensOnLoopback(t *testing.T) {
+	withLive(t)
+	c := startRun(t, "--profiles", t.TempDir())
 	var opened struct {
 		URL string `json:"url"`
 	}
@@ -266,21 +350,13 @@ func TestRunHasNoLiveAddressFlag(t *testing.T) {
 	}
 }
 
-// Without --live the page tools say so and nothing listens.
-func TestRunServesNoPageWithoutTheFlag(t *testing.T) {
-	c := startRun(t, "--profiles", t.TempDir())
-	raw := c.call("tools/call", map[string]any{"name": "page_open", "arguments": map[string]any{}})
-	if !strings.Contains(string(raw), "--live") || !strings.Contains(string(raw), `"isError":true`) {
-		t.Errorf("page_open without --live: %s", raw)
-	}
-}
-
 func TestRunServesTheLivePage(t *testing.T) {
 	profiles := t.TempDir()
 	if err := os.WriteFile(filepath.Join(profiles, "cpu.pb.gz"), pmfixture.CPUBasic(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c := startRun(t, "--profiles", profiles, "--live")
+	withLive(t)
+	c := startRun(t, "--profiles", profiles)
 	pageURL, pub := c.openAndPublish()
 	browser := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, Timeout: 10 * time.Second}
 	for _, route := range []string{"", "pub/" + pub + "/model"} {
@@ -723,9 +799,12 @@ func TestSignalEndsAServerBlockedOnOutput(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Pages large enough for the 8 MiB model of long.pb.gz.
-				args = append(args, "--live", "--limit", "MaxPageBytes=67108864", "--limit", "MaxPageNodes=1048576")
+				args = append(args, "--limit", "MaxPageBytes=67108864", "--limit", "MaxPageNodes=1048576")
 			}
 			cmd := exec.Command(bin, args...)
+			if c.live {
+				cmd = liveCommand(t, args...)
+			}
 			cmd.Stdin, cmd.Stdout = inR, outW
 			// blockStderr fills stderr and stops reading it.
 			blockStderr := func() {}

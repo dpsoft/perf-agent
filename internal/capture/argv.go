@@ -92,9 +92,16 @@ type ArgvSpec struct {
 	CaptureID string
 }
 
-// BuildArgv is the only producer of the perf-agent argv.
-func BuildArgv(a ArgvSpec) []string {
+// validUnwind are the --unwind values perf-agent accepts.
+var validUnwind = []string{"fp", "dwarf", "auto"}
+
+// BuildArgv is the only producer of the perf-agent argv. It rejects an
+// unwind strategy perf-agent does not know.
+func BuildArgv(a ArgvSpec) ([]string, error) {
 	s := a.Settings.Canonical()
+	if !slices.Contains(validUnwind, s.Unwind) {
+		return nil, Errorf(CodeInvalidArgument, "use unwind fp, dwarf or auto", "unwind %q is not one of fp, dwarf, auto", s.Unwind)
+	}
 	out := func(name string) string { return filepath.Join(a.Staging, name) }
 	argv := []string{
 		a.Binary,
@@ -119,5 +126,5 @@ func BuildArgv(a ArgvSpec) []string {
 	if s.KernelStacks {
 		argv = append(argv, "--kernel-stacks")
 	}
-	return append(argv, "--tag", "perf_agent_mcp_capture="+a.CaptureID)
+	return append(argv, "--tag", "perf_agent_mcp_capture="+a.CaptureID), nil
 }

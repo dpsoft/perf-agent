@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -30,11 +31,17 @@ func TestBuildArgvEveryCombination(t *testing.T) {
 		for _, ks := range []bool{false, true} {
 			for _, unwind := range []string{"fp", "dwarf", "auto"} {
 				s := Settings{Modes: modes, Duration: 10 * time.Second, SampleRate: 99, Unwind: unwind, KernelStacks: ks}
-				argv := BuildArgv(ArgvSpec{Binary: "/b/perf-agent", PID: 7, Settings: s, Staging: "/s", GPUShim: "/shim.so", CaptureID: "x/001"})
+				argv, err := BuildArgv(ArgvSpec{Binary: "/b/perf-agent", PID: 7, Settings: s, Staging: "/s", GPUShim: "/shim.so", CaptureID: "x/001"})
+				if err != nil {
+					t.Fatal(err)
+				}
 				if argv[0] != "/b/perf-agent" {
 					t.Fatalf("argv[0] = %q", argv[0])
 				}
 				for i, a := range argv[1:] {
+					if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") {
+						t.Fatalf("%v: single-dash argument %q", argv, a)
+					}
 					if name, ok := strings.CutPrefix(a, "--"); ok {
 						f, found := known[name]
 						if !found {
@@ -81,12 +88,15 @@ func TestBuildArgvEveryCombination(t *testing.T) {
 }
 
 func TestBuildArgvExact(t *testing.T) {
-	got := BuildArgv(ArgvSpec{
+	got, err := BuildArgv(ArgvSpec{
 		Binary: "/b/perf-agent", PID: 41234,
 		Settings:  Settings{Modes: []Mode{ModeCPU}, Duration: 10 * time.Second, SampleRate: 99, Unwind: "auto"},
 		Staging:   "/p/captures/s/.staging-ab",
 		CaptureID: "s/001",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"/b/perf-agent", "--pid", "41234", "--duration", "10s", "--sample-rate", "99", "--unwind", "auto",
 		"--no-debuginfod", "--profile", "--profile-output", "/p/captures/s/.staging-ab/cpu.pb.gz",
 		"--tag", "perf_agent_mcp_capture=s/001"}
@@ -106,5 +116,54 @@ func TestExpectedFiles(t *testing.T) {
 	got := ExpectedFiles([]Mode{ModeGPU, ModeCPU})
 	if want := []string{"cpu.pb.gz", "gpu.pb.gz", ExeclogFile}; !slices.Equal(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestBuildArgvExactOffCPUAndGPU(t *testing.T) {
+	base := ArgvSpec{Binary: "/b/pa", PID: 5, Staging: "/s", GPUShim: "/shim.so", CaptureID: "c/1"}
+	cases := []struct {
+		name string
+		mode []Mode
+		ks   bool
+		want []string
+	}{
+		{"offcpu", []Mode{ModeOffCPU}, false, []string{"/b/pa", "--pid", "5", "--duration", "5s", "--sample-rate", "49", "--unwind", "fp",
+			"--no-debuginfod", "--offcpu", "--offcpu-output", "/s/offcpu.pb.gz", "--tag", "perf_agent_mcp_capture=c/1"}},
+		{"gpu", []Mode{ModeGPU}, true, []string{"/b/pa", "--pid", "5", "--duration", "5s", "--sample-rate", "49", "--unwind", "fp",
+			"--no-debuginfod", "--gpu", "--gpu-shim", "/shim.so", "--gpu-output", "/s/gpu.pb.gz",
+			"--gpu-executions-output", "/s/gpu.execlog", "--kernel-stacks", "--tag", "perf_agent_mcp_capture=c/1"}},
+	}
+	for _, c := range cases {
+		a := base
+		a.Settings = Settings{Modes: c.mode, Duration: 5 * time.Second, SampleRate: 49, Unwind: "fp", KernelStacks: c.ks}
+		got, err := BuildArgv(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s:\ngot  %q\nwant %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestBuildArgvRejectsBadUnwind(t *testing.T) {
+	for _, u := range []string{"", "FP", "--evil", "fp,dwarf"} {
+		_, err := BuildArgv(ArgvSpec{Binary: "/b", Settings: Settings{Modes: []Mode{ModeCPU}, Unwind: u}})
+		e, ok := errors.AsType[*Error](err)
+		if !ok || e.Code != CodeInvalidArgument {
+			t.Errorf("unwind %q: err = %v", u, err)
+		}
+	}
+}
+
+func TestPerfAgentEnvExact(t *testing.T) {
+	want := []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C"}
+	if !slices.Equal(PerfAgentEnv, want) {
+		t.Fatalf("PerfAgentEnv = %q, want %q", PerfAgentEnv, want)
+	}
+	for _, kv := range PerfAgentEnv {
+		if k, _, _ := strings.Cut(kv, "="); k != "PATH" && k != "LC_ALL" {
+			t.Errorf("unexpected environment key %q", k)
+		}
 	}
 }

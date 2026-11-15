@@ -17,10 +17,10 @@ can.
 
 - On Linux 7.1 and later every BPF program failed to load with `apply CO-RE
   relocations: load kernel spec: load vmlinux: parsing .BTF header: header
-  contains non-zero trailer`, so no profiler could start. The header in `/sys/kernel/btf/vmlinux` grew from 24
-  to 32 bytes to describe the new BTF layout section, and cilium/ebpf v0.21.0
-  refused a longer header whose extra bytes are not zero. perf-agent now uses
-  cilium/ebpf v0.22.0, which reads it
+  contains non-zero trailer`, so no profiler could start. The header in
+  `/sys/kernel/btf/vmlinux` grew from 24 to 32 bytes to describe the new BTF
+  layout section, and cilium/ebpf v0.21.0 refused a longer header whose extra
+  bytes are not zero. perf-agent now uses cilium/ebpf v0.22.0, which reads it
   ([#266](https://github.com/dpsoft/perf-agent/pull/266)). Seen on Fedora 44
   with kernel 7.3.3; kernels before 7.1 are not affected.
 - The "Interactive version" links in the README and in

@@ -130,3 +130,36 @@ func TestFuseRejectsNoInputsButAcceptsOne(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"[cpu]", "a"}, out.Stacks[0].Frames)
 }
+
+func TestFuseRecordsWhatEachRootMeasures(t *testing.T) {
+	// The fused axis says "cpu+gpu", which is true of the whole graph and of
+	// no single subtree in it. A renderer explaining what a frame's width
+	// means has to know which input that frame came from.
+	cpu := foldOne(t, "cpu", stackSpec{value: 1, frames: []string{"a"}})
+	gpu := foldOne(t, "gpu", stackSpec{value: 1, frames: []string{"[gpu:launch]", "k"}})
+
+	out, err := Fuse([]FuseInput{{Result: cpu, Label: "[cpu]"}, {Result: gpu, Label: "[gpu]"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"[cpu]": "cpu", "[gpu]": "gpu"}, out.RootSampleTypes)
+}
+
+func TestFuseDoesNotClaimATypeForARootTwoKindsShare(t *testing.T) {
+	// Two inputs under one label merge into one subtree. If they measured
+	// different things, that subtree is neither, and naming either would be
+	// the same mistake as reading the fused axis.
+	cpu := foldOne(t, "cpu", stackSpec{value: 1, frames: []string{"a"}})
+	cpu2 := foldOne(t, "cpu", stackSpec{value: 1, frames: []string{"b"}})
+	gpu := foldOne(t, "gpu", stackSpec{value: 1, frames: []string{"c"}})
+
+	out, err := Fuse([]FuseInput{
+		{Result: cpu, Label: "[cpu]"},
+		{Result: cpu2, Label: "[cpu]"},
+		{Result: gpu, Label: "[cpu]"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"[cpu]": ""}, out.RootSampleTypes)
+
+	out, err = Fuse([]FuseInput{{Result: cpu, Label: "[cpu]"}, {Result: cpu2, Label: "[cpu]"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"[cpu]": "cpu"}, out.RootSampleTypes, "same kind under one label is still that kind")
+}

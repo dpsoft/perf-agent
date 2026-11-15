@@ -63,7 +63,8 @@ func Fuse(inputs []FuseInput) (*Result, error) {
 	}
 
 	out := &Result{
-		Unit: unit,
+		Unit:            unit,
+		RootSampleTypes: make(map[string]string, len(inputs)),
 		// Fold has already normalized every input's Stack.Frames to
 		// root-first, whatever each file stored, so the fused tree needs no
 		// further orientation. StackOrder here records what the renderer
@@ -78,6 +79,11 @@ func Fuse(inputs []FuseInput) (*Result, error) {
 
 		if !slices.Contains(names, r.SampleTypeName) {
 			names = append(names, r.SampleTypeName)
+		}
+		if prev, seen := out.RootSampleTypes[in.Label]; seen && prev != r.SampleTypeName {
+			out.RootSampleTypes[in.Label] = ""
+		} else if !seen {
+			out.RootSampleTypes[in.Label] = r.SampleTypeName
 		}
 		for _, st := range r.SampleTypes {
 			if !slices.Contains(out.SampleTypes, st) {

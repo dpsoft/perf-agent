@@ -51,8 +51,8 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // a caption. On a GPU profile every CPU frame is as wide as the DEVICE time
 // launched from it, not the CPU time spent in it; a reader fluent in flame
 // graphs assumes the opposite and the page carries no other signal to correct
-// them (issue #123). It decides from the axis label, so a CPU profile says
-// nothing.
+// them (issue #123). It decides from the axis of the frame's subtree, so a
+// CPU profile, or the CPU half of a fused one, says nothing.
 //
 // one-line note, the fixed status bar, the cursor tooltip and the info panel
 // — plus the frame box itself.
@@ -470,7 +470,10 @@ func rowCSS(maxDepth int) string {
 // that call path, not the CPU time spent in the frame. A reader fluent in
 // flame graphs assumes the opposite, because that is what the shape means
 // everywhere else, and the page carries no other signal to correct them
-// (issue #123). It decides from the axis label, so a CPU profile says nothing.
+// (issue #123). It decides from the axis of the frame's own subtree (axisOf):
+// on a fused page that is the data-axis of the root above it, elsewhere the
+// chart's axis label. So a CPU profile says nothing, and neither does the CPU
+// half of a fused one, whose chart axis also names gpu.
 const script = `
 (function(){
 "use strict";
@@ -562,8 +565,12 @@ function resolutionNote(d){
   if(d.domain==="unsym"){return "no symbol: the unwind found this frame, nothing could name it";}
   return "";
 }
+function axisOf(it){
+  for(var r=it;r;r=r.up){if(r.el.dataset.axis!==undefined){return r.el.dataset.axis;}}
+  return axis;
+}
 function widthMeaning(it,d){
-  if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
+  if(unit.indexOf("nanoseconds")<0||axisOf(it).indexOf("gpu/")<0){return "";}
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
   case "boundary": return "width: device time launched from this path, sampled one launch in N";

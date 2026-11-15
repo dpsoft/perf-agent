@@ -452,7 +452,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
 	writeModuleTable(ew, mods)
-	writeNode(ew, root, res.Unit, root.value, mods)
+	writeNode(ew, root, res.Unit, root.value, mods, rootAxes(res))
 	ew.s("</div>\n")
 	ew.s("</div>\n")
 	return ew.err
@@ -485,7 +485,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 // The label is deliberately terse — name, value, share. Domain, module and
 // the inference note stay in the visual tooltip; a screen reader user
 // scanning twenty frames does not want three sentences on each.
-func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable) {
+func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable, axes map[string]string) {
 	cls := fmt.Sprintf("frame d%d", n.depth)
 	if n.inexact > 0 {
 		cls += " inexact"
@@ -520,6 +520,17 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	if n.collapsed {
 		ew.s(` data-collapsed="1"`)
 	}
+	// A fused page's roots say what their own subtree measures; see
+	// rootAxes. Only the frames that change the answer carry it, and the
+	// script reads it from the nearest one above the frame it explains.
+	if axes != nil {
+		switch n.depth {
+		case 0:
+			ew.s(` data-axis=""`)
+		case 1:
+			ew.f(` data-axis="%s"`, html.EscapeString(axes[n.name]))
+		}
+	}
 	ew.s(">")
 	// No whitespace around the name: the script reads this back as the
 	// frame's identity, so the text node must be the symbol and nothing else.
@@ -527,8 +538,31 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	ew.s("</div>\n")
 
 	for _, c := range n.children {
-		writeNode(ew, c, unit, total, mods)
+		writeNode(ew, c, unit, total, mods, axes)
 	}
+}
+
+// rootAxes maps each root label of a fused profile to the axis of the input
+// under it, or returns nil for a profile that was not fused.
+//
+// It exists because a fused chart's own axis ("cpu+gpu/nanoseconds") is true
+// of the graph and of no frame in it: read as a whole, it would tell a reader
+// that CPU-sampled frames measure GPU time. A label that Fuse could not give
+// one type to maps to "", and so does the synthetic root, which spans every
+// input: both claim nothing.
+func rootAxes(res *foldedstacks.Result) map[string]string {
+	if res.RootSampleTypes == nil {
+		return nil
+	}
+	axes := make(map[string]string, len(res.RootSampleTypes))
+	for label, typ := range res.RootSampleTypes {
+		if typ != "" {
+			axes[label] = typ + "/" + res.Unit
+		} else {
+			axes[label] = ""
+		}
+	}
+	return axes
 }
 
 // pct formats a percentage in its shortest exact form, rounded to a

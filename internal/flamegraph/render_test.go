@@ -2,6 +2,7 @@ package flamegraph
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"html"
 	"os"
@@ -1233,4 +1234,157 @@ func findJSEngine(t *testing.T) (string, []string) {
 		}
 	}
 	return "", nil
+}
+
+// fusedCPUGPU is what `flamegraph -fuse` builds from a CPU and a GPU capture:
+// two subtrees whose widths measure different things, under one axis that
+// names both.
+func fusedCPUGPU(t *testing.T) *foldedstacks.Result {
+	t.Helper()
+	cpu := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3, Samples: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 3}},
+	}
+	gpu := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 2, Samples: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "[gpu:launch]", "gemm_kernel"}, Value: 2}},
+	}
+	res, err := foldedstacks.Fuse([]foldedstacks.FuseInput{
+		{Result: cpu, Label: "[cpu] perf-agent 99 Hz"},
+		{Result: gpu, Label: "[gpu] per sampled launch"},
+	})
+	require.NoError(t, err)
+	return res
+}
+
+// A fused page must say, per subtree, what that subtree measures.
+//
+// The chart's axis is "cpu+gpu/nanoseconds", which is true of the graph and
+// of no frame in it. widthMeaning used to read that axis, find "gpu/" in it
+// and tell the reader that every CPU-sampled frame was GPU time -- the
+// opposite of the truth for the larger half of a typical fused graph.
+func TestFusedPagesSayWhatEachRootMeasures(t *testing.T) {
+	page := renderString(t, fusedCPUGPU(t), Options{Title: "t"})
+
+	frame := func(name string) string {
+		t.Helper()
+		m := regexp.MustCompile(`<div class="frame [^>]*>` + regexp.QuoteMeta(html.EscapeString(name)) + `</div>`).FindString(page)
+		require.NotEmpty(t, m, "no frame named %q", name)
+		return m
+	}
+	assert.Contains(t, frame("[cpu] perf-agent 99 Hz"), `data-axis="cpu/nanoseconds"`)
+	assert.Contains(t, frame("[gpu] per sampled launch"), `data-axis="gpu/nanoseconds"`)
+	// The synthetic root spans both, so it claims neither.
+	assert.Contains(t, frame("all"), `data-axis=""`)
+	// Below the roots the attribute would only repeat its ancestor's.
+	assert.NotContains(t, frame("work"), "data-axis")
+	assert.NotContains(t, frame("gemm_kernel"), "data-axis")
+
+	// An unfused page has one axis, and the chart already carries it.
+	for _, typ := range []string{"cpu", "gpu"} {
+		res := result(foldedstacks.Stack{Frames: []string{"main", "work"}, Value: 1})
+		res.SampleTypeName = typ
+		assert.NotContains(t, renderString(t, res, Options{Title: "t"}), "data-axis", typ)
+	}
+}
+
+// jsFunction returns the source of one function declared in the shipped
+// script, from its keyword to its closing brace.
+func jsFunction(t *testing.T, name string) string {
+	t.Helper()
+	start := strings.Index(script, "function "+name+"(")
+	require.GreaterOrEqual(t, start, 0, "the script declares no %s", name)
+	depth, inStr, esc := 0, rune(0), false
+	for i, ch := range script[start:] {
+		switch {
+		case esc:
+			esc = false
+		case ch == '\\':
+			esc = true
+		case inStr != 0:
+			if ch == inStr {
+				inStr = 0
+			}
+		case ch == '"' || ch == '\'':
+			inStr = ch
+		case ch == '{':
+			depth++
+		case ch == '}':
+			depth--
+			if depth == 0 {
+				return script[start : start+i+1]
+			}
+		}
+	}
+	t.Fatalf("%s never closes", name)
+	return ""
+}
+
+// What each frame's tooltip says about its width, executed rather than
+// grepped for: the strings were always on the page, and the bug was which
+// frames they were shown on.
+//
+// The frames are stand-ins for the script's items, wired the way the page
+// wires them (d, up, el.dataset) and carrying the data-axis values
+// TestFusedPagesSayWhatEachRootMeasures pins on the rendered page.
+func TestWidthMeaningFollowsTheFrameNotTheChart(t *testing.T) {
+	engine := ""
+	for _, name := range []string{"node", "gjs"} {
+		if _, err := exec.LookPath(name); err == nil {
+			engine = name
+			break
+		}
+	}
+	if engine == "" {
+		t.Skip("no JavaScript engine that can run a script (node or gjs)")
+	}
+
+	prog := `var out=typeof print==="function"?print:console.log;
+var unit="nanoseconds",axis;
+` + jsFunction(t, "axisOf") + "\n" + jsFunction(t, "widthMeaning") + `
+function f(d,up,ax){return {d:d,up:up,el:{dataset:ax===undefined?{}:{axis:ax}}};}
+function tree(fused){
+  var all=f(0,undefined,fused?"":undefined);
+  var cpu=fused?f(1,all,"cpu/nanoseconds"):all;
+  var gpu=fused?f(1,all,"gpu/nanoseconds"):all;
+  var cmain=f(cpu.d+1,cpu),work=f(cpu.d+2,cmain);
+  var gmain=f(gpu.d+1,gpu),launch=f(gpu.d+2,gmain),kernel=f(gpu.d+3,launch);
+  return {all:all,cpu:cpu,work:[work,"cpu"],gmain:[gmain,"cpu"],launch:[launch,"boundary"],kernel:[kernel,"gpu-kernel"]};
+}
+function run(chartAxis,fused){
+  axis="Flame graph, "+chartAxis;
+  var t=tree(fused),r={};
+  ["work","gmain","launch","kernel"].forEach(function(k){r[k]=widthMeaning(t[k][0],{domain:t[k][1]});});
+  r.all=widthMeaning(t.all,{domain:"root"});
+  return r;
+}
+out(JSON.stringify({
+  fused:run("cpu+gpu/nanoseconds",true),
+  cpu:run("cpu/nanoseconds",false),
+  gpu:run("gpu/nanoseconds",false)
+}));
+`
+	src := filepath.Join(t.TempDir(), "width.js")
+	require.NoError(t, os.WriteFile(src, []byte(prog), 0o600))
+	raw, err := exec.Command(engine, src).CombinedOutput()
+	require.NoError(t, err, "%s", raw)
+
+	var got map[string]map[string]string
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(raw), &got), "%s", raw)
+
+	const (
+		launched = "width: GPU time launched from this call path — not CPU time spent here"
+		kernel   = "width: measured time this kernel ran on the device"
+		boundary = "width: device time launched from this path, sampled one launch in N"
+	)
+	assert.Equal(t, map[string]string{
+		"work": "", "all": "",
+		"gmain": launched, "launch": boundary, "kernel": kernel,
+	}, got["fused"], "fused: CPU-sampled frames say nothing; the GPU subtree keeps its text")
+	assert.Equal(t, map[string]string{
+		"work": "", "gmain": "", "launch": "", "kernel": "", "all": "",
+	}, got["cpu"], "a CPU page explains nothing")
+	assert.Equal(t, map[string]string{
+		"work": launched, "gmain": launched, "launch": boundary, "kernel": kernel, "all": launched,
+	}, got["gpu"], "a GPU page keeps every text it had")
 }

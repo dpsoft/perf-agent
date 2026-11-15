@@ -211,6 +211,12 @@ type Result struct {
 	SampleTypeName string
 	Unit           string
 	SampleIndex    int
+	// RootSampleTypes is set only by Fuse. It maps each synthetic root label
+	// to the SampleTypeName of the input that hangs under it, because a fused
+	// SampleTypeName ("cpu+gpu") is true of the graph and of no subtree in
+	// it. A label shared by inputs of different types maps to "": that
+	// subtree measures neither.
+	RootSampleTypes map[string]string
 	// SampleTypes lists every type the profile offered, so a page can say
 	// which one it is not showing.
 	SampleTypes []string

@@ -10,12 +10,16 @@
 
 ---
 
-![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](docs/flamegraph-pytorch-gpu.png)
+![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph, with GPU telemetry](docs/flamegraph-pytorch-gpu.gif)
 
-*One capture of a live PyTorch step: `pa_train_step (torch_workload.py:76)` under
-`Thread.run`, down through `torch::autograd` and `cublasSgemm_v2`, across the
-`[gpu:launch]` boundary into the CUDA kernel — Python, C++ and GPU in one tree.
-[Interactive version](https://htmlpreview.github.io/?https://github.com/dpsoft/perf-agent/blob/main/docs/flamegraph-pytorch-gpu.html).*
+*One 15-second capture of a live PyTorch training loop on an RTX 3090: CPU and
+GPU profiles fused into one graph, with NVML telemetry for the same window. It
+zooms into the GPU time that carries a CPU call path — `pa_train_step
+(torch_workload.py:76)` under `Thread.run (threading.py:1001)`, down through
+`torch::autograd` and `cublasSgemm_v2`, across the `[gpu:launch]` boundary into
+a `cutlass_80_simt_sgemm` kernel, beside torch's autograd engine thread
+launching `ampere_sgemm_128x64_tn` — then highlights every `cublas` frame.
+[Interactive version](https://htmlpreview.github.io/?https://github.com/dpsoft/perf-agent/blob/main/docs/flamegraph-pytorch-gpu.html) · [Still image](docs/flamegraph-pytorch-gpu.png).*
 
 ---
 

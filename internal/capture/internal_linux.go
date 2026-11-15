@@ -43,6 +43,9 @@ const (
 	// eventWriteTimeout bounds one event write to a server that is not
 	// reading; after a failure the reaper stops publishing.
 	eventWriteTimeout = 2 * time.Second
+	// launchHandshake bounds the spec write to the launcher and the wait
+	// for its exec.
+	launchHandshake = 10 * time.Second
 	// beforeExitLimit bounds the before-exit fault pause, so a test that
 	// forgets its file does not leave a reaper behind for long.
 	beforeExitLimit = time.Minute
@@ -171,6 +174,13 @@ type reaper struct {
 	// wait4 is wait4(-1, ws, WNOHANG); a test replaces it so that it never
 	// reaps the test process's own children.
 	wait4 func(ws *syscall.WaitStatus) (int, error)
+	// launches delivers the launcher's handshake: nil once the command
+	// runs, or why it does not.
+	launches chan error
+	// launchPending holds the workload's exited event while its exec is
+	// unconfirmed, so it follows launched.
+	launchPending bool
+	heldExit      *Event
 	// starts records the start time of each child the sweep listed.
 	starts  map[int]uint64
 	reasons []string
@@ -212,18 +222,19 @@ func runReaper(w reaperWire, specErr error) int {
 	_ = syscall.SetNonblock(eventFD, true)
 	spec := w.Spec
 	r := &reaper{
-		spec:    spec,
-		self:    os.Getpid(),
-		proc:    DefaultProc(),
-		out:     eventWriter{f: os.NewFile(eventFD, "events")},
-		lock:    w.slot(lockFD, "lock"),
-		perfOut: w.slot(perfOutFD, "perf-agent stdout"),
-		perfErr: w.slot(perfErrFD, "perf-agent stderr"),
-		workOut: w.slot(workOutFD, "workload stdout"),
-		workErr: w.slot(workErrFD, "workload stderr"),
-		live:    map[int]bool{},
-		exits:   make(chan exitNote, 4),
-		starts:  map[int]uint64{},
+		spec:     spec,
+		self:     os.Getpid(),
+		proc:     DefaultProc(),
+		out:      eventWriter{f: os.NewFile(eventFD, "events")},
+		lock:     w.slot(lockFD, "lock"),
+		perfOut:  w.slot(perfOutFD, "perf-agent stdout"),
+		perfErr:  w.slot(perfErrFD, "perf-agent stderr"),
+		workOut:  w.slot(workOutFD, "workload stdout"),
+		workErr:  w.slot(workErrFD, "workload stderr"),
+		live:     map[int]bool{},
+		exits:    make(chan exitNote, 4),
+		launches: make(chan error, 1),
+		starts:   map[int]uint64{},
 	}
 	if specErr == nil && spec.Deadline <= 0 {
 		specErr = errors.New("no deadline")
@@ -273,6 +284,7 @@ func (r *reaper) run() int {
 		cleanup += " (" + strings.Join(r.notes, "; ") + ")"
 	}
 	r.out.publish(Event{Op: EventReaped, PID: r.self, Survivors: survivors, Cleanup: cleanup})
+	r.awaitKnown()
 	r.beforeExit()
 	for _, f := range []*os.File{r.perfOut, r.perfErr, r.workOut, r.workErr, r.out.f} {
 		if f != nil {
@@ -387,6 +399,8 @@ func (r *reaper) serve() (aborted bool) {
 			return true
 		case <-r.term:
 			return true
+		case err := <-r.launches:
+			r.launchDone(err)
 		case <-r.cancelKill:
 			r.cancelKill = nil
 			r.signalGroup(r.perf, syscall.SIGKILL)
@@ -493,6 +507,12 @@ func (r *reaper) startWorkload() {
 		r.fail(WhoWorkload, err.Error())
 		return
 	}
+	syncR, syncW, err := os.Pipe()
+	if err != nil {
+		_, _ = specR.Close(), specW.Close()
+		r.fail(WhoWorkload, err.Error())
+		return
+	}
 	var cg *os.File
 	fallback := func(why error) {
 		r.notes = append(r.notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", why))
@@ -504,11 +524,11 @@ func (r *reaper) startWorkload() {
 		}
 	}
 	r.mu.Lock()
-	ch, err := startLauncher(selfExe, specR, r.spec.Launch.Dir, r.workOut, r.workErr, cg)
+	ch, err := startLauncher(selfExe, specR, syncW, r.spec.Launch.Dir, r.workOut, r.workErr, cg)
 	inCgroup := cg != nil
 	if err != nil && cg != nil && cgroupRetry(err) {
 		fallback(fmt.Errorf("start in %s: %w", r.spec.Cgroup, err))
-		ch, err = startLauncher(selfExe, specR, r.spec.Launch.Dir, r.workOut, r.workErr, nil)
+		ch, err = startLauncher(selfExe, specR, syncW, r.spec.Launch.Dir, r.workOut, r.workErr, nil)
 		inCgroup = false
 	}
 	if err == nil {
@@ -519,19 +539,58 @@ func (r *reaper) startWorkload() {
 	if cg != nil {
 		_ = cg.Close()
 	}
-	_ = specR.Close()
+	_, _ = specR.Close(), syncW.Close()
 	if err != nil {
-		_ = specW.Close()
+		_, _ = specW.Close(), syncR.Close()
 		r.fail(WhoWorkload, "start the launcher: "+err.Error())
 		return
 	}
 	r.workOut, r.workErr = nil, nil
 	r.work, r.inCgroup = ch, inCgroup
-	// The launcher reads its spec to EOF before it executes the command.
-	_, _ = specW.Write(b)
-	_ = specW.Close()
-	r.report(ch, EventLaunched, PauseAfterLauncherFork,
-		Event{Op: EventLaunched, Who: WhoWorkload, PID: ch.pid, PGID: ch.pid, StartTime: ch.start, Cgroup: inCgroup})
+	r.launchPending = true
+	// The handshake runs beside the main loop, which keeps serving EOF and
+	// the deadline; the launcher is a known child from here on.
+	go func() { r.launches <- handshake(specW, syncR, b) }()
+}
+
+// handshake writes the launcher its spec, then reads the sync pipe: EOF
+// with nothing written means the exec closed it, so the command runs;
+// anything written is the launcher's failure. Both steps have a deadline.
+func handshake(specW, syncR *os.File, spec []byte) error {
+	defer func() { _ = syncR.Close() }()
+	_ = specW.SetWriteDeadline(time.Now().Add(launchHandshake))
+	_, werr := specW.Write(spec)
+	if err := errors.Join(werr, specW.Close()); err != nil {
+		return fmt.Errorf("send the launcher its spec: %w", err)
+	}
+	_ = syncR.SetReadDeadline(time.Now().Add(launchHandshake))
+	msg, err := io.ReadAll(io.LimitReader(syncR, 4096))
+	switch {
+	case err != nil:
+		return fmt.Errorf("the launcher did not confirm its exec: %w", err)
+	case len(msg) > 0:
+		return errors.New(string(msg))
+	}
+	return nil
+}
+
+// launchDone publishes launched once the exec is confirmed, then any exit
+// held back meanwhile; a failed exec is an error event, and the workload
+// is never reported.
+func (r *reaper) launchDone(err error) {
+	r.launchPending = false
+	w := r.work
+	if err != nil {
+		r.heldExit = nil
+		r.fail(WhoWorkload, "launch: "+err.Error())
+		return
+	}
+	r.report(w, EventLaunched, PauseAfterLauncherFork,
+		Event{Op: EventLaunched, Who: WhoWorkload, PID: w.pid, PGID: w.pid, StartTime: w.start, Cgroup: r.inCgroup})
+	if r.heldExit != nil && w.reported {
+		r.out.publish(*r.heldExit)
+	}
+	r.heldExit = nil
 }
 
 // exited handles a known child's reaping: its event, then its handle and
@@ -542,11 +601,14 @@ func (r *reaper) exited(e exitNote) {
 			continue
 		}
 		c.reaped = true
-		if c.reported {
-			ev := Event{Op: EventExited, Who: c.who, PID: c.pid, PGID: c.pid, StartTime: c.start, Status: e.ws.ExitStatus()}
-			if e.ws.Signaled() {
-				ev.Signal = e.ws.Signal().String()
-			}
+		ev := Event{Op: EventExited, Who: c.who, PID: c.pid, PGID: c.pid, StartTime: c.start, Status: e.ws.ExitStatus()}
+		if e.ws.Signaled() {
+			ev.Signal = e.ws.Signal().String()
+		}
+		switch {
+		case c == r.work && r.launchPending:
+			r.heldExit = &ev
+		case c.reported:
 			r.out.publish(ev)
 		}
 		c.release()
@@ -820,6 +882,16 @@ func (r *reaper) removeCgroup() {
 	}
 	if err != nil {
 		r.reasons = append(r.reasons, "remove cgroup: "+err.Error())
+	}
+}
+
+// awaitKnown waits, without a bound, until both known children are
+// reaped: the captures directory stays locked for their sake even after a
+// reaped event that reported one as a survivor. The reaper's exit would
+// release the lock too, but it does not exit before.
+func (r *reaper) awaitKnown() {
+	for (r.perf != nil && !r.perf.reaped) || (r.work != nil && !r.work.reaped) {
+		r.exited(<-r.exits)
 	}
 }
 

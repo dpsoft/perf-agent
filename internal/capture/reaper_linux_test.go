@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -131,6 +132,7 @@ func startHarnessOpts(t *testing.T, spec ReaperSpec, o harnessOpts) *harness {
 func (h *harness) lines(f *os.File, out chan<- string) {
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
+	sc.Buffer(nil, 1<<20)
 	for sc.Scan() {
 		select {
 		case out <- sc.Text():
@@ -1225,6 +1227,75 @@ func TestReaperRefusesCommandsWhileEnding(t *testing.T) {
 	if !strings.Contains(ev.Err, "ending") {
 		t.Errorf("error = %q", ev.Err)
 	}
+	h.waitFor(EventReaped, "", 10*time.Second)
+	h.waitDone(10 * time.Second)
+}
+
+// launched is published only once the workload has been executed: the
+// launched PID already runs the command, not the launcher.
+func TestLaunchedComesAfterTheExec(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Launch = workload(t, "sleep", "1m")
+	h := startHarness(t, spec)
+	l := h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
+	exe, err := os.Readlink("/proc/" + strconv.Itoa(l.PID) + "/exe")
+	want, _ := filepath.EvalSymlinks(spec.Launch.Path)
+	if err != nil || exe != want {
+		t.Errorf("at launched pid %d runs %q (%v), want %s", l.PID, exe, err, want)
+	}
+	h.send(Command{Op: OpStop})
+	h.waitFor(EventReaped, "", 10*time.Second)
+	h.waitDone(10 * time.Second)
+}
+
+// A command that cannot be executed is an error, never launched.
+func TestAnExecFailureIsAnErrorNotLaunched(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Launch = workload(t, "sleep", "1m")
+	spec.Launch.Path = filepath.Join(t.TempDir(), "missing")
+	h := startHarness(t, spec)
+	ev := h.waitFor(EventError, WhoWorkload, 10*time.Second)
+	if !strings.Contains(ev.Err, "no such file") {
+		t.Errorf("error = %q, want the exec failure", ev.Err)
+	}
+	h.send(Command{Op: OpStop})
+	for _, e := range h.rest(10 * time.Second) {
+		if e.Op == EventLaunched || e.Op == EventExited {
+			t.Errorf("published %+v for a command that never ran", e)
+		}
+	}
+	for _, e := range h.all() {
+		if e.Op == EventLaunched {
+			t.Errorf("published %+v", e)
+		}
+	}
+	h.waitDone(10 * time.Second)
+}
+
+// A spec larger than a pipe's buffer still reaches the launcher whole.
+func TestALargeLaunchSpecArrivesWhole(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Launch = workload(t, "report")
+	// Several variables, each under the kernel's 128 KiB per-string limit.
+	var big []string
+	for i := range 7 {
+		big = append(big, fmt.Sprintf("PERFMCP_BIG%d=%s", i, strings.Repeat("x", 32<<10)))
+	}
+	spec.Launch.Env = append(spec.Launch.Env, big...)
+	h := startHarness(t, spec)
+	h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
+	var rep struct {
+		Env []string `json:"env"`
+	}
+	if err := json.Unmarshal([]byte(h.line(h.workLines, 10*time.Second)), &rep); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range big {
+		if !slices.Contains(rep.Env, v) {
+			t.Errorf("%.12s... did not arrive", v)
+		}
+	}
+	h.send(Command{Op: OpStop})
 	h.waitFor(EventReaped, "", 10*time.Second)
 	h.waitDone(10 * time.Second)
 }

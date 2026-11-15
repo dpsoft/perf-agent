@@ -43,18 +43,29 @@ func setChildSubreaper() error {
 // is missing) and the reason on stderr, which is the workload's stderr.
 func launch(spec LaunchSpec) int {
 	runtime.LockOSThread()
+	// The sync descriptor closes on a successful exec, which is how the
+	// reaper learns the command runs; a failure is written to it first.
+	syscall.CloseOnExec(launchSyncFD)
+	fail := func(code int, format string, args ...any) int {
+		msg := fmt.Sprintf(format, args...)
+		_, _ = syscall.Write(launchSyncFD, []byte(msg))
+		fmt.Fprintln(os.Stderr, "perf-agent-mcp launcher: "+msg)
+		return code
+	}
 	if err := noNewPrivs(); err != nil {
-		fmt.Fprintf(os.Stderr, "perf-agent-mcp launcher: prctl(PR_SET_NO_NEW_PRIVS): %v\n", err)
-		return 126
+		return fail(126, "prctl(PR_SET_NO_NEW_PRIVS): %v", err)
 	}
 	argv := spec.Args
 	if len(argv) == 0 {
 		argv = []string{spec.Path}
 	}
 	err := syscall.Exec(spec.Path, argv, spec.Env)
-	fmt.Fprintf(os.Stderr, "perf-agent-mcp launcher: exec %s: %v\n", spec.Path, err)
+	code := 126
 	if errors.Is(err, syscall.ENOENT) {
-		return 127
+		code = 127
 	}
-	return 126
+	return fail(code, "exec %s: %v", spec.Path, err)
 }
+
+// launchSyncFD is the launcher's end of the exec handshake.
+const launchSyncFD = 4

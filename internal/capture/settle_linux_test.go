@@ -3,12 +3,16 @@ package capture
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 )
 
 // Synthetic PIDs above Linux's pid_max: a stray signal reaches nothing.
@@ -196,5 +200,35 @@ func TestTheReaperLeavesAForeignCgroup(t *testing.T) {
 	}
 	if len(r.notes) == 0 {
 		t.Error("leaving it was not noted")
+	}
+}
+
+// The lock is held until both known children are reaped, even after a
+// reaped event that reported one of them as a survivor.
+func TestTheLockWaitsForTheKnownChildren(t *testing.T) {
+	r := fakeReaper(t.TempDir(), echild)
+	r.exits = make(chan exitNote, 1)
+	// A real, already waited-for process gives the child a handle to
+	// release; its PID is replaced by a synthetic one.
+	cmd := exec.Command(capturetest.Workload(t), "exit-after", "0s", "0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	r.perf = &child{cmd: cmd, who: WhoPerfAgent, pid: synthetic + 4}
+	done := make(chan struct{})
+	go func() {
+		r.awaitKnown()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("returned while perf-agent was not reaped")
+	case <-time.After(100 * time.Millisecond):
+	}
+	r.exits <- exitNote{pid: synthetic + 4}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not return once perf-agent was reaped")
 	}
 }

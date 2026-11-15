@@ -51,11 +51,12 @@ func startReaperProcess(self string, extra []*os.File) (*child, error) {
 }
 
 // startLauncher starts self as the launcher in its own session, reading
-// its spec from spec (fd 3), in dir, writing to stdout and stderr. A
-// cgroup directory, when given, is the cgroup it starts in.
-func startLauncher(self string, spec *os.File, dir string, stdout, stderr, cgroup *os.File) (*child, error) {
+// its spec from spec (fd 3) and reporting an exec failure on sync (fd 4),
+// in dir, writing to stdout and stderr. A cgroup directory, when given, is
+// the cgroup it starts in.
+func startLauncher(self string, spec, sync *os.File, dir string, stdout, stderr, cgroup *os.File) (*child, error) {
 	cmd := selfCommand(self, modeLauncher)
-	cmd.ExtraFiles = []*os.File{spec}
+	cmd.ExtraFiles = []*os.File{spec, sync}
 	cmd.Dir = dir
 	cmd.Stdout, cmd.Stderr = nilIfNone(stdout), nilIfNone(stderr)
 	attr := &syscall.SysProcAttr{Setsid: true}

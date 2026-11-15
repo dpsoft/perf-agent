@@ -24,7 +24,7 @@ go run ./cmd/flamegraph -fuse -o fused.html \
 (torch_workload.py:76)` under `Thread.run (threading.py:1001)`, down through
 `torch::autograd` and `cublasSgemm_v2`, across the `[gpu:launch]` boundary into
 the CUDA kernel — Python, C++ and GPU in one tree.
-[Interactive version](flamegraph-pytorch-gpu.html).*
+[Interactive version](https://htmlpreview.github.io/?https://github.com/dpsoft/perf-agent/blob/main/docs/flamegraph-pytorch-gpu.html).*
 
 Injection happens during `cuInit` and cannot be added to a live process, so
 `CUDA_INJECTION64_PATH` must be set before the workload starts — Parca and

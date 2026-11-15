@@ -53,3 +53,36 @@ func TestCheckSelf(t *testing.T) {
 		})
 	}
 }
+
+// A file whose permitted set the bounding set would cut fails execve with
+// EPERM, so the server refuses to capture with that perf-agent.
+func TestCheckBounding(t *testing.T) {
+	need := capSet(CapPerfmon, CapBPF, CapSysAdmin)
+	withBnd := func(bnd string) []byte {
+		return []byte("Uid:\t1000\t1000\t1000\t1000\nCapBnd:\t" + bnd + "\nNoNewPrivs:\t0\n")
+	}
+	if err := CheckBounding(withBnd("000001ffffffffff"), need); err != nil {
+		t.Fatalf("full bounding set: %v", err)
+	}
+	if err := CheckBounding(withBnd(zero), 0); err != nil {
+		t.Fatalf("no capability needed: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		status []byte
+		want   string
+	}{
+		{"no cap_bpf", withBnd("0000007fffffffff"), "cap_bpf"},
+		{"empty", withBnd(zero), "cap_sys_admin,cap_perfmon,cap_bpf"},
+		{"no CapBnd", []byte("Uid:\t1000\t1000\t1000\t1000\n"), "CapBnd"},
+		{"bad CapBnd", withBnd("zz"), "CapBnd"},
+		{"CapBnd twice", append(withBnd("000001ffffffffff"), "CapBnd:\t0\n"...), "CapBnd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := asError(t, CheckBounding(tc.status, need), CodeDisabled)
+			if !strings.Contains(e.Message, tc.want) {
+				t.Fatalf("message %q does not say %q", e.Message, tc.want)
+			}
+		})
+	}
+}

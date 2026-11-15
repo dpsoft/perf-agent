@@ -76,3 +76,38 @@ func CheckSelf(status []byte) error {
 	}
 	return nil
 }
+
+// CheckBounding refuses to capture with a perf-agent whose file grants a
+// capability outside the server's bounding set, read from its
+// /proc/self/status: the kernel refuses to execute a file with the
+// effective flag set when the bounding set would cut its permitted set,
+// so every capture would fail with EPERM. A CapBnd it cannot read exactly
+// refuses too.
+func CheckBounding(status []byte, need CapSet) error {
+	var bnd string
+	seen := false
+	sc := bufio.NewScanner(bytes.NewReader(status))
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), ":")
+		if !ok || k != "CapBnd" {
+			continue
+		}
+		if seen {
+			return Errorf(CodeDisabled, "", "/proc/self/status has CapBnd twice")
+		}
+		bnd, seen = strings.TrimSpace(v), true
+	}
+	if err := sc.Err(); err != nil {
+		return Errorf(CodeDisabled, "", "cannot read /proc/self/status: %v", err)
+	}
+	n, err := strconv.ParseUint(bnd, 16, 64)
+	if !seen || err != nil {
+		return Errorf(CodeDisabled, "", "cannot read CapBnd from /proc/self/status")
+	}
+	if missing := need &^ CapSet(n); missing != 0 {
+		return Errorf(CodeDisabled, "start perf-agent-mcp where the capability bounding set keeps perf-agent's capabilities",
+			"this server's capability bounding set lacks %s, which perf-agent's file grants; the kernel would refuse to execute it",
+			strings.Join(missing.Names(), ","))
+	}
+	return nil
+}

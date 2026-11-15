@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
@@ -235,6 +237,7 @@ func (s *Server) checkCall(tool checkingTool, a explainCall) (checked, error) {
 
 	r := explain.Check(v, exps, s.lim.Explain)
 	if r.OK {
+		notices = append(notices, unitNotices(r)...)
 		return checked{e: e, v: v, r: r, notices: notices, notes: notes}, nil
 	}
 	id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeRejected, r.Failures)
@@ -269,6 +272,60 @@ func (s *Server) recorded() {
 	if s.live != nil && s.refreshHistory() {
 		s.commit()
 	}
+}
+
+// unitNotices advise on the passing check r: a claim placeholder followed,
+// after whitespace, by a unit the page already shows with the claim's
+// value ("{c2} ns" shows as "411 ns ns"). Each is a unit_repeated notice,
+// once per claim per piece of text, and never a failure.
+func unitNotices(r explain.Result) []explain.Notice {
+	var out []explain.Notice
+	for i, c := range r.Checked {
+		claims := map[string]explain.CheckedClaim{}
+		for _, cl := range c.Claims {
+			claims[cl.ID] = cl
+		}
+		check := func(path string, segs []explain.Segment) {
+			noticed := map[string]bool{}
+			for k, sg := range segs[:max(len(segs)-1, 0)] {
+				cl, ok := claims[sg.Claim]
+				if sg.Kind != explain.SegmentClaim || !ok || noticed[sg.Claim] {
+					continue
+				}
+				word := wordAfterSpace(segs[k+1])
+				text, units := flamegraph.ShownClaim(cl.EngineValue)
+				if word == "" || !slices.Contains(units, word) {
+					continue
+				}
+				noticed[sg.Claim] = true
+				out = append(out, explain.Notice{Path: path, Code: explain.NoticeUnitRepeated, Message: fmt.Sprintf(
+					"the page shows {%s} as %q, unit included, so the %q after it shows a unit twice; drop it or write words instead", sg.Claim, text, word)})
+			}
+		}
+		at := fmt.Sprintf("explanations[%d]", i)
+		check(at+".prose", c.Prose)
+		for j, h := range c.Hypotheses {
+			check(fmt.Sprintf("%s.hypotheses[%d]", at, j), h)
+		}
+		check(at+".next_measurement", c.NextMeasurement)
+	}
+	return out
+}
+
+// wordAfterSpace is the first word of text segment sg when sg starts with
+// whitespace: the runes up to the next space or punctuation, "%" kept.
+func wordAfterSpace(sg explain.Segment) string {
+	if sg.Kind != explain.SegmentText {
+		return ""
+	}
+	rest := strings.TrimLeftFunc(sg.Text, unicode.IsSpace)
+	if len(rest) == len(sg.Text) {
+		return ""
+	}
+	if end := strings.IndexFunc(rest, func(c rune) bool { return unicode.IsSpace(c) || unicode.IsPunct(c) && c != '%' }); end >= 0 {
+		rest = rest[:end]
+	}
+	return rest
 }
 
 // uncheckedNumbers counts the numbers no claim checked in r's text and in

@@ -1340,6 +1340,31 @@ func factText(f profilemodel.Fact) (string, string) {
 	return displayValue(c, f.Unit, f.Status), exactTitle(c, f.Unit, f.Denominator, f.Rounding, f.Status == profilemodel.StatusZero)
 }
 
+// ShownClaim is claim e as an explained page shows it in place of its
+// placeholder, and the unit words that text carries: "%" for a share, the
+// word after the figure otherwise ("411 ns", "1,234 bytes"), and for a
+// duration every unit the page writes durations in, since which one it
+// picks depends on the value. A count, a measured zero and an unavailable
+// value carry none.
+func ShownClaim(e explain.EngineValue) (text string, units []string) {
+	text = displayEngine(e)
+	if e.Status == profilemodel.StatusUnavailable || e.Value == "" {
+		return text, nil
+	}
+	if e.Unit == profilemodel.UnitRatio {
+		return text, []string{"%"}
+	}
+	i := strings.LastIndexByte(text, ' ')
+	if i < 0 {
+		return text, nil
+	}
+	word := text[i+1:]
+	if durations := []string{"ns", "µs", "ms", "s"}; e.Unit == "nanoseconds" && slices.Contains(durations, word) {
+		return text, durations
+	}
+	return text, []string{word}
+}
+
 // displayEngine is a claim's engine value as shown.
 func displayEngine(e explain.EngineValue) string {
 	if e.Status == profilemodel.StatusUnavailable || e.Value == "" {

@@ -919,3 +919,23 @@ func TestExplainedPageMarksNumbersInTheTitle(t *testing.T) {
 	require.Len(t, h1, 2)
 	assert.Equal(t, "cpu-2026.pb.gz", h1[1])
 }
+
+func TestShownClaimNamesTheUnitsItShows(t *testing.T) {
+	for _, tc := range []struct {
+		e     explain.EngineValue
+		text  string
+		units []string
+	}{
+		{explain.EngineValue{Unit: "ratio", Value: "0.411", Status: "ok"}, "41.1%", []string{"%"}},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "411", Status: "ok"}, "411 ns", []string{"ns", "µs", "ms", "s"}},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "1500000", Status: "ok"}, "1.50 ms", []string{"ns", "µs", "ms", "s"}},
+		{explain.EngineValue{Unit: "bytes", Value: "1234", Status: "ok"}, "1,234 bytes", []string{"bytes"}},
+		{explain.EngineValue{Unit: "count", Value: "3", Status: "ok"}, "3", nil},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "0", Status: "zero"}, "0", nil},
+		{explain.EngineValue{Unit: "nanoseconds", Status: "unavailable", Reason: "not a GPU view"}, "unavailable: not a GPU view", nil},
+	} {
+		text, units := ShownClaim(tc.e)
+		assert.Equal(t, tc.text, text)
+		assert.Equal(t, tc.units, units, tc.text)
+	}
+}

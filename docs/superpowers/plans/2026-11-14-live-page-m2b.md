@@ -40,7 +40,7 @@
 - **Rejected history** (M2-R15..R20) is keyed by (profile digest, view), bounded as in M2, and never taken from the agent. A live publication of an explained view, facts-only included, shows the server's **current** record for its key. That record is refreshed whenever it changes, from either tool and through any handle of the digest. No argument hides it.
 - **Existing outputs do not change.**
   - `RenderHTML`, `RenderFragment` and `WriteDiffPage` stay byte-identical; their goldens are unchanged.
-  - `render_flamegraph`'s results and written bytes are unchanged for the same inputs.
+  - `render_flamegraph`'s results and written bytes are unchanged for the same inputs, except that a passing call whose text repeats a claim's unit after its placeholder now also carries a `unit_repeated` notice (M2b-R16).
   - The static explained page is byte-identical except inside its inline `<script>` element (golden from Task 3).
 - **Live page script rules.**
   - No inline script or style, and no `style=` attributes, in the shell. Geometry is set through CSSOM properties only (no `setAttribute('style'`, no `cssText`).

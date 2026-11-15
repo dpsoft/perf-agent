@@ -120,10 +120,10 @@ type pageOpenOut struct {
 }
 
 type pageExplainOut struct {
-	Attempt          string   `json:"attempt"`
-	Status           string   `json:"status"`
-	Publication      string   `json:"publication"`
-	URL              string   `json:"url"`
+	Attempt           string   `json:"attempt"`
+	Status            string   `json:"status"`
+	Publication       string   `json:"publication"`
+	URL               string   `json:"url"`
 	FiguresChecked    string   `json:"figures_checked"`
 	ReferencesChecked string   `json:"references_checked"`
 	UncheckedNumbers  string   `json:"unchecked_numbers"`
@@ -726,5 +726,66 @@ func TestPageExplainThatCannotBePublishedSaysWhy(t *testing.T) {
 	}
 	if after := pageState(t, url); after.Seq != before.Seq || len(after.Publications) != 0 {
 		t.Errorf("the page changed: %+v, then %+v", before, after)
+	}
+}
+
+// A claim shows its own unit, so a unit written right after it shows
+// twice. Both tools say so in a notice, and still publish or write.
+func TestARepeatedUnitIsANotice(t *testing.T) {
+	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, c, "cpu.pb.gz", "")
+	b := o.nodeID(t, "b")
+	exps := func(prose, hypothesis string) []any {
+		return []any{map[string]any{
+			"node": b,
+			"claims": []any{
+				map[string]any{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": "0.411"},
+				map[string]any{"id": "c2", "metric": "cumulative", "unit": "nanoseconds", "value": "411"},
+			},
+			"prose":      prose,
+			"hypotheses": []any{hypothesis},
+		}}
+	}
+	type notice struct {
+		Path    string `json:"path"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	var out struct {
+		Status  string   `json:"status"`
+		Notices []notice `json:"notices"`
+	}
+	repeated := func(ns []notice) []string {
+		var paths []string
+		for _, n := range ns {
+			if n.Code == "unit_repeated" {
+				paths = append(paths, n.Path)
+			}
+		}
+		return paths
+	}
+	i := 0
+	for _, tc := range []struct {
+		prose, hypothesis string
+		want              []string
+	}{
+		{"b runs {c2} ns, {c1} of it", "b waits", []string{"explanations[0].prose"}},
+		{"b runs {c2}\tns.", "{c1} % is b", []string{"explanations[0].prose", "explanations[0].hypotheses[0]"}},
+		{"b runs {c2} nanoseconds of CPU", "{c1} of the view", nil},
+		{"b runs {c2}, {c1} percent", "b nsfoo {c2} nsec", nil},
+	} {
+		i++
+		c.callOK("page_explain", o.args(map[string]any{"explanations": exps(tc.prose, tc.hypothesis)}), &out)
+		if out.Status != "published" || !slices.Equal(repeated(out.Notices), tc.want) {
+			t.Errorf("page_explain %q / %q: %s, unit notices at %q, want %q", tc.prose, tc.hypothesis, out.Status, repeated(out.Notices), tc.want)
+		}
+		c.callOK("render_flamegraph", o.args(map[string]any{"explanations": exps(tc.prose, tc.hypothesis), "out": fmt.Sprintf("r%d.html", i)}), &out)
+		if out.Status != "written" || !slices.Equal(repeated(out.Notices), tc.want) {
+			t.Errorf("render_flamegraph %q / %q: %s, unit notices at %q, want %q", tc.prose, tc.hypothesis, out.Status, repeated(out.Notices), tc.want)
+		}
+	}
+	c.callOK("page_explain", o.args(map[string]any{"explanations": exps("b runs {c2} ns", "{c1} of it")}), &out)
+	if len(out.Notices) != 1 || !strings.Contains(out.Notices[0].Message, `"411 ns"`) {
+		t.Errorf("the notice %+v does not show the page's value", out.Notices)
 	}
 }

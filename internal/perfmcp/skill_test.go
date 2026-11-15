@@ -22,14 +22,15 @@ var skillArgs = []string{
 	"view_scope", "id", "publication",
 }
 
-// explainCodes reads the failure codes declared in internal/explain.
+// explainCodes reads the failure and notice codes declared in
+// internal/explain.
 func explainCodes(t *testing.T) []string {
 	t.Helper()
 	files, err := filepath.Glob("../explain/*.go")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no explain sources: %v", err)
 	}
-	re := regexp.MustCompile(`Code\s+= "([a-z_]+)"`)
+	re := regexp.MustCompile(`(?:Code\s+|Notice[A-Za-z]+\s+)= "([a-z_]+)"`)
 	var codes []string
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
@@ -78,7 +79,7 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 		known := slices.Contains(tools, word) || slices.Contains(metrics, word) ||
 			slices.Contains(codes, word) || slices.Contains(skillArgs, word)
 		if !known {
-			t.Errorf("the skill cites `%s`, which is no tool, metric, failure code or known argument", word)
+			t.Errorf("the skill cites `%s`, which is no tool, metric, failure or notice code or known argument", word)
 		}
 	}
 

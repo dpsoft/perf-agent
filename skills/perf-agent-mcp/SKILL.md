@@ -54,7 +54,7 @@ Every call names its `handle` and `view`; nothing is "current". The exceptions: 
 | `unresolved_node_ref` | Name a frame with `{n:<id>}` using an ID from `top` or `path`, never the frame's text. |
 | `unknown_node` | The ID must exist in the view you passed; take it from `top` or `path` on that view. |
 
-Other mistakes with no failure code: a claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns"); a figure typed freely in prose is shown as an unchecked number on the page, so put it in a claim; a frame name containing braces must be written as `{n:<id>}`, never pasted into prose; and a share under a GPU launch is not GPU time.
+Other mistakes with no failure code: a claim renders with its unit, so never repeat the unit after the placeholder ("{c2} ns" shows "411 ns ns"; the result's notices say `unit_repeated` where it happened, and the page is still made); a figure typed freely in prose is shown as an unchecked number on the page, so put it in a claim; a frame name containing braces must be written as `{n:<id>}`, never pasted into prose; and a share under a GPU launch is not GPU time.
 
 ## Verify
 

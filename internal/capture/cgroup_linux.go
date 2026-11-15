@@ -78,9 +78,15 @@ func KillCgroup(path string) error {
 }
 
 // RemoveCgroup removes the cgroup at path and the cgroups below it, depth
-// first; one already gone is not an error. The kernel refuses a cgroup
+// first, restoring the owner's rwx on each first; one already gone is not
+// an error. The kernel refuses a cgroup
 // that still has processes, and every refusal is returned.
 func RemoveCgroup(path string) error {
+	// A workload may have taken its own permissions away from a cgroup it
+	// made; the owner can give them back.
+	if fi, err := os.Lstat(path); err == nil && fi.IsDir() && fi.Mode().Perm()&0o700 != 0o700 {
+		_ = os.Chmod(path, fi.Mode().Perm()|0o700)
+	}
 	ents, err := os.ReadDir(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil

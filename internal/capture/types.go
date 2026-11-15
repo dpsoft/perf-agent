@@ -98,8 +98,9 @@ const InternalEnv = "PERF_AGENT_MCP_INTERNAL"
 // set, is the command the reaper starts through the launcher. Deadline is
 // counted from the reaper's start: at it, everything is killed whatever
 // the server says. StopGrace bounds each wait for a signalled process.
-// Cgroup is a cgroup created for this capture, which the workload starts
-// in when the kernel allows it and which the reaper removes. FaultPause is
+// Cgroup is a cgroup created for this capture (its name starts with
+// CgroupPrefix; any other is not used), which the workload starts in when
+// the kernel allows it and which the reaper removes. FaultPause is
 // a test hook (see the FaultPause constants).
 type ReaperSpec struct {
 	PerfAgent           string
@@ -122,8 +123,9 @@ type LaunchSpec struct {
 // ReaperFiles are the descriptors the reaper inherits: the locked captures
 // lock, which it holds until both children are reaped, and the write ends
 // of perf-agent's and the workload's stdout and stderr. A nil file is
-// closed in the reaper. StartReaper does not close them; the caller closes
-// its write ends once the reaper has started, so its readers see EOF.
+// passed as the null device, and the reaper treats it as absent.
+// StartReaper does not close them; the caller closes its write ends once
+// the reaper has started, so its readers see EOF.
 type ReaperFiles struct {
 	Lock, PerfOut, PerfErr, WorkOut, WorkErr *os.File
 }

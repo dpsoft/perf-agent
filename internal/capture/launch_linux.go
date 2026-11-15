@@ -59,6 +59,12 @@ func launch(spec LaunchSpec) int {
 	if len(argv) == 0 {
 		argv = []string{spec.Path}
 	}
+	// The marker comes last before the exec: EOF after it, and nothing
+	// more, is the exec closing the pipe.
+	if _, err := syscall.Write(launchSyncFD, []byte{execMarker}); err != nil {
+		fmt.Fprintf(os.Stderr, "perf-agent-mcp launcher: write the exec marker: %v\n", err)
+		return 126
+	}
 	err := syscall.Exec(spec.Path, argv, spec.Env)
 	code := 126
 	if errors.Is(err, syscall.ENOENT) {
@@ -69,3 +75,9 @@ func launch(spec LaunchSpec) int {
 
 // launchSyncFD is the launcher's end of the exec handshake.
 const launchSyncFD = 4
+
+// execMarker is what the launcher writes on the sync pipe just before it
+// executes the command: EOF right after it is a successful exec, the
+// marker followed by text is a failed one, and nothing at all is a
+// launcher that exited before it got that far.
+const execMarker byte = '!'

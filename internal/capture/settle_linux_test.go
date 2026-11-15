@@ -2,6 +2,7 @@ package capture
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,5 +231,95 @@ func TestTheLockWaitsForTheKnownChildren(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not return once perf-agent was reaped")
+	}
+}
+
+// The handshake tells a confirmed exec from a launcher that failed or
+// exited before it: only the marker, then EOF, is an exec.
+func TestTheHandshakeNeedsTheExecMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name, wrote, want string
+	}{
+		{"exec", string(execMarker), ""},
+		{"exec failed", string(execMarker) + "exec /x: no such file or directory", "no such file"},
+		{"exited before exec", "", "exited before"},
+		{"prctl failed", "prctl(PR_SET_NO_NEW_PRIVS): EINVAL", "prctl"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			specR, specW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			syncR, syncW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				// The launcher's side: read the spec, write, exit or exec.
+				_, _ = io.ReadAll(specR)
+				_ = specR.Close()
+				_, _ = syncW.Write([]byte(tc.wrote))
+				_ = syncW.Close()
+			}()
+			err = handshake(specW, syncR, []byte(`{"Path":"/x"}`))
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("handshake = %v, want a confirmed exec", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Errorf("handshake = %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Without the subreaper, cleanup is incomplete even with a cgroup: a
+// descendant moved out of it, or into another session, is out of reach.
+func TestNoSubreaperIsIncompleteEvenWithACgroup(t *testing.T) {
+	cg := filepath.Join(t.TempDir(), "perf-agent-mcp-4")
+	fakeCgroup(t, cg, "populated 0\n")
+	r := fakeReaper(t.TempDir(), echild)
+	r.inCgroup, r.spec.Cgroup = true, cg
+	r.subreaper = syscall.EPERM
+	r.settle()
+	if !strings.Contains(strings.Join(r.reasons, ";"), "process group only") {
+		t.Errorf("reasons %q, want process group only", r.reasons)
+	}
+}
+
+// Reasons are one line: a multi-part removal error is joined with "; ".
+func TestCleanupReasonsAreOneLine(t *testing.T) {
+	cg := filepath.Join(t.TempDir(), "perf-agent-mcp-5")
+	fakeCgroup(t, filepath.Join(cg, "a"), "populated 0\n")
+	fakeCgroup(t, filepath.Join(cg, "b"), "populated 0\n")
+	r := fakeReaper(t.TempDir(), echild)
+	r.spec.Cgroup = cg
+	r.removeCgroup()
+	if len(r.reasons) == 0 {
+		t.Fatal("no removal failure reported")
+	}
+	for _, why := range r.reasons {
+		if strings.ContainsRune(why, '\n') {
+			t.Errorf("reason %q spans lines", why)
+		}
+	}
+}
+
+// A sub-cgroup the workload made unreadable is still removed.
+func TestRemoveCgroupRestoresAccessToASubCgroup(t *testing.T) {
+	capturetest.SkipIfPrivileged(t)
+	cg := filepath.Join(t.TempDir(), "perf-agent-mcp-6")
+	sub := filepath.Join(cg, "sub")
+	if err := os.MkdirAll(filepath.Join(sub, "deeper"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) })
+	if err := RemoveCgroup(cg); err != nil {
+		t.Errorf("RemoveCgroup = %v", err)
+	}
+	if _, err := os.Stat(cg); !os.IsNotExist(err) {
+		t.Errorf("%s left: %v", cg, err)
 	}
 }

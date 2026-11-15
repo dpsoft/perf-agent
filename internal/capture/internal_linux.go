@@ -188,6 +188,11 @@ type reaper struct {
 	notes []string
 }
 
+// reason records why the cleanup is incomplete, on one line.
+func (r *reaper) reason(why string) {
+	r.reasons = append(r.reasons, strings.ReplaceAll(why, "\n", "; "))
+}
+
 // exitNote is a known child the wait loop reaped.
 type exitNote struct {
 	pid int
@@ -517,7 +522,14 @@ func (r *reaper) startWorkload() {
 	fallback := func(why error) {
 		r.notes = append(r.notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", why))
 	}
-	if r.spec.Cgroup != "" {
+	switch {
+	case r.spec.Cgroup == "":
+	case !strings.HasPrefix(filepath.Base(r.spec.Cgroup), CgroupPrefix):
+		// A cgroup this server would not have created may hold anything:
+		// the workload never starts in it, so it is never killed, proven
+		// or removed either.
+		fallback(fmt.Errorf("%s is not a %s cgroup", r.spec.Cgroup, CgroupPrefix))
+	default:
 		if cg, err = os.OpenFile(r.spec.Cgroup, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0); err != nil {
 			cg = nil
 			fallback(err)
@@ -553,9 +565,11 @@ func (r *reaper) startWorkload() {
 	go func() { r.launches <- handshake(specW, syncR, b) }()
 }
 
-// handshake writes the launcher its spec, then reads the sync pipe: EOF
-// with nothing written means the exec closed it, so the command runs;
-// anything written is the launcher's failure. Both steps have a deadline.
+// handshake writes the launcher its spec, then reads the sync pipe to EOF:
+// exactly the exec marker means the exec closed it, so the command runs;
+// the marker and text, or text alone, is the launcher's failure; nothing
+// is a launcher that exited (or was killed) before it got to the exec.
+// Both steps have a deadline.
 func handshake(specW, syncR *os.File, spec []byte) error {
 	defer func() { _ = syncR.Close() }()
 	_ = specW.SetWriteDeadline(time.Now().Add(launchHandshake))
@@ -568,10 +582,14 @@ func handshake(specW, syncR *os.File, spec []byte) error {
 	switch {
 	case err != nil:
 		return fmt.Errorf("the launcher did not confirm its exec: %w", err)
-	case len(msg) > 0:
-		return errors.New(string(msg))
+	case len(msg) == 0:
+		return errors.New("the launcher exited before executing the command")
+	case len(msg) == 1 && msg[0] == execMarker:
+		return nil
+	case msg[0] == execMarker:
+		return errors.New(string(msg[1:]))
 	}
-	return nil
+	return errors.New(string(msg))
 }
 
 // launchDone publishes launched once the exec is confirmed, then any exit
@@ -646,7 +664,7 @@ func (r *reaper) endWorkload() bool {
 		if err == nil {
 			return true
 		}
-		r.reasons = append(r.reasons, "cgroup.kill: "+err.Error())
+		r.reason("cgroup.kill: " + err.Error())
 	}
 	// Members left after the leader are adopted children by then, and the
 	// sweep ends them.
@@ -664,7 +682,7 @@ func (r *reaper) killAll() {
 	r.signalGroup(r.perf, syscall.SIGKILL)
 	if r.inCgroup {
 		if err := KillCgroup(r.spec.Cgroup); err != nil {
-			r.reasons = append(r.reasons, "cgroup.kill: "+err.Error())
+			r.reason("cgroup.kill: " + err.Error())
 		}
 	}
 	r.signalGroup(r.work, syscall.SIGKILL)
@@ -715,6 +733,11 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 // is the tree quiescent. Then the cgroup must be proven empty, and both
 // known children reaped. What is left becomes survivors, with the reasons
 // in r.reasons.
+//
+// Survivors are listed only from what the reaper can see: its children
+// and the cgroup. Without a cgroup, a descendant that is still a child of
+// another descendant when the grace runs out (a fork chain racing the
+// kills) makes the cleanup incomplete, but is not itself listed.
 func (r *reaper) settle() []Survivor {
 	grace := max(r.spec.StopGrace, settleFloor)
 	end := time.Now().Add(grace)
@@ -735,13 +758,13 @@ func (r *reaper) settle() []Survivor {
 			}
 		}
 		survivors = append(survivors, s)
-		r.reasons = append(r.reasons, fmt.Sprintf("pid %d %s", pid, why))
+		r.reason(fmt.Sprintf("pid %d %s", pid, why))
 	}
 	for _, pid := range left {
 		add(pid, "not reaped")
 	}
 	if !quiet {
-		r.reasons = append(r.reasons, "the process tree was not quiescent at the stop grace")
+		r.reason("the process tree was not quiescent at the stop grace")
 	}
 	if r.inCgroup {
 		// populated in cgroup.events covers the whole subtree, so it is the
@@ -754,9 +777,9 @@ func (r *reaper) settle() []Survivor {
 		}
 		if ok, _ := r.waitUntil(end, false, empty); !ok {
 			if perr != nil {
-				r.reasons = append(r.reasons, fmt.Sprintf("cannot prove cgroup %s empty: %v", r.spec.Cgroup, perr))
+				r.reason(fmt.Sprintf("cannot prove cgroup %s empty: %v", r.spec.Cgroup, perr))
 			} else {
-				r.reasons = append(r.reasons, fmt.Sprintf("cgroup %s still populated", r.spec.Cgroup))
+				r.reason(fmt.Sprintf("cgroup %s still populated", r.spec.Cgroup))
 			}
 			for _, pid := range cgroupProcs(r.spec.Cgroup) {
 				add(pid, "still in the cgroup")
@@ -771,8 +794,11 @@ func (r *reaper) settle() []Survivor {
 			}
 		}
 	}
-	if r.subreaper != nil && !r.inCgroup {
-		r.reasons = append(r.reasons, "process group only (no subreaper: "+r.subreaper.Error()+")")
+	switch {
+	case r.subreaper != nil && r.inCgroup:
+		r.reason("process group only for descendants outside the cgroup (no subreaper: " + r.subreaper.Error() + ")")
+	case r.subreaper != nil:
+		r.reason("process group only (no subreaper: " + r.subreaper.Error() + ")")
 	}
 	return survivors
 }
@@ -830,7 +856,7 @@ func (r *reaper) killChild(pid int, sig syscall.Signal) error {
 	}
 	err = syscall.Kill(pid, sig)
 	if err != nil && !errors.Is(err, syscall.ESRCH) {
-		r.reasons = append(r.reasons, fmt.Sprintf("kill pid %d: %v", pid, err))
+		r.reason(fmt.Sprintf("kill pid %d: %v", pid, err))
 	}
 	return err
 }
@@ -881,14 +907,15 @@ func (r *reaper) removeCgroup() {
 		time.Sleep(sweepTick)
 	}
 	if err != nil {
-		r.reasons = append(r.reasons, "remove cgroup: "+err.Error())
+		r.reason("remove cgroup: " + err.Error())
 	}
 }
 
 // awaitKnown waits, without a bound, until both known children are
 // reaped: the captures directory stays locked for their sake even after a
-// reaped event that reported one as a survivor. The reaper's exit would
-// release the lock too, but it does not exit before.
+// reaped event that reported one as a survivor (say, stuck in D state).
+// The server must not assume the lock is free once reaped arrives; it is
+// free when the reaper exits, which is not before.
 func (r *reaper) awaitKnown() {
 	for (r.perf != nil && !r.perf.reaped) || (r.work != nil && !r.work.reaped) {
 		r.exited(<-r.exits)

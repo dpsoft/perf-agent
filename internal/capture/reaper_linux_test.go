@@ -821,8 +821,10 @@ func TestReaperKillsTheCgroup(t *testing.T) {
 	}
 	h.send(attach(spec, "300ms", t.TempDir()))
 	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-	if !CleanupIsComplete(rp.Cleanup) || len(rp.Survivors) != 0 {
-		t.Errorf("reaped = %+v", rp)
+	// Without the subreaper the only reason left is the one naming it.
+	if want := "incomplete: process group only for descendants outside the cgroup"; !strings.HasPrefix(rp.Cleanup, want) ||
+		strings.Contains(rp.Cleanup, ";") || len(rp.Survivors) != 0 {
+		t.Errorf("reaped = %+v, want only %q", rp, want)
 	}
 	if gc.alive() {
 		t.Error("the grandchild survived cgroup.kill")
@@ -835,35 +837,46 @@ func TestReaperKillsTheCgroup(t *testing.T) {
 
 func TestACgroupStartFailureFallsBack(t *testing.T) {
 	capturetest.SkipIfPrivileged(t)
-	rel, ok := strings.CutPrefix(strings.TrimSpace(string(selfCgroup(t))), "0::")
-	if !ok {
-		t.Skip("no cgroup v2")
+	parent, why := DelegatedCgroup(selfCgroup(t), cgroupMount)
+	if why != "" {
+		t.Skip("no delegated cgroup: " + why)
 	}
-	// The nearest ancestor this user may not move processes into: starting
-	// a child in it fails with EACCES.
-	dir := filepath.Join(cgroupMount, rel)
-	for syscall.Access(filepath.Join(dir, "cgroup.procs"), wOK) == nil {
-		if dir == cgroupMount {
-			t.Skip("every cgroup up to the root is writable")
+	// A writable cgroup this server would not have created, holding an
+	// unrelated process: the reaper must neither start the workload in it
+	// nor kill, prove or remove it.
+	foreign := filepath.Join(parent, "capture-test-foreign-"+strconv.Itoa(os.Getpid())+"-"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	if err := os.Mkdir(foreign, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !eventually(5*time.Second, func() bool { p, err := cgroupPopulated(foreign); return err != nil || !p }) {
+			t.Errorf("%s is still populated", foreign)
 		}
-		dir = filepath.Dir(dir)
+		if err := syscall.Rmdir(foreign); err != nil {
+			t.Errorf("remove %s: %v", foreign, err)
+		}
+	})
+	pid, gone := otherGroup(t)
+	if err := os.WriteFile(filepath.Join(foreign, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
+		t.Fatalf("move the sleeper into %s: %v", foreign, err)
 	}
+
 	spec := fakeSpec(t, capturetest.FakeOptions{})
-	spec.Cgroup = dir
+	spec.Cgroup = foreign
 	spec.Launch = workload(t, "sleep", "1m")
 	h := startHarness(t, spec)
 	if l := h.waitFor(EventLaunched, WhoWorkload, 10*time.Second); l.Cgroup {
-		t.Fatalf("launched = %+v, want the fallback outside %s", l, dir)
+		t.Errorf("launched = %+v, want the fallback outside %s", l, foreign)
 	}
 	h.send(attach(spec, "200ms", t.TempDir()))
 	h.waitFor(EventExited, WhoPerfAgent, 10*time.Second)
 	rp := h.waitFor(EventReaped, "", 10*time.Second+spec.StopGrace)
-	// The fallback is noted, and the foreign cgroup is left in place.
 	if !CleanupIsComplete(rp.Cleanup) || !strings.Contains(rp.Cleanup, "no cgroup") {
 		t.Errorf("reaped = %+v, want complete with the fallback noted", rp)
 	}
 	h.waitDone(10 * time.Second)
-	if _, err := os.Stat(dir); err != nil {
+	survives(t, gone)
+	if _, err := os.Stat(foreign); err != nil {
 		t.Errorf("the reaper removed a cgroup it never used: %v", err)
 	}
 }

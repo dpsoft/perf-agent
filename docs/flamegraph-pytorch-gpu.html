@@ -273,10 +273,10 @@ body.gpu-comparing #fd,body.gpu-comparing #tip,body.gpu-comparing #menu,body.gpu
 <ul>
 <li>[cpu] perf-agent 99 Hz: 6731 of 21079 frame slots (31.9%) have no symbol and are drawn as a raw address or [unknown].</li>
 <li>[cpu] perf-agent 99 Hz: 5587 frame slots were merged: runs of consecutive frames from one vendor library whose names say nothing (an address, or the CUDA symbol server&#39;s obfuscated libfoo_&lt;hex&gt;) are drawn as a single frame named after the library. The profile itself is unchanged.</li>
-<li>[gpu] per sampled launch: 39 of 700 frame slots (5.6%) have no symbol and are drawn as a raw address or [unknown].</li>
-<li>[gpu] per sampled launch: 29 frame slots were merged: runs of consecutive frames from one vendor library whose names say nothing (an address, or the CUDA symbol server&#39;s obfuscated libfoo_&lt;hex&gt;) are drawn as a single frame named after the library. The profile itself is unchanged.</li>
-<li>[gpu] per sampled launch: 2.2% of the total is attributed to its CPU call path by inference, not measurement (gpu_join is heuristic or unmatched, or the join was ambiguous). Those frames name a plausible caller, not an observed one.</li>
-<li>[gpu] per sampled launch: 2.2% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.</li>
+<li>[gpu] every launch: 39 of 700 frame slots (5.6%) have no symbol and are drawn as a raw address or [unknown].</li>
+<li>[gpu] every launch: 29 frame slots were merged: runs of consecutive frames from one vendor library whose names say nothing (an address, or the CUDA symbol server&#39;s obfuscated libfoo_&lt;hex&gt;) are drawn as a single frame named after the library. The profile itself is unchanged.</li>
+<li>[gpu] every launch: 2.2% of the total is attributed to its CPU call path by inference, not measurement (gpu_join is heuristic or unmatched, or the join was ambiguous). Those frames name a plausible caller, not an observed one.</li>
+<li>[gpu] every launch: 2.2% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.</li>
 </ul>
 <h2>Sample labels (not in the graph)</h2>
 <p class="muted">Frames are stack identity, so §8 of the GPU profiling v2 design keeps these out of the tree: a per-sample PC or correlation ID in the path would give every sample its own leaf and destroy the aggregation a flame graph exists to show. They are reported here instead, so nothing in the profile is silently discarded.</p>
@@ -311,10 +311,9 @@ body.gpu-comparing #fd,body.gpu-comparing #tip,body.gpu-comparing #menu,body.gpu
 <div id="gpu-summary-mount"></div><section id="gpu-comparison" role="tabpanel" aria-labelledby="gpu-tab-compare" hidden></section>
 <noscript><p class="note">GPU telemetry controls require JavaScript. The profile below remains available.</p></noscript>
 <div id="profile-view" role="tabpanel" aria-labelledby="gpu-tab-flame">
-<p class="note">gpu_sample_period=1 &mdash; one launch in 1 carried a CPU stack, so the width under [gpu:launch] is a sample of launches, not that path&rsquo;s share of GPU time. Nothing is scaled by 1.</p>
 <div id="hidden-note" hidden></div>
 <div class="canvas">
-<div class="chart" style="height:986px" role="group" aria-label="Flame graph, cpu+gpu/nanoseconds" data-total="35825614388" data-unit="nanoseconds">
+<div class="chart" style="height:986px" role="group" aria-label="Flame graph, cpu+gpu/nanoseconds" data-total="35825614388" data-unit="nanoseconds" data-every-launch="1">
 <script type="application/json" id="modules">["~/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/bin/python3.12","~/github/perf-agent/shim/libperfagent-gpu-nvidia.so","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/libcufile.so.0","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/libcupti.so.13","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/torch/lib/libc10.so","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so","~/pytorch-profile-test/.venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so","/usr/lib64/ld-linux-x86-64.so.2","/usr/lib64/libc.so.6","/usr/lib64/libcuda.so.620.70.06","/usr/lib64/libstdc++.so.6.0.35"]</script>
 <div class="frame d0 inexact" style="left:0%;width:100%" role="img" aria-label="all, 35.826 s, 100.00% of total" data-domain="root" data-value="35825614388" data-inexact="322348372" data-axis="cpu+gpu/nanoseconds">all</div>
 <div class="frame d1 j6" style="left:0%;width:58.758%" role="img" aria-label="[cpu] perf-agent 99 Hz, 21.051 s, 58.76% of total" data-domain="app" data-value="21050504840" data-axis="cpu/nanoseconds">[cpu] perf-agent 99 Hz</div>
@@ -1332,7 +1331,7 @@ body.gpu-comparing #fd,body.gpu-comparing #tip,body.gpu-comparing #menu,body.gpu
 <div class="frame d19 j2" style="left:58.702%;width:0.028%" role="img" aria-label="c10::intrusive_ptr&lt;c10::StorageImpl, c10::detail::intrusive_target_default_null_type&lt;c10::StorageImpl&gt; &gt;::reset_not_null_(c10::StorageImpl*), 10.10 ms, 0.03% of total" data-domain="app" data-value="10101010" data-m="7">c10::intrusive_ptr&lt;c10::StorageImpl, c10::detail::intrusive_target_default_null_type&lt;c10::StorageImpl&gt; &gt;::reset_not_null_(c10::StorageImpl*)</div>
 <div class="frame d20 j7" style="left:58.702%;width:0.028%" role="img" aria-label="c10::cuda::CUDACachingAllocator::Native::local_raw_delete(void*), 10.10 ms, 0.03% of total" data-domain="app" data-value="10101010" data-m="8">c10::cuda::CUDACachingAllocator::Native::local_raw_delete(void*)</div>
 <div class="frame d21 j2" style="left:58.702%;width:0.028%" role="img" aria-label="c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::get_allocated_block(void const*, bool), 10.10 ms, 0.03% of total" data-domain="app" data-value="10101010" data-m="8">c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::get_allocated_block(void const*, bool)</div>
-<div class="frame d1 inexact" style="left:58.758%;width:41.242%" role="img" aria-label="[gpu] per sampled launch, 14.775 s, 41.24% of total" data-domain="app" data-value="14775109548" data-inexact="322348372" data-axis="gpu/nanoseconds">[gpu] per sampled launch</div>
+<div class="frame d1 inexact j2" style="left:58.758%;width:41.242%" role="img" aria-label="[gpu] every launch, 14.775 s, 41.24% of total" data-domain="app" data-value="14775109548" data-inexact="322348372" data-axis="gpu/nanoseconds">[gpu] every launch</div>
 <div class="frame d2 inexact" style="left:58.758%;width:0.9%" role="img" aria-label="[gpu:launch unsampled], 322.35 ms, 0.90% of total" data-domain="boundary-unattributed" data-value="322348372" data-inexact="322348372">[gpu:launch unsampled]</div>
 <div class="frame d3 inexact j6" style="left:58.758%;width:0.001%" role="img" aria-label="[gpu:kernel:_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_], 459.11 µs, 0.00% of total" data-domain="gpu-kernel" data-value="459109" data-inexact="459109">[gpu:kernel:_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_]</div>
 <div class="frame d3 inexact j2" style="left:58.76%;width:0.002%" role="img" aria-label="[gpu:kernel:_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_], 683.43 µs, 0.00% of total" data-domain="gpu-kernel" data-value="683429" data-inexact="683429">[gpu:kernel:_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_]</div>
@@ -1748,6 +1747,7 @@ var mods=(function(){var e=doc.getElementById("modules");if(!e){return [];}
 function moduleOf(d){var i=d.m;return i===undefined?"":(mods[+i]||"");}
 var idle=st.textContent,zoomTarget=null;
 var axis=chart.getAttribute("aria-label");
+var everyLaunch=chart.dataset.everyLaunch==="1";
 var inverted=false,treeOn=false,treeRoot=null;
 var nav=[],navIdx=-1,cur=null,tally="";
 
@@ -1833,7 +1833,7 @@ function widthMeaning(it,d){
   if(types.length>1){return types.indexOf("cpu")<0?"":"width: CPU samples and GPU time added together \u2014 compare within one root";}
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
-  case "boundary": return "width: device time launched from this path, sampled one launch in N";
+  case "boundary": return everyLaunch?"width: device time launched from this path":"width: device time launched from this path, sampled one launch in N";
   case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
   default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
   }

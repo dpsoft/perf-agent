@@ -10,7 +10,8 @@ included, not just at itself.
 # The workload must already have loaded the adapter:
 #   CUDA_INJECTION64_PATH=/path/to/libperfagent-gpu-nvidia.so python train.py
 # The picture below also set PERFAGENT_GPU_SAMPLE_PERIOD=1 there, so every
-# launch carries its CPU stack instead of one in 8.
+# launch carries its CPU stack instead of one in 8, and labels its GPU root
+# '[gpu] every launch' instead of '[gpu] per sampled launch'.
 ./perf-agent --profile --gpu --duration 15s \
     --gpu-shim /path/to/libperfagent-gpu-nvidia.so --pid <PID> \
     --profile-output cpu.pb.gz --gpu-output gpu.pb.gz \

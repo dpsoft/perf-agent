@@ -436,7 +436,9 @@ func TestRunKillsKeepTheSweep(t *testing.T) {
 			func(s *RunSpec) { s.Bounds.FinishTimeout = 500 * time.Millisecond }, nil, CodeFinishTimeout},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			spec := runSpec(t, capturetest.FakeOptions{Mode: tc.mode})
+			// The readiness delay lets the workload fork its grandchild
+			// before any kill; Kill also waits for the reaper to adopt it.
+			spec := runSpec(t, capturetest.FakeOptions{Mode: tc.mode, ReadyAfter: 500 * time.Millisecond})
 			spec.Settings.Duration = time.Minute
 			spec.Launch = launchOf(t, tc.args...)
 			if tc.set != nil {
@@ -445,6 +447,7 @@ func TestRunKillsKeepTheSweep(t *testing.T) {
 			r := startRun(t, spec)
 			if tc.end != nil {
 				waitPhase(t, r, PhaseProfiling, 10*time.Second)
+				waitAdopted(t, r.reaper.PID())
 				tc.end(r)
 			}
 			o := waitRun(t, r, 30*time.Second)
@@ -456,6 +459,30 @@ func TestRunKillsKeepTheSweep(t *testing.T) {
 			}
 			requireGone(t, grandchildOf(t, o))
 		})
+	}
+}
+
+// waitAdopted waits until the reaper has the workload and its orphaned
+// setsid grandchild as children: the grandchild has printed its pid and
+// its parent has exited by then.
+func waitAdopted(t *testing.T, reaper int) {
+	t.Helper()
+	ok := eventually(10*time.Second, func() bool {
+		ents, _ := os.ReadDir("/proc")
+		n := 0
+		for _, e := range ents {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil {
+				continue
+			}
+			if st, err := readStat(DefaultProc(), pid); err == nil && st.ppid == reaper && st.comm == "capworkload" && !st.exited() {
+				n++
+			}
+		}
+		return n >= 2
+	})
+	if !ok {
+		t.Fatalf("the reaper %d never adopted the workload's grandchild", reaper)
 	}
 }
 

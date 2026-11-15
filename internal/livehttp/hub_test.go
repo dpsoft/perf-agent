@@ -395,8 +395,8 @@ func TestPublishRefusesEmptyData(t *testing.T) {
 		t.Fatalf("first state seq %d, want 1", seq)
 	}
 
-	// EventSource drops an event whose data is empty, so the page would stay
-	// on the old state without a sign.
+	// A state is a non-empty JSON document; empty data is not one, and
+	// nothing reaches the clients.
 	for _, data := range [][]byte{nil, {}} {
 		if err := h.Publish(data); !errors.Is(err, ErrEmpty) {
 			t.Errorf("Publish(%#v) = %v, want ErrEmpty", data, err)

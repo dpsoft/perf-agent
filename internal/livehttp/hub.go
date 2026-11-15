@@ -13,8 +13,9 @@ import (
 // would end the event's data line early.
 var ErrMultiline = errors.New("live state must be a single line")
 
-// ErrEmpty is returned by Publish for empty data. EventSource drops an event
-// whose data is empty, so the page would keep its old state without a sign.
+// ErrEmpty is returned by Publish for empty data. Every state the hub
+// sends is a non-empty JSON document the page parses; an empty one is not a
+// state, and a page given one could not tell what to show.
 var ErrEmpty = errors.New("live state must not be empty")
 
 // Hub streams the newest published state to every connected page as

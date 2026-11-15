@@ -124,11 +124,12 @@ type pageExplainOut struct {
 	Status           string   `json:"status"`
 	Publication      string   `json:"publication"`
 	URL              string   `json:"url"`
-	FiguresChecked   string   `json:"figures_checked"`
-	UncheckedNumbers string   `json:"unchecked_numbers"`
-	Notices          []any    `json:"notices"`
-	Notes            []string `json:"notes"`
-	Viewers          string   `json:"viewers"`
+	FiguresChecked    string   `json:"figures_checked"`
+	ReferencesChecked string   `json:"references_checked"`
+	UncheckedNumbers  string   `json:"unchecked_numbers"`
+	Notices           []any    `json:"notices"`
+	Notes             []string `json:"notes"`
+	Viewers           string   `json:"viewers"`
 }
 
 type pageShowOut struct {
@@ -254,6 +255,9 @@ func TestPageExplainPublishesCheckedClaims(t *testing.T) {
 	if strings.Contains(text, `"notes"`) {
 		t.Errorf("a CPU publication's result has notes: %s", text)
 	}
+	if out.ReferencesChecked != "0" {
+		t.Errorf("references_checked %q without a frame reference", out.ReferencesChecked)
+	}
 	if st := pageState(t, url); st.Current != "p1" || st.Selected != b || st.Focus != "" || len(st.Publications) != 1 {
 		t.Errorf("state %+v", st)
 	}
@@ -274,6 +278,28 @@ func TestPageExplainPublishesCheckedClaims(t *testing.T) {
 	text, isErr := c.call("page_explain", g.args(map[string]any{"explanations": shareClaim(conv, "0.7", "conv is {c1}")}))
 	if !isErr || !strings.Contains(text, `"notes":`+mustJSON(t, gop.Notes)) {
 		t.Errorf("a GPU rejection: isError=%v %s", isErr, text)
+	}
+}
+
+// The page's pill counts figures and references; the result names both,
+// so it says what the pill says.
+func TestPageExplainCountsTheReferencesItChecked(t *testing.T) {
+	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, c, "cpu.pb.gz", "")
+	b, cc, a := o.nodeID(t, "b"), o.nodeID(t, "c"), o.nodeID(t, "a")
+	exps := goldenExplanations(b, cc)
+	exps[0].(map[string]any)["hypotheses"] = []any{"{n:" + a + "} calls {n:" + b + "}"}
+	var out pageExplainOut
+	text := c.callOK("page_explain", o.args(map[string]any{"explanations": exps}), &out)
+	if out.FiguresChecked != "2" || out.ReferencesChecked != "3" {
+		t.Errorf("figures_checked %q and references_checked %q, want 2 and 3: %s", out.FiguresChecked, out.ReferencesChecked, text)
+	}
+	if model := pageGet(t, out.URL, "pub/"+out.Publication+"/model"); !strings.Contains(model, `"checked_pill":"5 figures and references checked"`) {
+		t.Errorf("the pill does not count both: %.400s", model)
+	}
+	// render_flamegraph's result does not change.
+	if text, isErr := c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "out": "r.html"})); isErr || strings.Contains(text, "references_checked") {
+		t.Errorf("render_flamegraph: isError=%v %s", isErr, text)
 	}
 }
 

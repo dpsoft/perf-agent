@@ -156,17 +156,20 @@ type pageExplainArgs struct {
 }
 
 // pagePublished carries the view's sampling notes on a GPU view, as every
-// response about one does, and no notes key otherwise.
+// response about one does, and no notes key otherwise. FiguresChecked
+// counts the claims and ReferencesChecked the distinct frames named by
+// {n:…}; the page's pill counts both together.
 type pagePublished struct {
-	Attempt          string           `json:"attempt"`
-	Status           string           `json:"status"`
-	Publication      string           `json:"publication"`
-	URL              string           `json:"url"`
-	FiguresChecked   string           `json:"figures_checked"`
-	UncheckedNumbers string           `json:"unchecked_numbers"`
-	Notices          []explain.Notice `json:"notices"`
-	Notes            []string         `json:"notes,omitzero"`
-	Viewers          string           `json:"viewers"`
+	Attempt           string           `json:"attempt"`
+	Status            string           `json:"status"`
+	Publication       string           `json:"publication"`
+	URL               string           `json:"url"`
+	FiguresChecked    string           `json:"figures_checked"`
+	ReferencesChecked string           `json:"references_checked"`
+	UncheckedNumbers  string           `json:"unchecked_numbers"`
+	Notices           []explain.Notice `json:"notices"`
+	Notes             []string         `json:"notes,omitzero"`
+	Viewers           string           `json:"viewers"`
 }
 
 // shrinkPublished is the advice for a published result over
@@ -213,8 +216,9 @@ func (s *Server) handlePageExplain(_ context.Context, raw json.RawMessage) (mcps
 	s.log.Info("published", "attempt", id, "handle", a.Handle, "view", a.View, "publication", p.id, "bytes", len(p.model))
 	return s.respond("page_explain", shrinkPublished, pagePublished{
 		Attempt: id, Status: outcomePublished, Publication: p.id, URL: url,
-		FiguresChecked: wireInt(int64(c.r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(c.r, a.Title))),
-		Notices: c.notices, Notes: c.notes, Viewers: s.viewers(),
+		FiguresChecked: wireInt(int64(c.r.Figures)), ReferencesChecked: wireInt(int64(c.r.References)),
+		UncheckedNumbers: wireInt(int64(uncheckedNumbers(c.r, a.Title))),
+		Notices:          c.notices, Notes: c.notes, Viewers: s.viewers(),
 	})
 }
 

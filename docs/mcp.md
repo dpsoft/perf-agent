@@ -112,7 +112,7 @@ Started with `--live`, the server can show what an agent explains on a page in t
 The four tools:
 
 - `page_open` starts the page and returns its URL. The agent gives the URL to the user: the server never opens a browser.
-- `page_explain` runs `render_flamegraph`'s check, with the same failures, the same `attempt` rules and one attempt history shared by both tools, and publishes the explained flame graph instead of writing it. A rejected call publishes nothing. `"explanations": []` publishes a view's facts alone.
+- `page_explain` runs `render_flamegraph`'s check, with the same failures, the same `attempt` rules and one attempt history shared by both tools, and publishes the explained flame graph instead of writing it. A rejected call publishes nothing. `"explanations": []` publishes a view's facts alone. Its result has `figures_checked` (the claims) and `references_checked` (the distinct frames named by `{n:…}`); the page's pill counts the two together.
 - `page_show` switches the page to a kept publication, selects a node (drawn or not) and, with `"focus": true`, lays the flame graph out from it.
 - `page_diff` takes `diff`'s arguments without `limit` and `cursor`, refuses what `diff` refuses, and publishes the comparison. Its nodes are union IDs from `diff`.
 

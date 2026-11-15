@@ -126,7 +126,10 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 }
 
 // Close stops the live page, if any, and closes the server's roots. It may
-// run on another goroutine than Serve's, while a request is in flight.
+// run on another goroutine than Serve's, while a request is in flight. The
+// page's streams end first and its other responses get liveShutdown before
+// their connections are dropped, so a tab that stopped reading delays Close
+// by at most that.
 func (s *Server) Close() error {
 	if s.live != nil {
 		s.live.close()

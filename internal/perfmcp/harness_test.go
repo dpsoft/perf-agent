@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // testClient drives a Server over in-process pipes.
@@ -151,4 +153,52 @@ func must[T any](v T, err error) func(*testing.T) T {
 		}
 		return v
 	}
+}
+
+// liveURL starts s's live page and returns its URL.
+func liveURL(t *testing.T, s *Server) string {
+	t.Helper()
+	return must(s.ensureLive())(t)
+}
+
+// httpGet requests url from a live page with the headers hdr ("Host"
+// sets the request's Host) and returns the response with its body read.
+func httpGet(t *testing.T, url string, hdr map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	return httpDo(t, http.MethodGet, url, hdr)
+}
+
+// httpDo is httpGet with another method. It follows no redirect and keeps
+// no connection open. Any goroutine may call it: an error is reported with
+// Errorf, and the response is then empty, with status 0.
+func httpDo(t *testing.T, method, url string, hdr map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, url, nil)
+	if err != nil {
+		t.Errorf("%s %s: %v", method, url, err)
+		return &http.Response{Header: http.Header{}}, nil
+	}
+	for k, v := range hdr {
+		if k == "Host" {
+			req.Host = v
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	client := &http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		t.Errorf("%s %s: %v", method, url, err)
+		return &http.Response{Header: http.Header{}}, nil
+	}
+	defer func() { _ = res.Body.Close() }()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Errorf("%s %s: reading the body: %v", method, url, err)
+	}
+	return res, body
 }

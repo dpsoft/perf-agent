@@ -187,8 +187,15 @@ func TestTheServerLinksNoProfiler(t *testing.T) {
 
 // networkingPackages are the packages that open connections. Among the
 // binary's own packages only internal/livehttp, the loopback listener, may
-// import them.
+// import them, and internal/perfmcp may import net/http for the page's
+// handlers and the server they run in.
 var networkingPackages = []string{"net", "net/http", "crypto/tls"}
+
+// handlerImports are the networking imports each package besides
+// internal/livehttp is allowed.
+var handlerImports = map[string][]string{
+	"github.com/dpsoft/perf-agent/internal/perfmcp": {"net/http"},
+}
 
 // clientSymbols are functions every outgoing connection or name lookup
 // through the standard library runs.
@@ -204,7 +211,8 @@ var clientSymbols = []string{
 }
 
 // TestTheServerOpensNoConnection is a stopgap for the network scan that
-// replaces it: only internal/livehttp imports a networking package, and
+// replaces it: only internal/livehttp imports a networking package (and
+// internal/perfmcp net/http, for its handlers), and
 // the linked binary has none of the client symbols. A call of
 // (*net.Dialer).DialContext is linked by the server side too, so nm cannot
 // tell it apart; the source scan and the socket test are still required.
@@ -219,6 +227,9 @@ func TestTheServerOpensNoConnection(t *testing.T) {
 			continue
 		}
 		for imp := range strings.FieldsSeq(imports) {
+			if slices.Contains(handlerImports[path], imp) {
+				continue
+			}
 			if slices.Contains(networkingPackages, imp) || strings.HasPrefix(imp, "net/http/") {
 				t.Errorf("%s imports %s; only internal/livehttp may", path, imp)
 			}

@@ -2,9 +2,14 @@ package perfmcp
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"maps"
+	"net/http"
 	"slices"
 	"sort"
 	"strconv"
@@ -29,6 +34,11 @@ const (
 	liveKeepAlive    = 15 * time.Second
 	liveWriteTimeout = 10 * time.Second
 )
+
+// liveShutdown is how long Close lets the page's responses finish before
+// it drops their connections. Close may run during a forced exit, so it
+// must not wait on a tab that stopped reading.
+const liveShutdown = 500 * time.Millisecond
 
 // pubKind is what a publication shows.
 type pubKind string
@@ -235,9 +245,10 @@ type liveSnapshot struct {
 //
 // The request goroutine alone changes the publications, the steering and
 // the snapshot: every field below snap is its own, and commit, the only
-// writer of snap, runs on it. HTTP handlers read only what snap points to.
-// The listener's lifecycle is the exception: Close may end it from another
-// goroutine (a forced exit), so it is behind mu.
+// writer of snap, runs on it. HTTP handlers read only what snap points to,
+// and the hub, which never changes. The listener's lifecycle is the
+// exception: the request goroutine starts it and Close may end it from
+// another goroutine (a forced exit), so it is behind mu.
 type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
@@ -260,6 +271,11 @@ type live struct {
 	mu sync.Mutex
 	// closed is set by close; nothing starts after it.
 	closed bool
+	// srv serves the page once start has run, from ln; url is the page's
+	// address.
+	srv *http.Server
+	ln  io.Closer
+	url string
 }
 
 func newLive(lim Limits, pins *pins) *live {
@@ -278,12 +294,79 @@ func newLive(lim Limits, pins *pins) *live {
 // snapshot is the latest committed snapshot. Any goroutine may call it.
 func (l *live) snapshot() *liveSnapshot { return l.snap.Load() }
 
+// errLiveClosed is ensureLive's answer once the server is closing.
+var errLiveClosed = errors.New("the live page is shut down: perf-agent-mcp is exiting")
+
 // close stops the live page. It may run on any goroutine, more than once.
+// The hub goes first, so every stream returns and its connection can go
+// idle; then the server gets liveShutdown to finish the other responses,
+// and the connections still busy, a tab that stopped reading, are
+// dropped. It logs nothing: stderr may be blocked during a forced exit.
 func (l *live) close() {
 	l.mu.Lock()
 	l.closed = true
+	srv, ln := l.srv, l.ln
 	l.mu.Unlock()
 	l.hub.Close()
+	if srv == nil {
+		return
+	}
+	// Serve may not have taken the listener yet; closing it here refuses
+	// new connections at once either way.
+	_ = ln.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), liveShutdown)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	_ = srv.Close()
+}
+
+// start listens on liveAddr with a new token and serves mux() behind the
+// guard, unless the page is already served or close has run. It returns
+// the page's URL, the address it listens on and whether this call
+// started it.
+func (l *live) start(mux func() http.Handler, log *slog.Logger) (url, addr string, started bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return "", "", false, errLiveClosed
+	}
+	if l.url != "" {
+		return l.url, "", false, nil
+	}
+	tok, err := livehttp.NewToken()
+	if err != nil {
+		return "", "", false, err
+	}
+	ln, err := livehttp.Listen(liveAddr)
+	if err != nil {
+		return "", "", false, fmt.Errorf("live page: %w", err)
+	}
+	srv := livehttp.NewServer(livehttp.Guard(tok, mux()), log)
+	go func() { _ = srv.Serve(ln) }()
+	// A TCP address prints an IPv6 host in brackets.
+	addr = ln.Addr().String()
+	l.srv, l.ln, l.url = srv, ln, "http://"+addr+"/s/"+string(tok)+"/"
+	return l.url, addr, true, nil
+}
+
+// ensureLive starts the live page on first use and returns its URL; later
+// calls return the same URL. It runs on the request goroutine, and refuses
+// once Close has run. The first start commits, so a page that connects
+// before anything is published is still sent a state.
+func (s *Server) ensureLive() (string, error) {
+	if s.live == nil {
+		return "", errors.New("the live page is off; restart perf-agent-mcp with --live to use it")
+	}
+	url, addr, started, err := s.live.start(s.liveMux, s.log)
+	if err != nil {
+		return "", err
+	}
+	if started {
+		// The address only: the token is in the URL, never in a log line.
+		s.log.Info("live page listening", "addr", addr)
+		s.commit()
+	}
+	return url, nil
 }
 
 // isClosed reports whether close has run.

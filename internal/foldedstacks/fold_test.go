@@ -364,6 +364,9 @@ func TestFoldExplainsWhatLaunchSamplingDoesToTheShape(t *testing.T) {
 	assert.Equal(t, int64(5590723), res.UnsampledLaunchTotal)
 	joined := strings.Join(res.Warnings, "\n")
 	assert.Contains(t, joined, "93.4% of the total sits under [gpu:launch unsampled]")
+	assert.Contains(t, joined, "whose launch carried no CPU stack")
+	assert.NotContains(t, joined, "not one of the sampled ones",
+		"true only above period 1; the residual at period 1 is launches with no attributable stack")
 	assert.Contains(t, joined, "one launch in 8 contributed a CPU stack")
 	assert.Contains(t, joined, "not a sample of GPU time")
 	assert.Contains(t, joined, "every value is a measured duration",
@@ -378,4 +381,28 @@ func TestFoldSaysNothingAboutSamplingWhenThereIsNone(t *testing.T) {
 	joined := strings.Join(res.Warnings, "\n")
 	assert.NotContains(t, joined, "launch")
 	assert.NotContains(t, joined, "sample of GPU time")
+}
+
+// At gpu_sample_period=1 every launch carried its stack, so the call path
+// under [gpu:launch] IS that path's share of GPU time. The sampling warning
+// would say the opposite of the truth.
+func TestFoldSaysNothingAboutSamplingWhenEveryLaunchCarriedAStack(t *testing.T) {
+	p := oneType(
+		sample(397131, map[string][]string{"gpu_join": {"exact"}, SamplePeriodLabel: {"1"}},
+			loc(3, "main"), loc(4, "[gpu:launch]"), loc(2, "[gpu:kernel:k]")),
+	)
+	res, err := Fold(p, Options{SampleIndex: -1})
+	require.NoError(t, err)
+	joined := strings.Join(res.Warnings, "\n")
+	assert.NotContains(t, joined, "one launch in")
+	assert.NotContains(t, joined, "sample of GPU time")
+
+	// One sampled population is enough for the warning to be true of it.
+	p = oneType(
+		sample(1, map[string][]string{SamplePeriodLabel: {"1"}}, loc(3, "main"), loc(4, "[gpu:launch]")),
+		sample(1, map[string][]string{SamplePeriodLabel: {"8"}}, loc(5, "other"), loc(4, "[gpu:launch]")),
+	)
+	res, err = Fold(p, Options{SampleIndex: -1})
+	require.NoError(t, err)
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "not a sample of GPU time")
 }

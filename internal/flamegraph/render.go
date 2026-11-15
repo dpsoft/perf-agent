@@ -448,11 +448,17 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 	// that height. The card gets its own element so the graph's arithmetic is
 	// untouched.
 	ew.s("<div class=\"canvas\">\n")
-	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s">`+"\n",
+	ew.f(`<div class="chart" style="height:%dpx" role="group" aria-label="Flame graph, %s" data-total="%d" data-unit="%s"`,
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
+	// Read by widthMeaning: at gpu_sample_period=1 the [gpu:launch] tooltip
+	// must not call the path beneath it a sample of launches.
+	if everyLaunchSampled(res) {
+		ew.s(` data-every-launch="1"`)
+	}
+	ew.s(">\n")
 	writeModuleTable(ew, mods)
-	writeNode(ew, root, res.Unit, root.value, mods)
+	writeNode(ew, root, res.Unit, root.value, mods, fusedAxesOf(res))
 	ew.s("</div>\n")
 	ew.s("</div>\n")
 	return ew.err
@@ -485,7 +491,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 // The label is deliberately terse — name, value, share. Domain, module and
 // the inference note stay in the visual tooltip; a screen reader user
 // scanning twenty frames does not want three sentences on each.
-func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable) {
+func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable, axes *fusedAxes) {
 	cls := fmt.Sprintf("frame d%d", n.depth)
 	if n.inexact > 0 {
 		cls += " inexact"
@@ -520,6 +526,17 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	if n.collapsed {
 		ew.s(` data-collapsed="1"`)
 	}
+	// A fused page's roots say what their own subtree measures; see
+	// fusedAxes. Only the frames that change the answer carry it, and the
+	// script reads it from the nearest one above the frame it explains.
+	if axes != nil {
+		switch n.depth {
+		case 0:
+			ew.f(` data-axis="%s"`, html.EscapeString(axes.all))
+		case 1:
+			ew.f(` data-axis="%s"`, html.EscapeString(axes.roots[n.name]))
+		}
+	}
 	ew.s(">")
 	// No whitespace around the name: the script reads this back as the
 	// frame's identity, so the text node must be the symbol and nothing else.
@@ -527,8 +544,42 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	ew.s("</div>\n")
 
 	for _, c := range n.children {
-		writeNode(ew, c, unit, total, mods)
+		writeNode(ew, c, unit, total, mods, axes)
 	}
+}
+
+// fusedAxes is what each level of a fused profile measures. The script
+// reads it to decide what to say about a frame's width; see widthMeaning.
+//
+// It exists because a fused chart's own axis ("cpu+gpu/nanoseconds") is true
+// of the graph and of no frame below the synthetic root: read as a whole, it
+// would tell a reader that CPU-sampled frames measure GPU time.
+type fusedAxes struct {
+	// all is the synthetic root's axis, the fused one, because its width
+	// really is the sum of every input.
+	all string
+	// roots maps each root label to the axis of the input under it, or to
+	// "" for a label Fuse could not give one type to, which claims nothing.
+	roots map[string]string
+}
+
+// fusedAxesOf returns nil for a profile that was not fused.
+func fusedAxesOf(res *foldedstacks.Result) *fusedAxes {
+	if res.RootSampleTypes == nil {
+		return nil
+	}
+	axes := &fusedAxes{
+		all:   res.SampleTypeName + "/" + res.Unit,
+		roots: make(map[string]string, len(res.RootSampleTypes)),
+	}
+	for label, typ := range res.RootSampleTypes {
+		if typ != "" {
+			axes.roots[label] = typ + "/" + res.Unit
+		} else {
+			axes.roots[label] = ""
+		}
+	}
+	return axes
 }
 
 // pct formats a percentage in its shortest exact form, rounded to a
@@ -760,13 +811,19 @@ func writeSamplePeriodNote(ew *errWriter, res *foldedstacks.Result) {
 		html.EscapeString(period), html.EscapeString(period))
 }
 
+// samplePeriod reports the launch sampling period worth warning about. At
+// period 1 there is none: every launch carried its stack.
 func samplePeriod(res *foldedstacks.Result) (string, bool) {
 	for _, l := range res.Labels {
-		if l.Key == foldedstacks.SamplePeriodLabel && len(l.Top) > 0 {
+		if l.Key == foldedstacks.SamplePeriodLabel && len(l.Top) > 0 && !foldedstacks.EveryLaunchSampled(l) {
 			return l.Top[0].Value, true
 		}
 	}
 	return "", false
+}
+
+func everyLaunchSampled(res *foldedstacks.Result) bool {
+	return slices.ContainsFunc(res.Labels, foldedstacks.EveryLaunchSampled)
 }
 
 // writeTreeContainer emits the empty box the tree view is built into.

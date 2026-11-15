@@ -2,6 +2,7 @@ package flamegraph
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"html"
 	"os"
@@ -389,6 +390,35 @@ func TestRenderHTMLKeepsTheChromeOffThePage(t *testing.T) {
 
 	// A profile with notes says so on the button that hides them.
 	assert.Contains(t, got, `<summary id="info-btn" class="notes"`)
+}
+
+// At gpu_sample_period=1 every launch carried its stack, so the width under
+// [gpu:launch] is that path's share of GPU time and the banner saying
+// otherwise would be false. The [gpu:launch] tooltip drops its "one launch in
+// N" clause for the same reason, which the chart attribute tells it.
+func TestEveryLaunchSampledCarriesNoSamplingWarning(t *testing.T) {
+	page := func(periods ...string) string {
+		res := result(foldedstacks.Stack{Frames: []string{"main", "[gpu:launch]", "[gpu:kernel:k]"}, Value: 100})
+		ls := foldedstacks.LabelSummary{Key: foldedstacks.SamplePeriodLabel, Distinct: len(periods), Total: 100, Count: 12}
+		for _, v := range periods {
+			ls.Top = append(ls.Top, foldedstacks.LabelValue{Value: v, Total: 50, Count: 6})
+		}
+		res.Labels = []foldedstacks.LabelSummary{ls}
+		return renderString(t, res, Options{Title: "t"})
+	}
+
+	got := page("1")
+	assert.NotContains(t, got, `<p class="note">`)
+	assert.NotContains(t, got, "not that path&rsquo;s share of GPU time")
+	assert.Contains(t, got, `data-every-launch="1"`)
+
+	for _, periods := range [][]string{{"8"}, {"1", "8"}} {
+		got := page(periods...)
+		assert.Contains(t, got, "not that path&rsquo;s share of GPU time", "periods %v", periods)
+		assert.NotContains(t, got, "data-every-launch", "periods %v", periods)
+	}
+	assert.NotContains(t, renderString(t, result(foldedstacks.Stack{Frames: []string{"main"}, Value: 1}), Options{}),
+		"data-every-launch", "no period label, no claim")
 }
 
 func TestRenderHTMLDoesNotFlagNotesOnAProfileThatHasNone(t *testing.T) {
@@ -980,10 +1010,19 @@ func TestGPUProfilesExplainWhatWidthMeans(t *testing.T) {
 	}
 	for _, want := range []string{
 		"measured time this kernel ran on the device",
-		"whose launch was not stack-sampled",
+		"whose launch carried no CPU stack",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("missing width explanation: %q", want)
+		}
+	}
+	// [gpu:launch unsampled] holds every execution whose launch has no CPU
+	// stack, which at gpu_sample_period=1 is not about sampling at all (an
+	// execution from before attach, say). Its texts must be true at any
+	// period.
+	for _, wrong := range []string{"not stack-sampled", "not one of the sampled ones"} {
+		if strings.Contains(page, wrong) {
+			t.Errorf("the unattributed boundary is described by sampling: %q", wrong)
 		}
 	}
 }
@@ -1233,4 +1272,174 @@ func findJSEngine(t *testing.T) (string, []string) {
 		}
 	}
 	return "", nil
+}
+
+// fusedCPUGPU is what `flamegraph -fuse` builds from a CPU and a GPU capture:
+// two subtrees whose widths measure different things, under one axis that
+// names both.
+func fusedCPUGPU(t *testing.T) *foldedstacks.Result {
+	t.Helper()
+	cpu := &foldedstacks.Result{
+		SampleTypeName: "cpu", Unit: "nanoseconds", Total: 3, Samples: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "work"}, Value: 3}},
+	}
+	gpu := &foldedstacks.Result{
+		SampleTypeName: "gpu", Unit: "nanoseconds", Total: 2, Samples: 1,
+		Stacks: []foldedstacks.Stack{{Frames: []string{"main", "[gpu:launch]", "gemm_kernel"}, Value: 2}},
+	}
+	res, err := foldedstacks.Fuse([]foldedstacks.FuseInput{
+		{Result: cpu, Label: "[cpu] perf-agent 99 Hz"},
+		{Result: gpu, Label: "[gpu] per sampled launch"},
+	})
+	require.NoError(t, err)
+	return res
+}
+
+// A fused page must say, per subtree, what that subtree measures.
+//
+// The chart's axis is "cpu+gpu/nanoseconds", which is true of the graph and
+// of no frame in it. widthMeaning used to read that axis, find "gpu/" in it
+// and tell the reader that every CPU-sampled frame was GPU time -- the
+// opposite of the truth for the larger half of a typical fused graph.
+func TestFusedPagesSayWhatEachRootMeasures(t *testing.T) {
+	page := renderString(t, fusedCPUGPU(t), Options{Title: "t"})
+
+	frame := func(name string) string {
+		t.Helper()
+		m := regexp.MustCompile(`<div class="frame [^>]*>` + regexp.QuoteMeta(html.EscapeString(name)) + `</div>`).FindString(page)
+		require.NotEmpty(t, m, "no frame named %q", name)
+		return m
+	}
+	assert.Contains(t, frame("[cpu] perf-agent 99 Hz"), `data-axis="cpu/nanoseconds"`)
+	assert.Contains(t, frame("[gpu] per sampled launch"), `data-axis="gpu/nanoseconds"`)
+	// The synthetic root spans both, and says so: its width is a sum of the
+	// two kinds, which is exactly what the fused axis names.
+	assert.Contains(t, frame("all"), `data-axis="cpu+gpu/nanoseconds"`)
+	// Below the roots the attribute would only repeat its ancestor's.
+	assert.NotContains(t, frame("work"), "data-axis")
+	assert.NotContains(t, frame("gemm_kernel"), "data-axis")
+
+	// An unfused page has one axis, and the chart already carries it.
+	for _, typ := range []string{"cpu", "gpu"} {
+		res := result(foldedstacks.Stack{Frames: []string{"main", "work"}, Value: 1})
+		res.SampleTypeName = typ
+		assert.NotContains(t, renderString(t, res, Options{Title: "t"}), "data-axis", typ)
+	}
+}
+
+// jsFunction returns the source of one function declared in the shipped
+// script, from its keyword to its closing brace.
+func jsFunction(t *testing.T, name string) string {
+	t.Helper()
+	start := strings.Index(script, "function "+name+"(")
+	require.GreaterOrEqual(t, start, 0, "the script declares no %s", name)
+	depth, inStr, esc := 0, rune(0), false
+	for i, ch := range script[start:] {
+		switch {
+		case esc:
+			esc = false
+		case ch == '\\':
+			esc = true
+		case inStr != 0:
+			if ch == inStr {
+				inStr = 0
+			}
+		case ch == '"' || ch == '\'':
+			inStr = ch
+		case ch == '{':
+			depth++
+		case ch == '}':
+			depth--
+			if depth == 0 {
+				return script[start : start+i+1]
+			}
+		}
+	}
+	t.Fatalf("%s never closes", name)
+	return ""
+}
+
+// What each frame's tooltip says about its width, executed rather than
+// grepped for: the strings were always on the page, and the bug was which
+// frames they were shown on.
+//
+// The frames are stand-ins for the script's items, wired the way the page
+// wires them (d, up, el.dataset) and carrying the data-axis values
+// TestFusedPagesSayWhatEachRootMeasures pins on the rendered page.
+func TestWidthMeaningFollowsTheFrameNotTheChart(t *testing.T) {
+	engine := ""
+	for _, name := range []string{"node", "gjs"} {
+		if _, err := exec.LookPath(name); err == nil {
+			engine = name
+			break
+		}
+	}
+	if engine == "" {
+		// A runner image that drops both engines must not turn this test into
+		// a silent pass: CI is where nobody is watching the skip count.
+		if os.Getenv("CI") == "true" {
+			t.Fatal("CI has no JavaScript engine that can run a script (node or gjs); the width tooltips are untested")
+		}
+		t.Skip("no JavaScript engine that can run a script (node or gjs)")
+	}
+
+	prog := `var out=typeof print==="function"?print:console.log;
+var unit="nanoseconds",axis,everyLaunch=false;
+` + jsFunction(t, "axisOf") + "\n" + jsFunction(t, "widthMeaning") + `
+function f(d,up,ax){return {d:d,up:up,el:{dataset:ax===undefined?{}:{axis:ax}}};}
+function tree(fused){
+  var all=f(0,undefined,fused);
+  var cpu=fused!==undefined?f(1,all,"cpu/nanoseconds"):all;
+  var gpu=fused!==undefined?f(1,all,"gpu/nanoseconds"):all;
+  var cmain=f(cpu.d+1,cpu),work=f(cpu.d+2,cmain);
+  var gmain=f(gpu.d+1,gpu),launch=f(gpu.d+2,gmain),kernel=f(gpu.d+3,launch);
+  return {all:all,cpu:cpu,work:[work,"cpu"],gmain:[gmain,"cpu"],launch:[launch,"boundary"],kernel:[kernel,"gpu-kernel"]};
+}
+function run(chartAxis,fused){
+  axis="Flame graph, "+chartAxis;
+  var t=tree(fused?chartAxis:undefined),r={};
+  ["work","gmain","launch","kernel"].forEach(function(k){r[k]=widthMeaning(t[k][0],{domain:t[k][1]});});
+  r.all=widthMeaning(t.all,{domain:"root"});
+  return r;
+}
+out(JSON.stringify({
+  fused:run("cpu+gpu/nanoseconds",true),
+  gpuFirst:run("gpu+cpu/nanoseconds",true),
+  noCPU:run("offcpu+gpu/nanoseconds",true),
+  mixedRoot:run("",true),
+  everyLaunch:(function(){everyLaunch=true;var r=run("gpu/nanoseconds",false);everyLaunch=false;return r;})(),
+  cpu:run("cpu/nanoseconds",false),
+  gpu:run("gpu/nanoseconds",false)
+}));
+`
+	src := filepath.Join(t.TempDir(), "width.js")
+	require.NoError(t, os.WriteFile(src, []byte(prog), 0o600))
+	raw, err := exec.Command(engine, src).CombinedOutput()
+	require.NoError(t, err, "%s", raw)
+
+	var got map[string]map[string]string
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(raw), &got), "%s", raw)
+
+	const (
+		summed   = "width: CPU samples and GPU time added together \u2014 compare within one root"
+		launched = "width: GPU time launched from this call path — not CPU time spent here"
+		kernel   = "width: measured time this kernel ran on the device"
+		boundary = "width: device time launched from this path, sampled one launch in N"
+	)
+	assert.Equal(t, map[string]string{
+		"work": "", "all": summed,
+		"gmain": launched, "launch": boundary, "kernel": kernel,
+	}, got["fused"], "fused: CPU-sampled frames say nothing; the GPU subtree keeps its text; the root warns it is a sum")
+	assert.Equal(t, got["fused"], got["gpuFirst"], "the order the inputs were given in changes nothing")
+	assert.Empty(t, got["noCPU"]["all"], "a sum with no CPU samples in it is not described as one")
+	assert.Empty(t, got["mixedRoot"]["all"], "a root that claims no axis says nothing")
+	assert.Equal(t, map[string]string{
+		"work": launched, "gmain": launched, "launch": "width: device time launched from this path", "kernel": kernel, "all": launched,
+	}, got["everyLaunch"], "at period 1 the boundary is not a sample of launches")
+	assert.Equal(t, map[string]string{
+		"work": "", "gmain": "", "launch": "", "kernel": "", "all": "",
+	}, got["cpu"], "a CPU page explains nothing")
+	assert.Equal(t, map[string]string{
+		"work": launched, "gmain": launched, "launch": boundary, "kernel": kernel, "all": launched,
+	}, got["gpu"], "a GPU page keeps every text it had")
 }

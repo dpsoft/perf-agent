@@ -11,7 +11,6 @@ import (
 	"maps"
 	"net/http"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -176,10 +175,7 @@ func (h *liveHistory) RetainedBytes() int64 {
 			n += failureOverhead + int64(failureBytes(f))
 		}
 	}
-	for _, id := range h.record {
-		n += 16 + int64(len(id))
-	}
-	return n
+	return n + recordBytes(h.record)
 }
 
 // same reports whether h was built from this record. A recorded attempt
@@ -199,6 +195,20 @@ func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts
 	keepAttempts = min(keepAttempts, len(rejected))
 	from := len(rejected) - keepAttempts
 	out := make([]explain.RejectedAttempt, keepAttempts)
+	// named is what failureKey names, without building its string; one
+	// map serves every attempt, so it holds at most one attempt's
+	// failures, which the record bounds.
+	type key struct {
+		claim, ref string
+		code       explain.Code
+	}
+	keyOf := func(f explain.Failure) key {
+		if f.Claim != "" {
+			return key{claim: f.Claim}
+		}
+		return key{ref: f.Ref, code: f.Code}
+	}
+	named := map[key]bool{}
 	for i := keepAttempts - 1; i >= 0; i-- {
 		ra := rejected[from+i]
 		m := min(keepFailures, len(ra.Failures))
@@ -206,14 +216,14 @@ func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts
 		kept, left := ra.Failures[len(ra.Failures)-m:], ra.Failures[:len(ra.Failures)-m]
 		out[i] = ra
 		out[i].Failures = make([]explain.Failure, len(kept))
-		named := map[string]bool{}
+		clear(named)
 		for j, f := range kept {
 			out[i].Failures[j] = cloneFailure(f)
-			named[failureKey(f)] = true
+			named[keyOf(f)] = true
 		}
 		out[i].Omitted += len(left)
 		for _, f := range left {
-			k := failureKey(f)
+			k := keyOf(f)
 			if f.Code == explain.CodeLimitExceeded && f.Claim == "" || named[k] {
 				continue
 			}
@@ -481,43 +491,82 @@ func (l *live) drop(p *publication) {
 }
 
 // newHistory is the history of a publication id of view v, at version,
-// from the record's rejected attempts. It keeps the most of the newest
-// failures, and failing that of the newest attempts, whose copy and JSON
-// fit in MaxPageBytes.
+// from the record's rejected attempts. It keeps the newest attempts, and
+// of them the newest failures, whose copy and JSON fit in MaxPageBytes.
+// What fits is chosen from size bounds before anything is copied or
+// encoded, so a record many times the budget costs no more than the
+// budget; the history built is then measured, and in case a bound fell
+// short it is halved until it fits.
 func (s *Server) newHistory(v *profilemodel.View, id string, version int64, rejected []explain.RejectedAttempt, dropped int, incomplete bool) *liveHistory {
 	record := make([]string, len(rejected))
 	for i, ra := range rejected {
 		record[i] = strings.Clone(ra.Attempt)
 	}
+	ver := strconv.FormatInt(version, 10)
 	build := func(keepFailures, keepAttempts int) *liveHistory {
 		kept, left := trimRejected(rejected, keepFailures, keepAttempts)
 		h := &liveHistory{version: version, rejected: kept, dropped: dropped + left, incomplete: incomplete,
 			record: record, recordDropped: dropped}
-		h.json = flamegraph.ExplainedLiveHistory(v, id, strconv.FormatInt(version, 10), kept, h.dropped, incomplete, 0)
+		h.json = flamegraph.ExplainedLiveHistory(v, id, ver, kept, h.dropped, incomplete, 0)
 		return h
 	}
 	limit := int64(s.lim.MaxPageBytes)
-	over := func(h *liveHistory) bool { return h.RetainedBytes() > limit }
-	failures := 0
-	for _, ra := range rejected {
-		failures += len(ra.Failures)
+	keepFailures, keepAttempts := fitHistory(v, rejected, limit-flamegraph.LiveHistoryBaseBound(id, ver)-recordBytes(record))
+	h := build(keepFailures, keepAttempts)
+	for h.RetainedBytes() > limit && (keepFailures > 0 || keepAttempts > 0) {
+		if keepFailures > 0 {
+			keepFailures /= 2
+		} else {
+			keepAttempts /= 2
+		}
+		h = build(keepFailures, keepAttempts)
 	}
-	if h := build(failures, len(rejected)); !over(h) {
-		return h
+	return h
+}
+
+// fitHistory is how many of the newest attempts of rejected, and then of
+// their newest failures, a history keeps within room bytes, by the size
+// bounds of their copies and rows. Attempts come first: a kept attempt
+// still counts its failures on the page, so every attempt that fits is
+// kept before any failure is listed.
+func fitHistory(v *profilemodel.View, rejected []explain.RejectedAttempt, room int64) (keepFailures, keepAttempts int) {
+	for i := len(rejected) - 1; i >= 0; i-- {
+		ra := rejected[i]
+		// An attempt may list its omitted failures, which trimming adds
+		// to, and those too large to keep.
+		more := 1
+		if ra.TooLarge > 0 {
+			more++
+		}
+		c := attemptOverhead + int64(len(ra.Attempt)+len(ra.RetryOf)+len(ra.Evidence)) + flamegraph.LiveHistoryAttemptBound(ra.Attempt, ra.Evidence, more)
+		if c > room {
+			break
+		}
+		room -= c
+		keepAttempts++
 	}
-	// Fewer failures, and then fewer attempts, make a smaller history, so
-	// each search finds the most that fits.
-	if k := sort.Search(failures+1, func(k int) bool { return over(build(k, len(rejected))) }) - 1; k >= 0 {
-		if h := build(k, len(rejected)); !over(h) {
-			return h
+	for i := len(rejected) - 1; i >= len(rejected)-keepAttempts; i-- {
+		ra := rejected[i]
+		for j := len(ra.Failures) - 1; j >= 0; j-- {
+			f := ra.Failures[j]
+			c := failureOverhead + int64(failureBytes(f)) + flamegraph.LiveHistoryRowBound(v, ra.Attempt, ra.Evidence, f)
+			if c > room {
+				return keepFailures, keepAttempts
+			}
+			room -= c
+			keepFailures++
 		}
 	}
-	if a := sort.Search(len(rejected)+1, func(a int) bool { return over(build(0, a)) }) - 1; a >= 0 {
-		if h := build(0, a); !over(h) {
-			return h
-		}
+	return keepFailures, keepAttempts
+}
+
+// recordBytes is what a history's record of attempt IDs counts.
+func recordBytes(record []string) int64 {
+	var n int64
+	for _, id := range record {
+		n += 16 + int64(len(id))
 	}
-	return build(0, 0)
+	return n
 }
 
 // refreshHistory rebuilds, at the next version, the history of every kept

@@ -707,3 +707,57 @@ func TestLiveHistoryIsUnboundedWithoutABudget(t *testing.T) {
 		assert.Equal(t, "", h["rejected_note"])
 	}
 }
+
+// TestLiveHistoryBoundsHoldEveryRow pins the bounds a caller fits a
+// history with before building it: every row of a failure is within
+// LiveHistoryRowBound, an attempt's "more" rows within
+// LiveHistoryAttemptBound, and the rest of the JSON within
+// LiveHistoryBaseBound.
+func TestLiveHistoryBoundsHoldEveryRow(t *testing.T) {
+	long := strings.Repeat("<&\"é", 600)
+	v := exView(t, pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn(long)}, Value: 9007199254740993}), nil)
+	main := exNode(t, v, "main")
+	deep := exNode(t, v, "main", long)
+	engines := []*explain.EngineValue{
+		nil,
+		{Metric: "share_of_total", Scope: "node", Node: main, Denominator: "view_total", Unit: "ratio", Value: "0.000001", Rounding: "0.001 ratio", Status: "ok"},
+		{Metric: "cumulative", Scope: "node", Node: deep, Unit: "nanoseconds", Value: "9007199254740993", Rounding: "exact", Status: "ok"},
+		{Metric: "executions_below", Scope: "node", Node: deep, Unit: "count", Value: "9007199254740993", Rounding: "exact", Status: "ok"},
+		{Metric: "share_of_parent", Scope: "node", Node: "ffffffffffffffff", Unit: "ratio", Status: "unavailable", Reason: long},
+		{Metric: "unsampled_portion", Scope: "view", Unit: "nanoseconds", Value: "0", Rounding: "exact", Status: "zero"},
+	}
+	var failures []explain.Failure
+	for _, e := range engines {
+		f := failure(explain.CodeValueMismatch, "c<1>", "", long, e)
+		f.Message = long
+		failures = append(failures, f)
+	}
+	for _, code := range []explain.Code{explain.CodeUnresolvedClaimRef, explain.CodeGluedToClaim, explain.CodeUnresolvedNodeRef, explain.CodeUnknownNode} {
+		for _, ref := range []string{"", "{" + long, long} {
+			failures = append(failures, failure(code, "", ref, "", nil))
+		}
+	}
+	failures = append(failures, failure(explain.CodeLimitExceeded, "", long, "", nil))
+
+	for _, evidence := range []string{"", "made with handle " + long} {
+		for _, f := range failures {
+			ra := explain.RejectedAttempt{Attempt: "a<12>", Evidence: evidence, Failures: []explain.Failure{f}, Omitted: 1 << 40, TooLarge: 1 << 40,
+				OmittedClaims: 1 << 40, OmittedReferences: 1 << 40}
+			raw := ExplainedLiveHistory(v, "p123", "456", []explain.RejectedAttempt{ra}, 1<<40, true, 0)
+			h := historyOf(t, raw)
+			rows := list(t, h, "rows")
+			require.Len(t, rows, 3, "one failure row and two more rows")
+			size := func(row map[string]any) int64 {
+				b, err := json.Marshal(row)
+				require.NoError(t, err)
+				return int64(len(b)) + 1 // its comma
+			}
+			rowBytes := size(rows[0])
+			assert.LessOrEqual(t, rowBytes, LiveHistoryRowBound(v, ra.Attempt, evidence, f), "row %+v", rows[0])
+			more := size(rows[1]) + size(rows[2])
+			assert.LessOrEqual(t, more, LiveHistoryAttemptBound(ra.Attempt, evidence, 2))
+			assert.LessOrEqual(t, int64(len(raw))-rowBytes-more, LiveHistoryBaseBound("p123", "456"), "the JSON without its rows")
+		}
+	}
+}

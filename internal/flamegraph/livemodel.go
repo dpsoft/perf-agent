@@ -270,6 +270,56 @@ func ExplainedLiveHistory(v *profilemodel.View, pub, version string, rejected []
 	return bare
 }
 
+// LiveHistoryRowBound bounds the bytes, its comma included, the row of
+// failure f of attempt (made with evidence, "" for none) takes in
+// ExplainedLiveHistory's JSON of view v. It builds nothing: a caller fits
+// a history with it before copying or encoding any of it.
+func LiveHistoryRowBound(v *profilemodel.View, attempt, evidence string, f explain.Failure) int64 {
+	n := int64(historyRowOverhead) + jsonEscapedBound(attempt) + jsonEscapedBound(evidence) + int64(len("reference")) +
+		// the label: "claim <claim>", "limit <ref>" or a reference label
+		int64(len("reference {n:}")) + jsonEscapedBound(f.Claim) + jsonEscapedBound(f.Ref) +
+		jsonEscapedBound(string(f.Code)) + jsonEscapedBound(f.Message) + jsonEscapedBound(f.Agent)
+	if e := f.Engine; e != nil {
+		n += jsonEscapedBound(e.Metric) + engineBound(*e) + nodeNameBound(v, e.Node)
+	}
+	return n
+}
+
+// engineBound bounds the JSON of displayEngine(e): an unavailable value's
+// reason, or a value at most doubled by grouping and units.
+func engineBound(e explain.EngineValue) int64 {
+	unavailable := int64(len("unavailable: the engine has no value")) + jsonEscapedBound(e.Reason)
+	shown := 2*jsonEscapedBound(e.Value) + jsonEscapedBound(e.Unit) + 24
+	return max(unavailable, shown)
+}
+
+// nodeNameBound bounds the JSON of the name a row gives node id: the whole
+// view, or the node's shown name and ID.
+func nodeNameBound(v *profilemodel.View, id profilemodel.NodeID) int64 {
+	n := int64(len("the whole view") + len("node  (node )") + len(id))
+	if v != nil {
+		if nd, ok := v.Node(id); ok {
+			name := nd.Function.Name
+			n += jsonEscapedBound(name[:min(len(name), maxShownName)]) + int64(len("…"))
+		}
+	}
+	return n
+}
+
+// LiveHistoryAttemptBound bounds the bytes rows of an attempt's "more"
+// rows take in ExplainedLiveHistory's JSON: an attempt has one for its
+// omitted failures and one for those too large to keep.
+func LiveHistoryAttemptBound(attempt, evidence string, rows int) int64 {
+	return int64(rows) * (int64(historyRowOverhead) + jsonEscapedBound(attempt) + jsonEscapedBound(evidence) + int64(len("more")) + 64)
+}
+
+// LiveHistoryBaseBound bounds the bytes ExplainedLiveHistory's JSON of
+// publication pub at version takes besides its rows: its keys, pills and
+// note.
+func LiveHistoryBaseBound(pub, version string) int64 {
+	return 1<<10 + jsonEscapedBound(pub) + jsonEscapedBound(version)
+}
+
 // historyRowEstimate bounds the bytes one rejected row takes in the
 // history JSON.
 func historyRowEstimate(row exRejected) int64 {

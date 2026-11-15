@@ -744,6 +744,57 @@ func TestTheHistoryKeepsOnlyWhatItShows(t *testing.T) {
 	}
 }
 
+// TestTheHistoryIsFittedBeforeItIsBuilt builds a history of a record
+// ten times larger than MaxPageBytes: it costs memory in proportion to
+// MaxPageBytes, not to the record, because what fits is chosen before
+// anything is copied or encoded.
+func TestTheHistoryIsFittedBeforeItIsBuilt(t *testing.T) {
+	s := newLiveServer(t, func(c *Config) {
+		c.Limits.MaxRetainedBytes = 32 << 10
+		c.Limits.MaxPageBytes = 16 << 10
+	}, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o := openLive(t, s, "cpu.pb.gz")
+	r := manyClaimsRejected(t, s, o, "b", 32)
+	for range 20 {
+		s.attempts.add(o.e.prof, o.view, "", outcomeRejected, r.Failures)
+	}
+	rejected, dropped, incomplete := s.attempts.rejected(o.e.prof, o.view)
+	full := flamegraph.ExplainedLiveHistory(o.v, "p1", "2", rejected, dropped, incomplete, 0)
+	if len(full) < 8*s.lim.MaxPageBytes {
+		t.Fatalf("the full history is %d bytes, not much larger than MaxPageBytes", len(full))
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	h := s.newHistory(o.v, "p1", 2, rejected, dropped, incomplete)
+	runtime.ReadMemStats(&after)
+	alloc := int64(after.TotalAlloc - before.TotalAlloc)
+	t.Logf("full history %d bytes; built %d bytes of JSON, %d retained, %d allocated", len(full), len(h.json), h.RetainedBytes(), alloc)
+	if limit := int64(4*s.lim.MaxPageBytes + 64<<10); alloc > limit {
+		t.Errorf("building the history allocated %d bytes, over %d", alloc, limit)
+	}
+	if h.RetainedBytes() > int64(s.lim.MaxPageBytes) || len(h.rejected) != 20 {
+		t.Errorf("history keeps %d bytes and %d attempts", h.RetainedBytes(), len(h.rejected))
+	}
+}
+
+func TestASmallHistoryIsTheWholeRecord(t *testing.T) {
+	s := newLiveServer(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o := openLive(t, s, "cpu.pb.gz")
+	for i := range 4 {
+		r := manyClaimsRejected(t, s, o, "b", i+1)
+		s.attempts.add(o.e.prof, o.view, "", outcomeRejected, r.Failures)
+		rejected, dropped, incomplete := s.attempts.rejected(o.e.prof, o.view)
+		h := s.newHistory(o.v, "p1", 3, rejected, dropped, incomplete)
+		if want := flamegraph.ExplainedLiveHistory(o.v, "p1", "3", rejected, dropped, incomplete, 0); !bytes.Equal(h.json, want) {
+			t.Errorf("%d attempts: the history is not the whole record's:\n%s\n%s", i+1, h.json, want)
+		}
+		if !reflect.DeepEqual(h.rejected, rejected) || h.dropped != dropped {
+			t.Errorf("%d attempts: the kept copy differs from the record", i+1)
+		}
+	}
+}
+
 func TestALargeLabelIsChargedToItsProfile(t *testing.T) {
 	src, err := pprof.ParseData(pmfixture.CPUBasic())
 	if err != nil {

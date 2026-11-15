@@ -467,6 +467,30 @@ func TestAliveSeesExitAndReuse(t *testing.T) {
 	}
 }
 
+// A task that has begun exiting (PF_EXITING in its stat flags) has ended,
+// whatever its state says: after exit_mm it is still R or S, but its exe
+// link is gone, which a recheck must not read as a change of dumpability.
+func TestAnExitingTaskHasEnded(t *testing.T) {
+	const pfExiting = 0x4
+	exiting := strings.Replace(fakeStat(11, "w", "S", 500), " 4194304 ", " "+strconv.Itoa(4194304|pfExiting)+" ", 1)
+	status := fakeStatus(ids(os.Getuid()), ids(os.Getgid()), "0000000000000000")
+	fp := fakeProc(t, 11, exiting, status, "", "")
+	if Alive(fp, 11, 500) {
+		t.Error("an exiting task is alive")
+	}
+	if _, e := Observe(fp, 11); errCode(e) != CodeTargetExited {
+		t.Errorf("Observe of an exiting task = %v, want target_exited", e)
+	}
+	if e := vanished(fp, 11, 500); errCode(e) != CodeTargetExited {
+		t.Errorf("vanished of an exiting task = %v, want target_exited", e)
+	}
+	// Other flags leave a task alive.
+	live := fakeProc(t, 11, fakeStat(11, "w", "S", 500), status, "", "/bin/true")
+	if !Alive(live, 11, 500) {
+		t.Error("a task without PF_EXITING is not alive")
+	}
+}
+
 func TestCheckShimMapped(t *testing.T) {
 	shimFile := filepath.Join(t.TempDir(), "libcupti_shim.so")
 	if err := os.WriteFile(shimFile, []byte("shim"), 0o644); err != nil {

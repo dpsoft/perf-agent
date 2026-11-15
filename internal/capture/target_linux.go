@@ -35,8 +35,13 @@ type procStat struct {
 	comm       string
 	state      byte
 	ppid, pgrp int
+	flags      uint64
 	start      uint64
 }
+
+// pfExiting is the kernel's PF_EXITING task flag, set when a task begins
+// to exit, before it releases its memory and long before it is a zombie.
+const pfExiting = 0x4
 
 // readStat parses /proc/<pid>/stat. The comm field is in parentheses and
 // may hold spaces and parentheses itself, so the fields are counted from
@@ -50,7 +55,8 @@ func readStat(p Proc, pid int) (procStat, error) {
 	if open < 0 || end < open {
 		return procStat{}, fmt.Errorf("pid %d: malformed stat", pid)
 	}
-	// After the comm: state is field 3, ppid 4, pgrp 5 and starttime 22.
+	// After the comm: state is field 3, ppid 4, pgrp 5, flags 9 and
+	// starttime 22.
 	fields := strings.Fields(string(b[end+1:]))
 	if len(fields) < 20 || len(fields[0]) != 1 {
 		return procStat{}, fmt.Errorf("pid %d: stat has %d fields after the comm", pid, len(fields))
@@ -61,18 +67,23 @@ func readStat(p Proc, pid int) (procStat, error) {
 	}
 	ppid, err1 := strconv.Atoi(fields[1])
 	pgrp, err2 := strconv.Atoi(fields[2])
-	if err := errors.Join(err1, err2); err != nil {
-		return procStat{}, fmt.Errorf("pid %d: stat ppid or pgrp: %w", pid, err)
+	flags, err3 := strconv.ParseUint(fields[6], 10, 64)
+	if err := errors.Join(err1, err2, err3); err != nil {
+		return procStat{}, fmt.Errorf("pid %d: stat ppid, pgrp or flags: %w", pid, err)
 	}
 	if p.StartTimeHook != nil {
 		start = p.StartTimeHook(pid, start)
 	}
-	return procStat{comm: string(b[open+1 : end]), state: fields[0][0], ppid: ppid, pgrp: pgrp, start: start}, nil
+	return procStat{comm: string(b[open+1 : end]), state: fields[0][0], ppid: ppid, pgrp: pgrp, flags: flags, start: start}, nil
 }
 
-// exited reports a state in which the task has exited: a zombie or dead.
+// exited reports a task that has ended: a zombie or dead, or one that
+// has begun to exit. An exiting task may still show R or S for a while
+// (a large address space takes time to release, a socket may linger),
+// but it has given up its memory and its exe link, so nothing about it
+// can be rechecked any more.
 func (s procStat) exited() bool {
-	return s.state == 'Z' || s.state == 'X' || s.state == 'x'
+	return s.state == 'Z' || s.state == 'X' || s.state == 'x' || s.flags&pfExiting != 0
 }
 
 // StartTime returns pid's start time in clock ticks since boot
@@ -84,10 +95,20 @@ func StartTime(p Proc, pid int) (uint64, error) {
 
 // Alive reports whether pid is still the process whose start time was
 // recorded, and has not exited. A stopped (T, t) or uninterruptible (D)
-// task is alive; a zombie, which its parent has not reaped yet, is not.
+// task is alive; a zombie, which its parent has not reaped yet, is not,
+// nor is a task that has begun to exit (PF_EXITING).
 func Alive(p Proc, pid int, start uint64) bool {
 	s, err := readStat(p, pid)
 	return err == nil && s.start == start && !s.exited()
+}
+
+// present reports whether pid is still the recorded process and not yet a
+// zombie, exiting or not: what survivors are counted by. A task stuck in
+// its exit (in D state, say) has ended for the rechecks but is still
+// there to report.
+func present(p Proc, pid int, start uint64) bool {
+	s, err := readStat(p, pid)
+	return err == nil && s.start == start && s.state != 'Z' && s.state != 'X' && s.state != 'x'
 }
 
 // gone reports an error that means the process no longer exists.

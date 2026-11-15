@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"io"
@@ -236,6 +237,61 @@ func TestRunLaunchesACommand(t *testing.T) {
 	}
 	if r.Phase() != PhaseDone {
 		t.Errorf("phase %s after Wait", r.Phase())
+	}
+}
+
+// A single-threaded command shows its exit window (PF_EXITING, no mm, the
+// exe link gone, still S) when the reaper ends it after perf-agent; the
+// end recheck meets it there and must not discard the capture.
+func TestRunASingleThreadedCommandThatOutlivesTheDurationIsOK(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	if python, err = filepath.EvalSymlinks(python); err != nil {
+		t.Skip(err)
+	}
+	for i := range 4 {
+		spec := runSpec(t, capturetest.FakeOptions{})
+		spec.Launch = &LaunchSpec{Path: python, Args: []string{python, "-c", "import time; time.sleep(60)"},
+			Env: []string{"PATH=/usr/bin:/bin"}, Dir: t.TempDir()}
+		o := waitRun(t, startRun(t, spec), 30*time.Second)
+		if o.Err != nil || o.StoppedBy != StoppedByDuration {
+			t.Fatalf("run %d: Err %+v, stopped by %q", i, o.Err, o.StoppedBy)
+		}
+	}
+}
+
+// A PID target that exits by itself mid-capture, with a recheck often
+// enough to meet its exit window, stops the capture as target_exit.
+func TestRunAPIDTargetExitingMidCaptureIsTargetExit(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	for i := range 4 {
+		spec := runSpec(t, capturetest.FakeOptions{})
+		spec.Settings.Duration = 20 * time.Second
+		spec.Bounds.Recheck = 5 * time.Millisecond
+		// A touched 1 GiB makes the exit, from exit_mm on, long enough to
+		// be seen.
+		cmd := exec.Command(python, "-c", "import time; b = b'x' * (1 << 30); print('ready', flush=True); time.sleep(1)")
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+		if line, _ := bufio.NewReader(out).ReadString('\n'); line != "ready\n" {
+			t.Fatalf("python printed %q", line)
+		}
+		spec.PID = cmd.Process.Pid
+		o := waitRun(t, startRun(t, spec), 30*time.Second)
+		if o.Err != nil || o.StoppedBy != StoppedByTargetExit {
+			t.Fatalf("run %d: Err %+v, stopped by %q", i, o.Err, o.StoppedBy)
+		}
 	}
 }
 

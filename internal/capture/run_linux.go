@@ -862,9 +862,9 @@ func (r *Run) containmentLost() {
 	r.o.Cleanup = "incomplete: " + why
 	r.o.Notes = append(r.o.Notes, why+"; perf-agent or the command may still be running")
 	for _, p := range []instance{r.perf, r.work} {
-		if p.pid > 0 && Alive(DefaultProc(), p.pid, p.start) {
+		if p.pid > 0 && present(r.spec.Proc, p.pid, p.start) {
 			s := Survivor{PID: p.pid, StartTime: p.start}
-			if st, err := readStat(DefaultProc(), p.pid); err == nil {
+			if st, err := readStat(r.spec.Proc, p.pid); err == nil {
 				s.Comm, s.State = st.comm, string(st.state)
 			}
 			r.o.Survivors = append(r.o.Survivors, s)

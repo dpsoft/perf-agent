@@ -101,6 +101,28 @@ func TestSettleWaitsForAListedZombieToBeReaped(t *testing.T) {
 	}
 }
 
+// A descendant stuck in its exit (PF_EXITING, in D state, as a wedged
+// GPU process may be) has ended for the rechecks but is still there: it is
+// a survivor, named by identity.
+func TestSettleReportsADescendantStuckInItsExit(t *testing.T) {
+	root := t.TempDir()
+	const stuck = synthetic + 3
+	fakeChild(t, root, stuck, os.Getpid(), "D", 14)
+	statPath := filepath.Join(root, strconv.Itoa(stuck), "stat")
+	b, err := os.ReadFile(statPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statPath, []byte(strings.Replace(string(b), " 4194304 ", " 4194308 ", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := fakeReaper(root, stillChildren)
+	left := r.settle()
+	if len(left) != 1 || left[0].PID != stuck || left[0].State != "D" {
+		t.Errorf("survivors = %+v, want %d in D state", left, stuck)
+	}
+}
+
 // Without ECHILD the tree is not proven quiet, even when no child is listed.
 func TestSettleWithoutECHILDIsIncomplete(t *testing.T) {
 	r := fakeReaper(t.TempDir(), stillChildren)

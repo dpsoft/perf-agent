@@ -754,7 +754,7 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 func (r *reaper) settle() []Survivor {
 	grace := max(r.spec.StopGrace, settleFloor)
 	end := time.Now().Add(grace)
-	left, quiet := sweep(r.round, r.killChild, func(pid int) bool { return Alive(r.proc, pid, r.starts[pid]) }, grace, time.Now)
+	left, quiet := sweep(r.round, r.killChild, func(pid int) bool { return present(r.proc, pid, r.starts[pid]) }, grace, time.Now)
 
 	var survivors []Survivor
 	add := func(pid int, why string) {

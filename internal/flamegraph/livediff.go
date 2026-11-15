@@ -22,6 +22,36 @@ type DiffLiveOptions struct {
 	// Focus, when set, is the union node the layout starts at: it is drawn
 	// at depth 0 and full width with its descendants below it.
 	Focus profilemodel.UnionID
+	// Measure, when set, is MeasureDiff of the same diff, with the page
+	// options its static copy is written with; the model then takes its
+	// colour scale and export from it instead of walking the whole union
+	// on every call. Nil measures the diff with the model's own Title,
+	// BaseName and NewName.
+	Measure *DiffMeasure
+}
+
+// DiffMeasure is what every live model of one diff computes from its whole
+// union, whatever its focus or budget: the colour scale, and the bound and
+// drawn node count of the static copy WriteDiffPageBounded checks. It never
+// changes once made, so any goroutine may read it.
+type DiffMeasure struct {
+	scale float64
+	bound int64
+	nodes int
+}
+
+// MeasureDiff measures d for its live models, with opts the page options
+// of its static copy.
+func MeasureDiff(d *profilemodel.Diff, opts DiffPageOptions) *DiffMeasure {
+	m := &DiffMeasure{}
+	if d == nil {
+		return m
+	}
+	m.bound, m.nodes = diffPageBound(d, opts)
+	if d.Root != nil {
+		m.scale = shareScale(d.Root)
+	}
+	return m
 }
 
 func (o DiffLiveOptions) pageOptions() DiffPageOptions {
@@ -128,8 +158,9 @@ type diffLiveModel struct {
 // ErrPageTooLarge. With opts.Focus the layout starts at that union node,
 // and its callers stay in the model, undrawn, for the path panel; an
 // unknown focus is profilemodel.ErrUnknownNode. The model's export says
-// whether WriteDiffPageBounded would write a static copy within
-// opts.MaxBytes and opts.MaxNodes.
+// whether WriteDiffPageBounded would write a static copy, with the page
+// options opts.Measure was made with, within opts.MaxBytes and
+// opts.MaxNodes.
 func DiffLiveModel(d *profilemodel.Diff, opts DiffLiveOptions) ([]byte, error) {
 	if d == nil {
 		return nil, errors.New("flamegraph: nil diff")
@@ -142,11 +173,11 @@ func DiffLiveModel(d *profilemodel.Diff, opts DiffLiveOptions) ([]byte, error) {
 		}
 		path = p
 	}
-	bound, nodes := diffPageBound(d, opts.pageOptions())
-	b := &diffLiveBuilder{d: d, opts: opts, export: exportState(bound, nodes, opts.MaxBytes, opts.MaxNodes)}
-	if d.Root != nil {
-		b.scale = shareScale(d.Root)
+	m := opts.Measure
+	if m == nil {
+		m = MeasureDiff(d, opts.pageOptions())
 	}
+	b := &diffLiveBuilder{d: d, opts: opts, scale: m.scale, export: exportState(m.bound, m.nodes, opts.MaxBytes, opts.MaxNodes)}
 	render := func(frameBytes int64) ([]byte, error) {
 		return json.Marshal(b.build(path, frameBytes))
 	}

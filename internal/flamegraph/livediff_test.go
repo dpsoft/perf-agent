@@ -437,3 +437,51 @@ func TestDiffLiveReadersShareTheDiff(t *testing.T) {
 	assert.Equal(t, retained, d.RetainedBytes())
 	assert.Equal(t, indexed, ix.RetainedBytes())
 }
+
+// A model given its diff's measure is the model that measures on each
+// call, whole, budgeted or focused; only the walks are saved.
+func TestDiffLiveModelWithAMeasureIsTheSame(t *testing.T) {
+	cpu := compared(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	deep := wideDeepDiff(4, 400, 64)
+	for name, d := range map[string]*profilemodel.Diff{"cpu": cpu, "wide and deep": deep} {
+		focus := d.Root.Children[0].UnionID()
+		for _, opts := range []DiffLiveOptions{
+			{},
+			{Title: "two 2 builds", BaseName: "base.pb.gz", NewName: "new.pb.gz"},
+			{MaxBytes: 64 << 10, MaxNodes: 50},
+			{MaxNodes: 3},
+			{Focus: focus},
+			{Focus: focus, MaxBytes: 32 << 10},
+		} {
+			want, err := DiffLiveModel(d, opts)
+			require.NoError(t, err)
+			measured := opts
+			measured.Measure = MeasureDiff(d, opts.pageOptions())
+			got, err := DiffLiveModel(d, measured)
+			require.NoError(t, err)
+			assert.Equal(t, string(want), string(got), "%s %+v", name, opts)
+		}
+	}
+}
+
+// The measure decides the model's export: measured with the page options
+// the static copy is written with, the model offers exactly what
+// WriteDiffPageBounded writes, whatever title the model shows.
+func TestDiffMeasureIsTheExportsBudget(t *testing.T) {
+	d := compared(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	export := DiffPageOptions{BaseName: "base.pb.gz", NewName: "new.pb.gz"}
+	m := MeasureDiff(d, export)
+	bound, nodes := diffPageBound(d, export)
+	for _, tc := range []struct{ maxBytes, maxNodes int }{
+		{0, 0}, {int(bound), nodes}, {int(bound) - 1, nodes}, {int(bound), nodes - 1},
+	} {
+		var w bytes.Buffer
+		err := WriteDiffPageBounded(&w, d, export, tc.maxBytes, tc.maxNodes)
+		got := exportState(m.bound, m.nodes, tc.maxBytes, tc.maxNodes)
+		assert.Equal(t, err == nil, got.OK, "%+v: %v", tc, err)
+	}
+	live, _ := diffLiveOf(t, d, DiffLiveOptions{Title: strings.Repeat("&", 200), MaxBytes: int(bound), MaxNodes: nodes, Measure: m})
+	assert.Equal(t, true, live["export"].(map[string]any)["ok"], "the model's own long title is not in the static copy")
+	live, _ = diffLiveOf(t, d, DiffLiveOptions{Title: strings.Repeat("&", 200), MaxBytes: int(bound), MaxNodes: nodes})
+	assert.Equal(t, false, live["export"].(map[string]any)["ok"], "unmeasured, the model counts its own title")
+}

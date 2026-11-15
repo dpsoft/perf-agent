@@ -257,6 +257,7 @@
   const renderNotes = (m) => {
     const notes = $('notes');
     clear(notes);
+    notes.setAttribute('aria-label', isDiff(m) ? 'Comparison notes' : 'Sampling notes');
     let items = m.notes || [];
     if (isDiff(m)) {
       items = [].concat(m.warnings || [], m.notes || [],

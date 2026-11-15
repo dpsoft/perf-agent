@@ -277,6 +277,9 @@ type live struct {
 	hub  *livehttp.Hub
 	lim  Limits
 	pins *pins
+	// heavySlots holds a token per export or focus request being served;
+	// see heavy.
+	heavySlots chan struct{}
 
 	mu sync.Mutex
 	// closed is set by close; nothing starts after it.
@@ -290,10 +293,11 @@ type live struct {
 
 func newLive(lim Limits, pins *pins) *live {
 	l := &live{
-		history: map[string]*liveHistory{},
-		hub:     livehttp.NewHub(lim.MaxPageClients, liveKeepAlive, liveWriteTimeout),
-		lim:     lim,
-		pins:    pins,
+		history:    map[string]*liveHistory{},
+		hub:        livehttp.NewHub(lim.MaxPageClients, liveKeepAlive, liveWriteTimeout),
+		lim:        lim,
+		pins:       pins,
+		heavySlots: make(chan struct{}, liveHeavy),
 	}
 	snap := &liveSnapshot{pubs: map[string]*publication{}, history: map[string]*liveHistory{}}
 	snap.state = stateOf(snap)

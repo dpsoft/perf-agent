@@ -295,11 +295,8 @@ type explainedPageData struct {
 // out and counted on the page, so the history alone never makes a page
 // fail. Nothing is written unless the page fits.
 func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) error {
-	if v == nil {
-		return errors.New("flamegraph: nil view")
-	}
-	if !r.OK {
-		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
+	if err := checkPageInput(v, r); err != nil {
+		return err
 	}
 	if opts.MaxBytes <= 0 {
 		data, err := buildExplained(v, r, opts, -1, -1)
@@ -308,19 +305,58 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 		}
 		return explainPageTmpl.Execute(w, data)
 	}
-	base, rows, err := fitHistory(v, r, opts)
-	if err != nil {
-		return err
-	}
-	page, err := fitFrames(opts.MaxBytes, base, func(frameBytes int64) ([]byte, error) {
-		return renderExplained(v, r, opts, frameBytes, rows)
-	})
+	page, err := ExplainedPage(v, r, opts)
 	if err != nil {
 		return err
 	}
 	_, err = w.Write(page)
 	return err
 }
+
+// ExplainedPage is the page WriteExplainedPage writes within a positive
+// opts.MaxBytes, rendered into memory once and not copied: a caller that
+// holds the page whole before sending it needs no buffer of its own. A
+// page that does not fit is ErrPageTooLarge.
+func ExplainedPage(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) ([]byte, error) {
+	if err := checkPageInput(v, r); err != nil {
+		return nil, err
+	}
+	if opts.MaxBytes <= 0 {
+		return nil, errors.New("flamegraph: ExplainedPage needs a positive MaxBytes; WriteExplainedPage renders an unbounded page")
+	}
+	base, rows, err := fitHistory(v, r, opts)
+	if err != nil {
+		return nil, err
+	}
+	return fitFrames(opts.MaxBytes, base, func(frameBytes int64) ([]byte, error) {
+		return renderExplained(v, r, opts, frameBytes, rows)
+	})
+}
+
+func checkPageInput(v *profilemodel.View, r explain.Result) error {
+	if v == nil {
+		return errors.New("flamegraph: nil view")
+	}
+	if !r.OK {
+		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
+	}
+	return nil
+}
+
+// ErrPageTooLarge is the error of a page or live model that does not fit
+// its MaxBytes even with only the explained and referenced paths drawn.
+// The error returned says how many bytes it needs; it is ErrPageTooLarge
+// by errors.Is.
+var ErrPageTooLarge = errors.New("flamegraph: the page does not fit its budget (MaxBytes)")
+
+// tooLargeError is an ErrPageTooLarge that says by how much.
+type tooLargeError struct{ msg string }
+
+func (e *tooLargeError) Error() string        { return e.msg }
+func (e *tooLargeError) Is(target error) bool { return target == ErrPageTooLarge }
+
+// tooLarge is an ErrPageTooLarge with the text format makes.
+func tooLarge(format string, a ...any) error { return &tooLargeError{fmt.Sprintf(format, a...)} }
 
 // fitFrames spends what maxBytes leaves after base, the output with only
 // the explained and referenced paths drawn, on frames: render is called
@@ -361,7 +397,7 @@ func fitHistory(v *profilemodel.View, r explain.Result, opts ExplainedPageOption
 	}
 	bare := buf.Bytes()
 	if len(bare) > opts.MaxBytes {
-		return nil, 0, fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
+		return nil, 0, tooLarge("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
 			len(bare), opts.MaxBytes)
 	}
 	keep, room := 0, int64(opts.MaxBytes-len(bare))

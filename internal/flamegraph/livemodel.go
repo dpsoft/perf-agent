@@ -97,7 +97,7 @@ func ExplainedLiveModel(v *profilemodel.View, r explain.Result, opts LiveOptions
 		return nil, err
 	}
 	if len(base) > opts.MaxBytes {
-		return nil, fmt.Errorf("flamegraph: the live model needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
+		return nil, tooLarge("flamegraph: the live model needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
 			len(base), opts.MaxBytes)
 	}
 	return fitFrames(opts.MaxBytes, base, render)

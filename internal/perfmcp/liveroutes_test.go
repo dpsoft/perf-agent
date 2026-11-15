@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
@@ -448,8 +449,38 @@ func TestTheExportShowsOnlyWhatTheHistoryKeeps(t *testing.T) {
 	if !strings.Contains(page, "640 claims rejected at render in 20 attempts") {
 		t.Error("the export's pill does not count every claim and attempt")
 	}
-	if !strings.Contains(page, "more failure") && !strings.Contains(page, "not kept") {
-		t.Error("the export does not say what it left out")
+	// Every failure of the record is either listed or counted, attempt by
+	// attempt, and the attempts left out are counted too.
+	if len(h.rejected)+h.dropped != 20 {
+		t.Errorf("the history keeps %d attempts and counts %d dropped, of 20", len(h.rejected), h.dropped)
+	}
+	omitted := 0
+	for _, ra := range h.rejected {
+		if len(ra.Failures)+ra.Omitted != 32 {
+			t.Errorf("%s keeps %d failures and counts %d omitted, of 32", ra.Attempt, len(ra.Failures), ra.Omitted)
+		}
+		if ra.Omitted > 0 {
+			omitted++
+			label := fmt.Sprintf("and %d more failures", ra.Omitted)
+			if ra.Omitted == 1 {
+				label = "and 1 more failure"
+			}
+			if !strings.Contains(page, label) {
+				t.Errorf("the export does not say %q for %s", label, ra.Attempt)
+			}
+		}
+	}
+	if omitted == 0 {
+		t.Error("no kept attempt has omitted failures; the test needs some")
+	}
+	if h.dropped > 0 {
+		label := fmt.Sprintf("plus %d earlier rejected attempts not kept", h.dropped)
+		if h.dropped == 1 {
+			label = "plus 1 earlier rejected attempt not kept"
+		}
+		if !strings.Contains(page, label) {
+			t.Errorf("the export does not say %q", label)
+		}
 	}
 }
 
@@ -477,7 +508,8 @@ func TestAnExportOverTheBudgetIs422(t *testing.T) {
 // TestExportReadsOnlyTheSnapshot exports from four goroutines while the
 // request goroutine changes p1's record, evicts its view's record and
 // finally evicts p1: every answer is a whole page of one committed
-// history, a 422, or, once p1 is gone, a 404.
+// history, a 422, a 503 while the other exports take every slot, or, once
+// p1 is gone, a 404.
 func TestExportReadsOnlyTheSnapshot(t *testing.T) {
 	profiles := equalCPU(3)
 	profiles["cpu.pb.gz"] = pmfixture.CPUBasic()
@@ -513,7 +545,7 @@ func TestExportReadsOnlyTheSnapshot(t *testing.T) {
 						t.Errorf("a partial export: %d bytes of %d", len(body), res.ContentLength)
 					}
 					bodies[sha256.Sum256(body)]++
-				case http.StatusUnprocessableEntity:
+				case http.StatusUnprocessableEntity, http.StatusServiceUnavailable:
 				case http.StatusNotFound:
 					if !gone {
 						t.Error("404 while p1 is kept")
@@ -781,14 +813,30 @@ func TestCloseStopsTheListener(t *testing.T) {
 	}
 }
 
+// longNames is cpu/nanoseconds with one stack of depth frames, each a
+// function with its own name of about nameLen bytes: every frame is as
+// wide as the view, so a page draws them all.
+func longNames(depth, nameLen int) []byte {
+	frames := make([]pmfixture.Frame, depth)
+	for i := range frames {
+		frames[i] = pmfixture.Fn(fmt.Sprintf("f%05d_", i) + strings.Repeat("x", nameLen))
+	}
+	return pmfixture.Build("cpu", "nanoseconds", nil, pmfixture.Sample{Frames: frames, Value: 1})
+}
+
 // TestCloseIsBoundedByStuckClients closes a server with a tab that never
 // reads its stream and a download that never reads its body: Close
 // returns within its bound, and both connections end.
 func TestCloseIsBoundedByStuckClients(t *testing.T) {
-	s := newLiveServer(t, func(c *Config) { c.Limits.MaxPageBytes, c.Limits.MaxPageNodes = 64<<20, 1<<20 }, map[string][]byte{"wide.pb.gz": pmfixture.Wide(20000)})
+	s := newLiveServer(t, func(c *Config) { c.Limits.MaxPageBytes, c.Limits.MaxPageNodes = 64<<20, 1<<20 }, map[string][]byte{"long.pb.gz": longNames(8000, 1000)})
 	base := liveURL(t, s)
-	o := openLive(t, s, "wide.pb.gz")
+	o := openLive(t, s, "long.pb.gz")
 	p := o.facts(t, s)
+	// Far more than a socket's buffers hold, so the download cannot end
+	// inside the kernel while the test waits.
+	if len(p.model) < 8<<20 {
+		t.Fatalf("the model is %d bytes; the test needs at least 8 MiB", len(p.model))
+	}
 	u := must(url.Parse(base))(t)
 	d := net.Dialer{Control: smallReceiveBuffer}
 	stuck := func(route string) net.Conn {
@@ -892,6 +940,10 @@ func TestLivePageRacesNothing(t *testing.T) {
 					case http.StatusOK:
 						ok.Add(1)
 					case http.StatusNotFound:
+					case http.StatusServiceUnavailable:
+						if !strings.HasPrefix(route, "focus/") {
+							t.Errorf("goroutine %d: %s is not bounded, but answered 503", i, route)
+						}
 					default:
 						t.Errorf("goroutine %d: %s status %d", i, route, res.StatusCode)
 					}
@@ -922,4 +974,82 @@ func TestLivePageRacesNothing(t *testing.T) {
 	if ok.Load() == 0 {
 		t.Error("no route answered 200")
 	}
+}
+
+// An export that fails for a reason other than its size says so without
+// sending the agent or the user after MaxPageBytes.
+func TestAnExportThatFailsOtherwiseSaysSo(t *testing.T) {
+	s, _, p, base := livePublished(t, nil)
+	broken := *p
+	broken.id, broken.n, broken.result = "p2", 2, explain.Result{}
+	if _, err := exportExplained(&broken, nil); err == nil || strings.Contains(err.Error(), "MaxPageBytes") {
+		t.Errorf("a failed check's export error %v", err)
+	}
+	l := s.live
+	l.pubs = append(l.pubs, &broken)
+	s.commit()
+	res, body := httpGet(t, base+"pub/p2/export", nil)
+	wantStatus(t, "export of a broken publication", res, body, http.StatusInternalServerError)
+	if bytes.Contains(body, []byte("MaxPageBytes")) || res.Header.Get("Content-Disposition") != "" {
+		t.Errorf("500 body %q, headers %v", body, res.Header)
+	}
+}
+
+// The export and focus routes, the ones that build a page or a model per
+// request, run at most liveHeavy at a time; one more is told to retry.
+func TestHeavyRoutesAreBounded(t *testing.T) {
+	s, o, _, base := livePublished(t, nil)
+	a, b := string(o.node(t, "a")), string(o.node(t, "b"))
+	for range cap(s.live.heavySlots) {
+		s.live.heavySlots <- struct{}{}
+	}
+	for _, route := range []string{"pub/p1/export", "pub/p1/focus/" + a} {
+		res, body := httpGet(t, base+route, nil)
+		wantStatus(t, route+" while busy", res, body, http.StatusServiceUnavailable)
+		if !bytes.Contains(body, []byte("busy")) || !bytes.Contains(body, []byte("retry")) || res.Header.Get("Retry-After") != "1" {
+			t.Errorf("%s: 503 body %q, Retry-After %q", route, body, res.Header.Get("Retry-After"))
+		}
+		if got := res.Header.Get("Content-Security-Policy"); got != livehttp.CSP {
+			t.Errorf("%s: 503 CSP %q", route, got)
+		}
+	}
+	for _, route := range []string{"state", "pub/p1/model", "pub/p1/history", "pub/p1/frame/" + b} {
+		res, body := httpGet(t, base+route, nil)
+		wantStatus(t, route+" while busy", res, body, http.StatusOK)
+	}
+	for range cap(s.live.heavySlots) {
+		<-s.live.heavySlots
+	}
+	for _, route := range []string{"pub/p1/export", "pub/p1/focus/" + a} {
+		res, body := httpGet(t, base+route, nil)
+		wantStatus(t, route+" once free", res, body, http.StatusOK)
+	}
+
+	// Many at once: each answer is a whole page or a 503, and the slots
+	// are all free afterwards.
+	var wg sync.WaitGroup
+	var ok, busy atomic.Int64
+	for range 16 {
+		wg.Go(func() {
+			for range 5 {
+				res, _ := httpGet(t, base+"pub/p1/export", nil)
+				switch res.StatusCode {
+				case http.StatusOK:
+					ok.Add(1)
+				case http.StatusServiceUnavailable:
+					busy.Add(1)
+				default:
+					t.Errorf("export status %d", res.StatusCode)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if ok.Load() == 0 {
+		t.Error("no export answered 200")
+	}
+	if n := len(s.live.heavySlots); n != 0 {
+		t.Errorf("%d slots still taken", n)
+	}
+	t.Logf("%d exports, %d told to retry", ok.Load(), busy.Load())
 }

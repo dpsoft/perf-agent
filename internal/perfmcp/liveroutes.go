@@ -1,7 +1,6 @@
 package perfmcp
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,14 +32,14 @@ const jsonType = "application/json; charset=utf-8"
 func (s *Server) liveMux() http.Handler {
 	l := s.live
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) { serveAsset(w, "") })
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { serveAsset(w, r, "") })
 	mux.HandleFunc("GET /assets/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if len(name) > maxPathValue {
 			http.NotFound(w, r)
 			return
 		}
-		serveAsset(w, "assets/"+name)
+		serveAsset(w, r, "assets/"+name)
 	})
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, _ *http.Request) {
 		snap := l.snapshot()
@@ -74,7 +73,7 @@ func (s *Server) liveMux() http.Handler {
 		out, err := flamegraph.ExplainedLiveFrame(p.v, p.result, node, p.opts.Digest)
 		writeComputed(w, out, err)
 	})
-	mux.HandleFunc("GET /pub/{id}/focus/{node}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /pub/{id}/focus/{node}", l.heavy(func(w http.ResponseWriter, r *http.Request) {
 		snap := l.snapshot()
 		p, node := lookupNode(w, r, snap)
 		if p == nil {
@@ -84,8 +83,8 @@ func (s *Server) liveMux() http.Handler {
 		opts.Focus = node
 		out, err := flamegraph.ExplainedLiveModel(p.v, p.result, opts)
 		writeComputed(w, out, err)
-	})
-	mux.HandleFunc("GET /pub/{id}/export", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("GET /pub/{id}/export", l.heavy(func(w http.ResponseWriter, r *http.Request) {
 		snap := l.snapshot()
 		p := lookupPub(w, r, snap)
 		if p == nil {
@@ -96,15 +95,19 @@ func (s *Server) liveMux() http.Handler {
 			return
 		}
 		page, err := exportExplained(p, snap.history[p.id])
-		if err != nil {
+		if _, ok := errors.AsType[*exportSizeError](err); ok {
 			unprocessable(w, err)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h := w.Header()
 		h.Set("Content-Security-Policy", livehttp.ExportCSP)
 		h.Set("Content-Disposition", `attachment; filename="`+p.id+`.html"`)
 		writeBody(w, "text/html; charset=utf-8", page)
-	})
+	}))
 	mux.HandleFunc("/", http.NotFound)
 	return cleanPathsOnly(mux)
 }
@@ -171,11 +174,38 @@ func writeComputed(w http.ResponseWriter, out []byte, err error) {
 	}
 }
 
+// liveHeavy is how many export and focus requests, which each build a
+// page or a model of up to MaxPageBytes, the page serves at once.
+const liveHeavy = 2
+
+// heavy serves h only while one of the live page's liveHeavy slots is
+// free, and otherwise answers 503 at once: a few tabs asking for exports
+// cannot hold many page-sized buffers between them.
+func (l *live) heavy(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case l.heavySlots <- struct{}{}:
+			defer func() { <-l.heavySlots }()
+			h(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "busy building another export or focus; retry in a moment", http.StatusServiceUnavailable)
+		}
+	}
+}
+
+// exportSizeError is an export refused for its size.
+type exportSizeError struct{ msg string }
+
+func (e *exportSizeError) Error() string { return e.msg }
+
 // exportExplained is p as the static explained page, with h, the rejected
 // attempts its history keeps (nil for none), within the page limits. It is
-// rendered whole before anything is sent, so a failure sends no page. The
-// rows h left out are counted on their attempts and in its dropped
-// attempts, so the page says how many it does not list.
+// rendered whole, once, before anything is sent, so a failure sends no
+// page. One over the limits is an *exportSizeError; any other failure
+// says nothing of the limits. The rows h left out are counted on their
+// attempts and in its dropped attempts, so the page says how many it does
+// not list.
 func exportExplained(p *publication, h *liveHistory) ([]byte, error) {
 	opts := flamegraph.ExplainedPageOptions{
 		Title: p.opts.Title, ProfileName: p.opts.ProfileName, Digest: p.opts.Digest, Attempt: p.opts.Attempt,
@@ -184,14 +214,16 @@ func exportExplained(p *publication, h *liveHistory) ([]byte, error) {
 	if h != nil {
 		opts.Rejected, opts.DroppedRejected, opts.HistoryIncomplete = h.rejected, h.dropped, h.incomplete
 	}
-	var page bytes.Buffer
-	if err := flamegraph.WriteExplainedPage(&page, p.v, p.result, opts); err != nil {
-		return nil, fmt.Errorf("the page cannot be exported within MaxPageBytes=%d: %v", p.opts.MaxBytes, err)
+	page, err := flamegraph.ExplainedPage(p.v, p.result, opts)
+	switch {
+	case errors.Is(err, flamegraph.ErrPageTooLarge):
+		return nil, &exportSizeError{fmt.Sprintf("the page cannot be exported within MaxPageBytes=%d: %v", p.opts.MaxBytes, err)}
+	case err != nil:
+		return nil, fmt.Errorf("the page cannot be exported: %v", err)
+	case len(page) > p.opts.MaxBytes:
+		return nil, &exportSizeError{fmt.Sprintf("the page is %d bytes, over MaxPageBytes=%d", len(page), p.opts.MaxBytes)}
 	}
-	if p.opts.MaxBytes > 0 && page.Len() > p.opts.MaxBytes {
-		return nil, fmt.Errorf("the page is %d bytes, over MaxPageBytes=%d", page.Len(), p.opts.MaxBytes)
-	}
-	return page.Bytes(), nil
+	return page, nil
 }
 
 // emptyHistory is the history of a publication without one, a diff.
@@ -208,10 +240,10 @@ func emptyHistory(id string) []byte {
 	return out
 }
 
-func serveAsset(w http.ResponseWriter, name string) {
+func serveAsset(w http.ResponseWriter, r *http.Request, name string) {
 	body, ctype, ok := flamegraph.LiveAsset(name)
 	if !ok {
-		http.Error(w, "404 page not found", http.StatusNotFound)
+		http.NotFound(w, r)
 		return
 	}
 	writeBody(w, ctype, body)

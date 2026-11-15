@@ -15,7 +15,7 @@
 *One capture of a live PyTorch step: `pa_train_step (torch_workload.py:76)` under
 `Thread.run`, down through `torch::autograd` and `cublasSgemm_v2`, across the
 `[gpu:launch]` boundary into the CUDA kernel — Python, C++ and GPU in one tree.
-[Interactive version](docs/flamegraph-pytorch-gpu.html).*
+[Interactive version](https://htmlpreview.github.io/?https://github.com/dpsoft/perf-agent/blob/main/docs/flamegraph-pytorch-gpu.html).*
 
 ---
 

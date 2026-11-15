@@ -141,3 +141,58 @@ func TestAStaleRecordDoesNotBlock(t *testing.T) {
 		t.Errorf("stale record not replaced: %q", b)
 	}
 }
+
+func TestTryLockRefusesASymlinkedLockFile(t *testing.T) {
+	dir, root := openDir(t)
+	victim := dir + "/victim"
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("victim", dir+"/.lock"); err != nil {
+		t.Fatal(err)
+	}
+	l, e := TryLock(root, Holder{ServerPID: os.Getpid()})
+	if e == nil {
+		_ = l.Close()
+		t.Fatal("TryLock followed a symlink")
+	}
+	if e.Code != CodeDisk {
+		t.Errorf("got %v, want a disk error", e)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+		t.Errorf("victim modified: %q", b)
+	}
+}
+
+func TestBusyReadsAHolderWithATornTail(t *testing.T) {
+	dir, root := openDir(t)
+	l, e := TryLock(root, Holder{ServerPID: os.Getpid()})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer func() { _ = l.Close() }()
+	long := `{"server_pid":7,"capture_id":"x/001","series":"` + strings.Repeat("s", 300) + `"}`
+	short := `{"server_pid":7,"reaper_pid":8,"capture_id":"x/002"}`
+	// A crash between the write and the truncate leaves the new record
+	// over the old one's tail.
+	if err := os.WriteFile(dir+"/.lock", []byte(short+long[len(short):]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, e = TryLock(root, Holder{})
+	if e == nil || e.Code != CodeBusy || !strings.Contains(e.Message, "x/002") || !strings.Contains(e.Message, "reaper pid 8") {
+		t.Fatalf("got %v", e)
+	}
+}
+
+func TestBusyWithoutADeadlineSaysUnknown(t *testing.T) {
+	_, root := openDir(t)
+	l, e := TryLock(root, Holder{ServerPID: os.Getpid(), CaptureID: "d/001"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer func() { _ = l.Close() }()
+	_, e = TryLock(root, Holder{})
+	if e == nil || !strings.Contains(e.Message, "ends by unknown") || strings.Contains(e.Message, "0001") {
+		t.Fatalf("got %v", e)
+	}
+}

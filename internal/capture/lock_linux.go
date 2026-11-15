@@ -3,6 +3,7 @@
 package capture
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,11 @@ const minRetryAfter = time.Second
 // a duplicate of File's descriptor keeps the directory locked after this
 // process closes its own. The lock is released when the last descriptor on
 // the description is closed, or the last holder exits.
+//
+// On NFS, flock is emulated with per-process fcntl byte-range locks, so
+// the lock does not follow a descriptor handed to another process and the
+// reaper-inheritance guarantee does not hold: a captures directory on NFS
+// is unsupported.
 type Lease struct {
 	mu sync.Mutex
 	f  *os.File
@@ -36,9 +42,18 @@ type Lease struct {
 // holds the directory, so a record left by a holder that is gone is
 // overwritten by the next successful TryLock and never blocks it.
 func TryLock(dir *os.Root, h Holder) (*Lease, *Error) {
-	f, err := dir.OpenFile(lockName, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := dir.OpenFile(lockName, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, Errorf(CodeDisk, "check the captures directory", "open %s: %v", lockName, err)
+	}
+	// os.Root follows an in-directory symlink whatever the flags, so the
+	// opened file must be the directory entry itself: a regular file that
+	// Lstat sees at the same name.
+	fi, err := f.Stat()
+	li, lerr := dir.Lstat(lockName)
+	if err != nil || lerr != nil || !fi.Mode().IsRegular() || !os.SameFile(fi, li) {
+		_ = f.Close()
+		return nil, Errorf(CodeDisk, "check the captures directory", "%s is not a regular file (a symlink?)", lockName)
 	}
 	for {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
@@ -68,12 +83,18 @@ func busyError(f *os.File) *Error {
 	buf := make([]byte, 64<<10)
 	n, _ := f.ReadAt(buf, 0)
 	var h Holder
-	if n == 0 || json.Unmarshal(buf[:n], &h) != nil || h.ServerPID == 0 && h.ReaperPID == 0 {
+	// The first JSON value is the record; a stale tail from a crash between
+	// the write and the truncate is ignored.
+	if n == 0 || json.NewDecoder(bytes.NewReader(buf[:n])).Decode(&h) != nil || h.ServerPID == 0 && h.ReaperPID == 0 {
 		e.Message = "another capture holds the captures directory (its holder record is unreadable)"
 		return e
 	}
+	ends := "unknown"
+	if !h.Deadline.IsZero() {
+		ends = h.Deadline.UTC().Format(time.RFC3339)
+	}
 	e.Message = fmt.Sprintf("capture %s by perf-agent-mcp pid %d (reaper pid %d), ends by %s",
-		h.CaptureID, h.ServerPID, h.ReaperPID, h.Deadline.UTC().Format(time.RFC3339))
+		h.CaptureID, h.ServerPID, h.ReaperPID, ends)
 	if !h.Deadline.IsZero() {
 		e.RetryAfter = max(time.Until(h.Deadline), minRetryAfter)
 	}
@@ -98,7 +119,8 @@ func (l *Lease) write(h Holder) error {
 // open file description, without close-on-exec, and keeps the lock until it
 // closes the descriptor or exits, whatever this process does. The Lease
 // still owns the original, which is close-on-exec, so no other child
-// inherits it. File is nil after Close.
+// inherits it. This holds on local filesystems only (see Lease). File is
+// nil after Close.
 func (l *Lease) File() *os.File {
 	l.mu.Lock()
 	defer l.mu.Unlock()

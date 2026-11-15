@@ -62,7 +62,7 @@ func writeCards(dir, repo, version string) (cards, error) {
 			"Python, C++ and CUDA kernels in one flame graph. Attach by PID, no restart.",
 			"Powered by <b>eBPF</b>, <b>cilium/ebpf</b>, <b>blazesym</b> and <b>CUPTI</b>")),
 		closing: write("closing.html", card("perf-agent "+html.EscapeString(version)+" · <code>ghcr.io/dpsoft/perf-agent</code>",
-			"Linux 7.1+ · CPU, off-CPU and GPU · Python 3.12–3.14 · NVML telemetry · pprof<br>"+
+			"Linux 6.2+ incl. 7.1 · CPU, off-CPU and GPU · Python 3.12–3.14 · NVML telemetry · pprof<br>"+
 				"<code>https://github.com/dpsoft/perf-agent</code>",
 			"Powered by <b>eBPF</b><code>ebpf.io</code> · <b>cilium/ebpf</b><code>github.com/cilium/ebpf</code><br>"+
 				"<b>blazesym</b><code>github.com/libbpf/blazesym</code> · <b>CUPTI</b><code>developer.nvidia.com/cupti</code>")),

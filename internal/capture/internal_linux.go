@@ -168,6 +168,9 @@ type reaper struct {
 	stopping   bool
 	subreaper  error
 	inCgroup   bool
+	// wait4 is wait4(-1, ws, WNOHANG); a test replaces it so that it never
+	// reaps the test process's own children.
+	wait4 func(ws *syscall.WaitStatus) (int, error)
 	// starts records the start time of each child the sweep listed.
 	starts  map[int]uint64
 	reasons []string
@@ -305,30 +308,45 @@ func readCommands(f *os.File) <-chan Command {
 	return ch
 }
 
-// waitLoop is the one place children are reaped: wait4(-1) until nothing
-// is left to reap, woken by SIGCHLD or the poll. It also reaps the orphans
-// this subreaper adopted. Known children go to the main goroutine.
+// reap is the one place children are reaped: wait4(-1) until nothing is
+// left to reap, under mu. It also reaps the orphans this subreaper
+// adopted. It returns the known children it reaped, and none when the
+// kernel says this process has no child at all (ECHILD): as a subreaper,
+// then, it has no descendant either.
+func (r *reaper) reap() (got []exitNote, none bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for {
+		var ws syscall.WaitStatus
+		var pid int
+		var err error
+		if r.wait4 != nil {
+			pid, err = r.wait4(&ws)
+		} else {
+			pid, err = syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		}
+		switch {
+		case errors.Is(err, syscall.EINTR):
+			continue
+		case errors.Is(err, syscall.ECHILD):
+			return got, true
+		case err != nil || pid <= 0:
+			return got, false
+		}
+		if r.live[pid] {
+			delete(r.live, pid)
+			got = append(got, exitNote{pid, ws})
+		}
+	}
+}
+
+// waitLoop reaps whenever SIGCHLD or the poll wakes it, and hands the
+// known children to the main goroutine.
 func (r *reaper) waitLoop(sigchld <-chan os.Signal) {
 	tick := time.NewTicker(waitPoll)
 	defer tick.Stop()
 	for {
-		var got []exitNote
-		r.mu.Lock()
-		for {
-			var ws syscall.WaitStatus
-			pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
-			if errors.Is(err, syscall.EINTR) {
-				continue
-			}
-			if err != nil || pid <= 0 {
-				break
-			}
-			if r.live[pid] {
-				delete(r.live, pid)
-				got = append(got, exitNote{pid, ws})
-			}
-		}
-		r.mu.Unlock()
+		got, _ := r.reap()
 		for _, e := range got {
 			r.exits <- e
 		}
@@ -618,14 +636,17 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 	}
 }
 
-// settle is the final cleanup: the sweep of this process's children
-// (adopted descendants included), then a wait, all within StopGrace, for
-// the cgroup to empty and both known children to be reaped. What is left
-// becomes survivors, with the reasons in r.reasons.
+// settle is the final cleanup, all within StopGrace. The sweep reaps,
+// lists this process's children (adopted descendants included) and
+// SIGKILLs them by verified PID, round after round, until the kernel
+// reports no child left (ECHILD) and a fresh /proc scan agrees: only then
+// is the tree quiescent. Then the cgroup must be proven empty, and both
+// known children reaped. What is left becomes survivors, with the reasons
+// in r.reasons.
 func (r *reaper) settle() []Survivor {
 	grace := max(r.spec.StopGrace, settleFloor)
 	end := time.Now().Add(grace)
-	left := sweep(r.children, r.killChild, func(pid int) bool { return Alive(r.proc, pid, r.starts[pid]) }, grace, time.Now)
+	left, quiet := sweep(r.round, r.killChild, func(pid int) bool { return Alive(r.proc, pid, r.starts[pid]) }, grace, time.Now)
 
 	var survivors []Survivor
 	add := func(pid int, why string) {
@@ -647,6 +668,9 @@ func (r *reaper) settle() []Survivor {
 	for _, pid := range left {
 		add(pid, "not reaped")
 	}
+	if !quiet {
+		r.reasons = append(r.reasons, "the process tree was not quiescent at the stop grace")
+	}
 	if r.inCgroup {
 		empty := func() bool { p, err := cgroupPopulated(r.spec.Cgroup); return err == nil && !p }
 		if ok, _ := r.waitUntil(end, false, empty); !ok {
@@ -667,6 +691,26 @@ func (r *reaper) settle() []Survivor {
 		r.reasons = append(r.reasons, "process group only (no subreaper: "+r.subreaper.Error()+")")
 	}
 	return survivors
+}
+
+// round is one sweep round: reap what has exited, handle the known
+// children among it, then list the children left, zombies included. quiet
+// is ECHILD from the reaping and an empty listing after it.
+func (r *reaper) round() (pids []int, quiet bool) {
+	got, none := r.reap()
+	for _, e := range got {
+		r.exited(e)
+	}
+	for drained := false; !drained; {
+		select {
+		case e := <-r.exits:
+			r.exited(e)
+		default:
+			drained = true
+		}
+	}
+	pids = r.children()
+	return pids, none && len(pids) == 0
 }
 
 // children lists this process's children from /proc, recording each start
@@ -707,27 +751,28 @@ func (r *reaper) killChild(pid int, sig syscall.Signal) error {
 	return err
 }
 
-// sweep SIGKILLs, by PID, every child children lists that alive says is
-// alive, round after round (a killed process's orphans are adopted and
-// listed next), until none is left or grace has passed. It returns the
-// survivors.
-func sweep(children func() []int, kill func(pid int, sig syscall.Signal) error, alive func(pid int) bool, grace time.Duration, now func() time.Time) []int {
+// sweep runs children's rounds, SIGKILLing every listed process by PID
+// (a zombie is harmless to signal, and its orphans are adopted as it
+// exits, so it keeps the sweep going), until a round reports quiet or
+// grace has passed. It returns the listed processes alive says are still
+// alive when grace ran out, and whether the tree went quiet.
+func sweep(children func() (pids []int, quiet bool), kill func(pid int, sig syscall.Signal) error, alive func(pid int) bool, grace time.Duration, now func() time.Time) (left []int, quiet bool) {
 	end := now().Add(grace)
 	for {
-		var live []int
-		for _, pid := range children() {
-			if alive(pid) {
-				live = append(live, pid)
-			}
+		pids, quiet := children()
+		if quiet {
+			return nil, true
 		}
-		if len(live) == 0 {
-			return nil
-		}
-		for _, pid := range live {
+		for _, pid := range pids {
 			_ = kill(pid, syscall.SIGKILL)
 		}
 		if !now().Before(end) {
-			return live
+			for _, pid := range pids {
+				if alive(pid) {
+					left = append(left, pid)
+				}
+			}
+			return left, false
 		}
 		time.Sleep(sweepTick)
 	}

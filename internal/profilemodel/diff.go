@@ -212,6 +212,8 @@ type Diff struct {
 	// is OK do nodes carry DeltaPerUnit.
 	PerUnit Availability `json:"per_unit"`
 	Root    *DiffNode    `json:"root"`
+	// retained is RetainedBytes, set once Compare has built the union.
+	retained int64
 }
 
 // ErrIncompatibleViews is returned when the views differ in sample type,
@@ -273,7 +275,7 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 			return nil, err
 		}
 	}
-	return &Diff{
+	out := &Diff{
 		BaseHandle:      baseView.Handle,
 		NewHandle:       newView.Handle,
 		View:            baseView.name(),
@@ -288,7 +290,9 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 		NewNotes:        notes[newSide],
 		PerUnit:         d.perUnit,
 		Root:            root,
-	}, nil
+	}
+	out.retained = diffRetained(out)
+	return out, nil
 }
 
 // viewSamplingNotes is the view-level sampling note text PathFacts.Notes

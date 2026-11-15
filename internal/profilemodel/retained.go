@@ -30,6 +30,17 @@ const (
 	retainedPerChild      = 8   // one slot of a children slice
 	retainedPerCallSite   = 64  // a LocationID
 	retainedPerSampleSlot = 8   // one slot of a node's sample-index slice
+
+	// A diff: its union nodes. A node's names and node IDs are its views'
+	// strings, so they count with the views.
+	retainedDiffBase      = 2 << 10
+	retainedPerDiffNode   = 512 // a *DiffNode and its share delta's ratio and exact rational
+	retainedPerDiffChild  = 8   // one slot of a children slice
+	retainedPerCandidate  = 48  // a Candidate
+	retainedPerUnitDelta  = 192 // a per-unit-of-work delta Fact and its value
+	retainedIndexBase     = 256
+	retainedPerIndexEntry = 48 // a slot of the union ID map, its control byte and growth room
+	retainedPerIndexSlot  = 12 // one entry each of the node and parent slices
 )
 
 // RetainedBytes estimates the heap p keeps reachable: its parsed profile,
@@ -132,4 +143,65 @@ func viewRetained(v *View) int64 {
 			retainedPerSampleSlot*int64(cap(nd.samples)+cap(nd.zeroSamples))
 	}
 	return n
+}
+
+// RetainedBytes estimates the heap d keeps reachable beyond the views it
+// compares: its union nodes, their slices and facts, and the strings the
+// diff made (causes, notes, warnings), each counted once. A diff built by
+// Compare has it computed once, at construction; any other diff is
+// estimated from its nodes on every call, which reads d and changes
+// nothing.
+func (d *Diff) RetainedBytes() int64 {
+	if d.retained > 0 {
+		return d.retained
+	}
+	return diffRetained(d)
+}
+
+// diffRetained is d's estimate, from its counts and its strings. The walk
+// is iterative: a union is as deep as its stacks.
+func diffRetained(d *Diff) int64 {
+	strs := stringBytes{}
+	n := int64(retainedDiffBase)
+	strs.add(d.QualityWarnings...)
+	strs.add(d.BaseNotes...)
+	strs.add(d.NewNotes...)
+	n += 16 * int64(cap(d.QualityWarnings)+cap(d.BaseNotes)+cap(d.NewNotes))
+	if d.Root == nil {
+		return n + strs.total
+	}
+	stack := []*DiffNode{d.Root}
+	for len(stack) > 0 {
+		dn := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		n += retainedPerDiffNode + retainedPerDiffChild*int64(cap(dn.Children)) + retainedPerCandidate*int64(cap(dn.Candidates))
+		if dn.DeltaPerUnit != nil {
+			n += retainedPerUnitDelta
+		}
+		strs.add(dn.Why)
+		stack = append(stack, dn.Children...)
+	}
+	return n + strs.total
+}
+
+// indexRetained is ix's estimate: its slices at their capacity, a map
+// slot per node and each union ID's bytes, which the index allocated.
+func indexRetained(ix *DiffIndex) int64 {
+	n := int64(retainedIndexBase) + 8*int64(cap(ix.nodes)) + 4*int64(cap(ix.parent)) + retainedPerIndexEntry*int64(len(ix.byID))
+	for id := range ix.byID {
+		n += sizeClass(len(id))
+	}
+	return n
+}
+
+// sizeClass is the heap bytes a small allocation of n bytes takes: n
+// rounded up to 16 bytes, and to 8 for the tiniest.
+func sizeClass(n int) int64 {
+	switch {
+	case n == 0:
+		return 0
+	case n <= 8:
+		return 8
+	}
+	return int64((n + 15) &^ 15)
 }

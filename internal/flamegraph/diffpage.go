@@ -148,19 +148,19 @@ type diffBuilder struct {
 	omitted      int
 }
 
-// shareScale is the share shift drawn at full saturation.
+// shareScale is the share shift drawn at full saturation. The walk is
+// iterative: a union is as deep as its stacks.
 func shareScale(root *profilemodel.DiffNode) float64 {
 	m := fullScaleShare
-	var walk func(n *profilemodel.DiffNode)
-	walk = func(n *profilemodel.DiffNode) {
+	stack := []*profilemodel.DiffNode{root}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if s, ok := shareOf(n); ok {
 			m = max(m, math.Abs(s))
 		}
-		for _, c := range n.Children {
-			walk(c)
-		}
+		stack = append(stack, n.Children...)
 	}
-	walk(root)
 	return m
 }
 
@@ -178,44 +178,9 @@ func (b *diffBuilder) view(n *profilemodel.DiffNode, parentCombined int64) *diff
 	if v.Name == "" {
 		v.Name = "(all)"
 	}
-	classes := []string{"b"}
-	share, ok := shareOf(n)
-	switch {
-	case !ok:
-		classes = append(classes, "share-none")
-	case share < 0:
-		classes = append(classes, "share-lower")
-	case share > 0:
-		classes = append(classes, "share-higher")
-	default:
-		classes = append(classes, "share-same")
-	}
-	if ok && share != 0 {
-		v.Hue = strconv.Itoa(hueLower)
-		if share > 0 {
-			v.Hue = strconv.Itoa(hueHigher)
-		}
-		v.Tint = strconv.FormatFloat(min(1, math.Abs(share)/b.scale), 'f', 3, 64)
-	} else {
-		v.Hue, v.Tint = "0", "0"
-	}
-	switch n.Presence {
-	case profilemodel.PresenceOnlyBase:
-		classes = append(classes, "only-base")
-	case profilemodel.PresenceOnlyNew:
-		classes = append(classes, "only-new")
-	}
-	if n.Match == profilemodel.MatchAmbiguous {
-		classes = append(classes, "ambiguous")
-	}
-	if n.Interpretation == profilemodel.NotComparable {
-		classes = append(classes, "not-comparable")
-		v.Marker = "!"
-	}
-	v.Classes = strings.Join(classes, " ")
-	v.Tooltip = b.tooltip(n, share, ok)
+	v.Hue, v.Tint, v.Classes, v.Marker, v.Tooltip = diffAppearance(n, b.scale, b.unit)
 	for _, c := range n.Children {
-		if float64(c.Combined) < minDrawFraction*float64(b.rootCombined) || c.Combined <= 0 {
+		if !drawnOnDiffPage(c, b.rootCombined) {
 			if c.Combined > 0 {
 				b.omitted += countNodes(c)
 			}
@@ -226,16 +191,69 @@ func (b *diffBuilder) view(n *profilemodel.DiffNode, parentCombined int64) *diff
 	return v
 }
 
-func (b *diffBuilder) tooltip(n *profilemodel.DiffNode, share float64, shareOK bool) string {
+// drawnOnDiffPage says a child of a drawn node is drawn: it is at least
+// minDrawFraction of the root's width rootCombined, and has weight.
+func drawnOnDiffPage(c *profilemodel.DiffNode, rootCombined int64) bool {
+	return !(float64(c.Combined) < minDrawFraction*float64(rootCombined) || c.Combined <= 0)
+}
+
+// diffAppearance is how a diff page draws n, at the colour scale scale
+// (shareScale's) in the sample unit unit: its hue and tint, its classes,
+// its marker and its tooltip.
+func diffAppearance(n *profilemodel.DiffNode, scale float64, unit string) (hue, tint, classes, marker, tooltip string) {
+	return diffAppearanceNamed(n, scale, unit, n.Name)
+}
+
+// diffAppearanceNamed is diffAppearance with the tooltip naming n as name,
+// so the live page can name it as it shows it.
+func diffAppearanceNamed(n *profilemodel.DiffNode, scale float64, unit, name string) (hue, tint, classes, marker, tooltip string) {
+	cls := []string{"b"}
+	share, ok := shareOf(n)
+	switch {
+	case !ok:
+		cls = append(cls, "share-none")
+	case share < 0:
+		cls = append(cls, "share-lower")
+	case share > 0:
+		cls = append(cls, "share-higher")
+	default:
+		cls = append(cls, "share-same")
+	}
+	if ok && share != 0 {
+		hue = strconv.Itoa(hueLower)
+		if share > 0 {
+			hue = strconv.Itoa(hueHigher)
+		}
+		tint = strconv.FormatFloat(min(1, math.Abs(share)/scale), 'f', 3, 64)
+	} else {
+		hue, tint = "0", "0"
+	}
+	switch n.Presence {
+	case profilemodel.PresenceOnlyBase:
+		cls = append(cls, "only-base")
+	case profilemodel.PresenceOnlyNew:
+		cls = append(cls, "only-new")
+	}
+	if n.Match == profilemodel.MatchAmbiguous {
+		cls = append(cls, "ambiguous")
+	}
+	if n.Interpretation == profilemodel.NotComparable {
+		cls = append(cls, "not-comparable")
+		marker = "!"
+	}
+	return hue, tint, strings.Join(cls, " "), marker, diffTooltip(n, name, share, ok, unit)
+}
+
+// diffTooltip is n's tooltip, naming it as name ("(all)" when empty).
+func diffTooltip(n *profilemodel.DiffNode, name string, share float64, shareOK bool, unit string) string {
 	var s strings.Builder
-	name := n.Name
 	if name == "" {
 		name = "(all)"
 	}
 	fmt.Fprintf(&s, "%s\nbase %s, new %s\nchange %s", name,
-		withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, b.unit),
-		withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, b.unit),
-		signed(n.DeltaAbs, b.unit))
+		withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, unit),
+		withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, unit),
+		signed(n.DeltaAbs, unit))
 	if shareOK {
 		fmt.Fprintf(&s, "\nchange in share of own total %+.2f points", share*100)
 	} else {
@@ -349,9 +367,13 @@ func percent(part, whole int64) string {
 // countNodes counts n and everything below it: a node left out of the
 // drawing takes its subtree with it.
 func countNodes(n *profilemodel.DiffNode) int {
-	c := 1
-	for _, k := range n.Children {
-		c += countNodes(k)
+	c := 0
+	stack := []*profilemodel.DiffNode{n}
+	for len(stack) > 0 {
+		m := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		c++
+		stack = append(stack, m.Children...)
 	}
 	return c
 }

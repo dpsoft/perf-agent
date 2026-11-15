@@ -156,3 +156,44 @@ func TestRetainedEstimatesCountEveryStringOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestDiffRetainedEstimatesTrackTheHeap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("compares two 100k-sample profiles")
+	}
+	for _, tc := range []struct {
+		name      string
+		base, new []byte
+	}{
+		{"wide 100k samples against itself", pmfixture.Wide(100_000), pmfixture.Wide(100_000)},
+		{"Deep(5000) vs DeepNew(5000)", pmfixture.Deep(5000), pmfixture.DeepNew(5000)},
+		{"CPUBasic vs CPUBasicNew", pmfixture.CPUBasic(), pmfixture.CPUBasicNew()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bv, nv := viewOf(t, tc.base), viewOf(t, tc.new)
+			d, heldD := heapGrowth(func() *Diff {
+				d, err := Compare(bv, nv, WorkCounts{Base: 3, New: 4})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return d
+			})
+			ix, heldI := heapGrowth(func() *DiffIndex { return NewDiffIndex(d) })
+			runtime.KeepAlive(bv)
+			runtime.KeepAlive(nv)
+			for _, c := range []struct {
+				what           string
+				estimate, held int64
+			}{
+				{"diff", d.RetainedBytes(), heldD},
+				{"index", ix.RetainedBytes(), heldI},
+			} {
+				ratio := float64(c.estimate) / float64(c.held)
+				t.Logf("%s: estimate %d, heap %d, ratio %.3f", c.what, c.estimate, c.held, ratio)
+				if c.held <= 0 || ratio < 0.5 || ratio > 2 {
+					t.Errorf("%s: RetainedBytes %d is not within [0.5x, 2x] of the %d bytes it holds on the heap", c.what, c.estimate, c.held)
+				}
+			}
+		})
+	}
+}

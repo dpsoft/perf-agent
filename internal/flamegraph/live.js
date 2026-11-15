@@ -95,13 +95,26 @@
   // selected node, with the drawn model's frames and elements by node ID.
   let view = null;
 
+  // A publication is an explained view or a diff; their models differ in
+  // shape, and a diff's frames are turned into the panel's frames.
+  const isDiff = (m) => !!m && m.kind === 'diff';
+  const selectedOf = (m) => (isDiff(m) ? m.selected : m.model.selected);
+  // diffPanelFrame is a diff frame as the panel shows one: its facts are
+  // the model's fact rows read from the frame's fields, and its share in a
+  // path is its change in share. The rows' titles are set once shown.
+  const diffPanelFrame = (f, rows) => Object.assign({}, f, {
+    share: f.delta_share,
+    facts: (rows || []).map((r) => ({v: f[r.f] || ''})),
+  });
+
   let panel = null;
   const panelModel = {
     get fact_rows() {
-      return view ? view.shown.model.fact_rows : [];
+      if (!view) return [];
+      return isDiff(view.shown) ? view.shown.fact_rows : view.shown.model.fact_rows;
     },
     get prompts() {
-      return view ? view.shown.model.prompts : [];
+      return view && !isDiff(view.shown) ? view.shown.model.prompts : [];
     },
   };
 
@@ -143,6 +156,10 @@
     const pills = $('pills');
     clear(pills);
     if (!view) return;
+    if (isDiff(view.whole)) {
+      pills.appendChild(make('span', 'pill ok', view.whole.pill));
+      return;
+    }
     pills.appendChild(make('span', 'pill ai', '✦ Explained by an agent via MCP'));
     const ok = make('span', 'pill ok', view.whole.checked_pill);
     ok.title = 'Each structured claim was compared with the engine at its rounding, and each frame reference resolved';
@@ -215,6 +232,17 @@
   const renderLegend = (m) => {
     const legend = $('legend');
     clear(legend);
+    if (isDiff(m)) {
+      for (const l of m.legend || []) {
+        const c = make('span', 'c');
+        const sw = make('i', 'sw dsw');
+        sw.dataset.key = l.key;
+        c.appendChild(sw);
+        c.appendChild(document.createTextNode(l.label));
+        legend.appendChild(c);
+      }
+      return;
+    }
     for (const l of m.legend || []) {
       const c = make('span', 'c');
       const sw = make('i', 'sw');
@@ -229,11 +257,17 @@
   const renderNotes = (m) => {
     const notes = $('notes');
     clear(notes);
-    notes.hidden = !(m.notes && m.notes.length);
+    let items = m.notes || [];
+    if (isDiff(m)) {
+      items = [].concat(m.warnings || [], m.notes || [],
+        (m.base_notes || []).map((n) => 'base: ' + n), (m.new_notes || []).map((n) => 'new: ' + n),
+        m.empty_note ? [m.empty_note] : []);
+    }
+    notes.hidden = !items.length;
     if (notes.hidden) return;
-    notes.appendChild(make('b', '', 'Sampling notes'));
+    notes.appendChild(make('b', '', isDiff(m) ? 'Comparison notes' : 'Sampling notes'));
     const ul = make('ul');
-    for (const n of m.notes) ul.appendChild(make('li', '', n));
+    for (const n of items) ul.appendChild(make('li', '', n));
     notes.appendChild(ul);
   };
 
@@ -253,6 +287,15 @@
   const renderFoot = (m) => {
     const foot = $('foot');
     clear(foot);
+    if (isDiff(m)) {
+      for (const [side, name, handle, total] of [['Base', m.base_name, m.base_handle, m.base_total], ['New', m.new_name, m.new_handle, m.new_total]]) {
+        const s = make('span', '', side + ' ' + name + ': ' + total);
+        s.title = handle;
+        foot.appendChild(s);
+      }
+      foot.appendChild(make('span', '', 'View ' + m.view));
+      return;
+    }
     const total = make('span', '', 'Total ' + m.total);
     total.title = m.total_title;
     foot.appendChild(total);
@@ -275,17 +318,21 @@
   // the frames, the axis, what was left out and the explained rows. The
   // frames' geometry is the model's strings with their units; the static
   // page's "cur" class is dropped, because this page owns the selection.
+  // A diff's frames take their colour from the model's hue and tint.
   const drawModel = (m) => {
+    const diff = isDiff(m);
     view.shown = m;
+    view.list = diff ? m.frames.map((f) => diffPanelFrame(f, m.fact_rows)) : m.model.frames;
     view.frames = new Map();
     view.els = new Map();
-    for (const f of m.model.frames) view.frames.set(f.id, f);
+    for (const f of view.list) view.frames.set(f.id, f);
 
     const chart = $('chart');
     clear(chart);
+    chart.classList.toggle('diff', diff);
     chart.style.height = m.height + 'px';
     for (const d of m.drawn) {
-      const f = m.model.frames[d.i];
+      const f = view.list[d.i];
       if (!f) continue;
       const el = make('div', 'frame');
       for (const c of (d.cls || '').split(' ')) {
@@ -295,14 +342,19 @@
       el.style.width = d.width + '%';
       el.style.top = d.top + 'px';
       el.dataset.i = d.i;
-      el.dataset.domain = d.domain;
-      if (d.res) el.dataset.resolution = d.res;
+      if (diff) {
+        el.style.setProperty('--h', d.hue);
+        el.style.setProperty('--t', d.tint);
+      } else {
+        el.dataset.domain = d.domain;
+        if (d.res) el.dataset.resolution = d.res;
+      }
       el.tabIndex = 0;
       el.setAttribute('role', 'button');
       el.title = d.tip;
       const label = make('span', 'fl');
       if (d.star) label.appendChild(make('span', 'star', '✦'));
-      label.appendChild(document.createTextNode(f.name));
+      label.appendChild(document.createTextNode(d.marker ? d.marker + ' ' + f.name : f.name));
       el.appendChild(label);
       chart.appendChild(el);
       view.els.set(f.id, el);
@@ -311,9 +363,13 @@
     const axis = $('axis');
     clear(axis);
     axis.appendChild(make('span', '', m.view + ' · ' + m.axis));
-    const total = make('span', '', 'total ' + m.total);
-    total.title = m.total_title;
-    axis.appendChild(total);
+    if (diff) {
+      axis.appendChild(make('span', '', 'base ' + m.base_total + ' · new ' + m.new_total));
+    } else {
+      const total = make('span', '', 'total ' + m.total);
+      total.title = m.total_title;
+      axis.appendChild(total);
+    }
 
     const left = $('left-out');
     clear(left);
@@ -323,6 +379,11 @@
 
     const rows = $('rows');
     clear(rows);
+    $('rows-sec').hidden = diff;
+    if (diff) {
+      updateButtons();
+      return;
+    }
     for (const r of m.rows || []) {
       const b = make('button', 'exrow');
       b.type = 'button';
@@ -346,17 +407,31 @@
   // commitPublication shows publication id with its model and history,
   // which were fetched together and are shown together.
   const commitPublication = (id, model, hist) => {
-    view = {pub: id, whole: model, shown: null, hist: null, focus: '', selected: '', frames: new Map(), els: new Map()};
+    view = {pub: id, whole: model, shown: null, hist: null, focus: '', selected: '', list: [], frames: new Map(), els: new Map()};
     document.title = model.doc_title || 'perf-agent live page';
     const title = $('title');
     clear(title);
     titleSegments(title, model.title_segs);
     $('view').textContent = model.view;
     $('waiting').hidden = true;
+    // A diff too large for a static copy says so instead of offering one.
     const exp = $('export');
-    exp.href = pubPath(id, 'export');
-    exp.download = id + '.html';
+    const exportable = !isDiff(model) || (model.export && model.export.ok);
+    if (exportable) {
+      exp.href = pubPath(id, 'export');
+      exp.download = id + '.html';
+      exp.textContent = 'Download a static copy';
+      exp.title = '';
+      exp.removeAttribute('aria-disabled');
+    } else {
+      exp.removeAttribute('href');
+      exp.removeAttribute('download');
+      exp.textContent = 'No static copy';
+      exp.title = (model.export && model.export.reason) || '';
+      exp.setAttribute('aria-disabled', 'true');
+    }
     exp.hidden = false;
+    $('quality-sec').hidden = isDiff(model);
     renderLegend(model);
     renderNotes(model);
     renderQuality(model);
@@ -399,6 +474,16 @@
 
   const showFrame = (f, path, scroll) => {
     panel.show(f, path);
+    // A diff has no explanations: its figures are the engine's, and no
+    // agent claim is made about them. A row with exact digits shows them
+    // on hover.
+    if (isDiff(view.whole)) {
+      $('noexp').hidden = true;
+      const vals = $('facts').querySelectorAll('.v');
+      (view.whole.fact_rows || []).forEach((r, i) => {
+        if (r.t && vals[i]) vals[i].title = f[r.t] || '';
+      });
+    }
     view.selected = f.id;
     const el = view.els.get(f.id);
     if (el && scroll) el.scrollIntoView({block: 'nearest', inline: 'nearest'});
@@ -415,8 +500,10 @@
     const v = view;
     const r = await transport.getJSON(nodePath(v.pub, 'frame', id));
     if (g !== gen || view !== v || !r || !r.frame || r.frame.id !== id) return null;
-    const path = (r.path || []).map((p) => Object.assign({}, p, {ref: refOf(p.id)}));
-    return showFrame(relabel(r.frame), path, scroll);
+    const diff = isDiff(v.whole);
+    const frame = diff ? diffPanelFrame(r.frame, v.whole.fact_rows) : r.frame;
+    const path = (r.path || []).map((p) => Object.assign({}, p, {ref: refOf(p.id)}, diff ? {share: p.delta_share} : {}));
+    return showFrame(relabel(frame), path, scroll);
   };
 
   // focusOn draws the subtree under node id. It resolves to false when the
@@ -433,7 +520,7 @@
   const loadPub = async (id, g) => {
     const [model, hist] = await Promise.all([transport.getJSON(pubPath(id, 'model')), transport.getJSON(pubPath(id, 'history'))]);
     if (g !== gen) return false;
-    if (!model || model.kind !== 'explained') throw new Error('this page cannot show a publication of this kind');
+    if (!model || (model.kind !== 'explained' && model.kind !== 'diff')) throw new Error('this page cannot show a publication of this kind');
     commitPublication(id, model, hist);
     return true;
   };
@@ -484,7 +571,7 @@
     if (!isPub(id)) return;
     const g = ++gen;
     quietly(loadPub(id, g).then((ok) => {
-      const sel = ok && view.whole.model.selected;
+      const sel = ok && selectedOf(view.whole);
       return sel && isNode(sel) ? selectIn(sel, g, true) : null;
     }));
   };
@@ -568,7 +655,7 @@
       drawModel(view.whole);
     }
     if (g !== gen) return;
-    const sel = isNode(st.selected) ? st.selected : view.whole.model.selected;
+    const sel = isNode(st.selected) ? st.selected : selectedOf(view.whole);
     let f = null;
     if (isNode(sel)) {
       f = await selectIn(sel, g, true);
@@ -743,7 +830,7 @@
     }
   };
 
-  const frameOf = (el) => view && view.shown && view.shown.model.frames[el.dataset.i];
+  const frameOf = (el) => view && view.list && view.list[el.dataset.i];
   const chart = $('chart');
   chart.addEventListener('click', (ev) => {
     const el = ev.target.closest('.frame');

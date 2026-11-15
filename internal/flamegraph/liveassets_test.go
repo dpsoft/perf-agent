@@ -610,6 +610,13 @@ func (s *liveServer) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// servedPaths lists the paths the server was asked for, in order.
+func (s *liveServer) servedPaths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.served)
+}
+
 // push sends state on every open stream, as the hub does.
 func (s *liveServer) push(state []byte) {
 	s.mu.Lock()
@@ -767,6 +774,52 @@ func newLivePage(t *testing.T, c *chromeSession, f *liveFixture, state []byte, s
 	return s, c.open(t, s.url)
 }
 
+// liveDiff is CPUBasic against CPUBasicNew, published as p4 with at most
+// four frames drawn: all, main, a and d, so b and c are left out.
+type liveDiff struct {
+	d     *profilemodel.Diff
+	ids   map[string]profilemodel.UnionID // name -> union ID
+	pub   *livePub
+	model map[string]any
+}
+
+func newLiveDiff(t *testing.T) *liveDiff {
+	t.Helper()
+	d := compared(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	ix := profilemodel.NewDiffIndex(d)
+	ld := &liveDiff{d: d, ids: map[string]profilemodel.UnionID{}}
+	opts := DiffLiveOptions{Title: "b went down by 111", BaseName: "cpu.pb.gz", NewName: "cpu-new.pb.gz", MaxNodes: 4}
+	whole, err := DiffLiveModel(d, opts)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(whole, &ld.model))
+	ld.pub = &livePub{whole: whole, frames: map[string][]byte{}, focusAt: map[string][]byte{}}
+	for _, f := range d.Flatten().Nodes {
+		ld.ids[f.Name] = f.ID
+		ld.pub.frames[string(f.ID)], err = DiffLiveFrame(d, ix, f.ID)
+		require.NoError(t, err)
+		o := opts
+		o.Focus = f.ID
+		ld.pub.focusAt[string(f.ID)], err = DiffLiveModel(d, o)
+		require.NoError(t, err)
+	}
+	return ld
+}
+
+// diffState is a state showing p4, the diff, with node selected.
+func diffState(seq string, selected profilemodel.UnionID) []byte {
+	st := liveStateJSON{Seq: seq, Current: "p4", Selected: string(selected), Publications: []livePubEntry{{
+		ID: "p4", Kind: "diff", Title: "b went down by 111",
+		TitleSegs: titleSegments(ExplainedPageOptions{Title: "b went down by 111"}), View: "cpu/nanoseconds#0", History: "0",
+	}}}
+	out, err := json.Marshal(st)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+const factsProbe = `[...document.querySelectorAll('#facts .v')].map((e) => e.textContent + '|' + e.title).join('\n')`
+
 func TestLivePageInChrome(t *testing.T) {
 	c := startChrome(t)
 	f := newLiveFixture(t)
@@ -845,6 +898,96 @@ func TestLivePageInChrome(t *testing.T) {
 		d = tab.waitFor("seq 2 by polling", func(d liveDOM) bool { return d.SelName == "c" })
 		assert.Equal(t, "quiet", d.BannerKind)
 		assert.Equal(t, 0, s.streamCount())
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a diff publication is drawn and its nodes are shown", func(t *testing.T) {
+		ld := newLiveDiff(t)
+		s := newLiveServer(t)
+		s.pubs["p4"] = ld.pub
+		s.history["p4"] = []byte(`{"publication":"p4","version":"0","rows":[]}`)
+		s.state = diffState("1", ld.ids["b"])
+		s.sse = s.state
+		tab := c.open(t, s.url)
+
+		// b is not in the model: it comes from the frame route, by its
+		// union ID, which carries a slash.
+		d := tab.waitFor("b selected", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.Equal(t, []string{"all", "main", "a", "d"}, d.Frames)
+		assert.Equal(t, string(ld.ids["b"]), d.SelID)
+		assert.Equal(t, string(ld.ids["b"]), d.SelRef, "a node the model does not hold is named by its ID")
+		assert.Contains(t, s.servedPaths(), "pub/p4/frame/"+string(ld.ids["b"]))
+		facts := tab.eval(factsProbe)
+		assert.Contains(t, facts, "-111 nanoseconds (-111 ns)|", "the panel shows the engine's change")
+		assert.Contains(t, facts, "-11.1%|-0.111 ratio of view_total", "the share change has its exact digits in its title")
+		assert.Contains(t, facts, "unavailable: no work count")
+		refs := map[string]string{}
+		for _, f := range ld.model["frames"].([]any) {
+			fm := f.(map[string]any)
+			refs[str(fm, "name")] = str(fm, "ref")
+		}
+		assert.Equal(t, []string{refs["main"] + " main", refs["a"] + " a", string(ld.ids["b"]) + " b"}, d.Path)
+		assert.Equal(t, "b went down by 111", d.Title)
+		assert.Equal(t, []string{"111"}, d.Marks, "the agent's title has its numbers marked")
+		// Four frames are the budget of a static copy too, which draws six.
+		assert.Empty(t, d.Export, "no link to an export that would be refused")
+		assert.False(t, d.ExportHid)
+		assert.Contains(t, tab.eval(`document.getElementById('export').title`), "draws 6 nodes, over its budget of no limit on bytes and 4 nodes")
+		assert.Equal(t, "true", tab.eval(`document.getElementById('export').getAttribute('aria-disabled')`))
+		assert.Equal(t, []string{"Diff of two views: every figure is computed by perf-agent"}, d.Pills)
+		assert.Contains(t, d.Axis, "base 1000 nanoseconds (1.00 µs) · new 1000 nanoseconds (1.00 µs)")
+		assert.True(t, tab.eval(`String(document.getElementById('noexp').hidden)`) == "true", "a diff has no explanation to miss")
+		assert.Equal(t, "true", tab.eval(`String(document.getElementById('rows-sec').hidden)`))
+
+		// The frames are coloured by the model's hue and tint.
+		drawn := ld.model["drawn"].([]any)
+		for i, want := range drawn {
+			dm := want.(map[string]any)
+			got := tab.eval(fmt.Sprintf(`(() => { const e = document.querySelectorAll('#chart .frame')[%d]; return e.style.getPropertyValue('--h') + ' ' + e.style.getPropertyValue('--t') + ' ' + e.className + ' ' + e.title; })()`, i))
+			assert.Equal(t, str(dm, "hue")+" "+str(dm, "tint")+" frame "+str(dm, "cls")+" "+str(dm, "tip"), got, "frame %d", i)
+		}
+
+		// A drawn frame is selected locally, from the model.
+		tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === 'd').click(), ''`)
+		d = tab.waitFor("d clicked", func(d liveDOM) bool { return d.SelName == "d" })
+		assert.Equal(t, refs["d"], d.SelRef)
+		assert.Equal(t, []string{"d"}, d.Cur)
+		assert.Contains(t, tab.eval(factsProbe), "+111 nanoseconds (+111 ns)|")
+		assert.Contains(t, tab.eval(factsProbe), "only_new|")
+
+		// Focus draws a's subtree, b included, from the focus route.
+		tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === 'a').click(), ''`)
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		d = tab.waitFor("a's subtree", func(d liveDOM) bool { return slices.Equal(d.Frames, []string{"a", "b"}) })
+		assert.Contains(t, d.Axis, "widths relative to a")
+		tab.eval(`document.getElementById('whole-btn').click(), ''`)
+		tab.waitFor("the whole diff", func(d liveDOM) bool { return slices.Equal(d.Frames, []string{"all", "main", "a", "d"}) })
+
+		lines := strings.Split(tab.waitText(`(document.getElementById('probe') || {}).textContent || ''`), "\n")
+		require.Len(t, lines, 3)
+		assert.Equal(t, "0", lines[1], "no content-security-policy violation")
+		assert.Equal(t, 0, tab.dom().Violations)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a diff that fits offers its static copy", func(t *testing.T) {
+		ld := newLiveDiff(t)
+		whole, err := DiffLiveModel(ld.d, DiffLiveOptions{Title: "b went down by 111"})
+		require.NoError(t, err)
+		ld.pub.whole = whole
+		s := newLiveServer(t)
+		s.pubs["p4"] = ld.pub
+		s.history["p4"] = []byte(`{"publication":"p4","version":"0","rows":[]}`)
+		s.state = diffState("1", ld.ids["a"])
+		s.sse = s.state
+		tab := c.open(t, s.url)
+		d := tab.waitFor("a selected", func(d liveDOM) bool { return d.SelName == "a" })
+		assert.Equal(t, []string{"all", "main", "a", "b", "d", "c"}, d.Frames, "in pre-order, as the static copy nests them")
+		assert.Equal(t, "pub/p4/export", d.Export)
+		assert.False(t, d.ExportHid)
+		assert.Empty(t, tab.eval(`document.getElementById('export').title`))
+		assert.Equal(t, "null", tab.eval(`String(document.getElementById('export').getAttribute('aria-disabled'))`))
 		assert.Empty(t, tab.errors())
 	})
 

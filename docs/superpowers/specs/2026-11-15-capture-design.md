@@ -1507,9 +1507,11 @@ differences:
 build when a change adds a network client, a second listener, a raw system
 call or a process start outside the reviewed call sites, so such an
 addition is seen before it lands. It is not a defence against a committer
-set on evading it. It reads the packages linked for linux/amd64,
-linux/arm64 and darwin/arm64, and fails on cgo, go:linkname, assembly or
-object files for any target and on go/build, go/importer or plugin. It
+set on evading it. It reads every non-test Go file of the packages linked
+for linux/amd64, linux/arm64 and darwin/arm64 (a file for another target
+or a custom tag by the name rules only, and an import no target links is
+a finding), and fails on cgo, go:linkname, assembly or object files for
+any target and on go/build, go/importer or plugin. It
 resolves names with go/types and holds the reviewed files to exact shapes:
 `exec_linux.go` to `exec.Command(self)` in `selfCommand` and
 `exec.Command(path)` in `startPerfAgent`, each argument the function's own
@@ -1517,11 +1519,16 @@ parameter, never reassigned; `git.go` to `exec.LookPath("git")` and
 `exec.CommandContext(ctx, bin, argv...)` in `revParse`, `bin` the
 LookPath result; `launch_linux.go` to one `syscall.Exec` and the two prctl
 calls with `syscall.SYS_PRCTL` and package-level constants of the kernel's
-values declared in that file. No exec.Cmd literal is allowed anywhere, no
-Cmd's Path is ever set, and its Args, Env and Dir are set only in those
-two files. It tracks no values beyond these rules: what a reviewed helper
-is passed, a value returned or built at run time, reflect and unsafe are
-not followed, and string-building evasions (concatenated literals) are
+values declared in that file. `selfCommand` is called only from
+`startReaperProcess` and `startLauncher` with their own `self`, and
+`startPerfAgent` only from the reaper's `attach` with `r.spec.PerfAgent`,
+once each (CAP-R41); any other reference, a func value included, is a
+finding. No literal of exec.Cmd's struct is allowed anywhere, whatever
+the type is named, no Cmd's Path is ever set, and its Args, Env and Dir
+are set only in those two files. It tracks no values beyond these rules:
+what those callers are passed (the reaper's spec, and the callers of
+`startReaperProcess` and `startLauncher`), a value returned or built at
+run time, reflect and unsafe are not followed, and string-building evasions (concatenated literals) are
 out of scope; the shell-name rule matches whole literals only.
 
 ### 9.1 Client timeouts and progress (CAP-R8)

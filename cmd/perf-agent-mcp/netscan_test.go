@@ -3,13 +3,18 @@
 // than the reviewed one, a raw system call or a process start outside the
 // few reviewed call sites, so such an addition is seen before it lands.
 // It is not a defence against a committer set on evading it. It resolves
-// names with go/types and holds the reviewed files to the exact shapes
-// below, but it follows no values beyond those rules: what a reviewed
-// helper is passed, what a function returns, reflect and unsafe are not
-// tracked. String-building evasions (concatenated literals, bytes, a path
-// read at run time) are out of its scope: the shell rule matches whole
-// literals only. It reads the packages linked for linux/amd64,
-// linux/arm64 and darwin/arm64.
+// names with go/types and holds the reviewed files, and the calls of their
+// process-start helpers, to the exact shapes below, but it follows no
+// values beyond those rules: what the helpers' callers are passed (the
+// reaper's spec, startReaperProcess's and startLauncher's callers), what
+// a function returns, reflect and unsafe are not tracked. String-building
+// evasions (concatenated literals, bytes, a path read at run time) are
+// out of its scope: the shell rule matches whole literals only. It reads
+// every non-test Go file of the packages linked for linux/amd64,
+// linux/arm64 and darwin/arm64, a file for another target or a custom tag
+// included: those are held to the name rules only, as only the three
+// targets' files are type-checked, and an import of a non-standard
+// package none of the targets links is a finding.
 
 package main
 
@@ -47,14 +52,15 @@ import (
 
 // rawCalls are the syscall and x/sys/unix names that open or use a socket,
 // start a process behind the net and os/exec packages' backs, or change
-// the process's credentials or namespaces. The server's own system call
+// the process's credentials, namespaces or root. The server's own system call
 // uses are O_NONBLOCK and the SIGINT and SIGTERM constants.
 var rawCalls = []string{
 	"Socket", "Connect", "Bind", "Listen", "Sendto", "Sendmsg", "SendmsgN", "Sendmmsg",
 	"Syscall", "Syscall6", "RawSyscall", "RawSyscall6",
 	"AllThreadsSyscall", "AllThreadsSyscall6", "SyscallNoError", "RawSyscallNoError",
 	"ForkExec", "StartProcess", "Exec",
-	"Mount", "Unshare", "Setuid", "Setgid", "Setresuid", "Setresgid",
+	"Mount", "Unshare", "Chroot", "PivotRoot",
+	"Setuid", "Setgid", "Setresuid", "Setresgid", "Setreuid", "Setregid", "Setgroups", "Setfsuid", "Setfsgid",
 }
 
 // rawPackages are the packages rawCalls are denied in, and rawPrefixes
@@ -113,6 +119,7 @@ const (
 	commandFile  = "internal/capture/exec_linux.go"
 	gitFile      = "internal/sourceroot/git.go"
 	launchFile   = "internal/capture/launch_linux.go"
+	attachFile   = "internal/capture/internal_linux.go"
 	shellFreeDir = "internal/capture/"
 )
 
@@ -125,6 +132,26 @@ type allowedFiles struct {
 	exec    map[string]execRule
 	launch  string
 	noShell string
+	// helpers are the process-start helpers, by name, with their
+	// reviewed callers.
+	helpers map[string]helperRule
+	// covered are the import paths of the non-standard packages the scan
+	// reads; an import of another one is a finding. nil checks none.
+	covered map[string]bool
+}
+
+// helperRule is a process-start helper declared in file, and the only
+// calls of it allowed.
+type helperRule struct {
+	file  string
+	calls []helperCall
+}
+
+// helperCall is a reviewed call of a helper: once, in the function fn of
+// file, its first argument written exactly as arg0, whose variable (arg0's
+// root, for a field) is fn's receiver or parameter, never reassigned.
+type helperCall struct {
+	file, fn, arg0 string
 }
 
 // execRule is what a file allowed os/exec may use of it: the calls, each
@@ -166,6 +193,17 @@ var execRules = map[string]execRule{
 		},
 		types: []string{"ExitError"},
 	},
+}
+
+// helperRules are the helpers of commandFile that start a process: the
+// server's own executable from the reaper and launcher starts, and the
+// verified perf-agent from the reaper's attach.
+var helperRules = map[string]helperRule{
+	"selfCommand": {file: commandFile, calls: []helperCall{
+		{file: commandFile, fn: "startReaperProcess", arg0: "self"},
+		{file: commandFile, fn: "startLauncher", arg0: "self"},
+	}},
+	"startPerfAgent": {file: commandFile, calls: []helperCall{{file: attachFile, fn: "attach", arg0: "r.spec.PerfAgent"}}},
 }
 
 // advice is the advice of a finding in a file held to rule.
@@ -236,6 +274,8 @@ type scanned struct {
 	// seen in the launch file, in source order.
 	commands map[string][]string
 	launches []string
+	// helpers are the reviewed helper calls seen, as "fn: helper(arg0, …)".
+	helpers []string
 }
 
 // typeUnit is one package to type-check: its files for one target, the
@@ -408,6 +448,98 @@ func (s *scanner) check(u typeUnit) {
 			s.launchCalls(f, info, pkg, u.files[i], seen)
 		}
 	}
+	for _, helper := range slices.Sorted(maps.Keys(s.allow.helpers)) {
+		rule := s.allow.helpers[helper]
+		fn, ok := pkg.Scope().Lookup(helper).(*types.Func)
+		if !ok || s.display(s.fset.Position(fn.Pos()).Filename) != rule.file {
+			continue
+		}
+		s.helperCalls(files, u.files, info, fn, rule, seen)
+	}
+}
+
+// helperCalls allows the first call of fn by each of rule's callers whose
+// first argument is bound as the rule says, and reports every other
+// reference to fn in files, a func value included.
+func (s *scanner) helperCalls(files []*ast.File, paths []string, info *types.Info, fn *types.Func, rule helperRule, seen map[string]bool) {
+	allowed := map[*ast.Ident]bool{}
+	var only []string
+	for _, c := range rule.calls {
+		only = append(only, fmt.Sprintf("%s(%s, …) once in %s (%s)", fn.Name(), c.arg0, c.fn, c.file))
+	}
+	for i, f := range files {
+		name := s.display(paths[i])
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				id, ok := ast.Unparen(call.Fun).(*ast.Ident)
+				if !ok || info.Uses[id] != fn {
+					return true
+				}
+				arg0 := types.ExprString(call.Args[0])
+				i := slices.IndexFunc(rule.calls, func(c helperCall) bool { return c.file == name && c.fn == fd.Name.Name && c.arg0 == arg0 })
+				desc := fd.Name.Name + ": " + fn.Name() + "(" + arg0 + ", …)"
+				if i < 0 || seen[name+": "+desc] {
+					return true
+				}
+				allowed[id] = true
+				if why := ownArgument(fd, info, call.Args[0]); why != "" {
+					s.report(call, "%s in %s: %s", types.ExprString(call), fd.Name.Name, why)
+					return true
+				}
+				seen[name+": "+desc] = true
+				if !slices.Contains(s.out.helpers, desc) {
+					s.out.helpers = append(s.out.helpers, desc)
+				}
+				return true
+			})
+		}
+	}
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && info.Uses[id] == fn && !allowed[id] {
+				s.report(id, "references %s: only %s may", fn.Name(), strings.Join(only, " and "))
+			}
+			return true
+		})
+	}
+}
+
+// ownArgument says why arg, a variable or a field of one, is not fd's own
+// receiver or parameter left as it was given, or "".
+func ownArgument(fd *ast.FuncDecl, info *types.Info, arg ast.Expr) string {
+	root := ast.Unparen(arg)
+	for {
+		sel, ok := root.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		root = ast.Unparen(sel.X)
+	}
+	id, ok := root.(*ast.Ident)
+	v, isVar := info.Uses[id].(*types.Var)
+	if !ok || !isVar {
+		return fmt.Sprintf("%s is not a variable", types.ExprString(arg))
+	}
+	sig := info.Defs[fd.Name].(*types.Func).Signature()
+	own := slices.Collect(sig.Params().Variables())
+	if sig.Recv() != nil {
+		own = append(own, sig.Recv())
+	}
+	switch {
+	case !slices.Contains(own, v):
+		return fmt.Sprintf("%s is not a receiver or parameter of %s", id.Name, fd.Name.Name)
+	case assigned(fd.Body, info, v):
+		return fmt.Sprintf("%s is assigned again, or its address taken, in %s", id.Name, fd.Name.Name)
+	}
+	return ""
 }
 
 // cmdUses reports exec.Cmd literals, and the Cmd fields f sets that its
@@ -416,7 +548,9 @@ func (s *scanner) cmdUses(f *ast.File, info *types.Info, name string) {
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.CompositeLit:
-			if isExecCmd(info.TypeOf(n)) {
+			// A literal of Cmd's struct, whatever the type is named; its
+			// keys, being Cmd's fields, can only belong to that struct.
+			if t := info.TypeOf(n); isExecCmd(t) || hasCmdStruct(t) {
 				s.report(n, cmdLiteral)
 			}
 		case *ast.AssignStmt:
@@ -473,6 +607,19 @@ func isExecCmd(t types.Type) bool {
 	}
 	n, ok := types.Unalias(t).(*types.Named)
 	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == "os/exec" && n.Obj().Name() == "Cmd"
+}
+
+// hasCmdStruct reports whether t, or what it points to, has exec.Cmd's
+// struct as its underlying type, as a type defined from exec.Cmd does.
+func hasCmdStruct(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if p, ok := t.Underlying().(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	st, ok := t.Underlying().(*types.Struct)
+	return ok && st.NumFields() > 0 && isCmdField(st.Field(0))
 }
 
 // isCmdField reports whether field is one of os/exec Cmd's own fields.
@@ -709,6 +856,9 @@ func (s *scanner) syntax(file string) {
 		case p == "os/exec":
 			s.report(imp, "imports os/exec outside %s", strings.Join(slices.Sorted(maps.Keys(s.allow.exec)), " and "))
 		}
+		if first, _, _ := strings.Cut(p, "/"); s.allow.covered != nil && strings.Contains(first, ".") && !s.allow.covered[p] {
+			s.report(imp, "imports %s, which no scan target links, so the scan does not read it", p)
+		}
 		_, client := clientNames[p]
 		_, listen := listenNames[p]
 		n := path.Base(p)
@@ -931,6 +1081,34 @@ func listTargets(t *testing.T, dir, pattern string, env ...string) targetListing
 	return l
 }
 
+// covered is the set of l's packages.
+func (l targetListing) covered() map[string]bool {
+	out := map[string]bool{}
+	for p := range l.dirs {
+		out[p] = true
+	}
+	return out
+}
+
+// scanFiles are every non-test Go file of dirs, whatever its build
+// constraints.
+func scanFiles(t *testing.T, dirs map[string]string) []string {
+	t.Helper()
+	var files []string
+	for _, dir := range slices.Sorted(maps.Values(dirs)) {
+		matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range matches {
+			if !strings.HasSuffix(m, "_test.go") {
+				files = append(files, m)
+			}
+		}
+	}
+	return files
+}
+
 // TestNoClientNetworkingInTheServer reads the source of every non-standard
 // package the binary links on any scan target, internal/livehttp's
 // included, and finds no dial, name lookup, HTTP client, non-TCP socket or
@@ -951,19 +1129,9 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	for _, p := range listed.problems {
 		t.Error(p)
 	}
-	var files []string
-	for _, dir := range slices.Sorted(maps.Values(listed.dirs)) {
-		// Every non-test file, whatever its build constraints.
-		matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, m := range matches {
-			if !strings.HasSuffix(m, "_test.go") {
-				files = append(files, m)
-			}
-		}
-	}
+	// Every non-test file, whatever its build constraints, so a file for
+	// another target or a custom tag is read by the name rules too.
+	files := scanFiles(t, listed.dirs)
 	// The scanned set is the binary's, not this test's: go list -deps
 	// without -test leaves test files and test-only imports out. This file
 	// imports go/importer, so the process-package check above would also
@@ -993,6 +1161,7 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	}
 	got := scanNetworking(t, files, listed.units, display, allowedFiles{
 		listen: listenFile, exec: execRules, launch: launchFile, noShell: shellFreeDir,
+		helpers: helperRules, covered: listed.covered(),
 	})
 	for _, f := range got.findings {
 		t.Error(f)
@@ -1018,6 +1187,15 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	}
 	if want := []string{"syscall.RawSyscall(SYS_PRCTL, prSetNoNewPrivs)", "syscall.RawSyscall(SYS_PRCTL, prSetChildSubreaper)", "syscall.Exec"}; !slices.Equal(got.launches, want) {
 		t.Errorf("system calls in %s = %v, want exactly %v", launchFile, got.launches, want)
+	}
+	var helpers []string
+	for _, h := range slices.Sorted(maps.Keys(helperRules)) {
+		for _, c := range helperRules[h].calls {
+			helpers = append(helpers, c.fn+": "+h+"("+c.arg0+", …)")
+		}
+	}
+	if got := slices.Sorted(slices.Values(got.helpers)); !slices.Equal(got, slices.Sorted(slices.Values(helpers))) {
+		t.Errorf("helper calls = %v, want exactly %v", got, helpers)
 	}
 	t.Logf("scanned %d files in %d packages, %d type-checks over %v", len(files), len(listed.dirs), len(listed.units), scanTargets)
 }
@@ -1287,7 +1465,10 @@ func TestTheNetworkScanSeesHandBuiltCommands(t *testing.T) {
 			"func startPerfAgent(path string) *exec.Cmd {\n\tcmd := exec.Command(path)\n\tcmd.Args = []string{path}\n\tcmd.Env, cmd.Dir = nil, \"/\"\n\treturn cmd\n}\n" +
 			"func built() *exec.Cmd { return &exec.Cmd{Path: \"/bin/true\"} }\n" +
 			"func aliased() *alias { return &alias{} }\n" +
-			"func retarget(c *exec.Cmd) { c.Path = \"/bin/true\" }\n",
+			"func retarget(c *exec.Cmd) { c.Path = \"/bin/true\" }\n" +
+			"type cmdDef exec.Cmd\n" +
+			"func defined() *cmdDef { return &cmdDef{Path: \"/bin/true\"} }\n" +
+			"func definedEmpty() *cmdDef { return &cmdDef{} }\n",
 		"other.go": "package x\n" +
 			"func use() {\n\ttarget := selfCommand(\"/bin/true\", \"m\")\n" +
 			"\ttarget.Args = []string{\"x\"}\n" +
@@ -1303,6 +1484,8 @@ func TestTheNetworkScanSeesHandBuiltCommands(t *testing.T) {
 		"exec_linux.go:11: " + cmdLiteral,
 		"exec_linux.go:12: " + cmdLiteral,
 		"exec_linux.go:13: " + cmdPath,
+		"exec_linux.go:15: " + cmdLiteral,
+		"exec_linux.go:16: " + cmdLiteral,
 		"other.go:4: sets exec.Cmd.Args outside exec_linux.go and git.go",
 		"other.go:5: sets exec.Cmd.Env outside exec_linux.go and git.go",
 		"other.go:6: " + cmdPath,
@@ -1321,6 +1504,63 @@ func TestTheNetworkScanSeesHandBuiltCommands(t *testing.T) {
 	checkFindings(t, got.findings, []string{"exec_linux.go:3: " + cmdLiteral})
 }
 
+// The capture fixtures' process-start helpers and their reviewed callers.
+var helperFixtureRules = map[string]helperRule{
+	"selfCommand": {file: "exec_linux.go", calls: []helperCall{
+		{file: "exec_linux.go", fn: "startReaperProcess", arg0: "self"},
+		{file: "exec_linux.go", fn: "startLauncher", arg0: "self"},
+	}},
+	"startPerfAgent": {file: "exec_linux.go", calls: []helperCall{{file: "internal_linux.go", fn: "attach", arg0: "r.spec.PerfAgent"}}},
+}
+
+// selfCommand and startPerfAgent are called only from their reviewed
+// callers, once each, with the first argument the caller's own receiver
+// or parameter (or a field of it), never reassigned; any other reference,
+// a func value included, is a finding.
+func TestTheNetworkScanPinsTheHelperCalls(t *testing.T) {
+	allow := captureFixtureAllow
+	allow.helpers = helperFixtureRules
+	files := writeFixtures(t, map[string]string{
+		"exec_linux.go": "package x\nimport \"os/exec\"\n" +
+			"func selfCommand(self, mode string) *exec.Cmd { return exec.Command(self) }\n" +
+			"func startPerfAgent(path string) *exec.Cmd { return exec.Command(path) }\n" +
+			"func startReaperProcess(self string) *exec.Cmd { return selfCommand(self, \"r\") }\n" +
+			"func startLauncher(other string) *exec.Cmd {\n\tself := \"/bin/true\"\n\treturn selfCommand(self, \"l\")\n}\n",
+		"internal_linux.go": "package x\n" +
+			"type reaper struct{ spec struct{ PerfAgent, Other string } }\n" +
+			"func (r *reaper) attach() {\n\t_ = startPerfAgent(r.spec.PerfAgent)\n\t_ = startPerfAgent(r.spec.PerfAgent)\n\t_ = startPerfAgent(r.spec.Other)\n}\n" +
+			"func (r *reaper) other() { _ = startPerfAgent(\"/bin/true\") }\n",
+		"other.go": "package x\nvar f = selfCommand\nfunc g() { _ = startPerfAgent(\"/bin/true\") }\n",
+	})
+	got := scanNetworking(t, files, []typeUnit{fixtureUnit(files...)}, filepath.Base, allow)
+	onlySelf := "references selfCommand: only selfCommand(self, …) once in startReaperProcess (exec_linux.go) and selfCommand(self, …) once in startLauncher (exec_linux.go) may"
+	onlyPerf := "references startPerfAgent: only startPerfAgent(r.spec.PerfAgent, …) once in attach (internal_linux.go) may"
+	checkFindings(t, got.findings, []string{
+		`exec_linux.go:8: selfCommand(self, "l") in startLauncher: self is not a receiver or parameter of startLauncher`,
+		"internal_linux.go:5: " + onlyPerf,
+		"internal_linux.go:6: " + onlyPerf,
+		"internal_linux.go:8: " + onlyPerf,
+		"other.go:2: " + onlySelf,
+		"other.go:3: " + onlyPerf,
+	})
+	if want := []string{"startReaperProcess: selfCommand(self, …)", "attach: startPerfAgent(r.spec.PerfAgent, …)"}; !slices.Equal(got.helpers, want) {
+		t.Errorf("helpers = %v, want %v", got.helpers, want)
+	}
+
+	// A receiver reassigned before the call is not the caller's own.
+	files = writeFixtures(t, map[string]string{
+		"exec_linux.go": "package x\nimport \"os/exec\"\n" +
+			"func startPerfAgent(path string) *exec.Cmd { return exec.Command(path) }\n",
+		"internal_linux.go": "package x\n" +
+			"type reaper struct{ spec struct{ PerfAgent string } }\n" +
+			"func (r *reaper) attach() {\n\tr = &reaper{}\n\t_ = startPerfAgent(r.spec.PerfAgent)\n}\n",
+	})
+	got = scanNetworking(t, files, []typeUnit{fixtureUnit(files...)}, filepath.Base, allow)
+	checkFindings(t, got.findings, []string{
+		"internal_linux.go:5: startPerfAgent(r.spec.PerfAgent) in attach: r is assigned again, or its address taken, in attach",
+	})
+}
+
 // go/build, go/importer and plugin may not be imported, nor os/exec dot
 // imported even where it is allowed; the ptrace wrappers, the other raw
 // call forms and the credential and namespace calls are denied.
@@ -1332,8 +1572,9 @@ func TestTheNetworkScanDeniesMoreProcessStarts(t *testing.T) {
 			"var _ = sc.AllThreadsSyscall\nvar _ = sc.AllThreadsSyscall6\n" +
 			"var _ = sc.PtraceAttach\nvar _ = sc.PtracePokeText\n" +
 			"var _ = sc.Mount\nvar _ = sc.Unshare\n" +
-			"var _ = sc.Setuid\nvar _ = sc.Setgid\nvar _ = sc.Setresuid\nvar _ = sc.Setresgid\n",
-		"s.go":   "package x\nimport u \"golang.org/x/sys/unix\"\nvar _ = u.SyscallNoError\nvar _ = u.RawSyscallNoError\nvar _ = u.PtraceSetRegs\n",
+			"var _ = sc.Setuid\nvar _ = sc.Setgid\nvar _ = sc.Setresuid\nvar _ = sc.Setresgid\n" +
+			"var _ = sc.Setreuid\nvar _ = sc.Setregid\nvar _ = sc.Setgroups\nvar _ = sc.Setfsuid\nvar _ = sc.Setfsgid\nvar _ = sc.Chroot\n",
+		"s.go":   "package x\nimport u \"golang.org/x/sys/unix\"\nvar _ = u.SyscallNoError\nvar _ = u.RawSyscallNoError\nvar _ = u.PtraceSetRegs\nvar _ = u.PivotRoot\n",
 		"git.go": "package x\nimport . \"os/exec\"\nvar _ *ExitError\n",
 	})
 	got := scanNetworking(t, files, nil, filepath.Base, allowedFiles{listen: "listen.go", exec: gitOnly})
@@ -1352,9 +1593,16 @@ func TestTheNetworkScanDeniesMoreProcessStarts(t *testing.T) {
 		"r.go:10: uses syscall.Setgid",
 		"r.go:11: uses syscall.Setresuid",
 		"r.go:12: uses syscall.Setresgid",
+		"r.go:13: uses syscall.Setreuid",
+		"r.go:14: uses syscall.Setregid",
+		"r.go:15: uses syscall.Setgroups",
+		"r.go:16: uses syscall.Setfsuid",
+		"r.go:17: uses syscall.Setfsgid",
+		"r.go:18: uses syscall.Chroot",
 		"s.go:3: uses golang.org/x/sys/unix.SyscallNoError",
 		"s.go:4: uses golang.org/x/sys/unix.RawSyscallNoError",
 		"s.go:5: uses golang.org/x/sys/unix.PtraceSetRegs",
+		"s.go:6: uses golang.org/x/sys/unix.PivotRoot",
 	})
 }
 
@@ -1433,6 +1681,11 @@ func TestTheScanListsEveryTarget(t *testing.T) {
 		"mac/mac.go":      "package mac\n\nimport _ \"plugin\"\n",
 		"arm/arm.go":      "package arm\n",
 		"arm/arm_ppc64.s": "\n",
+		// Files no scan target builds are read by the name rules, and an
+		// import only they add is not read at all: a finding.
+		"main_linux_riscv64.go": "package main\n\nimport _ \"example.com/targets/riscv\"\n",
+		"riscv/riscv.go":        "package riscv\n",
+		"tagged.go":             "//go:build customtag\n\npackage main\n\nimport _ \"net/smtp\"\n",
 	})
 	l := listTargets(t, dir, ".", "GOFLAGS=", "GOWORK=off", "GOTOOLCHAIN=local")
 	if got, want := slices.Sorted(maps.Keys(l.dirs)), []string{"example.com/targets", "example.com/targets/arm", "example.com/targets/mac"}; !slices.Equal(got, want) {
@@ -1456,8 +1709,15 @@ func TestTheScanListsEveryTarget(t *testing.T) {
 	if !slices.Equal(checks, want) {
 		t.Errorf("type-checks %v, want %v", checks, want)
 	}
-	// Each target's files type-check, plugin and all.
-	_ = scanNetworking(t, nil, l.units, filepath.Base, allowedFiles{})
+	// Each target's files type-check, plugin and all; every Go file of
+	// the covered packages is read, whatever its build constraints.
+	display := func(f string) string { rel, _ := filepath.Rel(dir, f); return filepath.ToSlash(rel) }
+	got := scanNetworking(t, scanFiles(t, l.dirs), l.units, display, allowedFiles{covered: l.covered()})
+	checkFindings(t, got.findings, []string{
+		"mac/mac.go:3: imports plugin, which can start a process or load code",
+		"main_linux_riscv64.go:3: imports example.com/targets/riscv, which no scan target links, so the scan does not read it",
+		"tagged.go:5: imports net/smtp",
+	})
 }
 
 // procSocket is one row of /proc/<pid>/net/{tcp,tcp6,udp,udp6}.

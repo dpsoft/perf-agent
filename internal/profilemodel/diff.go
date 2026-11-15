@@ -212,6 +212,8 @@ type Diff struct {
 	// is OK do nodes carry DeltaPerUnit.
 	PerUnit Availability `json:"per_unit"`
 	Root    *DiffNode    `json:"root"`
+	// retained is RetainedBytes, set once Compare has built the union.
+	retained int64
 }
 
 // ErrIncompatibleViews is returned when the views differ in sample type,
@@ -261,6 +263,9 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 	}
 	d := &differ{views: [2]*View{baseView, newView}, work: [2]float64{work.Base, work.New}}
 	d.perUnit = workAvailability(d.work)
+	if d.perUnit.OK {
+		d.perUnitUnit = baseView.Unit + "/work"
+	}
 	roots := [2]*Node{baseView.Root, newView.Root}
 	top := d.basisOf(roots)
 	root, err := d.node(roots, "", nil, top, nil)
@@ -273,7 +278,7 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 			return nil, err
 		}
 	}
-	return &Diff{
+	out := &Diff{
 		BaseHandle:      baseView.Handle,
 		NewHandle:       newView.Handle,
 		View:            baseView.name(),
@@ -288,7 +293,9 @@ func Compare(baseView, newView *View, work WorkCounts) (*Diff, error) {
 		NewNotes:        notes[newSide],
 		PerUnit:         d.perUnit,
 		Root:            root,
-	}, nil
+	}
+	out.retained = diffRetained(out)
+	return out, nil
 }
 
 // viewSamplingNotes is the view-level sampling note text PathFacts.Notes
@@ -312,6 +319,9 @@ type differ struct {
 	views   [2]*View
 	work    [2]float64
 	perUnit Availability
+	// perUnitUnit is the per-unit deltas' unit, "<unit>/work", built once
+	// and shared by every node: a long sample unit is held once.
+	perUnitUnit string
 }
 
 func (d *differ) gpu() bool { return d.views[baseSide].SampleType == gpuSampleType }
@@ -479,7 +489,7 @@ func (d *differ) perUnitDelta(cum [2]int64) *Fact {
 	if !d.perUnit.OK {
 		return nil
 	}
-	unit := d.views[baseSide].Unit + "/work"
+	unit := d.perUnitUnit
 	delta := float64(cum[newSide])/d.work[newSide] - float64(cum[baseSide])/d.work[baseSide]
 	if math.IsInf(delta, 0) || math.IsNaN(delta) {
 		return new(unavailableFact(MetricPerWorkDelta, unit, ReasonNonFinite))

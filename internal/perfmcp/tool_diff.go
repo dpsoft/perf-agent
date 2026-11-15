@@ -168,6 +168,52 @@ func workArg(name string, w *float64) error {
 	return nil
 }
 
+// diffSide is one side of a comparison: the entry of its handle and its
+// view.
+type diffSide struct {
+	e *entry
+	v *profilemodel.View
+}
+
+// diffSides checks q's work counts and finds both of its views, with
+// diff's errors.
+func (s *Server) diffSides(q diffQuery) (base, next diffSide, err error) {
+	if err := errors.Join(workArg("work_base", q.WorkBase), workArg("work_new", q.WorkNew)); err != nil {
+		return diffSide{}, diffSide{}, err
+	}
+	base.e, base.v, err = s.store.view(q.BaseHandle, q.BaseView)
+	if err != nil {
+		return diffSide{}, diffSide{}, fmt.Errorf("base: %w", err)
+	}
+	next.e, next.v, err = s.store.view(q.NewHandle, q.NewView)
+	if err != nil {
+		return diffSide{}, diffSide{}, fmt.Errorf("new: %w", err)
+	}
+	return base, next, nil
+}
+
+// compare compares the views of q's sides, which diffSides found,
+// uncached: every error is diff's, word for word. It returns the whole
+// union, which a publication pins with both sides.
+func (s *Server) compare(q diffQuery, base, next diffSide) (*profilemodel.Diff, error) {
+	var work profilemodel.WorkCounts
+	if q.WorkBase != nil {
+		work.Base = *q.WorkBase
+	}
+	if q.WorkNew != nil {
+		work.New = *q.WorkNew
+	}
+	d, err := profilemodel.Compare(base.v, next.v, work)
+	if errors.Is(err, profilemodel.ErrIncompatibleViews) {
+		return nil, fmt.Errorf("cannot diff view %s of %s against view %s of %s: %v; pick views with the same sample type, unit and index",
+			q.BaseView, q.BaseHandle, q.NewView, q.NewHandle, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot diff the views: %v; call open again for both profiles and retry, and report this if it repeats", err)
+	}
+	return d, nil
+}
+
 func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	var a diffArgs
 	if err := decodeArgs("diff", raw, &a); err != nil {
@@ -180,35 +226,19 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 		}
 		limit = *a.Limit
 	}
-	if err := errors.Join(workArg("work_base", a.WorkBase), workArg("work_new", a.WorkNew)); err != nil {
+	q := diffQuery{BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew}
+	// The sides are checked on a cache hit too: a handle evicted since
+	// is not open, whatever the cache still holds.
+	base, next, err := s.diffSides(q)
+	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	_, bv, err := s.store.view(a.BaseHandle, a.BaseView)
-	if err != nil {
-		return mcpstdio.Result{}, fmt.Errorf("base: %w", err)
-	}
-	_, nv, err := s.store.view(a.NewHandle, a.NewView)
-	if err != nil {
-		return mcpstdio.Result{}, fmt.Errorf("new: %w", err)
-	}
-	q := diffQuery{BaseHandle: a.BaseHandle, BaseView: a.BaseView, NewHandle: a.NewHandle, NewView: a.NewView, WorkBase: a.WorkBase, WorkNew: a.WorkNew}
 	key := diffKey(q)
 	d, ok := s.diffs.get(key)
 	if !ok {
-		var work profilemodel.WorkCounts
-		if a.WorkBase != nil {
-			work.Base = *a.WorkBase
-		}
-		if a.WorkNew != nil {
-			work.New = *a.WorkNew
-		}
-		full, err := profilemodel.Compare(bv, nv, work)
-		if errors.Is(err, profilemodel.ErrIncompatibleViews) {
-			return mcpstdio.Result{}, fmt.Errorf("cannot diff view %s of %s against view %s of %s: %v; pick views with the same sample type, unit and index",
-				a.BaseView, a.BaseHandle, a.NewView, a.NewHandle, err)
-		}
+		full, err := s.compare(q, base, next)
 		if err != nil {
-			return mcpstdio.Result{}, fmt.Errorf("cannot diff the views: %v; call open again for both profiles and retry, and report this if it repeats", err)
+			return mcpstdio.Result{}, err
 		}
 		flat := full.Flatten()
 		d = &flat
@@ -229,7 +259,7 @@ func (s *Server) handleDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	}
 	// Like every other tool, a diff of CPU views has no notes keys and one
 	// of GPU views always has them.
-	if bv.IsGPU() {
+	if base.v.IsGPU() {
 		out.BaseNotes, out.NewNotes = nonNil(d.BaseNotes), nonNil(d.NewNotes)
 	}
 	for _, n := range pg {

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>perf-agent live page</title>
+<link rel="stylesheet" href="assets/live.css">
+<script src="assets/panel.js" defer></script>
+<script src="assets/live.js" defer></script>
+</head>
+<body>
+<header class="top">
+<span class="brand"><b>perf-agent</b><i>Enjoy the Flames.</i></span>
+<h1 id="title">perf-agent live page</h1>
+<span class="readout">View <b id="view">none yet</b></span>
+<div class="prov" id="pills"></div>
+</header>
+<div id="banner" role="status" aria-live="polite" hidden></div>
+<nav id="pubs" aria-label="Publications"></nav>
+<div class="legend" id="legend" aria-label="Colour key"></div>
+<section class="notes" id="notes" aria-label="Sampling notes" hidden></section>
+<main class="body">
+<div class="graph">
+<p class="muted" id="waiting">Waiting for your agent to publish a page (page_explain or page_diff).</p>
+<p class="muted" id="load-note" hidden></p>
+<div class="chips" id="views"><button type="button" class="chip" id="focus-btn" disabled>Focus here</button><button type="button" class="chip" id="whole-btn" disabled>Whole view</button><a class="chip" id="export" download hidden>Download a static copy</a></div>
+<div class="canvas"><div class="chart" id="chart"></div></div>
+<div class="axis" id="axis"></div>
+<div id="left-out"></div>
+<section id="rows-sec" aria-label="Paths the agent explained"><h4>Paths the agent explained</h4>
+<div id="rows"></div>
+</section>
+<section id="quality-sec" aria-label="Quality summary"><h4>Quality summary</h4>
+<div class="qgrid" id="quality"></div>
+</section>
+</div>
+<aside class="side" aria-label="Selected frame">
+<div class="hd"><div class="lbl">Frame details · <span class="ref" id="sel-ref"></span></div><div class="nm" id="sel-name"></div><div class="nid" id="sel-id"></div></div>
+<section class="sec"><h5>Profile facts — computed by perf-agent</h5>
+<div class="facts" id="facts"></div>
+</section>
+<div id="exp"></div>
+<p class="sec muted" id="noexp" hidden>The agent did not explain this frame: these are the profile's facts only.</p>
+<div id="rejected"></div>
+<section class="sec"><h5>Path (root → frame)</h5>
+<ol class="path" id="path"></ol>
+</section>
+<section class="sec" id="followup"><h5>Follow up in your agent</h5>
+<p class="muted">Copies a question to paste into your MCP client, with the profile and the frame already named.</p>
+<div class="chips" id="chips"></div>
+<textarea id="copybox" rows="3" readonly hidden aria-label="Prompt to copy"></textarea>
+</section>
+</aside>
+</main>
+<footer class="foot" id="foot"></footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

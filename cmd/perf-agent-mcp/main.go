@@ -1,6 +1,7 @@
 // Command perf-agent-mcp serves perf-agent profiles to an MCP client over
-// stdio. It is read-only, needs no capabilities and opens no network
-// connection; the only files it writes are pages under --output.
+// stdio. It is read-only, needs no capabilities and never opens an outgoing
+// connection and opens no listener; the only files it writes are pages under
+// --output.
 package main
 
 import (
@@ -24,6 +25,11 @@ import (
 
 // version is reported in serverInfo and by --version.
 var version = "dev"
+
+// configHook, when set, adjusts the server's configuration before it is
+// built. The command sets none; tests use it to run the live page engine,
+// which the stdio server does not expose.
+var configHook func(*perfmcp.Config)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -93,7 +99,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 
 	log := slog.New(slog.NewTextHandler(stderr, nil))
-	srv, err := perfmcp.New(perfmcp.Config{
+	cfg := perfmcp.Config{
 		ProfilesDir:     *profiles,
 		SourceDirs:      sources,
 		SourceManifests: manifests,
@@ -102,7 +108,11 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		Limits:          lim,
 		Version:         version,
 		Log:             log,
-	})
+	}
+	if configHook != nil {
+		configHook(&cfg)
+	}
+	srv, err := perfmcp.New(cfg)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: %v\n", err)
 		return 1

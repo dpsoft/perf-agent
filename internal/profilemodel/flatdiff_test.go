@@ -123,7 +123,8 @@ func TestFlattenCarriesEveryField(t *testing.T) {
 			}
 			dv, fv := reflect.ValueOf(*d), reflect.ValueOf(f)
 			for _, sf := range reflect.VisibleFields(reflect.TypeFor[Diff]()) {
-				if sf.Name == "Root" {
+				// The memory estimate is bookkeeping, not part of the diff.
+				if sf.Name == "Root" || !sf.IsExported() {
 					continue
 				}
 				ff, ok := reflect.TypeFor[FlatDiff]().FieldByName(sf.Name)

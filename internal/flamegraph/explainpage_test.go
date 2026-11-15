@@ -378,12 +378,11 @@ func modelJSONText(t *testing.T, page string) string {
 }
 
 func TestExplainedPageScriptUsesTextContentOnly(t *testing.T) {
-	src, err := os.ReadFile("explainpage.js")
-	require.NoError(t, err)
+	src := explainPageScript
 	for _, forbidden := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "fetch(", "XMLHttpRequest"} {
-		assert.NotContains(t, string(src), forbidden)
+		assert.NotContains(t, src, forbidden)
 	}
-	assert.Contains(t, string(src), "textContent")
+	assert.Contains(t, src, "textContent")
 }
 
 func TestExplainedPageRefusesAFailedCheckAndANilView(t *testing.T) {
@@ -504,11 +503,10 @@ func TestExplainedPageCountsRejectedClaimsApartFromReferences(t *testing.T) {
 func TestExplainedPageHeadingsSayWhoseTextItIs(t *testing.T) {
 	v, _, r := cpuBasicExplained(t)
 	got := exPage(t, v, r, exOpts())
-	src, err := os.ReadFile("explainpage.js")
-	require.NoError(t, err)
+	src := explainPageScript
 	for _, h := range []string{"Hypotheses — the agent's, not measured", "Next measurement — the agent's suggestion, not verified"} {
 		assert.Contains(t, got, h)
-		assert.Contains(t, string(src), h)
+		assert.Contains(t, src, h)
 	}
 }
 
@@ -527,9 +525,8 @@ func TestExplainedPageBoundsTheNameInPrompts(t *testing.T) {
 	for _, p := range prompts {
 		assert.NotContains(t, html.UnescapeString(p[1]), string([]rune(long)[:201]))
 	}
-	src, err := os.ReadFile("explainpage.js")
-	require.NoError(t, err)
-	assert.Contains(t, string(src), "200", "the script bounds the name the same way")
+	src := explainPageScript
+	assert.Contains(t, src, "200", "the script bounds the name the same way")
 }
 
 // wideView is a view of at least frames nodes with names of nameLen bytes
@@ -921,4 +918,26 @@ func TestExplainedPageMarksNumbersInTheTitle(t *testing.T) {
 	h1 = regexp.MustCompile(`(?s)<h1>(.*?)</h1>`).FindStringSubmatch(exPage(t, v, r, opts))
 	require.Len(t, h1, 2)
 	assert.Equal(t, "cpu-2026.pb.gz", h1[1])
+}
+
+func TestShownClaimNamesTheUnitsItShows(t *testing.T) {
+	for _, tc := range []struct {
+		e     explain.EngineValue
+		text  string
+		units []string
+	}{
+		{explain.EngineValue{Unit: "ratio", Value: "0.411", Status: "ok"}, "41.1%", []string{"%"}},
+		{explain.EngineValue{Unit: "ratio", Value: "0.000", Status: "ok"}, "0.0%", []string{"%"}},
+		{explain.EngineValue{Unit: "ratio", Value: "0.000", Status: "zero"}, "0", nil},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "411", Status: "ok"}, "411 ns", []string{"ns", "µs", "ms", "s"}},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "1500000", Status: "ok"}, "1.50 ms", []string{"ns", "µs", "ms", "s"}},
+		{explain.EngineValue{Unit: "bytes", Value: "1234", Status: "ok"}, "1,234 bytes", []string{"bytes"}},
+		{explain.EngineValue{Unit: "count", Value: "3", Status: "ok"}, "3", nil},
+		{explain.EngineValue{Unit: "nanoseconds", Value: "0", Status: "zero"}, "0", nil},
+		{explain.EngineValue{Unit: "nanoseconds", Status: "unavailable", Reason: "not a GPU view"}, "unavailable: not a GPU view", nil},
+	} {
+		text, units := ShownClaim(tc.e)
+		assert.Equal(t, tc.text, text)
+		assert.Equal(t, tc.units, units, tc.text)
+	}
 }

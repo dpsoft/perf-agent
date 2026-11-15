@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only, offline, needs no capabilities, checks every figure an agent
   states against the engine, and is built from source only. See
   [docs/mcp.md](docs/mcp.md).
+- The live page (`page_open`, `page_explain`, `page_diff`, `page_show`) is
+  not exposed by the stdio `perf-agent-mcp`, which has no `--live` flag and
+  opens no listener; it will ship with a separate serve binary. Limits
+  `MaxPublications`, `MaxRetainedBytes` and `MaxPageClients` are kept for it.
 
 ## [1.5.2] - 2026-11-12
 

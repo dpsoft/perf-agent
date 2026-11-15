@@ -1,10 +1,10 @@
 # perf-agent-mcp
 
-`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles. It speaks MCP over stdio only, is read-only and works offline. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written.
+`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles. It speaks MCP over stdio only, is read-only and works offline. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written or published. A live page that a browser on the same machine reads will ship with a separate serve binary, not this one.
 
 ## What it does not do
 
-- It opens no network connection and links neither `net`, `net/http` nor `crypto/tls`. A test checks this.
+- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It opens no listener: nothing in this process serves HTTP, and the stdio server registers no `page_*` tool. The live page engine is compiled in as library code for the future serve binary, so the binary still links `net/http` until that split. Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls and listening calls, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback.
 - It captures nothing: it never starts the perf-agent profiler, links neither `perfagent` nor `cilium/ebpf`, and needs no capabilities.
 - It writes only pages under `--output`, and never replaces an existing file.
 - It is not shipped in releases, release archives or container images. Build it from source.
@@ -53,7 +53,7 @@ Arguments match by exact name; an unknown argument, a name given twice or a diff
 | `source` | Source lines for a node and how well they are tied to the profiled build. |
 | `render_flamegraph` | Check explanations and write an explained flame graph page. |
 
-Every tool takes `handle` and `view` (a view name `open` returned, such as `cpu/nanoseconds#0`) unless noted. One example call of each, as `arguments`:
+Every tool takes `handle` and `view` (a view name `open` returned, such as `cpu/nanoseconds#0`) unless noted: `open` takes a `path`, `diff` takes a base and a new handle and view. One example call of each, as `arguments`:
 
 ```json
 open               {"path": "cpu.pb.gz", "execlog": "run.execlog"}
@@ -66,7 +66,7 @@ diff               {"base_handle": "<handle>", "base_view": "cpu/nanoseconds#0",
 source             {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>", "context": 5}
 ```
 
-`render_flamegraph` has its own example under Explanations. `execlog`, `work_base`, `work_new` and `context` are optional; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
+`render_flamegraph` has its own example under Explanations. `execlog`, `work_base`, `work_new`, `context`, `title`, `focus` are optional; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
 
 Lists carry `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (the sum of the omitted rows' own values, which overlap, so never a remaining share), `omitted_weight_basis` (which value was summed: `cum`, `self`, `abs_delta` or `value`) and `next_cursor`; pass the cursor back with the same arguments.
 
@@ -91,10 +91,14 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 - Prose, hypotheses and `next_measurement` place figures with `{cN}`, a claim of the same explanation, and frames with `{n:<id>}`. Any other number is shown as unchecked. Every claim must be placed by its `{cN}`; a claim placed nowhere is rejected as `unplaced_claim`, so the page's checked count is the figures it shows.
 - Only node facts are claimable: what `top` with `rows: "nodes"`, `path` and `facts` give for a node. Function aggregates (`top` with `rows: "functions"`, `sandwich`) are not.
 - A claim's `metric` is a claimable metric name (the guide lists them), not a path in the `facts` JSON: `serialization.true` is `serialization_true`, `quality.serialized.true` is `quality_serialized_true`. Quality metrics take `"scope": "node"` or `"scope": "view"`; `quality_unresolved_by_module` also needs `module`. `unsampled_portion` is view-level only: claim it with `"scope": "view"` and no node.
-- A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning is rejected as `glued_to_claim`: a sign, digit or decimal point before it, and after it anything but a space, the end of the text or closing punctuation (`. , ; : ! ? …`, a closing bracket or quote). A claim shows its own unit, so a `%`, `‰`, unit or letter in any script after it is glued.
+- A range is written "between {c1} and {c2}". Text glued to a placeholder that changes its meaning is rejected as `glued_to_claim`: a sign, digit or decimal point before it, and after it anything but a space, the end of the text or closing punctuation (`. , ; : ! ? …`, a closing bracket or quote). A claim shows its own unit, so a `%`, `‰`, unit or letter in any script after it is glued. A unit the claim already shows, written after the placeholder and a space ("{c2} ns"), is not refused: the result's `notices` carry a `unit_repeated` notice at that text's path.
 - `title` is free text of at most `Explain.MaxTitleBytes` bytes with no placeholders; a longer one or one with a placeholder is refused before any attempt is recorded. Numbers in it are marked unchecked in the page's heading and counted in `unchecked_numbers`.
 - The page's follow-up prompts name the profile's path relative to the profiles root and its `profile_digest`: whoever follows one opens that path and checks the digest matches.
-- If anything fails, nothing is written. The result is `rejected`, lists every failure (with the engine's value when one can be computed; the result is itself bounded by `MaxResponseBytes`), and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view.
+- If anything fails, nothing is written. The result is `rejected`, lists every failure (with the engine's value when one can be computed; the result is itself bounded by `MaxResponseBytes`), and returns an `attempt` to pass when retrying. The page lists earlier rejected attempts for the same profile and view, made through any handle. That history is bounded (`MaxAttemptsPerView`, `MaxAttemptViews`, `MaxHistoryBytes` and the page's own size): what it leaves out, the page counts.
+
+## Live page
+
+The live page, a read-only page a browser on the same machine reads while the agent explains profiles, will ship with a separate long-lived serve binary. The stdio server has no `--live` flag, registers no `page_*` tool and opens no listener.
 
 ## Agent skill
 
@@ -155,6 +159,9 @@ Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must 
 | `MaxAttemptsPerView` | 20 |
 | `MaxAttemptViews` | 64 |
 | `MaxHistoryBytes` (all attempt records) | 4194304 (4 MiB) |
+| `MaxPublications` (live page publications kept) | 8 |
+| `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; at least `MaxPageBytes`); used by the live page engine, not by the stdio server | 2147483648 (2 GiB) |
+| `MaxPageClients` (live page streams at once) | 4 |
 | `Source.MaxFileBytes` | 8388608 (8 MiB) |
 | `Source.MaxLineBytes` | 512 |
 | `Source.MaxContext` | 50 |

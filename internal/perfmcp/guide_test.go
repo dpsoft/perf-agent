@@ -11,6 +11,9 @@ import (
 )
 
 func TestGuideIsShortAndStatesTheRules(t *testing.T) {
+	if strings.Contains(guideText, "page_") || strings.Contains(guideText, "--live") {
+		t.Error("the stdio guide mentions the live page, which this server does not expose")
+	}
 	if len(guideText) > 12288 {
 		t.Errorf("guide is %d bytes, want at most 12288", len(guideText))
 	}
@@ -29,6 +32,7 @@ func TestGuideIsShortAndStatesTheRules(t *testing.T) {
 		"`unplaced_claim`",
 		"`Explain.MaxTitleBytes`",
 		"check that `profile_digest` matches",
+		"the page lists the rejections the server kept and counts the ones it left out",
 	} {
 		if !strings.Contains(guideText, want) {
 			t.Errorf("guide does not contain %q", want)

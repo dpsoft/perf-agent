@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
@@ -21,7 +24,26 @@ import (
 var explainPageSource string
 
 //go:embed explainpage.js
-var explainPageScript string
+var explainPageWiring string
+
+//go:embed explainpanel.js
+var explainPanelScript string
+
+//go:embed explainpage.css
+var explainPageCSS string
+
+// explainPageScript is the static page's inline script: the shared panel
+// and the wiring that drives it.
+var explainPageScript = explainPanelScript + "\n" + explainPageWiring
+
+// explainedCSS is the explained page's stylesheet with the light and dark
+// chrome in place of their markers. It is computed once.
+var explainedCSS = sync.OnceValue(func() string {
+	return strings.NewReplacer(
+		"/*LIGHT*/", string(lightChrome),
+		"/*DARK*/", darkChrome,
+	).Replace(explainPageCSS)
+})
 
 var explainPageTmpl = template.Must(template.New("explainpage").Parse(explainPageSource))
 
@@ -67,6 +89,12 @@ type ExplainedPageOptions struct {
 	// HistoryIncomplete says the server may have lost count of earlier
 	// attempts of this view; the page says so.
 	HistoryIncomplete bool
+	// LiveHistory words the rejected attempts for a live publication's
+	// history, which follows the server's record: it holds the attempts on
+	// the profile and view made before the publication and after it, so
+	// the page does not call them earlier attempts or itself the attempt
+	// that passed. render_flamegraph's page leaves it false.
+	LiveHistory bool
 	// MaxNodes bounds the frames drawn; 0 means defaultExplainedMaxNodes.
 	// Explained and referenced nodes and their callers are always drawn.
 	MaxNodes int
@@ -110,7 +138,11 @@ type exFactRow struct {
 
 // exQualityRow is one quality fact with its status.
 type exQualityRow struct {
-	Label, Value, Title, Status, Note string
+	Label  string `json:"k"`
+	Value  string `json:"v"`
+	Title  string `json:"t"`
+	Status string `json:"s"`
+	Note   string `json:"n"`
 }
 
 // exSegment is one piece of agent text ready to show: the engine's value
@@ -145,6 +177,7 @@ type exFrame struct {
 	// Extra are the facts only an explained frame shows.
 	Extra       []exFactRow     `json:"extra,omitzero"`
 	Explanation []exExplanation `json:"explanation,omitzero"`
+	index       int             // its index in the builder's frames
 }
 
 // exPromptPart is a literal piece of a follow-up prompt or a slot the
@@ -167,43 +200,77 @@ type exModel struct {
 	Prompts  []exPrompt  `json:"prompts"`
 }
 
-// exDrawn is one frame div.
+// exDrawn is one frame div. Its name is the model frame's, so the live
+// model leaves it out.
 type exDrawn struct {
-	I, Class, Left, Width, Top, Domain, Resolution, Name, Tip string
-	Star                                                      bool
+	I          string `json:"i"`
+	Class      string `json:"cls,omitzero"`
+	Left       string `json:"left"`
+	Width      string `json:"width"`
+	Top        string `json:"top"`
+	Domain     string `json:"domain"`
+	Resolution string `json:"res,omitzero"`
+	Name       string `json:"-"`
+	Tip        string `json:"tip"`
+	Star       bool   `json:"star,omitzero"`
 }
 
 type exChip struct{ Label, Prompt string }
 
-type exPathItem struct{ Ref, Node, Name, Share string }
+type exPathItem struct {
+	Ref   string `json:"ref"`
+	Node  string `json:"node"`
+	Name  string `json:"name"`
+	Share string `json:"share"`
+}
 
-type exRow struct{ Ref, Node, Name, Share, Cum string }
+type exRow struct {
+	Ref   string `json:"ref"`
+	Node  string `json:"node"`
+	Name  string `json:"name"`
+	Share string `json:"share"`
+	Cum   string `json:"cum"`
+}
 
 // exRejected is one row of "Rejected at render". Kind is "claim",
 // "reference" or "limit"; only claim rows carry a metric and figures.
 type exRejected struct {
-	Attempt, Evidence, Kind, Label, Metric, Node, Agent, Engine, Code, Reason string
+	Attempt  string `json:"attempt"`
+	Evidence string `json:"evidence,omitzero"`
+	Kind     string `json:"kind"`
+	Label    string `json:"label"`
+	Metric   string `json:"metric,omitzero"`
+	Node     string `json:"node,omitzero"`
+	Agent    string `json:"agent,omitzero"`
+	Engine   string `json:"engine,omitzero"`
+	Code     string `json:"code,omitzero"`
+	Reason   string `json:"reason,omitzero"`
 }
 
-type exLegend struct{ Key, Label string }
+type exLegend struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
 
 type explainedPageData struct {
-	LightChrome, DarkChrome, Palette template.CSS
-	Title, ProfileName, Digest       string
-	TitleSegs                        []exSegment
-	Attempt, View                    string
-	CheckedPill                      string
-	RejectedPill, LimitPill          string
-	HistoryPill                      string
-	GPU                              bool
-	Notes                            []string
-	Quality                          []exQualityRow
-	Legend                           []exLegend
-	Axis, Total, TotalTitle          string
-	Height                           string
-	Frames                           []exDrawn
-	NarrowNote, LimitNote, SizeNote  string
-	RejectedNote                     string
+	CSS, Palette                    template.CSS
+	Title, ProfileName, Digest      string
+	TitleSegs                       []exSegment
+	Attempt, View                   string
+	CheckedPill                     string
+	RejectedPill, LimitPill         string
+	HistoryPill                     string
+	GPU                             bool
+	Notes                           []string
+	Quality                         []exQualityRow
+	Legend                          []exLegend
+	Axis, Total, TotalTitle         string
+	Height                          string
+	Frames                          []exDrawn
+	NarrowNote, LimitNote, SizeNote string
+	RejectedNote                    string
+	// LiveHistory words the rejected section for a live publication.
+	LiveHistory bool
 	// allRejected are every rejected row, before historyRows cut them.
 	allRejected []exRejected
 	Rows        []exRow
@@ -236,11 +303,8 @@ type explainedPageData struct {
 // out and counted on the page, so the history alone never makes a page
 // fail. Nothing is written unless the page fits.
 func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) error {
-	if v == nil {
-		return errors.New("flamegraph: nil view")
-	}
-	if !r.OK {
-		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
+	if err := checkPageInput(v, r); err != nil {
+		return err
 	}
 	if opts.MaxBytes <= 0 {
 		data, err := buildExplained(v, r, opts, -1, -1)
@@ -249,25 +313,77 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 		}
 		return explainPageTmpl.Execute(w, data)
 	}
-	base, rows, err := fitHistory(v, r, opts)
+	page, err := ExplainedPage(v, r, opts)
 	if err != nil {
 		return err
 	}
-	frameBytes := int64(opts.MaxBytes - len(base) - pageSlack)
-	for range maxBudgetPasses {
-		page, err := renderExplained(v, r, opts, max(frameBytes, 0), rows)
-		if err != nil {
-			return err
-		}
-		if len(page) <= opts.MaxBytes {
-			_, err = w.Write(page)
-			return err
-		}
-		frameBytes -= int64(len(page)-opts.MaxBytes) + pageSlack
-	}
-	// Only the explained and referenced paths are certain to fit.
-	_, err = w.Write(base)
+	_, err = w.Write(page)
 	return err
+}
+
+// ExplainedPage is the page WriteExplainedPage writes within a positive
+// opts.MaxBytes, rendered into memory once and not copied: a caller that
+// holds the page whole before sending it needs no buffer of its own. A
+// page that does not fit is ErrPageTooLarge.
+func ExplainedPage(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions) ([]byte, error) {
+	if err := checkPageInput(v, r); err != nil {
+		return nil, err
+	}
+	if opts.MaxBytes <= 0 {
+		return nil, errors.New("flamegraph: ExplainedPage needs a positive MaxBytes; WriteExplainedPage renders an unbounded page")
+	}
+	base, rows, err := fitHistory(v, r, opts)
+	if err != nil {
+		return nil, err
+	}
+	return fitFrames(opts.MaxBytes, base, func(frameBytes int64) ([]byte, error) {
+		return renderExplained(v, r, opts, frameBytes, rows)
+	})
+}
+
+func checkPageInput(v *profilemodel.View, r explain.Result) error {
+	if v == nil {
+		return errors.New("flamegraph: nil view")
+	}
+	if !r.OK {
+		return errors.New("flamegraph: the explanations did not pass the check; only a passing check is rendered")
+	}
+	return nil
+}
+
+// ErrPageTooLarge is the error of a page or live model that does not fit
+// its MaxBytes even with only the explained and referenced paths drawn.
+// The error returned says how many bytes it needs; it is ErrPageTooLarge
+// by errors.Is.
+var ErrPageTooLarge = errors.New("flamegraph: the page does not fit its budget (MaxBytes)")
+
+// tooLargeError is an ErrPageTooLarge that says by how much.
+type tooLargeError struct{ msg string }
+
+func (e *tooLargeError) Error() string        { return e.msg }
+func (e *tooLargeError) Is(target error) bool { return target == ErrPageTooLarge }
+
+// tooLarge is an ErrPageTooLarge with the text format makes.
+func tooLarge(format string, a ...any) error { return &tooLargeError{fmt.Sprintf(format, a...)} }
+
+// fitFrames spends what maxBytes leaves after base, the output with only
+// the explained and referenced paths drawn, on frames: render is called
+// with a frame budget, which shrinks by the overshoot and pageSlack until
+// the output fits, at most maxBudgetPasses times. Only base is certain to
+// fit, so it is the answer when no pass does.
+func fitFrames(maxBytes int, base []byte, render func(frameBytes int64) ([]byte, error)) ([]byte, error) {
+	frameBytes := int64(maxBytes - len(base) - pageSlack)
+	for range maxBudgetPasses {
+		out, err := render(max(frameBytes, 0))
+		if err != nil {
+			return nil, err
+		}
+		if len(out) <= maxBytes {
+			return out, nil
+		}
+		frameBytes -= int64(len(out)-maxBytes) + pageSlack
+	}
+	return base, nil
 }
 
 // rowOverhead bounds the markup of one rejected row besides its text.
@@ -289,7 +405,7 @@ func fitHistory(v *profilemodel.View, r explain.Result, opts ExplainedPageOption
 	}
 	bare := buf.Bytes()
 	if len(bare) > opts.MaxBytes {
-		return nil, 0, fmt.Errorf("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
+		return nil, 0, tooLarge("flamegraph: the page needs %d bytes with only the explained and referenced paths drawn, over the budget of %d bytes (MaxBytes)",
 			len(bare), opts.MaxBytes)
 	}
 	keep, room := 0, int64(opts.MaxBytes-len(bare))
@@ -339,21 +455,36 @@ func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageO
 // buildExplained assembles the page; frameBytes < 0 means no byte budget,
 // and historyRows < 0 every rejected row.
 func buildExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64, historyRows int) (*explainedPageData, error) {
-	b := &explainedBuilder{v: v, r: r, opts: opts, historyRows: historyRows, refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
-	return b.build(frameBytes)
+	return newExplainedBuilder(v, r, opts, nil, historyRows).build(frameBytes)
+}
+
+// newExplainedBuilder is a builder of v whose layout starts at root, or at
+// the view's root when root is nil.
+func newExplainedBuilder(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, root *profilemodel.Node, historyRows int) *explainedBuilder {
+	return &explainedBuilder{v: v, r: r, opts: opts, root: root, historyRows: historyRows,
+		refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
 }
 
 type explainedBuilder struct {
 	v    *profilemodel.View
 	r    explain.Result
 	opts ExplainedPageOptions
+	// root is the node the layout starts at, drawn at depth 0 and full
+	// width; nil is the view's root. Shares stay of the view total.
+	root *profilemodel.Node
+	// modelOnly says the output is JSON alone, where a frame's name is
+	// written once, in the model.
+	modelOnly bool
+	// partial says the builder holds only some of the explained frames:
+	// explanations of nodes it has no frame for are skipped, not an error.
+	partial bool
 	// historyRows is how many of the newest rejected rows the page lists;
 	// < 0 lists them all.
 	historyRows int
 	view        string
 	specs       []exRowSpec
 	frames      []*exFrame
-	refs        map[profilemodel.NodeID]string // node -> "f<k>" for drawn nodes
+	refs        map[profilemodel.NodeID]string // node -> "f<k>" for the model's nodes
 	byID        map[profilemodel.NodeID]*exFrame
 }
 
@@ -362,8 +493,7 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	b.view = fmt.Sprintf("%s/%s#%d", v.SampleType, v.Unit, v.Index)
 	b.specs = b.rowSpecs()
 	data := &explainedPageData{
-		LightChrome: lightChrome,
-		DarkChrome:  template.CSS(darkChrome),
+		CSS:         template.CSS(explainedCSS()),
 		Palette:     template.CSS(paletteCSS + jitterCSS),
 		Title:       cmp.Or(b.opts.Title, b.opts.ProfileName, "Explained flame graph"),
 		TitleSegs:   titleSegments(b.opts),
@@ -384,6 +514,9 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	if data.GPU {
 		data.Axis = "width = GPU time launched from the sampled stacks of this path, not CPU time"
 	}
+	if b.root != nil {
+		data.Axis += "; widths relative to " + shownName(b.root.Function.Name) + ", shares are of the view total"
+	}
 	notes, err := v.Notes()
 	if err != nil {
 		return nil, err
@@ -394,6 +527,28 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	if err := b.layout(data, frameBytes); err != nil {
 		return nil, err
 	}
+	nDrawn := len(b.frames)
+	if b.root != nil {
+		// The focus's callers and every explained and referenced path are
+		// in the model, undrawn, so the path panel and the rows can name
+		// them. The callers go in first: with them the model's frames are
+		// closed under parents, so each anchor's path stops at its first
+		// caller already in the model, and each anchor is added once.
+		if err := b.addPath(b.root.Parent); err != nil {
+			return nil, err
+		}
+		seen := map[profilemodel.NodeID]bool{}
+		for _, id := range b.anchors() {
+			n, ok := b.v.Node(id)
+			if !ok || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if err := b.addPath(n); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := b.attachExplanations(); err != nil {
 		return nil, err
 	}
@@ -402,9 +557,13 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		data.Rows = append(data.Rows, exRow{Ref: f.Ref, Node: f.ID, Name: f.Name, Share: f.Share,
 			Cum: factValue(ch.Facts.Cumulative)})
 	}
+	// The first explained frame drawn is selected, else the layout's root.
 	sel := b.frames[0]
-	if len(b.r.Checked) > 0 {
-		sel = b.byID[b.r.Checked[0].Node]
+	for _, ch := range b.r.Checked {
+		if f := b.byID[ch.Node]; f.index < nDrawn {
+			sel = f
+			break
+		}
 	}
 	data.Sel = sel
 	data.SelFacts = b.factRows(sel)
@@ -423,11 +582,10 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	data.allRejected = data.Rejected
 	if n := len(data.Rejected) - b.historyRows; b.historyRows >= 0 && n > 0 {
 		data.Rejected = data.Rejected[n:]
-		data.RejectedNote = fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
+		data.RejectedNote = rejectedNote(n, b.opts.LiveHistory)
 	}
-	if b.opts.HistoryIncomplete {
-		data.HistoryPill = "earlier attempt history for this view may be incomplete"
-	}
+	data.HistoryPill = historyPill(b.opts.HistoryIncomplete, b.opts.LiveHistory)
+	data.LiveHistory = b.opts.LiveHistory
 	data.Legend = legendOf(data.Frames)
 
 	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, FactRows: b.specs, Frames: b.frames, Prompts: prompts})
@@ -480,25 +638,41 @@ func (b *explainedBuilder) factRows(f *exFrame) []exFactRow {
 	return append(out, f.Extra...)
 }
 
-// forced is the set of nodes always drawn: every explained node, every
-// node a placeholder names, the root, and all their callers, so the set is
-// closed under parents and a node left out never hides one of them.
-func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
-	out := map[profilemodel.NodeID]bool{b.v.Root.ID: true}
-	add := func(id profilemodel.NodeID) {
-		for n, ok := b.v.Node(id); ok && n != nil && !out[n.ID]; n = n.Parent {
-			out[n.ID] = true
-		}
+// rejectedNote says how many of the oldest rejected rows a budget left
+// out. A live history (live) holds attempts made after its publication
+// too, so it calls them older rather than earlier.
+func rejectedNote(n int, live bool) string {
+	rows := plural(n, "earlier row", "earlier rows")
+	if live {
+		rows = plural(n, "older row", "older rows")
 	}
+	return fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", rows, isAre(n))
+}
+
+// historyPill says the attempt history may be incomplete, or is "".
+func historyPill(incomplete, live bool) string {
+	switch {
+	case !incomplete:
+		return ""
+	case live:
+		return "attempt history for this view may be incomplete"
+	}
+	return "earlier attempt history for this view may be incomplete"
+}
+
+// anchors are the explained nodes and the nodes their placeholders name,
+// in the order the explanations give them.
+func (b *explainedBuilder) anchors() []profilemodel.NodeID {
+	var out []profilemodel.NodeID
 	nodesIn := func(segs []explain.Segment) {
 		for _, sg := range segs {
 			if sg.Kind == explain.SegmentNode {
-				add(sg.Node)
+				out = append(out, sg.Node)
 			}
 		}
 	}
 	for _, ch := range b.r.Checked {
-		add(ch.Node)
+		out = append(out, ch.Node)
 		nodesIn(ch.Prose)
 		for _, h := range ch.Hypotheses {
 			nodesIn(h)
@@ -506,6 +680,48 @@ func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
 		nodesIn(ch.NextMeasurement)
 	}
 	return out
+}
+
+// forced is the set of nodes always drawn: every anchor, the root, and all
+// their callers, so the set is closed under parents and a node left out
+// never hides one of them.
+func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
+	out := map[profilemodel.NodeID]bool{b.v.Root.ID: true}
+	for _, id := range b.anchors() {
+		for n, ok := b.v.Node(id); ok && n != nil && !out[n.ID]; n = n.Parent {
+			out[n.ID] = true
+		}
+	}
+	return out
+}
+
+// addPath adds n and its callers up to the view's root to the model,
+// undrawn, root first, stopping at the first caller already in it: the
+// callers of a frame in the model must be in it too, except those of the
+// layout's root. A nil n adds nothing.
+func (b *explainedBuilder) addPath(n *profilemodel.Node) error {
+	var missing []*profilemodel.Node
+	for ; n != nil && b.byID[n.ID] == nil; n = n.Parent {
+		missing = append(missing, n)
+	}
+	for _, p := range slices.Backward(missing) {
+		f, err := b.frame(p)
+		if err != nil {
+			return err
+		}
+		b.refs[p.ID] = f.Ref
+	}
+	return nil
+}
+
+// under says n is root or below it.
+func under(n, root *profilemodel.Node) bool {
+	for ; n != nil; n = n.Parent {
+		if n == root {
+			return true
+		}
+	}
+	return false
 }
 
 // leftOut counts the nodes not drawn, by why.
@@ -517,16 +733,29 @@ const (
 	reasonSize
 )
 
-// layout chooses the frames to draw, breadth first so the widest and
-// shallowest come first, and places each at its offset within its parent:
-// left and width are percentages of the view total, top is its depth.
-// Forced nodes are always drawn. Any other node is drawn only when it is
-// at least minDrawFraction of the total, the MaxNodes budget has room and
-// its estimated bytes fit in frameBytes (unless frameBytes < 0). A node
-// not drawn takes everything below it along; they are counted instead.
+// layout chooses the frames to draw from the layout's root down, breadth
+// first so the widest and shallowest come first, and places each at its
+// offset within its parent: left and width are percentages of the root's
+// cumulative (the view total for the view's root), top is its depth below
+// the root. Forced nodes under the root are always drawn. Any other node is
+// drawn only when it is at least minDrawFraction of that width, the
+// MaxNodes budget has room and its estimated bytes fit in frameBytes
+// (unless frameBytes < 0). A node not drawn takes everything below it
+// along; they are counted instead.
 func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) error {
 	v := b.v
+	root, total := v.Root, v.Total
+	if b.root != nil {
+		root, total = b.root, b.root.Cum
+	}
 	forced := b.forced()
+	if root != v.Root {
+		maps.DeleteFunc(forced, func(id profilemodel.NodeID, _ bool) bool {
+			n, _ := v.Node(id)
+			return !under(n, root)
+		})
+		forced[root.ID] = true
+	}
 	maxNodes := cmp.Or(b.opts.MaxNodes, defaultExplainedMaxNodes)
 	nodeBudget := max(0, maxNodes-len(forced))
 	type queued struct {
@@ -535,7 +764,7 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 		jitter int
 	}
 	wide := func(n *profilemodel.Node) bool {
-		return n.Cum > 0 && float64(n.Cum) >= minDrawFraction*float64(v.Total)
+		return n.Cum > 0 && float64(n.Cum) >= minDrawFraction*float64(total)
 	}
 	explained := map[profilemodel.NodeID]bool{}
 	for _, ch := range b.r.Checked {
@@ -543,7 +772,7 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 	}
 	var out leftOut
 	var usedBytes int64
-	queue := []queued{{n: v.Root}}
+	queue := []queued{{n: root}}
 	maxDepth, unforced := 0, 0
 	for len(queue) > 0 {
 		q := queue[0]
@@ -554,17 +783,18 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 			return err
 		}
 		b.refs[n.ID] = f.Ref
-		maxDepth = max(maxDepth, n.Depth)
+		depth := n.Depth - root.Depth
+		maxDepth = max(maxDepth, depth)
 		d := exDrawn{
 			I:     strconv.Itoa(len(b.frames) - 1),
-			Left:  pctOf(q.offset, v.Total),
-			Width: pctOf(n.Cum, v.Total),
-			Top:   strconv.Itoa(n.Depth * explainedRowPitch),
+			Left:  pctOf(q.offset, total),
+			Width: pctOf(n.Cum, total),
+			Top:   strconv.Itoa(depth * explainedRowPitch),
 			Name:  f.Name,
 			Tip:   f.Facts[0].Value + ", " + f.Share + " of total",
 			Star:  explained[n.ID],
 		}
-		if v.Total <= 0 && n == v.Root {
+		if total <= 0 && n == root {
 			d.Width = "100"
 		}
 		dom := DomainRoot
@@ -591,12 +821,12 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 			case !wide(c) || unforced >= nodeBudget:
 				countLeftOut(c, wide, reasonLimit, &out)
 				drawn = false
-			case frameBytes >= 0 && usedBytes+frameEstimate(c) > frameBytes:
+			case frameBytes >= 0 && usedBytes+b.frameEstimate(c) > frameBytes:
 				countLeftOut(c, wide, reasonSize, &out)
 				drawn = false
 			default:
 				unforced++
-				usedBytes += frameEstimate(c)
+				usedBytes += b.frameEstimate(c)
 			}
 			if drawn {
 				queue = append(queue, queued{n: c, offset: offset, jitter: (i * 3) % jitterSteps})
@@ -639,11 +869,16 @@ func countLeftOut(n *profilemodel.Node, wide func(*profilemodel.Node) bool, reas
 	}
 }
 
-// frameEstimate bounds the bytes drawing n adds: its div and model entry,
-// and its name escaped once for HTML text and once as a JSON string.
-func frameEstimate(n *profilemodel.Node) int64 {
+// frameEstimate bounds the bytes drawing n adds: its div (or drawn entry)
+// and model entry, and its name escaped as a JSON string and, on the page,
+// once more for HTML text.
+func (b *explainedBuilder) frameEstimate(n *profilemodel.Node) int64 {
 	name := shownName(n.Function.Name)
-	return frameOverhead + htmlEscapedBound(name) + jsonEscapedBound(name)
+	size := frameOverhead + jsonEscapedBound(name)
+	if !b.modelOnly {
+		size += htmlEscapedBound(name)
+	}
+	return size
 }
 
 // htmlEscapedBound bounds the length of s as html/template escapes text:
@@ -717,6 +952,7 @@ func (b *explainedBuilder) frame(n *profilemodel.Node) (*exFrame, error) {
 	}
 	f := &exFrame{
 		ID:    string(n.ID),
+		index: len(b.frames),
 		Ref:   "f" + strconv.Itoa(len(b.frames)),
 		Name:  shownName(n.Function.Name),
 		Cum:   strconv.FormatInt(n.Cum, 10),
@@ -745,6 +981,9 @@ func valueOf(f profilemodel.Fact) exFactVal {
 func (b *explainedBuilder) attachExplanations() error {
 	for _, ch := range b.r.Checked {
 		f := b.byID[ch.Node]
+		if f == nil && b.partial {
+			continue
+		}
 		if f == nil {
 			return fmt.Errorf("flamegraph: explained node %s is not in the view", ch.Node)
 		}
@@ -838,6 +1077,9 @@ func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
 // nodeName is "<name> (node <id>)", or "node <id>" for a node the view
 // does not have.
 func (b *explainedBuilder) nodeName(id profilemodel.NodeID) string {
+	if b.v == nil {
+		return "node " + string(id)
+	}
 	if n, ok := b.v.Node(id); ok {
 		return shownName(n.Function.Name) + " (node " + string(id) + ")"
 	}
@@ -1003,21 +1245,27 @@ func (b *explainedBuilder) rejected() (rows []exRejected, claimsPill, limitsPill
 	if refs > 0 {
 		parts = append(parts, plural(refs, "reference", "references"))
 	}
+	// A live history follows the record, whose attempts may come after the
+	// publication: its pills say what was rejected, not when.
+	rejectedAt, exceededAt, older := " rejected at render", " exceeded at render", "earlier"
+	if b.opts.LiveHistory {
+		rejectedAt, exceededAt, older = " rejected", " exceeded", "older"
+	}
 	if len(parts) > 0 {
-		claimsPill = strings.Join(parts, " and ") + " rejected at render"
+		claimsPill = strings.Join(parts, " and ") + rejectedAt
 		if attempts > 1 {
 			claimsPill += fmt.Sprintf(" in %d attempts", attempts)
 		}
 	}
 	if n := b.opts.DroppedRejected; n > 0 {
-		dropped := plural(n, "earlier rejected attempt", "earlier rejected attempts") + " not kept"
+		dropped := plural(n, older+" rejected attempt", older+" rejected attempts") + " not kept"
 		if claimsPill != "" {
 			dropped = claimsPill + ", plus " + dropped
 		}
 		claimsPill = dropped
 	}
 	if limits > 0 {
-		limitsPill = plural(limits, "limit", "limits") + " exceeded at render"
+		limitsPill = plural(limits, "limit", "limits") + exceededAt
 	}
 	return rows, claimsPill, limitsPill
 }
@@ -1090,6 +1338,33 @@ func factText(f profilemodel.Fact) (string, string) {
 		return s, s
 	}
 	return displayValue(c, f.Unit, f.Status), exactTitle(c, f.Unit, f.Denominator, f.Rounding, f.Status == profilemodel.StatusZero)
+}
+
+// ShownClaim is claim e as an explained page shows it in place of its
+// placeholder, and the unit words that text carries: "%" for a share, the
+// word after the figure otherwise ("411 ns", "1,234 bytes"), and for a
+// duration every unit the page writes durations in, since which one it
+// picks depends on the value. A count, a measured zero and an unavailable
+// value carry none.
+func ShownClaim(e explain.EngineValue) (text string, units []string) {
+	text = displayEngine(e)
+	// A measured zero is shown as "0", with no unit; a share that only
+	// rounds to zero is "0.0%" and keeps its "%".
+	if e.Status == profilemodel.StatusUnavailable || e.Status == profilemodel.StatusZero || e.Value == "" {
+		return text, nil
+	}
+	if e.Unit == profilemodel.UnitRatio {
+		return text, []string{"%"}
+	}
+	i := strings.LastIndexByte(text, ' ')
+	if i < 0 {
+		return text, nil
+	}
+	word := text[i+1:]
+	if durations := []string{"ns", "µs", "ms", "s"}; e.Unit == "nanoseconds" && slices.Contains(durations, word) {
+		return text, durations
+	}
+	return text, []string{word}
 }
 
 // displayEngine is a claim's engine value as shown.

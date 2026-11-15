@@ -20,6 +20,11 @@ type Config struct {
 	// OutputDir is the root rendered pages are written to; "" disables
 	// rendering.
 	OutputDir string
+	// Live enables the live page: the page_* tools, and a page the browser
+	// reads from a loopback port the server opens at the first of them.
+	// The stdio command never sets it, so it registers no page_* tool and
+	// never listens; it is for a long-lived server and for tests.
+	Live bool
 	// Limits bound every input and response; they are fixed at New, which
 	// fills in defaults for a zero Limits or a zero Model.
 	Limits Limits

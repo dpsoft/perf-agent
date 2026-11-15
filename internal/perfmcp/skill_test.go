@@ -19,17 +19,18 @@ var skillArgs = []string{
 	"next_cursor", "cursor", "attempt", "out", "ok", "zero", "unavailable",
 	"denominator", "unit", "value", "metric", "scope", "node", "facts",
 	"view_total", "source_unverified", "unsampled_portion", "base_handle", "base_view", "new_handle", "new_view",
-	"view_scope",
+	"view_scope", "id", "publication",
 }
 
-// explainCodes reads the failure codes declared in internal/explain.
+// explainCodes reads the failure and notice codes declared in
+// internal/explain.
 func explainCodes(t *testing.T) []string {
 	t.Helper()
 	files, err := filepath.Glob("../explain/*.go")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no explain sources: %v", err)
 	}
-	re := regexp.MustCompile(`Code\s+= "([a-z_]+)"`)
+	re := regexp.MustCompile(`(?:Code\s+|Notice[A-Za-z]+\s+)= "([a-z_]+)"`)
 	var codes []string
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
@@ -78,7 +79,7 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 		known := slices.Contains(tools, word) || slices.Contains(metrics, word) ||
 			slices.Contains(codes, word) || slices.Contains(skillArgs, word)
 		if !known {
-			t.Errorf("the skill cites `%s`, which is no tool, metric, failure code or known argument", word)
+			t.Errorf("the skill cites `%s`, which is no tool, metric, failure or notice code or known argument", word)
 		}
 	}
 
@@ -97,7 +98,9 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	}
 
 	// The rules agents most often get wrong are stated as the guide states them.
-	for _, rule := range []string{"Only node facts are claimable", "Never just copy the engine's value", "`facts` under `view_scope`"} {
+	for _, rule := range []string{
+		"Only node facts are claimable", "Never just copy the engine's value", "`facts` under `view_scope`",
+	} {
 		if !strings.Contains(skill, rule) {
 			t.Errorf("the skill does not say %q", rule)
 		}

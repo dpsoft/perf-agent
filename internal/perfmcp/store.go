@@ -27,10 +27,14 @@ type entry struct {
 // store holds a server's open handles. It belongs to one Server and is used
 // from its single request goroutine, so it takes no locks; there is no cache
 // shared between servers, so each server judges evidence by its own limits.
+// Each entry holds its profile and views in the server's pin ledger, and
+// lets go of them when it is evicted; a publication of them holds them on
+// its own.
 type store struct {
 	root *os.Root
 	lim  profilemodel.Limits
 	max  int
+	pins *pins
 	// entries are the open handles; order lists them least recently used
 	// first.
 	entries map[profilemodel.Handle]*entry
@@ -41,8 +45,8 @@ type store struct {
 	inputs []os.FileInfo
 }
 
-func newStore(root *os.Root, lim profilemodel.Limits, max int) *store {
-	return &store{root: root, lim: lim, max: max, entries: map[profilemodel.Handle]*entry{}}
+func newStore(root *os.Root, lim profilemodel.Limits, max int, pins *pins) *store {
+	return &store{root: root, lim: lim, max: max, pins: pins, entries: map[profilemodel.Handle]*entry{}}
 }
 
 // fileFS serves already opened files under fixed names, so LoadFS reads the
@@ -114,8 +118,10 @@ func (s *store) open(name, execlog string) (_ *entry, err error) {
 	}
 	e.views[def] = v
 	s.entries[p.Handle] = e
+	s.pins.hold(e, p, v)
 	s.order = append(s.order, p.Handle)
 	for len(s.order) > s.max {
+		s.pins.release(s.entries[s.order[0]])
 		delete(s.entries, s.order[0])
 		s.order = slices.Delete(s.order, 0, 1)
 	}
@@ -156,6 +162,7 @@ func (s *store) view(h profilemodel.Handle, view string) (*entry, *profilemodel.
 		return nil, nil, fmt.Errorf("cannot build view %s of handle %s: %v", view, h, err)
 	}
 	e.views[view] = v
+	s.pins.hold(e, v)
 	return e, v, nil
 }
 

@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>b and c: 2 hot paths</title>
+<style>
+:root{ --bg:#f7f6f9;--panel:#ffffff;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--ai:#5b4bdb;--ai-bg:#f5f3ff;--ai-line:#d6d1fa;--ok:#1f7a45;--ok-bg:#f1faf4;--ok-line:#bfe3cd;--bad:#b3352a;--bad-bg:#fdf3f2;--bad-line:#f0c8c3;--chip-bg:#ffffff}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){ --bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;--line:#332f3b;--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232;--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}}
+:root[data-theme="dark"]{ --bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;--line:#332f3b;--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232;--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.muted{color:var(--muted)}
+button{font:inherit;color:inherit}
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:9px}
+.brand b{font-size:16px;font-weight:700;letter-spacing:-.015em}
+.brand i{font-style:italic;color:var(--muted);font-size:12.5px}
+h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width:8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.readout{padding:3px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);font-size:12px;white-space:nowrap}
+.prov{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 9px;font-size:12px;border:1px solid var(--line);background:var(--bg);white-space:nowrap;font-weight:500}
+.pill.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-bg)}
+.pill.bad{color:var(--bad);border-color:var(--bad-line);background:var(--bad-bg)}
+.pill.ai{color:var(--ai);border-color:var(--ai-line);background:var(--ai-bg)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
+.legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.legend .sw{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block}
+.legend .key{margin-left:auto;color:var(--ai)}
+.notes{margin:12px 16px 0;padding:8px 12px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:8px;font-size:12.5px}
+.notes ul{margin:4px 0 0;padding-left:18px}
+.body{display:grid;grid-template-columns:minmax(0,1fr) 420px;align-items:start}
+@media (max-width:1000px){.body{grid-template-columns:minmax(0,1fr)}}
+.graph{padding:12px 16px;min-width:0}
+.canvas{max-height:72vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:2px}
+.chart{position:relative;min-width:100%}
+.frame{position:absolute;height:19px;padding:0;border:0;margin:0;overflow:hidden;cursor:pointer;border-radius:2px}
+.frame .fl{display:block;padding:0 5px;font:11px/19px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.frame .star{color:#4a39c9;font-weight:700;margin-right:3px}
+.frame.cite{outline:2px dashed var(--ai);outline-offset:-2px;z-index:1}
+.frame:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;z-index:2}
+.axis{display:flex;justify-content:space-between;gap:12px;margin-top:6px;font-size:12px;color:var(--muted)}
+.left-out{margin:4px 0 0;font-size:12px;color:var(--muted)}
+h4{margin:16px 0 6px;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
+.exrow{display:flex;width:100%;gap:8px;align-items:center;padding:6px 9px;margin:0 0 6px;border:1px solid var(--line);border-radius:7px;background:var(--panel);cursor:pointer;text-align:left}
+.exrow:hover,.exrow:focus-visible{border-color:var(--ai)}
+.exrow .star{color:var(--ai);font-weight:700}
+.exrow code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exrow .w{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ref{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ai)}
+.qgrid,.facts{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.facts{grid-template-columns:max-content minmax(0,1fr) minmax(9em,1fr)}
+.facts .v{white-space:normal;overflow-wrap:anywhere}
+.k{color:var(--muted);white-space:nowrap}
+.v{font-weight:600;white-space:nowrap}
+.p{color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.st{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted);justify-self:start}
+.st-ok{color:var(--ok);border-color:var(--ok-line)}
+.st-unavailable{color:var(--bad);border-color:var(--bad-line)}
+.qgrid{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.side{background:var(--panel);border-left:1px solid var(--line);min-width:0;position:sticky;top:0;max-height:100vh;overflow:auto}
+@media (max-width:1000px){.side{position:static;max-height:none;border-left:0;border-top:1px solid var(--line)}}
+.hd{padding:12px 16px;border-bottom:1px solid var(--line)}
+.hd .lbl{font-size:12px;color:var(--muted)}
+.hd .nm{font:600 13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.hd .nid{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted)}
+.sec{padding:11px 16px;border-bottom:1px solid var(--line)}
+.sec h5{margin:0 0 8px;font-size:12.5px;font-weight:600}
+.sec h5 .tag{font-weight:500}
+.interp h5{color:var(--ai)}
+.sec p{margin:0 0 6px}
+.claim{font-weight:600;border-bottom:1px solid var(--ok-line);cursor:help}
+mark.unchecked{background:var(--warn-bg);color:inherit;border-bottom:1px dashed var(--warn-line);padding:0 1px;cursor:help}
+button.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--ai-bg);color:var(--ai);border:1px solid var(--ai-line);border-radius:4px;padding:0 4px;cursor:pointer;vertical-align:1px}
+.hyp{margin:0;padding-left:18px}
+.hyp li{margin:0 0 4px}
+.hyp b{color:var(--ai)}
+.rej{margin:0;padding:0;list-style:none}
+.rej li{background:var(--bad-bg);border:1px solid var(--bad-line);border-radius:6px;padding:7px 10px;margin:0 0 6px;font-size:12.5px}
+.rej s{color:var(--bad)}
+.rej .why{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.path{list-style:none;margin:0;padding:0}
+.path button{display:flex;width:100%;gap:6px;align-items:baseline;padding:2px 4px;border:0;border-radius:4px;background:none;cursor:pointer;text-align:left}
+.path button:hover,.path button:focus-visible{background:var(--ai-bg)}
+.path .pn{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.path .c{color:var(--muted);font-size:11px;white-space:nowrap}
+.path li:last-child button{background:var(--ai-bg)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;background:var(--chip-bg);cursor:pointer}
+.chip:hover,.chip:focus-visible{border-color:var(--ai);color:var(--ai)}
+#copybox{display:block;width:100%;margin-top:8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+#copybox[hidden]{display:none}
+.foot{display:flex;flex-wrap:wrap;gap:6px 18px;padding:8px 16px;border-top:1px solid var(--line);background:var(--panel);font-size:12px;color:var(--muted)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:7px 14px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+.toast.on{opacity:1}
+</style>
+<style>
+:root{
+  --fill-dl:0%;
+  --fill-ds:1;
+  --fill-j:0;
+  --hatch-ink:rgb(22 20 18 / .26);
+
+  --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+  --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+
+  --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
+  --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
+  --fill-vendor:   hsl( 50 calc(88% * var(--fill-ds)) calc(69% + var(--fill-dl)));
+  --fill-kernel:   hsl( 28 calc(92% * var(--fill-ds)) calc(70% + var(--fill-dl)));
+  --fill-boundary: hsl(  0                        0%  calc(84% + var(--fill-dl)));
+  --fill-boundary-unattributed: hsl(0             0%  calc(92% + var(--fill-dl)));
+  --fill-gpu-kernel: hsl(128 calc(48% * var(--fill-ds)) calc(67% + var(--fill-dl)));
+  --fill-accel-source: hsl(184 calc(52% * var(--fill-ds)) calc(65% + var(--fill-dl)));
+  --fill-unsym: hsl( 45 calc(20% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-shim:  hsl(215 calc(15% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-root: hsl(30 calc(8% * var(--fill-ds)) calc(81% + var(--fill-dl)));
+
+  --edge-frame:        rgb(255 255 255 / .55);
+  --edge-boundary:     hsl(  0  0% calc(40% + var(--fill-dl)));
+  --edge-unattributed: hsl(  0  0% calc(55% + var(--fill-dl)));
+  --edge-shim:         hsl(215 24% calc(46% + var(--fill-dl)));
+
+  --frame-ink: hsl(30 12% 9%);
+  --fill-match: hsl(300 100% 71%);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}}
+:root[data-theme="dark"]{--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}
+
+.frame{color:var(--frame-ink);background-color:var(--fill-x);background-color:hsl(from var(--fill-x) h s calc(l + var(--fill-j)));box-shadow:inset 0 0 0 .5px var(--edge-frame)}
+[data-domain="root"]{--fill-x:var(--fill-root)}
+[data-domain="app"]{--fill-x:var(--fill-app)}
+[data-domain="system"]{--fill-x:var(--fill-system)}
+[data-domain="kernel"]{--fill-x:var(--fill-kernel)}
+[data-domain="vendor"]{--fill-x:var(--fill-vendor)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
+[data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
+[data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
+[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
+[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
+.frame.inexact{background-image:var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
+
+.frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
+.frame.match{background-color:var(--fill-match)}
+.frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
+.sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
+.j1{--fill-j:1.14}
+.j2{--fill-j:2.29}
+.j3{--fill-j:3.43}
+.j4{--fill-j:4.57}
+.j5{--fill-j:5.71}
+.j6{--fill-j:6.86}
+.j7{--fill-j:8.00}
+</style>
+</head>
+<body>
+<header class="top">
+<span class="brand"><b>perf-agent</b><i>Enjoy the Flames.</i></span>
+<h1>b and c: <mark class="unchecked" title="not checked by perf-agent">2</mark> hot paths</h1>
+<span class="readout">View <b>cpu/nanoseconds#0</b></span>
+<div class="prov">
+<span class="pill ai">✦ Explained by an agent via MCP</span>
+<span class="pill ok" title="Each structured claim was compared with the engine at its rounding, and each frame reference resolved">4 figures and references checked</span>
+<span class="pill">prose is not verified</span>
+<span class="pill bad">1 claim rejected at render</span>
+</div>
+</header>
+<div class="legend" aria-label="Colour key"><span class="c"><i class="sw" data-domain="app"></i>application</span><span class="c key">✦ path with an explanation</span></div>
+<main class="body">
+<div class="graph">
+<div class="canvas"><div class="chart" id="chart" style="height:80px">
+<div class="frame" style="left:0%;width:100%;top:0px" data-i="0" data-domain="root" tabindex="0" role="button" title="1.00 µs, 100.0% of total"><span class="fl">all</span></div>
+<div class="frame" style="left:0%;width:100%;top:20px" data-i="1" data-domain="app" tabindex="0" role="button" title="1.00 µs, 100.0% of total"><span class="fl">main</span></div>
+<div class="frame" style="left:0%;width:51.1%;top:40px" data-i="2" data-domain="app" tabindex="0" role="button" title="511 ns, 51.1% of total"><span class="fl">a</span></div>
+<div class="frame j3" style="left:51.1%;width:48.9%;top:40px" data-i="3" data-domain="app" tabindex="0" role="button" title="489 ns, 48.9% of total"><span class="fl"><span class="star">✦</span>c</span></div>
+<div class="frame cur" style="left:0%;width:41.1%;top:60px" data-i="4" data-domain="app" tabindex="0" role="button" title="411 ns, 41.1% of total"><span class="fl"><span class="star">✦</span>b</span></div>
+</div>
+</div>
+<div class="axis"><span>cpu/nanoseconds#0 · width = cpu (nanoseconds) at or below the frame</span><span title="1000 nanoseconds, exact">total 1.00 µs</span></div>
+<section aria-label="Paths the agent explained"><h4>Paths the agent explained</h4>
+<button type="button" class="exrow" data-node="19f8d19ed72f72ff"><span class="star">✦</span><span class="ref">f4</span><code>b</code><span class="w">41.1% · 411 ns</span></button>
+<button type="button" class="exrow" data-node="dc7211ebcac6e9c7"><span class="star">✦</span><span class="ref">f3</span><code>c</code><span class="w">48.9% · 489 ns</span></button>
+</section>
+<section aria-label="Quality summary"><h4>Quality summary</h4>
+<div class="qgrid"><span class="k">Unresolved frames</span><span class="v" title="0.000 ratio of view_total, rounded to 0.001 ratio, measured zero">0</span><span class="st st-zero">zero</span><span class="p">share of the view with an unresolved frame</span><span class="k">Executions log</span><span class="v" title="unavailable: no sidecar">unavailable: no sidecar</span><span class="st st-unavailable">unavailable</span><span class="p">executions are not counted</span></div>
+</section>
+</div>
+<aside class="side" aria-label="Selected frame">
+<div class="hd"><div class="lbl">Frame details · <span class="ref" id="sel-ref">f4</span></div><div class="nm" id="sel-name">b</div><div class="nid" id="sel-id">19f8d19ed72f72ff</div></div>
+<section class="sec"><h5>Profile facts — computed by perf-agent</h5>
+<div class="facts" id="facts"><span class="k">Cumulative</span><span class="v" title="411 nanoseconds, exact">411 ns</span><span class="p"></span><span class="k">Self</span><span class="v" title="411 nanoseconds, exact">411 ns</span><span class="p"></span><span class="k">Share of total</span><span class="v" title="0.411 ratio of view_total, rounded to 0.001 ratio">41.1%</span><span class="p">of the view total</span><span class="k">Share of parent</span><span class="v" title="0.804 ratio of parent:50666367c7698688, rounded to 0.001 ratio">80.4%</span><span class="p">of a</span><span class="k">Inexact portion</span><span class="v" title="0 nanoseconds, exact, measured zero">0</span><span class="p">from inexact samples</span><span class="k">Executions below</span><span class="v" title="unavailable: no sidecar">unavailable: no sidecar</span><span class="p">the executions log is not usable</span><span class="k">Kernel names observed</span><span class="v" title="unavailable: not a GPU view">unavailable: not a GPU view</span><span class="p">names at or below, not distinct kernels</span></div>
+</section>
+<div id="exp"><section class="sec interp"><h5>Agent interpretation — prose, not verified</h5><p><button type="button" class="cite" data-node="19f8d19ed72f72ff" title="19f8d19ed72f72ff">f4</button> <code>b</code> takes <span class="claim" title="share_of_total of b (node 19f8d19ed72f72ff): 0.411 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent">41.1%</span> of the time, maybe <mark class="unchecked" title="not checked by perf-agent">3</mark> calls deep</p></section>
+<section class="sec"><h5>Hypotheses — the agent's, not measured</h5><ul class="hyp"><li><b>Hypothesis:</b> b spins on a lock</li><li><b>Hypothesis:</b> b allocates <mark class="unchecked" title="not checked by perf-agent">2</mark> buffers per call</li></ul></section>
+<section class="sec"><h5>Next measurement — the agent's suggestion, not verified</h5><p>profile b with an off-CPU profile</p></section>
+</div>
+<p class="sec muted" id="noexp" hidden>The agent did not explain this frame: these are the profile's facts only.</p>
+<section class="sec"><h5>Rejected at render</h5>
+<p class="muted">perf-agent refused these in earlier attempts. A claim row strikes through the agent's figure beside the engine's; reference and limit rows say what was wrong. This page is the attempt that passed.</p>
+<ul class="rej"><li><span class="ref">a1</span> claim c1 (<code>share_of_total</code> of b (node 19f8d19ed72f72ff)): the agent wrote <s>0.62</s>, perf-agent has <b>41.1%</b><div class="why">value_mismatch: share_of_total is 0.411 at the engine&#39;s rounding (0.001 ratio); 0.62 is 0.620 at that rounding</div></li>
+</ul>
+</section>
+<section class="sec"><h5>Path (root → frame)</h5>
+<ol class="path" id="path"><li><button type="button" data-node="6d8817fb4e98e681"><span class="ref">f1</span><span class="pn">main</span><span class="c">100.0%</span></button></li><li><button type="button" data-node="50666367c7698688"><span class="ref">f2</span><span class="pn">a</span><span class="c">51.1%</span></button></li><li><button type="button" data-node="19f8d19ed72f72ff"><span class="ref">f4</span><span class="pn">b</span><span class="c">41.1%</span></button></li></ol>
+</section>
+<section class="sec"><h5>Follow up in your agent</h5>
+<p class="muted">Copies a question to paste into your MCP client, with the profile and the frame already named.</p>
+<div class="chips" id="chips"><button type="button" class="chip" data-prompt="Why is node 19f8d19ed72f72ff (b) wide? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0.">Why is it wide?</button><button type="button" class="chip" data-prompt="Is any of node 19f8d19ed72f72ff profiler overhead? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0.">Is it profiler overhead?</button><button type="button" class="chip" data-prompt="Compare node 19f8d19ed72f72ff with another profile using diff. Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0.">Compare with another profile</button></div>
+<textarea id="copybox" rows="3" readonly hidden aria-label="Prompt to copy"></textarea>
+</section>
+</aside>
+</main>
+<footer class="foot"><span title="1000 nanoseconds, exact">Total 1.00 µs</span><span>View cpu/nanoseconds#0</span><span>Profile cpu.pb.gz</span><span>Digest <code>891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b</code></span><span>Attempt a2</span></footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script type="application/json" id="model">{"view":"cpu/nanoseconds#0","selected":"19f8d19ed72f72ff","fact_rows":[{"k":"Cumulative","u":"nanoseconds","r":"exact"},{"k":"Self","u":"nanoseconds","r":"exact"},{"k":"Share of total","n":"of the view total","u":"ratio","d":"view_total","r":"0.001 ratio"},{"k":"Share of parent","pn":true,"u":"ratio","d":"parent","r":"0.001 ratio"},{"k":"Inexact portion","n":"from inexact samples","u":"nanoseconds","r":"exact"}],"frames":[{"id":"e3b0c44298fc1c14","ref":"f0","name":"all","cum":"1000","share":"100.0%","facts":[{"v":"1.00 µs","c":"1000"},{"v":"0","c":"0","z":true},{"v":"100.0%","c":"1.000"},{"v":"unavailable: no parent"},{"v":"0","c":"0","z":true}]},{"id":"6d8817fb4e98e681","ref":"f1","name":"main","parent":"e3b0c44298fc1c14","cum":"1000","share":"100.0%","facts":[{"v":"1.00 µs","c":"1000"},{"v":"0","c":"0","z":true},{"v":"100.0%","c":"1.000"},{"v":"100.0%","c":"1.000"},{"v":"0","c":"0","z":true}]},{"id":"50666367c7698688","ref":"f2","name":"a","parent":"6d8817fb4e98e681","cum":"511","share":"51.1%","facts":[{"v":"511 ns","c":"511"},{"v":"100 ns","c":"100"},{"v":"51.1%","c":"0.511"},{"v":"51.1%","c":"0.511"},{"v":"0","c":"0","z":true}]},{"id":"dc7211ebcac6e9c7","ref":"f3","name":"c","parent":"6d8817fb4e98e681","cum":"489","share":"48.9%","facts":[{"v":"489 ns","c":"489"},{"v":"489 ns","c":"489"},{"v":"48.9%","c":"0.489"},{"v":"48.9%","c":"0.489"},{"v":"0","c":"0","z":true}],"extra":[{"k":"Executions below","v":"unavailable: no sidecar","t":"unavailable: no sidecar","n":"the executions log is not usable"},{"k":"Kernel names observed","v":"unavailable: not a GPU view","t":"unavailable: not a GPU view","n":"names at or below, not distinct kernels"}],"explanation":[{"prose":[{"kind":"node","text":"f3","title":"dc7211ebcac6e9c7","node":"dc7211ebcac6e9c7","name":"c"},{"kind":"text","text":" is the widest at "},{"kind":"claim","text":"48.9%","title":"share_of_total of c (node dc7211ebcac6e9c7): 0.489 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent"},{"kind":"text","text":"."}],"hypotheses":null,"next":[]}]},{"id":"19f8d19ed72f72ff","ref":"f4","name":"b","parent":"50666367c7698688","cum":"411","share":"41.1%","facts":[{"v":"411 ns","c":"411"},{"v":"411 ns","c":"411"},{"v":"41.1%","c":"0.411"},{"v":"80.4%","c":"0.804"},{"v":"0","c":"0","z":true}],"extra":[{"k":"Executions below","v":"unavailable: no sidecar","t":"unavailable: no sidecar","n":"the executions log is not usable"},{"k":"Kernel names observed","v":"unavailable: not a GPU view","t":"unavailable: not a GPU view","n":"names at or below, not distinct kernels"}],"explanation":[{"prose":[{"kind":"node","text":"f4","title":"19f8d19ed72f72ff","node":"19f8d19ed72f72ff","name":"b"},{"kind":"text","text":" takes "},{"kind":"claim","text":"41.1%","title":"share_of_total of b (node 19f8d19ed72f72ff): 0.411 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent"},{"kind":"text","text":" of the time, maybe "},{"kind":"unchecked","text":"3","title":"not checked by perf-agent"},{"kind":"text","text":" calls deep"}],"hypotheses":[[{"kind":"text","text":"b spins on a lock"}],[{"kind":"text","text":"b allocates "},{"kind":"unchecked","text":"2","title":"not checked by perf-agent"},{"kind":"text","text":" buffers per call"}]],"next":[{"kind":"text","text":"profile b with an off-CPU profile"}]}]}],"prompts":[{"label":"Why is it wide?","parts":[{"s":"Why is node "},{"slot":"id"},{"s":" ("},{"slot":"name"},{"s":") wide? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0."}]},{"label":"Is it profiler overhead?","parts":[{"s":"Is any of node "},{"slot":"id"},{"s":" profiler overhead? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0."}]},{"label":"Compare with another profile","parts":[{"s":"Compare node "},{"slot":"id"},{"s":" with another profile using diff. Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is 891132b92a6ac5299fbf52b1cb95fc7f8a4f8c07d04354077e4471c128e9b17b, view cpu/nanoseconds#0."}]}]}</script>
+<script>// perfAgentPanel builds the explained page's side panel. model is the
+// page's model (fact_rows, prompts); hooks is {frameById(id), elementFor(id),
+// onSelect(id)}: frameById returns a frame object or undefined, elementFor
+// the drawn element of a frame or null, and onSelect is called with the id of
+// a frame the viewer picked inside the panel. It returns {show(frame, path),
+// factRows(f), explanation(parent, e), segments(parent, segs)}; path is the
+// list of path items from the root's child down to the frame, each with at
+// least id, ref, name and share.
+function perfAgentPanel(model, hooks) {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const chart = $('chart');
+
+  const make = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const clear = (e) => {
+    while (e.firstChild) e.removeChild(e.firstChild);
+  };
+
+  const segments = (parent, segs) => {
+    for (const s of segs || []) {
+      if (s.kind === 'claim') {
+        const e = make('span', 'claim', s.text);
+        e.title = s.title;
+        parent.appendChild(e);
+      } else if (s.kind === 'node') {
+        const b = make('button', 'cite', s.text);
+        b.type = 'button';
+        b.dataset.node = s.node;
+        b.title = s.title;
+        parent.appendChild(b);
+        parent.appendChild(document.createTextNode(' '));
+        parent.appendChild(make('code', '', s.name));
+      } else if (s.kind === 'unchecked') {
+        const m = make('mark', 'unchecked', s.text);
+        m.title = s.title;
+        parent.appendChild(m);
+      } else {
+        parent.appendChild(document.createTextNode(s.text));
+      }
+    }
+  };
+
+  const section = (cls, heading) => {
+    const s = make('section', cls ? 'sec ' + cls : 'sec');
+    s.appendChild(make('h5', '', heading));
+    return s;
+  };
+
+  const explanation = (parent, e) => {
+    const interp = section('interp', 'Agent interpretation — prose, not verified');
+    const p = make('p');
+    segments(p, e.prose);
+    interp.appendChild(p);
+    parent.appendChild(interp);
+    if (e.hypotheses && e.hypotheses.length) {
+      const hs = section('', "Hypotheses — the agent's, not measured");
+      const ul = make('ul', 'hyp');
+      for (const h of e.hypotheses) {
+        const li = make('li');
+        li.appendChild(make('b', '', 'Hypothesis:'));
+        li.appendChild(document.createTextNode(' '));
+        segments(li, h);
+        ul.appendChild(li);
+      }
+      hs.appendChild(ul);
+      parent.appendChild(hs);
+    }
+    if (e.next && e.next.length) {
+      const ns = section('', "Next measurement — the agent's suggestion, not verified");
+      const p2 = make('p');
+      segments(p2, e.next);
+      ns.appendChild(p2);
+      parent.appendChild(ns);
+    }
+  };
+
+  const maxPromptName = 200;
+  const promptName = (name) => {
+    const chars = Array.from(name);
+    return chars.length > maxPromptName ? chars.slice(0, maxPromptName).join('') + '…' : name;
+  };
+  const prompt = (p, f) => p.parts.map((part) => {
+    if (part.slot === 'id') return f.id;
+    if (part.slot === 'name') return promptName(f.name);
+    return part.s || '';
+  }).join('');
+
+  const exactTitle = (c, unit, den, rounding, zero) => {
+    let s = c + ' ' + unit;
+    if (den) s += ' of ' + den;
+    if (rounding === 'exact') s += ', exact';
+    else if (rounding) s += ', rounded to ' + rounding;
+    if (zero) s += ', measured zero';
+    return s;
+  };
+  const factRowsWith = (f, parent) => {
+    const rows = model.fact_rows.map((spec, i) => {
+      const val = f.facts[i];
+      let note = spec.n || '';
+      if (spec.pn) note = parent ? 'of ' + parent.name : '';
+      let title = val.v;
+      if (val.c) title = exactTitle(val.c, spec.u, spec.d === 'parent' ? 'parent:' + f.parent : spec.d, spec.r, val.z);
+      return {k: spec.k, v: val.v, t: title, n: note};
+    });
+    return rows.concat(f.extra || []);
+  };
+  const factRows = (f) => factRowsWith(f, f.parent ? hooks.frameById(f.parent) : undefined);
+
+  let currentEl = null;
+  const show = (f, path) => {
+    if (!f) return;
+    if (currentEl) currentEl.classList.remove('cur');
+    currentEl = hooks.elementFor(f.id) || null;
+    if (currentEl) currentEl.classList.add('cur');
+    $('sel-ref').textContent = f.ref;
+    $('sel-name').textContent = f.name;
+    $('sel-id').textContent = f.id;
+
+    const parent = (f.parent && (hooks.frameById(f.parent) || (path || []).find((g) => g.id === f.parent))) || undefined;
+    const facts = $('facts');
+    clear(facts);
+    for (const r of factRowsWith(f, parent)) {
+      facts.appendChild(make('span', 'k', r.k));
+      const v = make('span', 'v', r.v);
+      v.title = r.t;
+      facts.appendChild(v);
+      facts.appendChild(make('span', 'p', r.n || ''));
+    }
+
+    const exp = $('exp');
+    clear(exp);
+    const list = f.explanation || [];
+    for (const e of list) explanation(exp, e);
+    $('noexp').hidden = list.length > 0;
+
+    if (chart) for (const c of chart.querySelectorAll('.frame.cite')) c.classList.remove('cite');
+    for (const b of exp.querySelectorAll('button.cite')) {
+      const ce = hooks.elementFor(b.dataset.node);
+      if (ce && b.dataset.node !== f.id) ce.classList.add('cite');
+    }
+
+    const pathEl = $('path');
+    clear(pathEl);
+    for (const g of path || []) {
+      const li = make('li');
+      const b = make('button');
+      b.type = 'button';
+      b.dataset.node = g.id;
+      b.appendChild(make('span', 'ref', g.ref));
+      b.appendChild(make('span', 'pn', g.name));
+      b.appendChild(make('span', 'c', g.share));
+      li.appendChild(b);
+      pathEl.appendChild(li);
+    }
+
+    const chips = $('chips');
+    clear(chips);
+    for (const p of model.prompts) {
+      const b = make('button', 'chip', p.label);
+      b.type = 'button';
+      b.dataset.prompt = prompt(p, f);
+      chips.appendChild(b);
+    }
+    $('copybox').hidden = true;
+  };
+
+  // Frames picked inside the panel (a reference in the explanation or a
+  // path entry) go to onSelect. The click stops here: show() replaces the
+  // panel's content, so a handler further up would find the target detached
+  // from the panel and take it for a click elsewhere.
+  const picked = (ev) => {
+    const b = ev.target.closest('[data-node]');
+    if (!b) return;
+    ev.stopPropagation();
+    hooks.onSelect(b.dataset.node);
+  };
+  $('exp').addEventListener('click', picked);
+  $('path').addEventListener('click', picked);
+
+  return {show, factRows, explanation, segments};
+}
+
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const model = JSON.parse($('model').textContent);
+  const frames = model.frames;
+  const byId = new Map();
+  frames.forEach((f, i) => byId.set(f.id, i));
+  const chart = $('chart');
+  const els = new Map();
+  for (const el of chart.querySelectorAll('.frame')) els.set(Number(el.dataset.i), el);
+
+  const chainFromModel = (i) => {
+    const chain = [];
+    for (let g = frames[i]; g && g.parent; g = frames[byId.get(g.parent)]) chain.push(g);
+    return chain.reverse();
+  };
+
+  let panel;
+  const select = (i, scroll) => {
+    const f = frames[i];
+    if (!f) return;
+    panel.show(f, chainFromModel(i));
+    const el = els.get(i);
+    if (el && scroll) el.scrollIntoView({block: 'nearest', inline: 'nearest'});
+  };
+  panel = perfAgentPanel(model, {
+    frameById: (id) => frames[byId.get(id)],
+    elementFor: (id) => els.get(byId.get(id)),
+    onSelect: (id) => {
+      if (byId.has(id)) select(byId.get(id), true);
+    },
+  });
+
+  let toastTimer = 0;
+  const toast = (msg) => {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+  };
+  const fallback = (text) => {
+    const box = $('copybox');
+    box.value = text;
+    box.hidden = false;
+    box.focus();
+    box.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (e) {
+      ok = false;
+    }
+    toast(ok ? 'Copied the prompt' : 'Press Ctrl+C to copy the selected prompt');
+  };
+  const copy = (text) => {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast('Copied the prompt'), () => fallback(text));
+    } else {
+      fallback(text);
+    }
+  };
+
+  chart.addEventListener('click', (ev) => {
+    const el = ev.target.closest('.frame');
+    if (el) select(Number(el.dataset.i), false);
+  });
+  chart.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    const el = ev.target.closest('.frame');
+    if (!el) return;
+    ev.preventDefault();
+    select(Number(el.dataset.i), false);
+  });
+  document.addEventListener('click', (ev) => {
+    const chip = ev.target.closest('[data-prompt]');
+    if (chip) {
+      copy(chip.dataset.prompt);
+      return;
+    }
+    const ref = ev.target.closest('[data-node]');
+    if (ref && !ref.closest('#exp, #path') && byId.has(ref.dataset.node)) select(byId.get(ref.dataset.node), true);
+  });
+
+  if (byId.has(model.selected)) select(byId.get(model.selected), false);
+})();
+</script>
+</body>
+</html>
+
+

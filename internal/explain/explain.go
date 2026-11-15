@@ -108,11 +108,18 @@ func (l Literal) MarshalJSON() ([]byte, error) {
 const maxEcho = 64
 
 // Notice is something Decode ignored, at a path like
-// "explanations[0].claims[1].tolerance".
+// "explanations[0].claims[1].tolerance", or advice about text that passed.
+// Code, when set, names the advice. A notice never fails a check.
 type Notice struct {
 	Path    string `json:"path"`
+	Code    string `json:"code,omitzero"`
 	Message string `json:"message"`
 }
+
+// NoticeUnitRepeated is the code of a notice about a unit written right
+// after a claim placeholder: the page shows the claim with its own unit,
+// so the unit would show twice.
+const NoticeUnitRepeated = "unit_repeated"
 
 // Code names why a claim or reference failed.
 type Code string

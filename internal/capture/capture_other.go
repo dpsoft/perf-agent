@@ -118,3 +118,21 @@ func KillCgroup(string) error { return notLinux() }
 
 // RemoveCgroup is disabled: capture needs Linux.
 func RemoveCgroup(string) error { return notLinux() }
+
+// Run is one capture, which needs Linux.
+type Run struct{}
+
+// Start is disabled: capture needs Linux.
+func Start(RunSpec) (*Run, *Error) { return nil, notLinux() }
+
+// Phase is done: there is never a capture here.
+func (*Run) Phase() string { return PhaseDone }
+
+// Cancel does nothing: there is never a capture here.
+func (*Run) Cancel() {}
+
+// Kill does nothing: there is never a capture here.
+func (*Run) Kill() {}
+
+// Wait returns at once: there is never a capture here.
+func (*Run) Wait() Outcome { return Outcome{Err: notLinux(), PerfAgentExit: -1} }

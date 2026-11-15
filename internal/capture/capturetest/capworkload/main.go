@@ -61,8 +61,16 @@ func run(mode string, args []string) error {
 	// Arguments are parsed up front so a bad one is an error, never a
 	// zero duration.
 	switch mode {
-	case "busy", "sleep", "fork-and-exit", "double-fork-setsid", spawnSetsid, "ignore-sigterm":
+	case "busy", "sleep", "fork-and-exit", spawnSetsid, "ignore-sigterm":
 		dur(0)
+	case "double-fork-setsid":
+		dur(0)
+		if len(args) > 1 {
+			dur(1)
+		}
+	case "flood-then-sleep":
+		num(0)
+		dur(1)
 	case "exit-after":
 		dur(0)
 		num(1)
@@ -87,7 +95,11 @@ func run(mode string, args []string) error {
 	case "fork-and-exit":
 		return forkAndExit(dur(0))
 	case "double-fork-setsid":
-		return doubleForkSetsid(dur(0))
+		grandchild := dur(0)
+		if len(args) > 1 {
+			grandchild = dur(1)
+		}
+		return doubleForkSetsid(dur(0), grandchild)
 	case spawnSetsid:
 		return spawnDetached(dur(0))
 	case "drop-dumpable-after":
@@ -103,6 +115,10 @@ func run(mode string, args []string) error {
 		time.Sleep(dur(0))
 	case "flood-output":
 		flood(num(0))
+	case "flood-then-sleep":
+		flood(num(0))
+		fmt.Println("flooded")
+		time.Sleep(dur(1))
 	case "report":
 		return report()
 	case "exec":
@@ -126,11 +142,12 @@ func forkAndExit(d time.Duration) error {
 	return nil
 }
 
-// doubleForkSetsid runs an intermediate that starts a sleeper in a new
-// session and exits, so the sleeper is orphaned and outside this group.
-// It prints the sleeper's pid, then sleeps itself.
-func doubleForkSetsid(d time.Duration) error {
-	c := exec.Command(os.Args[0], spawnSetsid, d.String())
+// doubleForkSetsid runs an intermediate that starts a sleeper (for
+// grandchild) in a new session and exits, so the sleeper is orphaned and
+// outside this group. It prints the sleeper's pid, then sleeps for d
+// itself.
+func doubleForkSetsid(d, grandchild time.Duration) error {
+	c := exec.Command(os.Args[0], spawnSetsid, grandchild.String())
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	if err := c.Run(); err != nil {
 		return err

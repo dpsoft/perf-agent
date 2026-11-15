@@ -140,6 +140,14 @@ func run() int {
 		spam(os.Stdout)
 		spam(os.Stderr)
 	}
+	if mf.Mode == fakemode.HugeFileThenHang {
+		signal.Ignore(syscall.SIGINT)
+		if err := writeOutputs(fakemode.HugeFile, dir, vals, bools); err != nil {
+			return fail(err)
+		}
+		time.Sleep(10 * time.Minute)
+		return 1
+	}
 
 	var timeout <-chan time.Time
 	if duration > 0 {

@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -187,9 +188,9 @@ type Event struct {
 	Err       string     `json:",omitzero"`
 }
 
-// The FaultPause values. Each suspends only the publication of one event,
-// for the life of the reaper; the reaper still owns the child and kills it
-// on EOF or at the deadline.
+// The FaultPause values. Each but the launcher's suspends only the
+// publication of one event, for the life of the reaper; the reaper still
+// owns the child and kills it on EOF or at the deadline.
 const (
 	// PauseAfterPerfAgentFork holds back the attached event, and with it
 	// perf-agent's exited event.
@@ -202,4 +203,122 @@ const (
 	// PauseBeforeExit, followed by a path, keeps the reaper and its lock
 	// after cleanup until that path disappears.
 	PauseBeforeExit = "before-exit:"
+	// PauseLauncherDiesAfterMarker makes the launcher SIGKILL itself after
+	// it writes the exec marker and before it executes the command, so the
+	// reaper publishes launched for a process that never ran it.
+	PauseLauncherDiesAfterMarker = "launcher-dies-after-marker"
 )
+
+// Bounds are the limits one capture runs under. StartTimeout runs from
+// Start to perf-agent's readiness line (for a command, its launch
+// included); FinishTimeout from the stop to perf-agent's exit; StopGrace
+// bounds each wait for a signalled process. MaxOutputTail is the most of
+// each output an Outcome carries. MaxProfileBytes and MaxExeclogBytes
+// bound the files in the staging directory while they are written.
+// Recheck is the interval of the target recheck and Poll that of the size
+// and liveness checks.
+type Bounds struct {
+	StartTimeout, FinishTimeout, StopGrace time.Duration
+	MaxOutputTail                          int
+	MaxProfileBytes, MaxExeclogBytes       int64
+	Recheck, Poll                          time.Duration
+}
+
+// DefaultBounds are the default limits of §6.1.
+func DefaultBounds() Bounds {
+	return Bounds{
+		StartTimeout:    15 * time.Second,
+		FinishTimeout:   30 * time.Second,
+		StopGrace:       5 * time.Second,
+		MaxOutputTail:   2 << 10,
+		MaxProfileBytes: 256 << 20,
+		MaxExeclogBytes: 256 << 20,
+		Recheck:         time.Second,
+		Poll:            250 * time.Millisecond,
+	}
+}
+
+// RunSpec is one capture. Self is the server's own binary, which runs the
+// reaper and the launcher. The target is PID, or the command Launch, which
+// the reaper starts (exactly one is set); Launch.Path is the resolved
+// command. Staging is the open staging directory, at StagingPath, which
+// perf-agent writes into. GPU is the verified shim for a gpu capture.
+// Lock is the locked captures lock, handed to the reaper, which holds it
+// until both children are reaped; the caller still closes its own copy.
+// Cgroup is the delegated parent cgroup (from DelegatedCgroup), under
+// which a command gets a cgroup of its own; empty means none. Log takes
+// the children's output at debug level. FaultPause is passed to the
+// reaper. Events, a test seam, may rewrite the reaper's event stream.
+type RunSpec struct {
+	Self        string
+	Binary      Binary
+	Proc        Proc
+	SelfID      SelfID
+	PID         int
+	Launch      *LaunchSpec
+	Settings    Settings
+	Staging     *os.Root
+	StagingPath string
+	CaptureID   string
+	GPU         *Shim
+	Bounds      Bounds
+	Lock        *os.File
+	Cgroup      string
+	Log         *slog.Logger
+	FaultPause  string
+	Events      func(<-chan Event) <-chan Event
+}
+
+// What stopped a capture that profiled.
+const (
+	StoppedByDuration    = "duration"
+	StoppedByTargetExit  = "target_exit"
+	StoppedByCommandExit = "command_exit"
+	StoppedByCancel      = "cancel"
+)
+
+// The phases of a Run, as Phase reports them.
+const (
+	PhaseLaunching = "launching"
+	PhaseAttaching = "attaching"
+	PhaseProfiling = "profiling"
+	PhaseFinishing = "finishing"
+	PhaseDone      = "done"
+)
+
+// Tail is the end of a launched command's stdout and stderr: at most
+// Bounds.MaxOutputTail bytes each, valid UTF-8, cut on a rune boundary.
+// It is the program's own output, and untrusted.
+type Tail struct {
+	Stdout, Stderr string
+}
+
+// Outcome is how one capture ended. Err is nil only for a capture whose
+// files may be kept. StoppedBy is one of the StoppedBy values once
+// profiling began. Target is what the preflight saw; Launched says the
+// command was proven to run (its PID alive and running the command, not
+// the launcher). CommandPath and ArgCount describe the command (ArgCount
+// is its argv length, argv[0] included). Started is when the capture
+// began. AttachLatency runs to the readiness line from the command's
+// launch, or for a PID from the attach; Profiled from the readiness line
+// to the stop. PerfAgentExit is perf-agent's exit status, -1 when it was
+// killed or never ran; StderrTail is its stderr's end, on failure only.
+// Survivors and Cleanup are the reaper's report. Argv is perf-agent's
+// argv, once it was built.
+type Outcome struct {
+	Err                     *Error
+	StoppedBy               string
+	Target                  TargetState
+	Launched                bool
+	CommandPath             string
+	ArgCount                int
+	Started                 time.Time
+	AttachLatency, Profiled time.Duration
+	PerfAgentExit           int
+	StderrTail              string
+	Workload                Tail
+	Survivors               []Survivor
+	Cleanup                 string
+	Notes                   []string
+	Argv                    []string
+}

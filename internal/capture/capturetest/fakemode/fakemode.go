@@ -21,11 +21,14 @@ const (
 	ForkGrandchild  Mode = "fork-grandchild"
 	HangAfterSIGINT Mode = "hang-after-sigint"
 	NoGPUSamples    Mode = "no-gpu-samples"
+	// HugeFileThenHang gives its first output a 256 MiB size right after
+	// readiness, then ignores SIGINT and never exits until killed.
+	HugeFileThenHang Mode = "huge-file-then-hang"
 )
 
 // All lists every mode; the fake refuses a mode that is not here.
 var All = []Mode{Normal, NeverReady, IgnoreSIGINT, Exit1Stderr, Exit2, Exit127Loader, NoFile,
-	HugeFile, SymlinkOutput, HardlinkOutput, SpamStdout, ForkGrandchild, HangAfterSIGINT, NoGPUSamples}
+	HugeFile, SymlinkOutput, HardlinkOutput, SpamStdout, ForkGrandchild, HangAfterSIGINT, NoGPUSamples, HugeFileThenHang}
 
 // File is fake-mode.json, which sits beside the fake executable because the
 // fake runs with a scrubbed environment.

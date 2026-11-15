@@ -41,10 +41,12 @@ func setChildSubreaper() error {
 // directory and the output descriptors; the environment is exactly
 // spec.Env. It returns only on failure, with 126 (or 127 when the command
 // is missing) and the reason on stderr, which is the workload's stderr.
-func launch(spec LaunchSpec) int {
+func launch(w launcherWire) int {
+	spec := w.Spec
 	runtime.LockOSThread()
-	// The sync descriptor closes on a successful exec, which is how the
-	// reaper learns the command runs; a failure is written to it first.
+	// The sync descriptor closes on a successful exec, and also when the
+	// launcher dies, so EOF alone proves nothing; a failure is written to
+	// it first, and the marker says the exec was reached.
 	syscall.CloseOnExec(launchSyncFD)
 	fail := func(code int, format string, args ...any) int {
 		msg := fmt.Sprintf(format, args...)
@@ -60,10 +62,14 @@ func launch(spec LaunchSpec) int {
 		argv = []string{spec.Path}
 	}
 	// The marker comes last before the exec: EOF after it, and nothing
-	// more, is the exec closing the pipe.
+	// more, is the exec closing the pipe or the launcher dying before the
+	// exec took effect; the two cannot be told apart from here.
 	if _, err := syscall.Write(launchSyncFD, []byte{execMarker}); err != nil {
 		fmt.Fprintf(os.Stderr, "perf-agent-mcp launcher: write the exec marker: %v\n", err)
 		return 126
+	}
+	if w.DieAfterMarker {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 	}
 	err := syscall.Exec(spec.Path, argv, spec.Env)
 	code := 126
@@ -77,7 +83,8 @@ func launch(spec LaunchSpec) int {
 const launchSyncFD = 4
 
 // execMarker is what the launcher writes on the sync pipe just before it
-// executes the command: EOF right after it is a successful exec, the
-// marker followed by text is a failed one, and nothing at all is a
-// launcher that exited before it got that far.
+// executes the command: EOF right after it is an exec attempted (it
+// succeeded, or the launcher died before it took effect), the marker
+// followed by text is a failed one, and nothing at all is a launcher that
+// exited before it got that far.
 const execMarker byte = '!'

@@ -234,8 +234,8 @@ func TestTheLockWaitsForTheKnownChildren(t *testing.T) {
 	}
 }
 
-// The handshake tells a confirmed exec from a launcher that failed or
-// exited before it: only the marker, then EOF, is an exec.
+// The handshake tells an attempted exec from a launcher that failed or
+// exited before it: only the marker, then EOF, is an exec attempted.
 func TestTheHandshakeNeedsTheExecMarker(t *testing.T) {
 	for _, tc := range []struct {
 		name, wrote, want string
@@ -264,7 +264,7 @@ func TestTheHandshakeNeedsTheExecMarker(t *testing.T) {
 			err = handshake(specW, syncR, []byte(`{"Path":"/x"}`))
 			switch {
 			case tc.want == "" && err != nil:
-				t.Errorf("handshake = %v, want a confirmed exec", err)
+				t.Errorf("handshake = %v, want an attempted exec", err)
 			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
 				t.Errorf("handshake = %v, want an error containing %q", err, tc.want)
 			}

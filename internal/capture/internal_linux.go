@@ -66,7 +66,7 @@ func RunInternal() (code int, handled bool) {
 	}
 	spec := os.NewFile(specFD, "spec")
 	if mode == modeLauncher {
-		var l LaunchSpec
+		var l launcherWire
 		if err := readSpec(spec, &l); err != nil {
 			fmt.Fprintf(os.Stderr, "perf-agent-mcp launcher: read the spec: %v\n", err)
 			return 126, true
@@ -84,6 +84,14 @@ func RunInternal() (code int, handled bool) {
 type reaperWire struct {
 	Spec    ReaperSpec
 	Present uint8
+}
+
+// launcherWire is what fd 3 carries to a launcher: the command, and
+// DieAfterMarker, the fault pause that kills the launcher between the exec
+// marker and the exec.
+type launcherWire struct {
+	Spec           LaunchSpec
+	DieAfterMarker bool `json:",omitzero"`
 }
 
 // slot returns fd as a file when the wire says it carries one.
@@ -174,11 +182,11 @@ type reaper struct {
 	// wait4 is wait4(-1, ws, WNOHANG); a test replaces it so that it never
 	// reaps the test process's own children.
 	wait4 func(ws *syscall.WaitStatus) (int, error)
-	// launches delivers the launcher's handshake: nil once the command
-	// runs, or why it does not.
+	// launches delivers the launcher's handshake: nil once it reached the
+	// exec (attempted, not proven), or why it did not.
 	launches chan error
-	// launchPending holds the workload's exited event while its exec is
-	// unconfirmed, so it follows launched.
+	// launchPending holds the workload's exited event while the handshake
+	// is pending, so it follows launched.
 	launchPending bool
 	heldExit      *Event
 	// starts records the start time of each child the sweep listed.
@@ -502,7 +510,7 @@ func (r *reaper) startWorkload() {
 		r.fail(WhoWorkload, fmt.Sprintf("command path %q is not absolute", r.spec.Launch.Path))
 		return
 	}
-	b, err := json.Marshal(r.spec.Launch)
+	b, err := json.Marshal(launcherWire{Spec: *r.spec.Launch, DieAfterMarker: r.spec.FaultPause == PauseLauncherDiesAfterMarker})
 	if err != nil {
 		r.fail(WhoWorkload, err.Error())
 		return
@@ -566,10 +574,14 @@ func (r *reaper) startWorkload() {
 }
 
 // handshake writes the launcher its spec, then reads the sync pipe to EOF:
-// exactly the exec marker means the exec closed it, so the command runs;
-// the marker and text, or text alone, is the launcher's failure; nothing
-// is a launcher that exited (or was killed) before it got to the exec.
-// Both steps have a deadline.
+// exactly the exec marker means the launcher got as far as the exec and
+// the pipe then closed, which a successful exec does, but so does a
+// launcher killed in between: no signal reaches user space after an exec
+// succeeds, so this is "exec attempted", never proof that the command
+// runs. The server proves it from /proc on launched. The marker and text,
+// or text alone, is the launcher's failure; nothing is a launcher that
+// exited (or was killed) before it got to the exec. Both steps have a
+// deadline.
 func handshake(specW, syncR *os.File, spec []byte) error {
 	defer func() { _ = syncR.Close() }()
 	_ = specW.SetWriteDeadline(time.Now().Add(launchHandshake))
@@ -592,9 +604,10 @@ func handshake(specW, syncR *os.File, spec []byte) error {
 	return errors.New(string(msg))
 }
 
-// launchDone publishes launched once the exec is confirmed, then any exit
-// held back meanwhile; a failed exec is an error event, and the workload
-// is never reported.
+// launchDone publishes launched once the launcher reached its exec, then
+// any exit held back meanwhile; a failed exec is an error event, and the
+// workload is never reported. launched says the exec was attempted; the
+// server checks that the PID really runs the command.
 func (r *reaper) launchDone(err error) {
 	r.launchPending = false
 	w := r.work

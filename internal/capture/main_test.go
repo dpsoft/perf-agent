@@ -59,6 +59,26 @@ var testChildBodies = map[string]func() string{
 		}()
 		return "ready"
 	},
+	// flip-dumpable turns non-dumpable on SIGUSR1 and prints "dropped", and
+	// dumpable again on SIGUSR2 and prints "restored".
+	"flip-dumpable": func() string {
+		sig := make(chan os.Signal, 2)
+		signal.Notify(sig, syscall.SIGUSR1, syscall.SIGUSR2)
+		go func() {
+			for s := range sig {
+				v, say := 0, "dropped"
+				if s == syscall.SIGUSR2 {
+					v, say = 1, "restored"
+				}
+				if err := unix.Prctl(unix.PR_SET_DUMPABLE, uintptr(v), 0, 0, 0); err != nil {
+					fmt.Println("failed", err)
+					continue
+				}
+				fmt.Println(say)
+			}
+		}()
+		return "ready"
+	},
 	// hold-lock takes the captures lock in testLockDirEnv for the life of
 	// the child and prints "held".
 	"hold-lock": func() string {

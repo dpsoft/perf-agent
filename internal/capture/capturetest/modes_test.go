@@ -392,6 +392,24 @@ func TestFakeModes(t *testing.T) {
 		}
 	})
 
+	t.Run("huge-file-then-hang", func(t *testing.T) {
+		dir := t.TempDir()
+		fake := capturetest.FakePerfAgent(t, capturetest.FakeOptions{Mode: capturetest.FakeHugeFileThenHang})
+		p := start(t, fakeCmd(argvFor(t, fake, dir, short)))
+		readyLine(t, p)
+		if !waitFor(10*time.Second, func() bool { fi, err := os.Stat(cpuFile(dir)); return err == nil && fi.Size() >= 64<<20 }) {
+			t.Fatal("no huge output after readiness")
+		}
+		// It outlives its duration and a SIGINT: only a kill ends it.
+		_ = p.cmd.Process.Signal(syscall.SIGINT)
+		time.Sleep(short.Duration + 300*time.Millisecond)
+		if !p.alive() {
+			t.Fatal("exited before it was killed")
+		}
+		_ = p.cmd.Process.Kill()
+		p.wait(t)
+	})
+
 	t.Run("symlink-output", func(t *testing.T) {
 		dir := t.TempDir()
 		fake := capturetest.FakePerfAgent(t, capturetest.FakeOptions{Mode: capturetest.FakeSymlinkOutput})
@@ -557,6 +575,18 @@ func TestWorkloadModes(t *testing.T) {
 		p.wait(t)
 	})
 
+	t.Run("double-fork-setsid-grandchild-outlives", func(t *testing.T) {
+		p := run(t, "double-fork-setsid", "100ms", "5s")
+		gc := pidLine(t, p)
+		if got := p.wait(t); got != 0 {
+			t.Fatalf("exit %d", got)
+		}
+		if _, err := startTime(gc); err != nil {
+			t.Fatalf("the grandchild did not outlive the workload: %v", err)
+		}
+		pidKills[gc]()
+	})
+
 	t.Run("drop-dumpable-after", func(t *testing.T) {
 		capturetest.SkipIfPrivileged(t)
 		p := run(t, "drop-dumpable-after", "50ms", "5s")
@@ -607,13 +637,39 @@ func TestWorkloadModes(t *testing.T) {
 		}
 	})
 
+	t.Run("flood-then-sleep", func(t *testing.T) {
+		p := run(t, "flood-then-sleep", "1", "300ms")
+		if !waitFor(10*time.Second, func() bool { return bytes.HasSuffix(p.stdout.bytes(), []byte("flooded\n")) }) {
+			t.Fatal("no flooded line")
+		}
+		if !p.alive() {
+			t.Fatal("exited before its sleep")
+		}
+		if got := p.wait(t); got != 0 {
+			t.Fatalf("exit %d", got)
+		}
+		if out := p.stdout.bytes(); len(out) < 1<<20 || p.stderr.Len() < 1<<20 || utf8.Valid(out) {
+			t.Fatalf("stdout %d (valid utf8 %v) stderr %d", len(out), utf8.Valid(out), p.stderr.Len())
+		}
+	})
+
 	t.Run("bad-invocations", func(t *testing.T) {
-		for _, args := range [][]string{{}, {"nope"}, {"sleep"}, {"sleep", "soon"}, {"exit-after", "1ms", "x"}, {"flood-output", "many"}, {"exec"}, {"exec", "/nonexistent/x"}} {
+		for _, args := range [][]string{{}, {"nope"}, {"sleep"}, {"sleep", "soon"}, {"exit-after", "1ms", "x"}, {"flood-output", "many"}, {"flood-then-sleep", "1"}, {"double-fork-setsid", "1s", "x"}, {"exec"}, {"exec", "/nonexistent/x"}} {
 			if got := run(t, args...).wait(t); got != 2 {
 				t.Errorf("%q: exit %d, want 2", args, got)
 			}
 		}
 	})
+}
+
+// waitFor polls cond every 10 ms until it holds or d passes.
+func waitFor(d time.Duration, cond func() bool) bool {
+	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if cond() {
+			return true
+		}
+	}
+	return cond()
 }
 
 // sessionOf reads the session id from /proc/<pid>/stat.

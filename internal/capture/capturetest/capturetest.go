@@ -111,6 +111,10 @@ const (
 	// FakeNoGPUSamples writes a valid profile with zero GPU samples and an
 	// execution log consistent with it.
 	FakeNoGPUSamples = fakemode.NoGPUSamples
+	// FakeHugeFileThenHang gives its first output a 256 MiB size right
+	// after readiness, then hangs, SIGINT ignored, until killed: a size
+	// limit can only end it by a kill.
+	FakeHugeFileThenHang = fakemode.HugeFileThenHang
 )
 
 // FakeOptions configures one fake perf-agent.

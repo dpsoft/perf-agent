@@ -160,6 +160,9 @@ type reaper struct {
 	exits      chan exitNote
 	cmds       <-chan Command
 	deadline   <-chan time.Time
+	// term delivers SIGTERM, SIGINT and SIGHUP, which end the capture as
+	// EOF does instead of killing the reaper.
+	term <-chan os.Signal
 	// cancelKill fires StopGrace after a cancel's SIGINT.
 	cancelKill <-chan time.Time
 	stopping   bool
@@ -231,6 +234,9 @@ func runReaper(w reaperWire, specErr error) int {
 // and exits until perf-agent is done or the server is gone, the end of the
 // workload, the final cleanup and survivor report, and the lock last.
 func (r *reaper) run() int {
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	r.term = term
 	if r.spec.FaultPause == PauseNoSubreaper {
 		r.subreaper = errors.New("skipped by the no-subreaper fault pause")
 	} else {
@@ -355,6 +361,8 @@ func (r *reaper) serve() (aborted bool) {
 		case e := <-r.exits:
 			r.exited(e)
 		case <-r.deadline:
+			return true
+		case <-r.term:
 			return true
 		case <-r.cancelKill:
 			r.cancelKill = nil
@@ -518,38 +526,20 @@ func (r *reaper) exited(e exitNote) {
 	}
 }
 
-// signalGroup signals c's process group, under mu. While the leader is
-// unreaped its PID, and so the group's number, cannot be reused. Once it
-// is reaped, the group is signalled only while /proc shows a member: the
-// kernel does not reuse a number still in use as a process group ID.
+// signalGroup signals c's process group, and only while c is an unreaped
+// child: under mu the wait loop cannot reap it, so its PID, and with it
+// the group's number, is still c's. Once c is reaped the number may be
+// reused by anyone; what is left of the group is reached only through the
+// sweep of adopted children, by verified PID, or the cgroup.
 func (r *reaper) signalGroup(c *child, sig syscall.Signal) {
 	if c == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.live[c.pid] || r.groupMembers(c.pid, false) {
+	if r.live[c.pid] {
 		_ = syscall.Kill(-c.pid, sig)
 	}
-}
-
-// groupMembers reports whether a process is in group pgid; liveOnly
-// leaves out zombies.
-func (r *reaper) groupMembers(pgid int, liveOnly bool) bool {
-	ents, err := os.ReadDir(r.proc.Root)
-	if err != nil {
-		return false
-	}
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		if s, err := readStat(r.proc, pid); err == nil && s.pgrp == pgid && (!liveOnly || !s.exited()) {
-			return true
-		}
-	}
-	return false
 }
 
 // endWorkload ends a workload still running after perf-agent: cgroup.kill
@@ -568,8 +558,10 @@ func (r *reaper) endWorkload() bool {
 		}
 		r.reasons = append(r.reasons, "cgroup.kill: "+err.Error())
 	}
+	// Members left after the leader are adopted children by then, and the
+	// sweep ends them.
 	r.signalGroup(w, syscall.SIGTERM)
-	ok, aborted := r.waitUntil(time.Now().Add(r.spec.StopGrace), true, func() bool { return !r.groupMembers(w.pid, true) })
+	ok, aborted := r.waitUntil(time.Now().Add(r.spec.StopGrace), true, func() bool { return w.reaped })
 	if !ok {
 		r.signalGroup(w, syscall.SIGKILL)
 	}
@@ -595,9 +587,9 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 	defer tick.Stop()
 	timer := time.NewTimer(time.Until(end))
 	defer timer.Stop()
-	cmds, deadline := r.cmds, r.deadline
+	cmds, deadline, term := r.cmds, r.deadline, r.term
 	if !abortable {
-		cmds, deadline = nil, nil
+		cmds, deadline, term = nil, nil, nil
 	}
 	for {
 		if cond() {
@@ -606,11 +598,18 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 		select {
 		case e := <-r.exits:
 			r.exited(e)
-		case _, open := <-cmds:
+		case c, open := <-cmds:
 			if !open {
 				return false, true
 			}
+			who := ""
+			if c.Op == OpAttach {
+				who = WhoPerfAgent
+			}
+			r.fail(who, fmt.Sprintf("the capture is ending: %s ignored", c.Op))
 		case <-deadline:
+			return false, true
+		case <-term:
 			return false, true
 		case <-timer.C:
 			return cond(), false

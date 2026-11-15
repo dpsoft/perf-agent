@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -681,6 +682,9 @@ func TestKillLeavesTheReaperToCleanUp(t *testing.T) {
 	if !h.reaper.alive() {
 		t.Fatal("the reaper is gone; Kill must never kill it")
 	}
+	// The test's own lease is closed first, so busy can only be the
+	// reaper's inherited descriptor.
+	_ = h.lease.Close()
 	if _, e := TryLock(h.root, Holder{}); e == nil || e.Code != CodeBusy {
 		t.Errorf("TryLock while the reaper holds the lock = %v, want busy", e)
 	}
@@ -1051,4 +1055,115 @@ func TestReaperClosesStrayDescriptors(t *testing.T) {
 	if !h.reaper.alive() {
 		t.Error("the reaper exited; the test proves nothing")
 	}
+}
+
+// otherGroup starts a sleeper in its own process group that no reaper
+// owns, standing in for a process that reused a reaped child's number.
+// gone is closed when the sleeper has exited.
+func otherGroup(t *testing.T) (pid int, gone <-chan struct{}) {
+	t.Helper()
+	cmd := exec.Command(capturetest.Workload(t), "sleep", "30s")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-done
+	})
+	return cmd.Process.Pid, done
+}
+
+func survives(t *testing.T, gone <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-gone:
+		t.Fatal("an unrelated process group was signalled")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Once a child is reaped its group number may belong to someone else, so
+// the reaper never signals it again.
+func TestAReapedGroupIsNeverSignalled(t *testing.T) {
+	pid, gone := otherGroup(t)
+	r := &reaper{proc: DefaultProc(), live: map[int]bool{}}
+	start, _ := StartTime(DefaultProc(), pid)
+	r.signalGroup(&child{pid: pid, start: start, reaped: true}, syscall.SIGKILL)
+	survives(t, gone)
+}
+
+// The server's Kill signals nothing: a group number from an event may
+// already have been reaped and reused when Kill runs.
+func TestServerKillSignalsNoGroup(t *testing.T) {
+	pid, gone := otherGroup(t)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Reaper{proc: &child{pid: os.Getpid()}, closeCmds: func() {}, events: make(chan Event, 8)}
+	go r.readEvents(pr)
+	for _, ev := range []Event{
+		{Op: EventLaunched, Who: WhoWorkload, PID: pid, PGID: pid},
+		{Op: EventAttached, Who: WhoPerfAgent, PID: pid, PGID: pid},
+	} {
+		b, _ := json.Marshal(ev)
+		if _, err := pw.Write(append(b, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		<-r.events
+	}
+	r.Kill()
+	_ = pw.Close()
+	survives(t, gone)
+}
+
+// SIGTERM, SIGINT or SIGHUP to the reaper is a full cleanup, as EOF is:
+// it never dies of them and leaves the children.
+func TestReaperTreatsTerminationSignalsAsEOF(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			spec := fakeSpec(t, capturetest.FakeOptions{})
+			spec.Launch = workload(t, "sleep", "1m")
+			h := startHarness(t, spec)
+			wl := h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
+			h.send(attach(spec, "1m", t.TempDir()))
+			at := h.waitFor(EventAttached, WhoPerfAgent, 10*time.Second)
+			h.waitReady()
+			if err := syscall.Kill(h.reaper.pid, sig); err != nil {
+				t.Fatal(err)
+			}
+			rp := h.waitFor(EventReaped, "", spec.StopGrace+slack)
+			if !CleanupIsComplete(rp.Cleanup) {
+				t.Errorf("reaped = %+v", rp)
+			}
+			if !groupGone(at.PGID) || !groupGone(wl.PGID) {
+				t.Error("a group survived")
+			}
+			h.waitDone(10 * time.Second)
+		})
+	}
+}
+
+// A command that arrives while the workload is being ended is answered
+// with an error, not dropped.
+func TestReaperRefusesCommandsWhileEnding(t *testing.T) {
+	spec := fakeSpec(t, capturetest.FakeOptions{})
+	spec.Launch = workload(t, "ignore-sigterm", "1m")
+	h := startHarness(t, spec)
+	h.waitFor(EventLaunched, WhoWorkload, 10*time.Second)
+	h.send(attach(spec, "200ms", t.TempDir()))
+	h.waitFor(EventExited, WhoPerfAgent, 10*time.Second)
+	h.send(attach(spec, "200ms", t.TempDir()))
+	ev := h.waitFor(EventError, WhoPerfAgent, spec.StopGrace+slack)
+	if !strings.Contains(ev.Err, "ending") {
+		t.Errorf("error = %q", ev.Err)
+	}
+	h.waitFor(EventReaped, "", 10*time.Second)
+	h.waitDone(10 * time.Second)
 }

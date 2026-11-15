@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
-	"syscall"
 )
 
 // Reaper is the server's handle on a capture's reaper: a detached process
@@ -23,9 +21,6 @@ type Reaper struct {
 	closeCmds func()
 	events    chan Event
 	done      chan struct{}
-	// The process groups the events reported, cleared when their leader's
-	// exit is reported. Kill reads them without a lock.
-	perfPGID, workPGID atomic.Int64
 }
 
 // eventBuffer bounds the events queued for a server that is not reading;
@@ -118,8 +113,7 @@ func startReaper(self string, spec ReaperSpec, f ReaperFiles, more []*os.File) (
 	return r, nil
 }
 
-// readEvents decodes the event pipe until the reaper closes it, recording
-// the process groups Kill needs before passing each event on.
+// readEvents decodes the event pipe until the reaper closes it.
 func (r *Reaper) readEvents(f *os.File) {
 	defer close(r.events)
 	defer func() { _ = f.Close() }()
@@ -129,25 +123,7 @@ func (r *Reaper) readEvents(f *os.File) {
 		if err := dec.Decode(&ev); err != nil {
 			return
 		}
-		r.record(ev)
 		r.events <- ev
-	}
-}
-
-func (r *Reaper) record(ev Event) {
-	g := &r.perfPGID
-	if ev.Who == WhoWorkload {
-		g = &r.workPGID
-	}
-	switch ev.Op {
-	case EventLaunched, EventAttached:
-		if ev.PGID > 1 {
-			g.Store(int64(ev.PGID))
-		}
-	case EventExited:
-		// The reaper has reaped the leader, so the number may be reused;
-		// what is left of the group is the reaper's to clean up.
-		g.CompareAndSwap(int64(ev.PGID), 0)
 	}
 }
 
@@ -173,20 +149,16 @@ func (r *Reaper) Done() <-chan struct{} { return r.done }
 // PID is the reaper's process ID.
 func (r *Reaper) PID() int { return r.proc.pid }
 
-// Kill is the server's emergency end: one SIGKILL per recorded process
-// group, then the command pipe is closed. It never signals the reaper,
-// which reads the EOF and runs its cleanup (cgroup.kill, or the sweep of
-// adopted descendants), reports survivors and only then exits; killing it
-// would leave setsid'd descendants nobody sweeps. Kill takes no lock and
-// does not block, and is safe from any goroutine and more than once.
-func (r *Reaper) Kill() {
-	for _, g := range []*atomic.Int64{&r.perfPGID, &r.workPGID} {
-		if pgid := int(g.Load()); pgid > 1 && pgid != r.proc.pid {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		}
-	}
-	r.closeCmds()
-}
+// Kill is the server's emergency end: it closes the command pipe, which
+// the reaper reads as EOF and answers with SIGKILL to both children, the
+// cgroup kill or the sweep, and the survivor report, before it exits.
+// Kill signals nothing itself. A process group number the server heard of
+// may already have been reaped and reused by the time Kill runs; only the
+// reaper, which reaps, knows when a number is still its child's. Nor does
+// Kill signal the reaper: killing it would leave setsid'd descendants that
+// nobody sweeps. Kill takes no lock, does not block, and is safe from any
+// goroutine and more than once.
+func (r *Reaper) Kill() { r.closeCmds() }
 
 // closeCommands closes the command pipe without killing anything, as a
 // dead server would.

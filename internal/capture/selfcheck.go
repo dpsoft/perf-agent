@@ -11,24 +11,46 @@ import (
 // /proc/self/status, runs with euid 0, holds any effective or permitted
 // capability, or runs under no_new_privs. Under root the same-uid target
 // rule would cover every root daemon; under no_new_privs perf-agent's file
-// capabilities are not granted at exec. A field it cannot read refuses too.
+// capabilities are not granted at exec. Anything it cannot read exactly
+// refuses too: a missing, repeated or malformed field, or a status the
+// scanner cannot split.
 func CheckSelf(status []byte) error {
+	read := map[string]bool{"Uid": true, "CapEff": true, "CapPrm": true, "NoNewPrivs": true}
 	fields := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(status))
 	for sc.Scan() {
-		if k, v, ok := strings.Cut(sc.Text(), ":"); ok {
-			fields[k] = strings.TrimSpace(v)
+		k, v, ok := strings.Cut(sc.Text(), ":")
+		if !ok || !read[k] {
+			continue
 		}
+		if _, dup := fields[k]; dup {
+			return Errorf(CodeDisabled, "", "/proc/self/status has %s twice", k)
+		}
+		fields[k] = strings.TrimSpace(v)
+	}
+	if err := sc.Err(); err != nil {
+		return Errorf(CodeDisabled, "", "cannot read /proc/self/status: %v", err)
 	}
 	unreadable := func(field string) error {
 		return Errorf(CodeDisabled, "", "cannot read %s from /proc/self/status", field)
 	}
 
+	// Uid is the real, effective, saved and filesystem uid, each a uid_t.
 	uids := strings.Fields(fields["Uid"])
-	if len(uids) < 2 {
+	if len(uids) != 4 {
 		return unreadable("Uid")
 	}
-	if uids[1] == "0" {
+	var euid uint64
+	for i, u := range uids {
+		n, err := strconv.ParseUint(u, 10, 32)
+		if err != nil {
+			return unreadable("Uid")
+		}
+		if i == 1 {
+			euid = n
+		}
+	}
+	if euid == 0 {
 		return Errorf(CodeDisabled, "run perf-agent-mcp as your own user; perf-agent gets its capabilities from setcap",
 			"perf-agent-mcp runs with euid 0; capture is disabled, since the same-uid target rule would cover every root process")
 	}

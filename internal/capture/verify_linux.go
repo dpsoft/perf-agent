@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -16,15 +18,47 @@ const capXattr = "security.capability"
 // where file capabilities are ignored. /tmp is mounted so on most hosts.
 const copyAdvice = "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there"
 
+// creds are the server's effective ids, which decide who may run and
+// replace the binary.
+type creds struct {
+	uid, gid uint32
+	groups   []uint32
+}
+
+func currentCreds() creds {
+	c := creds{uid: uint32(os.Geteuid()), gid: uint32(os.Getegid())}
+	// Without the supplementary groups the group class is judged by the
+	// effective gid alone, which can only refuse more.
+	if gs, err := os.Getgroups(); err == nil {
+		for _, g := range gs {
+			c.groups = append(c.groups, uint32(g))
+		}
+	}
+	return c
+}
+
+func (c creds) inGroup(gid uint32) bool {
+	return gid == c.gid || slices.Contains(c.groups, gid)
+}
+
 // VerifyBinary checks, without running it, that path is a perf-agent the
-// server may start, in this order: the path is absolute and resolves
-// (once, with EvalSymlinks); the file is a regular executable, not
-// setuid or setgid, not writable by group or other, owned by root or the
-// server's user; its filesystem honours file capabilities; its
-// security.capability grants the required set and nothing outside the
-// allowed one; its Go build information names perf-agent's main package.
-// A shared blazesym library is a warning. Every later check works on the
-// resolved path, which is Binary.Path.
+// server may start, in this order:
+//   - the path is absolute and resolves, once, with EvalSymlinks; every
+//     later check is about the resolved path, which is Binary.Path;
+//   - the file is regular, not setuid or setgid, not writable by group or
+//     other, owned by root or the server's user, and executable by the
+//     server's user;
+//   - every directory above it is owned by root or the server's user and
+//     is not writable by group or other unless it is sticky, so no other
+//     user can replace the file;
+//   - its filesystem honours file capabilities;
+//   - its security.capability grants the required set and nothing outside
+//     the allowed one;
+//   - its Go build information identifies it as perf-agent;
+//   - a shared blazesym library is a warning.
+//
+// The checks from the mount on read one open descriptor, so they are all
+// about the same inode.
 func VerifyBinary(path string) (Binary, error) {
 	if !filepath.IsAbs(path) {
 		return Binary{}, Errorf(CodeDisabled, "pass the perf-agent binary as an absolute path",
@@ -35,15 +69,46 @@ func VerifyBinary(path string) (Binary, error) {
 		return Binary{}, Errorf(CodeDisabled, "pass the path of a built perf-agent binary",
 			"cannot resolve the perf-agent path: %v", err)
 	}
-	st, err := checkStat(resolved)
-	if err != nil {
+	c := currentCreds()
+
+	// Lstat before opening, so a FIFO or a device is refused unopened.
+	var pre syscall.Stat_t
+	if err := syscall.Lstat(resolved, &pre); err != nil {
+		return Binary{}, Errorf(CodeDisabled, "", "cannot stat %s: %v", resolved, err)
+	}
+	if err := checkBinaryStat(resolved, &pre, c); err != nil {
 		return Binary{}, err
 	}
-	if err := checkMount(resolved); err != nil {
+	if err := checkAncestors(resolved, c, syscall.Lstat); err != nil {
+		return Binary{}, err
+	}
+
+	// O_NOFOLLOW refuses a symlink swapped in since the Lstat; O_NONBLOCK
+	// keeps a FIFO swapped in from blocking the open.
+	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return Binary{}, Errorf(CodeDisabled, "", "cannot open %s: %v", resolved, err)
+	}
+	defer func() { _ = f.Close() }()
+	fd := int(f.Fd())
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return Binary{}, Errorf(CodeDisabled, "", "cannot stat %s: %v", resolved, err)
+	}
+	if st.Dev != pre.Dev || st.Ino != pre.Ino {
+		return Binary{}, changedDuringVerification(resolved, "dev,ino")
+	}
+	if err := checkBinaryStat(resolved, &st, c); err != nil {
+		return Binary{}, err
+	}
+
+	if err := checkMount(resolved, fd); err != nil {
 		return Binary{}, err
 	}
 	setcap := "run: " + strings.ReplaceAll(SetcapLine, "<path>", resolved)
-	raw, err := readCapXattr(resolved)
+	// getxattr through the descriptor's /proc link reads the open inode;
+	// the syscall package has no fgetxattr.
+	raw, err := readCapXattr("/proc/self/fd/" + strconv.Itoa(fd))
 	if err != nil {
 		return Binary{}, Errorf(CodeDisabled, setcap, "cannot read the file capabilities of %s: %v", resolved, err)
 	}
@@ -62,58 +127,129 @@ func VerifyBinary(path string) (Binary, error) {
 		}
 		return Binary{}, err
 	}
-	version, revision, err := checkBuildInfo(resolved)
+	version, revision, err := checkBuildInfo(f, resolved)
 	if err != nil {
 		return Binary{}, err
 	}
-	warnings = append(warnings, checkELF(resolved)...)
+	warnings = append(warnings, checkELF(f, resolved)...)
 
-	// The checks above read the file in several steps. The identity they
-	// saw must still be the file's, or a replacement slipped in between.
-	id := identity(st, raw)
+	// The checks above read one inode. Comparing its identity at the open
+	// with the path's identity now shows that the path still names that
+	// inode, and that its size, times and capability xattr did not change
+	// while it was read: a write or chmod in between moves mtime or ctime.
+	id := identity(&st, raw)
 	now, err := IdentityOf(resolved)
 	if err != nil {
 		return Binary{}, Errorf(CodeDisabled, "", "cannot re-read %s after verifying it: %v", resolved, err)
 	}
 	if e := checkIdentity(id, now); e != nil {
-		e.Message = resolved + " changed while it was being verified"
-		e.Next = "retry once it is no longer being written"
-		return Binary{}, e
+		return Binary{}, changedDuringVerification(resolved, e.Changed)
 	}
 	return Binary{Path: resolved, ID: id, Caps: caps, Version: version, Revision: revision, Warnings: warnings}, nil
 }
 
-// checkStat applies the file rules to the resolved path. Lstat, so a
-// symlink swapped in after resolution is not a regular file.
-func checkStat(path string) (*syscall.Stat_t, error) {
-	var st syscall.Stat_t
-	if err := syscall.Lstat(path, &st); err != nil {
-		return nil, Errorf(CodeDisabled, "", "cannot stat %s: %v", path, err)
+func changedDuringVerification(path, changed string) *Error {
+	e := Errorf(CodeBinaryChanged, "check that no build, copy or setcap is still writing it, then restart perf-agent-mcp",
+		"%s changed while it was being verified", path)
+	e.Changed = changed
+	return e
+}
+
+// checkOwner refuses a file or directory owned by neither root nor the
+// server's user: its owner could replace or rewrite it.
+func checkOwner(what, path string, st *syscall.Stat_t, c creds, next string) error {
+	if st.Uid != 0 && st.Uid != c.uid {
+		return Errorf(CodeDisabled, next, "%s %s is owned by uid %d, neither root nor this server's user", what, path, st.Uid)
 	}
+	return nil
+}
+
+// checkBinaryStat applies the file rules to perf-agent's stat result.
+func checkBinaryStat(path string, st *syscall.Stat_t, c creds) error {
 	mode := st.Mode
 	switch {
 	case mode&syscall.S_IFMT != syscall.S_IFREG:
-		return nil, Errorf(CodeDisabled, "pass the perf-agent binary itself", "%s is not a regular file", path)
+		return Errorf(CodeDisabled, "pass the perf-agent binary itself", "%s is not a regular file", path)
 	case mode&(syscall.S_ISUID|syscall.S_ISGID) != 0:
 		// A setuid binary would change the uids the target rule relies on.
-		return nil, Errorf(CodeDisabled, "chmod ug-s "+path, "%s is setuid or setgid", path)
+		return Errorf(CodeDisabled, "chmod ug-s "+path, "%s is setuid or setgid", path)
 	case mode&0o022 != 0:
 		// Writing to a file clears its file capabilities, so a file nobody
 		// else can write keeps the capabilities it was verified with.
-		return nil, Errorf(CodeDisabled, "chmod go-w "+path, "%s is writable by group or other (mode %#o)", path, mode&0o7777)
+		return Errorf(CodeDisabled, "chmod go-w "+path, "%s is writable by group or other (mode %#o)", path, mode&0o7777)
 	case mode&0o111 == 0:
-		return nil, Errorf(CodeDisabled, "chmod +x "+path, "%s is not executable", path)
-	case st.Uid != 0 && st.Uid != uint32(os.Getuid()):
-		return nil, Errorf(CodeDisabled, "use a binary you or root own", "%s is owned by uid %d, neither root nor this server's user", path, st.Uid)
+		return Errorf(CodeDisabled, "chmod u+x "+path, "%s is not executable", path)
 	}
-	return &st, nil
+	if err := checkOwner("perf-agent", path, st, c, "use a perf-agent binary you or root own"); err != nil {
+		return err
+	}
+	if !executableBy(st, c) {
+		return Errorf(CodeDisabled, "chmod u+x "+path+" (or a+x for a root-owned file)",
+			"%s is not executable by this server's user (mode %#o; the kernel uses the owner, group or other bits that match it)", path, mode&0o7777)
+	}
+	return nil
+}
+
+// executableBy applies the kernel's permission classes: the owner bits
+// when c owns the file, else the group bits when c is in its group, else
+// the other bits. Root needs any x bit.
+func executableBy(st *syscall.Stat_t, c creds) bool {
+	switch {
+	case c.uid == 0:
+		return st.Mode&0o111 != 0
+	case st.Uid == c.uid:
+		return st.Mode&0o100 != 0
+	case c.inGroup(st.Gid):
+		return st.Mode&0o010 != 0
+	default:
+		return st.Mode&0o001 != 0
+	}
+}
+
+// checkShimStat applies the file rules to the shim's stat result.
+func checkShimStat(path string, st *syscall.Stat_t, c creds) error {
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return Errorf(CodeDisabled, "pass the CUPTI adapter library itself", "%s is not a regular file", path)
+	}
+	if st.Mode&0o022 != 0 {
+		return Errorf(CodeDisabled, "chmod go-w "+path, "%s is writable by group or other (mode %#o)", path, st.Mode&0o7777)
+	}
+	return checkOwner("GPU shim", path, st, c, "use a GPU shim you or root own")
+}
+
+// checkAncestors refuses path when a directory above it would let another
+// user replace it: one owned by neither root nor the server's user, or one
+// writable by group or other without the sticky bit (which limits
+// renaming and removal to an entry's owner). path is resolved, so each
+// ancestor is a directory; one that is not has changed since.
+func checkAncestors(path string, c creds, lstat func(string, *syscall.Stat_t) error) error {
+	next := "move it to a directory only you or root can write, e.g. ~/bin"
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		var st syscall.Stat_t
+		if err := lstat(dir, &st); err != nil {
+			return Errorf(CodeDisabled, "", "cannot stat directory %s: %v", dir, err)
+		}
+		if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+			return Errorf(CodeDisabled, "", "%s is not a directory any more", dir)
+		}
+		if err := checkOwner("directory", dir, &st, c, next); err != nil {
+			return err
+		}
+		if st.Mode&0o022 != 0 && st.Mode&syscall.S_ISVTX == 0 {
+			return Errorf(CodeDisabled, "chmod go-w "+dir+", or "+next,
+				"directory %s is writable by group or other and not sticky (mode %#o), so another user could replace %s", dir, st.Mode&0o7777, path)
+		}
+		if dir == "/" {
+			return nil
+		}
+	}
 }
 
 // checkMount refuses a filesystem mounted nosuid or noexec: the kernel
 // ignores file capabilities on the first and refuses the exec on the second.
-func checkMount(path string) error {
+func checkMount(path string, fd int) error {
 	var fs syscall.Statfs_t
-	if err := syscall.Statfs(path, &fs); err != nil {
+	if err := syscall.Fstatfs(fd, &fs); err != nil {
 		return Errorf(CodeDisabled, "", "cannot read the mount flags of %s: %v", path, err)
 	}
 	flags := uint64(fs.Flags)
@@ -184,8 +320,9 @@ func (b Binary) Unchanged() *Error {
 }
 
 // VerifyShim checks the CUPTI adapter: an absolute path to a regular file
-// that neither group nor other can write. The target's own process loads
-// it, so it needs no capability check. Path is the resolved file.
+// owned by root or the server's user, not writable by group or other, in
+// directories no other user can replace it from. The target's own process
+// loads it, so it needs no capability check. Path is the resolved file.
 func VerifyShim(path string) (Shim, error) {
 	if !filepath.IsAbs(path) {
 		return Shim{}, Errorf(CodeDisabled, "pass --gpu-shim as an absolute path", "GPU shim path %q is not absolute", path)
@@ -198,11 +335,12 @@ func VerifyShim(path string) (Shim, error) {
 	if err := syscall.Lstat(resolved, &st); err != nil {
 		return Shim{}, Errorf(CodeDisabled, "", "cannot stat %s: %v", resolved, err)
 	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
-		return Shim{}, Errorf(CodeDisabled, "pass the CUPTI adapter library itself", "%s is not a regular file", resolved)
+	c := currentCreds()
+	if err := checkShimStat(resolved, &st, c); err != nil {
+		return Shim{}, err
 	}
-	if st.Mode&0o022 != 0 {
-		return Shim{}, Errorf(CodeDisabled, "chmod go-w "+resolved, "%s is writable by group or other (mode %#o)", resolved, st.Mode&0o7777)
+	if err := checkAncestors(resolved, c, syscall.Lstat); err != nil {
+		return Shim{}, err
 	}
 	return Shim{Path: resolved, Dev: uint64(st.Dev), Ino: uint64(st.Ino)}, nil
 }

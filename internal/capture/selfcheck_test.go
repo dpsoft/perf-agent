@@ -35,6 +35,14 @@ func TestCheckSelf(t *testing.T) {
 		{"NoNewPrivs", status("1000\t1000\t1000\t1000", zero, zero, "1"), "this server inherited no_new_privs (a sandbox?); perf-agent's file capabilities cannot apply"},
 		{"no Uid", []byte("CapPrm:\t" + zero + "\nCapEff:\t" + zero + "\nNoNewPrivs:\t0\n"), "Uid"},
 		{"bad CapEff", status("1000\t1000\t1000\t1000", "zz", zero, "0"), "CapEff"},
+		{"non-numeric effective uid", status("1000 nope 1000 1000", zero, zero, "0"), "Uid"},
+		{"negative effective uid", status("1000 -1 1000 1000", zero, zero, "0"), "Uid"},
+		{"effective uid past uid_t", status("1000 4294967296 1000 1000", zero, zero, "0"), "Uid"},
+		{"truncated Uid", status("1000 1000", zero, zero, "0"), "Uid"},
+		{"five Uid fields", status("1000 1000 1000 1000 1000", zero, zero, "0"), "Uid"},
+		{"effective uid 00", status("1000 00 1000 1000", zero, zero, "0"), "euid 0"},
+		{"a line past the scanner's limit", append(status("1000 1000 1000 1000", zero, zero, "0"), strings.Repeat("x", 65537)...), "/proc/self/status"},
+		{"Uid twice", append(status("1000\t1000\t1000\t1000", zero, zero, "0"), "Uid:\t1000\t0\t1000\t1000\n"...), "Uid"},
 		{"no NoNewPrivs", []byte("Uid:\t1000\t1000\t1000\t1000\nCapPrm:\t" + zero + "\nCapEff:\t" + zero + "\n"), "NoNewPrivs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

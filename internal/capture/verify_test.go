@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // goBuild builds a one-file main package whose go.mod names module into
@@ -61,22 +62,44 @@ func goBuild(t *testing.T, module string) (bin, revision string) {
 	return bin, revision
 }
 
+// buildInfoOf runs checkBuildInfo on the file at path.
+func buildInfoOf(t *testing.T, path string) (version, revision string, err error) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	return checkBuildInfo(f, path)
+}
+
+// elfWarningsOf runs checkELF on the file at path.
+func elfWarningsOf(t *testing.T, path string) []string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	return checkELF(f, path)
+}
+
 func TestCheckBuildInfo(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := checkBuildInfo(self); err == nil || !strings.Contains(err.Error(), "not perf-agent") || !strings.Contains(err.Error(), ".test") {
+	if _, _, err := buildInfoOf(t, self); err == nil || !strings.Contains(err.Error(), "not perf-agent") || !strings.Contains(err.Error(), ".test") {
 		t.Errorf("the test binary: %v, want refused as not perf-agent, naming its .test main package", err)
 	}
 
 	other, _ := goBuild(t, "example.com/x")
-	if _, _, err := checkBuildInfo(other); err == nil || !strings.Contains(err.Error(), "example.com/x") {
+	if _, _, err := buildInfoOf(t, other); err == nil || !strings.Contains(err.Error(), "example.com/x") {
 		t.Errorf("module example.com/x: %v, want refused naming it", err)
 	}
 
 	pa, rev := goBuild(t, PerfAgentModule)
-	version, revision, err := checkBuildInfo(pa)
+	version, revision, err := buildInfoOf(t, pa)
 	if err != nil {
 		t.Fatalf("a %s main at the module root: %v", PerfAgentModule, err)
 	}
@@ -91,7 +114,7 @@ func TestCheckBuildInfo(t *testing.T) {
 	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := checkBuildInfo(plain); err == nil || !strings.Contains(err.Error(), "not perf-agent") {
+	if _, _, err := buildInfoOf(t, plain); err == nil || !strings.Contains(err.Error(), "not perf-agent") {
 		t.Errorf("a shell script: %v, want refused as not perf-agent", err)
 	}
 }
@@ -113,6 +136,22 @@ func TestCheckModule(t *testing.T) {
 	if _, _, err := checkModule(bi); err == nil || !strings.Contains(err.Error(), "cmd/flamegraph") {
 		t.Fatalf("another main package of the module: %v, want refused naming it", err)
 	}
+
+	// The paths come from the file, so what a refusal echoes is bounded.
+	bi.Main.Path = "example.com/" + strings.Repeat("é", 400)
+	_, _, err = checkModule(bi)
+	if err == nil || len(err.Error()) > 2*maxEchoBytes || !strings.Contains(err.Error(), "…") {
+		t.Fatalf("a long module path: %d bytes %q, want refused and bounded", len(err.Error()), err)
+	}
+	if !utf8.ValidString(err.Error()) {
+		t.Fatalf("a long module path: %q is not valid UTF-8", err)
+	}
+	bi.Main.Path = PerfAgentModule
+	bi.Path = PerfAgentModule
+	bi.Main.Version = strings.Repeat("v", 1000)
+	if version, _, err := checkModule(bi); err != nil || len(version) > maxEchoBytes+len("…") {
+		t.Fatalf("a long version: %d bytes, %v; want it bounded", len(version), err)
+	}
 }
 
 func TestCheckELFWarnsOnSharedBlazesym(t *testing.T) {
@@ -120,7 +159,7 @@ func TestCheckELFWarnsOnSharedBlazesym(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w := checkELF(self); len(w) != 0 {
+	if w := elfWarningsOf(t, self); len(w) != 0 {
 		t.Errorf("the test binary: warnings %q, want none", w)
 	}
 	if w := blazesymWarnings([]string{"libc.so.6", "libblazesym_c.so"}); len(w) != 1 || !strings.Contains(w[0], "libblazesym_c.so") {
@@ -129,8 +168,12 @@ func TestCheckELFWarnsOnSharedBlazesym(t *testing.T) {
 	if w := blazesymWarnings([]string{"libc.so.6", "libm.so.6"}); len(w) != 0 {
 		t.Errorf("no blazesym: warnings %q, want none", w)
 	}
-	if w := checkELF(filepath.Join(t.TempDir(), "missing")); len(w) != 1 {
-		t.Errorf("an unreadable file: warnings %q, want one", w)
+	script := filepath.Join(t.TempDir(), "script")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if w := elfWarningsOf(t, script); len(w) != 1 {
+		t.Errorf("a file that is not ELF: warnings %q, want one", w)
 	}
 }
 

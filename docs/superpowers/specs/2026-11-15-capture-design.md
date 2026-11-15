@@ -551,7 +551,7 @@ at start-up and before every exec:
 | Not writable by group or other (`mode & 022 == 0`); owner is root or the server's uid | `Stat` | A user-owned file is accepted, since the user builds in a worktree or under `~/`. Writing to a file clears its `security.capability`, so the user cannot alter a capped file and keep its caps |
 | Filesystem not mounted `nosuid` or `noexec` | `syscall.Statfs`, `Flags & (MS_NOSUID|MS_NOEXEC)` | File capabilities are ignored on a nosuid mount, as `/tmp` is here (memory note). Refused with "copy it outside /tmp, e.g. to the worktree or ~/bin, and setcap it there" |
 | File capabilities | `syscall.Getxattr(path, "security.capability")`, parsed as `vfs_cap_data` | See the next table. This is the getcap check without running getcap |
-| It is perf-agent | `debug/buildinfo.ReadFile`: main module `github.com/dpsoft/perf-agent`, main package path is the module root | Proves the file is perf-agent without running it. The version and `vcs.revision` go into each result |
+| It is perf-agent | `debug/buildinfo.ReadFile`: main module `github.com/dpsoft/perf-agent`, main package path is the module root | Identifies the file as perf-agent without running it (a marker, not authentication; the capability xattr is the trust anchor). The version and `vcs.revision` go into each result |
 | Shared blazesym | `debug/elf` `DT_NEEDED` names a `*blazesym*` library | A warning, not a refusal. Under secure execution `LD_LIBRARY_PATH` is ignored, so the library must be in a system path or linked statically (memory note) |
 | Unchanged since start-up | `(dev, ino, size, mtime, ctime)` and the xattr bytes compared before each exec | Refused with "perf-agent changed since start-up; restart perf-agent-mcp" |
 

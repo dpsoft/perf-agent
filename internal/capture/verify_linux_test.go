@@ -18,28 +18,49 @@ func nosuidOrNoexec(t *testing.T, dir string) bool {
 	return uint64(st.Flags)&(syscall.MS_NOSUID|syscall.MS_NOEXEC) != 0
 }
 
-// execDir returns a new directory on a filesystem where file capabilities
-// apply, so a refusal after the mount step is for the reason the test
-// names. t.TempDir() is usually under a nosuid /tmp, so the fallback is a
-// dot-directory inside the package, removed at the end of the test.
+// execDir returns a new directory where a test binary passes the
+// directory and mount rules, so a refusal after them is for the reason the
+// test names. t.TempDir() is usually under a nosuid /tmp, and a checkout
+// may sit below a world-writable directory, so it also tries a
+// dot-directory inside the package and one in the user's cache directory,
+// each removed at the end of the test.
 func execDir(t *testing.T) string {
 	t.Helper()
-	if d := t.TempDir(); !nosuidOrNoexec(t, d) {
+	var tried []string
+	usable := func(d string) bool {
+		if nosuidOrNoexec(t, d) {
+			tried = append(tried, d+": nosuid or noexec")
+			return false
+		}
+		if err := checkAncestors(filepath.Join(d, "probe"), currentCreds(), syscall.Lstat); err != nil {
+			tried = append(tried, err.Error())
+			return false
+		}
+		return true
+	}
+	if d := t.TempDir(); usable(d) {
 		return d
 	}
-	d, err := os.MkdirTemp(".", ".verify-test-")
-	if err != nil {
-		t.Fatal(err)
+	parents := []string{"."}
+	if cache, err := os.UserCacheDir(); err == nil {
+		parents = append(parents, cache)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(d) })
-	d, err = filepath.Abs(d)
-	if err != nil {
-		t.Fatal(err)
+	for _, parent := range parents {
+		d, err := os.MkdirTemp(parent, ".verify-test-")
+		if err != nil {
+			tried = append(tried, err.Error())
+			continue
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(d) })
+		if d, err = filepath.Abs(d); err != nil {
+			t.Fatal(err)
+		}
+		if usable(d) {
+			return d
+		}
 	}
-	if nosuidOrNoexec(t, d) {
-		t.Skipf("neither the temporary directory nor %s allows file capabilities", d)
-	}
-	return d
+	t.Skipf("no directory where a binary passes the directory and mount rules: %s", strings.Join(tried, "; "))
+	return ""
 }
 
 // file writes a file with exactly mode (chmod after create, past the umask).
@@ -67,6 +88,7 @@ func TestVerifyBinaryStatRules(t *testing.T) {
 		{"setuid", file(t, filepath.Join(dir, "su"), 0o755|os.ModeSetuid), "setuid or setgid"},
 		{"setgid", file(t, filepath.Join(dir, "sg"), 0o755|os.ModeSetgid), "setuid or setgid"},
 		{"not executable", file(t, filepath.Join(dir, "nx"), 0o644), "not executable"},
+		{"executable by other only", file(t, filepath.Join(dir, "ox"), 0o405), "not executable by this server's user"},
 		{"directory", dir, "not a regular file"},
 		{"missing", filepath.Join(dir, "missing"), "no such file"},
 	} {
@@ -183,5 +205,124 @@ func TestReadSelfStatus(t *testing.T) {
 		if !strings.Contains(string(b), field) {
 			t.Errorf("/proc/self/status has no %q", field)
 		}
+	}
+}
+
+func TestVerifyBinaryDirectoryRules(t *testing.T) {
+	dir := execDir(t)
+
+	open := filepath.Join(dir, "open")
+	if err := os.Mkdir(open, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	_, err := VerifyBinary(file(t, filepath.Join(open, "perf-agent"), 0o755))
+	e := asError(t, err, CodeDisabled)
+	if !strings.Contains(e.Message, "directory "+open+" is writable by group or other") {
+		t.Fatalf("a 0777 parent: %q, want refused naming %s", e, open)
+	}
+
+	sticky := filepath.Join(dir, "sticky")
+	if err := os.Mkdir(sticky, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	_, err = VerifyBinary(file(t, filepath.Join(sticky, "perf-agent"), 0o755))
+	e = asError(t, err, CodeDisabled)
+	if !strings.Contains(e.Message, "no file capabilities") {
+		t.Fatalf("a sticky world-writable parent: %q, want it to pass the directory rule and stop at the capability step", e)
+	}
+
+	_, err = VerifyShim(file(t, filepath.Join(open, "libshim.so"), 0o644))
+	e = asError(t, err, CodeDisabled)
+	if !strings.Contains(e.Message, "directory "+open+" is writable by group or other") {
+		t.Fatalf("a shim in a 0777 parent: %q, want refused naming %s", e, open)
+	}
+	if _, err := VerifyShim(file(t, filepath.Join(sticky, "libshim.so"), 0o644)); err != nil {
+		t.Fatalf("a shim in a sticky world-writable parent: %v", err)
+	}
+}
+
+// fakeLstat reports the real lstat of every path, with change applied to
+// dir's result.
+func fakeLstat(dir string, change func(*syscall.Stat_t)) func(string, *syscall.Stat_t) error {
+	return func(p string, st *syscall.Stat_t) error {
+		if err := syscall.Lstat(p, st); err != nil {
+			return err
+		}
+		if p == dir {
+			change(st)
+		}
+		return nil
+	}
+}
+
+func TestCheckAncestorsOwner(t *testing.T) {
+	dir := execDir(t)
+	path := filepath.Join(dir, "perf-agent")
+	c := currentCreds()
+	if err := checkAncestors(path, c, syscall.Lstat); err != nil {
+		t.Fatalf("the real directories: %v", err)
+	}
+	other := c.uid + 1000
+	err := checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Uid = other }))
+	e := asError(t, err, CodeDisabled)
+	if !strings.Contains(e.Message, "directory "+dir+" is owned by uid") {
+		t.Fatalf("a parent owned by uid %d: %q, want refused naming %s", other, e, dir)
+	}
+	if err := checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Uid = 0 })); err != nil {
+		t.Fatalf("a root-owned parent: %v", err)
+	}
+	err = checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Mode = syscall.S_IFLNK | 0o777 }))
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("a parent that became a symlink: %v, want refused", err)
+	}
+	err = checkAncestors(path, c, fakeLstat(dir, func(st *syscall.Stat_t) { st.Mode |= 0o020 }))
+	if err == nil || !strings.Contains(err.Error(), "writable by group or other") {
+		t.Fatalf("a group-writable parent: %v, want refused", err)
+	}
+}
+
+func TestFileRulesOwnerAndExecClass(t *testing.T) {
+	c := creds{uid: 1000, gid: 1000, groups: []uint32{10}}
+	st := func(uid, gid, mode uint32) *syscall.Stat_t {
+		return &syscall.Stat_t{Uid: uid, Gid: gid, Mode: syscall.S_IFREG | mode}
+	}
+	for _, tc := range []struct {
+		name string
+		st   *syscall.Stat_t
+		want string // empty: accepted
+	}{
+		{"mine 0755", st(1000, 1000, 0o755), ""},
+		{"mine 0500", st(1000, 1000, 0o500), ""},
+		{"mine 0405", st(1000, 1000, 0o405), "not executable by this server's user"},
+		{"root 0755", st(0, 0, 0o755), ""},
+		{"root 0750 in my supplementary group", st(0, 10, 0o750), ""},
+		{"root 0750 in another group", st(0, 0, 0o750), "not executable by this server's user"},
+		{"root 0705", st(0, 0, 0o705), ""},
+		{"another user's", st(1234, 1234, 0o755), "owned by uid 1234"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkBinaryStat("/p", tc.st, c)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("refused: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Fatalf("%v, want refused with %q", err, tc.want)
+			}
+		})
+	}
+	if err := checkBinaryStat("/p", st(0, 0, 0o601), creds{uid: 0}); err != nil {
+		t.Errorf("euid 0 runs a file with any x bit: %v", err)
+	}
+	if err := checkShimStat("/s", st(1234, 1234, 0o644), c); err == nil || !strings.Contains(err.Error(), "owned by uid 1234") {
+		t.Errorf("a shim owned by another user: %v, want refused", err)
+	}
+	if err := checkShimStat("/s", st(0, 0, 0o644), c); err != nil {
+		t.Errorf("a root-owned shim: %v", err)
 	}
 }

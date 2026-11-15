@@ -53,7 +53,7 @@ type sessionKey struct{}
 func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
 	ss := &session{
 		s:          s,
-		out:        newOutQueue(w, s.o.MaxOutMessages, s.o.MaxOutBytes),
+		out:        newOutQueue(w, s.o.MaxOutMessages, s.o.MaxOutBytes, s.o.StallTimeout),
 		wake:       make(chan struct{}, 1),
 		inputEnded: make(chan struct{}),
 		dispatched: make(chan struct{}),
@@ -227,9 +227,16 @@ func (ss *session) take(line []byte, oversized bool) {
 		return
 	}
 	ss.mu.Lock()
-	if n := len(ss.queue); n >= ss.s.o.MaxQueued {
+	// The running request counts too: once a request is answered the
+	// client may send another before the dispatcher takes the next one, so
+	// 1+MaxQueued outstanding requests always fit.
+	outstanding := len(ss.queue)
+	if ss.running != nil {
+		outstanding++
+	}
+	if outstanding > ss.s.o.MaxQueued {
 		ss.mu.Unlock()
-		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", n)))
+		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", ss.s.o.MaxQueued)))
 		return
 	}
 	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID)})
@@ -308,7 +315,10 @@ func (ss *session) dispatch() {
 }
 
 // next takes the first queued request and makes it the running one, or
-// returns nil once there is nothing more to do.
+// returns nil once there is nothing more to do. It starts a request only
+// while the output backlog is under half its bounds, so a slow but live
+// client holds requests back rather than overflowing the output. The
+// reader goes on meanwhile: cancels, EOF and the end of ctx are still seen.
 func (ss *session) next() (*request, context.Context) {
 	for {
 		ss.mu.Lock()
@@ -316,22 +326,39 @@ func (ss *session) next() (*request, context.Context) {
 			ss.mu.Unlock()
 			return nil, nil
 		}
-		if len(ss.queue) > 0 {
-			r := ss.queue[0]
-			ss.queue[0] = nil
-			ss.queue = ss.queue[1:]
-			ctx, cancel := context.WithCancel(ss.hctx)
-			r.cancel = cancel
-			ss.running = r
+		if len(ss.queue) == 0 {
+			done := ss.inputDone
 			ss.mu.Unlock()
-			return r, ctx
+			if done {
+				return nil, nil
+			}
+			<-ss.wake
+			continue
 		}
-		done := ss.inputDone
 		ss.mu.Unlock()
-		if done {
-			return nil, nil
+		if ok, changed := ss.out.room(); !ok {
+			select {
+			case <-changed:
+			case <-ss.wake:
+			case <-ss.out.dead:
+				// Nothing more will be written; wait for Serve to stop us.
+				<-ss.wake
+			}
+			continue
 		}
-		<-ss.wake
+		ss.mu.Lock()
+		if ss.stopped || len(ss.queue) == 0 {
+			ss.mu.Unlock()
+			continue
+		}
+		r := ss.queue[0]
+		ss.queue[0] = nil
+		ss.queue = ss.queue[1:]
+		ctx, cancel := context.WithCancel(ss.hctx)
+		r.cancel = cancel
+		ss.running = r
+		ss.mu.Unlock()
+		return r, ctx
 	}
 }
 

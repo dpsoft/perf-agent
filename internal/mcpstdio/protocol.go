@@ -37,6 +37,7 @@ const (
 	defaultMaxOutMessages  = 64
 	defaultMaxOutBytes     = 4 << 20
 	defaultDrainTimeout    = time.Second
+	defaultStallTimeout    = 30 * time.Second
 )
 
 // ErrClientGone is what Serve returns when the client stopped reading its
@@ -147,14 +148,19 @@ type Options struct {
 	// one more is answered "server busy" at once. 0 means 8.
 	MaxQueued int
 	// MaxOutMessages and MaxOutBytes bound the messages waiting to be
-	// written. A message that does not fit means the client stopped
-	// reading, except that a message always fits an empty queue. 0 means
-	// 64 messages, and 4 × MaxToolErrorBytes (4 MiB when that is 0).
+	// written. A response that finds the backlog already at a bound means
+	// the client stopped reading, so one response of any size fits behind
+	// a smaller backlog. A request is started only once the backlog is
+	// under half of both. 0 means 64 messages, and 4 × MaxToolErrorBytes
+	// (4 MiB when that is 0).
 	MaxOutMessages int
 	MaxOutBytes    int
 	// DrainTimeout bounds how long Serve, once the input or its context
 	// ended, waits for the queued output to be written. 0 means 1 s.
 	DrainTimeout time.Duration
+	// StallTimeout is how long the output may make no progress, with
+	// messages waiting, before the client is taken as gone. 0 means 30 s.
+	StallTimeout time.Duration
 	// OnClose, when set, is called once, on Serve's goroutine, when the
 	// session starts to end and before the handlers' contexts are
 	// cancelled. It must not block.

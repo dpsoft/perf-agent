@@ -45,6 +45,9 @@ func New(o Options) *Server {
 	if s.o.DrainTimeout <= 0 {
 		s.o.DrainTimeout = defaultDrainTimeout
 	}
+	if s.o.StallTimeout <= 0 {
+		s.o.StallTimeout = defaultStallTimeout
+	}
 	return s
 }
 

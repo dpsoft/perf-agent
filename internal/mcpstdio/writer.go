@@ -11,50 +11,69 @@ import (
 // whole encoded lines and never wait; one goroutine (run) writes them in
 // order, so lines never interleave.
 //
-// The backlog is bounded by maxMsgs and maxBytes, but a line always fits an
-// empty queue, so one large answer is not mistaken for a dead client. A
-// line that does not fit, or a failed write, marks the client dead: the
-// queue closes and dead is closed.
+// maxMsgs and maxBytes bound the backlog (the lines not yet taken by a
+// write). A response is refused only when the backlog has already reached
+// a bound, so one line of any size fits behind a small backlog; a refused
+// response marks the client dead. The dispatcher waits for the backlog to
+// fall under half the bounds before it starts a request (room), so a live
+// client is not declared dead for reading slowly. The client is dead too
+// when a write fails, or when no write ends for stall while lines wait.
 type outQueue struct {
 	w        io.Writer
 	maxMsgs  int
 	maxBytes int
+	stall    time.Duration
 
 	wake chan struct{} // cap 1: the queue may have lines
 	stop chan struct{} // closed by shutdown
 	dead chan struct{} // closed once the client is dead
 
-	mu       sync.Mutex
-	q        [][]byte
-	size     int
-	writing  bool          // a Write is in progress
-	closed   bool          // no more lines are accepted
-	idle     chan struct{} // closed and replaced each time a Write ends
-	writeErr error         // the failed write that marked the client dead
-	stopOnce sync.Once
+	mu        sync.Mutex
+	q         [][]byte
+	size      int
+	writing   bool          // a Write is in progress
+	closed    bool          // no more lines are accepted
+	changed   chan struct{} // closed and replaced when a line is taken or a write ends
+	writeErr  error         // the failed write that marked the client dead
+	stallFrom time.Time     // the last write's end, or when the backlog stopped being empty
+	stallT    *time.Timer
+	stopOnce  sync.Once
 }
 
-func newOutQueue(w io.Writer, maxMsgs, maxBytes int) *outQueue {
-	return &outQueue{
-		w: w, maxMsgs: maxMsgs, maxBytes: maxBytes,
-		wake: make(chan struct{}, 1),
-		stop: make(chan struct{}),
-		dead: make(chan struct{}),
-		idle: make(chan struct{}),
+func newOutQueue(w io.Writer, maxMsgs, maxBytes int, stall time.Duration) *outQueue {
+	o := &outQueue{
+		w: w, maxMsgs: max(maxMsgs, 1), maxBytes: max(maxBytes, 1), stall: stall,
+		wake:    make(chan struct{}, 1),
+		stop:    make(chan struct{}),
+		dead:    make(chan struct{}),
+		changed: make(chan struct{}),
 	}
+	o.stallT = time.AfterFunc(time.Hour, o.checkStall)
+	o.stallT.Stop()
+	return o
 }
 
-// enqueue adds one line and reports whether it was accepted. It never
-// waits. A line that does not fit marks the client dead.
+// enqueue adds a response and reports whether it was accepted. It never
+// waits. A response refused because the backlog is at a bound marks the
+// client dead.
 func (o *outQueue) enqueue(line []byte) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed {
 		return false
 	}
-	if len(o.q) > 0 && (len(o.q) >= o.maxMsgs || o.size+len(line) > o.maxBytes) {
+	if len(o.q) >= o.maxMsgs || o.size >= o.maxBytes {
 		o.dieLocked(nil)
 		return false
+	}
+	o.addLocked(line)
+	return true
+}
+
+func (o *outQueue) addLocked(line []byte) {
+	if len(o.q) == 0 {
+		o.stallFrom = time.Now()
+		o.stallT.Reset(o.stall)
 	}
 	o.q = append(o.q, line)
 	o.size += len(line)
@@ -62,12 +81,45 @@ func (o *outQueue) enqueue(line []byte) bool {
 	case o.wake <- struct{}{}:
 	default:
 	}
-	return true
+}
+
+// roomLocked reports whether the backlog is under half of both bounds.
+func (o *outQueue) roomLocked() bool {
+	return 2*len(o.q) < o.maxMsgs && 2*o.size < o.maxBytes
+}
+
+// room reports whether the backlog is under half of both bounds and, when
+// it is not, returns a channel closed when it may have changed.
+func (o *outQueue) room() (bool, <-chan struct{}) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.roomLocked(), o.changed
+}
+
+// checkStall runs on stallT: lines that waited stall with no write ending
+// mean the client stopped reading.
+func (o *outQueue) checkStall() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || len(o.q) == 0 {
+		return
+	}
+	if left := o.stall - time.Since(o.stallFrom); left > 0 {
+		o.stallT.Reset(left)
+		return
+	}
+	o.dieLocked(nil)
+}
+
+func (o *outQueue) changedLocked() {
+	close(o.changed)
+	o.changed = make(chan struct{})
 }
 
 // dieLocked closes the queue and marks the client dead, once.
 func (o *outQueue) dieLocked(err error) {
 	o.closed = true
+	o.stallT.Stop()
 	select {
 	case <-o.dead:
 	default:
@@ -101,14 +153,18 @@ func (o *outQueue) run() {
 		o.q = o.q[1:]
 		o.size -= len(line)
 		o.writing = true
+		o.changedLocked()
 		o.mu.Unlock()
 
 		_, err := o.w.Write(line)
 
 		o.mu.Lock()
 		o.writing = false
-		close(o.idle)
-		o.idle = make(chan struct{})
+		o.changedLocked()
+		o.stallFrom = time.Now()
+		if len(o.q) > 0 {
+			o.stallT.Reset(o.stall)
+		}
 		if err != nil {
 			o.dieLocked(err)
 			o.mu.Unlock()
@@ -135,10 +191,10 @@ func (o *outQueue) drain(deadline time.Time) bool {
 			o.mu.Unlock()
 			return true
 		}
-		idle := o.idle
+		changed := o.changed
 		o.mu.Unlock()
 		select {
-		case <-idle:
+		case <-changed:
 		case <-o.dead:
 			return false
 		case <-t.C:
@@ -151,6 +207,7 @@ func (o *outQueue) drain(deadline time.Time) bool {
 func (o *outQueue) shutdown() {
 	o.mu.Lock()
 	o.closed = true
+	o.stallT.Stop()
 	o.mu.Unlock()
 	o.stopOnce.Do(func() { close(o.stop) })
 }

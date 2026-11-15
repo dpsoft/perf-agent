@@ -1,5 +1,13 @@
 # M2b: the live page — design addendum
 
+> **Superseded in part.** The live page no longer ships through the stdio
+> `perf-agent-mcp`: it moves to a separate long-lived `perf-agent-mcp-serve`
+> binary (see `.superpowers/m2c/2026-11-15-local-server-design.md`, section
+> D5), and stdio has no listener, no `--live` flag and no `page_*` tools.
+> The page engine described here (publications, routes, security model,
+> limits) is kept as library code and still applies to that server; the
+> parts about the stdio flag and the stdio tool registration do not.
+
 **Status:** implemented in M2b (draft PR). Addendum to
 [2026-11-13-ai-flamegraph-design.md](2026-11-13-ai-flamegraph-design.md)
 (the spec). It builds on M2 as M2 is after its Task 16

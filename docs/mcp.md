@@ -1,10 +1,10 @@
 # perf-agent-mcp
 
-`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles. It speaks MCP over stdio only, is read-only and works offline. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written or published. With `--live` it also shows a read-only [live page](#live-page) to a browser on the same machine.
+`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles. It speaks MCP over stdio only, is read-only and works offline. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written or published. A live page that a browser on the same machine reads will ship with a separate serve binary, not this one.
 
 ## What it does not do
 
-- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It listens only when started with `--live`, only from the first `page_*` call, and only on `127.0.0.1` at a port the kernel picks; it links `net/http` for that listener alone. Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls and listening calls, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback.
+- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It opens no listener: nothing in this process serves HTTP, and the stdio server registers no `page_*` tool. The live page engine is compiled in as library code for the future serve binary, so the binary still links `net/http` until that split. Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls and listening calls, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback.
 - It captures nothing: it never starts the perf-agent profiler, links neither `perfagent` nor `cilium/ebpf`, and needs no capabilities.
 - It writes only pages under `--output`, and never replaces an existing file.
 - It is not shipped in releases, release archives or container images. Build it from source.
@@ -24,7 +24,6 @@ go build -o perf-agent-mcp ./cmd/perf-agent-mcp
 | `--source-manifest FILE` | A source manifest. Repeatable. |
 | `--source-git` | Allow read-only, offline git probes in the source roots. On by default; `--source-git=false` turns it off. |
 | `--output DIR` | The root rendered pages are written to. Without it `render_flamegraph` is disabled. |
-| `--live` | Enable the [live page](#live-page) and the `page_*` tools. Off by default; without it the server never listens. There is no flag for the address: the page is always served on `127.0.0.1` at a random port. |
 | `--limit Name=Value` | Override a limit. Repeatable. Names are the fields of the limits table below, such as `Model.MaxRawBytes=1073741824`. An unknown name exits 2 and lists the valid ones. |
 | `--version` | Print the version. |
 
@@ -53,12 +52,8 @@ Arguments match by exact name; an unknown argument, a name given twice or a diff
 | `diff` | Compare two opened profiles of the same view. |
 | `source` | Source lines for a node and how well they are tied to the profiled build. |
 | `render_flamegraph` | Check explanations and write an explained flame graph page. |
-| `page_open` | Start the live page, unless it is started, and return its URL, its publications and how many tabs watch it. Needs `--live`. |
-| `page_explain` | Check explanations exactly as `render_flamegraph` does and publish them on the live page instead of writing a file. Needs `--live`. |
-| `page_show` | Steer the live page: switch publication, select a node, or lay the flame graph out from it. Needs `--live`. |
-| `page_diff` | Compare two views exactly as `diff` does and publish the comparison on the live page. Needs `--live`. |
 
-Every tool takes `handle` and `view` (a view name `open` returned, such as `cpu/nanoseconds#0`) unless noted: `open` takes a `path`, `diff` and `page_diff` take a base and a new handle and view, `page_open` takes no arguments, and `page_show` takes a `publication` and a `node`. One example call of each, as `arguments`:
+Every tool takes `handle` and `view` (a view name `open` returned, such as `cpu/nanoseconds#0`) unless noted: `open` takes a `path`, `diff` takes a base and a new handle and view. One example call of each, as `arguments`:
 
 ```json
 open               {"path": "cpu.pb.gz", "execlog": "run.execlog"}
@@ -69,13 +64,9 @@ gpu_kernels_for    {"handle": "<handle>", "view": "<a GPU view>", "node": "<laun
 facts              {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>"}
 diff               {"base_handle": "<handle>", "base_view": "cpu/nanoseconds#0", "new_handle": "<handle>", "new_view": "cpu/nanoseconds#0", "work_base": 1000, "work_new": 1200}
 source             {"handle": "<handle>", "view": "cpu/nanoseconds#0", "node": "<node id from top>", "context": 5}
-page_open          {}
-page_explain       {"handle": "<handle>", "view": "cpu/nanoseconds#0", "explanations": []}
-page_show          {"publication": "p1", "node": "<node id from top>", "focus": true}
-page_diff          {"base_handle": "<handle>", "base_view": "cpu/nanoseconds#0", "new_handle": "<handle>", "new_view": "cpu/nanoseconds#0", "node": "<id from diff>"}
 ```
 
-`render_flamegraph` has its own example under Explanations; `page_explain` takes the same `explanations`. `execlog`, `work_base`, `work_new`, `context`, `title`, `focus` and `page_diff`'s `node` are optional, and so is either of `page_show`'s `publication` and `node`; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
+`render_flamegraph` has its own example under Explanations. `execlog`, `work_base`, `work_new`, `context`, `title`, `focus` are optional; `top`, `path`, `sandwich`, `gpu_kernels_for`, `diff` and `source` also take `limit` and `cursor`, `top` takes `domain`.
 
 Lists carry `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (the sum of the omitted rows' own values, which overlap, so never a remaining share), `omitted_weight_basis` (which value was summed: `cum`, `self`, `abs_delta` or `value`) and `next_cursor`; pass the cursor back with the same arguments.
 
@@ -107,33 +98,7 @@ The agent guide is served as the `perf-agent-guide` prompt and the `perf-agent:/
 
 ## Live page
 
-Started with `--live`, the server can show what an agent explains on a page in the user's browser, and steer it while the conversation goes on. Nothing listens until the agent's first `page_*` call. That call opens a listener on `127.0.0.1` at a port the kernel picks, and stderr logs `live page listening addr=127.0.0.1:PORT`; the URL itself is only in the page tools' results.
-
-The four tools:
-
-- `page_open` starts the page and returns its URL. The agent gives the URL to the user: the server never opens a browser.
-- `page_explain` runs `render_flamegraph`'s check, with the same failures, the same `attempt` rules and one attempt history shared by both tools, and publishes the explained flame graph instead of writing it. A rejected call publishes nothing. `"explanations": []` publishes a view's facts alone. Its result has `figures_checked` (the claims) and `references_checked` (the distinct frames named by `{n:…}`); the page's pill counts the two together.
-- `page_show` switches the page to a kept publication, selects a node (drawn or not) and, with `"focus": true`, lays the flame graph out from it.
-- `page_diff` takes `diff`'s arguments without `limit` and `cursor`, refuses what `diff` refuses, and publishes the comparison. Its nodes are union IDs from `diff`.
-
-An explained publication shows the server's own record of rejected attempts for its profile and view, made through any handle, and follows it as it grows. No argument hides it. It is bounded like `render_flamegraph`'s history, and the page counts what it leaves out.
-
-What is served, and to whom:
-
-- **This machine only.** The listener binds `127.0.0.1` and nothing else. Every request must name this machine in its `Host` (`localhost`, an IPv4 loopback address or `[::1]`), which defeats DNS rebinding. The page is for a browser on the same machine; remote use is not supported.
-- **A token.** Every URL is under `/s/<token>/`, where the token is 256 random bits made for this run, compared in constant time. A wrong or missing token gets 404. The token is in the tool results only, never in a log line, so give the URL to the user only.
-- **Read-only.** Only `GET` and `HEAD` are served, over HTTP/1 only, and a request with a body is refused. No handler changes server state: only the agent's tool calls do. No response carries an `Access-Control-*` header. Cross-site requests are refused, except a top-level navigation to the page itself, which holds no data.
-- Every response carries a Content-Security-Policy that allows scripts, styles, images and fetches from the page's own origin only, with no inline code, no forms and no framing.
-
-**Download a static copy.** The page's export link downloads the current publication as a standalone page: an explained page like the ones `render_flamegraph` writes, with its history, or a diff page like `cmd/flamegraph -diff`'s. The server builds it in memory within `MaxPageBytes` and refuses one that does not fit, with the reason on the page, before sending any of it. The browser saves it; the server writes no file.
-
-What the page never does:
-
-- It sends nothing anywhere: every request it makes is a relative `GET` to the server that served it.
-- It runs no tool and changes nothing: the agent steers it, the user only reads and navigates.
-- It does not work offline. It reads everything from the running server, so once `perf-agent-mcp` exits it says the server is gone and keeps the last state it showed. Download a static copy to keep one.
-
-The page keeps at most `MaxPublications` publications, dropping the least recently shown and never the one on screen. `MaxRetainedBytes` is an estimated budget for what they keep: the profiles and views they pin, each counted once however many publications share it, plus their checked results, page models and histories. It is not a physical memory cap. The estimates are within half and twice the heap they stand for, so the real heap can reach about twice the budget, and responses being written are not counted. A publication that cannot fit is refused and changes nothing. `MaxPageClients` bounds the tabs that stream the page at once. A tab beyond it polls the server every few seconds instead, and says so. A browser opens at most six connections to one host and port, and each streaming tab holds one, so keep `MaxPageClients` at least two below that: the default 4 leaves two for every tab's fetches.
+The live page, a read-only page a browser on the same machine reads while the agent explains profiles, will ship with a separate long-lived serve binary. The stdio server has no `--live` flag, registers no `page_*` tool and opens no listener.
 
 ## Agent skill
 
@@ -195,7 +160,7 @@ Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must 
 | `MaxAttemptViews` | 64 |
 | `MaxHistoryBytes` (all attempt records) | 4194304 (4 MiB) |
 | `MaxPublications` (live page publications kept) | 8 |
-| `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; with `--live` at least `MaxPageBytes`) | 2147483648 (2 GiB) |
+| `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; at least `MaxPageBytes`); used by the live page engine, not by the stdio server | 2147483648 (2 GiB) |
 | `MaxPageClients` (live page streams at once) | 4 |
 | `Source.MaxFileBytes` | 8388608 (8 MiB) |
 | `Source.MaxLineBytes` | 512 |
@@ -214,7 +179,7 @@ Claude Code:
 claude mcp add perf-agent -- /path/to/perf-agent-mcp --profiles /path/to/profiles --output /path/to/pages
 ```
 
-Add `--live` to that command for the live page. Any other MCP client: run `/path/to/perf-agent-mcp --profiles DIR --output DIR` as a stdio server. The server answers protocol versions 2025-11-25 and 2025-06-18 and answers `server/discover` with method-not-found, so clients fall back to `initialize`.
+Any other MCP client: run `/path/to/perf-agent-mcp --profiles DIR --output DIR` as a stdio server. The server answers protocol versions 2025-11-25 and 2025-06-18 and answers `server/discover` with method-not-found, so clients fall back to `initialize`.
 
 ## Evals
 

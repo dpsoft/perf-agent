@@ -25,9 +25,9 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 4. Two profiles: `open` both, then `diff`.
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
 6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all (for a mismatch, re-check the claim's node and metric rather than copying the value), and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
-7. With `--live`: `page_open` and give the user the URL, then `page_explain` instead of `render_flamegraph` (the same check and `attempt` rules; it publishes instead of writing), `page_diff` to show a comparison (`diff`'s arguments, and a union `id` from `diff` as its `node`), and `page_show` to select or focus a node. The page lists the rejected attempts the server kept for the view and counts the ones it left out; its history is bounded. Use `render_flamegraph` when the user wants a file.
+7. The live page is not part of this server: it will ship with a separate long-lived serve binary. Use `render_flamegraph` when the user wants a page.
 
-Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`; `diff` and `page_diff` take `base_handle`, `base_view`, `new_handle` and `new_view`; `page_open` takes no arguments; `page_show` takes a `publication` and a `node`, and without `publication` steers the publication on the page. If a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
+Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`; `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`; if a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 
 ## Hard rules
 

@@ -71,3 +71,50 @@ func (*Lease) Update(Holder) error { return notLinux() }
 
 // Close is disabled: capture needs Linux.
 func (*Lease) Close() error { return nil }
+
+// Recheck is disabled: capture needs Linux.
+func (Binary) Recheck() *Error { return notLinux() }
+
+// RunInternal never handles anything here: the internal modes need Linux.
+func RunInternal() (code int, handled bool) { return 0, false }
+
+// Reaper is a capture's reaper, which needs Linux.
+type Reaper struct{}
+
+// StartReaper is disabled: capture needs Linux.
+func StartReaper(string, ReaperSpec, ReaperFiles) (*Reaper, error) { return nil, notLinux() }
+
+// Send is disabled: capture needs Linux.
+func (*Reaper) Send(Command) error { return notLinux() }
+
+// Events is closed at once: there is never a reaper here.
+func (*Reaper) Events() <-chan Event {
+	ch := make(chan Event)
+	close(ch)
+	return ch
+}
+
+// Done is closed at once: there is never a reaper here.
+func (*Reaper) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// PID is 0: there is never a reaper here.
+func (*Reaper) PID() int { return 0 }
+
+// Kill does nothing: there is never a reaper here.
+func (*Reaper) Kill() {}
+
+// DelegatedCgroup never finds one: capture needs Linux.
+func DelegatedCgroup([]byte, string) (parent, why string) { return "", "capture needs Linux" }
+
+// CreateCgroup is disabled: capture needs Linux.
+func CreateCgroup(string, string) (string, error) { return "", notLinux() }
+
+// KillCgroup is disabled: capture needs Linux.
+func KillCgroup(string) error { return notLinux() }
+
+// RemoveCgroup is disabled: capture needs Linux.
+func RemoveCgroup(string) error { return notLinux() }

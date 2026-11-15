@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 )
 
 // testChildEnv names the helper body a re-executed test binary runs
@@ -92,6 +94,11 @@ var testChildBodies = map[string]func() string{
 }
 
 func TestMain(m *testing.M) {
+	// The reaper and the launcher are this binary re-executed, as they are
+	// the server's binary in production.
+	if code, ok := RunInternal(); ok {
+		os.Exit(code)
+	}
 	if mode, ok := os.LookupEnv(testChildEnv); ok {
 		os.Exit(runTestChild(mode))
 	}
@@ -109,11 +116,12 @@ func runTestChild(mode string) int {
 	return 0
 }
 
-// runTests runs the tests, then kills and reaps, by recorded process, any
-// helper child a test left behind. The package owns the children for the
+// runTests runs the tests under capturetest.Main, which owns the built fake
+// binaries, then kills and reaps, by recorded process, any helper child a
+// test left behind. The package owns the children for the
 // life of the test binary, not the test that happened to start one.
 func runTests(m *testing.M) int {
-	code := m.Run()
+	code := capturetest.Main(m)
 	testChildren.killAll()
 	return code
 }

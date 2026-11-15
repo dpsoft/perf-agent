@@ -41,6 +41,7 @@ type Record struct {
 	Env        []string `json:"env"`
 	PID        int      `json:"pid"`
 	PGID       int      `json:"pgid"`
+	Cwd        string   `json:"cwd"`
 	Grandchild int      `json:"grandchild,omitzero"`
 }
 

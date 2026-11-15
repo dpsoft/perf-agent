@@ -95,7 +95,8 @@ func run() int {
 		log.Fatal("--gpu-shim is only meaningful with --gpu")
 	}
 
-	rec := fakemode.Record{Argv: os.Args, Env: os.Environ(), PID: os.Getpid(), PGID: syscall.Getpgrp()}
+	cwd, _ := os.Getwd()
+	rec := fakemode.Record{Argv: os.Args, Env: os.Environ(), PID: os.Getpid(), PGID: syscall.Getpgrp(), Cwd: cwd}
 	if mf.Mode == fakemode.ForkGrandchild {
 		gc := exec.Command(exe, fakemode.GrandchildArg)
 		if err := gc.Start(); err != nil {

@@ -261,16 +261,61 @@ func checkAncestors(path string, c creds, lstat func(string, *syscall.Stat_t) er
 // checkMount refuses a filesystem mounted nosuid or noexec: the kernel
 // ignores file capabilities on the first and refuses the exec on the second.
 func checkMount(path string, fd int) error {
+	return checkMountFor(path, fd, true)
+}
+
+// checkMountFor reads fd's mount flags for mountFlagsError.
+func checkMountFor(path string, fd int, caps bool) error {
 	var fs syscall.Statfs_t
 	if err := syscall.Fstatfs(fd, &fs); err != nil {
 		return Errorf(CodeDisabled, "", "cannot read the mount flags of %s: %v", path, err)
 	}
-	flags := uint64(fs.Flags)
-	if flags&syscall.MS_NOSUID != 0 {
+	return mountFlagsError(path, uint64(fs.Flags), caps)
+}
+
+// mountFlagsError refuses noexec, and nosuid when caps says the binary
+// relies on file capabilities, which nosuid voids.
+func mountFlagsError(path string, flags uint64, caps bool) error {
+	if caps && flags&syscall.MS_NOSUID != 0 {
 		return Errorf(CodeDisabled, copyAdvice, "%s is on a filesystem mounted nosuid, where file capabilities do not apply", path)
 	}
 	if flags&syscall.MS_NOEXEC != 0 {
 		return Errorf(CodeDisabled, copyAdvice, "%s is on a filesystem mounted noexec", path)
+	}
+	return nil
+}
+
+// Recheck re-runs, before an exec of b, the checks that do not need the
+// whole verification: the path still names the verified identity, its
+// directories still pass the ancestor rule, and its mount still honours
+// the capabilities it was verified with. The mount flags are read on a
+// descriptor that is checked to be the verified inode.
+func (b Binary) Recheck() *Error {
+	if e := b.Unchanged(); e != nil {
+		return e
+	}
+	asError := func(err error) *Error {
+		if e, ok := errors.AsType[*Error](err); ok {
+			return e
+		}
+		return Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "%v", err)
+	}
+	if err := checkAncestors(b.Path, currentCreds(), syscall.Lstat); err != nil {
+		return asError(err)
+	}
+	f, err := os.OpenFile(b.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "cannot open perf-agent to recheck it: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil || uint64(st.Dev) != b.ID.Dev || uint64(st.Ino) != b.ID.Ino {
+		e := Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "perf-agent changed since start-up")
+		e.Changed = "dev,ino"
+		return e
+	}
+	if err := checkMountFor(b.Path, int(f.Fd()), b.ID.Xattr != [32]byte{}); err != nil {
+		return asError(err)
 	}
 	return nil
 }

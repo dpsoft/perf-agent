@@ -117,8 +117,8 @@ const (
 type FakeOptions struct {
 	Mode       FakeMode
 	ReadyAfter time.Duration
-	// Record is a path the fake writes its argv, environment, pid and
-	// pgid to as JSON.
+	// Record is a path the fake writes its argv, environment, pid, pgid
+	// and working directory to as JSON.
 	Record string
 }
 

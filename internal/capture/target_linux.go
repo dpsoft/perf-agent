@@ -32,9 +32,10 @@ func (p Proc) ownerOf(path string) (int, error) {
 
 // procStat is what the target rule reads from /proc/<pid>/stat.
 type procStat struct {
-	comm  string
-	state byte
-	start uint64
+	comm       string
+	state      byte
+	ppid, pgrp int
+	start      uint64
 }
 
 // readStat parses /proc/<pid>/stat. The comm field is in parentheses and
@@ -49,7 +50,7 @@ func readStat(p Proc, pid int) (procStat, error) {
 	if open < 0 || end < open {
 		return procStat{}, fmt.Errorf("pid %d: malformed stat", pid)
 	}
-	// After the comm: state is field 3 and starttime field 22.
+	// After the comm: state is field 3, ppid 4, pgrp 5 and starttime 22.
 	fields := strings.Fields(string(b[end+1:]))
 	if len(fields) < 20 || len(fields[0]) != 1 {
 		return procStat{}, fmt.Errorf("pid %d: stat has %d fields after the comm", pid, len(fields))
@@ -58,10 +59,15 @@ func readStat(p Proc, pid int) (procStat, error) {
 	if err != nil {
 		return procStat{}, fmt.Errorf("pid %d: stat start time: %w", pid, err)
 	}
+	ppid, err1 := strconv.Atoi(fields[1])
+	pgrp, err2 := strconv.Atoi(fields[2])
+	if err := errors.Join(err1, err2); err != nil {
+		return procStat{}, fmt.Errorf("pid %d: stat ppid or pgrp: %w", pid, err)
+	}
 	if p.StartTimeHook != nil {
 		start = p.StartTimeHook(pid, start)
 	}
-	return procStat{comm: string(b[open+1 : end]), state: fields[0][0], start: start}, nil
+	return procStat{comm: string(b[open+1 : end]), state: fields[0][0], ppid: ppid, pgrp: pgrp, start: start}, nil
 }
 
 // exited reports a state in which the task has exited: a zombie or dead.

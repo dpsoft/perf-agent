@@ -74,10 +74,18 @@ func (s *Server) liveMux() http.Handler {
 		}
 		var out []byte
 		var err error
+		limit := p.opts.MaxBytes
 		if p.kind == pubDiff {
+			limit = p.diffOpts.MaxBytes
 			out, err = flamegraph.DiffLiveFrame(p.diff, p.index, profilemodel.UnionID(node))
 		} else {
 			out, err = flamegraph.ExplainedLiveFrame(p.v, p.result, profilemodel.NodeID(node), p.opts.Digest)
+		}
+		// A frame's path names every caller, so a deep stack of long names
+		// makes it as large as the stack: it is bounded like a model.
+		if err == nil && limit > 0 && len(out) > limit {
+			err = fmt.Errorf("the frame and its path from the root take %d bytes, over this server's MaxPageBytes=%d, so the page cannot show it; "+
+				"restart perf-agent-mcp with a larger --limit MaxPageBytes=N to see it", len(out), limit)
 		}
 		writeComputed(w, out, err)
 	})

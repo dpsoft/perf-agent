@@ -590,7 +590,7 @@ ID; `<node>` is a node ID, or a union ID for a diff.
 | `events` | SSE: on connect and on every change, `event: state` with the `state` JSON as data; `: keep-alive` every 15 s |
 | `pub/<p>/model` | the publication's model JSON (explained or diff), fixed at publish time |
 | `pub/<p>/history` | `{"publication","version",…}`: rejected rows and pill texts from the snapshot's copy of the server's record (explained only; empty rows for a diff) |
-| `pub/<p>/frame/<node>` | one frame's facts, path and explanation (if any), from the engine. For a diff it comes from the full union index, not from the serialized model, which the budget may cut (M2b-R3) |
+| `pub/<p>/frame/<node>` | one frame's facts, path and explanation (if any), from the engine. For a diff it comes from the full union index, not from the serialized model, which the budget may cut (M2b-R3). Its path names every caller, so it is bounded by `MaxPageBytes`: a larger one is `422` with the reason, before any body |
 | `pub/<p>/focus/<node>` | the subtree under node, laid out, bounded by `MaxPageBytes` |
 | `pub/<p>/export` | the static page as an attachment (D6), or `422` with a reason when it does not fit (M2b-R2) |
 

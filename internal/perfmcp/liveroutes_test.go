@@ -1203,3 +1203,43 @@ func TestADiffIsChargedForItsDerivedUnits(t *testing.T) {
 		t.Errorf("one shared derived unit fits the budget: %v", err)
 	}
 }
+
+// A frame's path holds every caller's name, so a deep stack of long names
+// makes a frame response as large as the stack. It is bounded like every
+// other response the page builds: over MaxPageBytes it is refused with
+// 422 and a reason, before any of it is sent.
+func TestAFrameIsBoundedByMaxPageBytes(t *testing.T) {
+	const depth, nameLen, budget = 300, 1000, 96 << 10
+	frames := make([]pmfixture.Frame, depth)
+	for i := range frames {
+		s := fmt.Sprintf("f%04d_", i)
+		frames[i] = pmfixture.Fn(s + strings.Repeat("n", nameLen-len(s)))
+	}
+	deep := pmfixture.Build("cpu", "nanoseconds", nil, pmfixture.Sample{Frames: frames, Value: 10})
+	shallow := pmfixture.Build("cpu", "nanoseconds", nil, pmfixture.Sample{Frames: frames[:depth/3], Value: 10})
+	p := openLivePair(t, func(c *Config) { c.Limits.MaxPageBytes = budget }, shallow, deep)
+	bottom := fmt.Sprintf("f%04d_", depth-1)
+
+	// An explained publication's frame, from the facts-only page of the
+	// deep profile.
+	var out pageExplainOut
+	p.c.callOK("page_explain", p.new.args(map[string]any{"explanations": []any{}}), &out)
+	id := p.new.nodeID(t, bottom+strings.Repeat("n", nameLen-len(bottom)))
+	res, body := httpGet(t, out.URL+"pub/"+out.Publication+"/frame/"+id, nil)
+	wantStatus(t, "explained frame", res, body, http.StatusUnprocessableEntity)
+	if !strings.Contains(string(body), fmt.Sprintf("MaxPageBytes=%d", budget)) || len(body) > 1<<10 {
+		t.Errorf("the refusal says %.200q (%d bytes)", body, len(body))
+	}
+	mid := p.new.nodeID(t, "f0001_"+strings.Repeat("n", nameLen-len("f0001_")))
+	res, body = httpGet(t, out.URL+"pub/"+out.Publication+"/frame/"+mid, nil)
+	wantStatus(t, "a shallow frame", res, body, http.StatusOK)
+
+	// A diff's frame of the same node, only in new.
+	diff, _ := p.pageDiff(t, nil)
+	union := p.unionID(t, bottom+strings.Repeat("n", nameLen-len(bottom)))
+	res, body = httpGet(t, out.URL+"pub/"+diff.Publication+"/frame/"+url.PathEscape(union), nil)
+	wantStatus(t, "diff frame", res, body, http.StatusUnprocessableEntity)
+	if !strings.Contains(string(body), fmt.Sprintf("MaxPageBytes=%d", budget)) {
+		t.Errorf("the diff refusal says %.200q", body)
+	}
+}

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,7 +132,11 @@ type exFactRow struct {
 
 // exQualityRow is one quality fact with its status.
 type exQualityRow struct {
-	Label, Value, Title, Status, Note string
+	Label  string `json:"k"`
+	Value  string `json:"v"`
+	Title  string `json:"t"`
+	Status string `json:"s"`
+	Note   string `json:"n"`
 }
 
 // exSegment is one piece of agent text ready to show: the engine's value
@@ -187,25 +193,57 @@ type exModel struct {
 	Prompts  []exPrompt  `json:"prompts"`
 }
 
-// exDrawn is one frame div.
+// exDrawn is one frame div. Its name is the model frame's, so the live
+// model leaves it out.
 type exDrawn struct {
-	I, Class, Left, Width, Top, Domain, Resolution, Name, Tip string
-	Star                                                      bool
+	I          string `json:"i"`
+	Class      string `json:"cls,omitzero"`
+	Left       string `json:"left"`
+	Width      string `json:"width"`
+	Top        string `json:"top"`
+	Domain     string `json:"domain"`
+	Resolution string `json:"res,omitzero"`
+	Name       string `json:"-"`
+	Tip        string `json:"tip"`
+	Star       bool   `json:"star,omitzero"`
 }
 
 type exChip struct{ Label, Prompt string }
 
-type exPathItem struct{ Ref, Node, Name, Share string }
+type exPathItem struct {
+	Ref   string `json:"ref"`
+	Node  string `json:"node"`
+	Name  string `json:"name"`
+	Share string `json:"share"`
+}
 
-type exRow struct{ Ref, Node, Name, Share, Cum string }
+type exRow struct {
+	Ref   string `json:"ref"`
+	Node  string `json:"node"`
+	Name  string `json:"name"`
+	Share string `json:"share"`
+	Cum   string `json:"cum"`
+}
 
 // exRejected is one row of "Rejected at render". Kind is "claim",
 // "reference" or "limit"; only claim rows carry a metric and figures.
 type exRejected struct {
-	Attempt, Evidence, Kind, Label, Metric, Node, Agent, Engine, Code, Reason string
+	Attempt  string `json:"attempt"`
+	Evidence string `json:"evidence,omitzero"`
+	Kind     string `json:"kind"`
+	Label    string `json:"label"`
+	Metric   string `json:"metric,omitzero"`
+	Node     string `json:"node,omitzero"`
+	Agent    string `json:"agent,omitzero"`
+	Engine   string `json:"engine,omitzero"`
+	Code     string `json:"code,omitzero"`
+	Reason   string `json:"reason,omitzero"`
 }
 
-type exLegend struct{ Key, Label string }
+type exLegend struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
 
 type explainedPageData struct {
 	CSS, Palette                    template.CSS
@@ -273,21 +311,34 @@ func WriteExplainedPage(w io.Writer, v *profilemodel.View, r explain.Result, opt
 	if err != nil {
 		return err
 	}
-	frameBytes := int64(opts.MaxBytes - len(base) - pageSlack)
-	for range maxBudgetPasses {
-		page, err := renderExplained(v, r, opts, max(frameBytes, 0), rows)
-		if err != nil {
-			return err
-		}
-		if len(page) <= opts.MaxBytes {
-			_, err = w.Write(page)
-			return err
-		}
-		frameBytes -= int64(len(page)-opts.MaxBytes) + pageSlack
+	page, err := fitFrames(opts.MaxBytes, base, func(frameBytes int64) ([]byte, error) {
+		return renderExplained(v, r, opts, frameBytes, rows)
+	})
+	if err != nil {
+		return err
 	}
-	// Only the explained and referenced paths are certain to fit.
-	_, err = w.Write(base)
+	_, err = w.Write(page)
 	return err
+}
+
+// fitFrames spends what maxBytes leaves after base, the output with only
+// the explained and referenced paths drawn, on frames: render is called
+// with a frame budget, which shrinks by the overshoot and pageSlack until
+// the output fits, at most maxBudgetPasses times. Only base is certain to
+// fit, so it is the answer when no pass does.
+func fitFrames(maxBytes int, base []byte, render func(frameBytes int64) ([]byte, error)) ([]byte, error) {
+	frameBytes := int64(maxBytes - len(base) - pageSlack)
+	for range maxBudgetPasses {
+		out, err := render(max(frameBytes, 0))
+		if err != nil {
+			return nil, err
+		}
+		if len(out) <= maxBytes {
+			return out, nil
+		}
+		frameBytes -= int64(len(out)-maxBytes) + pageSlack
+	}
+	return base, nil
 }
 
 // rowOverhead bounds the markup of one rejected row besides its text.
@@ -359,21 +410,36 @@ func renderExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageO
 // buildExplained assembles the page; frameBytes < 0 means no byte budget,
 // and historyRows < 0 every rejected row.
 func buildExplained(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, frameBytes int64, historyRows int) (*explainedPageData, error) {
-	b := &explainedBuilder{v: v, r: r, opts: opts, historyRows: historyRows, refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
-	return b.build(frameBytes)
+	return newExplainedBuilder(v, r, opts, nil, historyRows).build(frameBytes)
+}
+
+// newExplainedBuilder is a builder of v whose layout starts at root, or at
+// the view's root when root is nil.
+func newExplainedBuilder(v *profilemodel.View, r explain.Result, opts ExplainedPageOptions, root *profilemodel.Node, historyRows int) *explainedBuilder {
+	return &explainedBuilder{v: v, r: r, opts: opts, root: root, historyRows: historyRows,
+		refs: map[profilemodel.NodeID]string{}, byID: map[profilemodel.NodeID]*exFrame{}}
 }
 
 type explainedBuilder struct {
 	v    *profilemodel.View
 	r    explain.Result
 	opts ExplainedPageOptions
+	// root is the node the layout starts at, drawn at depth 0 and full
+	// width; nil is the view's root. Shares stay of the view total.
+	root *profilemodel.Node
+	// modelOnly says the output is JSON alone, where a frame's name is
+	// written once, in the model.
+	modelOnly bool
+	// partial says the builder holds only some of the explained frames:
+	// explanations of nodes it has no frame for are skipped, not an error.
+	partial bool
 	// historyRows is how many of the newest rejected rows the page lists;
 	// < 0 lists them all.
 	historyRows int
 	view        string
 	specs       []exRowSpec
 	frames      []*exFrame
-	refs        map[profilemodel.NodeID]string // node -> "f<k>" for drawn nodes
+	refs        map[profilemodel.NodeID]string // node -> "f<k>" for the model's nodes
 	byID        map[profilemodel.NodeID]*exFrame
 }
 
@@ -403,6 +469,9 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	if data.GPU {
 		data.Axis = "width = GPU time launched from the sampled stacks of this path, not CPU time"
 	}
+	if b.root != nil {
+		data.Axis += "; widths relative to " + shownName(b.root.Function.Name) + ", shares are of the view total"
+	}
 	notes, err := v.Notes()
 	if err != nil {
 		return nil, err
@@ -413,6 +482,16 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	if err := b.layout(data, frameBytes); err != nil {
 		return nil, err
 	}
+	drawn := b.frames[:len(b.frames):len(b.frames)]
+	if b.root != nil {
+		// The focus's callers and every explained and referenced path are
+		// in the model, undrawn, so the path panel and the rows can name them.
+		for _, id := range append([]profilemodel.NodeID{b.root.ID}, b.anchors()...) {
+			if err := b.addPath(id); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := b.attachExplanations(); err != nil {
 		return nil, err
 	}
@@ -421,9 +500,13 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 		data.Rows = append(data.Rows, exRow{Ref: f.Ref, Node: f.ID, Name: f.Name, Share: f.Share,
 			Cum: factValue(ch.Facts.Cumulative)})
 	}
+	// The first explained frame drawn is selected, else the layout's root.
 	sel := b.frames[0]
-	if len(b.r.Checked) > 0 {
-		sel = b.byID[b.r.Checked[0].Node]
+	for _, ch := range b.r.Checked {
+		if f := b.byID[ch.Node]; slices.Contains(drawn, f) {
+			sel = f
+			break
+		}
 	}
 	data.Sel = sel
 	data.SelFacts = b.factRows(sel)
@@ -442,11 +525,9 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	data.allRejected = data.Rejected
 	if n := len(data.Rejected) - b.historyRows; b.historyRows >= 0 && n > 0 {
 		data.Rejected = data.Rejected[n:]
-		data.RejectedNote = fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
+		data.RejectedNote = rejectedNote(n)
 	}
-	if b.opts.HistoryIncomplete {
-		data.HistoryPill = "earlier attempt history for this view may be incomplete"
-	}
+	data.HistoryPill = historyPill(b.opts.HistoryIncomplete)
 	data.Legend = legendOf(data.Frames)
 
 	model, err := json.Marshal(exModel{View: b.view, Selected: sel.ID, FactRows: b.specs, Frames: b.frames, Prompts: prompts})
@@ -499,25 +580,33 @@ func (b *explainedBuilder) factRows(f *exFrame) []exFactRow {
 	return append(out, f.Extra...)
 }
 
-// forced is the set of nodes always drawn: every explained node, every
-// node a placeholder names, the root, and all their callers, so the set is
-// closed under parents and a node left out never hides one of them.
-func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
-	out := map[profilemodel.NodeID]bool{b.v.Root.ID: true}
-	add := func(id profilemodel.NodeID) {
-		for n, ok := b.v.Node(id); ok && n != nil && !out[n.ID]; n = n.Parent {
-			out[n.ID] = true
-		}
+// rejectedNote says how many of the oldest rejected rows a budget left
+// out.
+func rejectedNote(n int) string {
+	return fmt.Sprintf("%s beyond the page's size budget %s not listed; the pills count them.", plural(n, "earlier row", "earlier rows"), isAre(n))
+}
+
+// historyPill says the attempt history may be incomplete, or is "".
+func historyPill(incomplete bool) string {
+	if !incomplete {
+		return ""
 	}
+	return "earlier attempt history for this view may be incomplete"
+}
+
+// anchors are the explained nodes and the nodes their placeholders name,
+// in the order the explanations give them.
+func (b *explainedBuilder) anchors() []profilemodel.NodeID {
+	var out []profilemodel.NodeID
 	nodesIn := func(segs []explain.Segment) {
 		for _, sg := range segs {
 			if sg.Kind == explain.SegmentNode {
-				add(sg.Node)
+				out = append(out, sg.Node)
 			}
 		}
 	}
 	for _, ch := range b.r.Checked {
-		add(ch.Node)
+		out = append(out, ch.Node)
 		nodesIn(ch.Prose)
 		for _, h := range ch.Hypotheses {
 			nodesIn(h)
@@ -525,6 +614,50 @@ func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
 		nodesIn(ch.NextMeasurement)
 	}
 	return out
+}
+
+// forced is the set of nodes always drawn: every anchor, the root, and all
+// their callers, so the set is closed under parents and a node left out
+// never hides one of them.
+func (b *explainedBuilder) forced() map[profilemodel.NodeID]bool {
+	out := map[profilemodel.NodeID]bool{b.v.Root.ID: true}
+	for _, id := range b.anchors() {
+		for n, ok := b.v.Node(id); ok && n != nil && !out[n.ID]; n = n.Parent {
+			out[n.ID] = true
+		}
+	}
+	return out
+}
+
+// addPath adds the view's root and id's callers down to id to the model,
+// undrawn, where they are not in it yet. A node the view does not have
+// adds nothing.
+func (b *explainedBuilder) addPath(id profilemodel.NodeID) error {
+	n, ok := b.v.Node(id)
+	if !ok {
+		return nil
+	}
+	for _, p := range append([]*profilemodel.Node{b.v.Root}, b.v.Path(n)...) {
+		if b.byID[p.ID] != nil {
+			continue
+		}
+		f, err := b.frame(p)
+		if err != nil {
+			return err
+		}
+		b.refs[p.ID] = f.Ref
+	}
+	return nil
+}
+
+// under says n is root or below it.
+func under(n, root *profilemodel.Node) bool {
+	for ; n != nil; n = n.Parent {
+		if n == root {
+			return true
+		}
+	}
+	return false
 }
 
 // leftOut counts the nodes not drawn, by why.
@@ -536,16 +669,29 @@ const (
 	reasonSize
 )
 
-// layout chooses the frames to draw, breadth first so the widest and
-// shallowest come first, and places each at its offset within its parent:
-// left and width are percentages of the view total, top is its depth.
-// Forced nodes are always drawn. Any other node is drawn only when it is
-// at least minDrawFraction of the total, the MaxNodes budget has room and
-// its estimated bytes fit in frameBytes (unless frameBytes < 0). A node
-// not drawn takes everything below it along; they are counted instead.
+// layout chooses the frames to draw from the layout's root down, breadth
+// first so the widest and shallowest come first, and places each at its
+// offset within its parent: left and width are percentages of the root's
+// cumulative (the view total for the view's root), top is its depth below
+// the root. Forced nodes under the root are always drawn. Any other node is
+// drawn only when it is at least minDrawFraction of that width, the
+// MaxNodes budget has room and its estimated bytes fit in frameBytes
+// (unless frameBytes < 0). A node not drawn takes everything below it
+// along; they are counted instead.
 func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) error {
 	v := b.v
+	root, total := v.Root, v.Total
+	if b.root != nil {
+		root, total = b.root, b.root.Cum
+	}
 	forced := b.forced()
+	if root != v.Root {
+		maps.DeleteFunc(forced, func(id profilemodel.NodeID, _ bool) bool {
+			n, _ := v.Node(id)
+			return !under(n, root)
+		})
+		forced[root.ID] = true
+	}
 	maxNodes := cmp.Or(b.opts.MaxNodes, defaultExplainedMaxNodes)
 	nodeBudget := max(0, maxNodes-len(forced))
 	type queued struct {
@@ -554,7 +700,7 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 		jitter int
 	}
 	wide := func(n *profilemodel.Node) bool {
-		return n.Cum > 0 && float64(n.Cum) >= minDrawFraction*float64(v.Total)
+		return n.Cum > 0 && float64(n.Cum) >= minDrawFraction*float64(total)
 	}
 	explained := map[profilemodel.NodeID]bool{}
 	for _, ch := range b.r.Checked {
@@ -562,7 +708,7 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 	}
 	var out leftOut
 	var usedBytes int64
-	queue := []queued{{n: v.Root}}
+	queue := []queued{{n: root}}
 	maxDepth, unforced := 0, 0
 	for len(queue) > 0 {
 		q := queue[0]
@@ -573,17 +719,18 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 			return err
 		}
 		b.refs[n.ID] = f.Ref
-		maxDepth = max(maxDepth, n.Depth)
+		depth := n.Depth - root.Depth
+		maxDepth = max(maxDepth, depth)
 		d := exDrawn{
 			I:     strconv.Itoa(len(b.frames) - 1),
-			Left:  pctOf(q.offset, v.Total),
-			Width: pctOf(n.Cum, v.Total),
-			Top:   strconv.Itoa(n.Depth * explainedRowPitch),
+			Left:  pctOf(q.offset, total),
+			Width: pctOf(n.Cum, total),
+			Top:   strconv.Itoa(depth * explainedRowPitch),
 			Name:  f.Name,
 			Tip:   f.Facts[0].Value + ", " + f.Share + " of total",
 			Star:  explained[n.ID],
 		}
-		if v.Total <= 0 && n == v.Root {
+		if total <= 0 && n == root {
 			d.Width = "100"
 		}
 		dom := DomainRoot
@@ -610,12 +757,12 @@ func (b *explainedBuilder) layout(data *explainedPageData, frameBytes int64) err
 			case !wide(c) || unforced >= nodeBudget:
 				countLeftOut(c, wide, reasonLimit, &out)
 				drawn = false
-			case frameBytes >= 0 && usedBytes+frameEstimate(c) > frameBytes:
+			case frameBytes >= 0 && usedBytes+b.frameEstimate(c) > frameBytes:
 				countLeftOut(c, wide, reasonSize, &out)
 				drawn = false
 			default:
 				unforced++
-				usedBytes += frameEstimate(c)
+				usedBytes += b.frameEstimate(c)
 			}
 			if drawn {
 				queue = append(queue, queued{n: c, offset: offset, jitter: (i * 3) % jitterSteps})
@@ -658,11 +805,16 @@ func countLeftOut(n *profilemodel.Node, wide func(*profilemodel.Node) bool, reas
 	}
 }
 
-// frameEstimate bounds the bytes drawing n adds: its div and model entry,
-// and its name escaped once for HTML text and once as a JSON string.
-func frameEstimate(n *profilemodel.Node) int64 {
+// frameEstimate bounds the bytes drawing n adds: its div (or drawn entry)
+// and model entry, and its name escaped as a JSON string and, on the page,
+// once more for HTML text.
+func (b *explainedBuilder) frameEstimate(n *profilemodel.Node) int64 {
 	name := shownName(n.Function.Name)
-	return frameOverhead + htmlEscapedBound(name) + jsonEscapedBound(name)
+	size := frameOverhead + jsonEscapedBound(name)
+	if !b.modelOnly {
+		size += htmlEscapedBound(name)
+	}
+	return size
 }
 
 // htmlEscapedBound bounds the length of s as html/template escapes text:
@@ -764,6 +916,9 @@ func valueOf(f profilemodel.Fact) exFactVal {
 func (b *explainedBuilder) attachExplanations() error {
 	for _, ch := range b.r.Checked {
 		f := b.byID[ch.Node]
+		if f == nil && b.partial {
+			continue
+		}
 		if f == nil {
 			return fmt.Errorf("flamegraph: explained node %s is not in the view", ch.Node)
 		}
@@ -857,6 +1012,9 @@ func (b *explainedBuilder) claimTitle(c explain.CheckedClaim) string {
 // nodeName is "<name> (node <id>)", or "node <id>" for a node the view
 // does not have.
 func (b *explainedBuilder) nodeName(id profilemodel.NodeID) string {
+	if b.v == nil {
+		return "node " + string(id)
+	}
 	if n, ok := b.v.Node(id); ok {
 		return shownName(n.Function.Name) + " (node " + string(id) + ")"
 	}

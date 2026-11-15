@@ -1274,8 +1274,9 @@ func TestFusedPagesSayWhatEachRootMeasures(t *testing.T) {
 	}
 	assert.Contains(t, frame("[cpu] perf-agent 99 Hz"), `data-axis="cpu/nanoseconds"`)
 	assert.Contains(t, frame("[gpu] per sampled launch"), `data-axis="gpu/nanoseconds"`)
-	// The synthetic root spans both, so it claims neither.
-	assert.Contains(t, frame("all"), `data-axis=""`)
+	// The synthetic root spans both, and says so: its width is a sum of the
+	// two kinds, which is exactly what the fused axis names.
+	assert.Contains(t, frame("all"), `data-axis="cpu+gpu/nanoseconds"`)
 	// Below the roots the attribute would only repeat its ancestor's.
 	assert.NotContains(t, frame("work"), "data-axis")
 	assert.NotContains(t, frame("gemm_kernel"), "data-axis")
@@ -1336,6 +1337,11 @@ func TestWidthMeaningFollowsTheFrameNotTheChart(t *testing.T) {
 		}
 	}
 	if engine == "" {
+		// A runner image that drops both engines must not turn this test into
+		// a silent pass: CI is where nobody is watching the skip count.
+		if os.Getenv("CI") == "true" {
+			t.Fatal("CI has no JavaScript engine that can run a script (node or gjs); the width tooltips are untested")
+		}
 		t.Skip("no JavaScript engine that can run a script (node or gjs)")
 	}
 
@@ -1344,22 +1350,25 @@ var unit="nanoseconds",axis;
 ` + jsFunction(t, "axisOf") + "\n" + jsFunction(t, "widthMeaning") + `
 function f(d,up,ax){return {d:d,up:up,el:{dataset:ax===undefined?{}:{axis:ax}}};}
 function tree(fused){
-  var all=f(0,undefined,fused?"":undefined);
-  var cpu=fused?f(1,all,"cpu/nanoseconds"):all;
-  var gpu=fused?f(1,all,"gpu/nanoseconds"):all;
+  var all=f(0,undefined,fused);
+  var cpu=fused!==undefined?f(1,all,"cpu/nanoseconds"):all;
+  var gpu=fused!==undefined?f(1,all,"gpu/nanoseconds"):all;
   var cmain=f(cpu.d+1,cpu),work=f(cpu.d+2,cmain);
   var gmain=f(gpu.d+1,gpu),launch=f(gpu.d+2,gmain),kernel=f(gpu.d+3,launch);
   return {all:all,cpu:cpu,work:[work,"cpu"],gmain:[gmain,"cpu"],launch:[launch,"boundary"],kernel:[kernel,"gpu-kernel"]};
 }
 function run(chartAxis,fused){
   axis="Flame graph, "+chartAxis;
-  var t=tree(fused),r={};
+  var t=tree(fused?chartAxis:undefined),r={};
   ["work","gmain","launch","kernel"].forEach(function(k){r[k]=widthMeaning(t[k][0],{domain:t[k][1]});});
   r.all=widthMeaning(t.all,{domain:"root"});
   return r;
 }
 out(JSON.stringify({
   fused:run("cpu+gpu/nanoseconds",true),
+  gpuFirst:run("gpu+cpu/nanoseconds",true),
+  noCPU:run("offcpu+gpu/nanoseconds",true),
+  mixedRoot:run("",true),
   cpu:run("cpu/nanoseconds",false),
   gpu:run("gpu/nanoseconds",false)
 }));
@@ -1373,14 +1382,18 @@ out(JSON.stringify({
 	require.NoError(t, json.Unmarshal(bytes.TrimSpace(raw), &got), "%s", raw)
 
 	const (
+		summed   = "width: CPU samples and GPU time added together \u2014 compare within one root"
 		launched = "width: GPU time launched from this call path — not CPU time spent here"
 		kernel   = "width: measured time this kernel ran on the device"
 		boundary = "width: device time launched from this path, sampled one launch in N"
 	)
 	assert.Equal(t, map[string]string{
-		"work": "", "all": "",
+		"work": "", "all": summed,
 		"gmain": launched, "launch": boundary, "kernel": kernel,
-	}, got["fused"], "fused: CPU-sampled frames say nothing; the GPU subtree keeps its text")
+	}, got["fused"], "fused: CPU-sampled frames say nothing; the GPU subtree keeps its text; the root warns it is a sum")
+	assert.Equal(t, got["fused"], got["gpuFirst"], "the order the inputs were given in changes nothing")
+	assert.Empty(t, got["noCPU"]["all"], "a sum with no CPU samples in it is not described as one")
+	assert.Empty(t, got["mixedRoot"]["all"], "a root that claims no axis says nothing")
 	assert.Equal(t, map[string]string{
 		"work": "", "gmain": "", "launch": "", "kernel": "", "all": "",
 	}, got["cpu"], "a CPU page explains nothing")

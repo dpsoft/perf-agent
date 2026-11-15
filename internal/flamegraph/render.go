@@ -452,7 +452,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 		maxDepth*frameHeight-1, html.EscapeString(res.SampleTypeName+"/"+res.Unit),
 		root.value, html.EscapeString(res.Unit))
 	writeModuleTable(ew, mods)
-	writeNode(ew, root, res.Unit, root.value, mods, rootAxes(res))
+	writeNode(ew, root, res.Unit, root.value, mods, fusedAxesOf(res))
 	ew.s("</div>\n")
 	ew.s("</div>\n")
 	return ew.err
@@ -485,7 +485,7 @@ func writeChart(ew *errWriter, root *node, maxDepth int, res *foldedstacks.Resul
 // The label is deliberately terse — name, value, share. Domain, module and
 // the inference note stay in the visual tooltip; a screen reader user
 // scanning twenty frames does not want three sentences on each.
-func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable, axes map[string]string) {
+func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTable, axes *fusedAxes) {
 	cls := fmt.Sprintf("frame d%d", n.depth)
 	if n.inexact > 0 {
 		cls += " inexact"
@@ -521,14 +521,14 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 		ew.s(` data-collapsed="1"`)
 	}
 	// A fused page's roots say what their own subtree measures; see
-	// rootAxes. Only the frames that change the answer carry it, and the
+	// fusedAxes. Only the frames that change the answer carry it, and the
 	// script reads it from the nearest one above the frame it explains.
 	if axes != nil {
 		switch n.depth {
 		case 0:
-			ew.s(` data-axis=""`)
+			ew.f(` data-axis="%s"`, html.EscapeString(axes.all))
 		case 1:
-			ew.f(` data-axis="%s"`, html.EscapeString(axes[n.name]))
+			ew.f(` data-axis="%s"`, html.EscapeString(axes.roots[n.name]))
 		}
 	}
 	ew.s(">")
@@ -542,24 +542,35 @@ func writeNode(ew *errWriter, n *node, unit string, total int64, mods moduleTabl
 	}
 }
 
-// rootAxes maps each root label of a fused profile to the axis of the input
-// under it, or returns nil for a profile that was not fused.
+// fusedAxes is what each level of a fused profile measures. The script
+// reads it to decide what to say about a frame's width; see widthMeaning.
 //
 // It exists because a fused chart's own axis ("cpu+gpu/nanoseconds") is true
-// of the graph and of no frame in it: read as a whole, it would tell a reader
-// that CPU-sampled frames measure GPU time. A label that Fuse could not give
-// one type to maps to "", and so does the synthetic root, which spans every
-// input: both claim nothing.
-func rootAxes(res *foldedstacks.Result) map[string]string {
+// of the graph and of no frame below the synthetic root: read as a whole, it
+// would tell a reader that CPU-sampled frames measure GPU time.
+type fusedAxes struct {
+	// all is the synthetic root's axis, the fused one, because its width
+	// really is the sum of every input.
+	all string
+	// roots maps each root label to the axis of the input under it, or to
+	// "" for a label Fuse could not give one type to, which claims nothing.
+	roots map[string]string
+}
+
+// fusedAxesOf returns nil for a profile that was not fused.
+func fusedAxesOf(res *foldedstacks.Result) *fusedAxes {
 	if res.RootSampleTypes == nil {
 		return nil
 	}
-	axes := make(map[string]string, len(res.RootSampleTypes))
+	axes := &fusedAxes{
+		all:   res.SampleTypeName + "/" + res.Unit,
+		roots: make(map[string]string, len(res.RootSampleTypes)),
+	}
 	for label, typ := range res.RootSampleTypes {
 		if typ != "" {
-			axes[label] = typ + "/" + res.Unit
+			axes.roots[label] = typ + "/" + res.Unit
 		} else {
-			axes[label] = ""
+			axes.roots[label] = ""
 		}
 	}
 	return axes

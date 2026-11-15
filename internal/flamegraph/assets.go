@@ -473,7 +473,9 @@ func rowCSS(maxDepth int) string {
 // (issue #123). It decides from the axis of the frame's own subtree (axisOf):
 // on a fused page that is the data-axis of the root above it, elsewhere the
 // chart's axis label. So a CPU profile says nothing, and neither does the CPU
-// half of a fused one, whose chart axis also names gpu.
+// half of a fused one, whose chart axis also names gpu. The fused root itself
+// is the one frame whose axis is a sum, and a CPU+GPU sum adds sampled CPU
+// time to measured device time, so it says that rather than either.
 const script = `
 (function(){
 "use strict";
@@ -570,7 +572,9 @@ function axisOf(it){
   return axis;
 }
 function widthMeaning(it,d){
-  if(unit.indexOf("nanoseconds")<0||axisOf(it).indexOf("gpu/")<0){return "";}
+  var types=axisOf(it).replace(/^Flame graph, /,"").split("/")[0].split("+");
+  if(unit.indexOf("nanoseconds")<0||types.indexOf("gpu")<0){return "";}
+  if(types.length>1){return types.indexOf("cpu")<0?"":"width: CPU samples and GPU time added together \u2014 compare within one root";}
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
   case "boundary": return "width: device time launched from this path, sampled one launch in N";

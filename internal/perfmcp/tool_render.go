@@ -115,7 +115,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 	if _, err := s.pageName(a.Out); err != nil {
 		return mcpstdio.Result{}, err
 	}
-	c, err := s.checkCall("render_flamegraph", explainCall{
+	c, err := s.checkCall(renderChecks, explainCall{
 		Handle: a.Handle, View: a.View, Attempt: a.Attempt, Title: a.Title,
 		Explanations: a.Explanations, Rounding: a.Rounding, Tolerance: a.Tolerance,
 	})
@@ -178,14 +178,15 @@ type checked struct {
 	rejection *mcpstdio.Result
 }
 
-// verbOf is what tool does with a page that passes: render_flamegraph
-// writes it, page_explain publishes it.
-func verbOf(tool string) string {
-	if tool == "page_explain" {
-		return "published"
-	}
-	return "written"
-}
+// checkingTool is a tool that runs the explanation check, as its advice
+// names it: the tool to call again, and what it does with a page that
+// passes.
+type checkingTool struct{ name, verb string }
+
+var (
+	renderChecks  = checkingTool{name: "render_flamegraph", verb: "written"}
+	explainChecks = checkingTool{name: "page_explain", verb: "published"}
+)
 
 // checkCall runs the check render_flamegraph and page_explain share, and
 // records the attempt when it gets that far: it finds the handle's view,
@@ -194,8 +195,8 @@ func verbOf(tool string) string {
 // invalid) and checks them against the engine. A failed check is recorded
 // as rejected and answered with the rejection result, an isError result
 // listing every failure with the engine's value. Every piece of advice
-// names tool, the tool to call again.
-func (s *Server) checkCall(tool string, a explainCall) (checked, error) {
+// names tool, the tool to call again, and what it does with a page.
+func (s *Server) checkCall(tool checkingTool, a explainCall) (checked, error) {
 	e, v, err := s.store.view(a.Handle, a.View)
 	if err != nil {
 		return checked{}, err
@@ -205,7 +206,7 @@ func (s *Server) checkCall(tool string, a explainCall) (checked, error) {
 		if len(a.Title) > s.lim.Explain.MaxTitleBytes {
 			limit = " (--limit Explain.MaxTitleBytes=N)"
 		}
-		return checked{}, fmt.Errorf("%v%s; nothing was recorded, so call %s again with the same attempt, if any", err, limit, tool)
+		return checked{}, fmt.Errorf("%v%s; nothing was recorded, so call %s again with the same attempt, if any", err, limit, tool.name)
 	}
 	notes, err := viewNotes(v)
 	if err != nil {
@@ -228,7 +229,7 @@ func (s *Server) checkCall(tool string, a explainCall) (checked, error) {
 	if err != nil {
 		id := s.attempts.add(e.prof, a.View, a.Attempt, outcomeInvalid, nil)
 		s.recorded()
-		return checked{}, fmt.Errorf("attempt %s: %v; fix explanations and call %s again with attempt %q", id, err, tool, id)
+		return checked{}, fmt.Errorf("attempt %s: %v; fix explanations and call %s again with attempt %q", id, err, tool.name, id)
 	}
 	notices = append(notices, decoded...)
 
@@ -251,9 +252,9 @@ func (s *Server) checkCall(tool string, a explainCall) (checked, error) {
 				"and none whose text exceeds %d bytes, so a later page lists those and says %s",
 			len(r.Failures), id, maxStoredFailures, maxFailureBytes, strings.Join(says, " and "))})
 	}
-	res, err := s.respond(tool, shrinkRejected, renderRejected{
+	res, err := s.respond(tool.name, shrinkRejected, renderRejected{
 		Attempt: id, Status: outcomeRejected, Failures: r.Failures, Notices: notices, Notes: notes,
-		Next: fmt.Sprintf("nothing was %s; %s (the engine's value is in engine), and call %s again with attempt %q", verbOf(tool), recheckAdvice, tool, id),
+		Next: fmt.Sprintf("nothing was %s; %s (the engine's value is in engine), and call %s again with attempt %q", tool.verb, recheckAdvice, tool.name, id),
 	})
 	if err != nil {
 		return checked{}, fmt.Errorf("attempt %s was rejected with %d failures: %v", id, len(r.Failures), err)

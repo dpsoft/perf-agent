@@ -1,12 +1,14 @@
 package perfmcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/livehttp"
@@ -70,7 +72,13 @@ func (s *Server) liveMux() http.Handler {
 		if p == nil {
 			return
 		}
-		out, err := flamegraph.ExplainedLiveFrame(p.v, p.result, node, p.opts.Digest)
+		var out []byte
+		var err error
+		if p.kind == pubDiff {
+			out, err = flamegraph.DiffLiveFrame(p.diff, p.index, profilemodel.UnionID(node))
+		} else {
+			out, err = flamegraph.ExplainedLiveFrame(p.v, p.result, profilemodel.NodeID(node), p.opts.Digest)
+		}
 		writeComputed(w, out, err)
 	})
 	mux.HandleFunc("GET /pub/{id}/focus/{node}", l.heavy(func(w http.ResponseWriter, r *http.Request) {
@@ -79,9 +87,17 @@ func (s *Server) liveMux() http.Handler {
 		if p == nil {
 			return
 		}
-		opts := p.opts
-		opts.Focus = node
-		out, err := flamegraph.ExplainedLiveModel(p.v, p.result, opts)
+		var out []byte
+		var err error
+		if p.kind == pubDiff {
+			opts := p.diffOpts
+			opts.Focus = profilemodel.UnionID(node)
+			out, err = flamegraph.DiffLiveModel(p.diff, opts)
+		} else {
+			opts := p.opts
+			opts.Focus = profilemodel.NodeID(node)
+			out, err = flamegraph.ExplainedLiveModel(p.v, p.result, opts)
+		}
 		writeComputed(w, out, err)
 	}))
 	mux.HandleFunc("GET /pub/{id}/export", l.heavy(func(w http.ResponseWriter, r *http.Request) {
@@ -90,11 +106,13 @@ func (s *Server) liveMux() http.Handler {
 		if p == nil {
 			return
 		}
-		if p.kind != pubExplained {
-			notFound(w)
-			return
+		var page []byte
+		var err error
+		if p.kind == pubDiff {
+			page, err = exportDiff(p)
+		} else {
+			page, err = exportExplained(p, snap.history[p.id])
 		}
-		page, err := exportExplained(p, snap.history[p.id])
 		if _, ok := errors.AsType[*exportSizeError](err); ok {
 			unprocessable(w, err)
 			return
@@ -115,14 +133,43 @@ func (s *Server) liveMux() http.Handler {
 // cleanPathsOnly answers 404 for a path that is not clean or that holds
 // an escaped character the route would decode, such as %2F. The mux would
 // redirect such a path to its cleaned form, from the root rather than
-// below the token, and no route needs one.
+// below the token. The one escape served is a union ID's slash on a
+// frame or focus route, which the page sends as %2F (see unionRoute).
 func cleanPathsOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.RawPath != "" || path.Clean(r.URL.Path) != r.URL.Path {
+		if r.URL.RawPath != "" && !unionRoute(r.URL.Path, r.URL.RawPath) || path.Clean(r.URL.Path) != r.URL.Path {
 			http.NotFound(w, r)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// unionRoute reports whether a path whose escaped form is raw is a frame
+// or focus route of a union node, "pub/<id>/frame/<base>%2F<new>" or
+// ".../focus/...", with each side a node ID or "-" and nothing else
+// escaped: raw is exactly the decoded path with that one slash written
+// %2F, as encodeURIComponent writes it.
+func unionRoute(decoded, raw string) bool {
+	parts := strings.Split(decoded, "/")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "pub" || parts[3] != "frame" && parts[3] != "focus" ||
+		!isSideID(parts[4]) || !isSideID(parts[5]) {
+		return false
+	}
+	return raw == strings.Join(parts[:5], "/")+"%2F"+parts[5]
+}
+
+// isSideID reports whether s is one side of a union ID: "-" for a side
+// the node is absent from, or a node ID, 16 lowercase hex digits.
+func isSideID(s string) bool {
+	if s == "-" {
+		return true
+	}
+	if len(s) != 16 {
+		return false
+	}
+	return !strings.ContainsFunc(s, func(c rune) bool {
+		return (c < '0' || c > '9') && (c < 'a' || c > 'f')
 	})
 }
 
@@ -141,10 +188,11 @@ func lookupPub(w http.ResponseWriter, r *http.Request, snap *liveSnapshot) *publ
 	return p
 }
 
-// lookupNode is the snapshot's explained publication and the node the
-// route names, or a nil publication after answering 404. Whether the node
-// is in the view is the engine's to say.
-func lookupNode(w http.ResponseWriter, r *http.Request, snap *liveSnapshot) (*publication, profilemodel.NodeID) {
+// lookupNode is the snapshot's publication and the node the route names,
+// or a nil publication after answering 404: a node ID of an explained
+// publication's view, or a union ID of a diff's, looked up in its index.
+// Whether an explained node is in the view is the engine's to say.
+func lookupNode(w http.ResponseWriter, r *http.Request, snap *liveSnapshot) (*publication, string) {
 	node := r.PathValue("node")
 	if len(node) > maxPathValue {
 		notFound(w)
@@ -154,11 +202,11 @@ func lookupNode(w http.ResponseWriter, r *http.Request, snap *liveSnapshot) (*pu
 	if p == nil {
 		return nil, ""
 	}
-	if p.kind != pubExplained {
+	if p.kind == pubDiff && !p.hasNode(node) {
 		notFound(w)
 		return nil, ""
 	}
-	return p, profilemodel.NodeID(node)
+	return p, node
 }
 
 // writeComputed answers with a model or frame the engine built, 404 for a
@@ -224,6 +272,24 @@ func exportExplained(p *publication, h *liveHistory) ([]byte, error) {
 		return nil, &exportSizeError{fmt.Sprintf("the page is %d bytes, over MaxPageBytes=%d", len(page), p.opts.MaxBytes)}
 	}
 	return page, nil
+}
+
+// exportDiff is diff publication p as WriteDiffPage writes it, without
+// the agent's title, whose numbers that page would show unmarked. It is
+// bounded before any of it is built, against the limits the model's
+// export state was judged by, and rendered whole before anything is sent.
+// One over the limits is an *exportSizeError.
+func exportDiff(p *publication) ([]byte, error) {
+	var page bytes.Buffer
+	err := flamegraph.WriteDiffPageBounded(&page, p.diff, p.export, p.diffOpts.MaxBytes, p.diffOpts.MaxNodes)
+	switch {
+	case errors.Is(err, flamegraph.ErrPageTooLarge):
+		return nil, &exportSizeError{fmt.Sprintf("the diff cannot be exported within this server's MaxPageBytes=%d and MaxPageNodes=%d: %v",
+			p.diffOpts.MaxBytes, p.diffOpts.MaxNodes, err)}
+	case err != nil:
+		return nil, fmt.Errorf("the diff cannot be exported: %v", err)
+	}
+	return page.Bytes(), nil
 }
 
 // emptyHistory is the history of a publication without one, a diff.

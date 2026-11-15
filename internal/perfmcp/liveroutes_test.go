@@ -253,20 +253,110 @@ func TestStateAndModelServeThePublication(t *testing.T) {
 	}
 }
 
+// liveDiffed is a live server with p1 explained and the CPUBasic pair
+// compared in p2, from methods only.
+func liveDiffed(t *testing.T, edit func(*Config)) (*Server, *publication, string) {
+	t.Helper()
+	s := newLiveServer(t, edit, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic(), "new.pb.gz": pmfixture.CPUBasicNew()})
+	base := liveURL(t, s)
+	o := openLive(t, s, "cpu.pb.gz")
+	o.publish(t, s, o.explained(t, s, "b", "0.411"), "")
+	n := openLive(t, s, "new.pb.gz")
+	d, bs, ns, err := s.compare(diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := must(s.publishDiff(d, bs, ns, "", ""))(t)
+	return s, p, base
+}
+
 func TestADiffPublicationHasAnEmptyHistory(t *testing.T) {
-	s, _, _, base := livePublished(t, nil)
-	// No tool publishes a diff yet; a publication of that kind with no
-	// history is what one will be.
-	l := s.live
-	d := &publication{id: "p2", n: 2, kind: pubDiff, titleSegs: json.RawMessage(`[]`), model: []byte(`{}`)}
-	l.pubs = append(l.pubs, d)
-	l.current = "p2"
-	s.commit()
+	s, p, base := liveDiffed(t, nil)
+	if p.id != "p2" || s.live.snapshot().history["p2"] != nil {
+		t.Fatalf("diff %s has a history", p.id)
+	}
 	res, body := httpGet(t, base+"pub/p2/history", nil)
 	wantStatus(t, "diff history", res, body, http.StatusOK)
 	if got, want := string(body), `{"publication":"p2","version":"0","rows":[]}`; got != want {
 		t.Errorf("diff history %s, want %s", got, want)
 	}
+	if st := liveStateOf(t, s); st.Publications[1].Kind != "diff" || st.Publications[1].History != "0" || st.Publications[1].Digest != "" {
+		t.Errorf("the diff's state entry %+v", st.Publications[1])
+	}
+}
+
+// A diff publication pins what its routes read: the Diff, its index and
+// both sides' Profiles and Views, shared with their other holders and
+// counted once.
+func TestADiffPinsBothSides(t *testing.T) {
+	s, p, _ := liveDiffed(t, nil)
+	if p.prof == p.newProf || p.v == p.newV {
+		t.Fatal("the sides are one profile")
+	}
+	// The diff alone holds its Diff and index; the store holds both sides
+	// too, and p1, an explanation of the base view, the base side.
+	cases := []struct {
+		o             retained
+		held, evicted int
+	}{
+		{p.diff, 1, 1}, {p.index, 1, 1}, {p.prof, 3, 2}, {p.v, 3, 2}, {p.newProf, 2, 1}, {p.newV, 2, 1},
+	}
+	for _, c := range cases {
+		if got := s.pins.holders(c.o); got != c.held {
+			t.Errorf("%T has %d holders, want %d", c.o, got, c.held)
+		}
+		if !slices.Contains(p.pinned(nil), c.o) {
+			t.Errorf("%T is not pinned", c.o)
+		}
+	}
+	for _, h := range slices.Clone(s.store.order) {
+		s.pins.release(s.store.entries[h])
+		delete(s.store.entries, h)
+	}
+	s.store.order = nil
+	for _, c := range cases {
+		if got := s.pins.holders(c.o); got != c.evicted {
+			t.Errorf("%T has %d holders after the store let go, want %d", c.o, got, c.evicted)
+		}
+	}
+}
+
+// Many tabs read a diff's routes while the request goroutine publishes and
+// steers: every handler reads only its snapshot.
+func TestDiffRoutesRaceNothing(t *testing.T) {
+	s, p, base := liveDiffed(t, nil)
+	b := p.index.Path(p.diff.Root.Children[0].UnionID())
+	if len(b) == 0 {
+		t.Fatal("no main in the union")
+	}
+	id := url.PathEscape(string(b[len(b)-1].UnionID()))
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, route := range []string{"pub/p2/model", "pub/p2/frame/" + id, "pub/p2/focus/" + id, "pub/p2/export", "pub/p2/history"} {
+					res, body := httpGet(t, base+route, nil)
+					if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusServiceUnavailable && res.StatusCode != http.StatusNotFound {
+						t.Errorf("%s: %d %s", route, res.StatusCode, body)
+					}
+				}
+			}
+		})
+	}
+	for i := range 20 {
+		if err := s.live.show("p2", string(p.diff.Root.UnionID()), i%2 == 0); err != nil {
+			t.Error(err)
+		}
+		s.commit()
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // liveModelJSON is the part of a live model these tests read.

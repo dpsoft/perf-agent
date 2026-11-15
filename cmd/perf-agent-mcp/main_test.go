@@ -100,7 +100,7 @@ func TestRunServesOverStdio(t *testing.T) {
 		names = append(names, tl.Name)
 	}
 	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph",
-		"page_open", "page_explain", "page_show"}
+		"page_open", "page_explain", "page_show", "page_diff"}
 	slices.Sort(names)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
@@ -216,10 +216,12 @@ var clientSymbols = []string{
 // liveSymbols are functions of the live page's server and handlers. The
 // linker keeps only code a page tool can reach, so the client symbols'
 // absence says something about the handlers only while these are linked.
+// Each is called only through a func value or an interface, so the
+// compiler cannot inline it away: an inlined function could be missing
+// from the symbol table and still be reachable.
 var liveSymbols = []string{
 	"github.com/dpsoft/perf-agent/internal/perfmcp.(*Server).liveMux",
-	"github.com/dpsoft/perf-agent/internal/livehttp.NewServer",
-	"github.com/dpsoft/perf-agent/internal/livehttp.isShellNavigation",
+	"github.com/dpsoft/perf-agent/internal/perfmcp.(*Server).liveMux.func1",
 	"github.com/dpsoft/perf-agent/internal/livehttp.(*Hub).ServeHTTP",
 }
 

@@ -153,7 +153,7 @@ const minToolErrorBytes = 1024
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
 	return []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool(),
-		s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool()}
+		s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool()}
 }
 
 // readOnly are the annotations of every tool that only reads.

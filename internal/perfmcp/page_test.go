@@ -167,7 +167,7 @@ func pageGet(t *testing.T, url, route string) string {
 	return string(body)
 }
 
-var pageTools = []string{"page_open", "page_explain", "page_show"}
+var pageTools = []string{"page_open", "page_explain", "page_show", "page_diff"}
 
 func TestPageToolsAreDisabledWithoutLive(t *testing.T) {
 	cfg := testConfig(t)
@@ -203,6 +203,7 @@ func TestPageToolsAreDisabledWithoutLive(t *testing.T) {
 		"page_open":    map[string]any{},
 		"page_explain": o.args(map[string]any{"explanations": []any{}}),
 		"page_show":    map[string]any{"publication": "p1"},
+		"page_diff":    map[string]any{"base_handle": o.handle, "base_view": o.view, "new_handle": o.handle, "new_view": o.view},
 	} {
 		for _, a := range []any{args, map[string]any{"bogus": 1}} {
 			text, isErr := c.call(name, a)
@@ -442,8 +443,8 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 	if st := pageState(t, pub.URL); out.Focus != cn || st.Selected != cn || st.Focus != cn {
 		t.Errorf("focus on the selection: result %+v, state %+v", out, st)
 	}
-	c.callOK("page_show", map[string]any{"node": b, "focus": false}, &out)
-	if st := pageState(t, pub.URL); st.Selected != b || st.Focus != "" {
+	c.callOK("page_show", map[string]any{"focus": false}, &out)
+	if st := pageState(t, pub.URL); st.Selected != cn || st.Focus != "" {
 		t.Errorf("unfocused: state %+v", st)
 	}
 
@@ -452,9 +453,17 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 	if facts.Publication != "p2" {
 		t.Fatalf("facts-only %+v", facts)
 	}
+	// p1 was left with c selected; coming back to it selects its first
+	// explained node, b.
 	c.callOK("page_show", map[string]any{"publication": "p1"}, &out)
 	if st := pageState(t, pub.URL); st.Current != "p1" || st.Selected != b || st.Focus != "" || out.Selected != b {
 		t.Errorf("back to p1: result %+v, state %+v", out, st)
+	}
+	// Steering the current publication without node keeps its selection.
+	c.callOK("page_show", map[string]any{"node": cn}, &out)
+	c.callOK("page_show", map[string]any{"publication": "p1"}, &out)
+	if out.Selected != cn {
+		t.Errorf("p1 again while current: selected %q, want c kept", out.Selected)
 	}
 	c.callOK("page_show", map[string]any{"publication": "p2", "node": cn, "focus": true}, &out)
 	if st := pageState(t, pub.URL); st.Current != "p2" || st.Selected != cn || st.Focus != cn {
@@ -555,6 +564,10 @@ func TestPageToolsDecodeStrictly(t *testing.T) {
 		"page_show duplicate":      {"page_show", `{"node": "x", "node": "y"}`, "twice"},
 		"page_show unknown":        {"page_show", `{"view": "x"}`, `unknown argument "view"`},
 		"page_show focus type":     {"page_show", `{"focus": "yes"}`, "invalid arguments to page_show"},
+		"page_diff case-folded":    {"page_diff", fmt.Sprintf(`{"base_handle": %q, "base_view": %q, "new_handle": %q, "New_View": %q}`, h, v, h, v), `unknown argument "New_View"`},
+		"page_diff duplicate":      {"page_diff", fmt.Sprintf(`{"base_handle": %q, "base_view": %q, "new_handle": %q, "new_view": %q, "node": "a", "node": "b"}`, h, v, h, v), "twice"},
+		"page_diff limit":          {"page_diff", fmt.Sprintf(`{"base_handle": %q, "base_view": %q, "new_handle": %q, "new_view": %q, "limit": 2}`, h, v, h, v), `unknown argument "limit"`},
+		"page_diff cursor":         {"page_diff", fmt.Sprintf(`{"base_handle": %q, "base_view": %q, "new_handle": %q, "new_view": %q, "cursor": "c1.0.x"}`, h, v, h, v), `unknown argument "cursor"`},
 	} {
 		text, isErr := c.call(call.tool, json.RawMessage(call.raw))
 		if !isErr || !strings.Contains(text, call.want) || !strings.Contains(text, call.tool) {
@@ -614,7 +627,7 @@ func TestPageCopyHasNoGluedPlaceholder(t *testing.T) {
 		cfg.Live = live
 		s := must(New(cfg))(t)
 		t.Cleanup(func() { _ = s.Close() })
-		for _, tl := range []mcpstdio.Tool{s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool()} {
+		for _, tl := range []mcpstdio.Tool{s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool()} {
 			for _, text := range []string{tl.Title, tl.Description, string(tl.InputSchema)} {
 				if g := gluedPlaceholder(text); g != "" {
 					t.Errorf("%s shows %q", tl.Name, g)
@@ -632,5 +645,27 @@ func TestPageCopyHasNoGluedPlaceholder(t *testing.T) {
 	}
 	if g := gluedPlaceholder("b is {c1}s"); g == "" {
 		t.Error("the check misses a glued placeholder")
+	}
+}
+
+// Explanations that pass but whose page cannot be built within MaxPageBytes
+// publish nothing: the attempt is recorded as failed, the advice names the
+// limit, and the page does not change.
+func TestPageExplainThatCannotBePublishedSaysWhy(t *testing.T) {
+	c := pageClient(t, func(c *Config) { c.Limits.MaxPageBytes = 2048 }, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	o, _ := openOn(t, c, "cpu.pb.gz", "")
+	url := pageOpen(t, c).URL
+	before := pageState(t, url)
+	text, isErr := c.call("page_explain", o.args(map[string]any{"explanations": shareClaim(o.nodeID(t, "b"), "0.411", "b takes {c1}")}))
+	want := "attempt a1: the explanations passed, but the page cannot be built within this server's MaxPageBytes=2048: "
+	if !isErr || !strings.HasPrefix(text, want) ||
+		!strings.HasSuffix(text, "; explain fewer or shorter paths, or restart perf-agent-mcp with a larger --limit MaxPageBytes=N; nothing was published") {
+		t.Errorf("isError=%v %s", isErr, text)
+	}
+	if at := c.srv.attempts.byID["a1"]; at == nil || at.outcome != outcomeFailed {
+		t.Errorf("attempt a1 %+v, want outcome failed", at)
+	}
+	if after := pageState(t, url); after.Seq != before.Seq || len(after.Publications) != 0 {
+		t.Errorf("the page changed: %+v, then %+v", before, after)
 	}
 }

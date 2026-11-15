@@ -36,7 +36,7 @@ const pageOpenSchema = `{
 
 const pageOpenDescription = "Start the live page, unless it is started, and return its URL, the publications it keeps, the current one, " +
 	"and viewers, the number of browser tabs that have it open. Give the URL to the user: the server never opens a browser. " +
-	"The page is read-only and shows what page_explain publishes and page_show selects; the URL holds its access token, so give it to the user only."
+	"The page is read-only and shows what page_explain and page_diff publish and page_show selects; the URL holds its access token, so give it to the user only."
 
 func (s *Server) pageOpenTool() mcpstdio.Tool {
 	return s.pageTool(mcpstdio.Tool{
@@ -82,17 +82,18 @@ func (s *Server) pageExplainTool() mcpstdio.Tool {
 const pageShowSchema = `{
   "type": "object",
   "properties": {
-    "publication": {"type": "string", "description": "A publication ID that page_open or page_explain returned (p1, p2, …); default: the current publication."},
-    "node": {"type": "string", "description": "A node ID of the publication's view, from top or path on that view; it need not be drawn on the page."},
+    "publication": {"type": "string", "description": "A publication ID that page_open, page_explain or page_diff returned (p1, p2, …); default: the current publication."},
+    "node": {"type": "string", "description": "A node ID of the publication's view, from top or path on that view, or for a diff publication a union ID from diff; it need not be drawn on the page."},
     "focus": {"type": "boolean", "description": "true lays the flame graph out from the node (node, or the one selected); false or omitted draws the whole view."}
   },
   "minProperties": 1,
   "additionalProperties": false
 }`
 
-const pageShowDescription = "Steer the live page: make a kept publication current, select a node of its view (drawn or not), or both, " +
-	"and with focus lay the flame graph out from the selected node. Without publication it steers the current publication; " +
-	"switching to another publication without node selects its first explained node. Returns what the page now shows and viewers, the number of tabs watching."
+const pageShowDescription = "Steer the live page: make a kept publication current, select a node of it (drawn or not), or both, " +
+	"and with focus true lay the flame graph out from the selected node; without focus it draws the whole view. " +
+	"Without publication it steers the current publication; switching to another publication without node selects its first explained node, " +
+	"or for a diff the node page_diff selected. A diff's nodes are union IDs from diff. Returns what the page now shows and viewers, the number of tabs watching."
 
 func (s *Server) pageShowTool() mcpstdio.Tool {
 	return s.pageTool(mcpstdio.Tool{
@@ -186,7 +187,7 @@ func (s *Server) handlePageExplain(_ context.Context, raw json.RawMessage) (mcps
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	c, err := s.checkCall("page_explain", explainCall{
+	c, err := s.checkCall(explainChecks, explainCall{
 		Handle: a.Handle, View: a.View, Attempt: a.Attempt, Title: a.Title,
 		Explanations: a.Explanations, Rounding: a.Rounding, Tolerance: a.Tolerance,
 	})
@@ -225,14 +226,18 @@ type pageShowArgs struct {
 	Focus       *bool   `json:"focus"`
 }
 
-// pageShown carries the shown publication's sampling notes when its view
-// is a GPU view, and no notes key otherwise.
+// pageShown carries the shown publication's sampling notes when its views
+// are GPU views: notes for an explained view, and base_notes and
+// new_notes, as diff gives them, for a diff. Otherwise it has no notes
+// key.
 type pageShown struct {
 	Publication string   `json:"publication"`
 	Selected    string   `json:"selected"`
 	Focus       string   `json:"focus"`
 	URL         string   `json:"url"`
 	Notes       []string `json:"notes,omitzero"`
+	BaseNotes   []string `json:"base_notes,omitzero"`
+	NewNotes    []string `json:"new_notes,omitzero"`
 	Viewers     string   `json:"viewers"`
 }
 
@@ -267,7 +272,11 @@ func (s *Server) handlePageShow(_ context.Context, raw json.RawMessage) (mcpstdi
 	switch {
 	case a.Node != nil:
 		node = *a.Node
-		if !p.hasNode(node) {
+		switch {
+		case p.hasNode(node):
+		case p.kind == pubDiff:
+			return mcpstdio.Result{}, fmt.Errorf("node %q is not a union ID of the diff in publication %s; find union IDs (a row's id) with diff on the same views", echo(node), p.id)
+		default:
 			return mcpstdio.Result{}, fmt.Errorf("node %q is not in view %s of publication %s; find node IDs with top or path", echo(node), echo(p.view), p.id)
 		}
 	case id == l.current:
@@ -279,9 +288,12 @@ func (s *Server) handlePageShow(_ context.Context, raw json.RawMessage) (mcpstdi
 	if focus && node == "" {
 		return mcpstdio.Result{}, fmt.Errorf("publication %s has no node selected to focus on; pass node with focus", p.id)
 	}
-	var notes []string
-	if p.v != nil {
-		if notes, err = viewNotes(p.v); err != nil {
+	out := pageShown{URL: url}
+	switch {
+	case p.kind == pubDiff && p.v.IsGPU():
+		out.BaseNotes, out.NewNotes = nonNil(p.diff.BaseNotes), nonNil(p.diff.NewNotes)
+	case p.kind == pubExplained && p.v != nil:
+		if out.Notes, err = viewNotes(p.v); err != nil {
 			return mcpstdio.Result{}, err
 		}
 	}
@@ -289,9 +301,8 @@ func (s *Server) handlePageShow(_ context.Context, raw json.RawMessage) (mcpstdi
 		return mcpstdio.Result{}, err
 	}
 	s.commit()
-	return s.respond("page_show", shrinkPage, pageShown{
-		Publication: l.current, Selected: l.selected, Focus: l.focus, URL: url, Notes: notes, Viewers: s.viewers(),
-	})
+	out.Publication, out.Selected, out.Focus, out.Viewers = l.current, l.selected, l.focus, s.viewers()
+	return s.respond("page_show", shrinkPage, out)
 }
 
 // keptIDs lists the kept publications in the order they were made, or
@@ -309,19 +320,38 @@ func (l *live) keptIDs() string {
 	return strings.Join(ids, ", ")
 }
 
-// hasNode reports whether node is a node of p's view, drawn or not.
+// hasNode reports whether node is a node of p, drawn or not: of an
+// explained publication's view, or of a diff's whole union, looked up in
+// its index and never in its model.
 func (p *publication) hasNode(node string) bool {
-	if p.kind != pubExplained || p.v == nil || len(node) > maxPathValue {
+	if len(node) > maxPathValue {
 		return false
 	}
-	_, ok := p.v.Node(profilemodel.NodeID(node))
-	return ok
+	switch p.kind {
+	case pubExplained:
+		if p.v == nil {
+			return false
+		}
+		_, ok := p.v.Node(profilemodel.NodeID(node))
+		return ok
+	case pubDiff:
+		if p.index == nil {
+			return false
+		}
+		_, ok := p.index.Node(profilemodel.UnionID(node))
+		return ok
+	}
+	return false
 }
 
-// firstSelected is the node p selects when it becomes current: its first
-// explained node, none for a facts-only page.
+// firstSelected is the node p selects when it becomes current: an
+// explained page's first explained node, none for a facts-only page, and
+// for a diff the node page_diff selected, if any.
 func (p *publication) firstSelected() string {
-	if p.kind != pubExplained || len(p.result.Checked) == 0 {
+	switch {
+	case p.kind == pubDiff:
+		return p.node
+	case p.kind != pubExplained || len(p.result.Checked) == 0:
 		return ""
 	}
 	return string(p.result.Checked[0].Node)

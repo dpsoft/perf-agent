@@ -50,7 +50,9 @@ const (
 // publication is one page the live page can show. It is complete before
 // the snapshot holds it, and never changes after: HTTP handlers read it
 // from any goroutine. It pins the engine objects its routes compute from,
-// its Profile and View, so it stays valid after the store lets them go.
+// so it stays valid after the store lets them go: an explained one its
+// Profile and View, a diff its Diff, the Diff's index and both sides'
+// Profiles and Views, which the Diff's nodes point into.
 type publication struct {
 	id   string // "p<n>"
 	n    int
@@ -74,6 +76,20 @@ type publication struct {
 
 	opts  flamegraph.LiveOptions
 	model []byte
+
+	// A diff's: prof and v above are its base side, newProf and newV its
+	// new side. index finds any node of the union; node is the node
+	// page_diff selected, "" for none. diffOpts are its model's options,
+	// with the measure taken once when it was published, and export the
+	// page options of its static copy, which that measure was taken with.
+	diff    *profilemodel.Diff
+	index   *profilemodel.DiffIndex
+	newProf *profilemodel.Profile
+	newV    *profilemodel.View
+	node    string
+
+	diffOpts flamegraph.DiffLiveOptions
+	export   flamegraph.DiffPageOptions
 }
 
 // publicationOverhead is what a publication costs besides its model and
@@ -136,6 +152,10 @@ func (p *publication) pinned(h *liveHistory) []retained {
 	}
 	if p.v != nil {
 		out = append(out, p.v)
+	}
+	if p.diff != nil {
+		// A diff has all four.
+		out = append(out, p.diff, p.index, p.newProf, p.newV)
 	}
 	if h != nil {
 		out = append(out, h)
@@ -437,8 +457,55 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	return p, nil
 }
 
-// modelError is publishExplained's error for a model that cannot be built
-// within the page limits, as opposed to one the retained budget refuses.
+// publishDiff publishes d, the comparison of base's view with next's,
+// titled title, with node selected ("" for none). It indexes the whole
+// union once and measures it once, for every model and export the page
+// asks for later. A node that is not in the union publishes nothing, and
+// neither does a model that cannot be built within the page limits (a
+// *modelError). An admitted publication becomes current, unfocused, and
+// the page is told.
+func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node string) (*publication, error) {
+	ix := profilemodel.NewDiffIndex(d)
+	if node != "" {
+		if _, ok := ix.Node(profilemodel.UnionID(node)); !ok {
+			return nil, &nodeError{node}
+		}
+	}
+	export := flamegraph.DiffPageOptions{BaseName: base.e.name, NewName: next.e.name}
+	opts := flamegraph.DiffLiveOptions{
+		Title: title, BaseName: base.e.name, NewName: next.e.name,
+		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
+		Measure: flamegraph.MeasureDiff(d, export),
+	}
+	model, err := flamegraph.DiffLiveModel(d, opts)
+	if err != nil {
+		return nil, &modelError{err}
+	}
+	p := &publication{
+		kind: pubDiff, title: title, titleSegs: flamegraph.LiveTitleSegments(title, "Diff of "+base.e.name+" and "+next.e.name),
+		view: d.View, prof: base.e.prof, v: base.v, model: model,
+		diff: d, index: ix, newProf: next.e.prof, newV: next.v, node: node, diffOpts: opts, export: export,
+	}
+	if err := s.admit(p); err != nil {
+		return nil, err
+	}
+	l := s.live
+	l.selected, l.focus = p.firstSelected(), ""
+	s.commit()
+	return p, nil
+}
+
+// nodeError is publishDiff's error for a node that is not in the diff's
+// union.
+type nodeError struct{ node string }
+
+func (e *nodeError) Error() string {
+	return fmt.Sprintf("node %q is not a union ID of this diff; take a union ID (a row's id) from diff with the same arguments; nothing was published", echo(e.node))
+}
+
+// modelError is publishExplained's and publishDiff's error for a model
+// that cannot be built within the page limits, as opposed to one the
+// retained budget refuses.
 type modelError struct{ err error }
 
 func (e *modelError) Error() string { return e.err.Error() }
@@ -679,7 +746,7 @@ func stateOf(snap *liveSnapshot) []byte {
 	for _, id := range snap.order {
 		p := snap.pubs[id]
 		e := liveStateEntry{ID: p.id, Kind: p.kind, Title: p.title, TitleSegs: p.titleSegs, View: p.view, History: "0"}
-		if p.prof != nil {
+		if p.kind == pubExplained && p.prof != nil {
 			e.Digest = p.digest.String()
 		}
 		if h := snap.history[id]; h != nil {

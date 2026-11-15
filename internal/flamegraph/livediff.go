@@ -398,7 +398,7 @@ func (b *diffLiveBuilder) layout(m *diffLiveModel, root *profilemodel.DiffNode, 
 // unit in every value.
 func (b *diffLiveBuilder) frameEstimate(n *profilemodel.DiffNode) int64 {
 	ids := int64(len(n.BaseID) + len(n.NewID) + 2)
-	return diffFrameOverhead + 2*jsonEscapedBound(shownName(n.Name)) + 2*jsonEscapedBound(n.Why) + 4*ids + 10*jsonEscapedBound(b.d.Unit)
+	return diffFrameOverhead + filledFactsBound + 2*jsonEscapedBound(shownName(n.Name)) + 2*jsonEscapedBound(n.Why) + 4*ids + 10*jsonEscapedBound(b.d.Unit)
 }
 
 // frame adds n, whose union parent is parent (nil for the root), to the
@@ -410,6 +410,33 @@ func (b *diffLiveBuilder) frame(n, parent *profilemodel.DiffNode) *dfFrame {
 	return f
 }
 
+// The panel reads a frame's facts by row index, so a fact the engine
+// leaves empty is shown in words, never as a blank row.
+const (
+	matchRoot     = "not applicable: the root of both views"
+	matchOnlyBase = "not paired: only in base"
+	matchOnlyNew  = "not paired: only in new"
+	noneText      = "none"
+	// filledFactsBound bounds the bytes these words add to a frame.
+	filledFactsBound = int64(len(matchRoot) + len(noneText))
+)
+
+// matchText is n's match as the panel shows it: the synthetic root and a
+// one-sided node have none, and say why.
+func matchText(d *profilemodel.Diff, n *profilemodel.DiffNode) string {
+	switch {
+	case n.Match != "":
+		return string(n.Match)
+	case n == d.Root:
+		return matchRoot
+	case n.Presence == profilemodel.PresenceOnlyBase:
+		return matchOnlyBase
+	case n.Presence == profilemodel.PresenceOnlyNew:
+		return matchOnlyNew
+	}
+	return noneText
+}
+
 // diffFrame is n as the panel shows it, with no ref.
 func diffFrame(d *profilemodel.Diff, n, parent *profilemodel.DiffNode) *dfFrame {
 	unit := d.Unit
@@ -417,12 +444,13 @@ func diffFrame(d *profilemodel.Diff, n, parent *profilemodel.DiffNode) *dfFrame 
 		ID:             string(n.UnionID()),
 		Name:           shownName(cmp.Or(n.Name, "(all)")),
 		Presence:       string(n.Presence),
-		Match:          string(n.Match),
+		Match:          matchText(d, n),
 		Interpretation: string(n.Interpretation),
-		Why:            n.Why,
-		BaseCum:        withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, unit),
-		NewCum:         withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, unit),
-		DeltaAbs:       signed(n.DeltaAbs, unit),
+		// A comparable node whose every comparison was made has no cause.
+		Why:      cmp.Or(n.Why, noneText),
+		BaseCum:  withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, unit),
+		NewCum:   withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, unit),
+		DeltaAbs: signed(n.DeltaAbs, unit),
 	}
 	if parent != nil {
 		f.Parent = string(parent.UnionID())

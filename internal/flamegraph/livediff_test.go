@@ -2,6 +2,7 @@ package flamegraph
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -484,4 +485,78 @@ func TestDiffMeasureIsTheExportsBudget(t *testing.T) {
 	assert.Equal(t, true, live["export"].(map[string]any)["ok"], "the model's own long title is not in the static copy")
 	live, _ = diffLiveOf(t, d, DiffLiveOptions{Title: strings.Repeat("&", 200), MaxBytes: int(bound), MaxNodes: nodes})
 	assert.Equal(t, false, live["export"].(map[string]any)["ok"], "unmeasured, the model counts its own title")
+}
+
+// The panel reads a diff frame's facts by row index, so no row is left
+// blank: the synthetic root and a one-sided node say why they have no
+// match, and a comparable node with nothing to report says so.
+func TestDiffLiveFramesLeaveNoRowBlank(t *testing.T) {
+	d := compared(t, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
+	ix := profilemodel.NewDiffIndex(d)
+	live, _ := diffLiveOf(t, d, DiffLiveOptions{})
+	rows := list(t, live, "fact_rows")
+	require.Len(t, rows, 9, "the rows the panel reads by index")
+	assert.Equal(t, "match", str(rows[1], "f"))
+	assert.Equal(t, "why", str(rows[3], "f"))
+
+	frames := map[string]map[string]any{}
+	for _, f := range list(t, live, "frames") {
+		frames[str(f, "id")] = f
+	}
+	seen := map[string]bool{}
+	for _, n := range allDiffNodes(d) {
+		f := frames[string(n.UnionID())]
+		require.NotNil(t, f, "%s is in the model", n.Name)
+		for _, r := range rows {
+			assert.NotEmpty(t, str(f, str(r, "f")), "%s row %s", cmp.Or(n.Name, "(all)"), str(r, "k"))
+		}
+		var wantMatch, wantWhy string
+		switch {
+		case n == d.Root:
+			wantMatch, wantWhy, seen["root"] = "not applicable: the root of both views", "none", true
+		case n.Presence == profilemodel.PresenceOnlyNew:
+			wantMatch, seen["only new"] = "not paired: only in new", true
+		case n.Presence == profilemodel.PresenceOnlyBase:
+			wantMatch, seen["only base"] = "not paired: only in base", true
+		default:
+			wantMatch = string(n.Match)
+		}
+		if n != d.Root && n.Interpretation == profilemodel.Comparable && n.Why == "" {
+			wantWhy, seen["comparable"] = "none", true
+		}
+		assert.Equal(t, wantMatch, str(f, "match"), n.Name)
+		if wantWhy != "" {
+			assert.Equal(t, wantWhy, str(f, "why"), n.Name)
+		}
+		raw, err := DiffLiveFrame(d, ix, n.UnionID())
+		require.NoError(t, err)
+		var one struct {
+			Frame map[string]any `json:"frame"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &one))
+		assert.Equal(t, str(f, "match"), str(one.Frame, "match"), "the frame route agrees with the model")
+		assert.Equal(t, str(f, "why"), str(one.Frame, "why"))
+	}
+	assert.Equal(t, map[string]bool{"root": true, "only new": true, "comparable": true}, seen)
+
+	// A literal one-sided node of base.
+	base := withIDs(&profilemodel.Diff{Unit: "nanoseconds", View: "cpu", BaseTotal: 10, NewTotal: 0, Root: &profilemodel.DiffNode{
+		Presence: profilemodel.PresenceBoth, Interpretation: profilemodel.Comparable, BaseCum: 10, Combined: 10,
+		Children: []*profilemodel.DiffNode{{Name: "gone", Presence: profilemodel.PresenceOnlyBase, Interpretation: profilemodel.Comparable, BaseCum: 10, Combined: 10}},
+	}})
+	gone, _ := diffLiveOf(t, base, DiffLiveOptions{})
+	assert.Equal(t, "not paired: only in base", str(list(t, gone, "frames")[1], "match"))
+}
+
+// allDiffNodes is every node of d's union, in pre-order.
+func allDiffNodes(d *profilemodel.Diff) []*profilemodel.DiffNode {
+	var out []*profilemodel.DiffNode
+	stack := []*profilemodel.DiffNode{d.Root}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		out = append(out, n)
+		stack = append(stack, n.Children...)
+	}
+	return out
 }

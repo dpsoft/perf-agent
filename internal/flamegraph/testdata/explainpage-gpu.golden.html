@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cpu.pb.gz explained</title>
+<style>
+:root{ --bg:#f7f6f9;--panel:#ffffff;--ink:#1d1a17;--muted:#6b6259;--line:#e2dad0;--accent:#b4522a;--warn-bg:#fff6e8;--warn-line:#e8c88a;--ai:#5b4bdb;--ai-bg:#f5f3ff;--ai-line:#d6d1fa;--ok:#1f7a45;--ok-bg:#f1faf4;--ok-line:#bfe3cd;--bad:#b3352a;--bad-bg:#fdf3f2;--bad-line:#f0c8c3;--chip-bg:#ffffff}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){ --bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;--line:#332f3b;--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232;--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}}
+:root[data-theme="dark"]{ --bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;--line:#332f3b;--accent:#ff9a6a;--warn-bg:#2b2313;--warn-line:#6d5722;--fatal-bg:#2e1616;--fatal-line:#7a3232;--ai:#b3a8ff;--ai-bg:#24203d;--ai-line:#433b78;--ok:#7fd8a4;--ok-bg:#142a1d;--ok-line:#2c5a3d;--bad:#ff9a8c;--bad-bg:#2e1616;--bad-line:#7a3232;--chip-bg:#26242c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.muted{color:var(--muted)}
+button{font:inherit;color:inherit}
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:9px}
+.brand b{font-size:16px;font-weight:700;letter-spacing:-.015em}
+.brand i{font-style:italic;color:var(--muted);font-size:12.5px}
+h1{font-size:12.5px;font-weight:500;color:var(--muted);margin:0;flex:1;min-width:8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.readout{padding:3px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);font-size:12px;white-space:nowrap}
+.prov{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 9px;font-size:12px;border:1px solid var(--line);background:var(--bg);white-space:nowrap;font-weight:500}
+.pill.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-bg)}
+.pill.bad{color:var(--bad);border-color:var(--bad-line);background:var(--bad-bg)}
+.pill.ai{color:var(--ai);border-color:var(--ai-line);background:var(--ai-bg)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:5px 14px;padding:7px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11.5px;color:var(--muted)}
+.legend .c{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.legend .sw{width:11px;height:11px;border-radius:3px;border:1px solid rgb(0 0 0/.22);display:inline-block}
+.legend .key{margin-left:auto;color:var(--ai)}
+.notes{margin:12px 16px 0;padding:8px 12px;background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:8px;font-size:12.5px}
+.notes ul{margin:4px 0 0;padding-left:18px}
+.body{display:grid;grid-template-columns:minmax(0,1fr) 420px;align-items:start}
+@media (max-width:1000px){.body{grid-template-columns:minmax(0,1fr)}}
+.graph{padding:12px 16px;min-width:0}
+.canvas{max-height:72vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:2px}
+.chart{position:relative;min-width:100%}
+.frame{position:absolute;height:19px;padding:0;border:0;margin:0;overflow:hidden;cursor:pointer;border-radius:2px}
+.frame .fl{display:block;padding:0 5px;font:11px/19px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.frame .star{color:#4a39c9;font-weight:700;margin-right:3px}
+.frame.cite{outline:2px dashed var(--ai);outline-offset:-2px;z-index:1}
+.frame:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;z-index:2}
+.axis{display:flex;justify-content:space-between;gap:12px;margin-top:6px;font-size:12px;color:var(--muted)}
+.left-out{margin:4px 0 0;font-size:12px;color:var(--muted)}
+h4{margin:16px 0 6px;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
+.exrow{display:flex;width:100%;gap:8px;align-items:center;padding:6px 9px;margin:0 0 6px;border:1px solid var(--line);border-radius:7px;background:var(--panel);cursor:pointer;text-align:left}
+.exrow:hover,.exrow:focus-visible{border-color:var(--ai)}
+.exrow .star{color:var(--ai);font-weight:700}
+.exrow code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exrow .w{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ref{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ai)}
+.qgrid,.facts{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.facts{grid-template-columns:max-content minmax(0,1fr) minmax(9em,1fr)}
+.facts .v{white-space:normal;overflow-wrap:anywhere}
+.k{color:var(--muted);white-space:nowrap}
+.v{font-weight:600;white-space:nowrap}
+.p{color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.st{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted);justify-self:start}
+.st-ok{color:var(--ok);border-color:var(--ok-line)}
+.st-unavailable{color:var(--bad);border-color:var(--bad-line)}
+.qgrid{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.side{background:var(--panel);border-left:1px solid var(--line);min-width:0;position:sticky;top:0;max-height:100vh;overflow:auto}
+@media (max-width:1000px){.side{position:static;max-height:none;border-left:0;border-top:1px solid var(--line)}}
+.hd{padding:12px 16px;border-bottom:1px solid var(--line)}
+.hd .lbl{font-size:12px;color:var(--muted)}
+.hd .nm{font:600 13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.hd .nid{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted)}
+.sec{padding:11px 16px;border-bottom:1px solid var(--line)}
+.sec h5{margin:0 0 8px;font-size:12.5px;font-weight:600}
+.sec h5 .tag{font-weight:500}
+.interp h5{color:var(--ai)}
+.sec p{margin:0 0 6px}
+.claim{font-weight:600;border-bottom:1px solid var(--ok-line);cursor:help}
+mark.unchecked{background:var(--warn-bg);color:inherit;border-bottom:1px dashed var(--warn-line);padding:0 1px;cursor:help}
+button.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--ai-bg);color:var(--ai);border:1px solid var(--ai-line);border-radius:4px;padding:0 4px;cursor:pointer;vertical-align:1px}
+.hyp{margin:0;padding-left:18px}
+.hyp li{margin:0 0 4px}
+.hyp b{color:var(--ai)}
+.rej{margin:0;padding:0;list-style:none}
+.rej li{background:var(--bad-bg);border:1px solid var(--bad-line);border-radius:6px;padding:7px 10px;margin:0 0 6px;font-size:12.5px}
+.rej s{color:var(--bad)}
+.rej .why{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.path{list-style:none;margin:0;padding:0}
+.path button{display:flex;width:100%;gap:6px;align-items:baseline;padding:2px 4px;border:0;border-radius:4px;background:none;cursor:pointer;text-align:left}
+.path button:hover,.path button:focus-visible{background:var(--ai-bg)}
+.path .pn{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.path .c{color:var(--muted);font-size:11px;white-space:nowrap}
+.path li:last-child button{background:var(--ai-bg)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;background:var(--chip-bg);cursor:pointer}
+.chip:hover,.chip:focus-visible{border-color:var(--ai);color:var(--ai)}
+#copybox{display:block;width:100%;margin-top:8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+#copybox[hidden]{display:none}
+.foot{display:flex;flex-wrap:wrap;gap:6px 18px;padding:8px 16px;border-top:1px solid var(--line);background:var(--panel);font-size:12px;color:var(--muted)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:7px 14px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+.toast.on{opacity:1}
+</style>
+<style>
+:root{
+  --fill-dl:0%;
+  --fill-ds:1;
+  --fill-j:0;
+  --hatch-ink:rgb(22 20 18 / .26);
+
+  --hatch-gap: repeating-linear-gradient(45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+  --hatch-inf: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 1.4px,transparent 1.4px 5px);
+  --hatch-bare: repeating-linear-gradient(45deg,var(--hatch-ink) 0 3.2px,transparent 3.2px 5px);
+  --hatch-obf: radial-gradient(var(--hatch-ink) .9px,transparent 1px) 0 0/5px 5px;
+  --hatch-interp: repeating-linear-gradient(-45deg,var(--hatch-ink) 0 2.2px,transparent 2.2px 6px);
+
+  --fill-app:      hsl(335 calc(78% * var(--fill-ds)) calc(79% + var(--fill-dl)));
+  --fill-system:   hsl(  2 calc(68% * var(--fill-ds)) calc(78% + var(--fill-dl)));
+  --fill-vendor:   hsl( 50 calc(88% * var(--fill-ds)) calc(69% + var(--fill-dl)));
+  --fill-kernel:   hsl( 28 calc(92% * var(--fill-ds)) calc(70% + var(--fill-dl)));
+  --fill-boundary: hsl(  0                        0%  calc(84% + var(--fill-dl)));
+  --fill-boundary-unattributed: hsl(0             0%  calc(92% + var(--fill-dl)));
+  --fill-gpu-kernel: hsl(128 calc(48% * var(--fill-ds)) calc(67% + var(--fill-dl)));
+  --fill-accel-source: hsl(184 calc(52% * var(--fill-ds)) calc(65% + var(--fill-dl)));
+  --fill-unsym: hsl( 45 calc(20% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-shim:  hsl(215 calc(15% * var(--fill-ds)) calc(77% + var(--fill-dl)));
+  --fill-root: hsl(30 calc(8% * var(--fill-ds)) calc(81% + var(--fill-dl)));
+
+  --edge-frame:        rgb(255 255 255 / .55);
+  --edge-boundary:     hsl(  0  0% calc(40% + var(--fill-dl)));
+  --edge-unattributed: hsl(  0  0% calc(55% + var(--fill-dl)));
+  --edge-shim:         hsl(215 24% calc(46% + var(--fill-dl)));
+
+  --frame-ink: hsl(30 12% 9%);
+  --fill-match: hsl(300 100% 71%);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}}
+:root[data-theme="dark"]{--fill-dl:-9%;--fill-ds:.9;--hatch-ink:rgb(22 20 18 / .20)}
+
+.frame{color:var(--frame-ink);background-color:var(--fill-x);background-color:hsl(from var(--fill-x) h s calc(l + var(--fill-j)));box-shadow:inset 0 0 0 .5px var(--edge-frame)}
+[data-domain="root"]{--fill-x:var(--fill-root)}
+[data-domain="app"]{--fill-x:var(--fill-app)}
+[data-domain="system"]{--fill-x:var(--fill-system)}
+[data-domain="kernel"]{--fill-x:var(--fill-kernel)}
+[data-domain="vendor"]{--fill-x:var(--fill-vendor)}
+[data-domain="unsym"]{--fill-x:var(--fill-unsym)}
+[data-resolution="module-offset"]{background-image:var(--hatch-gap)}
+[data-resolution="bare-address"]{background-image:var(--hatch-bare)}
+[data-resolution="obfuscated"]{background-image:var(--hatch-obf)}
+[data-resolution="interpreter"]{background-image:var(--hatch-interp)}
+[data-domain="gpu-kernel"]{--fill-x:var(--fill-gpu-kernel)}
+[data-domain="shim"]{--fill-x:var(--fill-shim);box-shadow:inset 0 0 0 1px var(--edge-shim)}
+[data-domain="boundary"]{--fill-x:var(--fill-boundary);box-shadow:inset 0 0 0 1px var(--edge-boundary)}
+[data-domain="boundary-unattributed"]{--fill-x:var(--fill-boundary-unattributed);background-image:var(--hatch-gap);box-shadow:none;outline:1px dashed var(--edge-unattributed);outline-offset:-1px}
+.frame.inexact{background-image:var(--hatch-inf)}
+.frame.inexact[data-domain="boundary-unattributed"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="module-offset"]{background-image:var(--hatch-gap),var(--hatch-inf)}
+.frame.inexact[data-resolution="bare-address"]{background-image:var(--hatch-bare),var(--hatch-inf)}
+.frame.inexact[data-resolution="obfuscated"]{background-image:var(--hatch-obf),var(--hatch-inf)}
+.frame.inexact[data-resolution="interpreter"]{background-image:var(--hatch-interp),var(--hatch-inf)}
+
+.frame:hover{box-shadow:inset 0 0 0 1.4px var(--frame-ink);outline:none}
+.frame.match{background-color:var(--fill-match)}
+.frame.cur{box-shadow:inset 0 0 0 1.8px var(--frame-ink);outline:none}
+.sw[data-domain]{background-color:var(--fill-x)}
+.sw.res-module-offset{background-image:var(--hatch-gap)}
+.sw.res-bare-address{background-image:var(--hatch-bare)}
+.sw.res-obfuscated{background-image:var(--hatch-obf)}
+.sw.res-interpreter{background-image:var(--hatch-interp)}
+.j1{--fill-j:1.14}
+.j2{--fill-j:2.29}
+.j3{--fill-j:3.43}
+.j4{--fill-j:4.57}
+.j5{--fill-j:5.71}
+.j6{--fill-j:6.86}
+.j7{--fill-j:8.00}
+</style>
+</head>
+<body>
+<header class="top">
+<span class="brand"><b>perf-agent</b><i>Enjoy the Flames.</i></span>
+<h1>cpu.pb.gz explained</h1>
+<span class="readout">View <b>gpu/nanoseconds#0</b></span>
+<div class="prov">
+<span class="pill ai">✦ Explained by an agent via MCP</span>
+<span class="pill ok" title="Each structured claim was compared with the engine at its rounding, and each frame reference resolved">8 figures and references checked</span>
+<span class="pill">prose is not verified</span>
+</div>
+</header>
+<div class="legend" aria-label="Colour key"><span class="c"><i class="sw" data-domain="app"></i>application</span><span class="c"><i class="sw" data-domain="boundary"></i>CPU→GPU boundary</span><span class="c"><i class="sw" data-domain="boundary-unattributed"></i>GPU work with no CPU stack</span><span class="c"><i class="sw" data-domain="gpu-kernel"></i>GPU kernel execution</span><span class="c key">✦ path with an explanation</span></div>
+<section class="notes" aria-label="Sampling notes"><b>Sampling notes</b>
+<ul><li>20.0% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.</li><li>4 samples carry gpu_sample_period=8: one launch in 8 contributed a CPU stack. The call path beneath [gpu:launch] is therefore a sample of launches, not a sample of GPU time - do not read its width as the share of GPU work that call path is responsible for. Nothing here is scaled by 8; every value is a measured duration.</li></ul>
+</section>
+<main class="body">
+<div class="graph">
+<div class="canvas"><div class="chart" id="chart" style="height:100px">
+<div class="frame inexact" style="left:0%;width:100%;top:0px" data-i="0" data-domain="root" tabindex="0" role="button" title="500 ns, 100.0% of total"><span class="fl">all</span></div>
+<div class="frame inexact" style="left:0%;width:80%;top:20px" data-i="1" data-domain="app" tabindex="0" role="button" title="400 ns, 80.0% of total"><span class="fl">train</span></div>
+<div class="frame" style="left:80%;width:20%;top:20px" data-i="2" data-domain="boundary-unattributed" tabindex="0" role="button" title="100 ns, 20.0% of total"><span class="fl">[gpu:launch unsampled]</span></div>
+<div class="frame inexact cur" style="left:0%;width:80%;top:40px" data-i="3" data-domain="app" tabindex="0" role="button" title="400 ns, 80.0% of total"><span class="fl"><span class="star">✦</span>conv</span></div>
+<div class="frame" style="left:80%;width:20%;top:40px" data-i="4" data-domain="gpu-kernel" tabindex="0" role="button" title="100 ns, 20.0% of total"><span class="fl">[gpu:kernel:k1]</span></div>
+<div class="frame inexact" style="left:0%;width:80%;top:60px" data-i="5" data-domain="boundary" tabindex="0" role="button" title="400 ns, 80.0% of total"><span class="fl">[gpu:launch]</span></div>
+<div class="frame" style="left:0%;width:60%;top:80px" data-i="6" data-domain="gpu-kernel" tabindex="0" role="button" title="300 ns, 60.0% of total"><span class="fl">[gpu:kernel:k1]</span></div>
+<div class="frame j3 inexact" style="left:60%;width:20%;top:80px" data-i="7" data-domain="gpu-kernel" tabindex="0" role="button" title="100 ns, 20.0% of total"><span class="fl">[gpu:kernel:k2]</span></div>
+</div>
+</div>
+<div class="axis"><span>gpu/nanoseconds#0 · width = GPU time launched from the sampled stacks of this path, not CPU time</span><span title="500 nanoseconds, exact">total 500 ns</span></div>
+<p class="left-out">1 node narrower than 0.05% is not drawn.</p>
+<section aria-label="Paths the agent explained"><h4>Paths the agent explained</h4>
+<button type="button" class="exrow" data-node="6ebd829166d6c65d"><span class="star">✦</span><span class="ref">f3</span><code>conv</code><span class="w">80.0% · 400 ns</span></button>
+</section>
+<section aria-label="Quality summary"><h4>Quality summary</h4>
+<div class="qgrid"><span class="k">Unresolved frames</span><span class="v" title="0.000 ratio of view_total, rounded to 0.001 ratio, measured zero">0</span><span class="st st-zero">zero</span><span class="p">share of the view with an unresolved frame</span><span class="k">Executions log</span><span class="v" title="the executions log matched this profile">available</span><span class="st st-ok">ok</span><span class="p">executions are counted from it</span><span class="k">Exact joins</span><span class="v" title="0.800 ratio of view_total, rounded to 0.001 ratio">80.0%</span><span class="st st-ok">ok</span><span class="p">share joined to its launch exactly</span><span class="k">Unsampled launches</span><span class="v" title="0.200 ratio of view_total, rounded to 0.001 ratio">20.0%</span><span class="st st-ok">ok</span><span class="p">share with no sampled launch stack</span><span class="k">Serialized: true</span><span class="v" title="0.200 ratio of view_total, rounded to 0.001 ratio">20.0%</span><span class="st st-ok">ok</span><span class="p"></span><span class="k">Serialized: false</span><span class="v" title="0.800 ratio of view_total, rounded to 0.001 ratio">80.0%</span><span class="st st-ok">ok</span><span class="p"></span><span class="k">Serialized: unknown</span><span class="v" title="0.000 ratio of view_total, rounded to 0.001 ratio, measured zero">0</span><span class="st st-zero">zero</span><span class="p"></span><span class="k">Serialized: missing</span><span class="v" title="0.000 ratio of view_total, rounded to 0.001 ratio, measured zero">0</span><span class="st st-zero">zero</span><span class="p"></span></div>
+</section>
+</div>
+<aside class="side" aria-label="Selected frame">
+<div class="hd"><div class="lbl">Frame details · <span class="ref" id="sel-ref">f3</span></div><div class="nm" id="sel-name">conv</div><div class="nid" id="sel-id">6ebd829166d6c65d</div></div>
+<section class="sec"><h5>Profile facts — computed by perf-agent</h5>
+<div class="facts" id="facts"><span class="k">Cumulative</span><span class="v" title="400 nanoseconds, exact">400 ns</span><span class="p"></span><span class="k">Self</span><span class="v" title="0 nanoseconds, exact, measured zero">0</span><span class="p"></span><span class="k">Share of total</span><span class="v" title="0.800 ratio of view_total, rounded to 0.001 ratio">80.0%</span><span class="p">of the view total</span><span class="k">Share of parent</span><span class="v" title="1.000 ratio of parent:7c6fe73fdd780786, rounded to 0.001 ratio">100.0%</span><span class="p">of train</span><span class="k">Inexact portion</span><span class="v" title="100 nanoseconds, exact">100 ns</span><span class="p">from inexact samples</span><span class="k">Executions below</span><span class="v" title="4 count, exact">4</span><span class="p">distinct executions in the checked executions log</span><span class="k">Kernel names observed</span><span class="v" title="3 count, exact">3</span><span class="p">names at or below, not distinct kernels</span></div>
+</section>
+<div id="exp"><section class="sec interp"><h5>Agent interpretation — prose, not verified</h5><p>Of the GPU time launched from the sampled stacks, <span class="claim" title="share_of_total of conv (node 6ebd829166d6c65d): 0.800 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent">80.0%</span> falls under <button type="button" class="cite" data-node="6ebd829166d6c65d" title="6ebd829166d6c65d">f3</button> <code>conv</code>: <span class="claim" title="cumulative of conv (node 6ebd829166d6c65d): 400 nanoseconds, exact; checked by perf-agent">400 ns</span> over <span class="claim" title="executions_below of conv (node 6ebd829166d6c65d): 4 count, exact; checked by perf-agent">4</span> executions and <span class="claim" title="kernel_names_observed of conv (node 6ebd829166d6c65d): 3 count, exact; checked by perf-agent">3</span> kernel names. Most of it is <button type="button" class="cite" data-node="73bf87d997303185" title="73bf87d997303185">f6</button> <code>[gpu:kernel:k1]</code> at <span class="claim" title="share_of_total of [gpu:kernel:k1] (node 73bf87d997303185): 0.600 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent">60.0%</span>. <span class="claim" title="unsampled_portion of the whole view: 100 nanoseconds, exact; checked by perf-agent">100 ns</span> of GPU time has no sampled launch stack and is not attributed to any caller.</p></section>
+<section class="sec"><h5>Hypotheses — the agent's, not measured</h5><ul class="hyp"><li><b>Hypothesis:</b> k1 is the convolution itself; k2 looks like a layout transform that runs once per layer.</li></ul></section>
+<section class="sec"><h5>Next measurement — the agent's suggestion, not verified</h5><p>Count k2 executions per iteration and compare them with the number of layers.</p></section>
+</div>
+<p class="sec muted" id="noexp" hidden>The agent did not explain this frame: these are the profile's facts only.</p>
+<section class="sec"><h5>Path (root → frame)</h5>
+<ol class="path" id="path"><li><button type="button" data-node="7c6fe73fdd780786"><span class="ref">f1</span><span class="pn">train</span><span class="c">80.0%</span></button></li><li><button type="button" data-node="6ebd829166d6c65d"><span class="ref">f3</span><span class="pn">conv</span><span class="c">80.0%</span></button></li></ol>
+</section>
+<section class="sec"><h5>Follow up in your agent</h5>
+<p class="muted">Copies a question to paste into your MCP client, with the profile and the frame already named.</p>
+<div class="chips" id="chips"><button type="button" class="chip" data-prompt="Why is node 6ebd829166d6c65d (conv) wide? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0.">Why is it wide?</button><button type="button" class="chip" data-prompt="Is any of node 6ebd829166d6c65d profiler overhead? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0.">Is it profiler overhead?</button><button type="button" class="chip" data-prompt="Compare node 6ebd829166d6c65d with another profile using diff. Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0.">Compare with another profile</button><button type="button" class="chip" data-prompt="Explain the CPU→GPU causality under node 6ebd829166d6c65d. Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0.">CPU→GPU causality</button></div>
+<textarea id="copybox" rows="3" readonly hidden aria-label="Prompt to copy"></textarea>
+</section>
+</aside>
+</main>
+<footer class="foot"><span title="500 nanoseconds, exact">Total 500 ns</span><span>View gpu/nanoseconds#0</span><span>Profile cpu.pb.gz</span><span>Digest <code>sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000</code></span><span>Attempt a2</span></footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script type="application/json" id="model">{"view":"gpu/nanoseconds#0","selected":"6ebd829166d6c65d","fact_rows":[{"k":"Cumulative","u":"nanoseconds","r":"exact"},{"k":"Self","u":"nanoseconds","r":"exact"},{"k":"Share of total","n":"of the view total","u":"ratio","d":"view_total","r":"0.001 ratio"},{"k":"Share of parent","pn":true,"u":"ratio","d":"parent","r":"0.001 ratio"},{"k":"Inexact portion","n":"from inexact samples","u":"nanoseconds","r":"exact"}],"frames":[{"id":"e3b0c44298fc1c14","ref":"f0","name":"all","cum":"500","share":"100.0%","facts":[{"v":"500 ns","c":"500"},{"v":"0","c":"0","z":true},{"v":"100.0%","c":"1.000"},{"v":"unavailable: no parent"},{"v":"100 ns","c":"100"}]},{"id":"7c6fe73fdd780786","ref":"f1","name":"train","parent":"e3b0c44298fc1c14","cum":"400","share":"80.0%","facts":[{"v":"400 ns","c":"400"},{"v":"0","c":"0","z":true},{"v":"80.0%","c":"0.800"},{"v":"80.0%","c":"0.800"},{"v":"100 ns","c":"100"}]},{"id":"4fdff6507c3ac409","ref":"f2","name":"[gpu:launch unsampled]","parent":"e3b0c44298fc1c14","cum":"100","share":"20.0%","facts":[{"v":"100 ns","c":"100"},{"v":"0","c":"0","z":true},{"v":"20.0%","c":"0.200"},{"v":"20.0%","c":"0.200"},{"v":"0","c":"0","z":true}]},{"id":"6ebd829166d6c65d","ref":"f3","name":"conv","parent":"7c6fe73fdd780786","cum":"400","share":"80.0%","facts":[{"v":"400 ns","c":"400"},{"v":"0","c":"0","z":true},{"v":"80.0%","c":"0.800"},{"v":"100.0%","c":"1.000"},{"v":"100 ns","c":"100"}],"extra":[{"k":"Executions below","v":"4","t":"4 count, exact","n":"distinct executions in the checked executions log"},{"k":"Kernel names observed","v":"3","t":"3 count, exact","n":"names at or below, not distinct kernels"}],"explanation":[{"prose":[{"kind":"text","text":"Of the GPU time launched from the sampled stacks, "},{"kind":"claim","text":"80.0%","title":"share_of_total of conv (node 6ebd829166d6c65d): 0.800 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent"},{"kind":"text","text":" falls under "},{"kind":"node","text":"f3","title":"6ebd829166d6c65d","node":"6ebd829166d6c65d","name":"conv"},{"kind":"text","text":": "},{"kind":"claim","text":"400 ns","title":"cumulative of conv (node 6ebd829166d6c65d): 400 nanoseconds, exact; checked by perf-agent"},{"kind":"text","text":" over "},{"kind":"claim","text":"4","title":"executions_below of conv (node 6ebd829166d6c65d): 4 count, exact; checked by perf-agent"},{"kind":"text","text":" executions and "},{"kind":"claim","text":"3","title":"kernel_names_observed of conv (node 6ebd829166d6c65d): 3 count, exact; checked by perf-agent"},{"kind":"text","text":" kernel names. Most of it is "},{"kind":"node","text":"f6","title":"73bf87d997303185","node":"73bf87d997303185","name":"[gpu:kernel:k1]"},{"kind":"text","text":" at "},{"kind":"claim","text":"60.0%","title":"share_of_total of [gpu:kernel:k1] (node 73bf87d997303185): 0.600 ratio of view_total, rounded to 0.001 ratio; checked by perf-agent"},{"kind":"text","text":". "},{"kind":"claim","text":"100 ns","title":"unsampled_portion of the whole view: 100 nanoseconds, exact; checked by perf-agent"},{"kind":"text","text":" of GPU time has no sampled launch stack and is not attributed to any caller."}],"hypotheses":[[{"kind":"text","text":"k1 is the convolution itself; k2 looks like a layout transform that runs once per layer."}]],"next":[{"kind":"text","text":"Count k2 executions per iteration and compare them with the number of layers."}]}]},{"id":"ba1fb11d50de174d","ref":"f4","name":"[gpu:kernel:k1]","parent":"4fdff6507c3ac409","cum":"100","share":"20.0%","facts":[{"v":"100 ns","c":"100"},{"v":"100 ns","c":"100"},{"v":"20.0%","c":"0.200"},{"v":"100.0%","c":"1.000"},{"v":"0","c":"0","z":true}]},{"id":"f4648b4fa3d18ffb","ref":"f5","name":"[gpu:launch]","parent":"6ebd829166d6c65d","cum":"400","share":"80.0%","facts":[{"v":"400 ns","c":"400"},{"v":"0","c":"0","z":true},{"v":"80.0%","c":"0.800"},{"v":"100.0%","c":"1.000"},{"v":"100 ns","c":"100"}]},{"id":"73bf87d997303185","ref":"f6","name":"[gpu:kernel:k1]","parent":"f4648b4fa3d18ffb","cum":"300","share":"60.0%","facts":[{"v":"300 ns","c":"300"},{"v":"300 ns","c":"300"},{"v":"60.0%","c":"0.600"},{"v":"75.0%","c":"0.750"},{"v":"0","c":"0","z":true}]},{"id":"15c0d42b466d3779","ref":"f7","name":"[gpu:kernel:k2]","parent":"f4648b4fa3d18ffb","cum":"100","share":"20.0%","facts":[{"v":"100 ns","c":"100"},{"v":"100 ns","c":"100"},{"v":"20.0%","c":"0.200"},{"v":"25.0%","c":"0.250"},{"v":"100 ns","c":"100"}]}],"prompts":[{"label":"Why is it wide?","parts":[{"s":"Why is node "},{"slot":"id"},{"s":" ("},{"slot":"name"},{"s":") wide? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0."}]},{"label":"Is it profiler overhead?","parts":[{"s":"Is any of node "},{"slot":"id"},{"s":" profiler overhead? Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0."}]},{"label":"Compare with another profile","parts":[{"s":"Compare node "},{"slot":"id"},{"s":" with another profile using diff. Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0."}]},{"label":"CPU→GPU causality","parts":[{"s":"Explain the CPU→GPU causality under node "},{"slot":"id"},{"s":". Use perf-agent-mcp: open the profile cpu.pb.gz (relative to the profiles root), check that its profile_digest is sha256:9c1e4b7a00000000000000000000000000000000000000000000000000000000, view gpu/nanoseconds#0."}]}]}</script>
+<script></script>
+</body>
+</html>
+
+

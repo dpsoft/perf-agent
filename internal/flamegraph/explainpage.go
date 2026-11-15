@@ -11,6 +11,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
@@ -21,7 +22,26 @@ import (
 var explainPageSource string
 
 //go:embed explainpage.js
-var explainPageScript string
+var explainPageWiring string
+
+//go:embed explainpanel.js
+var explainPanelScript string
+
+//go:embed explainpage.css
+var explainPageCSS string
+
+// explainPageScript is the static page's inline script: the shared panel
+// and the wiring that drives it.
+var explainPageScript = explainPanelScript + "\n" + explainPageWiring
+
+// explainedCSS is the explained page's stylesheet with the light and dark
+// chrome in place of their markers. It is computed once.
+var explainedCSS = sync.OnceValue(func() string {
+	return strings.NewReplacer(
+		"/*LIGHT*/", string(lightChrome),
+		"/*DARK*/", darkChrome,
+	).Replace(explainPageCSS)
+})
 
 var explainPageTmpl = template.Must(template.New("explainpage").Parse(explainPageSource))
 
@@ -188,22 +208,22 @@ type exRejected struct {
 type exLegend struct{ Key, Label string }
 
 type explainedPageData struct {
-	LightChrome, DarkChrome, Palette template.CSS
-	Title, ProfileName, Digest       string
-	TitleSegs                        []exSegment
-	Attempt, View                    string
-	CheckedPill                      string
-	RejectedPill, LimitPill          string
-	HistoryPill                      string
-	GPU                              bool
-	Notes                            []string
-	Quality                          []exQualityRow
-	Legend                           []exLegend
-	Axis, Total, TotalTitle          string
-	Height                           string
-	Frames                           []exDrawn
-	NarrowNote, LimitNote, SizeNote  string
-	RejectedNote                     string
+	CSS, Palette                    template.CSS
+	Title, ProfileName, Digest      string
+	TitleSegs                       []exSegment
+	Attempt, View                   string
+	CheckedPill                     string
+	RejectedPill, LimitPill         string
+	HistoryPill                     string
+	GPU                             bool
+	Notes                           []string
+	Quality                         []exQualityRow
+	Legend                          []exLegend
+	Axis, Total, TotalTitle         string
+	Height                          string
+	Frames                          []exDrawn
+	NarrowNote, LimitNote, SizeNote string
+	RejectedNote                    string
 	// allRejected are every rejected row, before historyRows cut them.
 	allRejected []exRejected
 	Rows        []exRow
@@ -362,8 +382,7 @@ func (b *explainedBuilder) build(frameBytes int64) (*explainedPageData, error) {
 	b.view = fmt.Sprintf("%s/%s#%d", v.SampleType, v.Unit, v.Index)
 	b.specs = b.rowSpecs()
 	data := &explainedPageData{
-		LightChrome: lightChrome,
-		DarkChrome:  template.CSS(darkChrome),
+		CSS:         template.CSS(explainedCSS()),
 		Palette:     template.CSS(paletteCSS + jitterCSS),
 		Title:       cmp.Or(b.opts.Title, b.opts.ProfileName, "Explained flame graph"),
 		TitleSegs:   titleSegments(b.opts),

@@ -6,7 +6,7 @@ require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/NVIDIA/go-nvml v0.13.4-1
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/cilium/ebpf v0.21.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936
 	github.com/iovisor/gobpf v0.2.0
 	github.com/klauspost/compress v1.18.5

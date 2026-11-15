@@ -28,6 +28,18 @@ type perfSampleKey struct {
 	UserStack int64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	perfMapCounts              = "counts"
+	perfMapPids                = "pids"
+	perfMapStackmap            = "stackmap"
+	perfProgProfile            = "profile"
+	perfVarKernelStacksEnabled = "kernel_stacks_enabled"
+	perfVarSystemWide          = "system_wide"
+)
+
 // loadPerf returns the embedded CollectionSpec for perf.
 func loadPerf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_PerfBytes)
@@ -48,7 +60,7 @@ func loadPerf() (*ebpf.CollectionSpec, error) {
 //	*perfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadPerfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadPerfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadPerf()
 	if err != nil {
 		return err

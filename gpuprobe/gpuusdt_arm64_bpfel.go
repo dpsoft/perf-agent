@@ -113,6 +113,38 @@ type gpuusdtWalkPersist struct {
 	Pad             uint32
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	gpuusdtMapCfiLengths          = "cfi_lengths"
+	gpuusdtMapCfiMissEvents       = "cfi_miss_events"
+	gpuusdtMapCfiMissRatelimit    = "cfi_miss_ratelimit"
+	gpuusdtMapCfiRules            = "cfi_rules"
+	gpuusdtMapDropped             = "dropped"
+	gpuusdtMapEvents              = "events"
+	gpuusdtMapGpuPendingBatch     = "gpu_pending_batch"
+	gpuusdtMapGpuStackScratch     = "gpu_stack_scratch"
+	gpuusdtMapGpuStacks           = "gpu_stacks"
+	gpuusdtMapHandoffRanges       = "handoff_ranges"
+	gpuusdtMapInterpProgs         = "interp_progs"
+	gpuusdtMapInterpStats         = "interp_stats"
+	gpuusdtMapPidMappingLengths   = "pid_mapping_lengths"
+	gpuusdtMapPidMappings         = "pid_mappings"
+	gpuusdtMapPids                = "pids"
+	gpuusdtMapStackIdSeq          = "stack_id_seq"
+	gpuusdtMapStacksMissing       = "stacks_missing"
+	gpuusdtMapWalkErrors          = "walk_errors"
+	gpuusdtMapWalkStates          = "walk_states"
+	gpuusdtMapWalkerScratch       = "walker_scratch"
+	gpuusdtProgGpuUsdtBatch       = "gpu_usdt_batch"
+	gpuusdtProgInterpResumeStep   = "interp_resume_step"
+	gpuusdtProgInterpResumeWalk   = "interp_resume_walk"
+	gpuusdtVarBtfAnchorCfiEntry   = "_btf_anchor_cfi_entry"
+	gpuusdtVarBtfAnchorPidMapping = "_btf_anchor_pid_mapping"
+	gpuusdtVarInterpEnabled       = "interp_enabled"
+)
+
 // loadGpuusdt returns the embedded CollectionSpec for gpuusdt.
 func loadGpuusdt() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_GpuusdtBytes)
@@ -133,7 +165,7 @@ func loadGpuusdt() (*ebpf.CollectionSpec, error) {
 //	*gpuusdtMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadGpuusdtObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadGpuusdtObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadGpuusdt()
 	if err != nil {
 		return err

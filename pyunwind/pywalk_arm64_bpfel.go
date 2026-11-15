@@ -80,6 +80,22 @@ type pywalkWalkPersist struct {
 	Pad             uint32
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	pywalkMapInterpProgs              = "interp_progs"
+	pywalkMapInterpStats              = "interp_stats"
+	pywalkMapPyFrameScratch           = "py_frame_scratch"
+	pywalkMapPyProcs                  = "py_procs"
+	pywalkMapPyWalkCounters           = "py_walk_counters"
+	pywalkMapWalkStates               = "walk_states"
+	pywalkMapWalkerScratch            = "walker_scratch"
+	pywalkProgInterpPythonPerfEvent   = "interp_python_perf_event"
+	pywalkProgInterpPythonSchedSwitch = "interp_python_sched_switch"
+	pywalkProgInterpPythonUprobe      = "interp_python_uprobe"
+)
+
 // loadPywalk returns the embedded CollectionSpec for pywalk.
 func loadPywalk() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_PywalkBytes)
@@ -100,7 +116,7 @@ func loadPywalk() (*ebpf.CollectionSpec, error) {
 //	*pywalkMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadPywalkObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadPywalkObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadPywalk()
 	if err != nil {
 		return err

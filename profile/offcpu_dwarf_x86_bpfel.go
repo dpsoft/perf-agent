@@ -100,6 +100,36 @@ type offcpu_dwarfWalkPersist struct {
 	Pad             uint32
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	offcpu_dwarfMapCfiLengths              = "cfi_lengths"
+	offcpu_dwarfMapCfiMissEvents           = "cfi_miss_events"
+	offcpu_dwarfMapCfiMissRatelimit        = "cfi_miss_ratelimit"
+	offcpu_dwarfMapCfiRules                = "cfi_rules"
+	offcpu_dwarfMapHandoffRanges           = "handoff_ranges"
+	offcpu_dwarfMapInterpProgs             = "interp_progs"
+	offcpu_dwarfMapInterpStats             = "interp_stats"
+	offcpu_dwarfMapKernStackmap            = "kern_stackmap"
+	offcpu_dwarfMapOffcpuStart             = "offcpu_start"
+	offcpu_dwarfMapPidMappingLengths       = "pid_mapping_lengths"
+	offcpu_dwarfMapPidMappings             = "pid_mappings"
+	offcpu_dwarfMapPids                    = "pids"
+	offcpu_dwarfMapStackEvents             = "stack_events"
+	offcpu_dwarfMapWalkStates              = "walk_states"
+	offcpu_dwarfMapWalkerScratch           = "walker_scratch"
+	offcpu_dwarfProgInterpResumeStep       = "interp_resume_step"
+	offcpu_dwarfProgInterpResumeWalk       = "interp_resume_walk"
+	offcpu_dwarfProgOffcpuDwarfSchedSwitch = "offcpu_dwarf_sched_switch"
+	offcpu_dwarfVarBtfAnchorCfiEntry       = "_btf_anchor_cfi_entry"
+	offcpu_dwarfVarBtfAnchorOffcpuStartKey = "_btf_anchor_offcpu_start_key"
+	offcpu_dwarfVarBtfAnchorPidMapping     = "_btf_anchor_pid_mapping"
+	offcpu_dwarfVarInterpEnabled           = "interp_enabled"
+	offcpu_dwarfVarKernelStacksEnabled     = "kernel_stacks_enabled"
+	offcpu_dwarfVarSystemWide              = "system_wide"
+)
+
 // loadOffcpu_dwarf returns the embedded CollectionSpec for offcpu_dwarf.
 func loadOffcpu_dwarf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_Offcpu_dwarfBytes)
@@ -120,7 +150,7 @@ func loadOffcpu_dwarf() (*ebpf.CollectionSpec, error) {
 //	*offcpu_dwarfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadOffcpu_dwarfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadOffcpu_dwarfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadOffcpu_dwarf()
 	if err != nil {
 		return err

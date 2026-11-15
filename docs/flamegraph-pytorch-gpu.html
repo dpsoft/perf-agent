@@ -257,7 +257,7 @@ body.gpu-comparing #fd,body.gpu-comparing #tip,body.gpu-comparing #menu,body.gpu
 <li><span class="sw" style="background-color:var(--fill-unsym)"></span><b>vendor, no symbols</b> Unwound correctly; no symbol table could name it. The depth is real, the names are missing — usually a stripped vendor library with no exported symbols. Labelled module+offset (libcuda.so.1+0x1b71c6) where the profile knows which file the address fell in, and as a bare address where it does not. The CPU band&#39;s hue, drained: right layer, no name.</li>
 <li><span class="sw" style="background-color:var(--fill-shim)";border-color:var(--edge-shim)></span><b>perf-agent</b> The profiler observing itself: perf-agent&#39;s injected callback, not work your program asked for. Cool slate, outside the warm CPU band, because it is not your computation.</li>
 <li><span class="sw" style="background-color:var(--fill-boundary)";border-color:var(--edge-boundary)></span><b>CPU→GPU boundary</b> [gpu:launch] — the launch this execution was joined to. Everything below it ran on the CPU; everything above it ran on the accelerator. Grey, Gregg&#39;s boundary marker.</li>
-<li><span class="sw hatched" style="background-color:var(--fill-boundary-unattributed)";border-color:var(--edge-unattributed)></span><b>GPU work with no CPU stack</b> [gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones: its duration is measured, its caller unknown and not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed: a boundary with nothing behind it.</li>
+<li><span class="sw hatched" style="background-color:var(--fill-boundary-unattributed)";border-color:var(--edge-unattributed)></span><b>GPU work with no CPU stack</b> [gpu:launch unsampled] — measured GPU time whose launch carried no CPU stack: its duration is measured, its caller unknown and not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed: a boundary with nothing behind it.</li>
 <li><span class="sw" style="background-color:var(--fill-gpu-kernel)"></span><b>GPU kernel execution</b> The kernel that ran on the accelerator, and how long it ran for. Green, Gregg&#39;s accelerator-execution layer.</li>
 </ul>
 <h2>Texture means how well it is named</h2>
@@ -276,7 +276,7 @@ body.gpu-comparing #fd,body.gpu-comparing #tip,body.gpu-comparing #menu,body.gpu
 <li>[gpu] every launch: 39 of 700 frame slots (5.6%) have no symbol and are drawn as a raw address or [unknown].</li>
 <li>[gpu] every launch: 29 frame slots were merged: runs of consecutive frames from one vendor library whose names say nothing (an address, or the CUDA symbol server&#39;s obfuscated libfoo_&lt;hex&gt;) are drawn as a single frame named after the library. The profile itself is unchanged.</li>
 <li>[gpu] every launch: 2.2% of the total is attributed to its CPU call path by inference, not measurement (gpu_join is heuristic or unmatched, or the join was ambiguous). Those frames name a plausible caller, not an observed one.</li>
-<li>[gpu] every launch: 2.2% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.</li>
+<li>[gpu] every launch: 2.2% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch carried no CPU stack, so it has no CPU caller and none is borrowed from a sampled sibling.</li>
 </ul>
 <h2>Sample labels (not in the graph)</h2>
 <p class="muted">Frames are stack identity, so §8 of the GPU profiling v2 design keeps these out of the tree: a per-sample PC or correlation ID in the path would give every sample its own leaf and destroy the aggregation a flame graph exists to show. They are reported here instead, so nothing in the profile is silently discarded.</p>
@@ -1834,7 +1834,7 @@ function widthMeaning(it,d){
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
   case "boundary": return everyLaunch?"width: device time launched from this path":"width: device time launched from this path, sampled one launch in N";
-  case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
+  case "boundary-unattributed": return "width: measured device time whose launch carried no CPU stack, so it has no caller";
   default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
   }
 }

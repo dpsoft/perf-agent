@@ -325,7 +325,7 @@ func TestTheServerLinksNoProfiler(t *testing.T) {
 // binary's own packages only internal/livehttp, the loopback listener, may
 // import them, and internal/perfmcp may import net/http for the page's
 // handlers and the server they run in.
-var networkingPackages = []string{"net", "net/http", "crypto/tls"}
+var networkingPackages = []string{"net", "net/http", "crypto/tls", "net/textproto", "log/syslog"}
 
 // handlerImports are the networking imports each package besides
 // internal/livehttp is allowed.

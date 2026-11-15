@@ -4,7 +4,7 @@
 
 ## What it does not do
 
-- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It listens only when started with `--live`, only from the first `page_*` call, and only on `127.0.0.1` at a port the kernel picks; it links `net/http` for that listener alone. Tests read the source of every package the binary links for client calls and listening calls, and check that every socket of a running server is TCP on loopback.
+- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It listens only when started with `--live`, only from the first `page_*` call, and only on `127.0.0.1` at a port the kernel picks; it links `net/http` for that listener alone. Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls and listening calls, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback.
 - It captures nothing: it never starts the perf-agent profiler, links neither `perfagent` nor `cilium/ebpf`, and needs no capabilities.
 - It writes only pages under `--output`, and never replaces an existing file.
 - It is not shipped in releases, release archives or container images. Build it from source.

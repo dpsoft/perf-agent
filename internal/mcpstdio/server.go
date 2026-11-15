@@ -11,10 +11,14 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 )
 
-// Server is an MCP server. Requests are handled one at a time, in order.
+// Server is an MCP server. Requests are handled one at a time, in order,
+// except the calls to Control tools, which are answered at once.
 type Server struct {
 	o   Options
 	max int
@@ -30,79 +34,237 @@ func New(o Options) *Server {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
+	if s.o.MaxQueued <= 0 {
+		s.o.MaxQueued = defaultMaxQueued
+	}
+	if s.o.MaxOutMessages <= 0 {
+		s.o.MaxOutMessages = defaultMaxOutMessages
+	}
+	if s.o.MaxOutBytes <= 0 {
+		s.o.MaxOutBytes = defaultMaxOutBytes
+		if s.o.MaxToolErrorBytes > 0 {
+			s.o.MaxOutBytes = 4 * s.o.MaxToolErrorBytes
+		}
+	}
+	if s.o.DrainTimeout <= 0 {
+		s.o.DrainTimeout = defaultDrainTimeout
+	}
 	return s
 }
 
-// inputLine is one line read from the client.
-type inputLine struct {
-	data      []byte
-	oversized bool
-	err       error
-}
-
 // Serve reads newline-delimited JSON-RPC messages from r and writes
-// responses to w until r reaches EOF or ctx ends, both of which return nil.
-// Nothing but compact JSON-RPC lines is ever written to w.
+// responses and notifications to w. Nothing but compact JSON-RPC lines is
+// ever written to w, and only by one goroutine.
 //
-// A reader goroutine owns r: it may still read from r once more after Serve
-// returns, so the caller should close r. A blocked w.Write is not
-// interrupted by ctx.
+// Nothing Serve does waits on w. The reader goroutine takes every line as
+// it comes: notifications/cancelled ends the named request, a Control tool
+// is answered at once, and any other request joins a queue of MaxQueued,
+// beyond which it is answered "server busy". One dispatcher answers the
+// queue in order. Every message goes through a bounded output queue.
+//
+// Serve returns:
+//   - at EOF, once the queued requests are answered (their contexts are
+//     cancelled first) and the output is drained: nil, or ErrClientGone
+//     when the drain took longer than DrainTimeout. An input that fails
+//     to read ends the same way, and Serve then returns the read error;
+//   - when ctx ends, once the output enqueued so far is drained, for at
+//     most DrainTimeout: nil, or an error that is both ErrClientGone and
+//     ctx.Err() when the drain ran out;
+//   - at once with ErrClientGone when the client stopped reading its
+//     output (the output queue overflowed or a write failed).
+//
+// A handler or a write still running then is not waited for. The reader
+// goroutine owns r: it may still read from r once more after Serve
+// returns, so the caller should close r.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	lines := make(chan inputLine)
-	go s.readLines(ctx, r, lines)
+	ss := s.newSession(ctx, w)
+	defer ss.hcancel()
+	go ss.out.run()
+	go ss.dispatch()
+	go ss.read(r)
 
-	initialized := false
-	for {
-		var in inputLine
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return nil
-		case in, ok = <-lines:
-			if !ok {
-				return nil
-			}
+	select {
+	case <-ctx.Done():
+		return ss.endContext(ctx)
+	case <-ss.out.dead:
+		return ss.endGone()
+	case <-ss.inputEnded:
+	}
+	ss.end(CloseEOF)
+	ss.mu.Lock()
+	ss.inputDone = true
+	ss.mu.Unlock()
+	ss.wakeDispatcher()
+	select {
+	case <-ss.dispatched:
+	case <-ctx.Done():
+		return ss.endContext(ctx)
+	case <-ss.out.dead:
+		return ss.endGone()
+	}
+	drained := ss.out.drain(time.Now().Add(s.o.DrainTimeout))
+	ss.halt()
+	if !drained {
+		return ss.out.goneErr()
+	}
+	return ss.readErr
+}
+
+// session is the state of one Serve call.
+type session struct {
+	s *Server
+	// hctx is the parent of every handler's context; hcancel ends them all.
+	hctx    context.Context
+	hcancel context.CancelFunc
+	out     *outQueue
+	// initialized is set by the dispatcher once the answer to initialize
+	// is enqueued, so a Control call answered on the reader after it
+	// cannot overtake that answer.
+	initialized atomic.Bool
+
+	wake       chan struct{} // cap 1: the dispatcher has work or must stop
+	inputEnded chan struct{} // closed when the reader stops
+	readErr    error         // why the input ended, when not at EOF; set before inputEnded closes
+	dispatched chan struct{} // closed when the dispatcher returns
+	endOnce    sync.Once
+
+	mu        sync.Mutex
+	queue     []*request
+	running   *request
+	inputDone bool // no more requests will be queued
+	stopped   bool // stop reading and dispatching
+}
+
+// request is a queued or running request.
+type request struct {
+	env *envelope
+	key string // the id as compact JSON, which notifications/cancelled matches
+	// Guarded by session.mu.
+	cancel    context.CancelFunc
+	cancelled bool
+}
+
+type sessionKey struct{}
+
+func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
+	ss := &session{
+		s:          s,
+		out:        newOutQueue(w, s.o.MaxOutMessages, s.o.MaxOutBytes),
+		wake:       make(chan struct{}, 1),
+		inputEnded: make(chan struct{}),
+		dispatched: make(chan struct{}),
+	}
+	ss.hctx, ss.hcancel = context.WithCancel(context.WithValue(ctx, sessionKey{}, ss))
+	return ss
+}
+
+// end calls OnClose and cancels every handler, once.
+func (ss *session) end(why CloseReason) {
+	ss.endOnce.Do(func() {
+		if f := ss.s.o.OnClose; f != nil {
+			f(why)
 		}
-		if in.err != nil {
-			return in.err
-		}
-		var out *outgoing
-		if in.oversized {
-			out = errorResponse(nil, codeInvalidRequest,
-				fmt.Sprintf("message exceeds MaxMessageBytes (%d bytes); it was discarded", s.max))
-		} else {
-			out = s.dispatch(ctx, in.data, &initialized)
-		}
-		if out == nil {
-			continue
-		}
-		if err := writeMessage(w, out); err != nil {
-			return err
-		}
+		ss.hcancel()
+	})
+}
+
+// halt stops the reader and the dispatcher and closes the output.
+func (ss *session) halt() {
+	ss.mu.Lock()
+	ss.stopped = true
+	ss.mu.Unlock()
+	ss.wakeDispatcher()
+	ss.out.shutdown()
+}
+
+// endGone ends a session whose client stopped reading.
+func (ss *session) endGone() error {
+	ss.end(CloseClientGone)
+	ss.halt()
+	return ss.out.goneErr()
+}
+
+// endContext ends a session whose context is done: no new request is
+// dispatched, and the output enqueued until the running handler returns or
+// the drain deadline passes is written.
+func (ss *session) endContext(ctx context.Context) error {
+	ss.end(CloseContext)
+	deadline := time.Now().Add(ss.s.o.DrainTimeout)
+	ss.mu.Lock()
+	ss.stopped = true
+	ss.mu.Unlock()
+	ss.wakeDispatcher()
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-ss.dispatched:
+	case <-ss.out.dead:
+	case <-t.C:
+	}
+	drained := ss.out.drain(deadline)
+	ss.halt()
+	if !drained {
+		// It wraps ctx.Err() too: the session ended because ctx did.
+		return fmt.Errorf("%w (%w)", ss.out.goneErr(), ctx.Err())
+	}
+	return nil
+}
+
+func (ss *session) wakeDispatcher() {
+	select {
+	case ss.wake <- struct{}{}:
+	default:
 	}
 }
 
-// readLines splits r into lines. A line longer than the limit is reported
-// once as oversized and the remainder of it is read and dropped, never held.
-func (s *Server) readLines(ctx context.Context, r io.Reader, out chan<- inputLine) {
-	defer close(out)
-	send := func(l inputLine) bool {
-		select {
-		case out <- l:
-			return true
-		case <-ctx.Done():
-			return false
-		}
+// halted reports whether the reader must stop.
+func (ss *session) halted() bool {
+	select {
+	case <-ss.out.dead:
+		return true
+	default:
 	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.stopped
+}
+
+// send encodes m and enqueues it, and reports whether it was enqueued.
+func (ss *session) send(m any) bool {
+	line, err := encodeLine(m)
+	if err != nil {
+		ss.s.log.Error("encode message", "err", err)
+		return false
+	}
+	return ss.out.enqueue(line)
+}
+
+// encodeLine is m as one compact JSON line without HTML escaping.
+func encodeLine(m any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b) // compact, newline-terminated
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
+// read splits r into lines and takes each one as it comes. A line longer
+// than the limit is answered once as oversized and the remainder of it is
+// read and dropped, never held. Nothing here waits but r.Read.
+func (ss *session) read(r io.Reader) {
+	defer close(ss.inputEnded)
 	br := bufio.NewReaderSize(r, 64<<10)
 	var buf []byte
 	over := false
 	for {
 		chunk, err := br.ReadSlice('\n')
+		if ss.halted() {
+			return
+		}
 		if !over {
-			if len(buf)+len(chunk) > s.max+1 {
+			if len(buf)+len(chunk) > ss.s.max+1 {
 				over = true
 				buf = nil
 			} else {
@@ -114,12 +276,10 @@ func (s *Server) readLines(ctx context.Context, r io.Reader, out chan<- inputLin
 			complete := err == nil
 			if !over {
 				buf = bytes.TrimSuffix(buf, []byte("\n"))
-				over = len(buf) > s.max
+				over = len(buf) > ss.s.max
 			}
 			if over || len(bytes.TrimSpace(buf)) > 0 {
-				if !send(inputLine{data: buf, oversized: over}) {
-					return
-				}
+				ss.take(buf, over)
 			}
 			buf, over = nil, false
 			if !complete {
@@ -128,21 +288,147 @@ func (s *Server) readLines(ctx context.Context, r io.Reader, out chan<- inputLin
 		case errors.Is(err, bufio.ErrBufferFull):
 			// keep accumulating (or discarding) the same line
 		default:
-			send(inputLine{err: err})
+			ss.readErr = err
 			return
 		}
 	}
 }
 
-func writeMessage(w io.Writer, m *outgoing) error {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b) // compact, newline-terminated
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(m); err != nil {
-		return err
+// take handles one input line on the reader goroutine.
+func (ss *session) take(line []byte, oversized bool) {
+	if oversized {
+		ss.send(errorResponse(nil, codeInvalidRequest,
+			fmt.Sprintf("message exceeds MaxMessageBytes (%d bytes); it was discarded", ss.s.max)))
+		return
 	}
-	_, err := w.Write(b.Bytes())
-	return err
+	env, bad := ss.s.parse(line)
+	if bad != nil {
+		ss.send(bad)
+		return
+	}
+	if env == nil {
+		return
+	}
+	if len(env.ID) == 0 {
+		// Notification: never answered.
+		if env.Method == "notifications/cancelled" {
+			ss.cancelRequest(env.Params)
+		}
+		return
+	}
+	if ss.initialized.Load() && ss.s.isControlCall(env) {
+		if out, _ := ss.answer(ss.hctx, env); out != nil {
+			ss.send(out)
+		}
+		return
+	}
+	ss.mu.Lock()
+	if n := len(ss.queue); n >= ss.s.o.MaxQueued {
+		ss.mu.Unlock()
+		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", n)))
+		return
+	}
+	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID)})
+	ss.mu.Unlock()
+	ss.wakeDispatcher()
+}
+
+// isControlCall reports whether env calls a Control tool.
+func (s *Server) isControlCall(env *envelope) bool {
+	if env.Method != "tools/call" {
+		return false
+	}
+	var p struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(env.Params, &p) != nil {
+		return false
+	}
+	i := slices.IndexFunc(s.o.Tools, func(t Tool) bool { return t.Name == p.Name })
+	return i >= 0 && s.o.Tools[i].Control
+}
+
+// cancelRequest ends the request notifications/cancelled names: the running
+// one is cancelled and its answer dropped, a queued one is dropped
+// unanswered, and an unknown id is ignored.
+func (ss *session) cancelRequest(params json.RawMessage) {
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(params, &p) != nil || !validID(p.RequestID) {
+		return
+	}
+	key := compactID(p.RequestID)
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if r := ss.running; r != nil && r.key == key {
+		r.cancelled = true
+		r.cancel()
+		return
+	}
+	if i := slices.IndexFunc(ss.queue, func(r *request) bool { return r.key == key }); i >= 0 {
+		ss.queue = slices.Delete(ss.queue, i, i+1)
+	}
+}
+
+func compactID(raw json.RawMessage) string {
+	var b bytes.Buffer
+	if json.Compact(&b, raw) != nil {
+		return string(raw)
+	}
+	return b.String()
+}
+
+// dispatch answers the queued requests one at a time, in order, until the
+// input is done and the queue empty, or the session stops.
+func (ss *session) dispatch() {
+	defer close(ss.dispatched)
+	for {
+		r, ctx := ss.next()
+		if r == nil {
+			return
+		}
+		out, initialized := ss.answer(ctx, r.env)
+		ss.mu.Lock()
+		ss.running = nil
+		dropped := r.cancelled
+		ss.mu.Unlock()
+		r.cancel()
+		if out != nil && !dropped {
+			ss.send(out)
+		}
+		if initialized {
+			ss.initialized.Store(true)
+		}
+	}
+}
+
+// next takes the first queued request and makes it the running one, or
+// returns nil once there is nothing more to do.
+func (ss *session) next() (*request, context.Context) {
+	for {
+		ss.mu.Lock()
+		if ss.stopped {
+			ss.mu.Unlock()
+			return nil, nil
+		}
+		if len(ss.queue) > 0 {
+			r := ss.queue[0]
+			ss.queue[0] = nil
+			ss.queue = ss.queue[1:]
+			ctx, cancel := context.WithCancel(ss.hctx)
+			r.cancel = cancel
+			ss.running = r
+			ss.mu.Unlock()
+			return r, ctx
+		}
+		done := ss.inputDone
+		ss.mu.Unlock()
+		if done {
+			return nil, nil
+		}
+		<-ss.wake
+	}
 }
 
 func errorResponse(id json.RawMessage, code int, msg string) *outgoing {
@@ -176,66 +462,65 @@ func validID(raw json.RawMessage) bool {
 // marshal encodes v compactly without HTML escaping, so text such as "<b>&"
 // reaches the client literally.
 func marshal(v any) ([]byte, error) {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	b, err := encodeLine(v)
+	if err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+	return bytes.TrimSuffix(b, []byte("\n")), nil
 }
 
-// dispatch handles one line and returns the response, or nil for none.
-func (s *Server) dispatch(ctx context.Context, line []byte, initialized *bool) *outgoing {
+// parse validates one line. It returns the message, or the error answer for
+// a line that is not a valid message, or neither for a line that is
+// dropped silently.
+func (s *Server) parse(line []byte) (*envelope, *outgoing) {
 	trimmed := bytes.TrimSpace(line)
 	if !json.Valid(trimmed) {
-		return errorResponse(nil, codeParseError, "parse error: invalid JSON")
+		return nil, errorResponse(nil, codeParseError, "parse error: invalid JSON")
 	}
 	if trimmed[0] == '[' {
-		return errorResponse(nil, codeInvalidRequest, "batches are not supported")
+		return nil, errorResponse(nil, codeInvalidRequest, "batches are not supported")
 	}
 	if trimmed[0] != '{' {
-		return errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")
+		return nil, errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")
 	}
 	var env envelope
 	if err := json.Unmarshal(trimmed, &env); err != nil {
-		return errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
+		return nil, errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
 	}
 	if env.Method == "" && (len(env.Result) > 0 || len(env.Error) > 0) {
 		s.log.Warn("dropping a client response; this server sends no requests")
-		return nil
+		return nil, nil
 	}
 	if len(env.ID) > 0 && !validID(env.ID) {
-		return errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
+		return nil, errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
 	}
 	if env.JSONRPC != "2.0" {
-		return errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)
+		return nil, errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)
 	}
 	if env.Method == "" {
-		return errorResponse(env.ID, codeInvalidRequest, "invalid request: method is required")
+		return nil, errorResponse(env.ID, codeInvalidRequest, "invalid request: method is required")
 	}
-	if len(env.ID) == 0 {
-		// Notification: never answered.
-		return nil
-	}
+	return &env, nil
+}
+
+// answer handles one request and returns its response, and whether it
+// completed initialize.
+func (ss *session) answer(ctx context.Context, env *envelope) (*outgoing, bool) {
 	// Unknown methods (server/discover included) answer method-not-found even
 	// before initialize so clients can fall back to the initialize handshake.
-	if env.Method != "initialize" && env.Method != "ping" && !*initialized && knownMethods[env.Method] {
-		return errorResponse(env.ID, codeInvalidRequest, "send initialize first")
+	if env.Method != "initialize" && env.Method != "ping" && !ss.initialized.Load() && knownMethods[env.Method] {
+		return errorResponse(env.ID, codeInvalidRequest, "send initialize first"), false
 	}
-	result, rerr := s.handle(ctx, env.Method, env.Params)
+	result, rerr := ss.s.handle(ctx, env.Method, env.Params)
 	if rerr != nil {
-		return errorResponse(env.ID, rerr.Code, rerr.Message)
-	}
-	if env.Method == "initialize" {
-		*initialized = true
+		return errorResponse(env.ID, rerr.Code, rerr.Message), false
 	}
 	raw, err := marshal(result)
 	if err != nil {
-		s.log.Error("marshal result", "method", env.Method, "err", err)
-		return errorResponse(env.ID, codeInternalError, "internal error")
+		ss.s.log.Error("marshal result", "method", env.Method, "err", err)
+		return errorResponse(env.ID, codeInternalError, "internal error"), false
 	}
-	return &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}
+	return &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}, env.Method == "initialize"
 }
 
 var knownMethods = map[string]bool{
@@ -333,6 +618,9 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+		Meta      struct {
+			ProgressToken json.RawMessage `json:"progressToken"`
+		} `json:"_meta"`
 	}
 	if e := decodeParams(params, &p); e != nil {
 		return nil, e
@@ -340,6 +628,9 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	i := slices.IndexFunc(s.o.Tools, func(t Tool) bool { return t.Name == p.Name })
 	if i < 0 || s.o.Tools[i].Handler == nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + echoName(p.Name)}
+	}
+	if ss, ok := ctx.Value(sessionKey{}).(*session); ok && !s.o.Tools[i].Control && validID(p.Meta.ProgressToken) {
+		ctx = context.WithValue(ctx, progressKey{}, &progressTarget{token: p.Meta.ProgressToken, ss: ss})
 	}
 	args := p.Arguments
 	if len(args) == 0 || string(args) == "null" {
@@ -438,4 +729,37 @@ func cut(s string, limit int) string {
 		n--
 	}
 	return s[:n] + ellipsis
+}
+
+type progressKey struct{}
+
+// progressTarget is where a request's progress goes.
+type progressTarget struct {
+	token json.RawMessage
+	ss    *session
+}
+
+// Progress sends a notifications/progress for the tool call ctx belongs to,
+// through the output queue, and reports whether it was enqueued. It sends
+// nothing, and returns false, when the call carried no progressToken, when
+// ctx is done (the call was cancelled or has been answered), or outside a
+// tool call. A total <= 0 and an empty message are left out. It never
+// waits; a notification that does not fit the output queue marks the
+// client dead, as any message does.
+func Progress(ctx context.Context, progress, total float64, message string) bool {
+	p, ok := ctx.Value(progressKey{}).(*progressTarget)
+	if !ok || ctx.Err() != nil {
+		return false
+	}
+	type params struct {
+		ProgressToken json.RawMessage `json:"progressToken"`
+		Progress      float64         `json:"progress"`
+		Total         float64         `json:"total,omitzero"`
+		Message       string          `json:"message,omitzero"`
+	}
+	return p.ss.send(struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  params `json:"params"`
+	}{"2.0", "notifications/progress", params{p.token, progress, max(total, 0), message}})
 }

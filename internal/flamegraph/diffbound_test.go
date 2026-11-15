@@ -2,8 +2,12 @@ package flamegraph
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
+	"math"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -42,7 +46,81 @@ func boundFixtures(t *testing.T) map[string]*profilemodel.Diff {
 		"empty":                     empty,
 		"wide":                      wideDiff(900, 40),
 		"many rows":                 manyRows(700),
+		"tight names and causes":    tightNamesAndCauses(),
+		"tight table":               tightTable(),
+		"row ties":                  rowTies(),
 	}
+}
+
+// plusQuote is n bytes of '+' and '"', which the page writes 5 bytes each.
+func plusQuote(n int, salt string) string {
+	return salt + strings.Repeat(`+"`, (n-len(salt))/2)
+}
+
+// tightNamesAndCauses is 30 one-sided nodes whose names and causes are
+// 1 KiB of characters escaped five times over, with positive shares and
+// huge positive changes: the escaped strings are nearly the whole page, so
+// a bound that leaves any of them out falls under the page.
+func tightNamesAndCauses() *profilemodel.Diff {
+	var kids []*profilemodel.DiffNode
+	var next int64
+	for i := range 30 {
+		v := int64(1e15) + int64(i)
+		n := dnode(plusQuote(1<<10, fmt.Sprintf("n%02d", i)), 0, v)
+		n.Why = plusQuote(1<<10, fmt.Sprintf("w%02d", i))
+		n.DeltaShare = shareFact(0.03)
+		kids = append(kids, n)
+		next += v
+	}
+	root := dnode(plusQuote(1<<10, "root"), 0, next, kids...)
+	root.Presence = profilemodel.PresenceBoth
+	root.DeltaShare = shareFact(0)
+	return withIDs(diffOf("cpu", "nanoseconds", 1, next, root))
+}
+
+// tightTable is a 30-deep chain of '+' names over 700 one-sided leaves:
+// the table's paths, 500 of them, are nearly the whole page.
+func tightTable() *profilemodel.Diff {
+	var leaves []*profilemodel.DiffNode
+	var base int64
+	for i := range 700 {
+		leaves = append(leaves, dnode(fmt.Sprintf("leaf%03d", i)+strings.Repeat("+", 32), int64(100+i), 0))
+		base += int64(100 + i)
+	}
+	n := dnode(strings.Repeat("+", 32)+"29", base, 1, leaves...)
+	for i := 28; i >= 0; i-- {
+		n = dnode(strings.Repeat("+", 32)+fmt.Sprint(i), base, 1, n)
+	}
+	return withIDs(diffOf("cpu", "nanoseconds", base, 1, dnode("", base, 1, n)))
+}
+
+// rowTies is more one-sided paths than the table lists, many with equal
+// changes and some with equal paths, so the table's order rests on every
+// key: the change, then the path, then the walk.
+func rowTies() *profilemodel.Diff {
+	var kids []*profilemodel.DiffNode
+	var base, next int64
+	for i := range 40 {
+		var gs []*profilemodel.DiffNode
+		var gb, gn int64
+		for j := range 20 {
+			// Every group has the same names: equal paths under equal
+			// parents' names.
+			c := dnode(fmt.Sprintf("g%02d", j%7), int64(j%3), 0)
+			if j%2 == 1 {
+				c = dnode(fmt.Sprintf("g%02d", j%7), 0, int64(j%4)+1)
+			}
+			if c.Combined == 0 {
+				c = dnode(fmt.Sprintf("g%02d", j%7), 2, 0)
+			}
+			gs = append(gs, c)
+			gb, gn = gb+c.BaseCum, gn+c.NewCum
+		}
+		k := dnode(fmt.Sprintf("p%02d", i%9), gb+1, gn+1, gs...)
+		kids = append(kids, k)
+		base, next = base+k.BaseCum, next+k.NewCum
+	}
+	return withIDs(diffOf("cpu", "nanoseconds", base, next, dnode("", base, next, kids...)))
 }
 
 // manyRows is a root over n one-sided children, more than the table lists.
@@ -137,7 +215,8 @@ func TestBoundedDiffExportRefusesBeforeBuilding(t *testing.T) {
 	w.Reset()
 	err = WriteDiffPageBounded(&w, d, DiffPageOptions{}, 1<<30, 3200)
 	require.ErrorIs(t, err, ErrPageTooLarge)
-	assert.Contains(t, err.Error(), "3201")
+	assert.Contains(t, err.Error(), "draws 3201 nodes, over its budget of 3200 nodes")
+	assert.NotContains(t, err.Error(), "bytes", "only the limit exceeded is named")
 	assert.Zero(t, w.Len())
 }
 
@@ -163,4 +242,138 @@ func TestDiffLiveModelExportStateFollowsTheBound(t *testing.T) {
 	assert.Contains(t, ex["reason"], fmt.Sprint(nodes))
 	live, _ = diffLiveOf(t, d, DiffLiveOptions{Title: "t", MaxBytes: 1 << 20, MaxNodes: nodes})
 	assert.Equal(t, map[string]any{"ok": true, "reason": ""}, live["export"])
+}
+
+// referenceRows is the table as the page first listed it: every topmost
+// one-sided path, by a recursive walk, stably sorted by change and path,
+// then cut to maxTableRows.
+func referenceRows(d *profilemodel.Diff) ([]diffRow, int) {
+	var rows []diffRow
+	var collect func(n *profilemodel.DiffNode, path []string, parentOneSided bool)
+	collect = func(n *profilemodel.DiffNode, path []string, parentOneSided bool) {
+		if n.Name != "" || len(path) > 0 {
+			path = append(path[:len(path):len(path)], n.Name)
+		}
+		oneSided := n.Presence != profilemodel.PresenceBoth
+		if oneSided && !parentOneSided {
+			rows = append(rows, diffRow{Path: strings.Join(path, " > "), Presence: string(n.Presence), Delta: signed(n.DeltaAbs, d.Unit),
+				Interpretation: string(n.Interpretation), Why: n.Why, absDelta: absDelta(n.DeltaAbs)})
+		}
+		for _, c := range n.Children {
+			collect(c, path, oneSided)
+		}
+	}
+	collect(d.Root, nil, false)
+	slices.SortStableFunc(rows, func(x, y diffRow) int {
+		return cmp.Or(cmp.Compare(y.absDelta, x.absDelta), strings.Compare(x.Path, y.Path))
+	})
+	total := len(rows)
+	return rows[:min(len(rows), maxTableRows)], total
+}
+
+func TestDiffPageTableIsTheLargestRowsInOrder(t *testing.T) {
+	for name, d := range boundFixtures(t) {
+		if d.Root == nil || d.Root.Combined <= 0 {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			want, wantTotal := referenceRows(d)
+			got, total := diffTable(d.Root, d.Unit)
+			assert.Equal(t, wantTotal, total)
+			require.Len(t, got, len(want))
+			for i := range want {
+				require.Equal(t, want[i], got[i], "row %d", i)
+			}
+		})
+	}
+}
+
+// exportAlloc is what an admitted export of d allocates, and its page's
+// length. The destination is sized first: its growth is not the export's.
+func exportAlloc(t *testing.T, d *profilemodel.Diff) (alloc uint64, page int) {
+	t.Helper()
+	var w bytes.Buffer
+	w.Grow(16 << 20)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	require.NoError(t, WriteDiffPageBounded(&w, d, DiffPageOptions{Title: "deep"}, 8<<20, 20000))
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, w.Len()
+}
+
+// deepOverLeaves is a chain depth deep over leaves one-sided leaves.
+func deepOverLeaves(depth, leaves int) *profilemodel.Diff {
+	var ls []*profilemodel.DiffNode
+	var next int64
+	for i := range leaves {
+		ls = append(ls, dnode(fmt.Sprintf("leaf%04d", i), 0, int64(1+i%5)))
+		next += int64(1 + i%5)
+	}
+	n := dnode(fmt.Sprintf("f%d", depth-1), 1, next, ls...)
+	for i := depth - 2; i >= 0; i-- {
+		n = dnode(fmt.Sprintf("f%d", i), 1, next, n)
+	}
+	return withIDs(diffOf("cpu", "nanoseconds", 1, next, dnode("", 1, next, n)))
+}
+
+func TestAdmittedDiffExportAllocatesInProportionToItsPage(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		short, deep   *profilemodel.Diff
+		shortN, deepN int
+	}{
+		{"Deep vs itself, all matched", compared(t, pmfixture.Deep(1000), pmfixture.Deep(1000)), compared(t, pmfixture.Deep(3000), pmfixture.Deep(3000)), 1000, 3000},
+		{"a chain over 3000 one-sided leaves", deepOverLeaves(100, 3000), deepOverLeaves(300, 3000), 100, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sa, sp := exportAlloc(t, tc.short)
+			da, dp := exportAlloc(t, tc.deep)
+			perShort, perDeep := float64(sa)/float64(sp), float64(da)/float64(dp)
+			t.Logf("depth %d: page %d, allocated %d (%.1f per page byte); depth %d: page %d, allocated %d (%.1f)",
+				tc.shortN, sp, sa, perShort, tc.deepN, dp, da, perDeep)
+			assert.Less(t, perDeep, 1.5*perShort, "allocation per page byte does not grow with depth")
+			assert.Less(t, da, uint64(12*dp+(4<<20)), "an admitted export allocates in proportion to its page")
+		})
+	}
+}
+
+func TestDiffPageBoundHoldsOneStackFramePerDepth(t *testing.T) {
+	d := wideDiff(200_000, 8)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, nodes := diffPageBound(d, DiffPageOptions{})
+	runtime.ReadMemStats(&after)
+	alloc := after.TotalAlloc - before.TotalAlloc
+	t.Logf("bounding %d drawn of 200001 nodes allocated %d bytes", nodes, alloc)
+	assert.Less(t, alloc, uint64(64<<10), "the walk holds a frame per depth, not a node per sibling")
+}
+
+func TestDiffExportRefusalNamesOnlyTheLimitExceeded(t *testing.T) {
+	e := exportState(1000, 10, 500, 20)
+	assert.Equal(t, "a static copy of this diff needs up to 1000 bytes, over its budget of 500 bytes", e.Reason)
+	e = exportState(1000, 10, 0, 5)
+	assert.Equal(t, "a static copy of this diff draws 10 nodes, over its budget of 5 nodes", e.Reason)
+	e = exportState(1000, 10, 500, 5)
+	assert.Equal(t, "a static copy of this diff needs up to 1000 bytes, over its budget of 500 bytes, and draws 10 nodes, over its budget of 5 nodes", e.Reason)
+}
+
+// Each value's bound holds on its own, as the page escapes the value:
+// none leans on the chrome's slack.
+func TestDiffValueBoundsHoldEachValue(t *testing.T) {
+	values := []int64{math.MinInt64, math.MinInt64 + 1, -1 << 60, -999_999_999_999, -1000, -1, 0, 1, 9, 10, 999, 1000, 1023, 1024,
+		999_999, 1_000_000, 999_999_999, 1_000_000_000, 1 << 50, 1<<62 + 12345, math.MaxInt64}
+	for _, unit := range []string{"nanoseconds", "bytes", "count", "+&<>\"'"} {
+		u := htmlEscapedBound(unit)
+		for _, v := range values {
+			for _, s := range []string{withHuman(strconv.FormatInt(v, 10), v, unit), signed(v, unit)} {
+				assert.GreaterOrEqual(t, valueBound(v, u), htmlEscapedBound(s), "%q", s)
+			}
+		}
+	}
+	for _, x := range []float64{-100, -99.995, -1, -0.004, 0, 0.004, 0.995, 9.995, 99.995, 100, 12345.678, 1e300} {
+		s := fmt.Sprintf("%+.2f", x)
+		assert.GreaterOrEqual(t, pointsBound(x), htmlEscapedBound(s), "%q", s)
+	}
 }

@@ -125,15 +125,8 @@ func WriteDiffPage(w io.Writer, d *profilemodel.Diff, opts DiffPageOptions) erro
 		data.Root = b.view(d.Root, d.Root.Combined)
 		data.Omitted = b.omitted
 		data.FullScale = strconv.FormatFloat(100*b.scale, 'f', 2, 64)
-		b.collect(d.Root, nil, false)
-		slices.SortStableFunc(b.rows, func(x, y diffRow) int {
-			return cmp.Or(cmp.Compare(y.absDelta, x.absDelta), strings.Compare(x.Path, y.Path))
-		})
-		data.RowsTotal = len(b.rows)
-		if len(b.rows) > maxTableRows {
-			b.rows, data.RowsTruncated = b.rows[:maxTableRows], true
-		}
-		data.Rows = b.rows
+		data.Rows, data.RowsTotal = diffTable(d.Root, d.Unit)
+		data.RowsTruncated = data.RowsTotal > len(data.Rows)
 	}
 	return diffPageTmpl.Execute(w, data)
 }
@@ -144,7 +137,6 @@ type diffBuilder struct {
 	unit         string
 	rootCombined int64
 	scale        float64
-	rows         []diffRow
 	omitted      int
 }
 
@@ -250,6 +242,8 @@ func diffTooltip(n *profilemodel.DiffNode, name string, share float64, shareOK b
 	if name == "" {
 		name = "(all)"
 	}
+	// Sized once for the fixed words, the values and the IDs.
+	s.Grow(len(name) + len(n.Why) + 3*len(unit) + len(n.BaseID) + len(n.NewID) + 256)
 	fmt.Fprintf(&s, "%s\nbase %s, new %s\nchange %s", name,
 		withHuman(strconv.FormatInt(n.BaseCum, 10), n.BaseCum, unit),
 		withHuman(strconv.FormatInt(n.NewCum, 10), n.NewCum, unit),
@@ -281,26 +275,168 @@ func diffTooltip(n *profilemodel.DiffNode, name string, share float64, shareOK b
 	return s.String()
 }
 
-// collect lists the topmost one-sided nodes: everything below one is
-// one-sided too, and listing it would repeat the same removal or addition.
-func (b *diffBuilder) collect(n *profilemodel.DiffNode, path []string, parentOneSided bool) {
-	if n.Name != "" || len(path) > 0 {
-		path = append(path[:len(path):len(path)], n.Name)
+// diffTable is the table of removed and added paths under root: the
+// topmost one-sided nodes (everything below one is one-sided too, and
+// listing it would repeat the same removal or addition), largest change
+// first, then by path, then in walk order, cut to maxTableRows, and how
+// many there are in all.
+//
+// The walk is iterative and shares one path among the nodes it visits. Only the
+// largest maxTableRows rows are kept as it goes, and a row's path is
+// joined only when it is kept, so the table costs what it lists.
+func diffTable(root *profilemodel.DiffNode, unit string) ([]diffRow, int) {
+	t := rowTable{h: make([]tableRow, 0, maxTableRows)}
+	var path []string
+	type frame struct {
+		n        *profilemodel.DiffNode
+		next     int
+		pathLen  int // len(path) before n's name
+		oneSided bool
 	}
-	oneSided := n.Presence != profilemodel.PresenceBoth
-	if oneSided && !parentOneSided {
-		b.rows = append(b.rows, diffRow{
-			Path:           strings.Join(path, " > "),
-			Presence:       string(n.Presence),
-			Delta:          signed(n.DeltaAbs, b.unit),
-			Interpretation: string(n.Interpretation),
-			Why:            n.Why,
-			absDelta:       absDelta(n.DeltaAbs),
+	var stack []frame
+	visit := func(n *profilemodel.DiffNode, parentOneSided bool) {
+		pathLen := len(path)
+		if n.Name != "" || len(path) > 0 {
+			path = append(path, n.Name)
+		}
+		oneSided := n.Presence != profilemodel.PresenceBoth
+		if oneSided && !parentOneSided {
+			t.add(n, path)
+		}
+		stack = append(stack, frame{n: n, pathLen: pathLen, oneSided: oneSided})
+	}
+	visit(root, false)
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+		if top.next == len(top.n.Children) {
+			path = path[:top.pathLen]
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		c, oneSided := top.n.Children[top.next], top.oneSided
+		top.next++
+		visit(c, oneSided)
+	}
+	slices.SortFunc(t.h, func(x, y tableRow) int { return -x.order(y) })
+	rows := make([]diffRow, 0, len(t.h))
+	for _, r := range t.h {
+		rows = append(rows, diffRow{
+			Path:           r.path,
+			Presence:       string(r.n.Presence),
+			Delta:          signed(r.n.DeltaAbs, unit),
+			Interpretation: string(r.n.Interpretation),
+			Why:            r.n.Why,
+			absDelta:       r.abs,
 		})
 	}
-	for _, c := range n.Children {
-		b.collect(c, path, oneSided)
+	return rows, t.total
+}
+
+// tableRow is a row the table keeps: its node, its change, its joined path
+// and its place in the walk.
+type tableRow struct {
+	n    *profilemodel.DiffNode
+	abs  int64
+	path string
+	seq  int
+}
+
+// order is > 0 when r is listed before o: a larger change, then a smaller
+// path, then earlier in the walk.
+func (r tableRow) order(o tableRow) int {
+	return cmp.Or(cmp.Compare(r.abs, o.abs), strings.Compare(o.path, r.path), cmp.Compare(o.seq, r.seq))
+}
+
+// rowTable keeps the maxTableRows rows listed first, as a heap whose root
+// is the one listed last, and counts every row offered.
+type rowTable struct {
+	h     []tableRow
+	total int
+}
+
+func (t *rowTable) add(n *profilemodel.DiffNode, path []string) {
+	seq := t.total
+	t.total++
+	abs := absDelta(n.DeltaAbs)
+	if len(t.h) < cap(t.h) {
+		t.h = append(t.h, tableRow{n: n, abs: abs, path: strings.Join(path, " > "), seq: seq})
+		t.up(len(t.h) - 1)
+		return
 	}
+	if len(t.h) == 0 {
+		return
+	}
+	// Against the row listed last, decided before the path is joined.
+	last := t.h[0]
+	switch c := cmp.Compare(abs, last.abs); {
+	case c < 0:
+		return
+	case c == 0 && comparePath(path, last.path) >= 0:
+		// An equal path loses too: this row comes later in the walk.
+		return
+	}
+	t.h[0] = tableRow{n: n, abs: abs, path: strings.Join(path, " > "), seq: seq}
+	t.down(0)
+}
+
+func (t *rowTable) up(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if t.h[i].order(t.h[p]) >= 0 {
+			return
+		}
+		t.h[i], t.h[p] = t.h[p], t.h[i]
+		i = p
+	}
+}
+
+func (t *rowTable) down(i int) {
+	for {
+		last, l, r := i, 2*i+1, 2*i+2
+		if l < len(t.h) && t.h[l].order(t.h[last]) < 0 {
+			last = l
+		}
+		if r < len(t.h) && t.h[r].order(t.h[last]) < 0 {
+			last = r
+		}
+		if last == i {
+			return
+		}
+		t.h[i], t.h[last] = t.h[last], t.h[i]
+		i = last
+	}
+}
+
+// comparePath compares strings.Join(parts, " > ") with s byte by byte,
+// as strings.Compare would, without joining them.
+func comparePath(parts []string, s string) int {
+	at := 0
+	chunk := func(c string) int {
+		rest := s[at:]
+		n := min(len(c), len(rest))
+		if r := strings.Compare(c[:n], rest[:n]); r != 0 {
+			return r
+		}
+		if len(c) > len(rest) {
+			return 1
+		}
+		at += n
+		return 0
+	}
+	for i, p := range parts {
+		if i > 0 {
+			if r := chunk(" > "); r != 0 {
+				return r
+			}
+		}
+		if r := chunk(p); r != 0 {
+			return r
+		}
+	}
+	if at < len(s) {
+		return -1
+	}
+	return 0
 }
 
 // signed is a change as an exact signed value, with a readable one beside

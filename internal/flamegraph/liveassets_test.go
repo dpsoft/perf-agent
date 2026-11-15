@@ -932,7 +932,7 @@ func TestLivePageInChrome(t *testing.T) {
 		// Four frames are the budget of a static copy too, which draws six.
 		assert.Empty(t, d.Export, "no link to an export that would be refused")
 		assert.False(t, d.ExportHid)
-		assert.Contains(t, tab.eval(`document.getElementById('export').title`), "draws 6 nodes, over its budget of no limit on bytes and 4 nodes")
+		assert.Contains(t, tab.eval(`document.getElementById('export').title`), "draws 6 nodes, over its budget of 4 nodes")
 		assert.Equal(t, "true", tab.eval(`document.getElementById('export').getAttribute('aria-disabled')`))
 		assert.Equal(t, []string{"Diff of two views: every figure is computed by perf-agent"}, d.Pills)
 		assert.Contains(t, d.Axis, "base 1000 nanoseconds (1.00 µs) · new 1000 nanoseconds (1.00 µs)")

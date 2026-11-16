@@ -28,13 +28,29 @@ import (
 //   - slow sleeps {"ms": N} milliseconds, or until its context ends;
 //   - big answers {"bytes": N} bytes of text;
 //   - received sends what mcpstdio.Received says, and when it ran, on
-//     receipts.
+//     receipts;
+//   - capture_cancel is a Control tool and page_state a Snapshot tool:
+//     each answers at once, or with {"block": true} behaves as block;
+//   - hold takes the engine, a one-slot semaphore, then behaves as block;
+//     queued waits for the engine, or the end of its context, counts
+//     itself in started and answers. Together they stand in for a tool
+//     holding perfmcp's engine and the calls queued behind it.
+//
+// The resource pageStateURI is a Snapshot resource and otherURI a plain
+// one.
 type fake struct {
 	*mcpstdio.Server
 	flushed  atomic.Int32
 	calls    chan *call
 	receipts chan receipt
+	engine   chan struct{}
+	started  atomic.Int32
 }
+
+const (
+	pageStateURI = "perf-agent://page/state"
+	otherURI     = "perf-agent://other"
+)
 
 // call is one running block call.
 type call struct {
@@ -55,23 +71,29 @@ func (f *fake) FlushWarnings() {
 }
 
 func newFake() *fake {
-	f := &fake{calls: make(chan *call, 64), receipts: make(chan receipt, 16)}
+	f := &fake{calls: make(chan *call, 64), receipts: make(chan receipt, 16), engine: make(chan struct{}, 1)}
 	f.Server = mcpstdio.New(mcpstdio.Options{
 		Info: mcpstdio.Implementation{Name: "fake"},
 		Tools: []mcpstdio.Tool{
 			{Name: "block", Handler: func(ctx context.Context, _ json.RawMessage) (mcpstdio.Result, error) {
-				c := &call{ctx: ctx, release: make(chan struct{}), ended: make(chan error, 1)}
-				f.calls <- c
+				return f.block(ctx)
+			}},
+			{Name: "capture_cancel", Control: true, Handler: f.maybeBlock("cancelling")},
+			{Name: "page_state", Snapshot: true, Handler: f.maybeBlock("state")},
+			{Name: "hold", Handler: func(ctx context.Context, _ json.RawMessage) (mcpstdio.Result, error) {
+				f.engine <- struct{}{}
+				defer func() { <-f.engine }()
+				return f.block(ctx)
+			}},
+			{Name: "queued", Handler: func(ctx context.Context, _ json.RawMessage) (mcpstdio.Result, error) {
 				select {
-				case <-c.release:
+				case f.engine <- struct{}{}:
 				case <-ctx.Done():
+					return mcpstdio.Result{}, fmt.Errorf("cancelled while queued: %w", ctx.Err())
 				}
-				err := ctx.Err()
-				c.ended <- err
-				if err != nil {
-					return mcpstdio.Result{}, fmt.Errorf("cancelled: %w", err)
-				}
-				return mcpstdio.Result{Text: "released"}, nil
+				f.started.Add(1)
+				<-f.engine
+				return mcpstdio.Result{Text: "ran"}, nil
 			}},
 			{Name: "slow", Handler: func(ctx context.Context, args json.RawMessage) (mcpstdio.Result, error) {
 				var a struct{ MS int }
@@ -94,8 +116,42 @@ func newFake() *fake {
 				return mcpstdio.Result{Text: "ok"}, nil
 			}},
 		},
+		Resources: []mcpstdio.Resource{
+			{URI: pageStateURI, Name: "page state", Snapshot: true, Read: func(context.Context) (string, error) { return "{}", nil }},
+			{URI: otherURI, Name: "other", Text: "other"},
+		},
 	})
 	return f
+}
+
+// block sends a call on calls and waits for its release or the end of
+// ctx.
+func (f *fake) block(ctx context.Context) (mcpstdio.Result, error) {
+	c := &call{ctx: ctx, release: make(chan struct{}), ended: make(chan error, 1)}
+	f.calls <- c
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+	}
+	err := ctx.Err()
+	c.ended <- err
+	if err != nil {
+		return mcpstdio.Result{}, fmt.Errorf("cancelled: %w", err)
+	}
+	return mcpstdio.Result{Text: "released"}, nil
+}
+
+// maybeBlock answers text at once, or behaves as block when the arguments
+// are {"block": true}.
+func (f *fake) maybeBlock(text string) mcpstdio.Handler {
+	return func(ctx context.Context, args json.RawMessage) (mcpstdio.Result, error) {
+		var a struct{ Block bool }
+		_ = json.Unmarshal(args, &a)
+		if a.Block {
+			return f.block(ctx)
+		}
+		return mcpstdio.Result{Text: text}, nil
+	}
 }
 
 // nextCall is the next block call to start.
@@ -294,11 +350,14 @@ func (h *hub) checkAnswers() {
 	}
 }
 
-// reply is one HTTP answer as the client read it.
+// reply is one HTTP answer as the client read it. close is whether the
+// server said it closes the connection: net/http takes "Connection: close"
+// out of the header and reports it here.
 type reply struct {
 	status int
 	header http.Header
 	body   []byte
+	close  bool
 }
 
 // rpcErr is the error of a JSON-RPC answer body, zero when there is none.
@@ -360,7 +419,7 @@ func (h *hub) do(method, sid, body string, hdr ...string) reply {
 	if err != nil {
 		h.t.Fatalf("%s: reading the answer: %v", method, err)
 	}
-	return reply{status: resp.StatusCode, header: resp.Header, body: b}
+	return reply{status: resp.StatusCode, header: resp.Header, body: b, close: resp.Close}
 }
 
 func (h *hub) post(sid, body string, hdr ...string) reply {
@@ -403,6 +462,13 @@ func cancelBody(id any) string {
 // the channel.
 func (h *hub) callAsync(sid string, id any, tool string, args any) <-chan reply {
 	ch := make(chan reply, 1)
+	h.callInto(ch, sid, id, tool, args)
+	return ch
+}
+
+// callInto sends a tools/call on its own goroutine; the reply arrives on
+// ch, which several calls may share.
+func (h *hub) callInto(ch chan<- reply, sid string, id any, tool string, args any) {
 	body := callBody(id, tool, args)
 	go func() {
 		req, _ := http.NewRequest(http.MethodPost, h.url, strings.NewReader(body))
@@ -419,7 +485,6 @@ func (h *hub) callAsync(sid string, id any, tool string, args any) <-chan reply 
 		b, _ := io.ReadAll(resp.Body)
 		ch <- reply{status: resp.StatusCode, header: resp.Header, body: b}
 	}()
-	return ch
 }
 
 func await(t *testing.T, ch <-chan reply, within time.Duration) reply {
@@ -446,6 +511,13 @@ func (h *hub) rawRequest(sid, body string) []byte {
 	return b.Bytes()
 }
 
+// rawHead is rawRequest's headers announcing a body of n bytes, without
+// the body.
+func (h *hub) rawHead(sid string, n int) []byte {
+	full := h.rawRequest(sid, strings.Repeat(" ", n))
+	return full[:len(full)-n]
+}
+
 // dial opens a raw connection to the hub, closed with the test.
 func (h *hub) dial() net.Conn {
 	h.t.Helper()
@@ -469,7 +541,7 @@ func readReply(t *testing.T, br *bufio.Reader) reply {
 	if err != nil {
 		t.Fatalf("reading an answer body: %v", err)
 	}
-	return reply{status: resp.StatusCode, header: resp.Header, body: b}
+	return reply{status: resp.StatusCode, header: resp.Header, body: b, close: resp.Close}
 }
 
 // eventually waits up to within for cond.

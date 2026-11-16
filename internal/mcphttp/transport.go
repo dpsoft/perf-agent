@@ -39,6 +39,14 @@ const (
 	defaultIngressBodyTimeout = 2 * time.Second
 	defaultWriteBound         = 10 * time.Second
 	defaultMaxAnswerBytes     = 4 << 20
+
+	defaultMaxIngressReaders    = 16
+	defaultMaxIngressBytes      = 8 << 20
+	defaultMaxControlInFlight   = 32
+	defaultMaxPageStateInFlight = 4
+	defaultMaxCalls             = 16
+	defaultMaxCallsPerSession   = 4
+	defaultMaxRequestBytes      = 16 << 20
 )
 
 // Options configures a Transport.
@@ -59,6 +67,28 @@ type Options struct {
 	// otherwise, as the stdio output queue replaces a long line. 0 means
 	// 4 MiB.
 	MaxAnswerBytes int64
+
+	// The ingress bounds the bodies being read, before any byte of one is
+	// read: MaxIngressReaders bodies at once (0 means 16), whose
+	// Content-Lengths sum to at most MaxIngressBytes (0 means 8 MiB). A
+	// request beyond either gets 503 unread and its connection closed.
+	MaxIngressReaders int
+	MaxIngressBytes   int64
+	// The admission classes bound the parsed messages in flight, each
+	// class apart, so a full one never delays another; see Class.
+	// MaxControlInFlight bounds the control messages (0 means 32), and
+	// MaxPageStateInFlight the page-state reads (0 means 4). MaxCalls
+	// bounds the calls server-wide, running or waiting in their handler
+	// (0 means 16), MaxCallsPerSession those of one session (0 means 4),
+	// and MaxRequestBytes the arguments the calls hold, as parsed, never
+	// the raw body (0 means 16 MiB). A message beyond a cap gets 503 at
+	// once, with Retry-After and a JSON-RPC error -32000 for its id naming
+	// the cap.
+	MaxControlInFlight   int
+	MaxPageStateInFlight int
+	MaxCalls             int
+	MaxCallsPerSession   int
+	MaxRequestBytes      int64
 	// Log receives diagnostics; nil discards them. It is called on the
 	// request's goroutine, so it must not block.
 	Log *slog.Logger
@@ -73,6 +103,10 @@ type Stats struct {
 	// ReservedBytes the sum of their Content-Length.
 	Readers       int
 	ReservedBytes int64
+	// Control, PageState and Calls are how many messages each admission
+	// class holds, and RequestBytes the arguments the calls hold.
+	Control, PageState, Calls int
+	RequestBytes              int64
 }
 
 // Transport is the MCP endpoint, an http.Handler for POST and DELETE.
@@ -92,8 +126,14 @@ type Transport struct {
 	sessions map[string]*session
 	tick     uint64
 	inflight int
+	// readers and reserved are the ingress: the bodies being read and the
+	// sum of their Content-Lengths.
 	readers  int
 	reserved int64
+	// control, pageState and calls count each admission class, and
+	// requestBytes the arguments the calls hold.
+	control, pageState, calls int
+	requestBytes              int64
 }
 
 // New is a Transport answering through h.
@@ -115,6 +155,27 @@ func New(h Handler, o Options) *Transport {
 	}
 	if o.MaxAnswerBytes <= 0 {
 		o.MaxAnswerBytes = defaultMaxAnswerBytes
+	}
+	if o.MaxIngressReaders <= 0 {
+		o.MaxIngressReaders = defaultMaxIngressReaders
+	}
+	if o.MaxIngressBytes <= 0 {
+		o.MaxIngressBytes = defaultMaxIngressBytes
+	}
+	if o.MaxControlInFlight <= 0 {
+		o.MaxControlInFlight = defaultMaxControlInFlight
+	}
+	if o.MaxPageStateInFlight <= 0 {
+		o.MaxPageStateInFlight = defaultMaxPageStateInFlight
+	}
+	if o.MaxCalls <= 0 {
+		o.MaxCalls = defaultMaxCalls
+	}
+	if o.MaxCallsPerSession <= 0 {
+		o.MaxCallsPerSession = defaultMaxCallsPerSession
+	}
+	if o.MaxRequestBytes <= 0 {
+		o.MaxRequestBytes = defaultMaxRequestBytes
 	}
 	log := o.Log
 	if log == nil {
@@ -142,7 +203,11 @@ func (t *Transport) Close() {
 func (t *Transport) Stats() Stats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return Stats{Sessions: len(t.sessions), InFlight: t.inflight, Readers: t.readers, ReservedBytes: t.reserved}
+	return Stats{
+		Sessions: len(t.sessions), InFlight: t.inflight,
+		Readers: t.readers, ReservedBytes: t.reserved,
+		Control: t.control, PageState: t.pageState, Calls: t.calls, RequestBytes: t.requestBytes,
+	}
 }
 
 // closing reports whether t takes no more requests. Called with t.mu held.
@@ -172,9 +237,24 @@ func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// post answers one JSON-RPC message.
+// post answers one JSON-RPC message. Its body is read only with a reader
+// and its Content-Length reserved, both given back once it is parsed;
+// then the message is admitted to its class (see Class) or refused.
 func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *http.Request) {
-	msg, err := t.readBody(w, rc, r)
+	if r.ContentLength > t.o.MaxMessageBytes {
+		t.refuseUnread(w, rc, http.StatusRequestEntityTooLarge, errorBody(nil, codeInvalidRequest,
+			fmt.Sprintf("message exceeds MaxMessageBytes (%d bytes)", t.o.MaxMessageBytes)))
+		return
+	}
+	done, busy := t.reserveIngress(r.ContentLength)
+	if busy != "" {
+		t.log.Debug("mcp request refused unread", "reason", busy)
+		w.Header().Set("Retry-After", "1")
+		t.refuseUnread(w, rc, http.StatusServiceUnavailable, errorBody(nil, codeServerBusy, busy))
+		return
+	}
+	req, bad, received, err := t.parseBody(w, rc, r)
+	done()
 	if err != nil {
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			w.Header().Set("Connection", "close")
@@ -186,8 +266,6 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 		t.write(w, rc, http.StatusBadRequest, errorBody(nil, codeParseError, "the request body could not be read"))
 		return
 	}
-	received := time.Now()
-	req, bad := t.h.Parse(msg)
 	if bad != nil {
 		t.write(w, rc, http.StatusBadRequest, bad)
 		return
@@ -197,8 +275,10 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 		return
 	}
 	var id json.RawMessage
+	class := ClassControl
 	if req != nil {
 		id = req.ID
+		class = classify(t.h, req)
 	}
 
 	t.mu.Lock()
@@ -216,17 +296,33 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 		return
 	}
 	if req.Notification() {
+		// A notification is answered under the lock, so it holds its place
+		// in the control class only for that long.
+		tk, busy := t.takeControl()
+		if busy != "" {
+			t.mu.Unlock()
+			t.refuseBusy(w, rc, nil, busy)
+			return
+		}
 		if req.Method == "notifications/cancelled" {
 			t.cancelNamed(s, req.Params)
 		}
+		t.release(tk)
 		t.mu.Unlock()
 		t.write(w, rc, http.StatusAccepted, nil)
+		return
+	}
+	tk, busy := t.take(class, s, int64(len(req.Params)))
+	if busy != "" {
+		t.mu.Unlock()
+		t.refuseBusy(w, rc, req.ID, busy)
 		return
 	}
 	key := compactID(req.ID)
 	ctx, cancel := context.WithCancel(t.life)
 	defer cancel()
 	if !t.register(s, key, cancel) {
+		t.release(tk)
 		t.mu.Unlock()
 		t.write(w, rc, http.StatusBadRequest, errorBody(req.ID, codeInvalidRequest, "a request with this id is in flight in this session"))
 		return
@@ -237,8 +333,17 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 
 	t.mu.Lock()
 	t.unregister(s, key)
+	t.release(tk)
 	t.mu.Unlock()
 	t.write(w, rc, http.StatusOK, t.bound(req, out))
+}
+
+// refuseBusy answers 503 with Retry-After and a JSON-RPC error for id
+// carrying text, for a message that was read.
+func (t *Transport) refuseBusy(w http.ResponseWriter, rc *http.ResponseController, id json.RawMessage, text string) {
+	t.log.Debug("mcp request refused", "reason", text)
+	w.Header().Set("Retry-After", "1")
+	t.write(w, rc, http.StatusServiceUnavailable, errorBody(id, codeServerBusy, text))
 }
 
 // find is the session of a request other than initialize, checked in
@@ -269,17 +374,26 @@ func (t *Transport) find(r *http.Request, id json.RawMessage) (*session, int, []
 // when initialize succeeded. An Mcp-Session-Id sent with it is ignored, so
 // a client whose session is gone starts again. The table makes room by
 // evicting the least recently used idle session; with every session busy
-// the answer is 503.
+// the answer is 503. It is a control message.
 func (t *Transport) initialize(w http.ResponseWriter, rc *http.ResponseController, req *mcpstdio.Request, received time.Time) {
+	t.mu.Lock()
+	tk, busy := t.takeControl()
+	t.mu.Unlock()
+	if busy != "" {
+		t.refuseBusy(w, rc, req.ID, busy)
+		return
+	}
 	ctx, cancel := context.WithCancel(t.life)
 	defer cancel()
 	s := &session{id: newSessionID(), proto: mcpstdio.NewSession(), calls: map[string]context.CancelFunc{}}
 	out := t.bound(req, t.h.Handle(mcpstdio.WithReceived(ctx, received), s.proto, req))
+	t.mu.Lock()
+	t.release(tk)
 	if !s.proto.Initialized() {
+		t.mu.Unlock()
 		t.write(w, rc, http.StatusOK, out)
 		return
 	}
-	t.mu.Lock()
 	if t.closing() {
 		t.mu.Unlock()
 		t.write(w, rc, http.StatusServiceUnavailable, errorBody(req.ID, codeServerBusy, closingText))
@@ -301,7 +415,8 @@ func (t *Transport) initialize(w http.ResponseWriter, rc *http.ResponseControlle
 }
 
 // delete ends a session: its calls are cancelled and it is forgotten. Jobs
-// it started are the server's and go on.
+// it started are the server's and go on. It is a control message, answered
+// under the lock.
 func (t *Transport) delete(w http.ResponseWriter, rc *http.ResponseController, r *http.Request) {
 	t.mu.Lock()
 	s, status, refusal := t.find(r, nil)
@@ -310,7 +425,14 @@ func (t *Transport) delete(w http.ResponseWriter, rc *http.ResponseController, r
 		t.write(w, rc, status, refusal)
 		return
 	}
+	tk, busy := t.takeControl()
+	if busy != "" {
+		t.mu.Unlock()
+		t.refuseBusy(w, rc, nil, busy)
+		return
+	}
 	t.remove(s)
+	t.release(tk)
 	t.mu.Unlock()
 	t.write(w, rc, http.StatusNoContent, nil)
 }

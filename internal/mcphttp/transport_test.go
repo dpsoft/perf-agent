@@ -296,7 +296,7 @@ func TestTheBodyDeadlineIsClearedBeforeTheWait(t *testing.T) {
 		if text, isErr := r.toolText(); r.status != http.StatusOK || isErr || text != "slept" {
 			t.Fatalf("request %d on one connection: %d %s", i, r.status, r.body)
 		}
-		if strings.EqualFold(r.header.Get("Connection"), "close") {
+		if r.close {
 			t.Fatalf("request %d: the server closes the connection", i)
 		}
 	}
@@ -553,7 +553,7 @@ func TestCloseCancelsEverything(t *testing.T) {
 // TestConcurrentCallsOnOneSession runs many calls of one session at once:
 // each gets its own answer, and the session's label never changes.
 func TestConcurrentCallsOnOneSession(t *testing.T) {
-	h := startHub(t, nil, nil)
+	h := startHub(t, func(o *Options) { o.MaxCalls, o.MaxCallsPerSession, o.MaxIngressReaders = 16, 16, 16 }, nil)
 	sid := h.initialize()
 	var wg sync.WaitGroup
 	for i := range 16 {
@@ -619,7 +619,9 @@ func TestNewAppliesTheDefaults(t *testing.T) {
 	tr := New(newFake(), Options{})
 	defer tr.Close()
 	want := Options{MaxSessions: 32, MaxMessageBytes: 4 << 20, IngressBodyTimeout: 2 * time.Second,
-		WriteBound: 10 * time.Second, MaxAnswerBytes: 4 << 20}
+		WriteBound: 10 * time.Second, MaxAnswerBytes: 4 << 20,
+		MaxIngressReaders: 16, MaxIngressBytes: 8 << 20, MaxControlInFlight: 32, MaxPageStateInFlight: 4,
+		MaxCalls: 16, MaxCallsPerSession: 4, MaxRequestBytes: 16 << 20}
 	got := tr.o
 	got.Lifetime, got.Log = nil, nil
 	if got != want {

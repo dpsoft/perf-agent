@@ -20,6 +20,16 @@
 // read under IngressBodyTimeout, the wait for the handler has none, and the
 // answer is written under WriteBound.
 //
+// Admission never waits. A body is read only with a reader and its
+// Content-Length reserved from the ingress bounds (MaxIngressReaders,
+// MaxIngressBytes); otherwise the answer is 503 unread, and a body that
+// does not arrive within IngressBodyTimeout loses its connection. Both are
+// given back once the body is parsed. The message then takes a place in
+// its class (control, page state or calls, see Class), each with its own
+// caps, so a full call class never delays a cancel; a full class answers
+// 503 at once, naming the cap. A call keeps its place until its handler
+// returns, even after its client went away.
+//
 // The Transport sits behind livehttp.Front and livehttp.MCPGuard, which
 // check the Host, refuse browsers, check the bearer token and the headers,
 // and bound the body before any of it is read. It opens no connection.

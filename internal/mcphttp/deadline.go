@@ -21,20 +21,9 @@ const refuseReadWindow = 100 * time.Millisecond
 // unread rest of the body before it reuses the connection, and a body that
 // stalled would hold that drain, the connection and its goroutine for as
 // long as the client waits. With the deadline the drain fails and the
-// connection is closed. While it reads, the request counts as a reader
-// holding its Content-Length.
+// connection is closed. The caller holds a reader and the body's bytes
+// (reserveIngress) while it reads.
 func (t *Transport) readBody(w http.ResponseWriter, rc *http.ResponseController, r *http.Request) ([]byte, error) {
-	reserved := max(r.ContentLength, 0)
-	t.mu.Lock()
-	t.readers++
-	t.reserved += reserved
-	t.mu.Unlock()
-	defer func() {
-		t.mu.Lock()
-		t.readers--
-		t.reserved -= reserved
-		t.mu.Unlock()
-	}()
 	_ = rc.SetReadDeadline(time.Now().Add(t.o.IngressBodyTimeout))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, t.o.MaxMessageBytes))
 	if err != nil {

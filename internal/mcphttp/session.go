@@ -14,10 +14,12 @@ type session struct {
 	id    string
 	proto *mcpstdio.Session
 	// used is the transport's tick at the session's last request, which
-	// orders eviction; calls holds the cancel of each call in flight, by
-	// its id as compact JSON. Both are guarded by Transport.mu.
-	used  uint64
-	calls map[string]context.CancelFunc
+	// orders eviction; calls holds the cancel of each request in flight,
+	// by its id as compact JSON; admitted counts those in the call class.
+	// All are guarded by Transport.mu.
+	used     uint64
+	calls    map[string]context.CancelFunc
+	admitted int
 }
 
 // newSessionID is 32 random bytes as unpadded base64url: 43 characters.

@@ -110,6 +110,7 @@ type jobEnv struct {
 	t        *testing.T
 	s        *Server
 	profiles string
+	fake     string
 	record   string
 	faults   *faultGates
 	mu       sync.Mutex
@@ -137,7 +138,7 @@ func newJobEnv(t *testing.T, o jobOpts) *jobEnv {
 		id, err := capture.IdentityOf(p)
 		return capture.Binary{Path: p, ID: id, Version: "v0.0.0-test", Caps: o.caps}, err
 	}}
-	env := &jobEnv{t: t, profiles: cfg.ProfilesDir, record: o.fake.Record, faults: newFaultGates()}
+	env := &jobEnv{t: t, profiles: cfg.ProfilesDir, fake: fake, record: o.fake.Record, faults: newFaultGates()}
 	beforeMaintenance = func(s *Server) {
 		s.captureFault = env.faults.fault
 		if o.setup != nil {
@@ -414,7 +415,8 @@ func attachClient(t *testing.T, s *Server) *testClient {
 }
 
 // commitSynthetic commits a capture of st in series with fixture files and
-// no process, as a job would, and returns its id.
+// no process, as a job would, and returns its id. Its profiles differ from
+// the fake perf-agent's, so a compare of the two has two handles per mode.
 func (e *jobEnv) commitSynthetic(series, label string, st capture.Settings, meta manifest) int {
 	e.t.Helper()
 	d, ce := e.s.openCaptureDir()
@@ -443,7 +445,10 @@ func (e *jobEnv) commitSynthetic(series, label string, st capture.Settings, meta
 		b := fileContent(out, label)
 		switch out {
 		case capture.OutputFile(capture.ModeCPU):
-			b = pmfixture.CPUBasic()
+			b = pmfixture.CPUBasicNew()
+		case capture.OutputFile(capture.ModeOffCPU):
+			b = pmfixture.Build("offcpu", "nanoseconds", nil,
+				pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("poll")}, Value: 2000})
 		case capture.OutputFile(capture.ModeGPU):
 			b = pmfixture.GPUBasic()
 		case capture.ExeclogFile:
@@ -1012,8 +1017,9 @@ func TestKillCapturesNeverBlocks(t *testing.T) {
 	})
 }
 
-// Start-up maintenance holding the engine in retention leaves the control
-// path answering; an engine tool answers once it is done.
+// Start-up maintenance blocked in retention leaves the control path
+// answering, and the engine too: retention snapshots what it must keep
+// under the engine and removes files without it.
 func TestMaintenanceKeepsControlResponsive(t *testing.T) {
 	first := newJobEnv(t, jobOpts{})
 	st := capture.Settings{Modes: cpuOnly, Duration: 400 * time.Millisecond, SampleRate: 99, Unwind: "auto"}
@@ -1049,27 +1055,22 @@ func TestMaintenanceKeepsControlResponsive(t *testing.T) {
 	if a := j.requestCancel(); a != cancelAnswerCancelling {
 		t.Errorf("cancel %q", a)
 	}
-	topDone := make(chan string, 1)
+	openDone := make(chan string, 1)
 	go func() {
 		text, _ := c.call("open", map[string]any{"path": "cpu.pb.gz"})
-		topDone <- text
+		openDone <- text
 	}()
 	select {
-	case <-topDone:
-		t.Fatal("an engine tool answered while retention held the engine")
-	case <-time.After(100 * time.Millisecond):
-	}
-	g.open()
-	select {
-	case text := <-topDone:
+	case text := <-openDone:
 		if !strings.Contains(text, `"handle"`) {
 			t.Errorf("open: %s", text)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("the engine tool never answered")
+		t.Fatal("an engine tool waited for retention's hashing")
 	}
+	g.open()
 	e.finish(j)
-	if slices.Contains(e.seriesNames("adhoc"), "001-one-cpu.pb.gz") {
+	if !eventuallyTrue(10*time.Second, func() bool { return !slices.Contains(e.seriesNames("adhoc"), "001-one-cpu.pb.gz") }) {
 		t.Error("maintenance did not evict the old capture")
 	}
 }

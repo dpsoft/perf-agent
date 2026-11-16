@@ -221,6 +221,11 @@ type captureTxn struct {
 	// link may or may not have been made.
 	pending *manifest
 	decide  *fileIdentity
+	// word is the job's decision word while the commit is undecided, so
+	// the settle reports a cancel that came meanwhile; settled is the
+	// failure the settle recorded when the link was not made.
+	word    *decisionWord
+	settled *capture.Error
 	// cancelNote is what to report about a cancel that met the commit.
 	cancelNote string
 	// notes say what the transaction left where it was, and why.
@@ -252,8 +257,12 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	}
 	start, err := s.startTime()
 	if err != nil || start == 0 {
+		why := "it reads as 0"
+		if err != nil {
+			why = causeText(err)
+		}
 		return nil, capture.Errorf(capture.CodeDisabled, "",
-			"cannot read this server's start time, which a capture's intent records so that recovery can tell its owner is alive: %v", err)
+			"cannot read this server's start time, which a capture's intent records so that recovery can tell its owner is alive: %s", why)
 	}
 	ser, err := d.series(series)
 	if err != nil {
@@ -475,7 +484,9 @@ func (t *captureTxn) stopHeartbeat() {
 func (s *Server) writeNewFile(root *os.Root, name string, b []byte, op string) (fileIdentity, error) {
 	f, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fileIdentity{}, fmt.Errorf("cannot create %s in %s: %w", name, root.Name(), pathless(err))
+		// The name is a temporary that carries the owner token: messages
+		// never show it, nor the directory's absolute path.
+		return fileIdentity{}, fmt.Errorf("cannot create a file for the %s: %w", op, pathless(err))
 	}
 	err = s.wErr(op)
 	if err == nil {
@@ -501,7 +512,7 @@ func (s *Server) writeNewFile(root *os.Root, name string, b []byte, op string) (
 		if !errors.Is(err, errCrash) && id.SHA256 != "" {
 			_, _, _ = removeByIdentity(root, name, id)
 		}
-		return fileIdentity{}, fmt.Errorf("cannot write %s in %s: %w", name, root.Name(), pathless(err))
+		return fileIdentity{}, fmt.Errorf("cannot write the %s: %w", op, pathless(err))
 	}
 	return id, nil
 }
@@ -522,7 +533,7 @@ func (t *captureTxn) writeTemp(final string, b []byte, op string) (fileIdentity,
 		}
 		return id, err
 	}
-	return fileIdentity{}, fmt.Errorf("cannot create a temporary for %s in %s: every name tried exists", final, t.ser.Name())
+	return fileIdentity{}, fmt.Errorf("cannot create a temporary for %s: every name tried exists", final)
 }
 
 // rewrite replaces the intent with t.in: through a temporary, renamed over
@@ -598,7 +609,7 @@ func (t *captureTxn) probe() error {
 	if lerr == nil {
 		return nil
 	}
-	where := fmt.Sprintf("the capture directory %s is inside the profiles root %s", t.d.rel, t.d.profiles)
+	where := fmt.Sprintf("the capture directory %s is inside the profiles root", t.d.rel)
 	// Not a switch on errno: ENOTSUP and EOPNOTSUPP are one value on Linux
 	// and two on darwin.
 	errno, _ := errors.AsType[syscall.Errno](lerr)
@@ -763,7 +774,8 @@ func (t *captureTxn) link() error {
 		}
 		if err := t.s.linkNoReplace(t.ser, rootCaptures, filepath.Join(t.in.Staging, f.Staged), f.Name); err != nil && landed(t.ser, f.Name, f) != linkMade {
 			if errors.Is(err, fs.ErrExist) {
-				return capture.Errorf(capture.CodeExists, "pass another label", "%v", err)
+				return capture.Errorf(capture.CodeExists, "pass another label",
+					"%s already exists in series %s and is never replaced", f.Name, t.series)
 			}
 			return err
 		}
@@ -796,7 +808,8 @@ func (t *captureTxn) manifestOf(m manifest, outcome string, e *wireError) manife
 // anything else a write failure.
 func (t *captureTxn) linkCause(err error) *capture.Error {
 	if errors.Is(err, fs.ErrExist) {
-		return capture.Errorf(capture.CodeExists, "pass another label", "%v", err)
+		return capture.Errorf(capture.CodeExists, "pass another label",
+			"%s already exists in series %s and is never replaced", manifestName(t.id, t.in.Label), t.series)
 	}
 	return t.cause(err)
 }
@@ -847,6 +860,7 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 				t.s.log.Warn("the manifest link answered an error but was made; the capture is committed", "manifest", name, "err", err)
 				err = nil
 			case linkUnknown:
+				t.word = d
 				return false, t.undecided(tmp, err)
 			}
 		}
@@ -902,11 +916,20 @@ func (t *captureTxn) settle() error {
 	case linkMade:
 		t.decide = nil
 		t.unstrand()
+		if t.word != nil {
+			t.cancelNote = t.word.settle(true)
+		}
 		return t.afterCommit()
 	}
 	t.decide = nil
 	t.unstrand()
 	cause := capture.Errorf(capture.CodeDisk, "", "the manifest link of capture %s/%s was not made", t.series, formatID(t.id))
+	// A cancel that came while the commit was undecided wins against a
+	// link that was not made (§7.4).
+	if t.word != nil && t.word.settle(false) == cancelAnswerCancelled {
+		cause = cancelledError()
+	}
+	t.settled = cause
 	if err := t.rollback(cause, manifest{}); err != nil && !errors.Is(err, errAlreadyCommitted) {
 		return err
 	}

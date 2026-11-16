@@ -332,6 +332,19 @@ func (r *registry) cancel(id string) (answer string, ok bool) {
 	if a := r.active.Load(); a != nil && (a.id == id || a.captureIDIs(id)) {
 		return a.requestCancel(), true
 	}
+	answer, pending, ok := r.finalOf(id)
+	if pending != nil {
+		// A commit nobody could read yet: the job records the cancel,
+		// outside r.mu, and the settle reports it.
+		return pending.requestCancel(), true
+	}
+	return answer, ok
+}
+
+// finalOf is what a cancel of the finished job or capture id is told, from
+// its entry or its alias; pending is the job when its commit is undecided,
+// which the cancel must reach.
+func (r *registry) finalOf(id string) (answer string, pending *job, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	el, ok := r.byJob[id]
@@ -339,22 +352,27 @@ func (r *registry) cancel(id string) (answer string, ok bool) {
 		el, ok = r.byCapture[id]
 	}
 	if ok && el.Value.(*registryEntry).j != nil {
-		return el.Value.(*registryEntry).answer, true
+		e := el.Value.(*registryEntry)
+		if e.answer == cancelAnswerPending {
+			return "", e.j, true
+		}
+		return e.answer, nil, true
 	}
 	if a, ok := r.aliases[id]; ok {
-		return a.answer, true
+		return a.answer, nil, true
 	}
-	return "", false
+	return "", nil, false
 }
 
-// finalAnswer is what a cancel of the ended job j is told, and its capture
-// id. A job calls finish only once it has ended; one that has not is
-// answered as ended, rather than left looking cancellable.
+// finalAnswer is what a cancel of the finished job j is told, and its
+// capture id. A job leaves the slot before it has ended only when its
+// commit is undecided: it may have committed, so the answer is that the
+// decision is pending until update records how it was settled.
 func finalAnswer(j *job) (answer, captureID string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.status.terminal() {
-		return cancelAnswerEnded, j.captureID
+		return cancelAnswerPending, j.captureID
 	}
 	return j.status.cancelAnswer(), j.captureID
 }

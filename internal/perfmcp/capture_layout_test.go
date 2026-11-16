@@ -217,10 +217,13 @@ func TestOwnerFileRefusesTheOtherKind(t *testing.T) {
 			if e == nil || e.Code != capture.CodeOwnerMismatch {
 				t.Fatalf("other kind: %v, want owner_mismatch", e)
 			}
-			for _, want := range []string{filepath.Join(profiles, "shared"), order[0]} {
+			for _, want := range []string{"shared inside the profiles root", order[0]} {
 				if !strings.Contains(e.Message, want) {
 					t.Errorf("message %q does not name %q", e.Message, want)
 				}
+			}
+			if strings.Contains(e.Message, profiles) {
+				t.Errorf("message %q names the profiles root's path", e.Message)
 			}
 			// The kind is cached: the next refusal needs no I/O.
 			if e := second.ownerMismatch(); e == nil || e.Code != capture.CodeOwnerMismatch {
@@ -292,10 +295,13 @@ func TestCaptureMessagesNameTheProfilesRoot(t *testing.T) {
 		t.Fatalf("code %s, want disk", e.Code)
 	}
 	text := e.Message + " " + e.Next
-	for _, want := range []string{s.profiles.Name(), "--captures"} {
+	for _, want := range []string{"inside the profiles root", "--captures"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("%q does not name %q", text, want)
 		}
+	}
+	if strings.Contains(text, s.profiles.Name()) {
+		t.Errorf("%q names the profiles root's path", text)
 	}
 	if strings.Contains(text, "--output") || strings.Contains(text, "output root") {
 		t.Errorf("%q mentions the output root", text)

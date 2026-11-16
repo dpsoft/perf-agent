@@ -15,6 +15,10 @@ const (
 	cancelAnswerCancelling = "cancelling"
 	cancelAnswerTooLate    = "too late: committed"
 	cancelAnswerCancelled  = "cancelled"
+	// cancelAnswerPending answers a cancel of a capture whose commit nobody
+	// could read yet: it may have committed, and the cancel is reported
+	// once that is settled.
+	cancelAnswerPending = "cancelling (decision pending)"
 )
 
 // decisionWord decides, once per job, whether a cancel or the commit wins

@@ -54,7 +54,7 @@ func (s *Server) startJob(req captureRequest) (*job, *capture.Error) {
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
 	if s.closed {
-		return nil, capture.Errorf(capture.CodeDisabled, "", "the server is shutting down")
+		return nil, capture.Errorf(capture.CodeClosing, "start a new perf-agent-mcp to capture", "this server is closing and starts no capture")
 	}
 	now := s.clock()
 	j := newJob(s.registry.newJobID(), now, reserve)
@@ -165,7 +165,11 @@ func (r *jobRun) capture() (jobStatus, *capture.Error) {
 	}
 
 	j.setState(jobPreparing, "retention")
-	if err := r.engineSection(); err != nil {
+	p, err := r.engineSection()
+	if err != nil {
+		return r.fail(err)
+	}
+	if err := r.retain(p); err != nil {
 		return r.fail(err)
 	}
 	if err := s.fault(faultAfterEngine); err != nil {
@@ -234,6 +238,7 @@ func (r *jobRun) capture() (jobStatus, *capture.Error) {
 	if s.killed.Load() {
 		run.Kill()
 	}
+	r.recordReaper(run)
 	j.setState(jobRunning, "")
 	o := r.relay(run)
 	r.o = &o
@@ -383,6 +388,8 @@ func (s *Server) resolveCwd(cwd string) (string, *capture.Error) {
 		}
 		return s.profiles.Name(), nil
 	}
+	// Messages repeat the agent's cwd, cut, and name the roots by kind:
+	// never an absolute path of the server's.
 	p := cwd
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(s.profiles.Name(), p)
@@ -404,7 +411,7 @@ func (s *Server) resolveCwd(cwd string) (string, *capture.Error) {
 	if _, err := s.rel(s.profiles, real); err == nil {
 		return real, nil
 	}
-	return "", capture.Errorf(capture.CodeInvalidArgument, next, "cwd %q is not inside a --source root or the profiles root %s", echo(cwd), s.profiles.Name())
+	return "", capture.Errorf(capture.CodeInvalidArgument, next, "cwd %q is not inside a --source root or the profiles root", echo(cwd))
 }
 
 // resolved is the server's own directory dir with its symbolic links
@@ -416,18 +423,51 @@ func (s *Server) resolved(dir string) string {
 	return dir
 }
 
+// recordReaper records the capture's reaper in its intent, so recovery
+// judges the capture's owner alive while the reaper runs, and in the lock
+// file, so a busy answer names it. Neither failure stops the capture: the
+// reaper holds the lock, so no recovery runs while it lives.
+func (r *jobRun) recordReaper(run *capture.Run) {
+	pid, start := run.Reaper()
+	if pid <= 0 || start == 0 {
+		return
+	}
+	if err := r.txn.setReaper(pid, start); err != nil {
+		r.s.log.Warn("cannot record the capture's reaper in its intent", "capture", r.j.captureIDNow(), "err", causeText(err))
+	}
+	r.holder.ReaperPID, r.holder.ReaperStart = pid, start
+	if err := r.lease.Update(r.holder); err != nil {
+		r.s.log.Debug("capture lock holder", "err", causeText(err))
+	}
+}
+
+// retain runs retention against p, without the engine. Its failure is
+// logged, and the space check decides whether the capture can go on.
+func (r *jobRun) retain(p protection) error {
+	evicted, err := r.s.retain(r.d, p, r.s.clock())
+	r.evicted = evicted
+	if errors.Is(err, errCrash) {
+		return err
+	}
+	if err != nil {
+		r.s.log.Warn("capture retention stopped; the space check decides", "err", causeText(err))
+	}
+	return nil
+}
+
 // engineSection is §7.4 step 3, holding the engine: the baseline is
 // resolved and checked, the effective settings are found and checked
 // against this server and charged to the windows, keep is checked, and
-// retention runs with the baseline pinned.
-func (r *jobRun) engineSection() error {
+// what retention must keep is read, the baseline pinned among it. The
+// engine is released before retention hashes and removes files.
+func (r *jobRun) engineSection() (protection, error) {
 	s, j := r.s, r.j
 	if err := s.engine.acquire(r.ctx); err != nil {
-		return cancelledError()
+		return protection{}, cancelledError()
 	}
 	defer s.engine.release()
 	if err := s.fault(faultInEngine); err != nil {
-		return err
+		return protection{}, err
 	}
 	var (
 		ms  []manifest
@@ -436,31 +476,31 @@ func (r *jobRun) engineSection() error {
 	)
 	if _, err := r.d.root.Lstat(r.series); err == nil {
 		if ser, err = r.d.openSeries(r.series); err != nil {
-			return err
+			return protection{}, err
 		}
 		defer func() { _ = ser.Close() }()
 		if ms, bad, err = seriesManifests(ser); err != nil {
-			return r.d.writeError(err)
+			return protection{}, r.d.writeError(err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return r.d.writeError(err)
+		return protection{}, r.d.writeError(err)
 	}
 	if j.req.CompareWith != "" {
 		base, err := r.baseline(ser, ms, bad)
 		if err != nil {
-			return err
+			return protection{}, err
 		}
 		r.base = base
 		r.m.CompareWith = base.ID
 	}
 	eff, err := r.effective()
 	if err != nil {
-		return err
+		return protection{}, err
 	}
 	r.eff = eff
 	j.set(func() { j.duration = eff.Duration })
 	if err := s.registry.reconcile(j, eff.Duration, s.clock()); err != nil {
-		return err
+		return protection{}, err
 	}
 	if j.req.Keep {
 		kept := 0
@@ -470,25 +510,17 @@ func (r *jobRun) engineSection() error {
 			}
 		}
 		if kept >= s.lim.Capture.MaxKeptPerSeries {
-			return capture.Errorf(capture.CodeInvalidArgument, "pass keep false, or start a new series",
+			return protection{}, capture.Errorf(capture.CodeInvalidArgument, "pass keep false, or start a new series",
 				"series %s already holds %d kept captures, Capture.MaxKeptPerSeries=%d; one more would let keep defeat retention",
 				r.series, kept, s.lim.Capture.MaxKeptPerSeries)
 		}
 	}
+	// The baseline is pinned: retention keeps it whatever its age.
 	baseline := ""
 	if r.base != nil {
 		baseline = captureKey(r.series, r.base.ID)
-		j.pins = append(j.pins, baseline)
 	}
-	evicted, err := s.retain(r.d, s.protected(r.d, baseline), s.clock())
-	r.evicted = evicted
-	if errors.Is(err, errCrash) {
-		return err
-	}
-	if err != nil {
-		s.log.Warn("capture retention stopped; the space check decides", "err", err)
-	}
-	return nil
+	return s.protected(r.d, baseline), nil
 }
 
 // lastOK is how many of a series' ok captures a refused baseline lists.
@@ -562,7 +594,9 @@ func (r *jobRun) effective() (capture.Settings, error) {
 	if r.base != nil {
 		bs, err := fromWire(r.base.Settings)
 		if err != nil {
-			return eff, capture.Errorf(capture.CodeUnknownBaseline, "", "the settings of baseline %s/%s cannot be read: %v", r.series, r.base.ID, err)
+			return eff, capture.Errorf(capture.CodeUnknownBaseline, "compare with another capture of the series, or start a new series",
+				"the settings baseline %s/%s records are not ones this server can read (duration %q, sample_rate %q)",
+				r.series, r.base.ID, echo(r.base.Settings.Duration), echo(r.base.Settings.SampleRate))
 		}
 		bw, rw := toWire(bs), toWire(req.Settings)
 		fields := []struct {
@@ -652,9 +686,10 @@ func (r *jobRun) spaceCheck() error {
 			"the capture directory %s holds %d bytes after retention, and this capture may write %d more, over Capture.MaxStoredBytes=%d%s",
 			r.d.rel, used, need, c.MaxStoredBytes, largestSeries(r.d))
 	}
-	free, err := capture.FreeBytes(r.d.root.Name())
+	free, err := r.freeBytes()
 	if err != nil {
-		return capture.Errorf(capture.CodeDisk, "", "cannot read the free space of the capture directory %s: %v", r.d.rel, err)
+		return capture.Errorf(capture.CodeDisk, "check that the capture directory's filesystem is mounted and readable, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+			"cannot read the free space of the capture directory %s: %s", r.d.rel, causeText(err))
 	}
 	if free < c.MinFreeBytes {
 		return capture.Errorf(capture.CodeDisk, "free space on that filesystem, or lower --limit Capture.MinFreeBytes",
@@ -662,6 +697,17 @@ func (r *jobRun) spaceCheck() error {
 			r.d.rel, free, c.MinFreeBytes, largestSeries(r.d))
 	}
 	return nil
+}
+
+// freeBytes is the free space of the capture directory's filesystem, read
+// through the directory the job holds open.
+func (r *jobRun) freeBytes() (int64, error) {
+	f, err := r.d.root.Open(".")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	return capture.FreeBytes(f)
 }
 
 // largestSeries names the series using most space, for a disk message.
@@ -858,7 +904,7 @@ func (r *jobRun) profiled() time.Duration {
 func (r *jobRun) end(status jobStatus, e *capture.Error) {
 	j := r.j
 	j.set(func() { j.status, j.phase, j.err = status, "", e })
-	r.s.log.Info("capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "err", e)
+	r.s.log.Info("capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
 	if err := r.s.registry.finish(j, 0, r.profiled()); err != nil {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)
 	}
@@ -878,7 +924,6 @@ func (r *jobRun) done() {
 		s.pins.release(j)
 		s.engine.release()
 	}
-	j.pins = nil
 	if r.o != nil && r.launch != nil {
 		res.Capture.WorkloadOutputTail = &outputTail{Stdout: r.o.Workload.Stdout, Stderr: r.o.Workload.Stderr, Untrusted: true}
 	}

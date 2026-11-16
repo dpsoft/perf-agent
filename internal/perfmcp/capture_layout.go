@@ -88,23 +88,21 @@ func (s *Server) openCaptureDir() (*captureDir, *capture.Error) {
 	}
 	dir := s.captureDirName()
 	profiles := s.profiles.Name()
-	next := "start perf-agent-mcp with --captures naming a directory inside the profiles root " + profiles
+	const next = "start perf-agent-mcp with --captures naming a directory inside the profiles root"
 	rel, err := s.rel(s.profiles, dir)
 	if err == nil {
 		rel = filepath.Clean(rel)
-		if !filepath.IsLocal(rel) || rel == "." {
-			err = fmt.Errorf("the capture directory %s is not a directory inside the profiles root %s", dir, profiles)
-		}
 	}
-	if err != nil {
-		return nil, capture.Errorf(capture.CodeDisabled, next, "%v", err)
+	if err != nil || !filepath.IsLocal(rel) || rel == "." {
+		// The configured name is not repeated: it may be an absolute path.
+		return nil, capture.Errorf(capture.CodeDisabled, next, "the capture directory (--captures) is not a directory inside the profiles root")
 	}
 	if err := s.profiles.MkdirAll(rel, 0o700); err != nil {
-		return nil, capture.Errorf(capture.CodeDisk, next, "cannot create the capture directory %s inside the profiles root %s: %v", rel, profiles, pathless(err))
+		return nil, capture.Errorf(capture.CodeDisk, next, "cannot create the capture directory %s inside the profiles root: %s", rel, causeText(err))
 	}
 	root, err := s.profiles.OpenRoot(rel)
 	if err != nil {
-		return nil, capture.Errorf(capture.CodeDisk, next, "cannot open the capture directory %s inside the profiles root %s: %v", rel, profiles, pathless(err))
+		return nil, capture.Errorf(capture.CodeDisk, next, "cannot open the capture directory %s inside the profiles root: %s", rel, causeText(err))
 	}
 	d := &captureDir{root: root, rel: rel, owner: kind, profiles: profiles}
 	if e := s.claimOwner(d); e != nil {
@@ -126,7 +124,6 @@ func (s *Server) claimOwner(d *captureDir) *capture.Error {
 	case !errors.Is(err, fs.ErrExist):
 		return d.writeError(err)
 	}
-	abs := d.root.Name()
 	b, _, err = readSmall(d.root, ownerFile, maxSmallFile)
 	var rec ownerRecord
 	if err == nil {
@@ -134,7 +131,7 @@ func (s *Server) claimOwner(d *captureDir) *capture.Error {
 	}
 	if err != nil || rec.Format != 1 || (rec.Kind != ownerStdio && rec.Kind != ownerServe) {
 		return capture.Errorf(capture.CodeOwnerMismatch, "give this server its own directory with --captures",
-			"the capture directory %s has an %s that perf-agent-mcp did not write", abs, ownerFile)
+			"the capture directory %s inside the profiles root has an %s that perf-agent-mcp did not write", d.rel, ownerFile)
 	}
 	s.ownerSeen.Store(&rec.Kind)
 	return s.ownerMismatch()
@@ -148,13 +145,9 @@ func (s *Server) ownerMismatch() *capture.Error {
 	if seen == nil || *seen == s.ownerKind() {
 		return nil
 	}
-	dir := s.captureDirName()
-	if s.profiles != nil && !filepath.IsAbs(dir) {
-		dir = filepath.Join(s.profiles.Name(), dir)
-	}
 	return capture.Errorf(capture.CodeOwnerMismatch,
 		"a stdio server and a serve server never share a capture directory; start this one with --captures naming another directory",
-		"the capture directory %s belongs to a perf-agent-mcp %s server, and this one is %s", dir, *seen, s.ownerKind())
+		"the capture directory %s inside the profiles root belongs to a perf-agent-mcp %s server, and this one is %s", s.capturesRel(), *seen, s.ownerKind())
 }
 
 // series opens the series directory name, creating it (mode 0700) when it
@@ -177,7 +170,7 @@ func (d *captureDir) openSeries(name string) (*os.Root, error) {
 		return nil, d.writeError(err)
 	}
 	if !fi.IsDir() {
-		return nil, fmt.Errorf("series %s in the capture directory %s is %s, not a directory", name, d.root.Name(), describeType(fi.Mode()))
+		return nil, fmt.Errorf("series %s in the capture directory %s is %s, not a directory", name, d.rel, describeType(fi.Mode()))
 	}
 	r, err := d.root.OpenRoot(name)
 	if err != nil {
@@ -185,7 +178,7 @@ func (d *captureDir) openSeries(name string) (*os.Root, error) {
 	}
 	if got, err := r.Stat("."); err != nil || !os.SameFile(fi, got) {
 		_ = r.Close()
-		return nil, fmt.Errorf("series %s in the capture directory %s changed while it was opened", name, d.root.Name())
+		return nil, fmt.Errorf("series %s in the capture directory %s changed while it was opened", name, d.rel)
 	}
 	return r, nil
 }
@@ -195,7 +188,18 @@ func (d *captureDir) openSeries(name string) (*os.Root, error) {
 func (d *captureDir) writeError(err error) *capture.Error {
 	return capture.Errorf(capture.CodeDisk,
 		"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
-		"cannot write in the capture directory %s inside the profiles root %s: %v", d.rel, d.profiles, pathless(err))
+		"cannot write in the capture directory %s inside the profiles root: %s", d.rel, causeText(err))
+}
+
+// causeText is err as a message may show it: its errno, named, when it has
+// one, and otherwise its own text, never a path a PathError or LinkError
+// carries. The capture protocol's own errors keep temporaries and absolute
+// paths out of their text.
+func causeText(err error) string {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+		return errnoText(errno)
+	}
+	return pathless(err).Error()
 }
 
 // cause is err as a capture failure: a capture.Error as it is, anything

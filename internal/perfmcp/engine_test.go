@@ -290,9 +290,9 @@ func TestPublishNewNamesItsRoot(t *testing.T) {
 		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EPERM}
 	}
 	_, err = s.publishNew(s.profiles, rootProfiles, ".", "intent", []byte("x"), 0o600)
-	if err == nil || !strings.Contains(err.Error(), "under the profiles root "+dir) ||
+	if err == nil || !strings.Contains(err.Error(), "under the profiles root") || strings.Contains(err.Error(), dir) ||
 		!strings.Contains(err.Error(), "--captures") || strings.Contains(err.Error(), "--output") {
-		t.Errorf("a refused hard link: %v, want it to name the profiles root and --captures", err)
+		t.Errorf("a refused hard link: %v, want it to name the profiles root by its kind and --captures", err)
 	}
 	noTemps()
 	s.link = (*os.Root).Link

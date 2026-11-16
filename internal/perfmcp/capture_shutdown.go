@@ -8,8 +8,13 @@ import (
 )
 
 // strandedEvery is how often maintenance retries this server's stranded
-// rollbacks and settles its undecided commits.
-const strandedEvery = 30 * time.Second
+// rollbacks and settles its undecided commits; maintenanceHold is the end a
+// maintenance pass records in the lock file, which a busy answer's
+// retry_after is counted from.
+const (
+	strandedEvery   = 30 * time.Second
+	maintenanceHold = 5 * time.Second
+)
 
 // beforeMaintenance, when set, runs on a new server before its maintenance
 // starts; a seam for tests, which arm their fault seams there.
@@ -123,7 +128,7 @@ func (s *Server) maintenance(full bool) {
 	}
 	defer d.close()
 	start, _ := s.startTime()
-	lease, e := capture.TryLock(d.root, capture.Holder{ServerPID: os.Getpid(), ServerStart: start, Deadline: s.clock().Add(time.Minute)})
+	lease, e := capture.TryLock(d.root, capture.Holder{ServerPID: os.Getpid(), ServerStart: start, Deadline: s.clock().Add(maintenanceHold)})
 	if e != nil {
 		s.log.Info("capture maintenance skipped", "why", e)
 		return
@@ -134,14 +139,17 @@ func (s *Server) maintenance(full bool) {
 		return
 	}
 	if notes, err := s.recoverCaptures(d); err != nil {
-		s.log.Warn("capture recovery stopped", "err", err, "notes", len(notes))
+		s.log.Warn("capture recovery stopped", "err", causeText(err), "notes", len(notes))
 	}
+	// What retention keeps is read under the engine; the hashing and the
+	// removals run without it.
 	if err := s.engine.acquire(s.ctx); err != nil {
 		return
 	}
-	defer s.engine.release()
-	if evicted, err := s.retain(d, s.protected(d, ""), s.clock()); err != nil {
-		s.log.Warn("capture retention", "err", err, "evicted", len(evicted))
+	p := s.protected(d, "")
+	s.engine.release()
+	if evicted, err := s.retain(d, p, s.clock()); err != nil {
+		s.log.Warn("capture retention", "err", causeText(err), "evicted", len(evicted))
 	}
 }
 

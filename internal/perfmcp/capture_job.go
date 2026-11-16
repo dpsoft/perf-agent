@@ -105,14 +105,12 @@ type job struct {
 	// count from (created is on the server's clock, which tests move).
 	began time.Time
 
-	// pins are what the job pins, on its own goroutine: its baseline
-	// against retention, and the handles it holds in the pin ledger while
-	// it derives (the job is their holder there).
-	pins []any
-	// txn is the file transaction of a capture whose commit is undecided.
-	// The job sets it before it registers the job as undecided (under the
-	// server's capMu), and the pass that settles it reads it after.
-	txn *captureTxn
+	// txn is the file transaction of a capture whose commit is undecided,
+	// and base its baseline, for the recipe once it is settled. The job sets
+	// them before it registers the job as undecided (under the server's
+	// capMu), and the pass that settles it reads them after.
+	txn  *captureTxn
+	base *manifest
 
 	// d decides whether a cancel or the commit wins (§7.4).
 	d decisionWord
@@ -253,7 +251,9 @@ func (j *job) wait(ctx context.Context, d time.Duration) jobView {
 // on the control path (the reader goroutine): one CAS on the decision word
 // and one channel close, no I/O, never a wait. A job that has already
 // ended is answered from its final state and its word is left as it is,
-// since a failed manifest link leaves the word open.
+// since a failed manifest link leaves the word open. A job whose commit is
+// undecided records the cancel, which the settle reports, and answers that
+// the decision is pending.
 func (j *job) requestCancel() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -261,6 +261,9 @@ func (j *job) requestCancel() string {
 		return a
 	}
 	a := j.d.requestCancel()
+	if j.phase == phaseUndecided {
+		return cancelAnswerPending
+	}
 	if a == cancelAnswerCancelling {
 		j.cancelOnce.Do(func() { close(j.cancel) })
 	}

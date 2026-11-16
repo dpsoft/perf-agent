@@ -323,19 +323,22 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 // maintenance pass: a handler may still run after Serve returned. The
 // page's streams end first and its other responses get liveShutdown before
 // their connections are dropped, so a tab that stopped reading delays Close
-// by at most that. A second Close does nothing more.
+// by at most that. A second Close does nothing and returns nil.
 func (s *Server) Close() error {
 	signalled := s.killed.Load()
 	s.jobsMu.Lock()
 	again := s.closed
 	s.closed = true
 	s.jobsMu.Unlock()
+	if again {
+		return nil
+	}
 	if s.stop != nil {
 		s.stop()
 	}
 	s.cancelAllJobs()
 	s.KillCaptures()
-	if !signalled && !again {
+	if !signalled {
 		s.waitJobs(s.lim.Capture.StopGrace + time.Second)
 	}
 	if s.lookups != nil {

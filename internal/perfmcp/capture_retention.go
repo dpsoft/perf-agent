@@ -304,8 +304,8 @@ type retention struct {
 // captures it evicted, "<series>/<NNN>-<label>", each logged.
 func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []string, err error) {
 	if p.err != nil {
-		return nil, capture.Errorf(capture.CodeDisk, "", "retention removed nothing in the capture directory %s inside the profiles root %s: it could not read what it must keep: %v",
-			d.rel, d.profiles, pathless(p.err))
+		return nil, capture.Errorf(capture.CodeDisk, "", "retention removed nothing in the capture directory %s inside the profiles root: it could not read what it must keep: %s",
+			d.rel, causeText(p.err))
 	}
 	r := &retention{s: s, d: d, p: p, names: map[string][]string{}}
 	defer r.close()
@@ -658,7 +658,7 @@ func (r *retention) fail(err error) error {
 	}
 	return capture.Errorf(capture.CodeDisk,
 		"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
-		"retention stopped in the capture directory %s inside the profiles root %s: %v; the next pass goes on from there", r.d.rel, r.d.profiles, pathless(err))
+		"retention stopped in the capture directory %s inside the profiles root: %s; the next pass goes on from there", r.d.rel, causeText(err))
 }
 
 // isProtected reports whether p keeps h (a kept capture among them).

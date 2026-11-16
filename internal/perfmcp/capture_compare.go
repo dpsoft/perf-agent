@@ -164,31 +164,42 @@ func (s *Server) captureInfo(m manifest) captureInfo {
 
 // derive makes the committed capture m's results under the engine: each
 // profile opened with the existing open code (with its executions log for
-// gpu), and with a baseline, each view diffed with the existing diff code.
-// The profiles stay pinned to j until the job lets go of them. A failure
-// (a profile over the model limits, say) is reported as derived "failed"
-// and never touches the files.
+// gpu) and, with a baseline, diffed at once with the baseline's profile of
+// its mode by the existing diff code, so a compare needs only two open
+// handles whatever its modes. What it opens stays pinned to j until the
+// job lets go of it. A failure (a profile over the model limits, say) is
+// reported as derived "failed" and never touches the files.
 func (s *Server) derive(j *job, m manifest, base *manifest) captureResult {
 	res := captureResult{Capture: s.captureInfo(m), Notes: slices.Clone(m.Notes)}
+	if base != nil {
+		res.Compare = &compareResult{
+			Base:          compareSide{ID: base.ID, Label: base.Label},
+			New:           compareSide{ID: m.ID, Label: m.Label},
+			Comparability: comparability(m, *base),
+			Views:         []compareView{},
+		}
+	}
 	var failures []string
-	opened, errs := s.openAll(j, m)
 	for _, mode := range modesOf(m) {
 		path, execlog := s.profilePaths(m, mode)
-		pr := profileResult{Mode: string(mode), Path: path, Execlog: execlog, Open: opened[mode]}
-		if err := errs[mode]; err != nil {
+		pr := profileResult{Mode: string(mode), Path: path, Execlog: execlog}
+		o, err := s.openPinned(j, path, execlog)
+		if err != nil {
 			pr.OpenError = err.Error()
 			failures = append(failures, err.Error())
-		} else if mode == capture.ModeGPU && s.viewTotal(pr.Open) == 0 {
+			res.Profiles = append(res.Profiles, pr)
+			continue
+		}
+		pr.Open = o
+		if mode == capture.ModeGPU && s.viewTotal(o) == 0 {
 			res.Notes = append(res.Notes, gpuNote())
 		}
 		res.Profiles = append(res.Profiles, pr)
-	}
-	if base != nil && len(failures) == 0 {
-		cr, err := s.compareWith(j, m, *base, opened)
-		if err != nil {
-			failures = append(failures, err.Error())
+		if base != nil && len(failures) == 0 {
+			if err := s.compareMode(j, res.Compare, *base, mode, o); err != nil {
+				failures = append(failures, err.Error())
+			}
 		}
-		res.Compare = cr
 	}
 	if len(failures) > 0 {
 		res.Derived, res.DeriveError = derivedFailed, strings.Join(failures, "; ")
@@ -206,31 +217,24 @@ func (s *Server) underived(m manifest, base *manifest, why string) captureResult
 	}
 }
 
-// openAll opens each of m's profiles and pins what it loaded to j.
-func (s *Server) openAll(j *job, m manifest) (map[capture.Mode]*openResult, map[capture.Mode]error) {
-	opened, errs := map[capture.Mode]*openResult{}, map[capture.Mode]error{}
-	for _, mode := range modesOf(m) {
-		path, execlog := s.profilePaths(m, mode)
-		if err := s.fault(faultBeforeOpen); err != nil {
-			errs[mode] = fmt.Errorf("open %s: %w", path, err)
-			continue
-		}
-		o, err := s.openResultFor(path, execlog)
-		if err != nil {
-			errs[mode] = err
-			continue
-		}
-		opened[mode] = &o
-		if e, ok := s.store.entries[o.Handle]; ok {
-			objs := []retained{e.prof}
-			if v, ok := e.views[o.DefaultView]; ok {
-				objs = append(objs, v)
-			}
-			s.pins.hold(j, objs...)
-			j.pins = append(j.pins, o.Handle)
-		}
+// openPinned opens a capture's profile as open does and pins what it
+// loaded to j (j is their holder in the pin ledger).
+func (s *Server) openPinned(j *job, path, execlog string) (*openResult, error) {
+	if err := s.fault(faultBeforeOpen); err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	return opened, errs
+	o, err := s.openResultFor(path, execlog)
+	if err != nil {
+		return nil, err
+	}
+	if e, ok := s.store.entries[o.Handle]; ok {
+		objs := []retained{e.prof}
+		if v, ok := e.views[o.DefaultView]; ok {
+			objs = append(objs, v)
+		}
+		s.pins.hold(j, objs...)
+	}
+	return &o, nil
 }
 
 // viewTotal is the total of o's default view, -1 when it cannot be read.
@@ -254,46 +258,35 @@ func gpuNote() string {
 	return gpuEmptyNote
 }
 
-// compareWith opens the baseline's profiles and diffs each of m's default
-// views with the baseline's view of that name, cut to CompareRows rows.
-func (s *Server) compareWith(j *job, m, base manifest, opened map[capture.Mode]*openResult) (*compareResult, error) {
-	cr := &compareResult{
-		Base:          compareSide{ID: base.ID, Label: base.Label},
-		New:           compareSide{ID: m.ID, Label: m.Label},
-		Comparability: comparability(m, base),
-		Views:         []compareView{},
+// compareMode opens the baseline's profile of mode and diffs no's default
+// view with the baseline's view of that name, cut to CompareRows rows,
+// into cr.
+func (s *Server) compareMode(j *job, cr *compareResult, base manifest, mode capture.Mode, no *openResult) error {
+	path, execlog := s.profilePaths(base, mode)
+	bo, err := s.openPinned(j, path, execlog)
+	if err != nil {
+		return fmt.Errorf("baseline %s: %w", base.ID, err)
 	}
-	baseOpened, errs := s.openAll(j, base)
-	for _, mode := range modesOf(m) {
-		if err := errs[mode]; err != nil {
-			return cr, fmt.Errorf("baseline %s: %w", base.ID, err)
-		}
-		bo, no := baseOpened[mode], opened[mode]
-		if bo == nil || no == nil {
-			cr.Notes = append(cr.Notes, fmt.Sprintf("the baseline has no %s profile to compare with", mode))
-			continue
-		}
-		if cr.Base.Handle == "" {
-			cr.Base.Handle, cr.New.Handle = bo.Handle, no.Handle
-		}
-		view := no.DefaultView
-		if !slices.ContainsFunc(bo.Views, func(v viewInfo) bool { return v.View == view }) {
-			cr.Notes = append(cr.Notes, fmt.Sprintf("the baseline's %s profile has no view %s to compare with", mode, view))
-			continue
-		}
-		if err := s.fault(faultBeforeDiff); err != nil {
-			return cr, fmt.Errorf("diff %s: %w", view, err)
-		}
-		q := diffQuery{BaseHandle: bo.Handle, BaseView: view, NewHandle: no.Handle, NewView: view}
-		dr, err := s.diffPage(q, s.lim.Capture.CompareRows, "")
-		if err != nil {
-			return cr, fmt.Errorf("diff %s: %w", view, err)
-		}
-		cr.Views = append(cr.Views, compareView{diffResult: dr, Next: toolCall{Tool: "diff", Arguments: map[string]any{
-			"base_handle": string(bo.Handle), "base_view": view, "new_handle": string(no.Handle), "new_view": view,
-		}}})
+	if cr.Base.Handle == "" {
+		cr.Base.Handle, cr.New.Handle = bo.Handle, no.Handle
 	}
-	return cr, nil
+	view := no.DefaultView
+	if !slices.ContainsFunc(bo.Views, func(v viewInfo) bool { return v.View == view }) {
+		cr.Notes = append(cr.Notes, fmt.Sprintf("the baseline's %s profile has no view %s to compare with", mode, view))
+		return nil
+	}
+	if err := s.fault(faultBeforeDiff); err != nil {
+		return fmt.Errorf("diff %s: %w", view, err)
+	}
+	q := diffQuery{BaseHandle: bo.Handle, BaseView: view, NewHandle: no.Handle, NewView: view}
+	dr, err := s.diffPage(q, s.lim.Capture.CompareRows, "")
+	if err != nil {
+		return fmt.Errorf("diff %s: %w", view, err)
+	}
+	cr.Views = append(cr.Views, compareView{diffResult: dr, Next: toolCall{Tool: "diff", Arguments: map[string]any{
+		"base_handle": string(bo.Handle), "base_view": view, "new_handle": string(no.Handle), "new_view": view,
+	}}})
+	return nil
 }
 
 // comparability reports what may differ between a capture and its

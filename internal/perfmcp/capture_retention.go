@@ -268,10 +268,12 @@ type retention struct {
 	p protection
 	// all are the captures in series and id order; names each series'
 	// entries as the pass found them.
-	all     []*held
-	names   map[string][]string
-	roots   []*os.Root
-	evicted []string
+	all   []*held
+	names map[string][]string
+	roots []*os.Root
+	// evicted names each capture removed, "<series>/<NNN>-<label>", and
+	// keys is its captureKey.
+	evicted, keys []string
 }
 
 // retain removes committed captures from the capture directory as §7.3
@@ -309,7 +311,7 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 	}
 	r := &retention{s: s, d: d, p: p, names: map[string][]string{}}
 	defer r.close()
-	defer func() { s.forgetEvicted(evicted) }()
+	defer func() { s.forgetEvicted(r.keys) }()
 	if err := r.load(); err != nil {
 		return nil, r.fail(err)
 	}
@@ -320,14 +322,13 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 }
 
 // forgetEvicted drops what the registry holds of each capture retention
-// removed (evicted names "series/NNN-label"), so no wait answers one as
-// done from memory, and marks the history changed.
-func (s *Server) forgetEvicted(evicted []string) {
-	if len(evicted) == 0 {
+// removed (keys are captureKey's), so no wait answers one as done from
+// memory, and marks the history changed.
+func (s *Server) forgetEvicted(keys []string) {
+	if len(keys) == 0 {
 		return
 	}
-	for _, name := range evicted {
-		key, _, _ := strings.Cut(name, "-")
+	for _, key := range keys {
 		if s.registry != nil {
 			s.registry.forget(key)
 		}
@@ -758,6 +759,7 @@ func (r *retention) evict(h *held, why string) error {
 	}
 	h.gone = true
 	r.evicted = append(r.evicted, h.name())
+	r.keys = append(r.keys, h.key())
 	s.log.Info("capture evicted", "capture", h.name(), "why", why)
 	if !h.marked && !h.viaMarker {
 		return nil

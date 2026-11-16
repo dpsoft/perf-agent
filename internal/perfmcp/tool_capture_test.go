@@ -1123,24 +1123,29 @@ func TestAnInterruptedCaptureIsRetryable(t *testing.T) {
 // Once retention removes a capture, no answer kept in memory says it is
 // done: a wait reads the disk and finds it gone.
 func TestRetentionForgetsWhatItRemoved(t *testing.T) {
-	e := newJobEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.KeepPerSeries = 1 }})
-	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
-	e.commitSynthetic("s", "a", st, manifest{})
-	e.commitSynthetic("s", "b", st, manifest{})
-	c := e.serve()
-	if r, _ := waitResult(t, c, "s/001"); r.Derived != derivedRecompute {
-		t.Fatalf("first answer %+v", r)
-	}
-	text, _ := waitEnd(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"}))
-	if !isResult(t, text) {
-		t.Fatalf("the capture: %s", text)
-	}
-	if _, ok := e.manifestOf("s", "001"); ok {
-		t.Fatal("retention kept 001")
-	}
-	text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "5s"})
-	if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
-		t.Errorf("a removed capture answered %s", text)
+	// A series name may hold '-', as the capture's own name does.
+	for _, series := range []string{"s", "parse-opt"} {
+		t.Run(series, func(t *testing.T) {
+			e := newJobEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.KeepPerSeries = 1 }})
+			st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+			e.commitSynthetic(series, "a", st, manifest{})
+			e.commitSynthetic(series, "b", st, manifest{})
+			c := e.serve()
+			if r, _ := waitResult(t, c, series+"/001"); r.Derived != derivedRecompute {
+				t.Fatalf("first answer %+v", r)
+			}
+			text, _ := waitEnd(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": series, "duration": "1s"}))
+			if !isResult(t, text) {
+				t.Fatalf("the capture: %s", text)
+			}
+			if _, ok := e.manifestOf(series, "001"); ok {
+				t.Fatal("retention kept 001")
+			}
+			text, isErr := c.call("capture_wait", map[string]any{"id": series + "/001", "timeout": "5s"})
+			if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+				t.Errorf("a removed capture answered %s", text)
+			}
+		})
 	}
 }
 

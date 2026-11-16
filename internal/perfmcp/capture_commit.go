@@ -966,18 +966,33 @@ func (t *captureTxn) removeStagingDir(dir string) error {
 			return err
 		}
 	}
+	// A failure to remove the emptied directory is returned once it is back
+	// under its name, so the intent that records it stays for the next
+	// recovery; one that is not empty any more, or not the staging
+	// directory, is left and noted.
+	var rmErr error
 	if fi, err := t.ser.Lstat(q); err == nil && isStaging(fi) {
-		if err := t.ser.Remove(q); err == nil {
+		rmErr = t.s.wErr("remove staging")
+		if rmErr == nil {
+			rmErr = t.ser.Remove(q)
+		}
+		if rmErr == nil {
 			return nil
 		}
-		t.note("left", dir, "the staging directory is not empty any more")
+		if errors.Is(rmErr, errCrash) {
+			return rmErr
+		}
+		if errors.Is(rmErr, syscall.ENOTEMPTY) || errors.Is(rmErr, syscall.EEXIST) {
+			t.note("left", dir, "the staging directory is not empty any more")
+			rmErr = nil
+		}
 	} else {
 		t.note("left", dir, "not the staging directory this capture created")
 	}
 	if why := restore(t.ser, q, dir); why != "" {
 		t.note("left", q, "moved aside from "+dir+why)
 	}
-	return nil
+	return rmErr
 }
 
 // openStagingHook, when set, runs between the staging directory's Lstat

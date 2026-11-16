@@ -208,3 +208,26 @@ func TestBeginFailsClosedWithoutAStartTime(t *testing.T) {
 	}
 	invariant(t, d, recoverNow(t, s, d))
 }
+
+// TestAStagingDirectoryThatWouldNotGoKeepsItsIntent: when removing the
+// emptied staging directory fails, the cleanup stops with the intent in
+// place, and the next recovery removes the directory.
+func TestAStagingDirectoryThatWouldNotGoKeepsItsIntent(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EIO, syscall.ENOSPC} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			s, d, _ := newCaptureServer(t)
+			s.writeErr = failOpAt("remove staging", 1, errno)
+			r := drive(t, s, d, capCase{})
+			s.writeErr = nil
+			if !r.committed || r.err == nil {
+				t.Fatalf("committed %v, err %v", r.committed, r.err)
+			}
+			if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", intentName(1, "run"))); err != nil {
+				t.Fatalf("the intent went although staging stayed: %v", err)
+			}
+			notes := recoverNow(t, s, d)
+			noOrphans(t, notes)
+			invariant(t, d, notes)
+		})
+	}
+}

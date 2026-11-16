@@ -283,3 +283,28 @@ func TestTokenNamedTemporariesAreProvenByWhatTheyHold(t *testing.T) {
 	noOrphans(t, notes)
 	invariant(t, d2, notes)
 }
+
+// TestAFailedUnlinkPutsTheFileBack: a removal that fails after moving the
+// file aside puts it back under its own name, where the retry finds it.
+func TestAFailedUnlinkPutsTheFileBack(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeFile(t, root, "f", "ours")
+	want := recordedIdentity(t, root, "f")
+	quarantineAfterHook = func() error { return syscall.EIO }
+	removed, _, err := removeByIdentity(root, "f", want)
+	quarantineAfterHook = nil
+	if removed || err == nil {
+		t.Fatalf("removed %v, err %v", removed, err)
+	}
+	if names := dirNames(t, root, "."); len(names) != 1 || names[0] != "f" {
+		t.Fatalf("after a failed removal: %v", names)
+	}
+	if removed, _, err := removeByIdentity(root, "f", want); !removed || err != nil {
+		t.Fatalf("the retry: %v %v", removed, err)
+	}
+}

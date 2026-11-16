@@ -395,15 +395,27 @@ func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (re
 		}
 		return false, "", err
 	}
+	// A failure from here on puts the file back under its name, where a
+	// retry finds it; a crash leaves it under the quarantine name, which
+	// recovery proves by the tag.
+	fail := func(err error) (bool, string, error) {
+		if errors.Is(err, errCrash) {
+			return false, "", err
+		}
+		if why := restore(root, q, name); why != "" {
+			return false, "", fmt.Errorf("%w%s", err, why)
+		}
+		return false, "", err
+	}
 	if quarantineAfterHook != nil {
 		if err := quarantineAfterHook(); err != nil {
-			return false, "", err
+			return fail(err)
 		}
 	}
 	why, err = matches(root, q, want)
 	if err == nil && why == "" {
 		if err := root.Remove(q); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return false, "", err
+			return fail(err)
 		}
 		return true, "", nil
 	}

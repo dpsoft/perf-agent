@@ -121,83 +121,147 @@ func (s *Server) waitMaintenance(d time.Duration) {
 	}
 }
 
-// maintain is the background maintenance: one full pass (recovery and
-// retention) at start, then the stranded rollbacks every strandedEvery.
+// recoveryRetry is how soon a full maintenance pass is run again when one
+// could not do its work: the captures lock was held (a dead server's
+// reaper still ending its capture, say), or recovery left an intent whose
+// owner it could not judge yet, or a wait found a capture in progress whose
+// owner is gone. It is the heartbeat's stale bound, so a dead owner is
+// judged gone by the next pass.
+const recoveryRetry = staleAfter
+
+// maintain is the background maintenance: a full pass (recovery and
+// retention) at start, run again while it is owed (see recoveryRetry),
+// and the stranded rollbacks every strandedEvery.
 func (s *Server) maintain() {
 	defer close(s.maintained)
-	s.maintenance(true)
-	close(s.startPassDone)
+	var due time.Time
+	owe := func(d time.Duration) {
+		if d <= 0 {
+			return
+		}
+		if at := time.Now().Add(d); due.IsZero() || at.Before(due) {
+			due = at
+		}
+	}
+	owe(s.maintenance(true))
 	tick := time.NewTicker(strandedEvery)
 	defer tick.Stop()
 	for {
+		var retry <-chan time.Time
+		if !due.IsZero() {
+			retry = time.After(time.Until(due))
+		}
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-retry:
+			due = time.Time{}
+			owe(s.maintenance(true))
+		case <-s.recoveryWanted:
+			owe(recoveryRetry)
 		case <-tick.C:
 			s.maintenance(false)
 		}
 	}
 }
 
+// wantRecovery asks maintenance for a full pass within recoveryRetry,
+// without waiting: a capture in progress whose owner is gone is for
+// recovery to settle.
+func (s *Server) wantRecovery() {
+	select {
+	case s.recoveryWanted <- struct{}{}:
+	default:
+	}
+}
+
+// startPassOver records that the start-up pass is over: it ran, or found
+// nothing to recover.
+func (s *Server) startPassOver() {
+	s.recovered.Store(true)
+	s.startOnce.Do(func() { close(s.startPassDone) })
+}
+
 // maintenance is one pass: under the directory slot, then the captures
-// lock (skipped when another capture holds it), it retries the stranded
-// rollbacks and, when full, recovers and runs retention: what it must keep
-// is snapshotted under the engine, and the evictions run outside it.
-// A full pass waits for a job holding the slot; a retry pass leaves the
-// directory to a running job, which retries before it captures.
-func (s *Server) maintenance(full bool) {
+// lock, it retries the stranded rollbacks and, when full, recovers and
+// runs retention: what it must keep is snapshotted under the engine, and
+// the evictions run outside it. A full pass waits for a job holding the
+// slot; a retry pass leaves the directory to a running job, which retries
+// before it captures. A full pass returns how soon it is owed again (0:
+// not owed): when the captures lock was held, at the holder's busy
+// retry_after, and when recovery left an intent it could not judge, after
+// recoveryRetry.
+func (s *Server) maintenance(full bool) time.Duration {
 	if full {
 		if !s.captureDirExists() {
-			return
+			s.startPassOver()
+			return 0
 		}
 		if !s.lockDir(nil) {
-			return
+			return 0
 		}
 	} else {
 		s.capMu.Lock()
 		idle := len(s.stranded) == 0 && len(s.undecided) == 0
 		s.capMu.Unlock()
 		if idle {
-			return
+			return 0
 		}
 		select {
 		case s.dirMu <- struct{}{}:
 		default:
-			return
+			return 0
 		}
 	}
 	defer s.unlockDir()
 	d, e := s.openCaptureDir()
 	if e != nil {
 		s.log.Warn("capture maintenance", "err", e)
-		return
+		if full {
+			// Nothing this server can recover there; a capture says why.
+			s.startPassOver()
+		}
+		return 0
 	}
 	defer d.close()
 	start, _ := s.startTime()
 	lease, e := capture.TryLock(d.root, capture.Holder{ServerPID: os.Getpid(), ServerStart: start, Deadline: s.clock().Add(maintenanceHold)})
 	if e != nil {
 		s.log.Info("capture maintenance skipped", "why", e)
-		return
+		if !full {
+			return 0
+		}
+		if e.Code == capture.CodeBusy {
+			return min(max(e.RetryAfter, time.Second), recoveryRetry)
+		}
+		return recoveryRetry
 	}
 	defer func() { _ = lease.Close() }()
 	defer s.historyChanged()
 	s.retryStrandedPass(d)
 	if !full {
-		return
+		return 0
 	}
-	if notes, err := s.recoverCaptures(d); err != nil {
+	notes, err := s.recoverCaptures(d)
+	if err != nil {
 		s.log.Warn("capture recovery stopped", "err", causeText(err), "notes", len(notes))
+	}
+	s.startPassOver()
+	again := time.Duration(0)
+	if s.recoveryLeft.Load() {
+		again = recoveryRetry
 	}
 	// What retention keeps is read under the engine; the hashing and the
 	// removals run without it.
 	if err := s.engine.acquire(s.ctx); err != nil {
-		return
+		return again
 	}
 	p := s.protected(d, "")
 	s.engine.release()
 	if evicted, err := s.retain(d, p, s.clock()); err != nil {
 		s.log.Warn("capture retention", "err", causeText(err), "evicted", len(evicted))
 	}
+	return again
 }
 
 // captureDirExists reports whether the capture directory was created, so

@@ -20,10 +20,18 @@ import (
 // interrupted manifest. What no intent accounts for (a staging directory,
 // a temporary) is never removed: it is noted, and logged. notes says what
 // recovery did and left, one line each, starting with its kind
-// (finished, interrupted, left, orphan_staging, orphan_temp). An error
+// (finished, interrupted, left, orphan_staging, orphan_temp). An intent
+// whose owner cannot be judged yet sets recoveryLeft, so maintenance runs
+// recovery again; a pass without error sets recovered. An error
 // (ENOSPC, say) stops recovery where it is; every step is idempotent and
 // the next pass goes on from there.
 func (s *Server) recoverCaptures(d *captureDir) (notes []string, err error) {
+	s.recoveryLeft.Store(false)
+	defer func() {
+		if err == nil {
+			s.recovered.Store(true)
+		}
+	}()
 	names, err := readDirNames(d.root, ".")
 	if err != nil {
 		return nil, d.writeError(err)
@@ -231,6 +239,7 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 			add("left", n, fmt.Sprintf("its owner (server pid %d) is alive and finishes it", in.ServerPID))
 			continue
 		case ownerUnclear:
+			s.recoveryLeft.Store(true)
 			claim(in, n)
 			add("left", n, "its heartbeat and its owner's process disagree; the next recovery judges it again")
 			continue

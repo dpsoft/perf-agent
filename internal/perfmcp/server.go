@@ -85,13 +85,23 @@ type Server struct {
 	// reaperPause is every capture's RunSpec.FaultPause, which holds its
 	// reaper at a test's barrier; "" outside tests.
 	reaperPause string
-	// startPassDone is closed once the start-up maintenance pass is over,
-	// so a test can write in the capture directory without that pass
-	// recovering what it writes.
+	// startPassDone is closed once the start-up maintenance pass is over
+	// (it ran, or found no capture directory), so a test can write in the
+	// capture directory without that pass recovering what it writes. A
+	// pass that found the captures lock held is not over: it runs again.
 	startPassDone chan struct{}
 	// maintained is closed when the maintenance goroutine has returned,
 	// which Close waits for, bounded.
 	maintained chan struct{}
+	startOnce  sync.Once
+	// recovered says a recovery pass has run since start (the start-up
+	// pass, or a job's), or that there was nothing to recover: before it, a
+	// capture id with no manifest may be one recovery has yet to record.
+	recovered atomic.Bool
+	// recoveryLeft says the last recovery left an intent whose owner it
+	// could not judge yet; recoveryWanted asks maintenance for a full pass.
+	recoveryLeft   atomic.Bool
+	recoveryWanted chan struct{}
 	// selfStartTime reads this process's start time for its intents (nil:
 	// /proc).
 	selfStartTime func() (uint64, error)
@@ -241,6 +251,7 @@ func New(cfg Config) (_ *Server, err error) {
 		s.lookups = newLookupPool(lookupWorkers, lookupQueue)
 		s.startPassDone = make(chan struct{})
 		s.maintained = make(chan struct{})
+		s.recoveryWanted = make(chan struct{}, 1)
 		if beforeMaintenance != nil {
 			beforeMaintenance(s)
 		}

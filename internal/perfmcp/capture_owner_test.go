@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dpsoft/perf-agent/internal/capture"
 )
 
 // ownerTemps are the temporaries of .owner left in the capture directory
@@ -82,5 +84,37 @@ func TestCloseWaitsForTheMaintenancePass(t *testing.T) {
 	}
 	if left := ownerTemps(t, profiles); len(left) > 0 {
 		t.Errorf("Close returned while maintenance had written %q", left)
+	}
+}
+
+// A start-up pass that finds the captures lock held (a dead server's
+// reaper, say) is not given up: it is run again while the lock is held,
+// and runs once it is free, with no capture to trigger it.
+func TestABusyStartPassIsRunAgain(t *testing.T) {
+	profiles := t.TempDir()
+	dir := filepath.Join(profiles, defaultStdioCaptures)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	lease, ce := capture.TryLock(root, capture.Holder{ServerPID: os.Getpid(), CaptureID: "adhoc/001", Deadline: time.Now().Add(time.Hour)})
+	if ce != nil {
+		t.Fatal(ce)
+	}
+	e := newJobEnv(t, jobOpts{profiles: profiles})
+	select {
+	case <-e.s.startPassDone:
+		t.Fatal("the start-up pass ran while the lock was held")
+	case <-time.After(1500 * time.Millisecond):
+	}
+	_ = lease.Close()
+	select {
+	case <-e.s.startPassDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the start-up pass never ran once the lock was free")
 	}
 }

@@ -248,7 +248,7 @@ func TestEveryCodeHasADocumentedRetryable(t *testing.T) {
 		t.Fatalf("%d Code constants in errors.go, want the 27 rows of §4.4", len(codes))
 	}
 	retryable := []Code{
-		CodeBusy, CodeBudget, CodeTargetChanged, CodeTargetExited, CodePIDReused,
+		CodeBusy, CodeBudget, CodeTargetChanged, CodePIDReused,
 		CodeStartTimeout, CodeFinishTimeout, CodeNoOutput, CodePerfAgentFailed,
 	}
 	for _, c := range codes {

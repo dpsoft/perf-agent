@@ -778,8 +778,8 @@ func (r *Run) execProven(pid int, start uint64) *Error {
 		return nil
 	case slices.Contains(r.launchers, id):
 		r.o.Notes = append(r.o.Notes, fmt.Sprintf("pid %d never ran the command: it was still the launcher", pid))
-		return Errorf(CodeTargetExited, "capture it again",
-			"pid %d still runs the launcher, not %s: the command was never executed", pid, echo(r.spec.Launch.Path))
+		return notStarted(Errorf(CodeTargetExited, "capture it again",
+			"pid %d still runs the launcher, not %s: the command was never executed", pid, echo(r.spec.Launch.Path)))
 	}
 	// Not the launcher, so the exec happened; but this shows only that, not
 	// that it was the command resolved at the start.
@@ -789,8 +789,17 @@ func (r *Run) execProven(pid int, start uint64) *Error {
 	return nil
 }
 
+// notStarted marks e, a target_exited of a command the launcher never got
+// to run, retryable: unlike a command that ended on its own, the same call
+// may succeed.
+func notStarted(e *Error) *Error {
+	e.Retryable = true
+	return e
+}
+
 // commandEnded is target_exited for the launched command, with the hint
-// for a command that hands its work to another process.
+// for a command that hands its work to another process. It is not
+// retryable: the same command ends as fast again.
 func (r *Run) commandEnded(pid int, how string) *Error {
 	return Errorf(CodeTargetExited,
 		"the command ended before perf-agent attached; if it starts a daemon or a server and returns, start that yourself and capture it with pid; otherwise give it more work",
@@ -913,7 +922,7 @@ func (r *Run) targetGone() {
 	switch {
 	case r.readyAt.IsZero():
 		if !r.perfExited {
-			r.failStop(Errorf(CodeTargetExited, "start it again", "pid %d exited before profiling began", r.spec.PID))
+			r.failStop(Errorf(CodeTargetExited, pidGoneNext, "pid %d exited before profiling began", r.spec.PID))
 		}
 	case r.profiling():
 		r.earlyStop(StoppedByTargetExit)
@@ -995,7 +1004,7 @@ func (r *Run) launchError(msg string) *Error {
 			"the command %s could not be executed: %s", echo(r.spec.Launch.Path), cut(why, maxPathEcho))
 	}
 	r.o.Notes = append(r.o.Notes, "the launcher did not get to the command: "+cut(text, maxPathEcho))
-	return Errorf(CodeTargetExited, "capture it again", "the command was not started: %s", cut(text, maxPathEcho))
+	return notStarted(Errorf(CodeTargetExited, "capture it again", "the command was not started: %s", cut(text, maxPathEcho)))
 }
 
 // poll checks the staging sizes while perf-agent writes, and whether a PID
@@ -1202,7 +1211,7 @@ func (r *Run) exitError(stderr string) *Error {
 		if r.spec.Launch != nil {
 			return withTail(r.commandEnded(r.target.PID, "before profiling began"))
 		}
-		return withTail(Errorf(CodeTargetExited, "start it again", "pid %d exited before profiling began", r.target.PID))
+		return withTail(Errorf(CodeTargetExited, pidGoneNext, "pid %d exited before profiling began", r.target.PID))
 	}
 	switch {
 	case r.argvPID == 0 || r.perf.pid == 0:

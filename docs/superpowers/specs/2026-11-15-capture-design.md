@@ -471,10 +471,10 @@ A failure is an `isError` result. Its text is one JSON object, not prose,
 because a loop branches on it:
 
 ```json
-{"error": {"code": "target_exited", "message": "pid 41234 exited 0.3s after the start, before profiling began",
-           "retryable": true, "retry_after": "0s",
-           "next": "the command finishes faster than perf-agent attaches (1.4s last time); give it more work, e.g. more iterations",
-           "capture_id": "003", "perf_agent_exit": "1", "stderr_tail": "…"}}
+{"error": {"code": "target_exited", "message": "the launched command (pid 41234) ended before profiling began, 0.3s after the start",
+           "retryable": false,
+           "next": "the command ended before perf-agent attached; if it starts a daemon or a server and returns, start that yourself and capture it with pid; otherwise give it more work",
+           "job": "j3-3f9a", "capture_id": "parse-opt/003", "status": "failed", "perf_agent_exit": "1", "stderr_tail": "…"}}
 ```
 
 | `code` | `retryable` | Meaning, and what `next` says |
@@ -492,7 +492,7 @@ because a loop branches on it:
 | `exists` | no | The final name is taken (M2-R4); pass another `label` |
 | `target_refused` | no | Which rule of §6.3 failed (another uid, setgid, non-dumpable, capabilities, kernel thread) |
 | `target_not_found` | no | No such PID |
-| `target_exited` | yes | The target or command ended before readiness; the command's output tail is included |
+| `target_exited` | no; yes when the launcher never got to the command | The target or command ended before readiness; the command's output tail is included. Retrying cannot help a pid that is gone, or a command that ended on its own (it ends as fast again), so it is not retryable and `next` keeps the remedy: give the command more work, capture the process it hands its work to by pid, or start the process again and capture its new pid (CAP-R85) |
 | `pid_reused` | yes | The start time changed (§6.3) |
 | `gpu_not_injected` | no | §8 |
 | `perf_agent_refused_args` | no | Exit 2: perf-agent is too old or too new for this server; the version is included |

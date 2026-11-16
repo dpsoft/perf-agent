@@ -44,7 +44,9 @@ const (
 
 // DefaultRetryable says, per code, whether the same call may succeed
 // later. perf_agent_failed defaults to true; a capability failure sets
-// Retryable false on its own Error.
+// Retryable false on its own Error. target_exited defaults to false (a
+// gone pid stays gone, and a command that ended on its own ends so again);
+// a command the launcher never got to sets Retryable true on its own Error.
 var DefaultRetryable = map[Code]bool{
 	CodeDisabled:             false,
 	CodeInvalidArgument:      false,
@@ -59,7 +61,7 @@ var DefaultRetryable = map[Code]bool{
 	CodeExists:               false,
 	CodeTargetRefused:        false,
 	CodeTargetNotFound:       false,
-	CodeTargetExited:         true,
+	CodeTargetExited:         false,
 	CodePIDReused:            true,
 	CodeGPUNotInjected:       false,
 	CodePerfAgentRefusedArgs: false,

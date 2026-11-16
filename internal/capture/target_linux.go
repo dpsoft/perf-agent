@@ -130,8 +130,12 @@ func vanished(p Proc, pid int, start uint64) *Error {
 	return nil
 }
 
+// pidGoneNext is the remedy for a pid target that ended: the same pid can
+// never be captured again.
+const pidGoneNext = "the process is gone: start it again and capture its new pid, or capture a command instead"
+
 func targetExited(pid int) *Error {
-	return Errorf(CodeTargetExited, "start it again", "pid %d has exited", pid)
+	return Errorf(CodeTargetExited, pidGoneNext, "pid %d has exited", pid)
 }
 
 func targetNotFound(pid int) *Error {

@@ -481,7 +481,7 @@ func TestAnExitingTaskHasEnded(t *testing.T) {
 	if _, e := Observe(fp, 11); errCode(e) != CodeTargetExited {
 		t.Errorf("Observe of an exiting task = %v, want target_exited", e)
 	}
-	if e := vanished(fp, 11, 500); errCode(e) != CodeTargetExited {
+	if e := vanished(fp, 11, 500); errCode(e) != CodeTargetExited || e.Retryable {
 		t.Errorf("vanished of an exiting task = %v, want target_exited", e)
 	}
 	// Other flags leave a task alive.

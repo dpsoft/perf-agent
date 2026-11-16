@@ -191,7 +191,7 @@ A failure is an `isError` result whose text is one JSON object, so a loop can br
 | `exists` | no | A final name is taken; pass another `label` |
 | `target_refused` | no | The target is not an ordinary process of the user's (see Guardrails) |
 | `target_not_found` | no | No such PID |
-| `target_exited` | yes | The target or command ended before profiling began; the command's output tail is included |
+| `target_exited` | no; yes when the command was never started | The target or command ended before profiling began; the command's output tail is included. A gone pid or a command that ended on its own ends the same way again: `next` says what to change (more work for the command, the pid of the process it started, or the new pid of a restarted process) |
 | `pid_reused` | yes | The PID's start time changed |
 | `gpu_not_injected` | no | The `pid` target has not loaded the CUPTI adapter; restart it with `CUDA_INJECTION64_PATH`, or capture it as a command |
 | `perf_agent_refused_args` | no | perf-agent exited 2: it is older or newer than this server expects |

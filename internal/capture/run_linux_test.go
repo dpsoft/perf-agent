@@ -379,6 +379,10 @@ func TestRunTargetExitedBeforeReadiness(t *testing.T) {
 	if errCode(o.Err) != CodeTargetExited || o.StoppedBy != "" {
 		t.Fatalf("Err %v, stopped by %q", o.Err, o.StoppedBy)
 	}
+	// The same pid can never be captured again: retrying cannot help.
+	if o.Err.Retryable || o.Err.Next == "" {
+		t.Errorf("a gone pid: retryable %v, next %q; want not retryable, with the remedy", o.Err.Retryable, o.Err.Next)
+	}
 }
 
 // Review Focus 2: a wrapper that forks its real work and returns.
@@ -388,6 +392,10 @@ func TestRunForkAndExitIsTargetExitedWithAPIDHint(t *testing.T) {
 	o := waitRun(t, startRun(t, spec), 30*time.Second)
 	if errCode(o.Err) != CodeTargetExited || !strings.Contains(o.Err.Next, "capture it with pid") {
 		t.Fatalf("Err = %v", o.Err)
+	}
+	// A command that ended on its own ends so again: retrying cannot help.
+	if o.Err.Retryable {
+		t.Errorf("a command that ended on its own is retryable")
 	}
 	if !strings.Contains(o.Err.Message, "pid "+strconv.Itoa(o.Target.PID)) {
 		t.Errorf("message %q does not name the launched pid %d", o.Err.Message, o.Target.PID)

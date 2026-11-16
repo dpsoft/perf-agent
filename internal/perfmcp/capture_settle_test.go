@@ -157,3 +157,73 @@ func TestATransientReadKeepsTheJobUndecided(t *testing.T) {
 		t.Fatalf("after a good read %+v, err %v", v, jobErr(j))
 	}
 }
+
+// An undecided job is never evicted from the registry, whatever MaxJobs
+// says, so a cancel of it is always recorded and reported at the settle.
+func TestAnUndecidedJobIsNeverEvicted(t *testing.T) {
+	for _, made := range []bool{true, false} {
+		t.Run(map[bool]string{true: "made", false: "not made"}[made], func(t *testing.T) {
+			u := newUndecidedEnv(t, made)
+			u.s.registry.mu.Lock()
+			u.s.registry.lim.MaxJobs = 2
+			u.s.registry.mu.Unlock()
+			j := u.undecided(t)
+			for range 3 {
+				if f, v := u.run(u.compareRequest("999")); v.Status != string(jobFailed) {
+					t.Fatalf("filler %+v, err %v", v, jobErr(f))
+				}
+			}
+			u.s.registry.mu.Lock()
+			_, kept := u.s.registry.byJob[j.id]
+			u.s.registry.mu.Unlock()
+			if !kept {
+				t.Fatal("the undecided job was evicted")
+			}
+			if a, _ := u.s.registry.cancel(j.id); a != cancelAnswerPending {
+				t.Fatalf("cancel %q", a)
+			}
+			u.setBroken(false)
+			u.run(u.request(300 * time.Millisecond))
+			if made {
+				if r := u.result(j); r.Cancel != cancelAnswerTooLate {
+					t.Errorf("result cancel %q", r.Cancel)
+				}
+			} else if v := j.view(); v.Status != string(jobCancelled) {
+				t.Errorf("settled %+v, err %v", v, jobErr(j))
+			}
+		})
+	}
+}
+
+// A cancel that comes after the retry decided the link but before the job
+// has its final status is still honoured: one place decides.
+func TestACancelInTheSettleWindowIsHonoured(t *testing.T) {
+	for _, made := range []bool{true, false} {
+		t.Run(map[bool]string{true: "made", false: "not made"}[made], func(t *testing.T) {
+			u := newUndecidedEnv(t, made)
+			j := u.undecided(t)
+			var answer string
+			settleRead = func(ser *os.Root, name string) (manifest, error) {
+				if answer == "" {
+					answer = j.requestCancel()
+				}
+				return readManifest(ser, name)
+			}
+			t.Cleanup(func() { settleRead = readManifest })
+			u.setBroken(false)
+			u.run(u.request(300 * time.Millisecond))
+			if answer != cancelAnswerPending {
+				t.Fatalf("the cancel answered %q", answer)
+			}
+			if made {
+				if r := u.result(j); r.Cancel != cancelAnswerTooLate {
+					t.Errorf("result cancel %q", r.Cancel)
+				}
+				return
+			}
+			if v := j.view(); v.Status != string(jobCancelled) {
+				t.Errorf("settled %+v, err %v", v, jobErr(j))
+			}
+		})
+	}
+}

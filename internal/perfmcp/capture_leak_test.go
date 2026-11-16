@@ -59,7 +59,18 @@ func TestNoTokenOrAbsolutePathReachesAnAgent(t *testing.T) {
 	}
 	for _, op := range captureWriteOps {
 		cases = append(cases, failure{"write " + op, func(s *Server) { s.writeErr = failOpAt(op, 1, syscall.ENOSPC) }})
+		// An error with no errno: its own text reaches the message.
+		cases = append(cases, failure{"write " + op + " without an errno", func(s *Server) { s.writeErr = failOpAt(op, 1, errInjected) }})
 	}
+	cases = append(cases, failure{"a .seq this server did not write", func(s *Server) {
+		ser := filepath.Join(s.profiles.Name(), defaultStdioCaptures, "adhoc")
+		if err := os.MkdirAll(ser, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ser, seqFile), []byte("garbage"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}})
 	cases = append(cases, failure{"manifest link EEXIST", func(s *Server) {
 		s.link = func(r *os.Root, oldname, newname string) error {
 			if strings.HasSuffix(newname, manifestSuffix) {
@@ -80,6 +91,10 @@ func TestNoTokenOrAbsolutePathReachesAnAgent(t *testing.T) {
 			texts := map[string]string{"logs": logs.String()}
 			if ce := jobErr(j); ce != nil {
 				texts["wire error"] = string(must(json.Marshal(toWireError(ce)))(t))
+				// A message and its advice are one line each.
+				if strings.ContainsAny(ce.Message+ce.Next, "\n\r") {
+					t.Errorf("a line break in the wire error: %q / %q", ce.Message, ce.Next)
+				}
 			}
 			j.mu.Lock()
 			b := j.result
@@ -244,5 +259,23 @@ func TestErrorFromWireKeepsWhatAnAgentActsOn(t *testing.T) {
 	}
 	if errorFromWire(nil) != nil {
 		t.Error("nil is not nil")
+	}
+}
+
+// A .seq this server did not write is refused with advice about the .seq,
+// not about free space.
+func TestAForeignSeqIsRefusedWithItsOwnAdvice(t *testing.T) {
+	e := newJobEnv(t, jobOpts{})
+	if _, v := e.run(e.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+		t.Fatalf("first %+v", v)
+	}
+	if err := os.WriteFile(filepath.Join(e.profiles, defaultStdioCaptures, "adhoc", seqFile), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := e.run(e.request(300 * time.Millisecond))
+	ce := jobErr(j)
+	if ce == nil || strings.Contains(ce.Next, "free space") || !strings.Contains(ce.Next, ".seq") ||
+		!strings.Contains(ce.Message, "series adhoc") || strings.Contains(ce.Message, e.profiles) {
+		t.Fatalf("err %+v", ce)
 	}
 }

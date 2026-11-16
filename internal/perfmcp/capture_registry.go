@@ -371,6 +371,9 @@ func (r *registry) finalOf(id string) (answer string, pending *job, ok bool) {
 func finalAnswer(j *job) (answer, captureID string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.ending.terminal() {
+		return j.ending.cancelAnswer(), j.captureID
+	}
 	if !j.status.terminal() {
 		return cancelAnswerPending, j.captureID
 	}
@@ -400,12 +403,14 @@ func (r *registry) index(el *list.Element) {
 // never keep. Historical answers go first, the least recently used first:
 // one can always be read from its manifest again, while a job's derived
 // result exists only here (CAP-R60). Then jobs, the least recently used
-// first. r.mu is held.
+// first. A job whose commit is undecided is never evicted, as the active
+// one is not: a cancel must still reach it until it is settled. r.mu is
+// held.
 func (r *registry) evict(keep *list.Element) {
 	for r.lru.Len() > 1 && (r.lru.Len() > r.lim.MaxJobs || r.bytes > r.lim.MaxJobBytes) {
 		var victim, oldestJob *list.Element
 		for el := r.lru.Back(); el != nil; el = el.Prev() {
-			if el == keep {
+			if el == keep || el.Value.(*registryEntry).answer == cancelAnswerPending {
 				continue
 			}
 			if el.Value.(*registryEntry).j == nil {
@@ -418,6 +423,9 @@ func (r *registry) evict(keep *list.Element) {
 		}
 		if victim == nil {
 			victim = oldestJob
+		}
+		if victim == nil {
+			return
 		}
 		r.remove(victim)
 	}

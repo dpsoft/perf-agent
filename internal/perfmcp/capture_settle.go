@@ -60,31 +60,40 @@ func (s *Server) settleUndecided(d *captureDir) {
 			continue
 		}
 		m, err := s.readOwnManifest(d, t)
-		var b []byte
+		var e *capture.Error
 		switch {
 		case err == nil && m.Outcome == captureOK:
-			res := captureResult{
-				Capture: s.captureInfo(m), Notes: m.Notes, Cancel: t.cancelNote,
-				Derived: derivedRecompute, Handles: "reopen", Recompute: new(s.recomputeFor(m, j.base, "")),
-			}
-			b, _ = json.Marshal(res)
-			j.set(func() { j.status, j.phase, j.derived, j.err, j.result = jobDone, "", derivedRecompute, nil, b })
 		case err == nil:
-			e := errorFromWire(m.Error)
-			if e == nil {
+			if e = errorFromWire(m.Error); e == nil {
 				e = capture.Errorf(capture.CodeDisk, "", "capture %s/%s failed", t.series, formatID(t.id))
 			}
-			j.set(func() { j.status, j.phase, j.err = statusOf(e), "", e })
 		case errors.Is(err, fs.ErrNotExist):
-			e := t.settled
-			if e == nil {
+			if e = t.settled; e == nil {
 				e = capture.Errorf(capture.CodeDisk, "", "capture %s/%s was not committed: its manifest link was not made", t.series, formatID(t.id))
 			}
-			j.set(func() { j.status, j.phase, j.err = statusOf(e), "", e })
 		default:
 			s.log.Warn("an undecided capture's manifest cannot be read; it stays undecided", "job", j.id, "err", causeText(err))
 			continue
 		}
+		var b []byte
+		// The decision word is settled under the job's mutex, in the same
+		// step as the final status, so a cancel is either seen here or
+		// answered from that status: none is lost.
+		j.set(func() {
+			if e == nil {
+				res := captureResult{
+					Capture: s.captureInfo(m), Notes: m.Notes, Cancel: j.d.settle(true),
+					Derived: derivedRecompute, Handles: "reopen", Recompute: new(s.recomputeFor(m, j.base, "")),
+				}
+				b, _ = json.Marshal(res)
+				j.status, j.phase, j.derived, j.err, j.result = jobDone, "", derivedRecompute, nil, b
+				return
+			}
+			if j.d.settle(false) == cancelAnswerCancelled && e.Code != capture.CodeCancelled {
+				e = cancelledError()
+			}
+			j.status, j.phase, j.err = statusOf(e), "", e
+		})
 		s.capMu.Lock()
 		s.undecided = slices.DeleteFunc(s.undecided, func(u *job) bool { return u == j })
 		s.capMu.Unlock()

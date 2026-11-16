@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
 )
@@ -241,6 +242,7 @@ func (r *jobRun) capture() (jobStatus, *capture.Error) {
 	r.recordReaper(run)
 	j.setState(jobRunning, "")
 	o := r.relay(run)
+	r.scrub(&o)
 	r.o = &o
 	r.m = r.manifestFrom(o)
 	if o.Err != nil {
@@ -803,6 +805,46 @@ func (r *jobRun) relay(run *capture.Run) capture.Outcome {
 	}
 }
 
+// scrub takes the server's own paths out of what the capture's programs
+// printed, before it leaves the server: perf-agent names its output files
+// ("profile written to <path>"), and a workload may print its directory.
+// The staging directory becomes "staging" and the profiles root "the
+// profiles root", each as given and with its links resolved; a tail stays
+// within MaxOutputTail. The rest of the text is the programs' own.
+func (r *jobRun) scrub(o *capture.Outcome) {
+	staging := filepath.Join(r.txn.ser.Name(), r.txn.in.Staging)
+	root := r.s.profiles.Name()
+	var pairs []string
+	for _, p := range []struct{ path, as string }{{staging, "staging"}, {root, "the profiles root"}} {
+		pairs = append(pairs, p.path, p.as)
+		if real := r.s.resolved(p.path); real != p.path {
+			pairs = append(pairs, real, p.as)
+		}
+	}
+	rep := strings.NewReplacer(pairs...)
+	n := r.s.lim.Capture.MaxOutputTail
+	tail := func(s string) string { return lastBytes(rep.Replace(s), n) }
+	o.StderrTail = tail(o.StderrTail)
+	o.Workload.Stdout, o.Workload.Stderr = tail(o.Workload.Stdout), tail(o.Workload.Stderr)
+	if o.Err != nil {
+		e := *o.Err
+		e.StderrTail, e.Message = tail(e.StderrTail), rep.Replace(e.Message)
+		o.Err = &e
+	}
+}
+
+// lastBytes is the last n bytes of s at most, starting on a rune boundary.
+func lastBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[len(s)-n:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
+}
+
 // kernelNote is the note of a capture with kernel stacks.
 const kernelNote = "the profile contains kernel addresses (kernel_stacks)"
 
@@ -901,13 +943,20 @@ func (r *jobRun) profiled() time.Duration {
 }
 
 // end records that the job failed or was cancelled with e.
+//
+// The registry frees the slot before the end is visible, so a client that
+// sees it can start the next capture at once: until then the job answers a
+// cancel from the state it is ending in.
 func (r *jobRun) end(status jobStatus, e *capture.Error) {
 	j := r.j
-	j.set(func() { j.status, j.phase, j.err = status, "", e })
-	r.s.log.Info("capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
+	j.mu.Lock()
+	j.ending = status
+	j.mu.Unlock()
 	if err := r.s.registry.finish(j, 0, r.profiled()); err != nil {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)
 	}
+	j.set(func() { j.status, j.phase, j.err = status, "", e })
+	r.s.log.Info("capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
 }
 
 // done is a committed capture: it derives the open and compare results
@@ -937,9 +986,10 @@ func (r *jobRun) done() {
 	if res.Derived == derivedFailed {
 		derived = derivedFailed
 	}
-	j.set(func() { j.phase, j.derived, j.result = "", derived, b })
-	s.log.Info("capture done", "job", j.id, "capture", j.captureIDNow(), "derived", derived)
+	// The slot is freed before a wait can see the results.
 	if err := s.registry.finish(j, len(b), r.profiled()); err != nil {
 		s.log.Error("capture registry", "job", j.id, "err", err)
 	}
+	j.set(func() { j.phase, j.derived, j.result = "", derived, b })
+	s.log.Info("capture done", "job", j.id, "capture", j.captureIDNow(), "derived", derived)
 }

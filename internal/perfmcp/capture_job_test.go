@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1288,3 +1289,85 @@ func TestAStrandedRollbackNeverBlocksTheNextCapture(t *testing.T) {
 }
 
 var _ = errors.New
+
+// The slot is free before a job's end can be seen: with the registry held,
+// a job that has run cannot look ended, and once the registry is free a
+// wait that sees the end finds no active job, so the next capture is not
+// busy.
+func TestTheSlotIsFreeWhenAJobLooksEnded(t *testing.T) {
+	for _, mode := range []capturetest.FakeMode{capturetest.FakeNormal, capturetest.FakeExit2} {
+		t.Run(string(mode), func(t *testing.T) {
+			e := newJobEnv(t, jobOpts{fake: capturetest.FakeOptions{Mode: mode}})
+			j := e.start(e.request(300 * time.Millisecond))
+			if !eventuallyTrue(30*time.Second, func() bool { return j.view().Status == string(jobRunning) }) {
+				t.Fatalf("never running: %+v", j.view())
+			}
+			e.s.registry.mu.Lock()
+			v := j.wait(t.Context(), 2*time.Second)
+			e.s.registry.mu.Unlock()
+			if ended(v) {
+				t.Fatalf("the job looked ended while the registry still held its slot: %+v", v)
+			}
+			v = e.finish(j)
+			if a := e.s.registry.active.Load(); a != nil {
+				t.Errorf("the slot holds %s after %+v", a.id, v)
+			}
+			if _, ce := e.s.startJob(e.request(300 * time.Millisecond)); ce != nil {
+				t.Errorf("the next capture: %v", ce)
+			}
+		})
+	}
+}
+
+// What a capture's programs print is shown without the server's paths:
+// the profiles root and the staging directory are named by what they
+// are, in perf-agent's stderr tail and in the workload's tails.
+func TestTailsNameNoServerPath(t *testing.T) {
+	t.Run("perf-agent stderr", func(t *testing.T) {
+		e := newJobEnv(t, jobOpts{})
+		g := e.faults.block(t, faultAfterStaging)
+		j := e.start(e.request(300 * time.Millisecond))
+		g.reached(t)
+		ser := filepath.Join(e.profiles, defaultStdioCaptures, "adhoc")
+		ents, err := os.ReadDir(ser)
+		if err != nil {
+			t.Fatal(err)
+		}
+		staged := ""
+		for _, de := range ents {
+			if strings.HasPrefix(de.Name(), stagingPrefix) {
+				staged = filepath.Join(ser, de.Name())
+			}
+		}
+		// perf-agent cannot write its output there, and says where.
+		if err := os.Chmod(staged, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		g.open()
+		v := e.finish(j)
+		ce := jobErr(j)
+		if v.Status != string(jobFailed) || ce == nil || ce.StderrTail == "" {
+			t.Fatalf("view %+v, err %+v", v, ce)
+		}
+		if strings.Contains(ce.StderrTail, e.profiles) || !strings.Contains(ce.StderrTail, "staging") {
+			t.Errorf("stderr tail %q", ce.StderrTail)
+		}
+	})
+	t.Run("workload stdout", func(t *testing.T) {
+		py, err := exec.LookPath("python3")
+		if err != nil {
+			t.Skip("no python3")
+		}
+		e := newJobEnv(t, jobOpts{})
+		req := e.request(500 * time.Millisecond)
+		req.Command = []string{py, "-c", "import os, sys, time; print(os.getcwd(), flush=True); print(os.getcwd(), file=sys.stderr, flush=True); time.sleep(60)"}
+		j, v := e.run(req)
+		if v.Status != string(jobDone) {
+			t.Fatalf("view %+v, err %v", v, jobErr(j))
+		}
+		tail := e.result(j).Capture.WorkloadOutputTail
+		if tail == nil || !strings.Contains(tail.Stdout, "the profiles root") || strings.Contains(tail.Stdout+tail.Stderr, e.profiles) {
+			t.Errorf("workload tail %+v", tail)
+		}
+	})
+}

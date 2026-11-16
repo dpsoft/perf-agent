@@ -341,7 +341,7 @@ func (s *Server) nextID(ser *os.Root) (int, error) {
 		if !errors.Is(err, errCrash) {
 			_, _, _ = removeByIdentity(ser, tmp, tid)
 		}
-		return 0, fmt.Errorf("cannot write %s in %s: %w", seqFile, ser.Name(), err)
+		return 0, fmt.Errorf("cannot write the %s of series %s: %w", seqFile, filepath.Base(ser.Name()), err)
 	}
 	if err := s.syncDir(ser, ".", "fsync seq"); err != nil {
 		return 0, err
@@ -349,19 +349,31 @@ func (s *Server) nextID(ser *os.Root) (int, error) {
 	return id, nil
 }
 
-// readSeq is the id .seq says comes next, 0 when there is no .seq.
+// readSeq is the id .seq says comes next, 0 when there is no .seq. A .seq
+// that cannot be read is a disk failure; one this server did not write is
+// refused with the advice to move it away.
 func readSeq(ser *os.Root) (int, error) {
 	b, _, err := readSmall(ser, seqFile, maxSmallFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
+	series := filepath.Base(ser.Name())
+	if err != nil && !errors.Is(err, errNotRegular) {
+		return 0, fmt.Errorf("cannot read the %s of series %s: %w", seqFile, series, err)
+	}
 	var r seqRecord
+	why := "it is not a regular file"
 	if err == nil {
-		err = json.Unmarshal(b, &r)
+		why = "its format is not this server's"
+		if json.Unmarshal(b, &r) == nil && r.Format == 1 && r.WrittenBy == writtenBy {
+			why = "its next id is not a number above 0"
+		}
 	}
 	next, perr := strconv.Atoi(r.Next)
 	if err != nil || perr != nil || r.Format != 1 || r.WrittenBy != writtenBy || next < 1 {
-		return 0, fmt.Errorf("%s in %s is not one this server wrote (%v); move it away to let the series continue", seqFile, ser.Name(), errors.Join(err, perr))
+		return 0, capture.Errorf(capture.CodeDisk,
+			fmt.Sprintf("move %s/%s/%s away by hand to let the series continue, or capture into another series", rootCaptures, series, seqFile),
+			"the %s of series %s is not one this server wrote (%s)", seqFile, series, why)
 	}
 	return next, nil
 }

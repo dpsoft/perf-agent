@@ -1,6 +1,7 @@
 package perfmcp
 
 import (
+	"cmp"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,10 @@ type job struct {
 	phase, captureID, derived string
 	err                       *capture.Error
 	result                    []byte
+	// ending is the end state the job is about to show, set while the
+	// registry frees its slot, so a cancel and the registry already answer
+	// from it.
+	ending jobStatus
 	// duration is the capture's effective duration, once the job knows it.
 	duration time.Duration
 	// trail is every status the job went through (a done one with its
@@ -257,7 +262,7 @@ func (j *job) wait(ctx context.Context, d time.Duration) jobView {
 func (j *job) requestCancel() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if a := j.status.cancelAnswer(); a != "" {
+	if a := cmp.Or(j.status.cancelAnswer(), j.ending.cancelAnswer()); a != "" {
 		return a
 	}
 	a := j.d.requestCancel()

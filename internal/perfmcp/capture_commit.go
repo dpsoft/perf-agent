@@ -221,9 +221,10 @@ type captureTxn struct {
 	// link may or may not have been made.
 	pending *manifest
 	decide  *fileIdentity
-	// word is the job's decision word while the commit is undecided, so
-	// the settle reports a cancel that came meanwhile; settled is the
-	// failure the settle recorded when the link was not made.
+	// word is the job's decision word while the commit is undecided: the
+	// settle words a failure manifest as cancelled when a cancel came
+	// meanwhile, but only the job's settle decides the answer. settled is
+	// the failure the settle recorded when the link was not made.
 	word    *decisionWord
 	settled *capture.Error
 	// cancelNote is what to report about a cancel that met the commit.
@@ -548,7 +549,11 @@ func (t *captureTxn) rewrite() error {
 	}
 	if why, err := matches(t.ser, name, t.self); err != nil || why != "" {
 		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp)
-		return fmt.Errorf("the intent %s in %s is no longer the one this capture wrote (%s); it is left as it is", name, t.ser.Name(), cmpOrErr(why, err))
+		if err != nil {
+			why = causeText(err)
+		}
+		return capture.Errorf(capture.CodeDisk, "another process changed the capture's files; look at the series before capturing in it again",
+			"the intent %s of series %s is no longer the one this capture wrote (%s); it is left as it is", name, t.series, why)
 	}
 	if err := t.ser.Rename(tmp.Name, name); err != nil {
 		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp)
@@ -578,7 +583,8 @@ func (t *captureTxn) makeStaging() error {
 		return err
 	}
 	if !fi.IsDir() {
-		return fmt.Errorf("staging %s in %s is %s after it was created", t.in.Staging, t.ser.Name(), describeType(fi.Mode()))
+		return capture.Errorf(capture.CodeDisk, "another process changed the capture's files; look at the series before capturing in it again",
+			"staging %s of series %s is %s after it was created", t.in.Staging, t.series, describeType(fi.Mode()))
 	}
 	st, _ := statOf(fi)
 	t.in.StagingDev, t.in.StagingIno = st.dev, st.ino
@@ -916,17 +922,14 @@ func (t *captureTxn) settle() error {
 	case linkMade:
 		t.decide = nil
 		t.unstrand()
-		if t.word != nil {
-			t.cancelNote = t.word.settle(true)
-		}
 		return t.afterCommit()
 	}
 	t.decide = nil
 	t.unstrand()
 	cause := capture.Errorf(capture.CodeDisk, "", "the manifest link of capture %s/%s was not made", t.series, formatID(t.id))
 	// A cancel that came while the commit was undecided wins against a
-	// link that was not made (§7.4).
-	if t.word != nil && t.word.settle(false) == cancelAnswerCancelled {
+	// link that was not made (§7.4); the job's settle reports it.
+	if t.word != nil && t.word.cancelPending() {
 		cause = cancelledError()
 	}
 	t.settled = cause

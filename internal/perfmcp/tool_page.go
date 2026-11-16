@@ -16,8 +16,7 @@ import (
 
 // errLiveDisabled is every page tool's answer on a server without the
 // live page, and the start of their descriptions there.
-var errLiveDisabled = errors.New("DISABLED: start perf-agent-mcp with --live to enable the live page. " +
-	"This server was started without --live, so it serves no page")
+var errLiveDisabled = errors.New("DISABLED: this server has no live page; perf-agent-hub serves it")
 
 // pageTool is a page tool as tools/list shows it: disabled, and saying
 // so first, on a server without the live page.
@@ -119,7 +118,7 @@ type pageOpened struct {
 }
 
 // shrinkPage is the advice for a page tool's result over MaxResponseBytes.
-const shrinkPage = "restart perf-agent-mcp with a larger --limit MaxResponseBytes=N"
+func (s *Server) shrinkPage() string { return s.raiseAdvice("MaxResponseBytes") }
 
 func (s *Server) handlePageOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.live == nil {
@@ -139,7 +138,7 @@ func (s *Server) handlePageOpen(_ context.Context, raw json.RawMessage) (mcpstdi
 		p := snap.pubs[id]
 		out.Publications = append(out.Publications, pageListed{ID: p.id, Kind: p.kind, Title: p.title, View: p.view})
 	}
-	return s.respond("page_open", shrinkPage, out)
+	return s.respond("page_open", s.shrinkPage(), out)
 }
 
 // viewers is how many tabs have the page open, as PageConfig.Viewers
@@ -180,9 +179,11 @@ type pagePublished struct {
 
 // shrinkPublished is the advice for a published result over
 // MaxResponseBytes, which only its notices can make large.
-const shrinkPublished = "the page was published; its notices make the result large; restart perf-agent-mcp with a larger --limit MaxResponseBytes=N"
+func (s *Server) shrinkPublished() string {
+	return "the page was published; its notices make the result large; " + s.raiseAdvice("MaxResponseBytes")
+}
 
-func (s *Server) handlePageExplain(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
+func (s *Server) handlePageExplain(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.live == nil {
 		return mcpstdio.Result{}, errLiveDisabled
 	}
@@ -209,18 +210,18 @@ func (s *Server) handlePageExplain(_ context.Context, raw json.RawMessage) (mcps
 
 	id := s.attempts.add(c.e.prof, a.View, a.Attempt, outcomePublished, nil)
 	s.recorded()
-	p, err := s.publishExplained(c.e, c.v, a.View, c.r, a.Title, id)
+	p, err := s.publishExplained(c.e, c.v, a.View, c.r, a.Title, id, mcpstdio.ClientLabel(ctx))
 	if err != nil {
 		s.attempts.setOutcome(id, outcomeFailed)
 		s.recorded()
 		if _, ok := errors.AsType[*modelError](err); ok {
 			return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but the page cannot be built within this server's MaxPageBytes=%d: %v; "+
-				"explain fewer or shorter paths, or restart perf-agent-mcp with a larger --limit MaxPageBytes=N; nothing was published", id, s.lim.MaxPageBytes, err)
+				"explain fewer or shorter paths, or %s; nothing was published", id, s.lim.MaxPageBytes, err, s.raiseAdvice("MaxPageBytes"))
 		}
 		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but nothing was published: %v", id, err)
 	}
 	s.log.Info("published", "attempt", id, "handle", a.Handle, "view", a.View, "publication", p.id, "bytes", len(p.model))
-	return s.respond("page_explain", shrinkPublished, pagePublished{
+	return s.respond("page_explain", s.shrinkPublished(), pagePublished{
 		Attempt: id, Status: outcomePublished, Publication: p.id, URL: url,
 		FiguresChecked: wireInt(int64(c.r.Figures)), ReferencesChecked: wireInt(int64(c.r.References)),
 		UncheckedNumbers: wireInt(int64(uncheckedNumbers(c.r, a.Title))),
@@ -251,7 +252,7 @@ type pageShown struct {
 	Viewers     string   `json:"viewers"`
 }
 
-func (s *Server) handlePageShow(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
+func (s *Server) handlePageShow(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.live == nil {
 		return mcpstdio.Result{}, errLiveDisabled
 	}
@@ -307,12 +308,12 @@ func (s *Server) handlePageShow(_ context.Context, raw json.RawMessage) (mcpstdi
 			return mcpstdio.Result{}, err
 		}
 	}
-	if err := l.show(id, node, focus); err != nil {
+	if err := l.show(id, node, focus, mcpstdio.ClientLabel(ctx)); err != nil {
 		return mcpstdio.Result{}, err
 	}
 	s.commit()
 	out.Publication, out.Selected, out.Focus, out.Viewers = l.current, l.selected, l.focus, s.viewers()
-	return s.respond("page_show", shrinkPage, out)
+	return s.respond("page_show", s.shrinkPage(), out)
 }
 
 // keptIDs lists the kept publications in the order they were made, or

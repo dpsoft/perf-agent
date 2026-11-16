@@ -41,8 +41,10 @@ type publication struct {
 	titleSegs json.RawMessage
 	view      string
 	digest    profilemodel.Digest
-	// attempt is the attempt the publication was made for.
+	// attempt is the attempt the publication was made for, and by the
+	// label of the session that made it ("" for none).
 	attempt string
+	by      string
 
 	prof   *profilemodel.Profile
 	v      *profilemodel.View
@@ -242,6 +244,7 @@ func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts
 type liveSnapshot struct {
 	seq                      int64
 	current, selected, focus string
+	by                       string
 	pubs                     map[string]*publication
 	// order lists the publications as the state does, oldest first.
 	order   []string
@@ -268,8 +271,10 @@ type live struct {
 	seq  int64
 	// current, selected and focus are what the page is told to show: a
 	// publication, a node of it ("" for none) and the node its layout
-	// starts at ("" for the whole view).
+	// starts at ("" for the whole view). by is the label of the session
+	// that last set them, by publishing or with page_show.
 	current, selected, focus string
+	by                       string
 
 	// url is the page's address; notify receives every committed state
 	// and viewers counts the open streams (see PageConfig). opened is set
@@ -308,7 +313,7 @@ func newLive(lim Limits, pins *pins, page PageConfig) *live {
 func (l *live) snapshot() *liveSnapshot { return l.snap.Load() }
 
 // errLiveClosed is ensureLive's answer once the server is closing.
-var errLiveClosed = errors.New("the live page is shut down: perf-agent-mcp is exiting")
+var errLiveClosed = errors.New("the live page is shut down: this server is exiting")
 
 // close marks the live page closed, so no page tool runs after it. It may
 // run on any goroutine, more than once. Whoever serves the page stops
@@ -346,17 +351,17 @@ func (l *live) isClosed() bool {
 }
 
 // show makes publication id current, with node selected and, when focus
-// is set, the layout starting at node. It checks only that id is kept;
-// whether node may be shown is the caller's to check. Nothing reaches the
-// page until commit.
-func (l *live) show(id, node string, focus bool) error {
+// is set, the layout starting at node, as the session labelled by asked.
+// It checks only that id is kept; whether node may be shown is the
+// caller's to check. Nothing reaches the page until commit.
+func (l *live) show(id, node string, focus bool, by string) error {
 	i := slices.IndexFunc(l.pubs, func(p *publication) bool { return p.id == id })
 	if i < 0 {
 		return fmt.Errorf("publication %q is not kept", echo(id))
 	}
 	p := l.pubs[i]
 	l.pubs = append(slices.Delete(l.pubs, i, i+1), p)
-	l.current, l.selected, l.focus = id, node, ""
+	l.current, l.selected, l.focus, l.by = id, node, "", by
 	if focus {
 		l.focus = node
 	}
@@ -364,12 +369,13 @@ func (l *live) show(id, node string, focus bool) error {
 }
 
 // publishExplained publishes view v (named view) of e's profile with the
-// passing check r, titled title, made for attempt. The model is built
+// passing check r, titled title, made for attempt by the session labelled
+// by. The model is built
 // within the page limits; one that cannot be built publishes nothing. An
 // admitted publication becomes current with its first explained node
 // selected (none for a facts-only page) and no focus, and the page is
 // told. A model that cannot be built is a *modelError.
-func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt string) (*publication, error) {
+func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt, by string) (*publication, error) {
 	opts := flamegraph.LiveOptions{
 		Title: title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: attempt,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
@@ -380,26 +386,27 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	}
 	p := &publication{
 		kind: pubExplained, title: title, titleSegs: flamegraph.LiveTitleSegments(title, e.name),
-		view: view, digest: e.prof.Digest, attempt: attempt,
+		view: view, digest: e.prof.Digest, attempt: attempt, by: by,
 		prof: e.prof, v: v, result: r, resultSize: resultBytes(r), opts: opts, model: model,
 	}
 	if err := s.admit(p); err != nil {
 		return nil, err
 	}
 	l := s.live
-	l.selected, l.focus = p.firstSelected(), ""
+	l.selected, l.focus, l.by = p.firstSelected(), "", p.by
 	s.commit()
 	return p, nil
 }
 
 // publishDiff publishes d, the comparison of base's view with next's,
-// titled title, with node selected ("" for none). It indexes the whole
+// titled title, with node selected ("" for none), for the session
+// labelled by. It indexes the whole
 // union once and measures it once, for every model and export the page
 // asks for later. A node that is not in the union publishes nothing, and
 // neither does a model that cannot be built within the page limits (a
 // *modelError). An admitted publication becomes current, unfocused, and
 // the page is told.
-func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node string) (*publication, error) {
+func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node, by string) (*publication, error) {
 	ix := profilemodel.NewDiffIndex(d)
 	if node != "" {
 		if _, ok := ix.Node(profilemodel.UnionID(node)); !ok {
@@ -418,14 +425,14 @@ func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, n
 	}
 	p := &publication{
 		kind: pubDiff, title: title, titleSegs: flamegraph.LiveTitleSegments(title, "Diff of "+base.e.name+" and "+next.e.name),
-		view: d.View, prof: base.e.prof, v: base.v, model: model,
+		view: d.View, by: by, prof: base.e.prof, v: base.v, model: model,
 		diff: d, index: ix, newProf: next.e.prof, newV: next.v, node: node, diffOpts: opts, export: export,
 	}
 	if err := s.admit(p); err != nil {
 		return nil, err
 	}
 	l := s.live
-	l.selected, l.focus = p.firstSelected(), ""
+	l.selected, l.focus, l.by = p.firstSelected(), "", p.by
 	s.commit()
 	return p, nil
 }
@@ -480,8 +487,8 @@ func (s *Server) admit(p *publication) error {
 			what, smaller = "the profiles and views of both sides, the diff and its index, and the page model", "compare smaller views"
 		}
 		return fmt.Errorf("the page would keep %d bytes in memory (%s), over MaxRetainedBytes=%d; "+
-			"%s or restart perf-agent-mcp with a larger --limit MaxRetainedBytes=N",
-			cost(nil), what, s.lim.MaxRetainedBytes, smaller)
+			"%s or %s",
+			cost(nil), what, s.lim.MaxRetainedBytes, smaller, s.raiseAdvice("MaxRetainedBytes"))
 	}
 
 	for _, d := range l.pubs[:len(l.pubs)-len(kept)] {
@@ -641,7 +648,7 @@ func (s *Server) commit() {
 	l := s.live
 	l.seq++
 	snap := &liveSnapshot{
-		seq: l.seq, current: l.current, selected: l.selected, focus: l.focus,
+		seq: l.seq, current: l.current, selected: l.selected, focus: l.focus, by: l.by,
 		pubs: make(map[string]*publication, len(l.pubs)), history: maps.Clone(l.history),
 	}
 	for _, p := range slices.SortedFunc(slices.Values(l.pubs), func(a, b *publication) int { return cmp.Compare(a.n, b.n) }) {
@@ -658,7 +665,8 @@ func (s *Server) commit() {
 }
 
 // liveStateEntry is a publication as the state lists it. history is its
-// history's version, "0" for a publication without one.
+// history's version, "0" for a publication without one; by is the label
+// of the session that made it, "" for none.
 type liveStateEntry struct {
 	ID        string          `json:"id"`
 	Kind      pubKind         `json:"kind"`
@@ -667,13 +675,17 @@ type liveStateEntry struct {
 	View      string          `json:"view"`
 	Digest    string          `json:"digest"`
 	History   string          `json:"history"`
+	By        string          `json:"by"`
 }
 
+// liveState is the page's state. by is the label of the session that last
+// set the steering (current, selected and focus), "" for none.
 type liveState struct {
 	Seq          string           `json:"seq"`
 	Current      string           `json:"current"`
 	Selected     string           `json:"selected"`
 	Focus        string           `json:"focus"`
+	By           string           `json:"by"`
 	Publications []liveStateEntry `json:"publications"`
 }
 
@@ -681,12 +693,12 @@ type liveState struct {
 // it can switch to. Integers are decimal strings.
 func stateOf(snap *liveSnapshot) []byte {
 	st := liveState{
-		Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus,
+		Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus, By: snap.by,
 		Publications: []liveStateEntry{},
 	}
 	for _, id := range snap.order {
 		p := snap.pubs[id]
-		e := liveStateEntry{ID: p.id, Kind: p.kind, Title: p.title, TitleSegs: p.titleSegs, View: p.view, History: "0"}
+		e := liveStateEntry{ID: p.id, Kind: p.kind, Title: p.title, TitleSegs: p.titleSegs, View: p.view, History: "0", By: p.by}
 		if p.kind == pubExplained && p.prof != nil {
 			e.Digest = p.digest.String()
 		}

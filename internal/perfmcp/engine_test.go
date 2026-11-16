@@ -27,21 +27,21 @@ func TestAcquireTakesAFreeSlotEvenWithACancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	for i := range 1000 {
-		if err := e.acquire(ctx); err != nil {
+		if err := e.acquire(ctx, holder{tool: "test"}); err != nil {
 			t.Fatalf("try %d: a free slot with a cancelled context: %v", i, err)
 		}
-		if err := e.acquire(ctx); !errors.Is(err, context.Canceled) {
+		if err := e.acquire(ctx, holder{tool: "test"}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("try %d: a held slot with a cancelled context: %v, want context.Canceled", i, err)
 		}
 		e.release()
 	}
 
 	// A wait ends when the holder releases.
-	if err := e.acquire(t.Context()); err != nil {
+	if err := e.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	got := make(chan error, 1)
-	go func() { got <- e.acquire(t.Context()) }()
+	go func() { got <- e.acquire(t.Context(), holder{tool: "test"}) }()
 	select {
 	case err := <-got:
 		t.Fatalf("acquired a held slot: %v", err)
@@ -75,7 +75,7 @@ func TestTheEngineSerialisesToolsWithAJob(t *testing.T) {
 	var o openedAs
 	c.callOK("open", map[string]any{"path": "cpu.pb.gz"}, &o)
 
-	if err := c.srv.engine.acquire(t.Context()); err != nil {
+	if err := c.srv.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	req := fmt.Sprintf(`{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"top","arguments":{"handle":%q,"view":%q,"rows":"functions"}}}`+"\n", o.Handle, o.DefaultView)
@@ -173,7 +173,7 @@ func TestLivePageToolsHoldTheEngine(t *testing.T) {
 				return
 			default:
 			}
-			if err := s.engine.acquire(t.Context()); err != nil {
+			if err := s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 				return
 			}
 			for _, name := range []string{"cpu.pb.gz", "cpu-new.pb.gz"} {
@@ -206,7 +206,7 @@ func TestOpenAndDiffResultsAreUnchanged(t *testing.T) {
 	var nw openedAs
 	c.callOK("open", map[string]any{"path": "cpu-new.pb.gz"}, &nw)
 
-	if err := s.engine.acquire(t.Context()); err != nil {
+	if err := s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	direct, err := s.openResultFor("cpu.pb.gz", "")
@@ -229,7 +229,7 @@ func TestOpenAndDiffResultsAreUnchanged(t *testing.T) {
 	args["cursor"] = cursor
 	second := c.callOK("diff", args, nil)
 
-	if err := s.engine.acquire(t.Context()); err != nil {
+	if err := s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	defer s.engine.release()

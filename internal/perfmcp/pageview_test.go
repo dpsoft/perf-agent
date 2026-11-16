@@ -41,7 +41,7 @@ func goldenPublications(t *testing.T, edit func(*Config)) (*Server, liveOpened, 
 	n := openLive(t, s, "new.pb.gz")
 	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
 	bs, ns := mustBoth(s.diffSides(q))(t)
-	p2 := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "golden diff", ""))(t)
+	p2 := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "golden diff", "", ""))(t)
 	return s, o, unionNamed(t, p2.diff, "b")
 }
 
@@ -216,7 +216,7 @@ func TestNotifyGetsEveryCommittedState(t *testing.T) {
 		func() { o.publish(t, s, o.explained(t, s, "b", "0.411"), "") },
 		func() { o.reject(t, s, "c"); s.refreshHistory(); s.commit() },
 		func() {
-			if err := s.live.show("p1", "", false); err != nil {
+			if err := s.live.show("p1", "", false, ""); err != nil {
 				t.Fatal(err)
 			}
 			s.commit()
@@ -329,7 +329,7 @@ func TestNoPageToolsWithoutPage(t *testing.T) {
 	if s.live == nil {
 		t.Error("a server with Page has no live state")
 	}
-	if st := s.PageSnapshot().State(); string(st) != `{"seq":"0","current":"","selected":"","focus":"","publications":[]}` {
+	if st := s.PageSnapshot().State(); string(st) != `{"seq":"0","current":"","selected":"","focus":"","by":"","publications":[]}` {
 		t.Errorf("the zero state %s", st)
 	}
 }
@@ -499,7 +499,7 @@ func TestADiffPinsBothSides(t *testing.T) {
 	o, n := openLive(t, s, "cpu.pb.gz"), openLive(t, s, "new.pb.gz")
 	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
 	bs, ns := mustBoth(s.diffSides(q))(t)
-	p := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", ""))(t)
+	p := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "", ""))(t)
 	if p.prof == p.newProf || p.v == p.newV {
 		t.Fatal("the sides are one profile")
 	}
@@ -583,7 +583,7 @@ func TestDiffRoutesRaceNothing(t *testing.T) {
 		})
 	}
 	for i := range 20 {
-		if err := s.live.show("p2", string(p.diff.Root.UnionID()), i%2 == 0); err != nil {
+		if err := s.live.show("p2", string(p.diff.Root.UnionID()), i%2 == 0, ""); err != nil {
 			t.Error(err)
 		}
 		s.commit()
@@ -745,7 +745,7 @@ func TestADiffIsChargedForItsDerivedUnits(t *testing.T) {
 	if d.RetainedBytes() < unitBytes {
 		t.Errorf("the diff is estimated at %d bytes while its %d derived unit strings hold %d", d.RetainedBytes(), len(units), unitBytes)
 	}
-	if _, err := s.publishDiff(d, b, n, "", ""); err != nil {
+	if _, err := s.publishDiff(d, b, n, "", "", ""); err != nil {
 		t.Errorf("one shared derived unit fits the budget: %v", err)
 	}
 }

@@ -24,10 +24,10 @@ const rootCaptures = "captures"
 // uses by default inside the profiles root. They never share one.
 const (
 	ownerStdio = "stdio"
-	ownerServe = "serve"
+	ownerHub   = "hub"
 
 	defaultStdioCaptures = "captures"
-	defaultServeCaptures = "captures-serve"
+	defaultHubCaptures   = "captures-hub"
 )
 
 // Names inside the capture directory and its series.
@@ -50,6 +50,9 @@ type captureDir struct {
 	rel      string
 	owner    string
 	profiles string
+	// cmd is the binary the server runs as, which a write error tells the
+	// user to restart; "" means perf-agent-mcp.
+	cmd string
 }
 
 func (d *captureDir) close() { _ = d.root.Close() }
@@ -69,8 +72,8 @@ func (s *Server) captureDirName() string {
 	switch {
 	case s.captureCfg.Dir != "":
 		return s.captureCfg.Dir
-	case s.ownerKind() == ownerServe:
-		return defaultServeCaptures
+	case s.ownerKind() == ownerHub:
+		return defaultHubCaptures
 	}
 	return defaultStdioCaptures
 }
@@ -83,12 +86,12 @@ func (s *Server) captureDirName() string {
 // (ownerMismatch).
 func (s *Server) openCaptureDir() (*captureDir, *capture.Error) {
 	kind := s.ownerKind()
-	if kind != ownerStdio && kind != ownerServe {
-		return nil, capture.Errorf(capture.CodeDisabled, "", "the capture owner %q is neither %s nor %s", kind, ownerStdio, ownerServe)
+	if kind != ownerStdio && kind != ownerHub {
+		return nil, capture.Errorf(capture.CodeDisabled, "", "the capture owner %q is neither %s nor %s", kind, ownerStdio, ownerHub)
 	}
 	dir := s.captureDirName()
 	profiles := s.profiles.Name()
-	const next = "start perf-agent-mcp with --captures naming a directory inside the profiles root"
+	next := s.startAdvice("--captures naming a directory inside the profiles root")
 	rel, err := s.rel(s.profiles, dir)
 	if err == nil {
 		rel = filepath.Clean(rel)
@@ -108,11 +111,11 @@ func (s *Server) openCaptureDir() (*captureDir, *capture.Error) {
 	if fi, err := root.Stat("."); err == nil {
 		if pi, err := s.profiles.Stat("."); err == nil && os.SameFile(fi, pi) {
 			_ = root.Close()
-			return nil, capture.Errorf(capture.CodeDisabled, "start perf-agent-mcp with --captures naming a subdirectory of the profiles root",
+			return nil, capture.Errorf(capture.CodeDisabled, s.startAdvice("--captures naming a subdirectory of the profiles root"),
 				"the capture directory (--captures) is the profiles root itself, through a link")
 		}
 	}
-	d := &captureDir{root: root, rel: rel, owner: kind, profiles: profiles}
+	d := &captureDir{root: root, rel: rel, owner: kind, profiles: profiles, cmd: s.command()}
 	if e := s.claimOwner(d); e != nil {
 		d.close()
 		return nil, e
@@ -141,7 +144,7 @@ func (s *Server) claimOwner(d *captureDir) *capture.Error {
 	if err == nil {
 		err = json.Unmarshal(b, &rec)
 	}
-	if err != nil || rec.Format != 1 || (rec.Kind != ownerStdio && rec.Kind != ownerServe) {
+	if err != nil || rec.Format != 1 || (rec.Kind != ownerStdio && rec.Kind != ownerHub) {
 		return capture.Errorf(capture.CodeOwnerMismatch, "give this server its own directory with --captures",
 			"the capture directory %s inside the profiles root has an %s that perf-agent-mcp did not write", d.rel, ownerFile)
 	}
@@ -158,7 +161,7 @@ func (s *Server) ownerMismatch() *capture.Error {
 		return nil
 	}
 	return capture.Errorf(capture.CodeOwnerMismatch,
-		"a stdio server and a serve server never share a capture directory; start this one with --captures naming another directory",
+		"a stdio server and a hub server never share a capture directory; "+s.startAdvice("--captures naming another directory"),
 		"the capture directory %s inside the profiles root belongs to a perf-agent-mcp %s server, and this one is %s", s.capturesRel(), *seen, s.ownerKind())
 }
 
@@ -199,7 +202,7 @@ func (d *captureDir) openSeries(name string) (*os.Root, error) {
 // inside the profiles root and the flag that moves it.
 func (d *captureDir) writeError(err error) *capture.Error {
 	return capture.Errorf(capture.CodeDisk,
-		"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+		"free space there, or "+startWith(cmp.Or(d.cmd, defaultCommand), "--captures naming another directory inside the profiles root"),
 		"cannot write in the capture directory %s inside the profiles root: %s", d.rel, causeText(err))
 }
 

@@ -37,6 +37,9 @@ type UsageError struct{ Msg string }
 
 func (e *UsageError) Error() string { return e.Msg }
 
+// hubLimitPrefix starts the names of the limits only perf-agent-hub has.
+const hubLimitPrefix = "Hub."
+
 // captureFlags are the flags that only matter with --perf-agent.
 var captureFlags = []string{"captures", "capture-command", "capture-ttl", "gpu-shim"}
 
@@ -154,6 +157,10 @@ func (v *Values) Config(fs *flag.FlagSet, stderr io.Writer, version string) (per
 		lim.MaxOpenHandles = hubOpenHandles
 	}
 	for _, kv := range v.limits {
+		// The Hub limits bound the hub's transport, which stdio has not.
+		if limit, _, _ := strings.Cut(kv, "="); v.kind != Hub && strings.HasPrefix(limit, hubLimitPrefix) {
+			return perfmcp.Config{}, usage("--limit %s: %s is a perf-agent-hub limit", kv, limit)
+		}
 		if err := SetLimit(&lim, kv); err != nil {
 			return perfmcp.Config{}, usage("--limit %s: %v", kv, err)
 		}

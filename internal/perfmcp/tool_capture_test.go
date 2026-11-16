@@ -289,7 +289,7 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 
 	// A capture directory known to belong to the other kind is refused
 	// before anything else is looked at.
-	e.s.ownerSeen.Store(new(ownerServe))
+	e.s.ownerSeen.Store(new(ownerHub))
 	text, _ := c.call("capture", map[string]any{"pid": 0})
 	if w := toolErrorOf(t, text); w.Code != string(capture.CodeOwnerMismatch) {
 		t.Errorf("%+v", w)

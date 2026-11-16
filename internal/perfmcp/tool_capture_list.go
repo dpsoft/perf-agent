@@ -154,22 +154,22 @@ const (
 // pool, waiting at most listWait for it.
 func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
-		return toolError(s.disabledError(), nil), nil
+		return s.toolError(s.disabledError(), nil), nil
 	}
 	var a listArgs
 	if err := decodeArgs("capture_list", raw, &a); err != nil {
-		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	series := ""
 	if a.Series != nil {
 		if !validSeries(*a.Series) {
-			return toolError(invalidArgument("pass a series as capture_list without series shows them", "series %q is not a series name", echo(*a.Series)), nil), nil
+			return s.toolError(invalidArgument("pass a series as capture_list without series shows them", "series %q is not a series name", echo(*a.Series)), nil), nil
 		}
 		series = *a.Series
 	}
 	limit, err := s.pageLimit(a.Limit)
 	if err != nil {
-		return toolError(invalidArgument(fmt.Sprintf("pass limit from 1 to %d, or leave it out", s.lim.MaxRows), "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(fmt.Sprintf("pass limit from 1 to %d, or leave it out", s.lim.MaxRows), "%s", err.Error()), nil), nil
 	}
 
 	var out listAnswer
@@ -216,7 +216,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		out.Captures = s.withHandles(out.Captures)
 	}
 	if err != nil {
-		return toolError(invalidArgument("call capture_list again without cursor for the first page, then pass the next_cursor it answers", "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument("call capture_list again without cursor for the first page, then pass the next_cursor it answers", "%s", err.Error()), nil), nil
 	}
 	out.TotalRows, out.Skipped, out.OmittedCount = number(info.TotalRows), number(info.Skipped), number(info.OmittedCount)
 	out.NextCursor = info.NextCursor
@@ -225,7 +225,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, err
 	}
 	if len(b) > s.lim.MaxResponseBytes {
-		return toolError(invalidArgument(shrinkWithLimit, "the capture_list answer is %d bytes, over MaxResponseBytes=%d", len(b), s.lim.MaxResponseBytes), nil), nil
+		return s.toolError(invalidArgument(shrinkWithLimit, "the capture_list answer is %d bytes, over MaxResponseBytes=%d", len(b), s.lim.MaxResponseBytes), nil), nil
 	}
 	return mcpstdio.Result{Text: string(b)}, nil
 }

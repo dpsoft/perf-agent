@@ -437,14 +437,14 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 		if err := os.Mkdir(e.captures(), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		owner := []byte(`{"kind":"serve","format":1}` + "\n")
+		owner := []byte(`{"kind":"hub","format":1}` + "\n")
 		if err := os.WriteFile(filepath.Join(e.captures(), ownerFile), owner, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		cfg := e.config()
 		cfg.Captures = "captures"
 		c := startServerProcess(t, cfg)
-		refuses(t, e, c, ownerServe, ownerStdio)
+		refuses(t, e, c, ownerHub, ownerStdio)
 		if names := e.listCaptures(); !slices.Equal(names, []string{ownerFile}) {
 			t.Errorf("the serve directory holds %v", names)
 		}
@@ -461,9 +461,9 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 		s := startServerProcess(t, cfg)
 		s.waitResult(s.startCapture(e.args("1s")))
 		before := e.listCaptures()
-		cfg.Owner = ownerServe
+		cfg.Owner = ownerHub
 		c := startServerProcess(t, cfg)
-		refuses(t, e, c, ownerStdio, ownerServe)
+		refuses(t, e, c, ownerStdio, ownerHub)
 		if after := e.listCaptures(); !slices.Equal(after, before) {
 			t.Errorf("the serve server changed the stdio directory: %v, then %v", before, after)
 		}

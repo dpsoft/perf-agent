@@ -188,3 +188,25 @@ func TestEveryLimitFieldCanBeSetByFlag(t *testing.T) {
 		}
 	}
 }
+
+// The Hub limits bound the hub's transport: stdio has none, so it refuses
+// them by name rather than accept a limit with no effect.
+func TestStdioRefusesHubLimits(t *testing.T) {
+	profiles := t.TempDir()
+	_, _, err := parse(t, Stdio, "--profiles", profiles, "--limit", "Hub.MaxCalls=4")
+	if ue, ok := errors.AsType[*UsageError](err); !ok || !strings.Contains(ue.Msg, "Hub.MaxCalls is a perf-agent-hub limit") {
+		t.Errorf("stdio --limit Hub.MaxCalls=4: %v", err)
+	}
+	cfg, _, err := parse(t, Hub, "--profiles", profiles, "--limit", "Hub.MaxCalls=4")
+	if err != nil {
+		t.Fatalf("hub --limit Hub.MaxCalls=4: %v", err)
+	}
+	if cfg.Limits.Hub.MaxCalls != 4 {
+		t.Errorf("hub MaxCalls = %d", cfg.Limits.Hub.MaxCalls)
+	}
+	// The engine wait is every server's.
+	cfg, _, err = parse(t, Stdio, "--profiles", profiles, "--limit", "MaxEngineWait=10s")
+	if err != nil || cfg.Limits.MaxEngineWait != 10*time.Second {
+		t.Errorf("stdio --limit MaxEngineWait=10s: %v, %v", cfg.Limits.MaxEngineWait, err)
+	}
+}

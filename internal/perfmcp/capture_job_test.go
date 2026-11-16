@@ -516,7 +516,7 @@ func TestJobRunsThroughEveryState(t *testing.T) {
 	if r.Profiles[0].Path != "captures/adhoc/001-run-cpu.pb.gz" || r.Capture.ID != "001" || r.Capture.Series != "adhoc" {
 		t.Errorf("result %+v", r.Capture)
 	}
-	if err := e.s.engine.acquire(t.Context()); err != nil {
+	if err := e.s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	_, open := e.s.store.entries[r.Profiles[0].Open.Handle]
@@ -595,7 +595,7 @@ func TestBlockedSeamsNeverBlockAdmissionOrWait(t *testing.T) {
 	}
 	t.Run("the engine", func(t *testing.T) {
 		e := newJobEnv(t, jobOpts{})
-		if err := e.s.engine.acquire(t.Context()); err != nil {
+		if err := e.s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 			t.Fatal(err)
 		}
 		held := true

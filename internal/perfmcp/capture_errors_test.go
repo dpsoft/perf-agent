@@ -102,7 +102,7 @@ func TestEveryErrorCodeIsProducedOnce(t *testing.T) {
 				if err := os.Mkdir(dir, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				writeFixture(t, dir, ownerFile, []byte(`{"kind":"serve","format":1}`+"\n"))
+				writeFixture(t, dir, ownerFile, []byte(`{"kind":"hub","format":1}`+"\n"))
 			})
 		},
 		capture.CodeBudget: func(t *testing.T) string {

@@ -679,7 +679,7 @@ func (r *retention) fail(err error) error {
 		return err
 	}
 	return capture.Errorf(capture.CodeDisk,
-		"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+		"free space there, or "+r.s.startAdvice("--captures naming another directory inside the profiles root"),
 		"retention stopped in the capture directory %s inside the profiles root: %s; the next pass goes on from there", r.d.rel, causeText(err))
 }
 

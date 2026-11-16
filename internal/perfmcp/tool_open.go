@@ -94,7 +94,7 @@ func (s *Server) handleOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	return s.respond("open", shrinkOpen, out)
+	return s.respond("open", s.shrinkOpen(), out)
 }
 
 // openResultFor opens name, and execlog when not "", both relative to the

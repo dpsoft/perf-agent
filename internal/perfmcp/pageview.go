@@ -2,6 +2,7 @@ package perfmcp
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +53,9 @@ const maxPageID = 64
 // ErrPageNotFound.
 type PageView struct {
 	snap *liveSnapshot
+	// cmd is the binary the server runs as, which a limit's advice names;
+	// "" means perf-agent-mcp.
+	cmd string
 }
 
 // PageSnapshot is the snapshot the engine holder last committed. Any
@@ -60,7 +64,7 @@ func (s *Server) PageSnapshot() PageView {
 	if s.live == nil {
 		return PageView{}
 	}
-	return PageView{snap: s.live.snapshot()}
+	return PageView{snap: s.live.snapshot(), cmd: s.command()}
 }
 
 // ClaimPage marks s's live page as served. A page has one set of routes:
@@ -131,7 +135,7 @@ func (v PageView) Frame(pub, node string) ([]byte, error) {
 	// makes it as large as the stack: it is bounded like a model.
 	if limit > 0 && len(out) > limit {
 		return nil, &PageLimitError{fmt.Sprintf("the frame and its path from the root take %d bytes, over this server's MaxPageBytes=%d, so the page cannot show it; "+
-			"restart perf-agent-mcp with a larger --limit MaxPageBytes=N to see it", len(out), limit)}
+			"restart %s with a larger --limit MaxPageBytes=N to see it", len(out), limit, cmp.Or(v.cmd, defaultCommand))}
 	}
 	return out, nil
 }

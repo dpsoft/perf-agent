@@ -86,7 +86,7 @@ func retainNow(t *testing.T, s *Server, d *captureDir, baseline string) []string
 
 func retainOnce(t *testing.T, s *Server, d *captureDir, baseline string) ([]string, error) {
 	t.Helper()
-	if err := s.engine.acquire(t.Context()); err != nil {
+	if err := s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	defer s.engine.release()

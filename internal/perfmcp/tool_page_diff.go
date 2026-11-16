@@ -65,7 +65,7 @@ type pageDiffed struct {
 	Viewers         string   `json:"viewers"`
 }
 
-func (s *Server) handlePageDiff(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
+func (s *Server) handlePageDiff(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.live == nil {
 		return mcpstdio.Result{}, errLiveDisabled
 	}
@@ -101,10 +101,10 @@ func (s *Server) handlePageDiff(_ context.Context, raw json.RawMessage) (mcpstdi
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	p, err := s.publishDiff(d, base, next, a.Title, node)
+	p, err := s.publishDiff(d, base, next, a.Title, node, mcpstdio.ClientLabel(ctx))
 	if _, ok := errors.AsType[*modelError](err); ok {
 		return mcpstdio.Result{}, fmt.Errorf("the diff cannot be drawn within this server's MaxPageBytes=%d: %v; "+
-			"restart perf-agent-mcp with a larger --limit MaxPageBytes=N; nothing was published", s.lim.MaxPageBytes, err)
+			"%s; nothing was published", s.lim.MaxPageBytes, err, s.raiseAdvice("MaxPageBytes"))
 	}
 	if err != nil {
 		return mcpstdio.Result{}, err
@@ -118,5 +118,5 @@ func (s *Server) handlePageDiff(_ context.Context, raw json.RawMessage) (mcpstdi
 	if base.v.IsGPU() {
 		out.BaseNotes, out.NewNotes = nonNil(d.BaseNotes), nonNil(d.NewNotes)
 	}
-	return s.respond("page_diff", shrinkPage, out)
+	return s.respond("page_diff", s.shrinkPage(), out)
 }

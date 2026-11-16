@@ -34,6 +34,14 @@ type Config struct {
 	Limits Limits
 	// Version is reported to clients in serverInfo.
 	Version string
+	// Command is the name of the binary that runs the server: serverInfo
+	// names it, and so does every text that tells the user to start or
+	// restart the server. "" means perf-agent-mcp.
+	Command string
+	// HoldEngine, when set, is called with a tool's name once the call
+	// holds the engine, before the tool's handler runs. It is a seam for
+	// tests, which hold the engine with it; nil in production.
+	HoldEngine func(tool string)
 	// Log receives diagnostics; nil discards them. It must not write to the
 	// stream Serve answers on.
 	Log *slog.Logger
@@ -54,8 +62,9 @@ type CaptureConfig struct {
 	// Dir is the captures directory; GPUShim the absolute path of the
 	// CUPTI adapter a gpu capture injects, "" when gpu captures are off.
 	Dir, GPUShim string
-	// Owner is the kind of server that writes in Dir ("stdio" or
-	// "serve"), so two kinds never share one captures directory.
+	// Owner is the kind of server that writes in Dir ("stdio" or "hub"),
+	// so two kinds never share one captures directory. Without Dir, each
+	// kind has its own default: captures, or captures-hub.
 	Owner string
 	// Commands, when set, are the only programs a capture may launch, each
 	// an absolute path.

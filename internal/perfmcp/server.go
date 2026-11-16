@@ -2,6 +2,7 @@ package perfmcp
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -64,8 +65,12 @@ type Server struct {
 	// evalSymlinks is filepath.EvalSymlinks; a seam for tests.
 	evalSymlinks func(string) (string, error)
 
-	// engine grants the engine state to one holder at a time.
-	engine *engine
+	// engine grants the engine state to one holder at a time; holdEngine
+	// is Config.HoldEngine.
+	engine     *engine
+	holdEngine func(tool string)
+	// cmd is the binary's name, Config.Command or perf-agent-mcp.
+	cmd string
 	// captureCfg is the capture configuration, and perfAgent and shim what
 	// New verified of it. captureDisabled says why capture is off, and is
 	// "" when it is on.
@@ -73,6 +78,9 @@ type Server struct {
 	perfAgent       capture.Binary
 	shim            capture.Shim
 	captureDisabled string
+	// noPerfAgent says capture is off because no perf-agent was given, so
+	// captureDisabled is the tools' own DISABLED sentence.
+	noPerfAgent bool
 
 	// The capture file protocol's seams, all nil outside tests: now is the
 	// clock (time.Now); ownerAlive judges an intent's owner (by its
@@ -166,9 +174,29 @@ type Server struct {
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
 var readSelfStatus = capture.ReadSelfStatus
 
+// defaultCommand is the binary a server runs as when Config.Command is
+// empty: the stdio one.
+const defaultCommand = "perf-agent-mcp"
+
+// command is the name of the binary this server runs as.
+func (s *Server) command() string { return cmp.Or(s.cmd, defaultCommand) }
+
+// startAdvice tells the user to start the server with what.
+func (s *Server) startAdvice(what string) string { return startWith(s.command(), what) }
+
+// startWith tells the user to start the binary command with what.
+func startWith(command, what string) string { return "start " + command + " with " + what }
+
+// raiseAdvice tells the user to restart the server with limit raised.
+func (s *Server) raiseAdvice(limit string) string {
+	return "restart " + s.command() + " with a larger --limit " + limit + "=N"
+}
+
 // captureDisabledText is every capture call's answer, and the start of the
 // tool's description, on a server started without a perf-agent binary.
-const captureDisabledText = "DISABLED: start perf-agent-mcp with --perf-agent PATH (the setcap'd perf-agent binary) to enable capturing."
+func (s *Server) captureDisabledText() string {
+	return "DISABLED: " + s.startAdvice("--perf-agent PATH (the setcap'd perf-agent binary) to enable capturing.")
+}
 
 // drainTimeout bounds how long Serve, once its input or context ended,
 // writes the answers already queued: under the command's 1 s shutdown
@@ -194,6 +222,8 @@ func New(cfg Config) (_ *Server, err error) {
 
 		evalSymlinks: filepath.EvalSymlinks,
 		engine:       newEngine(),
+		holdEngine:   cfg.HoldEngine,
+		cmd:          cfg.Command,
 		dirMu:        make(chan struct{}, 1),
 		listKept:     map[string]keptHistory{},
 	}
@@ -232,7 +262,7 @@ func New(cfg Config) (_ *Server, err error) {
 	}
 	s.registry = newRegistry(lim.Capture, randHex(2))
 	s.mcp = mcpstdio.New(mcpstdio.Options{
-		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
+		Info:            mcpstdio.Implementation{Name: s.command(), Title: "perf-agent profiles", Version: cfg.Version},
 		Instructions:    instructions,
 		Tools:           s.tools(),
 		Prompts:         guidePrompts(),
@@ -297,7 +327,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 		s.captureDisabled = "capture needs Linux"
 		return nil
 	case c.PerfAgent == "":
-		s.captureDisabled = captureDisabledText
+		s.captureDisabled, s.noPerfAgent = s.captureDisabledText(), true
 		return nil
 	}
 	verify := c.Verify
@@ -432,7 +462,7 @@ func (s *Server) tools() []mcpstdio.Tool {
 	}
 	for _, group := range [][]mcpstdio.Tool{ts, pages} {
 		for i := range group {
-			group[i].Handler = s.engineHandler(group[i].Handler)
+			group[i].Handler = s.engineHandler(group[i].Name, group[i].Handler)
 		}
 	}
 	// The capture tools never hold the engine: a wait would keep every
@@ -444,16 +474,17 @@ func (s *Server) tools() []mcpstdio.Tool {
 // readOnly are the annotations of every tool that only reads.
 var readOnly = mcpstdio.Annotations{ReadOnly: true, Idempotent: true}
 
-// Advice for a response over MaxResponseBytes, per kind of tool.
-const (
-	// shrinkWithLimit is for tools that page their rows with limit.
-	shrinkWithLimit = "call again with a smaller limit"
-	// shrinkOpen is for open, whose size is the profile's own: one
-	// unresolved_by_module entry per module with unresolved frames, and the
-	// notes.
-	shrinkOpen = "it is large because of the profile's unresolved_by_module entries and notes; " +
-		"restart perf-agent-mcp with a larger --limit MaxResponseBytes=N to open it"
-)
+// shrinkWithLimit is the advice for a response over MaxResponseBytes of a
+// tool that pages its rows with limit.
+const shrinkWithLimit = "call again with a smaller limit"
+
+// shrinkOpen is the advice for open's response over MaxResponseBytes,
+// whose size is the profile's own: one unresolved_by_module entry per
+// module with unresolved frames, and the notes.
+func (s *Server) shrinkOpen() string {
+	return "it is large because of the profile's unresolved_by_module entries and notes; " +
+		s.raiseAdvice("MaxResponseBytes") + " to open it"
+}
 
 // respond encodes a tool's result as compact JSON text, refusing one over
 // MaxResponseBytes with shrink, which says how to get a smaller one.

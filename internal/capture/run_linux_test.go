@@ -1641,3 +1641,26 @@ func TestADeadlineAfterPerfAgentFinishedFailsNothing(t *testing.T) {
 		t.Fatalf("Err = %v", r.o.Err)
 	}
 }
+
+// A reaper that cannot start and a cgroup that cannot be made are
+// reported without the server's paths: the server's own binary and the
+// cgroup's directory are not the agent's to see.
+func TestStartFailuresNameNoServerPath(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Launch = launchOf(t, "sleep", "1s")
+	missing := filepath.Join(t.TempDir(), "no-such-server")
+	spec.Self = missing
+	if _, e := Start(spec); e == nil || strings.Contains(e.Message+e.Next, missing) {
+		t.Errorf("a reaper that cannot start: %v", e)
+	}
+
+	spec = runSpec(t, capturetest.FakeOptions{})
+	spec.Launch = launchOf(t, "sleep", "1s")
+	parent := filepath.Join(t.TempDir(), "no-such-cgroup-parent")
+	spec.Cgroup = parent
+	o := waitRun(t, startRun(t, spec), 30*time.Second)
+	notes := strings.Join(o.Notes, "\n")
+	if !strings.Contains(notes, "no cgroup") || strings.Contains(notes, parent) {
+		t.Errorf("notes %q: no cgroup note, or one naming %s", notes, parent)
+	}
+}

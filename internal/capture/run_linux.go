@@ -175,7 +175,7 @@ func Start(spec RunSpec) (*Run, *Error) {
 		if spec.Cgroup != "" {
 			cg, err := CreateCgroup(spec.Cgroup, cgroupName(spec.CaptureID))
 			if err != nil {
-				r.o.Notes = append(r.o.Notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", err))
+				r.o.Notes = append(r.o.Notes, fmt.Sprintf("no cgroup: creating the capture's cgroup under the delegated cgroup failed (%v); the subreaper sweep was used", pathErr(err)))
 			}
 			rspec.Cgroup, r.cgroup = cg, cg
 		}
@@ -299,7 +299,7 @@ func (r *Run) startReaper(rs ReaperSpec) *Error {
 		if reads[i], writes[i], err = os.Pipe(); err != nil {
 			closeAll(reads[:])
 			closeAll(writes[:])
-			return Errorf(CodePerfAgentUnstartable, "", "create the capture's pipes: %v", err)
+			return Errorf(CodePerfAgentUnstartable, "", "create the capture's pipes: %v", pathErr(err))
 		}
 	}
 	files := ReaperFiles{Lock: r.spec.Lock, PerfOut: writes[0], PerfErr: writes[1]}
@@ -310,7 +310,7 @@ func (r *Run) startReaper(rs ReaperSpec) *Error {
 	closeAll(writes[:])
 	if err != nil {
 		closeAll(reads[:])
-		return Errorf(CodePerfAgentUnstartable, "check that perf-agent-mcp's own binary is intact", "start the capture's reaper: %v", err)
+		return Errorf(CodePerfAgentUnstartable, "check that perf-agent-mcp's own binary is intact", "start the capture's reaper (perf-agent-mcp's own binary): %v", pathErr(err))
 	}
 	r.reaper = reaper
 	r.evc = reaper.Events()
@@ -1161,7 +1161,7 @@ func (r *Run) lost(why string) {
 	}
 	if r.cgroup != "" {
 		if _, err := os.Stat(r.cgroup); err == nil {
-			r.o.Notes = append(r.o.Notes, fmt.Sprintf("the command's cgroup %s was not removed; it may still hold processes", r.cgroup))
+			r.o.Notes = append(r.o.Notes, fmt.Sprintf("the command's cgroup %s under the delegated cgroup was not removed; it may still hold processes", filepath.Base(r.cgroup)))
 			for _, pid := range cgroupProcs(r.cgroup) {
 				if st, err := readStat(r.spec.Proc, pid); err == nil {
 					add(pid, st.start)

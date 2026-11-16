@@ -1611,3 +1611,25 @@ func TestWaitReturnsWithTheLockFree(t *testing.T) {
 	}
 	_ = l.Close()
 }
+
+// A deadline the reaper reaches while it ends the command, perf-agent
+// having finished well, fails nothing: the profile is complete.
+func TestADeadlineAfterPerfAgentFinishedFailsNothing(t *testing.T) {
+	kills := 0
+	r := testRun(t, &kills)
+	r.spec.Launch = &LaunchSpec{Path: "/x/bench"}
+	r.work = instance{11, 11}
+	r.targetKnown, r.target = true, TargetState{PID: 11, StartTime: 11}
+	r.readyAt = time.Now().Add(-time.Second)
+	r.setPhase(PhaseProfiling)
+	evs := make(chan Event, 3)
+	evs <- Event{Op: EventExited, Who: WhoPerfAgent, PID: 1, Status: 0}
+	evs <- Event{Op: EventDeadline}
+	evs <- Event{Op: EventExited, Who: WhoWorkload, PID: 11, Status: -1, Signal: "killed"}
+	close(evs)
+	r.evc = evs
+	r.drainPending()
+	if r.o.Err != nil {
+		t.Fatalf("Err = %v", r.o.Err)
+	}
+}

@@ -715,7 +715,14 @@ func (r *Run) event(ev Event) {
 // deadline, which only a server that did not act on its own bounds (one
 // stopped or starved) lets come: a bound, start_timeout before readiness
 // and finish_timeout after, decided before the exits the kills cause.
+// After perf-agent's exit it is only a note: perf-agent's exit decides.
 func (r *Run) deadlinePassed() {
+	if r.perfExited {
+		// perf-agent had finished: the deadline came while the reaper ended
+		// the command, and perf-agent's own exit decides the capture.
+		r.o.Notes = append(r.o.Notes, "the capture's reaper ended the command at its deadline, after perf-agent had finished")
+		return
+	}
 	const next = "capture again; if this repeats, check that perf-agent-mcp is not stopped or starved of CPU"
 	e := Errorf(CodeFinishTimeout, next,
 		"the capture's reaper ended it at its deadline, after FinishTimeout=%v: this server did not stop it in time", r.b.FinishTimeout)

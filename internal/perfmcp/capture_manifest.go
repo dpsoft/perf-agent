@@ -353,8 +353,12 @@ func hashFile(f *os.File) (string, error) {
 const quarantinePrefix = ".del-"
 
 // quarantineHook, when set, runs between the identity check and the move
-// aside; a seam for tests.
-var quarantineHook func(root *os.Root, name string)
+// aside, and quarantineAfterHook just after the move (an errCrash from it
+// stops there, as a crash would); seams for tests.
+var (
+	quarantineHook      func(root *os.Root, name string)
+	quarantineAfterHook func() error
+)
 
 // removeByIdentity removes name inside root only when it is the file want
 // records (see matches). It reports whether it removed the name, and when
@@ -365,6 +369,13 @@ var quarantineHook func(root *os.Root, name string)
 // then unlinked; a file that turns out not to be the recorded one is put
 // back under its name without replacing anything.
 func removeByIdentity(root *os.Root, name string, want fileIdentity) (removed bool, left string, err error) {
+	return removeTagged(root, name, want, "")
+}
+
+// removeTagged is removeByIdentity with tag in the quarantine name: a
+// capture's token, so that recovery can tell whose quarantined file a
+// crash left.
+func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (removed bool, left string, err error) {
 	why, err := matches(root, name, want)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -377,12 +388,17 @@ func removeByIdentity(root *os.Root, name string, want fileIdentity) (removed bo
 	if quarantineHook != nil {
 		quarantineHook(root, name)
 	}
-	q := filepath.Join(filepath.Dir(name), quarantinePrefix+randHex(8))
+	q := filepath.Join(filepath.Dir(name), quarantinePrefix+tag+randHex(8))
 	if err := root.Rename(name, q); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, "", nil
 		}
 		return false, "", err
+	}
+	if quarantineAfterHook != nil {
+		if err := quarantineAfterHook(); err != nil {
+			return false, "", err
+		}
 	}
 	why, err = matches(root, q, want)
 	if err == nil && why == "" {

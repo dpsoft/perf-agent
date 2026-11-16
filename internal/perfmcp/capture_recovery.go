@@ -159,6 +159,20 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 				claimed[tn] = true
 			}
 		}
+		// A manifest temporary no rewrite recorded yet carries the token in
+		// its name and holds this capture's manifest.
+		for _, tn := range names {
+			if !in.isTemp(t.id, tn) || !strings.HasPrefix(tn, "."+manifestName(t.id, in.Label)) || slices.ContainsFunc(in.Temps, func(f fileIdentity) bool { return f.Name == tn }) {
+				continue
+			}
+			if id, ok := proveByToken(ser, tn, in, maxManifestBytes, in.holdsManifest); ok {
+				if removed, _, err := t.remove(ser, tn, id); err != nil {
+					return notes, d.writeError(err)
+				} else if removed {
+					claimed[tn] = true
+				}
+			}
+		}
 		// A heartbeat the intent does not record yet (a crash before the
 		// rewrite that records it) is proven by holding the intent's token.
 		hbName := heartbeatName(t.id, in.Label)
@@ -167,6 +181,31 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 				return string(b) == in.Token+"\n"
 			}); ok {
 				t.in.Heartbeat = &id
+			}
+		}
+		// A name this capture's removal moved aside, when a crash came
+		// before its unlink: proven against what the intent records.
+		for _, tn := range names {
+			if !strings.HasPrefix(tn, quarantinePrefix+t.tag()) {
+				continue
+			}
+			fi, err := ser.Lstat(tn)
+			if err != nil {
+				continue
+			}
+			if fi.IsDir() {
+				if st, _ := statOf(fi); in.StagingDev != 0 && st.dev == in.StagingDev && st.ino == in.StagingIno {
+					if err := t.removeStagingDir(tn); err != nil {
+						return notes, d.writeError(err)
+					}
+				}
+			} else if id, ok := t.proveQuarantined(ser, tn); ok {
+				if _, _, err := t.remove(ser, tn, id); err != nil {
+					return notes, d.writeError(err)
+				}
+			}
+			if _, err := ser.Lstat(tn); errors.Is(err, fs.ErrNotExist) {
+				claimed[tn] = true
 			}
 		}
 		which := formatID(t.id) + "-" + in.Label
@@ -217,6 +256,7 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 		case claimed[n], n == seqFile:
 		case strings.HasPrefix(n, stagingPrefix):
 			add("orphan_staging", n, "no intent identifies this staging directory, so it is never removed automatically; remove it by hand")
+		case strings.HasPrefix(n, ".") && s.removeStray(ser, series, n):
 		case strings.HasPrefix(n, "."):
 			add("orphan_temp", n, "a file this server cannot prove it made, so it is never removed automatically; remove it by hand")
 		case ok && kind == kindHeartbeat:
@@ -232,15 +272,16 @@ const lockFile = ".lock"
 // interruptedNote is the note of a manifest recovery writes.
 const interruptedNote = "the server running this capture ended before it finished; recovery removed what it had written"
 
-// proveByToken is name's identity when it is a regular file with one link,
-// at most limit bytes, whose contents pass ours: bytes carrying in's
-// owner token, which only this server wrote. ok is false otherwise.
+// proveByToken is name's identity when it is a regular file with one or
+// two links (the second a name of the same bytes), at most limit bytes,
+// whose contents pass ours: bytes carrying in's owner token, which only
+// this server wrote. ok is false otherwise.
 func proveByToken(ser *os.Root, name string, in intent, limit int64, ours func([]byte) bool) (fileIdentity, bool) {
 	b, fi, err := readSmall(ser, name, limit)
 	if err != nil || in.Token == "" {
 		return fileIdentity{}, false
 	}
-	if st, _ := statOf(fi); st.nlink != 1 || !ours(b) {
+	if st, _ := statOf(fi); st.nlink < 1 || st.nlink > 2 || !ours(b) {
 		return fileIdentity{}, false
 	}
 	id := identityOf(name, fi)
@@ -253,6 +294,96 @@ func proveByToken(ser *os.Root, name string, in intent, limit int64, ours func([
 func (t *captureTxn) isRecorded(id fileIdentity) bool {
 	why, err := matches(t.ser, id.Name, id)
 	return err == nil && why == ""
+}
+
+// holdsToken reports whether b is bytes only this capture wrote: its
+// token (the heartbeat, the probe), or a version of its intent.
+func (in intent) holdsToken(b []byte) bool {
+	if string(b) == in.Token+"\n" {
+		return true
+	}
+	var other intent
+	return json.Unmarshal(b, &other) == nil && other.Token == in.Token && other.ID == in.ID && other.Label == in.Label && other.Series == in.Series
+}
+
+// holdsManifest reports whether b is a manifest of this capture.
+func (in intent) holdsManifest(b []byte) bool {
+	var m manifest
+	return json.Unmarshal(b, &m) == nil && m.WrittenBy == writtenBy && m.ID == in.ID && m.Label == in.Label && m.Series == in.Series
+}
+
+// proveQuarantined is the identity that proves a quarantined name of this
+// capture, when one does: a file the intent records (a capture file, a
+// temporary, the heartbeat, the intent itself), the committed manifest
+// under a second name, or bytes carrying the token.
+func (t *captureTxn) proveQuarantined(root *os.Root, name string) (fileIdentity, bool) {
+	cands := slices.Clone(t.in.Files)
+	cands = append(cands, t.in.Temps...)
+	if t.in.Heartbeat != nil {
+		cands = append(cands, *t.in.Heartbeat)
+	}
+	cands = append(cands, t.self)
+	if b, fi, err := readSmall(t.ser, manifestName(t.id, t.in.Label), maxManifestBytes); err == nil {
+		id := identityOf(name, fi)
+		sum := sha256.Sum256(b)
+		id.SHA256 = hex.EncodeToString(sum[:])
+		cands = append(cands, id)
+	}
+	for _, c := range cands {
+		c.Name = name
+		if why, err := matches(root, name, c); err == nil && why == "" {
+			return c, true
+		}
+	}
+	return proveByToken(root, name, t.in, maxManifestBytes, t.in.holdsToken)
+}
+
+// removeStray removes a dot-name of the series that no intent accounts
+// for when what it holds proves it: a capture's intent a crash left
+// quarantined after its manifest was written, or an intent temporary
+// whose intent was never linked. It reports whether the name is gone.
+func (s *Server) removeStray(ser *os.Root, series, name string) bool {
+	var tok, final string
+	switch {
+	case strings.HasPrefix(name, quarantinePrefix):
+		tok, _, _ = strings.Cut(strings.TrimPrefix(name, quarantinePrefix), "-")
+	default:
+		before, after, ok := strings.Cut(strings.TrimPrefix(name, "."), ".tmp-")
+		if !ok || !strings.HasSuffix(before, intentSuffix) {
+			return false
+		}
+		final, tok = before, after[:min(16, len(after))]
+	}
+	if !isHex(tok, 16) {
+		return false
+	}
+	var in intent
+	b, _, err := readSmall(ser, name, maxManifestBytes)
+	if err != nil || json.Unmarshal(b, &in) != nil || len(in.Token) != 32 || in.Token[:16] != tok || in.Series != series {
+		return false
+	}
+	id, ok := parseID(in.ID)
+	if !ok || in.check(intentName(id, in.Label)) != nil || !in.isTemp(id, name) && final != "" {
+		return false
+	}
+	if final == "" {
+		// Quarantined: only ever the intent's last removal, after its
+		// manifest.
+		if _, err := readManifest(ser, manifestName(id, in.Label)); err != nil {
+			return false
+		}
+	} else if _, err := ser.Lstat(final); !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	proof, ok := proveByToken(ser, name, in, maxManifestBytes, in.holdsToken)
+	if !ok {
+		return false
+	}
+	removed, _, err := removeByIdentity(ser, name, proof)
+	if removed {
+		s.log.Info("capture recovery removed a leftover its contents prove", "series", series, "name", name)
+	}
+	return err == nil && removed
 }
 
 // adopt is the transaction of an intent another (gone) owner wrote, for

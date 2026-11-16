@@ -1,12 +1,17 @@
 package perfmcp
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dpsoft/perf-agent/internal/capture"
 )
 
 // TestRemovalQuarantinesBeforeItUnlinks: a file swapped in under the name
@@ -181,4 +186,100 @@ func TestAStagingDirectorySwappedAfterItsCheckIsLeft(t *testing.T) {
 		t.Fatalf("the swapped-in directory's file is %q, %v", got, err)
 	}
 	invariant(t, d, notes, filepath.Base(staging)+".moved")
+}
+
+// quarantineCrash makes the n-th quarantine move the last thing the
+// process does: the file is renamed aside, and nothing after happens.
+func quarantineCrash(n int) func() {
+	var seen int
+	quarantineAfterHook = func() error {
+		seen++
+		if seen == n {
+			return errCrash
+		}
+		return nil
+	}
+	return func() { quarantineAfterHook = nil }
+}
+
+// TestAQuarantinedFileIsProvenByItsCapture: a crash between moving a file
+// aside and unlinking it leaves a quarantine name that carries the
+// capture's token; recovery proves it against what the intent recorded
+// (or the token it holds) and removes it, at every removal of a commit's
+// cleanup and of a rollback.
+func TestAQuarantinedFileIsProvenByItsCapture(t *testing.T) {
+	// The removals of a clean capture, counted in a run that does not crash.
+	count := 0
+	s0, d0, _ := newCaptureServer(t)
+	quarantineAfterHook = func() error { count++; return nil }
+	if r := drive(t, s0, d0, capCase{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}}); !r.committed {
+		t.Fatal(r.err)
+	}
+	quarantineAfterHook = nil
+	if count < 6 {
+		t.Fatalf("only %d removals in a clean capture", count)
+	}
+	for n := 1; n <= count; n++ {
+		t.Run(fmt.Sprintf("commit-removal-%d", n), func(t *testing.T) {
+			s, d, clk := newCaptureServer(t)
+			defer quarantineCrash(n)()
+			r := drive(t, s, d, capCase{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}})
+			quarantineAfterHook = nil
+			if !errors.Is(r.err, errCrash) {
+				t.Fatalf("no crash at removal %d: %v", n, r.err)
+			}
+			notes := crashRecover(t, s, d, clk)
+			noOrphans(t, notes)
+			invariant(t, d, notes)
+		})
+	}
+	t.Run("rollback-removal", func(t *testing.T) {
+		s, d, clk := newCaptureServer(t)
+		s.captureFault = inject(shot{faultAfterLinks, 1, errInjected})
+		defer quarantineCrash(1)()
+		r := drive(t, s, d, capCase{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}})
+		quarantineAfterHook = nil
+		s.captureFault = nil
+		if !errors.Is(r.err, errCrash) {
+			t.Fatalf("no crash: %v", r.err)
+		}
+		notes := crashRecover(t, s, d, clk)
+		noOrphans(t, notes)
+		invariant(t, d, notes)
+	})
+}
+
+// TestTokenNamedTemporariesAreProvenByWhatTheyHold: a temporary a crash
+// left after it was written and before anything recorded it carries the
+// intent's token in its name and holds this capture's intent or manifest;
+// that proves it.
+func TestTokenNamedTemporariesAreProvenByWhatTheyHold(t *testing.T) {
+	s, d, clk, r := crashedIntent(t)
+	ser, _ := d.root.OpenRoot("adhoc")
+	defer func() { _ = ser.Close() }()
+	tok := r.txn.in.Token[:16]
+	m := r.txn.manifestOf(manifest{}, captureFailed, nil)
+	b, _ := json.Marshal(m)
+	writeFile(t, ser, "."+manifestName(1, "run")+".tmp-"+tok, string(b))
+	notes := crashRecover(t, s, d, clk)
+	noOrphans(t, notes)
+	invariant(t, d, notes)
+
+	// An intent temporary whose intent was never linked (the id wasted).
+	s2, d2, clk2 := newCaptureServer(t)
+	s2.link = func(r *os.Root, oldname, newname string) error {
+		if strings.HasSuffix(newname, intentSuffix) {
+			return errCrash
+		}
+		return r.Link(oldname, newname)
+	}
+	drive(t, s2, d2, capCase{})
+	s2.link = (*os.Root).Link
+	temps, _ := filepath.Glob(filepath.Join(d2.root.Name(), "adhoc", "."+intentName(1, "run")+".tmp-*"))
+	if len(temps) != 1 {
+		t.Fatalf("intent temporaries %v", temps)
+	}
+	notes = crashRecover(t, s2, d2, clk2)
+	noOrphans(t, notes)
+	invariant(t, d2, notes)
 }

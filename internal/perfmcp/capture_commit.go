@@ -274,7 +274,7 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 		if err != nil && !errors.Is(err, errCrash) && landed(ser, name, tmp) {
 			err = nil
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errCrash) {
 			_, _, _ = removeByIdentity(ser, tmp.Name, tmp)
 		}
 	}
@@ -291,7 +291,9 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 		return t, t.crashed(err)
 	} else if err != nil {
 		t.in.Temps = append(t.in.Temps, tmp)
-	} else if _, left, err := removeByIdentity(ser, tmp.Name, tmp); err != nil || left != "" {
+	} else if _, left, err := t.remove(ser, tmp.Name, tmp); errors.Is(err, errCrash) {
+		return t, t.crashed(err)
+	} else if err != nil || left != "" {
 		t.in.Temps = append(t.in.Temps, tmp)
 	}
 	if err := s.syncDir(ser, ".", "fsync intent"); err != nil {
@@ -525,8 +527,11 @@ func (t *captureTxn) probe() error {
 		return t.crashed(err)
 	}
 	lerr := t.s.linkNoReplace(t.ser, rootCaptures, p, q)
-	_, _, _ = removeByIdentity(t.ser, q, id)
-	_, _, _ = removeByIdentity(t.ser, p, id)
+	for _, n := range []string{q, p} {
+		if _, _, err := t.remove(t.ser, n, id); errors.Is(err, errCrash) {
+			return t.crashed(err)
+		}
+	}
 	if lerr == nil {
 		return nil
 	}
@@ -843,13 +848,26 @@ func (t *captureTxn) cleanup() error {
 	return nil
 }
 
+// tag is the quarantine tag of this transaction's removals.
+func (t *captureTxn) tag() string {
+	if len(t.in.Token) < 16 {
+		return ""
+	}
+	return t.in.Token[:16] + "-"
+}
+
+// remove is removeByIdentity inside root, tagged with this capture.
+func (t *captureTxn) remove(root *os.Root, name string, want fileIdentity) (bool, string, error) {
+	return removeTagged(root, name, want, t.tag())
+}
+
 // removeRecorded removes the file id records, noting it when it is not
 // that file any more; op names the removal for the write seam.
 func (t *captureTxn) removeRecorded(id fileIdentity, what, op string) error {
 	if err := t.s.wErr(op); err != nil {
 		return err
 	}
-	_, left, err := removeByIdentity(t.ser, id.Name, id)
+	_, left, err := t.remove(t.ser, id.Name, id)
 	if left != "" {
 		t.note("left", id.Name, what+" is now "+left)
 	}
@@ -866,7 +884,7 @@ func (t *captureTxn) note(kind, name, why string) {
 // removeTemps removes the recorded manifest temporaries by identity.
 func (t *captureTxn) removeTemps() error {
 	for _, tmp := range t.in.Temps {
-		_, left, err := removeByIdentity(t.ser, tmp.Name, tmp)
+		_, left, err := t.remove(t.ser, tmp.Name, tmp)
 		if err != nil {
 			return err
 		}
@@ -882,7 +900,7 @@ func (t *captureTxn) removeTemps() error {
 // where it still is that file with its size and digest.
 func (t *captureTxn) removeFinals() error {
 	for _, f := range t.in.Files {
-		_, left, err := removeByIdentity(t.ser, f.Name, f)
+		_, left, err := t.remove(t.ser, f.Name, f)
 		if err != nil {
 			return err
 		}
@@ -901,8 +919,11 @@ func (t *captureTxn) removeFinals() error {
 // path is walked after the check; its identity proves it is the capture's
 // private 0700 workspace. Anything else stays, and so does the directory
 // then. The empty directory is moved aside, checked again and removed.
-func (t *captureTxn) removeStaging() error {
-	dir := t.in.Staging
+func (t *captureTxn) removeStaging() error { return t.removeStagingDir(t.in.Staging) }
+
+// removeStagingDir is removeStaging for the staging directory under the
+// name dir: its own, or a quarantine name a crash left it under.
+func (t *captureTxn) removeStagingDir(dir string) error {
 	if t.in.StagingDev == 0 && t.in.StagingIno == 0 {
 		return nil
 	}
@@ -936,9 +957,14 @@ func (t *captureTxn) removeStaging() error {
 	if err != nil || kept {
 		return err
 	}
-	q := quarantinePrefix + randHex(8)
+	q := quarantinePrefix + t.tag() + randHex(8)
 	if err := t.ser.Rename(dir, q); err != nil {
 		return err
+	}
+	if quarantineAfterHook != nil {
+		if err := quarantineAfterHook(); err != nil {
+			return err
+		}
 	}
 	if fi, err := t.ser.Lstat(q); err == nil && isStaging(fi) {
 		if err := t.ser.Remove(q); err == nil {
@@ -975,7 +1001,7 @@ func (t *captureTxn) emptyStaging(sr *os.Root) (kept bool, err error) {
 	}
 	for _, n := range names {
 		if f, ok := recorded[n]; ok {
-			_, left, err := removeByIdentity(sr, n, f)
+			_, left, err := t.remove(sr, n, f)
 			if err != nil {
 				return kept, err
 			}
@@ -983,6 +1009,16 @@ func (t *captureTxn) emptyStaging(sr *os.Root) (kept bool, err error) {
 				keep(n, "not the file this capture recorded: "+left)
 			}
 			continue
+		}
+		if t.tag() != "" && strings.HasPrefix(n, quarantinePrefix+t.tag()) {
+			if id, ok := t.proveQuarantined(sr, n); ok {
+				if _, left, err := t.remove(sr, n, id); err != nil {
+					return kept, err
+				} else if left != "" {
+					keep(n, left)
+				}
+				continue
+			}
 		}
 		if !slices.Contains(t.in.Outputs, n) && n != probeName && n != probeLinkName {
 			keep(n, "not a file this capture writes")

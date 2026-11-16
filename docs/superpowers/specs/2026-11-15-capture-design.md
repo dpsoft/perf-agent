@@ -1279,9 +1279,13 @@ answer there is `cancelling` until the link resolves.
   reused, and the server's own links, renames and heartbeat updates
   change a file's ctime, so the contents are the proof (CAP-R44);
 - the name is first renamed to a private quarantine name beside it
-  (`.del-<16 hex>`), checked again there, and only then unlinked; a file
-  that is not the recorded one is put back without replacing anything
-  (CAP-R43);
+  (`.del-<token[:16]>-<16 hex>` for a capture's own removals), checked
+  again there, and only then unlinked; a file that is not the recorded
+  one is put back without replacing anything (CAP-R43). Recovery proves a
+  quarantine name a crash left against what its intent records, or by
+  the token its bytes hold; an intent quarantined after its manifest, and
+  an intent or manifest temporary written but not yet recorded, are
+  proven the same way;
 - a staging directory is opened as a root and proven to be the recorded
   dev and inode before perf-agent's outputs in it are removed by name
   (CAP-R48);
@@ -1342,8 +1346,8 @@ sees an error while capture files are still published.
 - **Single-syscall windows (CAP-R47).** A crash inside one system call
   of a write, after a new name exists and before any record of it is
   durable, leaves a file nothing can prove: a `.seq` temporary, a
-  heartbeat or an intent temporary created but not yet written, a
-  manifest temporary not yet recorded, a quarantined `.del-*` name, a staging directory (CAP-R12
+  heartbeat or a temporary created but not yet written, a quarantined
+  `.del-*` name nothing records, a staging directory (CAP-R12
   above), or a temporary of `.owner` in the capture directory itself.
   Each is retained, never deleted without proof, and logged by recovery
   as `orphan_temp`, `orphan_staging` or `left`; `capture_list`'s series

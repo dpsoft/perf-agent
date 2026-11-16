@@ -41,7 +41,56 @@ func Main(m *testing.M) int {
 	}
 	buildDir = dir
 	defer func() { _ = os.RemoveAll(dir) }()
-	return m.Run()
+	code := m.Run()
+	// A capture's cgroup is named with the pid of the process that made
+	// it: one this test process made and no reaper removed is a leak the
+	// tests failed to clean up. The empty ones are removed here (they are
+	// this process's own), and the run fails.
+	if left := ownCgroupsLeft(15 * time.Second); len(left) > 0 {
+		fmt.Fprintln(os.Stderr, "capturetest: cgroups this test process made are left:", strings.Join(left, " "))
+		for _, p := range left {
+			_ = os.Remove(p)
+		}
+		code = max(code, 1)
+	}
+	return code
+}
+
+// cgroupPrefix is capture.CgroupPrefix, which this package cannot import.
+const cgroupPrefix = "perf-agent-mcp-"
+
+// ownCgroupsLeft lists the capture cgroups this process made, under its
+// own cgroup v2 directory, that are still there after waiting up to d for
+// the reapers ending to remove them.
+func ownCgroupsLeft(d time.Duration) []string {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil
+	}
+	rel := ""
+	for line := range strings.Lines(string(b)) {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "0::"); ok {
+			rel = p
+		}
+	}
+	if rel == "" {
+		return nil
+	}
+	dir := filepath.Join("/sys/fs/cgroup", rel)
+	mark := fmt.Sprintf("-%d-", os.Getpid())
+	var left []string
+	for end := time.Now().Add(d); ; time.Sleep(100 * time.Millisecond) {
+		left = left[:0]
+		ents, _ := os.ReadDir(dir)
+		for _, e := range ents {
+			if e.IsDir() && strings.HasPrefix(e.Name(), cgroupPrefix) && strings.Contains(e.Name(), mark) {
+				left = append(left, filepath.Join(dir, e.Name()))
+			}
+		}
+		if len(left) == 0 || time.Now().After(end) {
+			return left
+		}
+	}
 }
 
 var build = sync.OnceValue(func() error {

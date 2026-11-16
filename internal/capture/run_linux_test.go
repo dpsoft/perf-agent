@@ -1675,3 +1675,45 @@ func TestCgroupTextNamesNoPath(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// A reaper killed while the command runs loses containment: the outcome
+// is stuck_child, listing the command and naming its cgroup, which still
+// holds it. The test then ends the command and removes the cgroup itself,
+// as nothing else will.
+func TestALostReaperNamesTheCgroupItLeft(t *testing.T) {
+	capturetest.SkipIfPrivileged(t)
+	parent, why := DelegatedCgroup(selfCgroup(t), cgroupMount)
+	if why != "" {
+		t.Skip("no delegated cgroup: " + why)
+	}
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Settings.Duration = time.Minute
+	spec.Cgroup = parent
+	spec.Launch = launchOf(t, "sleep", "1m")
+	r := startRun(t, spec)
+	waitPhase(t, r, PhaseProfiling, 10*time.Second)
+	cg := r.cgroup
+	t.Cleanup(func() {
+		_ = KillCgroup(cg)
+		if !eventually(10*time.Second, func() bool { return RemoveCgroup(cg) == nil }) {
+			t.Errorf("the cgroup %s could not be removed", cg)
+		}
+	})
+	if err := syscall.Kill(r.reaper.PID(), syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	o := waitRun(t, r, 30*time.Second)
+	// perf-agent, orphaned with the reaper, is not in the cgroup: the
+	// test ends it by its pid and start time.
+	for _, s := range o.Survivors {
+		if p := (procRef{s.PID, s.StartTime}); p.alive() {
+			_ = syscall.Kill(s.PID, syscall.SIGKILL)
+		}
+	}
+	if errCode(o.Err) != CodeStuckChild || !strings.Contains(o.Err.Message, "containment lost") {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	if notes := strings.Join(o.Notes, "\n"); !strings.Contains(notes, filepath.Base(cg)) || strings.Contains(notes, parent) {
+		t.Errorf("notes %q: the cgroup is not named, or named by its path", notes)
+	}
+}

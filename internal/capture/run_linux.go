@@ -1159,6 +1159,12 @@ func (r *Run) lost(why string) {
 			add(p.pid, p.start)
 		}
 	}
+	if r.cgroup != "" && !r.unresponsive {
+		// A reaper gone without its cleanup leaves its cgroup: once the
+		// cgroup holds no process, nothing else will remove it. rmdir
+		// refuses a cgroup that still holds one.
+		_ = os.Remove(r.cgroup)
+	}
 	if r.cgroup != "" {
 		if _, err := os.Stat(r.cgroup); err == nil {
 			r.o.Notes = append(r.o.Notes, fmt.Sprintf("the command's cgroup %s under the delegated cgroup was not removed; it may still hold processes", filepath.Base(r.cgroup)))

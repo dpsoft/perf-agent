@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -552,5 +555,49 @@ func TestAnUnknownMethodIsEchoedBounded(t *testing.T) {
 	r := c.call(`{"jsonrpc":"2.0","id":2,"method":"` + strings.Repeat("m", 100000) + `"}`)
 	if r.Error == nil || r.Error.Code != -32601 || len(r.Error.Message) > 200 || !strings.Contains(r.Error.Message, "mmmm") {
 		t.Errorf("error = %.300v", r.Error)
+	}
+}
+
+// stuckLog is a log destination that never returns from Write, as a
+// full stderr nobody reads; writes counts the writes begun.
+type stuckLog struct {
+	writes  atomic.Int64
+	release chan struct{}
+}
+
+func (w *stuckLog) Write(b []byte) (int, error) {
+	w.writes.Add(1)
+	<-w.release
+	return len(b), nil
+}
+
+// A warning on the reader's path never waits for the log: with the log
+// blocked, client responses are still read and dropped, the end of the
+// input is still seen, and each kind of warning is written once.
+func TestAWarningNeverHoldsTheReader(t *testing.T) {
+	w := &stuckLog{release: make(chan struct{})}
+	t.Cleanup(func() { close(w.release) })
+	o := testOptions()
+	o.Log = slog.New(slog.NewTextHandler(w, nil))
+	sr, cw := io.Pipe()
+	s := New(o)
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(t.Context(), sr, io.Discard) }()
+	go func() {
+		for range 3000 {
+			if _, err := io.WriteString(cw, `{"jsonrpc":"2.0","id":"x","result":{}}`+"\n"); err != nil {
+				return
+			}
+		}
+		_ = cw.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cw.Close()
+		t.Fatal("the server did not see the end of its input with the log blocked")
+	}
+	if n := w.writes.Load(); n > 1 {
+		t.Errorf("%d log writes for one kind of warning", n)
 	}
 }

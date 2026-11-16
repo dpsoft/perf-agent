@@ -330,6 +330,42 @@ func TestABlockedStderrNeverHoldsTheExit(t *testing.T) {
 	}
 }
 
+// A client that sends responses the server never asked for, with stderr
+// never read, cannot hold the reader on a log line: the server still sees
+// stdin end, and the capture's children are gone within StopGrace of it.
+func TestClientResponsesWithStderrBlockedNeverHoldTheReader(t *testing.T) {
+	p := startCaptureServer(t, capturetest.FakeIgnoreSIGINT, nil)
+	job := p.startCapture(map[string]any{"command": []any{capturetest.Workload(t), "double-fork-setsid", "2m"}, "duration": "1m"})
+	p.waitProfiling(job)
+	gc := p.awaitGrandchild()
+	rec := p.fakeRecord()
+	p.blockStderr()
+	go func() { _ = p.readAll() }()
+	unblock := func() {
+		go func() { _, _ = io.Copy(io.Discard, p.errR) }()
+		_ = p.errR.SetReadDeadline(time.Time{})
+	}
+	line := []byte(`{"jsonrpc":"2.0","id":"x","result":{}}` + "\n")
+	_ = p.in.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	for i := range 3000 {
+		if _, err := p.in.Write(line); err != nil {
+			unblock()
+			t.Fatalf("the server stopped reading its stdin after %d responses: %v", i, err)
+		}
+	}
+	_ = p.in.Close()
+	sent := time.Now()
+	deadline := sent.Add(stopGrace + time.Second)
+	p.goneBy(deadline, "the fake perf-agent's group", func() bool { return groupGone(rec.PGID) })
+	p.goneBy(deadline, "the workload's setsid grandchild", func() bool { return !gc.alive() })
+	select {
+	case <-p.exited:
+	case <-time.After(stopGrace + 2*time.Second):
+		unblock()
+		t.Fatal("the server still runs after stdin ended, its stderr blocked")
+	}
+}
+
 // serverProc is the server run as a subprocess over pipes, its stdout a
 // 4 KiB pipe so a test can block it by not reading.
 type serverProc struct {

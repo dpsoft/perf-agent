@@ -496,9 +496,47 @@ func decodeArgs(tool string, raw json.RawMessage, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		if te, ok := errors.AsType[*json.UnmarshalTypeError](err); ok && te.Field != "" {
+			return bad(fmt.Sprintf("argument %s is %s, and it takes %s", te.Field, jsonValueKind(te.Value), jsonTypeOf(te.Type)))
+		}
 		return bad(echoError(err))
 	}
 	return nil
+}
+
+// jsonValueKind names a JSON value of the kind a type error reports
+// (string, number, number 1.5, bool, array, object).
+func jsonValueKind(v string) string {
+	switch {
+	case v == "bool":
+		return "a boolean"
+	case v == "array", v == "object":
+		return "an " + v
+	case v == "string", v == "number", strings.HasPrefix(v, "number "):
+		return "a " + v
+	}
+	return "a JSON " + v
+}
+
+// jsonTypeOf names the JSON type a Go type decodes from, in the words of a
+// JSON schema, never Go's.
+func jsonTypeOf(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Pointer:
+		return jsonTypeOf(t.Elem())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "an integer (a JSON number without quotes, such as 99)"
+	case reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean (true or false, without quotes)"
+	case reflect.Slice, reflect.Array:
+		return "an array of " + strings.TrimPrefix(strings.TrimPrefix(jsonTypeOf(t.Elem()), "an "), "a ") + "s"
+	}
+	return "an object"
 }
 
 // maxEchoError is the most characters of a decoding error a message

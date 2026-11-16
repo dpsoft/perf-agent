@@ -33,27 +33,27 @@ type captureResult struct {
 
 // captureInfo is the capture itself, as its manifest records it.
 type captureInfo struct {
-	ID                 string         `json:"id"`
-	Capture            string         `json:"capture"`
-	Series             string         `json:"series"`
-	Label              string         `json:"label"`
-	Manifest           string         `json:"manifest"`
-	Settings           wireSettings   `json:"settings"`
-	SettingsDigest     string         `json:"settings_digest"`
-	Target             manifestTarget `json:"target,omitzero"`
-	Modes              []string       `json:"modes"`
-	RequestedDuration  string         `json:"requested_duration"`
-	ProfiledDuration   string         `json:"profiled_duration,omitzero"`
-	AttachLatency      string         `json:"attach_latency,omitzero"`
-	SampleRate         string         `json:"sample_rate"`
-	KernelStacks       bool           `json:"kernel_stacks"`
-	StoppedBy          string         `json:"stopped_by,omitzero"`
-	CompareWith        string         `json:"compare_with,omitzero"`
-	Kept               bool           `json:"kept"`
-	PerfAgent          perfAgentInfo  `json:"perf_agent,omitzero"`
-	Survivors          []wireSurvivor `json:"survivors,omitzero"`
-	Cleanup            string         `json:"cleanup,omitzero"`
-	WorkloadOutputTail *outputTail    `json:"workload_output_tail,omitzero"`
+	ID                 string           `json:"id"`
+	Capture            string           `json:"capture"`
+	Series             string           `json:"series"`
+	Label              string           `json:"label"`
+	Manifest           string           `json:"manifest"`
+	Settings           resultSettings   `json:"settings"`
+	SettingsDigest     string           `json:"settings_digest"`
+	Target             resultTarget     `json:"target,omitzero"`
+	Modes              []string         `json:"modes"`
+	RequestedDuration  string           `json:"requested_duration"`
+	ProfiledDuration   string           `json:"profiled_duration,omitzero"`
+	AttachLatency      string           `json:"attach_latency,omitzero"`
+	SampleRate         int              `json:"sample_rate"`
+	KernelStacks       bool             `json:"kernel_stacks"`
+	StoppedBy          string           `json:"stopped_by,omitzero"`
+	CompareWith        string           `json:"compare_with,omitzero"`
+	Kept               bool             `json:"kept"`
+	PerfAgent          perfAgentInfo    `json:"perf_agent,omitzero"`
+	Survivors          []resultSurvivor `json:"survivors,omitzero"`
+	Cleanup            string           `json:"cleanup,omitzero"`
+	WorkloadOutputTail *outputTail      `json:"workload_output_tail,omitzero"`
 }
 
 // outputTail is the end of a launched command's output: the program's
@@ -161,10 +161,10 @@ func (s *Server) captureInfo(m manifest) captureInfo {
 	}
 	return captureInfo{
 		ID: m.ID, Capture: captureKey(m.Series, m.ID), Series: m.Series, Label: m.Label, Manifest: s.capturePath(m.Series, manifestName(id, m.Label)),
-		Settings: m.Settings, SettingsDigest: m.SettingsDigest, Target: m.Target, Modes: m.Settings.Modes,
+		Settings: toResultSettings(m.Settings), SettingsDigest: m.SettingsDigest, Target: toResultTarget(m.Target), Modes: m.Settings.Modes,
 		RequestedDuration: m.Settings.Duration, ProfiledDuration: m.ProfiledDuration, AttachLatency: m.AttachLatency,
-		SampleRate: m.Settings.SampleRate, KernelStacks: m.Settings.KernelStacks, StoppedBy: m.StoppedBy,
-		CompareWith: m.CompareWith, Kept: m.Kept, PerfAgent: m.PerfAgent, Survivors: m.Survivors, Cleanup: m.Cleanup,
+		SampleRate: toResultSettings(m.Settings).SampleRate, KernelStacks: m.Settings.KernelStacks, StoppedBy: m.StoppedBy,
+		CompareWith: m.CompareWith, Kept: m.Kept, PerfAgent: m.PerfAgent, Survivors: toResultSurvivors(m.Survivors), Cleanup: m.Cleanup,
 	}
 }
 

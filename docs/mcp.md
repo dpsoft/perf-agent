@@ -40,7 +40,7 @@ Every file is opened through an `os.Root`, so `..`, symlinks that leave the root
 
 ## Tools
 
-Integers are decimal strings in every result, a failure's `explanation` index included, except source line numbers (a row's `line` and each `lines[].n`), which are JSON integers. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
+Integers are decimal strings in every result, a failure's `explanation` index included, except source line numbers (a row's `line` and each `lines[].n`) and the capture tools' own integers (`sample_rate` in settings, a target's `pid` and `start_time`, `capture_list`'s counts), which are JSON integers, so a setting read back can be passed again as it is. An argument of the wrong JSON type is refused naming the argument and the type it takes. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
 
 Every result about a GPU view carries the view's sampling `notes`, `render_flamegraph` results included. A result about a CPU view has no `notes` key (nor `diff`'s `base_notes` and `new_notes`), except `open`, whose `notes` is always present.
 

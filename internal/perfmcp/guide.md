@@ -17,7 +17,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 ## Reading the numbers
 
-- Every integer (values, counts, weights, a failure's `explanation` index) is a decimal string. Do not convert it to a float; quote it as the string. Only source line numbers (`line`, `lines[].n`) are JSON integers.
+- Every integer (values, counts, weights, a failure's `explanation` index) is a decimal string. Do not convert it to a float; quote it as the string. Source line numbers (`line`, `lines[].n`) and the capture tools' integers are JSON integers.
 - A fact has `status` `ok`, `zero` or `unavailable`. An unavailable fact has a `reason` and no `value`: unavailable is not zero, never report it as 0.
 - A share names its `denominator` (`view_total`, parent, ...). Say which one, and copy the fact's denominator and unit into the claim.
 - Lists are paged: `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (with `omitted_weight_basis`) and `next_cursor`. Pass the cursor back with the same arguments. The omitted rows overlap (a callee is inside its caller), so `omitted_weight` is a sum of the rows' own values, never a remaining share.

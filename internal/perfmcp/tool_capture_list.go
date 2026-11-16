@@ -68,29 +68,29 @@ type listJob struct {
 // and the captures in progress (an intent without a manifest yet).
 type seriesRow struct {
 	Series     string `json:"series"`
-	Captures   string `json:"captures"`
-	Bytes      string `json:"bytes"`
-	Leftovers  string `json:"leftovers"`
-	InProgress string `json:"in_progress"`
+	Captures   int    `json:"captures"`
+	Bytes      int64  `json:"bytes"`
+	Leftovers  int    `json:"leftovers"`
+	InProgress int    `json:"in_progress"`
 }
 
 // listRow is a capture of a series as its manifest records it. It never
 // carries the manifest's token.
 type listRow struct {
-	ID               string        `json:"id"`
-	Capture          string        `json:"capture"`
-	Label            string        `json:"label"`
-	Outcome          string        `json:"outcome"`
-	StoppedBy        string        `json:"stopped_by,omitzero"`
-	Settings         wireSettings  `json:"settings"`
-	SettingsDigest   string        `json:"settings_digest"`
-	Target           listTarget    `json:"target,omitzero"`
-	Start            time.Time     `json:"start,omitzero"`
-	ProfiledDuration string        `json:"profiled_duration,omitzero"`
-	Manifest         string        `json:"manifest"`
-	Profiles         []listProfile `json:"profiles,omitzero"`
-	Kept             bool          `json:"kept"`
-	CompareWith      string        `json:"compare_with,omitzero"`
+	ID               string         `json:"id"`
+	Capture          string         `json:"capture"`
+	Label            string         `json:"label"`
+	Outcome          string         `json:"outcome"`
+	StoppedBy        string         `json:"stopped_by,omitzero"`
+	Settings         resultSettings `json:"settings"`
+	SettingsDigest   string         `json:"settings_digest"`
+	Target           listTarget     `json:"target,omitzero"`
+	Start            time.Time      `json:"start,omitzero"`
+	ProfiledDuration string         `json:"profiled_duration,omitzero"`
+	Manifest         string         `json:"manifest"`
+	Profiles         []listProfile  `json:"profiles,omitzero"`
+	Kept             bool           `json:"kept"`
+	CompareWith      string         `json:"compare_with,omitzero"`
 }
 
 // listTarget is the profiled process by its name and build-id.
@@ -124,8 +124,8 @@ type listAnswer struct {
 	Stranded   []strandedRow `json:"stranded,omitzero"`
 	Series     []seriesRow   `json:"series,omitzero"`
 	Captures   []listRow     `json:"captures,omitzero"`
-	Leftovers  string        `json:"leftovers,omitzero"`
-	InProgress string        `json:"in_progress,omitzero"`
+	Leftovers  *int          `json:"leftovers,omitzero"`
+	InProgress *int          `json:"in_progress,omitzero"`
 	Warnings   []string      `json:"warnings,omitzero"`
 	Loading    bool          `json:"loading,omitzero"`
 	// ReadAt is when the history answered was read, when it is an earlier
@@ -133,9 +133,9 @@ type listAnswer struct {
 	ReadAt     string `json:"read_at,omitzero"`
 	RetryAfter string `json:"retry_after,omitzero"`
 
-	TotalRows    string `json:"total_rows,omitzero"`
-	Skipped      string `json:"skipped,omitzero"`
-	OmittedCount string `json:"omitted_count,omitzero"`
+	TotalRows    *int64 `json:"total_rows,omitzero"`
+	Skipped      *int64 `json:"skipped,omitzero"`
+	OmittedCount *int64 `json:"omitted_count,omitzero"`
 	NextCursor   string `json:"next_cursor,omitzero"`
 }
 
@@ -156,7 +156,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	var a listArgs
 	if err := decodeArgs("capture_list", raw, &a); err != nil {
-		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
+		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	series := ""
 	if a.Series != nil {
@@ -197,7 +197,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		out.Warnings = append(out.Warnings, "the history cannot be read: "+causeText(err))
 		return answer(out)
 	}
-	out.Leftovers, out.Warnings = strconv.Itoa(h.leftovers), append(out.Warnings, h.warnings...)
+	out.Leftovers, out.Warnings = new(h.leftovers), append(out.Warnings, h.warnings...)
 	if !asOf.IsZero() {
 		out.ReadAt = asOf.UTC().Format(time.RFC3339)
 	}
@@ -206,17 +206,18 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	}{series})
 	var info pageInfo
 	if series == "" {
-		out.Series, info, err = pageRows(h.series, func(r seriesRow) int64 { n, _ := strconv.ParseInt(r.Captures, 10, 64); return n },
+		out.Series, info, err = pageRows(h.series, func(r seriesRow) int64 { return int64(r.Captures) },
 			"captures", bind, a.Cursor, limit)
 	} else {
-		out.InProgress = strconv.Itoa(h.inProgress)
+		out.InProgress = new(h.inProgress)
 		out.Captures, info, err = pageRows(h.rows, func(listRow) int64 { return 1 }, "captures", bind, a.Cursor, limit)
 		out.Captures = s.withHandles(out.Captures)
 	}
 	if err != nil {
 		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
 	}
-	out.TotalRows, out.Skipped, out.OmittedCount, out.NextCursor = info.TotalRows, info.Skipped, info.OmittedCount, info.NextCursor
+	out.TotalRows, out.Skipped, out.OmittedCount = number(info.TotalRows), number(info.Skipped), number(info.OmittedCount)
+	out.NextCursor = info.NextCursor
 	b, err := marshal(out)
 	if err != nil {
 		return mcpstdio.Result{}, err
@@ -225,6 +226,16 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		return toolError(invalidArgument(shrinkWithLimit, "the capture_list answer is %d bytes, over MaxResponseBytes=%d", len(b), s.lim.MaxResponseBytes), nil), nil
 	}
 	return mcpstdio.Result{Text: string(b)}, nil
+}
+
+// number is the decimal string a page's count is kept as, as a JSON
+// number; nil (left out) when it is not one.
+func number(s string) *int64 {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &n
 }
 
 // unsettledRows are this server's captures in series ("" for all) whose
@@ -432,8 +443,7 @@ func (s *Server) loadHistory(series string) (*captureHistory, error) {
 			continue
 		}
 		h.series = append(h.series, seriesRow{
-			Series: n, Captures: strconv.Itoa(sc.captures), Bytes: strconv.FormatInt(bytes, 10),
-			Leftovers: strconv.Itoa(sc.leftovers), InProgress: strconv.Itoa(sc.inProgress),
+			Series: n, Captures: sc.captures, Bytes: bytes, Leftovers: sc.leftovers, InProgress: sc.inProgress,
 		})
 		h.leftovers += sc.leftovers
 		h.warnings = append(h.warnings, sc.warnings...)
@@ -540,7 +550,7 @@ func (s *Server) listRowOf(m manifest) listRow {
 	}
 	r := listRow{
 		ID: m.ID, Capture: captureKey(m.Series, m.ID), Label: m.Label, Outcome: outcome, StoppedBy: m.StoppedBy,
-		Settings: m.Settings, SettingsDigest: m.SettingsDigest,
+		Settings: toResultSettings(m.Settings), SettingsDigest: m.SettingsDigest,
 		Target: listTarget{Comm: m.Target.Comm, Exe: m.Target.Exe, BuildID: m.Target.BuildID},
 		Start:  m.Start, ProfiledDuration: m.ProfiledDuration,
 		Manifest: s.capturePath(m.Series, manifestName(id, m.Label)), Kept: m.Kept, CompareWith: m.CompareWith,

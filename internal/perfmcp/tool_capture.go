@@ -78,13 +78,16 @@ func toolError(e *capture.Error, j *job) mcpstdio.Result {
 // errorResult is w as an isError result.
 func errorResult(w *wireError) mcpstdio.Result {
 	b, err := marshal(struct {
-		Error *wireError `json:"error"`
-	}{w})
+		Error resultError `json:"error"`
+	}{resultError{wireError: w, Survivors: toResultSurvivors(w.Survivors)}})
 	if err != nil {
 		b = []byte(`{"error":{"code":"` + w.Code + `","message":"the error could not be encoded","retryable":false}}`)
 	}
 	return mcpstdio.Result{Text: string(b), IsError: true}
 }
+
+// argsNext is the next of arguments that do not decode.
+const argsNext = "fix the arguments as the message says; the tool's input schema gives each argument's JSON type"
 
 // invalidArgument is a refused argument.
 func invalidArgument(next, format string, args ...any) *capture.Error {
@@ -199,7 +202,7 @@ var unwinds = []string{"auto", "fp", "dwarf"}
 func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture.Error) {
 	var a captureArgs
 	if err := decodeArgs("capture", raw, &a); err != nil {
-		return captureRequest{}, invalidArgument("", "%s", err.Error())
+		return captureRequest{}, invalidArgument(argsNext, "%s", err.Error())
 	}
 	req := captureRequest{Cwd: a.Cwd, Explicit: map[string]bool{}, Keep: a.Keep, Series: defaultSeries, Label: defaultLabel}
 	if e := checkTarget(a); e != nil {
@@ -413,7 +416,7 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	var a waitArgs
 	if err := decodeArgs("capture_wait", raw, &a); err != nil {
-		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
+		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	if a.ID == "" {
 		return toolError(invalidArgument("pass the job id capture answered, or a capture id as <series>/NNN", "capture_wait needs id"), nil), nil
@@ -1086,7 +1089,7 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 		ID string `json:"id"`
 	}
 	if err := decodeArgs("capture_cancel", raw, &a); err != nil {
-		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
+		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	if a.ID == "" {
 		return toolError(invalidArgument("pass the job id capture answered", "capture_cancel needs id"), nil), nil

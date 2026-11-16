@@ -375,7 +375,12 @@ without `--output`.
 | `show` | bool | true | Serve mode with the live page only: make the facts-only publication current (§9). |
 
 Durations are strings and other integers are JSON integers, as in existing
-tool inputs (`limit`, `context`). There is no `env` argument (§6.4) and no
+tool inputs (`limit`, `context`). The capture tools' answers carry their
+own integers (settings, a target's pid and start time, `capture_list`'s
+counts) as JSON integers too, so a setting read back is passed again as
+it is; the files keep them as decimal strings. An argument of the wrong
+JSON type is `invalid_argument` naming the argument and the JSON type it
+takes, never Go's types (CAP-R90). There is no `env` argument (§6.4) and no
 `tags` argument.
 
 **A loop iteration**, as the agent calls it:
@@ -400,16 +405,16 @@ capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "pa
     "series": "parse-opt",
     "label": "cand1",
     "manifest": "captures/parse-opt/002-cand1.capture.json",
-    "settings": {"modes": ["cpu"], "duration": "20s", "sample_rate": "99", "unwind": "auto", "kernel_stacks": false},
+    "settings": {"modes": ["cpu"], "duration": "20s", "sample_rate": 99, "unwind": "auto", "kernel_stacks": false},
     "settings_digest": "sha256:…",
-    "target": {"pid": "41234", "comm": "bench", "exe": "bench",
-               "start_time": "1234567", "launched": true,
+    "target": {"pid": 41234, "comm": "bench", "exe": "bench",
+               "start_time": 1234567, "launched": true,
                "exit": "exited 0 after 8.2s"},
     "modes": ["cpu"],
     "requested_duration": "10s",
     "profiled_duration": "8.2s",
     "attach_latency": "1.4s",
-    "sample_rate": "99",
+    "sample_rate": 99,
     "kernel_stacks": false,
     "stopped_by": "command_exit",
     "perf_agent": {"path": "/home/u/bin/perf-agent", "version": "v1.5.2",

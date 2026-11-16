@@ -39,7 +39,7 @@ Every call names its `handle` and `view`; nothing is "current". The exceptions: 
 
 ## Hard rules
 
-- Integers are decimal strings. Quote them as strings; never turn them into floats. The exception is source line numbers, which are JSON integers.
+- Integers are decimal strings. Quote them as strings; never turn them into floats. The exceptions are source line numbers and the capture tools' integers (settings, pids, counts), which are JSON integers.
 - A fact is `ok`, `zero` or `unavailable`. Unavailable is not zero: never report it as 0.
 - Say which denominator a share uses (`view_total`, the parent, ...).
 - A width under `[gpu:launch]` is a sample of launches, not a share of GPU time. Never multiply anything by the sample period to get launches, executions or time.

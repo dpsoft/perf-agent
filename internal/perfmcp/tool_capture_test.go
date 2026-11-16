@@ -571,7 +571,7 @@ type listing struct {
 	Loading  bool   `json:"loading"`
 	Retry    string `json:"retry_after"`
 	Warnings []string
-	Left     string `json:"leftovers"`
+	Left     int    `json:"leftovers"`
 	Next     string `json:"next_cursor"`
 }
 
@@ -596,7 +596,7 @@ func TestCaptureListShowsTheRunningCaptureFirst(t *testing.T) {
 	}
 	var all listing
 	c.callOK("capture_list", map[string]any{}, &all)
-	if len(all.Series) != 1 || all.Series[0].Series != "adhoc" || all.Series[0].Captures != "1" || all.Series[0].InProgress != "1" {
+	if len(all.Series) != 1 || all.Series[0].Series != "adhoc" || all.Series[0].Captures != 1 || all.Series[0].InProgress != 1 {
 		t.Errorf("series %+v", all.Series)
 	}
 	c.callOK("capture_cancel", map[string]any{"id": second}, nil)
@@ -663,14 +663,14 @@ func TestCaptureListPagesAndLoads(t *testing.T) {
 	if err := os.Link(filepath.Join(ser, "005-l5.capture.json"), filepath.Join(ser, "005-l5.evicting")); err != nil {
 		t.Fatal(err)
 	}
-	if l := rows(); len(l.Captures) != 5 || l.Left != "0" || len(l.Warnings) != 0 {
+	if l := rows(); len(l.Captures) != 5 || l.Left != 0 || len(l.Warnings) != 0 {
 		t.Errorf("with a marker: %+v", l)
 	}
 	// The marker alone: the capture is being evicted and is not listed.
 	if err := os.Remove(filepath.Join(ser, "005-l5.capture.json")); err != nil {
 		t.Fatal(err)
 	}
-	if l := rows(); len(l.Captures) != 4 || l.Captures[0].ID != "004" || l.Left != "0" {
+	if l := rows(); len(l.Captures) != 4 || l.Captures[0].ID != "004" || l.Left != 0 {
 		t.Errorf("marker only: %+v", l)
 	}
 	// What recovery would note, a stale staging directory and a heartbeat
@@ -683,12 +683,12 @@ func TestCaptureListPagesAndLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := rows()
-	if l.Left != "2" || len(l.Warnings) != 1 || !strings.Contains(l.Warnings[0], ".seq") {
-		t.Errorf("leftovers %q warnings %q", l.Left, l.Warnings)
+	if l.Left != 2 || len(l.Warnings) != 1 || !strings.Contains(l.Warnings[0], ".seq") {
+		t.Errorf("leftovers %d warnings %q", l.Left, l.Warnings)
 	}
 	var all listing
 	c.callOK("capture_list", map[string]any{}, &all)
-	if len(all.Series) != 1 || all.Series[0].Captures != "4" || all.Series[0].Leftovers != "2" || all.Series[0].Bytes == "0" {
+	if len(all.Series) != 1 || all.Series[0].Captures != 4 || all.Series[0].Leftovers != 2 || all.Series[0].Bytes == 0 {
 		t.Errorf("series %+v", all.Series)
 	}
 

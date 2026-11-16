@@ -24,9 +24,7 @@ const heavySlots = 2
 
 // routes is the page's handler: the mux and the heavy routes' slots.
 type routes struct {
-	srv    *perfmcp.Server
-	mux    http.Handler
-	events http.Handler
+	mux http.Handler
 	// heavy holds a token per export or focus request being served; see
 	// bounded.
 	heavy chan struct{}
@@ -37,12 +35,20 @@ type routes struct {
 // each publication's model, history, frame, focus and export. Every
 // handler reads the snapshot it takes first, and nothing else of srv, so
 // a request never changes server state. Only GET and HEAD reach it.
+//
+// A server's page has one set of routes, so that their bounds, such as
+// heavySlots, hold for the server: Routes claims srv's page, and panics
+// for a server without one or one already routed. Either is a programming
+// error, as non-positive limits are to livehttp.NewHub.
 func Routes(srv *perfmcp.Server, events http.Handler) http.Handler {
 	return newRoutes(srv, events)
 }
 
 func newRoutes(srv *perfmcp.Server, events http.Handler) *routes {
-	rt := &routes{srv: srv, events: events, heavy: make(chan struct{}, heavySlots)}
+	if err := srv.ClaimPage(); err != nil {
+		panic("perfpage.Routes: " + err.Error())
+	}
+	rt := &routes{heavy: make(chan struct{}, heavySlots)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { serveAsset(w, r, "") })
 	mux.HandleFunc("GET /assets/{name}", func(w http.ResponseWriter, r *http.Request) {

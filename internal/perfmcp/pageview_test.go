@@ -775,3 +775,23 @@ func (m liveModelJSON) drawnIDs(t *testing.T) []string {
 	}
 	return out
 }
+
+// A server's live page is claimed once, by its one set of routes; a
+// server without Page has none to claim.
+func TestClaimPageOnce(t *testing.T) {
+	cfg := testConfig(t)
+	s := must(New(cfg))(t)
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.ClaimPage(); err == nil || !strings.Contains(err.Error(), "Config.Page") {
+		t.Errorf("ClaimPage without Page: %v", err)
+	}
+	live := newLiveServer(t, nil, nil)
+	if err := live.ClaimPage(); err != nil {
+		t.Fatalf("the first ClaimPage: %v", err)
+	}
+	for range 2 {
+		if err := live.ClaimPage(); err == nil || !strings.Contains(err.Error(), "already served") {
+			t.Errorf("a later ClaimPage: %v", err)
+		}
+	}
+}

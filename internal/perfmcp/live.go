@@ -278,6 +278,8 @@ type live struct {
 	notify  func([]byte)
 	viewers func() int
 	opened  bool
+	// claimed is set by ClaimPage, on whichever goroutine routes the page.
+	claimed atomic.Bool
 
 	lim  Limits
 	pins *pins

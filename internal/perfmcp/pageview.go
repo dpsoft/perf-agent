@@ -63,6 +63,20 @@ func (s *Server) PageSnapshot() PageView {
 	return PageView{snap: s.live.snapshot()}
 }
 
+// ClaimPage marks s's live page as served. A page has one set of routes:
+// the bounds they keep, such as how many exports run at once, hold for the
+// server only while nothing else serves it. It fails on a server without
+// Page, and on every call after the first. Any goroutine may call it.
+func (s *Server) ClaimPage() error {
+	if s.live == nil {
+		return errors.New("perfmcp: this server has no live page: Config.Page is nil")
+	}
+	if !s.live.claimed.CompareAndSwap(false, true) {
+		return errors.New("perfmcp: this server's live page is already served")
+	}
+	return nil
+}
+
 // State is the snapshot's state JSON: what the page shows and the
 // publications it can switch to.
 func (v PageView) State() []byte {

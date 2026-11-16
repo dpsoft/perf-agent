@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -17,9 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpsoft/perf-agent/internal/explain"
+	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
 // published1 is a page with CPUBasic open and b explained in p1.
@@ -202,7 +207,7 @@ func TestFrameAndFocusAreComputedByTheEngine(t *testing.T) {
 	}
 
 	body := p.get("pub/p1/frame/" + c)
-	if want := must(v.Frame("p1", c))(t); !bytes.Equal(body, want) {
+	if want := explainedFrame(t, pmfixture.CPUBasic(), shareClaim(o.nodeID("b"), "0.411", "b takes {c1}"), c); !bytes.Equal(body, want) {
 		t.Errorf("frame route %s\nwant %s", body, want)
 	}
 	var fr struct {
@@ -270,9 +275,10 @@ func TestExportIsTheStaticPageAsADownload(t *testing.T) {
 	if !bytes.HasPrefix(body, []byte("<!doctype html>")) {
 		t.Errorf("export starts %.40q", body)
 	}
-	// It is the engine's export of the publication and its current record.
-	if want := must(p.srv.PageSnapshot().Export("p1"))(t); !bytes.Equal(body, want) {
-		t.Error("the export is not the engine's")
+	// It is the page perfmcp's own route served for the same calls before
+	// the routes moved here.
+	if want := must(os.ReadFile(filepath.Join("testdata", "explained-export.golden")))(t); !bytes.Equal(body, want) {
+		t.Errorf("the export is %d bytes that are not the %d the route served before the move", len(body), len(want))
 	}
 	for _, text := range []string{"41.1%", rejected.Attempt, "Attempt a1"} {
 		if !strings.Contains(string(body), text) {
@@ -320,6 +326,51 @@ func TestAnExportThatFailsOtherwiseSaysSo(t *testing.T) {
 			t.Errorf("%v: body %q", c.err, got)
 		}
 	}
+}
+
+// explainedFrame is node's frame in raw's default view explained by exps,
+// as the engine computes it, built here apart from any server.
+func explainedFrame(t *testing.T, raw []byte, exps []any, node string) []byte {
+	t.Helper()
+	prof := must(profilemodel.FromBytes(raw, nil, profilemodel.DefaultLimits()))(t)
+	v := must(prof.View(profilemodel.ViewOptions{SampleIndex: -1}))(t)
+	lim := perfmcp.DefaultLimits().Explain
+	decoded, _, err := explain.Decode(must(json.Marshal(exps))(t), lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := explain.Check(v, decoded, lim)
+	if !r.OK {
+		t.Fatalf("the check failed: %+v", r.Failures)
+	}
+	return must(flamegraph.ExplainedLiveFrame(v, r, profilemodel.NodeID(node), prof.Digest.String()))(t)
+}
+
+// A server's page has one set of routes, and a server without a page has
+// none: either is a programming error, and Routes panics.
+func TestRoutesNeedAPageOfTheirOwn(t *testing.T) {
+	panics := func(what string, f func()) {
+		t.Helper()
+		defer func() {
+			r := recover()
+			if s, ok := r.(string); !ok || !strings.HasPrefix(s, "perfpage.Routes: ") {
+				t.Errorf("%s: recovered %v, want a perfpage.Routes panic", what, r)
+			}
+		}()
+		f()
+	}
+	srv, err := perfmcp.New(perfmcp.Config{ProfilesDir: t.TempDir(), Limits: perfmcp.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	events := NewEvents(perfmcp.DefaultLimits())
+	t.Cleanup(events.Close)
+	panics("a server without Page", func() { Routes(srv, events) })
+
+	p := newPage(t, nil)
+	panics("a second set of routes", func() { Routes(p.srv, p.events) })
+	p.get("state")
 }
 
 // eventsClient reads the page's stream over a connection of its own, so

@@ -259,10 +259,10 @@ var knownMethods = map[string]bool{
 	"resources/list": true, "resources/templates/list": true, "resources/read": true,
 }
 
-func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
+func (s *Server) handle(ctx context.Context, ps *Session, method string, params json.RawMessage) (any, *rpcError) {
 	switch method {
 	case "initialize":
-		return s.initialize(ctx, params)
+		return s.initialize(ps, params)
 	case "ping":
 		return struct{}{}, nil
 	case "tools/list":
@@ -306,7 +306,7 @@ func decodeParams(params json.RawMessage, v any) *rpcError {
 	return nil
 }
 
-func (s *Server) initialize(ctx context.Context, params json.RawMessage) (any, *rpcError) {
+func (s *Server) initialize(ps *Session, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		ClientInfo      struct {
@@ -320,9 +320,7 @@ func (s *Server) initialize(ctx context.Context, params json.RawMessage) (any, *
 	if slices.Contains(SupportedVersions, p.ProtocolVersion) {
 		version = p.ProtocolVersion
 	}
-	if ps, ok := ctx.Value(protoKey{}).(*Session); ok {
-		ps.record(version, clientLabel(p.ClientInfo.Name))
-	}
+	ps.record(version, clientLabel(p.ClientInfo.Name))
 	type listChanged struct {
 		ListChanged bool `json:"listChanged"`
 	}
@@ -465,8 +463,13 @@ func (s *Server) readResource(ctx context.Context, params json.RawMessage) (any,
 	text := r.Text
 	if r.Read != nil {
 		var err error
-		if text, err = r.Read(ctx); err != nil {
-			return nil, &rpcError{Code: codeInternalError, Message: err.Error()}
+		var panicked bool
+		text, err, panicked = s.runRead(ctx, r)
+		if panicked {
+			return nil, &rpcError{Code: codeInternalError, Message: "internal error: resource " + echoName(r.URI) + " failed"}
+		}
+		if err != nil {
+			return nil, &rpcError{Code: codeInternalError, Message: cut(err.Error(), s.o.MaxToolErrorBytes)}
 		}
 	}
 	content := map[string]string{"uri": r.URI, "text": text}
@@ -474,6 +477,18 @@ func (s *Server) readResource(ctx context.Context, params json.RawMessage) (any,
 		content["mimeType"] = r.MIMEType
 	}
 	return map[string]any{"contents": []map[string]string{content}}, nil
+}
+
+// runRead calls the resource's Read and turns a panic into a flag.
+func (s *Server) runRead(ctx context.Context, r Resource) (text string, err error, panicked bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.warn("resource read panicked", r.URI, slog.LevelError, "uri", r.URI, "panic", fmt.Sprint(p))
+			panicked = true
+		}
+	}()
+	text, err = r.Read(ctx)
+	return text, err, false
 }
 
 // maxEchoName is the most characters of a client's tool, prompt or

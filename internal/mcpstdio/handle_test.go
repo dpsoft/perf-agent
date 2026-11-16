@@ -175,6 +175,28 @@ func TestADynamicResourceIsReadEachTime(t *testing.T) {
 	}
 }
 
+func TestAResourceReadThatPanicsOrOverrunsIsBounded(t *testing.T) {
+	o := testOptions()
+	o.MaxToolErrorBytes = 20
+	o.Resources = []Resource{
+		{URI: "mem://boom", Name: "b", Read: func(context.Context) (string, error) { panic("secret /home/x") }},
+		{URI: "mem://long", Name: "l", Read: func(context.Context) (string, error) {
+			return "", errors.New(strings.Repeat("e", 100))
+		}},
+	}
+	s := New(o)
+	ss := NewSession()
+	handleLine(t, s, ss, `{"jsonrpc":"2.0","id":0,"method":"initialize"}`)
+	out := string(handleLine(t, s, ss, `{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"mem://boom"}}`))
+	if !strings.Contains(out, `"code":-32603`) || !strings.Contains(out, `internal error: resource \"mem://boom\" failed`) || strings.Contains(out, "secret") {
+		t.Fatal(out)
+	}
+	out = string(handleLine(t, s, ss, `{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"mem://long"}}`))
+	if !strings.Contains(out, `"code":-32603`) || strings.Contains(out, strings.Repeat("e", 21)) || !strings.Contains(out, "…") {
+		t.Fatal(out)
+	}
+}
+
 func TestToolLookup(t *testing.T) {
 	o := testOptions()
 	o.Tools[0].Snapshot = true

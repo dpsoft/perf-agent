@@ -148,9 +148,6 @@ func (s *Server) Handle(ctx context.Context, ss *Session, r *Request) []byte {
 	}
 	env := &envelope{JSONRPC: "2.0", ID: r.ID, Method: r.Method, Params: r.Params}
 	out, initialized := s.answer(withSession(ctx, ss), ss, env)
-	if out == nil {
-		return nil
-	}
 	b, err := marshal(out)
 	if err != nil {
 		s.warn("encode message", "", slog.LevelError, "err", err)

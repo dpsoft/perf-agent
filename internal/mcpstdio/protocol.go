@@ -138,7 +138,9 @@ type Resource struct {
 	Snapshot bool `json:"-"`
 	// Read, when set, produces the text on every resources/read, with the
 	// request's context, in place of Text. An error answers -32603
-	// carrying its text.
+	// carrying its text, cut like a tool error; a panic answers -32603
+	// "internal error: resource <uri> failed". The text goes to the client
+	// verbatim, so it must never carry an absolute path or a token.
 	Read func(ctx context.Context) (string, error) `json:"-"`
 }
 

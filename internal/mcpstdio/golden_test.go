@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"io"
 	"os"
 	"testing"
 )
@@ -80,5 +79,4 @@ func TestStdioTranscriptIsUnchanged(t *testing.T) {
 	if !bytes.Equal(got.Bytes(), want) {
 		t.Fatalf("stdio transcript changed:\n got: %s\nwant: %s", got.Bytes(), want)
 	}
-	_ = io.Discard
 }

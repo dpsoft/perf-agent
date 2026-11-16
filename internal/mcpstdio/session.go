@@ -438,7 +438,7 @@ func (s *Server) answer(ctx context.Context, ps *Session, env *envelope) (*outgo
 	if env.Method != "initialize" && env.Method != "ping" && !ps.Initialized() && knownMethods[env.Method] {
 		return errorResponse(env.ID, codeInvalidRequest, "send initialize first"), false
 	}
-	result, rerr := s.handle(ctx, env.Method, env.Params)
+	result, rerr := s.handle(ctx, ps, env.Method, env.Params)
 	if rerr != nil {
 		return errorResponse(env.ID, rerr.Code, rerr.Message), false
 	}
@@ -497,7 +497,8 @@ func Progress(ctx context.Context, progress, total float64, message string) bool
 
 // Received is when the request ctx belongs to was read from the client,
 // before it waited in the queue; ok is false for a context of no queued
-// request (a Control call runs as it is read).
+// request (a Control call runs as it is read). A time set with
+// WithReceived takes precedence over the request's own.
 func Received(ctx context.Context) (at time.Time, ok bool) {
 	if t, ok := ctx.Value(receivedKey{}).(time.Time); ok {
 		return t, true

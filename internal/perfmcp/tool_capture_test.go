@@ -1081,12 +1081,13 @@ func TestCaptureListConvergesWhenTheReadIsSlow(t *testing.T) {
 		t.Fatalf("a 300ms read answered within 100ms: %+v", first)
 	}
 	time.Sleep(400 * time.Millisecond)
-	// Every later call answers, each with the last read that finished,
-	// however often the agent calls.
+	// Every later call answers, however often the agent calls: with a
+	// read that finished in time (fresh), or else with the last read that
+	// finished (read_at); never loading.
 	for range 5 {
 		var next listing
 		text := c.callOK("capture_list", map[string]any{"series": "s"}, &next)
-		if next.Loading || len(next.Captures) != 1 || !strings.Contains(text, `"read_at"`) {
+		if next.Loading || len(next.Captures) != 1 {
 			t.Errorf("the finished read was not answered: %s", text)
 		}
 		time.Sleep(50 * time.Millisecond)

@@ -105,7 +105,7 @@ func TestCaptureLimitsCeilings(t *testing.T) {
 			StopGrace: 30 * time.Second, WindowDuration: 5 * time.Minute,
 			MaxSampleRate: 10000, KeepPerSeries: 1, MaxKeptPerSeries: 1, CompareRows: defaultMaxDiffRows,
 			MaxJobs: 1, MaxJobBytes: 1, WindowCaptures: 1, MaxOutputTail: 64 << 10,
-			MaxProfileBytes: 1, MaxExeclogBytes: 1, MaxStoredBytes: 2, MinFreeBytes: 1,
+			MaxProfileBytes: 1, MaxExeclogBytes: 1, MaxStoredBytes: 4 + storeHeadroom, MinFreeBytes: 1,
 		}
 	})
 	cfg := testConfig(t)
@@ -327,6 +327,14 @@ func TestCaptureLimitsCrossFieldChecks(t *testing.T) {
 		{"execlog over the model", func(l *Limits) { l.Capture.MaxExeclogBytes = l.Model.MaxSidecarBytes + 1 }, []string{"Capture.MaxExeclogBytes", "Model.MaxSidecarBytes"}},
 		{"window under one capture", func(l *Limits) { l.Capture.WindowDuration = l.Capture.MaxDuration - time.Second }, []string{"Capture.WindowDuration", "Capture.MaxDuration"}},
 		{"store under one capture", func(l *Limits) { l.Capture.MaxStoredBytes = 300 << 20 }, []string{"Capture.MaxStoredBytes", "Capture.MaxProfileBytes", "Capture.MaxExeclogBytes"}},
+		// The capture directory's own small files need room beside the
+		// largest capture: three profiles and an executions log.
+		{"store of exactly one capture", func(l *Limits) {
+			l.Capture.MaxStoredBytes = 3*l.Capture.MaxProfileBytes + l.Capture.MaxExeclogBytes
+		}, []string{"Capture.MaxStoredBytes", "3 × Capture.MaxProfileBytes + Capture.MaxExeclogBytes + 1 MiB"}},
+		{"store of one cpu capture", func(l *Limits) {
+			l.Capture.MaxStoredBytes = l.Capture.MaxProfileBytes + l.Capture.MaxExeclogBytes + storeHeadroom
+		}, []string{"Capture.MaxStoredBytes"}},
 		{"tails over the response", func(l *Limits) { l.Capture.MaxOutputTail = 16 << 10; l.MaxResponseBytes = 256<<10 - 1 }, []string{"Capture.MaxOutputTail", "MaxResponseBytes"}},
 		{"explicit compare rows", func(l *Limits) { l.MaxDiffRows = 10; l.Capture.CompareRows = 15 }, []string{"Capture.CompareRows", "MaxDiffRows"}},
 	} {
@@ -368,7 +376,7 @@ func TestCaptureLimitsDefaultStoreHoldsTheLargestCapture(t *testing.T) {
 	cfg.Limits = Limits{Model: model, MaxMessageBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxOpenHandles: 4}
 	s := must(New(cfg))(t)
 	defer func() { _ = s.Close() }()
-	if got, want := s.lim.Capture.MaxStoredBytes, int64(5<<30); got != want {
+	if got, want := s.lim.Capture.MaxStoredBytes, int64(3*4<<30+1<<30+storeHeadroom); got != want {
 		t.Errorf("MaxStoredBytes %d, want %d", got, want)
 	}
 	// Under the default it stays 4 GiB.
@@ -439,5 +447,27 @@ func TestCaptureLimitsFitIsLogged(t *testing.T) {
 	_ = s.Close()
 	if strings.Contains(buf.String(), "fitted") {
 		t.Errorf("defaults logged a fit:\n%s", buf.String())
+	}
+}
+
+// The most a capture writes is a profile per mode and, with gpu, an
+// executions log.
+func TestCaptureNeed(t *testing.T) {
+	c := CaptureLimits{MaxProfileBytes: 10, MaxExeclogBytes: 3}
+	for _, tc := range []struct {
+		modes []capture.Mode
+		want  int64
+	}{
+		{[]capture.Mode{capture.ModeCPU}, 10},
+		{[]capture.Mode{capture.ModeCPU, capture.ModeOffCPU}, 20},
+		{[]capture.Mode{capture.ModeGPU}, 13},
+		{[]capture.Mode{capture.ModeCPU, capture.ModeOffCPU, capture.ModeGPU}, 33},
+	} {
+		if got := c.captureNeed(tc.modes); got != tc.want {
+			t.Errorf("captureNeed(%v) = %d, want %d", tc.modes, got, tc.want)
+		}
+	}
+	if got := c.largestCapture(); got != 33 {
+		t.Errorf("largestCapture = %d", got)
 	}
 }

@@ -92,7 +92,7 @@ func (p *protection) addSeries(d *captureDir, series string) error {
 			p.captures[captureKey(series, formatID(id))] = true
 		}
 	}
-	ms, _, err := seriesManifests(ser)
+	ms, err := protectedManifests(ser, names)
 	if err != nil {
 		return err
 	}
@@ -107,6 +107,34 @@ func (p *protection) addSeries(d *captureDir, series string) error {
 		p.captures[captureKey(series, newest)] = true
 	}
 	return nil
+}
+
+// protectedManifests reads the manifests among names, in id order. A
+// manifest this server did not write is passed over; one that cannot be
+// read (an I/O error, a permission) is an error, since it may name a
+// baseline or be kept.
+func protectedManifests(ser *os.Root, names []string) ([]manifest, error) {
+	var ms []manifest
+	for _, n := range names {
+		if _, _, kind, ok := parseName(n); !ok || kind != kindManifest {
+			continue
+		}
+		b, _, err := readSmall(ser, n, maxManifestBytes)
+		if _, isIO := errors.AsType[*fs.PathError](err); isIO && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("manifest %s: %w", n, err)
+		}
+		var m manifest
+		if err != nil || json.Unmarshal(b, &m) != nil || checkManifest(m, n) != nil {
+			continue
+		}
+		ms = append(ms, m)
+	}
+	slices.SortFunc(ms, func(a, b manifest) int {
+		ia, _ := parseID(a.ID)
+		ib, _ := parseID(b.ID)
+		return ia - ib
+	})
+	return ms, nil
 }
 
 // seriesDirs lists the series directories of the capture directory.
@@ -125,11 +153,11 @@ func seriesDirs(d *captureDir) ([]string, error) {
 	return dirs, nil
 }
 
-// storeHasRoom reports whether a capture directory of used bytes still
-// has room for one more capture of the largest size under MaxStoredBytes.
-func (s *Server) storeHasRoom(used int64) bool {
-	c := s.lim.Capture
-	return used+c.MaxProfileBytes+c.MaxExeclogBytes <= c.MaxStoredBytes
+// storeHasRoom reports whether a capture directory of used bytes has room,
+// under Capture.MaxStoredBytes, for a capture that may write need bytes
+// (CaptureLimits.captureNeed).
+func (s *Server) storeHasRoom(used, need int64) bool {
+	return used+need <= s.lim.Capture.MaxStoredBytes
 }
 
 // dirBytes is the size of the regular files under root, each file counted
@@ -171,18 +199,31 @@ type held struct {
 	series string
 	ser    *os.Root
 	m      manifest
-	// self is the manifest file as it was read, its digest included.
+	// self is the manifest file as it was read, its digest included:
+	// under its own name, or under the eviction marker's when the
+	// manifest's name is gone (viaMarker).
 	self fileIdentity
 	// written is the capture's start, or its manifest's time when the
 	// manifest records none (a failure before the capture started).
 	written time.Time
+	// marked says the eviction marker is there, a second name of the
+	// manifest: an earlier pass began to evict the capture, and this one
+	// finishes it. viaMarker says the manifest's own name is gone already
+	// and the marker is all of it that is left. blocked says why the
+	// marker's name holds something else.
+	marked, viaMarker bool
+	blocked           string
 	// gone says this pass evicted it; spared that it holds something
 	// retention cannot prove is its own, so this pass leaves it.
 	gone, spared bool
 }
 
-func (h *held) key() string  { return captureKey(h.series, h.m.ID) }
-func (h *held) name() string { return h.series + "/" + h.m.ID + "-" + h.m.Label }
+func (h *held) key() string      { return captureKey(h.series, h.m.ID) }
+func (h *held) name() string     { return h.series + "/" + h.m.ID + "-" + h.m.Label }
+func (h *held) failure() bool    { return h.m.Outcome != captureOK }
+func (h *held) id() int          { id, _ := parseID(h.m.ID); return id }
+func (h *held) marker() string   { return evictingName(h.id(), h.m.Label) }
+func (h *held) manifest() string { return manifestName(h.id(), h.m.Label) }
 
 // tag is the quarantine tag of retention's removals of h: the capture's
 // token (so recovery's report names the capture) and "r-", which no
@@ -208,23 +249,33 @@ type retention struct {
 }
 
 // retain removes committed captures from the capture directory as §7.3
-// orders, keeping everything p protects: first it finishes any eviction a
-// crash or a failure interrupted; then it removes every capture older than
-// Capture.TTL (when set); then, per series, the unkept captures past the
-// newest Capture.KeepPerSeries, oldest first; then, while the directory
-// lacks room for one more capture of the largest size under
-// Capture.MaxStoredBytes, the oldest unkept capture, least recently written
-// series first. Failed and interrupted captures count like any other. It
-// runs under the captures lock and the engine.
+// orders, keeping everything p protects:
+//  1. it puts back under their names the files an interrupted pass left
+//     under quarantine names, then finishes every eviction an earlier
+//     pass began, which the eviction marker shows;
+//  2. when Capture.TTL is set, it removes every capture older than that
+//     (by its start), unless the clock reads earlier than the newest
+//     capture's start;
+//  3. per series, it removes the unkept captures past the newest
+//     Capture.KeepPerSeries, oldest first; failed and interrupted
+//     captures have a budget of their own, of the same size;
+//  4. while the directory lacks room for the largest capture under
+//     Capture.MaxStoredBytes, it removes the oldest unkept capture, least
+//     recently written series first; but only when removing every capture
+//     it may remove would make that room.
 //
-// A capture's files are removed before its manifest, each only when it is
-// still the file the manifest records (device, inode, one link, size and
-// SHA-256), and through the quarantine move removeByIdentity makes. A
-// capture holding anything else under one of its names keeps it, and its
-// manifest, and is noted. The manifest is removed last, by its own
-// identity, so an eviction cut short leaves a manifest the next pass
-// finishes, and no id is ever handed out again. It returns the captures it
-// evicted, "<series>/<NNN>-<label>", each logged.
+// Before it removes anything of a capture with files, it links the
+// eviction marker, NNN-label.evicting, to the manifest, so a pass that is
+// cut short is finished by the next one, and a capture missing a file
+// with no marker (a user moved or deleted it) is kept and noted. A
+// capture's files are removed before its manifest, and the marker last;
+// each only when it is still the file the manifest records (device, inode,
+// one link, size and SHA-256), moved aside and checked first: if any is
+// not, every file is put back, and the capture is kept and noted. What an
+// interrupted pass left under quarantine names is put back first. So no id
+// is ever handed out again: the manifest, or its marker, outlives the
+// files. It runs under the captures lock and the engine, and returns the
+// captures it evicted, "<series>/<NNN>-<label>", each logged.
 func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []string, err error) {
 	if p.err != nil {
 		return nil, capture.Errorf(capture.CodeDisk, "", "retention removed nothing in the capture directory %s inside the profiles root %s: it could not read what it must keep: %v",
@@ -241,64 +292,171 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 	return r.evicted, nil
 }
 
-// run is the pass's four steps.
+// run is the pass's four steps, after it puts back what an interrupted
+// pass left aside.
 func (r *retention) run(now time.Time) error {
-	lim := r.s.lim.Capture
 	for _, h := range r.all {
-		if r.partial(h) {
+		if err := r.unquarantine(h); err != nil {
+			return err
+		}
+	}
+	for _, h := range r.all {
+		if h.marked || h.viaMarker {
 			if err := r.evict(h, "finishing an eviction that was cut short"); err != nil {
 				return err
 			}
 		}
 	}
-	if lim.TTL > 0 {
-		for _, h := range r.all {
-			if now.Sub(h.written) > lim.TTL {
-				if err := r.evict(h, "older than Capture.TTL "+lim.TTL.String()); err != nil {
-					return err
-				}
-			}
+	if err := r.byAge(now); err != nil {
+		return err
+	}
+	if err := r.byCount(); err != nil {
+		return err
+	}
+	return r.bySize()
+}
+
+// byAge is the TTL step.
+func (r *retention) byAge(now time.Time) error {
+	ttl := r.s.lim.Capture.TTL
+	if ttl <= 0 {
+		return nil
+	}
+	var newest time.Time
+	for _, h := range r.all {
+		if !h.gone && h.m.Start.After(newest) {
+			newest = h.m.Start
+		}
+	}
+	if now.Before(newest) {
+		r.note(fmt.Sprintf("the clock reads %s, earlier than the newest capture's start %s; the TTL step is skipped this pass",
+			now.UTC().Format(time.RFC3339), newest.UTC().Format(time.RFC3339)))
+		return nil
+	}
+	old := func(h *held) bool { return !h.gone && now.Sub(h.written) > ttl && !r.isProtected(h) }
+	counts := map[string]int{}
+	for _, h := range r.all {
+		if old(h) {
+			counts[h.series]++
 		}
 	}
 	for _, series := range r.seriesOrder(false) {
-		var unkept []*held
-		for _, h := range r.all {
-			if h.series == series && !h.gone && !h.m.Kept {
-				unkept = append(unkept, h)
-			}
+		if n := counts[series]; n > r.s.lim.Capture.KeepPerSeries {
+			r.s.log.Warn("capture retention removes many captures by age at once",
+				"series", series, "count", n, "ttl", ttl.String(), "keep_per_series", r.s.lim.Capture.KeepPerSeries)
 		}
-		if len(unkept) <= lim.KeepPerSeries {
-			continue
-		}
-		for _, h := range unkept[:len(unkept)-lim.KeepPerSeries] {
-			if err := r.evict(h, fmt.Sprintf("past the newest %d unkept captures of its series (Capture.KeepPerSeries)", lim.KeepPerSeries)); err != nil {
+	}
+	for _, h := range r.all {
+		if old(h) {
+			if err := r.evict(h, "older than Capture.TTL "+ttl.String()); err != nil {
 				return err
 			}
 		}
 	}
-	used, err := dirBytes(r.d.root)
-	if err != nil {
-		return err
-	}
-	for _, series := range r.seriesOrder(true) {
-		for _, h := range r.all {
-			if r.s.storeHasRoom(used) {
-				return nil
+	return nil
+}
+
+// byCount is the keep-count step: per series, the newest KeepPerSeries
+// unkept captures stay, and so do the newest KeepPerSeries failure
+// manifests, counted apart, so a run of failures never pushes out a
+// capture that succeeded.
+func (r *retention) byCount() error {
+	keep := r.s.lim.Capture.KeepPerSeries
+	for _, series := range r.seriesOrder(false) {
+		for _, failures := range []bool{false, true} {
+			var unkept []*held
+			for _, h := range r.all {
+				if h.series == series && !h.gone && !h.m.Kept && h.failure() == failures {
+					unkept = append(unkept, h)
+				}
 			}
-			if h.series != series {
+			if len(unkept) <= keep {
 				continue
 			}
-			if err := r.evict(h, "making room under Capture.MaxStoredBytes"); err != nil {
-				return err
+			what := "unkept captures"
+			if failures {
+				what = "failed or interrupted captures"
 			}
-			if h.gone {
-				if used, err = dirBytes(r.d.root); err != nil {
+			for _, h := range unkept[:len(unkept)-keep] {
+				if err := r.evict(h, fmt.Sprintf("past the newest %d %s of its series (Capture.KeepPerSeries)", keep, what)); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// bySize is the stored-bytes step. It measures the directory once and
+// counts down what each eviction frees. When removing every capture it
+// may remove would still leave no room, or the directory cannot be
+// measured, it removes nothing: the capture that needs the room then
+// fails with disk, and no capture is removed for nothing.
+func (r *retention) bySize() error {
+	need := r.s.lim.Capture.largestCapture()
+	used, err := dirBytes(r.d.root)
+	if err != nil {
+		r.note("the stored-bytes step removes nothing: it cannot measure the capture directory: " + pathless(err).Error())
+		return nil
+	}
+	if r.s.storeHasRoom(used, need) {
+		return nil
+	}
+	var cands []*held
+	var freeable int64
+	for _, series := range r.seriesOrder(true) {
+		for _, h := range r.all {
+			if h.series == series && r.evictable(h) {
+				cands = append(cands, h)
+				freeable += r.size(h)
+			}
+		}
+	}
+	if !r.s.storeHasRoom(used-freeable, need) {
+		r.note(fmt.Sprintf("the capture directory holds %d bytes; a capture may need %d more, under Capture.MaxStoredBytes %d, and removing every capture retention may remove would free only %d, so it removes none by size",
+			used, need, r.s.lim.Capture.MaxStoredBytes, freeable))
+		return nil
+	}
+	for _, h := range cands {
+		if r.s.storeHasRoom(used, need) {
+			return nil
+		}
+		size := r.size(h)
+		if err := r.evict(h, "making room under Capture.MaxStoredBytes"); err != nil {
+			return err
+		}
+		if h.gone {
+			used -= size
+		}
+	}
+	return nil
+}
+
+// evictable reports whether evict would try to remove h.
+func (r *retention) evictable(h *held) bool {
+	return !h.gone && !h.spared && !h.m.Kept && !r.isProtected(h) && h.blocked == "" &&
+		(h.marked || h.viaMarker || r.missing(h) == "")
+}
+
+// size is what removing h frees: its files still there, and its manifest.
+func (r *retention) size(h *held) int64 {
+	n := h.self.Size
+	for _, f := range h.m.Files {
+		if fi, err := h.ser.Lstat(f.Name); err == nil {
+			n += fi.Size()
+		}
+	}
+	return n
+}
+
+// missing is the first file of h that is not there, "" when none is.
+func (r *retention) missing(h *held) string {
+	for _, f := range h.m.Files {
+		if _, err := h.ser.Lstat(f.Name); errors.Is(err, fs.ErrNotExist) {
+			return f.Name
+		}
+	}
+	return ""
 }
 
 // seriesOrder lists the series in name order or, by recency, least
@@ -320,8 +478,9 @@ func (r *retention) seriesOrder(byRecency bool) []string {
 	return order
 }
 
-// load reads every series' manifests. A manifest this server did not
-// write, or cannot read, is never a capture retention removes.
+// load reads every series' manifests and eviction markers. A manifest
+// this server did not write, or cannot read, is never a capture retention
+// removes.
 func (r *retention) load() error {
 	series, err := seriesDirs(r.d)
 	if err != nil {
@@ -339,34 +498,65 @@ func (r *retention) load() error {
 		}
 		slices.Sort(names)
 		r.names[name] = names
+		byName := map[string]*held{}
 		var hs []*held
 		for _, n := range names {
 			if _, _, kind, ok := parseName(n); !ok || kind != kindManifest {
 				continue
 			}
-			if h, ok := readHeld(ser, name, n); ok {
+			if h, ok := readHeld(ser, name, n, n); ok {
+				hs = append(hs, h)
+				byName[n] = h
+			}
+		}
+		for _, n := range names {
+			id, label, kind, ok := parseName(n)
+			if !ok || kind != kindEvicting {
+				continue
+			}
+			if h := byName[manifestName(id, label)]; h != nil {
+				r.markedBy(h, n)
+				continue
+			}
+			// The manifest's name is gone: the marker is the manifest
+			// itself, read as one, and the rest of the eviction is
+			// finished from it.
+			if h, ok := readHeld(ser, name, n, manifestName(id, label)); ok && !h.failure() {
+				h.viaMarker = true
 				hs = append(hs, h)
 			}
 		}
-		slices.SortFunc(hs, func(a, b *held) int {
-			ia, _ := parseID(a.m.ID)
-			ib, _ := parseID(b.m.ID)
-			return ia - ib
-		})
+		slices.SortFunc(hs, func(a, b *held) int { return a.id() - b.id() })
 		r.all = append(r.all, hs...)
 	}
 	return nil
 }
 
-// readHeld reads the manifest name of series as readManifest does, and
-// takes its identity from the bytes read.
-func readHeld(ser *os.Root, series, name string) (*held, bool) {
+// markedBy records what the marker name n beside h's manifest is: the
+// manifest's second name (the eviction began), or something else.
+func (r *retention) markedBy(h *held, n string) {
+	mfi, merr := h.ser.Lstat(h.self.Name)
+	fi, err := h.ser.Lstat(n)
+	switch {
+	case err != nil || merr != nil:
+		h.blocked = "the eviction marker could not be read"
+	case fi.Mode().IsRegular() && os.SameFile(fi, mfi):
+		h.marked = true
+	default:
+		h.blocked = "the eviction marker's name holds a file retention did not link there"
+	}
+}
+
+// readHeld reads name in series as the manifest as (its own name, or the
+// manifest name an eviction marker stands for), as readManifest checks it,
+// and takes its identity from the bytes read.
+func readHeld(ser *os.Root, series, name, as string) (*held, bool) {
 	b, fi, err := readSmall(ser, name, maxManifestBytes)
 	if err != nil {
 		return nil, false
 	}
 	var m manifest
-	if json.Unmarshal(b, &m) != nil || checkManifest(m, name) != nil || m.Series != series {
+	if json.Unmarshal(b, &m) != nil || checkManifest(m, as) != nil || m.Series != series {
 		return nil, false
 	}
 	self := identityOf(name, fi)
@@ -406,129 +596,286 @@ func (r *retention) isProtected(h *held) bool {
 	return slices.ContainsFunc(h.m.Files, func(f fileIdentity) bool { return r.p.files[fileKey{f.Dev, f.Ino}] })
 }
 
-// partial reports whether an earlier pass began to evict h: a file of it
-// is gone (removed, or left under retention's quarantine name).
-func (r *retention) partial(h *held) bool {
-	return slices.ContainsFunc(h.m.Files, func(f fileIdentity) bool {
-		_, err := h.ser.Lstat(f.Name)
-		return errors.Is(err, fs.ErrNotExist)
-	})
-}
-
-// evict removes h, files first and its manifest last, unless it is
-// protected or something of it is not provably its own; why says which
-// rule evicts it.
+// evict removes h: the marker first, then its files, its manifest and the
+// marker last. It does nothing for a protected or kept capture, and keeps,
+// noting why, a capture that is not wholly its own: a file replaced or
+// linked elsewhere, or missing with no marker to show retention removed
+// it. why says which rule evicts it.
 func (r *retention) evict(h *held, why string) error {
-	if h.gone || h.spared || r.isProtected(h) {
+	if h.gone || h.spared || h.m.Kept || r.isProtected(h) {
+		return nil
+	}
+	if h.blocked != "" {
+		r.spare(h, h.marker(), h.blocked)
+		return nil
+	}
+	if !h.marked && !h.viaMarker {
+		if f := r.missing(h); f != "" {
+			r.spare(h, f, "incomplete: "+f+" is missing, and nothing shows retention began to remove the capture")
+			return nil
+		}
+	}
+	// By their stat first: a capture that is plainly not its own is kept
+	// before anything is written.
+	for _, f := range h.m.Files {
+		fi, err := h.ser.Lstat(f.Name)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			return err
+		}
+		if why := cmp.Or(statWhy(fi, f), linksWhy(fi, 1)); why != "" {
+			r.spare(h, f.Name, why)
+			return nil
+		}
+	}
+	if len(h.m.Files) > 0 && !h.marked && !h.viaMarker {
+		if err := r.mark(h); err != nil || h.spared {
+			return err
+		}
+	}
+	if spared, err := r.removeFiles(h); err != nil {
+		return err
+	} else if spared {
+		r.unmark(h)
 		return nil
 	}
 	s := r.s
-	for _, f := range h.m.Files {
-		if err := s.fault(faultRetentionHash); err != nil {
-			return err
-		}
-		if left, err := checkEvictable(h.ser, f); err != nil {
-			return err
-		} else if left != "" {
-			r.spare(h, f.Name, left)
-			return nil
-		}
-	}
-	if err := r.finishQuarantined(h); err != nil {
-		return err
-	}
-	tag := h.tag()
-	for _, f := range h.m.Files {
-		if err := s.wErr("retention remove"); err != nil {
-			return err
-		}
-		if err := s.fault(faultRetentionHash); err != nil {
-			return err
-		}
-		if _, left, err := removeTagged(h.ser, f.Name, f, tag); err != nil {
-			return err
-		} else if left != "" {
-			r.spare(h, f.Name, left)
-			return nil
-		}
-	}
 	if len(h.m.Files) > 0 {
 		// The files are gone for good before the manifest goes.
 		if err := s.syncDir(h.ser, ".", "fsync retention"); err != nil {
 			return err
 		}
 	}
+	if !h.viaMarker {
+		links := uint64(1)
+		if h.marked {
+			links = 2
+		}
+		if err := s.wErr("retention remove"); err != nil {
+			return err
+		}
+		if err := s.fault(faultRetentionHash); err != nil {
+			return err
+		}
+		_, left, err := removeLinked(h.ser, h.self.Name, h.self, h.tag(), links)
+		switch {
+		case err != nil:
+			return err
+		case left != "":
+			r.spare(h, h.self.Name, left)
+			return nil
+		}
+		if err := s.syncDir(h.ser, ".", "fsync retention"); err != nil {
+			return err
+		}
+	}
+	h.gone = true
+	r.evicted = append(r.evicted, h.name())
+	s.log.Info("capture evicted", "capture", h.name(), "why", why)
+	if !h.marked && !h.viaMarker {
+		return nil
+	}
+	// The marker is the manifest's last name now.
+	marker := h.self
+	marker.Name = h.marker()
 	if err := s.wErr("retention remove"); err != nil {
 		return err
 	}
 	if err := s.fault(faultRetentionHash); err != nil {
 		return err
 	}
-	removed, left, err := removeTagged(h.ser, h.self.Name, h.self, tag)
-	switch {
-	case err != nil:
+	if _, left, err := removeLinked(h.ser, marker.Name, marker, h.tag(), 1); err != nil {
 		return err
-	case left != "":
-		r.spare(h, h.self.Name, left)
-		return nil
-	}
-	h.gone = true
-	if removed {
-		r.evicted = append(r.evicted, h.name())
-		s.log.Info("capture evicted", "capture", h.name(), "why", why)
+	} else if left != "" {
+		r.note(fmt.Sprintf("left %s/%s: %s; capture %s is evicted, and this file is kept", h.series, marker.Name, left, h.name()))
 	}
 	return s.syncDir(h.ser, ".", "fsync retention")
 }
 
-// checkEvictable says why the file f records may not be removed, "" when
-// it may or is gone already: it must still be the recorded file, with no
-// name but the capture's.
-func checkEvictable(ser *os.Root, f fileIdentity) (string, error) {
-	fi, err := ser.Lstat(f.Name)
+// mark links the eviction marker to h's manifest, without replacing
+// anything, and makes it durable: from here on the eviction is finished
+// even when the pass is cut short. A name taken by another file keeps the
+// capture.
+func (r *retention) mark(h *held) error {
+	s := r.s
+	if err := s.wErr("retention mark"); err != nil {
+		return err
+	}
+	err := s.linkNoReplace(h.ser, rootCaptures, h.self.Name, h.marker())
+	if err != nil && !errors.Is(err, errCrash) && landed(h.ser, h.marker(), h.self) == linkMade {
+		err = nil
+	}
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return "", nil
+	case errors.Is(err, fs.ErrExist):
+		r.spare(h, h.marker(), "the eviction marker's name holds a file retention did not link there")
+		return nil
 	case err != nil:
-		return "", err
+		return err
 	}
-	if st, _ := statOf(fi); fi.Mode().IsRegular() && st.nlink != 1 {
-		return fmt.Sprintf("%d links: another name shares the file, so it is not the capture's alone", st.nlink), nil
-	}
-	why, err := matches(ser, f.Name, f)
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
-	}
-	return why, err
+	h.marked = true
+	return s.syncDir(h.ser, ".", "fsync retention")
 }
 
-// finishQuarantined removes the names of h's files an interrupted pass
-// left under retention's quarantine name, each only when it is a file h's
-// manifest records. Anything else there is left, for recovery to report.
-func (r *retention) finishQuarantined(h *held) error {
-	if len(h.m.Files) == 0 {
-		return nil
+// unmark removes the marker of a capture whose files are all back under
+// their names after it was spared: nothing of it was removed. When a file
+// is missing, the marker stays, and the capture is still one whose
+// eviction began.
+func (r *retention) unmark(h *held) {
+	if !h.marked || r.missing(h) != "" {
+		return
 	}
-	tag := h.tag()
+	marker := h.self
+	marker.Name = h.marker()
+	removed, left, err := removeLinked(h.ser, marker.Name, marker, h.tag(), 2)
+	if err != nil || left != "" {
+		r.note(fmt.Sprintf("left %s/%s: the eviction marker of capture %s, which retention kept, stays: %s", h.series, marker.Name, h.name(), cmpOrErr(left, err)))
+		return
+	}
+	if removed {
+		h.marked = false
+		_ = r.s.syncDir(h.ser, ".", "fsync retention")
+	}
+}
+
+// aside is a capture file removeFiles moved to its quarantine name.
+type aside struct {
+	want fileIdentity
+	q    string
+	f    *os.File
+	fi   fs.FileInfo
+}
+
+// removeFiles removes h's files: it moves each aside, then checks each
+// there (its stat and its SHA-256, once), then unlinks them. If any is not
+// the file the manifest records, every one moved is put back under its
+// name, and the capture is spared. A crash leaves the moved files under
+// quarantine names, which the next pass puts back (unquarantine).
+func (r *retention) removeFiles(h *held) (spared bool, err error) {
+	s, tag := r.s, h.tag()
+	var moved []*aside
+	defer func() {
+		for _, a := range moved {
+			if a.f != nil {
+				_ = a.f.Close()
+			}
+		}
+	}()
+	undo := func() string {
+		var why []string
+		for _, a := range moved {
+			if a.q != "" {
+				if w := restore(h.ser, a.q, a.want.Name); w != "" {
+					why = append(why, a.want.Name+w)
+				}
+				a.q = ""
+			}
+		}
+		return strings.Join(why, "")
+	}
+	fail := func(err error) (bool, error) {
+		if errors.Is(err, errCrash) {
+			return false, err
+		}
+		if w := undo(); w != "" {
+			err = fmt.Errorf("%w; %s", err, w)
+		}
+		return false, err
+	}
+	spare := func(name, why string) (bool, error) {
+		if w := undo(); w != "" {
+			why += "; " + w
+		}
+		r.spare(h, name, why)
+		return true, nil
+	}
+	for _, f := range h.m.Files {
+		if err := s.wErr("retention remove"); err != nil {
+			return fail(err)
+		}
+		q, left, err := moveAside(h.ser, f.Name, f, tag, 1)
+		switch {
+		case err != nil:
+			return fail(err)
+		case left != "":
+			return spare(f.Name, left)
+		case q != "":
+			moved = append(moved, &aside{want: f, q: q})
+		}
+	}
+	for _, a := range moved {
+		if err := s.fault(faultRetentionHash); err != nil {
+			return fail(err)
+		}
+		f, fi, left, err := checkAside(h.ser, a.q, a.want.Name, a.want, 1)
+		if f == nil {
+			// checkAside put this one back itself.
+			a.q = ""
+			if err != nil {
+				return fail(err)
+			}
+			return spare(a.want.Name, left)
+		}
+		a.f, a.fi = f, fi
+	}
+	for _, a := range moved {
+		_, left, err := unlinkAside(h.ser, a.q, a.want.Name, a.fi)
+		q := a.q
+		a.q = ""
+		switch {
+		case err != nil:
+			return fail(err)
+		case left != "":
+			return spare(q, left)
+		}
+	}
+	return false, nil
+}
+
+// unquarantine undoes what an interrupted pass of retention left under
+// its quarantine names for h, before h is judged again: a name that is a
+// second name of a file h still holds under its own name (a file put back
+// before a crash removed its quarantine name) is dropped, which loses
+// nothing; any other file with the device and inode of one of h's files
+// (or of its manifest) goes back under that file's name when the name is
+// free. Nothing is deleted on its contents' account here: the files back
+// under their names are judged like any other.
+func (r *retention) unquarantine(h *held) error {
+	type cand struct {
+		id    fileIdentity
+		names []string
+	}
+	cands := []cand{{h.self, []string{h.manifest(), h.marker()}}}
+	for _, f := range h.m.Files {
+		cands = append(cands, cand{f, []string{f.Name}})
+	}
 	for _, n := range r.names[h.series] {
-		if !strings.HasPrefix(n, quarantinePrefix+tag) {
+		if !strings.HasPrefix(n, quarantinePrefix+h.tag()) {
 			continue
 		}
-		for _, f := range h.m.Files {
-			id := f
-			id.Name = n
-			if err := r.s.fault(faultRetentionHash); err != nil {
+		qfi, err := h.ser.Lstat(n)
+		if err != nil || !qfi.Mode().IsRegular() {
+			continue
+		}
+		st, _ := statOf(qfi)
+		i := slices.IndexFunc(cands, func(c cand) bool { return st.dev == c.id.Dev && st.ino == c.id.Ino })
+		if i < 0 {
+			continue
+		}
+		c := cands[i]
+		held := slices.ContainsFunc(c.names, func(name string) bool {
+			fi, err := h.ser.Lstat(name)
+			return err == nil && os.SameFile(fi, qfi)
+		})
+		if held {
+			if err := h.ser.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
-			if why, err := matches(h.ser, n, id); err != nil || why != "" {
-				continue
-			}
-			if err := r.s.wErr("retention remove"); err != nil {
-				return err
-			}
-			if _, _, err := removeTagged(h.ser, n, id, tag); err != nil {
-				return err
-			}
-			break
+			continue
+		}
+		if why := restore(h.ser, n, c.names[0]); why != "" {
+			r.note(fmt.Sprintf("left %s/%s: retention moved it aside from %s before a crash%s", h.series, n, c.names[0], why))
 		}
 	}
 	return nil
@@ -538,7 +885,11 @@ func (r *retention) finishQuarantined(h *held) error {
 // own.
 func (r *retention) spare(h *held, name, why string) {
 	h.spared = true
-	note := fmt.Sprintf("left %s/%s: %s; capture %s keeps it and its manifest, since retention removes only files it can prove are the ones the manifest records",
-		h.series, name, why, h.name())
-	r.s.log.Warn("capture retention left a file in place", "note", note)
+	r.note(fmt.Sprintf("left %s/%s: %s; capture %s keeps it and its manifest, since retention removes only files it can prove are the ones the manifest records",
+		h.series, name, why, h.name()))
+}
+
+// note logs what the pass left, or did not do, and why.
+func (r *retention) note(n string) {
+	r.s.log.Warn("capture retention", "note", n)
 }

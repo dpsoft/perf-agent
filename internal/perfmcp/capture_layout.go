@@ -247,6 +247,9 @@ const (
 	kindIntent
 	kindHeartbeat
 	kindFile
+	// kindEvicting is retention's eviction marker, a second name of the
+	// manifest of a capture it began to remove.
+	kindEvicting
 )
 
 // The suffixes that tell the kinds apart; anything else after "NNN-" is a
@@ -255,11 +258,12 @@ const (
 	manifestSuffix  = ".capture.json"
 	intentSuffix    = ".intent.json"
 	heartbeatSuffix = ".intent.hb"
+	evictingSuffix  = ".evicting"
 )
 
 // parseName splits a series entry "NNN-<rest>" into its id, the rest and
-// its kind: for a manifest, an intent and a heartbeat the rest is the
-// label; for a capture file it is "<label>-<output>".
+// its kind: for a manifest, an intent, a heartbeat and an eviction marker
+// the rest is the label; for a capture file it is "<label>-<output>".
 func parseName(name string) (id int, rest string, kind nameKind, ok bool) {
 	digits, rest, found := strings.Cut(name, "-")
 	if !found {
@@ -272,7 +276,7 @@ func parseName(name string) (id int, rest string, kind nameKind, ok bool) {
 	for _, k := range []struct {
 		kind   nameKind
 		suffix string
-	}{{kindManifest, manifestSuffix}, {kindIntent, intentSuffix}, {kindHeartbeat, heartbeatSuffix}} {
+	}{{kindManifest, manifestSuffix}, {kindIntent, intentSuffix}, {kindHeartbeat, heartbeatSuffix}, {kindEvicting, evictingSuffix}} {
 		if label, cut := strings.CutSuffix(rest, k.suffix); cut {
 			rest, kind = label, k.kind
 			break
@@ -290,6 +294,7 @@ func finalName(id int, label, output string) string {
 func manifestName(id int, label string) string  { return formatID(id) + "-" + label + manifestSuffix }
 func intentName(id int, label string) string    { return formatID(id) + "-" + label + intentSuffix }
 func heartbeatName(id int, label string) string { return formatID(id) + "-" + label + heartbeatSuffix }
+func evictingName(id int, label string) string  { return formatID(id) + "-" + label + evictingSuffix }
 
 // seqRecord is .seq's content: the next id the series hands out.
 type seqRecord struct {

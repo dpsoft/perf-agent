@@ -2,8 +2,10 @@ package perfmcp
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
+	"github.com/dpsoft/perf-agent/internal/capture"
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 	"github.com/dpsoft/perf-agent/internal/sourceroot"
@@ -298,7 +300,7 @@ func (l Limits) resolve() (Limits, []limitChange) {
 // fit moves the capture limits left at their defaults to fit the limits
 // they depend on, and says which it moved: CompareRows, MaxProfileBytes,
 // MaxExeclogBytes and MaxOutputTail are lowered, then MaxStoredBytes is
-// raised to hold the largest capture's files.
+// raised to hold the largest capture's files and storeHeadroom.
 func (c CaptureLimits) fit(l Limits) (CaptureLimits, []limitChange) {
 	def := defaultCaptureLimits(profilemodel.DefaultLimits())
 	var changes []limitChange
@@ -306,7 +308,7 @@ func (c CaptureLimits) fit(l Limits) (CaptureLimits, []limitChange) {
 	fitTo(&changes, "Capture.MaxProfileBytes", "Model.MaxRawBytes", &c.MaxProfileBytes, def.MaxProfileBytes, min(def.MaxProfileBytes, l.Model.MaxRawBytes))
 	fitTo(&changes, "Capture.MaxExeclogBytes", "Model.MaxSidecarBytes", &c.MaxExeclogBytes, def.MaxExeclogBytes, min(def.MaxExeclogBytes, l.Model.MaxSidecarBytes))
 	fitTo(&changes, "Capture.MaxOutputTail", "MaxResponseBytes", &c.MaxOutputTail, def.MaxOutputTail, fittedTail(l))
-	fitTo(&changes, "Capture.MaxStoredBytes", "Capture.MaxProfileBytes + Capture.MaxExeclogBytes", &c.MaxStoredBytes, def.MaxStoredBytes, max(def.MaxStoredBytes, c.MaxProfileBytes+c.MaxExeclogBytes))
+	fitTo(&changes, "Capture.MaxStoredBytes", largestCaptureText+" + 1 MiB", &c.MaxStoredBytes, def.MaxStoredBytes, max(def.MaxStoredBytes, c.largestCapture()+storeHeadroom))
 	return c, changes
 }
 
@@ -431,9 +433,9 @@ func (c CaptureLimits) validate(l Limits) error {
 	case c.WindowDuration < c.MaxDuration:
 		return fmt.Errorf("perfmcp: limit Capture.WindowDuration is %v, under Capture.MaxDuration (%v): the longest capture would never fit the window",
 			c.WindowDuration, c.MaxDuration)
-	case c.MaxStoredBytes < c.MaxProfileBytes+c.MaxExeclogBytes:
-		return fmt.Errorf("perfmcp: limit Capture.MaxStoredBytes is %d, under Capture.MaxProfileBytes + Capture.MaxExeclogBytes (%d): the largest capture would not fit",
-			c.MaxStoredBytes, c.MaxProfileBytes+c.MaxExeclogBytes)
+	case c.MaxStoredBytes < c.largestCapture()+storeHeadroom:
+		return fmt.Errorf("perfmcp: limit Capture.MaxStoredBytes is %d, under %s + 1 MiB (%d): the largest capture would not fit beside the capture directory's own small files",
+			c.MaxStoredBytes, largestCaptureText, c.largestCapture()+storeHeadroom)
 	// A tail at its fitted default is as small as fit makes it: under 16
 	// bytes of response it is one byte, and not refused.
 	case maxTailsPerResult*c.MaxOutputTail > l.MaxResponseBytes/4 && c.MaxOutputTail != fittedTail(l):
@@ -441,4 +443,28 @@ func (c CaptureLimits) validate(l Limits) error {
 			c.MaxOutputTail, maxTailsPerResult, maxTailsPerResult*c.MaxOutputTail, l.MaxResponseBytes/4)
 	}
 	return nil
+}
+
+// storeHeadroom is what MaxStoredBytes holds beyond the largest capture:
+// the capture directory's own small files (.owner, .lock, each series'
+// .seq and manifests).
+const storeHeadroom = 1 << 20
+
+// largestCaptureText names largestCapture in messages.
+const largestCaptureText = "3 × Capture.MaxProfileBytes + Capture.MaxExeclogBytes"
+
+// largestCapture is the most a capture may write: a profile of each mode
+// and an executions log.
+func (c CaptureLimits) largestCapture() int64 {
+	return c.captureNeed([]capture.Mode{capture.ModeCPU, capture.ModeOffCPU, capture.ModeGPU})
+}
+
+// captureNeed is the most a capture of modes may write: a profile per
+// mode, and an executions log with gpu.
+func (c CaptureLimits) captureNeed(modes []capture.Mode) int64 {
+	need := c.MaxProfileBytes * int64(len(modes))
+	if slices.Contains(modes, capture.ModeGPU) {
+		need += c.MaxExeclogBytes
+	}
+	return need
 }

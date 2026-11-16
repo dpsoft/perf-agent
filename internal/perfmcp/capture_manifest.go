@@ -414,61 +414,115 @@ func removeByIdentity(root *os.Root, name string, want fileIdentity) (removed bo
 // capture's token, so that recovery can tell whose quarantined file a
 // crash left.
 func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (removed bool, left string, err error) {
-	// Only the stat is checked under the name: the contents are hashed
-	// once, under the quarantine name, where nothing else looks.
-	_, why, err := statMatches(root, name, want)
+	return removeLinked(root, name, want, tag, 0)
+}
+
+// removeLinked is removeTagged for a file that must have exactly links
+// names, under its own name and its quarantine name alike; 0 allows one or
+// two (a capture file's staging and final names).
+func removeLinked(root *os.Root, name string, want fileIdentity, tag string, links uint64) (removed bool, left string, err error) {
+	q, left, err := moveAside(root, name, want, tag, links)
+	if q == "" {
+		return false, left, err
+	}
+	f, fi, left, err := checkAside(root, q, name, want, links)
+	if f == nil {
+		return false, left, err
+	}
+	defer func() { _ = f.Close() }()
+	return unlinkAside(root, q, name, fi)
+}
+
+// linksWhy says why fi does not have exactly links names, "" when it
+// does or links is 0.
+func linksWhy(fi fs.FileInfo, links uint64) string {
+	if st, _ := statOf(fi); links != 0 && st.nlink != links {
+		return fmt.Sprintf("%d links, not the %d recorded: another name shares the file", st.nlink, links)
+	}
+	return ""
+}
+
+// moveAside is the first step of a removal: when name is, by its stat,
+// the file want records (with links names), it is renamed to a private
+// quarantine name beside it, which it returns. Only the stat is checked
+// under the name: the contents are hashed once, under the quarantine name,
+// where nothing else looks. An empty q means nothing was moved: the name
+// is missing, or left says why it is not the recorded file.
+func moveAside(root *os.Root, name string, want fileIdentity, tag string, links uint64) (q, left string, err error) {
+	fi, why, err := statMatches(root, name, want)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return false, "", nil
+		return "", "", nil
 	case err != nil:
-		return false, "", err
-	case why != "":
-		return false, why, nil
+		return "", "", err
+	case why == "":
+		why = linksWhy(fi, links)
+	}
+	if why != "" {
+		return "", why, nil
 	}
 	if quarantineHook != nil {
 		quarantineHook(root, name)
 	}
-	q := filepath.Join(filepath.Dir(name), quarantinePrefix+tag+randHex(8))
+	q = filepath.Join(filepath.Dir(name), quarantinePrefix+tag+randHex(8))
 	if err := root.Rename(name, q); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return false, "", nil
+			return "", "", nil
 		}
-		return false, "", err
-	}
-	// A failure from here on puts the file back under its name, where a
-	// retry finds it; a crash leaves it under the quarantine name, which
-	// recovery proves by the tag.
-	fail := func(err error) (bool, string, error) {
-		if errors.Is(err, errCrash) {
-			return false, "", err
-		}
-		if why := restore(root, q, name); why != "" {
-			return false, "", fmt.Errorf("%w%s", err, why)
-		}
-		return false, "", err
+		return "", "", err
 	}
 	if quarantineAfterHook != nil {
 		if err := quarantineAfterHook(); err != nil {
-			return fail(err)
+			return "", "", putBack(root, q, name, err)
 		}
 	}
-	f, fi, err := openNoFollow(root, q)
+	return q, "", nil
+}
+
+// putBack is err, a failure after name was moved to q, once the file is
+// back under its name, where a retry finds it; a crash leaves it under the
+// quarantine name, which recovery proves by the tag.
+func putBack(root *os.Root, q, name string, err error) error {
+	if errors.Is(err, errCrash) {
+		return err
+	}
+	if why := restore(root, q, name); why != "" {
+		return fmt.Errorf("%w%s", err, why)
+	}
+	return err
+}
+
+// checkAside opens the file moved to q and checks it there, its stat and
+// its SHA-256, against want. A file that is not the recorded one is put
+// back under name, and left says why; f is then nil.
+func checkAside(root *os.Root, q, name string, want fileIdentity, links uint64) (f *os.File, fi fs.FileInfo, left string, err error) {
+	f, fi, err = openNoFollow(root, q)
 	if err != nil {
 		if errors.Is(err, errNotRegular) {
-			return false, err.Error() + restore(root, q, name), nil
+			return nil, nil, err.Error() + restore(root, q, name), nil
 		}
-		return fail(err)
+		return nil, nil, "", putBack(root, q, name, err)
 	}
-	defer func() { _ = f.Close() }()
-	why = statWhy(fi, want)
+	why := statWhy(fi, want)
+	if why == "" {
+		why = linksWhy(fi, links)
+	}
 	if why == "" {
 		if why, err = contentsMatch(f, want); err != nil {
-			return fail(err)
+			_ = f.Close()
+			return nil, nil, "", putBack(root, q, name, err)
 		}
 	}
 	if why != "" {
-		return false, why + restore(root, q, name), nil
+		_ = f.Close()
+		return nil, nil, why + restore(root, q, name), nil
 	}
+	return f, fi, "", nil
+}
+
+// unlinkAside unlinks q, the file checkAside checked as fi.
+func unlinkAside(root *os.Root, q, name string, fi fs.FileInfo) (removed bool, left string, err error) {
+	fail := func(err error) (bool, string, error) { return false, "", putBack(root, q, name, err) }
 	// Right before the unlink, the quarantine name must still be the file
 	// just checked. This narrows the window in which a same-user process
 	// could rename another file onto the name; it does not close it.
@@ -485,10 +539,14 @@ func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (re
 }
 
 // restore puts q back under name without replacing anything there, and
-// says where the file is when it cannot.
+// says where the file is when it cannot. Once the file is back, its
+// quarantine name is a second name of it, removed (twice tried) or
+// reported.
 func restore(root *os.Root, q, name string) string {
 	if err := root.Link(q, name); err == nil {
-		_ = root.Remove(q)
+		if err := removeSecondName(root, q); err != nil {
+			return "; it is back under its name, and a second name of it is left at " + q + " (" + pathless(err).Error() + ")"
+		}
 		return ""
 	}
 	if _, err := root.Lstat(name); errors.Is(err, fs.ErrNotExist) {
@@ -497,4 +555,16 @@ func restore(root *os.Root, q, name string) string {
 		}
 	}
 	return "; it was moved aside to " + q + ", since its name is taken now"
+}
+
+// removeSecondName unlinks q, a name of a file just linked back under its
+// own name, trying twice.
+func removeSecondName(root *os.Root, q string) error {
+	var err error
+	for range 2 {
+		if err = root.Remove(q); err == nil || errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+	}
+	return err
 }

@@ -153,20 +153,22 @@ func TestRetentionKeepsPerSeriesNewestFirst(t *testing.T) {
 	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
 		t.Errorf("second pass evicted %q", ev)
 	}
-	// A manifest of series a copied into series b is not b's capture:
-	// retention leaves it, though none of the files it names is in b.
-	src := filepath.Join(d.root.Name(), "a", manifestName(5, "run"))
-	b, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
+	// A capture of series a moved whole into series b (its own files,
+	// renamed) is not b's capture, though b has one more than it keeps.
+	commitAged(t, s, d, aged{series: "b"})
+	commitAged(t, s, d, aged{series: "b"})
+	for _, n := range seriesNames(t, d, "a") {
+		if strings.HasPrefix(n, "005-") {
+			if err := os.Rename(filepath.Join(d.root.Name(), "a", n), filepath.Join(d.root.Name(), "b", n)); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	stray := filepath.Join(d.root.Name(), "b", manifestName(5, "run"))
-	mustWrite(t, stray, b)
-	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+	if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"b/001-run"}) {
 		t.Errorf("evicted %q", ev)
 	}
-	if _, err := os.Lstat(stray); err != nil {
-		t.Errorf("the copied manifest went: %v", err)
+	if !hasManifest(t, d, "b", 5, "run") {
+		t.Error("the moved capture went")
 	}
 }
 
@@ -187,7 +189,8 @@ func TestRetentionByStoredBytes(t *testing.T) {
 	const reserve = 8 << 10
 	setup := func(t *testing.T) (*Server, *captureDir, map[string]int64) {
 		s, d, _, _ := retentionServer(t, 100)
-		s.lim.Capture.MaxProfileBytes, s.lim.Capture.MaxExeclogBytes = reserve/2, reserve/2
+		// The largest capture writes three profiles and an executions log.
+		s.lim.Capture.MaxProfileBytes, s.lim.Capture.MaxExeclogBytes = reserve/4, reserve/4
 		// Series old was written least recently; its first capture is kept.
 		commitAged(t, s, d, aged{series: "old", label: "base", keep: true, age: 9 * time.Hour})
 		commitAged(t, s, d, aged{series: "old", age: 3 * time.Hour})
@@ -219,13 +222,13 @@ func TestRetentionByStoredBytes(t *testing.T) {
 	t.Run("one byte over", func(t *testing.T) {
 		s, d, _ := setup(t)
 		s.lim.Capture.MaxStoredBytes = used(t, d) + reserve - 1
-		if s.storeHasRoom(used(t, d)) {
+		if s.storeHasRoom(used(t, d), reserve) {
 			t.Fatal("the store has room before retention")
 		}
 		if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"old/002-run"}) {
 			t.Fatalf("evicted %q", ev)
 		}
-		if !s.storeHasRoom(used(t, d)) {
+		if !s.storeHasRoom(used(t, d), reserve) {
 			t.Error("no room after retention")
 		}
 		invariant(t, d, nil)
@@ -242,17 +245,56 @@ func TestRetentionByStoredBytes(t *testing.T) {
 		}
 		invariant(t, d, nil)
 	})
-	t.Run("not enough room is no error", func(t *testing.T) {
+	// When removing every capture it may remove would still leave no
+	// room, nothing is removed for nothing.
+	futile := func(t *testing.T, s *Server, d *captureDir, logs *lockedBuffer) {
+		t.Helper()
+		before := used(t, d)
+		if ev := retainNow(t, s, d, "new/002"); len(ev) != 0 {
+			t.Fatalf("evicted %q although no room can be made", ev)
+		}
+		if used(t, d) != before {
+			t.Error("the directory changed")
+		}
+		if !strings.Contains(logs.String(), "removes none by size") {
+			t.Errorf("not noted:\n%s", logs.String())
+		}
+	}
+	t.Run("the kept capture and the baseline leave no room", func(t *testing.T) {
 		s, d, _ := setup(t)
+		logs := &lockedBuffer{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
 		s.lim.Capture.MaxStoredBytes = reserve
-		ev := retainNow(t, s, d, "new/002")
-		if want := []string{"old/002-run", "old/003-run", "new/001-run"}; !slices.Equal(ev, want) {
-			t.Fatalf("evicted %q, want %q", ev, want)
-		}
-		if s.storeHasRoom(used(t, d)) {
-			t.Error("room although the kept capture and the baseline stay")
-		}
+		futile(t, s, d, logs)
 		invariant(t, d, nil)
+	})
+	t.Run("a foreign file over the budget", func(t *testing.T) {
+		s, d, _ := setup(t)
+		logs := &lockedBuffer{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
+		s.lim.Capture.MaxStoredBytes = used(t, d) + reserve
+		mustWrite(t, filepath.Join(d.root.Name(), "notes.bin"), make([]byte, used(t, d)+64<<10))
+		futile(t, s, d, logs)
+	})
+	t.Run("a directory it cannot measure", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a directory of mode 0")
+		}
+		s, d, _ := setup(t)
+		logs := &lockedBuffer{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
+		s.lim.Capture.MaxStoredBytes = used(t, d) + reserve - 1
+		private := filepath.Join(d.root.Name(), ".private")
+		if err := os.Mkdir(private, 0); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(private, 0o700) }()
+		if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+			t.Fatalf("evicted %q", ev)
+		}
+		if !strings.Contains(logs.String(), "cannot measure") {
+			t.Errorf("not noted:\n%s", logs.String())
+		}
 	})
 }
 
@@ -328,7 +370,6 @@ func TestRetentionTTL(t *testing.T) {
 func TestRetentionNeverDeletesProtected(t *testing.T) {
 	s, d, _, _ := retentionServer(t, 1)
 	s.lim.Capture.TTL = time.Minute
-	s.lim.Capture.MaxStoredBytes = s.lim.Capture.MaxProfileBytes + s.lim.Capture.MaxExeclogBytes
 	s.ownerAlive = func(intent) bool { return true }
 	old := time.Hour
 	commitAged(t, s, d, aged{label: "base", keep: true, age: old})                                                    // 001 kept
@@ -409,10 +450,13 @@ type replaceFile struct {
 	do   func(t *testing.T, path string)
 	// late changes the file between the check and the move aside.
 	late bool
+	// byStat says the change shows in the file's stat, before anything is
+	// moved.
+	byStat bool
 }
 
 var replacements = []replaceFile{
-	{name: "replaced by another file with the same bytes", do: func(t *testing.T, path string) {
+	{name: "replaced by another file with the same bytes", byStat: true, do: func(t *testing.T, path string) {
 		b, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -423,12 +467,12 @@ var replacements = []replaceFile{
 		}
 	}},
 	{name: "rewritten in place", do: rewriteInPlace},
-	{name: "hard-linked elsewhere", do: func(t *testing.T, path string) {
+	{name: "hard-linked elsewhere", byStat: true, do: func(t *testing.T, path string) {
 		if err := os.Link(path, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(path))), "mine")); err != nil {
 			t.Fatal(err)
 		}
 	}},
-	{name: "a symbolic link", do: func(t *testing.T, path string) {
+	{name: "a symbolic link", byStat: true, do: func(t *testing.T, path string) {
 		b, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -467,6 +511,8 @@ func TestRetentionSparesAReplacedFile(t *testing.T) {
 	for _, rp := range replacements {
 		t.Run(rp.name, func(t *testing.T) {
 			s, d, _, logs := retentionServer(t, 1)
+			var ops []string
+			s.writeErr = func(op string) error { ops = append(ops, op); return nil }
 			// Both the TTL and the keep count select 001; it is judged,
 			// and noted, once.
 			s.lim.Capture.TTL = time.Hour
@@ -502,12 +548,19 @@ func TestRetentionSparesAReplacedFile(t *testing.T) {
 			if err != nil || string(after) != string(before) {
 				t.Fatalf("the replaced file changed: %v", err)
 			}
-			if !rp.late {
-				for _, o := range []string{"cpu.pb.gz", "gpu.pb.gz"} {
-					if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", finalName(1, "run", o))); err != nil {
-						t.Errorf("%s of a capture with a replaced file went: %v", o, err)
-					}
+			// Every file of the capture stays, or is put back.
+			for _, o := range []string{"cpu.pb.gz", "gpu.pb.gz"} {
+				if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", finalName(1, "run", o))); err != nil {
+					t.Errorf("%s of a capture with a replaced file went: %v", o, err)
 				}
+			}
+			if slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
+				t.Error("the spared capture keeps its eviction marker")
+			}
+			// A capture plainly not its own by its stat is kept before
+			// anything is written: only 002 is marked.
+			if n := strings.Count(strings.Join(ops, ","), "retention mark"); rp.byStat && n != 1 {
+				t.Errorf("%d markers written: %q", n, ops)
 			}
 			if !hasManifest(t, d, "adhoc", 1, "run") {
 				t.Fatal("the manifest of a capture with a replaced file went")
@@ -545,9 +598,10 @@ func evictionOps(t *testing.T) (ops map[string]int, points map[faultPoint]int, m
 	if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"adhoc/001-run"}) {
 		t.Fatalf("evicted %q", ev)
 	}
-	// The files' removals are durable before the manifest goes.
+	// The marker is durable before anything goes, and the files' removals
+	// before the manifest.
 	rm, sync := "retention remove", "fsync retention"
-	if want := []string{rm, rm, rm, sync, rm, sync}; !slices.Equal(seq, want) {
+	if want := []string{"retention mark", sync, rm, rm, rm, sync, rm, sync, rm, sync}; !slices.Equal(seq, want) {
 		t.Fatalf("writes %q, want %q", seq, want)
 	}
 	return ops, points, moves
@@ -578,6 +632,29 @@ func evictionState(t *testing.T, d *captureDir, notes []string) {
 	if err != nil || len(bad) != 0 {
 		t.Fatalf("manifests: %v %v", bad, err)
 	}
+	// A marker is a second name of its manifest, or, once the manifest's
+	// name is gone, the manifest itself.
+	markers := map[string]bool{}
+	for _, n := range dirNames(t, ser, ".") {
+		id, label, kind, ok := parseName(n)
+		if !ok || kind != kindEvicting {
+			continue
+		}
+		markers[n] = true
+		mn := manifestName(id, label)
+		if fi, err := ser.Lstat(mn); err == nil {
+			if mfi, _ := ser.Lstat(n); !os.SameFile(fi, mfi) {
+				t.Errorf("%s is not a name of %s", n, mn)
+			}
+			continue
+		}
+		h, ok := readHeld(ser, "adhoc", n, mn)
+		if !ok {
+			t.Errorf("%s is not a manifest", n)
+			continue
+		}
+		ms = append(ms, h.m)
+	}
 	owned := map[string]bool{}
 	for _, m := range ms {
 		for _, f := range m.Files {
@@ -592,7 +669,7 @@ func evictionState(t *testing.T, d *captureDir, notes []string) {
 	for _, n := range dirNames(t, ser, ".") {
 		_, _, kind, ok := parseName(n)
 		switch {
-		case n == seqFile, owned[n], ok && kind == kindManifest:
+		case n == seqFile, owned[n], markers[n], ok && kind == kindManifest:
 		case strings.HasPrefix(n, "."):
 			if !noted(notes, "orphan_temp", n) {
 				t.Errorf("%s: a leftover nothing noted (notes %q)", n, notes)
@@ -604,13 +681,17 @@ func evictionState(t *testing.T, d *captureDir, notes []string) {
 }
 
 // TestRetentionFinishesAPartialEviction: an eviction that stops part-way
-// (a crash, or EIO/ENOSPC, at any step) leaves the manifest until the
-// capture's files are gone, so the state stays valid, and the next pass
-// finishes it. Only a crash between moving the manifest itself aside and
-// unlinking it leaves a quarantined name, which recovery reports.
+// (a crash, or EIO/ENOSPC, at any step) leaves its marker and the manifest
+// (or the marker, its last name) until the capture's files are gone, so
+// the state stays valid, and the next pass finishes exactly the evictions
+// that began. Only a crash between moving the marker, the manifest's last
+// name, aside and unlinking it leaves a quarantined name, which recovery
+// reports.
 func TestRetentionFinishesAPartialEviction(t *testing.T) {
 	ops, points, moves := evictionOps(t)
-	if moves != 4 || ops["retention remove"] != 4 || points[faultRetentionHash] < 4 {
+	// Each of the three files, the manifest and the marker is moved aside
+	// and hashed once.
+	if moves != 5 || ops["retention remove"] != 5 || points[faultRetentionHash] != 5 {
 		t.Fatalf("a clean eviction: %d moves, ops %v, points %v", moves, ops, points)
 	}
 	check := func(t *testing.T, s *Server, d *captureDir, clk *testClock, err error, crash bool) {
@@ -627,7 +708,7 @@ func TestRetentionFinishesAPartialEviction(t *testing.T) {
 		evictionState(t, d, notes)
 		// Whether the pass had begun to remove 001: a name of it gone or
 		// moved aside.
-		touched := !hasManifest(t, d, "adhoc", 1, "run")
+		touched := !hasManifest(t, d, "adhoc", 1, "run") || slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run"))
 		for _, n := range seriesNames(t, d, "adhoc") {
 			touched = touched || strings.HasPrefix(n, quarantinePrefix)
 		}
@@ -727,10 +808,10 @@ func TestRetentionDoesNotReuseIDs(t *testing.T) {
 }
 
 // TestFailedManifestsAreRetainedLikeCaptures: failed and interrupted
-// manifests count toward a series' keep count and the TTL like captures,
-// and are evicted by the identity of the manifest.
+// manifests are retained like captures, in a keep count of their own, and
+// by the TTL, and are evicted by the identity of the manifest.
 func TestFailedManifestsAreRetainedLikeCaptures(t *testing.T) {
-	s, d, clk, logs := retentionServer(t, 3)
+	s, d, clk, logs := retentionServer(t, 2)
 	commitAged(t, s, d, aged{})                                  // 001 ok
 	commitAged(t, s, d, aged{failedAt: faultAfterSeq})           // 002 failed, no intent
 	commitAged(t, s, d, aged{failedAt: faultAfterStaging})       // 003 failed, rolled back
@@ -743,7 +824,9 @@ func TestFailedManifestsAreRetainedLikeCaptures(t *testing.T) {
 	}
 	commitAged(t, s, d, aged{}) // 005 ok
 
-	if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"adhoc/001-run", "adhoc/002-run"}) {
+	// Two captures that succeeded fit the keep count; of the three
+	// failures, the oldest goes.
+	if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"adhoc/002-run"}) {
 		t.Fatalf("evicted %q", ev)
 	}
 	invariant(t, d, nil)
@@ -802,6 +885,272 @@ func TestRetentionRemovesNothingWhenItCannotTellWhatToKeep(t *testing.T) {
 	for id := 1; id <= 3; id++ {
 		if !hasManifest(t, d, "a", id, "run") {
 			t.Errorf("a/%s was evicted", formatID(id))
+		}
+	}
+}
+
+// TestAFailureRunNeverPushesOutGoodCaptures: failures have their own keep
+// count, so a run of them leaves every capture that succeeded.
+func TestAFailureRunNeverPushesOutGoodCaptures(t *testing.T) {
+	s, d, _, _ := retentionServer(t, 3)
+	commitAged(t, s, d, aged{label: "good"})
+	commitAged(t, s, d, aged{label: "good"})
+	for range 4 {
+		commitAged(t, s, d, aged{failedAt: faultAfterSeq})
+	}
+	if ev := retainNow(t, s, d, ""); !slices.Equal(ev, []string{"adhoc/003-run"}) {
+		t.Fatalf("evicted %q", ev)
+	}
+	for id := 1; id <= 2; id++ {
+		if !hasManifest(t, d, "adhoc", id, "good") {
+			t.Errorf("good capture %s went", formatID(id))
+		}
+	}
+}
+
+// TestRetentionKeepsAnIncompleteCapture: a capture one of whose files the
+// user moved away or deleted shows no sign that retention began to evict
+// it. Retention keeps what is left, whatever rule selects it, and notes it.
+func TestRetentionKeepsAnIncompleteCapture(t *testing.T) {
+	modes := []capture.Mode{capture.ModeCPU, capture.ModeGPU}
+	for _, tc := range []struct {
+		name string
+		keep int
+		do   func(t *testing.T, path string, d *captureDir)
+	}{
+		{"moved away, no rule selects it", 10, func(t *testing.T, path string, d *captureDir) {
+			if err := os.Rename(path, filepath.Join(d.root.Name(), "kept-by-user")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"deleted, no rule selects it", 10, func(t *testing.T, path string, _ *captureDir) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"deleted, past the keep count", 1, func(t *testing.T, path string, _ *captureDir) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, d, _, logs := retentionServer(t, tc.keep)
+			commitAged(t, s, d, aged{modes: modes})
+			commitAged(t, s, d, aged{modes: modes})
+			gone := finalName(1, "run", "gpu.execlog")
+			tc.do(t, filepath.Join(d.root.Name(), "adhoc", gone), d)
+			if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+				t.Fatalf("evicted %q", ev)
+			}
+			for _, o := range []string{"cpu.pb.gz", "gpu.pb.gz"} {
+				if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", finalName(1, "run", o))); err != nil {
+					t.Errorf("%s went: %v", o, err)
+				}
+			}
+			if !hasManifest(t, d, "adhoc", 1, "run") {
+				t.Error("the manifest went")
+			}
+			if slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
+				t.Error("a marker was written")
+			}
+			if tc.keep == 1 && !strings.Contains(logs.String(), "incomplete: "+gone+" is missing") {
+				t.Errorf("not noted:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestAMarkerNameTakenByAnotherFileKeepsTheCapture: retention never
+// replaces a file at the marker's name, and never takes one it did not
+// link there for its own.
+func TestAMarkerNameTakenByAnotherFileKeepsTheCapture(t *testing.T) {
+	s, d, _, logs := retentionServer(t, 1)
+	commitAged(t, s, d, aged{})
+	commitAged(t, s, d, aged{})
+	marker := filepath.Join(d.root.Name(), "adhoc", evictingName(1, "run"))
+	mustWrite(t, marker, []byte("mine\n"))
+	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+		t.Fatalf("evicted %q", ev)
+	}
+	if b, err := os.ReadFile(marker); err != nil || string(b) != "mine\n" {
+		t.Fatalf("the user's file changed: %q %v", b, err)
+	}
+	if !hasManifest(t, d, "adhoc", 1, "run") || !strings.Contains(logs.String(), "left adhoc/"+evictingName(1, "run")) {
+		t.Errorf("the capture went, or nothing was noted:\n%s", logs.String())
+	}
+}
+
+// TestAMarkerNameTakenDuringItsLinkKeepsTheCapture: a file that appears at
+// the marker's name as it is linked is never replaced.
+func TestAMarkerNameTakenDuringItsLinkKeepsTheCapture(t *testing.T) {
+	s, d, _, logs := retentionServer(t, 1)
+	commitAged(t, s, d, aged{})
+	commitAged(t, s, d, aged{})
+	marker := filepath.Join(d.root.Name(), "adhoc", evictingName(1, "run"))
+	s.link = func(r *os.Root, oldname, newname string) error {
+		if newname == evictingName(1, "run") {
+			mustWrite(t, marker, []byte("mine\n"))
+		}
+		return r.Link(oldname, newname)
+	}
+	ev, err := retainOnce(t, s, d, "")
+	if err != nil || len(ev) != 0 {
+		t.Fatalf("evicted %q, err %v", ev, err)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "mine\n" || !hasManifest(t, d, "adhoc", 1, "run") {
+		t.Fatalf("the user's file or the capture went: %q", b)
+	}
+	if !strings.Contains(logs.String(), "left adhoc/"+evictingName(1, "run")) {
+		t.Errorf("not noted:\n%s", logs.String())
+	}
+}
+
+// TestALinkMadeDuringTheEvictionKeepsTheCapture: a second name the user
+// gives a file after its check is seen under the quarantine name: the
+// file is put back, the capture kept, and the user's link holds the bytes.
+func TestALinkMadeDuringTheEvictionKeepsTheCapture(t *testing.T) {
+	s, d, _, _ := retentionServer(t, 1)
+	commitAged(t, s, d, aged{})
+	commitAged(t, s, d, aged{})
+	target := finalName(1, "run", "cpu.pb.gz")
+	src := filepath.Join(d.root.Name(), "adhoc", target)
+	mine := filepath.Join(s.profiles.Name(), "mine")
+	before, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHook = func(_ *os.Root, name string) {
+		if name == target {
+			if err := os.Link(src, mine); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	defer func() { quarantineHook = nil }()
+	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+		t.Fatalf("evicted %q", ev)
+	}
+	for _, p := range []string{src, mine} {
+		if b, err := os.ReadFile(p); err != nil || string(b) != string(before) {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	if !hasManifest(t, d, "adhoc", 1, "run") || slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
+		t.Errorf("series %v", seriesNames(t, d, "adhoc"))
+	}
+}
+
+// TestRetentionKeepsAKeptCaptureItself: even given a protection that
+// omits it, retention does not remove a kept capture.
+func TestRetentionKeepsAKeptCaptureItself(t *testing.T) {
+	s, d, _, _ := retentionServer(t, 1)
+	s.lim.Capture.TTL = time.Minute
+	commitAged(t, s, d, aged{label: "base", keep: true, age: time.Hour})
+	commitAged(t, s, d, aged{age: time.Hour})
+	ev, err := s.retain(d, protection{files: map[fileKey]bool{}, captures: map[string]bool{}}, s.clock())
+	if err != nil || !slices.Equal(ev, []string{"adhoc/002-run"}) || !hasManifest(t, d, "adhoc", 1, "base") {
+		t.Fatalf("evicted %q, err %v", ev, err)
+	}
+}
+
+// TestAnUnreadableManifestStopsRetention: a manifest that cannot be read
+// may be kept, or name the newest baseline, so retention removes nothing.
+func TestAnUnreadableManifestStopsRetention(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file of mode 0")
+	}
+	s, d, _, _ := retentionServer(t, 1)
+	commitAged(t, s, d, aged{label: "base"})
+	commitAged(t, s, d, aged{label: "base2"})
+	commitAged(t, s, d, aged{label: "c", compare: "001"})
+	commitAged(t, s, d, aged{label: "c2", compare: "002"})
+	m := filepath.Join(d.root.Name(), "adhoc", manifestName(4, "c2"))
+	if err := os.Chmod(m, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(m, 0o600) }()
+	ev, err := retainOnce(t, s, d, "")
+	if err == nil || len(ev) != 0 || !hasManifest(t, d, "adhoc", 2, "base2") {
+		t.Fatalf("evicted %q, err %v", ev, err)
+	}
+}
+
+// TestTheTTLStepWatchesTheClock: when the clock reads earlier than the
+// newest capture's start (it jumped back), the TTL step is skipped; and a
+// TTL step that removes more than the keep count of one series says so
+// first.
+func TestTheTTLStepWatchesTheClock(t *testing.T) {
+	t.Run("backwards", func(t *testing.T) {
+		s, d, _, logs := retentionServer(t, 100)
+		s.lim.Capture.TTL = time.Hour
+		commitAged(t, s, d, aged{age: 2 * time.Hour})
+		commitAged(t, s, d, aged{age: -48 * time.Hour})
+		if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+			t.Fatalf("evicted %q", ev)
+		}
+		if !strings.Contains(logs.String(), "the TTL step is skipped") {
+			t.Errorf("not noted:\n%s", logs.String())
+		}
+	})
+	t.Run("many at once", func(t *testing.T) {
+		s, d, _, logs := retentionServer(t, 2)
+		s.lim.Capture.TTL = time.Hour
+		for range 4 {
+			commitAged(t, s, d, aged{age: 2 * time.Hour})
+		}
+		commitAged(t, s, d, aged{})
+		if ev := retainNow(t, s, d, ""); len(ev) != 4 {
+			t.Fatalf("evicted %q", ev)
+		}
+		if !strings.Contains(logs.String(), "removes many captures by age at once") || !strings.Contains(logs.String(), "count=4") {
+			t.Errorf("not logged:\n%s", logs.String())
+		}
+	})
+}
+
+// TestACrashedEvictionPutsTheFilesBack: a crash after a file the user
+// rewrote was moved aside leaves it under a quarantine name; the next
+// pass puts every file back under its name, finds the rewritten one, and
+// keeps the capture whole.
+func TestACrashedEvictionPutsTheFilesBack(t *testing.T) {
+	s, d, clk, _ := retentionServer(t, 1)
+	commitAged(t, s, d, aged{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}})
+	commitAged(t, s, d, aged{})
+	target := finalName(1, "run", "gpu.execlog")
+	path := filepath.Join(d.root.Name(), "adhoc", target)
+	var mine []byte
+	quarantineHook = func(_ *os.Root, name string) {
+		if name == target {
+			rewriteInPlace(t, path)
+			mine, _ = os.ReadFile(path)
+		}
+	}
+	defer func() { quarantineHook = nil }()
+	restoreCrash := quarantineCrash(3)
+	_, err := retainOnce(t, s, d, "")
+	restoreCrash()
+	quarantineHook = nil
+	if !errors.Is(err, errCrash) || mine == nil {
+		t.Fatalf("no crash after the rewritten file's move: %v", err)
+	}
+	notes := crashRecover(t, s, d, clk)
+	evictionState(t, d, notes)
+	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+		t.Fatalf("evicted %q", ev)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != string(mine) {
+		t.Fatalf("the user's file is not back under its name: %v", err)
+	}
+	names := seriesNames(t, d, "adhoc")
+	for _, o := range []string{"cpu.pb.gz", "gpu.pb.gz"} {
+		if !slices.Contains(names, finalName(1, "run", o)) {
+			t.Errorf("%s is not back: %v", o, names)
+		}
+	}
+	for _, n := range names {
+		if strings.HasPrefix(n, quarantinePrefix) || n == evictingName(1, "run") {
+			t.Errorf("%s left", n)
 		}
 	}
 }

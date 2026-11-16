@@ -1284,7 +1284,7 @@ func TestAHistoricalFailureIsAnsweredByItsOutcome(t *testing.T) {
 		{"interrupted", manifest{Outcome: captureInterrupted}, capture.CodeCancelled, captureInterrupted, true},
 		{"interrupted with an error", manifest{Outcome: captureInterrupted, Error: disk}, capture.CodeCancelled, captureInterrupted, true},
 		{"failed", manifest{Outcome: captureFailed, Error: disk}, capture.CodeDisk, string(jobFailed), true},
-		{"failed without an error", manifest{Outcome: captureFailed}, capture.CodePerfAgentFailed, string(jobFailed), true},
+		{"failed without an error", manifest{Outcome: captureFailed}, capture.CodeNoOutput, string(jobFailed), true},
 		{"cancelled", manifest{Outcome: captureFailed, Error: &wireError{Code: string(capture.CodeCancelled), Message: "cancelled"}}, capture.CodeCancelled, string(jobCancelled), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1295,6 +1295,9 @@ func TestAHistoricalFailureIsAnsweredByItsOutcome(t *testing.T) {
 			w := toolErrorOf(t, res.Text)
 			if w.Code != string(tc.code) || w.Status != tc.status || w.Retryable != tc.retryable || w.CaptureID != "s/001" {
 				t.Errorf("%+v", w)
+			}
+			if tc.m.Outcome == captureFailed && tc.m.Error == nil && !strings.Contains(w.Message, "failed without a recorded cause") {
+				t.Errorf("message %q", w.Message)
 			}
 		})
 	}

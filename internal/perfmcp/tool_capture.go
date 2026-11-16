@@ -719,8 +719,8 @@ func (s *Server) historicalAnswer(key, jobID string, h *historical) mcpstdio.Res
 			e.Retryable, e.RetryAfter = true, 0
 			status = captureInterrupted
 		case m.Error == nil:
-			e = capture.Errorf(capture.CodePerfAgentFailed, "capture again; capture_list shows the series' history",
-				"capture %s failed, and its manifest records no error", key)
+			e = capture.Errorf(capture.CodeNoOutput, "capture again; capture_list shows the series' history",
+				"capture %s: the capture failed without a recorded cause", key)
 			e.Retryable, e.RetryAfter = true, 0
 		default:
 			e = errorFromWire(m.Error)

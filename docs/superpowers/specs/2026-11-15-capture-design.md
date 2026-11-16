@@ -366,7 +366,7 @@ without `--output`.
 | `modes` | array of `"cpu"`, `"offcpu"`, `"gpu"` | `["cpu"]` | Distinct values. `gpu` needs `--gpu-shim` (§8). |
 | `duration` | string, Go duration | `"10s"` | In [1s, `Capture.MaxDuration`]. Same syntax and default as perf-agent's `--duration`. |
 | `sample_rate` | integer, Hz | 99 | In [1, `Capture.MaxSampleRate`]. Same default as perf-agent. |
-| `kernel_stacks` | bool | false | Opt-in [user]. Refused unless the binary has `cap_syslog`, since without it kernel frames come out unsymbolized and no error is reported. The result and the manifest note that the file contains kernel addresses. |
+| `kernel_stacks` | bool | false | Opt-in [user]. Refused (`disabled`, with `next` the `setcap` line naming this server's perf-agent) unless the binary has `cap_syslog`, since without it kernel frames come out unsymbolized and no error is reported. The result and the manifest note that the file contains kernel addresses. |
 | `unwind` | `"auto"`, `"fp"` or `"dwarf"` | `"auto"` | Passed to perf-agent's `--unwind`. |
 | `series` | string | `"adhoc"` | The series (a subdirectory of the capture directory): `[A-Za-z0-9._-]`, 1–64 bytes, not starting with `.`. One loop is one series. |
 | `label` | string | `"run"` | Names the capture inside its series, as in `base` or `cand3`. Same character rule, 1–32 bytes. |

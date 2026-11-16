@@ -666,7 +666,7 @@ func (r *jobRun) effective() (capture.Settings, error) {
 		return eff, capture.Errorf(capture.CodeDisabled, "start perf-agent-mcp with --gpu-shim PATH",
 			"mode gpu%s needs the CUPTI adapter, and this server has none", from(argModes))
 	case eff.KernelStacks && !r.s.perfAgent.Caps.Has(capture.CapSyslog):
-		return eff, capture.Errorf(capture.CodeInvalidArgument, "add cap_syslog to perf-agent's file capabilities: "+capture.SetcapLine,
+		return eff, capture.Errorf(capture.CodeDisabled, r.s.syslogNext(),
 			"kernel_stacks%s needs cap_syslog in perf-agent's file capabilities, or kernel frames come out unsymbolized", from(argKernelStacks))
 	}
 	return eff, nil

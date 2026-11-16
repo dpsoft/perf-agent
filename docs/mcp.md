@@ -149,7 +149,7 @@ capture_list   {"series": "parse-opt"}
 | `modes` | `["cpu"]` | `cpu`, `offcpu`, `gpu`, each once. `gpu` needs `--gpu-shim`; a `pid` target must already have the shim mapped. |
 | `duration` | `10s` | A Go duration from 1s to `Capture.MaxDuration`. |
 | `sample_rate` | 99 | Hz, from 1 to `Capture.MaxSampleRate`. |
-| `kernel_stacks` | false | Needs `cap_syslog` on perf-agent. The profile then holds kernel addresses. |
+| `kernel_stacks` | false | Needs `cap_syslog` on perf-agent; without it the capture is `disabled`, and `next` gives the `setcap` line for this server's perf-agent. The profile then holds kernel addresses. |
 | `unwind` | `auto` | `auto`, `fp` or `dwarf`, perf-agent's `--unwind`. |
 | `series` | `adhoc` | One series per loop: 1–64 bytes of `[A-Za-z0-9._-]`, not starting with a dot. |
 | `label` | `run` | Names the capture in its series, as `base` or `cand3`: 1–32 bytes of the same set. |

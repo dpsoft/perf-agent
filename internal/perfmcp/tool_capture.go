@@ -249,7 +249,7 @@ func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture
 	}
 	if a.KernelStacks != nil {
 		if *a.KernelStacks && !s.perfAgent.Caps.Has(capture.CapSyslog) {
-			return req, invalidArgument("add cap_syslog to perf-agent's file capabilities: "+capture.SetcapLine,
+			return req, capture.Errorf(capture.CodeDisabled, s.syslogNext(),
 				"kernel_stacks needs cap_syslog in perf-agent's file capabilities, or kernel frames come out unsymbolized")
 		}
 		st.KernelStacks, req.Explicit[argKernelStacks] = *a.KernelStacks, true
@@ -275,6 +275,14 @@ func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture
 		req.CompareWith = id
 	}
 	return req, nil
+}
+
+// syslogNext is what to do for kernel_stacks on a perf-agent without
+// cap_syslog: the setcap line for this server's perf-agent, the one path a
+// capture answer shows.
+func (s *Server) syslogNext() string {
+	return "capture without kernel_stacks, or ask the user to run " +
+		strings.ReplaceAll(capture.SetcapLine, "<path>", s.perfAgent.Path) + " and restart perf-agent-mcp"
 }
 
 // checkTarget checks that exactly one of pid and command names the

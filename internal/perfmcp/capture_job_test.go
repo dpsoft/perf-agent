@@ -796,7 +796,7 @@ func TestInheritedSettingsAreValidatedAndBudgeted(t *testing.T) {
 	}{
 		{"adhoc", capture.CodeInvalidArgument, "20s"},
 		{"gpu", capture.CodeDisabled, "--gpu-shim"},
-		{"kernel", capture.CodeInvalidArgument, "cap_syslog"},
+		{"kernel", capture.CodeDisabled, "cap_syslog"},
 	}
 	for _, c := range cases {
 		req := short.compareRequest("001")

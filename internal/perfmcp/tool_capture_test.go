@@ -243,7 +243,7 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 		{"sample_rate zero", with("sample_rate", 0), capture.CodeInvalidArgument, "sample_rate"},
 		{"sample_rate over the limit", with("sample_rate", 100000), capture.CodeInvalidArgument, "MaxSampleRate"},
 		{"an unknown unwind", with("unwind", "lbr"), capture.CodeInvalidArgument, "unwind"},
-		{"kernel stacks without cap_syslog", with("kernel_stacks", true), capture.CodeInvalidArgument, "cap_syslog"},
+		{"kernel stacks without cap_syslog", with("kernel_stacks", true), capture.CodeDisabled, "cap_syslog"},
 		{"a series starting with a dot", with("series", ".x"), capture.CodeInvalidArgument, "series"},
 		{"a series with a slash", with("series", "a/b"), capture.CodeInvalidArgument, "series"},
 		{"a series too long", with("series", strings.Repeat("s", 65)), capture.CodeInvalidArgument, "series"},
@@ -266,6 +266,12 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 			}
 			if strings.ContainsRune(w.Message, '\n') {
 				t.Errorf("a message of more than one line: %q", w.Message)
+			}
+			if w.Next == "" || strings.Contains(w.Next, "<path>") {
+				t.Errorf("next %q: none, or a placeholder where the path belongs", w.Next)
+			}
+			if c0.code == capture.CodeDisabled && c0.says == "cap_syslog" && !strings.Contains(w.Next, "setcap") || strings.Contains(c0.says, "cap_syslog") && !strings.Contains(w.Next, e.fake) {
+				t.Errorf("next %q does not give the setcap line for %s", w.Next, e.fake)
 			}
 			if e.s.registry.active.Load() != nil {
 				t.Fatal("a job was admitted")

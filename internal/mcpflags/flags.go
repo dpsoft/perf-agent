@@ -152,9 +152,6 @@ func (v *Values) Config(fs *flag.FlagSet, stderr io.Writer, version string) (per
 	if v.kind == Hub {
 		owner = "hub"
 		lim.MaxOpenHandles = hubOpenHandles
-		if captureDir == "" && *v.perfAgent != "" {
-			captureDir = "captures-hub"
-		}
 	}
 	for _, kv := range v.limits {
 		if err := SetLimit(&lim, kv); err != nil {

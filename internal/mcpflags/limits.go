@@ -45,8 +45,9 @@ func LimitFields(l *perfmcp.Limits) map[string]reflect.Value {
 
 var durationType = reflect.TypeFor[time.Duration]()
 
-// Fails at start-up if a field of perfmcp.Limits could not be set by
-// --limit, so a new field of another type cannot go unnoticed.
+// An init-time check that every field of perfmcp.Limits has a type --limit
+// can set: LimitFields panics otherwise, so a new field of another type
+// cannot go unnoticed.
 var _ = LimitFields(&perfmcp.Limits{})
 
 func isSignedInt(k reflect.Kind) bool {

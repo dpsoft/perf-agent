@@ -94,8 +94,8 @@ func TestHubDefaultsOpenHandlesTo32AndOwnerHub(t *testing.T) {
 	if cfg.Limits.MaxOpenHandles != 32 || cfg.Capture.Owner != "hub" {
 		t.Errorf("MaxOpenHandles %d, Owner %q", cfg.Limits.MaxOpenHandles, cfg.Capture.Owner)
 	}
-	if cfg.Capture.Dir != "captures-hub" {
-		t.Errorf("Capture.Dir = %q, want captures-hub", cfg.Capture.Dir)
+	if cfg.Capture.Dir != "" {
+		t.Errorf("Capture.Dir = %q, want it left to perfmcp's owner default", cfg.Capture.Dir)
 	}
 	stdio, _, err := parse(t, Stdio, "--profiles", t.TempDir())
 	if err != nil {

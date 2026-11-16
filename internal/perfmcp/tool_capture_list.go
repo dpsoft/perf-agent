@@ -283,7 +283,7 @@ func (s *Server) history(ctx context.Context, series string) (h *captureHistory,
 		return h, err
 	}
 	if l, ok := s.lookups.get(key, load); ok {
-		v, ready, err := l.wait(ctx, cmp.Or(s.listWait, listWaitDefault))
+		v, ready, err := l.wait(ctx, fromReceipt(ctx, cmp.Or(s.listWait, listWaitDefault)))
 		switch {
 		case ready && err != nil:
 			return nil, asOf, err

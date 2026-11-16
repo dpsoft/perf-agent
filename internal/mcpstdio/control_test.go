@@ -568,3 +568,35 @@ func TestProgressGoesThroughTheWriter(t *testing.T) {
 		t.Fatal("Progress outside a request returned true")
 	}
 }
+
+// A queued request knows when it was read: Received is the time the
+// reader took it, not the time the dispatcher ran it, so a handler can
+// count the queueing against its own budget.
+func TestReceivedIsWhenTheReaderTookTheRequest(t *testing.T) {
+	b := newBlocker()
+	got := make(chan time.Time, 1)
+	o := testOptions()
+	o.Tools = append(o.Tools, b.tool(), Tool{Name: "when", Description: "says when it was received",
+		Handler: func(ctx context.Context, _ json.RawMessage) (Result, error) {
+			at, _ := Received(ctx)
+			got <- at
+			return Result{Text: "ok"}, nil
+		}})
+	c := newClient(t, o)
+	c.init()
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"block","arguments":{}}}`)
+	<-b.started
+	sent := time.Now()
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"when","arguments":{}}}`)
+	time.Sleep(300 * time.Millisecond)
+	close(b.release)
+	c.recv()
+	c.recv()
+	at := <-got
+	if at.IsZero() || at.Before(sent.Add(-time.Second)) || at.After(sent.Add(200*time.Millisecond)) {
+		t.Errorf("received at %v, sent at %v: it should be when the reader took it, before it waited", at, sent)
+	}
+	if _, ok := Received(context.Background()); ok {
+		t.Error("a context of no request has a receipt time")
+	}
+}

@@ -422,6 +422,7 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	if e != nil {
 		return toolError(e, nil), nil
 	}
+	d = fromReceipt(ctx, d)
 	if j, ok := s.registry.get(a.ID); ok {
 		return s.waitJob(ctx, j, d), nil
 	}
@@ -439,6 +440,16 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		return toolError(unknownCapture(a.ID, "no capture job of this server, and no capture id as <series>/NNN"), nil), nil
 	}
 	return s.waitHistorical(ctx, key, jobID, d), nil
+}
+
+// fromReceipt is what is left of a call's wait d, which counts from when
+// the call was read, not from when it ran: a call queued behind another
+// still answers within its own budget of the client's time.
+func fromReceipt(ctx context.Context, d time.Duration) time.Duration {
+	if at, ok := mcpstdio.Received(ctx); ok {
+		return max(d-time.Since(at), 0)
+	}
+	return d
 }
 
 // splitCaptureKey splits a capture id "series/NNN".

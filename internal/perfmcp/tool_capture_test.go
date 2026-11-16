@@ -1212,6 +1212,61 @@ func TestARemovalDuringAHistoricalReadKeepsNoAnswer(t *testing.T) {
 	}
 }
 
+// A capture_wait queued behind another counts its time in the queue
+// against its own timeout: it answers when the one ahead does, its budget
+// spent, not a whole timeout later.
+func TestAQueuedWaitKeepsItsBudgetFromReceipt(t *testing.T) {
+	_, c := newCapEnv(t, jobOpts{})
+	job := startCapture(t, c, map[string]any{"command": workloadCmd(t), "duration": "60s"})
+	waitStatus(t, c, job, profiling)
+	first := c.sendTool("capture_wait", map[string]any{"id": job, "timeout": "4s"}, nil)
+	second := c.sendTool("capture_wait", map[string]any{"id": job, "timeout": "3s"}, nil)
+	sent := time.Now()
+	if res, _ := c.recv(first); res.Error != nil {
+		t.Fatalf("first wait: %+v", res.Error)
+	}
+	firstAt := time.Since(sent)
+	res, _ := c.recv(second)
+	text, isErr := c.toolText(res)
+	secondAt := time.Since(sent)
+	if isErr || isResult(t, text) {
+		t.Fatalf("second wait: %s", text)
+	}
+	// Without the receipt time the second would wait its 3 s after the
+	// first's 4 s.
+	if secondAt > firstAt+1500*time.Millisecond {
+		t.Errorf("the queued wait answered %v after it was sent, %v after the one ahead of it; its budget was 3s from receipt", secondAt, secondAt-firstAt)
+	}
+	c.callOK("capture_cancel", map[string]any{"id": job}, nil)
+	waitEnd(t, c, job)
+}
+
+// A capture_list queued behind a wait answers once its own wait for the
+// history is spent from receipt.
+func TestAQueuedListKeepsItsBudgetFromReceipt(t *testing.T) {
+	_, c := newCapEnv(t, jobOpts{setup: func(s *Server) {
+		s.listWait = 2 * time.Second
+		s.lookupHook = func(k string) {
+			if strings.HasPrefix(k, "list:") {
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}})
+	job := startCapture(t, c, map[string]any{"command": workloadCmd(t), "duration": "60s"})
+	waitStatus(t, c, job, profiling)
+	first := c.sendTool("capture_wait", map[string]any{"id": job, "timeout": "3s"}, nil)
+	list := c.sendTool("capture_list", map[string]any{"series": "adhoc"}, nil)
+	sent := time.Now()
+	c.recv(first)
+	firstAt := time.Since(sent)
+	c.recv(list)
+	if listAt := time.Since(sent); listAt > firstAt+1500*time.Millisecond {
+		t.Errorf("the queued list answered %v after it was sent, %v after the wait ahead of it; its wait was 2s from receipt", listAt, listAt-firstAt)
+	}
+	c.callOK("capture_cancel", map[string]any{"id": job}, nil)
+	waitEnd(t, c, job)
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

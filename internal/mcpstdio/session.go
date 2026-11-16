@@ -43,6 +43,8 @@ type session struct {
 type request struct {
 	env *envelope
 	key string // the id as compact JSON, which notifications/cancelled matches
+	// received is when the reader took the request, before it queued.
+	received time.Time
 	// Guarded by session.mu.
 	cancel    context.CancelFunc
 	cancelled bool
@@ -301,7 +303,7 @@ func (ss *session) take(line []byte, oversized bool) {
 		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", ss.s.o.MaxQueued)))
 		return
 	}
-	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID)})
+	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID), received: time.Now()})
 	ss.mu.Unlock()
 	ss.wakeDispatcher()
 }
@@ -489,4 +491,15 @@ func Progress(ctx context.Context, progress, total float64, message string) bool
 		return false
 	}
 	return p.ss.out.enqueueNote(line)
+}
+
+// Received is when the request ctx belongs to was read from the client,
+// before it waited in the queue; ok is false for a context of no queued
+// request (a Control call runs as it is read).
+func Received(ctx context.Context) (at time.Time, ok bool) {
+	r, ok := ctx.Value(requestKey{}).(*request)
+	if !ok {
+		return time.Time{}, false
+	}
+	return r.received, true
 }

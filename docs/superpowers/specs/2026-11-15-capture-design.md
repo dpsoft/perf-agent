@@ -220,7 +220,7 @@ accepted → preparing → running → committing → done | failed | cancelled
 | State | Holds | Work |
 |---|---|---|
 | `accepted` | nothing | `capture` has validated the arguments (pure checks, no I/O) and admitted the job in memory, to the single active-job slot; the job is queued |
-| `preparing` | first the **dir lease**, then the **engine** for shared inputs | The job takes the non-blocking captures lock (the dir lease, §6.1) **before any filesystem side effect**. A cross-process `busy` is therefore an asynchronous job failure. It then runs recovery. Next, **holding the engine**, it resolves and pins the `compare_with` baseline, snapshots the protected inputs (handles open in the store, publication pins) and runs retention against them. It releases the engine, then writes `.seq` and the intent, checks space, creates staging, runs the target preflight and starts the reaper. This is the one order, §7.4 steps 1–7 |
+| `preparing` | first the **dir lease**, then the **engine** for shared inputs | The job takes the non-blocking captures lock (the dir lease, §6.1) **before any filesystem side effect**. A cross-process `busy` is therefore an asynchronous job failure. It then runs recovery. Next, **holding the engine**, it resolves and pins the `compare_with` baseline, snapshots the protected inputs (handles open in the store, publication pins), and releases the engine; retention then runs against that snapshot without the engine (no hashing under the engine). Then it writes `.seq` and the intent, checks space, creates staging, runs the target preflight and starts the reaper. This is the one order, §7.4 steps 1–7 |
 | `running` | the lease only | the reaper and its children capture (§5, §6); rechecks every 1 s |
 | `committing` | the lease only | validate, hash, record the identities, link, and write the **manifest, which is the commit point** (§7.4 steps 8–11). The file commit never holds the engine |
 | `done` | the engine, for the derivations and pin release; then nothing | committed. **Post-commit derivations** then run in the same job: `store.open` of each profile and the `compare_with` diff, plus in serve the publication. Their state is `derived: pending \| ready \| failed` while the job is in the registry, and `recompute` once it has left (CAP-R17). Then the job releases the baseline and protected-input pins. A derivation failure (for example `open` over the model limits) is **reported in the result and never rolls files back** |
@@ -230,8 +230,9 @@ The lease (the captures `flock`, held by the reaper too, CAP-R6b) is
 released once the reaper has reaped both children and the files are
 committed or rolled back. **The child wait and the file commit run
 outside the engine.** The engine sections do file I/O by design: baseline
-verification, retention and `store.open` (§7.4 step 3, and the
-derivations).
+verification, the protection snapshot and `store.open` (§7.4 step 3, and
+the derivations). Retention's hashing and removals run after the engine
+is released, against the snapshot.
 
 - **Every phase runs in a server-owned job goroutine.** `capture` only
   enqueues the job and returns:
@@ -261,7 +262,7 @@ derivations).
 |---|---|---|
 | `capture` (arguments §4.2) | microseconds: no I/O, no lock, no engine | `{job, status: "accepted", eta}`, or a synchronous `invalid_argument` or `busy` (in-process slot) error. Cross-process `busy` and every later error arrive as the job's `failed` state |
 | `capture_wait {id, timeout?}` (a job id or a capture id) | at most `timeout`, default 30 s, **capped at 45 s**, and never past its own deadline. It reads the job registry; a historical id goes to the lookup pool (CAP-R14). Never the engine | the current state. When `done` with `derived: ready`, the §4.3 result. Otherwise `{job, id?, status, phase, elapsed, eta, derived?}`, or `status: "loading"` when a historical lookup has not finished by the deadline |
-| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias |
+| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias. A job whose commit is undecided (CAP-R50) answers `cancelling (decision pending)`, from the job, the registry and the alias; the cancel is recorded and reported when the commit is settled: `too late: committed` if the link was made, `cancelled` if it was not (CAP-R64) |
 | `capture_list` (§4.6) | the in-memory jobs at once; the history through the lookup pool, to the call's deadline | active and recent jobs first, then the history from the manifests, with `"loading": true` for pages not read in time |
 
 **Ownership (SRV-R7).** Jobs belong to the server, not to sessions:
@@ -498,10 +499,14 @@ because a loop branches on it:
 | `too_large` | no | A file passed its limit; suggests a shorter duration or a lower rate |
 | `no_output` | yes | Exit 0 without the expected file |
 | `stuck_child` | no | Processes survived `StopGrace`; `survivors` lists their PID, `comm`, start time and state (CAP-R3b); do not retry; tell the user |
+| `closing` | no | The server is shutting down and starts no capture; start a new one |
 | `cancelled` | — | Only in `capture_list`; no response is sent for a cancelled request |
 
 Every message is bounded, and repeats agent input only through `echo`, as
-M2 does. A failed capture keeps no profile. Its manifest is kept, with
+M2 does. No message, failure manifest error or log line names an absolute
+path of the server's or a temporary (whose name carries the owner token's
+first 16 hex): it names the final file and the root by its kind
+(CAP-R63). The result's `perf_agent.path` is the one path a result shows. A failed capture keeps no profile. Its manifest is kept, with
 `outcome: "failed"` and the code, so `capture_list` shows the failure in
 the series' history. It is subject to retention like any capture.
 
@@ -1278,12 +1283,14 @@ directory. The job's states map onto the steps:
    - resolve and validate `compare_with`: its manifest must exist, be
      `ok`, and have files matching their digests;
    - **pin** the baseline (CAP-R4);
-   - snapshot the protected inputs (open handles, publication pins);
-   - run **retention** (§7.3) against the pins and protected inputs.
+   - snapshot the protected inputs (open handles, publication pins).
 
-   This section does file I/O (digest checks, manifest reads, removals)
-   while holding the engine, by design: retention must not race the
-   store's view of what is open. Then the engine is released.
+   This section does file I/O (digest checks, manifest reads) while
+   holding the engine, by design: the snapshot must not race the store's
+   view of what is open. Then the engine is released, and **retention**
+   (§7.3) runs against the pins and the snapshot without it, so its
+   hashing never holds up the engine's tools. A file opened after the
+   snapshot may be removed; its handle keeps the profile in memory.
 4. **Id.** Read `<series>/.seq` (a missing file means "highest manifest
    or intent id + 1"), write `id + 1` through temp + fsync + rename +
    directory fsync, **before** the id is used. A crash after this step
@@ -1309,8 +1316,11 @@ directory. The job's states map onto the steps:
    already run). A failure goes to live rollback.
 7. **Staging, preflight, reaper.** Create `.staging-<16 hex>`
    (`Mkdir(0o700)`) and record its dev and inode in the intent. Run the
-   target preflight (§6.3) and start the reaper (§6.6). The job enters
-   `running`.
+   target preflight (§6.3) and start the reaper (§6.6). The reaper's PID
+   and start time are recorded in the intent (an intent rewrite) and in
+   the lock file's holder record (CAP-R62), so recovery judges the owner
+   alive while the reaper runs and a `busy` answer names it. The job
+   enters `running`.
 
 **`committing`:**
 
@@ -1417,8 +1427,13 @@ answer there is `cancelling` until the link resolves.
 error is judged by an `Lstat` of its name: made (the temp's dev and
 inode), not made, or unknown when the name cannot be read. An unknown
 manifest link is never rolled back: the capture keeps its intent and
-files, the job reports `disk`, and the owner settles it before its next
-capture from what is on disk. A rollback removes published files only
+files, and the job stays `committing` with phase `undecided`, holding no
+error, out of the active slot (CAP-R64). The owner settles it before its
+next capture, and every 30 s, from what is on disk: this capture's ok
+manifest makes the job `done` (`derived: recompute`, its baseline kept in
+the recipe); its own failure manifest, or none, makes it fail with that
+error; a manifest that cannot be read for any other reason leaves it
+undecided for the next pass. The registry entry is then corrected. A rollback removes published files only
 when nothing is at the manifest name; this capture's own ok manifest
 there finishes the commit instead, and anything else strands the
 rollback with the files kept.

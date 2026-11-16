@@ -159,7 +159,8 @@ func TestRunServesOverStdio(t *testing.T) {
 	for _, tl := range list.Result.Tools {
 		names = append(names, tl.Name)
 	}
-	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph"}
+	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph",
+		"capture", "capture_wait", "capture_cancel", "capture_list"}
 	slices.Sort(names)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
@@ -314,7 +315,7 @@ func TestRunHasNoLiveFlags(t *testing.T) {
 
 // The stdio server registers no page tool: tools/list is the nine tools
 // of the profile and render surface, and a page tool call is unknown.
-func TestRunRegistersNoPageTools(t *testing.T) {
+func TestRunRegistersTheProfileAndCaptureTools(t *testing.T) {
 	c := startRun(t, "--profiles", t.TempDir())
 	var list struct {
 		Tools []struct {
@@ -324,10 +325,14 @@ func TestRunRegistersNoPageTools(t *testing.T) {
 	if err := json.Unmarshal(c.call("tools/list", map[string]any{}), &list); err != nil {
 		t.Fatal(err)
 	}
+	var names []string
 	for _, tl := range list.Tools {
-		if strings.HasPrefix(tl.Name, "page_") {
-			t.Errorf("tools/list has %s", tl.Name)
-		}
+		names = append(names, tl.Name)
+	}
+	want := []string{"open", "top", "path", "facts", "gpu_kernels_for", "sandwich", "diff", "source", "render_flamegraph",
+		"capture", "capture_wait", "capture_cancel", "capture_list"}
+	if !slices.Equal(names, want) {
+		t.Errorf("tools/list has %v, want %v", names, want)
 	}
 	if raw := c.call("tools/call", map[string]any{"name": "page_open", "arguments": map[string]any{}}); len(raw) != 0 {
 		t.Errorf("page_open answered with a result: %s", raw)

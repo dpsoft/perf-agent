@@ -131,6 +131,9 @@ type job struct {
 	ending jobStatus
 	// duration is the capture's effective duration, once the job knows it.
 	duration time.Duration
+	// recipe is how to make a done job's results again from its files, for
+	// a wait that finds its handles evicted from the store.
+	recipe *recompute
 	// trail is every status the job went through (a done one with its
 	// derived state), for logs and tests.
 	trail []string
@@ -225,6 +228,22 @@ func (j *job) viewLocked(now time.Time) jobView {
 		v.ETA = max(d+etaSlack-elapsed, 0).Round(100 * time.Millisecond).String()
 	}
 	return v
+}
+
+// watch is the job's state now, whether a wait has nothing more to wait
+// for, and the channel closed at its next change.
+func (j *job) watch() (jobView, bool, <-chan struct{}) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.viewLocked(time.Now()), j.settled(), j.changed
+}
+
+// expected is how long the job is expected to take in all: its effective
+// duration, else its reservation, and the slack after it, as eta counts.
+func (j *job) expected() time.Duration {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return cmp.Or(j.duration, j.reserve) + etaSlack
 }
 
 // settled reports whether a wait has nothing more to wait for: the job

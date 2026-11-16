@@ -1017,6 +1017,7 @@ func (r *jobRun) done() {
 	if err := s.registry.finish(j, len(b), r.profiled()); err != nil {
 		s.log.Error("capture registry", "job", j.id, "err", err)
 	}
-	j.set(func() { j.phase, j.derived, j.result = "", derived, b })
+	rc := s.recomputeFor(m, r.base, "")
+	j.set(func() { j.phase, j.derived, j.result, j.recipe = "", derived, b, &rc })
 	s.log.Info("capture done", "job", j.id, "capture", j.captureIDNow(), "derived", derived)
 }

@@ -1054,8 +1054,25 @@ func TestMaintenanceKeepsControlResponsive(t *testing.T) {
 	if v := j.wait(t.Context(), 50*time.Millisecond); v.Status != string(jobPreparing) && v.Status != string(jobAccepted) {
 		t.Errorf("view %+v", v)
 	}
-	if a := j.requestCancel(); a != cancelAnswerCancelling {
-		t.Errorf("cancel %q", a)
+	// The capture tools answer too: the history is read without the
+	// directory slot or the engine, and a wait and a cancel need neither.
+	var l listing
+	c.callOK("capture_list", map[string]any{"series": "adhoc"}, &l)
+	if l.Active != j.id || l.Loading || len(l.Captures) != 2 {
+		t.Errorf("capture_list %+v", l)
+	}
+	var v jobView
+	c.callOK("capture_wait", map[string]any{"id": j.id, "timeout": "50ms"}, &v)
+	if v.Status != string(jobPreparing) && v.Status != string(jobAccepted) {
+		t.Errorf("capture_wait %+v", v)
+	}
+	if text, isErr := c.call("capture_cancel", map[string]any{"id": "j99-0000"}); !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+		t.Errorf("an unknown cancel: %s", text)
+	}
+	var a map[string]string
+	c.callOK("capture_cancel", map[string]any{"id": j.id}, &a)
+	if a["status"] != cancelAnswerCancelling {
+		t.Errorf("cancel %v", a)
 	}
 	openDone := make(chan string, 1)
 	go func() {

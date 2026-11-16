@@ -150,9 +150,13 @@ func (s *Server) profilePaths(m manifest, mode capture.Mode) (path, execlog stri
 	return path, execlog
 }
 
-// captureInfo is m as a result shows it.
+// captureInfo is m as a result shows it. A target that ended the
+// capture says so, and when: perf-agent reports no exit status.
 func (s *Server) captureInfo(m manifest) captureInfo {
 	id, _ := parseID(m.ID)
+	if m.Target.Exit == "" && (m.StoppedBy == capture.StoppedByTargetExit || m.StoppedBy == capture.StoppedByCommandExit) {
+		m.Target.Exit = "exited after " + cmp.Or(m.ProfiledDuration, "an unknown time") + " of profiling"
+	}
 	return captureInfo{
 		ID: m.ID, Series: m.Series, Label: m.Label, Manifest: s.capturePath(m.Series, manifestName(id, m.Label)),
 		Settings: m.Settings, SettingsDigest: m.SettingsDigest, Target: m.Target, Modes: m.Settings.Modes,

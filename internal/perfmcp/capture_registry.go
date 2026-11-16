@@ -293,6 +293,16 @@ func (r *registry) alias(jobID string) (captureID string, ok bool) {
 	return a.captureID, ok
 }
 
+// final is the capture id and the final answer of the finished job jobID,
+// from its alias, which outlives its entry; ok is false for a job id this
+// registry does not remember.
+func (r *registry) final(jobID string) (captureID, answer string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.aliases[jobID]
+	return a.captureID, a.answer, ok
+}
+
 // historical is the historical answer kept for captureID, which becomes
 // the most recently used.
 func (r *registry) historical(captureID string) (*historical, bool) {

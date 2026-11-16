@@ -1,11 +1,11 @@
 ---
 name: perf-agent-mcp
-description: Use when asked to investigate, explain or compare CPU or GPU profiles, flame graphs, hot functions, pprof .pb.gz files or perf-agent output, or when perf-agent MCP tools (open, top, render_flamegraph) are available.
+description: Use when asked to investigate, explain or compare CPU or GPU profiles, flame graphs, hot functions, pprof .pb.gz files or perf-agent output, to capture a program's profile and compare a change with a baseline, or when perf-agent MCP tools (open, top, render_flamegraph, capture) are available.
 ---
 
 # Using the perf-agent MCP server
 
-perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`). It is read-only and offline. Every figure comes from an engine, not from you.
+perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`), and, when started with `--perf-agent`, captures new ones. Every figure comes from an engine, not from you.
 
 ## First
 
@@ -15,7 +15,7 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 
 - A question about where time goes in a profile, why something is slow, what changed between two profiles, or what a GPU kernel launch costs.
 - A request for a flame graph with explanations.
-- Not for profiling a live process or writing profiles: this server only reads existing files.
+- Profiling a process or a command of yours, and comparing a change with a baseline, when the server was started with `--perf-agent` (see Capture loop).
 
 ## Workflow
 
@@ -26,6 +26,14 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
 6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all (for a mismatch, re-check the claim's node and metric rather than copying the value), and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
 7. The live page is not part of this server: it will ship with a separate long-lived serve binary. Use `render_flamegraph` when the user wants a page.
+
+## Capture loop
+
+1. `capture` with `command` (an absolute path, or a bare name in PATH; never `./x`) or `pid`, a `series` per loop and a `label`; keep the base with `keep`. It answers a `job` at once.
+2. `capture_wait` with that `job` (or the capture `id`, `series/NNN`) until it returns the result: each call blocks at most its `timeout` (45s) and returns the state meanwhile. The result holds the `handle` of each profile; use it with the tools above.
+3. After a change, `capture` again with `compare_with` set to the base's id: it inherits the base's settings, and the result's `compare` carries the diff rows and the `next` call for the rest.
+4. A failure is one JSON `error` with a `code`, `retryable`, `retry_after` and `next`: follow `next`. `busy` and `budget` say when to retry; `incomparable` and `unknown_baseline` mean the compare is wrong, not the capture.
+5. `capture_cancel` stops a job at once; `capture_list` shows the running job and each series' history, with the `recompute` calls when a result is no longer in memory (`handles` is then `reopen`).
 
 Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`; `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`; if a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 

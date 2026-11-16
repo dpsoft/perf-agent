@@ -20,6 +20,10 @@ var skillArgs = []string{
 	"denominator", "unit", "value", "metric", "scope", "node", "facts",
 	"view_total", "source_unverified", "unsampled_portion", "base_handle", "base_view", "new_handle", "new_view",
 	"view_scope", "id", "publication",
+	// The capture loop's arguments, result fields and failure codes.
+	"command", "pid", "series", "label", "keep", "job", "timeout", "compare_with", "compare", "next",
+	"error", "code", "retryable", "retry_after", "busy", "budget", "incomparable", "unknown_baseline",
+	"recompute", "handles", "reopen",
 }
 
 // explainCodes reads the failure and notice codes declared in

@@ -124,6 +124,11 @@ type Server struct {
 	// cgroupParent is the delegated cgroup a command's own cgroup goes
 	// under, "" when there is none.
 	cgroupParent func() string
+	// listWait is how long capture_list waits for the history (0:
+	// listWaitDefault), and lookupHook, when set, runs at the start of
+	// each historical read; both are seams for tests.
+	listWait   time.Duration
+	lookupHook func(key string)
 }
 
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
@@ -367,13 +372,19 @@ const minToolErrorBytes = 1024
 // tools are the server's tools, in the order tools/list shows them.
 func (s *Server) tools() []mcpstdio.Tool {
 	ts := []mcpstdio.Tool{s.openTool(), s.topTool(), s.pathTool(), s.factsTool(), s.kernelsTool(), s.sandwichTool(), s.diffTool(), s.sourceTool(), s.renderTool()}
+	var pages []mcpstdio.Tool
 	if s.live != nil {
-		ts = append(ts, s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool())
+		pages = []mcpstdio.Tool{s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool()}
 	}
-	for i := range ts {
-		ts[i].Handler = s.engineHandler(ts[i].Handler)
+	for _, group := range [][]mcpstdio.Tool{ts, pages} {
+		for i := range group {
+			group[i].Handler = s.engineHandler(group[i].Handler)
+		}
 	}
-	return ts
+	// The capture tools never hold the engine: a wait would keep every
+	// other tool, and the jobs' own steps, from it.
+	ts = append(ts, s.captureTools()...)
+	return append(ts, pages...)
 }
 
 // readOnly are the annotations of every tool that only reads.

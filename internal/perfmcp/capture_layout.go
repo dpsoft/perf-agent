@@ -63,6 +63,14 @@ type ownerRecord struct {
 	Format int    `json:"format"`
 }
 
+// ownerBinary is the binary that writes captures as owner kind kind.
+func ownerBinary(kind string) string {
+	if kind == ownerHub {
+		return "perf-agent-hub"
+	}
+	return defaultCommand
+}
+
 // ownerKind is the kind this server writes as.
 func (s *Server) ownerKind() string { return cmp.Or(s.captureCfg.Owner, ownerStdio) }
 
@@ -162,7 +170,8 @@ func (s *Server) ownerMismatch() *capture.Error {
 	}
 	return capture.Errorf(capture.CodeOwnerMismatch,
 		"a stdio server and a hub server never share a capture directory; "+s.startAdvice("--captures naming another directory"),
-		"the capture directory %s inside the profiles root belongs to a perf-agent-mcp %s server, and this one is %s", s.capturesRel(), *seen, s.ownerKind())
+		"the capture directory %s inside the profiles root belongs to a %s server (owner kind %s), and this one is %s (owner kind %s)",
+		s.capturesRel(), ownerBinary(*seen), *seen, s.command(), s.ownerKind())
 }
 
 // series opens the series directory name, creating it (mode 0700) when it

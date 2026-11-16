@@ -80,7 +80,11 @@ func CheckLimits(l *perfmcp.Limits) error {
 }
 
 // SetLimit applies one Name=Value to l.
-func SetLimit(l *perfmcp.Limits, kv string) error {
+func SetLimit(l *perfmcp.Limits, kv string) error { return setLimit(l, kv, Hub) }
+
+// setLimit is SetLimit for the binary kind: an unknown name is answered
+// with the names kind can set, so stdio's list leaves out the Hub ones.
+func setLimit(l *perfmcp.Limits, kv string, kind Kind) error {
 	name, val, ok := strings.Cut(kv, "=")
 	if !ok {
 		return errors.New("want Name=Value")
@@ -90,7 +94,9 @@ func SetLimit(l *perfmcp.Limits, kv string) error {
 	if !ok {
 		names := make([]string, 0, len(fields))
 		for n := range fields {
-			names = append(names, n)
+			if kind == Hub || !strings.HasPrefix(n, hubLimitPrefix) {
+				names = append(names, n)
+			}
 		}
 		slices.Sort(names)
 		return fmt.Errorf("unknown limit %q; valid names: %s", name, strings.Join(names, ", "))

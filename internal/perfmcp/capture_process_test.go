@@ -421,8 +421,8 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 				sync = true
 			}
 			w := toolErrorOf(t, text)
-			if w.Code != string(capture.CodeOwnerMismatch) || !strings.Contains(w.Message, "belongs to a perf-agent-mcp "+theirs+" server") ||
-				!strings.Contains(w.Message, "this one is "+mine) {
+			if w.Code != string(capture.CodeOwnerMismatch) || !strings.Contains(w.Message, "belongs to a "+ownerBinary(theirs)+" server (owner kind "+theirs+")") ||
+				!strings.Contains(w.Message, "(owner kind "+mine+")") {
 				t.Fatalf("%+v", w)
 			}
 		}

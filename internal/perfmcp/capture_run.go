@@ -1011,7 +1011,7 @@ func (r *jobRun) end(status jobStatus, e *capture.Error) {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)
 	}
 	j.set(func() { j.status, j.phase, j.err = status, "", e })
-	r.s.logBounded(slog.LevelInfo, "capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
+	r.s.logBounded(slog.LevelInfo, "capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", named(e.Message, r.s.command()))
 }
 
 // done is a committed capture: it derives the open and compare results

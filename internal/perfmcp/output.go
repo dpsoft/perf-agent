@@ -101,15 +101,15 @@ func (s *Server) linkNoReplace(root *os.Root, kind, tmp, name string) error {
 		return takenError{fmt.Errorf("%s already exists under the %s root and is never replaced", echo(name), kind)}
 	case kind == rootOutput:
 		return fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
-			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
-			"Start %s with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err), s.command())
+			"%[4]s publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
+			"Start %[4]s with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err), s.command())
 	}
 	// The message names the final name and the root by its kind only: the
 	// temporary carries an owner token, and the root's path is the
 	// server's.
 	return wrapped{fmt.Sprintf("cannot publish %s under the %s root with a hard link: %s; "+
-		"perf-agent-mcp publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
-		"Start %s with --captures on a filesystem that supports hard links", echo(name), kind, errnoText(err), s.command()), err}
+		"%[4]s publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
+		"Start %[4]s with --captures on a filesystem that supports hard links", echo(name), kind, errnoText(err), s.command()), err}
 }
 
 // wrapped is an error with its own text that still unwraps to its cause,

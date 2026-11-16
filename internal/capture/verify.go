@@ -111,7 +111,7 @@ func checkIdentity(was, now Identity) *Error {
 	add(was.Mtime != now.Mtime, "mtime")
 	add(was.Ctime != now.Ctime, "ctime")
 	add(was.Xattr != now.Xattr, "xattr")
-	e := Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "perf-agent changed since start-up")
+	e := Errorf(CodeBinaryChanged, "restart "+CommandMark, "perf-agent changed since start-up")
 	e.Changed = strings.Join(changed, ",")
 	return e
 }

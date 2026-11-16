@@ -212,7 +212,7 @@ func checkRunSpec(s RunSpec) *Error {
 	case s.Settings.Duration <= 0:
 		return bad("duration %v is not positive", s.Settings.Duration)
 	case slices.Contains(s.Settings.Modes, ModeGPU) && s.GPU == nil:
-		return Errorf(CodeInvalidArgument, "start perf-agent-mcp with --gpu-shim PATH", "a gpu capture needs the CUPTI adapter")
+		return Errorf(CodeInvalidArgument, "start "+CommandMark+" with --gpu-shim PATH", "a gpu capture needs the CUPTI adapter")
 	case b.StartTimeout <= 0 || b.FinishTimeout <= 0 || b.StopGrace <= 0 || b.MaxOutputTail <= 0 ||
 		b.MaxProfileBytes <= 0 || b.MaxExeclogBytes <= 0 || b.Recheck <= 0 || b.Poll <= 0:
 		return bad("every capture bound must be positive: %+v", b)
@@ -310,7 +310,7 @@ func (r *Run) startReaper(rs ReaperSpec) *Error {
 	closeAll(writes[:])
 	if err != nil {
 		closeAll(reads[:])
-		return Errorf(CodePerfAgentUnstartable, "check that perf-agent-mcp's own binary is intact", "start the capture's reaper (perf-agent-mcp's own binary): %v", pathErr(err))
+		return Errorf(CodePerfAgentUnstartable, "check that "+CommandMark+"'s own binary is intact", "start the capture's reaper ("+CommandMark+"'s own binary): %v", pathErr(err))
 	}
 	r.reaper = reaper
 	r.evc = reaper.Events()
@@ -723,7 +723,7 @@ func (r *Run) deadlinePassed() {
 		r.o.Notes = append(r.o.Notes, "the capture's reaper ended the command at its deadline, after perf-agent had finished")
 		return
 	}
-	const next = "capture again; if this repeats, check that perf-agent-mcp is not stopped or starved of CPU"
+	const next = "capture again; if this repeats, check that " + CommandMark + " is not stopped or starved of CPU"
 	e := Errorf(CodeFinishTimeout, next,
 		"the capture's reaper ended it at its deadline, after FinishTimeout=%v: this server did not stop it in time", r.b.FinishTimeout)
 	if r.readyAt.IsZero() {
@@ -1233,8 +1233,8 @@ func (r *Run) exitError(stderr string) *Error {
 	switch r.perfStatus {
 	case 0:
 	case 2:
-		return withTail(Errorf(CodePerfAgentRefusedArgs, "use a perf-agent that matches this perf-agent-mcp",
-			"perf-agent refused its arguments; it may be older than perf-agent-mcp expects (found %s)", cmp.Or(r.spec.Binary.Version, "an unknown version")))
+		return withTail(Errorf(CodePerfAgentRefusedArgs, "use a perf-agent that matches this "+CommandMark,
+			"perf-agent refused its arguments; it may be older than "+CommandMark+" expects (found %s)", cmp.Or(r.spec.Binary.Version, "an unknown version")))
 	case 1:
 		e := Errorf(CodePerfAgentFailed, "", "the capture failed")
 		if strings.Contains(stderr, "set capabilities") || strings.Contains(stderr, "cap_checkpoint_restore") {

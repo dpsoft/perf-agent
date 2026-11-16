@@ -161,7 +161,7 @@ func (v *Values) Config(fs *flag.FlagSet, stderr io.Writer, version string) (per
 		if limit, _, _ := strings.Cut(kv, "="); v.kind != Hub && strings.HasPrefix(limit, hubLimitPrefix) {
 			return perfmcp.Config{}, usage("--limit %s: %s is a perf-agent-hub limit", kv, limit)
 		}
-		if err := SetLimit(&lim, kv); err != nil {
+		if err := setLimit(&lim, kv, v.kind); err != nil {
 			return perfmcp.Config{}, usage("--limit %s: %v", kv, err)
 		}
 	}

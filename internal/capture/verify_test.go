@@ -203,7 +203,7 @@ func TestCheckIdentity(t *testing.T) {
 		if e.Code != CodeBinaryChanged || e.Retryable {
 			t.Errorf("%s differs: code %s retryable %v, want binary_changed, not retryable", tc.field, e.Code, e.Retryable)
 		}
-		if got := e.Error(); !strings.Contains(got, "perf-agent changed since start-up; restart perf-agent-mcp") {
+		if got := e.Error(); !strings.Contains(got, "perf-agent changed since start-up; restart "+CommandMark) {
 			t.Errorf("%s differs: %q", tc.field, got)
 		}
 		if e.Changed != tc.field {

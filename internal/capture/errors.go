@@ -105,6 +105,12 @@ func (e *Error) Error() string {
 	return s
 }
 
+// CommandMark stands, in an Error's Message and Next, for the name of the
+// binary that runs the server (perf-agent-mcp, perf-agent-hub): the server
+// replaces it wherever the text reaches the agent or the user, since this
+// package does not know which binary it runs in.
+const CommandMark = "<command>"
+
 // Errorf builds an Error whose message is formatted from format and args,
 // with Retryable taken from DefaultRetryable.
 func Errorf(code Code, next, format string, args ...any) *Error {

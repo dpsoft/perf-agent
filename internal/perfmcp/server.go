@@ -187,6 +187,11 @@ func (s *Server) startAdvice(what string) string { return startWith(s.command(),
 // startWith tells the user to start the binary command with what.
 func startWith(command, what string) string { return "start " + command + " with " + what }
 
+// named is text with capture.CommandMark replaced by command.
+func named(text, command string) string {
+	return strings.ReplaceAll(text, capture.CommandMark, command)
+}
+
 // raiseAdvice tells the user to restart the server with limit raised.
 func (s *Server) raiseAdvice(limit string) string {
 	return "restart " + s.command() + " with a larger --limit " + limit + "=N"
@@ -263,7 +268,7 @@ func New(cfg Config) (_ *Server, err error) {
 	s.registry = newRegistry(lim.Capture, randHex(2))
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: s.command(), Title: "perf-agent profiles", Version: cfg.Version},
-		Instructions:    instructions,
+		Instructions:    s.instructions(),
 		Tools:           s.tools(),
 		Prompts:         guidePrompts(),
 		Resources:       guideResources(),
@@ -336,7 +341,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	bin, err := verify(c.PerfAgent)
 	if err != nil {
-		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, uncoded{err})
+		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, s.uncoded(err))
 	}
 	s.perfAgent = bin
 	for _, w := range bin.Warnings {
@@ -344,7 +349,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	if c.GPUShim != "" {
 		if s.shim, err = capture.VerifyShim(c.GPUShim); err != nil {
-			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, uncoded{err})
+			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, s.uncoded(err))
 		}
 	}
 	for _, cmd := range c.Commands {
@@ -352,7 +357,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 			return fmt.Errorf("perfmcp: capture command %q is not an absolute path; name each allowed program by its absolute path", cmd)
 		}
 		if e := capture.CheckCommandFile(cmd); e != nil {
-			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, uncoded{e})
+			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, s.uncoded(e))
 		}
 	}
 	status, err := readSelfStatus()
@@ -374,7 +379,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 		}
 	}
 	if err != nil {
-		s.captureDisabled = uncoded{err}.Error()
+		s.captureDisabled = s.uncoded(err).Error()
 		s.log.Warn("capture disabled", "reason", s.captureDisabled)
 		return nil
 	}
@@ -384,17 +389,25 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 
 // uncoded is a capture error as text that already says what failed: its
 // message and advice without the code ("disabled: ..."), which would only
-// repeat it. It unwraps to the error.
-type uncoded struct{ err error }
+// repeat it, naming the binary cmd ("" for perf-agent-mcp). It unwraps to
+// the error.
+type uncoded struct {
+	err error
+	cmd string
+}
+
+// uncoded is err as an uncoded naming the binary this server runs as.
+func (s *Server) uncoded(err error) uncoded { return uncoded{err: err, cmd: s.command()} }
 
 func (u uncoded) Error() string {
+	text := u.err.Error()
 	if e, ok := errors.AsType[*capture.Error](u.err); ok {
-		if e.Next == "" {
-			return e.Message
+		text = e.Message
+		if e.Next != "" {
+			text += "; " + e.Next
 		}
-		return e.Message + "; " + e.Next
 	}
-	return u.err.Error()
+	return named(text, cmp.Or(u.cmd, defaultCommand))
 }
 
 func (u uncoded) Unwrap() error { return u.err }

@@ -186,11 +186,12 @@ func holdTop(t *testing.T, h *engineHold, a *mcpSession, o openedAs) <-chan stri
 }
 
 // §D2.4: a tool call waits at most MaxEngineWait, and the answer names
-// the holder: its tool, its session's label and how long it has run.
+// the holder: its tool, its session's label (quoted: the client chose it)
+// and how long it has run.
 func TestABusyEngineAnswersWhoHoldsIt(t *testing.T) {
 	for _, tc := range []struct{ command, want string }{
-		{"", "perf-agent-mcp is busy with top from A (running 0s); call again"},
-		{"perf-agent-hub", "perf-agent-hub is busy with top from A (running 0s); call again"},
+		{"", `perf-agent-mcp is busy with top from "A" (running 0s); call again`},
+		{"perf-agent-hub", `perf-agent-hub is busy with top from "A" (running 0s); call again`},
 	} {
 		t.Run(cmp.Or(tc.command, "default"), func(t *testing.T) {
 			h := newEngineHold()
@@ -284,8 +285,9 @@ func TestTheUncontendedEngineAllocatesNothing(t *testing.T) {
 	}
 }
 
-// A capture job's engine sections hold the engine as "capture <id>", and
-// maintenance as "capture retention", so a busy answer names them.
+// A capture job's engine sections hold the engine as "capture <id>" (its
+// job's id before the capture has one), and maintenance as "capture
+// retention", so a busy answer names them.
 func TestCaptureJobsHoldTheEngineByName(t *testing.T) {
 	var (
 		mu   sync.Mutex
@@ -303,7 +305,7 @@ func TestCaptureJobsHoldTheEngineByName(t *testing.T) {
 	e := newJobEnv(t, jobOpts{setup: func(s *Server) {
 		fault := s.captureFault
 		s.captureFault = func(p faultPoint) error {
-			if p == faultInEngine {
+			if p == faultInEngine || p == faultBeforeOpen {
 				record(s)
 			}
 			return fault(p)
@@ -324,6 +326,10 @@ func TestCaptureJobsHoldTheEngineByName(t *testing.T) {
 	// by the job's.
 	if want := "capture " + v.Job; !slices.Contains(seen, want) {
 		t.Errorf("the job's engine section held as %q, want %q", seen, want)
+	}
+	// Its results are derived once the capture has its id.
+	if want := "capture " + v.ID; !slices.Contains(seen, want) {
+		t.Errorf("the job's derivation held as %q, want %q", seen, want)
 	}
 	if !slices.Contains(seen, "capture retention") {
 		t.Errorf("maintenance held as %q, want capture retention", seen)

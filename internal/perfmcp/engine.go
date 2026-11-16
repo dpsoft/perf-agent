@@ -1,11 +1,11 @@
 package perfmcp
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -125,13 +125,20 @@ func (s *Server) engineHandler(tool string, h mcpstdio.Handler) mcpstdio.Handler
 }
 
 // busyText is the answer to a call that waited MaxEngineWait for the
-// engine: who holds it and for how long, in whole seconds.
+// engine: who holds it and for how long, in whole seconds. A holder with
+// no session label (a capture job, maintenance) is "another session".
 func (s *Server) busyText() string {
 	h, ok := s.engine.holding()
 	if !ok {
 		// The holder let go as the wait ran out.
 		return s.command() + " is busy; call again"
 	}
+	// The label is the client's own text, shown to another session: it is
+	// quoted.
+	from := "another session"
+	if h.by != "" {
+		from = strconv.Quote(h.by)
+	}
 	return fmt.Sprintf("%s is busy with %s from %s (running %ds); call again",
-		s.command(), h.tool, cmp.Or(h.by, "another session"), int64(time.Since(h.since)/time.Second))
+		s.command(), h.tool, from, int64(time.Since(h.since)/time.Second))
 }

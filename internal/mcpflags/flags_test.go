@@ -204,6 +204,15 @@ func TestStdioRefusesHubLimits(t *testing.T) {
 	if cfg.Limits.Hub.MaxCalls != 4 {
 		t.Errorf("hub MaxCalls = %d", cfg.Limits.Hub.MaxCalls)
 	}
+	// stdio's list of limit names leaves them out; the hub's has them.
+	_, _, err = parse(t, Stdio, "--profiles", profiles, "--limit", "Nope=1")
+	if err == nil || !strings.Contains(err.Error(), "valid names: ") || strings.Contains(err.Error(), "Hub.") || !strings.Contains(err.Error(), "MaxEngineWait") {
+		t.Errorf("stdio --limit Nope=1: %v", err)
+	}
+	_, _, err = parse(t, Hub, "--profiles", profiles, "--limit", "Nope=1")
+	if err == nil || !strings.Contains(err.Error(), "Hub.MaxCalls") {
+		t.Errorf("hub --limit Nope=1: %v", err)
+	}
 	// The engine wait is every server's.
 	cfg, _, err = parse(t, Stdio, "--profiles", profiles, "--limit", "MaxEngineWait=10s")
 	if err != nil || cfg.Limits.MaxEngineWait != 10*time.Second {

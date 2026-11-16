@@ -148,7 +148,7 @@ func VerifyBinary(path string) (Binary, error) {
 }
 
 func changedDuringVerification(path, changed string) *Error {
-	e := Errorf(CodeBinaryChanged, "check that no build, copy or setcap is still writing it, then restart perf-agent-mcp",
+	e := Errorf(CodeBinaryChanged, "check that no build, copy or setcap is still writing it, then restart "+CommandMark,
 		"%s changed while it was being verified", path)
 	e.Changed = changed
 	return e
@@ -298,19 +298,19 @@ func (b Binary) Recheck() *Error {
 		if e, ok := errors.AsType[*Error](err); ok {
 			return e
 		}
-		return Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "%v", err)
+		return Errorf(CodeBinaryChanged, "restart "+CommandMark, "%v", err)
 	}
 	if err := checkAncestors(b.Path, currentCreds(), syscall.Lstat); err != nil {
 		return asError(err)
 	}
 	f, err := os.OpenFile(b.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "cannot open perf-agent to recheck it: %v", err)
+		return Errorf(CodeBinaryChanged, "restart "+CommandMark, "cannot open perf-agent to recheck it: %v", err)
 	}
 	defer func() { _ = f.Close() }()
 	var st syscall.Stat_t
 	if err := syscall.Fstat(int(f.Fd()), &st); err != nil || uint64(st.Dev) != b.ID.Dev || uint64(st.Ino) != b.ID.Ino {
-		e := Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "perf-agent changed since start-up")
+		e := Errorf(CodeBinaryChanged, "restart "+CommandMark, "perf-agent changed since start-up")
 		e.Changed = "dev,ino"
 		return e
 	}
@@ -370,7 +370,7 @@ func IdentityOf(path string) (Identity, error) {
 func (b Binary) Unchanged() *Error {
 	now, err := IdentityOf(b.Path)
 	if err != nil {
-		e := Errorf(CodeBinaryChanged, "restart perf-agent-mcp", "perf-agent changed since start-up: %v", err)
+		e := Errorf(CodeBinaryChanged, "restart "+CommandMark, "perf-agent changed since start-up: %v", err)
 		e.Changed = "unreadable"
 		return e
 	}

@@ -1222,7 +1222,7 @@ func TestServerKillSignalsNoGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &Reaper{proc: &child{pid: os.Getpid()}, closeCmds: func() {}, events: make(chan Event, 8)}
+	r := &Reaper{proc: &child{pid: os.Getpid()}, closeCmds: func() {}, events: make(chan Event, 8), ended: make(chan struct{})}
 	go r.readEvents(pr)
 	for _, ev := range []Event{
 		{Op: EventLaunched, Who: WhoWorkload, PID: pid, PGID: pid},

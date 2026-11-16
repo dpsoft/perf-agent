@@ -1111,8 +1111,8 @@ const scanPattern = ". ../../internal/livehttp ../../internal/perfpage ../../int
 // TestNoClientNetworkingInTheServer reads the source of every non-standard
 // package scanPattern links on any scan target, internal/livehttp's,
 // internal/perfpage's and internal/mcphttp's included, and finds no dial,
-// name lookup, HTTP
-// client, non-TCP socket or raw system call, no listening call but the one in
+// name lookup, HTTP client, non-TCP socket or raw system call, no
+// listening call but the one in
 // internal/livehttp/listen.go, which checks the address is loopback first,
 // no os/exec outside the git probe and capture's exec_linux.go, each held
 // to its reviewed calls, no hand-built or retargeted exec.Cmd, and in

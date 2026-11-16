@@ -21,6 +21,8 @@ type session struct {
 }
 
 // newSessionID is 32 random bytes as unpadded base64url: 43 characters.
+// A session id is not a credential: the bearer token gates the endpoint
+// before any lookup, so a plain map lookup is fine.
 func newSessionID() string {
 	var b [32]byte
 	// crypto/rand.Read never fails: it crashes the program instead.
@@ -52,9 +54,11 @@ func (t *Transport) touch(s *session) {
 }
 
 // admit adds s to the table, evicting the least recently used session
-// with no call in flight when the table is full. It reports false, adding
-// nothing, when every session has a call in flight. Called with t.mu held.
-func (t *Transport) admit(s *session) bool {
+// with no call in flight when the table is full. It reports whether s was
+// added, false when every session has a call in flight, and how many
+// sessions it evicted, for the caller to log once t.mu is released.
+// Called with t.mu held.
+func (t *Transport) admit(s *session) (added bool, evicted int) {
 	for len(t.sessions) >= t.o.MaxSessions {
 		var victim *session
 		for _, c := range t.sessions {
@@ -63,14 +67,14 @@ func (t *Transport) admit(s *session) bool {
 			}
 		}
 		if victim == nil {
-			return false
+			return false, evicted
 		}
 		delete(t.sessions, victim.id)
-		t.log.Debug("mcp session evicted", "sessions", len(t.sessions))
+		evicted++
 	}
 	t.sessions[s.id] = s
 	t.touch(s)
-	return true
+	return true, evicted
 }
 
 // remove ends s: its calls are cancelled and it leaves the table. Its

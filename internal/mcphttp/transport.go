@@ -285,14 +285,17 @@ func (t *Transport) initialize(w http.ResponseWriter, rc *http.ResponseControlle
 		t.write(w, rc, http.StatusServiceUnavailable, errorBody(req.ID, codeServerBusy, closingText))
 		return
 	}
-	if !t.admit(s) {
-		t.mu.Unlock()
+	added, evicted := t.admit(s)
+	t.mu.Unlock()
+	if evicted > 0 {
+		t.log.Debug("mcp sessions evicted", "evicted", evicted)
+	}
+	if !added {
 		w.Header().Set("Retry-After", "1")
 		t.write(w, rc, http.StatusServiceUnavailable, errorBody(req.ID, codeServerBusy,
 			fmt.Sprintf("server busy: MaxSessions=%d reached; retry", t.o.MaxSessions)))
 		return
 	}
-	t.mu.Unlock()
 	w.Header().Set(HeaderSession, s.id)
 	t.write(w, rc, http.StatusOK, out)
 }

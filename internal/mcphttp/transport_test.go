@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -624,4 +625,29 @@ func TestNewAppliesTheDefaults(t *testing.T) {
 	if got != want {
 		t.Fatalf("options %+v, want %+v", got, want)
 	}
+}
+
+// TestABodyThatStallsClosesItsConnection: a body that stops arriving short
+// of its Content-Length is answered, and its connection closed, within
+// IngressBodyTimeout, while the server still runs; net/http's drain of the
+// unread rest must not wait on the client.
+func TestABodyThatStallsClosesItsConnection(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	h := startHub(t, func(o *Options) { o.IngressBodyTimeout = timeout }, nil)
+	sid := h.initialize()
+	req := h.rawRequest(sid, callBody(1, "slow", map[string]int{"ms": 1}))
+	c := h.dial()
+	start := time.Now()
+	if _, err := c.Write(req[:len(req)-10]); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(timeout + time.Second))
+	_, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("the connection stayed open %v after the body stalled: %v", time.Since(start), err)
+	}
+	if d := time.Since(start); d > timeout+500*time.Millisecond {
+		t.Fatalf("the connection closed %v after the body stalled", d)
+	}
+	eventually(t, time.Second, "the reader is released", func() bool { return h.tr.Stats().Readers == 0 })
 }

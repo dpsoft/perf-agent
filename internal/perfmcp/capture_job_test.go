@@ -417,10 +417,18 @@ func attachClient(t *testing.T, s *Server) *testClient {
 }
 
 // commitSynthetic commits a capture of st in series with fixture files and
-// no process, as a job would, and returns its id. Its profiles differ from
-// the fake perf-agent's, so a compare of the two has two handles per mode.
+// no process, as a job would, under the directory slot, and returns its
+// id. Its profiles differ from the fake perf-agent's, so a compare of the
+// two has two handles per mode.
 func (e *jobEnv) commitSynthetic(series, label string, st capture.Settings, meta manifest) int {
 	e.t.Helper()
+	// The directory slot, as a job holds it: the server's start-up
+	// maintenance, which finds the directory this creates, must not
+	// recover the transaction while it is written.
+	if !e.s.lockDir(nil) {
+		e.t.Fatal("the server closed")
+	}
+	defer e.s.unlockDir()
 	d, ce := e.s.openCaptureDir()
 	if ce != nil {
 		e.t.Fatal(ce)

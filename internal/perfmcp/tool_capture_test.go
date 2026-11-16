@@ -1376,6 +1376,68 @@ func TestAKeptAnswerWhoseManifestIsGoneIsUnknown(t *testing.T) {
 	}
 }
 
+// A wait that joins a read retention overtook gets the read made again,
+// which finds the capture gone, not the stale answer.
+func TestAJoinedWaitGetsTheReRead(t *testing.T) {
+	read := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e := newJobEnv(t, jobOpts{
+		limits: func(l *Limits) { l.Capture.KeepPerSeries = 1 },
+		setup: func(s *Server) {
+			s.readHook = func(k string) {
+				if k == "s/001" {
+					once.Do(func() { close(read); <-release })
+				}
+			}
+		},
+	})
+	var rel sync.Once
+	t.Cleanup(func() { rel.Do(func() { close(release) }) })
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	e.commitSynthetic("s", "b", st, manifest{})
+	c := e.serve()
+	if text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "1s"}); isErr || isResult(t, text) {
+		t.Fatalf("the paused read answered %s", text)
+	}
+	<-read
+	text, _ := waitEnd(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"}))
+	if !isResult(t, text) {
+		t.Fatalf("the capture: %s", text)
+	}
+	// This wait joins the paused read, which is released only then.
+	id := c.sendTool("capture_wait", map[string]any{"id": "s/001", "timeout": "20s"}, nil)
+	time.Sleep(500 * time.Millisecond)
+	rel.Do(func() { close(release) })
+	res, _ := c.recv(id)
+	text, isErr := c.toolText(res)
+	if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+		t.Fatalf("the joined wait answered %s", text)
+	}
+}
+
+// Retention marks the history changed before it forgets: a read that
+// keeps its answer between the two would otherwise keep it after the
+// forget. With the registry locked, forgetEvicted must have changed the
+// generation already while it waits to forget.
+func TestRetentionMarksTheChangeBeforeItForgets(t *testing.T) {
+	e := newJobEnv(t, jobOpts{})
+	gen := e.s.historyGen.Load()
+	e.s.registry.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.s.forgetEvicted([]string{"s/001"})
+	}()
+	marked := eventuallyTrue(5*time.Second, func() bool { return e.s.historyGen.Load() != gen })
+	e.s.registry.mu.Unlock()
+	<-done
+	if !marked {
+		t.Fatal("forgetEvicted forgot before it marked the history changed")
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

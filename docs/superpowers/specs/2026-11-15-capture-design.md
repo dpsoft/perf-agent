@@ -454,7 +454,11 @@ capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "pa
   the full result".
 - **`target`:** carries `comm` and the basename of `exe`, never `cmdline`,
   which can hold secrets. The workload's argv is not echoed back either:
-  the agent sent it.
+  the agent sent it. When the target's end stopped the capture, `exit`
+  says how: a launched command `exited <status> after <profiled>` or
+  `killed by signal "<name>" after <profiled>`, a PID `exited after
+  <profiled>` (its status is not the server's to read). The manifest
+  records it.
 - **`workload_output_tail`:** the last `Capture.MaxOutputTail` bytes (2 KiB
   each) of the launched command's stdout and stderr. It is labelled
   untrusted program output. perf-agent's own stdout is never returned, and
@@ -500,7 +504,7 @@ because a loop branches on it:
 | `no_output` | yes | Exit 0 without the expected file |
 | `stuck_child` | no | Processes survived `StopGrace`; `survivors` lists their PID, `comm`, start time and state (CAP-R3b); do not retry; tell the user |
 | `closing` | no | The server is shutting down and starts no capture; start a new one |
-| `cancelled` | — | Only in `capture_list`; no response is sent for a cancelled request |
+| `cancelled` | — | Only in `capture_list`; no response is sent for a cancelled request. `capture_wait` also answers it for a cancelled job, and with `status: "interrupted"`, `retryable: true` and `retry_after: "0s"` for a capture whose server ended under it (recovery wrote its manifest) |
 
 Every message is bounded, and repeats agent input only through `echo`, as
 M2 does. No message, failure manifest error or log line names an absolute
@@ -541,7 +545,12 @@ holds:
 - the handle, if this server has it open.
 
 With no `series`, it lists the series with their capture counts and
-bytes. It pages like `top`.
+bytes. It pages like `top`. A history whose read does not finish within the call's 10 s is
+answered from the last read that did, with `read_at`, as long as this
+server has written nothing in the capture directory since and it is under
+30 s old; otherwise it is `"loading": true`. The read goes on, so calls
+converge however slow the scan is. A capture retention removes is dropped
+from the registry, so no wait answers it as done from memory.
 
 It also serves §9: with several agents, and connections that can drop, a
 capture's result must be findable without the call that started it.

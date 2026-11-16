@@ -116,7 +116,7 @@ Who decides each point:
 - **The 2026-07-28 binding** (sessionless, `Mcp-Method` headers). State is
   designed not to be session-keyed (§D3), so adding it later is a
   transport-only change.
-- **`serve stop`, a systemd user unit, auto-start.** v1 runs in the
+- **`perf-agent-hub stop`, a systemd user unit, auto-start.** v1 runs in the
   foreground and stops with Ctrl-C or SIGTERM.
 - **A filesystem bridge from headless runs to the page** (§D3.5). It is
   a later follow-up (decision 8.4).
@@ -157,8 +157,8 @@ socket:
     user points them at the same place.
   - **Ownership is enforced, not just documented.** On first use a
     captures directory records its writer kind in `.owner` (`stdio` or
-    `serve`). Serve refuses a stdio-owned directory, and stdio a
-    serve-owned one, with an error naming the owner and the other
+    `hub`). The hub refuses a stdio-owned directory, and stdio a
+    hub-owned one, with an error naming the owner and the other
     default.
   - **Within a kind, one process at a time.** The cross-process lease
     (CAP-R6) is a `flock` on an open file description. The reaper
@@ -214,7 +214,7 @@ The split **[mine]**:
   - the publications, the snapshot, the page tools, the inbox data and
     validation, and the engine slot;
   - `live.hub` becomes a notifier, `func(state []byte)`, set through
-    `Config.Page`. `commit()` calls it, and `serve` points it at
+    `Config.Page`. `commit()` calls it, and `perf-agent-hub` points it at
     `Hub.Publish`.
 - **`internal/perfpage`** (new, linked only by the serve binary) gets:
   - the M2b routes from `liveroutes.go`, moved unchanged;
@@ -238,7 +238,7 @@ package, and the restored M2 test proves it (§D7).
   because that terminal is the user. Unlike M2b, stderr here is not an
   MCP client's log.
 - **One per user.** The server takes `flock` on
-  `$RUNTIME/perf-agent-mcp/serve.lock`. A second instance exits with
+  `$RUNTIME/perf-agent-mcp/hub.lock`. A second instance exits with
   code 1, saying `perf-agent-hub is already running (pid N, port
   P)`.
 - **Port [user, decision 8.2].** The server listens on a fixed loopback
@@ -269,7 +269,7 @@ first direction mentioned a thin stdio adapter that would forward to a
 running server. The user dropped it, for these reasons:
 - **It would couple the headless loop to hidden state.** The same config
   would behave differently depending on whether some terminal happens to
-  run `serve`: other agents' handles, evictions and steering, with added
+  run `perf-agent-hub`: other agents' handles, evictions and steering, with added
   latency. That breaks decision 6.
 - **It needs an outbound dial.** Forwarding means a loopback client
   connection from the stdio process, which reverses M2b's "no client
@@ -645,7 +645,7 @@ they are all that user's. The trust boundary is the token, not the agent.
 
 | State | Scope | Notes |
 |---|---|---|
-| Handles (store) | shared | Handles are content digests (`profilemodel` derives them from the profile digest and execlog), so two agents opening the same file get the same handle. `MaxOpenHandles` is shared: one agent's opens can evict another's handle, which gets M2's error "call open(path) again", deterministic and safe. `serve` raises the default to 32 (stdio keeps 8) |
+| Handles (store) | shared | Handles are content digests (`profilemodel` derives them from the profile digest and execlog), so two agents opening the same file get the same handle. `MaxOpenHandles` is shared: one agent's opens can evict another's handle, which gets M2's error "call open(path) again", deterministic and safe. `perf-agent-hub` raises the default to 32 (stdio keeps 8) |
 | Diff cache | shared | as above |
 | Attempts record | shared, keyed by (digest, view) as M2-R18 | It must be shared: M2b's anti-goal "a live page can show a view without its rejections" requires a rejection by any agent to appear on every publication of that key. IDs `a1, a2, …` are server-wide. A retry may name any agent's attempt of the same key |
 | Publications, steering | shared; last writer wins | The page is one screen. Each publication and each steering change records `by` (the session's client label), and the page shows "p4 · codex" |
@@ -774,8 +774,8 @@ Instead:
     and never `seq`.
 - **The state bus combines them.** It is a small struct with its own
   mutex, holding the latest bytes of each part. Each writer replaces its
-  part, then builds the envelope and publishes it to the hub while
-  holding that mutex. The hub never blocks (M2b D2), so the mutex is held
+  part, then builds the envelope and publishes it to the events hub (`livehttp.Hub`) while
+  holding that mutex. The events hub never blocks (M2b D2), so the mutex is held
   only to build the frame. `GET state` reads the same combined bytes.
   Neither writer ever waits for the other's lock (the engine slot or the
   inbox mutex).
@@ -870,14 +870,14 @@ authority over TCP**, and accepts **one kind of browser write**.
 | A process with **the user's uid** (malware, a compromised tool) | read `mcp-token` and call every tool, `capture` included | do more than it already could: it can read the profiles itself and run the setcap'd `perf-agent` directly (the capture design's §12 makes the same point). Out of scope, as in M2b. The stdio-over-HTTP design keeps this cost visible: it is why the default stays stdio for headless use |
 | A **web page** in the user's browser | send requests to `127.0.0.1:*`, including a cross-site navigation to the page shell (M2b-R6) | **MCP:** it has no bearer token, cannot set `Authorization` cross-origin without a CORS preflight that never succeeds, and any request it makes carries `Origin` and `Sec-Fetch-Site`, which `/mcp` refuses. **Inbox:** it lacks the page token; with a leaked token it still fails the `Origin`, `Sec-Fetch-Site`, content-type and custom-header checks |
 | A **DNS-rebinding** page | reach the port under its own hostname | pass `Front`'s Host check |
-| Someone **with the page URL** (history, screen share) | read the page and append `select`, `focus` and `ask` reports | call a tool, or inject text: reports are validated IDs, and names come from the engine (§D4). Rotation: restart `serve` |
+| Someone **with the page URL** (history, screen share) | read the page and append `select`, `focus` and `ask` reports | call a tool, or inject text: reports are validated IDs, and names come from the engine (§D4). Rotation: restart `perf-agent-hub` |
 | A **misbehaving agent** | flood tool calls, steer the page, evict others' handles | exhaust memory or goroutines: `MaxCalls`, `MaxCallsPerSession` and `MaxRequestBytes` refuse excess at once (SRV-R4). It also cannot starve the page (snapshot reads), delay a parsed control message behind calls or the engine (SRV-R4b), or hold the slot forever (`MaxEngineWait`); every tool keeps M2's bounds. **With the token it can flood slow bodies:** while `MaxIngressReaders` are busy, new requests, controls included, get `503` until readers free, within `IngressBodyTimeout` (SRV-R4c, stated conditionally). The flood holds no engine state, and capture jobs keep running |
 | **Hostile profile content** | as in M2b | as in M2b; the inbox stores no page-supplied text |
 
 **Long-lived consequences:**
 - **Memory.** It is bounded as in M2b (`MaxRetainedBytes`, an estimated
   2 GiB, plus the handle, diff and attempt bounds), but held for the
-  process's life instead of one session's. `serve` logs its retained
+  process's life instead of one session's. `perf-agent-hub` logs its retained
   estimate at each publication (no token in it).
 - **Rotation.** Both tokens are rotated at every start. There is no
   in-process rotation in v1. The token files are deleted at exit, and the
@@ -1056,7 +1056,7 @@ authority over TCP**, and accepts **one kind of browser write**.
     cancel during the wait, a commit error, and shutdown. The pin ledger
     and the reserved bytes return to their baseline.
 - **Writer ownership and crashes (SRV-R5, CAP-R6b):**
-  - serve refuses a stdio-owned directory and stdio a serve-owned one;
+  - the hub refuses a stdio-owned directory and stdio a hub-owned one;
   - the defaults `captures` and `captures-hub` are distinct;
   - a serve SIGKILLed mid-capture leaves the reaper holding the lease. A
     restarted serve refuses capture, naming the reaper's pid, and runs no
@@ -1103,7 +1103,7 @@ authority over TCP**, and accepts **one kind of browser write**.
 - Claude Code with `claude -p --mcp-config <scratch json>` (M2-R1: never
   `claude mcp add`) and the `headersHelper`;
 - Codex with a scratch `config.toml` and `http_headers_helper`;
-- restart `serve` mid-session and record how each client recovers from
+- restart `perf-agent-hub` mid-session and record how each client recovers from
   the `404` and `401`;
 - two agents at once on one page.
 
@@ -1159,7 +1159,7 @@ byte-identical. `live.js` and `livepage.html` are live-only assets that
 | `internal/mcpstdio/server.go` | Extract `dispatch` into exported `(*Server).Handle(ctx, *Session, []byte) []byte` with a `Session` type (the `initialized` flag, the negotiated version, the client label). `Serve` uses it with one session, and its bytes are unchanged | The HTTP binding must feed one message at a time per session. It is the same code, not a fork, so both transports answer identically |
 | `internal/mcpstdio/protocol.go` | `Resource.Read func() (string, error)` (optional, dynamic); `initialize` records `clientInfo.name` into the `Session` | `perf-agent://page/state` is dynamic; the label is needed for `by` and `read_by` |
 | `internal/perfmcp/server.go` | `tools()` wraps handlers with the engine slot; page tools and `page_state` registered only with `Config.Page`; `Close` no longer stops a listener | The ownership invariant must hold with many request goroutines (§D2.4) |
-| `internal/perfmcp/config.go` | `Live bool` becomes `Page *PageConfig` (`URL string`, set by `serve`) | `perfmcp` no longer listens; the host tells it the URL |
+| `internal/perfmcp/config.go` | `Live bool` becomes `Page *PageConfig` (`URL string`, set by `perf-agent-hub`) | `perfmcp` no longer listens; the host tells it the URL |
 | `internal/perfmcp/live.go` | Remove `start`, the listener fields, `mu` and the `livehttp` import; `hub` becomes the `Config.Page` notifier; `ensureLive` returns `Config.Page.URL` and commits on first use; publications and state record `by`; comments say "slot holder" | The lifecycle moves to the serve binary, and `perfmcp` must import no networking (decision 8.3; §D5, task 7) |
 | `internal/perfmcp/liveroutes.go` | **Moved** to `internal/perfpage`; the snapshot-only reads are unchanged. `stateOf` stays in `perfmcp`, adds `by`, and feeds the `engine` part of the state bus (`statebus.go`, new, in `perfmcp`) | It is the file that imports `net/http`; SRV-R3 |
 | `internal/perfmcp/attempts.go` | `attempt.by` (display only; not in static output) | attribution across agents (§D3) |

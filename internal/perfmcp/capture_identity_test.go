@@ -235,7 +235,10 @@ func TestAQuarantinedFileIsProvenByItsCapture(t *testing.T) {
 				t.Fatalf("no crash at removal %d: %v", n, r.err)
 			}
 			notes := crashRecover(t, s, d, clk)
-			noOrphans(t, notes)
+			// The intent's own removal is the last: with the intent gone
+			// nothing is left to prove its quarantined copy against, so
+			// that copy is reported and kept.
+			noOrphansBut(t, notes, func(n string) bool { return holdsAnIntent(t, d, n) })
 			invariant(t, d, notes)
 		})
 	}
@@ -255,23 +258,25 @@ func TestAQuarantinedFileIsProvenByItsCapture(t *testing.T) {
 	})
 }
 
-// TestTokenNamedTemporariesAreProvenByWhatTheyHold: a temporary a crash
-// left after it was written and before anything recorded it carries the
-// intent's token in its name and holds this capture's intent or manifest;
-// that proves it.
-func TestTokenNamedTemporariesAreProvenByWhatTheyHold(t *testing.T) {
+// TestTokenNamedTemporariesWithNoRecordAreNoted: a manifest temporary a
+// crash left before anything recorded it, and an intent temporary whose
+// intent was never linked, hold bytes no adopted intent pins down (a
+// manifest's free text; no intent at all), so they are kept and reported.
+func TestTokenNamedTemporariesWithNoRecordAreNoted(t *testing.T) {
 	s, d, clk, r := crashedIntent(t)
 	ser, _ := d.root.OpenRoot("adhoc")
 	defer func() { _ = ser.Close() }()
 	tok := r.txn.in.Token[:16]
 	m := r.txn.manifestOf(manifest{}, captureFailed, nil)
 	b, _ := json.Marshal(m)
-	writeFile(t, ser, "."+manifestName(1, "run")+".tmp-"+tok, string(b)+"\n")
+	mtmp := "." + manifestName(1, "run") + ".tmp-" + tok
+	writeFile(t, ser, mtmp, string(b)+"\n")
 	notes := crashRecover(t, s, d, clk)
-	noOrphans(t, notes)
+	if _, err := ser.Lstat(mtmp); err != nil || !noted(notes, "orphan_temp", mtmp) {
+		t.Fatalf("%s: %v, notes %q", mtmp, err, notes)
+	}
 	invariant(t, d, notes)
 
-	// An intent temporary whose intent was never linked (the id wasted).
 	s2, d2, clk2 := newCaptureServer(t)
 	s2.link = func(r *os.Root, oldname, newname string) error {
 		if strings.HasSuffix(newname, intentSuffix) {
@@ -286,8 +291,33 @@ func TestTokenNamedTemporariesAreProvenByWhatTheyHold(t *testing.T) {
 		t.Fatalf("intent temporaries %v", temps)
 	}
 	notes = crashRecover(t, s2, d2, clk2)
-	noOrphans(t, notes)
+	if _, err := os.Lstat(temps[0]); err != nil || !noted(notes, "orphan_temp", filepath.Base(temps[0])) {
+		t.Fatalf("%s: %v, notes %q", temps[0], err, notes)
+	}
 	invariant(t, d2, notes)
+}
+
+// noOrphansBut is noOrphans, allowing the orphan_temp names expected
+// passes.
+func noOrphansBut(t *testing.T, notes []string, expected func(name string) bool) {
+	t.Helper()
+	for _, n := range notes {
+		if !strings.HasPrefix(n, "orphan_") && !strings.HasPrefix(n, "left ") {
+			continue
+		}
+		name := strings.TrimPrefix(strings.SplitN(strings.SplitN(n, " ", 2)[1], ":", 2)[0], "adhoc/")
+		if !strings.HasPrefix(n, "orphan_temp ") || !expected(name) {
+			t.Errorf("left in place: %s", n)
+		}
+	}
+}
+
+// holdsAnIntent reports whether the series file name holds an intent.
+func holdsAnIntent(t *testing.T, d *captureDir, name string) bool {
+	t.Helper()
+	b, err := os.ReadFile(serPath(d, name))
+	var in intent
+	return err == nil && json.Unmarshal(b, &in) == nil && in.Token != ""
 }
 
 // TestAFailedUnlinkPutsTheFileBack: a removal that fails after moving the

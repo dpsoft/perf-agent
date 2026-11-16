@@ -90,6 +90,17 @@ func (d *decisionWord) settle(linked bool) (cancel string) {
 	return ""
 }
 
+// commitAfter records a commit found after a failed manifest link was
+// settled (the link was made after all): the word becomes committed, and a
+// cancel requested meanwhile is reported as too late.
+func (d *decisionWord) commitAfter() (cancel string) {
+	prev := d.v.Swap(decisionCommitted)
+	if d.cancelInFlight.Swap(false) || prev == decisionCancelRequested {
+		return cancelAnswerTooLate
+	}
+	return ""
+}
+
 // cancelled reports whether a cancel is waiting to be honoured.
 func (d *decisionWord) cancelled() bool {
 	return d.v.Load() == decisionCancelRequested

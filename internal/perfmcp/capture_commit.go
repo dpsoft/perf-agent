@@ -307,8 +307,17 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	hbTmp, err := t.writeTemp(hbName, []byte(t.in.Token+"\n"), "heartbeat")
 	if err == nil {
 		err = s.linkNoReplace(ser, rootCaptures, hbTmp.Name, hbName)
-		if err != nil && !errors.Is(err, errCrash) && landed(ser, hbName, hbTmp) == linkMade {
-			err = nil
+		if err != nil && !errors.Is(err, errCrash) {
+			switch landed(ser, hbName, hbTmp) {
+			case linkMade:
+				err = nil
+			case linkUnknown:
+				// The heartbeat may be there: record it, so the rollback
+				// removes it by its identity.
+				hb := hbTmp
+				hb.Name = hbName
+				t.in.Heartbeat = &hb
+			}
 		}
 		if err != nil && !errors.Is(err, errCrash) {
 			_, _, _ = removeByIdentity(ser, hbTmp.Name, hbTmp)
@@ -335,6 +344,10 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 
 // landedLstat is how a link's outcome is checked; a seam for tests.
 var landedLstat = (*os.Root).Lstat
+
+// afterSettle, when set, runs right after a failed manifest link was
+// settled; a seam for tests.
+var afterSettle func()
 
 // errAlreadyCommitted is a rollback that found this capture's own ok
 // manifest at its manifest name: the capture committed after all.
@@ -843,10 +856,15 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 			return false, t.crashed(err)
 		}
 		var cause error = t.linkCause(err)
-		if d.settle(false) == cancelAnswerCancelled || d.cancelled() {
+		settled := d.settle(false)
+		if afterSettle != nil {
+			afterSettle()
+		}
+		if settled == cancelAnswerCancelled || d.cancelled() {
 			cause = cancelledError()
 		}
 		if rerr := t.rollback(t.cause(cause), m); errors.Is(rerr, errAlreadyCommitted) {
+			t.cancelNote = d.commitAfter()
 			return true, nil
 		} else if errors.Is(rerr, errCrash) {
 			return false, errCrash
@@ -1438,6 +1456,8 @@ func (in intent) check(name string) error {
 		return errors.New("has no owner token")
 	case !strings.HasPrefix(in.Staging, stagingPrefix) || !isHex(strings.TrimPrefix(in.Staging, stagingPrefix), 16):
 		return errors.New("names no staging directory of its own")
+	case in.State != statePrepared && in.State != stateLinking && in.State != stateRollingBack:
+		return fmt.Errorf("has state %q", echo(in.State))
 	case len(in.Outputs) != len(in.Finals):
 		return errors.New("lists outputs and final names that differ in number")
 	case in.Heartbeat != nil && in.Heartbeat.Name != heartbeatName(id, in.Label):
@@ -1455,12 +1475,12 @@ func (in intent) check(name string) error {
 		}
 	}
 	for _, f := range in.Files {
-		if !validName(f.Staged, maxFileName) {
+		if !validName(f.Staged, maxFileName) || !isHex(f.SHA256, 64) {
 			return fmt.Errorf("records staged file %s", echo(f.Staged))
 		}
 	}
 	for _, tmp := range in.Temps {
-		if !in.isTemp(id, tmp.Name) {
+		if !in.isTemp(id, tmp.Name) || !isHex(tmp.SHA256, 64) {
 			return fmt.Errorf("records temporary %s", echo(tmp.Name))
 		}
 	}

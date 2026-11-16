@@ -242,7 +242,7 @@ func TestTokenProofsNeverTakeAFileWithDataOfItsOwn(t *testing.T) {
 		{"manifest-temp-exact", manifestTemp, func(t *testing.T, x *captureTxn) []byte {
 			b, _ := json.Marshal(failure(x))
 			return append(b, '\n')
-		}, true},
+		}, false},
 		{"heartbeat-temp-extra-line", hbTemp, func(t *testing.T, x *captureTxn) []byte { return []byte(x.in.Token + "\nPRECIOUS\n") }, false},
 		{"heartbeat-temp-exact", hbTemp, func(t *testing.T, x *captureTxn) []byte { return []byte(x.in.Token + "\n") }, true},
 		{"quarantine-intent-extra-field", quarantined, func(t *testing.T, x *captureTxn) []byte {
@@ -326,71 +326,6 @@ func TestARemovalChecksTheFileItUnlinks(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the file renamed onto the quarantine name was unlinked")
-	}
-}
-
-// TestStrayQuarantinedIntentsNeedEveryProof: an intent left under a
-// quarantine name with no intent beside it is removed only when its token
-// matches the name, it is of this series, and its manifest exists; an
-// intent temporary only when its intent is absent.
-func TestStrayQuarantinedIntentsNeedEveryProof(t *testing.T) {
-	committed := func(t *testing.T) (*Server, *captureDir, *os.Root, intent) {
-		t.Helper()
-		s, d, _ := newCaptureServer(t)
-		r := drive(t, s, d, capCase{})
-		if !r.committed {
-			t.Fatal(r.err)
-		}
-		ser, _ := d.root.OpenRoot("adhoc")
-		t.Cleanup(func() { _ = ser.Close() })
-		return s, d, ser, r.txn.in
-	}
-	for _, c := range []struct {
-		name string
-		make func(t *testing.T, ser *os.Root, in intent) string
-		gone bool
-	}{
-		{"proven", func(t *testing.T, ser *os.Root, in intent) string {
-			n := quarantinePrefix + in.Token[:16] + "-0123456789abcdef"
-			writeFile(t, ser, n, string(canonicalIntent(in)))
-			return n
-		}, true},
-		{"token-not-the-name", func(t *testing.T, ser *os.Root, in intent) string {
-			n := quarantinePrefix + strings.Repeat("d", 16) + "-0123456789abcdef"
-			writeFile(t, ser, n, string(canonicalIntent(in)))
-			return n
-		}, false},
-		{"another-series", func(t *testing.T, ser *os.Root, in intent) string {
-			in.Series = "other"
-			n := quarantinePrefix + in.Token[:16] + "-0123456789abcdef"
-			writeFile(t, ser, n, string(canonicalIntent(in)))
-			return n
-		}, false},
-		{"no-manifest", func(t *testing.T, ser *os.Root, in intent) string {
-			if err := ser.Rename(manifestName(1, "run"), "kept-manifest"); err != nil {
-				t.Fatal(err)
-			}
-			n := quarantinePrefix + in.Token[:16] + "-0123456789abcdef"
-			writeFile(t, ser, n, string(canonicalIntent(in)))
-			return n
-		}, false},
-		{"intent-temp-beside-its-intent", func(t *testing.T, ser *os.Root, in intent) string {
-			// Something recovery leaves in place holds the intent's name.
-			writeFile(t, ser, intentName(1, "run"), "not an intent")
-			n := "." + intentName(1, "run") + ".tmp-" + in.Token[:16]
-			writeFile(t, ser, n, string(canonicalIntent(in)))
-			return n
-		}, false},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			s, d, ser, in := committed(t)
-			n := c.make(t, ser, in)
-			recoverNow(t, s, d)
-			_, err := ser.Lstat(n)
-			if gone := errors.Is(err, fs.ErrNotExist); gone != c.gone {
-				t.Fatalf("%s: gone %v, want %v", n, gone, c.gone)
-			}
-		})
 	}
 }
 

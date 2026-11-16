@@ -157,20 +157,6 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 				claimed[tn] = true
 			}
 		}
-		// A manifest temporary no rewrite recorded yet carries the token in
-		// its name and holds this capture's manifest.
-		for _, tn := range names {
-			if !in.isTemp(t.id, tn) || !strings.HasPrefix(tn, "."+manifestName(t.id, in.Label)) || slices.ContainsFunc(in.Temps, func(f fileIdentity) bool { return f.Name == tn }) {
-				continue
-			}
-			if id, ok := proveByToken(ser, tn, in, maxManifestBytes, in.holdsManifest); ok {
-				if removed, _, err := t.remove(ser, tn, id); err != nil {
-					return notes, d.writeError(err)
-				} else if removed {
-					claimed[tn] = true
-				}
-			}
-		}
 		// A heartbeat temporary holds the token: a second name of the
 		// heartbeat, or one a crash left before it was linked.
 		for _, tn := range names {
@@ -278,7 +264,6 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 		case claimed[n], n == seqFile:
 		case strings.HasPrefix(n, stagingPrefix):
 			add("orphan_staging", n, "no intent identifies this staging directory, so it is never removed automatically; remove it by hand")
-		case strings.HasPrefix(n, ".") && s.removeStray(ser, series, n):
 		case strings.HasPrefix(n, quarantinePrefix):
 			tok, _, _ := strings.Cut(strings.TrimPrefix(n, quarantinePrefix), "-")
 			whose := "a removal a crash interrupted moved this file aside"
@@ -327,10 +312,9 @@ func (t *captureTxn) isRecorded(id fileIdentity) bool {
 
 // holdsToken reports whether b is exactly bytes this capture writes: its
 // token and a newline (the heartbeat, the probe), or a version of its
-// intent as the server encodes it. The bytes must equal the decoded
-// value's own encoding, so nothing else can ride along (an added field, an
-// edit, another layout), and the intent must be valid, of this capture and
-// carry its token.
+// intent as the server encodes it. An intent must equal its own canonical
+// encoding (nothing rides along), be valid, and be the same capture as in,
+// the intent recovery adopted: see sameCapture.
 func (in intent) holdsToken(b []byte) bool {
 	if string(b) == in.Token+"\n" {
 		return true
@@ -343,24 +327,34 @@ func (in intent) holdsToken(b []byte) bool {
 		return false
 	}
 	id, ok := parseID(other.ID)
-	return ok && other.check(intentName(id, other.Label)) == nil &&
-		other.Token == in.Token && other.ID == in.ID && other.Label == in.Label && other.Series == in.Series
+	return ok && other.check(intentName(id, other.Label)) == nil && in.sameCapture(other)
 }
 
-// holdsManifest reports whether b is exactly a manifest of this capture as
-// the server writes it: the decoded value's own encoding and a newline, a
-// valid manifest for this capture's name, and this capture's token.
-func (in intent) holdsManifest(b []byte) bool {
-	var m manifest
-	if json.Unmarshal(b, &m) != nil {
-		return false
-	}
-	if canon, err := json.Marshal(m); err != nil || !bytes.Equal(append(canon, '\n'), b) {
-		return false
-	}
-	id, ok := parseID(in.ID)
-	return ok && checkManifest(m, manifestName(id, in.Label)) == nil &&
-		m.Token == in.Token && m.Series == in.Series
+// sameCapture reports whether o is a version of in, the adopted intent:
+// everything an intent never changes once written is equal (the token, the
+// capture, its settings, outputs (and so finals) and staging name, its
+// server), and what it records once (the staging inode, the reaper, the
+// heartbeat, the files) is equal wherever both have recorded it. o may be
+// older than in (a quarantined earlier version) or newer (the temporary of
+// a rewrite a crash cut short), so either may lack a record. What may
+// differ holds no free text: the state and the temporaries' names, which
+// check holds to their forms, and identities (numbers, digests and fixed
+// names).
+func (in intent) sameCapture(o intent) bool {
+	once := func(a, b uint64) bool { return a == 0 || b == 0 || a == b }
+	return o.Token == in.Token && o.ID == in.ID && o.Label == in.Label && o.Series == in.Series &&
+		// The finals follow from the outputs, which check holds them to.
+		sameSettings(o.Settings, in.Settings) && slices.Equal(o.Outputs, in.Outputs) &&
+		o.Staging == in.Staging && o.ServerPID == in.ServerPID && o.ServerStart == in.ServerStart &&
+		once(o.StagingDev, in.StagingDev) && once(o.StagingIno, in.StagingIno) &&
+		(o.ReaperPID == 0 || in.ReaperPID == 0 || o.ReaperPID == in.ReaperPID && o.ReaperStart == in.ReaperStart) &&
+		(o.Heartbeat == nil || in.Heartbeat == nil || *o.Heartbeat == *in.Heartbeat) &&
+		(len(o.Files) == 0 || len(in.Files) == 0 || slices.Equal(o.Files, in.Files))
+}
+
+func sameSettings(a, b wireSettings) bool {
+	return slices.Equal(a.Modes, b.Modes) && a.Duration == b.Duration && a.SampleRate == b.SampleRate &&
+		a.Unwind == b.Unwind && a.KernelStacks == b.KernelStacks
 }
 
 // proveQuarantined is the identity that proves a quarantined name of this
@@ -387,54 +381,6 @@ func (t *captureTxn) proveQuarantined(root *os.Root, name string) (fileIdentity,
 		}
 	}
 	return proveByToken(root, name, t.in, maxManifestBytes, t.in.holdsToken)
-}
-
-// removeStray removes a dot-name of the series that no intent accounts
-// for when what it holds proves it: a capture's intent a crash left
-// quarantined after its manifest was written, or an intent temporary
-// whose intent was never linked. It reports whether the name is gone.
-func (s *Server) removeStray(ser *os.Root, series, name string) bool {
-	var tok, final string
-	switch {
-	case strings.HasPrefix(name, quarantinePrefix):
-		tok, _, _ = strings.Cut(strings.TrimPrefix(name, quarantinePrefix), "-")
-	default:
-		before, after, ok := strings.Cut(strings.TrimPrefix(name, "."), ".tmp-")
-		if !ok || !strings.HasSuffix(before, intentSuffix) {
-			return false
-		}
-		final, tok = before, after[:min(16, len(after))]
-	}
-	if !isHex(tok, 16) {
-		return false
-	}
-	var in intent
-	b, _, err := readSmall(ser, name, maxManifestBytes)
-	if err != nil || json.Unmarshal(b, &in) != nil || len(in.Token) != 32 || in.Token[:16] != tok || in.Series != series {
-		return false
-	}
-	id, ok := parseID(in.ID)
-	if !ok || in.check(intentName(id, in.Label)) != nil || !in.isTemp(id, name) && final != "" {
-		return false
-	}
-	if final == "" {
-		// Quarantined: only ever the intent's last removal, after its
-		// manifest.
-		if _, err := readManifest(ser, manifestName(id, in.Label)); err != nil {
-			return false
-		}
-	} else if _, err := ser.Lstat(final); !errors.Is(err, fs.ErrNotExist) {
-		return false
-	}
-	proof, ok := proveByToken(ser, name, in, maxManifestBytes, in.holdsToken)
-	if !ok {
-		return false
-	}
-	removed, _, err := removeByIdentity(ser, name, proof)
-	if removed {
-		s.log.Info("capture recovery removed a leftover its contents prove", "series", series, "name", name)
-	}
-	return err == nil && removed
 }
 
 // adopt is the transaction of an intent another (gone) owner wrote, for

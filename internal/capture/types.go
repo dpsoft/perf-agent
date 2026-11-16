@@ -304,7 +304,9 @@ type Tail struct {
 // to the stop. PerfAgentExit is perf-agent's exit status, -1 when it was
 // killed or never ran; StderrTail is its stderr's end, on failure only.
 // Survivors and Cleanup are the reaper's report. Argv is perf-agent's
-// argv, once it was built.
+// argv, once it was built. WorkloadExited says the launched command was
+// reaped, with its exit status, or WorkloadSignal naming the signal that
+// killed it (the status is then -1).
 type Outcome struct {
 	Err                     *Error
 	StoppedBy               string
@@ -321,4 +323,7 @@ type Outcome struct {
 	Cleanup                 string
 	Notes                   []string
 	Argv                    []string
+	WorkloadExited          bool
+	WorkloadStatus          int
+	WorkloadSignal          string
 }

@@ -680,6 +680,7 @@ func (r *Run) event(ev Event) {
 	case ev.Op == EventExited && ev.Who == WhoPerfAgent:
 		r.perfDone(ev)
 	case ev.Op == EventExited && ev.Who == WhoWorkload:
+		r.o.WorkloadExited, r.o.WorkloadStatus, r.o.WorkloadSignal = true, ev.Status, ev.Signal
 		r.workDone()
 	case ev.Op == EventError:
 		r.reaperError(ev)

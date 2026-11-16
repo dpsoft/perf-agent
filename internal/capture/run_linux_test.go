@@ -314,6 +314,25 @@ func TestRunStopsWhenTheCommandExits(t *testing.T) {
 	}
 }
 
+// The launched command's own exit is recorded: its status, or the signal
+// that killed it.
+func TestRunRecordsHowTheCommandExited(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	spec.Settings.Duration = 20 * time.Second
+	spec.Launch = launchOf(t, "exit-after", "500ms", "3")
+	o := waitRun(t, startRun(t, spec), 30*time.Second)
+	if o.Err != nil || !o.WorkloadExited || o.WorkloadStatus != 3 || o.WorkloadSignal != "" {
+		t.Fatalf("Err %v, exited %v, status %d, signal %q", o.Err, o.WorkloadExited, o.WorkloadStatus, o.WorkloadSignal)
+	}
+
+	r := testRun(t, new(0))
+	r.spec.Launch = &LaunchSpec{Path: "/x/bench"}
+	r.event(Event{Op: EventExited, Who: WhoWorkload, PID: 11, Status: -1, Signal: "killed"})
+	if !r.o.WorkloadExited || r.o.WorkloadSignal != "killed" {
+		t.Errorf("exited %v, signal %q", r.o.WorkloadExited, r.o.WorkloadSignal)
+	}
+}
+
 func TestRunStopsWhenThePIDExits(t *testing.T) {
 	spec := runSpec(t, capturetest.FakeOptions{})
 	spec.Settings.Duration = 20 * time.Second

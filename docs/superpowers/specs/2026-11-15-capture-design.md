@@ -1206,8 +1206,12 @@ directory. The job's states map onto the steps:
    - the owner identity: server PID and start time; the reaper's, once
      known.
 
-   The owner refreshes `NNN-label.intent.hb` (its mtime) every 2 s
-   while the operation is in flight. That is the **heartbeat**.
+   Then it creates `NNN-label.intent.hb`, which holds the owner token, and
+   records its identity with an intent rewrite (CAP-R45: the intent
+   first, so a crash between the two leaves an intent judged by its
+   owner's liveness, never a heartbeat no intent names). The owner
+   refreshes the heartbeat's mtime every 2 s while the operation is in
+   flight. That is the **heartbeat**.
 6. **Space.** Check `MaxStoredBytes` and `MinFreeBytes` (retention has
    already run). A failure goes to live rollback.
 7. **Staging, preflight, reaper.** Create `.staging-<16 hex>`
@@ -1234,9 +1238,12 @@ directory. The job's states map onto the steps:
     identities from step 9) and fsync it. Then apply the **terminal
     decision rule** (below), and link the temp no-replace to
     `NNN-label.capture.json` and fsync the directory. **The successful
-    link is the commit point.** Then remove the staging directory (which
-    drops each inode to `nlink 1`), the intent and the heartbeat, and
-    fsync. The reaper is told `done`, and releases the lease once its
+    link is the commit point.** A link that answers an error (`EEXIST`
+    included, as a retransmitted NFS request answers for its own link)
+    while the manifest name now is the temp's dev and inode did succeed
+    (CAP-R46); a name taken by another file is `exists`. Then remove the
+    staging directory (which drops each inode to `nlink 1`), the
+    heartbeat, then the intent (CAP-R45), and fsync. The reaper is told `done`, and releases the lease once its
     children are reaped (CAP-R6b).
 
 **The terminal decision rule (cancel vs commit; CAP-R16, refined after
@@ -1267,7 +1274,17 @@ answer there is `cancelling` until the link resolves.
 **Identity-matched deletion (the only way this protocol deletes):**
 - a name is removed only if `Lstat` shows a regular file whose dev and
   inode equal the recorded ones;
-- and, for a final name, whose size and SHA-256 match;
+- and whose size and SHA-256 match, for every name, temporaries and the
+  heartbeat (which holds the token) included: an inode number can be
+  reused, and the server's own links, renames and heartbeat updates
+  change a file's ctime, so the contents are the proof (CAP-R44);
+- the name is first renamed to a private quarantine name beside it
+  (`.del-<16 hex>`), checked again there, and only then unlinked; a file
+  that is not the recorded one is put back without replacing anything
+  (CAP-R43);
+- a staging directory is opened as a root and proven to be the recorded
+  dev and inode before perf-agent's outputs in it are removed by name
+  (CAP-R48);
 - `nlink` may be 1 or 2. 2 is the staging+final pair after a crash in
   steps 10–11, and both names are then removed;
 - a name whose identity differs, or that was never recorded (a crash
@@ -1293,7 +1310,8 @@ sees an error while capture files are still published.
 **Recovery** (step 2, and at start-up), under the lease. For each intent:
 - **A manifest exists:** the capture was committed. Remove the leftovers
   by identity (staging names), then the intent.
-- **The owner is alive:** its heartbeat is newer than 10 s, and the
+- **The owner is alive:** its heartbeat is newer than 10 s (one dated
+  more than 10 s ahead, after a clock jump, is stale), and the
   recorded server or reaper PID and start time is alive. The intent is
   left to its owner, which is still rolling back.
 - **Abandoned:** heartbeat stale, server and reaper (PID and start time)
@@ -1315,6 +1333,18 @@ sees an error while capture files are still published.
     summary counts it, so the user can remove it.
 - Any other `.staging-*` directory that no intent names, and whose dev
   and inode cannot be matched, is likewise left and logged.
+- A token temporary whose dev, inode and contents equal the intent's own
+  file (a crash between linking the intent and removing its temporary's
+  name) is a second name of the intent, and is removed.
+- **Single-syscall windows (CAP-R47).** A crash inside one system call
+  of a write, after a new name exists and before any record of it is
+  durable, leaves a file nothing can prove: a `.seq` temporary, a
+  heartbeat created but not yet recorded, an intent or manifest
+  temporary, a quarantined `.del-*` name, a staging directory (CAP-R12
+  above), or a temporary of `.owner` in the capture directory itself.
+  Each is retained, never deleted without proof, and logged by recovery
+  as `orphan_temp`, `orphan_staging` or `left`; `capture_list`'s series
+  summary counts them, left heartbeats included.
 - Recovery that hits `ENOSPC` stops and leaves the intent. Every step is
   idempotent.
 
@@ -1331,8 +1361,9 @@ sees an error while capture files are still published.
 
 After each, recovery or the live owner leaves either a committed capture
 with verified files, or a failure or `interrupted` manifest with no
-capture files. There is no orphan beyond CAP-R12's, and `capture_list`
-shows it.
+capture files, and nothing else: a fault at a boundary leaves no orphan.
+Only a crash inside a single system call can leave one, as listed above,
+and `capture_list` shows it.
 
 Two dedicated cases:
 - **lost `Link` race:** a user file is created at a final name between

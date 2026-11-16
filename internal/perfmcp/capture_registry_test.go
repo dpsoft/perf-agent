@@ -100,8 +100,15 @@ func TestAdmitIsOneAtATime(t *testing.T) {
 	j2 := testJob(r, regT0.Add(time.Second), 10*time.Second)
 	e := r.admit(j2, regT0.Add(time.Second))
 	wantCode(t, "second admit", e, capture.CodeBusy)
-	if !e.Retryable || e.RetryAfter != 9*time.Second {
-		t.Errorf("busy: retryable %v, retry_after %v; want true, 9s (the active job's reserved end)", e.Retryable, e.RetryAfter)
+	if !e.Retryable || e.RetryAfter != 5*time.Second {
+		t.Errorf("busy: retryable %v, retry_after %v; want true, 5s (the active job's reserved end, 9s away, capped)", e.Retryable, e.RetryAfter)
+	}
+	if end := regT0.Add(10 * time.Second).UTC().Format(time.RFC3339); !strings.Contains(e.Next, end) {
+		t.Errorf("busy: next %q does not name the active job's latest end %s", e.Next, end)
+	}
+	j3 := testJob(r, regT0.Add(7500*time.Millisecond), 10*time.Second)
+	if e := r.admit(j3, regT0.Add(7500*time.Millisecond)); e == nil || e.RetryAfter != 3*time.Second {
+		t.Errorf("busy 2.5s before the end: %v, want retry_after 3s (rounded up)", e)
 	}
 	if r.active.Load() != j1 {
 		t.Fatal("a busy admit changed the slot")
@@ -994,9 +1001,9 @@ func TestBusyRetryAfter(t *testing.T) {
 	if err := r.reconcile(j, 20*time.Second, regT0); err != nil {
 		t.Fatal(err)
 	}
-	e := r.admit(testJob(r, regT0, time.Second), regT0.Add(5*time.Second))
-	if e == nil || e.RetryAfter != 15*time.Second {
-		t.Fatalf("busy after reconcile: %v, want retry_after 15s (from the reconciled 20s)", e)
+	e := r.admit(testJob(r, regT0, time.Second), regT0.Add(17500*time.Millisecond))
+	if e == nil || e.RetryAfter != 3*time.Second || !strings.Contains(e.Next, regT0.Add(20*time.Second).UTC().Format(time.RFC3339)) {
+		t.Fatalf("busy after reconcile: %v, want retry_after 3s and the end from the reconciled 20s", e)
 	}
 	e = r.admit(testJob(r, regT0, time.Second), regT0.Add(time.Hour))
 	if e == nil || e.RetryAfter != time.Second {

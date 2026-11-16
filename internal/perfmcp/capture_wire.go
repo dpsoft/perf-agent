@@ -36,7 +36,7 @@ type wireSurvivor struct {
 }
 
 // toWireError is e as the wire shows it, nil for nil. A retryable failure
-// always says when to retry, "0s" meaning at once.
+// always says when to retry, in whole seconds, "0s" meaning at once.
 func toWireError(e *capture.Error) *wireError {
 	if e == nil {
 		return nil
@@ -52,7 +52,7 @@ func toWireError(e *capture.Error) *wireError {
 		Survivors:     toWireSurvivors(e.Survivors),
 	}
 	if e.Retryable {
-		w.RetryAfter = e.RetryAfter.String()
+		w.RetryAfter = capture.CeilSecond(e.RetryAfter).String()
 	}
 	return w
 }

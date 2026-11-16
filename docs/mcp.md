@@ -171,10 +171,10 @@ A stdio session's jobs end with it: EOF on stdin cancels them, and so does a cli
 A failure is an `isError` result whose text is one JSON object, so a loop can branch on it:
 
 ```json
-{"error": {"code": "busy", "message": "capture job j3-3f9a is running; one capture runs at a time", "retryable": true, "retry_after": "12s", "next": "capture_wait or capture_cancel j3-3f9a"}}
+{"error": {"code": "busy", "message": "capture job j3-3f9a is running; one capture runs at a time", "retryable": true, "retry_after": "5s", "next": "capture_wait or capture_cancel j3-3f9a; its reserved duration ends by 2026-11-15T10:42:07Z"}}
 ```
 
-`retryable` is always present, and a retryable failure always has `retry_after` (`0s`: at once). A job's failure also names `job`, `capture_id` and `status`; perf-agent's exit and stderr tail come only on failure. Messages repeat agent input only cut, and name no absolute server path or temporary: the profiles root is `the profiles root` and the staging directory `staging`, in the programs' output tails too.
+`retryable` is always present, and a retryable failure always has `retry_after`, in whole seconds (`0s`: at once). A job's failure also names `job`, `capture_id` and `status`; perf-agent's exit and stderr tail come only on failure. Messages repeat agent input only cut, and name no absolute server path or temporary: the profiles root is `the profiles root` and the staging directory `staging`, in the programs' output tails too.
 
 | Code | Retryable | Meaning, and what `next` says |
 |---|---|---|
@@ -182,11 +182,11 @@ A failure is an `isError` result whose text is one JSON object, so a loop can br
 | `invalid_argument` | no | Names the argument and the valid range; also too many kept captures, and a command that cannot be executed |
 | `incomparable` | no | A setting differs from the `compare_with` baseline; names it and both values |
 | `unknown_baseline` | no | No usable baseline with that id in the series: none, a failed or interrupted one, one whose files no longer verify, or settings this server cannot read; lists the series' last ok ids |
-| `busy` | yes | Another capture holds the slot or the captures lock: this server, another server, or a reaper still ending one; names the holder; `retry_after` is when it should end |
+| `busy` | yes | Another capture holds the slot or the captures lock: this server, another server, or a reaper still ending one; names the holder. `retry_after` is the time to the holder's recorded end, rounded up to whole seconds and at most 5s (a holder records its worst case); `next` names that latest end |
 | `unknown_capture` | no | `capture_wait` or `capture_cancel` named an id this server has no job or manifest for, or whose manifest is gone |
 | `target_changed` | yes | The target's credentials, dumpable flag, capabilities or start time changed during the capture; it was discarded |
 | `owner_mismatch` | no | The capture directory belongs to another kind of server |
-| `budget` | yes | `Capture.WindowCaptures` or `Capture.WindowDuration` is used up; `retry_after` is when the window frees |
+| `budget` | yes | `Capture.WindowCaptures` or `Capture.WindowDuration` is used up; `retry_after` is when the window frees, rounded up to whole seconds |
 | `disk` | no | `Capture.MaxStoredBytes` or `Capture.MinFreeBytes` cannot be met even after retention, or a write failed; names the series using most space |
 | `exists` | no | A final name is taken; pass another `label` |
 | `target_refused` | no | The target is not an ordinary process of the user's (see Guardrails) |

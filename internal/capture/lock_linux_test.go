@@ -212,3 +212,36 @@ func TestBusyNamesAHolderWithoutACapture(t *testing.T) {
 		t.Fatalf("got %v (retry after %v)", e, e.RetryAfter)
 	}
 }
+
+// A busy answer's retry_after is the holder's remaining time, rounded up to
+// whole seconds, but never more than busyRetryCap: a holder records its
+// worst case, and an agent asks again soon rather than idling through it.
+// next names the holder's latest end.
+func TestBusyRetryAfterIsCappedAndRounded(t *testing.T) {
+	for _, tc := range []struct {
+		left time.Duration
+		want time.Duration
+	}{
+		{47 * time.Second, 5 * time.Second},
+		{2300 * time.Millisecond, 3 * time.Second},
+		{200 * time.Millisecond, time.Second},
+	} {
+		_, root := openDir(t)
+		deadline := time.Now().Add(tc.left)
+		l, e := TryLock(root, Holder{ServerPID: os.Getpid(), CaptureID: "d/001", Deadline: deadline})
+		if e != nil {
+			t.Fatal(e)
+		}
+		_, e = TryLock(root, Holder{})
+		_ = l.Close()
+		if e == nil || e.Code != CodeBusy {
+			t.Fatalf("got %v", e)
+		}
+		if e.RetryAfter != tc.want {
+			t.Errorf("%v left: retry after %v, want %v", tc.left, e.RetryAfter, tc.want)
+		}
+		if end := deadline.UTC().Format(time.RFC3339); !strings.Contains(e.Next, end) {
+			t.Errorf("%v left: next %q does not name the latest end %s", tc.left, e.Next, end)
+		}
+	}
+}

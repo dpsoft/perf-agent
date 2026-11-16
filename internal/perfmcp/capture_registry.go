@@ -107,8 +107,8 @@ func (r *registry) newJobID() string {
 }
 
 // admit gives j the one active slot and reserves j.reserve in the windows.
-// A capture already active is busy, with retry_after its reserved end (at
-// least 1 s); windows that cannot take j.reserve are budget, and then the
+// A capture already active is busy, with retry_after the time to its
+// reserved end, from 1 s to 5 s, and next naming that end; windows that cannot take j.reserve are budget, and then the
 // slot is left as it was and nothing is reserved (PLAN-R3).
 func (r *registry) admit(j *job, now time.Time) *capture.Error {
 	if j.reserve < 0 {
@@ -121,9 +121,11 @@ func (r *registry) admit(j *job, now time.Time) *capture.Error {
 		if res := r.res[a]; res != nil {
 			d = res.d
 		}
-		e := capture.Errorf(capture.CodeBusy, "capture_wait or capture_cancel "+a.id,
+		end := a.created.Add(d)
+		e := capture.Errorf(capture.CodeBusy,
+			fmt.Sprintf("capture_wait or capture_cancel %s; its reserved duration ends by %s", a.id, end.UTC().Format(time.RFC3339)),
 			"capture job %s is running; one capture runs at a time", a.id)
-		e.RetryAfter = max(a.created.Add(d).Sub(now), time.Second)
+		e.RetryAfter = capture.BusyRetry(end.Sub(now))
 		return e
 	}
 	if e := r.win.allow(now, j.reserve, r.lim.WindowCaptures, r.lim.WindowDuration); e != nil {

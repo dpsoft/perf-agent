@@ -17,9 +17,6 @@ import (
 // holder record, so a refused capture can say who is running.
 const lockName = ".lock"
 
-// minRetryAfter is the shortest retry_after a busy answer gives.
-const minRetryAfter = time.Second
-
 // Lease is the captures lock: an exclusive flock(2) on <captures>/.lock.
 // flock locks belong to the open file description, so any process holding
 // a duplicate of File's descriptor keeps the directory locked after this
@@ -79,7 +76,7 @@ func TryLock(dir *os.Root, h Holder) (*Lease, *Error) {
 // busyError reads the holder record from f and describes it.
 func busyError(f *os.File) *Error {
 	e := &Error{Code: CodeBusy, Retryable: true, RetryAfter: minRetryAfter,
-		Next: "retry after the running capture ends"}
+		Next: "retry after retry_after; the holder's end is unknown"}
 	buf := make([]byte, 64<<10)
 	n, _ := f.ReadAt(buf, 0)
 	var h Holder
@@ -103,7 +100,8 @@ func busyError(f *os.File) *Error {
 	}
 	e.Message = fmt.Sprintf("%s by %s, ends by %s", what, who, ends)
 	if !h.Deadline.IsZero() {
-		e.RetryAfter = max(time.Until(h.Deadline), minRetryAfter)
+		e.RetryAfter = BusyRetry(time.Until(h.Deadline))
+		e.Next = "retry after retry_after; the holder ends by " + ends + " at the latest"
 	}
 	return e
 }

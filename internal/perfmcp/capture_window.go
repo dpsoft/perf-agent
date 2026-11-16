@@ -124,8 +124,10 @@ func freedBy(rs []*reservation, need time.Duration) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// budgetError is a window refusal that frees after wait.
+// budgetError is a window refusal that frees after wait, rounded up to
+// whole seconds.
 func budgetError(why string, wait time.Duration) *capture.Error {
+	wait = capture.CeilSecond(wait)
 	e := capture.Errorf(capture.CodeBudget, "retry after "+wait.String(), "%s", why)
 	e.RetryAfter = wait
 	return e

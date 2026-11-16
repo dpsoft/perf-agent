@@ -114,6 +114,28 @@ func Errorf(code Code, next, format string, args ...any) *Error {
 	}
 }
 
+// minRetryAfter and maxBusyRetry bound a busy answer's retry_after: a
+// holder records its worst-case end, which is often far later than its
+// real one, so an agent is told to ask again within maxBusyRetry.
+const (
+	minRetryAfter = time.Second
+	maxBusyRetry  = 5 * time.Second
+)
+
+// BusyRetry is a busy answer's retry_after for a holder with left to its
+// recorded end: left rounded up to whole seconds, from 1 s to 5 s.
+func BusyRetry(left time.Duration) time.Duration {
+	return min(max(CeilSecond(left), minRetryAfter), maxBusyRetry)
+}
+
+// CeilSecond is d rounded up to whole seconds; 0 and less stay 0.
+func CeilSecond(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return (d + time.Second - 1) / time.Second * time.Second
+}
+
 // Survivor is a process that outlived the stop grace.
 type Survivor struct {
 	PID       int

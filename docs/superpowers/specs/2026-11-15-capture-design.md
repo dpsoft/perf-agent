@@ -483,11 +483,11 @@ because a loop branches on it:
 | `invalid_argument` | no | Names the argument and the valid range |
 | `incomparable` | no | A setting differs from the `compare_with` baseline; it names the setting and both values. Drop the argument, or start a new series |
 | `unknown_baseline` | no | No such capture in the series; it lists the series' last ids |
-| `busy` | yes | Another capture holds the captures lock: this process, another stdio server, or an orphaned reaper (CAP-R6b). The message names the holder (server and reaper PIDs, capture id); `retry_after` is its latest end |
+| `busy` | yes | Another capture holds the captures lock: this process, another stdio server, or an orphaned reaper (CAP-R6b). The message names the holder (server and reaper PIDs, capture id); `retry_after` is the time to its recorded end, rounded up to whole seconds, from 1s to at most 5s (a holder records its worst case), and `next` names that latest end (CAP-R89) |
 | `unknown_capture` | no | `capture_wait` or `capture_cancel` named an id this server never started; `capture_list` shows the ids |
 | `target_changed` | yes | The target's credentials, dumpable flag, capabilities or start time changed during the capture; it was discarded (CAP-R1b) |
 | `owner_mismatch` | no | The capture directory belongs to the other server kind (SRV-R5, §6.2) |
-| `budget` | yes | A window limit; `retry_after` is when the window frees |
+| `budget` | yes | A window limit; `retry_after` is when the window frees, rounded up to whole seconds |
 | `disk` | no | `MaxStoredBytes` or `MinFreeBytes` cannot be met even after retention; it names the series using most space |
 | `exists` | no | The final name is taken (M2-R4); pass another `label` |
 | `target_refused` | no | Which rule of §6.3 failed (another uid, setgid, non-dumpable, capabilities, kernel thread) |

@@ -96,6 +96,9 @@ func TestAWaitForACaptureInProgressNamesItsHolder(t *testing.T) {
 		!strings.Contains(a.Holder, fmt.Sprintf("perf-agent-mcp pid %d", os.Getpid())) {
 		t.Fatalf("capture_wait %s with its intent on disk: %s", key, text)
 	}
+	if !strings.Contains(a.Next, "another perf-agent-mcp is running this capture") || !strings.Contains(a.Next, "stop waiting") {
+		t.Errorf("next %q does not say who runs it, or when to stop waiting", a.Next)
+	}
 	if d, err := time.ParseDuration(a.RetryAfter); err != nil || d < time.Second || d > 5*time.Second {
 		t.Errorf("retry_after %q, want 1s to 5s", a.RetryAfter)
 	}
@@ -106,5 +109,38 @@ func TestAWaitForACaptureInProgressNamesItsHolder(t *testing.T) {
 	e.s.historyChanged()
 	if _, text, isErr := waitByID(t, c, key); !isErr || toolErrorOf(t, text).Code != string(capture.CodeDisk) {
 		t.Fatalf("capture_wait %s once its failure manifest is written: %s", key, text)
+	}
+}
+
+// The in_progress answer judges the holder by its server alone, says when
+// a dead server's reaper still ends the capture, and always says when to
+// stop asking: an answer that may repeat (an intent recovery never
+// records, an owner stopped with a stale heartbeat) has an end.
+func TestTheInProgressAnswerSaysWhoAndWhenToStop(t *testing.T) {
+	in := intent{ServerPID: 41, ReaperPID: 42}
+	for _, tc := range []struct {
+		name           string
+		server, reaper bool
+		holder, next   string
+	}{
+		{"server alive", true, true, "perf-agent-mcp pid 41 (reaper pid 42)", "another perf-agent-mcp is running this capture"},
+		{"server alive, reaper gone", true, false, "perf-agent-mcp pid 41 (reaper pid 42)", "another perf-agent-mcp is running this capture"},
+		{"server gone, reaper alive", false, true, "perf-agent-mcp pid 41, which is gone; its reaper pid 42 still runs", "its reaper is ending it"},
+		{"both gone", false, false, "perf-agent-mcp pid 41 (reaper pid 42), which is gone", "and its reaper are gone"},
+	} {
+		ip := &inProgressError{in: in, server: tc.server, reaper: tc.reaper, retry: time.Second, giveUp: "after 2m0s of waiting"}
+		var a waitAnswer
+		if err := json.Unmarshal([]byte(ip.answer("adhoc/001", "adhoc/001").Text), &a); err != nil {
+			t.Fatal(err)
+		}
+		if a.Holder != tc.holder || !strings.Contains(a.Next, tc.next) {
+			t.Errorf("%s: holder %q, next %q; want %q, and next with %q", tc.name, a.Holder, a.Next, tc.holder, tc.next)
+		}
+		if !strings.Contains(a.Next, "if it still answers in_progress after 2m0s of waiting, stop waiting: call capture_list and tell the user") {
+			t.Errorf("%s: next %q has no give-up clause", tc.name, a.Next)
+		}
+		if !tc.server && strings.Contains(a.Next, "another perf-agent-mcp is running") {
+			t.Errorf("%s: next %q says a gone server runs it", tc.name, a.Next)
+		}
 	}
 }

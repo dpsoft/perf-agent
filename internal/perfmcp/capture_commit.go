@@ -138,11 +138,19 @@ var selfStart = sync.OnceValues(func() (uint64, error) {
 // time, still runs (a zombie or an exiting task does not), through the
 // ownerAlive seam.
 func (s *Server) ownerIsAlive(in intent) bool {
+	server, reaper := s.ownerLiveness(in)
+	return server || reaper
+}
+
+// ownerLiveness reports, apart, whether in's server and its reaper still
+// run. The ownerAlive seam judges the owner as a whole: it answers for the
+// server, and the reaper is then not looked at.
+func (s *Server) ownerLiveness(in intent) (server, reaper bool) {
 	if s.ownerAlive != nil {
-		return s.ownerAlive(in)
+		return s.ownerAlive(in), false
 	}
 	p := capture.DefaultProc()
-	return in.ServerPID > 0 && capture.Alive(p, in.ServerPID, in.ServerStart) ||
+	return in.ServerPID > 0 && capture.Alive(p, in.ServerPID, in.ServerStart),
 		in.ReaperPID > 0 && capture.Alive(p, in.ReaperPID, in.ReaperStart)
 }
 

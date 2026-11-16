@@ -529,6 +529,9 @@ func TestARestartRightAfterAKillAnswersTheCaptureInProgress(t *testing.T) {
 		if ip.Capture != "adhoc/001" || ip.Next == "" || !strings.Contains(ip.Holder, fmt.Sprintf("pid %d", a.pid())) {
 			t.Errorf("the answer does not name the capture, what to do, or the dead server pid %d: %s", a.pid(), text)
 		}
+		if !strings.Contains(ip.Holder, fmt.Sprintf("its reaper pid %d still runs", h.ReaperPID)) || strings.Contains(ip.Next, "another perf-agent-mcp is running") {
+			t.Errorf("the answer does not say the server is gone and its reaper %d runs: %s", h.ReaperPID, text)
+		}
 		if reaper.gone() {
 			t.Fatal("the reaper exited while its barrier file exists")
 		}

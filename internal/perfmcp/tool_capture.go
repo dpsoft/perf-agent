@@ -721,7 +721,7 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 	}
 	v, ready, err := l.wait(ctx, d)
 	if ip, ok := errors.AsType[*inProgressError](err); ok {
-		if !ip.live {
+		if !ip.live() {
 			s.wantRecovery()
 		}
 		return ip.answer(asked, key)
@@ -819,25 +819,37 @@ func loadingAnswerNext(id, next string) mcpstdio.Result {
 const statusInProgress = "in_progress"
 
 // inProgressRetry is the retry_after of an in_progress answer when the
-// captures lock names no end for it.
-const inProgressRetry = 5 * time.Second
+// captures lock names no end for it. inProgressSlack is how long past the
+// capture's latest end an in_progress answer is still worth asking again.
+const (
+	inProgressRetry = 5 * time.Second
+	inProgressSlack = time.Minute
+)
 
 // inProgressError is a capture id whose intent is on disk and whose
 // manifest is not: its owner, another process, is writing it, or recovery
 // has yet to record it. It is never kept: the next wait reads the disk
 // again.
 type inProgressError struct {
-	in    intent
-	live  bool
-	retry time.Duration
+	in intent
+	// server and reaper say which of the intent's owner still runs.
+	server, reaper bool
+	retry          time.Duration
+	// giveUp is when to stop asking, as "after ...".
+	giveUp string
 }
 
 func (e *inProgressError) Error() string { return "the capture is in progress" }
 
+// live reports whether the capture's owner, its server or its reaper,
+// still runs: recovery leaves the capture to it.
+func (e *inProgressError) live() bool { return e.server || e.reaper }
+
 // inProgress is capture key's (id's) in-progress state in ser, when its
 // intent is there: whether its owner (by its recorded server and reaper)
-// is alive, and when to ask again, from the captures lock's record when it
-// names this capture.
+// is alive, and when to ask again and when to stop, from the captures
+// lock's record when it names this capture, else from this server's
+// longest capture.
 func (s *Server) inProgress(d *captureDir, ser *os.Root, key string, id int) (*inProgressError, bool) {
 	names, err := readDirNames(ser, ".")
 	if err != nil {
@@ -852,9 +864,15 @@ func (s *Server) inProgress(d *captureDir, ser *os.Root, key string, id int) (*i
 		if err != nil {
 			return nil, false
 		}
-		ip := &inProgressError{in: in, live: s.ownerIsAlive(in), retry: inProgressRetry}
+		c := s.lim.Capture
+		longest := c.StartTimeout + c.MaxDuration + c.FinishTimeout + c.StopGrace
+		ip := &inProgressError{in: in, retry: inProgressRetry,
+			giveUp: fmt.Sprintf("after %v of waiting", capture.CeilSecond(longest+inProgressSlack))}
+		ip.server, ip.reaper = s.ownerLiveness(in)
 		if h, ok := capture.ReadHolder(d.root); ok && h.CaptureID == key && time.Until(h.Deadline) > 0 {
 			ip.retry = capture.BusyRetry(time.Until(h.Deadline))
+			ip.giveUp = fmt.Sprintf("after %s (a minute past the capture's deadline)",
+				h.Deadline.Add(inProgressSlack).UTC().Format(time.RFC3339))
 		}
 		return ip, true
 	}
@@ -862,19 +880,31 @@ func (s *Server) inProgress(d *captureDir, ser *os.Root, key string, id int) (*i
 }
 
 // answer is the in_progress answer for key, asked by asked: the server
-// (and reaper) writing it, and what to do.
+// (and reaper) writing it, and what to do. Only a live server is another
+// perf-agent-mcp running the capture; a dead server's live reaper is
+// still ending it.
 func (e *inProgressError) answer(asked, key string) mcpstdio.Result {
 	holder := fmt.Sprintf("perf-agent-mcp pid %d", e.in.ServerPID)
+	reaper := ""
 	if e.in.ReaperPID > 0 {
-		holder += fmt.Sprintf(" (reaper pid %d)", e.in.ReaperPID)
+		reaper = fmt.Sprintf(" (reaper pid %d)", e.in.ReaperPID)
 	}
-	next := "another perf-agent-mcp is running this capture; call capture_wait again after retry_after: " +
-		"once it is committed or has failed, the answer comes from its manifest"
-	if !e.live {
-		holder += ", which is gone"
-		next = "the server that ran this capture is gone; this server's recovery records it as interrupted once the captures lock is free " +
-			"(a reaper of that server holds it at most until the capture's deadline); call capture_wait again after retry_after"
+	var next string
+	switch {
+	case e.server:
+		holder += reaper
+		next = "another perf-agent-mcp is running this capture; call capture_wait again after retry_after: " +
+			"once it is committed or has failed, the answer comes from its manifest"
+	case e.reaper:
+		holder += fmt.Sprintf(", which is gone; its reaper pid %d still runs", e.in.ReaperPID)
+		next = "the server that ran this capture is gone and its reaper is ending it; this server's recovery records it as interrupted " +
+			"once that reaper releases the captures lock (at most at the capture's deadline); call capture_wait again after retry_after"
+	default:
+		holder += reaper + ", which is gone"
+		next = "the server that ran this capture and its reaper are gone; this server's recovery records it as interrupted " +
+			"once the captures lock is free; call capture_wait again after retry_after"
 	}
+	next += "; if it still answers in_progress " + e.giveUp + ", stop waiting: call capture_list and tell the user"
 	r, _ := answer(struct {
 		ID         string `json:"id"`
 		Capture    string `json:"capture_id"`

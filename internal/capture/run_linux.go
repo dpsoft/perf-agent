@@ -755,7 +755,10 @@ func (r *Run) launched(ev Event) {
 		e = r.execProven(ev.PID, ev.StartTime)
 	}
 	if e != nil {
-		if e.Code == CodeTargetExited || e.Code == CodeTargetNotFound {
+		// A pid gone or not found is the command that ended on its own; a
+		// retryable target_exited (the launcher never ran it) keeps its
+		// own message and verdict.
+		if (e.Code == CodeTargetExited || e.Code == CodeTargetNotFound) && !e.Retryable {
 			e = r.commandEnded(ev.PID, "before it could be profiled: it exited at once, or never ran the command")
 		}
 		r.failStop(e)

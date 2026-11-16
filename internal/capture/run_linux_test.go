@@ -1024,6 +1024,42 @@ func TestExecProofNeedsTheCommandNotTheLauncher(t *testing.T) {
 	}
 }
 
+// launched keeps the exec proof's verdict: a pid still running the
+// launcher stays retryable target_exited, and only a pid that is gone
+// becomes the command that ended on its own.
+func TestLaunchedKeepsARetryableNotStarted(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := capturetest.Workload(t)
+	launch := func(pid int, start uint64) *Error {
+		kills := 0
+		r := testRun(t, &kills)
+		r.spec.Launch, r.spec.SelfID = &LaunchSpec{Path: w}, ourSelf()
+		r.launchers, r.cmdIDs = launcherIDs(self), commandIDs(w)
+		r.launched(Event{Op: EventLaunched, Who: WhoWorkload, PID: pid, StartTime: start})
+		if r.o.Launched {
+			t.Errorf("pid %d: launched although the proof failed", pid)
+		}
+		return r.o.Err
+	}
+	launcher := startChild(t, "sleep")
+	start, err := StartTime(DefaultProc(), launcher.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := launch(launcher.PID, start); errCode(e) != CodeTargetExited || !e.Retryable || !strings.Contains(e.Message, "still runs the launcher") {
+		t.Errorf("a pid still running the launcher: %+v; want retryable target_exited naming the launcher", e)
+	}
+	gone := startChild(t, "sleep")
+	gstart, _ := StartTime(DefaultProc(), gone.PID)
+	_ = gone.reap()
+	if e := launch(gone.PID, gstart); errCode(e) != CodeTargetExited || e.Retryable || !strings.Contains(e.Message, "launched command") {
+		t.Errorf("a gone pid: %+v; want the command that ended, not retryable", e)
+	}
+}
+
 // An error-driven stop records its time: the finish bound counts from it,
 // StoppedBy stays empty (the error is the cause) and Profiled is real.
 func TestRunAFailureStopArmsTheFinishBound(t *testing.T) {

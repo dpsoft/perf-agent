@@ -1335,12 +1335,15 @@ sees an error while capture files are still published.
   and inode cannot be matched, is likewise left and logged.
 - A token temporary whose dev, inode and contents equal the intent's own
   file (a crash between linking the intent and removing its temporary's
-  name) is a second name of the intent, and is removed.
+  name) is a second name of the intent, and is removed. So is an intent
+  temporary or a heartbeat that no rewrite recorded yet but whose
+  contents carry the intent's owner token (an intent with that token, or
+  the token itself): those bytes are only ever written by this server.
 - **Single-syscall windows (CAP-R47).** A crash inside one system call
   of a write, after a new name exists and before any record of it is
   durable, leaves a file nothing can prove: a `.seq` temporary, a
-  heartbeat created but not yet recorded, an intent or manifest
-  temporary, a quarantined `.del-*` name, a staging directory (CAP-R12
+  heartbeat or an intent temporary created but not yet written, a
+  manifest temporary not yet recorded, a quarantined `.del-*` name, a staging directory (CAP-R12
   above), or a temporary of `.owner` in the capture directory itself.
   Each is retained, never deleted without proof, and logged by recovery
   as `orphan_temp`, `orphan_staging` or `left`; `capture_list`'s series

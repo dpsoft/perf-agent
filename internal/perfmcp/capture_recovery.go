@@ -1,6 +1,9 @@
 package perfmcp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -130,18 +133,40 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 			continue
 		}
 		t := s.adopt(d, ser, series, in, self)
-		// A temporary that is a second name of the intent itself (a crash
-		// between linking the intent and removing that name) is proven by
-		// the intent's own identity.
+		// An intent temporary is proven by the intent's own identity (a
+		// second name of it, after a crash between linking the intent and
+		// removing that name), or by holding an intent with this token: a
+		// crash before a rewrite recorded it. Either holds only bytes this
+		// server wrote.
 		for _, tn := range names {
-			if strings.HasPrefix(tn, "."+n+".tmp-"+in.Token[:16]) {
-				alias := self
-				alias.Name = tn
-				if removed, _, err := removeByIdentity(ser, tn, alias); err != nil {
-					return notes, d.writeError(err)
-				} else if removed {
-					claimed[tn] = true
+			if !in.isTemp(t.id, tn) || !strings.HasPrefix(tn, "."+n) {
+				continue
+			}
+			alias := self
+			alias.Name = tn
+			if why, _ := matches(ser, tn, alias); why != "" {
+				var ok bool
+				if alias, ok = proveByToken(ser, tn, in, maxManifestBytes, func(b []byte) bool {
+					var other intent
+					return json.Unmarshal(b, &other) == nil && other.Token == in.Token && other.ID == in.ID && other.Label == in.Label
+				}); !ok {
+					continue
 				}
+			}
+			if removed, _, err := removeByIdentity(ser, tn, alias); err != nil {
+				return notes, d.writeError(err)
+			} else if removed {
+				claimed[tn] = true
+			}
+		}
+		// A heartbeat the intent does not record yet (a crash before the
+		// rewrite that records it) is proven by holding the intent's token.
+		hbName := heartbeatName(t.id, in.Label)
+		if hb := in.Heartbeat; hb == nil || !t.isRecorded(*hb) {
+			if id, ok := proveByToken(ser, hbName, in, int64(len(in.Token)+1), func(b []byte) bool {
+				return string(b) == in.Token+"\n"
+			}); ok {
+				t.in.Heartbeat = &id
 			}
 		}
 		which := formatID(t.id) + "-" + in.Label
@@ -206,6 +231,29 @@ const lockFile = ".lock"
 
 // interruptedNote is the note of a manifest recovery writes.
 const interruptedNote = "the server running this capture ended before it finished; recovery removed what it had written"
+
+// proveByToken is name's identity when it is a regular file with one link,
+// at most limit bytes, whose contents pass ours: bytes carrying in's
+// owner token, which only this server wrote. ok is false otherwise.
+func proveByToken(ser *os.Root, name string, in intent, limit int64, ours func([]byte) bool) (fileIdentity, bool) {
+	b, fi, err := readSmall(ser, name, limit)
+	if err != nil || in.Token == "" {
+		return fileIdentity{}, false
+	}
+	if st, _ := statOf(fi); st.nlink != 1 || !ours(b) {
+		return fileIdentity{}, false
+	}
+	id := identityOf(name, fi)
+	sum := sha256.Sum256(b)
+	id.SHA256 = hex.EncodeToString(sum[:])
+	return id, true
+}
+
+// isRecorded reports whether the file id records is there.
+func (t *captureTxn) isRecorded(id fileIdentity) bool {
+	why, err := matches(t.ser, id.Name, id)
+	return err == nil && why == ""
+}
 
 // adopt is the transaction of an intent another (gone) owner wrote, for
 // recovery to finish or undo. ser stays recovery's.

@@ -113,6 +113,57 @@ func TestTheHeartbeatGoesBeforeTheIntent(t *testing.T) {
 		})
 	}
 
+	// A crash after the heartbeat is written and before the intent records
+	// it: the heartbeat holds the intent's token, which proves it.
+	t.Run("before-the-record", func(t *testing.T) {
+		s, d, clk := newCaptureServer(t)
+		s.writeErr = failOpAt("intent rewrite", 1, errCrash)
+		r := drive(t, s, d, capCase{})
+		s.writeErr = nil
+		if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", heartbeatName(1, "run"))); err != nil || !r.intent {
+			t.Fatalf("no heartbeat to prove: %v (intent %v)", err, r.intent)
+		}
+		notes := crashRecover(t, s, d, clk)
+		// The rewrite's own temporary was created empty when the crash
+		// came, and proves nothing: the one leftover of that window.
+		for _, n := range notes {
+			if !strings.HasPrefix(n, "orphan_temp adhoc/."+intentName(1, "run")+".tmp-") && (strings.HasPrefix(n, "orphan_") || strings.HasPrefix(n, "left ")) {
+				t.Errorf("left in place: %s", n)
+			}
+		}
+		invariant(t, d, notes)
+	})
+
+	// An intent temporary a crash left after writing it holds the intent
+	// with its token, which proves it.
+	t.Run("written-intent-temp", func(t *testing.T) {
+		s, d, clk, r := crashedIntent(t)
+		ser, _ := d.root.OpenRoot("adhoc")
+		defer func() { _ = ser.Close() }()
+		b, err := ser.ReadFile(intentName(1, "run"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmp := "." + intentName(1, "run") + ".tmp-" + r.txn.in.Token[:16] + "-1"
+		writeFile(t, ser, tmp, string(b))
+		notes := crashRecover(t, s, d, clk)
+		noOrphans(t, notes)
+		invariant(t, d, notes)
+	})
+
+	// An empty file at the heartbeat's name proves nothing and stays.
+	t.Run("empty-heartbeat", func(t *testing.T) {
+		s, d, clk := newCaptureServer(t)
+		s.writeErr = failOp("heartbeat", errCrash)
+		drive(t, s, d, capCase{})
+		s.writeErr = nil
+		notes := crashRecover(t, s, d, clk)
+		if !noted(notes, "left", heartbeatName(1, "run")) {
+			t.Fatalf("notes %q", notes)
+		}
+		invariant(t, d, notes, heartbeatName(1, "run"))
+	})
+
 	// A crash after the intent and before the heartbeat leaves an intent
 	// judged by its owner's liveness alone.
 	t.Run("before-the-heartbeat", func(t *testing.T) {

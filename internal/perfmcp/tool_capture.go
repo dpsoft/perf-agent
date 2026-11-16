@@ -484,6 +484,7 @@ func endedEarly(a jobAlias) mcpstdio.Result {
 // each change of state and every progressEvery; a client that asked for
 // none gets none.
 func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration) mcpstdio.Result {
+	deadline := time.Now().Add(d)
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	// The capture's own phases (attaching, profiling, finishing) change
@@ -495,7 +496,7 @@ func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration) mcpstdio.
 	for {
 		v, settled, changed := j.watch()
 		if settled {
-			return s.jobAnswer(j)
+			return s.settledAnswer(ctx, j, deadline)
 		}
 		if m := v.Status + " " + v.Phase; m != mark || time.Since(sent) >= progressEvery {
 			p.send(v)
@@ -505,21 +506,44 @@ func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration) mcpstdio.
 		case <-changed:
 		case <-poll.C:
 		case <-timer.C:
-			return s.stateAnswer(j)
+			return s.stateAnswer(ctx, j, deadline)
 		case <-ctx.Done():
-			return s.stateAnswer(j)
+			return s.stateAnswer(ctx, j, deadline)
 		}
 	}
 }
 
 // stateAnswer is j's answer when a wait ends first: its state, or, when it
 // settled at that very moment, its result or error.
-func (s *Server) stateAnswer(j *job) mcpstdio.Result {
+func (s *Server) stateAnswer(ctx context.Context, j *job, deadline time.Time) mcpstdio.Result {
 	v, settled, _ := j.watch()
 	if settled {
-		return s.jobAnswer(j)
+		return s.settledAnswer(ctx, j, deadline)
 	}
 	return viewAnswer(v)
+}
+
+// settledAnswer is a settled job's answer, given from memory only while
+// a done capture's manifest is still there: removed (by another server's
+// retention, or a person), the job is forgotten and the capture unknown.
+// The re-check never holds the call past its deadline: when it cannot
+// tell in time, the answer is loading.
+func (s *Server) settledAnswer(ctx context.Context, j *job, deadline time.Time) mcpstdio.Result {
+	j.mu.Lock()
+	status, key := j.status, j.captureID
+	j.mu.Unlock()
+	if status != jobDone || key == "" {
+		return s.jobAnswer(j)
+	}
+	gone, ready := s.recheck(ctx, key, j.req.Label, time.Until(deadline))
+	switch {
+	case !ready:
+		return loadingAnswer(key)
+	case gone:
+		s.registry.forget(key)
+		return toolError(unknownCapture(key, "its manifest is gone: another server's retention, or a person, removed it"), nil)
+	}
+	return s.jobAnswer(j)
 }
 
 // progress sends a wait's progress notifications: progress is the
@@ -652,7 +676,11 @@ var errNoCapture = errors.New("no such capture")
 // at most d. One not read by then, or a full pool, is loading.
 func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.Duration) mcpstdio.Result {
 	if h, ok := s.registry.historical(key); ok {
-		if !s.manifestGone(key, h.m) {
+		gone, ready := s.recheck(ctx, key, h.m.Label, d)
+		switch {
+		case !ready:
+			return loadingAnswer(key)
+		case !gone:
 			return s.historicalAnswer(key, jobID, h)
 		}
 		// Another server's retention, or a person, removed it.
@@ -674,10 +702,34 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 	return s.historicalAnswer(key, jobID, v.(*historical))
 }
 
-// manifestGone reports, with one Lstat, that capture key's manifest m is
-// no longer in its series, so an answer kept in memory must not be given.
-// A check that cannot tell says it is there.
-func (s *Server) manifestGone(key string, m manifest) bool {
+// recheckWait bounds the re-check of a manifest before an answer from
+// memory: one Lstat, which only a hung filesystem makes slow.
+const recheckWait = time.Second
+
+// recheck reports whether capture key's manifest (with label) is gone. It
+// runs on the lookup pool, shared by the calls that ask at once, and waits
+// at most min(d, recheckWait): ready is false when it could not tell in
+// time, or the pool is full, and the caller answers loading.
+func (s *Server) recheck(ctx context.Context, key, label string, d time.Duration) (gone, ready bool) {
+	l, ok := s.lookups.get("gone:"+key, func() (any, error) { return s.manifestGone(key, label), nil })
+	if !ok {
+		return false, false
+	}
+	v, ready, _ := l.wait(ctx, min(d, recheckWait))
+	if !ready {
+		return false, false
+	}
+	gone, _ = v.(bool)
+	return gone, true
+}
+
+// manifestGone reports, with one Lstat, that capture key's manifest (with
+// label) is no longer in its series, so an answer kept in memory must not
+// be given. A check that cannot tell says it is there.
+func (s *Server) manifestGone(key, label string) bool {
+	if s.lookupHook != nil {
+		s.lookupHook("gone:" + key)
+	}
 	series, id, ok := splitCaptureKey(key)
 	if !ok {
 		return false
@@ -687,7 +739,7 @@ func (s *Server) manifestGone(key string, m manifest) bool {
 		return errors.Is(err, fs.ErrNotExist)
 	}
 	defer d.close()
-	_, err = d.root.Lstat(filepath.Join(series, manifestName(id, m.Label)))
+	_, err = d.root.Lstat(filepath.Join(series, manifestName(id, label)))
 	return errors.Is(err, fs.ErrNotExist)
 }
 

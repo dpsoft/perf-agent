@@ -1438,6 +1438,68 @@ func TestRetentionMarksTheChangeBeforeItForgets(t *testing.T) {
 	}
 }
 
+// The re-check of a kept answer's manifest never holds the dispatcher: a
+// re-check that hangs (a hung mount) answers loading within its bound,
+// and the next call is answered at once.
+func TestAHungManifestRecheckAnswersLoading(t *testing.T) {
+	var block atomic.Bool
+	release := make(chan struct{})
+	e := newJobEnv(t, jobOpts{setup: func(s *Server) {
+		s.lookupHook = func(k string) {
+			if strings.HasPrefix(k, "gone:") && block.Load() {
+				select {
+				case <-release:
+				case <-time.After(10 * time.Second):
+				}
+			}
+		}
+	}})
+	t.Cleanup(func() { close(release) })
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	c := e.serve()
+	waitResult(t, c, "s/001")
+	block.Store(true)
+	sent := time.Now()
+	text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "30s"})
+	if took := time.Since(sent); took > 3*time.Second {
+		t.Errorf("the wait took %v with its re-check hung", took)
+	}
+	if isErr || !strings.Contains(text, `"status":"loading"`) {
+		t.Errorf("the wait answered %s", text)
+	}
+	sent = time.Now()
+	c.callOK("capture_list", map[string]any{"series": "s"}, nil)
+	if took := time.Since(sent); took > 3*time.Second {
+		t.Errorf("the next call took %v", took)
+	}
+}
+
+// The server's own finished job is answered from memory only while its
+// manifest is there: removed by another server's retention, it is unknown
+// by capture id and by job id.
+func TestAnOwnJobWhoseManifestIsGoneIsUnknown(t *testing.T) {
+	e, c := newCapEnv(t, jobOpts{})
+	job := startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"})
+	res, _ := waitResult(t, c, job)
+	ser := filepath.Join(e.profiles, defaultStdioCaptures, "s")
+	names, err := filepath.Glob(filepath.Join(ser, res.Capture.ID+"-*"))
+	if err != nil || len(names) == 0 {
+		t.Fatalf("the capture's files: %v %v", names, err)
+	}
+	for _, n := range names {
+		if err := os.Remove(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"s/" + res.Capture.ID, job} {
+		text, isErr := c.call("capture_wait", map[string]any{"id": id, "timeout": "5s"})
+		if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+			t.Errorf("capture_wait %s answered %s", id, text)
+		}
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

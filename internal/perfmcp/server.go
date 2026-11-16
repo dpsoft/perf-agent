@@ -85,6 +85,9 @@ type Server struct {
 	// selfStartTime reads this process's start time for its intents (nil:
 	// /proc).
 	selfStartTime func() (uint64, error)
+	// captureProtect, when set, names files retention must keep besides
+	// the ones this server knows of (serve's publications); nil in stdio.
+	captureProtect func() []fileKey
 	// ownerSeen is the capture directory's owner kind once it was read,
 	// so a mismatch is refused without I/O.
 	ownerSeen atomic.Pointer[string]

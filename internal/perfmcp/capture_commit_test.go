@@ -54,6 +54,9 @@ type capCase struct {
 	// content overrides the bytes written for a staging file; nil content
 	// means the file is not written at all.
 	content map[string][]byte
+	// meta is what the job knows of the capture for its manifest (its
+	// start, keep and compare_with); nil is a plain ten-second capture.
+	meta *manifest
 }
 
 // capRun is what drive saw.
@@ -171,7 +174,11 @@ func drive(t *testing.T, s *Server, d *captureDir, c capCase) (r capRun) {
 			t.Fatal(err)
 		}
 	}
-	r.committed, r.err = txn.finish(manifest{StoppedBy: "duration", ProfiledDuration: "10s"}, c.dec)
+	m := manifest{StoppedBy: "duration", ProfiledDuration: "10s"}
+	if c.meta != nil {
+		m = *c.meta
+	}
+	r.committed, r.err = txn.finish(m, c.dec)
 	return r
 }
 

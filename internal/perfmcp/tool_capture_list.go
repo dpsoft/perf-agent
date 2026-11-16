@@ -128,6 +128,8 @@ type listAnswer struct {
 	InProgress *int          `json:"in_progress,omitzero"`
 	Warnings   []string      `json:"warnings,omitzero"`
 	Loading    bool          `json:"loading,omitzero"`
+	// Next says what to do while the history is loading.
+	Next string `json:"next,omitzero"`
 	// ReadAt is when the history answered was read, when it is an earlier
 	// read's because this call's did not finish in time.
 	ReadAt     string `json:"read_at,omitzero"`
@@ -191,7 +193,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	h, asOf, err := s.history(ctx, series)
 	switch {
 	case errors.Is(err, errLoading):
-		out.Loading, out.RetryAfter = true, loadingRetry.String()
+		out.Loading, out.RetryAfter, out.Next = true, loadingRetry.String(), loadingNext
 		return answer(out)
 	case err != nil:
 		out.Warnings = append(out.Warnings, "the history cannot be read: "+causeText(err))

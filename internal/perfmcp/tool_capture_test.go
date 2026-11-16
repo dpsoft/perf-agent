@@ -569,16 +569,17 @@ func TestCaptureCancelUnknownIDDoesNoIO(t *testing.T) {
 
 // listing is capture_list's answer as the tests read it.
 type listing struct {
-	Active   string `json:"active"`
-	Jobs     []listJob
-	Series   []seriesRow `json:"series"`
-	Captures []listRow   `json:"captures"`
-	Stranded []strandedRow
-	Loading  bool   `json:"loading"`
-	Retry    string `json:"retry_after"`
-	Warnings []string
-	Left     int    `json:"leftovers"`
-	Next     string `json:"next_cursor"`
+	Active      string `json:"active"`
+	Jobs        []listJob
+	Series      []seriesRow `json:"series"`
+	Captures    []listRow   `json:"captures"`
+	Stranded    []strandedRow
+	Loading     bool   `json:"loading"`
+	LoadingNext string `json:"next"`
+	Retry       string `json:"retry_after"`
+	Warnings    []string
+	Left        int    `json:"leftovers"`
+	Next        string `json:"next_cursor"`
 }
 
 // The running capture is listed first, ahead of the history read from
@@ -1083,8 +1084,8 @@ func TestCaptureListConvergesWhenTheReadIsSlow(t *testing.T) {
 	c := e.serve()
 	var first listing
 	c.callOK("capture_list", map[string]any{"series": "s"}, &first)
-	if !first.Loading {
-		t.Fatalf("a 300ms read answered within 100ms: %+v", first)
+	if !first.Loading || first.LoadingNext == "" {
+		t.Fatalf("a 300ms read answered within 100ms, or loading without a next: %+v", first)
 	}
 	time.Sleep(400 * time.Millisecond)
 	// Every later call answers, however often the agent calls: with a

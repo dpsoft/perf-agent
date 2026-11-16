@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A second, long-lived binary, `perf-agent-mcp-serve`, gives the human layer one loopback server. It serves the M2b live page and speaks MCP over Streamable HTTP behind a bearer token, so several Claude Code and Codex sessions share one engine and one page. The user's clicks reach agents through an inbox they read with `page_state`. The plain stdio `perf-agent-mcp` goes back to linking no networking.
+**Goal:** A second, long-lived binary, `perf-agent-hub`, gives the human layer one loopback server. It serves the M2b live page and speaks MCP over Streamable HTTP behind a bearer token, so several Claude Code and Codex sessions share one engine and one page. The user's clicks reach agents through an inbox they read with `page_state`. The plain stdio `perf-agent-mcp` goes back to linking no networking.
 
 **Architecture:**
 - **`internal/perfmcp`** loses every network import. It keeps:
@@ -15,7 +15,7 @@
 - **`internal/mcphttp`** (new) is the Streamable HTTP binding over `mcpstdio`'s exported per-message API. It holds the sessions, the bounded ingress, the admission classes, the in-flight table that scopes cancellation, and the deadlines.
 - **`internal/livehttp`** gains `Front`, `MCPGuard` and `InboxGuard`.
 - **`internal/mcpflags`** (new) holds the flag parsing that both binaries share.
-- **`cmd/perf-agent-mcp-serve`** (new) wires it all together. It owns the runtime directory, the lock, the tokens, the one listener and the shutdown order. It also hosts the capture jobs, with page publication of their results.
+- **`cmd/perf-agent-hub`** (new) wires it all together. It owns the runtime directory, the lock, the tokens, the one listener and the shutdown order. It also hosts the capture jobs, with page publication of their results.
 
 **Tech Stack:** Go 1.26 standard library only (`net/http`, `net/netip`, `crypto/subtle`, `crypto/rand`, `syscall.Flock`, `sync/atomic`, `os.Root`). Tests may use `golang.org/x/sys/unix`, as the existing tests do. No new module.
 
@@ -37,7 +37,7 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 
 | # | Spec text | Shipped | Plan |
 |---|---|---|---|
-| 1 | §2, §9, SRV-R5: the `.owner` writer kinds and the `captures-serve` default are to be built, with an error "naming the owner and the other default" | Built in capture. `.owner` holds `{kind, format: 1}` and is written no-replace by `openCaptureDir`. `CaptureConfig.Owner` exists, and the default is `captures-serve` for serve. `owner_mismatch` is synchronous once cached, otherwise async. Its text names the kinds and says "give this server its own directory with --captures" | Serve passes `Owner: "serve"` and no `Dir`, and builds nothing new. Task 13 adds one binary-level test; the docs name both defaults |
+| 1 | §2, §9, SRV-R5: the `.owner` writer kinds and the `captures-hub` default are to be built, with an error "naming the owner and the other default" | Built in capture. `.owner` holds `{kind, format: 1}` and is written no-replace by `openCaptureDir`. `CaptureConfig.Owner` exists, and the default is `captures-hub` for serve. `owner_mismatch` is synchronous once cached, otherwise async. Its text names the kinds and says "give this server its own directory with --captures" | The hub passes `Owner: "hub"` and no `Dir`. Task 5 renames the shipped constants (`ownerServe` "serve" → `ownerHub` "hub", `defaultServeCaptures` "captures-serve" → "captures-hub"; no released build ever wrote "serve") and the owner_mismatch text names the binary through `Config.Command`. Task 13 adds one binary-level test; the docs name both defaults |
 | 2 | §2, §D7: the job takes the lease "before any filesystem side effect", so a cross-process `busy` job changed nothing | `<captures>` (0700) and `.owner` are created **before** the lease, because `.lock` lives inside the directory | The difference is moot here: another process can only hold the lease once that directory and its `.owner` exist. Task 13 asserts that serve 2 creates **no entry at all**, comparing the directory tree before and after |
 | 3 | §2, §D7: "a restarted serve refuses capture, naming the reaper's pid … until the reaper has reaped both children" | `capture` is accepted, and the job fails with `busy` naming the holder. `retry_after` is min(remaining, 5 s) (CAP-R89). A wait by capture id whose intent is on disk answers `in_progress` with `holder` (CAP-R84). A skipped start pass is re-armed (CAP-R87). `Run` waits ≤ 1 s for the reaper (CAP-R79) | Task 13's crash test expects these shapes: `accepted`, then a `busy` job failure, `in_progress` naming the dead server's reaper, and finally `interrupted`, retryable |
 | 4 | §D1.2: stop order is listener, hub, kill captures, 1 s grace, files | `KillCaptures` must run **first** on every signal path. It never signals the reaper, only closes its command pipe (CAP-R20), and `Close` then skips its job wait. Shutdown log lines are bounded at 100 ms | Task 10's shutdown order: `KillCaptures`, hub `Close`, transport `Close` (which cancels the calls' `Lifetime` context, so a long `capture_wait` or engine wait answers at once), `http.Server.Shutdown` (1 s, for calls that ignore their context), perfmcp `Close`, then the files are removed. Logs on that path go through `logBounded` |
@@ -62,8 +62,8 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 - **Every task ends green, with no forward dependency.** A task declares every type, helper, scan rule and test expectation that its own code first uses. Each task's verification step runs, besides its own tests, the commands below, covering each listed package once it exists:
 
   ```bash
-  go test -race ./internal/... ./cmd/perf-agent-mcp/ ./cmd/perf-agent-mcp-serve/
-  GOOS=darwin go build ./internal/... ./cmd/perf-agent-mcp/ ./cmd/perf-agent-mcp-serve/
+  go test -race ./internal/... ./cmd/perf-agent-mcp/ ./cmd/perf-agent-hub/
+  GOOS=darwin go build ./internal/... ./cmd/perf-agent-mcp/ ./cmd/perf-agent-hub/
   ```
 
   No existing guard is weakened to get there. A test that moves keeps its name, or the task names the test that replaces it.
@@ -83,7 +83,7 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 - **Loopback only [user, M2b-R7, decision 8.2].**
   - The host is always `127.0.0.1`. `--port` is the only address flag; there is no `--addr`, `--host` or `--listen`.
   - There is no remote use, and the docs never describe SSH forwarding.
-  - `livehttp.Listen` stays the one listening call. Only `cmd/perf-agent-mcp-serve` calls it.
+  - `livehttp.Listen` stays the one listening call. Only `cmd/perf-agent-hub` calls it.
   - No client networking anywhere: no dial, no resolver and no HTTP client in non-test code.
 - **Secrets.**
   - The MCP token and the page token are each 32 random bytes in base64url, rotated at every start.
@@ -110,7 +110,7 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
   - Claude Code is driven only through `claude -p --mcp-config <scratch json> --strict-mcp-config`.
   - Codex (codex-cli is installed) is driven through `codex exec` with `-c mcp_servers.perf-agent-live.*` overrides. If those cannot express the header helper, or cannot keep the user's own servers out, the Codex smoke is a manual step, recorded as such.
 - **Commits.**
-  - Package prefixes: `mcpflags:`, `perfmcp:`, `perfpage:`, `livehttp:`, `mcpstdio:`, `mcphttp:`, `flamegraph:`, `perf-agent-mcp:`, `perf-agent-mcp-serve:`, `docs:`.
+  - Package prefixes: `mcpflags:`, `perfmcp:`, `perfpage:`, `livehttp:`, `mcpstdio:`, `mcphttp:`, `flamegraph:`, `perf-agent-mcp:`, `perf-agent-hub:`, `docs:`.
   - No Co-Authored-By, and never commit `CLAUDE.md`.
   - Push only in Task 15, as a draft PR. **Never merge.**
 - **Model routing.** Tasks 2, 6, 7, 12 and 13 are load-bearing: the package split, the transport and capture hosting. Route them, and their reviews, to opus. Every task's commit range also goes to the second reviewer through Workforce; message bodies with code go through a quoted heredoc file.
@@ -123,10 +123,10 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 
    Test in Task 6 (`TestAnOldSessionIs404AndAnOldTokenIs401AfterARestart`).
 2. **`Accept` and `Content-Type` headers as real clients write them:** `application/json;q=0.9, text/event-stream`, `Application/JSON; charset=utf-8`, `*/*`, and a repeated `Accept` header. Expected: parsed as media ranges. Wildcards and parameters are accepted; a range with `q=0` is not acceptable. A POST whose `Accept` covers both types passes. Test in Task 3 (`TestAcceptAndContentTypeAreParsedAsMediaRanges`).
-3. **`perf-agent-mcp-serve token` when no server runs**, including a stale `mcp-token` left by a SIGKILLed server. Expected: exit 1, the reason on stderr, and **nothing on stdout**, so a client sends no stale header and shows "failed to connect". Test in Task 10 (`TestTokenWithoutARunningServerPrintsNothing`).
-4. **The default port is taken**, by another program or by a stale `serve.json` from a killed server. Expected:
+3. **`perf-agent-hub token` when no server runs**, including a stale `mcp-token` left by a SIGKILLed server. Expected: exit 1, the reason on stderr, and **nothing on stdout**, so a client sends no stale header and shows "failed to connect". Test in Task 10 (`TestTokenWithoutARunningServerPrintsNothing`).
+4. **The default port is taken**, by another program or by a stale `hub.json` from a killed server. Expected:
    - a busy port exits 1, naming the port and `--port`;
-   - a stale `serve.json` with the lock free never blocks a start: it is replaced.
+   - a stale `hub.json` with the lock free never blocks a start: it is replaced.
 
    Tests in Task 10 (`TestABusyPortNamesItAndTheFlag`, `TestAStaleServeJSONDoesNotBlockStart`).
 5. **A `page_state` cursor kept across a serve restart.** Ask ids would restart at `i1`, and an old cursor `i40` would hide every new ask. Expected: ids carry a per-process nonce of 8 hex digits (`i7-3f9a01c2`). A cursor from another process returns every retained ask, with a note saying so. Test in Task 8 (`TestACursorFromAnEarlierServerReturnsEveryRetainedAsk`).
@@ -141,7 +141,7 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 |---|---|---|
 | Default port (§8.1) | **7341** (`DefaultPort`). It sits in the 7284–7364 block, unassigned in the IANA registry as shipped in `/etc/services` (registry date 2021-01-19). The implementer re-checks the current IANA registry and records the check in the ledger | A fixed URL in client configs (§D2.3) |
 | `MaxOpenHandles` (§8.2) | 32 in serve, set by `mcpflags.Serve` before `--limit`; 8 in stdio | Several agents share one store |
-| Transport limits | `Limits.Serve ServeLimits`: `MaxSessions` 32, `MaxIngressReaders` 16, `MaxIngressBytes` 8 MiB, `IngressBodyTimeout` 2 s, `MaxControlInFlight` 32, `MaxPageStateInFlight` 4, `MaxCalls` 16, `MaxCallsPerSession` 4, `MaxRequestBytes` 16 MiB, `MaxInboxEntries` 32. `--limit Serve.X=…` sets them. stdio refuses `Serve.*` names, saying they are perf-agent-mcp-serve's | `--limit` reflects over `Limits`. A flat field would appear in stdio with no effect |
+| Transport limits | `Limits.Hub ServeLimits`: `MaxSessions` 32, `MaxIngressReaders` 16, `MaxIngressBytes` 8 MiB, `IngressBodyTimeout` 2 s, `MaxControlInFlight` 32, `MaxPageStateInFlight` 4, `MaxCalls` 16, `MaxCallsPerSession` 4, `MaxRequestBytes` 16 MiB, `MaxInboxEntries` 32. `--limit Serve.X=…` sets them. stdio refuses `Serve.*` names, saying they are perf-agent-hub's | `--limit` reflects over `Limits`. A flat field would appear in stdio with no effect |
 | `MaxEngineWait` | A flat `Limits` field, 45 s by default and at most 55 s. It applies to tool calls in both binaries; in stdio it is reachable only behind its own capture's derivations | Under Codex's 60 s, and with no behaviour change in practice for stdio |
 | Validation | Refused at start-up, naming both fields: `MaxCallsPerSession > MaxCalls`, `MaxIngressBytes < MaxMessageBytes`, `MaxRequestBytes < MaxMessageBytes`, `IngressBodyTimeout > 30s`, `MaxEngineWait > 55s` | Each otherwise makes a cap unreachable or a call unanswerable |
 | Body read deadline | `IngressBodyTimeout` (2 s), not §D2.5's 30 s | SRV-R4c came later and is the stricter rule |
@@ -153,7 +153,7 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 | Client label | `clientInfo.name`: at most 64 bytes of printable ASCII (0x20–0x7e); otherwise, or when absent, `client` | §D2.2 |
 | Engine holder text | `<Command> is busy with <tool> from <label> (running <N>s); call again`. The holder's fields sit under the engine's own mutex, set on acquire and cleared on release, so the uncontended path allocates nothing. A capture job holds as `capture <capture id or job id>`, and maintenance as `capture retention`; an empty label reads `another session` | §D2.4 |
 | Test seam for the engine | `Config.HoldEngine func(tool string)`, called with the engine held, before a tool's handler; nil in production | The cmd tests must hold the engine across processes |
-| Test seam for the reaper | None is exported. The deterministic "a dead serve's reaper still holds the lease" case runs in perfmcp's existing process harness (`procserver_test.go`, which already sets `reaperPause` from its JSON config) with `Owner: "serve"`. Task 13's binary-level crash test needs no pause: it asserts only what holds whenever the reaper lets go | A test-only field in production config is a seam an operator could set |
+| Test seam for the reaper | None is exported. The deterministic "a dead serve's reaper still holds the lease" case runs in perfmcp's existing process harness (`procserver_test.go`, which already sets `reaperPause` from its JSON config) with `Owner: "hub"`. Task 13's binary-level crash test needs no pause: it asserts only what holds whenever the reaper lets go | A test-only field in production config is a seam an operator could set |
 | perfpage tests | They drive a real `perfmcp.Server` through `Serve` over an `io.Pipe`, with a small JSON-RPC client in `harness_test.go`. They build fixtures from `pmfixture` | No import cycle and no unexported access |
 | Tests that read engine internals | They stay in perfmcp and are rewritten against `PageView` | The routes move; the computations do not |
 | Ask ids | `i<N>-<8 hex nonce>` | Review Focus 5. With 4 digits, a restart reuses the nonce once in 65 536 and silently hides asks |
@@ -164,8 +164,8 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 | Publication title | `<series>/NNN-<label> · <comm> (<pid>) · <mode> · <profiled_duration>`, cut to `Explain.MaxTitleBytes` | The capture design's example |
 | A publication failure | `derived: "failed"`, with `derive_error` starting `publication: `. The recipe includes the page step. Files are never touched | §D2.5 |
 | The binary's name in agent-visible text | `Config.Command` (default `perf-agent-mcp`), declared in Task 5. Every text that tells the user to start or restart the server names it: `serverInfo.Name`, `captureDisabledText`, the page tools' texts, the busy text, and the capture `next` and advice strings (about 25: `capture_layout.go`, `capture_wire.go`, `capture_commit.go`, `tool_capture.go`). Text that only describes another process ("by perf-agent-mcp pid N") keeps the family name. This touches capture code, which is AI layer and may change | Otherwise serve points agents at the wrong binary |
-| Runtime files | Written through `os.Root` on the runtime directory as a temporary file plus rename, 0600. `serve.lock` is never removed. `serve.json` integers are JSON numbers (it is not MCP wire) | Readers never see a half-written token |
-| The `token` subcommand | `token --port N` (or `--url URL`) prints only while the lock is held (a `LOCK_SH|LOCK_NB` probe fails) **and** N equals `serve.json`'s port. Otherwise it exits 1 and prints nothing. The documented client configs pass the port | Review Focus 3 and 7: a squatter on a stale port never gets the token |
+| Runtime files | Written through `os.Root` on the runtime directory as a temporary file plus rename, 0600. `serve.lock` is never removed. `hub.json` integers are JSON numbers (it is not MCP wire) | Readers never see a half-written token |
+| The `token` subcommand | `token --port N` (or `--url URL`) prints only while the lock is held (a `LOCK_SH|LOCK_NB` probe fails) **and** N equals `hub.json`'s port. Otherwise it exits 1 and prints nothing. The documented client configs pass the port | Review Focus 3 and 7: a squatter on a stale port never gets the token |
 | Stale runtime files | Removed right after the lock is taken, before anything else starts | A helper must never print a dead server's token while the new one starts |
 
 ## File structure
@@ -181,10 +181,10 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 | `internal/mcphttp/{ingress.go,admit.go}` | ingress budget, classes and caps | 7 |
 | `internal/perfmcp/{statebus.go,inbox.go,tool_page_state.go}`, `internal/perfpage/inbox.go`, `internal/flamegraph/{live.js,liveassets_test.go}` | the envelope (and `live.js` reading it), inbox, `page_state` | 8 |
 | `internal/flamegraph/{live.js,livepage.html,live.css,liveassets_test.go}` | page reports, chip, toast, inbox count | 9 |
-| `cmd/perf-agent-mcp-serve/{main.go,serve.go,runtimedir.go,main_test.go,runtimedir_test.go}` | the binary | 10 |
-| `cmd/perf-agent-mcp-serve/{netscan_test.go,sockets_linux_test.go,link_test.go,chrome_test.go}`, `cmd/perf-agent-mcp/main_test.go` | the network promises, moved; end-to-end page | 11 |
+| `cmd/perf-agent-hub/{main.go,serve.go,runtimedir.go,main_test.go,runtimedir_test.go}` | the binary | 10 |
+| `cmd/perf-agent-hub/{netscan_test.go,sockets_linux_test.go,link_test.go,chrome_test.go}`, `cmd/perf-agent-mcp/main_test.go` | the network promises, moved; end-to-end page | 11 |
 | `internal/perfmcp/{capture_publish.go,capture_compare.go,capture_run.go,tool_capture.go,tool_capture_list.go,procserver_test.go}` | capture hosting: publication, `show`, protect, recipe, `by`; the dead-reaper case | 12 |
-| `cmd/perf-agent-mcp-serve/capture_linux_test.go` | serve-level capture and crash tests | 13 |
+| `cmd/perf-agent-hub/capture_linux_test.go` | serve-level capture and crash tests | 13 |
 | `docs/mcp.md`, `internal/perfmcp/guide.md`, `guide.go`, `skills/perf-agent-mcp/SKILL.md`, `CHANGELOG.md`, `docs/superpowers/specs/2026-11-15-local-server-design.md` | docs; spec amendments | 14 |
 
 ---
@@ -198,13 +198,13 @@ Rows 1–17 are the places where the serve spec assumed something about capture 
 **Interfaces:**
 - Consumes: `perfmcp.Config`, `perfmcp.CaptureConfig`, `perfmcp.DefaultLimits`.
 - Produces:
-  - `type Kind string`, with `const Stdio Kind = "stdio"` and `const Serve Kind = "serve"`.
-  - `func Register(fs *flag.FlagSet, kind Kind) *Values` registers every flag the stdio command has today: `--profiles`, `--source`, `--source-manifest`, `--source-git`, `--output`, `--limit`, `--perf-agent`, `--captures`, `--capture-command`, `--capture-ttl`, `--gpu-shim` and `--version`. The usage texts are byte-identical for `Stdio`. For `Serve`, the `--captures` default reads `<profiles>/captures-serve`.
+  - `type Kind string`, with `const Stdio Kind = "stdio"` and `const Hub Kind = "hub"`.
+  - `func Register(fs *flag.FlagSet, kind Kind) *Values` registers every flag the stdio command has today: `--profiles`, `--source`, `--source-manifest`, `--source-git`, `--output`, `--limit`, `--perf-agent`, `--captures`, `--capture-command`, `--capture-ttl`, `--gpu-shim` and `--version`. The usage texts are byte-identical for `Stdio`. For `Serve`, the `--captures` default reads `<profiles>/captures-hub`.
   - `func (v *Values) Version() bool`.
   - `func (v *Values) Config(fs *flag.FlagSet, stderr io.Writer, version string) (perfmcp.Config, error)`:
     - it runs today's checks in today's order, and warns once about capture flags given without `--perf-agent`;
     - a usage error is a `*UsageError` (exit 2), whose text is prefixed `fs.Name() + ": "`;
-    - `Stdio` sets `Capture.Owner` to `"stdio"`; `Serve` sets it to `"serve"` and `MaxOpenHandles` to 32 before applying `--limit`.
+    - `Stdio` sets `Capture.Owner` to `"stdio"`; `Hub` sets it to `"hub"` and `MaxOpenHandles` to 32 before applying `--limit`.
   - `type UsageError struct{ Msg string }`.
   - Exported from `limits.go`: `SetLimit(l *perfmcp.Limits, kv string) error`, `CheckLimits(l *perfmcp.Limits) error`, `LimitFields(l *perfmcp.Limits) map[string]reflect.Value`, `CheckCapturesDir(profiles, dir string) (string, error)`.
 
@@ -479,25 +479,25 @@ git commit -m "mcpstdio: an exported session and one-message handler, so another
     - it waits at most `MaxEngineWait` (the try-free-first fast path is unchanged, and no timer is made when the slot is free);
     - on timeout it returns the busy text of Builder's calls;
     - it calls `Config.HoldEngine(tool)` when set, holding the engine.
-  - **Limits.** `Limits.MaxEngineWait time.Duration` and `Limits.Serve ServeLimits{ MaxSessions, MaxIngressReaders, MaxControlInFlight, MaxPageStateInFlight, MaxCalls, MaxCallsPerSession, MaxInboxEntries int; MaxIngressBytes, MaxRequestBytes int64; IngressBodyTimeout time.Duration }`, with the defaults and validation of Builder's calls. `resolve` fills `Serve` only when the whole struct is zero.
+  - **Limits.** `Limits.MaxEngineWait time.Duration` and `Limits.Hub ServeLimits{ MaxSessions, MaxIngressReaders, MaxControlInFlight, MaxPageStateInFlight, MaxCalls, MaxCallsPerSession, MaxInboxEntries int; MaxIngressBytes, MaxRequestBytes int64; IngressBodyTimeout time.Duration }`, with the defaults and validation of Builder's calls. `resolve` fills `Serve` only when the whole struct is zero.
   - **Attribution.** `publication.by`, and `live.by` for the steering. `liveStateEntry.By` and `liveState.By` are always present (`json:"by"`).
-  - **mcpflags.** `Stdio`'s `SetLimit` refuses `Serve.` names: "Serve.MaxCalls is a perf-agent-mcp-serve limit".
+  - **mcpflags.** `Stdio`'s `SetLimit` refuses `Serve.` names: "Serve.MaxCalls is a perf-agent-hub limit".
   - **The binary's name.** `Config.Command string` ("" means `perf-agent-mcp`), and `func (s *Server) command() string`. It is used by `serverInfo.Name`, the busy text, `captureDisabledText` (now built, not a constant compared by value) and every start-or-restart advice string of Builder's calls. This touches shipped capture code, which is AI layer and may change.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
-func TestABusyEngineAnswersWhoHoldsIt(t *testing.T)          // HoldEngine blocks top from Session "A"; Session "B" calls facts with MaxEngineWait 200ms → isError "perf-agent-mcp is busy with top from A (running 0s); call again" within 200..400 ms; with Command "perf-agent-mcp-serve" the text starts with it
+func TestABusyEngineAnswersWhoHoldsIt(t *testing.T)          // HoldEngine blocks top from Session "A"; Session "B" calls facts with MaxEngineWait 200ms → isError "perf-agent-mcp is busy with top from A (running 0s); call again" within 200..400 ms; with Command "perf-agent-hub" the text starts with it
 func TestAWaiterWhoseContextEndsRunsNothing(t *testing.T)    // cancelled while waiting → handler never ran; the engine is free after
 func TestTheUncontendedEngineAllocatesNothing(t *testing.T)  // testing.AllocsPerRun(acquire with a holder + release) == 0
-func TestCommandNamesTheBinaryInEveryAdvice(t *testing.T)    // Command "perf-agent-mcp-serve": serverInfo.Name, the capture-disabled text, an owner_mismatch next and a write-error next name it; a go/ast scan of non-test perfmcp files finds no string literal containing "start perf-agent-mcp" or "restart perf-agent-mcp"
+func TestCommandNamesTheBinaryInEveryAdvice(t *testing.T)    // Command "perf-agent-hub": serverInfo.Name, the capture-disabled text, an owner_mismatch next and a write-error next name it; a go/ast scan of non-test perfmcp files finds no string literal containing "start perf-agent-mcp" or "restart perf-agent-mcp"
 // every capture message test passes with the default Command, unchanged
 func BenchmarkTopThroughTheEngine(b *testing.B)              // recorded in the ledger before/after; no measurable change (spec §D7)
 func TestCaptureJobsHoldTheEngineByName(t *testing.T)        // a job's engine section holds as "capture <id>", maintenance as "capture retention"
 func TestServeLimitsDefaultsAndValidation(t *testing.T)      // each default; each of the five refusals names both fields
 func TestPublicationsAndSteeringRecordBy(t *testing.T)       // sessions "claude-code" and "codex": page_explain by one, page_show by the other → state entries by, steering by; render_flamegraph goldens unchanged
 // internal/mcpflags
-func TestStdioRefusesServeLimits(t *testing.T)               // Stdio: --limit Serve.MaxCalls=4 → UsageError naming perf-agent-mcp-serve; Serve: accepted
+func TestStdioRefusesServeLimits(t *testing.T)               // Stdio: --limit Serve.MaxCalls=4 → UsageError naming perf-agent-hub; Serve: accepted
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -652,7 +652,7 @@ git commit -m "mcphttp: bounded ingress, then control, page-state and call class
   - `internal/flamegraph/live.js` and `liveassets_test.go`: the page reads the envelope in this same task, so no task leaves the served page unable to read its state.
 
 **Interfaces:**
-- Consumes: Task 2 `PageView`; Task 4 `Tool.Snapshot`, `Resource.Read`, `Resource.Snapshot` and `ClientLabel`; Task 5 `Limits.Serve.MaxInboxEntries` and `HoldEngine`.
+- Consumes: Task 2 `PageView`; Task 4 `Tool.Snapshot`, `Resource.Read`, `Resource.Snapshot` and `ClientLabel`; Task 5 `Limits.Hub.MaxInboxEntries` and `HoldEngine`.
 - Produces:
   - **The bus.** `type stateBus struct{…}`:
     - `setEngine(seq int64, b []byte)` and `setInbox(rev int64, b []byte)` each ignore a part that is not newer;
@@ -779,17 +779,17 @@ git add internal/flamegraph
 git commit -m "flamegraph: the live page reports selections and asks to the inbox"
 ```
 
-### Task 10: `cmd/perf-agent-mcp-serve`: runtime directory, lock, tokens, wiring and shutdown
+### Task 10: `cmd/perf-agent-hub`: runtime directory, lock, tokens, wiring and shutdown
 
 **Files:**
-- Create: `cmd/perf-agent-mcp-serve/main.go`, `serve.go`, `runtimedir.go`, `main_test.go`, `runtimedir_test.go`, `serve_test.go`
+- Create: `cmd/perf-agent-hub/main.go`, `serve.go`, `runtimedir.go`, `main_test.go`, `runtimedir_test.go`, `serve_test.go`
 
 **Interfaces:**
-- Consumes: Task 1 `mcpflags.Serve`; Tasks 2 and 8 `perfpage.Routes`, `Inbox` and `NewHub`; Task 3 `Front`, `MCPGuard` and `InboxGuard`; Tasks 6–7 `mcphttp`; Task 5 `Limits.Serve` and `Config.Command`; `capture.RunInternal`.
+- Consumes: Task 1 `mcpflags.Serve`; Tasks 2 and 8 `perfpage.Routes`, `Inbox` and `NewHub`; Task 3 `Front`, `MCPGuard` and `InboxGuard`; Tasks 6–7 `mcphttp`; Task 5 `Limits.Hub` and `Config.Command`; `capture.RunInternal`.
 - Produces:
   - **`main()`.**
     - `capture.RunInternal()` runs first.
-    - Then the subcommands: `token (--port N | --url URL) [--runtime-dir DIR]` and `url [--runtime-dir DIR]`. `token` prints only when the server runs **and** N (or the URL's port) equals `serve.json`'s port; otherwise exit 1 with the reason on stderr and nothing on stdout. A token without `--port` or `--url` is a usage error (exit 2).
+    - Then the subcommands: `token (--port N | --url URL) [--runtime-dir DIR]` and `url [--runtime-dir DIR]`. `token` prints only when the server runs **and** N (or the URL's port) equals `hub.json`'s port; otherwise exit 1 with the reason on stderr and nothing on stdout. A token without `--port` or `--url` is a usage error (exit 2).
     - Otherwise `runServe(ctx, args, stdout, stderr) int`. Exit 0 on SIGINT or SIGTERM, 1 on a runtime error, 2 on usage. `--port N` (1..65535, default `DefaultPort` = 7341), `--runtime-dir DIR`, and the mcpflags.
   - **`runtimedir.go`.**
     - `type runtimeDir struct{ root *os.Root; path string; lock *os.File }`.
@@ -797,7 +797,7 @@ git commit -m "flamegraph: the live page reports selections and asks to the inbo
       - with `XDG_RUNTIME_DIR`, it uses `$XDG_RUNTIME_DIR/perf-agent-mcp`, created 0700 when missing;
       - without it, `--runtime-dir` is required, and its absence is an error naming both;
       - it refuses a symlink, a non-directory, a mode other than 0700, or an owner other than the uid (through the `ownerOf` seam).
-    - `(*runtimeDir).take() (serveInfo, error)`: `syscall.Flock(LOCK_EX|LOCK_NB)` on `serve.lock`. A held lock gives "perf-agent-mcp-serve is already running (pid N, port P)", read from `serve.json`. Once taken, it removes any `serve.json`, `mcp-token` and `page-url` a dead server left, before anything else starts.
+    - `(*runtimeDir).take() (serveInfo, error)`: `syscall.Flock(LOCK_EX|LOCK_NB)` on `serve.lock`. A held lock gives "perf-agent-hub is already running (pid N, port P)", read from `hub.json`. Once taken, it removes any `hub.json`, `mcp-token` and `page-url` a dead server left, before anything else starts.
     - `write(info serveInfo, mcpToken livehttp.Token, pageURL string) error` writes the three files (0600, a temporary file plus rename).
     - `remove()`.
     - `func running(dir string) bool`: a `LOCK_SH|LOCK_NB` probe fails.
@@ -807,8 +807,8 @@ git commit -m "flamegraph: the live page reports selections and asks to the inbo
       1. the runtime directory and its lock, then the stale files go;
       2. the tokens;
       3. the hub;
-      4. `perfmcp.New` with `Page` and `Config.Command = "perf-agent-mcp-serve"`;
-      5. `mcphttp.New(srv.MCP(), …)` from `Limits.Serve`;
+      4. `perfmcp.New` with `Page` and `Config.Command = "perf-agent-hub"`;
+      5. `mcphttp.New(srv.MCP(), …)` from `Limits.Hub`;
       6. `livehttp.Listen("127.0.0.1:<port>")`. A busy port gives "port P is in use; start with --port N";
       7. `livehttp.NewServer(Front(page, MCPGuard(mcpTok, MaxMessageBytes, tr), InboxGuard(page, Rate{5, 5}, perfpage.Inbox(srv)), Guard(page, perfpage.Routes(srv, hub))))`;
       8. the files;
@@ -827,14 +827,14 @@ git commit -m "flamegraph: the live page reports selections and asks to the inbo
 func TestRuntimeDirModesAndOwner(t *testing.T)          // 0755 → refused naming the mode; ownerOf seam returns another uid → refused; a symlink → refused; created 0700 when missing
 func TestRuntimeDirNeedsXDGOrAFlag(t *testing.T)        // no XDG_RUNTIME_DIR, no --runtime-dir → exit 1 naming both
 func TestASecondInstanceIsRefused(t *testing.T)         // exit 1, "already running (pid <first>, port <p>)"
-func TestFilesAreWrittenAndRemoved(t *testing.T)        // serve.json, mcp-token, page-url all 0600; serve.json has no token; after SIGTERM all three gone, serve.lock kept
+func TestFilesAreWrittenAndRemoved(t *testing.T)        // hub.json, mcp-token, page-url all 0600; hub.json has no token; after SIGTERM all three gone, serve.lock kept
 func TestNoTokenEverReachesStderr(t *testing.T)         // a full run (initialize, tools, page GETs, an inbox POST, SIGTERM): neither token appears in stderr
 func TestThePageURLGoesToStdoutOnly(t *testing.T)       // stdout is exactly one line, the page URL == page-url's content
 func TestTokenAndURLSubcommands(t *testing.T)           // token --port <p> and token --url http://127.0.0.1:<p>/mcp → {"Authorization":"Bearer <mcp-token>"}\n; url → the page URL; token alone → exit 2
 func TestTokenOnlyForTheServersPort(t *testing.T)       // Review Focus 7: server on p; token --port p+1 (a squatted port in the client config) → exit 1, stdout empty, stderr names both ports
 func TestTokenWithoutARunningServerPrintsNothing(t *testing.T) // Review Focus 3: no server; a stale mcp-token with the lock free → exit 1, stderr says not running, stdout empty
 func TestABusyPortNamesItAndTheFlag(t *testing.T)       // Review Focus 4
-func TestAStaleServeJSONDoesNotBlockStart(t *testing.T) // Review Focus 4: a serve.json naming a dead pid, lock free → starts and replaces it
+func TestAStaleServeJSONDoesNotBlockStart(t *testing.T) // Review Focus 4: a hub.json naming a dead pid, lock free → starts and replaces it
 func TestStaleRuntimeFilesGoWhenTheLockIsTaken(t *testing.T) // stale mcp-token and page-url, and a Listen seam that blocks: while blocked, neither file exists and token exits 1
 func TestServeHasNoAddressFlag(t *testing.T)            // --addr, --host, --listen → exit 2
 func TestThePageURLIsLoopbackWithAToken(t *testing.T)   // replaces the perfmcp listener test: 127.0.0.1:<port>/s/<43 chars>/
@@ -844,34 +844,34 @@ func TestShutdownStopsTheListener(t *testing.T)         // replaces TestCloseSto
 func TestShutdownIsBoundedByStuckTabs(t *testing.T)     // replaces TestCloseIsBoundedByStuckClients
 func TestServeToolList(t *testing.T)                    // the 13 stdio tools, then page_open, page_explain, page_show, page_diff, then page_state; resources include perf-agent://page/state
 func TestOneCallRunsAtATime(t *testing.T)               // 8 sessions call tools at once while tabs GET and POST inbox; HoldEngine counts concurrent holders: max 1; each session's answers echo its ids (§D7)
-func TestTheServeBinaryIsNotShipped(t *testing.T)       // Makefile, Dockerfiles, release workflow, notices script do not mention perf-agent-mcp-serve
+func TestTheServeBinaryIsNotShipped(t *testing.T)       // Makefile, Dockerfiles, release workflow, notices script do not mention perf-agent-hub
 func TestTheServeBinaryLinksNoProfiler(t *testing.T)
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `go test -race ./cmd/perf-agent-mcp-serve/`
+Run: `go test -race ./cmd/perf-agent-hub/`
 Expected: FAIL (no package).
 
 - [ ] **Step 3: Implement.**
 
 - [ ] **Step 4: Run them to verify they pass**
 
-Run: `go test -race -count=2 ./cmd/perf-agent-mcp-serve/`, then the green check, now with `./cmd/perf-agent-mcp-serve/`.
+Run: `go test -race -count=2 ./cmd/perf-agent-hub/`, then the green check, now with `./cmd/perf-agent-hub/`.
 Expected: PASS twice, with no leftover process and no file left in the temporary runtime directories.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/perf-agent-mcp-serve internal/perfmcp/server.go
-git commit -m "perf-agent-mcp-serve: one loopback server for the page and MCP over HTTP, with a per-user lock and rotated tokens"
+git add cmd/perf-agent-hub internal/perfmcp/server.go
+git commit -m "perf-agent-hub: one loopback server for the page and MCP over HTTP, with a per-user lock and rotated tokens"
 ```
 
 ### Task 11: The network promises move to the serve binary, and the page end to end
 
 **Files:**
-- Move: `cmd/perf-agent-mcp/netscan_test.go` → `cmd/perf-agent-mcp-serve/netscan_test.go` (`git mv`, then retarget)
-- Create: `cmd/perf-agent-mcp-serve/sockets_linux_test.go`, `link_test.go`, `chrome_test.go`, `httpclient_test.go` (a hand-written MCP-over-HTTP client, no dependency)
+- Move: `cmd/perf-agent-mcp/netscan_test.go` → `cmd/perf-agent-hub/netscan_test.go` (`git mv`, then retarget)
+- Create: `cmd/perf-agent-hub/sockets_linux_test.go`, `link_test.go`, `chrome_test.go`, `httpclient_test.go` (a hand-written MCP-over-HTTP client, no dependency)
 - Modify: `cmd/perf-agent-mcp/main_test.go` (keeps `TestTheServerLinksNoNetworking`, `TestPerfmcpImportsNoNetworking` and `TestTheServerLinksNoProfiler`)
 
 **Interfaces:**
@@ -880,7 +880,7 @@ git commit -m "perf-agent-mcp-serve: one loopback server for the page and MCP ov
   - **The scan** covers both binaries: the packages of `.` and of `../perf-agent-mcp` are listed and scanned together, so the stdio main package stays under the exec and listen rules after the move:
     - its coverage list adds `internal/livehttp`, `internal/perfpage`, `internal/mcphttp`, `internal/mcpflags` and the main package;
     - `got.listens == ["net.Listen"]` in `listen.go` again;
-    - `allowedFiles.listenCallers = []string{"cmd/perf-agent-mcp-serve/serve.go"}`: `livehttp.Listen` is referenced once, there, and anywhere else is a finding;
+    - `allowedFiles.listenCallers = []string{"cmd/perf-agent-hub/serve.go"}`: `livehttp.Listen` is referenced once, there, and anywhere else is a finding;
     - the exec, launch and helper rules are unchanged.
   - **nm.** `liveSymbols` become `perfpage.Routes.func1`, `(*livehttp.Hub).ServeHTTP` and `(*mcphttp.Transport).ServeHTTP`. `clientSymbols` are unchanged.
   - **`httpClient`.** `initialize(label)`, `call(tool, args)`, `notify(method, params)`, `delete()` and `get(path)`.
@@ -899,28 +899,28 @@ func TestAnAskReachesPageStateInChrome(t *testing.T)         // real server: pub
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `go test -race ./cmd/perf-agent-mcp-serve/ -run 'Network|Opens|Links|Socket|InChrome'`
+Run: `go test -race ./cmd/perf-agent-hub/ -run 'Network|Opens|Links|Socket|InChrome'`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement the retargeting and the client.**
 
 - [ ] **Step 4: Run them to verify they pass**
 
-Run: the green check, plus `go test -race -run 'Links|Imports|Network' ./cmd/perf-agent-mcp/ ./cmd/perf-agent-mcp-serve/`
+Run: the green check, plus `go test -race -run 'Links|Imports|Network' ./cmd/perf-agent-mcp/ ./cmd/perf-agent-hub/`
 Expected: PASS. The stdio binary links no networking, and the serve binary links the page and the transport with no client symbol.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/perf-agent-mcp cmd/perf-agent-mcp-serve
-git commit -m "perf-agent-mcp-serve: the source scan, socket and symbol checks now guard the binary that has a network"
+git add cmd/perf-agent-mcp cmd/perf-agent-hub
+git commit -m "perf-agent-hub: the source scan, socket and symbol checks now guard the binary that has a network"
 ```
 
 ### Task 12: Capture hosting in perfmcp: publication, `show`, protection, the recipe and `by` (opus)
 
 **Files:**
 - Create: `internal/perfmcp/capture_publish.go`, `capture_serve_test.go`
-- Modify (tests): `internal/perfmcp/capture_process_test.go` (the dead-reaper case with `Owner: "serve"`, through the existing `procserver_test.go` harness and its `reaper_pause`)
+- Modify (tests): `internal/perfmcp/capture_process_test.go` (the dead-reaper case with `Owner: "hub"`, through the existing `procserver_test.go` harness and its `reaper_pause`)
 - Modify:
   - `internal/perfmcp/`: `capture_run.go` (`done` publishes under the engine it already holds), `capture_compare.go` (`recomputeFor` adds the page steps with `Page`), `capture_job.go` (`job.by`, `captureRequest.Show`), `tool_capture.go` (the `show` schema and `publication` fields with `Page`), `tool_capture_list.go` (`listJob.By`), `server.go` (`captureProtect` set with `Page`), `live.go` (`publication.files []fileKey`).
 
@@ -956,7 +956,7 @@ func TestMultiSessionWaitsAndCancel(t *testing.T)          // A starts; A's Sess
 func TestHistoricalLookupsInServe(t *testing.T)            // MaxJobs 1, lookupHook blocks: repeated waits return loading at their deadlines with no goroutine growth; unblock → done, derived recompute, recompute names page_explain; no derived file written
 func TestCaptureListShowsWhoStartedTheRunningJob(t *testing.T)
 func TestFourSessionsRaceTheCaptureTools(t *testing.T)    // Review Focus 8, -race -count=5: four sessions loop capture, capture_wait, capture_cancel and capture_list for 3 s on short fake captures; every answer is accepted, a state, a result or a documented error code; at most one job active at any time; no leftover process
-func TestADeadServesReaperHoldsTheLease(t *testing.T)     // capture_process_test, Owner "serve", reaper_pause before-exit:<f>: kill9 A mid-capture; B: capture → accepted, then the job fails busy (retry_after ≤ 5 s) naming A's reaper; capture_wait by A's capture id → in_progress naming the dead server's reaper; remove f → interrupted, retryable
+func TestADeadServesReaperHoldsTheLease(t *testing.T)     // capture_process_test, Owner "hub", reaper_pause before-exit:<f>: kill9 A mid-capture; B: capture → accepted, then the job fails busy (retry_after ≤ 5 s) naming A's reaper; capture_wait by A's capture id → in_progress naming the dead server's reaper; remove f → interrupted, retryable
 func TestPinsAndReservationsReturnAfterAnEngineWaitCancel(t *testing.T) // a job cancelled while waiting for the engine in preparing → pin ledger and reserved window back to baseline
 ```
 
@@ -982,8 +982,8 @@ git commit -m "perfmcp: in serve a committed capture is published on the page, k
 ### Task 13: Serve-level capture and crash tests (opus)
 
 **Files:**
-- Create: `cmd/perf-agent-mcp-serve/capture_linux_test.go`
-- Modify: `cmd/perf-agent-mcp-serve/main_test.go` (`PERF_AGENT_MCP_SERVE_TEST_FAKE_VERIFY=1` composes into `configHook`; no reaper pause reaches the binary)
+- Create: `cmd/perf-agent-hub/capture_linux_test.go`
+- Modify: `cmd/perf-agent-hub/main_test.go` (`PERF_AGENT_MCP_SERVE_TEST_FAKE_VERIFY=1` composes into `configHook`; no reaper pause reaches the binary)
 
 **Interfaces:**
 - Consumes: Tasks 10–12; `capturetest.FakePerfAgent`, `Workload`, `SkipIfPrivileged`.
@@ -1004,7 +1004,7 @@ func TestSIGTERMKillsTheCaptureFirst(t *testing.T)        // double-fork-setsid 
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `go test -race ./cmd/perf-agent-mcp-serve/ -run 'OverHTTP|NeverCancel|FullCalls|HoldsTheLease|KilledServeIsRecovered|EachOthers|WhileCapturing|KillsTheCapture'`
+Run: `go test -race ./cmd/perf-agent-hub/ -run 'OverHTTP|NeverCancel|FullCalls|HoldsTheLease|KilledServeIsRecovered|EachOthers|WhileCapturing|KillsTheCapture'`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement the harness.** Fix what the tests expose in Tasks 6, 10 and 12, each fix with the test that found it.
@@ -1017,8 +1017,8 @@ Expected: PASS three times. `ps -eo pid,comm | grep -E '^ *[0-9]+ (fakeperfagent
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/perf-agent-mcp-serve
-git commit -m "perf-agent-mcp-serve: capture over HTTP across sessions, with crash, lease and shutdown tests"
+git add cmd/perf-agent-hub
+git commit -m "perf-agent-hub: capture over HTTP across sessions, with crash, lease and shutdown tests"
 ```
 
 ### Task 14: Docs, guide, skill, changelog and the spec's amendments
@@ -1034,18 +1034,18 @@ git commit -m "perf-agent-mcp-serve: capture over HTTP across sessions, with cra
     - Line 3 and "What it does not do" now say the stdio binary links no networking, and name the serve binary as the only listener.
     - A new section, "Watching with the live server":
       - start it, with `--port` and its default 7341, and `--runtime-dir`;
-      - the Claude Code JSON (`type: http`, `url`, `headersHelper: "perf-agent-mcp-serve token --port 7341"`) and the Codex TOML (`url`, `http_headers_helper` with the same command); the port in the helper must match the URL's;
-      - the squatter risk: any local user can listen on a port the server is not on. The helper never sends the token there, but a client whose URL names such a port talks to an impostor, which can feed the agent false results and instructions (a prompt-injection channel). Keep the client's URL and `--port` in step, and check `perf-agent-mcp-serve url` when a client fails to connect;
+      - the Claude Code JSON (`type: http`, `url`, `headersHelper: "perf-agent-hub token --port 7341"`) and the Codex TOML (`url`, `http_headers_helper` with the same command); the port in the helper must match the URL's;
+      - the squatter risk: any local user can listen on a port the server is not on. The helper never sends the token there, but a client whose URL names such a port talks to an impostor, which can feed the agent false results and instructions (a prompt-injection channel). Keep the client's URL and `--port` in step, and check `perf-agent-hub url` when a client fails to connect;
       - what a restart does to clients;
       - "do not configure both in one session: the same tools appear twice";
       - the inbox and `page_state`;
       - the threat-model delta;
-      - the `captures-serve` default and `.owner`;
+      - the `captures-hub` default and `.owner`;
       - the `Serve.*` limits table and `MaxEngineWait`.
     - Line 43 names `page_state` among the decimal-string results.
     - No SSH or remote text anywhere.
   - **The guide** names the page tools as serve-only, and `page_state` for "what the user selected or asked about". It stays ≤ 12288 bytes.
-  - **The skill**: line 7 now says the live page is `perf-agent-mcp-serve`'s, configured as an HTTP server, and that headless loops use stdio.
+  - **The skill**: line 7 now says the live page is `perf-agent-hub`'s, configured as an HTTP server, and that headless loops use stdio.
   - **`CHANGELOG.md`**: an `[Unreleased]` entry.
   - **The spec's amendments**, each with a line in its §10 naming the ruling or the plan row:
     - §D2.5 "Long calls" step 1 (line ~600) and the §D2.6 table (line ~625): the body is read under `IngressBodyTimeout` (2 s), not 30 s (SRV-R4c);
@@ -1057,7 +1057,7 @@ git commit -m "perf-agent-mcp-serve: capture over HTTP across sessions, with cra
 
 ```go
 func TestDocsListEveryServeLimit(t *testing.T)            // every Serve.* field and MaxEngineWait, with its default from DefaultLimits, appears in docs/mcp.md
-func TestDocsShowBothClientConfigs(t *testing.T)          // "headersHelper", "http_headers_helper", "http://127.0.0.1:7341/mcp", "perf-agent-mcp-serve token --port 7341", and the squatter paragraph
+func TestDocsShowBothClientConfigs(t *testing.T)          // "headersHelper", "http_headers_helper", "http://127.0.0.1:7341/mcp", "perf-agent-hub token --port 7341", and the squatter paragraph
 func TestDocsNeverDescribeRemoteUse(t *testing.T)         // no "ssh", "-L ", "0.0.0.0", "--addr" in docs/mcp.md, the guide or the skill
 // guide_test: + "page_state"; skill_test: the skill's names exist in the serve tool list
 ```
@@ -1089,9 +1089,9 @@ git commit -m "docs: the live server, its client configuration, the inbox and pa
 - [ ] **Step 2: Lint.** `golangci-lint version` must say 2.11.4; install it if the command exits 127. `golangci-lint run ./...` must report no findings.
 - [ ] **Step 3: Check the pre-existing tree is untouched.** `git diff --stat ai-mcp-m2c-capture -- main.go telemetry.go perfagent gpu cmd/flamegraph internal/profilemodel` must be empty.
 - [ ] **Step 4: Run the Claude Code smoke.**
-  - Build `perf-agent-mcp-serve` into the worktree, not `/tmp`.
+  - Build `perf-agent-hub` into the worktree, not `/tmp`.
   - Start it with a fixture profiles root and, optionally, `--perf-agent <setcap'd perf-agent>`.
-  - Write a scratch JSON: `{"mcpServers":{"perf-agent-live":{"type":"http","url":"http://127.0.0.1:7341/mcp","headersHelper":"<abs path>/perf-agent-mcp-serve token --port 7341"}}}`.
+  - Write a scratch JSON: `{"mcpServers":{"perf-agent-live":{"type":"http","url":"http://127.0.0.1:7341/mcp","headersHelper":"<abs path>/perf-agent-hub token --port 7341"}}}`.
   - Run `claude -p --mcp-config <scratch json> --strict-mcp-config` through open, `page_explain` and `page_state`, plus a capture when perf-agent is given.
   - Then restart the server and ask again, recording how the client recovers from the 404 and the 401.
   - Then run two `claude -p` sessions at once on one page.
@@ -1102,7 +1102,7 @@ git commit -m "docs: the live server, its client configuration, the inbox and pa
 
 ```bash
 git push -u origin ai-mcp-m2c-serve
-gh pr create --draft --base ai-mcp-m2c-capture --title "perf-agent-mcp-serve: one local server for the live page and MCP over HTTP" --body-file .superpowers/sdd/2026-11-16-serve-plan/pr-body.md
+gh pr create --draft --base ai-mcp-m2c-capture --title "perf-agent-hub: one local server for the live page and MCP over HTTP" --body-file .superpowers/sdd/2026-11-16-serve-plan/pr-body.md
 ```
 
 ---

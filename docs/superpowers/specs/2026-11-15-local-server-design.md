@@ -37,7 +37,7 @@ Who decides each point:
    client does not know the server exists.
 2. **One long-lived local process** replaces it. The user starts it
    (working name `perf-agent-mcp serve`; decision 8.3 makes it a
-   separate binary, `perf-agent-mcp-serve`), and it owns all state:
+   separate binary, `perf-agent-hub`), and it owns all state:
    - the open profiles;
    - the publications;
    - the attempt and rejection record;
@@ -73,7 +73,7 @@ Who decides each point:
    2. **A fixed `127.0.0.1` port, set with `--port`.** It is still
       loopback-only, with no remote or SSH use. This amends M2b-R7: a
       port flag is allowed, an address flag never is.
-   3. **A separate binary for the server: `cmd/perf-agent-mcp-serve`.**
+   3. **A separate binary for the server: `cmd/perf-agent-hub`.**
       The stdio binary then again links no `net`, `net/http` or
       `crypto/tls`, so M2's "links no networking" test comes back for it.
       M2b's network tests (source scan, every-socket-loopback, `nm`) move
@@ -94,7 +94,7 @@ Who decides each point:
 | Tier | Part | Why it is in this tier |
 |---|---|---|
 | 0: must not regress | Plain stdio `perf-agent-mcp`: M2's tools (plus `capture`/`capture_list` from the capture design); no page tools; links no networking; no discovery; no new step | It is the product's main path (decision 6) |
-| 1: the human layer | `perf-agent-mcp-serve`, a separate binary: one listener carrying the page (M2b engine, reused) and MCP over Streamable HTTP; shared state; the engine slot (§D2.4); tokens in the runtime directory | This is the user's architecture |
+| 1: the human layer | `perf-agent-hub`, a separate binary: one listener carrying the page (M2b engine, reused) and MCP over Streamable HTTP; shared state; the engine slot (§D2.4); tokens in the runtime directory | This is the user's architecture |
 | 2: interactivity | The inbox, `page_state`, and the `perf-agent://page/state` resource for Claude Code's `@` mentions | Useful only once tier 1 exists |
 | Deferred | See §1.3 | Not needed for a first useful server |
 
@@ -129,7 +129,7 @@ Who decides each point:
 ```
  headless loop (main path)                human layer (optional)
  ┌───────────────────────┐                ┌──────────────────────────────────────────────────┐
- │ agent ─stdio─► perf-  │                │ perf-agent-mcp-serve  (one per user, foreground) │
+ │ agent ─stdio─► perf-  │                │ perf-agent-hub  (one per user, foreground) │
  │ agent-mcp (M2 tools + │                │                                                  │
  │ capture). Links no    │                │  127.0.0.1:PORT ── livehttp.Front ──┬─ /mcp ──► mcphttp ──┐
  │ networking.           │                │                                     │                     │
@@ -143,7 +143,7 @@ Who decides each point:
                                           │    diffs, attempts, publications, steering
                                           │    capture waits OUTSIDE the slot (capture design §9)
                                           └──────────────────────────────────────────────────┘
-   Claude Code / Codex (type: http, url http://127.0.0.1:PORT/mcp, header from `perf-agent-mcp-serve token`)
+   Claude Code / Codex (type: http, url http://127.0.0.1:PORT/mcp, header from `perf-agent-hub token`)
    browser tab (http://127.0.0.1:PORT/s/<page token>/)
 ```
 
@@ -153,7 +153,7 @@ socket:
 - **a capture directory, written by exactly one kind of binary (SRV-R5,
   CAP-R6, CAP-R6b).**
   - **Distinct defaults.** Stdio writes `<profiles>/captures` and serve
-    writes `<profiles>/captures-serve`, so the two never meet unless the
+    writes `<profiles>/captures-hub`, so the two never meet unless the
     user points them at the same place.
   - **Ownership is enforced, not just documented.** On first use a
     captures directory records its writer kind in `.owner` (`stdio` or
@@ -190,7 +190,7 @@ socket:
   M2 plus capture. It has no page tools and no `--live`. **It links no
   `net`, `net/http` or `crypto/tls`**, and M2's link test comes back for
   it.
-- **`perf-agent-mcp-serve [flags]`** (`cmd/perf-agent-mcp-serve`, new):
+- **`perf-agent-hub [flags]`** (`cmd/perf-agent-hub`, new):
   the long-lived server.
   - It takes the same root and limit flags as stdio: `--profiles`,
     `--source`, `--source-manifest`, `--output`, `--source-git`,
@@ -198,10 +198,10 @@ socket:
   - Both binaries parse these through one new shared package,
     `internal/mcpflags`, moved out of `cmd/perf-agent-mcp/main.go`.
   - It adds `--port` and `--runtime-dir`.
-- **`perf-agent-mcp-serve token`** prints
+- **`perf-agent-hub token`** prints
   `{"Authorization":"Bearer <token>"}` for a client's header helper
   (§D2.3).
-- **`perf-agent-mcp-serve url`** prints the page URL for the user.
+- **`perf-agent-hub url`** prints the page URL for the user.
 
 **What the separate binary requires: `perfmcp` must stop importing
 `net/http`.** Today two M2b files bring it in:
@@ -225,21 +225,21 @@ The split **[mine]**:
   It never touches engine state, which is M2b D4's rule written as a
   package boundary.
 - **`internal/livehttp`** and **`internal/mcphttp`** are imported only by
-  `perfpage` and `cmd/perf-agent-mcp-serve`.
+  `perfpage` and `cmd/perf-agent-hub`.
 
 The stdio binary's dependency closure then contains no networking
 package, and the restored M2 test proves it (§D7).
 
 #### D1.2 Start and stop **[mine]**
 
-- **Start.** The user runs `perf-agent-mcp-serve --profiles DIR …` in a
+- **Start.** The user runs `perf-agent-hub --profiles DIR …` in a
   terminal. It runs in the foreground. It logs to stderr, and no log line
   ever carries a token. **The page URL is printed once to stdout**,
   because that terminal is the user. Unlike M2b, stderr here is not an
   MCP client's log.
 - **One per user.** The server takes `flock` on
   `$RUNTIME/perf-agent-mcp/serve.lock`. A second instance exits with
-  code 1, saying `perf-agent-mcp-serve is already running (pid N, port
+  code 1, saying `perf-agent-hub is already running (pid N, port
   P)`.
 - **Port [user, decision 8.2].** The server listens on a fixed loopback
   port, `127.0.0.1:<default>`, which `--port N` changes.
@@ -259,7 +259,7 @@ package, and the restored M2 test proves it (§D7).
      banner);
   3. kill running captures (capture design §6.6);
   4. give in-flight tool calls the 1 s grace of M2-R27, then exit;
-  5. remove `serve.json` and the token file.
+  5. remove `hub.json` and the token file.
 - **Restart rotates both tokens.** Clients recover: see §D2.3.
 
 #### D1.3 Discovery, and what happens with no server **[user, decision 8.1]**
@@ -283,7 +283,7 @@ So:
   socket.
 - **An interactive session with a human watching:** the user configures
   that client with the HTTP entry (`perf-agent-live` →
-  `http://127.0.0.1:PORT/mcp`), served by `perf-agent-mcp-serve`.
+  `http://127.0.0.1:PORT/mcp`), served by `perf-agent-hub`.
 - **Do not configure both in one session.** The tool names would collide
   (`mcp__perf-agent__open` against `mcp__perf-agent-live__open`). The
   docs say so.
@@ -293,7 +293,7 @@ So:
   it.
 
 The **runtime directory** exists for the server's own use (lock, token,
-`serve.json`), not for discovery by stdio:
+`hub.json`), not for discovery by stdio:
 - it is `$XDG_RUNTIME_DIR/perf-agent-mcp/`, created with mode 0700;
 - the server refuses a directory that is not owned by the uid or is not
   0700;
@@ -302,7 +302,7 @@ The **runtime directory** exists for the server's own use (lock, token,
   Tokens are never written to a persistent disk by default (tmpfs,
   cleared at logout).
 
-`serve.json` (0600) holds `{pid, port, mcp_url, started, version}` and no
+`hub.json` (0600) holds `{pid, port, mcp_url, started, version}` and no
 token. The token is kept apart in `mcp-token` (0600), and the page URL in
 `page-url` (0600).
 
@@ -389,14 +389,14 @@ restart's rotated token is picked up without editing config):
 { "mcpServers": { "perf-agent-live": {
     "type": "http",
     "url": "http://127.0.0.1:PORT/mcp",
-    "headersHelper": "perf-agent-mcp-serve token" } } }
+    "headersHelper": "perf-agent-hub token" } } }
 ```
 
 ```toml
 # Codex (~/.codex/config.toml)
 [mcp_servers.perf-agent-live]
 url = "http://127.0.0.1:PORT/mcp"
-http_headers_helper = "perf-agent-mcp-serve token"
+http_headers_helper = "perf-agent-hub token"
 ```
 
 - **Claude Code** runs the helper on every connection, and "On a 401 or
@@ -823,11 +823,11 @@ Sampling lets a server ask the client's model for a completion.
 | 4. Live models (JSON) | **Kept** | the state becomes an envelope with `engine` (the M2b state, plus `by`) and `inbox` (its own `rev`) (SRV-R3) |
 | 5. Live shell, CSS and script | **Kept, extended** | `transport.post(path, body)`; local select and focus report to `inbox`; the "Ask my agent about this" chip; the inbox count. `onState` reads the envelope: `engine` through the unchanged R1/R9..R12 logic, `inbox` by its own `rev` (SRV-R3). Reports are fire-and-forget and never touch `acceptedSeq` or the generation |
 | 6. Publications and snapshot | **Kept** | the ownership comments move from "request goroutine" to "engine slot holder"; `by` recorded |
-| 7. Listener lifecycle and routes | **Routes moved; lifecycle moved** | `perfmcp` no longer listens: `live.start`, `ensureLive`'s listener branch and `live.srv/ln/mu` go, and the hub becomes a notifier. `liveroutes.go` moves, unchanged in behaviour, to `internal/perfpage`, which reads `Server.PageSnapshot()`. `perf-agent-mcp-serve` mounts it with the inbox handler, and `page_open` returns the URL the serve binary gives it |
+| 7. Listener lifecycle and routes | **Routes moved; lifecycle moved** | `perfmcp` no longer listens: `live.start`, `ensureLive`'s listener branch and `live.srv/ln/mu` go, and the hub becomes a notifier. `liveroutes.go` moves, unchanged in behaviour, to `internal/perfpage`, which reads `Server.PageSnapshot()`. `perf-agent-hub` mounts it with the inbox handler, and `page_open` returns the URL the serve binary gives it |
 | 8. `page_open`, `page_explain`, `page_show` | **Kept; serve-only** | registered only when `Config.Page` is set (decision 8.4). Stdio does not list the page tools, so a headless agent's tool list and context are M2's |
 | 9. Flat live diff model | **Kept** unchanged | — |
 | 10. `page_diff` | **Kept; serve-only** | as for 8 |
-| 11. Flags, network tests, guide, docs | **Reworked** | `--live` dropped. The network tests (source scan, every-socket-loopback, `nm`) move to `cmd/perf-agent-mcp-serve`, and M2's "links no networking" test comes back for `cmd/perf-agent-mcp` (§D7). The guide's live section moves to serve-mode instructions. `docs/mcp.md` gets a "watching with the live server" section with both client configs |
+| 11. Flags, network tests, guide, docs | **Reworked** | `--live` dropped. The network tests (source scan, every-socket-loopback, `nm`) move to `cmd/perf-agent-hub`, and M2's "links no networking" test comes back for `cmd/perf-agent-mcp` (§D7). The guide's live section moves to serve-mode instructions. `docs/mcp.md` gets a "watching with the live server" section with both client configs |
 | 12. Verification and push | **Redone** | a new smoke with real Claude Code and Codex over HTTP |
 
 **Migration path [user, decision 8.4]: trim #264, then stack. Capture
@@ -848,7 +848,7 @@ ships first, the server second (decision 8.5).**
    `ai-mcp-m2c-serve`). It adds:
    - the `perfmcp`/`perfpage` split, after which the stdio binary links no
      networking and the M2 link test is restored;
-   - `cmd/perf-agent-mcp-serve` and `internal/mcpflags`;
+   - `cmd/perf-agent-hub` and `internal/mcpflags`;
    - `mcphttp`, the engine slot, the inbox and `page_state`;
    - the slot-held prepare and commit steps of `capture`, in SRV-R2b's
      order, with the two-step `capture`/`capture_wait` API (CAP-R8);
@@ -910,7 +910,7 @@ authority over TCP**, and accepts **one kind of browser write**.
     `internal/livehttp`, `internal/mcphttp` or `internal/perfpage`;
   - `cmd/perf-agent-mcp` has no `serve` subcommand and no file that
     imports them;
-  - **the positive half:** `cmd/perf-agent-mcp-serve` links
+  - **the positive half:** `cmd/perf-agent-hub` links
     `internal/perfpage`, `internal/livehttp` and `internal/mcphttp`, so
     the negative half is not vacuous.
 - **The dependency halves are kept.** No `perfagent`, `cilium/ebpf` or
@@ -922,14 +922,14 @@ authority over TCP**, and accepts **one kind of browser write**.
 - **No regression.** A benchmark on the stdio call path (`top` on a
   fixture) shows no measurable change from the engine-slot wrapper.
 
-**Serve binary `cmd/perf-agent-mcp-serve`: M2b's network tests move here
+**Serve binary `cmd/perf-agent-hub`: M2b's network tests move here
 (decision 8.3).**
 - **Source scan** of every non-standard package the serve binary links:
   - no client networking (`net.Dial*`, HTTP clients, resolver lookups,
     raw syscalls, cgo, linkname), as in M2b. There is no adapter, so no
     dial is ever needed;
   - the one listening call, `livehttp.Listen`, called only from
-    `cmd/perf-agent-mcp-serve`;
+    `cmd/perf-agent-hub`;
   - the `os/exec` exceptions are `git.go` plus the capture runner (capture
     design §11).
 - **Every-socket-loopback** (Linux): the built server runs while the test
@@ -1057,7 +1057,7 @@ authority over TCP**, and accepts **one kind of browser write**.
     and the reserved bytes return to their baseline.
 - **Writer ownership and crashes (SRV-R5, CAP-R6b):**
   - serve refuses a stdio-owned directory and stdio a serve-owned one;
-  - the defaults `captures` and `captures-serve` are distinct;
+  - the defaults `captures` and `captures-hub` are distinct;
   - a serve SIGKILLed mid-capture leaves the reaper holding the lease. A
     restarted serve refuses capture, naming the reaper's pid, and runs no
     retention or recovery there until the reaper has reaped both children;
@@ -1147,7 +1147,7 @@ byte-identical. `live.js` and `livepage.html` are live-only assets that
   inbox HTTP handler. Only the serve binary links it.
 - `internal/mcpflags`: the root, limit and capture flag parsing, shared by
   both binaries.
-- `cmd/perf-agent-mcp-serve` (`main.go`, `runtimedir.go`): the
+- `cmd/perf-agent-hub` (`main.go`, `runtimedir.go`): the
   `token`/`url` subcommands, the runtime directory, the lock, the token
   files and the wiring.
 - Their tests.
@@ -1164,12 +1164,12 @@ byte-identical. `live.js` and `livepage.html` are live-only assets that
 | `internal/perfmcp/liveroutes.go` | **Moved** to `internal/perfpage`; the snapshot-only reads are unchanged. `stateOf` stays in `perfmcp`, adds `by`, and feeds the `engine` part of the state bus (`statebus.go`, new, in `perfmcp`) | It is the file that imports `net/http`; SRV-R3 |
 | `internal/perfmcp/attempts.go` | `attempt.by` (display only; not in static output) | attribution across agents (§D3) |
 | `internal/perfmcp/limits.go` | `MaxSessions`, `MaxEngineWait`, `MaxIngressReaders`, `IngressBodyTimeout`, `MaxIngressBytes`, `MaxControlInFlight`, `MaxPageStateInFlight`, `MaxCalls`, `MaxCallsPerSession`, `MaxRequestBytes`, `MaxInboxEntries`; serve-mode default `MaxOpenHandles` 32. The capture limits (`Capture.MaxJobs` 32, `Capture.MaxJobBytes` 4 MiB) are the capture design's, unchanged | `--limit` reflects over `Limits` |
-| `internal/perfmcp/tool_page.go` | the descriptions drop the `--live` DISABLED text; `page_open` says the page is served by `perf-agent-mcp-serve` | the text would be false |
+| `internal/perfmcp/tool_page.go` | the descriptions drop the `--live` DISABLED text; `page_open` says the page is served by `perf-agent-hub` | the text would be false |
 | `internal/livehttp/guard.go` | export `LoopbackHost` (it wraps the existing function; `Guard` is unchanged) | `Front` and the new guards reuse the exact Host rule |
 | `internal/flamegraph/live.js`, `livepage.html`, `live.css` | `transport.post`; reports to `inbox`; the "Ask my agent about this" chip; inbox count; toast | interactivity (§D4); no static-page change |
 | `cmd/perf-agent-mcp/main.go` | remove `--live`; parse flags through `internal/mcpflags` | entry point; the flags are shared with the serve binary |
 | `cmd/perf-agent-mcp/main_test.go` | restore M2's "links no `net`, `net/http`, `crypto/tls`" test, and add the no-`livehttp`/`mcphttp`/`perfpage` check | decision 8.3 |
-| `cmd/perf-agent-mcp/netscan_test.go` | **Moved** to `cmd/perf-agent-mcp-serve`, with the M2b socket and `nm` tests, retargeted at that binary (§D7) | the network promises now belong to the binary that has a network |
+| `cmd/perf-agent-mcp/netscan_test.go` | **Moved** to `cmd/perf-agent-hub`, with the M2b socket and `nm` tests, retargeted at that binary (§D7) | the network promises now belong to the binary that has a network |
 | `docs/mcp.md`, the guide, `skills/perf-agent-mcp/SKILL.md`, CHANGELOG | the serve section; `--live` removed; the page tools described as serve-only | docs would be false |
 
 The capture design's own changes (its §11) are separate and compatible.
@@ -1189,7 +1189,7 @@ They meet in three places:
 |---|---|
 | Headless stdio first; serve reuses the same handler (§9) | stdio unchanged apart from the uncontended slot; serve hosts the same `perfmcp.Server` |
 | The single capture lifecycle (its §4.0, §7, §9; CAP-R13) | referenced, not copied (§D2.5). Serve supplies the engine slot that the job takes for prepare's shared inputs and for the derivations. The child wait and the file commit run outside it, under the lease |
-| CAP-R6, CAP-R6b: a cross-process lease on the captures directory, held by the reaper until both children are reaped | the job takes it nonblocking before any filesystem side effect, and a held lease is an async job failure (CAP-R13). Plus SRV-R5: enforced `.owner` writer kinds, with distinct defaults (`captures` for stdio, `captures-serve` for serve). A crashed serve's reaper keeps the lease, and a restarted serve's jobs fail `busy` until it is free (§2) |
+| CAP-R6, CAP-R6b: a cross-process lease on the captures directory, held by the reaper until both children are reaped | the job takes it nonblocking before any filesystem side effect, and a held lease is an async job failure (CAP-R13). Plus SRV-R5: enforced `.owner` writer kinds, with distinct defaults (`captures` for stdio, `captures-hub` for serve). A crashed serve's reaper keeps the lease, and a restarted serve's jobs fail `busy` until it is free (§2) |
 | `notifications/cancelled` only from the starting session; a dropped connection is not a cancel | sessions track their in-flight ids; the transport never cancels on disconnect (§D2.2, D2.5) |
 | A finished capture → a facts-only publication | done under the slot, with `by` recorded |
 | The browser cannot start or stop a capture | yes: the amended anti-goal covers engine state, captures included (§D6) |
@@ -1295,13 +1295,13 @@ stdio the request loop is sequential, so capture needs no engine slot.
 | Part | Depends on capture? |
 |---|---|
 | `perfmcp`/`perfpage` split; restored M2 link test for stdio (§D1.1, D7) | No |
-| `cmd/perf-agent-mcp-serve`, runtime directory, lock, tokens, `--port` (§D1) | No |
+| `cmd/perf-agent-hub`, runtime directory, lock, tokens, `--port` (§D1) | No |
 | `internal/mcpflags` (§D1.1) | **Yes, mildly:** it must carry capture's flags (`--perf-agent`, `--captures`, `--capture-command`, `--gpu-shim`), so it is written after they exist |
 | `mcphttp`: endpoint, sessions, guards, deadlines (§D2.1–D2.3, D2.6) | No. The long-call deadline handling (§D2.5) is motivated by capture but tested with any slow tool |
 | Cancellation scoping per session (§D2.2, D2.5) | **Yes:** it is capture's requirement (capture design §9), and capture is the first handler that honours its context |
 | Hosting the capture lifecycle (capture design §4.0, §7, §9; CAP-R13..R16): the engine slot for its engine steps, the admission classes, page publication of results, and multi-session waits (SRV-R7) | **Yes**. The whole lifecycle (state machine, lease, manifest, registry, lookup workers) ships in the capture milestone; serve adds only these hosting parts |
 | Ingress reader cap and body deadline (SRV-R4c) | No |
-| `.owner` writer kinds and the `captures-serve` default (SRV-R5) | **Yes**: the `.owner` file and its check belong in the capture milestone, so stdio enforces its side from the start |
+| `.owner` writer kinds and the `captures-hub` default (SRV-R5) | **Yes**: the `.owner` file and its check belong in the capture milestone, so stdio enforces its side from the start |
 | The engine slot and admission caps (§D2.4) | No for the slot and the caps. **Yes** for capture's three phases (SRV-R2): the prepare and commit steps under the slot, failure cleanup, and the retention-overlap tests |
 | Captures as facts-only publications on the page (capture design §9) | **Yes** |
 | Shared state, attribution `by` (§D3) | No; capture's `capture_list` attribution reuses the label |
@@ -1333,7 +1333,7 @@ rulings, recorded in
 
 | Ruling | Finding | Resolution here |
 |---|---|---|
-| **SRV-R1** | The inventory contradicted the separate binary: `PageHandler`/`InboxHandler` exported from `perfmcp`, the mux left in `perfmcp/liveroutes.go`, a `cmd/perf-agent-mcp/serve.go` dispatched from the stdio main, and D7 pinning that call site | The pinned copy predated part of the decision-8 rewrite. Now everything is built around `cmd/perf-agent-mcp-serve` and `internal/perfpage`: §D1.1, §D5 tasks 7 and 11, §D7 and §5. `perfmcp` exposes no HTTP (only the `PageSnapshot()` read accessor and the state-bus notifier). The question 5 of the first draft is gone (the user decided it). The dependency tests name these paths, with a positive half on the serve binary (§D7) |
+| **SRV-R1** | The inventory contradicted the separate binary: `PageHandler`/`InboxHandler` exported from `perfmcp`, the mux left in `perfmcp/liveroutes.go`, a `cmd/perf-agent-mcp/serve.go` dispatched from the stdio main, and D7 pinning that call site | The pinned copy predated part of the decision-8 rewrite. Now everything is built around `cmd/perf-agent-hub` and `internal/perfpage`: §D1.1, §D5 tasks 7 and 11, §D7 and §5. `perfmcp` exposes no HTTP (only the `PageSnapshot()` read accessor and the state-bus notifier). The question 5 of the first draft is gone (the user decided it). The dependency tests name these paths, with a positive half on the serve binary (§D7) |
 | **SRV-R2** | Capture's retention and `compare_with` read and mutate shared store state outside the engine slot | Three phases (§D2.5): prepare under the slot (validate, pin the baseline, resolve the protected inputs, run retention, reserve capacity, produce immutable inputs), wait outside it, then commit, compare and publish under it. Everything prepare took is released on every failure path. Tests overlap retention with `open`, eviction, publication and comparison (§D7) |
 | **SRV-R3** | Inbox-only changes could not reach other tabs: `commit()` is the only snapshot writer and bumps `seq`, and `live.js` drops states whose `seq` is not new | The state envelope has two parts with independent revisions, `engine.seq` and `inbox.rev`, combined by a state bus that neither the engine slot nor the inbox mutex waits on. `live.js` applies each part by its own revision (§D4). Tests use two tabs, with no engine activity and while a tool holds the slot, and check that neither part regresses the other (§D7) |
 | **SRV-R4** | The admission queue was unbounded: a goroutine and a body per waiting request, while `MaxSessions` does not cap calls | The global and per-session caps `MaxCalls` and `MaxCallsPerSession`, plus `MaxRequestBytes`. A required `Content-Length` lets bytes be reserved before reading. Excess gets `503` at once. Control traffic (`initialize`, `ping`, the list methods, `notifications/cancelled`, `DELETE`) never waits for the slot. *SRV-R4b refines this: controls are served ahead of calls from their own reserve, and can still get `503` once that reserve is full.* Tested with a same-session saturation test (§D2.4, §D7) |
@@ -1371,7 +1371,7 @@ CAP-R2b, R6b and R8.
 | **SRV-R2b** | The capture slot was claimed only after prepare's side effects (pins, retention, reservations) | One order (§D2.5): nonblocking capture admission and the cross-process lease **first**, then prepare under the engine slot, the wait outside it, commit or cleanup under it, and the lease released **last**. The server never waits for a lease while holding the engine slot, and a refused second capture changes nothing: no files, IDs, retention or reservations. The stale "only the final step" wording in §D5, §5, §6 and §9 is rewritten. Tested (§D7) |
 | **SRV-R4b** | The admission classifier could not decide from headers, because in 2025-11-25 every message is a `POST /mcp` | Four stages (§D2.4): header-only rejection first; bodies read within a bounded ingress budget; method and id parsed; then three admission classes (control with its own reserve and priority, `page_state`, calls). **The exact guarantee:** controls are served ahead of calls and never wait for the engine. Beyond their reserve they too get `503`. Tests: a cancel behind many small tool POSTs at full capacity, and control-reserve saturation (§D7) |
 | **SRV-R3b** | `page_state` was still behind the engine wrapper | `page_state`, the tool and the resource, is a snapshot-and-inbox-only handler, with no engine slot and its own small admission class (§D2.4, §D4). Tested while a tool holds the slot (§D7) |
-| **SRV-R5** | Headless isolation was overclaimed while stdio and serve shared a default captures directory | Writer ownership is enforced: a `.owner` file records the writer kind on first use, and each binary refuses the other kind's directory. The defaults are distinct (`<profiles>/captures` for stdio, `<profiles>/captures-serve` for serve). The reaper-held lease (CAP-R6b) carries into crash concurrency: a restarted serve refuses capture until the reaper has reaped both children, and recovery checks the reaper's identity and start time. The later page bridge may only read a stdio directory (§2, §D3.5, §D7) |
+| **SRV-R5** | Headless isolation was overclaimed while stdio and serve shared a default captures directory | Writer ownership is enforced: a `.owner` file records the writer kind on first use, and each binary refuses the other kind's directory. The defaults are distinct (`<profiles>/captures` for stdio, `<profiles>/captures-hub` for serve). The reaper-held lease (CAP-R6b) carries into crash concurrency: a restarted serve refuses capture until the reaper has reaped both children, and recovery checks the reaper's identity and start time. The later page bridge may only read a stdio directory (§2, §D3.5, §D7) |
 | **SRV-R6** | The transport contradicted itself: the capture design's §9.1 used POST SSE while this design is JSON-only | The transport is JSON-only, with no SSE responses, progress or server-to-client requests. CAP-R8's two-step `capture`, then `capture_wait` with a timeout of at most 45 s, keeps every call under the 60 s first-byte limit. **Elicitation is removed from both documents**: §1.3, §D2.5, §6 and §9 no longer mention it as an option. The capture design drops its POST-SSE and progress requirement (§D2.5) |
 
 ### 10.3 Review #408 (Codex, 2026-11-15)

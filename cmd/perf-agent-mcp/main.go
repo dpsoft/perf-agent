@@ -300,9 +300,12 @@ func checkCapturesDir(profiles, dir string) (string, error) {
 	}
 	defer func() { _ = root.Close() }()
 	fi, err := root.Stat(rel)
+	self, serr := root.Stat(".")
 	switch {
 	case err == nil && !fi.IsDir():
 		return "", errors.New("it is not a directory; name a directory inside the profiles root")
+	case err == nil && serr == nil && os.SameFile(fi, self):
+		return "", fmt.Errorf("it is the profiles root itself %s, through a link; name a subdirectory of it, such as captures", profiles)
 	case err == nil, errors.Is(err, fs.ErrNotExist):
 		return rel, nil
 	case errors.Is(err, fs.ErrPermission):

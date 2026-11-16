@@ -251,6 +251,13 @@ func TestRunValidatesTheCapturesDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(profiles, "file"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Links that lead back to the profiles root itself.
+	if err := os.Symlink(".", filepath.Join(profiles, "self")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(profiles, "inside", "up")); err != nil {
+		t.Fatal(err)
+	}
 	var got perfmcp.Config
 	configHook = func(c *perfmcp.Config) {
 		got = *c
@@ -274,6 +281,9 @@ func TestRunValidatesTheCapturesDir(t *testing.T) {
 		{"inside/..", "the profiles root itself", 2},
 		{profiles, "the profiles root itself", 2},
 		{profiles + "/", "the profiles root itself", 2},
+		{"self", "the profiles root itself", 2},
+		{"inside/up", "the profiles root itself", 2},
+		{filepath.Join(profiles, "self"), "the profiles root itself", 2},
 	} {
 		got = perfmcp.Config{}
 		var out, errb bytes.Buffer

@@ -1331,6 +1331,27 @@ func TestKeptHistoriesStayBounded(t *testing.T) {
 	}
 }
 
+// A capture directory that is the profiles root itself, through a link,
+// is refused when it is opened: captures never mix with the profiles.
+func TestACaptureDirThatIsTheProfilesRootIsRefused(t *testing.T) {
+	profiles := t.TempDir()
+	if err := os.Symlink(".", filepath.Join(profiles, "self")); err != nil {
+		t.Fatal(err)
+	}
+	e := newJobEnv(t, jobOpts{profiles: profiles, setup: func(s *Server) { s.captureCfg.Dir = "self" }})
+	d, ce := e.s.openCaptureDir()
+	if ce == nil {
+		d.close()
+		t.Fatal("the profiles root was opened as the capture directory")
+	}
+	if ce.Code != capture.CodeDisabled || !strings.Contains(ce.Message, "profiles root itself") {
+		t.Errorf("%v", ce)
+	}
+	if _, err := os.Lstat(filepath.Join(profiles, ownerFile)); err == nil {
+		t.Error(".owner was written in the profiles root")
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

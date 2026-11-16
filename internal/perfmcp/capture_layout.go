@@ -104,6 +104,14 @@ func (s *Server) openCaptureDir() (*captureDir, *capture.Error) {
 	if err != nil {
 		return nil, capture.Errorf(capture.CodeDisk, next, "cannot open the capture directory %s inside the profiles root: %s", rel, causeText(err))
 	}
+	// A link can lead back to the root: captures never mix with profiles.
+	if fi, err := root.Stat("."); err == nil {
+		if pi, err := s.profiles.Stat("."); err == nil && os.SameFile(fi, pi) {
+			_ = root.Close()
+			return nil, capture.Errorf(capture.CodeDisabled, "start perf-agent-mcp with --captures naming a subdirectory of the profiles root",
+				"the capture directory (--captures) is the profiles root itself, through a link")
+		}
+	}
 	d := &captureDir{root: root, rel: rel, owner: kind, profiles: profiles}
 	if e := s.claimOwner(d); e != nil {
 		d.close()

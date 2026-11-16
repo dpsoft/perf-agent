@@ -418,6 +418,9 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	if a.ID == "" {
 		return toolError(invalidArgument("pass the job id capture answered, or a capture id as <series>/NNN", "capture_wait needs id"), nil), nil
 	}
+	if e := bareCaptureID("capture_wait", a.ID); e != nil {
+		return toolError(e, nil), nil
+	}
 	d, e := waitTimeout(a.Timeout)
 	if e != nil {
 		return toolError(e, nil), nil
@@ -440,6 +443,16 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		return toolError(unknownCapture(a.ID, "no capture job of this server, and no capture id as <series>/NNN"), nil), nil
 	}
 	return s.waitHistorical(ctx, key, jobID, d, a.ID), nil
+}
+
+// bareCaptureID refuses a capture's number without its series (001): a
+// capture id names its series, as capture_list's capture field shows it.
+func bareCaptureID(tool, id string) *capture.Error {
+	if _, ok := parseID(id); !ok {
+		return nil
+	}
+	return invalidArgument(fmt.Sprintf("pass the capture id with its series, <series>/%s, as capture_list's capture field shows it, or the job id capture answered", id),
+		"%s takes a job id or a capture id <series>/%s, and %s names no series", tool, id, id)
 }
 
 // fromReceipt is what is left of a call's wait d, which counts from when
@@ -849,7 +862,7 @@ func (e *inProgressError) answer(asked, key string) mcpstdio.Result {
 	}
 	r, _ := answer(struct {
 		ID         string `json:"id"`
-		Capture    string `json:"capture"`
+		Capture    string `json:"capture_id"`
 		Status     string `json:"status"`
 		RetryAfter string `json:"retry_after"`
 		Next       string `json:"next"`
@@ -1053,10 +1066,11 @@ func (s *Server) captureCancelTool() mcpstdio.Tool {
 	}
 }
 
-// cancelAnswer is capture_cancel's answer.
+// cancelAnswer is capture_cancel's answer, with the job's capture id
+// (series/NNN) once it has one.
 type cancelAnswer struct {
 	Job    string `json:"job"`
-	ID     string `json:"id,omitzero"`
+	ID     string `json:"capture_id,omitzero"`
 	Status string `json:"status"`
 }
 
@@ -1076,6 +1090,9 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	if a.ID == "" {
 		return toolError(invalidArgument("pass the job id capture answered", "capture_cancel needs id"), nil), nil
+	}
+	if e := bareCaptureID("capture_cancel", a.ID); e != nil {
+		return toolError(e, nil), nil
 	}
 	out := cancelAnswer{Job: a.ID}
 	if j, ok := s.registry.get(a.ID); ok {

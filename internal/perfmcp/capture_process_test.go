@@ -481,7 +481,7 @@ func groupGone(pgid int) bool { return syscall.Kill(-pgid, 0) == syscall.ESRCH }
 // disk and whose manifest is not yet.
 type inProgress struct {
 	ID         string `json:"id"`
-	Capture    string `json:"capture"`
+	Capture    string `json:"capture_id"`
 	Status     string `json:"status"`
 	RetryAfter string `json:"retry_after"`
 	Next       string `json:"next"`

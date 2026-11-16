@@ -16,7 +16,7 @@ import (
 // loading, or in_progress.
 type waitAnswer struct {
 	ID         string `json:"id"`
-	Capture    string `json:"capture"`
+	Capture    string `json:"capture_id"`
 	Status     string `json:"status"`
 	RetryAfter string `json:"retry_after"`
 	Next       string `json:"next"`

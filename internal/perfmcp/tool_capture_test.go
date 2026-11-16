@@ -366,13 +366,15 @@ func TestCaptureWaitTimeouts(t *testing.T) {
 	if took < 300*time.Millisecond || took > 5*time.Second {
 		t.Errorf("a 300ms wait took %v", took)
 	}
-	for _, unknown := range []string{"j9-ffff", "nope/001", "001"} {
+	for unknown, code := range map[string]capture.Code{
+		"j9-ffff": capture.CodeUnknownCapture, "nope/001": capture.CodeUnknownCapture, "001": capture.CodeInvalidArgument,
+	} {
 		text, isErr := c.call("capture_wait", map[string]any{"id": unknown, "timeout": "1s"})
 		if !isErr {
 			t.Fatalf("%s answered %s", unknown, text)
 		}
-		if w := toolErrorOf(t, text); w.Code != string(capture.CodeUnknownCapture) || !strings.Contains(w.Next, "capture_list") {
-			t.Errorf("%s: %+v", unknown, w)
+		if w := toolErrorOf(t, text); w.Code != string(code) || !strings.Contains(w.Next, "capture_list") {
+			t.Errorf("%s: %+v, want %s", unknown, w, code)
 		}
 	}
 	c.callOK("capture_cancel", map[string]any{"id": id}, nil)
@@ -478,7 +480,7 @@ func TestCaptureCancelStopsTheChildPromptly(t *testing.T) {
 	e.noteRecord()
 	var a map[string]string
 	c.callOK("capture_cancel", map[string]any{"id": "adhoc/001"}, &a)
-	if a["status"] != cancelAnswerCancelling || a["job"] != id || a["id"] != "adhoc/001" {
+	if a["status"] != cancelAnswerCancelling || a["job"] != id || a["capture_id"] != "adhoc/001" {
 		t.Fatalf("cancel %v", a)
 	}
 	grace := e.s.lim.Capture.StopGrace + time.Second
@@ -531,14 +533,17 @@ func TestEOFStopsTheChildPromptly(t *testing.T) {
 func TestCaptureCancelUnknownIDDoesNoIO(t *testing.T) {
 	var lookups atomic.Int32
 	e, c := newCapEnv(t, jobOpts{setup: func(s *Server) { s.lookupHook = func(string) { lookups.Add(1) } }})
-	for _, id := range []string{"j9-ffff", "adhoc/001", "001", "../x"} {
+	for id, code := range map[string]capture.Code{
+		"j9-ffff": capture.CodeUnknownCapture, "adhoc/001": capture.CodeUnknownCapture,
+		"001": capture.CodeInvalidArgument, "../x": capture.CodeUnknownCapture,
+	} {
 		begin := time.Now()
 		text, isErr := c.call("capture_cancel", map[string]any{"id": id})
 		if !isErr {
 			t.Fatalf("%s answered %s", id, text)
 		}
-		if w := toolErrorOf(t, text); w.Code != string(capture.CodeUnknownCapture) {
-			t.Errorf("%s: %+v", id, w)
+		if w := toolErrorOf(t, text); w.Code != string(code) {
+			t.Errorf("%s: %+v, want %s", id, w, code)
 		}
 		if took := time.Since(begin); took > time.Second {
 			t.Errorf("%s took %v", id, took)
@@ -1517,7 +1522,7 @@ func TestEvictedIDsStillAnswer(t *testing.T) {
 	for _, id := range []string{done, "x/001"} {
 		var a map[string]string
 		c.callOK("capture_cancel", map[string]any{"id": id}, &a)
-		if a["status"] != cancelAnswerTooLate || a["job"] != done || a["id"] != "x/001" {
+		if a["status"] != cancelAnswerTooLate || a["job"] != done || a["capture_id"] != "x/001" {
 			t.Errorf("cancel %s: %v", id, a)
 		}
 	}

@@ -47,11 +47,20 @@ type listArgs struct {
 	Cursor string  `json:"cursor"`
 }
 
-// listJob is a job of this server as capture_list shows it.
+// listJob is a job of this server as capture_list shows it: its state,
+// with its number in the series (id) and its capture id (capture,
+// series/NNN), as the history's rows name them.
 type listJob struct {
-	jobView
-	Series string `json:"series"`
-	Label  string `json:"label"`
+	Job     string `json:"job"`
+	ID      string `json:"id,omitzero"`
+	Capture string `json:"capture,omitzero"`
+	Status  string `json:"status"`
+	Phase   string `json:"phase,omitzero"`
+	Elapsed string `json:"elapsed,omitzero"`
+	ETA     string `json:"eta,omitzero"`
+	Derived string `json:"derived,omitzero"`
+	Series  string `json:"series"`
+	Label   string `json:"label"`
 }
 
 // seriesRow is a series of the capture directory: its captures (marker-
@@ -170,7 +179,10 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		for _, j := range s.registry.list() {
 			js, label := cmp.Or(j.req.Series, defaultSeries), cmp.Or(j.req.Label, defaultLabel)
 			if series == "" || js == series {
-				out.Jobs = append(out.Jobs, listJob{jobView: j.view(), Series: js, Label: label})
+				v := j.view()
+				_, num, _ := strings.Cut(v.ID, "/")
+				out.Jobs = append(out.Jobs, listJob{Job: v.Job, ID: num, Capture: v.ID, Status: v.Status, Phase: v.Phase,
+					Elapsed: v.Elapsed, ETA: v.ETA, Derived: v.Derived, Series: js, Label: label})
 			}
 		}
 	}

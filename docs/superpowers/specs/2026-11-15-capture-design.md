@@ -261,8 +261,8 @@ is released, against the snapshot.
 | Tool | Blocks for | Returns |
 |---|---|---|
 | `capture` (arguments §4.2) | microseconds: no I/O, no lock, no engine | `{job, status: "accepted", eta}`, or a synchronous `invalid_argument` or `busy` (in-process slot) error. Cross-process `busy` and every later error arrive as the job's `failed` state |
-| `capture_wait {id, timeout?}` (a job id or a capture id) | at most `timeout`, default 30 s, **capped at 45 s**, and never past its own deadline. It reads the job registry; a historical id goes to the lookup pool (CAP-R14). Never the engine | the current state. When `done` with `derived: ready`, the §4.3 result. Otherwise `{job, id?, status, phase, elapsed, eta, derived?}`, or `status: "loading"` when a historical lookup has not finished by the deadline |
-| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias. A job whose commit is undecided (CAP-R50) answers `cancelling (decision pending)`, from the job, the registry and the alias; the cancel is recorded and reported when the commit is settled: `too late: committed` if the link was made, `cancelled` if it was not (CAP-R64). Such a job is never evicted from the registry until it is settled (CAP-R65), and its decision word is settled at one point: for a link judged not made, the moment it is judged, so a cancel before it wins (`cancelled`, as the failure manifest then says) and one after it is told `too late: failed`; for a link that was made, the step that sets the final status, so a cancel before it is reported `too late: committed` (CAP-R66, CAP-R69). Job status, manifest outcome and answer always agree. A job's slot is freed before its end is visible, so a client that sees the end can start the next capture at once (CAP-R67) |
+| `capture_wait {id, timeout?}` (a job id or a capture id) | at most `timeout`, default 30 s, **capped at 45 s**, and never past its own deadline. It reads the job registry; a historical id goes to the lookup pool (CAP-R14). Never the engine | the current state. When `done` with `derived: ready`, the §4.3 result. Otherwise `{job, capture_id?, status, phase, elapsed, eta, derived?}` (`capture_id` is the capture id, `series/NNN`, once assigned, as a job's error names it), or `status: "loading"` when a historical lookup has not finished by the deadline |
+| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, capture_id?, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias. A job whose commit is undecided (CAP-R50) answers `cancelling (decision pending)`, from the job, the registry and the alias; the cancel is recorded and reported when the commit is settled: `too late: committed` if the link was made, `cancelled` if it was not (CAP-R64). Such a job is never evicted from the registry until it is settled (CAP-R65), and its decision word is settled at one point: for a link judged not made, the moment it is judged, so a cancel before it wins (`cancelled`, as the failure manifest then says) and one after it is told `too late: failed`; for a link that was made, the step that sets the final status, so a cancel before it is reported `too late: committed` (CAP-R66, CAP-R69). Job status, manifest outcome and answer always agree. A job's slot is freed before its end is visible, so a client that sees the end can start the next capture at once (CAP-R67) |
 | `capture_list` (§4.6) | the in-memory jobs at once; the history through the lookup pool, to the call's deadline | active and recent jobs first, then the history from the manifests, with `"loading": true` for pages not read in time |
 
 **Ownership (SRV-R7).** Jobs belong to the server, not to sessions:
@@ -382,7 +382,7 @@ tool inputs (`limit`, `context`). There is no `env` argument (§6.4) and no
 
 ```json
 capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "parse-opt", "label": "base", "duration": "20s", "keep": true}
-   → {id "parse-opt/001", status "running"}; capture_wait {"id": "parse-opt/001"} → handle h1
+   → {job "j1-3f9a", status "accepted"}; capture_wait {"id": "j1-3f9a"} → handle h1, capture "parse-opt/001"
 … change code, rebuild …
 capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "parse-opt", "label": "cand1", "compare_with": "001"}
    → running; capture_wait → handle h2, diff summary 001 → 002, with the diff call to run for more
@@ -396,6 +396,7 @@ capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "pa
 {
   "capture": {
     "id": "002",
+    "capture": "parse-opt/002",
     "series": "parse-opt",
     "label": "cand1",
     "manifest": "captures/parse-opt/002-cand1.capture.json",
@@ -550,7 +551,11 @@ the series' history. It is subject to retention like any capture.
 the **manifests on disk** (§7.2), not from memory, so a loop whose stdio
 server restarts between iterations still finds its history. Each row
 holds:
-- id, label, outcome (`ok` or the failure code), `stopped_by`;
+- `id` (the number in the series, `001`, as `compare_with` takes it) and
+  `capture` (the capture id, `parse-opt/001`, as `capture_wait` and
+  `capture_cancel` take it; a bare `001` there is `invalid_argument`
+  naming `<series>/001`, CAP-R86), label, outcome (`ok` or the failure
+  code), `stopped_by`;
 - settings and `settings_digest`, the target `comm` and build-id;
 - the time and the paths;
 - `kept`, and the baseline it was compared with;

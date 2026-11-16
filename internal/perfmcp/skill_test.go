@@ -25,7 +25,7 @@ var skillArgs = []string{
 	// codes are capture.DefaultRetryable's.
 	"command", "pid", "series", "label", "keep", "job", "timeout", "compare_with", "compare", "next",
 	"error", "code", "retryable", "retry_after", "recompute", "handles", "reopen",
-	"comparability", "status", "done", "interrupted", "derived",
+	"comparability", "status", "done", "interrupted", "derived", "capture_id",
 }
 
 // captureCodes are the capture failure codes, which the skill may cite.

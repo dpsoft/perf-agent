@@ -34,6 +34,7 @@ type captureResult struct {
 // captureInfo is the capture itself, as its manifest records it.
 type captureInfo struct {
 	ID                 string         `json:"id"`
+	Capture            string         `json:"capture"`
 	Series             string         `json:"series"`
 	Label              string         `json:"label"`
 	Manifest           string         `json:"manifest"`
@@ -159,7 +160,7 @@ func (s *Server) captureInfo(m manifest) captureInfo {
 		m.Target.Exit = "exited after " + cmp.Or(m.ProfiledDuration, "an unknown time")
 	}
 	return captureInfo{
-		ID: m.ID, Series: m.Series, Label: m.Label, Manifest: s.capturePath(m.Series, manifestName(id, m.Label)),
+		ID: m.ID, Capture: captureKey(m.Series, m.ID), Series: m.Series, Label: m.Label, Manifest: s.capturePath(m.Series, manifestName(id, m.Label)),
 		Settings: m.Settings, SettingsDigest: m.SettingsDigest, Target: m.Target, Modes: m.Settings.Modes,
 		RequestedDuration: m.Settings.Duration, ProfiledDuration: m.ProfiledDuration, AttachLatency: m.AttachLatency,
 		SampleRate: m.Settings.SampleRate, KernelStacks: m.Settings.KernelStacks, StoppedBy: m.StoppedBy,

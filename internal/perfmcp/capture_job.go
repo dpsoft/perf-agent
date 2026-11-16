@@ -78,10 +78,11 @@ type captureRequest struct {
 }
 
 // jobView is a job's state as capture_wait shows it; empty values are left
-// out.
+// out. ID is its capture id, series/NNN, once assigned: what capture_wait
+// takes, as capture_id, the name a job's error gives it too.
 type jobView struct {
 	Job     string `json:"job"`
-	ID      string `json:"id,omitzero"`
+	ID      string `json:"capture_id,omitzero"`
 	Status  string `json:"status"`
 	Phase   string `json:"phase,omitzero"`
 	Elapsed string `json:"elapsed,omitzero"`

@@ -302,8 +302,10 @@ type retention struct {
 // not, every file is put back, and the capture is kept and noted. What an
 // interrupted pass left under quarantine names is put back first. So no id
 // is ever handed out again: the manifest, or its marker, outlives the
-// files. It runs under the captures lock and the engine, and returns the
-// captures it evicted, "<series>/<NNN>-<label>", each logged.
+// files. It runs under the captures lock but not the engine: p, what it
+// must keep, was snapshotted under the engine (protected), which was then
+// released, so the hashing and removals hold no tool call up. It returns
+// the captures it evicted, "<series>/<NNN>-<label>", each logged.
 func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []string, err error) {
 	if p.err != nil {
 		return nil, capture.Errorf(capture.CodeDisk, "", "retention removed nothing in the capture directory %s inside the profiles root: it could not read what it must keep: %s",

@@ -120,7 +120,8 @@ func (s *Server) maintain() {
 
 // maintenance is one pass: under the directory slot, then the captures
 // lock (skipped when another capture holds it), it retries the stranded
-// rollbacks and, when full, recovers and runs retention under the engine.
+// rollbacks and, when full, recovers and runs retention: what it must keep
+// is snapshotted under the engine, and the evictions run outside it.
 // A full pass waits for a job holding the slot; a retry pass leaves the
 // directory to a running job, which retries before it captures.
 func (s *Server) maintenance(full bool) {

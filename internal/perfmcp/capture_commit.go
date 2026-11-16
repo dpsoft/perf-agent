@@ -559,17 +559,20 @@ func (t *captureTxn) probe() error {
 		return nil
 	}
 	where := fmt.Sprintf("the capture directory %s is inside the profiles root %s", t.d.rel, t.d.profiles)
+	// Not a switch on errno: ENOTSUP and EOPNOTSUPP are one value on Linux
+	// and two on darwin.
 	errno, _ := errors.AsType[syscall.Errno](lerr)
-	switch {
-	case errno == syscall.EPERM || errno == syscall.ENOTSUP || errno == syscall.EOPNOTSUPP || errno == syscall.EXDEV:
+	if errno == syscall.EPERM || errno == syscall.ENOTSUP || errno == syscall.EOPNOTSUPP || errno == syscall.EXDEV {
 		return capture.Errorf(capture.CodeDisabled,
 			"start perf-agent-mcp with --captures naming a directory inside the profiles root on a filesystem that supports hard links",
 			"%v (%s)", lerr, where)
-	case errno == syscall.ENOSPC || errno == syscall.EDQUOT:
+	}
+	if errno == syscall.ENOSPC || errno == syscall.EDQUOT {
 		return capture.Errorf(capture.CodeDisk,
 			"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
 			"there is no room to make a hard link in the capture directory: %s (%s)", errnoText(lerr), where)
-	case errno == syscall.EMLINK:
+	}
+	if errno == syscall.EMLINK {
 		return capture.Errorf(capture.CodeDisk,
 			"start perf-agent-mcp with --captures naming a directory inside the profiles root on another filesystem",
 			"the filesystem refused a second link to a new file, too many links: %s (%s)", errnoText(lerr), where)

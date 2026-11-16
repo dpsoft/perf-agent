@@ -146,10 +146,7 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 			alias.Name = tn
 			if why, _ := matches(ser, tn, alias); why != "" {
 				var ok bool
-				if alias, ok = proveByToken(ser, tn, in, maxManifestBytes, func(b []byte) bool {
-					var other intent
-					return json.Unmarshal(b, &other) == nil && other.Token == in.Token && other.ID == in.ID && other.Label == in.Label
-				}); !ok {
+				if alias, ok = proveByToken(ser, tn, in, maxManifestBytes, in.holdsToken); !ok {
 					continue
 				}
 			}

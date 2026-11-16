@@ -139,13 +139,19 @@ func TestATokenTempSharingTheIntentsInodeIsRemoved(t *testing.T) {
 }
 
 // TestAnIntentTempThatCouldNotBeRemovedIsRetried: when removing the
-// intent's temporary fails, the capture goes on, records it, and removes
-// it with the rest.
+// intent's or the heartbeat's temporary fails, the capture goes on,
+// records it, and removes it with the rest.
 func TestAnIntentTempThatCouldNotBeRemovedIsRetried(t *testing.T) {
+	for _, op := range []string{"remove intent temp", "remove heartbeat temp"} {
+		t.Run(op, func(t *testing.T) { tempRemovalRetried(t, op) })
+	}
+}
+
+func tempRemovalRetried(t *testing.T, failing string) {
 	s, d, _ := newCaptureServer(t)
 	failed := false
 	s.writeErr = func(op string) error {
-		if op == "remove intent temp" && !failed {
+		if op == failing && !failed {
 			failed = true
 			return syscall.EIO
 		}

@@ -130,7 +130,9 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		}
 	}
 	captureDir := *captures
-	if captureDir != "" {
+	// Without --perf-agent, --captures has no effect, and the warning
+	// below says so: it is not checked.
+	if captureDir != "" && *perfAgent != "" {
 		var err error
 		if captureDir, err = checkCapturesDir(*profiles, captureDir); err != nil {
 			_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: --captures %s: %v\n", *captures, err)
@@ -288,6 +290,9 @@ func checkCapturesDir(profiles, dir string) (string, error) {
 	}
 	if rel == "" || !filepath.IsLocal(rel) {
 		return "", fmt.Errorf("it is outside the profiles root %s; name a directory inside it", profiles)
+	}
+	if rel = filepath.Clean(rel); rel == "." {
+		return "", fmt.Errorf("it is the profiles root itself %s; name a subdirectory of it, such as captures", profiles)
 	}
 	root, err := os.OpenRoot(profiles)
 	if err != nil {

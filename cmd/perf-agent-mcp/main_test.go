@@ -270,10 +270,14 @@ func TestRunValidatesTheCapturesDir(t *testing.T) {
 		{"away/runs", "outside the profiles root", 2},
 		{"away", "outside the profiles root", 2},
 		{"file", "not a directory", 2},
+		{".", "the profiles root itself", 2},
+		{"inside/..", "the profiles root itself", 2},
+		{profiles, "the profiles root itself", 2},
+		{profiles + "/", "the profiles root itself", 2},
 	} {
 		got = perfmcp.Config{}
 		var out, errb bytes.Buffer
-		code := run([]string{"--profiles", profiles, "--captures", c.dir}, strings.NewReader(""), &out, &errb)
+		code := run([]string{"--profiles", profiles, "--perf-agent", "/opt/perf-agent/perf-agent", "--captures", c.dir}, strings.NewReader(""), &out, &errb)
 		if code != c.code {
 			t.Errorf("--captures %s: exit %d, want %d; stderr %q", c.dir, code, c.code, errb.String())
 			continue
@@ -283,6 +287,20 @@ func TestRunValidatesTheCapturesDir(t *testing.T) {
 		}
 		if code != 0 && (!strings.Contains(errb.String(), "--captures") || !strings.Contains(errb.String(), c.want)) {
 			t.Errorf("--captures %s: stderr %q, want it to name --captures and %q", c.dir, errb.String(), c.want)
+		}
+	}
+}
+
+// Without --perf-agent, --captures is not checked: it has no effect, and
+// the one line saying so is all the server says of it.
+func TestRunLeavesCapturesUncheckedWithoutPerfAgent(t *testing.T) {
+	for _, dir := range []string{"../runs", "."} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"--profiles", t.TempDir(), "--captures", dir}, strings.NewReader(""), &out, &errb); code != 0 {
+			t.Errorf("--captures %s without --perf-agent: exit %d, stderr %q", dir, code, errb.String())
+		}
+		if !strings.Contains(errb.String(), "without --perf-agent") || strings.Contains(errb.String(), "profiles root") {
+			t.Errorf("--captures %s without --perf-agent: stderr %q", dir, errb.String())
 		}
 	}
 }

@@ -42,14 +42,19 @@ func (d *decisionWord) requestCancel() string {
 			return cancelAnswerCancelling
 		case decisionManifestInFlight:
 			d.cancelInFlight.Store(true)
-			// The job stores committed before it reads cancelInFlight, and
-			// this reads the word after storing it, so one of the two sees
-			// the other: either settle reports the cancel as too late, or
-			// this answer already says so.
-			if d.v.Load() == decisionCommitted {
+			// settle stores the outcome before it reads cancelInFlight, and
+			// this reads the word after storing the flag, so one of the two
+			// sees the other. Still in flight: settle will see the flag.
+			// Committed: the answer is too late. Back to open or
+			// cancel_requested: the link failed and settle may have read
+			// the flag before it was set, so go round and ask again, which
+			// moves an open word to cancel_requested.
+			switch d.v.Load() {
+			case decisionManifestInFlight:
+				return cancelAnswerCancelling
+			case decisionCommitted:
 				return cancelAnswerTooLate
 			}
-			return cancelAnswerCancelling
 		default:
 			return cancelAnswerTooLate
 		}
@@ -70,16 +75,18 @@ func (d *decisionWord) beginManifest() bool {
 func (d *decisionWord) settle(linked bool) (cancel string) {
 	if linked {
 		d.v.Store(decisionCommitted)
-		if d.cancelInFlight.Load() {
+		if d.cancelInFlight.Swap(false) {
 			return cancelAnswerTooLate
 		}
 		return ""
 	}
-	if d.cancelInFlight.Load() {
+	// The word leaves manifest_in_flight before the flag is read, so a
+	// cancel that sets the flag later sees the word move and asks again.
+	d.v.Store(decisionOpen)
+	if d.cancelInFlight.Swap(false) {
 		d.v.Store(decisionCancelRequested)
 		return cancelAnswerCancelled
 	}
-	d.v.Store(decisionOpen)
 	return ""
 }
 

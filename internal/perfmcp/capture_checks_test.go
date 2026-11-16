@@ -53,6 +53,7 @@ func TestReadManifestRefusesWhatItDidNotWrite(t *testing.T) {
 		{"id", func(m *manifest) { m.ID = "002" }},
 		{"label", func(m *manifest) { m.Label = "other" }},
 		{"outcome", func(m *manifest) { m.Outcome = "maybe" }},
+		{"outcome-without-files", func(m *manifest) { m.Outcome, m.Files = "maybe", nil }},
 		{"ok-without-files", func(m *manifest) { m.Files = nil }},
 		{"failed-with-files", func(m *manifest) { m.Outcome = captureFailed }},
 		{"interrupted-with-files", func(m *manifest) { m.Outcome = captureInterrupted }},

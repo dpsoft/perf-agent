@@ -920,6 +920,9 @@ func (t *captureTxn) removeStaging() error {
 		t.note("left", dir, "not the staging directory this capture created")
 		return nil
 	}
+	if openStagingHook != nil {
+		openStagingHook(t.ser, dir)
+	}
 	sr, err := t.ser.OpenRoot(dir)
 	if err != nil {
 		return err
@@ -950,6 +953,10 @@ func (t *captureTxn) removeStaging() error {
 	}
 	return nil
 }
+
+// openStagingHook, when set, runs between the staging directory's Lstat
+// and its opening; a seam for tests.
+var openStagingHook func(ser *os.Root, dir string)
 
 // emptyStaging removes from the opened staging root what this capture
 // put there, and reports whether anything had to stay.

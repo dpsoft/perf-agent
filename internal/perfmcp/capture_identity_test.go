@@ -158,3 +158,27 @@ func TestAnIntentTempThatCouldNotBeRemovedIsRetried(t *testing.T) {
 		t.Fatalf("temporaries left: %v", temps)
 	}
 }
+
+// TestAStagingDirectorySwappedAfterItsCheckIsLeft: the staging directory
+// is proven again once it is open, so a directory swapped in after the
+// first check keeps what it holds.
+func TestAStagingDirectorySwappedAfterItsCheckIsLeft(t *testing.T) {
+	s, d, clk, r := crashedIntent(t)
+	series := filepath.Join(d.root.Name(), "adhoc")
+	staging := filepath.Join(series, r.txn.in.Staging)
+	openStagingHook = func(*os.Root, string) {
+		if err := os.Rename(staging, staging+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(staging, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(staging, "cpu.pb.gz"), []byte("user"))
+	}
+	defer func() { openStagingHook = nil }()
+	notes := crashRecover(t, s, d, clk)
+	if got, err := os.ReadFile(filepath.Join(staging, "cpu.pb.gz")); err != nil || string(got) != "user" {
+		t.Fatalf("the swapped-in directory's file is %q, %v", got, err)
+	}
+	invariant(t, d, notes, filepath.Base(staging)+".moved")
+}

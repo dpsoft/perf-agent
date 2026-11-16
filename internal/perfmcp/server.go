@@ -13,6 +13,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
@@ -71,6 +73,22 @@ type Server struct {
 	perfAgent       capture.Binary
 	shim            capture.Shim
 	captureDisabled string
+
+	// The capture file protocol's seams, all nil outside tests: now is the
+	// clock (time.Now); ownerAlive judges an intent's owner (by its
+	// recorded PIDs and start times); captureFault fails, or simulates a
+	// crash at, a protocol boundary; writeErr fails a named write.
+	now          func() time.Time
+	ownerAlive   func(intent) bool
+	captureFault func(faultPoint) error
+	writeErr     func(op string) error
+	// ownerSeen is the capture directory's owner kind once it was read,
+	// so a mismatch is refused without I/O.
+	ownerSeen atomic.Pointer[string]
+	// stranded are this server's rollbacks that could not commit their
+	// failure manifest yet; capMu guards the list.
+	capMu    sync.Mutex
+	stranded []*captureTxn
 }
 
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
@@ -228,6 +246,7 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 // their connections are dropped, so a tab that stopped reading delays Close
 // by at most that.
 func (s *Server) Close() error {
+	s.stopStranded()
 	if s.live != nil {
 		s.live.close()
 	}

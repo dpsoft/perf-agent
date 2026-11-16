@@ -357,6 +357,17 @@ func (r *Run) Kill() {
 	r.wakeKill()
 }
 
+// Reaper is the capture's reaper by its PID and start time, which the
+// server records in the capture's intent and the lock file, so recovery
+// and a busy answer can tell the capture's owner still runs. It is read
+// once the capture has started, while the reaper is this process's
+// unreaped child; the start time is 0 when it cannot be read.
+func (r *Run) Reaper() (pid int, start uint64) {
+	pid = r.reaper.PID()
+	start, _ = StartTime(r.spec.Proc, pid)
+	return pid, start
+}
+
 // Wait blocks until the reaper reports its cleanup, or exits without
 // doing so, or does not answer a kill in time, and returns how the
 // capture ended. The captures lock may stay held by the reaper after Wait

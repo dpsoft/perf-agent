@@ -2,5 +2,7 @@
 
 package capture
 
+import "os"
+
 // FreeBytes is disabled: capture needs Linux.
-func FreeBytes(string) (int64, error) { return 0, notLinux() }
+func FreeBytes(*os.File) (int64, error) { return 0, notLinux() }

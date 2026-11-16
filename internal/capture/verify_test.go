@@ -244,8 +244,8 @@ func TestEveryCodeHasADocumentedRetryable(t *testing.T) {
 			}
 		}
 	}
-	if len(codes) != 26 {
-		t.Fatalf("%d Code constants in errors.go, want the 26 rows of §4.4", len(codes))
+	if len(codes) != 27 {
+		t.Fatalf("%d Code constants in errors.go, want the 27 rows of §4.4", len(codes))
 	}
 	retryable := []Code{
 		CodeBusy, CodeBudget, CodeTargetChanged, CodeTargetExited, CodePIDReused,

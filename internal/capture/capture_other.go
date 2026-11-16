@@ -134,5 +134,8 @@ func (*Run) Cancel() {}
 // Kill does nothing: there is never a capture here.
 func (*Run) Kill() {}
 
+// Reaper is no process: there is never a capture here.
+func (*Run) Reaper() (int, uint64) { return 0, 0 }
+
 // Wait returns at once: there is never a capture here.
 func (*Run) Wait() Outcome { return Outcome{Err: notLinux(), PerfAgentExit: -1} }

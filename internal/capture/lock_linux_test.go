@@ -196,3 +196,19 @@ func TestBusyWithoutADeadlineSaysUnknown(t *testing.T) {
 		t.Fatalf("got %v", e)
 	}
 }
+
+// A holder with no capture yet (a maintenance pass) and no reaper is named
+// by what it is, without empty fields.
+func TestBusyNamesAHolderWithoutACapture(t *testing.T) {
+	_, root := openDir(t)
+	l, e := TryLock(root, Holder{ServerPID: os.Getpid(), Deadline: time.Now().Add(5 * time.Second)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer func() { _ = l.Close() }()
+	_, e = TryLock(root, Holder{})
+	if e == nil || strings.Contains(e.Message, "capture  by") || strings.Contains(e.Message, "reaper pid 0") ||
+		!strings.Contains(e.Message, "perf-agent-mcp pid "+strconv.Itoa(os.Getpid())) || e.RetryAfter > 6*time.Second {
+		t.Fatalf("got %v (retry after %v)", e, e.RetryAfter)
+	}
+}

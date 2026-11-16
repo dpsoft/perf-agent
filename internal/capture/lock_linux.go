@@ -93,8 +93,15 @@ func busyError(f *os.File) *Error {
 	if !h.Deadline.IsZero() {
 		ends = h.Deadline.UTC().Format(time.RFC3339)
 	}
-	e.Message = fmt.Sprintf("capture %s by perf-agent-mcp pid %d (reaper pid %d), ends by %s",
-		h.CaptureID, h.ServerPID, h.ReaperPID, ends)
+	what := "the captures directory's maintenance"
+	if h.CaptureID != "" {
+		what = "capture " + h.CaptureID
+	}
+	who := fmt.Sprintf("perf-agent-mcp pid %d", h.ServerPID)
+	if h.ReaperPID > 0 {
+		who += fmt.Sprintf(" (reaper pid %d)", h.ReaperPID)
+	}
+	e.Message = fmt.Sprintf("%s by %s, ends by %s", what, who, ends)
 	if !h.Deadline.IsZero() {
 		e.RetryAfter = max(time.Until(h.Deadline), minRetryAfter)
 	}

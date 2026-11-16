@@ -37,6 +37,9 @@ const (
 	CodeNoOutput             Code = "no_output"
 	CodeStuckChild           Code = "stuck_child"
 	CodeCancelled            Code = "cancelled"
+	// CodeClosing refuses a capture asked of a server that is shutting
+	// down; a new server is needed, so it is not retryable.
+	CodeClosing Code = "closing"
 )
 
 // DefaultRetryable says, per code, whether the same call may succeed
@@ -69,6 +72,7 @@ var DefaultRetryable = map[Code]bool{
 	CodeNoOutput:             true,
 	CodeStuckChild:           false,
 	CodeCancelled:            false,
+	CodeClosing:              false,
 }
 
 // Error is a failure an agent can act on: what happened, whether to retry

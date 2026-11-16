@@ -26,17 +26,22 @@ type Server struct {
 	warned map[string]int
 }
 
-// warn logs the first warning of each kind off the caller's goroutine,
-// and only counts the later ones, so a log nobody reads (a full stderr)
-// never holds the reader or the dispatcher: at most one goroutine per kind
-// can wait on it. Serve logs the counts, the same way, when it returns.
-func (s *Server) warn(kind string, level slog.Level, args ...any) {
+// warn logs the first warning of each kind, per subject (a tool's name,
+// or ""), off the caller's goroutine, and only counts the later ones, so
+// a log nobody reads (a full stderr) never holds the reader or the
+// dispatcher: at most one goroutine per kind and subject can wait on it.
+// Serve logs the counts, the same way, when it returns.
+func (s *Server) warn(kind, subject string, level slog.Level, args ...any) {
+	key := kind
+	if subject != "" {
+		key += " (" + subject + ")"
+	}
 	s.warnMu.Lock()
 	if s.warned == nil {
 		s.warned = map[string]int{}
 	}
-	n := s.warned[kind]
-	s.warned[kind] = n + 1
+	n := s.warned[key]
+	s.warned[key] = n + 1
 	s.warnMu.Unlock()
 	if n == 0 {
 		go s.log.Log(context.Background(), level, kind+"; later ones are counted, not logged", args...)
@@ -230,7 +235,7 @@ func (s *Server) parse(line []byte) (*envelope, *outgoing) {
 		return nil, errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
 	}
 	if env.Method == "" && (len(env.Result) > 0 || len(env.Error) > 0) {
-		s.warn("dropping a client response; this server sends no requests", slog.LevelWarn)
+		s.warn("dropping a client response; this server sends no requests", "", slog.LevelWarn)
 		return nil, nil
 	}
 	if len(env.ID) > 0 && !validID(env.ID) {
@@ -407,7 +412,7 @@ func (s *Server) MaxResultBytes() int {
 func (s *Server) runHandler(ctx context.Context, t Tool, args json.RawMessage) (res Result, err error, panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			s.warn("tool handler panicked", slog.LevelError, "tool", t.Name, "panic", fmt.Sprint(r))
+			s.warn("tool handler panicked", t.Name, slog.LevelError, "tool", t.Name, "panic", fmt.Sprint(r))
 			panicked = true
 		}
 	}()

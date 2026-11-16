@@ -168,7 +168,7 @@ func (ss *session) halted() bool {
 func (ss *session) send(m any) bool {
 	line, err := encodeLine(m)
 	if err != nil {
-		ss.s.warn("encode message", slog.LevelError, "err", err)
+		ss.s.warn("encode message", "", slog.LevelError, "err", err)
 		return false
 	}
 	return ss.out.enqueue(line)
@@ -189,11 +189,11 @@ const tooLargeText = "result too large for the output bound"
 func (ss *session) sendAnswer(env *envelope, out *outgoing) bool {
 	line, err := encodeLine(out)
 	if err != nil {
-		ss.s.warn("encode message", slog.LevelError, "err", err)
+		ss.s.warn("encode message", "", slog.LevelError, "err", err)
 		return false
 	}
 	if 2*len(line) > ss.s.o.MaxOutBytes {
-		ss.s.warn("answer over half the output bound replaced", slog.LevelWarn, "method", env.Method, "bytes", len(line))
+		ss.s.warn("answer over half the output bound replaced", "", slog.LevelWarn, "method", env.Method, "bytes", len(line))
 		small := errorResponse(env.ID, codeInternalError, "internal error: "+tooLargeText)
 		if env.Method == "tools/call" {
 			if raw, err := marshal(toolResult(Result{Text: tooLargeText, IsError: true})); err == nil {
@@ -201,7 +201,7 @@ func (ss *session) sendAnswer(env *envelope, out *outgoing) bool {
 			}
 		}
 		if line, err = encodeLine(small); err != nil {
-			ss.s.warn("encode message", slog.LevelError, "err", err)
+			ss.s.warn("encode message", "", slog.LevelError, "err", err)
 			return false
 		}
 	}
@@ -443,7 +443,7 @@ func (ss *session) answer(ctx context.Context, env *envelope) (*outgoing, bool) 
 	}
 	raw, err := marshal(result)
 	if err != nil {
-		ss.s.warn("marshal result", slog.LevelError, "method", env.Method, "err", err)
+		ss.s.warn("marshal result", "", slog.LevelError, "method", env.Method, "err", err)
 		return errorResponse(env.ID, codeInternalError, "internal error"), false
 	}
 	return &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}, env.Method == "initialize"

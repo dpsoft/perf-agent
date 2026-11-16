@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -599,5 +601,46 @@ func TestAWarningNeverHoldsTheReader(t *testing.T) {
 	}
 	if n := w.writes.Load(); n > 1 {
 		t.Errorf("%d log writes for one kind of warning", n)
+	}
+}
+
+// syncLog is a log destination a test reads back.
+type syncLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *syncLog) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(b)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// A warning is logged once per kind and tool: a second tool's panic is
+// logged with its own name, not counted as the first one's.
+func TestAPanicIsLoggedOncePerTool(t *testing.T) {
+	var log syncLog
+	o := testOptions()
+	o.Log = slog.New(slog.NewTextHandler(&log, nil))
+	o.Tools = append(o.Tools, Tool{Name: "boom2", Description: "panics too",
+		Handler: func(context.Context, json.RawMessage) (Result, error) { panic("kaboom2") }})
+	c := newClient(t, o)
+	c.init()
+	for i, tool := range []string{"boom", "boom", "boom2"} {
+		c.call(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":{}}}`, i+2, tool))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(log.String(), "tool=boom2") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := log.String()
+	if strings.Count(got, "tool=boom ") != 1 || strings.Count(got, "tool=boom2") != 1 {
+		t.Errorf("log:\n%s", got)
 	}
 }

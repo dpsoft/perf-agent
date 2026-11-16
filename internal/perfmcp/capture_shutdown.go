@@ -105,6 +105,7 @@ func (s *Server) waitJobs(d time.Duration) {
 // retention) at start, then the stranded rollbacks every strandedEvery.
 func (s *Server) maintain() {
 	s.maintenance(true)
+	close(s.startPassDone)
 	tick := time.NewTicker(strandedEvery)
 	defer tick.Stop()
 	for {

@@ -422,9 +422,15 @@ func attachClient(t *testing.T, s *Server) *testClient {
 // two has two handles per mode.
 func (e *jobEnv) commitSynthetic(series, label string, st capture.Settings, meta manifest) int {
 	e.t.Helper()
-	// The directory slot, as a job holds it: the server's start-up
-	// maintenance, which finds the directory this creates, must not
-	// recover the transaction while it is written.
+	// The server's start-up maintenance must be over, or it could find
+	// the directory this creates and recover the transaction while it is
+	// written, and bump the history generation later in the test. Then the
+	// directory slot, as a job holds it.
+	select {
+	case <-e.s.startPassDone:
+	case <-time.After(time.Minute):
+		e.t.Fatal("the start-up maintenance pass never ended")
+	}
 	if !e.s.lockDir(nil) {
 		e.t.Fatal("the server closed")
 	}

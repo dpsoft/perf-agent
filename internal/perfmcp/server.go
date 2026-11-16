@@ -85,6 +85,10 @@ type Server struct {
 	// reaperPause is every capture's RunSpec.FaultPause, which holds its
 	// reaper at a test's barrier; "" outside tests.
 	reaperPause string
+	// startPassDone is closed once the start-up maintenance pass is over,
+	// so a test can write in the capture directory without that pass
+	// recovering what it writes.
+	startPassDone chan struct{}
 	// selfStartTime reads this process's start time for its intents (nil:
 	// /proc).
 	selfStartTime func() (uint64, error)
@@ -232,6 +236,7 @@ func New(cfg Config) (_ *Server, err error) {
 	})
 	if s.captureDisabled == "" {
 		s.lookups = newLookupPool(lookupWorkers, lookupQueue)
+		s.startPassDone = make(chan struct{})
 		if beforeMaintenance != nil {
 			beforeMaintenance(s)
 		}

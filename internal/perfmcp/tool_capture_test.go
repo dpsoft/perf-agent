@@ -1544,3 +1544,56 @@ func TestAnUndecidedCommitIsListedAsUndecided(t *testing.T) {
 	}
 	u.setBroken(false)
 }
+
+// A wait whose budget was spent queueing behind another call still gets a
+// settled job's result: the manifest re-check has a floor of its own, so
+// a budget of zero is not answered loading. By job id and by capture id.
+func TestAWaitWithItsBudgetSpentStillGetsASettledResult(t *testing.T) {
+	_, c := newCapEnv(t, jobOpts{})
+	done := startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"})
+	res, _ := waitResult(t, c, done)
+	running := startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "r", "duration": "60s"})
+	waitStatus(t, c, running, profiling)
+	ahead := c.sendTool("capture_wait", map[string]any{"id": running, "timeout": "2s"}, nil)
+	var queued []int
+	for _, id := range []string{done, "s/" + res.Capture.ID} {
+		queued = append(queued, c.sendTool("capture_wait", map[string]any{"id": id, "timeout": "1s"}, nil))
+	}
+	if r, _ := c.recv(ahead); r.Error != nil {
+		t.Fatalf("the wait ahead: %+v", r.Error)
+	}
+	for i, q := range queued {
+		r, _ := c.recv(q)
+		if text, isErr := c.toolText(r); isErr || !isResult(t, text) {
+			t.Errorf("queued wait %d, its budget spent, answered %s", i, text)
+		}
+	}
+	c.callOK("capture_cancel", map[string]any{"id": running}, nil)
+	waitEnd(t, c, running)
+}
+
+// A loading answer names the id the client asked by, not the capture id
+// the server resolved it to.
+func TestALoadingAnswerNamesTheIDAskedBy(t *testing.T) {
+	var block atomic.Bool
+	release := make(chan struct{})
+	_, c := newCapEnv(t, jobOpts{setup: func(s *Server) {
+		s.lookupHook = func(k string) {
+			if strings.HasPrefix(k, "gone:") && block.Load() {
+				select {
+				case <-release:
+				case <-time.After(10 * time.Second):
+				}
+			}
+		}
+	}})
+	t.Cleanup(func() { close(release) })
+	job := startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"})
+	waitResult(t, c, job)
+	block.Store(true)
+	text, isErr := c.call("capture_wait", map[string]any{"id": job, "timeout": "2s"})
+	var a struct{ ID, Status string }
+	if err := json.Unmarshal([]byte(text), &a); isErr || err != nil || a.Status != statusLoading || a.ID != job {
+		t.Errorf("a wait by job id %s with its re-check hung answered %s", job, text)
+	}
+}

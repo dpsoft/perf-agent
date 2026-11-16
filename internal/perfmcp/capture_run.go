@@ -766,6 +766,7 @@ func (r *jobRun) start() (*capture.Run, *capture.Error) {
 		Bounds:      r.tailBounds(),
 		Lock:        r.lease.File(),
 		Log:         s.log,
+		FaultPause:  s.reaperPause,
 	}
 	shim := ""
 	if slices.Contains(r.eff.Modes, capture.ModeGPU) {

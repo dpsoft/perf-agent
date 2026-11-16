@@ -82,6 +82,9 @@ type Server struct {
 	ownerAlive   func(intent) bool
 	captureFault func(faultPoint) error
 	writeErr     func(op string) error
+	// reaperPause is every capture's RunSpec.FaultPause, which holds its
+	// reaper at a test's barrier; "" outside tests.
+	reaperPause string
 	// selfStartTime reads this process's start time for its intents (nil:
 	// /proc).
 	selfStartTime func() (uint64, error)

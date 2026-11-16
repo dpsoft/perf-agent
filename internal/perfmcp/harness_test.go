@@ -16,7 +16,7 @@ import (
 type testClient struct {
 	t      *testing.T
 	srv    *Server
-	w      *io.PipeWriter
+	w      io.WriteCloser
 	r      *bufio.Reader
 	nextID int
 	// held are answers recv read while it looked for another id.

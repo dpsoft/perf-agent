@@ -26,6 +26,9 @@ type protection struct {
 	files    map[fileKey]bool
 	captures map[string]bool
 	err      error
+	// skipped are the series that could not be opened or listed: nothing
+	// in them is removed, and the others go on.
+	skipped map[string]bool
 }
 
 // captureKey names a capture as the wire does: "<series>/<NNN>".
@@ -40,7 +43,7 @@ func captureKey(series, id string) string { return series + "/" + id }
 // page: a publication holds its profile in memory, so removing its files
 // loses nothing it shows; serve protects them through captureProtect.
 func (s *Server) protected(d *captureDir, baseline string) protection {
-	p := protection{files: map[fileKey]bool{}, captures: map[string]bool{}}
+	p := protection{files: map[fileKey]bool{}, captures: map[string]bool{}, skipped: map[string]bool{}}
 	if baseline != "" {
 		p.captures[baseline] = true
 	}
@@ -69,24 +72,47 @@ func (s *Server) protected(d *captureDir, baseline string) protection {
 		return p
 	}
 	for _, name := range series {
-		p.err = errors.Join(p.err, p.addSeries(d, name))
+		unreadable, err := p.addSeries(d, name)
+		if unreadable != nil {
+			p.skipped[name] = true
+			s.log.Warn("capture retention", "note", unreadableSeries(name, unreadable))
+		}
+		p.err = errors.Join(p.err, err)
 	}
 	return p
 }
 
-// addSeries protects what series holds: the capture of each intent, each
-// kept capture, and the baseline the newest capture comparing with one
-// named.
-func (p *protection) addSeries(d *captureDir, series string) error {
+// openListed opens series and lists it, names sorted.
+func openListed(d *captureDir, series string) (*os.Root, []string, error) {
 	ser, err := d.openSeries(series)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	defer func() { _ = ser.Close() }()
 	names, err := readDirNames(ser, ".")
 	if err != nil {
-		return err
+		_ = ser.Close()
+		return nil, nil, err
 	}
+	slices.Sort(names)
+	return ser, names, nil
+}
+
+// unreadableSeries notes a series retention leaves because it cannot be
+// opened or listed.
+func unreadableSeries(series string, err error) string {
+	return fmt.Sprintf("series %s cannot be read (%v); retention leaves everything in it, and goes on in the others", series, pathless(err))
+}
+
+// addSeries protects what series holds: the capture of each intent, each
+// kept capture, and the baseline the newest capture comparing with one
+// named. unreadable says the series could not be opened or listed;
+// retention then leaves it alone.
+func (p *protection) addSeries(d *captureDir, series string) (unreadable, err error) {
+	ser, names, err := openListed(d, series)
+	if err != nil {
+		return err, nil
+	}
+	defer func() { _ = ser.Close() }()
 	for _, n := range names {
 		if id, _, kind, ok := parseName(n); ok && kind == kindIntent {
 			p.captures[captureKey(series, formatID(id))] = true
@@ -94,7 +120,7 @@ func (p *protection) addSeries(d *captureDir, series string) error {
 	}
 	ms, err := protectedManifests(ser, names)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newest := ""
 	for _, m := range ms {
@@ -106,7 +132,7 @@ func (p *protection) addSeries(d *captureDir, series string) error {
 	if newest != "" {
 		p.captures[captureKey(series, newest)] = true
 	}
-	return nil
+	return nil, nil
 }
 
 // protectedManifests reads the manifests among names, in id order. A
@@ -412,30 +438,73 @@ func (r *retention) bySize() error {
 			}
 		}
 	}
-	if !r.s.storeHasRoom(used-freeable, need) {
-		r.note(fmt.Sprintf("the capture directory holds %d bytes; a capture may need %d more, under Capture.MaxStoredBytes %d, and removing every capture retention may remove would free only %d, so it removes none by size",
-			used, need, r.s.lim.Capture.MaxStoredBytes, freeable))
-		return nil
-	}
+	// A capture evict spares after all (one only its contents show is
+	// not its own) frees nothing: the rest must still make the room, or no
+	// more is removed.
+	removed := 0
 	for _, h := range cands {
 		if r.s.storeHasRoom(used, need) {
+			return nil
+		}
+		if !r.s.storeHasRoom(used-freeable, need) {
+			what := "none"
+			if removed > 0 {
+				what = "no more"
+			}
+			r.note(fmt.Sprintf("the capture directory holds %d bytes; a capture may need %d more, under Capture.MaxStoredBytes %d, and removing every capture retention may still remove would free only %d, so it removes %s by size",
+				used, need, r.s.lim.Capture.MaxStoredBytes, freeable, what))
 			return nil
 		}
 		size := r.size(h)
 		if err := r.evict(h, "making room under Capture.MaxStoredBytes"); err != nil {
 			return err
 		}
+		freeable -= size
 		if h.gone {
 			used -= size
+			removed++
 		}
 	}
 	return nil
 }
 
-// evictable reports whether evict would try to remove h.
+// evictable reports whether evict would try to remove h: nothing keeps
+// it, and by their stat its files and its manifest are its own.
 func (r *retention) evictable(h *held) bool {
-	return !h.gone && !h.spared && !h.m.Kept && !r.isProtected(h) && h.blocked == "" &&
-		(h.marked || h.viaMarker || r.missing(h) == "")
+	if h.gone || h.spared || h.m.Kept || r.isProtected(h) || h.blocked != "" ||
+		!h.marked && !h.viaMarker && r.missing(h) != "" {
+		return false
+	}
+	_, why, err := r.precheck(h)
+	return err == nil && why == ""
+}
+
+// precheck says which name of h is plainly not its own by its stat, and
+// why, "" when none is: each file still there must be the recorded one
+// with one link, and the manifest must have its own name only, and the
+// marker's when marked (the marker alone when it is all that is left).
+func (r *retention) precheck(h *held) (name, why string, err error) {
+	for _, f := range h.m.Files {
+		fi, err := h.ser.Lstat(f.Name)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			return "", "", err
+		}
+		if why := cmp.Or(statWhy(fi, f), linksWhy(fi, 1)); why != "" {
+			return f.Name, why, nil
+		}
+	}
+	links := uint64(1)
+	if h.marked {
+		links = 2
+	}
+	fi, err := h.ser.Lstat(h.self.Name)
+	if err != nil {
+		return "", "", err
+	}
+	return h.self.Name, cmp.Or(statWhy(fi, h.self), linksWhy(fi, links)), nil
 }
 
 // size is what removing h frees: its files still there, and its manifest.
@@ -487,16 +556,15 @@ func (r *retention) load() error {
 		return err
 	}
 	for _, name := range series {
-		ser, err := r.d.openSeries(name)
+		if r.p.skipped[name] {
+			continue
+		}
+		ser, names, err := openListed(r.d, name)
 		if err != nil {
+			r.note(unreadableSeries(name, err))
 			continue
 		}
 		r.roots = append(r.roots, ser)
-		names, err := readDirNames(ser, ".")
-		if err != nil {
-			return err
-		}
-		slices.Sort(names)
 		r.names[name] = names
 		byName := map[string]*held{}
 		var hs []*held
@@ -518,9 +586,14 @@ func (r *retention) load() error {
 				r.markedBy(h, n)
 				continue
 			}
-			// The manifest's name is gone: the marker is the manifest
-			// itself, read as one, and the rest of the eviction is
-			// finished from it.
+			// Only when the manifest's name is gone is the marker the
+			// manifest itself, read as one, and the rest of the eviction
+			// finished from it. A name that holds something else leaves
+			// both alone.
+			if _, err := ser.Lstat(manifestName(id, label)); !errors.Is(err, fs.ErrNotExist) {
+				r.note(fmt.Sprintf("left %s/%s: an eviction marker whose manifest name holds a file this server cannot read as that manifest; retention leaves both", name, n))
+				continue
+			}
 			if h, ok := readHeld(ser, name, n, manifestName(id, label)); ok && !h.failure() {
 				h.viaMarker = true
 				hs = append(hs, h)
@@ -611,24 +684,19 @@ func (r *retention) evict(h *held, why string) error {
 	}
 	if !h.marked && !h.viaMarker {
 		if f := r.missing(h); f != "" {
-			r.spare(h, f, "incomplete: "+f+" is missing, and nothing shows retention began to remove the capture")
+			h.spared = true
+			r.note(fmt.Sprintf("incomplete %s: %s is missing, and nothing shows retention began to remove the capture, so it keeps the rest",
+				h.name(), f))
 			return nil
 		}
 	}
 	// By their stat first: a capture that is plainly not its own is kept
 	// before anything is written.
-	for _, f := range h.m.Files {
-		fi, err := h.ser.Lstat(f.Name)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			continue
-		case err != nil:
-			return err
-		}
-		if why := cmp.Or(statWhy(fi, f), linksWhy(fi, 1)); why != "" {
-			r.spare(h, f.Name, why)
-			return nil
-		}
+	if name, why, err := r.precheck(h); err != nil {
+		return err
+	} else if why != "" {
+		r.spare(h, name, why)
+		return nil
 	}
 	if len(h.m.Files) > 0 && !h.marked && !h.viaMarker {
 		if err := r.mark(h); err != nil || h.spared {

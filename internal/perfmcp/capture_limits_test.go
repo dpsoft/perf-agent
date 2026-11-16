@@ -462,6 +462,8 @@ func TestCaptureNeed(t *testing.T) {
 		{[]capture.Mode{capture.ModeCPU, capture.ModeOffCPU}, 20},
 		{[]capture.Mode{capture.ModeGPU}, 13},
 		{[]capture.Mode{capture.ModeCPU, capture.ModeOffCPU, capture.ModeGPU}, 33},
+		{[]capture.Mode{capture.ModeCPU, capture.ModeCPU}, 10},
+		{[]capture.Mode{capture.ModeGPU, capture.ModeGPU}, 13},
 	} {
 		if got := c.captureNeed(tc.modes); got != tc.want {
 			t.Errorf("captureNeed(%v) = %d, want %d", tc.modes, got, tc.want)

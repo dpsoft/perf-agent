@@ -861,34 +861,6 @@ func TestFailedManifestsAreRetainedLikeCaptures(t *testing.T) {
 	}
 }
 
-// TestRetentionRemovesNothingWhenItCannotTellWhatToKeep: a series that
-// cannot be read may hold an intent or a baseline; retention then removes
-// nothing anywhere.
-func TestRetentionRemovesNothingWhenItCannotTellWhatToKeep(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a directory of mode 0")
-	}
-	s, d, _, _ := retentionServer(t, 1)
-	for range 3 {
-		commitAged(t, s, d, aged{series: "a"})
-	}
-	commitAged(t, s, d, aged{series: "b"})
-	b := filepath.Join(d.root.Name(), "b")
-	if err := os.Chmod(b, 0); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(b, 0o700) }()
-	ev, err := retainOnce(t, s, d, "")
-	if err == nil || len(ev) != 0 || captureErr(t, err).Code != capture.CodeDisk {
-		t.Fatalf("evicted %q, err %v", ev, err)
-	}
-	for id := 1; id <= 3; id++ {
-		if !hasManifest(t, d, "a", id, "run") {
-			t.Errorf("a/%s was evicted", formatID(id))
-		}
-	}
-}
-
 // TestAFailureRunNeverPushesOutGoodCaptures: failures have their own keep
 // count, so a run of them leaves every capture that succeeded.
 func TestAFailureRunNeverPushesOutGoodCaptures(t *testing.T) {
@@ -954,7 +926,7 @@ func TestRetentionKeepsAnIncompleteCapture(t *testing.T) {
 			if slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
 				t.Error("a marker was written")
 			}
-			if tc.keep == 1 && !strings.Contains(logs.String(), "incomplete: "+gone+" is missing") {
+			if tc.keep == 1 && !strings.Contains(logs.String(), "incomplete adhoc/001-run: "+gone+" is missing") {
 				t.Errorf("not noted:\n%s", logs.String())
 			}
 		})
@@ -1152,5 +1124,173 @@ func TestACrashedEvictionPutsTheFilesBack(t *testing.T) {
 		if strings.HasPrefix(n, quarantinePrefix) || n == evictingName(1, "run") {
 			t.Errorf("%s left", n)
 		}
+	}
+}
+
+// markedAndCut leaves 001 (cpu+gpu) marked, as a crash right after the
+// marker was linked and synced would: nothing of it removed.
+func markedAndCut(t *testing.T) (*Server, *captureDir, *testClock, *lockedBuffer) {
+	t.Helper()
+	s, d, clk, logs := retentionServer(t, 1)
+	commitAged(t, s, d, aged{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}})
+	commitAged(t, s, d, aged{})
+	s.writeErr = failOpAt("retention remove", 1, errCrash)
+	if _, err := retainOnce(t, s, d, ""); !errors.Is(err, errCrash) {
+		t.Fatalf("no crash after the marker: %v", err)
+	}
+	s.writeErr = nil
+	if !slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
+		t.Fatal("no marker")
+	}
+	crashRecover(t, s, d, clk)
+	s.lim.Capture.KeepPerSeries = 100
+	return s, d, clk, logs
+}
+
+// TestTheSizeStepCountsOnlyWhatItCanRemove: a capture retention will keep
+// (a file the user linked elsewhere, which its stat shows, or one rewritten
+// in place, which only its contents show) frees nothing, so the size step
+// does not remove other captures for room it cannot make.
+func TestTheSizeStepCountsOnlyWhatItCanRemove(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		do   func(t *testing.T, s *Server, path string)
+		// age is the big capture's: one its stat shows is not its own is
+		// never counted, wherever it comes in the order (here last); one
+		// only its contents show stops the step once it is found (here
+		// first).
+		age time.Duration
+	}{
+		{"linked elsewhere", func(t *testing.T, s *Server, path string) {
+			if err := os.Link(path, filepath.Join(s.profiles.Name(), "mine.pb.gz")); err != nil {
+				t.Fatal(err)
+			}
+		}, time.Minute},
+		{"rewritten in place", func(t *testing.T, _ *Server, path string) { rewriteInPlace(t, path) }, 3 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, d, _, logs := retentionServer(t, 100)
+			c := &s.lim.Capture
+			c.MaxProfileBytes, c.MaxExeclogBytes = 256<<10, 64<<10
+			big := make([]byte, 200<<10)
+			for i := range big {
+				big[i] = byte(i * 7)
+			}
+			commitAged(t, s, d, aged{series: "a", label: "big", age: tc.age, content: map[string][]byte{"cpu.pb.gz": big}})
+			for range 3 {
+				commitAged(t, s, d, aged{series: "b", age: 2 * time.Hour})
+			}
+			commitAged(t, s, d, aged{series: "c", age: time.Hour})
+			tc.do(t, s, filepath.Join(d.root.Name(), "a", finalName(1, "big", "cpu.pb.gz")))
+			used, err := dirBytes(d.root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Room only once the big capture goes.
+			c.MaxStoredBytes = used + c.largestCapture() - int64(len(big)) + 1024
+			if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+				t.Fatalf("evicted %q for room that cannot be made", ev)
+			}
+			if !strings.Contains(logs.String(), "removes none by size") {
+				t.Errorf("not noted:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestAManifestLinkedElsewhereKeepsTheCapture: a manifest with a second
+// name the user made is not the capture's alone; nothing of it is removed
+// and no marker is left.
+func TestAManifestLinkedElsewhereKeepsTheCapture(t *testing.T) {
+	s, d, _, logs := retentionServer(t, 1)
+	commitAged(t, s, d, aged{modes: []capture.Mode{capture.ModeCPU, capture.ModeGPU}})
+	commitAged(t, s, d, aged{})
+	mp := filepath.Join(d.root.Name(), "adhoc", manifestName(1, "run"))
+	if err := os.Link(mp, filepath.Join(s.profiles.Name(), "mine.json")); err != nil {
+		t.Fatal(err)
+	}
+	for pass := range 2 {
+		if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+			t.Fatalf("pass %d evicted %q", pass, ev)
+		}
+	}
+	want := []string{"001-run-cpu.pb.gz", "001-run-gpu.execlog", "001-run-gpu.pb.gz", "001-run.capture.json"}
+	for _, n := range want {
+		if !slices.Contains(seriesNames(t, d, "adhoc"), n) {
+			t.Errorf("%s went: %v", n, seriesNames(t, d, "adhoc"))
+		}
+	}
+	if slices.Contains(seriesNames(t, d, "adhoc"), evictingName(1, "run")) {
+		t.Error("a marker was left")
+	}
+	if !strings.Contains(logs.String(), "left adhoc/"+manifestName(1, "run")) {
+		t.Errorf("not noted:\n%s", logs.String())
+	}
+}
+
+// TestAnUnreadableSeriesIsSkipped: a directory named like a series that
+// cannot be opened is left, and noted; retention goes on in the others.
+func TestAnUnreadableSeriesIsSkipped(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory of mode 0")
+	}
+	s, d, _, logs := retentionServer(t, 1)
+	commitAged(t, s, d, aged{})
+	commitAged(t, s, d, aged{})
+	p := filepath.Join(d.root.Name(), "mine")
+	if err := os.Mkdir(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(p, 0o700) }()
+	ev, err := retainOnce(t, s, d, "")
+	if err != nil || !slices.Equal(ev, []string{"adhoc/001-run"}) {
+		t.Fatalf("evicted %q, err %v", ev, err)
+	}
+	if n := strings.Count(logs.String(), "series mine"); n != 1 {
+		t.Errorf("noted %d times:\n%s", n, logs.String())
+	}
+	// A series that turns unreadable after the protection was read is
+	// left by the pass too.
+	if err := os.Chmod(p, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commitAged(t, s, d, aged{series: "b"})
+	commitAged(t, s, d, aged{series: "b"})
+	commitAged(t, s, d, aged{})
+	p2 := s.protected(d, "")
+	b := filepath.Join(d.root.Name(), "b")
+	if err := os.Chmod(b, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(b, 0o700) }()
+	ev, err = s.retain(d, p2, s.clock())
+	if err != nil || !slices.Equal(ev, []string{"adhoc/002-run"}) {
+		t.Fatalf("evicted %q, err %v", ev, err)
+	}
+	if !strings.Contains(logs.String(), "series b cannot be read") {
+		t.Errorf("not noted:\n%s", logs.String())
+	}
+}
+
+// TestAMarkerIsTheManifestOnlyWhenTheManifestIsGone: a marker beside a
+// manifest name that now holds the user's own file is not a capture to
+// finish; nothing is removed.
+func TestAMarkerIsTheManifestOnlyWhenTheManifestIsGone(t *testing.T) {
+	s, d, _, _ := markedAndCut(t)
+	dir := filepath.Join(d.root.Name(), "adhoc")
+	mp := filepath.Join(dir, manifestName(1, "run"))
+	mustWrite(t, mp+".new", []byte("user notes, not a manifest\n"))
+	if err := os.Rename(mp+".new", mp); err != nil {
+		t.Fatal(err)
+	}
+	before := seriesNames(t, d, "adhoc")
+	if ev := retainNow(t, s, d, ""); len(ev) != 0 {
+		t.Fatalf("evicted %q", ev)
+	}
+	if b, err := os.ReadFile(mp); err != nil || string(b) != "user notes, not a manifest\n" {
+		t.Fatalf("the user's file went: %v", err)
+	}
+	if after := seriesNames(t, d, "adhoc"); !slices.Equal(after, before) {
+		t.Errorf("series %v, was %v", after, before)
 	}
 }

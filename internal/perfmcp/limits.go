@@ -460,8 +460,9 @@ func (c CaptureLimits) largestCapture() int64 {
 }
 
 // captureNeed is the most a capture of modes may write: a profile per
-// mode, and an executions log with gpu.
+// distinct mode, and an executions log with gpu.
 func (c CaptureLimits) captureNeed(modes []capture.Mode) int64 {
+	modes = slices.Compact(slices.Sorted(slices.Values(modes)))
 	need := c.MaxProfileBytes * int64(len(modes))
 	if slices.Contains(modes, capture.ModeGPU) {
 		need += c.MaxExeclogBytes

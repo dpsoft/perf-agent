@@ -299,9 +299,32 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	if err := s.syncDir(ser, ".", "fsync intent"); err != nil {
 		return t, t.crashed(err)
 	}
-	hb, err := s.writeNewFile(ser, heartbeatName(id, label), []byte(t.in.Token+"\n"), "heartbeat")
+	// The heartbeat holds the token and is linked into place from a
+	// temporary, like the intent, so its name never holds an empty file.
+	hbName := heartbeatName(id, label)
+	hbTmp, err := t.writeTemp(hbName, []byte(t.in.Token+"\n"), "heartbeat")
+	if err == nil {
+		err = s.linkNoReplace(ser, rootCaptures, hbTmp.Name, hbName)
+		if err != nil && !errors.Is(err, errCrash) && landed(ser, hbName, hbTmp) {
+			err = nil
+		}
+		if err != nil && !errors.Is(err, errCrash) {
+			_, _, _ = removeByIdentity(ser, hbTmp.Name, hbTmp)
+		}
+	}
 	if err != nil {
 		return t, t.crashed(err)
+	}
+	hb := hbTmp
+	hb.Name = hbName
+	if err := s.wErr("remove heartbeat temp"); errors.Is(err, errCrash) {
+		return t, t.crashed(err)
+	} else if err != nil {
+		t.in.Temps = append(t.in.Temps, hbTmp)
+	} else if _, left, err := t.remove(ser, hbTmp.Name, hbTmp); errors.Is(err, errCrash) {
+		return t, t.crashed(err)
+	} else if err != nil || left != "" {
+		t.in.Temps = append(t.in.Temps, hbTmp)
 	}
 	t.in.Heartbeat = &hb
 	t.startHeartbeat()
@@ -1298,10 +1321,10 @@ func (in intent) check(name string) error {
 }
 
 // isTemp reports whether name is one of the intent's own temporaries:
-// ".<intent or manifest>.tmp-<token[:16]>", or that with "-<n>" after it
-// (see writeTemp).
+// ".<intent, heartbeat or manifest>.tmp-<token[:16]>", or that with "-<n>"
+// after it (see writeTemp).
 func (in intent) isTemp(id int, name string) bool {
-	for _, final := range []string{intentName(id, in.Label), manifestName(id, in.Label)} {
+	for _, final := range []string{intentName(id, in.Label), heartbeatName(id, in.Label), manifestName(id, in.Label)} {
 		rest, ok := strings.CutPrefix(name, "."+final+".tmp-"+in.Token[:16])
 		if !ok {
 			continue

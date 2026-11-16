@@ -173,6 +173,20 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 				}
 			}
 		}
+		// A heartbeat temporary holds the token: a second name of the
+		// heartbeat, or one a crash left before it was linked.
+		for _, tn := range names {
+			if !in.isTemp(t.id, tn) || !strings.HasPrefix(tn, "."+heartbeatName(t.id, in.Label)) {
+				continue
+			}
+			if id, ok := proveByToken(ser, tn, in, int64(len(in.Token)+1), func(b []byte) bool { return string(b) == in.Token+"\n" }); ok {
+				if removed, _, err := t.remove(ser, tn, id); err != nil {
+					return notes, d.writeError(err)
+				} else if removed {
+					claimed[tn] = true
+				}
+			}
+		}
 		// A heartbeat the intent does not record yet (a crash before the
 		// rewrite that records it) is proven by holding the intent's token.
 		hbName := heartbeatName(t.id, in.Label)

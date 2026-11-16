@@ -151,17 +151,34 @@ func TestTheHeartbeatGoesBeforeTheIntent(t *testing.T) {
 		invariant(t, d, notes)
 	})
 
-	// An empty file at the heartbeat's name proves nothing and stays.
+	// The heartbeat is linked into place from a temporary, so its name
+	// never holds an empty file: a crash while the temporary is created
+	// leaves only that temporary, which proves nothing and is reported.
 	t.Run("empty-heartbeat", func(t *testing.T) {
 		s, d, clk := newCaptureServer(t)
 		s.writeErr = failOp("heartbeat", errCrash)
 		drive(t, s, d, capCase{})
 		s.writeErr = nil
+		if _, err := os.Lstat(filepath.Join(d.root.Name(), "adhoc", heartbeatName(1, "run"))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a heartbeat before it was written: %v", err)
+		}
 		notes := crashRecover(t, s, d, clk)
-		if !noted(notes, "left", heartbeatName(1, "run")) {
+		if !noted(notes, "orphan_temp", "."+heartbeatName(1, "run")+".tmp-") {
 			t.Fatalf("notes %q", notes)
 		}
-		invariant(t, d, notes, heartbeatName(1, "run"))
+		invariant(t, d, notes)
+	})
+
+	// A crash between linking the heartbeat and removing its temporary's
+	// name leaves a second name of it, proven by the token it holds.
+	t.Run("heartbeat-temp", func(t *testing.T) {
+		s, d, clk := newCaptureServer(t)
+		s.writeErr = failOp("remove heartbeat temp", errCrash)
+		drive(t, s, d, capCase{})
+		s.writeErr = nil
+		notes := crashRecover(t, s, d, clk)
+		noOrphans(t, notes)
+		invariant(t, d, notes)
 	})
 
 	// A crash after the intent and before the heartbeat leaves an intent

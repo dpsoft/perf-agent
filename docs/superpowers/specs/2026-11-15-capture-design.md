@@ -1206,8 +1206,9 @@ directory. The job's states map onto the steps:
    - the owner identity: server PID and start time; the reaper's, once
      known.
 
-   Then it creates `NNN-label.intent.hb`, which holds the owner token, and
-   records its identity with an intent rewrite (CAP-R45: the intent
+   Then it creates `NNN-label.intent.hb`, which holds the owner token and
+   is linked into place from a temporary like the intent, and records its
+   identity with an intent rewrite (CAP-R45: the intent
    first, so a crash between the two leaves an intent judged by its
    owner's liveness, never a heartbeat no intent names). The owner
    refreshes the heartbeat's mtime every 2 s while the operation is in
@@ -1346,12 +1347,14 @@ sees an error while capture files are still published.
 - **Single-syscall windows (CAP-R47).** A crash inside one system call
   of a write, after a new name exists and before any record of it is
   durable, leaves a file nothing can prove: a `.seq` temporary, a
-  heartbeat or a temporary created but not yet written, a quarantined
+  temporary created but not yet written, a quarantined
   `.del-*` name nothing records, a staging directory (CAP-R12
   above), or a temporary of `.owner` in the capture directory itself.
   Each is retained, never deleted without proof, and logged by recovery
   as `orphan_temp`, `orphan_staging` or `left`; `capture_list`'s series
-  summary counts them, left heartbeats included.
+  summary counts them, left heartbeats included (a heartbeat is never
+  left by a crash, since it is linked into place with its contents, but
+  one an unreadable intent names is).
 - Recovery that hits `ENOSPC` stops and leaves the intent. Every step is
   idempotent.
 

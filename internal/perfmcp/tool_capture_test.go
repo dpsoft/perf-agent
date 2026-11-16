@@ -1300,6 +1300,37 @@ func TestAHistoricalFailureIsAnsweredByItsOutcome(t *testing.T) {
 	}
 }
 
+// The histories kept for capture_list stay bounded: one that can no
+// longer be answered (older than listKeep, or of an earlier history
+// generation) is dropped when another is kept, and at most maxListKept
+// are kept, the oldest going first.
+func TestKeptHistoriesStayBounded(t *testing.T) {
+	e := newJobEnv(t, jobOpts{})
+	s := e.s
+	now := time.Now()
+	gen := s.historyGen.Load()
+	s.keepHistory("list:old", keptHistory{h: &captureHistory{}, gen: gen, at: now.Add(-2 * listKeep)})
+	s.keepHistory("list:stale", keptHistory{h: &captureHistory{}, gen: gen, at: now})
+	s.historyChanged()
+	gen = s.historyGen.Load()
+	for i := range 3 * maxListKept {
+		s.keepHistory(fmt.Sprintf("list:s%d", i), keptHistory{h: &captureHistory{}, gen: gen, at: now.Add(time.Duration(i) * time.Millisecond)})
+	}
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
+	if len(s.listKept) > maxListKept {
+		t.Errorf("%d histories kept, more than %d", len(s.listKept), maxListKept)
+	}
+	for _, k := range []string{"list:old", "list:stale", "list:s0"} {
+		if _, ok := s.listKept[k]; ok {
+			t.Errorf("%s is still kept", k)
+		}
+	}
+	if _, ok := s.listKept[fmt.Sprintf("list:s%d", 3*maxListKept-1)]; !ok {
+		t.Error("the newest history was not kept")
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -255,12 +256,37 @@ var errLoading = errors.New("the history is still being read")
 // listKeep is how old a kept history may be to be answered.
 const listKeep = 30 * time.Second
 
+// maxListKept bounds the histories kept, one per series queried.
+const maxListKept = 64
+
 // keptHistory is the last history read for a query, at gen, the history
 // generation then, and at, when it was read.
 type keptHistory struct {
 	h   *captureHistory
 	gen uint64
 	at  time.Time
+}
+
+// keepHistory keeps k as the last history read for key. Histories that
+// can no longer be answered (older than listKeep, or of an earlier
+// generation) are dropped, and beyond maxListKept the oldest go.
+func (s *Server) keepHistory(key string, k keptHistory) {
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
+	gen := s.historyGen.Load()
+	maps.DeleteFunc(s.listKept, func(_ string, v keptHistory) bool {
+		return v.gen != gen || time.Since(v.at) >= listKeep
+	})
+	s.listKept[key] = k
+	for len(s.listKept) > maxListKept {
+		oldest := ""
+		for name, v := range s.listKept {
+			if oldest == "" || v.at.Before(s.listKept[oldest].at) {
+				oldest = name
+			}
+		}
+		delete(s.listKept, oldest)
+	}
 }
 
 // history is the capture directory's history for series, read through
@@ -276,9 +302,7 @@ func (s *Server) history(ctx context.Context, series string) (h *captureHistory,
 		gen := s.historyGen.Load()
 		h, err := s.loadHistory(series)
 		if err == nil {
-			s.listMu.Lock()
-			s.listKept[key] = keptHistory{h: h, gen: gen, at: time.Now()}
-			s.listMu.Unlock()
+			s.keepHistory(key, keptHistory{h: h, gen: gen, at: time.Now()})
 		}
 		return h, err
 	}

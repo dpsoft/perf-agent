@@ -1352,6 +1352,27 @@ func TestACaptureDirThatIsTheProfilesRootIsRefused(t *testing.T) {
 	}
 }
 
+// A historical answer kept in memory is checked against its manifest
+// before it is given: a capture another server's retention removed is
+// unknown, not done.
+func TestAKeptAnswerWhoseManifestIsGoneIsUnknown(t *testing.T) {
+	e := newJobEnv(t, jobOpts{})
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	c := e.serve()
+	waitResult(t, c, "s/001")
+	if _, ok := e.s.registry.historical("s/001"); !ok {
+		t.Fatal("the answer was not kept")
+	}
+	if err := os.Remove(filepath.Join(e.profiles, defaultStdioCaptures, "s", manifestName(1, "a"))); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "5s"})
+	if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+		t.Errorf("a capture whose manifest is gone answered %s", text)
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

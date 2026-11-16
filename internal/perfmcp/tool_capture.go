@@ -652,7 +652,11 @@ var errNoCapture = errors.New("no such capture")
 // at most d. One not read by then, or a full pool, is loading.
 func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.Duration) mcpstdio.Result {
 	if h, ok := s.registry.historical(key); ok {
-		return s.historicalAnswer(key, jobID, h)
+		if !s.manifestGone(key, h.m) {
+			return s.historicalAnswer(key, jobID, h)
+		}
+		// Another server's retention, or a person, removed it.
+		s.registry.forget(key)
 	}
 	l, ok := s.lookups.get(key, func() (any, error) { return s.loadHistorical(key) })
 	if !ok {
@@ -668,6 +672,23 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 		return toolError(unknownCapture(key, "a capture whose manifest cannot be read: "+causeText(err)), nil)
 	}
 	return s.historicalAnswer(key, jobID, v.(*historical))
+}
+
+// manifestGone reports, with one Lstat, that capture key's manifest m is
+// no longer in its series, so an answer kept in memory must not be given.
+// A check that cannot tell says it is there.
+func (s *Server) manifestGone(key string, m manifest) bool {
+	series, id, ok := splitCaptureKey(key)
+	if !ok {
+		return false
+	}
+	d, err := s.readCaptureDir()
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	defer d.close()
+	_, err = d.root.Lstat(filepath.Join(series, manifestName(id, m.Label)))
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // loadingAnswer is a historical answer that is still being read.

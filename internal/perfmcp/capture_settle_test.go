@@ -195,35 +195,103 @@ func TestAnUndecidedJobIsNeverEvicted(t *testing.T) {
 	}
 }
 
-// A cancel that comes after the retry decided the link but before the job
-// has its final status is still honoured: one place decides.
-func TestACancelInTheSettleWindowIsHonoured(t *testing.T) {
+// A cancel at every instant of an undecided job's settle gets an answer
+// the job, its manifest and the registry all agree with (§7.4): one before
+// the retry judges the link is honoured (too late once made, cancelled when
+// not); one after the judge finds a link that was not made decided, so the
+// job fails as its failure manifest says and the cancel is told so; one
+// after the final status is answered from it.
+func TestACancelAtEachSettleInstantIsConsistent(t *testing.T) {
+	const (
+		beforeJudge   = "before the judge"
+		atManifest    = "at the failure manifest's write"
+		afterManifest = "after the failure manifest"
+		viaRegistry   = "through the registry after the failure manifest"
+		afterFinal    = "after the final status"
+	)
 	for _, made := range []bool{true, false} {
-		t.Run(map[bool]string{true: "made", false: "not made"}[made], func(t *testing.T) {
-			u := newUndecidedEnv(t, made)
-			j := u.undecided(t)
-			var answer string
-			settleRead = func(ser *os.Root, name string) (manifest, error) {
-				if answer == "" {
-					answer = j.requestCancel()
+		for _, at := range []string{beforeJudge, atManifest, afterManifest, viaRegistry, afterFinal} {
+			if made && at == atManifest {
+				continue
+			}
+			t.Run(map[bool]string{true: "made", false: "not made"}[made]+"/"+at, func(t *testing.T) {
+				u := newUndecidedEnv(t, made)
+				j := u.undecided(t)
+				var answer string
+				var once sync.Once
+				cancel := func() {
+					once.Do(func() {
+						if at == viaRegistry {
+							answer, _ = u.s.registry.cancel(j.id)
+						} else {
+							answer = j.requestCancel()
+						}
+					})
 				}
-				return readManifest(ser, name)
-			}
-			t.Cleanup(func() { settleRead = readManifest })
-			u.setBroken(false)
-			u.run(u.request(300 * time.Millisecond))
-			if answer != cancelAnswerPending {
-				t.Fatalf("the cancel answered %q", answer)
-			}
-			if made {
-				if r := u.result(j); r.Cancel != cancelAnswerTooLate {
-					t.Errorf("result cancel %q", r.Cancel)
+				switch at {
+				case beforeJudge:
+					landedLstat = func(r *os.Root, name string) (os.FileInfo, error) {
+						if u.isBroken(name) {
+							return nil, syscall.EIO
+						}
+						if strings.HasPrefix(name, "002-") && strings.HasSuffix(name, manifestSuffix) {
+							cancel()
+						}
+						return r.Lstat(name)
+					}
+				case atManifest:
+					u.s.writeErr = func(op string) error {
+						if op == "manifest temp" {
+							cancel()
+						}
+						return nil
+					}
+				case afterManifest, viaRegistry:
+					settleRead = func(ser *os.Root, name string) (manifest, error) {
+						cancel()
+						return readManifest(ser, name)
+					}
+					t.Cleanup(func() { settleRead = readManifest })
 				}
-				return
-			}
-			if v := j.view(); v.Status != string(jobCancelled) {
-				t.Errorf("settled %+v, err %v", v, jobErr(j))
-			}
-		})
+				u.setBroken(false)
+				if next, v := u.run(u.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+					t.Fatalf("next: %+v, err %v", v, jobErr(next))
+				}
+				if at == afterFinal {
+					cancel()
+				}
+				v := j.view()
+				m, ok := u.manifestOf("adhoc", "002")
+				if !ok {
+					t.Fatal("no manifest")
+				}
+				after, _ := u.s.registry.cancel(j.id)
+				code := ""
+				if m.Error != nil {
+					code = m.Error.Code
+				}
+				var want struct{ status, outcome, code, answer, after string }
+				switch {
+				case made:
+					want.status, want.outcome, want.answer, want.after = string(jobDone), captureOK, cancelAnswerPending, cancelAnswerTooLate
+					if at == afterFinal {
+						want.answer = cancelAnswerTooLate
+					}
+				case at == beforeJudge:
+					want.status, want.outcome, want.code, want.answer, want.after = string(jobCancelled), captureFailed, string(capture.CodeCancelled), cancelAnswerPending, cancelAnswerCancelled
+				default:
+					want.status, want.outcome, want.code, want.answer, want.after = string(jobFailed), captureFailed, string(capture.CodeDisk), cancelAnswerEnded, cancelAnswerEnded
+				}
+				got := struct{ status, outcome, code, answer, after string }{v.Status, m.Outcome, code, answer, after}
+				if got != want {
+					t.Errorf("got %+v\nwant %+v", got, want)
+				}
+				if made && at != afterFinal {
+					if r := u.result(j); r.Cancel != cancelAnswerTooLate {
+						t.Errorf("result cancel %q", r.Cancel)
+					}
+				}
+			})
+		}
 	}
 }

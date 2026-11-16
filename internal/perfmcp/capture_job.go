@@ -157,6 +157,18 @@ func newJob(id string, created time.Time, reserve time.Duration) *job {
 	}
 }
 
+// decideFailed decides an undecided job whose link was not made: a cancel
+// recorded meanwhile wins, and the job is ending cancelled; otherwise it is
+// ending failed, and a later cancel is told so. j.mu is held.
+func (j *job) decideFailed() (cancelled bool) {
+	cancelled = j.d.settle(false) == cancelAnswerCancelled
+	j.ending = jobFailed
+	if cancelled {
+		j.ending = jobCancelled
+	}
+	return cancelled
+}
+
 // set changes the job's state under its mutex, through f, and wakes every
 // wait.
 func (j *job) set(f func()) {

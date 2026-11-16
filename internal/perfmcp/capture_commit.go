@@ -221,12 +221,13 @@ type captureTxn struct {
 	// link may or may not have been made.
 	pending *manifest
 	decide  *fileIdentity
-	// word is the job's decision word while the commit is undecided: the
-	// settle words a failure manifest as cancelled when a cancel came
-	// meanwhile, but only the job's settle decides the answer. settled is
-	// the failure the settle recorded when the link was not made.
-	word    *decisionWord
-	settled *capture.Error
+	// decideFailed, set by the job while the commit is undecided, decides
+	// on the job's decision word, once the link is judged not made,
+	// whether a cancel that came meanwhile wins (true) or the capture
+	// failed: the failure manifest is worded by that one decision. settled
+	// is the failure the settle recorded then.
+	decideFailed func() (cancelled bool)
+	settled      *capture.Error
 	// cancelNote is what to report about a cancel that met the commit.
 	cancelNote string
 	// notes say what the transaction left where it was, and why.
@@ -866,7 +867,6 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 				t.s.log.Warn("the manifest link answered an error but was made; the capture is committed", "manifest", name, "err", err)
 				err = nil
 			case linkUnknown:
-				t.word = d
 				return false, t.undecided(tmp, err)
 			}
 		}
@@ -928,8 +928,8 @@ func (t *captureTxn) settle() error {
 	t.unstrand()
 	cause := capture.Errorf(capture.CodeDisk, "", "the manifest link of capture %s/%s was not made", t.series, formatID(t.id))
 	// A cancel that came while the commit was undecided wins against a
-	// link that was not made (§7.4); the job's settle reports it.
-	if t.word != nil && t.word.cancelPending() {
+	// link that was not made (§7.4); one after this decision is too late.
+	if t.decideFailed != nil && t.decideFailed() {
 		cause = cancelledError()
 	}
 	t.settled = cause

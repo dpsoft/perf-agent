@@ -93,6 +93,12 @@ type jobRun struct {
 	m          manifest
 	o          *capture.Outcome
 	cancelNote string
+	// paths are the server's paths scrub replaces, the longest first, as
+	// strings.NewReplacer pairs; slack is the longest of them, which Run
+	// keeps beyond each tail so a path across the tail's cut is replaced
+	// whole.
+	paths []string
+	slack int
 }
 
 // runJob runs j through §7.4's steps, then records how it ended.
@@ -754,7 +760,7 @@ func (r *jobRun) start() (*capture.Run, *capture.Error) {
 		Staging:     staging,
 		StagingPath: filepath.Join(t.ser.Name(), t.in.Staging),
 		CaptureID:   captureKey(r.series, formatID(r.id)),
-		Bounds:      s.captureBounds(),
+		Bounds:      r.tailBounds(),
 		Lock:        r.lease.File(),
 		Log:         s.log,
 	}
@@ -805,25 +811,46 @@ func (r *jobRun) relay(run *capture.Run) capture.Outcome {
 	}
 }
 
+// tailBounds are the capture's bounds, with each output tail kept longer
+// by the longest server path scrub replaces.
+func (r *jobRun) tailBounds() capture.Bounds {
+	staging := filepath.Join(r.txn.ser.Name(), r.txn.in.Staging)
+	root := r.s.profiles.Name()
+	r.paths, r.slack = nil, 0
+	for _, p := range []struct{ path, as string }{{staging, "staging"}, {root, "the profiles root"}} {
+		for _, path := range slices.Compact([]string{p.path, r.s.resolved(p.path)}) {
+			r.paths = append(r.paths, path, p.as)
+			r.slack = max(r.slack, len(path))
+		}
+	}
+	b := r.s.captureBounds()
+	b.MaxOutputTail += r.slack
+	return b
+}
+
 // scrub takes the server's own paths out of what the capture's programs
 // printed, before it leaves the server: perf-agent names its output files
 // ("profile written to <path>"), and a workload may print its directory.
 // The staging directory becomes "staging" and the profiles root "the
-// profiles root", each as given and with its links resolved; a tail stays
-// within MaxOutputTail. The rest of the text is the programs' own.
+// profiles root", each as given and with its links resolved. Run kept
+// each tail longer by the longest such path: a tail it cut loses its first
+// line (all of it up to the slack when it has no line break), which may
+// hold a path cut short; then the paths are replaced and the tail is cut to
+// MaxOutputTail. The rest of the text is the programs' own.
 func (r *jobRun) scrub(o *capture.Outcome) {
-	staging := filepath.Join(r.txn.ser.Name(), r.txn.in.Staging)
-	root := r.s.profiles.Name()
-	var pairs []string
-	for _, p := range []struct{ path, as string }{{staging, "staging"}, {root, "the profiles root"}} {
-		pairs = append(pairs, p.path, p.as)
-		if real := r.s.resolved(p.path); real != p.path {
-			pairs = append(pairs, real, p.as)
-		}
-	}
-	rep := strings.NewReplacer(pairs...)
+	rep := strings.NewReplacer(r.paths...)
 	n := r.s.lim.Capture.MaxOutputTail
-	tail := func(s string) string { return lastBytes(rep.Replace(s), n) }
+	kept := n + r.slack
+	tail := func(s string) string {
+		if len(s) > kept-utf8.UTFMax {
+			if i := strings.IndexByte(s, '\n'); i >= 0 && i < len(s)-1 {
+				s = s[i+1:]
+			} else {
+				s = lastBytes(s, len(s)-r.slack)
+			}
+		}
+		return lastBytes(rep.Replace(s), n)
+	}
 	o.StderrTail = tail(o.StderrTail)
 	o.Workload.Stdout, o.Workload.Stderr = tail(o.Workload.Stdout), tail(o.Workload.Stderr)
 	if o.Err != nil {

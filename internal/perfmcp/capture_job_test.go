@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -1368,6 +1369,25 @@ func TestTailsNameNoServerPath(t *testing.T) {
 		tail := e.result(j).Capture.WorkloadOutputTail
 		if tail == nil || !strings.Contains(tail.Stdout, "the profiles root") || strings.Contains(tail.Stdout+tail.Stderr, e.profiles) {
 			t.Errorf("workload tail %+v", tail)
+		}
+	})
+	t.Run("a path across the tail's cut", func(t *testing.T) {
+		py, err := exec.LookPath("python3")
+		if err != nil {
+			t.Skip("no python3")
+		}
+		e := newJobEnv(t, jobOpts{})
+		n := e.s.lim.Capture.MaxOutputTail
+		req := e.request(500 * time.Millisecond)
+		// The last n bytes hold only the path's last 12 bytes.
+		req.Command = []string{py, "-c", fmt.Sprintf("import os, time; print(os.getcwd() + 'Z' * %d, end='', flush=True); time.sleep(60)", n-12)}
+		j, v := e.run(req)
+		if v.Status != string(jobDone) {
+			t.Fatalf("view %+v, err %v", v, jobErr(j))
+		}
+		tail := e.result(j).Capture.WorkloadOutputTail
+		if tail == nil || len(tail.Stdout) > n || strings.Contains(tail.Stdout, e.profiles[len(e.profiles)-12:]) {
+			t.Errorf("workload tail %q", tail.Stdout)
 		}
 	})
 }

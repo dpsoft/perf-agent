@@ -358,11 +358,11 @@ func readSeq(ser *os.Root) (int, error) {
 		return 0, nil
 	}
 	series := filepath.Base(ser.Name())
-	if err != nil && !errors.Is(err, errNotRegular) {
-		return 0, fmt.Errorf("cannot read the %s of series %s: %w", seqFile, series, err)
-	}
 	var r seqRecord
 	why := "it is not a regular file"
+	if err != nil && !errors.Is(err, errNotRegular) {
+		why = "it cannot be read: " + causeText(err)
+	}
 	if err == nil {
 		why = "its format is not this server's"
 		if json.Unmarshal(b, &r) == nil && r.Format == 1 && r.WrittenBy == writtenBy {
@@ -373,7 +373,7 @@ func readSeq(ser *os.Root) (int, error) {
 	if err != nil || perr != nil || r.Format != 1 || r.WrittenBy != writtenBy || next < 1 {
 		return 0, capture.Errorf(capture.CodeDisk,
 			fmt.Sprintf("move %s/%s/%s away by hand to let the series continue, or capture into another series", rootCaptures, series, seqFile),
-			"the %s of series %s is not one this server wrote (%s)", seqFile, series, why)
+			"the %s of series %s is not one this server can use (%s)", seqFile, series, why)
 	}
 	return next, nil
 }

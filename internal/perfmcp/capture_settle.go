@@ -20,6 +20,14 @@ import (
 func (r *jobRun) leaveUndecided(e *capture.Error) {
 	s, j := r.s, r.j
 	j.txn, j.base = r.txn, r.base
+	// A link judged not made is decided at once, under the job's mutex: a
+	// cancel before it wins, and one after it is told the capture failed,
+	// as its failure manifest will say.
+	r.txn.decideFailed = func() bool {
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		return j.decideFailed()
+	}
 	j.setState(jobCommitting, phaseUndecided)
 	s.capMu.Lock()
 	s.undecided = append(s.undecided, j)
@@ -76,9 +84,12 @@ func (s *Server) settleUndecided(d *captureDir) {
 			continue
 		}
 		var b []byte
-		// The decision word is settled under the job's mutex, in the same
-		// step as the final status, so a cancel is either seen here or
-		// answered from that status: none is lost.
+		// A commit that was made is decided here, under the job's mutex,
+		// in the same step as the final status, so a cancel is either seen
+		// here or answered from that status. A link not made was decided
+		// when it was judged (decideFailed), and the job keeps what its
+		// failure manifest says; one never judged (a transaction that died)
+		// is decided here.
 		j.set(func() {
 			if e == nil {
 				res := captureResult{
@@ -86,10 +97,10 @@ func (s *Server) settleUndecided(d *captureDir) {
 					Derived: derivedRecompute, Handles: "reopen", Recompute: new(s.recomputeFor(m, j.base, "")),
 				}
 				b, _ = json.Marshal(res)
-				j.status, j.phase, j.derived, j.err, j.result = jobDone, "", derivedRecompute, nil, b
+				j.status, j.phase, j.derived, j.err, j.result, j.ending = jobDone, "", derivedRecompute, nil, b, ""
 				return
 			}
-			if j.d.settle(false) == cancelAnswerCancelled && e.Code != capture.CodeCancelled {
+			if j.ending == "" && j.decideFailed() && e.Code != capture.CodeCancelled {
 				e = cancelledError()
 			}
 			j.status, j.phase, j.err = statusOf(e), "", e

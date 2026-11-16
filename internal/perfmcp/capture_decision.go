@@ -105,10 +105,6 @@ func (d *decisionWord) commitAfter() (cancel string) {
 	return ""
 }
 
-// cancelPending reports whether a cancel arrived while the manifest link
-// was in flight and has not been settled yet. It changes nothing.
-func (d *decisionWord) cancelPending() bool { return d.cancelInFlight.Load() }
-
 // cancelled reports whether a cancel is waiting to be honoured.
 func (d *decisionWord) cancelled() bool {
 	return d.v.Load() == decisionCancelRequested

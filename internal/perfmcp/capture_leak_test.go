@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 )
 
 // syncBuffer is a log destination several goroutines write.
@@ -277,5 +278,36 @@ func TestAForeignSeqIsRefusedWithItsOwnAdvice(t *testing.T) {
 	if ce == nil || strings.Contains(ce.Next, "free space") || !strings.Contains(ce.Next, ".seq") ||
 		!strings.Contains(ce.Message, "series adhoc") || strings.Contains(ce.Message, e.profiles) {
 		t.Fatalf("err %+v", ce)
+	}
+}
+
+// A .seq that cannot be read, or is too large to be this server's, is
+// refused naming the .seq, with the advice to move it away.
+func TestAnUnreadableSeqIsRefusedWithItsOwnAdvice(t *testing.T) {
+	capturetest.SkipIfPrivileged(t)
+	for _, c := range []struct {
+		name string
+		set  func(string) error
+	}{
+		{"too large", func(p string) error { return os.WriteFile(p, bytes.Repeat([]byte("x"), 5000), 0o600) }},
+		{"unreadable", func(p string) error { return os.Chmod(p, 0) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newJobEnv(t, jobOpts{})
+			if _, v := e.run(e.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+				t.Fatalf("first %+v", v)
+			}
+			seq := filepath.Join(e.profiles, defaultStdioCaptures, "adhoc", seqFile)
+			if err := c.set(seq); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(seq, 0o600) })
+			j, _ := e.run(e.request(300 * time.Millisecond))
+			ce := jobErr(j)
+			if ce == nil || !strings.Contains(ce.Message, ".seq of series adhoc") || !strings.Contains(ce.Next, "move captures/adhoc/.seq away") ||
+				strings.Contains(ce.Next, "free space") || strings.Contains(ce.Message+ce.Next, e.profiles) {
+				t.Fatalf("err %+v", ce)
+			}
+		})
 	}
 }

@@ -250,29 +250,30 @@ func (r *registry) update(j *job, resultBytes int) error {
 // unless a job of this server already answers for that id; that is not an
 // error.
 func (r *registry) put(captureID string, h *historical) error {
-	return r.putIf(captureID, h, nil)
+	_, err := r.putIf(captureID, h, nil)
+	return err
 }
 
 // putIf is put, unless fresh, checked under the registry's lock, says the
-// answer went stale while it was read. A forget takes the same lock, so a
+// answer went stale while it was read; kept is false then. A forget takes the same lock, so a
 // removal that changes what fresh checks before its forget either sees
 // the answer kept, and forgets it, or keeps it from being kept.
-func (r *registry) putIf(captureID string, h *historical, fresh func() bool) error {
+func (r *registry) putIf(captureID string, h *historical, fresh func() bool) (kept bool, err error) {
 	if captureID == "" || h == nil {
-		return fmt.Errorf("put %q: no capture id or no answer", captureID)
+		return false, fmt.Errorf("put %q: no capture id or no answer", captureID)
 	}
 	n := historicalBytes(h)
 	if a := r.active.Load(); a != nil && a.captureIDIs(captureID) {
-		return nil
+		return true, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if fresh != nil && !fresh() {
-		return nil
+		return false, nil
 	}
 	if el, ok := r.byCapture[captureID]; ok {
 		if el.Value.(*registryEntry).j != nil {
-			return nil
+			return true, nil
 		}
 		r.remove(el)
 	}
@@ -280,7 +281,7 @@ func (r *registry) putIf(captureID string, h *historical, fresh func() bool) err
 	r.index(el)
 	r.bytes += n
 	r.evict(el)
-	return nil
+	return true, nil
 }
 
 // get is the job with the job or capture id id, active or finished. A

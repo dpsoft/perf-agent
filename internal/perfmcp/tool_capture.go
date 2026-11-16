@@ -758,15 +758,39 @@ func (s *Server) readCaptureDir() (*captureDir, error) {
 
 // loadHistorical reads capture key's manifest, and its baseline's when it
 // was compared with one, on a lookup worker, and keeps the answer in the
-// registry for the next wait.
+// registry for the next wait. A write to the capture directory during the
+// read (retention removing this capture, say) makes the answer stale: it
+// is read again, and an answer still overtaken after that is returned to
+// the waits that asked, but never kept.
 func (s *Server) loadHistorical(key string) (any, error) {
 	if s.lookupHook != nil {
 		s.lookupHook(key)
 	}
-	// A write to the capture directory during the read (retention
-	// removing this capture, say) makes the answer stale: it is returned
-	// to this call, but not kept.
-	gen := s.historyGen.Load()
+	for try := 1; ; try++ {
+		gen := s.historyGen.Load()
+		h, err := s.readHistorical(key)
+		if err != nil {
+			return nil, err
+		}
+		if s.readHook != nil {
+			s.readHook(key)
+		}
+		kept, err := s.registry.putIf(key, h, func() bool { return s.historyGen.Load() == gen })
+		if err != nil {
+			s.log.Error("capture registry", "capture", key, "err", err)
+		}
+		if kept || err != nil || try == historicalReads {
+			return h, nil
+		}
+	}
+}
+
+// historicalReads bounds how often a historical read overtaken by a write
+// to the capture directory is read again.
+const historicalReads = 3
+
+// readHistorical reads capture key's manifest, and its baseline's.
+func (s *Server) readHistorical(key string) (*historical, error) {
 	series, id, ok := splitCaptureKey(key)
 	if !ok {
 		return nil, errNoCapture
@@ -804,12 +828,6 @@ func (s *Server) loadHistorical(key string) (any, error) {
 		default:
 			h.base = &bm
 		}
-	}
-	if s.readHook != nil {
-		s.readHook(key)
-	}
-	if err := s.registry.putIf(key, h, func() bool { return s.historyGen.Load() == gen }); err != nil {
-		s.log.Error("capture registry", "capture", key, "err", err)
 	}
 	return h, nil
 }

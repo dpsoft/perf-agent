@@ -1092,7 +1092,8 @@ before returning (§11).
   CAP-R6), so two servers never assign the same id.
 - `ls` order is capture order, and `base` and `cand` read at a glance.
 - Retention never reuses an id: `.seq` is written and fsynced before an
-  id is used (§7.4).
+  id is used (§7.4), and is never lowered. It must not be removed by
+  hand: in a series retention has emptied, ids would start again.
 
 ### 7.2 The manifest
 
@@ -1122,31 +1123,96 @@ Retention bounds disk use across many iterations. It runs at start-up and
 before each capture, and only inside the capture directory.
 
 - **What it may delete:** a capture's files only when its manifest says
-  `written_by: perf-agent-mcp`, and each file's inode, size and SHA-256
-  still match the manifest. A file the user replaced, or anything without
-  a manifest, is never touched.
+  `written_by: perf-agent-mcp` and sits in the series it names, and each
+  file still has the manifest's dev, inode, size and SHA-256, and exactly
+  one link. A file the user replaced, rewrote, linked elsewhere or turned
+  into a symbolic link, or anything without a manifest, is never touched.
+  If any file of a capture is not provably its own, the whole capture is
+  kept, its files put back, and the pass notes it.
 - **What it never deletes:**
   - `kept` captures (`keep: true` is the pin; at most
     `MaxKeptPerSeries`), whatever their age;
-  - the baseline named by the newest capture of the series, whatever its
-    age;
+  - the baseline named by the newest capture of the series that names
+    one (the newest `compare_with`), whatever its age;
   - **the baseline of the call in progress:** `compare_with` is resolved,
     validated and pinned before any eviction (CAP-R4, §7.4 step 3);
-  - any capture named by a live intent;
+  - any capture named by an intent, or by a rollback this server has not
+    finished;
   - a capture whose handle is open in this server, or that a live
     publication pins. Another process's open handles are not visible.
     Deleting a file they opened is harmless to them, since a handle holds
     its loaded profile in memory. Their `compare_with` baselines are
-    protected by the newest-capture rule above.
+    protected by the newest-capture rule above;
+  - an **incomplete** capture: one missing a file with no eviction marker
+    (below), so nothing shows retention began to remove it. The user
+    moved or deleted that file; retention keeps the rest and notes
+    `incomplete`;
+  - anything at all, when a manifest cannot be read (an I/O error or a
+    permission, not merely a file this server did not write): it may be
+    kept or name the newest baseline.
 - **Order:**
-  1. every unprotected capture older than `--capture-ttl` (default 7
-     days, from the manifest's start time; `0` disables the TTL);
-  2. per series, unkept captures beyond `KeepPerSeries`, oldest first;
-  3. then, while `MaxStoredBytes` would be exceeded, the oldest unkept
-     capture in any series, least recently written series first.
-- **How:** `root.Remove` of each file, then the manifest last, so a crash
-  part-way leaves a manifest that a later pass finishes. Every eviction is
-  logged to stderr and listed in the result's `evicted`.
+  1. every eviction an earlier pass began, which its marker shows, is
+     finished;
+  2. every unprotected capture older than `--capture-ttl` (default 7
+     days, from the manifest's start time, or its file time for a failure
+     recorded before a start; `0` disables the TTL). The step is skipped
+     when the clock reads earlier than the newest manifest's start (it
+     jumped back), and a step that would remove more than
+     `KeepPerSeries` captures of one series is logged with the count
+     first. A clock that jumps *forward* by more than the TTL makes every
+     unkept, unprotected capture look expired, and they go: retention
+     cannot tell such a jump from time passing;
+  3. per series, unkept captures beyond `KeepPerSeries`, oldest first.
+     Failed and interrupted captures have a budget of their own of the
+     same size, so a run of failures never pushes out a capture that
+     succeeded;
+  4. then, while the directory lacks room for the largest capture (a
+     profile of each of the three modes and an executions log) under
+     `MaxStoredBytes`, the oldest unkept capture in any series, least
+     recently written series first. The directory is measured once, and
+     each eviction's size counted down. If removing every capture
+     retention may remove would still leave no room (the kept captures,
+     the baselines, or a foreign file take it), or the directory cannot be
+     measured, this step removes nothing and notes why; the capture then
+     fails with `disk`. `MaxStoredBytes` must be at least the largest
+     capture plus 1 MiB for the directory's own small files (`.owner`,
+     `.lock`, `.seq`, manifests); start-up refuses less, and the default
+     grows to that.
+- **How:**
+  1. Before the first removal of a capture with files, retention links
+     the **eviction marker** `NNN-label.evicting` to the manifest (a
+     second name, no-replace, then a directory fsync). From then on the
+     eviction is begun, durably: the next pass finishes it. The marker
+     holds the manifest's own bytes (its token included); a marker name
+     that holds any other file keeps the capture.
+  2. Each file is moved aside to a private quarantine name
+     (`.del-<token16>-r-…`), then each is checked there (stat and
+     SHA-256, once), then each is unlinked; a file that is not the
+     recorded one puts every moved file back. Then the directory is
+     fsynced.
+  3. The manifest is removed, by its own identity, and fsynced.
+  4. The marker, the manifest's last name, is removed last, and fsynced.
+
+  A crash or a failure part-way leaves the marker (and the manifest, or
+  the marker alone), which the next pass finishes. Each pass first puts
+  back what an interrupted one left under retention's quarantine names: a
+  file with the device and inode of one of a capture's files goes back
+  under that file's name, and a second name of a file still held under
+  its own name is dropped. The files are then judged as above, so a file
+  the user rewrote while it was aside keeps its capture. Only a crash
+  between moving the marker (the manifest's last name) aside and
+  unlinking it leaves a `.del-*` name nothing records, which recovery
+  reports. A failure
+  manifest has no files, so it gets no marker; only its manifest is
+  removed. Every eviction is logged to stderr and listed in the result's
+  `evicted`.
+- **Ids:** the manifest, or its marker, outlives the files, and `.seq` is
+  never lowered, so no id is handed out twice. `.seq` must not be removed
+  by hand: once a series is emptied, the ids would start again from 1.
+- **Identities across remounts:** some filesystems (btrfs subvolumes, for
+  one) may report another `st_dev` after a remount. The recorded
+  identities then no longer match, and the captures cannot be evicted:
+  this fails safe, and the user removes them by hand.
 - **No other deletion:** there is no delete tool, and nothing outside the
   capture directory is ever removed. This is the one place where the
   server deletes files, so the docs state it next to "never replaces a
@@ -1197,7 +1263,9 @@ directory. The job's states map onto the steps:
 4. **Id.** Read `<series>/.seq` (a missing file means "highest manifest
    or intent id + 1"), write `id + 1` through temp + fsync + rename +
    directory fsync, **before** the id is used. A crash after this step
-   wastes an id and never reuses one.
+   wastes an id and never reuses one. `.seq` is the only record of the
+   ids a series has used once retention has removed their manifests, so
+   it must not be removed by hand.
 5. **Intent.** Write `NNN-label.intent.json` (no-replace, fsync) with:
    - `state: "prepared"`;
    - the id, series, label and settings;

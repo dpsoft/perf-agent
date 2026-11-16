@@ -1104,13 +1104,14 @@ func scanFiles(t *testing.T, dirs map[string]string) []string {
 }
 
 // scanPattern is what the network scan reads: the binary, and the
-// packages that serve the live page over HTTP, which the binary does not
-// link, so the one listening call stays under the scan.
-const scanPattern = ". ../../internal/livehttp ../../internal/perfpage"
+// packages that serve the live page and MCP over HTTP, which the binary
+// does not link, so the one listening call stays under the scan.
+const scanPattern = ". ../../internal/livehttp ../../internal/perfpage ../../internal/mcphttp"
 
 // TestNoClientNetworkingInTheServer reads the source of every non-standard
-// package scanPattern links on any scan target, internal/livehttp's and
-// internal/perfpage's included, and finds no dial, name lookup, HTTP
+// package scanPattern links on any scan target, internal/livehttp's,
+// internal/perfpage's and internal/mcphttp's included, and finds no dial,
+// name lookup, HTTP
 // client, non-TCP socket or raw system call, no listening call but the one in
 // internal/livehttp/listen.go, which checks the address is loopback first,
 // no os/exec outside the git probe and capture's exec_linux.go, each held
@@ -1143,6 +1144,7 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	for _, want := range []string{
 		"github.com/dpsoft/perf-agent/internal/capture",
 		"github.com/dpsoft/perf-agent/internal/livehttp",
+		"github.com/dpsoft/perf-agent/internal/mcphttp",
 		"github.com/dpsoft/perf-agent/internal/perfpage",
 		"github.com/dpsoft/perf-agent/internal/perfmcp",
 		"github.com/dpsoft/perf-agent/internal/mcpstdio",

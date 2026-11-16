@@ -1279,14 +1279,23 @@ answer there is `cancelling` until the link resolves.
   heartbeat (which holds the token) included: an inode number can be
   reused, and the server's own links, renames and heartbeat updates
   change a file's ctime, so the contents are the proof (CAP-R44);
-- the name is first renamed to a private quarantine name beside it
-  (`.del-<token[:16]>-<16 hex>` for a capture's own removals), checked
-  again there, and only then unlinked; a file that is not the recorded
+- the name is checked by its stat only, then renamed to a private
+  quarantine name beside it (`.del-<token[:16]>-<16 hex>` for a
+  capture's own removals); the file is opened there and its stat and
+  SHA-256 checked through that handle, and right before the unlink the
+  quarantine name must still be that same file (CAP-R52). This narrows
+  the window in which another process of the same user could rename a
+  file onto the quarantine name between the check and the unlink; it
+  does not close it, since no unlink-if-this-inode call exists; a file that is not the recorded
   one is put back without replacing anything (CAP-R43). Recovery proves a
   quarantine name a crash left against what its intent records, or by
   the token its bytes hold; an intent quarantined after its manifest, and
   an intent or manifest temporary written but not yet recorded, are
-  proven the same way;
+  proven the same way. A proof by contents needs the exact bytes the
+  server writes: the token and a newline, or an intent or manifest whose
+  bytes equal its own canonical encoding, that is valid for its name and
+  that carries the capture's token (CAP-R51). A file with anything of its
+  own in it is never taken;
 - a staging directory is opened as a root and proven to be the recorded
   dev and inode before perf-agent's outputs in it are removed by name
   (CAP-R48);
@@ -1296,6 +1305,22 @@ answer there is `cancelling` until the link resolves.
   before step 9), is **left in place and logged**. That covers a user's
   file that won a `Link` race, and anything else the server cannot prove
   it created.
+
+**A link whose outcome is unknown (CAP-R50).** A link that answered an
+error is judged by an `Lstat` of its name: made (the temp's dev and
+inode), not made, or unknown when the name cannot be read. An unknown
+manifest link is never rolled back: the capture keeps its intent and
+files, the job reports `disk`, and the owner settles it before its next
+capture from what is on disk. A rollback removes published files only
+when nothing is at the manifest name; this capture's own ok manifest
+there finishes the commit instead, and anything else strands the
+rollback with the files kept.
+
+**The intent rewrite's window.** A rewrite checks that the intent is
+still the file this capture wrote, then renames its temporary over it.
+The two are separate calls, so a same-user process replacing the intent
+in between has its file replaced; the check narrows that window and
+does not close it, as for removals.
 
 **Live rollback** is done by the owner, on any failure after step 5: an
 `ENOSPC`, a size kill, `target_changed`, a cancel, a publish or manifest

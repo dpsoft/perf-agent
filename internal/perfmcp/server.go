@@ -27,10 +27,10 @@ import (
 // the pins and the live page's publications belong to the engine holder:
 // every tool runs holding the engine (see engine), and so will a capture
 // job's steps, so they need no locks of their own. Serve must not run
-// concurrently with itself. The live page's HTTP handlers read only the
-// snapshot the engine holder last committed and the immutable publications
-// it holds. Close may run on another goroutine, even after Serve returned
-// while a handler still runs, and stops the live page under its lock.
+// concurrently with itself. A PageView reads only the snapshot the engine
+// holder last committed and the immutable publications it holds. Close
+// may run on another goroutine, even after Serve returned while a handler
+// still runs, and marks the live page closed under its lock.
 type Server struct {
 	lim Limits
 	log *slog.Logger
@@ -51,7 +51,7 @@ type Server struct {
 	attempts *attempts
 	mcp      *mcpstdio.Server
 	// pins is the ledger of the profiles and views the store and the live
-	// page keep. live is the live page, nil unless Config.Live.
+	// page keep. live is the live page, nil unless Config.Page.
 	pins *pins
 	live *live
 
@@ -183,7 +183,7 @@ func New(cfg Config) (_ *Server, err error) {
 		return nil, errors.New("perfmcp: Config.ProfilesDir is required: the directory profiles are read from")
 	}
 	lim, fitted := cfg.Limits.resolve()
-	if err := lim.validate(cfg.Live); err != nil {
+	if err := lim.validate(cfg.Page != nil); err != nil {
 		return nil, err
 	}
 	s := &Server{
@@ -224,8 +224,8 @@ func New(cfg Config) (_ *Server, err error) {
 	s.diffs = newDiffCache(lim.MaxCachedDiffs)
 	s.pins = newPins()
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles, s.pins)
-	if cfg.Live {
-		s.live = newLive(lim, s.pins)
+	if cfg.Page != nil {
+		s.live = newLive(lim, s.pins, *cfg.Page)
 	}
 	if err := s.setupCapture(cfg.Capture); err != nil {
 		return nil, err
@@ -377,13 +377,11 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 // Close cancels the capture jobs and kills their captures, waits up to
 // Capture.StopGrace + 1 s for the jobs to roll back and up to
 // maintenanceJoin for the maintenance goroutine to end (neither when a
-// signal path already called KillCaptures), stops the live page, if any,
-// and closes the server's roots. It may run on another goroutine than
-// Serve's, while a request is in flight, and does not wait for the engine:
-// a handler may still run after Serve returned. The
-// page's streams end first and its other responses get liveShutdown before
-// their connections are dropped, so a tab that stopped reading delays Close
-// by at most that. A second Close does nothing and returns nil.
+// signal path already called KillCaptures), marks the live page closed,
+// if any, and closes the server's roots. It may run on another goroutine
+// than Serve's, while a request is in flight, and does not wait for the
+// engine: a handler may still run after Serve returned. It serves no page,
+// so it waits for no tab. A second Close does nothing and returns nil.
 func (s *Server) Close() error {
 	signalled := s.killed.Load()
 	s.jobsMu.Lock()

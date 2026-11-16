@@ -142,8 +142,14 @@ func (s *Server) handlePageOpen(_ context.Context, raw json.RawMessage) (mcpstdi
 	return s.respond("page_open", shrinkPage, out)
 }
 
-// viewers is how many tabs have the page open, as a decimal string.
-func (s *Server) viewers() string { return strconv.Itoa(s.live.hub.Clients()) }
+// viewers is how many tabs have the page open, as PageConfig.Viewers
+// counts them, as a decimal string.
+func (s *Server) viewers() string {
+	if s.live.viewers == nil {
+		return "0"
+	}
+	return strconv.Itoa(s.live.viewers())
+}
 
 type pageExplainArgs struct {
 	Handle       profilemodel.Handle `json:"handle"`
@@ -328,7 +334,7 @@ func (l *live) keptIDs() string {
 // explained publication's view, or of a diff's whole union, looked up in
 // its index and never in its model.
 func (p *publication) hasNode(node string) bool {
-	if len(node) > maxPathValue {
+	if len(node) > maxPageID {
 		return false
 	}
 	switch p.kind {

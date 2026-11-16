@@ -7,10 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
-	"net/netip"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,11 +23,6 @@ import (
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
-
-// liveEnv makes a test binary run as the server with the live page engine,
-// which the stdio command does not expose: the engine is exercised through
-// the same run function, and a subprocess is this package's test binary, built without -race.
-const liveEnv = "PERF_AGENT_MCP_TEST_LIVE"
 
 // fakeVerifyEnv makes a test binary run as the server and accept any
 // --perf-agent, such as the fake perf-agent, which cannot be setcap'd.
@@ -54,8 +45,8 @@ func TestMain(m *testing.M) {
 		return
 	}
 	code := capturetest.Main(m)
-	if liveBinDir != "" {
-		_ = os.RemoveAll(liveBinDir)
+	if fakeBinDir != "" {
+		_ = os.RemoveAll(fakeBinDir)
 	}
 	os.Exit(code)
 }
@@ -64,9 +55,6 @@ func TestMain(m *testing.M) {
 // every test variable set, or nil when none is.
 func envConfigHook() func(*perfmcp.Config) {
 	var steps []func(*perfmcp.Config)
-	if os.Getenv(liveEnv) == "1" {
-		steps = append(steps, func(c *perfmcp.Config) { c.Live = true })
-	}
 	if os.Getenv(fakeVerifyEnv) == "1" {
 		steps = append(steps, func(c *perfmcp.Config) { c.Capture.Verify = fakeVerify })
 	}
@@ -99,7 +87,7 @@ func fakeVerify(p string) (capture.Binary, error) {
 // binary built without -race, with env added to the test's environment.
 func fakeCommand(t *testing.T, env []string, args ...string) *exec.Cmd {
 	t.Helper()
-	exe, err := liveTestBinary()
+	exe, err := fakeTestBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,36 +96,23 @@ func fakeCommand(t *testing.T, env []string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// liveBinDir holds the test binary liveCommand builds.
-var liveBinDir string
+// fakeBinDir holds the test binary fakeCommand builds.
+var fakeBinDir string
 
-// liveTestBinary builds this package's test binary without the race
+// fakeTestBinary builds this package's test binary without the race
 // detector, whose overhead slows the shutdown the signal tests time.
-var liveTestBinary = sync.OnceValues(func() (string, error) {
-	dir, err := os.MkdirTemp("", "perf-agent-mcp-live")
+var fakeTestBinary = sync.OnceValues(func() (string, error) {
+	dir, err := os.MkdirTemp("", "perf-agent-mcp-fake")
 	if err != nil {
 		return "", err
 	}
-	liveBinDir = dir
-	bin := filepath.Join(dir, "live.test")
+	fakeBinDir = dir
+	bin := filepath.Join(dir, "server.test")
 	if out, err := exec.Command("go", "test", "-c", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go test -c: %v\n%s", err, out)
 	}
 	return bin, nil
 })
-
-// withLive runs the server of this test with the live page engine.
-func withLive(t *testing.T) {
-	t.Helper()
-	configHook = func(c *perfmcp.Config) { c.Live = true }
-	t.Cleanup(func() { configHook = nil })
-}
-
-// liveCommand is a subprocess running the server with the live page engine.
-func liveCommand(t *testing.T, args ...string) *exec.Cmd {
-	t.Helper()
-	return fakeCommand(t, []string{liveEnv + "=1"}, args...)
-}
 
 func TestRunNeedsAProfilesRoot(t *testing.T) {
 	var out, errb bytes.Buffer
@@ -566,76 +541,9 @@ func TestRunServesOverStdio(t *testing.T) {
 	}
 }
 
-// liveSession runs a server with the live page over pipes: it opens
-// cpu.pb.gz, starts the page, publishes the facts of its default view and
-// steers the page to them, while a browser reads the shell, the model and
-// the stream. It returns the ended client, its stderr and the page's URL.
-func liveSession(t *testing.T) (c *stdioClient, stderr, pageURL string) {
-	t.Helper()
-	profiles, output := t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(profiles, "cpu.pb.gz"), pmfixture.CPUBasic(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var errb lockedBuffer
-	withLive(t)
-	c = startRunLogging(t, &errb, "--profiles", profiles, "--output", output)
-	c.call("tools/list", map[string]any{})
-	pageURL, pub := c.openAndPublish()
-	c.tool("page_show", map[string]any{"publication": pub})
-
-	browser := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 10 * time.Second}
-	defer browser.CloseIdleConnections()
-	stream := browserGet(t, browser, pageURL+"events")
-	if line, err := bufio.NewReader(stream.Body).ReadString('\n'); err != nil || line != "event: state\n" {
-		t.Errorf("stream: %q (%v)", line, err)
-	}
-	_ = stream.Body.Close()
-	for _, route := range []string{"", "pub/" + pub + "/model"} {
-		res := browserGet(t, browser, pageURL+route)
-		_, _ = io.Copy(io.Discard, res.Body)
-		_ = res.Body.Close()
-	}
-	if code := c.end(); code != 0 {
-		t.Fatalf("exit %d, stderr %q", code, errb.String())
-	}
-	return c, errb.String(), pageURL
-}
-
-// pageAddr is the host:port of a page URL.
-func pageAddr(t *testing.T, pageURL string) netip.AddrPort {
-	t.Helper()
-	u, err := url.Parse(pageURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ap, err := netip.ParseAddrPort(u.Host)
-	if err != nil {
-		t.Fatalf("page URL host %q: %v", u.Host, err)
-	}
-	return ap
-}
-
-// pageToken is the token segment of a page URL.
-func pageToken(t *testing.T, pageURL string) string {
-	t.Helper()
-	_, after, ok := strings.Cut(pageURL, "/s/")
-	tok, _, _ := strings.Cut(after, "/")
-	if !ok || len(tok) < 32 {
-		t.Fatalf("page URL %s has no token", redact(pageURL))
-	}
-	return tok
-}
-
 func TestStdoutCarriesOnlyJSONRPC(t *testing.T) {
 	stdout, _, _, _ := session(t)
-	live, stderr, pageURL := liveSession(t)
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
-	for _, l := range live.lines {
-		lines = append(lines, strings.TrimSuffix(string(l), "\n"))
-	}
-	if len(live.rest) != 0 {
-		t.Errorf("stdout carried %q after the last response", live.rest)
-	}
 	for _, line := range lines {
 		var m struct {
 			JSONRPC string `json:"jsonrpc"`
@@ -643,12 +551,6 @@ func TestStdoutCarriesOnlyJSONRPC(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &m); err != nil || m.JSONRPC != "2.0" {
 			t.Errorf("stdout line is not JSON-RPC 2.0: %q (%v)", line, err)
 		}
-	}
-	if want := "addr=" + pageAddr(t, pageURL).String(); !strings.Contains(stderr, "live page listening") || !strings.Contains(stderr, want) {
-		t.Errorf("stderr does not log the listening address %s:\n%s", want, stderr)
-	}
-	if strings.Contains(stderr, pageToken(t, pageURL)) {
-		t.Error("stderr carries the page token")
 	}
 }
 
@@ -694,48 +596,7 @@ func TestRunRegistersTheProfileAndCaptureTools(t *testing.T) {
 	}
 }
 
-// The live page engine, run through the same entry point with the page
-// switched on by a test, listens on 127.0.0.1 and a port the kernel picks.
-func TestLivePageListensOnLoopback(t *testing.T) {
-	withLive(t)
-	c := startRun(t, "--profiles", t.TempDir())
-	var opened struct {
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal([]byte(c.tool("page_open", map[string]any{})), &opened); err != nil {
-		t.Fatal(err)
-	}
-	if ap := pageAddr(t, opened.URL); ap.Addr() != netip.MustParseAddr("127.0.0.1") || ap.Port() == 0 {
-		t.Errorf("the page listens on %v, want 127.0.0.1 and a port", ap)
-	}
-}
-
-func TestRunServesTheLivePage(t *testing.T) {
-	profiles := t.TempDir()
-	if err := os.WriteFile(filepath.Join(profiles, "cpu.pb.gz"), pmfixture.CPUBasic(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	withLive(t)
-	c := startRun(t, "--profiles", profiles)
-	pageURL, pub := c.openAndPublish()
-	browser := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, Timeout: 10 * time.Second}
-	for _, route := range []string{"", "pub/" + pub + "/model"} {
-		res := browserGet(t, browser, pageURL+route)
-		_, _ = io.Copy(io.Discard, res.Body)
-		_ = res.Body.Close()
-	}
-	if code := c.end(); code != 0 {
-		t.Fatalf("exit %d at the end of input", code)
-	}
-	addr := pageAddr(t, pageURL).String()
-	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		_ = conn.Close()
-		t.Errorf("%s still accepts connections after run returned", addr)
-	}
-}
-
-// TestTheServerLinksNoProfiler keeps the profiler out of the binary. net,
-// net/http and crypto/tls are linked for the live page's loopback listener.
+// TestTheServerLinksNoProfiler keeps the profiler out of the binary.
 func TestTheServerLinksNoProfiler(t *testing.T) {
 	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".").Output()
 	if err != nil {
@@ -757,99 +618,47 @@ func TestTheServerLinksNoProfiler(t *testing.T) {
 	}
 }
 
-// networkingPackages are the packages that open connections. Among the
-// binary's own packages only internal/livehttp, the loopback listener, may
-// import them, and internal/perfmcp may import net/http for the page's
-// handlers and the server they run in.
+// networkingPackages are the packages that open or accept connections.
+// net/url and net/netip only parse addresses, and stay allowed.
 var networkingPackages = []string{"net", "net/http", "crypto/tls", "net/textproto", "log/syslog"}
 
-// handlerImports are the networking imports each package besides
-// internal/livehttp is allowed.
-var handlerImports = map[string][]string{
-	"github.com/dpsoft/perf-agent/internal/perfmcp": {"net/http"},
+// pageServers are this repository's packages that serve the live page or
+// MCP over HTTP: only perf-agent-hub links them.
+var pageServers = []string{
+	"github.com/dpsoft/perf-agent/internal/livehttp",
+	"github.com/dpsoft/perf-agent/internal/mcphttp",
+	"github.com/dpsoft/perf-agent/internal/perfpage",
 }
 
-// clientSymbols are functions every outgoing connection or name lookup
-// through the standard library runs. crypto/tls's client handshake is not
-// one of them: net/http's server links it too, since it wraps an accepted
-// unencrypted HTTP/2 connection with tls.Client, so nm cannot tell it
-// apart. Nor is (*net.Resolver).LookupIPAddr: the compiler always inlines
-// it into its callers, so it never has a symbol, and the lookupIPAddr it
-// calls is linked by the listener's address parsing too. The source scan
-// (TestNoClientNetworkingInTheServer) refuses calls of it.
-var clientSymbols = []string{
-	"net/http.(*Client).do",
-	"net/http.(*Transport).roundTrip",
-	"net/http.(*Transport).dialConn",
-	"net.Dial",
-	"net.DialTimeout",
-	"net.(*Resolver).LookupHost",
-}
-
-// liveSymbols are functions of the live page's server and handlers. The
-// linker keeps only code a page tool can reach, so the client symbols'
-// absence says something about the handlers only while these are linked.
-// Each is called only through a func value or an interface, so the
-// compiler cannot inline it away: an inlined function could be missing
-// from the symbol table and still be reachable.
-var liveSymbols = []string{
-	"github.com/dpsoft/perf-agent/internal/perfmcp.(*Server).liveMux",
-	"github.com/dpsoft/perf-agent/internal/perfmcp.(*Server).liveMux.func1",
-	"github.com/dpsoft/perf-agent/internal/livehttp.(*Hub).ServeHTTP",
-}
-
-// TestTheServerOpensNoConnection is a layer under the source scan
-// (TestNoClientNetworkingInTheServer) and the socket test
-// (TestEverySocketIsLoopback): only internal/livehttp imports a networking
-// package (and internal/perfmcp net/http, for its handlers), and the linked
-// binary has none of the client symbols while it links the live page's
-// handlers. It cannot replace either: a call of (*net.Dialer).DialContext,
-// which tls.Dial makes too, is linked by the server side as well, so nm
-// cannot tell it apart.
-func TestTheServerOpensNoConnection(t *testing.T) {
-	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", `{{if not .Standard}}{{.ImportPath}}: {{join .Imports " "}}{{end}}`, ".").Output()
+// linksNetworking fails t for every networking package and page server
+// that pkg links, through any import, on this platform.
+func linksNetworking(t *testing.T, pkg string) {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}}", pkg).Output()
 	if err != nil {
-		t.Fatalf("go list: %v", err)
+		t.Fatalf("go list %s: %v", pkg, err)
 	}
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		path, imports, _ := strings.Cut(line, ": ")
-		if path == "github.com/dpsoft/perf-agent/internal/livehttp" {
-			continue
-		}
-		for imp := range strings.FieldsSeq(imports) {
-			if slices.Contains(handlerImports[path], imp) {
-				continue
-			}
-			if slices.Contains(networkingPackages, imp) || strings.HasPrefix(imp, "net/http/") {
-				t.Errorf("%s imports %s; only internal/livehttp may", path, imp)
-			}
+	deps := strings.Fields(string(out))
+	if !slices.Contains(deps, "net/url") || !slices.Contains(deps, "github.com/dpsoft/perf-agent/internal/mcpstdio") {
+		t.Fatalf("go list %s lists %d packages without net/url or mcpstdio: not the server's dependencies", pkg, len(deps))
+	}
+	for _, d := range deps {
+		if slices.Contains(networkingPackages, d) || strings.HasPrefix(d, "net/http/") || slices.Contains(pageServers, d) {
+			t.Errorf("%s links %s", pkg, d)
 		}
 	}
+}
 
-	bin := filepath.Join(t.TempDir(), "perf-agent-mcp")
-	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	syms, err := exec.Command("go", "tool", "nm", bin).Output()
-	if err != nil {
-		t.Fatalf("go tool nm: %v", err)
-	}
-	linked := map[string]bool{}
-	for line := range strings.SplitSeq(string(syms), "\n") {
-		if f := strings.Fields(line); len(f) >= 3 {
-			linked[f[len(f)-1]] = true
-		}
-	}
-	for _, sym := range liveSymbols {
-		if !linked[sym] {
-			t.Errorf("the binary does not link %s: the live page's handlers are unreachable, so finding no client symbol proves nothing about them", sym)
-		}
-	}
-	for _, sym := range clientSymbols {
-		if linked[sym] {
-			t.Errorf("the binary links %s, which opens a connection or looks a name up", sym)
-		}
-	}
+// The stdio server opens no socket: its binary links no networking
+// package and none of the packages that serve the page or MCP over HTTP.
+func TestTheServerLinksNoNetworking(t *testing.T) {
+	linksNetworking(t, ".")
+}
+
+// perfmcp, which both binaries embed, links no networking: the page's
+// routes live in internal/perfpage, which reads it through PageView.
+func TestPerfmcpImportsNoNetworking(t *testing.T) {
+	linksNetworking(t, "../../internal/perfmcp")
 }
 
 func TestTheServerIsNotShipped(t *testing.T) {

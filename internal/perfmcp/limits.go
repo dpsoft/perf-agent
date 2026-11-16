@@ -331,9 +331,9 @@ func fittedTail(l Limits) int {
 // failure. Together they may take a quarter of MaxResponseBytes.
 const maxTailsPerResult = 4
 
-// validate refuses limits a server cannot run with. live says the live
-// page is on: only then must the retained budget hold a whole page.
-func (l Limits) validate(live bool) error {
+// validate refuses limits a server cannot run with. page says the live
+// page engine is on: only then must the retained budget hold a whole page.
+func (l Limits) validate(page bool) error {
 	for _, f := range []struct {
 		name string
 		v    int
@@ -367,7 +367,7 @@ func (l Limits) validate(live bool) error {
 	if l.MaxRetainedBytes <= 0 {
 		return fmt.Errorf("perfmcp: limit MaxRetainedBytes must be positive, got %d", l.MaxRetainedBytes)
 	}
-	if live && l.MaxRetainedBytes < int64(l.MaxPageBytes) {
+	if page && l.MaxRetainedBytes < int64(l.MaxPageBytes) {
 		return fmt.Errorf("perfmcp: MaxRetainedBytes must be at least MaxPageBytes: a live page keeps its model, so a budget of %d bytes cannot hold a %d-byte page",
 			l.MaxRetainedBytes, l.MaxPageBytes)
 	}

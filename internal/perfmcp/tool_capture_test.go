@@ -950,7 +950,7 @@ func TestTheResultIsCutToMaxResponseBytes(t *testing.T) {
 // the page tools of a live server.
 func TestToolsListOrder(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	c := newTestServer(t, cfg)
 	var list struct {
 		Tools []struct {

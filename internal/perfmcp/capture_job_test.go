@@ -131,7 +131,9 @@ func newJobEnv(t *testing.T, o jobOpts) *jobEnv {
 	if o.profiles != "" {
 		cfg.ProfilesDir = o.profiles
 	}
-	cfg.Live = o.live
+	if o.live {
+		cfg.Page = livePage()
+	}
 	cfg.Limits = jobLimits()
 	if o.limits != nil {
 		o.limits(&cfg.Limits)

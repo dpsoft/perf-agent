@@ -1,6 +1,6 @@
 //go:build !unix
 
-package perfmcp
+package perfpage
 
 import "syscall"
 

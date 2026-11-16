@@ -2,42 +2,20 @@ package perfmcp
 
 import (
 	"cmp"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"maps"
-	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
-	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
-
-// liveAddr is where the live page listens: the IPv4 loopback, on a port
-// the kernel picks. livehttp.Listen checks it is loopback.
-const liveAddr = "127.0.0.1:0"
-
-// The live page's stream: a keep-alive comment after this long without an
-// event, and this long for each write before the stream is dropped.
-const (
-	liveKeepAlive    = 15 * time.Second
-	liveWriteTimeout = 10 * time.Second
-)
-
-// liveShutdown is how long Close lets the page's responses finish before
-// it drops their connections. Close may run during a forced exit, so it
-// must not wait on a tab that stopped reading.
-const liveShutdown = 500 * time.Millisecond
 
 // pubKind is what a publication shows.
 type pubKind string
@@ -48,7 +26,7 @@ const (
 )
 
 // publication is one page the live page can show. It is complete before
-// the snapshot holds it, and never changes after: HTTP handlers read it
+// the snapshot holds it, and never changes after: a PageView reads it
 // from any goroutine. It pins the engine objects its routes compute from,
 // so it stays valid after the store lets them go: an explained one its
 // Profile and View, a diff its Diff, the Diff's index and both sides'
@@ -258,9 +236,9 @@ func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts
 	return out, from
 }
 
-// liveSnapshot is what the live page's HTTP handlers read: the steering,
-// the kept publications and their histories, and the state JSON every page
-// is sent. A snapshot never changes once stored; commit replaces it.
+// liveSnapshot is what a PageView reads: the steering, the kept
+// publications and their histories, and the state JSON every page is
+// sent. A snapshot never changes once stored; commit replaces it.
 type liveSnapshot struct {
 	seq                      int64
 	current, selected, focus string
@@ -275,10 +253,9 @@ type liveSnapshot struct {
 //
 // The engine holder alone changes the publications, the steering and the
 // snapshot: every field below snap is its own, and commit, the only writer
-// of snap, runs under the engine. HTTP handlers read only what snap points
-// to, and the hub, which never changes. The listener's lifecycle is the
-// exception: the engine holder starts it and Close may end it from another
-// goroutine (a forced exit), so it is behind mu.
+// of snap, runs under the engine. A PageView reads only what snap points
+// to. closed is the exception: Close may set it from another goroutine (a
+// forced exit), so it is behind mu.
 type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
@@ -294,30 +271,30 @@ type live struct {
 	// starts at ("" for the whole view).
 	current, selected, focus string
 
-	hub  *livehttp.Hub
+	// url is the page's address; notify receives every committed state
+	// and viewers counts the open streams (see PageConfig). opened is set
+	// by the first ensureLive, which commits.
+	url     string
+	notify  func([]byte)
+	viewers func() int
+	opened  bool
+
 	lim  Limits
 	pins *pins
-	// heavySlots holds a token per export or focus request being served;
-	// see heavy.
-	heavySlots chan struct{}
 
 	mu sync.Mutex
-	// closed is set by close; nothing starts after it.
+	// closed is set by close; the page tools refuse after it.
 	closed bool
-	// srv serves the page once start has run, from ln; url is the page's
-	// address.
-	srv *http.Server
-	ln  io.Closer
-	url string
 }
 
-func newLive(lim Limits, pins *pins) *live {
+func newLive(lim Limits, pins *pins, page PageConfig) *live {
 	l := &live{
-		history:    map[string]*liveHistory{},
-		hub:        livehttp.NewHub(lim.MaxPageClients, liveKeepAlive, liveWriteTimeout),
-		lim:        lim,
-		pins:       pins,
-		heavySlots: make(chan struct{}, liveHeavy),
+		history: map[string]*liveHistory{},
+		url:     page.URL,
+		notify:  page.Notify,
+		viewers: page.Viewers,
+		lim:     lim,
+		pins:    pins,
 	}
 	snap := &liveSnapshot{pubs: map[string]*publication{}, history: map[string]*liveHistory{}}
 	snap.state = stateOf(snap)
@@ -331,76 +308,32 @@ func (l *live) snapshot() *liveSnapshot { return l.snap.Load() }
 // errLiveClosed is ensureLive's answer once the server is closing.
 var errLiveClosed = errors.New("the live page is shut down: perf-agent-mcp is exiting")
 
-// close stops the live page. It may run on any goroutine, more than once.
-// The hub goes first, so every stream returns and its connection can go
-// idle; then the server gets liveShutdown to finish the other responses,
-// and the connections still busy, a tab that stopped reading, are
-// dropped. It logs nothing: stderr may be blocked during a forced exit.
+// close marks the live page closed, so no page tool runs after it. It may
+// run on any goroutine, more than once. Whoever serves the page stops
+// that on its own; close neither waits nor logs, since stderr may be
+// blocked during a forced exit.
 func (l *live) close() {
 	l.mu.Lock()
-	l.closed = true
-	srv, ln := l.srv, l.ln
-	l.mu.Unlock()
-	l.hub.Close()
-	if srv == nil {
-		return
-	}
-	// Serve may not have taken the listener yet; closing it here refuses
-	// new connections at once either way.
-	_ = ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), liveShutdown)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
-	_ = srv.Close()
-}
-
-// start listens on liveAddr with a new token and serves mux() behind the
-// guard, unless the page is already served or close has run. It returns
-// the page's URL, the address it listens on and whether this call
-// started it.
-func (l *live) start(mux func() http.Handler, log *slog.Logger) (url, addr string, started bool, err error) {
-	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
-		return "", "", false, errLiveClosed
-	}
-	if l.url != "" {
-		return l.url, "", false, nil
-	}
-	tok, err := livehttp.NewToken()
-	if err != nil {
-		return "", "", false, err
-	}
-	ln, err := livehttp.Listen(liveAddr)
-	if err != nil {
-		return "", "", false, fmt.Errorf("live page: %w", err)
-	}
-	srv := livehttp.NewServer(livehttp.Guard(tok, mux()), log)
-	go func() { _ = srv.Serve(ln) }()
-	// A TCP address prints an IPv6 host in brackets.
-	addr = ln.Addr().String()
-	l.srv, l.ln, l.url = srv, ln, "http://"+addr+"/s/"+string(tok)+"/"
-	return l.url, addr, true, nil
+	l.closed = true
 }
 
-// ensureLive starts the live page on first use and returns its URL; later
-// calls return the same URL. It runs under the engine, and refuses
-// once Close has run. The first start commits, so a page that connects
+// ensureLive returns the page's URL, and refuses once Close has run. It
+// runs under the engine. The first call commits, so a page that connects
 // before anything is published is still sent a state.
 func (s *Server) ensureLive() (string, error) {
 	if s.live == nil {
 		return "", errLiveDisabled
 	}
-	url, addr, started, err := s.live.start(s.liveMux, s.log)
-	if err != nil {
-		return "", err
+	l := s.live
+	if l.isClosed() {
+		return "", errLiveClosed
 	}
-	if started {
-		// The address only: the token is in the URL, never in a log line.
-		s.log.Info("live page listening", "addr", addr)
+	if !l.opened {
+		l.opened = true
 		s.commit()
 	}
-	return url, nil
+	return l.url, nil
 }
 
 // isClosed reports whether close has run.
@@ -700,8 +633,8 @@ func (l *live) heldByKept() int64 {
 }
 
 // commit stores a new snapshot of the live state, at the next seq, and
-// sends its state to every page. It is the only writer of the snapshot,
-// and runs under the engine.
+// hands its state to notify. It is the only writer of the snapshot, and
+// runs under the engine.
 func (s *Server) commit() {
 	l := s.live
 	l.seq++
@@ -716,8 +649,10 @@ func (s *Server) commit() {
 	snap.state = stateOf(snap)
 	l.snap.Store(snap)
 	// The state is compact JSON from encoding/json: never empty and never
-	// more than one line, the only data Publish refuses.
-	_ = l.hub.Publish(snap.state)
+	// more than one line.
+	if l.notify != nil {
+		l.notify(snap.state)
+	}
 }
 
 // liveStateEntry is a publication as the state lists it. history is its

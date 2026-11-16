@@ -156,7 +156,7 @@ func TestPipelinedCallsAtEOFAreAnswered(t *testing.T) {
 // capture job does: they hold the engine, so the two never run at once.
 func TestLivePageToolsHoldTheEngine(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	writeCPUFixtures(t, cfg)
 	c := newTestServer(t, cfg)
 	var o openedAs

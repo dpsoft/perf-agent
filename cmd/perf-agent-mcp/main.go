@@ -31,8 +31,8 @@ import (
 var version = "dev"
 
 // configHook, when set, adjusts the server's configuration before it is
-// built. The command sets none; tests use it to run the live page engine,
-// which the stdio server does not expose.
+// built. The command sets none; tests use it to read the configuration or
+// to set test seams, such as a smaller output queue.
 var configHook func(*perfmcp.Config)
 
 func main() {

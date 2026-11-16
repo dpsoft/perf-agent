@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net/netip"
 	"reflect"
 	"runtime"
 	"slices"
@@ -17,19 +16,19 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
-	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
-// newLiveServer is a server with the live page on that nothing serves:
-// the test calls its methods itself, as its one request goroutine would.
+// newLiveServer is a server with the live page engine on, which nothing
+// serves: the test calls its methods itself, as its one request goroutine
+// would.
 // edit, when set, changes the config first; fixtures maps file names in
 // the profiles root to their bytes.
 func newLiveServer(t *testing.T, edit func(*Config), fixtures map[string][]byte) *Server {
 	t.Helper()
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	if edit != nil {
 		edit(&cfg)
 	}
@@ -158,16 +157,6 @@ func ids(pubs []*publication) []string {
 		out = append(out, p.id)
 	}
 	return out
-}
-
-func TestTheLiveAddressIsLoopbackOnAnyPort(t *testing.T) {
-	ap, err := livehttp.CheckAddr(liveAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ap.Addr() != netip.MustParseAddr("127.0.0.1") || ap.Port() != 0 {
-		t.Errorf("live address %s, want 127.0.0.1 on a port the kernel picks", ap)
-	}
 }
 
 func TestTheZeroStateIsEmpty(t *testing.T) {
@@ -825,24 +814,9 @@ func TestALargeLabelIsChargedToItsProfile(t *testing.T) {
 	}
 }
 
-func TestNoLiveWithoutTheFlag(t *testing.T) {
-	cfg := testConfig(t)
-	s := must(New(cfg))(t)
-	t.Cleanup(func() { _ = s.Close() })
-	if s.live != nil {
-		t.Error("a server without Live has live state")
-	}
-	cfg.Live = true
-	s = must(New(cfg))(t)
-	t.Cleanup(func() { _ = s.Close() })
-	if s.live == nil {
-		t.Error("a server with Live has no live state")
-	}
-}
-
 func TestLimitsValidateTheRetainedBudget(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	cfg.Limits.MaxPageBytes = 1 << 20
 	cfg.Limits.MaxRetainedBytes = 1<<20 - 1
 	_, err := New(cfg)
@@ -851,10 +825,10 @@ func TestLimitsValidateTheRetainedBudget(t *testing.T) {
 		t.Errorf("New with MaxRetainedBytes < MaxPageBytes: %v", err)
 	}
 
-	cfg.Live = false
+	cfg.Page = nil
 	s, err := New(cfg)
 	if err != nil {
-		t.Errorf("without Live the budget is not checked against MaxPageBytes: %v", err)
+		t.Errorf("without Page the budget is not checked against MaxPageBytes: %v", err)
 	} else {
 		_ = s.Close()
 	}

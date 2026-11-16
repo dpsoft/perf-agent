@@ -1,6 +1,6 @@
 //go:build linux
 
-package perfmcp
+package perfpage
 
 import (
 	"os/exec"

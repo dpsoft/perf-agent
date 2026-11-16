@@ -133,31 +133,11 @@ func newProcEnv(t *testing.T, fo capturetest.FakeOptions) *procEnv {
 	t.Helper()
 	capturetest.SkipIfPrivileged(t)
 	fo.Record = filepath.Join(t.TempDir(), "record.json")
-	e := &procEnv{t: t, profiles: t.TempDir(), fake: ownFake(t, fo), record: fo.Record}
+	e := &procEnv{t: t, profiles: t.TempDir(), fake: capturetest.FakePerfAgent(t, fo), record: fo.Record}
 	e.plain = sync.OnceValue(func() string {
-		return ownFake(t, capturetest.FakeOptions{Record: filepath.Join(t.TempDir(), "record.json")})
+		return capturetest.FakePerfAgent(t, capturetest.FakeOptions{Record: filepath.Join(t.TempDir(), "record.json")})
 	})
 	return e
-}
-
-// ownFake is a fake perf-agent on an inode of its own. FakePerfAgent
-// hard-links the one built binary, so staging another fake changes the
-// inode's ctime under every server that verified it, and a parallel test
-// would make their captures fail binary_changed.
-func ownFake(t *testing.T, fo capturetest.FakeOptions) string {
-	t.Helper()
-	path := capturetest.FakePerfAgent(t, fo)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, b, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
 
 // config is a server over the env with the job tests' limits.

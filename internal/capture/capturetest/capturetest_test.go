@@ -213,3 +213,39 @@ func TestFakeFailureModes(t *testing.T) {
 		}
 	}
 }
+
+// Each fake is a file of its own: staging one changes nothing of another,
+// so a server that verified a fake's identity never sees it change
+// because a parallel test staged one.
+func TestEachFakeIsItsOwnFile(t *testing.T) {
+	first := capturetest.FakePerfAgent(t, capturetest.FakeOptions{})
+	before, err := capture.IdentityOf(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi1, err := os.Stat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := capturetest.FakePerfAgent(t, capturetest.FakeOptions{})
+	fi2, err := os.Stat(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(fi1, fi2) {
+		t.Error("two fakes share one inode")
+	}
+	if fi1.Sys().(*syscall.Stat_t).Nlink != 1 {
+		t.Errorf("a fake has %d links", fi1.Sys().(*syscall.Stat_t).Nlink)
+	}
+	after, err := capture.IdentityOf(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("staging a second fake changed the first: %+v, then %+v", before, after)
+	}
+	if fi1.Mode().Perm()&0o111 == 0 {
+		t.Errorf("the fake is not executable: %v", fi1.Mode())
+	}
+}

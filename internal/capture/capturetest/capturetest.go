@@ -129,16 +129,16 @@ type FakeOptions struct {
 // FakePerfAgent stages a fake perf-agent in tb.TempDir() and returns its
 // path. The executable keeps the basename fakeperfagent so its comm is
 // recognisable. Beside it are fake-mode.json and fixtures/, which the fake
-// copies from.
+// copies from. Each fake is a copy of its own, never a link to the built
+// binary: staging one must not change the identity (links, ctime) of a
+// fake another test's server has verified.
 func FakePerfAgent(tb testing.TB, o FakeOptions) string {
 	tb.Helper()
 	built, _ := Binaries(tb)
 	dir := tb.TempDir()
 	path := filepath.Join(dir, fakeName)
-	if err := os.Link(built, path); err != nil {
-		if err := copyFile(built, path); err != nil {
-			tb.Fatal(err)
-		}
+	if err := copyFile(built, path); err != nil {
+		tb.Fatal(err)
 	}
 	mode := o.Mode
 	if mode == "" {

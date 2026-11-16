@@ -209,6 +209,17 @@ func failOp(op string, err error) func(string) error {
 	}
 }
 
+// failOpAt is a writeErr that fails op with err the n-th time only.
+func failOpAt(op string, n int, err error) func(string) error {
+	var seen atomic.Int32
+	return func(o string) error {
+		if o == op && int(seen.Add(1)) == n {
+			return err
+		}
+		return nil
+	}
+}
+
 var errInjected = errors.New("injected failure")
 
 // crashRecover lets every owner be gone and every heartbeat go stale, then

@@ -82,6 +82,9 @@ type Server struct {
 	ownerAlive   func(intent) bool
 	captureFault func(faultPoint) error
 	writeErr     func(op string) error
+	// selfStartTime reads this process's start time for its intents (nil:
+	// /proc).
+	selfStartTime func() (uint64, error)
 	// ownerSeen is the capture directory's owner kind once it was read,
 	// so a mismatch is refused without I/O.
 	ownerSeen atomic.Pointer[string]

@@ -129,9 +129,8 @@ const (
 )
 
 // selfStart is this process's start time, as the intent records it.
-var selfStart = sync.OnceValue(func() uint64 {
-	st, _ := capture.StartTime(capture.DefaultProc(), os.Getpid())
-	return st
+var selfStart = sync.OnceValues(func() (uint64, error) {
+	return capture.StartTime(capture.DefaultProc(), os.Getpid())
 })
 
 // ownerIsAlive reports whether in's server or reaper, by its PID and start
@@ -232,15 +231,22 @@ func randHex(n int) string {
 }
 
 // beginTxn writes the intent of capture id in series (step 5), without
-// replacing anything, and starts its heartbeat. outputs are the files
-// perf-agent will write in staging. A nil transaction means nothing was
-// left to roll back: the caller writes the failure manifest itself. Once
-// the intent exists the transaction is returned even with an error, which
-// the caller rolls back.
+// replacing anything, then its heartbeat, which a rewrite records, and
+// starts the heartbeat. outputs are the files perf-agent will write in
+// staging. A nil transaction means nothing was left to roll back: the
+// caller writes the failure manifest itself. Once the intent exists the
+// transaction is returned even with an error, which the caller rolls back.
+// A crash between the intent and its heartbeat leaves an intent that
+// recovery judges by its owner's liveness alone.
 func (s *Server) beginTxn(d *captureDir, series string, id int, label string, settings wireSettings, outputs []string) (*captureTxn, error) {
 	if !validLabel(label) {
 		return nil, capture.Errorf(capture.CodeInvalidArgument, "pass a label of [A-Za-z0-9._-]",
 			"label %q is not 1-%d bytes of [A-Za-z0-9._-] not starting with '.'", echo(label), maxLabel)
+	}
+	start, err := s.startTime()
+	if err != nil || start == 0 {
+		return nil, capture.Errorf(capture.CodeDisabled, "",
+			"cannot read this server's start time, which a capture's intent records so that recovery can tell its owner is alive: %v", err)
 	}
 	ser, err := d.series(series)
 	if err != nil {
@@ -250,29 +256,24 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	t.in = intent{
 		Format: 1, State: statePrepared, ID: formatID(id), Series: series, Label: label, Settings: settings,
 		Outputs: slices.Clone(outputs), Staging: stagingPrefix + randHex(8), Token: randHex(16),
-		ServerPID: os.Getpid(), ServerStart: selfStart(), WrittenBy: writtenBy,
+		ServerPID: os.Getpid(), ServerStart: start, WrittenBy: writtenBy,
 	}
 	for _, o := range outputs {
 		t.in.Finals = append(t.in.Finals, finalName(id, label, o))
 	}
 	name := intentName(id, label)
-	hb, err := s.writeNewFile(ser, heartbeatName(id, label), []byte(t.in.Token+"\n"), "heartbeat")
-	if err != nil {
-		return nil, t.abort(err)
-	}
-	t.in.Heartbeat = &hb
 	b, _ := json.Marshal(t.in)
 	tmp, err := t.writeTemp(name, b, "intent")
 	if err == nil {
 		err = s.linkNoReplace(ser, rootCaptures, tmp.Name, name)
-		if err != nil && !errors.Is(err, errCrash) {
+		if err != nil && !errors.Is(err, errCrash) && landed(ser, name, tmp) {
+			err = nil
+		}
+		if err != nil {
 			_, _, _ = removeByIdentity(ser, tmp.Name, tmp)
 		}
 	}
 	if err != nil {
-		if !errors.Is(err, errCrash) {
-			_, _, _ = removeByIdentity(ser, hb.Name, hb)
-		}
 		return nil, t.abort(err)
 	}
 	t.self = tmp
@@ -288,11 +289,36 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	} else if _, left, err := removeByIdentity(ser, tmp.Name, tmp); err != nil || left != "" {
 		t.in.Temps = append(t.in.Temps, tmp)
 	}
-	t.startHeartbeat()
 	if err := s.syncDir(ser, ".", "fsync intent"); err != nil {
 		return t, t.crashed(err)
 	}
-	return t, nil
+	hb, err := s.writeNewFile(ser, heartbeatName(id, label), []byte(t.in.Token+"\n"), "heartbeat")
+	if err != nil {
+		return t, t.crashed(err)
+	}
+	t.in.Heartbeat = &hb
+	t.startHeartbeat()
+	return t, t.rewrite()
+}
+
+// startTime is this process's start time, through the selfStartTime seam.
+func (s *Server) startTime() (uint64, error) {
+	if s.selfStartTime != nil {
+		return s.selfStartTime()
+	}
+	return selfStart()
+}
+
+// landed reports whether name now is the file tmp records: a link that
+// answered an error may still have been made (a retransmitted NFS request
+// answers EEXIST for the link it made itself).
+func landed(root *os.Root, name string, tmp fileIdentity) bool {
+	fi, err := root.Lstat(name)
+	if err != nil {
+		return false
+	}
+	st, _ := statOf(fi)
+	return fi.Mode().IsRegular() && st.dev == tmp.Dev && st.ino == tmp.Ino
 }
 
 // abort ends a transaction whose intent was never written.
@@ -645,7 +671,7 @@ func (t *captureTxn) link() error {
 				return err
 			}
 		}
-		if err := t.s.linkNoReplace(t.ser, rootCaptures, filepath.Join(t.in.Staging, f.Staged), f.Name); err != nil {
+		if err := t.s.linkNoReplace(t.ser, rootCaptures, filepath.Join(t.in.Staging, f.Staged), f.Name); err != nil && !landed(t.ser, f.Name, f) {
 			if errors.Is(err, fs.ErrExist) {
 				return capture.Errorf(capture.CodeExists, "pass another label", "%v", err)
 			}
@@ -673,6 +699,16 @@ func (t *captureTxn) manifestOf(m manifest, outcome string, e *wireError) manife
 		}
 	}
 	return m
+}
+
+// linkCause is a failed manifest link as the failure it reports: a name
+// taken by another file is exists (the manifest is never written over),
+// anything else a write failure.
+func (t *captureTxn) linkCause(err error) *capture.Error {
+	if errors.Is(err, fs.ErrExist) {
+		return capture.Errorf(capture.CodeExists, "pass another label", "%v", err)
+	}
+	return t.cause(err)
 }
 
 func cancelledError() *capture.Error {
@@ -715,12 +751,16 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 	}
 	if err == nil {
 		err = t.s.linkNoReplace(t.ser, rootCaptures, tmp.Name, name)
+		if err != nil && landed(t.ser, name, tmp) {
+			t.s.log.Warn("the manifest link answered an error but was made; the capture is committed", "manifest", name, "err", err)
+			err = nil
+		}
 	}
 	if err != nil {
 		if errors.Is(err, errCrash) {
 			return false, t.crashed(err)
 		}
-		var cause error = t.cause(err)
+		var cause error = t.linkCause(err)
 		if d.settle(false) == cancelAnswerCancelled {
 			cause = cancelledError()
 		}
@@ -769,13 +809,13 @@ func (t *captureTxn) cleanup() error {
 		return err
 	}
 	t.stopHeartbeat()
-	if err := t.removeRecorded(t.self, "the intent"); err != nil {
-		return err
-	}
 	if hb := t.in.Heartbeat; hb != nil {
-		if err := t.removeRecorded(*hb, "the heartbeat"); err != nil {
+		if err := t.removeRecorded(*hb, "the heartbeat", "remove heartbeat"); err != nil {
 			return err
 		}
+	}
+	if err := t.removeRecorded(t.self, "the intent", "remove intent"); err != nil {
+		return err
 	}
 	if err := t.s.syncDir(t.ser, ".", "fsync cleanup"); err != nil {
 		return err
@@ -785,8 +825,11 @@ func (t *captureTxn) cleanup() error {
 }
 
 // removeRecorded removes the file id records, noting it when it is not
-// that file any more.
-func (t *captureTxn) removeRecorded(id fileIdentity, what string) error {
+// that file any more; op names the removal for the write seam.
+func (t *captureTxn) removeRecorded(id fileIdentity, what, op string) error {
+	if err := t.s.wErr(op); err != nil {
+		return err
+	}
 	_, left, err := removeByIdentity(t.ser, id.Name, id)
 	if left != "" {
 		t.note("left", id.Name, what+" is now "+left)
@@ -992,9 +1035,12 @@ func (t *captureTxn) unwind(fm manifest, p faultPoint) error {
 	err := t.s.wErr("manifest link")
 	if err == nil {
 		err = t.s.linkNoReplace(t.ser, rootCaptures, tmp.Name, name)
+		if err != nil && landed(t.ser, name, tmp) {
+			err = nil
+		}
 	}
 	if err != nil {
-		return t.strand(err)
+		return t.strand(t.linkCause(err))
 	}
 	t.pending = nil
 	t.unstrand()

@@ -99,7 +99,7 @@ func TestRecoveryJudgesTheOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 		txn.in.ServerPID = 1 << 30
-		if err := txn.setReaper(os.Getpid(), selfStart()); err != nil {
+		if err := txn.setReaper(os.Getpid(), mustSelfStart(t)); err != nil {
 			t.Fatal(err)
 		}
 		txn.die()
@@ -229,8 +229,9 @@ func TestAnUnrecordedStagingDirIsALoggedOrphan(t *testing.T) {
 
 	t.Run("crash-before-the-record", func(t *testing.T) {
 		s, d, clk := newCaptureServer(t)
-		// The first intent rewrite is the one that records staging.
-		s.writeErr = failOp("intent rewrite", errCrash)
+		// The first intent rewrite records the heartbeat, the second
+		// staging.
+		s.writeErr = failOpAt("intent rewrite", 2, errCrash)
 		r := drive(t, s, d, capCase{})
 		s.writeErr = nil
 		staging := filepath.Join(d.root.Name(), "adhoc", r.txn.in.Staging)
@@ -250,4 +251,13 @@ func TestAnUnrecordedStagingDirIsALoggedOrphan(t *testing.T) {
 			t.Errorf("the note does not tell the user what to do: %q", notes)
 		}
 	})
+}
+
+func mustSelfStart(t *testing.T) uint64 {
+	t.Helper()
+	st, err := selfStart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }

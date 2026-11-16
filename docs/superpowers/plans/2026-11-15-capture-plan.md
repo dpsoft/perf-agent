@@ -29,7 +29,7 @@
 - §15 maps every review finding.
 
 Related records:
-- **Design rulings** (CAP-R1..R17, SRV-R5/R6/R7) and the Codex #418 carries: the end of `/home/diego/github/perf-agent/.worktrees/ai-mcp-m2b/.superpowers/sdd/2026-11-14-live-page-m2b/progress.md`.
+- **Design rulings** (CAP-R1..R17, SRV-R5/R6/R7) and the Codex #418 carries: the end of the M2b live-page progress log (`<m2b-worktree>/.superpowers/sdd/2026-11-14-live-page-m2b/progress.md`).
 - **Plan rulings** (pre-flight P-1..P-29, Codex #428 PLAN-R1..R7, and the adopted notes): `.superpowers/sdd/2026-11-15-capture-plan/progress.md` in this worktree.
 - **The serve design** (`docs/superpowers/specs/2026-11-15-local-server-design.md`) is **not** built here. This plan only leaves the seams it names (see "Seams for serve").
 
@@ -50,8 +50,8 @@ Related records:
 - Commands that build the perf-agent root package (the contract test, `./...`) need these variables. The MCP packages do not import blazesym.
 
   ```bash
-  CGO_CFLAGS=-I/home/diego/github/blazesym/capi/include
-  CGO_LDFLAGS=-L/home/diego/github/perf-agent/.worktrees/ai-mcp-m2/.superpowers/sdd/2026-11-14-mcp-server-m2/blazesym-lib
+  CGO_CFLAGS=-I<blazesym>/capi/include
+  CGO_LDFLAGS=-L<blazesym-lib-dir>
   ```
 - **Build on top [user].** Nothing that predates the MCP work changes:
   - not `main.go`, `telemetry.go`, `perfagent/`, `cmd/flamegraph` or `gpu/*`;

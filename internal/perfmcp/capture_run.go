@@ -117,9 +117,11 @@ func (s *Server) runJob(j *job) {
 	r := &jobRun{s: s, j: j, ctx: ctx, series: cmp.Or(j.req.Series, defaultSeries), label: cmp.Or(j.req.Label, defaultLabel)}
 	status, e := r.capture()
 	if status == jobCommitting {
-		// Registered before the directory is free, so the pass that takes
-		// it next finds the job undecided and its decision rule armed.
+		// Registered, and out of the active slot, before the directory is
+		// free: the pass that takes it next finds the job undecided with its
+		// decision rule armed, and the finished entry its settle updates.
 		r.markUndecided()
+		r.leaveUndecided(e)
 	}
 	if s.beforeRelease != nil {
 		s.beforeRelease(j)
@@ -131,7 +133,7 @@ func (s *Server) runJob(j *job) {
 	case jobDone:
 		r.done()
 	case jobCommitting:
-		r.leaveUndecided(e)
+		// It left the slot before the release; a settle ends it.
 	default:
 		r.end(status, e)
 	}

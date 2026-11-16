@@ -328,3 +328,28 @@ func TestAnUndecidedJobIsRegisteredBeforeItLetsGoOfTheDirectory(t *testing.T) {
 		t.Errorf("job %s let go of the directory before it was registered undecided with its decision rule", j.id)
 	}
 }
+
+// An undecided job leaves the active slot before it lets go of the
+// directory: a maintenance pass that takes the directory the moment it is
+// free and settles the job updates a finished entry (its result counted
+// against MaxJobBytes), never one the job is yet to finish.
+func TestAnUndecidedJobLeavesTheSlotBeforeItLetsGoOfTheDirectory(t *testing.T) {
+	var mu sync.Mutex
+	left := map[string]bool{}
+	u := newUndecidedEnvWith(t, true, func(s *Server) {
+		s.beforeRelease = func(j *job) {
+			s.registry.mu.Lock()
+			ok := s.registry.active.Load() != j && s.registry.finished(j.id)
+			s.registry.mu.Unlock()
+			mu.Lock()
+			left[j.id] = ok
+			mu.Unlock()
+		}
+	})
+	j := u.undecided(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if !left[j.id] {
+		t.Errorf("job %s let go of the directory while still the registry's active job", j.id)
+	}
+}

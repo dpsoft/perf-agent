@@ -35,8 +35,9 @@ func (r *jobRun) markUndecided() {
 	s.capMu.Unlock()
 }
 
-// leaveUndecided lets the undecided job leave the active slot, once the
-// directory is free; e is only logged.
+// leaveUndecided lets the undecided job leave the active slot while the
+// directory is still held, so a settle never finds it active; e is only
+// logged.
 func (r *jobRun) leaveUndecided(e *capture.Error) {
 	s, j := r.s, r.j
 	s.log.Warn("capture undecided: its manifest link had an outcome that could not be read", "job", j.id, "capture", j.captureIDNow(), "why", e.Message)

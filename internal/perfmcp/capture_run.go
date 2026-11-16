@@ -116,6 +116,14 @@ func (s *Server) runJob(j *job) {
 	}()
 	r := &jobRun{s: s, j: j, ctx: ctx, series: cmp.Or(j.req.Series, defaultSeries), label: cmp.Or(j.req.Label, defaultLabel)}
 	status, e := r.capture()
+	if status == jobCommitting {
+		// Registered before the directory is free, so the pass that takes
+		// it next finds the job undecided and its decision rule armed.
+		r.markUndecided()
+	}
+	if s.beforeRelease != nil {
+		s.beforeRelease(j)
+	}
 	r.release()
 	// Whatever the end, the capture directory may have been written.
 	s.historyChanged()

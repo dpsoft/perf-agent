@@ -12,12 +12,13 @@ import (
 	"github.com/dpsoft/perf-agent/internal/capture"
 )
 
-// leaveUndecided records a capture whose commit nobody could read: it may
-// have committed, so it is neither done nor failed, and holds no error yet.
-// It leaves the active slot, and the pass that settles it from the disk
-// tells the job; a cancel meanwhile is recorded on the decision word and
-// reported then. e is only logged.
-func (r *jobRun) leaveUndecided(e *capture.Error) {
+// markUndecided records a capture whose commit nobody could read: it may
+// have committed, so it is neither done nor failed, and holds no error
+// yet. It arms the job's decision rule and registers it undecided, under
+// the directory slot, so the pass that settles it from the disk can never
+// find it half recorded; a cancel meanwhile is recorded on the decision
+// word and reported then.
+func (r *jobRun) markUndecided() {
 	s, j := r.s, r.j
 	j.txn, j.base = r.txn, r.base
 	// A link judged not made is decided at once, under the job's mutex: a
@@ -32,6 +33,12 @@ func (r *jobRun) leaveUndecided(e *capture.Error) {
 	s.capMu.Lock()
 	s.undecided = append(s.undecided, j)
 	s.capMu.Unlock()
+}
+
+// leaveUndecided lets the undecided job leave the active slot, once the
+// directory is free; e is only logged.
+func (r *jobRun) leaveUndecided(e *capture.Error) {
+	s, j := r.s, r.j
 	s.log.Warn("capture undecided: its manifest link had an outcome that could not be read", "job", j.id, "capture", j.captureIDNow(), "why", e.Message)
 	if err := s.registry.finish(j, 0, r.profiled()); err != nil {
 		s.log.Error("capture registry", "job", j.id, "err", err)

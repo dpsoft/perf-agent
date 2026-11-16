@@ -90,6 +90,9 @@ type Server struct {
 	// capture directory without that pass recovering what it writes. A
 	// pass that found the captures lock held is not over: it runs again.
 	startPassDone chan struct{}
+	// beforeRelease, when set, runs as a job is about to let go of the
+	// capture directory; a seam for tests.
+	beforeRelease func(*job)
 	// maintained is closed when the maintenance goroutine has returned,
 	// which Close waits for, bounded.
 	maintained chan struct{}

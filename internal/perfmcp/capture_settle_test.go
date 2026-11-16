@@ -2,6 +2,7 @@ package perfmcp
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,8 +23,16 @@ type undecidedEnv struct {
 }
 
 func newUndecidedEnv(t *testing.T, made bool) *undecidedEnv {
+	return newUndecidedEnvWith(t, made, nil)
+}
+
+// newUndecidedEnvWith is newUndecidedEnv with setup run on the server too.
+func newUndecidedEnvWith(t *testing.T, made bool, setup func(*Server)) *undecidedEnv {
 	u := &undecidedEnv{}
 	u.jobEnv = newJobEnv(t, jobOpts{setup: func(s *Server) {
+		if setup != nil {
+			setup(s)
+		}
 		s.link = func(r *os.Root, oldname, newname string) error {
 			if !u.isBroken(newname) {
 				return r.Link(oldname, newname)
@@ -293,5 +302,29 @@ func TestACancelAtEachSettleInstantIsConsistent(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// An undecided job is registered, and can be settled, before it lets go
+// of the directory: a maintenance pass that takes the directory the
+// moment it is free finds the job undecided and its decision rule armed.
+func TestAnUndecidedJobIsRegisteredBeforeItLetsGoOfTheDirectory(t *testing.T) {
+	var mu sync.Mutex
+	armed := map[string]bool{}
+	u := newUndecidedEnvWith(t, true, func(s *Server) {
+		s.beforeRelease = func(j *job) {
+			s.capMu.Lock()
+			ok := slices.Contains(s.undecided, j) && j.txn != nil && j.txn.decideFailed != nil
+			s.capMu.Unlock()
+			mu.Lock()
+			armed[j.id] = ok
+			mu.Unlock()
+		}
+	})
+	j := u.undecided(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if !armed[j.id] {
+		t.Errorf("job %s let go of the directory before it was registered undecided with its decision rule", j.id)
 	}
 }

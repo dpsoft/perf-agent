@@ -1162,7 +1162,7 @@ func (r *Run) exitError(stderr string) *Error {
 	case !r.perfExited:
 		return withTail(Errorf(CodePerfAgentFailed, "", "perf-agent's exit was never reported"))
 	case r.perfSignal != "":
-		return withTail(Errorf(CodePerfAgentFailed, "", "perf-agent was killed by %s", r.perfSignal))
+		return withTail(Errorf(CodePerfAgentFailed, "", "perf-agent was ended by a signal: %s", r.perfSignal))
 	}
 	switch r.perfStatus {
 	case 0:

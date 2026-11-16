@@ -1507,3 +1507,18 @@ func TestRunAnUnresponsiveReaperNamesTheCgroup(t *testing.T) {
 		t.Error("the reaper did not finish once continued")
 	}
 }
+
+// A perf-agent ended by a signal is named by that signal once: the event
+// carries the signal's own text ("killed", "terminated").
+func TestASignalledPerfAgentNamesItsSignal(t *testing.T) {
+	for _, sig := range []string{"killed", "terminated", "segmentation fault"} {
+		kills := 0
+		r := testRun(t, &kills)
+		r.readyAt = time.Now().Add(-time.Second)
+		r.perfExited, r.perfStatus, r.perfSignal = true, -1, sig
+		e := r.exitError("")
+		if errCode(e) != CodePerfAgentFailed || e.Message != "perf-agent was ended by a signal: "+sig || e.PerfAgentExit != sig {
+			t.Errorf("%s: %+v", sig, e)
+		}
+	}
+}

@@ -375,7 +375,9 @@ func TestRealCrashesAtCommitBoundaries(t *testing.T) {
 			if tc.recoverCrash {
 				rc := e.config()
 				rc.Crash = "in-recovery"
-				r := startServerProcess(t, rc)
+				// It crashes in its start-up maintenance, maybe before it
+				// could answer initialize: nothing is asked of it.
+				r := spawnServerProcess(t, rc)
 				r.waitLine(crashLine + "in-recovery")
 				if code := r.exitCode(); code != crashExit {
 					t.Fatalf("the recovering server exited %d", code)

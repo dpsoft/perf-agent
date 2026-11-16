@@ -316,6 +316,17 @@ type procClient struct {
 // for any cgroup of its captures left under the delegated cgroup.
 func startServerProcess(t *testing.T, cfg procConfig) *procClient {
 	t.Helper()
+	p := spawnServerProcess(t, cfg)
+	if res := p.rpc("initialize", map[string]any{"protocolVersion": "2025-11-25"}); res.Error != nil {
+		t.Fatalf("initialize: %+v", res.Error)
+	}
+	return p
+}
+
+// spawnServerProcess is startServerProcess without the initialize call,
+// for a server that may crash in its start-up maintenance first.
+func spawnServerProcess(t *testing.T, cfg procConfig) *procClient {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -353,9 +364,6 @@ func startServerProcess(t *testing.T, cfg procConfig) *procClient {
 	p.self, _ = procOf(cmd.Process.Pid)
 	t.Cleanup(p.cleanup)
 	p.testClient = &testClient{t: t, w: inW, r: bufio.NewReaderSize(deadlineReader{outR}, 1<<20), nextID: 1}
-	if res := p.rpc("initialize", map[string]any{"protocolVersion": "2025-11-25"}); res.Error != nil {
-		t.Fatalf("initialize: %+v", res.Error)
-	}
 	return p
 }
 

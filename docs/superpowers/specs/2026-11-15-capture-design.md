@@ -261,7 +261,7 @@ derivations).
 |---|---|---|
 | `capture` (arguments §4.2) | microseconds: no I/O, no lock, no engine | `{job, status: "accepted", eta}`, or a synchronous `invalid_argument` or `busy` (in-process slot) error. Cross-process `busy` and every later error arrive as the job's `failed` state |
 | `capture_wait {id, timeout?}` (a job id or a capture id) | at most `timeout`, default 30 s, **capped at 45 s**, and never past its own deadline. It reads the job registry; a historical id goes to the lookup pool (CAP-R14). Never the engine | the current state. When `done` with `derived: ready`, the §4.3 result. Otherwise `{job, id?, status, phase, elapsed, eta, derived?}`, or `status: "loading"` when a historical lookup has not finished by the deadline |
-| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded |
+| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias |
 | `capture_list` (§4.6) | the in-memory jobs at once; the history through the lookup pool, to the call's deadline | active and recent jobs first, then the history from the manifests, with `"loading": true` for pages not read in time |
 
 **Ownership (SRV-R7).** Jobs belong to the server, not to sessions:
@@ -275,6 +275,14 @@ derivations).
 - One active capture at a time.
 - Terminal jobs stay in memory up to `Capture.MaxJobs` (32) and
   `Capture.MaxJobBytes` (4 MiB) of results, least recently used first.
+  The newest entry is always kept, so the bound is `MaxJobBytes` plus one
+  result. Historical answers (below) are evicted before any job, since
+  they can be read from the manifest again and a job's derived result
+  cannot (CAP-R60).
+- A job id outlives its entry: up to 4096 finished job ids stay as
+  aliases to their capture id and final answer, so `capture_wait` on an
+  evicted job id resolves through the capture id, and `capture_cancel`
+  still answers its final state (CAP-R60).
 - **Derived results live only in memory (CAP-R17).** The open and diff
   summaries, with their handles, are kept only in the job registry,
   under `MaxJobs` and `MaxJobBytes`. Nothing derived is persisted: there
@@ -726,7 +734,7 @@ These go in a new `Limits.Capture` struct, so they are settable through
 | lookup pool | 2 workers, a queue of 16 | — | Historical result reads (CAP-R14); fixed, not a `--limit` |
 | `Capture.MinFreeBytes` | 1 GiB | — | `Statfs` of the capture directory before starting |
 | `Capture.WindowCaptures` | 60 per rolling hour | — | A runaway loop. A rolling window suits a long-lived server (§9); in stdio it is per process, so a loop that restarts the server resets it, and `MaxStoredBytes` is what bounds it across restarts |
-| `Capture.WindowDuration` | 30 min of requested duration per rolling hour | — | Same reason |
+| `Capture.WindowDuration` | 30 min of capture time per rolling hour | — | Same reason. Admission reserves the requested duration (`MaxDuration` when it is inherited); the job reconciles it with the effective duration, and at its end charges what it profiled, at most the reservation. A capture that never profiled still counts toward `WindowCaptures` (CAP-R59) |
 | `Capture.MaxOutputTail` | 2 KiB | 64 KiB | The response budget |
 
 **One at a time [user], across processes (CAP-R6).** Several stdio
@@ -1341,6 +1349,11 @@ cancel_requested, manifest_in_flight, committed}`:
   - `manifest_in_flight`: it records the request in the job (a second
     flag) and answers `cancelling` (decision pending);
   - `committed` answers `too late: committed`.
+- **Once the job has ended** the registry answers instead of the word
+  (CAP-R61), since a failed link leaves the word `open`: a done job
+  answers `too late: committed`, a cancelled one `cancelled`, and a
+  failed one `too late: failed`. The word and the job's cancel channel
+  are left as they are.
 - **The job,** at step 11 before the link, does
   `CAS(open → manifest_in_flight)`:
   - if that fails because the word is `cancel_requested`, it does not
@@ -1898,6 +1911,8 @@ first-byte timer is never reached.
       the link has returned success;
     - a cancel after the commit answers `too late: committed`
       immediately.
+    - a cancel after a failure answers `too late: failed`, and after a
+      cancellation `cancelled`, without moving the word (CAP-R61)
   - **Cancel through the control path (CAP-R10):**
     - stdio: `capture_cancel` sent while a 45 s `capture_wait` is in
       progress returns `cancelling` at once, and the wait then reports

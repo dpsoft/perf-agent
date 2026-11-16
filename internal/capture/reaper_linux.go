@@ -21,6 +21,9 @@ type Reaper struct {
 	closeCmds func()
 	events    chan Event
 	done      chan struct{}
+	// ended is closed when the event pipe reaches EOF: the reaper closes
+	// it after it has let go of the captures lock.
+	ended chan struct{}
 }
 
 // eventBuffer bounds the events queued for a server that is not reading;
@@ -95,7 +98,7 @@ func startReaper(self string, spec ReaperSpec, f ReaperFiles, more []*os.File) (
 		closeAll(specW, cmdW, evR)
 		return nil, fmt.Errorf("start the reaper: %w", err)
 	}
-	r := &Reaper{proc: proc, cmds: cmdW, events: make(chan Event, eventBuffer), done: make(chan struct{})}
+	r := &Reaper{proc: proc, cmds: cmdW, events: make(chan Event, eventBuffer), done: make(chan struct{}), ended: make(chan struct{})}
 	r.closeCmds = sync.OnceFunc(func() { _ = cmdW.Close() })
 	go r.readEvents(evR)
 	go func() {
@@ -115,6 +118,7 @@ func startReaper(self string, spec ReaperSpec, f ReaperFiles, more []*os.File) (
 
 // readEvents decodes the event pipe until the reaper closes it.
 func (r *Reaper) readEvents(f *os.File) {
+	defer close(r.ended)
 	defer close(r.events)
 	defer func() { _ = f.Close() }()
 	dec := json.NewDecoder(f)
@@ -142,6 +146,10 @@ func (r *Reaper) Send(c Command) error {
 // Events delivers the reaper's events in order and is closed when the
 // reaper closes its event pipe; reaped is the last.
 func (r *Reaper) Events() <-chan Event { return r.events }
+
+// Ended is closed when the reaper has closed its event pipe, which it
+// does last, after it has let go of the captures lock.
+func (r *Reaper) Ended() <-chan struct{} { return r.ended }
 
 // Done is closed when the reaper process has exited.
 func (r *Reaper) Done() <-chan struct{} { return r.done }

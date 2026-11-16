@@ -1561,3 +1561,53 @@ func TestTheReapersDeadlineIsABound(t *testing.T) {
 		})
 	}
 }
+
+// Wait returns once the reaper has let go of the captures lock, not only
+// once it reported reaped: the next capture can take the lock at once.
+// The reaper is held a while after reaped, as a slow exit would hold it.
+func TestWaitReturnsWithTheLockFree(t *testing.T) {
+	spec := runSpec(t, capturetest.FakeOptions{})
+	target := startChild(t, "sleep")
+	spec.PID = target.PID
+	dir, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dir.Close() })
+	lease, e := TryLock(dir, Holder{ServerPID: os.Getpid(), CaptureID: "cap/lock"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	spec.Lock = lease.File()
+	hold := filepath.Join(t.TempDir(), "hold")
+	if err := os.WriteFile(hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(hold) })
+	spec.FaultPause = PauseBeforeExit + hold
+	spec.Events = func(in <-chan Event) <-chan Event {
+		out := make(chan Event)
+		go func() {
+			defer close(out)
+			for ev := range in {
+				if ev.Op == EventReaped {
+					time.AfterFunc(300*time.Millisecond, func() { _ = os.Remove(hold) })
+				}
+				out <- ev
+			}
+		}()
+		return out
+	}
+	r := startRun(t, spec)
+	// Only the reaper holds the lock from here, as in a job after Start.
+	_ = lease.Close()
+	o := waitRun(t, r, 30*time.Second)
+	if o.Err != nil {
+		t.Fatalf("Err = %v", o.Err)
+	}
+	l, be := TryLock(dir, Holder{ServerPID: os.Getpid(), CaptureID: "cap/next"})
+	if be != nil {
+		t.Fatalf("the lock is still held when Wait returns: %v", be)
+	}
+	_ = l.Close()
+}

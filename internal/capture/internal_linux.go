@@ -303,7 +303,7 @@ func (r *reaper) run() int {
 	r.out.publish(Event{Op: EventReaped, PID: r.self, Survivors: survivors, Cleanup: cleanup})
 	r.awaitKnown()
 	r.beforeExit()
-	for _, f := range []*os.File{r.perfOut, r.perfErr, r.workOut, r.workErr, r.out.f} {
+	for _, f := range []*os.File{r.perfOut, r.perfErr, r.workOut, r.workErr} {
 		if f != nil {
 			_ = f.Close()
 		}
@@ -313,10 +313,14 @@ func (r *reaper) run() int {
 			c.release()
 		}
 	}
-	// Last: the captures directory stays locked until both children are
-	// reaped and the cleanup is done.
+	// The captures directory stays locked until both children are reaped
+	// and the cleanup is done. Then the event pipe is closed, so the server
+	// sees the lock free once it sees the pipe end.
 	if r.lock != nil {
 		_ = r.lock.Close()
+	}
+	if r.out.f != nil {
+		_ = r.out.f.Close()
 	}
 	return 0
 }

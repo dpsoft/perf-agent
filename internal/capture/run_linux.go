@@ -589,8 +589,30 @@ func (r *Run) supervise() {
 			}
 		}
 	}
+	if r.reaped != nil {
+		r.awaitRelease()
+	}
 	r.finishOutcome()
 	r.outcome = r.o
+}
+
+// reaperRelease bounds how long Wait waits, after reaped, for the reaper
+// to let go of the captures lock.
+const reaperRelease = time.Second
+
+// awaitRelease waits, at most reaperRelease, for the reaper to close its
+// event pipe, which it does once it has let go of the captures lock, or to
+// exit: so the next capture can take the lock as soon as this one is seen
+// to end. A reaper still holding it after that (a known child stuck in
+// the kernel) keeps it, and the next capture is told busy.
+func (r *Run) awaitRelease() {
+	t := time.NewTimer(reaperRelease)
+	defer t.Stop()
+	select {
+	case <-r.reaper.Ended():
+	case <-r.reaper.Done():
+	case <-t.C:
+	}
 }
 
 // handleEvent takes one item of the event stream; reaped, or its end,

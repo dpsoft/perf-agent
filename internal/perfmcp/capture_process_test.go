@@ -42,41 +42,27 @@ func TestTwoServersShareOneCapturesDir(t *testing.T) {
 		t.Fatalf("A's cancelled capture: %s", text)
 	}
 
-	// Both servers capture at once, round after round: each capture is
-	// done or busy, never anything else, and every done one has its own id.
+	// Round after round, one server captures and the other, asking while
+	// it profiles, is told busy; then the roles swap. Each capture starts
+	// as soon as the round before ended: a finished capture's reaper has
+	// let go of the lock by then. Every capture has its own id.
 	ids := map[string]string{}
-	for round := range 3 {
-		ja, jb := a.startCapture(e.args("1s")), b.startCapture(e.args("1s"))
-		done := 0
-		for _, r := range []struct {
-			c   *procClient
-			job string
-		}{{a, ja}, {b, jb}} {
-			text, isErr := r.c.waitEnd(r.job)
-			if isErr {
-				if w := toolErrorOf(t, text); w.Code != string(capture.CodeBusy) {
-					t.Fatalf("round %d: %+v", round, w)
-				}
-				continue
-			}
-			var res captureResult
-			if err := json.Unmarshal([]byte(text), &res); err != nil {
-				t.Fatal(err)
-			}
-			if prev, ok := ids[res.Capture.ID]; ok {
-				t.Fatalf("id %s handed out twice: %s and %s", res.Capture.ID, prev, r.job)
-			}
-			ids[res.Capture.ID] = r.job
-			done++
+	for round := range 4 {
+		lead, other := a, b
+		if round%2 == 1 {
+			lead, other = b, a
 		}
-		if done == 0 {
-			// The other capture's reaper may still hold the lock when both
-			// jobs ask; the next round must get through.
-			t.Logf("round %d: both busy", round)
+		job := lead.startCapture(e.args("2s"))
+		lead.waitProfiling(job)
+		text, isErr := other.waitEnd(other.startCapture(e.args("1s")))
+		if w := toolErrorOf(t, text); !isErr || w.Code != string(capture.CodeBusy) || !strings.Contains(w.Message, fmt.Sprintf("perf-agent-mcp pid %d", lead.pid())) {
+			t.Fatalf("round %d: the other server's capture: %s", round, text)
 		}
-	}
-	if len(ids) == 0 {
-		t.Fatal("no capture got through in three rounds")
+		res := lead.waitResult(job)
+		if prev, ok := ids[res.Capture.ID]; ok {
+			t.Fatalf("id %s handed out twice: %s and %s", res.Capture.ID, prev, job)
+		}
+		ids[res.Capture.ID] = job
 	}
 	for _, c := range []*procClient{a, b} {
 		var l listing

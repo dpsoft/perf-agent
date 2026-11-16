@@ -895,7 +895,7 @@ func TestTheResultIsCutToMaxResponseBytes(t *testing.T) {
 			if len(o) != 4 || o["handle"] != "h1" || o["quality"] == nil || o["views"] == nil || o["default_view"] == nil {
 				t.Errorf("open %v", o)
 			}
-			if !strings.Contains(fmt.Sprint(m["notes"]), "call open with path for the full result") {
+			if !strings.Contains(fmt.Sprint(m["notes"]), cutOpenAdvice) {
 				t.Errorf("notes %v", m["notes"])
 			}
 			if v := m["compare"].(map[string]any)["views"].([]any)[0].(map[string]any); v["rows"] == nil {

@@ -1111,14 +1111,53 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 	return answer(out)
 }
 
-// The notes a cut result carries, one per cut.
+// What a cut result's one note says was cut, and what to call for it; and
+// the note of a result cut to its paths.
 const (
-	cutOpenNote    = "each profile's open was cut to its handle, views, default_view and quality to fit MaxResponseBytes: call open with path for the full result"
-	cutRowsNote    = "the compare's rows were left out to fit MaxResponseBytes: call diff with each view's next for them"
-	cutTailNote    = "the workload's output tail was left out to fit MaxResponseBytes"
-	cutViewsNote   = "each profile's open was cut to its handle and default_view, and each compare view to its totals and next, to fit MaxResponseBytes"
-	cutMinimalNote = "the result is over MaxResponseBytes even cut: call open with each profile's path, and diff, for its contents"
+	cutOpenPart     = "each profile's open was cut to its handle, views, default_view and quality"
+	cutOpenMinPart  = "each profile's open was cut to its handle and default_view"
+	cutRowsPart     = "the compare's rows were left out"
+	cutViewsPart    = "each compare view was cut to its totals and next"
+	cutTailPart     = "the workload's output tail was left out"
+	cutOpenAdvice   = "call open with each profile's path for the full result"
+	cutDiffAdvice   = "call diff with each view's next for the rows"
+	cutMinimalNote  = "the result is over MaxResponseBytes even cut: call open with each profile's path, and diff, for its contents"
+	cutNoteContains = "to fit MaxResponseBytes"
 )
+
+// cutState is what cutResult has cut so far.
+type cutState struct{ opens, opensMin, rows, views, tail bool }
+
+// note is the one note that says everything cut and what to call for it.
+func (c cutState) note() string {
+	var parts, advice []string
+	switch {
+	case c.opensMin:
+		parts = append(parts, cutOpenMinPart)
+	case c.opens:
+		parts = append(parts, cutOpenPart)
+	}
+	switch {
+	case c.views:
+		parts = append(parts, cutViewsPart)
+	case c.rows:
+		parts = append(parts, cutRowsPart)
+	}
+	if c.tail {
+		parts = append(parts, cutTailPart)
+	}
+	if c.opens || c.opensMin {
+		advice = append(advice, cutOpenAdvice)
+	}
+	if c.rows || c.views {
+		advice = append(advice, cutDiffAdvice)
+	}
+	n := strings.Join(parts, "; ") + ", " + cutNoteContains
+	if len(advice) > 0 {
+		n += ": " + strings.Join(advice, ", and ")
+	}
+	return n
+}
 
 // fitResult is the result b as an answer, cut to MaxResponseBytes; one
 // that cannot be cut that far is a short error saying how to read it.
@@ -1133,8 +1172,8 @@ func (s *Server) fitResult(b []byte) mcpstdio.Result {
 		"the capture's result is over MaxResponseBytes=%d even cut to its paths", max), nil)
 }
 
-// cutResult cuts the result b to max bytes (§4.3), a step at a time,
-// each named in its notes: the opens to their handle, views, default view
+// cutResult cuts the result b to max bytes (§4.3), a step at a time, with
+// one note saying all that was cut: the opens to their handle, views, default view
 // and quality; the compare's rows; the workload's output tail; the opens
 // to their handle and default view and the compare views to their totals
 // and next; at last everything but what finds the capture and its
@@ -1149,23 +1188,24 @@ func (s *Server) cutResult(b []byte, max int) []byte {
 	}
 	var notes []string
 	_ = json.Unmarshal(top["notes"], &notes)
-	steps := []struct {
-		note string
-		cut  func() bool
-	}{
-		{cutOpenNote, func() bool { return cutOpens(top, "handle", "views", "default_view", "quality") }},
-		{cutRowsNote, func() bool { return cutCompareViews(top, "rows") }},
-		{cutTailNote, func() bool { return cutKey(top, "capture", "workload_output_tail") }},
-		{cutViewsNote, func() bool {
-			a := cutOpens(top, "handle", "default_view")
-			return cutCompareViews(top, "view", "base_total", "new_total", "next") || a
-		}},
+	own := len(notes)
+	var c cutState
+	steps := []func() bool{
+		func() bool { c.opens = cutOpens(top, "handle", "views", "default_view", "quality"); return c.opens },
+		func() bool { c.rows = cutCompareViews(top, "rows"); return c.rows },
+		func() bool { c.tail = cutKey(top, "capture", "workload_output_tail"); return c.tail },
+		func() bool {
+			c.opensMin = cutOpens(top, "handle", "default_view")
+			c.views = cutCompareViews(top, "view", "base_total", "new_total", "next")
+			return c.opensMin || c.views
+		},
 	}
-	for _, st := range steps {
-		if !st.cut() {
+	for _, cut := range steps {
+		if !cut() {
 			continue
 		}
-		notes = append(notes, st.note)
+		// One note says all that was cut: each step's replaces the last.
+		notes = append(notes[:own], c.note())
 		top["notes"], _ = json.Marshal(notes)
 		if out, err := marshal(top); err == nil && len(out) <= max {
 			return out
@@ -1177,11 +1217,11 @@ func (s *Server) cutResult(b []byte, max int) []byte {
 			minimal[k] = v
 		}
 	}
-	var c map[string]json.RawMessage
-	if json.Unmarshal(top["capture"], &c) == nil {
+	var ci map[string]json.RawMessage
+	if json.Unmarshal(top["capture"], &ci) == nil {
 		kept := map[string]json.RawMessage{}
-		for _, k := range []string{"id", "series", "label", "manifest"} {
-			if v, ok := c[k]; ok {
+		for _, k := range []string{"id", "capture", "series", "label", "manifest"} {
+			if v, ok := ci[k]; ok {
 				kept[k] = v
 			}
 		}

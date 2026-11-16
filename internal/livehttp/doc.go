@@ -22,6 +22,6 @@
 // 404, so a probe learns nothing from the status. Cross-site requests are
 // refused through Origin and Sec-Fetch-Site, except a top-level navigation
 // to the shell route, which holds no data and whose own requests are all
-// same-origin. A refused request is answered from its headers alone, before
-// any body byte is read.
+// same-origin. Every guard check runs before any body byte is read, so a
+// request a check refuses is answered from its headers alone.
 package livehttp

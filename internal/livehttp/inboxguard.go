@@ -23,7 +23,8 @@ const (
 type Rate struct{ PerSecond, Burst int }
 
 // InboxGuard admits a POST to /s/<page>/inbox only from the live page
-// itself. It runs behind Front, which has already checked Host. In order:
+// itself. It is never mounted without Front, which owns the Host check (DNS
+// rebinding) and the security headers; InboxGuard does neither. In order:
 //   - a wrong or missing page token, compared in constant time, gets 404;
 //   - a method other than POST gets 405;
 //   - Origin must appear once, be non-empty and equal http://<Host>, and

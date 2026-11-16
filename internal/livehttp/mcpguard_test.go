@@ -323,6 +323,11 @@ func TestAcceptAndContentTypeAreParsedAsMediaRanges(t *testing.T) {
 		{"application/json ; q=0.5 , text/event-stream;q=0.001"},
 		{`text/event-stream;x="a,b", application/json`},
 		{"text/html, */*;q=0.1"},
+		// A range whose q is not an RFC 9110 qvalue is dropped, not read.
+		{"application/json, text/event-stream, text/event-stream;q=NaN"},
+		{"application/json, text/event-stream, text/event-stream;q=0x0p0"},
+		{"application/json;q=1.000, text/event-stream;q=0.001"},
+		{"application/json;q=1., text/event-stream;q=0.5"},
 	}
 	for _, accept := range accepted {
 		req := mcpPost(10)
@@ -346,6 +351,20 @@ func TestAcceptAndContentTypeAreParsedAsMediaRanges(t *testing.T) {
 		{"application/json, text/event-stream;q=2"},
 		{"application/json, text/event-stream;q=abc"},
 		{"*/json, text/event-stream"},
+		{"application/json;q=0x1p-1, text/event-stream"},
+		{"application/json;q=1e0, text/event-stream"},
+		{"application/json;q=5e-1, text/event-stream"},
+		{"application/json;q=NaN, text/event-stream"},
+		{"application/json;q=Inf, text/event-stream"},
+		{"application/json;q=.5, text/event-stream"},
+		{"application/json;q=01, text/event-stream"},
+		{"application/json;q=1.0001, text/event-stream"},
+		{"application/json;q=0.1234, text/event-stream"},
+		{"application/json;q=1.5, text/event-stream"},
+		{"application/json;q=+0.5, text/event-stream"},
+		{"application/json;q=0_5, text/event-stream"},
+		{"application/json;q=, text/event-stream"},
+		{"application/json, text/event-stream;q=0."},
 	}
 	for _, accept := range refused {
 		req := mcpPost(10)

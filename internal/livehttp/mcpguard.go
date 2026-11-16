@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
-	"strconv"
 	"strings"
 )
 
@@ -15,8 +14,9 @@ import (
 var browserMetadata = [...]string{"Origin", "Sec-Fetch-Site", "Sec-Fetch-Dest"}
 
 // MCPGuard admits a request to the MCP endpoint only from a client holding
-// the bearer token, and never from a browser. It runs behind Front, which has
-// already checked Host. In order:
+// the bearer token, and never from a browser. It is never mounted without
+// Front, which owns the Host check (DNS rebinding) and the security headers;
+// MCPGuard does neither. In order:
 //   - any Origin, Sec-Fetch-Site or Sec-Fetch-Dest header, even empty or
 //     repeated, gets 403: no browser is a client of this endpoint;
 //   - a method other than POST or DELETE gets 405 with Allow: POST, DELETE;
@@ -155,7 +155,7 @@ func (m mediaRange) matches(typ, sub string) bool {
 }
 
 // parseRange parses one media range. A range that does not parse, a "*/x"
-// range or a q outside [0, 1] is dropped.
+// range or a q that is not a qvalue is dropped.
 func parseRange(item string) (mediaRange, bool) {
 	mt, params, err := mime.ParseMediaType(item)
 	if err != nil {
@@ -167,12 +167,40 @@ func parseRange(item string) (mediaRange, bool) {
 	}
 	q := 1.0
 	if s, ok := params["q"]; ok {
-		q, err = strconv.ParseFloat(s, 64)
-		if err != nil || q < 0 || q > 1 {
+		if q, ok = qvalue(s); !ok {
 			return mediaRange{}, false
 		}
 	}
 	return mediaRange{typ: typ, sub: sub, q: q}, true
+}
+
+// qvalue reads a weight by the RFC 9110 grammar, "0" [ "." 0*3DIGIT ] or
+// "1" [ "." 0*3("0") ], and nothing else: no sign, exponent, hex form,
+// NaN or infinity.
+func qvalue(s string) (float64, bool) {
+	whole, frac, _ := strings.Cut(s, ".")
+	if len(frac) > 3 {
+		return 0, false
+	}
+	switch whole {
+	case "0":
+		thousandths := 0
+		for i := range 3 {
+			d := byte('0')
+			if i < len(frac) {
+				d = frac[i]
+			}
+			if d < '0' || d > '9' {
+				return 0, false
+			}
+			thousandths = thousandths*10 + int(d-'0')
+		}
+		return float64(thousandths) / 1000, true
+	case "1":
+		return 1, strings.Trim(frac, "0") == ""
+	default:
+		return 0, false
+	}
 }
 
 // quality is the q the most specific matching range gives typ/sub, or 0

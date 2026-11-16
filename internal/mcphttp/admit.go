@@ -14,7 +14,9 @@ type Class int
 const (
 	// ClassControl is what must get through while the server is busy:
 	// notifications, ping, initialize, the list methods, DELETE and the
-	// calls of a Control tool.
+	// calls of a Control tool. Notifications and DELETE are answered
+	// under the transport's lock and take no place in it, so a full class
+	// never refuses them.
 	ClassControl Class = iota
 	// ClassPageState is a call of a Snapshot tool or a read of a Snapshot
 	// resource: answered from a snapshot, never waiting on the engine.

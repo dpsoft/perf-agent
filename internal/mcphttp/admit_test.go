@@ -91,7 +91,7 @@ func TestClassify(t *testing.T) {
 // then the server-wide cap from several sessions. The excess is refused
 // at once, goroutines and request bytes stay under the caps, controls from
 // the saturating session and from others are answered, and the admitted
-// calls complete (§D2.4, SRV-R4).
+// calls complete (§D2.4).
 func TestSameSessionSaturation(t *testing.T) {
 	// Forty bodies may be read at the same instant; the reader cap is not
 	// what this test is about.
@@ -187,7 +187,7 @@ func TestSameSessionSaturation(t *testing.T) {
 // TestControlIsServedBehindAFullCallClass: the call class is full of
 // small fast POSTs queued behind a tool holding the engine; a cancel and a
 // capture_cancel sent behind them are read, classed as control and
-// answered before any queued call starts (§D2.4, SRV-R4b).
+// answered before any queued call starts (§D2.4).
 func TestControlIsServedBehindAFullCallClass(t *testing.T) {
 	h := startHub(t, nil, nil)
 	var sids []string
@@ -242,7 +242,7 @@ func TestControlIsServedBehindAFullCallClass(t *testing.T) {
 // unread; each stalled body is dropped at IngressBodyTimeout and its
 // reader and bytes released; then a cancel is served, and goroutines and
 // bytes are back to their baseline with the server still running (§D2.4,
-// SRV-R4c).
+// §D2.4).
 func TestSlowIncompleteBodiesFillOnlyTheReaders(t *testing.T) {
 	const timeout = 300 * time.Millisecond
 	h := startHub(t, func(o *Options) { o.IngressBodyTimeout = timeout }, nil)
@@ -317,10 +317,12 @@ func TestSlowIncompleteBodiesFillOnlyTheReaders(t *testing.T) {
 // TestControlClassSaturation: with MaxControlInFlight controls running,
 // the next control of every kind gets 503 at once, calls and page_state
 // are not affected, and controls are served again as soon as one frees
-// (§D2.4, SRV-R4b).
+// (§D2.4). Notifications and DELETE are answered under the transport's
+// lock and hold no place, so a cancel gets through a full class: a client
+// never retries a notification.
 func TestControlClassSaturation(t *testing.T) {
 	h := startHub(t, func(o *Options) { o.MaxControlInFlight = 4 }, nil)
-	a, b := h.initialize(), h.initialize()
+	a, b, idle := h.initialize(), h.initialize(), h.initialize()
 	var answers []<-chan reply
 	var held []*call
 	for i := range 4 {
@@ -338,14 +340,16 @@ func TestControlClassSaturation(t *testing.T) {
 	busy("ping", a, pingBody, `"ping"`)
 	busy("ping from another session", b, pingBody, `"ping"`)
 	busy("tools/list", b, toolsList, `"list"`)
-	busy("cancelled", a, cancelBody("c0"), "null")
-	busy("initialized", b, initialized, "null")
 	busy("capture_cancel", b, callBody("x", "capture_cancel", nil), `"x"`)
 	busy("initialize", "", initBody, "0")
-	r := timed(t, "DELETE", controlBound, func() reply { return h.do(http.MethodDelete, b, "") })
-	wantBusy(t, "DELETE", r, "MaxControlInFlight", 4, "null")
-	if err := held[0].ctx.Err(); err != nil {
-		t.Fatalf("the refused cancel ended the call: %v", err)
+
+	r := timed(t, "initialized", controlBound, func() reply { return h.post(b, initialized) })
+	if r.status != http.StatusAccepted {
+		t.Fatalf("initialized with the class full: %d %s", r.status, r.body)
+	}
+	r = timed(t, "DELETE", controlBound, func() reply { return h.do(http.MethodDelete, idle, "") })
+	if r.status != http.StatusNoContent {
+		t.Fatalf("DELETE with the class full: %d %s", r.status, r.body)
 	}
 
 	if r = h.post(b, callBody(5, "slow", map[string]int{"ms": 1})); r.status != http.StatusOK {
@@ -358,16 +362,19 @@ func TestControlClassSaturation(t *testing.T) {
 		t.Fatalf("the page state resource: %d %s", r.status, r.body)
 	}
 
-	close(held[0].release)
+	r = timed(t, "cancelled", controlBound, func() reply { return h.post(a, cancelBody("c0")) })
+	if r.status != http.StatusAccepted {
+		t.Fatalf("a cancel with the class full: %d %s", r.status, r.body)
+	}
+	if err := held[0].end(t); err == nil {
+		t.Fatal("the cancel sent with the class full did not end its call")
+	}
 	if r = await(t, answers[0], 2*time.Second); r.status != http.StatusOK {
-		t.Fatalf("the freed control: %d %s", r.status, r.body)
+		t.Fatalf("the cancelled control: %d %s", r.status, r.body)
 	}
 	eventually(t, time.Second, "a control frees", func() bool { return h.tr.Stats().Control == 3 })
 	if r = timed(t, "ping once freed", controlBound, func() reply { return h.post(a, pingBody) }); r.status != http.StatusOK {
 		t.Fatalf("ping once freed: %d %s", r.status, r.body)
-	}
-	if r = h.do(http.MethodDelete, b, ""); r.status != http.StatusNoContent {
-		t.Fatalf("DELETE once freed: %d %s", r.status, r.body)
 	}
 	for i, c := range held[1:] {
 		close(c.release)
@@ -378,10 +385,67 @@ func TestControlClassSaturation(t *testing.T) {
 	}
 }
 
+// TestTheIngressKeepsAReserveForSmallBodies: bodies over 64 KiB that
+// stall take every reader but one, and every byte but 64 KiB, so a small
+// cancel, capture_cancel or ping is still read while they do (§D2.4).
+func TestTheIngressKeepsAReserveForSmallBodies(t *testing.T) {
+	stall := func(t *testing.T, h *hub, sid string, n, conns int) {
+		t.Helper()
+		for range conns {
+			if _, err := h.dial().Write(append(h.rawHead(sid, n), "0123456789"...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		eventually(t, time.Second, "the stalled readers", func() bool { return h.tr.Stats().Readers == conns })
+	}
+	headers := func(t *testing.T, h *hub, sid string, n int) reply {
+		t.Helper()
+		c := h.dial()
+		defer func() { _ = c.Close() }()
+		if _, err := c.Write(h.rawHead(sid, n)); err != nil {
+			t.Fatal(err)
+		}
+		return timed(t, "a large body's headers", controlBound, func() reply { return readReply(t, bufio.NewReader(c)) })
+	}
+	smallControlsGetThrough := func(t *testing.T, h *hub, sid string) {
+		t.Helper()
+		ans := h.callAsync(sid, "b", "block", nil)
+		held := h.f.nextCall(t)
+		if r := timed(t, "ping", controlBound, func() reply { return h.post(sid, pingBody) }); r.status != http.StatusOK {
+			t.Fatalf("ping: %d %s", r.status, r.body)
+		}
+		r := timed(t, "capture_cancel", controlBound, func() reply { return h.post(sid, callBody("c", "capture_cancel", nil)) })
+		if text, _ := r.toolText(); r.status != http.StatusOK || text != "cancelling" {
+			t.Fatalf("capture_cancel: %d %s", r.status, r.body)
+		}
+		if r = timed(t, "cancelled", controlBound, func() reply { return h.post(sid, cancelBody("b")) }); r.status != http.StatusAccepted {
+			t.Fatalf("cancelled: %d %s", r.status, r.body)
+		}
+		if err := held.end(t); err == nil {
+			t.Fatal("the cancel did not end its call")
+		}
+		await(t, ans, 2*time.Second)
+	}
+
+	t.Run("readers", func(t *testing.T) {
+		h := startHub(t, nil, nil)
+		sid := h.initialize()
+		stall(t, h, sid, 100<<10, 15)
+		wantBusy(t, "a 16th large body", headers(t, h, sid, 100<<10), "MaxIngressReaders", 16, "null")
+		smallControlsGetThrough(t, h, sid)
+	})
+	t.Run("bytes", func(t *testing.T) {
+		h := startHub(t, func(o *Options) { o.MaxIngressBytes, o.MaxMessageBytes = 2<<20, 1<<20 }, nil)
+		sid := h.initialize()
+		stall(t, h, sid, 1<<20, 1)
+		wantBusy(t, "a second 1 MiB body", headers(t, h, sid, 1<<20), "MaxIngressBytes", 2<<20, "null")
+		smallControlsGetThrough(t, h, sid)
+	})
+}
+
 // TestHeaderOnlyRejection: a Content-Length over what is left of
 // MaxIngressBytes gets 503, and one over MaxMessageBytes 413, from the
-// headers alone; a small body still fits beside a stalled one (§D2.4,
-// SRV-R4b).
+// headers alone; a small body still fits beside a stalled one (§D2.4).
 func TestHeaderOnlyRejection(t *testing.T) {
 	h := startHub(t, func(o *Options) {
 		o.MaxIngressBytes = 768 << 10
@@ -426,7 +490,7 @@ func TestHeaderOnlyRejection(t *testing.T) {
 
 // TestPageStateHasItsOwnClass: page_state is admitted with the call class
 // full, MaxPageStateInFlight bounds it, the tool and the resource alike,
-// and calls are admitted with it full (§D2.4, SRV-R3b).
+// and calls are admitted with it full (§D2.4).
 func TestPageStateHasItsOwnClass(t *testing.T) {
 	h := startHub(t, func(o *Options) { o.MaxCalls, o.MaxCallsPerSession = 4, 4 }, nil)
 	a := h.initialize()

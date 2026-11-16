@@ -70,14 +70,18 @@ type Options struct {
 
 	// The ingress bounds the bodies being read, before any byte of one is
 	// read: MaxIngressReaders bodies at once (0 means 16), whose
-	// Content-Lengths sum to at most MaxIngressBytes (0 means 8 MiB). A
-	// request beyond either gets 503 unread and its connection closed.
+	// Content-Lengths sum to at most MaxIngressBytes (0 means 8 MiB). One
+	// reader and 64 KiB of them are kept for bodies of at most 64 KiB, so
+	// large bodies that stall never keep a control message from being
+	// read. A request beyond either gets 503 unread and its connection
+	// closed.
 	MaxIngressReaders int
 	MaxIngressBytes   int64
 	// The admission classes bound the parsed messages in flight, each
 	// class apart, so a full one never delays another; see Class.
-	// MaxControlInFlight bounds the control messages (0 means 32), and
-	// MaxPageStateInFlight the page-state reads (0 means 4). MaxCalls
+	// MaxControlInFlight bounds the control requests (0 means 32);
+	// notifications and DELETE, answered under the lock, are not counted.
+	// MaxPageStateInFlight bounds the page-state reads (0 means 4). MaxCalls
 	// bounds the calls server-wide, running or waiting in their handler
 	// (0 means 16), MaxCallsPerSession those of one session (0 means 4),
 	// and MaxRequestBytes the arguments the calls hold, as parsed, never
@@ -116,6 +120,10 @@ type Transport struct {
 	h   Handler
 	o   Options
 	log *slog.Logger
+	// reserveReaders and reserveBytes are the part of the ingress bounds
+	// kept for small bodies (ingressReserve).
+	reserveReaders int
+	reserveBytes   int64
 	// life is the parent of every call's context; stop ends it.
 	life  context.Context
 	stop  context.CancelFunc
@@ -182,6 +190,7 @@ func New(h Handler, o Options) *Transport {
 		log = slog.New(slog.DiscardHandler)
 	}
 	t := &Transport{h: h, o: o, log: log, sessions: map[string]*session{}, flush: sync.OnceFunc(h.FlushWarnings)}
+	t.reserveReaders, t.reserveBytes = ingressReserve(o)
 	t.life, t.stop = context.WithCancel(o.Lifetime)
 	return t
 }
@@ -296,18 +305,13 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 		return
 	}
 	if req.Notification() {
-		// A notification is answered under the lock, so it holds its place
-		// in the control class only for that long.
-		tk, busy := t.takeControl()
-		if busy != "" {
-			t.mu.Unlock()
-			t.refuseBusy(w, rc, nil, busy)
-			return
-		}
+		// A notification is answered under the lock and holds nothing
+		// after, so it takes no place in the control class: a full class
+		// never refuses one, and a cancel, which a client never retries,
+		// is never lost.
 		if req.Method == "notifications/cancelled" {
 			t.cancelNamed(s, req.Params)
 		}
-		t.release(tk)
 		t.mu.Unlock()
 		t.write(w, rc, http.StatusAccepted, nil)
 		return
@@ -415,8 +419,8 @@ func (t *Transport) initialize(w http.ResponseWriter, rc *http.ResponseControlle
 }
 
 // delete ends a session: its calls are cancelled and it is forgotten. Jobs
-// it started are the server's and go on. It is a control message, answered
-// under the lock.
+// it started are the server's and go on. It is a control message answered
+// under the lock, so like a notification it takes no place in the class.
 func (t *Transport) delete(w http.ResponseWriter, rc *http.ResponseController, r *http.Request) {
 	t.mu.Lock()
 	s, status, refusal := t.find(r, nil)
@@ -425,14 +429,7 @@ func (t *Transport) delete(w http.ResponseWriter, rc *http.ResponseController, r
 		t.write(w, rc, status, refusal)
 		return
 	}
-	tk, busy := t.takeControl()
-	if busy != "" {
-		t.mu.Unlock()
-		t.refuseBusy(w, rc, nil, busy)
-		return
-	}
 	t.remove(s)
-	t.release(tk)
 	t.mu.Unlock()
 	t.write(w, rc, http.StatusNoContent, nil)
 }

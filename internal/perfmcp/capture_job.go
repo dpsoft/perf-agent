@@ -1,6 +1,7 @@
 package perfmcp
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,48 @@ func (s jobStatus) cancelAnswer() string {
 	return ""
 }
 
+// The values of a done job's derived state: its open and compare results
+// are being made, are ready, or could not be made (the capture stays
+// committed). recompute is an answer read back from a manifest.
+const (
+	derivedPending   = "pending"
+	derivedReady     = "ready"
+	derivedFailed    = "failed"
+	derivedRecompute = "recompute"
+)
+
+// phaseUndecided is the phase of a committing job whose manifest link had
+// an outcome nobody could read: it may have committed. It stays so until a
+// later pass settles it from what is on disk.
+const phaseUndecided = "undecided"
+
+// captureRequest is what an admitted capture asks for. Exactly one of PID
+// and Command is set; Cwd is the command's directory as the agent gave it
+// ("" for the default). Settings holds every setting, defaults filled in;
+// Explicit names the ones the agent passed (modes, duration, sample_rate,
+// unwind, kernel_stacks), so that compare_with inherits the others.
+type captureRequest struct {
+	PID                        int
+	Command                    []string
+	Cwd                        string
+	Settings                   capture.Settings
+	Explicit                   map[string]bool
+	Series, Label, CompareWith string
+	Keep                       bool
+}
+
+// jobView is a job's state as capture_wait shows it; empty values are left
+// out.
+type jobView struct {
+	Job     string `json:"job"`
+	ID      string `json:"id,omitzero"`
+	Status  string `json:"status"`
+	Phase   string `json:"phase,omitzero"`
+	Elapsed string `json:"elapsed,omitzero"`
+	ETA     string `json:"eta,omitzero"`
+	Derived string `json:"derived,omitzero"`
+}
+
 // job is one capture, owned by the server (§4.0). The fields before mu
 // are set at admission and never change; the ones after it are the job's
 // state, which mu guards. mu is held only to read or write that state,
@@ -57,6 +100,19 @@ type job struct {
 	// reserve is the duration admission charged to the windows, until the
 	// job reconciles it with the effective duration.
 	reserve time.Duration
+	req     captureRequest
+	// began is when admission ran by the wall clock, which elapsed and eta
+	// count from (created is on the server's clock, which tests move).
+	began time.Time
+
+	// pins are what the job pins, on its own goroutine: its baseline
+	// against retention, and the handles it holds in the pin ledger while
+	// it derives (the job is their holder there).
+	pins []any
+	// txn is the file transaction of a capture whose commit is undecided.
+	// The job sets it before it registers the job as undecided (under the
+	// server's capMu), and the pass that settles it reads it after.
+	txn *captureTxn
 
 	// d decides whether a cancel or the commit wins (§7.4).
 	d decisionWord
@@ -70,6 +126,11 @@ type job struct {
 	phase, captureID, derived string
 	err                       *capture.Error
 	result                    []byte
+	// duration is the capture's effective duration, once the job knows it.
+	duration time.Duration
+	// trail is every status the job went through (a done one with its
+	// derived state), for logs and tests.
+	trail []string
 	// changed is closed and replaced at each change of state, so a wait
 	// selects on it with its own deadline and needs no goroutine.
 	changed chan struct{}
@@ -89,6 +150,102 @@ func newJob(id string, created time.Time, reserve time.Duration) *job {
 		cancel:  make(chan struct{}),
 		status:  jobAccepted,
 		changed: make(chan struct{}),
+		trail:   []string{string(jobAccepted)},
+	}
+}
+
+// set changes the job's state under its mutex, through f, and wakes every
+// wait.
+func (j *job) set(f func()) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	f()
+	mark := string(j.status)
+	if j.status == jobDone && j.derived != "" {
+		mark += "/" + j.derived
+	}
+	if len(j.trail) == 0 || j.trail[len(j.trail)-1] != mark {
+		j.trail = append(j.trail, mark)
+	}
+	close(j.changed)
+	j.changed = make(chan struct{})
+}
+
+// setState moves the job to status and phase.
+func (j *job) setState(status jobStatus, phase string) {
+	j.set(func() { j.status, j.phase = status, phase })
+}
+
+// etaSlack is what a capture takes beyond its duration, as eta counts it.
+const etaSlack = 5 * time.Second
+
+// view is the job's state now.
+func (j *job) view() jobView {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.viewLocked(time.Now())
+}
+
+func (j *job) viewLocked(now time.Time) jobView {
+	v := jobView{Job: j.id, ID: j.captureID, Status: string(j.status), Phase: j.phase}
+	if j.status == jobRunning {
+		if r := j.run.Load(); r != nil {
+			v.Phase = r.Phase()
+		}
+	}
+	if j.status == jobDone {
+		v.Derived = j.derived
+	}
+	from := j.began
+	if from.IsZero() {
+		from = j.created
+	}
+	elapsed := now.Sub(from)
+	v.Elapsed = elapsed.Round(100 * time.Millisecond).String()
+	if !j.status.terminal() && v.Phase != phaseUndecided {
+		d := j.duration
+		if d == 0 {
+			d = j.reserve
+		}
+		v.ETA = max(d+etaSlack-elapsed, 0).Round(100 * time.Millisecond).String()
+	}
+	return v
+}
+
+// settled reports whether a wait has nothing more to wait for: the job
+// failed, was cancelled, or is done with its derivations made.
+func (j *job) settled() bool {
+	switch j.status {
+	case jobFailed, jobCancelled:
+		return true
+	case jobDone:
+		return j.derived != derivedPending
+	}
+	return false
+}
+
+// wait returns the job's state once it has settled, or when d has passed
+// or ctx is done, whichever is first. It starts no goroutine: one timer and
+// a select on the job's change channel.
+func (j *job) wait(ctx context.Context, d time.Duration) jobView {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		j.mu.Lock()
+		if j.settled() {
+			v := j.viewLocked(time.Now())
+			j.mu.Unlock()
+			return v
+		}
+		ch := j.changed
+		j.mu.Unlock()
+		select {
+		case <-ch:
+		case <-timer.C:
+			return j.view()
+		case <-ctx.Done():
+			return j.view()
+		}
 	}
 }
 

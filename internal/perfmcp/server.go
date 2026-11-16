@@ -92,9 +92,38 @@ type Server struct {
 	// so a mismatch is refused without I/O.
 	ownerSeen atomic.Pointer[string]
 	// stranded are this server's rollbacks that could not commit their
-	// failure manifest yet; capMu guards the list.
-	capMu    sync.Mutex
-	stranded []*captureTxn
+	// failure manifest yet, and undecided its jobs whose commit could not
+	// be read; capMu guards both lists.
+	capMu     sync.Mutex
+	stranded  []*captureTxn
+	undecided []*job
+
+	// self is this server's own binary, which runs each capture's reaper
+	// and launcher.
+	self string
+	// registry holds the capture jobs and lookups the historical answers.
+	registry *registry
+	lookups  *lookupPool
+	// ctx ends at Close, and with it every wait of the jobs and of
+	// maintenance.
+	ctx  context.Context
+	stop context.CancelFunc
+	// dirMu is the in-process slot of the capture directory: a job holds
+	// it from its lease to its end, and maintenance for its pass, so the
+	// two never refuse each other the lease. It is a channel so a wait for
+	// it can end with a cancel.
+	dirMu chan struct{}
+	// jobsMu orders admission against Close: closed refuses new jobs, and
+	// jobsWG counts the running ones.
+	jobsMu sync.Mutex
+	closed bool
+	jobsWG sync.WaitGroup
+	// killed says KillCaptures ran: a signal path kills the captures before
+	// Close, which then does not wait for the jobs' rollbacks.
+	killed atomic.Bool
+	// cgroupParent is the delegated cgroup a command's own cgroup goes
+	// under, "" when there is none.
+	cgroupParent func() string
 }
 
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
@@ -128,7 +157,10 @@ func New(cfg Config) (_ *Server, err error) {
 
 		evalSymlinks: filepath.EvalSymlinks,
 		engine:       newEngine(),
+		dirMu:        make(chan struct{}, 1),
 	}
+	s.ctx, s.stop = context.WithCancel(context.Background())
+	s.cgroupParent = sync.OnceValue(s.findCgroupParent)
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
@@ -160,6 +192,7 @@ func New(cfg Config) (_ *Server, err error) {
 	if err := s.setupCapture(cfg.Capture); err != nil {
 		return nil, err
 	}
+	s.registry = newRegistry(lim.Capture, randHex(2))
 	s.mcp = mcpstdio.New(mcpstdio.Options{
 		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
 		Instructions:    instructions,
@@ -175,8 +208,38 @@ func New(cfg Config) (_ *Server, err error) {
 		// answers of MaxToolErrorBytes at their worst escaping.
 		DrainTimeout: drainTimeout,
 		Log:          s.log,
+		// Nobody collects a stdio session's jobs once it ends.
+		OnClose: func(mcpstdio.CloseReason) { s.cancelAllJobs() },
 	})
+	if s.captureDisabled == "" {
+		s.lookups = newLookupPool(lookupWorkers, lookupQueue)
+		if beforeMaintenance != nil {
+			beforeMaintenance(s)
+		}
+		go s.maintain()
+	}
 	return s, nil
+}
+
+// The historical lookup pool's size (§4.0): fixed, not a limit.
+const (
+	lookupWorkers = 2
+	lookupQueue   = 16
+)
+
+// findCgroupParent is the delegated cgroup v2 directory a launched command
+// gets a cgroup of its own under, or "" (logged) when there is none.
+func (s *Server) findCgroupParent() string {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		s.log.Info("captured commands get no cgroup of their own", "why", err)
+		return ""
+	}
+	parent, why := capture.DelegatedCgroup(b, "/sys/fs/cgroup")
+	if parent == "" {
+		s.log.Info("captured commands get no cgroup of their own", "why", why)
+	}
+	return parent
 }
 
 // setupCapture verifies c and records whether capture is on. A perf-agent
@@ -230,6 +293,14 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	if err == nil {
 		err = capture.CheckBounding(status, bin.Caps)
 	}
+	if err == nil {
+		// The reaper and the launcher are this binary in their internal
+		// modes.
+		var perr error
+		if s.self, perr = os.Executable(); perr != nil {
+			err = capture.Errorf(capture.CodeDisabled, "", "cannot find this server's own binary, which runs each capture's reaper: %v", perr)
+		}
+	}
 	if err != nil {
 		s.captureDisabled = err.Error()
 		s.log.Warn("capture disabled", "reason", err)
@@ -244,14 +315,32 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	return s.mcp.Serve(ctx, r, w)
 }
 
-// Close stops the live page, if any, and closes the server's roots. It may
-// run on another goroutine than Serve's, while a request is in flight, and
-// does not wait for the engine: a handler may still run after Serve
-// returned. The
+// Close cancels the capture jobs and kills their captures, waits up to
+// Capture.StopGrace + 1 s for the jobs to roll back (not when a signal path
+// already called KillCaptures), stops the live page, if any, and closes the
+// server's roots. It may run on another goroutine than Serve's, while a
+// request is in flight, and does not wait for the engine or for a
+// maintenance pass: a handler may still run after Serve returned. The
 // page's streams end first and its other responses get liveShutdown before
 // their connections are dropped, so a tab that stopped reading delays Close
-// by at most that.
+// by at most that. A second Close does nothing more.
 func (s *Server) Close() error {
+	signalled := s.killed.Load()
+	s.jobsMu.Lock()
+	again := s.closed
+	s.closed = true
+	s.jobsMu.Unlock()
+	if s.stop != nil {
+		s.stop()
+	}
+	s.cancelAllJobs()
+	s.KillCaptures()
+	if !signalled && !again {
+		s.waitJobs(s.lim.Capture.StopGrace + time.Second)
+	}
+	if s.lookups != nil {
+		s.lookups.close()
+	}
 	s.stopStranded()
 	if s.live != nil {
 		s.live.close()

@@ -1288,14 +1288,24 @@ answer there is `cancelling` until the link resolves.
   file onto the quarantine name between the check and the unlink; it
   does not close it, since no unlink-if-this-inode call exists; a file that is not the recorded
   one is put back without replacing anything (CAP-R43). Recovery proves a
-  quarantine name a crash left against what its intent records, or by
-  the token its bytes hold; an intent quarantined after its manifest, and
-  an intent or manifest temporary written but not yet recorded, are
-  proven the same way. A proof by contents needs the exact bytes the
-  server writes: the token and a newline, or an intent or manifest whose
-  bytes equal its own canonical encoding, that is valid for its name and
-  that carries the capture's token (CAP-R51). A file with anything of its
-  own in it is never taken;
+  quarantine name a crash left, or an intent or heartbeat temporary
+  written but not yet recorded, only against the intent it adopted: by
+  the identities that intent records, or by contents that are exactly
+  bytes this capture writes (CAP-R51, CAP-R53). That is the token and a
+  newline (the heartbeat, its temporary, the probe), or a version of the
+  adopted intent: bytes equal to their own canonical encoding, valid for
+  the intent's name, with the same token, id, label and series, the same
+  settings, outputs, finals, staging name and server, and the staging
+  inode, reaper, heartbeat and files equal wherever both versions record
+  them (an older version may lack them, and so may the adopted intent
+  when the version is a rewrite a crash cut short). What may differ holds
+  no free text: the state and the temporaries, checked for form, and
+  identities (numbers, digests, fixed names). A manifest temporary nothing recorded is never proven by its
+  contents, since its free text (error message, notes, target) is pinned
+  by nothing; and a file no adopted intent accounts for (an intent
+  quarantined after its manifest, an intent temporary whose intent was
+  never linked) is never proven by contents either, since nothing but the
+  file itself would be checked. Both are kept and reported;
 - a staging directory is opened as a root and proven to be the recorded
   dev and inode before perf-agent's outputs in it are removed by name
   (CAP-R48);
@@ -1372,7 +1382,9 @@ sees an error while capture files are still published.
 - **Single-syscall windows (CAP-R47).** A crash inside one system call
   of a write, after a new name exists and before any record of it is
   durable, leaves a file nothing can prove: a `.seq` temporary, a
-  temporary created but not yet written, a quarantined
+  temporary created but not yet written, a manifest temporary not yet
+  recorded, an intent temporary whose intent was never linked, the
+  intent itself quarantined by its own last removal, a quarantined
   `.del-*` name nothing records, a staging directory (CAP-R12
   above), or a temporary of `.owner` in the capture directory itself.
   Each is retained, never deleted without proof, and logged by recovery
